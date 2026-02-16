@@ -1,0 +1,17 @@
+# Build output
+build/
+
+# Toolchain (large, download separately)
+tools/xtensa-lx106-elf/
+
+# Firmware backup (large binary)
+backup/
+
+# Editor/IDE files
+.vscode/
+*.swp
+*.swo
+*~
+
+# Claude Code session data
+.claude/
