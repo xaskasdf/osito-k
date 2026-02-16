@@ -14,9 +14,21 @@
 #include "drivers/uart.h"
 #include "mem/pool_alloc.h"
 #include "kernel/task.h"
+#include "kernel/mq.h"
 #include "shell/shell.h"
 
 extern "C" {
+
+/* ====== IPC: shell -> heartbeat message queue ====== */
+
+/* Message type for IPC demo */
+typedef struct {
+    uint32_t value;
+} hb_msg_t;
+
+/* Queue storage (4 messages deep) */
+static uint8_t hb_mq_buf[4 * sizeof(hb_msg_t)];
+mq_t hb_mq;  /* global — shell.cpp uses this */
 
 /* ====== Heartbeat task ====== */
 
@@ -26,6 +38,16 @@ static void heartbeat_task(void *arg)
     uint32_t count = 0;
 
     for (;;) {
+        /* Check for IPC messages (non-blocking) */
+        hb_msg_t msg;
+        while (mq_tryrecv(&hb_mq, &msg) == 0) {
+            uart_lock();
+            uart_puts("[heartbeat: pong ");
+            uart_put_dec(msg.value);
+            uart_puts("]\n");
+            uart_unlock();
+        }
+
         uart_lock();
         uart_puts("[heartbeat ");
         uart_put_dec(count);
@@ -52,6 +74,9 @@ void kernel_main(void)
 
     /* Initialize memory pool */
     pool_init();
+
+    /* Initialize IPC queue */
+    mq_init(&hb_mq, hb_mq_buf, sizeof(hb_msg_t), 4);
 
     /* Initialize scheduler (creates idle task) */
     sched_init();

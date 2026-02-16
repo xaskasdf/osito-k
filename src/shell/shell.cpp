@@ -13,6 +13,10 @@
 #include "drivers/uart.h"
 #include "mem/pool_alloc.h"
 #include "kernel/task.h"
+#include "kernel/mq.h"
+
+/* IPC queue to heartbeat (defined in main.cpp) */
+extern mq_t hb_mq;
 
 extern "C" {
 
@@ -104,8 +108,29 @@ static void cmd_help(void)
     uart_puts("  ps      - list tasks\n");
     uart_puts("  mem     - memory pool status\n");
     uart_puts("  ticks   - uptime in ticks\n");
+    uart_puts("  ping    - send IPC message to heartbeat\n");
     uart_puts("  help    - this message\n");
     uart_puts("  reboot  - software reset\n");
+}
+
+static uint32_t ping_counter = 0;
+
+static void cmd_ping(void)
+{
+    /* Send a message to heartbeat through the IPC queue */
+    typedef struct { uint32_t value; } hb_msg_t;
+    hb_msg_t msg;
+    msg.value = ping_counter++;
+
+    if (mq_trysend(&hb_mq, &msg) == 0) {
+        uart_puts("ping ");
+        uart_put_dec(msg.value);
+        uart_puts(" -> heartbeat (queued: ");
+        uart_put_dec(mq_count(&hb_mq));
+        uart_puts(")\n");
+    } else {
+        uart_puts("queue full!\n");
+    }
 }
 
 static void cmd_reboot(void)
@@ -135,6 +160,8 @@ static void process_command(const char *cmd)
         cmd_ticks();
     else if (ets_strcmp(cmd, "help") == 0)
         cmd_help();
+    else if (ets_strcmp(cmd, "ping") == 0)
+        cmd_ping();
     else if (ets_strcmp(cmd, "reboot") == 0)
         cmd_reboot();
     else {
