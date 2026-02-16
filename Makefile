@@ -77,6 +77,7 @@ CXX_SRCS = \
 	$(SRCDIR)/fs/ositofs.cpp \
 	$(SRCDIR)/drivers/uart.cpp \
 	$(SRCDIR)/drivers/gpio.cpp \
+	$(SRCDIR)/vm/vm.cpp \
 	$(SRCDIR)/shell/shell.cpp \
 	$(SRCDIR)/main.cpp
 

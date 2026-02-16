@@ -19,6 +19,7 @@
 #include "kernel/task.h"
 #include "kernel/mq.h"
 #include "kernel/timer_sw.h"
+#include "vm/vm.h"
 
 /* IPC queue to heartbeat (defined in main.cpp) */
 extern mq_t hb_mq;
@@ -438,6 +439,7 @@ static void cmd_help(void)
     uart_puts("  pri N P - set task N priority to P\n");
     uart_puts("  ping    - send IPC message to heartbeat\n");
     uart_puts("  timer   - test 1s software timer\n");
+    uart_puts("  run F   - run .vm bytecode program\n");
     uart_puts("  uname   - system info\n");
     uart_puts("  help    - this message\n");
     uart_puts("  reboot  - software reset\n");
@@ -653,6 +655,74 @@ static void cmd_uname(void)
     uart_puts("\n");
 }
 
+/* ====== VM run command ====== */
+
+/* Static VM state — too large for the shell task stack */
+static vm_t vm;
+
+static void cmd_run(const char *args)
+{
+    while (*args == ' ') args++;
+    if (*args == '\0') {
+        uart_puts("usage: run <file.vm>\n");
+        return;
+    }
+
+    /* Check file exists and get size */
+    int size = fs_stat(args);
+    if (size < 0) {
+        uart_puts("not found: ");
+        uart_puts(args);
+        uart_puts("\n");
+        return;
+    }
+    if (size < (int)VM_HEADER_SIZE) {
+        uart_puts("file too small\n");
+        return;
+    }
+
+    /* Allocate buffer from heap */
+    uint8_t *buf = (uint8_t *)heap_alloc((uint32_t)size);
+    if (!buf) {
+        uart_puts("no memory (need ");
+        uart_put_dec((uint32_t)size);
+        uart_puts(" bytes)\n");
+        return;
+    }
+
+    /* Read file */
+    int got = fs_read(args, buf, (uint32_t)size);
+    if (got != size) {
+        uart_puts("read error\n");
+        heap_free(buf);
+        return;
+    }
+
+    /* Initialize and load VM */
+    vm_init(&vm);
+    if (vm_load(&vm, buf, (uint32_t)size) < 0) {
+        heap_free(buf);
+        return;
+    }
+
+    /* Run */
+    uart_puts("[vm: running ");
+    uart_puts(args);
+    uart_puts(" (");
+    uart_put_dec(vm.code_size);
+    uart_puts(" bytes)]\n");
+
+    int rc = vm_run(&vm);
+
+    uart_puts("[vm: exit ");
+    uart_put_dec((uint32_t)rc);
+    uart_puts(", ");
+    uart_put_dec(vm.insn_count);
+    uart_puts(" insns]\n");
+
+    heap_free(buf);
+}
+
 static void cmd_reboot(void)
 {
     uart_puts("Rebooting...\n");
@@ -692,6 +762,8 @@ static void process_command(const char *cmd)
         cmd_ping();
     else if (ets_strcmp(cmd, "timer") == 0)
         cmd_timer();
+    else if (ets_strncmp(cmd, "run", 3) == 0 && (cmd[3] == ' ' || cmd[3] == '\0'))
+        cmd_run(cmd + 3);
     else if (ets_strcmp(cmd, "uname") == 0)
         cmd_uname();
     else if (ets_strcmp(cmd, "reboot") == 0)

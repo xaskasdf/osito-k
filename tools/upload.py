@@ -76,7 +76,7 @@ def main():
     ser.reset_input_buffer()
 
     # Send upload command
-    cmd = f"fs upload {remote_name} {size}\r\n"
+    cmd = f"fs upload {remote_name} {size}\r"
     print(f"Sending: {cmd.strip()}")
     ser.write(cmd.encode("ascii"))
 
