@@ -74,8 +74,25 @@ void fs_list(void);
 /* Free space in bytes. */
 uint32_t fs_free(void);
 
+/* Overwrite an existing file (or create if not found). Returns 0 on success. */
+int fs_overwrite(const char *name, const void *data, uint32_t size);
+
+/* Append data to an existing file. Returns 0 on success, -1 if not found or won't fit. */
+int fs_append(const char *name, const void *data, uint32_t size);
+
+/* Rename a file. Returns 0 on success, -1 if not found or new name exists. */
+int fs_rename(const char *old_name, const char *new_name);
+
+/* Upload a file via UART (binary protocol with sector-level ACK).
+ * Handles sector allocation, UART reading, flash writes internally.
+ * Returns CRC16 of received data on success, -1 on error. */
+int fs_upload(const char *name, uint32_t total_size);
+
 /* Is the filesystem mounted? */
 int fs_mounted(void);
+
+/* CRC16-CCITT (for upload verification) */
+uint16_t fs_crc16(const uint8_t *data, uint32_t len);
 
 #ifdef __cplusplus
 }

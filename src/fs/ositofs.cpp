@@ -8,6 +8,7 @@
 
 #include "fs/ositofs.h"
 #include "drivers/uart.h"
+#include "kernel/task.h"
 
 extern "C" {
 
@@ -413,9 +414,311 @@ uint32_t fs_free(void)
     return count_free(bmap) * FS_SECTOR_SIZE;
 }
 
+int fs_overwrite(const char *name, const void *data, uint32_t size)
+{
+    if (!mounted) return -1;
+    if (name[0] == '\0' || size == 0) return -1;
+
+    uint32_t ps = irq_save();
+    read_table();
+
+    int idx = find_file(name);
+    if (idx < 0) {
+        /* File doesn't exist — create it */
+        irq_restore(ps);
+        return fs_create(name, data, size);
+    }
+
+    fs_entry_t *e = table_entry(idx);
+    uint16_t new_nsec = (uint16_t)((size + FS_SECTOR_SIZE - 1) / FS_SECTOR_SIZE);
+
+    if (new_nsec <= e->sector_count) {
+        /* Fits in existing sectors — erase and rewrite in place */
+        uint16_t start = e->start_sector;
+
+        /* Erase all old sectors */
+        for (int s = 0; s < e->sector_count; s++) {
+            uint32_t addr = FS_DATA_ADDR + (uint32_t)(start + s) * FS_SECTOR_SIZE;
+            flash_erase_sector(addr);
+        }
+
+        /* Write new data */
+        const uint8_t *src = (const uint8_t *)data;
+        uint32_t remaining = size;
+        for (int s = 0; s < new_nsec; s++) {
+            uint32_t addr = FS_DATA_ADDR + (uint32_t)(start + s) * FS_SECTOR_SIZE;
+            uint32_t chunk = remaining > FS_SECTOR_SIZE ? FS_SECTOR_SIZE : remaining;
+            uint32_t write_len = (chunk + 3) & ~3u;
+            flash_write(addr, src, write_len);
+            src += chunk;
+            remaining -= chunk;
+        }
+
+        /* Update entry: new size & sector count */
+        e->size = size;
+        e->sector_count = new_nsec;
+        write_table();
+
+        irq_restore(ps);
+        return 0;
+    }
+
+    /* Doesn't fit — delete and recreate */
+    ets_memset(e, 0, sizeof(fs_entry_t));
+    write_table();
+
+    fs_super_t sb;
+    read_super(&sb);
+    if (sb.file_count > 0) sb.file_count--;
+    write_super(&sb);
+
+    irq_restore(ps);
+    return fs_create(name, data, size);
+}
+
+int fs_append(const char *name, const void *data, uint32_t size)
+{
+    if (!mounted || size == 0) return -1;
+
+    uint32_t ps = irq_save();
+    read_table();
+
+    int idx = find_file(name);
+    if (idx < 0) {
+        irq_restore(ps);
+        return -1;
+    }
+
+    fs_entry_t *e = table_entry(idx);
+    uint32_t old_size = e->size;
+    uint32_t new_total = old_size + size;
+    uint16_t start = e->start_sector;
+    uint16_t nsec = e->sector_count;
+
+    uint16_t need_nsec = (uint16_t)((new_total + FS_SECTOR_SIZE - 1) / FS_SECTOR_SIZE);
+    if (need_nsec > nsec) {
+        irq_restore(ps);
+        uart_puts("fs: append won't fit in allocated sectors\n");
+        return -1;
+    }
+
+    /* Save entry info — we'll reuse sec_buf for data ops */
+    const uint8_t *src = (const uint8_t *)data;
+    uint32_t remaining = size;
+    uint32_t write_pos = old_size;
+
+    /* Handle partial last sector: read-modify-write */
+    uint32_t offset_in_sec = write_pos % FS_SECTOR_SIZE;
+    if (offset_in_sec != 0) {
+        uint32_t sec_idx = write_pos / FS_SECTOR_SIZE;
+        uint32_t addr = FS_DATA_ADDR + (uint32_t)(start + sec_idx) * FS_SECTOR_SIZE;
+
+        flash_read(addr, sec_buf, FS_SECTOR_SIZE);
+
+        uint32_t space = FS_SECTOR_SIZE - offset_in_sec;
+        uint32_t chunk = remaining < space ? remaining : space;
+        ets_memcpy(sec_buf + offset_in_sec, src, chunk);
+
+        flash_erase_sector(addr);
+        flash_write(addr, sec_buf, FS_SECTOR_SIZE);
+
+        src += chunk;
+        remaining -= chunk;
+        write_pos += chunk;
+    }
+
+    /* Write remaining full sectors */
+    while (remaining > 0) {
+        uint32_t sec_idx = write_pos / FS_SECTOR_SIZE;
+        uint32_t addr = FS_DATA_ADDR + (uint32_t)(start + sec_idx) * FS_SECTOR_SIZE;
+        uint32_t chunk = remaining > FS_SECTOR_SIZE ? FS_SECTOR_SIZE : remaining;
+
+        flash_erase_sector(addr);
+        uint32_t write_len = (chunk + 3) & ~3u;
+        flash_write(addr, src, write_len);
+
+        src += chunk;
+        remaining -= chunk;
+        write_pos += chunk;
+    }
+
+    /* Reload table and update size */
+    read_table();
+    table_entry(idx)->size = new_total;
+    write_table();
+
+    irq_restore(ps);
+    return 0;
+}
+
+int fs_rename(const char *old_name, const char *new_name)
+{
+    if (!mounted) return -1;
+    if (old_name[0] == '\0' || new_name[0] == '\0') return -1;
+
+    uint32_t ps = irq_save();
+    read_table();
+
+    int idx = find_file(old_name);
+    if (idx < 0) {
+        irq_restore(ps);
+        return -1;
+    }
+
+    /* Check new name doesn't already exist */
+    if (find_file(new_name) >= 0) {
+        irq_restore(ps);
+        uart_puts("fs: target name exists\n");
+        return -1;
+    }
+
+    fs_strncpy(table_entry(idx)->name, new_name, FS_NAME_LEN);
+    write_table();
+
+    irq_restore(ps);
+    return 0;
+}
+
+int fs_upload(const char *name, uint32_t total_size)
+{
+    if (!mounted) return -1;
+    if (name[0] == '\0' || total_size == 0) return -1;
+
+    uint32_t ps = irq_save();
+
+    /* Delete existing file if any */
+    read_table();
+    int old_idx = find_file(name);
+    if (old_idx >= 0) {
+        ets_memset(table_entry(old_idx), 0, sizeof(fs_entry_t));
+        write_table();
+        fs_super_t sb;
+        read_super(&sb);
+        if (sb.file_count > 0) sb.file_count--;
+        write_super(&sb);
+        /* Reload table after superblock write (write_super uses sec_buf) */
+        read_table();
+    }
+
+    /* Find free slot */
+    int slot = find_free_slot();
+    if (slot < 0) {
+        irq_restore(ps);
+        uart_puts("fs: file table full\n");
+        return -1;
+    }
+
+    /* Allocate sectors */
+    uint16_t nsec = (uint16_t)((total_size + FS_SECTOR_SIZE - 1) / FS_SECTOR_SIZE);
+    uint8_t bmap[BITMAP_BYTES];
+    build_bitmap(bmap);
+
+    int start = alloc_sectors(bmap, nsec);
+    if (start < 0) {
+        irq_restore(ps);
+        uart_puts("fs: no space\n");
+        return -1;
+    }
+
+    /* Create file table entry NOW (so sectors are reserved) */
+    fs_entry_t *e = table_entry(slot);
+    ets_memset(e, 0, sizeof(fs_entry_t));
+    fs_strncpy(e->name, name, FS_NAME_LEN);
+    e->size = total_size;
+    e->start_sector = (uint16_t)start;
+    e->sector_count = nsec;
+    write_table();
+
+    /* Update superblock */
+    fs_super_t sb;
+    read_super(&sb);
+    sb.file_count++;
+    write_super(&sb);
+
+    irq_restore(ps);
+
+    /* Signal PC: ready to receive */
+    uart_puts("READY\n");
+
+    /* Receive data sector by sector */
+    uint16_t crc = 0xFFFF;
+    uint32_t received = 0;
+
+    for (uint16_t sec = 0; sec < nsec; sec++) {
+        uint32_t chunk = total_size - received;
+        if (chunk > FS_SECTOR_SIZE) chunk = FS_SECTOR_SIZE;
+
+        /* Read chunk bytes from UART into sec_buf */
+        uint32_t got = 0;
+        uint32_t timeout_start = get_tick_count();
+        while (got < chunk) {
+            int c = uart_getc();
+            if (c >= 0) {
+                sec_buf[got++] = (uint8_t)c;
+                timeout_start = get_tick_count();
+            } else {
+                task_yield();
+                if (get_tick_count() - timeout_start > 10 * TICK_HZ) {
+                    /* Timeout — delete the partial file */
+                    fs_delete(name);
+                    uart_puts("ERR timeout\n");
+                    return -1;
+                }
+            }
+        }
+
+        /* Update CRC */
+        for (uint32_t i = 0; i < got; i++) {
+            crc ^= (uint16_t)sec_buf[i] << 8;
+            for (int b = 0; b < 8; b++) {
+                if (crc & 0x8000)
+                    crc = (crc << 1) ^ 0x1021;
+                else
+                    crc <<= 1;
+            }
+        }
+
+        received += got;
+
+        /* Pad remaining bytes in sector to 0xFF */
+        for (uint32_t i = got; i < FS_SECTOR_SIZE; i++)
+            sec_buf[i] = 0xFF;
+
+        /* Write sector to flash */
+        uint32_t addr = FS_DATA_ADDR + (uint32_t)(start + sec) * FS_SECTOR_SIZE;
+        flash_erase_sector(addr);
+        flash_write(addr, sec_buf, FS_SECTOR_SIZE);
+
+        /* ACK this sector — PC waits for '#' before sending next chunk */
+        uart_putc('#');
+    }
+
+    /* Done */
+    uart_puts("\nOK ");
+    uart_put_hex(crc);
+    uart_puts("\n");
+
+    return (int)crc;
+}
+
 int fs_mounted(void)
 {
     return mounted;
+}
+
+uint16_t fs_crc16(const uint8_t *data, uint32_t len)
+{
+    uint16_t crc = 0xFFFF;
+    for (uint32_t i = 0; i < len; i++) {
+        crc ^= (uint16_t)data[i] << 8;
+        for (int b = 0; b < 8; b++) {
+            if (crc & 0x8000)
+                crc = (crc << 1) ^ 0x1021;
+            else
+                crc <<= 1;
+        }
+    }
+    return crc;
 }
 
 } /* extern "C" */

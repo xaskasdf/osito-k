@@ -76,7 +76,7 @@ The kernel provides the following capabilities:
     storage. Inspired by the BBC Micro's DFS.
   - **Interrupt-driven serial communications** with a 64-byte receive
     buffer and cooperative mutual exclusion for output operations.
-  - **An interactive operator console** with 15 built-in commands for
+  - **An interactive operator console** with 19 built-in commands for
     system monitoring, file operations, and hardware control.
 
 
@@ -536,16 +536,20 @@ power cycles.
 **Shell Commands:**
 
 ```
-  COMMAND                DESCRIPTION
-  -------                -----------
-  fs format              Create a fresh filesystem (erases all files)
-  fs ls                  List all files with size and sector count
-  fs df                  Display free space in KB and bytes
-  fs write NAME DATA     Create a file with the given text content
-  fs cat NAME            Print file contents to the console
-  fs xxd NAME            Hex dump of file contents (up to 256 bytes)
-  fs rm NAME             Delete a file and reclaim its sectors
-  fs help                Show filesystem command summary
+  COMMAND                  DESCRIPTION
+  -------                  -----------
+  fs format                Create a fresh filesystem (erases all files)
+  fs ls                    List all files with size and sector count
+  fs df                    Display free space in KB and bytes
+  fs write NAME DATA       Create a file with the given text content
+  fs overwrite NAME DATA   Overwrite an existing file (or create new)
+  fs append NAME DATA      Append data to an existing file
+  fs mv OLD NEW            Rename a file
+  fs cat NAME              Print file contents to the console
+  fs xxd NAME              Hex dump of file contents (up to 256 bytes)
+  fs rm NAME               Delete a file and reclaim its sectors
+  fs upload NAME SIZE      Receive binary file via UART (see below)
+  fs help                  Show filesystem command summary
 ```
 
 **Sample filesystem session:**
@@ -558,29 +562,56 @@ power cycles.
   osito> fs write hello.txt Hello from OsitoK!
   wrote 18 bytes to 'hello.txt'
 
-  osito> fs write kernel.dat ABCDEF12345678
-  wrote 14 bytes to 'kernel.dat'
-
-  osito> fs ls
-  Name                     Size  Sec
-  hello.txt                18  1
-  kernel.dat               14  1
+  osito> fs overwrite hello.txt Goodbye!
+  wrote 8 bytes to 'hello.txt'
 
   osito> fs cat hello.txt
-  Hello from OsitoK!
+  Goodbye!
 
-  osito> fs xxd kernel.dat
-  0x00000000: 41 42 43 44 45 46 31 32 33 34 35 36 37 38
+  osito> fs append hello.txt  See you later.
+  appended 14 bytes to 'hello.txt'
 
-  osito> fs df
-  Free: 3824 KB (3915776 bytes)
+  osito> fs cat hello.txt
+  Goodbye! See you later.
 
-  osito> fs rm hello.txt
-  deleted
+  osito> fs mv hello.txt message.txt
+  renamed 'hello.txt' -> 'message.txt'
 
   osito> fs ls
   Name                     Size  Sec
-  kernel.dat               14  1
+  message.txt              22  1
+
+  osito> fs rm message.txt
+  deleted
+```
+
+**Binary Upload Protocol:**
+
+The `fs upload` command enables transfer of binary files from a host
+computer to OsitoFS. This is essential for loading program images that
+exceed the shell's 128-byte command buffer.
+
+```
+  PROTOCOL SEQUENCE
+  -----------------
+  1. Host sends:   fs upload <name> <size>\r\n
+  2. Device sends: READY\n
+  3. For each 4096-byte sector:
+     a. Host sends up to 4096 bytes of raw data
+     b. Device writes sector to flash
+     c. Device sends '#' (ACK)
+  4. Device sends: \nOK 0x<crc16>\n
+```
+
+The host MUST wait for the '#' acknowledgment before transmitting the
+next sector. This prevents overflow of the 64-byte UART receive buffer
+during flash erase/write operations (~30 ms per sector).
+
+A Python upload utility is provided at `tools/upload.py`:
+
+```
+  py tools/upload.py COM4 game.bin game.bin
+  py tools/upload.py COM4 data.bin data.bin --baud 74880
 ```
 
       NOTE: The filesystem uses ROM SPI functions (SPIRead, SPIWrite,
@@ -639,7 +670,7 @@ power cycles.
                     +----+----+  +-----+-----+
                     |   IPC   |  |   SHELL   |
                     | sem/mq  |  | COMMANDS  |
-                    | swtimer |  | 15 cmds   |
+                    | swtimer |  | 19 cmds   |
                     +---------+  +-----+-----+
                                        |
               +----------+-------------+-------------+
@@ -776,8 +807,8 @@ power cycles.
 
   Filesystem
   ~~~~~~~~~~
-  src/fs/ositofs.cpp                 421   Flat filesystem on SPI flash
-  src/fs/ositofs.h                    84   Filesystem API declarations
+  src/fs/ositofs.cpp                 724   Flat filesystem on SPI flash
+  src/fs/ositofs.h                   101   Filesystem API declarations
 
   Drivers
   ~~~~~~~
@@ -788,7 +819,7 @@ power cycles.
 
   User interface
   ~~~~~~~~~~~~~~
-  src/shell/shell.cpp                618   Interactive console, 15 commands
+  src/shell/shell.cpp                744   Interactive console, 19 commands
   src/shell/shell.h                   20   Shell entry point declaration
   src/main.cpp                       107   kernel_main: init and launch
 
@@ -801,6 +832,10 @@ power cycles.
   include/hw/esp8266_iomux.h          70   Pin multiplexing definitions
   include/hw/esp8266_rom.h            68   ROM function prototypes
 
+  Tools
+  ~~~~~
+  tools/upload.py                    171   Binary upload utility (Python)
+
   Build system
   ~~~~~~~~~~~~
   ld/osito.ld                         84   Linker script (IRAM/DRAM/irom0)
@@ -809,7 +844,7 @@ power cycles.
   tools/flash.sh                      45   Flash utility script
   tools/monitor.sh                    17   Serial monitor script
                                    -----
-  TOTAL                            4,402   lines of source
+  TOTAL                            5,019   lines of source
 ```
 
 
@@ -839,11 +874,12 @@ current release:
      No mechanism for graceful task exit and resource reclamation is
      provided in this release.
 
-  6. **Filesystem Limitations.** Files are allocated contiguously and
-     cannot grow after creation. To modify a file, the operator must
-     delete it and create it anew. External fragmentation may prevent
-     allocation of large files even when sufficient total free space
-     exists.
+  6. **Filesystem Limitations.** Files are allocated contiguously.
+     `fs_append` can extend a file only within its pre-allocated sectors;
+     it cannot reallocate. `fs_overwrite` will delete and recreate if the
+     new data exceeds the original sector count. External fragmentation
+     may prevent allocation of large files even when sufficient total
+     free space exists.
 
   7. **SPI Flash Alignment.** All SPI flash operations require 4-byte
      aligned buffers. The filesystem handles this internally, but
@@ -879,7 +915,7 @@ current release:
 |  NUMBER OF WRITE CYCLES. THE AUTHORS ACCEPT NO RESPONSIBILITY FOR          |
 |  DATA LOSS DUE TO FLASH WEAR, POWER INTERRUPTION DURING WRITE             |
 |  OPERATIONS, OR THE OPERATOR'S FAILURE TO MAINTAIN ADEQUATE BACKUPS        |
-|  OF IRREPLACEABLE FILES CONTAINING 4,402 LINES OF KERNEL CODE.            |
+|  OF IRREPLACEABLE FILES CONTAINING 5,019 LINES OF KERNEL CODE.            |
 |                                                                            |
 +============================================================================+
 ```
@@ -895,6 +931,6 @@ current release:
   Written for the Xtensa LX106 processor.
   Assembled and tested on the Wemos D1 Mini computing module.
 
-  4,402 lines of code. 80 KB of RAM. 3.8 MB of persistent storage.
+  5,019 lines of code. 80 KB of RAM. 3.8 MB of persistent storage.
   No bears were harmed in the making of this kernel.
 ```

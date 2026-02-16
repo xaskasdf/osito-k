@@ -157,13 +157,17 @@ static void cmd_fs(const char *args)
 
     if (*args == '\0' || ets_strcmp(args, "help") == 0) {
         uart_puts("fs commands:\n");
-        uart_puts("  fs format      - create filesystem\n");
-        uart_puts("  fs ls          - list files\n");
-        uart_puts("  fs df          - free space\n");
-        uart_puts("  fs cat NAME    - print file\n");
+        uart_puts("  fs format          - create filesystem\n");
+        uart_puts("  fs ls              - list files\n");
+        uart_puts("  fs df              - free space\n");
+        uart_puts("  fs cat NAME        - print file\n");
         uart_puts("  fs write NAME DATA - write text file\n");
-        uart_puts("  fs rm NAME     - delete file\n");
-        uart_puts("  fs xxd NAME    - hex dump file\n");
+        uart_puts("  fs overwrite NAME DATA - overwrite file\n");
+        uart_puts("  fs append NAME DATA - append to file\n");
+        uart_puts("  fs mv OLD NEW      - rename file\n");
+        uart_puts("  fs rm NAME         - delete file\n");
+        uart_puts("  fs xxd NAME        - hex dump file\n");
+        uart_puts("  fs upload NAME SIZE - binary upload\n");
         return;
     }
 
@@ -272,6 +276,128 @@ static void cmd_fs(const char *args)
             uart_puts(name);
             uart_puts("'\n");
         }
+        return;
+    }
+
+    if (ets_strncmp(args, "overwrite ", 10) == 0) {
+        const char *rest = args + 10;
+        while (*rest == ' ') rest++;
+
+        char name[FS_NAME_LEN];
+        int ni = 0;
+        while (*rest && *rest != ' ' && ni < FS_NAME_LEN - 1)
+            name[ni++] = *rest++;
+        name[ni] = '\0';
+
+        if (ni == 0) { uart_puts("usage: fs overwrite <name> <data>\n"); return; }
+        while (*rest == ' ') rest++;
+        if (*rest == '\0') { uart_puts("usage: fs overwrite <name> <data>\n"); return; }
+
+        uint32_t len = 0;
+        const char *p = rest;
+        while (*p++) len++;
+
+        if (fs_overwrite(name, rest, len) == 0) {
+            uart_puts("wrote ");
+            uart_put_dec(len);
+            uart_puts(" bytes to '");
+            uart_puts(name);
+            uart_puts("'\n");
+        }
+        return;
+    }
+
+    if (ets_strncmp(args, "append ", 7) == 0) {
+        const char *rest = args + 7;
+        while (*rest == ' ') rest++;
+
+        char name[FS_NAME_LEN];
+        int ni = 0;
+        while (*rest && *rest != ' ' && ni < FS_NAME_LEN - 1)
+            name[ni++] = *rest++;
+        name[ni] = '\0';
+
+        if (ni == 0) { uart_puts("usage: fs append <name> <data>\n"); return; }
+        while (*rest == ' ') rest++;
+        if (*rest == '\0') { uart_puts("usage: fs append <name> <data>\n"); return; }
+
+        uint32_t len = 0;
+        const char *p = rest;
+        while (*p++) len++;
+
+        if (fs_append(name, rest, len) == 0) {
+            uart_puts("appended ");
+            uart_put_dec(len);
+            uart_puts(" bytes to '");
+            uart_puts(name);
+            uart_puts("'\n");
+        } else {
+            uart_puts("append failed\n");
+        }
+        return;
+    }
+
+    if (ets_strncmp(args, "mv ", 3) == 0) {
+        const char *rest = args + 3;
+        while (*rest == ' ') rest++;
+
+        char old_name[FS_NAME_LEN];
+        int ni = 0;
+        while (*rest && *rest != ' ' && ni < FS_NAME_LEN - 1)
+            old_name[ni++] = *rest++;
+        old_name[ni] = '\0';
+
+        if (ni == 0) { uart_puts("usage: fs mv <old> <new>\n"); return; }
+        while (*rest == ' ') rest++;
+
+        char new_name[FS_NAME_LEN];
+        ni = 0;
+        while (*rest && *rest != ' ' && ni < FS_NAME_LEN - 1)
+            new_name[ni++] = *rest++;
+        new_name[ni] = '\0';
+
+        if (ni == 0) { uart_puts("usage: fs mv <old> <new>\n"); return; }
+
+        if (fs_rename(old_name, new_name) == 0) {
+            uart_puts("renamed '");
+            uart_puts(old_name);
+            uart_puts("' -> '");
+            uart_puts(new_name);
+            uart_puts("'\n");
+        } else {
+            uart_puts("rename failed\n");
+        }
+        return;
+    }
+
+    if (ets_strncmp(args, "upload ", 7) == 0) {
+        const char *rest = args + 7;
+        while (*rest == ' ') rest++;
+
+        /* Parse filename */
+        char name[FS_NAME_LEN];
+        int ni = 0;
+        while (*rest && *rest != ' ' && ni < FS_NAME_LEN - 1)
+            name[ni++] = *rest++;
+        name[ni] = '\0';
+
+        if (ni == 0) { uart_puts("usage: fs upload <name> <size>\n"); return; }
+        while (*rest == ' ') rest++;
+
+        /* Parse size */
+        if (*rest < '0' || *rest > '9') {
+            uart_puts("usage: fs upload <name> <size>\n");
+            return;
+        }
+        uint32_t total_size = 0;
+        while (*rest >= '0' && *rest <= '9') {
+            total_size = total_size * 10 + (*rest - '0');
+            rest++;
+        }
+        if (total_size == 0) { uart_puts("size must be > 0\n"); return; }
+
+        /* fs_upload handles everything: alloc, UART read, flash write, ACK */
+        fs_upload(name, total_size);
         return;
     }
 
