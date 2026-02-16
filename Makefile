@@ -13,8 +13,9 @@ OBJCOPY = $(TOOLCHAIN)-objcopy
 OBJDUMP = $(TOOLCHAIN)-objdump
 SIZE    = $(TOOLCHAIN)-size
 
-# esptool
-ESPTOOL ?= python -m esptool
+# Python + esptool (use Windows py launcher by default)
+PYTHON  ?= py
+ESPTOOL  = $(PYTHON) -m esptool
 PORT    ?= COM4
 BAUD    ?= 460800
 
@@ -24,10 +25,11 @@ INCDIR   = include
 BUILDDIR = build
 LDDIR    = ld
 
-# Flash parameters (Wemos D1: 4MB, DOUT mode)
+# Flash parameters (Wemos D1: 4MB, DOUT mode, image v1)
 FLASH_MODE  = dout
 FLASH_SIZE  = 4MB
 FLASH_FREQ  = 40m
+IMAGE_VER   = 1
 
 # Compiler flags
 COMMON_FLAGS = \
@@ -79,9 +81,11 @@ C_OBJS   = $(patsubst $(SRCDIR)/%.c,$(BUILDDIR)/%.o,$(C_SRCS))
 CXX_OBJS = $(patsubst $(SRCDIR)/%.cpp,$(BUILDDIR)/%.o,$(CXX_SRCS))
 OBJS     = $(ASM_OBJS) $(C_OBJS) $(CXX_OBJS)
 
-# Output
-ELF = $(BUILDDIR)/osito.elf
-BIN = $(BUILDDIR)/osito.bin
+# Output files
+# esptool elf2image with -o build/osito produces build/osito0x00000.bin
+ELF     = $(BUILDDIR)/osito.elf
+BIN_PFX = $(BUILDDIR)/osito
+BIN     = $(BIN_PFX)0x00000.bin
 
 # =============================================================================
 
@@ -95,41 +99,43 @@ all: $(BIN)
 # Link
 $(ELF): $(OBJS)
 	@echo "  LD    $@"
-	$(LD) $(LDFLAGS) -o $@ $^ -lgcc
+	@$(LD) $(LDFLAGS) -o $@ $^ -lgcc
 
 # Generate flash binary using esptool
 $(BIN): $(ELF)
 	@echo "  BIN   $@"
-	$(ESPTOOL) --chip esp8266 elf2image --flash_mode $(FLASH_MODE) --flash_size $(FLASH_SIZE) \
-		--flash_freq $(FLASH_FREQ) --version 2 -o $@ $<
+	@$(ESPTOOL) --chip esp8266 elf2image \
+		--flash-mode $(FLASH_MODE) --flash-size $(FLASH_SIZE) \
+		--flash-freq $(FLASH_FREQ) --version $(IMAGE_VER) \
+		-o $(BIN_PFX) $<
 
 # Compile assembly
 $(BUILDDIR)/%.o: $(SRCDIR)/%.S
 	@mkdir -p $(dir $@)
 	@echo "  AS    $<"
-	$(AS) $(ASFLAGS) -c -o $@ $<
+	@$(AS) $(ASFLAGS) -c -o $@ $<
 
 # Compile C
 $(BUILDDIR)/%.o: $(SRCDIR)/%.c
 	@mkdir -p $(dir $@)
 	@echo "  CC    $<"
-	$(CC) $(CFLAGS) -c -o $@ $<
+	@$(CC) $(CFLAGS) -c -o $@ $<
 
 # Compile C++
 $(BUILDDIR)/%.o: $(SRCDIR)/%.cpp
 	@mkdir -p $(dir $@)
 	@echo "  CXX   $<"
-	$(CXX) $(CXXFLAGS) -c -o $@ $<
+	@$(CXX) $(CXXFLAGS) -c -o $@ $<
 
-# Flash
+# Flash to board
 flash: $(BIN)
-	$(ESPTOOL) --chip esp8266 --port $(PORT) --baud $(BAUD) write_flash \
-		--flash_mode $(FLASH_MODE) --flash_size $(FLASH_SIZE) --flash_freq $(FLASH_FREQ) \
+	$(ESPTOOL) --chip esp8266 --port $(PORT) --baud $(BAUD) write-flash \
+		--flash-mode $(FLASH_MODE) --flash-size $(FLASH_SIZE) --flash-freq $(FLASH_FREQ) \
 		0x00000 $(BIN)
 
-# Serial monitor
+# Serial console
 monitor:
-	python -m serial.tools.miniterm $(PORT) 115200
+	$(PYTHON) tools/console.py $(PORT)
 
 # Disassembly dump
 dump: $(ELF)
