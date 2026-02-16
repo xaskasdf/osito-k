@@ -15,6 +15,7 @@
  */
 
 #include "kernel/task.h"
+#include "kernel/timer_sw.h"
 #include "drivers/uart.h"
 
 /* Xtensa EXCCAUSE values */
@@ -63,6 +64,9 @@ void os_exception_handler(void)
                 pool[i].state = TASK_STATE_READY;
             }
         }
+
+        /* Process software timers */
+        swtimer_tick();
 
         need_schedule = 1;
     }

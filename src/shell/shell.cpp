@@ -14,6 +14,7 @@
 #include "mem/pool_alloc.h"
 #include "kernel/task.h"
 #include "kernel/mq.h"
+#include "kernel/timer_sw.h"
 
 /* IPC queue to heartbeat (defined in main.cpp) */
 extern mq_t hb_mq;
@@ -109,6 +110,7 @@ static void cmd_help(void)
     uart_puts("  mem     - memory pool status\n");
     uart_puts("  ticks   - uptime in ticks\n");
     uart_puts("  ping    - send IPC message to heartbeat\n");
+    uart_puts("  timer   - test 1s software timer\n");
     uart_puts("  help    - this message\n");
     uart_puts("  reboot  - software reset\n");
 }
@@ -131,6 +133,41 @@ static void cmd_ping(void)
     } else {
         uart_puts("queue full!\n");
     }
+}
+
+/* Software timer demo: fires once after 1 second */
+static swtimer_t demo_timer;
+static volatile uint32_t demo_timer_fired = 0;
+
+static void demo_timer_cb(void *arg)
+{
+    (void)arg;
+    demo_timer_fired++;
+}
+
+static void cmd_timer(void)
+{
+    swtimer_init(&demo_timer, demo_timer_cb, nullptr);
+    demo_timer_fired = 0;
+    swtimer_start(&demo_timer, 100, SWTIMER_ONESHOT);
+    uart_puts("timer: armed 1s one-shot... ");
+
+    /* Wait for it to fire (busy-wait is fine for demo) */
+    uint32_t start = get_tick_count();
+    while (!demo_timer_fired && (get_tick_count() - start) < 200) {
+        task_yield();
+    }
+
+    if (demo_timer_fired) {
+        uart_puts("FIRED! (");
+        uart_put_dec(get_tick_count() - start);
+        uart_puts(" ticks)\n");
+    } else {
+        uart_puts("timeout!\n");
+    }
+    uart_puts("active timers: ");
+    uart_put_dec(swtimer_active_count());
+    uart_puts("\n");
 }
 
 static void cmd_reboot(void)
@@ -162,6 +199,8 @@ static void process_command(const char *cmd)
         cmd_help();
     else if (ets_strcmp(cmd, "ping") == 0)
         cmd_ping();
+    else if (ets_strcmp(cmd, "timer") == 0)
+        cmd_timer();
     else if (ets_strcmp(cmd, "reboot") == 0)
         cmd_reboot();
     else {
