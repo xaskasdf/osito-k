@@ -5,12 +5,14 @@
  *   ps     - list all tasks with state and tick count
  *   mem    - show memory pool statistics
  *   ticks  - show current tick count
+ *   gpio   - read/write GPIO pins
  *   help   - show available commands
  *   reboot - software reset
  */
 
 #include "shell/shell.h"
 #include "drivers/uart.h"
+#include "drivers/gpio.h"
 #include "mem/pool_alloc.h"
 #include "kernel/task.h"
 #include "kernel/mq.h"
@@ -109,6 +111,7 @@ static void cmd_help(void)
     uart_puts("  ps      - list tasks\n");
     uart_puts("  mem     - memory pool status\n");
     uart_puts("  ticks   - uptime in ticks\n");
+    uart_puts("  gpio    - read/write GPIO pins\n");
     uart_puts("  ping    - send IPC message to heartbeat\n");
     uart_puts("  timer   - test 1s software timer\n");
     uart_puts("  help    - this message\n");
@@ -170,6 +173,105 @@ static void cmd_timer(void)
     uart_puts("\n");
 }
 
+/* ====== GPIO command ====== */
+
+static int parse_pin(const char *s, uint8_t *pin)
+{
+    while (*s == ' ') s++;
+    if (*s < '0' || *s > '9') return -1;
+    uint8_t val = 0;
+    while (*s >= '0' && *s <= '9') {
+        val = val * 10 + (*s - '0');
+        s++;
+    }
+    if (val > 16) return -1;
+    *pin = val;
+    return 0;
+}
+
+static void cmd_gpio(const char *args)
+{
+    while (*args == ' ') args++;
+
+    if (*args == '\0') {
+        /* Show all safe pin states */
+        struct { uint8_t pin; const char *label; } pins[] = {
+            { 0, "D3"}, { 2, "D4/LED"}, { 4, "D2"}, { 5, "D1"},
+            {12, "D6"}, {13, "D7"}, {14, "D5"}, {15, "D8"}, {16, "D0"},
+        };
+        uart_puts("Pin  Dir  Val  Wemos\n");
+        for (int i = 0; i < 9; i++) {
+            uint8_t p = pins[i].pin;
+            if (p < 10) uart_puts(" ");
+            uart_put_dec(p);
+            uart_puts("   ");
+            /* Direction */
+            if (p == 16)
+                uart_puts((RTC_GPIO_ENABLE & 1) ? "out" : "in ");
+            else
+                uart_puts((GPIO_ENABLE & (1 << p)) ? "out" : "in ");
+            uart_puts("  ");
+            uart_put_dec(gpio_read(p));
+            uart_puts("    ");
+            uart_puts(pins[i].label);
+            uart_puts("\n");
+        }
+        return;
+    }
+
+    uint8_t pin;
+
+    if (ets_strncmp(args, "read ", 5) == 0) {
+        if (parse_pin(args + 5, &pin) < 0) {
+            uart_puts("usage: gpio read <0-16>\n"); return;
+        }
+        uart_puts("GPIO");
+        uart_put_dec(pin);
+        uart_puts(" = ");
+        uart_put_dec(gpio_read(pin));
+        uart_puts("\n");
+    }
+    else if (ets_strncmp(args, "high ", 5) == 0) {
+        if (parse_pin(args + 5, &pin) < 0) {
+            uart_puts("usage: gpio high <0-16>\n"); return;
+        }
+        gpio_mode(pin, GPIO_MODE_OUTPUT);
+        gpio_write(pin, 1);
+        uart_puts("GPIO");
+        uart_put_dec(pin);
+        uart_puts(" -> HIGH\n");
+    }
+    else if (ets_strncmp(args, "low ", 4) == 0) {
+        if (parse_pin(args + 4, &pin) < 0) {
+            uart_puts("usage: gpio low <0-16>\n"); return;
+        }
+        gpio_mode(pin, GPIO_MODE_OUTPUT);
+        gpio_write(pin, 0);
+        uart_puts("GPIO");
+        uart_put_dec(pin);
+        uart_puts(" -> LOW\n");
+    }
+    else if (ets_strcmp(args, "blink") == 0) {
+        uart_puts("blinking LED (GPIO2) 5x...\n");
+        gpio_mode(2, GPIO_MODE_OUTPUT);
+        for (int i = 0; i < 5; i++) {
+            gpio_write(2, 0);  /* LED on (active low) */
+            task_delay_ticks(25);
+            gpio_write(2, 1);  /* LED off */
+            task_delay_ticks(25);
+        }
+        uart_puts("done\n");
+    }
+    else {
+        uart_puts("gpio commands:\n");
+        uart_puts("  gpio          - show all pins\n");
+        uart_puts("  gpio read N   - read pin\n");
+        uart_puts("  gpio high N   - set output high\n");
+        uart_puts("  gpio low N    - set output low\n");
+        uart_puts("  gpio blink    - blink LED (GPIO2)\n");
+    }
+}
+
 static void cmd_reboot(void)
 {
     uart_puts("Rebooting...\n");
@@ -197,6 +299,8 @@ static void process_command(const char *cmd)
         cmd_ticks();
     else if (ets_strcmp(cmd, "help") == 0)
         cmd_help();
+    else if (ets_strncmp(cmd, "gpio", 4) == 0 && (cmd[4] == ' ' || cmd[4] == '\0'))
+        cmd_gpio(cmd + 4);
     else if (ets_strcmp(cmd, "ping") == 0)
         cmd_ping();
     else if (ets_strcmp(cmd, "timer") == 0)
