@@ -13,6 +13,7 @@
 #include "osito.h"
 #include "drivers/uart.h"
 #include "mem/pool_alloc.h"
+#include "mem/heap.h"
 #include "kernel/task.h"
 #include "kernel/mq.h"
 #include "shell/shell.h"
@@ -72,8 +73,9 @@ void kernel_main(void)
     uart_puts("  Bare-metal kernel for ESP8266\n");
     uart_puts("=============================\n");
 
-    /* Initialize memory pool */
+    /* Initialize memory pool and heap */
     pool_init();
+    heap_init();
 
     /* Initialize IPC queue */
     mq_init(&hb_mq, hb_mq_buf, sizeof(hb_msg_t), 4);

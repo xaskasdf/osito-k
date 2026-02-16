@@ -14,6 +14,7 @@
 #include "drivers/uart.h"
 #include "drivers/gpio.h"
 #include "mem/pool_alloc.h"
+#include "mem/heap.h"
 #include "kernel/task.h"
 #include "kernel/mq.h"
 #include "kernel/timer_sw.h"
@@ -95,6 +96,56 @@ static void cmd_mem(void)
     uart_puts(" blocks\n");
 }
 
+static void cmd_heap(const char *args)
+{
+    while (*args == ' ') args++;
+
+    if (ets_strcmp(args, "test") == 0) {
+        /* Allocate, free, show coalescing */
+        uart_puts("alloc a=100, b=200, c=50\n");
+        void *a = heap_alloc(100);
+        void *b = heap_alloc(200);
+        void *c = heap_alloc(50);
+        uart_puts("  a="); uart_put_hex((uint32_t)a);
+        uart_puts("  b="); uart_put_hex((uint32_t)b);
+        uart_puts("  c="); uart_put_hex((uint32_t)c);
+        uart_puts("\n  used="); uart_put_dec(heap_used_total());
+        uart_puts("  free="); uart_put_dec(heap_free_total());
+        uart_puts("  frags="); uart_put_dec(heap_frag_count());
+        uart_puts("\nfree b...\n");
+        heap_free(b);
+        uart_puts("  used="); uart_put_dec(heap_used_total());
+        uart_puts("  free="); uart_put_dec(heap_free_total());
+        uart_puts("  frags="); uart_put_dec(heap_frag_count());
+        uart_puts("\nfree a, c...\n");
+        heap_free(a);
+        heap_free(c);
+        uart_puts("  used="); uart_put_dec(heap_used_total());
+        uart_puts("  free="); uart_put_dec(heap_free_total());
+        uart_puts("  frags="); uart_put_dec(heap_frag_count());
+        uart_puts("\n");
+        return;
+    }
+
+    /* Default: show heap stats */
+    uart_puts("Heap:\n");
+    uart_puts("  Total:      ");
+    uart_put_dec(HEAP_SIZE);
+    uart_puts(" bytes\n");
+    uart_puts("  Free:       ");
+    uart_put_dec(heap_free_total());
+    uart_puts(" bytes\n");
+    uart_puts("  Used:       ");
+    uart_put_dec(heap_used_total());
+    uart_puts(" bytes\n");
+    uart_puts("  Largest:    ");
+    uart_put_dec(heap_largest_free());
+    uart_puts(" bytes\n");
+    uart_puts("  Fragments:  ");
+    uart_put_dec(heap_frag_count());
+    uart_puts("\n");
+}
+
 static void cmd_ticks(void)
 {
     uint32_t t = get_tick_count();
@@ -110,6 +161,7 @@ static void cmd_help(void)
     uart_puts("OsitoK v" OSITO_VERSION_STRING " shell commands:\n");
     uart_puts("  ps      - list tasks\n");
     uart_puts("  mem     - memory pool status\n");
+    uart_puts("  heap    - heap allocator status\n");
     uart_puts("  ticks   - uptime in ticks\n");
     uart_puts("  gpio    - read/write GPIO pins\n");
     uart_puts("  ping    - send IPC message to heartbeat\n");
@@ -295,6 +347,8 @@ static void process_command(const char *cmd)
         cmd_ps();
     else if (ets_strcmp(cmd, "mem") == 0)
         cmd_mem();
+    else if (ets_strncmp(cmd, "heap", 4) == 0 && (cmd[4] == ' ' || cmd[4] == '\0'))
+        cmd_heap(cmd + 4);
     else if (ets_strcmp(cmd, "ticks") == 0)
         cmd_ticks();
     else if (ets_strcmp(cmd, "help") == 0)

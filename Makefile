@@ -73,6 +73,7 @@ CXX_SRCS = \
 	$(SRCDIR)/kernel/mq.cpp \
 	$(SRCDIR)/kernel/timer_sw.cpp \
 	$(SRCDIR)/mem/pool_alloc.cpp \
+	$(SRCDIR)/mem/heap.cpp \
 	$(SRCDIR)/drivers/uart.cpp \
 	$(SRCDIR)/drivers/gpio.cpp \
 	$(SRCDIR)/shell/shell.cpp \

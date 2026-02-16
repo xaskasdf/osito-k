@@ -30,6 +30,9 @@
 #define POOL_NUM_BLOCKS 256
 #define POOL_TOTAL_SIZE (POOL_BLOCK_SIZE * POOL_NUM_BLOCKS)  /* 8KB */
 
+/* Heap configuration */
+#define HEAP_SIZE       8192  /* 8KB heap for variable-size allocations */
+
 /* UART configuration */
 #define UART_BAUD       115200
 #define UART_RX_BUF_SIZE 64
