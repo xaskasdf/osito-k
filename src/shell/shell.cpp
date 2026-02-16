@@ -169,6 +169,7 @@ static void cmd_help(void)
     uart_puts("  pri N P - set task N priority to P\n");
     uart_puts("  ping    - send IPC message to heartbeat\n");
     uart_puts("  timer   - test 1s software timer\n");
+    uart_puts("  uname   - system info\n");
     uart_puts("  help    - this message\n");
     uart_puts("  reboot  - software reset\n");
 }
@@ -368,6 +369,21 @@ static void cmd_pri(const char *args)
     uart_puts("\n");
 }
 
+static void cmd_uname(void)
+{
+    uart_puts("OsitoK v" OSITO_VERSION_STRING " xtensa-lx106 ESP8266 @ ");
+    uart_put_dec(CPU_FREQ_HZ / 1000000);
+    uart_puts("MHz DRAM:");
+    uart_put_dec((DRAM_END - DRAM_START + 1) / 1024);
+    uart_puts("KB IRAM:");
+    uart_put_dec((IRAM_END - IRAM_START + 1) / 1024);
+    uart_puts("KB tick:");
+    uart_put_dec(TICK_HZ);
+    uart_puts("Hz tasks:");
+    uart_put_dec(MAX_TASKS);
+    uart_puts("\n");
+}
+
 static void cmd_reboot(void)
 {
     uart_puts("Rebooting...\n");
@@ -405,6 +421,8 @@ static void process_command(const char *cmd)
         cmd_ping();
     else if (ets_strcmp(cmd, "timer") == 0)
         cmd_timer();
+    else if (ets_strcmp(cmd, "uname") == 0)
+        cmd_uname();
     else if (ets_strcmp(cmd, "reboot") == 0)
         cmd_reboot();
     else {
