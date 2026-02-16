@@ -9,7 +9,7 @@
 |                                                                            |
 |                        OPERATOR'S REFERENCE MANUAL                         |
 |                                                                            |
-|                          REVISION 1 -- FEB 2026                            |
+|                          REVISION 2 -- FEB 2026                            |
 |                                                                            |
 +============================================================================+
 ```
@@ -36,11 +36,13 @@
   VI.   LOADING THE SYSTEM INTO MEMORY .........................      6
   VII.  SYSTEM INITIALIZATION SEQUENCE .........................      7
   VIII. OPERATOR CONSOLE COMMANDS ..............................      8
-  IX.   SYSTEM ARCHITECTURE ....................................      9
-  X.    MEMORY MAP .............................................     10
-  XI.   SOURCE FILE DIRECTORY ..................................     11
-  XII.  KNOWN LIMITATIONS ......................................     12
-  XIII. WARRANTY AND DISCLAIMER ................................     13
+  IX.   INTER-PROCESS COMMUNICATION ............................      9
+  X.    FILESYSTEM (OsitoFS) ...................................     10
+  XI.   SYSTEM ARCHITECTURE ....................................     11
+  XII.  MEMORY MAP .............................................     12
+  XIII. SOURCE FILE DIRECTORY ..................................     13
+  XIV.  KNOWN LIMITATIONS ......................................     14
+  XV.   WARRANTY AND DISCLAIMER ................................     15
 ```
 
 ---
@@ -54,18 +56,28 @@ with the hardware registers of the processing unit.
 
 The kernel provides the following capabilities:
 
-  - **Preemptive round-robin task scheduling** at a rate of 100 operations
-    per second, ensuring fair distribution of the processor's considerable
-    computational resources among all active programs.
+  - **Priority-based preemptive scheduling** at a rate of 100 ticks per
+    second. Higher-priority tasks always preempt lower-priority ones;
+    tasks at the same priority level are scheduled round-robin.
   - **Hardware interrupt-driven context switching** with full preservation
     of all 16 general-purpose registers, the Processor Status word, the
     Shift Amount Register, and the Exception Program Counter.
-  - **Fixed-block memory allocation** providing 8,192 bytes of dynamically
-    assignable storage organized in 256 blocks of 32 bytes each.
+  - **Two-tier memory allocation**: a fixed-block pool (8 KB, 256 x 32-byte
+    blocks) for fast O(1) alloc/free, and a general-purpose heap allocator
+    (8 KB) with first-fit allocation and automatic coalescing.
+  - **Inter-process communication** via counting semaphores, mutexes,
+    and bounded message queues with blocking and non-blocking modes.
+  - **Software timers** with one-shot and periodic modes, serviced by
+    the kernel tick interrupt at zero additional hardware cost.
+  - **General-purpose I/O** with automatic IOMUX configuration for all
+    17 GPIO pins, including the special RTC-domain GPIO16.
+  - **Flat filesystem (OsitoFS)** on SPI flash with contiguous allocation,
+    bitmap-based sector management, and up to 128 files on ~3.8 MB of
+    storage. Inspired by the BBC Micro's DFS.
   - **Interrupt-driven serial communications** with a 64-byte receive
     buffer and cooperative mutual exclusion for output operations.
-  - **An interactive operator console** with built-in diagnostic commands
-    for system monitoring and administration.
+  - **An interactive operator console** with 15 built-in commands for
+    system monitoring, file operations, and hardware control.
 
 
 ## II. HARDWARE SPECIFICATIONS
@@ -193,8 +205,9 @@ The assembler will process all source modules and produce the following
 output files:
 
 ```
-  build/osito.elf         Executable and Linkable Format image
-  build/osito.map         Memory allocation map
+  build/osito.elf              Executable and Linkable Format image
+  build/osito.map              Memory allocation map
+  build/osito0x00000.bin       Binary image for flash programming
 ```
 
 Upon successful assembly, the system will display a summary of memory
@@ -203,23 +216,12 @@ utilization:
 ```
   === OsitoK build complete ===
      text    data     bss     dec     hex filename
-     3546     968   21824   26338    66e2 build/osito.elf
+    10458    2924   33916   47298    b8c2 build/osito.elf
 ```
 
-      NOTE: The .bss segment includes all task stacks and the memory
-      pool, which accounts for the majority of RAM allocation.
-
-To convert the ELF image into a format suitable for the flash memory,
-execute:
-
-```
-  py -m esptool --chip esp8266 elf2image \
-      --flash_mode dout --flash_size 4MB \
-      --flash_freq 40m --version 1 \
-      -o build/osito build/osito.elf
-```
-
-This produces the binary image file `build/osito0x00000.bin`.
+      NOTE: The .bss segment includes all task stacks, the memory pool,
+      the heap arena, and the filesystem sector buffer, which accounts
+      for the majority of RAM allocation.
 
       IMPORTANT: The image version parameter MUST be set to 1.
       Version 2 images are not compatible with this hardware.
@@ -235,6 +237,12 @@ via the USB cable.
 Windows systems).
 
 **Step 3.** Transfer the system image to the flash memory:
+
+```
+  make flash
+```
+
+Or manually:
 
 ```
   py -m esptool --chip esp8266 --port COM4 --baud 460800 \
@@ -272,10 +280,13 @@ sequence automatically:
     3      nosdk_init                         Disable watchdog, PLL to 80 MHz
     4      uart_init                          Serial port: 115200 8N1, RX interrupts
     5      pool_init                          Memory pool: 256 blocks x 32 bytes
-    6      sched_init                         Scheduler: idle task created
-    7      task_create (x2)                   Heartbeat and Shell tasks registered
-    8      timer_init                         FRC1 armed: 100 Hz, prescaler /16
-    9      sched_start                        Context loaded, rfe — system live
+    6      heap_init                          Heap allocator: 8192 bytes
+    7      fs_init                            Mount filesystem (if formatted)
+    8      mq_init                            IPC message queue: 4 slots
+    9      sched_init                         Scheduler: idle task created
+   10      task_create (x2)                   Heartbeat (pri=1) and Shell (pri=2)
+   11      timer_init                         FRC1 armed: 100 Hz, prescaler /16
+   12      sched_start                        Context loaded, rfe — system live
 ```
 
 The operator console will display the following banner:
@@ -285,14 +296,17 @@ The operator console will display the following banner:
     OsitoK v0.1
     Bare-metal kernel for ESP8266
   =============================
-  timer: FRC1 configured at 100 Hz (load=50000)
   pool: initialized 256 blocks x 32 bytes = 8192 bytes
+  heap: 8192 bytes
+  fs: mounted, 0 files, 958 sectors
   sched: initialized, idle task created
   sched: created task 'heartbeat' (id=1)
   sched: created task 'shell' (id=2)
-  sched: starting scheduler
+  timer: FRC1 configured at 100 Hz (load=50000)
 
   Starting kernel...
+
+  sched: starting scheduler
 
   osito>
 ```
@@ -315,30 +329,56 @@ The OsitoK interactive shell accepts the following commands at the
 The BACKSPACE key may be used to correct input errors.
 
 ```
-+--------+----------------------------------------------------------+
-|COMMAND | DESCRIPTION                                              |
-+--------+----------------------------------------------------------+
-|        |                                                          |
-| ps     | Display a listing of all active tasks in the system.     |
-|        | For each task, the following information is shown:       |
-|        |   ID     - Unique task identification number (0-7)       |
-|        |   State  - Current execution state (see table below)     |
-|        |   Ticks  - Number of timer ticks consumed by the task    |
-|        |   Name   - Human-readable task designation               |
-|        |                                                          |
-| mem    | Display memory pool utilization statistics, including:   |
-|        |   Block size, total blocks, free blocks, used blocks.    |
-|        |                                                          |
-| ticks  | Display the current system tick counter and the          |
-|        | equivalent elapsed time in seconds.                      |
-|        |                                                          |
-| help   | Display a summary of available commands.                 |
-|        |                                                          |
-| reboot | Perform an immediate software reset of the processor.    |
-|        | All task state will be lost. The system will reinitialize |
-|        | from the boot sequence.                                  |
-|        |                                                          |
-+--------+----------------------------------------------------------+
++----------+----------------------------------------------------------+
+| COMMAND  | DESCRIPTION                                              |
++----------+----------------------------------------------------------+
+|          |                                                          |
+| ps       | Display a listing of all active tasks in the system.     |
+|          | For each task: ID, Priority, State, Ticks, Name.         |
+|          |                                                          |
+| mem      | Display memory pool utilization statistics.               |
+|          |                                                          |
+| heap     | Display heap allocator statistics: free, used, largest   |
+|          | contiguous block, and fragmentation count.               |
+|          |                                                          |
+| heap test| Demonstrate heap allocation and coalescing by allocating |
+|          | and freeing several blocks with interleaved patterns.    |
+|          |                                                          |
+| ticks    | Display the current system tick counter and the          |
+|          | equivalent elapsed time in seconds.                      |
+|          |                                                          |
+| gpio     | Display the state of all safe GPIO pins: direction,     |
+|          | value, and Wemos D1 board label (D0-D8).                |
+|          |                                                          |
+| gpio     | Read a specific pin. Returns 0 or 1.                     |
+|   read N |                                                          |
+|          |                                                          |
+| gpio     | Set pin N as output HIGH or LOW.                         |
+|  high N  |                                                          |
+|  low N   |                                                          |
+|          |                                                          |
+| gpio     | Blink the onboard LED (GPIO2) five times.                |
+|  blink   |                                                          |
+|          |                                                          |
+| fs       | Filesystem commands (see Section X for details).         |
+|          |                                                          |
+| pri N P  | Change the priority of task N to level P. Takes effect   |
+|          | at the next scheduling decision. Priority 0 is lowest.   |
+|          |                                                          |
+| ping     | Send an IPC message to the heartbeat task. The heartbeat |
+|          | will respond with "pong N" at its next iteration.        |
+|          |                                                          |
+| timer    | Arm a one-shot software timer for 1 second. Reports     |
+|          | the actual elapsed ticks when it fires.                   |
+|          |                                                          |
+| uname    | Display system identification: kernel version, CPU,      |
+|          | clock speed, memory sizes, tick rate, max tasks.         |
+|          |                                                          |
+| help     | Display a summary of available commands.                 |
+|          |                                                          |
+| reboot   | Perform an immediate software reset of the processor.    |
+|          |                                                          |
++----------+----------------------------------------------------------+
 ```
 
 **Task States:**
@@ -357,10 +397,13 @@ The BACKSPACE key may be used to correct input errors.
 
 ```
   osito> ps
-  ID  State  Ticks  Name
-  0   ready  1  idle
-  1   ready  293  heartbeat
-  2   run    222  shell
+  ID  Pri  State  Ticks  Name
+  0   0    ready  1  idle
+  1   1    block  293  heartbeat
+  2   2    run    222  shell
+
+  osito> uname
+  OsitoK v0.1 xtensa-lx106 ESP8266 @ 80MHz DRAM:80KB IRAM:32KB tick:100Hz tasks:8
 
   osito> mem
   Memory pool:
@@ -369,12 +412,187 @@ The BACKSPACE key may be used to correct input errors.
     Free:        256 blocks
     Used:        0 blocks
 
+  osito> heap
+  Heap:
+    Total:      8192 bytes
+    Free:       8188 bytes
+    Used:       0 bytes
+    Largest:    8188 bytes
+    Fragments:  1
+
+  osito> gpio
+  Pin  Dir  Val  Wemos
+   0   in   1    D3
+   2   in   1    D4/LED
+   4   in   1    D2
+   5   in   1    D1
+  12   in   0    D6
+  13   in   0    D7
+  14   in   0    D5
+  15   in   0    D8
+  16   in   0    D0
+
+  osito> ping
+  ping 0 -> heartbeat (queued: 1)
+  [heartbeat: pong 0]
+
+  osito> timer
+  timer: armed 1s one-shot... FIRED! (100 ticks)
+  active timers: 0
+
   osito> ticks
   Tick count: 808 (8 seconds)
 ```
 
 
-## IX. SYSTEM ARCHITECTURE
+## IX. INTER-PROCESS COMMUNICATION
+
+OsitoK provides three IPC primitives for synchronization and data
+exchange between tasks:
+
+**Counting Semaphores:**
+
+```
+  FUNCTION                 DESCRIPTION
+  --------                 -----------
+  sem_init(&s, count)      Initialize with given count
+  sem_wait(&s)             Decrement; block if count is zero
+  sem_trywait(&s)          Non-blocking attempt (returns -1 if zero)
+  sem_post(&s)             Increment; wake one blocked task
+  sem_count(&s)            Read current count
+```
+
+Semaphores are used for resource counting and event signaling.
+A semaphore initialized to 1 functions as a mutual exclusion lock
+(mutex). The UART output subsystem uses this mechanism to prevent
+interleaved output from concurrent tasks.
+
+**Message Queues:**
+
+```
+  FUNCTION                 DESCRIPTION
+  --------                 -----------
+  mq_init(&q, buf, sz, n) Initialize queue with buffer, message size, depth
+  mq_send(&q, msg)         Enqueue message; block if full
+  mq_recv(&q, msg)         Dequeue message; block if empty
+  mq_trysend(&q, msg)      Non-blocking send (returns -1 if full)
+  mq_tryrecv(&q, msg)      Non-blocking receive (returns -1 if empty)
+  mq_count(&q)             Number of messages currently queued
+```
+
+Messages are copied by value. The queue is implemented as a circular
+buffer with head and tail pointers. The `ping` shell command demonstrates
+message queue operation by sending a message from the shell task to the
+heartbeat task.
+
+**Software Timers:**
+
+```
+  FUNCTION                      DESCRIPTION
+  --------                      -----------
+  swtimer_init(&t, cb, arg)     Initialize with callback and argument
+  swtimer_start(&t, tk, mode)   Arm for tk ticks (ONESHOT or PERIODIC)
+  swtimer_stop(&t)              Disarm the timer
+  swtimer_active_count()        Number of currently armed timers
+```
+
+Timers are serviced by the kernel tick ISR at 100 Hz. Callbacks execute
+in interrupt context and must be brief. The `timer` shell command
+demonstrates one-shot timer operation.
+
+
+## X. FILESYSTEM (OsitoFS)
+
+OsitoFS is a flat filesystem on SPI flash, inspired by the BBC Micro's
+Disc Filing System (DFS). It provides persistent file storage across
+power cycles.
+
+**Design Characteristics:**
+
+```
+  Property                  Value
+  --------                  -----
+  Maximum files             128
+  Maximum filename length   23 characters (+ null terminator)
+  Maximum file size         ~3.8 MB (limited by flash capacity)
+  Allocation strategy       Contiguous (no fragmentation within files)
+  Sector size               4,096 bytes
+  Data sectors available    958 (~3,832 KB)
+  Directory structure       Flat (no subdirectories)
+```
+
+**Flash Layout:**
+
+```
+  ADDRESS     SIZE     CONTENTS
+  -------     ----     --------
+  0x00000     256 KB   Kernel firmware image
+  0x40000     4 KB     Superblock (magic, version, statistics)
+  0x41000     4 KB     File table (128 entries x 32 bytes)
+  0x42000     3,832KB  Data area (958 sectors)
+  0x400000    ---      End of 4 MB flash
+```
+
+**Shell Commands:**
+
+```
+  COMMAND                DESCRIPTION
+  -------                -----------
+  fs format              Create a fresh filesystem (erases all files)
+  fs ls                  List all files with size and sector count
+  fs df                  Display free space in KB and bytes
+  fs write NAME DATA     Create a file with the given text content
+  fs cat NAME            Print file contents to the console
+  fs xxd NAME            Hex dump of file contents (up to 256 bytes)
+  fs rm NAME             Delete a file and reclaim its sectors
+  fs help                Show filesystem command summary
+```
+
+**Sample filesystem session:**
+
+```
+  osito> fs format
+  fs: formatting...
+  fs: formatted, 958 sectors (3832 KB) available
+
+  osito> fs write hello.txt Hello from OsitoK!
+  wrote 18 bytes to 'hello.txt'
+
+  osito> fs write kernel.dat ABCDEF12345678
+  wrote 14 bytes to 'kernel.dat'
+
+  osito> fs ls
+  Name                     Size  Sec
+  hello.txt                18  1
+  kernel.dat               14  1
+
+  osito> fs cat hello.txt
+  Hello from OsitoK!
+
+  osito> fs xxd kernel.dat
+  0x00000000: 41 42 43 44 45 46 31 32 33 34 35 36 37 38
+
+  osito> fs df
+  Free: 3824 KB (3915776 bytes)
+
+  osito> fs rm hello.txt
+  deleted
+
+  osito> fs ls
+  Name                     Size  Sec
+  kernel.dat               14  1
+```
+
+      NOTE: The filesystem uses ROM SPI functions (SPIRead, SPIWrite,
+      SPIEraseSector) for all flash operations. All buffers passed to
+      these functions must be 4-byte aligned. The filesystem handles
+      alignment internally using a staging buffer when necessary.
+
+      IMPORTANT: The `fs format` command will erase all files
+      irrecoverably. The operator should exercise caution.
+
+
+## XI. SYSTEM ARCHITECTURE
 
 ```
                      +============================+
@@ -404,10 +622,10 @@ The BACKSPACE key may be used to correct input errors.
                      +----------+-----------+
                      |     SCHEDULER        |
                      |     sched.cpp        |
-                     |  Round-robin select  |
-                     |  task_create()       |
-                     |  task_yield()  [sw]  |
-                     |  task_delay_ticks()  |
+                     |  Priority-based +    |
+                     |  round-robin select  |
+                     |  task_create/yield   |
+                     |  task_delay_ticks    |
                      +----------+-----------+
                                 |
               +-----------+-----+------+-----------+
@@ -415,26 +633,47 @@ The BACKSPACE key may be used to correct input errors.
         +-----+---+ +----+----+ +-----+----+ +----+-----+
         |  IDLE   | |HEARTBEAT| |  SHELL   | | (slots  |
         | task 0  | | task 1  | | task 2   | |  3 - 7) |
-        | 512B stk| | 1536B   | | 1536B    | | avail.  |
+        | pri=0   | | pri=1   | | pri=2    | | avail.  |
         +---------+ +---------+ +-----+----+ +----------+
+                         |             |
+                    +----+----+  +-----+-----+
+                    |   IPC   |  |   SHELL   |
+                    | sem/mq  |  | COMMANDS  |
+                    | swtimer |  | 15 cmds   |
+                    +---------+  +-----+-----+
                                        |
-                                 +-----+-----+
-                                 |   UART    |
-                                 | uart.cpp  |
-                                 | TX polled |
-                                 | RX irq    |
-                                 | mutex     |
-                                 +-----------+
-                                       |
-                                 +-----+-----+
-                                 | POOL ALLOC|
-                                 | 32B x 256 |
-                                 | free list |
-                                 +-----------+
+              +----------+-------------+-------------+
+              |          |             |             |
+        +-----+--+ +----+-----+ +----+-----+ +-----+----+
+        |  UART  | | POOL     | |  HEAP    | | OsitoFS  |
+        | TX/RX  | | 32Bx256  | |  8KB     | | SPI flash|
+        | mutex  | | free list| | 1st fit  | | 3.8 MB   |
+        +--------+ +----------+ +----------+ +----------+
+```
+
+**GPIO Subsystem:**
+
+```
+  +-----------------------------------------------------------+
+  |  GPIO DRIVER (gpio.cpp)                                   |
+  |                                                           |
+  |  GPIO 0-15: Standard peripheral (0x60000300)              |
+  |    - IOMUX auto-configuration per pin                     |
+  |    - Direction via GPIO_ENABLE register                   |
+  |    - Read/write via GPIO_IN / GPIO_OUT registers          |
+  |                                                           |
+  |  GPIO 16: RTC domain (separate registers)                 |
+  |    - RTC_GPIO_OUT, RTC_GPIO_ENABLE, RTC_GPIO_IN           |
+  |                                                           |
+  |  Wemos D1 Pin Mapping:                                    |
+  |    D0=GPIO16  D1=GPIO5   D2=GPIO4   D3=GPIO0              |
+  |    D4=GPIO2   D5=GPIO14  D6=GPIO12  D7=GPIO13             |
+  |    D8=GPIO15  (GPIO 6-11 reserved for SPI flash)          |
+  +-----------------------------------------------------------+
 ```
 
 
-## X. MEMORY MAP
+## XII. MEMORY MAP
 
 ```
   INSTRUCTION RAM (32 KB)
@@ -450,6 +689,7 @@ The BACKSPACE key may be used to correct input errors.
               | ISR Entry/Exit      |  context_switch.S
               | Scheduler hot path  |  sched.cpp (critical sections)
               | Timer handler       |  timer_tick.c
+              | All kernel code     |  ~10 KB total
   0x40107FFF  +---------------------+  End of IRAM
 
 
@@ -463,60 +703,117 @@ The BACKSPACE key may be used to correct input errors.
               |   task_pool[8]      |  8 x TCB structs
               |   stack_pool[8]     |  8 x 1536 bytes = 12 KB
               |   pool_memory       |  256 x 32 bytes = 8 KB
+              |   heap_memory       |  8 KB
+              |   sec_buf[4096]     |  Filesystem sector buffer
               |   rx_buf[64]        |  UART receive ring buffer
               |   isr_stack[512]    |  Dedicated interrupt stack
               +---------------------+
-              | <<< free space >>>  |  ~56 KB available
+              | <<< free space >>>  |  ~46 KB available
               |                     |
   0x3FFFBFF0  +---------------------+  Initial stack pointer
   0x3FFFBFFF  +---------------------+  DRAM_END
 
 
-  FLASH (4 MB, memory-mapped)
-  ===========================
+  SPI FLASH (4 MB)
+  =================
+  0x00000000  +---------------------+
+              | Firmware image      |  ~13 KB (kernel + data)
+  0x00003FFF  +---------------------+
+              | (unused)            |
+  0x00040000  +---------------------+  FS_FLASH_BASE
+              | OsitoFS Superblock  |  4 KB (magic, version, stats)
+  0x00041000  +---------------------+
+              | File Table          |  4 KB (128 entries x 32 bytes)
+  0x00042000  +---------------------+
+              | Data Area           |  958 sectors = 3,832 KB
+              |                     |  Contiguous file storage
+  0x00400000  +---------------------+  FS_FLASH_END (4 MB boundary)
+
+
+  FLASH-MAPPED CODE (irom0)
+  =========================
   0x40200000  +---------------------+
-              | .irom0.text         |  Bulk code (shell, drivers)
+              | .irom0.text         |  Bulk code (if cache enabled)
               | String literals     |  Mapped through cache
   0x405FFFFF  +---------------------+
 ```
 
 
-## XI. SOURCE FILE DIRECTORY
+## XIII. SOURCE FILE DIRECTORY
 
 ```
   FILE                              LINES  DESCRIPTION
   ----                              -----  -----------
+
+  Boot sequence
+  ~~~~~~~~~~~~~
   src/boot/vectors.S                  90   Exception vector table at VECBASE
   src/boot/crt0.S                     70   CPU init: SP, VECBASE, BSS, jump
   src/boot/nosdk_init.c               81   WDT off, PLL 80MHz, IOMUX setup
+
+  Kernel core
+  ~~~~~~~~~~~
   src/kernel/context_switch.S        239   Full ISR save/restore, stack switch
-  src/kernel/sched.cpp               253   Round-robin scheduler, task mgmt
-  src/kernel/timer_tick.c            131   FRC1 config, exception dispatcher
-  src/kernel/task.h                  154   TCB struct, offsets, API protos
+  src/kernel/sched.cpp               267   Priority scheduler, task management
+  src/kernel/timer_tick.c            148   FRC1 config, exception dispatcher
+  src/kernel/task.h                  155   TCB struct, offsets, API protos
+
+  Synchronization and IPC
+  ~~~~~~~~~~~~~~~~~~~~~~~
+  src/kernel/sem.cpp                 116   Counting semaphores and mutexes
+  src/kernel/sem.h                    64   Semaphore API declarations
+  src/kernel/mq.cpp                  101   Bounded message queues
+  src/kernel/mq.h                     61   Message queue API declarations
+  src/kernel/timer_sw.cpp            113   Software timers (one-shot/periodic)
+  src/kernel/timer_sw.h               65   Software timer API declarations
+
+  Memory management
+  ~~~~~~~~~~~~~~~~~
   src/mem/pool_alloc.cpp             107   Fixed-block allocator, free list
   src/mem/pool_alloc.h                32   Pool API declarations
-  src/drivers/uart.cpp               188   UART0: TX, RX IRQ, ring buf, mutex
+  src/mem/heap.cpp                   178   First-fit heap, auto-coalescing
+  src/mem/heap.h                      46   Heap API declarations
+
+  Filesystem
+  ~~~~~~~~~~
+  src/fs/ositofs.cpp                 421   Flat filesystem on SPI flash
+  src/fs/ositofs.h                    84   Filesystem API declarations
+
+  Drivers
+  ~~~~~~~
+  src/drivers/uart.cpp               175   UART0: TX, RX IRQ, ring buf, mutex
   src/drivers/uart.h                  46   UART API declarations
-  src/shell/shell.cpp                185   Interactive console, 5 commands
+  src/drivers/gpio.cpp               128   GPIO 0-16, IOMUX auto-config
+  src/drivers/gpio.h                  46   GPIO API declarations
+
+  User interface
+  ~~~~~~~~~~~~~~
+  src/shell/shell.cpp                618   Interactive console, 15 commands
   src/shell/shell.h                   20   Shell entry point declaration
-  src/main.cpp                        76   kernel_main: init and launch
+  src/main.cpp                       107   kernel_main: init and launch
+
+  System headers
+  ~~~~~~~~~~~~~~
   include/osito.h                     27   Master include
-  include/kernel/config.h             49   System constants
+  include/kernel/config.h             59   System constants
   include/kernel/types.h              80   Freestanding type definitions
   include/hw/esp8266_regs.h          143   Peripheral register addresses
   include/hw/esp8266_iomux.h          70   Pin multiplexing definitions
   include/hw/esp8266_rom.h            68   ROM function prototypes
+
+  Build system
+  ~~~~~~~~~~~~
   ld/osito.ld                         84   Linker script (IRAM/DRAM/irom0)
   ld/rom_functions.ld                 76   ROM function address bindings
-  Makefile                           143   Build system
+  Makefile                           155   Build system
   tools/flash.sh                      45   Flash utility script
   tools/monitor.sh                    17   Serial monitor script
                                    -----
-  TOTAL                            2,563   lines of source
+  TOTAL                            4,402   lines of source
 ```
 
 
-## XII. KNOWN LIMITATIONS
+## XIV. KNOWN LIMITATIONS
 
 The operator should be aware of the following limitations in the
 current release:
@@ -526,29 +823,39 @@ current release:
      exceptions when invoked from preemptible task context. The system
      uses inline string length computation to avoid this condition.
 
-  2. **Build System.** The Makefile invokes `python` for the esptool
-     image generation step. On systems where the Python interpreter
-     is registered as `py`, the operator must execute the image
-     conversion command manually (see Section V).
-
-  3. **Serial Baud Rate.** The ROM bootloader transmits at 74880 baud
+  2. **Serial Baud Rate.** The ROM bootloader transmits at 74880 baud
      before kernel initialization sets the UART to 115200 baud. Brief
      garbled output during the boot phase is expected.
 
-  4. **WiFi Subsystem.** The IEEE 802.11 radio transceiver is present
+  3. **WiFi Subsystem.** The IEEE 802.11 radio transceiver is present
      on the hardware but is not initialized or controlled by this
      release. WiFi support is planned for Version 0.2.
 
-  5. **Watchdog Timer.** The hardware watchdog is disabled during
+  4. **Watchdog Timer.** The hardware watchdog is disabled during
      operation. A software watchdog facility is planned for a future
      release.
 
-  6. **Task Termination.** Tasks are designed to run indefinitely.
+  5. **Task Termination.** Tasks are designed to run indefinitely.
      No mechanism for graceful task exit and resource reclamation is
      provided in this release.
 
+  6. **Filesystem Limitations.** Files are allocated contiguously and
+     cannot grow after creation. To modify a file, the operator must
+     delete it and create it anew. External fragmentation may prevent
+     allocation of large files even when sufficient total free space
+     exists.
 
-## XIII. WARRANTY AND DISCLAIMER
+  7. **SPI Flash Alignment.** All SPI flash operations require 4-byte
+     aligned buffers. The filesystem handles this internally, but
+     callers of the raw ROM functions (SPIRead, SPIWrite) must ensure
+     proper alignment.
+
+  8. **Stack Size.** Task stacks are limited to 1,536 bytes. Functions
+     must avoid allocating large arrays on the stack. The filesystem
+     uses a shared global sector buffer to stay within this constraint.
+
+
+## XV. WARRANTY AND DISCLAIMER
 
 ```
 +============================================================================+
@@ -568,6 +875,12 @@ current release:
 |  MAY VARY DEPENDING ON AMBIENT TEMPERATURE, COSMIC RAY FLUX, AND          |
 |  THE GENERAL DISPOSITION OF THE HARDWARE ON ANY GIVEN DAY.                 |
 |                                                                            |
+|  THE FILESYSTEM STORES DATA ON SPI FLASH MEMORY WHICH HAS A FINITE        |
+|  NUMBER OF WRITE CYCLES. THE AUTHORS ACCEPT NO RESPONSIBILITY FOR          |
+|  DATA LOSS DUE TO FLASH WEAR, POWER INTERRUPTION DURING WRITE             |
+|  OPERATIONS, OR THE OPERATOR'S FAILURE TO MAINTAIN ADEQUATE BACKUPS        |
+|  OF IRREPLACEABLE FILES CONTAINING 4,402 LINES OF KERNEL CODE.            |
+|                                                                            |
 +============================================================================+
 ```
 
@@ -582,6 +895,6 @@ current release:
   Written for the Xtensa LX106 processor.
   Assembled and tested on the Wemos D1 Mini computing module.
 
-  This document was prepared using only 80 KB of RAM.
+  4,402 lines of code. 80 KB of RAM. 3.8 MB of persistent storage.
   No bears were harmed in the making of this kernel.
 ```
