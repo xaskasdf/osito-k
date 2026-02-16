@@ -56,6 +56,17 @@ void software_reset(void) __attribute__((noreturn));
 void ets_wdt_disable(void);
 void ets_wdt_enable(void);
 
+/* RTC SAR ADC I2C master (used for analog read) */
+uint8_t rom_i2c_readReg(uint8_t block, uint8_t host_id, uint8_t reg_add);
+void rom_i2c_writeReg(uint8_t block, uint8_t host_id, uint8_t reg_add, uint8_t data);
+uint8_t rom_i2c_readReg_Mask(uint8_t block, uint8_t host_id, uint8_t reg_add,
+                              uint8_t Msb, uint8_t Lsb);
+void rom_i2c_writeReg_Mask(uint8_t block, uint8_t host_id, uint8_t reg_add,
+                             uint8_t Msb, uint8_t Lsb, uint8_t indata);
+
+/* SAR ADC initialization (configures internal I2C bus for SAR) */
+void rom_sar_init(void);
+
 /* SPI flash */
 int SPIRead(uint32_t addr, void *dst, uint32_t size);
 int SPIWrite(uint32_t addr, const void *src, uint32_t size);

@@ -121,6 +121,16 @@
 #define RTC_GPIO_IN       REG32(RTC_BASE + 0x8C)
 #define RTC_GPIO_CONF     REG32(RTC_BASE + 0x90)
 
+/* ======== SAR ADC registers (0x60000D00) ======== */
+#define SAR_BASE          0x60000D00
+#define SAR_CFG(n)        REG32(SAR_BASE + (n) * 4)  /* Indexed like SDK: SAR_BASE[n] */
+/* SAR_CFG(20) = 0xD50: ctrl (clk_div[15:8], r_state[26:24], start bit 1)  */
+/* SAR_CFG(21) = 0xD54: timing 1                                            */
+/* SAR_CFG(22) = 0xD58: timing 2                                            */
+/* SAR_CFG(23) = 0xD5C: enable (bit 21 = conversion enable)                 */
+/* SAR_CFG(24) = 0xD60: reset/ack                                           */
+/* SAR_CFG(32) = 0xD80: data output (inverted! read as ~value, 11-bit)      */
+
 /* ======== Xtensa interrupt numbers ======== */
 #define INUM_SLC       1   /* SLC */
 #define INUM_SPI       2   /* SPI */

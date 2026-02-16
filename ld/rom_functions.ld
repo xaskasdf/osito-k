@@ -68,6 +68,15 @@ PROVIDE ( memcpy = 0x400018b4 );
 PROVIDE ( memmove = 0x400018c4 );
 PROVIDE ( memcmp = 0x400018d4 );
 
+/* rom_i2c_readReg / rom_i2c_writeReg / _Mask variants - RTC SAR ADC I2C master */
+PROVIDE ( rom_i2c_readReg = 0x40007268 );
+PROVIDE ( rom_i2c_writeReg = 0x400072d8 );
+PROVIDE ( rom_i2c_readReg_Mask = 0x40007208 );
+PROVIDE ( rom_i2c_writeReg_Mask = 0x40007258 );
+
+/* rom_sar_init - initializes SAR ADC I2C bus configuration */
+PROVIDE ( rom_sar_init = 0x40006738 );
+
 /* str* from ROM */
 PROVIDE ( strlen = 0x400020c0 );
 PROVIDE ( strcmp = 0x40002aa8 );

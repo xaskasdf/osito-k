@@ -9,6 +9,8 @@
 #include "vm/vm.h"
 #include "drivers/uart.h"
 #include "drivers/gpio.h"
+#include "drivers/adc.h"
+#include "drivers/input.h"
 #include "kernel/task.h"
 
 extern "C" {
@@ -133,6 +135,18 @@ static int vm_syscall(vm_t *vm, uint8_t num)
     case SYS_GPIO_TOGGLE:
         if (vm_pop(vm, &a) < 0) return -1;  /* pin */
         gpio_toggle((uint8_t)a);
+        break;
+
+    case SYS_INPUT_POLL:
+        vm_push(vm, (uint32_t)input_poll());
+        break;
+
+    case SYS_INPUT_STATE:
+        vm_push(vm, input_get_state());
+        break;
+
+    case SYS_ADC_READ:
+        vm_push(vm, (uint32_t)adc_read());
         break;
 
     default:

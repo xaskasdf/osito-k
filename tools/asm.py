@@ -60,6 +60,24 @@ OPCODES = {
     'syscall': (0x60, 'u8'),
 }
 
+# Syscall aliases: mnemonic -> (opcode=0x60, 'u8') with implicit operand
+SYSCALL_ALIASES = {
+    'putc':         0,
+    'getc':         1,
+    'put_dec':      2,
+    'put_hex':      3,
+    'yield':        4,
+    'delay':        5,
+    'ticks':        6,
+    'gpio_mode':    7,
+    'gpio_write':   8,
+    'gpio_read':    9,
+    'gpio_toggle':  10,
+    'input_poll':   11,
+    'input_state':  12,
+    'adc_read':     13,
+}
+
 def parse_int(s):
     """Parse an integer literal (decimal or 0x hex)."""
     s = s.strip()
@@ -104,6 +122,11 @@ def assemble(lines):
         parts = line.split(None, 1)
         mnem = parts[0].lower()
         operand = parts[1].strip() if len(parts) > 1 else None
+
+        # Expand syscall aliases: e.g. "input_poll" -> "syscall 11"
+        if mnem in SYSCALL_ALIASES:
+            operand = str(SYSCALL_ALIASES[mnem])
+            mnem = 'syscall'
 
         if mnem not in OPCODES:
             print(f"error: line {line_num}: unknown instruction '{mnem}'", file=sys.stderr)

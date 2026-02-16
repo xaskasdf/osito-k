@@ -102,6 +102,9 @@ typedef enum {
 #define SYS_GPIO_WRITE  8
 #define SYS_GPIO_READ   9
 #define SYS_GPIO_TOGGLE 10
+#define SYS_INPUT_POLL  11
+#define SYS_INPUT_STATE 12
+#define SYS_ADC_READ    13
 
 /* ====== VM state ====== */
 

@@ -34,14 +34,20 @@ def crc16_ccitt(data):
 
 
 def main():
-    if len(sys.argv) < 4:
-        print("Usage: py tools/upload.py <port> <local_file> <remote_name> [--baud N]")
-        print("Example: py tools/upload.py COM4 game.bin game.bin --baud 74880")
+    if len(sys.argv) < 3:
+        print("Usage: py tools/upload.py <port> <local_file> [remote_name] [--baud N]")
+        print("Example: py tools/upload.py COM4 examples/game.bin")
+        print("Remote name defaults to basename of local file.")
         sys.exit(1)
 
     port = sys.argv[1]
     local_file = sys.argv[2]
-    remote_name = sys.argv[3]
+
+    # Remote name: explicit 3rd arg, or basename of local file
+    if len(sys.argv) > 3 and not sys.argv[3].startswith("--"):
+        remote_name = sys.argv[3]
+    else:
+        remote_name = os.path.basename(local_file)
 
     baud = 74880
     if "--baud" in sys.argv:

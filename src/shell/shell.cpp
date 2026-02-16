@@ -13,6 +13,8 @@
 #include "shell/shell.h"
 #include "drivers/uart.h"
 #include "drivers/gpio.h"
+#include "drivers/adc.h"
+#include "drivers/input.h"
 #include "mem/pool_alloc.h"
 #include "mem/heap.h"
 #include "fs/ositofs.h"
@@ -440,6 +442,7 @@ static void cmd_help(void)
     uart_puts("  ping    - send IPC message to heartbeat\n");
     uart_puts("  timer   - test 1s software timer\n");
     uart_puts("  run F   - run .vm bytecode program\n");
+    uart_puts("  joy     - joystick live monitor\n");
     uart_puts("  uname   - system info\n");
     uart_puts("  help    - this message\n");
     uart_puts("  reboot  - software reset\n");
@@ -723,6 +726,62 @@ static void cmd_run(const char *args)
     heap_free(buf);
 }
 
+static void cmd_joy(void)
+{
+    uart_puts("Joystick (Ctrl+C to exit)\n");
+
+    for (;;) {
+        /* Check for Ctrl+C */
+        if (uart_rx_available()) {
+            int ch = uart_getc();
+            if (ch == 0x03) {
+                uart_puts("\n");
+                return;
+            }
+        }
+
+        uint16_t x = adc_read();
+        uint32_t state = input_get_state();
+        uint8_t btn = (state >> 16) & 1;
+
+        uart_puts("X=");
+        uart_put_dec(x);
+        uart_puts(" btn=");
+        uart_puts(btn ? "DOWN" : "UP  ");
+
+        /* Show recent events */
+        input_event_t ev;
+        while ((ev = input_poll()) != INPUT_NONE) {
+            uart_puts(" ");
+            switch (ev) {
+                case INPUT_LEFT:    uart_puts("L"); break;
+                case INPUT_RIGHT:   uart_puts("R"); break;
+                case INPUT_PRESS:   uart_puts("P"); break;
+                case INPUT_RELEASE: uart_puts("r"); break;
+                default: break;
+            }
+        }
+
+        uart_puts("\r");
+        task_delay_ticks(10);  /* ~100ms update rate */
+    }
+}
+
+static void cmd_adc(void)
+{
+    /* Dump I2C registers for SAR ADC */
+    adc_debug();
+
+    /* 3 consecutive reads */
+    uart_puts("Read 1: ");
+    uart_put_dec(adc_read());
+    uart_puts("\nRead 2: ");
+    uart_put_dec(adc_read());
+    uart_puts("\nRead 3: ");
+    uart_put_dec(adc_read());
+    uart_puts("\n");
+}
+
 static void cmd_reboot(void)
 {
     uart_puts("Rebooting...\n");
@@ -764,6 +823,10 @@ static void process_command(const char *cmd)
         cmd_timer();
     else if (ets_strncmp(cmd, "run", 3) == 0 && (cmd[3] == ' ' || cmd[3] == '\0'))
         cmd_run(cmd + 3);
+    else if (ets_strcmp(cmd, "joy") == 0)
+        cmd_joy();
+    else if (ets_strcmp(cmd, "adc") == 0)
+        cmd_adc();
     else if (ets_strcmp(cmd, "uname") == 0)
         cmd_uname();
     else if (ets_strcmp(cmd, "reboot") == 0)
