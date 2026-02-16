@@ -33,6 +33,13 @@
 /* Heap configuration */
 #define HEAP_SIZE       8192  /* 8KB heap for variable-size allocations */
 
+/* Filesystem (OsitoFS) — flat FS on SPI flash */
+#define FS_SECTOR_SIZE  4096
+#define FS_MAX_FILES    128          /* max files (fits in 1 sector: 128*32=4096) */
+#define FS_NAME_LEN     24           /* max filename length including null */
+#define FS_FLASH_BASE   0x40000      /* 256KB offset — firmware is below this */
+#define FS_FLASH_END    0x400000     /* 4MB flash boundary */
+
 /* UART configuration */
 #define UART_BAUD       115200
 #define UART_RX_BUF_SIZE 64

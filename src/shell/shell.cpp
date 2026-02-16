@@ -15,6 +15,7 @@
 #include "drivers/gpio.h"
 #include "mem/pool_alloc.h"
 #include "mem/heap.h"
+#include "fs/ositofs.h"
 #include "kernel/task.h"
 #include "kernel/mq.h"
 #include "kernel/timer_sw.h"
@@ -25,7 +26,7 @@ extern mq_t hb_mq;
 extern "C" {
 
 /* Command line buffer */
-#define CMD_BUF_SIZE 64
+#define CMD_BUF_SIZE 128
 
 static char cmd_buf[CMD_BUF_SIZE];
 static int cmd_pos = 0;
@@ -148,6 +149,147 @@ static void cmd_heap(const char *args)
     uart_puts("\n");
 }
 
+/* ====== Filesystem commands ====== */
+
+static void cmd_fs(const char *args)
+{
+    while (*args == ' ') args++;
+
+    if (*args == '\0' || ets_strcmp(args, "help") == 0) {
+        uart_puts("fs commands:\n");
+        uart_puts("  fs format      - create filesystem\n");
+        uart_puts("  fs ls          - list files\n");
+        uart_puts("  fs df          - free space\n");
+        uart_puts("  fs cat NAME    - print file\n");
+        uart_puts("  fs write NAME DATA - write text file\n");
+        uart_puts("  fs rm NAME     - delete file\n");
+        uart_puts("  fs xxd NAME    - hex dump file\n");
+        return;
+    }
+
+    if (ets_strcmp(args, "format") == 0) {
+        fs_format();
+        return;
+    }
+
+    if (ets_strcmp(args, "ls") == 0) {
+        fs_list();
+        return;
+    }
+
+    if (ets_strcmp(args, "df") == 0) {
+        if (!fs_mounted()) { uart_puts("fs: not mounted\n"); return; }
+        uint32_t free_bytes = fs_free();
+        uart_puts("Free: ");
+        uart_put_dec(free_bytes / 1024);
+        uart_puts(" KB (");
+        uart_put_dec(free_bytes);
+        uart_puts(" bytes)\n");
+        return;
+    }
+
+    if (ets_strncmp(args, "cat ", 4) == 0) {
+        const char *name = args + 4;
+        while (*name == ' ') name++;
+        if (*name == '\0') { uart_puts("usage: fs cat <name>\n"); return; }
+
+        int size = fs_stat(name);
+        if (size < 0) { uart_puts("not found\n"); return; }
+        if (size == 0) { return; }
+
+        /* Read in chunks using heap */
+        uint32_t chunk = (uint32_t)size < 512 ? (uint32_t)size : 512;
+        uint8_t *buf = (uint8_t *)heap_alloc(chunk);
+        if (!buf) { uart_puts("no memory\n"); return; }
+
+        int got = fs_read(name, buf, chunk);
+        if (got > 0) {
+            for (int i = 0; i < got; i++)
+                uart_putc((char)buf[i]);
+            if (buf[got - 1] != '\n')
+                uart_puts("\n");
+        }
+        heap_free(buf);
+        return;
+    }
+
+    if (ets_strncmp(args, "xxd ", 4) == 0) {
+        const char *name = args + 4;
+        while (*name == ' ') name++;
+        if (*name == '\0') { uart_puts("usage: fs xxd <name>\n"); return; }
+
+        int size = fs_stat(name);
+        if (size < 0) { uart_puts("not found\n"); return; }
+
+        uint32_t chunk = (uint32_t)size < 256 ? (uint32_t)size : 256;
+        uint8_t *buf = (uint8_t *)heap_alloc(chunk);
+        if (!buf) { uart_puts("no memory\n"); return; }
+
+        int got = fs_read(name, buf, chunk);
+        for (int i = 0; i < got; i++) {
+            if (i % 16 == 0) {
+                uart_put_hex(i);
+                uart_puts(": ");
+            }
+            /* Print hex byte */
+            const char hex[] = "0123456789abcdef";
+            uart_putc(hex[(buf[i] >> 4) & 0xF]);
+            uart_putc(hex[buf[i] & 0xF]);
+            uart_putc(' ');
+            if (i % 16 == 15 || i == got - 1)
+                uart_puts("\n");
+        }
+        heap_free(buf);
+        return;
+    }
+
+    if (ets_strncmp(args, "write ", 6) == 0) {
+        const char *rest = args + 6;
+        while (*rest == ' ') rest++;
+
+        /* Extract filename (until next space) */
+        char name[FS_NAME_LEN];
+        int ni = 0;
+        while (*rest && *rest != ' ' && ni < FS_NAME_LEN - 1)
+            name[ni++] = *rest++;
+        name[ni] = '\0';
+
+        if (ni == 0) { uart_puts("usage: fs write <name> <data>\n"); return; }
+
+        /* Skip space to get data */
+        while (*rest == ' ') rest++;
+        if (*rest == '\0') { uart_puts("usage: fs write <name> <data>\n"); return; }
+
+        /* Data is the rest of the command line */
+        uint32_t len = 0;
+        const char *p = rest;
+        while (*p++) len++;
+
+        if (fs_create(name, rest, len) == 0) {
+            uart_puts("wrote ");
+            uart_put_dec(len);
+            uart_puts(" bytes to '");
+            uart_puts(name);
+            uart_puts("'\n");
+        }
+        return;
+    }
+
+    if (ets_strncmp(args, "rm ", 3) == 0) {
+        const char *name = args + 3;
+        while (*name == ' ') name++;
+        if (*name == '\0') { uart_puts("usage: fs rm <name>\n"); return; }
+
+        if (fs_delete(name) == 0)
+            uart_puts("deleted\n");
+        else
+            uart_puts("not found\n");
+        return;
+    }
+
+    uart_puts("unknown fs command (try 'fs help')\n");
+}
+
 static void cmd_ticks(void)
 {
     uint32_t t = get_tick_count();
@@ -166,6 +308,7 @@ static void cmd_help(void)
     uart_puts("  heap    - heap allocator status\n");
     uart_puts("  ticks   - uptime in ticks\n");
     uart_puts("  gpio    - read/write GPIO pins\n");
+    uart_puts("  fs      - filesystem commands\n");
     uart_puts("  pri N P - set task N priority to P\n");
     uart_puts("  ping    - send IPC message to heartbeat\n");
     uart_puts("  timer   - test 1s software timer\n");
@@ -415,6 +558,8 @@ static void process_command(const char *cmd)
         cmd_help();
     else if (ets_strncmp(cmd, "gpio", 4) == 0 && (cmd[4] == ' ' || cmd[4] == '\0'))
         cmd_gpio(cmd + 4);
+    else if (ets_strncmp(cmd, "fs", 2) == 0 && (cmd[2] == ' ' || cmd[2] == '\0'))
+        cmd_fs(cmd + 2);
     else if (ets_strncmp(cmd, "pri ", 4) == 0)
         cmd_pri(cmd + 4);
     else if (ets_strcmp(cmd, "ping") == 0)

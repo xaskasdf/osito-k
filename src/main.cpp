@@ -14,6 +14,7 @@
 #include "drivers/uart.h"
 #include "mem/pool_alloc.h"
 #include "mem/heap.h"
+#include "fs/ositofs.h"
 #include "kernel/task.h"
 #include "kernel/mq.h"
 #include "shell/shell.h"
@@ -76,6 +77,9 @@ void kernel_main(void)
     /* Initialize memory pool and heap */
     pool_init();
     heap_init();
+
+    /* Mount filesystem (non-fatal if not formatted yet) */
+    fs_init();
 
     /* Initialize IPC queue */
     mq_init(&hb_mq, hb_mq_buf, sizeof(hb_msg_t), 4);
