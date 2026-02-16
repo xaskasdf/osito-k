@@ -1,11 +1,14 @@
 /*
- * OsitoK - Round-robin preemptive scheduler
+ * OsitoK - Priority-based preemptive scheduler
  *
  * Features:
  *   - Up to MAX_TASKS tasks (including idle)
- *   - Round-robin scheduling with idle task skip
+ *   - Highest-priority-first scheduling
+ *   - Round-robin among tasks at the same priority level
  *   - Static stack allocation per task
  *   - Task creation with initial context frame setup
+ *
+ * Priority 0 is reserved for idle. Higher number = higher priority.
  */
 
 #include "kernel/task.h"
@@ -166,9 +169,9 @@ int task_create(const char *name, task_func_t func, void *arg, uint8_t priority)
 /*
  * schedule - pick the next task to run
  *
- * Called from the timer ISR (os_tick_handler) with interrupts disabled.
- * Implements round-robin: scan forward from last_scheduled, skip idle
- * if there's another ready task.
+ * Called from the timer ISR (os_exception_handler) with interrupts disabled.
+ * Selects the highest-priority READY task. Among tasks at the same
+ * priority level, round-robin is used for fairness.
  */
 void schedule(void)
 {
@@ -177,19 +180,29 @@ void schedule(void)
         current_task->state = TASK_STATE_READY;
     }
 
-    /* Round-robin: start scanning from the task after current */
+    /* Find the highest priority among all ready tasks */
+    uint8_t max_pri = 0;
+    for (int i = 0; i < MAX_TASKS; i++) {
+        if (task_pool[i].state == TASK_STATE_READY &&
+            task_pool[i].priority > max_pri)
+            max_pri = task_pool[i].priority;
+    }
+
+    /* Round-robin among ready tasks at max_pri */
     int next = last_scheduled;
     int found = -1;
 
     for (int i = 0; i < MAX_TASKS; i++) {
         next = (next + 1) % MAX_TASKS;
-        if (task_pool[next].state == TASK_STATE_READY && next != IDLE_TASK_ID) {
+        if (task_pool[next].state == TASK_STATE_READY &&
+            task_pool[next].priority == max_pri &&
+            next != IDLE_TASK_ID) {
             found = next;
             break;
         }
     }
 
-    /* If no ready task found (other than idle), run idle */
+    /* If nothing found (only idle is ready), run idle */
     if (found < 0) {
         found = IDLE_TASK_ID;
     }

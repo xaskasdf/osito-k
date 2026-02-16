@@ -58,7 +58,7 @@ static void cmd_ps(void)
 {
     task_tcb_t *pool = sched_get_task_pool();
 
-    uart_puts("ID  State  Ticks  Name\n");
+    uart_puts("ID  Pri  State  Ticks  Name\n");
 
     for (int i = 0; i < MAX_TASKS; i++) {
         if (pool[i].state == TASK_STATE_FREE)
@@ -66,6 +66,8 @@ static void cmd_ps(void)
 
         uart_put_dec(pool[i].id);
         uart_puts("   ");
+        uart_put_dec(pool[i].priority);
+        uart_puts("    ");
         put_padded(state_name(pool[i].state), 7);
         uart_put_dec(pool[i].ticks_run);
         uart_puts("  ");
@@ -164,6 +166,7 @@ static void cmd_help(void)
     uart_puts("  heap    - heap allocator status\n");
     uart_puts("  ticks   - uptime in ticks\n");
     uart_puts("  gpio    - read/write GPIO pins\n");
+    uart_puts("  pri N P - set task N priority to P\n");
     uart_puts("  ping    - send IPC message to heartbeat\n");
     uart_puts("  timer   - test 1s software timer\n");
     uart_puts("  help    - this message\n");
@@ -324,6 +327,47 @@ static void cmd_gpio(const char *args)
     }
 }
 
+static void cmd_pri(const char *args)
+{
+    while (*args == ' ') args++;
+
+    uint8_t tid;
+    if (parse_pin(args, &tid) < 0 || tid >= MAX_TASKS) {
+        uart_puts("usage: pri <task_id> <priority>\n");
+        return;
+    }
+
+    /* Skip past task id digits */
+    while (*args >= '0' && *args <= '9') args++;
+    while (*args == ' ') args++;
+
+    uint8_t pri;
+    if (*args < '0' || *args > '9') {
+        uart_puts("usage: pri <task_id> <priority>\n");
+        return;
+    }
+    pri = 0;
+    while (*args >= '0' && *args <= '9') {
+        pri = pri * 10 + (*args - '0');
+        args++;
+    }
+
+    task_tcb_t *pool = sched_get_task_pool();
+    if (pool[tid].state == TASK_STATE_FREE) {
+        uart_puts("task not found\n");
+        return;
+    }
+
+    uint8_t old = pool[tid].priority;
+    pool[tid].priority = pri;
+    uart_puts(pool[tid].name ? pool[tid].name : "?");
+    uart_puts(": priority ");
+    uart_put_dec(old);
+    uart_puts(" -> ");
+    uart_put_dec(pri);
+    uart_puts("\n");
+}
+
 static void cmd_reboot(void)
 {
     uart_puts("Rebooting...\n");
@@ -355,6 +399,8 @@ static void process_command(const char *cmd)
         cmd_help();
     else if (ets_strncmp(cmd, "gpio", 4) == 0 && (cmd[4] == ' ' || cmd[4] == '\0'))
         cmd_gpio(cmd + 4);
+    else if (ets_strncmp(cmd, "pri ", 4) == 0)
+        cmd_pri(cmd + 4);
     else if (ets_strcmp(cmd, "ping") == 0)
         cmd_ping();
     else if (ets_strcmp(cmd, "timer") == 0)

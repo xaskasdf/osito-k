@@ -83,9 +83,9 @@ void kernel_main(void)
     /* Initialize scheduler (creates idle task) */
     sched_init();
 
-    /* Create user tasks */
+    /* Create user tasks (higher priority = runs first) */
     task_create("heartbeat", heartbeat_task, nullptr, 1);
-    task_create("shell", shell_task, nullptr, 1);
+    task_create("shell", shell_task, nullptr, 2);
 
     /* Configure FRC1 timer for 100Hz preemptive ticks */
     timer_init();
