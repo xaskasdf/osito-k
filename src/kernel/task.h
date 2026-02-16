@@ -35,6 +35,7 @@ typedef struct task_tcb {
     uint8_t     priority;               /* Priority (0=lowest, unused for now) */
     uint8_t     _pad;
     uint32_t    ticks_run;              /* Number of ticks this task has run */
+    uint32_t    wake_tick;              /* Tick at which to wake (0 = not sleeping) */
     uint32_t    stack_base;             /* Bottom of stack allocation */
     uint32_t    stack_size;             /* Stack size in bytes */
     const char *name;                   /* Human-readable name */

@@ -234,10 +234,11 @@ uint32_t get_tick_count(void)
 
 void task_delay_ticks(uint32_t ticks)
 {
-    uint32_t target = tick_count + ticks;
-    while ((int32_t)(target - tick_count) > 0) {
-        task_yield();
-    }
+    uint32_t ps = irq_save();
+    current_task->wake_tick = tick_count + ticks;
+    current_task->state = TASK_STATE_BLOCKED;
+    irq_restore(ps);
+    task_yield();
 }
 
 task_tcb_t *sched_current_task(void)

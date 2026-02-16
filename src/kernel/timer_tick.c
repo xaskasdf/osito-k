@@ -51,6 +51,19 @@ void os_exception_handler(void)
         tick_count++;
         /* Count this timer tick for the interrupted task */
         current_task->ticks_run++;
+
+        /* Wake tasks whose sleep timer has expired */
+        task_tcb_t *pool = sched_get_task_pool();
+        for (int i = 0; i < MAX_TASKS; i++) {
+            if (pool[i].state == TASK_STATE_BLOCKED &&
+                pool[i].wake_tick != 0 &&
+                (int32_t)(tick_count - pool[i].wake_tick) >= 0)
+            {
+                pool[i].wake_tick = 0;
+                pool[i].state = TASK_STATE_READY;
+            }
+        }
+
         need_schedule = 1;
     }
 

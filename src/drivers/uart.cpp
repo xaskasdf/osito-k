@@ -10,6 +10,7 @@
 
 #include "drivers/uart.h"
 #include "kernel/task.h"
+#include "kernel/sem.h"
 
 extern "C" {
 
@@ -55,33 +56,16 @@ void IRAM_ATTR uart_isr_handler(void)
 
 /* ====== UART output mutex ====== */
 
-/*
- * Simple cooperative mutex for UART output.
- * Tasks that want atomic multi-line output should call
- * uart_lock() / uart_unlock() around their print sequence.
- *
- * Uses irq_save/restore for the flag check (atomic),
- * then yields if the lock is taken.
- */
-static volatile uint32_t uart_tx_locked = 0;
+static mutex_t uart_mtx;
 
 void uart_lock(void)
 {
-    for (;;) {
-        uint32_t ps = irq_save();
-        if (!uart_tx_locked) {
-            uart_tx_locked = 1;
-            irq_restore(ps);
-            return;
-        }
-        irq_restore(ps);
-        task_yield();
-    }
+    mutex_lock(&uart_mtx);
 }
 
 void uart_unlock(void)
 {
-    uart_tx_locked = 0;
+    mutex_unlock(&uart_mtx);
 }
 
 /* ====== Public API ====== */
@@ -92,6 +76,9 @@ void uart_init(void)
      * Here we set up the UART for RX interrupts.
      * The actual interrupt routing is handled by our custom vector table
      * and os_exception_handler() — no ROM ets_isr_attach needed. */
+
+    /* Initialize output mutex */
+    mutex_init(&uart_mtx);
 
     /* Clear pending interrupts */
     UART0_INT_CLR = 0xFFFFFFFF;

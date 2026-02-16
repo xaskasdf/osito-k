@@ -67,6 +67,7 @@ C_SRCS = \
 
 CXX_SRCS = \
 	$(SRCDIR)/kernel/sched.cpp \
+	$(SRCDIR)/kernel/sem.cpp \
 	$(SRCDIR)/mem/pool_alloc.cpp \
 	$(SRCDIR)/drivers/uart.cpp \
 	$(SRCDIR)/shell/shell.cpp \
