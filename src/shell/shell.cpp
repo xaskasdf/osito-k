@@ -26,6 +26,7 @@
 #include "basic/basic.h"
 #include "math/fixedpoint.h"
 #include "math/matrix3.h"
+#include "gfx/wire3d.h"
 
 /* IPC queue to heartbeat (defined in main.cpp) */
 extern mq_t hb_mq;
@@ -451,6 +452,8 @@ static void cmd_help(void)
     uart_puts("  basic   - Tiny BASIC interpreter\n");
     uart_puts("  fixtest - fixed-point math test\n");
     uart_puts("  mat3test- 3D matrix/vector test\n");
+    uart_puts("  wiretest- wireframe cube (static)\n");
+    uart_puts("  wirespin- wireframe cube (anim)\n");
     uart_puts("  uname   - system info\n");
     uart_puts("  help    - this message\n");
     uart_puts("  reboot  - software reset\n");
@@ -868,6 +871,10 @@ static void process_command(const char *cmd)
         fix_test();
     else if (ets_strcmp(cmd, "mat3test") == 0)
         mat3_test();
+    else if (ets_strcmp(cmd, "wiretest") == 0)
+        wire_test();
+    else if (ets_strcmp(cmd, "wirespin") == 0)
+        wire_spin();
     else if (ets_strcmp(cmd, "uname") == 0)
         cmd_uname();
     else if (ets_strcmp(cmd, "reboot") == 0)

@@ -77,6 +77,7 @@ CXX_SRCS = \
 	$(SRCDIR)/fs/ositofs.cpp \
 	$(SRCDIR)/math/fixedpoint.cpp \
 	$(SRCDIR)/math/matrix3.cpp \
+	$(SRCDIR)/gfx/wire3d.cpp \
 	$(SRCDIR)/drivers/uart.cpp \
 	$(SRCDIR)/drivers/gpio.cpp \
 	$(SRCDIR)/drivers/adc.cpp \
