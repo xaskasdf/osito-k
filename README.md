@@ -1,7 +1,7 @@
 ```
 +============================================================================+
 |                                                                            |
-|                        O S I T O K   v 0 . 1                               |
+|                       O S I T O - K   v 0 . 1                              |
 |                                                                            |
 |               PREEMPTIVE MULTITASKING OPERATING SYSTEM KERNEL              |
 |                                                                            |
@@ -17,7 +17,7 @@
                             *** IMPORTANT NOTICE ***
 
       This manual describes the installation, configuration, and operation
-      of the OsitoK Preemptive Kernel, Version 0.1. The operator should
+      of the Osito-K Preemptive Kernel, Version 0.1. The operator should
       read this document in its entirety before attempting to initialize
       the system. Improper configuration may result in unpredictable
       behavior of the processing unit.
@@ -51,8 +51,9 @@
 
 ## I. SYSTEM OVERVIEW
 
-OsitoK (from Spanish *osito*, "little bear") is a **bare-metal preemptive
-multitasking kernel** engineered for the Xtensa LX106 processor. The system
+Osito-K (from Spanish *osito*, "little bear") is a **bare-metal preemptive
+multitasking kernel** engineered for the Xtensa LX106 processor.
+A [naranjositos.tech](https://naranjositos.tech/) project. The system
 operates without the assistance of any vendor SDK, communicating directly
 with the hardware registers of the processing unit.
 
@@ -91,7 +92,7 @@ The kernel provides the following capabilities:
 
 ## II. HARDWARE SPECIFICATIONS
 
-The OsitoK kernel is designed to exploit the full capabilities of the
+The Osito-K kernel is designed to exploit the full capabilities of the
 following high-performance computing platform:
 
 ```
@@ -223,7 +224,7 @@ Upon successful assembly, the system will display a summary of memory
 utilization:
 
 ```
-  === OsitoK build complete ===
+  === Osito-K build complete ===
      text    data     bss     dec     hex filename
     24742    9992   37232   71966   1191e build/osito.elf
 ```
@@ -303,7 +304,7 @@ The operator console will display the following banner:
 
 ```
   =============================
-    OsitoK v0.1
+    Osito-K v0.1
     Bare-metal kernel for ESP8266
   =============================
   pool: initialized 256 blocks x 32 bytes = 8192 bytes
@@ -333,7 +334,7 @@ operator input.
 
 ## VIII. OPERATOR CONSOLE COMMANDS
 
-The OsitoK interactive shell accepts the following commands at the
+The Osito-K interactive shell accepts the following commands at the
 `osito>` prompt. Commands are terminated by pressing the RETURN key.
 The BACKSPACE key may be used to correct input errors.
 
@@ -440,7 +441,7 @@ The BACKSPACE key may be used to correct input errors.
   2   3    run    206  shell
 
   osito> uname
-  OsitoK v0.1 xtensa-lx106 ESP8266 @ 80MHz DRAM:80KB IRAM:32KB tick:100Hz tasks:8
+  Osito-K v0.1 xtensa-lx106 ESP8266 @ 80MHz DRAM:80KB IRAM:32KB tick:100Hz tasks:8
 
   osito> mem
   Memory pool:
@@ -483,7 +484,7 @@ The BACKSPACE key may be used to correct input errors.
 
 ## IX. INTER-PROCESS COMMUNICATION
 
-OsitoK provides three IPC primitives for synchronization and data
+Osito-K provides three IPC primitives for synchronization and data
 exchange between tasks:
 
 **Counting Semaphores:**
@@ -595,7 +596,7 @@ power cycles.
   fs: formatting...
   fs: formatted, 958 sectors (3832 KB) available
 
-  osito> fs write hello.txt Hello from OsitoK!
+  osito> fs write hello.txt Hello from Osito-K!
   wrote 18 bytes to 'hello.txt'
 
   osito> fs overwrite hello.txt Goodbye!
@@ -661,7 +662,7 @@ A Python upload utility is provided at `tools/upload.py`:
 
 ## XI. 3D GRAPHICS AND ELITE FLIGHT DEMO
 
-OsitoK includes a complete wireframe 3D rendering pipeline, built
+Osito-K includes a complete wireframe 3D rendering pipeline, built
 entirely with integer arithmetic on a processor with no floating-point
 unit. This system powers the Elite flight demo.
 
@@ -721,7 +722,7 @@ The `elite` command launches an interactive flight demo:
 
 ## XII. ZFORTH INTERACTIVE LANGUAGE
 
-OsitoK includes **zForth**, a minimal Forth interpreter adapted for
+Osito-K includes **zForth**, a minimal Forth interpreter adapted for
 bare-metal embedded use. zForth replaces the earlier Tiny BASIC
 interpreter and bytecode VM, saving approximately 4 KB of IRAM.
 
@@ -757,7 +758,7 @@ The core bootstrap defines essential control flow and convenience words:
 
 **Hardware Syscalls:**
 
-zForth programs can access OsitoK hardware through numbered syscalls:
+zForth programs can access Osito-K hardware through numbered syscalls:
 
 ```
   WORD           STACK EFFECT       DESCRIPTION
@@ -1131,7 +1132,10 @@ current release:
 |  NUMBER OF WRITE CYCLES. THE AUTHORS ACCEPT NO RESPONSIBILITY FOR          |
 |  DATA LOSS DUE TO FLASH WEAR, POWER INTERRUPTION DURING WRITE             |
 |  OPERATIONS, OR THE OPERATOR'S FAILURE TO MAINTAIN ADEQUATE BACKUPS        |
-|  OF IRREPLACEABLE FILES CONTAINING 5,019 LINES OF KERNEL CODE.            |
+|  OF IRREPLACEABLE FILES CONTAINING ~8,000 LINES OF KERNEL CODE.           |
+|                                                                            |
+|  Osito-K IS A PROJECT OF NARANJOSITOS.TECH                                 |
+|  https://naranjositos.tech/                                                |
 |                                                                            |
 +============================================================================+
 ```
@@ -1140,9 +1144,11 @@ current release:
 ---
 
 ```
-  OsitoK v0.1
-  Copyright (C) 2026
+  Osito-K v0.1
+  Copyright (C) 2026 naranjositos.tech
   All rights reserved.
+
+  https://naranjositos.tech/
 
   Written for the Xtensa LX106 processor.
   Assembled and tested on the Wemos D1 Mini computing module.

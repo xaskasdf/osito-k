@@ -1,8 +1,9 @@
-# OsitoK - Developer Notes
+# Osito-K - Developer Notes
 
 ## What is this
 Bare-metal preemptive kernel for ESP8266 (Wemos D1, Xtensa LX106 @ 80MHz).
 No Espressif SDK — runs directly on hardware using `nosdk8266` approach.
+A [naranjositos.tech](https://naranjositos.tech/) project.
 
 ## Build & Flash
 
