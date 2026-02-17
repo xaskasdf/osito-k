@@ -15,6 +15,7 @@
 #include "drivers/gpio.h"
 #include "drivers/adc.h"
 #include "drivers/input.h"
+#include "drivers/video.h"
 #include "mem/pool_alloc.h"
 #include "mem/heap.h"
 #include "fs/ositofs.h"
@@ -443,6 +444,7 @@ static void cmd_help(void)
     uart_puts("  timer   - test 1s software timer\n");
     uart_puts("  run F   - run .vm bytecode program\n");
     uart_puts("  joy     - joystick live monitor\n");
+    uart_puts("  fbtest  - framebuffer test pattern\n");
     uart_puts("  uname   - system info\n");
     uart_puts("  help    - this message\n");
     uart_puts("  reboot  - software reset\n");
@@ -782,6 +784,34 @@ static void cmd_adc(void)
     uart_puts("\n");
 }
 
+static void cmd_fbtest(void)
+{
+    uart_puts("fb: drawing test pattern...\n");
+
+    fb_clear();
+
+    /* Border */
+    fb_line(0, 0, FB_WIDTH - 1, 0);
+    fb_line(FB_WIDTH - 1, 0, FB_WIDTH - 1, FB_HEIGHT - 1);
+    fb_line(FB_WIDTH - 1, FB_HEIGHT - 1, 0, FB_HEIGHT - 1);
+    fb_line(0, FB_HEIGHT - 1, 0, 0);
+
+    /* Diagonals */
+    fb_line(0, 0, FB_WIDTH - 1, FB_HEIGHT - 1);
+    fb_line(FB_WIDTH - 1, 0, 0, FB_HEIGHT - 1);
+
+    /* Centered box (32x16 in the middle) */
+    int cx = FB_WIDTH / 2;
+    int cy = FB_HEIGHT / 2;
+    fb_line(cx - 16, cy - 8, cx + 15, cy - 8);
+    fb_line(cx + 15, cy - 8, cx + 15, cy + 7);
+    fb_line(cx + 15, cy + 7, cx - 16, cy + 7);
+    fb_line(cx - 16, cy + 7, cx - 16, cy - 8);
+
+    fb_flush();
+    uart_puts("fb: flushed 1028 bytes\n");
+}
+
 static void cmd_reboot(void)
 {
     uart_puts("Rebooting...\n");
@@ -827,6 +857,8 @@ static void process_command(const char *cmd)
         cmd_joy();
     else if (ets_strcmp(cmd, "adc") == 0)
         cmd_adc();
+    else if (ets_strcmp(cmd, "fbtest") == 0)
+        cmd_fbtest();
     else if (ets_strcmp(cmd, "uname") == 0)
         cmd_uname();
     else if (ets_strcmp(cmd, "reboot") == 0)

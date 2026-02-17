@@ -172,4 +172,19 @@ bool uart_rx_available(void)
     return rx_head != rx_tail;
 }
 
+void uart_write_raw(const uint8_t *buf, uint16_t len)
+{
+    for (uint16_t i = 0; i < len; i++) {
+        /* Feed HW WDT periodically */
+        if ((i & 0x7F) == 0)
+            REG32(0x60000914) = 0x73;
+
+        /* Wait until TX FIFO has space */
+        while (((UART0_STATUS >> UART_TXFIFO_CNT_SHIFT) & UART_TXFIFO_CNT_MASK) >= 126)
+            ;
+
+        UART0_FIFO = (uint32_t)buf[i];
+    }
+}
+
 } /* extern "C" */

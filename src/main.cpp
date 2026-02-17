@@ -18,6 +18,7 @@
 #include "kernel/task.h"
 #include "kernel/mq.h"
 #include "drivers/input.h"
+#include "drivers/video.h"
 #include "shell/shell.h"
 
 extern "C" {
@@ -90,6 +91,9 @@ void kernel_main(void)
 
     /* Initialize input subsystem (ADC + button GPIO) */
     input_init();
+
+    /* Initialize video framebuffer */
+    video_init();
 
     /* Create user tasks (higher priority = runs first) */
     task_create("heartbeat", heartbeat_task, nullptr, 1);

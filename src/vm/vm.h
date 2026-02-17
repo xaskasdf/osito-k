@@ -105,6 +105,10 @@ typedef enum {
 #define SYS_INPUT_POLL  11
 #define SYS_INPUT_STATE 12
 #define SYS_ADC_READ    13
+#define SYS_FB_CLEAR    14
+#define SYS_FB_PIXEL    15
+#define SYS_FB_LINE     16
+#define SYS_FB_FLUSH    17
 
 /* ====== VM state ====== */
 

@@ -76,6 +76,10 @@ SYSCALL_ALIASES = {
     'input_poll':   11,
     'input_state':  12,
     'adc_read':     13,
+    'fb_clear':     14,
+    'fb_pixel':     15,
+    'fb_line':      16,
+    'fb_flush':     17,
 }
 
 def parse_int(s):

@@ -11,6 +11,7 @@
 #include "drivers/gpio.h"
 #include "drivers/adc.h"
 #include "drivers/input.h"
+#include "drivers/video.h"
 #include "kernel/task.h"
 
 extern "C" {
@@ -147,6 +148,31 @@ static int vm_syscall(vm_t *vm, uint8_t num)
 
     case SYS_ADC_READ:
         vm_push(vm, (uint32_t)adc_read());
+        break;
+
+    case SYS_FB_CLEAR:
+        fb_clear();
+        break;
+
+    case SYS_FB_PIXEL:
+        if (vm_pop(vm, &b) < 0) return -1;  /* y */
+        if (vm_pop(vm, &a) < 0) return -1;  /* x */
+        fb_set_pixel((int)a, (int)b);
+        break;
+
+    case SYS_FB_LINE:
+        {
+            uint32_t y1, x1;
+            if (vm_pop(vm, &y1) < 0) return -1;
+            if (vm_pop(vm, &x1) < 0) return -1;
+            if (vm_pop(vm, &b) < 0) return -1;   /* y0 */
+            if (vm_pop(vm, &a) < 0) return -1;   /* x0 */
+            fb_line((int)a, (int)b, (int)x1, (int)y1);
+        }
+        break;
+
+    case SYS_FB_FLUSH:
+        fb_flush();
         break;
 
     default:

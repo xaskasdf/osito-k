@@ -39,6 +39,10 @@ int uart_getc(void);
 /* Check if there's data available in RX buffer */
 bool uart_rx_available(void);
 
+/* Bulk write raw bytes directly to UART FIFO.
+ * No \n -> \r\n conversion, no mutex. For video bridge use. */
+void uart_write_raw(const uint8_t *buf, uint16_t len);
+
 #ifdef __cplusplus
 }
 #endif
