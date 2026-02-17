@@ -20,20 +20,18 @@
 #include "mem/heap.h"
 #include "fs/ositofs.h"
 #include "kernel/task.h"
-#include "kernel/mq.h"
 #include "kernel/timer_sw.h"
-#include "vm/vm.h"
-#include "basic/basic.h"
 #include "math/fixedpoint.h"
 #include "math/matrix3.h"
 #include "gfx/wire3d.h"
 #include "gfx/ships.h"
 #include "game/game.h"
 
-/* IPC queue to heartbeat (defined in main.cpp) */
-extern mq_t hb_mq;
-
 extern "C" {
+
+/* Forth REPL and file runner (from zf_host.cpp) */
+void forth_enter(void);
+void forth_run(const char *filename);
 
 /* Command line buffer */
 #define CMD_BUF_SIZE 128
@@ -446,12 +444,11 @@ static void cmd_help(void)
     uart_puts("  gpio    - read/write GPIO pins\n");
     uart_puts("  fs      - filesystem commands\n");
     uart_puts("  pri N P - set task N priority to P\n");
-    uart_puts("  ping    - send IPC message to heartbeat\n");
     uart_puts("  timer   - test 1s software timer\n");
-    uart_puts("  run F   - run .vm bytecode program\n");
+    uart_puts("  run F   - run .zf Forth script\n");
+    uart_puts("  forth   - Forth REPL\n");
     uart_puts("  joy     - joystick live monitor\n");
     uart_puts("  fbtest  - framebuffer test pattern\n");
-    uart_puts("  basic   - Tiny BASIC interpreter\n");
     uart_puts("  fixtest - fixed-point math test\n");
     uart_puts("  mat3test- 3D matrix/vector test\n");
     uart_puts("  wiretest- wireframe cube (static)\n");
@@ -462,26 +459,6 @@ static void cmd_help(void)
     uart_puts("  uname   - system info\n");
     uart_puts("  help    - this message\n");
     uart_puts("  reboot  - software reset\n");
-}
-
-static uint32_t ping_counter = 0;
-
-static void cmd_ping(void)
-{
-    /* Send a message to heartbeat through the IPC queue */
-    typedef struct { uint32_t value; } hb_msg_t;
-    hb_msg_t msg;
-    msg.value = ping_counter++;
-
-    if (mq_trysend(&hb_mq, &msg) == 0) {
-        uart_puts("ping ");
-        uart_put_dec(msg.value);
-        uart_puts(" -> heartbeat (queued: ");
-        uart_put_dec(mq_count(&hb_mq));
-        uart_puts(")\n");
-    } else {
-        uart_puts("queue full!\n");
-    }
 }
 
 /* Software timer demo: fires once after 1 second */
@@ -674,72 +651,16 @@ static void cmd_uname(void)
     uart_puts("\n");
 }
 
-/* ====== VM run command ====== */
-
-/* Static VM state — too large for the shell task stack */
-static vm_t vm;
+/* ====== Forth run command ====== */
 
 static void cmd_run(const char *args)
 {
     while (*args == ' ') args++;
     if (*args == '\0') {
-        uart_puts("usage: run <file.vm>\n");
+        uart_puts("usage: run <file.zf>\n");
         return;
     }
-
-    /* Check file exists and get size */
-    int size = fs_stat(args);
-    if (size < 0) {
-        uart_puts("not found: ");
-        uart_puts(args);
-        uart_puts("\n");
-        return;
-    }
-    if (size < (int)VM_HEADER_SIZE) {
-        uart_puts("file too small\n");
-        return;
-    }
-
-    /* Allocate buffer from heap */
-    uint8_t *buf = (uint8_t *)heap_alloc((uint32_t)size);
-    if (!buf) {
-        uart_puts("no memory (need ");
-        uart_put_dec((uint32_t)size);
-        uart_puts(" bytes)\n");
-        return;
-    }
-
-    /* Read file */
-    int got = fs_read(args, buf, (uint32_t)size);
-    if (got != size) {
-        uart_puts("read error\n");
-        heap_free(buf);
-        return;
-    }
-
-    /* Initialize and load VM */
-    vm_init(&vm);
-    if (vm_load(&vm, buf, (uint32_t)size) < 0) {
-        heap_free(buf);
-        return;
-    }
-
-    /* Run */
-    uart_puts("[vm: running ");
-    uart_puts(args);
-    uart_puts(" (");
-    uart_put_dec(vm.code_size);
-    uart_puts(" bytes)]\n");
-
-    int rc = vm_run(&vm);
-
-    uart_puts("[vm: exit ");
-    uart_put_dec((uint32_t)rc);
-    uart_puts(", ");
-    uart_put_dec(vm.insn_count);
-    uart_puts(" insns]\n");
-
-    heap_free(buf);
+    forth_run(args);
 }
 
 static void cmd_joy(void)
@@ -858,8 +779,6 @@ static void process_command(const char *cmd)
         cmd_fs(cmd + 2);
     else if (ets_strncmp(cmd, "pri ", 4) == 0)
         cmd_pri(cmd + 4);
-    else if (ets_strcmp(cmd, "ping") == 0)
-        cmd_ping();
     else if (ets_strcmp(cmd, "timer") == 0)
         cmd_timer();
     else if (ets_strncmp(cmd, "run", 3) == 0 && (cmd[3] == ' ' || cmd[3] == '\0'))
@@ -870,8 +789,8 @@ static void process_command(const char *cmd)
         cmd_adc();
     else if (ets_strcmp(cmd, "fbtest") == 0)
         cmd_fbtest();
-    else if (ets_strcmp(cmd, "basic") == 0)
-        basic_enter();
+    else if (ets_strcmp(cmd, "forth") == 0)
+        forth_enter();
     else if (ets_strcmp(cmd, "fixtest") == 0)
         fix_test();
     else if (ets_strcmp(cmd, "mat3test") == 0)

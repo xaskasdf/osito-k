@@ -16,53 +16,11 @@
 #include "mem/heap.h"
 #include "fs/ositofs.h"
 #include "kernel/task.h"
-#include "kernel/mq.h"
 #include "drivers/input.h"
 #include "drivers/video.h"
 #include "shell/shell.h"
 
 extern "C" {
-
-/* ====== IPC: shell -> heartbeat message queue ====== */
-
-/* Message type for IPC demo */
-typedef struct {
-    uint32_t value;
-} hb_msg_t;
-
-/* Queue storage (4 messages deep) */
-static uint8_t hb_mq_buf[4 * sizeof(hb_msg_t)];
-mq_t hb_mq;  /* global — shell.cpp uses this */
-
-/* ====== Heartbeat task ====== */
-
-static void heartbeat_task(void *arg)
-{
-    (void)arg;
-    uint32_t count = 0;
-
-    for (;;) {
-        /* Check for IPC messages (non-blocking) */
-        hb_msg_t msg;
-        while (mq_tryrecv(&hb_mq, &msg) == 0) {
-            uart_lock();
-            uart_puts("[heartbeat: pong ");
-            uart_put_dec(msg.value);
-            uart_puts("]\n");
-            uart_unlock();
-        }
-
-        uart_lock();
-        uart_puts("[heartbeat ");
-        uart_put_dec(count);
-        uart_puts("]\n");
-        uart_unlock();
-        count++;
-
-        /* Wait ~2 seconds (200 ticks at 100Hz) */
-        task_delay_ticks(200);
-    }
-}
 
 /* ====== Kernel entry point ====== */
 
@@ -83,9 +41,6 @@ void kernel_main(void)
     /* Mount filesystem (non-fatal if not formatted yet) */
     fs_init();
 
-    /* Initialize IPC queue */
-    mq_init(&hb_mq, hb_mq_buf, sizeof(hb_msg_t), 4);
-
     /* Initialize scheduler (creates idle task) */
     sched_init();
 
@@ -96,7 +51,6 @@ void kernel_main(void)
     video_init();
 
     /* Create user tasks (higher priority = runs first) */
-    task_create("heartbeat", heartbeat_task, nullptr, 1);
     task_create("input", input_task, nullptr, 2);
     task_create("shell", shell_task, nullptr, 3);
 

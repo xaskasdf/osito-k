@@ -61,11 +61,13 @@ LDFLAGS = \
 ASM_SRCS = \
 	$(SRCDIR)/boot/vectors.S \
 	$(SRCDIR)/boot/crt0.S \
-	$(SRCDIR)/kernel/context_switch.S
+	$(SRCDIR)/kernel/context_switch.S \
+	$(SRCDIR)/forth/setjmp.S
 
 C_SRCS = \
 	$(SRCDIR)/boot/nosdk_init.c \
-	$(SRCDIR)/kernel/timer_tick.c
+	$(SRCDIR)/kernel/timer_tick.c \
+	$(SRCDIR)/forth/zforth.c
 
 CXX_SRCS = \
 	$(SRCDIR)/kernel/sched.cpp \
@@ -86,8 +88,7 @@ CXX_SRCS = \
 	$(SRCDIR)/drivers/input.cpp \
 	$(SRCDIR)/drivers/font.cpp \
 	$(SRCDIR)/drivers/video.cpp \
-	$(SRCDIR)/vm/vm.cpp \
-	$(SRCDIR)/basic/basic.cpp \
+	$(SRCDIR)/forth/zf_host.cpp \
 	$(SRCDIR)/shell/shell.cpp \
 	$(SRCDIR)/main.cpp
 
