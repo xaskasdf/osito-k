@@ -1155,5 +1155,5 @@ current release:
 
   ~8,000 lines of code. 80 KB of RAM. 3.8 MB of persistent storage.
   One Forth interpreter. Four spaceships. Zero floating-point units.
-  No bears were harmed in the making of this kernel.
+  No bears or orange cats were harmed in the making of this kernel.
 ```
