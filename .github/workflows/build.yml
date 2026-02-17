@@ -27,7 +27,7 @@ jobs:
       - name: Build
         run: |
           export PATH="$PWD/tools/xtensa-lx106-elf/bin:$PATH"
-          make
+          make PYTHON=python3
 
       - name: Show size
         run: |
