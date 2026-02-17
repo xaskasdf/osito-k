@@ -76,9 +76,13 @@ src/drivers/adc.cpp         SAR ADC (10-bit, A0 pin)
 src/drivers/input.cpp       Joystick input (ADC + button, event queue)
 src/drivers/font.cpp        4×6 bitmap font (ASCII 32-126)
 src/drivers/video.cpp       Framebuffer 128×64, line drawing, text, UART streaming
-src/vm/vm.cpp               Bytecode VM interpreter
-src/basic/basic.cpp         Tiny BASIC interpreter
-src/shell/shell.cpp         Interactive shell (ps, mem, heap, fs, gpio, run, fixtest, mat3test, etc.)
+src/forth/zforth.c          zForth core interpreter (MIT, adapted for no-libc)
+src/forth/zforth.h          zForth API header (ctx struct, eval, push/pop)
+src/forth/zfconf.h          zForth config: int32 cells, 2KB dict, 16-deep stacks
+src/forth/zf_host.cpp       Host callbacks, core.zf bootstrap, REPL, file runner
+src/forth/setjmp.h          jmp_buf typedef for Xtensa CALL0
+src/forth/setjmp.S          setjmp/longjmp asm (6 regs, 24 bytes)
+src/shell/shell.cpp         Interactive shell (ps, mem, heap, fs, gpio, forth, run, etc.)
 src/main.cpp                kernel_main: init → create tasks → timer → sched_start
 ```
 
@@ -97,11 +101,22 @@ src/main.cpp                kernel_main: init → create tasks → timer → sch
 - `project()` uses `FIX16_ROUND`, screen center at (64,32), returns 0 if behind camera
 - `mat3_multiply` uses internal temp buffer — safe even if out aliases a or b
 
-## Resource Budget (as of Feature 7)
+## zForth Integration
+
+Minimal Forth interpreter (github.com/zevv/zForth, MIT). Replaced BASIC+VM.
+- **Config**: int32_t cells, 2KB dictionary, 16-deep data/return stacks
+- **Context**: `zf_ctx` struct (~2.3KB in BSS), persistent across invocations
+- **Bootstrap**: core.zf embedded as `static const char[]` — defines if/else/fi, do/loop, variables, s"
+- **Syscalls**: emit(0), print(1), tell(2), fb-clear(128), fb-pixel(129), fb-line(130), fb-flush(131), fb-text(132), yield(133), ticks(134), delay(135)
+- **setjmp/longjmp**: custom Xtensa CALL0 asm, saves a0/a1/a12-a15 (24 bytes)
+- **Shell**: `forth` (REPL, Ctrl+C exit), `run <file.zf>` (execute from OsitoFS)
+
+## Resource Budget (as of F10 + zForth)
 ```
-IRAM .text:  26,594 / 32,768 bytes (~6.1 KB free)
-DRAM:        sin_table 1KB + pool 8KB + heap 8KB + FS buffers
+IRAM .text:  24,602 / 32,768 bytes (~8.2 KB free)
+DRAM:        sin_table 1KB + pool 8KB + heap 8KB + FS buffers + zf_ctx ~2.3KB
 Flash:       OsitoFS on SPI flash (4MB total)
+Tasks:       idle, input, shell (3 of 8 slots used)
 ```
 
 ## Roadmap — Remaining Features
@@ -110,27 +125,14 @@ Goal: port BBC Micro Elite (wireframe 3D) + spreadsheet app.
 
 | Feature | Description | Status |
 |---------|-------------|--------|
-| F1-F5   | Kernel, scheduler, drivers, FS, heap, VM, BASIC, font, framebuffer | Done |
+| F1-F5   | Kernel, scheduler, drivers, FS, heap, font, framebuffer | Done |
 | F6      | Fixed-point 16.16 math library (sin/cos/div/sqrt) | Done |
 | F7      | 3D vectors, matrices, perspective projection | Done |
-| **F8**  | **Wireframe renderer** — vertex/edge lists → rotate → project → draw lines | Next |
-| F9      | Ship models — Elite ship data (Cobra, Sidewinder, Coriolis) as vertex/edge lists | Planned |
-| F10     | Game loop + HUD — flight controls, starfield, radar, joystick input | Planned |
-| F11     | Spreadsheet engine — cell grid, formula parser, evaluation, cursor UI | Planned |
-
-### F8: Wireframe Renderer
-Takes a model (vertex array + edge index array), applies mat3_t rotation, projects all
-vertices with `project()`, and draws edges with `fb_line()`. Core rendering pipeline for Elite.
-Should support: model definition struct, render function, backface culling (optional), clipping.
-
-### F9: Ship Models
-Define Elite ship geometry as static const vertex/edge arrays. Priority ships:
-Cobra Mk III (player), Sidewinder (enemy), Coriolis (station). ~20-40 vertices each.
-
-### F10: Game Loop + HUD
-Main game task: poll joystick → update rotation → render scene → fb_flush.
-HUD: speed bar, compass, front/rear view toggle, simple radar dot display.
-Starfield: random dots scrolling based on velocity.
+| F8      | Wireframe renderer — vertex/edge → rotate → project → draw | Done |
+| F9      | Ship models — Cobra, Sidewinder, Coriolis, Viper, Asp, Shuttle | Done |
+| F10     | Game loop + HUD — flight, starfield, radar, joystick | Done |
+| **zF**  | **zForth** — replaced BASIC+VM, saved ~4KB IRAM | Done |
+| **F11** | **Spreadsheet engine** — cell grid, formula parser, cursor UI | Next |
 
 ### F11: Spreadsheet Engine
 Cell grid (e.g. 8×16), each cell holds number or formula string.
