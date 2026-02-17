@@ -9,7 +9,7 @@
 |                                                                            |
 |                        OPERATOR'S REFERENCE MANUAL                         |
 |                                                                            |
-|                          REVISION 2 -- FEB 2026                            |
+|                          REVISION 3 -- FEB 2026                            |
 |                                                                            |
 +============================================================================+
 ```
@@ -38,11 +38,13 @@
   VIII. OPERATOR CONSOLE COMMANDS ..............................      8
   IX.   INTER-PROCESS COMMUNICATION ............................      9
   X.    FILESYSTEM (OsitoFS) ...................................     10
-  XI.   SYSTEM ARCHITECTURE ....................................     11
-  XII.  MEMORY MAP .............................................     12
-  XIII. SOURCE FILE DIRECTORY ..................................     13
-  XIV.  KNOWN LIMITATIONS ......................................     14
-  XV.   WARRANTY AND DISCLAIMER ................................     15
+  XI.   3D GRAPHICS AND ELITE FLIGHT DEMO ......................     11
+  XII.  ZFORTH INTERACTIVE LANGUAGE ............................     12
+  XIII. SYSTEM ARCHITECTURE ....................................     13
+  XIV.  MEMORY MAP .............................................     14
+  XV.   SOURCE FILE DIRECTORY ..................................     15
+  XVI.  KNOWN LIMITATIONS ......................................     16
+  XVII. WARRANTY AND DISCLAIMER ................................     17
 ```
 
 ---
@@ -76,8 +78,15 @@ The kernel provides the following capabilities:
     storage. Inspired by the BBC Micro's DFS.
   - **Interrupt-driven serial communications** with a 64-byte receive
     buffer and cooperative mutual exclusion for output operations.
-  - **An interactive operator console** with 19 built-in commands for
-    system monitoring, file operations, and hardware control.
+  - **An interactive operator console** with 25+ built-in commands for
+    system monitoring, file operations, hardware control, 3D graphics,
+    and an Elite flight demo.
+  - **zForth interactive language** — a minimal Forth interpreter with
+    hardware syscalls for framebuffer graphics, wireframe 3D rendering,
+    and task scheduling. Scripts stored on OsitoFS.
+  - **3D wireframe graphics** with fixed-point math, 3x3 matrix rotation,
+    perspective projection, and Elite ship models (Cobra, Sidewinder,
+    Viper, Coriolis). All running at 80 MHz with no floating point.
 
 
 ## II. HARDWARE SPECIFICATIONS
@@ -216,7 +225,7 @@ utilization:
 ```
   === OsitoK build complete ===
      text    data     bss     dec     hex filename
-    10458    2924   33916   47298    b8c2 build/osito.elf
+    24742    9992   37232   71966   1191e build/osito.elf
 ```
 
       NOTE: The .bss segment includes all task stacks, the memory pool,
@@ -282,11 +291,12 @@ sequence automatically:
     5      pool_init                          Memory pool: 256 blocks x 32 bytes
     6      heap_init                          Heap allocator: 8192 bytes
     7      fs_init                            Mount filesystem (if formatted)
-    8      mq_init                            IPC message queue: 4 slots
-    9      sched_init                         Scheduler: idle task created
-   10      task_create (x2)                   Heartbeat (pri=1) and Shell (pri=2)
-   11      timer_init                         FRC1 armed: 100 Hz, prescaler /16
-   12      sched_start                        Context loaded, rfe — system live
+    8      sched_init                         Scheduler: idle task created
+    9      input_init                         Joystick ADC + button GPIO setup
+   10      video_init                         Framebuffer 128x64 (1024 bytes)
+   11      task_create (x2)                   Input (pri=2) and Shell (pri=3)
+   12      timer_init                         FRC1 armed: 100 Hz, prescaler /16
+   13      sched_start                        Context loaded, rfe — system live
 ```
 
 The operator console will display the following banner:
@@ -300,7 +310,8 @@ The operator console will display the following banner:
   heap: 8192 bytes
   fs: mounted, 0 files, 958 sectors
   sched: initialized, idle task created
-  sched: created task 'heartbeat' (id=1)
+  video: framebuffer 128x64 (1024 bytes)
+  sched: created task 'input' (id=1)
   sched: created task 'shell' (id=2)
   timer: FRC1 configured at 100 Hz (load=50000)
 
@@ -312,9 +323,7 @@ The operator console will display the following banner:
 ```
 
 The `osito>` prompt indicates the system is operational and awaiting
-operator input. The `[heartbeat N]` messages will appear at
-approximately 2-second intervals, confirming that the preemptive
-scheduler is functioning correctly.
+operator input.
 
       NOTE: The serial console operates at 74880 baud during the ROM
       bootloader phase, then 115200 baud during kernel operation.
@@ -365,11 +374,39 @@ The BACKSPACE key may be used to correct input errors.
 | pri N P  | Change the priority of task N to level P. Takes effect   |
 |          | at the next scheduling decision. Priority 0 is lowest.   |
 |          |                                                          |
-| ping     | Send an IPC message to the heartbeat task. The heartbeat |
-|          | will respond with "pong N" at its next iteration.        |
-|          |                                                          |
 | timer    | Arm a one-shot software timer for 1 second. Reports     |
 |          | the actual elapsed ticks when it fires.                   |
+|          |                                                          |
+| forth    | Enter the zForth interactive REPL. Type Forth code       |
+|          | at the prompt. Press Ctrl+C to return to the shell.      |
+|          |                                                          |
+| run F    | Execute a .zf Forth script stored in OsitoFS.            |
+|          | Usage: run <filename>                                    |
+|          |                                                          |
+| joy      | Joystick live monitor. Displays ADC value, button state, |
+|          | and input events in real time. Press Ctrl+C to exit.     |
+|          |                                                          |
+| fbtest   | Draw a test pattern on the 128x64 framebuffer:           |
+|          | border, title text, and character set sample.            |
+|          |                                                          |
+| fixtest  | Run the fixed-point 16.16 math test suite: sin, cos,    |
+|          | sqrt, div, lerp, and distance approximation.             |
+|          |                                                          |
+| mat3test | Run the 3D matrix/vector math test: rotations,           |
+|          | projections, and matrix multiplication.                  |
+|          |                                                          |
+| wiretest | Render a static wireframe cube to the framebuffer.       |
+|          |                                                          |
+| wirespin | Animate a spinning wireframe cube (~5 seconds).          |
+|          | Press Ctrl+C to stop early.                              |
+|          |                                                          |
+| ship [N] | Display Elite ship model (1=cobra, 2=sidewinder,         |
+|          | 3=viper, 4=coriolis). No argument lists all.             |
+|          |                                                          |
+| shipspin | Cycle through all ship models with rotation animation.   |
+|          |                                                          |
+| elite    | Launch the Elite flight demo. Keyboard controls:          |
+|          | a/d=yaw, w/s=pitch, n=next ship. Press Ctrl+C to exit.  |
 |          |                                                          |
 | uname    | Display system identification: kernel version, CPU,      |
 |          | clock speed, memory sizes, tick rate, max tasks.         |
@@ -399,8 +436,8 @@ The BACKSPACE key may be used to correct input errors.
   osito> ps
   ID  Pri  State  Ticks  Name
   0   0    ready  1  idle
-  1   1    block  293  heartbeat
-  2   2    run    222  shell
+  1   2    ready  0  input
+  2   3    run    206  shell
 
   osito> uname
   OsitoK v0.1 xtensa-lx106 ESP8266 @ 80MHz DRAM:80KB IRAM:32KB tick:100Hz tasks:8
@@ -420,21 +457,20 @@ The BACKSPACE key may be used to correct input errors.
     Largest:    8188 bytes
     Fragments:  1
 
-  osito> gpio
-  Pin  Dir  Val  Wemos
-   0   in   1    D3
-   2   in   1    D4/LED
-   4   in   1    D2
-   5   in   1    D1
-  12   in   0    D6
-  13   in   0    D7
-  14   in   0    D5
-  15   in   0    D8
-  16   in   0    D0
+  osito> forth
+  zf: ready (Ctrl+C exit)
+  1 2 + .
+  3  ok
+  : sq dup * ;
+   ok
+  7 sq .
+  49  ok
+  [Ctrl+C]
 
-  osito> ping
-  ping 0 -> heartbeat (queued: 1)
-  [heartbeat: pong 0]
+  osito> fs write test.zf : cube dup dup * * ; 5 cube .
+  wrote 29 bytes to 'test.zf'
+  osito> run test.zf
+  125  ok
 
   osito> timer
   timer: armed 1s one-shot... FIRED! (100 ticks)
@@ -623,7 +659,155 @@ A Python upload utility is provided at `tools/upload.py`:
       irrecoverably. The operator should exercise caution.
 
 
-## XI. SYSTEM ARCHITECTURE
+## XI. 3D GRAPHICS AND ELITE FLIGHT DEMO
+
+OsitoK includes a complete wireframe 3D rendering pipeline, built
+entirely with integer arithmetic on a processor with no floating-point
+unit. This system powers the Elite flight demo.
+
+**Fixed-Point Math (16.16):**
+
+All 3D computation uses `fix16_t` — a 32-bit signed integer where the
+upper 16 bits represent the integer part and the lower 16 bits the
+fractional part. A 256-entry sine table provides trigonometric functions
+with 1.4-degree resolution. Division and square root are computed
+iteratively without hardware support.
+
+**3D Pipeline:**
+
+```
+  Model vertices (fix16 xyz)
+       |
+       v
+  mat3_rotate_x/y/z    ← 3x3 rotation matrix, angle_t (0-255)
+       |
+       v
+  mat3_transform        ← apply rotation to each vertex
+       |
+       v
+  project()             ← perspective projection to 2D (128x64)
+       |
+       v
+  fb_line()             ← Bresenham line drawing to framebuffer
+       |
+       v
+  fb_flush()            ← stream 1024 bytes to UART/display
+```
+
+**Ship Models:**
+
+Geometry data from the original BBC Micro Elite (bbcelite.com),
+scaled to fix16 coordinates:
+
+```
+  MODEL        VERTICES  EDGES   DESCRIPTION
+  -----        --------  -----   -----------
+  Cube              8      12    Test model (unit cube)
+  Cobra Mk III     28      38    Player ship (iconic)
+  Sidewinder       10      15    Common pirate/enemy
+  Viper            15      20    Police patrol ship
+  Coriolis         16      28    Space station (rotating)
+```
+
+**Elite Flight Demo:**
+
+The `elite` command launches an interactive flight demo:
+- Keyboard: `a`/`d` = yaw, `w`/`s` = pitch, `n` = next ship model
+- Starfield: pseudo-random dots scrolling with velocity
+- HUD: speed indicator, compass, ship name
+- Renders at ~15-20 FPS on the 80 MHz processor
+- Press Ctrl+C to exit
+
+
+## XII. ZFORTH INTERACTIVE LANGUAGE
+
+OsitoK includes **zForth**, a minimal Forth interpreter adapted for
+bare-metal embedded use. zForth replaces the earlier Tiny BASIC
+interpreter and bytecode VM, saving approximately 4 KB of IRAM.
+
+**Characteristics:**
+
+```
+  Property                  Value
+  --------                  -----
+  Cell size                 32-bit signed integer (int32_t)
+  Dictionary                2,048 bytes
+  Data stack depth          16 cells
+  Return stack depth        16 cells
+  Number formats            Decimal, hexadecimal (0x prefix)
+  Context persistence       Yes (definitions survive between sessions)
+  Source                    github.com/zevv/zForth (MIT license)
+```
+
+**Built-in Words (core.zf bootstrap):**
+
+The core bootstrap defines essential control flow and convenience words:
+
+```
+  CATEGORY     WORDS
+  --------     -----
+  Arithmetic   + - * / % 1+ 1- dup drop swap rot over pick
+  Comparison   = != < > <= >= <0 =0 not
+  Logic        & | ^ << >>
+  Control      if else fi unless begin again until do loop
+  Variables    variable constant allot !  @ +!
+  I/O          emit . cr br tell s" ."
+  Stack        >r r> i j
+```
+
+**Hardware Syscalls:**
+
+zForth programs can access OsitoK hardware through numbered syscalls:
+
+```
+  WORD           STACK EFFECT       DESCRIPTION
+  ----           ------------       -----------
+  emit           ( c -- )           Print character to UART
+  .              ( n -- )           Print number
+  tell           ( addr len -- )    Print string from dictionary
+  fb-clear       ( -- )             Clear 128x64 framebuffer
+  fb-pixel       ( x y -- )         Set pixel
+  fb-line        ( x0 y0 x1 y1 -- ) Draw line (Bresenham)
+  fb-flush       ( -- )             Send framebuffer to display
+  fb-text        ( col row a l -- ) Draw text string
+  yield          ( -- )             Yield CPU to other tasks
+  ticks          ( -- n )           Push system tick count
+  delay          ( n -- )           Sleep for n ticks
+  wire-render    ( m rx ry rz -- )  Render 3D wireframe model
+  wire-models    ( -- n )           Push number of models
+```
+
+The `wire-render` syscall accepts a model index (0=cube, 1=cobra,
+2=sidewinder, 3=viper, 4=coriolis) and three rotation angles
+(0-255 = 0-360 degrees).
+
+**Example: Spinning Cobra from Forth:**
+
+```
+  osito> forth
+  zf: ready (Ctrl+C exit)
+  : spin 20 0 do fb-clear dup i 8 * i 8 * 0 wire-render fb-flush 3 delay loop drop ;
+   ok
+  1 spin
+   ok
+```
+
+**Running Scripts from OsitoFS:**
+
+```
+  osito> fs write demo.zf fb-clear 1 30 45 0 wire-render fb-flush
+  wrote 46 bytes to 'demo.zf'
+  osito> run demo.zf
+   ok
+```
+
+      NOTE: The earlier Tiny BASIC interpreter and bytecode VM have been
+      removed to conserve IRAM. Their source code is preserved in git
+      history (commits 434697a through 11d5a48) and may be restored as
+      an optional compile-time feature if desired.
+
+
+## XIII. SYSTEM ARCHITECTURE
 
 ```
                      +============================+
@@ -662,15 +846,15 @@ A Python upload utility is provided at `tools/upload.py`:
               +-----------+-----+------+-----------+
               |           |            |           |
         +-----+---+ +----+----+ +-----+----+ +----+-----+
-        |  IDLE   | |HEARTBEAT| |  SHELL   | | (slots  |
+        |  IDLE   | |  INPUT  | |  SHELL   | | (slots  |
         | task 0  | | task 1  | | task 2   | |  3 - 7) |
-        | pri=0   | | pri=1   | | pri=2    | | avail.  |
+        | pri=0   | | pri=2   | | pri=3    | | avail.  |
         +---------+ +---------+ +-----+----+ +----------+
                          |             |
                     +----+----+  +-----+-----+
                     |   IPC   |  |   SHELL   |
                     | sem/mq  |  | COMMANDS  |
-                    | swtimer |  | 19 cmds   |
+                    | swtimer |  |  25+ cmds |
                     +---------+  +-----+-----+
                                        |
               +----------+-------------+-------------+
@@ -704,7 +888,7 @@ A Python upload utility is provided at `tools/upload.py`:
 ```
 
 
-## XII. MEMORY MAP
+## XIV. MEMORY MAP
 
 ```
   INSTRUCTION RAM (32 KB)
@@ -770,7 +954,7 @@ A Python upload utility is provided at `tools/upload.py`:
 ```
 
 
-## XIII. SOURCE FILE DIRECTORY
+## XV. SOURCE FILE DIRECTORY
 
 ```
   FILE                              LINES  DESCRIPTION
@@ -816,12 +1000,44 @@ A Python upload utility is provided at `tools/upload.py`:
   src/drivers/uart.h                  46   UART API declarations
   src/drivers/gpio.cpp               128   GPIO 0-16, IOMUX auto-config
   src/drivers/gpio.h                  46   GPIO API declarations
+  src/drivers/adc.cpp                 68   SAR ADC (10-bit, A0 pin)
+  src/drivers/adc.h                   21   ADC API declarations
+  src/drivers/input.cpp              121   Joystick input (ADC + button)
+  src/drivers/input.h                 34   Input event API declarations
+  src/drivers/font.cpp               185   4x6 bitmap font (ASCII 32-126)
+  src/drivers/font.h                  19   Font API declarations
+  src/drivers/video.cpp              270   Framebuffer 128x64, Bresenham lines
+
+  Math library
+  ~~~~~~~~~~~~
+  src/math/fixedpoint.h              120   Fixed-point 16.16 types and inlines
+  src/math/fixedpoint.cpp            162   sin/cos tables, div, sqrt, print
+  src/math/matrix3.h                  72   3D vector/matrix types and inlines
+  src/math/matrix3.cpp               165   Rotation, multiply, transform, project
+
+  3D graphics
+  ~~~~~~~~~~~
+  src/gfx/wire3d.h                    53   Wireframe model struct, render API
+  src/gfx/wire3d.cpp                 140   Render pipeline: rotate→project→draw
+  src/gfx/ships.h                     40   Elite ship model declarations
+  src/gfx/ships.cpp                  285   Ship vertex/edge data (4 models)
+  src/game/game.h                     18   Game API declarations
+  src/game/game.cpp                  220   Elite flight demo (HUD, starfield)
+
+  zForth language
+  ~~~~~~~~~~~~~~~
+  src/forth/zforth.c                 887   Core interpreter (adapted, MIT)
+  src/forth/zforth.h                 119   API header (ctx, eval, push/pop)
+  src/forth/zfconf.h                  28   Config: int32 cells, 2KB dict
+  src/forth/zf_host.cpp              400   Host callbacks, REPL, file runner
+  src/forth/setjmp.h                  25   jmp_buf typedef for Xtensa CALL0
+  src/forth/setjmp.S                  44   setjmp/longjmp (6 registers, 24B)
 
   User interface
   ~~~~~~~~~~~~~~
-  src/shell/shell.cpp                744   Interactive console, 19 commands
+  src/shell/shell.cpp                830   Interactive console, 25+ commands
   src/shell/shell.h                   20   Shell entry point declaration
-  src/main.cpp                       107   kernel_main: init and launch
+  src/main.cpp                        70   kernel_main: init and launch
 
   System headers
   ~~~~~~~~~~~~~~
@@ -844,11 +1060,11 @@ A Python upload utility is provided at `tools/upload.py`:
   tools/flash.sh                      45   Flash utility script
   tools/monitor.sh                    17   Serial monitor script
                                    -----
-  TOTAL                            5,019   lines of source
+  TOTAL                           ~8,000   lines of source
 ```
 
 
-## XIV. KNOWN LIMITATIONS
+## XVI. KNOWN LIMITATIONS
 
 The operator should be aware of the following limitations in the
 current release:
@@ -891,7 +1107,7 @@ current release:
      uses a shared global sector buffer to stay within this constraint.
 
 
-## XV. WARRANTY AND DISCLAIMER
+## XVII. WARRANTY AND DISCLAIMER
 
 ```
 +============================================================================+
@@ -931,6 +1147,7 @@ current release:
   Written for the Xtensa LX106 processor.
   Assembled and tested on the Wemos D1 Mini computing module.
 
-  5,019 lines of code. 80 KB of RAM. 3.8 MB of persistent storage.
+  ~8,000 lines of code. 80 KB of RAM. 3.8 MB of persistent storage.
+  One Forth interpreter. Four spaceships. Zero floating-point units.
   No bears were harmed in the making of this kernel.
 ```

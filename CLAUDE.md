@@ -107,13 +107,20 @@ Minimal Forth interpreter (github.com/zevv/zForth, MIT). Replaced BASIC+VM.
 - **Config**: int32_t cells, 2KB dictionary, 16-deep data/return stacks
 - **Context**: `zf_ctx` struct (~2.3KB in BSS), persistent across invocations
 - **Bootstrap**: core.zf embedded as `static const char[]` — defines if/else/fi, do/loop, variables, s"
-- **Syscalls**: emit(0), print(1), tell(2), fb-clear(128), fb-pixel(129), fb-line(130), fb-flush(131), fb-text(132), yield(133), ticks(134), delay(135)
+- **Syscalls**: emit(0), print(1), tell(2), fb-clear(128), fb-pixel(129), fb-line(130), fb-flush(131), fb-text(132), yield(133), ticks(134), delay(135), wire-render(136), wire-models(137)
+- **wire-render** `( model rx ry rz -- )`: models 0=cube, 1=cobra, 2=sidewinder, 3=viper, 4=coriolis
 - **setjmp/longjmp**: custom Xtensa CALL0 asm, saves a0/a1/a12-a15 (24 bytes)
 - **Shell**: `forth` (REPL, Ctrl+C exit), `run <file.zf>` (execute from OsitoFS)
 
+### Historical: BASIC + VM (removed)
+Tiny BASIC interpreter and bytecode VM were the original scripting layer (F1-F5).
+Replaced by zForth to save ~4KB IRAM. Original source preserved in git history
+(commit 434697a..11d5a48). Could be restored as optional compile-time feature
+by re-adding src/basic/ and src/vm/ to the Makefile.
+
 ## Resource Budget (as of F10 + zForth)
 ```
-IRAM .text:  24,602 / 32,768 bytes (~8.2 KB free)
+IRAM .text:  24,742 / 32,768 bytes (~8.0 KB free)
 DRAM:        sin_table 1KB + pool 8KB + heap 8KB + FS buffers + zf_ctx ~2.3KB
 Flash:       OsitoFS on SPI flash (4MB total)
 Tasks:       idle, input, shell (3 of 8 slots used)
