@@ -27,6 +27,8 @@
 #include "math/fixedpoint.h"
 #include "math/matrix3.h"
 #include "gfx/wire3d.h"
+#include "gfx/ships.h"
+#include "game/game.h"
 
 /* IPC queue to heartbeat (defined in main.cpp) */
 extern mq_t hb_mq;
@@ -454,6 +456,9 @@ static void cmd_help(void)
     uart_puts("  mat3test- 3D matrix/vector test\n");
     uart_puts("  wiretest- wireframe cube (static)\n");
     uart_puts("  wirespin- wireframe cube (anim)\n");
+    uart_puts("  ship    - show Elite ship model\n");
+    uart_puts("  shipspin- spin all ships (anim)\n");
+    uart_puts("  elite   - Elite flight demo\n");
     uart_puts("  uname   - system info\n");
     uart_puts("  help    - this message\n");
     uart_puts("  reboot  - software reset\n");
@@ -875,6 +880,12 @@ static void process_command(const char *cmd)
         wire_test();
     else if (ets_strcmp(cmd, "wirespin") == 0)
         wire_spin();
+    else if (ets_strncmp(cmd, "ship", 4) == 0 && (cmd[4] == ' ' || cmd[4] == '\0'))
+        cmd_ship(cmd + 4);
+    else if (ets_strcmp(cmd, "shipspin") == 0)
+        cmd_shipspin();
+    else if (ets_strcmp(cmd, "elite") == 0)
+        game_elite();
     else if (ets_strcmp(cmd, "uname") == 0)
         cmd_uname();
     else if (ets_strcmp(cmd, "reboot") == 0)

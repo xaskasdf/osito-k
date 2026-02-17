@@ -78,6 +78,8 @@ CXX_SRCS = \
 	$(SRCDIR)/math/fixedpoint.cpp \
 	$(SRCDIR)/math/matrix3.cpp \
 	$(SRCDIR)/gfx/wire3d.cpp \
+	$(SRCDIR)/gfx/ships.cpp \
+	$(SRCDIR)/game/game.cpp \
 	$(SRCDIR)/drivers/uart.cpp \
 	$(SRCDIR)/drivers/gpio.cpp \
 	$(SRCDIR)/drivers/adc.cpp \
