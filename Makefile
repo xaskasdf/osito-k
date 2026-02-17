@@ -79,8 +79,10 @@ CXX_SRCS = \
 	$(SRCDIR)/drivers/gpio.cpp \
 	$(SRCDIR)/drivers/adc.cpp \
 	$(SRCDIR)/drivers/input.cpp \
+	$(SRCDIR)/drivers/font.cpp \
 	$(SRCDIR)/drivers/video.cpp \
 	$(SRCDIR)/vm/vm.cpp \
+	$(SRCDIR)/basic/basic.cpp \
 	$(SRCDIR)/shell/shell.cpp \
 	$(SRCDIR)/main.cpp
 

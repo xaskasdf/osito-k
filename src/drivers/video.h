@@ -43,6 +43,20 @@ void fb_line(int x0, int y0, int x1, int y1);
 /* Flush framebuffer to UART (sync header + 1024 bytes) */
 void fb_flush(void);
 
+/* ====== Text rendering (requires font.h) ====== */
+
+/* Draw a single character at pixel coordinates (OR-compositing) */
+void fb_putchar(int x, int y, char c);
+
+/* Draw a string at pixel coordinates (no wrapping) */
+void fb_puts_at(int x, int y, const char *str);
+
+/* Draw a character at grid coordinates (col 0-31, row 0-9) */
+void fb_text_putc(int col, int row, char c);
+
+/* Draw a string at grid coordinates (wraps at screen edge) */
+void fb_text_puts(int col, int row, const char *str);
+
 #ifdef __cplusplus
 }
 #endif

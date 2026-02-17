@@ -23,6 +23,7 @@
 #include "kernel/mq.h"
 #include "kernel/timer_sw.h"
 #include "vm/vm.h"
+#include "basic/basic.h"
 
 /* IPC queue to heartbeat (defined in main.cpp) */
 extern mq_t hb_mq;
@@ -445,6 +446,7 @@ static void cmd_help(void)
     uart_puts("  run F   - run .vm bytecode program\n");
     uart_puts("  joy     - joystick live monitor\n");
     uart_puts("  fbtest  - framebuffer test pattern\n");
+    uart_puts("  basic   - Tiny BASIC interpreter\n");
     uart_puts("  uname   - system info\n");
     uart_puts("  help    - this message\n");
     uart_puts("  reboot  - software reset\n");
@@ -796,17 +798,14 @@ static void cmd_fbtest(void)
     fb_line(FB_WIDTH - 1, FB_HEIGHT - 1, 0, FB_HEIGHT - 1);
     fb_line(0, FB_HEIGHT - 1, 0, 0);
 
-    /* Diagonals */
-    fb_line(0, 0, FB_WIDTH - 1, FB_HEIGHT - 1);
-    fb_line(FB_WIDTH - 1, 0, 0, FB_HEIGHT - 1);
+    /* Title text at top */
+    fb_text_puts(2, 1, "OsitoK v0.1");
 
-    /* Centered box (32x16 in the middle) */
-    int cx = FB_WIDTH / 2;
-    int cy = FB_HEIGHT / 2;
-    fb_line(cx - 16, cy - 8, cx + 15, cy - 8);
-    fb_line(cx + 15, cy - 8, cx + 15, cy + 7);
-    fb_line(cx + 15, cy + 7, cx - 16, cy + 7);
-    fb_line(cx - 16, cy + 7, cx - 16, cy - 8);
+    /* Info text */
+    fb_text_puts(2, 3, "128x64 framebuffer");
+    fb_text_puts(2, 4, "4x6 font 32x10 grid");
+    fb_text_puts(2, 6, "ABCDEFGHIJ0123456789");
+    fb_text_puts(2, 8, "Ready.");
 
     fb_flush();
     uart_puts("fb: flushed 1028 bytes\n");
@@ -859,6 +858,8 @@ static void process_command(const char *cmd)
         cmd_adc();
     else if (ets_strcmp(cmd, "fbtest") == 0)
         cmd_fbtest();
+    else if (ets_strcmp(cmd, "basic") == 0)
+        basic_enter();
     else if (ets_strcmp(cmd, "uname") == 0)
         cmd_uname();
     else if (ets_strcmp(cmd, "reboot") == 0)

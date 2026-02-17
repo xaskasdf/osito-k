@@ -80,6 +80,7 @@ SYSCALL_ALIASES = {
     'fb_pixel':     15,
     'fb_line':      16,
     'fb_flush':     17,
+    'fb_putchar':   18,
 }
 
 def parse_int(s):

@@ -109,6 +109,7 @@ typedef enum {
 #define SYS_FB_PIXEL    15
 #define SYS_FB_LINE     16
 #define SYS_FB_FLUSH    17
+#define SYS_FB_PUTCHAR  18
 
 /* ====== VM state ====== */
 

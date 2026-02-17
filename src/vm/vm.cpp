@@ -175,6 +175,16 @@ static int vm_syscall(vm_t *vm, uint8_t num)
         fb_flush();
         break;
 
+    case SYS_FB_PUTCHAR:
+        {
+            uint32_t ch;
+            if (vm_pop(vm, &ch) < 0) return -1;  /* char */
+            if (vm_pop(vm, &b) < 0) return -1;    /* y */
+            if (vm_pop(vm, &a) < 0) return -1;    /* x */
+            fb_putchar((int)a, (int)b, (char)ch);
+        }
+        break;
+
     default:
         uart_puts("vm: unknown syscall ");
         uart_put_dec(num);

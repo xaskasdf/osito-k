@@ -7,6 +7,7 @@
  */
 
 #include "drivers/video.h"
+#include "drivers/font.h"
 #include "drivers/uart.h"
 
 extern "C" {
@@ -89,6 +90,50 @@ void fb_line(int x0, int y0, int x1, int y1)
             }
             y0 += sy;
         }
+    }
+}
+
+/* ====== Text rendering ====== */
+
+void fb_putchar(int x, int y, char c)
+{
+    if (c < FONT_FIRST || c > FONT_LAST)
+        c = '?';
+    const uint8_t *glyph = font_4x6[c - FONT_FIRST];
+
+    for (int row = 0; row < FONT_H; row++) {
+        uint8_t bits = glyph[row];  /* pixels in bits 7:4 */
+        for (int col = 0; col < FONT_W; col++) {
+            if (bits & (0x80 >> col))
+                fb_set_pixel(x + col, y + row);
+        }
+    }
+}
+
+void fb_puts_at(int x, int y, const char *str)
+{
+    while (*str) {
+        fb_putchar(x, y, *str++);
+        x += FONT_W;
+    }
+}
+
+void fb_text_putc(int col, int row, char c)
+{
+    fb_putchar(col * FONT_W, row * FONT_H, c);
+}
+
+void fb_text_puts(int col, int row, const char *str)
+{
+    while (*str) {
+        if (col >= TEXT_COLS) {
+            col = 0;
+            row++;
+            if (row >= TEXT_ROWS)
+                return;
+        }
+        fb_putchar(col * FONT_W, row * FONT_H, *str++);
+        col++;
     }
 }
 
