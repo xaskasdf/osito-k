@@ -24,6 +24,7 @@
 #include "kernel/timer_sw.h"
 #include "vm/vm.h"
 #include "basic/basic.h"
+#include "math/fixedpoint.h"
 
 /* IPC queue to heartbeat (defined in main.cpp) */
 extern mq_t hb_mq;
@@ -447,6 +448,7 @@ static void cmd_help(void)
     uart_puts("  joy     - joystick live monitor\n");
     uart_puts("  fbtest  - framebuffer test pattern\n");
     uart_puts("  basic   - Tiny BASIC interpreter\n");
+    uart_puts("  fixtest - fixed-point math test\n");
     uart_puts("  uname   - system info\n");
     uart_puts("  help    - this message\n");
     uart_puts("  reboot  - software reset\n");
@@ -860,6 +862,8 @@ static void process_command(const char *cmd)
         cmd_fbtest();
     else if (ets_strcmp(cmd, "basic") == 0)
         basic_enter();
+    else if (ets_strcmp(cmd, "fixtest") == 0)
+        fix_test();
     else if (ets_strcmp(cmd, "uname") == 0)
         cmd_uname();
     else if (ets_strcmp(cmd, "reboot") == 0)

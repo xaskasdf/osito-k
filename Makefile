@@ -75,6 +75,7 @@ CXX_SRCS = \
 	$(SRCDIR)/mem/pool_alloc.cpp \
 	$(SRCDIR)/mem/heap.cpp \
 	$(SRCDIR)/fs/ositofs.cpp \
+	$(SRCDIR)/math/fixedpoint.cpp \
 	$(SRCDIR)/drivers/uart.cpp \
 	$(SRCDIR)/drivers/gpio.cpp \
 	$(SRCDIR)/drivers/adc.cpp \
