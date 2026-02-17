@@ -12,6 +12,8 @@
 #include "kernel/task.h"
 #include "mem/heap.h"
 #include "fs/ositofs.h"
+#include "gfx/wire3d.h"
+#include "gfx/ships.h"
 
 extern "C" {
 
@@ -36,6 +38,8 @@ static const char core_zf[] =
     ": yield     133 sys ; "
     ": ticks     134 sys ; "
     ": delay     135 sys ; "
+    ": wire-render 136 sys ; "
+    ": wire-models 137 sys ; "
     /* Dictionary access shortcuts */
     ": !    0 !! ; "
     ": @    0 @@ ; "
@@ -225,6 +229,31 @@ zf_input_state zf_host_sys(zf_ctx *ctx, zf_syscall_id id, const char *last_word)
     case ZF_SYSCALL_USER + 7: { /* delay ( ticks -- ) */
         uint32_t t = (uint32_t)zf_pop(ctx);
         task_delay_ticks(t);
+        break;
+    }
+
+    case ZF_SYSCALL_USER + 8: { /* wire-render ( model rx ry rz -- ) */
+        uint8_t rz = (uint8_t)zf_pop(ctx);
+        uint8_t ry = (uint8_t)zf_pop(ctx);
+        uint8_t rx = (uint8_t)zf_pop(ctx);
+        int idx = (int)zf_pop(ctx);
+        /* 0=cube, 1-4=ships */
+        const wire_model_t *m = &wire_cube;
+        if (idx >= 1 && idx <= SHIP_COUNT)
+            m = ship_list[idx - 1];
+        mat3_t rot;
+        mat3_rotate_x(&rot, rx);
+        mat3_t ry_m; mat3_rotate_y(&ry_m, ry);
+        mat3_t tmp; mat3_multiply(&tmp, &ry_m, &rot);
+        mat3_t rz_m; mat3_rotate_z(&rz_m, rz);
+        mat3_multiply(&rot, &rz_m, &tmp);
+        vec3_t pos = vec3(0, 0, FIX16(6));
+        wire_render(m, &rot, pos, FIX16(64));
+        break;
+    }
+
+    case ZF_SYSCALL_USER + 9: { /* wire-models ( -- n ) */
+        zf_push(ctx, SHIP_COUNT + 1); /* cube + ships */
         break;
     }
 
