@@ -1,0 +1,38 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download xtensa-lx106-elf toolchain
+        run: |
+          curl -sSL https://dl.espressif.com/dl/xtensa-lx106-elf-gcc8_4_0-esp-2020r3-linux-amd64.tar.gz \
+            -o toolchain.tar.gz
+          mkdir -p tools
+          tar xzf toolchain.tar.gz -C tools/
+          rm toolchain.tar.gz
+
+      - name: Install esptool
+        run: pip install esptool
+
+      - name: Build
+        run: |
+          export PATH="$PWD/tools/xtensa-lx106-elf/bin:$PATH"
+          make
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            build/osito0x00000.bin
+            build/osito.elf

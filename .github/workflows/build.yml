@@ -1,0 +1,45 @@
+name: Build
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download xtensa-lx106-elf toolchain
+        run: |
+          curl -sSL https://dl.espressif.com/dl/xtensa-lx106-elf-gcc8_4_0-esp-2020r3-linux-amd64.tar.gz \
+            -o toolchain.tar.gz
+          mkdir -p tools
+          tar xzf toolchain.tar.gz -C tools/
+          rm toolchain.tar.gz
+
+      - name: Install esptool
+        run: pip install esptool
+
+      - name: Build
+        run: |
+          export PATH="$PWD/tools/xtensa-lx106-elf/bin:$PATH"
+          make
+
+      - name: Show size
+        run: |
+          export PATH="$PWD/tools/xtensa-lx106-elf/bin:$PATH"
+          xtensa-lx106-elf-size build/osito.elf
+          xtensa-lx106-elf-size -A build/osito.elf | grep -E '\.text|\.data|\.bss|Total'
+
+      - name: Upload firmware artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: osito-k-firmware
+          path: |
+            build/osito0x00000.bin
+            build/osito.elf
+            build/osito.map
