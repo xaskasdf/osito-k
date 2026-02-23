@@ -3,6 +3,10 @@ build/
 
 # Toolchain (large, download separately)
 tools/xtensa-lx106-elf/
+tools/*.tar.gz
+
+# Python venv
+.venv/
 
 # Firmware backup (large binary)
 backup/

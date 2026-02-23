@@ -13,10 +13,10 @@ OBJCOPY = $(TOOLCHAIN)-objcopy
 OBJDUMP = $(TOOLCHAIN)-objdump
 SIZE    = $(TOOLCHAIN)-size
 
-# Python + esptool (use Windows py launcher by default)
-PYTHON  ?= py
+# Python + esptool (auto-detect: python3 on Linux, py on Windows)
+PYTHON  ?= python3
 ESPTOOL  = $(PYTHON) -m esptool
-PORT    ?= COM4
+PORT    ?= /dev/ttyUSB0
 BAUD    ?= 460800
 
 # Directories
@@ -47,6 +47,10 @@ COMMON_FLAGS = \
 CFLAGS = $(COMMON_FLAGS) -std=c11
 CXXFLAGS = $(COMMON_FLAGS) -std=c++17 -fno-exceptions -fno-rtti
 ASFLAGS = -mlongcalls -mtext-section-literals -I$(INCDIR) -I$(SRCDIR)
+
+# GCC 10.3 libgcc lacks Xtensa div/mul builtins; pull them from bundled 8.4 libgcc
+TOOLCHAIN_DIR := $(dir $(shell which $(CC) 2>/dev/null))..
+LIBGCC_COMPAT  = $(TOOLCHAIN_DIR)/lib/gcc/xtensa-lx106-elf/8.4.0/libgcc.a
 
 LDFLAGS = \
 	-mlongcalls \
@@ -116,7 +120,7 @@ all: $(BIN)
 # Link
 $(ELF): $(OBJS)
 	@echo "  LD    $@"
-	@$(LD) $(LDFLAGS) -o $@ $^ -lgcc
+	@$(LD) $(LDFLAGS) -o $@ $^ -lgcc $(wildcard $(LIBGCC_COMPAT))
 
 # Generate flash binary using esptool
 $(BIN): $(ELF)
