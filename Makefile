@@ -48,9 +48,9 @@ CFLAGS = $(COMMON_FLAGS) -std=c11
 CXXFLAGS = $(COMMON_FLAGS) -std=c++17 -fno-exceptions -fno-rtti
 ASFLAGS = -mlongcalls -mtext-section-literals -I$(INCDIR) -I$(SRCDIR)
 
-# GCC 10.3 libgcc lacks Xtensa div/mul builtins; pull them from bundled 8.4 libgcc
-TOOLCHAIN_DIR := $(dir $(shell which $(CC) 2>/dev/null))..
-LIBGCC_COMPAT  = $(TOOLCHAIN_DIR)/lib/gcc/xtensa-lx106-elf/8.4.0/libgcc.a
+# GCC 10.3 libgcc lacks Xtensa div/mul builtins; find 8.4 libgcc if present
+LIBGCC_COMPAT := $(shell find $(dir $(shell which $(CC) 2>/dev/null)).. \
+	-path '*/8.4.0/libgcc.a' 2>/dev/null | head -1)
 
 LDFLAGS = \
 	-mlongcalls \
