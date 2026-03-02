@@ -13,6 +13,11 @@ OBJCOPY = $(TOOLCHAIN)-objcopy
 OBJDUMP = $(TOOLCHAIN)-objdump
 SIZE    = $(TOOLCHAIN)-size
 
+# Feature flags (1=enabled, 0=disabled)
+ENABLE_ELITE ?= 1
+ENABLE_FORTH ?= 1
+ENABLE_DOOM  ?= 0
+
 # Python + esptool (auto-detect: python3 on Linux, py on Windows)
 PYTHON  ?= python3
 ESPTOOL  = $(PYTHON) -m esptool
@@ -42,11 +47,15 @@ COMMON_FLAGS = \
 	-I$(INCDIR) \
 	-I$(SRCDIR) \
 	-DICACHE_FLASH_ATTR='__attribute__((section(".irom0.text")))' \
-	-DIRAM_ATTR='__attribute__((section(".iram0.text")))'
+	-DIRAM_ATTR='__attribute__((section(".iram0.text")))' \
+	-DENABLE_ELITE=$(ENABLE_ELITE) \
+	-DENABLE_FORTH=$(ENABLE_FORTH) \
+	-DENABLE_DOOM=$(ENABLE_DOOM)
 
 CFLAGS = $(COMMON_FLAGS) -std=c11
 CXXFLAGS = $(COMMON_FLAGS) -std=c++17 -fno-exceptions -fno-rtti
-ASFLAGS = -mlongcalls -mtext-section-literals -I$(INCDIR) -I$(SRCDIR)
+ASFLAGS = -mlongcalls -mtext-section-literals -I$(INCDIR) -I$(SRCDIR) \
+	-DENABLE_ELITE=$(ENABLE_ELITE) -DENABLE_FORTH=$(ENABLE_FORTH) -DENABLE_DOOM=$(ENABLE_DOOM)
 
 # GCC 10.3 libgcc lacks Xtensa div/mul builtins; find 8.4 libgcc if present
 LIBGCC_COMPAT := $(shell find $(dir $(shell which $(CC) 2>/dev/null)).. \
@@ -61,17 +70,15 @@ LDFLAGS = \
 	-Wl,--gc-sections \
 	-Wl,-Map=$(BUILDDIR)/osito.map
 
-# Source files
+# Source files — core (always compiled)
 ASM_SRCS = \
 	$(SRCDIR)/boot/vectors.S \
 	$(SRCDIR)/boot/crt0.S \
-	$(SRCDIR)/kernel/context_switch.S \
-	$(SRCDIR)/forth/setjmp.S
+	$(SRCDIR)/kernel/context_switch.S
 
 C_SRCS = \
 	$(SRCDIR)/boot/nosdk_init.c \
-	$(SRCDIR)/kernel/timer_tick.c \
-	$(SRCDIR)/forth/zforth.c
+	$(SRCDIR)/kernel/timer_tick.c
 
 CXX_SRCS = \
 	$(SRCDIR)/kernel/sched.cpp \
@@ -83,18 +90,37 @@ CXX_SRCS = \
 	$(SRCDIR)/fs/ositofs.cpp \
 	$(SRCDIR)/math/fixedpoint.cpp \
 	$(SRCDIR)/math/matrix3.cpp \
-	$(SRCDIR)/gfx/wire3d.cpp \
-	$(SRCDIR)/gfx/ships.cpp \
-	$(SRCDIR)/game/game.cpp \
 	$(SRCDIR)/drivers/uart.cpp \
 	$(SRCDIR)/drivers/gpio.cpp \
 	$(SRCDIR)/drivers/adc.cpp \
 	$(SRCDIR)/drivers/input.cpp \
 	$(SRCDIR)/drivers/font.cpp \
 	$(SRCDIR)/drivers/video.cpp \
-	$(SRCDIR)/forth/zf_host.cpp \
 	$(SRCDIR)/shell/shell.cpp \
 	$(SRCDIR)/main.cpp
+
+# Feature: Elite wireframe flight demo (~2.1KB IRAM)
+ifeq ($(ENABLE_ELITE),1)
+CXX_SRCS += \
+	$(SRCDIR)/gfx/wire3d.cpp \
+	$(SRCDIR)/gfx/ships.cpp \
+	$(SRCDIR)/game/game.cpp
+endif
+
+# Feature: zForth scripting engine (~4.2KB IRAM)
+ifeq ($(ENABLE_FORTH),1)
+ASM_SRCS += $(SRCDIR)/forth/setjmp.S
+C_SRCS   += $(SRCDIR)/forth/zforth.c
+CXX_SRCS += $(SRCDIR)/forth/zf_host.cpp
+endif
+
+# Feature: DOOM wireframe 2.5D engine (~3.5KB IRAM)
+ifeq ($(ENABLE_DOOM),1)
+CXX_SRCS += \
+	$(SRCDIR)/doom/doom_gen.cpp \
+	$(SRCDIR)/doom/doom_render.cpp \
+	$(SRCDIR)/doom/doom_game.cpp
+endif
 
 # Object files
 ASM_OBJS = $(patsubst $(SRCDIR)/%.S,$(BUILDDIR)/%.o,$(ASM_SRCS))

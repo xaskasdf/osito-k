@@ -23,15 +23,22 @@
 #include "kernel/timer_sw.h"
 #include "math/fixedpoint.h"
 #include "math/matrix3.h"
+#if ENABLE_ELITE
 #include "gfx/wire3d.h"
 #include "gfx/ships.h"
 #include "game/game.h"
+#endif
+#if ENABLE_DOOM
+#include "doom/doom.h"
+#endif
 
 extern "C" {
 
+#if ENABLE_FORTH
 /* Forth REPL and file runner (from zf_host.cpp) */
 void forth_enter(void);
 void forth_run(const char *filename);
+#endif
 
 /* Command line buffer */
 #define CMD_BUF_SIZE 128
@@ -445,17 +452,24 @@ static void cmd_help(void)
     uart_puts("  fs      - filesystem commands\n");
     uart_puts("  pri N P - set task N priority to P\n");
     uart_puts("  timer   - test 1s software timer\n");
+#if ENABLE_FORTH
     uart_puts("  run F   - run .zf Forth script\n");
     uart_puts("  forth   - Forth REPL\n");
+#endif
     uart_puts("  joy     - joystick live monitor\n");
     uart_puts("  fbtest  - framebuffer test pattern\n");
     uart_puts("  fixtest - fixed-point math test\n");
     uart_puts("  mat3test- 3D matrix/vector test\n");
+#if ENABLE_ELITE
     uart_puts("  wiretest- wireframe cube (static)\n");
     uart_puts("  wirespin- wireframe cube (anim)\n");
     uart_puts("  ship    - show Elite ship model\n");
     uart_puts("  shipspin- spin all ships (anim)\n");
     uart_puts("  elite   - Elite flight demo\n");
+#endif
+#if ENABLE_DOOM
+    uart_puts("  doom    - DOOM wireframe 2.5D\n");
+#endif
     uart_puts("  uname   - system info\n");
     uart_puts("  help    - this message\n");
     uart_puts("  reboot  - software reset\n");
@@ -651,6 +665,7 @@ static void cmd_uname(void)
     uart_puts("\n");
 }
 
+#if ENABLE_FORTH
 /* ====== Forth run command ====== */
 
 static void cmd_run(const char *args)
@@ -662,6 +677,7 @@ static void cmd_run(const char *args)
     }
     forth_run(args);
 }
+#endif
 
 static void cmd_joy(void)
 {
@@ -781,20 +797,25 @@ static void process_command(const char *cmd)
         cmd_pri(cmd + 4);
     else if (ets_strcmp(cmd, "timer") == 0)
         cmd_timer();
+#if ENABLE_FORTH
     else if (ets_strncmp(cmd, "run", 3) == 0 && (cmd[3] == ' ' || cmd[3] == '\0'))
         cmd_run(cmd + 3);
+#endif
     else if (ets_strcmp(cmd, "joy") == 0)
         cmd_joy();
     else if (ets_strcmp(cmd, "adc") == 0)
         cmd_adc();
     else if (ets_strcmp(cmd, "fbtest") == 0)
         cmd_fbtest();
+#if ENABLE_FORTH
     else if (ets_strcmp(cmd, "forth") == 0)
         forth_enter();
+#endif
     else if (ets_strcmp(cmd, "fixtest") == 0)
         fix_test();
     else if (ets_strcmp(cmd, "mat3test") == 0)
         mat3_test();
+#if ENABLE_ELITE
     else if (ets_strcmp(cmd, "wiretest") == 0)
         wire_test();
     else if (ets_strcmp(cmd, "wirespin") == 0)
@@ -805,6 +826,11 @@ static void process_command(const char *cmd)
         cmd_shipspin();
     else if (ets_strcmp(cmd, "elite") == 0)
         game_elite();
+#endif
+#if ENABLE_DOOM
+    else if (ets_strcmp(cmd, "doom") == 0)
+        game_doom();
+#endif
     else if (ets_strcmp(cmd, "uname") == 0)
         cmd_uname();
     else if (ets_strcmp(cmd, "reboot") == 0)

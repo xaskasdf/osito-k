@@ -8,19 +8,32 @@ A [naranjositos.tech](https://naranjositos.tech/) project.
 ## Build & Flash
 
 ```bash
+# Linux:
+export PATH="$PWD/tools/xtensa-lx106-elf/bin:$PATH"
+make                    # default: all features enabled
+make ENABLE_ELITE=0 ENABLE_FORTH=0 ENABLE_DOOM=1   # DOOM config
+make flash              # flash via /dev/ttyUSB0
+
+# Windows:
 export PATH="/c/Users/xasko/osito-k/tools/xtensa-lx106-elf/bin:$PATH"
-make                    # ELF links fine, BIN step fails (python vs py)
-# Manual image + flash:
-py -m esptool --chip esp8266 elf2image --flash_mode dout --flash_size 4MB --flash_freq 40m --version 1 -o build/osito build/osito.elf
-py -m esptool --chip esp8266 --port COM4 --baud 460800 write_flash --flash_mode dout --flash_size 4MB --flash_freq 40m 0x00000 build/osito0x00000.bin
+make PYTHON=py          # or run esptool manually
+```
+
+**Feature flags** (see Makefile):
+```
+ENABLE_ELITE=1   Elite wireframe flight demo + ship models (~2.1KB IRAM)
+ENABLE_FORTH=1   zForth scripting engine (~4.2KB IRAM)
+ENABLE_DOOM=0    DOOM wireframe 2.5D engine (~3.5KB IRAM)
 ```
 
 **Serial monitor**: 74880 baud (ROM bootloader uses ~52MHz APB, not 80MHz).
 ```bash
-py -c "import serial,time; s=serial.Serial('COM4',74880,timeout=0.5); s.dtr=False; s.rts=False; [print(s.read(256).decode('ascii',errors='replace'),end='') for _ in range(100)]"
+python3 tools/tviewer.py                    # terminal video bridge (SSH-safe)
+python3 tools/tviewer.py /dev/ttyUSB0 74880 # explicit port/baud
+python3 tools/console.py /dev/ttyUSB0       # text-only console
 ```
 
-**Restore original firmware**: `py -m esptool --port COM4 write_flash 0x0 backup/wemos_d1_full_backup.bin`
+**Restore original firmware**: `python3 -m esptool --port /dev/ttyUSB0 write_flash 0x0 backup/wemos_d1_full_backup.bin`
 
 ## Critical Architecture Details
 
@@ -49,10 +62,10 @@ py -c "import serial,time; s=serial.Serial('COM4',74880,timeout=0.5); s.dtr=Fals
 
 ### Known issues
 - `ets_strlen` ROM function crashes when called from preemptible task context. Use inline strlen instead.
-- Makefile BIN step uses `python` but system has `py`. Run esptool manually.
 - UART baud shows 74880 because ROM bootloader sets ~52MHz APB clock before our PLL init.
 - Flash mode MUST be DOUT (QIO causes boot failure on Wemos D1).
 - Image format MUST be version 1 (v2 doesn't boot on ESP8266).
+- GCC 10.3 (earlephilhower) libgcc lacks Xtensa div/mul builtins. Makefile auto-finds GCC 8.4 libgcc via LIBGCC_COMPAT.
 
 ## Code Map
 ```
@@ -83,7 +96,11 @@ src/forth/zfconf.h          zForth config: int32 cells, 2KB dict, 16-deep stacks
 src/forth/zf_host.cpp       Host callbacks, core.zf bootstrap, REPL, file runner
 src/forth/setjmp.h          jmp_buf typedef for Xtensa CALL0
 src/forth/setjmp.S          setjmp/longjmp asm (6 regs, 24 bytes)
-src/shell/shell.cpp         Interactive shell (ps, mem, heap, fs, gpio, forth, run, etc.)
+src/doom/doom.h             DOOM engine data structures (level, player, enemies, game state)
+src/doom/doom_gen.cpp       Procedural level generator (4x4 grid, snake path, enemy placement)
+src/doom/doom_render.cpp    2.5D wireframe renderer (walls, enemy sprites, weapon, HUD)
+src/doom/doom_game.cpp      Game loop: input, movement, collision, shooting, AI, game over
+src/shell/shell.cpp         Interactive shell (ps, mem, heap, fs, gpio, forth, run, doom, etc.)
 src/main.cpp                kernel_main: init → create tasks → timer → sched_start
 ```
 
@@ -119,17 +136,48 @@ Replaced by zForth to save ~4KB IRAM. Original source preserved in git history
 (commit 434697a..11d5a48). Could be restored as optional compile-time feature
 by re-adding src/basic/ and src/vm/ to the Makefile.
 
-## Resource Budget (as of F10 + zForth)
+## Resource Budget
+
+### IRAM .text breakdown by subsystem
 ```
-IRAM .text:  24,742 / 32,768 bytes (~8.0 KB free)
-DRAM:        sin_table 1KB + pool 8KB + heap 8KB + FS buffers + zf_ctx ~2.3KB
-Flash:       OsitoFS on SPI flash (4MB total)
-Tasks:       idle, input, shell (3 of 8 slots used)
+Subsystem                        IRAM (bytes)   Config flag
+─────────────────────────────────────────────────────────────
+Core (boot, kernel, scheduler)     ~4,800       always
+Drivers (uart, gpio, adc, input)   ~2,200       always
+Video (framebuffer, font)          ~2,600       always
+Memory (pool, heap)                ~1,800       always
+Filesystem (ositofs)               ~2,100       always
+Math (fixedpoint, matrix3)         ~2,200       always
+Shell                              ~2,600       always
+────── subtotal core ──────       ~18,300
+Elite (wire3d, ships, game)        ~2,100       ENABLE_ELITE
+zForth (zforth, zf_host, setjmp)   ~4,200       ENABLE_FORTH
+DOOM (gen, render, game, combat)   ~5,900       ENABLE_DOOM
 ```
 
-## Roadmap — Remaining Features
+### Build configurations
+```
+Config                              .text    .data    .bss    IRAM free
+All features (Elite+Forth+DOOM)    ~30,500  ~15,700  ~37,800  ~2.3KB
+Elite + Forth (default)             24,594    9,848   37,232   ~8.2KB
+DOOM only (with combat)             24,274    5,908   36,432   ~8.5KB
+Core only (no features)            ~18,300   ~5,800  ~35,400  ~14.5KB
+```
 
-Goal: port BBC Micro Elite (wireframe 3D) + spreadsheet app.
+### DRAM usage
+```
+sin_table 1KB + pool 8KB + heap 8KB + FS buffers ~4KB + stacks ~12KB
++ zf_ctx ~2.3KB (if ENABLE_FORTH) + doom_state ~1.5KB (if ENABLE_DOOM)
+Total used: ~35-37KB of ~80KB available
+```
+
+### Other resources
+```
+Flash:   OsitoFS on SPI flash (4MB total)
+Tasks:   idle, input, shell (3 of 8 slots used)
+```
+
+## Roadmap
 
 | Feature | Description | Status |
 |---------|-------------|--------|
@@ -140,7 +188,23 @@ Goal: port BBC Micro Elite (wireframe 3D) + spreadsheet app.
 | F9      | Ship models — Cobra, Sidewinder, Coriolis, Viper, Asp, Shuttle | Done |
 | F10     | Game loop + HUD — flight, starfield, radar, joystick | Done |
 | **zF**  | **zForth** — replaced BASIC+VM, saved ~4KB IRAM | Done |
+| **F12** | **DOOM wireframe** — 2.5D BSP engine, procedural levels | Done |
 | **F11** | **Spreadsheet engine** — cell grid, formula parser, cursor UI | Next |
+
+### F12: DOOM Wireframe 2.5D
+Procedural level generator (4x4 grid, snake path connectivity) + wall-segment projection renderer.
+Compile-time feature: `ENABLE_DOOM=1`. Disabled by default to save IRAM.
+Controls: WASD=move, Q/E=strafe, A/D=turn, F/SPACE=shoot, M=minimap, R=new level, Ctrl+C=exit.
+Uses fix16 math for all transforms. doom_state_t in static BSS (~1.5KB).
+
+**Combat system**:
+- **Enemies**: denemy_t (12B), max 8 per level, placed in rooms away from spawn
+- **AI states**: IDLE → CHASE (speed 0.06/frame) → ATTACK (damage every ~0.3s) → HURT (stun) → DEAD
+- **Shooting**: hitscan — project enemy to screen X, check if within ±12px of crosshair, closest hit wins
+- **Sprites**: wireframe diamond scaled by distance, state-dependent visuals (shake on hurt, arms on attack, flat line when dead)
+- **Player HP**: 10, enemy HP: 3. Damage flash (border), muzzle flash (radial lines)
+- **Game over**: screen with kill count, R to restart, Ctrl+C to exit
+- **Minimap**: enemies shown as X marks, dead enemies hidden
 
 ### F11: Spreadsheet Engine
 Cell grid (e.g. 8×16), each cell holds number or formula string.
