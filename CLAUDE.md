@@ -124,6 +124,8 @@ arch/x86/fs/gpt.h                   GPT structs (UEFI spec) + API
 arch/x86/fs/gpt.c                   GPT parser (name match + superblock magic probe)
 arch/x86/fs/gguf.h                  GGUF types (tensor, model structs) + API
 arch/x86/fs/gguf.c                  GGUF loader (in-memory parser, NVMe read, tensor table)
+arch/x86/kernel/tensor.h            Tensor engine API (math, dequant, matvec, ops, RoPE)
+arch/x86/kernel/tensor.c            Tensor engine impl (Q4_0/Q8_0, x87/SSE math, benchmark)
 arch/x86/include/types.h            Freestanding types + MMIO + port I/O
 
 # OsitoFS v2 Host Tools (tools/ositofs/)
@@ -246,8 +248,8 @@ Tasks:   idle, input, shell (3 of 8 slots used)
 | X11     | QEMU test infrastructure (OVMF + e1000e, serial log, UDP forward) | Done |
 | **X12** | **GPT parser** (auto-find OsitoFS partition by name + magic probe) | Done |
 | **X13** | **GGUF model loader** (load from OsitoFS into RAM, in-memory parser, tensor table) | Done |
-| X14     | Tensor compute engine (CPU matmul, quantized ops) | Next |
-| X15     | Inference runtime (transformer forward pass) | Planned |
+| **X14** | **Tensor compute engine** (Q4_0/Q8_0 matvec, rmsnorm, softmax, SiLU, RoPE) | Done |
+| X15     | Inference runtime (transformer forward pass) | Next |
 | X16     | GPU compute (NVIDIA GSP-shim or MMIO shader dispatch) | Research |
 
 ### F12: DOOM Wireframe 2.5D

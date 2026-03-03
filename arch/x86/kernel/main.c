@@ -8,6 +8,7 @@
 #include "../include/types.h"
 #include "../drivers/gpu.h"
 #include "../fs/gguf.h"
+#include "tensor.h"
 
 /* ── External functions ──────────────────────────────────────── */
 
@@ -105,6 +106,9 @@ void kernel_entry(void *memory_map, uint64_t map_size,
     serial_puts("[KERN] Initializing memory manager...\n");
     fb_puts(" Initializing memory...\n");
     mem_init(memory_map, map_size, desc_size);
+
+    /* ── Tensor compute self-test ── */
+    tensor_benchmark();
 
     /* ── Step 2: PCI enumeration ── */
     serial_puts("[KERN] Scanning PCIe bus...\n");
