@@ -476,6 +476,58 @@ typedef struct {
     bool      ready;               /* Compute dispatch ready */
 } compute_state_t;
 
+/* ── X35: Copy Engine (CE) DMA Defines ───────────────────── */
+
+/* CE class IDs per GPU generation (clXXb5.h, open-gpu-doc) */
+#define TURING_DMA_COPY_A     0xC5B5
+#define AMPERE_DMA_COPY_A     0xC6B5
+#define AMPERE_DMA_COPY_B     0xC7B5   /* Also used by Ada Lovelace */
+
+/* CE method offsets (stable from Maxwell through Hopper) */
+#define CE_NOP                      0x0100
+#define CE_SET_SEMAPHORE_A          0x0240   /* addr upper 17 bits */
+#define CE_SET_SEMAPHORE_B          0x0244   /* addr lower 32 bits */
+#define CE_SET_SEMAPHORE_PAYLOAD    0x0248   /* 32-bit payload value */
+#define CE_SET_SRC_PHYS_MODE        0x0260   /* physical src type */
+#define CE_SET_DST_PHYS_MODE        0x0264   /* physical dst type */
+#define CE_LAUNCH_DMA               0x0300   /* trigger the copy */
+#define CE_OFFSET_IN_UPPER          0x0400   /* src addr upper */
+#define CE_OFFSET_IN_LOWER          0x0404   /* src addr lower */
+#define CE_OFFSET_OUT_UPPER         0x0408   /* dst addr upper */
+#define CE_OFFSET_OUT_LOWER         0x040C   /* dst addr lower */
+#define CE_PITCH_IN                 0x0410   /* src pitch (2D) */
+#define CE_PITCH_OUT                0x0414   /* dst pitch (2D) */
+#define CE_LINE_LENGTH_IN           0x0418   /* bytes per line */
+#define CE_LINE_COUNT               0x041C   /* line count (1=linear) */
+
+/* LAUNCH_DMA bitfields (clc5b5.h, identical across generations) */
+#define CE_LAUNCH_DMA_TRANSFER_NONE           (0 << 0)
+#define CE_LAUNCH_DMA_TRANSFER_PIPELINED      (1 << 0)
+#define CE_LAUNCH_DMA_TRANSFER_NON_PIPELINED  (2 << 0)
+#define CE_LAUNCH_DMA_FLUSH_ENABLE            (1 << 2)
+#define CE_LAUNCH_DMA_SEM_NONE                (0 << 3)
+#define CE_LAUNCH_DMA_SEM_RELEASE_1WORD       (1 << 3)
+#define CE_LAUNCH_DMA_SRC_PITCH               (1 << 7)
+#define CE_LAUNCH_DMA_DST_PITCH               (1 << 8)
+#define CE_LAUNCH_DMA_SRC_PHYSICAL            (1 << 12)
+#define CE_LAUNCH_DMA_DST_PHYSICAL            (1 << 13)
+
+/* Physical memory target (SET_SRC_PHYS_MODE / SET_DST_PHYS_MODE) */
+#define CE_PHYS_TARGET_LOCAL_FB            0   /* VRAM */
+#define CE_PHYS_TARGET_COHERENT_SYSMEM     1   /* System RAM, coherent */
+#define CE_PHYS_TARGET_NONCOHERENT_SYSMEM  2   /* System RAM, non-coherent */
+
+/* CE state (managed by host) */
+typedef struct {
+    uint32_t  ce_class;            /* Generation-specific CE class ID */
+    bool      class_bound;         /* SET_OBJECT sent to subchannel 4 */
+    pushbuf_state_t pb;            /* CE pushbuffer (shared or separate) */
+    uint32_t *semaphore;           /* CE semaphore memory */
+    uint64_t  sem_phys;            /* Physical address */
+    uint32_t  fence_seq;           /* Monotonic fence sequence */
+    bool      ready;               /* CE operational */
+} ce_state_t;
+
 /* Channel state (managed by host) */
 typedef struct {
     /* GPFIFO ring buffer */
@@ -941,6 +993,12 @@ channel_state_t *gsp_get_channel(void);  /* Get channel state */
 int  gsp_compute_init(void);          /* Bind compute class, activate channel */
 compute_state_t *gsp_get_compute(void);  /* Get compute state */
 int  gsp_compute_barrier(void);       /* Push WAIT_FOR_IDLE + semaphore fence */
+
+/* X35: Copy Engine DMA */
+int  gsp_ce_init(void);                           /* Bind CE class, init state */
+ce_state_t *gsp_get_ce(void);                     /* Get CE state */
+int  gsp_ce_copy_h2d(uint64_t src_phys, uint64_t dst_vram, uint32_t size);  /* Host→Device */
+int  gsp_ce_copy_d2h(uint64_t src_vram, uint64_t dst_phys, uint32_t size);  /* Device→Host */
 
 /* Phase 9: VBIOS read + BIT parse + FWSEC extraction */
 int  gpu_read_vbios(void);           /* Read VBIOS from VRAM via PRAMIN */

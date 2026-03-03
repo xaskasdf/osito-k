@@ -1477,6 +1477,310 @@ int gsp_compute_barrier(void)
     return compute_poll_semaphore(fence_val, 2000);
 }
 
+/* ══════════════════════════════════════════════════════════
+ *  X35: Copy Engine DMA
+ *
+ *  Host-to-device and device-to-host DMA transfers via the
+ *  Copy Engine (CE). Uses physical addressing for both system
+ *  RAM and VRAM. Shares the same GPFIFO channel as compute
+ *  (subchannel 4 = CE, subchannel 1 = compute).
+ *
+ *  Reference: NVIDIA open-gpu-doc clc5b5.h/clc6b5.h/clc7b5.h,
+ *             Nouveau nvc0 CE usage patterns.
+ * ══════════════════════════════════════════════════════════ */
+
+static ce_state_t ce;
+
+ce_state_t *gsp_get_ce(void)
+{
+    return &ce;
+}
+
+/* Select CE class based on GPU generation */
+static uint32_t ce_class_for_gen(gpu_gen_t gen)
+{
+    switch (gen) {
+    case GPU_GEN_TURING:       return TURING_DMA_COPY_A;
+    case GPU_GEN_AMPERE:       return AMPERE_DMA_COPY_A;
+    case GPU_GEN_ADA_LOVELACE: return AMPERE_DMA_COPY_B;
+    default:                   return AMPERE_DMA_COPY_A;
+    }
+}
+
+/* Poll CE semaphore for completion */
+static int ce_poll_semaphore(uint32_t expected, uint32_t timeout_ms)
+{
+    uint64_t timeout_cycles = (uint64_t)timeout_ms * 3000000ULL;
+    uint64_t t0 = rdtsc();
+
+    while (1) {
+        rmb();
+        uint32_t val = ce.semaphore[0];
+        if (val == expected) {
+            serial_puts("[CE] Semaphore = ");
+            serial_putdec(val);
+            serial_puts(" (OK)\n");
+            return 0;
+        }
+
+        uint64_t elapsed = rdtsc() - t0;
+        if (elapsed > timeout_cycles) {
+            serial_puts("[CE] Semaphore timeout: expected ");
+            serial_putdec(expected);
+            serial_puts(", got ");
+            serial_putdec(val);
+            serial_puts("\n");
+            return -1;
+        }
+    }
+}
+
+/* Submit CE pushbuffer via shared GPFIFO channel */
+static int ce_pb_submit(pushbuf_state_t *pb)
+{
+    if (pb->pos == 0) return 0;
+
+    uint32_t gp_idx = channel.gp_put % channel.gpfifo_entries;
+
+    gpfifo_make_entry(&channel.gpfifo[gp_idx], pb->buf_phys, pb_size_bytes(pb));
+    wmb();
+
+    channel.gp_put++;
+
+    volatile uint32_t *userd = (volatile uint32_t *)channel.userd_mem;
+    userd[USERD_GP_PUT / 4] = channel.gp_put;
+    wmb();
+
+    serial_puts("[CE] Submitted ");
+    serial_putdec(pb->pos);
+    serial_puts(" dwords via GPFIFO[");
+    serial_putdec(gp_idx);
+    serial_puts("]\n");
+
+    return 0;
+}
+
+/* ── Internal: push a CE DMA copy ── */
+
+static int ce_push_copy(uint64_t src_phys, uint64_t dst_phys,
+                        uint32_t size, uint32_t src_target, uint32_t dst_target)
+{
+    if (!ce.class_bound) return -1;
+    if (size == 0) return 0;
+
+    /* Max single transfer: 16MB (CE LINE_LENGTH_IN is 32 bits, but
+     * practical limit due to pushbuffer space). Chunk larger copies. */
+    #define CE_MAX_COPY_SIZE  (16 * 1024 * 1024)
+
+    uint64_t remaining = size;
+    uint64_t src = src_phys;
+    uint64_t dst = dst_phys;
+
+    while (remaining > 0) {
+        uint32_t chunk = remaining > CE_MAX_COPY_SIZE ?
+                         CE_MAX_COPY_SIZE : (uint32_t)remaining;
+
+        pushbuf_state_t *pb = &ce.pb;
+        pb_begin(pb);
+
+        /* Set physical memory targets */
+        pb_push(pb, NV_METHOD(SUBCHANNEL_CE, CE_SET_SRC_PHYS_MODE, 2));
+        pb_push(pb, src_target);
+        pb_push(pb, dst_target);
+
+        /* Set source address */
+        pb_push(pb, NV_METHOD(SUBCHANNEL_CE, CE_OFFSET_IN_UPPER, 4));
+        pb_push(pb, (uint32_t)(src >> 32));
+        pb_push(pb, (uint32_t)(src & 0xFFFFFFFF));
+        /* Set destination address */
+        pb_push(pb, (uint32_t)(dst >> 32));
+        pb_push(pb, (uint32_t)(dst & 0xFFFFFFFF));
+
+        /* Set transfer size: linear 1D copy */
+        pb_push(pb, NV_METHOD(SUBCHANNEL_CE, CE_LINE_LENGTH_IN, 2));
+        pb_push(pb, chunk);
+        pb_push(pb, 1);  /* LINE_COUNT = 1 (linear) */
+
+        /* Semaphore: release on last chunk only */
+        if (remaining <= CE_MAX_COPY_SIZE) {
+            ce.fence_seq++;
+            pb_push(pb, NV_METHOD(SUBCHANNEL_CE, CE_SET_SEMAPHORE_A, 3));
+            pb_push(pb, (uint32_t)(ce.sem_phys >> 32) & 0x1FFFF);
+            pb_push(pb, (uint32_t)(ce.sem_phys & 0xFFFFFFFF));
+            pb_push(pb, ce.fence_seq);
+        }
+
+        /* LAUNCH_DMA */
+        uint32_t launch = CE_LAUNCH_DMA_TRANSFER_NON_PIPELINED
+                        | CE_LAUNCH_DMA_SRC_PITCH
+                        | CE_LAUNCH_DMA_DST_PITCH
+                        | CE_LAUNCH_DMA_SRC_PHYSICAL
+                        | CE_LAUNCH_DMA_DST_PHYSICAL;
+
+        /* Add semaphore release on last chunk */
+        if (remaining <= CE_MAX_COPY_SIZE)
+            launch |= CE_LAUNCH_DMA_SEM_RELEASE_1WORD;
+
+        pb_push(pb, NV_METHOD(SUBCHANNEL_CE, CE_LAUNCH_DMA, 1));
+        pb_push(pb, launch);
+
+        ce_pb_submit(pb);
+
+        src += chunk;
+        dst += chunk;
+        remaining -= chunk;
+    }
+
+    return 0;
+}
+
+/* ── Public API: gsp_ce_copy_h2d — Host to Device (sysmem → VRAM) ── */
+
+int gsp_ce_copy_h2d(uint64_t src_phys, uint64_t dst_vram, uint32_t size)
+{
+    serial_puts("[CE] H2D copy: src=0x");
+    serial_puthex(src_phys, 16);
+    serial_puts(" dst=VRAM+0x");
+    serial_puthex(dst_vram, 16);
+    serial_puts(" size=");
+    serial_putdec(size);
+    serial_puts("\n");
+
+    int ret = ce_push_copy(src_phys, dst_vram, size,
+                           CE_PHYS_TARGET_COHERENT_SYSMEM,
+                           CE_PHYS_TARGET_LOCAL_FB);
+    if (ret < 0) return ret;
+
+    /* Wait for completion */
+    return ce_poll_semaphore(ce.fence_seq, 5000);
+}
+
+/* ── Public API: gsp_ce_copy_d2h — Device to Host (VRAM → sysmem) ── */
+
+int gsp_ce_copy_d2h(uint64_t src_vram, uint64_t dst_phys, uint32_t size)
+{
+    serial_puts("[CE] D2H copy: src=VRAM+0x");
+    serial_puthex(src_vram, 16);
+    serial_puts(" dst=0x");
+    serial_puthex(dst_phys, 16);
+    serial_puts(" size=");
+    serial_putdec(size);
+    serial_puts("\n");
+
+    int ret = ce_push_copy(src_vram, dst_phys, size,
+                           CE_PHYS_TARGET_LOCAL_FB,
+                           CE_PHYS_TARGET_COHERENT_SYSMEM);
+    if (ret < 0) return ret;
+
+    /* Wait for completion */
+    return ce_poll_semaphore(ce.fence_seq, 5000);
+}
+
+/* ── Public API: gsp_ce_init ── */
+
+int gsp_ce_init(void)
+{
+    if (!channel.allocated) {
+        serial_puts("[CE] Channel not allocated, skipping CE init\n");
+        return -1;
+    }
+
+    serial_puts("[CE] === Copy Engine Init ===\n");
+
+    memset(&ce, 0, sizeof(ce));
+
+    /* Determine CE class for this GPU */
+    gpu_device_t *dev = &gpu_dev;
+    ce.ce_class = ce_class_for_gen(dev->generation);
+
+    serial_puts("[CE] GPU gen=");
+    serial_puts(gpu_gen_name(dev->generation));
+    serial_puts(", CE class=0x");
+    serial_puthex(ce.ce_class, 4);
+    serial_puts("\n");
+
+    /* Allocate CE pushbuffer (4KB, page-aligned) */
+    ce.pb.capacity = PUSHBUF_SIZE_DWORDS;
+    ce.pb.buf = (uint32_t *)mem_alloc_aligned(PUSHBUF_SIZE_DWORDS * 4, 4096);
+    if (!ce.pb.buf) {
+        serial_puts("[CE] Failed to allocate pushbuffer\n");
+        return -1;
+    }
+    memset(ce.pb.buf, 0, PUSHBUF_SIZE_DWORDS * 4);
+    ce.pb.buf_phys = (uint64_t)(uintptr_t)ce.pb.buf;
+    ce.pb.pos = 0;
+
+    /* Allocate CE semaphore (4KB page) */
+    ce.semaphore = (uint32_t *)mem_alloc_aligned(4096, 4096);
+    if (!ce.semaphore) {
+        serial_puts("[CE] Failed to allocate semaphore\n");
+        return -1;
+    }
+    memset(ce.semaphore, 0, 4096);
+    ce.sem_phys = (uint64_t)(uintptr_t)ce.semaphore;
+    ce.fence_seq = 0;
+
+    serial_puts("[CE] Pushbuf=0x");
+    serial_puthex(ce.pb.buf_phys, 16);
+    serial_puts(" Sem=0x");
+    serial_puthex(ce.sem_phys, 16);
+    serial_puts("\n");
+
+    /* Bind CE class to subchannel 4 via SET_OBJECT */
+    serial_puts("[CE] SET_OBJECT (class 0x");
+    serial_puthex(ce.ce_class, 4);
+    serial_puts(") on subchannel ");
+    serial_putdec(SUBCHANNEL_CE);
+    serial_puts("\n");
+
+    pushbuf_state_t *pb = &ce.pb;
+    pb_begin(pb);
+
+    pb_push(pb, NV_METHOD(SUBCHANNEL_CE, NVA06F_SET_OBJECT, 1));
+    pb_push(pb, ce.ce_class);
+
+    /* NOP padding */
+    pb_push(pb, NV_NOP);
+    pb_push(pb, NV_NOP);
+
+    ce_pb_submit(pb);
+
+    ce.class_bound = true;
+
+    /* Test: semaphore-only fence (no DMA copy, just verify CE responds) */
+    ce.fence_seq = 1;
+    ce.semaphore[0] = 0;
+    wmb();
+
+    pb_begin(pb);
+
+    pb_push(pb, NV_METHOD(SUBCHANNEL_CE, CE_SET_SEMAPHORE_A, 3));
+    pb_push(pb, (uint32_t)(ce.sem_phys >> 32) & 0x1FFFF);
+    pb_push(pb, (uint32_t)(ce.sem_phys & 0xFFFFFFFF));
+    pb_push(pb, 1);  /* payload = 1 */
+
+    /* Launch with semaphore release only, no actual data transfer */
+    pb_push(pb, NV_METHOD(SUBCHANNEL_CE, CE_LAUNCH_DMA, 1));
+    pb_push(pb, CE_LAUNCH_DMA_TRANSFER_NONE
+              | CE_LAUNCH_DMA_SEM_RELEASE_1WORD);
+
+    ce_pb_submit(pb);
+
+    int ret = ce_poll_semaphore(1, 2000);
+    if (ret == 0) {
+        ce.ready = true;
+        serial_puts("[CE] Copy Engine READY\n");
+        fb_puts_color(" CE DMA: READY\n", 0x0000FF00);
+    } else {
+        serial_puts("[CE] Semaphore timeout (expected without full boot chain)\n");
+        fb_puts(" CE DMA: init sent (pending boot chain)\n");
+    }
+
+    serial_puts("[CE] === CE init complete ===\n");
+
+    return 0;
+}
+
 /* ── Phase 10: FWSEC-FRTS Execution + WPR2 ───────────────────── */
 
 /*
@@ -2697,6 +3001,7 @@ int gsp_boot(void)
         gsp_rm_init();
         gsp_channel_init();
         gsp_compute_init();
+        gsp_ce_init();
     }
 
     return ret;

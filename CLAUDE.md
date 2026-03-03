@@ -276,6 +276,7 @@ Tasks:   idle, input, shell (3 of 8 slots used)
 | **X32** | **RPC ID fix + generic RM alloc/control** (corrected rpc_global_enums IDs, RM_ALLOC func 103, subdevice + VASPACE) | Done |
 | **X33** | **Channel + GPFIFO** (TSG alloc, GPFIFO channel alloc, ring buffer + instance/USERD memory) | Done |
 | **X34** | **Compute class bind + kernel dispatch** (pushbuffer encoding, SET_OBJECT, CTRL_BIND/SCHEDULE, semaphore fence) | Done |
+| **X35** | **Copy Engine DMA** (CE class bind, H2D/D2H physical copy, semaphore fence, chunked transfers) | Done |
 
 > Full GPU roadmap (X27-X40 + contingency): see [docs/x86-gpu-roadmap.md](docs/x86-gpu-roadmap.md)
 
@@ -513,6 +514,18 @@ Binds compute class to GPFIFO channel, activates channel, pushes initial command
 - **Semaphore sync**: Host allocates 4KB semaphore page. GPU writes payload via SEMAPHORE A/B/C/D release method. Host polls semaphore value with rdtsc timeout.
 - **compute_state_t**: Tracks compute class, pushbuffer state, semaphore memory, bind/schedule/ready flags.
 - **Integration**: Called from `gsp_boot()` after `gsp_channel_init()`. Without full GSP boot chain, semaphore times out (expected).
+
+### X35: Copy Engine DMA
+Host-to-device and device-to-host DMA transfers via the Copy Engine (CE).
+- **CE classes**: Turing 0xC5B5, Ampere 0xC6B5, Ada 0xC7B5 (AMPERE_DMA_COPY_B). Per-gen via `ce_class_for_gen()`.
+- **Subchannel 4**: CE shares the same GPFIFO channel as compute. SET_OBJECT binds CE class to subchannel 4.
+- **Physical addressing**: SET_SRC_PHYS_MODE/SET_DST_PHYS_MODE select COHERENT_SYSMEM (1) or LOCAL_FB (0).
+- **Copy sequence**: OFFSET_IN_UPPER/LOWER (src) → OFFSET_OUT_UPPER/LOWER (dst) → LINE_LENGTH_IN + LINE_COUNT → LAUNCH_DMA.
+- **LAUNCH_DMA bitfields**: NON_PIPELINED + SRC_PITCH + DST_PITCH + SRC_PHYSICAL + DST_PHYSICAL + SEM_RELEASE_1WORD.
+- **Chunking**: Copies larger than 16MB are split into multiple pushbuffer submissions.
+- **Semaphore fence**: CE semaphore via SET_SEMAPHORE_A/B/PAYLOAD, monotonic fence_seq counter.
+- **API**: `gsp_ce_copy_h2d(src_phys, dst_vram, size)`, `gsp_ce_copy_d2h(src_vram, dst_phys, size)`.
+- **Integration**: Called from `gsp_boot()` after `gsp_compute_init()`.
 
 ## Language
 The user speaks Spanish. Communicate in Spanish when appropriate.

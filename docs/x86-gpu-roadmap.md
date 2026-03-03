@@ -1,6 +1,6 @@
 # OsitoK x86-64 — GPU Compute Roadmap
 
-> Status: X1–X34 + X-CPU1 done. Phase A complete. Phase B: X32-X34 done, X35 next.
+> Status: X1–X35 + X-CPU1 done. Phase A complete. Phase B: X32-X35 done, X36 next.
 > Last updated: 2026-03-03
 
 ## Current State
@@ -20,7 +20,8 @@ and added generic RM alloc/control + subdevice + VASPACE allocation.
 X33 allocated TSG + GPFIFO channel with instance/USERD memory.
 X34 binds compute class to channel, activates via CTRL_BIND+SCHEDULE,
 pushes SET_OBJECT + cache invalidate + semaphore fence through GPFIFO.
-**Next**: X35 — Copy Engine DMA (host↔device transfers).
+X35 implements CE DMA with physical addressing (sysmem↔VRAM), semaphore fencing.
+**Next**: X36 — Kernel completion + semaphore sync.
 
 ---
 
@@ -98,7 +99,7 @@ Requires Phase A complete (functional GSP-RM). Sets up GPU compute dispatch.
 | **X32** | **RPC ID fix + generic RM alloc/control** — corrected IDs, RM_ALLOC/RM_CONTROL wrappers, subdevice + VASPACE | ~200 | Done |
 | **X33** | **Channel + GPFIFO** — TSG alloc, GPFIFO channel alloc, ring buffer + inst/USERD memory | ~200 | Done |
 | **X34** | **Compute class bind + kernel dispatch** — bind compute class, push methods, semaphore fence | ~300 | Done |
-| **X35** | **Copy Engine DMA** — host-to-device and device-to-host transfers | ~250 | Low |
+| **X35** | **Copy Engine DMA** — host-to-device and device-to-host transfers, semaphore fence | ~250 | Done |
 | **X36** | **Kernel completion + semaphore sync** — wait for kernel, read results | ~100 | Low |
 
 ### Key structures
