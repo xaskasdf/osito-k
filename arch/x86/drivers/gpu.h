@@ -607,6 +607,11 @@ typedef struct {
     bool        rpc_ready;        /* INIT_DONE received */
     /* RM Init (Phase 8) */
     bool        rm_init_done;     /* RM init sequence completed */
+    /* SEC2 Booter (X31) */
+    void       *booter_data;      /* booter.bin in RAM */
+    uint64_t    booter_size;
+    bool        booter_loaded;    /* booter.bin loaded from OsitoFS */
+    bool        sec2_boot_ok;     /* SEC2 booter completed successfully */
 } gsp_state_t;
 
 /* ── API ────────────────────────────────────────────────────── */

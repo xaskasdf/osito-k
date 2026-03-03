@@ -1842,7 +1842,218 @@ static int gsp_boot_legacy(void)
     return gsp.boot_ack ? 0 : -1;
 }
 
-/* ── gsp_boot: dispatcher — try v2 (bootloader), fallback to legacy ── */
+/* ══════════════════════════════════════════════════════════
+ *  X31: SEC2 Booter Load
+ *
+ *  The SEC2 falcon runs a "booter_load" firmware that:
+ *  1. Reads GspFwWprMeta from address in MAILBOX0/1
+ *  2. Walks radix3 page tables to find firmware pages
+ *  3. DMA-copies firmware into WPR2 protected VRAM region
+ *  4. Validates cryptographic signatures
+ *  5. Sets up GSP boot environment
+ *
+ *  The booter is a separate firmware blob ("booter.bin") from
+ *  the NVIDIA firmware package, loaded from OsitoFS.
+ *
+ *  Reference: nouveau tu102_gsp_booter_load(), nova-core run_booter()
+ * ══════════════════════════════════════════════════════════ */
+
+static int gsp_load_booter(void)
+{
+    if (!osfs2_is_mounted()) {
+        serial_puts("[SEC2] OsitoFS not mounted, cannot load booter\n");
+        return -1;
+    }
+
+    osfs2_file_t *file = osfs2_find("booter.bin");
+    if (!file) {
+        serial_puts("[SEC2] booter.bin not found in OsitoFS (optional)\n");
+        return -1;
+    }
+
+    /* Validate size: min 4KB, max 4MB */
+    if (file->size < 4096) {
+        serial_puts("[SEC2] booter.bin too small (");
+        serial_putdec(file->size);
+        serial_puts(" bytes)\n");
+        return -1;
+    }
+    if (file->size > 4ULL * 1024 * 1024) {
+        serial_puts("[SEC2] booter.bin too large (");
+        serial_putdec(file->size / 1024);
+        serial_puts(" KB, max 4MB)\n");
+        return -1;
+    }
+
+    serial_puts("[SEC2] Loading booter.bin (");
+    serial_putdec(file->size);
+    serial_puts(" bytes)...\n");
+
+    gsp.booter_data = mem_alloc_aligned(file->size, 4096);
+    if (!gsp.booter_data) {
+        serial_puts("[SEC2] Failed to allocate booter buffer\n");
+        return -1;
+    }
+
+    gsp.booter_size = file->size;
+
+    /* Read in chunks */
+    uint64_t offset = 0;
+    uint64_t remaining = file->size;
+
+    while (remaining > 0) {
+        uint64_t chunk = remaining < OSFS2_BLOCK_SIZE ? remaining : OSFS2_BLOCK_SIZE;
+        if (osfs2_read(file, offset, (uint8_t *)gsp.booter_data + offset, chunk) < 0) {
+            serial_puts("[SEC2] Read failed at offset ");
+            serial_puthex(offset, 8);
+            serial_puts("\n");
+            return -1;
+        }
+        offset += chunk;
+        remaining -= chunk;
+    }
+
+    serial_puts("[SEC2] Booter loaded to RAM at 0x");
+    serial_puthex((uint64_t)(uintptr_t)gsp.booter_data, 16);
+    serial_puts("\n");
+
+    gsp.booter_loaded = true;
+    return 0;
+}
+
+static int gsp_sec2_booter(void)
+{
+    gpu_probe_t *p = gpu_get_probe();
+
+    if (!p || !p->sec2_present) {
+        serial_puts("[SEC2] SEC2 falcon not present\n");
+        return -1;
+    }
+    if (!gsp.booter_loaded || !gsp.booter_data || gsp.booter_size == 0) {
+        serial_puts("[SEC2] No booter firmware loaded\n");
+        return -1;
+    }
+    if (!radix3.built) {
+        serial_puts("[SEC2] Radix3 not built, cannot run booter\n");
+        return -1;
+    }
+
+    serial_puts("[SEC2] === SEC2 Booter Load ===\n");
+
+    /* ── Step 1: Reset SEC2 Falcon ── */
+    serial_puts("[SEC2] Resetting SEC2 Falcon...\n");
+    if (falcon_reset(NV_PSEC_BASE) < 0) {
+        serial_puts("[SEC2] SEC2 reset failed\n");
+        return -1;
+    }
+
+    /* ── Step 2: DMA-load booter to SEC2 IMEM ── */
+    uint64_t booter_phys = (uint64_t)(uintptr_t)gsp.booter_data;
+
+    serial_puts("[SEC2] DMA loading booter (");
+    serial_putdec(gsp.booter_size);
+    serial_puts(" bytes) to SEC2 IMEM...\n");
+
+    if (falcon_dma_load(NV_PSEC_BASE, booter_phys, 0,
+                        (uint32_t)gsp.booter_size, true) < 0) {
+        serial_puts("[SEC2] DMA load to SEC2 IMEM failed\n");
+        return -1;
+    }
+
+    /* ── Step 3: Set BOOTVEC to 0 ── */
+    gpu_reg_write(NV_PSEC_BASE + NV_FALCON_BOOTVEC, 0);
+    wmb();
+
+    /* ── Step 4: Set MAILBOX0/1 to WPR metadata physical address ── */
+    uint64_t vram_bytes = (uint64_t)p->vram_size_mb * 1024 * 1024;
+    uint64_t wpr_meta_addr = vram_bytes - WPR_META_VRAM_OFFSET_FROM_END;
+
+    gpu_reg_write(NV_PSEC_BASE + NV_FALCON_MAILBOX0,
+                  (uint32_t)(wpr_meta_addr & 0xFFFFFFFF));
+    gpu_reg_write(NV_PSEC_BASE + NV_FALCON_MAILBOX1,
+                  (uint32_t)(wpr_meta_addr >> 32));
+    wmb();
+
+    serial_puts("[SEC2] BOOTVEC=0, MAILBOX0/1=0x");
+    serial_puthex(wpr_meta_addr, 16);
+    serial_puts(" (WPR meta)\n");
+
+    /* ── Step 5: Start SEC2 ── */
+    serial_puts("[SEC2] Starting SEC2 Falcon...\n");
+    gpu_reg_write(NV_PSEC_BASE + NV_FALCON_CPUCTL, NV_FALCON_CPUCTL_STARTCPU);
+    wmb();
+
+    /* ── Step 6: Poll for completion (3s timeout) ── */
+    /* SEC2 booter sets MAILBOX0 = 0 on success, nonzero on error.
+     * It also halts when done. We check both. */
+    uint64_t t0 = rdtsc();
+    uint64_t timeout_cycles = 9000000000ULL;  /* ~3s @ 3GHz */
+    bool completed = false;
+    uint32_t mbox0 = (uint32_t)(wpr_meta_addr & 0xFFFFFFFF);
+
+    while (1) {
+        rmb();
+        uint32_t cpuctl = gpu_reg_read(NV_PSEC_BASE + NV_FALCON_CPUCTL);
+
+        if (cpuctl & NV_FALCON_CPUCTL_HALTED) {
+            mbox0 = gpu_reg_read(NV_PSEC_BASE + NV_FALCON_MAILBOX0);
+            completed = true;
+            break;
+        }
+
+        /* Also check if mailbox changed from initial value */
+        mbox0 = gpu_reg_read(NV_PSEC_BASE + NV_FALCON_MAILBOX0);
+        if (mbox0 != (uint32_t)(wpr_meta_addr & 0xFFFFFFFF)) {
+            completed = true;
+            break;
+        }
+
+        if (rdtsc() - t0 >= timeout_cycles)
+            break;
+    }
+
+    uint64_t elapsed_ms = (rdtsc() - t0) / 3000000;
+    uint32_t final_cpuctl = gpu_reg_read(NV_PSEC_BASE + NV_FALCON_CPUCTL);
+    uint32_t mbox1 = gpu_reg_read(NV_PSEC_BASE + NV_FALCON_MAILBOX1);
+
+    serial_puts("[SEC2] ");
+    serial_puts(completed ? "Completed" : "TIMEOUT");
+    serial_puts(" after ~");
+    serial_putdec(elapsed_ms);
+    serial_puts(" ms\n");
+    serial_puts("[SEC2] CPUCTL=0x");
+    serial_puthex(final_cpuctl, 8);
+    serial_puts(" MBOX0=0x");
+    serial_puthex(mbox0, 8);
+    serial_puts(" MBOX1=0x");
+    serial_puthex(mbox1, 8);
+    serial_puts("\n");
+
+    /* MAILBOX0 == 0 indicates success (booter loaded firmware into WPR2) */
+    bool success = completed && (mbox0 == 0);
+
+    if (success) {
+        serial_puts("[SEC2] Booter succeeded — GSP firmware loaded into WPR2\n");
+        fb_puts(" SEC2 booter: OK\n");
+    } else if (completed) {
+        serial_puts("[SEC2] Booter completed with error (mbox0=0x");
+        serial_puthex(mbox0, 8);
+        serial_puts(")\n");
+        fb_puts(" SEC2 booter: err 0x");
+        fb_puthex(mbox0, 8);
+        fb_puts("\n");
+    } else {
+        serial_puts("[SEC2] Booter timed out — may need FWSEC-SB authentication\n");
+        fb_puts(" SEC2 booter: timeout\n");
+    }
+
+    gsp.sec2_boot_ok = success;
+    serial_puts("[SEC2] === end ===\n");
+
+    return success ? 0 : -1;
+}
+
+/* ── gsp_boot: full chain dispatcher ── */
 
 int gsp_boot(void)
 {
@@ -1865,7 +2076,12 @@ int gsp_boot(void)
     gsp_extract_bootloader();
     gsp_write_wpr_meta();
 
-    /* ── Try two-stage bootloader boot (X30) ── */
+    /* ── X31: SEC2 booter (loads firmware into WPR2 via radix3) ── */
+    gsp_load_booter();
+    if (gsp.booter_loaded)
+        gsp_sec2_booter();
+
+    /* ── Boot GSP: try v2 (bootloader via DMA), fallback to legacy ── */
     int ret = gsp_boot_v2();
 
     if (ret < 0) {
