@@ -115,11 +115,11 @@ arch/x86/boot/efi_main.c            UEFI entry: GOP, serial, memory map, ExitBoo
 arch/x86/kernel/main.c              Post-boot kernel: PCI scan, NVMe init, mount OsitoFS
 arch/x86/kernel/serial.c            COM1 UART (0x3F8, 115200 baud)
 arch/x86/kernel/framebuffer.c       GOP 32bpp text console (8×16 font)
-arch/x86/kernel/pci.c               PCIe enumeration (ECAM via MCFG ACPI table)
+arch/x86/kernel/pci.c               PCIe enumeration (ECAM via MCFG, BAR size detection)
 arch/x86/kernel/memory.c            Physical memory manager (bitmap, 4KB pages)
 arch/x86/drivers/nvme.c             Minimal NVMe driver (admin+IO queues, read-only)
 arch/x86/drivers/gpu.h              GPU types, MMIO register defines, probe API
-arch/x86/drivers/gpu.c              GPU probe Phase 1+2 (chip ID, engines, VRAM, BAR1 R/W, PRAMIN)
+arch/x86/drivers/gpu.c              GPU probe Phase 1-3 (chip ID, engines, VRAM, BAR1 R/W, PRAMIN R/W)
 arch/x86/fs/ositofs2.c              OsitoFS v2 bare-metal driver (mount, list, read)
 arch/x86/fs/gpt.h                   GPT structs (UEFI spec) + API
 arch/x86/fs/gpt.c                   GPT parser (name match + superblock magic probe)
@@ -255,7 +255,8 @@ Tasks:   idle, input, shell (3 of 8 slots used)
 | **X15** | **Inference runtime** (Llama forward pass, GQA attention, SwiGLU, greedy decode) | Done |
 | **X16** | **GPU MMIO probe** (chip ID, engines, PTIMER, Falcon detect — Phase 1) | Done |
 | **X17** | **GPU VRAM discovery** (VRAM size, BAR1 R/W test, PRAMIN window — Phase 2) | Done |
-| X18     | GPU compute (NVIDIA GSP firmware loading, GPFIFO, compute dispatch) | Research |
+| **X18** | **GPU PCI BAR sizes + gpu_write + PRAMIN window slide R/W** (Phase 3) | Done |
+| X19     | GPU compute (NVIDIA GSP firmware loading, GPFIFO, compute dispatch) | Research |
 
 ### F12: DOOM Wireframe 2.5D
 Procedural level generator (4x4 grid, snake path connectivity) + wall-segment projection renderer.
@@ -315,6 +316,14 @@ VRAM size discovery, BAR1 read/write test, PRAMIN window probe.
 - **PRAMIN**: Read 4 dwords at BAR0+0x700000 (1MB instance memory window)
 - **Safety**: No writes to GPU control registers. BAR1 write test uses VRAM only. Skip on inaccessible BAR1.
 - **Barriers**: wmb() after writes, rmb() before reads
+
+### X18: GPU PCI BAR Sizes + gpu_write + PRAMIN Window R/W (Phase 3)
+First active writes to GPU: PCI config space BAR size detection, PRAMIN window control.
+- **pci_write32**: Write 32-bit to PCI config space (ECAM or legacy I/O CF8/CFC)
+- **pci_read_bar_size**: Standard PCI BAR size detection (save → write 0xFFFFFFFF → read mask → restore). Supports 32-bit and 64-bit BARs.
+- **gpu_write**: First GPU register write function (`mmio_write32` via BAR0)
+- **PRAMIN window slide**: Write `NV_PBUS_BAR0_WINDOW` (0x001700) to move 1MB PRAMIN window to arbitrary VRAM offset. Test at VRAM+64MB: write 0xDEADBEEF/0x0517014B, read back, restore originals + window position.
+- **Safety**: Only writes to PBUS_BAR0_WINDOW (well-documented control register) and VRAM data through PRAMIN. All originals saved and restored. BAR size detection during PCI scan (before gpu_init uses BARs).
 
 ## Language
 The user speaks Spanish. Communicate in Spanish when appropriate.

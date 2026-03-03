@@ -128,6 +128,18 @@ static uint16_t pci_read16(uint8_t bus, uint8_t dev, uint8_t func, uint16_t offs
     return (uint16_t)(val >> ((offset & 2) * 8));
 }
 
+static void pci_write32(uint8_t bus, uint8_t dev, uint8_t func, uint16_t offset, uint32_t val)
+{
+    if (ecam_base)
+        mmio_write32(ecam_addr(bus, dev, func, offset), val);
+    else {
+        uint32_t addr = (1 << 31) | ((uint32_t)bus << 16) | ((uint32_t)dev << 11) |
+                        ((uint32_t)func << 8) | (offset & 0xFC);
+        outl(PCI_CONFIG_PORT, addr);
+        outl(PCI_DATA_PORT, val);
+    }
+}
+
 /* ── Read PCI BAR ────────────────────────────────────────────── */
 
 static uint64_t pci_read_bar(uint8_t bus, uint8_t dev, uint8_t func, int bar_idx)
@@ -143,6 +155,42 @@ static uint64_t pci_read_bar(uint8_t bus, uint8_t dev, uint8_t func, int bar_idx
         return ((uint64_t)hi << 32) | (lo & ~0xFULL);
     }
     return lo & ~0xFULL;
+}
+
+/* ── Read PCI BAR Size ───────────────────────────────────────── */
+
+static uint64_t pci_read_bar_size(uint8_t bus, uint8_t dev, uint8_t func, int bar_idx)
+{
+    uint16_t offset = (uint16_t)(0x10 + bar_idx * 4);
+
+    /* Save original BAR value */
+    uint32_t orig_lo = pci_read32(bus, dev, func, offset);
+    if (orig_lo == 0) return 0;
+
+    bool is_64bit = ((orig_lo & 0x6) == 0x4);
+    uint32_t orig_hi = 0;
+    if (is_64bit)
+        orig_hi = pci_read32(bus, dev, func, offset + 4);
+
+    /* Write all-ones to get size mask */
+    pci_write32(bus, dev, func, offset, 0xFFFFFFFF);
+    uint32_t mask_lo = pci_read32(bus, dev, func, offset);
+
+    uint64_t mask = mask_lo & ~0xFULL;   /* Clear type/prefetch bits */
+
+    if (is_64bit) {
+        pci_write32(bus, dev, func, offset + 4, 0xFFFFFFFF);
+        uint32_t mask_hi = pci_read32(bus, dev, func, offset + 4);
+        mask = ((uint64_t)mask_hi << 32) | (mask_lo & ~0xFULL);
+        /* Restore high */
+        pci_write32(bus, dev, func, offset + 4, orig_hi);
+    }
+
+    /* Restore original */
+    pci_write32(bus, dev, func, offset, orig_lo);
+
+    if (mask == 0) return 0;
+    return (~mask) + 1;
 }
 
 /* ── Find MCFG ACPI table ────────────────────────────────────── */
@@ -254,6 +302,14 @@ static void pci_add_device(uint8_t bus, uint8_t dev, uint8_t func,
         gpu_dev.backend = GPU_BACKEND_NVIDIA_GSP;
         gpu_dev.bar0_base = d->bar[0];
         gpu_dev.bar1_base = d->bar[1];
+        gpu_dev.bar0_size = pci_read_bar_size(bus, dev, func, 0);
+        gpu_dev.bar1_size = pci_read_bar_size(bus, dev, func, 1);
+
+        serial_puts("[PCI] GPU BAR0: ");
+        serial_putdec(gpu_dev.bar0_size >> 20);
+        serial_puts(" MB, BAR1: ");
+        serial_putdec(gpu_dev.bar1_size >> 20);
+        serial_puts(" MB\n");
     }
 
     /* Check if NVMe controller */

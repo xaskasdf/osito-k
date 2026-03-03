@@ -1,10 +1,9 @@
 /*
- * OsitoK x86-64 — GPU MMIO Probe Driver (Phase 1 + 2)
+ * OsitoK x86-64 — GPU MMIO Probe Driver (Phase 1-3)
  *
  * Phase 1: Read-only BAR0 probe — chip ID, engines, PTIMER, Falcons.
  * Phase 2: VRAM size, BAR1 read/write test, PRAMIN window read.
- *
- * NO WRITES to GPU control registers. BAR1 write test uses VRAM only.
+ * Phase 3: PCI BAR sizes, gpu_write, PRAMIN window slide + R/W test.
  *
  * Reference: envytools (https://envytools.rtfd.io), nouveau driver.
  */
@@ -36,6 +35,11 @@ static gpu_state_t gpu;
 static uint32_t gpu_read(uint32_t reg)
 {
     return mmio_read32((volatile void *)((uint64_t)gpu.bar0 + reg));
+}
+
+static void gpu_write(uint32_t reg, uint32_t val)
+{
+    mmio_write32((volatile void *)((uint64_t)gpu.bar0 + reg), val);
 }
 
 /* ── Chip Name Lookup ────────────────────────────────────────── */
@@ -251,6 +255,78 @@ static void gpu_probe_pramin(void)
         gpu.probe.pramin_accessible = true;
 }
 
+/* ── Phase 3: PRAMIN Window Slide + R/W Test ─────────────────── */
+
+#define PRAMIN_RW_TARGET_MB  64  /* Test at VRAM offset 64MB */
+
+static void gpu_probe_pramin_rw(void)
+{
+    if (!gpu.probe.pramin_accessible) {
+        serial_puts("[GPU] PRAMIN R/W: skipped (not accessible)\n");
+        return;
+    }
+
+    /* Save original window position */
+    uint32_t orig_window = gpu_read(NV_PBUS_BAR0_WINDOW);
+
+    /* Slide window to VRAM offset 64MB (target >> 16 = 0x400) */
+    uint32_t target = (PRAMIN_RW_TARGET_MB * 1024 * 1024) >> 16;
+    gpu_write(NV_PBUS_BAR0_WINDOW, target);
+    wmb();
+
+    /* Verify window moved */
+    uint32_t readback = gpu_read(NV_PBUS_BAR0_WINDOW);
+    if ((readback & 0x00FFFFFF) != target) {
+        serial_puts("[GPU] PRAMIN R/W: window slide failed (wrote ");
+        serial_puthex(target, 6);
+        serial_puts(", read ");
+        serial_puthex(readback & 0x00FFFFFF, 6);
+        serial_puts(")\n");
+        /* Restore and bail */
+        gpu_write(NV_PBUS_BAR0_WINDOW, orig_window);
+        wmb();
+        return;
+    }
+
+    /* Save originals at the new window location */
+    rmb();
+    uint32_t orig0 = gpu_read(NV_PRAMIN_BASE + 0x00);
+    uint32_t orig1 = gpu_read(NV_PRAMIN_BASE + 0x04);
+
+    /* Write test patterns */
+    gpu_write(NV_PRAMIN_BASE + 0x00, 0xDEADBEEF);
+    gpu_write(NV_PRAMIN_BASE + 0x04, 0x0517014B);
+    wmb();
+
+    /* Read back */
+    rmb();
+    uint32_t rb0 = gpu_read(NV_PRAMIN_BASE + 0x00);
+    uint32_t rb1 = gpu_read(NV_PRAMIN_BASE + 0x04);
+
+    serial_puts("[GPU] PRAMIN R/W at VRAM+64MB: wrote DEADBEEF, read ");
+    serial_puthex(rb0, 8);
+
+    if (rb0 == 0xDEADBEEF && rb1 == 0x0517014B) {
+        serial_puts(" OK\n");
+        gpu.probe.pramin_rw_ok = true;
+    } else {
+        serial_puts(" FAIL (expected DEADBEEF/0517014B, got ");
+        serial_puthex(rb0, 8);
+        serial_puts("/");
+        serial_puthex(rb1, 8);
+        serial_puts(")\n");
+    }
+
+    /* Restore original data */
+    gpu_write(NV_PRAMIN_BASE + 0x00, orig0);
+    gpu_write(NV_PRAMIN_BASE + 0x04, orig1);
+    wmb();
+
+    /* Restore original window position */
+    gpu_write(NV_PBUS_BAR0_WINDOW, orig_window);
+    wmb();
+}
+
 /* ── Report: Print Results ───────────────────────────────────── */
 
 static void gpu_report(uint64_t bar1_base)
@@ -364,11 +440,33 @@ static void gpu_report(uint64_t bar1_base)
     /* PRAMIN status */
     serial_puts("[GPU] PRAMIN: ");
     serial_puts(p->pramin_accessible ? "accessible" : "NOT accessible");
+    if (p->pramin_accessible) {
+        serial_puts(", R/W ");
+        serial_puts(p->pramin_rw_ok ? "OK" : "read-only");
+    }
     serial_puts("\n");
 
     fb_puts("  PRAMIN: ");
     fb_puts(p->pramin_accessible ? "accessible" : "NOT accessible");
+    if (p->pramin_accessible) {
+        fb_puts(p->pramin_rw_ok ? " R/W OK" : " read-only");
+    }
     fb_puts("\n");
+}
+
+static void gpu_report_bars(gpu_device_t *dev)
+{
+    serial_puts("[GPU] BAR0: ");
+    serial_putdec(dev->bar0_size >> 20);
+    serial_puts(" MB, BAR1: ");
+    serial_putdec(dev->bar1_size >> 20);
+    serial_puts(" MB\n");
+
+    fb_puts("  BAR0: ");
+    fb_putdec(dev->bar0_size >> 20);
+    fb_puts(" MB, BAR1: ");
+    fb_putdec(dev->bar1_size >> 20);
+    fb_puts(" MB\n");
 }
 
 /* ── Public API ──────────────────────────────────────────────── */
@@ -409,11 +507,16 @@ int gpu_init(uint64_t bar0_phys)
     gpu_probe_bar1_rw(bar1_base, dev ? dev->bar1_size : 0);
     gpu_probe_pramin();
 
+    /* Phase 3: PRAMIN window slide + R/W */
+    gpu_probe_pramin_rw();
+
     /* Report results */
     gpu_report(bar1_base);
+    if (dev)
+        gpu_report_bars(dev);
 
-    serial_puts("[GPU] Phase 2 probe complete\n");
-    fb_puts("  Phase 2 probe complete\n");
+    serial_puts("[GPU] Phase 3 probe complete\n");
+    fb_puts("  Phase 3 probe complete\n");
 
     return 0;
 }
