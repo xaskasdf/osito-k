@@ -1,10 +1,8 @@
 /*
- * OsitoK x86-64 — GSP Falcon Probe + Firmware Loader (Phase 4)
+ * OsitoK x86-64 — GSP Falcon Driver (Phase 4-5)
  *
- * Deep probe of GSP Falcon microcontroller (HWCFG2, CPUCTL, mailboxes).
- * Load GSP firmware blob from OsitoFS to RAM, upload to VRAM via PRAMIN.
- *
- * Does NOT boot the GSP — that is Phase 5 (X20).
+ * Phase 4: Deep probe (HWCFG2, CPUCTL, mailboxes), firmware load + VRAM upload.
+ * Phase 5: ELF64 parse, boot sequence (BOOTVEC, CPUCTL start), mailbox handshake.
  *
  * Reference: envytools (https://envytools.rtfd.io), nouveau driver.
  */
@@ -352,6 +350,210 @@ int gsp_load_firmware(void)
     }
 
     return 0;
+}
+
+/* ── ELF64 Parser (firmware in RAM) ──────────────────────────── */
+
+static int gsp_parse_elf(void)
+{
+    if (!gsp.fw_data || gsp.fw_size < sizeof(elf64_ehdr_t)) {
+        serial_puts("[GSP] No firmware data for ELF parse\n");
+        return -1;
+    }
+
+    elf64_ehdr_t *ehdr = (elf64_ehdr_t *)gsp.fw_data;
+
+    /* Validate ELF magic */
+    uint32_t magic = *(uint32_t *)ehdr->e_ident;
+    if (magic != ELF_MAGIC) {
+        serial_puts("[GSP] Not an ELF binary (magic=0x");
+        serial_puthex(magic, 8);
+        serial_puts(")\n");
+        return -1;
+    }
+
+    /* Validate ELF64 little-endian */
+    if (ehdr->e_ident[4] != ELFCLASS64) {
+        serial_puts("[GSP] Not ELF64 (class=");
+        serial_putdec(ehdr->e_ident[4]);
+        serial_puts(")\n");
+        return -1;
+    }
+    if (ehdr->e_ident[5] != ELFDATA2LSB) {
+        serial_puts("[GSP] Not little-endian (data=");
+        serial_putdec(ehdr->e_ident[5]);
+        serial_puts(")\n");
+        return -1;
+    }
+
+    /* Extract key fields */
+    gsp.elf_entry   = ehdr->e_entry;
+    gsp.elf_phnum   = ehdr->e_phnum;
+    gsp.elf_machine = ehdr->e_machine;
+
+    serial_puts("[GSP] ELF64: machine=0x");
+    serial_puthex(ehdr->e_machine, 4);
+    serial_puts(ehdr->e_machine == 0xF3 ? " (RISC-V)" : "");
+    serial_puts(", entry=0x");
+    serial_puthex(ehdr->e_entry, 16);
+    serial_puts("\n");
+
+    serial_puts("[GSP] ELF64: ");
+    serial_putdec(ehdr->e_phnum);
+    serial_puts(" program headers\n");
+
+    /* Iterate program headers — informative only */
+    if (ehdr->e_phoff && ehdr->e_phnum &&
+        ehdr->e_phoff + (uint64_t)ehdr->e_phnum * sizeof(elf64_phdr_t) <= gsp.fw_size) {
+
+        elf64_phdr_t *phdr = (elf64_phdr_t *)((uint8_t *)gsp.fw_data + ehdr->e_phoff);
+
+        for (uint16_t i = 0; i < ehdr->e_phnum; i++) {
+            if (phdr[i].p_type == PT_LOAD) {
+                serial_puts("[GSP]   PT_LOAD: vaddr=0x");
+                serial_puthex(phdr[i].p_vaddr, 16);
+                serial_puts(" filesz=");
+                serial_putdec(phdr[i].p_filesz);
+                serial_puts(" memsz=");
+                serial_putdec(phdr[i].p_memsz);
+                serial_puts("\n");
+            }
+        }
+    }
+
+    return 0;
+}
+
+/* ── Phase 5: GSP Falcon Boot ────────────────────────────────── */
+
+int gsp_boot(void)
+{
+    gpu_probe_t *p = gpu_get_probe();
+    if (!p || !p->present || !p->gsp_present) {
+        return -1;   /* No GPU/GSP — silent */
+    }
+
+    /* Parse ELF from firmware in RAM */
+    if (gsp_parse_elf() < 0) {
+        serial_puts("[GSP] ELF parse failed, skipping boot\n");
+        return -1;
+    }
+
+    /* Pre-conditions */
+    if (!gsp.fw_uploaded) {
+        serial_puts("[GSP] Firmware not in VRAM, skipping boot\n");
+        return -1;
+    }
+    if (gsp.elf_entry == 0) {
+        serial_puts("[GSP] ELF entry point is 0, skipping boot\n");
+        return -1;
+    }
+
+    /* ── Step 1: Halt Falcon ── */
+    serial_puts("[GSP] Boot: halting Falcon...\n");
+    gpu_reg_write(NV_PGSP_BASE + NV_FALCON_CPUCTL, NV_FALCON_CPUCTL_HALTED);
+    wmb();
+
+    /* ── Step 2: Clear mailboxes ── */
+    gpu_reg_write(NV_PGSP_BASE + NV_FALCON_MAILBOX0, 0);
+    gpu_reg_write(NV_PGSP_BASE + NV_FALCON_MAILBOX1, 0);
+    wmb();
+
+    /* ── Step 3: Set DMATRFBASE (firmware location in VRAM, >> 8) ── */
+    uint32_t dma_base = (uint32_t)(gsp.vram_offset >> 8);
+    gpu_reg_write(NV_PGSP_BASE + NV_FALCON_DMATRFBASE, dma_base);
+    wmb();
+
+    /* ── Step 4: Set BOOTVEC (entry point >> 8) ── */
+    uint32_t bootvec = (uint32_t)(gsp.elf_entry >> 8);
+    gpu_reg_write(NV_PGSP_BASE + NV_FALCON_BOOTVEC, bootvec);
+    wmb();
+
+    serial_puts("[GSP] Boot: DMATRFBASE=0x");
+    serial_puthex(dma_base, 8);
+    serial_puts(" BOOTVEC=0x");
+    serial_puthex(bootvec, 8);
+    serial_puts("\n");
+
+    /* ── Step 5: Start CPU ── */
+    serial_puts("[GSP] Boot: starting CPU...\n");
+    gpu_reg_write(NV_PGSP_BASE + NV_FALCON_CPUCTL, NV_FALCON_CPUCTL_STARTCPU);
+    wmb();
+    gsp.booted = true;
+
+    /* ── Step 6: Poll mailbox (timeout ~1 second @ 3GHz) ── */
+    serial_puts("[GSP] Boot: polling mailbox (timeout 1s)...\n");
+
+    uint64_t t0 = rdtsc();
+    uint64_t timeout_cycles = 3000000000ULL;  /* ~1s @ 3GHz */
+    uint32_t mbox0 = 0;
+
+    while (1) {
+        rmb();
+        mbox0 = gpu_reg_read(NV_PGSP_BASE + NV_FALCON_MAILBOX0);
+        if (mbox0 != 0)
+            break;
+
+        uint64_t elapsed = rdtsc() - t0;
+        if (elapsed >= timeout_cycles)
+            break;
+    }
+
+    uint64_t t1 = rdtsc();
+    uint64_t elapsed_cycles = t1 - t0;
+    uint64_t elapsed_ms = elapsed_cycles / 3000000;
+
+    gsp.boot_status = mbox0;
+    gsp.boot_ack = (mbox0 != 0);
+
+    if (gsp.boot_ack) {
+        /* Success — GSP responded */
+        serial_puts("[GSP] Boot: mailbox0=0x");
+        serial_puthex(mbox0, 8);
+        serial_puts(" after ~");
+        serial_putdec(elapsed_ms);
+        serial_puts(" ms (");
+        serial_putdec(elapsed_cycles / 1000000);
+        serial_puts("M cycles)\n");
+
+        uint32_t cpuctl = gpu_reg_read(NV_PGSP_BASE + NV_FALCON_CPUCTL);
+        serial_puts("[GSP] Boot: GSP alive! CPUCTL=0x");
+        serial_puthex(cpuctl, 8);
+        serial_puts("\n");
+
+        fb_puts(" GSP: boot OK, mailbox=0x");
+        fb_puthex(mbox0, 8);
+        fb_puts("\n");
+    } else {
+        /* Timeout — dump diagnostics */
+        serial_puts("[GSP] Boot: TIMEOUT after ");
+        serial_putdec(elapsed_ms);
+        serial_puts(" ms\n");
+
+        uint32_t cpuctl = gpu_reg_read(NV_PGSP_BASE + NV_FALCON_CPUCTL);
+        uint32_t mbox1  = gpu_reg_read(NV_PGSP_BASE + NV_FALCON_MAILBOX1);
+
+        serial_puts("[GSP] Boot: CPUCTL=0x");
+        serial_puthex(cpuctl, 8);
+        serial_puts(" (");
+        if (cpuctl & NV_FALCON_CPUCTL_HALTED)  serial_puts("HALTED");
+        if ((cpuctl & NV_FALCON_CPUCTL_HALTED) &&
+            (cpuctl & NV_FALCON_CPUCTL_STOPPED)) serial_puts("+");
+        if (cpuctl & NV_FALCON_CPUCTL_STOPPED) serial_puts("STOPPED");
+        if (!(cpuctl & (NV_FALCON_CPUCTL_HALTED | NV_FALCON_CPUCTL_STOPPED)))
+            serial_puts("RUNNING");
+        serial_puts(") Mailbox0=0x");
+        serial_puthex(mbox0, 8);
+        serial_puts(" Mailbox1=0x");
+        serial_puthex(mbox1, 8);
+        serial_puts("\n");
+
+        serial_puts("[GSP] Boot: GSP did not respond — firmware may require additional init\n");
+
+        fb_puts(" GSP: boot timeout\n");
+    }
+
+    return gsp.boot_ack ? 0 : -1;
 }
 
 gsp_state_t *gsp_get_state(void)

@@ -6,7 +6,8 @@
  * Phase 2: VRAM discovery, BAR1 read/write test, PRAMIN window.
  * Phase 3: PCI BAR sizes, gpu_write, PRAMIN window slide + R/W.
  * Phase 4: GSP Falcon deep probe, firmware load to RAM, upload to VRAM.
- * Phase 5+: GSP boot, message queues, RPC protocol.
+ * Phase 5: GSP boot (ELF parse, BOOTVEC, CPUCTL start, mailbox handshake).
+ * Phase 6+: Message queues, RPC protocol, GPU init via GSP-RM.
  */
 
 #ifndef OSITOK_GPU_H
@@ -75,6 +76,41 @@
 #define NV_FALCON_DMEMD            0x0001C4
 
 #define GSP_FW_VRAM_OFFSET_MB      128   /* Firmware placement: VRAM+128MB */
+
+/* ── Minimal ELF64 types (for GSP firmware parsing) ────────── */
+
+#define ELF_MAGIC       0x464C457F  /* "\x7FELF" as uint32_t LE */
+#define ELFCLASS64      2
+#define ELFDATA2LSB     1
+#define PT_LOAD         1
+
+typedef struct {
+    uint8_t  e_ident[16];
+    uint16_t e_type;
+    uint16_t e_machine;
+    uint32_t e_version;
+    uint64_t e_entry;          /* Entry point */
+    uint64_t e_phoff;          /* Program header table offset */
+    uint64_t e_shoff;
+    uint32_t e_flags;
+    uint16_t e_ehsize;
+    uint16_t e_phentsize;
+    uint16_t e_phnum;          /* Number of program headers */
+    uint16_t e_shentsize;
+    uint16_t e_shnum;
+    uint16_t e_shstrndx;
+} elf64_ehdr_t;               /* 64 bytes */
+
+typedef struct {
+    uint32_t p_type;           /* PT_LOAD = 1 */
+    uint32_t p_flags;
+    uint64_t p_offset;         /* Offset in file */
+    uint64_t p_vaddr;          /* Virtual address */
+    uint64_t p_paddr;          /* Physical address */
+    uint64_t p_filesz;         /* Size in file */
+    uint64_t p_memsz;          /* Size in memory */
+    uint64_t p_align;
+} elf64_phdr_t;               /* 56 bytes */
 
 /* Dead register sentinel */
 #define NV_DEAD_REG            0xFFFFFFFF
@@ -161,7 +197,7 @@ typedef struct {
     bool        pramin_rw_ok;      /* PRAMIN write/read through window slide OK */
 } gpu_probe_t;
 
-/* ── Phase 4: GSP Falcon State ──────────────────────────────── */
+/* ── Phase 4-5: GSP Falcon State ───────────────────────────── */
 
 typedef struct {
     /* Falcon hardware */
@@ -176,6 +212,13 @@ typedef struct {
     uint64_t    vram_offset;      /* VRAM placement */
     bool        fw_loaded;        /* In RAM */
     bool        fw_uploaded;      /* In VRAM, verified */
+    /* Boot (Phase 5) */
+    uint64_t    elf_entry;        /* ELF e_entry */
+    uint16_t    elf_phnum;        /* Number of program headers */
+    uint16_t    elf_machine;      /* e_machine (RISC-V = 0xF3) */
+    uint32_t    boot_status;      /* Post-boot mailbox0 value */
+    bool        booted;           /* CPUCTL_STARTCPU sent */
+    bool        boot_ack;         /* Mailbox handshake OK */
 } gsp_state_t;
 
 /* ── API ────────────────────────────────────────────────────── */
@@ -194,5 +237,8 @@ void     gpu_reg_write(uint32_t reg, uint32_t val);
 int  gsp_probe(void);
 int  gsp_load_firmware(void);
 gsp_state_t *gsp_get_state(void);
+
+/* Phase 5: GSP Falcon boot (ELF parse, boot sequence, mailbox poll) */
+int  gsp_boot(void);
 
 #endif /* OSITOK_GPU_H */

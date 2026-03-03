@@ -120,7 +120,7 @@ arch/x86/kernel/memory.c            Physical memory manager (bitmap, 4KB pages)
 arch/x86/drivers/nvme.c             Minimal NVMe driver (admin+IO queues, read-only)
 arch/x86/drivers/gpu.h              GPU types, MMIO register defines, Falcon defines, probe + GSP API
 arch/x86/drivers/gpu.c              GPU probe Phase 1-3 (chip ID, engines, VRAM, BAR1 R/W, PRAMIN R/W)
-arch/x86/drivers/gsp.c              GSP Falcon probe + firmware loader + VRAM upload (Phase 4)
+arch/x86/drivers/gsp.c              GSP Falcon driver: probe, firmware load, ELF parse, boot (Phase 4-5)
 arch/x86/fs/ositofs2.c              OsitoFS v2 bare-metal driver (mount, list, read)
 arch/x86/fs/gpt.h                   GPT structs (UEFI spec) + API
 arch/x86/fs/gpt.c                   GPT parser (name match + superblock magic probe)
@@ -258,7 +258,7 @@ Tasks:   idle, input, shell (3 of 8 slots used)
 | **X17** | **GPU VRAM discovery** (VRAM size, BAR1 R/W test, PRAMIN window — Phase 2) | Done |
 | **X18** | **GPU PCI BAR sizes + gpu_write + PRAMIN window slide R/W** (Phase 3) | Done |
 | **X19** | **GSP Falcon deep probe + firmware load to VRAM** (Phase 4) | Done |
-| X20     | GSP boot (ELF parse, BOOTVEC, CPUCTL start, mailbox handshake) | Next |
+| **X20** | **GSP boot** (ELF parse, BOOTVEC, CPUCTL start, mailbox handshake) — Phase 5 | Done |
 
 ### F12: DOOM Wireframe 2.5D
 Procedural level generator (4x4 grid, snake path connectivity) + wall-segment projection renderer.
@@ -336,6 +336,16 @@ Deep probe of GSP Falcon microcontroller, load firmware blob to RAM, upload to V
 - **Timing**: rdtsc for upload measurement, estimated @ 3GHz
 - **Safety**: Only reads Falcon status registers (no writes to CPUCTL/BOOTVEC/DMACTL). PRAMIN window save/restore. Only writes firmware data to VRAM. Graceful degradation: no GPU → skip VRAM upload; no gsp.bin → log and continue.
 - **Does NOT boot GSP** — that is X20 (BOOTVEC, CPUCTL_STARTCPU, mailbox handshake)
+
+### X20: GSP Falcon Boot — ELF Parse + Boot Sequence + Mailbox Handshake (Phase 5)
+First attempt to boot the GSP Falcon microcontroller.
+- **ELF64 parse**: Validate magic/class/endian, extract entry point + program headers from `gsp.fw_data` in RAM
+- **Boot sequence**: Halt Falcon → clear mailboxes → set DMATRFBASE (VRAM offset >> 8) → set BOOTVEC (entry >> 8) → CPUCTL_STARTCPU
+- **Mailbox poll**: Read MAILBOX0 in tight loop (~1s timeout @ 3GHz). Any non-zero value = firmware alive.
+- **Diagnostics**: On timeout, dump CPUCTL (HALTED/STOPPED/RUNNING), MAILBOX0, MAILBOX1
+- **Registers written**: CPUCTL (halt/start), BOOTVEC, DMATRFBASE, MAILBOX0/1 (clear to 0)
+- **Safety**: Timeout-based, never hangs. On failure Falcon returns to HALTED. OS continues regardless.
+- **Does NOT implement RPC** — that is X21+ (shared memory message queues, GSP-RM protocol)
 
 ## Language
 The user speaks Spanish. Communicate in Spanish when appropriate.

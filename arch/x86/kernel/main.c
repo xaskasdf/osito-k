@@ -58,6 +58,7 @@ extern bool osfs2_is_mounted(void);
 /* GSP Falcon */
 extern int  gsp_probe(void);
 extern int  gsp_load_firmware(void);
+extern int  gsp_boot(void);
 
 /* ── UDP Echo Handler ────────────────────────────────────────── */
 
@@ -165,11 +166,13 @@ void kernel_entry(void *memory_map, uint64_t map_size,
                         }
                     }
 
-                    /* GSP firmware loading */
+                    /* GSP firmware loading + boot */
                     gpu_probe_t *gp = gpu_get_probe();
                     if (gp && gp->gsp_present)
                         gsp_probe();
                     gsp_load_firmware();
+                    if (gp && gp->gsp_present)
+                        gsp_boot();
                 }
             } else {
                 serial_puts("[KERN] OsitoFS partition not found in GPT\n");
