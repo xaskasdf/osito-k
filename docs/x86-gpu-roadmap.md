@@ -1,20 +1,18 @@
 # OsitoK x86-64 — GPU Compute Roadmap
 
-> Status: X1–X26 done, X-CPU1 + X27 in progress.
+> Status: X1–X28 + X-CPU1 done. X29 next.
 > Last updated: 2026-03-03
 
 ## Current State
 
-X26 completed the FWSEC-FRTS attempt (VBIOS read → BIT parse → FWSEC upload → Falcon
-boot). GSP-RM does not respond because **the FWSEC load method is wrong**:
+X28 implemented the correct GBL-based FWSEC-FRTS boot sequence:
+- PIO-load GBL microcode to Falcon IMEM
+- BootloaderDmemDescV2 in DMEM with physical addresses of FWSEC in system RAM
+- FBIF TRANSCFG for coherent system memory DMA
+- SEC2 target for Turing, GSP for Ampere+
+- Legacy VRAM+DMATRFBASE fallback preserved
 
-| What X26 does | What should happen |
-|---|---|
-| Upload FWSEC to VRAM via PRAMIN | Upload Generic Bootloader (GBL) to IMEM via PIO |
-| DMATRFBASE + BOOTVEC + STARTCPU | GBL DMA-loads FWSEC from system memory → executes |
-
-The registers `IMEMC`/`IMEMD` (gpu.h lines 77–80) are already defined but never used for
-programmatic load. Fixing this is the critical path.
+**Next**: X29 builds WPR2 metadata + radix3 page tables so GSP firmware can boot properly.
 
 ---
 
@@ -24,8 +22,8 @@ The make-or-break phase. Without WPR2, GSP-RM cannot function.
 
 | Feature | Description | Est. Lines | Risk |
 |---------|-------------|-----------|------|
-| **X27** | **Falcon PIO Load** — write code to IMEM/DMEM via IMEMC/IMEMD registers | ~150 | Low |
-| **X28** | **GBL extraction + FWSEC-FRTS via GBL** — extract GBL from VBIOS, PIO-load to IMEM, GBL DMA-loads FWSEC from sysmem, execute FRTS | ~350 | **High** |
+| **X27** | **Falcon PIO Load** — write code to IMEM/DMEM via IMEMC/IMEMD registers | ~150 | Done |
+| **X28** | **GBL extraction + FWSEC-FRTS via GBL** — extract GBL from VBIOS, PIO-load to IMEM, GBL DMA-loads FWSEC from sysmem, execute FRTS | ~350 | Done |
 | **X29** | **WPR2 metadata + Radix3 page tables** — build radix3 PT for GSP firmware, write WPR meta to VRAM | ~300 | Medium |
 | **X30** | **GSP bootloader separation** — separate GSP bootloader from main firmware, proper 2-stage boot | ~250 | Medium |
 | **X31** | **GSP-RM functional RPC** — with proper boot chain, existing X22-X23 RPC code should work | ~200 | Low |
@@ -216,12 +214,12 @@ If GPU compute is unreachable, maximize CPU inference:
 ```
 Priority  Feature    Rationale
 ───────── ────────── ──────────────────────────────────────────
-1st       X-CPU1     AVX2 tensorops — immediate speedup, zero risk
-2nd       X27        Falcon PIO load — prerequisite, low risk
-3rd       X28        GBL + FWSEC-FRTS — the make-or-break step
-          X37        SASS compile — can parallelize with X28 validation
-4th       If X28 works: X29 → X31 → X32 → X36 → X38 → X40
-          If X28 fails: X-ALT2 (SEC2) → X-ALT1 → X-ALT3
+1st       X-CPU1     AVX2 tensorops — DONE
+2nd       X27        Falcon PIO load — DONE
+3rd       X28        GBL + FWSEC-FRTS — DONE (needs hardware validation)
+4th       X29        WPR2 metadata + Radix3 page tables  ← NEXT
+          X37        SASS compile — can parallelize with X29
+5th       X30 → X31 → X32 → X36 → X38 → X40
 ```
 
 ## Dependencies
