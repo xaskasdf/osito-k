@@ -270,6 +270,7 @@ Tasks:   idle, input, shell (3 of 8 slots used)
 | **X-CPU1** | **AVX2/FMA tensor ops** (runtime CPUID, vectorized matvec_q4_0 + rmsnorm, ~4-8x speedup) | Done |
 | **X27** | **Falcon PIO Load** (IMEMC/IMEMD write/read, falcon_reset, falcon_boot, PIO self-test) | Done |
 | **X28** | **GBL-based FWSEC-FRTS** (parse FWSEC header, PIO-load GBL to IMEM, DMEM descriptor, FBIF DMA, SEC2/GSP dispatch) | Done |
+| **X29** | **WPR2 metadata + Radix3 page tables** (3-level PT build, RmRiscvUCodeDesc extract, GspFwWprMeta write to VRAM) | Done |
 
 > Full GPU roadmap (X27-X40 + contingency): see [docs/x86-gpu-roadmap.md](docs/x86-gpu-roadmap.md)
 
@@ -451,6 +452,16 @@ Correct Turing+ boot sequence using Generic Bootloader (GBL) intermediary instea
 - **Boot + poll**: `falcon_boot(base, 0)` starts GBL which DMA-loads FWSEC and executes FRTS. Poll mailbox 2s for completion.
 - **Fallback**: If v2 fails, `gsp_fwsec_frts_legacy()` (old X26 VRAM+DMATRFBASE approach) runs automatically
 - **Known limitation**: Without full SEC2 bootstrap chain on Turing, GBL may not complete DMA. Diagnostic output reveals which step failed.
+
+### X29: WPR2 Metadata + Radix3 Page Tables
+Prepare GSP boot environment: radix3 page tables, bootloader extraction, WPR metadata.
+- **Radix3 page tables**: 3-level hierarchy (L0→L1→L2→firmware pages) mapping firmware at GSP virtual address 0. 512 entries per 4KB page. Identity-mapped (DMA addr = pointer). Allocated in system RAM.
+- **RmRiscvUCodeDesc**: Descriptor at end of gsp.bin (`fw_size - sizeof(desc)`). Contains `bootloader_offset/size`, `riscv_elf_offset/size`, `manifest_offset`. Bootloader copied to page-aligned DMA-accessible RAM.
+- **GspFwWprMeta v2**: Written to VRAM (end - 256KB) via PRAMIN. Contains radix3 L0 DMA addr, bootloader DMA addr + offsets, VRAM layout (fbSize, gspFwWprEnd). Magic 0x57505232 "WPR2" for verification.
+- **Integration**: Called from `gsp_boot()` after `gsp_fwsec_frts()`, before DMATRFBASE/BOOTVEC boot.
+- **Size calculation**: ~32MB gsp.bin → 8192 FW pages, 16 L2 pages, 1 L1 page = 73KB total PT.
+- **Safety**: All allocations from system RAM. PRAMIN writes to end-of-VRAM (away from framebuffer/firmware). Verify via magic readback. Graceful degradation on any failure.
+- **Does NOT change boot sequence** — that is X30 (two-stage bootloader-first boot via radix3).
 
 ## Language
 The user speaks Spanish. Communicate in Spanish when appropriate.

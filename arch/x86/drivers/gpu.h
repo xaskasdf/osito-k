@@ -678,4 +678,71 @@ int  falcon_boot(uint32_t base, uint32_t boot_addr);
 /* Self-test: PIO write + readback verify on IMEM/DMEM. Returns 0 on success. */
 int  falcon_pio_selftest(uint32_t base);
 
+/* ── X29: Radix3 Page Tables + WPR Metadata + GSP Bootloader ── */
+
+/* Radix3 page table constants */
+#define RADIX3_PAGE_SIZE       4096
+#define RADIX3_PTES_PER_PAGE   512      /* 4096 / 8 bytes per entry */
+
+/* Radix3 state (host-allocated page tables in system RAM) */
+typedef struct {
+    uint64_t *lvl0;           /* Level 0: 1 page, 1 entry → L1 */
+    uint64_t *lvl1;           /* Level 1: N pages, entries → L2 */
+    uint64_t *lvl2;           /* Level 2: N pages, entries → FW pages */
+    uint32_t  num_l1_pages;
+    uint32_t  num_l2_pages;
+    uint32_t  num_fw_pages;
+    bool      built;
+} radix3_state_t;
+
+/* GSP bootloader descriptor (RmRiscvUCodeDesc — found inside gsp.bin).
+ * Reference: nouveau nvkm_gsp_fwsec_sb, nova-core RmRiscvUCodeDesc */
+typedef struct {
+    uint32_t bootloader_offset;
+    uint32_t bootloader_size;
+    uint32_t bootloader_param_offset;
+    uint32_t bootloader_param_size;
+    uint32_t riscv_elf_offset;        /* Main firmware offset */
+    uint32_t riscv_elf_size;          /* Main firmware size */
+    uint32_t manifest_offset;
+    uint32_t manifest_size;
+    uint32_t monitor_data_offset;
+    uint32_t monitor_data_size;
+    uint32_t monitor_code_offset;
+    uint32_t monitor_code_size;
+    uint32_t app_version;
+} __attribute__((packed)) rm_riscv_ucode_desc_t;
+
+/* GspFwWprMeta v2 — written to end-of-VRAM for GSP bootloader.
+ * Reference: nouveau GspFwWprMeta, open-gpu-kernel-modules */
+typedef struct {
+    uint32_t magic;                    /* 0x57505232 "WPR2" */
+    uint32_t revision;                 /* 1 */
+    uint64_t sysmemAddrOfRadix3Elf;   /* DMA addr of radix3 L0 page */
+    uint64_t sizeOfRadix3Elf;         /* Firmware ELF total size */
+    uint64_t sysmemAddrOfBootloader;  /* DMA addr of GSP bootloader */
+    uint64_t sizeOfBootloader;        /* Bootloader size */
+    uint32_t bootloaderCodeOffset;
+    uint32_t bootloaderDataOffset;
+    uint32_t bootloaderManifestOffset;
+    uint32_t pad0;
+    uint32_t nonWprHeapOffset;
+    uint32_t nonWprHeapSize;
+    uint64_t gspFwRsvdStart;
+    uint64_t gspFwWprEnd;
+    uint64_t fbSize;
+    uint64_t vgaWorkspaceOffset;
+    uint64_t vgaWorkspaceSize;
+    uint32_t bootCount;
+    uint32_t pad2;
+} gsp_fw_wpr_meta_v2_t;
+
+/* WPR metadata VRAM placement (end of VRAM minus 256KB) */
+#define WPR_META_VRAM_OFFSET_FROM_END  (256 * 1024)
+
+/* X29 API */
+int  gsp_build_radix3(void);          /* Build 3-level PTs from firmware in RAM */
+int  gsp_extract_bootloader(void);    /* Extract bootloader desc from gsp.bin */
+int  gsp_write_wpr_meta(void);        /* Build + write WPR meta to VRAM */
+
 #endif /* OSITOK_GPU_H */

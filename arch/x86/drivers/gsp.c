@@ -1612,6 +1612,11 @@ int gsp_boot(void)
     /* ── Pre-boot: FWSEC-FRTS (create WPR2 before GSP firmware boot) ── */
     gsp_fwsec_frts();
 
+    /* ── X29: Build radix3 PTs + extract bootloader + write WPR meta ── */
+    gsp_build_radix3();
+    gsp_extract_bootloader();
+    gsp_write_wpr_meta();
+
     /* Pre-conditions */
     if (!gsp.fw_uploaded) {
         serial_puts("[GSP] Firmware not in VRAM, skipping boot\n");
@@ -1925,6 +1930,264 @@ int falcon_pio_selftest(uint32_t base)
     }
 
     return ok ? 0 : -1;
+}
+
+/* ══════════════════════════════════════════════════════════
+ *  X29: Radix3 Page Tables + WPR Metadata + Bootloader
+ *
+ *  Build 3-level page tables mapping firmware at GSP virtual
+ *  address 0, extract bootloader descriptor from gsp.bin,
+ *  and write GspFwWprMeta to VRAM for the GSP bootloader.
+ *
+ *  Reference: nouveau nvkm_gsp_radix3_sg, nova-core map_into_lvl()
+ * ══════════════════════════════════════════════════════════ */
+
+static radix3_state_t radix3;
+static rm_riscv_ucode_desc_t bl_desc;
+static uint8_t *bl_data;       /* Bootloader copy in page-aligned RAM */
+static uint32_t bl_size;
+
+int gsp_build_radix3(void)
+{
+    if (!gsp.fw_data || gsp.fw_size == 0) {
+        serial_puts("[GSP] Radix3: no firmware data\n");
+        return -1;
+    }
+
+    /* Calculate page counts */
+    uint32_t fw_size = (uint32_t)gsp.fw_size;
+    radix3.num_fw_pages = (fw_size + RADIX3_PAGE_SIZE - 1) / RADIX3_PAGE_SIZE;
+    radix3.num_l2_pages = (radix3.num_fw_pages + RADIX3_PTES_PER_PAGE - 1)
+                          / RADIX3_PTES_PER_PAGE;
+    radix3.num_l1_pages = (radix3.num_l2_pages + RADIX3_PTES_PER_PAGE - 1)
+                          / RADIX3_PTES_PER_PAGE;
+
+    serial_puts("[GSP] Radix3: ");
+    serial_putdec(radix3.num_fw_pages);
+    serial_puts(" fw pages, ");
+    serial_putdec(radix3.num_l2_pages);
+    serial_puts(" L2 pages, ");
+    serial_putdec(radix3.num_l1_pages);
+    serial_puts(" L1 pages\n");
+
+    /* Allocate page-aligned page table levels */
+    uint32_t l0_size = RADIX3_PAGE_SIZE;
+    uint32_t l1_size = radix3.num_l1_pages * RADIX3_PAGE_SIZE;
+    uint32_t l2_size = radix3.num_l2_pages * RADIX3_PAGE_SIZE;
+
+    radix3.lvl0 = (uint64_t *)mem_alloc_aligned(l0_size, RADIX3_PAGE_SIZE);
+    radix3.lvl1 = (uint64_t *)mem_alloc_aligned(l1_size, RADIX3_PAGE_SIZE);
+    radix3.lvl2 = (uint64_t *)mem_alloc_aligned(l2_size, RADIX3_PAGE_SIZE);
+
+    if (!radix3.lvl0 || !radix3.lvl1 || !radix3.lvl2) {
+        serial_puts("[GSP] Radix3: allocation failed\n");
+        return -1;
+    }
+
+    memset(radix3.lvl0, 0, l0_size);
+    memset(radix3.lvl1, 0, l1_size);
+    memset(radix3.lvl2, 0, l2_size);
+
+    /* Fill L2: each entry = DMA physical addr of a 4KB firmware page */
+    uint8_t *fw = (uint8_t *)gsp.fw_data;
+    for (uint32_t i = 0; i < radix3.num_fw_pages; i++)
+        radix3.lvl2[i] = (uint64_t)(uintptr_t)(fw + i * RADIX3_PAGE_SIZE);
+
+    /* Fill L1: each entry = DMA addr of a L2 page */
+    for (uint32_t i = 0; i < radix3.num_l2_pages; i++)
+        radix3.lvl1[i] = (uint64_t)(uintptr_t)(&radix3.lvl2[i * RADIX3_PTES_PER_PAGE]);
+
+    /* Fill L0: single entry = DMA addr of L1 */
+    radix3.lvl0[0] = (uint64_t)(uintptr_t)radix3.lvl1;
+
+    radix3.built = true;
+
+    uint32_t total_pt_bytes = l0_size + l1_size + l2_size;
+    serial_puts("[GSP] Radix3: L0=0x");
+    serial_puthex((uint64_t)(uintptr_t)radix3.lvl0, 16);
+    serial_puts(" L1=0x");
+    serial_puthex((uint64_t)(uintptr_t)radix3.lvl1, 16);
+    serial_puts(" L2=0x");
+    serial_puthex((uint64_t)(uintptr_t)radix3.lvl2, 16);
+    serial_puts("\n");
+    serial_puts("[GSP] Radix3: total PT size = ");
+    serial_putdec(total_pt_bytes);
+    serial_puts(" bytes (");
+    serial_putdec(total_pt_bytes / 4096);
+    serial_puts(" pages)\n");
+
+    fb_puts(" Radix3: ");
+    fb_putdec(radix3.num_fw_pages);
+    fb_puts(" pages OK\n");
+
+    return 0;
+}
+
+int gsp_extract_bootloader(void)
+{
+    if (!gsp.fw_data || gsp.fw_size < sizeof(elf64_ehdr_t)) {
+        serial_puts("[GSP] Bootloader: no firmware data\n");
+        return -1;
+    }
+
+    /* The RmRiscvUCodeDesc is at the end of the ELF file.
+     * Nouveau locates it via: fw_size - sizeof(rm_riscv_ucode_desc_t).
+     * Reference: nouveau nvkm_gsp_fwsec_sb(), nova-core gsp_fw_new() */
+    if (gsp.fw_size < sizeof(rm_riscv_ucode_desc_t)) {
+        serial_puts("[GSP] Bootloader: firmware too small for descriptor\n");
+        return -1;
+    }
+
+    uint64_t desc_off = gsp.fw_size - sizeof(rm_riscv_ucode_desc_t);
+    const rm_riscv_ucode_desc_t *desc_ptr =
+        (const rm_riscv_ucode_desc_t *)((uint8_t *)gsp.fw_data + desc_off);
+
+    /* Copy descriptor */
+    memcpy(&bl_desc, desc_ptr, sizeof(bl_desc));
+
+    serial_puts("[GSP] Bootloader desc at fw+0x");
+    serial_puthex(desc_off, 8);
+    serial_puts(":\n");
+    serial_puts("[GSP]   bl_off=0x");
+    serial_puthex(bl_desc.bootloader_offset, 8);
+    serial_puts(" bl_sz=");
+    serial_putdec(bl_desc.bootloader_size);
+    serial_puts("\n");
+    serial_puts("[GSP]   elf_off=0x");
+    serial_puthex(bl_desc.riscv_elf_offset, 8);
+    serial_puts(" elf_sz=");
+    serial_putdec(bl_desc.riscv_elf_size);
+    serial_puts("\n");
+    serial_puts("[GSP]   manifest_off=0x");
+    serial_puthex(bl_desc.manifest_offset, 8);
+    serial_puts(" app_ver=0x");
+    serial_puthex(bl_desc.app_version, 8);
+    serial_puts("\n");
+
+    /* Validate bootloader region */
+    if (bl_desc.bootloader_size == 0 ||
+        bl_desc.bootloader_offset + bl_desc.bootloader_size > gsp.fw_size) {
+        serial_puts("[GSP] Bootloader: invalid offset/size (off=0x");
+        serial_puthex(bl_desc.bootloader_offset, 8);
+        serial_puts(" sz=");
+        serial_putdec(bl_desc.bootloader_size);
+        serial_puts(" fw_sz=");
+        serial_putdec((uint32_t)gsp.fw_size);
+        serial_puts(")\n");
+        return -1;
+    }
+
+    /* Allocate page-aligned copy for DMA */
+    bl_size = bl_desc.bootloader_size;
+    bl_data = (uint8_t *)mem_alloc_aligned(bl_size, RADIX3_PAGE_SIZE);
+    if (!bl_data) {
+        serial_puts("[GSP] Bootloader: alloc failed (");
+        serial_putdec(bl_size);
+        serial_puts(" bytes)\n");
+        return -1;
+    }
+
+    memcpy(bl_data, (uint8_t *)gsp.fw_data + bl_desc.bootloader_offset, bl_size);
+
+    serial_puts("[GSP] Bootloader: extracted ");
+    serial_putdec(bl_size);
+    serial_puts(" bytes to 0x");
+    serial_puthex((uint64_t)(uintptr_t)bl_data, 16);
+    serial_puts("\n");
+
+    fb_puts(" GSP BL: ");
+    fb_putdec(bl_size);
+    fb_puts("B OK\n");
+
+    return 0;
+}
+
+int gsp_write_wpr_meta(void)
+{
+    gpu_probe_t *p = gpu_get_probe();
+
+    if (!p || !p->pramin_rw_ok) {
+        serial_puts("[GSP] WPR meta: PRAMIN not writable\n");
+        return -1;
+    }
+    if (!radix3.built) {
+        serial_puts("[GSP] WPR meta: radix3 not built\n");
+        return -1;
+    }
+    if (!bl_data || bl_size == 0) {
+        serial_puts("[GSP] WPR meta: bootloader not extracted\n");
+        return -1;
+    }
+
+    uint64_t vram_bytes = (uint64_t)p->vram_size_mb * 1024 * 1024;
+
+    /* Build GspFwWprMeta v2 */
+    gsp_fw_wpr_meta_v2_t meta;
+    memset(&meta, 0, sizeof(meta));
+
+    meta.magic                   = WPR2_MAGIC;
+    meta.revision                = 1;
+    meta.sysmemAddrOfRadix3Elf   = (uint64_t)(uintptr_t)radix3.lvl0;
+    meta.sizeOfRadix3Elf         = gsp.fw_size;
+    meta.sysmemAddrOfBootloader  = (uint64_t)(uintptr_t)bl_data;
+    meta.sizeOfBootloader        = bl_size;
+    meta.bootloaderCodeOffset    = 0;
+    meta.bootloaderDataOffset    = bl_desc.bootloader_param_offset;
+    meta.bootloaderManifestOffset = bl_desc.manifest_offset;
+    meta.fbSize                  = vram_bytes;
+    meta.gspFwWprEnd             = vram_bytes - RADIX3_PAGE_SIZE;
+    meta.gspFwRsvdStart          = vram_bytes - WPR_META_VRAM_OFFSET_FROM_END;
+
+    /* Write to VRAM via PRAMIN at end-of-VRAM - 256KB */
+    uint64_t meta_vram_off = vram_bytes - WPR_META_VRAM_OFFSET_FROM_END;
+    uint32_t orig_window = gpu_reg_read(NV_PBUS_BAR0_WINDOW);
+
+    uint32_t window_val = (uint32_t)(meta_vram_off >> 16);
+    gpu_reg_write(NV_PBUS_BAR0_WINDOW, window_val);
+    wmb();
+
+    uint32_t pramin_off = (uint32_t)(meta_vram_off & (NV_PRAMIN_SIZE - 1));
+    uint32_t *src = (uint32_t *)&meta;
+    uint32_t dwords = sizeof(meta) / 4;
+
+    for (uint32_t i = 0; i < dwords; i++)
+        gpu_reg_write(NV_PRAMIN_BASE + pramin_off + (i * 4), src[i]);
+    wmb();
+
+    /* Verify magic readback */
+    rmb();
+    uint32_t read_magic = gpu_reg_read(NV_PRAMIN_BASE + pramin_off);
+
+    /* Restore window */
+    gpu_reg_write(NV_PBUS_BAR0_WINDOW, orig_window);
+    wmb();
+
+    bool verify_ok = (read_magic == WPR2_MAGIC);
+
+    serial_puts("[GSP] WPR meta: written to VRAM+0x");
+    serial_puthex(meta_vram_off, 16);
+    serial_puts(" (");
+    serial_putdec(sizeof(meta));
+    serial_puts(" bytes)\n");
+    serial_puts("[GSP] WPR meta: magic verify ");
+    serial_puts(verify_ok ? "OK" : "FAIL");
+    serial_puts(" (read 0x");
+    serial_puthex(read_magic, 8);
+    serial_puts(")\n");
+
+    serial_puts("[GSP] WPR meta: radix3_l0=0x");
+    serial_puthex(meta.sysmemAddrOfRadix3Elf, 16);
+    serial_puts(" bl=0x");
+    serial_puthex(meta.sysmemAddrOfBootloader, 16);
+    serial_puts(" fbSize=");
+    serial_putdec(vram_bytes / (1024 * 1024));
+    serial_puts("MB\n");
+
+    fb_puts(" WPR meta: ");
+    fb_puts(verify_ok ? "OK" : "FAIL");
+    fb_puts("\n");
+
+    return verify_ok ? 0 : -1;
 }
 
 gsp_state_t *gsp_get_state(void)
