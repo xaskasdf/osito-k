@@ -1781,6 +1781,207 @@ int gsp_ce_init(void)
     return 0;
 }
 
+/* ══════════════════════════════════════════════════════════
+ *  X36: Kernel Completion + Semaphore Sync
+ *
+ *  Builds QMD (Queue Meta Data, 256 bytes), dispatches via
+ *  SEND_PCAS_A + SEND_SIGNALING_PCAS_B, waits for QMD
+ *  RELEASE0 semaphore, reads results via CE DMA.
+ *
+ *  QMD version: V02_03 (Turing/Ampere compatible).
+ *  Reference: NVIDIA open-gpu-doc clc5c0qmd.h, Mesa NAK qmd.rs.
+ * ══════════════════════════════════════════════════════════ */
+
+/* ── QMD builder (QMDV02_03, 256 bytes = 64 dwords) ── */
+
+static void qmd_build(uint32_t *qmd, const compute_dispatch_t *desc)
+{
+    memset(qmd, 0, QMD_SIZE_BYTES);
+
+    /* DW4: SM_GLOBAL_CACHING_ENABLE + SEMAPHORE_RELEASE_ENABLE0 */
+    qmd[QMD_DW4] = (1 << 6);   /* SM_GLOBAL_CACHING_ENABLE */
+    if (desc->sem_addr)
+        qmd[QMD_DW4] |= (1 << 10); /* SEMAPHORE_RELEASE_ENABLE0 */
+
+    /* DW5: Invalidate all caches */
+    qmd[QMD_DW5] = (1 << 26)   /* INVALIDATE_TEXTURE_HEADER_CACHE */
+                  | (1 << 27)   /* INVALIDATE_TEXTURE_SAMPLER_CACHE */
+                  | (1 << 28)   /* INVALIDATE_TEXTURE_DATA_CACHE */
+                  | (1 << 29)   /* INVALIDATE_SHADER_DATA_CACHE */
+                  | (1 << 30)   /* INVALIDATE_INSTRUCTION_CACHE */
+                  | (1 << 31);  /* INVALIDATE_SHADER_CONSTANT_CACHE */
+
+    /* DW11: RELEASE_MEMBAR_TYPE=FE_SYSMEMBAR, CWD_MEMBAR=L1_SYSMEMBAR,
+     *       API_VISIBLE_CALL_LIMIT=NO_CHECK */
+    qmd[QMD_DW11] = (1 << 14)   /* RELEASE_MEMBAR_TYPE = FE_SYSMEMBAR */
+                   | (1 << 16)   /* CWD_MEMBAR_TYPE = L1_SYSMEMBAR */
+                   | (1 << 26);  /* API_VISIBLE_CALL_LIMIT = NO_CHECK */
+
+    /* DW12-14: Grid dimensions (CTA raster) */
+    qmd[QMD_DW12] = desc->grid_x;
+    qmd[QMD_DW13] = desc->grid_y & 0xFFFF;
+    qmd[QMD_DW14] = desc->grid_z & 0xFFFF;
+
+    /* DW17: Shared memory size (aligned to 0x100) */
+    qmd[QMD_DW17] = (desc->shared_mem_size + 0xFF) & ~0xFF;
+
+    /* DW18: QMD version + CTA_THREAD_DIMENSION0 */
+    qmd[QMD_DW18] = (QMD_VERSION_V02_03)          /* bits 3:0 */
+                   | (QMD_MAJOR_VERSION_V02 << 4)  /* bits 7:4 */
+                   | (desc->block_x << 16);         /* bits 31:16 */
+
+    /* DW19: CTA_THREAD_DIMENSION1 + CTA_THREAD_DIMENSION2 */
+    qmd[QMD_DW19] = (desc->block_y & 0xFFFF)
+                   | ((desc->block_z & 0xFFFF) << 16);
+
+    /* DW20: REGISTER_COUNT_V (Volta+, bits 16:8) */
+    qmd[QMD_DW20] = (desc->register_count & 0xFF) << 8;
+
+    /* DW23-25: RELEASE0 semaphore (if enabled) */
+    if (desc->sem_addr) {
+        qmd[QMD_DW23] = (uint32_t)(desc->sem_addr & 0xFFFFFFFF);
+        qmd[QMD_DW24] = (uint32_t)((desc->sem_addr >> 32) & 0xFF);
+        /* RELEASE0_STRUCTURE_SIZE = ONE_WORD (bit 31 = 1) */
+        qmd[QMD_DW24] |= (1 << 31);
+        qmd[QMD_DW25] = desc->sem_payload;
+    }
+
+    /* DW29: SHADER_LOCAL_MEMORY_LOW_SIZE + BARRIER_COUNT */
+    qmd[QMD_DW29] = (desc->barrier_count & 0x1F) << 27;
+
+    /* DW48-49: PROGRAM_ADDRESS */
+    qmd[QMD_DW48] = (uint32_t)(desc->program_addr & 0xFFFFFFFF);
+    qmd[QMD_DW49] = (uint32_t)((desc->program_addr >> 32) & 0x1FFFF);
+}
+
+/* ── Dispatch: push SEND_PCAS + signal ── */
+
+int gsp_compute_dispatch(const compute_dispatch_t *desc)
+{
+    if (!compute.class_bound) {
+        serial_puts("[DISPATCH] Compute class not bound\n");
+        return -1;
+    }
+    if (!desc || !desc->program_addr) {
+        serial_puts("[DISPATCH] Invalid dispatch descriptor\n");
+        return -1;
+    }
+
+    serial_puts("[DISPATCH] Grid=");
+    serial_putdec(desc->grid_x); serial_puts("x");
+    serial_putdec(desc->grid_y); serial_puts("x");
+    serial_putdec(desc->grid_z);
+    serial_puts(" Block=");
+    serial_putdec(desc->block_x); serial_puts("x");
+    serial_putdec(desc->block_y); serial_puts("x");
+    serial_putdec(desc->block_z);
+    serial_puts(" Regs=");
+    serial_putdec(desc->register_count);
+    serial_puts("\n");
+
+    /* Allocate QMD (256-byte aligned) */
+    uint32_t *qmd = (uint32_t *)mem_alloc_aligned(QMD_SIZE_BYTES, QMD_ALIGNMENT);
+    if (!qmd) {
+        serial_puts("[DISPATCH] Failed to allocate QMD\n");
+        return -1;
+    }
+
+    /* Build QMD */
+    qmd_build(qmd, desc);
+    wmb();
+
+    uint64_t qmd_phys = (uint64_t)(uintptr_t)qmd;
+
+    serial_puts("[DISPATCH] QMD at 0x");
+    serial_puthex(qmd_phys, 16);
+    serial_puts(" prog=0x");
+    serial_puthex(desc->program_addr, 16);
+    serial_puts("\n");
+
+    /* Push dispatch commands */
+    pushbuf_state_t *pb = &compute.pb;
+    pb_begin(pb);
+
+    /* SEND_PCAS_A: QMD address >> 8 */
+    pb_push(pb, NV_METHOD(SUBCHANNEL_COMPUTE, NVC5C0_SEND_PCAS_A, 1));
+    pb_push(pb, (uint32_t)(qmd_phys >> 8));
+
+    /* Determine dispatch signal method based on GPU generation */
+    gpu_device_t *dev = &gpu_dev;
+    if (dev->generation >= GPU_GEN_AMPERE) {
+        /* Ampere+: SEND_SIGNALING_PCAS2_B */
+        pb_push(pb, NV_METHOD_IMMD(SUBCHANNEL_COMPUTE,
+                    NVC6C0_SEND_SIGNALING_PCAS2_B,
+                    PCAS2_ACTION_INVALIDATE_COPY_SCHEDULE));
+    } else {
+        /* Turing: SEND_SIGNALING_PCAS_B */
+        pb_push(pb, NV_METHOD_IMMD(SUBCHANNEL_COMPUTE,
+                    NVC5C0_SEND_SIGNALING_PCAS_B,
+                    SIGNALING_PCAS_B_INVALIDATE | SIGNALING_PCAS_B_SCHEDULE));
+    }
+
+    pb_submit(pb);
+
+    serial_puts("[DISPATCH] Kernel launched\n");
+
+    return 0;
+}
+
+/* ── Wait for kernel completion via semaphore ── */
+
+int gsp_compute_wait(uint64_t sem_addr, uint32_t expected, uint32_t timeout_ms)
+{
+    volatile uint32_t *sem = (volatile uint32_t *)(uintptr_t)sem_addr;
+    uint64_t timeout_cycles = (uint64_t)timeout_ms * 3000000ULL;
+    uint64_t t0 = rdtsc();
+
+    serial_puts("[DISPATCH] Waiting for semaphore at 0x");
+    serial_puthex(sem_addr, 16);
+    serial_puts(" expected=");
+    serial_putdec(expected);
+    serial_puts("...\n");
+
+    while (1) {
+        rmb();
+        uint32_t val = *sem;
+        if (val == expected) {
+            uint64_t elapsed_cycles = rdtsc() - t0;
+            uint32_t elapsed_us = (uint32_t)(elapsed_cycles / 3000);
+            serial_puts("[DISPATCH] Kernel complete (");
+            serial_putdec(elapsed_us);
+            serial_puts(" us)\n");
+            return 0;
+        }
+
+        uint64_t elapsed = rdtsc() - t0;
+        if (elapsed > timeout_cycles) {
+            serial_puts("[DISPATCH] Timeout waiting for kernel (");
+            serial_putdec(timeout_ms);
+            serial_puts(" ms), sem=");
+            serial_putdec(val);
+            serial_puts("\n");
+            return -1;
+        }
+    }
+}
+
+/* ── Read results back from GPU memory via CE DMA ── */
+
+int gsp_compute_read_results(uint64_t src_vram, void *dst, uint32_t size)
+{
+    if (!dst || size == 0) return -1;
+
+    serial_puts("[DISPATCH] Reading ");
+    serial_putdec(size);
+    serial_puts(" bytes from VRAM+0x");
+    serial_puthex(src_vram, 16);
+    serial_puts("\n");
+
+    /* Use CE D2H copy (X35) */
+    uint64_t dst_phys = (uint64_t)(uintptr_t)dst;
+    return gsp_ce_copy_d2h(src_vram, dst_phys, size);
+}
+
 /* ── Phase 10: FWSEC-FRTS Execution + WPR2 ───────────────────── */
 
 /*

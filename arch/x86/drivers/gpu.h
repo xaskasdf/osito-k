@@ -476,6 +476,60 @@ typedef struct {
     bool      ready;               /* Compute dispatch ready */
 } compute_state_t;
 
+/* ── X36: QMD (Queue Meta Data) + Dispatch ───────────────── */
+
+/* QMD size: 256 bytes = 64 dwords (QMDV02_03 / QMDV03_00) */
+#define QMD_SIZE_BYTES   256
+#define QMD_SIZE_DWORDS  64
+#define QMD_ALIGNMENT    256   /* Must be 256-byte aligned */
+
+/* QMD version constants */
+#define QMD_MAJOR_VERSION_V02   2   /* Turing, Ampere (compat) */
+#define QMD_MAJOR_VERSION_V03   3   /* Ampere (native) */
+#define QMD_VERSION_V02_03      3   /* Turing+ */
+#define QMD_VERSION_V03_00      0   /* Ampere+ native */
+
+/* QMD dword indices for key fields (QMDV02_03 layout) */
+#define QMD_DW4    4    /* QMD_GROUP_ID, SM_GLOBAL_CACHING, SEM_RELEASE_ENABLE */
+#define QMD_DW5    5    /* INVALIDATE cache flags */
+#define QMD_DW11  11    /* RELEASE_MEMBAR, CWD_MEMBAR, API_VISIBLE_CALL_LIMIT */
+#define QMD_DW12  12    /* CTA_RASTER_WIDTH */
+#define QMD_DW13  13    /* CTA_RASTER_HEIGHT (bits 15:0) */
+#define QMD_DW14  14    /* CTA_RASTER_DEPTH (bits 15:0) */
+#define QMD_DW17  17    /* SHARED_MEMORY_SIZE */
+#define QMD_DW18  18    /* QMD_VERSION, CTA_THREAD_DIMENSION0 */
+#define QMD_DW19  19    /* CTA_THREAD_DIMENSION1, CTA_THREAD_DIMENSION2 */
+#define QMD_DW20  20    /* CONSTANT_BUFFER_VALID, REGISTER_COUNT_V */
+#define QMD_DW23  23    /* RELEASE0_ADDRESS_LOWER */
+#define QMD_DW24  24    /* RELEASE0_ADDRESS_UPPER + flags */
+#define QMD_DW25  25    /* RELEASE0_PAYLOAD */
+#define QMD_DW29  29    /* SHADER_LOCAL_MEMORY_LOW_SIZE, BARRIER_COUNT */
+#define QMD_DW30  30    /* SHADER_LOCAL_MEMORY_HIGH_SIZE */
+#define QMD_DW48  48    /* PROGRAM_ADDRESS_LOWER */
+#define QMD_DW49  49    /* PROGRAM_ADDRESS_UPPER */
+
+/* SEND_SIGNALING_PCAS_B (0x02BC) — Turing dispatch trigger */
+#define NVC5C0_SEND_SIGNALING_PCAS_B          0x02BC
+#define SIGNALING_PCAS_B_INVALIDATE           (1 << 0)
+#define SIGNALING_PCAS_B_SCHEDULE             (1 << 1)
+
+/* SEND_SIGNALING_PCAS2_B (0x02C0) — Ampere+ dispatch trigger */
+#define NVC6C0_SEND_SIGNALING_PCAS2_B         0x02C0
+#define PCAS2_ACTION_INVALIDATE_COPY_SCHEDULE 3
+
+/* Compute dispatch descriptor */
+typedef struct {
+    uint64_t  program_addr;        /* GPU virtual/physical addr of SASS shader */
+    uint32_t  grid_x, grid_y, grid_z;    /* Grid dimensions (CTA count) */
+    uint32_t  block_x, block_y, block_z; /* Block dimensions (threads) */
+    uint32_t  register_count;      /* GPRs per thread */
+    uint32_t  shared_mem_size;     /* Shared memory (aligned to 0x100) */
+    uint32_t  barrier_count;       /* Number of barriers */
+    /* Semaphore fence (host-accessible physical address) */
+    uint64_t  sem_addr;            /* Semaphore address for RELEASE0 */
+    uint32_t  sem_payload;         /* Value to write on completion */
+} compute_dispatch_t;
+
 /* ── X35: Copy Engine (CE) DMA Defines ───────────────────── */
 
 /* CE class IDs per GPU generation (clXXb5.h, open-gpu-doc) */
@@ -999,6 +1053,11 @@ int  gsp_ce_init(void);                           /* Bind CE class, init state *
 ce_state_t *gsp_get_ce(void);                     /* Get CE state */
 int  gsp_ce_copy_h2d(uint64_t src_phys, uint64_t dst_vram, uint32_t size);  /* Host→Device */
 int  gsp_ce_copy_d2h(uint64_t src_vram, uint64_t dst_phys, uint32_t size);  /* Device→Host */
+
+/* X36: Compute dispatch + kernel completion */
+int  gsp_compute_dispatch(const compute_dispatch_t *desc); /* Build QMD + SEND_PCAS */
+int  gsp_compute_wait(uint64_t sem_addr, uint32_t expected, uint32_t timeout_ms);
+int  gsp_compute_copy_results(uint64_t src_vram, void *dst, uint32_t size); /* D2H + sync */
 
 /* Phase 9: VBIOS read + BIT parse + FWSEC extraction */
 int  gpu_read_vbios(void);           /* Read VBIOS from VRAM via PRAMIN */

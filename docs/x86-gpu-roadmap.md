@@ -1,6 +1,6 @@
 # OsitoK x86-64 — GPU Compute Roadmap
 
-> Status: X1–X35 + X-CPU1 done. Phase A complete. Phase B: X32-X35 done, X36 next.
+> Status: X1–X36 + X-CPU1 done. Phase A + B complete. Phase C: X37 next.
 > Last updated: 2026-03-03
 
 ## Current State
@@ -21,7 +21,8 @@ X33 allocated TSG + GPFIFO channel with instance/USERD memory.
 X34 binds compute class to channel, activates via CTRL_BIND+SCHEDULE,
 pushes SET_OBJECT + cache invalidate + semaphore fence through GPFIFO.
 X35 implements CE DMA with physical addressing (sysmem↔VRAM), semaphore fencing.
-**Next**: X36 — Kernel completion + semaphore sync.
+X36 adds QMD construction (QMDV02_03), SEND_PCAS dispatch, kernel wait, result readback.
+**Phase B complete.** Next: Phase C — NTransformer port to GPU (X37: offline SASS compilation).
 
 ---
 
@@ -100,7 +101,7 @@ Requires Phase A complete (functional GSP-RM). Sets up GPU compute dispatch.
 | **X33** | **Channel + GPFIFO** — TSG alloc, GPFIFO channel alloc, ring buffer + inst/USERD memory | ~200 | Done |
 | **X34** | **Compute class bind + kernel dispatch** — bind compute class, push methods, semaphore fence | ~300 | Done |
 | **X35** | **Copy Engine DMA** — host-to-device and device-to-host transfers, semaphore fence | ~250 | Done |
-| **X36** | **Kernel completion + semaphore sync** — wait for kernel, read results | ~100 | Low |
+| **X36** | **Kernel completion + semaphore sync** — QMD build, SEND_PCAS dispatch, wait, result readback | ~200 | Done |
 
 ### Key structures
 

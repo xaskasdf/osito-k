@@ -277,6 +277,7 @@ Tasks:   idle, input, shell (3 of 8 slots used)
 | **X33** | **Channel + GPFIFO** (TSG alloc, GPFIFO channel alloc, ring buffer + instance/USERD memory) | Done |
 | **X34** | **Compute class bind + kernel dispatch** (pushbuffer encoding, SET_OBJECT, CTRL_BIND/SCHEDULE, semaphore fence) | Done |
 | **X35** | **Copy Engine DMA** (CE class bind, H2D/D2H physical copy, semaphore fence, chunked transfers) | Done |
+| **X36** | **Kernel completion + semaphore sync** (QMD build QMDV02_03, SEND_PCAS dispatch, kernel wait, CE result readback) | Done |
 
 > Full GPU roadmap (X27-X40 + contingency): see [docs/x86-gpu-roadmap.md](docs/x86-gpu-roadmap.md)
 
@@ -526,6 +527,15 @@ Host-to-device and device-to-host DMA transfers via the Copy Engine (CE).
 - **Semaphore fence**: CE semaphore via SET_SEMAPHORE_A/B/PAYLOAD, monotonic fence_seq counter.
 - **API**: `gsp_ce_copy_h2d(src_phys, dst_vram, size)`, `gsp_ce_copy_d2h(src_vram, dst_phys, size)`.
 - **Integration**: Called from `gsp_boot()` after `gsp_compute_init()`.
+
+### X36: Kernel Completion + Semaphore Sync
+Complete compute dispatch pipeline: QMD construction, kernel launch, wait, result readback.
+- **QMD (QMDV02_03)**: 256-byte descriptor with grid/block dims, program address, register count, shared memory, cache invalidation, RELEASE0 semaphore.
+- **QMD fields**: DW4 (SM_GLOBAL_CACHING + SEM_ENABLE), DW5 (cache invalidation), DW11 (membar + API_VISIBLE_CALL_LIMIT), DW12-14 (grid dims), DW17 (shared_mem), DW18-19 (version + block dims), DW20 (REGISTER_COUNT_V), DW23-25 (RELEASE0 semaphore), DW48-49 (PROGRAM_ADDRESS).
+- **Dispatch**: SEND_PCAS_A (QMD addr >> 8) + SEND_SIGNALING_PCAS_B (Turing: 0x02BC, invalidate+schedule) or SEND_SIGNALING_PCAS2_B (Ampere+: 0x02C0, action=3).
+- **Kernel wait**: `gsp_compute_wait()` polls RELEASE0 semaphore address with rdtsc timeout, reports elapsed microseconds.
+- **Result readback**: `gsp_compute_read_results()` uses CE D2H copy (X35) to transfer VRAM results to host.
+- **Note**: Actual dispatch requires SASS shader (X37). QMD infrastructure is ready.
 
 ## Language
 The user speaks Spanish. Communicate in Spanish when appropriate.
