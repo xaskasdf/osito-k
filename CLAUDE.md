@@ -121,6 +121,8 @@ arch/x86/drivers/nvme.c             Minimal NVMe driver (admin+IO queues, read-o
 arch/x86/drivers/gpu.h              GPU types, MMIO register defines, Falcon defines, RPC IDs, VBIOS/BIT/FWSEC/WPR2 structs, PIO API, probe + GSP API
 arch/x86/drivers/gpu.c              GPU probe Phase 1-3 + Phase 9 VBIOS read, BIT parse, FWSEC extraction
 arch/x86/drivers/gsp.c              GSP Falcon driver: probe, firmware load, ELF parse, boot, queues, RPC, FWSEC-FRTS, PIO load (Phase 4-10 + X27)
+arch/x86/drivers/sass.h              SASS kernel types, 128-bit instruction encoding, control code helpers, kernel catalog
+arch/x86/drivers/sass.c              Pre-encoded SASS kernels (NOP, S2R, NOP4), VRAM upload via PRAMIN, smoke test dispatch
 arch/x86/fs/ositofs2.c              OsitoFS v2 bare-metal driver (mount, list, read)
 arch/x86/fs/gpt.h                   GPT structs (UEFI spec) + API
 arch/x86/fs/gpt.c                   GPT parser (name match + superblock magic probe)
@@ -278,6 +280,7 @@ Tasks:   idle, input, shell (3 of 8 slots used)
 | **X34** | **Compute class bind + kernel dispatch** (pushbuffer encoding, SET_OBJECT, CTRL_BIND/SCHEDULE, semaphore fence) | Done |
 | **X35** | **Copy Engine DMA** (CE class bind, H2D/D2H physical copy, semaphore fence, chunked transfers) | Done |
 | **X36** | **Kernel completion + semaphore sync** (QMD build QMDV02_03, SEND_PCAS dispatch, kernel wait, CE result readback) | Done |
+| **X37** | **SASS kernel infrastructure** (128-bit instruction encoding, pre-encoded NOP/S2R/NOP4 kernels, VRAM upload via PRAMIN, dispatch smoke test) | Done |
 
 > Full GPU roadmap (X27-X40 + contingency): see [docs/x86-gpu-roadmap.md](docs/x86-gpu-roadmap.md)
 
@@ -536,6 +539,17 @@ Complete compute dispatch pipeline: QMD construction, kernel launch, wait, resul
 - **Kernel wait**: `gsp_compute_wait()` polls RELEASE0 semaphore address with rdtsc timeout, reports elapsed microseconds.
 - **Result readback**: `gsp_compute_read_results()` uses CE D2H copy (X35) to transfer VRAM results to host.
 - **Note**: Actual dispatch requires SASS shader (X37). QMD infrastructure is ready.
+
+### X37: SASS Kernel Infrastructure
+Pre-encoded SASS (Shader ASSembly) compute kernels for NVIDIA SM75+ GPUs.
+- **Instruction format**: 128-bit per instruction (SM70+). Lower 64 bits = opcode + registers + modifiers. Upper 64 bits = control/scheduling codes (stall, yield, barrier, reuse).
+- **No SPH needed**: Compute kernels dispatched via QMD don't use Shader Program Header — QMD carries all execution metadata (register count, shared memory, grid/block dims).
+- **Pre-encoded kernels**: `nop` (EXIT only, 16B — dispatch smoke test), `s2r_exit` (S2R R2,SR_TID.X + EXIT, 32B — register read test), `nop4_exit` (4×NOP + EXIT, 80B — multi-instruction fetch test).
+- **Verified encodings (SM75)**: EXIT=0x794d|0x000fea0003800000, NOP=0x7918|0x000fc00000000000, S2R R2,SR_TID.X=0x027919|0x000e220000002100.
+- **VRAM upload**: Kernels placed at VRAM+256MB via PRAMIN window (same X18 pattern), 256-byte aligned, readback verify.
+- **Smoke test**: `sass_smoke_test()` dispatches NOP kernel with QMD semaphore (RELEASE0), waits 500ms. Expected to timeout without full GSP boot chain.
+- **Files**: `arch/x86/drivers/sass.h` (types, encoding defines, API), `arch/x86/drivers/sass.c` (kernel binaries, upload, smoke test).
+- **Integration**: Called from `gsp_boot()` after compute/CE init. Works with or without GSP — PRAMIN upload always succeeds if GPU is present.
 
 ## Language
 The user speaks Spanish. Communicate in Spanish when appropriate.

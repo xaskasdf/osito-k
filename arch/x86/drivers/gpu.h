@@ -1059,6 +1059,10 @@ int  gsp_compute_dispatch(const compute_dispatch_t *desc); /* Build QMD + SEND_P
 int  gsp_compute_wait(uint64_t sem_addr, uint32_t expected, uint32_t timeout_ms);
 int  gsp_compute_copy_results(uint64_t src_vram, void *dst, uint32_t size); /* D2H + sync */
 
+/* X37: SASS kernel infrastructure (see sass.h for types) */
+int  sass_init(void);          /* Register + upload pre-encoded SASS kernels */
+int  sass_smoke_test(void);    /* Dispatch NOP kernel, check semaphore */
+
 /* Phase 9: VBIOS read + BIT parse + FWSEC extraction */
 int  gpu_read_vbios(void);           /* Read VBIOS from VRAM via PRAMIN */
 int  gpu_parse_bit(void);            /* Parse BIT table, extract FWSEC */

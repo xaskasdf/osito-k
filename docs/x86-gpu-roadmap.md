@@ -1,6 +1,6 @@
 # OsitoK x86-64 — GPU Compute Roadmap
 
-> Status: X1–X36 + X-CPU1 done. Phase A + B complete. Phase C: X37 next.
+> Status: X1–X37 + X-CPU1 done. Phase A + B complete. Phase C in progress: X38 next.
 > Last updated: 2026-03-03
 
 ## Current State
@@ -120,7 +120,7 @@ Port inference pipeline to GPU compute. Requires Phase B.
 
 | Feature | Description | Est. Lines | Risk |
 |---------|-------------|-----------|------|
-| **X37** | **Offline SASS compilation** — tools/cuda/ SASS assembler for compute kernels | ~300 | Medium |
+| **X37** | **Offline SASS compilation** — SASS instruction encoding, pre-encoded kernels (NOP/S2R/NOP4), VRAM upload, smoke test | ~300 | Done |
 | **X38** | **Kernel loader** — load compiled SASS from OsitoFS, setup launch params | ~400 | Medium |
 | **X39** | **GPU tensor ops** — SASS kernels: matvec_q4_0, rmsnorm, softmax, RoPE | ~600 | Medium |
 | **X40** | **GPU-accelerated Llama inference** — orchestrate GPU kernels for full forward pass | ~400 | Medium |
@@ -253,7 +253,7 @@ X37 ─────────────────────────�
 | `arch/x86/kernel/tensor.c` | X-CPU1 | Runtime dispatch (AVX2/scalar) |
 | `arch/x86/drivers/gsp.c` | X27-X31 | Falcon PIO load + boot chain fix |
 | `arch/x86/drivers/gpu.h` | X27-X31 | PIO API declarations |
-| `arch/x86/drivers/gmmu.c` | X32 | GPU page tables (new) |
-| `arch/x86/drivers/channel.c` | X33 | GPFIFO channel management (new) |
-| `arch/x86/drivers/compute.c` | X34 | Compute dispatch (new) |
-| `tools/cuda/` | X37 | SASS compilation tools (new) |
+| `arch/x86/drivers/gsp.c` | X32-X36 | RM alloc/control, channel, compute, CE, dispatch |
+| `arch/x86/drivers/gpu.h` | X32-X36 | Compute/CE/QMD types + API declarations |
+| `arch/x86/drivers/sass.h` | X37 | SASS instruction types, encoding defines, kernel catalog |
+| `arch/x86/drivers/sass.c` | X37 | Pre-encoded SASS kernels, VRAM upload, smoke test |

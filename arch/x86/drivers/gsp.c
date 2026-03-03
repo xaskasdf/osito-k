@@ -3205,6 +3205,9 @@ int gsp_boot(void)
         gsp_ce_init();
     }
 
+    /* X37: SASS kernel infrastructure (works with or without GSP boot) */
+    sass_init();
+
     return ret;
 }
 
