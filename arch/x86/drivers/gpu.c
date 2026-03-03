@@ -475,6 +475,7 @@ extern void *mem_alloc_aligned(uint64_t size, uint64_t alignment);
 
 static vbios_state_t vbios;
 static fwsec_state_t fwsec;
+static gbl_state_t   gbl;
 
 static const char *vbios_code_type_name(uint8_t code_type)
 {
@@ -495,6 +496,7 @@ int gpu_read_vbios(void)
 
     memset(&vbios, 0, sizeof(vbios));
     memset(&fwsec, 0, sizeof(fwsec));
+    memset(&gbl, 0, sizeof(gbl));
 
     serial_puts("[GPU] VBIOS: reading via PRAMIN...\n");
 
@@ -813,6 +815,22 @@ int gpu_parse_bit(void)
                     serial_puthex(fwsec.target_id, 2);
                     serial_puts("\n");
                 }
+
+                /* Look for GBL (Generic Bootloader) application */
+                if (desc->application_id == FALCON_APP_GBL &&
+                    desc->vbios_offset + desc->stored_size <= vbios.size) {
+                    gbl.code = vbios.data + desc->vbios_offset;
+                    gbl.code_size = desc->stored_size;
+                    gbl.data = NULL;
+                    gbl.data_size = 0;
+                    gbl.found = true;
+
+                    serial_puts("[GPU] GBL: extracted from BIT, ");
+                    serial_putdec(gbl.code_size);
+                    serial_puts(" bytes at +0x");
+                    serial_puthex(desc->vbios_offset, 4);
+                    serial_puts("\n");
+                }
             }
             break;
         }
@@ -849,6 +867,7 @@ int gpu_parse_bit(void)
 
 vbios_state_t *gpu_get_vbios(void)  { return &vbios; }
 fwsec_state_t *gpu_get_fwsec(void)  { return &fwsec; }
+gbl_state_t   *gpu_get_gbl(void)    { return &gbl; }
 
 /* ── Public API ──────────────────────────────────────────────── */
 

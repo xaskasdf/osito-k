@@ -373,7 +373,9 @@ typedef struct {
 } __attribute__((packed)) falcon_ucode_desc_t;
 
 #define FALCON_APP_FWSEC  0x01
-#define FALCON_TARGET_GSP 0x03
+#define FALCON_APP_GBL    0x02   /* Generic Bootloader */
+#define FALCON_TARGET_GSP  0x03
+#define FALCON_TARGET_SEC2 0x04
 
 /* FWSEC state */
 typedef struct {
@@ -414,6 +416,64 @@ typedef struct {
 /* FWSEC command defines */
 #define FWSEC_FRTS_CMD         0x15  /* FRTS = Falcon Recovery Table Setup */
 #define FWSEC_SB_CMD           0x16  /* Secure Boot command */
+
+/* FBIF — Falcon Framebuffer Interface (enables DMA from system memory) */
+#define NV_PFALCON_FBIF_TRANSCFG              0x000600  /* Offset from falcon base */
+#define FBIF_TRANSCFG_TARGET_COHERENT_SYSMEM  0x02
+
+/* Falcon DMATRFBASE1 — high 32 bits for 64-bit DMA addressing */
+#define NV_FALCON_DMATRFBASE1  0x000128
+
+/* ── X28: FWSEC Internal Header + GBL Structures ─────────────── */
+
+/* FWSEC internal firmware header (at start of FWSEC blob from BIT).
+ * Contains offsets to bootloader (GBL), OS code, OS data, and application sections.
+ * Reference: nouveau nvkm_falcon_fw, nova-core falcon_fw_hdr */
+typedef struct {
+    uint32_t os_code_offset;       /* OS code section offset (bytes) */
+    uint32_t os_code_size;         /* OS code section size */
+    uint32_t os_data_offset;       /* OS data section offset */
+    uint32_t os_data_size;         /* OS data section size */
+    uint32_t num_apps;             /* Number of applications */
+    uint32_t app_code_start;       /* App code start offset */
+    uint32_t app_code_size;        /* App code size */
+    uint32_t app_data_start;       /* App data start offset */
+    uint32_t app_data_size;        /* App data size */
+    uint32_t bl_code_offset;       /* Bootloader (GBL) code offset */
+    uint32_t bl_code_size;         /* Bootloader code size */
+    uint32_t bl_data_offset;       /* Bootloader data offset */
+    uint32_t bl_data_size;         /* Bootloader data size */
+} __attribute__((packed)) falcon_fw_hdr_t;
+
+/* BootloaderDmemDescV2 — written to Falcon DMEM via PIO.
+ * Tells GBL where FWSEC code/data live in system memory (DMA-accessible).
+ * Reference: nova-core BootloaderDmemDescV2, nouveau nv_flcn_bl_dmem_desc_v2 */
+typedef struct {
+    uint32_t reserved[4];          /* 16 bytes reserved */
+    uint32_t signature;            /* 0x42444456 "VDBD" LE */
+    uint32_t ctx_dma;              /* DMA context (0 for bare-metal) */
+    uint32_t code_dma_base;        /* Low 32 bits phys addr of code */
+    uint32_t code_dma_base1;       /* High 32 bits of code addr */
+    uint32_t non_sec_code_off;     /* Non-secure code offset */
+    uint32_t non_sec_code_size;    /* Non-secure code size */
+    uint32_t sec_code_off;         /* Secure code offset (0 for FWSEC) */
+    uint32_t sec_code_size;        /* Secure code size */
+    uint32_t code_entry_point;     /* Code entry point offset */
+    uint32_t data_dma_base;        /* Low 32 bits phys addr of data */
+    uint32_t data_dma_base1;       /* High 32 bits of data addr */
+    uint32_t data_size;            /* Data section size */
+    uint32_t argc;                 /* Argument count */
+    uint32_t argv;                 /* Argument value (FRTS_CMD=0x15) */
+} __attribute__((packed)) bl_dmem_desc_v2_t;
+
+/* GBL state (extracted from BIT Falcon ucode table or FWSEC internal header) */
+typedef struct {
+    uint8_t  *code;               /* GBL code pointer (into FWSEC blob) */
+    uint32_t  code_size;
+    uint8_t  *data;               /* GBL data pointer (optional) */
+    uint32_t  data_size;
+    bool      found;
+} gbl_state_t;
 
 /* Dead register sentinel */
 #define NV_DEAD_REG            0xFFFFFFFF
@@ -582,7 +642,10 @@ vbios_state_t *gpu_get_vbios(void);  /* Get VBIOS state */
 fwsec_state_t *gpu_get_fwsec(void);  /* Get FWSEC state */
 
 /* Phase 10: FWSEC-FRTS execution + WPR2 creation */
-int  gsp_fwsec_frts(void);    /* Load FWSEC, execute FRTS, create WPR2 */
+int  gsp_fwsec_frts(void);    /* GBL-based (v2), falls back to legacy */
+
+/* GBL state accessor */
+gbl_state_t *gpu_get_gbl(void);
 
 /* ── X27: Falcon PIO Load ──────────────────────────────── */
 

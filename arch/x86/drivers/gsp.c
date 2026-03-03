@@ -888,7 +888,7 @@ int gsp_rm_init(void)
 
 #define FWSEC_VRAM_OFFSET_MB  192   /* Place FWSEC at VRAM+192MB (away from gsp.bin at +128MB) */
 
-int gsp_fwsec_frts(void)
+static int gsp_fwsec_frts_legacy(void)
 {
     gpu_probe_t *p = gpu_get_probe();
     fwsec_state_t *fw = gpu_get_fwsec();
@@ -1132,6 +1132,376 @@ int gsp_fwsec_frts(void)
     fb_puts("\n");
 
     return responded ? 0 : -1;
+}
+
+/* ── X28: GBL-based FWSEC-FRTS Execution ─────────────────────── */
+/*
+ * Correct Turing+ boot sequence using Generic Bootloader (GBL):
+ *  1. Parse FWSEC internal header → extract GBL code offsets
+ *  2. Select target Falcon (SEC2 for Turing, GSP for Ampere+)
+ *  3. Allocate FWSEC code+data in system RAM (identity-mapped → DMA-accessible)
+ *  4. falcon_reset() target Falcon
+ *  5. Program FBIF TRANSCFG for system memory DMA access
+ *  6. PIO-load GBL microcode to Falcon IMEM
+ *  7. Build BootloaderDmemDescV2 (physical addrs of FWSEC code/data in RAM)
+ *  8. PIO-load descriptor to Falcon DMEM
+ *  9. Boot Falcon — GBL DMA-loads FWSEC, executes FRTS
+ * 10. Poll mailbox, check WPR2
+ *
+ * Reference: nouveau, nova-core PATCH v10 (GBL + BootloaderDmemDescV2)
+ */
+
+static int gsp_fwsec_frts_v2(void)
+{
+    gpu_probe_t *p = gpu_get_probe();
+    fwsec_state_t *fw = gpu_get_fwsec();
+
+    if (!p || !p->present) {
+        serial_puts("[FWSEC] v2: No GPU detected\n");
+        return -1;
+    }
+    if (!fw || !fw->found || !fw->data || fw->size == 0) {
+        serial_puts("[FWSEC] v2: No FWSEC image available\n");
+        return -1;
+    }
+
+    /* ── Step 1: Parse FWSEC internal header ── */
+    if (fw->size < sizeof(falcon_fw_hdr_t)) {
+        serial_puts("[FWSEC] v2: FWSEC too small for firmware header\n");
+        return -1;
+    }
+
+    falcon_fw_hdr_t *hdr = (falcon_fw_hdr_t *)fw->data;
+
+    serial_puts("[FWSEC] v2: === GBL-based FWSEC-FRTS ===\n");
+    serial_puts("[FWSEC] v2: FW header: bl_code_off=0x");
+    serial_puthex(hdr->bl_code_offset, 8);
+    serial_puts(" bl_code_sz=");
+    serial_putdec(hdr->bl_code_size);
+    serial_puts(" bl_data_off=0x");
+    serial_puthex(hdr->bl_data_offset, 8);
+    serial_puts(" bl_data_sz=");
+    serial_putdec(hdr->bl_data_size);
+    serial_puts("\n");
+
+    serial_puts("[FWSEC] v2: os_code_off=0x");
+    serial_puthex(hdr->os_code_offset, 8);
+    serial_puts(" os_code_sz=");
+    serial_putdec(hdr->os_code_size);
+    serial_puts(" os_data_off=0x");
+    serial_puthex(hdr->os_data_offset, 8);
+    serial_puts(" os_data_sz=");
+    serial_putdec(hdr->os_data_size);
+    serial_puts("\n");
+
+    /* Determine GBL code source: prefer BIT-extracted, fallback to header */
+    gbl_state_t *gbl_st = gpu_get_gbl();
+    uint8_t *bl_code;
+    uint32_t bl_code_size;
+
+    if (gbl_st && gbl_st->found && gbl_st->code_size > 0) {
+        bl_code = gbl_st->code;
+        bl_code_size = gbl_st->code_size;
+        serial_puts("[FWSEC] v2: Using BIT-extracted GBL (");
+        serial_putdec(bl_code_size);
+        serial_puts(" bytes)\n");
+    } else if (hdr->bl_code_size > 0 &&
+               hdr->bl_code_offset + hdr->bl_code_size <= fw->size) {
+        bl_code = fw->data + hdr->bl_code_offset;
+        bl_code_size = hdr->bl_code_size;
+        serial_puts("[FWSEC] v2: Using header-embedded GBL (");
+        serial_putdec(bl_code_size);
+        serial_puts(" bytes)\n");
+    } else {
+        serial_puts("[FWSEC] v2: No GBL code found (bl_code_size=");
+        serial_putdec(hdr->bl_code_size);
+        serial_puts(", bl_code_offset=0x");
+        serial_puthex(hdr->bl_code_offset, 8);
+        serial_puts(")\n");
+        return -1;
+    }
+
+    /* Validate OS code/data sections */
+    uint32_t code_off  = hdr->os_code_offset;
+    uint32_t code_size = hdr->os_code_size;
+    uint32_t data_off  = hdr->os_data_offset;
+    uint32_t data_size = hdr->os_data_size;
+
+    if (code_size == 0 || code_off + code_size > fw->size) {
+        serial_puts("[FWSEC] v2: Invalid OS code section\n");
+        return -1;
+    }
+    if (data_size > 0 && data_off + data_size > fw->size) {
+        serial_puts("[FWSEC] v2: Invalid OS data section\n");
+        return -1;
+    }
+
+    /* ── Step 2: Select target Falcon ── */
+    extern gpu_device_t gpu_dev;
+    gpu_gen_t gen = gpu_dev.generation;
+    uint32_t falcon_base;
+
+    if (fw->target_id == FALCON_TARGET_SEC2 || gen == GPU_GEN_TURING) {
+        falcon_base = NV_PSEC_BASE;
+        serial_puts("[FWSEC] v2: Target = SEC2 Falcon (");
+        serial_puts(gpu_gen_name(gen));
+        serial_puts(")\n");
+        if (!p->sec2_present) {
+            serial_puts("[FWSEC] v2: SEC2 Falcon not present!\n");
+            return -1;
+        }
+    } else {
+        falcon_base = NV_PGSP_BASE;
+        serial_puts("[FWSEC] v2: Target = GSP Falcon (");
+        serial_puts(gpu_gen_name(gen));
+        serial_puts(")\n");
+        if (!p->gsp_present) {
+            serial_puts("[FWSEC] v2: GSP Falcon not present!\n");
+            return -1;
+        }
+    }
+
+    /* ── Step 3: Allocate FWSEC code+data in system RAM ── */
+    uint32_t total_fw_size = code_size + data_size;
+    uint8_t *fw_buf = (uint8_t *)mem_alloc_aligned(total_fw_size, 256);
+    if (!fw_buf) {
+        serial_puts("[FWSEC] v2: Failed to allocate ");
+        serial_putdec(total_fw_size);
+        serial_puts(" bytes for FWSEC\n");
+        return -1;
+    }
+
+    /* Copy code section */
+    memcpy(fw_buf, fw->data + code_off, code_size);
+    /* Copy data section (contiguous after code) */
+    if (data_size > 0)
+        memcpy(fw_buf + code_size, fw->data + data_off, data_size);
+
+    uint64_t code_phys = (uint64_t)(uintptr_t)fw_buf;
+    uint64_t data_phys = (uint64_t)(uintptr_t)(fw_buf + code_size);
+
+    serial_puts("[FWSEC] v2: FWSEC in RAM at 0x");
+    serial_puthex(code_phys, 16);
+    serial_puts(" (code=");
+    serial_putdec(code_size);
+    serial_puts(" + data=");
+    serial_putdec(data_size);
+    serial_puts(")\n");
+
+    /* ── Step 4: Reset target Falcon ── */
+    serial_puts("[FWSEC] v2: Resetting Falcon...\n");
+    if (falcon_reset(falcon_base) < 0) {
+        serial_puts("[FWSEC] v2: Falcon reset failed\n");
+        return -1;
+    }
+
+    /* ── Step 5: Program FBIF TRANSCFG ── */
+    gpu_reg_write(falcon_base + NV_PFALCON_FBIF_TRANSCFG,
+                  FBIF_TRANSCFG_TARGET_COHERENT_SYSMEM);
+    wmb();
+    serial_puts("[FWSEC] v2: FBIF TRANSCFG = 0x02 (coherent sysmem)\n");
+
+    /* ── Step 6: PIO-load GBL to IMEM ── */
+    serial_puts("[FWSEC] v2: PIO loading GBL to IMEM (");
+    serial_putdec(bl_code_size);
+    serial_puts(" bytes)...\n");
+
+    falcon_pio_load_imem(falcon_base, 0, (const uint32_t *)bl_code, bl_code_size);
+
+    /* Verify first 2 dwords */
+    uint32_t imem_verify[2] = {0};
+    falcon_pio_read_imem(falcon_base, 0, imem_verify, 8);
+    uint32_t *bl_src = (uint32_t *)bl_code;
+    if (imem_verify[0] == bl_src[0] && imem_verify[1] == bl_src[1]) {
+        serial_puts("[FWSEC] v2: IMEM verify OK (");
+        serial_puthex(imem_verify[0], 8);
+        serial_puts(" ");
+        serial_puthex(imem_verify[1], 8);
+        serial_puts(")\n");
+    } else {
+        serial_puts("[FWSEC] v2: IMEM verify MISMATCH (expected ");
+        serial_puthex(bl_src[0], 8);
+        serial_puts("/");
+        serial_puthex(bl_src[1], 8);
+        serial_puts(", got ");
+        serial_puthex(imem_verify[0], 8);
+        serial_puts("/");
+        serial_puthex(imem_verify[1], 8);
+        serial_puts(")\n");
+        return -1;
+    }
+
+    /* ── Step 7: Build BootloaderDmemDescV2 ── */
+    bl_dmem_desc_v2_t desc;
+    memset(&desc, 0, sizeof(desc));
+
+    desc.signature       = 0x42444456;   /* "VDBD" LE */
+    desc.ctx_dma         = 0;            /* Bare-metal: no DMA context */
+    desc.code_dma_base   = (uint32_t)(code_phys & 0xFFFFFFFF);
+    desc.code_dma_base1  = (uint32_t)(code_phys >> 32);
+    desc.non_sec_code_off  = 0;
+    desc.non_sec_code_size = code_size;
+    desc.sec_code_off    = 0;
+    desc.sec_code_size   = code_size;
+    desc.code_entry_point = 0;
+    desc.data_dma_base   = (uint32_t)(data_phys & 0xFFFFFFFF);
+    desc.data_dma_base1  = (uint32_t)(data_phys >> 32);
+    desc.data_size       = data_size;
+    desc.argc            = 1;
+    desc.argv            = FWSEC_FRTS_CMD;
+
+    serial_puts("[FWSEC] v2: DMEM desc: code=0x");
+    serial_puthex(code_phys, 16);
+    serial_puts(" data=0x");
+    serial_puthex(data_phys, 16);
+    serial_puts(" argv=0x");
+    serial_puthex(FWSEC_FRTS_CMD, 2);
+    serial_puts("\n");
+
+    /* ── Step 8: PIO-load descriptor to DMEM ── */
+    serial_puts("[FWSEC] v2: PIO loading DMEM descriptor (");
+    serial_putdec(sizeof(desc));
+    serial_puts(" bytes)...\n");
+
+    falcon_pio_load_dmem(falcon_base, 0, (const uint32_t *)&desc, sizeof(desc));
+
+    /* ── Step 9: Boot Falcon ── */
+    gpu_reg_write(falcon_base + NV_FALCON_MAILBOX0, 0);
+    wmb();
+
+    serial_puts("[FWSEC] v2: Booting Falcon (GBL → FWSEC → FRTS)...\n");
+    falcon_boot(falcon_base, 0);
+
+    /* ── Step 10: Poll mailbox (2s timeout) ── */
+    uint64_t t0 = rdtsc();
+    uint64_t timeout_cycles = 6000000000ULL;  /* ~2s @ 3GHz */
+    uint32_t mbox0;
+    bool responded = false;
+
+    /* Wait for mailbox to become non-zero (GBL/FWSEC sets it on completion)
+     * or for Falcon to halt (indicates completion or error) */
+    while (1) {
+        rmb();
+        mbox0 = gpu_reg_read(falcon_base + NV_FALCON_MAILBOX0);
+
+        if (mbox0 != 0) {
+            responded = true;
+            break;
+        }
+
+        /* Also check if Falcon halted (FWSEC done or error) */
+        uint32_t cpuctl = gpu_reg_read(falcon_base + NV_FALCON_CPUCTL);
+        if (cpuctl & NV_FALCON_CPUCTL_HALTED) {
+            responded = true;
+            break;
+        }
+
+        uint64_t elapsed = rdtsc() - t0;
+        if (elapsed >= timeout_cycles)
+            break;
+    }
+
+    uint64_t t1 = rdtsc();
+    uint64_t elapsed_ms = (t1 - t0) / 3000000;
+
+    uint32_t final_cpuctl = gpu_reg_read(falcon_base + NV_FALCON_CPUCTL);
+    uint32_t mbox1 = gpu_reg_read(falcon_base + NV_FALCON_MAILBOX1);
+
+    serial_puts("[FWSEC] v2: ");
+    serial_puts(responded ? "Responded" : "TIMEOUT");
+    serial_puts(" after ~");
+    serial_putdec(elapsed_ms);
+    serial_puts(" ms\n");
+    serial_puts("[FWSEC] v2: CPUCTL=0x");
+    serial_puthex(final_cpuctl, 8);
+    serial_puts(" MAILBOX0=0x");
+    serial_puthex(mbox0, 8);
+    serial_puts(" MAILBOX1=0x");
+    serial_puthex(mbox1, 8);
+    serial_puts("\n");
+
+    /* mailbox0 == 0 after execution typically indicates success */
+    bool exec_ok = responded && (mbox0 == 0);
+    if (exec_ok) {
+        serial_puts("[FWSEC] v2: FWSEC execution appears successful (mailbox0=0)\n");
+    } else if (responded) {
+        serial_puts("[FWSEC] v2: FWSEC returned non-zero mailbox (error or status)\n");
+    }
+
+    /* ── Step 11: Check for WPR2 metadata ── */
+    serial_puts("[FWSEC] v2: Checking WPR2...\n");
+    uint64_t vram_bytes = (uint64_t)p->vram_size_mb * 1024 * 1024;
+    uint32_t orig_window = gpu_reg_read(NV_PBUS_BAR0_WINDOW);
+
+    uint64_t wpr2_check_offsets[] = {
+        vram_bytes - 4096,
+        vram_bytes - (1024 * 1024),
+        vram_bytes - (2 * 1024 * 1024),
+    };
+
+    bool wpr2_found = false;
+    for (int i = 0; i < 3 && !wpr2_found; i++) {
+        uint64_t check_off = wpr2_check_offsets[i];
+        if (check_off >= vram_bytes)
+            continue;
+
+        gpu_reg_write(NV_PBUS_BAR0_WINDOW, (uint32_t)(check_off >> 16));
+        wmb();
+        rmb();
+
+        uint32_t pramin_off = (uint32_t)(check_off & (NV_PRAMIN_SIZE - 1));
+        uint32_t magic = gpu_reg_read(NV_PRAMIN_BASE + pramin_off);
+
+        if (magic == WPR2_MAGIC) {
+            serial_puts("[FWSEC] v2: WPR2 found at VRAM+0x");
+            serial_puthex(check_off, 16);
+            serial_puts("!\n");
+
+            uint32_t rev = gpu_reg_read(NV_PRAMIN_BASE + pramin_off + 4);
+            serial_puts("[FWSEC] v2: WPR2 revision: ");
+            serial_putdec(rev);
+            serial_puts("\n");
+
+            wpr2_found = true;
+        }
+    }
+
+    if (!wpr2_found)
+        serial_puts("[FWSEC] v2: WPR2 not found (may require full SEC2 bootstrap)\n");
+
+    /* ── Step 12: Restore and halt ── */
+    gpu_reg_write(NV_PBUS_BAR0_WINDOW, orig_window);
+    wmb();
+
+    gpu_reg_write(falcon_base + NV_FALCON_CPUCTL, NV_FALCON_CPUCTL_HALTED);
+    wmb();
+
+    serial_puts("[FWSEC] v2: === GBL FWSEC-FRTS ");
+    serial_puts(responded ? "completed" : "timed out");
+    serial_puts(wpr2_found ? " — WPR2 active" : " — no WPR2");
+    serial_puts(" ===\n");
+
+    fb_puts(" FWSEC-v2: ");
+    fb_puts(responded ? "GBL done" : "GBL timeout");
+    fb_puts(wpr2_found ? ", WPR2 OK" : ", no WPR2");
+    fb_puts("\n");
+
+    return responded ? 0 : -1;
+}
+
+/* ── Public FWSEC-FRTS: try GBL v2 first, fallback to legacy ── */
+
+int gsp_fwsec_frts(void)
+{
+    serial_puts("[FWSEC] Attempting GBL-based execution (v2)...\n");
+    int ret = gsp_fwsec_frts_v2();
+
+    if (ret < 0) {
+        serial_puts("[FWSEC] v2 failed, falling back to legacy...\n");
+        ret = gsp_fwsec_frts_legacy();
+    }
+
+    return ret;
 }
 
 /* ── Public API: Load firmware ───────────────────────────────── */
