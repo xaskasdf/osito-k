@@ -1,6 +1,6 @@
 # OsitoK x86-64 — GPU Compute Roadmap
 
-> Status: X1–X31 + X-CPU1 done. Phase A complete. X32 next.
+> Status: X1–X32 + X-CPU1 done. Phase A complete. Phase B started (X32 done, X33 next).
 > Last updated: 2026-03-03
 
 ## Current State
@@ -14,7 +14,10 @@ X28 implemented the correct GBL-based FWSEC-FRTS boot sequence:
 
 **Phase A complete.** X27-X31 implement the full GSP secure boot chain infrastructure.
 Hardware testing will determine which steps succeed on specific GPU generations.
-**Next**: Phase B — GPU compute pipeline (X32: GMMU page tables).
+
+X32 corrected all RPC function IDs (verified against `rpc_global_enums.h` 535.113.01)
+and added generic RM alloc/control + subdevice + VASPACE allocation.
+**Next**: X33 — Channel + GPFIFO ring buffer.
 
 ---
 
@@ -89,7 +92,7 @@ Requires Phase A complete (functional GSP-RM). Sets up GPU compute dispatch.
 
 | Feature | Description | Est. Lines | Risk |
 |---------|-------------|-----------|------|
-| **X32** | **GMMU 4-level page tables** — GPU virtual memory (PDE3→PDE2→PDE1→PTE) | ~400 | Medium |
+| **X32** | **RPC ID fix + generic RM alloc/control** — corrected IDs, RM_ALLOC/RM_CONTROL wrappers, subdevice + VASPACE | ~200 | Done |
 | **X33** | **Channel + GPFIFO** — allocate channel via RM, setup GPFIFO ring buffer | ~350 | Medium |
 | **X34** | **Compute class bind + kernel dispatch** — bind compute class, push methods | ~500 | Medium |
 | **X35** | **Copy Engine DMA** — host-to-device and device-to-host transfers | ~250 | Low |
@@ -219,9 +222,9 @@ Priority  Feature    Rationale
 1st       X-CPU1     AVX2 tensorops — DONE
 2nd       X27        Falcon PIO load — DONE
 3rd       X28        GBL + FWSEC-FRTS — DONE (needs hardware validation)
-4th       X29        WPR2 metadata + Radix3 page tables  ← NEXT
-          X37        SASS compile — can parallelize with X29
-5th       X30 → X31 → X32 → X36 → X38 → X40
+4th       X29        WPR2 metadata + Radix3 page tables — DONE
+          X37        SASS compile — can parallelize
+5th       X30 → X31 → X32 (all DONE) → X33 → X36 → X38 → X40
 ```
 
 ## Dependencies

@@ -726,7 +726,7 @@ static void str_copy(char *dst, const char *src, uint32_t max)
     dst[i] = '\0';
 }
 
-/* Step 1: SET_SYSTEM_INFO (func 70) — fire-and-forget */
+/* Step 1: SET_SYSTEM_INFO (func 72) — fire-and-forget */
 static void gsp_rm_send_system_info(void)
 {
     gsp_system_info_t info;
@@ -756,7 +756,7 @@ static void gsp_rm_send_system_info(void)
     gsp_queue_send(GSP_RPC_GSP_SET_SYSTEM_INFO, &info, sizeof(info));
 }
 
-/* Step 2: SET_REGISTRY (func 69) — fire-and-forget */
+/* Step 2: SET_REGISTRY (func 73) — fire-and-forget */
 static void gsp_rm_send_registry(void)
 {
     gsp_registry_table_t reg;
@@ -825,7 +825,7 @@ static void gsp_rm_alloc_device(void)
     }
 }
 
-/* Step 5: INIT_POST_OBJGPU (func 71) — no payload, poll response */
+/* Step 5: INIT_POST_OBJGPU (func 74) — no payload, poll response */
 static void gsp_rm_init_post_objgpu(void)
 {
     gsp_queue_send(GSP_RPC_GSP_INIT_POST_OBJGPU, NULL, 0);
@@ -842,6 +842,125 @@ static void gsp_rm_init_post_objgpu(void)
     }
 }
 
+/* ── X32: Generic RM Alloc + Control ─────────────────────────── */
+
+/* Generic RM_ALLOC (func 103). Builds rpc_rm_alloc_hdr_t + inline params.
+ * Returns 0 on success response, -1 on timeout/error. */
+int gsp_rm_alloc(uint32_t hParent, uint32_t hObject, uint32_t hClass,
+                 const void *params, uint32_t params_size)
+{
+    /* Build message: 32-byte header + params_size inline */
+    uint8_t buf[512];  /* Max: 32 + params (largest is ~48B VASPACE) */
+    uint32_t total = sizeof(rpc_rm_alloc_hdr_t) + params_size;
+    if (total > sizeof(buf)) return -1;
+
+    memset(buf, 0, total);
+    rpc_rm_alloc_hdr_t *hdr = (rpc_rm_alloc_hdr_t *)buf;
+    hdr->hClient   = GSP_RM_CLIENT_HANDLE;
+    hdr->hParent   = hParent;
+    hdr->hObject   = hObject;
+    hdr->hClass    = hClass;
+    hdr->status    = 0;
+    hdr->paramsSize = params_size;
+    hdr->flags     = 0;
+
+    if (params && params_size > 0)
+        memcpy(buf + sizeof(rpc_rm_alloc_hdr_t), params, params_size);
+
+    serial_puts("[GSP-RM] RM_ALLOC: class=0x");
+    serial_puthex(hClass, 4);
+    serial_puts(" parent=0x");
+    serial_puthex(hParent, 8);
+    serial_puts(" obj=0x");
+    serial_puthex(hObject, 8);
+    serial_puts(" params=");
+    serial_putdec(params_size);
+    serial_puts("B\n");
+
+    gsp_queue_send(GSP_RPC_GSP_RM_ALLOC, buf, total);
+
+    uint32_t func, result;
+    if (gsp_rpc_poll(&func, &result, NULL, 0, 2000) == 0) {
+        serial_puts("[GSP-RM] RM_ALLOC response: func=0x");
+        serial_puthex(func, 8);
+        serial_puts(" result=0x");
+        serial_puthex(result, 8);
+        serial_puts("\n");
+        return (result == GSP_RPC_RESULT_OK) ? 0 : -1;
+    }
+
+    serial_puts("[GSP-RM] RM_ALLOC timeout (expected without full boot chain)\n");
+    return -1;
+}
+
+/* Generic RM_CONTROL (func 76). Builds rpc_rm_ctrl_hdr_t + inline params.
+ * Returns 0 on success response, -1 on timeout/error. */
+int gsp_rm_control(uint32_t hObject, uint32_t cmd,
+                   const void *params, uint32_t params_size)
+{
+    uint8_t buf[512];
+    uint32_t total = sizeof(rpc_rm_ctrl_hdr_t) + params_size;
+    if (total > sizeof(buf)) return -1;
+
+    memset(buf, 0, total);
+    rpc_rm_ctrl_hdr_t *hdr = (rpc_rm_ctrl_hdr_t *)buf;
+    hdr->hClient   = GSP_RM_CLIENT_HANDLE;
+    hdr->hObject   = hObject;
+    hdr->cmd       = cmd;
+    hdr->status    = 0;
+    hdr->paramsSize = params_size;
+    hdr->flags     = 0;
+
+    if (params && params_size > 0)
+        memcpy(buf + sizeof(rpc_rm_ctrl_hdr_t), params, params_size);
+
+    serial_puts("[GSP-RM] RM_CONTROL: obj=0x");
+    serial_puthex(hObject, 8);
+    serial_puts(" cmd=0x");
+    serial_puthex(cmd, 8);
+    serial_puts(" params=");
+    serial_putdec(params_size);
+    serial_puts("B\n");
+
+    gsp_queue_send(GSP_RPC_GSP_RM_CONTROL, buf, total);
+
+    uint32_t func, result;
+    if (gsp_rpc_poll(&func, &result, NULL, 0, 2000) == 0) {
+        serial_puts("[GSP-RM] RM_CONTROL response: func=0x");
+        serial_puthex(func, 8);
+        serial_puts(" result=0x");
+        serial_puthex(result, 8);
+        serial_puts("\n");
+        return (result == GSP_RPC_RESULT_OK) ? 0 : -1;
+    }
+
+    serial_puts("[GSP-RM] RM_CONTROL timeout (expected without full boot chain)\n");
+    return -1;
+}
+
+/* Step 6: ALLOC_SUBDEVICE (class 0x2080) via generic RM_ALLOC */
+static void gsp_rm_alloc_subdevice(void)
+{
+    nv2080_alloc_params_t params;
+    memset(&params, 0, sizeof(params));
+    params.subDeviceId = 0;
+
+    gsp_rm_alloc(GSP_RM_DEVICE_HANDLE, GSP_RM_SUBDEVICE_HANDLE,
+                 NV20_SUBDEVICE_0, &params, sizeof(params));
+}
+
+/* Step 7: ALLOC_VASPACE (class 0x90F1) via generic RM_ALLOC */
+static void gsp_rm_alloc_vaspace(void)
+{
+    nv_vaspace_alloc_params_t params;
+    memset(&params, 0, sizeof(params));
+    params.index = NV_VASPACE_ALLOCATION_INDEX_GPU_NEW;
+    params.flags = NV_VASPACE_ALLOCATION_FLAGS_IS_EXTERNALLY_OWNED;
+
+    gsp_rm_alloc(GSP_RM_DEVICE_HANDLE, GSP_RM_VASPACE_HANDLE,
+                 FERMI_VASPACE_A, &params, sizeof(params));
+}
+
 int gsp_rm_init(void)
 {
     if (!gsp.queues_ready) {
@@ -851,24 +970,30 @@ int gsp_rm_init(void)
 
     serial_puts("[GSP-RM] === GSP-RM Init Sequence ===\n");
 
-    serial_puts("[GSP-RM] Step 1/5: SET_SYSTEM_INFO\n");
+    serial_puts("[GSP-RM] Step 1/7: SET_SYSTEM_INFO\n");
     gsp_rm_send_system_info();
 
-    serial_puts("[GSP-RM] Step 2/5: SET_REGISTRY\n");
+    serial_puts("[GSP-RM] Step 2/7: SET_REGISTRY\n");
     gsp_rm_send_registry();
 
-    serial_puts("[GSP-RM] Step 3/5: ALLOC_ROOT\n");
+    serial_puts("[GSP-RM] Step 3/7: ALLOC_ROOT\n");
     gsp_rm_alloc_root();
 
-    serial_puts("[GSP-RM] Step 4/5: ALLOC_DEVICE\n");
+    serial_puts("[GSP-RM] Step 4/7: ALLOC_DEVICE\n");
     gsp_rm_alloc_device();
 
-    serial_puts("[GSP-RM] Step 5/5: INIT_POST_OBJGPU\n");
+    serial_puts("[GSP-RM] Step 5/7: INIT_POST_OBJGPU\n");
     gsp_rm_init_post_objgpu();
+
+    serial_puts("[GSP-RM] Step 6/7: ALLOC_SUBDEVICE\n");
+    gsp_rm_alloc_subdevice();
+
+    serial_puts("[GSP-RM] Step 7/7: ALLOC_VASPACE\n");
+    gsp_rm_alloc_vaspace();
 
     gsp.rm_init_done = true;
 
-    serial_puts("[GSP-RM] === Init sequence complete ===\n");
+    serial_puts("[GSP-RM] === Init sequence complete (7 steps) ===\n");
 
     fb_puts(" GSP-RM: init sequence done\n");
 

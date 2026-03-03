@@ -190,7 +190,7 @@ typedef struct {
     uint64_t statQueueOffset;      /* GSP queue offset = 0x41000 */
 } gsp_msgq_init_args_t;           /* 32 bytes */
 
-/* ── GSP-RM RPC Function IDs (rpc_global_enums.h) ──────────── */
+/* ── GSP-RM RPC Function IDs (rpc_global_enums.h, verified 535.113.01) ── */
 
 #define GSP_RPC_NOP                       0
 #define GSP_RPC_SET_GUEST_SYSTEM_INFO     1
@@ -198,18 +198,18 @@ typedef struct {
 #define GSP_RPC_ALLOC_DEVICE              3
 #define GSP_RPC_ALLOC_MEMORY              4
 #define GSP_RPC_FREE                      10
-#define GSP_RPC_GET_GSP_STATIC_INFO       68
-#define GSP_RPC_SET_REGISTRY              69
-#define GSP_RPC_GSP_SET_SYSTEM_INFO       70
-#define GSP_RPC_GSP_INIT_POST_OBJGPU      71
+#define GSP_RPC_GET_GSP_STATIC_INFO       65   /* was 68 — WRONG (68=RMFS_CLEANUP) */
+#define GSP_RPC_CONTINUATION_RECORD       71   /* was 0x43 — WRONG */
+#define GSP_RPC_GSP_SET_SYSTEM_INFO       72   /* was 70 — WRONG (70=UPDATE_BAR_PDE) */
+#define GSP_RPC_SET_REGISTRY              73   /* was 69 — WRONG (69=RMFS_TEST) */
+#define GSP_RPC_GSP_INIT_POST_OBJGPU      74   /* was 71 — WRONG (71=CONTINUATION_RECORD) */
 #define GSP_RPC_GSP_RM_CONTROL            76
-#define GSP_RPC_GSP_RM_ALLOC              77
-#define GSP_RPC_CONTINUATION_RECORD       0x43
+#define GSP_RPC_GSP_RM_ALLOC             103   /* was 77 — WRONG (77=GET_STATIC_INFO2) */
 
-/* GSP-RM Event IDs (async GSP→host) */
-#define GSP_EVENT_GSP_INIT_DONE           0x80
-#define GSP_EVENT_RUN_CPU_SEQUENCER       0x81
-#define GSP_EVENT_POST_EVENT              0x82
+/* GSP-RM Event IDs (async GSP→host, start at 0x1000) */
+#define GSP_EVENT_GSP_INIT_DONE           0x1001  /* was 0x80 — WRONG */
+#define GSP_EVENT_RUN_CPU_SEQUENCER       0x1002  /* was 0x81 — WRONG */
+#define GSP_EVENT_POST_EVENT              0x1003  /* was 0x82 — WRONG */
 
 /* RPC result sentinels */
 #define GSP_RPC_RESULT_PENDING            0xFFFFFFFF
@@ -220,10 +220,69 @@ typedef struct {
 #define GSP_RM_CLIENT_HANDLE     0xC1D00000
 #define GSP_RM_DEVICE_HANDLE     0xDE1D0000
 #define GSP_RM_SUBDEVICE_HANDLE  0x5D1D0000
+#define GSP_RM_VASPACE_HANDLE    0x90F10000
+
+/* ── RM Class IDs (NVIDIA RM Object Classes) ──────────────── */
+
+#define NV01_ROOT               0x0000
+#define NV01_DEVICE_0           0x0080
+#define NV20_SUBDEVICE_0        0x2080
+#define FERMI_VASPACE_A         0x90F1
+#define KEPLER_CHANNEL_GROUP_A  0xA06C
+#define TURING_CHANNEL_GPFIFO_A 0xC46F
+#define AMPERE_CHANNEL_GPFIFO_A 0xC56F
+
+/* ── X32: Generic RM Alloc/Control Structures ─────────────── */
+
+/* rpc_gsp_rm_alloc (func 103) — 32-byte header + variable params.
+ * Reference: g_rpc-structures.h rpc_gsp_rm_alloc_v03_00 */
+typedef struct {
+    uint32_t hClient;       /* Client handle (e.g. 0xC1D00000) */
+    uint32_t hParent;       /* Parent object handle */
+    uint32_t hObject;       /* New object handle to create */
+    uint32_t hClass;        /* RM class ID (0x2080, 0x90F1, etc.) */
+    uint32_t status;        /* [OUT] result status */
+    uint32_t paramsSize;    /* Size of params[] in bytes */
+    uint32_t flags;         /* Allocation flags (0 normally) */
+    uint8_t  reserved[4];   /* Padding */
+    /* uint8_t params[]; — variable-length, appended inline */
+} __attribute__((packed)) rpc_rm_alloc_hdr_t;  /* 32 bytes */
+
+/* rpc_gsp_rm_control (func 76) — 24-byte header + variable params.
+ * Reference: g_rpc-structures.h rpc_gsp_rm_control_v03_00 (535.113.01) */
+typedef struct {
+    uint32_t hClient;       /* Client handle */
+    uint32_t hObject;       /* Target object handle */
+    uint32_t cmd;           /* Control command (NV*_CTRL_CMD_*) */
+    uint32_t status;        /* [OUT] result status */
+    uint32_t paramsSize;    /* Size of params[] in bytes */
+    uint32_t flags;         /* RPC flags (0 normally) */
+    /* uint8_t params[]; — variable-length, appended inline */
+} __attribute__((packed)) rpc_rm_ctrl_hdr_t;   /* 24 bytes */
+
+/* NV2080_ALLOC_PARAMETERS (NV20_SUBDEVICE_0) */
+typedef struct {
+    uint32_t subDeviceId;   /* Subdevice instance (0 for single GPU) */
+} nv2080_alloc_params_t;    /* 4 bytes */
+
+/* NV_VASPACE_ALLOCATION_PARAMETERS (FERMI_VASPACE_A) */
+typedef struct {
+    uint32_t index;              /* GPU index (0 = NV_VASPACE_ALLOCATION_INDEX_GPU_NEW) */
+    uint32_t flags;              /* NV_VASPACE_ALLOCATION_FLAGS_* */
+    uint64_t vaSize;             /* VA space total size */
+    uint64_t vaStartInternal;    /* Internal VA start */
+    uint64_t vaLimitInternal;    /* Internal VA limit */
+    uint32_t bigPageSize;        /* Big page size (0 = default) */
+    uint8_t  pad[4];
+    uint64_t vaBase;             /* VA base address */
+} nv_vaspace_alloc_params_t;    /* 48 bytes */
+
+#define NV_VASPACE_ALLOCATION_INDEX_GPU_NEW             0x00
+#define NV_VASPACE_ALLOCATION_FLAGS_IS_EXTERNALLY_OWNED (1 << 3)
 
 /* ── GSP-RM Payload Structures (Phase 8) ──────────────────── */
 
-/* SET_SYSTEM_INFO payload (func 70, 88 bytes) */
+/* SET_SYSTEM_INFO payload (func 72, 88 bytes) */
 typedef struct {
     uint64_t gpuPhysAddr;           /* BAR0 */
     uint64_t gpuPhysFbAddr;         /* BAR1 */
@@ -241,7 +300,7 @@ typedef struct {
     uint32_t pad0;
 } gsp_system_info_t;               /* 88 bytes */
 
-/* Registry entry (for SET_REGISTRY, func 69) */
+/* Registry entry (for SET_REGISTRY, func 73) */
 typedef struct {
     char     name[64];
     uint32_t type;      /* 1=DWORD */
@@ -646,7 +705,13 @@ int  gsp_rpc_poll(uint32_t *function, uint32_t *result,
 int  gsp_rpc_init(void);       /* Post-boot RPC init sequence */
 
 /* Phase 8: RM init commands */
-int  gsp_rm_init(void);        /* 5-step RM init sequence */
+int  gsp_rm_init(void);        /* 7-step RM init sequence */
+
+/* X32: Generic RM alloc/control */
+int  gsp_rm_alloc(uint32_t hParent, uint32_t hObject, uint32_t hClass,
+                  const void *params, uint32_t params_size);
+int  gsp_rm_control(uint32_t hObject, uint32_t cmd,
+                    const void *params, uint32_t params_size);
 
 /* Phase 9: VBIOS read + BIT parse + FWSEC extraction */
 int  gpu_read_vbios(void);           /* Read VBIOS from VRAM via PRAMIN */
