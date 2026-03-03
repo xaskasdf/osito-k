@@ -302,6 +302,9 @@ static void pci_add_device(uint8_t bus, uint8_t dev, uint8_t func,
         gpu_dev.backend = GPU_BACKEND_NVIDIA_GSP;
         gpu_dev.bar0_base = d->bar[0];
         gpu_dev.bar1_base = d->bar[1];
+        gpu_dev.pci_bus  = bus;
+        gpu_dev.pci_dev  = dev;
+        gpu_dev.pci_func = func;
         gpu_dev.bar0_size = pci_read_bar_size(bus, dev, func, 0);
         gpu_dev.bar1_size = pci_read_bar_size(bus, dev, func, 1);
 

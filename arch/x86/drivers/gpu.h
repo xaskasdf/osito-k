@@ -8,7 +8,8 @@
  * Phase 4: GSP Falcon deep probe, firmware load to RAM, upload to VRAM.
  * Phase 5: GSP boot (ELF parse, BOOTVEC, CPUCTL start, mailbox handshake).
  * Phase 6: GSP shared memory message queues (host↔GSP bidirectional).
- * Phase 7+: RPC protocol, GPU init via GSP-RM.
+ * Phase 7: RPC protocol (function IDs, poll with timeout, init sequence).
+ * Phase 8: RM init commands (SET_SYSTEM_INFO, ALLOC_ROOT, etc.).
  */
 
 #ifndef OSITOK_GPU_H
@@ -209,6 +210,65 @@ typedef struct {
 #define GSP_RPC_RESULT_PENDING            0xFFFFFFFF
 #define GSP_RPC_RESULT_OK                 0x00000000
 
+/* ── GSP-RM Handle Constants ───────────────────────────────── */
+
+#define GSP_RM_CLIENT_HANDLE     0xC1D00000
+#define GSP_RM_DEVICE_HANDLE     0xDE1D0000
+#define GSP_RM_SUBDEVICE_HANDLE  0x5D1D0000
+
+/* ── GSP-RM Payload Structures (Phase 8) ──────────────────── */
+
+/* SET_SYSTEM_INFO payload (func 70, 88 bytes) */
+typedef struct {
+    uint64_t gpuPhysAddr;           /* BAR0 */
+    uint64_t gpuPhysFbAddr;         /* BAR1 */
+    uint64_t gpuPhysInstAddr;       /* 0 */
+    uint64_t nvDomainBusDeviceFunc; /* PCI BDF encoded */
+    uint64_t simAccessBufPhysAddr;  /* 0 */
+    uint64_t pcieAtomicsOpMask;     /* 0 */
+    uint64_t consoleMemSize;        /* 0 */
+    uint64_t maxUserVa;             /* (1ULL << 47) - 4096 */
+    uint32_t pciConfigMirrorBase;   /* 0x088000 */
+    uint32_t pciConfigMirrorSize;   /* 0x001000 */
+    uint32_t PCIDeviceID;           /* (device_id << 16) | vendor_id */
+    uint32_t PCISubDeviceID;        /* 0 */
+    uint32_t PCIRevisionID;         /* 0 */
+    uint32_t pad0;
+} gsp_system_info_t;               /* 88 bytes */
+
+/* Registry entry (for SET_REGISTRY, func 69) */
+typedef struct {
+    char     name[64];
+    uint32_t type;      /* 1=DWORD */
+    uint32_t len;       /* 4 */
+    uint32_t value;
+    uint32_t pad;
+} gsp_registry_entry_t;            /* 76 bytes */
+
+typedef struct {
+    uint32_t numEntries;
+    uint32_t pad;
+    gsp_registry_entry_t entries[2];
+} gsp_registry_table_t;            /* 160 bytes */
+
+/* ALLOC_ROOT payload (func 2) */
+typedef struct {
+    uint32_t hClient;   /* 0xC1D00000 */
+    uint32_t hClass;    /* 0x0000 NV01_ROOT */
+    uint32_t processID; /* 0 */
+    uint32_t pad;
+} gsp_alloc_root_t;                /* 16 bytes */
+
+/* ALLOC_DEVICE payload (func 3) */
+typedef struct {
+    uint32_t hClient;         /* parent */
+    uint32_t hDevice;         /* 0xDE1D0000 */
+    uint32_t hClass;          /* 0x0080 NV01_DEVICE */
+    uint32_t pad;
+    uint32_t deviceInstance;  /* 0 */
+    uint32_t pad2;
+} gsp_alloc_device_t;              /* 24 bytes */
+
 /* GET_GSP_STATIC_INFO response (partial — only GPU name parsed) */
 typedef struct {
     char     gpu_name[40];     /* Null-terminated GPU name string */
@@ -247,6 +307,12 @@ typedef struct {
     uint64_t     bar0_size;
     uint64_t     bar1_base;     /* VRAM aperture */
     uint64_t     bar1_size;
+
+    /* PCI Bus/Device/Function */
+    uint8_t      pci_bus;
+    uint8_t      pci_dev;
+    uint8_t      pci_func;
+    uint8_t      pci_pad;
 
     /* Mapped virtual addresses (after memory manager init) */
     volatile void *bar0_mapped;
@@ -331,6 +397,8 @@ typedef struct {
     /* RPC Protocol (Phase 7) */
     char        gpu_name[40];     /* From GET_GSP_STATIC_INFO */
     bool        rpc_ready;        /* INIT_DONE received */
+    /* RM Init (Phase 8) */
+    bool        rm_init_done;     /* RM init sequence completed */
 } gsp_state_t;
 
 /* ── API ────────────────────────────────────────────────────── */
@@ -363,5 +431,8 @@ int  gsp_queue_recv(void *buf, uint32_t buf_size,
 int  gsp_rpc_poll(uint32_t *function, uint32_t *result,
                   void *buf, uint32_t buf_size, uint32_t timeout_ms);
 int  gsp_rpc_init(void);       /* Post-boot RPC init sequence */
+
+/* Phase 8: RM init commands */
+int  gsp_rm_init(void);        /* 5-step RM init sequence */
 
 #endif /* OSITOK_GPU_H */

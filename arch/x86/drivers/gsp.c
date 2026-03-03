@@ -5,6 +5,7 @@
  * Phase 5: ELF64 parse, boot sequence (BOOTVEC, CPUCTL start), mailbox handshake.
  * Phase 6: Shared memory message queues (host↔GSP bidirectional).
  * Phase 7: RPC protocol (function IDs, poll with timeout, init sequence).
+ * Phase 8: RM init commands (SET_SYSTEM_INFO, ALLOC_ROOT, etc.).
  *
  * Reference: envytools (https://envytools.rtfd.io), nouveau driver,
  *            NVIDIA open-gpu-kernel-modules (rpc_global_enums.h).
@@ -700,6 +701,174 @@ int gsp_rpc_init(void)
     return gsp.rpc_ready ? 0 : -1;
 }
 
+/* ── Phase 8: GSP-RM Init Commands ───────────────────────────── */
+
+extern gpu_device_t gpu_dev;  /* from pci.c */
+
+static uint64_t pci_encode_bdf(uint8_t bus, uint8_t dev, uint8_t func)
+{
+    return ((uint64_t)bus << 8) | ((uint64_t)dev << 3) | func;
+}
+
+static void str_copy(char *dst, const char *src, uint32_t max)
+{
+    uint32_t i = 0;
+    while (i < max - 1 && src[i]) {
+        dst[i] = src[i];
+        i++;
+    }
+    dst[i] = '\0';
+}
+
+/* Step 1: SET_SYSTEM_INFO (func 70) — fire-and-forget */
+static void gsp_rm_send_system_info(void)
+{
+    gsp_system_info_t info;
+    memset(&info, 0, sizeof(info));
+
+    info.gpuPhysAddr           = gpu_dev.bar0_base;
+    info.gpuPhysFbAddr         = gpu_dev.bar1_base;
+    info.nvDomainBusDeviceFunc = pci_encode_bdf(gpu_dev.pci_bus,
+                                                gpu_dev.pci_dev,
+                                                gpu_dev.pci_func);
+    info.maxUserVa             = (1ULL << 47) - 4096;
+    info.pciConfigMirrorBase   = 0x088000;
+    info.pciConfigMirrorSize   = 0x001000;
+    info.PCIDeviceID           = ((uint32_t)gpu_dev.device_id << 16) |
+                                 gpu_dev.vendor_id;
+
+    serial_puts("[GSP-RM] SET_SYSTEM_INFO: BAR0=0x");
+    serial_puthex(info.gpuPhysAddr, 16);
+    serial_puts(" BAR1=0x");
+    serial_puthex(info.gpuPhysFbAddr, 16);
+    serial_puts(" BDF=0x");
+    serial_puthex(info.nvDomainBusDeviceFunc, 4);
+    serial_puts(" PCI=0x");
+    serial_puthex(info.PCIDeviceID, 8);
+    serial_puts("\n");
+
+    gsp_queue_send(GSP_RPC_GSP_SET_SYSTEM_INFO, &info, sizeof(info));
+}
+
+/* Step 2: SET_REGISTRY (func 69) — fire-and-forget */
+static void gsp_rm_send_registry(void)
+{
+    gsp_registry_table_t reg;
+    memset(&reg, 0, sizeof(reg));
+
+    reg.numEntries = 2;
+
+    str_copy(reg.entries[0].name, "RMSecBusResetEnable", 64);
+    reg.entries[0].type  = 1;  /* DWORD */
+    reg.entries[0].len   = 4;
+    reg.entries[0].value = 1;
+
+    str_copy(reg.entries[1].name, "RMForcePcieConfigSave", 64);
+    reg.entries[1].type  = 1;
+    reg.entries[1].len   = 4;
+    reg.entries[1].value = 1;
+
+    gsp_queue_send(GSP_RPC_SET_REGISTRY, &reg, sizeof(reg));
+}
+
+/* Step 3: ALLOC_ROOT (func 2) — poll response */
+static void gsp_rm_alloc_root(void)
+{
+    gsp_alloc_root_t alloc;
+    memset(&alloc, 0, sizeof(alloc));
+
+    alloc.hClient = GSP_RM_CLIENT_HANDLE;
+    alloc.hClass  = 0x0000;  /* NV01_ROOT */
+
+    gsp_queue_send(GSP_RPC_ALLOC_ROOT, &alloc, sizeof(alloc));
+
+    uint32_t func, result;
+    if (gsp_rpc_poll(&func, &result, NULL, 0, 2000) == 0) {
+        serial_puts("[GSP-RM] ALLOC_ROOT response: func=0x");
+        serial_puthex(func, 8);
+        serial_puts(" result=0x");
+        serial_puthex(result, 8);
+        serial_puts("\n");
+    } else {
+        serial_puts("[GSP-RM] ALLOC_ROOT timeout (expected without full boot chain)\n");
+    }
+}
+
+/* Step 4: ALLOC_DEVICE (func 3) — poll response */
+static void gsp_rm_alloc_device(void)
+{
+    gsp_alloc_device_t alloc;
+    memset(&alloc, 0, sizeof(alloc));
+
+    alloc.hClient        = GSP_RM_CLIENT_HANDLE;
+    alloc.hDevice        = GSP_RM_DEVICE_HANDLE;
+    alloc.hClass         = 0x0080;  /* NV01_DEVICE */
+    alloc.deviceInstance = 0;
+
+    gsp_queue_send(GSP_RPC_ALLOC_DEVICE, &alloc, sizeof(alloc));
+
+    uint32_t func, result;
+    if (gsp_rpc_poll(&func, &result, NULL, 0, 2000) == 0) {
+        serial_puts("[GSP-RM] ALLOC_DEVICE response: func=0x");
+        serial_puthex(func, 8);
+        serial_puts(" result=0x");
+        serial_puthex(result, 8);
+        serial_puts("\n");
+    } else {
+        serial_puts("[GSP-RM] ALLOC_DEVICE timeout (expected without full boot chain)\n");
+    }
+}
+
+/* Step 5: INIT_POST_OBJGPU (func 71) — no payload, poll response */
+static void gsp_rm_init_post_objgpu(void)
+{
+    gsp_queue_send(GSP_RPC_GSP_INIT_POST_OBJGPU, NULL, 0);
+
+    uint32_t func, result;
+    if (gsp_rpc_poll(&func, &result, NULL, 0, 2000) == 0) {
+        serial_puts("[GSP-RM] INIT_POST_OBJGPU response: func=0x");
+        serial_puthex(func, 8);
+        serial_puts(" result=0x");
+        serial_puthex(result, 8);
+        serial_puts("\n");
+    } else {
+        serial_puts("[GSP-RM] INIT_POST_OBJGPU timeout (expected without full boot chain)\n");
+    }
+}
+
+int gsp_rm_init(void)
+{
+    if (!gsp.queues_ready) {
+        serial_puts("[GSP-RM] Queues not ready, skipping RM init\n");
+        return -1;
+    }
+
+    serial_puts("[GSP-RM] === GSP-RM Init Sequence ===\n");
+
+    serial_puts("[GSP-RM] Step 1/5: SET_SYSTEM_INFO\n");
+    gsp_rm_send_system_info();
+
+    serial_puts("[GSP-RM] Step 2/5: SET_REGISTRY\n");
+    gsp_rm_send_registry();
+
+    serial_puts("[GSP-RM] Step 3/5: ALLOC_ROOT\n");
+    gsp_rm_alloc_root();
+
+    serial_puts("[GSP-RM] Step 4/5: ALLOC_DEVICE\n");
+    gsp_rm_alloc_device();
+
+    serial_puts("[GSP-RM] Step 5/5: INIT_POST_OBJGPU\n");
+    gsp_rm_init_post_objgpu();
+
+    gsp.rm_init_done = true;
+
+    serial_puts("[GSP-RM] === Init sequence complete ===\n");
+
+    fb_puts(" GSP-RM: init sequence done\n");
+
+    return 0;
+}
+
 /* ── Public API: Load firmware ───────────────────────────────── */
 
 int gsp_load_firmware(void)
@@ -936,6 +1105,7 @@ int gsp_boot(void)
     /* ── Post-boot: RPC init sequence (poll INIT_DONE, query static info) ── */
     if (gsp.queues_ready) {
         gsp_rpc_init();
+        gsp_rm_init();    /* X23: RM init sequence */
     }
 
     return gsp.boot_ack ? 0 : -1;
