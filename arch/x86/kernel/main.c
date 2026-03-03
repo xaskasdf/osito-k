@@ -9,6 +9,7 @@
 #include "../drivers/gpu.h"
 #include "../fs/gguf.h"
 #include "tensor.h"
+#include "inference.h"
 
 /* ── External functions ──────────────────────────────────────── */
 
@@ -167,7 +168,14 @@ void kernel_entry(void *memory_map, uint64_t map_size,
 
                     /* Load GGUF model (if present) */
                     static gguf_model_t gguf_model;
-                    gguf_load(&gguf_model);
+                    if (gguf_load(&gguf_model) == 0 && gguf_model.num_tensors > 0) {
+                        static llama_state_t llama;
+                        if (llama_init(&llama, &gguf_model, 256) == 0) {
+                            uint32_t prompt[] = { 128000 };  /* BOS */
+                            llama_generate(&llama, prompt, 1, 32);
+                            llama_free(&llama);
+                        }
+                    }
                 }
             } else {
                 serial_puts("[KERN] OsitoFS partition not found in GPT\n");

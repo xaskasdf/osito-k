@@ -126,6 +126,8 @@ arch/x86/fs/gguf.h                  GGUF types (tensor, model structs) + API
 arch/x86/fs/gguf.c                  GGUF loader (in-memory parser, NVMe read, tensor table)
 arch/x86/kernel/tensor.h            Tensor engine API (math, dequant, matvec, ops, RoPE)
 arch/x86/kernel/tensor.c            Tensor engine impl (Q4_0/Q8_0, x87/SSE math, benchmark)
+arch/x86/kernel/inference.h         Llama inference API (state, weights, KV cache, forward pass)
+arch/x86/kernel/inference.c         Transformer forward pass (embed, GQA attention, SwiGLU FFN, generate)
 arch/x86/include/types.h            Freestanding types + MMIO + port I/O
 
 # OsitoFS v2 Host Tools (tools/ositofs/)
@@ -249,7 +251,7 @@ Tasks:   idle, input, shell (3 of 8 slots used)
 | **X12** | **GPT parser** (auto-find OsitoFS partition by name + magic probe) | Done |
 | **X13** | **GGUF model loader** (load from OsitoFS into RAM, in-memory parser, tensor table) | Done |
 | **X14** | **Tensor compute engine** (Q4_0/Q8_0 matvec, rmsnorm, softmax, SiLU, RoPE) | Done |
-| X15     | Inference runtime (transformer forward pass) | Next |
+| **X15** | **Inference runtime** (Llama forward pass, GQA attention, SwiGLU, greedy decode) | Done |
 | X16     | GPU compute (NVIDIA GSP-shim or MMIO shader dispatch) | Research |
 
 ### F12: DOOM Wireframe 2.5D
@@ -283,6 +285,15 @@ Compatible with e1000e in QEMU (Intel 82574L, same igb register set).
 Static IP configuration, ARP table (16 entries), IPv4 with checksum verification.
 UDP send/recv with port-based handler dispatch. Echo server on port 7777.
 No ICMP, no TCP, no DHCP — minimal footprint for inference prompt delivery.
+
+### X15: Inference Runtime
+Complete Llama 3.2 1B transformer forward pass. Orchestrates tensor.h primitives over GGUF model data.
+- **Architecture**: dim=2048, 16 layers, 32 heads, 8 KV heads (GQA 4:1), head_dim=64, ffn_dim=8192, vocab=128256
+- **Forward pass**: embed → 16× (attn_norm → Q/K/V matvec → RoPE → KV cache → GQA attention → output proj → residual → ffn_norm → SwiGLU → down proj → residual) → final norm → logits
+- **Decoding**: greedy argmax, BOS token 128000, EOS tokens 128001/128009
+- **Memory**: scratch ~602KB + KV cache ~16MB (256 seq len) = ~17MB total
+- **Performance**: ~5-10s/token CPU scalar @ 3GHz (demo functional)
+- **Timing**: rdtsc per token, ms estimated @ 3GHz
 
 ## Language
 The user speaks Spanish. Communicate in Spanish when appropriate.

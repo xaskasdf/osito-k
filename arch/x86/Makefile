@@ -49,7 +49,8 @@ BUILD    = build
 # Source files
 EFI_SRC  = boot/efi_main.c
 KERN_SRC = kernel/main.c kernel/serial.c kernel/framebuffer.c \
-           kernel/pci.c kernel/memory.c kernel/net.c kernel/tensor.c
+           kernel/pci.c kernel/memory.c kernel/net.c kernel/tensor.c \
+           kernel/inference.c
 DRV_SRC  = drivers/nvme.c drivers/i211.c
 FS_SRC   = fs/ositofs2.c fs/gpt.c fs/gguf.c
 
