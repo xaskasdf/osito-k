@@ -116,26 +116,10 @@ void kernel_entry(void *memory_map, uint64_t map_size,
     fb_puts(" Scanning PCIe...\n");
     pci_scan();
 
-    /* Report GPU */
+    /* GPU MMIO probe (Phase 1) */
     gpu_device_t *gpu = pci_get_gpu();
-    if (gpu) {
-        serial_puts("[KERN] GPU found: NVIDIA ");
-        serial_puts(gpu_gen_name(gpu->generation));
-        serial_puts(" [");
-        serial_puthex(gpu->device_id, 4);
-        serial_puts("] BAR0=");
-        serial_puthex(gpu->bar0_base, 16);
-        serial_puts("\n");
-
-        fb_puts("\n GPU: NVIDIA ");
-        fb_puts_color(gpu_gen_name(gpu->generation), 0x0000FF00);
-        fb_puts(" [");
-        fb_puthex(gpu->device_id, 4);
-        fb_puts("]\n");
-        fb_puts("  BAR0: ");
-        fb_puthex(gpu->bar0_base, 16);
-        fb_puts("\n");
-        fb_puts("  Backend: GSP-shim (Phase 0 — detect only)\n");
+    if (gpu && gpu->bar0_base) {
+        gpu_init(gpu->bar0_base);
     } else {
         serial_puts("[KERN] No NVIDIA GPU found\n");
         fb_puts("\n GPU: not detected\n");

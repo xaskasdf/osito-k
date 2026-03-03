@@ -1,8 +1,8 @@
 /*
- * OsitoK x86-64 — GPU Abstraction Placeholder
+ * OsitoK x86-64 — GPU Driver
  *
- * Defines GPU backend types for future driver implementations.
- * Phase 0: detection only (PCI ID match).
+ * Phase 0: PCI detection (vendor/device ID, BAR addresses, generation).
+ * Phase 1: MMIO probe (chip ID, engines, PTIMER, Falcon detect).
  * Phase 2+: GSP firmware loading, command submission.
  */
 
@@ -10,6 +10,38 @@
 #define OSITOK_GPU_H
 
 #include "../include/types.h"
+
+/* ── NVIDIA MMIO Register Defines (BAR0 offsets, envytools) ──── */
+
+/* PMC — Card Master Control */
+#define NV_PMC_BOOT_0          0x000000
+#define NV_PMC_BOOT_42         0x0000A8
+#define NV_PMC_INTR_0          0x000100
+#define NV_PMC_ENABLE          0x000200
+
+/* PTIMER — GPU Timer */
+#define NV_PTIMER_TIME_0       0x009400   /* Low 32 bits (ns) */
+#define NV_PTIMER_TIME_1       0x009410   /* High 32 bits (ns) */
+
+/* PFB — Framebuffer / Memory Controller */
+#define NV_PFB_CFG0            0x100C04
+
+/* Falcon microcontroller bases (Turing+) */
+#define NV_PGSP_BASE           0x110000
+#define NV_PSEC_BASE           0x087000
+#define NV_PPMU_BASE           0x10A000
+#define NV_FALCON_HWCFG        0x000064   /* Offset within falcon base */
+
+/* PMC_ENABLE engine bits */
+#define NV_PMC_ENABLE_PGRAPH   (1 << 12)
+#define NV_PMC_ENABLE_PFB      (1 << 20)
+#define NV_PMC_ENABLE_PFIFO    (1 <<  8)
+#define NV_PMC_ENABLE_PTIMER   (1 << 16)
+#define NV_PMC_ENABLE_CE0      (1 <<  6)
+#define NV_PMC_ENABLE_CE1      (1 <<  7)
+
+/* Dead register sentinel */
+#define NV_DEAD_REG            0xFFFFFFFF
 
 /* GPU backend types */
 typedef enum {
@@ -70,5 +102,26 @@ static inline const char *gpu_gen_name(gpu_gen_t gen)
     default:                   return "Unknown";
     }
 }
+
+/* ── Phase 1: MMIO Probe Results ───────────────────────────────── */
+
+typedef struct {
+    bool        present;          /* BAR0 accessible */
+    uint32_t    boot0;            /* Raw PMC_BOOT_0 value */
+    uint32_t    boot42;           /* Raw PMC_BOOT_42 value */
+    uint32_t    chip_id;          /* bits 31:20 of boot0 */
+    uint32_t    chip_rev;         /* bits 3:0 of boot0 */
+    uint32_t    engines;          /* Raw PMC_ENABLE value */
+    uint64_t    gpu_timer_ns;     /* PTIMER nanoseconds since power-on */
+    bool        gsp_present;      /* GSP falcon detected */
+    bool        sec2_present;     /* SEC2 falcon detected */
+    bool        pmu_present;      /* PMU falcon detected */
+} gpu_probe_t;
+
+/* Phase 1: Probe GPU via MMIO reads (read-only, no writes) */
+int gpu_init(uint64_t bar0_phys);
+
+/* Get probe results (valid after gpu_init succeeds) */
+gpu_probe_t *gpu_get_probe(void);
 
 #endif /* OSITOK_GPU_H */

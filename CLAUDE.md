@@ -118,7 +118,8 @@ arch/x86/kernel/framebuffer.c       GOP 32bpp text console (8×16 font)
 arch/x86/kernel/pci.c               PCIe enumeration (ECAM via MCFG ACPI table)
 arch/x86/kernel/memory.c            Physical memory manager (bitmap, 4KB pages)
 arch/x86/drivers/nvme.c             Minimal NVMe driver (admin+IO queues, read-only)
-arch/x86/drivers/gpu.h              GPU abstraction placeholder (GSP/custom/Vulkan)
+arch/x86/drivers/gpu.h              GPU types, MMIO register defines, probe API
+arch/x86/drivers/gpu.c              GPU MMIO probe (chip ID, engines, PTIMER, Falcon detect)
 arch/x86/fs/ositofs2.c              OsitoFS v2 bare-metal driver (mount, list, read)
 arch/x86/fs/gpt.h                   GPT structs (UEFI spec) + API
 arch/x86/fs/gpt.c                   GPT parser (name match + superblock magic probe)
@@ -252,7 +253,8 @@ Tasks:   idle, input, shell (3 of 8 slots used)
 | **X13** | **GGUF model loader** (load from OsitoFS into RAM, in-memory parser, tensor table) | Done |
 | **X14** | **Tensor compute engine** (Q4_0/Q8_0 matvec, rmsnorm, softmax, SiLU, RoPE) | Done |
 | **X15** | **Inference runtime** (Llama forward pass, GQA attention, SwiGLU, greedy decode) | Done |
-| X16     | GPU compute (NVIDIA GSP-shim or MMIO shader dispatch) | Research |
+| **X16** | **GPU MMIO probe** (chip ID, engines, PTIMER, Falcon detect — Phase 1) | Done |
+| X17     | GPU compute (NVIDIA GSP firmware loading, GPFIFO, compute dispatch) | Research |
 
 ### F12: DOOM Wireframe 2.5D
 Procedural level generator (4x4 grid, snake path connectivity) + wall-segment projection renderer.
@@ -294,6 +296,15 @@ Complete Llama 3.2 1B transformer forward pass. Orchestrates tensor.h primitives
 - **Memory**: scratch ~602KB + KV cache ~16MB (256 seq len) = ~17MB total
 - **Performance**: ~5-10s/token CPU scalar @ 3GHz (demo functional)
 - **Timing**: rdtsc per token, ms estimated @ 3GHz
+
+### X16: GPU MMIO Probe (Phase 1)
+Read-only BAR0 MMIO probe — no writes to GPU registers.
+- **Chip ID**: PMC_BOOT_0 bits 31:20 → chip name lookup (Turing through Blackwell)
+- **Engines**: PMC_ENABLE → PGRAPH, PFIFO, PFB, PTIMER, CE0, CE1
+- **PTIMER**: 64-bit nanosecond timer (high-low-high rollover-safe read)
+- **Falcons**: GSP (0x110000), SEC2 (0x087000), PMU (0x10A000) — HWCFG presence check
+- **Safety**: Dead register (0xFFFFFFFF) and zero checks on BAR0 access
+- **Pattern**: Static state, mmio_read32 wrapper (same as i211.c)
 
 ## Language
 The user speaks Spanish. Communicate in Spanish when appropriate.
