@@ -1,11 +1,13 @@
 /*
- * OsitoK x86-64 — GSP Falcon Driver (Phase 4-5)
+ * OsitoK x86-64 — GSP Falcon Driver (Phase 4-7)
  *
  * Phase 4: Deep probe (HWCFG2, CPUCTL, mailboxes), firmware load + VRAM upload.
  * Phase 5: ELF64 parse, boot sequence (BOOTVEC, CPUCTL start), mailbox handshake.
  * Phase 6: Shared memory message queues (host↔GSP bidirectional).
+ * Phase 7: RPC protocol (function IDs, poll with timeout, init sequence).
  *
- * Reference: envytools (https://envytools.rtfd.io), nouveau driver.
+ * Reference: envytools (https://envytools.rtfd.io), nouveau driver,
+ *            NVIDIA open-gpu-kernel-modules (rpc_global_enums.h).
  */
 
 #include "../include/types.h"
@@ -542,7 +544,8 @@ int gsp_queue_send(uint32_t function, const void *payload, uint32_t len)
     return 0;
 }
 
-int gsp_queue_recv(void *buf, uint32_t buf_size, uint32_t *function)
+int gsp_queue_recv(void *buf, uint32_t buf_size,
+                   uint32_t *function, uint32_t *rpc_result)
 {
     if (!gsp.queues_ready) {
         return -1;
@@ -584,6 +587,8 @@ int gsp_queue_recv(void *buf, uint32_t buf_size, uint32_t *function)
 
     if (function)
         *function = rpc->function;
+    if (rpc_result)
+        *rpc_result = rpc->rpc_result;
 
     /* Copy payload to caller buffer */
     uint32_t payload_off = sizeof(gsp_msg_elem_hdr_t) + sizeof(gsp_rpc_hdr_t);
@@ -613,6 +618,86 @@ int gsp_queue_recv(void *buf, uint32_t buf_size, uint32_t *function)
 
     (void)elem;
     return 0;
+}
+
+/* ── Phase 7: RPC Protocol ───────────────────────────────────── */
+
+int gsp_rpc_poll(uint32_t *function, uint32_t *result,
+                 void *buf, uint32_t buf_size, uint32_t timeout_ms)
+{
+    uint64_t t0 = rdtsc();
+    uint64_t timeout_cycles = (uint64_t)timeout_ms * 3000000ULL;
+
+    while (1) {
+        uint32_t func, res;
+        if (gsp_queue_recv(buf, buf_size, &func, &res) == 0) {
+            if (function) *function = func;
+            if (result)   *result   = res;
+            return 0;
+        }
+
+        uint64_t elapsed = rdtsc() - t0;
+        if (elapsed >= timeout_cycles)
+            return -1;  /* Timeout */
+    }
+}
+
+int gsp_rpc_init(void)
+{
+    if (!gsp.queues_ready) return -1;
+
+    serial_puts("[GSP] RPC: waiting for INIT_DONE...\n");
+
+    /* ── Step 1: Poll for GSP_INIT_DONE event ── */
+    uint32_t func, result;
+    if (gsp_rpc_poll(&func, &result, NULL, 0, 2000) == 0) {
+        serial_puts("[GSP] RPC: received func=0x");
+        serial_puthex(func, 8);
+        if (func == GSP_EVENT_GSP_INIT_DONE) {
+            serial_puts(" (INIT_DONE)\n");
+            gsp.rpc_ready = true;
+        } else {
+            serial_puts(" (unexpected, expected INIT_DONE)\n");
+        }
+    } else {
+        serial_puts("[GSP] RPC: INIT_DONE timeout (expected without full boot chain)\n");
+        return -1;
+    }
+
+    /* ── Step 2: Send GET_GSP_STATIC_INFO ── */
+    serial_puts("[GSP] RPC: sending GET_GSP_STATIC_INFO...\n");
+    gsp_queue_send(GSP_RPC_GET_GSP_STATIC_INFO, NULL, 0);
+
+    /* ── Step 3: Poll for response ── */
+    uint8_t info_buf[256];
+    if (gsp_rpc_poll(&func, &result, info_buf, sizeof(info_buf), 2000) == 0) {
+        serial_puts("[GSP] RPC: response func=0x");
+        serial_puthex(func, 8);
+        serial_puts(" result=0x");
+        serial_puthex(result, 8);
+        serial_puts("\n");
+
+        if (func == GSP_RPC_GET_GSP_STATIC_INFO &&
+            result == GSP_RPC_RESULT_OK) {
+            /* Parse GPU name from first 40 bytes of payload */
+            gsp_static_info_t *info = (gsp_static_info_t *)info_buf;
+            info->gpu_name[39] = '\0';
+            for (int i = 0; i < 40; i++)
+                gsp.gpu_name[i] = info->gpu_name[i];
+
+            serial_puts("[GSP] GPU: ");
+            serial_puts(gsp.gpu_name);
+            serial_puts("\n");
+
+            fb_puts(" GSP GPU: ");
+            fb_puts(gsp.gpu_name);
+            fb_puts("\n");
+        }
+    } else {
+        serial_puts("[GSP] RPC: GET_GSP_STATIC_INFO timeout\n");
+    }
+
+    return gsp.rpc_ready ? 0 : -1;
 }
 
 /* ── Public API: Load firmware ───────────────────────────────── */
@@ -848,19 +933,9 @@ int gsp_boot(void)
         fb_puts(" GSP: boot timeout\n");
     }
 
-    /* ── Post-boot: try to receive init message from GSP ── */
-    if (gsp.boot_ack && gsp.queues_ready) {
-        uint8_t rxbuf[256];
-        uint32_t func;
-        if (gsp_queue_recv(rxbuf, sizeof(rxbuf), &func) == 0) {
-            serial_puts("[GSP] Received init message: func=0x");
-            serial_puthex(func, 8);
-            serial_puts("\n");
-        } else {
-            serial_puts("[GSP] No message on status queue (expected without full boot chain)\n");
-        }
-    } else if (gsp.queues_ready) {
-        serial_puts("[GSP] No message on status queue (expected without full boot chain)\n");
+    /* ── Post-boot: RPC init sequence (poll INIT_DONE, query static info) ── */
+    if (gsp.queues_ready) {
+        gsp_rpc_init();
     }
 
     return gsp.boot_ack ? 0 : -1;

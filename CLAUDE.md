@@ -118,9 +118,9 @@ arch/x86/kernel/framebuffer.c       GOP 32bpp text console (8×16 font)
 arch/x86/kernel/pci.c               PCIe enumeration (ECAM via MCFG, BAR size detection)
 arch/x86/kernel/memory.c            Physical memory manager (bitmap, 4KB pages)
 arch/x86/drivers/nvme.c             Minimal NVMe driver (admin+IO queues, read-only)
-arch/x86/drivers/gpu.h              GPU types, MMIO register defines, Falcon defines, probe + GSP API
+arch/x86/drivers/gpu.h              GPU types, MMIO register defines, Falcon defines, RPC IDs, probe + GSP API
 arch/x86/drivers/gpu.c              GPU probe Phase 1-3 (chip ID, engines, VRAM, BAR1 R/W, PRAMIN R/W)
-arch/x86/drivers/gsp.c              GSP Falcon driver: probe, firmware load, ELF parse, boot, message queues (Phase 4-6)
+arch/x86/drivers/gsp.c              GSP Falcon driver: probe, firmware load, ELF parse, boot, queues, RPC (Phase 4-7)
 arch/x86/fs/ositofs2.c              OsitoFS v2 bare-metal driver (mount, list, read)
 arch/x86/fs/gpt.h                   GPT structs (UEFI spec) + API
 arch/x86/fs/gpt.c                   GPT parser (name match + superblock magic probe)
@@ -260,6 +260,7 @@ Tasks:   idle, input, shell (3 of 8 slots used)
 | **X19** | **GSP Falcon deep probe + firmware load to VRAM** (Phase 4) | Done |
 | **X20** | **GSP boot** (ELF parse, BOOTVEC, CPUCTL start, mailbox handshake) — Phase 5 | Done |
 | **X21** | **GSP message queues** (shared memory, TX/RX primitives, init args to VRAM) — Phase 6 | Done |
+| **X22** | **GSP-RM RPC protocol** (function IDs, poll with timeout, init sequence) — Phase 7 | Done |
 
 ### F12: DOOM Wireframe 2.5D
 Procedural level generator (4x4 grid, snake path connectivity) + wall-segment projection renderer.
@@ -360,6 +361,16 @@ Bidirectional host↔GSP communication via shared memory queues following NVIDIA
 - **Doorbell**: NV_PGSP_QUEUE_HEAD (0x110C00) write notifies GSP of new messages
 - **Post-boot**: Attempts recv on status queue (no response expected without full boot chain)
 - **Does NOT implement RPC commands** — that is X22+ (INIT command, ACK handling)
+
+### X22: GSP-RM RPC Protocol (Phase 7)
+RPC protocol layer on top of X21 message queues. Function IDs, polling, init sequence.
+- **Function IDs**: Enum defines from `rpc_global_enums.h` — NOP(0), ALLOC_ROOT(2), GET_GSP_STATIC_INFO(68), GSP_RM_CONTROL(76), CONTINUATION_RECORD(0x43), etc.
+- **Event IDs**: GSP_INIT_DONE(0x80), RUN_CPU_SEQUENCER(0x81), POST_EVENT(0x82)
+- **gsp_rpc_poll**: Polls status queue with rdtsc-based timeout (~3GHz estimate). Returns function, result, and payload to caller. Never blocks indefinitely.
+- **gsp_rpc_init**: Post-boot sequence — (1) poll for INIT_DONE event (2s timeout), (2) send GET_GSP_STATIC_INFO, (3) poll response and parse GPU name from `gsp_static_info_t`.
+- **gsp_queue_recv**: Extended with `rpc_result` output parameter.
+- **Graceful degradation**: Without full boot chain (FWSEC, WPR, radix3), GSP doesn't respond — timeouts logged, OS continues.
+- **Does NOT implement RM commands** — that is X23+ (SET_SYSTEM_INFO, ALLOC_ROOT, INIT_POST_OBJGPU)
 
 ## Language
 The user speaks Spanish. Communicate in Spanish when appropriate.

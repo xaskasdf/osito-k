@@ -184,6 +184,37 @@ typedef struct {
     uint64_t statQueueOffset;      /* GSP queue offset = 0x41000 */
 } gsp_msgq_init_args_t;           /* 32 bytes */
 
+/* ── GSP-RM RPC Function IDs (rpc_global_enums.h) ──────────── */
+
+#define GSP_RPC_NOP                       0
+#define GSP_RPC_SET_GUEST_SYSTEM_INFO     1
+#define GSP_RPC_ALLOC_ROOT                2
+#define GSP_RPC_ALLOC_DEVICE              3
+#define GSP_RPC_ALLOC_MEMORY              4
+#define GSP_RPC_FREE                      10
+#define GSP_RPC_GET_GSP_STATIC_INFO       68
+#define GSP_RPC_SET_REGISTRY              69
+#define GSP_RPC_GSP_SET_SYSTEM_INFO       70
+#define GSP_RPC_GSP_INIT_POST_OBJGPU      71
+#define GSP_RPC_GSP_RM_CONTROL            76
+#define GSP_RPC_GSP_RM_ALLOC              77
+#define GSP_RPC_CONTINUATION_RECORD       0x43
+
+/* GSP-RM Event IDs (async GSP→host) */
+#define GSP_EVENT_GSP_INIT_DONE           0x80
+#define GSP_EVENT_RUN_CPU_SEQUENCER       0x81
+#define GSP_EVENT_POST_EVENT              0x82
+
+/* RPC result sentinels */
+#define GSP_RPC_RESULT_PENDING            0xFFFFFFFF
+#define GSP_RPC_RESULT_OK                 0x00000000
+
+/* GET_GSP_STATIC_INFO response (partial — only GPU name parsed) */
+typedef struct {
+    char     gpu_name[40];     /* Null-terminated GPU name string */
+    /* ... many more fields (~0x6c8 bytes total, not parsed yet) ... */
+} gsp_static_info_t;
+
 /* Dead register sentinel */
 #define NV_DEAD_REG            0xFFFFFFFF
 
@@ -297,6 +328,9 @@ typedef struct {
     uint32_t    cmd_seq;          /* Command sequence counter */
     uint32_t    rpc_seq;          /* RPC sequence counter */
     bool        queues_ready;     /* Queues initialized */
+    /* RPC Protocol (Phase 7) */
+    char        gpu_name[40];     /* From GET_GSP_STATIC_INFO */
+    bool        rpc_ready;        /* INIT_DONE received */
 } gsp_state_t;
 
 /* ── API ────────────────────────────────────────────────────── */
@@ -322,6 +356,12 @@ int  gsp_boot(void);
 /* Phase 6: GSP message queues */
 int  gsp_queue_init(void);      /* Allocate + init shared memory */
 int  gsp_queue_send(uint32_t function, const void *payload, uint32_t len);
-int  gsp_queue_recv(void *buf, uint32_t buf_size, uint32_t *function);
+int  gsp_queue_recv(void *buf, uint32_t buf_size,
+                    uint32_t *function, uint32_t *rpc_result);
+
+/* Phase 7: RPC protocol */
+int  gsp_rpc_poll(uint32_t *function, uint32_t *result,
+                  void *buf, uint32_t buf_size, uint32_t timeout_ms);
+int  gsp_rpc_init(void);       /* Post-boot RPC init sequence */
 
 #endif /* OSITOK_GPU_H */
