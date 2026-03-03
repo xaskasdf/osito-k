@@ -1,10 +1,10 @@
 /*
- * OsitoK x86-64 — GPU MMIO Probe Driver (Phase 1)
+ * OsitoK x86-64 — GPU MMIO Probe Driver (Phase 1 + 2)
  *
- * Read-only BAR0 probe: chip ID, active engines, GPU timer,
- * Falcon microcontroller detection (GSP/SEC2/PMU).
+ * Phase 1: Read-only BAR0 probe — chip ID, engines, PTIMER, Falcons.
+ * Phase 2: VRAM size, BAR1 read/write test, PRAMIN window read.
  *
- * NO WRITES to GPU registers. This is a passive probe only.
+ * NO WRITES to GPU control registers. BAR1 write test uses VRAM only.
  *
  * Reference: envytools (https://envytools.rtfd.io), nouveau driver.
  */
@@ -135,6 +135,122 @@ static void gpu_probe_falcons(void)
     gpu.probe.pmu_present  = gpu_probe_falcon(NV_PPMU_BASE);
 }
 
+/* ── Phase 2: VRAM Discovery ─────────────────────────────────── */
+
+static void gpu_probe_vram(void)
+{
+    uint32_t range = gpu_read(NV_PFB_PRI_MMU_LOCAL_MEMORY_RANGE);
+
+    if (range == NV_DEAD_REG || range == 0) {
+        gpu.probe.vram_size_mb = 0;
+        return;
+    }
+
+    /* Bits 29:0 shifted left by 17 gives VRAM in bytes */
+    uint64_t vram_bytes = (uint64_t)(range & 0x3FFFFFFF) << 17;
+    gpu.probe.vram_size_mb = (uint32_t)(vram_bytes >> 20);
+}
+
+static void gpu_probe_bar1(uint64_t bar1_phys, uint64_t bar1_size)
+{
+    if (bar1_phys == 0 || bar1_size == 0) {
+        serial_puts("[GPU] BAR1: not configured\n");
+        return;
+    }
+
+    volatile uint32_t *bar1 = (volatile uint32_t *)bar1_phys;
+    uint32_t d0, d1, d2, d3;
+
+    rmb();
+    d0 = bar1[0];
+    d1 = bar1[1];
+    d2 = bar1[2];
+    d3 = bar1[3];
+
+    serial_puts("[GPU] BAR1[0..3]: ");
+    serial_puthex(d0, 8); serial_puts(" ");
+    serial_puthex(d1, 8); serial_puts(" ");
+    serial_puthex(d2, 8); serial_puts(" ");
+    serial_puthex(d3, 8); serial_puts("\n");
+
+    /* All 0xFFFFFFFF means BAR1 is not accessible */
+    if (d0 == NV_DEAD_REG && d1 == NV_DEAD_REG &&
+        d2 == NV_DEAD_REG && d3 == NV_DEAD_REG)
+        return;
+
+    gpu.probe.bar1_accessible = true;
+}
+
+#define BAR1_RW_TEST_OFFSET  (32 * 1024 * 1024)  /* 32MB past start */
+
+static void gpu_probe_bar1_rw(uint64_t bar1_phys, uint64_t bar1_size)
+{
+    if (!gpu.probe.bar1_accessible)
+        return;
+
+    /* Need at least 32MB + 16 bytes of aperture */
+    if (bar1_size < BAR1_RW_TEST_OFFSET + 16) {
+        serial_puts("[GPU] BAR1 R/W test: aperture too small, skipped\n");
+        return;
+    }
+
+    volatile uint32_t *test = (volatile uint32_t *)(bar1_phys + BAR1_RW_TEST_OFFSET);
+
+    /* Save originals */
+    rmb();
+    uint32_t orig0 = test[0];
+    uint32_t orig1 = test[1];
+
+    /* Write test patterns */
+    test[0] = 0xDEADBEEF;
+    test[1] = 0x0517014B;  /* "OSITOK" */
+    wmb();
+
+    /* Read back */
+    rmb();
+    uint32_t rb0 = test[0];
+    uint32_t rb1 = test[1];
+
+    serial_puts("[GPU] BAR1 R/W test at +32MB: wrote DEADBEEF, read ");
+    serial_puthex(rb0, 8);
+
+    if (rb0 == 0xDEADBEEF && rb1 == 0x0517014B) {
+        serial_puts(" OK\n");
+        gpu.probe.bar1_rw_ok = true;
+    } else {
+        serial_puts(" FAIL (expected DEADBEEF/0517014B, got ");
+        serial_puthex(rb0, 8);
+        serial_puts("/");
+        serial_puthex(rb1, 8);
+        serial_puts(")\n");
+    }
+
+    /* Restore originals */
+    test[0] = orig0;
+    test[1] = orig1;
+    wmb();
+}
+
+static void gpu_probe_pramin(void)
+{
+    uint32_t d0, d1, d2, d3;
+
+    d0 = gpu_read(NV_PRAMIN_BASE + 0x00);
+    d1 = gpu_read(NV_PRAMIN_BASE + 0x04);
+    d2 = gpu_read(NV_PRAMIN_BASE + 0x08);
+    d3 = gpu_read(NV_PRAMIN_BASE + 0x0C);
+
+    serial_puts("[GPU] PRAMIN[0..3]: ");
+    serial_puthex(d0, 8); serial_puts(" ");
+    serial_puthex(d1, 8); serial_puts(" ");
+    serial_puthex(d2, 8); serial_puts(" ");
+    serial_puthex(d3, 8); serial_puts("\n");
+
+    if (d0 != NV_DEAD_REG || d1 != NV_DEAD_REG ||
+        d2 != NV_DEAD_REG || d3 != NV_DEAD_REG)
+        gpu.probe.pramin_accessible = true;
+}
+
 /* ── Report: Print Results ───────────────────────────────────── */
 
 static void gpu_report(uint64_t bar1_base)
@@ -209,6 +325,50 @@ static void gpu_report(uint64_t bar1_base)
     fb_puts(" PMU=");
     fb_puts(p->pmu_present ? "yes" : "no");
     fb_puts("\n");
+
+    /* ── Phase 2 report ── */
+
+    /* VRAM size */
+    serial_puts("[GPU] VRAM: ");
+    if (p->vram_size_mb > 0) {
+        serial_putdec(p->vram_size_mb);
+        serial_puts(" MB\n");
+    } else {
+        serial_puts("unknown\n");
+    }
+
+    fb_puts("  VRAM: ");
+    if (p->vram_size_mb > 0) {
+        fb_putdec(p->vram_size_mb);
+        fb_puts(" MB\n");
+    } else {
+        fb_puts("unknown\n");
+    }
+
+    /* BAR1 status */
+    serial_puts("[GPU] BAR1: ");
+    serial_puts(p->bar1_accessible ? "accessible" : "NOT accessible");
+    if (p->bar1_accessible) {
+        serial_puts(", R/W ");
+        serial_puts(p->bar1_rw_ok ? "OK" : "FAIL");
+    }
+    serial_puts("\n");
+
+    fb_puts("  BAR1: ");
+    fb_puts(p->bar1_accessible ? "accessible" : "NOT accessible");
+    if (p->bar1_accessible) {
+        fb_puts(p->bar1_rw_ok ? " R/W OK" : " R/W FAIL");
+    }
+    fb_puts("\n");
+
+    /* PRAMIN status */
+    serial_puts("[GPU] PRAMIN: ");
+    serial_puts(p->pramin_accessible ? "accessible" : "NOT accessible");
+    serial_puts("\n");
+
+    fb_puts("  PRAMIN: ");
+    fb_puts(p->pramin_accessible ? "accessible" : "NOT accessible");
+    fb_puts("\n");
 }
 
 /* ── Public API ──────────────────────────────────────────────── */
@@ -238,16 +398,22 @@ int gpu_init(uint64_t bar0_phys)
 
     gpu.probe.present = true;
 
-    /* Probe remaining subsystems */
+    /* Phase 1: probe subsystems */
     gpu_probe_engines();
     gpu_probe_timer();
     gpu_probe_falcons();
 
+    /* Phase 2: VRAM / BAR1 / PRAMIN */
+    gpu_probe_vram();
+    gpu_probe_bar1(bar1_base, dev ? dev->bar1_size : 0);
+    gpu_probe_bar1_rw(bar1_base, dev ? dev->bar1_size : 0);
+    gpu_probe_pramin();
+
     /* Report results */
     gpu_report(bar1_base);
 
-    serial_puts("[GPU] Phase 1 probe complete\n");
-    fb_puts("  Phase 1 probe complete\n");
+    serial_puts("[GPU] Phase 2 probe complete\n");
+    fb_puts("  Phase 2 probe complete\n");
 
     return 0;
 }

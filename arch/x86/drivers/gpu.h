@@ -3,7 +3,8 @@
  *
  * Phase 0: PCI detection (vendor/device ID, BAR addresses, generation).
  * Phase 1: MMIO probe (chip ID, engines, PTIMER, Falcon detect).
- * Phase 2+: GSP firmware loading, command submission.
+ * Phase 2: VRAM discovery, BAR1 read/write test, PRAMIN window.
+ * Phase 3+: GSP firmware loading, command submission.
  */
 
 #ifndef OSITOK_GPU_H
@@ -39,6 +40,13 @@
 #define NV_PMC_ENABLE_PTIMER   (1 << 16)
 #define NV_PMC_ENABLE_CE0      (1 <<  6)
 #define NV_PMC_ENABLE_CE1      (1 <<  7)
+
+/* PFB — VRAM size (Turing+, envytools) */
+#define NV_PFB_PRI_MMU_LOCAL_MEMORY_RANGE  0x100CE0  /* bits 29:0 << 17 = bytes */
+
+/* PRAMIN — Instance memory window through BAR0 */
+#define NV_PRAMIN_BASE      0x700000   /* 1MB window */
+#define NV_PRAMIN_SIZE      0x100000
 
 /* Dead register sentinel */
 #define NV_DEAD_REG            0xFFFFFFFF
@@ -116,6 +124,12 @@ typedef struct {
     bool        gsp_present;      /* GSP falcon detected */
     bool        sec2_present;     /* SEC2 falcon detected */
     bool        pmu_present;      /* PMU falcon detected */
+
+    /* Phase 2: VRAM / BAR1 */
+    uint32_t    vram_size_mb;      /* VRAM total in MB */
+    bool        bar1_accessible;   /* BAR1 reads != 0xFFFFFFFF */
+    bool        bar1_rw_ok;        /* Write/read test pattern OK */
+    bool        pramin_accessible; /* PRAMIN window readable */
 } gpu_probe_t;
 
 /* Phase 1: Probe GPU via MMIO reads (read-only, no writes) */
