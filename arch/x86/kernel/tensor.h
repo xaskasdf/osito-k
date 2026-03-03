@@ -51,6 +51,26 @@ void vec_mul(float *out, const float *a,
 void rope(float *vec, uint32_t n_heads,
           uint32_t head_dim, uint32_t pos, float theta);
 
+/* ── AVX2/FMA accelerated paths (tensor_avx2.c) ─────── */
+
+void matvec_q4_0_avx2(float *out, const void *weight,
+                       const float *input, uint32_t rows, uint32_t cols);
+void rmsnorm_avx2(float *out, const float *x,
+                  const float *weight, uint32_t n);
+void vec_add_avx2(float *out, const float *a,
+                  const float *b, uint32_t n);
+void vec_mul_avx2(float *out, const float *a,
+                  const float *b, uint32_t n);
+
+/* ── AVX2 detection + enable ────────────────────────── */
+
+/* Detect AVX2/FMA via CPUID, enable AVX state (CR4 + XCR0).
+ * Returns 1 if AVX2+FMA available, 0 otherwise. */
+int  tensor_avx2_detect(void);
+
+/* Returns cached result after first detect call */
+int  tensor_has_avx2(void);
+
 /* ── Self-test + benchmark ───────────────────────────── */
 
 void tensor_benchmark(void);

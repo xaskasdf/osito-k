@@ -118,16 +118,17 @@ arch/x86/kernel/framebuffer.c       GOP 32bpp text console (8×16 font)
 arch/x86/kernel/pci.c               PCIe enumeration (ECAM via MCFG, BAR size detection)
 arch/x86/kernel/memory.c            Physical memory manager (bitmap, 4KB pages)
 arch/x86/drivers/nvme.c             Minimal NVMe driver (admin+IO queues, read-only)
-arch/x86/drivers/gpu.h              GPU types, MMIO register defines, Falcon defines, RPC IDs, VBIOS/BIT/FWSEC/WPR2 structs, probe + GSP API
+arch/x86/drivers/gpu.h              GPU types, MMIO register defines, Falcon defines, RPC IDs, VBIOS/BIT/FWSEC/WPR2 structs, PIO API, probe + GSP API
 arch/x86/drivers/gpu.c              GPU probe Phase 1-3 + Phase 9 VBIOS read, BIT parse, FWSEC extraction
-arch/x86/drivers/gsp.c              GSP Falcon driver: probe, firmware load, ELF parse, boot, queues, RPC, FWSEC-FRTS (Phase 4-10)
+arch/x86/drivers/gsp.c              GSP Falcon driver: probe, firmware load, ELF parse, boot, queues, RPC, FWSEC-FRTS, PIO load (Phase 4-10 + X27)
 arch/x86/fs/ositofs2.c              OsitoFS v2 bare-metal driver (mount, list, read)
 arch/x86/fs/gpt.h                   GPT structs (UEFI spec) + API
 arch/x86/fs/gpt.c                   GPT parser (name match + superblock magic probe)
 arch/x86/fs/gguf.h                  GGUF types (tensor, model structs) + API
 arch/x86/fs/gguf.c                  GGUF loader (in-memory parser, NVMe read, tensor table)
-arch/x86/kernel/tensor.h            Tensor engine API (math, dequant, matvec, ops, RoPE)
-arch/x86/kernel/tensor.c            Tensor engine impl (Q4_0/Q8_0, x87/SSE math, benchmark)
+arch/x86/kernel/tensor.h            Tensor engine API (math, dequant, matvec, ops, RoPE, AVX2 dispatch)
+arch/x86/kernel/tensor.c            Tensor engine impl (Q4_0/Q8_0, x87/SSE math, AVX2 detect, benchmark)
+arch/x86/kernel/tensor_avx2.c       AVX2/FMA vectorized tensor ops (matvec_q4_0, rmsnorm, vec_add/mul)
 arch/x86/kernel/inference.h         Llama inference API (state, weights, KV cache, forward pass)
 arch/x86/kernel/inference.c         Transformer forward pass (embed, GQA attention, SwiGLU FFN, generate)
 arch/x86/include/types.h            Freestanding types + MMIO + port I/O
@@ -144,6 +145,7 @@ tools/ositofs/common.c/h             CRC32, block I/O, display helpers
 # Documentation
 docs/ositofs2-spec.md                OsitoFS v2 format specification
 docs/bare-metal-ai-os.md             x86 bare-metal AI OS research & design
+docs/x86-gpu-roadmap.md              GPU compute roadmap (X27-X40 + contingency)
 ```
 
 ## Math Library Summary
@@ -265,6 +267,10 @@ Tasks:   idle, input, shell (3 of 8 slots used)
 | **X24** | **VBIOS read** (PRAMIN window read, ROM+PCIR parse, image chain enumeration) — Phase 9 | Done |
 | **X25** | **BIT table parse** (BIT scan, Falcon ucode table, FWSEC extraction) — Phase 9 | Done |
 | **X26** | **FWSEC-FRTS execution** (FWSEC upload to VRAM, Falcon boot, WPR2 creation attempt) — Phase 10 | Done |
+| **X-CPU1** | **AVX2/FMA tensor ops** (runtime CPUID, vectorized matvec_q4_0 + rmsnorm, ~4-8x speedup) | Done |
+| **X27** | **Falcon PIO Load** (IMEMC/IMEMD write/read, falcon_reset, falcon_boot, PIO self-test) | Done |
+
+> Full GPU roadmap (X27-X40 + contingency): see [docs/x86-gpu-roadmap.md](docs/x86-gpu-roadmap.md)
 
 ### F12: DOOM Wireframe 2.5D
 Procedural level generator (4x4 grid, snake path connectivity) + wall-segment projection renderer.
@@ -412,6 +418,26 @@ Load FWSEC into GSP Falcon, execute FRTS command to create WPR2 region.
 - **Post-execution**: Halts Falcon, ready for gsp.bin re-boot
 - **Safety**: Timeout-based, never hangs. Falcon returns to HALTED on failure.
 - **Known limitation**: Without full SEC2 bootstrap chain, FWSEC may not execute on all GPUs. Expected behavior for initial implementation.
+
+### X-CPU1: AVX2/FMA Tensor Ops
+Runtime-dispatched AVX2 vectorization of hot-path tensor operations.
+- **Detection**: CPUID check for XSAVE+AVX+FMA+AVX2. Enables CR4.OSXSAVE and XCR0 bits for AVX state on bare-metal.
+- **matvec_q4_0_avx2**: SIMD nibble unpack (vpunpckl/hbw) → cvtepu8_epi32 → cvtepi32_ps → vfmadd. 4 groups of 8 per Q4_0 block. ~4-8x speedup.
+- **rmsnorm_avx2**: AVX2 FMA sum-of-squares + vectorized element-wise multiply.
+- **vec_add/mul_avx2**: 8-wide AVX2 with scalar tail.
+- **Dispatch**: `tensor_has_avx2()` cached check. Public functions (matvec_q4_0, rmsnorm, etc.) auto-dispatch.
+- **Build**: `tensor_avx2.c` compiled with `-mavx2 -mfma` (AVXFLAGS in Makefile). All other files stay default ISA.
+- **Benchmark**: tensor_benchmark() runs scalar vs AVX2 comparison on 2048×2048 matvec, reports speedup.
+
+### X27: Falcon PIO Load
+Programmed I/O access to Falcon IMEM/DMEM via IMEMC/IMEMD registers.
+- **falcon_pio_load_imem(base, dst, data, size)**: Write dwords to IMEM. IMEMC = addr | (1<<24) auto-inc.
+- **falcon_pio_load_dmem(base, dst, data, size)**: Write dwords to DMEM. Same pattern.
+- **falcon_pio_read_imem/dmem**: Readback via auto-inc-on-read (bit 25).
+- **falcon_reset(base)**: Halt + clear mailboxes + verify.
+- **falcon_boot(base, boot_addr)**: BOOTVEC + STARTCPU.
+- **falcon_pio_selftest(base)**: Write pattern to DMEM, readback verify, restore zeros.
+- **Purpose**: Prerequisite for X28 (GBL load to IMEM for FWSEC-FRTS proper boot chain).
 
 ## Language
 The user speaks Spanish. Communicate in Spanish when appropriate.

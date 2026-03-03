@@ -584,4 +584,35 @@ fwsec_state_t *gpu_get_fwsec(void);  /* Get FWSEC state */
 /* Phase 10: FWSEC-FRTS execution + WPR2 creation */
 int  gsp_fwsec_frts(void);    /* Load FWSEC, execute FRTS, create WPR2 */
 
+/* ── X27: Falcon PIO Load ──────────────────────────────── */
+
+/* PIO write to Falcon IMEM via IMEMC/IMEMD registers.
+ * base: Falcon MMIO base (e.g. NV_PGSP_BASE).
+ * dst:  Byte offset in IMEM (must be 4-byte aligned).
+ * data: Source dwords.
+ * size: Byte count (must be multiple of 4). */
+void falcon_pio_load_imem(uint32_t base, uint32_t dst,
+                          const uint32_t *data, uint32_t size);
+
+/* PIO write to Falcon DMEM via DMEMC/DMEMD registers. */
+void falcon_pio_load_dmem(uint32_t base, uint32_t dst,
+                          const uint32_t *data, uint32_t size);
+
+/* PIO read from Falcon IMEM (for verification). */
+void falcon_pio_read_imem(uint32_t base, uint32_t src,
+                          uint32_t *buf, uint32_t size);
+
+/* PIO read from Falcon DMEM (for verification). */
+void falcon_pio_read_dmem(uint32_t base, uint32_t src,
+                          uint32_t *buf, uint32_t size);
+
+/* Halt Falcon, clear mailboxes, verify halted. Returns 0 on success. */
+int  falcon_reset(uint32_t base);
+
+/* Set BOOTVEC and start Falcon. Returns 0 on success (no poll). */
+int  falcon_boot(uint32_t base, uint32_t boot_addr);
+
+/* Self-test: PIO write + readback verify on IMEM/DMEM. Returns 0 on success. */
+int  falcon_pio_selftest(uint32_t base);
+
 #endif /* OSITOK_GPU_H */

@@ -20,6 +20,61 @@ extern void fb_puts(const char *s);
 extern void *mem_alloc_pages(uint64_t count);
 extern void  mem_free_pages(void *addr, uint64_t count);
 
+/* ── AVX2 Detection + Enable ────────────────────────── */
+
+static int avx2_detected = -1;  /* -1 = not checked yet */
+
+int tensor_avx2_detect(void)
+{
+    uint32_t eax, ebx, ecx, edx;
+
+    /* CPUID.1: check XSAVE (bit 26), AVX (bit 28), FMA (bit 12) */
+    __asm__ volatile("cpuid"
+        : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx)
+        : "a"(1), "c"(0));
+
+    int has_xsave = (ecx >> 26) & 1;
+    int has_avx   = (ecx >> 28) & 1;
+    int has_fma   = (ecx >> 12) & 1;
+
+    if (!has_xsave || !has_avx || !has_fma) {
+        avx2_detected = 0;
+        return 0;
+    }
+
+    /* Enable CR4.OSXSAVE (bit 18) if not already set */
+    int os_xsave = (ecx >> 27) & 1;
+    if (!os_xsave) {
+        uint64_t cr4;
+        __asm__ volatile("mov %%cr4, %0" : "=r"(cr4));
+        cr4 |= (1ULL << 18);
+        __asm__ volatile("mov %0, %%cr4" :: "r"(cr4));
+    }
+
+    /* Enable SSE + AVX state saving in XCR0 (bits 0=x87, 1=SSE, 2=AVX) */
+    uint32_t xcr0_lo, xcr0_hi;
+    __asm__ volatile("xgetbv" : "=a"(xcr0_lo), "=d"(xcr0_hi) : "c"(0));
+    if ((xcr0_lo & 0x7) != 0x7) {
+        xcr0_lo |= 0x7;
+        __asm__ volatile("xsetbv" :: "a"(xcr0_lo), "d"(xcr0_hi), "c"(0));
+    }
+
+    /* CPUID.7: check AVX2 (EBX bit 5) */
+    __asm__ volatile("cpuid"
+        : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx)
+        : "a"(7), "c"(0));
+
+    avx2_detected = (ebx >> 5) & 1;
+    return avx2_detected;
+}
+
+int tensor_has_avx2(void)
+{
+    if (avx2_detected < 0)
+        tensor_avx2_detect();
+    return avx2_detected;
+}
+
 /* ── Utility helpers ─────────────────────────────────── */
 
 static inline uint64_t rdtsc(void)
@@ -242,8 +297,8 @@ void dequant_q8_0(const void *src, float *dst, uint64_t n)
  * Inline dequant + dot product per row. Does NOT materialize
  * the full dequantized row in float, saving memory bandwidth.
  */
-void matvec_q4_0(float *out, const void *weight,
-                 const float *input, uint32_t rows, uint32_t cols)
+static void matvec_q4_0_scalar(float *out, const void *weight,
+                               const float *input, uint32_t rows, uint32_t cols)
 {
     const uint8_t *w = (const uint8_t *)weight;
     uint32_t blocks_per_row = cols / Q4_0_VALUES;
@@ -263,6 +318,15 @@ void matvec_q4_0(float *out, const void *weight,
         }
         out[r] = sum;
     }
+}
+
+void matvec_q4_0(float *out, const void *weight,
+                 const float *input, uint32_t rows, uint32_t cols)
+{
+    if (tensor_has_avx2())
+        matvec_q4_0_avx2(out, weight, input, rows, cols);
+    else
+        matvec_q4_0_scalar(out, weight, input, rows, cols);
 }
 
 void matvec_q8_0(float *out, const void *weight,
@@ -290,7 +354,7 @@ void matvec_q8_0(float *out, const void *weight,
  *  Vector operations
  * ══════════════════════════════════════════════════════════ */
 
-void rmsnorm(float *out, const float *x, const float *weight, uint32_t n)
+static void rmsnorm_scalar(float *out, const float *x, const float *weight, uint32_t n)
 {
     float ss = 0.0f;
     for (uint32_t i = 0; i < n; i++)
@@ -298,6 +362,14 @@ void rmsnorm(float *out, const float *x, const float *weight, uint32_t n)
     float rms = 1.0f / sqrtf_bare(ss / n + 1e-5f);
     for (uint32_t i = 0; i < n; i++)
         out[i] = x[i] * rms * weight[i];
+}
+
+void rmsnorm(float *out, const float *x, const float *weight, uint32_t n)
+{
+    if (tensor_has_avx2())
+        rmsnorm_avx2(out, x, weight, n);
+    else
+        rmsnorm_scalar(out, x, weight, n);
 }
 
 /* Numerically stable softmax (in-place) */
@@ -327,12 +399,20 @@ void silu_inplace(float *x, uint32_t n)
 
 void vec_add(float *out, const float *a, const float *b, uint32_t n)
 {
+    if (tensor_has_avx2()) {
+        vec_add_avx2(out, a, b, n);
+        return;
+    }
     for (uint32_t i = 0; i < n; i++)
         out[i] = a[i] + b[i];
 }
 
 void vec_mul(float *out, const float *a, const float *b, uint32_t n)
 {
+    if (tensor_has_avx2()) {
+        vec_mul_avx2(out, a, b, n);
+        return;
+    }
     for (uint32_t i = 0; i < n; i++)
         out[i] = a[i] * b[i];
 }
@@ -413,6 +493,12 @@ static uint32_t pages_for(uint32_t bytes)
 void tensor_benchmark(void)
 {
     serial_puts("\n[TENSOR] === Tensor Compute Engine ===\n");
+
+    /* Detect and enable AVX2 */
+    int avx2 = tensor_avx2_detect();
+    serial_puts("[TENSOR] AVX2+FMA: ");
+    serial_puts(avx2 ? "ENABLED\n" : "not available (scalar fallback)\n");
+
     fb_puts("\n Tensor engine self-test...\n");
 
     int pass = 1;
@@ -672,10 +758,75 @@ void tensor_benchmark(void)
         if (output)  mem_free_pages(output, v_pg);
     }
 
+    /* ── Perf: AVX2 vs scalar comparison (if AVX2 available) ── */
+    if (avx2) {
+        uint32_t rows = 2048, cols = 2048;
+        uint32_t w_bytes = rows * (cols / 32) * Q4_0_BLOCK_SIZE;
+        uint32_t w_pg   = pages_for(w_bytes);
+        uint32_t v_pg   = pages_for(cols * sizeof(float));
+
+        uint8_t *weights = (uint8_t *)mem_alloc_pages(w_pg);
+        float   *input2  = (float *)mem_alloc_pages(v_pg);
+        float   *out_s   = (float *)mem_alloc_pages(v_pg);
+        float   *out_a   = (float *)mem_alloc_pages(v_pg);
+
+        if (weights && input2 && out_s && out_a) {
+            fill_q4_0(weights, rows, cols);
+            for (uint32_t i = 0; i < cols; i++)
+                input2[i] = (float)((i % 7) + 1) * 0.1f;
+
+            /* Scalar path */
+            uint64_t ts0 = rdtsc();
+            matvec_q4_0_scalar(out_s, weights, input2, rows, cols);
+            uint64_t ts1 = rdtsc();
+
+            /* AVX2 path */
+            uint64_t ta0 = rdtsc();
+            matvec_q4_0_avx2(out_a, weights, input2, rows, cols);
+            uint64_t ta1 = rdtsc();
+
+            uint64_t scalar_ms = (ts1 - ts0) / 3000000;
+            uint64_t avx2_ms   = (ta1 - ta0) / 3000000;
+
+            serial_puts("[TENSOR] Perf: scalar=");
+            serial_putdec(scalar_ms);
+            serial_puts("ms  AVX2=");
+            serial_putdec(avx2_ms);
+            serial_puts("ms");
+            if (avx2_ms > 0) {
+                serial_puts("  speedup=");
+                serial_putdec(scalar_ms / avx2_ms);
+                serial_puts("x");
+            }
+            serial_puts("\n");
+
+            /* Verify AVX2 matches scalar */
+            float max_diff = 0.0f;
+            for (uint32_t i = 0; i < rows; i++) {
+                float d = out_s[i] - out_a[i];
+                if (d < 0) d = -d;
+                if (d > max_diff) max_diff = d;
+            }
+            serial_puts("[TENSOR] AVX2 vs scalar max diff: ");
+            serial_putfloat(max_diff, 6);
+            serial_puts(max_diff < 0.01f ? " OK\n" : " MISMATCH\n");
+            if (max_diff >= 0.01f) pass = 0;
+        }
+
+        if (weights) mem_free_pages(weights, w_pg);
+        if (input2)  mem_free_pages(input2, v_pg);
+        if (out_s)   mem_free_pages(out_s, v_pg);
+        if (out_a)   mem_free_pages(out_a, v_pg);
+    }
+
     /* ── Summary ─────────────────────────────────────── */
     if (pass) {
-        serial_puts("[TENSOR] Engine ready\n\n");
-        fb_puts(" Tensor engine: OK\n");
+        serial_puts("[TENSOR] Engine ready");
+        if (avx2) serial_puts(" (AVX2)");
+        serial_puts("\n\n");
+        fb_puts(" Tensor engine: OK");
+        if (avx2) fb_puts(" [AVX2]");
+        fb_puts("\n");
     } else {
         serial_puts("[TENSOR] Engine: SOME TESTS FAILED\n\n");
         fb_puts(" Tensor engine: ERRORS\n");

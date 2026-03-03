@@ -1379,6 +1379,184 @@ int gsp_boot(void)
     return gsp.boot_ack ? 0 : -1;
 }
 
+/* ══════════════════════════════════════════════════════════
+ *  X27: Falcon PIO Load
+ *
+ *  Programmed I/O write/read to Falcon IMEM/DMEM via IMEMC/IMEMD
+ *  and DMEMC/DMEMD registers. Used to load small bootstrap code
+ *  (Generic Bootloader) that then DMA-loads larger payloads.
+ *
+ *  Register format (envytools, nova-core):
+ *    Control (IMEMC/DMEMC):
+ *      bits 15:0 = byte address (must be 4-byte aligned)
+ *      bit 24    = auto-increment on write
+ *      bit 25    = auto-increment on read
+ *    Data (IMEMD/DMEMD):
+ *      Write/read dwords sequentially, address auto-increments.
+ *
+ *  Reference: nouveau nvkm_falcon_pio_wr(), nova-core Falcon::pio_wr()
+ * ══════════════════════════════════════════════════════════ */
+
+void falcon_pio_load_imem(uint32_t base, uint32_t dst,
+                          const uint32_t *data, uint32_t size)
+{
+    /* Set IMEMC: destination byte address | auto-increment on write */
+    gpu_reg_write(base + NV_FALCON_IMEMC, (dst & 0xFFFC) | (1 << 24));
+    wmb();
+
+    uint32_t dwords = size / 4;
+    for (uint32_t i = 0; i < dwords; i++)
+        gpu_reg_write(base + NV_FALCON_IMEMD, data[i]);
+    wmb();
+}
+
+void falcon_pio_load_dmem(uint32_t base, uint32_t dst,
+                          const uint32_t *data, uint32_t size)
+{
+    /* Set DMEMC: destination byte address | auto-increment on write */
+    gpu_reg_write(base + NV_FALCON_DMEMC, (dst & 0xFFFC) | (1 << 24));
+    wmb();
+
+    uint32_t dwords = size / 4;
+    for (uint32_t i = 0; i < dwords; i++)
+        gpu_reg_write(base + NV_FALCON_DMEMD, data[i]);
+    wmb();
+}
+
+void falcon_pio_read_imem(uint32_t base, uint32_t src,
+                          uint32_t *buf, uint32_t size)
+{
+    /* Set IMEMC: source byte address | auto-increment on read */
+    gpu_reg_write(base + NV_FALCON_IMEMC, (src & 0xFFFC) | (1 << 25));
+    wmb();
+    rmb();
+
+    uint32_t dwords = size / 4;
+    for (uint32_t i = 0; i < dwords; i++)
+        buf[i] = gpu_reg_read(base + NV_FALCON_IMEMD);
+}
+
+void falcon_pio_read_dmem(uint32_t base, uint32_t src,
+                          uint32_t *buf, uint32_t size)
+{
+    /* Set DMEMC: source byte address | auto-increment on read */
+    gpu_reg_write(base + NV_FALCON_DMEMC, (src & 0xFFFC) | (1 << 25));
+    wmb();
+    rmb();
+
+    uint32_t dwords = size / 4;
+    for (uint32_t i = 0; i < dwords; i++)
+        buf[i] = gpu_reg_read(base + NV_FALCON_DMEMD);
+}
+
+int falcon_reset(uint32_t base)
+{
+    /* Halt the Falcon */
+    gpu_reg_write(base + NV_FALCON_CPUCTL, NV_FALCON_CPUCTL_HALTED);
+    wmb();
+
+    /* Clear mailboxes */
+    gpu_reg_write(base + NV_FALCON_MAILBOX0, 0);
+    gpu_reg_write(base + NV_FALCON_MAILBOX1, 0);
+    wmb();
+
+    /* Verify halted */
+    rmb();
+    uint32_t cpuctl = gpu_reg_read(base + NV_FALCON_CPUCTL);
+    if (!(cpuctl & NV_FALCON_CPUCTL_HALTED)) {
+        serial_puts("[FALCON] Reset: not halted (CPUCTL=0x");
+        serial_puthex(cpuctl, 8);
+        serial_puts(")\n");
+        return -1;
+    }
+
+    return 0;
+}
+
+int falcon_boot(uint32_t base, uint32_t boot_addr)
+{
+    /* Set boot vector (byte address >> 8 for some Falcon versions,
+     * or direct byte address — depends on firmware. Use raw value
+     * and let caller decide the encoding.) */
+    gpu_reg_write(base + NV_FALCON_BOOTVEC, boot_addr);
+    wmb();
+
+    /* Start CPU */
+    gpu_reg_write(base + NV_FALCON_CPUCTL, NV_FALCON_CPUCTL_STARTCPU);
+    wmb();
+
+    return 0;
+}
+
+int falcon_pio_selftest(uint32_t base)
+{
+    gpu_probe_t *p = gpu_get_probe();
+    if (!p || !p->present || !p->gsp_present) {
+        serial_puts("[FALCON] PIO self-test: no GPU/GSP\n");
+        return -1;
+    }
+
+    serial_puts("[FALCON] PIO self-test on base 0x");
+    serial_puthex(base, 6);
+    serial_puts("...\n");
+
+    /* Halt first */
+    if (falcon_reset(base) < 0)
+        return -1;
+
+    /* Read HWCFG2 to get DMEM size */
+    uint32_t hwcfg2 = gpu_reg_read(base + NV_FALCON_HWCFG2);
+    uint32_t dmem_size = ((hwcfg2 & NV_FALCON_HWCFG2_DMEM_MASK) >>
+                           NV_FALCON_HWCFG2_DMEM_SHIFT) * 256;
+
+    if (dmem_size == 0) {
+        serial_puts("[FALCON] DMEM size = 0, cannot test PIO\n");
+        return -1;
+    }
+
+    serial_puts("[FALCON] DMEM size: ");
+    serial_putdec(dmem_size);
+    serial_puts(" bytes\n");
+
+    /* Test: write pattern to DMEM, read back and verify */
+    uint32_t test_data[4] = { 0xDEADBEEF, 0x05170000, 0xCAFEBABE, 0x12345678 };
+    uint32_t read_buf[4]  = { 0 };
+
+    /* Write 16 bytes at DMEM offset 0 */
+    falcon_pio_load_dmem(base, 0, test_data, 16);
+
+    /* Read back */
+    falcon_pio_read_dmem(base, 0, read_buf, 16);
+
+    int ok = 1;
+    for (int i = 0; i < 4; i++) {
+        if (read_buf[i] != test_data[i]) {
+            serial_puts("[FALCON] DMEM PIO mismatch at dword ");
+            serial_putdec(i);
+            serial_puts(": wrote 0x");
+            serial_puthex(test_data[i], 8);
+            serial_puts(" read 0x");
+            serial_puthex(read_buf[i], 8);
+            serial_puts("\n");
+            ok = 0;
+        }
+    }
+
+    /* Restore DMEM: write zeros to test area */
+    uint32_t zeros[4] = { 0 };
+    falcon_pio_load_dmem(base, 0, zeros, 16);
+
+    if (ok) {
+        serial_puts("[FALCON] PIO self-test: PASS\n");
+        fb_puts(" Falcon PIO: OK\n");
+    } else {
+        serial_puts("[FALCON] PIO self-test: FAIL\n");
+        fb_puts(" Falcon PIO: FAIL\n");
+    }
+
+    return ok ? 0 : -1;
+}
+
 gsp_state_t *gsp_get_state(void)
 {
     return &gsp;

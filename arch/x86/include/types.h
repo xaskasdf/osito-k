@@ -21,7 +21,7 @@ typedef signed long long    int64_t;
 
 typedef uint64_t            uintptr_t;
 typedef int64_t             intptr_t;
-typedef uint64_t            size_t;
+typedef __SIZE_TYPE__        size_t;  /* matches GCC's stddef.h, avoids conflict with immintrin.h */
 typedef int64_t             ssize_t;
 
 #if !defined(__bool_true_false_are_defined) && !defined(__cplusplus) && (__STDC_VERSION__ < 202311L)

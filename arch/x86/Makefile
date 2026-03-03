@@ -36,6 +36,9 @@ KCFLAGS  = -std=c11 -ffreestanding -fno-stack-protector -mno-red-zone \
            -Wall -Wextra -O2 -fPIE -fno-jump-tables -Iinclude -I../../include/common \
            -D__KERNEL_X86__=1
 
+# AVX2/FMA flags for tensor_avx2.c only (runtime CPUID dispatch in tensor.c)
+AVXFLAGS = $(KCFLAGS) -mavx2 -mfma
+
 LDFLAGS  = -nostdlib -shared -Bsymbolic \
            -T $(EFI_LDS) \
            -L$(EFI_LIB) \
@@ -50,7 +53,7 @@ BUILD    = build
 EFI_SRC  = boot/efi_main.c
 KERN_SRC = kernel/main.c kernel/serial.c kernel/framebuffer.c \
            kernel/pci.c kernel/memory.c kernel/net.c kernel/tensor.c \
-           kernel/inference.c
+           kernel/tensor_avx2.c kernel/inference.c
 DRV_SRC  = drivers/nvme.c drivers/i211.c drivers/gpu.c drivers/gsp.c
 FS_SRC   = fs/ositofs2.c fs/gpt.c fs/gguf.c
 
@@ -87,6 +90,10 @@ $(BUILD)/efi_main.o: boot/efi_main.c | $(BUILD)/boot
 # Kernel files (freestanding, no libc)
 $(BUILD)/kernel/%.o: kernel/%.c | $(BUILD)/kernel
 	$(CC) $(KCFLAGS) -c -o $@ $<
+
+# tensor_avx2.c needs AVX2/FMA flags (overrides pattern rule above)
+$(BUILD)/kernel/tensor_avx2.o: kernel/tensor_avx2.c | $(BUILD)/kernel
+	$(CC) $(AVXFLAGS) -c -o $@ $<
 
 # Drivers
 $(BUILD)/drivers/%.o: drivers/%.c | $(BUILD)/drivers
