@@ -74,6 +74,9 @@
 #define NV_FALCON_BOOTVEC          0x000104
 #define NV_FALCON_DMACTL           0x00010C
 #define NV_FALCON_DMATRFBASE      0x000110
+#define NV_FALCON_DMATRFMOFFS     0x000114   /* DMA destination offset (falcon IMEM/DMEM) */
+#define NV_FALCON_DMATRFCMD       0x000118   /* DMA transfer command (trigger) */
+#define NV_FALCON_DMATRFFBOFFS    0x00011C   /* DMA source offset (relative to DMATRFBASE) */
 #define NV_FALCON_IMEMC            0x000180
 #define NV_FALCON_IMEMD            0x000184
 #define NV_FALCON_DMEMC            0x0001C0
@@ -424,6 +427,11 @@ typedef struct {
 /* Falcon DMATRFBASE1 — high 32 bits for 64-bit DMA addressing */
 #define NV_FALCON_DMATRFBASE1  0x000128
 
+/* DMATRFCMD bit definitions (envytools, nova-core) */
+#define DMATRFCMD_IDLE         (1 << 1)   /* DMA engine idle */
+#define DMATRFCMD_IMEM         (1 << 4)   /* 1=IMEM target, 0=DMEM target */
+#define DMATRFCMD_SIZE_256B    (6 << 8)   /* Transfer size = 256 bytes */
+
 /* ── X28: FWSEC Internal Header + GBL Structures ─────────────── */
 
 /* FWSEC internal firmware header (at start of FWSEC blob from BIT).
@@ -677,6 +685,19 @@ int  falcon_boot(uint32_t base, uint32_t boot_addr);
 
 /* Self-test: PIO write + readback verify on IMEM/DMEM. Returns 0 on success. */
 int  falcon_pio_selftest(uint32_t base);
+
+/* ── X30: Falcon DMA Load + Two-Stage GSP Boot ──────────── */
+
+/* DMA-load firmware from system RAM to Falcon IMEM or DMEM.
+ * Uses DMATRFBASE/DMATRFCMD in 256-byte chunks.
+ * base:     Falcon MMIO base (e.g. NV_PGSP_BASE).
+ * src_phys: Physical address of source data in system RAM.
+ * dst_off:  Destination byte offset in falcon IMEM/DMEM.
+ * size:     Byte count (rounded up to 256B chunks).
+ * to_imem:  true = IMEM target, false = DMEM target.
+ * Returns 0 on success, -1 on timeout. */
+int  falcon_dma_load(uint32_t base, uint64_t src_phys,
+                     uint32_t dst_off, uint32_t size, bool to_imem);
 
 /* ── X29: Radix3 Page Tables + WPR Metadata + GSP Bootloader ── */
 

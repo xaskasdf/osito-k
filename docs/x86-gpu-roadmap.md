@@ -1,6 +1,6 @@
 # OsitoK x86-64 — GPU Compute Roadmap
 
-> Status: X1–X29 + X-CPU1 done. X30 next.
+> Status: X1–X30 + X-CPU1 done. X31 next.
 > Last updated: 2026-03-03
 
 ## Current State
@@ -12,7 +12,7 @@ X28 implemented the correct GBL-based FWSEC-FRTS boot sequence:
 - SEC2 target for Turing, GSP for Ampere+
 - Legacy VRAM+DMATRFBASE fallback preserved
 
-**Next**: X30 separates GSP bootloader for proper 2-stage boot via radix3 page tables.
+**Next**: X31 validates GSP-RM functional RPC with the proper boot chain in place.
 
 ---
 
@@ -25,7 +25,7 @@ The make-or-break phase. Without WPR2, GSP-RM cannot function.
 | **X27** | **Falcon PIO Load** — write code to IMEM/DMEM via IMEMC/IMEMD registers | ~150 | Done |
 | **X28** | **GBL extraction + FWSEC-FRTS via GBL** — extract GBL from VBIOS, PIO-load to IMEM, GBL DMA-loads FWSEC from sysmem, execute FRTS | ~350 | Done |
 | **X29** | **WPR2 metadata + Radix3 page tables** — build radix3 PT for GSP firmware, write WPR meta to VRAM | ~300 | Done |
-| **X30** | **GSP bootloader separation** — separate GSP bootloader from main firmware, proper 2-stage boot | ~250 | Medium |
+| **X30** | **Two-stage GSP boot** — Falcon DMA load, bootloader-first boot, WPR meta mailboxes, legacy fallback | ~250 | Done |
 | **X31** | **GSP-RM functional RPC** — with proper boot chain, existing X22-X23 RPC code should work | ~200 | Low |
 
 ### X27: Falcon PIO Load (prerequisite)

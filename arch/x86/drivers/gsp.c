@@ -42,6 +42,12 @@ static inline uint64_t rdtsc(void)
 
 static gsp_state_t gsp;
 
+/* X29 state (forward declarations — defined fully in X29 section) */
+static radix3_state_t radix3;
+static rm_riscv_ucode_desc_t bl_desc;
+static uint8_t *bl_data;
+static uint32_t bl_size;
+
 /* ── GSP Falcon Probe ────────────────────────────────────────── */
 
 int gsp_probe(void)
@@ -1596,11 +1602,253 @@ static int gsp_parse_elf(void)
 
 /* ── Phase 5: GSP Falcon Boot ────────────────────────────────── */
 
+/* ── X30: Two-stage boot via bootloader + radix3 ── */
+
+static int gsp_boot_v2(void)
+{
+    gpu_probe_t *p = gpu_get_probe();
+
+    if (!bl_data || bl_size == 0) {
+        serial_puts("[GSP] Boot v2: no bootloader extracted\n");
+        return -1;
+    }
+    if (!radix3.built) {
+        serial_puts("[GSP] Boot v2: radix3 not built\n");
+        return -1;
+    }
+
+    serial_puts("[GSP] Boot v2: === Two-stage bootloader boot ===\n");
+
+    /* ── Step 1: Reset GSP Falcon ── */
+    serial_puts("[GSP] Boot v2: resetting GSP Falcon...\n");
+    if (falcon_reset(NV_PGSP_BASE) < 0) {
+        serial_puts("[GSP] Boot v2: reset failed\n");
+        return -1;
+    }
+
+    /* ── Step 2: DMA-load bootloader to GSP IMEM ── */
+    uint64_t bl_phys = (uint64_t)(uintptr_t)bl_data;
+
+    serial_puts("[GSP] Boot v2: DMA loading bootloader (");
+    serial_putdec(bl_size);
+    serial_puts(" bytes) to GSP IMEM...\n");
+
+    if (falcon_dma_load(NV_PGSP_BASE, bl_phys, 0, bl_size, true) < 0) {
+        serial_puts("[GSP] Boot v2: DMA load to IMEM failed\n");
+        return -1;
+    }
+
+    /* ── Step 3: Load bootloader data to DMEM (if present) ── */
+    if (bl_desc.bootloader_param_size > 0 &&
+        bl_desc.bootloader_param_offset + bl_desc.bootloader_param_size <= gsp.fw_size) {
+        uint8_t *param_data = (uint8_t *)gsp.fw_data + bl_desc.bootloader_param_offset;
+        uint64_t param_phys = (uint64_t)(uintptr_t)param_data;
+
+        serial_puts("[GSP] Boot v2: DMA loading BL params (");
+        serial_putdec(bl_desc.bootloader_param_size);
+        serial_puts(" bytes) to DMEM...\n");
+
+        if (falcon_dma_load(NV_PGSP_BASE, param_phys, 0,
+                            bl_desc.bootloader_param_size, false) < 0) {
+            serial_puts("[GSP] Boot v2: DMA load to DMEM failed\n");
+            return -1;
+        }
+    }
+
+    /* ── Step 4: Write queue init args to VRAM ── */
+    if (gsp.queues_ready)
+        gsp_queue_write_args();
+
+    /* ── Step 5: Set BOOTVEC to bootloader entry (0) ── */
+    gpu_reg_write(NV_PGSP_BASE + NV_FALCON_BOOTVEC, 0);
+    wmb();
+
+    /* ── Step 6: Set MAILBOX0/1 to WPR metadata address in VRAM ── */
+    uint64_t vram_bytes = (uint64_t)p->vram_size_mb * 1024 * 1024;
+    uint64_t wpr_meta_addr = vram_bytes - WPR_META_VRAM_OFFSET_FROM_END;
+
+    gpu_reg_write(NV_PGSP_BASE + NV_FALCON_MAILBOX0,
+                  (uint32_t)(wpr_meta_addr & 0xFFFFFFFF));
+    gpu_reg_write(NV_PGSP_BASE + NV_FALCON_MAILBOX1,
+                  (uint32_t)(wpr_meta_addr >> 32));
+    wmb();
+
+    serial_puts("[GSP] Boot v2: BOOTVEC=0, MAILBOX0/1=0x");
+    serial_puthex(wpr_meta_addr, 16);
+    serial_puts(" (WPR meta)\n");
+
+    /* ── Step 7: Start CPU ── */
+    serial_puts("[GSP] Boot v2: starting GSP...\n");
+    gpu_reg_write(NV_PGSP_BASE + NV_FALCON_CPUCTL, NV_FALCON_CPUCTL_STARTCPU);
+    wmb();
+    gsp.booted = true;
+
+    /* ── Step 8: Poll mailbox (2s timeout) ── */
+    uint64_t t0 = rdtsc();
+    uint64_t timeout_cycles = 6000000000ULL;  /* ~2s @ 3GHz */
+    uint32_t mbox0_initial = (uint32_t)(wpr_meta_addr & 0xFFFFFFFF);
+    uint32_t mbox0 = mbox0_initial;
+    bool responded = false;
+
+    while (1) {
+        rmb();
+        mbox0 = gpu_reg_read(NV_PGSP_BASE + NV_FALCON_MAILBOX0);
+        if (mbox0 != mbox0_initial) {
+            responded = true;
+            break;
+        }
+
+        /* Also check if Falcon halted (bootloader done or error) */
+        uint32_t cpuctl = gpu_reg_read(NV_PGSP_BASE + NV_FALCON_CPUCTL);
+        if ((cpuctl & NV_FALCON_CPUCTL_HALTED) && mbox0 != mbox0_initial) {
+            responded = true;
+            break;
+        }
+
+        if (rdtsc() - t0 >= timeout_cycles)
+            break;
+    }
+
+    uint64_t elapsed_ms = (rdtsc() - t0) / 3000000;
+    uint32_t final_cpuctl = gpu_reg_read(NV_PGSP_BASE + NV_FALCON_CPUCTL);
+    uint32_t mbox1 = gpu_reg_read(NV_PGSP_BASE + NV_FALCON_MAILBOX1);
+
+    serial_puts("[GSP] Boot v2: ");
+    serial_puts(responded ? "responded" : "TIMEOUT");
+    serial_puts(" after ~");
+    serial_putdec(elapsed_ms);
+    serial_puts(" ms\n");
+    serial_puts("[GSP] Boot v2: CPUCTL=0x");
+    serial_puthex(final_cpuctl, 8);
+    serial_puts(" MBOX0=0x");
+    serial_puthex(mbox0, 8);
+    serial_puts(" MBOX1=0x");
+    serial_puthex(mbox1, 8);
+    serial_puts("\n");
+
+    gsp.boot_status = mbox0;
+    gsp.boot_ack = responded;
+
+    if (responded) {
+        serial_puts("[GSP] Boot v2: GSP bootloader responded!\n");
+        fb_puts(" GSP boot v2: OK mbox=0x");
+        fb_puthex(mbox0, 8);
+        fb_puts("\n");
+    } else {
+        serial_puts("[GSP] Boot v2: timeout — may need SEC2 booter chain\n");
+        fb_puts(" GSP boot v2: timeout\n");
+    }
+
+    serial_puts("[GSP] Boot v2: === end ===\n");
+    return responded ? 0 : -1;
+}
+
+/* ── Legacy direct boot (X20 original) ── */
+
+static int gsp_boot_legacy(void)
+{
+    /* Pre-conditions */
+    if (!gsp.fw_uploaded) {
+        serial_puts("[GSP] Legacy boot: firmware not in VRAM\n");
+        return -1;
+    }
+    if (gsp.elf_entry == 0) {
+        serial_puts("[GSP] Legacy boot: ELF entry point is 0\n");
+        return -1;
+    }
+
+    serial_puts("[GSP] Legacy boot: direct DMATRFBASE+BOOTVEC...\n");
+
+    /* ── Step 1: Halt Falcon ── */
+    gpu_reg_write(NV_PGSP_BASE + NV_FALCON_CPUCTL, NV_FALCON_CPUCTL_HALTED);
+    wmb();
+
+    /* ── Step 2: Write queue init args to VRAM ── */
+    if (gsp.queues_ready)
+        gsp_queue_write_args();
+
+    /* ── Step 3: Set mailboxes to shared memory address ── */
+    if (gsp.queues_ready) {
+        gpu_reg_write(NV_PGSP_BASE + NV_FALCON_MAILBOX0,
+                      (uint32_t)(gsp.shm_phys & 0xFFFFFFFF));
+        gpu_reg_write(NV_PGSP_BASE + NV_FALCON_MAILBOX1,
+                      (uint32_t)(gsp.shm_phys >> 32));
+    } else {
+        gpu_reg_write(NV_PGSP_BASE + NV_FALCON_MAILBOX0, 0);
+        gpu_reg_write(NV_PGSP_BASE + NV_FALCON_MAILBOX1, 0);
+    }
+    wmb();
+
+    /* ── Step 4: Set DMATRFBASE ── */
+    uint32_t dma_base = (uint32_t)(gsp.vram_offset >> 8);
+    gpu_reg_write(NV_PGSP_BASE + NV_FALCON_DMATRFBASE, dma_base);
+    wmb();
+
+    /* ── Step 5: Set BOOTVEC ── */
+    uint32_t bootvec = (uint32_t)(gsp.elf_entry >> 8);
+    gpu_reg_write(NV_PGSP_BASE + NV_FALCON_BOOTVEC, bootvec);
+    wmb();
+
+    serial_puts("[GSP] Legacy: DMATRFBASE=0x");
+    serial_puthex(dma_base, 8);
+    serial_puts(" BOOTVEC=0x");
+    serial_puthex(bootvec, 8);
+    serial_puts("\n");
+
+    /* ── Step 6: Start CPU ── */
+    gpu_reg_write(NV_PGSP_BASE + NV_FALCON_CPUCTL, NV_FALCON_CPUCTL_STARTCPU);
+    wmb();
+    gsp.booted = true;
+
+    /* ── Step 7: Poll mailbox (timeout ~1 second @ 3GHz) ── */
+    serial_puts("[GSP] Legacy: polling mailbox (timeout 1s)...\n");
+
+    uint32_t mbox0_initial = gpu_reg_read(NV_PGSP_BASE + NV_FALCON_MAILBOX0);
+    uint64_t t0 = rdtsc();
+    uint64_t timeout_cycles = 3000000000ULL;  /* ~1s @ 3GHz */
+    uint32_t mbox0 = mbox0_initial;
+
+    while (1) {
+        rmb();
+        mbox0 = gpu_reg_read(NV_PGSP_BASE + NV_FALCON_MAILBOX0);
+        if (mbox0 != mbox0_initial)
+            break;
+        if (rdtsc() - t0 >= timeout_cycles)
+            break;
+    }
+
+    uint64_t elapsed_ms = (rdtsc() - t0) / 3000000;
+    gsp.boot_status = mbox0;
+    gsp.boot_ack = (mbox0 != mbox0_initial);
+
+    serial_puts("[GSP] Legacy: ");
+    serial_puts(gsp.boot_ack ? "responded" : "TIMEOUT");
+    serial_puts(" after ~");
+    serial_putdec(elapsed_ms);
+    serial_puts(" ms, MBOX0=0x");
+    serial_puthex(mbox0, 8);
+    serial_puts("\n");
+
+    if (gsp.boot_ack) {
+        fb_puts(" GSP legacy: OK\n");
+    } else {
+        uint32_t cpuctl = gpu_reg_read(NV_PGSP_BASE + NV_FALCON_CPUCTL);
+        serial_puts("[GSP] Legacy: CPUCTL=0x");
+        serial_puthex(cpuctl, 8);
+        serial_puts("\n");
+        fb_puts(" GSP legacy: timeout\n");
+    }
+
+    return gsp.boot_ack ? 0 : -1;
+}
+
+/* ── gsp_boot: dispatcher — try v2 (bootloader), fallback to legacy ── */
+
 int gsp_boot(void)
 {
     gpu_probe_t *p = gpu_get_probe();
     if (!p || !p->present || !p->gsp_present) {
-        return -1;   /* No GPU/GSP — silent */
+        return -1;
     }
 
     /* Parse ELF from firmware in RAM */
@@ -1617,141 +1865,21 @@ int gsp_boot(void)
     gsp_extract_bootloader();
     gsp_write_wpr_meta();
 
-    /* Pre-conditions */
-    if (!gsp.fw_uploaded) {
-        serial_puts("[GSP] Firmware not in VRAM, skipping boot\n");
-        return -1;
-    }
-    if (gsp.elf_entry == 0) {
-        serial_puts("[GSP] ELF entry point is 0, skipping boot\n");
-        return -1;
+    /* ── Try two-stage bootloader boot (X30) ── */
+    int ret = gsp_boot_v2();
+
+    if (ret < 0) {
+        serial_puts("[GSP] Boot v2 failed, falling back to legacy boot...\n");
+        ret = gsp_boot_legacy();
     }
 
-    /* ── Step 1: Halt Falcon ── */
-    serial_puts("[GSP] Boot: halting Falcon...\n");
-    gpu_reg_write(NV_PGSP_BASE + NV_FALCON_CPUCTL, NV_FALCON_CPUCTL_HALTED);
-    wmb();
-
-    /* ── Step 2: Write queue init args to VRAM (before clearing mailboxes) ── */
-    if (gsp.queues_ready)
-        gsp_queue_write_args();
-
-    /* ── Step 3: Set mailboxes to shared memory address (for GSP to find queues) ── */
-    if (gsp.queues_ready) {
-        gpu_reg_write(NV_PGSP_BASE + NV_FALCON_MAILBOX0,
-                      (uint32_t)(gsp.shm_phys & 0xFFFFFFFF));
-        gpu_reg_write(NV_PGSP_BASE + NV_FALCON_MAILBOX1,
-                      (uint32_t)(gsp.shm_phys >> 32));
-    } else {
-        gpu_reg_write(NV_PGSP_BASE + NV_FALCON_MAILBOX0, 0);
-        gpu_reg_write(NV_PGSP_BASE + NV_FALCON_MAILBOX1, 0);
-    }
-    wmb();
-
-    /* ── Step 4: Set DMATRFBASE (firmware location in VRAM, >> 8) ── */
-    uint32_t dma_base = (uint32_t)(gsp.vram_offset >> 8);
-    gpu_reg_write(NV_PGSP_BASE + NV_FALCON_DMATRFBASE, dma_base);
-    wmb();
-
-    /* ── Step 5: Set BOOTVEC (entry point >> 8) ── */
-    uint32_t bootvec = (uint32_t)(gsp.elf_entry >> 8);
-    gpu_reg_write(NV_PGSP_BASE + NV_FALCON_BOOTVEC, bootvec);
-    wmb();
-
-    serial_puts("[GSP] Boot: DMATRFBASE=0x");
-    serial_puthex(dma_base, 8);
-    serial_puts(" BOOTVEC=0x");
-    serial_puthex(bootvec, 8);
-    serial_puts("\n");
-
-    /* ── Step 6: Start CPU ── */
-    serial_puts("[GSP] Boot: starting CPU...\n");
-    gpu_reg_write(NV_PGSP_BASE + NV_FALCON_CPUCTL, NV_FALCON_CPUCTL_STARTCPU);
-    wmb();
-    gsp.booted = true;
-
-    /* ── Step 7: Poll mailbox (timeout ~1 second @ 3GHz) ── */
-    serial_puts("[GSP] Boot: polling mailbox (timeout 1s)...\n");
-
-    /* Remember what we wrote so we detect GSP changing it */
-    uint32_t mbox0_initial = gpu_reg_read(NV_PGSP_BASE + NV_FALCON_MAILBOX0);
-
-    uint64_t t0 = rdtsc();
-    uint64_t timeout_cycles = 3000000000ULL;  /* ~1s @ 3GHz */
-    uint32_t mbox0 = mbox0_initial;
-
-    while (1) {
-        rmb();
-        mbox0 = gpu_reg_read(NV_PGSP_BASE + NV_FALCON_MAILBOX0);
-        if (mbox0 != mbox0_initial)
-            break;
-
-        uint64_t elapsed = rdtsc() - t0;
-        if (elapsed >= timeout_cycles)
-            break;
-    }
-
-    uint64_t t1 = rdtsc();
-    uint64_t elapsed_cycles = t1 - t0;
-    uint64_t elapsed_ms = elapsed_cycles / 3000000;
-
-    gsp.boot_status = mbox0;
-    gsp.boot_ack = (mbox0 != mbox0_initial);
-
-    if (gsp.boot_ack) {
-        /* Success — GSP responded */
-        serial_puts("[GSP] Boot: mailbox0=0x");
-        serial_puthex(mbox0, 8);
-        serial_puts(" after ~");
-        serial_putdec(elapsed_ms);
-        serial_puts(" ms (");
-        serial_putdec(elapsed_cycles / 1000000);
-        serial_puts("M cycles)\n");
-
-        uint32_t cpuctl = gpu_reg_read(NV_PGSP_BASE + NV_FALCON_CPUCTL);
-        serial_puts("[GSP] Boot: GSP alive! CPUCTL=0x");
-        serial_puthex(cpuctl, 8);
-        serial_puts("\n");
-
-        fb_puts(" GSP: boot OK, mailbox=0x");
-        fb_puthex(mbox0, 8);
-        fb_puts("\n");
-    } else {
-        /* Timeout — dump diagnostics */
-        serial_puts("[GSP] Boot: TIMEOUT after ");
-        serial_putdec(elapsed_ms);
-        serial_puts(" ms\n");
-
-        uint32_t cpuctl = gpu_reg_read(NV_PGSP_BASE + NV_FALCON_CPUCTL);
-        uint32_t mbox1  = gpu_reg_read(NV_PGSP_BASE + NV_FALCON_MAILBOX1);
-
-        serial_puts("[GSP] Boot: CPUCTL=0x");
-        serial_puthex(cpuctl, 8);
-        serial_puts(" (");
-        if (cpuctl & NV_FALCON_CPUCTL_HALTED)  serial_puts("HALTED");
-        if ((cpuctl & NV_FALCON_CPUCTL_HALTED) &&
-            (cpuctl & NV_FALCON_CPUCTL_STOPPED)) serial_puts("+");
-        if (cpuctl & NV_FALCON_CPUCTL_STOPPED) serial_puts("STOPPED");
-        if (!(cpuctl & (NV_FALCON_CPUCTL_HALTED | NV_FALCON_CPUCTL_STOPPED)))
-            serial_puts("RUNNING");
-        serial_puts(") Mailbox0=0x");
-        serial_puthex(mbox0, 8);
-        serial_puts(" Mailbox1=0x");
-        serial_puthex(mbox1, 8);
-        serial_puts("\n");
-
-        serial_puts("[GSP] Boot: GSP did not respond — firmware may require additional init\n");
-
-        fb_puts(" GSP: boot timeout\n");
-    }
-
-    /* ── Post-boot: RPC init sequence (poll INIT_DONE, query static info) ── */
+    /* ── Post-boot: RPC init sequence ── */
     if (gsp.queues_ready) {
         gsp_rpc_init();
-        gsp_rm_init();    /* X23: RM init sequence */
+        gsp_rm_init();
     }
 
-    return gsp.boot_ack ? 0 : -1;
+    return ret;
 }
 
 /* ══════════════════════════════════════════════════════════
@@ -1933,6 +2061,94 @@ int falcon_pio_selftest(uint32_t base)
 }
 
 /* ══════════════════════════════════════════════════════════
+ *  X30: Falcon DMA Load
+ *
+ *  Load firmware from system RAM to Falcon IMEM/DMEM using the
+ *  Falcon's DMA engine (DMATRFBASE/DMATRFCMD). Transfers in
+ *  256-byte chunks with idle polling between each.
+ *
+ *  Reference: nova-core falcon.load(), nouveau nvkm_falcon_load()
+ * ══════════════════════════════════════════════════════════ */
+
+int falcon_dma_load(uint32_t base, uint64_t src_phys,
+                    uint32_t dst_off, uint32_t size, bool to_imem)
+{
+    if (size == 0) return 0;
+
+    /* Program FBIF TRANSCFG for coherent system memory DMA */
+    gpu_reg_write(base + NV_PFALCON_FBIF_TRANSCFG,
+                  FBIF_TRANSCFG_TARGET_COHERENT_SYSMEM);
+    wmb();
+
+    /* Set DMA base address (physical >> 8) */
+    gpu_reg_write(base + NV_FALCON_DMATRFBASE,
+                  (uint32_t)((src_phys >> 8) & 0xFFFFFFFF));
+    gpu_reg_write(base + NV_FALCON_DMATRFBASE1,
+                  (uint32_t)(src_phys >> 40));
+    wmb();
+
+    /* Transfer in 256-byte chunks */
+    uint32_t cmd_flags = DMATRFCMD_SIZE_256B;
+    if (to_imem)
+        cmd_flags |= DMATRFCMD_IMEM;
+
+    uint32_t chunks = (size + 255) / 256;
+
+    for (uint32_t i = 0; i < chunks; i++) {
+        uint32_t chunk_off = i * 256;
+
+        /* Destination offset in falcon IMEM/DMEM */
+        gpu_reg_write(base + NV_FALCON_DMATRFMOFFS, dst_off + chunk_off);
+        /* Source offset relative to DMATRFBASE */
+        gpu_reg_write(base + NV_FALCON_DMATRFFBOFFS, chunk_off);
+        wmb();
+
+        /* Trigger DMA transfer */
+        gpu_reg_write(base + NV_FALCON_DMATRFCMD, cmd_flags);
+        wmb();
+
+        /* Poll for idle (timeout ~10ms per chunk @ 3GHz) */
+        uint64_t t0 = rdtsc();
+        uint64_t timeout = 30000000ULL;  /* ~10ms @ 3GHz */
+        bool idle = false;
+
+        while (1) {
+            rmb();
+            uint32_t cmd = gpu_reg_read(base + NV_FALCON_DMATRFCMD);
+            if (cmd & DMATRFCMD_IDLE) {
+                idle = true;
+                break;
+            }
+            if (rdtsc() - t0 >= timeout)
+                break;
+        }
+
+        if (!idle) {
+            serial_puts("[FALCON] DMA load timeout at chunk ");
+            serial_putdec(i);
+            serial_puts("/");
+            serial_putdec(chunks);
+            serial_puts("\n");
+            return -1;
+        }
+    }
+
+    serial_puts("[FALCON] DMA load: ");
+    serial_putdec(size);
+    serial_puts(" bytes (");
+    serial_putdec(chunks);
+    serial_puts(" chunks) to ");
+    serial_puts(to_imem ? "IMEM" : "DMEM");
+    serial_puts("+0x");
+    serial_puthex(dst_off, 4);
+    serial_puts(" from phys 0x");
+    serial_puthex(src_phys, 16);
+    serial_puts("\n");
+
+    return 0;
+}
+
+/* ══════════════════════════════════════════════════════════
  *  X29: Radix3 Page Tables + WPR Metadata + Bootloader
  *
  *  Build 3-level page tables mapping firmware at GSP virtual
@@ -1941,11 +2157,6 @@ int falcon_pio_selftest(uint32_t base)
  *
  *  Reference: nouveau nvkm_gsp_radix3_sg, nova-core map_into_lvl()
  * ══════════════════════════════════════════════════════════ */
-
-static radix3_state_t radix3;
-static rm_riscv_ucode_desc_t bl_desc;
-static uint8_t *bl_data;       /* Bootloader copy in page-aligned RAM */
-static uint32_t bl_size;
 
 int gsp_build_radix3(void)
 {
