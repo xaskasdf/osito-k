@@ -221,6 +221,8 @@ typedef struct {
 #define GSP_RM_DEVICE_HANDLE     0xDE1D0000
 #define GSP_RM_SUBDEVICE_HANDLE  0x5D1D0000
 #define GSP_RM_VASPACE_HANDLE    0x90F10000
+#define GSP_RM_TSG_HANDLE        0xA06C0000
+#define GSP_RM_CHAN_HANDLE       0xF1F00000
 
 /* ── RM Class IDs (NVIDIA RM Object Classes) ──────────────── */
 
@@ -230,7 +232,7 @@ typedef struct {
 #define FERMI_VASPACE_A         0x90F1
 #define KEPLER_CHANNEL_GROUP_A  0xA06C
 #define TURING_CHANNEL_GPFIFO_A 0xC46F
-#define AMPERE_CHANNEL_GPFIFO_A 0xC56F
+#define AMPERE_CHANNEL_GPFIFO_A 0xC56F  /* Also used by Ada Lovelace */
 
 /* ── X32: Generic RM Alloc/Control Structures ─────────────── */
 
@@ -279,6 +281,122 @@ typedef struct {
 
 #define NV_VASPACE_ALLOCATION_INDEX_GPU_NEW             0x00
 #define NV_VASPACE_ALLOCATION_FLAGS_IS_EXTERNALLY_OWNED (1 << 3)
+
+/* ── X33: Channel + GPFIFO Structures ─────────────────────── */
+
+/* NV2080 engine types (engine.h, verified) */
+#define NV2080_ENGINE_TYPE_NULL   0x00
+#define NV2080_ENGINE_TYPE_GR0    0x01   /* Graphics/Compute */
+#define NV2080_ENGINE_TYPE_COPY0  0x09   /* Copy Engine 0 */
+
+/* Address space types for NV_MEMORY_DESC_PARAMS (verified from nouveau r535) */
+#define ADDR_FBMEM    1   /* Framebuffer / VRAM */
+#define ADDR_SYSMEM   2   /* System memory (host RAM) */
+
+/* Cache attributes */
+#define NV_MEMORY_UNCACHED  0
+#define NV_MEMORY_CACHED    1
+
+/* NV_MEMORY_DESC_PARAMS — memory descriptor for channel allocations */
+typedef struct {
+    uint64_t base;           /* Physical address */
+    uint64_t size;           /* Size in bytes */
+    uint32_t addressSpace;   /* ADDR_SYSMEM or ADDR_FBMEM */
+    uint32_t cacheAttrib;    /* NV_MEMORY_UNCACHED/CACHED */
+} nv_mem_desc_t;             /* 24 bytes */
+
+/* NV_CHANNEL_GROUP_ALLOCATION_PARAMETERS (KEPLER_CHANNEL_GROUP_A 0xA06C).
+ * Reference: open-gpu-kernel-modules alloc_channel.h */
+typedef struct {
+    uint32_t hObjectError;          /* Error notifier handle (0) */
+    uint32_t hObjectEccError;       /* ECC error notifier (0) */
+    uint32_t hVASpace;              /* VA space handle */
+    uint32_t engineType;            /* NV2080_ENGINE_TYPE_* */
+    uint32_t bIsCallingContextVgpuPlugin;  /* false (0) */
+} nv_tsg_alloc_params_t;           /* 20 bytes */
+
+/* NV_CHANNEL_ALLOC_PARAMS (TURING/AMPERE/ADA_CHANNEL_GPFIFO_A).
+ * Full wire-format struct. Reference: open-gpu-kernel-modules alloc_channel.h */
+#define NV_MAX_SUBDEVICES  8
+typedef struct {
+    uint32_t hObjectError;                         /* 0:   Error notifier handle */
+    uint32_t hObjectBuffer;                        /* 4:   Unused */
+    uint64_t gpFifoOffset;                         /* 8:   Physical addr of GPFIFO ring */
+    uint32_t gpFifoEntries;                        /* 16:  Number of GPFIFO entries */
+    uint32_t flags;                                /* 20:  NVOS04_FLAGS_* */
+    uint32_t hContextShare;                        /* 24:  Context share handle (0) */
+    uint32_t hVASpace;                             /* 28:  VA space handle */
+    uint32_t hUserdMemory[NV_MAX_SUBDEVICES];      /* 32:  USERD memory handles (0) */
+    uint64_t userdOffset[NV_MAX_SUBDEVICES];       /* 64:  USERD offsets (0) */
+    uint32_t engineType;                           /* 128: NV2080_ENGINE_TYPE_* */
+    uint32_t cid;                                  /* 132: Channel ID */
+    uint32_t subDeviceId;                          /* 136: Subdevice index (0) */
+    uint32_t hObjectEccError;                      /* 140: ECC error handle (0) */
+    nv_mem_desc_t instanceMem;                     /* 144: Instance memory (RAMFC) */
+    nv_mem_desc_t userdMem;                        /* 168: User submit data */
+    nv_mem_desc_t ramfcMem;                        /* 192: RAMFC (often = instanceMem) */
+    nv_mem_desc_t mthdbufMem;                      /* 216: Method buffer */
+    uint32_t hPhysChannelGroup;                    /* 240: Physical channel group (0) */
+    uint32_t internalFlags;                        /* 244: Internal flags (0) */
+    nv_mem_desc_t errorNotifierMem;                /* 248: Error notifier memory */
+    nv_mem_desc_t eccErrorNotifierMem;             /* 272: ECC error notifier */
+    uint32_t ProcessID;                            /* 296: Process ID (0) */
+    uint32_t SubProcessID;                         /* 300: Sub-process ID (0) */
+    uint32_t encryptIv[3];                         /* 304: Encryption IV (0) */
+    uint32_t decryptIv[3];                         /* 316: Decryption IV (0) */
+    uint32_t hmacNonce[8];                         /* 328: HMAC nonce (0) */
+} nv_chan_alloc_params_t;                          /* 360 bytes */
+
+/* NVOS04 channel flags */
+#define NVOS04_FLAGS_CHANNEL_TYPE_PHYSICAL   0
+#define NVOS04_FLAGS_PRIVILEGED_CHANNEL      (1 << 5)
+
+/* GPFIFO entry format (8 bytes each, clc36f.h Volta+).
+ * Word 0: bit 0 = FETCH (0=unconditional), bits 31:2 = addr[31:2]
+ * Word 1: bits 7:0 = addr[39:32], bit 8 = PRIV, bit 9 = LEVEL,
+ *          bits 30:10 = length in dwords, bit 31 = SYNC */
+#define GPFIFO_ENTRY_COUNT  512     /* 512 entries × 8B = 4KB */
+
+typedef struct {
+    uint32_t entry_lo;    /* bit 0=FETCH, bits 31:2 = addr[31:2] */
+    uint32_t entry_hi;    /* bits 7:0=addr[39:32], bit 8=PRIV, bits 30:10=LEN(dw) */
+} gpfifo_entry_t;         /* 8 bytes */
+
+/* Build a GPFIFO entry pointing to a pushbuffer segment */
+static inline void gpfifo_make_entry(gpfifo_entry_t *e, uint64_t addr, uint32_t len_bytes)
+{
+    e->entry_lo = (uint32_t)(addr & 0xFFFFFFFC);  /* addr[31:2], FETCH=0 (unconditional) */
+    e->entry_hi = (uint32_t)((addr >> 32) & 0xFF) /* addr[39:32] */
+                | ((len_bytes / 4) << 10);         /* length in dwords */
+}
+
+/* USERD control offsets (Volta+ Nvc36fControl, 512B mapped page) */
+#define USERD_GP_GET   0x88   /* GPFIFO get pointer (RO, updated by GPU) */
+#define USERD_GP_PUT   0x8C   /* GPFIFO put pointer (RW, written by CPU) */
+
+/* Channel state (managed by host) */
+typedef struct {
+    /* GPFIFO ring buffer */
+    gpfifo_entry_t *gpfifo;         /* GPFIFO ring (page-aligned) */
+    uint64_t        gpfifo_phys;    /* Physical address */
+    uint32_t        gpfifo_entries; /* Entry count (512) */
+    uint32_t        gp_put;         /* Next write index */
+
+    /* Instance memory (RAMFC — channel control block in VRAM or sysmem) */
+    void           *inst_mem;       /* Page-aligned */
+    uint64_t        inst_phys;
+
+    /* USERD (user submit data — GP_PUT/GP_GET doorbell area) */
+    void           *userd_mem;      /* Page-aligned */
+    uint64_t        userd_phys;
+
+    /* RM handles */
+    uint32_t        tsg_handle;     /* TSG (channel group) RM handle */
+    uint32_t        chan_handle;    /* Channel RM handle */
+    uint32_t        chan_class;     /* Channel class (gen-dependent) */
+
+    bool            allocated;      /* Channel successfully allocated */
+} channel_state_t;
 
 /* ── GSP-RM Payload Structures (Phase 8) ──────────────────── */
 
@@ -712,6 +830,10 @@ int  gsp_rm_alloc(uint32_t hParent, uint32_t hObject, uint32_t hClass,
                   const void *params, uint32_t params_size);
 int  gsp_rm_control(uint32_t hObject, uint32_t cmd,
                     const void *params, uint32_t params_size);
+
+/* X33: Channel + GPFIFO */
+int  gsp_channel_init(void);          /* Allocate TSG + channel + GPFIFO */
+channel_state_t *gsp_get_channel(void);  /* Get channel state */
 
 /* Phase 9: VBIOS read + BIT parse + FWSEC extraction */
 int  gpu_read_vbios(void);           /* Read VBIOS from VRAM via PRAMIN */
