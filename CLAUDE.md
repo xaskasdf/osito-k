@@ -120,6 +120,10 @@ arch/x86/kernel/memory.c            Physical memory manager (bitmap, 4KB pages)
 arch/x86/drivers/nvme.c             Minimal NVMe driver (admin+IO queues, read-only)
 arch/x86/drivers/gpu.h              GPU abstraction placeholder (GSP/custom/Vulkan)
 arch/x86/fs/ositofs2.c              OsitoFS v2 bare-metal driver (mount, list, read)
+arch/x86/fs/gpt.h                   GPT structs (UEFI spec) + API
+arch/x86/fs/gpt.c                   GPT parser (name match + superblock magic probe)
+arch/x86/fs/gguf.h                  GGUF types (tensor, model structs) + API
+arch/x86/fs/gguf.c                  GGUF loader (in-memory parser, NVMe read, tensor table)
 arch/x86/include/types.h            Freestanding types + MMIO + port I/O
 
 # OsitoFS v2 Host Tools (tools/ositofs/)
@@ -240,9 +244,9 @@ Tasks:   idle, input, shell (3 of 8 slots used)
 | **X9**  | **Intel I211 Ethernet driver** (igb family, legacy descriptors, polling) | Done |
 | **X10** | **Network stack** (ARP responder, IPv4, UDP send/recv, echo server) | Done |
 | X11     | QEMU test infrastructure (OVMF + e1000e, serial log, UDP forward) | Done |
-| X12     | GPT parser (auto-find OsitoFS partition) | Next |
-| X13     | GGUF model loader (read from OsitoFS into memory) | Planned |
-| X14     | Tensor compute engine (CPU matmul, quantized ops) | Planned |
+| **X12** | **GPT parser** (auto-find OsitoFS partition by name + magic probe) | Done |
+| **X13** | **GGUF model loader** (load from OsitoFS into RAM, in-memory parser, tensor table) | Done |
+| X14     | Tensor compute engine (CPU matmul, quantized ops) | Next |
 | X15     | Inference runtime (transformer forward pass) | Planned |
 | X16     | GPU compute (NVIDIA GSP-shim or MMIO shader dispatch) | Research |
 

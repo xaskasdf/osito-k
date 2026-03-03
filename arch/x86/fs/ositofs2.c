@@ -232,6 +232,32 @@ int osfs2_read_file_block(osfs2_file_t *file, uint32_t block_index, void *buf)
     return osfs2_read_block_data(file->start_block + block_index, buf);
 }
 
+/* ── Find first GGUF file ────────────────────────────────────── */
+
+osfs2_file_t *osfs2_find_gguf(void)
+{
+    if (!mounted) return NULL;
+
+    for (uint32_t i = 0; i < OSFS2_MAX_FILES; i++) {
+        if ((file_table[i].flags & OSFS2_FLAG_VALID) &&
+            (file_table[i].flags & OSFS2_FLAG_GGUF)) {
+            return &file_table[i];
+        }
+    }
+    return NULL;
+}
+
+/* ── Read layer index from block 3 ──────────────────────────── */
+
+int osfs2_read_layer_index(uint16_t slot, osfs2_layer_idx_t *li)
+{
+    if (!mounted || slot >= OSFS2_MAX_MODELS) return -1;
+
+    uint64_t offset = ((uint64_t)OSFS2_LAYERIDX_BLK << OSFS2_BLOCK_SHIFT)
+                    + (uint64_t)slot * sizeof(osfs2_layer_idx_t);
+    return osfs2_part_read(offset, li, sizeof(*li));
+}
+
 /* ── Accessors ───────────────────────────────────────────────── */
 
 bool osfs2_is_mounted(void)  { return mounted; }

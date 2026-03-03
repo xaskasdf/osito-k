@@ -7,6 +7,7 @@
 
 #include "../include/types.h"
 #include "../drivers/gpu.h"
+#include "../fs/gguf.h"
 
 /* ── External functions ──────────────────────────────────────── */
 
@@ -152,24 +153,22 @@ void kernel_entry(void *memory_map, uint64_t map_size,
         if (nvme_init(nvme_pci->bar[0]) == 0) {
             serial_puts("[KERN] NVMe ready\n");
 
-            /* ── Step 4: Mount OsitoFS ── */
-            /* TODO: Parse GPT to find OsitoFS partition automatically.
-             * For now, the partition offset must be determined externally.
-             * Use: sudo fdisk -l /dev/nvme0n1 to find partition 6 start sector,
-             * then multiply by 512 to get byte offset.
-             *
-             * Placeholder: try a few known offsets or skip if unknown. */
+            /* ── Step 4: Mount OsitoFS via GPT ── */
+            extern int gpt_find_ositofs(uint64_t *part_offset, uint64_t *part_size);
 
-            serial_puts("[KERN] OsitoFS mount requires partition offset\n");
-            serial_puts("[KERN] TODO: implement GPT parser\n");
-            fb_puts("\n OsitoFS: awaiting GPT parser implementation\n");
-            fb_puts(" (partition offset needed for mount)\n");
+            uint64_t part_offset, part_size;
+            if (gpt_find_ositofs(&part_offset, &part_size) == 0) {
+                if (osfs2_mount(part_offset) == 0) {
+                    osfs2_list();
 
-            /* When GPT parser is ready:
-             * uint64_t part_offset = gpt_find_partition("OsitoFS-AI");
-             * if (osfs2_mount(part_offset) == 0)
-             *     osfs2_list();
-             */
+                    /* Load GGUF model (if present) */
+                    static gguf_model_t gguf_model;
+                    gguf_load(&gguf_model);
+                }
+            } else {
+                serial_puts("[KERN] OsitoFS partition not found in GPT\n");
+                fb_puts("\n OsitoFS: not found\n");
+            }
         } else {
             serial_puts("[KERN] NVMe init failed\n");
             fb_puts(" NVMe: init failed\n");

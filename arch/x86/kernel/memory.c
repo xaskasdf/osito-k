@@ -34,8 +34,8 @@ typedef struct __attribute__((packed)) {
 
 #define PAGE_SIZE       4096
 #define PAGE_SHIFT      12
-#define MAX_PHYS_PAGES  (4ULL * 1024 * 1024 * 1024 / PAGE_SIZE)  /* Up to 4GB tracked */
-#define BITMAP_SIZE     (MAX_PHYS_PAGES / 8)  /* 128KB for 4GB */
+#define MAX_PHYS_PAGES  (16ULL * 1024 * 1024 * 1024 / PAGE_SIZE) /* Up to 16GB tracked */
+#define BITMAP_SIZE     (MAX_PHYS_PAGES / 8)  /* 512KB for 16GB */
 
 /* Bitmap: 1 = free, 0 = used/reserved */
 static uint8_t page_bitmap[BITMAP_SIZE];
