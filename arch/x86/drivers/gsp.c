@@ -1297,13 +1297,18 @@ static int compute_push_set_object(void)
               | INVALIDATE_SHADER_CACHES_CONSTANT
               | INVALIDATE_SHADER_CACHES_FLUSH_DATA);
 
+    /* SET_SHADER_SHARED_MEMORY_WINDOW: 0xFE000000 (standard) */
+    pb_push(pb, NV_METHOD(SUBCHANNEL_COMPUTE, NVC5C0_SET_SHADER_SHARED_MEMORY_WINDOW_A, 2));
+    pb_push(pb, 0x00000000);  /* upper bits */
+    pb_push(pb, 0xFE000000);  /* lower bits */
+
+    /* SET_SHADER_LOCAL_MEMORY_WINDOW: 0xFF000000 (standard) */
+    pb_push(pb, NV_METHOD(SUBCHANNEL_COMPUTE, NVC5C0_SET_SHADER_LOCAL_MEMORY_WINDOW, 1));
+    pb_push(pb, 0xFF000000);
+
     /* WAIT_FOR_IDLE: barrier */
     pb_push(pb, NV_METHOD(SUBCHANNEL_COMPUTE, NVC5C0_WAIT_FOR_IDLE, 1));
     pb_push(pb, 0x00000000);
-
-    /* NOP: padding */
-    pb_push(pb, NV_NOP);
-    pb_push(pb, NV_NOP);
 
     int ret = pb_submit(pb);
     compute.class_bound = (ret == 0);
@@ -1834,8 +1839,10 @@ static void qmd_build(uint32_t *qmd, const compute_dispatch_t *desc)
     qmd[QMD_DW19] = (desc->block_y & 0xFFFF)
                    | ((desc->block_z & 0xFFFF) << 16);
 
-    /* DW20: REGISTER_COUNT_V (Volta+, bits 16:8) */
+    /* DW20: CONSTANT_BUFFER_VALID (bit 0 = CB0) + REGISTER_COUNT_V (bits 16:8) */
     qmd[QMD_DW20] = (desc->register_count & 0xFF) << 8;
+    if (desc->cbuf_size > 0)
+        qmd[QMD_DW20] |= (1 << 0);  /* CONSTANT_BUFFER_VALID(0) */
 
     /* DW23-25: RELEASE0 semaphore (if enabled) */
     if (desc->sem_addr) {
@@ -1848,6 +1855,15 @@ static void qmd_build(uint32_t *qmd, const compute_dispatch_t *desc)
 
     /* DW29: SHADER_LOCAL_MEMORY_LOW_SIZE + BARRIER_COUNT */
     qmd[QMD_DW29] = (desc->barrier_count & 0x1F) << 27;
+
+    /* DW32-33: CONSTANT_BUFFER(0) address + size (if enabled) */
+    if (desc->cbuf_size > 0) {
+        qmd[QMD_DW32] = (uint32_t)(desc->cbuf_addr & 0xFFFFFFFF);
+        /* DW33: ADDR_UPPER(16:0) | SIZE_SHIFTED4(31:17) */
+        uint32_t size_shifted = (desc->cbuf_size >> 4) & 0x7FFF;
+        qmd[QMD_DW33] = ((uint32_t)(desc->cbuf_addr >> 32) & 0x1FFFF)
+                       | (size_shifted << 17);
+    }
 
     /* DW48-49: PROGRAM_ADDRESS */
     qmd[QMD_DW48] = (uint32_t)(desc->program_addr & 0xFFFFFFFF);
@@ -3204,6 +3220,9 @@ int gsp_boot(void)
         gsp_compute_init();
         gsp_ce_init();
     }
+
+    /* X38: GMMU page tables (identity-map VRAM for compute) */
+    gmmu_init();
 
     /* X37: SASS kernel infrastructure (works with or without GSP boot) */
     sass_init();

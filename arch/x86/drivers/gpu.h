@@ -418,8 +418,6 @@ static inline void gpfifo_make_entry(gpfifo_entry_t *e, uint64_t addr, uint32_t 
 #define NVC5C0_NO_OPERATION                       0x0100
 #define NVC5C0_WAIT_FOR_IDLE                      0x0110
 #define NVC5C0_INVALIDATE_SHADER_CACHES           0x021C
-#define NVC5C0_SET_SHADER_SHARED_MEMORY_WINDOW_A  0x02A0
-#define NVC5C0_SET_SHADER_SHARED_MEMORY_WINDOW_B  0x02A4
 #define NVC5C0_SET_QMD_VERSION                    0x0288
 #define NVC5C0_SET_CWD_SLOT_COUNT                 0x02B0
 #define NVC5C0_SEND_PCAS_A                        0x02B4   /* QMD address >> 8 */
@@ -505,6 +503,8 @@ typedef struct {
 #define QMD_DW25  25    /* RELEASE0_PAYLOAD */
 #define QMD_DW29  29    /* SHADER_LOCAL_MEMORY_LOW_SIZE, BARRIER_COUNT */
 #define QMD_DW30  30    /* SHADER_LOCAL_MEMORY_HIGH_SIZE */
+#define QMD_DW32  32    /* CONSTANT_BUFFER_ADDR_LOWER(0) */
+#define QMD_DW33  33    /* CONSTANT_BUFFER_ADDR_UPPER(0) + SIZE_SHIFTED4 */
 #define QMD_DW48  48    /* PROGRAM_ADDRESS_LOWER */
 #define QMD_DW49  49    /* PROGRAM_ADDRESS_UPPER */
 
@@ -519,7 +519,7 @@ typedef struct {
 
 /* Compute dispatch descriptor */
 typedef struct {
-    uint64_t  program_addr;        /* GPU virtual/physical addr of SASS shader */
+    uint64_t  program_addr;        /* GPU virtual addr of SASS shader */
     uint32_t  grid_x, grid_y, grid_z;    /* Grid dimensions (CTA count) */
     uint32_t  block_x, block_y, block_z; /* Block dimensions (threads) */
     uint32_t  register_count;      /* GPRs per thread */
@@ -528,7 +528,15 @@ typedef struct {
     /* Semaphore fence (host-accessible physical address) */
     uint64_t  sem_addr;            /* Semaphore address for RELEASE0 */
     uint32_t  sem_payload;         /* Value to write on completion */
+    /* Constant buffer 0 (kernel parameters) */
+    uint64_t  cbuf_addr;           /* GPU virtual addr of constant buffer */
+    uint32_t  cbuf_size;           /* Size in bytes (0 = no CB) */
 } compute_dispatch_t;
+
+/* Compute method offsets for memory windows (clc5c0.h) */
+#define NVC5C0_SET_SHADER_SHARED_MEMORY_WINDOW_A  0x077C
+#define NVC5C0_SET_SHADER_SHARED_MEMORY_WINDOW_B  0x0780
+#define NVC5C0_SET_SHADER_LOCAL_MEMORY_WINDOW      0x07B0
 
 /* ── X35: Copy Engine (CE) DMA Defines ───────────────────── */
 
@@ -1062,6 +1070,11 @@ int  gsp_compute_copy_results(uint64_t src_vram, void *dst, uint32_t size); /* D
 /* X37: SASS kernel infrastructure (see sass.h for types) */
 int  sass_init(void);          /* Register + upload pre-encoded SASS kernels */
 int  sass_smoke_test(void);    /* Dispatch NOP kernel, check semaphore */
+
+/* X38: GMMU page tables + kernel loader */
+int      gmmu_init(void);              /* Build identity-map page tables, configure instance block */
+uint64_t gmmu_get_pdb_phys(void);      /* Get PDB physical address */
+bool     gmmu_is_initialized(void);    /* Check if GMMU is ready */
 
 /* Phase 9: VBIOS read + BIT parse + FWSEC extraction */
 int  gpu_read_vbios(void);           /* Read VBIOS from VRAM via PRAMIN */

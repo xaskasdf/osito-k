@@ -123,6 +123,7 @@ arch/x86/drivers/gpu.c              GPU probe Phase 1-3 + Phase 9 VBIOS read, BI
 arch/x86/drivers/gsp.c              GSP Falcon driver: probe, firmware load, ELF parse, boot, queues, RPC, FWSEC-FRTS, PIO load (Phase 4-10 + X27)
 arch/x86/drivers/sass.h              SASS kernel types, 128-bit instruction encoding, control code helpers, kernel catalog
 arch/x86/drivers/sass.c              Pre-encoded SASS kernels (NOP, S2R, NOP4), VRAM upload via PRAMIN, smoke test dispatch
+arch/x86/drivers/gmmu.c              GMMU page tables: 5-level identity map, instance block PDB config
 arch/x86/fs/ositofs2.c              OsitoFS v2 bare-metal driver (mount, list, read)
 arch/x86/fs/gpt.h                   GPT structs (UEFI spec) + API
 arch/x86/fs/gpt.c                   GPT parser (name match + superblock magic probe)
@@ -281,6 +282,7 @@ Tasks:   idle, input, shell (3 of 8 slots used)
 | **X35** | **Copy Engine DMA** (CE class bind, H2D/D2H physical copy, semaphore fence, chunked transfers) | Done |
 | **X36** | **Kernel completion + semaphore sync** (QMD build QMDV02_03, SEND_PCAS dispatch, kernel wait, CE result readback) | Done |
 | **X37** | **SASS kernel infrastructure** (128-bit instruction encoding, pre-encoded NOP/S2R/NOP4 kernels, VRAM upload via PRAMIN, dispatch smoke test) | Done |
+| **X38** | **GMMU page tables** (GP100+ MMU v2, 5-level identity map, constant buffer QMD, memory windows) | Done |
 
 > Full GPU roadmap (X27-X40 + contingency): see [docs/x86-gpu-roadmap.md](docs/x86-gpu-roadmap.md)
 
@@ -550,6 +552,18 @@ Pre-encoded SASS (Shader ASSembly) compute kernels for NVIDIA SM75+ GPUs.
 - **Smoke test**: `sass_smoke_test()` dispatches NOP kernel with QMD semaphore (RELEASE0), waits 500ms. Expected to timeout without full GSP boot chain.
 - **Files**: `arch/x86/drivers/sass.h` (types, encoding defines, API), `arch/x86/drivers/sass.c` (kernel binaries, upload, smoke test).
 - **Integration**: Called from `gsp_boot()` after compute/CE init. Works with or without GSP — PRAMIN upload always succeeds if GPU is present.
+
+### X38: GMMU Page Tables + Kernel Loader
+GPU MMU identity map for compute kernel dispatch. Compute engine always uses GPU virtual addresses — GMMU is mandatory.
+- **Page table format**: GP100+ MMU v2. 5 levels: PDB(2b) → PD2(9b) → PD1(9b) → PD0(8b,dual) → SPT(9b). 49-bit VA space, 4KB small pages.
+- **PTE encoding**: `data = (phys_addr >> 4) | flags`. VALID(bit 0), APERTURE(bits 2:1, 0=VRAM, 2=SYS_COHERENT), VOL(bit 3).
+- **PD0 dual PDE**: 16-byte entries — `small_pde = table_addr | flags` (NOT shifted!), `big_pde = 0` (disabled).
+- **Identity map**: GPU VA = VRAM physical address. Maps 4MB at VRAM+256MB (SASS kernel region). Requires ~24KB of page tables (1 PDB + 1 PD2 + 1 PD1 + 1 PD0 + 2 SPT pages).
+- **Instance block**: PDB physical address written to channel RAMIN offset 0x200. TARGET=SYS_COHERENT (page tables in system RAM, GPU reads via PCIe).
+- **Constant buffer**: `compute_dispatch_t` extended with `cbuf_addr`/`cbuf_size`. QMD DW20 bit 0 = CB0_VALID, DW32-33 = CB0 address + size.
+- **Memory windows**: SET_SHADER_SHARED_MEMORY_WINDOW (0x077C/0x0780) = 0xFE000000, SET_SHADER_LOCAL_MEMORY_WINDOW (0x07B0) = 0xFF000000. Pushed during compute class initialization.
+- **Files**: `arch/x86/drivers/gmmu.c` (page table builder, instance block config).
+- **Integration**: Called from `gsp_boot()` before `sass_init()`. Independent of GSP boot — allocates page tables in system RAM.
 
 ## Language
 The user speaks Spanish. Communicate in Spanish when appropriate.
