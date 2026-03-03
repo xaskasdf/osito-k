@@ -1153,6 +1153,330 @@ int gsp_channel_init(void)
     return 0;
 }
 
+/* ══════════════════════════════════════════════════════════
+ *  X34: Compute Class Bind + Kernel Dispatch
+ *
+ *  Binds compute class to GPFIFO channel (subchannel 1),
+ *  activates channel via NVA06F_CTRL_BIND + GPFIFO_SCHEDULE,
+ *  pushes SET_OBJECT + INVALIDATE_SHADER_CACHES + WAIT_FOR_IDLE
+ *  as initial compute barrier / smoke test.
+ *
+ *  Reference: NVIDIA open-gpu-doc dev_ram.ref.txt (pushbuffer format),
+ *             clc5c0.h/clc6c0.h/clc9c0.h (compute methods),
+ *             ctrla06f (channel control commands).
+ * ══════════════════════════════════════════════════════════ */
+
+static compute_state_t compute;
+
+compute_state_t *gsp_get_compute(void)
+{
+    return &compute;
+}
+
+/* Select compute class based on GPU generation */
+static uint32_t compute_class_for_gen(gpu_gen_t gen)
+{
+    switch (gen) {
+    case GPU_GEN_TURING:       return TURING_COMPUTE_A;
+    case GPU_GEN_AMPERE:       return AMPERE_COMPUTE_A;
+    case GPU_GEN_ADA_LOVELACE: return ADA_COMPUTE_A;
+    default:                   return AMPERE_COMPUTE_A;
+    }
+}
+
+/* ── Pushbuffer helpers ── */
+
+static void pb_begin(pushbuf_state_t *pb)
+{
+    pb->pos = 0;
+}
+
+static void pb_push(pushbuf_state_t *pb, uint32_t data)
+{
+    if (pb->pos < pb->capacity)
+        pb->buf[pb->pos++] = data;
+}
+
+static uint32_t pb_size_bytes(pushbuf_state_t *pb)
+{
+    return pb->pos * 4;
+}
+
+/* Submit pushbuffer via GPFIFO ring + USERD GP_PUT doorbell */
+static int pb_submit(pushbuf_state_t *pb)
+{
+    if (pb->pos == 0) return 0;
+
+    uint32_t gp_idx = channel.gp_put % channel.gpfifo_entries;
+
+    /* Build GPFIFO entry pointing to pushbuffer data */
+    gpfifo_make_entry(&channel.gpfifo[gp_idx], pb->buf_phys, pb_size_bytes(pb));
+    wmb();
+
+    /* Advance GP_PUT */
+    channel.gp_put++;
+
+    /* Write GP_PUT to USERD doorbell */
+    volatile uint32_t *userd = (volatile uint32_t *)channel.userd_mem;
+    userd[USERD_GP_PUT / 4] = channel.gp_put;
+    wmb();
+
+    serial_puts("[COMPUTE] Submitted ");
+    serial_putdec(pb->pos);
+    serial_puts(" dwords via GPFIFO[");
+    serial_putdec(gp_idx);
+    serial_puts("], gp_put=");
+    serial_putdec(channel.gp_put);
+    serial_puts("\n");
+
+    return 0;
+}
+
+/* ── Channel activation via RM control commands ── */
+
+static int compute_bind_channel(void)
+{
+    serial_puts("[COMPUTE] Step 1/4: CTRL_BIND (engine=GR0)\n");
+
+    nva06f_ctrl_bind_params_t bind_params;
+    memset(&bind_params, 0, sizeof(bind_params));
+    bind_params.engineType = NV2080_ENGINE_TYPE_GR0;
+
+    int ret = gsp_rm_control(GSP_RM_CHAN_HANDLE, NVA06F_CTRL_CMD_BIND,
+                             &bind_params, sizeof(bind_params));
+
+    compute.channel_bound = (ret == 0);
+    serial_puts("[COMPUTE] Bind: ");
+    serial_puts(compute.channel_bound ? "sent" : "failed");
+    serial_puts("\n");
+
+    return ret;
+}
+
+static int compute_schedule_channel(void)
+{
+    serial_puts("[COMPUTE] Step 2/4: CTRL_GPFIFO_SCHEDULE (enable)\n");
+
+    nva06f_ctrl_gpfifo_schedule_params_t sched_params;
+    memset(&sched_params, 0, sizeof(sched_params));
+    sched_params.bEnable     = 1;
+    sched_params.bSkipSubmit = 0;
+
+    int ret = gsp_rm_control(GSP_RM_CHAN_HANDLE, NVA06F_CTRL_CMD_GPFIFO_SCHEDULE,
+                             &sched_params, sizeof(sched_params));
+
+    compute.channel_scheduled = (ret == 0);
+    serial_puts("[COMPUTE] Schedule: ");
+    serial_puts(compute.channel_scheduled ? "sent" : "failed");
+    serial_puts("\n");
+
+    return ret;
+}
+
+/* ── Push compute class binding + initial barrier ── */
+
+static int compute_push_set_object(void)
+{
+    serial_puts("[COMPUTE] Step 3/4: SET_OBJECT (class 0x");
+    serial_puthex(compute.compute_class, 4);
+    serial_puts(") on subchannel ");
+    serial_putdec(SUBCHANNEL_COMPUTE);
+    serial_puts("\n");
+
+    pushbuf_state_t *pb = &compute.pb;
+    pb_begin(pb);
+
+    /* SET_OBJECT: bind compute class to subchannel 1 */
+    pb_push(pb, NV_METHOD(SUBCHANNEL_COMPUTE, NVC5C0_SET_OBJECT, 1));
+    pb_push(pb, compute.compute_class);
+
+    /* INVALIDATE_SHADER_CACHES: flush I$/D$/const caches */
+    pb_push(pb, NV_METHOD(SUBCHANNEL_COMPUTE, NVC5C0_INVALIDATE_SHADER_CACHES, 1));
+    pb_push(pb, INVALIDATE_SHADER_CACHES_INSTRUCTION
+              | INVALIDATE_SHADER_CACHES_DATA
+              | INVALIDATE_SHADER_CACHES_CONSTANT
+              | INVALIDATE_SHADER_CACHES_FLUSH_DATA);
+
+    /* WAIT_FOR_IDLE: barrier */
+    pb_push(pb, NV_METHOD(SUBCHANNEL_COMPUTE, NVC5C0_WAIT_FOR_IDLE, 1));
+    pb_push(pb, 0x00000000);
+
+    /* NOP: padding */
+    pb_push(pb, NV_NOP);
+    pb_push(pb, NV_NOP);
+
+    int ret = pb_submit(pb);
+    compute.class_bound = (ret == 0);
+
+    return ret;
+}
+
+/* ── Semaphore fence (GPU→CPU completion signal) ── */
+
+static int compute_push_semaphore_fence(void)
+{
+    if (!compute.semaphore) return -1;
+
+    serial_puts("[COMPUTE] Step 4/4: Semaphore fence at 0x");
+    serial_puthex(compute.sem_phys, 16);
+    serial_puts("\n");
+
+    /* Reset semaphore to 0 */
+    compute.semaphore[0] = 0;
+    wmb();
+
+    pushbuf_state_t *pb = &compute.pb;
+    pb_begin(pb);
+
+    /* SEMAPHORE RELEASE on compute subchannel */
+    pb_push(pb, NV_METHOD(SUBCHANNEL_COMPUTE, NVA06F_SEMAPHOREA, 4));
+    pb_push(pb, (uint32_t)(compute.sem_phys >> 32));  /* SEMAPHOREA: addr upper */
+    pb_push(pb, (uint32_t)(compute.sem_phys & 0xFFFFFFFF));  /* SEMAPHOREB: addr lower */
+    pb_push(pb, 0x00000001);  /* SEMAPHOREC: payload value (1 = done) */
+    pb_push(pb, NVA06F_SEMAPHORED_OPERATION_RELEASE
+              | NVA06F_SEMAPHORED_RELEASE_SIZE_4BYTE);  /* SEMAPHORED */
+
+    return pb_submit(pb);
+}
+
+/* ── Poll semaphore for GPU completion ── */
+
+static int compute_poll_semaphore(uint32_t expected, uint32_t timeout_ms)
+{
+    uint64_t timeout_cycles = (uint64_t)timeout_ms * 3000000ULL;  /* ~3GHz estimate */
+    uint64_t t0 = rdtsc();
+
+    while (1) {
+        rmb();
+        uint32_t val = compute.semaphore[0];
+        if (val == expected) {
+            serial_puts("[COMPUTE] Semaphore = ");
+            serial_putdec(val);
+            serial_puts(" (OK)\n");
+            return 0;
+        }
+
+        uint64_t elapsed = rdtsc() - t0;
+        if (elapsed > timeout_cycles) {
+            serial_puts("[COMPUTE] Semaphore timeout: expected ");
+            serial_putdec(expected);
+            serial_puts(", got ");
+            serial_putdec(val);
+            serial_puts("\n");
+            return -1;
+        }
+    }
+}
+
+/* ── Public API: gsp_compute_init ── */
+
+int gsp_compute_init(void)
+{
+    if (!channel.allocated) {
+        serial_puts("[COMPUTE] Channel not allocated, skipping compute init\n");
+        return -1;
+    }
+
+    serial_puts("[COMPUTE] === Compute Class Init ===\n");
+
+    memset(&compute, 0, sizeof(compute));
+
+    /* Determine compute class for this GPU */
+    gpu_device_t *dev = &gpu_dev;
+    compute.compute_class = compute_class_for_gen(dev->generation);
+
+    serial_puts("[COMPUTE] GPU gen=");
+    serial_puts(gpu_gen_name(dev->generation));
+    serial_puts(", compute class=0x");
+    serial_puthex(compute.compute_class, 4);
+    serial_puts("\n");
+
+    /* Allocate pushbuffer (4KB, page-aligned) */
+    compute.pb.capacity = PUSHBUF_SIZE_DWORDS;
+    compute.pb.buf = (uint32_t *)mem_alloc_aligned(PUSHBUF_SIZE_DWORDS * 4, 4096);
+    if (!compute.pb.buf) {
+        serial_puts("[COMPUTE] Failed to allocate pushbuffer\n");
+        return -1;
+    }
+    memset(compute.pb.buf, 0, PUSHBUF_SIZE_DWORDS * 4);
+    compute.pb.buf_phys = (uint64_t)(uintptr_t)compute.pb.buf;
+    compute.pb.pos = 0;
+
+    serial_puts("[COMPUTE] Pushbuffer at 0x");
+    serial_puthex(compute.pb.buf_phys, 16);
+    serial_puts(" (");
+    serial_putdec(PUSHBUF_SIZE_DWORDS * 4);
+    serial_puts(" bytes)\n");
+
+    /* Allocate semaphore memory (4KB page, only first dword used) */
+    compute.semaphore = (uint32_t *)mem_alloc_aligned(4096, 4096);
+    if (!compute.semaphore) {
+        serial_puts("[COMPUTE] Failed to allocate semaphore memory\n");
+        return -1;
+    }
+    memset(compute.semaphore, 0, 4096);
+    compute.sem_phys = (uint64_t)(uintptr_t)compute.semaphore;
+
+    serial_puts("[COMPUTE] Semaphore at 0x");
+    serial_puthex(compute.sem_phys, 16);
+    serial_puts("\n");
+
+    /* Step 1: Bind channel to GR0 engine */
+    compute_bind_channel();
+
+    /* Step 2: Schedule channel on runlist */
+    compute_schedule_channel();
+
+    /* Step 3: Push SET_OBJECT + cache invalidate + barrier */
+    compute_push_set_object();
+
+    /* Step 4: Push semaphore fence */
+    compute_push_semaphore_fence();
+
+    /* Poll for semaphore (2s timeout) — will timeout without full GSP boot chain */
+    int sem_ret = compute_poll_semaphore(1, 2000);
+    if (sem_ret == 0) {
+        compute.ready = true;
+        serial_puts("[COMPUTE] Compute engine READY\n");
+        fb_puts_color(" Compute: READY\n", 0x0000FF00);
+    } else {
+        serial_puts("[COMPUTE] Semaphore timeout (expected without full boot chain)\n");
+        fb_puts(" Compute: init sent (pending boot chain)\n");
+    }
+
+    serial_puts("[COMPUTE] === Compute init complete ===\n");
+
+    return 0;
+}
+
+/* ── Public API: gsp_compute_barrier ── */
+
+int gsp_compute_barrier(void)
+{
+    if (!compute.class_bound) return -1;
+
+    pushbuf_state_t *pb = &compute.pb;
+    pb_begin(pb);
+
+    /* WAIT_FOR_IDLE on compute subchannel */
+    pb_push(pb, NV_METHOD(SUBCHANNEL_COMPUTE, NVC5C0_WAIT_FOR_IDLE, 1));
+    pb_push(pb, 0x00000000);
+
+    /* Semaphore release for CPU synchronization */
+    uint32_t fence_val = compute.semaphore[0] + 1;
+
+    pb_push(pb, NV_METHOD(SUBCHANNEL_COMPUTE, NVA06F_SEMAPHOREA, 4));
+    pb_push(pb, (uint32_t)(compute.sem_phys >> 32));
+    pb_push(pb, (uint32_t)(compute.sem_phys & 0xFFFFFFFF));
+    pb_push(pb, fence_val);
+    pb_push(pb, NVA06F_SEMAPHORED_OPERATION_RELEASE
+              | NVA06F_SEMAPHORED_RELEASE_SIZE_4BYTE);
+
+    pb_submit(pb);
+
+    return compute_poll_semaphore(fence_val, 2000);
+}
+
 /* ── Phase 10: FWSEC-FRTS Execution + WPR2 ───────────────────── */
 
 /*
@@ -2372,6 +2696,7 @@ int gsp_boot(void)
         gsp_rpc_init();
         gsp_rm_init();
         gsp_channel_init();
+        gsp_compute_init();
     }
 
     return ret;

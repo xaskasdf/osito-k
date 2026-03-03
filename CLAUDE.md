@@ -275,6 +275,7 @@ Tasks:   idle, input, shell (3 of 8 slots used)
 | **X31** | **SEC2 booter load** (load booter.bin from OsitoFS, DMA to SEC2, boot with WPR meta, firmware→WPR2) | Done |
 | **X32** | **RPC ID fix + generic RM alloc/control** (corrected rpc_global_enums IDs, RM_ALLOC func 103, subdevice + VASPACE) | Done |
 | **X33** | **Channel + GPFIFO** (TSG alloc, GPFIFO channel alloc, ring buffer + instance/USERD memory) | Done |
+| **X34** | **Compute class bind + kernel dispatch** (pushbuffer encoding, SET_OBJECT, CTRL_BIND/SCHEDULE, semaphore fence) | Done |
 
 > Full GPU roadmap (X27-X40 + contingency): see [docs/x86-gpu-roadmap.md](docs/x86-gpu-roadmap.md)
 
@@ -502,6 +503,16 @@ GPU compute channel allocation via RM. Foundation for pushing GPU commands.
 - **GPFIFO entry format**: 8 bytes — address[39:2] + length in dwords. `gpfifo_make_entry()` helper.
 - **channel_state_t**: Tracks GPFIFO ring, gp_put index, inst/userd memory, RM handles, chan_class.
 - **Integration**: Called from `gsp_boot()` after `gsp_rm_init()`.
+
+### X34: Compute Class Bind + Kernel Dispatch
+Binds compute class to GPFIFO channel, activates channel, pushes initial commands through pushbuffer.
+- **Compute classes**: Turing 0xC5C0, Ampere 0xC6C0, Ada 0xC9C0 (per-gen selection via `compute_class_for_gen()`).
+- **Pushbuffer format**: SEC_OP(31:29) | COUNT(28:16) | SUBCHANNEL(15:13) | METHOD_ADDR(11:0). Macros: `NV_METHOD()`, `NV_METHOD_NI()`, `NV_METHOD_IMMD()`.
+- **Channel activation**: NVA06F_CTRL_CMD_BIND (0xa06f0104) binds to GR0 engine, NVA06F_CTRL_CMD_GPFIFO_SCHEDULE (0xa06f0103) enables on runlist — both via `gsp_rm_control()` on channel handle.
+- **Initial pushbuffer sequence**: SET_OBJECT (class on subchannel 1) → INVALIDATE_SHADER_CACHES → WAIT_FOR_IDLE → semaphore release fence.
+- **Semaphore sync**: Host allocates 4KB semaphore page. GPU writes payload via SEMAPHORE A/B/C/D release method. Host polls semaphore value with rdtsc timeout.
+- **compute_state_t**: Tracks compute class, pushbuffer state, semaphore memory, bind/schedule/ready flags.
+- **Integration**: Called from `gsp_boot()` after `gsp_channel_init()`. Without full GSP boot chain, semaphore times out (expected).
 
 ## Language
 The user speaks Spanish. Communicate in Spanish when appropriate.

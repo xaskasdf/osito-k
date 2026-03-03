@@ -374,6 +374,108 @@ static inline void gpfifo_make_entry(gpfifo_entry_t *e, uint64_t addr, uint32_t 
 #define USERD_GP_GET   0x88   /* GPFIFO get pointer (RO, updated by GPU) */
 #define USERD_GP_PUT   0x8C   /* GPFIFO put pointer (RW, written by CPU) */
 
+/* ── X34: Compute Class + Pushbuffer Defines ─────────────── */
+
+/* Compute class IDs per GPU generation (clXXc0.h, Mesa headers) */
+#define TURING_COMPUTE_A     0xC5C0   /* TU102/TU104/TU106/TU116/TU117 */
+#define AMPERE_COMPUTE_A     0xC6C0   /* GA102/GA104/GA106 */
+#define ADA_COMPUTE_A        0xC9C0   /* AD102/AD103/AD104/AD106/AD107 */
+
+/* Pushbuffer method header encoding (dev_ram.ref.txt, Turing+).
+ * Format: SEC_OP(31:29) | COUNT(28:16) | SUBCHAN(15:13) | METHOD_ADDR(11:0)
+ * METHOD_ADDR = byte_address >> 2 (dword-addressed in header) */
+#define NV_METHOD(sc, mthd, cnt) \
+    ((0x1u << 29) | ((uint32_t)(cnt) << 16) | ((uint32_t)(sc) << 13) | ((mthd) >> 2))
+#define NV_METHOD_NI(sc, mthd, cnt) \
+    ((0x3u << 29) | ((uint32_t)(cnt) << 16) | ((uint32_t)(sc) << 13) | ((mthd) >> 2))
+#define NV_METHOD_IMMD(sc, mthd, data) \
+    ((0x4u << 29) | ((uint32_t)(data) << 16) | ((uint32_t)(sc) << 13) | ((mthd) >> 2))
+#define NV_NOP  0x00000000u
+
+/* Subchannel assignments (Graphics/Compute runlist) */
+#define SUBCHANNEL_3D       0
+#define SUBCHANNEL_COMPUTE  1
+#define SUBCHANNEL_I2M      2
+#define SUBCHANNEL_2D       3
+#define SUBCHANNEL_CE       4
+
+/* Host methods (NVA06F, all subchannels, byte addresses) */
+#define NVA06F_SET_OBJECT              0x0000
+#define NVA06F_NOP                     0x0008
+#define NVA06F_SEMAPHOREA              0x0010   /* Semaphore addr upper */
+#define NVA06F_SEMAPHOREB              0x0014   /* Semaphore addr lower */
+#define NVA06F_SEMAPHOREC              0x0018   /* Semaphore payload */
+#define NVA06F_SEMAPHORED              0x001C   /* Semaphore operation */
+#define NVA06F_NON_STALL_INTERRUPT     0x0020
+
+/* Semaphore operations (SEMAPHORED bits) */
+#define NVA06F_SEMAPHORED_OPERATION_RELEASE       0x00000002
+#define NVA06F_SEMAPHORED_RELEASE_WFI_EN          (1 << 20)
+#define NVA06F_SEMAPHORED_RELEASE_SIZE_4BYTE      0x00000000
+
+/* Compute engine methods (clc5c0.h / clc6c0.h / clc9c0.h) */
+#define NVC5C0_SET_OBJECT                         0x0000
+#define NVC5C0_NO_OPERATION                       0x0100
+#define NVC5C0_WAIT_FOR_IDLE                      0x0110
+#define NVC5C0_INVALIDATE_SHADER_CACHES           0x021C
+#define NVC5C0_SET_SHADER_SHARED_MEMORY_WINDOW_A  0x02A0
+#define NVC5C0_SET_SHADER_SHARED_MEMORY_WINDOW_B  0x02A4
+#define NVC5C0_SET_QMD_VERSION                    0x0288
+#define NVC5C0_SET_CWD_SLOT_COUNT                 0x02B0
+#define NVC5C0_SEND_PCAS_A                        0x02B4   /* QMD address >> 8 */
+#define NVC5C0_SEND_PCAS_B                        0x02B8   /* FROM + DELTA */
+
+/* Inline-to-Memory (I2M) methods — used for uploading data via pushbuffer */
+#define NVC5C0_LINE_LENGTH_IN                     0x0180
+#define NVC5C0_LINE_COUNT                         0x0184
+#define NVC5C0_OFFSET_OUT_UPPER                   0x0188
+#define NVC5C0_OFFSET_OUT                         0x018C
+#define NVC5C0_LAUNCH_DMA                         0x01B0
+#define NVC5C0_LOAD_INLINE_DATA                   0x01B4
+
+/* INVALIDATE_SHADER_CACHES bitfields */
+#define INVALIDATE_SHADER_CACHES_INSTRUCTION      (1 << 0)
+#define INVALIDATE_SHADER_CACHES_DATA             (1 << 2)
+#define INVALIDATE_SHADER_CACHES_CONSTANT         (1 << 3)
+#define INVALIDATE_SHADER_CACHES_FLUSH_DATA       (1 << 4)
+
+/* NVA06F channel control commands (via gsp_rm_control on channel handle) */
+#define NVA06F_CTRL_CMD_BIND             0xa06f0104
+#define NVA06F_CTRL_CMD_GPFIFO_SCHEDULE  0xa06f0103
+
+/* NVA06F_CTRL_BIND_PARAMS */
+typedef struct {
+    uint32_t engineType;    /* NV2080_ENGINE_TYPE_* */
+} nva06f_ctrl_bind_params_t;
+
+/* NVA06F_CTRL_GPFIFO_SCHEDULE_PARAMS */
+typedef struct {
+    uint32_t bEnable;       /* 1=enable, 0=disable */
+    uint32_t bSkipSubmit;   /* 0 normally */
+} nva06f_ctrl_gpfifo_schedule_params_t;
+
+/* Pushbuffer state (host-managed command buffer) */
+#define PUSHBUF_SIZE_DWORDS  1024   /* 4KB pushbuffer */
+typedef struct {
+    uint32_t *buf;          /* Pushbuffer memory (page-aligned) */
+    uint64_t  buf_phys;     /* Physical address */
+    uint32_t  pos;          /* Current write position (dwords) */
+    uint32_t  capacity;     /* Total capacity (dwords) */
+} pushbuf_state_t;
+
+/* Compute state (managed by host) */
+typedef struct {
+    uint32_t  compute_class;       /* Generation-specific class ID */
+    bool      class_bound;         /* SET_OBJECT sent to subchannel 1 */
+    bool      channel_bound;       /* NVA06F_CTRL_BIND sent */
+    bool      channel_scheduled;   /* NVA06F_CTRL_GPFIFO_SCHEDULE sent */
+    pushbuf_state_t pb;            /* Pushbuffer */
+    /* Semaphore for GPU→CPU signaling */
+    uint32_t *semaphore;           /* Semaphore memory (page-aligned) */
+    uint64_t  sem_phys;            /* Physical address */
+    bool      ready;               /* Compute dispatch ready */
+} compute_state_t;
+
 /* Channel state (managed by host) */
 typedef struct {
     /* GPFIFO ring buffer */
@@ -834,6 +936,11 @@ int  gsp_rm_control(uint32_t hObject, uint32_t cmd,
 /* X33: Channel + GPFIFO */
 int  gsp_channel_init(void);          /* Allocate TSG + channel + GPFIFO */
 channel_state_t *gsp_get_channel(void);  /* Get channel state */
+
+/* X34: Compute class bind + kernel dispatch */
+int  gsp_compute_init(void);          /* Bind compute class, activate channel */
+compute_state_t *gsp_get_compute(void);  /* Get compute state */
+int  gsp_compute_barrier(void);       /* Push WAIT_FOR_IDLE + semaphore fence */
 
 /* Phase 9: VBIOS read + BIT parse + FWSEC extraction */
 int  gpu_read_vbios(void);           /* Read VBIOS from VRAM via PRAMIN */
