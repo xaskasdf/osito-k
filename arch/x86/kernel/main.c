@@ -58,6 +58,7 @@ extern bool osfs2_is_mounted(void);
 /* GSP Falcon */
 extern int  gsp_probe(void);
 extern int  gsp_load_firmware(void);
+extern int  gsp_queue_init(void);
 extern int  gsp_boot(void);
 
 /* ── UDP Echo Handler ────────────────────────────────────────── */
@@ -171,6 +172,8 @@ void kernel_entry(void *memory_map, uint64_t map_size,
                     if (gp && gp->gsp_present)
                         gsp_probe();
                     gsp_load_firmware();
+                    if (gp && gp->gsp_present)
+                        gsp_queue_init();
                     if (gp && gp->gsp_present)
                         gsp_boot();
                 }

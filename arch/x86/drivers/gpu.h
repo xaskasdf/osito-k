@@ -7,7 +7,8 @@
  * Phase 3: PCI BAR sizes, gpu_write, PRAMIN window slide + R/W.
  * Phase 4: GSP Falcon deep probe, firmware load to RAM, upload to VRAM.
  * Phase 5: GSP boot (ELF parse, BOOTVEC, CPUCTL start, mailbox handshake).
- * Phase 6+: Message queues, RPC protocol, GPU init via GSP-RM.
+ * Phase 6: GSP shared memory message queues (host↔GSP bidirectional).
+ * Phase 7+: RPC protocol, GPU init via GSP-RM.
  */
 
 #ifndef OSITOK_GPU_H
@@ -77,6 +78,27 @@
 
 #define GSP_FW_VRAM_OFFSET_MB      128   /* Firmware placement: VRAM+128MB */
 
+/* GSP Queue Doorbell (notify GSP of new messages) */
+#define NV_PGSP_QUEUE_HEAD         0x110C00
+
+/* ── GSP Message Queue Constants ─────────────────────────────── */
+
+#define GSP_PAGE_SIZE              4096
+#define GSP_PAGE_SHIFT             12
+#define GSP_MSGQ_NUM_PAGES         63       /* Entries per queue */
+#define GSP_MSG_SIGNATURE          0x43505256  /* "VRPC" LE */
+#define GSP_MSG_HDR_VERSION        0x03000000
+
+/* Shared memory region offsets */
+#define GSP_SHM_PTE_OFF            0x00000
+#define GSP_SHM_CPUQ_HDR_OFF      0x01000
+#define GSP_SHM_CPUQ_DATA_OFF     0x02000
+#define GSP_SHM_GSPQ_HDR_OFF      0x41000
+#define GSP_SHM_GSPQ_DATA_OFF     0x42000
+#define GSP_SHM_TOTAL_SIZE         0x81000  /* ~513KB */
+
+#define GSP_QUEUE_ARGS_VRAM_MB     126   /* Init args at VRAM+126MB */
+
 /* ── Minimal ELF64 types (for GSP firmware parsing) ────────── */
 
 #define ELF_MAGIC       0x464C457F  /* "\x7FELF" as uint32_t LE */
@@ -111,6 +133,56 @@ typedef struct {
     uint64_t p_memsz;          /* Size in memory */
     uint64_t p_align;
 } elf64_phdr_t;               /* 56 bytes */
+
+/* ── GSP Message Queue Structures ─────────────────────────────── */
+
+/* TX header — written by producer, read by consumer (32 bytes) */
+typedef struct {
+    uint32_t version;       /* Queue version = 1 */
+    uint32_t size;          /* Total queue data size (bytes) */
+    uint32_t msgSize;       /* Entry size = 4096 */
+    uint32_t msgCount;      /* Number of entries = 63 */
+    uint32_t writePtr;      /* Next write index (volatile) */
+    uint32_t flags;         /* 0 normally */
+    uint32_t rxHdrOff;      /* Offset of RX header from queue header start */
+    uint32_t entryOff;      /* Offset of data entries from queue header start */
+} gsp_msgq_tx_hdr_t;       /* 32 bytes */
+
+/* RX header — written by consumer, read by producer (4 bytes + pad) */
+typedef struct {
+    uint32_t readPtr;       /* Next read index (volatile) */
+} gsp_msgq_rx_hdr_t;
+
+/* Message element header (48 bytes, prefixes every queue entry) */
+typedef struct {
+    uint8_t  authTag[16];   /* Zeros (no encryption) */
+    uint8_t  aad[16];       /* Zeros (no encryption) */
+    uint32_t checkSum;      /* XOR checksum (total XOR = 0) */
+    uint32_t seqNum;        /* Sequence number */
+    uint32_t elemCount;     /* Pages used by this message */
+    uint32_t pad;
+} gsp_msg_elem_hdr_t;      /* 48 bytes = 0x30 */
+
+/* RPC message header (32 bytes, follows element header) */
+typedef struct {
+    uint32_t header_version; /* 0x03000000 */
+    uint32_t signature;      /* 0x43505256 "VRPC" */
+    uint32_t length;         /* Total length incl header */
+    uint32_t function;       /* RPC function number */
+    uint32_t rpc_result;     /* Status from GSP */
+    uint32_t rpc_result_private;
+    uint32_t sequence;       /* RPC sequence */
+    uint32_t cpuRmGfid;     /* GPU function ID */
+} gsp_rpc_hdr_t;            /* 32 bytes = 0x20 */
+
+/* Message queue init arguments (passed to GSP at boot via VRAM) */
+typedef struct {
+    uint64_t sharedMemPhysAddr;    /* Physical addr of shared region */
+    uint32_t pageTableEntryCount;  /* PTEs in first page */
+    uint32_t pad;
+    uint64_t cmdQueueOffset;       /* CPU queue offset = 0x1000 */
+    uint64_t statQueueOffset;      /* GSP queue offset = 0x41000 */
+} gsp_msgq_init_args_t;           /* 32 bytes */
 
 /* Dead register sentinel */
 #define NV_DEAD_REG            0xFFFFFFFF
@@ -219,6 +291,12 @@ typedef struct {
     uint32_t    boot_status;      /* Post-boot mailbox0 value */
     bool        booted;           /* CPUCTL_STARTCPU sent */
     bool        boot_ack;         /* Mailbox handshake OK */
+    /* Message Queues (Phase 6) */
+    void       *shm_base;         /* Shared memory region (513KB) */
+    uint64_t    shm_phys;         /* Physical address */
+    uint32_t    cmd_seq;          /* Command sequence counter */
+    uint32_t    rpc_seq;          /* RPC sequence counter */
+    bool        queues_ready;     /* Queues initialized */
 } gsp_state_t;
 
 /* ── API ────────────────────────────────────────────────────── */
@@ -240,5 +318,10 @@ gsp_state_t *gsp_get_state(void);
 
 /* Phase 5: GSP Falcon boot (ELF parse, boot sequence, mailbox poll) */
 int  gsp_boot(void);
+
+/* Phase 6: GSP message queues */
+int  gsp_queue_init(void);      /* Allocate + init shared memory */
+int  gsp_queue_send(uint32_t function, const void *payload, uint32_t len);
+int  gsp_queue_recv(void *buf, uint32_t buf_size, uint32_t *function);
 
 #endif /* OSITOK_GPU_H */

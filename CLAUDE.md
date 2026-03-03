@@ -120,7 +120,7 @@ arch/x86/kernel/memory.c            Physical memory manager (bitmap, 4KB pages)
 arch/x86/drivers/nvme.c             Minimal NVMe driver (admin+IO queues, read-only)
 arch/x86/drivers/gpu.h              GPU types, MMIO register defines, Falcon defines, probe + GSP API
 arch/x86/drivers/gpu.c              GPU probe Phase 1-3 (chip ID, engines, VRAM, BAR1 R/W, PRAMIN R/W)
-arch/x86/drivers/gsp.c              GSP Falcon driver: probe, firmware load, ELF parse, boot (Phase 4-5)
+arch/x86/drivers/gsp.c              GSP Falcon driver: probe, firmware load, ELF parse, boot, message queues (Phase 4-6)
 arch/x86/fs/ositofs2.c              OsitoFS v2 bare-metal driver (mount, list, read)
 arch/x86/fs/gpt.h                   GPT structs (UEFI spec) + API
 arch/x86/fs/gpt.c                   GPT parser (name match + superblock magic probe)
@@ -259,6 +259,7 @@ Tasks:   idle, input, shell (3 of 8 slots used)
 | **X18** | **GPU PCI BAR sizes + gpu_write + PRAMIN window slide R/W** (Phase 3) | Done |
 | **X19** | **GSP Falcon deep probe + firmware load to VRAM** (Phase 4) | Done |
 | **X20** | **GSP boot** (ELF parse, BOOTVEC, CPUCTL start, mailbox handshake) — Phase 5 | Done |
+| **X21** | **GSP message queues** (shared memory, TX/RX primitives, init args to VRAM) — Phase 6 | Done |
 
 ### F12: DOOM Wireframe 2.5D
 Procedural level generator (4x4 grid, snake path connectivity) + wall-segment projection renderer.
@@ -346,6 +347,19 @@ First attempt to boot the GSP Falcon microcontroller.
 - **Registers written**: CPUCTL (halt/start), BOOTVEC, DMATRFBASE, MAILBOX0/1 (clear to 0)
 - **Safety**: Timeout-based, never hangs. On failure Falcon returns to HALTED. OS continues regardless.
 - **Does NOT implement RPC** — that is X21+ (shared memory message queues, GSP-RM protocol)
+
+### X21: GSP Shared Memory Message Queues (Phase 6)
+Bidirectional host↔GSP communication via shared memory queues following NVIDIA `open-gpu-kernel-modules` architecture.
+- **Shared memory**: 513KB region (0x81000 bytes) — PTE array + 2× (header + 63 pages data)
+- **Layout**: PTE(4KB) + CPU queue header(4KB) + CPU queue data(252KB) + GSP queue header(4KB) + GSP queue data(252KB)
+- **Headers**: MsgqTxHeader (32B: version, size, msgSize, msgCount, writePtr, flags, rxHdrOff, entryOff) + MsgqRxHeader (4B: readPtr)
+- **Protocol**: Lock-free — producer writes TX writePtr, consumer reads RX readPtr. Modular % 63 indexing.
+- **Messages**: Element header (48B: authTag, aad, XOR checksum, seqNum, elemCount) + RPC header (32B: version, "VRPC" signature, function, result, sequence)
+- **Queue init args**: Written to VRAM+126MB via PRAMIN for GSP to find at boot
+- **Mailboxes**: Now carry shared memory physical address (low 32 in MAILBOX0, high 32 in MAILBOX1)
+- **Doorbell**: NV_PGSP_QUEUE_HEAD (0x110C00) write notifies GSP of new messages
+- **Post-boot**: Attempts recv on status queue (no response expected without full boot chain)
+- **Does NOT implement RPC commands** — that is X22+ (INIT command, ACK handling)
 
 ## Language
 The user speaks Spanish. Communicate in Spanish when appropriate.

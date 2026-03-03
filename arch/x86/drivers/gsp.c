@@ -3,6 +3,7 @@
  *
  * Phase 4: Deep probe (HWCFG2, CPUCTL, mailboxes), firmware load + VRAM upload.
  * Phase 5: ELF64 parse, boot sequence (BOOTVEC, CPUCTL start), mailbox handshake.
+ * Phase 6: Shared memory message queues (host↔GSP bidirectional).
  *
  * Reference: envytools (https://envytools.rtfd.io), nouveau driver.
  */
@@ -334,6 +335,286 @@ static int gsp_upload_to_vram(void)
     return verify_ok ? 0 : -1;
 }
 
+/* ── Phase 6: Message Queues ─────────────────────────────────── */
+
+int gsp_queue_init(void)
+{
+    gpu_probe_t *p = gpu_get_probe();
+    if (!p || !p->present || !p->gsp_present) {
+        return -1;
+    }
+
+    /* Allocate 513KB shared memory, page-aligned */
+    gsp.shm_base = mem_alloc_aligned(GSP_SHM_TOTAL_SIZE, GSP_PAGE_SIZE);
+    if (!gsp.shm_base) {
+        serial_puts("[GSP] Failed to allocate shared memory (513KB)\n");
+        return -1;
+    }
+
+    /* Identity-mapped physical address */
+    gsp.shm_phys = (uint64_t)gsp.shm_base;
+
+    /* Zero entire region */
+    memset(gsp.shm_base, 0, GSP_SHM_TOTAL_SIZE);
+
+    uint8_t *base = (uint8_t *)gsp.shm_base;
+
+    /* ── CPU queue TX header (host→GSP) at offset 0x1000 ── */
+    gsp_msgq_tx_hdr_t *cpu_tx = (gsp_msgq_tx_hdr_t *)(base + GSP_SHM_CPUQ_HDR_OFF);
+    cpu_tx->version  = 1;
+    cpu_tx->size     = GSP_MSGQ_NUM_PAGES * GSP_PAGE_SIZE;
+    cpu_tx->msgSize  = GSP_PAGE_SIZE;
+    cpu_tx->msgCount = GSP_MSGQ_NUM_PAGES;
+    cpu_tx->writePtr = 0;
+    cpu_tx->flags    = 0;
+    cpu_tx->rxHdrOff = sizeof(gsp_msgq_tx_hdr_t);   /* RX header follows TX */
+    cpu_tx->entryOff = GSP_SHM_CPUQ_DATA_OFF - GSP_SHM_CPUQ_HDR_OFF;
+
+    /* CPU queue RX header (GSP's read pointer for this queue) */
+    gsp_msgq_rx_hdr_t *cpu_rx = (gsp_msgq_rx_hdr_t *)(base + GSP_SHM_CPUQ_HDR_OFF
+                                                        + sizeof(gsp_msgq_tx_hdr_t));
+    cpu_rx->readPtr = 0;
+
+    /* ── GSP queue TX header (GSP→host) at offset 0x41000 ── */
+    gsp_msgq_tx_hdr_t *gsp_tx = (gsp_msgq_tx_hdr_t *)(base + GSP_SHM_GSPQ_HDR_OFF);
+    gsp_tx->version  = 1;
+    gsp_tx->size     = GSP_MSGQ_NUM_PAGES * GSP_PAGE_SIZE;
+    gsp_tx->msgSize  = GSP_PAGE_SIZE;
+    gsp_tx->msgCount = GSP_MSGQ_NUM_PAGES;
+    gsp_tx->writePtr = 0;
+    gsp_tx->flags    = 0;
+    gsp_tx->rxHdrOff = sizeof(gsp_msgq_tx_hdr_t);
+    gsp_tx->entryOff = GSP_SHM_GSPQ_DATA_OFF - GSP_SHM_GSPQ_HDR_OFF;
+
+    /* GSP queue RX header (our read pointer) */
+    gsp_msgq_rx_hdr_t *gsp_rx = (gsp_msgq_rx_hdr_t *)(base + GSP_SHM_GSPQ_HDR_OFF
+                                                        + sizeof(gsp_msgq_tx_hdr_t));
+    gsp_rx->readPtr = 0;
+
+    gsp.cmd_seq = 0;
+    gsp.rpc_seq = 0;
+    gsp.queues_ready = true;
+
+    serial_puts("[GSP] Message queues: 513KB at 0x");
+    serial_puthex(gsp.shm_phys, 16);
+    serial_puts(" (cpuq@+0x1000, gspq@+0x41000)\n");
+
+    fb_puts(" GSP queues: 513KB OK\n");
+
+    return 0;
+}
+
+/* Write queue init args to VRAM via PRAMIN so GSP finds them at boot */
+static int gsp_queue_write_args(void)
+{
+    gpu_probe_t *p = gpu_get_probe();
+    if (!p || !p->pramin_rw_ok) {
+        serial_puts("[GSP] PRAMIN not writable, cannot write queue args\n");
+        return -1;
+    }
+
+    gsp_msgq_init_args_t args;
+    memset(&args, 0, sizeof(args));
+    args.sharedMemPhysAddr   = gsp.shm_phys;
+    args.pageTableEntryCount = 512;    /* PTEs in first page */
+    args.cmdQueueOffset      = GSP_SHM_CPUQ_HDR_OFF;
+    args.statQueueOffset     = GSP_SHM_GSPQ_HDR_OFF;
+
+    /* Write to VRAM+126MB via PRAMIN window */
+    uint64_t vram_off = (uint64_t)GSP_QUEUE_ARGS_VRAM_MB * 1024 * 1024;
+    uint32_t orig_window = gpu_reg_read(NV_PBUS_BAR0_WINDOW);
+
+    uint32_t window_val = (uint32_t)(vram_off >> 16);
+    gpu_reg_write(NV_PBUS_BAR0_WINDOW, window_val);
+    wmb();
+
+    /* Write args structure as dwords */
+    uint32_t *src = (uint32_t *)&args;
+    uint32_t dwords = sizeof(args) / 4;
+    for (uint32_t i = 0; i < dwords; i++) {
+        gpu_reg_write(NV_PRAMIN_BASE + (i * 4), src[i]);
+    }
+    wmb();
+
+    /* Restore window */
+    gpu_reg_write(NV_PBUS_BAR0_WINDOW, orig_window);
+    wmb();
+
+    serial_puts("[GSP] Queue init args written to VRAM+");
+    serial_putdec(GSP_QUEUE_ARGS_VRAM_MB);
+    serial_puts("MB\n");
+
+    return 0;
+}
+
+static uint32_t gsp_xor_checksum(const uint32_t *data, uint32_t dwords)
+{
+    uint32_t xor = 0;
+    for (uint32_t i = 0; i < dwords; i++)
+        xor ^= data[i];
+    return xor;
+}
+
+int gsp_queue_send(uint32_t function, const void *payload, uint32_t len)
+{
+    if (!gsp.queues_ready) {
+        serial_puts("[GSP] TX: queues not ready\n");
+        return -1;
+    }
+
+    uint8_t *base = (uint8_t *)gsp.shm_base;
+
+    /* Read current write pointer and consumer's read pointer */
+    gsp_msgq_tx_hdr_t *tx_hdr = (gsp_msgq_tx_hdr_t *)(base + GSP_SHM_CPUQ_HDR_OFF);
+    gsp_msgq_rx_hdr_t *rx_hdr = (gsp_msgq_rx_hdr_t *)(base + GSP_SHM_CPUQ_HDR_OFF
+                                                        + sizeof(gsp_msgq_tx_hdr_t));
+
+    uint32_t wp = tx_hdr->writePtr;
+    uint32_t rp = rx_hdr->readPtr;
+
+    /* Check if queue is full */
+    uint32_t next_wp = (wp + 1) % GSP_MSGQ_NUM_PAGES;
+    if (next_wp == rp) {
+        serial_puts("[GSP] TX: queue full\n");
+        return -1;
+    }
+
+    /* Payload must fit in one page minus headers */
+    uint32_t max_payload = GSP_PAGE_SIZE - sizeof(gsp_msg_elem_hdr_t)
+                           - sizeof(gsp_rpc_hdr_t);
+    if (len > max_payload) {
+        serial_puts("[GSP] TX: payload too large (");
+        serial_putdec(len);
+        serial_puts(" > ");
+        serial_putdec(max_payload);
+        serial_puts(")\n");
+        return -1;
+    }
+
+    /* Build message in queue entry */
+    uint8_t *entry = base + GSP_SHM_CPUQ_DATA_OFF + (wp * GSP_PAGE_SIZE);
+    memset(entry, 0, GSP_PAGE_SIZE);
+
+    /* Element header */
+    gsp_msg_elem_hdr_t *elem = (gsp_msg_elem_hdr_t *)entry;
+    elem->seqNum    = gsp.cmd_seq++;
+    elem->elemCount = 1;
+
+    /* RPC header */
+    gsp_rpc_hdr_t *rpc = (gsp_rpc_hdr_t *)(entry + sizeof(gsp_msg_elem_hdr_t));
+    rpc->header_version = GSP_MSG_HDR_VERSION;
+    rpc->signature      = GSP_MSG_SIGNATURE;
+    rpc->length         = sizeof(gsp_rpc_hdr_t) + len;
+    rpc->function       = function;
+    rpc->rpc_result     = 0;
+    rpc->sequence       = gsp.rpc_seq++;
+
+    /* Copy payload */
+    if (payload && len > 0) {
+        uint8_t *dst = entry + sizeof(gsp_msg_elem_hdr_t) + sizeof(gsp_rpc_hdr_t);
+        const uint8_t *src = (const uint8_t *)payload;
+        for (uint32_t i = 0; i < len; i++)
+            dst[i] = src[i];
+    }
+
+    /* XOR checksum over entire page (checksum field set so total XOR = 0) */
+    elem->checkSum = 0;
+    uint32_t xor = gsp_xor_checksum((uint32_t *)entry,
+                                     GSP_PAGE_SIZE / sizeof(uint32_t));
+    elem->checkSum = xor;  /* Now total XOR of page = 0 */
+
+    /* Advance write pointer */
+    wmb();
+    tx_hdr->writePtr = next_wp;
+    wmb();
+
+    /* Ring doorbell */
+    gpu_reg_write(NV_PGSP_QUEUE_HEAD, 0);
+
+    serial_puts("[GSP] TX: func=0x");
+    serial_puthex(function, 8);
+    serial_puts(" seq=");
+    serial_putdec(rpc->sequence);
+    serial_puts(" len=");
+    serial_putdec(len);
+    serial_puts("\n");
+
+    return 0;
+}
+
+int gsp_queue_recv(void *buf, uint32_t buf_size, uint32_t *function)
+{
+    if (!gsp.queues_ready) {
+        return -1;
+    }
+
+    uint8_t *base = (uint8_t *)gsp.shm_base;
+
+    /* Read GSP's write pointer and our read pointer */
+    gsp_msgq_tx_hdr_t *tx_hdr = (gsp_msgq_tx_hdr_t *)(base + GSP_SHM_GSPQ_HDR_OFF);
+    gsp_msgq_rx_hdr_t *rx_hdr = (gsp_msgq_rx_hdr_t *)(base + GSP_SHM_GSPQ_HDR_OFF
+                                                        + sizeof(gsp_msgq_tx_hdr_t));
+
+    rmb();
+    uint32_t wp = tx_hdr->writePtr;
+    uint32_t rp = rx_hdr->readPtr;
+
+    /* Empty? */
+    if (wp == rp) {
+        return -1;
+    }
+
+    rmb();
+
+    /* Read entry */
+    uint8_t *entry = base + GSP_SHM_GSPQ_DATA_OFF + (rp * GSP_PAGE_SIZE);
+
+    /* Validate checksum */
+    uint32_t xor = gsp_xor_checksum((uint32_t *)entry,
+                                     GSP_PAGE_SIZE / sizeof(uint32_t));
+    if (xor != 0) {
+        serial_puts("[GSP] RX: checksum mismatch (xor=0x");
+        serial_puthex(xor, 8);
+        serial_puts(")\n");
+    }
+
+    /* Parse headers */
+    gsp_msg_elem_hdr_t *elem = (gsp_msg_elem_hdr_t *)entry;
+    gsp_rpc_hdr_t *rpc = (gsp_rpc_hdr_t *)(entry + sizeof(gsp_msg_elem_hdr_t));
+
+    if (function)
+        *function = rpc->function;
+
+    /* Copy payload to caller buffer */
+    uint32_t payload_off = sizeof(gsp_msg_elem_hdr_t) + sizeof(gsp_rpc_hdr_t);
+    uint32_t payload_len = 0;
+    if (rpc->length > sizeof(gsp_rpc_hdr_t))
+        payload_len = rpc->length - sizeof(gsp_rpc_hdr_t);
+    if (payload_len > buf_size)
+        payload_len = buf_size;
+
+    if (buf && payload_len > 0) {
+        uint8_t *src = entry + payload_off;
+        uint8_t *dst = (uint8_t *)buf;
+        for (uint32_t i = 0; i < payload_len; i++)
+            dst[i] = src[i];
+    }
+
+    /* Advance read pointer */
+    rx_hdr->readPtr = (rp + 1) % GSP_MSGQ_NUM_PAGES;
+
+    serial_puts("[GSP] RX: func=0x");
+    serial_puthex(rpc->function, 8);
+    serial_puts(" result=0x");
+    serial_puthex(rpc->rpc_result, 8);
+    serial_puts(" seq=");
+    serial_putdec(rpc->sequence);
+    serial_puts("\n");
+
+    (void)elem;
+    return 0;
+}
+
 /* ── Public API: Load firmware ───────────────────────────────── */
 
 int gsp_load_firmware(void)
@@ -454,17 +735,28 @@ int gsp_boot(void)
     gpu_reg_write(NV_PGSP_BASE + NV_FALCON_CPUCTL, NV_FALCON_CPUCTL_HALTED);
     wmb();
 
-    /* ── Step 2: Clear mailboxes ── */
-    gpu_reg_write(NV_PGSP_BASE + NV_FALCON_MAILBOX0, 0);
-    gpu_reg_write(NV_PGSP_BASE + NV_FALCON_MAILBOX1, 0);
+    /* ── Step 2: Write queue init args to VRAM (before clearing mailboxes) ── */
+    if (gsp.queues_ready)
+        gsp_queue_write_args();
+
+    /* ── Step 3: Set mailboxes to shared memory address (for GSP to find queues) ── */
+    if (gsp.queues_ready) {
+        gpu_reg_write(NV_PGSP_BASE + NV_FALCON_MAILBOX0,
+                      (uint32_t)(gsp.shm_phys & 0xFFFFFFFF));
+        gpu_reg_write(NV_PGSP_BASE + NV_FALCON_MAILBOX1,
+                      (uint32_t)(gsp.shm_phys >> 32));
+    } else {
+        gpu_reg_write(NV_PGSP_BASE + NV_FALCON_MAILBOX0, 0);
+        gpu_reg_write(NV_PGSP_BASE + NV_FALCON_MAILBOX1, 0);
+    }
     wmb();
 
-    /* ── Step 3: Set DMATRFBASE (firmware location in VRAM, >> 8) ── */
+    /* ── Step 4: Set DMATRFBASE (firmware location in VRAM, >> 8) ── */
     uint32_t dma_base = (uint32_t)(gsp.vram_offset >> 8);
     gpu_reg_write(NV_PGSP_BASE + NV_FALCON_DMATRFBASE, dma_base);
     wmb();
 
-    /* ── Step 4: Set BOOTVEC (entry point >> 8) ── */
+    /* ── Step 5: Set BOOTVEC (entry point >> 8) ── */
     uint32_t bootvec = (uint32_t)(gsp.elf_entry >> 8);
     gpu_reg_write(NV_PGSP_BASE + NV_FALCON_BOOTVEC, bootvec);
     wmb();
@@ -475,23 +767,26 @@ int gsp_boot(void)
     serial_puthex(bootvec, 8);
     serial_puts("\n");
 
-    /* ── Step 5: Start CPU ── */
+    /* ── Step 6: Start CPU ── */
     serial_puts("[GSP] Boot: starting CPU...\n");
     gpu_reg_write(NV_PGSP_BASE + NV_FALCON_CPUCTL, NV_FALCON_CPUCTL_STARTCPU);
     wmb();
     gsp.booted = true;
 
-    /* ── Step 6: Poll mailbox (timeout ~1 second @ 3GHz) ── */
+    /* ── Step 7: Poll mailbox (timeout ~1 second @ 3GHz) ── */
     serial_puts("[GSP] Boot: polling mailbox (timeout 1s)...\n");
+
+    /* Remember what we wrote so we detect GSP changing it */
+    uint32_t mbox0_initial = gpu_reg_read(NV_PGSP_BASE + NV_FALCON_MAILBOX0);
 
     uint64_t t0 = rdtsc();
     uint64_t timeout_cycles = 3000000000ULL;  /* ~1s @ 3GHz */
-    uint32_t mbox0 = 0;
+    uint32_t mbox0 = mbox0_initial;
 
     while (1) {
         rmb();
         mbox0 = gpu_reg_read(NV_PGSP_BASE + NV_FALCON_MAILBOX0);
-        if (mbox0 != 0)
+        if (mbox0 != mbox0_initial)
             break;
 
         uint64_t elapsed = rdtsc() - t0;
@@ -504,7 +799,7 @@ int gsp_boot(void)
     uint64_t elapsed_ms = elapsed_cycles / 3000000;
 
     gsp.boot_status = mbox0;
-    gsp.boot_ack = (mbox0 != 0);
+    gsp.boot_ack = (mbox0 != mbox0_initial);
 
     if (gsp.boot_ack) {
         /* Success — GSP responded */
@@ -551,6 +846,21 @@ int gsp_boot(void)
         serial_puts("[GSP] Boot: GSP did not respond — firmware may require additional init\n");
 
         fb_puts(" GSP: boot timeout\n");
+    }
+
+    /* ── Post-boot: try to receive init message from GSP ── */
+    if (gsp.boot_ack && gsp.queues_ready) {
+        uint8_t rxbuf[256];
+        uint32_t func;
+        if (gsp_queue_recv(rxbuf, sizeof(rxbuf), &func) == 0) {
+            serial_puts("[GSP] Received init message: func=0x");
+            serial_puthex(func, 8);
+            serial_puts("\n");
+        } else {
+            serial_puts("[GSP] No message on status queue (expected without full boot chain)\n");
+        }
+    } else if (gsp.queues_ready) {
+        serial_puts("[GSP] No message on status queue (expected without full boot chain)\n");
     }
 
     return gsp.boot_ack ? 0 : -1;
