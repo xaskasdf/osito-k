@@ -869,6 +869,271 @@ int gsp_rm_init(void)
     return 0;
 }
 
+/* ── Phase 10: FWSEC-FRTS Execution + WPR2 ───────────────────── */
+
+/*
+ * FWSEC-FRTS: Load FWSEC from VBIOS into GSP Falcon, execute FRTS command
+ * to create WPR2 region in VRAM. This must happen before GSP firmware boot.
+ *
+ * Sequence (Ampere/Ada — direct GSP Falcon):
+ *  1. Halt GSP Falcon
+ *  2. Upload FWSEC image to VRAM via PRAMIN
+ *  3. Set DMATRFBASE to FWSEC location in VRAM
+ *  4. Set BOOTVEC to FWSEC entry point
+ *  5. Set MAILBOX0 = FRTS command, MAILBOX1 = 0
+ *  6. Start Falcon
+ *  7. Poll mailbox for completion
+ *  8. Check for WPR2 metadata in VRAM
+ */
+
+#define FWSEC_VRAM_OFFSET_MB  192   /* Place FWSEC at VRAM+192MB (away from gsp.bin at +128MB) */
+
+int gsp_fwsec_frts(void)
+{
+    gpu_probe_t *p = gpu_get_probe();
+    fwsec_state_t *fw = gpu_get_fwsec();
+
+    if (!p || !p->present || !p->gsp_present) {
+        serial_puts("[FWSEC] No GPU/GSP detected\n");
+        return -1;
+    }
+
+    if (!fw || !fw->found || !fw->data || fw->size == 0) {
+        serial_puts("[FWSEC] No FWSEC image available (VBIOS parse may have failed)\n");
+        return -1;
+    }
+
+    if (!p->pramin_rw_ok) {
+        serial_puts("[FWSEC] PRAMIN not writable, cannot upload FWSEC\n");
+        return -1;
+    }
+
+    uint64_t vram_bytes = (uint64_t)p->vram_size_mb * 1024 * 1024;
+    uint64_t fwsec_vram_off = (uint64_t)FWSEC_VRAM_OFFSET_MB * 1024 * 1024;
+
+    if (vram_bytes < fwsec_vram_off + fw->size) {
+        serial_puts("[FWSEC] Not enough VRAM for FWSEC placement\n");
+        return -1;
+    }
+
+    serial_puts("[FWSEC] === FWSEC-FRTS Execution ===\n");
+    serial_puts("[FWSEC] Image: ");
+    serial_putdec(fw->size);
+    serial_puts(" bytes, target=0x");
+    serial_puthex(fw->target_id, 2);
+    serial_puts("\n");
+
+    /* ── Step 1: Halt Falcon ── */
+    serial_puts("[FWSEC] Step 1: Halting GSP Falcon...\n");
+    gpu_reg_write(NV_PGSP_BASE + NV_FALCON_CPUCTL, NV_FALCON_CPUCTL_HALTED);
+    wmb();
+
+    /* Verify halted */
+    uint32_t cpuctl = gpu_reg_read(NV_PGSP_BASE + NV_FALCON_CPUCTL);
+    if (!(cpuctl & NV_FALCON_CPUCTL_HALTED)) {
+        serial_puts("[FWSEC] WARNING: Falcon did not halt (CPUCTL=0x");
+        serial_puthex(cpuctl, 8);
+        serial_puts(")\n");
+    }
+
+    /* ── Step 2: Upload FWSEC to VRAM via PRAMIN ── */
+    serial_puts("[FWSEC] Step 2: Uploading FWSEC to VRAM+");
+    serial_putdec(FWSEC_VRAM_OFFSET_MB);
+    serial_puts("MB...\n");
+
+    uint32_t orig_window = gpu_reg_read(NV_PBUS_BAR0_WINDOW);
+
+    uint64_t uploaded = 0;
+    uint32_t *src32 = (uint32_t *)fw->data;
+
+    while (uploaded < fw->size) {
+        uint64_t vram_addr = fwsec_vram_off + uploaded;
+        uint32_t window_val = (uint32_t)(vram_addr >> 16);
+        gpu_reg_write(NV_PBUS_BAR0_WINDOW, window_val);
+        wmb();
+
+        uint64_t chunk = fw->size - uploaded;
+        if (chunk > NV_PRAMIN_SIZE)
+            chunk = NV_PRAMIN_SIZE;
+
+        uint32_t pramin_start = (uint32_t)(vram_addr & (NV_PRAMIN_SIZE - 1));
+        uint32_t available = NV_PRAMIN_SIZE - pramin_start;
+        if (chunk > available)
+            chunk = available;
+
+        uint32_t dwords = (uint32_t)((chunk + 3) / 4);
+        for (uint32_t i = 0; i < dwords; i++)
+            gpu_reg_write(NV_PRAMIN_BASE + pramin_start + (i * 4),
+                          src32[(uploaded / 4) + i]);
+        wmb();
+
+        uploaded += chunk;
+    }
+
+    serial_puts("[FWSEC] Uploaded ");
+    serial_putdec(uploaded);
+    serial_puts(" bytes\n");
+
+    /* Verify first 4 dwords */
+    gpu_reg_write(NV_PBUS_BAR0_WINDOW, (uint32_t)(fwsec_vram_off >> 16));
+    wmb();
+    rmb();
+
+    uint32_t v0 = gpu_reg_read(NV_PRAMIN_BASE);
+    uint32_t v1 = gpu_reg_read(NV_PRAMIN_BASE + 4);
+    bool verify_ok = (v0 == src32[0] && v1 == src32[1]);
+
+    serial_puts("[FWSEC] Verify: ");
+    serial_puthex(v0, 8);
+    serial_puts(" ");
+    serial_puthex(v1, 8);
+    serial_puts(verify_ok ? " OK\n" : " MISMATCH\n");
+
+    /* ── Step 3: Set DMATRFBASE ── */
+    uint32_t dma_base = (uint32_t)(fwsec_vram_off >> 8);
+    gpu_reg_write(NV_PGSP_BASE + NV_FALCON_DMATRFBASE, dma_base);
+    wmb();
+
+    /* ── Step 4: Set BOOTVEC ── */
+    /* FWSEC entry point is typically at offset 0 */
+    uint32_t bootvec = 0;
+    gpu_reg_write(NV_PGSP_BASE + NV_FALCON_BOOTVEC, bootvec);
+    wmb();
+
+    /* ── Step 5: Set mailboxes with FRTS command ── */
+    gpu_reg_write(NV_PGSP_BASE + NV_FALCON_MAILBOX0, FWSEC_FRTS_CMD);
+    gpu_reg_write(NV_PGSP_BASE + NV_FALCON_MAILBOX1, 0);
+    wmb();
+
+    serial_puts("[FWSEC] Step 3-5: DMATRFBASE=0x");
+    serial_puthex(dma_base, 8);
+    serial_puts(" BOOTVEC=0x");
+    serial_puthex(bootvec, 8);
+    serial_puts(" MAILBOX0=0x");
+    serial_puthex(FWSEC_FRTS_CMD, 2);
+    serial_puts("\n");
+
+    /* ── Step 6: Start Falcon ── */
+    serial_puts("[FWSEC] Step 6: Starting Falcon (FWSEC-FRTS)...\n");
+    gpu_reg_write(NV_PGSP_BASE + NV_FALCON_CPUCTL, NV_FALCON_CPUCTL_STARTCPU);
+    wmb();
+
+    /* ── Step 7: Poll mailbox for completion ── */
+    serial_puts("[FWSEC] Step 7: Polling mailbox (timeout 2s)...\n");
+
+    uint64_t t0 = rdtsc();
+    uint64_t timeout_cycles = 6000000000ULL;  /* ~2s @ 3GHz */
+    uint32_t mbox0;
+    bool responded = false;
+
+    while (1) {
+        rmb();
+        mbox0 = gpu_reg_read(NV_PGSP_BASE + NV_FALCON_MAILBOX0);
+
+        /* FWSEC clears or changes mailbox when done */
+        if (mbox0 != FWSEC_FRTS_CMD) {
+            responded = true;
+            break;
+        }
+
+        uint64_t elapsed = rdtsc() - t0;
+        if (elapsed >= timeout_cycles)
+            break;
+    }
+
+    uint64_t t1 = rdtsc();
+    uint64_t elapsed_ms = (t1 - t0) / 3000000;
+
+    cpuctl = gpu_reg_read(NV_PGSP_BASE + NV_FALCON_CPUCTL);
+    uint32_t mbox1 = gpu_reg_read(NV_PGSP_BASE + NV_FALCON_MAILBOX1);
+
+    if (responded) {
+        serial_puts("[FWSEC] FRTS completed in ~");
+        serial_putdec(elapsed_ms);
+        serial_puts(" ms, MAILBOX0=0x");
+        serial_puthex(mbox0, 8);
+        serial_puts(" MAILBOX1=0x");
+        serial_puthex(mbox1, 8);
+        serial_puts("\n");
+    } else {
+        serial_puts("[FWSEC] FRTS TIMEOUT after ");
+        serial_putdec(elapsed_ms);
+        serial_puts(" ms\n");
+        serial_puts("[FWSEC] CPUCTL=0x");
+        serial_puthex(cpuctl, 8);
+        serial_puts(" MAILBOX0=0x");
+        serial_puthex(mbox0, 8);
+        serial_puts(" MAILBOX1=0x");
+        serial_puthex(mbox1, 8);
+        serial_puts("\n");
+
+        if (cpuctl & NV_FALCON_CPUCTL_HALTED)
+            serial_puts("[FWSEC] Falcon HALTED — FWSEC may require SEC2 bootstrap\n");
+    }
+
+    /* ── Step 8: Check for WPR2 metadata ── */
+    serial_puts("[FWSEC] Step 8: Checking for WPR2 metadata...\n");
+
+    /* WPR2 metadata is typically at the end of VRAM minus a page */
+    /* Try several known locations: end-4KB, end-1MB, specific offsets */
+    uint64_t wpr2_check_offsets[] = {
+        vram_bytes - 4096,              /* End of VRAM - 4KB */
+        vram_bytes - (1024 * 1024),     /* End of VRAM - 1MB */
+        vram_bytes - (2 * 1024 * 1024), /* End of VRAM - 2MB */
+    };
+
+    bool wpr2_found = false;
+    for (int i = 0; i < 3 && !wpr2_found; i++) {
+        uint64_t check_off = wpr2_check_offsets[i];
+        if (check_off >= vram_bytes)
+            continue;
+
+        gpu_reg_write(NV_PBUS_BAR0_WINDOW, (uint32_t)(check_off >> 16));
+        wmb();
+        rmb();
+
+        uint32_t pramin_off = (uint32_t)(check_off & (NV_PRAMIN_SIZE - 1));
+        uint32_t magic = gpu_reg_read(NV_PRAMIN_BASE + pramin_off);
+
+        if (magic == WPR2_MAGIC) {
+            serial_puts("[FWSEC] WPR2 metadata found at VRAM+0x");
+            serial_puthex(check_off, 16);
+            serial_puts("!\n");
+
+            /* Read WPR meta fields for diagnostics */
+            uint32_t rev = gpu_reg_read(NV_PRAMIN_BASE + pramin_off + 4);
+            serial_puts("[FWSEC] WPR2 revision: ");
+            serial_putdec(rev);
+            serial_puts("\n");
+
+            wpr2_found = true;
+        }
+    }
+
+    if (!wpr2_found)
+        serial_puts("[FWSEC] WPR2 metadata not found (expected without full secure boot chain)\n");
+
+    /* Restore PRAMIN window */
+    gpu_reg_write(NV_PBUS_BAR0_WINDOW, orig_window);
+    wmb();
+
+    /* Halt Falcon — ready for GSP firmware re-boot */
+    gpu_reg_write(NV_PGSP_BASE + NV_FALCON_CPUCTL, NV_FALCON_CPUCTL_HALTED);
+    wmb();
+
+    serial_puts("[FWSEC] === FWSEC-FRTS ");
+    serial_puts(responded ? "completed" : "timed out");
+    serial_puts(wpr2_found ? " — WPR2 active" : " — no WPR2");
+    serial_puts(" ===\n");
+
+    fb_puts(" FWSEC: ");
+    fb_puts(responded ? "FRTS done" : "FRTS timeout");
+    fb_puts(wpr2_found ? ", WPR2 OK" : ", no WPR2");
+    fb_puts("\n");
+
+    return responded ? 0 : -1;
+}
+
 /* ── Public API: Load firmware ───────────────────────────────── */
 
 int gsp_load_firmware(void)
@@ -973,6 +1238,9 @@ int gsp_boot(void)
         serial_puts("[GSP] ELF parse failed, skipping boot\n");
         return -1;
     }
+
+    /* ── Pre-boot: FWSEC-FRTS (create WPR2 before GSP firmware boot) ── */
+    gsp_fwsec_frts();
 
     /* Pre-conditions */
     if (!gsp.fw_uploaded) {

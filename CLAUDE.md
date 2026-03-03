@@ -118,9 +118,9 @@ arch/x86/kernel/framebuffer.c       GOP 32bpp text console (8×16 font)
 arch/x86/kernel/pci.c               PCIe enumeration (ECAM via MCFG, BAR size detection)
 arch/x86/kernel/memory.c            Physical memory manager (bitmap, 4KB pages)
 arch/x86/drivers/nvme.c             Minimal NVMe driver (admin+IO queues, read-only)
-arch/x86/drivers/gpu.h              GPU types, MMIO register defines, Falcon defines, RPC IDs, probe + GSP API
-arch/x86/drivers/gpu.c              GPU probe Phase 1-3 (chip ID, engines, VRAM, BAR1 R/W, PRAMIN R/W)
-arch/x86/drivers/gsp.c              GSP Falcon driver: probe, firmware load, ELF parse, boot, queues, RPC (Phase 4-7)
+arch/x86/drivers/gpu.h              GPU types, MMIO register defines, Falcon defines, RPC IDs, VBIOS/BIT/FWSEC/WPR2 structs, probe + GSP API
+arch/x86/drivers/gpu.c              GPU probe Phase 1-3 + Phase 9 VBIOS read, BIT parse, FWSEC extraction
+arch/x86/drivers/gsp.c              GSP Falcon driver: probe, firmware load, ELF parse, boot, queues, RPC, FWSEC-FRTS (Phase 4-10)
 arch/x86/fs/ositofs2.c              OsitoFS v2 bare-metal driver (mount, list, read)
 arch/x86/fs/gpt.h                   GPT structs (UEFI spec) + API
 arch/x86/fs/gpt.c                   GPT parser (name match + superblock magic probe)
@@ -262,6 +262,9 @@ Tasks:   idle, input, shell (3 of 8 slots used)
 | **X21** | **GSP message queues** (shared memory, TX/RX primitives, init args to VRAM) — Phase 6 | Done |
 | **X22** | **GSP-RM RPC protocol** (function IDs, poll with timeout, init sequence) — Phase 7 | Done |
 | **X23** | **GSP-RM init commands** (SET_SYSTEM_INFO, ALLOC_ROOT, ALLOC_DEVICE, INIT_POST_OBJGPU) — Phase 8 | Done |
+| **X24** | **VBIOS read** (PRAMIN window read, ROM+PCIR parse, image chain enumeration) — Phase 9 | Done |
+| **X25** | **BIT table parse** (BIT scan, Falcon ucode table, FWSEC extraction) — Phase 9 | Done |
+| **X26** | **FWSEC-FRTS execution** (FWSEC upload to VRAM, Falcon boot, WPR2 creation attempt) — Phase 10 | Done |
 
 ### F12: DOOM Wireframe 2.5D
 Procedural level generator (4x4 grid, snake path connectivity) + wall-segment projection renderer.
@@ -380,6 +383,35 @@ RPC protocol layer on top of X21 message queues. Function IDs, polling, init seq
 - **Graceful degradation**: Each step logs and continues on timeout. Without full boot chain, all polls timeout — expected behavior.
 - **Integration**: Called from `gsp_boot()` after `gsp_rpc_init()`. Independent guard on `queues_ready`.
 - **Does NOT implement RM control** — that is X24+ (secure boot chain, GPU compute)
+
+### X24: VBIOS Read from VRAM (Phase 9)
+Read VBIOS from VRAM via PRAMIN window, parse ROM+PCIR image chain.
+- **Read method**: PRAMIN window at VRAM offset 0, reads 64KB initial then extends if needed (max 256KB)
+- **ROM header**: 0xAA55 signature, PCIR offset field at byte 24
+- **PCIR chain**: Each image has PCIR with vendor/device ID, code_type, image_length (512B units), last_image flag
+- **Code types**: PciAt (0x00), UEFI (0x03), FwSec (0xE0) — FwSec images identified for X25/X26
+- **Fallback**: Tries offset 0x1000 if no signature at offset 0
+- **Safety**: Read-only VRAM access. PRAMIN window saved/restored. No GPU register writes.
+- **Integration**: Called from `gpu_init()` after Phase 3 PRAMIN R/W test
+
+### X25: BIT Table Parse + FWSEC Extraction (Phase 9)
+Parse BIT (BIOS Information Table) from VBIOS, extract FWSEC blob.
+- **BIT scan**: Linear scan for "BIT\0" signature in VBIOS data
+- **Token 0x70**: Falcon Data token points to Falcon Ucode Table
+- **Ucode table**: Header + descriptors with application_id (0x01=FWSEC), target_id (0x03=GSP), VBIOS offset
+- **Fallback**: If no BIT found, uses PCIR code_type=0xE0 images from X24 directly
+- **State**: `fwsec_state_t` holds pointer into VBIOS buffer (no separate allocation)
+- **Safety**: Parse-only, no writes. Graceful on missing BIT or missing Falcon token.
+
+### X26: FWSEC-FRTS Execution + WPR2 Creation (Phase 10)
+Load FWSEC into GSP Falcon, execute FRTS command to create WPR2 region.
+- **Upload**: FWSEC image → VRAM+192MB via PRAMIN (same pattern as gsp.bin upload)
+- **Boot sequence**: Halt → DMATRFBASE → BOOTVEC=0 → MAILBOX0=0x15 (FRTS cmd) → STARTCPU
+- **Poll**: Waits for mailbox change (2s timeout @ 3GHz)
+- **WPR2 check**: Scans end-of-VRAM offsets (-4KB, -1MB, -2MB) for 0x57505232 "WPR2" magic
+- **Post-execution**: Halts Falcon, ready for gsp.bin re-boot
+- **Safety**: Timeout-based, never hangs. Falcon returns to HALTED on failure.
+- **Known limitation**: Without full SEC2 bootstrap chain, FWSEC may not execute on all GPUs. Expected behavior for initial implementation.
 
 ## Language
 The user speaks Spanish. Communicate in Spanish when appropriate.

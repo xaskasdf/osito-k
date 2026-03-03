@@ -469,6 +469,387 @@ static void gpu_report_bars(gpu_device_t *dev)
     fb_puts(" MB\n");
 }
 
+/* ── Phase 9: VBIOS Read + BIT Parse ─────────────────────────── */
+
+extern void *mem_alloc_aligned(uint64_t size, uint64_t alignment);
+
+static vbios_state_t vbios;
+static fwsec_state_t fwsec;
+
+static const char *vbios_code_type_name(uint8_t code_type)
+{
+    if (code_type == VBIOS_CODE_TYPE_PCAT)  return "PciAt";
+    if (code_type == VBIOS_CODE_TYPE_UEFI)  return "UEFI";
+    if (code_type == VBIOS_CODE_TYPE_FWSEC) return "FwSec";
+    return "Unknown";
+}
+
+int gpu_read_vbios(void)
+{
+    gpu_probe_t *p = &gpu.probe;
+
+    if (!p->present || !p->pramin_accessible) {
+        serial_puts("[GPU] VBIOS: no PRAMIN access, skipping\n");
+        return -1;
+    }
+
+    memset(&vbios, 0, sizeof(vbios));
+    memset(&fwsec, 0, sizeof(fwsec));
+
+    serial_puts("[GPU] VBIOS: reading via PRAMIN...\n");
+
+    /* Allocate 256KB buffer */
+    vbios.data = (uint8_t *)mem_alloc_aligned(VBIOS_MAX_SIZE, 4096);
+    if (!vbios.data) {
+        serial_puts("[GPU] VBIOS: failed to allocate 256KB buffer\n");
+        return -1;
+    }
+    memset(vbios.data, 0, VBIOS_MAX_SIZE);
+
+    /* Save original PRAMIN window */
+    uint32_t orig_window = gpu_read(NV_PBUS_BAR0_WINDOW);
+
+    /* Slide window to VRAM offset 0 (where VBIOS lives) */
+    gpu_write(NV_PBUS_BAR0_WINDOW, 0);
+    wmb();
+    rmb();
+
+    /* Read first 64KB through PRAMIN */
+    uint32_t *dst32 = (uint32_t *)vbios.data;
+    uint32_t first_read = 64 * 1024;
+    for (uint32_t i = 0; i < first_read / 4; i++)
+        dst32[i] = gpu_read(NV_PRAMIN_BASE + (i * 4));
+
+    /* Check 0xAA55 signature */
+    vbios_rom_hdr_t *rom = (vbios_rom_hdr_t *)vbios.data;
+    if (rom->signature != 0xAA55) {
+        serial_puts("[GPU] VBIOS: no 0xAA55 signature (got 0x");
+        serial_puthex(rom->signature, 4);
+        serial_puts("), trying offset 0x1000...\n");
+
+        /* Some GPUs store VBIOS at 0x1000 offset in VRAM */
+        rom = (vbios_rom_hdr_t *)(vbios.data + 0x1000);
+        if (rom->signature != 0xAA55) {
+            serial_puts("[GPU] VBIOS: no valid ROM signature found\n");
+            gpu_write(NV_PBUS_BAR0_WINDOW, orig_window);
+            wmb();
+            return -1;
+        }
+        /* Shift data so image chain starts at vbios.data[0] */
+        uint8_t *shifted = vbios.data + 0x1000;
+        for (uint32_t i = 0; i < first_read - 0x1000; i++)
+            vbios.data[i] = shifted[i];
+        first_read -= 0x1000;
+        rom = (vbios_rom_hdr_t *)vbios.data;
+    }
+
+    serial_puts("[GPU] VBIOS: 0xAA55 signature OK, PCIR at +0x");
+    serial_puthex(rom->pcir_offset, 4);
+    serial_puts("\n");
+
+    /* Parse image chain via PCIR structures */
+    uint32_t offset = 0;
+    uint32_t total_size = 0;
+
+    while (offset < first_read && vbios.image_count < VBIOS_MAX_IMAGES) {
+        vbios_rom_hdr_t *hdr = (vbios_rom_hdr_t *)(vbios.data + offset);
+
+        /* Each image starts with 0xAA55 */
+        if (hdr->signature != 0xAA55) {
+            /* Allow first image without signature check (already validated) */
+            if (offset > 0)
+                break;
+        }
+
+        /* Find PCIR */
+        uint16_t pcir_off = hdr->pcir_offset;
+        if (pcir_off == 0 || offset + pcir_off + sizeof(vbios_pcir_t) > VBIOS_MAX_SIZE)
+            break;
+
+        vbios_pcir_t *pcir = (vbios_pcir_t *)(vbios.data + offset + pcir_off);
+
+        /* Validate PCIR signature */
+        if (pcir->signature[0] != 'P' || pcir->signature[1] != 'C' ||
+            pcir->signature[2] != 'I' || pcir->signature[3] != 'R') {
+            serial_puts("[GPU] VBIOS: invalid PCIR at +0x");
+            serial_puthex(offset + pcir_off, 4);
+            serial_puts("\n");
+            break;
+        }
+
+        uint32_t img_size = (uint32_t)pcir->image_length * 512;
+
+        vbios_image_t *img = &vbios.images[vbios.image_count];
+        img->offset    = offset;
+        img->size      = img_size;
+        img->code_type = pcir->code_type;
+        img->vendor_id = pcir->vendor_id;
+        img->device_id = pcir->device_id;
+
+        serial_puts("[GPU] VBIOS image ");
+        serial_putdec(vbios.image_count);
+        serial_puts(": ");
+        serial_puts(vbios_code_type_name(pcir->code_type));
+        serial_puts(", ");
+        serial_putdec(img_size);
+        serial_puts(" bytes at +0x");
+        serial_puthex(offset, 4);
+        serial_puts("\n");
+
+        if (pcir->code_type == VBIOS_CODE_TYPE_FWSEC)
+            vbios.fwsec_count++;
+
+        vbios.image_count++;
+        total_size = offset + img_size;
+
+        /* Last image? */
+        if (pcir->last_image & 0x80)
+            break;
+
+        offset += img_size;
+    }
+
+    /* If total exceeds first 64KB read, read remaining via window slide */
+    if (total_size > first_read && total_size <= VBIOS_MAX_SIZE) {
+        uint32_t remaining = total_size - first_read;
+        uint32_t read_off = first_read;
+
+        serial_puts("[GPU] VBIOS: reading additional ");
+        serial_putdec(remaining / 1024);
+        serial_puts("KB...\n");
+
+        /* Slide PRAMIN window for 64KB..total_size range */
+        /* Each window covers 1MB but we only need small chunks */
+        while (remaining > 0) {
+            uint32_t chunk = remaining;
+            uint32_t window_offset = read_off & ~(NV_PRAMIN_SIZE - 1);
+            uint32_t pramin_start = read_off - window_offset;
+
+            if (chunk > NV_PRAMIN_SIZE - pramin_start)
+                chunk = NV_PRAMIN_SIZE - pramin_start;
+
+            uint32_t window_val = window_offset >> 16;
+            gpu_write(NV_PBUS_BAR0_WINDOW, window_val);
+            wmb();
+            rmb();
+
+            uint32_t dwords = (chunk + 3) / 4;
+            for (uint32_t i = 0; i < dwords; i++)
+                dst32[(read_off / 4) + i] = gpu_read(NV_PRAMIN_BASE + pramin_start + (i * 4));
+
+            read_off += chunk;
+            remaining -= chunk;
+        }
+    }
+
+    /* Restore PRAMIN window */
+    gpu_write(NV_PBUS_BAR0_WINDOW, orig_window);
+    wmb();
+
+    vbios.size = total_size;
+    vbios.valid = (vbios.image_count > 0);
+
+    serial_puts("[GPU] VBIOS: ");
+    serial_putdec(vbios.image_count);
+    serial_puts(" images, total ");
+    serial_putdec(total_size);
+    serial_puts(" bytes\n");
+
+    if (vbios.fwsec_count > 0) {
+        serial_puts("[GPU] VBIOS: ");
+        serial_putdec(vbios.fwsec_count);
+        serial_puts(" FwSec image(s) found\n");
+    }
+
+    fb_puts("  VBIOS: ");
+    fb_putdec(vbios.image_count);
+    fb_puts(" images, ");
+    fb_putdec(total_size / 1024);
+    fb_puts("KB");
+    if (vbios.fwsec_count > 0) {
+        fb_puts(", ");
+        fb_putdec(vbios.fwsec_count);
+        fb_puts(" FwSec");
+    }
+    fb_puts("\n");
+
+    return vbios.valid ? 0 : -1;
+}
+
+/* ── BIT Table Parse + FWSEC Extraction ──────────────────────── */
+
+int gpu_parse_bit(void)
+{
+    if (!vbios.valid || !vbios.data) {
+        serial_puts("[GPU] BIT: no valid VBIOS data\n");
+        return -1;
+    }
+
+    /* Scan for "BIT\0" signature in VBIOS */
+    uint32_t bit_offset = 0;
+    bool bit_found = false;
+
+    for (uint32_t i = 0; i + 4 <= vbios.size; i++) {
+        uint32_t sig = *(uint32_t *)(vbios.data + i);
+        if (sig == BIT_SIGNATURE) {
+            bit_offset = i;
+            bit_found = true;
+            break;
+        }
+    }
+
+    if (!bit_found) {
+        serial_puts("[GPU] BIT: signature not found in VBIOS\n");
+
+        /* Fallback: use PCIR-based FwSec images directly (X24 already found them) */
+        if (vbios.fwsec_count > 0) {
+            /* Use last FwSec image (typically FWSEC-FRTS) */
+            for (uint32_t i = 0; i < vbios.image_count; i++) {
+                if (vbios.images[i].code_type == VBIOS_CODE_TYPE_FWSEC) {
+                    fwsec.data = vbios.data + vbios.images[i].offset;
+                    fwsec.size = vbios.images[i].size;
+                    fwsec.vbios_offset = vbios.images[i].offset;
+                    fwsec.target_id = FALCON_TARGET_GSP;
+                    fwsec.found = true;
+
+                    serial_puts("[GPU] FWSEC: using PCIR image ");
+                    serial_putdec(i);
+                    serial_puts(", ");
+                    serial_putdec(fwsec.size);
+                    serial_puts(" bytes at +0x");
+                    serial_puthex(fwsec.vbios_offset, 4);
+                    serial_puts("\n");
+                }
+            }
+            return fwsec.found ? 0 : -1;
+        }
+        return -1;
+    }
+
+    serial_puts("[GPU] BIT: found at +0x");
+    serial_puthex(bit_offset, 4);
+    serial_puts("\n");
+
+    bit_header_t *bit = (bit_header_t *)(vbios.data + bit_offset);
+
+    serial_puts("[GPU] BIT: v");
+    serial_putdec(bit->version_major);
+    serial_puts(".");
+    serial_putdec(bit->version_minor);
+    serial_puts(", ");
+    serial_putdec(bit->token_count);
+    serial_puts(" tokens (entry_size=");
+    serial_putdec(bit->token_entry_size);
+    serial_puts(")\n");
+
+    /* Validate token entry size */
+    if (bit->token_entry_size < sizeof(bit_token_t)) {
+        serial_puts("[GPU] BIT: token entry size too small\n");
+        return -1;
+    }
+
+    /* Iterate tokens */
+    uint8_t *token_base = (uint8_t *)bit + bit->header_size;
+    bool found_falcon = false;
+
+    for (uint8_t t = 0; t < bit->token_count; t++) {
+        bit_token_t *tok = (bit_token_t *)(token_base + t * bit->token_entry_size);
+
+        if (tok->id == BIT_TOKEN_FALCON_DATA) {
+            serial_puts("[GPU] BIT: Falcon Data token at +0x");
+            serial_puthex(tok->data_offset, 4);
+            serial_puts(" (");
+            serial_putdec(tok->data_size);
+            serial_puts(" bytes)\n");
+
+            found_falcon = true;
+
+            /* Parse Falcon Ucode Table */
+            if (tok->data_offset + sizeof(falcon_ucode_table_hdr_t) > vbios.size)
+                break;
+
+            falcon_ucode_table_hdr_t *tbl =
+                (falcon_ucode_table_hdr_t *)(vbios.data + tok->data_offset);
+
+            serial_puts("[GPU] Falcon ucode table: ");
+            serial_putdec(tbl->entry_count);
+            serial_puts(" entries (desc_size=");
+            serial_putdec(tbl->desc_size);
+            serial_puts(")\n");
+
+            if (tbl->desc_size < sizeof(falcon_ucode_desc_t))
+                break;
+
+            uint8_t *desc_base = (uint8_t *)tbl + tbl->header_size;
+
+            for (uint8_t e = 0; e < tbl->entry_count; e++) {
+                falcon_ucode_desc_t *desc =
+                    (falcon_ucode_desc_t *)(desc_base + e * tbl->desc_size);
+
+                serial_puts("[GPU]   ucode[");
+                serial_putdec(e);
+                serial_puts("]: app=0x");
+                serial_puthex(desc->application_id, 2);
+                serial_puts(" target=0x");
+                serial_puthex(desc->target_id, 2);
+                serial_puts(" size=");
+                serial_putdec(desc->stored_size);
+                serial_puts(" at +0x");
+                serial_puthex(desc->vbios_offset, 4);
+                serial_puts("\n");
+
+                /* Look for FWSEC application */
+                if (desc->application_id == FALCON_APP_FWSEC &&
+                    desc->vbios_offset + desc->stored_size <= vbios.size) {
+                    fwsec.data = vbios.data + desc->vbios_offset;
+                    fwsec.size = desc->stored_size;
+                    fwsec.vbios_offset = desc->vbios_offset;
+                    fwsec.target_id = desc->target_id;
+                    fwsec.found = true;
+
+                    serial_puts("[GPU] FWSEC: extracted, ");
+                    serial_putdec(fwsec.size);
+                    serial_puts(" bytes, target=0x");
+                    serial_puthex(fwsec.target_id, 2);
+                    serial_puts("\n");
+                }
+            }
+            break;
+        }
+    }
+
+    if (!found_falcon) {
+        serial_puts("[GPU] BIT: no Falcon Data token (0x70) found\n");
+
+        /* Fallback to PCIR-based FwSec images */
+        if (vbios.fwsec_count > 0) {
+            for (uint32_t i = 0; i < vbios.image_count; i++) {
+                if (vbios.images[i].code_type == VBIOS_CODE_TYPE_FWSEC) {
+                    fwsec.data = vbios.data + vbios.images[i].offset;
+                    fwsec.size = vbios.images[i].size;
+                    fwsec.vbios_offset = vbios.images[i].offset;
+                    fwsec.target_id = FALCON_TARGET_GSP;
+                    fwsec.found = true;
+                }
+            }
+            serial_puts("[GPU] FWSEC: fallback to PCIR image, ");
+            serial_putdec(fwsec.size);
+            serial_puts(" bytes\n");
+        }
+    }
+
+    if (fwsec.found) {
+        fb_puts("  FWSEC: ");
+        fb_putdec(fwsec.size / 1024);
+        fb_puts("KB extracted\n");
+    }
+
+    return fwsec.found ? 0 : -1;
+}
+
+vbios_state_t *gpu_get_vbios(void)  { return &vbios; }
+fwsec_state_t *gpu_get_fwsec(void)  { return &fwsec; }
+
 /* ── Public API ──────────────────────────────────────────────── */
 
 int gpu_init(uint64_t bar0_phys)
@@ -517,6 +898,10 @@ int gpu_init(uint64_t bar0_phys)
 
     serial_puts("[GPU] Phase 3 probe complete\n");
     fb_puts("  Phase 3 probe complete\n");
+
+    /* Phase 9: VBIOS read + BIT parse + FWSEC extraction */
+    if (gpu_read_vbios() == 0)
+        gpu_parse_bit();
 
     return 0;
 }

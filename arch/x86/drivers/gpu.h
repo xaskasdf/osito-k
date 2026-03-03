@@ -10,6 +10,8 @@
  * Phase 6: GSP shared memory message queues (host↔GSP bidirectional).
  * Phase 7: RPC protocol (function IDs, poll with timeout, init sequence).
  * Phase 8: RM init commands (SET_SYSTEM_INFO, ALLOC_ROOT, etc.).
+ * Phase 9: VBIOS read + BIT parse + FWSEC extraction.
+ * Phase 10: FWSEC-FRTS execution + WPR2 creation.
  */
 
 #ifndef OSITOK_GPU_H
@@ -275,6 +277,144 @@ typedef struct {
     /* ... many more fields (~0x6c8 bytes total, not parsed yet) ... */
 } gsp_static_info_t;
 
+/* ── VBIOS ROM Structures (Phase 9) ──────────────────────────── */
+
+/* VBIOS ROM header (at offset 0x00 of each image) */
+typedef struct {
+    uint16_t signature;       /* 0xAA55 */
+    uint8_t  reserved[22];
+    uint16_t pcir_offset;     /* Offset to PCIR structure */
+} __attribute__((packed)) vbios_rom_hdr_t;
+
+/* PCIR structure (PCI Data Structure, PCI spec 3.0 §6.3.1.2) */
+typedef struct {
+    uint8_t  signature[4];    /* "PCIR" */
+    uint16_t vendor_id;
+    uint16_t device_id;
+    uint16_t device_list_off;
+    uint16_t pcir_length;
+    uint8_t  pcir_revision;
+    uint8_t  class_code[3];
+    uint16_t image_length;    /* In 512-byte units */
+    uint16_t image_revision;
+    uint8_t  code_type;       /* 0x00=x86, 0x03=UEFI, 0xE0=FwSec */
+    uint8_t  last_image;      /* Bit 7 = last image flag */
+    uint16_t max_runtime_size;
+} __attribute__((packed)) vbios_pcir_t;
+
+/* VBIOS code type constants */
+#define VBIOS_CODE_TYPE_PCAT   0x00
+#define VBIOS_CODE_TYPE_UEFI   0x03
+#define VBIOS_CODE_TYPE_FWSEC  0xE0
+
+/* VBIOS image descriptor */
+#define VBIOS_MAX_IMAGES  8
+typedef struct {
+    uint32_t offset;          /* Offset within VBIOS data */
+    uint32_t size;            /* Image size in bytes */
+    uint8_t  code_type;       /* Code type from PCIR */
+    uint16_t vendor_id;       /* PCI vendor from PCIR */
+    uint16_t device_id;       /* PCI device from PCIR */
+} vbios_image_t;
+
+/* VBIOS state */
+#define VBIOS_MAX_SIZE  (256 * 1024)  /* 256KB max VBIOS */
+typedef struct {
+    uint8_t       *data;          /* Allocated VBIOS buffer */
+    uint32_t       size;          /* Total VBIOS size */
+    uint32_t       image_count;
+    vbios_image_t  images[VBIOS_MAX_IMAGES];
+    uint32_t       fwsec_count;   /* Number of FwSec images */
+    bool           valid;
+} vbios_state_t;
+
+/* ── BIT Table Structures (Phase 9) ──────────────────────────── */
+
+/* BIT header (BIOS Information Table) */
+#define BIT_SIGNATURE  0x00544942  /* "BIT\0" as uint32_t LE */
+typedef struct {
+    uint32_t signature;       /* "BIT\0" */
+    uint16_t header_size;
+    uint8_t  version_major;
+    uint8_t  version_minor;
+    uint8_t  token_count;
+    uint8_t  token_entry_size;
+} __attribute__((packed)) bit_header_t;
+
+/* BIT token entry */
+typedef struct {
+    uint8_t  id;              /* Token ID (0x70 = Falcon Data) */
+    uint8_t  data_version;
+    uint16_t data_size;
+    uint16_t data_offset;     /* Offset from VBIOS start */
+} __attribute__((packed)) bit_token_t;
+
+#define BIT_TOKEN_FALCON_DATA  0x70
+
+/* Falcon ucode table entry (pointed to by token 0x70) */
+typedef struct {
+    uint8_t  version;
+    uint8_t  header_size;
+    uint8_t  entry_size;
+    uint8_t  entry_count;
+    uint8_t  desc_version;
+    uint8_t  desc_size;
+} __attribute__((packed)) falcon_ucode_table_hdr_t;
+
+/* Falcon ucode descriptor (follows table header) */
+typedef struct {
+    uint32_t stored_size;     /* Compressed size in VBIOS */
+    uint32_t uncompressed_size;
+    uint32_t vbios_offset;    /* Offset into VBIOS data */
+    uint8_t  application_id;  /* 0x01 = FWSEC */
+    uint8_t  target_id;       /* Falcon target: 0x01=PMU, 0x03=GSP, 0x04=SEC2 */
+    uint8_t  flags;
+    uint8_t  pad;
+} __attribute__((packed)) falcon_ucode_desc_t;
+
+#define FALCON_APP_FWSEC  0x01
+#define FALCON_TARGET_GSP 0x03
+
+/* FWSEC state */
+typedef struct {
+    uint8_t  *data;           /* Pointer into VBIOS buffer (not separately allocated) */
+    uint32_t  size;           /* FWSEC blob size */
+    uint32_t  vbios_offset;   /* Offset within VBIOS */
+    uint8_t   target_id;      /* Falcon target */
+    bool      found;
+} fwsec_state_t;
+
+/* ── FWSEC-FRTS / WPR2 Structures (Phase 10) ────────────────── */
+
+/* GspFwWprMeta — WPR2 metadata structure in VRAM */
+typedef struct {
+    uint32_t magic;                /* 0x57505232 "WPR2" */
+    uint32_t revision;             /* Structure revision */
+    uint64_t sysmemAddrOfRadix3Elf;
+    uint32_t sizeOfRadix3Elf;
+    uint32_t pad0;
+    uint64_t sysmemAddrOfBootloader;
+    uint32_t sizeOfBootloader;
+    uint32_t bootloaderCodeOffset;
+    uint32_t bootloaderDataOffset;
+    uint32_t pad1;
+    uint32_t nonWprHeapOffset;
+    uint32_t nonWprHeapSize;
+    uint64_t gspFwRsvdStart;
+    uint64_t gspFwWprEnd;
+    uint64_t fbSize;
+    uint64_t vgaWorkspaceOffset;
+    uint64_t vgaWorkspaceSize;
+    uint32_t bootCount;
+    uint32_t pad2;
+} gsp_fw_wpr_meta_t;
+
+#define WPR2_MAGIC  0x57505232  /* "WPR2" */
+
+/* FWSEC command defines */
+#define FWSEC_FRTS_CMD         0x15  /* FRTS = Falcon Recovery Table Setup */
+#define FWSEC_SB_CMD           0x16  /* Secure Boot command */
+
 /* Dead register sentinel */
 #define NV_DEAD_REG            0xFFFFFFFF
 
@@ -434,5 +574,14 @@ int  gsp_rpc_init(void);       /* Post-boot RPC init sequence */
 
 /* Phase 8: RM init commands */
 int  gsp_rm_init(void);        /* 5-step RM init sequence */
+
+/* Phase 9: VBIOS read + BIT parse + FWSEC extraction */
+int  gpu_read_vbios(void);           /* Read VBIOS from VRAM via PRAMIN */
+int  gpu_parse_bit(void);            /* Parse BIT table, extract FWSEC */
+vbios_state_t *gpu_get_vbios(void);  /* Get VBIOS state */
+fwsec_state_t *gpu_get_fwsec(void);  /* Get FWSEC state */
+
+/* Phase 10: FWSEC-FRTS execution + WPR2 creation */
+int  gsp_fwsec_frts(void);    /* Load FWSEC, execute FRTS, create WPR2 */
 
 #endif /* OSITOK_GPU_H */
