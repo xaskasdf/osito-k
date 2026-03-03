@@ -118,8 +118,9 @@ arch/x86/kernel/framebuffer.c       GOP 32bpp text console (8×16 font)
 arch/x86/kernel/pci.c               PCIe enumeration (ECAM via MCFG, BAR size detection)
 arch/x86/kernel/memory.c            Physical memory manager (bitmap, 4KB pages)
 arch/x86/drivers/nvme.c             Minimal NVMe driver (admin+IO queues, read-only)
-arch/x86/drivers/gpu.h              GPU types, MMIO register defines, probe API
+arch/x86/drivers/gpu.h              GPU types, MMIO register defines, Falcon defines, probe + GSP API
 arch/x86/drivers/gpu.c              GPU probe Phase 1-3 (chip ID, engines, VRAM, BAR1 R/W, PRAMIN R/W)
+arch/x86/drivers/gsp.c              GSP Falcon probe + firmware loader + VRAM upload (Phase 4)
 arch/x86/fs/ositofs2.c              OsitoFS v2 bare-metal driver (mount, list, read)
 arch/x86/fs/gpt.h                   GPT structs (UEFI spec) + API
 arch/x86/fs/gpt.c                   GPT parser (name match + superblock magic probe)
@@ -256,7 +257,8 @@ Tasks:   idle, input, shell (3 of 8 slots used)
 | **X16** | **GPU MMIO probe** (chip ID, engines, PTIMER, Falcon detect — Phase 1) | Done |
 | **X17** | **GPU VRAM discovery** (VRAM size, BAR1 R/W test, PRAMIN window — Phase 2) | Done |
 | **X18** | **GPU PCI BAR sizes + gpu_write + PRAMIN window slide R/W** (Phase 3) | Done |
-| X19     | GPU compute (NVIDIA GSP firmware loading, GPFIFO, compute dispatch) | Research |
+| **X19** | **GSP Falcon deep probe + firmware load to VRAM** (Phase 4) | Done |
+| X20     | GSP boot (ELF parse, BOOTVEC, CPUCTL start, mailbox handshake) | Next |
 
 ### F12: DOOM Wireframe 2.5D
 Procedural level generator (4x4 grid, snake path connectivity) + wall-segment projection renderer.
@@ -324,6 +326,16 @@ First active writes to GPU: PCI config space BAR size detection, PRAMIN window c
 - **gpu_write**: First GPU register write function (`mmio_write32` via BAR0)
 - **PRAMIN window slide**: Write `NV_PBUS_BAR0_WINDOW` (0x001700) to move 1MB PRAMIN window to arbitrary VRAM offset. Test at VRAM+64MB: write 0xDEADBEEF/0x0517014B, read back, restore originals + window position.
 - **Safety**: Only writes to PBUS_BAR0_WINDOW (well-documented control register) and VRAM data through PRAMIN. All originals saved and restored. BAR size detection during PCI scan (before gpu_init uses BARs).
+
+### X19: GSP Falcon Deep Probe + Firmware Load to VRAM (Phase 4)
+Deep probe of GSP Falcon microcontroller, load firmware blob to RAM, upload to VRAM.
+- **Falcon probe**: HWCFG2 → decode IMEM/DMEM sizes, CPUCTL halted/stopped status, MAILBOX0/1 values
+- **Firmware load**: `osfs2_find("gsp.bin")` → validate size (1–128MB) → `mem_alloc_aligned` → read in 1MB chunks
+- **VRAM upload**: PRAMIN window slide (same X18 pattern) → write firmware 4 bytes/dword through 1MB window → verify first 4 dwords → restore window
+- **Placement**: Firmware at VRAM+128MB (away from GOP framebuffer)
+- **Timing**: rdtsc for upload measurement, estimated @ 3GHz
+- **Safety**: Only reads Falcon status registers (no writes to CPUCTL/BOOTVEC/DMACTL). PRAMIN window save/restore. Only writes firmware data to VRAM. Graceful degradation: no GPU → skip VRAM upload; no gsp.bin → log and continue.
+- **Does NOT boot GSP** — that is X20 (BOOTVEC, CPUCTL_STARTCPU, mailbox handshake)
 
 ## Language
 The user speaks Spanish. Communicate in Spanish when appropriate.

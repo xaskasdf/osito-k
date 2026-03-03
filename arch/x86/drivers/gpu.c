@@ -525,3 +525,8 @@ gpu_probe_t *gpu_get_probe(void)
 {
     return &gpu.probe;
 }
+
+/* ── Register access wrappers (for gsp.c) ────────────────────── */
+
+uint32_t gpu_reg_read(uint32_t reg)  { return gpu_read(reg); }
+void gpu_reg_write(uint32_t reg, uint32_t val) { gpu_write(reg, val); }

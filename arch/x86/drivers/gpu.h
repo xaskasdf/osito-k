@@ -5,7 +5,8 @@
  * Phase 1: MMIO probe (chip ID, engines, PTIMER, Falcon detect).
  * Phase 2: VRAM discovery, BAR1 read/write test, PRAMIN window.
  * Phase 3: PCI BAR sizes, gpu_write, PRAMIN window slide + R/W.
- * Phase 4+: GSP firmware loading, command submission.
+ * Phase 4: GSP Falcon deep probe, firmware load to RAM, upload to VRAM.
+ * Phase 5+: GSP boot, message queues, RPC protocol.
  */
 
 #ifndef OSITOK_GPU_H
@@ -51,6 +52,29 @@
 
 /* PBUS — BAR0 PRAMIN window control (Fermi+, envytools) */
 #define NV_PBUS_BAR0_WINDOW    0x001700   /* bits 23:0 = VRAM addr >> 16 */
+
+/* Falcon Microcontroller Registers (offsets from falcon base) */
+#define NV_FALCON_HWCFG2          0x000068   /* IMEM/DMEM sizes */
+#define NV_FALCON_HWCFG2_IMEM_MASK   0x000001FF  /* bits 8:0 * 256 = IMEM bytes */
+#define NV_FALCON_HWCFG2_DMEM_SHIFT  9
+#define NV_FALCON_HWCFG2_DMEM_MASK   0x0003FE00  /* bits 17:9 * 256 = DMEM bytes */
+
+#define NV_FALCON_MAILBOX0         0x000040
+#define NV_FALCON_MAILBOX1         0x000044
+#define NV_FALCON_OS               0x000080
+#define NV_FALCON_CPUCTL           0x000100
+#define NV_FALCON_CPUCTL_STARTCPU  (1 << 1)
+#define NV_FALCON_CPUCTL_HALTED    (1 << 4)
+#define NV_FALCON_CPUCTL_STOPPED   (1 << 5)
+#define NV_FALCON_BOOTVEC          0x000104
+#define NV_FALCON_DMACTL           0x00010C
+#define NV_FALCON_DMATRFBASE      0x000110
+#define NV_FALCON_IMEMC            0x000180
+#define NV_FALCON_IMEMD            0x000184
+#define NV_FALCON_DMEMC            0x0001C0
+#define NV_FALCON_DMEMD            0x0001C4
+
+#define GSP_FW_VRAM_OFFSET_MB      128   /* Firmware placement: VRAM+128MB */
 
 /* Dead register sentinel */
 #define NV_DEAD_REG            0xFFFFFFFF
@@ -137,10 +161,38 @@ typedef struct {
     bool        pramin_rw_ok;      /* PRAMIN write/read through window slide OK */
 } gpu_probe_t;
 
-/* Phase 1: Probe GPU via MMIO reads (read-only, no writes) */
+/* ── Phase 4: GSP Falcon State ──────────────────────────────── */
+
+typedef struct {
+    /* Falcon hardware */
+    uint32_t    hwcfg, hwcfg2;
+    uint32_t    imem_size, dmem_size;   /* bytes */
+    uint32_t    cpuctl;
+    bool        halted, stopped;
+    uint32_t    mailbox0, mailbox1;
+    /* Firmware */
+    void       *fw_data;          /* RAM buffer */
+    uint64_t    fw_size;
+    uint64_t    vram_offset;      /* VRAM placement */
+    bool        fw_loaded;        /* In RAM */
+    bool        fw_uploaded;      /* In VRAM, verified */
+} gsp_state_t;
+
+/* ── API ────────────────────────────────────────────────────── */
+
+/* Phase 1-3: Probe GPU via MMIO (read-only in Phase 1) */
 int gpu_init(uint64_t bar0_phys);
 
 /* Get probe results (valid after gpu_init succeeds) */
 gpu_probe_t *gpu_get_probe(void);
+
+/* GPU register access (wrappers for use by gsp.c) */
+uint32_t gpu_reg_read(uint32_t reg);
+void     gpu_reg_write(uint32_t reg, uint32_t val);
+
+/* Phase 4: GSP Falcon probe + firmware loading */
+int  gsp_probe(void);
+int  gsp_load_firmware(void);
+gsp_state_t *gsp_get_state(void);
 
 #endif /* OSITOK_GPU_H */
