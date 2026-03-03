@@ -211,6 +211,8 @@ Tasks:   idle, input, shell (3 of 8 slots used)
 
 ## Roadmap
 
+### ESP8266 (Xtensa LX106)
+
 | Feature | Description | Status |
 |---------|-------------|--------|
 | F1-F5   | Kernel, scheduler, drivers, FS, heap, font, framebuffer | Done |
@@ -222,6 +224,27 @@ Tasks:   idle, input, shell (3 of 8 slots used)
 | **zF**  | **zForth** — replaced BASIC+VM, saved ~4KB IRAM | Done |
 | **F12** | **DOOM wireframe** — 2.5D BSP engine, procedural levels | Done |
 | **F11** | **Spreadsheet engine** — cell grid, formula parser, cursor UI | Next |
+
+### x86-64 Bare-Metal AI OS
+
+| Feature | Description | Status |
+|---------|-------------|--------|
+| X1      | UEFI boot (gnu-efi): GOP framebuffer, serial, ExitBootServices | Done |
+| X2      | Kernel entry: COM1 serial (115200), GOP 32bpp text console (8×16 font) | Done |
+| X3      | Physical memory manager (bitmap allocator, 4KB pages) | Done |
+| X4      | PCIe enumeration (ECAM via MCFG ACPI table, legacy I/O fallback) | Done |
+| X5      | NVMe driver (admin + IO queues, read-only) | Done |
+| X6      | OsitoFS v2 bare-metal driver (mount, list, read) | Done |
+| X7      | OsitoFS v2 host tools (mkfs, write, ls, info) + GGUF parser | Done |
+| X8      | GPU detection (NVIDIA gen detect, GSP-shim placeholder) | Done |
+| **X9**  | **Intel I211 Ethernet driver** (igb family, legacy descriptors, polling) | Done |
+| **X10** | **Network stack** (ARP responder, IPv4, UDP send/recv, echo server) | Done |
+| X11     | QEMU test infrastructure (OVMF + e1000e, serial log, UDP forward) | Done |
+| X12     | GPT parser (auto-find OsitoFS partition) | Next |
+| X13     | GGUF model loader (read from OsitoFS into memory) | Planned |
+| X14     | Tensor compute engine (CPU matmul, quantized ops) | Planned |
+| X15     | Inference runtime (transformer forward pass) | Planned |
+| X16     | GPU compute (NVIDIA GSP-shim or MMIO shader dispatch) | Research |
 
 ### F12: DOOM Wireframe 2.5D
 Procedural level generator (4x4 grid, snake path connectivity) + wall-segment projection renderer.
@@ -243,6 +266,17 @@ Cell grid (e.g. 8×16), each cell holds number or formula string.
 Formula parser: `=A1+B2*3`, cell references, basic operators (+−×÷).
 Evaluation with dependency tracking (topological sort or mark-dirty).
 UI: grid rendered on framebuffer, cursor navigation with joystick, cell editing via UART.
+
+### X9: Intel I211 Ethernet Driver
+Intel I211 Gigabit (igb family, PCI `8086:1539`). Legacy 16-byte RX/TX descriptors,
+single queue, polling (no IRQs). Ring sizes: RX=128, TX=64, 2048B packet buffers.
+Init: global reset → MAC read from RAL/RAH → RX/TX ring setup → RCTL/TCTL enable.
+Compatible with e1000e in QEMU (Intel 82574L, same igb register set).
+
+### X10: Minimal Network Stack
+Static IP configuration, ARP table (16 entries), IPv4 with checksum verification.
+UDP send/recv with port-based handler dispatch. Echo server on port 7777.
+No ICMP, no TCP, no DHCP — minimal footprint for inference prompt delivery.
 
 ## Language
 The user speaks Spanish. Communicate in Spanish when appropriate.
