@@ -1,0 +1,214 @@
+/*
+ * OsitoK x86-64 — Physical Memory Manager
+ *
+ * Bitmap allocator over UEFI memory map.
+ * 4KB page granularity. Identity-mapped (phys == virt).
+ */
+
+#include "../include/types.h"
+
+/* ── Declarations ────────────────────────────────────────────── */
+
+extern void serial_puts(const char *s);
+extern void serial_puthex(uint64_t val, int digits);
+extern void serial_putdec(uint64_t val);
+extern void fb_puts(const char *s);
+extern void fb_putdec(uint64_t val);
+
+/* ── UEFI Memory Descriptor (matches EFI spec) ──────────────── */
+
+#define EFI_CONVENTIONAL_MEMORY   7
+#define EFI_BOOT_SERVICES_CODE    3
+#define EFI_BOOT_SERVICES_DATA    4
+
+typedef struct __attribute__((packed)) {
+    uint32_t type;
+    uint32_t pad;
+    uint64_t physical_start;
+    uint64_t virtual_start;
+    uint64_t number_of_pages;
+    uint64_t attribute;
+} efi_memory_descriptor_t;
+
+/* ── Bitmap allocator ────────────────────────────────────────── */
+
+#define PAGE_SIZE       4096
+#define PAGE_SHIFT      12
+#define MAX_PHYS_PAGES  (4ULL * 1024 * 1024 * 1024 / PAGE_SIZE)  /* Up to 4GB tracked */
+#define BITMAP_SIZE     (MAX_PHYS_PAGES / 8)  /* 128KB for 4GB */
+
+/* Bitmap: 1 = free, 0 = used/reserved */
+static uint8_t page_bitmap[BITMAP_SIZE];
+
+static uint64_t total_pages;
+static uint64_t free_pages;
+static uint64_t total_memory;
+
+/* ── Bitmap helpers ──────────────────────────────────────────── */
+
+static void bitmap_set(uint64_t page)
+{
+    if (page < MAX_PHYS_PAGES)
+        page_bitmap[page / 8] |= (1 << (page % 8));
+}
+
+static void bitmap_clear(uint64_t page)
+{
+    if (page < MAX_PHYS_PAGES)
+        page_bitmap[page / 8] &= ~(1 << (page % 8));
+}
+
+static int bitmap_test(uint64_t page)
+{
+    if (page >= MAX_PHYS_PAGES) return 0;
+    return (page_bitmap[page / 8] >> (page % 8)) & 1;
+}
+
+/* ── Initialize from UEFI memory map ────────────────────────── */
+
+void mem_init(void *mmap, uint64_t mmap_size, uint64_t desc_size)
+{
+    /* Start with everything reserved */
+    memset(page_bitmap, 0, sizeof(page_bitmap));
+    total_pages = 0;
+    free_pages = 0;
+    total_memory = 0;
+
+    /* Walk the UEFI memory map */
+    uint64_t entries = mmap_size / desc_size;
+    uint8_t *ptr = (uint8_t *)mmap;
+
+    uint64_t usable_regions = 0;
+
+    for (uint64_t i = 0; i < entries; i++) {
+        efi_memory_descriptor_t *desc = (efi_memory_descriptor_t *)(ptr + i * desc_size);
+
+        total_memory += desc->number_of_pages * PAGE_SIZE;
+
+        /* Only use conventional memory and freed boot services memory */
+        if (desc->type == EFI_CONVENTIONAL_MEMORY ||
+            desc->type == EFI_BOOT_SERVICES_CODE ||
+            desc->type == EFI_BOOT_SERVICES_DATA) {
+
+            uint64_t start_page = desc->physical_start >> PAGE_SHIFT;
+            uint64_t num_pages = desc->number_of_pages;
+
+            /* Skip first 1MB (BIOS, legacy, etc.) */
+            if (desc->physical_start < 0x100000) {
+                uint64_t skip = (0x100000 - desc->physical_start) >> PAGE_SHIFT;
+                if (skip >= num_pages) continue;
+                start_page += skip;
+                num_pages -= skip;
+            }
+
+            /* Mark pages as free */
+            for (uint64_t p = 0; p < num_pages && (start_page + p) < MAX_PHYS_PAGES; p++) {
+                bitmap_set(start_page + p);
+                free_pages++;
+            }
+            total_pages += num_pages;
+            usable_regions++;
+        }
+    }
+
+    serial_puts("[MEM] Memory manager initialized\n");
+    serial_puts("[MEM] Total: ");
+    serial_putdec(total_memory / (1024 * 1024));
+    serial_puts(" MB, Usable: ");
+    serial_putdec(free_pages * PAGE_SIZE / (1024 * 1024));
+    serial_puts(" MB (");
+    serial_putdec(free_pages);
+    serial_puts(" pages), Regions: ");
+    serial_putdec(usable_regions);
+    serial_puts("\n");
+
+    fb_puts("\n Memory: ");
+    fb_putdec(total_memory / (1024 * 1024));
+    fb_puts(" MB total, ");
+    fb_putdec(free_pages * PAGE_SIZE / (1024 * 1024));
+    fb_puts(" MB usable\n");
+}
+
+/* ── Allocate physical pages ─────────────────────────────────── */
+
+void *mem_alloc_pages(uint64_t count)
+{
+    if (count == 0 || free_pages < count) return NULL;
+
+    /* Simple first-fit search */
+    uint64_t run_start = 0;
+    uint64_t run_len = 0;
+
+    for (uint64_t p = 256; p < MAX_PHYS_PAGES; p++) {  /* Start above 1MB */
+        if (bitmap_test(p)) {
+            if (run_len == 0) run_start = p;
+            run_len++;
+            if (run_len == count) {
+                /* Found a contiguous run */
+                for (uint64_t i = 0; i < count; i++) {
+                    bitmap_clear(run_start + i);
+                    free_pages--;
+                }
+                return (void *)(run_start << PAGE_SHIFT);
+            }
+        } else {
+            run_len = 0;
+        }
+    }
+
+    return NULL; /* Out of contiguous pages */
+}
+
+/* ── Free physical pages ─────────────────────────────────────── */
+
+void mem_free_pages(void *addr, uint64_t count)
+{
+    uint64_t start_page = (uint64_t)addr >> PAGE_SHIFT;
+    for (uint64_t i = 0; i < count; i++) {
+        bitmap_set(start_page + i);
+        free_pages++;
+    }
+}
+
+/* ── Allocate aligned buffer (for DMA, NVMe queues, etc.) ───── */
+
+void *mem_alloc_aligned(uint64_t size, uint64_t alignment)
+{
+    uint64_t pages = (size + PAGE_SIZE - 1) >> PAGE_SHIFT;
+    uint64_t align_pages = alignment >> PAGE_SHIFT;
+    if (align_pages == 0) align_pages = 1;
+
+    /* Search for aligned contiguous pages */
+    for (uint64_t p = 256; p < MAX_PHYS_PAGES; p++) {
+        /* Align to required boundary */
+        if (p % align_pages != 0) continue;
+
+        /* Check if enough contiguous pages */
+        uint64_t ok = 1;
+        for (uint64_t i = 0; i < pages && ok; i++) {
+            if (!bitmap_test(p + i)) ok = 0;
+        }
+
+        if (ok) {
+            for (uint64_t i = 0; i < pages; i++) {
+                bitmap_clear(p + i);
+                free_pages--;
+            }
+            return (void *)(p << PAGE_SHIFT);
+        }
+    }
+
+    return NULL;
+}
+
+/* ── Info ────────────────────────────────────────────────────── */
+
+uint64_t mem_get_free(void)
+{
+    return free_pages * PAGE_SIZE;
+}
+
+uint64_t mem_get_total(void)
+{
+    return total_memory;
+}
