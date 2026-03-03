@@ -19,6 +19,13 @@ export PATH="/c/Users/xasko/osito-k/tools/xtensa-lx106-elf/bin:$PATH"
 make PYTHON=py          # or run esptool manually
 ```
 
+**x86-64 bare-metal build** (requires `gnu-efi`):
+```bash
+sudo apt install gnu-efi
+make -C arch/x86            # builds arch/x86/build/ositok.efi
+make -C tools/ositofs        # builds host tools (mkfs, write, ls, info)
+```
+
 **Feature flags** (see Makefile):
 ```
 ENABLE_ELITE=1   Elite wireframe flight demo + ship models (~2.1KB IRAM)
@@ -102,6 +109,31 @@ src/doom/doom_render.cpp    2.5D wireframe renderer (walls, enemy sprites, weapo
 src/doom/doom_game.cpp      Game loop: input, movement, collision, shooting, AI, game over
 src/shell/shell.cpp         Interactive shell (ps, mem, heap, fs, gpio, forth, run, doom, etc.)
 src/main.cpp                kernel_main: init → create tasks → timer → sched_start
+
+# x86-64 Bare-Metal AI OS (arch/x86/)
+arch/x86/boot/efi_main.c            UEFI entry: GOP, serial, memory map, ExitBootServices
+arch/x86/kernel/main.c              Post-boot kernel: PCI scan, NVMe init, mount OsitoFS
+arch/x86/kernel/serial.c            COM1 UART (0x3F8, 115200 baud)
+arch/x86/kernel/framebuffer.c       GOP 32bpp text console (8×16 font)
+arch/x86/kernel/pci.c               PCIe enumeration (ECAM via MCFG ACPI table)
+arch/x86/kernel/memory.c            Physical memory manager (bitmap, 4KB pages)
+arch/x86/drivers/nvme.c             Minimal NVMe driver (admin+IO queues, read-only)
+arch/x86/drivers/gpu.h              GPU abstraction placeholder (GSP/custom/Vulkan)
+arch/x86/fs/ositofs2.c              OsitoFS v2 bare-metal driver (mount, list, read)
+arch/x86/include/types.h            Freestanding types + MMIO + port I/O
+
+# OsitoFS v2 Host Tools (tools/ositofs/)
+include/common/ositofs2_format.h     On-disk format (shared header)
+tools/ositofs/mkfs.c                 Format device with OsitoFS v2
+tools/ositofs/write.c                Write files (GGUF auto-detect, layer index)
+tools/ositofs/ls.c                   List files with model metadata
+tools/ositofs/info.c                 Show filesystem info
+tools/ositofs/gguf.c/h               GGUF parser (metadata + tensor offsets)
+tools/ositofs/common.c/h             CRC32, block I/O, display helpers
+
+# Documentation
+docs/ositofs2-spec.md                OsitoFS v2 format specification
+docs/bare-metal-ai-os.md             x86 bare-metal AI OS research & design
 ```
 
 ## Math Library Summary

@@ -17,5 +17,12 @@ backup/
 *.swo
 *~
 
+# Object files and compiled tools
+*.o
+tools/ositofs/mkfs.ositofs
+tools/ositofs/ositofs-info
+tools/ositofs/ositofs-ls
+tools/ositofs/ositofs-write
+
 # Claude Code session data
 .claude/
