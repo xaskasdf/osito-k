@@ -23,6 +23,8 @@ extern void fb_puthex(uint64_t val, int digits);
 extern void fb_putc(char c, uint32_t color);
 
 extern int nvme_read_bytes(uint64_t byte_offset, void *buf, uint64_t len);
+extern int nvme_write_bytes(uint64_t byte_offset, const void *buf, uint64_t len);
+extern int nvme_flush(void);
 extern void *mem_alloc_aligned(uint64_t size, uint64_t alignment);
 extern void  mem_free_pages(void *addr, uint64_t count);
 
@@ -256,6 +258,149 @@ int osfs2_read_layer_index(uint16_t slot, osfs2_layer_idx_t *li)
     uint64_t offset = ((uint64_t)OSFS2_LAYERIDX_BLK << OSFS2_BLOCK_SHIFT)
                     + (uint64_t)slot * sizeof(osfs2_layer_idx_t);
     return osfs2_part_read(offset, li, sizeof(*li));
+}
+
+/* ── Write to partition ──────────────────────────────────────── */
+
+static int osfs2_part_write(uint64_t offset, const void *buf, uint64_t len)
+{
+    return nvme_write_bytes(partition_offset + offset, buf, len);
+}
+
+/* ── Persist superblock to disk ─────────────────────────────── */
+
+static int osfs2_write_superblock(void)
+{
+    superblock.crc32 = 0;
+    superblock.crc32 = osfs2_crc32(&superblock, sizeof(superblock));
+    return osfs2_part_write(0, &superblock, sizeof(superblock));
+}
+
+/* ── Persist file table to disk ─────────────────────────────── */
+
+static int osfs2_write_file_table(void)
+{
+    return osfs2_part_write((uint64_t)OSFS2_FILETAB_BLK << OSFS2_BLOCK_SHIFT,
+                            file_table, OSFS2_BLOCK_SIZE);
+}
+
+/* ── Create a new file ──────────────────────────────────────── */
+
+osfs2_file_t *osfs2_create(const char *name, uint64_t size)
+{
+    if (!mounted || !name) return NULL;
+
+    /* Check name doesn't already exist */
+    if (osfs2_find(name)) {
+        serial_puts("[OsitoFS] File already exists: ");
+        serial_puts(name);
+        serial_puts("\n");
+        return NULL;
+    }
+
+    /* Find free slot */
+    int slot = -1;
+    for (uint32_t i = 0; i < OSFS2_MAX_FILES; i++) {
+        if (!(file_table[i].flags & OSFS2_FLAG_VALID)) {
+            slot = (int)i;
+            break;
+        }
+    }
+    if (slot < 0) {
+        serial_puts("[OsitoFS] File table full\n");
+        return NULL;
+    }
+
+    /* Calculate blocks needed */
+    uint32_t blocks = (uint32_t)((size + OSFS2_BLOCK_SIZE - 1) >> OSFS2_BLOCK_SHIFT);
+    if (blocks == 0) blocks = 1;
+
+    /* Check space */
+    if (superblock.next_data_block + blocks > superblock.total_blocks) {
+        serial_puts("[OsitoFS] Not enough space: need ");
+        serial_putdec(blocks);
+        serial_puts(" blocks\n");
+        return NULL;
+    }
+
+    /* Fill file entry */
+    osfs2_file_t *f = &file_table[slot];
+    memset(f, 0, sizeof(*f));
+    strcpy(f->name, name);
+    f->size = size;
+    f->start_block = superblock.next_data_block;
+    f->block_count = blocks;
+    f->flags = OSFS2_FLAG_VALID;
+    f->layer_index_slot = 0xFFFF;
+
+    /* Update superblock */
+    superblock.next_data_block += blocks;
+    superblock.used_blocks += blocks;
+    superblock.file_count++;
+
+    /* Persist */
+    if (osfs2_write_file_table() < 0 || osfs2_write_superblock() < 0) {
+        serial_puts("[OsitoFS] Failed to persist metadata\n");
+        return NULL;
+    }
+    nvme_flush();
+
+    serial_puts("[OsitoFS] Created '");
+    serial_puts(name);
+    serial_puts("' size=");
+    serial_putdec(size);
+    serial_puts(" blocks=");
+    serial_putdec(blocks);
+    serial_puts(" @ block ");
+    serial_putdec(f->start_block);
+    serial_puts("\n");
+
+    return f;
+}
+
+/* ── Write data to an existing file ─────────────────────────── */
+
+int osfs2_write(osfs2_file_t *file, uint64_t offset, const void *buf, uint64_t len)
+{
+    if (!mounted || !file || !buf) return -1;
+    if (offset + len > (uint64_t)file->block_count << OSFS2_BLOCK_SHIFT) return -1;
+
+    uint64_t abs_offset = ((uint64_t)file->start_block << OSFS2_BLOCK_SHIFT) + offset;
+    int ret = osfs2_part_write(abs_offset, buf, len);
+    if (ret < 0) return -1;
+
+    /* Update file size if we wrote past current end */
+    if (offset + len > file->size) {
+        file->size = offset + len;
+        osfs2_write_file_table();
+        osfs2_write_superblock();
+    }
+
+    return 0;
+}
+
+/* ── Delete a file ──────────────────────────────────────────── */
+
+int osfs2_delete(const char *name)
+{
+    if (!mounted || !name) return -1;
+
+    osfs2_file_t *f = osfs2_find(name);
+    if (!f) return -1;
+
+    /* Mark as invalid (space not reclaimed — append-only allocator) */
+    f->flags = 0;
+    superblock.file_count--;
+
+    if (osfs2_write_file_table() < 0 || osfs2_write_superblock() < 0)
+        return -1;
+
+    nvme_flush();
+
+    serial_puts("[OsitoFS] Deleted '");
+    serial_puts(name);
+    serial_puts("'\n");
+    return 0;
 }
 
 /* ── Accessors ───────────────────────────────────────────────── */

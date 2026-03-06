@@ -294,8 +294,11 @@ Tasks:   idle, input, shell (3 of 8 slots used)
 | **X40** | **GPU-accelerated inference** (hybrid GPU/CPU forward pass, kernel dispatch table, VRAM scratch, benchmark) | Done |
 | **X41** | **PTX kernel compilation pipeline** (ntransformer CUDA→PTX translation, ptxas build, cubin ELF extract, C array embed) | Done |
 | **X42** | **Compiled kernel dispatch** (CB0 parameter passing, gpu_dispatch_kernel helper, per-kernel wrappers for all 8 PTX kernels) | Done |
+| **X-CPU2** | **NVMe write** (IO write command, nvme_write/write_bytes/flush, OsitoFS v2 create/write/delete) | Done |
+| **X-CPU3** | **UDP prompt server** (port 7777, token ID input/output, inference dispatch, keep model alive) | Done |
 
 > Full GPU roadmap (X27-X40 + contingency): see [docs/x86-gpu-roadmap.md](docs/x86-gpu-roadmap.md)
+> Full OS roadmap (Tier 0-5): see [docs/os-selfhost-roadmap.md](docs/os-selfhost-roadmap.md)
 
 ### F12: DOOM Wireframe 2.5D
 Procedural level generator (4x4 grid, snake path connectivity) + wall-segment projection renderer.
@@ -453,6 +456,19 @@ Runtime-dispatched AVX2 vectorization of hot-path tensor operations.
 - **Dispatch**: `tensor_has_avx2()` cached check. Public functions (matvec_q4_0, rmsnorm, etc.) auto-dispatch.
 - **Build**: `tensor_avx2.c` compiled with `-mavx2 -mfma` (AVXFLAGS in Makefile). All other files stay default ISA.
 - **Benchmark**: tensor_benchmark() runs scalar vs AVX2 comparison on 2048×2048 matvec, reports speedup.
+
+### X-CPU2: NVMe Write + OsitoFS v2 Write
+Full read/write storage support for persistence and file creation.
+- **NVMe write**: IO write command (opcode 0x01), same queue infrastructure as read. `nvme_write(lba, count, buf)`, `nvme_write_bytes(byte_offset, buf, len)` with read-modify-write for unaligned access, `nvme_flush()` for cache flush.
+- **OsitoFS v2 write**: `osfs2_create(name, size)` allocates contiguous blocks from `next_data_block`, `osfs2_write(file, offset, buf, len)` writes data, `osfs2_delete(name)` marks file invalid. Superblock + file table persisted to NVMe after each mutation.
+- **Append-only allocator**: Space from deleted files is not reclaimed (simple bump allocator via `next_data_block`). Sufficient for logging and checkpoint files.
+
+### X-CPU3: UDP Prompt Server
+Network-accessible inference over UDP port 7777.
+- **Protocol**: Send raw text → receive generated token IDs. Send `#128000 1234` → token ID prefill mode.
+- **Prompt handler**: Replaces echo handler. Resets model state, prefills BOS or provided tokens, generates up to 32 tokens via `llama_forward` + argmax, sends token IDs back as decimal text.
+- **Model lifecycle**: `llama_state_t` kept alive after boot inference (not freed), pointer stored in `prompt_llama` for handler access.
+- **No tokenizer**: Client sends/receives raw token IDs. Text tokenization is client-side responsibility.
 
 ### X27: Falcon PIO Load
 Programmed I/O access to Falcon IMEM/DMEM via IMEMC/IMEMD registers.

@@ -1,7 +1,7 @@
 /*
  * OsitoK x86-64 — Minimal NVMe Driver (Read-only)
  *
- * Supports: identify, read. Enough to mount OsitoFS v2.
+ * Supports: identify, read, write. Full OsitoFS v2 I/O.
  *
  * NVMe registers at BAR0 (MMIO). Admin queue + one I/O queue.
  * Uses polling (no interrupts) for simplicity.
@@ -80,6 +80,7 @@ typedef struct __attribute__((packed)) {
 #define NVME_ADMIN_CREATE_IOCQ    0x05
 
 #define NVME_IO_READ              0x02
+#define NVME_IO_WRITE             0x01
 
 /* ── Queue sizes ─────────────────────────────────────────────── */
 
@@ -459,6 +460,106 @@ int nvme_read_bytes(uint64_t byte_offset, void *buf, uint64_t len)
 
     mem_free_pages(temp, 2);
     return 0;
+}
+
+/* ── Write LBAs ──────────────────────────────────────────────── */
+
+int nvme_write(uint64_t lba, uint32_t count, const void *buf)
+{
+    if (!nvme.initialized) return -1;
+    if (count == 0 || count > nvme.max_transfer) return -1;
+
+    uint32_t lbas_per_page = 4096 / nvme.lba_size;
+    const uint8_t *src = (const uint8_t *)buf;
+
+    while (count > 0) {
+        uint32_t this_count = count;
+        if (this_count > lbas_per_page * 2) this_count = lbas_per_page * 2;
+
+        uint64_t bytes = (uint64_t)this_count * nvme.lba_size;
+
+        nvme_sqe_t cmd;
+        memset(&cmd, 0, sizeof(cmd));
+        cmd.cdw0 = NVME_IO_WRITE;
+        cmd.nsid = 1;
+        cmd.prp1 = (uint64_t)src;
+        if (bytes > 4096)
+            cmd.prp2 = (uint64_t)(src + 4096);
+        cmd.cdw10 = (uint32_t)(lba & 0xFFFFFFFF);
+        cmd.cdw11 = (uint32_t)(lba >> 32);
+        cmd.cdw12 = this_count - 1; /* 0-based */
+
+        if (nvme_io_submit_wait(&cmd) < 0) return -1;
+
+        src += bytes;
+        lba += this_count;
+        count -= this_count;
+    }
+
+    return 0;
+}
+
+/* ── Write bytes at arbitrary offset ─────────────────────────── */
+
+int nvme_write_bytes(uint64_t byte_offset, const void *buf, uint64_t len)
+{
+    if (!nvme.initialized) return -1;
+    if (len == 0) return 0;
+
+    uint64_t lba = byte_offset / nvme.lba_size;
+    uint64_t lba_offset = byte_offset % nvme.lba_size;
+
+    uint8_t *temp = (uint8_t *)mem_alloc_aligned(4096 * 2, 4096);
+    if (!temp) return -1;
+
+    const uint8_t *src = (const uint8_t *)buf;
+    uint64_t remaining = len;
+    uint64_t cur_lba = lba;
+    uint64_t cur_offset = lba_offset;
+
+    while (remaining > 0) {
+        uint32_t rw_lbas = (uint32_t)((cur_offset + remaining + nvme.lba_size - 1) / nvme.lba_size);
+        if (rw_lbas > 8) rw_lbas = 8;
+
+        /* Read-modify-write if not aligned */
+        if (cur_offset != 0 || remaining < (uint64_t)rw_lbas * nvme.lba_size) {
+            if (nvme_read(cur_lba, rw_lbas, temp) < 0) {
+                mem_free_pages(temp, 2);
+                return -1;
+            }
+        }
+
+        uint64_t avail = (uint64_t)rw_lbas * nvme.lba_size - cur_offset;
+        uint64_t copy = remaining < avail ? remaining : avail;
+        memcpy(temp + cur_offset, src, copy);
+
+        if (nvme_write(cur_lba, rw_lbas, temp) < 0) {
+            mem_free_pages(temp, 2);
+            return -1;
+        }
+
+        src += copy;
+        remaining -= copy;
+        cur_lba += rw_lbas;
+        cur_offset = 0;
+    }
+
+    mem_free_pages(temp, 2);
+    return 0;
+}
+
+/* ── Flush ───────────────────────────────────────────────────── */
+
+int nvme_flush(void)
+{
+    if (!nvme.initialized) return -1;
+
+    nvme_sqe_t cmd;
+    memset(&cmd, 0, sizeof(cmd));
+    cmd.cdw0 = 0x00; /* Flush opcode */
+    cmd.nsid = 1;
+
+    return nvme_io_submit_wait(&cmd);
 }
 
 /* ── Accessors ───────────────────────────────────────────────── */

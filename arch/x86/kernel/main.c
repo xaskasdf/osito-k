@@ -62,12 +62,14 @@ extern int  gsp_load_firmware(void);
 extern int  gsp_queue_init(void);
 extern int  gsp_boot(void);
 
-/* ── UDP Echo Handler ────────────────────────────────────────── */
+/* ── X-CPU3: UDP Prompt Server ────────────────────────────────── */
 
-static void echo_handler(const uint8_t *src_ip, uint16_t src_port,
-                          const void *data, uint32_t len)
+static llama_state_t *prompt_llama;  /* Set after model init */
+
+static void prompt_handler(const uint8_t *src_ip, uint16_t src_port,
+                           const void *data, uint32_t len)
 {
-    serial_puts("[NET] UDP echo from ");
+    serial_puts("[PROMPT] UDP from ");
     serial_putdec(src_ip[0]); serial_puts(".");
     serial_putdec(src_ip[1]); serial_puts(".");
     serial_putdec(src_ip[2]); serial_puts(".");
@@ -77,8 +79,103 @@ static void echo_handler(const uint8_t *src_ip, uint16_t src_port,
     serial_putdec(len);
     serial_puts(" bytes)\n");
 
-    /* Echo back to sender */
-    net_udp_send(src_ip, src_port, 7777, data, len);
+    /* If no model loaded, echo back */
+    if (!prompt_llama) {
+        const char *msg = "[OsitoK] No model loaded — echo: ";
+        net_udp_send(src_ip, src_port, 7777, msg, strlen(msg));
+        net_udp_send(src_ip, src_port, 7777, data, len);
+        return;
+    }
+
+    /* Reset model state for fresh generation */
+    prompt_llama->pos = 0;
+
+    /* Use BOS token as prompt — received text is logged but not tokenized
+     * (tokenizer not implemented yet; token IDs would come from client) */
+    uint32_t prompt_tokens[] = { 128000 };  /* BOS */
+    uint32_t prompt_len_tok = 1;
+
+    /* Check if input looks like raw token IDs (starts with '#') */
+    const uint8_t *input = (const uint8_t *)data;
+    if (len >= 2 && input[0] == '#') {
+        /* Parse space-separated token IDs: "#128000 1234 5678" */
+        uint32_t tokens[64];
+        uint32_t ntok = 0;
+        uint32_t val = 0;
+        bool in_num = false;
+
+        for (uint32_t i = 1; i < len && ntok < 64; i++) {
+            if (input[i] >= '0' && input[i] <= '9') {
+                val = val * 10 + (input[i] - '0');
+                in_num = true;
+            } else {
+                if (in_num) { tokens[ntok++] = val; val = 0; in_num = false; }
+            }
+        }
+        if (in_num && ntok < 64) tokens[ntok++] = val;
+
+        if (ntok > 0) {
+            serial_puts("[PROMPT] Token IDs: ");
+            serial_putdec(ntok);
+            serial_puts(" tokens\n");
+
+            /* Prefill */
+            for (uint32_t i = 0; i < ntok; i++)
+                llama_forward(prompt_llama, tokens[i]);
+        }
+        prompt_len_tok = 0;  /* Already prefilled */
+    }
+
+    /* Prefill BOS if not already done */
+    if (prompt_len_tok > 0) {
+        for (uint32_t i = 0; i < prompt_len_tok; i++)
+            llama_forward(prompt_llama, prompt_tokens[i]);
+    }
+
+    /* Generate up to 32 tokens, collect IDs */
+    uint32_t gen_tokens[32];
+    uint32_t gen_count = 0;
+
+    /* Get vocab size from state */
+    uint32_t vocab = prompt_llama->vocab_size;
+
+    /* Simple argmax */
+    extern uint32_t argmax(const float *v, uint32_t n);
+
+    uint32_t next = argmax(prompt_llama->logits, vocab);
+
+    for (uint32_t step = 0; step < 32; step++) {
+        if (next == 128001 || next == 128009) break;  /* EOS */
+        gen_tokens[gen_count++] = next;
+        llama_forward(prompt_llama, next);
+        next = argmax(prompt_llama->logits, vocab);
+    }
+
+    /* Send token IDs back as text: "128000 1234 5678\n" */
+    char resp[512];
+    uint32_t pos = 0;
+    for (uint32_t i = 0; i < gen_count && pos < 480; i++) {
+        uint32_t tok = gen_tokens[i];
+        /* Convert to decimal */
+        char num[12];
+        int nlen = 0;
+        if (tok == 0) { num[nlen++] = '0'; }
+        else {
+            uint32_t t = tok;
+            while (t > 0) { num[nlen++] = '0' + (t % 10); t /= 10; }
+        }
+        /* Reverse */
+        for (int j = nlen - 1; j >= 0; j--)
+            resp[pos++] = num[j];
+        resp[pos++] = ' ';
+    }
+    if (pos > 0) resp[pos - 1] = '\n';  /* Replace trailing space */
+
+    net_udp_send(src_ip, src_port, 7777, resp, pos);
+
+    serial_puts("[PROMPT] Generated ");
+    serial_putdec(gen_count);
+    serial_puts(" tokens, sent response\n");
 }
 
 /* ── Banner ──────────────────────────────────────────────────── */
@@ -194,7 +291,8 @@ void kernel_entry(void *memory_map, uint64_t map_size,
 
                             gpu_llama_free(&gpu_llama);
                         }
-                        llama_free(&llama);
+                        /* Keep llama state alive for UDP prompt server */
+                        prompt_llama = &llama;
                     } else {
                         /* No model — run standalone GPU benchmark */
                         gpu_llama_benchmark_standalone();
@@ -222,7 +320,7 @@ void kernel_entry(void *memory_map, uint64_t map_size,
         if (i211_init(nic_pci->bar[0]) == 0) {
             uint8_t ip[] = {192, 168, 1, 100};
             net_init(ip);
-            net_udp_listen(7777, echo_handler);
+            net_udp_listen(7777, prompt_handler);
         } else {
             serial_puts("[KERN] I211 init failed\n");
             fb_puts(" NIC: init failed\n");
