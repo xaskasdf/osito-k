@@ -36,6 +36,11 @@ extern void syscall_init(void);
 /* ELF loader */
 extern int elf_exec(const char *filename, int argc, const char **argv);
 
+/* Process */
+extern void proc_init(void);
+extern int  proc_exec(const char *filename, int argc, const char **argv);
+extern void proc_list(void);
+
 /* Serial */
 extern void serial_puts(const char *s);
 extern void serial_puthex(uint64_t val, int digits);
@@ -245,6 +250,9 @@ void kernel_entry(void *memory_map, uint64_t map_size,
 
     /* ── Step 1.8: Syscall interface ── */
     syscall_init();
+
+    /* ── Step 1.9: Process subsystem ── */
+    proc_init();
 
     /* ── Tensor compute self-test ── */
     tensor_benchmark();

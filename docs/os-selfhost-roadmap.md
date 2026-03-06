@@ -53,7 +53,7 @@ seguidos de las capas fundamentales del OS.
 | **X-OS3** | **Heap allocator** | malloc/free sobre page allocator (first-fit o buddy), brk/sbrk | ~400 | Done ✓ |
 | **X-OS4** | **Syscall interface** | MSR setup (LSTAR/STAR/FMASK), dispatch table, ABI: RAX=nr, RDI-R9=args | ~400 | Done ✓ |
 | **X-OS5** | **ELF loader** | Cargar PT_LOAD segments, setup stack (argc/argv/envp), jump to e_entry | ~400 | Done ✓ |
-| **X-OS6** | **Proceso mínimo** | process_t struct, file descriptor table, exec/exit/waitpid | ~500 | X-OS4, X-OS5 |
+| **X-OS6** | **Proceso mínimo** | process_t struct, file descriptor table, exec/exit/waitpid | ~500 | Done ✓ |
 
 **Hito**: Ejecutar `hello.elf` compilado en Linux que hace `write(1, "Hello\n", 6); exit(0);`
 

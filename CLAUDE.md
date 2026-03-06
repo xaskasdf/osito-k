@@ -124,6 +124,7 @@ arch/x86/kernel/heap.c              Kernel heap allocator (kmalloc/kfree, first-
 arch/x86/kernel/syscall.c           SYSCALL/SYSRET setup, dispatch table, fd table
 arch/x86/kernel/syscall_entry.S     SYSCALL entry point (save regs, call C dispatch, SYSRETQ)
 arch/x86/kernel/elf.c               ELF64 loader (PT_LOAD, stack setup, entry jump)
+arch/x86/kernel/process.c           Process table, exec/exit/waitpid, PID allocation
 arch/x86/drivers/nvme.c             Minimal NVMe driver (admin+IO queues, read/write)
 arch/x86/drivers/gpu.h              GPU types, MMIO register defines, Falcon defines, RPC IDs, VBIOS/BIT/FWSEC/WPR2 structs, PIO API, probe + GSP API
 arch/x86/drivers/gpu.c              GPU probe Phase 1-3 + Phase 9 VBIOS read, BIT parse, FWSEC extraction
@@ -308,6 +309,7 @@ Tasks:   idle, input, shell (3 of 8 slots used)
 | **X-OS3** | **Heap allocator** (kmalloc/kfree/kcalloc/krealloc, first-fit free list, block coalescing, auto-grow via page allocator) | Done |
 | **X-OS4** | **Syscall interface** (SYSCALL/SYSRET via LSTAR/STAR/FMASK MSRs, dispatch table, write/read/exit, fd table with stdin/stdout/stderr) | Done |
 | **X-OS5** | **ELF loader** (ELF64 validation, PT_LOAD segment loading, stack setup with argc/argv/envp, entry point jump) | Done |
+| **X-OS6** | **Process subsystem** (process_t table, PID alloc, per-process FD table, proc_exec/exit/waitpid, kernel PID 0) | Done |
 
 > Full GPU roadmap (X27-X40 + contingency): see [docs/x86-gpu-roadmap.md](docs/x86-gpu-roadmap.md)
 > Full OS roadmap (Tier 0-5): see [docs/os-selfhost-roadmap.md](docs/os-selfhost-roadmap.md)
@@ -524,6 +526,19 @@ Load and execute ELF64 binaries from OsitoFS.
 - **Stack setup**: 64KB stack with argc/argv/envp layout (Linux-compatible: argc, argv ptrs, NULL, envp, NULL).
 - **Execution**: `elf_jump()` sets RSP and jumps to entry. Currently ring-0 only.
 - **API**: `elf_exec(filename, argc, argv)` — reads from OsitoFS, loads, and jumps. Does not return.
+
+### X-OS6: Process Subsystem
+Minimal process abstraction for exec/exit lifecycle.
+- **Process table**: 16 slots, states: FREE/READY/RUNNING/ZOMBIE. PID auto-increment.
+- **Per-process FD table**: 16 entries cloned from parent. stdin/stdout/stderr initialized to console.
+- **Kernel process**: PID 1 created at init, set as `current_proc`.
+- **proc_exec()**: Allocates process slot, sets current, calls `elf_exec()`. On failure, cleans up.
+- **proc_exit()**: Marks process as ZOMBIE, stores exit code. Cleanup via `proc_waitpid()`.
+- **proc_waitpid()**: Synchronous — checks for ZOMBIE, returns exit code, frees process.
+- **proc_list()**: Dumps process table (PID, state, name) for debugging.
+- **Memory tracking**: `mem_region_t` array per process for cleanup on exit.
+
+**Tier 1 milestone**: OsitoK can now load and execute an ELF64 binary from OsitoFS that uses `write(1, "Hello\n", 6); exit(0);` syscalls.
 
 ### X27: Falcon PIO Load
 Programmed I/O access to Falcon IMEM/DMEM via IMEMC/IMEMD registers.
