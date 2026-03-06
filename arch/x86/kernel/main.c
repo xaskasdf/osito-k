@@ -82,6 +82,7 @@ extern void net_udp_listen(uint16_t port, udp_handler_t handler);
 extern int osfs2_mount(uint64_t part_offset);
 extern void osfs2_list(void);
 extern bool osfs2_is_mounted(void);
+extern void *osfs2_find(const char *name);
 
 /* GSP Falcon */
 extern int  gsp_probe(void);
@@ -262,8 +263,39 @@ void kernel_entry(void *memory_map, uint64_t map_size,
     fb_puts(" Scanning PCIe...\n");
     pci_scan();
 
-    /* GPU MMIO probe (Phase 1) */
+    /* ── Map PCI device BARs into page tables ── */
+    typedef struct {
+        uint8_t  bus, dev, func;
+        uint16_t vendor_id, device_id;
+        uint8_t  class_code, subclass;
+        uint64_t bar[6];
+    } pci_dev_t;
+
+    /* Map GPU BAR0 if present */
     gpu_device_t *gpu = pci_get_gpu();
+    if (gpu && gpu->bar0_base) {
+        paging_map_mmio(gpu->bar0_base, 32ULL * 1024 * 1024);  /* 32MB */
+    }
+
+    /* Map NVMe BAR0 */
+    pci_dev_t *nvme_pci = (pci_dev_t *)pci_get_nvme();
+    if (nvme_pci && nvme_pci->bar[0]) {
+        paging_map_mmio(nvme_pci->bar[0], 16 * 1024);  /* 16KB NVMe regs */
+        serial_puts("[KERN] Mapped NVMe BAR0 0x");
+        serial_puthex(nvme_pci->bar[0], 16);
+        serial_puts("\n");
+    }
+
+    /* Map NIC BAR0 */
+    pci_dev_t *nic_pci_early = (pci_dev_t *)pci_get_nic();
+    if (nic_pci_early && nic_pci_early->bar[0]) {
+        paging_map_mmio(nic_pci_early->bar[0], 128 * 1024);  /* 128KB igb */
+    }
+
+    /* Flush TLB after all MMIO mappings */
+    __asm__ volatile ("mov %%cr3, %%rax; mov %%rax, %%cr3" ::: "rax", "memory");
+
+    /* GPU MMIO probe (Phase 1) */
     if (gpu && gpu->bar0_base) {
         gpu_init(gpu->bar0_base);
     } else {
@@ -272,15 +304,6 @@ void kernel_entry(void *memory_map, uint64_t map_size,
     }
 
     /* ── Step 3: NVMe init ── */
-    /* Get NVMe BAR0 from PCI scan */
-    typedef struct {
-        uint8_t  bus, dev, func;
-        uint16_t vendor_id, device_id;
-        uint8_t  class_code, subclass;
-        uint64_t bar[6];
-    } pci_dev_t;
-
-    pci_dev_t *nvme_pci = (pci_dev_t *)pci_get_nvme();
     if (nvme_pci && nvme_pci->bar[0]) {
         serial_puts("[KERN] Initializing NVMe...\n");
         fb_puts("\n Initializing NVMe...\n");
@@ -292,56 +315,73 @@ void kernel_entry(void *memory_map, uint64_t map_size,
             extern int gpt_find_ositofs(uint64_t *part_offset, uint64_t *part_size);
 
             uint64_t part_offset, part_size;
+            bool fs_mounted = false;
+
             if (gpt_find_ositofs(&part_offset, &part_size) == 0) {
-                if (osfs2_mount(part_offset) == 0) {
-                    osfs2_list();
+                fs_mounted = (osfs2_mount(part_offset) == 0);
+            }
 
-                    /* Load GGUF model (if present) */
-                    static gguf_model_t gguf_model;
-                    static llama_state_t llama;
-                    bool model_ready = false;
+            /* Fallback: try raw OsitoFS at offset 0 (no GPT) */
+            if (!fs_mounted) {
+                serial_puts("[KERN] GPT not found, trying raw OsitoFS at offset 0...\n");
+                fs_mounted = (osfs2_mount(0) == 0);
+            }
 
-                    if (gguf_load(&gguf_model) == 0 && gguf_model.num_tensors > 0) {
-                        if (llama_init(&llama, &gguf_model, 256) == 0) {
-                            /* CPU inference (baseline) */
-                            uint32_t prompt[] = { 128000 };  /* BOS */
-                            llama_generate(&llama, prompt, 1, 32);
-                            model_ready = true;
-                        }
-                    }
+            if (fs_mounted) {
+                osfs2_list();
 
-                    /* GSP firmware loading + boot */
-                    gpu_probe_t *gp = gpu_get_probe();
-                    if (gp && gp->gsp_present)
-                        gsp_probe();
-                    gsp_load_firmware();
-                    if (gp && gp->gsp_present)
-                        gsp_queue_init();
-                    if (gp && gp->gsp_present)
-                        gsp_boot();
+                /* Load GGUF model (if present) */
+                static gguf_model_t gguf_model;
+                static llama_state_t llama;
+                bool model_ready = false;
 
-                    /* X40: GPU-accelerated inference (after GPU init) */
-                    if (model_ready) {
-                        static gpu_llama_state_t gpu_llama;
-                        if (gpu_llama_init(&gpu_llama, &llama) == 0) {
-                            gpu_llama_benchmark(&gpu_llama);
-
-                            /* GPU-accelerated inference run */
-                            llama.pos = 0;  /* Reset position for fresh run */
-                            uint32_t prompt2[] = { 128000 };
-                            gpu_llama_generate(&gpu_llama, prompt2, 1, 32);
-
-                            gpu_llama_free(&gpu_llama);
-                        }
-                        /* Keep llama state alive for UDP prompt server */
-                        prompt_llama = &llama;
-                    } else {
-                        /* No model — run standalone GPU benchmark */
-                        gpu_llama_benchmark_standalone();
+                if (gguf_load(&gguf_model) == 0 && gguf_model.num_tensors > 0) {
+                    if (llama_init(&llama, &gguf_model, 256) == 0) {
+                        /* CPU inference (baseline) */
+                        uint32_t prompt[] = { 128000 };  /* BOS */
+                        llama_generate(&llama, prompt, 1, 32);
+                        model_ready = true;
                     }
                 }
+
+                /* GSP firmware loading + boot */
+                gpu_probe_t *gp = gpu_get_probe();
+                if (gp && gp->gsp_present)
+                    gsp_probe();
+                gsp_load_firmware();
+                if (gp && gp->gsp_present)
+                    gsp_queue_init();
+                if (gp && gp->gsp_present)
+                    gsp_boot();
+
+                /* X40: GPU-accelerated inference (after GPU init) */
+                if (model_ready) {
+                    static gpu_llama_state_t gpu_llama;
+                    if (gpu_llama_init(&gpu_llama, &llama) == 0) {
+                        gpu_llama_benchmark(&gpu_llama);
+
+                        /* GPU-accelerated inference run */
+                        llama.pos = 0;  /* Reset position for fresh run */
+                        uint32_t prompt2[] = { 128000 };
+                        gpu_llama_generate(&gpu_llama, prompt2, 1, 32);
+
+                        gpu_llama_free(&gpu_llama);
+                    }
+                    /* Keep llama state alive for UDP prompt server */
+                    prompt_llama = &llama;
+                } else {
+                    /* No model — run standalone GPU benchmark */
+                    gpu_llama_benchmark_standalone();
+                }
+
+                /* ── Try executing hello.elf if present ── */
+                if (osfs2_find("hello.elf")) {
+                    serial_puts("[KERN] Found hello.elf — executing...\n");
+                    fb_puts_color("\n Running hello.elf...\n", 0x0000FF00);
+                    proc_exec("hello.elf", 0, NULL);
+                }
             } else {
-                serial_puts("[KERN] OsitoFS partition not found in GPT\n");
+                serial_puts("[KERN] OsitoFS not found (no GPT, no raw)\n");
                 fb_puts("\n OsitoFS: not found\n");
             }
         } else {

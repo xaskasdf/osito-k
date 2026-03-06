@@ -149,14 +149,19 @@ static int elf_load_segments(const uint8_t *data, uint64_t data_size,
     serial_putdec(hdr->e_phnum);
     serial_puts(" program headers\n");
 
-    for (int i = 0; i < hdr->e_phnum && i < ELF_MAX_SEGMENTS; i++) {
+    /* First pass: find min/max vaddr across all LOAD segments.
+     * We allocate one contiguous block so RIP-relative addressing
+     * between segments (e.g. .text → .rodata) works correctly. */
+    uint64_t vaddr_min = UINT64_MAX;
+    uint64_t vaddr_max = 0;
+    int load_count = 0;
+
+    for (int i = 0; i < hdr->e_phnum; i++) {
         uint64_t phoff = hdr->e_phoff + (uint64_t)i * hdr->e_phentsize;
         if (phoff + sizeof(elf64_phdr_t) > data_size) break;
 
         const elf64_phdr_t *ph = (const elf64_phdr_t *)(data + phoff);
-
-        if (ph->p_type != PT_LOAD) continue;
-        if (ph->p_memsz == 0) continue;
+        if (ph->p_type != PT_LOAD || ph->p_memsz == 0) continue;
 
         serial_puts("[ELF]   LOAD: vaddr=0x");
         serial_puthex(ph->p_vaddr, 16);
@@ -170,47 +175,69 @@ static int elf_load_segments(const uint8_t *data, uint64_t data_size,
         if (ph->p_flags & PF_X) serial_puts("X");
         serial_puts("\n");
 
-        /* Allocate pages for this segment */
-        uint64_t pages = (ph->p_memsz + 4095) / 4096;
-        void *seg = mem_alloc_aligned(pages * 4096, 4096);
-        if (!seg) {
-            serial_puts("[ELF] Failed to allocate segment\n");
-            return -1;
-        }
+        if (ph->p_vaddr < vaddr_min)
+            vaddr_min = ph->p_vaddr;
+        if (ph->p_vaddr + ph->p_memsz > vaddr_max)
+            vaddr_max = ph->p_vaddr + ph->p_memsz;
+        load_count++;
+    }
 
-        /* Zero the allocation (BSS needs zeros) */
-        memset(seg, 0, pages * 4096);
+    if (load_count == 0) {
+        serial_puts("[ELF] No LOAD segments found\n");
+        return -1;
+    }
 
-        /* Copy file data into segment */
+    /* Allocate one contiguous block covering all segments */
+    uint64_t total_size = vaddr_max - vaddr_min;
+    uint64_t total_pages = (total_size + 4095) / 4096;
+
+    void *base = mem_alloc_aligned(total_pages * 4096, 4096);
+    if (!base) {
+        serial_puts("[ELF] Failed to allocate ");
+        serial_putdec(total_pages);
+        serial_puts(" pages\n");
+        return -1;
+    }
+
+    /* Zero entire region (BSS segments need zeros) */
+    memset(base, 0, total_pages * 4096);
+
+    loaded->segments[0] = base;
+    loaded->segment_pages[0] = total_pages;
+    loaded->segment_count = 1;
+
+    serial_puts("[ELF] Load base: 0x");
+    serial_puthex((uint64_t)base, 16);
+    serial_puts(", ");
+    serial_putdec(total_pages * 4);
+    serial_puts(" KB\n");
+
+    /* Second pass: copy segment data at correct offsets within the block */
+    for (int i = 0; i < hdr->e_phnum; i++) {
+        uint64_t phoff = hdr->e_phoff + (uint64_t)i * hdr->e_phentsize;
+        if (phoff + sizeof(elf64_phdr_t) > data_size) break;
+
+        const elf64_phdr_t *ph = (const elf64_phdr_t *)(data + phoff);
+        if (ph->p_type != PT_LOAD || ph->p_memsz == 0) continue;
+
+        uint64_t offset_in_block = ph->p_vaddr - vaddr_min;
+
         if (ph->p_filesz > 0) {
             if (ph->p_offset + ph->p_filesz > data_size) {
                 serial_puts("[ELF] Segment data out of bounds\n");
                 return -1;
             }
-            memcpy(seg, data + ph->p_offset, ph->p_filesz);
-        }
-
-        loaded->segments[loaded->segment_count] = seg;
-        loaded->segment_pages[loaded->segment_count] = pages;
-        loaded->segment_count++;
-
-        /* For position-dependent executables, the entry point
-         * is an absolute address. We load at the physical address
-         * returned by our allocator instead. Adjust entry. */
-        if (ph->p_vaddr <= loaded->entry &&
-            loaded->entry < ph->p_vaddr + ph->p_memsz) {
-            uint64_t offset_in_seg = loaded->entry - ph->p_vaddr;
-            loaded->entry = (uint64_t)seg + offset_in_seg;
-            serial_puts("[ELF]   Adjusted entry: 0x");
-            serial_puthex(loaded->entry, 16);
-            serial_puts("\n");
+            memcpy((uint8_t *)base + offset_in_block,
+                   data + ph->p_offset, ph->p_filesz);
         }
     }
 
-    if (loaded->segment_count == 0) {
-        serial_puts("[ELF] No LOAD segments found\n");
-        return -1;
-    }
+    /* Adjust entry point: base + (entry - vaddr_min) */
+    loaded->entry = (uint64_t)base + (hdr->e_entry - vaddr_min);
+
+    serial_puts("[ELF] Adjusted entry: 0x");
+    serial_puthex(loaded->entry, 16);
+    serial_puts("\n");
 
     return 0;
 }
