@@ -48,11 +48,11 @@ seguidos de las capas fundamentales del OS.
 
 | ID | Feature | Descripción | ~Líneas | Deps |
 |----|---------|-------------|---------|------|
-| **X-OS1** | **IDT + Exceptions** | Tabla de interrupciones propia, handlers de #PF/#GP/#UD, APIC timer | ~500 | Ninguna |
-| **X-OS2** | **Paging (x86-64 4-level)** | PML4 setup, identity map kernel, per-process page tables, CR3 switch | ~600 | X-OS1 |
-| **X-OS3** | **Heap allocator** | malloc/free sobre page allocator (first-fit o buddy), brk/sbrk | ~400 | X-OS2 |
-| **X-OS4** | **Syscall interface** | MSR setup (LSTAR/STAR/FMASK), dispatch table, ABI: RAX=nr, RDI-R9=args | ~400 | X-OS2 |
-| **X-OS5** | **ELF loader** | Cargar PT_LOAD segments, setup stack (argc/argv/envp), jump to e_entry | ~400 | X-OS2, X-OS4 |
+| **X-OS1** | **IDT + Exceptions** | Tabla de interrupciones propia, handlers de #PF/#GP/#UD, APIC timer | ~500 | Done ✓ |
+| **X-OS2** | **Paging (x86-64 4-level)** | PML4 setup, identity map kernel, per-process page tables, CR3 switch | ~600 | Done ✓ |
+| **X-OS3** | **Heap allocator** | malloc/free sobre page allocator (first-fit o buddy), brk/sbrk | ~400 | Done ✓ |
+| **X-OS4** | **Syscall interface** | MSR setup (LSTAR/STAR/FMASK), dispatch table, ABI: RAX=nr, RDI-R9=args | ~400 | Done ✓ |
+| **X-OS5** | **ELF loader** | Cargar PT_LOAD segments, setup stack (argc/argv/envp), jump to e_entry | ~400 | Done ✓ |
 | **X-OS6** | **Proceso mínimo** | process_t struct, file descriptor table, exec/exit/waitpid | ~500 | X-OS4, X-OS5 |
 
 **Hito**: Ejecutar `hello.elf` compilado en Linux que hace `write(1, "Hello\n", 6); exit(0);`

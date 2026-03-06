@@ -120,6 +120,10 @@ arch/x86/kernel/memory.c            Physical memory manager (bitmap, 4KB pages)
 arch/x86/kernel/idt.c               IDT setup, exception handlers (#PF/#GP/#UD), APIC timer
 arch/x86/kernel/isr_stubs.S         ISR entry stubs (save regs, call C handler, IRETQ)
 arch/x86/kernel/paging.c            4-level page tables, identity map, CR3 switch, MMIO mapping
+arch/x86/kernel/heap.c              Kernel heap allocator (kmalloc/kfree, first-fit, coalescing)
+arch/x86/kernel/syscall.c           SYSCALL/SYSRET setup, dispatch table, fd table
+arch/x86/kernel/syscall_entry.S     SYSCALL entry point (save regs, call C dispatch, SYSRETQ)
+arch/x86/kernel/elf.c               ELF64 loader (PT_LOAD, stack setup, entry jump)
 arch/x86/drivers/nvme.c             Minimal NVMe driver (admin+IO queues, read/write)
 arch/x86/drivers/gpu.h              GPU types, MMIO register defines, Falcon defines, RPC IDs, VBIOS/BIT/FWSEC/WPR2 structs, PIO API, probe + GSP API
 arch/x86/drivers/gpu.c              GPU probe Phase 1-3 + Phase 9 VBIOS read, BIT parse, FWSEC extraction
@@ -301,6 +305,9 @@ Tasks:   idle, input, shell (3 of 8 slots used)
 | **X-CPU3** | **UDP prompt server** (port 7777, token ID input/output, inference dispatch, keep model alive) | Done |
 | **X-OS1** | **IDT + Exceptions + APIC timer** (256-entry IDT, ISR stubs, #PF/#GP/#UD handlers with register dump, xAPIC periodic timer vector 32) | Done |
 | **X-OS2** | **Paging** (4-level x86-64 page tables, identity map RAM+MMIO with 2MB large pages, CR3 switch, paging_map_mmio API) | Done |
+| **X-OS3** | **Heap allocator** (kmalloc/kfree/kcalloc/krealloc, first-fit free list, block coalescing, auto-grow via page allocator) | Done |
+| **X-OS4** | **Syscall interface** (SYSCALL/SYSRET via LSTAR/STAR/FMASK MSRs, dispatch table, write/read/exit, fd table with stdin/stdout/stderr) | Done |
+| **X-OS5** | **ELF loader** (ELF64 validation, PT_LOAD segment loading, stack setup with argc/argv/envp, entry point jump) | Done |
 
 > Full GPU roadmap (X27-X40 + contingency): see [docs/x86-gpu-roadmap.md](docs/x86-gpu-roadmap.md)
 > Full OS roadmap (Tier 0-5): see [docs/os-selfhost-roadmap.md](docs/os-selfhost-roadmap.md)
@@ -492,6 +499,31 @@ Own page tables replacing UEFI's. Identity maps all memory (virt == phys).
 - **CR3 switch**: `paging_init()` builds tables, then atomically switches CR3 with interrupts disabled.
 - **API**: `paging_map_page()` for single 4KB mappings with INVLPG, `paging_get_kernel_cr3()` for process cloning, `paging_switch()` for context switch.
 - **Integration**: Called after `idt_init()`, before PCI scan. Page tables allocated from physical page allocator.
+
+### X-OS3: Heap Allocator
+Kernel-space malloc/free over physical page allocator.
+- **Algorithm**: First-fit free list with boundary-tag headers (32 bytes). Adjacent free blocks coalesced on free.
+- **API**: `kmalloc(size)`, `kfree(ptr)`, `kcalloc(count, size)`, `krealloc(ptr, size)`.
+- **Growth**: Initial 256KB from page allocator. Auto-grows 64KB at a time via `mem_alloc_pages()`.
+- **Alignment**: All allocations 16-byte aligned. Minimum allocation 16 bytes.
+- **Safety**: Magic number (0x4F53) corruption detection, double-free check.
+- **Self-test**: alloc/free/coalesce cycle on init, verifies fragmentation handling.
+
+### X-OS4: Syscall Interface
+SYSCALL/SYSRET fast path for user→kernel transitions.
+- **MSR setup**: EFER.SCE enable, LSTAR=entry point, STAR=kernel/user CS, FMASK=mask IF+DF+TF.
+- **Entry**: `syscall_entry.S` — saves RCX(RIP)/R11(RFLAGS) + callee-saved regs, shuffles args to C ABI, calls `syscall_dispatch()`, SYSRETQ.
+- **Syscalls**: write(1), read(0), exit(60), brk(12) implemented. open/close/arch_prctl are stubs returning -ENOSYS.
+- **FD table**: 16 entries. fd 0=stdin(read→EOF), fd 1=stdout(write→serial+FB), fd 2=stderr(same as stdout).
+- **Linux ABI**: RAX=nr, RDI/RSI/RDX/R10/R8/R9=args. Return in RAX. Compatible with static Linux binaries.
+
+### X-OS5: ELF64 Loader
+Load and execute ELF64 binaries from OsitoFS.
+- **Validation**: Magic, class (64-bit), endianness (LE), machine (x86-64), type (EXEC or DYN).
+- **Loading**: Iterates PT_LOAD segments, allocates pages, copies file data, zeros BSS. Adjusts entry point for physical load address.
+- **Stack setup**: 64KB stack with argc/argv/envp layout (Linux-compatible: argc, argv ptrs, NULL, envp, NULL).
+- **Execution**: `elf_jump()` sets RSP and jumps to entry. Currently ring-0 only.
+- **API**: `elf_exec(filename, argc, argv)` — reads from OsitoFS, loads, and jumps. Does not return.
 
 ### X27: Falcon PIO Load
 Programmed I/O access to Falcon IMEM/DMEM via IMEMC/IMEMD registers.

@@ -23,6 +23,19 @@ extern void paging_init(void);
 extern uint64_t paging_get_kernel_cr3(void);
 extern int paging_map_mmio(uint64_t phys, uint64_t size);
 
+/* Heap */
+extern void heap_init(void);
+extern void *kmalloc(uint64_t size);
+extern void  kfree(void *ptr);
+extern void *kcalloc(uint64_t count, uint64_t size);
+extern void *krealloc(void *ptr, uint64_t new_size);
+
+/* Syscall */
+extern void syscall_init(void);
+
+/* ELF loader */
+extern int elf_exec(const char *filename, int argc, const char **argv);
+
 /* Serial */
 extern void serial_puts(const char *s);
 extern void serial_puthex(uint64_t val, int digits);
@@ -226,6 +239,12 @@ void kernel_entry(void *memory_map, uint64_t map_size,
 
     /* ── Step 1.6: Kernel page tables ── */
     paging_init();
+
+    /* ── Step 1.7: Kernel heap ── */
+    heap_init();
+
+    /* ── Step 1.8: Syscall interface ── */
+    syscall_init();
 
     /* ── Tensor compute self-test ── */
     tensor_benchmark();
