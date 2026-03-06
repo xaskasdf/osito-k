@@ -1,0 +1,258 @@
+// OsitoK — softmax PTX kernel
+// Translated from ntransformer/src/cuda/softmax.cu softmax_kernel
+//
+// 3-phase numerically stable softmax:
+//   Phase 1: find max (warp + cross-warp reduction)
+//   Phase 2: exp(x[i] - max), sum (warp + cross-warp reduction)
+//   Phase 3: normalize y[i] /= sum
+//
+// In-place: output overwrites input (same pointer OK).
+// One block per row. 256 threads.
+//
+// Grid:  rows
+// Block: 256
+//
+// Compile: ptxas --gpu-name sm_75 -o softmax.cubin softmax.ptx
+//
+
+.version 7.5
+.target sm_75
+.address_size 64
+
+.entry softmax(
+    .param .u64 p_output,       // float* output [rows * cols]
+    .param .u64 p_input,        // float* input  [rows * cols]
+    .param .u32 p_cols
+) {
+    .reg .u32   %tid, %cols, %i, %lane, %wid, %nwarps;
+    .reg .u64   %out_ptr, %in_ptr, %addr;
+    .reg .f32   %val, %local_max, %row_max, %local_sum, %sum_inv, %exp_val;
+    .reg .f32   %shfl_val, %neg_max;
+    .reg .b32   %shfl_src;
+    .reg .pred  %p0, %p1;
+
+    // shared: [0..31] for reduction, [32] for broadcast max, [33] for broadcast sum_inv
+    .shared .align 4 .f32 shared[34];
+
+    ld.param.u64    %out_ptr, [p_output];
+    ld.param.u64    %in_ptr,  [p_input];
+    ld.param.u32    %cols,    [p_cols];
+
+    mov.u32         %tid, %tid.x;
+
+    // Offset by row
+    {
+        .reg .u32 %row;
+        .reg .u64 %row_off;
+        mov.u32     %row, %ctaid.x;
+        mul.wide.u32 %row_off, %row, %cols;
+        shl.b64     %row_off, %row_off, 2;
+        add.u64     %in_ptr, %in_ptr, %row_off;
+        add.u64     %out_ptr, %out_ptr, %row_off;
+    }
+
+    // ── Phase 1: Find max ──
+    mov.f32         %local_max, 0fFF7FFFFF;     // -FLT_MAX
+    mov.u32         %i, %tid;
+max_loop:
+    setp.ge.u32     %p0, %i, %cols;
+    @%p0 bra        max_done;
+    mul.wide.u32    %addr, %i, 4;
+    add.u64         %addr, %in_ptr, %addr;
+    ld.global.f32   %val, [%addr];
+    max.f32         %local_max, %local_max, %val;
+    add.u32         %i, %i, 256;
+    bra             max_loop;
+max_done:
+
+    // Warp reduction for max
+    mov.b32         %shfl_src, %local_max;
+    shfl.sync.bfly.b32 %shfl_src, %shfl_src, 16, 31, 0xFFFFFFFF;
+    mov.b32         %shfl_val, %shfl_src;
+    max.f32         %local_max, %local_max, %shfl_val;
+    mov.b32         %shfl_src, %local_max;
+    shfl.sync.bfly.b32 %shfl_src, %shfl_src, 8, 31, 0xFFFFFFFF;
+    mov.b32         %shfl_val, %shfl_src;
+    max.f32         %local_max, %local_max, %shfl_val;
+    mov.b32         %shfl_src, %local_max;
+    shfl.sync.bfly.b32 %shfl_src, %shfl_src, 4, 31, 0xFFFFFFFF;
+    mov.b32         %shfl_val, %shfl_src;
+    max.f32         %local_max, %local_max, %shfl_val;
+    mov.b32         %shfl_src, %local_max;
+    shfl.sync.bfly.b32 %shfl_src, %shfl_src, 2, 31, 0xFFFFFFFF;
+    mov.b32         %shfl_val, %shfl_src;
+    max.f32         %local_max, %local_max, %shfl_val;
+    mov.b32         %shfl_src, %local_max;
+    shfl.sync.bfly.b32 %shfl_src, %shfl_src, 1, 31, 0xFFFFFFFF;
+    mov.b32         %shfl_val, %shfl_src;
+    max.f32         %local_max, %local_max, %shfl_val;
+
+    // Cross-warp max reduction
+    and.b32         %lane, %tid, 31;
+    shr.u32         %wid, %tid, 5;
+
+    setp.ne.u32     %p0, %lane, 0;
+    @%p0 bra        skip_max_store;
+    mul.lo.u32      %i, %wid, 4;
+    st.shared.f32   [shared + %i], %local_max;
+skip_max_store:
+    bar.sync        0;
+
+    setp.ne.u32     %p0, %wid, 0;
+    @%p0 bra        skip_max_reduce;
+
+    mov.u32         %nwarps, 8;
+    setp.lt.u32     %p1, %tid, %nwarps;
+    @%p1 bra        load_max_shared;
+    mov.f32         %local_max, 0fFF7FFFFF;
+    bra             do_max_reduce;
+load_max_shared:
+    mul.lo.u32      %i, %lane, 4;
+    ld.shared.f32   %local_max, [shared + %i];
+do_max_reduce:
+    mov.b32         %shfl_src, %local_max;
+    shfl.sync.bfly.b32 %shfl_src, %shfl_src, 16, 31, 0xFFFFFFFF;
+    mov.b32         %shfl_val, %shfl_src;
+    max.f32         %local_max, %local_max, %shfl_val;
+    mov.b32         %shfl_src, %local_max;
+    shfl.sync.bfly.b32 %shfl_src, %shfl_src, 8, 31, 0xFFFFFFFF;
+    mov.b32         %shfl_val, %shfl_src;
+    max.f32         %local_max, %local_max, %shfl_val;
+    mov.b32         %shfl_src, %local_max;
+    shfl.sync.bfly.b32 %shfl_src, %shfl_src, 4, 31, 0xFFFFFFFF;
+    mov.b32         %shfl_val, %shfl_src;
+    max.f32         %local_max, %local_max, %shfl_val;
+    mov.b32         %shfl_src, %local_max;
+    shfl.sync.bfly.b32 %shfl_src, %shfl_src, 2, 31, 0xFFFFFFFF;
+    mov.b32         %shfl_val, %shfl_src;
+    max.f32         %local_max, %local_max, %shfl_val;
+    mov.b32         %shfl_src, %local_max;
+    shfl.sync.bfly.b32 %shfl_src, %shfl_src, 1, 31, 0xFFFFFFFF;
+    mov.b32         %shfl_val, %shfl_src;
+    max.f32         %local_max, %local_max, %shfl_val;
+
+    setp.ne.u32     %p0, %tid, 0;
+    @%p0 bra        skip_max_bcast;
+    st.shared.f32   [shared + 128], %local_max;
+skip_max_bcast:
+skip_max_reduce:
+    bar.sync        0;
+    ld.shared.f32   %row_max, [shared + 128];
+
+    // ── Phase 2: exp(x - max) and sum ──
+    neg.f32         %neg_max, %row_max;
+    mov.f32         %local_sum, 0f00000000;
+    mov.u32         %i, %tid;
+exp_loop:
+    setp.ge.u32     %p0, %i, %cols;
+    @%p0 bra        exp_done;
+    mul.wide.u32    %addr, %i, 4;
+    {
+        .reg .u64 %tmp;
+        add.u64     %tmp, %in_ptr, %addr;
+        ld.global.f32 %val, [%tmp];
+    }
+    add.f32         %val, %val, %neg_max;       // x[i] - max
+    // exp approximation via ex2: exp(x) = 2^(x * log2(e))
+    mul.f32         %val, %val, 0f3FB8AA3B;     // log2(e) = 1.44269504
+    ex2.approx.f32  %exp_val, %val;
+    // Store exp value
+    {
+        .reg .u64 %tmp;
+        add.u64     %tmp, %out_ptr, %addr;
+        st.global.f32 [%tmp], %exp_val;
+    }
+    add.f32         %local_sum, %local_sum, %exp_val;
+    add.u32         %i, %i, 256;
+    bra             exp_loop;
+exp_done:
+
+    // Warp reduction for sum
+    mov.b32         %shfl_src, %local_sum;
+    shfl.sync.bfly.b32 %shfl_src, %shfl_src, 16, 31, 0xFFFFFFFF;
+    mov.b32         %shfl_val, %shfl_src;
+    add.f32         %local_sum, %local_sum, %shfl_val;
+    mov.b32         %shfl_src, %local_sum;
+    shfl.sync.bfly.b32 %shfl_src, %shfl_src, 8, 31, 0xFFFFFFFF;
+    mov.b32         %shfl_val, %shfl_src;
+    add.f32         %local_sum, %local_sum, %shfl_val;
+    mov.b32         %shfl_src, %local_sum;
+    shfl.sync.bfly.b32 %shfl_src, %shfl_src, 4, 31, 0xFFFFFFFF;
+    mov.b32         %shfl_val, %shfl_src;
+    add.f32         %local_sum, %local_sum, %shfl_val;
+    mov.b32         %shfl_src, %local_sum;
+    shfl.sync.bfly.b32 %shfl_src, %shfl_src, 2, 31, 0xFFFFFFFF;
+    mov.b32         %shfl_val, %shfl_src;
+    add.f32         %local_sum, %local_sum, %shfl_val;
+    mov.b32         %shfl_src, %local_sum;
+    shfl.sync.bfly.b32 %shfl_src, %shfl_src, 1, 31, 0xFFFFFFFF;
+    mov.b32         %shfl_val, %shfl_src;
+    add.f32         %local_sum, %local_sum, %shfl_val;
+
+    // Cross-warp sum reduction
+    setp.ne.u32     %p0, %lane, 0;
+    @%p0 bra        skip_sum_store;
+    mul.lo.u32      %i, %wid, 4;
+    st.shared.f32   [shared + %i], %local_sum;
+skip_sum_store:
+    bar.sync        0;
+
+    setp.ne.u32     %p0, %wid, 0;
+    @%p0 bra        skip_sum_reduce;
+    setp.lt.u32     %p1, %tid, 8;
+    @%p1 bra        load_sum_shared;
+    mov.f32         %local_sum, 0f00000000;
+    bra             do_sum_reduce;
+load_sum_shared:
+    mul.lo.u32      %i, %lane, 4;
+    ld.shared.f32   %local_sum, [shared + %i];
+do_sum_reduce:
+    mov.b32         %shfl_src, %local_sum;
+    shfl.sync.bfly.b32 %shfl_src, %shfl_src, 16, 31, 0xFFFFFFFF;
+    mov.b32         %shfl_val, %shfl_src;
+    add.f32         %local_sum, %local_sum, %shfl_val;
+    mov.b32         %shfl_src, %local_sum;
+    shfl.sync.bfly.b32 %shfl_src, %shfl_src, 8, 31, 0xFFFFFFFF;
+    mov.b32         %shfl_val, %shfl_src;
+    add.f32         %local_sum, %local_sum, %shfl_val;
+    mov.b32         %shfl_src, %local_sum;
+    shfl.sync.bfly.b32 %shfl_src, %shfl_src, 4, 31, 0xFFFFFFFF;
+    mov.b32         %shfl_val, %shfl_src;
+    add.f32         %local_sum, %local_sum, %shfl_val;
+    mov.b32         %shfl_src, %local_sum;
+    shfl.sync.bfly.b32 %shfl_src, %shfl_src, 2, 31, 0xFFFFFFFF;
+    mov.b32         %shfl_val, %shfl_src;
+    add.f32         %local_sum, %local_sum, %shfl_val;
+    mov.b32         %shfl_src, %local_sum;
+    shfl.sync.bfly.b32 %shfl_src, %shfl_src, 1, 31, 0xFFFFFFFF;
+    mov.b32         %shfl_val, %shfl_src;
+    add.f32         %local_sum, %local_sum, %shfl_val;
+
+    setp.ne.u32     %p0, %tid, 0;
+    @%p0 bra        skip_sum_bcast;
+    rcp.approx.f32  %sum_inv, %local_sum;       // 1.0 / sum
+    st.shared.f32   [shared + 132], %sum_inv;   // shared[33]
+skip_sum_bcast:
+skip_sum_reduce:
+    bar.sync        0;
+    ld.shared.f32   %sum_inv, [shared + 132];
+
+    // ── Phase 3: Normalize ──
+    mov.u32         %i, %tid;
+norm_loop:
+    setp.ge.u32     %p0, %i, %cols;
+    @%p0 bra        done;
+    mul.wide.u32    %addr, %i, 4;
+    {
+        .reg .u64 %tmp;
+        add.u64     %tmp, %out_ptr, %addr;
+        ld.global.f32 %val, [%tmp];
+        mul.f32     %val, %val, %sum_inv;
+        st.global.f32 [%tmp], %val;
+    }
+    add.u32         %i, %i, 256;
+    bra             norm_loop;
+
+done:
+    ret;
+}

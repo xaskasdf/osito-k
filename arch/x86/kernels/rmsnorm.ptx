@@ -1,0 +1,202 @@
+// OsitoK — rmsnorm PTX kernel
+// Translated from ntransformer/src/cuda/rmsnorm.cu rmsnorm_kernel
+//
+// y[i] = (x[i] / sqrt(mean(x^2) + eps)) * weight[i]
+//
+// Single-pass: sum of squares with warp + cross-warp reduction.
+// One block per row, 256 threads.
+//
+// Grid:  batch_size (1 for decode)
+// Block: 256 threads
+//
+// Compile: ptxas --gpu-name sm_75 -o rmsnorm.cubin rmsnorm.ptx
+//
+
+.version 7.5
+.target sm_75
+.address_size 64
+
+.entry rmsnorm(
+    .param .u64 p_output,       // float* output [hidden_size]
+    .param .u64 p_input,        // float* input  [hidden_size]
+    .param .u64 p_weight,       // float* weight [hidden_size]
+    .param .u32 p_hidden_size,
+    .param .f32 p_eps
+) {
+    .reg .u32   %tid, %hidden_size, %i, %lane, %wid, %nwarps;
+    .reg .u64   %out_ptr, %in_ptr, %w_ptr, %addr;
+    .reg .f32   %sum_sq, %val, %wval, %eps, %mean_sq, %rms_inv, %result;
+    .reg .f32   %shfl_val;
+    .reg .b32   %shfl_src;
+    .reg .pred  %p0, %p1;
+
+    // Shared memory for cross-warp reduction (32 floats) + rms_inv broadcast
+    .shared .align 4 .f32 shared[33];  // [0..31] = warp sums, [32] = rms_inv
+
+    // Load params
+    ld.param.u64    %out_ptr, [p_output];
+    ld.param.u64    %in_ptr,  [p_input];
+    ld.param.u64    %w_ptr,   [p_weight];
+    ld.param.u32    %hidden_size, [p_hidden_size];
+    ld.param.f32    %eps,     [p_eps];
+
+    mov.u32         %tid, %tid.x;
+
+    // Offset by row: row = blockIdx.x
+    {
+        .reg .u32 %row;
+        .reg .u64 %row_off;
+        mov.u32     %row, %ctaid.x;
+        mul.wide.u32 %row_off, %row, %hidden_size;
+        shl.b64     %row_off, %row_off, 2;     // * sizeof(float)
+        add.u64     %in_ptr, %in_ptr, %row_off;
+        add.u64     %out_ptr, %out_ptr, %row_off;
+    }
+
+    // Phase 1: Compute sum of squares
+    mov.f32         %sum_sq, 0f00000000;
+    mov.u32         %i, %tid;
+sum_loop:
+    setp.ge.u32     %p0, %i, %hidden_size;
+    @%p0 bra        sum_done;
+
+    mul.wide.u32    %addr, %i, 4;
+    add.u64         %addr, %in_ptr, %addr;
+    ld.global.f32   %val, [%addr];
+    fma.rn.f32      %sum_sq, %val, %val, %sum_sq;
+
+    add.u32         %i, %i, 256;    // BLOCK_SIZE = 256
+    bra             sum_loop;
+sum_done:
+
+    // Warp reduction for sum_sq
+    mov.b32         %shfl_src, %sum_sq;
+    shfl.sync.bfly.b32 %shfl_src, %shfl_src, 16, 31, 0xFFFFFFFF;
+    mov.b32         %shfl_val, %shfl_src;
+    add.f32         %sum_sq, %sum_sq, %shfl_val;
+
+    mov.b32         %shfl_src, %sum_sq;
+    shfl.sync.bfly.b32 %shfl_src, %shfl_src, 8, 31, 0xFFFFFFFF;
+    mov.b32         %shfl_val, %shfl_src;
+    add.f32         %sum_sq, %sum_sq, %shfl_val;
+
+    mov.b32         %shfl_src, %sum_sq;
+    shfl.sync.bfly.b32 %shfl_src, %shfl_src, 4, 31, 0xFFFFFFFF;
+    mov.b32         %shfl_val, %shfl_src;
+    add.f32         %sum_sq, %sum_sq, %shfl_val;
+
+    mov.b32         %shfl_src, %sum_sq;
+    shfl.sync.bfly.b32 %shfl_src, %shfl_src, 2, 31, 0xFFFFFFFF;
+    mov.b32         %shfl_val, %shfl_src;
+    add.f32         %sum_sq, %sum_sq, %shfl_val;
+
+    mov.b32         %shfl_src, %sum_sq;
+    shfl.sync.bfly.b32 %shfl_src, %shfl_src, 1, 31, 0xFFFFFFFF;
+    mov.b32         %shfl_val, %shfl_src;
+    add.f32         %sum_sq, %sum_sq, %shfl_val;
+
+    // Cross-warp reduction via shared memory
+    and.b32         %lane, %tid, 31;
+    shr.u32         %wid, %tid, 5;
+
+    // if (lane == 0) shared[wid] = sum_sq
+    setp.ne.u32     %p0, %lane, 0;
+    @%p0 bra        skip_store;
+    mul.lo.u32      %i, %wid, 4;
+    st.shared.f32   [shared + %i], %sum_sq;
+skip_store:
+    bar.sync        0;
+
+    // Only warp 0 does final reduction
+    setp.ne.u32     %p0, %wid, 0;
+    @%p0 bra        skip_final_reduce;
+
+    // Load from shared (nwarps = 256/32 = 8)
+    mov.u32         %nwarps, 8;
+    setp.lt.u32     %p1, %tid, %nwarps;
+    @%p1 bra        load_shared;
+    mov.f32         %sum_sq, 0f00000000;
+    bra             do_final_reduce;
+load_shared:
+    mul.lo.u32      %i, %lane, 4;
+    ld.shared.f32   %sum_sq, [shared + %i];
+
+do_final_reduce:
+    // Warp reduction again for cross-warp
+    mov.b32         %shfl_src, %sum_sq;
+    shfl.sync.bfly.b32 %shfl_src, %shfl_src, 16, 31, 0xFFFFFFFF;
+    mov.b32         %shfl_val, %shfl_src;
+    add.f32         %sum_sq, %sum_sq, %shfl_val;
+    mov.b32         %shfl_src, %sum_sq;
+    shfl.sync.bfly.b32 %shfl_src, %shfl_src, 8, 31, 0xFFFFFFFF;
+    mov.b32         %shfl_val, %shfl_src;
+    add.f32         %sum_sq, %sum_sq, %shfl_val;
+    mov.b32         %shfl_src, %sum_sq;
+    shfl.sync.bfly.b32 %shfl_src, %shfl_src, 4, 31, 0xFFFFFFFF;
+    mov.b32         %shfl_val, %shfl_src;
+    add.f32         %sum_sq, %sum_sq, %shfl_val;
+    mov.b32         %shfl_src, %sum_sq;
+    shfl.sync.bfly.b32 %shfl_src, %shfl_src, 2, 31, 0xFFFFFFFF;
+    mov.b32         %shfl_val, %shfl_src;
+    add.f32         %sum_sq, %sum_sq, %shfl_val;
+    mov.b32         %shfl_src, %sum_sq;
+    shfl.sync.bfly.b32 %shfl_src, %shfl_src, 1, 31, 0xFFFFFFFF;
+    mov.b32         %shfl_val, %shfl_src;
+    add.f32         %sum_sq, %sum_sq, %shfl_val;
+
+    // tid == 0: compute rms_inv = rsqrt(sum_sq / hidden_size + eps)
+    setp.ne.u32     %p0, %tid, 0;
+    @%p0 bra        skip_rms;
+    cvt.rn.f32.u32  %val, %hidden_size;
+    div.rn.f32      %mean_sq, %sum_sq, %val;
+    add.f32         %mean_sq, %mean_sq, %eps;
+    rsqrt.approx.f32 %rms_inv, %mean_sq;
+    // Broadcast rms_inv via shared[32]
+    st.shared.f32   [shared + 128], %rms_inv;  // shared[32]
+skip_rms:
+skip_final_reduce:
+
+    bar.sync        0;
+
+    // All threads load rms_inv
+    ld.shared.f32   %rms_inv, [shared + 128];
+
+    // Phase 3: Apply normalization: y[i] = x[i] * rms_inv * weight[i]
+    mov.u32         %i, %tid;
+norm_loop:
+    setp.ge.u32     %p0, %i, %hidden_size;
+    @%p0 bra        done;
+
+    mul.wide.u32    %addr, %i, 4;
+
+    // Load x[i]
+    {
+        .reg .u64 %tmp;
+        add.u64     %tmp, %in_ptr, %addr;
+        ld.global.f32 %val, [%tmp];
+    }
+
+    // Load weight[i]
+    {
+        .reg .u64 %tmp;
+        add.u64     %tmp, %w_ptr, %addr;
+        ld.global.f32 %wval, [%tmp];
+    }
+
+    // result = x * rms_inv * weight
+    mul.f32         %result, %val, %rms_inv;
+    mul.f32         %result, %result, %wval;
+
+    // Store y[i]
+    {
+        .reg .u64 %tmp;
+        add.u64     %tmp, %out_ptr, %addr;
+        st.global.f32 [%tmp], %result;
+    }
+
+    add.u32         %i, %i, 256;
+    bra             norm_loop;
+
+done:
+    ret;
+}

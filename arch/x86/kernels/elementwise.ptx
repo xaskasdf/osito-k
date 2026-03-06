@@ -1,0 +1,196 @@
+// OsitoK — elementwise PTX kernels
+// Translated from ntransformer/src/cuda/elementwise.cu
+//
+// Multi-block element-wise operations (proper global thread ID).
+//
+// Grid:  (size + 255) / 256
+// Block: 256
+//
+// Compile: ptxas --gpu-name sm_75 -o elementwise.cubin elementwise.ptx
+//
+
+.version 7.5
+.target sm_75
+.address_size 64
+
+// ── vec_add: out[i] = a[i] + b[i] ──
+.entry vec_add(
+    .param .u64 p_out,
+    .param .u64 p_a,
+    .param .u64 p_b,
+    .param .u32 p_size
+) {
+    .reg .u32   %i, %size, %tid, %bid, %bdim;
+    .reg .u64   %out_ptr, %a_ptr, %b_ptr, %addr;
+    .reg .f32   %va, %vb, %vc;
+    .reg .pred  %p0;
+
+    ld.param.u64    %out_ptr, [p_out];
+    ld.param.u64    %a_ptr,   [p_a];
+    ld.param.u64    %b_ptr,   [p_b];
+    ld.param.u32    %size,    [p_size];
+
+    // i = blockIdx.x * blockDim.x + threadIdx.x
+    mov.u32         %tid, %tid.x;
+    mov.u32         %bid, %ctaid.x;
+    mov.u32         %bdim, %ntid.x;
+    mad.lo.u32      %i, %bid, %bdim, %tid;
+
+    setp.ge.u32     %p0, %i, %size;
+    @%p0 bra        done;
+
+    mul.wide.u32    %addr, %i, 4;
+
+    {
+        .reg .u64 %tmp;
+        add.u64     %tmp, %a_ptr, %addr;
+        ld.global.f32 %va, [%tmp];
+        add.u64     %tmp, %b_ptr, %addr;
+        ld.global.f32 %vb, [%tmp];
+    }
+
+    add.f32         %vc, %va, %vb;
+
+    {
+        .reg .u64 %tmp;
+        add.u64     %tmp, %out_ptr, %addr;
+        st.global.f32 [%tmp], %vc;
+    }
+
+done:
+    ret;
+}
+
+// ── vec_mul: out[i] = a[i] * b[i] ──
+.entry vec_mul(
+    .param .u64 p_out,
+    .param .u64 p_a,
+    .param .u64 p_b,
+    .param .u32 p_size
+) {
+    .reg .u32   %i, %size, %tid, %bid, %bdim;
+    .reg .u64   %out_ptr, %a_ptr, %b_ptr, %addr;
+    .reg .f32   %va, %vb, %vc;
+    .reg .pred  %p0;
+
+    ld.param.u64    %out_ptr, [p_out];
+    ld.param.u64    %a_ptr,   [p_a];
+    ld.param.u64    %b_ptr,   [p_b];
+    ld.param.u32    %size,    [p_size];
+
+    mov.u32         %tid, %tid.x;
+    mov.u32         %bid, %ctaid.x;
+    mov.u32         %bdim, %ntid.x;
+    mad.lo.u32      %i, %bid, %bdim, %tid;
+
+    setp.ge.u32     %p0, %i, %size;
+    @%p0 bra        done;
+
+    mul.wide.u32    %addr, %i, 4;
+    {
+        .reg .u64 %tmp;
+        add.u64     %tmp, %a_ptr, %addr;
+        ld.global.f32 %va, [%tmp];
+        add.u64     %tmp, %b_ptr, %addr;
+        ld.global.f32 %vb, [%tmp];
+    }
+    mul.f32         %vc, %va, %vb;
+    {
+        .reg .u64 %tmp;
+        add.u64     %tmp, %out_ptr, %addr;
+        st.global.f32 [%tmp], %vc;
+    }
+done:
+    ret;
+}
+
+// ── silu_mul: out[i] = SiLU(gate[i]) * up[i] ──
+// SiLU(x) = x / (1 + exp(-x)) = x * sigmoid(x)
+.entry silu_mul(
+    .param .u64 p_out,
+    .param .u64 p_gate,
+    .param .u64 p_up,
+    .param .u32 p_size
+) {
+    .reg .u32   %i, %size, %tid, %bid, %bdim;
+    .reg .u64   %out_ptr, %gate_ptr, %up_ptr, %addr;
+    .reg .f32   %g, %u, %neg_g, %exp_neg, %sigmoid, %silu, %result;
+    .reg .pred  %p0;
+
+    ld.param.u64    %out_ptr,  [p_out];
+    ld.param.u64    %gate_ptr, [p_gate];
+    ld.param.u64    %up_ptr,   [p_up];
+    ld.param.u32    %size,     [p_size];
+
+    mov.u32         %tid, %tid.x;
+    mov.u32         %bid, %ctaid.x;
+    mov.u32         %bdim, %ntid.x;
+    mad.lo.u32      %i, %bid, %bdim, %tid;
+
+    setp.ge.u32     %p0, %i, %size;
+    @%p0 bra        done;
+
+    mul.wide.u32    %addr, %i, 4;
+    {
+        .reg .u64 %tmp;
+        add.u64     %tmp, %gate_ptr, %addr;
+        ld.global.f32 %g, [%tmp];
+        add.u64     %tmp, %up_ptr, %addr;
+        ld.global.f32 %u, [%tmp];
+    }
+
+    // SiLU(g) = g / (1 + exp(-g))
+    neg.f32         %neg_g, %g;
+    // exp(-g) via 2^(-g * log2(e))
+    mul.f32         %neg_g, %neg_g, 0f3FB8AA3B;    // log2(e)
+    ex2.approx.f32  %exp_neg, %neg_g;
+    add.f32         %sigmoid, %exp_neg, 0f3F800000; // 1.0 + exp(-g)
+    rcp.approx.f32  %sigmoid, %sigmoid;             // 1 / (1 + exp(-g))
+    mul.f32         %silu, %g, %sigmoid;             // g * sigmoid(g)
+    mul.f32         %result, %silu, %u;              // SiLU(gate) * up
+
+    {
+        .reg .u64 %tmp;
+        add.u64     %tmp, %out_ptr, %addr;
+        st.global.f32 [%tmp], %result;
+    }
+done:
+    ret;
+}
+
+// ── add_inplace: a[i] += b[i] ──
+.entry add_inplace(
+    .param .u64 p_a,
+    .param .u64 p_b,
+    .param .u32 p_size
+) {
+    .reg .u32   %i, %size, %tid, %bid, %bdim;
+    .reg .u64   %a_ptr, %b_ptr, %addr, %addr_a;
+    .reg .f32   %va, %vb;
+    .reg .pred  %p0;
+
+    ld.param.u64    %a_ptr, [p_a];
+    ld.param.u64    %b_ptr, [p_b];
+    ld.param.u32    %size,  [p_size];
+
+    mov.u32         %tid, %tid.x;
+    mov.u32         %bid, %ctaid.x;
+    mov.u32         %bdim, %ntid.x;
+    mad.lo.u32      %i, %bid, %bdim, %tid;
+
+    setp.ge.u32     %p0, %i, %size;
+    @%p0 bra        done;
+
+    mul.wide.u32    %addr, %i, 4;
+    add.u64         %addr_a, %a_ptr, %addr;
+    ld.global.f32   %va, [%addr_a];
+    {
+        .reg .u64 %tmp;
+        add.u64     %tmp, %b_ptr, %addr;
+        ld.global.f32 %vb, [%tmp];
+    }
+    add.f32         %va, %va, %vb;
+    st.global.f32   [%addr_a], %va;
+done:
+    ret;
+}

@@ -1,0 +1,245 @@
+// OsitoK — gemv_q4_0 PTX kernel
+// Translated from ntransformer/src/cuda/gemm.cu gemv_q4_0_kernel
+//
+// Matrix-vector multiply for Q4_0 quantized weights.
+// y[out_features] = W[out_features, in_features/32 blocks] * x[in_features]
+//
+// Layout: 8 warps/block (256 threads). Each warp computes one output row.
+// Input vector x cached in dynamic shared memory (eliminates redundant reads).
+// Q4_0 block: 2-byte FP16 scale + 16 bytes (32 nibbles).
+//
+// Grid:  (out_features + 7) / 8 blocks
+// Block: 32 threads x 8 warps = 256 threads
+// Smem:  in_features * 4 bytes (for x vector)
+//
+// Compile: ptxas --gpu-name sm_75 -o gemv_q4_0.cubin gemv_q4_0.ptx
+//
+
+.version 7.5
+.target sm_75
+.address_size 64
+
+// Q4_0 block layout (18 bytes per block of 32 weights):
+//   offset 0:  uint16_t d    (FP16 scale)
+//   offset 2:  uint8_t qs[16] (32 nibbles: low nibble = weights[0..15], high = weights[16..31])
+
+.entry gemv_q4_0(
+    .param .u64 p_y,            // float* output [out_features]
+    .param .u64 p_W,            // void*  Q4_0 weight data
+    .param .u64 p_x,            // float* input [in_features]
+    .param .u32 p_out_features,
+    .param .u32 p_in_features
+) {
+    // Register declarations
+    .reg .u32   %tid, %warp_id, %flat_id, %nthreads;
+    .reg .u32   %out_features, %in_features, %num_blocks;
+    .reg .u32   %row, %r0, %r1, %r2, %r3;
+    .reg .u64   %y_ptr, %w_ptr, %x_ptr, %addr;
+    .reg .f32   %sum, %d_scale, %block_sum, %val, %xval;
+    .reg .f32   %lo_f, %hi_f;
+    .reg .u32   %byte_val, %lo_int, %hi_int;
+    .reg .s32   %lo_s, %hi_s;
+    .reg .u32   %b, %j, %base, %off;
+    .reg .pred  %p0, %p1, %p2;
+    .reg .f32   %shfl_val;
+    .reg .u32   %mask, %laneMask;
+    .reg .b32   %shfl_src;
+    .reg .f16   %d_f16;
+
+    // Load parameters
+    ld.param.u64    %y_ptr, [p_y];
+    ld.param.u64    %w_ptr, [p_W];
+    ld.param.u64    %x_ptr, [p_x];
+    ld.param.u32    %out_features, [p_out_features];
+    ld.param.u32    %in_features, [p_in_features];
+
+    // Thread indexing: tid = threadIdx.x, warp_id = threadIdx.y
+    mov.u32         %tid, %tid.x;
+    mov.u32         %warp_id, %tid.y;
+
+    // flat_id = warp_id * 32 + tid
+    mad.lo.u32      %flat_id, %warp_id, 32, %tid;
+
+    // nthreads = blockDim.y * 32 (= 256)
+    mov.u32         %nthreads, 256;
+
+    // ── Phase 1: Cooperatively load x into shared memory ──
+    // extern __shared__ float sx[];
+    .shared .align 4 .b8 smem[];
+
+    // for (i = flat_id; i < in_features; i += nthreads)
+    mov.u32         %r0, %flat_id;
+load_x_loop:
+    setp.ge.u32     %p0, %r0, %in_features;
+    @%p0 bra        load_x_done;
+
+    // sx[i] = x[i]
+    mul.wide.u32    %addr, %r0, 4;
+    add.u64         %addr, %x_ptr, %addr;
+    ld.global.f32   %val, [%addr];
+
+    // Store to shared memory
+    mul.lo.u32      %r1, %r0, 4;
+    // Use generic address space for shared memory store
+    {
+        .reg .u64 %smem_addr;
+        cvta.to.shared.u64 %smem_addr, smem;
+        add.u64     %smem_addr, %smem_addr, %r1;
+        st.shared.f32 [%smem_addr], %val;
+    }
+
+    add.u32         %r0, %r0, %nthreads;
+    bra             load_x_loop;
+load_x_done:
+
+    // __syncthreads()
+    bar.sync        0;
+
+    // ── Phase 2: Compute GEMV for this warp's row ──
+
+    // row = blockIdx.x * blockDim.y + warp_id
+    mov.u32         %r0, %ctaid.x;
+    mov.u32         %r1, %ntid.y;
+    mad.lo.u32      %row, %r0, %r1, %warp_id;
+
+    // if (row >= out_features) return
+    setp.ge.u32     %p0, %row, %out_features;
+    @%p0 bra        done;
+
+    // num_blocks = in_features / 32
+    shr.u32         %num_blocks, %in_features, 5;
+
+    // row_blocks = W + row * num_blocks * 18
+    mul.lo.u32      %r0, %row, %num_blocks;
+    mul.wide.u32    %addr, %r0, 18;
+    add.u64         %w_ptr, %w_ptr, %addr;
+
+    // sum = 0.0f
+    mov.f32         %sum, 0f00000000;
+
+    // for (b = tid; b < num_blocks; b += 32)
+    mov.u32         %b, %tid;
+block_loop:
+    setp.ge.u32     %p0, %b, %num_blocks;
+    @%p0 bra        block_loop_done;
+
+    // Load scale: d = f16_to_f32(block.d)
+    // block address = w_ptr + b * 18
+    mul.wide.u32    %addr, %b, 18;
+    add.u64         %addr, %w_ptr, %addr;
+    ld.global.u16   %r0, [%addr];
+    // Convert FP16 to FP32
+    {
+        .reg .b16 %h;
+        mov.b16     %h, %r0;
+        cvt.f32.f16 %d_scale, %h;
+    }
+
+    // base = b * 32
+    shl.b32         %base, %b, 5;
+
+    // block_sum = 0.0f
+    mov.f32         %block_sum, 0f00000000;
+
+    // Inner loop: for (j = 0; j < 16; j++)
+    mov.u32         %j, 0;
+nibble_loop:
+    setp.ge.u32     %p1, %j, 16;
+    @%p1 bra        nibble_loop_done;
+
+    // byte = block.qs[j] (at offset +2 from block start)
+    {
+        .reg .u64 %qs_addr;
+        .reg .u32 %qs_off;
+        add.u32     %qs_off, %j, 2;     // qs starts at offset 2
+        mul.wide.u32 %qs_addr, %b, 18;
+        add.u64     %qs_addr, %w_ptr, %qs_addr;
+        add.u64     %qs_addr, %qs_addr, %qs_off;
+        ld.global.u8 %byte_val, [%qs_addr];
+    }
+
+    // lo = (byte & 0x0F) - 8
+    and.b32         %lo_int, %byte_val, 0x0F;
+    sub.s32         %lo_s, %lo_int, 8;
+    cvt.rn.f32.s32  %lo_f, %lo_s;
+
+    // hi = (byte >> 4) - 8
+    shr.u32         %hi_int, %byte_val, 4;
+    sub.s32         %hi_s, %hi_int, 8;
+    cvt.rn.f32.s32  %hi_f, %hi_s;
+
+    // Load sx[base + j] and sx[base + j + 16] from shared memory
+    {
+        .reg .u32 %idx_lo, %idx_hi;
+        .reg .u64 %smem_base;
+        .reg .f32 %sx_lo, %sx_hi;
+
+        cvta.to.shared.u64 %smem_base, smem;
+
+        add.u32     %idx_lo, %base, %j;
+        mul.lo.u32  %idx_lo, %idx_lo, 4;
+        add.u64     %addr, %smem_base, %idx_lo;
+        ld.shared.f32 %sx_lo, [%addr];
+
+        add.u32     %idx_hi, %base, %j;
+        add.u32     %idx_hi, %idx_hi, 16;
+        mul.lo.u32  %idx_hi, %idx_hi, 4;
+        add.u64     %addr, %smem_base, %idx_hi;
+        ld.shared.f32 %sx_hi, [%addr];
+
+        // block_sum += lo * sx[base+j] + hi * sx[base+j+16]
+        fma.rn.f32  %block_sum, %lo_f, %sx_lo, %block_sum;
+        fma.rn.f32  %block_sum, %hi_f, %sx_hi, %block_sum;
+    }
+
+    add.u32         %j, %j, 1;
+    bra             nibble_loop;
+nibble_loop_done:
+
+    // sum += d * block_sum
+    fma.rn.f32      %sum, %d_scale, %block_sum, %sum;
+
+    add.u32         %b, %b, 32;
+    bra             block_loop;
+block_loop_done:
+
+    // ── Phase 3: Warp reduction ──
+    // for (offset = 16; offset > 0; offset >>= 1)
+    //   sum += __shfl_xor_sync(0xFFFFFFFF, sum, offset)
+
+    mov.b32         %shfl_src, %sum;
+    shfl.sync.bfly.b32 %shfl_src, %shfl_src, 16, 31, 0xFFFFFFFF;
+    mov.b32         %shfl_val, %shfl_src;
+    add.f32         %sum, %sum, %shfl_val;
+
+    mov.b32         %shfl_src, %sum;
+    shfl.sync.bfly.b32 %shfl_src, %shfl_src, 8, 31, 0xFFFFFFFF;
+    mov.b32         %shfl_val, %shfl_src;
+    add.f32         %sum, %sum, %shfl_val;
+
+    mov.b32         %shfl_src, %sum;
+    shfl.sync.bfly.b32 %shfl_src, %shfl_src, 4, 31, 0xFFFFFFFF;
+    mov.b32         %shfl_val, %shfl_src;
+    add.f32         %sum, %sum, %shfl_val;
+
+    mov.b32         %shfl_src, %sum;
+    shfl.sync.bfly.b32 %shfl_src, %shfl_src, 2, 31, 0xFFFFFFFF;
+    mov.b32         %shfl_val, %shfl_src;
+    add.f32         %sum, %sum, %shfl_val;
+
+    mov.b32         %shfl_src, %sum;
+    shfl.sync.bfly.b32 %shfl_src, %shfl_src, 1, 31, 0xFFFFFFFF;
+    mov.b32         %shfl_val, %shfl_src;
+    add.f32         %sum, %sum, %shfl_val;
+
+    // if (tid == 0) y[row] = sum
+    setp.ne.u32     %p0, %tid, 0;
+    @%p0 bra        done;
+
+    mul.wide.u32    %addr, %row, 4;
+    add.u64         %addr, %y_ptr, %addr;
+    st.global.f32   [%addr], %sum;
+
+done:
+    ret;
+}

@@ -128,6 +128,9 @@ arch/x86/drivers/gpu_tensor.h        GPU tensor ops API (VRAM alloc, upload/down
 arch/x86/drivers/gpu_tensor.c        GPU tensor dispatch layer, PRAMIN data transfer, self-test, PTX docs
 arch/x86/drivers/gpu_inference.h     GPU inference orchestration API (hybrid GPU/CPU forward pass)
 arch/x86/drivers/gpu_inference.c     GPU-accelerated Llama forward pass, kernel dispatch table, benchmark
+arch/x86/kernels/*.ptx               PTX kernels translated from ntransformer CUDA (gemv_q4_0, rmsnorm, softmax, elementwise, rope)
+arch/x86/scripts/compile_kernels.sh  PTX→cubin→C array build pipeline (requires CUDA toolkit)
+arch/x86/scripts/cubin2array.py      ELF parser: extracts SASS .text from cubin, generates C byte array header
 arch/x86/fs/ositofs2.c              OsitoFS v2 bare-metal driver (mount, list, read)
 arch/x86/fs/gpt.h                   GPT structs (UEFI spec) + API
 arch/x86/fs/gpt.c                   GPT parser (name match + superblock magic probe)
@@ -289,6 +292,7 @@ Tasks:   idle, input, shell (3 of 8 slots used)
 | **X38** | **GMMU page tables** (GP100+ MMU v2, 5-level identity map, constant buffer QMD, memory windows) | Done |
 | **X39** | **GPU tensor ops** (store_pattern STG test, vec_add_f32 kernel, VRAM buffer mgmt, dispatch layer, PTX docs) | Done |
 | **X40** | **GPU-accelerated inference** (hybrid GPU/CPU forward pass, kernel dispatch table, VRAM scratch, benchmark) | Done |
+| **X41** | **PTX kernel compilation pipeline** (ntransformer CUDA→PTX translation, ptxas build, cubin ELF extract, C array embed) | Done |
 
 > Full GPU roadmap (X27-X40 + contingency): see [docs/x86-gpu-roadmap.md](docs/x86-gpu-roadmap.md)
 
@@ -594,6 +598,16 @@ Hybrid GPU/CPU forward pass orchestration. Mirrors `llama_forward()` from `infer
 - **Bottleneck analysis**: matvec_q4_0 = ~90% of compute. Current GPU vec_add saves ~1%. Real speedup comes when matvec_q4_0 SASS kernel is compiled.
 - **Files**: `arch/x86/drivers/gpu_inference.h`, `arch/x86/drivers/gpu_inference.c`.
 - **Integration**: `gpu_llama_init()` + `gpu_llama_generate()` called from `kernel/main.c` after GPU boot. CPU inference runs first as baseline, then GPU inference for comparison.
+
+### X41: PTX Kernel Compilation Pipeline
+Complete PTX translations of ntransformer's critical CUDA kernels + build tooling.
+- **Kernels translated**: `gemv_q4_0.ptx` (Q4_0 GEMV — 90% of inference compute, shared memory tiling, warp reduction via `shfl.sync.bfly`), `rmsnorm.ptx` (warp + cross-warp reduction, `rsqrt.approx`), `softmax.ptx` (3-phase: max → exp → normalize, `ex2.approx`), `elementwise.ptx` (vec_add, vec_mul, silu_mul, add_inplace), `rope.ptx` (Llama-style RoPE, `cos/sin.approx`, `lg2/ex2` for pow).
+- **Build pipeline**: `compile_kernels.sh` runs `ptxas --gpu-name sm_75` → cubin ELF → `cubin2array.py` extracts .text section → C byte array header. Optional `nvdisasm` for SASS listing.
+- **cubin2array.py**: Pure Python ELF64 parser — reads section headers, finds `.text.<kernel>` executable section, generates `static const uint8_t sass_code_<name>[]` with per-instruction hex + opcode comments.
+- **Target**: SM75 (Turing RTX 2070/2080). Configurable via `GPU_ARCH` env var.
+- **Output**: `arch/x86/kernels/generated/*.h` — checked into git so bare-metal build doesn't need CUDA tools.
+- **Integration path**: Generated headers included in `sass.c`, registered in `sass_init()`, uploaded to VRAM via existing PRAMIN infrastructure.
+- **Purpose**: Eliminates hand-encoding SASS. ntransformer CUDA kernels are the reference — these PTX translations preserve the exact algorithms (warp reductions, shared memory tiling, Q4_0 dequant) that deliver 48.9 tok/s on 8B models.
 
 ### AArch64/SM8350 Port (arch/arm/)
 Reference bare-metal code for ASUS ROG Phone 5 (Snapdragon 888).

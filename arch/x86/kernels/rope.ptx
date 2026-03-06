@@ -1,0 +1,162 @@
+// OsitoK — RoPE (Rotary Position Embedding) PTX kernel
+// Translated from ntransformer/src/cuda/rotary.cu rope_kernel
+//
+// Llama-style RoPE: pairs are (i, i + head_dim/2)
+// Each thread handles one pair of elements across Q and K.
+//
+// Parameters passed via constant buffer (not kernel params, too many):
+//   CB0[0]: q_ptr (u64)
+//   CB0[8]: k_ptr (u64)
+//   CB0[16]: pos (u32)
+//   CB0[20]: n_heads (u32)
+//   CB0[24]: n_kv_heads (u32)
+//   CB0[28]: head_dim (u32)
+//   CB0[32]: theta_base (f32)
+//
+// For single-token decode: applies RoPE to q[n_heads * head_dim] and k[n_kv_heads * head_dim].
+// Grid:  ((n_heads + n_kv_heads) * half_dim + 255) / 256
+// Block: 256
+//
+// Compile: ptxas --gpu-name sm_75 -o rope.cubin rope.ptx
+//
+
+.version 7.5
+.target sm_75
+.address_size 64
+
+.entry rope(
+    .param .u64 p_q,           // float* q [n_heads * head_dim]
+    .param .u64 p_k,           // float* k [n_kv_heads * head_dim]
+    .param .u32 p_pos,
+    .param .u32 p_n_heads,
+    .param .u32 p_n_kv_heads,
+    .param .u32 p_head_dim,
+    .param .f32 p_theta_base
+) {
+    .reg .u32   %idx, %tid, %bid, %bdim;
+    .reg .u32   %pos, %n_heads, %n_kv_heads, %head_dim, %half_dim;
+    .reg .u32   %total_q, %total_k, %total;
+    .reg .u32   %local_idx, %pair_idx, %head, %n_h;
+    .reg .u32   %base, %off0, %off1;
+    .reg .u64   %q_ptr, %k_ptr, %data_ptr, %addr;
+    .reg .f32   %theta, %freq, %angle, %cos_val, %sin_val;
+    .reg .f32   %x0, %x1, %y0, %y1, %pos_f, %pair_f, %hd_f;
+    .reg .f32   %two, %neg_one;
+    .reg .pred  %p0, %p1, %is_key;
+
+    // Load params
+    ld.param.u64    %q_ptr, [p_q];
+    ld.param.u64    %k_ptr, [p_k];
+    ld.param.u32    %pos, [p_pos];
+    ld.param.u32    %n_heads, [p_n_heads];
+    ld.param.u32    %n_kv_heads, [p_n_kv_heads];
+    ld.param.u32    %head_dim, [p_head_dim];
+    ld.param.f32    %theta, [p_theta_base];
+
+    // Global thread index
+    mov.u32         %tid, %tid.x;
+    mov.u32         %bid, %ctaid.x;
+    mov.u32         %bdim, %ntid.x;
+    mad.lo.u32      %idx, %bid, %bdim, %tid;
+
+    // half_dim = head_dim / 2
+    shr.u32         %half_dim, %head_dim, 1;
+
+    // total_q = n_heads * half_dim
+    mul.lo.u32      %total_q, %n_heads, %half_dim;
+    // total_k = n_kv_heads * half_dim
+    mul.lo.u32      %total_k, %n_kv_heads, %half_dim;
+    // total = total_q + total_k
+    add.u32         %total, %total_q, %total_k;
+
+    // Bounds check
+    setp.ge.u32     %p0, %idx, %total;
+    @%p0 bra        done;
+
+    // Determine if this thread works on Q or K
+    setp.ge.u32     %is_key, %idx, %total_q;
+
+    // local_idx, n_h, data_ptr
+    @%is_key bra    setup_key;
+    // Q path
+    mov.u32         %local_idx, %idx;
+    mov.u32         %n_h, %n_heads;
+    mov.u64         %data_ptr, %q_ptr;
+    bra             compute;
+setup_key:
+    sub.u32         %local_idx, %idx, %total_q;
+    mov.u32         %n_h, %n_kv_heads;
+    mov.u64         %data_ptr, %k_ptr;
+
+compute:
+    // pair_idx = local_idx % half_dim
+    rem.u32         %pair_idx, %local_idx, %half_dim;
+    // head = (local_idx / half_dim) % n_h
+    div.u32         %head, %local_idx, %half_dim;
+    rem.u32         %head, %head, %n_h;
+
+    // freq = 1.0 / pow(theta, 2*pair_idx / head_dim)
+    cvt.rn.f32.u32  %pair_f, %pair_idx;
+    cvt.rn.f32.u32  %hd_f, %head_dim;
+    mov.f32         %two, 0f40000000;       // 2.0
+    mul.f32         %pair_f, %pair_f, %two;
+    div.rn.f32      %pair_f, %pair_f, %hd_f; // 2*pair_idx / head_dim
+
+    // pow(theta, exponent) = exp(exponent * ln(theta))
+    // freq = 1/pow = exp(-exponent * ln(theta))
+    {
+        .reg .f32 %ln_theta, %neg_exp;
+        // ln(theta) = log2(theta) / log2(e) = log2(theta) * ln(2)
+        // But simpler: use lg2 + multiply
+        lg2.approx.f32 %ln_theta, %theta;    // log2(theta)
+        mul.f32     %neg_exp, %pair_f, %ln_theta;  // exponent * log2(theta)
+        neg.f32     %neg_exp, %neg_exp;             // -exponent * log2(theta)
+        ex2.approx.f32 %freq, %neg_exp;             // 2^(-exp*log2(theta)) = 1/theta^exp
+    }
+
+    // angle = pos * freq
+    cvt.rn.f32.u32  %pos_f, %pos;
+    mul.f32         %angle, %pos_f, %freq;
+
+    // cos_val, sin_val
+    cos.approx.f32  %cos_val, %angle;
+    sin.approx.f32  %sin_val, %angle;
+
+    // base = head * head_dim (flat offset into q/k)
+    mul.lo.u32      %base, %head, %head_dim;
+
+    // Load x0 = data[base + pair_idx], x1 = data[base + pair_idx + half_dim]
+    add.u32         %off0, %base, %pair_idx;
+    mul.wide.u32    %addr, %off0, 4;
+    add.u64         %addr, %data_ptr, %addr;
+    ld.global.f32   %x0, [%addr];
+
+    add.u32         %off1, %off0, %half_dim;
+    mul.wide.u32    %addr, %off1, 4;
+    add.u64         %addr, %data_ptr, %addr;
+    ld.global.f32   %x1, [%addr];
+
+    // y0 = x0 * cos - x1 * sin
+    mul.f32         %y0, %x0, %cos_val;
+    {
+        .reg .f32 %tmp;
+        mul.f32     %tmp, %x1, %sin_val;
+        sub.f32     %y0, %y0, %tmp;
+    }
+
+    // y1 = x1 * cos + x0 * sin
+    mul.f32         %y1, %x1, %cos_val;
+    fma.rn.f32      %y1, %x0, %sin_val, %y1;
+
+    // Store results
+    mul.wide.u32    %addr, %off0, 4;
+    add.u64         %addr, %data_ptr, %addr;
+    st.global.f32   [%addr], %y0;
+
+    mul.wide.u32    %addr, %off1, 4;
+    add.u64         %addr, %data_ptr, %addr;
+    st.global.f32   [%addr], %y1;
+
+done:
+    ret;
+}

@@ -1,6 +1,6 @@
 # OsitoK x86-64 — GPU Compute Roadmap
 
-> Status: X1–X40 + X-CPU1 done. Phase A + B + C complete.
+> Status: X1–X41 + X-CPU1 done. Phase A + B + C + D (partial) complete.
 > Last updated: 2026-03-06
 
 ## Current State
@@ -22,7 +22,7 @@ X34 binds compute class to channel, activates via CTRL_BIND+SCHEDULE,
 pushes SET_OBJECT + cache invalidate + semaphore fence through GPFIFO.
 X35 implements CE DMA with physical addressing (sysmem↔VRAM), semaphore fencing.
 X36 adds QMD construction (QMDV02_03), SEND_PCAS dispatch, kernel wait, result readback.
-**Phase B complete.** Phase C (NTransformer port to GPU) also complete: X37-X40.
+**Phase B complete.** Phase C (NTransformer port to GPU) also complete: X37-X41.
 
 ---
 
@@ -124,19 +124,20 @@ Port inference pipeline to GPU compute. Requires Phase B.
 | **X38** | **GMMU page tables + kernel loader** — GP100+ MMU v2 identity map, constant buffer QMD, memory windows, instance block PDB | ~400 | Done |
 | **X39** | **GPU tensor ops** — store_pattern + vec_add_f32 SASS kernels, VRAM buffer mgmt, dispatch layer, PTX docs | ~600 | Done |
 | **X40** | **GPU-accelerated Llama inference** — hybrid GPU/CPU forward pass, kernel dispatch table, VRAM scratch, benchmark | ~450 | Done |
+| **X41** | **PTX kernel compilation pipeline** — ntransformer CUDA→PTX translation, ptxas build, cubin ELF→C array | ~800 | Done |
 
 ### SASS Kernel Strategy
 
-NVIDIA GPUs execute SASS (Shader ASSembly) natively. Without CUDA/PTX toolchain,
-we compile SASS offline using `nvdisasm`/`cuobjdump` reverse-engineered formats
-or use a minimal SASS assembler.
+Two-stage approach:
+1. **Hand-encoded SASS** (X37-X39): Simple kernels (NOP, S2R, store_pattern, vec_add_f32) for infrastructure validation
+2. **PTX compilation** (X41): Complex kernels translated from ntransformer CUDA → PTX → ptxas → cubin → C array
 
-Key kernels needed:
-- `matvec_q4_0_kernel` — Q4_0 dequant + dot product (shared memory tiling)
-- `rmsnorm_kernel` — parallel reduction
-- `softmax_kernel` — parallel max + exp + sum + normalize
-- `rope_kernel` — element-wise sin/cos rotation
-- `silu_kernel` — element-wise activation
+PTX kernels translated from ntransformer (all 5 critical inference kernels):
+- `gemv_q4_0.ptx` — Q4_0 dequant + dot product (shared memory tiling, warp reduction) — 90% of compute
+- `rmsnorm.ptx` — parallel sum-of-squares reduction + rsqrt normalize
+- `softmax.ptx` — 3-phase numerically stable (max → exp → normalize)
+- `elementwise.ptx` — vec_add, vec_mul, silu_mul, add_inplace
+- `rope.ptx` — Llama-style rotary position embedding (cos/sin via MUFU)
 
 ---
 
@@ -229,7 +230,7 @@ Priority  Feature    Rationale
 3rd       X28        GBL + FWSEC-FRTS — DONE (needs hardware validation)
 4th       X29        WPR2 metadata + Radix3 page tables — DONE
           X37        SASS compile — can parallelize
-5th       X30 → X31 → X32 (all DONE) → X33 → X36 → X38 → X40
+5th       X30 → X31 → X32 (all DONE) → X33 → X36 → X38 → X40 → X41
 ```
 
 ## Dependencies
@@ -242,7 +243,7 @@ X-CPU3 ────────────────────────�
 X27 → X28 → X29 → X30 → X31 ──┐
                                 ├── X32 → X33 → X34 → X35 → X36
 X37 ───────────────────────────┘         ↓
-                                    X38 → X39 → X40
+                                    X38 → X39 → X40 → X41
 ```
 
 ## Files
@@ -264,3 +265,10 @@ X37 ─────────────────────────�
 | `arch/x86/drivers/gpu_inference.h` | X40 | GPU inference orchestration API (hybrid GPU/CPU forward pass) |
 | `arch/x86/drivers/gpu_inference.c` | X40 | GPU-accelerated forward pass, dispatch table, benchmark |
 | `arch/x86/kernel/main.c` | X40 | Integration: GPU inference run after GPU boot |
+| `arch/x86/kernels/gemv_q4_0.ptx` | X41 | Q4_0 GEMV kernel (shared mem tiling, warp reduction) |
+| `arch/x86/kernels/rmsnorm.ptx` | X41 | RMSNorm kernel (cross-warp reduction, rsqrt) |
+| `arch/x86/kernels/softmax.ptx` | X41 | Softmax kernel (3-phase: max, exp, normalize) |
+| `arch/x86/kernels/elementwise.ptx` | X41 | vec_add, vec_mul, silu_mul, add_inplace |
+| `arch/x86/kernels/rope.ptx` | X41 | Llama-style RoPE (cos/sin, frequency computation) |
+| `arch/x86/scripts/compile_kernels.sh` | X41 | PTX→cubin→C array build pipeline |
+| `arch/x86/scripts/cubin2array.py` | X41 | Cubin ELF .text extractor + C byte array generator |
