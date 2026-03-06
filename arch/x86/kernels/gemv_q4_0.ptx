@@ -31,7 +31,7 @@
     .param .u32 p_in_features
 ) {
     // Register declarations
-    .reg .u32   %tid, %warp_id, %flat_id, %nthreads;
+    .reg .u32   %tx, %warp_id, %flat_id, %nthreads;
     .reg .u32   %out_features, %in_features, %num_blocks;
     .reg .u32   %row, %r0, %r1, %r2, %r3;
     .reg .u64   %y_ptr, %w_ptr, %x_ptr, %addr;
@@ -54,18 +54,18 @@
     ld.param.u32    %in_features, [p_in_features];
 
     // Thread indexing: tid = threadIdx.x, warp_id = threadIdx.y
-    mov.u32         %tid, %tid.x;
+    mov.u32         %tx, %tid.x;
     mov.u32         %warp_id, %tid.y;
 
-    // flat_id = warp_id * 32 + tid
-    mad.lo.u32      %flat_id, %warp_id, 32, %tid;
+    // flat_id = warp_id * 32 + tx
+    mad.lo.u32      %flat_id, %warp_id, 32, %tx;
 
     // nthreads = blockDim.y * 32 (= 256)
     mov.u32         %nthreads, 256;
 
     // ── Phase 1: Cooperatively load x into shared memory ──
-    // extern __shared__ float sx[];
-    .shared .align 4 .b8 smem[];
+    // Shared memory: max 8192 floats = 32KB (fits SM75 48KB limit)
+    .shared .align 4 .f32 sx[8192];
 
     // for (i = flat_id; i < in_features; i += nthreads)
     mov.u32         %r0, %flat_id;
@@ -78,15 +78,11 @@ load_x_loop:
     add.u64         %addr, %x_ptr, %addr;
     ld.global.f32   %val, [%addr];
 
-    // Store to shared memory
-    mul.lo.u32      %r1, %r0, 4;
-    // Use generic address space for shared memory store
-    {
-        .reg .u64 %smem_addr;
-        cvta.to.shared.u64 %smem_addr, smem;
-        add.u64     %smem_addr, %smem_addr, %r1;
-        st.shared.f32 [%smem_addr], %val;
-    }
+    // Store to shared memory: sx[r0]
+    mul.lo.u32      %r1, %r0, 4;      // byte offset
+    mov.u32         %r2, sx;           // shared base address
+    add.u32         %r2, %r2, %r1;
+    st.shared.f32   [%r2], %val;
 
     add.u32         %r0, %r0, %nthreads;
     bra             load_x_loop;
@@ -117,8 +113,8 @@ load_x_done:
     // sum = 0.0f
     mov.f32         %sum, 0f00000000;
 
-    // for (b = tid; b < num_blocks; b += 32)
-    mov.u32         %b, %tid;
+    // for (b = tx; b < num_blocks; b += 32)
+    mov.u32         %b, %tx;
 block_loop:
     setp.ge.u32     %p0, %b, %num_blocks;
     @%p0 bra        block_loop_done;
@@ -127,11 +123,10 @@ block_loop:
     // block address = w_ptr + b * 18
     mul.wide.u32    %addr, %b, 18;
     add.u64         %addr, %w_ptr, %addr;
-    ld.global.u16   %r0, [%addr];
-    // Convert FP16 to FP32
+    // Load FP16 scale and convert to FP32
     {
         .reg .b16 %h;
-        mov.b16     %h, %r0;
+        ld.global.b16   %h, [%addr];
         cvt.f32.f16 %d_scale, %h;
     }
 
@@ -154,7 +149,9 @@ nibble_loop:
         add.u32     %qs_off, %j, 2;     // qs starts at offset 2
         mul.wide.u32 %qs_addr, %b, 18;
         add.u64     %qs_addr, %w_ptr, %qs_addr;
-        add.u64     %qs_addr, %qs_addr, %qs_off;
+        // Add u32 offset via wide conversion
+        cvt.u64.u32 %addr, %qs_off;
+        add.u64     %qs_addr, %qs_addr, %addr;
         ld.global.u8 %byte_val, [%qs_addr];
     }
 
@@ -170,22 +167,21 @@ nibble_loop:
 
     // Load sx[base + j] and sx[base + j + 16] from shared memory
     {
-        .reg .u32 %idx_lo, %idx_hi;
-        .reg .u64 %smem_base;
+        .reg .u32 %idx_lo, %idx_hi, %saddr;
         .reg .f32 %sx_lo, %sx_hi;
 
-        cvta.to.shared.u64 %smem_base, smem;
+        mov.u32     %saddr, sx;        // shared base address
 
         add.u32     %idx_lo, %base, %j;
         mul.lo.u32  %idx_lo, %idx_lo, 4;
-        add.u64     %addr, %smem_base, %idx_lo;
-        ld.shared.f32 %sx_lo, [%addr];
+        add.u32     %idx_lo, %saddr, %idx_lo;
+        ld.shared.f32 %sx_lo, [%idx_lo];
 
         add.u32     %idx_hi, %base, %j;
         add.u32     %idx_hi, %idx_hi, 16;
         mul.lo.u32  %idx_hi, %idx_hi, 4;
-        add.u64     %addr, %smem_base, %idx_hi;
-        ld.shared.f32 %sx_hi, [%addr];
+        add.u32     %idx_hi, %saddr, %idx_hi;
+        ld.shared.f32 %sx_hi, [%idx_hi];
 
         // block_sum += lo * sx[base+j] + hi * sx[base+j+16]
         fma.rn.f32  %block_sum, %lo_f, %sx_lo, %block_sum;
@@ -232,8 +228,8 @@ block_loop_done:
     mov.b32         %shfl_val, %shfl_src;
     add.f32         %sum, %sum, %shfl_val;
 
-    // if (tid == 0) y[row] = sum
-    setp.ne.u32     %p0, %tid, 0;
+    // if (tx == 0) y[row] = sum
+    setp.ne.u32     %p0, %tx, 0;
     @%p0 bra        done;
 
     mul.wide.u32    %addr, %row, 4;

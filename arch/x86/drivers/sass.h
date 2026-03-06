@@ -88,7 +88,7 @@ typedef struct {
 
 /* ── Kernel Catalog ───────────────────────────────────── */
 
-#define SASS_MAX_KERNELS  16
+#define SASS_MAX_KERNELS  24
 
 typedef struct {
     sass_kernel_t  kernels[SASS_MAX_KERNELS];

@@ -65,12 +65,17 @@ compile_kernel() {
     local cubin_size=$(stat -c%s "$cubin")
     echo "  cubin: $cubin_size bytes"
 
-    # Step 2: Extract .text section (SASS code) from ELF cubin
-    # cubin is an ELF file — the .text section contains the SASS binary
-    python3 "$SCRIPT_DIR/cubin2array.py" "$cubin" "$name" > "$header"
+    # Step 2: Extract .text sections from ELF cubin
+    # Detect entry points: multi-kernel PTX files have multiple .entry directives
+    local entries
+    entries=$(grep -oP '(?<=\.entry )\w+' "$ptx" 2>/dev/null || echo "$name")
 
-    local header_size=$(stat -c%s "$header")
-    echo "  header: $header ($header_size bytes)"
+    for entry in $entries; do
+        local entry_header="$GEN_DIR/${entry}_code.h"
+        python3 "$SCRIPT_DIR/cubin2array.py" "$cubin" "$entry" > "$entry_header"
+        local entry_size=$(stat -c%s "$entry_header")
+        echo "  header: $entry_header ($entry_size bytes)"
+    done
 
     # Step 3: Optional disassembly
     if [ -n "$NVDISASM" ]; then

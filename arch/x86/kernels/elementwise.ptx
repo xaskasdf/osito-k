@@ -20,7 +20,7 @@
     .param .u64 p_b,
     .param .u32 p_size
 ) {
-    .reg .u32   %i, %size, %tid, %bid, %bdim;
+    .reg .u32   %i, %size, %tx, %bid, %bdim;
     .reg .u64   %out_ptr, %a_ptr, %b_ptr, %addr;
     .reg .f32   %va, %vb, %vc;
     .reg .pred  %p0;
@@ -31,10 +31,10 @@
     ld.param.u32    %size,    [p_size];
 
     // i = blockIdx.x * blockDim.x + threadIdx.x
-    mov.u32         %tid, %tid.x;
+    mov.u32         %tx, %tid.x;
     mov.u32         %bid, %ctaid.x;
     mov.u32         %bdim, %ntid.x;
-    mad.lo.u32      %i, %bid, %bdim, %tid;
+    mad.lo.u32      %i, %bid, %bdim, %tx;
 
     setp.ge.u32     %p0, %i, %size;
     @%p0 bra        done;
@@ -68,7 +68,7 @@ done:
     .param .u64 p_b,
     .param .u32 p_size
 ) {
-    .reg .u32   %i, %size, %tid, %bid, %bdim;
+    .reg .u32   %i, %size, %tx, %bid, %bdim;
     .reg .u64   %out_ptr, %a_ptr, %b_ptr, %addr;
     .reg .f32   %va, %vb, %vc;
     .reg .pred  %p0;
@@ -78,10 +78,10 @@ done:
     ld.param.u64    %b_ptr,   [p_b];
     ld.param.u32    %size,    [p_size];
 
-    mov.u32         %tid, %tid.x;
+    mov.u32         %tx, %tid.x;
     mov.u32         %bid, %ctaid.x;
     mov.u32         %bdim, %ntid.x;
-    mad.lo.u32      %i, %bid, %bdim, %tid;
+    mad.lo.u32      %i, %bid, %bdim, %tx;
 
     setp.ge.u32     %p0, %i, %size;
     @%p0 bra        done;
@@ -112,7 +112,7 @@ done:
     .param .u64 p_up,
     .param .u32 p_size
 ) {
-    .reg .u32   %i, %size, %tid, %bid, %bdim;
+    .reg .u32   %i, %size, %tx, %bid, %bdim;
     .reg .u64   %out_ptr, %gate_ptr, %up_ptr, %addr;
     .reg .f32   %g, %u, %neg_g, %exp_neg, %sigmoid, %silu, %result;
     .reg .pred  %p0;
@@ -122,10 +122,10 @@ done:
     ld.param.u64    %up_ptr,   [p_up];
     ld.param.u32    %size,     [p_size];
 
-    mov.u32         %tid, %tid.x;
+    mov.u32         %tx, %tid.x;
     mov.u32         %bid, %ctaid.x;
     mov.u32         %bdim, %ntid.x;
-    mad.lo.u32      %i, %bid, %bdim, %tid;
+    mad.lo.u32      %i, %bid, %bdim, %tx;
 
     setp.ge.u32     %p0, %i, %size;
     @%p0 bra        done;
@@ -164,7 +164,7 @@ done:
     .param .u64 p_b,
     .param .u32 p_size
 ) {
-    .reg .u32   %i, %size, %tid, %bid, %bdim;
+    .reg .u32   %i, %size, %tx, %bid, %bdim;
     .reg .u64   %a_ptr, %b_ptr, %addr, %addr_a;
     .reg .f32   %va, %vb;
     .reg .pred  %p0;
@@ -173,10 +173,10 @@ done:
     ld.param.u64    %b_ptr, [p_b];
     ld.param.u32    %size,  [p_size];
 
-    mov.u32         %tid, %tid.x;
+    mov.u32         %tx, %tid.x;
     mov.u32         %bid, %ctaid.x;
     mov.u32         %bdim, %ntid.x;
-    mad.lo.u32      %i, %bid, %bdim, %tid;
+    mad.lo.u32      %i, %bid, %bdim, %tx;
 
     setp.ge.u32     %p0, %i, %size;
     @%p0 bra        done;

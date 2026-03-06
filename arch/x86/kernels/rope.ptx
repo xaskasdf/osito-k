@@ -33,7 +33,7 @@
     .param .u32 p_head_dim,
     .param .f32 p_theta_base
 ) {
-    .reg .u32   %idx, %tid, %bid, %bdim;
+    .reg .u32   %idx, %tx, %bid, %bdim;
     .reg .u32   %pos, %n_heads, %n_kv_heads, %head_dim, %half_dim;
     .reg .u32   %total_q, %total_k, %total;
     .reg .u32   %local_idx, %pair_idx, %head, %n_h;
@@ -54,10 +54,10 @@
     ld.param.f32    %theta, [p_theta_base];
 
     // Global thread index
-    mov.u32         %tid, %tid.x;
+    mov.u32         %tx, %tid.x;
     mov.u32         %bid, %ctaid.x;
     mov.u32         %bdim, %ntid.x;
-    mad.lo.u32      %idx, %bid, %bdim, %tid;
+    mad.lo.u32      %idx, %bid, %bdim, %tx;
 
     // half_dim = head_dim / 2
     shr.u32         %half_dim, %head_dim, 1;

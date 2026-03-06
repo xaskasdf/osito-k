@@ -23,7 +23,7 @@
     .param .u32 p_hidden_size,
     .param .f32 p_eps
 ) {
-    .reg .u32   %tid, %hidden_size, %i, %lane, %wid, %nwarps;
+    .reg .u32   %tx, %hidden_size, %i, %lane, %wid, %nwarps;
     .reg .u64   %out_ptr, %in_ptr, %w_ptr, %addr;
     .reg .f32   %sum_sq, %val, %wval, %eps, %mean_sq, %rms_inv, %result;
     .reg .f32   %shfl_val;
@@ -40,7 +40,7 @@
     ld.param.u32    %hidden_size, [p_hidden_size];
     ld.param.f32    %eps,     [p_eps];
 
-    mov.u32         %tid, %tid.x;
+    mov.u32         %tx, %tid.x;
 
     // Offset by row: row = blockIdx.x
     {
@@ -55,7 +55,7 @@
 
     // Phase 1: Compute sum of squares
     mov.f32         %sum_sq, 0f00000000;
-    mov.u32         %i, %tid;
+    mov.u32         %i, %tx;
 sum_loop:
     setp.ge.u32     %p0, %i, %hidden_size;
     @%p0 bra        sum_done;
@@ -96,14 +96,19 @@ sum_done:
     add.f32         %sum_sq, %sum_sq, %shfl_val;
 
     // Cross-warp reduction via shared memory
-    and.b32         %lane, %tid, 31;
-    shr.u32         %wid, %tid, 5;
+    and.b32         %lane, %tx, 31;
+    shr.u32         %wid, %tx, 5;
 
     // if (lane == 0) shared[wid] = sum_sq
     setp.ne.u32     %p0, %lane, 0;
     @%p0 bra        skip_store;
     mul.lo.u32      %i, %wid, 4;
-    st.shared.f32   [shared + %i], %sum_sq;
+    {
+        .reg .u32 %saddr;
+        mov.u32     %saddr, shared;
+        add.u32     %saddr, %saddr, %i;
+        st.shared.f32 [%saddr], %sum_sq;
+    }
 skip_store:
     bar.sync        0;
 
@@ -113,13 +118,18 @@ skip_store:
 
     // Load from shared (nwarps = 256/32 = 8)
     mov.u32         %nwarps, 8;
-    setp.lt.u32     %p1, %tid, %nwarps;
+    setp.lt.u32     %p1, %tx, %nwarps;
     @%p1 bra        load_shared;
     mov.f32         %sum_sq, 0f00000000;
     bra             do_final_reduce;
 load_shared:
     mul.lo.u32      %i, %lane, 4;
-    ld.shared.f32   %sum_sq, [shared + %i];
+    {
+        .reg .u32 %saddr;
+        mov.u32     %saddr, shared;
+        add.u32     %saddr, %saddr, %i;
+        ld.shared.f32 %sum_sq, [%saddr];
+    }
 
 do_final_reduce:
     // Warp reduction again for cross-warp
@@ -145,7 +155,7 @@ do_final_reduce:
     add.f32         %sum_sq, %sum_sq, %shfl_val;
 
     // tid == 0: compute rms_inv = rsqrt(sum_sq / hidden_size + eps)
-    setp.ne.u32     %p0, %tid, 0;
+    setp.ne.u32     %p0, %tx, 0;
     @%p0 bra        skip_rms;
     cvt.rn.f32.u32  %val, %hidden_size;
     div.rn.f32      %mean_sq, %sum_sq, %val;
@@ -162,7 +172,7 @@ skip_final_reduce:
     ld.shared.f32   %rms_inv, [shared + 128];
 
     // Phase 3: Apply normalization: y[i] = x[i] * rms_inv * weight[i]
-    mov.u32         %i, %tid;
+    mov.u32         %i, %tx;
 norm_loop:
     setp.ge.u32     %p0, %i, %hidden_size;
     @%p0 bra        done;
