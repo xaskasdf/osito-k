@@ -126,6 +126,8 @@ arch/x86/drivers/sass.c              Pre-encoded SASS kernels (NOP, S2R, NOP4, s
 arch/x86/drivers/gmmu.c              GMMU page tables: 5-level identity map, instance block PDB config
 arch/x86/drivers/gpu_tensor.h        GPU tensor ops API (VRAM alloc, upload/download, dispatch wrappers)
 arch/x86/drivers/gpu_tensor.c        GPU tensor dispatch layer, PRAMIN data transfer, self-test, PTX docs
+arch/x86/drivers/gpu_inference.h     GPU inference orchestration API (hybrid GPU/CPU forward pass)
+arch/x86/drivers/gpu_inference.c     GPU-accelerated Llama forward pass, kernel dispatch table, benchmark
 arch/x86/fs/ositofs2.c              OsitoFS v2 bare-metal driver (mount, list, read)
 arch/x86/fs/gpt.h                   GPT structs (UEFI spec) + API
 arch/x86/fs/gpt.c                   GPT parser (name match + superblock magic probe)
@@ -286,6 +288,7 @@ Tasks:   idle, input, shell (3 of 8 slots used)
 | **X37** | **SASS kernel infrastructure** (128-bit instruction encoding, pre-encoded NOP/S2R/NOP4 kernels, VRAM upload via PRAMIN, dispatch smoke test) | Done |
 | **X38** | **GMMU page tables** (GP100+ MMU v2, 5-level identity map, constant buffer QMD, memory windows) | Done |
 | **X39** | **GPU tensor ops** (store_pattern STG test, vec_add_f32 kernel, VRAM buffer mgmt, dispatch layer, PTX docs) | Done |
+| **X40** | **GPU-accelerated inference** (hybrid GPU/CPU forward pass, kernel dispatch table, VRAM scratch, benchmark) | Done |
 
 > Full GPU roadmap (X27-X40 + contingency): see [docs/x86-gpu-roadmap.md](docs/x86-gpu-roadmap.md)
 
@@ -578,6 +581,19 @@ GPU-accelerated tensor operation dispatch layer with hand-encoded SM75 SASS kern
 - **Kernel patching**: `sass_patch_vec_add()` modifies MOV immediate fields at known offsets, re-uploads kernel to VRAM.
 - **Files**: `arch/x86/drivers/gpu_tensor.h`, `arch/x86/drivers/gpu_tensor.c`, additions to `sass.h/sass.c`.
 - **Integration**: `gpu_tensor_init()` called from `gsp_boot()` after `sass_init()`. Runs store_test + vec_add self-tests.
+
+### X40: GPU-Accelerated Llama Inference
+Hybrid GPU/CPU forward pass orchestration. Mirrors `llama_forward()` from `inference.c` with GPU dispatch hooks.
+- **Dispatch table**: `gpu_kernel_table_t` — boolean per-kernel availability (vec_add, matvec_q4_0, rmsnorm, softmax, silu, rope, vec_mul). Auto-detected from SASS catalog.
+- **VRAM scratch**: 3 buffers (A, B, Out) allocated from gpu_tensor VRAM region, sized for max(dim, ffn_dim) floats.
+- **Chunked vec_add**: GPU `vec_add_f32` handles 256 elements/dispatch. Vectors larger than 256 are chunked into multiple dispatches with PRAMIN upload/download per chunk.
+- **Forward pass**: `gpu_llama_forward()` — identical transformer logic to CPU, but dispatches available ops to GPU. Currently: vec_add on GPU (when ≤ VRAM and kernel available), all matvec/rmsnorm/softmax/silu/rope on CPU.
+- **Generate loop**: `gpu_llama_generate()` — prefill + decode with per-token timing, GPU/CPU dispatch stats.
+- **Benchmark**: `gpu_llama_benchmark()` — GPU vs CPU vec_add timing comparison with correctness verification. Reports PRAMIN transfer overhead. `gpu_llama_benchmark_standalone()` runs without a model.
+- **Stats tracking**: GPU ops count, CPU ops count, GPU/CPU cycle totals, dispatch percentage.
+- **Bottleneck analysis**: matvec_q4_0 = ~90% of compute. Current GPU vec_add saves ~1%. Real speedup comes when matvec_q4_0 SASS kernel is compiled.
+- **Files**: `arch/x86/drivers/gpu_inference.h`, `arch/x86/drivers/gpu_inference.c`.
+- **Integration**: `gpu_llama_init()` + `gpu_llama_generate()` called from `kernel/main.c` after GPU boot. CPU inference runs first as baseline, then GPU inference for comparison.
 
 ### AArch64/SM8350 Port (arch/arm/)
 Reference bare-metal code for ASUS ROG Phone 5 (Snapdragon 888).

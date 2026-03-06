@@ -7,6 +7,7 @@
 
 #include "../include/types.h"
 #include "../drivers/gpu.h"
+#include "../drivers/gpu_inference.h"
 #include "../fs/gguf.h"
 #include "tensor.h"
 #include "inference.h"
@@ -158,12 +159,15 @@ void kernel_entry(void *memory_map, uint64_t map_size,
 
                     /* Load GGUF model (if present) */
                     static gguf_model_t gguf_model;
+                    static llama_state_t llama;
+                    bool model_ready = false;
+
                     if (gguf_load(&gguf_model) == 0 && gguf_model.num_tensors > 0) {
-                        static llama_state_t llama;
                         if (llama_init(&llama, &gguf_model, 256) == 0) {
+                            /* CPU inference (baseline) */
                             uint32_t prompt[] = { 128000 };  /* BOS */
                             llama_generate(&llama, prompt, 1, 32);
-                            llama_free(&llama);
+                            model_ready = true;
                         }
                     }
 
@@ -176,6 +180,25 @@ void kernel_entry(void *memory_map, uint64_t map_size,
                         gsp_queue_init();
                     if (gp && gp->gsp_present)
                         gsp_boot();
+
+                    /* X40: GPU-accelerated inference (after GPU init) */
+                    if (model_ready) {
+                        static gpu_llama_state_t gpu_llama;
+                        if (gpu_llama_init(&gpu_llama, &llama) == 0) {
+                            gpu_llama_benchmark(&gpu_llama);
+
+                            /* GPU-accelerated inference run */
+                            llama.pos = 0;  /* Reset position for fresh run */
+                            uint32_t prompt2[] = { 128000 };
+                            gpu_llama_generate(&gpu_llama, prompt2, 1, 32);
+
+                            gpu_llama_free(&gpu_llama);
+                        }
+                        llama_free(&llama);
+                    } else {
+                        /* No model — run standalone GPU benchmark */
+                        gpu_llama_benchmark_standalone();
+                    }
                 }
             } else {
                 serial_puts("[KERN] OsitoFS partition not found in GPT\n");

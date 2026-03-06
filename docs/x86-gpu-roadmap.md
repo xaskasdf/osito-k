@@ -1,7 +1,7 @@
 # OsitoK x86-64 — GPU Compute Roadmap
 
-> Status: X1–X39 + X-CPU1 done. Phase A + B complete. Phase C nearly complete: X40 next.
-> Last updated: 2026-03-03
+> Status: X1–X40 + X-CPU1 done. Phase A + B + C complete.
+> Last updated: 2026-03-06
 
 ## Current State
 
@@ -22,7 +22,7 @@ X34 binds compute class to channel, activates via CTRL_BIND+SCHEDULE,
 pushes SET_OBJECT + cache invalidate + semaphore fence through GPFIFO.
 X35 implements CE DMA with physical addressing (sysmem↔VRAM), semaphore fencing.
 X36 adds QMD construction (QMDV02_03), SEND_PCAS dispatch, kernel wait, result readback.
-**Phase B complete.** Next: Phase C — NTransformer port to GPU (X37: offline SASS compilation).
+**Phase B complete.** Phase C (NTransformer port to GPU) also complete: X37-X40.
 
 ---
 
@@ -123,7 +123,7 @@ Port inference pipeline to GPU compute. Requires Phase B.
 | **X37** | **Offline SASS compilation** — SASS instruction encoding, pre-encoded kernels (NOP/S2R/NOP4), VRAM upload, smoke test | ~300 | Done |
 | **X38** | **GMMU page tables + kernel loader** — GP100+ MMU v2 identity map, constant buffer QMD, memory windows, instance block PDB | ~400 | Done |
 | **X39** | **GPU tensor ops** — store_pattern + vec_add_f32 SASS kernels, VRAM buffer mgmt, dispatch layer, PTX docs | ~600 | Done |
-| **X40** | **GPU-accelerated Llama inference** — orchestrate GPU kernels for full forward pass | ~400 | Medium |
+| **X40** | **GPU-accelerated Llama inference** — hybrid GPU/CPU forward pass, kernel dispatch table, VRAM scratch, benchmark | ~450 | Done |
 
 ### SASS Kernel Strategy
 
@@ -261,3 +261,6 @@ X37 ─────────────────────────�
 | `arch/x86/drivers/gpu_tensor.h` | X39 | GPU tensor ops API (VRAM alloc, transfer, dispatch) |
 | `arch/x86/drivers/gpu_tensor.c` | X39 | Dispatch layer, PRAMIN transfer, self-test, PTX source docs |
 | `arch/x86/drivers/sass.c` | X39 | +store_pattern (STG test), +vec_add_f32 (LDG+FADD+STG) |
+| `arch/x86/drivers/gpu_inference.h` | X40 | GPU inference orchestration API (hybrid GPU/CPU forward pass) |
+| `arch/x86/drivers/gpu_inference.c` | X40 | GPU-accelerated forward pass, dispatch table, benchmark |
+| `arch/x86/kernel/main.c` | X40 | Integration: GPU inference run after GPU boot |

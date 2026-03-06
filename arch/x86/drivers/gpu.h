@@ -1079,6 +1079,9 @@ bool     gmmu_is_initialized(void);    /* Check if GMMU is ready */
 /* X39: GPU tensor operations (see gpu_tensor.h for full API) */
 int  gpu_tensor_init(void);            /* Init tensor subsystem + self-test */
 
+/* X40: GPU-accelerated inference (see gpu_inference.h for full API) */
+int  gpu_llama_benchmark_standalone(void);  /* Run GPU vs CPU benchmark (no model needed) */
+
 /* Phase 9: VBIOS read + BIT parse + FWSEC extraction */
 int  gpu_read_vbios(void);           /* Read VBIOS from VRAM via PRAMIN */
 int  gpu_parse_bit(void);            /* Parse BIT table, extract FWSEC */
