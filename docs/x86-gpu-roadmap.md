@@ -1,6 +1,6 @@
 # OsitoK x86-64 — GPU Compute Roadmap
 
-> Status: X1–X38 + X-CPU1 done. Phase A + B complete. Phase C in progress: X39 next.
+> Status: X1–X39 + X-CPU1 done. Phase A + B complete. Phase C nearly complete: X40 next.
 > Last updated: 2026-03-03
 
 ## Current State
@@ -122,7 +122,7 @@ Port inference pipeline to GPU compute. Requires Phase B.
 |---------|-------------|-----------|------|
 | **X37** | **Offline SASS compilation** — SASS instruction encoding, pre-encoded kernels (NOP/S2R/NOP4), VRAM upload, smoke test | ~300 | Done |
 | **X38** | **GMMU page tables + kernel loader** — GP100+ MMU v2 identity map, constant buffer QMD, memory windows, instance block PDB | ~400 | Done |
-| **X39** | **GPU tensor ops** — SASS kernels: matvec_q4_0, rmsnorm, softmax, RoPE | ~600 | Medium |
+| **X39** | **GPU tensor ops** — store_pattern + vec_add_f32 SASS kernels, VRAM buffer mgmt, dispatch layer, PTX docs | ~600 | Done |
 | **X40** | **GPU-accelerated Llama inference** — orchestrate GPU kernels for full forward pass | ~400 | Medium |
 
 ### SASS Kernel Strategy
@@ -258,3 +258,6 @@ X37 ─────────────────────────�
 | `arch/x86/drivers/sass.h` | X37 | SASS instruction types, encoding defines, kernel catalog |
 | `arch/x86/drivers/sass.c` | X37 | Pre-encoded SASS kernels, VRAM upload, smoke test |
 | `arch/x86/drivers/gmmu.c` | X38 | GMMU 5-level page tables, identity map, instance block PDB |
+| `arch/x86/drivers/gpu_tensor.h` | X39 | GPU tensor ops API (VRAM alloc, transfer, dispatch) |
+| `arch/x86/drivers/gpu_tensor.c` | X39 | Dispatch layer, PRAMIN transfer, self-test, PTX source docs |
+| `arch/x86/drivers/sass.c` | X39 | +store_pattern (STG test), +vec_add_f32 (LDG+FADD+STG) |

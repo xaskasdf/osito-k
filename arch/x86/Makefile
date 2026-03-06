@@ -54,7 +54,7 @@ EFI_SRC  = boot/efi_main.c
 KERN_SRC = kernel/main.c kernel/serial.c kernel/framebuffer.c \
            kernel/pci.c kernel/memory.c kernel/net.c kernel/tensor.c \
            kernel/tensor_avx2.c kernel/inference.c
-DRV_SRC  = drivers/nvme.c drivers/i211.c drivers/gpu.c drivers/gsp.c drivers/sass.c drivers/gmmu.c
+DRV_SRC  = drivers/nvme.c drivers/i211.c drivers/gpu.c drivers/gsp.c drivers/sass.c drivers/gmmu.c drivers/gpu_tensor.c
 FS_SRC   = fs/ositofs2.c fs/gpt.c fs/gguf.c
 
 EFI_OBJ  = $(BUILD)/efi_main.o

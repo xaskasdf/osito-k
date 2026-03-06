@@ -119,6 +119,145 @@ static const uint8_t __attribute__((aligned(256))) sass_code_nop4_exit[] = {
     0x00, 0x00, 0x80, 0x03, 0x00, 0xea, 0x0f, 0x00,
 };
 
+/* ── Kernel: store_pattern ────────────────────────────────
+ *
+ * Writes 0xCAFEBABE to VRAM+256MB+1MB (GPU VA 0x10100000).
+ * Proves: compute dispatch → GMMU translation → STG to VRAM.
+ * Must be dispatched as 1 thread, 1 block.
+ *
+ * SASS:
+ *   MOV R2, 0x10100000;     // target address low (identity-mapped VRAM)
+ *   MOV R3, 0x00000000;     // target address high (< 4GB = 0)
+ *   MOV R0, 0xCAFEBABE;     // test pattern
+ *   STG.E [R2], R0;         // store to VRAM (64-bit addr = R2:R3)
+ *   EXIT;
+ *
+ * Requirements: 4 registers, 0 shared mem, 0 barriers.
+ */
+static const uint8_t __attribute__((aligned(256))) sass_code_store_pattern[] = {
+    /* MOV R2, 0x10100000 — target VRAM address (low 32 bits) */
+    0x02, 0x78, 0x02, 0x00, 0x00, 0x00, 0x10, 0x10,  /* opcode */
+    0x00, 0x0f, 0x00, 0x00, 0x00, 0xca, 0x0f, 0x00,  /* control */
+    /* MOV R3, 0x00000000 — address high = 0 */
+    0x02, 0x78, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x0f, 0x00, 0x00, 0x00, 0xca, 0x0f, 0x00,
+    /* MOV R0, 0xCAFEBABE — test pattern */
+    0x02, 0x78, 0x00, 0x00, 0xBE, 0xBA, 0xFE, 0xCA,
+    0x00, 0x0f, 0x00, 0x00, 0x00, 0xca, 0x0f, 0x00,
+    /* STG.E [R2], R0 — store R0 to address R2:R3 */
+    0x86, 0x73, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0xe9, 0x10, 0x00, 0x00, 0xe2, 0x0f, 0x00,
+    /* EXIT */
+    0x4d, 0x79, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x80, 0x03, 0x00, 0xea, 0x0f, 0x00,
+};
+
+/* ── Kernel: vec_add_f32 ─────────────────────────────────
+ *
+ * dst[i] = a[i] + b[i], 1 block of 256 threads.
+ * Base addresses embedded as MOV immediates (patched before upload).
+ * Uses IADD3 for ×4 byte offset: R1 = R0+R0, R1 = R1+R1.
+ *
+ * SASS:
+ *   S2R R0, SR_TID.X;            // threadIdx.x
+ *   IADD3 R1, R0, R0, RZ;        // R1 = 2*tid
+ *   IADD3 R1, R1, R1, RZ;        // R1 = 4*tid (byte offset)
+ *   MOV R3, 0x00000000;           // addr high = 0
+ *   MOV R2, <src_a>;              // src_a base [PATCH offset 0x44]
+ *   IADD3 R4, R2, R1, RZ;        // R4 = src_a + byte_offset
+ *   LDG.E R10, [R4];             // R10 = a[tid]
+ *   MOV R2, <src_b>;              // src_b base [PATCH offset 0x74]
+ *   IADD3 R4, R2, R1, RZ;        // R4 = src_b + byte_offset
+ *   NOP; NOP; NOP; NOP;           // wait for R10 (LDG latency)
+ *   LDG.E R11, [R4];             // R11 = b[tid]
+ *   NOP; NOP; NOP; NOP;           // wait for R11 (LDG latency)
+ *   FADD R12, R10, R11;           // R12 = a[i] + b[i]
+ *   MOV R2, <dst>;                // dst base [PATCH offset 0x124]
+ *   IADD3 R4, R2, R1, RZ;        // R4 = dst + byte_offset
+ *   STG.E [R4], R12;             // store result
+ *   EXIT;
+ *
+ * Patch offsets (byte positions of MOV immediate fields):
+ *   src_a: byte 0x44 (instruction 4, bytes 4-7 of word0)
+ *   src_b: byte 0x74 (instruction 7, bytes 4-7 of word0)
+ *   dst:   byte 0x124 (instruction 18, bytes 4-7 of word0)
+ *
+ * Requirements: 16 registers, 0 shared mem, 0 barriers, max 256 threads.
+ */
+static uint8_t __attribute__((aligned(256))) sass_code_vec_add_f32[] = {
+    /* [0] S2R R0, SR_TID.X */
+    0x19, 0x79, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x21, 0x00, 0x00, 0x00, 0x22, 0x0e, 0x00,
+    /* [1] IADD3 R1, R0, R0, RZ — R1 = 2*tid */
+    0x10, 0x72, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0xff, 0xe0, 0xff, 0x07, 0x00, 0xc0, 0x0f, 0x00,
+    /* [2] IADD3 R1, R1, R1, RZ — R1 = 4*tid */
+    0x10, 0x72, 0x01, 0x01, 0x01, 0x00, 0x00, 0x00,
+    0xff, 0xe0, 0xff, 0x07, 0x00, 0xc0, 0x0f, 0x00,
+    /* [3] MOV R3, 0x00000000 — address high */
+    0x02, 0x78, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x0f, 0x00, 0x00, 0x00, 0xca, 0x0f, 0x00,
+    /* [4] MOV R2, <src_a> — PATCH bytes 0x44-0x47 */
+    0x02, 0x78, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x0f, 0x00, 0x00, 0x00, 0xca, 0x0f, 0x00,
+    /* [5] IADD3 R4, R2, R1, RZ — R4 = src_a + offset */
+    0x10, 0x72, 0x04, 0x02, 0x01, 0x00, 0x00, 0x00,
+    0xff, 0xe0, 0xff, 0x07, 0x00, 0xc0, 0x0f, 0x00,
+    /* [6] NOP — stall for IADD3 */
+    0x18, 0x79, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0xc0, 0x0f, 0x00,
+    /* [7] LDG.E R10, [R4] — load a[tid] via R4:R5 */
+    0x81, 0x73, 0x0a, 0x04, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0xe9, 0x1e, 0x00, 0x00, 0xa2, 0x0e, 0x00,
+    /* [8] MOV R2, <src_b> — PATCH bytes 0x84-0x87 */
+    0x02, 0x78, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x0f, 0x00, 0x00, 0x00, 0xca, 0x0f, 0x00,
+    /* [9] IADD3 R4, R2, R1, RZ — R4 = src_b + offset */
+    0x10, 0x72, 0x04, 0x02, 0x01, 0x00, 0x00, 0x00,
+    0xff, 0xe0, 0xff, 0x07, 0x00, 0xc0, 0x0f, 0x00,
+    /* [10] NOP — stall for IADD3 */
+    0x18, 0x79, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0xc0, 0x0f, 0x00,
+    /* [11] LDG.E R11, [R4] — load b[tid] via R4:R5 */
+    0x81, 0x73, 0x0b, 0x04, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0xe9, 0x1e, 0x00, 0x00, 0xa2, 0x0e, 0x00,
+    /* [12-15] NOP x4 — wait for LDG latency */
+    0x18, 0x79, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0xc0, 0x0f, 0x00,
+    0x18, 0x79, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0xc0, 0x0f, 0x00,
+    0x18, 0x79, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0xc0, 0x0f, 0x00,
+    0x18, 0x79, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0xc0, 0x0f, 0x00,
+    /* [16] FADD R12, R10, R11 — result = a[i] + b[i] */
+    0x21, 0x72, 0x0c, 0x0a, 0x0b, 0x00, 0x00, 0x00,
+    0xff, 0x00, 0x00, 0x00, 0x00, 0xc0, 0x0f, 0x00,
+    /* [17] NOP — stall for FADD */
+    0x18, 0x79, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0xc0, 0x0f, 0x00,
+    /* [18] MOV R2, <dst> — PATCH bytes 0x124-0x127 */
+    0x02, 0x78, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x0f, 0x00, 0x00, 0x00, 0xca, 0x0f, 0x00,
+    /* [19] IADD3 R4, R2, R1, RZ — R4 = dst + offset */
+    0x10, 0x72, 0x04, 0x02, 0x01, 0x00, 0x00, 0x00,
+    0xff, 0xe0, 0xff, 0x07, 0x00, 0xc0, 0x0f, 0x00,
+    /* [20] NOP — stall for IADD3 */
+    0x18, 0x79, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0xc0, 0x0f, 0x00,
+    /* [21] STG.E [R4], R12 — store result */
+    0x86, 0x73, 0x00, 0x04, 0x0c, 0x00, 0x00, 0x00,
+    0x00, 0xe9, 0x10, 0x00, 0x00, 0xe2, 0x0f, 0x00,
+    /* [22] EXIT */
+    0x4d, 0x79, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x80, 0x03, 0x00, 0xea, 0x0f, 0x00,
+};
+
+/* Patch offsets for vec_add_f32 kernel (MOV immediate fields) */
+#define VEC_ADD_PATCH_SRC_A   0x44   /* instruction [4], bytes 4-7 */
+#define VEC_ADD_PATCH_SRC_B   0x84   /* instruction [8], bytes 4-7 */
+#define VEC_ADD_PATCH_DST     0x124  /* instruction [18], bytes 4-7 */
+
 /* ── Kernel Registration ─────────────────────────────────── */
 
 static void sass_register_kernel(const char *name, const uint8_t *code,
@@ -354,6 +493,12 @@ int sass_init(void)
     sass_register_kernel("nop4_exit", sass_code_nop4_exit,
                          sizeof(sass_code_nop4_exit), 2, 0, 0, 1024);
 
+    sass_register_kernel("store_pattern", sass_code_store_pattern,
+                         sizeof(sass_code_store_pattern), 4, 0, 0, 1);
+
+    sass_register_kernel("vec_add_f32", sass_code_vec_add_f32,
+                         sizeof(sass_code_vec_add_f32), 16, 0, 0, 256);
+
     serial_puts("[SASS] Registered ");
     serial_putdec(sass_state.count);
     serial_puts(" kernels: ");
@@ -411,4 +556,142 @@ int sass_init(void)
     fb_puts("B VRAM)\n");
 
     return 0;
+}
+
+/* ══════════════════════════════════════════════════════════
+ *  X39: GPU Tensor Ops — Store Test + Vec Add
+ *
+ *  sass_store_test():
+ *    Dispatches store_pattern kernel (1 thread), verifies
+ *    0xCAFEBABE written to VRAM via PRAMIN readback.
+ *    Proves: GMMU page table → compute dispatch → STG → VRAM.
+ *
+ *  sass_patch_vec_add():
+ *    Patches src_a/src_b/dst addresses into vec_add_f32 kernel
+ *    binary, re-uploads to VRAM. Enables data-driven dispatch.
+ * ══════════════════════════════════════════════════════════ */
+
+int sass_store_test(void)
+{
+    serial_puts("[SASS] -- Store test: write 0xCAFEBABE to VRAM --\n");
+
+    sass_kernel_t *k = sass_get_kernel("store_pattern");
+    if (!k || !k->uploaded) {
+        serial_puts("[SASS] store_pattern kernel not available\n");
+        return -1;
+    }
+
+    gpu_probe_t *p = gpu_get_probe();
+    if (!p || !p->present || p->vram_size_mb == 0)
+        return -1;
+
+    /* Target address: VRAM+256MB+1MB = 0x10100000 (identity-mapped via GMMU) */
+    uint64_t target_vram = 0x10100000;
+
+    /* Clear target via PRAMIN */
+    uint32_t saved_window = gpu_reg_read(NV_PBUS_BAR0_WINDOW);
+    gpu_reg_write(NV_PBUS_BAR0_WINDOW, (uint32_t)(target_vram >> 16));
+    wmb();
+    uint32_t pramin_off = (uint32_t)(target_vram & 0xFFFF);
+    gpu_reg_write(NV_PRAMIN_BASE + pramin_off, 0x00000000);
+    wmb();
+
+    /* Verify cleared */
+    rmb();
+    uint32_t before = gpu_reg_read(NV_PRAMIN_BASE + pramin_off);
+    serial_puts("[SASS] VRAM@0x");
+    serial_puthex(target_vram, 8);
+    serial_puts(" before: 0x");
+    serial_puthex(before, 8);
+    serial_puts("\n");
+
+    gpu_reg_write(NV_PBUS_BAR0_WINDOW, saved_window);
+    wmb();
+
+    /* Allocate semaphore */
+    uint32_t *sem = (uint32_t *)mem_alloc_aligned(4096, 4096);
+    if (!sem) return -1;
+    *sem = 0;
+    wmb();
+    uint64_t sem_phys = (uint64_t)(uintptr_t)sem;
+
+    /* Dispatch store_pattern kernel */
+    compute_dispatch_t desc;
+    memset(&desc, 0, sizeof(desc));
+    desc.program_addr   = k->vram_addr;
+    desc.grid_x         = 1;
+    desc.grid_y         = 1;
+    desc.grid_z         = 1;
+    desc.block_x        = 1;
+    desc.block_y        = 1;
+    desc.block_z        = 1;
+    desc.register_count = k->register_count;
+    desc.sem_addr       = sem_phys;
+    desc.sem_payload    = 0x5705E5E7;
+
+    serial_puts("[SASS] Dispatching store_pattern: prog=0x");
+    serial_puthex(k->vram_addr, 8);
+    serial_puts("\n");
+
+    int ret = gsp_compute_dispatch(&desc);
+    if (ret < 0) {
+        serial_puts("[SASS] Dispatch failed\n");
+        return -1;
+    }
+
+    /* Wait for completion */
+    ret = gsp_compute_wait(sem_phys, 0x5705E5E7, 500);
+
+    /* Read back target via PRAMIN */
+    saved_window = gpu_reg_read(NV_PBUS_BAR0_WINDOW);
+    gpu_reg_write(NV_PBUS_BAR0_WINDOW, (uint32_t)(target_vram >> 16));
+    wmb();
+    rmb();
+    uint32_t after = gpu_reg_read(NV_PRAMIN_BASE + pramin_off);
+    gpu_reg_write(NV_PBUS_BAR0_WINDOW, saved_window);
+    wmb();
+
+    serial_puts("[SASS] VRAM@0x");
+    serial_puthex(target_vram, 8);
+    serial_puts(" after: 0x");
+    serial_puthex(after, 8);
+    serial_puts("\n");
+
+    if (after == 0xCAFEBABE) {
+        serial_puts("[SASS] *** STORE TEST PASSED! GMMU+Compute+STG works! ***\n");
+        fb_puts_color(" SASS: store test PASS!\n", 0x0000FF00);
+        return 0;
+    }
+
+    if (ret == 0)
+        serial_puts("[SASS] Kernel completed but VRAM not written (GMMU or STG issue)\n");
+    else
+        serial_puts("[SASS] Store test pending — needs full GSP boot chain\n");
+
+    return -1;
+}
+
+int sass_patch_vec_add(uint32_t src_a, uint32_t src_b, uint32_t dst)
+{
+    /* Patch MOV immediate fields in vec_add_f32 binary */
+    sass_code_vec_add_f32[VEC_ADD_PATCH_SRC_A + 0] = (src_a >>  0) & 0xFF;
+    sass_code_vec_add_f32[VEC_ADD_PATCH_SRC_A + 1] = (src_a >>  8) & 0xFF;
+    sass_code_vec_add_f32[VEC_ADD_PATCH_SRC_A + 2] = (src_a >> 16) & 0xFF;
+    sass_code_vec_add_f32[VEC_ADD_PATCH_SRC_A + 3] = (src_a >> 24) & 0xFF;
+
+    sass_code_vec_add_f32[VEC_ADD_PATCH_SRC_B + 0] = (src_b >>  0) & 0xFF;
+    sass_code_vec_add_f32[VEC_ADD_PATCH_SRC_B + 1] = (src_b >>  8) & 0xFF;
+    sass_code_vec_add_f32[VEC_ADD_PATCH_SRC_B + 2] = (src_b >> 16) & 0xFF;
+    sass_code_vec_add_f32[VEC_ADD_PATCH_SRC_B + 3] = (src_b >> 24) & 0xFF;
+
+    sass_code_vec_add_f32[VEC_ADD_PATCH_DST + 0] = (dst >>  0) & 0xFF;
+    sass_code_vec_add_f32[VEC_ADD_PATCH_DST + 1] = (dst >>  8) & 0xFF;
+    sass_code_vec_add_f32[VEC_ADD_PATCH_DST + 2] = (dst >> 16) & 0xFF;
+    sass_code_vec_add_f32[VEC_ADD_PATCH_DST + 3] = (dst >> 24) & 0xFF;
+
+    /* Re-upload patched kernel to VRAM */
+    sass_kernel_t *k = sass_get_kernel("vec_add_f32");
+    if (!k) return -1;
+    k->uploaded = false;
+    return sass_upload_kernel(k);
 }

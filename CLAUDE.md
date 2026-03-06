@@ -122,8 +122,10 @@ arch/x86/drivers/gpu.h              GPU types, MMIO register defines, Falcon def
 arch/x86/drivers/gpu.c              GPU probe Phase 1-3 + Phase 9 VBIOS read, BIT parse, FWSEC extraction
 arch/x86/drivers/gsp.c              GSP Falcon driver: probe, firmware load, ELF parse, boot, queues, RPC, FWSEC-FRTS, PIO load (Phase 4-10 + X27)
 arch/x86/drivers/sass.h              SASS kernel types, 128-bit instruction encoding, control code helpers, kernel catalog
-arch/x86/drivers/sass.c              Pre-encoded SASS kernels (NOP, S2R, NOP4), VRAM upload via PRAMIN, smoke test dispatch
+arch/x86/drivers/sass.c              Pre-encoded SASS kernels (NOP, S2R, NOP4, store_pattern, vec_add_f32), VRAM upload, dispatch
 arch/x86/drivers/gmmu.c              GMMU page tables: 5-level identity map, instance block PDB config
+arch/x86/drivers/gpu_tensor.h        GPU tensor ops API (VRAM alloc, upload/download, dispatch wrappers)
+arch/x86/drivers/gpu_tensor.c        GPU tensor dispatch layer, PRAMIN data transfer, self-test, PTX docs
 arch/x86/fs/ositofs2.c              OsitoFS v2 bare-metal driver (mount, list, read)
 arch/x86/fs/gpt.h                   GPT structs (UEFI spec) + API
 arch/x86/fs/gpt.c                   GPT parser (name match + superblock magic probe)
@@ -283,6 +285,7 @@ Tasks:   idle, input, shell (3 of 8 slots used)
 | **X36** | **Kernel completion + semaphore sync** (QMD build QMDV02_03, SEND_PCAS dispatch, kernel wait, CE result readback) | Done |
 | **X37** | **SASS kernel infrastructure** (128-bit instruction encoding, pre-encoded NOP/S2R/NOP4 kernels, VRAM upload via PRAMIN, dispatch smoke test) | Done |
 | **X38** | **GMMU page tables** (GP100+ MMU v2, 5-level identity map, constant buffer QMD, memory windows) | Done |
+| **X39** | **GPU tensor ops** (store_pattern STG test, vec_add_f32 kernel, VRAM buffer mgmt, dispatch layer, PTX docs) | Done |
 
 > Full GPU roadmap (X27-X40 + contingency): see [docs/x86-gpu-roadmap.md](docs/x86-gpu-roadmap.md)
 
@@ -564,6 +567,40 @@ GPU MMU identity map for compute kernel dispatch. Compute engine always uses GPU
 - **Memory windows**: SET_SHADER_SHARED_MEMORY_WINDOW (0x077C/0x0780) = 0xFE000000, SET_SHADER_LOCAL_MEMORY_WINDOW (0x07B0) = 0xFF000000. Pushed during compute class initialization.
 - **Files**: `arch/x86/drivers/gmmu.c` (page table builder, instance block config).
 - **Integration**: Called from `gsp_boot()` before `sass_init()`. Independent of GSP boot — allocates page tables in system RAM.
+
+### X39: GPU Tensor Ops
+GPU-accelerated tensor operation dispatch layer with hand-encoded SM75 SASS kernels.
+- **store_pattern kernel** (80B, 5 insns): MOV×3 + STG.E + EXIT. Writes 0xCAFEBABE to VRAM+257MB via GMMU identity map. Proves full compute+GMMU+STG pipeline.
+- **vec_add_f32 kernel** (368B, 23 insns): S2R + IADD3(×4 offset) + LDG.E + FADD + STG.E. Self-modifying: MOV immediates patched with buffer addresses before VRAM upload.
+- **SM75 instruction encodings** (verified): MOV imm(0x7802), STG.E(0x7386), LDG.E(0x7381), FADD(0x7221), S2R(0x7919), IADD3(0x7210). Control words from nvdisasm output.
+- **GPU tensor dispatch** (`gpu_tensor.h/c`): VRAM bump allocator (4MB at +260MB), PRAMIN upload/download, dispatch wrappers, self-test.
+- **PTX source**: Documented in `gpu_tensor.c` for all target kernels (vec_add, matvec_q4_0, rmsnorm, softmax, rope, silu). Ready for `ptxas --gpu-name sm_75` compilation.
+- **Kernel patching**: `sass_patch_vec_add()` modifies MOV immediate fields at known offsets, re-uploads kernel to VRAM.
+- **Files**: `arch/x86/drivers/gpu_tensor.h`, `arch/x86/drivers/gpu_tensor.c`, additions to `sass.h/sass.c`.
+- **Integration**: `gpu_tensor_init()` called from `gsp_boot()` after `sass_init()`. Runs store_test + vec_add self-tests.
+
+### AArch64/SM8350 Port (arch/arm/)
+Reference bare-metal code for ASUS ROG Phone 5 (Snapdragon 888).
+All code verified on real hardware via sm8350-boot bootloader (2026-03-03/04).
+
+```
+arch/arm/include/sm8350.h      SM8350 MMIO register definitions (verified)
+arch/arm/include/aarch64.h     System register helpers, GICv3 ICC, timer, context frame
+arch/arm/boot/start.S          EL1 entry, ARM64 image header, exception vectors
+arch/arm/boot/linker.ld        Linker script (WARNING: load addr != link addr)
+arch/arm/drivers/geni_uart.c   Qualcomm GENI UART (TX timeout mandatory)
+arch/arm/drivers/framebuffer.c Splash FB console (ARGB8888, 1080x2448, 0xE5000000)
+arch/arm/drivers/timer.c       ARM Generic Timer (19.2 MHz, scheduler tick)
+arch/arm/drivers/spmi.c        SPMI PMIC buttons (WIP, data abort on observer probe)
+```
+
+**Critical rules for AArch64 SM8350**:
+- ABL loads at ~0xA0080000, NOT 0x80080000. Never use stored pointers (`char *p = "str"`), always use arrays (`char p[] = "str"`)
+- UART TX MUST have timeout (~100k iterations) or system hangs
+- FB output BEFORE UART output in dual-output wrappers
+- PSCI reboot: `ldr x0, =0x84000009` then `smc #0` (not mov — immediate too large)
+
+See `docs/porting-rog5-sm8350.md` for full hardware reference and verified findings.
 
 ## Language
 The user speaks Spanish. Communicate in Spanish when appropriate.

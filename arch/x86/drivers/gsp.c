@@ -3227,6 +3227,9 @@ int gsp_boot(void)
     /* X37: SASS kernel infrastructure (works with or without GSP boot) */
     sass_init();
 
+    /* X39: GPU tensor operations (dispatch layer + self-test) */
+    gpu_tensor_init();
+
     return ret;
 }
 

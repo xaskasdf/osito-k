@@ -115,4 +115,10 @@ int  sass_upload_kernel(sass_kernel_t *k);
 /* Smoke test: dispatch NOP kernel, check QMD semaphore */
 int  sass_smoke_test(void);
 
+/* X39: Store test — dispatch store_pattern, verify via PRAMIN */
+int  sass_store_test(void);
+
+/* X39: Patch vec_add_f32 addresses and re-upload to VRAM */
+int  sass_patch_vec_add(uint32_t src_a, uint32_t src_b, uint32_t dst);
+
 #endif /* OSITOK_SASS_H */

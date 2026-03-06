@@ -1076,6 +1076,9 @@ int      gmmu_init(void);              /* Build identity-map page tables, config
 uint64_t gmmu_get_pdb_phys(void);      /* Get PDB physical address */
 bool     gmmu_is_initialized(void);    /* Check if GMMU is ready */
 
+/* X39: GPU tensor operations (see gpu_tensor.h for full API) */
+int  gpu_tensor_init(void);            /* Init tensor subsystem + self-test */
+
 /* Phase 9: VBIOS read + BIT parse + FWSEC extraction */
 int  gpu_read_vbios(void);           /* Read VBIOS from VRAM via PRAMIN */
 int  gpu_parse_bit(void);            /* Parse BIT table, extract FWSEC */
