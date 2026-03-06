@@ -117,7 +117,10 @@ arch/x86/kernel/serial.c            COM1 UART (0x3F8, 115200 baud)
 arch/x86/kernel/framebuffer.c       GOP 32bpp text console (8×16 font)
 arch/x86/kernel/pci.c               PCIe enumeration (ECAM via MCFG, BAR size detection)
 arch/x86/kernel/memory.c            Physical memory manager (bitmap, 4KB pages)
-arch/x86/drivers/nvme.c             Minimal NVMe driver (admin+IO queues, read-only)
+arch/x86/kernel/idt.c               IDT setup, exception handlers (#PF/#GP/#UD), APIC timer
+arch/x86/kernel/isr_stubs.S         ISR entry stubs (save regs, call C handler, IRETQ)
+arch/x86/kernel/paging.c            4-level page tables, identity map, CR3 switch, MMIO mapping
+arch/x86/drivers/nvme.c             Minimal NVMe driver (admin+IO queues, read/write)
 arch/x86/drivers/gpu.h              GPU types, MMIO register defines, Falcon defines, RPC IDs, VBIOS/BIT/FWSEC/WPR2 structs, PIO API, probe + GSP API
 arch/x86/drivers/gpu.c              GPU probe Phase 1-3 + Phase 9 VBIOS read, BIT parse, FWSEC extraction
 arch/x86/drivers/gsp.c              GSP Falcon driver: probe, firmware load, ELF parse, boot, queues, RPC, FWSEC-FRTS, PIO load (Phase 4-10 + X27)
@@ -296,6 +299,8 @@ Tasks:   idle, input, shell (3 of 8 slots used)
 | **X42** | **Compiled kernel dispatch** (CB0 parameter passing, gpu_dispatch_kernel helper, per-kernel wrappers for all 8 PTX kernels) | Done |
 | **X-CPU2** | **NVMe write** (IO write command, nvme_write/write_bytes/flush, OsitoFS v2 create/write/delete) | Done |
 | **X-CPU3** | **UDP prompt server** (port 7777, token ID input/output, inference dispatch, keep model alive) | Done |
+| **X-OS1** | **IDT + Exceptions + APIC timer** (256-entry IDT, ISR stubs, #PF/#GP/#UD handlers with register dump, xAPIC periodic timer vector 32) | Done |
+| **X-OS2** | **Paging** (4-level x86-64 page tables, identity map RAM+MMIO with 2MB large pages, CR3 switch, paging_map_mmio API) | Done |
 
 > Full GPU roadmap (X27-X40 + contingency): see [docs/x86-gpu-roadmap.md](docs/x86-gpu-roadmap.md)
 > Full OS roadmap (Tier 0-5): see [docs/os-selfhost-roadmap.md](docs/os-selfhost-roadmap.md)
@@ -469,6 +474,24 @@ Network-accessible inference over UDP port 7777.
 - **Prompt handler**: Replaces echo handler. Resets model state, prefills BOS or provided tokens, generates up to 32 tokens via `llama_forward` + argmax, sends token IDs back as decimal text.
 - **Model lifecycle**: `llama_state_t` kept alive after boot inference (not freed), pointer stored in `prompt_llama` for handler access.
 - **No tokenizer**: Client sends/receives raw token IDs. Text tokenization is client-side responsibility.
+
+### X-OS1: IDT + Exceptions + APIC Timer
+Own IDT replacing UEFI-provided one. Foundation for all OS services (paging, syscalls, scheduling).
+- **IDT**: 256-entry table, 16 bytes each (4KB), loaded via `LIDT`. 64-bit interrupt gates, DPL=0. CS selector auto-detected from current GDT.
+- **ISR stubs**: Assembly entry points (`isr_stubs.S`) — save all 15 GPRs, push vector + error code, call `isr_handler()` in C, restore, IRETQ. Vectors with CPU error code: 8,10-14,17,21,29,30.
+- **Exception handlers**: Vectors 0-31 decoded with name + full register dump (RIP, RSP, RAX-R15, RFLAGS). #PF decodes CR2 + fault flags (P/W/U/RSVD/IF). #GP decodes selector index + table (IDT/GDT/LDT). Halts on exception (no recovery yet).
+- **APIC timer**: xAPIC mode via MSR 0x1B. Periodic mode, vector 32, divide-by-16, initial count 100000 (~100 Hz). EOI on tick. `idt_get_ticks()` returns monotonic counter.
+- **Integration**: Called from `kernel_entry()` after `mem_init()`, before PCI scan. Enables interrupts via `STI`.
+
+### X-OS2: Paging (4-Level x86-64)
+Own page tables replacing UEFI's. Identity maps all memory (virt == phys).
+- **4-level hierarchy**: PML4 → PDPT → PD → PT. 512 entries per level, 4KB pages.
+- **2MB large pages**: Used for aligned 2MB regions (bulk of RAM). Falls back to 4KB for partial ranges.
+- **Identity map**: First 4GB always mapped (RAM + legacy MMIO + APIC + PCI config). Extended RAM above 4GB mapped if present.
+- **MMIO support**: `paging_map_mmio(phys, size)` maps device MMIO as uncacheable (PWT+PCD flags).
+- **CR3 switch**: `paging_init()` builds tables, then atomically switches CR3 with interrupts disabled.
+- **API**: `paging_map_page()` for single 4KB mappings with INVLPG, `paging_get_kernel_cr3()` for process cloning, `paging_switch()` for context switch.
+- **Integration**: Called after `idt_init()`, before PCI scan. Page tables allocated from physical page allocator.
 
 ### X27: Falcon PIO Load
 Programmed I/O access to Falcon IMEM/DMEM via IMEMC/IMEMD registers.

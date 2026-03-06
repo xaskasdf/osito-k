@@ -53,16 +53,19 @@ BUILD    = build
 EFI_SRC  = boot/efi_main.c
 KERN_SRC = kernel/main.c kernel/serial.c kernel/framebuffer.c \
            kernel/pci.c kernel/memory.c kernel/net.c kernel/tensor.c \
-           kernel/tensor_avx2.c kernel/inference.c
+           kernel/tensor_avx2.c kernel/inference.c kernel/idt.c \
+           kernel/paging.c
+ASM_SRC  = kernel/isr_stubs.S
 DRV_SRC  = drivers/nvme.c drivers/i211.c drivers/gpu.c drivers/gsp.c drivers/sass.c drivers/gmmu.c drivers/gpu_tensor.c drivers/gpu_inference.c
 FS_SRC   = fs/ositofs2.c fs/gpt.c fs/gguf.c
 
 EFI_OBJ  = $(BUILD)/efi_main.o
 KERN_OBJ = $(KERN_SRC:%.c=$(BUILD)/%.o)
+ASM_OBJ  = $(ASM_SRC:%.S=$(BUILD)/%.o)
 DRV_OBJ  = $(DRV_SRC:%.c=$(BUILD)/%.o)
 FS_OBJ   = $(FS_SRC:%.c=$(BUILD)/%.o)
 
-ALL_OBJ  = $(EFI_OBJ) $(KERN_OBJ) $(DRV_OBJ) $(FS_OBJ)
+ALL_OBJ  = $(EFI_OBJ) $(KERN_OBJ) $(ASM_OBJ) $(DRV_OBJ) $(FS_OBJ)
 
 TARGET   = $(BUILD)/ositok.efi
 SO       = $(BUILD)/ositok.so
@@ -94,6 +97,10 @@ $(BUILD)/kernel/%.o: kernel/%.c | $(BUILD)/kernel
 # tensor_avx2.c needs AVX2/FMA flags (overrides pattern rule above)
 $(BUILD)/kernel/tensor_avx2.o: kernel/tensor_avx2.c | $(BUILD)/kernel
 	$(CC) $(AVXFLAGS) -c -o $@ $<
+
+# Assembly files
+$(BUILD)/kernel/%.o: kernel/%.S | $(BUILD)/kernel
+	$(CC) -c -o $@ $<
 
 # Drivers
 $(BUILD)/drivers/%.o: drivers/%.c | $(BUILD)/drivers

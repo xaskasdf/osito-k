@@ -14,6 +14,15 @@
 
 /* ── External functions ──────────────────────────────────────── */
 
+/* IDT + Interrupts */
+extern void idt_init(void);
+extern uint64_t idt_get_ticks(void);
+
+/* Paging */
+extern void paging_init(void);
+extern uint64_t paging_get_kernel_cr3(void);
+extern int paging_map_mmio(uint64_t phys, uint64_t size);
+
 /* Serial */
 extern void serial_puts(const char *s);
 extern void serial_puthex(uint64_t val, int digits);
@@ -211,6 +220,12 @@ void kernel_entry(void *memory_map, uint64_t map_size,
     serial_puts("[KERN] Initializing memory manager...\n");
     fb_puts(" Initializing memory...\n");
     mem_init(memory_map, map_size, desc_size);
+
+    /* ── Step 1.5: IDT + Exceptions + APIC timer ── */
+    idt_init();
+
+    /* ── Step 1.6: Kernel page tables ── */
+    paging_init();
 
     /* ── Tensor compute self-test ── */
     tensor_benchmark();
