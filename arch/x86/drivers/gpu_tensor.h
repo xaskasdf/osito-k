@@ -62,6 +62,46 @@ int gpu_tensor_download(uint64_t vram_addr, void *data, uint32_t size);
 /* Vector addition: dst[i] = a[i] + b[i] (max 256 elements, 1-block) */
 int gpu_vec_add(uint64_t dst_vram, uint64_t a_vram, uint64_t b_vram, uint32_t n);
 
+/* ── X42: Compiled PTX kernel dispatch (CB0 parameter passing) ── */
+
+/* CB0 layout: blockDim at 0x00, user params at 0x160 */
+#define CB0_PARAM_OFFSET   0x160
+#define CB0_TOTAL_SIZE     0x200   /* 512 bytes */
+
+/* Helper: dispatch a compiled kernel with CB0 parameters */
+int gpu_dispatch_kernel(const char *name, uint32_t grid_x, uint32_t grid_y,
+                        uint32_t block_x, uint32_t block_y,
+                        const void *params, uint32_t params_size,
+                        uint32_t shared_mem);
+
+/* vec_add_ptx: out[i] = a[i] + b[i], multi-block */
+int gpu_vec_add_ptx(uint64_t out_vram, uint64_t a_vram, uint64_t b_vram, uint32_t n);
+
+/* vec_mul: out[i] = a[i] * b[i], multi-block */
+int gpu_vec_mul_ptx(uint64_t out_vram, uint64_t a_vram, uint64_t b_vram, uint32_t n);
+
+/* add_inplace: a[i] += b[i], multi-block */
+int gpu_add_inplace_ptx(uint64_t a_vram, uint64_t b_vram, uint32_t n);
+
+/* silu_mul: out[i] = SiLU(gate[i]) * up[i], multi-block */
+int gpu_silu_mul_ptx(uint64_t out_vram, uint64_t gate_vram, uint64_t up_vram, uint32_t n);
+
+/* rmsnorm: out[i] = (x[i] / rms(x)) * weight[i], 1 block per row */
+int gpu_rmsnorm_ptx(uint64_t out_vram, uint64_t x_vram, uint64_t w_vram,
+                    uint32_t hidden_size, float eps);
+
+/* softmax: in-place softmax over cols, 1 block per row */
+int gpu_softmax_ptx(uint64_t out_vram, uint64_t in_vram, uint32_t cols, uint32_t rows);
+
+/* rope: Llama-style rotary position embedding */
+int gpu_rope_ptx(uint64_t q_vram, uint64_t k_vram, uint32_t pos,
+                 uint32_t n_heads, uint32_t n_kv_heads, uint32_t head_dim,
+                 float theta_base);
+
+/* gemv_q4_0: y = W * x for Q4_0 quantized weights */
+int gpu_gemv_q4_0_ptx(uint64_t y_vram, uint64_t w_vram, uint64_t x_vram,
+                      uint32_t out_features, uint32_t in_features);
+
 /* ── Self-Test ──────────────────────────────────────────── */
 
 /* Run GPU tensor self-test (store_pattern + vec_add if available) */

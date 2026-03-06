@@ -243,6 +243,233 @@ int gpu_vec_add(uint64_t dst_vram, uint64_t a_vram, uint64_t b_vram, uint32_t n)
     return gsp_compute_wait(sem_phys, 0xADD0ADD0, 1000);
 }
 
+/* ── X42: Compiled PTX Kernel Dispatch (CB0 parameter passing) ── */
+
+/*
+ * CB0 (Constant Buffer 0) layout for compiled PTX kernels:
+ *   c[0x0][0x00] = blockDim.x  (uint32_t)
+ *   c[0x0][0x04] = blockDim.y  (uint32_t)
+ *   c[0x0][0x08] = blockDim.z  (uint32_t)
+ *   ...
+ *   c[0x0][0x160..] = user .param parameters (kernel-specific)
+ *
+ * ptxas SM75 places .param arguments at EIATTR_PARAM_CBANK offset 0x160.
+ * The compiled SASS reads params via LDC instructions from c[0x0][0x160+off].
+ */
+
+/* Build CB0 in a local buffer, upload to VRAM, dispatch kernel */
+int gpu_dispatch_kernel(const char *name, uint32_t grid_x, uint32_t grid_y,
+                        uint32_t block_x, uint32_t block_y,
+                        const void *params, uint32_t params_size,
+                        uint32_t shared_mem)
+{
+    sass_kernel_t *k = sass_get_kernel(name);
+    if (!k || !k->uploaded) {
+        serial_puts("[GPU_TENSOR] dispatch: kernel '");
+        serial_puts(name);
+        serial_puts("' not found/uploaded\n");
+        return -1;
+    }
+
+    if (params_size > CB0_TOTAL_SIZE - CB0_PARAM_OFFSET) {
+        serial_puts("[GPU_TENSOR] dispatch: params too large\n");
+        return -1;
+    }
+
+    /* Allocate CB0 in VRAM (within GMMU identity-mapped region) */
+    uint64_t cb0_vram = gpu_tensor_alloc(CB0_TOTAL_SIZE);
+    if (!cb0_vram) {
+        serial_puts("[GPU_TENSOR] dispatch: CB0 VRAM alloc failed\n");
+        return -1;
+    }
+
+    /* Build CB0 buffer in host RAM */
+    uint8_t cb0[CB0_TOTAL_SIZE];
+    memset(cb0, 0, CB0_TOTAL_SIZE);
+
+    /* blockDim at offset 0x00 */
+    uint32_t *cb0_u32 = (uint32_t *)cb0;
+    cb0_u32[0] = block_x;    /* c[0x0][0x00] = blockDim.x */
+    cb0_u32[1] = block_y;    /* c[0x0][0x04] = blockDim.y */
+    cb0_u32[2] = 1;          /* c[0x0][0x08] = blockDim.z */
+
+    /* User params at offset 0x160 */
+    if (params && params_size > 0)
+        memcpy(cb0 + CB0_PARAM_OFFSET, params, params_size);
+
+    /* Upload CB0 to VRAM */
+    if (gpu_tensor_upload(cb0_vram, cb0, CB0_TOTAL_SIZE) < 0) {
+        serial_puts("[GPU_TENSOR] dispatch: CB0 upload failed\n");
+        return -1;
+    }
+
+    /* Allocate semaphore for completion */
+    uint32_t *sem = (uint32_t *)mem_alloc_aligned(4096, 4096);
+    if (!sem) return -1;
+    *sem = 0;
+    wmb();
+    uint64_t sem_phys = (uint64_t)(uintptr_t)sem;
+
+    /* Build dispatch descriptor */
+    compute_dispatch_t desc;
+    memset(&desc, 0, sizeof(desc));
+    desc.program_addr   = k->vram_addr;
+    desc.grid_x         = grid_x;
+    desc.grid_y         = grid_y;
+    desc.grid_z         = 1;
+    desc.block_x        = block_x;
+    desc.block_y        = block_y;
+    desc.block_z        = 1;
+    desc.register_count = k->register_count;
+    desc.shared_mem_size = shared_mem;
+    desc.barrier_count  = k->barrier_count;
+    desc.sem_addr       = sem_phys;
+    desc.sem_payload    = 0xD15A7C40 + (uint32_t)(uintptr_t)name;
+    desc.cbuf_addr      = cb0_vram;  /* GPU VA = VRAM phys (identity mapped) */
+    desc.cbuf_size      = CB0_TOTAL_SIZE;
+
+    serial_puts("[GPU_TENSOR] dispatch '");
+    serial_puts(name);
+    serial_puts("' grid=");
+    serial_putdec(grid_x); serial_puts("x"); serial_putdec(grid_y);
+    serial_puts(" block=");
+    serial_putdec(block_x); serial_puts("x"); serial_putdec(block_y);
+    serial_puts(" CB0=0x");
+    serial_puthex(cb0_vram, 8);
+    serial_puts("\n");
+
+    int ret = gsp_compute_dispatch(&desc);
+    if (ret < 0) return -1;
+
+    return gsp_compute_wait(sem_phys, desc.sem_payload, 1000);
+}
+
+/* ── Per-kernel dispatch wrappers ─────────────────────────── */
+
+int gpu_vec_add_ptx(uint64_t out_vram, uint64_t a_vram, uint64_t b_vram, uint32_t n)
+{
+    if (n == 0) return -1;
+    /* CB0 params layout (matches elementwise.ptx .param order):
+     *   0x160: .u64 out
+     *   0x168: .u64 a
+     *   0x170: .u64 b
+     *   0x178: .u32 n
+     */
+    struct { uint64_t out; uint64_t a; uint64_t b; uint32_t n; } params = {
+        out_vram, a_vram, b_vram, n
+    };
+    uint32_t threads = 256;
+    uint32_t blocks = (n + threads - 1) / threads;
+    return gpu_dispatch_kernel("vec_add", blocks, 1, threads, 1,
+                               &params, sizeof(params), 0);
+}
+
+int gpu_vec_mul_ptx(uint64_t out_vram, uint64_t a_vram, uint64_t b_vram, uint32_t n)
+{
+    if (n == 0) return -1;
+    struct { uint64_t out; uint64_t a; uint64_t b; uint32_t n; } params = {
+        out_vram, a_vram, b_vram, n
+    };
+    uint32_t threads = 256;
+    uint32_t blocks = (n + threads - 1) / threads;
+    return gpu_dispatch_kernel("vec_mul", blocks, 1, threads, 1,
+                               &params, sizeof(params), 0);
+}
+
+int gpu_add_inplace_ptx(uint64_t a_vram, uint64_t b_vram, uint32_t n)
+{
+    if (n == 0) return -1;
+    /* add_inplace params: .u64 a, .u64 b, .u32 n */
+    struct { uint64_t a; uint64_t b; uint32_t n; } params = {
+        a_vram, b_vram, n
+    };
+    uint32_t threads = 256;
+    uint32_t blocks = (n + threads - 1) / threads;
+    return gpu_dispatch_kernel("add_inplace", blocks, 1, threads, 1,
+                               &params, sizeof(params), 0);
+}
+
+int gpu_silu_mul_ptx(uint64_t out_vram, uint64_t gate_vram, uint64_t up_vram, uint32_t n)
+{
+    if (n == 0) return -1;
+    /* silu_mul params: .u64 out, .u64 gate, .u64 up, .u32 n */
+    struct { uint64_t out; uint64_t gate; uint64_t up; uint32_t n; } params = {
+        out_vram, gate_vram, up_vram, n
+    };
+    uint32_t threads = 256;
+    uint32_t blocks = (n + threads - 1) / threads;
+    return gpu_dispatch_kernel("silu_mul", blocks, 1, threads, 1,
+                               &params, sizeof(params), 0);
+}
+
+int gpu_rmsnorm_ptx(uint64_t out_vram, uint64_t x_vram, uint64_t w_vram,
+                    uint32_t hidden_size, float eps)
+{
+    if (hidden_size == 0) return -1;
+    /* rmsnorm params: .u64 out, .u64 x, .u64 w, .u32 n, .f32 eps */
+    struct { uint64_t out; uint64_t x; uint64_t w; uint32_t n; float eps; } params = {
+        out_vram, x_vram, w_vram, hidden_size, eps
+    };
+    /* 1 block, threads = min(hidden_size, 256) */
+    uint32_t threads = hidden_size < 256 ? hidden_size : 256;
+    return gpu_dispatch_kernel("rmsnorm", 1, 1, threads, 1,
+                               &params, sizeof(params),
+                               threads * 4);  /* shared mem for reduction */
+}
+
+int gpu_softmax_ptx(uint64_t out_vram, uint64_t in_vram, uint32_t cols, uint32_t rows)
+{
+    if (cols == 0 || rows == 0) return -1;
+    /* softmax params: .u64 out, .u64 in, .u32 cols, .u32 rows */
+    struct { uint64_t out; uint64_t in; uint32_t cols; uint32_t rows; } params = {
+        out_vram, in_vram, cols, rows
+    };
+    /* 1 block per row, threads = min(cols, 256) */
+    uint32_t threads = cols < 256 ? cols : 256;
+    return gpu_dispatch_kernel("softmax", rows, 1, threads, 1,
+                               &params, sizeof(params),
+                               threads * 4);  /* shared mem for reductions */
+}
+
+int gpu_rope_ptx(uint64_t q_vram, uint64_t k_vram, uint32_t pos,
+                 uint32_t n_heads, uint32_t n_kv_heads, uint32_t head_dim,
+                 float theta_base)
+{
+    if (head_dim == 0) return -1;
+    /* rope params: .u64 q, .u64 k, .u32 pos, .u32 n_heads, .u32 n_kv_heads,
+     *              .u32 head_dim, .f32 theta_base */
+    struct {
+        uint64_t q; uint64_t k;
+        uint32_t pos; uint32_t n_heads; uint32_t n_kv_heads;
+        uint32_t head_dim; float theta_base;
+    } params = {
+        q_vram, k_vram, pos, n_heads, n_kv_heads, head_dim, theta_base
+    };
+    /* Each thread handles one dim pair. Total pairs = n_heads * head_dim/2 */
+    uint32_t total_pairs = n_heads * (head_dim / 2);
+    uint32_t threads = 256;
+    uint32_t blocks = (total_pairs + threads - 1) / threads;
+    return gpu_dispatch_kernel("rope", blocks, 1, threads, 1,
+                               &params, sizeof(params), 0);
+}
+
+int gpu_gemv_q4_0_ptx(uint64_t y_vram, uint64_t w_vram, uint64_t x_vram,
+                      uint32_t out_features, uint32_t in_features)
+{
+    if (out_features == 0 || in_features == 0) return -1;
+    /* gemv_q4_0 params: .u64 y, .u64 w, .u64 x, .u32 out_features, .u32 in_features */
+    struct {
+        uint64_t y; uint64_t w; uint64_t x;
+        uint32_t out_features; uint32_t in_features;
+    } params = {
+        y_vram, w_vram, x_vram, out_features, in_features
+    };
+    /* 1 block per output row, 256 threads per block for warp reduction */
+    return gpu_dispatch_kernel("gemv_q4_0", out_features, 1, 256, 1,
+                               &params, sizeof(params),
+                               256 * 4);  /* shared mem for reduction */
+}
+
 /* ── Self-Test ───────────────────────────────────────────── */
 
 int gpu_tensor_test(void)

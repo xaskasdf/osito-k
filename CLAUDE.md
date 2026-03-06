@@ -293,6 +293,7 @@ Tasks:   idle, input, shell (3 of 8 slots used)
 | **X39** | **GPU tensor ops** (store_pattern STG test, vec_add_f32 kernel, VRAM buffer mgmt, dispatch layer, PTX docs) | Done |
 | **X40** | **GPU-accelerated inference** (hybrid GPU/CPU forward pass, kernel dispatch table, VRAM scratch, benchmark) | Done |
 | **X41** | **PTX kernel compilation pipeline** (ntransformer CUDA→PTX translation, ptxas build, cubin ELF extract, C array embed) | Done |
+| **X42** | **Compiled kernel dispatch** (CB0 parameter passing, gpu_dispatch_kernel helper, per-kernel wrappers for all 8 PTX kernels) | Done |
 
 > Full GPU roadmap (X27-X40 + contingency): see [docs/x86-gpu-roadmap.md](docs/x86-gpu-roadmap.md)
 
@@ -608,6 +609,14 @@ Complete PTX translations of ntransformer's critical CUDA kernels + build toolin
 - **Output**: `arch/x86/kernels/generated/*.h` — checked into git so bare-metal build doesn't need CUDA tools.
 - **Integration path**: Generated headers included in `sass.c`, registered in `sass_init()`, uploaded to VRAM via existing PRAMIN infrastructure.
 - **Purpose**: Eliminates hand-encoding SASS. ntransformer CUDA kernels are the reference — these PTX translations preserve the exact algorithms (warp reductions, shared memory tiling, Q4_0 dequant) that deliver 48.9 tok/s on 8B models.
+
+### X42: Compiled Kernel Dispatch (CB0 Parameter Passing)
+Dispatch wrappers that correctly pass kernel parameters via Constant Buffer 0 (CB0) to compiled SASS kernels.
+- **CB0 ABI**: ptxas SM75 places `.param` arguments at `c[0x0][0x160]`. Lower offsets contain driver data: `c[0x0][0x00]`=blockDim.x, `c[0x0][0x04]`=blockDim.y, `c[0x0][0x08]`=blockDim.z. Total CB0 size = 512 bytes.
+- **gpu_dispatch_kernel()**: Generic dispatch helper — looks up SASS kernel by name, allocates CB0 in VRAM (within GMMU identity-mapped region), fills blockDim at offset 0x00 and user params at offset 0x160, uploads via PRAMIN, builds `compute_dispatch_t` with CB0 address, dispatches via QMD + SEND_PCAS, waits on semaphore.
+- **Per-kernel wrappers**: `gpu_vec_add_ptx`, `gpu_vec_mul_ptx`, `gpu_add_inplace_ptx`, `gpu_silu_mul_ptx` (256 threads/block, multi-block), `gpu_rmsnorm_ptx` (1 block, shared mem reduction), `gpu_softmax_ptx` (1 block/row, shared mem), `gpu_rope_ptx` (thread per dim pair), `gpu_gemv_q4_0_ptx` (1 block/row, 256 threads, warp reduction).
+- **VRAM layout**: CB0 allocated from tensor buffer region (260MB+) within GMMU 8MB identity map (256-264MB). GPU VA = VRAM physical address.
+- **QMD integration**: `compute_dispatch_t.cbuf_addr/cbuf_size` → QMD DW20 bit 0 (CB0_VALID) + DW32-33 (CB0 addr + size).
 
 ### AArch64/SM8350 Port (arch/arm/)
 Reference bare-metal code for ASUS ROG Phone 5 (Snapdragon 888).

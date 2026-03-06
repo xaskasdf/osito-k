@@ -1,6 +1,6 @@
 # OsitoK x86-64 — GPU Compute Roadmap
 
-> Status: X1–X41 + X-CPU1 done. Phase A + B + C + D (partial) complete.
+> Status: X1–X42 + X-CPU1 done. Phase A + B + C + D (partial) complete.
 > Last updated: 2026-03-06
 
 ## Current State
@@ -125,12 +125,14 @@ Port inference pipeline to GPU compute. Requires Phase B.
 | **X39** | **GPU tensor ops** — store_pattern + vec_add_f32 SASS kernels, VRAM buffer mgmt, dispatch layer, PTX docs | ~600 | Done |
 | **X40** | **GPU-accelerated Llama inference** — hybrid GPU/CPU forward pass, kernel dispatch table, VRAM scratch, benchmark | ~450 | Done |
 | **X41** | **PTX kernel compilation pipeline** — ntransformer CUDA→PTX translation, ptxas build, cubin ELF→C array | ~800 | Done |
+| **X42** | **Compiled kernel dispatch** — CB0 parameter passing, gpu_dispatch_kernel helper, per-kernel wrappers | ~250 | Done |
 
 ### SASS Kernel Strategy
 
-Two-stage approach:
+Three-stage approach:
 1. **Hand-encoded SASS** (X37-X39): Simple kernels (NOP, S2R, store_pattern, vec_add_f32) for infrastructure validation
 2. **PTX compilation** (X41): Complex kernels translated from ntransformer CUDA → PTX → ptxas → cubin → C array
+3. **CB0 dispatch** (X42): Correct parameter passing via Constant Buffer 0 (params at c[0x0][0x160], blockDim at c[0x0][0x0])
 
 PTX kernels translated from ntransformer (all 5 critical inference kernels):
 - `gemv_q4_0.ptx` — Q4_0 dequant + dot product (shared memory tiling, warp reduction) — 90% of compute
