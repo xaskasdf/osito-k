@@ -465,7 +465,7 @@ void kernel_entry(void *memory_map, uint64_t map_size,
         fb_puts("\n NIC: not detected\n");
     }
 
-    /* HTTP available via shell 'curl' command */
+    /* HTTP + Claude API available via shell commands (curl, apikey, ask) */
 
     /* ── Step 5: Keyboard + Terminal + Shell ── */
     kb_init();

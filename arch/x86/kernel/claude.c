@@ -230,9 +230,9 @@ static int sse_body_cb(const void *data, uint32_t len, void *ctx)
                 int type_len = 0;
                 const char *type = json_find_str(json, "type", &type_len);
 
-                if (type && type_len == 20 &&
+                if (type && type_len == 19 &&
                     type[0] == 'c' && type[8] == 'b' &&
-                    type[14] == 'd' && type[19] == 'a') {
+                    type[14] == 'd' && type[18] == 'a') {
                     /* "content_block_delta" — extract the text from
                      * delta.text (skip the "type":"text_delta" match) */
                     int text_len = 0;

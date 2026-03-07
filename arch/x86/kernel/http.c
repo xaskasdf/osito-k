@@ -204,7 +204,7 @@ int http_request(http_session_t *s, const char *method, const char *path,
 
     while (hdr_len < (int)sizeof(hdr) - 1) {
         int n = tls_recv(&s->tls, hdr + hdr_len,
-                         (uint32_t)(sizeof(hdr) - 1 - (uint32_t)hdr_len), 1000);
+                         (uint32_t)(sizeof(hdr) - 1 - (uint32_t)hdr_len), 5000);
         if (n <= 0) {
             serial_puts("[HTTP] Timeout reading headers\n");
             return -1;
