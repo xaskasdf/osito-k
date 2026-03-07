@@ -260,7 +260,10 @@ int proc_exec(const char *filename, int argc, const char **argv)
 
     /* Save kernel context so proc_exit() can longjmp back here */
     if (kern_setjmp(exec_jmpbuf) != 0) {
-        /* Returned from proc_exit via longjmp */
+        /* Returned from proc_exit via longjmp.
+         * SYSCALL disables interrupts (FMASK clears IF) and the longjmp
+         * bypasses SYSRET which would re-enable them. Re-enable now. */
+        __asm__ volatile ("sti");
         int code = last_exit_code;
         current_proc = prev;
         proc_free(p);

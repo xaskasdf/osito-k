@@ -160,7 +160,9 @@ arch/x86/kernel/process.c           Process table, exec/exit/waitpid, setjmp/lon
 arch/x86/kernel/setjmp.S            kern_setjmp/longjmp (RBX,RBP,R12-R15,RSP,RIP)
 arch/x86/kernel/keyboard.c          PS/2 keyboard (scancode set 1, IRQ 1, ring buffer)
 arch/x86/kernel/terminal.c          Line editor (readline, backspace, history, Ctrl shortcuts)
-arch/x86/kernel/shell.c             Interactive shell (12 builtins, argv parser, ELF exec)
+arch/x86/kernel/net.c               Network stack (ARP, IPv4, UDP, ICMP, TCP client)
+arch/x86/kernel/net.h               Network types + API (eth/arp/ip/udp/tcp structs)
+arch/x86/kernel/shell.c             Interactive shell (15 builtins, argv parser, ELF exec)
 arch/x86/include/types.h            Freestanding types + MMIO + port I/O
 arch/x86/libc/crt.c                 Minimal CRT (_start, printf, malloc, POSIX I/O wrappers)
 arch/x86/libc/syscall.S             Raw SYSCALL instruction wrappers (__syscall1-4)
@@ -335,6 +337,7 @@ Tasks:   idle, input, shell (3 of 8 slots used)
 | **X-OS12** | **Minimal CRT** (crt.c: _start, printf, malloc, open/close/read/write/lseek, strlen/memset/memcpy; syscall.S: raw SYSCALL wrappers) | Done |
 | **X-OS13** | **TCC in-OS compilation** (TCC 0.9.28rc runs inside OsitoK, compiles .c → .o, extended libc: FILE*, fprintf, strtol, qsort, setjmp) | Done |
 | **X-NET1** | **ICMP** (echo request/reply, ping command in shell, IP checksum verification) | Done |
+| **X-NET2** | **TCP stack** (client-only, 3-way handshake, send/recv, FIN close, tcptest shell command) | Done |
 
 > Full GPU roadmap (X27-X40 + contingency): see [docs/x86-gpu-roadmap.md](docs/x86-gpu-roadmap.md)
 > Full OS roadmap (Tier 0-5): see [docs/os-selfhost-roadmap.md](docs/os-selfhost-roadmap.md)
@@ -586,7 +589,7 @@ Scancode set 1 translation with modifier tracking and ring buffer.
 ### X-OS9: Mini Shell
 Interactive command shell with builtins and argument parsing.
 - **Parsing**: Whitespace-delimited argv splitting, max 16 args.
-- **Builtins**: `help`, `uname`, `ps`, `mem`, `uptime`, `echo`, `ls`, `cat`, `exec`, `cc`/`tcc`, `clear`, `reboot`, `halt`.
+- **Builtins**: `help`, `uname`, `ps`, `mem`, `uptime`, `echo`, `ls`, `cat`, `exec`, `cc`/`tcc`, `ping`, `tcptest`, `clear`, `reboot`, `halt`.
 - **exec**: Runs ELF binary from OsitoFS via `proc_exec()`. Process exit returns to shell.
 - **cc/tcc**: Compile C with TCC. `cc file.c` produces file.elf, `cc -run file.c` compiles+executes.
 - **cat**: Reads file from OsitoFS, displays as text (non-printable → '.'), max 4KB preview.
@@ -655,6 +658,21 @@ TCC 0.9.28rc compiled as a static ELF64 binary running inside OsitoK. Can read C
 - **Files**: `arch/x86/libc/tcclib.c`, `arch/x86/libc/syscall.S` (extended), `arch/x86/libc/Makefile` (extended)
 
 **Tier 3 milestone**: TCC compiler runs inside OsitoK, reads C source from OsitoFS, and writes compiled object files back to disk.
+
+### X-NET2: TCP Stack (Client-Only)
+Minimal TCP implementation for outgoing connections. No listen/accept, no retransmission, polling-based.
+- **3-way handshake**: SYN → SYN-ACK → ACK. Blocking `net_tcp_connect()` with 5s timeout.
+- **TCP checksum**: Pseudo-header (src/dst IP, proto, length) + segment. IP words read as native 16-bit for endianness consistency.
+- **State machine**: CLOSED → SYN_SENT → ESTABLISHED → FIN_WAIT_1 → FIN_WAIT_2 → TIME_WAIT → CLOSED. Also CLOSE_WAIT → LAST_ACK for remote-initiated close.
+- **Send**: `net_tcp_send()` chunks data at MSS=1460 bytes, PSH+ACK flags.
+- **Receive**: `net_tcp_recv()` (non-blocking) and `net_tcp_recv_timeout()` (blocking). Data buffered in 8KB rx_buf per connection, shifted on read.
+- **Close**: `net_tcp_close()` sends FIN+ACK, waits for FIN response (3s timeout). TIME_WAIT skipped (no 2MSL needed in bare-metal).
+- **Connection table**: 4 static `tcp_conn_t` slots. Per-connection: state, IPs, ports, sequence numbers, rx buffer.
+- **ISN**: Simple counter (0x12345678 + 64000 per connection). Not cryptographically random.
+- **Shell command**: `tcptest [ip] [port]` — connects, sends HTTP GET, displays response.
+- **Bug fix**: `proc_exit` via longjmp bypasses SYSRET which would re-enable interrupts. Added `sti` after longjmp return in `proc_exec`. Without this, HLT hangs forever after any ELF execution.
+- **Verified**: Full HTTP GET/response through QEMU SLIRP guestfwd. All checksums correct (tcpdump verified).
+- **Files**: `arch/x86/kernel/net.c` (TCP implementation), `arch/x86/kernel/net.h` (types + API), `arch/x86/kernel/shell.c` (tcptest command), `arch/x86/kernel/process.c` (STI fix)
 
 ### X27: Falcon PIO Load
 Programmed I/O access to Falcon IMEM/DMEM via IMEMC/IMEMD registers.

@@ -51,6 +51,14 @@ extern void  kfree(void *ptr);
 
 /* Network */
 extern void net_poll(void);
+extern void     net_icmp_send_echo(const uint8_t dst_ip[4], uint16_t seq);
+extern uint32_t net_icmp_get_rx_count(void);
+extern int  net_tcp_connect(const uint8_t dst_ip[4], uint16_t dst_port, uint16_t src_port);
+extern int  net_tcp_send(int conn, const void *data, uint32_t len);
+extern int  net_tcp_recv(int conn, void *buf, uint32_t buf_size);
+extern int  net_tcp_recv_timeout(int conn, void *buf, uint32_t buf_size, uint32_t timeout_ticks);
+extern void net_tcp_close(int conn);
+extern int  net_tcp_state(int conn);
 
 /* ── Shell output helpers ────────────────────────────────────── */
 
@@ -112,6 +120,7 @@ static void cmd_help(void)
     sh_puts("  exec      Run an ELF binary\n");
     sh_puts("  cc        Compile C with TCC (cc file.c [-run])\n");
     sh_puts("  ping      Ping an IP address\n");
+    sh_puts("  tcptest   TCP connection test (tcptest [ip] [port])\n");
     sh_puts("  clear     Clear screen\n");
     sh_puts("  reboot    Reboot system\n");
     sh_puts("  halt      Halt CPU\n");
@@ -374,9 +383,6 @@ static void cmd_cc(int argc, char *argv[])
 
 /* ── Builtin: ping ──────────────────────────────────────────── */
 
-extern void net_icmp_send_echo(const uint8_t dst_ip[4], uint16_t seq);
-extern uint32_t net_icmp_get_rx_count(void);
-
 static int parse_ip(const char *s, uint8_t ip[4])
 {
     int i = 0, val = 0;
@@ -454,6 +460,84 @@ static void cmd_ping(int argc, char *argv[])
     sh_puts(" received ---\n");
 }
 
+/* ── Builtin: tcptest ─────────────────────────────────────────── */
+
+static void cmd_tcptest(int argc, char *argv[])
+{
+    /* Default: connect to QEMU SLIRP host gateway HTTP (10.0.2.2:80) */
+    uint8_t dst[4] = {10, 0, 2, 2};
+    uint16_t port = 80;
+
+    if (argc >= 2) {
+        if (parse_ip(argv[1], dst) < 0) {
+            sh_puts("Invalid IP: ");
+            sh_puts(argv[1]);
+            sh_puts("\n");
+            return;
+        }
+    }
+    if (argc >= 3) {
+        port = 0;
+        for (const char *p = argv[2]; *p >= '0' && *p <= '9'; p++)
+            port = port * 10 + (*p - '0');
+    }
+
+    sh_puts("TCP connect ");
+    sh_putdec(dst[0]); sh_puts(".");
+    sh_putdec(dst[1]); sh_puts(".");
+    sh_putdec(dst[2]); sh_puts(".");
+    sh_putdec(dst[3]); sh_puts(":");
+    sh_putdec(port); sh_puts("...\n");
+
+    int conn = net_tcp_connect(dst, port, 49152);
+    if (conn < 0) {
+        sh_puts("  Connection failed!\n");
+        return;
+    }
+
+    sh_puts("  Connected! Sending HTTP GET...\n");
+
+    const char *req = "GET / HTTP/1.0\r\nHost: 10.0.2.2\r\n\r\n";
+    uint32_t req_len = 0;
+    for (const char *p = req; *p; p++) req_len++;
+
+    int sent = net_tcp_send(conn, req, req_len);
+    sh_puts("  Sent ");
+    sh_putdec(sent);
+    sh_puts(" bytes\n");
+
+    /* Read response */
+    char buf[512];
+    int total = 0;
+    sh_puts("  Response:\n");
+
+    for (;;) {
+        int n = net_tcp_recv_timeout(conn, buf, sizeof(buf) - 1, 300);
+        if (n <= 0) break;
+        buf[n] = '\0';
+        /* Print first 400 chars of response */
+        if (total < 400) {
+            int show = n;
+            if (total + show > 400)
+                show = 400 - total;
+            for (int i = 0; i < show; i++) {
+                char c = buf[i];
+                if (c == '\r') continue;
+                char s[2] = {c, 0};
+                sh_puts(s);
+            }
+        }
+        total += n;
+    }
+
+    sh_puts("\n  Total received: ");
+    sh_putdec(total);
+    sh_puts(" bytes\n");
+
+    net_tcp_close(conn);
+    sh_puts("  Connection closed.\n");
+}
+
 /* ── Builtin: reboot ─────────────────────────────────────────── */
 
 static void cmd_reboot(void)
@@ -521,6 +605,8 @@ static void shell_exec(char *line)
         cmd_cc(argc, argv);
     } else if (strcmp(cmd, "ping") == 0) {
         cmd_ping(argc, argv);
+    } else if (strcmp(cmd, "tcptest") == 0) {
+        cmd_tcptest(argc, argv);
     } else if (strcmp(cmd, "clear") == 0) {
         cmd_clear();
     } else if (strcmp(cmd, "reboot") == 0) {

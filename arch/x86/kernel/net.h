@@ -68,6 +68,55 @@ typedef struct __attribute__((packed)) {
     uint16_t checksum;
 } udp_hdr_t;
 
+/* ── TCP ─────────────────────────────────────────────────────── */
+
+typedef struct __attribute__((packed)) {
+    uint16_t src_port;
+    uint16_t dst_port;
+    uint32_t seq;
+    uint32_t ack;
+    uint8_t  data_off;          /* upper 4 bits = header len / 4 */
+    uint8_t  flags;
+    uint16_t window;
+    uint16_t checksum;
+    uint16_t urgent;
+} tcp_hdr_t;
+
+#define TCP_FIN  0x01
+#define TCP_SYN  0x02
+#define TCP_RST  0x04
+#define TCP_PSH  0x08
+#define TCP_ACK  0x10
+
+/* TCP connection states */
+#define TCP_CLOSED      0
+#define TCP_SYN_SENT    1
+#define TCP_ESTABLISHED 2
+#define TCP_FIN_WAIT_1  3
+#define TCP_FIN_WAIT_2  4
+#define TCP_CLOSE_WAIT  5
+#define TCP_LAST_ACK    6
+#define TCP_TIME_WAIT   7
+
+#define TCP_RX_BUF_SIZE 8192
+#define TCP_MAX_CONNS   4
+
+typedef struct {
+    int       state;
+    uint8_t   remote_ip[4];
+    uint16_t  local_port;
+    uint16_t  remote_port;
+
+    uint32_t  snd_nxt;      /* next seq to send */
+    uint32_t  snd_una;      /* oldest unacked seq */
+    uint32_t  rcv_nxt;      /* next expected seq from remote */
+
+    uint8_t   rx_buf[TCP_RX_BUF_SIZE];
+    uint32_t  rx_len;       /* bytes available in rx_buf */
+
+    uint64_t  last_activity;  /* tick of last packet */
+} tcp_conn_t;
+
 /* ── Network API ─────────────────────────────────────────────── */
 
 /* UDP receive callback */
@@ -86,5 +135,35 @@ int  net_udp_send(const uint8_t dst_ip[4], uint16_t dst_port,
 
 /* Register UDP listener on a port */
 void net_udp_listen(uint16_t port, udp_handler_t handler);
+
+/* ICMP */
+void     net_icmp_send_echo(const uint8_t dst_ip[4], uint16_t seq);
+uint32_t net_icmp_get_rx_count(void);
+
+/* ── TCP API (client-only) ───────────────────────────────────── */
+
+/* Connect to remote host. Blocks until handshake completes or timeout.
+ * Returns connection index (0..TCP_MAX_CONNS-1) or -1 on failure. */
+int  net_tcp_connect(const uint8_t dst_ip[4], uint16_t dst_port,
+                     uint16_t src_port);
+
+/* Send data on established connection. Blocks until sent or timeout.
+ * Returns bytes sent, or -1 on error. */
+int  net_tcp_send(int conn, const void *data, uint32_t len);
+
+/* Receive data from connection. Non-blocking — returns bytes copied
+ * to buf, or 0 if nothing available, or -1 if connection closed. */
+int  net_tcp_recv(int conn, void *buf, uint32_t buf_size);
+
+/* Receive data with timeout (in ticks). Blocks until data arrives
+ * or timeout. Returns bytes read, 0 on timeout, -1 on closed. */
+int  net_tcp_recv_timeout(int conn, void *buf, uint32_t buf_size,
+                          uint32_t timeout_ticks);
+
+/* Close TCP connection gracefully. Blocks for FIN handshake. */
+void net_tcp_close(int conn);
+
+/* Get TCP connection state */
+int  net_tcp_state(int conn);
 
 #endif /* OSITOK_NET_H */
