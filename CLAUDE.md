@@ -338,6 +338,7 @@ Tasks:   idle, input, shell (3 of 8 slots used)
 | **X-OS13** | **TCC in-OS compilation** (TCC 0.9.28rc runs inside OsitoK, compiles .c → .o, extended libc: FILE*, fprintf, strtol, qsort, setjmp) | Done |
 | **X-NET1** | **ICMP** (echo request/reply, ping command in shell, IP checksum verification) | Done |
 | **X-NET2** | **TCP stack** (client-only, 3-way handshake, send/recv, FIN close, tcptest shell command) | Done |
+| **X-NET3** | **DNS resolver** (UDP query to SLIRP DNS, A record parse, resolve shell command) | Done |
 
 > Full GPU roadmap (X27-X40 + contingency): see [docs/x86-gpu-roadmap.md](docs/x86-gpu-roadmap.md)
 > Full OS roadmap (Tier 0-5): see [docs/os-selfhost-roadmap.md](docs/os-selfhost-roadmap.md)
@@ -673,6 +674,18 @@ Minimal TCP implementation for outgoing connections. No listen/accept, no retran
 - **Bug fix**: `proc_exit` via longjmp bypasses SYSRET which would re-enable interrupts. Added `sti` after longjmp return in `proc_exec`. Without this, HLT hangs forever after any ELF execution.
 - **Verified**: Full HTTP GET/response through QEMU SLIRP guestfwd. All checksums correct (tcpdump verified).
 - **Files**: `arch/x86/kernel/net.c` (TCP implementation), `arch/x86/kernel/net.h` (types + API), `arch/x86/kernel/shell.c` (tcptest command), `arch/x86/kernel/process.c` (STI fix)
+
+### X-NET3: DNS Resolver
+Minimal DNS client over UDP. Resolves A records (IPv4 addresses) from hostnames.
+- **Query format**: Standard DNS header (12B) + QNAME labels + QTYPE=A + QCLASS=IN. Transaction ID for matching.
+- **Response parse**: Skips question section, iterates answer RRs, finds first TYPE=A (rdlength=4), extracts IPv4.
+- **Name compression**: Handles DNS pointer labels (0xC0 prefix) in both question and answer sections.
+- **ARP retry**: `net_udp_send` returns -1 if ARP not resolved. DNS send retries up to 5 times with poll between attempts.
+- **Default server**: 10.0.2.3 (QEMU SLIRP DNS). Configurable via `net_dns_set_server()`.
+- **Blocking**: Polls for 3s (300 ticks) with HLT between polls.
+- **Shell command**: `resolve <hostname>` — displays resolved IP address.
+- **Verified**: `api.anthropic.com` → `160.79.104.10` via QEMU SLIRP DNS.
+- **Files**: `arch/x86/kernel/net.c` (dns_handler, net_dns_resolve), `arch/x86/kernel/net.h` (API), `arch/x86/kernel/shell.c` (resolve command)
 
 ### X27: Falcon PIO Load
 Programmed I/O access to Falcon IMEM/DMEM via IMEMC/IMEMD registers.

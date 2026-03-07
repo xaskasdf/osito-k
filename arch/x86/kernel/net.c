@@ -1022,6 +1022,172 @@ int net_tcp_state(int conn_idx)
     return tcp_conns[conn_idx].state;
 }
 
+/* ── DNS Resolver ────────────────────────────────────────────── */
+
+static uint8_t dns_server[4] = {10, 0, 2, 3};  /* QEMU SLIRP default */
+static uint8_t dns_result_ip[4];
+static volatile int dns_got_reply = 0;
+static uint16_t dns_query_id = 0x1234;
+
+void net_dns_set_server(const uint8_t ip[4])
+{
+    memcpy(dns_server, ip, 4);
+}
+
+/* DNS response handler (registered as UDP listener on port 53) */
+static void dns_handler(const uint8_t *src_ip, uint16_t src_port,
+                         const void *data, uint32_t len)
+{
+    (void)src_ip;
+    (void)src_port;
+
+    if (len < 12)
+        return;
+
+    const uint8_t *pkt = (const uint8_t *)data;
+
+    /* Check transaction ID matches */
+    uint16_t id = ((uint16_t)pkt[0] << 8) | pkt[1];
+    if (id != dns_query_id)
+        return;
+
+    /* Check QR=1 (response), RCODE=0 (no error) */
+    uint8_t flags1 = pkt[2];
+    uint8_t flags2 = pkt[3];
+    if (!(flags1 & 0x80))      /* Not a response */
+        return;
+    if ((flags2 & 0x0F) != 0)  /* Error code */
+        return;
+
+    uint16_t ancount = ((uint16_t)pkt[6] << 8) | pkt[7];
+    if (ancount == 0)
+        return;
+
+    /* Skip header (12 bytes) + question section */
+    uint32_t off = 12;
+
+    /* Skip QNAME (labels terminated by 0) */
+    while (off < len && pkt[off] != 0) {
+        if ((pkt[off] & 0xC0) == 0xC0) {
+            off += 2;  /* Pointer — 2 bytes */
+            goto past_qname;
+        }
+        off += 1 + pkt[off];  /* Label length + label */
+    }
+    off++;  /* Skip terminal 0 */
+past_qname:
+    off += 4;  /* Skip QTYPE (2) + QCLASS (2) */
+
+    /* Parse answers — find first A record (type 1) */
+    for (uint16_t i = 0; i < ancount && off + 10 < len; i++) {
+        /* Skip NAME (may be pointer or labels) */
+        if ((pkt[off] & 0xC0) == 0xC0) {
+            off += 2;
+        } else {
+            while (off < len && pkt[off] != 0)
+                off += 1 + pkt[off];
+            off++;
+        }
+
+        if (off + 10 > len) break;
+
+        uint16_t rtype  = ((uint16_t)pkt[off] << 8) | pkt[off + 1];
+        /* uint16_t rclass = ((uint16_t)pkt[off+2] << 8) | pkt[off+3]; */
+        /* uint32_t ttl    = ...; */
+        uint16_t rdlen  = ((uint16_t)pkt[off + 8] << 8) | pkt[off + 9];
+        off += 10;
+
+        if (rtype == 1 && rdlen == 4 && off + 4 <= len) {
+            /* A record — IPv4 address */
+            memcpy(dns_result_ip, pkt + off, 4);
+            dns_got_reply = 1;
+            return;
+        }
+
+        off += rdlen;
+    }
+}
+
+int net_dns_resolve(const char *hostname, uint8_t ip_out[4])
+{
+    /* Build DNS query packet */
+    uint8_t query[256];
+    uint32_t qlen = 0;
+
+    /* Header: ID, flags, qdcount=1 */
+    dns_query_id++;
+    query[0] = (uint8_t)(dns_query_id >> 8);
+    query[1] = (uint8_t)(dns_query_id & 0xFF);
+    query[2] = 0x01;  /* RD=1 (recursion desired) */
+    query[3] = 0x00;
+    query[4] = 0x00; query[5] = 0x01;  /* QDCOUNT = 1 */
+    query[6] = 0x00; query[7] = 0x00;  /* ANCOUNT = 0 */
+    query[8] = 0x00; query[9] = 0x00;  /* NSCOUNT = 0 */
+    query[10] = 0x00; query[11] = 0x00; /* ARCOUNT = 0 */
+    qlen = 12;
+
+    /* Encode hostname as DNS labels: "api.anthropic.com" → 3api9anthropic3com0 */
+    const char *p = hostname;
+    while (*p) {
+        /* Find end of label (next dot or end) */
+        const char *dot = p;
+        while (*dot && *dot != '.') dot++;
+        uint32_t label_len = (uint32_t)(dot - p);
+
+        if (label_len == 0 || label_len > 63 || qlen + 1 + label_len > 250)
+            return -1;
+
+        query[qlen++] = (uint8_t)label_len;
+        for (uint32_t i = 0; i < label_len; i++)
+            query[qlen++] = (uint8_t)p[i];
+
+        p = dot;
+        if (*p == '.') p++;
+    }
+    query[qlen++] = 0;  /* Terminal zero */
+
+    /* QTYPE = A (1), QCLASS = IN (1) */
+    query[qlen++] = 0x00; query[qlen++] = 0x01;  /* TYPE A */
+    query[qlen++] = 0x00; query[qlen++] = 0x01;  /* CLASS IN */
+
+    /* Register DNS response handler (use port 10053 as source) */
+    dns_got_reply = 0;
+    net_udp_listen(10053, dns_handler);
+
+    /* Send query — retry if ARP not yet resolved */
+    serial_puts("[DNS] Resolving ");
+    serial_puts(hostname);
+    serial_puts("...\n");
+
+    for (int attempt = 0; attempt < 5; attempt++) {
+        if (net_udp_send(dns_server, 53, 10053, query, qlen) == 0)
+            break;
+        /* ARP not resolved yet — poll and retry */
+        net_poll();
+        __asm__ volatile ("hlt");
+    }
+
+    /* Poll for response (3s timeout = 300 ticks) */
+    uint64_t start = idt_get_ticks();
+    while (!dns_got_reply && (idt_get_ticks() - start) < 300) {
+        net_poll();
+        __asm__ volatile ("hlt");
+    }
+
+    if (dns_got_reply) {
+        memcpy(ip_out, dns_result_ip, 4);
+        serial_puts("[DNS] Resolved: ");
+        serial_putdec(ip_out[0]); serial_puts(".");
+        serial_putdec(ip_out[1]); serial_puts(".");
+        serial_putdec(ip_out[2]); serial_puts(".");
+        serial_putdec(ip_out[3]); serial_puts("\n");
+        return 0;
+    }
+
+    serial_puts("[DNS] Timeout\n");
+    return -1;
+}
+
 /* ── Register UDP Listener ───────────────────────────────────── */
 
 void net_udp_listen(uint16_t port, udp_handler_t handler)

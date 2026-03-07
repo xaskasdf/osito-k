@@ -166,4 +166,13 @@ void net_tcp_close(int conn);
 /* Get TCP connection state */
 int  net_tcp_state(int conn);
 
+/* ── DNS API ─────────────────────────────────────────────────── */
+
+/* Resolve hostname to IPv4 address. Blocks until response or timeout.
+ * Returns 0 on success (ip_out filled), -1 on failure. */
+int  net_dns_resolve(const char *hostname, uint8_t ip_out[4]);
+
+/* Set DNS server IP (default: 10.0.2.3 for QEMU SLIRP) */
+void net_dns_set_server(const uint8_t ip[4]);
+
 #endif /* OSITOK_NET_H */
