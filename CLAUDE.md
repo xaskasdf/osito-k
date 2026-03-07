@@ -168,6 +168,8 @@ arch/x86/kernel/tls.h               TLS 1.2 client types + API (tls_conn_t, conn
 arch/x86/kernel/tls.c               TLS 1.2 client (ECDHE-RSA-AES128-GCM-SHA256, no cert verify)
 arch/x86/kernel/http.h              HTTP client API (http_session_t, open/request/read_body/close)
 arch/x86/kernel/http.c              HTTPS client (GET/POST, chunked transfer, streaming body)
+arch/x86/kernel/claude.h            Claude API client types + API (chat, ask, streaming)
+arch/x86/kernel/claude.c            Claude Messages API (JSON builder, SSE parser, streaming)
 arch/x86/kernel/shell.c             Interactive shell (15 builtins, argv parser, ELF exec)
 arch/x86/include/types.h            Freestanding types + MMIO + port I/O
 arch/x86/libc/crt.c                 Minimal CRT (_start, printf, malloc, POSIX I/O wrappers)
@@ -345,6 +347,7 @@ Tasks:   idle, input, shell (3 of 8 slots used)
 | **X-NET1** | **ICMP** (echo request/reply, ping command in shell, IP checksum verification) | Done |
 | **X-NET4** | **TLS 1.2 + Crypto** (SHA-256, HMAC, AES-128-GCM, X25519, ECDHE-RSA handshake, gateway routing) | Done |
 | **X-NET5** | **HTTP client** (GET/POST over HTTPS, chunked transfer-encoding, streaming body, curl command) | Done |
+| **X-CL1** | **Claude API client** (Messages API, JSON builder, SSE streaming, apikey/ask commands) | Done |
 | **X-NET2** | **TCP stack** (client-only, 3-way handshake, send/recv, FIN close, tcptest shell command) | Done |
 | **X-NET3** | **DNS resolver** (UDP query to SLIRP DNS, A record parse, resolve shell command) | Done |
 
@@ -598,7 +601,7 @@ Scancode set 1 translation with modifier tracking and ring buffer.
 ### X-OS9: Mini Shell
 Interactive command shell with builtins and argument parsing.
 - **Parsing**: Whitespace-delimited argv splitting, max 16 args.
-- **Builtins**: `help`, `uname`, `ps`, `mem`, `uptime`, `echo`, `ls`, `cat`, `exec`, `cc`/`tcc`, `ping`, `resolve`, `tcptest`, `tlstest`, `curl`, `clear`, `reboot`, `halt`.
+- **Builtins**: `help`, `uname`, `ps`, `mem`, `uptime`, `echo`, `ls`, `cat`, `exec`, `cc`/`tcc`, `ping`, `resolve`, `tcptest`, `tlstest`, `curl`, `apikey`, `ask`, `clear`, `reboot`, `halt`.
 - **exec**: Runs ELF binary from OsitoFS via `proc_exec()`. Process exit returns to shell.
 - **cc/tcc**: Compile C with TCC. `cc file.c` produces file.elf, `cc -run file.c` compiles+executes.
 - **cat**: Reads file from OsitoFS, displays as text (non-printable → '.'), max 4KB preview.
@@ -729,6 +732,18 @@ HTTPS client over DNS + TCP + TLS. Supports GET/POST, chunked transfer-encoding,
 - **Shell command**: `curl <hostname> [path]` — HTTPS GET, displays first 1000 chars of response body.
 - **Verified**: `curl example.com /` returns 528 bytes HTML (`<!doctype html><html lang="en">...Example Domain...`).
 - **Files**: `arch/x86/kernel/http.h`, `arch/x86/kernel/http.c`, `arch/x86/kernel/shell.c` (curl command)
+
+### X-CL1: Claude API Client
+Native C client for Anthropic Messages API with SSE streaming.
+- **JSON builder**: Minimal hand-rolled JSON serialization (string escaping, integer, array). Builds `{"model":"...","max_tokens":N,"stream":true,"messages":[...]}`.
+- **JSON parser**: `json_find_str()` — finds `"key":"value"` pairs in flat JSON. No full parser, sufficient for SSE event parsing.
+- **SSE parser**: `sse_body_cb()` — processes `data: {...}` lines from streaming response. Extracts text from `content_block_delta` events. JSON-unescapes `\n`, `\r`, `\t`, `\"`, `\\`.
+- **API flow**: `claude_chat()` — kmalloc session+response, http_open to api.anthropic.com, POST /v1/messages with JSON body, stream SSE response via http_read_body callback, extract and deliver text chunks.
+- **Error handling**: HTTP non-200 responses logged with first 200 chars of error body.
+- **API key**: `claude_set_api_key()` stores in static buffer. Shell command `apikey sk-ant-...` sets it.
+- **Shell commands**: `apikey [key]` — set/show API key. `ask <prompt>` — single-turn chat with streaming output.
+- **Convenience**: `claude_ask(prompt, buf, size)` — single-turn, response to buffer.
+- **Files**: `arch/x86/kernel/claude.h`, `arch/x86/kernel/claude.c`, `arch/x86/kernel/shell.c` (apikey/ask commands)
 
 ### X27: Falcon PIO Load
 Programmed I/O access to Falcon IMEM/DMEM via IMEMC/IMEMD registers.

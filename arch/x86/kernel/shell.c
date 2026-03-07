@@ -83,6 +83,13 @@ extern const char *http_get_header(const void *resp, const char *name);
 extern uint32_t http_session_size(void);
 extern uint32_t http_response_size(void);
 
+/* Claude API */
+extern void claude_set_api_key(const char *key);
+extern const char *claude_get_api_key(void);
+extern int  claude_chat(const void *messages, int msg_count,
+                        const char *model, int max_tokens,
+                        int (*callback)(const char *, uint32_t, void *), void *ctx);
+
 /* ── Shell output helpers ────────────────────────────────────── */
 
 static void sh_puts(const char *s)
@@ -147,6 +154,8 @@ static void cmd_help(void)
     sh_puts("  resolve   DNS lookup (resolve hostname)\n");
     sh_puts("  tlstest   TLS connect test (tlstest [hostname])\n");
     sh_puts("  curl      HTTPS GET (curl hostname [path])\n");
+    sh_puts("  apikey    Set Claude API key (apikey sk-ant-...)\n");
+    sh_puts("  ask       Ask Claude (ask <prompt>)\n");
     sh_puts("  clear     Clear screen\n");
     sh_puts("  reboot    Reboot system\n");
     sh_puts("  halt      Halt CPU\n");
@@ -751,6 +760,91 @@ static void cmd_curl(int argc, char *argv[])
     kfree(session);
 }
 
+/* ── Builtin: apikey ──────────────────────────────────────────── */
+
+static void cmd_apikey(int argc, char *argv[])
+{
+    if (argc < 2) {
+        const char *key = claude_get_api_key();
+        if (key) {
+            sh_puts("API key set (");
+            /* Show first 10 + last 4 chars */
+            int len = 0;
+            const char *p = key;
+            while (*p) { len++; p++; }
+            for (int i = 0; i < 10 && i < len; i++) {
+                char s[2] = {key[i], 0};
+                sh_puts(s);
+            }
+            sh_puts("...");
+            if (len > 14) {
+                for (int i = len - 4; i < len; i++) {
+                    char s[2] = {key[i], 0};
+                    sh_puts(s);
+                }
+            }
+            sh_puts(")\n");
+        } else {
+            sh_puts("No API key set. Usage: apikey sk-ant-...\n");
+        }
+        return;
+    }
+    claude_set_api_key(argv[1]);
+    sh_puts_color("API key set.\n", 0x0000FF00);
+}
+
+/* ── Builtin: ask ────────────────────────────────────────────── */
+
+/* Streaming callback: print each text chunk to console */
+static int ask_stream_cb(const char *text, uint32_t len, void *ctx)
+{
+    (void)ctx;
+    for (uint32_t i = 0; i < len; i++) {
+        char s[2] = {text[i], 0};
+        sh_puts(s);
+    }
+    return 0;
+}
+
+static void cmd_ask(int argc, char *argv[])
+{
+    if (argc < 2) {
+        sh_puts("Usage: ask <prompt>\n");
+        sh_puts("  Example: ask What is OsitoK?\n");
+        return;
+    }
+
+    if (!claude_get_api_key()) {
+        sh_puts("Set API key first: apikey sk-ant-...\n");
+        return;
+    }
+
+    /* Reconstruct prompt from argv (join with spaces) */
+    char prompt[1024];
+    int pp = 0;
+    for (int i = 1; i < argc; i++) {
+        if (i > 1 && pp < (int)sizeof(prompt) - 1) prompt[pp++] = ' ';
+        const char *w = argv[i];
+        while (*w && pp < (int)sizeof(prompt) - 1) prompt[pp++] = *w++;
+    }
+    prompt[pp] = '\0';
+
+    sh_puts_color("\nClaude: ", 0x00FF8800);
+
+    /* Build message struct — must match claude_msg_t layout:
+     * { const char *role; const char *content; } */
+    struct { const char *role; const char *content; } msg;
+    msg.role = "user";
+    msg.content = prompt;
+
+    int r = claude_chat(&msg, 1, NULL, 1024, ask_stream_cb, NULL);
+    if (r < 0) {
+        sh_puts_color("\n[error]\n", 0x00FF0000);
+    } else {
+        sh_puts("\n");
+    }
+}
+
 /* ── Builtin: reboot ─────────────────────────────────────────── */
 
 static void cmd_reboot(void)
@@ -826,6 +920,10 @@ static void shell_exec(char *line)
         cmd_tlstest(argc, argv);
     } else if (strcmp(cmd, "curl") == 0) {
         cmd_curl(argc, argv);
+    } else if (strcmp(cmd, "apikey") == 0) {
+        cmd_apikey(argc, argv);
+    } else if (strcmp(cmd, "ask") == 0) {
+        cmd_ask(argc, argv);
     } else if (strcmp(cmd, "clear") == 0) {
         cmd_clear();
     } else if (strcmp(cmd, "reboot") == 0) {
