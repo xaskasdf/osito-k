@@ -392,6 +392,14 @@ void kernel_entry(void *memory_map, uint64_t map_size,
                     serial_putdec(ret < 0 ? (uint64_t)(-(int64_t)ret) : (uint64_t)ret);
                     serial_puts("\n");
                 }
+
+                if (osfs2_find("hello_c.elf")) {
+                    serial_puts("[KERN] Found hello_c.elf (TCC) — executing...\n");
+                    int ret = proc_exec("hello_c.elf", 0, NULL);
+                    serial_puts("[KERN] hello_c.elf exited with code ");
+                    serial_putdec(ret < 0 ? (uint64_t)(-(int64_t)ret) : (uint64_t)ret);
+                    serial_puts("\n");
+                }
             } else {
                 serial_puts("[KERN] OsitoFS not found (no GPT, no raw)\n");
                 fb_puts("\n OsitoFS: not found\n");

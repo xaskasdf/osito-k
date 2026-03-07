@@ -77,6 +77,7 @@ dd if=/dev/zero of="$DISK_IMG" bs=1M count=32 status=none
 "$TOOLS_DIR/mkfs.ositofs" "$DISK_IMG" --label "test" 2>&1 | head -3
 "$TOOLS_DIR/ositofs-write" "$DISK_IMG" "$TEST_DIR/hello.elf" 2>&1 | head -3
 [ -f "$TEST_DIR/fileio.elf" ] && "$TOOLS_DIR/ositofs-write" "$DISK_IMG" "$TEST_DIR/fileio.elf" 2>&1 | head -3
+[ -f "$TEST_DIR/hello_c.elf" ] && "$TOOLS_DIR/ositofs-write" "$DISK_IMG" "$TEST_DIR/hello_c.elf" 2>&1 | head -3
 "$TOOLS_DIR/ositofs-ls" "$DISK_IMG" 2>&1
 
 # ── Create ESP image ─────────────────────────────────────

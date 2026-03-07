@@ -162,6 +162,9 @@ arch/x86/kernel/keyboard.c          PS/2 keyboard (scancode set 1, IRQ 1, ring b
 arch/x86/kernel/terminal.c          Line editor (readline, backspace, history, Ctrl shortcuts)
 arch/x86/kernel/shell.c             Interactive shell (12 builtins, argv parser, ELF exec)
 arch/x86/include/types.h            Freestanding types + MMIO + port I/O
+arch/x86/libc/crt.c                 Minimal CRT (_start, printf, malloc, POSIX I/O wrappers)
+arch/x86/libc/syscall.S             Raw SYSCALL instruction wrappers (__syscall1-4)
+arch/x86/libc/Makefile              Build CRT + link userspace ELFs with TCC
 
 # OsitoFS v2 Host Tools (tools/ositofs/)
 include/common/ositofs2_format.h     On-disk format (shared header)
@@ -326,6 +329,8 @@ Tasks:   idle, input, shell (3 of 8 slots used)
 | **X-OS8** | **PS/2 keyboard driver** (scancode set 1→ASCII, shift/ctrl/caps, ring buffer, IRQ 1 via 8259 PIC vector 0x71) | Done |
 | **X-OS9** | **Mini shell** (command parser, 12 builtins: help/uname/ps/mem/uptime/echo/ls/cat/exec/clear/reboot/halt) | Done |
 | **X-OS10** | **File I/O syscalls + GDT fix** (open/close/read/lseek/fstat/brk/writev, OsitoFS fd table, GDT relocation, ET_EXEC memory lifecycle) | Done |
+| **X-OS11** | **TCC cross-compilation** (TCC 0.9.28rc compiles C → .o, ld links with CRT → static ET_EXEC ELF for OsitoK) | Done |
+| **X-OS12** | **Minimal CRT** (crt.c: _start, printf, malloc, open/close/read/write/lseek, strlen/memset/memcpy; syscall.S: raw SYSCALL wrappers) | Done |
 
 > Full GPU roadmap (X27-X40 + contingency): see [docs/x86-gpu-roadmap.md](docs/x86-gpu-roadmap.md)
 > Full OS roadmap (Tier 0-5): see [docs/os-selfhost-roadmap.md](docs/os-selfhost-roadmap.md)
@@ -604,6 +609,27 @@ Complete file I/O syscall set and critical GDT memory safety fix.
 - **Files**: `syscall.c` (file syscalls), `memory.c` (mem_reserve_range), `elf.c` (lifecycle), `process.c` (proc_add_region), `idt.c` (gdt_init), `test/fileio.c`
 
 **Tier 2 complete**: Full file I/O + stable sequential ELF execution. Ready for Tier 3 (TCC cross-compilation).
+
+### X-OS11: TCC Cross-Compilation
+TCC (Tiny C Compiler) 0.9.28rc compiles C programs for OsitoK from Linux host.
+- **TCC source**: Built from git (`repo.or.cz/tinycc.git`), installed to `~/tcc-install/`.
+- **Compilation flow**: `tcc -c -nostdlib -nostdinc app.c -o app.o` → `ld -nostdlib -static -no-pie -e _start -Ttext=0x401000 crt.o syscall.o app.o -o app.elf`
+- **Output**: ET_EXEC ELF64, static, non-PIE at 0x400000. Runs on OsitoK via `proc_exec()`.
+- **Verified**: hello_c.elf (TCC-compiled) runs printf, malloc, file I/O on OsitoK.
+- **Build**: `make -C arch/x86/libc TCC=~/tcc-install/bin/tcc hello_c.elf`
+- **Files**: `arch/x86/libc/Makefile`
+
+### X-OS12: Minimal CRT (C Runtime)
+Freestanding C runtime so TCC-compiled programs can use printf, malloc, and file I/O.
+- **_start** (`crt.c`): ELF entry point. Reads argc/argv from stack, calls main(), calls _exit().
+- **Syscall wrappers** (`syscall.S`): `__syscall1` through `__syscall4` — raw SYSCALL instruction with arg shuffle.
+- **POSIX I/O**: write, read, open, close, lseek via syscall wrappers.
+- **malloc/free**: brk-based bump allocator. malloc grows heap in 4KB increments via sys_brk. free is a no-op.
+- **printf**: Minimal variadic printf supporting %s, %d, %ld, %u, %lu, %x, %lx, %p, %c, %%.
+- **String ops**: strlen, memset, memcpy, strcmp.
+- **Files**: `arch/x86/libc/crt.c`, `arch/x86/libc/syscall.S`, `arch/x86/libc/Makefile`
+
+**Tier 3 milestone (partial)**: TCC cross-compiles C programs with printf/malloc/file I/O for OsitoK. Next: compile TCC itself as an OsitoK binary (X-OS13).
 
 ### X27: Falcon PIO Load
 Programmed I/O access to Falcon IMEM/DMEM via IMEMC/IMEMD registers.
