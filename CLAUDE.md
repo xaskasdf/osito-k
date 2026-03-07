@@ -585,8 +585,9 @@ Scancode set 1 translation with modifier tracking and ring buffer.
 ### X-OS9: Mini Shell
 Interactive command shell with builtins and argument parsing.
 - **Parsing**: Whitespace-delimited argv splitting, max 16 args.
-- **Builtins**: `help`, `uname`, `ps`, `mem`, `uptime`, `echo`, `ls`, `cat`, `exec`, `clear`, `reboot`, `halt`.
+- **Builtins**: `help`, `uname`, `ps`, `mem`, `uptime`, `echo`, `ls`, `cat`, `exec`, `cc`/`tcc`, `clear`, `reboot`, `halt`.
 - **exec**: Runs ELF binary from OsitoFS via `proc_exec()`. Process exit returns to shell.
+- **cc/tcc**: Compile C with TCC. `cc file.c` produces file.elf, `cc -run file.c` compiles+executes.
 - **cat**: Reads file from OsitoFS, displays as text (non-printable → '.'), max 4KB preview.
 - **reboot**: Triple fault via zero-length IDT + INT3.
 - **Network**: `net_poll()` called between commands (keeps UDP echo server responsive).

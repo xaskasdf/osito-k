@@ -110,6 +110,7 @@ static void cmd_help(void)
     sh_puts("  ls        List files on disk\n");
     sh_puts("  cat       Display file contents\n");
     sh_puts("  exec      Run an ELF binary\n");
+    sh_puts("  cc        Compile C with TCC (cc file.c [-run])\n");
     sh_puts("  clear     Clear screen\n");
     sh_puts("  reboot    Reboot system\n");
     sh_puts("  halt      Halt CPU\n");
@@ -285,6 +286,91 @@ static void cmd_exec(int argc, char *argv[])
     proc_exec(argv[1], argc - 1, (const char **)(argv + 1));
 }
 
+/* ── Builtin: cc (compile C with TCC) ────────────────────────── */
+
+static void cmd_cc(int argc, char *argv[])
+{
+    if (!osfs2_is_mounted() || !osfs2_find("tcc.elf")) {
+        sh_puts("tcc.elf not found on disk\n");
+        return;
+    }
+
+    if (argc < 2) {
+        sh_puts("Usage: cc <file.c> [-run]    Compile and optionally run\n");
+        sh_puts("       cc -run <file.c>      Compile + run immediately\n");
+        return;
+    }
+
+    /* Check for -run flag */
+    int run_mode = 0;
+    const char *source = NULL;
+
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "-run") == 0)
+            run_mode = 1;
+        else if (!source)
+            source = argv[i];
+    }
+
+    if (!source) {
+        sh_puts("No source file specified\n");
+        return;
+    }
+
+    if (!osfs2_find(source)) {
+        sh_puts("File not found: ");
+        sh_puts(source);
+        sh_puts("\n");
+        return;
+    }
+
+    /* Build output filename: foo.c → foo.elf */
+    char outname[64];
+    int j = 0;
+    const char *s = source;
+    while (*s && *s != '.' && j < 58) outname[j++] = *s++;
+    outname[j++] = '.'; outname[j++] = 'e'; outname[j++] = 'l'; outname[j++] = 'f'; outname[j] = '\0';
+
+    /* Step 1: Compile + link */
+    sh_puts_color("Compiling: ", 0x0000FF00);
+    sh_puts(source);
+    sh_puts(" → ");
+    sh_puts(outname);
+    sh_puts("\n");
+
+    const char *tcc_argv[] = {
+        "tcc", "-nostdlib", "-nostdinc", "-static",
+        source, "-o", outname
+    };
+    int ret = proc_exec("tcc.elf", 7, tcc_argv);
+
+    if (ret != 0) {
+        sh_puts_color("Compilation failed", 0x00FF0000);
+        sh_puts(" (exit ");
+        sh_putdec(ret < 0 ? (uint64_t)(-(int64_t)ret) : (uint64_t)ret);
+        sh_puts(")\n");
+        return;
+    }
+
+    sh_puts_color("OK", 0x0000FF00);
+    sh_puts(" — compiled successfully\n");
+
+    /* Step 2: Run if -run flag */
+    if (run_mode) {
+        if (!osfs2_find(outname)) {
+            sh_puts("Output file not found on disk\n");
+            return;
+        }
+        sh_puts_color("Running: ", 0x0000FF00);
+        sh_puts(outname);
+        sh_puts("\n");
+        ret = proc_exec(outname, 0, NULL);
+        sh_puts("Exit code: ");
+        sh_putdec(ret < 0 ? (uint64_t)(-(int64_t)ret) : (uint64_t)ret);
+        sh_puts("\n");
+    }
+}
+
 /* ── Builtin: reboot ─────────────────────────────────────────── */
 
 static void cmd_reboot(void)
@@ -348,6 +434,8 @@ static void shell_exec(char *line)
         cmd_cat(argc, argv);
     } else if (strcmp(cmd, "exec") == 0) {
         cmd_exec(argc, argv);
+    } else if (strcmp(cmd, "cc") == 0 || strcmp(cmd, "tcc") == 0) {
+        cmd_cc(argc, argv);
     } else if (strcmp(cmd, "clear") == 0) {
         cmd_clear();
     } else if (strcmp(cmd, "reboot") == 0) {
