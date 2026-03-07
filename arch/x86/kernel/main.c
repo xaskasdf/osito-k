@@ -401,13 +401,29 @@ void kernel_entry(void *memory_map, uint64_t map_size,
                     serial_puts("\n");
                 }
 
-                if (osfs2_find("tcc.elf")) {
-                    serial_puts("[KERN] Found tcc.elf — compiling tiny.c...\n");
-                    const char *tcc_argv[] = { "tcc", "-c", "-nostdlib", "-nostdinc", "tiny.c", "-o", "tiny.o" };
+                if (osfs2_find("tcc.elf") && osfs2_find("selftest.c")) {
+                    /* Step 1: TCC compiles+links selftest.c → selftest.elf */
+                    serial_puts("[KERN] === Self-hosting test ===\n");
+                    serial_puts("[KERN] Step 1: TCC compiling selftest.c...\n");
+                    const char *tcc_argv[] = {
+                        "tcc", "-nostdlib", "-nostdinc", "-static",
+                        "selftest.c", "-o", "selftest.elf"
+                    };
                     int ret = proc_exec("tcc.elf", 7, tcc_argv);
-                    serial_puts("[KERN] tcc.elf exited with code ");
+                    serial_puts("[KERN] TCC exited with code ");
                     serial_putdec(ret < 0 ? (uint64_t)(-(int64_t)ret) : (uint64_t)ret);
                     serial_puts("\n");
+
+                    /* Step 2: Execute the freshly compiled binary */
+                    if (ret == 0 && osfs2_find("selftest.elf")) {
+                        serial_puts("[KERN] Step 2: Executing selftest.elf...\n");
+                        ret = proc_exec("selftest.elf", 0, NULL);
+                        serial_puts("[KERN] selftest.elf exited with code ");
+                        serial_putdec(ret < 0 ? (uint64_t)(-(int64_t)ret) : (uint64_t)ret);
+                        serial_puts("\n");
+                    } else if (ret == 0) {
+                        serial_puts("[KERN] selftest.elf not found on disk after compile\n");
+                    }
                 }
             } else {
                 serial_puts("[KERN] OsitoFS not found (no GPT, no raw)\n");
