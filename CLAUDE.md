@@ -334,6 +334,7 @@ Tasks:   idle, input, shell (3 of 8 slots used)
 | **X-OS11** | **TCC cross-compilation** (TCC 0.9.28rc compiles C → .o, ld links with CRT → static ET_EXEC ELF for OsitoK) | Done |
 | **X-OS12** | **Minimal CRT** (crt.c: _start, printf, malloc, open/close/read/write/lseek, strlen/memset/memcpy; syscall.S: raw SYSCALL wrappers) | Done |
 | **X-OS13** | **TCC in-OS compilation** (TCC 0.9.28rc runs inside OsitoK, compiles .c → .o, extended libc: FILE*, fprintf, strtol, qsort, setjmp) | Done |
+| **X-NET1** | **ICMP** (echo request/reply, ping command in shell, IP checksum verification) | Done |
 
 > Full GPU roadmap (X27-X40 + contingency): see [docs/x86-gpu-roadmap.md](docs/x86-gpu-roadmap.md)
 > Full OS roadmap (Tier 0-5): see [docs/os-selfhost-roadmap.md](docs/os-selfhost-roadmap.md)

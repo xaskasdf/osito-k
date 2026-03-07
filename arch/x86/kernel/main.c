@@ -445,7 +445,9 @@ void kernel_entry(void *memory_map, uint64_t map_size,
         fb_puts("\n Initializing NIC...\n");
 
         if (i211_init(nic_pci->bar[0]) == 0) {
-            uint8_t ip[] = {192, 168, 1, 100};
+            /* 10.0.2.15 = QEMU SLIRP default DHCP.
+             * Change to 192.168.1.100 for real hardware. */
+            uint8_t ip[] = {10, 0, 2, 15};
             net_init(ip);
             net_udp_listen(7777, prompt_handler);
         } else {

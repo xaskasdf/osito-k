@@ -111,6 +111,7 @@ static void cmd_help(void)
     sh_puts("  cat       Display file contents\n");
     sh_puts("  exec      Run an ELF binary\n");
     sh_puts("  cc        Compile C with TCC (cc file.c [-run])\n");
+    sh_puts("  ping      Ping an IP address\n");
     sh_puts("  clear     Clear screen\n");
     sh_puts("  reboot    Reboot system\n");
     sh_puts("  halt      Halt CPU\n");
@@ -371,6 +372,88 @@ static void cmd_cc(int argc, char *argv[])
     }
 }
 
+/* ── Builtin: ping ──────────────────────────────────────────── */
+
+extern void net_icmp_send_echo(const uint8_t dst_ip[4], uint16_t seq);
+extern uint32_t net_icmp_get_rx_count(void);
+
+static int parse_ip(const char *s, uint8_t ip[4])
+{
+    int i = 0, val = 0;
+    for (; *s && i < 4; s++) {
+        if (*s >= '0' && *s <= '9') {
+            val = val * 10 + (*s - '0');
+        } else if (*s == '.') {
+            if (val > 255) return -1;
+            ip[i++] = (uint8_t)val;
+            val = 0;
+        } else return -1;
+    }
+    if (i != 3 || val > 255) return -1;
+    ip[3] = (uint8_t)val;
+    return 0;
+}
+
+static void cmd_ping(int argc, char *argv[])
+{
+    if (argc < 2) {
+        sh_puts("Usage: ping <ip>\n");
+        return;
+    }
+
+    uint8_t dst[4];
+    if (parse_ip(argv[1], dst) < 0) {
+        sh_puts("Invalid IP: ");
+        sh_puts(argv[1]);
+        sh_puts("\n");
+        return;
+    }
+
+    sh_puts("PING ");
+    sh_putdec(dst[0]); sh_puts(".");
+    sh_putdec(dst[1]); sh_puts(".");
+    sh_putdec(dst[2]); sh_puts(".");
+    sh_putdec(dst[3]); sh_puts("\n");
+
+    uint32_t sent = 0, recv_before = net_icmp_get_rx_count();
+
+    for (int i = 0; i < 4; i++) {
+        net_icmp_send_echo(dst, (uint16_t)(i + 1));
+        sent++;
+
+        /* Poll for ~500ms (50 ticks at 100Hz) */
+        uint64_t start = idt_get_ticks();
+        uint32_t old_count = net_icmp_get_rx_count();
+        while (idt_get_ticks() - start < 50) {
+            net_poll();
+            if (net_icmp_get_rx_count() > old_count) {
+                sh_puts("  reply from ");
+                sh_putdec(dst[0]); sh_puts(".");
+                sh_putdec(dst[1]); sh_puts(".");
+                sh_putdec(dst[2]); sh_puts(".");
+                sh_putdec(dst[3]);
+                sh_puts(" seq=");
+                sh_putdec(i + 1);
+                sh_puts("\n");
+                break;
+            }
+            __asm__ volatile ("hlt");
+        }
+        if (net_icmp_get_rx_count() == old_count) {
+            sh_puts("  timeout seq=");
+            sh_putdec(i + 1);
+            sh_puts("\n");
+        }
+    }
+
+    uint32_t recv_total = net_icmp_get_rx_count() - recv_before;
+    sh_puts("--- ");
+    sh_putdec(sent);
+    sh_puts(" sent, ");
+    sh_putdec(recv_total);
+    sh_puts(" received ---\n");
+}
+
 /* ── Builtin: reboot ─────────────────────────────────────────── */
 
 static void cmd_reboot(void)
@@ -436,6 +519,8 @@ static void shell_exec(char *line)
         cmd_exec(argc, argv);
     } else if (strcmp(cmd, "cc") == 0 || strcmp(cmd, "tcc") == 0) {
         cmd_cc(argc, argv);
+    } else if (strcmp(cmd, "ping") == 0) {
+        cmd_ping(argc, argv);
     } else if (strcmp(cmd, "clear") == 0) {
         cmd_clear();
     } else if (strcmp(cmd, "reboot") == 0) {

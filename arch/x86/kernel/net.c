@@ -227,6 +227,124 @@ static void handle_arp(const uint8_t *pkt, uint32_t len)
     }
 }
 
+/* ── ICMP ────────────────────────────────────────────────────── */
+
+#define ICMP_ECHO_REPLY   0
+#define ICMP_DEST_UNREACH 3
+#define ICMP_ECHO_REQUEST 8
+
+typedef struct __attribute__((packed)) {
+    uint8_t  type;
+    uint8_t  code;
+    uint16_t checksum;
+    uint16_t id;
+    uint16_t seq;
+} icmp_hdr_t;
+
+static uint32_t icmp_rx_count;
+
+static void icmp_send(const uint8_t dst_ip[4], uint8_t type, uint8_t code,
+                       uint16_t id, uint16_t seq,
+                       const void *data, uint32_t data_len)
+{
+    /* Resolve destination MAC */
+    arp_entry_t *entry = arp_lookup(dst_ip);
+    if (!entry) {
+        arp_send_request(dst_ip);
+        return;
+    }
+
+    uint32_t icmp_len = sizeof(icmp_hdr_t) + data_len;
+    uint32_t ip_total = sizeof(ipv4_hdr_t) + icmp_len;
+
+    if (ETH_HDR_LEN + ip_total > sizeof(tx_pkt))
+        return;
+
+    /* Ethernet */
+    eth_hdr_t *eth = (eth_hdr_t *)tx_pkt;
+    memcpy(eth->dst, entry->mac, ETH_ALEN);
+    memcpy(eth->src, our_mac, ETH_ALEN);
+    eth->ethertype = htons(ETH_TYPE_IP4);
+
+    /* IPv4 */
+    ipv4_hdr_t *ip = (ipv4_hdr_t *)(tx_pkt + ETH_HDR_LEN);
+    ip->ver_ihl   = 0x45;
+    ip->tos       = 0;
+    ip->total_len = htons((uint16_t)ip_total);
+    ip->id        = htons(ip_id_counter++);
+    ip->frag      = 0;
+    ip->ttl       = 64;
+    ip->proto     = IP_PROTO_ICMP;
+    ip->checksum  = 0;
+    memcpy(ip->src, our_ip, 4);
+    memcpy(ip->dst, dst_ip, 4);
+    ip->checksum  = ip_checksum(ip, sizeof(ipv4_hdr_t));
+
+    /* ICMP */
+    icmp_hdr_t *icmp = (icmp_hdr_t *)(tx_pkt + ETH_HDR_LEN + sizeof(ipv4_hdr_t));
+    icmp->type     = type;
+    icmp->code     = code;
+    icmp->checksum = 0;
+    icmp->id       = id;
+    icmp->seq      = seq;
+
+    if (data && data_len > 0)
+        memcpy((uint8_t *)icmp + sizeof(icmp_hdr_t), data, data_len);
+
+    /* ICMP checksum covers entire ICMP message */
+    icmp->checksum = ip_checksum(icmp, icmp_len);
+
+    uint32_t frame_len = ETH_HDR_LEN + ip_total;
+    if (frame_len < 60) {
+        memset(tx_pkt + frame_len, 0, 60 - frame_len);
+        frame_len = 60;
+    }
+
+    i211_send(tx_pkt, frame_len);
+}
+
+static void handle_icmp(const uint8_t *src_ip, const uint8_t *pkt, uint32_t len)
+{
+    if (len < sizeof(icmp_hdr_t))
+        return;
+
+    const icmp_hdr_t *icmp = (const icmp_hdr_t *)pkt;
+
+    /* Verify ICMP checksum */
+    if (ip_checksum(pkt, len) != 0)
+        return;
+
+    if (icmp->type == ICMP_ECHO_REQUEST && icmp->code == 0) {
+        /* Echo reply: same id/seq/data, type=0 */
+        uint32_t data_len = len - sizeof(icmp_hdr_t);
+        const uint8_t *data = pkt + sizeof(icmp_hdr_t);
+
+        icmp_send(src_ip, ICMP_ECHO_REPLY, 0,
+                  icmp->id, icmp->seq, data, data_len);
+    }
+
+    if (icmp->type == ICMP_ECHO_REPLY && icmp->code == 0) {
+        /* Got a ping reply — increment counter for shell ping cmd */
+        icmp_rx_count++;
+    }
+}
+
+/* ── ICMP: Send Echo Request (ping) ─────────────────────────── */
+
+static uint16_t ping_id = 0x4F53;  /* "OS" */
+
+void net_icmp_send_echo(const uint8_t dst_ip[4], uint16_t seq)
+{
+    /* 32 bytes of timestamp-like payload */
+    uint8_t data[32];
+    memset(data, 'O', 32);
+
+    icmp_send(dst_ip, ICMP_ECHO_REQUEST, 0,
+              htons(ping_id), htons(seq), data, 32);
+}
+
+uint32_t net_icmp_get_rx_count(void) { return icmp_rx_count; }
+
 /* ── Handle IPv4 Packet ──────────────────────────────────────── */
 
 static void handle_ipv4(const uint8_t *pkt, uint32_t len)
@@ -259,6 +377,11 @@ static void handle_ipv4(const uint8_t *pkt, uint32_t len)
 
     const uint8_t *payload = pkt + ihl;
     uint32_t payload_len = total - ihl;
+
+    if (ip->proto == IP_PROTO_ICMP) {
+        handle_icmp(ip->src, payload, payload_len);
+        return;
+    }
 
     if (ip->proto == IP_PROTO_UDP) {
         /* Handle UDP */
