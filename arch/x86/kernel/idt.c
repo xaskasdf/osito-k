@@ -181,6 +181,71 @@ static inline void wrmsr(uint32_t msr, uint64_t val) {
                       "a"((uint32_t)val), "d"((uint32_t)(val >> 32)));
 }
 
+/* ── GDT relocation ─────────────────────────────────────────── */
+/*
+ * UEFI's GDT lives in boot services memory, which gets freed by
+ * mem_init(). Once the page allocator reuses those pages, the GDT
+ * entries are overwritten.  SYSCALL doesn't consult the GDT (uses
+ * STAR MSR), so syscalls keep working — but iretq in ISR stubs
+ * DOES reload CS/SS from the GDT on every interrupt return.
+ * A corrupted GDT entry makes iretq jump to garbage.
+ *
+ * Fix: copy the GDT to a static BSS buffer and LGDT it before
+ * any allocations can corrupt the original.
+ */
+
+#define GDT_MAX_ENTRIES 32
+static uint64_t kernel_gdt[GDT_MAX_ENTRIES] __attribute__((aligned(16)));
+
+static struct __attribute__((packed)) {
+    uint16_t limit;
+    uint64_t base;
+} kernel_gdtr;
+
+static void gdt_init(void)
+{
+    /* Read current GDTR (UEFI's GDT) */
+    struct __attribute__((packed)) {
+        uint16_t limit;
+        uint64_t base;
+    } old_gdtr;
+
+    __asm__ volatile ("sgdt %0" : "=m"(old_gdtr));
+
+    serial_puts("[GDT] UEFI GDT at 0x");
+    serial_puthex(old_gdtr.base, 16);
+    serial_puts(", limit=");
+    serial_putdec(old_gdtr.limit + 1);
+    serial_puts(" bytes\n");
+
+    uint64_t gdt_bytes = (uint64_t)(old_gdtr.limit) + 1;
+    int entries = (int)(gdt_bytes / 8);
+    if (entries > GDT_MAX_ENTRIES) entries = GDT_MAX_ENTRIES;
+
+    /* Copy existing GDT to our static buffer */
+    memcpy(kernel_gdt, (void *)old_gdtr.base, (uint64_t)entries * 8);
+
+    /* Ensure critical entries are valid 64-bit segments.
+     * SYSCALL uses CS=0x28 (index 5), SS=0x30 (index 6).
+     * IDT gates use CS=0x38 (index 7). */
+    if (entries < 8) entries = 8;  /* Extend if UEFI GDT was smaller */
+    kernel_gdt[5] = 0x00AF9A000000FFFFULL; /* 0x28: 64-bit code (P=1,DPL=0,S=1,type=0xA,L=1,G=1) */
+    kernel_gdt[6] = 0x00CF92000000FFFFULL; /* 0x30: 64-bit data (P=1,DPL=0,S=1,type=0x2,G=1) */
+    kernel_gdt[7] = 0x00AF9A000000FFFFULL; /* 0x38: 64-bit code (same as 0x28) */
+
+    /* Load our GDT */
+    kernel_gdtr.limit = (uint16_t)((uint64_t)entries * 8 - 1);
+    kernel_gdtr.base  = (uint64_t)kernel_gdt;
+
+    __asm__ volatile ("lgdt %0" : : "m"(kernel_gdtr));
+
+    serial_puts("[GDT] Relocated to static buffer at 0x");
+    serial_puthex((uint64_t)kernel_gdt, 16);
+    serial_puts(" (");
+    serial_putdec((uint64_t)entries);
+    serial_puts(" entries)\n");
+}
+
 /* ── State ───────────────────────────────────────────────────── */
 
 static volatile uint64_t tick_count;
@@ -427,6 +492,11 @@ void idt_init(void)
 
     /* Disable interrupts during IDT setup */
     __asm__ volatile ("cli");
+
+    /* Relocate GDT from UEFI memory to static BSS buffer.
+     * MUST happen before any page allocations (paging_init, heap_init)
+     * that could overwrite the UEFI GDT in freed boot services memory. */
+    gdt_init();
 
     /* Detect current CS selector from GDT */
     uint16_t cs = get_cs();

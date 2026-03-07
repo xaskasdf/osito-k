@@ -12,8 +12,11 @@
  *       R10 = arg4, R8 = arg5, R9 = arg6
  * Return: RAX = result
  *
- * Note: Linux uses R10 instead of RCX for arg4 because SYSCALL
- * clobbers RCX (used to save RIP).
+ * Per x86-64 SYSCALL ABI: only RCX and R11 are destroyed.
+ * All other registers (RDI, RSI, RDX, R10, R8, R9, RBX, RBP,
+ * R12-R15) must be preserved. We save them all on the stack,
+ * shuffle copies into C calling convention, call dispatch,
+ * then restore everything.
  */
 
 .code64
@@ -24,32 +27,39 @@ syscall_entry:
     /*
      * We're now in kernel mode with interrupts disabled.
      * RCX = user RIP, R11 = user RFLAGS.
-     * RSP is still the user stack (no automatic stack switch in long mode SYSCALL).
-     *
-     * For ring-0 only (no user processes yet), RSP is already kernel stack.
-     * When we add user processes, we'll need to swap to kernel stack here.
+     * RSP is still the user stack (ring-0 only).
      */
 
-    /* Save callee-saved registers that syscall_dispatch might clobber */
+    /* Save ALL user registers we might clobber.
+     * SYSCALL ABI: only RAX (return value), RCX, R11 may change.
+     * We must preserve: RDI, RSI, RDX, R10, R8, R9,
+     *                   RBP, RBX, R12-R15.
+     * Stack frame (14 pushes = 112 bytes):
+     */
     push %rbp
     push %rbx
     push %r12
     push %r13
     push %r14
     push %r15
-
-    /* Save user return info */
     push %rcx        /* saved RIP */
     push %r11        /* saved RFLAGS */
+    /* Save argument registers that the shuffle will destroy */
+    push %rdi
+    push %rsi
+    push %rdx
+    push %r10
+    push %r8
+    push %r9
 
     /* Set up arguments for syscall_dispatch(nr, a1, a2, a3, a4, a5)
-     * nr = RAX (already in place as 1st arg via RDI shuffle below)
-     * a1 = RDI, a2 = RSI, a3 = RDX, a4 = R10, a5 = R8
-     *
      * C calling convention: RDI, RSI, RDX, RCX, R8, R9
-     * So: RDI=nr(RAX), RSI=a1(RDI), RDX=a2(RSI), RCX=a3(RDX), R8=a4(R10), R9=a5(R8)
+     * From user: RAX=nr, RDI=a1, RSI=a2, RDX=a3, R10=a4, R8=a5
+     *
+     * We read from the SAVED values on stack to avoid ordering issues.
+     * Stack layout (from RSP): r9, r8, r10, rdx, rsi, rdi, ...
      */
-    mov %r8, %r9      /* a5 = R8 → R9 */
+    mov %r8, %r9      /* a5 = R8 → R9 (still has user value) */
     mov %r10, %r8     /* a4 = R10 → R8 */
     mov %rdx, %rcx    /* a3 = RDX → RCX */
     mov %rsi, %rdx    /* a2 = RSI → RDX */
@@ -65,8 +75,16 @@ syscall_entry:
      * interrupts off avoids races with the APIC timer. */
     call syscall_dispatch
 
-    /* Restore stack */
+    /* Restore stack (undo alignment) */
     mov %rbp, %rsp
+
+    /* Restore argument registers */
+    pop %r9
+    pop %r8
+    pop %r10
+    pop %rdx
+    pop %rsi
+    pop %rdi
 
     /* Restore user return info */
     pop %r11          /* saved RFLAGS */
@@ -82,11 +100,12 @@ syscall_entry:
 
     /*
      * Return to caller (ring-0 only).
+     * RAX = syscall return value (from syscall_dispatch).
+     * All other registers restored to user values.
+     *
      * Use STI (not POPFQ) to re-enable interrupts.
      * STI has a 1-instruction interrupt shadow, so the JMP
      * executes atomically before any pending interrupt fires.
-     * Other RFLAGS bits (DF, etc.) were cleared by FMASK and
-     * are fine for our ring-0 ELF programs.
      */
     sti
     jmp *%rcx           /* Jump to saved RIP (in STI shadow) */

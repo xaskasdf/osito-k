@@ -60,6 +60,9 @@ if [ "$1" != "--no-build" ]; then
     info "Building hello.elf..."
     gcc -nostdlib -static -no-pie -o "$TEST_DIR/hello.elf" "$TEST_DIR/hello.S"
 
+    info "Building fileio.elf..."
+    gcc -nostdlib -static -no-pie -o "$TEST_DIR/fileio.elf" "$TEST_DIR/fileio.c"
+
     info "Building OsitoFS tools..."
     make -C "$TOOLS_DIR" -j$(nproc) 2>&1 | tail -1
 fi
@@ -73,6 +76,7 @@ info "Creating OsitoFS disk with hello.elf..."
 dd if=/dev/zero of="$DISK_IMG" bs=1M count=32 status=none
 "$TOOLS_DIR/mkfs.ositofs" "$DISK_IMG" --label "test" 2>&1 | head -3
 "$TOOLS_DIR/ositofs-write" "$DISK_IMG" "$TEST_DIR/hello.elf" 2>&1 | head -3
+[ -f "$TEST_DIR/fileio.elf" ] && "$TOOLS_DIR/ositofs-write" "$DISK_IMG" "$TEST_DIR/fileio.elf" 2>&1 | head -3
 "$TOOLS_DIR/ositofs-ls" "$DISK_IMG" 2>&1
 
 # ── Create ESP image ─────────────────────────────────────
@@ -102,7 +106,7 @@ info "  ESP:  $ESP_IMG"
 info "  Disk: $DISK_IMG"
 info ""
 
-timeout 15 qemu-system-x86_64 \
+timeout 25 qemu-system-x86_64 \
     $BIOS_ARGS \
     -drive file="$ESP_IMG",format=raw,if=ide \
     -drive file="$DISK_IMG",format=raw,if=none,id=nvme0 \

@@ -22,12 +22,16 @@ extern void fb_putdec(uint64_t val);
 
 extern void *mem_alloc_aligned(uint64_t size, uint64_t alignment);
 extern void  mem_free_pages(void *addr, uint64_t count);
+extern int   mem_reserve_range(uint64_t phys, uint64_t count);
 extern void *kmalloc(uint64_t size);
 extern void  kfree(void *ptr);
 
 /* OsitoFS */
 extern void *osfs2_find(const char *name);  /* returns osfs2_file_t* */
 extern int osfs2_read(void *file, uint64_t offset, void *buf, uint64_t len);
+
+/* Process — register memory for cleanup on exit */
+extern void proc_add_region(void *base, uint64_t pages);
 
 /* ── ELF64 structures ───────────────────────────────────────── */
 
@@ -187,16 +191,45 @@ static int elf_load_segments(const uint8_t *data, uint64_t data_size,
         return -1;
     }
 
-    /* Allocate one contiguous block covering all segments */
     uint64_t total_size = vaddr_max - vaddr_min;
     uint64_t total_pages = (total_size + 4095) / 4096;
 
-    void *base = mem_alloc_aligned(total_pages * 4096, 4096);
-    if (!base) {
-        serial_puts("[ELF] Failed to allocate ");
-        serial_putdec(total_pages);
-        serial_puts(" pages\n");
-        return -1;
+    /*
+     * For ET_EXEC (non-PIE): load at the exact vaddr requested.
+     * The code has absolute addresses that must match the load address.
+     * For ET_DYN (PIE): allocate dynamic memory and adjust entry.
+     */
+    void *base;
+    bool fixed_load = (hdr->e_type == ET_EXEC);
+
+    if (fixed_load) {
+        /* Reserve the exact pages from the page allocator */
+        if (mem_reserve_range(vaddr_min, total_pages) < 0) {
+            serial_puts("[ELF] Fixed-load at 0x");
+            serial_puthex(vaddr_min, 16);
+            serial_puts(" conflicts with allocated memory\n");
+            return -1;
+        }
+        base = (void *)vaddr_min;
+        serial_puts("[ELF] Fixed load at vaddr 0x");
+        serial_puthex(vaddr_min, 16);
+        serial_puts(", ");
+        serial_putdec(total_pages * 4);
+        serial_puts(" KB\n");
+    } else {
+        /* PIE/shared: allocate dynamic memory */
+        base = mem_alloc_aligned(total_pages * 4096, 4096);
+        if (!base) {
+            serial_puts("[ELF] Failed to allocate ");
+            serial_putdec(total_pages);
+            serial_puts(" pages\n");
+            return -1;
+        }
+        serial_puts("[ELF] Load base: 0x");
+        serial_puthex((uint64_t)base, 16);
+        serial_puts(", ");
+        serial_putdec(total_pages * 4);
+        serial_puts(" KB\n");
     }
 
     /* Zero entire region (BSS segments need zeros) */
@@ -205,12 +238,6 @@ static int elf_load_segments(const uint8_t *data, uint64_t data_size,
     loaded->segments[0] = base;
     loaded->segment_pages[0] = total_pages;
     loaded->segment_count = 1;
-
-    serial_puts("[ELF] Load base: 0x");
-    serial_puthex((uint64_t)base, 16);
-    serial_puts(", ");
-    serial_putdec(total_pages * 4);
-    serial_puts(" KB\n");
 
     /* Second pass: copy segment data at correct offsets within the block */
     for (int i = 0; i < hdr->e_phnum; i++) {
@@ -232,10 +259,15 @@ static int elf_load_segments(const uint8_t *data, uint64_t data_size,
         }
     }
 
-    /* Adjust entry point: base + (entry - vaddr_min) */
-    loaded->entry = (uint64_t)base + (hdr->e_entry - vaddr_min);
+    if (fixed_load) {
+        /* ET_EXEC: use original entry point (absolute addresses) */
+        loaded->entry = hdr->e_entry;
+    } else {
+        /* ET_DYN/PIE: adjust entry point */
+        loaded->entry = (uint64_t)base + (hdr->e_entry - vaddr_min);
+    }
 
-    serial_puts("[ELF] Adjusted entry: 0x");
+    serial_puts("[ELF] Entry: 0x");
     serial_puthex(loaded->entry, 16);
     serial_puts("\n");
 
@@ -316,7 +348,7 @@ static uint64_t elf_setup_stack(elf_loaded_t *loaded,
 void elf_free(elf_loaded_t *loaded)
 {
     for (int i = 0; i < loaded->segment_count; i++) {
-        if (loaded->segments[i])
+        if (loaded->segments[i] && loaded->segment_pages[i] > 0)
             mem_free_pages(loaded->segments[i], loaded->segment_pages[i]);
     }
     if (loaded->stack_base)
@@ -434,6 +466,16 @@ int elf_exec(const char *filename, int argc, const char **argv)
 
     /* Free the read buffer (segments are already copied) */
     kfree(data);
+
+    /* Register ELF memory with the process for cleanup on exit.
+     * After elf_jump, the loaded struct is on the abandoned stack,
+     * so proc_free needs its own copy of the regions. */
+    for (int i = 0; i < loaded.segment_count; i++) {
+        if (loaded.segments[i] && loaded.segment_pages[i] > 0)
+            proc_add_region(loaded.segments[i], loaded.segment_pages[i]);
+    }
+    if (loaded.stack_base)
+        proc_add_region(loaded.stack_base, USER_STACK_SIZE / 4096);
 
     /* Jump to entry — does not return */
     elf_jump(loaded.entry, sp);

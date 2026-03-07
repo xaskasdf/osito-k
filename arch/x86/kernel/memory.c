@@ -159,6 +159,31 @@ void *mem_alloc_pages(uint64_t count)
     return NULL; /* Out of contiguous pages */
 }
 
+/* ── Reserve specific physical pages (for ET_EXEC fixed loads) ─ */
+
+int mem_reserve_range(uint64_t phys, uint64_t count)
+{
+    uint64_t start_page = phys >> PAGE_SHIFT;
+
+    /* Check all pages are free first */
+    for (uint64_t i = 0; i < count; i++) {
+        if (!bitmap_test(start_page + i)) {
+            serial_puts("[MEM] CONFLICT: page 0x");
+            serial_puthex((start_page + i) << PAGE_SHIFT, 16);
+            serial_puts(" already allocated\n");
+            return -1;
+        }
+    }
+
+    /* Mark as used */
+    for (uint64_t i = 0; i < count; i++) {
+        bitmap_clear(start_page + i);
+        free_pages--;
+    }
+
+    return 0;
+}
+
 /* ── Free physical pages ─────────────────────────────────────── */
 
 void mem_free_pages(void *addr, uint64_t count)

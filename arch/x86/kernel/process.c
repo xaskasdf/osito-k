@@ -32,6 +32,9 @@ extern uint64_t paging_get_kernel_cr3(void);
 /* ELF loader */
 extern int elf_exec(const char *filename, int argc, const char **argv);
 
+/* Syscall state cleanup */
+extern void syscall_reset_process(void);
+
 /* ── Constants ───────────────────────────────────────────────── */
 
 #define MAX_PROCESSES   16
@@ -160,17 +163,32 @@ static process_t *proc_alloc(const char *name)
 
 static void proc_free(process_t *p)
 {
-    /* Free memory regions */
+    /* Free memory regions (ELF segments + stack) */
     for (int i = 0; i < p->region_count; i++) {
-        if (p->regions[i].base)
+        if (p->regions[i].base && p->regions[i].pages > 0)
             mem_free_pages(p->regions[i].base, p->regions[i].pages);
     }
+
+    /* Reset per-process syscall state (file FDs, brk heap) */
+    syscall_reset_process();
 
     /* Close FDs */
     for (int i = 0; i < MAX_FDS; i++)
         p->fds[i].open = false;
 
     p->state = PROC_FREE;
+}
+
+/* ── Register memory region with current process (for cleanup) ── */
+
+void proc_add_region(void *base, uint64_t pages)
+{
+    if (!current_proc) return;
+    process_t *p = current_proc;
+    if (p->region_count >= MAX_REGIONS) return;
+    p->regions[p->region_count].base = base;
+    p->regions[p->region_count].pages = pages;
+    p->region_count++;
 }
 
 /* ── Public API ──────────────────────────────────────────────── */

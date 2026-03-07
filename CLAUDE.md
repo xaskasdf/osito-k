@@ -325,6 +325,7 @@ Tasks:   idle, input, shell (3 of 8 slots used)
 | **X-OS7** | **Terminal line editor** (readline with echo, backspace, insert mode, Ctrl+C/D/U/A/E/W, command history) | Done |
 | **X-OS8** | **PS/2 keyboard driver** (scancode set 1→ASCII, shift/ctrl/caps, ring buffer, IRQ 1 via 8259 PIC vector 0x71) | Done |
 | **X-OS9** | **Mini shell** (command parser, 12 builtins: help/uname/ps/mem/uptime/echo/ls/cat/exec/clear/reboot/halt) | Done |
+| **X-OS10** | **File I/O syscalls + GDT fix** (open/close/read/lseek/fstat/brk/writev, OsitoFS fd table, GDT relocation, ET_EXEC memory lifecycle) | Done |
 
 > Full GPU roadmap (X27-X40 + contingency): see [docs/x86-gpu-roadmap.md](docs/x86-gpu-roadmap.md)
 > Full OS roadmap (Tier 0-5): see [docs/os-selfhost-roadmap.md](docs/os-selfhost-roadmap.md)
@@ -589,6 +590,20 @@ Interactive command shell with builtins and argument parsing.
 - **STAR MSR**: SYSCALL CS base = `kernel_ss - 8` so SS = valid data segment (0x30), not TSS (0x40).
 
 **Tier 2 milestone**: Interactive `osito>` shell with keyboard input, ELF execution, filesystem browsing. 20/20 QEMU test stability.
+
+### X-OS10: File I/O Syscalls + GDT Relocation
+Complete file I/O syscall set and critical GDT memory safety fix.
+- **File syscalls**: open(2), close(3), read(0), lseek(8), fstat(5), brk(12), writev(20), ioctl(16). Linux-compatible numbers and semantics.
+- **FD table**: 16 entries per process. Types: FD_TYPE_CONSOLE (stdin/stdout/stderr) and FD_TYPE_FILE (OsitoFS files). open() returns lowest free fd, close() releases it.
+- **OsitoFS integration**: open() calls `osfs2_find()`/`osfs2_create()`, read/write dispatch to `osfs2_read()`/`osfs2_write()`. Tracks file offset per fd. O_CREAT, O_APPEND, O_TRUNC flags.
+- **lseek**: SEEK_SET/SEEK_CUR/SEEK_END. fstat: returns st_size/st_mode/st_blksize for files, S_IFCHR for console.
+- **brk**: Lazy 4MB heap allocation via kmalloc. brk(0) returns current break, brk(addr) adjusts within region. Zeroes newly exposed memory.
+- **GDT relocation** (`idt.c:gdt_init()`): UEFI's GDT lives in boot services memory freed by mem_init(). iretq in ISR stubs reloads CS/SS from GDT on every interrupt return. When allocations overwrite the GDT, iretq jumps to garbage. Fix: copy GDT to static BSS buffer + LGDT before any page allocations.
+- **ET_EXEC memory lifecycle**: `mem_reserve_range()` validates fixed-address ELF loads against page allocator bitmap. `proc_add_region()` registers ELF segments + stack with process for cleanup on exit. `syscall_reset_process()` frees file FDs and brk heap between processes.
+- **Test**: `fileio.c` — 11 tests (open, read, lseek, fstat, close, read-after-close, ENOENT, brk alloc, brk read/write). All pass with sequential hello.elf → fileio.elf execution.
+- **Files**: `syscall.c` (file syscalls), `memory.c` (mem_reserve_range), `elf.c` (lifecycle), `process.c` (proc_add_region), `idt.c` (gdt_init), `test/fileio.c`
+
+**Tier 2 complete**: Full file I/O + stable sequential ELF execution. Ready for Tier 3 (TCC cross-compilation).
 
 ### X27: Falcon PIO Load
 Programmed I/O access to Falcon IMEM/DMEM via IMEMC/IMEMD registers.

@@ -379,11 +379,18 @@ void kernel_entry(void *memory_map, uint64_t map_size,
                     gpu_llama_benchmark_standalone();
                 }
 
-                /* ── Try executing hello.elf if present ── */
+                /* ── Try executing ELF programs if present ── */
                 if (osfs2_find("hello.elf")) {
                     serial_puts("[KERN] Found hello.elf — executing...\n");
-                    fb_puts_color("\n Running hello.elf...\n", 0x0000FF00);
                     proc_exec("hello.elf", 0, NULL);
+                }
+
+                if (osfs2_find("fileio.elf")) {
+                    serial_puts("[KERN] Found fileio.elf — executing...\n");
+                    int ret = proc_exec("fileio.elf", 0, NULL);
+                    serial_puts("[KERN] fileio.elf exited with code ");
+                    serial_putdec(ret < 0 ? (uint64_t)(-(int64_t)ret) : (uint64_t)ret);
+                    serial_puts("\n");
                 }
             } else {
                 serial_puts("[KERN] OsitoFS not found (no GPT, no raw)\n");
