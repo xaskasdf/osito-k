@@ -166,6 +166,8 @@ arch/x86/kernel/crypto.h            Crypto primitives API (SHA-256, HMAC, AES-12
 arch/x86/kernel/crypto.c            Crypto implementation (all from scratch, no external libs)
 arch/x86/kernel/tls.h               TLS 1.2 client types + API (tls_conn_t, connect/send/recv/close)
 arch/x86/kernel/tls.c               TLS 1.2 client (ECDHE-RSA-AES128-GCM-SHA256, no cert verify)
+arch/x86/kernel/http.h              HTTP client API (http_session_t, open/request/read_body/close)
+arch/x86/kernel/http.c              HTTPS client (GET/POST, chunked transfer, streaming body)
 arch/x86/kernel/shell.c             Interactive shell (15 builtins, argv parser, ELF exec)
 arch/x86/include/types.h            Freestanding types + MMIO + port I/O
 arch/x86/libc/crt.c                 Minimal CRT (_start, printf, malloc, POSIX I/O wrappers)
@@ -342,6 +344,7 @@ Tasks:   idle, input, shell (3 of 8 slots used)
 | **X-OS13** | **TCC in-OS compilation** (TCC 0.9.28rc runs inside OsitoK, compiles .c → .o, extended libc: FILE*, fprintf, strtol, qsort, setjmp) | Done |
 | **X-NET1** | **ICMP** (echo request/reply, ping command in shell, IP checksum verification) | Done |
 | **X-NET4** | **TLS 1.2 + Crypto** (SHA-256, HMAC, AES-128-GCM, X25519, ECDHE-RSA handshake, gateway routing) | Done |
+| **X-NET5** | **HTTP client** (GET/POST over HTTPS, chunked transfer-encoding, streaming body, curl command) | Done |
 | **X-NET2** | **TCP stack** (client-only, 3-way handshake, send/recv, FIN close, tcptest shell command) | Done |
 | **X-NET3** | **DNS resolver** (UDP query to SLIRP DNS, A record parse, resolve shell command) | Done |
 
@@ -595,7 +598,7 @@ Scancode set 1 translation with modifier tracking and ring buffer.
 ### X-OS9: Mini Shell
 Interactive command shell with builtins and argument parsing.
 - **Parsing**: Whitespace-delimited argv splitting, max 16 args.
-- **Builtins**: `help`, `uname`, `ps`, `mem`, `uptime`, `echo`, `ls`, `cat`, `exec`, `cc`/`tcc`, `ping`, `resolve`, `tcptest`, `tlstest`, `clear`, `reboot`, `halt`.
+- **Builtins**: `help`, `uname`, `ps`, `mem`, `uptime`, `echo`, `ls`, `cat`, `exec`, `cc`/`tcc`, `ping`, `resolve`, `tcptest`, `tlstest`, `curl`, `clear`, `reboot`, `halt`.
 - **exec**: Runs ELF binary from OsitoFS via `proc_exec()`. Process exit returns to shell.
 - **cc/tcc**: Compile C with TCC. `cc file.c` produces file.elf, `cc -run file.c` compiles+executes.
 - **cat**: Reads file from OsitoFS, displays as text (non-printable → '.'), max 4KB preview.
@@ -715,6 +718,17 @@ Complete TLS 1.2 client with all crypto implemented from scratch (no external li
 - **PRNG**: RDTSC-seeded xorshift64 for client_random and ECDHE private key.
 - **Verified**: HTTPS GET to example.com returns HTTP/1.1 200 OK over encrypted TLS 1.2 channel.
 - **Files**: `arch/x86/kernel/crypto.h`, `arch/x86/kernel/crypto.c`, `arch/x86/kernel/tls.h`, `arch/x86/kernel/tls.c`, `arch/x86/kernel/net.c` (gateway routing), `arch/x86/kernel/shell.c` (tlstest command)
+
+### X-NET5: HTTP Client
+HTTPS client over DNS + TCP + TLS. Supports GET/POST, chunked transfer-encoding, streaming body callback.
+- **Session API**: `http_open(session, hostname)` — DNS resolve + TCP connect (port 443) + TLS 1.2 handshake in one call. `http_close(session)` tears down everything.
+- **Request API**: `http_request(session, method, path, hostname, headers, body, body_len, resp)` — builds and sends HTTP request, reads and parses response status + headers. Handles `Connection: close`, `User-Agent`, `Content-Length`.
+- **Response parsing**: Reads until `\r\n\r\n`, parses status code, up to 16 response headers (case-insensitive lookup), detects `Transfer-Encoding: chunked` and `Content-Length`.
+- **Body reading**: `http_read_body(session, resp, callback, ctx)` — streaming body via callback. Handles both chunked (hex-size parsing, chunk-by-chunk delivery) and content-length modes. `http_read_body_full()` convenience wrapper reads into buffer.
+- **Leftover handling**: Data received after header `\r\n\r\n` but before `http_read_body` call is stashed in static buffer (4KB) and delivered first.
+- **Shell command**: `curl <hostname> [path]` — HTTPS GET, displays first 1000 chars of response body.
+- **Verified**: `curl example.com /` returns 528 bytes HTML (`<!doctype html><html lang="en">...Example Domain...`).
+- **Files**: `arch/x86/kernel/http.h`, `arch/x86/kernel/http.c`, `arch/x86/kernel/shell.c` (curl command)
 
 ### X27: Falcon PIO Load
 Programmed I/O access to Falcon IMEM/DMEM via IMEMC/IMEMD registers.

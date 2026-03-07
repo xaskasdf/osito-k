@@ -68,6 +68,21 @@ extern int  tls_send(void *tls, const void *data, uint32_t len);
 extern int  tls_recv(void *tls, void *buf, uint32_t buf_size, uint32_t timeout_ticks);
 extern void tls_close(void *tls);
 
+/* HTTP — uses http_session_t (includes tls_conn_t, ~17KB) */
+extern int  http_open(void *session, const char *hostname);
+extern int  http_request(void *session, const char *method, const char *path,
+                         const char *hostname, const char *const *req_headers,
+                         const void *body, uint32_t body_len, void *resp);
+extern int  http_read_body_full(void *session, const void *resp,
+                                void *buf, uint32_t buf_size);
+extern void http_close(void *session);
+extern const char *http_get_header(const void *resp, const char *name);
+
+/* http_session_t size = sizeof(tls_conn_t) + int + bool + padding.
+ * Approximate with tls_conn_size() + 16. Actually let's just define it: */
+extern uint32_t http_session_size(void);
+extern uint32_t http_response_size(void);
+
 /* ── Shell output helpers ────────────────────────────────────── */
 
 static void sh_puts(const char *s)
@@ -131,6 +146,7 @@ static void cmd_help(void)
     sh_puts("  tcptest   TCP connection test (tcptest [ip] [port])\n");
     sh_puts("  resolve   DNS lookup (resolve hostname)\n");
     sh_puts("  tlstest   TLS connect test (tlstest [hostname])\n");
+    sh_puts("  curl      HTTPS GET (curl hostname [path])\n");
     sh_puts("  clear     Clear screen\n");
     sh_puts("  reboot    Reboot system\n");
     sh_puts("  halt      Halt CPU\n");
@@ -662,6 +678,79 @@ static void cmd_tlstest(int argc, char *argv[])
     sh_puts("Connection closed.\n");
 }
 
+/* ── Builtin: curl ───────────────────────────────────────────── */
+
+static void cmd_curl(int argc, char *argv[])
+{
+    if (argc < 2) {
+        sh_puts("Usage: curl <hostname> [path]\n");
+        sh_puts("  Example: curl example.com /\n");
+        sh_puts("  Example: curl api.anthropic.com /v1/models\n");
+        return;
+    }
+
+    const char *hostname = argv[1];
+    const char *path = "/";
+    if (argc >= 3) path = argv[2];
+
+    void *session = kmalloc(http_session_size());
+    if (!session) { sh_puts("Out of memory\n"); return; }
+
+    void *resp = kmalloc(http_response_size());
+    if (!resp) { kfree(session); sh_puts("Out of memory\n"); return; }
+
+    /* Open HTTPS session */
+    if (http_open(session, hostname) < 0) {
+        kfree(resp);
+        kfree(session);
+        return;
+    }
+
+    /* Send GET request */
+    const char *headers[] = {
+        "Connection: close",
+        "User-Agent: OsitoK/1.0",
+        NULL
+    };
+
+    if (http_request(session, "GET", path, hostname, headers,
+                     NULL, 0, resp) < 0) {
+        http_close(session);
+        kfree(resp);
+        kfree(session);
+        return;
+    }
+
+    /* Read body */
+    char *body = (char *)kmalloc(8192);
+    if (body) {
+        int n = http_read_body_full(session, resp, body, 8191);
+        if (n > 0) {
+            body[n] = '\0';
+            /* Print first 1000 chars */
+            int show = n > 1000 ? 1000 : n;
+            for (int i = 0; i < show; i++) {
+                char c = body[i];
+                if (c == '\r') continue;
+                if (c < 0x20 && c != '\n' && c != '\t') c = '.';
+                char s[2] = {c, 0};
+                sh_puts(s);
+            }
+            if (n > 1000) {
+                sh_puts("\n... (");
+                sh_putdec((uint64_t)(n - 1000));
+                sh_puts(" more bytes)\n");
+            }
+            sh_puts("\n");
+        }
+        kfree(body);
+    }
+
+    http_close(session);
+    kfree(resp);
+    kfree(session);
+}
+
 /* ── Builtin: reboot ─────────────────────────────────────────── */
 
 static void cmd_reboot(void)
@@ -735,6 +824,8 @@ static void shell_exec(char *line)
         cmd_resolve(argc, argv);
     } else if (strcmp(cmd, "tlstest") == 0) {
         cmd_tlstest(argc, argv);
+    } else if (strcmp(cmd, "curl") == 0) {
+        cmd_curl(argc, argv);
     } else if (strcmp(cmd, "clear") == 0) {
         cmd_clear();
     } else if (strcmp(cmd, "reboot") == 0) {

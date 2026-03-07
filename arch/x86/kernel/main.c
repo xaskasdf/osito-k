@@ -465,7 +465,7 @@ void kernel_entry(void *memory_map, uint64_t map_size,
         fb_puts("\n NIC: not detected\n");
     }
 
-    /* TLS available via shell 'tlstest' command */
+    /* HTTP available via shell 'curl' command */
 
     /* ── Step 5: Keyboard + Terminal + Shell ── */
     kb_init();
