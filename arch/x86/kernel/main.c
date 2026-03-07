@@ -41,6 +41,11 @@ extern void proc_init(void);
 extern int  proc_exec(const char *filename, int argc, const char **argv);
 extern void proc_list(void);
 
+/* Keyboard + Terminal + Shell */
+extern void kb_init(void);
+extern void term_init(void);
+extern void shell_run(void);
+
 /* Serial */
 extern void serial_puts(const char *s);
 extern void serial_puthex(uint64_t val, int digits);
@@ -412,14 +417,13 @@ void kernel_entry(void *memory_map, uint64_t map_size,
         fb_puts("\n NIC: not detected\n");
     }
 
-    /* ── Done — main loop with net polling ── */
-    serial_puts("\n[KERN] Boot complete. Entering main loop.\n");
-    serial_puts("[KERN] Serial console ready (115200 8N1)\n");
+    /* ── Step 5: Keyboard + Terminal + Shell ── */
+    kb_init();
+    term_init();
 
-    fb_puts("\n Boot complete. Network active.\n");
+    serial_puts("\n[KERN] Boot complete.\n");
+    fb_puts("\n Boot complete.\n");
 
-    for (;;) {
-        net_poll();
-        __asm__ volatile ("hlt");
-    }
+    /* Run interactive shell (never returns) */
+    shell_run();
 }

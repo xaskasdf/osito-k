@@ -97,7 +97,11 @@ extern void isr_stub_29(void);
 extern void isr_stub_30(void);
 extern void isr_stub_31(void);
 extern void isr_stub_32(void);   /* APIC timer */
-extern void isr_stub_default(void);  /* vectors 33-255 */
+extern void isr_stub_33(void);   /* Keyboard IRQ */
+extern void isr_stub_default(void);  /* vectors 34-255 */
+
+/* Keyboard handler */
+extern void keyboard_irq(void);
 
 /* ── Exception names ─────────────────────────────────────────── */
 
@@ -221,6 +225,20 @@ void isr_handler(interrupt_frame_t *frame)
         return;
     }
 
+    /* Keyboard IRQ (IDT 0x71 uses isr_stub_33 which pushes vec=33) */
+    if (vec == 33) {
+        keyboard_irq();
+        outb(0x20, 0x20);  /* PIC EOI to master */
+        return;
+    }
+
+    /* Other PIC IRQs (just EOI and ignore) */
+    if (vec >= 0x70 && vec < 0x80) {
+        if (vec >= 0x78) outb(0xA0, 0x20);  /* Slave EOI */
+        outb(0x20, 0x20);  /* Master EOI */
+        return;
+    }
+
     /* CPU exception (vectors 0-31) */
     if (vec < 32) {
         serial_puts("\n!!! EXCEPTION: ");
@@ -314,6 +332,52 @@ void isr_handler(interrupt_frame_t *frame)
         apic_write(APIC_EOI, 0);
 }
 
+/* ── 8259 PIC init (remap IRQ 0-15 → vectors 32-47) ──────────── */
+
+static void pic_init(void)
+{
+    /* Mask all IRQs first to prevent spurious interrupts during remap */
+    outb(0x21, 0xFF);
+    outb(0xA1, 0xFF);
+
+    /* Small I/O delay */
+    inb(0x80); inb(0x80);
+
+    /* ICW1: begin init sequence, cascade, ICW4 needed */
+    outb(0x20, 0x11);  /* Master PIC command */
+    inb(0x80);
+    outb(0xA0, 0x11);  /* Slave PIC command */
+    inb(0x80);
+
+    /* ICW2: remap vectors (above APIC timer at 32) */
+    outb(0x21, 0x70);  /* Master: IRQ 0-7 → vectors 0x70-0x77 */
+    inb(0x80);
+    outb(0xA1, 0x78);  /* Slave:  IRQ 8-15 → vectors 0x78-0x7F */
+    inb(0x80);
+
+    /* ICW3: cascade wiring */
+    outb(0x21, 0x04);  /* Master: slave on IRQ 2 */
+    inb(0x80);
+    outb(0xA1, 0x02);  /* Slave:  cascade identity 2 */
+    inb(0x80);
+
+    /* ICW4: 8086 mode */
+    outb(0x21, 0x01);
+    inb(0x80);
+    outb(0xA1, 0x01);
+    inb(0x80);
+
+    /* Mask all IRQs initially (keyboard will unmask IRQ 1 in kb_init) */
+    outb(0x21, 0xFF);
+    outb(0xA1, 0xFF);
+
+    /* Send EOI to clear any pending */
+    outb(0x20, 0x20);
+    outb(0xA0, 0x20);
+
+    serial_puts("[IDT] 8259 PIC remapped: IRQ 0-7 → vec 0x70, IRQ 8-15 → vec 0x78\n");
+}
+
 /* ── APIC init ───────────────────────────────────────────────── */
 
 static void apic_init(void)
@@ -361,6 +425,9 @@ void idt_init(void)
 {
     serial_puts("[IDT] Setting up interrupt descriptor table...\n");
 
+    /* Disable interrupts during IDT setup */
+    __asm__ volatile ("cli");
+
     /* Detect current CS selector from GDT */
     uint16_t cs = get_cs();
     serial_puts("[IDT] Current CS: 0x");
@@ -380,20 +447,25 @@ void idt_init(void)
         isr_stub_20, isr_stub_21, isr_stub_22, isr_stub_23,
         isr_stub_24, isr_stub_25, isr_stub_26, isr_stub_27,
         isr_stub_28, isr_stub_29, isr_stub_30, isr_stub_31,
-        isr_stub_32
+        isr_stub_32,
+        isr_stub_33
     };
 
-    /* Set exception + timer entries with actual CS */
-    for (int i = 0; i <= 32; i++) {
+    /* Set exception + timer + keyboard entries with actual CS */
+    for (int i = 0; i <= 33; i++) {
         idt_set_entry(i, stubs[i], 0);
         idt[i].selector = cs;
     }
 
-    /* Vectors 33-255: default stub (just IRET) */
-    for (int i = 33; i < 256; i++) {
+    /* Vectors 34-255: default stub (just IRET) */
+    for (int i = 34; i < 256; i++) {
         idt_set_entry(i, isr_stub_default, 0);
         idt[i].selector = cs;
     }
+
+    /* Override: vector 0x71 = keyboard IRQ (uses isr_stub_33) */
+    idt_set_entry(0x71, isr_stub_33, 0);
+    idt[0x71].selector = cs;
 
     /* Load IDT */
     idtr.limit = sizeof(idt) - 1;
@@ -404,6 +476,9 @@ void idt_init(void)
     serial_puts("[IDT] Loaded IDT (256 entries) at 0x");
     serial_puthex(idtr.base, 16);
     serial_puts("\n");
+
+    /* Initialize 8259 PIC (remap IRQs to vectors 32+) */
+    pic_init();
 
     /* Initialize APIC and enable timer */
     apic_init();

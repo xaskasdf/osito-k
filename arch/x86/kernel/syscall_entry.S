@@ -60,20 +60,17 @@ syscall_entry:
     mov %rsp, %rbp
     and $~0xF, %rsp
 
-    /* Re-enable interrupts for syscall handler */
-    sti
-
+    /* Interrupts stay disabled during syscall (non-preemptive kernel).
+     * kern_longjmp (proc_exit) bypasses the return path, so keeping
+     * interrupts off avoids races with the APIC timer. */
     call syscall_dispatch
-
-    /* Disable interrupts for SYSRET */
-    cli
 
     /* Restore stack */
     mov %rbp, %rsp
 
     /* Restore user return info */
-    pop %r11          /* RFLAGS */
-    pop %rcx          /* RIP */
+    pop %r11          /* saved RFLAGS */
+    pop %rcx          /* saved RIP */
 
     /* Restore callee-saved registers */
     pop %r15
@@ -83,8 +80,13 @@ syscall_entry:
     pop %rbx
     pop %rbp
 
-    /* Return to caller.
-     * SYSRET loads: RIP=RCX, RFLAGS=R11, CS/SS from STAR
-     * For ring-0 only: use SYSRETQ.
-     * RAX already has return value from syscall_dispatch. */
-    sysretq
+    /*
+     * Return to caller (ring-0 only).
+     * Use STI (not POPFQ) to re-enable interrupts.
+     * STI has a 1-instruction interrupt shadow, so the JMP
+     * executes atomically before any pending interrupt fires.
+     * Other RFLAGS bits (DF, etc.) were cleared by FMASK and
+     * are fine for our ring-0 ELF programs.
+     */
+    sti
+    jmp *%rcx           /* Jump to saved RIP (in STI shadow) */

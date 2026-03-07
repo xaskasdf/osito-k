@@ -197,6 +197,8 @@ void fb_putc(char c, uint32_t color)
         text_row++;
     } else if (c == '\r') {
         text_col = 0;
+    } else if (c == '\b') {
+        if (text_col > 0) text_col--;
     } else if (c == '\t') {
         text_col = (text_col + 4) & ~3;
     } else {
@@ -242,4 +244,9 @@ void fb_putdec(uint64_t val)
         val /= 10;
     }
     while (--i >= 0) fb_putc(buf[i], FG_COLOR);
+}
+
+void fb_putchar(char c)
+{
+    fb_putc(c, FG_COLOR);
 }

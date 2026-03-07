@@ -121,21 +121,16 @@ static int64_t sys_read(uint64_t fd, uint64_t buf, uint64_t count)
     return fd_table[fd].read((void *)buf, (size_t)count);
 }
 
+extern void proc_exit(int32_t code);
+
 static int64_t sys_exit(uint64_t status)
 {
-    serial_puts("[SYSCALL] exit(");
-    serial_putdec(status);
-    serial_puts(")\n");
+    /* Return to kernel via proc_exit (longjmp to proc_exec) */
+    proc_exit((int32_t)status);
 
-    fb_puts("\n Process exited with code ");
-    fb_putdec(status);
-    fb_puts("\n");
-
-    /* For now, just halt. With X-OS6 (processes), this will
-     * clean up the process and return to scheduler. */
+    /* unreachable — proc_exit never returns */
     for (;;) __asm__ volatile ("hlt");
-
-    return 0;  /* unreachable */
+    return 0;
 }
 
 /* brk stub — returns current break (no-op for now, heap handles this) */
@@ -181,7 +176,6 @@ static uint16_t get_cs(void)
 
 /* Assembly entry point (defined in syscall_entry.S) */
 extern void syscall_entry(void);
-
 void syscall_init(void)
 {
     serial_puts("[SYSCALL] Setting up SYSCALL/SYSRET...\n");
@@ -204,15 +198,26 @@ void syscall_init(void)
      * But for now we only have ring 0, so user selectors don't matter yet.
      */
     uint16_t kernel_cs = get_cs();
-    uint64_t star = ((uint64_t)(kernel_cs - 16) << 48) | ((uint64_t)kernel_cs << 32);
+    uint16_t kernel_ss;
+    __asm__ volatile ("mov %%ss, %0" : "=r"(kernel_ss));
+
+    /* SYSCALL requires CS and SS as adjacent GDT entries:
+     * CS = STAR[47:32], SS = STAR[47:32]+8.
+     * Use (SS-8) as the SYSCALL CS base so SS lands on the
+     * actual data segment, not the TSS. */
+    uint16_t syscall_cs_base = kernel_ss - 8;
+    uint64_t star = ((uint64_t)(syscall_cs_base - 16) << 48) |
+                    ((uint64_t)syscall_cs_base << 32);
+
+    serial_puts("[SYSCALL] Kernel CS=0x");
+    serial_puthex(kernel_cs, 4);
+    serial_puts(" SS=0x");
+    serial_puthex(kernel_ss, 4);
+    serial_puts(" SYSCALL CS base=0x");
+    serial_puthex(syscall_cs_base, 4);
+    serial_puts("\n");
 
     wrmsr(MSR_STAR, star);
-
-    serial_puts("[SYSCALL] Kernel CS: 0x");
-    serial_puthex(kernel_cs, 4);
-    serial_puts(", STAR: 0x");
-    serial_puthex(star, 16);
-    serial_puts("\n");
 
     /* LSTAR: RIP loaded on SYSCALL */
     wrmsr(MSR_LSTAR, (uint64_t)syscall_entry);

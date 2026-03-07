@@ -93,6 +93,13 @@ static process_t proctab[MAX_PROCESSES];
 static process_t *current_proc;
 static uint32_t next_pid = 1;
 
+/* Kernel return context — saved before exec, restored on exit */
+extern int  kern_setjmp(uint64_t *buf);
+extern void kern_longjmp(uint64_t *buf, int val);
+
+static uint64_t exec_jmpbuf[8];   /* setjmp/longjmp buffer */
+static int32_t  last_exit_code;
+
 /* Console I/O (shared with syscall.c) */
 extern void serial_putc(char c);
 extern void fb_putc(char c, uint32_t color);
@@ -187,22 +194,8 @@ process_t *proc_find(uint32_t pid)
 /* Process exit — called from sys_exit() */
 void proc_exit(int32_t code)
 {
-    if (!current_proc) return;
-
-    serial_puts("[PROC] Process '");
-    serial_puts(current_proc->name);
-    serial_puts("' (PID ");
-    serial_putdec(current_proc->pid);
-    serial_puts(") exited with code ");
-    serial_putdec((uint64_t)(code < 0 ? -code : code));
-    serial_puts("\n");
-
-    current_proc->exit_code = code;
-    current_proc->state = PROC_ZOMBIE;
-
-    /* For now, just mark as zombie. The parent (kernel) will
-     * clean up via waitpid. With a scheduler, this would
-     * switch to the next ready process. */
+    last_exit_code = code;
+    kern_longjmp(exec_jmpbuf, 1);
 }
 
 /* Wait for process to finish (synchronous) */
@@ -247,6 +240,15 @@ int proc_exec(const char *filename, int argc, const char **argv)
     fb_puts(filename);
     fb_puts("\n");
 
+    /* Save kernel context so proc_exit() can longjmp back here */
+    if (kern_setjmp(exec_jmpbuf) != 0) {
+        /* Returned from proc_exit via longjmp */
+        int code = last_exit_code;
+        current_proc = prev;
+        proc_free(p);
+        return code;
+    }
+
     /* Execute ELF — this calls elf_exec which does not return
      * on success (jumps to ELF entry). On failure, returns here. */
     int ret = elf_exec(filename, argc, argv);
@@ -262,27 +264,34 @@ int proc_exec(const char *filename, int argc, const char **argv)
     return ret;
 }
 
-/* Process list (for shell `ps` command) */
+/* Process list (for shell `ps` command) — outputs to serial + framebuffer */
 void proc_list(void)
 {
-    serial_puts("[PROC] Process list:\n");
     serial_puts("  PID  STATE    NAME\n");
+    fb_puts("  PID  STATE    NAME\n");
 
     for (int i = 0; i < MAX_PROCESSES; i++) {
         if (proctab[i].state == PROC_FREE) continue;
 
         serial_puts("  ");
         serial_putdec(proctab[i].pid);
+        fb_puts("  ");
+        fb_putdec(proctab[i].pid);
 
+        const char *state_str;
         switch (proctab[i].state) {
-        case PROC_READY:   serial_puts("  READY    "); break;
-        case PROC_RUNNING: serial_puts("  RUNNING  "); break;
-        case PROC_ZOMBIE:  serial_puts("  ZOMBIE   "); break;
-        default:           serial_puts("  ???      "); break;
+        case PROC_READY:   state_str = "  READY    "; break;
+        case PROC_RUNNING: state_str = "  RUNNING  "; break;
+        case PROC_ZOMBIE:  state_str = "  ZOMBIE   "; break;
+        default:           state_str = "  ???      "; break;
         }
+        serial_puts(state_str);
+        fb_puts(state_str);
 
         serial_puts(proctab[i].name);
         serial_puts("\n");
+        fb_puts(proctab[i].name);
+        fb_puts("\n");
     }
 }
 

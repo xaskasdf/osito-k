@@ -37,6 +37,12 @@ void serial_putc(char c)
     outb(COM1_PORT + REG_DATA, (uint8_t)c);
 }
 
+void serial_putchar(char c)
+{
+    if (c == '\n') serial_putc('\r');
+    serial_putc(c);
+}
+
 void serial_puts(const char *s)
 {
     while (*s) {

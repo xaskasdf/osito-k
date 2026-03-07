@@ -130,7 +130,11 @@ ISR_NOERR 31
 
 ISR_NOERR 32
 
-/* ── Default stub for vectors 33-255 ─────────────────────────── */
+/* ── Vector 33: Keyboard IRQ (IRQ 1) ────────────────────────── */
+
+ISR_NOERR 33
+
+/* ── Default stub for vectors 34-255 ─────────────────────────── */
 
 .globl isr_stub_default
 isr_stub_default:
