@@ -400,6 +400,15 @@ void kernel_entry(void *memory_map, uint64_t map_size,
                     serial_putdec(ret < 0 ? (uint64_t)(-(int64_t)ret) : (uint64_t)ret);
                     serial_puts("\n");
                 }
+
+                if (osfs2_find("tcc.elf")) {
+                    serial_puts("[KERN] Found tcc.elf — compiling tiny.c...\n");
+                    const char *tcc_argv[] = { "tcc", "-c", "-nostdlib", "-nostdinc", "tiny.c", "-o", "tiny.o" };
+                    int ret = proc_exec("tcc.elf", 7, tcc_argv);
+                    serial_puts("[KERN] tcc.elf exited with code ");
+                    serial_putdec(ret < 0 ? (uint64_t)(-(int64_t)ret) : (uint64_t)ret);
+                    serial_puts("\n");
+                }
             } else {
                 serial_puts("[KERN] OsitoFS not found (no GPT, no raw)\n");
                 fb_puts("\n OsitoFS: not found\n");

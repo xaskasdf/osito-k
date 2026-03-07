@@ -243,19 +243,4 @@ int puts(const char *s)
     return 0;
 }
 
-/* ── ELF entry point ── */
-
-extern int main(int argc, char **argv);
-
-void _start(void)
-{
-    /* Stack layout from ELF loader: RSP → argc, argv[0], ..., NULL, envp */
-    long *sp;
-    __asm__ volatile ("mov %%rsp, %0" : "=r"(sp));
-
-    int argc = (int)sp[0];
-    char **argv = (char **)&sp[1];
-
-    int ret = main(argc, argv);
-    _exit(ret);
-}
+/* _start is in syscall.S — reads argc/argv before C prologue corrupts RSP */

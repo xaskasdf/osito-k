@@ -77,7 +77,9 @@ static inline void wrmsr(uint32_t msr, uint64_t val) {
 #define SYS_BRK         12
 #define SYS_IOCTL       16
 #define SYS_WRITEV      20
+#define SYS_ACCESS      21
 #define SYS_EXIT        60
+#define SYS_UNLINK      87
 #define SYS_ARCH_PRCTL  158
 
 /* errno values */
@@ -395,6 +397,25 @@ static int64_t sys_ioctl(uint64_t fd, uint64_t request, uint64_t arg)
     return -ENOTTY;
 }
 
+/* access — check if file exists */
+extern int osfs2_delete(const char *name);
+
+static int64_t sys_access(uint64_t path_addr, uint64_t mode)
+{
+    (void)mode;
+    const char *path = (const char *)path_addr;
+    if (!path) return -EFAULT;
+    return osfs2_find(path) ? 0 : -ENOENT;
+}
+
+/* unlink — delete file from OsitoFS */
+static int64_t sys_unlink(uint64_t path_addr)
+{
+    const char *path = (const char *)path_addr;
+    if (!path) return -EFAULT;
+    return osfs2_delete(path) == 0 ? 0 : -ENOENT;
+}
+
 /* ── Syscall dispatch (called from assembly) ─────────────────── */
 
 int64_t syscall_dispatch(uint64_t nr, uint64_t a1, uint64_t a2,
@@ -412,7 +433,9 @@ int64_t syscall_dispatch(uint64_t nr, uint64_t a1, uint64_t a2,
     case SYS_BRK:        return sys_brk(a1);
     case SYS_IOCTL:      return sys_ioctl(a1, a2, a3);
     case SYS_WRITEV:     return sys_writev(a1, a2, a3);
+    case SYS_ACCESS:     return sys_access(a1, a2);
     case SYS_EXIT:       return sys_exit(a1);
+    case SYS_UNLINK:     return sys_unlink(a1);
     case SYS_ARCH_PRCTL: return -ENOSYS;  /* stub */
     default:
         serial_puts("[SYSCALL] Unknown syscall ");

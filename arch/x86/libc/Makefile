@@ -2,8 +2,9 @@
 # OsitoK x86-64 — Minimal libc for userspace programs
 #
 # Usage:
-#   make                    # build crt.o + syscall.o
+#   make                    # build crt.o + syscall.o + tcclib.o
 #   make hello_c.elf        # build test program
+#   make tcc.elf            # build TCC compiler for OsitoK
 #
 # Link your program:
 #   tcc -c -nostdlib -nostdinc myapp.c -o myapp.o
@@ -20,16 +21,21 @@ LIBC   := $(BUILD)/libc
 
 .PHONY: all clean
 
-all: $(LIBC)/crt.o $(LIBC)/syscall.o
+all: $(LIBC)/crt.o $(LIBC)/syscall.o $(LIBC)/tcclib.o
 
 $(LIBC):
 	mkdir -p $(LIBC)
 
 $(LIBC)/crt.o: crt.c | $(LIBC)
-	$(TCC) -c -nostdlib -nostdinc $< -o $@
+	$(CC) -c -O2 -std=gnu11 -fno-builtin -fno-stack-protector -fno-pie \
+	    -nostdinc -ffreestanding $< -o $@
 
 $(LIBC)/syscall.o: syscall.S | $(LIBC)
 	$(CC) -c -nostdlib $< -o $@
+
+$(LIBC)/tcclib.o: tcclib.c | $(LIBC)
+	$(CC) -c -O2 -std=gnu11 -fno-builtin -fno-stack-protector -fno-pie \
+	    -nostdinc -ffreestanding $< -o $@
 
 clean:
 	rm -rf $(LIBC)
@@ -43,3 +49,13 @@ $(TEST)/hello_c.elf: $(LIBC)/crt.o $(LIBC)/syscall.o $(TEST)/hello_c.c
 	    $(LIBC)/crt.o $(LIBC)/syscall.o $(BUILD)/hello_c.o -o $@
 
 hello_c.elf: $(TEST)/hello_c.elf
+
+# ── Build TCC for OsitoK ──
+TCC_OBJ := $(BUILD)/tcc.o
+
+$(TEST)/tcc.elf: $(LIBC)/crt.o $(LIBC)/syscall.o $(LIBC)/tcclib.o $(TCC_OBJ)
+	$(LD) -nostdlib -static -no-pie -e _start -Ttext=0x401000 \
+	    $(LIBC)/crt.o $(LIBC)/syscall.o $(LIBC)/tcclib.o $(TCC_OBJ) -o $@
+	@ls -lh $@
+
+tcc.elf: $(TEST)/tcc.elf

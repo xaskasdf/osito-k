@@ -164,7 +164,9 @@ arch/x86/kernel/shell.c             Interactive shell (12 builtins, argv parser,
 arch/x86/include/types.h            Freestanding types + MMIO + port I/O
 arch/x86/libc/crt.c                 Minimal CRT (_start, printf, malloc, POSIX I/O wrappers)
 arch/x86/libc/syscall.S             Raw SYSCALL instruction wrappers (__syscall1-4)
-arch/x86/libc/Makefile              Build CRT + link userspace ELFs with TCC
+arch/x86/libc/Makefile              Build CRT + tcclib + link userspace ELFs
+arch/x86/libc/tcclib.c              Extended libc for TCC (FILE*, fprintf, strtol, qsort, setjmp stubs)
+arch/x86/test/tiny.c                Minimal test C program for TCC compilation test
 
 # OsitoFS v2 Host Tools (tools/ositofs/)
 include/common/ositofs2_format.h     On-disk format (shared header)
@@ -331,6 +333,7 @@ Tasks:   idle, input, shell (3 of 8 slots used)
 | **X-OS10** | **File I/O syscalls + GDT fix** (open/close/read/lseek/fstat/brk/writev, OsitoFS fd table, GDT relocation, ET_EXEC memory lifecycle) | Done |
 | **X-OS11** | **TCC cross-compilation** (TCC 0.9.28rc compiles C → .o, ld links with CRT → static ET_EXEC ELF for OsitoK) | Done |
 | **X-OS12** | **Minimal CRT** (crt.c: _start, printf, malloc, open/close/read/write/lseek, strlen/memset/memcpy; syscall.S: raw SYSCALL wrappers) | Done |
+| **X-OS13** | **TCC in-OS compilation** (TCC 0.9.28rc runs inside OsitoK, compiles .c → .o, extended libc: FILE*, fprintf, strtol, qsort, setjmp) | Done |
 
 > Full GPU roadmap (X27-X40 + contingency): see [docs/x86-gpu-roadmap.md](docs/x86-gpu-roadmap.md)
 > Full OS roadmap (Tier 0-5): see [docs/os-selfhost-roadmap.md](docs/os-selfhost-roadmap.md)
@@ -629,7 +632,27 @@ Freestanding C runtime so TCC-compiled programs can use printf, malloc, and file
 - **String ops**: strlen, memset, memcpy, strcmp.
 - **Files**: `arch/x86/libc/crt.c`, `arch/x86/libc/syscall.S`, `arch/x86/libc/Makefile`
 
-**Tier 3 milestone (partial)**: TCC cross-compiles C programs with printf/malloc/file I/O for OsitoK. Next: compile TCC itself as an OsitoK binary (X-OS13).
+### X-OS13: TCC In-OS Compilation
+TCC 0.9.28rc compiled as a static ELF64 binary running inside OsitoK. Can read C source from OsitoFS and produce .o object files.
+- **TCC object**: GCC cross-compiles tcc.c with `-DONE_SOURCE=1 -DTCC_TARGET_X86_64=1 -DCONFIG_TCC_STATIC=1 -std=gnu11 -fno-builtin`. 556KB .o with 317 text symbols.
+- **Extended libc** (`tcclib.c`): ~600 lines providing everything TCC needs beyond crt.c:
+  - **FILE* I/O**: fopen/fclose/fread/fwrite/fseek/ftell/fflush/fgetc/fputc/fputs/fdopen/freopen. Static FILE array, unbuffered stdout/stderr, 1KB buffered for file I/O.
+  - **Formatted output**: vsnprintf core with full format support (%d/%u/%x/%o/%s/%c/%p/%f, width, precision, length modifiers). fprintf/sprintf/snprintf/vfprintf all via common formatter.
+  - **String/memory**: strcpy/strncmp/strchr/strrchr/strstr/strpbrk/memmove/memcmp/strdup/strerror + ctype functions.
+  - **Number conversion**: strtol/strtoul/strtoull + `__isoc23_*` aliases (GCC 15 glibc redirect), strtod/strtof/strtold, ldexpl.
+  - **Memory**: realloc (allocate + copy for bump allocator), calloc.
+  - **qsort**: Insertion sort (sufficient for TCC's symbol tables).
+  - **OS stubs**: getenv→NULL, getcwd→"/", realpath→identity, signal/sigaction→0, sem_*→no-op, mprotect→0, time→epoch 0.
+  - **exit()**: Flushes all FILE streams before syscall exit.
+  - **errno**: `__errno_location()` returns static int, `__assert_fail()` prints and exits.
+- **_setjmp/longjmp** (`syscall.S`): Save/restore RBX,RBP,R12-R15,RSP,RIP. 64-byte jmp_buf.
+- **_start fix** (`syscall.S`): Assembly _start reads argc/argv from RSP BEFORE any C prologue. TCC-generated C _start pushed RBP+SUB $0x20 before reading RSP → corrupted argc/argv.
+- **Syscalls added**: access(21), unlink(87) for TCC file operations.
+- **Build**: `ld -nostdlib -static -no-pie -e _start crt.o syscall.o tcclib.o tcc.o → tcc.elf` (406KB).
+- **Verified**: `tcc -c -nostdlib -nostdinc tiny.c -o tiny.o` produces object file inside OsitoK.
+- **Files**: `arch/x86/libc/tcclib.c`, `arch/x86/libc/syscall.S` (extended), `arch/x86/libc/Makefile` (extended)
+
+**Tier 3 milestone**: TCC compiler runs inside OsitoK, reads C source from OsitoFS, and writes compiled object files back to disk.
 
 ### X27: Falcon PIO Load
 Programmed I/O access to Falcon IMEM/DMEM via IMEMC/IMEMD registers.
