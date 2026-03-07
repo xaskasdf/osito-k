@@ -160,8 +160,12 @@ arch/x86/kernel/process.c           Process table, exec/exit/waitpid, setjmp/lon
 arch/x86/kernel/setjmp.S            kern_setjmp/longjmp (RBX,RBP,R12-R15,RSP,RIP)
 arch/x86/kernel/keyboard.c          PS/2 keyboard (scancode set 1, IRQ 1, ring buffer)
 arch/x86/kernel/terminal.c          Line editor (readline, backspace, history, Ctrl shortcuts)
-arch/x86/kernel/net.c               Network stack (ARP, IPv4, UDP, ICMP, TCP client)
+arch/x86/kernel/net.c               Network stack (ARP, IPv4, UDP, ICMP, TCP client, DNS resolver)
 arch/x86/kernel/net.h               Network types + API (eth/arp/ip/udp/tcp structs)
+arch/x86/kernel/crypto.h            Crypto primitives API (SHA-256, HMAC, AES-128-GCM, X25519)
+arch/x86/kernel/crypto.c            Crypto implementation (all from scratch, no external libs)
+arch/x86/kernel/tls.h               TLS 1.2 client types + API (tls_conn_t, connect/send/recv/close)
+arch/x86/kernel/tls.c               TLS 1.2 client (ECDHE-RSA-AES128-GCM-SHA256, no cert verify)
 arch/x86/kernel/shell.c             Interactive shell (15 builtins, argv parser, ELF exec)
 arch/x86/include/types.h            Freestanding types + MMIO + port I/O
 arch/x86/libc/crt.c                 Minimal CRT (_start, printf, malloc, POSIX I/O wrappers)
@@ -337,6 +341,7 @@ Tasks:   idle, input, shell (3 of 8 slots used)
 | **X-OS12** | **Minimal CRT** (crt.c: _start, printf, malloc, open/close/read/write/lseek, strlen/memset/memcpy; syscall.S: raw SYSCALL wrappers) | Done |
 | **X-OS13** | **TCC in-OS compilation** (TCC 0.9.28rc runs inside OsitoK, compiles .c → .o, extended libc: FILE*, fprintf, strtol, qsort, setjmp) | Done |
 | **X-NET1** | **ICMP** (echo request/reply, ping command in shell, IP checksum verification) | Done |
+| **X-NET4** | **TLS 1.2 + Crypto** (SHA-256, HMAC, AES-128-GCM, X25519, ECDHE-RSA handshake, gateway routing) | Done |
 | **X-NET2** | **TCP stack** (client-only, 3-way handshake, send/recv, FIN close, tcptest shell command) | Done |
 | **X-NET3** | **DNS resolver** (UDP query to SLIRP DNS, A record parse, resolve shell command) | Done |
 
@@ -590,7 +595,7 @@ Scancode set 1 translation with modifier tracking and ring buffer.
 ### X-OS9: Mini Shell
 Interactive command shell with builtins and argument parsing.
 - **Parsing**: Whitespace-delimited argv splitting, max 16 args.
-- **Builtins**: `help`, `uname`, `ps`, `mem`, `uptime`, `echo`, `ls`, `cat`, `exec`, `cc`/`tcc`, `ping`, `tcptest`, `clear`, `reboot`, `halt`.
+- **Builtins**: `help`, `uname`, `ps`, `mem`, `uptime`, `echo`, `ls`, `cat`, `exec`, `cc`/`tcc`, `ping`, `resolve`, `tcptest`, `tlstest`, `clear`, `reboot`, `halt`.
 - **exec**: Runs ELF binary from OsitoFS via `proc_exec()`. Process exit returns to shell.
 - **cc/tcc**: Compile C with TCC. `cc file.c` produces file.elf, `cc -run file.c` compiles+executes.
 - **cat**: Reads file from OsitoFS, displays as text (non-printable → '.'), max 4KB preview.
@@ -686,6 +691,30 @@ Minimal DNS client over UDP. Resolves A records (IPv4 addresses) from hostnames.
 - **Shell command**: `resolve <hostname>` — displays resolved IP address.
 - **Verified**: `api.anthropic.com` → `160.79.104.10` via QEMU SLIRP DNS.
 - **Files**: `arch/x86/kernel/net.c` (dns_handler, net_dns_resolve), `arch/x86/kernel/net.h` (API), `arch/x86/kernel/shell.c` (resolve command)
+
+### X-NET4: TLS 1.2 + Crypto Primitives
+Complete TLS 1.2 client with all crypto implemented from scratch (no external libraries).
+- **Cipher suite**: TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256 (0xC02F). Only suite offered/accepted.
+- **Crypto primitives** (`crypto.c`, ~750 lines):
+  - **SHA-256** (FIPS 180-4): Full implementation with init/update/final API.
+  - **HMAC-SHA-256** (RFC 2104): Used for TLS PRF and Finished verify.
+  - **AES-128** (FIPS 197): Key expansion + single-block encrypt. T-tables for performance.
+  - **AES-128-GCM** (NIST SP 800-38D): GHASH + CTR mode. Encrypt and decrypt with authentication tag.
+  - **X25519** (RFC 7748): Curve25519 scalar multiplication. 16-limb field elements (16-bit limbs in int64_t). Montgomery ladder, Fermat inverse. Proper final reduction via conditional subtraction of p.
+- **Self-test** (`crypto_selftest()`): Runs at boot. SHA-256 "abc", HMAC RFC 4231, AES FIPS 197 Appendix B, GCM NIST Test Case 3, GCM round-trip + tamper, X25519 RFC 7748 Section 6.1.
+- **TLS handshake** (`tls.c`, ~530 lines):
+  - **ClientHello**: SNI extension, supported_groups (x25519), signature_algorithms (rsa_pkcs1_sha256).
+  - **ServerHello parse**: Validates version=0x0303, cipher=0xC02F.
+  - **Certificate**: Received but NOT verified (no CA trust store).
+  - **ServerKeyExchange**: Extracts x25519 server pubkey, computes ECDHE shared secret.
+  - **Key derivation**: PRF-SHA-256 for master_secret (48B) and key expansion (write keys + IVs).
+  - **Finished**: verify_data via PRF over handshake transcript hash. Encrypted with AES-128-GCM.
+  - **Application data**: GCM encrypt/decrypt with per-record nonce (implicit_iv || seq_num).
+- **Gateway routing** (`net.c`): `arp_nexthop()` routes off-subnet IPs through default gateway (10.0.2.2 for QEMU SLIRP). Applied to ICMP, UDP, TCP send paths.
+- **Shell command**: `tlstest` — DNS resolve + TCP connect + TLS handshake + HTTPS GET to example.com.
+- **PRNG**: RDTSC-seeded xorshift64 for client_random and ECDHE private key.
+- **Verified**: HTTPS GET to example.com returns HTTP/1.1 200 OK over encrypted TLS 1.2 channel.
+- **Files**: `arch/x86/kernel/crypto.h`, `arch/x86/kernel/crypto.c`, `arch/x86/kernel/tls.h`, `arch/x86/kernel/tls.c`, `arch/x86/kernel/net.c` (gateway routing), `arch/x86/kernel/shell.c` (tlstest command)
 
 ### X27: Falcon PIO Load
 Programmed I/O access to Falcon IMEM/DMEM via IMEMC/IMEMD registers.

@@ -260,6 +260,12 @@ void kernel_entry(void *memory_map, uint64_t map_size,
     /* ── Step 1.9: Process subsystem ── */
     proc_init();
 
+    /* ── Crypto self-test ── */
+    {
+        extern int crypto_selftest(void);
+        crypto_selftest();
+    }
+
     /* ── Tensor compute self-test ── */
     tensor_benchmark();
 
@@ -458,6 +464,8 @@ void kernel_entry(void *memory_map, uint64_t map_size,
         serial_puts("[KERN] No Ethernet NIC found\n");
         fb_puts("\n NIC: not detected\n");
     }
+
+    /* TLS available via shell 'tlstest' command */
 
     /* ── Step 5: Keyboard + Terminal + Shell ── */
     kb_init();

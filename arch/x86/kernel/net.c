@@ -72,6 +72,8 @@ extern uint64_t idt_get_ticks(void);
 
 static uint8_t our_ip[4];
 static uint8_t our_mac[ETH_ALEN];
+static uint8_t gateway_ip[4] = {10, 0, 2, 2};    /* Default: QEMU SLIRP */
+static uint8_t netmask[4]    = {255, 255, 255, 0};
 static uint16_t ip_id_counter;
 
 /* Packet buffer for receive */
@@ -113,6 +115,16 @@ static bool ip_eq(const uint8_t a[4], const uint8_t b[4])
 }
 
 /* ── ARP Table Lookup / Update ───────────────────────────────── */
+
+/* Return the IP to ARP for: direct if on-subnet, gateway otherwise */
+static const uint8_t *arp_nexthop(const uint8_t dst_ip[4])
+{
+    for (int i = 0; i < 4; i++) {
+        if ((dst_ip[i] & netmask[i]) != (our_ip[i] & netmask[i]))
+            return gateway_ip;
+    }
+    return dst_ip;
+}
 
 static arp_entry_t *arp_lookup(const uint8_t ip[4])
 {
@@ -257,10 +269,11 @@ static void icmp_send(const uint8_t dst_ip[4], uint8_t type, uint8_t code,
                        uint16_t id, uint16_t seq,
                        const void *data, uint32_t data_len)
 {
-    /* Resolve destination MAC */
-    arp_entry_t *entry = arp_lookup(dst_ip);
+    /* Resolve next-hop MAC (gateway for off-subnet) */
+    const uint8_t *nexthop = arp_nexthop(dst_ip);
+    arp_entry_t *entry = arp_lookup(nexthop);
     if (!entry) {
-        arp_send_request(dst_ip);
+        arp_send_request(nexthop);
         return;
     }
 
@@ -482,11 +495,12 @@ void net_poll(void)
 int net_udp_send(const uint8_t dst_ip[4], uint16_t dst_port,
                  uint16_t src_port, const void *data, uint32_t len)
 {
-    /* Resolve destination MAC via ARP */
-    arp_entry_t *entry = arp_lookup(dst_ip);
+    /* Resolve next-hop MAC (gateway for off-subnet destinations) */
+    const uint8_t *nexthop = arp_nexthop(dst_ip);
+    arp_entry_t *entry = arp_lookup(nexthop);
     if (!entry) {
         /* Send ARP request and bail — caller should retry */
-        arp_send_request(dst_ip);
+        arp_send_request(nexthop);
         return -1;
     }
 
@@ -581,10 +595,11 @@ static uint16_t tcp_checksum(const uint8_t src_ip[4], const uint8_t dst_ip[4],
 static int tcp_send_segment(tcp_conn_t *conn, uint8_t flags,
                              const void *data, uint32_t data_len)
 {
-    /* Resolve MAC */
-    arp_entry_t *entry = arp_lookup(conn->remote_ip);
+    /* Resolve next-hop MAC (gateway for off-subnet) */
+    const uint8_t *nexthop = arp_nexthop(conn->remote_ip);
+    arp_entry_t *entry = arp_lookup(nexthop);
     if (!entry) {
-        arp_send_request(conn->remote_ip);
+        arp_send_request(nexthop);
         return -1;
     }
 
@@ -840,21 +855,22 @@ int net_tcp_connect(const uint8_t dst_ip[4], uint16_t dst_port,
         return -1;
     }
 
-    /* Ensure we have ARP for destination — send request and poll */
-    if (!arp_lookup(dst_ip)) {
-        arp_send_request(dst_ip);
+    /* Ensure we have ARP for next-hop (gateway for off-subnet) */
+    const uint8_t *nexthop = arp_nexthop(dst_ip);
+    if (!arp_lookup(nexthop)) {
+        arp_send_request(nexthop);
         /* Poll for ARP reply (2s timeout, 200 ticks) */
         uint64_t arp_start = idt_get_ticks();
-        while (!arp_lookup(dst_ip) && (idt_get_ticks() - arp_start) < 200) {
+        while (!arp_lookup(nexthop) && (idt_get_ticks() - arp_start) < 200) {
             net_poll();
             __asm__ volatile ("hlt");
         }
-        if (!arp_lookup(dst_ip)) {
+        if (!arp_lookup(nexthop)) {
             serial_puts("[TCP] ARP timeout for ");
-            serial_putdec(dst_ip[0]); serial_puts(".");
-            serial_putdec(dst_ip[1]); serial_puts(".");
-            serial_putdec(dst_ip[2]); serial_puts(".");
-            serial_putdec(dst_ip[3]); serial_puts("\n");
+            serial_putdec(nexthop[0]); serial_puts(".");
+            serial_putdec(nexthop[1]); serial_puts(".");
+            serial_putdec(nexthop[2]); serial_puts(".");
+            serial_putdec(nexthop[3]); serial_puts("\n");
             return -1;
         }
     }

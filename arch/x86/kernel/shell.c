@@ -61,6 +61,13 @@ extern void net_tcp_close(int conn);
 extern int  net_tcp_state(int conn);
 extern int  net_dns_resolve(const char *hostname, uint8_t ip_out[4]);
 
+/* TLS — opaque pointer, allocated via kmalloc(tls_conn_size()) */
+extern uint32_t tls_conn_size(void);
+extern int  tls_connect(void *tls, int tcp_conn, const char *hostname);
+extern int  tls_send(void *tls, const void *data, uint32_t len);
+extern int  tls_recv(void *tls, void *buf, uint32_t buf_size, uint32_t timeout_ticks);
+extern void tls_close(void *tls);
+
 /* ── Shell output helpers ────────────────────────────────────── */
 
 static void sh_puts(const char *s)
@@ -123,6 +130,7 @@ static void cmd_help(void)
     sh_puts("  ping      Ping an IP address\n");
     sh_puts("  tcptest   TCP connection test (tcptest [ip] [port])\n");
     sh_puts("  resolve   DNS lookup (resolve hostname)\n");
+    sh_puts("  tlstest   TLS connect test (tlstest [hostname])\n");
     sh_puts("  clear     Clear screen\n");
     sh_puts("  reboot    Reboot system\n");
     sh_puts("  halt      Halt CPU\n");
@@ -564,6 +572,96 @@ static void cmd_resolve(int argc, char *argv[])
     }
 }
 
+/* ── Builtin: tlstest ─────────────────────────────────────────── */
+
+static void cmd_tlstest(int argc, char *argv[])
+{
+    const char *hostname = "example.com";
+    if (argc >= 2) hostname = argv[1];
+
+    /* Resolve hostname */
+    uint8_t ip[4];
+    sh_puts("Resolving ");
+    sh_puts(hostname);
+    sh_puts("...\n");
+    if (net_dns_resolve(hostname, ip) < 0) {
+        sh_puts("DNS resolution failed\n");
+        return;
+    }
+    sh_puts("  -> ");
+    sh_putdec(ip[0]); sh_puts(".");
+    sh_putdec(ip[1]); sh_puts(".");
+    sh_putdec(ip[2]); sh_puts(".");
+    sh_putdec(ip[3]); sh_puts("\n");
+
+    /* TCP connect to port 443 */
+    int tcp = net_tcp_connect(ip, 443, 49200);
+    if (tcp < 0) {
+        sh_puts("TCP connect failed\n");
+        return;
+    }
+    sh_puts("TCP connected, starting TLS...\n");
+
+    /* Allocate TLS state */
+    void *tls = kmalloc(tls_conn_size());
+    if (!tls) {
+        sh_puts("Out of memory for TLS\n");
+        net_tcp_close(tcp);
+        return;
+    }
+
+    if (tls_connect(tls, tcp, hostname) < 0) {
+        sh_puts("TLS handshake failed\n");
+        kfree(tls);
+        net_tcp_close(tcp);
+        return;
+    }
+
+    sh_puts_color("TLS established!\n", 0x0000FF00);
+
+    /* Send HTTP GET */
+    char req[256];
+    int rlen = 0;
+    const char *hdr1 = "GET / HTTP/1.1\r\nHost: ";
+    while (hdr1[rlen]) { req[rlen] = hdr1[rlen]; rlen++; }
+    const char *h = hostname;
+    while (*h) req[rlen++] = *h++;
+    const char *hdr2 = "\r\nConnection: close\r\n\r\n";
+    for (int i = 0; hdr2[i]; i++) req[rlen++] = hdr2[i];
+
+    tls_send(tls, req, (uint32_t)rlen);
+    sh_puts("HTTP GET sent, waiting for response...\n");
+
+    /* Read response */
+    char buf[512];
+    int total = 0;
+    for (;;) {
+        int n = tls_recv(tls, buf, sizeof(buf) - 1, 500);
+        if (n <= 0) break;
+        buf[n] = '\0';
+        if (total < 400) {
+            int show = n;
+            if (total + show > 400) show = 400 - total;
+            for (int i = 0; i < show; i++) {
+                char c = buf[i];
+                if (c == '\r') continue;
+                char s[2] = {c, 0};
+                sh_puts(s);
+            }
+        }
+        total += n;
+    }
+
+    sh_puts("\n  Total: ");
+    sh_putdec(total);
+    sh_puts(" bytes\n");
+
+    tls_close(tls);
+    kfree(tls);
+    net_tcp_close(tcp);
+    sh_puts("Connection closed.\n");
+}
+
 /* ── Builtin: reboot ─────────────────────────────────────────── */
 
 static void cmd_reboot(void)
@@ -635,6 +733,8 @@ static void shell_exec(char *line)
         cmd_tcptest(argc, argv);
     } else if (strcmp(cmd, "resolve") == 0) {
         cmd_resolve(argc, argv);
+    } else if (strcmp(cmd, "tlstest") == 0) {
+        cmd_tlstest(argc, argv);
     } else if (strcmp(cmd, "clear") == 0) {
         cmd_clear();
     } else if (strcmp(cmd, "reboot") == 0) {
