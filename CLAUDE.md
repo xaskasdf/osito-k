@@ -149,6 +149,18 @@ arch/x86/kernel/tensor.c            Tensor engine impl (Q4_0/Q8_0, x87/SSE math,
 arch/x86/kernel/tensor_avx2.c       AVX2/FMA vectorized tensor ops (matvec_q4_0, rmsnorm, vec_add/mul)
 arch/x86/kernel/inference.h         Llama inference API (state, weights, KV cache, forward pass)
 arch/x86/kernel/inference.c         Transformer forward pass (embed, GQA attention, SwiGLU FFN, generate)
+arch/x86/kernel/idt.c               IDT setup, exception handlers, APIC timer, 8259 PIC remap
+arch/x86/kernel/isr_stubs.S         ISR entry points (save GPRs, call C handler, IRETQ)
+arch/x86/kernel/paging.c            4-level page tables, identity map, MMIO map, CR3 switch
+arch/x86/kernel/heap.c              kmalloc/kfree first-fit heap (auto-grow, coalescing)
+arch/x86/kernel/syscall.c           SYSCALL MSR setup, dispatch table, write/read/exit/brk
+arch/x86/kernel/syscall_entry.S     SYSCALL entry point (arg shuffle, STI+JMP return)
+arch/x86/kernel/elf.c               ELF64 loader (PT_LOAD, stack setup, entry jump)
+arch/x86/kernel/process.c           Process table, exec/exit/waitpid, setjmp/longjmp lifecycle
+arch/x86/kernel/setjmp.S            kern_setjmp/longjmp (RBX,RBP,R12-R15,RSP,RIP)
+arch/x86/kernel/keyboard.c          PS/2 keyboard (scancode set 1, IRQ 1, ring buffer)
+arch/x86/kernel/terminal.c          Line editor (readline, backspace, history, Ctrl shortcuts)
+arch/x86/kernel/shell.c             Interactive shell (12 builtins, argv parser, ELF exec)
 arch/x86/include/types.h            Freestanding types + MMIO + port I/O
 
 # OsitoFS v2 Host Tools (tools/ositofs/)
@@ -310,6 +322,9 @@ Tasks:   idle, input, shell (3 of 8 slots used)
 | **X-OS4** | **Syscall interface** (SYSCALL/SYSRET via LSTAR/STAR/FMASK MSRs, dispatch table, write/read/exit, fd table with stdin/stdout/stderr) | Done |
 | **X-OS5** | **ELF loader** (ELF64 validation, PT_LOAD segment loading, stack setup with argc/argv/envp, entry point jump) | Done |
 | **X-OS6** | **Process subsystem** (process_t table, PID alloc, per-process FD table, proc_exec/exit/waitpid, kernel PID 0) | Done |
+| **X-OS7** | **Terminal line editor** (readline with echo, backspace, insert mode, Ctrl+C/D/U/A/E/W, command history) | Done |
+| **X-OS8** | **PS/2 keyboard driver** (scancode set 1→ASCII, shift/ctrl/caps, ring buffer, IRQ 1 via 8259 PIC vector 0x71) | Done |
+| **X-OS9** | **Mini shell** (command parser, 12 builtins: help/uname/ps/mem/uptime/echo/ls/cat/exec/clear/reboot/halt) | Done |
 
 > Full GPU roadmap (X27-X40 + contingency): see [docs/x86-gpu-roadmap.md](docs/x86-gpu-roadmap.md)
 > Full OS roadmap (Tier 0-5): see [docs/os-selfhost-roadmap.md](docs/os-selfhost-roadmap.md)
@@ -539,6 +554,41 @@ Minimal process abstraction for exec/exit lifecycle.
 - **Memory tracking**: `mem_region_t` array per process for cleanup on exit.
 
 **Tier 1 milestone**: OsitoK can now load and execute an ELF64 binary from OsitoFS that uses `write(1, "Hello\n", 6); exit(0);` syscalls.
+
+### X-OS7: Terminal Line Editor
+Line-buffered input with editing, bridging keyboard to shell.
+- **Readline**: `term_readline(prompt, buf, size)` — blocking line input with echo. Returns length, -1 on EOF (Ctrl+D).
+- **Editing**: Insert mode, backspace (with visual redraw), Ctrl+A (home), Ctrl+E (end), Ctrl+U (kill line), Ctrl+W (delete word backward).
+- **Signals**: Ctrl+C returns empty line (shell interprets as cancel), Ctrl+D on empty line returns EOF.
+- **History**: 8-entry circular buffer. Duplicate detection (won't add same command twice in a row).
+- **Output**: Dual serial + framebuffer via `term_putchar()`/`term_puts()`.
+- **Files**: `arch/x86/kernel/terminal.c`
+
+### X-OS8: PS/2 Keyboard Driver
+Scancode set 1 translation with modifier tracking and ring buffer.
+- **Translation**: 128-entry normal + shifted tables. ASCII for printable keys, control codes for special keys.
+- **Modifiers**: Left/right Shift, Ctrl, Alt, Caps Lock (toggle). Ctrl+C → ETX (0x03), Ctrl+D → EOT (0x04).
+- **Ring buffer**: 64-byte circular buffer. `kb_getchar()` (blocking, HLT-based), `kb_trygetchar()` (non-blocking), `kb_has_input()`.
+- **IRQ**: 8259 PIC IRQ 1 → IDT vector 0x71 via dedicated `isr_stub_33`. PIC EOI in ISR handler.
+- **PIC remap**: 8259 PIC remapped to vectors 0x70-0x7F (master) / 0x78-0x7F (slave) to avoid collision with APIC timer at vector 32.
+- **Files**: `arch/x86/kernel/keyboard.c`, ISR in `arch/x86/kernel/idt.c`
+
+### X-OS9: Mini Shell
+Interactive command shell with builtins and argument parsing.
+- **Parsing**: Whitespace-delimited argv splitting, max 16 args.
+- **Builtins**: `help`, `uname`, `ps`, `mem`, `uptime`, `echo`, `ls`, `cat`, `exec`, `clear`, `reboot`, `halt`.
+- **exec**: Runs ELF binary from OsitoFS via `proc_exec()`. Process exit returns to shell.
+- **cat**: Reads file from OsitoFS, displays as text (non-printable → '.'), max 4KB preview.
+- **reboot**: Triple fault via zero-length IDT + INT3.
+- **Network**: `net_poll()` called between commands (keeps UDP echo server responsive).
+- **Files**: `arch/x86/kernel/shell.c`
+
+### Tier 2 Key Fixes
+- **kern_setjmp/longjmp** (`setjmp.S`): Saves/restores RBX,RBP,R12-R15,RSP,RIP. Used by proc_exec to save kernel context; proc_exit longjmps back. Cleanly bypasses syscall return path.
+- **SYSCALL return race**: `popfq` has no interrupt shadow — APIC timer could fire between IF=1 and `jmp *%rcx`, corrupting return. Fix: `sti; jmp *%rcx` (STI shadows the next instruction).
+- **STAR MSR**: SYSCALL CS base = `kernel_ss - 8` so SS = valid data segment (0x30), not TSS (0x40).
+
+**Tier 2 milestone**: Interactive `osito>` shell with keyboard input, ELF execution, filesystem browsing. 20/20 QEMU test stability.
 
 ### X27: Falcon PIO Load
 Programmed I/O access to Falcon IMEM/DMEM via IMEMC/IMEMD registers.
