@@ -28,6 +28,11 @@ extern uint32_t osfs2_file_count(void);
 extern void    *osfs2_file_at(uint32_t index);
 extern uint64_t osfs2_file_size(void *file);
 
+/* Process execution + output capture (X-CL4 tool exec) */
+extern int  proc_exec(const char *filename, int argc, const char **argv);
+extern void syscall_capture_start(char *buf, uint32_t max_len);
+extern uint32_t syscall_capture_stop(void);
+
 /* ── Helpers ─────────────────────────────────────────────────── */
 
 static uint32_t cstrlen(const char *s)
@@ -121,7 +126,7 @@ static int jp_int(char *buf, int pos, int max, int val)
     return pos;
 }
 
-/* Tools JSON definition (X-CL3) */
+/* Tools JSON definition (X-CL3 + X-CL4) */
 static const char *tools_json_def =
     ",\"tools\":["
     "{\"name\":\"file_read\",\"description\":\"Read a file from the OsitoK filesystem.\","
@@ -132,7 +137,13 @@ static const char *tools_json_def =
     "\"description\":\"File name\"},\"content\":{\"type\":\"string\","
     "\"description\":\"Content to write\"}},\"required\":[\"path\",\"content\"]}},"
     "{\"name\":\"file_list\",\"description\":\"List all files on the OsitoK filesystem.\","
-    "\"input_schema\":{\"type\":\"object\",\"properties\":{}}}"
+    "\"input_schema\":{\"type\":\"object\",\"properties\":{}}},"
+    "{\"name\":\"exec\",\"description\":\"Execute an ELF binary from the filesystem. Returns stdout output and exit code.\","
+    "\"input_schema\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\","
+    "\"description\":\"ELF filename to execute\"}},\"required\":[\"path\"]}},"
+    "{\"name\":\"run_code\",\"description\":\"Compile C source code with TCC and execute it. Returns stdout output and exit code.\","
+    "\"input_schema\":{\"type\":\"object\",\"properties\":{\"code\":{\"type\":\"string\","
+    "\"description\":\"C source code to compile and run\"}},\"required\":[\"code\"]}}"
     "]";
 
 /* Build Claude API request JSON.
@@ -810,6 +821,176 @@ static int tool_file_list(char *result, int max_len)
 }
 
 /* Execute a single tool and return result length */
+/* ── X-CL4 Tools: exec + run_code ──────────────────────────── */
+
+/* Tool: exec — run an ELF binary, capture stdout */
+static int tool_exec(const char *input_json, char *result, int max_len)
+{
+    char path[128];
+    if (tool_get_param(input_json, "path", path, sizeof(path)) < 0) {
+        int p = 0;
+        p = jp(result, p, max_len, "Error: missing 'path' parameter");
+        return p;
+    }
+
+    if (!osfs2_find(path)) {
+        int p = 0;
+        p = jp(result, p, max_len, "Error: file not found: ");
+        p = jp(result, p, max_len, path);
+        return p;
+    }
+
+    /* Capture stdout */
+    char *capture = (char *)kmalloc(CLAUDE_MAX_TOOL_RESULT);
+    if (!capture) {
+        int p = 0;
+        p = jp(result, p, max_len, "Error: out of memory");
+        return p;
+    }
+
+    syscall_capture_start(capture, CLAUDE_MAX_TOOL_RESULT - 1);
+    int exit_code = proc_exec(path, 0, NULL);
+    uint32_t cap_len = syscall_capture_stop();
+
+    serial_puts("[TOOL] exec: ");
+    serial_puts(path);
+    serial_puts(" exit=");
+    serial_putdec(exit_code < 0 ? (uint64_t)(-(int64_t)exit_code) : (uint64_t)exit_code);
+    serial_puts(" output=");
+    serial_putdec(cap_len);
+    serial_puts(" bytes\n");
+
+    /* Format result: output + exit code */
+    int p = 0;
+    if (cap_len > 0) {
+        uint32_t copy_len = cap_len < (uint32_t)(max_len - 64) ? cap_len : (uint32_t)(max_len - 64);
+        cmemcpy(result, capture, copy_len);
+        p = (int)copy_len;
+    }
+    kfree(capture);
+
+    p = jp(result, p, max_len, "\n[exit code: ");
+    p = jp_int(result, p, max_len, exit_code);
+    p = jp(result, p, max_len, "]");
+    return p;
+}
+
+/* Tool: run_code — compile C source with TCC + execute */
+static int tool_run_code(const char *input_json, char *result, int max_len)
+{
+    /* Check TCC is available */
+    if (!osfs2_find("tcc.elf")) {
+        int p = 0;
+        p = jp(result, p, max_len, "Error: tcc.elf not found on disk (compiler not available)");
+        return p;
+    }
+
+    /* Get code parameter */
+    char *code = (char *)kmalloc(CLAUDE_MAX_TOOL_INPUT);
+    if (!code) {
+        int p = 0;
+        p = jp(result, p, max_len, "Error: out of memory");
+        return p;
+    }
+
+    int clen = tool_get_param(input_json, "code", code, CLAUDE_MAX_TOOL_INPUT);
+    if (clen < 0) {
+        kfree(code);
+        int p = 0;
+        p = jp(result, p, max_len, "Error: missing 'code' parameter");
+        return p;
+    }
+
+    /* Write source to temp file */
+    void *src_file = osfs2_find("_cl_tmp.c");
+    if (src_file) osfs2_delete("_cl_tmp.c");
+    src_file = osfs2_create("_cl_tmp.c", (uint64_t)clen);
+    if (!src_file) {
+        kfree(code);
+        int p = 0;
+        p = jp(result, p, max_len, "Error: failed to create temp source file");
+        return p;
+    }
+    osfs2_write(src_file, 0, code, (uint64_t)clen);
+    kfree(code);
+
+    /* Delete old output if exists */
+    if (osfs2_find("_cl_tmp.elf")) osfs2_delete("_cl_tmp.elf");
+
+    /* Step 1: Compile with TCC */
+    char *capture = (char *)kmalloc(CLAUDE_MAX_TOOL_RESULT);
+    if (!capture) {
+        int p = 0;
+        p = jp(result, p, max_len, "Error: out of memory");
+        return p;
+    }
+
+    const char *tcc_argv[] = {
+        "tcc", "-nostdlib", "-nostdinc", "-static",
+        "_cl_tmp.c", "-o", "_cl_tmp.elf"
+    };
+
+    syscall_capture_start(capture, CLAUDE_MAX_TOOL_RESULT - 1);
+    int comp_ret = proc_exec("tcc.elf", 7, tcc_argv);
+    uint32_t comp_cap = syscall_capture_stop();
+
+    serial_puts("[TOOL] run_code: compile exit=");
+    serial_putdec(comp_ret < 0 ? (uint64_t)(-(int64_t)comp_ret) : (uint64_t)comp_ret);
+    serial_puts("\n");
+
+    if (comp_ret != 0) {
+        int p = 0;
+        p = jp(result, p, max_len, "Compilation failed (exit ");
+        p = jp_int(result, p, max_len, comp_ret);
+        p = jp(result, p, max_len, "):\n");
+        if (comp_cap > 0) {
+            uint32_t copy = comp_cap < (uint32_t)(max_len - p - 1) ? comp_cap : (uint32_t)(max_len - p - 1);
+            cmemcpy(result + p, capture, copy);
+            p += (int)copy;
+        }
+        kfree(capture);
+        return p;
+    }
+
+    /* Step 2: Run compiled binary */
+    if (!osfs2_find("_cl_tmp.elf")) {
+        kfree(capture);
+        int p = 0;
+        p = jp(result, p, max_len, "Error: compiled binary not found after TCC");
+        return p;
+    }
+
+    syscall_capture_start(capture, CLAUDE_MAX_TOOL_RESULT - 1);
+    int run_ret = proc_exec("_cl_tmp.elf", 0, NULL);
+    uint32_t run_cap = syscall_capture_stop();
+
+    serial_puts("[TOOL] run_code: run exit=");
+    serial_putdec(run_ret < 0 ? (uint64_t)(-(int64_t)run_ret) : (uint64_t)run_ret);
+    serial_puts(" output=");
+    serial_putdec(run_cap);
+    serial_puts(" bytes\n");
+
+    /* Format result */
+    int p = 0;
+    if (run_cap > 0) {
+        uint32_t copy = run_cap < (uint32_t)(max_len - 64) ? run_cap : (uint32_t)(max_len - 64);
+        cmemcpy(result, capture, copy);
+        p = (int)copy;
+    }
+    kfree(capture);
+
+    p = jp(result, p, max_len, "\n[exit code: ");
+    p = jp_int(result, p, max_len, run_ret);
+    p = jp(result, p, max_len, "]");
+
+    /* Clean up temp files */
+    osfs2_delete("_cl_tmp.c");
+    osfs2_delete("_cl_tmp.elf");
+
+    return p;
+}
+
+/* Dispatch tool execution by name */
 static int tool_execute(const claude_tool_use_t *tu, char *result, int max_len)
 {
     result[0] = '\0';
@@ -820,6 +1001,10 @@ static int tool_execute(const claude_tool_use_t *tu, char *result, int max_len)
         return tool_file_write(tu->input_json, result, max_len);
     if (tu->name[0] == 'f' && tu->name[5] == 'l')  /* file_list */
         return tool_file_list(result, max_len);
+    if (tu->name[0] == 'e' && tu->name[1] == 'x')  /* exec */
+        return tool_exec(tu->input_json, result, max_len);
+    if (tu->name[0] == 'r' && tu->name[4] == 'c')  /* run_code */
+        return tool_run_code(tu->input_json, result, max_len);
 
     int p = 0;
     p = jp(result, p, max_len, "Error: unknown tool: ");

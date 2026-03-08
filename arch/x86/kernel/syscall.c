@@ -133,13 +133,39 @@ typedef struct {
 
 static fd_entry_t fd_table[MAX_FDS];
 
-/* stdout/stderr → serial + framebuffer */
+/* ── Output capture (X-CL4: tool exec) ──────────────────────── */
+
+static char    *capture_buf;
+static uint32_t capture_pos;
+static uint32_t capture_max;
+
+void syscall_capture_start(char *buf, uint32_t max_len)
+{
+    capture_buf = buf;
+    capture_pos = 0;
+    capture_max = max_len;
+}
+
+uint32_t syscall_capture_stop(void)
+{
+    uint32_t len = capture_pos;
+    if (capture_buf && capture_pos < capture_max)
+        capture_buf[capture_pos] = '\0';
+    capture_buf = NULL;
+    capture_pos = 0;
+    capture_max = 0;
+    return len;
+}
+
+/* stdout/stderr → serial + framebuffer (+ optional capture) */
 static ssize_t console_write(const void *buf, size_t count)
 {
     const char *s = (const char *)buf;
     for (size_t i = 0; i < count; i++) {
         serial_putc(s[i]);
         fb_putc(s[i], 0x00CCCCCC);
+        if (capture_buf && capture_pos < capture_max - 1)
+            capture_buf[capture_pos++] = s[i];
     }
     return (ssize_t)count;
 }

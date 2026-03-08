@@ -352,6 +352,7 @@ Tasks:   idle, input, shell (3 of 8 slots used)
 | **X-CL1** | **Claude API client** (Messages API, JSON builder, SSE streaming, apikey/ask commands) | Done |
 | **X-CL2** | **Claude REPL** (multi-turn conversation, session history, sliding window, `claude` shell command) | Done |
 | **X-CL3** | **Tool use: file read/write** (Anthropic tool_use protocol, SSE tool parsing, file_read/write/list, tool loop) | Done |
+| **X-CL4** | **Tool: exec** (compile+run C code via TCC, execute ELF binaries, stdout capture) | Done |
 | **X-NET2** | **TCP stack** (client-only, 3-way handshake, send/recv, FIN close, tcptest shell command) | Done |
 | **X-NET3** | **DNS resolver** (UDP query to SLIRP DNS, A record parse, resolve shell command) | Done |
 | **X-TOK1** | **BPE tokenizer** (Llama 3 BPE encode/decode, GGUF vocab extraction, FNV-1a hash, greedy+merge) | Done |
@@ -774,6 +775,14 @@ Claude can read, write, and list files on OsitoFS via Anthropic tool_use protoco
 - **Request builder**: `build_request_json()` now accepts `with_tools` flag to append tools definitions. `claude_chat_ex()` internal function accepts tools flag and `claude_tool_state_t *`.
 - **OsitoFS accessor**: Added `osfs2_file_at(index)` to iterate files by index for `file_list` tool.
 - **Files**: `arch/x86/kernel/claude.h` (claude_tool_state_t, tool use types), `arch/x86/kernel/claude.c` (SSE parser, tool execution, tool loop), `arch/x86/fs/ositofs2.c` (osfs2_file_at)
+
+### X-CL4: Tool Exec — Compile and Run Code
+Claude can compile C code with TCC and execute ELF binaries, capturing stdout output.
+- **Output capture**: `syscall_capture_start(buf, max)` / `syscall_capture_stop()` in `syscall.c`. `console_write()` copies to capture buffer alongside serial+FB output. Non-invasive — capture is NULL when not in use.
+- **Tool: exec**: Run an existing ELF binary from OsitoFS. Capture stdout + report exit code.
+- **Tool: run_code**: Write C source to `_cl_tmp.c`, compile with `tcc.elf` (`-nostdlib -nostdinc -static`), run `_cl_tmp.elf`, capture output, clean up temp files. Reports compilation errors if TCC fails.
+- **Integration**: Tools added to `tools_json_def`, dispatched in `tool_execute()`. `proc_exec()` handles process lifecycle (setjmp/longjmp). Capture wraps the entire exec call.
+- **Files**: `arch/x86/kernel/syscall.c` (capture API), `arch/x86/kernel/claude.c` (tool_exec, tool_run_code)
 
 ### X-TOK1: BPE Tokenizer
 Byte-pair encoding tokenizer for Llama 3 models. Ported from xasko's C++ tiktoken (reason_agent/tools/tiktoken.cpp).
