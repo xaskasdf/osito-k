@@ -4,13 +4,14 @@
  * Hybrid GPU/CPU forward pass orchestration.
  * Uses GPU SASS kernels where available, CPU tensor.h for the rest.
  *
- * Current state:
- *   - vec_add_f32 on GPU (256 elements/dispatch, chunked for larger)
- *   - All other ops: CPU fallback (matvec_q4_0, rmsnorm, softmax, etc.)
+ * Current state (X-INF1):
+ *   - matvec_q4_0 on GPU (streaming: upload weights+input, dispatch, download)
+ *   - rmsnorm on GPU (upload x+weight, dispatch, download)
+ *   - silu_mul on GPU (replaces silu_inplace + vec_mul in one kernel)
+ *   - rope on GPU (upload q+k, in-place dispatch, download)
+ *   - vec_add on GPU (chunked 256-element dispatches)
  *   - PRAMIN data transfer (slow but functional without DMA)
- *
- * When future SASS kernels are compiled (matvec_q4_0 = 90% of cost),
- * they plug into the dispatch table and accelerate automatically.
+ *   - Attention (GQA loop + softmax): CPU-only (irregular access pattern)
  *
  * ── Data flow ─────────────────────────────────────────────
  *
@@ -18,22 +19,19 @@
  *   KV cache:     System RAM (per-layer, per-position)
  *   Activations:  System RAM (scratch buffers in llama_state_t)
  *   GPU transfer: PRAMIN upload → GPU compute → PRAMIN download
+ *   VRAM alloc:   Save/restore bump allocator per dispatch (no leaks)
  *
- * ── Bottleneck analysis (Llama 3.2 1B, per token) ─────────
+ * ── Dispatch table (Llama 3.2 1B, per token) ──────────────
  *
- *   Operation           Calls/token   Compute     GPU kernel
+ *   Operation           Calls/token   Compute     Dispatch
  *   ──────────────────  ───────────   ──────────  ──────────
- *   matvec_q4_0         7×16 = 112    ~90% cost   TODO
- *   rmsnorm             3×16+1 = 49   ~2%         TODO
- *   softmax             32×16 = 512   ~3%         TODO
- *   rope                2×16 = 32     ~1%         TODO
- *   silu_inplace        1×16 = 16     ~1%         TODO
- *   vec_add             2×16 = 32     ~1%         Available
- *   vec_mul             1×16 = 16     ~1%         TODO
+ *   matvec_q4_0         7×16 = 112    ~90% cost   GPU (streaming)
+ *   rmsnorm             3×16+1 = 49   ~2%         GPU
+ *   softmax             32×16 = 512   ~3%         CPU (per-head)
+ *   rope                1×16 = 16     ~1%         GPU (q+k combined)
+ *   silu_mul             1×16 = 16    ~1%         GPU (fused)
+ *   vec_add             2×16 = 32     ~1%         GPU (chunked)
  *   attention (QKV)     32×16 = 512   ~1%         CPU-only
- *
- *   matvec_q4_0 dominates. GPU vec_add saves ~1% — the real
- *   speedup comes when matvec_q4_0 SASS kernel is compiled.
  */
 
 #include "gpu_inference.h"
@@ -99,20 +97,90 @@ static void gpu_embed_token(float *dst, gguf_tensor_t *embd,
     }
 }
 
+/* ── VRAM bump allocator save/restore ────────────────────── */
+
+/* Save/restore pattern prevents VRAM leaks from per-dispatch temp
+ * allocations (data buffers + CB0 inside gpu_dispatch_kernel).
+ * The permanent scratch buffers (vram_a/b/out) stay at the start
+ * of the region and are never reclaimed. */
+
+static inline uint64_t vram_save(void)
+{
+    gpu_tensor_state_t *ts = gpu_tensor_get_state();
+    return ts ? ts->vram_next : 0;
+}
+
+static inline void vram_restore(uint64_t saved)
+{
+    gpu_tensor_state_t *ts = gpu_tensor_get_state();
+    if (ts) ts->vram_next = saved;
+}
+
 /* ── Matvec dispatch (CPU, type-aware) ───────────────────── */
+
+/* Attempt GPU matvec_q4_0 dispatch.
+ * Uploads weights + input to VRAM, dispatches kernel, downloads output.
+ * Returns 0 on success, -1 on failure (caller should fallback to CPU). */
+static int gpu_matvec_q4_0_dispatch(float *out, const void *weights,
+                                     const float *input,
+                                     uint32_t rows, uint32_t cols,
+                                     gpu_llama_state_t *gs __attribute__((unused)))
+{
+    /* Q4_0 block: 32 elements = 18 bytes (2 byte scale + 16 byte nibbles) */
+    uint32_t blocks_per_row = cols / 32;
+    uint32_t row_bytes = blocks_per_row * 18;
+    uint32_t weight_bytes = rows * row_bytes;
+    uint32_t input_bytes = cols * sizeof(float);
+    uint32_t output_bytes = rows * sizeof(float);
+
+    /* Check if fits in VRAM buffer region (16MB limit) */
+    uint32_t total_needed = weight_bytes + input_bytes + output_bytes + 768;
+    if (total_needed > 16 * 1024 * 1024)
+        return -1;
+
+    /* Save allocator state — restore after download to free temp buffers */
+    uint64_t saved = vram_save();
+
+    /* Allocate VRAM regions */
+    uint64_t w_vram = gpu_tensor_alloc(weight_bytes);
+    uint64_t x_vram = gpu_tensor_alloc(input_bytes);
+    uint64_t y_vram = gpu_tensor_alloc(output_bytes);
+
+    if (!w_vram || !x_vram || !y_vram) { vram_restore(saved); return -1; }
+
+    /* Upload weights and input to VRAM via PRAMIN */
+    if (gpu_tensor_upload(w_vram, weights, weight_bytes) < 0) { vram_restore(saved); return -1; }
+    if (gpu_tensor_upload(x_vram, input, input_bytes) < 0) { vram_restore(saved); return -1; }
+
+    /* Dispatch gemv_q4_0 kernel */
+    int ret = gpu_gemv_q4_0_ptx(y_vram, w_vram, x_vram, rows, cols);
+    if (ret < 0) { vram_restore(saved); return -1; }
+
+    /* Download result */
+    if (gpu_tensor_download(y_vram, out, output_bytes) < 0) { vram_restore(saved); return -1; }
+
+    vram_restore(saved);
+    return 0;
+}
 
 static void gpu_matvec(float *out, gguf_tensor_t *tensor,
                        const float *input, uint32_t rows, uint32_t cols,
                        gpu_llama_state_t *gs)
 {
-    /* TODO: when matvec_q4_0 SASS kernel is compiled:
-     *   1. Upload weight block to VRAM (streaming)
-     *   2. Upload input vector to VRAM
-     *   3. Dispatch GPU matvec
-     *   4. Download output
-     * For now: CPU only. */
     uint64_t t0 = rdtsc_gpu();
 
+    /* Try GPU dispatch for Q4_0 when kernel is available */
+    if (tensor->type == GGML_TYPE_Q4_0 && gs->kernels.matvec_q4_0) {
+        if (gpu_matvec_q4_0_dispatch(out, tensor->data, input,
+                                      rows, cols, gs) == 0) {
+            gs->gpu_cycles += rdtsc_gpu() - t0;
+            gs->gpu_ops++;
+            return;
+        }
+        /* GPU dispatch failed — fall through to CPU */
+    }
+
+    /* CPU fallback */
     switch (tensor->type) {
     case GGML_TYPE_Q4_0:
         matvec_q4_0(out, tensor->data, input, rows, cols);
@@ -157,6 +225,7 @@ static void gpu_vec_add_dispatch(float *out, const float *a, const float *b,
 
     /* GPU dispatch: chunk into 256-element blocks */
     uint64_t t0 = rdtsc_gpu();
+    uint64_t saved = vram_save();
     uint32_t offset = 0;
 
     while (offset < n) {
@@ -170,10 +239,10 @@ static void gpu_vec_add_dispatch(float *out, const float *a, const float *b,
         gpu_tensor_upload(gs->vram_a, a + offset, bytes);
         gpu_tensor_upload(gs->vram_b, b + offset, bytes);
 
-        /* Dispatch GPU vec_add */
+        /* Dispatch GPU vec_add (CB0 allocated inside, reclaimed by restore) */
         int ret = gpu_vec_add(gs->vram_out, gs->vram_a, gs->vram_b, chunk);
         if (ret < 0) {
-            /* GPU failed — fall back to CPU for remaining */
+            vram_restore(saved);
             vec_add(out + offset, a + offset, b + offset, n - offset);
             gs->cpu_ops++;
             gs->gpu_cycles += rdtsc_gpu() - t0;
@@ -183,8 +252,178 @@ static void gpu_vec_add_dispatch(float *out, const float *a, const float *b,
         /* Download result */
         gpu_tensor_download(gs->vram_out, out + offset, bytes);
         offset += chunk;
+
+        /* Reclaim CB0 allocations between chunks */
+        vram_restore(saved);
     }
 
+    gs->gpu_cycles += rdtsc_gpu() - t0;
+    gs->gpu_ops++;
+}
+
+/* ── GPU rmsnorm dispatch ────────────────────────────────── */
+
+static void gpu_rmsnorm_dispatch(float *out, const float *x,
+                                  const float *weight, uint32_t dim,
+                                  gpu_llama_state_t *gs)
+{
+    if (!gs->kernels.rmsnorm || !gs->vram_a) {
+        uint64_t t0 = rdtsc_gpu();
+        rmsnorm(out, x, weight, dim);
+        gs->cpu_cycles += rdtsc_gpu() - t0;
+        gs->cpu_ops++;
+        return;
+    }
+
+    uint64_t t0 = rdtsc_gpu();
+    uint32_t bytes = dim * sizeof(float);
+    uint64_t saved = vram_save();
+
+    /* Upload x and weight to VRAM scratch */
+    if (gpu_tensor_upload(gs->vram_a, x, bytes) < 0 ||
+        gpu_tensor_upload(gs->vram_b, weight, bytes) < 0) {
+        vram_restore(saved);
+        rmsnorm(out, x, weight, dim);
+        gs->cpu_cycles += rdtsc_gpu() - t0;
+        gs->cpu_ops++;
+        return;
+    }
+
+    /* Dispatch rmsnorm kernel (eps=1e-5) */
+    int ret = gpu_rmsnorm_ptx(gs->vram_out, gs->vram_a, gs->vram_b, dim, 1e-5f);
+    if (ret < 0) {
+        vram_restore(saved);
+        rmsnorm(out, x, weight, dim);
+        gs->cpu_cycles += rdtsc_gpu() - t0;
+        gs->cpu_ops++;
+        return;
+    }
+
+    /* Download result */
+    if (gpu_tensor_download(gs->vram_out, out, bytes) < 0) {
+        vram_restore(saved);
+        rmsnorm(out, x, weight, dim);
+        gs->cpu_cycles += rdtsc_gpu() - t0;
+        gs->cpu_ops++;
+        return;
+    }
+
+    vram_restore(saved);
+    gs->gpu_cycles += rdtsc_gpu() - t0;
+    gs->gpu_ops++;
+}
+
+/* ── GPU silu_mul dispatch (fused SiLU(gate) * up) ──────── */
+
+static void gpu_silu_mul_dispatch(float *out, float *gate, const float *up,
+                                   uint32_t n, gpu_llama_state_t *gs)
+{
+    if (!gs->kernels.silu || !gs->vram_a) {
+        uint64_t t0 = rdtsc_gpu();
+        silu_inplace(gate, n);
+        vec_mul(out, gate, up, n);
+        gs->cpu_cycles += rdtsc_gpu() - t0;
+        gs->cpu_ops++;
+        return;
+    }
+
+    uint64_t t0 = rdtsc_gpu();
+    uint32_t bytes = n * sizeof(float);
+    uint64_t saved = vram_save();
+
+    /* Upload gate and up to VRAM */
+    if (gpu_tensor_upload(gs->vram_a, gate, bytes) < 0 ||
+        gpu_tensor_upload(gs->vram_b, up, bytes) < 0) {
+        vram_restore(saved);
+        silu_inplace(gate, n);
+        vec_mul(out, gate, up, n);
+        gs->cpu_cycles += rdtsc_gpu() - t0;
+        gs->cpu_ops++;
+        return;
+    }
+
+    /* Dispatch fused silu_mul kernel: out[i] = SiLU(gate[i]) * up[i] */
+    int ret = gpu_silu_mul_ptx(gs->vram_out, gs->vram_a, gs->vram_b, n);
+    if (ret < 0) {
+        vram_restore(saved);
+        silu_inplace(gate, n);
+        vec_mul(out, gate, up, n);
+        gs->cpu_cycles += rdtsc_gpu() - t0;
+        gs->cpu_ops++;
+        return;
+    }
+
+    /* Download result */
+    if (gpu_tensor_download(gs->vram_out, out, bytes) < 0) {
+        vram_restore(saved);
+        silu_inplace(gate, n);
+        vec_mul(out, gate, up, n);
+        gs->cpu_cycles += rdtsc_gpu() - t0;
+        gs->cpu_ops++;
+        return;
+    }
+
+    vram_restore(saved);
+    gs->gpu_cycles += rdtsc_gpu() - t0;
+    gs->gpu_ops++;
+}
+
+/* ── GPU RoPE dispatch (in-place on q and k) ────────────── */
+
+static void gpu_rope_dispatch(float *q, float *k,
+                               uint32_t n_heads, uint32_t n_kv_heads,
+                               uint32_t head_dim, uint32_t pos,
+                               float theta, gpu_llama_state_t *gs)
+{
+    if (!gs->kernels.rope || !gs->vram_a) {
+        uint64_t t0 = rdtsc_gpu();
+        rope(q, n_heads,    head_dim, pos, theta);
+        rope(k, n_kv_heads, head_dim, pos, theta);
+        gs->cpu_cycles += rdtsc_gpu() - t0;
+        gs->cpu_ops++;
+        return;
+    }
+
+    uint64_t t0 = rdtsc_gpu();
+    uint32_t q_bytes = n_heads * head_dim * sizeof(float);
+    uint32_t k_bytes = n_kv_heads * head_dim * sizeof(float);
+    uint64_t saved = vram_save();
+
+    /* Upload q and k to VRAM */
+    if (gpu_tensor_upload(gs->vram_a, q, q_bytes) < 0 ||
+        gpu_tensor_upload(gs->vram_b, k, k_bytes) < 0) {
+        vram_restore(saved);
+        rope(q, n_heads,    head_dim, pos, theta);
+        rope(k, n_kv_heads, head_dim, pos, theta);
+        gs->cpu_cycles += rdtsc_gpu() - t0;
+        gs->cpu_ops++;
+        return;
+    }
+
+    /* Dispatch rope kernel (processes both q and k) */
+    int ret = gpu_rope_ptx(gs->vram_a, gs->vram_b, pos,
+                           n_heads, n_kv_heads, head_dim, theta);
+    if (ret < 0) {
+        vram_restore(saved);
+        rope(q, n_heads,    head_dim, pos, theta);
+        rope(k, n_kv_heads, head_dim, pos, theta);
+        gs->cpu_cycles += rdtsc_gpu() - t0;
+        gs->cpu_ops++;
+        return;
+    }
+
+    /* Download modified q and k back */
+    if (gpu_tensor_download(gs->vram_a, q, q_bytes) < 0 ||
+        gpu_tensor_download(gs->vram_b, k, k_bytes) < 0) {
+        vram_restore(saved);
+        rope(q, n_heads,    head_dim, pos, theta);
+        rope(k, n_kv_heads, head_dim, pos, theta);
+        gs->cpu_cycles += rdtsc_gpu() - t0;
+        gs->cpu_ops++;
+        return;
+    }
+
+    vram_restore(saved);
     gs->gpu_cycles += rdtsc_gpu() - t0;
     gs->gpu_ops++;
 }
@@ -214,8 +453,8 @@ int gpu_llama_init(gpu_llama_state_t *gs, llama_state_t *cpu_state)
         serial_puts("[GPU_INF] Kernel: vec_add_f32 (GPU)\n");
     }
 
-    /* Future kernel detection (not yet compiled) */
-    sass_kernel_t *k_matvec = sass_get_kernel("matvec_q4_0");
+    /* Compiled PTX kernel detection */
+    sass_kernel_t *k_matvec = sass_get_kernel("gemv_q4_0");
     if (k_matvec && k_matvec->uploaded)
         gs->kernels.matvec_q4_0 = true;
 
@@ -227,7 +466,7 @@ int gpu_llama_init(gpu_llama_state_t *gs, llama_state_t *cpu_state)
     if (k_softmax && k_softmax->uploaded)
         gs->kernels.softmax = true;
 
-    sass_kernel_t *k_silu = sass_get_kernel("silu");
+    sass_kernel_t *k_silu = sass_get_kernel("silu_mul");
     if (k_silu && k_silu->uploaded)
         gs->kernels.silu = true;
 
@@ -271,7 +510,7 @@ int gpu_llama_init(gpu_llama_state_t *gs, llama_state_t *cpu_state)
             serial_puts("\n");
         } else {
             serial_puts("[GPU_INF] VRAM scratch alloc failed, GPU ops disabled\n");
-            gs->kernels.vec_add = false;
+            memset(&gs->kernels, 0, sizeof(gs->kernels));
         }
     } else {
         serial_puts("[GPU_INF] GPU tensor subsystem not ready, CPU-only mode\n");
@@ -280,21 +519,22 @@ int gpu_llama_init(gpu_llama_state_t *gs, llama_state_t *cpu_state)
     /* Dispatch summary */
     serial_puts("[GPU_INF] Dispatch plan:\n");
     serial_puts("[GPU_INF]   matvec_q4_0: ");
-    serial_puts(gs->kernels.matvec_q4_0 ? "GPU" : "CPU (AVX2)");
-    serial_puts(" [~90% of compute]\n");
-    serial_puts("[GPU_INF]   vec_add:     ");
-    serial_puts(gs->kernels.vec_add ? "GPU (chunked 256)" : "CPU");
-    serial_puts("\n");
+    serial_puts(gs->kernels.matvec_q4_0 ? "GPU (streaming)" : "CPU (AVX2)");
+    serial_puts(" [~90%]\n");
     serial_puts("[GPU_INF]   rmsnorm:     ");
     serial_puts(gs->kernels.rmsnorm ? "GPU" : "CPU");
-    serial_puts("\n");
-    serial_puts("[GPU_INF]   softmax:     CPU (attention loop)\n");
+    serial_puts(" [49/tok]\n");
+    serial_puts("[GPU_INF]   silu_mul:    ");
+    serial_puts(gs->kernels.silu ? "GPU (fused)" : "CPU");
+    serial_puts(" [16/tok]\n");
     serial_puts("[GPU_INF]   rope:        ");
-    serial_puts(gs->kernels.rope ? "GPU" : "CPU");
-    serial_puts("\n");
-    serial_puts("[GPU_INF]   silu:        ");
-    serial_puts(gs->kernels.silu ? "GPU" : "CPU");
-    serial_puts("\n");
+    serial_puts(gs->kernels.rope ? "GPU (q+k)" : "CPU");
+    serial_puts(" [16/tok]\n");
+    serial_puts("[GPU_INF]   vec_add:     ");
+    serial_puts(gs->kernels.vec_add ? "GPU (chunked)" : "CPU");
+    serial_puts(" [32/tok]\n");
+    serial_puts("[GPU_INF]   softmax:     CPU (per-head) [512/tok]\n");
+    serial_puts("[GPU_INF]   attention:   CPU (GQA loop)\n");
 
     gs->initialized = true;
 
@@ -325,17 +565,17 @@ int gpu_llama_forward(gpu_llama_state_t *gs, uint32_t token)
     for (uint32_t l = 0; l < s->n_layers; l++) {
         llama_layer_t *ly = &s->weights.layers[l];
 
-        /* Attention norm (CPU) */
-        rmsnorm(s->xb, s->x, gpu_norm_data(ly->attn_norm), dim);
+        /* Attention norm — GPU when available */
+        gpu_rmsnorm_dispatch(s->xb, s->x, gpu_norm_data(ly->attn_norm), dim, gs);
 
-        /* Q, K, V projections (CPU — dominant cost) */
+        /* Q, K, V projections — GPU matvec_q4_0 when available */
         gpu_matvec(s->q, ly->attn_q, s->xb, dim, dim, gs);
         gpu_matvec(s->k, ly->attn_k, s->xb, kv_dim, dim, gs);
         gpu_matvec(s->v, ly->attn_v, s->xb, kv_dim, dim, gs);
 
-        /* RoPE (CPU) */
-        rope(s->q, s->n_heads,    hd, pos, 500000.0f);
-        rope(s->k, s->n_kv_heads, hd, pos, 500000.0f);
+        /* RoPE — GPU when available (combined q+k dispatch) */
+        gpu_rope_dispatch(s->q, s->k, s->n_heads, s->n_kv_heads,
+                          hd, pos, 500000.0f, gs);
 
         /* Store K, V in cache */
         float *kc = s->kv_cache[l].k + (uint64_t)pos * kv_dim;
@@ -377,15 +617,14 @@ int gpu_llama_forward(gpu_llama_state_t *gs, uint32_t token)
         gpu_vec_add_dispatch(s->x, s->x, s->xb, dim, gs);
 
         /* ── FFN ── */
-        rmsnorm(s->xb, s->x, gpu_norm_data(ly->ffn_norm), dim);
+        gpu_rmsnorm_dispatch(s->xb, s->x, gpu_norm_data(ly->ffn_norm), dim, gs);
 
-        /* Gate + Up projections (CPU) */
+        /* Gate + Up projections — GPU matvec_q4_0 when available */
         gpu_matvec(s->hb,  ly->ffn_gate, s->xb, s->ffn_dim, dim, gs);
         gpu_matvec(s->hb2, ly->ffn_up,   s->xb, s->ffn_dim, dim, gs);
 
-        /* SwiGLU: SiLU(gate) * up (CPU) */
-        silu_inplace(s->hb, s->ffn_dim);
-        vec_mul(s->hb, s->hb, s->hb2, s->ffn_dim);
+        /* SwiGLU: SiLU(gate) * up — GPU fused kernel when available */
+        gpu_silu_mul_dispatch(s->hb, s->hb, s->hb2, s->ffn_dim, gs);
 
         /* Down projection (CPU) */
         gpu_matvec(s->xb, ly->ffn_down, s->hb, dim, s->ffn_dim, gs);
@@ -394,8 +633,8 @@ int gpu_llama_forward(gpu_llama_state_t *gs, uint32_t token)
         gpu_vec_add_dispatch(s->x, s->x, s->xb, dim, gs);
     }
 
-    /* ── Final norm + logits (CPU) ── */
-    rmsnorm(s->x, s->x, gpu_norm_data(s->weights.output_norm), dim);
+    /* ── Final norm + logits ── */
+    gpu_rmsnorm_dispatch(s->x, s->x, gpu_norm_data(s->weights.output_norm), dim, gs);
     gpu_matvec(s->logits, s->weights.output, s->x, s->vocab_size, dim, gs);
 
     s->pos++;

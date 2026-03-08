@@ -326,9 +326,9 @@ int gmmu_init(void)
 
     memset(&gmmu, 0, sizeof(gmmu));
 
-    /* Identity-map VRAM region: SASS kernels (256MB) + tensor buffers (260MB) */
+    /* Identity-map VRAM region: SASS kernels (256MB) + tensor buffers (260MB, 16MB) */
     uint64_t vram_base = (uint64_t)SASS_VRAM_OFFSET_MB * 1024 * 1024;
-    uint64_t vram_size = 8 * 1024 * 1024;  /* 8MB: kernels (4MB) + tensor data (4MB) */
+    uint64_t vram_size = 24 * 1024 * 1024;  /* 24MB: kernels (4MB) + tensor data (16MB) + headroom */
 
     if (gmmu_build_identity_map(vram_base, vram_size) < 0) {
         serial_puts("[GMMU] Failed to build page tables\n");

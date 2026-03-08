@@ -353,6 +353,7 @@ Tasks:   idle, input, shell (3 of 8 slots used)
 | **X-NET2** | **TCP stack** (client-only, 3-way handshake, send/recv, FIN close, tcptest shell command) | Done |
 | **X-NET3** | **DNS resolver** (UDP query to SLIRP DNS, A record parse, resolve shell command) | Done |
 | **X-TOK1** | **BPE tokenizer** (Llama 3 BPE encode/decode, GGUF vocab extraction, FNV-1a hash, greedy+merge) | Done |
+| **X-INF1** | **GPU inference dispatch** (matvec_q4_0 + rmsnorm + silu_mul + rope + vec_add on GPU, VRAM save/restore, CPU fallback) | Done |
 
 > Full GPU roadmap (X27-X40 + contingency): see [docs/x86-gpu-roadmap.md](docs/x86-gpu-roadmap.md)
 > Full OS roadmap (Tier 0-5): see [docs/os-selfhost-roadmap.md](docs/os-selfhost-roadmap.md)
@@ -758,6 +759,19 @@ Byte-pair encoding tokenizer for Llama 3 models. Ported from xasko's C++ tiktoke
 - **Limits**: TOK_MAX_VOCAB=200000, TOK_MAX_TOKEN_LEN=128, TOK_MAX_MERGES=200000.
 - **Memory**: ~25MB for Llama 3 128K vocab (vocab array + hash table + merge rules). All via kmalloc.
 - **Files**: `arch/x86/kernel/tokenizer.h`, `arch/x86/kernel/tokenizer.c`, `arch/x86/fs/gguf.c` (gguf_load_tokenizer), `arch/x86/fs/gguf.h` (gguf_tokenizer_t)
+
+### X-INF1: GPU Inference Dispatch
+Full GPU dispatch for the Llama transformer forward pass. 6 of 7 operations dispatch to GPU with transparent CPU fallback.
+- **matvec_q4_0 (streaming)**: Upload Q4_0 weights + float input to VRAM, dispatch `gemv_q4_0` kernel, download result. Per-dispatch allocation via save/restore (no VRAM leaks). Falls back to CPU for >16MB matrices (e.g., vocab projection 128K×2048).
+- **rmsnorm**: Upload x + weight vectors to VRAM scratch buffers, dispatch `rmsnorm` kernel (eps=1e-5), download normalized output.
+- **silu_mul (fused)**: Single GPU kernel replaces CPU `silu_inplace() + vec_mul()`. Dispatches `silu_mul` — computes `SiLU(gate[i]) * up[i]` in one pass. Saves one PCIe round trip.
+- **rope (combined q+k)**: Uploads both Q and K vectors, dispatches `rope` kernel for in-place rotation, downloads both back. Replaces two separate CPU `rope()` calls.
+- **vec_add (chunked)**: Pre-allocated VRAM scratch buffers (3 × max(dim, ffn_dim) floats). 256-element chunks with PRAMIN transfer per chunk.
+- **VRAM allocator fix**: `gpu_tensor_reset()` was destroying pre-allocated scratch buffers. Replaced with `vram_save()/vram_restore()` pattern — saves bump allocator position before temp allocations, restores after download. CB0 allocations inside `gpu_dispatch_kernel()` are also reclaimed.
+- **CPU-only ops**: Attention GQA loop (irregular per-head access pattern) and per-head softmax stay on CPU. ~4% of compute.
+- **Dispatch per token** (Llama 3.2 1B, 16 layers): 112 matvec_q4_0 + 49 rmsnorm + 16 silu_mul + 16 rope + 32 vec_add = 225 GPU dispatches/token.
+- **GMMU**: Identity map expanded 8→24MB (kernels 4MB + tensor buffers 16MB + headroom). VRAM buffer region expanded 4→16MB.
+- **Files**: `arch/x86/drivers/gpu_inference.c` (dispatch wrappers + forward pass), `arch/x86/drivers/gpu_tensor.h` (VRAM size), `arch/x86/drivers/gmmu.c` (identity map size)
 
 ### X27: Falcon PIO Load
 Programmed I/O access to Falcon IMEM/DMEM via IMEMC/IMEMD registers.
