@@ -382,13 +382,14 @@ Tasks:   idle, input, shell (3 of 8 slots used)
 | **X-MMAP** | **mmap/munmap/mprotect** (MAP_ANONYMOUS identity-mapped, VMA tracking, page-level protection, CRT wrappers, 6/6 QEMU tests pass) | Done |
 | **X-VFS** | **Virtual filesystem layer** (/dev/null,zero,urandom,console + /proc/self/status,maps + getcwd/readlink/getdents64 syscalls, 7/7 QEMU tests pass) | Done |
 | **X-MUSL** | **musl libc port** (cross-compiled musl 1.2.5 static libc, +20 syscalls: arch_prctl/set_tid_address/clock_gettime/getrandom/nanosleep/getpid/gettid/futex/fcntl/prlimit64/etc, 9/9 QEMU tests pass) | Done |
+| **X-FORK** | **fork/wait4/getppid** (scheduler-based fork via fake ISR frames, child user stack copy + frame pointer relocation, ZOMBIE lifecycle, +25 busybox syscall stubs, 3/3 QEMU tests pass) | Done |
 
 > Full GPU roadmap (X27-X40 + contingency): see [docs/x86-gpu-roadmap.md](docs/x86-gpu-roadmap.md)
 > Full OS roadmap (Tiers 0-9): see [docs/os-selfhost-roadmap.md](docs/os-selfhost-roadmap.md)
 > Binary compatibility roadmap: see [docs/binary-compat-roadmap.md](docs/binary-compat-roadmap.md)
 > Paths to Claude analysis: see [docs/paths-to-claude-on-ositok.md](docs/paths-to-claude-on-ositok.md)
 
-**Tier 7+ (next)**: X-THREAD (clone/futex),
+**Tier 7+ (next)**: X-BUSYBOX (static busybox binary execution),
 X-EDIT (port kilo editor), X-HTTPD (TCP server), X-SELF (self-hosting kernel compile).
 See `docs/os-selfhost-roadmap.md` for full details and dependency chains.
 
@@ -1145,10 +1146,23 @@ Cross-compiled musl 1.2.5 as static libc for OsitoK. Programs linked with musl r
   - **Memory**: getrandom(318) from xorshift64 PRNG, futex(202) minimal WAIT/WAKE stubs.
   - **Files**: pread64(17), pwrite64(18), fcntl(72) F_GETFD/SETFD/GETFL/SETFL/DUPFD, newfstatat(262), dup(32), fsync(74).
   - **Process**: exit_group(231) alias to exit, sched_yield(24) via HLT, prlimit64(302) RLIMIT_STACK/NOFILE, set_robust_list(273) stub.
-  - **Stubs**: clone(56), fork(57), execve(59) return -ENOSYS.
+  - **Stubs**: clone(56), fork(57), execve(59) were stubs, now implemented in X-FORK.
 - **Verified**: 9/9 tests pass in QEMU — printf, strlen/strcmp, malloc/free, mmap, getpid, clock_gettime, /dev/zero, snprintf with floats, argc/argv.
 - **Files**: `arch/x86/kernel/syscall.c` (all new syscalls), `arch/x86/test/musl_test.c`
 - **musl source**: `/tmp/musl-src/`, installed to `/tmp/musl-install/`
+
+### X-FORK: fork/wait4/getppid Syscalls
+Preemptive process creation via scheduler-based fork. Child gets own kernel stack with fake ISR interrupt frame; scheduler's IRETQ delivers child to userspace with RAX=0.
+- **proc_fork()**: Reads parent's registers from SYSCALL stack frame (14 pushes by syscall_entry.S). Allocates 16KB kernel stack, builds 176-byte fake ISR frame (22 × uint64_t: 15 GPRs + vector/error + RIP/CS/RFLAGS/RSP/SS). Allocates 64KB user stack, copies 32KB from parent, relocates saved frame pointers.
+- **Frame pointer relocation**: After memcpy of parent's user stack, scans copied region for any uint64_t value within parent's stack range [user_rsp .. user_rsp+32KB) and adjusts by parent→child delta. Without this, `pop %rbp` in function epilogues restores parent's frame pointer, causing child to write locals into parent's stack memory.
+- **proc_exit() dual path**: Processes with kernel_stack (fork/sched_spawn) → set ZOMBIE + halt for scheduler. Processes from proc_exec (shell) → longjmp to exec_jmpbuf. Memory region cleanup deferred to proc_wait4 (process still running on user stack during exit).
+- **proc_wait4()**: Non-blocking first scan, then blocking `sti;hlt;cli` loop. Reaps ZOMBIE children, frees kernel stack + memory regions, returns exit status in Linux format `(code & 0xFF) << 8`.
+- **Scheduler fixes**: ZOMBIE processes force-switch immediately (quantum=0 bypass). `sched_tick` preserves ZOMBIE state (only RUNNING→READY on preemption). BSP-only guard prevents SMP corruption.
+- **syscall_user_rsp**: Global in syscall_entry.S BSS, saved before any pushes. Fork reads parent's complete register state from this frame.
+- **New syscalls** (~25 stubs for busybox/musl): openat(257), readlinkat(267), uname(63), getuid/gid/euid/egid(102-108), setuid/setgid(105-106), getppid(110), getpgrp(111), setsid(112), getgroups(115), prctl(157), dup3(292), pipe2(293), rseq(334), close_range(436), madvise(28), stat/lstat(4/6), sendfile(40).
+- **getppid**: Per-process `ppid` field set in proc_alloc from current_proc->pid. proc_current_ppid() exported.
+- **Verified**: 3/3 QEMU tests — T1 fork+wait (exit 42), T2 fork+exit (exit 7), T3 getpid. Zero #GP faults. Shell returns cleanly.
+- **Files**: `arch/x86/kernel/process.c` (proc_fork, proc_wait4, proc_exit dual path), `arch/x86/kernel/syscall.c` (sys_clone, sys_wait4, +25 stubs), `arch/x86/kernel/syscall_entry.S` (syscall_user_rsp), `arch/x86/test/fork_test.c`
 
 ### AArch64/SM8350 Port (arch/arm/)
 Reference bare-metal code for ASUS ROG Phone 5 (Snapdragon 888).
