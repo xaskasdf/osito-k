@@ -46,7 +46,12 @@ extern void syscall_reset_process(void);
 #define PROC_FREE       0
 #define PROC_READY      1
 #define PROC_RUNNING    2
-#define PROC_ZOMBIE     3
+#define PROC_BLOCKED    3
+#define PROC_ZOMBIE     4
+
+/* Scheduler constants (X-SCHED) */
+#define SCHED_QUANTUM       5       /* ticks per time slice (50ms @ 100Hz) */
+#define KERNEL_STACK_SIZE   16384   /* 16KB per kernel thread */
 
 /* ── File descriptor ─────────────────────────────────────────── */
 
@@ -85,9 +90,10 @@ typedef struct {
     /* Address space (for future per-process paging) */
     uint64_t    cr3;
 
-    /* Saved context (for future scheduling) */
-    uint64_t    rsp;
-    uint64_t    rip;
+    /* Scheduler context (X-SCHED) */
+    void    *kernel_stack;       /* allocated kernel stack (NULL for kernel proc) */
+    uint64_t kernel_rsp;         /* saved RSP pointing to interrupt frame */
+    uint32_t quantum;            /* ticks remaining in time slice */
 } process_t;
 
 /* ── Process table ───────────────────────────────────────────── */
@@ -309,6 +315,7 @@ void proc_list(void)
         switch (proctab[i].state) {
         case PROC_READY:   state_str = "  READY    "; break;
         case PROC_RUNNING: state_str = "  RUNNING  "; break;
+        case PROC_BLOCKED: state_str = "  BLOCKED  "; break;
         case PROC_ZOMBIE:  state_str = "  ZOMBIE   "; break;
         default:           state_str = "  ???      "; break;
         }
@@ -322,6 +329,212 @@ void proc_list(void)
     }
 }
 
+/* ════════════════════════════════════════════════════════════════
+ * X-SCHED: Preemptive Scheduler
+ *
+ * Timer-based round-robin context switching via APIC timer (100Hz).
+ * The ISR stub in isr_stubs.S checks sched_switch_rsp after each
+ * timer tick — if non-zero, it swaps RSP before popping GPRs,
+ * effectively switching to the next process's saved interrupt frame.
+ *
+ * Each kernel thread gets a 16KB stack with a fake interrupt frame
+ * at the top for the first context switch. After that, real frames
+ * are saved/restored by the timer ISR.
+ * ════════════════════════════════════════════════════════════════ */
+
+/* ISR stub sets RSP to this value when non-zero (defined in isr_stubs.S) */
+extern volatile uint64_t sched_switch_rsp;
+
+static int      sched_current_idx = -1;
+static bool     sched_enabled = false;
+static uint64_t sched_switches = 0;
+
+/* Thread exit trampoline — if a kernel thread's entry function returns,
+ * execution lands here (the return address was placed below the fake frame). */
+static void __attribute__((noreturn)) sched_thread_exit(void)
+{
+    if (sched_current_idx >= 0)
+        proctab[sched_current_idx].state = PROC_ZOMBIE;
+    for (;;) __asm__ volatile ("hlt");
+}
+
+/* ── sched_tick: called from ISR on every APIC timer tick ────── */
+
+/* Read LAPIC ID from APIC_ID register (bits 31:24) */
+extern volatile uint32_t *idt_get_apic_base(void);
+
+static inline uint32_t sched_get_lapic_id(void)
+{
+    volatile uint32_t *apic = idt_get_apic_base();
+    if (!apic) return 0;
+    return apic[0x020 / 4] >> 24;
+}
+
+void sched_tick(void *frame_ptr)
+{
+    if (!sched_enabled || sched_current_idx < 0)
+        return;
+
+    /* Only BSP (LAPIC ID 0) runs the scheduler — APs have their own
+     * timer interrupts but must not touch single-CPU scheduler state */
+    if (sched_get_lapic_id() != 0)
+        return;
+
+    process_t *cur = &proctab[sched_current_idx];
+
+    /* Decrement quantum — if still running, continue */
+    if (cur->quantum > 1) {
+        cur->quantum--;
+        return;
+    }
+
+    /* Quantum expired — find next READY process (round-robin) */
+    int next_idx = -1;
+    for (int i = 1; i <= MAX_PROCESSES; i++) {
+        int idx = (sched_current_idx + i) % MAX_PROCESSES;
+        if (proctab[idx].state == PROC_READY) {
+            next_idx = idx;
+            break;
+        }
+    }
+
+    if (next_idx < 0) {
+        /* No other runnable process — reset quantum, continue */
+        cur->quantum = SCHED_QUANTUM;
+        return;
+    }
+
+    /* ── Context switch ────────────────────────────────────────── */
+
+    /* Save current process: frame_ptr is RSP pointing to the saved
+     * GPRs on this process's stack (set by ISR stub before calling
+     * isr_handler). Store it so we can restore later. */
+    cur->kernel_rsp = (uint64_t)frame_ptr;
+    cur->state = PROC_READY;
+
+    /* Load next process */
+    process_t *next = &proctab[next_idx];
+    next->state = PROC_RUNNING;
+    next->quantum = SCHED_QUANTUM;
+    current_proc = next;
+    sched_current_idx = next_idx;
+
+    /* Tell ISR stub to switch RSP before popping GPRs.
+     * The stub will: mov sched_switch_rsp → RSP, then pop + iretq
+     * using the new process's saved interrupt frame. */
+    sched_switch_rsp = next->kernel_rsp;
+
+    sched_switches++;
+}
+
+/* ── sched_spawn: create a preemptively-scheduled kernel thread ── */
+
+int sched_spawn(const char *name, void (*entry)(void))
+{
+    process_t *p = proc_alloc(name);
+    if (!p) {
+        serial_puts("[SCHED] No free process slot\n");
+        return -1;
+    }
+
+    /* Allocate kernel stack */
+    void *stack = mem_alloc_aligned(KERNEL_STACK_SIZE, 4096);
+    if (!stack) {
+        p->state = PROC_FREE;
+        serial_puts("[SCHED] Stack allocation failed\n");
+        return -1;
+    }
+    p->kernel_stack = stack;
+
+    uint64_t stack_top = (uint64_t)stack + KERNEL_STACK_SIZE;
+
+    /* Place fake interrupt frame at top of stack (176 bytes = 22 × uint64_t).
+     * When the scheduler first switches to this process, the ISR stub
+     * pops GPRs from this frame and iretq jumps to the entry function. */
+    uint64_t frame_addr = (stack_top - 176) & ~0xFULL;  /* 16-byte aligned */
+    uint64_t *frame = (uint64_t *)frame_addr;
+    memset(frame, 0, 176);
+
+    /* Place return address below frame — if entry() returns, it lands
+     * in sched_thread_exit() which marks the process as ZOMBIE. */
+    uint64_t ret_addr = frame_addr - 8;
+    *(uint64_t *)ret_addr = (uint64_t)sched_thread_exit;
+
+    /* Fill CPU-pushed portion of interrupt frame:
+     * [17]=RIP  [18]=CS  [19]=RFLAGS  [20]=RSP  [21]=SS */
+    frame[17] = (uint64_t)entry;    /* RIP = thread entry function */
+    frame[18] = 0x38;               /* CS  = kernel code segment */
+    frame[19] = 0x202;              /* RFLAGS = IF=1, reserved bit 1 */
+    frame[20] = ret_addr;           /* RSP = just below frame (ABI: 8 mod 16) */
+    frame[21] = 0x30;               /* SS  = kernel data segment */
+
+    /* Set initial scheduler state */
+    p->kernel_rsp = frame_addr;
+    p->state = PROC_READY;
+    p->quantum = SCHED_QUANTUM;
+
+    /* Auto-activate scheduler on first spawn */
+    if (!sched_enabled) {
+        /* Set up kernel process for scheduling */
+        proctab[sched_current_idx].quantum = SCHED_QUANTUM;
+        sched_enabled = true;
+        serial_puts("[SCHED] Preemptive scheduling activated\n");
+    }
+
+    serial_puts("[SCHED] Spawned '");
+    serial_puts(name);
+    serial_puts("' PID ");
+    serial_putdec(p->pid);
+    serial_puts("\n");
+
+    return (int)p->pid;
+}
+
+/* ── sched_yield: voluntarily give up remaining time slice ────── */
+
+void sched_yield(void)
+{
+    if (!sched_enabled || sched_current_idx < 0) return;
+    proctab[sched_current_idx].quantum = 0;
+    __asm__ volatile ("hlt");  /* wait for next timer tick → switch */
+}
+
+/* ── sched_stats: return context switch count ────────────────── */
+
+uint64_t sched_get_switches(void) { return sched_switches; }
+bool sched_is_enabled(void) { return sched_enabled; }
+
+/* ── Test threads (used by shell 'sched' command) ────────────── */
+
+extern uint64_t idt_get_ticks(void);
+
+void sched_test_a(void)
+{
+    for (int i = 0; i < 20; i++) {
+        serial_puts("A");
+        fb_puts("A");
+        /* Busy-wait ~500ms (50 ticks @ 100Hz) */
+        uint64_t start = idt_get_ticks();
+        while (idt_get_ticks() - start < 50)
+            __asm__ volatile ("hlt");
+    }
+    serial_puts("\n[thread_a] done\n");
+    fb_puts("\n[thread_a] done\n");
+}
+
+void sched_test_b(void)
+{
+    for (int i = 0; i < 20; i++) {
+        serial_puts("B");
+        fb_puts("B");
+        uint64_t start = idt_get_ticks();
+        while (idt_get_ticks() - start < 50)
+            __asm__ volatile ("hlt");
+    }
+    serial_puts("\n[thread_b] done\n");
+    fb_puts("\n[thread_b] done\n");
+}
+
 /* ── Initialize process subsystem ────────────────────────────── */
 
 void proc_init(void)
@@ -331,11 +544,12 @@ void proc_init(void)
     memset(proctab, 0, sizeof(proctab));
     current_proc = NULL;
 
-    /* Create PID 0 (kernel) */
+    /* Create PID 1 (kernel) */
     process_t *kernel = proc_alloc("kernel");
     if (kernel) {
         kernel->state = PROC_RUNNING;
         current_proc = kernel;
+        sched_current_idx = (int)(kernel - &proctab[0]);
         serial_puts("[PROC] Kernel process PID ");
         serial_putdec(kernel->pid);
         serial_puts("\n");

@@ -2,205 +2,281 @@
 
 ## Context
 
-OsitoK x86-64 ha completado X1–X42 + X-CPU1: UEFI boot, NVMe read, OsitoFS,
-Ethernet + UDP, GPU compute pipeline completo (SASS kernels + CB0 dispatch),
-CPU Llama inference con AVX2. Pero es esencialmente un **firmware especializado**
-que corre una secuencia monolítica en ring 0 sin aislamiento.
+OsitoK x86-64 ha completado Tiers 0-6: un OS bare-metal con UEFI boot, NVMe R/W,
+OsitoFS R/W, GPU compute pipeline (SASS SM75 + CB0 dispatch), CPU Llama 3.2 1B
+inference con AVX2+BPE tokenizer, TCP/TLS/HTTPS, Claude API con tool use,
+TCC compiler in-OS, multi-core SMP, pipes/signals, dynamic linking, QuickJS
+JavaScript engine, y git nativo con SHA-1+zlib.
 
-**Objetivo**: Transformar OsitoK en un OS general capaz de:
-1. Ejecutar programas compilados (ELF binaries)
-2. Auto-hospedarse (compilar C en el propio OS)
-3. Hacer llamadas HTTPS a la API de Claude
-4. Eventualmente correr un cliente Claude CLI nativo
+**Objetivos originales** (todos cumplidos):
+1. ~~Ejecutar programas compilados (ELF binaries)~~ ✅ Tier 1
+2. ~~Auto-hospedarse (compilar C en el propio OS)~~ ✅ Tier 3
+3. ~~Hacer llamadas HTTPS a la API de Claude~~ ✅ Tier 4-5
+4. ~~Correr un cliente Claude CLI nativo~~ ✅ Tier 5
 
-**Próximos pasos inmediatos**: X-CPU2 (NVMe write) y X-CPU3 (UDP prompt server),
-seguidos de las capas fundamentales del OS.
+**Nuevos objetivos**:
+1. Madurar el OS — scheduler preemptivo, VFS, mmap, threads
+2. Correr binarios Linux sin modificar (busybox, toybox, static Go)
+3. Optimizar GPU inference — full VRAM pipeline, >10 tok/s
+4. Self-hosting completo — compilar el propio kernel desde OsitoK
 
 ---
 
-## Estado Actual del OS — Inventario
+## Estado Actual del OS — Inventario (marzo 2026)
 
 | Subsistema | Estado | Qué Falta |
 |-----------|--------|-----------|
-| **Memoria** | Bitmap page allocator (4KB), `mem_alloc_aligned` | No paging, no heap, no malloc/free, no VM |
-| **Procesos** | Ninguno — secuencia monolítica ring 0 | No scheduler, no syscalls, no aislamiento |
-| **Filesystem** | OsitoFS v2 read/write, NVMe read/write | No directorios, no permisos |
-| **Red** | I211 Ethernet + ARP + IPv4 + UDP (polling) | No TCP, no DNS, no TLS, no ICMP |
-| **Consola** | Serial COM1 + framebuffer GOP | No input por teclado, no ANSI, no terminal |
-| **libc** | memset/memcpy/strlen/strcmp inline | No stdio, no stdlib, no math.h |
-| **ELF** | Parser parcial (solo firmware GSP) | No loader user-space, no dynamic linking |
-| **Interrupts** | UEFI-managed, polling en todo | No IDT propio, no APIC, no timer IRQ |
-| **GPU** | Completo: X1-X42 (boot chain + compute + SASS) | Funcional pero GSP boot chain sin validar en HW |
-| **AI** | Llama 3.2 1B CPU inference + AVX2 | ~5-10s/tok, single-token, solo Q4_0/Q8_0 |
+| **Memoria** | Page allocator + 4-level paging + kmalloc/kfree heap | No mmap, no per-process address space, no demand paging |
+| **Procesos** | process_t, PID, FD table, exec/exit/waitpid (cooperative) | No scheduler preemptivo, no threads, no fork |
+| **Filesystem** | OsitoFS v2 R/W, NVMe R/W, GPT parser | No directorios, no VFS, no /dev /proc |
+| **Red** | I211 Ethernet + ARP + IPv4 + UDP + TCP + DNS + TLS 1.2 + HTTPS | No TCP server (listen/accept), no socket syscalls |
+| **Consola** | Serial + GOP framebuffer + PS/2 keyboard + terminal line editor | No VT100 completo, no raw mode TTY |
+| **libc** | CRT (_start, printf, malloc) + tcclib (FILE*, fprintf, qsort) | No musl, no POSIX completo |
+| **ELF** | Full ELF64 loader (PT_LOAD, stack, argv) + dynamic linker | No PIE con ASLR, no lazy binding |
+| **Interrupts** | IDT 256-entry, #PF/#GP/#UD handlers, APIC timer 100Hz, PIC remap | No preemptive scheduling via timer |
+| **Syscalls** | 13 Linux-compat (read/write/open/close/fstat/lseek/brk/writev/access/unlink/ioctl/exit/arch_prctl) | No mmap, no clone, no signals, no sockets (~27 faltan para Phase 1) |
+| **Compiler** | TCC 0.9.28rc in-OS (.c → .o → ELF) | No linker in-OS, no self-compile kernel |
+| **GPU** | Completo: X1-X42 (boot chain + compute + SASS SM75), VRAM-resident weights/activations | GSP boot chain sin validar en HW real |
+| **AI** | Llama 3.2 1B: CPU AVX2 + GPU dispatch + BPE tokenizer + Claude API streaming + 5 tools | No sampling (temp/top-p), no K-quants |
+| **IPC** | Pipes (pipe/dup2), signals (SIGINT/SIGTERM/SIGKILL/SIGPIPE), shell redirection | No futex, no shared memory, no Unix domain sockets |
+| **SMP** | 4-core AP startup via INIT-SIPI-SIPI, APIC init per core | No per-core scheduling, APs idle after boot |
+| **Scripting** | QuickJS ES2020+ (bare-metal port, 7 builtins) | No fs/net bindings, no npm |
+| **VCS** | Git nativo (SHA-1+zlib, init/add/commit/log/status/diff/branch/checkout) | No pack files, no merge, no remote |
 
 ---
 
 ## Roadmap de Features — Orden de Ejecución
 
-### Tier 0: Completar Features Pendientes (X-CPU2, X-CPU3)
+### Tier 0: Completar Features Pendientes ✅
 
-| ID | Feature | Descripción | ~Líneas | Deps |
-|----|---------|-------------|---------|------|
-| **X-CPU2** | **NVMe write** | IO command write + OsitoFS v2 write (create, append, truncate) | ~400 | Done ✓ |
-| **X-CPU3** | **UDP prompt server** | Recibir prompt UDP:7777 → inference → devolver tokens | ~200 | Done ✓ |
+| ID | Feature | Estado |
+|----|---------|--------|
+| **X-CPU2** | NVMe write + OsitoFS v2 write | ✅ Done |
+| **X-CPU3** | UDP prompt server (port 7777) | ✅ Done |
 
-### Tier 1: OS Fundaciones — Ejecutar Programas (~2-3 semanas)
+### Tier 1: OS Fundaciones ✅
 
-| ID | Feature | Descripción | ~Líneas | Deps |
-|----|---------|-------------|---------|------|
-| **X-OS1** | **IDT + Exceptions** | Tabla de interrupciones propia, handlers de #PF/#GP/#UD, APIC timer | ~500 | Done ✓ |
-| **X-OS2** | **Paging (x86-64 4-level)** | PML4 setup, identity map kernel, per-process page tables, CR3 switch | ~600 | Done ✓ |
-| **X-OS3** | **Heap allocator** | malloc/free sobre page allocator (first-fit o buddy), brk/sbrk | ~400 | Done ✓ |
-| **X-OS4** | **Syscall interface** | MSR setup (LSTAR/STAR/FMASK), dispatch table, ABI: RAX=nr, RDI-R9=args | ~400 | Done ✓ |
-| **X-OS5** | **ELF loader** | Cargar PT_LOAD segments, setup stack (argc/argv/envp), jump to e_entry | ~400 | Done ✓ |
-| **X-OS6** | **Proceso mínimo** | process_t struct, file descriptor table, exec/exit/waitpid | ~500 | Done ✓ |
+| ID | Feature | Estado |
+|----|---------|--------|
+| **X-OS1** | IDT + Exceptions + APIC timer | ✅ Done |
+| **X-OS2** | Paging (4-level x86-64) | ✅ Done |
+| **X-OS3** | Heap allocator (kmalloc/kfree) | ✅ Done |
+| **X-OS4** | Syscall interface (SYSCALL/SYSRET) | ✅ Done |
+| **X-OS5** | ELF64 loader | ✅ Done |
+| **X-OS6** | Process subsystem (exec/exit/waitpid) | ✅ Done |
 
-**Hito**: Ejecutar `hello.elf` compilado en Linux que hace `write(1, "Hello\n", 6); exit(0);`
+**Hito** ✅: `hello.elf` ejecuta `write(1, "Hello\n", 6); exit(0);`
 
-### Tier 2: Shell + Filesystem Write (~2 semanas)
+### Tier 2: Shell + Filesystem Write ✅
 
-| ID | Feature | Descripción | ~Líneas | Deps |
-|----|---------|-------------|---------|------|
-| **X-OS7** | **Terminal + line editor** | Line discipline, backspace, Ctrl+C, VT100 básico (ANSI colors/cursor) | ~400 | X-OS1 |
-| **X-OS8** | **Keyboard driver** | PS/2 o USB HID keyboard (scancode → ASCII), ring buffer | ~300 | X-OS1 |
-| **X-OS9** | **Mini shell** | Parse cmdline, fork+exec, pipes, redirection (<, >, >>), builtins (cd, echo, exit) | ~600 | X-OS6, X-OS7, X-OS8 |
-| **X-OS10** | **OsitoFS v2 write** | Crear archivos, append, truncate. File descriptor write syscall | ~500 | X-CPU2, X-OS4 |
+| ID | Feature | Estado |
+|----|---------|--------|
+| **X-OS7** | Terminal line editor | ✅ Done |
+| **X-OS8** | PS/2 keyboard driver | ✅ Done |
+| **X-OS9** | Mini shell (20+ builtins) | ✅ Done |
+| **X-OS10** | File I/O syscalls + GDT fix | ✅ Done |
 
-**Hito**: Prompt interactivo `osito>` que ejecuta programas del disco
+**Hito** ✅: Shell interactivo `osito>` con keyboard, ELF exec, filesystem
 
-### Tier 3: Compilador Self-Hosting (~3 semanas)
+### Tier 3: Compilador Self-Hosting ✅ (parcial)
 
-| ID | Feature | Descripción | ~Líneas | Deps |
-|----|---------|-------------|---------|------|
-| **X-OS11** | **Cross-compile TCC** | Portar TCC (Tiny C Compiler, ~15KB bin) para target OsitoK | ~200 glue | X-OS6, X-OS3 |
-| **X-OS12** | **Newlib stubs** | _read/_write/_sbrk/_exit → syscalls de OsitoK. libc mínima | ~300 | X-OS4, X-OS3 |
-| **X-OS13** | **TCC self-hosting** | `tcc -c tcc.c && tcc -o tcc tcc.o` en OsitoK | ~100 test | X-OS11, X-OS12 |
-| **X-OS14** | **Port musl libc** | libc POSIX-compliant. Compilar con TCC en OsitoK | ~500 glue | X-OS13 |
-| **X-OS15** | **Port chibicc** | Compilador C11 completo. Mejor que TCC para apps reales | ~300 glue | X-OS14 |
+| ID | Feature | Estado |
+|----|---------|--------|
+| **X-OS11** | TCC cross-compilation | ✅ Done |
+| **X-OS12** | Minimal CRT (crt.c + syscall.S) | ✅ Done |
+| **X-OS13** | TCC in-OS compilation (.c → .o) | ✅ Done |
+| **X-OS14** | Port musl libc | Pendiente → Tier 7 |
+| **X-OS15** | Port chibicc | Pendiente → Tier 7 |
 
-**Hito**: Escribir, compilar y ejecutar un programa C **dentro de OsitoK**
+**Hito** ✅: TCC compila C dentro de OsitoK, produce y ejecuta ELF binaries
 
-### Tier 4: TCP/TLS + HTTP Client (~3-4 semanas)
+### Tier 4: TCP/TLS + HTTP Client ✅
 
-| ID | Feature | Descripción | ~Líneas | Deps |
-|----|---------|-------------|---------|------|
-| **X-NET1** | **ICMP** | Ping request/reply, unreachable reporting | ~200 | Ninguna |
-| **X-NET2** | **TCP stack** | Portar lwIP (o implementar minimal: 3-way handshake, send/recv, close) | ~1500 | X-NET1 |
-| **X-NET3** | **DNS resolver** | UDP query a 8.8.8.8, parse A records, cache | ~300 | X-NET2 |
-| **X-NET4** | **TLS 1.2/1.3** | Portar BearSSL (30-50KB, no malloc, ideal bare-metal) | ~500 glue | X-NET2 |
-| **X-NET5** | **HTTP client** | GET/POST sobre TLS, JSON parse mínimo, streaming response | ~600 | X-NET3, X-NET4 |
+| ID | Feature | Estado |
+|----|---------|--------|
+| **X-NET1** | ICMP (ping) | ✅ Done |
+| **X-NET2** | TCP stack (client-only) | ✅ Done |
+| **X-NET3** | DNS resolver | ✅ Done |
+| **X-NET4** | TLS 1.2 + crypto from scratch | ✅ Done |
+| **X-NET5** | HTTP client (GET/POST, chunked, streaming) | ✅ Done |
 
-**Hito**: `curl api.anthropic.com/v1/messages` funcional desde OsitoK
+**Hito** ✅: `curl api.anthropic.com/v1/messages` funcional desde OsitoK
 
-### Tier 5: Claude CLI Nativo (~2-3 semanas)
+### Tier 5: Claude CLI Nativo ✅
 
-| ID | Feature | Descripción | ~Líneas | Deps |
-|----|---------|-------------|---------|------|
-| **X-CL1** | **Claude API client (C)** | HTTP POST a /v1/messages, streaming SSE, tool_use parse | ~800 | X-NET5, X-OS3 |
-| **X-CL2** | **REPL interactivo** | Prompt → API → print response, historial, multi-turn | ~400 | X-CL1, X-OS7 |
-| **X-CL3** | **Tool: file read/write** | Claude puede leer/escribir archivos del FS | ~300 | X-CL2, X-OS10 |
-| **X-CL4** | **Tool: exec** | Claude puede compilar y ejecutar código | ~300 | X-CL3, X-OS11 |
-| **X-CL5** | **Tool: search** | Grep-like búsqueda en codebase (simple C, no ripgrep) | ~400 | X-CL3 |
+| ID | Feature | Estado |
+|----|---------|--------|
+| **X-CL1** | Claude API client (SSE streaming) | ✅ Done |
+| **X-CL2** | REPL multi-turn | ✅ Done |
+| **X-CL3** | Tool: file read/write/list | ✅ Done |
+| **X-CL4** | Tool: exec (compile + run) | ✅ Done |
+| **X-CL5** | Tool: search (grep) | ✅ Done |
 
-**Hito**: Claude CLI nativo en C que lee código, escribe archivos y ejecuta programas
+**Hito** ✅: Claude agent nativo que lee código, escribe archivos, compila y ejecuta
 
-### Tier 6: Avanzado (futuro)
+### Tier 6: Avanzado ✅
 
-| ID | Feature | Descripción |
-|----|---------|-------------|
-| **X-SMP** | Multi-core (AP startup, spinlocks) | Paralelizar inference y OS tasks |
-| **X-PIPE** | IPC pipes + señales POSIX | Comunicación entre procesos |
-| **X-DYN** | Dynamic linking (ld.so) | Shared libraries |
-| **X-JS** | Port QuickJS (~367KB) | JavaScript runtime para Claude Code real |
-| **X-GIT** | Port git (o mini-vcs) | Version control nativo |
+| ID | Feature | Estado |
+|----|---------|--------|
+| **X-SMP** | Multi-core AP startup (INIT-SIPI-SIPI) | ✅ Done |
+| **X-PIPE** | Pipes + dup2 + signals + shell redirection | ✅ Done |
+| **X-DYN** | Dynamic linking (ld.so) | ✅ Done |
+| **X-JS** | QuickJS ES2020+ JavaScript engine | ✅ Done |
+| **X-GIT** | Git nativo (SHA-1 + zlib, 8 commands) | ✅ Done |
 
----
+### Extras completados (fuera de roadmap original)
 
-## Cadena de Dependencias
-
-```
-Tier 0 (inmediato):
-  X-CPU2 (NVMe write) ──────────────────────────────────────────→ X-OS10
-  X-CPU3 (UDP prompt) ──────────────────────────────────────────→ (standalone)
-
-Tier 1 (OS fundaciones):
-  X-OS1 (IDT) → X-OS2 (Paging) → X-OS3 (Heap) ─┐
-                     │                             ├→ X-OS6 (Process) → Tier 2
-                     └→ X-OS4 (Syscall) → X-OS5 (ELF) ┘
-
-Tier 2 (shell):
-  X-OS7 (Terminal) ─┐
-  X-OS8 (Keyboard) ─┼→ X-OS9 (Shell) → Tier 3
-  X-OS6 (Process)  ─┘
-  X-CPU2 → X-OS10 (FS write) → Tier 3
-
-Tier 3 (compiler):
-  X-OS11 (TCC port) → X-OS13 (self-host) → X-OS14 (musl) → X-OS15 (chibicc)
-  X-OS12 (Newlib) ──→ X-OS13
-
-Tier 4 (network):
-  X-NET1 (ICMP) → X-NET2 (TCP) → X-NET3 (DNS) ─┐
-                                   X-NET4 (TLS) ─┼→ X-NET5 (HTTP)
-                                                  └→ Tier 5
-
-Tier 5 (Claude CLI):
-  X-NET5 + X-OS3 → X-CL1 (API) → X-CL2 (REPL) → X-CL3-5 (tools)
-```
+| ID | Feature | Estado |
+|----|---------|--------|
+| **X-TOK1** | BPE tokenizer (Llama 3, 128K vocab) | ✅ Done |
+| **X-INF1** | GPU inference dispatch (6/7 ops en GPU) | ✅ Done |
+| **X-INF2** | VRAM-resident activations | ✅ Done |
+| **X-INF3** | VRAM-resident weights (~664MB) | ✅ Done |
 
 ---
 
-## Opciones Tecnológicas Clave
+### Tier 7: Madurez del OS — Siguiente Fase
 
-### Compilador: TCC → chibicc
-- **TCC**: 15-20KB binario, self-hosting, single-pass. Ideal para bootstrap.
-- **chibicc**: C11 completo, multi-pass, compila Git/SQLite/libpng. Para producción.
-- **Ambos**: Cross-compilar desde Linux inicialmente, luego self-host en OsitoK.
+Transformar OsitoK de un OS cooperative ring-0 a un OS preemptivo con las
+abstracciones necesarias para correr software real sin modificar.
 
-### libc: Newlib stubs → musl
-- **Newlib**: Diseñada para bare-metal, solo necesita _read/_write/_sbrk stubs.
-- **musl**: POSIX-compliant, 500KB static core. Para apps reales.
-- **Path**: Newlib para bootstrap TCC, musl para chibicc y apps.
+| ID | Feature | Descripción | ~Líneas | Deps |
+|----|---------|-------------|---------|------|
+| **X-SCHED** | **Scheduler preemptivo** | Timer-based context switch entre procesos. APIC timer ya corre a 100Hz — agregar per-process kernel stack, save/restore de registros completo, round-robin queue. Prerequisito para threads y procesos reales. | ~800 | Ninguna |
+| **X-MMAP** | **mmap/munmap/mprotect** | Virtual memory real. MAP_ANONYMOUS (core), MAP_FIXED (ELF loader), MAP_PRIVATE (file-backed). Per-process VMA tracking. Bloqueante #1 para binarios Linux. | ~1200 | X-SCHED |
+| **X-VFS** | **VFS layer** | Abstracción sobre OsitoFS. Mount points, `/dev` (null, zero, urandom, console), `/proc` (self/maps, self/status). Abrir la puerta a múltiples filesystems. | ~800 | Ninguna |
+| **X-MUSL** | **Port musl libc** | Cross-compilar musl como libc estática para OsitoK. Syscall stubs, errno, TLS setup. Reemplaza CRT mínimo actual. Habilita portar apps POSIX reales. | ~500 glue | X-MMAP, X-VFS |
+| **X-THREAD** | **Threads (clone/futex)** | clone(CLONE_VM\|CLONE_THREAD), futex(WAIT/WAKE), set_tid_address, gettid. Per-thread stacks, TLS via arch_prctl ARCH_SET_FS. Usar SMP cores para threads reales. | ~1000 | X-SCHED, X-MMAP |
+| **X-EDIT** | **Port editor mínimo** | Portar un editor de texto (kilo ~1000LOC, o nano subset). Editar archivos desde OsitoK sin host. Necesita raw mode TTY + VT100 ANSI. | ~600 glue | X-MUSL |
+| **X-HTTPD** | **TCP server (listen/accept)** | Completar TCP stack: listen(), accept(), server sockets. Implementar HTTP server mínimo. Exponer servicios desde OsitoK a la red. | ~600 | Ninguna |
+| **X-SELF** | **Self-hosting completo** | Compilar el propio kernel x86 desde OsitoK. Requiere: TCC o GCC port, musl libc, gnu-efi headers, ld linker in-OS, make equivalent. Hito definitivo de un OS. | ~2000 | X-MUSL, X-EDIT |
 
-### TCP: lwIP (port) o custom minimal
-- **lwIP**: ~100KB, maduro, probado en embedded. Port = driver glue code.
-- **Custom**: Más control, menos código, pero muchos edge cases (RFC 793).
-- **Recomendación**: lwIP (confiable) o TCP mínimo si solo necesitamos HTTP client.
+**Hito**: `busybox sh` (musl-static, ~1MB) corre dentro de OsitoK. Editor funcional.
 
-### TLS: BearSSL
-- **BearSSL**: 30-50KB, no necesita malloc, diseñado para bare-metal.
-- **Alternativas**: wolfSSL (más features, más grande), mbedTLS (necesita malloc).
-- **BearSSL es ideal** para OsitoK por su diseño sin heap.
+### Tier 8: GPU + Inference Optimization
 
-### Claude CLI: C nativo (no Node.js)
-- Claude Code real es Node.js/TypeScript (~10.5MB bundle). **No viable** a corto plazo.
-- **Path real**: Cliente C que habla directo con la API REST de Claude.
-- **Largo plazo**: Port QuickJS (~367KB JS runtime) para JavaScript.
+Cerrar el gap entre "funciona" y "es rápido". Validar en hardware real.
+
+| ID | Feature | Descripción | ~Líneas | Deps |
+|----|---------|-------------|---------|------|
+| **X-GPU-OPT** | **Full VRAM pipeline** | Eliminar CPU fallback para attention loop. Compile SASS attention kernel (QKV + softmax + output en un dispatch). Meta: 0% CPU en forward pass (excepto logits argmax). | ~800 | Ninguna |
+| **X-SAMPLE** | **Sampling avanzado** | temperature, top-p, top-k, repetition penalty sobre logits. ~200 LOC, mejora dramática en calidad de generación. | ~200 | Ninguna |
+| **X-KQUANT** | **K-quant support** | Q4_K_M, Q6_K dequant para modelos modernos (Llama 3.1, Mistral, etc.). 256-value superblocks. | ~600 | Ninguna |
+| **X-HW** | **Hardware testing** | Validar GSP boot chain + GPU compute en RTX 2070+ real. Correr tests en hardware no-QEMU. El momento de la verdad para X16-X42. | ~200 test | Ninguna |
+| **X-STREAM** | **Layer streaming (NVMe)** | Cargar layers on-demand desde NVMe para modelos >RAM (8B, 70B). Double-buffer: layer N en GPU mientras layer N+1 lee de disco. | ~500 | X-GPU-OPT |
+
+**Hito**: >10 tok/s en RTX 2070+ con Llama 3.2 1B. Modelos 8B viables con streaming.
+
+### Tier 9: Linux Binary Compatibility (largo plazo)
+
+Correr binarios Linux estáticos sin modificar. Ver `docs/binary-compat-roadmap.md`.
+
+| ID | Feature | Descripción | ~Líneas | Deps |
+|----|---------|-------------|---------|------|
+| **X-SYSCALL40** | **40 syscalls POSIX** | Completar las ~27 syscalls faltantes para binarios musl-static (stat, getdents64, clock_gettime, nanosleep, signals, fork/execve/wait4, socket API). | ~2000 | X-MMAP, X-THREAD |
+| **X-BUSYBOX** | **Run busybox** | Test target: `busybox sh`, `busybox ls`, `busybox cat`. Primer binario Linux no-trivial sin modificar. | ~200 test | X-SYSCALL40, X-MUSL |
+| **X-SOCKET** | **Socket syscalls** | socket(AF_INET), connect, sendto, recvfrom, bind, listen, accept. Wrapper sobre TCP/UDP stack existente. Expone red via interfaz POSIX. | ~800 | X-HTTPD |
+| **X-SIGNAL** | **Señales completas** | rt_sigaction, rt_sigprocmask, rt_sigreturn, sigframe en user stack. Signal delivery en syscall return + timer tick. | ~1000 | X-SCHED |
+| **X-PE** | **Windows PE loader** | PE/COFF loader + NT syscall translation (Phase 3 del binary-compat-roadmap). Largo plazo. | ~5000+ | X-SYSCALL40 |
+
+**Hito**: `busybox sh` interactivo. Luego: static Go binaries, toybox.
 
 ---
 
-## Primer Paso: X-CPU2 + X-CPU3
+## Cadena de Dependencias (Tier 7+)
 
-### X-CPU2: NVMe Write (~400 líneas)
-**Archivos**: `arch/x86/drivers/nvme.c`, `arch/x86/fs/ositofs2.c`
-- Agregar NVMe IO write command (opcode 0x01, misma infraestructura que read)
-- `nvme_write(lba, count, buf)` — write blocks
-- `nvme_write_bytes(offset, buf, len)` — byte-level con chunking
-- OsitoFS v2: `osfs2_create(name, size)`, `osfs2_write(file, offset, buf, len)`
-- Actualizar file table + superblock en disco
-
-### X-CPU3: UDP Prompt Server (~200 líneas)
-**Archivos**: `arch/x86/kernel/net.c` (o nuevo `kernel/prompt_server.c`)
-- UDP listener en port 7777
-- Formato: raw text prompt → inference → raw text response
-- Loop: `net_poll() → parse prompt → inference_generate() → net_udp_send()`
-- Integrar con GPU dispatch table (usa GPU kernels si disponible)
-
-### Verificación
-```bash
-make -C arch/x86 clean && make -C arch/x86
-# QEMU: enviar prompt por UDP → recibir tokens
-echo "Hello" | nc -u localhost 7777
 ```
+Tier 7 (OS maturity):
+  X-SCHED (preemptive) ──→ X-MMAP (virtual memory) ──→ X-MUSL (musl libc) ──→ X-EDIT (editor)
+       │                        │                            │                       │
+       └──→ X-THREAD ──────────┘                            └──→ X-SELF (self-host) ┘
+                                                                      │
+  X-VFS (mount/dev/proc) ──→ X-MUSL                                  │
+  X-HTTPD (TCP server) ──→ (standalone)                               │
+                                                                      v
+                                                              Compilar kernel
+                                                              desde OsitoK
+
+Tier 8 (GPU optimization):
+  X-SAMPLE (sampling) ──→ (standalone)
+  X-KQUANT (K-quants) ──→ (standalone)
+  X-GPU-OPT (full VRAM) ──→ X-STREAM (layer streaming NVMe)
+  X-HW (hardware test) ──→ (standalone, critical validation)
+
+Tier 9 (Linux compat):
+  X-MMAP + X-THREAD ──→ X-SYSCALL40 ──→ X-BUSYBOX
+  X-HTTPD ──→ X-SOCKET (POSIX sockets)
+  X-SCHED ──→ X-SIGNAL (full signals)
+  (all above) ──→ X-PE (Windows PE, largo plazo)
+```
+
+### Camino crítico para `busybox sh`:
+
+```
+X-SCHED → X-MMAP → X-MUSL → X-SYSCALL40 → X-BUSYBOX
+                       ↑
+                    X-VFS
+```
+
+### Camino crítico para self-hosting:
+
+```
+X-SCHED → X-MMAP → X-MUSL → X-EDIT → X-SELF
+                       ↑
+                    X-VFS
+```
+
+### Paralelizable (sin deps):
+
+```
+X-HTTPD (TCP server)      — se puede hacer ya
+X-SAMPLE (sampling)       — se puede hacer ya
+X-KQUANT (K-quants)       — se puede hacer ya
+X-HW (hardware test)      — se puede hacer ya
+X-VFS (VFS layer)         — se puede hacer ya
+```
+
+---
+
+## Opciones Tecnológicas Clave (actualizado)
+
+### Scheduler: APIC timer-driven preemption
+- APIC timer ya corre a 100Hz. Solo falta: save registers → pick next → restore → IRET.
+- Per-process kernel stack + TSS update (RSP0 para ring 3→0 transitions).
+- Referencia: xv6's `swtch()` — 20 líneas de asm, el scheduler más simple que funciona.
+
+### Virtual Memory: mmap con VMA tracking
+- Per-process VMA list (start, end, flags, file). mmap = alloc pages + map PTEs + record VMA.
+- Demand paging opcional (page fault → alloc on access). Simplificar: pre-alloc all pages.
+- mprotect = update PTE bits + INVLPG.
+
+### libc: musl (cross-compiled)
+- Cross-compilar musl desde Linux host como libc.a estática para OsitoK target.
+- Syscall stubs: musl usa `__syscall` inline asm → nuestro SYSCALL entry.
+- Path: `x86_64-ositok-musl-gcc` cross-compiler o parche mínimo sobre musl configure.
+
+### VFS: minimal, OsitoFS como root
+- Superblock table con mount points. OsitoFS monta como `/`.
+- `/dev` in-memory: null, zero, urandom (RDRAND), console (tty), fd/N.
+- `/proc` in-memory: self/maps (VMA dump), self/status (PID/name).
+- No es necesario un VFS completo — solo lo suficiente para que musl funcione.
+
+### Editor: kilo (antirez)
+- ~1000 LOC de C, un solo archivo, sin deps. MIT license.
+- Necesita: raw mode TTY (tcgetattr/tcsetattr → ioctl stubs), ANSI escape sequences.
+- Alternativa: escribir uno propio (~500 LOC si es solo ed-style line editor).
+
+### TCP server: extensión de net.c
+- TCP stack existente es client-only. Agregar: listen state, SYN backlog, accept().
+- Reusa 90% del código TCP existente (handshake, state machine, checksums).
+- HTTP server mínimo: serve static files + API endpoints.
+
+### Self-hosting: path a compilar el kernel
+- **Opción A**: Port GCC cross-compiler a OsitoK (pesado pero completo)
+- **Opción B**: Usar TCC in-OS + linker script + gnu-efi headers (más viable)
+- **Opción C**: Port chibicc (C11 completo, ~10K LOC, más simple que GCC)
+- **Bloqueantes**: EFI binary format (shared object with objcopy), gnu-efi headers,
+  linker script support. TCC puede no manejar todo el Makefile.
 
 ---
 
@@ -214,3 +290,22 @@ echo "Hello" | nc -u localhost 7777
 
 **Lección clave**: Todos portaron GCC/TCC en vez de escribir compilador propio.
 Cross-compilar primero, luego self-host. TCC es el path más rápido al bootstrap.
+
+---
+
+## Resumen: Feature Count por Tier
+
+| Tier | Features | Estado |
+|------|----------|--------|
+| Tier 0 | 2 | ✅ Completo |
+| Tier 1 | 6 | ✅ Completo |
+| Tier 2 | 4 | ✅ Completo |
+| Tier 3 | 3/5 | ✅ Parcial (musl/chibicc pendientes) |
+| Tier 4 | 5 | ✅ Completo |
+| Tier 5 | 5 | ✅ Completo |
+| Tier 6 | 5 | ✅ Completo |
+| Extras | 4 | ✅ Completo |
+| **Tier 7** | **8** | **← Siguiente** |
+| **Tier 8** | **5** | Paralelizable |
+| **Tier 9** | **5** | Largo plazo |
+| **Total** | **52** | 34 done, 18 pendientes |

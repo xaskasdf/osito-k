@@ -202,79 +202,103 @@ Path B4: C nativo     2-3 sem   Claude agent con tools               SI (ya empe
 
 ## Recomendacion: Roadmap Combinado
 
-### Fase 1: Inference Interactiva (2-3 semanas)
-- Tokenizer BPE para Llama 3
-- Sampling (temperature, top-p)
-- Compilar SASS kernels desde PTX existente
-- Resultado: `osito> llama "Explain quicksort"` a >1 tok/s
+### Fase 1: Inference Interactiva ✅
+- ~~Tokenizer BPE para Llama 3~~ ✅ X-TOK1
+- ~~Compilar SASS kernels desde PTX existente~~ ✅ X41-X42
+- ~~GPU inference dispatch con VRAM-resident weights~~ ✅ X-INF1/2/3
+- Sampling (temperature, top-p) — pendiente (X-SAMPLE)
+- Resultado: Llama 3.2 1B funciona con BPE tokenizer + GPU dispatch
 
-### Fase 2: Claude Agent Nativo (2-3 semanas)
-- X-CL2: REPL multi-turn con historial
-- X-CL3: Tool use — file read/write
-- X-CL4: Tool use — exec (compilar y ejecutar C)
-- X-CL5: Tool use — search (grep en codebase)
-- Resultado: Claude agent funcional que modifica codigo en OsitoK
+### Fase 2: Claude Agent Nativo ✅
+- ~~X-CL2: REPL multi-turn con historial~~ ✅
+- ~~X-CL3: Tool use — file read/write~~ ✅
+- ~~X-CL4: Tool use — exec (compilar y ejecutar C)~~ ✅
+- ~~X-CL5: Tool use — search (grep en codebase)~~ ✅
+- Resultado: Claude agent funcional que lee, escribe, compila y ejecuta desde OsitoK
 
-### Fase 3: JavaScript Runtime (3-4 semanas)
-- Port de QuickJS a OsitoK (compilar como app ELF)
-- Bindings a syscalls (fs, net, console)
-- Correr scripts JS que hablen con la API de Claude
-- Resultado: Primera app JS en OsitoK
+### Fase 3: JavaScript + Git ✅
+- ~~QuickJS ES2020+ engine en bare-metal~~ ✅ X-JS
+- ~~Git nativo con SHA-1 + zlib~~ ✅ X-GIT
+- QuickJS bindings a fs/net — pendiente
+- Resultado: JavaScript runtime + version control nativos
 
-### Fase 4: OS Maturity (3-6 meses, paralelo)
-- mmap/mprotect (virtual memory real)
-- clone/threads (al menos cooperativos)
-- Directorios en filesystem
-- Mas syscalls POSIX
-- Cada feature acerca a poder correr binarios Linux reales
+### Fase 4: OS Maturity — SIGUIENTE
+Madurar el kernel para soportar software real. Ver `docs/os-selfhost-roadmap.md` Tier 7.
+- **Scheduler preemptivo** (X-SCHED) — timer-based context switch, prerequisito para todo
+- **mmap/munmap/mprotect** (X-MMAP) — virtual memory real, bloqueante #1 para Linux compat
+- **VFS layer** (X-VFS) — mount points, /dev, /proc
+- **Port musl libc** (X-MUSL) — libc POSIX para portar apps reales
+- **Threads** (X-THREAD) — clone/futex, usar SMP cores
+- **Port editor** (X-EDIT) — editar archivos desde OsitoK (kilo ~1000LOC)
+- **TCP server** (X-HTTPD) — listen/accept, servir HTTP
+- **Self-hosting** (X-SELF) — compilar el propio kernel desde OsitoK
+- Resultado: busybox sh funcional, editor, TCP server, self-compile
 
-### Fase 5: Linux Binary Compatibility (6-12 meses, largo plazo)
-- Dynamic linker
-- musl libc port completo
-- epoll, futex, signals
-- Objetivo: correr binarios Linux estaticos sin modificar
-- Eventualmente: correr el binario de Claude Code
+### Fase 5: GPU Optimization (paralela)
+Ver `docs/os-selfhost-roadmap.md` Tier 8.
+- **Full VRAM pipeline** (X-GPU-OPT) — eliminar CPU fallback en forward pass
+- **Sampling** (X-SAMPLE) — temperature, top-p, top-k
+- **K-quant support** (X-KQUANT) — Q4_K_M, Q6_K para modelos modernos
+- **Hardware testing** (X-HW) — validar GPU pipeline en RTX 2070+ real
+- **Layer streaming** (X-STREAM) — modelos >RAM desde NVMe
+- Resultado: >10 tok/s en GPU real, modelos 8B viables
+
+### Fase 6: Linux Binary Compatibility (largo plazo)
+Ver `docs/binary-compat-roadmap.md`.
+- 40+ syscalls POSIX (X-SYSCALL40)
+- Socket syscalls (X-SOCKET)
+- Señales completas (X-SIGNAL)
+- Objetivo: correr binarios Linux estáticos sin modificar
+- Eventualmente: dynamic linker → Bun → Claude Code binario
 
 ---
 
-## Dependencias entre Paths
+## Dependencias entre Paths (actualizado marzo 2026)
 
 ```
-Path A (Inference)     Path B (Claude Binary)
-    |                      |
-    v                      v
-Tokenizer ---------> Usable por ambos paths
-    |                      |
-    v                      v
-SASS Kernels          QuickJS Port (B3)
-    |                  /          \
-    v                 v            v
->1 tok/s          JS scripts    C Agent (B4)
-                      |            |
-                      v            v
-                  JS + API     Tool Use Protocol
-                      |            |
-                      +-----+------+
-                            |
-                            v
-                     mmap + threads (Fase 4)
-                            |
-                            v
-                     Dynamic Linker (Fase 5)
-                            |
-                            v
-                     Claude Code Binary (B1)
+COMPLETADO                           SIGUIENTE
+──────────                           ─────────
+Path A: Inference ✅                 Fase 5: GPU Optimization
+  Tokenizer ✅                         X-SAMPLE (sampling)
+  SASS Kernels ✅                      X-KQUANT (K-quants)
+  VRAM weights ✅                      X-GPU-OPT (full VRAM pipeline)
+  GPU dispatch ✅                      X-HW (hardware test!)
+                                       X-STREAM (layer streaming)
+Path B4: C Agent ✅
+  Claude API ✅                      Fase 4: OS Maturity
+  Tool Use ✅                          X-SCHED (preemptive scheduler)
+  REPL multi-turn ✅                       ↓
+                                       X-MMAP (virtual memory)
+Path B3: QuickJS ✅                        ↓        ↓
+  JS engine ✅                         X-VFS ──→ X-MUSL (musl libc)
+  Git nativo ✅                                      ↓
+                                       X-THREAD     X-EDIT (editor)
+                                           ↓             ↓
+                                       X-HTTPD      X-SELF (self-host kernel)
+
+                                     Fase 6: Linux Compat
+                                       X-SYSCALL40 (40 syscalls)
+                                       X-SOCKET (POSIX sockets)
+                                       X-SIGNAL (full signals)
+                                           ↓
+                                       X-BUSYBOX (busybox sh)
+                                           ↓
+                                       Dynamic Linker
+                                           ↓
+                                       Claude Code Binary (B1)
 ```
 
 ---
 
 ## Appendix: Syscall Gap (OsitoK vs Linux)
 
-### Implementados (13)
+### Implementados (15+)
 ```
 read(0)  write(1)  open(2)  close(3)  fstat(5)  lseek(8)
-brk(12)  ioctl(16)  access(21)  writev(20)  exit(60)
-arch_prctl(158)  unlink(87)
+brk(12)  ioctl(16)  writev(20)  access(21)  unlink(87)
+exit(60)  arch_prctl(158)
++ pipe/dup2/kill via X-PIPE subsystem (kernel-level, no via SYSCALL nr yet)
++ signal handlers (SIGINT/SIGTERM/SIGKILL/SIGPIPE) via X-PIPE
 ```
 
 ### Criticos para binarios Linux (faltan ~25)

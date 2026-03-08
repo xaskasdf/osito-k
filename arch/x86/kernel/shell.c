@@ -49,6 +49,12 @@ extern int  osfs2_read(void *file, uint64_t offset, void *buf, uint64_t len);
 extern void *kmalloc(uint64_t size);
 extern void  kfree(void *ptr);
 
+/* Scheduler (X-SCHED) */
+extern int  sched_spawn(const char *name, void (*entry)(void));
+extern void sched_yield(void);
+extern uint64_t sched_get_switches(void);
+extern bool sched_is_enabled(void);
+
 /* Git */
 extern int git_init(void);
 extern int git_add(const char *filename);
@@ -226,6 +232,7 @@ static void cmd_help(void)
     sh_puts("  js        QuickJS REPL (js [script.js])\n");
     sh_puts("  dl        Dynamic linker (dl load/sym/call/close/list)\n");
     sh_puts("  git       Version control (init/add/commit/log/status/diff/branch/checkout)\n");
+    sh_puts("  sched     Scheduler test (sched [stats])\n");
     sh_puts("  clear     Clear screen\n");
     sh_puts("  reboot    Reboot system\n");
     sh_puts("  halt      Halt CPU\n");
@@ -1391,6 +1398,23 @@ static void shell_exec(char *line)
             sh_puts("Unknown git command: ");
             sh_puts(argv[1]);
             sh_puts("\n");
+        }
+    } else if (strcmp(cmd, "sched") == 0) {
+        /* X-SCHED: scheduler test and stats */
+        if (argc >= 2 && strcmp(argv[1], "stats") == 0) {
+            sh_puts("Scheduler: ");
+            sh_puts(sched_is_enabled() ? "active" : "inactive");
+            sh_puts("\nContext switches: ");
+            sh_putdec(sched_get_switches());
+            sh_puts("\n");
+        } else {
+            /* Spawn two test threads that print alternating characters */
+            extern void sched_test_a(void);
+            extern void sched_test_b(void);
+            sched_spawn("thread_a", sched_test_a);
+            sched_spawn("thread_b", sched_test_b);
+            sh_puts("Spawned 2 test threads (printing A and B).\n");
+            sh_puts("Use 'ps' to see processes, 'sched stats' for switch count.\n");
         }
     } else if (strcmp(cmd, "clear") == 0) {
         cmd_clear();

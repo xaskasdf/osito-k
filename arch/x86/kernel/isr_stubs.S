@@ -46,8 +46,19 @@ isr_common:
     /* Call C handler */
     call isr_handler
 
-    /* Restore stack */
+    /* Restore stack (undo 16-byte alignment) */
     mov %rbp, %rsp
+
+    /* ── Scheduler: check for context switch (X-SCHED) ────────── */
+    /* If sched_tick() set sched_switch_rsp, switch to new stack   */
+    /* before popping GPRs — the new stack has the next process's  */
+    /* saved interrupt frame, so pops + iretq resume that process. */
+    mov sched_switch_rsp(%rip), %rax
+    test %rax, %rax
+    jz .Lno_switch
+    mov %rax, %rsp
+    movq $0, sched_switch_rsp(%rip)
+.Lno_switch:
 
     /* Restore all GPRs */
     pop %r15
@@ -141,3 +152,13 @@ isr_stub_default:
     push $0              /* dummy error code */
     push $255            /* generic vector */
     jmp isr_common
+
+/* ── Scheduler RSP switch variable (X-SCHED) ──────────────── */
+/* When non-zero, ISR stub loads this as RSP before popping    */
+/* GPRs, effectively switching to another process's context.   */
+
+.section .bss
+.align 8
+.globl sched_switch_rsp
+sched_switch_rsp:
+    .quad 0

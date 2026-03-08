@@ -378,9 +378,17 @@ Tasks:   idle, input, shell (3 of 8 slots used)
 | **X-DYN** | **Dynamic linking** (dl_open/dl_sym/dl_close, ET_DYN ELF loading, PT_DYNAMIC parse, R_X86_64_RELATIVE/GLOB_DAT/JUMP_SLOT relocations, kernel symbol export, `dl` shell command) | Done |
 | **X-JS** | **QuickJS JavaScript engine** (QuickJS 2024-01-13 bare-metal port, x87 FPU math library, freestanding shim headers, `js` shell command, 1002KB ELF) | Done |
 | **X-GIT** | **Git version control** (SHA-1 + zlib DEFLATE, standard git objects, init/add/commit/log/status/diff/branch/checkout, `git` shell command) | Done |
+| **X-SCHED** | **Preemptive scheduler** (APIC timer round-robin, fake interrupt frame spawn, RSP-swap context switch in ISR stub, BSP-only guard for SMP safety, `sched` shell command) | Done |
 
 > Full GPU roadmap (X27-X40 + contingency): see [docs/x86-gpu-roadmap.md](docs/x86-gpu-roadmap.md)
-> Full OS roadmap (Tier 0-5): see [docs/os-selfhost-roadmap.md](docs/os-selfhost-roadmap.md)
+> Full OS roadmap (Tiers 0-9): see [docs/os-selfhost-roadmap.md](docs/os-selfhost-roadmap.md)
+> Binary compatibility roadmap: see [docs/binary-compat-roadmap.md](docs/binary-compat-roadmap.md)
+> Paths to Claude analysis: see [docs/paths-to-claude-on-ositok.md](docs/paths-to-claude-on-ositok.md)
+
+**Tier 7+ (next)**: X-MMAP (mmap/munmap/mprotect),
+X-VFS (mount points, /dev, /proc), X-MUSL (musl libc port), X-THREAD (clone/futex),
+X-EDIT (port kilo editor), X-HTTPD (TCP server), X-SELF (self-hosting kernel compile).
+See `docs/os-selfhost-roadmap.md` for full details and dependency chains.
 
 ### F12: DOOM Wireframe 2.5D
 Procedural level generator (4x4 grid, snake path connectivity) + wall-segment projection renderer.
@@ -1088,6 +1096,18 @@ Standard git object model running on OsitoK bare-metal. SHA-1 addressing, zlib c
 - **Commands**: `git init` (create .git/HEAD), `git add <file>` (blob + index update), `git commit <msg>` (tree + commit + ref update), `git log` (walk parent chain, 50 max), `git status` (branch, staged, untracked), `git diff` (line-by-line old vs new), `git branch [name]` (list/create), `git checkout <branch>` (update HEAD + rebuild index).
 - **Storage**: Each git object uses 1 OsitoFS file (1MB block minimum). Practical for repos with <100 objects (~100MB). 64-byte filename limit accommodates `.git/objects/XX/38-char-hash` (54 chars).
 - **Files**: `arch/x86/kernel/crypto.c` (SHA-1), `arch/x86/kernel/zlib.h/c` (DEFLATE), `arch/x86/kernel/git.h/c` (git core), `arch/x86/kernel/shell.c` (git command)
+
+### X-SCHED: Preemptive Scheduler
+Timer-based round-robin context switching via APIC timer (100Hz). First preemptive multitasking in OsitoK.
+- **Context switch mechanism**: ISR stub in `isr_stubs.S` checks `sched_switch_rsp` (BSS variable) after every timer tick. If non-zero, replaces RSP with the new value before popping GPRs + IRETQ — this switches to the next process's saved interrupt frame without a dedicated context_switch function.
+- **Fake interrupt frame**: `sched_spawn()` allocates 16KB kernel stack, builds a 176-byte fake interrupt frame at the top (22 × uint64_t: 15 zeroed GPRs + vector/error + RIP/CS/RFLAGS/RSP/SS). CS=0x38, SS=0x30, RFLAGS=0x202 (IF=1). Return address (`sched_thread_exit`) placed below frame.
+- **Round-robin scheduling**: `sched_tick()` called from ISR on APIC timer vector 32. Decrements quantum (5 ticks = 50ms). On expiry, scans process table for next READY process, saves current RSP, loads next's RSP into `sched_switch_rsp`.
+- **SMP safety**: `sched_get_lapic_id()` check at top of `sched_tick()` — only BSP (LAPIC ID 0) runs the scheduler. APs receive timer interrupts but skip scheduling. Without this, multiple CPUs corrupt shared scheduler state (caused #GP on first implementation).
+- **Auto-activation**: Scheduler stays dormant until first `sched_spawn()` call. Backwards-compatible with existing single-process ELF exec.
+- **Thread lifecycle**: `sched_thread_exit()` trampoline marks process ZOMBIE when entry function returns. `sched_yield()` sets quantum=0 + HLT for voluntary preemption.
+- **Shell command**: `sched` spawns 2 test threads printing interleaved A/B chars. `sched stats` shows switch count and active status.
+- **Verified**: QEMU `-smp 4` — threads produce ABABAB... pattern (20 each), both terminate cleanly. No #GP or crashes.
+- **Files**: `arch/x86/kernel/process.c` (sched_tick, sched_spawn, sched_yield, test threads), `arch/x86/kernel/isr_stubs.S` (RSP swap + sched_switch_rsp BSS), `arch/x86/kernel/idt.c` (timer→sched_tick call), `arch/x86/kernel/shell.c` (sched command)
 
 ### AArch64/SM8350 Port (arch/arm/)
 Reference bare-metal code for ASUS ROG Phone 5 (Snapdragon 888).

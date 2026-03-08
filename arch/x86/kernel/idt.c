@@ -21,6 +21,9 @@ extern void fb_puts_color(const char *s, uint32_t color);
 extern void fb_putdec(uint64_t val);
 extern void fb_puthex(uint64_t val, int digits);
 
+/* X-SCHED: scheduler tick (process.c) */
+extern void sched_tick(void *frame);
+
 /* ── IDT structures (x86-64 long mode) ──────────────────────── */
 
 typedef struct __attribute__((packed)) {
@@ -287,6 +290,9 @@ void isr_handler(interrupt_frame_t *frame)
     /* APIC timer tick */
     if (vec == 32) {
         tick_count++;
+        /* X-SCHED: preemptive scheduler — check quantum, switch if expired.
+         * frame points to saved GPRs on the current process's stack. */
+        sched_tick(frame);
         if (apic_enabled)
             apic_write(APIC_EOI, 0);
         return;
