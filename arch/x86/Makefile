@@ -58,7 +58,8 @@ KERN_SRC = kernel/main.c kernel/serial.c kernel/framebuffer.c \
            kernel/elf.c kernel/process.c \
            kernel/keyboard.c kernel/terminal.c kernel/shell.c \
            kernel/crypto.c kernel/tls.c kernel/http.c kernel/claude.c \
-           kernel/tokenizer.c kernel/smp.c kernel/dynlink.c
+           kernel/tokenizer.c kernel/smp.c kernel/dynlink.c \
+           kernel/zlib.c kernel/git.c
 ASM_SRC  = kernel/isr_stubs.S kernel/syscall_entry.S kernel/setjmp.S
 DRV_SRC  = drivers/nvme.c drivers/i211.c drivers/gpu.c drivers/gsp.c drivers/sass.c drivers/gmmu.c drivers/gpu_tensor.c drivers/gpu_inference.c
 FS_SRC   = fs/ositofs2.c fs/gpt.c fs/gguf.c

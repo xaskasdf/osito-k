@@ -160,6 +160,95 @@ void sha256(const void *data, uint32_t len, uint8_t digest[32])
 }
 
 /* ══════════════════════════════════════════════════════════════
+ *  SHA-1 (FIPS 180-1) — for git object hashing
+ * ══════════════════════════════════════════════════════════════ */
+
+static inline uint32_t rotl32(uint32_t x, int n) { return (x << n) | (x >> (32 - n)); }
+
+static void sha1_transform(sha1_ctx *ctx, const uint8_t block[64])
+{
+    uint32_t W[80], a, b, c, d, e;
+
+    for (int i = 0; i < 16; i++)
+        W[i] = be32(block + i * 4);
+    for (int i = 16; i < 80; i++)
+        W[i] = rotl32(W[i-3] ^ W[i-8] ^ W[i-14] ^ W[i-16], 1);
+
+    a = ctx->state[0]; b = ctx->state[1]; c = ctx->state[2];
+    d = ctx->state[3]; e = ctx->state[4];
+
+    for (int i = 0; i < 80; i++) {
+        uint32_t f, k;
+        if (i < 20) {
+            f = (b & c) | ((~b) & d);  k = 0x5A827999;
+        } else if (i < 40) {
+            f = b ^ c ^ d;              k = 0x6ED9EBA1;
+        } else if (i < 60) {
+            f = (b & c) | (b & d) | (c & d); k = 0x8F1BBCDC;
+        } else {
+            f = b ^ c ^ d;              k = 0xCA62C1D6;
+        }
+        uint32_t temp = rotl32(a, 5) + f + e + k + W[i];
+        e = d; d = c; c = rotl32(b, 30); b = a; a = temp;
+    }
+
+    ctx->state[0] += a; ctx->state[1] += b; ctx->state[2] += c;
+    ctx->state[3] += d; ctx->state[4] += e;
+}
+
+void sha1_init(sha1_ctx *ctx)
+{
+    ctx->state[0] = 0x67452301; ctx->state[1] = 0xEFCDAB89;
+    ctx->state[2] = 0x98BADCFE; ctx->state[3] = 0x10325476;
+    ctx->state[4] = 0xC3D2E1F0;
+    ctx->count = 0;
+    ctx->buf_len = 0;
+}
+
+void sha1_update(sha1_ctx *ctx, const void *data, uint32_t len)
+{
+    const uint8_t *p = (const uint8_t *)data;
+    while (len > 0) {
+        uint32_t space = 64 - ctx->buf_len;
+        uint32_t take = len < space ? len : space;
+        cmemcpy(ctx->buf + ctx->buf_len, p, take);
+        ctx->buf_len += take;
+        p += take;
+        len -= take;
+        if (ctx->buf_len == 64) {
+            sha1_transform(ctx, ctx->buf);
+            ctx->count += 64;
+            ctx->buf_len = 0;
+        }
+    }
+}
+
+void sha1_final(sha1_ctx *ctx, uint8_t digest[20])
+{
+    uint64_t total_bits = (ctx->count + ctx->buf_len) * 8;
+    ctx->buf[ctx->buf_len++] = 0x80;
+    if (ctx->buf_len > 56) {
+        cmemset(ctx->buf + ctx->buf_len, 0, 64 - ctx->buf_len);
+        sha1_transform(ctx, ctx->buf);
+        ctx->buf_len = 0;
+    }
+    cmemset(ctx->buf + ctx->buf_len, 0, 56 - ctx->buf_len);
+    put_be64(ctx->buf + 56, total_bits);
+    sha1_transform(ctx, ctx->buf);
+
+    for (int i = 0; i < 5; i++)
+        put_be32(digest + i * 4, ctx->state[i]);
+}
+
+void sha1(const void *data, uint32_t len, uint8_t digest[20])
+{
+    sha1_ctx ctx;
+    sha1_init(&ctx);
+    sha1_update(&ctx, data, len);
+    sha1_final(&ctx, digest);
+}
+
+/* ══════════════════════════════════════════════════════════════
  *  HMAC-SHA-256 (RFC 2104)
  * ══════════════════════════════════════════════════════════════ */
 

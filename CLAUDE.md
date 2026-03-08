@@ -162,8 +162,12 @@ arch/x86/kernel/keyboard.c          PS/2 keyboard (scancode set 1, IRQ 1, ring b
 arch/x86/kernel/terminal.c          Line editor (readline, backspace, history, Ctrl shortcuts)
 arch/x86/kernel/net.c               Network stack (ARP, IPv4, UDP, ICMP, TCP client, DNS resolver)
 arch/x86/kernel/net.h               Network types + API (eth/arp/ip/udp/tcp structs)
-arch/x86/kernel/crypto.h            Crypto primitives API (SHA-256, HMAC, AES-128-GCM, X25519)
+arch/x86/kernel/crypto.h            Crypto primitives API (SHA-1, SHA-256, HMAC, AES-128-GCM, X25519)
 arch/x86/kernel/crypto.c            Crypto implementation (all from scratch, no external libs)
+arch/x86/kernel/zlib.h              zlib API (inflate/deflate for git objects)
+arch/x86/kernel/zlib.c              DEFLATE inflate + deflate with LZ77 hash chain
+arch/x86/kernel/git.h               Git VCS types + API (init/add/commit/log/status/diff/branch/checkout)
+arch/x86/kernel/git.c               Git-compatible VCS (SHA-1 objects, zlib compression, OsitoFS storage)
 arch/x86/kernel/tls.h               TLS 1.2 client types + API (tls_conn_t, connect/send/recv/close)
 arch/x86/kernel/tls.c               TLS 1.2 client (ECDHE-RSA-AES128-GCM-SHA256, no cert verify)
 arch/x86/kernel/http.h              HTTP client API (http_session_t, open/request/read_body/close)
@@ -176,14 +180,18 @@ arch/x86/kernel/smp.h               SMP types (cpu_info_t, spinlock_t) + API
 arch/x86/kernel/smp.c               Multi-core startup (MADT parse, trampoline, INIT-SIPI-SIPI)
 arch/x86/kernel/ap_trampoline.S     AP trampoline source (16→32→64 mode transition)
 arch/x86/kernel/dynlink.c            Dynamic linker (dl_open/dl_sym/dl_close, ELF relocation, kernel symbol export)
-arch/x86/kernel/shell.c             Interactive shell (17 builtins, argv parser, ELF exec)
+arch/x86/kernel/shell.c             Interactive shell (18 builtins, argv parser, ELF exec)
 arch/x86/include/types.h            Freestanding types + MMIO + port I/O
 arch/x86/libc/crt.c                 Minimal CRT (_start, printf, malloc, POSIX I/O wrappers)
 arch/x86/libc/syscall.S             Raw SYSCALL instruction wrappers (__syscall1-4)
 arch/x86/libc/Makefile              Build CRT + tcclib + link userspace ELFs
-arch/x86/libc/tcclib.c              Extended libc for TCC (FILE*, fprintf, strtol, qsort, setjmp stubs)
+arch/x86/libc/tcclib.c              Extended libc for TCC/QuickJS (FILE*, fprintf, strtol, qsort, __udivti3, fesetround)
+arch/x86/libc/math.c               Freestanding x87 FPU math library (35+ functions: sin/cos/exp/log/pow/sqrt/etc)
+arch/x86/libc/qjs_main.c           QuickJS REPL wrapper (JS_NewRuntime2 custom allocator, console.log, file eval)
+arch/x86/libc/qjs_headers/          Freestanding shim headers (stdlib/stdio/math/string/etc for QuickJS)
 arch/x86/test/tiny.c                Minimal test C program for TCC compilation test
 arch/x86/test/testmod.c              Test dynamic module (mod_hello, mod_add, mod_factorial, mod_square)
+arch/x86/test/qjs.elf              QuickJS interpreter binary (1002KB, static ET_EXEC)
 
 # OsitoFS v2 Host Tools (tools/ositofs/)
 include/common/ositofs2_format.h     On-disk format (shared header)
@@ -368,6 +376,8 @@ Tasks:   idle, input, shell (3 of 8 slots used)
 | **X-SMP** | **Multi-core AP startup** (ACPI MADT parse, INIT-SIPI-SIPI, 16→32→64 trampoline, AP LAPIC init, `cpus` shell command) | Done |
 | **X-PIPE** | **Pipes, dup2, signals, shell redirection** (pipe() circular buffer, dup2(), kill(), sigaction(), shell `>` / `>>` operators) | Done |
 | **X-DYN** | **Dynamic linking** (dl_open/dl_sym/dl_close, ET_DYN ELF loading, PT_DYNAMIC parse, R_X86_64_RELATIVE/GLOB_DAT/JUMP_SLOT relocations, kernel symbol export, `dl` shell command) | Done |
+| **X-JS** | **QuickJS JavaScript engine** (QuickJS 2024-01-13 bare-metal port, x87 FPU math library, freestanding shim headers, `js` shell command, 1002KB ELF) | Done |
+| **X-GIT** | **Git version control** (SHA-1 + zlib DEFLATE, standard git objects, init/add/commit/log/status/diff/branch/checkout, `git` shell command) | Done |
 
 > Full GPU roadmap (X27-X40 + contingency): see [docs/x86-gpu-roadmap.md](docs/x86-gpu-roadmap.md)
 > Full OS roadmap (Tier 0-5): see [docs/os-selfhost-roadmap.md](docs/os-selfhost-roadmap.md)
@@ -1052,6 +1062,32 @@ Runtime loading of ET_DYN ELF shared objects. Provides dlopen/dlsym/dlclose API 
 - **Shell command**: `dl load <file.so>`, `dl sym <file.so> <name>`, `dl call <file.so> <name>` (call void fn), `dl close <file.so>`, `dl list` (show modules + exported symbols).
 - **Test module**: `arch/x86/test/testmod.c` — exports mod_add, mod_hello, mod_factorial, mod_square. References kernel serial_puts/fb_puts/fb_puts_color. Build: `gcc -shared -fPIC -nostdlib -Wl,--hash-style=sysv -o testmod.so testmod.c`.
 - **Files**: `arch/x86/kernel/dynlink.c` (dynamic linker), `arch/x86/test/testmod.c` (test module), `arch/x86/kernel/shell.c` (dl command), `arch/x86/kernel/main.c` (dl_init call)
+
+### X-JS: QuickJS JavaScript Engine
+QuickJS 2024-01-13 (Bellard) ported to OsitoK bare-metal. Full ES2020+ with BigInt/BigFloat/BigDecimal.
+- **Source files**: quickjs.c (55K lines), libbf.c (bignum), cutils.c (buffers), libregexp.c (regex), libunicode.c (Unicode). Compiled with `-DEMSCRIPTEN` (disables atomics) and `-DCONFIG_BIGNUM`.
+- **Shim headers** (`libc/qjs_headers/`): 18 freestanding headers providing stdlib.h, stdio.h, math.h, string.h, etc. Map to functions in crt.c + tcclib.c + math.c. No system libc dependency.
+- **x87 FPU math library** (`libc/math.c`, ~440 lines): 35+ math.h functions using x87 hardware transcendentals (fsin, fcos, fpatan, fyl2x, f2xm1, fscale). IEEE 754 classification (isnan, isfinite, isinf, signbit). Rounding (floor/ceil/trunc/round via FPU control word). Float/long double wrappers via inline casts.
+- **libc extensions** (`tcclib.c`): Added abort(), fesetround/fegetround (x87 FPU control word), localtime_r/gmtime_r/mktime/strftime/clock stubs, malloc_usable_size (returns 0), strtoimax/strtoumax, __udivti3/__udivmodti4 (128-bit integer division for BigInt), improved snprintf %e/%f/%g (scientific notation, sign flags, precision).
+- **REPL wrapper** (`libc/qjs_main.c`): JS_NewRuntime2 with custom malloc/free/realloc allocator (8MB limit, 256KB stack). JS_NewContextRaw with all intrinsics (BaseObjects, Date, Eval, RegExp, JSON, Proxy, MapSet, TypedArrays, Promise, BigInt, BigFloat, BigDecimal). Global `console.log` and `print`. File evaluation mode (`js script.js`) and interactive REPL with `.exit` command.
+- **Binary size**: 1002 KB (923 KB .text, 25 KB .data). Static ET_EXEC at 0x401000.
+- **Shell command**: `js` (REPL) or `js script.js` (execute file from OsitoFS).
+- **Verified features**: Arithmetic, Math (sqrt, sin, PI), strings (toUpperCase), JSON, arrow functions, RegExp, BigInt, closures, recursive functions.
+- **Build**: `make -C arch/x86/libc qjs.elf QJS_SRC=/tmp/quickjs-2024-01-13`
+- **Files**: `arch/x86/libc/math.c`, `arch/x86/libc/qjs_main.c`, `arch/x86/libc/qjs_headers/` (18 shim headers), `arch/x86/libc/tcclib.c` (extended), `arch/x86/libc/Makefile` (qjs.elf target), `arch/x86/kernel/shell.c` (js command)
+
+### X-GIT: Git-Compatible Version Control
+Standard git object model running on OsitoK bare-metal. SHA-1 addressing, zlib compression, byte-compatible with standard git.
+- **SHA-1 hashing** (`crypto.c`): FIPS 180-1 implementation added alongside existing SHA-256. init/update/final API, one-shot wrapper. Used for all git object addressing.
+- **zlib DEFLATE** (`zlib.c`, ~500 lines): Full inflate (stored, fixed, dynamic Huffman + LZ77 back-references) for reading objects. Deflate with fixed Huffman codes + LZ77 hash chain (32-entry chain, 32KB window) for writing objects. Adler-32 checksum. zlib framing (CMF+FLG header, trailer).
+- **Object store**: Standard git format — each object stored as zlib-compressed `"type size\0data"` at `.git/objects/XX/YYY...YYYY` on OsitoFS. SHA-1 computed over uncompressed header+content. Dedup: skips write if object already exists.
+- **Index/staging**: Text format at `.git/index` — `"mode sha1hex name\n"` per entry. Max 256 entries. Loaded/saved on each operation.
+- **Refs**: Standard git ref files — `.git/refs/heads/<branch>` contains SHA-1 hex + newline. HEAD at `.git/HEAD` with `"ref: refs/heads/master\n"` format.
+- **Tree objects**: Standard git tree format — entries of `"mode name\0sha1_raw"` concatenated. Octal mode encoding.
+- **Commit objects**: Standard git commit format — tree/parent/author/committer headers + blank line + message. Fixed identity `OsitoK <osito@bare-metal>`.
+- **Commands**: `git init` (create .git/HEAD), `git add <file>` (blob + index update), `git commit <msg>` (tree + commit + ref update), `git log` (walk parent chain, 50 max), `git status` (branch, staged, untracked), `git diff` (line-by-line old vs new), `git branch [name]` (list/create), `git checkout <branch>` (update HEAD + rebuild index).
+- **Storage**: Each git object uses 1 OsitoFS file (1MB block minimum). Practical for repos with <100 objects (~100MB). 64-byte filename limit accommodates `.git/objects/XX/38-char-hash` (54 chars).
+- **Files**: `arch/x86/kernel/crypto.c` (SHA-1), `arch/x86/kernel/zlib.h/c` (DEFLATE), `arch/x86/kernel/git.h/c` (git core), `arch/x86/kernel/shell.c` (git command)
 
 ### AArch64/SM8350 Port (arch/arm/)
 Reference bare-metal code for ASUS ROG Phone 5 (Snapdragon 888).

@@ -10,6 +10,22 @@
 
 #include "../include/types.h"
 
+/* ── SHA-1 ──────────────────────────────────────────────────── */
+
+typedef struct {
+    uint32_t state[5];
+    uint64_t count;          /* Total bytes processed */
+    uint8_t  buf[64];
+    uint32_t buf_len;
+} sha1_ctx;
+
+void sha1_init(sha1_ctx *ctx);
+void sha1_update(sha1_ctx *ctx, const void *data, uint32_t len);
+void sha1_final(sha1_ctx *ctx, uint8_t digest[20]);
+
+/* One-shot */
+void sha1(const void *data, uint32_t len, uint8_t digest[20]);
+
 /* ── SHA-256 ─────────────────────────────────────────────────── */
 
 typedef struct {

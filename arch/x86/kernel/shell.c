@@ -49,6 +49,16 @@ extern int  osfs2_read(void *file, uint64_t offset, void *buf, uint64_t len);
 extern void *kmalloc(uint64_t size);
 extern void  kfree(void *ptr);
 
+/* Git */
+extern int git_init(void);
+extern int git_add(const char *filename);
+extern int git_commit(const char *message);
+extern int git_log(void);
+extern int git_status(void);
+extern int git_diff(void);
+extern int git_branch(const char *name);
+extern int git_checkout(const char *branch);
+
 /* Network */
 extern void net_poll(void);
 extern void     net_icmp_send_echo(const uint8_t dst_ip[4], uint16_t seq);
@@ -213,7 +223,9 @@ static void cmd_help(void)
     sh_puts("  claude    Claude REPL (multi-turn conversation)\n");
     sh_puts("  chat      Local inference (chat <prompt>)\n");
     sh_puts("  temp      Set sampling (temp <temperature> [top_p])\n");
+    sh_puts("  js        QuickJS REPL (js [script.js])\n");
     sh_puts("  dl        Dynamic linker (dl load/sym/call/close/list)\n");
+    sh_puts("  git       Version control (init/add/commit/log/status/diff/branch/checkout)\n");
     sh_puts("  clear     Clear screen\n");
     sh_puts("  reboot    Reboot system\n");
     sh_puts("  halt      Halt CPU\n");
@@ -1330,8 +1342,56 @@ static void shell_exec(char *line)
         cmd_chat(argc, argv);
     } else if (strcmp(cmd, "temp") == 0) {
         cmd_temp(argc, argv);
+    } else if (strcmp(cmd, "js") == 0) {
+        /* QuickJS REPL — run qjs.elf with optional script argument */
+        if (argc > 1) {
+            const char *js_argv[] = { "qjs.elf", argv[1] };
+            proc_exec("qjs.elf", 2, js_argv);
+        } else {
+            const char *js_argv[] = { "qjs.elf" };
+            proc_exec("qjs.elf", 1, js_argv);
+        }
     } else if (strcmp(cmd, "dl") == 0) {
         cmd_dl(argc, argv);
+    } else if (strcmp(cmd, "git") == 0) {
+        if (argc < 2) {
+            sh_puts("Usage: git <init|add|commit|log|status|diff|branch|checkout>\n");
+        } else if (strcmp(argv[1], "init") == 0) {
+            git_init();
+        } else if (strcmp(argv[1], "add") == 0) {
+            if (argc < 3) sh_puts("Usage: git add <file>\n");
+            else git_add(argv[2]);
+        } else if (strcmp(argv[1], "commit") == 0) {
+            if (argc < 3) {
+                sh_puts("Usage: git commit <message>\n");
+            } else {
+                /* Join remaining args as message */
+                char msg[256];
+                int pos = 0;
+                for (int i = 2; i < argc && pos < 250; i++) {
+                    if (i > 2) msg[pos++] = ' ';
+                    const char *w = argv[i];
+                    while (*w && pos < 250) msg[pos++] = *w++;
+                }
+                msg[pos] = '\0';
+                git_commit(msg);
+            }
+        } else if (strcmp(argv[1], "log") == 0) {
+            git_log();
+        } else if (strcmp(argv[1], "status") == 0) {
+            git_status();
+        } else if (strcmp(argv[1], "diff") == 0) {
+            git_diff();
+        } else if (strcmp(argv[1], "branch") == 0) {
+            git_branch(argc >= 3 ? argv[2] : NULL);
+        } else if (strcmp(argv[1], "checkout") == 0) {
+            if (argc < 3) sh_puts("Usage: git checkout <branch>\n");
+            else git_checkout(argv[2]);
+        } else {
+            sh_puts("Unknown git command: ");
+            sh_puts(argv[1]);
+            sh_puts("\n");
+        }
     } else if (strcmp(cmd, "clear") == 0) {
         cmd_clear();
     } else if (strcmp(cmd, "reboot") == 0) {
