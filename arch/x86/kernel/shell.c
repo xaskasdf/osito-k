@@ -90,6 +90,13 @@ extern int  claude_chat(const void *messages, int msg_count,
                         const char *model, int max_tokens,
                         int (*callback)(const char *, uint32_t, void *), void *ctx);
 
+/* Claude Session (X-CL2) — opaque pointer, managed by claude.c */
+extern void *claude_session_new(void);
+extern void  claude_session_free(void *s);
+extern void  claude_session_clear(void *s);
+extern int   claude_session_send(void *s, const char *user_msg,
+                                  int (*callback)(const char *, uint32_t, void *), void *ctx);
+
 /* Tokenizer */
 extern char g_tokenizer[];  /* tokenizer_t (opaque) */
 extern int  tok_encode(const void *tok, const char *text, uint32_t text_len,
@@ -169,6 +176,7 @@ static void cmd_help(void)
     sh_puts("  curl      HTTPS GET (curl hostname [path])\n");
     sh_puts("  apikey    Set Claude API key (apikey sk-ant-...)\n");
     sh_puts("  ask       Ask Claude (ask <prompt>)\n");
+    sh_puts("  claude    Claude REPL (multi-turn conversation)\n");
     sh_puts("  chat      Local inference (chat <prompt>)\n");
     sh_puts("  temp      Set sampling (temp <temperature> [top_p])\n");
     sh_puts("  clear     Clear screen\n");
@@ -860,6 +868,66 @@ static void cmd_ask(int argc, char *argv[])
     }
 }
 
+/* ── Builtin: claude (multi-turn REPL, X-CL2) ────────────────── */
+
+static void cmd_claude(int argc, char *argv[])
+{
+    (void)argc; (void)argv;
+
+    if (!claude_get_api_key()) {
+        sh_puts("Set API key first: apikey sk-ant-...\n");
+        return;
+    }
+
+    void *session = claude_session_new();
+    if (!session) {
+        sh_puts("Failed to allocate session\n");
+        return;
+    }
+
+    sh_puts_color("Claude REPL", 0x00FF8800);
+    sh_puts(" (multi-turn). Type 'quit' or Ctrl+D to exit, 'clear' to reset.\n\n");
+
+    char line[1024];
+
+    for (;;) {
+        int len = term_readline("you> ", line, sizeof(line));
+
+        /* Ctrl+D (EOF) or empty + Ctrl+D */
+        if (len < 0) {
+            sh_puts("\n");
+            break;
+        }
+
+        /* Skip empty lines */
+        if (len == 0) continue;
+
+        /* Builtins within REPL */
+        if (line[0] == 'q' && line[1] == 'u' && line[2] == 'i' &&
+            line[3] == 't' && (line[4] == '\0' || line[4] == ' '))
+            break;
+
+        if (line[0] == 'c' && line[1] == 'l' && line[2] == 'e' &&
+            line[3] == 'a' && line[4] == 'r' && line[5] == '\0') {
+            claude_session_clear(session);
+            sh_puts_color("Session cleared.\n\n", 0x00888888);
+            continue;
+        }
+
+        sh_puts_color("\nClaude: ", 0x00FF8800);
+
+        int r = claude_session_send(session, line, ask_stream_cb, NULL);
+        if (r < 0) {
+            sh_puts_color("\n[error]\n", 0x00FF0000);
+        } else {
+            sh_puts("\n\n");
+        }
+    }
+
+    claude_session_free(session);
+    sh_puts("Session ended.\n");
+}
+
 /* ── Builtin: temp (sampling parameters) ─────────────────────── */
 
 /* Parse simple decimal float: "0.7", "1.0", "0" */
@@ -1029,6 +1097,8 @@ static void shell_exec(char *line)
         cmd_apikey(argc, argv);
     } else if (strcmp(cmd, "ask") == 0) {
         cmd_ask(argc, argv);
+    } else if (strcmp(cmd, "claude") == 0) {
+        cmd_claude(argc, argv);
     } else if (strcmp(cmd, "chat") == 0) {
         cmd_chat(argc, argv);
     } else if (strcmp(cmd, "temp") == 0) {

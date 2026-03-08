@@ -56,4 +56,32 @@ int claude_chat(const claude_msg_t *messages, int msg_count,
  * Returns bytes written to buf, or -1 on error. */
 int claude_ask(const char *prompt, char *response_buf, uint32_t buf_size);
 
+/* ── Multi-Turn Session (X-CL2) ───────────────────────────────── */
+
+#define CLAUDE_SESSION_MAX_TURNS  8   /* Max user+assistant turn pairs */
+
+typedef struct {
+    char     user[CLAUDE_SESSION_MAX_TURNS][CLAUDE_MAX_MSG_LEN];
+    char     assistant[CLAUDE_SESSION_MAX_TURNS][CLAUDE_MAX_MSG_LEN];
+    int      turn_count;     /* Number of completed turns */
+    char     pending_response[CLAUDE_MAX_RESPONSE]; /* Current response accumulator */
+    uint32_t response_pos;
+} claude_session_t;
+
+/* Allocate and initialize a session (kmalloc). Caller must free. */
+claude_session_t *claude_session_new(void);
+
+/* Free a session */
+void claude_session_free(claude_session_t *s);
+
+/* Send a user message within a session (multi-turn).
+ * Appends user message to history, streams response via callback,
+ * saves assistant response to history for next turn.
+ * Returns total response length, or -1 on error. */
+int claude_session_send(claude_session_t *s, const char *user_msg,
+                         claude_stream_cb callback, void *ctx);
+
+/* Clear session history (restart conversation) */
+void claude_session_clear(claude_session_t *s);
+
 #endif /* OSITOK_CLAUDE_H */

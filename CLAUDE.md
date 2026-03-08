@@ -169,7 +169,7 @@ arch/x86/kernel/tls.c               TLS 1.2 client (ECDHE-RSA-AES128-GCM-SHA256,
 arch/x86/kernel/http.h              HTTP client API (http_session_t, open/request/read_body/close)
 arch/x86/kernel/http.c              HTTPS client (GET/POST, chunked transfer, streaming body)
 arch/x86/kernel/claude.h            Claude API client types + API (chat, ask, streaming)
-arch/x86/kernel/claude.c            Claude Messages API (JSON builder, SSE parser, streaming)
+arch/x86/kernel/claude.c            Claude Messages API (JSON builder, SSE parser, streaming, multi-turn session)
 arch/x86/kernel/tokenizer.h         BPE tokenizer API (tok_entry_t, tok_merge_t, tokenizer_t)
 arch/x86/kernel/tokenizer.c         BPE encode/decode (FNV-1a hash, greedy+merge, GGUF vocab)
 arch/x86/kernel/shell.c             Interactive shell (15 builtins, argv parser, ELF exec)
@@ -350,6 +350,7 @@ Tasks:   idle, input, shell (3 of 8 slots used)
 | **X-NET4** | **TLS 1.2 + Crypto** (SHA-256, HMAC, AES-128-GCM, X25519, ECDHE-RSA handshake, gateway routing) | Done |
 | **X-NET5** | **HTTP client** (GET/POST over HTTPS, chunked transfer-encoding, streaming body, curl command) | Done |
 | **X-CL1** | **Claude API client** (Messages API, JSON builder, SSE streaming, apikey/ask commands) | Done |
+| **X-CL2** | **Claude REPL** (multi-turn conversation, session history, sliding window, `claude` shell command) | Done |
 | **X-NET2** | **TCP stack** (client-only, 3-way handshake, send/recv, FIN close, tcptest shell command) | Done |
 | **X-NET3** | **DNS resolver** (UDP query to SLIRP DNS, A record parse, resolve shell command) | Done |
 | **X-TOK1** | **BPE tokenizer** (Llama 3 BPE encode/decode, GGUF vocab extraction, FNV-1a hash, greedy+merge) | Done |
@@ -750,6 +751,17 @@ Native C client for Anthropic Messages API with SSE streaming.
 - **Shell commands**: `apikey [key]` — set/show API key. `ask <prompt>` — single-turn chat with streaming output.
 - **Convenience**: `claude_ask(prompt, buf, size)` — single-turn, response to buffer.
 - **Files**: `arch/x86/kernel/claude.h`, `arch/x86/kernel/claude.c`, `arch/x86/kernel/shell.c` (apikey/ask commands)
+
+### X-CL2: Claude REPL
+Multi-turn interactive conversation with Claude from OsitoK shell.
+- **Session state**: `claude_session_t` — 8-turn history (user + assistant), sliding window (oldest turn discarded when full). ~40KB per session via kmalloc.
+- **Message builder**: Constructs alternating user/assistant message array from history. Current turn is last user message (no assistant yet). Past turns include both.
+- **Response capture**: Dual callback — captures response into `pending_response` buffer for history AND forwards to user's display callback for streaming output.
+- **Sliding window**: When turn_count reaches CLAUDE_SESSION_MAX_TURNS (8), shifts all turns left, discards turn 0. Keeps conversation flowing without unbounded memory.
+- **JSON buffer scaling**: `claude_chat()` allocates `4096 + msg_count * 2048` bytes for request JSON, scaling with conversation length.
+- **Shell command**: `claude` — enters REPL mode with `you>` prompt. Builtins: `quit` (exit), `clear` (reset history), Ctrl+D (exit). Reuses `term_readline()` for input with editing + history.
+- **Integration**: `ask` command remains for single-turn. `claude` is the multi-turn REPL. Both use the same streaming callback for output.
+- **Files**: `arch/x86/kernel/claude.h` (claude_session_t, session API), `arch/x86/kernel/claude.c` (session_send, sliding window), `arch/x86/kernel/shell.c` (cmd_claude REPL loop)
 
 ### X-TOK1: BPE Tokenizer
 Byte-pair encoding tokenizer for Llama 3 models. Ported from xasko's C++ tiktoken (reason_agent/tools/tiktoken.cpp).

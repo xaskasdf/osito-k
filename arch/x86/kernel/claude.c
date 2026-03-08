@@ -296,11 +296,12 @@ int claude_chat(const claude_msg_t *messages, int msg_count,
         return -1;
     }
 
-    /* Build request JSON */
-    char *json_buf = (char *)kmalloc(4096);
+    /* Build request JSON — scale buffer with message count */
+    uint32_t json_buf_size = 4096 + (uint32_t)msg_count * 2048;
+    char *json_buf = (char *)kmalloc(json_buf_size);
     if (!json_buf) return -1;
 
-    int json_len = build_request_json(json_buf, 4096,
+    int json_len = build_request_json(json_buf, (int)json_buf_size,
                                        messages, msg_count,
                                        model, max_tokens, true);
 
@@ -434,4 +435,111 @@ int claude_ask(const char *prompt, char *response_buf, uint32_t buf_size)
         ctx.buf[ctx.pos] = '\0';
 
     return (int)ctx.pos;
+}
+
+/* ══════════════════════════════════════════════════════════════
+ *  X-CL2: Multi-Turn Session
+ * ══════════════════════════════════════════════════════════════ */
+
+claude_session_t *claude_session_new(void)
+{
+    claude_session_t *s = (claude_session_t *)kmalloc(sizeof(claude_session_t));
+    if (s) cmemset(s, 0, sizeof(*s));
+    return s;
+}
+
+void claude_session_free(claude_session_t *s)
+{
+    if (s) kfree(s);
+}
+
+void claude_session_clear(claude_session_t *s)
+{
+    if (s) {
+        s->turn_count = 0;
+        s->response_pos = 0;
+    }
+}
+
+/* Callback that captures response into session + forwards to user cb */
+typedef struct {
+    claude_session_t *session;
+    claude_stream_cb  user_cb;
+    void             *user_ctx;
+} session_stream_ctx_t;
+
+static int session_stream_cb(const char *text, uint32_t len, void *ctx)
+{
+    session_stream_ctx_t *sc = (session_stream_ctx_t *)ctx;
+    claude_session_t *s = sc->session;
+
+    /* Capture into pending_response */
+    for (uint32_t i = 0; i < len && s->response_pos < CLAUDE_MAX_RESPONSE - 1; i++)
+        s->pending_response[s->response_pos++] = text[i];
+
+    /* Forward to user callback */
+    if (sc->user_cb)
+        return sc->user_cb(text, len, sc->user_ctx);
+    return 0;
+}
+
+int claude_session_send(claude_session_t *s, const char *user_msg,
+                         claude_stream_cb callback, void *ctx)
+{
+    if (!s) return -1;
+
+    /* If history is full, shift out oldest turn to make room */
+    if (s->turn_count >= CLAUDE_SESSION_MAX_TURNS) {
+        for (int i = 0; i < CLAUDE_SESSION_MAX_TURNS - 1; i++) {
+            cmemcpy(s->user[i], s->user[i + 1], CLAUDE_MAX_MSG_LEN);
+            cmemcpy(s->assistant[i], s->assistant[i + 1], CLAUDE_MAX_MSG_LEN);
+        }
+        s->turn_count = CLAUDE_SESSION_MAX_TURNS - 1;
+    }
+
+    /* Save user message */
+    int cur = s->turn_count;
+    uint32_t ulen = cstrlen(user_msg);
+    if (ulen >= CLAUDE_MAX_MSG_LEN) ulen = CLAUDE_MAX_MSG_LEN - 1;
+    cmemcpy(s->user[cur], user_msg, ulen);
+    s->user[cur][ulen] = '\0';
+
+    /* Build message array from history: user0, assistant0, user1, ... userN */
+    claude_msg_t messages[CLAUDE_MAX_MESSAGES];
+    int msg_count = 0;
+
+    for (int i = 0; i <= cur && msg_count < CLAUDE_MAX_MESSAGES - 1; i++) {
+        messages[msg_count].role = "user";
+        messages[msg_count].content = s->user[i];
+        msg_count++;
+
+        if (i < cur) {
+            messages[msg_count].role = "assistant";
+            messages[msg_count].content = s->assistant[i];
+            msg_count++;
+        }
+    }
+
+    /* Reset response accumulator */
+    s->response_pos = 0;
+
+    /* Stream request with capture callback */
+    session_stream_ctx_t sc = {
+        .session  = s,
+        .user_cb  = callback,
+        .user_ctx = ctx,
+    };
+
+    int r = claude_chat(messages, msg_count, NULL, 2048,
+                         session_stream_cb, &sc);
+
+    /* Save response to history */
+    s->pending_response[s->response_pos] = '\0';
+    cmemcpy(s->assistant[cur], s->pending_response,
+             s->response_pos < CLAUDE_MAX_MSG_LEN ? s->response_pos + 1
+                                                    : CLAUDE_MAX_MSG_LEN);
+    s->assistant[cur][CLAUDE_MAX_MSG_LEN - 1] = '\0';
+    s->turn_count = cur + 1;
+
+    return r;
 }
