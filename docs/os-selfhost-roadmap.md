@@ -142,10 +142,10 @@ abstracciones necesarias para correr software real sin modificar.
 
 | ID | Feature | Descripción | ~Líneas | Deps |
 |----|---------|-------------|---------|------|
-| **X-SCHED** | **Scheduler preemptivo** | Timer-based context switch entre procesos. APIC timer ya corre a 100Hz — agregar per-process kernel stack, save/restore de registros completo, round-robin queue. Prerequisito para threads y procesos reales. | ~800 | Ninguna |
-| **X-MMAP** | **mmap/munmap/mprotect** | Virtual memory real. MAP_ANONYMOUS (core), MAP_FIXED (ELF loader), MAP_PRIVATE (file-backed). Per-process VMA tracking. Bloqueante #1 para binarios Linux. | ~1200 | X-SCHED |
-| **X-VFS** | **VFS layer** | Abstracción sobre OsitoFS. Mount points, `/dev` (null, zero, urandom, console), `/proc` (self/maps, self/status). Abrir la puerta a múltiples filesystems. | ~800 | Ninguna |
-| **X-MUSL** | **Port musl libc** | Cross-compilar musl como libc estática para OsitoK. Syscall stubs, errno, TLS setup. Reemplaza CRT mínimo actual. Habilita portar apps POSIX reales. | ~500 glue | X-MMAP, X-VFS |
+| **X-SCHED** | **Scheduler preemptivo** | Timer-based context switch entre procesos. | ~800 | Ninguna | ✅ Done |
+| **X-MMAP** | **mmap/munmap/mprotect** | MAP_ANONYMOUS identity-mapped, VMA tracking. | ~1200 | X-SCHED | ✅ Done |
+| **X-VFS** | **VFS layer** | /dev, /proc, getcwd, readlink, getdents64. | ~800 | Ninguna | ✅ Done |
+| **X-MUSL** | **Port musl libc** | musl 1.2.5 static + 20 new syscalls (TLS, time, signals). | ~500 glue | X-MMAP, X-VFS | ✅ Done |
 | **X-THREAD** | **Threads (clone/futex)** | clone(CLONE_VM\|CLONE_THREAD), futex(WAIT/WAKE), set_tid_address, gettid. Per-thread stacks, TLS via arch_prctl ARCH_SET_FS. Usar SMP cores para threads reales. | ~1000 | X-SCHED, X-MMAP |
 | **X-EDIT** | **Port editor mínimo** | Portar un editor de texto (kilo ~1000LOC, o nano subset). Editar archivos desde OsitoK sin host. Necesita raw mode TTY + VT100 ANSI. | ~600 glue | X-MUSL |
 | **X-HTTPD** | **TCP server (listen/accept)** | Completar TCP stack: listen(), accept(), server sockets. Implementar HTTP server mínimo. Exponer servicios desde OsitoK a la red. | ~600 | Ninguna |

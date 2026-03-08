@@ -9,22 +9,20 @@
  * saves registers and calls syscall_dispatch() here.
  *
  * Syscalls (Linux-compatible numbers):
- *   0 = read(fd, buf, count)
- *   1 = write(fd, buf, count)
- *   2 = open(path, flags, mode)
- *   3 = close(fd)
- *   5 = fstat(fd, statbuf)
- *   8 = lseek(fd, offset, whence)
- *   9 = mmap(addr, len, prot, flags, fd, offset)
- *  10 = mprotect(addr, len, prot)
- *  11 = munmap(addr, len)
- *  12 = brk(addr)
- *  13 = sigaction(sig, act, oldact)
- *  22 = pipe(pipefd[2])
- *  33 = dup2(oldfd, newfd)
- *  60 = exit(status)
- *  62 = kill(pid, sig)
- * 158 = arch_prctl             [stub]
+ *   0-3,5,8-12  = read/write/open/close/fstat/lseek/mmap/mprotect/munmap/brk
+ *  13-15        = rt_sigaction/rt_sigprocmask/rt_sigreturn
+ *  16-21        = ioctl/pread64/pwrite64/writev/access
+ *  22,24,32,33  = pipe/sched_yield/dup/dup2
+ *  35,39        = nanosleep/getpid
+ *  56-60,62     = clone/fork/execve/exit/kill   [clone/fork/execve stubs]
+ *  72,74,79     = fcntl/fsync/getcwd
+ *  87,89        = unlink/readlink
+ * 131,158       = sigaltstack/arch_prctl(ARCH_SET_FS)
+ * 186,202       = gettid/futex
+ * 217-218       = getdents64/set_tid_address
+ * 228,231,234   = clock_gettime/exit_group/tgkill
+ * 262,273       = newfstatat/set_robust_list
+ * 302,318       = prlimit64/getrandom
  */
 
 #include "../include/types.h"
@@ -50,6 +48,9 @@ extern void *osfs2_create(const char *name, uint64_t size);
 extern void *kmalloc(uint64_t size);
 extern void  kfree(void *ptr);
 
+/* Timer */
+extern uint64_t idt_get_ticks(void);
+
 /* Physical memory */
 extern void *mem_alloc_pages(uint64_t count);
 extern void  mem_free_pages(void *addr, uint64_t count);
@@ -60,6 +61,8 @@ extern int paging_unmap_page(uint64_t virt);
 extern int paging_set_flags(uint64_t virt, uint64_t flags);
 
 /* ── MSR definitions ─────────────────────────────────────────── */
+
+#define MSR_FS_BASE 0xC0000100  /* FS segment base (for TLS) */
 
 #define MSR_STAR    0xC0000081  /* Segment selectors for SYSCALL/SYSRET */
 #define MSR_LSTAR   0xC0000082  /* RIP for SYSCALL (64-bit) */
@@ -107,7 +110,29 @@ static inline void wrmsr(uint32_t msr, uint64_t val) {
 #define SYS_GETDENTS64  217
 #define SYS_ARCH_PRCTL  158
 #define SYS_SIGACTION   13
+#define SYS_SIGPROCMASK 14
 #define SYS_SIGRETURN   15
+#define SYS_PREAD64     17
+#define SYS_PWRITE64    18
+#define SYS_SCHED_YIELD 24
+#define SYS_NANOSLEEP   35
+#define SYS_GETPID      39
+#define SYS_CLONE       56
+#define SYS_FORK        57
+#define SYS_EXECVE      59
+#define SYS_FCNTL       72
+#define SYS_FSYNC       74
+#define SYS_SIGALTSTACK 131
+#define SYS_GETTID      186
+#define SYS_FUTEX       202
+#define SYS_SET_TID_ADDR 218
+#define SYS_CLOCK_GETTIME 228
+#define SYS_EXIT_GROUP  231
+#define SYS_TGKILL      234
+#define SYS_NEWFSTATAT  262
+#define SYS_SET_ROBUST_LIST 273
+#define SYS_PRLIMIT64   302
+#define SYS_GETRANDOM   318
 
 /* errno values */
 #define EPERM    1
@@ -125,6 +150,10 @@ static inline void wrmsr(uint32_t msr, uint64_t val) {
 #define ESRCH    3
 #define EAGAIN  11
 #define ENOTDIR 20
+#define ENOSPC  28
+#define ERANGE  34
+#define ENOTSUP 95
+#define EAFNOSUPPORT 97
 
 /* open flags (Linux values) */
 #define O_RDONLY    0x0000
@@ -1144,6 +1173,317 @@ void syscall_check_signals(void)
     }
 }
 
+/* ── New syscalls for musl libc (X-MUSL) ─────────────────────── */
+
+/* arch_prctl — set/get FS/GS base (TLS support) */
+#define ARCH_SET_FS  0x1002
+#define ARCH_GET_FS  0x1003
+#define ARCH_SET_GS  0x1001
+#define ARCH_GET_GS  0x1004
+
+static int64_t sys_arch_prctl(uint64_t code, uint64_t addr)
+{
+    switch (code) {
+    case ARCH_SET_FS:
+        wrmsr(MSR_FS_BASE, addr);
+        return 0;
+    case ARCH_GET_FS:
+        if (!addr) return -EFAULT;
+        *(uint64_t *)addr = rdmsr(MSR_FS_BASE);
+        return 0;
+    case ARCH_SET_GS:
+    case ARCH_GET_GS:
+        return -ENOSYS;  /* GS not needed for musl */
+    default:
+        return -EINVAL;
+    }
+}
+
+/* set_tid_address — set pointer for child tid notification */
+static int64_t sys_set_tid_address(uint64_t tidptr)
+{
+    (void)tidptr;  /* We don't implement CLONE_CHILD_CLEARTID yet */
+    return (int64_t)proc_current_pid();  /* Return current TID */
+}
+
+/* getpid / gettid — return process/thread ID */
+static int64_t sys_getpid(void)
+{
+    return (int64_t)proc_current_pid();
+}
+
+static int64_t sys_gettid(void)
+{
+    return (int64_t)proc_current_pid();  /* TID = PID (no threads yet) */
+}
+
+/* rt_sigprocmask — block/unblock signals (minimal stub) */
+static int64_t sys_rt_sigprocmask(uint64_t how, uint64_t set_addr,
+                                   uint64_t oldset_addr, uint64_t sigsetsize)
+{
+    (void)how; (void)sigsetsize;
+
+    /* Return old mask if requested */
+    if (oldset_addr) {
+        uint64_t *oldset = (uint64_t *)oldset_addr;
+        *oldset = 0;  /* No signals blocked */
+    }
+
+    /* Accept but ignore the new mask for now */
+    (void)set_addr;
+    return 0;
+}
+
+/* sigaltstack — set alternate signal stack (stub) */
+static int64_t sys_sigaltstack(uint64_t ss_addr, uint64_t old_ss_addr)
+{
+    if (old_ss_addr) {
+        /* Return "no alternate stack" */
+        memset((void *)old_ss_addr, 0, 24);  /* ss_sp, ss_flags=SS_DISABLE, ss_size */
+        *(int *)((uint8_t *)old_ss_addr + 8) = 2;  /* SS_DISABLE */
+    }
+    (void)ss_addr;
+    return 0;
+}
+
+/* exit_group — terminate all threads (alias to exit for now) */
+static int64_t sys_exit_group(uint64_t status)
+{
+    return sys_exit(status);
+}
+
+/* clock_gettime — return monotonic/realtime clock */
+#define CLOCK_REALTIME  0
+#define CLOCK_MONOTONIC 1
+
+typedef struct {
+    int64_t tv_sec;
+    int64_t tv_nsec;
+} timespec_t;
+
+static int64_t sys_clock_gettime(uint64_t clk_id, uint64_t tp_addr)
+{
+    if (!tp_addr) return -EFAULT;
+    timespec_t *tp = (timespec_t *)tp_addr;
+
+    /* Use APIC ticks (100Hz) for time base */
+    uint64_t ticks = idt_get_ticks();
+    uint64_t ms = ticks * 10;  /* 100Hz → 10ms per tick */
+
+    tp->tv_sec  = (int64_t)(ms / 1000);
+    tp->tv_nsec = (int64_t)((ms % 1000) * 1000000);
+
+    (void)clk_id;  /* Same time for REALTIME and MONOTONIC */
+    return 0;
+}
+
+/* nanosleep — sleep for specified time */
+static int64_t sys_nanosleep(uint64_t req_addr, uint64_t rem_addr)
+{
+    if (!req_addr) return -EFAULT;
+    const timespec_t *req = (const timespec_t *)req_addr;
+
+    /* Convert to APIC ticks (100Hz = 10ms per tick) */
+    uint64_t ms = (uint64_t)(req->tv_sec * 1000 + req->tv_nsec / 1000000);
+    uint64_t sleep_ticks = (ms + 9) / 10;  /* round up */
+    if (sleep_ticks == 0) sleep_ticks = 1;
+
+    uint64_t deadline = idt_get_ticks() + sleep_ticks;
+    while (idt_get_ticks() < deadline)
+        __asm__ volatile ("hlt");
+
+    if (rem_addr) {
+        timespec_t *rem = (timespec_t *)rem_addr;
+        rem->tv_sec = 0;
+        rem->tv_nsec = 0;
+    }
+    return 0;
+}
+
+/* getrandom — fill buffer with random bytes */
+static int64_t sys_getrandom(uint64_t buf_addr, uint64_t buflen, uint64_t flags)
+{
+    (void)flags;
+    if (!buf_addr) return -EFAULT;
+
+    uint8_t *buf = (uint8_t *)buf_addr;
+    for (uint64_t i = 0; i < buflen; i += 8) {
+        uint64_t r = urandom_next();
+        uint64_t n = buflen - i;
+        if (n > 8) n = 8;
+        memcpy(buf + i, &r, (size_t)n);
+    }
+    return (int64_t)buflen;
+}
+
+/* sched_yield — yield CPU (no-op in non-preemptive for now) */
+static int64_t sys_sched_yield(void)
+{
+    __asm__ volatile ("hlt");  /* Wait for next timer tick */
+    return 0;
+}
+
+/* fcntl — file control (minimal: F_GETFD, F_SETFD, F_GETFL, F_SETFL) */
+#define F_GETFD  1
+#define F_SETFD  2
+#define F_GETFL  3
+#define F_SETFL  4
+#define F_DUPFD  0
+#define F_DUPFD_CLOEXEC 1030
+
+static int64_t sys_fcntl(uint64_t fd, uint64_t cmd, uint64_t arg)
+{
+    if (fd >= MAX_FDS || !fd_table[fd].open) return -EBADF;
+    (void)arg;
+
+    switch (cmd) {
+    case F_GETFD: return 0;  /* No close-on-exec */
+    case F_SETFD: return 0;  /* Ignore */
+    case F_GETFL: return (int64_t)fd_table[fd].oflags;
+    case F_SETFL: fd_table[fd].oflags = (uint16_t)(arg & 0xFFFF); return 0;
+    case F_DUPFD:
+    case F_DUPFD_CLOEXEC: {
+        /* Find lowest fd >= arg */
+        for (uint64_t i = arg; i < MAX_FDS; i++) {
+            if (!fd_table[i].open) {
+                fd_table[i] = fd_table[fd];
+                return (int64_t)i;
+            }
+        }
+        return -EMFILE;
+    }
+    default: return -EINVAL;
+    }
+}
+
+/* newfstatat / fstatat — stat by path relative to dirfd */
+#define AT_FDCWD -100
+
+static int64_t sys_newfstatat(uint64_t dirfd, uint64_t path_addr,
+                               uint64_t statbuf_addr, uint64_t flags)
+{
+    (void)dirfd; (void)flags;
+    const char *path = (const char *)path_addr;
+    if (!path || !statbuf_addr) return -EFAULT;
+
+    /* Open, stat, close */
+    int64_t fd = sys_open(path_addr, O_RDONLY, 0);
+    if (fd < 0) return fd;
+    int64_t ret = sys_fstat((uint64_t)fd, statbuf_addr);
+    sys_close((uint64_t)fd);
+    return ret;
+}
+
+/* pread64 — read from fd at offset without changing position */
+static int64_t sys_pread64(uint64_t fd, uint64_t buf, uint64_t count, uint64_t offset)
+{
+    if (fd >= MAX_FDS || !fd_table[fd].open) return -EBADF;
+    fd_entry_t *f = &fd_table[fd];
+    if (f->type != FD_TYPE_FILE) return -ESPIPE;
+
+    uint64_t saved_offset = f->offset;
+    f->offset = offset;
+    int64_t ret = sys_read(fd, buf, count);
+    f->offset = saved_offset;
+    return ret;
+}
+
+/* pwrite64 — write to fd at offset without changing position */
+static int64_t sys_pwrite64(uint64_t fd, uint64_t buf, uint64_t count, uint64_t offset)
+{
+    if (fd >= MAX_FDS || !fd_table[fd].open) return -EBADF;
+    fd_entry_t *f = &fd_table[fd];
+    if (f->type != FD_TYPE_FILE) return -ESPIPE;
+
+    uint64_t saved_offset = f->offset;
+    f->offset = offset;
+    int64_t ret = sys_write(fd, buf, count);
+    f->offset = saved_offset;
+    return ret;
+}
+
+/* futex — minimal WAIT/WAKE */
+#define FUTEX_WAIT 0
+#define FUTEX_WAKE 1
+#define FUTEX_PRIVATE_FLAG 128
+
+static int64_t sys_futex(uint64_t uaddr, uint64_t op, uint64_t val,
+                          uint64_t timeout, uint64_t uaddr2)
+{
+    (void)timeout; (void)uaddr2;
+    int cmd = (int)(op & ~FUTEX_PRIVATE_FLAG);
+
+    if (cmd == FUTEX_WAIT) {
+        /* Check if value matches, if so sleep briefly */
+        volatile int *addr = (volatile int *)uaddr;
+        if (*addr != (int)val) return -EAGAIN;
+        /* Single-threaded: just yield once */
+        __asm__ volatile ("hlt");
+        return 0;
+    }
+    if (cmd == FUTEX_WAKE) {
+        /* Single-threaded: nothing to wake */
+        return 0;
+    }
+    return -ENOSYS;
+}
+
+/* set_robust_list — stub for thread-safety (musl calls at startup) */
+static int64_t sys_set_robust_list(uint64_t head, uint64_t len)
+{
+    (void)head; (void)len;
+    return 0;
+}
+
+/* prlimit64 — get/set resource limits */
+typedef struct {
+    uint64_t rlim_cur;
+    uint64_t rlim_max;
+} rlimit64_t;
+
+#define RLIMIT_STACK 3
+#define RLIMIT_NOFILE 7
+
+static int64_t sys_prlimit64(uint64_t pid, uint64_t resource,
+                              uint64_t new_rlim_addr, uint64_t old_rlim_addr)
+{
+    (void)pid; (void)new_rlim_addr;
+
+    if (old_rlim_addr) {
+        rlimit64_t *old = (rlimit64_t *)old_rlim_addr;
+        switch (resource) {
+        case RLIMIT_STACK:
+            old->rlim_cur = 8 * 1024 * 1024;  /* 8MB */
+            old->rlim_max = 8 * 1024 * 1024;
+            break;
+        case RLIMIT_NOFILE:
+            old->rlim_cur = MAX_FDS;
+            old->rlim_max = MAX_FDS;
+            break;
+        default:
+            old->rlim_cur = (uint64_t)-1;  /* RLIM_INFINITY */
+            old->rlim_max = (uint64_t)-1;
+            break;
+        }
+    }
+    return 0;
+}
+
+/* dup — duplicate fd to lowest available */
+static int64_t sys_dup(uint64_t oldfd)
+{
+    if (oldfd >= MAX_FDS || !fd_table[oldfd].open) return -EBADF;
+    for (int i = 0; i < MAX_FDS; i++) {
+        if (!fd_table[i].open) {
+            fd_table[i] = fd_table[oldfd];
+            return (int64_t)i;
+        }
+    }
+    return -EMFILE;
+}
+
+#define SYS_DUP 32
+
 /* ── VFS: getcwd, readlink, getdents64 (X-VFS) ──────────────── */
 
 static int64_t sys_getcwd(uint64_t buf_addr, uint64_t size)
@@ -1264,20 +1604,43 @@ int64_t syscall_dispatch(uint64_t nr, uint64_t a1, uint64_t a2,
     case SYS_MPROTECT:   return sys_mprotect(a1, a2, a3);
     case SYS_MUNMAP:     return sys_munmap(a1, a2);
     case SYS_BRK:        return sys_brk(a1);
+    case SYS_SIGACTION:  return sys_sigaction(a1, a2, a3);
+    case SYS_SIGPROCMASK: return sys_rt_sigprocmask(a1, a2, a3, a4);
+    case SYS_SIGRETURN:  return 0;  /* stub */
     case SYS_IOCTL:      return sys_ioctl(a1, a2, a3);
+    case SYS_PREAD64:    return sys_pread64(a1, a2, a3, a4);
+    case SYS_PWRITE64:   return sys_pwrite64(a1, a2, a3, a4);
     case SYS_WRITEV:     return sys_writev(a1, a2, a3);
     case SYS_ACCESS:     return sys_access(a1, a2);
+    case SYS_SCHED_YIELD: return sys_sched_yield();
     case SYS_PIPE:       return sys_pipe(a1);
+    case SYS_DUP:        return sys_dup(a1);
     case SYS_DUP2:       return sys_dup2(a1, a2);
+    case SYS_NANOSLEEP:  return sys_nanosleep(a1, a2);
+    case SYS_GETPID:     return sys_getpid();
+    case SYS_CLONE:      return -ENOSYS;  /* no threads yet */
+    case SYS_FORK:       return -ENOSYS;  /* no fork */
+    case SYS_EXECVE:     return -ENOSYS;  /* use proc_exec */
     case SYS_EXIT:       return sys_exit(a1);
     case SYS_KILL:       return sys_kill(a1, a2);
+    case SYS_FCNTL:      return sys_fcntl(a1, a2, a3);
+    case SYS_FSYNC:      return 0;  /* no-op */
     case SYS_GETCWD:     return sys_getcwd(a1, a2);
     case SYS_UNLINK:     return sys_unlink(a1);
     case SYS_READLINK:   return sys_readlink(a1, a2, a3);
-    case SYS_ARCH_PRCTL: return -ENOSYS;  /* stub */
+    case SYS_SIGALTSTACK: return sys_sigaltstack(a1, a2);
+    case SYS_ARCH_PRCTL: return sys_arch_prctl(a1, a2);
+    case SYS_GETTID:     return sys_gettid();
+    case SYS_FUTEX:      return sys_futex(a1, a2, a3, a4, a5);
     case SYS_GETDENTS64: return sys_getdents64(a1, a2, a3);
-    case SYS_SIGACTION:  return sys_sigaction(a1, a2, a3);
-    case SYS_SIGRETURN:  return 0;  /* stub */
+    case SYS_SET_TID_ADDR: return sys_set_tid_address(a1);
+    case SYS_CLOCK_GETTIME: return sys_clock_gettime(a1, a2);
+    case SYS_EXIT_GROUP: return sys_exit_group(a1);
+    case SYS_TGKILL:     return sys_kill(a2, a3);  /* reuse kill */
+    case SYS_NEWFSTATAT: return sys_newfstatat(a1, a2, a3, a4);
+    case SYS_SET_ROBUST_LIST: return sys_set_robust_list(a1, a2);
+    case SYS_PRLIMIT64:  return sys_prlimit64(a1, a2, a3, a4);
+    case SYS_GETRANDOM:  return sys_getrandom(a1, a2, a3);
     default:
         serial_puts("[SYSCALL] Unknown syscall ");
         serial_putdec(nr);

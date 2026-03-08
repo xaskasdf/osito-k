@@ -381,13 +381,14 @@ Tasks:   idle, input, shell (3 of 8 slots used)
 | **X-SCHED** | **Preemptive scheduler** (APIC timer round-robin, fake interrupt frame spawn, RSP-swap context switch in ISR stub, BSP-only guard for SMP safety, `sched` shell command) | Done |
 | **X-MMAP** | **mmap/munmap/mprotect** (MAP_ANONYMOUS identity-mapped, VMA tracking, page-level protection, CRT wrappers, 6/6 QEMU tests pass) | Done |
 | **X-VFS** | **Virtual filesystem layer** (/dev/null,zero,urandom,console + /proc/self/status,maps + getcwd/readlink/getdents64 syscalls, 7/7 QEMU tests pass) | Done |
+| **X-MUSL** | **musl libc port** (cross-compiled musl 1.2.5 static libc, +20 syscalls: arch_prctl/set_tid_address/clock_gettime/getrandom/nanosleep/getpid/gettid/futex/fcntl/prlimit64/etc, 9/9 QEMU tests pass) | Done |
 
 > Full GPU roadmap (X27-X40 + contingency): see [docs/x86-gpu-roadmap.md](docs/x86-gpu-roadmap.md)
 > Full OS roadmap (Tiers 0-9): see [docs/os-selfhost-roadmap.md](docs/os-selfhost-roadmap.md)
 > Binary compatibility roadmap: see [docs/binary-compat-roadmap.md](docs/binary-compat-roadmap.md)
 > Paths to Claude analysis: see [docs/paths-to-claude-on-ositok.md](docs/paths-to-claude-on-ositok.md)
 
-**Tier 7+ (next)**: X-MUSL (musl libc port), X-THREAD (clone/futex),
+**Tier 7+ (next)**: X-THREAD (clone/futex),
 X-EDIT (port kilo editor), X-HTTPD (TCP server), X-SELF (self-hosting kernel compile).
 See `docs/os-selfhost-roadmap.md` for full details and dependency chains.
 
@@ -1132,6 +1133,22 @@ VFS dispatch in sys_open routes paths to virtual devices, procfs, or OsitoFS.
 - **osfs2_file_name()**: New accessor added to ositofs2.c for getdents64.
 - **Verified**: 7/7 tests pass in QEMU — null R/W, zero, urandom, proc/self/status, console, ENOENT.
 - **Files**: `arch/x86/kernel/syscall.c` (VFS dispatch, dev/proc handlers, getcwd/readlink/getdents64), `arch/x86/kernel/process.c` (proc_current_name), `arch/x86/fs/ositofs2.c` (osfs2_file_name), `arch/x86/test/vfs_test.c`
+
+### X-MUSL: musl libc Port
+Cross-compiled musl 1.2.5 as static libc for OsitoK. Programs linked with musl run natively.
+- **Build**: `git clone musl → ./configure --disable-shared → make → make install`. `musl-gcc -static -no-pie` produces ET_EXEC ELF64.
+- **New syscalls** (~20 added to syscall.c):
+  - **TLS**: arch_prctl(158) ARCH_SET_FS via WRMSR to MSR 0xC0000100 (IA32_FS_BASE).
+  - **Thread IDs**: set_tid_address(218), getpid(39), gettid(186) — all return current PID.
+  - **Signals**: rt_sigprocmask(14) stub, sigaltstack(131) stub, tgkill(234) reuses kill.
+  - **Time**: clock_gettime(228) from APIC ticks (100Hz→ms), nanosleep(35) via HLT loop.
+  - **Memory**: getrandom(318) from xorshift64 PRNG, futex(202) minimal WAIT/WAKE stubs.
+  - **Files**: pread64(17), pwrite64(18), fcntl(72) F_GETFD/SETFD/GETFL/SETFL/DUPFD, newfstatat(262), dup(32), fsync(74).
+  - **Process**: exit_group(231) alias to exit, sched_yield(24) via HLT, prlimit64(302) RLIMIT_STACK/NOFILE, set_robust_list(273) stub.
+  - **Stubs**: clone(56), fork(57), execve(59) return -ENOSYS.
+- **Verified**: 9/9 tests pass in QEMU — printf, strlen/strcmp, malloc/free, mmap, getpid, clock_gettime, /dev/zero, snprintf with floats, argc/argv.
+- **Files**: `arch/x86/kernel/syscall.c` (all new syscalls), `arch/x86/test/musl_test.c`
+- **musl source**: `/tmp/musl-src/`, installed to `/tmp/musl-install/`
 
 ### AArch64/SM8350 Port (arch/arm/)
 Reference bare-metal code for ASUS ROG Phone 5 (Snapdragon 888).
