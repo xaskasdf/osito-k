@@ -353,6 +353,7 @@ Tasks:   idle, input, shell (3 of 8 slots used)
 | **X-CL2** | **Claude REPL** (multi-turn conversation, session history, sliding window, `claude` shell command) | Done |
 | **X-CL3** | **Tool use: file read/write** (Anthropic tool_use protocol, SSE tool parsing, file_read/write/list, tool loop) | Done |
 | **X-CL4** | **Tool: exec** (compile+run C code via TCC, execute ELF binaries, stdout capture) | Done |
+| **X-CL5** | **Tool: search** (grep-like substring search across OsitoFS files, line-number matches) | Done |
 | **X-NET2** | **TCP stack** (client-only, 3-way handshake, send/recv, FIN close, tcptest shell command) | Done |
 | **X-NET3** | **DNS resolver** (UDP query to SLIRP DNS, A record parse, resolve shell command) | Done |
 | **X-TOK1** | **BPE tokenizer** (Llama 3 BPE encode/decode, GGUF vocab extraction, FNV-1a hash, greedy+merge) | Done |
@@ -783,6 +784,14 @@ Claude can compile C code with TCC and execute ELF binaries, capturing stdout ou
 - **Tool: run_code**: Write C source to `_cl_tmp.c`, compile with `tcc.elf` (`-nostdlib -nostdinc -static`), run `_cl_tmp.elf`, capture output, clean up temp files. Reports compilation errors if TCC fails.
 - **Integration**: Tools added to `tools_json_def`, dispatched in `tool_execute()`. `proc_exec()` handles process lifecycle (setjmp/longjmp). Capture wraps the entire exec call.
 - **Files**: `arch/x86/kernel/syscall.c` (capture API), `arch/x86/kernel/claude.c` (tool_exec, tool_run_code)
+
+### X-CL5: Tool Search — Grep-like File Search
+Claude can search for text patterns across files on OsitoFS.
+- **Tool: search**: Takes `pattern` (required) and optional `path`. Substring match (case-sensitive). Returns `file:line: content` formatted matches.
+- **Single file mode**: When `path` is given, searches only that file.
+- **All files mode**: When no path, iterates all files via `osfs2_file_at()`. Skips files >256KB (binary/model data).
+- **Line scanning**: Reads file into RAM, splits by `\n`, searches each line with `strfind()`. Truncates lines >200 chars in output.
+- **Files**: `arch/x86/kernel/claude.c` (tool_search, search_file, strfind)
 
 ### X-TOK1: BPE Tokenizer
 Byte-pair encoding tokenizer for Llama 3 models. Ported from xasko's C++ tiktoken (reason_agent/tools/tiktoken.cpp).

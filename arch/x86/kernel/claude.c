@@ -143,7 +143,11 @@ static const char *tools_json_def =
     "\"description\":\"ELF filename to execute\"}},\"required\":[\"path\"]}},"
     "{\"name\":\"run_code\",\"description\":\"Compile C source code with TCC and execute it. Returns stdout output and exit code.\","
     "\"input_schema\":{\"type\":\"object\",\"properties\":{\"code\":{\"type\":\"string\","
-    "\"description\":\"C source code to compile and run\"}},\"required\":[\"code\"]}}"
+    "\"description\":\"C source code to compile and run\"}},\"required\":[\"code\"]}},"
+    "{\"name\":\"search\",\"description\":\"Search for a text pattern in files. Returns matching lines with file:line prefixes.\","
+    "\"input_schema\":{\"type\":\"object\",\"properties\":{\"pattern\":{\"type\":\"string\","
+    "\"description\":\"Text to search for (substring match)\"},\"path\":{\"type\":\"string\","
+    "\"description\":\"Optional: search only this file. If omitted, searches all files.\"}},\"required\":[\"pattern\"]}}"
     "]";
 
 /* Build Claude API request JSON.
@@ -990,6 +994,112 @@ static int tool_run_code(const char *input_json, char *result, int max_len)
     return p;
 }
 
+/* ── X-CL5 Tool: search ───────────────────────────────────── */
+
+/* Simple substring search (case-sensitive) */
+static const char *strfind(const char *haystack, int haylen,
+                            const char *needle, int needlen)
+{
+    for (int i = 0; i <= haylen - needlen; i++) {
+        bool match = true;
+        for (int j = 0; j < needlen; j++) {
+            if (haystack[i + j] != needle[j]) { match = false; break; }
+        }
+        if (match) return haystack + i;
+    }
+    return NULL;
+}
+
+/* Search a single file for pattern, append matches to result */
+static int search_file(const char *fname, const char *pattern, int patlen,
+                        char *result, int p, int max_len)
+{
+    void *file = osfs2_find(fname);
+    if (!file) return p;
+
+    uint64_t fsize = osfs2_file_size(file);
+    if (fsize == 0 || fsize > 256 * 1024) return p;  /* Skip huge files */
+
+    char *buf = (char *)kmalloc((uint32_t)fsize + 1);
+    if (!buf) return p;
+
+    if (osfs2_read(file, 0, buf, (uint32_t)fsize) < 0) {
+        kfree(buf);
+        return p;
+    }
+    buf[fsize] = '\0';
+
+    /* Scan line by line */
+    int line_num = 1;
+    const char *line_start = buf;
+    for (uint64_t i = 0; i <= fsize; i++) {
+        if (buf[i] == '\n' || buf[i] == '\0') {
+            int line_len = (int)(&buf[i] - line_start);
+            if (line_len > 0 && strfind(line_start, line_len, pattern, patlen)) {
+                /* Append: fname:linenum: line content */
+                if (p >= max_len - 128) break;
+                p = jp(result, p, max_len, fname);
+                p = jp(result, p, max_len, ":");
+                p = jp_int(result, p, max_len, line_num);
+                p = jp(result, p, max_len, ": ");
+                /* Truncate long lines */
+                int show = line_len > 200 ? 200 : line_len;
+                for (int j = 0; j < show && p < max_len - 2; j++)
+                    result[p++] = line_start[j];
+                p = jp(result, p, max_len, "\n");
+            }
+            line_start = &buf[i + 1];
+            line_num++;
+        }
+    }
+
+    kfree(buf);
+    return p;
+}
+
+static int tool_search(const char *input_json, char *result, int max_len)
+{
+    char pattern[256];
+    if (tool_get_param(input_json, "pattern", pattern, sizeof(pattern)) < 0) {
+        int p = 0;
+        p = jp(result, p, max_len, "Error: missing 'pattern' parameter");
+        return p;
+    }
+    int patlen = (int)cstrlen(pattern);
+
+    /* Optional: search single file */
+    char path[128];
+    int has_path = tool_get_param(input_json, "path", path, sizeof(path));
+
+    int p = 0;
+
+    if (has_path >= 0) {
+        /* Search single file */
+        p = search_file(path, pattern, patlen, result, p, max_len);
+    } else {
+        /* Search all files */
+        uint32_t count = osfs2_file_count();
+        for (uint32_t i = 0; i < count && p < max_len - 128; i++) {
+            void *f = osfs2_file_at(i);
+            if (!f) break;
+            const char *fname = (const char *)f;
+            p = search_file(fname, pattern, patlen, result, p, max_len);
+        }
+    }
+
+    if (p == 0) {
+        p = jp(result, p, max_len, "No matches found for: ");
+        p = jp(result, p, max_len, pattern);
+    }
+
+    serial_puts("[TOOL] search: '");
+    serial_puts(pattern);
+    serial_puts("' → ");
+    serial_putdec((uint64_t)p);
+    serial_puts(" bytes result\n");
+    return p;
+}
+
 /* Dispatch tool execution by name */
 static int tool_execute(const claude_tool_use_t *tu, char *result, int max_len)
 {
@@ -1005,6 +1115,8 @@ static int tool_execute(const claude_tool_use_t *tu, char *result, int max_len)
         return tool_exec(tu->input_json, result, max_len);
     if (tu->name[0] == 'r' && tu->name[4] == 'c')  /* run_code */
         return tool_run_code(tu->input_json, result, max_len);
+    if (tu->name[0] == 's' && tu->name[1] == 'e')  /* search */
+        return tool_search(tu->input_json, result, max_len);
 
     int p = 0;
     p = jp(result, p, max_len, "Error: unknown tool: ");
