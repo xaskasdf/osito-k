@@ -12,7 +12,7 @@
 
 /* ── Configuration ──────────────────────────────────────────── */
 
-#define CLAUDE_MAX_MESSAGES     16
+#define CLAUDE_MAX_MESSAGES     24
 #define CLAUDE_MAX_MSG_LEN      2048
 #define CLAUDE_MAX_RESPONSE     8192
 #define CLAUDE_API_HOST         "api.anthropic.com"
@@ -83,5 +83,33 @@ int claude_session_send(claude_session_t *s, const char *user_msg,
 
 /* Clear session history (restart conversation) */
 void claude_session_clear(claude_session_t *s);
+
+/* ── Tool Use (X-CL3) ───────────────────────────────────────────── */
+
+#define CLAUDE_MAX_TOOL_ID      64     /* "toolu_..." */
+#define CLAUDE_MAX_TOOL_NAME    32     /* "file_read", etc. */
+#define CLAUDE_MAX_TOOL_INPUT   2048   /* Max JSON input per tool */
+#define CLAUDE_MAX_TOOL_RESULT  4096   /* Max result text per tool */
+#define CLAUDE_MAX_TOOL_USES    4      /* Max tool_use blocks per response */
+
+typedef struct {
+    char     id[CLAUDE_MAX_TOOL_ID];
+    char     name[CLAUDE_MAX_TOOL_NAME];
+    char     input_json[CLAUDE_MAX_TOOL_INPUT];
+    uint32_t input_len;
+} claude_tool_use_t;
+
+typedef struct {
+    claude_tool_use_t uses[CLAUDE_MAX_TOOL_USES];
+    int               count;
+    bool              stop_for_tools;   /* stop_reason == "tool_use" */
+    int               cur_tool;         /* Index being parsed (-1 if none) */
+} claude_tool_state_t;
+
+/* Send message with tool support (X-CL3).
+ * Handles tool_use → execute → tool_result loop internally.
+ * Tools: file_read, file_write, file_list. Max 5 iterations. */
+int claude_session_send_with_tools(claude_session_t *s, const char *user_msg,
+                                    claude_stream_cb callback, void *ctx);
 
 #endif /* OSITOK_CLAUDE_H */

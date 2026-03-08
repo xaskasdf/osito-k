@@ -18,6 +18,16 @@ extern void  kfree(void *ptr);
 extern uint32_t http_session_size(void);
 extern uint32_t http_response_size(void);
 
+/* OsitoFS (X-CL3 tool use) */
+extern void *osfs2_find(const char *name);
+extern int   osfs2_read(void *file, uint64_t offset, void *buf, uint64_t len);
+extern void *osfs2_create(const char *name, uint64_t size);
+extern int   osfs2_write(void *file, uint64_t offset, const void *buf, uint64_t len);
+extern int   osfs2_delete(const char *name);
+extern uint32_t osfs2_file_count(void);
+extern void    *osfs2_file_at(uint32_t index);
+extern uint64_t osfs2_file_size(void *file);
+
 /* ── Helpers ─────────────────────────────────────────────────── */
 
 static uint32_t cstrlen(const char *s)
@@ -111,10 +121,27 @@ static int jp_int(char *buf, int pos, int max, int val)
     return pos;
 }
 
-/* Build Claude API request JSON */
+/* Tools JSON definition (X-CL3) */
+static const char *tools_json_def =
+    ",\"tools\":["
+    "{\"name\":\"file_read\",\"description\":\"Read a file from the OsitoK filesystem.\","
+    "\"input_schema\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\","
+    "\"description\":\"File name\"}},\"required\":[\"path\"]}},"
+    "{\"name\":\"file_write\",\"description\":\"Write content to a file (creates or overwrites).\","
+    "\"input_schema\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\","
+    "\"description\":\"File name\"},\"content\":{\"type\":\"string\","
+    "\"description\":\"Content to write\"}},\"required\":[\"path\",\"content\"]}},"
+    "{\"name\":\"file_list\",\"description\":\"List all files on the OsitoK filesystem.\","
+    "\"input_schema\":{\"type\":\"object\",\"properties\":{}}}"
+    "]";
+
+/* Build Claude API request JSON.
+ * If with_tools, appends tools definitions.
+ * If content starts with '[', it's treated as raw JSON (for tool_use/tool_result). */
 static int build_request_json(char *buf, int buf_size,
                                const claude_msg_t *messages, int msg_count,
-                               const char *model, int max_tokens, bool stream)
+                               const char *model, int max_tokens, bool stream,
+                               bool with_tools)
 {
     int p = 0, mx = buf_size;
 
@@ -133,10 +160,18 @@ static int build_request_json(char *buf, int buf_size,
         p = jp(buf, p, mx, "{\"role\":");
         p = jp_str(buf, p, mx, messages[i].role);
         p = jp(buf, p, mx, ",\"content\":");
-        p = jp_str(buf, p, mx, messages[i].content);
+        if (messages[i].content[0] == '[')
+            p = jp(buf, p, mx, messages[i].content);  /* Raw JSON array */
+        else
+            p = jp_str(buf, p, mx, messages[i].content);
         p = jp(buf, p, mx, "}");
     }
-    p = jp(buf, p, mx, "]}");
+    p = jp(buf, p, mx, "]");
+
+    if (with_tools)
+        p = jp(buf, p, mx, tools_json_def);
+
+    p = jp(buf, p, mx, "}");
 
     if (p < mx) buf[p] = '\0';
     return p;
@@ -198,19 +233,40 @@ static const char *json_find_str(const char *json, const char *key,
  */
 
 typedef struct {
-    claude_stream_cb callback;
-    void            *ctx;
-    int              total_len;
-    bool             error;
+    claude_stream_cb     callback;
+    void                *ctx;
+    int                  total_len;
+    bool                 error;
+    claude_tool_state_t *tool_state;  /* Non-NULL when tools enabled (X-CL3) */
 } sse_ctx_t;
+
+/* JSON-unescape src[0..src_len) into dst, return decoded length */
+static int json_unescape(const char *src, int src_len, char *dst, int dst_max)
+{
+    int dlen = 0;
+    for (int j = 0; j < src_len && dlen < dst_max - 1; j++) {
+        if (src[j] == '\\' && j + 1 < src_len) {
+            j++;
+            switch (src[j]) {
+                case 'n':  dst[dlen++] = '\n'; break;
+                case 'r':  dst[dlen++] = '\r'; break;
+                case 't':  dst[dlen++] = '\t'; break;
+                case '"':  dst[dlen++] = '"';  break;
+                case '\\': dst[dlen++] = '\\'; break;
+                default:   dst[dlen++] = src[j]; break;
+            }
+        } else {
+            dst[dlen++] = src[j];
+        }
+    }
+    return dlen;
+}
 
 static int sse_body_cb(const void *data, uint32_t len, void *ctx)
 {
     sse_ctx_t *sc = (sse_ctx_t *)ctx;
     const char *buf = (const char *)data;
 
-    /* Process line by line. SSE lines end with \n.
-     * We accumulate into a static line buffer. */
     static char line[CLAUDE_MAX_RESPONSE];
     static int line_pos = 0;
 
@@ -219,58 +275,101 @@ static int sse_body_cb(const void *data, uint32_t len, void *ctx)
         if (c == '\n') {
             line[line_pos] = '\0';
 
-            /* Process completed line */
             if (line_pos >= 6 && line[0] == 'd' && line[1] == 'a' &&
                 line[2] == 't' && line[3] == 'a' && line[4] == ':' &&
                 line[5] == ' ') {
-                /* "data: {...}" */
                 const char *json = line + 6;
 
-                /* Check event type */
                 int type_len = 0;
                 const char *type = json_find_str(json, "type", &type_len);
 
+                /* ── content_block_delta (type_len=19, pos14='d') ── */
                 if (type && type_len == 19 &&
                     type[0] == 'c' && type[8] == 'b' &&
                     type[14] == 'd' && type[18] == 'a') {
-                    /* "content_block_delta" — extract the text from
-                     * delta.text (skip the "type":"text_delta" match) */
-                    int text_len = 0;
-                    const char *text = json_find_str(json, "text", &text_len);
-                    /* First hit is "text_delta" — skip it */
-                    if (text && text_len > 4 && text[4] == '_') {
-                        text = json_find_str(text + text_len + 1, "text", &text_len);
-                    }
-                    /* Second hit might be delta.type="text_delta" again — skip */
-                    if (text && text_len > 4 && text[4] == '_') {
-                        text = json_find_str(text + text_len + 1, "text", &text_len);
-                    }
-                    if (text && text_len > 0) {
-                        /* Unescape the text in place to a temp buffer */
-                        char decoded[2048];
-                        int dlen = 0;
-                        for (int j = 0; j < text_len && dlen < (int)sizeof(decoded) - 1; j++) {
-                            if (text[j] == '\\' && j + 1 < text_len) {
-                                j++;
-                                switch (text[j]) {
-                                    case 'n': decoded[dlen++] = '\n'; break;
-                                    case 'r': decoded[dlen++] = '\r'; break;
-                                    case 't': decoded[dlen++] = '\t'; break;
-                                    case '"': decoded[dlen++] = '"'; break;
-                                    case '\\': decoded[dlen++] = '\\'; break;
-                                    default: decoded[dlen++] = text[j]; break;
+                    /* Find delta type (second "type" field) */
+                    int dt_len = 0;
+                    const char *dt = json_find_str(type + type_len, "type", &dt_len);
+
+                    if (dt && dt_len == 10 && dt[0] == 't' && dt[5] == 'd') {
+                        /* "text_delta" — extract text */
+                        int text_len = 0;
+                        const char *text = json_find_str(dt + dt_len, "text", &text_len);
+                        if (text && text_len > 0) {
+                            char decoded[2048];
+                            int dlen = json_unescape(text, text_len,
+                                                      decoded, (int)sizeof(decoded));
+                            sc->total_len += dlen;
+                            if (sc->callback) {
+                                if (sc->callback(decoded, (uint32_t)dlen, sc->ctx) < 0) {
+                                    sc->error = true;
+                                    return -1;
                                 }
-                            } else {
-                                decoded[dlen++] = text[j];
                             }
                         }
-
-                        sc->total_len += dlen;
-                        if (sc->callback) {
-                            if (sc->callback(decoded, (uint32_t)dlen, sc->ctx) < 0) {
-                                sc->error = true;
-                                return -1;
+                    } else if (dt && dt_len == 16 && dt[0] == 'i' && dt[6] == 'j') {
+                        /* "input_json_delta" — accumulate tool input (X-CL3) */
+                        if (sc->tool_state && sc->tool_state->cur_tool >= 0) {
+                            int pj_len = 0;
+                            const char *pj = json_find_str(json, "partial_json", &pj_len);
+                            if (pj && pj_len > 0) {
+                                claude_tool_use_t *tu =
+                                    &sc->tool_state->uses[sc->tool_state->cur_tool];
+                                int dlen = json_unescape(pj, pj_len,
+                                    tu->input_json + tu->input_len,
+                                    CLAUDE_MAX_TOOL_INPUT - (int)tu->input_len);
+                                tu->input_len += (uint32_t)dlen;
                             }
+                        }
+                    }
+                }
+
+                /* ── content_block_start (type_len=19, pos14='s') ── */
+                else if (type && type_len == 19 &&
+                         type[0] == 'c' && type[8] == 'b' &&
+                         type[14] == 's' && type[18] == 't') {
+                    if (sc->tool_state) {
+                        /* Check inner type for "tool_use" */
+                        int t2_len = 0;
+                        const char *t2 = json_find_str(type + type_len, "type", &t2_len);
+                        if (t2 && t2_len == 8 && t2[0] == 't' && t2[5] == 'u') {
+                            /* "tool_use" — extract id and name */
+                            int idx = sc->tool_state->count;
+                            if (idx < CLAUDE_MAX_TOOL_USES) {
+                                int id_len = 0, nm_len = 0;
+                                const char *id = json_find_str(json, "id", &id_len);
+                                const char *nm = json_find_str(json, "name", &nm_len);
+                                if (id && id_len < CLAUDE_MAX_TOOL_ID) {
+                                    cmemcpy(sc->tool_state->uses[idx].id, id, id_len);
+                                    sc->tool_state->uses[idx].id[id_len] = '\0';
+                                }
+                                if (nm && nm_len < CLAUDE_MAX_TOOL_NAME) {
+                                    cmemcpy(sc->tool_state->uses[idx].name, nm, nm_len);
+                                    sc->tool_state->uses[idx].name[nm_len] = '\0';
+                                }
+                                sc->tool_state->uses[idx].input_len = 0;
+                                sc->tool_state->cur_tool = idx;
+                                sc->tool_state->count++;
+                            }
+                        }
+                    }
+                }
+
+                /* ── content_block_stop (type_len=18) ── */
+                else if (type && type_len == 18 &&
+                         type[0] == 'c' && type[14] == 's' && type[17] == 'p') {
+                    if (sc->tool_state)
+                        sc->tool_state->cur_tool = -1;
+                }
+
+                /* ── message_delta (type_len=13) — stop_reason ── */
+                else if (type && type_len == 13 &&
+                         type[0] == 'm' && type[7] == '_') {
+                    if (sc->tool_state) {
+                        int sr_len = 0;
+                        const char *sr = json_find_str(json, "stop_reason", &sr_len);
+                        if (sr && sr_len == 8 && sr[0] == 't' && sr[5] == 'u') {
+                            sc->tool_state->stop_for_tools = true;
                         }
                     }
                 }
@@ -287,9 +386,11 @@ static int sse_body_cb(const void *data, uint32_t len, void *ctx)
 
 /* ── Public API ──────────────────────────────────────────────── */
 
-int claude_chat(const claude_msg_t *messages, int msg_count,
-                const char *model, int max_tokens,
-                claude_stream_cb callback, void *ctx)
+/* Internal chat with optional tools + tool state */
+static int claude_chat_ex(const claude_msg_t *messages, int msg_count,
+                           const char *model, int max_tokens,
+                           claude_stream_cb callback, void *ctx,
+                           bool with_tools, claude_tool_state_t *tool_state)
 {
     if (!api_key_set) {
         serial_puts("[CLAUDE] No API key set\n");
@@ -298,12 +399,14 @@ int claude_chat(const claude_msg_t *messages, int msg_count,
 
     /* Build request JSON — scale buffer with message count */
     uint32_t json_buf_size = 4096 + (uint32_t)msg_count * 2048;
+    if (with_tools) json_buf_size += 1024;  /* Tools definition */
     char *json_buf = (char *)kmalloc(json_buf_size);
     if (!json_buf) return -1;
 
     int json_len = build_request_json(json_buf, (int)json_buf_size,
                                        messages, msg_count,
-                                       model, max_tokens, true);
+                                       model, max_tokens, true,
+                                       with_tools);
 
     serial_puts("[CLAUDE] Request: ");
     serial_putdec((uint64_t)json_len);
@@ -383,12 +486,12 @@ int claude_chat(const claude_msg_t *messages, int msg_count,
     }
 
     /* Parse streaming response */
-    /* Reset SSE line buffer */
     sse_ctx_t sc = {
         .callback = callback,
         .ctx = ctx,
         .total_len = 0,
         .error = false,
+        .tool_state = tool_state,
     };
 
     /* Reset static line buffer in sse_body_cb */
@@ -405,6 +508,16 @@ int claude_chat(const claude_msg_t *messages, int msg_count,
     kfree(session);
 
     return sc.error ? -1 : sc.total_len;
+}
+
+/* ── Public API (wraps internal) ─────────────────────────────── */
+
+int claude_chat(const claude_msg_t *messages, int msg_count,
+                const char *model, int max_tokens,
+                claude_stream_cb callback, void *ctx)
+{
+    return claude_chat_ex(messages, msg_count, model, max_tokens,
+                           callback, ctx, false, NULL);
 }
 
 /* ── Convenience: single-turn ────────────────────────────────── */
@@ -534,6 +647,399 @@ int claude_session_send(claude_session_t *s, const char *user_msg,
                          session_stream_cb, &sc);
 
     /* Save response to history */
+    s->pending_response[s->response_pos] = '\0';
+    cmemcpy(s->assistant[cur], s->pending_response,
+             s->response_pos < CLAUDE_MAX_MSG_LEN ? s->response_pos + 1
+                                                    : CLAUDE_MAX_MSG_LEN);
+    s->assistant[cur][CLAUDE_MAX_MSG_LEN - 1] = '\0';
+    s->turn_count = cur + 1;
+
+    return r;
+}
+
+/* ══════════════════════════════════════════════════════════════
+ *  X-CL3: Tool Use — File Read/Write/List
+ * ══════════════════════════════════════════════════════════════ */
+
+/* Extract JSON string value by key from tool input (unescaped) */
+static int tool_get_param(const char *input_json, const char *key,
+                           char *out, int out_max)
+{
+    int vlen = 0;
+    const char *v = json_find_str(input_json, key, &vlen);
+    if (!v || vlen <= 0) return -1;
+    int dlen = json_unescape(v, vlen, out, out_max);
+    out[dlen] = '\0';
+    return dlen;
+}
+
+/* Tool: file_read — read file from OsitoFS */
+static int tool_file_read(const char *input_json, char *result, int max_len)
+{
+    char path[128];
+    if (tool_get_param(input_json, "path", path, sizeof(path)) < 0) {
+        int p = 0;
+        p = jp(result, p, max_len, "Error: missing 'path' parameter");
+        return p;
+    }
+
+    void *file = osfs2_find(path);
+    if (!file) {
+        int p = 0;
+        p = jp(result, p, max_len, "Error: file not found: ");
+        p = jp(result, p, max_len, path);
+        return p;
+    }
+
+    uint64_t fsize = osfs2_file_size(file);
+    uint32_t read_size = (uint32_t)(fsize < (uint64_t)(max_len - 1) ? fsize : (uint64_t)(max_len - 1));
+
+    if (osfs2_read(file, 0, result, read_size) < 0) {
+        int p = 0;
+        p = jp(result, p, max_len, "Error: read failed for: ");
+        p = jp(result, p, max_len, path);
+        return p;
+    }
+
+    result[read_size] = '\0';
+    serial_puts("[TOOL] file_read: ");
+    serial_puts(path);
+    serial_puts(" (");
+    serial_putdec(read_size);
+    serial_puts(" bytes)\n");
+    return (int)read_size;
+}
+
+/* Tool: file_write — write/create file on OsitoFS */
+static int tool_file_write(const char *input_json, char *result, int max_len)
+{
+    char path[128];
+    if (tool_get_param(input_json, "path", path, sizeof(path)) < 0) {
+        int p = 0;
+        p = jp(result, p, max_len, "Error: missing 'path' parameter");
+        return p;
+    }
+
+    /* Get content — may be large, allocate temp buffer */
+    char *content = (char *)kmalloc(CLAUDE_MAX_TOOL_RESULT);
+    if (!content) {
+        int p = 0;
+        p = jp(result, p, max_len, "Error: out of memory");
+        return p;
+    }
+
+    int clen = tool_get_param(input_json, "content", content, CLAUDE_MAX_TOOL_RESULT);
+    if (clen < 0) {
+        kfree(content);
+        int p = 0;
+        p = jp(result, p, max_len, "Error: missing 'content' parameter");
+        return p;
+    }
+
+    /* Find or create file */
+    void *file = osfs2_find(path);
+    if (!file) {
+        file = osfs2_create(path, (uint64_t)clen);
+        if (!file) {
+            kfree(content);
+            int p = 0;
+            p = jp(result, p, max_len, "Error: failed to create file: ");
+            p = jp(result, p, max_len, path);
+            return p;
+        }
+    }
+
+    if (osfs2_write(file, 0, content, (uint64_t)clen) < 0) {
+        kfree(content);
+        int p = 0;
+        p = jp(result, p, max_len, "Error: write failed for: ");
+        p = jp(result, p, max_len, path);
+        return p;
+    }
+
+    kfree(content);
+
+    int p = 0;
+    p = jp(result, p, max_len, "Wrote ");
+    p = jp_int(result, p, max_len, clen);
+    p = jp(result, p, max_len, " bytes to ");
+    p = jp(result, p, max_len, path);
+
+    serial_puts("[TOOL] file_write: ");
+    serial_puts(path);
+    serial_puts(" (");
+    serial_putdec((uint64_t)clen);
+    serial_puts(" bytes)\n");
+    return p;
+}
+
+/* Tool: file_list — list all files on OsitoFS */
+static int tool_file_list(char *result, int max_len)
+{
+    uint32_t count = osfs2_file_count();
+    int p = 0;
+    p = jp(result, p, max_len, "Files on OsitoFS (");
+    p = jp_int(result, p, max_len, (int)count);
+    p = jp(result, p, max_len, " files):\n");
+
+    for (uint32_t i = 0; i < count && p < max_len - 64; i++) {
+        void *file = osfs2_file_at(i);
+        if (!file) break;
+        /* File name is at offset 0 of osfs2_file_t */
+        const char *name = (const char *)file;
+        uint64_t size = osfs2_file_size(file);
+        p = jp(result, p, max_len, "  ");
+        p = jp(result, p, max_len, name);
+        p = jp(result, p, max_len, "  (");
+        if (size >= 1024 * 1024) {
+            p = jp_int(result, p, max_len, (int)(size / (1024 * 1024)));
+            p = jp(result, p, max_len, " MB)\n");
+        } else if (size >= 1024) {
+            p = jp_int(result, p, max_len, (int)(size / 1024));
+            p = jp(result, p, max_len, " KB)\n");
+        } else {
+            p = jp_int(result, p, max_len, (int)size);
+            p = jp(result, p, max_len, " B)\n");
+        }
+    }
+
+    serial_puts("[TOOL] file_list: ");
+    serial_putdec(count);
+    serial_puts(" files\n");
+    return p;
+}
+
+/* Execute a single tool and return result length */
+static int tool_execute(const claude_tool_use_t *tu, char *result, int max_len)
+{
+    result[0] = '\0';
+
+    if (tu->name[0] == 'f' && tu->name[5] == 'r')  /* file_read */
+        return tool_file_read(tu->input_json, result, max_len);
+    if (tu->name[0] == 'f' && tu->name[5] == 'w')  /* file_write */
+        return tool_file_write(tu->input_json, result, max_len);
+    if (tu->name[0] == 'f' && tu->name[5] == 'l')  /* file_list */
+        return tool_file_list(result, max_len);
+
+    int p = 0;
+    p = jp(result, p, max_len, "Error: unknown tool: ");
+    p = jp(result, p, max_len, tu->name);
+    return p;
+}
+
+/* Build assistant content JSON: [{"type":"text","text":"..."},{"type":"tool_use",...}] */
+static int build_assistant_content(const char *text, uint32_t text_len,
+                                    const claude_tool_state_t *ts,
+                                    char *buf, int buf_size)
+{
+    int p = 0, mx = buf_size;
+    p = jp(buf, p, mx, "[");
+
+    /* Text block (if any) */
+    if (text_len > 0) {
+        p = jp(buf, p, mx, "{\"type\":\"text\",\"text\":");
+        /* Need a null-terminated copy for jp_str */
+        char *tcopy = (char *)kmalloc(text_len + 1);
+        if (tcopy) {
+            cmemcpy(tcopy, text, text_len);
+            tcopy[text_len] = '\0';
+            p = jp_str(buf, p, mx, tcopy);
+            kfree(tcopy);
+        } else {
+            p = jp_str(buf, p, mx, "...");
+        }
+        p = jp(buf, p, mx, "}");
+    }
+
+    /* Tool use blocks */
+    for (int i = 0; i < ts->count; i++) {
+        if (text_len > 0 || i > 0) p = jp(buf, p, mx, ",");
+        p = jp(buf, p, mx, "{\"type\":\"tool_use\",\"id\":");
+        p = jp_str(buf, p, mx, ts->uses[i].id);
+        p = jp(buf, p, mx, ",\"name\":");
+        p = jp_str(buf, p, mx, ts->uses[i].name);
+        p = jp(buf, p, mx, ",\"input\":");
+        /* Input is already valid JSON */
+        if (ts->uses[i].input_len > 0) {
+            p = jp(buf, p, mx, ts->uses[i].input_json);
+        } else {
+            p = jp(buf, p, mx, "{}");
+        }
+        p = jp(buf, p, mx, "}");
+    }
+
+    p = jp(buf, p, mx, "]");
+    if (p < mx) buf[p] = '\0';
+    return p;
+}
+
+/* Build tool_result content JSON: [{"type":"tool_result","tool_use_id":"...","content":"..."},...] */
+static int build_tool_result_content(const claude_tool_state_t *ts,
+                                      char **results, int *result_lens,
+                                      char *buf, int buf_size)
+{
+    int p = 0, mx = buf_size;
+    p = jp(buf, p, mx, "[");
+
+    for (int i = 0; i < ts->count; i++) {
+        if (i > 0) p = jp(buf, p, mx, ",");
+        p = jp(buf, p, mx, "{\"type\":\"tool_result\",\"tool_use_id\":");
+        p = jp_str(buf, p, mx, ts->uses[i].id);
+        p = jp(buf, p, mx, ",\"content\":");
+        /* Truncate result for safety */
+        char *r = results[i];
+        r[result_lens[i]] = '\0';
+        p = jp_str(buf, p, mx, r);
+        p = jp(buf, p, mx, "}");
+    }
+
+    p = jp(buf, p, mx, "]");
+    if (p < mx) buf[p] = '\0';
+    return p;
+}
+
+/* Session send with tool support (X-CL3) */
+int claude_session_send_with_tools(claude_session_t *s, const char *user_msg,
+                                    claude_stream_cb callback, void *ctx)
+{
+    if (!s) return -1;
+
+    /* Sliding window (same as claude_session_send) */
+    if (s->turn_count >= CLAUDE_SESSION_MAX_TURNS) {
+        for (int i = 0; i < CLAUDE_SESSION_MAX_TURNS - 1; i++) {
+            cmemcpy(s->user[i], s->user[i + 1], CLAUDE_MAX_MSG_LEN);
+            cmemcpy(s->assistant[i], s->assistant[i + 1], CLAUDE_MAX_MSG_LEN);
+        }
+        s->turn_count = CLAUDE_SESSION_MAX_TURNS - 1;
+    }
+
+    /* Save user message */
+    int cur = s->turn_count;
+    uint32_t ulen = cstrlen(user_msg);
+    if (ulen >= CLAUDE_MAX_MSG_LEN) ulen = CLAUDE_MAX_MSG_LEN - 1;
+    cmemcpy(s->user[cur], user_msg, ulen);
+    s->user[cur][ulen] = '\0';
+
+    /* Build initial message array from history */
+    claude_msg_t messages[CLAUDE_MAX_MESSAGES];
+    int msg_count = 0;
+
+    for (int i = 0; i <= cur && msg_count < CLAUDE_MAX_MESSAGES - 4; i++) {
+        messages[msg_count].role = "user";
+        messages[msg_count].content = s->user[i];
+        msg_count++;
+
+        if (i < cur) {
+            messages[msg_count].role = "assistant";
+            messages[msg_count].content = s->assistant[i];
+            msg_count++;
+        }
+    }
+
+    s->response_pos = 0;
+
+    session_stream_ctx_t sc = {
+        .session  = s,
+        .user_cb  = callback,
+        .user_ctx = ctx,
+    };
+
+    /* Tool state */
+    claude_tool_state_t ts;
+    cmemset(&ts, 0, sizeof(ts));
+    ts.cur_tool = -1;
+
+    int r = claude_chat_ex(messages, msg_count, NULL, 2048,
+                            session_stream_cb, &sc, true, &ts);
+
+    /* Tool loop — max 5 iterations */
+    int base_msg_count = msg_count;  /* Save for rebuilding */
+    char *asst_content = NULL;
+    char *tr_content = NULL;
+
+    for (int iter = 0; iter < 5 && ts.stop_for_tools && ts.count > 0; iter++) {
+        serial_puts("[CLAUDE] Tool use round ");
+        serial_putdec((uint64_t)(iter + 1));
+        serial_puts(": ");
+        serial_putdec((uint64_t)ts.count);
+        serial_puts(" tool(s)\n");
+
+        /* Show tool names to user */
+        for (int t = 0; t < ts.count; t++) {
+            if (callback) {
+                callback("\n[tool: ", 8, ctx);
+                callback(ts.uses[t].name, cstrlen(ts.uses[t].name), ctx);
+                callback("]\n", 2, ctx);
+            }
+        }
+
+        /* Execute tools */
+        char *results[CLAUDE_MAX_TOOL_USES];
+        int result_lens[CLAUDE_MAX_TOOL_USES];
+        bool exec_ok = true;
+
+        for (int t = 0; t < ts.count; t++) {
+            results[t] = (char *)kmalloc(CLAUDE_MAX_TOOL_RESULT);
+            if (!results[t]) { exec_ok = false; break; }
+            ts.uses[t].input_json[ts.uses[t].input_len] = '\0';
+            result_lens[t] = tool_execute(&ts.uses[t], results[t],
+                                           CLAUDE_MAX_TOOL_RESULT - 1);
+        }
+
+        if (!exec_ok) {
+            for (int t = 0; t < ts.count; t++)
+                if (results[t]) kfree(results[t]);
+            break;
+        }
+
+        /* Build assistant content (text + tool_use blocks) */
+        if (asst_content) kfree(asst_content);
+        asst_content = (char *)kmalloc(16384);
+        if (!asst_content) {
+            for (int t = 0; t < ts.count; t++) kfree(results[t]);
+            break;
+        }
+        s->pending_response[s->response_pos] = '\0';
+        build_assistant_content(s->pending_response, s->response_pos,
+                                 &ts, asst_content, 16384);
+
+        /* Build tool_result content */
+        if (tr_content) kfree(tr_content);
+        tr_content = (char *)kmalloc(16384);
+        if (!tr_content) {
+            for (int t = 0; t < ts.count; t++) kfree(results[t]);
+            break;
+        }
+        build_tool_result_content(&ts, results, result_lens, tr_content, 16384);
+
+        for (int t = 0; t < ts.count; t++) kfree(results[t]);
+
+        /* Rebuild messages: history + assistant (tool_use) + user (tool_result) */
+        msg_count = base_msg_count;
+        if (msg_count < CLAUDE_MAX_MESSAGES - 2) {
+            messages[msg_count].role = "assistant";
+            messages[msg_count].content = asst_content;
+            msg_count++;
+            messages[msg_count].role = "user";
+            messages[msg_count].content = tr_content;
+            msg_count++;
+        }
+
+        /* Reset for next round */
+        cmemset(&ts, 0, sizeof(ts));
+        ts.cur_tool = -1;
+        s->response_pos = 0;
+
+        if (callback) callback("\nClaude: ", 9, ctx);
+
+        r = claude_chat_ex(messages, msg_count, NULL, 2048,
+                            session_stream_cb, &sc, true, &ts);
+    }
+
+    if (asst_content) kfree(asst_content);
+    if (tr_content) kfree(tr_content);
+
+    /* Save final response to history */
     s->pending_response[s->response_pos] = '\0';
     cmemcpy(s->assistant[cur], s->pending_response,
              s->response_pos < CLAUDE_MAX_MSG_LEN ? s->response_pos + 1

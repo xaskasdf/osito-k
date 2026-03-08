@@ -409,3 +409,17 @@ bool osfs2_is_mounted(void)  { return mounted; }
 uint32_t osfs2_file_count(void) { return mounted ? superblock.file_count : 0; }
 const char *osfs2_label(void) { return mounted ? superblock.label : ""; }
 uint64_t osfs2_file_size(osfs2_file_t *file) { return file ? file->size : 0; }
+
+/* Get nth valid file (0-indexed). Returns NULL if out of range. */
+osfs2_file_t *osfs2_file_at(uint32_t index)
+{
+    if (!mounted || !file_table) return NULL;
+    uint32_t count = 0;
+    for (uint32_t i = 0; i < OSFS2_MAX_FILES; i++) {
+        if (file_table[i].flags & OSFS2_FLAG_VALID) {
+            if (count == index) return &file_table[i];
+            count++;
+        }
+    }
+    return NULL;
+}

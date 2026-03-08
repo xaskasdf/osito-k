@@ -90,12 +90,14 @@ extern int  claude_chat(const void *messages, int msg_count,
                         const char *model, int max_tokens,
                         int (*callback)(const char *, uint32_t, void *), void *ctx);
 
-/* Claude Session (X-CL2) — opaque pointer, managed by claude.c */
+/* Claude Session (X-CL2/X-CL3) — opaque pointer, managed by claude.c */
 extern void *claude_session_new(void);
 extern void  claude_session_free(void *s);
 extern void  claude_session_clear(void *s);
 extern int   claude_session_send(void *s, const char *user_msg,
                                   int (*callback)(const char *, uint32_t, void *), void *ctx);
+extern int   claude_session_send_with_tools(void *s, const char *user_msg,
+                                             int (*callback)(const char *, uint32_t, void *), void *ctx);
 
 /* Tokenizer */
 extern char g_tokenizer[];  /* tokenizer_t (opaque) */
@@ -916,7 +918,7 @@ static void cmd_claude(int argc, char *argv[])
 
         sh_puts_color("\nClaude: ", 0x00FF8800);
 
-        int r = claude_session_send(session, line, ask_stream_cb, NULL);
+        int r = claude_session_send_with_tools(session, line, ask_stream_cb, NULL);
         if (r < 0) {
             sh_puts_color("\n[error]\n", 0x00FF0000);
         } else {

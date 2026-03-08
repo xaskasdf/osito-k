@@ -351,6 +351,7 @@ Tasks:   idle, input, shell (3 of 8 slots used)
 | **X-NET5** | **HTTP client** (GET/POST over HTTPS, chunked transfer-encoding, streaming body, curl command) | Done |
 | **X-CL1** | **Claude API client** (Messages API, JSON builder, SSE streaming, apikey/ask commands) | Done |
 | **X-CL2** | **Claude REPL** (multi-turn conversation, session history, sliding window, `claude` shell command) | Done |
+| **X-CL3** | **Tool use: file read/write** (Anthropic tool_use protocol, SSE tool parsing, file_read/write/list, tool loop) | Done |
 | **X-NET2** | **TCP stack** (client-only, 3-way handshake, send/recv, FIN close, tcptest shell command) | Done |
 | **X-NET3** | **DNS resolver** (UDP query to SLIRP DNS, A record parse, resolve shell command) | Done |
 | **X-TOK1** | **BPE tokenizer** (Llama 3 BPE encode/decode, GGUF vocab extraction, FNV-1a hash, greedy+merge) | Done |
@@ -762,6 +763,17 @@ Multi-turn interactive conversation with Claude from OsitoK shell.
 - **Shell command**: `claude` — enters REPL mode with `you>` prompt. Builtins: `quit` (exit), `clear` (reset history), Ctrl+D (exit). Reuses `term_readline()` for input with editing + history.
 - **Integration**: `ask` command remains for single-turn. `claude` is the multi-turn REPL. Both use the same streaming callback for output.
 - **Files**: `arch/x86/kernel/claude.h` (claude_session_t, session API), `arch/x86/kernel/claude.c` (session_send, sliding window), `arch/x86/kernel/shell.c` (cmd_claude REPL loop)
+
+### X-CL3: Tool Use — File Read/Write/List
+Claude can read, write, and list files on OsitoFS via Anthropic tool_use protocol. Fully integrated into the claude REPL.
+- **Tools**: `file_read` (read file by name), `file_write` (create/overwrite file with content), `file_list` (list all files with sizes).
+- **SSE parsing extensions**: Detects `content_block_start` (type `tool_use` → extract `id`, `name`), `content_block_delta` (type `input_json_delta` → accumulate partial JSON), `content_block_stop` (reset cur_tool), `message_delta` (detect `stop_reason: "tool_use"`).
+- **Tool execution**: `tool_execute()` dispatches by name to `tool_file_read/write/list`. Uses OsitoFS API (`osfs2_find`, `osfs2_read`, `osfs2_create`, `osfs2_write`, `osfs2_file_at`).
+- **Tool loop**: Up to 5 iterations. After each tool_use response: execute tools → build assistant content JSON (text + tool_use blocks) → build user tool_result JSON → re-request with full history.
+- **Raw JSON content**: Messages with content starting with `[` are embedded as raw JSON arrays (for tool_use/tool_result blocks). Regular string content is quoted as before.
+- **Request builder**: `build_request_json()` now accepts `with_tools` flag to append tools definitions. `claude_chat_ex()` internal function accepts tools flag and `claude_tool_state_t *`.
+- **OsitoFS accessor**: Added `osfs2_file_at(index)` to iterate files by index for `file_list` tool.
+- **Files**: `arch/x86/kernel/claude.h` (claude_tool_state_t, tool use types), `arch/x86/kernel/claude.c` (SSE parser, tool execution, tool loop), `arch/x86/fs/ositofs2.c` (osfs2_file_at)
 
 ### X-TOK1: BPE Tokenizer
 Byte-pair encoding tokenizer for Llama 3 models. Ported from xasko's C++ tiktoken (reason_agent/tools/tiktoken.cpp).
