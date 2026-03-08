@@ -1,20 +1,19 @@
 /*
- * OsitoK x86-64 — GPU-Accelerated Llama Inference (X40)
+ * OsitoK x86-64 — GPU-Accelerated Llama Inference (X40 + X-INF1/INF2)
  *
  * Orchestration layer for hybrid GPU/CPU forward pass.
- * Dispatches tensor operations to GPU when SASS kernels are available,
- * falls back to CPU tensor.h primitives otherwise.
  *
- * Current GPU kernels: vec_add_f32 (256 elements max per dispatch)
- * Future kernels:      matvec_q4_0, rmsnorm, softmax, silu, rope, vec_mul
+ * Two modes:
+ *   VRAM-resident (X-INF2): Activation vectors stay in VRAM between ops.
+ *     Only weights are uploaded per-dispatch, activations persist.
+ *     Requires all core kernels available (matvec, rmsnorm, silu_mul, rope).
+ *     CPU attention loop downloads q/k/v, uploads xb2 output.
  *
- * Architecture:
- *   - Weights stay in system RAM (too large for VRAM buffer region)
- *   - Activation vectors uploaded to VRAM for GPU ops, downloaded after
- *   - PRAMIN transfer overhead dominates for small vectors — GPU dispatch
- *     becomes beneficial only with DMA (CE) transfers or large kernels
- *   - When matvec_q4_0 SASS kernel is compiled, the compute-bound
- *     bottleneck (~90% of forward pass) moves to GPU
+ *   Host-dispatch (X-INF1): Per-op upload/dispatch/download with CPU fallback.
+ *     Works with any subset of GPU kernels. Slower due to PRAMIN round trips.
+ *
+ * Weights stay in system RAM (Q4_0, too large for VRAM).
+ * KV cache stays in system RAM (grows with sequence length).
  */
 
 #ifndef OSITOK_GPU_INFERENCE_H
@@ -33,18 +32,36 @@ typedef struct {
     bool softmax;           /* max + exp + sum + divide */
     bool silu;              /* SiLU activation */
     bool rope;              /* Rotary position embedding */
+    bool add_inplace;       /* a[i] += b[i] */
 } gpu_kernel_table_t;
+
+/* ── VRAM-Resident Activation Buffers (X-INF2) ──────── */
+
+typedef struct {
+    uint64_t x;      /* [dim] main hidden state — persists across layers */
+    uint64_t xb;     /* [dim] post-norm scratch */
+    uint64_t xb2;    /* [dim] attention output */
+    uint64_t q;      /* [dim] query projection */
+    uint64_t k;      /* [kv_dim] key projection */
+    uint64_t v;      /* [kv_dim] value projection */
+    uint64_t hb;     /* [ffn_dim] FFN gate output */
+    uint64_t hb2;    /* [ffn_dim] FFN up output */
+} gpu_vram_acts_t;
 
 /* ── GPU Inference State ──────────────────────────────── */
 
 typedef struct {
     llama_state_t      *cpu;        /* CPU inference state (weights, KV, scratch) */
 
-    /* VRAM scratch for GPU-dispatched vector ops */
+    /* VRAM scratch for host-dispatch mode (X-INF1) */
     uint64_t            vram_a;     /* Input buffer A */
     uint64_t            vram_b;     /* Input buffer B */
     uint64_t            vram_out;   /* Output buffer */
     uint32_t            vram_buf_size; /* Size of each buffer in bytes */
+
+    /* VRAM-resident activations (X-INF2) */
+    gpu_vram_acts_t     acts;       /* Persistent activation buffers */
+    bool                vram_resident; /* true = VRAM path, false = host path */
 
     /* Dispatch table */
     gpu_kernel_table_t  kernels;

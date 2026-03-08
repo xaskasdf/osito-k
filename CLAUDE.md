@@ -354,6 +354,7 @@ Tasks:   idle, input, shell (3 of 8 slots used)
 | **X-NET3** | **DNS resolver** (UDP query to SLIRP DNS, A record parse, resolve shell command) | Done |
 | **X-TOK1** | **BPE tokenizer** (Llama 3 BPE encode/decode, GGUF vocab extraction, FNV-1a hash, greedy+merge) | Done |
 | **X-INF1** | **GPU inference dispatch** (matvec_q4_0 + rmsnorm + silu_mul + rope + vec_add on GPU, VRAM save/restore, CPU fallback) | Done |
+| **X-INF2** | **VRAM-resident activations** (activations stay in VRAM between ops, only weights uploaded per dispatch, zero-transfer for silu_mul/rope/residual) | Done |
 
 > Full GPU roadmap (X27-X40 + contingency): see [docs/x86-gpu-roadmap.md](docs/x86-gpu-roadmap.md)
 > Full OS roadmap (Tier 0-5): see [docs/os-selfhost-roadmap.md](docs/os-selfhost-roadmap.md)
@@ -772,6 +773,17 @@ Full GPU dispatch for the Llama transformer forward pass. 6 of 7 operations disp
 - **Dispatch per token** (Llama 3.2 1B, 16 layers): 112 matvec_q4_0 + 49 rmsnorm + 16 silu_mul + 16 rope + 32 vec_add = 225 GPU dispatches/token.
 - **GMMU**: Identity map expanded 8→24MB (kernels 4MB + tensor buffers 16MB + headroom). VRAM buffer region expanded 4→16MB.
 - **Files**: `arch/x86/drivers/gpu_inference.c` (dispatch wrappers + forward pass), `arch/x86/drivers/gpu_tensor.h` (VRAM size), `arch/x86/drivers/gmmu.c` (identity map size)
+
+### X-INF2: VRAM-Resident Activations
+Activations stay in VRAM between operations, eliminating per-op activation transfers. Two forward pass modes selected at init based on kernel availability.
+- **VRAM-resident mode**: Requires all core kernels (matvec_q4_0, rmsnorm, silu_mul, rope, add_inplace). Activation vectors (x, xb, xb2, q, k, v, hb, hb2) allocated in VRAM at init (~116KB for Llama 3.2 1B). Persist across layers.
+- **Data flow**: Embed token on CPU → upload x to VRAM once → run entire transformer chain in VRAM → download final x for logits. Per layer: download q/k/v for CPU attention (12KB), upload xb2 attention output (8KB). All other activations stay in VRAM.
+- **Zero-transfer ops**: `silu_mul` (hb,hb2 already in VRAM), `rope` (q,k already in VRAM), `add_inplace` residuals (x,xb already in VRAM). ~200-300KB saved per layer.
+- **VRAM-native dispatch helpers**: `gpu_matvec_vram()` (upload weights only, VRAM activations), `gpu_rmsnorm_vram()` (upload weight only), `gpu_silu_mul_vram()`, `gpu_rope_vram()`, `gpu_add_inplace_vram()` — all use save/restore for CB0 temp allocations.
+- **Host-dispatch fallback (X-INF1)**: When any core kernel is missing, per-op upload/dispatch/download with CPU fallback. `gpu_llama_forward()` dispatches to VRAM or host path automatically.
+- **Logits**: Vocab projection (128K×2048 = ~141MB Q4_0) too large for VRAM — always CPU. Final x downloaded from VRAM first.
+- **add_inplace kernel**: Newly detected in init. Replaces vec_add for residual connections (a[i]+=b[i], one less VRAM buffer needed).
+- **Files**: `arch/x86/drivers/gpu_inference.h` (gpu_vram_acts_t, vram_resident flag), `arch/x86/drivers/gpu_inference.c` (VRAM dispatch + forward_vram + forward_host)
 
 ### X27: Falcon PIO Load
 Programmed I/O access to Falcon IMEM/DMEM via IMEMC/IMEMD registers.

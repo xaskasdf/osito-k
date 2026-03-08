@@ -474,6 +474,10 @@ int gpu_llama_init(gpu_llama_state_t *gs, llama_state_t *cpu_state)
     if (k_rope && k_rope->uploaded)
         gs->kernels.rope = true;
 
+    sass_kernel_t *k_addinp = sass_get_kernel("add_inplace");
+    if (k_addinp && k_addinp->uploaded)
+        gs->kernels.add_inplace = true;
+
     /* Count available GPU kernels */
     uint32_t gpu_count = 0;
     if (gs->kernels.vec_add)      gpu_count++;
@@ -482,18 +486,22 @@ int gpu_llama_init(gpu_llama_state_t *gs, llama_state_t *cpu_state)
     if (gs->kernels.softmax)      gpu_count++;
     if (gs->kernels.silu)         gpu_count++;
     if (gs->kernels.rope)         gpu_count++;
+    if (gs->kernels.add_inplace)  gpu_count++;
 
     serial_puts("[GPU_INF] GPU kernels: ");
     serial_putdec(gpu_count);
-    serial_puts("/7, CPU fallback: ");
-    serial_putdec(7 - gpu_count);
-    serial_puts("/7\n");
+    serial_puts("/8, CPU fallback: ");
+    serial_putdec(8 - gpu_count);
+    serial_puts("/8\n");
 
-    /* Allocate VRAM scratch buffers for GPU ops.
+    /* Allocate VRAM scratch buffers for host-dispatch mode (X-INF1).
      * Each buffer holds max(dim, ffn_dim) floats.
      * dim=2048 → 8KB, ffn_dim=8192 → 32KB. Use ffn_dim as worst case. */
-    uint32_t max_dim = cpu_state->ffn_dim;
-    if (cpu_state->dim > max_dim) max_dim = cpu_state->dim;
+    uint32_t dim = cpu_state->dim;
+    uint32_t kv_dim = cpu_state->kv_dim;
+    uint32_t ffn_dim = cpu_state->ffn_dim;
+    uint32_t max_dim = ffn_dim;
+    if (dim > max_dim) max_dim = dim;
     gs->vram_buf_size = max_dim * sizeof(float);
 
     gpu_tensor_state_t *ts = gpu_tensor_get_state();
@@ -512,11 +520,47 @@ int gpu_llama_init(gpu_llama_state_t *gs, llama_state_t *cpu_state)
             serial_puts("[GPU_INF] VRAM scratch alloc failed, GPU ops disabled\n");
             memset(&gs->kernels, 0, sizeof(gs->kernels));
         }
+
+        /* Allocate VRAM-resident activation buffers (X-INF2).
+         * Llama 3.2 1B: dim=2048, kv_dim=512, ffn_dim=8192.
+         * Total: ~116KB. Persists across layers — no per-op transfers. */
+        gs->acts.x   = gpu_tensor_alloc(dim * sizeof(float));
+        gs->acts.xb  = gpu_tensor_alloc(dim * sizeof(float));
+        gs->acts.xb2 = gpu_tensor_alloc(dim * sizeof(float));
+        gs->acts.q   = gpu_tensor_alloc(dim * sizeof(float));
+        gs->acts.k   = gpu_tensor_alloc(kv_dim * sizeof(float));
+        gs->acts.v   = gpu_tensor_alloc(kv_dim * sizeof(float));
+        gs->acts.hb  = gpu_tensor_alloc(ffn_dim * sizeof(float));
+        gs->acts.hb2 = gpu_tensor_alloc(ffn_dim * sizeof(float));
+
+        bool acts_ok = gs->acts.x && gs->acts.xb && gs->acts.xb2 &&
+                       gs->acts.q && gs->acts.k && gs->acts.v &&
+                       gs->acts.hb && gs->acts.hb2;
+
+        /* VRAM-resident mode requires all core kernels + activation buffers */
+        gs->vram_resident = acts_ok &&
+                            gs->kernels.matvec_q4_0 &&
+                            gs->kernels.rmsnorm &&
+                            gs->kernels.silu &&
+                            gs->kernels.rope &&
+                            gs->kernels.add_inplace;
+
+        if (acts_ok) {
+            uint32_t acts_kb = (dim * 4 + dim * 4 + dim * 4 + dim * 4 +
+                                kv_dim * 4 + kv_dim * 4 +
+                                ffn_dim * 4 + ffn_dim * 4) / 1024;
+            serial_puts("[GPU_INF] VRAM activations: ");
+            serial_putdec(acts_kb);
+            serial_puts("KB (x,xb,xb2,q,k,v,hb,hb2)\n");
+        }
     } else {
         serial_puts("[GPU_INF] GPU tensor subsystem not ready, CPU-only mode\n");
     }
 
     /* Dispatch summary */
+    serial_puts("[GPU_INF] Mode: ");
+    serial_puts(gs->vram_resident ? "VRAM-resident (X-INF2)" : "host-dispatch (X-INF1)");
+    serial_puts("\n");
     serial_puts("[GPU_INF] Dispatch plan:\n");
     serial_puts("[GPU_INF]   matvec_q4_0: ");
     serial_puts(gs->kernels.matvec_q4_0 ? "GPU (streaming)" : "CPU (AVX2)");
@@ -530,8 +574,8 @@ int gpu_llama_init(gpu_llama_state_t *gs, llama_state_t *cpu_state)
     serial_puts("[GPU_INF]   rope:        ");
     serial_puts(gs->kernels.rope ? "GPU (q+k)" : "CPU");
     serial_puts(" [16/tok]\n");
-    serial_puts("[GPU_INF]   vec_add:     ");
-    serial_puts(gs->kernels.vec_add ? "GPU (chunked)" : "CPU");
+    serial_puts("[GPU_INF]   add_inplace: ");
+    serial_puts(gs->kernels.add_inplace ? "GPU (residual)" : "CPU");
     serial_puts(" [32/tok]\n");
     serial_puts("[GPU_INF]   softmax:     CPU (per-head) [512/tok]\n");
     serial_puts("[GPU_INF]   attention:   CPU (GQA loop)\n");
@@ -539,18 +583,250 @@ int gpu_llama_init(gpu_llama_state_t *gs, llama_state_t *cpu_state)
     gs->initialized = true;
 
     fb_puts(" GPU Inf: ");
+    if (gs->vram_resident)
+        fb_puts("VRAM-resident ");
     fb_putdec(gpu_count);
-    fb_puts("/7 GPU kernels\n");
+    fb_puts("/8 kernels\n");
 
-    serial_puts("[GPU_INF] == X40 init complete ==\n");
+    serial_puts("[GPU_INF] == init complete ==\n");
     return 0;
 }
 
 /* ══════════════════════════════════════════════════════════
- *  gpu_llama_forward — Single token, hybrid GPU/CPU
+ *  VRAM-native dispatch helpers (X-INF2)
+ *
+ *  These take VRAM addresses for activations and only upload
+ *  weights from system RAM. CB0 allocations reclaimed via
+ *  save/restore.
  * ══════════════════════════════════════════════════════════ */
 
-int gpu_llama_forward(gpu_llama_state_t *gs, uint32_t token)
+/* Matvec with VRAM-resident input/output, weight uploaded from RAM */
+static int gpu_matvec_vram(uint64_t out_vram, gguf_tensor_t *tensor,
+                            uint64_t input_vram, uint32_t rows, uint32_t cols,
+                            gpu_llama_state_t *gs)
+{
+    if (tensor->type != GGML_TYPE_Q4_0) return -1;
+
+    uint32_t blocks_per_row = cols / 32;
+    uint32_t row_bytes = blocks_per_row * 18;
+    uint32_t weight_bytes = rows * row_bytes;
+
+    if (weight_bytes > 16 * 1024 * 1024) return -1;
+
+    uint64_t t0 = rdtsc_gpu();
+    uint64_t saved = vram_save();
+
+    /* Allocate temp VRAM for weights */
+    uint64_t w_vram = gpu_tensor_alloc(weight_bytes);
+    if (!w_vram) { vram_restore(saved); return -1; }
+
+    /* Upload weights from system RAM */
+    if (gpu_tensor_upload(w_vram, tensor->data, weight_bytes) < 0) {
+        vram_restore(saved); return -1;
+    }
+
+    /* Dispatch — input and output are already in VRAM */
+    int ret = gpu_gemv_q4_0_ptx(out_vram, w_vram, input_vram, rows, cols);
+    vram_restore(saved);
+
+    if (ret == 0) {
+        gs->gpu_cycles += rdtsc_gpu() - t0;
+        gs->gpu_ops++;
+    }
+    return ret;
+}
+
+/* Rmsnorm with VRAM-resident x, weight uploaded from RAM */
+static int gpu_rmsnorm_vram(uint64_t out_vram, uint64_t x_vram,
+                             const float *weight_ram, uint32_t dim,
+                             gpu_llama_state_t *gs)
+{
+    uint64_t t0 = rdtsc_gpu();
+    uint64_t saved = vram_save();
+    uint32_t bytes = dim * sizeof(float);
+
+    /* Upload weight to temp VRAM */
+    uint64_t w_vram = gpu_tensor_alloc(bytes);
+    if (!w_vram) { vram_restore(saved); return -1; }
+
+    if (gpu_tensor_upload(w_vram, weight_ram, bytes) < 0) {
+        vram_restore(saved); return -1;
+    }
+
+    int ret = gpu_rmsnorm_ptx(out_vram, x_vram, w_vram, dim, 1e-5f);
+    vram_restore(saved);
+
+    if (ret == 0) {
+        gs->gpu_cycles += rdtsc_gpu() - t0;
+        gs->gpu_ops++;
+    }
+    return ret;
+}
+
+/* SiLU*mul — all operands in VRAM, zero upload */
+static int gpu_silu_mul_vram(uint64_t out_vram, uint64_t gate_vram,
+                              uint64_t up_vram, uint32_t n,
+                              gpu_llama_state_t *gs)
+{
+    uint64_t t0 = rdtsc_gpu();
+    uint64_t saved = vram_save();
+    int ret = gpu_silu_mul_ptx(out_vram, gate_vram, up_vram, n);
+    vram_restore(saved);
+    if (ret == 0) { gs->gpu_cycles += rdtsc_gpu() - t0; gs->gpu_ops++; }
+    return ret;
+}
+
+/* RoPE — all in VRAM, in-place modification */
+static int gpu_rope_vram(uint64_t q_vram, uint64_t k_vram,
+                          uint32_t n_heads, uint32_t n_kv_heads,
+                          uint32_t head_dim, uint32_t pos, float theta,
+                          gpu_llama_state_t *gs)
+{
+    uint64_t t0 = rdtsc_gpu();
+    uint64_t saved = vram_save();
+    int ret = gpu_rope_ptx(q_vram, k_vram, pos, n_heads, n_kv_heads,
+                           head_dim, theta);
+    vram_restore(saved);
+    if (ret == 0) { gs->gpu_cycles += rdtsc_gpu() - t0; gs->gpu_ops++; }
+    return ret;
+}
+
+/* Add-inplace — all in VRAM: a[i] += b[i] */
+static int gpu_add_inplace_vram(uint64_t a_vram, uint64_t b_vram,
+                                 uint32_t n, gpu_llama_state_t *gs)
+{
+    uint64_t t0 = rdtsc_gpu();
+    uint64_t saved = vram_save();
+    int ret = gpu_add_inplace_ptx(a_vram, b_vram, n);
+    vram_restore(saved);
+    if (ret == 0) { gs->gpu_cycles += rdtsc_gpu() - t0; gs->gpu_ops++; }
+    return ret;
+}
+
+/* ══════════════════════════════════════════════════════════
+ *  gpu_llama_forward_vram — VRAM-resident forward pass (X-INF2)
+ *
+ *  Activations stay in VRAM between ops. Only weights are
+ *  uploaded per dispatch. CPU attention downloads q/k/v,
+ *  uploads xb2 back.
+ * ══════════════════════════════════════════════════════════ */
+
+static int gpu_llama_forward_vram(gpu_llama_state_t *gs, uint32_t token)
+{
+    llama_state_t *s = gs->cpu;
+    gpu_vram_acts_t *a = &gs->acts;
+    uint32_t dim     = s->dim;
+    uint32_t kv_dim  = s->kv_dim;
+    uint32_t hd      = s->head_dim;
+    uint32_t pos     = s->pos;
+
+    /* ── Embed token (CPU → VRAM) ── */
+    gpu_embed_token(s->x, s->weights.token_embd, token, dim);
+    gpu_tensor_upload(a->x, s->x, dim * sizeof(float));
+
+    /* ── Transformer layers ── */
+    for (uint32_t l = 0; l < s->n_layers; l++) {
+        llama_layer_t *ly = &s->weights.layers[l];
+
+        /* Attention norm: x_vram → xb_vram (upload weight only) */
+        gpu_rmsnorm_vram(a->xb, a->x, gpu_norm_data(ly->attn_norm), dim, gs);
+
+        /* Q, K, V projections: xb_vram → q/k/v_vram (upload weights) */
+        gpu_matvec_vram(a->q, ly->attn_q, a->xb, dim, dim, gs);
+        gpu_matvec_vram(a->k, ly->attn_k, a->xb, kv_dim, dim, gs);
+        gpu_matvec_vram(a->v, ly->attn_v, a->xb, kv_dim, dim, gs);
+
+        /* RoPE: q/k_vram in-place (zero transfer) */
+        gpu_rope_vram(a->q, a->k, s->n_heads, s->n_kv_heads,
+                      hd, pos, 500000.0f, gs);
+
+        /* ── Download q, k, v for CPU attention ── */
+        gpu_tensor_download(a->q, s->q, dim * sizeof(float));
+        gpu_tensor_download(a->k, s->k, kv_dim * sizeof(float));
+        gpu_tensor_download(a->v, s->v, kv_dim * sizeof(float));
+
+        /* Store K, V in cache (CPU) */
+        float *kc = s->kv_cache[l].k + (uint64_t)pos * kv_dim;
+        float *vc = s->kv_cache[l].v + (uint64_t)pos * kv_dim;
+        memcpy(kc, s->k, kv_dim * sizeof(float));
+        memcpy(vc, s->v, kv_dim * sizeof(float));
+
+        /* ── GQA Attention (CPU — irregular access pattern) ── */
+        float scale = 1.0f / sqrtf_bare((float)hd);
+        uint64_t att_t0 = rdtsc_gpu();
+
+        for (uint32_t h = 0; h < s->n_heads; h++) {
+            uint32_t kv_h = h / s->gqa_ratio;
+            float *q_head = s->q + h * hd;
+
+            for (uint32_t p = 0; p <= pos; p++) {
+                float *k_pos = s->kv_cache[l].k + (uint64_t)p * kv_dim + kv_h * hd;
+                float dot = 0.0f;
+                for (uint32_t i = 0; i < hd; i++)
+                    dot += q_head[i] * k_pos[i];
+                s->att[p] = dot * scale;
+            }
+
+            softmax(s->att, pos + 1);
+
+            float *out_head = s->xb2 + h * hd;
+            memset(out_head, 0, hd * sizeof(float));
+            for (uint32_t p = 0; p <= pos; p++) {
+                float *v_pos = s->kv_cache[l].v + (uint64_t)p * kv_dim + kv_h * hd;
+                float aa = s->att[p];
+                for (uint32_t i = 0; i < hd; i++)
+                    out_head[i] += aa * v_pos[i];
+            }
+        }
+        gs->cpu_cycles += rdtsc_gpu() - att_t0;
+        gs->cpu_ops++;
+
+        /* ── Upload attention output → VRAM ── */
+        gpu_tensor_upload(a->xb2, s->xb2, dim * sizeof(float));
+
+        /* Output projection: xb2_vram → xb_vram (upload weights) */
+        gpu_matvec_vram(a->xb, ly->attn_output, a->xb2, dim, dim, gs);
+
+        /* Residual: x_vram += xb_vram (zero transfer) */
+        gpu_add_inplace_vram(a->x, a->xb, dim, gs);
+
+        /* ── FFN (entire chain in VRAM) ── */
+        gpu_rmsnorm_vram(a->xb, a->x, gpu_norm_data(ly->ffn_norm), dim, gs);
+
+        /* Gate + Up: xb_vram → hb/hb2_vram (upload weights) */
+        gpu_matvec_vram(a->hb,  ly->ffn_gate, a->xb, s->ffn_dim, dim, gs);
+        gpu_matvec_vram(a->hb2, ly->ffn_up,   a->xb, s->ffn_dim, dim, gs);
+
+        /* SwiGLU: SiLU(hb) * hb2 → hb (zero transfer) */
+        gpu_silu_mul_vram(a->hb, a->hb, a->hb2, s->ffn_dim, gs);
+
+        /* Down projection: hb_vram → xb_vram (upload weights) */
+        gpu_matvec_vram(a->xb, ly->ffn_down, a->hb, dim, s->ffn_dim, gs);
+
+        /* Residual: x_vram += xb_vram (zero transfer) */
+        gpu_add_inplace_vram(a->x, a->xb, dim, gs);
+    }
+
+    /* ── Final norm (in VRAM) + download for logits ── */
+    gpu_rmsnorm_vram(a->x, a->x, gpu_norm_data(s->weights.output_norm), dim, gs);
+    gpu_tensor_download(a->x, s->x, dim * sizeof(float));
+
+    /* Logits matvec: vocab (128K×2048 = ~141MB Q4_0) — too large for VRAM, CPU */
+    uint64_t t0 = rdtsc_gpu();
+    matvec_q4_0(s->logits, s->weights.output->data, s->x,
+                s->vocab_size, dim);
+    gs->cpu_cycles += rdtsc_gpu() - t0;
+    gs->cpu_ops++;
+
+    s->pos++;
+    return 0;
+}
+
+/* ══════════════════════════════════════════════════════════
+ *  gpu_llama_forward_host — Per-op upload/download (X-INF1 fallback)
+ * ══════════════════════════════════════════════════════════ */
+
+static int gpu_llama_forward_host(gpu_llama_state_t *gs, uint32_t token)
 {
     llama_state_t *s = gs->cpu;
     uint32_t dim     = s->dim;
@@ -604,32 +880,28 @@ int gpu_llama_forward(gpu_llama_state_t *gs, uint32_t token)
             memset(out_head, 0, hd * sizeof(float));
             for (uint32_t p = 0; p <= pos; p++) {
                 float *v_pos = s->kv_cache[l].v + (uint64_t)p * kv_dim + kv_h * hd;
-                float a = s->att[p];
+                float aa = s->att[p];
                 for (uint32_t i = 0; i < hd; i++)
-                    out_head[i] += a * v_pos[i];
+                    out_head[i] += aa * v_pos[i];
             }
         }
 
-        /* Output projection (CPU) */
+        /* Output projection */
         gpu_matvec(s->xb, ly->attn_output, s->xb2, dim, dim, gs);
 
-        /* Residual connection — GPU vec_add when available */
+        /* Residual connection */
         gpu_vec_add_dispatch(s->x, s->x, s->xb, dim, gs);
 
         /* ── FFN ── */
         gpu_rmsnorm_dispatch(s->xb, s->x, gpu_norm_data(ly->ffn_norm), dim, gs);
 
-        /* Gate + Up projections — GPU matvec_q4_0 when available */
         gpu_matvec(s->hb,  ly->ffn_gate, s->xb, s->ffn_dim, dim, gs);
         gpu_matvec(s->hb2, ly->ffn_up,   s->xb, s->ffn_dim, dim, gs);
 
-        /* SwiGLU: SiLU(gate) * up — GPU fused kernel when available */
         gpu_silu_mul_dispatch(s->hb, s->hb, s->hb2, s->ffn_dim, gs);
 
-        /* Down projection (CPU) */
         gpu_matvec(s->xb, ly->ffn_down, s->hb, dim, s->ffn_dim, gs);
 
-        /* Residual connection — GPU vec_add when available */
         gpu_vec_add_dispatch(s->x, s->x, s->xb, dim, gs);
     }
 
@@ -639,6 +911,18 @@ int gpu_llama_forward(gpu_llama_state_t *gs, uint32_t token)
 
     s->pos++;
     return 0;
+}
+
+/* ══════════════════════════════════════════════════════════
+ *  gpu_llama_forward — dispatch to VRAM or host path
+ * ══════════════════════════════════════════════════════════ */
+
+int gpu_llama_forward(gpu_llama_state_t *gs, uint32_t token)
+{
+    if (gs->vram_resident)
+        return gpu_llama_forward_vram(gs, token);
+    else
+        return gpu_llama_forward_host(gs, token);
 }
 
 /* ── Argmax ──────────────────────────────────────────────── */
