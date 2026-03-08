@@ -1,18 +1,18 @@
 /*
- * OsitoK x86-64 — GPU-Accelerated Llama Inference (X40 + X-INF1/INF2)
+ * OsitoK x86-64 — GPU-Accelerated Llama Inference (X40 + X-INF1/2/3)
  *
  * Orchestration layer for hybrid GPU/CPU forward pass.
  *
- * Two modes:
- *   VRAM-resident (X-INF2): Activation vectors stay in VRAM between ops.
- *     Only weights are uploaded per-dispatch, activations persist.
- *     Requires all core kernels available (matvec, rmsnorm, silu_mul, rope).
- *     CPU attention loop downloads q/k/v, uploads xb2 output.
+ * Three tiers (auto-selected):
+ *   VRAM-resident weights (X-INF3): All model weights uploaded to VRAM once
+ *     at boot (~18s via PRAMIN). Eliminates per-dispatch weight transfers.
+ *     Combined with X-INF2 activations = zero PCIe transfers for most ops.
+ *
+ *   VRAM-resident activations (X-INF2): Activation vectors stay in VRAM.
+ *     Weights uploaded per-dispatch. Reduces activation transfers.
  *
  *   Host-dispatch (X-INF1): Per-op upload/dispatch/download with CPU fallback.
- *     Works with any subset of GPU kernels. Slower due to PRAMIN round trips.
  *
- * Weights stay in system RAM (Q4_0, too large for VRAM).
  * KV cache stays in system RAM (grows with sequence length).
  */
 
@@ -34,6 +34,23 @@ typedef struct {
     bool rope;              /* Rotary position embedding */
     bool add_inplace;       /* a[i] += b[i] */
 } gpu_kernel_table_t;
+
+/* ── VRAM Weight Cache (X-INF3) ──────────────────────── */
+
+#define MAX_WEIGHT_CACHE  256
+
+typedef struct {
+    const void *host_ptr;    /* System RAM address (lookup key) */
+    uint64_t    vram_addr;   /* VRAM address where weight is stored */
+    uint32_t    size;        /* Size in bytes */
+} weight_entry_t;
+
+typedef struct {
+    weight_entry_t entries[MAX_WEIGHT_CACHE];
+    uint32_t       count;
+    uint64_t       total_bytes;   /* Total weight bytes in VRAM */
+    bool           ready;
+} weight_cache_t;
 
 /* ── VRAM-Resident Activation Buffers (X-INF2) ──────── */
 
@@ -62,6 +79,10 @@ typedef struct {
     /* VRAM-resident activations (X-INF2) */
     gpu_vram_acts_t     acts;       /* Persistent activation buffers */
     bool                vram_resident; /* true = VRAM path, false = host path */
+
+    /* VRAM-resident weights (X-INF3) */
+    weight_cache_t      wcache;     /* Weight host_ptr → VRAM addr lookup */
+    bool                weights_resident; /* true = weights pre-uploaded to VRAM */
 
     /* Dispatch table */
     gpu_kernel_table_t  kernels;

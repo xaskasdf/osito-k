@@ -23,7 +23,7 @@
 
 /* VRAM buffer region: starts after SASS kernels at 260MB */
 #define GPU_TENSOR_VRAM_OFFSET_MB  260
-#define GPU_TENSOR_VRAM_SIZE_MB     16   /* 16MB for tensor buffers (matvec Q4_0 needs ~10MB) */
+#define GPU_TENSOR_VRAM_SIZE_MB    700   /* 700MB: scratch (16MB) + model weights (~550MB) + headroom */
 
 /* GPU tensor buffer state */
 typedef struct {

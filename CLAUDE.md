@@ -355,6 +355,7 @@ Tasks:   idle, input, shell (3 of 8 slots used)
 | **X-TOK1** | **BPE tokenizer** (Llama 3 BPE encode/decode, GGUF vocab extraction, FNV-1a hash, greedy+merge) | Done |
 | **X-INF1** | **GPU inference dispatch** (matvec_q4_0 + rmsnorm + silu_mul + rope + vec_add on GPU, VRAM save/restore, CPU fallback) | Done |
 | **X-INF2** | **VRAM-resident activations** (activations stay in VRAM between ops, only weights uploaded per dispatch, zero-transfer for silu_mul/rope/residual) | Done |
+| **X-INF3** | **VRAM-resident weights** (all model weights uploaded to VRAM at boot, weight cache lookup, zero-transfer matvec/rmsnorm, GPU logits, GMMU 768MB identity map) | Done |
 
 > Full GPU roadmap (X27-X40 + contingency): see [docs/x86-gpu-roadmap.md](docs/x86-gpu-roadmap.md)
 > Full OS roadmap (Tier 0-5): see [docs/os-selfhost-roadmap.md](docs/os-selfhost-roadmap.md)
@@ -784,6 +785,22 @@ Activations stay in VRAM between operations, eliminating per-op activation trans
 - **Logits**: Vocab projection (128K×2048 = ~141MB Q4_0) too large for VRAM — always CPU. Final x downloaded from VRAM first.
 - **add_inplace kernel**: Newly detected in init. Replaces vec_add for residual connections (a[i]+=b[i], one less VRAM buffer needed).
 - **Files**: `arch/x86/drivers/gpu_inference.h` (gpu_vram_acts_t, vram_resident flag), `arch/x86/drivers/gpu_inference.c` (VRAM dispatch + forward_vram + forward_host)
+
+### X-INF3: VRAM-Resident Weights
+All model weights uploaded to VRAM once at boot, eliminating per-dispatch weight transfers via PRAMIN. Combined with X-INF2 VRAM-resident activations = zero PCIe transfers for all ops except attention KV cache.
+- **Weight cache**: `weight_cache_t` with `MAX_WEIGHT_CACHE=256` entries. Linear lookup by `host_ptr` (system RAM address → VRAM address). Simple and fast for ~147 tensors.
+- **Boot upload**: `gpu_upload_all_weights()` iterates all layers, uploads Q4_0 weight matrices + F32 norm vectors. Progress logged every 4 layers. ~523MB layer weights + ~141MB output = ~664MB for Llama 3.2 1B.
+- **GMMU expansion**: Identity map expanded from 24MB to 768MB (VRAM+256MB to VRAM+1024MB). Multi-PD0 page tables: 2 PD1 entries × 1 PD0 page each, 384 SPT pages. ~1.5MB page tables from system RAM.
+- **Tensor buffer expansion**: `GPU_TENSOR_VRAM_SIZE_MB` increased from 16 to 700. Bump allocator: permanent allocations (scratch 96KB + activations 116KB + weights ~664MB) at bottom, temp CB0 allocations via save/restore above.
+- **Zero-transfer matvec**: `gpu_matvec_vram()` calls `wcache_lookup()` before allocating temp VRAM — if weight found in cache, dispatches directly (only CB0 temp alloc). Falls back to per-dispatch upload if not cached.
+- **Zero-transfer rmsnorm**: `gpu_rmsnorm_vram()` same pattern — norm weights cached in VRAM.
+- **GPU logits**: When output projection weights are in VRAM, logits matvec (vocab 128K×2048) runs on GPU instead of CPU. Result downloaded (512KB) for argmax.
+- **Host-dispatch benefits**: `gpu_matvec_q4_0_dispatch()` (X-INF1 path) also checks weight cache — if weights cached, skips upload even in host-dispatch mode.
+- **Partial cache**: If VRAM runs out mid-upload, already-uploaded weights are still usable. `weights_resident` flag only set on full success.
+- **Mode auto-selection**: X-INF3 > X-INF2 > X-INF1. Init selects highest available tier based on kernels + VRAM capacity.
+- **Estimated boot cost**: ~18s for 664MB via PRAMIN (4 bytes/write, ~100ns each). One-time cost, amortized over all tokens.
+- **Per-token savings**: Eliminates ~34MB/token PRAMIN weight upload (112 matvecs × ~0.3MB avg). For 100 tokens: saves ~3.4GB of transfers.
+- **Files**: `arch/x86/drivers/gpu_inference.h` (weight_cache_t, weights_resident), `arch/x86/drivers/gpu_inference.c` (wcache_lookup/add, gpu_upload_all_weights), `arch/x86/drivers/gmmu.c` (768MB identity map, multi-PD0), `arch/x86/drivers/gpu_tensor.h` (700MB tensor region)
 
 ### X27: Falcon PIO Load
 Programmed I/O access to Falcon IMEM/DMEM via IMEMC/IMEMD registers.

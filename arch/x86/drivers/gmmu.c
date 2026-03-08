@@ -98,13 +98,15 @@ extern void *mem_alloc_aligned(uint64_t size, uint64_t alignment);
 
 /* ── GMMU State ──────────────────────────────────────────── */
 
-#define MAX_SPT_PAGES  16  /* Enough to map 32MB of VRAM */
+#define MAX_SPT_PAGES  512  /* Enough to map 1GB of VRAM */
+#define MAX_PD0_PAGES    4  /* Each PD1 entry → PD0, each covers 512MB */
 
 typedef struct {
     uint64_t *pdb;           /* Page Directory Base: 4 entries × 8B */
     uint64_t *pd2;           /* PD2: 512 entries × 8B = 4KB */
     uint64_t *pd1;           /* PD1: 512 entries × 8B = 4KB */
-    uint64_t *pd0;           /* PD0: 256 entries × 16B = 4KB (stored as uint64_t pairs) */
+    uint64_t *pd0[MAX_PD0_PAGES]; /* PD0 pages, one per PD1 entry used */
+    uint32_t  pd0_count;
     uint64_t *spt[MAX_SPT_PAGES]; /* SPT pages (4KB each) */
     uint32_t  spt_count;
     uint64_t  pdb_phys;
@@ -133,16 +135,14 @@ static inline uint64_t pt_phys(void *p)
 
 /*
  * Identity-map a VRAM range: GPU VA = VRAM physical address.
- * Only maps the range [vram_base, vram_base + size).
+ * Maps the range [vram_base, vram_base + size).
  *
- * For SASS kernels at VRAM+256MB, we map 256MB-260MB (4MB).
- * This requires:
- *   1 PDB page (32B, in 4KB allocation)
- *   1 PD2 page (4KB)
- *   1 PD1 page (4KB)
- *   1 PD0 page (4KB)
- *   N SPT pages (each covers 2MB, so 2 pages for 4MB)
- * Total: ~24KB
+ * Handles ranges that span multiple PD1 entries (>512MB).
+ * Each PD1 entry → one PD0 page (256 entries × 2MB = 512MB).
+ *
+ * For X-INF3 model weights at VRAM+256MB, maps up to 768MB:
+ *   1 PDB + 1 PD2 + 1 PD1 (shared) + 2 PD0 pages + 384 SPT pages
+ *   Page tables: ~1.5MB from system RAM.
  */
 static int gmmu_build_identity_map(uint64_t vram_base, uint64_t vram_size)
 {
@@ -172,18 +172,49 @@ static int gmmu_build_identity_map(uint64_t vram_base, uint64_t vram_size)
     serial_putdec(num_spt);
     serial_puts(" SPT pages)\n");
 
-    /* Allocate page table levels */
+    /* Allocate upper-level page tables (shared across all entries) */
     gmmu.pdb = alloc_pt_page();
     gmmu.pd2 = alloc_pt_page();
     gmmu.pd1 = alloc_pt_page();
-    gmmu.pd0 = alloc_pt_page();
 
-    if (!gmmu.pdb || !gmmu.pd2 || !gmmu.pd1 || !gmmu.pd0) {
+    if (!gmmu.pdb || !gmmu.pd2 || !gmmu.pd1) {
         serial_puts("[GMMU] Failed to allocate page table pages\n");
         return -1;
     }
-
     gmmu.pdb_phys = pt_phys(gmmu.pdb);
+
+    /* Wire upper levels (PDB → PD2 → PD1) — all our VAs share these */
+    gmmu.pdb[PDB_IDX(aligned_base)] = (pt_phys(gmmu.pd2) >> 4) | PDE_SYS;
+    gmmu.pd2[PD2_IDX(aligned_base)] = (pt_phys(gmmu.pd1) >> 4) | PDE_SYS;
+
+    /* Determine which PD1 entries we need (each covers 512MB) */
+    uint32_t pd1_first = PD1_IDX(aligned_base);
+    uint32_t pd1_last  = PD1_IDX(aligned_end - 1);
+    uint32_t num_pd0   = pd1_last - pd1_first + 1;
+
+    if (num_pd0 > MAX_PD0_PAGES) {
+        serial_puts("[GMMU] Too many PD0 pages needed\n");
+        return -1;
+    }
+
+    /* Allocate PD0 pages and wire to PD1 */
+    for (uint32_t p = 0; p < num_pd0; p++) {
+        gmmu.pd0[p] = alloc_pt_page();
+        if (!gmmu.pd0[p]) {
+            serial_puts("[GMMU] Failed to allocate PD0 page\n");
+            return -1;
+        }
+        gmmu.pd1[pd1_first + p] = (pt_phys(gmmu.pd0[p]) >> 4) | PDE_SYS;
+    }
+    gmmu.pd0_count = num_pd0;
+
+    serial_puts("[GMMU] PD1 entries ");
+    serial_putdec(pd1_first);
+    serial_puts("-");
+    serial_putdec(pd1_last);
+    serial_puts(" (");
+    serial_putdec(num_pd0);
+    serial_puts(" PD0 pages)\n");
 
     /* Allocate SPT pages */
     for (uint32_t i = 0; i < num_spt; i++) {
@@ -197,68 +228,40 @@ static int gmmu_build_identity_map(uint64_t vram_base, uint64_t vram_size)
     }
     gmmu.spt_count = num_spt;
 
-    /* ── Wire up page table hierarchy ── */
-
-    /* PDB[0] → PD2 (all addresses in our range have PDB index 0) */
-    gmmu.pdb[PDB_IDX(aligned_base)] = (pt_phys(gmmu.pd2) >> 4) | PDE_SYS;
-
-    /* PD2[idx] → PD1 */
-    gmmu.pd2[PD2_IDX(aligned_base)] = (pt_phys(gmmu.pd1) >> 4) | PDE_SYS;
-
-    /* PD1[idx] → PD0 */
-    gmmu.pd1[PD1_IDX(aligned_base)] = (pt_phys(gmmu.pd0) >> 4) | PDE_SYS;
-
-    /* PD0 entries → SPT pages (dual PDE format: small_pde at even offset, big=0) */
+    /* Wire PD0 → SPT and fill SPTs with identity-mapped PTEs */
     for (uint32_t i = 0; i < num_spt; i++) {
-        uint64_t va = aligned_base + i * SPT_COVERAGE;
+        uint64_t va = aligned_base + (uint64_t)i * SPT_COVERAGE;
+
+        /* Find which PD0 page this VA belongs to */
+        uint32_t pd1_idx = PD1_IDX(va);
+        uint32_t pd0_page = pd1_idx - pd1_first;
         uint32_t pd0_idx = PD0_IDX(va);
 
-        /* PD0 is dual PDE: each entry is 16 bytes (2 × uint64_t).
-         * Entry layout: [small_pde, big_pde]
-         * small_pde = phys_addr | flags (NOT shifted for PD0!)
-         * big_pde = 0 (disabled) */
-        gmmu.pd0[pd0_idx * 2]     = pt_phys(gmmu.spt[i]) | PD0_SYS;
-        gmmu.pd0[pd0_idx * 2 + 1] = 0;  /* big page PDE disabled */
-    }
+        /* PD0 dual PDE: [small_pde, big_pde=0] at pd0_idx*2 */
+        gmmu.pd0[pd0_page][pd0_idx * 2]     = pt_phys(gmmu.spt[i]) | PD0_SYS;
+        gmmu.pd0[pd0_page][pd0_idx * 2 + 1] = 0;
 
-    /* Fill SPT entries with identity-mapped VRAM PTEs */
-    for (uint32_t s = 0; s < num_spt; s++) {
-        uint64_t spt_base_va = aligned_base + s * SPT_COVERAGE;
+        /* Fill SPT with identity-mapped VRAM PTEs */
         for (uint32_t e = 0; e < SPT_ENTRIES; e++) {
-            uint64_t page_phys = spt_base_va + e * 4096;
-            /* PTE = (phys >> 4) | flags */
-            gmmu.spt[s][e] = (page_phys >> 4) | PTE_VRAM;
+            uint64_t page_phys = va + (uint64_t)e * 4096;
+            gmmu.spt[i][e] = (page_phys >> 4) | PTE_VRAM;
         }
     }
 
-    /* Memory barriers — ensure all PTs are visible before GPU reads them */
     wmb();
 
     gmmu.map_vram_base = aligned_base;
     gmmu.map_vram_size = aligned_size;
 
-    serial_puts("[GMMU] Page tables built:\n");
-    serial_puts("[GMMU]   PDB=0x");
-    serial_puthex(gmmu.pdb_phys, 16);
-    serial_puts(" PD2=0x");
-    serial_puthex(pt_phys(gmmu.pd2), 16);
-    serial_puts("\n");
-    serial_puts("[GMMU]   PD1=0x");
-    serial_puthex(pt_phys(gmmu.pd1), 16);
-    serial_puts(" PD0=0x");
-    serial_puthex(pt_phys(gmmu.pd0), 16);
-    serial_puts("\n");
-    for (uint32_t i = 0; i < num_spt; i++) {
-        serial_puts("[GMMU]   SPT[");
-        serial_putdec(i);
-        serial_puts("]=0x");
-        serial_puthex(pt_phys(gmmu.spt[i]), 16);
-        serial_puts(" (VA 0x");
-        serial_puthex(aligned_base + i * SPT_COVERAGE, 8);
-        serial_puts("-0x");
-        serial_puthex(aligned_base + (i + 1) * SPT_COVERAGE, 8);
-        serial_puts(")\n");
-    }
+    serial_puts("[GMMU] Page tables: PDB=0x");
+    serial_puthex(gmmu.pdb_phys, 8);
+    serial_puts(" ");
+    serial_putdec(num_spt);
+    serial_puts(" SPT + ");
+    serial_putdec(num_pd0);
+    serial_puts(" PD0 (~");
+    serial_putdec((num_spt + num_pd0 + 3) * 4);
+    serial_puts("KB)\n");
 
     return 0;
 }
@@ -326,9 +329,10 @@ int gmmu_init(void)
 
     memset(&gmmu, 0, sizeof(gmmu));
 
-    /* Identity-map VRAM region: SASS kernels (256MB) + tensor buffers (260MB, 16MB) */
+    /* Identity-map VRAM region: SASS kernels (256MB) + tensor/weights (260MB+)
+     * X-INF3: 768MB covers SASS (4MB) + scratch (16MB) + model weights (~550MB) + headroom */
     uint64_t vram_base = (uint64_t)SASS_VRAM_OFFSET_MB * 1024 * 1024;
-    uint64_t vram_size = 24 * 1024 * 1024;  /* 24MB: kernels (4MB) + tensor data (16MB) + headroom */
+    uint64_t vram_size = 768ULL * 1024 * 1024;  /* 768MB: kernels + tensors + weights */
 
     if (gmmu_build_identity_map(vram_base, vram_size) < 0) {
         serial_puts("[GMMU] Failed to build page tables\n");

@@ -1,25 +1,27 @@
 /*
- * OsitoK x86-64 — GPU-Accelerated Llama Inference (X40)
+ * OsitoK x86-64 — GPU-Accelerated Llama Inference (X40 + X-INF1/2/3)
  *
  * Hybrid GPU/CPU forward pass orchestration.
- * Uses GPU SASS kernels where available, CPU tensor.h for the rest.
  *
- * Current state (X-INF1):
- *   - matvec_q4_0 on GPU (streaming: upload weights+input, dispatch, download)
- *   - rmsnorm on GPU (upload x+weight, dispatch, download)
- *   - silu_mul on GPU (replaces silu_inplace + vec_mul in one kernel)
- *   - rope on GPU (upload q+k, in-place dispatch, download)
- *   - vec_add on GPU (chunked 256-element dispatches)
- *   - PRAMIN data transfer (slow but functional without DMA)
- *   - Attention (GQA loop + softmax): CPU-only (irregular access pattern)
+ * Three tiers (auto-selected based on kernel + VRAM availability):
+ *   X-INF3: VRAM-resident weights + activations. All model weights
+ *           uploaded to VRAM once at boot (~18s). Zero PCIe transfers
+ *           for matvec/rmsnorm — only attention KV via PCIe.
+ *   X-INF2: VRAM-resident activations, weights per-dispatch.
+ *   X-INF1: Per-op upload/dispatch/download, CPU fallback.
  *
  * ── Data flow ─────────────────────────────────────────────
  *
- *   Weights:      System RAM (loaded from GGUF via NVMe)
- *   KV cache:     System RAM (per-layer, per-position)
- *   Activations:  System RAM (scratch buffers in llama_state_t)
- *   GPU transfer: PRAMIN upload → GPU compute → PRAMIN download
- *   VRAM alloc:   Save/restore bump allocator per dispatch (no leaks)
+ *   X-INF3 (VRAM weights):
+ *     Weights:      VRAM (uploaded once at boot, ~18s via PRAMIN)
+ *     Activations:  VRAM (persistent, X-INF2)
+ *     KV cache:     System RAM (per-layer, per-position)
+ *     GPU transfer: Weights 0, activations ~0, only KV+attention via PCIe
+ *
+ *   X-INF1 fallback:
+ *     Weights:      System RAM → VRAM per dispatch
+ *     Activations:  System RAM (scratch buffers)
+ *     GPU transfer: PRAMIN upload → GPU compute → PRAMIN download
  *
  * ── Dispatch table (Llama 3.2 1B, per token) ──────────────
  *
@@ -116,47 +118,203 @@ static inline void vram_restore(uint64_t saved)
     if (ts) ts->vram_next = saved;
 }
 
+/* ── VRAM weight cache (X-INF3) ──────────────────────────── */
+
+/* Look up a weight in the VRAM cache by its system RAM pointer.
+ * Returns VRAM address or 0 if not cached. */
+static uint64_t wcache_lookup(gpu_llama_state_t *gs, const void *host_ptr)
+{
+    if (!gs->weights_resident) return 0;
+    for (uint32_t i = 0; i < gs->wcache.count; i++) {
+        if (gs->wcache.entries[i].host_ptr == host_ptr)
+            return gs->wcache.entries[i].vram_addr;
+    }
+    return 0;
+}
+
+/* Add a weight to the VRAM cache. Allocates from bump allocator and uploads. */
+static uint64_t wcache_add(gpu_llama_state_t *gs, const void *host_ptr,
+                            uint32_t size)
+{
+    if (gs->wcache.count >= MAX_WEIGHT_CACHE) return 0;
+
+    uint64_t vram = gpu_tensor_alloc(size);
+    if (!vram) return 0;
+
+    if (gpu_tensor_upload(vram, host_ptr, size) < 0) return 0;
+
+    weight_entry_t *e = &gs->wcache.entries[gs->wcache.count++];
+    e->host_ptr  = host_ptr;
+    e->vram_addr = vram;
+    e->size      = size;
+    gs->wcache.total_bytes += size;
+
+    return vram;
+}
+
+/* Upload all model weights to VRAM at boot time.
+ * Layer weights (~523MB for Llama 3.2 1B) + output (~141MB). */
+static int gpu_upload_all_weights(gpu_llama_state_t *gs)
+{
+    llama_state_t *s = gs->cpu;
+    uint32_t dim = s->dim;
+    uint32_t kv_dim = s->kv_dim;
+    uint32_t ffn_dim = s->ffn_dim;
+
+    serial_puts("[GPU_INF] X-INF3: Uploading model weights to VRAM...\n");
+    uint64_t t0 = rdtsc_gpu();
+
+    gs->wcache.count = 0;
+    gs->wcache.total_bytes = 0;
+
+    /* Helper: compute Q4_0 tensor byte size */
+    #define Q4_SIZE(rows, cols)  ((uint32_t)((cols) / 32) * 18 * (rows))
+    #define F32_SIZE(n)          ((uint32_t)((n) * sizeof(float)))
+
+    /* Upload per-layer weights */
+    for (uint32_t l = 0; l < s->n_layers; l++) {
+        llama_layer_t *ly = &s->weights.layers[l];
+
+        /* Attention weights (Q4_0) */
+        if (ly->attn_q && ly->attn_q->type == GGML_TYPE_Q4_0) {
+            if (!wcache_add(gs, ly->attn_q->data, Q4_SIZE(dim, dim)))
+                goto fail;
+        }
+        if (ly->attn_k && ly->attn_k->type == GGML_TYPE_Q4_0) {
+            if (!wcache_add(gs, ly->attn_k->data, Q4_SIZE(kv_dim, dim)))
+                goto fail;
+        }
+        if (ly->attn_v && ly->attn_v->type == GGML_TYPE_Q4_0) {
+            if (!wcache_add(gs, ly->attn_v->data, Q4_SIZE(kv_dim, dim)))
+                goto fail;
+        }
+        if (ly->attn_output && ly->attn_output->type == GGML_TYPE_Q4_0) {
+            if (!wcache_add(gs, ly->attn_output->data, Q4_SIZE(dim, dim)))
+                goto fail;
+        }
+
+        /* FFN weights (Q4_0) */
+        if (ly->ffn_gate && ly->ffn_gate->type == GGML_TYPE_Q4_0) {
+            if (!wcache_add(gs, ly->ffn_gate->data, Q4_SIZE(ffn_dim, dim)))
+                goto fail;
+        }
+        if (ly->ffn_up && ly->ffn_up->type == GGML_TYPE_Q4_0) {
+            if (!wcache_add(gs, ly->ffn_up->data, Q4_SIZE(ffn_dim, dim)))
+                goto fail;
+        }
+        if (ly->ffn_down && ly->ffn_down->type == GGML_TYPE_Q4_0) {
+            if (!wcache_add(gs, ly->ffn_down->data, Q4_SIZE(dim, ffn_dim)))
+                goto fail;
+        }
+
+        /* Norm weights (F32) */
+        if (ly->attn_norm) {
+            if (!wcache_add(gs, ly->attn_norm->data, F32_SIZE(dim)))
+                goto fail;
+        }
+        if (ly->ffn_norm) {
+            if (!wcache_add(gs, ly->ffn_norm->data, F32_SIZE(dim)))
+                goto fail;
+        }
+
+        /* Progress every 4 layers */
+        if ((l & 3) == 3 || l == s->n_layers - 1) {
+            serial_puts("[GPU_INF]   Layer ");
+            serial_putdec(l + 1);
+            serial_puts("/");
+            serial_putdec(s->n_layers);
+            serial_puts(": ");
+            serial_putdec(gs->wcache.total_bytes / (1024 * 1024));
+            serial_puts("MB uploaded\n");
+        }
+    }
+
+    /* Output norm (F32) */
+    if (s->weights.output_norm) {
+        if (!wcache_add(gs, s->weights.output_norm->data, F32_SIZE(dim)))
+            goto fail;
+    }
+
+    /* Output projection (Q4_0) — enables GPU logits matvec */
+    if (s->weights.output && s->weights.output->type == GGML_TYPE_Q4_0) {
+        uint32_t out_size = Q4_SIZE(s->vocab_size, dim);
+        if (!wcache_add(gs, s->weights.output->data, out_size))
+            serial_puts("[GPU_INF]   Output matrix too large for VRAM, CPU fallback\n");
+        /* Non-fatal: logits can still use CPU */
+    }
+
+    #undef Q4_SIZE
+    #undef F32_SIZE
+
+    uint64_t elapsed_ms = (rdtsc_gpu() - t0) / 3000000;
+
+    serial_puts("[GPU_INF] X-INF3: ");
+    serial_putdec(gs->wcache.count);
+    serial_puts(" tensors, ");
+    serial_putdec(gs->wcache.total_bytes / (1024 * 1024));
+    serial_puts("MB in VRAM (");
+    serial_putdec(elapsed_ms / 1000);
+    serial_puts(".");
+    serial_putdec((elapsed_ms % 1000) / 100);
+    serial_puts("s)\n");
+
+    gs->wcache.ready = true;
+    gs->weights_resident = true;
+    return 0;
+
+fail:
+    serial_puts("[GPU_INF] X-INF3: VRAM full at ");
+    serial_putdec(gs->wcache.total_bytes / (1024 * 1024));
+    serial_puts("MB (");
+    serial_putdec(gs->wcache.count);
+    serial_puts(" tensors). Weights NOT resident.\n");
+    /* Weights already uploaded are still usable for partial acceleration,
+     * but we won't set weights_resident = true. Fall back to per-dispatch. */
+    gs->wcache.ready = true;  /* partial cache still works */
+    return -1;
+}
+
 /* ── Matvec dispatch (CPU, type-aware) ───────────────────── */
 
-/* Attempt GPU matvec_q4_0 dispatch.
- * Uploads weights + input to VRAM, dispatches kernel, downloads output.
+/* Attempt GPU matvec_q4_0 dispatch (host-dispatch mode).
+ * X-INF3: uses weight cache if available (skip weight upload).
+ * Otherwise uploads weights + input to VRAM, dispatches, downloads output.
  * Returns 0 on success, -1 on failure (caller should fallback to CPU). */
 static int gpu_matvec_q4_0_dispatch(float *out, const void *weights,
                                      const float *input,
                                      uint32_t rows, uint32_t cols,
-                                     gpu_llama_state_t *gs __attribute__((unused)))
+                                     gpu_llama_state_t *gs)
 {
-    /* Q4_0 block: 32 elements = 18 bytes (2 byte scale + 16 byte nibbles) */
     uint32_t blocks_per_row = cols / 32;
     uint32_t row_bytes = blocks_per_row * 18;
     uint32_t weight_bytes = rows * row_bytes;
     uint32_t input_bytes = cols * sizeof(float);
     uint32_t output_bytes = rows * sizeof(float);
 
-    /* Check if fits in VRAM buffer region (16MB limit) */
-    uint32_t total_needed = weight_bytes + input_bytes + output_bytes + 768;
-    if (total_needed > 16 * 1024 * 1024)
-        return -1;
-
-    /* Save allocator state — restore after download to free temp buffers */
     uint64_t saved = vram_save();
 
-    /* Allocate VRAM regions */
-    uint64_t w_vram = gpu_tensor_alloc(weight_bytes);
+    /* X-INF3: check weight cache — skip weight upload */
+    uint64_t w_vram = wcache_lookup(gs, weights);
+
+    if (!w_vram) {
+        /* No cache: allocate + upload weights */
+        uint32_t total_needed = weight_bytes + input_bytes + output_bytes + 768;
+        if (total_needed > 16 * 1024 * 1024) { vram_restore(saved); return -1; }
+
+        w_vram = gpu_tensor_alloc(weight_bytes);
+        if (!w_vram) { vram_restore(saved); return -1; }
+        if (gpu_tensor_upload(w_vram, weights, weight_bytes) < 0) { vram_restore(saved); return -1; }
+    }
+
     uint64_t x_vram = gpu_tensor_alloc(input_bytes);
     uint64_t y_vram = gpu_tensor_alloc(output_bytes);
+    if (!x_vram || !y_vram) { vram_restore(saved); return -1; }
 
-    if (!w_vram || !x_vram || !y_vram) { vram_restore(saved); return -1; }
-
-    /* Upload weights and input to VRAM via PRAMIN */
-    if (gpu_tensor_upload(w_vram, weights, weight_bytes) < 0) { vram_restore(saved); return -1; }
     if (gpu_tensor_upload(x_vram, input, input_bytes) < 0) { vram_restore(saved); return -1; }
 
-    /* Dispatch gemv_q4_0 kernel */
     int ret = gpu_gemv_q4_0_ptx(y_vram, w_vram, x_vram, rows, cols);
     if (ret < 0) { vram_restore(saved); return -1; }
 
-    /* Download result */
     if (gpu_tensor_download(y_vram, out, output_bytes) < 0) { vram_restore(saved); return -1; }
 
     vram_restore(saved);
@@ -553,20 +711,36 @@ int gpu_llama_init(gpu_llama_state_t *gs, llama_state_t *cpu_state)
             serial_putdec(acts_kb);
             serial_puts("KB (x,xb,xb2,q,k,v,hb,hb2)\n");
         }
+
+        /* X-INF3: Upload all model weights to VRAM (one-time boot cost) */
+        if (gs->vram_resident && gs->kernels.matvec_q4_0) {
+            gpu_upload_all_weights(gs);
+        }
     } else {
         serial_puts("[GPU_INF] GPU tensor subsystem not ready, CPU-only mode\n");
     }
 
     /* Dispatch summary */
+    const char *mode_str = "host-dispatch (X-INF1)";
+    if (gs->vram_resident && gs->weights_resident)
+        mode_str = "VRAM-resident weights+acts (X-INF3)";
+    else if (gs->vram_resident)
+        mode_str = "VRAM-resident acts (X-INF2)";
     serial_puts("[GPU_INF] Mode: ");
-    serial_puts(gs->vram_resident ? "VRAM-resident (X-INF2)" : "host-dispatch (X-INF1)");
+    serial_puts(mode_str);
     serial_puts("\n");
+
     serial_puts("[GPU_INF] Dispatch plan:\n");
     serial_puts("[GPU_INF]   matvec_q4_0: ");
-    serial_puts(gs->kernels.matvec_q4_0 ? "GPU (streaming)" : "CPU (AVX2)");
+    if (gs->weights_resident && gs->kernels.matvec_q4_0)
+        serial_puts("GPU (VRAM weights)");
+    else if (gs->kernels.matvec_q4_0)
+        serial_puts("GPU (streaming)");
+    else
+        serial_puts("CPU (AVX2)");
     serial_puts(" [~90%]\n");
     serial_puts("[GPU_INF]   rmsnorm:     ");
-    serial_puts(gs->kernels.rmsnorm ? "GPU" : "CPU");
+    serial_puts(gs->kernels.rmsnorm ? (gs->weights_resident ? "GPU (VRAM)" : "GPU") : "CPU");
     serial_puts(" [49/tok]\n");
     serial_puts("[GPU_INF]   silu_mul:    ");
     serial_puts(gs->kernels.silu ? "GPU (fused)" : "CPU");
@@ -579,12 +753,20 @@ int gpu_llama_init(gpu_llama_state_t *gs, llama_state_t *cpu_state)
     serial_puts(" [32/tok]\n");
     serial_puts("[GPU_INF]   softmax:     CPU (per-head) [512/tok]\n");
     serial_puts("[GPU_INF]   attention:   CPU (GQA loop)\n");
+    if (gs->weights_resident) {
+        serial_puts("[GPU_INF]   logits:      ");
+        serial_puts(wcache_lookup(gs, gs->cpu->weights.output->data) ?
+                     "GPU (VRAM)" : "CPU (AVX2)");
+        serial_puts("\n");
+    }
 
     gs->initialized = true;
 
     fb_puts(" GPU Inf: ");
-    if (gs->vram_resident)
-        fb_puts("VRAM-resident ");
+    if (gs->weights_resident)
+        fb_puts("VRAM-weights ");
+    else if (gs->vram_resident)
+        fb_puts("VRAM-acts ");
     fb_putdec(gpu_count);
     fb_puts("/8 kernels\n");
 
@@ -593,14 +775,17 @@ int gpu_llama_init(gpu_llama_state_t *gs, llama_state_t *cpu_state)
 }
 
 /* ══════════════════════════════════════════════════════════
- *  VRAM-native dispatch helpers (X-INF2)
+ *  VRAM-native dispatch helpers (X-INF2/INF3)
  *
- *  These take VRAM addresses for activations and only upload
- *  weights from system RAM. CB0 allocations reclaimed via
- *  save/restore.
+ *  These take VRAM addresses for activations.
+ *  X-INF3: weights looked up from weight cache (zero transfer).
+ *  X-INF2 fallback: weights uploaded per dispatch.
+ *  CB0 allocations reclaimed via save/restore.
  * ══════════════════════════════════════════════════════════ */
 
-/* Matvec with VRAM-resident input/output, weight uploaded from RAM */
+/* Matvec with VRAM-resident input/output.
+ * X-INF3: tries weight cache first (zero transfer).
+ * Fallback: uploads weights per dispatch (X-INF2 behavior). */
 static int gpu_matvec_vram(uint64_t out_vram, gguf_tensor_t *tensor,
                             uint64_t input_vram, uint32_t rows, uint32_t cols,
                             gpu_llama_state_t *gs)
@@ -611,42 +796,58 @@ static int gpu_matvec_vram(uint64_t out_vram, gguf_tensor_t *tensor,
     uint32_t row_bytes = blocks_per_row * 18;
     uint32_t weight_bytes = rows * row_bytes;
 
+    uint64_t t0 = rdtsc_gpu();
+
+    /* X-INF3: check weight cache — zero transfer path */
+    uint64_t w_vram = wcache_lookup(gs, tensor->data);
+    if (w_vram) {
+        uint64_t saved = vram_save();
+        int ret = gpu_gemv_q4_0_ptx(out_vram, w_vram, input_vram, rows, cols);
+        vram_restore(saved);
+        if (ret == 0) { gs->gpu_cycles += rdtsc_gpu() - t0; gs->gpu_ops++; }
+        return ret;
+    }
+
+    /* Fallback: upload weights per dispatch */
     if (weight_bytes > 16 * 1024 * 1024) return -1;
 
-    uint64_t t0 = rdtsc_gpu();
     uint64_t saved = vram_save();
-
-    /* Allocate temp VRAM for weights */
-    uint64_t w_vram = gpu_tensor_alloc(weight_bytes);
+    w_vram = gpu_tensor_alloc(weight_bytes);
     if (!w_vram) { vram_restore(saved); return -1; }
 
-    /* Upload weights from system RAM */
     if (gpu_tensor_upload(w_vram, tensor->data, weight_bytes) < 0) {
         vram_restore(saved); return -1;
     }
 
-    /* Dispatch — input and output are already in VRAM */
     int ret = gpu_gemv_q4_0_ptx(out_vram, w_vram, input_vram, rows, cols);
     vram_restore(saved);
 
-    if (ret == 0) {
-        gs->gpu_cycles += rdtsc_gpu() - t0;
-        gs->gpu_ops++;
-    }
+    if (ret == 0) { gs->gpu_cycles += rdtsc_gpu() - t0; gs->gpu_ops++; }
     return ret;
 }
 
-/* Rmsnorm with VRAM-resident x, weight uploaded from RAM */
+/* Rmsnorm with VRAM-resident x.
+ * X-INF3: tries weight cache first (zero transfer). */
 static int gpu_rmsnorm_vram(uint64_t out_vram, uint64_t x_vram,
                              const float *weight_ram, uint32_t dim,
                              gpu_llama_state_t *gs)
 {
     uint64_t t0 = rdtsc_gpu();
-    uint64_t saved = vram_save();
     uint32_t bytes = dim * sizeof(float);
 
-    /* Upload weight to temp VRAM */
-    uint64_t w_vram = gpu_tensor_alloc(bytes);
+    /* X-INF3: check weight cache */
+    uint64_t w_vram = wcache_lookup(gs, weight_ram);
+    if (w_vram) {
+        uint64_t saved = vram_save();
+        int ret = gpu_rmsnorm_ptx(out_vram, x_vram, w_vram, dim, 1e-5f);
+        vram_restore(saved);
+        if (ret == 0) { gs->gpu_cycles += rdtsc_gpu() - t0; gs->gpu_ops++; }
+        return ret;
+    }
+
+    /* Fallback: upload weight per dispatch */
+    uint64_t saved = vram_save();
+    w_vram = gpu_tensor_alloc(bytes);
     if (!w_vram) { vram_restore(saved); return -1; }
 
     if (gpu_tensor_upload(w_vram, weight_ram, bytes) < 0) {
@@ -807,16 +1008,26 @@ static int gpu_llama_forward_vram(gpu_llama_state_t *gs, uint32_t token)
         gpu_add_inplace_vram(a->x, a->xb, dim, gs);
     }
 
-    /* ── Final norm (in VRAM) + download for logits ── */
+    /* ── Final norm (in VRAM) ── */
     gpu_rmsnorm_vram(a->x, a->x, gpu_norm_data(s->weights.output_norm), dim, gs);
-    gpu_tensor_download(a->x, s->x, dim * sizeof(float));
 
-    /* Logits matvec: vocab (128K×2048 = ~141MB Q4_0) — too large for VRAM, CPU */
-    uint64_t t0 = rdtsc_gpu();
-    matvec_q4_0(s->logits, s->weights.output->data, s->x,
-                s->vocab_size, dim);
-    gs->cpu_cycles += rdtsc_gpu() - t0;
-    gs->cpu_ops++;
+    /* ── Logits matvec: vocab (128K×2048) ── */
+    if (gs->weights_resident && s->weights.output &&
+        wcache_lookup(gs, s->weights.output->data)) {
+        /* X-INF3: output weights in VRAM — GPU logits, download result */
+        gpu_matvec_vram(a->xb, s->weights.output, a->x,
+                        s->vocab_size, dim, gs);
+        gpu_tensor_download(a->xb, s->logits,
+                            s->vocab_size * sizeof(float));
+    } else {
+        /* CPU fallback: download x, matvec on CPU */
+        gpu_tensor_download(a->x, s->x, dim * sizeof(float));
+        uint64_t t0 = rdtsc_gpu();
+        matvec_q4_0(s->logits, s->weights.output->data, s->x,
+                    s->vocab_size, dim);
+        gs->cpu_cycles += rdtsc_gpu() - t0;
+        gs->cpu_ops++;
+    }
 
     s->pos++;
     return 0;
@@ -1067,6 +1278,13 @@ void gpu_llama_stats(gpu_llama_state_t *gs)
         serial_puts("[GPU_INF]   GPU dispatch: ");
         serial_putdec(gpu_pct);
         serial_puts("% of ops\n");
+    }
+    if (gs->weights_resident) {
+        serial_puts("[GPU_INF]   Weights: VRAM-resident (");
+        serial_putdec(gs->wcache.total_bytes / (1024 * 1024));
+        serial_puts("MB, ");
+        serial_putdec(gs->wcache.count);
+        serial_puts(" tensors)\n");
     }
 }
 
