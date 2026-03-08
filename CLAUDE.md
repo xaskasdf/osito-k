@@ -172,7 +172,10 @@ arch/x86/kernel/claude.h            Claude API client types + API (chat, ask, st
 arch/x86/kernel/claude.c            Claude Messages API (JSON builder, SSE parser, streaming, multi-turn session)
 arch/x86/kernel/tokenizer.h         BPE tokenizer API (tok_entry_t, tok_merge_t, tokenizer_t)
 arch/x86/kernel/tokenizer.c         BPE encode/decode (FNV-1a hash, greedy+merge, GGUF vocab)
-arch/x86/kernel/shell.c             Interactive shell (15 builtins, argv parser, ELF exec)
+arch/x86/kernel/smp.h               SMP types (cpu_info_t, spinlock_t) + API
+arch/x86/kernel/smp.c               Multi-core startup (MADT parse, trampoline, INIT-SIPI-SIPI)
+arch/x86/kernel/ap_trampoline.S     AP trampoline source (16→32→64 mode transition)
+arch/x86/kernel/shell.c             Interactive shell (16 builtins, argv parser, ELF exec)
 arch/x86/include/types.h            Freestanding types + MMIO + port I/O
 arch/x86/libc/crt.c                 Minimal CRT (_start, printf, malloc, POSIX I/O wrappers)
 arch/x86/libc/syscall.S             Raw SYSCALL instruction wrappers (__syscall1-4)
@@ -360,6 +363,7 @@ Tasks:   idle, input, shell (3 of 8 slots used)
 | **X-INF1** | **GPU inference dispatch** (matvec_q4_0 + rmsnorm + silu_mul + rope + vec_add on GPU, VRAM save/restore, CPU fallback) | Done |
 | **X-INF2** | **VRAM-resident activations** (activations stay in VRAM between ops, only weights uploaded per dispatch, zero-transfer for silu_mul/rope/residual) | Done |
 | **X-INF3** | **VRAM-resident weights** (all model weights uploaded to VRAM at boot, weight cache lookup, zero-transfer matvec/rmsnorm, GPU logits, GMMU 768MB identity map) | Done |
+| **X-SMP** | **Multi-core AP startup** (ACPI MADT parse, INIT-SIPI-SIPI, 16→32→64 trampoline, AP LAPIC init, `cpus` shell command) | Done |
 
 > Full GPU roadmap (X27-X40 + contingency): see [docs/x86-gpu-roadmap.md](docs/x86-gpu-roadmap.md)
 > Full OS roadmap (Tier 0-5): see [docs/os-selfhost-roadmap.md](docs/os-selfhost-roadmap.md)
@@ -1007,6 +1011,20 @@ Dispatch wrappers that correctly pass kernel parameters via Constant Buffer 0 (C
 - **Per-kernel wrappers**: `gpu_vec_add_ptx`, `gpu_vec_mul_ptx`, `gpu_add_inplace_ptx`, `gpu_silu_mul_ptx` (256 threads/block, multi-block), `gpu_rmsnorm_ptx` (1 block, shared mem reduction), `gpu_softmax_ptx` (1 block/row, shared mem), `gpu_rope_ptx` (thread per dim pair), `gpu_gemv_q4_0_ptx` (1 block/row, 256 threads, warp reduction).
 - **VRAM layout**: CB0 allocated from tensor buffer region (260MB+) within GMMU 8MB identity map (256-264MB). GPU VA = VRAM physical address.
 - **QMD integration**: `compute_dispatch_t.cbuf_addr/cbuf_size` → QMD DW20 bit 0 (CB0_VALID) + DW32-33 (CB0 addr + size).
+
+### X-SMP: Multi-Core AP Startup
+SMP support — boot all Application Processors via INIT-SIPI-SIPI IPI sequence.
+- **ACPI MADT parse**: Find RSDP from EFI System Table ConfigurationTable (ACPI 2.0/1.0 GUID). Parse RSDT→MADT, enumerate Type 0 (Processor Local APIC) entries. Up to 16 CPUs.
+- **Trampoline** (`ap_trampoline.S`): 228-byte binary at physical 0x8000. Three-stage mode transition: 16-bit real (lgdt trampoline GDT, enable PE) → 32-bit PM (enable PAE, load CR3, enable LME+paging) → 64-bit LM (load stack, lgdt/lidt kernel, lretq CS reload, set segments, call entry).
+- **Trampoline GDT**: 4 entries — null, 32-bit code (D=1,L=0), data, 64-bit code (L=1,D=0). Separate from kernel GDT.
+- **Data block at 0x8100**: GDT(+0x00), GDTR(+0x20), CR3(+0x28), kernel GDTR(+0x30), kernel IDTR(+0x3C), entry(+0x48), stack(+0x50), cpu_idx(+0x58), ready(+0x5C).
+- **Critical ordering**: In 64-bit LM, must load stack + kernel GDT + kernel IDT + reload CS BEFORE loading kernel data segments (selector 0x30 doesn't exist in trampoline GDT).
+- **INIT-SIPI-SIPI**: LAPIC ICR write to target APIC ID. INIT assert → 200μs → INIT deassert → 10ms → SIPI (vector=0x08) → 200μs → SIPI → 200μs → poll ready flag (500ms timeout).
+- **AP entry** (`smp_ap_entry`): Enable LAPIC SVR, start APIC timer (same config as BSP), mark online, atomic increment `ap_started_count`, HLT loop.
+- **Shell command**: `cpus` — shows CPU table (APIC ID, online/offline, BSP flag).
+- **delay_us/delay_ms**: Uses nop loops (not `pause` — `pause` hangs when APs execute concurrently on QEMU).
+- **Verified**: QEMU `-smp 4` boots all 4 CPUs, `-smp 1` gracefully skips AP startup.
+- **Files**: `arch/x86/kernel/smp.h` (types + API), `arch/x86/kernel/smp.c` (MADT parse, trampoline, IPI), `arch/x86/kernel/ap_trampoline.S` (source assembly), `arch/x86/boot/efi_main.c` (efi_acpi_rsdp export), `arch/x86/kernel/idt.c` (idt_get_apic_base export), `arch/x86/kernel/shell.c` (cpus command)
 
 ### AArch64/SM8350 Port (arch/arm/)
 Reference bare-metal code for ASUS ROG Phone 5 (Snapdragon 888).

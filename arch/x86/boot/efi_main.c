@@ -88,6 +88,51 @@ static EFI_STATUS get_memory_map(EFI_SYSTEM_TABLE *ST)
     return status;
 }
 
+/* ── ACPI RSDP from EFI System Table ─────────────────────────── */
+
+/* Exported to kernel — smp.c reads this */
+unsigned long long efi_acpi_rsdp;
+
+static int guid_eq(EFI_GUID *a, EFI_GUID *b)
+{
+    unsigned char *p = (unsigned char *)a;
+    unsigned char *q = (unsigned char *)b;
+    for (int i = 0; i < 16; i++)
+        if (p[i] != q[i]) return 0;
+    return 1;
+}
+
+static void find_acpi_rsdp(EFI_SYSTEM_TABLE *ST)
+{
+    /* ACPI 2.0 GUID: 8868E871-E4F1-11D3-BC22-0080C73C8881 */
+    EFI_GUID acpi20_guid = { 0x8868E871, 0xE4F1, 0x11D3,
+        { 0xBC, 0x22, 0x00, 0x80, 0xC7, 0x3C, 0x88, 0x81 } };
+    /* ACPI 1.0 GUID: EB9D2D30-2D88-11D3-9A16-0090273FC14D */
+    EFI_GUID acpi10_guid = { 0xEB9D2D30, 0x2D88, 0x11D3,
+        { 0x9A, 0x16, 0x00, 0x90, 0x27, 0x3F, 0xC1, 0x4D } };
+
+    UINTN i;
+    for (i = 0; i < ST->NumberOfTableEntries; i++) {
+        EFI_CONFIGURATION_TABLE *t = &ST->ConfigurationTable[i];
+        if (guid_eq(&t->VendorGuid, &acpi20_guid)) {
+            efi_acpi_rsdp = (unsigned long long)t->VendorTable;
+            Print(L"ACPI 2.0 RSDP at 0x%lx\r\n", efi_acpi_rsdp);
+            return;
+        }
+    }
+    for (i = 0; i < ST->NumberOfTableEntries; i++) {
+        EFI_CONFIGURATION_TABLE *t = &ST->ConfigurationTable[i];
+        if (guid_eq(&t->VendorGuid, &acpi10_guid)) {
+            efi_acpi_rsdp = (unsigned long long)t->VendorTable;
+            Print(L"ACPI 1.0 RSDP at 0x%lx\r\n", efi_acpi_rsdp);
+            return;
+        }
+    }
+    efi_acpi_rsdp = 0;
+    Print(L"ACPI RSDP: %d config tables (ST=%lx)\r\n",
+          ST->NumberOfTableEntries, (unsigned long long)ST);
+}
+
 /* ── EFI Main ────────────────────────────────────────────────── */
 
 EFI_STATUS
@@ -111,6 +156,10 @@ efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable)
         Print(L"FATAL: Cannot initialize GOP framebuffer\r\n");
         goto halt;
     }
+
+    /* Find ACPI RSDP (must be done BEFORE ExitBootServices)
+     * Use gnu-efi global ST (initialized by InitializeLib) */
+    find_acpi_rsdp(ST);
 
     /* Get memory map (must be done LAST before ExitBootServices) */
     status = get_memory_map(SystemTable);

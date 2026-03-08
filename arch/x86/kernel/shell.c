@@ -164,6 +164,7 @@ static void cmd_help(void)
     sh_puts("  help      Show this message\n");
     sh_puts("  uname     System information\n");
     sh_puts("  ps        List processes\n");
+    sh_puts("  cpus      Show CPU cores (SMP)\n");
     sh_puts("  mem       Memory usage\n");
     sh_puts("  uptime    Show uptime\n");
     sh_puts("  echo      Print arguments\n");
@@ -1054,6 +1055,40 @@ static void cmd_ps(void)
     proc_list();
 }
 
+/* ── cmd_cpus — show SMP CPU state ─────────────────────────── */
+
+extern uint32_t smp_cpu_count(void);
+
+typedef struct {
+    uint32_t apic_id;
+    uint32_t cpu_index;
+    bool     online;
+    bool     bsp;
+    uint64_t stack_top;
+} cpu_info_t;
+
+extern cpu_info_t *smp_cpu_info(uint32_t index);
+
+static void cmd_cpus(void)
+{
+    uint32_t n = smp_cpu_count();
+    sh_puts("CPUs: ");
+    sh_putdec(n);
+    sh_puts("\n");
+
+    for (uint32_t i = 0; i < n; i++) {
+        cpu_info_t *ci = smp_cpu_info(i);
+        if (!ci) continue;
+        sh_puts("  CPU ");
+        sh_putdec(i);
+        sh_puts(": APIC ");
+        sh_putdec(ci->apic_id);
+        sh_puts(ci->online ? " [online]" : " [offline]");
+        if (ci->bsp) sh_puts(" (BSP)");
+        sh_puts("\n");
+    }
+}
+
 /* ── Dispatch command ────────────────────────────────────────── */
 
 static void shell_exec(char *line)
@@ -1071,6 +1106,8 @@ static void shell_exec(char *line)
         cmd_uname();
     } else if (strcmp(cmd, "ps") == 0) {
         cmd_ps();
+    } else if (strcmp(cmd, "cpus") == 0) {
+        cmd_cpus();
     } else if (strcmp(cmd, "mem") == 0) {
         cmd_mem();
     } else if (strcmp(cmd, "uptime") == 0) {

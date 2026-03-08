@@ -46,6 +46,9 @@ extern void kb_init(void);
 extern void term_init(void);
 extern void shell_run(void);
 
+/* SMP */
+extern void smp_init(void);
+
 /* Serial */
 extern void serial_puts(const char *s);
 extern void serial_puthex(uint64_t val, int digits);
@@ -286,6 +289,9 @@ void kernel_entry(void *memory_map, uint64_t map_size,
 
     /* ── Step 1.7: Kernel heap ── */
     heap_init();
+
+    /* ── Step 1.75: SMP — wake AP cores ── */
+    smp_init();
 
     /* ── Step 1.8: Syscall interface ── */
     syscall_init();

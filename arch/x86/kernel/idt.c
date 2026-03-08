@@ -253,6 +253,8 @@ static bool apic_enabled;
 
 uint64_t idt_get_ticks(void) { return tick_count; }
 
+volatile uint32_t *idt_get_apic_base(void) { return apic_base; }
+
 /* ── Set one IDT entry ───────────────────────────────────────── */
 
 static void idt_set_entry(int vector, void (*handler)(void), uint8_t ist)

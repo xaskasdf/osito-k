@@ -104,6 +104,7 @@ qemu-system-x86_64 \
     -drive file="$ESP_IMG",format=raw,if=ide \
     -m 512M \
     -machine q35 \
+    -smp 4 \
     -device e1000e,netdev=net0 \
     -netdev user,id=net0,hostfwd=udp::7777-:7777 \
     -display none \
