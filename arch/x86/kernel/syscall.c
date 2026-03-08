@@ -16,7 +16,11 @@
  *   5 = fstat(fd, statbuf)
  *   8 = lseek(fd, offset, whence)
  *  12 = brk(addr)
+ *  13 = sigaction(sig, act, oldact)
+ *  22 = pipe(pipefd[2])
+ *  33 = dup2(oldfd, newfd)
  *  60 = exit(status)
+ *  62 = kill(pid, sig)
  * 158 = arch_prctl             [stub]
  */
 
@@ -78,11 +82,17 @@ static inline void wrmsr(uint32_t msr, uint64_t val) {
 #define SYS_IOCTL       16
 #define SYS_WRITEV      20
 #define SYS_ACCESS      21
+#define SYS_PIPE        22
+#define SYS_DUP2        33
+#define SYS_KILL        62
 #define SYS_EXIT        60
 #define SYS_UNLINK      87
 #define SYS_ARCH_PRCTL  158
+#define SYS_SIGACTION   13
+#define SYS_SIGRETURN   15
 
 /* errno values */
+#define EPERM    1
 #define ENOSYS  38
 #define EBADF    9
 #define EFAULT  14
@@ -93,6 +103,9 @@ static inline void wrmsr(uint32_t msr, uint64_t val) {
 #define EISDIR  21
 #define ESPIPE  29
 #define ENOTTY  25
+#define EPIPE   32
+#define ESRCH    3
+#define EAGAIN  11
 
 /* open flags (Linux values) */
 #define O_RDONLY    0x0000
@@ -114,6 +127,7 @@ static inline void wrmsr(uint32_t msr, uint64_t val) {
 
 #define FD_TYPE_CONSOLE 1
 #define FD_TYPE_FILE    2
+#define FD_TYPE_PIPE    3
 
 typedef ssize_t (*fd_write_fn)(const void *buf, size_t count);
 typedef ssize_t (*fd_read_fn)(void *buf, size_t count);
@@ -132,6 +146,37 @@ typedef struct {
 } fd_entry_t;
 
 static fd_entry_t fd_table[MAX_FDS];
+
+/* ── Pipe buffers ───────────────────────────────────────────── */
+
+#define PIPE_BUF_SIZE   4096
+#define MAX_PIPES       8
+
+typedef struct {
+    uint8_t  buf[PIPE_BUF_SIZE];
+    uint32_t head;          /* write position */
+    uint32_t tail;          /* read position */
+    uint32_t count;         /* bytes in buffer */
+    bool     write_open;    /* write end still open */
+    bool     read_open;     /* read end still open */
+    bool     in_use;
+} pipe_buf_t;
+
+static pipe_buf_t pipes[MAX_PIPES];
+
+/* ── Signal state ───────────────────────────────────────────── */
+
+#define NSIG        32
+#define SIGINT       2
+#define SIGPIPE     13
+#define SIGTERM     15
+#define SIGKILL      9
+
+#define SIG_DFL     ((uint64_t)0)
+#define SIG_IGN     ((uint64_t)1)
+
+static uint64_t sig_handlers[NSIG];     /* handler addresses (SIG_DFL/SIG_IGN/fn) */
+static uint32_t sig_pending;            /* bitmask of pending signals */
 
 /* ── Output capture (X-CL4: tool exec) ──────────────────────── */
 
@@ -203,6 +248,24 @@ static int64_t sys_write(uint64_t fd, uint64_t buf, uint64_t count)
         return (int64_t)count;
     }
 
+    if (f->type == FD_TYPE_PIPE) {
+        pipe_buf_t *p = (pipe_buf_t *)f->file;
+        if (!p || !p->read_open) return -EPIPE;
+        const uint8_t *src = (const uint8_t *)buf;
+        uint64_t written = 0;
+        while (written < count) {
+            if (p->count >= PIPE_BUF_SIZE) {
+                /* Buffer full — return what we have (non-blocking) */
+                if (written > 0) return (int64_t)written;
+                return -EAGAIN;
+            }
+            p->buf[p->head] = src[written++];
+            p->head = (p->head + 1) % PIPE_BUF_SIZE;
+            p->count++;
+        }
+        return (int64_t)written;
+    }
+
     /* Console */
     if (!f->write) return -EBADF;
     return f->write((const void *)buf, (size_t)count);
@@ -225,6 +288,24 @@ static int64_t sys_read(uint64_t fd, uint64_t buf, uint64_t count)
         if (ret < 0) return -EFAULT;
         f->offset += count;
         return (int64_t)count;
+    }
+
+    if (f->type == FD_TYPE_PIPE) {
+        pipe_buf_t *p = (pipe_buf_t *)f->file;
+        if (!p) return -EBADF;
+        if (p->count == 0) {
+            /* Empty — if write end is closed, return EOF */
+            if (!p->write_open) return 0;
+            return -EAGAIN;
+        }
+        uint8_t *dst = (uint8_t *)buf;
+        uint64_t nread = 0;
+        while (nread < count && p->count > 0) {
+            dst[nread++] = p->buf[p->tail];
+            p->tail = (p->tail + 1) % PIPE_BUF_SIZE;
+            p->count--;
+        }
+        return (int64_t)nread;
     }
 
     /* Console */
@@ -277,8 +358,23 @@ static int64_t sys_open(uint64_t path_addr, uint64_t flags, uint64_t mode)
 static int64_t sys_close(uint64_t fd)
 {
     if (fd >= MAX_FDS || !fd_table[fd].open) return -EBADF;
-    fd_table[fd].open = false;
-    fd_table[fd].file = NULL;
+
+    fd_entry_t *f = &fd_table[fd];
+
+    if (f->type == FD_TYPE_PIPE && f->file) {
+        pipe_buf_t *p = (pipe_buf_t *)f->file;
+        /* Determine if this is read or write end via oflags */
+        if ((f->oflags & O_ACCMODE) == O_RDONLY)
+            p->read_open = false;
+        else
+            p->write_open = false;
+        /* Free pipe when both ends closed */
+        if (!p->read_open && !p->write_open)
+            p->in_use = false;
+    }
+
+    f->open = false;
+    f->file = NULL;
     return 0;
 }
 
@@ -442,6 +538,165 @@ static int64_t sys_unlink(uint64_t path_addr)
     return osfs2_delete(path) == 0 ? 0 : -ENOENT;
 }
 
+/* ── pipe(pipefd[2]) — create pipe ──────────────────────────── */
+
+static int64_t sys_pipe(uint64_t pipefd_addr)
+{
+    if (!pipefd_addr) return -EFAULT;
+    int *pipefd = (int *)pipefd_addr;
+
+    /* Find free pipe buffer */
+    int pi = -1;
+    for (int i = 0; i < MAX_PIPES; i++) {
+        if (!pipes[i].in_use) { pi = i; break; }
+    }
+    if (pi < 0) return -EMFILE;
+
+    /* Find two free FDs */
+    int rfd = -1, wfd = -1;
+    for (int i = 0; i < MAX_FDS; i++) {
+        if (!fd_table[i].open) {
+            if (rfd < 0) rfd = i;
+            else if (wfd < 0) { wfd = i; break; }
+        }
+    }
+    if (rfd < 0 || wfd < 0) return -EMFILE;
+
+    /* Initialize pipe buffer */
+    pipe_buf_t *p = &pipes[pi];
+    memset(p, 0, sizeof(*p));
+    p->in_use = true;
+    p->read_open = true;
+    p->write_open = true;
+
+    /* Read end */
+    fd_entry_t *rf = &fd_table[rfd];
+    memset(rf, 0, sizeof(*rf));
+    rf->open   = true;
+    rf->type   = FD_TYPE_PIPE;
+    rf->oflags = O_RDONLY;
+    rf->file   = p;
+
+    /* Write end */
+    fd_entry_t *wf = &fd_table[wfd];
+    memset(wf, 0, sizeof(*wf));
+    wf->open   = true;
+    wf->type   = FD_TYPE_PIPE;
+    wf->oflags = O_WRONLY;
+    wf->file   = p;
+
+    pipefd[0] = rfd;
+    pipefd[1] = wfd;
+    return 0;
+}
+
+/* ── dup2(oldfd, newfd) — duplicate file descriptor ────────── */
+
+static int64_t sys_dup2(uint64_t oldfd, uint64_t newfd)
+{
+    if (oldfd >= MAX_FDS || !fd_table[oldfd].open) return -EBADF;
+    if (newfd >= MAX_FDS) return -EBADF;
+
+    if (oldfd == newfd) return (int64_t)newfd;
+
+    /* Close newfd if open */
+    if (fd_table[newfd].open)
+        sys_close(newfd);
+
+    /* Copy fd entry */
+    fd_table[newfd] = fd_table[oldfd];
+
+    /* For pipes, both ends now reference same buffer */
+    /* No refcount needed — pipe_buf tracks read_open/write_open */
+
+    return (int64_t)newfd;
+}
+
+/* ── kill(pid, sig) — send signal ──────────────────────────── */
+
+extern int32_t proc_current_pid(void);
+
+static int64_t sys_kill(uint64_t pid, uint64_t sig)
+{
+    if (sig >= NSIG) return -EINVAL;
+
+    int32_t cur_pid = proc_current_pid();
+
+    /* Can only signal self or pid 0 (current process group) */
+    if (pid != 0 && (int64_t)pid != cur_pid)
+        return -ESRCH;
+
+    if (sig == SIGKILL || sig == SIGTERM) {
+        proc_exit(128 + (int32_t)sig);
+        /* unreachable */
+    }
+
+    if (sig == 0) return 0;  /* Signal 0 = test if process exists */
+
+    /* Queue signal for delivery */
+    sig_pending |= (1U << sig);
+
+    return 0;
+}
+
+/* ── sigaction(sig, act, oldact) — install signal handler ──── */
+
+typedef struct {
+    uint64_t sa_handler;
+    uint64_t sa_flags;
+    uint64_t sa_restorer;
+    uint64_t sa_mask;
+} sigaction_t;
+
+static int64_t sys_sigaction(uint64_t sig, uint64_t act_addr, uint64_t oldact_addr)
+{
+    if (sig >= NSIG || sig == SIGKILL) return -EINVAL;
+
+    if (oldact_addr) {
+        sigaction_t *old = (sigaction_t *)oldact_addr;
+        memset(old, 0, sizeof(*old));
+        old->sa_handler = sig_handlers[sig];
+    }
+
+    if (act_addr) {
+        const sigaction_t *act = (const sigaction_t *)act_addr;
+        sig_handlers[sig] = act->sa_handler;
+    }
+
+    return 0;
+}
+
+/* ── Check and deliver pending signals ─────────────────────── */
+
+void syscall_check_signals(void)
+{
+    if (!sig_pending) return;
+
+    for (uint32_t s = 1; s < NSIG; s++) {
+        if (!(sig_pending & (1U << s))) continue;
+        sig_pending &= ~(1U << s);
+
+        uint64_t handler = sig_handlers[s];
+
+        if (handler == SIG_IGN) continue;
+
+        if (handler == SIG_DFL) {
+            /* Default action for most signals: terminate */
+            if (s == SIGINT || s == SIGTERM || s == SIGPIPE) {
+                serial_puts("[SIGNAL] Delivering signal ");
+                serial_putdec(s);
+                serial_puts(" (default: terminate)\n");
+                proc_exit(128 + (int32_t)s);
+            }
+            continue;
+        }
+
+        /* Custom handler — call it (simple synchronous delivery) */
+        void (*fn)(int) = (void (*)(int))handler;
+        fn((int)s);
+    }
+}
+
 /* ── Syscall dispatch (called from assembly) ─────────────────── */
 
 int64_t syscall_dispatch(uint64_t nr, uint64_t a1, uint64_t a2,
@@ -460,9 +715,14 @@ int64_t syscall_dispatch(uint64_t nr, uint64_t a1, uint64_t a2,
     case SYS_IOCTL:      return sys_ioctl(a1, a2, a3);
     case SYS_WRITEV:     return sys_writev(a1, a2, a3);
     case SYS_ACCESS:     return sys_access(a1, a2);
+    case SYS_PIPE:       return sys_pipe(a1);
+    case SYS_DUP2:       return sys_dup2(a1, a2);
     case SYS_EXIT:       return sys_exit(a1);
+    case SYS_KILL:       return sys_kill(a1, a2);
     case SYS_UNLINK:     return sys_unlink(a1);
     case SYS_ARCH_PRCTL: return -ENOSYS;  /* stub */
+    case SYS_SIGACTION:  return sys_sigaction(a1, a2, a3);
+    case SYS_SIGRETURN:  return 0;  /* stub */
     default:
         serial_puts("[SYSCALL] Unknown syscall ");
         serial_putdec(nr);
@@ -484,11 +744,15 @@ static uint16_t get_cs(void)
 
 void syscall_reset_process(void)
 {
-    /* Close file FDs (keep console on 0/1/2) */
+    /* Close file/pipe FDs (keep console on 0/1/2) */
     for (int i = 3; i < MAX_FDS; i++) {
-        fd_table[i].open = false;
-        fd_table[i].file = NULL;
+        if (fd_table[i].open)
+            sys_close((uint64_t)i);
     }
+
+    /* Reset signal state */
+    memset(sig_handlers, 0, sizeof(sig_handlers));
+    sig_pending = 0;
 
     /* Free brk heap */
     if (brk_base) {

@@ -22,7 +22,10 @@ extern long __syscall4(long nr, long a1, long a2, long a3, long a4);
 #define SYS_close   3
 #define SYS_lseek   8
 #define SYS_brk     12
+#define SYS_pipe    22
+#define SYS_dup2    33
 #define SYS_exit    60
+#define SYS_kill    62
 
 /* ── POSIX-like wrappers ── */
 
@@ -58,6 +61,21 @@ int close(int fd)
 long lseek(int fd, long offset, int whence)
 {
     return __syscall3(SYS_lseek, fd, offset, whence);
+}
+
+int pipe(int pipefd[2])
+{
+    return (int)__syscall1(SYS_pipe, (long)pipefd);
+}
+
+int dup2(int oldfd, int newfd)
+{
+    return (int)__syscall2(SYS_dup2, oldfd, newfd);
+}
+
+int kill(int pid, int sig)
+{
+    return (int)__syscall2(SYS_kill, pid, sig);
 }
 
 /* ── brk-based malloc (bump allocator) ── */

@@ -199,6 +199,12 @@ process_t *proc_current(void)
     return current_proc;
 }
 
+/* Get current PID */
+int32_t proc_current_pid(void)
+{
+    return current_proc ? (int32_t)current_proc->pid : 0;
+}
+
 /* Get process by PID */
 process_t *proc_find(uint32_t pid)
 {

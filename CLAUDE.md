@@ -364,6 +364,7 @@ Tasks:   idle, input, shell (3 of 8 slots used)
 | **X-INF2** | **VRAM-resident activations** (activations stay in VRAM between ops, only weights uploaded per dispatch, zero-transfer for silu_mul/rope/residual) | Done |
 | **X-INF3** | **VRAM-resident weights** (all model weights uploaded to VRAM at boot, weight cache lookup, zero-transfer matvec/rmsnorm, GPU logits, GMMU 768MB identity map) | Done |
 | **X-SMP** | **Multi-core AP startup** (ACPI MADT parse, INIT-SIPI-SIPI, 16→32→64 trampoline, AP LAPIC init, `cpus` shell command) | Done |
+| **X-PIPE** | **Pipes, dup2, signals, shell redirection** (pipe() circular buffer, dup2(), kill(), sigaction(), shell `>` / `>>` operators) | Done |
 
 > Full GPU roadmap (X27-X40 + contingency): see [docs/x86-gpu-roadmap.md](docs/x86-gpu-roadmap.md)
 > Full OS roadmap (Tier 0-5): see [docs/os-selfhost-roadmap.md](docs/os-selfhost-roadmap.md)
@@ -1025,6 +1026,16 @@ SMP support — boot all Application Processors via INIT-SIPI-SIPI IPI sequence.
 - **delay_us/delay_ms**: Uses nop loops (not `pause` — `pause` hangs when APs execute concurrently on QEMU).
 - **Verified**: QEMU `-smp 4` boots all 4 CPUs, `-smp 1` gracefully skips AP startup.
 - **Files**: `arch/x86/kernel/smp.h` (types + API), `arch/x86/kernel/smp.c` (MADT parse, trampoline, IPI), `arch/x86/kernel/ap_trampoline.S` (source assembly), `arch/x86/boot/efi_main.c` (efi_acpi_rsdp export), `arch/x86/kernel/idt.c` (idt_get_apic_base export), `arch/x86/kernel/shell.c` (cpus command)
+
+### X-PIPE: Pipes, Signals, Shell Redirection
+IPC pipes, signal delivery, and shell I/O redirection operators.
+- **pipe() syscall** (#22): Creates read/write FD pair sharing a `pipe_buf_t` (4KB circular buffer). `MAX_PIPES=8`. Read returns EAGAIN if empty (write end open) or 0 (EOF, write end closed). Write returns EAGAIN if full, EPIPE if read end closed.
+- **dup2() syscall** (#33): Duplicates FD entry. Closes target if open. Used for I/O redirection.
+- **FD_TYPE_PIPE**: New FD type alongside CONSOLE and FILE. Pipe buffer tracked via `fd_entry_t.file` pointer. `oflags` distinguishes read end (O_RDONLY) from write end (O_WRONLY). Close tracks `read_open`/`write_open` per pipe; buffer freed when both ends closed.
+- **Signals**: 32-signal framework. `sig_handlers[NSIG]` array with SIG_DFL/SIG_IGN/function pointer. `sig_pending` bitmask. `sigaction()` syscall (#13) to install handlers. `kill()` syscall (#62, self-signal only). Default action for SIGINT/SIGTERM/SIGPIPE = terminate (exit 128+sig). SIGKILL always terminates. `syscall_check_signals()` for delivery.
+- **Shell redirection**: `parse_redirects()` extracts `>`, `>>`, `<` operators from argv before dispatch. Output captured via `sh_redir_fn` hook in `sh_puts()`/`sh_puts_color()`/`sh_putdec()`. Captured bytes written to OsitoFS file via `osfs2_create()`/`osfs2_write()`. Append mode uses `osfs2_file_size()` offset.
+- **CRT wrappers**: `pipe()`, `dup2()`, `kill()` added to `arch/x86/libc/crt.c` for userspace programs.
+- **Files**: `arch/x86/kernel/syscall.c` (pipe/dup2/kill/sigaction syscalls, pipe_buf_t, signal state), `arch/x86/kernel/shell.c` (redirection parsing, output capture), `arch/x86/kernel/process.c` (proc_current_pid), `arch/x86/libc/crt.c` (userspace wrappers)
 
 ### AArch64/SM8350 Port (arch/arm/)
 Reference bare-metal code for ASUS ROG Phone 5 (Snapdragon 888).

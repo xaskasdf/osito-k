@@ -114,22 +114,53 @@ extern void llama_set_sampling(float temperature, float top_p);
 
 /* ── Shell output helpers ────────────────────────────────────── */
 
+/* Output redirect hook (set by shell_exec for > and >> operators) */
+static void (*sh_redir_fn)(const char *s, size_t len);
+
 static void sh_puts(const char *s)
 {
-    serial_puts(s);
-    fb_puts(s);
+    if (sh_redir_fn) {
+        size_t len = 0;
+        while (s[len]) len++;
+        sh_redir_fn(s, len);
+    } else {
+        serial_puts(s);
+        fb_puts(s);
+    }
 }
 
 static void sh_puts_color(const char *s, uint32_t color)
 {
-    serial_puts(s);
-    fb_puts_color(s, color);
+    if (sh_redir_fn) {
+        size_t len = 0;
+        while (s[len]) len++;
+        sh_redir_fn(s, len);
+    } else {
+        serial_puts(s);
+        fb_puts_color(s, color);
+    }
 }
 
 static void sh_putdec(uint64_t val)
 {
-    serial_putdec(val);
-    fb_putdec(val);
+    if (sh_redir_fn) {
+        /* Convert to decimal string */
+        char buf[24];
+        int i = 0;
+        if (val == 0) { buf[i++] = '0'; }
+        else {
+            uint64_t tmp = val;
+            char rev[24];
+            int j = 0;
+            while (tmp) { rev[j++] = '0' + (tmp % 10); tmp /= 10; }
+            while (j--) buf[i++] = rev[j];
+        }
+        buf[i] = '\0';
+        sh_redir_fn(buf, (size_t)i);
+    } else {
+        serial_putdec(val);
+        fb_putdec(val);
+    }
 }
 
 /* ── Parse command line into argv ────────────────────────────── */
@@ -185,6 +216,9 @@ static void cmd_help(void)
     sh_puts("  clear     Clear screen\n");
     sh_puts("  reboot    Reboot system\n");
     sh_puts("  halt      Halt CPU\n");
+    sh_puts_color("I/O Redirection:\n", 0x00FF8800);
+    sh_puts("  cmd > file    Write output to file\n");
+    sh_puts("  cmd >> file   Append output to file\n");
 }
 
 /* ── Builtin: uname ──────────────────────────────────────────── */
@@ -1089,6 +1123,65 @@ static void cmd_cpus(void)
     }
 }
 
+/* ── I/O redirection (X-PIPE) ─────────────────────────────────── */
+
+typedef struct {
+    const char *out_file;   /* > or >> target */
+    const char *in_file;    /* < target */
+    bool        append;     /* >> vs > */
+} redir_t;
+
+static void parse_redirects(int *argc, char *argv[], redir_t *r)
+{
+    r->out_file = NULL;
+    r->in_file  = NULL;
+    r->append   = false;
+
+    int new_argc = 0;
+    for (int i = 0; i < *argc; i++) {
+        if (argv[i][0] == '>' && argv[i][1] == '>') {
+            /* >>file (no space) */
+            r->append = true;
+            if (argv[i][2])
+                r->out_file = &argv[i][2];
+            else if (i + 1 < *argc)
+                r->out_file = argv[++i];
+        } else if (argv[i][0] == '>' && argv[i][1] == '\0') {
+            /* > file */
+            r->append = false;
+            if (i + 1 < *argc)
+                r->out_file = argv[++i];
+        } else if (argv[i][0] == '>' && argv[i][1] != '\0') {
+            /* >file (no space) */
+            r->append = false;
+            r->out_file = &argv[i][1];
+        } else if (argv[i][0] == '<' && argv[i][1] == '\0') {
+            /* < file */
+            if (i + 1 < *argc)
+                r->in_file = argv[++i];
+        } else if (argv[i][0] == '<' && argv[i][1] != '\0') {
+            /* <file */
+            r->in_file = &argv[i][1];
+        } else {
+            argv[new_argc++] = argv[i];
+        }
+    }
+    *argc = new_argc;
+}
+
+/* Captured output buffer for redirection */
+static char    *redir_buf;
+static uint32_t redir_pos;
+static uint32_t redir_max;
+
+static void redir_capture(const char *s, size_t len)
+{
+    for (size_t i = 0; i < len; i++) {
+        if (redir_pos < redir_max - 1)
+            redir_buf[redir_pos++] = s[i];
+    }
+}
+
 /* ── Dispatch command ────────────────────────────────────────── */
 
 static void shell_exec(char *line)
@@ -1097,6 +1190,26 @@ static void shell_exec(char *line)
     int argc = parse_args(line, argv);
 
     if (argc == 0) return;
+
+    /* Parse I/O redirections */
+    redir_t redir;
+    parse_redirects(&argc, argv, &redir);
+
+    if (argc == 0) return;
+
+    /* Setup output redirection */
+    bool redirected = false;
+    char *out_buf = NULL;
+    if (redir.out_file) {
+        out_buf = (char *)kmalloc(65536);
+        if (out_buf) {
+            redir_buf = out_buf;
+            redir_pos = 0;
+            redir_max = 65536;
+            sh_redir_fn = redir_capture;
+            redirected = true;
+        }
+    }
 
     const char *cmd = argv[0];
 
@@ -1153,6 +1266,37 @@ static void shell_exec(char *line)
         sh_puts(cmd);
         sh_puts("\n  Type 'help' for available commands.\n");
     }
+
+    /* Finalize output redirection — write captured output to file */
+    if (redirected) {
+        sh_redir_fn = NULL;  /* Restore normal output first */
+
+        if (redir.out_file && out_buf && redir_pos > 0) {
+            extern void *osfs2_create(const char *name, uint64_t size);
+            extern int osfs2_write(void *file, uint64_t offset, const void *buf, uint64_t len);
+            extern uint64_t osfs2_file_size(void *file);
+
+            void *f = osfs2_find(redir.out_file);
+            if (!f)
+                f = osfs2_create(redir.out_file, redir_pos);
+            if (f) {
+                uint64_t off = redir.append ? osfs2_file_size(f) : 0;
+                osfs2_write(f, off, out_buf, redir_pos);
+                sh_puts("[");
+                sh_putdec(redir_pos);
+                sh_puts(" bytes -> ");
+                sh_puts(redir.out_file);
+                sh_puts("]\n");
+            } else {
+                sh_puts("Error: cannot create ");
+                sh_puts(redir.out_file);
+                sh_puts("\n");
+            }
+        }
+        redir_buf = NULL;
+        redir_pos = 0;
+    }
+    if (out_buf) kfree(out_buf);
 }
 
 /* ── Shell main loop ─────────────────────────────────────────── */
