@@ -100,6 +100,7 @@ static FILE _files[FILE_MAX] = {
 /* Forward declarations */
 int fflush(FILE *f);
 int fputc(int c, FILE *f);
+int snprintf(char *buf, size_t size, const char *fmt, ...);
 
 /* Global pointers */
 FILE *stdin  = &_files[0];
@@ -492,22 +493,158 @@ static int _fmt_core(_fmt_ctx *ctx, const char *fmt, va_list ap)
         case '%':
             _fmt_putc(ctx, '%');
             continue;
-        case 'f': case 'e': case 'g': case 'F': case 'E': case 'G': {
-            /* Minimal float printing — TCC needs this for float literals in error messages */
+        case 'f': case 'F': {
             double v = va_arg(ap, double);
-            if (v < 0) { _fmt_putc(ctx, '-'); v = -v; }
-            long ipart = (long)v;
-            _fmt_putdec(ctx, ipart, 0);
-            _fmt_putc(ctx, '.');
             int dp = (prec >= 0) ? prec : 6;
-            if (dp > 10) dp = 10;
+            if (dp > 20) dp = 20;
+            /* Sign */
+            if (v < 0.0) { _fmt_putc(ctx, '-'); v = -v; }
+            else if (show_sign) _fmt_putc(ctx, '+');
+            else if (space_sign) _fmt_putc(ctx, ' ');
+            /* Check special values */
+            if (__builtin_isnan(v)) { _fmt_puts(ctx, "nan"); continue; }
+            if (__builtin_isinf(v)) { _fmt_puts(ctx, "inf"); continue; }
+            /* Integer part */
+            unsigned long ipart = (unsigned long)v;
             double frac = v - (double)ipart;
-            for (int i = 0; i < dp; i++) {
-                frac *= 10.0;
-                int d = (int)frac;
-                _fmt_putc(ctx, '0' + d);
-                frac -= d;
+            /* Round the fractional part */
+            double rnd = 0.5;
+            for (int i = 0; i < dp; i++) rnd /= 10.0;
+            frac += rnd;
+            if (frac >= 1.0) { ipart++; frac -= 1.0; }
+            _fmt_putdec(ctx, (long)ipart, 1);
+            if (dp > 0 || alt) {
+                _fmt_putc(ctx, '.');
+                for (int i = 0; i < dp; i++) {
+                    frac *= 10.0;
+                    int d = (int)frac;
+                    if (d > 9) d = 9;
+                    _fmt_putc(ctx, '0' + d);
+                    frac -= d;
+                }
             }
+            continue;
+        }
+        case 'e': case 'E': {
+            double v = va_arg(ap, double);
+            int dp = (prec >= 0) ? prec : 6;
+            if (dp > 20) dp = 20;
+            /* Sign */
+            if (v < 0.0) { _fmt_putc(ctx, '-'); v = -v; }
+            else if (show_sign) _fmt_putc(ctx, '+');
+            else if (space_sign) _fmt_putc(ctx, ' ');
+            /* Special values */
+            if (__builtin_isnan(v)) { _fmt_puts(ctx, "nan"); continue; }
+            if (__builtin_isinf(v)) { _fmt_puts(ctx, "inf"); continue; }
+            /* Normalize to 1.xxxxx * 10^exp */
+            int exp10 = 0;
+            if (v == 0.0) {
+                exp10 = 0;
+            } else {
+                while (v >= 10.0) { v /= 10.0; exp10++; }
+                while (v < 1.0) { v *= 10.0; exp10--; }
+            }
+            /* Round the mantissa */
+            double rnd = 0.5;
+            for (int i = 0; i < dp; i++) rnd /= 10.0;
+            v += rnd;
+            if (v >= 10.0) { v /= 10.0; exp10++; }
+            /* Print mantissa digit */
+            int lead = (int)v;
+            if (lead > 9) lead = 9;
+            _fmt_putc(ctx, '0' + lead);
+            double frac = v - lead;
+            if (dp > 0 || alt) {
+                _fmt_putc(ctx, '.');
+                for (int i = 0; i < dp; i++) {
+                    frac *= 10.0;
+                    int d = (int)frac;
+                    if (d > 9) d = 9;
+                    _fmt_putc(ctx, '0' + d);
+                    frac -= d;
+                }
+            }
+            /* Print exponent */
+            _fmt_putc(ctx, (*fmt == 'E') ? 'E' : 'e');
+            if (exp10 < 0) { _fmt_putc(ctx, '-'); exp10 = -exp10; }
+            else _fmt_putc(ctx, '+');
+            if (exp10 < 10) _fmt_putc(ctx, '0');
+            if (exp10 >= 100) {
+                _fmt_putc(ctx, '0' + exp10 / 100);
+                _fmt_putc(ctx, '0' + (exp10 / 10) % 10);
+                _fmt_putc(ctx, '0' + exp10 % 10);
+            } else {
+                _fmt_putc(ctx, '0' + exp10 / 10);
+                _fmt_putc(ctx, '0' + exp10 % 10);
+            }
+            continue;
+        }
+        case 'g': case 'G': {
+            /* %g: use %e if exp < -4 or exp >= precision, else %f */
+            double v = va_arg(ap, double);
+            int gprec = (prec >= 0) ? prec : 6;
+            if (gprec == 0) gprec = 1;
+            double av = v < 0 ? -v : v;
+            /* Determine exponent */
+            int exp10 = 0;
+            if (av != 0.0 && !__builtin_isnan(av) && !__builtin_isinf(av)) {
+                double tmp = av;
+                while (tmp >= 10.0) { tmp /= 10.0; exp10++; }
+                while (tmp < 1.0) { tmp *= 10.0; exp10--; }
+            }
+            /* Push the value back and format as %e or %f via recursive call */
+            char gbuf[64];
+            if (exp10 < -4 || exp10 >= gprec) {
+                /* Use %e with precision = gprec-1 */
+                char gfmt[16];
+                int fi = 0;
+                gfmt[fi++] = '%';
+                if (show_sign) gfmt[fi++] = '+';
+                gfmt[fi++] = '.';
+                if (gprec - 1 >= 10) { gfmt[fi++] = '0' + (gprec-1)/10; gfmt[fi++] = '0' + (gprec-1)%10; }
+                else gfmt[fi++] = '0' + (gprec-1);
+                gfmt[fi++] = (*fmt == 'G') ? 'E' : 'e';
+                gfmt[fi] = '\0';
+                snprintf(gbuf, sizeof(gbuf), gfmt, v);
+            } else {
+                /* Use %f with precision = gprec - exp10 - 1 */
+                int fprec = gprec - exp10 - 1;
+                if (fprec < 0) fprec = 0;
+                char gfmt[16];
+                int fi = 0;
+                gfmt[fi++] = '%';
+                if (show_sign) gfmt[fi++] = '+';
+                gfmt[fi++] = '.';
+                if (fprec >= 10) { gfmt[fi++] = '0' + fprec/10; gfmt[fi++] = '0' + fprec%10; }
+                else gfmt[fi++] = '0' + fprec;
+                gfmt[fi++] = 'f';
+                gfmt[fi] = '\0';
+                snprintf(gbuf, sizeof(gbuf), gfmt, v);
+            }
+            /* Strip trailing zeros (unless # flag) */
+            if (!alt) {
+                int glen = 0;
+                while (gbuf[glen]) glen++;
+                /* Find 'e' or 'E' to not strip exponent */
+                int epos = -1;
+                for (int i = 0; i < glen; i++) if (gbuf[i] == 'e' || gbuf[i] == 'E') { epos = i; break; }
+                int strip_end = (epos >= 0) ? epos : glen;
+                int dot = -1;
+                for (int i = 0; i < strip_end; i++) if (gbuf[i] == '.') { dot = i; break; }
+                if (dot >= 0) {
+                    while (strip_end > dot + 1 && gbuf[strip_end-1] == '0') strip_end--;
+                    if (strip_end == dot + 1) strip_end = dot; /* remove dot too */
+                    /* Reassemble */
+                    if (epos >= 0) {
+                        int elen = glen - epos;
+                        for (int i = 0; i < elen; i++) gbuf[strip_end + i] = gbuf[epos + i];
+                        gbuf[strip_end + (glen - epos)] = '\0';
+                    } else {
+                        gbuf[strip_end] = '\0';
+                    }
+                }
+            }
+            _fmt_puts(ctx, gbuf);
             continue;
         }
         case 'n':
@@ -1064,6 +1201,104 @@ int sem_init(sem_t *sem, int pshared, unsigned int value)
 int sem_post(sem_t *sem) { if (sem) sem->value++; return 0; }
 int sem_wait(sem_t *sem) { if (sem) sem->value--; return 0; }
 
+/* ── abort ── */
+
+void abort(void)
+{
+    _write(2, "abort()\n", 8);
+    __syscall1(SYS_exit, 134);
+    __builtin_unreachable();
+}
+
+/* ── fesetround / fegetround (x87 FPU rounding) ── */
+
+int fesetround(int round)
+{
+    unsigned short cw;
+    __asm__ volatile ("fnstcw %0" : "=m"(cw));
+    cw = (cw & ~0x0C00) | ((round & 3) << 10);
+    __asm__ volatile ("fldcw %0" : : "m"(cw));
+    return 0;
+}
+
+int fegetround(void)
+{
+    unsigned short cw;
+    __asm__ volatile ("fnstcw %0" : "=m"(cw));
+    return (cw >> 10) & 3;
+}
+
+/* ── localtime_r / gmtime_r / mktime / strftime / clock stubs ── */
+
+struct _tm_compat {
+    int tm_sec, tm_min, tm_hour, tm_mday, tm_mon, tm_year;
+    int tm_wday, tm_yday, tm_isdst;
+    long tm_gmtoff;
+    const char *tm_zone;
+};
+
+struct _tm_compat *localtime_r(const time_t *t, struct _tm_compat *result)
+{
+    (void)t;
+    if (result) {
+        result->tm_sec = 0; result->tm_min = 0; result->tm_hour = 0;
+        result->tm_mday = 1; result->tm_mon = 0; result->tm_year = 70;
+        result->tm_wday = 4; result->tm_yday = 0; result->tm_isdst = 0;
+        result->tm_gmtoff = 0; result->tm_zone = "UTC";
+    }
+    return result;
+}
+
+struct _tm_compat *gmtime_r(const time_t *t, struct _tm_compat *result)
+{
+    return localtime_r(t, result);
+}
+
+struct _tm_compat *gmtime(const time_t *t)
+{
+    static struct _tm_compat _gm;
+    return gmtime_r(t, &_gm);
+}
+
+time_t mktime(struct _tm_compat *tm)
+{
+    (void)tm;
+    return 0;
+}
+
+size_t strftime(char *s, size_t max, const char *fmt, const struct _tm_compat *tm)
+{
+    (void)fmt; (void)tm;
+    if (s && max > 0) s[0] = '\0';
+    return 0;
+}
+
+long clock(void) { return 0; }
+
+/* ── malloc_usable_size stub ── */
+
+size_t malloc_usable_size(const void *ptr)
+{
+    (void)ptr;
+    return 0;
+}
+
+/* ── strtoimax / strtoumax ── */
+
+long strtoimax(const char *s, char **endp, int base)
+{
+    return strtol(s, endp, base);
+}
+
+unsigned long strtoumax(const char *s, char **endp, int base)
+{
+    return strtoul(s, endp, base);
+}
+
+/* ── getpid ── */
+
+int getpid(void) { return 1; }
+
 /* ── exit ── */
 
 void exit(int status)
@@ -1076,6 +1311,39 @@ void exit(int status)
     }
     __syscall1(SYS_exit, status);
     __builtin_unreachable();
+}
+
+/* ── 128-bit integer division (GCC __int128 support for libbf.c) ── */
+
+typedef unsigned __int128 uint128_t;
+
+uint128_t __udivmodti4(uint128_t num, uint128_t den, uint128_t *rem)
+{
+    if (den == 0) { if (rem) *rem = 0; return 0; }
+    if (num < den) { if (rem) *rem = num; return 0; }
+    if (den == 1) { if (rem) *rem = 0; return num; }
+
+    /* Binary long division */
+    uint128_t quot = 0;
+    int shift = 0;
+
+    /* Find highest bit position of num */
+    uint128_t tmp = num;
+    while (tmp > den) { tmp >>= 1; shift++; }
+
+    for (int i = shift; i >= 0; i--) {
+        if (num >= (den << i)) {
+            num -= (den << i);
+            quot |= ((uint128_t)1 << i);
+        }
+    }
+    if (rem) *rem = num;
+    return quot;
+}
+
+uint128_t __udivti3(uint128_t a, uint128_t b)
+{
+    return __udivmodti4(a, b, (uint128_t *)0);
 }
 
 /* ── Assert ── */
