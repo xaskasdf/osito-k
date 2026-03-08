@@ -49,6 +49,9 @@ extern void shell_run(void);
 /* SMP */
 extern void smp_init(void);
 
+/* Dynamic linker */
+extern void dl_init(void);
+
 /* Serial */
 extern void serial_puts(const char *s);
 extern void serial_puthex(uint64_t val, int digits);
@@ -298,6 +301,9 @@ void kernel_entry(void *memory_map, uint64_t map_size,
 
     /* ── Step 1.9: Process subsystem ── */
     proc_init();
+
+    /* ── Step 1.10: Dynamic linker ── */
+    dl_init();
 
     /* ── Crypto self-test ── */
     {

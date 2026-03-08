@@ -175,13 +175,15 @@ arch/x86/kernel/tokenizer.c         BPE encode/decode (FNV-1a hash, greedy+merge
 arch/x86/kernel/smp.h               SMP types (cpu_info_t, spinlock_t) + API
 arch/x86/kernel/smp.c               Multi-core startup (MADT parse, trampoline, INIT-SIPI-SIPI)
 arch/x86/kernel/ap_trampoline.S     AP trampoline source (16→32→64 mode transition)
-arch/x86/kernel/shell.c             Interactive shell (16 builtins, argv parser, ELF exec)
+arch/x86/kernel/dynlink.c            Dynamic linker (dl_open/dl_sym/dl_close, ELF relocation, kernel symbol export)
+arch/x86/kernel/shell.c             Interactive shell (17 builtins, argv parser, ELF exec)
 arch/x86/include/types.h            Freestanding types + MMIO + port I/O
 arch/x86/libc/crt.c                 Minimal CRT (_start, printf, malloc, POSIX I/O wrappers)
 arch/x86/libc/syscall.S             Raw SYSCALL instruction wrappers (__syscall1-4)
 arch/x86/libc/Makefile              Build CRT + tcclib + link userspace ELFs
 arch/x86/libc/tcclib.c              Extended libc for TCC (FILE*, fprintf, strtol, qsort, setjmp stubs)
 arch/x86/test/tiny.c                Minimal test C program for TCC compilation test
+arch/x86/test/testmod.c              Test dynamic module (mod_hello, mod_add, mod_factorial, mod_square)
 
 # OsitoFS v2 Host Tools (tools/ositofs/)
 include/common/ositofs2_format.h     On-disk format (shared header)
@@ -365,6 +367,7 @@ Tasks:   idle, input, shell (3 of 8 slots used)
 | **X-INF3** | **VRAM-resident weights** (all model weights uploaded to VRAM at boot, weight cache lookup, zero-transfer matvec/rmsnorm, GPU logits, GMMU 768MB identity map) | Done |
 | **X-SMP** | **Multi-core AP startup** (ACPI MADT parse, INIT-SIPI-SIPI, 16→32→64 trampoline, AP LAPIC init, `cpus` shell command) | Done |
 | **X-PIPE** | **Pipes, dup2, signals, shell redirection** (pipe() circular buffer, dup2(), kill(), sigaction(), shell `>` / `>>` operators) | Done |
+| **X-DYN** | **Dynamic linking** (dl_open/dl_sym/dl_close, ET_DYN ELF loading, PT_DYNAMIC parse, R_X86_64_RELATIVE/GLOB_DAT/JUMP_SLOT relocations, kernel symbol export, `dl` shell command) | Done |
 
 > Full GPU roadmap (X27-X40 + contingency): see [docs/x86-gpu-roadmap.md](docs/x86-gpu-roadmap.md)
 > Full OS roadmap (Tier 0-5): see [docs/os-selfhost-roadmap.md](docs/os-selfhost-roadmap.md)
@@ -1036,6 +1039,19 @@ IPC pipes, signal delivery, and shell I/O redirection operators.
 - **Shell redirection**: `parse_redirects()` extracts `>`, `>>`, `<` operators from argv before dispatch. Output captured via `sh_redir_fn` hook in `sh_puts()`/`sh_puts_color()`/`sh_putdec()`. Captured bytes written to OsitoFS file via `osfs2_create()`/`osfs2_write()`. Append mode uses `osfs2_file_size()` offset.
 - **CRT wrappers**: `pipe()`, `dup2()`, `kill()` added to `arch/x86/libc/crt.c` for userspace programs.
 - **Files**: `arch/x86/kernel/syscall.c` (pipe/dup2/kill/sigaction syscalls, pipe_buf_t, signal state), `arch/x86/kernel/shell.c` (redirection parsing, output capture), `arch/x86/kernel/process.c` (proc_current_pid), `arch/x86/libc/crt.c` (userspace wrappers)
+
+### X-DYN: Dynamic Linking
+Runtime loading of ET_DYN ELF shared objects. Provides dlopen/dlsym/dlclose API for loadable kernel modules.
+- **dl_open(filename)**: Loads .so from OsitoFS. Validates ELF64 ET_DYN, allocates contiguous pages via `mem_alloc_aligned`, copies PT_LOAD segments, parses PT_DYNAMIC for DT_SYMTAB/DT_STRTAB/DT_HASH/DT_RELA/DT_JMPREL, applies relocations, calls DT_INIT. Returns opaque handle. Refcount on duplicate open.
+- **dl_sym(handle, name)**: Symbol lookup. ELF SysV hash (DT_HASH: O(1) via bucket/chain) with linear scan fallback. Returns address of global/weak symbols defined in module. Skips SHN_UNDEF.
+- **dl_close(handle)**: Decrements refcount. On last close: calls DT_FINI, `mem_free_pages`, releases slot.
+- **Relocations**: R_X86_64_RELATIVE (base adjustment, most common in PIC), R_X86_64_GLOB_DAT (GOT entries), R_X86_64_JUMP_SLOT (PLT entries), R_X86_64_64 (absolute 64-bit). Both `.rela.dyn` and `.rela.plt` processed.
+- **Kernel symbol export**: `ksym_table[]` maps names to kernel function addresses (serial_puts, fb_puts, fb_puts_color, fb_putdec, serial_putdec, serial_puthex, kmalloc, kfree). Modules reference these via R_X86_64_JUMP_SLOT relocations; linker resolves at load time.
+- **DT_GNU_HASH fallback**: When DT_HASH absent, `gnu_hash_nsyms()` computes symbol count by scanning GNU hash buckets + chains.
+- **Module table**: 8 slots. Tracks: base, load_bias, size, pages, symtab, strtab, hashtab, init/fini, refcount.
+- **Shell command**: `dl load <file.so>`, `dl sym <file.so> <name>`, `dl call <file.so> <name>` (call void fn), `dl close <file.so>`, `dl list` (show modules + exported symbols).
+- **Test module**: `arch/x86/test/testmod.c` — exports mod_add, mod_hello, mod_factorial, mod_square. References kernel serial_puts/fb_puts/fb_puts_color. Build: `gcc -shared -fPIC -nostdlib -Wl,--hash-style=sysv -o testmod.so testmod.c`.
+- **Files**: `arch/x86/kernel/dynlink.c` (dynamic linker), `arch/x86/test/testmod.c` (test module), `arch/x86/kernel/shell.c` (dl command), `arch/x86/kernel/main.c` (dl_init call)
 
 ### AArch64/SM8350 Port (arch/arm/)
 Reference bare-metal code for ASUS ROG Phone 5 (Snapdragon 888).

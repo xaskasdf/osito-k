@@ -213,6 +213,7 @@ static void cmd_help(void)
     sh_puts("  claude    Claude REPL (multi-turn conversation)\n");
     sh_puts("  chat      Local inference (chat <prompt>)\n");
     sh_puts("  temp      Set sampling (temp <temperature> [top_p])\n");
+    sh_puts("  dl        Dynamic linker (dl load/sym/call/close/list)\n");
     sh_puts("  clear     Clear screen\n");
     sh_puts("  reboot    Reboot system\n");
     sh_puts("  halt      Halt CPU\n");
@@ -1123,6 +1124,80 @@ static void cmd_cpus(void)
     }
 }
 
+/* ── Builtin: dl (dynamic linker) ─────────────────────────────── */
+
+extern void *dl_open(const char *filename);
+extern void *dl_sym(void *handle, const char *name);
+extern int   dl_close(void *handle);
+extern void  dl_list_modules(void);
+extern void *dl_find(const char *name);
+
+static void cmd_dl(int argc, char *argv[])
+{
+    if (argc < 2) {
+        sh_puts("Usage:\n");
+        sh_puts("  dl load <file.so>        Load shared object\n");
+        sh_puts("  dl sym <file.so> <name>  Look up symbol address\n");
+        sh_puts("  dl call <file.so> <name> Call void(*)(void) function\n");
+        sh_puts("  dl close <file.so>       Unload module\n");
+        sh_puts("  dl list                  List loaded modules\n");
+        return;
+    }
+
+    if (strcmp(argv[1], "load") == 0) {
+        if (argc < 3) { sh_puts("Usage: dl load <file.so>\n"); return; }
+        void *h = dl_open(argv[2]);
+        if (h) {
+            sh_puts_color("Module loaded.\n", 0x0000FF00);
+        } else {
+            sh_puts_color("Load failed.\n", 0x00FF0000);
+        }
+    } else if (strcmp(argv[1], "sym") == 0) {
+        if (argc < 4) { sh_puts("Usage: dl sym <file.so> <name>\n"); return; }
+        void *h = dl_find(argv[2]);
+        if (!h) { sh_puts("Module not loaded: "); sh_puts(argv[2]); sh_puts("\n"); return; }
+        void *sym = dl_sym(h, argv[3]);
+        if (sym) {
+            sh_puts(argv[3]);
+            sh_puts(" = 0x");
+            serial_puthex((uint64_t)sym, 16);
+            /* Also show on fb as decimal (no hex helper there) */
+            fb_puts(argv[3]);
+            fb_puts(" found\n");
+            sh_puts("\n");
+        } else {
+            sh_puts("Symbol not found: ");
+            sh_puts(argv[3]);
+            sh_puts("\n");
+        }
+    } else if (strcmp(argv[1], "call") == 0) {
+        if (argc < 4) { sh_puts("Usage: dl call <file.so> <name>\n"); return; }
+        void *h = dl_find(argv[2]);
+        if (!h) { sh_puts("Module not loaded: "); sh_puts(argv[2]); sh_puts("\n"); return; }
+        void *sym = dl_sym(h, argv[3]);
+        if (!sym) { sh_puts("Symbol not found: "); sh_puts(argv[3]); sh_puts("\n"); return; }
+        sh_puts_color("Calling ", 0x0000FF00);
+        sh_puts(argv[3]);
+        sh_puts("()...\n");
+        void (*fn)(void) = (void (*)(void))sym;
+        fn();
+    } else if (strcmp(argv[1], "close") == 0) {
+        if (argc < 3) { sh_puts("Usage: dl close <file.so>\n"); return; }
+        void *h = dl_find(argv[2]);
+        if (!h) { sh_puts("Module not loaded: "); sh_puts(argv[2]); sh_puts("\n"); return; }
+        if (dl_close(h) == 0)
+            sh_puts_color("Module unloaded.\n", 0x0000FF00);
+        else
+            sh_puts_color("Unload failed.\n", 0x00FF0000);
+    } else if (strcmp(argv[1], "list") == 0) {
+        dl_list_modules();
+    } else {
+        sh_puts("Unknown: dl ");
+        sh_puts(argv[1]);
+        sh_puts("\n");
+    }
+}
+
 /* ── I/O redirection (X-PIPE) ─────────────────────────────────── */
 
 typedef struct {
@@ -1255,6 +1330,8 @@ static void shell_exec(char *line)
         cmd_chat(argc, argv);
     } else if (strcmp(cmd, "temp") == 0) {
         cmd_temp(argc, argv);
+    } else if (strcmp(cmd, "dl") == 0) {
+        cmd_dl(argc, argv);
     } else if (strcmp(cmd, "clear") == 0) {
         cmd_clear();
     } else if (strcmp(cmd, "reboot") == 0) {
