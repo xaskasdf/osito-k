@@ -76,6 +76,7 @@ typedef struct {
 
 typedef struct {
     uint32_t    pid;
+    uint32_t    ppid;           /* parent PID (for wait4) */
     uint32_t    state;
     char        name[MAX_NAME_LEN];
     int32_t     exit_code;
@@ -94,6 +95,7 @@ typedef struct {
     void    *kernel_stack;       /* allocated kernel stack (NULL for kernel proc) */
     uint64_t kernel_rsp;         /* saved RSP pointing to interrupt frame */
     uint32_t quantum;            /* ticks remaining in time slice */
+
 } process_t;
 
 /* ── Process table ───────────────────────────────────────────── */
@@ -108,6 +110,7 @@ extern void kern_longjmp(uint64_t *buf, int val);
 
 static uint64_t exec_jmpbuf[8];   /* setjmp/longjmp buffer */
 static int32_t  last_exit_code;
+
 
 /* Console I/O (shared with syscall.c) */
 extern void serial_putc(char c);
@@ -138,6 +141,7 @@ static process_t *proc_alloc(const char *name)
             process_t *p = &proctab[i];
             memset(p, 0, sizeof(*p));
             p->pid = next_pid++;
+            p->ppid = current_proc ? current_proc->pid : 0;
             p->state = PROC_READY;
             p->cr3 = paging_get_kernel_cr3();
 
@@ -211,6 +215,12 @@ int32_t proc_current_pid(void)
     return current_proc ? (int32_t)current_proc->pid : 0;
 }
 
+/* Get current parent PID */
+int32_t proc_current_ppid(void)
+{
+    return current_proc ? (int32_t)current_proc->ppid : 0;
+}
+
 /* Get current process name */
 const char *proc_current_name(void)
 {
@@ -227,9 +237,29 @@ process_t *proc_find(uint32_t pid)
     return NULL;
 }
 
-/* Process exit — called from sys_exit() */
+/* Process exit — called from sys_exit().
+ * Two cases:
+ *   1. Process started via proc_exec (shell) → longjmp back to shell
+ *   2. Process started via fork/execve → mark ZOMBIE, halt for scheduler */
 void proc_exit(int32_t code)
 {
+    process_t *p = current_proc;
+
+    /* If this process has a kernel_stack, it was created by fork/sched_spawn.
+     * Mark as ZOMBIE and let the scheduler switch away. Parent reaps via wait4. */
+    if (p && p->kernel_stack) {
+        p->exit_code = code;
+        p->state = PROC_ZOMBIE;
+        /* DON'T free memory regions here — we're still running on the
+         * user stack (SYSCALL doesn't switch stacks in ring-0 OS).
+         * proc_wait4 handles all cleanup after the process is reaped. */
+        /* Halt — scheduler will pick another process on next tick */
+        __asm__ volatile ("sti");
+        for (;;) __asm__ volatile ("hlt");
+    }
+
+    /* Normal exit — process started by proc_exec (shell's exec command).
+     * longjmp back to proc_exec which cleans up. */
     last_exit_code = code;
     kern_longjmp(exec_jmpbuf, 1);
 }
@@ -388,8 +418,9 @@ void sched_tick(void *frame_ptr)
 
     process_t *cur = &proctab[sched_current_idx];
 
-    /* Decrement quantum — if still running, continue */
-    if (cur->quantum > 1) {
+    /* Decrement quantum — if still running, continue.
+     * ZOMBIE processes always force-switch immediately. */
+    if (cur->state != PROC_ZOMBIE && cur->quantum > 1) {
         cur->quantum--;
         return;
     }
@@ -416,7 +447,10 @@ void sched_tick(void *frame_ptr)
      * GPRs on this process's stack (set by ISR stub before calling
      * isr_handler). Store it so we can restore later. */
     cur->kernel_rsp = (uint64_t)frame_ptr;
-    cur->state = PROC_READY;
+    /* Only mark as READY if currently RUNNING.
+     * ZOMBIE processes must stay ZOMBIE — proc_wait4 relies on this. */
+    if (cur->state == PROC_RUNNING)
+        cur->state = PROC_READY;
 
     /* Load next process */
     process_t *next = &proctab[next_idx];
@@ -539,6 +573,415 @@ void sched_test_b(void)
     }
     serial_puts("\n[thread_b] done\n");
     fb_puts("\n[thread_b] done\n");
+}
+
+/* ════════════════════════════════════════════════════════════════
+ * X-SYSCALL40: fork / wait4 / execve
+ *
+ * fork() creates a child with its own kernel stack containing a
+ * fake interrupt frame. The scheduler's IRETQ delivers the child
+ * to userspace with RAX=0 (fork return value for child).
+ * Parent returns immediately with child PID.
+ *
+ * Both processes share the same address space (identity-mapped).
+ * The child typically calls execve() immediately (gets new stack
+ * and code) or _exit(). Like vfork, but using the scheduler.
+ *
+ * proc_wait4():
+ *   Polls/blocks for ZOMBIE children, returns exit status.
+ *
+ * proc_execve():
+ *   Replace current process image with new ELF binary.
+ * ════════════════════════════════════════════════════════════════ */
+
+#define ECHILD  10
+#define WNOHANG  1
+
+/* User RSP saved by syscall_entry.S before any pushes */
+extern volatile uint64_t syscall_user_rsp;
+
+/*
+ * proc_fork — create child process via scheduler.
+ *
+ * Creates a child with a fake interrupt frame on its own kernel stack.
+ * When the scheduler switches to the child, IRETQ delivers it to
+ * userspace at the instruction after the SYSCALL, with RAX=0.
+ * Parent returns child PID immediately.
+ *
+ * ISR frame layout (176 bytes, 22 × uint64_t):
+ *   [0]=R15  [1]=R14  [2]=R13  [3]=R12  [4]=R11  [5]=R10
+ *   [6]=R9   [7]=R8   [8]=RBP  [9]=RDI  [10]=RSI [11]=RDX
+ *   [12]=RCX [13]=RBX [14]=RAX [15]=vector [16]=error_code
+ *   [17]=RIP [18]=CS  [19]=RFLAGS [20]=RSP [21]=SS
+ */
+int32_t proc_fork(void)
+{
+    if (!current_proc) return -1;
+
+    process_t *parent = current_proc;
+
+    /* We need the user's register state. The SYSCALL entry saved
+     * registers on the stack in this order (from RSP, 14 pushes):
+     *   RSP+0:  R9     (push #14)
+     *   RSP+8:  R8     (push #13)
+     *   RSP+16: R10    (push #12)
+     *   RSP+24: RDX    (push #11)
+     *   RSP+32: RSI    (push #10)
+     *   RSP+40: RDI    (push #9)
+     *   RSP+48: R11    (push #8) = user RFLAGS
+     *   RSP+56: RCX    (push #7) = user RIP
+     *   RSP+64: R15    (push #6)
+     *   RSP+72: R14    (push #5)
+     *   RSP+80: R13    (push #4)
+     *   RSP+88: R12    (push #3)
+     *   RSP+96: RBX    (push #2)
+     *   RSP+104: RBP   (push #1)
+     * But we can't access RSP from C (clobbered by function calls).
+     * Instead we use the known values we CAN get:
+     *   - User RIP  = RCX saved in syscall frame
+     *   - User RFLAGS = R11 saved in syscall frame
+     *   - User RSP = saved by syscall_entry.S in syscall_user_rsp
+     *   - Callee-saved regs (RBX,RBP,R12-R15) = read via inline asm
+     * The child doesn't need exact arg regs (RDI,RSI,etc.) because
+     * fork() returns only RAX, and callee-saved regs + RSP/RIP are
+     * what matters for resuming the C caller.
+     */
+
+    /* Read ALL user registers from the SYSCALL save area on the stack.
+     * syscall_entry.S saves user RSP in syscall_user_rsp before any pushes,
+     * then pushes 14 registers in this order:
+     *   push RBP, RBX, R12, R13, R14, R15, RCX(=RIP), R11(=RFLAGS),
+     *        RDI, RSI, RDX, R10, R8, R9
+     * So frame_base = user_rsp - 14*8 and the offsets are:
+     *   [0]=R9  [1]=R8  [2]=R10  [3]=RDX  [4]=RSI  [5]=RDI
+     *   [6]=R11(RFLAGS) [7]=RCX(RIP)
+     *   [8]=R15  [9]=R14  [10]=R13  [11]=R12  [12]=RBX  [13]=RBP
+     *
+     * IMPORTANT: We MUST read from the stack frame, NOT from inline asm.
+     * GCC may be using callee-saved registers (RBX, RBP, R12-R15) for
+     * its own purposes inside proc_fork. The stack frame has the actual
+     * user values saved at SYSCALL entry.
+     */
+    uint64_t user_rsp = syscall_user_rsp;
+    uint64_t *frame_base = (uint64_t *)(user_rsp - 14 * 8);
+
+    uint64_t user_r9     = frame_base[0];
+    uint64_t user_r8     = frame_base[1];
+    uint64_t user_r10    = frame_base[2];
+    uint64_t user_rdx    = frame_base[3];
+    uint64_t user_rsi    = frame_base[4];
+    uint64_t user_rdi    = frame_base[5];
+    uint64_t user_rflags = frame_base[6];   /* saved R11 = user RFLAGS */
+    uint64_t user_rip    = frame_base[7];   /* saved RCX = user RIP */
+    uint64_t r15         = frame_base[8];
+    uint64_t r14         = frame_base[9];
+    uint64_t r13         = frame_base[10];
+    uint64_t r12         = frame_base[11];
+    uint64_t rbx         = frame_base[12];
+    uint64_t rbp         = frame_base[13];
+
+    /* Allocate child process */
+    process_t *child = proc_alloc(parent->name);
+    if (!child) {
+        serial_puts("[FORK] Process table full\n");
+        return -1;
+    }
+
+    child->ppid = parent->pid;
+
+    /* Copy FD table from parent */
+    for (int i = 0; i < MAX_FDS; i++)
+        child->fds[i] = parent->fds[i];
+
+    child->region_count = 0;
+
+    /* Allocate kernel stack for the child */
+    void *stack = mem_alloc_aligned(KERNEL_STACK_SIZE, 4096);
+    if (!stack) {
+        child->state = PROC_FREE;
+        serial_puts("[FORK] Stack alloc failed\n");
+        return -1;
+    }
+    child->kernel_stack = stack;
+
+    uint64_t stack_top = (uint64_t)stack + KERNEL_STACK_SIZE;
+
+    /* Build fake interrupt frame at top of child's kernel stack.
+     * When the scheduler switches to this process, the ISR stub
+     * pops GPRs from this frame and IRETQ returns to userspace. */
+    uint64_t child_frame_addr = (stack_top - 176) & ~0xFULL;
+    uint64_t *cf = (uint64_t *)child_frame_addr;
+    memset(cf, 0, 176);
+
+    /* GPRs — match parent's values */
+    cf[0]  = r15;           /* R15 */
+    cf[1]  = r14;           /* R14 */
+    cf[2]  = r13;           /* R13 */
+    cf[3]  = r12;           /* R12 */
+    cf[4]  = user_rflags;   /* R11 (not used after IRETQ, but matches parent) */
+    cf[5]  = user_r10;      /* R10 */
+    cf[6]  = user_r9;       /* R9  */
+    cf[7]  = user_r8;       /* R8  */
+    cf[8]  = rbp;           /* RBP */
+    cf[9]  = user_rdi;      /* RDI */
+    cf[10] = user_rsi;      /* RSI */
+    cf[11] = user_rdx;      /* RDX */
+    cf[12] = user_rip;      /* RCX (unused after IRETQ) */
+    cf[13] = rbx;           /* RBX */
+    cf[14] = 0;             /* RAX = 0 → fork returns 0 to child */
+    cf[15] = 0;             /* vector (unused) */
+    cf[16] = 0;             /* error_code (unused) */
+
+    /* Allocate a separate user stack for the child.
+     * Without this, parent and child share the same user stack and
+     * the scheduler's concurrent execution corrupts both frames.
+     * Copy a portion of the parent's stack so the child has valid
+     * return addresses and local variables for the short time before
+     * it calls exec() or _exit(). */
+#define CHILD_USTACK_SIZE  (64 * 1024)  /* Same size as ELF loader */
+#define CHILD_USTACK_COPY  (32 * 1024)  /* Copy top 32KB of used stack */
+
+    void *child_ustack = mem_alloc_aligned(CHILD_USTACK_SIZE, 4096);
+    if (!child_ustack) {
+        mem_free_pages(stack, KERNEL_STACK_SIZE / 4096);
+        child->state = PROC_FREE;
+        serial_puts("[FORK] User stack alloc failed\n");
+        return -1;
+    }
+    memset(child_ustack, 0, CHILD_USTACK_SIZE);
+
+    /* The parent's stack grows downward. user_rsp is the current top of the
+     * used portion. We copy CHILD_USTACK_COPY bytes above user_rsp (the used
+     * frames: return addresses, local variables, etc.). */
+    uint64_t child_ustack_top = (uint64_t)child_ustack + CHILD_USTACK_SIZE;
+    uint64_t copy_size = CHILD_USTACK_COPY;
+    /* Copy from parent's [user_rsp .. user_rsp + copy_size) to child */
+    memcpy((void *)(child_ustack_top - copy_size),
+           (void *)user_rsp, copy_size);
+
+    /* Child's RSP = same offset from top as parent's */
+    uint64_t child_user_rsp = child_ustack_top - copy_size;
+
+    /* Register child user stack for cleanup on exit */
+    if (child->region_count < MAX_REGIONS) {
+        child->regions[child->region_count].base = child_ustack;
+        child->regions[child->region_count].pages = CHILD_USTACK_SIZE / 4096;
+        child->region_count++;
+    }
+
+    /* IRETQ frame */
+    cf[17] = user_rip;      /* RIP = return to userspace after SYSCALL */
+    cf[18] = 0x38;          /* CS  = kernel code segment */
+    cf[19] = user_rflags | 0x200;  /* RFLAGS with IF=1 */
+    cf[20] = child_user_rsp; /* RSP = child's own stack (copied from parent) */
+    cf[21] = 0x30;          /* SS  = kernel data segment */
+
+    /* Adjust child's RBP to point into the new stack if it was in the
+     * parent's stack range. This is needed for frame pointer unwinding. */
+    if (rbp >= user_rsp && rbp < user_rsp + copy_size) {
+        cf[8] = child_user_rsp + (rbp - user_rsp);  /* RBP adjusted */
+    }
+
+    /* Relocate saved frame pointers within the copied stack.
+     *
+     * The copied stack contains saved RBP values (pushed by function
+     * prologues) that point into the PARENT's stack. When the child
+     * returns through these functions, `pop %rbp` restores a parent
+     * pointer, causing the child to read/write parent stack memory.
+     *
+     * Fix: scan the copied region for any 8-byte value that falls
+     * within the parent's copied range [user_rsp .. user_rsp+copy_size),
+     * and adjust it by the parent→child delta. This catches all saved
+     * frame pointers without needing to walk the frame chain. */
+    {
+        int64_t delta = (int64_t)child_user_rsp - (int64_t)user_rsp;
+        uint64_t *scan = (uint64_t *)child_user_rsp;
+        uint64_t scan_count = copy_size / 8;
+        for (uint64_t i = 0; i < scan_count; i++) {
+            uint64_t val = scan[i];
+            if (val >= user_rsp && val < user_rsp + copy_size) {
+                scan[i] = val + delta;
+            }
+        }
+    }
+
+    /* Set up scheduler state */
+    child->kernel_rsp = child_frame_addr;
+    child->state = PROC_READY;
+    child->quantum = SCHED_QUANTUM;
+
+    /* Ensure scheduler tracks the parent (currently running) process.
+     * proc_exec started the parent outside the scheduler, so sched_current_idx
+     * may still point to the kernel process. Fix that now. */
+    int parent_idx = (int)(parent - &proctab[0]);
+    sched_current_idx = parent_idx;
+    parent->quantum = SCHED_QUANTUM;
+
+    /* The parent (ELF process from proc_exec) doesn't have a kernel_stack
+     * because it was started via the setjmp/longjmp lifecycle. It's running
+     * on the same stack as the kernel. The scheduler can still save/restore
+     * its context via the timer ISR frame — kernel_rsp will be set by
+     * sched_tick when the timer next fires. */
+
+    /* Enable scheduler if not already */
+    if (!sched_enabled) {
+        sched_enabled = true;
+        serial_puts("[SCHED] Preemptive scheduling activated (by fork)\n");
+    }
+
+    /* Parent returns child PID immediately */
+    return (int32_t)child->pid;
+}
+
+/*
+ * proc_wait4 — wait for child process state change.
+ * pid==-1: any child. pid>0: specific child.
+ * Returns child PID on success, -ECHILD if no children.
+ */
+int32_t proc_wait4(int32_t pid, int *wstatus, int options)
+{
+    if (!current_proc) return -ECHILD;
+
+    uint32_t my_pid = current_proc->pid;
+    bool has_children = false;
+
+    for (int i = 0; i < MAX_PROCESSES; i++) {
+        if (proctab[i].state == PROC_FREE) continue;
+        if (proctab[i].ppid != my_pid) continue;
+
+        has_children = true;
+
+        if (pid > 0 && proctab[i].pid != (uint32_t)pid)
+            continue;
+
+        if (proctab[i].state == PROC_ZOMBIE) {
+            int32_t child_pid = (int32_t)proctab[i].pid;
+            if (wstatus)
+                *wstatus = (proctab[i].exit_code & 0xFF) << 8;
+
+            /* Free child resources */
+            proctab[i].state = PROC_FREE;
+            for (int r = 0; r < proctab[i].region_count; r++) {
+                if (proctab[i].regions[r].base &&
+                    proctab[i].regions[r].pages > 0)
+                    mem_free_pages(proctab[i].regions[r].base,
+                                   proctab[i].regions[r].pages);
+            }
+            proctab[i].region_count = 0;
+            if (proctab[i].kernel_stack) {
+                mem_free_pages(proctab[i].kernel_stack,
+                               KERNEL_STACK_SIZE / 4096);
+                proctab[i].kernel_stack = NULL;
+            }
+
+            return child_pid;
+        }
+    }
+
+    if (!has_children)
+        return -ECHILD;
+
+    /* WNOHANG: return 0 if no child has exited yet */
+    if (options & WNOHANG)
+        return 0;
+
+    /* Blocking wait: poll until a child becomes ZOMBIE.
+     * SYSCALL entry disables interrupts (FMASK clears IF).
+     * We MUST enable them so the scheduler can run the child.
+     * STI + HLT + CLI: allow one timer tick, then re-disable. */
+    for (int tries = 0; tries < 10000; tries++) {
+        __asm__ volatile ("sti; hlt; cli");
+
+        for (int i = 0; i < MAX_PROCESSES; i++) {
+            if (proctab[i].state != PROC_ZOMBIE) continue;
+            if (proctab[i].ppid != my_pid) continue;
+            if (pid > 0 && proctab[i].pid != (uint32_t)pid) continue;
+
+            int32_t child_pid = (int32_t)proctab[i].pid;
+            if (wstatus)
+                *wstatus = (proctab[i].exit_code & 0xFF) << 8;
+
+            proctab[i].state = PROC_FREE;
+            /* Free memory regions (user stack, ELF segments) */
+            for (int r = 0; r < proctab[i].region_count; r++) {
+                if (proctab[i].regions[r].base &&
+                    proctab[i].regions[r].pages > 0)
+                    mem_free_pages(proctab[i].regions[r].base,
+                                   proctab[i].regions[r].pages);
+            }
+            proctab[i].region_count = 0;
+            if (proctab[i].kernel_stack) {
+                mem_free_pages(proctab[i].kernel_stack,
+                               KERNEL_STACK_SIZE / 4096);
+                proctab[i].kernel_stack = NULL;
+            }
+
+            return child_pid;
+        }
+    }
+
+    return -ECHILD;
+}
+
+/*
+ * proc_execve — replace current process image with new ELF.
+ * Called from sys_execve. The current process gets a new ELF loaded.
+ * For forked children: elf_exec gives them their own stack+segments.
+ */
+int proc_execve(const char *path, char *const argv[])
+{
+    if (!current_proc || !path) return -1;
+
+    process_t *p = current_proc;
+
+    serial_puts("[EXECVE] pid ");
+    serial_putdec(p->pid);
+    serial_puts(" -> '");
+    serial_puts(path);
+    serial_puts("'\n");
+
+    /* Update process name */
+    int j = 0;
+    const char *basename = path;
+    for (const char *c = path; *c; c++)
+        if (*c == '/') basename = c + 1;
+    while (basename[j] && j < MAX_NAME_LEN - 1) {
+        p->name[j] = basename[j];
+        j++;
+    }
+    p->name[j] = '\0';
+
+    /* Free old memory regions from previous exec (if any) */
+    for (int i = 0; i < p->region_count; i++) {
+        if (p->regions[i].base && p->regions[i].pages > 0)
+            mem_free_pages(p->regions[i].base, p->regions[i].pages);
+    }
+    p->region_count = 0;
+
+    /* Count argc from argv */
+    int argc = 0;
+    if (argv) {
+        while (argv[argc]) argc++;
+    }
+
+    /* Reset per-process syscall state (brk, file FDs) */
+    syscall_reset_process();
+
+    /* Close non-stdio FDs */
+    for (int i = 3; i < MAX_FDS; i++)
+        p->fds[i].open = false;
+
+    /* Execute the ELF — does not return on success.
+     * elf_exec loads segments, sets up stack, jumps to entry.
+     * When the process exits, proc_exit() handles cleanup. */
+    int ret = elf_exec(path, argc, (const char **)argv);
+
+    /* If we get here, exec failed */
+    serial_puts("[EXECVE] Failed: ");
+    serial_puts(path);
+    serial_puts("\n");
+
+    return ret;
 }
 
 /* ── Initialize process subsystem ────────────────────────────── */

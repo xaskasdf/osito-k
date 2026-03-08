@@ -131,8 +131,31 @@ static inline void wrmsr(uint32_t msr, uint64_t val) {
 #define SYS_TGKILL      234
 #define SYS_NEWFSTATAT  262
 #define SYS_SET_ROBUST_LIST 273
+#define SYS_SENDFILE    40
+#define SYS_WAIT4       61
+#define SYS_UNAME       63
+#define SYS_GETUID      102
+#define SYS_GETGID      104
+#define SYS_SETUID      105
+#define SYS_SETGID      106
+#define SYS_GETEUID     107
+#define SYS_GETEGID     108
+#define SYS_GETPPID     110
+#define SYS_GETPGRP     111
+#define SYS_SETSID      112
+#define SYS_GETGROUPS   115
+#define SYS_PRCTL       157
+#define SYS_OPENAT      257
+#define SYS_READLINKAT  267
+#define SYS_DUP3        292
+#define SYS_PIPE2       293
 #define SYS_PRLIMIT64   302
 #define SYS_GETRANDOM   318
+#define SYS_RSEQ        334
+#define SYS_CLOSE_RANGE 436
+#define SYS_MADVISE     28
+#define SYS_STAT        4
+#define SYS_LSTAT       6
 
 /* errno values */
 #define EPERM    1
@@ -1091,6 +1114,7 @@ static int64_t sys_dup2(uint64_t oldfd, uint64_t newfd)
 /* ── kill(pid, sig) — send signal ──────────────────────────── */
 
 extern int32_t proc_current_pid(void);
+extern int32_t proc_current_ppid(void);
 
 static int64_t sys_kill(uint64_t pid, uint64_t sig)
 {
@@ -1484,6 +1508,201 @@ static int64_t sys_dup(uint64_t oldfd)
 
 #define SYS_DUP 32
 
+/* ── Busybox/POSIX syscalls (X-SYSCALL40) ────────────────────── */
+
+/* openat — open relative to directory fd */
+static int64_t sys_openat(uint64_t dirfd, uint64_t path_addr,
+                           uint64_t flags, uint64_t mode)
+{
+    (void)dirfd;  /* AT_FDCWD (-100) = relative to cwd, same as open */
+    return sys_open(path_addr, flags, mode);
+}
+
+/* Forward declaration for readlinkat */
+static int64_t sys_readlink(uint64_t path_addr, uint64_t buf_addr, uint64_t bufsiz);
+
+/* readlinkat — readlink relative to directory fd */
+static int64_t sys_readlinkat(uint64_t dirfd, uint64_t path_addr,
+                               uint64_t buf_addr, uint64_t bufsiz)
+{
+    (void)dirfd;
+    return sys_readlink(path_addr, buf_addr, bufsiz);
+}
+
+/* uname — return system information */
+typedef struct {
+    char sysname[65];
+    char nodename[65];
+    char release[65];
+    char version[65];
+    char machine[65];
+    char domainname[65];
+} utsname_t;
+
+static int64_t sys_uname(uint64_t buf_addr)
+{
+    if (!buf_addr) return -EFAULT;
+    utsname_t *u = (utsname_t *)buf_addr;
+    memset(u, 0, sizeof(*u));
+    strcpy(u->sysname, "OsitoK");
+    strcpy(u->nodename, "osito");
+    strcpy(u->release, "1.0.0");
+    strcpy(u->version, "bare-metal x86-64");
+    strcpy(u->machine, "x86_64");
+    return 0;
+}
+
+/* prctl — process control */
+#define PR_SET_NAME 15
+#define PR_GET_NAME 16
+
+static char prctl_name[16] = "kernel";
+
+static int64_t sys_prctl(uint64_t option, uint64_t arg2,
+                          uint64_t arg3, uint64_t arg4, uint64_t arg5)
+{
+    (void)arg3; (void)arg4; (void)arg5;
+    switch (option) {
+    case PR_SET_NAME:
+        if (!arg2) return -EFAULT;
+        memset(prctl_name, 0, 16);
+        { const char *src = (const char *)arg2;
+          for (int i = 0; i < 15 && src[i]; i++) prctl_name[i] = src[i]; }
+        return 0;
+    case PR_GET_NAME:
+        if (!arg2) return -EFAULT;
+        memcpy((void *)arg2, prctl_name, 16);
+        return 0;
+    default:
+        return 0;  /* Silently accept unknown prctl options */
+    }
+}
+
+/* sendfile — copy data between file descriptors */
+static int64_t sys_sendfile(uint64_t out_fd, uint64_t in_fd,
+                             uint64_t offset_ptr, uint64_t count)
+{
+    if (out_fd >= MAX_FDS || !fd_table[out_fd].open) return -EBADF;
+    if (in_fd >= MAX_FDS || !fd_table[in_fd].open) return -EBADF;
+
+    /* If offset provided, seek input first */
+    if (offset_ptr) {
+        int64_t *offp = (int64_t *)offset_ptr;
+        fd_entry_t *inf = &fd_table[in_fd];
+        if (inf->type == FD_TYPE_FILE)
+            inf->offset = (uint64_t)*offp;
+    }
+
+    /* Copy in chunks via stack buffer */
+    char buf[2048];
+    int64_t total = 0;
+    while ((uint64_t)total < count) {
+        uint64_t chunk = count - (uint64_t)total;
+        if (chunk > sizeof(buf)) chunk = sizeof(buf);
+        int64_t nr = sys_read(in_fd, (uint64_t)buf, chunk);
+        if (nr <= 0) break;
+        int64_t nw = sys_write(out_fd, (uint64_t)buf, (uint64_t)nr);
+        if (nw < 0) return (total > 0) ? total : nw;
+        total += nw;
+        if (nw < nr) break;
+    }
+
+    /* Update offset if provided */
+    if (offset_ptr) {
+        int64_t *offp = (int64_t *)offset_ptr;
+        *offp += total;
+    }
+
+    return total;
+}
+
+/* pipe2 — pipe with flags */
+static int64_t sys_pipe2(uint64_t pipefd_addr, uint64_t flags)
+{
+    (void)flags;  /* ignore O_CLOEXEC/O_NONBLOCK for now */
+    return sys_pipe(pipefd_addr);
+}
+
+/* dup3 — dup2 with flags */
+static int64_t sys_dup3(uint64_t oldfd, uint64_t newfd, uint64_t flags)
+{
+    (void)flags;
+    return sys_dup2(oldfd, newfd);
+}
+
+/* close_range — close a range of file descriptors */
+static int64_t sys_close_range(uint64_t first, uint64_t last, uint64_t flags)
+{
+    (void)flags;
+    if (last >= MAX_FDS) last = MAX_FDS - 1;
+    for (uint64_t i = first; i <= last; i++) {
+        if (fd_table[i].open)
+            sys_close(i);
+    }
+    return 0;
+}
+
+/* ── clone/fork + wait4 (X-SYSCALL40 process management) ─────── */
+
+/* Process table access for clone/fork */
+extern int32_t proc_fork(void);
+extern int32_t proc_wait4(int32_t pid, int *wstatus, int options);
+
+/*
+ * sys_clone — create child process (fork semantics).
+ * Busybox calls clone(SIGCHLD, NULL, NULL, NULL, 0) which is equivalent to fork().
+ * Full CLONE_VM|CLONE_THREAD (threads) is NOT supported yet.
+ */
+static int64_t sys_clone(uint64_t flags, uint64_t child_stack,
+                          uint64_t ptid, uint64_t ctid, uint64_t tls)
+{
+    (void)child_stack; (void)ptid; (void)ctid; (void)tls;
+
+    /* Check for unsupported thread flags */
+    uint64_t thread_flags = 0x00010000 | 0x00000100 | 0x00002000;
+    /* CLONE_VM | CLONE_THREAD | CLONE_SIGHAND */
+    if (flags & thread_flags)
+        return -ENOSYS;  /* No thread support yet */
+
+    /* Fork semantics: SIGCHLD flag (or bare CLONE_CHILD_CLEARTID etc.) */
+    int32_t ret = proc_fork();
+    return (int64_t)ret;
+}
+
+/* wait4 — wait for child process */
+static int64_t sys_wait4(uint64_t pid, uint64_t wstatus_addr,
+                          uint64_t options, uint64_t rusage)
+{
+    (void)rusage;
+    int wstatus = 0;
+    int32_t ret = proc_wait4((int32_t)pid, &wstatus, (int)options);
+    if (ret > 0 && wstatus_addr) {
+        *(int *)wstatus_addr = wstatus;
+    }
+    return (int64_t)ret;
+}
+
+/* execve — replace process image (basic impl) */
+extern int proc_execve(const char *path, char *const argv[]);
+
+static int64_t sys_execve(uint64_t path_addr, uint64_t argv_addr, uint64_t envp_addr)
+{
+    (void)envp_addr;
+    const char *path = (const char *)path_addr;
+    if (!path) return -EFAULT;
+
+    int ret = proc_execve(path, (char *const *)argv_addr);
+    if (ret < 0) return -ENOENT;
+    /* If execve succeeds, it doesn't return */
+    return 0;
+}
+
+/* stat/lstat — stat by path (reuse newfstatat logic) */
+static int64_t sys_stat(uint64_t path_addr, uint64_t statbuf_addr)
+{
+    return sys_newfstatat((uint64_t)AT_FDCWD, path_addr, statbuf_addr, 0);
+}
+
 /* ── VFS: getcwd, readlink, getdents64 (X-VFS) ──────────────── */
 
 static int64_t sys_getcwd(uint64_t buf_addr, uint64_t size)
@@ -1590,9 +1809,26 @@ static int64_t sys_getdents64(uint64_t fd, uint64_t dirp_addr, uint64_t count)
 
 /* ── Syscall dispatch (called from assembly) ─────────────────── */
 
+/* Debug: serial port direct write (no function call, no relocation issues) */
+static inline void dbg_serial_char(char c) {
+    while (!(inb(0x3FD) & 0x20)) {}
+    outb(0x3F8, c);
+}
+static inline void dbg_serial_hex8(uint8_t v) {
+    const char *h = "0123456789ABCDEF";
+    dbg_serial_char(h[v >> 4]);
+    dbg_serial_char(h[v & 0xF]);
+}
+
 int64_t syscall_dispatch(uint64_t nr, uint64_t a1, uint64_t a2,
                          uint64_t a3, uint64_t a4, uint64_t a5)
 {
+    /* Debug: emit syscall number as hex to serial (PIE-safe) */
+    dbg_serial_char('<');
+    dbg_serial_hex8((uint8_t)(nr >> 8));
+    dbg_serial_hex8((uint8_t)nr);
+    dbg_serial_char('>');
+
     switch (nr) {
     case SYS_READ:       return sys_read(a1, a2, a3);
     case SYS_WRITE:      return sys_write(a1, a2, a3);
@@ -1618,17 +1854,34 @@ int64_t syscall_dispatch(uint64_t nr, uint64_t a1, uint64_t a2,
     case SYS_DUP2:       return sys_dup2(a1, a2);
     case SYS_NANOSLEEP:  return sys_nanosleep(a1, a2);
     case SYS_GETPID:     return sys_getpid();
-    case SYS_CLONE:      return -ENOSYS;  /* no threads yet */
-    case SYS_FORK:       return -ENOSYS;  /* no fork */
-    case SYS_EXECVE:     return -ENOSYS;  /* use proc_exec */
+    case SYS_MADVISE:    return 0;  /* ignore hints */
+    case SYS_STAT:       return sys_stat(a1, a2);
+    case SYS_LSTAT:      return sys_stat(a1, a2);  /* no symlinks */
+    case SYS_SENDFILE:   return sys_sendfile(a1, a2, a3, a4);
+    case SYS_CLONE:      return sys_clone(a1, a2, a3, a4, a5);
+    case SYS_FORK:       return sys_clone(17 /* SIGCHLD */, 0, 0, 0, 0);
+    case SYS_EXECVE:     return sys_execve(a1, a2, a3);
     case SYS_EXIT:       return sys_exit(a1);
+    case SYS_WAIT4:      return sys_wait4(a1, a2, a3, a4);
     case SYS_KILL:       return sys_kill(a1, a2);
+    case SYS_UNAME:      return sys_uname(a1);
     case SYS_FCNTL:      return sys_fcntl(a1, a2, a3);
     case SYS_FSYNC:      return 0;  /* no-op */
     case SYS_GETCWD:     return sys_getcwd(a1, a2);
     case SYS_UNLINK:     return sys_unlink(a1);
     case SYS_READLINK:   return sys_readlink(a1, a2, a3);
+    case SYS_GETUID:     return 0;
+    case SYS_GETGID:     return 0;
+    case SYS_SETUID:     return 0;
+    case SYS_SETGID:     return 0;
+    case SYS_GETEUID:    return 0;
+    case SYS_GETEGID:    return 0;
+    case SYS_GETPPID:    return (int64_t)proc_current_ppid();
+    case SYS_GETPGRP:    return (int64_t)proc_current_pid();
+    case SYS_SETSID:     return (int64_t)proc_current_pid();
+    case SYS_GETGROUPS:  return 0;  /* no supplementary groups */
     case SYS_SIGALTSTACK: return sys_sigaltstack(a1, a2);
+    case SYS_PRCTL:      return sys_prctl(a1, a2, a3, a4, a5);
     case SYS_ARCH_PRCTL: return sys_arch_prctl(a1, a2);
     case SYS_GETTID:     return sys_gettid();
     case SYS_FUTEX:      return sys_futex(a1, a2, a3, a4, a5);
@@ -1637,10 +1890,16 @@ int64_t syscall_dispatch(uint64_t nr, uint64_t a1, uint64_t a2,
     case SYS_CLOCK_GETTIME: return sys_clock_gettime(a1, a2);
     case SYS_EXIT_GROUP: return sys_exit_group(a1);
     case SYS_TGKILL:     return sys_kill(a2, a3);  /* reuse kill */
+    case SYS_OPENAT:     return sys_openat(a1, a2, a3, a4);
     case SYS_NEWFSTATAT: return sys_newfstatat(a1, a2, a3, a4);
+    case SYS_READLINKAT: return sys_readlinkat(a1, a2, a3, a4);
     case SYS_SET_ROBUST_LIST: return sys_set_robust_list(a1, a2);
+    case SYS_DUP3:       return sys_dup3(a1, a2, a3);
+    case SYS_PIPE2:      return sys_pipe2(a1, a2);
     case SYS_PRLIMIT64:  return sys_prlimit64(a1, a2, a3, a4);
     case SYS_GETRANDOM:  return sys_getrandom(a1, a2, a3);
+    case SYS_RSEQ:       return -ENOSYS;  /* musl handles gracefully */
+    case SYS_CLOSE_RANGE: return sys_close_range(a1, a2, a3);
     default:
         serial_puts("[SYSCALL] Unknown syscall ");
         serial_putdec(nr);

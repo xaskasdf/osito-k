@@ -22,6 +22,7 @@
 .code64
 .text
 
+.globl syscall_user_rsp
 .globl syscall_entry
 syscall_entry:
     /*
@@ -29,6 +30,9 @@ syscall_entry:
      * RCX = user RIP, R11 = user RFLAGS.
      * RSP is still the user stack (ring-0 only).
      */
+
+    /* Save user RSP for fork() — needed before any pushes */
+    movq %rsp, syscall_user_rsp(%rip)
 
     /* Save ALL user registers we might clobber.
      * SYSCALL ABI: only RAX (return value), RCX, R11 may change.
@@ -109,3 +113,10 @@ syscall_entry:
      */
     sti
     jmp *%rcx           /* Jump to saved RIP (in STI shadow) */
+
+/* ── Data section: user RSP saved on SYSCALL entry ─────────── */
+
+.section .bss
+.align 8
+syscall_user_rsp:
+    .quad 0
