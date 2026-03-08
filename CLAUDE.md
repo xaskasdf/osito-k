@@ -379,14 +379,14 @@ Tasks:   idle, input, shell (3 of 8 slots used)
 | **X-JS** | **QuickJS JavaScript engine** (QuickJS 2024-01-13 bare-metal port, x87 FPU math library, freestanding shim headers, `js` shell command, 1002KB ELF) | Done |
 | **X-GIT** | **Git version control** (SHA-1 + zlib DEFLATE, standard git objects, init/add/commit/log/status/diff/branch/checkout, `git` shell command) | Done |
 | **X-SCHED** | **Preemptive scheduler** (APIC timer round-robin, fake interrupt frame spawn, RSP-swap context switch in ISR stub, BSP-only guard for SMP safety, `sched` shell command) | Done |
+| **X-MMAP** | **mmap/munmap/mprotect** (MAP_ANONYMOUS identity-mapped, VMA tracking, page-level protection, CRT wrappers, 6/6 QEMU tests pass) | Done |
 
 > Full GPU roadmap (X27-X40 + contingency): see [docs/x86-gpu-roadmap.md](docs/x86-gpu-roadmap.md)
 > Full OS roadmap (Tiers 0-9): see [docs/os-selfhost-roadmap.md](docs/os-selfhost-roadmap.md)
 > Binary compatibility roadmap: see [docs/binary-compat-roadmap.md](docs/binary-compat-roadmap.md)
 > Paths to Claude analysis: see [docs/paths-to-claude-on-ositok.md](docs/paths-to-claude-on-ositok.md)
 
-**Tier 7+ (next)**: X-MMAP (mmap/munmap/mprotect),
-X-VFS (mount points, /dev, /proc), X-MUSL (musl libc port), X-THREAD (clone/futex),
+**Tier 7+ (next)**: X-VFS (mount points, /dev, /proc), X-MUSL (musl libc port), X-THREAD (clone/futex),
 X-EDIT (port kilo editor), X-HTTPD (TCP server), X-SELF (self-hosting kernel compile).
 See `docs/os-selfhost-roadmap.md` for full details and dependency chains.
 
@@ -1108,6 +1108,17 @@ Timer-based round-robin context switching via APIC timer (100Hz). First preempti
 - **Shell command**: `sched` spawns 2 test threads printing interleaved A/B chars. `sched stats` shows switch count and active status.
 - **Verified**: QEMU `-smp 4` — threads produce ABABAB... pattern (20 each), both terminate cleanly. No #GP or crashes.
 - **Files**: `arch/x86/kernel/process.c` (sched_tick, sched_spawn, sched_yield, test threads), `arch/x86/kernel/isr_stubs.S` (RSP swap + sched_switch_rsp BSS), `arch/x86/kernel/idt.c` (timer→sched_tick call), `arch/x86/kernel/shell.c` (sched command)
+
+### X-MMAP: mmap/munmap/mprotect
+Virtual memory mapping syscalls for anonymous page allocation, unmapping, and protection changes.
+- **sys_mmap (9)**: MAP_ANONYMOUS + MAP_PRIVATE only. Allocates contiguous physical pages via `mem_alloc_pages()`, returns identity-mapped address (virt == phys). Zeroes memory (POSIX guarantee). No file-backed mappings.
+- **sys_munmap (11)**: Frees pages via `mem_free_pages()`, removes VMA tracking entry. Supports exact and containing VMA matches.
+- **sys_mprotect (10)**: Changes page table flags via `paging_set_flags()` per 4KB page. Maps PROT_READ/WRITE/EXEC to PTE_PRESENT/WRITABLE/NX.
+- **VMA tracking**: Static array of 64 `vma_t` entries (base, pages, prot, in_use). Cleaned up on `syscall_reset_process()` — all mmap regions freed on process exit.
+- **Paging layer**: Added `paging_unmap_page()` (clear PTE + INVLPG) and `paging_set_flags()` (modify PTE flags + INVLPG) to `paging.c`. Both walk 4-level page tables, refuse on 2MB large pages.
+- **CRT wrappers**: `mmap()`, `munmap()`, `mprotect()` in `crt.c` via `__syscall5`/`__syscall6` (new 5-arg and 6-arg SYSCALL stubs in `syscall.S`).
+- **Verified**: 6/6 tests pass in QEMU — basic alloc, read/write, large alloc (64KB), zeroed guarantee, munmap, mprotect.
+- **Files**: `arch/x86/kernel/syscall.c` (VMA table, sys_mmap/munmap/mprotect), `arch/x86/kernel/paging.c` (unmap_page, set_flags), `arch/x86/libc/crt.c` (mmap/munmap/mprotect wrappers), `arch/x86/libc/syscall.S` (__syscall5/__syscall6), `arch/x86/test/mmap_test.c`
 
 ### AArch64/SM8350 Port (arch/arm/)
 Reference bare-metal code for ASUS ROG Phone 5 (Snapdragon 888).

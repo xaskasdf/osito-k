@@ -42,6 +42,29 @@ __syscall4:
     syscall
     ret
 
+.globl __syscall5
+__syscall5:
+    mov %rdi, %rax
+    mov %rsi, %rdi
+    mov %rdx, %rsi
+    mov %rcx, %rdx
+    mov %r8, %r10
+    mov %r9, %r8
+    syscall
+    ret
+
+.globl __syscall6
+__syscall6:
+    mov %rdi, %rax
+    mov %rsi, %rdi
+    mov %rdx, %rsi
+    mov %rcx, %rdx
+    mov %r8, %r10
+    mov %r9, %r8
+    mov 8(%rsp), %r9      /* 7th C arg is on stack */
+    syscall
+    ret
+
 /*
  * _setjmp / longjmp — save/restore execution context.
  * jmp_buf layout (8 x 8 = 64 bytes):

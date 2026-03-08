@@ -178,6 +178,60 @@ int paging_map_page(uint64_t virt, uint64_t phys, uint64_t flags)
     return ret;
 }
 
+/* Unmap a single 4KB page — clears PTE, invalidates TLB */
+int paging_unmap_page(uint64_t virt)
+{
+    if (!kernel_pml4) return -1;
+
+    uint64_t *pdpt, *pd, *pt;
+    int idx;
+
+    idx = PML4_INDEX(virt);
+    if (!(kernel_pml4[idx] & PTE_PRESENT)) return -1;
+    pdpt = (uint64_t *)(kernel_pml4[idx] & PTE_ADDR_MASK);
+
+    idx = PDPT_INDEX(virt);
+    if (!(pdpt[idx] & PTE_PRESENT)) return -1;
+    pd = (uint64_t *)(pdpt[idx] & PTE_ADDR_MASK);
+
+    idx = PD_INDEX(virt);
+    if (!(pd[idx] & PTE_PRESENT)) return -1;
+    if (pd[idx] & PTE_LARGE) return -1;  /* Can't unmap within 2MB page */
+    pt = (uint64_t *)(pd[idx] & PTE_ADDR_MASK);
+
+    pt[PT_INDEX(virt)] = 0;
+    invlpg(virt);
+    return 0;
+}
+
+/* Change protection flags on a 4KB page */
+int paging_set_flags(uint64_t virt, uint64_t flags)
+{
+    if (!kernel_pml4) return -1;
+
+    uint64_t *pdpt, *pd, *pt;
+    int idx;
+
+    idx = PML4_INDEX(virt);
+    if (!(kernel_pml4[idx] & PTE_PRESENT)) return -1;
+    pdpt = (uint64_t *)(kernel_pml4[idx] & PTE_ADDR_MASK);
+
+    idx = PDPT_INDEX(virt);
+    if (!(pdpt[idx] & PTE_PRESENT)) return -1;
+    pd = (uint64_t *)(pdpt[idx] & PTE_ADDR_MASK);
+
+    idx = PD_INDEX(virt);
+    if (!(pd[idx] & PTE_PRESENT)) return -1;
+    if (pd[idx] & PTE_LARGE) return -1;  /* Can't change 2MB page flags */
+    pt = (uint64_t *)(pd[idx] & PTE_ADDR_MASK);
+
+    idx = PT_INDEX(virt);
+    uint64_t phys = pt[idx] & PTE_ADDR_MASK;
+    pt[idx] = phys | flags;
+    invlpg(virt);
+    return 0;
+}
+
 /* Map an MMIO region (uncacheable) */
 int paging_map_mmio(uint64_t phys, uint64_t size)
 {

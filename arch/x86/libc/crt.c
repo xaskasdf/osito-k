@@ -13,19 +13,24 @@ extern long __syscall1(long nr, long a1);
 extern long __syscall2(long nr, long a1, long a2);
 extern long __syscall3(long nr, long a1, long a2, long a3);
 extern long __syscall4(long nr, long a1, long a2, long a3, long a4);
+extern long __syscall5(long nr, long a1, long a2, long a3, long a4, long a5);
+extern long __syscall6(long nr, long a1, long a2, long a3, long a4, long a5, long a6);
 
 /* ── Syscall numbers (Linux x86-64) ── */
 
-#define SYS_read    0
-#define SYS_write   1
-#define SYS_open    2
-#define SYS_close   3
-#define SYS_lseek   8
-#define SYS_brk     12
-#define SYS_pipe    22
-#define SYS_dup2    33
-#define SYS_exit    60
-#define SYS_kill    62
+#define SYS_read      0
+#define SYS_write     1
+#define SYS_open      2
+#define SYS_close     3
+#define SYS_lseek     8
+#define SYS_mmap      9
+#define SYS_mprotect  10
+#define SYS_munmap    11
+#define SYS_brk       12
+#define SYS_pipe      22
+#define SYS_dup2      33
+#define SYS_exit      60
+#define SYS_kill      62
 
 /* ── POSIX-like wrappers ── */
 
@@ -76,6 +81,35 @@ int dup2(int oldfd, int newfd)
 int kill(int pid, int sig)
 {
     return (int)__syscall2(SYS_kill, pid, sig);
+}
+
+/* ── mmap/munmap/mprotect ── */
+
+#define PROT_NONE   0x0
+#define PROT_READ   0x1
+#define PROT_WRITE  0x2
+#define PROT_EXEC   0x4
+
+#define MAP_PRIVATE   0x02
+#define MAP_ANONYMOUS 0x20
+#define MAP_FAILED    ((void *)-1)
+
+void *mmap(void *addr, size_t length, int prot, int flags, int fd, long offset)
+{
+    long ret = __syscall6(SYS_mmap, (long)addr, (long)length,
+                          (long)prot, (long)flags, (long)fd, offset);
+    if (ret < 0) return MAP_FAILED;
+    return (void *)ret;
+}
+
+int munmap(void *addr, size_t length)
+{
+    return (int)__syscall2(SYS_munmap, (long)addr, (long)length);
+}
+
+int mprotect(void *addr, size_t length, int prot)
+{
+    return (int)__syscall3(SYS_mprotect, (long)addr, (long)length, (long)prot);
 }
 
 /* ── brk-based malloc (bump allocator) ── */

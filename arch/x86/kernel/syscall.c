@@ -15,6 +15,9 @@
  *   3 = close(fd)
  *   5 = fstat(fd, statbuf)
  *   8 = lseek(fd, offset, whence)
+ *   9 = mmap(addr, len, prot, flags, fd, offset)
+ *  10 = mprotect(addr, len, prot)
+ *  11 = munmap(addr, len)
  *  12 = brk(addr)
  *  13 = sigaction(sig, act, oldact)
  *  22 = pipe(pipefd[2])
@@ -47,6 +50,15 @@ extern void *osfs2_create(const char *name, uint64_t size);
 extern void *kmalloc(uint64_t size);
 extern void  kfree(void *ptr);
 
+/* Physical memory */
+extern void *mem_alloc_pages(uint64_t count);
+extern void  mem_free_pages(void *addr, uint64_t count);
+
+/* Paging */
+extern int paging_map_page(uint64_t virt, uint64_t phys, uint64_t flags);
+extern int paging_unmap_page(uint64_t virt);
+extern int paging_set_flags(uint64_t virt, uint64_t flags);
+
 /* ── MSR definitions ─────────────────────────────────────────── */
 
 #define MSR_STAR    0xC0000081  /* Segment selectors for SYSCALL/SYSRET */
@@ -78,6 +90,9 @@ static inline void wrmsr(uint32_t msr, uint64_t val) {
 #define SYS_CLOSE       3
 #define SYS_FSTAT       5
 #define SYS_LSEEK       8
+#define SYS_MMAP        9
+#define SYS_MPROTECT    10
+#define SYS_MUNMAP      11
 #define SYS_BRK         12
 #define SYS_IOCTL       16
 #define SYS_WRITEV      20
@@ -488,6 +503,171 @@ static int64_t sys_brk(uint64_t addr)
     return (int64_t)(uint64_t)brk_current;
 }
 
+/* ── mmap/munmap/mprotect (X-MMAP) ────────────────────────────── */
+
+/* mmap flags (Linux values) */
+#define PROT_NONE       0x0
+#define PROT_READ       0x1
+#define PROT_WRITE      0x2
+#define PROT_EXEC       0x4
+
+#define MAP_SHARED      0x01
+#define MAP_PRIVATE     0x02
+#define MAP_FIXED       0x10
+#define MAP_ANONYMOUS   0x20
+#define MAP_ANON        MAP_ANONYMOUS
+
+/* Page table flags */
+#define PTE_PRESENT     (1ULL << 0)
+#define PTE_WRITABLE    (1ULL << 1)
+#define PTE_USER        (1ULL << 2)
+#define PTE_GLOBAL      (1ULL << 8)
+#define PTE_NX          (1ULL << 63)
+
+#define MAP_FAILED      ((uint64_t)-1)
+
+/* VMA tracking — per-process mmap regions */
+#define MAX_VMAS        64
+
+typedef struct {
+    uint64_t base;      /* virtual (== physical, identity-mapped) */
+    uint64_t pages;     /* number of 4KB pages */
+    uint32_t prot;      /* PROT_READ|PROT_WRITE|PROT_EXEC */
+    bool     in_use;
+} vma_t;
+
+static vma_t vma_table[MAX_VMAS];
+
+static uint64_t prot_to_pte_flags(uint32_t prot)
+{
+    uint64_t flags = PTE_PRESENT | PTE_GLOBAL;
+    if (prot & PROT_WRITE)
+        flags |= PTE_WRITABLE;
+    if (!(prot & PROT_EXEC))
+        flags |= PTE_NX;
+    return flags;
+}
+
+/*
+ * sys_mmap — MAP_ANONYMOUS only, identity-mapped.
+ * Allocates contiguous physical pages and returns phys addr (== virt addr).
+ * Linux ABI: mmap(addr, length, prot, flags, fd, offset)
+ *   args: a1=addr, a2=length, a3=prot, a4=flags, a5(R8)=fd, a6(R9)=offset
+ *   Note: R10 carries flags (a4 in our dispatch), fd is a5, offset is unused.
+ */
+static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
+                         uint64_t flags, uint64_t fd, uint64_t offset)
+{
+    (void)addr;    /* MAP_FIXED not supported yet */
+    (void)offset;
+
+    /* Only support anonymous private mappings */
+    if (!(flags & MAP_ANONYMOUS))
+        return -ENOSYS;  /* No file-backed mmap */
+    if (fd != (uint64_t)-1 && !(flags & MAP_ANONYMOUS))
+        return -EBADF;
+
+    if (length == 0) return -EINVAL;
+
+    /* Round up to page boundary */
+    uint64_t npages = (length + 4095) / 4096;
+
+    /* Find free VMA slot */
+    int vi = -1;
+    for (int i = 0; i < MAX_VMAS; i++) {
+        if (!vma_table[i].in_use) { vi = i; break; }
+    }
+    if (vi < 0) return -ENOMEM;
+
+    /* Allocate physical pages */
+    void *pages = mem_alloc_pages(npages);
+    if (!pages) return -ENOMEM;
+
+    uint64_t base = (uint64_t)pages;
+
+    /* Pages are already identity-mapped from paging_init (first 4GB at least).
+     * For pages above the initial identity map range, we'd need to map them.
+     * For now, paging_init maps all usable RAM, so allocated pages are mapped. */
+
+    /* Zero the memory (MAP_ANONYMOUS guarantees zeroed pages) */
+    memset(pages, 0, npages * 4096);
+
+    /* Track the VMA */
+    vma_table[vi].base   = base;
+    vma_table[vi].pages  = npages;
+    vma_table[vi].prot   = (uint32_t)prot;
+    vma_table[vi].in_use = true;
+
+    return (int64_t)base;
+}
+
+/* sys_munmap — unmap pages allocated by mmap */
+static int64_t sys_munmap(uint64_t addr, uint64_t length)
+{
+    if (!addr || (addr & 0xFFF)) return -EINVAL;  /* must be page-aligned */
+    if (length == 0) return -EINVAL;
+
+    uint64_t npages = (length + 4095) / 4096;
+
+    /* Find matching VMA */
+    for (int i = 0; i < MAX_VMAS; i++) {
+        if (!vma_table[i].in_use) continue;
+        if (vma_table[i].base == addr && vma_table[i].pages == npages) {
+            /* Free physical pages */
+            mem_free_pages((void *)addr, npages);
+            vma_table[i].in_use = false;
+            return 0;
+        }
+    }
+
+    /* Partial unmap: find VMA containing this range */
+    for (int i = 0; i < MAX_VMAS; i++) {
+        if (!vma_table[i].in_use) continue;
+        uint64_t vma_end = vma_table[i].base + vma_table[i].pages * 4096;
+        if (addr >= vma_table[i].base && addr + npages * 4096 <= vma_end) {
+            /* For simplicity, free the pages and mark VMA as unused.
+             * Full partial-unmap (splitting VMAs) not needed yet. */
+            mem_free_pages((void *)addr, npages);
+            vma_table[i].in_use = false;
+            return 0;
+        }
+    }
+
+    return -EINVAL;
+}
+
+/* sys_mprotect — change protection flags on mapped pages */
+static int64_t sys_mprotect(uint64_t addr, uint64_t length, uint64_t prot)
+{
+    if (!addr || (addr & 0xFFF)) return -EINVAL;
+    if (length == 0) return -EINVAL;
+
+    uint64_t npages = (length + 4095) / 4096;
+
+    /* Find VMA containing this range */
+    for (int i = 0; i < MAX_VMAS; i++) {
+        if (!vma_table[i].in_use) continue;
+        uint64_t vma_end = vma_table[i].base + vma_table[i].pages * 4096;
+        if (addr >= vma_table[i].base && addr + npages * 4096 <= vma_end) {
+            uint64_t pte_flags = prot_to_pte_flags((uint32_t)prot);
+
+            /* Update page table entries */
+            for (uint64_t p = 0; p < npages; p++) {
+                uint64_t va = addr + p * 4096;
+                paging_set_flags(va, pte_flags);
+            }
+
+            /* Update VMA prot */
+            vma_table[i].prot = (uint32_t)prot;
+            return 0;
+        }
+    }
+
+    /* If addr is in identity-mapped region (not from mmap),
+     * still allow mprotect as a no-op for compatibility */
+    return 0;
+}
+
 /* writev — gather write (used by printf/puts in newlib) */
 typedef struct {
     uint64_t iov_base;
@@ -702,8 +882,6 @@ void syscall_check_signals(void)
 int64_t syscall_dispatch(uint64_t nr, uint64_t a1, uint64_t a2,
                          uint64_t a3, uint64_t a4, uint64_t a5)
 {
-    (void)a4; (void)a5;
-
     switch (nr) {
     case SYS_READ:       return sys_read(a1, a2, a3);
     case SYS_WRITE:      return sys_write(a1, a2, a3);
@@ -711,6 +889,9 @@ int64_t syscall_dispatch(uint64_t nr, uint64_t a1, uint64_t a2,
     case SYS_CLOSE:      return sys_close(a1);
     case SYS_FSTAT:      return sys_fstat(a1, a2);
     case SYS_LSEEK:      return sys_lseek(a1, (int64_t)a2, a3);
+    case SYS_MMAP:       return sys_mmap(a1, a2, a3, a4, a5, 0);
+    case SYS_MPROTECT:   return sys_mprotect(a1, a2, a3);
+    case SYS_MUNMAP:     return sys_munmap(a1, a2);
     case SYS_BRK:        return sys_brk(a1);
     case SYS_IOCTL:      return sys_ioctl(a1, a2, a3);
     case SYS_WRITEV:     return sys_writev(a1, a2, a3);
@@ -760,6 +941,14 @@ void syscall_reset_process(void)
         brk_base = NULL;
         brk_current = NULL;
         brk_max = NULL;
+    }
+
+    /* Free mmap regions */
+    for (int i = 0; i < MAX_VMAS; i++) {
+        if (vma_table[i].in_use) {
+            mem_free_pages((void *)vma_table[i].base, vma_table[i].pages);
+            vma_table[i].in_use = false;
+        }
     }
 }
 
