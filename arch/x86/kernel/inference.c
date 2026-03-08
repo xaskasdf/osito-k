@@ -449,9 +449,9 @@ int llama_forward(llama_state_t *s, uint32_t token)
     return 0;
 }
 
-/* ── Argmax over logits ──────────────────────────────────────── */
+/* ── Sampling ────────────────────────────────────────────────── */
 
-static uint32_t argmax(const float *v, uint32_t n)
+uint32_t argmax(const float *v, uint32_t n)
 {
     uint32_t best = 0;
     float best_val = v[0];
@@ -462,6 +462,145 @@ static uint32_t argmax(const float *v, uint32_t n)
         }
     }
     return best;
+}
+
+/* PRNG: xorshift64 seeded from RDTSC */
+static uint64_t rng_state;
+
+static void rng_seed(void)
+{
+    rng_state = rdtsc();
+    if (rng_state == 0) rng_state = 0xDEADBEEFCAFE;
+}
+
+static uint64_t rng_next(void)
+{
+    uint64_t x = rng_state;
+    x ^= x << 13;
+    x ^= x >> 7;
+    x ^= x << 17;
+    rng_state = x;
+    return x;
+}
+
+/* Random float in [0, 1) */
+static float rng_float(void)
+{
+    return (float)(rng_next() >> 11) / (float)(1ULL << 53);
+}
+
+/* Index pair for sorting logits */
+typedef struct { float val; uint32_t idx; } logit_idx_t;
+
+/* Sample from logits with temperature + top-p (nucleus sampling).
+ *
+ * temperature: scales logits before softmax (0 = greedy, 1 = normal)
+ * top_p: cumulative probability cutoff (0.9 = typical)
+ *
+ * Uses a partial sort: find top-k candidates above threshold,
+ * then sample from their softmax distribution.
+ */
+uint32_t sample_topp(float *logits, uint32_t n,
+                     float temperature, float top_p)
+{
+    /* Temperature 0 = greedy */
+    if (temperature <= 0.0f)
+        return argmax(logits, n);
+
+    /* Apply temperature */
+    float inv_temp = 1.0f / temperature;
+    for (uint32_t i = 0; i < n; i++)
+        logits[i] *= inv_temp;
+
+    /* Find max for numerical stability */
+    float max_val = logits[0];
+    for (uint32_t i = 1; i < n; i++)
+        if (logits[i] > max_val) max_val = logits[i];
+
+    /* Softmax + collect candidates above a threshold.
+     * Pre-filter: skip logits more than 20 below max (exp(-20) ≈ 2e-9) */
+    extern float expf_bare(float x);
+    float cutoff = max_val - 20.0f;
+    float sum = 0.0f;
+
+    /* Use scratch buffer from state — logits array has vocab_size entries,
+     * we need at most vocab_size candidates. Use stack for small buffer,
+     * otherwise allocate. For 128K vocab, each entry is 8 bytes = 1MB.
+     * Use a fixed max to avoid stack overflow. */
+    #define SAMPLE_MAX_CANDIDATES 4096
+    static logit_idx_t candidates[SAMPLE_MAX_CANDIDATES];
+    uint32_t n_cand = 0;
+
+    for (uint32_t i = 0; i < n; i++) {
+        if (logits[i] < cutoff) continue;
+        float p = expf_bare(logits[i] - max_val);
+        sum += p;
+        if (n_cand < SAMPLE_MAX_CANDIDATES) {
+            candidates[n_cand].val = p;
+            candidates[n_cand].idx = i;
+            n_cand++;
+        }
+    }
+
+    if (n_cand == 0)
+        return argmax(logits, n);
+
+    /* Normalize */
+    for (uint32_t i = 0; i < n_cand; i++)
+        candidates[i].val /= sum;
+
+    /* Sort by probability (descending) — insertion sort, small n_cand */
+    for (uint32_t i = 1; i < n_cand; i++) {
+        logit_idx_t key = candidates[i];
+        int j = (int)i - 1;
+        while (j >= 0 && candidates[j].val < key.val) {
+            candidates[j + 1] = candidates[j];
+            j--;
+        }
+        candidates[j + 1] = key;
+    }
+
+    /* Top-p truncation */
+    float cum = 0.0f;
+    uint32_t last = n_cand;
+    for (uint32_t i = 0; i < n_cand; i++) {
+        cum += candidates[i].val;
+        if (cum >= top_p) {
+            last = i + 1;
+            break;
+        }
+    }
+
+    /* Re-normalize truncated distribution */
+    float trunc_sum = 0.0f;
+    for (uint32_t i = 0; i < last; i++)
+        trunc_sum += candidates[i].val;
+
+    /* Sample */
+    float r = rng_float() * trunc_sum;
+    float acc = 0.0f;
+    for (uint32_t i = 0; i < last; i++) {
+        acc += candidates[i].val;
+        if (acc >= r)
+            return candidates[i].idx;
+    }
+
+    return candidates[last - 1].idx;
+}
+
+/* Default sampling parameters */
+static float g_temperature = 0.6f;
+static float g_top_p = 0.9f;
+
+void llama_set_sampling(float temperature, float top_p)
+{
+    g_temperature = temperature;
+    g_top_p = top_p;
+}
+
+static uint32_t sample_next(float *logits, uint32_t vocab_size)
+{
+    return sample_topp(logits, vocab_size, g_temperature, g_top_p);
 }
 
 /* ══════════════════════════════════════════════════════════════
@@ -488,8 +627,20 @@ void llama_generate(llama_state_t *state, const uint32_t *prompt,
     fb_puts(" max gen\n");
 
     state->pos = 0;
+    rng_seed();
     uint64_t total_t0 = rdtsc();
     uint32_t total_tokens = 0;
+
+    serial_puts("[LLAMA] Sampling: temp=");
+    /* Print temperature as fixed point (avoid printf %f) */
+    uint32_t temp_int = (uint32_t)(g_temperature * 10.0f);
+    serial_putdec(temp_int / 10); serial_puts(".");
+    serial_putdec(temp_int % 10);
+    serial_puts(", top_p=");
+    uint32_t topp_int = (uint32_t)(g_top_p * 10.0f);
+    serial_putdec(topp_int / 10); serial_puts(".");
+    serial_putdec(topp_int % 10);
+    serial_puts("\n");
 
     /* ── Prefill: process prompt tokens ── */
     serial_puts("[LLAMA] Prefill:\n");
@@ -511,7 +662,7 @@ void llama_generate(llama_state_t *state, const uint32_t *prompt,
     serial_puts("[LLAMA] Generating:\n");
     fb_puts(" Generating...\n");
 
-    uint32_t next = argmax(state->logits, state->vocab_size);
+    uint32_t next = sample_next(state->logits, state->vocab_size);
 
     for (uint32_t step = 0; step < max_tokens; step++) {
         /* Check EOS */
@@ -558,7 +709,7 @@ void llama_generate(llama_state_t *state, const uint32_t *prompt,
         /* Print decoded text to framebuffer */
         if (text) fb_puts(text);
 
-        next = argmax(state->logits, state->vocab_size);
+        next = sample_next(state->logits, state->vocab_size);
     }
 
     /* ── Summary ── */
@@ -579,6 +730,135 @@ void llama_generate(llama_state_t *state, const uint32_t *prompt,
     fb_puts(" tok, ");
     fb_putdec(ms_per_tok);
     fb_puts(" ms/tok\n");
+}
+
+/* ══════════════════════════════════════════════════════════════
+ *  llama_chat — Text-in, text-out inference via tokenizer
+ *
+ *  Tokenizes input text, prepends BOS + Llama 3 chat template,
+ *  runs prefill + generation, streams decoded output via callback.
+ * ══════════════════════════════════════════════════════════════ */
+
+/* Tokenizer functions (tokenizer.c) */
+extern int tok_encode(const void *tok, const char *text, uint32_t text_len,
+                      uint32_t *out, uint32_t max_out);
+extern bool tok_is_ready(const void *tok);
+extern char g_tokenizer[];
+
+int llama_chat(llama_state_t *state, const char *text,
+               uint32_t max_tokens,
+               void (*on_token)(const char *text, void *ctx), void *ctx)
+{
+    if (!state || !text) return -1;
+
+    /* Compute text length */
+    uint32_t text_len = 0;
+    const char *p = text;
+    while (*p++) text_len++;
+
+    /* Check tokenizer */
+    if (!tok_is_ready(g_tokenizer)) {
+        serial_puts("[CHAT] Tokenizer not ready, falling back to BOS-only\n");
+        state->pos = 0;
+        uint32_t bos[] = { 128000 };
+        llama_generate(state, bos, 1, max_tokens);
+        return 0;
+    }
+
+    /* Build Llama 3 chat template:
+     * <|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\n
+     * {text}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n
+     *
+     * Special tokens:
+     *   128000 = <|begin_of_text|> (BOS)
+     *   128006 = <|start_header_id|>
+     *   128007 = <|end_header_id|>
+     *   128009 = <|eot_id|>
+     */
+
+    uint32_t tokens[1024];
+    uint32_t n = 0;
+
+    /* BOS + start header */
+    tokens[n++] = 128000;  /* <|begin_of_text|> */
+    tokens[n++] = 128006;  /* <|start_header_id|> */
+
+    /* Encode "user" */
+    int r = tok_encode(g_tokenizer, "user", 4, tokens + n, 1024 - n);
+    if (r > 0) n += (uint32_t)r;
+
+    tokens[n++] = 128007;  /* <|end_header_id|> */
+
+    /* Encode "\n\n" */
+    r = tok_encode(g_tokenizer, "\n\n", 2, tokens + n, 1024 - n);
+    if (r > 0) n += (uint32_t)r;
+
+    /* Encode user text */
+    r = tok_encode(g_tokenizer, text, text_len, tokens + n, 1024 - n);
+    if (r > 0) n += (uint32_t)r;
+
+    /* End user turn + start assistant */
+    tokens[n++] = 128009;  /* <|eot_id|> */
+    tokens[n++] = 128006;  /* <|start_header_id|> */
+
+    r = tok_encode(g_tokenizer, "assistant", 9, tokens + n, 1024 - n);
+    if (r > 0) n += (uint32_t)r;
+
+    tokens[n++] = 128007;  /* <|end_header_id|> */
+
+    r = tok_encode(g_tokenizer, "\n\n", 2, tokens + n, 1024 - n);
+    if (r > 0) n += (uint32_t)r;
+
+    serial_puts("[CHAT] Tokenized: ");
+    serial_putdec(n);
+    serial_puts(" tokens (");
+    serial_putdec(text_len);
+    serial_puts(" chars)\n");
+
+    /* Reset state */
+    state->pos = 0;
+
+    /* Prefill */
+    uint64_t t0 = rdtsc();
+    for (uint32_t i = 0; i < n; i++)
+        llama_forward(state, tokens[i]);
+    uint64_t t1 = rdtsc();
+
+    serial_puts("[CHAT] Prefill: ");
+    serial_putdec((t1 - t0) / 3000000);
+    serial_puts(" ms\n");
+
+    /* Generate */
+    rng_seed();
+    uint32_t next = sample_next(state->logits, state->vocab_size);
+    uint32_t gen = 0;
+
+    for (uint32_t step = 0; step < max_tokens; step++) {
+        if (next == LLAMA_EOS_1 || next == LLAMA_EOS_2) break;
+        if (state->pos >= state->max_seq) break;
+
+        /* Decode and deliver */
+        const char *tok_text = tok_global_decode(next);
+        if (tok_text && on_token) {
+            on_token(tok_text, ctx);
+        }
+
+        llama_forward(state, next);
+        gen++;
+        next = sample_next(state->logits, state->vocab_size);
+    }
+
+    uint64_t t2 = rdtsc();
+    uint64_t gen_ms = gen > 0 ? (t2 - t1) / 3000000 : 0;
+    uint64_t ms_per_tok = gen > 0 ? gen_ms / gen : 0;
+
+    serial_puts("[CHAT] Generated: ");
+    serial_putdec(gen);
+    serial_puts(" tokens (");
+    serial_putdec(ms_per_tok);
+    serial_puts(" ms/tok)\n");
+
+    return (int)gen;
 }
 
 /* ══════════════════════════════════════════════════════════════

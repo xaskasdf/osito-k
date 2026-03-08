@@ -31,6 +31,12 @@ const char *tok_global_decode(uint32_t id)
     return tok_decode_one(&g_tokenizer, id);
 }
 
+/* Check if tokenizer is initialized (opaque access for shell.c) */
+bool tok_is_ready(const tokenizer_t *tok)
+{
+    return tok && tok->ready;
+}
+
 /* ── Internal helpers ────────────────────────────────────────── */
 
 static uint32_t hash_bytes(const uint8_t *data, uint32_t len)

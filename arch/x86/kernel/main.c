@@ -97,7 +97,7 @@ extern int  gsp_boot(void);
 
 /* ── X-CPU3: UDP Prompt Server ────────────────────────────────── */
 
-static llama_state_t *prompt_llama;  /* Set after model init */
+llama_state_t *prompt_llama;  /* Set after model init, used by shell chat cmd */
 
 static void prompt_handler(const uint8_t *src_ip, uint16_t src_port,
                            const void *data, uint32_t len)
@@ -123,13 +123,9 @@ static void prompt_handler(const uint8_t *src_ip, uint16_t src_port,
     /* Reset model state for fresh generation */
     prompt_llama->pos = 0;
 
-    /* Use BOS token as prompt — received text is logged but not tokenized
-     * (tokenizer not implemented yet; token IDs would come from client) */
-    uint32_t prompt_tokens[] = { 128000 };  /* BOS */
-    uint32_t prompt_len_tok = 1;
+    const uint8_t *input = (const uint8_t *)data;
 
     /* Check if input looks like raw token IDs (starts with '#') */
-    const uint8_t *input = (const uint8_t *)data;
     if (len >= 2 && input[0] == '#') {
         /* Parse space-separated token IDs: "#128000 1234 5678" */
         uint32_t tokens[64];
@@ -152,17 +148,48 @@ static void prompt_handler(const uint8_t *src_ip, uint16_t src_port,
             serial_putdec(ntok);
             serial_puts(" tokens\n");
 
-            /* Prefill */
             for (uint32_t i = 0; i < ntok; i++)
                 llama_forward(prompt_llama, tokens[i]);
         }
-        prompt_len_tok = 0;  /* Already prefilled */
-    }
+    } else {
+        /* Text input — tokenize with BPE and use Llama 3 chat template */
+        extern int tok_encode(const void *, const char *, uint32_t,
+                              uint32_t *, uint32_t);
+        extern bool tok_is_ready(const void *);
+        extern char g_tokenizer[];
 
-    /* Prefill BOS if not already done */
-    if (prompt_len_tok > 0) {
-        for (uint32_t i = 0; i < prompt_len_tok; i++)
-            llama_forward(prompt_llama, prompt_tokens[i]);
+        uint32_t tokens[256];
+        uint32_t n = 0;
+
+        if (tok_is_ready(g_tokenizer)) {
+            /* Llama 3 chat template */
+            tokens[n++] = 128000;  /* <|begin_of_text|> */
+            tokens[n++] = 128006;  /* <|start_header_id|> */
+            int r = tok_encode(g_tokenizer, "user", 4, tokens + n, 256 - n);
+            if (r > 0) n += (uint32_t)r;
+            tokens[n++] = 128007;  /* <|end_header_id|> */
+            r = tok_encode(g_tokenizer, "\n\n", 2, tokens + n, 256 - n);
+            if (r > 0) n += (uint32_t)r;
+            r = tok_encode(g_tokenizer, (const char *)input, len, tokens + n, 256 - n);
+            if (r > 0) n += (uint32_t)r;
+            tokens[n++] = 128009;  /* <|eot_id|> */
+            tokens[n++] = 128006;  /* <|start_header_id|> */
+            r = tok_encode(g_tokenizer, "assistant", 9, tokens + n, 256 - n);
+            if (r > 0) n += (uint32_t)r;
+            tokens[n++] = 128007;  /* <|end_header_id|> */
+            r = tok_encode(g_tokenizer, "\n\n", 2, tokens + n, 256 - n);
+            if (r > 0) n += (uint32_t)r;
+
+            serial_puts("[PROMPT] Tokenized text: ");
+            serial_putdec(n);
+            serial_puts(" tokens\n");
+        } else {
+            /* Fallback: BOS only */
+            tokens[n++] = 128000;
+        }
+
+        for (uint32_t i = 0; i < n; i++)
+            llama_forward(prompt_llama, tokens[i]);
     }
 
     /* Generate up to 32 tokens, collect IDs */
@@ -172,37 +199,43 @@ static void prompt_handler(const uint8_t *src_ip, uint16_t src_port,
     /* Get vocab size from state */
     uint32_t vocab = prompt_llama->vocab_size;
 
-    /* Simple argmax */
-    extern uint32_t argmax(const float *v, uint32_t n);
+    /* Sample with temperature + top-p */
+    extern uint32_t sample_topp(float *, uint32_t, float, float);
 
-    uint32_t next = argmax(prompt_llama->logits, vocab);
+    uint32_t next = sample_topp(prompt_llama->logits, vocab, 0.6f, 0.9f);
 
     for (uint32_t step = 0; step < 32; step++) {
         if (next == 128001 || next == 128009) break;  /* EOS */
         gen_tokens[gen_count++] = next;
         llama_forward(prompt_llama, next);
-        next = argmax(prompt_llama->logits, vocab);
+        next = sample_topp(prompt_llama->logits, vocab, 0.6f, 0.9f);
     }
 
-    /* Send token IDs back as text: "128000 1234 5678\n" */
+    /* Send decoded text (or token IDs if no tokenizer) */
+    extern const char *tok_global_decode(uint32_t id);
     char resp[512];
     uint32_t pos = 0;
+
     for (uint32_t i = 0; i < gen_count && pos < 480; i++) {
-        uint32_t tok = gen_tokens[i];
-        /* Convert to decimal */
-        char num[12];
-        int nlen = 0;
-        if (tok == 0) { num[nlen++] = '0'; }
-        else {
-            uint32_t t = tok;
-            while (t > 0) { num[nlen++] = '0' + (t % 10); t /= 10; }
+        const char *text = tok_global_decode(gen_tokens[i]);
+        if (text) {
+            while (*text && pos < 480) resp[pos++] = *text++;
+        } else {
+            /* Fallback: decimal token ID */
+            uint32_t tok = gen_tokens[i];
+            char num[12];
+            int nlen = 0;
+            if (tok == 0) { num[nlen++] = '0'; }
+            else {
+                uint32_t t = tok;
+                while (t > 0) { num[nlen++] = '0' + (t % 10); t /= 10; }
+            }
+            for (int j = nlen - 1; j >= 0; j--)
+                resp[pos++] = num[j];
+            resp[pos++] = ' ';
         }
-        /* Reverse */
-        for (int j = nlen - 1; j >= 0; j--)
-            resp[pos++] = num[j];
-        resp[pos++] = ' ';
     }
-    if (pos > 0) resp[pos - 1] = '\n';  /* Replace trailing space */
+    if (pos > 0 && resp[pos - 1] == ' ') resp[pos - 1] = '\n';
 
     net_udp_send(src_ip, src_port, 7777, resp, pos);
 

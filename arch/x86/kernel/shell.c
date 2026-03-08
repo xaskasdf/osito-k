@@ -90,6 +90,19 @@ extern int  claude_chat(const void *messages, int msg_count,
                         const char *model, int max_tokens,
                         int (*callback)(const char *, uint32_t, void *), void *ctx);
 
+/* Tokenizer */
+extern char g_tokenizer[];  /* tokenizer_t (opaque) */
+extern int  tok_encode(const void *tok, const char *text, uint32_t text_len,
+                       uint32_t *out, uint32_t max_out);
+extern const char *tok_decode_one(const void *tok, uint32_t token_id);
+extern bool tok_is_ready(const void *tok);
+
+/* Inference */
+extern void *prompt_llama;  /* llama_state_t* from main.c */
+extern int  llama_chat(void *state, const char *text, uint32_t max_tokens,
+                       void (*on_token)(const char *text, void *ctx), void *ctx);
+extern void llama_set_sampling(float temperature, float top_p);
+
 /* ── Shell output helpers ────────────────────────────────────── */
 
 static void sh_puts(const char *s)
@@ -156,6 +169,8 @@ static void cmd_help(void)
     sh_puts("  curl      HTTPS GET (curl hostname [path])\n");
     sh_puts("  apikey    Set Claude API key (apikey sk-ant-...)\n");
     sh_puts("  ask       Ask Claude (ask <prompt>)\n");
+    sh_puts("  chat      Local inference (chat <prompt>)\n");
+    sh_puts("  temp      Set sampling (temp <temperature> [top_p])\n");
     sh_puts("  clear     Clear screen\n");
     sh_puts("  reboot    Reboot system\n");
     sh_puts("  halt      Halt CPU\n");
@@ -845,6 +860,96 @@ static void cmd_ask(int argc, char *argv[])
     }
 }
 
+/* ── Builtin: temp (sampling parameters) ─────────────────────── */
+
+/* Parse simple decimal float: "0.7", "1.0", "0" */
+static float parse_float(const char *s)
+{
+    float result = 0.0f;
+    float frac = 0.0f;
+    float div = 1.0f;
+    bool after_dot = false;
+
+    for (; *s; s++) {
+        if (*s == '.') { after_dot = true; continue; }
+        if (*s < '0' || *s > '9') break;
+        if (after_dot) {
+            div *= 10.0f;
+            frac += (*s - '0') / div;
+        } else {
+            result = result * 10.0f + (*s - '0');
+        }
+    }
+    return result + frac;
+}
+
+static void cmd_temp(int argc, char *argv[])
+{
+    if (argc < 2) {
+        sh_puts("Usage: temp <temperature> [top_p]\n");
+        sh_puts("  temperature: 0=greedy, 0.6=default, 1.0=creative\n");
+        sh_puts("  top_p:       0.9=default, 1.0=all tokens\n");
+        return;
+    }
+
+    float t = parse_float(argv[1]);
+    float p = 0.9f;
+    if (argc >= 3) p = parse_float(argv[2]);
+
+    llama_set_sampling(t, p);
+
+    sh_puts("Sampling: temp=");
+    sh_putdec((uint64_t)(t * 10.0f) / 10);
+    sh_puts(".");
+    sh_putdec((uint64_t)(t * 10.0f) % 10);
+    sh_puts(", top_p=");
+    sh_putdec((uint64_t)(p * 10.0f) / 10);
+    sh_puts(".");
+    sh_putdec((uint64_t)(p * 10.0f) % 10);
+    sh_puts("\n");
+}
+
+/* ── Builtin: chat (local inference) ─────────────────────────── */
+
+static void chat_token_cb(const char *text, void *ctx)
+{
+    (void)ctx;
+    sh_puts(text);
+}
+
+static void cmd_chat(int argc, char *argv[])
+{
+    if (argc < 2) {
+        sh_puts("Usage: chat <prompt>\n");
+        sh_puts("  Local Llama inference with tokenizer\n");
+        return;
+    }
+
+    if (!prompt_llama) {
+        sh_puts("No model loaded.\n");
+        return;
+    }
+
+    /* Reconstruct prompt from argv */
+    char prompt[1024];
+    int pp = 0;
+    for (int i = 1; i < argc; i++) {
+        if (i > 1 && pp < (int)sizeof(prompt) - 1) prompt[pp++] = ' ';
+        const char *w = argv[i];
+        while (*w && pp < (int)sizeof(prompt) - 1) prompt[pp++] = *w++;
+    }
+    prompt[pp] = '\0';
+
+    sh_puts_color("\nLlama: ", 0x00FF8800);
+
+    int r = llama_chat(prompt_llama, prompt, 128, chat_token_cb, NULL);
+    if (r < 0) {
+        sh_puts_color("[error]\n", 0x00FF0000);
+    } else {
+        sh_puts("\n");
+    }
+}
+
 /* ── Builtin: reboot ─────────────────────────────────────────── */
 
 static void cmd_reboot(void)
@@ -924,6 +1029,10 @@ static void shell_exec(char *line)
         cmd_apikey(argc, argv);
     } else if (strcmp(cmd, "ask") == 0) {
         cmd_ask(argc, argv);
+    } else if (strcmp(cmd, "chat") == 0) {
+        cmd_chat(argc, argv);
+    } else if (strcmp(cmd, "temp") == 0) {
+        cmd_temp(argc, argv);
     } else if (strcmp(cmd, "clear") == 0) {
         cmd_clear();
     } else if (strcmp(cmd, "reboot") == 0) {
