@@ -347,6 +347,21 @@ void kernel_entry(void *memory_map, uint64_t map_size,
                 bool model_ready = false;
 
                 if (gguf_load(&gguf_model) == 0 && gguf_model.num_tensors > 0) {
+                    /* Load tokenizer from GGUF metadata */
+                    {
+                        static gguf_tokenizer_t gtok;
+                        if (gguf_load_tokenizer(&gguf_model, &gtok) == 0) {
+                            extern int tok_init(void *, const char **,
+                                const uint32_t *, uint32_t, const char **,
+                                const uint32_t *, uint32_t, uint32_t, uint32_t);
+                            extern char g_tokenizer[];
+                            tok_init(g_tokenizer,
+                                     gtok.tokens, gtok.token_lens, gtok.n_tokens,
+                                     gtok.merges, gtok.merge_lens, gtok.n_merges,
+                                     gtok.bos_id, gtok.eos_id);
+                        }
+                    }
+
                     if (llama_init(&llama, &gguf_model, 256) == 0) {
                         /* CPU inference (baseline) */
                         uint32_t prompt[] = { 128000 };  /* BOS */

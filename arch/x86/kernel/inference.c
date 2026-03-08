@@ -24,6 +24,9 @@ extern void fb_putdec(uint64_t val);
 extern void *mem_alloc_pages(uint64_t count);
 extern void  mem_free_pages(void *addr, uint64_t count);
 
+/* Tokenizer decode (tokenizer.c) — returns NULL if tokenizer not initialized */
+extern const char *tok_global_decode(uint32_t id);
+
 /* ── Utility helpers ─────────────────────────────────────────── */
 
 #define PAGE_SZ 4096
@@ -535,12 +538,25 @@ void llama_generate(llama_state_t *state, const uint32_t *prompt,
 
         serial_puts("  [");
         serial_putdec(step + 1);
-        serial_puts("] token ");
-        serial_putdec(next);
+        serial_puts("] ");
+
+        /* Decode token to text if tokenizer available */
+        const char *text = tok_global_decode(next);
+        if (text) {
+            serial_puts("\"");
+            serial_puts(text);
+            serial_puts("\"");
+        } else {
+            serial_puts("token ");
+            serial_putdec(next);
+        }
         serial_puts(" (");
         serial_putdec(ms);
         serial_puts(" ms)\n");
         total_tokens++;
+
+        /* Print decoded text to framebuffer */
+        if (text) fb_puts(text);
 
         next = argmax(state->logits, state->vocab_size);
     }

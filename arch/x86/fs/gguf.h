@@ -105,4 +105,42 @@ int gguf_load(gguf_model_t *model);
  */
 gguf_tensor_t *gguf_find_tensor(gguf_model_t *model, const char *name);
 
+/* ── Tokenizer data extracted from GGUF metadata ──────────── */
+
+typedef struct {
+    /* Array of token strings (pointers into token_data buffer) */
+    const char **tokens;
+    uint32_t    *token_lens;
+    uint32_t     n_tokens;
+
+    /* Array of merge rule strings (pointers into merge_data buffer) */
+    const char **merges;
+    uint32_t    *merge_lens;
+    uint32_t     n_merges;
+
+    /* Special token IDs */
+    uint32_t bos_id;
+    uint32_t eos_id;
+
+    /* Backing buffers (caller must free) */
+    void *token_data;       /* raw strings for tokens */
+    void *merge_data;       /* raw strings for merges */
+
+    bool valid;
+} gguf_tokenizer_t;
+
+/*
+ * gguf_load_tokenizer — Extract tokenizer from GGUF metadata.
+ *
+ * Must be called after gguf_load (model->file_data must be valid).
+ * Allocates memory for token/merge arrays.
+ * Returns 0 on success, -1 if no tokenizer found.
+ */
+int gguf_load_tokenizer(gguf_model_t *model, gguf_tokenizer_t *tok);
+
+/*
+ * gguf_free_tokenizer — Free tokenizer data.
+ */
+void gguf_free_tokenizer(gguf_tokenizer_t *tok);
+
 #endif /* OSITOK_GGUF_H */

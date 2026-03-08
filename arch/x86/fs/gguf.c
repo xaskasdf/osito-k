@@ -454,3 +454,184 @@ gguf_tensor_t *gguf_find_tensor(gguf_model_t *model, const char *name)
     }
     return NULL;
 }
+
+/* ── Tokenizer extraction from GGUF metadata ─────────────────── */
+
+/* Read GGUF string into key_buf, returning length. -1 on error. */
+static int cur_string_len(gguf_cursor_t *c, char *out, uint64_t max_len)
+{
+    uint64_t len;
+    if (cur_u64(c, &len) < 0) return -1;
+
+    if (out && max_len > 0) {
+        uint64_t copy = len < (max_len - 1) ? len : (max_len - 1);
+        if (cur_read(c, out, copy) < 0) return -1;
+        out[copy] = '\0';
+        if (len > copy && cur_skip(c, len - copy) < 0) return -1;
+    } else {
+        if (cur_skip(c, len) < 0) return -1;
+    }
+    return (int)len;
+}
+
+/* Compare GGUF key name */
+static bool key_eq(const char *key, const char *target)
+{
+    while (*key && *target) {
+        if (*key != *target) return false;
+        key++;
+        target++;
+    }
+    return *key == *target;
+}
+
+int gguf_load_tokenizer(gguf_model_t *model, gguf_tokenizer_t *tok)
+{
+    memset(tok, 0, sizeof(*tok));
+
+    if (!model->file_data || model->file_size < 32) return -1;
+
+    /* Re-parse the GGUF header to find tokenizer metadata */
+    gguf_cursor_t c;
+    c.buf = (const uint8_t *)model->file_data;
+    c.size = model->file_size;
+    c.pos = 0;
+
+    uint32_t magic, version;
+    uint64_t tensor_count, kv_count;
+    if (cur_u32(&c, &magic) < 0) return -1;
+    if (magic != GGUF_MAGIC) return -1;
+    if (cur_u32(&c, &version) < 0) return -1;
+    if (cur_u64(&c, &tensor_count) < 0) return -1;
+    if (cur_u64(&c, &kv_count) < 0) return -1;
+
+    tok->bos_id = 128000;  /* Llama 3 defaults */
+    tok->eos_id = 128001;
+
+    /* First pass: scan for tokenizer keys to get sizes */
+    uint64_t tokens_offset = 0, merges_offset = 0;
+    uint32_t n_tokens = 0, n_merges = 0;
+
+    for (uint64_t i = 0; i < kv_count; i++) {
+        char key[128];
+        if (cur_string_len(&c, key, sizeof(key)) < 0) return -1;
+
+        uint32_t val_type;
+        if (cur_u32(&c, &val_type) < 0) return -1;
+
+        if (key_eq(key, "tokenizer.ggml.tokens") && val_type == GGUF_TYPE_ARRAY) {
+            uint32_t arr_type;
+            uint64_t arr_len;
+            if (cur_u32(&c, &arr_type) < 0) return -1;
+            if (cur_u64(&c, &arr_len) < 0) return -1;
+            if (arr_type != GGUF_TYPE_STRING) {
+                /* Skip non-string array */
+                for (uint64_t j = 0; j < arr_len; j++)
+                    if (cur_skip_value(&c, arr_type) < 0) return -1;
+                continue;
+            }
+            tokens_offset = c.pos;
+            n_tokens = (uint32_t)arr_len;
+            /* Skip the strings */
+            for (uint64_t j = 0; j < arr_len; j++)
+                if (cur_string(&c, NULL, 0) < 0) return -1;
+        } else if (key_eq(key, "tokenizer.ggml.merges") && val_type == GGUF_TYPE_ARRAY) {
+            uint32_t arr_type;
+            uint64_t arr_len;
+            if (cur_u32(&c, &arr_type) < 0) return -1;
+            if (cur_u64(&c, &arr_len) < 0) return -1;
+            if (arr_type != GGUF_TYPE_STRING) {
+                for (uint64_t j = 0; j < arr_len; j++)
+                    if (cur_skip_value(&c, arr_type) < 0) return -1;
+                continue;
+            }
+            merges_offset = c.pos;
+            n_merges = (uint32_t)arr_len;
+            for (uint64_t j = 0; j < arr_len; j++)
+                if (cur_string(&c, NULL, 0) < 0) return -1;
+        } else if (key_eq(key, "tokenizer.ggml.bos_token_id")) {
+            if (val_type == GGUF_TYPE_UINT32) {
+                cur_u32(&c, &tok->bos_id);
+            } else {
+                cur_skip_value(&c, val_type);
+            }
+        } else if (key_eq(key, "tokenizer.ggml.eos_token_id")) {
+            if (val_type == GGUF_TYPE_UINT32) {
+                cur_u32(&c, &tok->eos_id);
+            } else {
+                cur_skip_value(&c, val_type);
+            }
+        } else {
+            if (cur_skip_value(&c, val_type) < 0) return -1;
+        }
+    }
+
+    if (n_tokens == 0) {
+        serial_puts("[GGUF] No tokenizer found in metadata\n");
+        return -1;
+    }
+
+    serial_puts("[GGUF] Tokenizer: ");
+    serial_putdec(n_tokens);
+    serial_puts(" tokens, ");
+    serial_putdec(n_merges);
+    serial_puts(" merges\n");
+
+    /* Second pass: extract token strings */
+    /* Allocate arrays for pointers + lengths */
+    tok->tokens = (const char **)mem_alloc_aligned(
+        (uint64_t)n_tokens * sizeof(char *), 8);
+    tok->token_lens = (uint32_t *)mem_alloc_aligned(
+        (uint64_t)n_tokens * sizeof(uint32_t), 4);
+    if (!tok->tokens || !tok->token_lens) {
+        serial_puts("[GGUF] Failed to alloc token arrays\n");
+        return -1;
+    }
+    tok->n_tokens = n_tokens;
+
+    /* Point directly into the file buffer (zero-copy) */
+    c.pos = tokens_offset;
+    for (uint32_t i = 0; i < n_tokens; i++) {
+        uint64_t slen;
+        if (cur_u64(&c, &slen) < 0) return -1;
+        tok->tokens[i] = (const char *)(c.buf + c.pos);
+        tok->token_lens[i] = (uint32_t)slen;
+        if (cur_skip(&c, slen) < 0) return -1;
+    }
+    tok->token_data = NULL;  /* Zero-copy, no separate buffer */
+
+    /* Extract merge strings */
+    if (n_merges > 0 && merges_offset > 0) {
+        tok->merges = (const char **)mem_alloc_aligned(
+            (uint64_t)n_merges * sizeof(char *), 8);
+        tok->merge_lens = (uint32_t *)mem_alloc_aligned(
+            (uint64_t)n_merges * sizeof(uint32_t), 4);
+        if (!tok->merges || !tok->merge_lens) {
+            serial_puts("[GGUF] Failed to alloc merge arrays\n");
+            tok->n_merges = 0;
+        } else {
+            tok->n_merges = n_merges;
+            c.pos = merges_offset;
+            for (uint32_t i = 0; i < n_merges; i++) {
+                uint64_t slen;
+                if (cur_u64(&c, &slen) < 0) break;
+                tok->merges[i] = (const char *)(c.buf + c.pos);
+                tok->merge_lens[i] = (uint32_t)slen;
+                if (cur_skip(&c, slen) < 0) break;
+            }
+            tok->merge_data = NULL;
+        }
+    }
+
+    tok->valid = true;
+    return 0;
+}
+
+void gguf_free_tokenizer(gguf_tokenizer_t *tok)
+{
+    /* Zero-copy: tokens/merges point into file buffer, don't free.
+     * Only free the pointer arrays. */
+    (void)tok;
+    /* Arrays allocated via mem_alloc_aligned — not individually freeable
+     * with current allocator. Leak is acceptable (boot-time allocation). */
+}
