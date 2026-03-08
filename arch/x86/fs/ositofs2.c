@@ -409,6 +409,7 @@ bool osfs2_is_mounted(void)  { return mounted; }
 uint32_t osfs2_file_count(void) { return mounted ? superblock.file_count : 0; }
 const char *osfs2_label(void) { return mounted ? superblock.label : ""; }
 uint64_t osfs2_file_size(osfs2_file_t *file) { return file ? file->size : 0; }
+const char *osfs2_file_name(osfs2_file_t *file) { return file ? file->name : NULL; }
 
 /* Get nth valid file (0-indexed). Returns NULL if out of range. */
 osfs2_file_t *osfs2_file_at(uint32_t index)

@@ -211,6 +211,12 @@ int32_t proc_current_pid(void)
     return current_proc ? (int32_t)current_proc->pid : 0;
 }
 
+/* Get current process name */
+const char *proc_current_name(void)
+{
+    return current_proc ? current_proc->name : "kernel";
+}
+
 /* Get process by PID */
 process_t *proc_find(uint32_t pid)
 {

@@ -380,13 +380,14 @@ Tasks:   idle, input, shell (3 of 8 slots used)
 | **X-GIT** | **Git version control** (SHA-1 + zlib DEFLATE, standard git objects, init/add/commit/log/status/diff/branch/checkout, `git` shell command) | Done |
 | **X-SCHED** | **Preemptive scheduler** (APIC timer round-robin, fake interrupt frame spawn, RSP-swap context switch in ISR stub, BSP-only guard for SMP safety, `sched` shell command) | Done |
 | **X-MMAP** | **mmap/munmap/mprotect** (MAP_ANONYMOUS identity-mapped, VMA tracking, page-level protection, CRT wrappers, 6/6 QEMU tests pass) | Done |
+| **X-VFS** | **Virtual filesystem layer** (/dev/null,zero,urandom,console + /proc/self/status,maps + getcwd/readlink/getdents64 syscalls, 7/7 QEMU tests pass) | Done |
 
 > Full GPU roadmap (X27-X40 + contingency): see [docs/x86-gpu-roadmap.md](docs/x86-gpu-roadmap.md)
 > Full OS roadmap (Tiers 0-9): see [docs/os-selfhost-roadmap.md](docs/os-selfhost-roadmap.md)
 > Binary compatibility roadmap: see [docs/binary-compat-roadmap.md](docs/binary-compat-roadmap.md)
 > Paths to Claude analysis: see [docs/paths-to-claude-on-ositok.md](docs/paths-to-claude-on-ositok.md)
 
-**Tier 7+ (next)**: X-VFS (mount points, /dev, /proc), X-MUSL (musl libc port), X-THREAD (clone/futex),
+**Tier 7+ (next)**: X-MUSL (musl libc port), X-THREAD (clone/futex),
 X-EDIT (port kilo editor), X-HTTPD (TCP server), X-SELF (self-hosting kernel compile).
 See `docs/os-selfhost-roadmap.md` for full details and dependency chains.
 
@@ -1119,6 +1120,18 @@ Virtual memory mapping syscalls for anonymous page allocation, unmapping, and pr
 - **CRT wrappers**: `mmap()`, `munmap()`, `mprotect()` in `crt.c` via `__syscall5`/`__syscall6` (new 5-arg and 6-arg SYSCALL stubs in `syscall.S`).
 - **Verified**: 6/6 tests pass in QEMU — basic alloc, read/write, large alloc (64KB), zeroed guarantee, munmap, mprotect.
 - **Files**: `arch/x86/kernel/syscall.c` (VMA table, sys_mmap/munmap/mprotect), `arch/x86/kernel/paging.c` (unmap_page, set_flags), `arch/x86/libc/crt.c` (mmap/munmap/mprotect wrappers), `arch/x86/libc/syscall.S` (__syscall5/__syscall6), `arch/x86/test/mmap_test.c`
+
+### X-VFS: Virtual Filesystem Layer
+VFS dispatch in sys_open routes paths to virtual devices, procfs, or OsitoFS.
+- **Virtual devices**: `/dev/null` (read→EOF, write→discard), `/dev/zero` (read→zeros), `/dev/urandom` (xorshift64 PRNG seeded from RDTSC), `/dev/console` (serial+FB), `/dev/tty` (alias for console), `/dev/random` (alias for urandom).
+- **Procfs**: `/proc/self/status` (Name, Pid, State), `/proc/self/maps` (VMA table in Linux maps format). Content generated on open, served from static 4KB buffer.
+- **FD types**: `FD_TYPE_DEV` (device ID stored in offset field), `FD_TYPE_PROC` (read from generated buffer). Both integrated into sys_read/sys_write/sys_fstat.
+- **New syscalls**: getcwd(79) returns "/", readlink(89) handles /proc/self/exe, getdents64(217) lists /dev entries and OsitoFS files.
+- **Path routing**: sys_open checks `/dev/` and `/proc/` prefixes before falling through to OsitoFS. Leading "/" stripped for OsitoFS lookup compatibility.
+- **fstat**: DEV files return S_IFCHR with correct major:minor (1:3 null, 1:5 zero, 1:9 urandom, 5:1 console). PROC files return S_IFREG|0444.
+- **osfs2_file_name()**: New accessor added to ositofs2.c for getdents64.
+- **Verified**: 7/7 tests pass in QEMU — null R/W, zero, urandom, proc/self/status, console, ENOENT.
+- **Files**: `arch/x86/kernel/syscall.c` (VFS dispatch, dev/proc handlers, getcwd/readlink/getdents64), `arch/x86/kernel/process.c` (proc_current_name), `arch/x86/fs/ositofs2.c` (osfs2_file_name), `arch/x86/test/vfs_test.c`
 
 ### AArch64/SM8350 Port (arch/arm/)
 Reference bare-metal code for ASUS ROG Phone 5 (Snapdragon 888).

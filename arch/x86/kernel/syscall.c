@@ -102,6 +102,9 @@ static inline void wrmsr(uint32_t msr, uint64_t val) {
 #define SYS_KILL        62
 #define SYS_EXIT        60
 #define SYS_UNLINK      87
+#define SYS_GETCWD      79
+#define SYS_READLINK    89
+#define SYS_GETDENTS64  217
 #define SYS_ARCH_PRCTL  158
 #define SYS_SIGACTION   13
 #define SYS_SIGRETURN   15
@@ -121,6 +124,7 @@ static inline void wrmsr(uint32_t msr, uint64_t val) {
 #define EPIPE   32
 #define ESRCH    3
 #define EAGAIN  11
+#define ENOTDIR 20
 
 /* open flags (Linux values) */
 #define O_RDONLY    0x0000
@@ -143,6 +147,8 @@ static inline void wrmsr(uint32_t msr, uint64_t val) {
 #define FD_TYPE_CONSOLE 1
 #define FD_TYPE_FILE    2
 #define FD_TYPE_PIPE    3
+#define FD_TYPE_DEV     4   /* virtual device (/dev/null, /dev/zero, etc.) */
+#define FD_TYPE_PROC    5   /* virtual procfs (/proc/self/maps, etc.) */
 
 typedef ssize_t (*fd_write_fn)(const void *buf, size_t count);
 typedef ssize_t (*fd_read_fn)(void *buf, size_t count);
@@ -246,6 +252,70 @@ static uint8_t *brk_base;      /* start of brk region */
 static uint8_t *brk_current;   /* current break */
 static uint8_t *brk_max;       /* end of brk region */
 
+/* ── mmap/VFS shared definitions ───────────────────────────────── */
+
+/* mmap flags (Linux values) */
+#define PROT_NONE       0x0
+#define PROT_READ       0x1
+#define PROT_WRITE      0x2
+#define PROT_EXEC       0x4
+
+#define MAP_SHARED      0x01
+#define MAP_PRIVATE     0x02
+#define MAP_FIXED       0x10
+#define MAP_ANONYMOUS   0x20
+#define MAP_ANON        MAP_ANONYMOUS
+
+/* Page table flags */
+#define PTE_PRESENT     (1ULL << 0)
+#define PTE_WRITABLE    (1ULL << 1)
+#define PTE_USER        (1ULL << 2)
+#define PTE_GLOBAL      (1ULL << 8)
+#define PTE_NX          (1ULL << 63)
+
+#define MAP_FAILED      ((uint64_t)-1)
+
+/* VMA tracking — per-process mmap regions */
+#define MAX_VMAS        64
+
+typedef struct {
+    uint64_t base;      /* virtual (== physical, identity-mapped) */
+    uint64_t pages;     /* number of 4KB pages */
+    uint32_t prot;      /* PROT_READ|PROT_WRITE|PROT_EXEC */
+    bool     in_use;
+} vma_t;
+
+static vma_t vma_table[MAX_VMAS];
+
+/* ── VFS device/proc forward declarations (X-VFS) ─────────────── */
+
+/* Device IDs for virtual /dev entries */
+#define DEV_NULL        0
+#define DEV_ZERO        1
+#define DEV_URANDOM     2
+#define DEV_CONSOLE     3
+
+/* RDTSC-based PRNG for /dev/urandom */
+static uint64_t urandom_state;
+
+static uint64_t urandom_next(void)
+{
+    if (!urandom_state) {
+        uint32_t lo, hi;
+        __asm__ volatile ("rdtsc" : "=a"(lo), "=d"(hi));
+        urandom_state = ((uint64_t)hi << 32) | lo;
+    }
+    urandom_state ^= urandom_state << 13;
+    urandom_state ^= urandom_state >> 7;
+    urandom_state ^= urandom_state << 17;
+    return urandom_state;
+}
+
+/* Procfs content buffer — generated on open, read via offset */
+#define PROC_BUF_SIZE  4096
+static char  proc_buf[PROC_BUF_SIZE];
+static int   proc_buf_len;
+
 /* ── Syscall handlers ────────────────────────────────────────── */
 
 static int64_t sys_write(uint64_t fd, uint64_t buf, uint64_t count)
@@ -254,6 +324,21 @@ static int64_t sys_write(uint64_t fd, uint64_t buf, uint64_t count)
     if (!buf && count > 0) return -EFAULT;
 
     fd_entry_t *f = &fd_table[fd];
+
+    if (f->type == FD_TYPE_DEV) {
+        int dev_id = (int)f->offset;
+        switch (dev_id) {
+        case DEV_NULL:
+            return (int64_t)count;  /* discard */
+        case DEV_CONSOLE:
+            return console_write((const void *)buf, (size_t)count);
+        default:
+            return -EBADF;  /* zero/urandom are read-only */
+        }
+    }
+
+    if (f->type == FD_TYPE_PROC)
+        return -EBADF;  /* procfs is read-only */
 
     if (f->type == FD_TYPE_FILE) {
         if ((f->oflags & O_ACCMODE) == O_RDONLY) return -EBADF;
@@ -293,6 +378,43 @@ static int64_t sys_read(uint64_t fd, uint64_t buf, uint64_t count)
 
     fd_entry_t *f = &fd_table[fd];
 
+    if (f->type == FD_TYPE_DEV) {
+        int dev_id = (int)f->offset;
+        switch (dev_id) {
+        case DEV_NULL:
+            return 0;  /* always EOF */
+        case DEV_ZERO: {
+            memset((void *)buf, 0, (size_t)count);
+            return (int64_t)count;
+        }
+        case DEV_URANDOM: {
+            uint8_t *dst = (uint8_t *)buf;
+            for (uint64_t i = 0; i < count; i += 8) {
+                uint64_t r = urandom_next();
+                uint64_t n = count - i;
+                if (n > 8) n = 8;
+                memcpy(dst + i, &r, (size_t)n);
+            }
+            return (int64_t)count;
+        }
+        case DEV_CONSOLE:
+            return console_read((void *)buf, (size_t)count);
+        default:
+            return -EBADF;
+        }
+    }
+
+    if (f->type == FD_TYPE_PROC) {
+        /* Read from generated proc_buf */
+        uint64_t off = f->offset;
+        if (off >= (uint64_t)proc_buf_len) return 0;  /* EOF */
+        uint64_t avail = (uint64_t)proc_buf_len - off;
+        if (count > avail) count = avail;
+        memcpy((void *)buf, proc_buf + off, (size_t)count);
+        f->offset += count;
+        return (int64_t)count;
+    }
+
     if (f->type == FD_TYPE_FILE) {
         if ((f->oflags & O_ACCMODE) == O_WRONLY) return -EBADF;
         uint64_t file_size = osfs2_file_size(f->file);
@@ -328,24 +450,189 @@ static int64_t sys_read(uint64_t fd, uint64_t buf, uint64_t count)
     return f->read((void *)buf, (size_t)count);
 }
 
+/* ── VFS: Virtual Filesystem Layer (X-VFS) ────────────────────── */
+
+/* Proc IDs for procfs entries */
+#define PROC_MAPS       0
+#define PROC_STATUS     1
+
+/* Generate /proc/self/maps content into buffer */
+static int proc_gen_maps(char *buf, int max)
+{
+    int pos = 0;
+    /* List mmap VMAs */
+    for (int i = 0; i < MAX_VMAS && pos < max - 80; i++) {
+        if (!vma_table[i].in_use) continue;
+        uint64_t start = vma_table[i].base;
+        uint64_t end = start + vma_table[i].pages * 4096;
+        uint32_t p = vma_table[i].prot;
+        /* Format: start-end rwxp offset dev inode pathname */
+        /* Simple hex formatter inline */
+        char line[80];
+        int lp = 0;
+        /* start address */
+        for (int d = 60; d >= 0; d -= 4) {
+            int nib = (start >> d) & 0xF;
+            if (nib || lp > 0 || d == 0)
+                line[lp++] = "0123456789abcdef"[nib];
+        }
+        line[lp++] = '-';
+        /* end address */
+        for (int d = 60; d >= 0; d -= 4) {
+            int nib = (end >> d) & 0xF;
+            if (nib || lp > (int)(line + lp - line) || d == 0) /* always print at least one digit */
+                line[lp++] = "0123456789abcdef"[nib];
+        }
+        line[lp++] = ' ';
+        line[lp++] = (p & PROT_READ)  ? 'r' : '-';
+        line[lp++] = (p & PROT_WRITE) ? 'w' : '-';
+        line[lp++] = (p & PROT_EXEC)  ? 'x' : '-';
+        line[lp++] = 'p';
+        line[lp++] = ' ';
+        /* offset + dev + inode: all zeros */
+        for (int z = 0; z < 8; z++) line[lp++] = '0';
+        line[lp++] = ' ';
+        line[lp++] = '0'; line[lp++] = '0'; line[lp++] = ':';
+        line[lp++] = '0'; line[lp++] = '0'; line[lp++] = ' ';
+        line[lp++] = '0';
+        line[lp++] = '\n';
+        line[lp] = 0;
+        /* Copy to output */
+        for (int c = 0; c < lp && pos < max - 1; c++)
+            buf[pos++] = line[c];
+    }
+    buf[pos] = 0;
+    return pos;
+}
+
+/* Generate /proc/self/status content into buffer */
+extern int32_t proc_current_pid(void);
+extern const char *proc_current_name(void);
+
+static int proc_gen_status(char *buf, int max)
+{
+    int pos = 0;
+    const char *name = proc_current_name();
+    int32_t pid = proc_current_pid();
+
+    /* Name: */
+    const char *s = "Name:\t";
+    while (*s && pos < max - 1) buf[pos++] = *s++;
+    if (name) while (*name && pos < max - 1) buf[pos++] = *name++;
+    if (pos < max - 1) buf[pos++] = '\n';
+
+    /* Pid: */
+    s = "Pid:\t";
+    while (*s && pos < max - 1) buf[pos++] = *s++;
+    /* Simple decimal */
+    char digits[12];
+    int nd = 0;
+    int32_t val = pid;
+    if (val == 0) { digits[nd++] = '0'; }
+    else { while (val > 0) { digits[nd++] = '0' + (val % 10); val /= 10; } }
+    for (int d = nd - 1; d >= 0; d--)
+        if (pos < max - 1) buf[pos++] = digits[d];
+    if (pos < max - 1) buf[pos++] = '\n';
+
+    /* State: */
+    s = "State:\tR (running)\n";
+    while (*s && pos < max - 1) buf[pos++] = *s++;
+
+    buf[pos] = 0;
+    return pos;
+}
+
+/* Helper: simple prefix match */
+static bool str_startswith(const char *s, const char *prefix)
+{
+    while (*prefix) {
+        if (*s++ != *prefix++) return false;
+    }
+    return true;
+}
+
+static int vfs_alloc_fd(void)
+{
+    for (int i = 0; i < MAX_FDS; i++)
+        if (!fd_table[i].open) return i;
+    return -1;
+}
+
 static int64_t sys_open(uint64_t path_addr, uint64_t flags, uint64_t mode)
 {
     (void)mode;
     const char *path = (const char *)path_addr;
     if (!path) return -EFAULT;
 
-    /* Find lowest free fd */
-    int newfd = -1;
-    for (int i = 0; i < MAX_FDS; i++) {
-        if (!fd_table[i].open) { newfd = i; break; }
-    }
+    int newfd = vfs_alloc_fd();
     if (newfd < 0) return -EMFILE;
 
-    /* Try to find existing file */
+    /* ── VFS: virtual /dev devices ─────────────────────── */
+
+    if (str_startswith(path, "/dev/")) {
+        const char *devname = path + 5;
+        int dev_id = -1;
+
+        if (strcmp(devname, "null") == 0)        dev_id = DEV_NULL;
+        else if (strcmp(devname, "zero") == 0)    dev_id = DEV_ZERO;
+        else if (strcmp(devname, "urandom") == 0) dev_id = DEV_URANDOM;
+        else if (strcmp(devname, "random") == 0)  dev_id = DEV_URANDOM;
+        else if (strcmp(devname, "console") == 0) dev_id = DEV_CONSOLE;
+        else if (strcmp(devname, "tty") == 0)     dev_id = DEV_CONSOLE;
+        else return -ENOENT;
+
+        fd_entry_t *f = &fd_table[newfd];
+        memset(f, 0, sizeof(*f));
+        f->open   = true;
+        f->type   = FD_TYPE_DEV;
+        f->oflags = (uint16_t)(flags & 0xFFFF);
+        f->offset = (uint64_t)dev_id;  /* store device ID in offset field */
+        return newfd;
+    }
+
+    /* ── VFS: virtual /proc entries ──────────────────────── */
+
+    if (str_startswith(path, "/proc/self/") || str_startswith(path, "/proc/")) {
+        const char *entry = path;
+        /* Skip /proc/self/ or /proc/<pid>/ */
+        if (str_startswith(path, "/proc/self/"))
+            entry = path + 11;
+        else {
+            /* /proc/<digits>/ — skip digits */
+            entry = path + 6;
+            while (*entry >= '0' && *entry <= '9') entry++;
+            if (*entry == '/') entry++;
+        }
+
+        int proc_id = -1;
+        if (strcmp(entry, "maps") == 0) proc_id = PROC_MAPS;
+        else if (strcmp(entry, "status") == 0) proc_id = PROC_STATUS;
+        else return -ENOENT;
+
+        /* Generate content on open */
+        if (proc_id == PROC_MAPS)
+            proc_buf_len = proc_gen_maps(proc_buf, PROC_BUF_SIZE);
+        else
+            proc_buf_len = proc_gen_status(proc_buf, PROC_BUF_SIZE);
+
+        fd_entry_t *f = &fd_table[newfd];
+        memset(f, 0, sizeof(*f));
+        f->open   = true;
+        f->type   = FD_TYPE_PROC;
+        f->oflags = O_RDONLY;
+        f->offset = 0;  /* read position */
+        return newfd;
+    }
+
+    /* ── OsitoFS: regular files ─────────────────────────── */
+
     void *file = osfs2_find(path);
 
+    /* Strip leading "/" for OsitoFS lookup if not found */
+    if (!file && path[0] == '/')
+        file = osfs2_find(path + 1);
+
     if (!file && (flags & O_CREAT)) {
-        /* Create new file — start with 1MB allocation */
         file = osfs2_create(path, 0);
     }
 
@@ -363,7 +650,6 @@ static int64_t sys_open(uint64_t path_addr, uint64_t flags, uint64_t mode)
         f->offset = osfs2_file_size(file);
 
     if ((flags & O_TRUNC) && ((flags & O_ACCMODE) != O_RDONLY)) {
-        /* Truncate not supported by OsitoFS — just reset offset */
         f->offset = 0;
     }
 
@@ -452,6 +738,20 @@ static int64_t sys_fstat(uint64_t fd, uint64_t statbuf_addr)
         st->st_blksize = 4096;
         st->st_blocks = (st->st_size + 511) / 512;
         st->st_nlink = 1;
+    } else if (f->type == FD_TYPE_DEV) {
+        st->st_mode = 0020666;  /* S_IFCHR | 0666 */
+        int dev_id = (int)f->offset;
+        if (dev_id == DEV_NULL)    st->st_rdev = 0x0103;  /* 1,3 */
+        else if (dev_id == DEV_ZERO) st->st_rdev = 0x0105; /* 1,5 */
+        else if (dev_id == DEV_URANDOM) st->st_rdev = 0x0109; /* 1,9 */
+        else st->st_rdev = 0x0501;  /* /dev/console = 5,1 */
+        st->st_nlink = 1;
+        st->st_blksize = 4096;
+    } else if (f->type == FD_TYPE_PROC) {
+        st->st_mode = 0100444;  /* S_IFREG | 0444 (read-only) */
+        st->st_size = (int64_t)proc_buf_len;
+        st->st_blksize = 4096;
+        st->st_nlink = 1;
     } else {
         /* Console device */
         st->st_mode = 0020666;  /* S_IFCHR | 0666 */
@@ -504,39 +804,6 @@ static int64_t sys_brk(uint64_t addr)
 }
 
 /* ── mmap/munmap/mprotect (X-MMAP) ────────────────────────────── */
-
-/* mmap flags (Linux values) */
-#define PROT_NONE       0x0
-#define PROT_READ       0x1
-#define PROT_WRITE      0x2
-#define PROT_EXEC       0x4
-
-#define MAP_SHARED      0x01
-#define MAP_PRIVATE     0x02
-#define MAP_FIXED       0x10
-#define MAP_ANONYMOUS   0x20
-#define MAP_ANON        MAP_ANONYMOUS
-
-/* Page table flags */
-#define PTE_PRESENT     (1ULL << 0)
-#define PTE_WRITABLE    (1ULL << 1)
-#define PTE_USER        (1ULL << 2)
-#define PTE_GLOBAL      (1ULL << 8)
-#define PTE_NX          (1ULL << 63)
-
-#define MAP_FAILED      ((uint64_t)-1)
-
-/* VMA tracking — per-process mmap regions */
-#define MAX_VMAS        64
-
-typedef struct {
-    uint64_t base;      /* virtual (== physical, identity-mapped) */
-    uint64_t pages;     /* number of 4KB pages */
-    uint32_t prot;      /* PROT_READ|PROT_WRITE|PROT_EXEC */
-    bool     in_use;
-} vma_t;
-
-static vma_t vma_table[MAX_VMAS];
 
 static uint64_t prot_to_pte_flags(uint32_t prot)
 {
@@ -877,6 +1144,110 @@ void syscall_check_signals(void)
     }
 }
 
+/* ── VFS: getcwd, readlink, getdents64 (X-VFS) ──────────────── */
+
+static int64_t sys_getcwd(uint64_t buf_addr, uint64_t size)
+{
+    if (!buf_addr || size < 2) return -EINVAL;
+    char *buf = (char *)buf_addr;
+    buf[0] = '/';
+    buf[1] = '\0';
+    return (int64_t)buf_addr;
+}
+
+static int64_t sys_readlink(uint64_t path_addr, uint64_t buf_addr, uint64_t bufsiz)
+{
+    const char *path = (const char *)path_addr;
+    char *buf = (char *)buf_addr;
+    if (!path || !buf || bufsiz == 0) return -EFAULT;
+
+    /* /proc/self/exe → return current process name */
+    if (str_startswith(path, "/proc/self/exe") ||
+        str_startswith(path, "/proc/") /* /proc/<pid>/exe */) {
+        const char *name = proc_current_name();
+        if (!name) name = "unknown";
+        uint64_t len = strlen(name);
+        if (len > bufsiz) len = bufsiz;
+        memcpy(buf, name, (size_t)len);
+        return (int64_t)len;
+    }
+
+    return -EINVAL;
+}
+
+/* Linux getdents64 structure */
+typedef struct {
+    uint64_t d_ino;
+    int64_t  d_off;
+    uint16_t d_reclen;
+    uint8_t  d_type;
+    char     d_name[];
+} linux_dirent64_t;
+
+#define DT_REG  8
+#define DT_CHR  2
+#define DT_DIR  4
+
+extern void *osfs2_file_at(uint32_t index);
+extern const char *osfs2_file_name(void *file);
+
+static int64_t sys_getdents64(uint64_t fd, uint64_t dirp_addr, uint64_t count)
+{
+    if (fd >= MAX_FDS || !fd_table[fd].open) return -EBADF;
+
+    fd_entry_t *f = &fd_table[fd];
+    uint8_t *buf = (uint8_t *)dirp_addr;
+    uint64_t pos = 0;
+    int idx = (int)f->offset;  /* use offset as directory position */
+
+    if (f->type == FD_TYPE_DEV) {
+        /* Listing /dev/ directory */
+        static const char *dev_names[] = { "null", "zero", "urandom", "console", "tty", "random" };
+        int ndevs = 6;
+
+        for (int i = idx; i < ndevs; i++) {
+            uint64_t namelen = strlen(dev_names[i]);
+            uint64_t reclen = (uint64_t)(((int)(19 + namelen + 1) + 7) & ~7);  /* align to 8 */
+            if (pos + reclen > count) break;
+
+            linux_dirent64_t *d = (linux_dirent64_t *)(buf + pos);
+            d->d_ino = (uint64_t)(i + 100);
+            d->d_off = (int64_t)(i + 1);
+            d->d_reclen = (uint16_t)reclen;
+            d->d_type = DT_CHR;
+            memcpy(d->d_name, dev_names[i], (size_t)(namelen + 1));
+            pos += reclen;
+            f->offset = (uint64_t)(i + 1);
+        }
+        return (int64_t)pos;
+    }
+
+    if (f->type == FD_TYPE_FILE || f->type == FD_TYPE_PROC) {
+        /* Listing OsitoFS root directory or /proc */
+        for (int i = idx; ; i++) {
+            void *file = osfs2_file_at(i);
+            if (!file) break;
+            const char *name = osfs2_file_name(file);
+            if (!name) continue;
+            uint64_t namelen = strlen(name);
+            uint64_t reclen = (uint64_t)(((int)(19 + namelen + 1) + 7) & ~7);
+            if (pos + reclen > count) break;
+
+            linux_dirent64_t *d = (linux_dirent64_t *)(buf + pos);
+            d->d_ino = (uint64_t)(i + 1);
+            d->d_off = (int64_t)(i + 1);
+            d->d_reclen = (uint16_t)reclen;
+            d->d_type = DT_REG;
+            memcpy(d->d_name, name, (size_t)(namelen + 1));
+            pos += reclen;
+            f->offset = (uint64_t)(i + 1);
+        }
+        return (int64_t)pos;
+    }
+
+    return -ENOTDIR;
+}
+
 /* ── Syscall dispatch (called from assembly) ─────────────────── */
 
 int64_t syscall_dispatch(uint64_t nr, uint64_t a1, uint64_t a2,
@@ -900,8 +1271,11 @@ int64_t syscall_dispatch(uint64_t nr, uint64_t a1, uint64_t a2,
     case SYS_DUP2:       return sys_dup2(a1, a2);
     case SYS_EXIT:       return sys_exit(a1);
     case SYS_KILL:       return sys_kill(a1, a2);
+    case SYS_GETCWD:     return sys_getcwd(a1, a2);
     case SYS_UNLINK:     return sys_unlink(a1);
+    case SYS_READLINK:   return sys_readlink(a1, a2, a3);
     case SYS_ARCH_PRCTL: return -ENOSYS;  /* stub */
+    case SYS_GETDENTS64: return sys_getdents64(a1, a2, a3);
     case SYS_SIGACTION:  return sys_sigaction(a1, a2, a3);
     case SYS_SIGRETURN:  return 0;  /* stub */
     default:
