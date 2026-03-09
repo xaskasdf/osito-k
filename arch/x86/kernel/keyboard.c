@@ -86,11 +86,58 @@ static void kb_push(char c)
     }
 }
 
+/* ── Extended scancode state ──────────────────────────────────── */
+
+static bool kb_extended;   /* true after 0xE0 prefix byte */
+
+/* Push VT100 escape sequence into ring buffer: ESC [ <suffix> */
+static void kb_push_esc(const char *seq)
+{
+    kb_push(27);   /* ESC */
+    kb_push('[');
+    while (*seq) kb_push(*seq++);
+}
+
 /* ── IRQ 1 handler (called from IDT vector 33) ──────────────── */
 
 void keyboard_irq(void)
 {
     uint8_t sc = inb(KB_DATA_PORT);
+
+    /* Extended scancode prefix — set flag and wait for next byte */
+    if (sc == 0xE0) {
+        kb_extended = true;
+        return;
+    }
+
+    /* Handle extended key releases (0xE0 + 0x80|scancode) */
+    if (kb_extended && (sc & 0x80)) {
+        /* Extended key release — handle Ctrl release via 0xE0 prefix */
+        if (sc == SC_CTRL_RELEASE) kb_ctrl = false;
+        kb_extended = false;
+        return;
+    }
+
+    /* Handle extended key presses */
+    if (kb_extended) {
+        kb_extended = false;
+        /* Extended modifier keys */
+        if (sc == SC_CTRL_PRESS) { kb_ctrl = true; return; }
+
+        switch (sc) {
+        case 0x48: kb_push_esc("A");  return;  /* Up */
+        case 0x50: kb_push_esc("B");  return;  /* Down */
+        case 0x4D: kb_push_esc("C");  return;  /* Right */
+        case 0x4B: kb_push_esc("D");  return;  /* Left */
+        case 0x47: kb_push_esc("H");  return;  /* Home */
+        case 0x4F: kb_push_esc("F");  return;  /* End */
+        case 0x52: kb_push_esc("2~"); return;  /* Insert */
+        case 0x53: kb_push_esc("3~"); return;  /* Delete */
+        case 0x49: kb_push_esc("5~"); return;  /* Page Up */
+        case 0x51: kb_push_esc("6~"); return;  /* Page Down */
+        }
+        return; /* Unknown extended key — ignore */
+    }
 
     /* Handle modifier keys */
     switch (sc) {
@@ -122,9 +169,6 @@ void keyboard_irq(void)
     /* Ignore key releases (bit 7 set) */
     if (sc & 0x80) return;
 
-    /* Ignore extended scancodes (0xE0 prefix) for now */
-    if (sc == 0xE0) return;
-
     /* Translate scancode to ASCII */
     char c;
     if (kb_shift)
@@ -138,15 +182,13 @@ void keyboard_irq(void)
     else if (kb_caps && c >= 'A' && c <= 'Z')
         c = c - 'A' + 'a';
 
-    /* Ctrl+C → ASCII 3 (ETX) */
-    if (kb_ctrl && (c == 'c' || c == 'C')) {
-        kb_push(3);
+    /* Ctrl+letter: ASCII 1-26 */
+    if (kb_ctrl && c >= 'a' && c <= 'z') {
+        kb_push(c - 'a' + 1);
         return;
     }
-
-    /* Ctrl+D → ASCII 4 (EOT) */
-    if (kb_ctrl && (c == 'd' || c == 'D')) {
-        kb_push(4);
+    if (kb_ctrl && c >= 'A' && c <= 'Z') {
+        kb_push(c - 'A' + 1);
         return;
     }
 

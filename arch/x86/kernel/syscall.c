@@ -343,12 +343,45 @@ static ssize_t console_write(const void *buf, size_t count)
 
 /* stdin → read from PS/2 keyboard ring buffer */
 extern char kb_getchar(void);
+extern char kb_trygetchar(void);
+extern bool kb_has_input(void);
+
+/* ── Terminal mode state (X-EDIT) ─────────────────────────── */
+/* Tracks ICANON and ECHO flags from tcsetattr calls. */
+
+static bool term_canonical = true;   /* ICANON: line-buffered input */
+static bool term_echo      = true;   /* ECHO: echo input chars */
+
+/* Blocking keyboard read with interrupts enabled.
+ * SYSCALL entry disables interrupts (FMASK clears IF). We must
+ * re-enable them here so keyboard IRQs can actually fire. */
+static char kb_getchar_safe(void)
+{
+    while (!kb_has_input())
+        __asm__ volatile ("sti; hlt; cli" ::: "memory");
+    return kb_getchar();  /* non-blocking now, data is ready */
+}
+
 static ssize_t console_read(void *buf, size_t count)
 {
     if (count == 0) return 0;
     uint8_t *dst = (uint8_t *)buf;
-    /* Block for at least one character (no kernel echo — app handles it) */
-    dst[0] = (uint8_t)kb_getchar();
+
+    if (!term_canonical) {
+        /* Raw mode: return individual characters, no line buffering.
+         * Block for first char, then return as many as available. */
+        dst[0] = (uint8_t)kb_getchar_safe();
+        ssize_t n = 1;
+        while (n < (ssize_t)count && kb_has_input()) {
+            dst[n] = (uint8_t)kb_trygetchar();
+            if (dst[n] == 0) break;
+            n++;
+        }
+        return n;
+    }
+
+    /* Canonical mode: block for one character */
+    dst[0] = (uint8_t)kb_getchar_safe();
     return 1;
 }
 
@@ -1090,6 +1123,29 @@ struct winsize {
     uint16_t ws_ypixel;
 };
 
+/* Framebuffer dimensions (from framebuffer.c) */
+extern uint32_t fb_get_cols(void);
+extern uint32_t fb_get_rows(void);
+
+/* Linux termios c_lflag bits */
+#define TERMIOS_ECHO    0x0008
+#define TERMIOS_ICANON  0x0002
+#define TERMIOS_ISIG    0x0001
+
+/* Our tracking of the current termios state */
+static uint32_t cur_c_iflag = 0x0500;   /* ICRNL|IXON */
+static uint32_t cur_c_oflag = 0x0005;   /* OPOST|ONLCR */
+static uint32_t cur_c_cflag = 0x00B2;   /* CS8|CREAD|HUPCL */
+static uint32_t cur_c_lflag = 0x8A3B;   /* ISIG|ICANON|ECHO|... */
+
+/* termios struct layout (matches Linux kernel_termios) */
+typedef struct {
+    uint32_t c_iflag, c_oflag, c_cflag, c_lflag;
+    uint8_t  c_line;
+    uint8_t  c_cc[32];
+    uint32_t c_ispeed, c_ospeed;
+} termios_t;
+
 static int64_t sys_ioctl(uint64_t fd, uint64_t request, uint64_t arg)
 {
     (void)fd;
@@ -1097,36 +1153,45 @@ static int64_t sys_ioctl(uint64_t fd, uint64_t request, uint64_t arg)
     case TIOCGWINSZ: {
         if (!arg) return -EFAULT;
         struct winsize *ws = (struct winsize *)arg;
-        ws->ws_row = 25;
-        ws->ws_col = 80;
-        ws->ws_xpixel = 640;
-        ws->ws_ypixel = 400;
+        uint32_t cols = fb_get_cols();
+        uint32_t rows = fb_get_rows();
+        ws->ws_row = rows ? (uint16_t)rows : 25;
+        ws->ws_col = cols ? (uint16_t)cols : 80;
+        ws->ws_xpixel = ws->ws_col * 8;
+        ws->ws_ypixel = ws->ws_row * 16;
         return 0;
     }
     case TIOCSWINSZ:
         return 0;  /* ignore set */
     case TCGETS: {
         if (!arg) return -EFAULT;
-        /* Fill minimal termios for isatty() detection */
-        struct { uint32_t c_iflag, c_oflag, c_cflag, c_lflag;
-                 uint8_t c_line; uint8_t c_cc[32];
-                 uint32_t c_ispeed, c_ospeed; } *t = (void *)arg;
+        termios_t *t = (termios_t *)arg;
         memset(t, 0, sizeof(*t));
-        t->c_cflag = 0x00B2;  /* CS8|CREAD|HUPCL */
-        t->c_lflag = 0x8A3B;  /* ISIG|ICANON|ECHO|ECHOE|ECHOK|ECHOCTL|ECHOKE|IEXTEN */
-        t->c_iflag = 0x0500;  /* ICRNL|IXON */
-        t->c_oflag = 0x0005;  /* OPOST|ONLCR */
+        t->c_iflag  = cur_c_iflag;
+        t->c_oflag  = cur_c_oflag;
+        t->c_cflag  = cur_c_cflag;
+        t->c_lflag  = cur_c_lflag;
         t->c_ispeed = 38400;
         t->c_ospeed = 38400;
-        t->c_cc[0] = 3;   /* VINTR = Ctrl-C */
-        t->c_cc[1] = 28;  /* VQUIT */
-        t->c_cc[4] = 1;   /* VMIN */
+        t->c_cc[0]  = 3;   /* VINTR = Ctrl-C */
+        t->c_cc[1]  = 28;  /* VQUIT */
+        t->c_cc[4]  = 1;   /* VMIN */
         return 0;
     }
     case TCSETS:
     case TCSETSW:
-    case TCSETSF:
-        return 0;  /* accept but ignore termios changes */
+    case TCSETSF: {
+        if (!arg) return -EFAULT;
+        termios_t *t = (termios_t *)arg;
+        cur_c_iflag = t->c_iflag;
+        cur_c_oflag = t->c_oflag;
+        cur_c_cflag = t->c_cflag;
+        cur_c_lflag = t->c_lflag;
+        /* Update actual terminal behavior */
+        term_canonical = !!(cur_c_lflag & TERMIOS_ICANON);
+        term_echo      = !!(cur_c_lflag & TERMIOS_ECHO);
+        return 0;
+    }
     default:
         return -ENOTTY;
     }
@@ -1144,8 +1209,6 @@ struct pollfd {
     short events;
     short revents;
 };
-
-extern bool kb_has_input(void);
 
 static int poll_check(struct pollfd *fds, uint64_t nfds)
 {
@@ -2426,6 +2489,13 @@ void syscall_reset_process(void)
     /* Reset signal state */
     memset(sig_handlers, 0, sizeof(sig_handlers));
     sig_pending = 0;
+
+    /* Reset terminal to canonical+echo mode (X-EDIT safety) */
+    term_canonical = true;
+    term_echo = true;
+    cur_c_lflag = 0x8A3B;
+    cur_c_iflag = 0x0500;
+    cur_c_oflag = 0x0005;
 
     /* Free brk heap — but NOT if it's the parent's saved brk.
      * saved_parent.valid is true when a forked child is doing execve. */

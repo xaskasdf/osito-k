@@ -384,13 +384,14 @@ Tasks:   idle, input, shell (3 of 8 slots used)
 | **X-MUSL** | **musl libc port** (cross-compiled musl 1.2.5 static libc, +20 syscalls: arch_prctl/set_tid_address/clock_gettime/getrandom/nanosleep/getpid/gettid/futex/fcntl/prlimit64/etc, 9/9 QEMU tests pass) | Done |
 | **X-FORK** | **fork/wait4/getppid + busybox** (scheduler-based fork, wait4 memory clobber fix, execve /proc/self/exe, 8MB allocator boundary, ioctl/poll/vfork, busybox ash interactive, 3/3 QEMU tests pass) | Done |
 | **X-THREAD** | **clone(CLONE_THREAD) + futex** (per-thread TLS/FS_BASE save/restore, futex wait queue, PROC_BLOCKED state, clear_child_tid, thread exit cleanup, 2/2 QEMU tests pass) | Done |
+| **X-EDIT** | **Kilo text editor port** (ANSI CSI escape parser in framebuffer, extended PS/2 scancodes→VT100, termios raw mode, kb_getchar_safe with sti;hlt;cli, Ctrl+S save to OsitoFS) | Done |
 
 > Full GPU roadmap (X27-X40 + contingency): see [docs/x86-gpu-roadmap.md](docs/x86-gpu-roadmap.md)
 > Full OS roadmap (Tiers 0-9): see [docs/os-selfhost-roadmap.md](docs/os-selfhost-roadmap.md)
 > Binary compatibility roadmap: see [docs/binary-compat-roadmap.md](docs/binary-compat-roadmap.md)
 > Paths to Claude analysis: see [docs/paths-to-claude-on-ositok.md](docs/paths-to-claude-on-ositok.md)
 
-**Tier 7+ (next)**: X-EDIT (port kilo editor), X-HTTPD (TCP server), X-SELF (self-hosting kernel compile).
+**Tier 7+ (next)**: X-HTTPD (TCP server), X-SELF (self-hosting kernel compile).
 See `docs/os-selfhost-roadmap.md` for full details and dependency chains.
 
 ### F12: DOOM Wireframe 2.5D
@@ -1202,6 +1203,16 @@ Linux-compatible thread creation via clone() with thread flags, plus futex-based
 - **sys_futex** (`syscall.c`): FUTEX_WAIT → `futex_do_wait()`, FUTEX_WAKE → `futex_do_wake()`. Other ops return 0 (stub).
 - **Verified**: T1 clone+shared_counter (CLONE_VM), T2 futex wait/wake — 2/2 tests pass in QEMU.
 - **Files**: `arch/x86/kernel/process.c` (proc_clone_thread, futex, TLS, thread_exit_cleanup), `arch/x86/kernel/syscall.c` (sys_clone, sys_futex), `arch/x86/test/thread_test.c`
+
+### X-EDIT: Kilo Text Editor Port
+Antirez's kilo editor (BSD, 1308 lines) runs natively on OsitoK. Three kernel infrastructure changes enable terminal-based TUI applications.
+- **ANSI CSI escape parser** (`framebuffer.c`): State machine (NORMAL→ESC→CSI→QMARK) processes VT100/ANSI sequences. Supports cursor movement (A/B/C/D), cursor position (H/f), erase display (J), erase line (K), SGR colors (m, 8 normal + 8 bright), mode set/reset (h/l for cursor visibility). `fb_get_cols()`/`fb_get_rows()` API for real dimensions. `fb_clear_line_from()` and `fb_clear_line()` helpers.
+- **Extended PS/2 scancodes** (`keyboard.c`): 0xE0 prefix byte tracking → VT100 escape sequences. Arrow keys (ESC[A/B/C/D), Home (ESC[H), End (ESC[F), Insert (ESC[2~), Delete (ESC[3~), PgUp (ESC[5~), PgDn (ESC[6~). Extended Ctrl+key handling for 0xE0 prefix. Generalized Ctrl+letter (a-z → ASCII 1-26).
+- **termios raw mode** (`syscall.c`): Real ICANON/ECHO state tracking. TCSETS/TCSETSW/TCSETSF process c_lflag bits (ICANON=0x0002, ECHO=0x0008). Raw mode: `console_read` returns single chars immediately via `kb_getchar_safe()`. Canonical mode: line-buffered with `term_readline()`. TIOCGWINSZ returns real `fb_get_cols()`/`fb_get_rows()`. Terminal state reset on process exit.
+- **kb_getchar_safe()** (`syscall.c`): Critical fix — SYSCALL entry keeps IF=0 (interrupts disabled). Original `kb_getchar()` calls HLT which deadlocks. Fix: `sti; hlt; cli` loop re-enables interrupts briefly for each HLT, allowing keyboard IRQ to fire.
+- **Kilo binary**: Compiled with musl-gcc (`musl-gcc -static -no-pie -O2 kilo.c -o kilo.elf`), 91KB static ELF. Uploaded to OsitoFS via `ositofs-write`.
+- **Verified**: Text input, arrow navigation, Ctrl+Q quit (with unsaved-changes warning), Ctrl+S save to OsitoFS (49 bytes written). Full QEMU test via monitor sendkey.
+- **Files**: `arch/x86/kernel/framebuffer.c` (ANSI parser), `arch/x86/kernel/keyboard.c` (extended scancodes), `arch/x86/kernel/syscall.c` (termios, kb_getchar_safe), `arch/x86/test/kilo.elf` (binary)
 
 ### AArch64/SM8350 Port (arch/arm/)
 Reference bare-metal code for ASUS ROG Phone 5 (Snapdragon 888).

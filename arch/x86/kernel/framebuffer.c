@@ -188,9 +188,179 @@ static void fb_scroll(void)
         last[i] = BG_COLOR;
 }
 
+/* ── ANSI CSI escape sequence parser ────────────────────────── */
+
+#define ANSI_STATE_NORMAL  0
+#define ANSI_STATE_ESC     1   /* received ESC */
+#define ANSI_STATE_CSI     2   /* received ESC [ */
+#define ANSI_STATE_QMARK   3   /* received ESC [ ? */
+
+static int    ansi_state;
+static int    ansi_params[8];
+static int    ansi_nparams;
+static int    ansi_cur_param;
+static uint32_t ansi_fg_color = FG_COLOR;
+
+/* Basic ANSI color palette (SGR 30-37) */
+static const uint32_t ansi_colors[8] = {
+    0x00000000, /* 0: black */
+    0x00CC0000, /* 1: red */
+    0x0000CC00, /* 2: green */
+    0x00CCCC00, /* 3: yellow */
+    0x000000CC, /* 4: blue */
+    0x00CC00CC, /* 5: magenta */
+    0x0000CCCC, /* 6: cyan */
+    0x00CCCCCC, /* 7: white/gray */
+};
+
+/* Bright ANSI colors (SGR 90-97) */
+static const uint32_t ansi_bright[8] = {
+    0x00666666, /* 0: bright black (dark gray) */
+    0x00FF4444, /* 1: bright red */
+    0x0044FF44, /* 2: bright green */
+    0x00FFFF44, /* 3: bright yellow */
+    0x004444FF, /* 4: bright blue */
+    0x00FF44FF, /* 5: bright magenta */
+    0x0044FFFF, /* 6: bright cyan */
+    0x00FFFFFF, /* 7: bright white */
+};
+
+static void fb_clear_line_from(uint32_t row, uint32_t col)
+{
+    /* Clear from (col, row) to end of line */
+    for (uint32_t c = col; c < max_cols; c++)
+        fb_putchar_at(c, row, ' ', BG_COLOR);
+}
+
+static void fb_clear_line(uint32_t row)
+{
+    fb_clear_line_from(row, 0);
+}
+
+static void ansi_execute(char cmd)
+{
+    int p0 = (ansi_nparams > 0) ? ansi_params[0] : 0;
+    int p1 = (ansi_nparams > 1) ? ansi_params[1] : 0;
+
+    switch (cmd) {
+    case 'A': /* Cursor Up */
+        if (p0 == 0) p0 = 1;
+        text_row = (text_row >= (uint32_t)p0) ? text_row - p0 : 0;
+        break;
+    case 'B': /* Cursor Down */
+        if (p0 == 0) p0 = 1;
+        text_row += p0;
+        if (text_row >= max_rows) text_row = max_rows - 1;
+        break;
+    case 'C': /* Cursor Forward */
+        if (p0 == 0) p0 = 1;
+        text_col += p0;
+        if (text_col >= max_cols) text_col = max_cols - 1;
+        break;
+    case 'D': /* Cursor Back */
+        if (p0 == 0) p0 = 1;
+        text_col = (text_col >= (uint32_t)p0) ? text_col - p0 : 0;
+        break;
+    case 'H': /* Cursor Position (row;col, 1-based) */
+    case 'f':
+        text_row = (p0 > 0) ? (uint32_t)(p0 - 1) : 0;
+        text_col = (p1 > 0) ? (uint32_t)(p1 - 1) : 0;
+        if (text_row >= max_rows) text_row = max_rows - 1;
+        if (text_col >= max_cols) text_col = max_cols - 1;
+        break;
+    case 'J': /* Erase in Display */
+        if (p0 == 0) {
+            /* Clear from cursor to end of screen */
+            fb_clear_line_from(text_row, text_col);
+            for (uint32_t r = text_row + 1; r < max_rows; r++)
+                fb_clear_line(r);
+        } else if (p0 == 2 || p0 == 3) {
+            /* Clear entire screen */
+            fb_clear();
+        }
+        break;
+    case 'K': /* Erase in Line */
+        if (p0 == 0) {
+            fb_clear_line_from(text_row, text_col);
+        } else if (p0 == 2) {
+            fb_clear_line(text_row);
+        }
+        break;
+    case 'm': /* SGR — Select Graphic Rendition */
+        if (ansi_nparams == 0) {
+            ansi_fg_color = FG_COLOR; /* Reset */
+        }
+        for (int i = 0; i < ansi_nparams; i++) {
+            int p = ansi_params[i];
+            if (p == 0) ansi_fg_color = FG_COLOR;
+            else if (p == 1) { /* Bold — use bright version if available */ }
+            else if (p == 7) { /* Reverse — swap fg/bg (simplified) */ }
+            else if (p >= 30 && p <= 37) ansi_fg_color = ansi_colors[p - 30];
+            else if (p == 39) ansi_fg_color = FG_COLOR; /* Default fg */
+            else if (p >= 90 && p <= 97) ansi_fg_color = ansi_bright[p - 90];
+        }
+        break;
+    case 'n': /* Device Status Report */
+        /* 6n = cursor position report: we can't send back to the app
+         * from framebuffer. The syscall layer handles this via keyboard
+         * injection. Just ignore here. */
+        break;
+    case 'l': /* Reset Mode (used for ?25l = hide cursor) */
+    case 'h': /* Set Mode (used for ?25h = show cursor) */
+        /* Cursor visibility — we don't draw a cursor, so ignore */
+        break;
+    }
+}
+
 void fb_putc(char c, uint32_t color)
 {
     if (!fb_base) return;
+
+    /* ANSI state machine */
+    switch (ansi_state) {
+    case ANSI_STATE_ESC:
+        if (c == '[') {
+            ansi_state = ANSI_STATE_CSI;
+            ansi_nparams = 0;
+            ansi_cur_param = 0;
+            for (int i = 0; i < 8; i++) ansi_params[i] = 0;
+            return;
+        }
+        ansi_state = ANSI_STATE_NORMAL;
+        /* Fall through to render the character */
+        break;
+    case ANSI_STATE_CSI:
+    case ANSI_STATE_QMARK:
+        if (c == '?') {
+            ansi_state = ANSI_STATE_QMARK;
+            return;
+        }
+        if (c >= '0' && c <= '9') {
+            ansi_cur_param = ansi_cur_param * 10 + (c - '0');
+            return;
+        }
+        if (c == ';') {
+            if (ansi_nparams < 8)
+                ansi_params[ansi_nparams++] = ansi_cur_param;
+            ansi_cur_param = 0;
+            return;
+        }
+        /* Command character — finalize params and execute */
+        if (ansi_nparams < 8)
+            ansi_params[ansi_nparams++] = ansi_cur_param;
+        ansi_execute(c);
+        ansi_state = ANSI_STATE_NORMAL;
+        return;
+    }
+
+    /* Normal character processing */
+    if (c == 27) {  /* ESC */
+        ansi_state = ANSI_STATE_ESC;
+        return;
+    }
+
+    /* Use ANSI fg color if no explicit color override */
+    uint32_t fg = (color == FG_COLOR) ? ansi_fg_color : color;
 
     if (c == '\n') {
         text_col = 0;
@@ -202,7 +372,7 @@ void fb_putc(char c, uint32_t color)
     } else if (c == '\t') {
         text_col = (text_col + 4) & ~3;
     } else {
-        fb_putchar_at(text_col, text_row, c, color);
+        fb_putchar_at(text_col, text_row, c, fg);
         text_col++;
     }
 
@@ -215,6 +385,11 @@ void fb_putc(char c, uint32_t color)
         text_row = max_rows - 1;
     }
 }
+
+/* ── Query framebuffer dimensions ──────────────────────────── */
+
+uint32_t fb_get_cols(void) { return max_cols; }
+uint32_t fb_get_rows(void) { return max_rows; }
 
 void fb_puts(const char *s)
 {
