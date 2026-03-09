@@ -32,8 +32,15 @@ extern uint64_t paging_get_kernel_cr3(void);
 /* ELF loader */
 extern int elf_exec(const char *filename, int argc, const char **argv);
 
+/* Fork RW data restore (elf.c) — called after reaping forked child */
+extern void elf_fork_restore(void);
+
 /* Syscall state cleanup */
 extern void syscall_reset_process(void);
+
+/* Brk save/restore for fork+execve (syscall.c) */
+extern void syscall_save_brk(void);
+extern void syscall_restore_brk(void);
 
 /* ── Constants ───────────────────────────────────────────────── */
 
@@ -829,6 +836,9 @@ int32_t proc_fork(void)
         serial_puts("[SCHED] Preemptive scheduling activated (by fork)\n");
     }
 
+    /* Save parent's brk state before child can execve+reset it */
+    syscall_save_brk();
+
     /* Parent returns child PID immediately */
     return (int32_t)child->pid;
 }
@@ -874,6 +884,11 @@ int32_t proc_wait4(int32_t pid, int *wstatus, int options)
                 proctab[i].kernel_stack = NULL;
             }
 
+            /* Restore parent's RW data and brk heap state after child
+             * overwrote them (fork+execve of same binary in identity-mapped OS). */
+            elf_fork_restore();
+            syscall_restore_brk();
+
             return child_pid;
         }
     }
@@ -917,6 +932,10 @@ int32_t proc_wait4(int32_t pid, int *wstatus, int options)
                                KERNEL_STACK_SIZE / 4096);
                 proctab[i].kernel_stack = NULL;
             }
+
+            /* Restore parent's RW data and brk heap after reaping forked child */
+            elf_fork_restore();
+            syscall_restore_brk();
 
             return child_pid;
         }

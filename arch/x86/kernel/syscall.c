@@ -2066,6 +2066,69 @@ static uint16_t get_cs(void)
     return cs;
 }
 
+/* ── Save/restore brk state for fork+execve ──────────────────── */
+/*
+ * In an identity-mapped OS, the brk globals are shared between parent
+ * and child. When a forked child calls execve, syscall_reset_process
+ * frees the brk heap — destroying the parent's malloc state. We save
+ * the parent's brk pointers before the child's execve and restore them
+ * after the child is reaped in proc_wait4.
+ */
+
+/* Saved parent state — all per-process globals that syscall_reset_process
+ * would destroy when the forked child calls execve. */
+static struct {
+    uint8_t  *brk_base;
+    uint8_t  *brk_current;
+    uint8_t  *brk_max;
+    uint64_t  fs_base;
+    fd_entry_t fds[MAX_FDS];
+    uint64_t  sigs[NSIG];
+    uint32_t  sig_pend;
+    vma_t     vmas[MAX_VMAS];
+    bool      valid;
+} saved_parent;
+
+void syscall_save_brk(void)
+{
+    saved_parent.brk_base    = brk_base;
+    saved_parent.brk_current = brk_current;
+    saved_parent.brk_max     = brk_max;
+    saved_parent.fs_base     = rdmsr(MSR_FS_BASE);
+    memcpy(saved_parent.fds,  fd_table,     sizeof(fd_table));
+    memcpy(saved_parent.sigs, sig_handlers, sizeof(sig_handlers));
+    saved_parent.sig_pend = sig_pending;
+    memcpy(saved_parent.vmas, vma_table,    sizeof(vma_table));
+    saved_parent.valid = true;
+}
+
+void syscall_restore_brk(void)
+{
+    if (!saved_parent.valid) return;
+
+    /* Free the child's brk region if it allocated a different one */
+    if (brk_base && brk_base != saved_parent.brk_base)
+        kfree(brk_base);
+
+    brk_base    = saved_parent.brk_base;
+    brk_current = saved_parent.brk_current;
+    brk_max     = saved_parent.brk_max;
+
+    /* Restore FS_BASE (TLS segment register) — the child's musl init
+     * overwrites this via arch_prctl(ARCH_SET_FS). Without restoring,
+     * the parent reads the child's TLS area (errno, malloc context). */
+    if (saved_parent.fs_base)
+        wrmsr(MSR_FS_BASE, saved_parent.fs_base);
+
+    /* Restore FD table, signal handlers, VMA table */
+    memcpy(fd_table,     saved_parent.fds,  sizeof(fd_table));
+    memcpy(sig_handlers, saved_parent.sigs, sizeof(sig_handlers));
+    sig_pending = saved_parent.sig_pend;
+    memcpy(vma_table,    saved_parent.vmas, sizeof(vma_table));
+
+    saved_parent.valid = false;
+}
+
 /* ── Reset per-process syscall state ─────────────────────────── */
 
 void syscall_reset_process(void)
@@ -2080,21 +2143,27 @@ void syscall_reset_process(void)
     memset(sig_handlers, 0, sizeof(sig_handlers));
     sig_pending = 0;
 
-    /* Free brk heap */
-    if (brk_base) {
+    /* Free brk heap — but NOT if it's the parent's saved brk.
+     * saved_parent.valid is true when a forked child is doing execve. */
+    if (brk_base && (!saved_parent.valid || brk_base != saved_parent.brk_base)) {
         kfree(brk_base);
-        brk_base = NULL;
-        brk_current = NULL;
-        brk_max = NULL;
     }
+    brk_base = NULL;
+    brk_current = NULL;
+    brk_max = NULL;
 
-    /* Free mmap regions */
-    for (int i = 0; i < MAX_VMAS; i++) {
-        if (vma_table[i].in_use) {
-            mem_free_pages((void *)vma_table[i].base, vma_table[i].pages);
-            vma_table[i].in_use = false;
+    /* Free mmap regions — but NOT the parent's saved regions.
+     * When a forked child does execve, saved_parent.valid is true and
+     * the vma_table contains the parent's regions. Don't free those. */
+    if (!saved_parent.valid) {
+        for (int i = 0; i < MAX_VMAS; i++) {
+            if (vma_table[i].in_use) {
+                mem_free_pages((void *)vma_table[i].base, vma_table[i].pages);
+                vma_table[i].in_use = false;
+            }
         }
     }
+    memset(vma_table, 0, sizeof(vma_table));
 }
 
 /* ── Initialize syscall interface ────────────────────────────── */

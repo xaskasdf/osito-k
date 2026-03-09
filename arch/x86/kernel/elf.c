@@ -88,6 +88,44 @@ typedef struct {
 _Static_assert(sizeof(elf64_hdr_t) == 64, "ELF64 header must be 64 bytes");
 _Static_assert(sizeof(elf64_phdr_t) == 56, "ELF64 phdr must be 56 bytes");
 
+/* ── Fork RW data save/restore ───────────────────────────────── */
+/*
+ * When a forked child execve's the same binary in an identity-mapped OS,
+ * elf_load_segments zeroes+reloads the entire load range, destroying the
+ * parent's runtime data (modified globals, BSS state). We save the PF_W
+ * segments before overwriting and restore them after the child is reaped.
+ */
+
+#define MAX_FORK_SAVES 4
+
+typedef struct {
+    void    *buf;       /* kmalloc'd backup buffer */
+    uint64_t addr;      /* virtual address to restore to */
+    uint64_t size;      /* bytes saved */
+} fork_rw_save_t;
+
+static fork_rw_save_t fork_saves[MAX_FORK_SAVES];
+static int fork_save_count = 0;
+
+/* Called from proc_wait4 after reaping a child — restores parent's RW data */
+void elf_fork_restore(void)
+{
+    for (int i = 0; i < fork_save_count; i++) {
+        if (fork_saves[i].buf) {
+            serial_puts("[ELF] Restoring parent RW data at 0x");
+            serial_puthex(fork_saves[i].addr, 16);
+            serial_puts(" (");
+            serial_putdec(fork_saves[i].size);
+            serial_puts(" bytes)\n");
+            memcpy((void *)fork_saves[i].addr,
+                   fork_saves[i].buf, fork_saves[i].size);
+            kfree(fork_saves[i].buf);
+            fork_saves[i].buf = NULL;
+        }
+    }
+    fork_save_count = 0;
+}
+
 /* ── ELF state ───────────────────────────────────────────────── */
 
 #define ELF_MAX_SEGMENTS 16
@@ -210,6 +248,31 @@ static int elf_load_segments(const uint8_t *data, uint64_t data_size,
             serial_puts("[ELF] Fixed-load at 0x");
             serial_puthex(vaddr_min, 16);
             serial_puts(" already mapped — reusing (fork+execve)\n");
+
+            /* Save PF_W segments before memset destroys the parent's
+             * runtime data. Restored in proc_wait4 after child exits. */
+            fork_save_count = 0;
+            for (int i = 0; i < hdr->e_phnum && fork_save_count < MAX_FORK_SAVES; i++) {
+                uint64_t phoff2 = hdr->e_phoff + (uint64_t)i * hdr->e_phentsize;
+                if (phoff2 + sizeof(elf64_phdr_t) > data_size) break;
+                const elf64_phdr_t *ph2 = (const elf64_phdr_t *)(data + phoff2);
+                if (ph2->p_type != PT_LOAD || ph2->p_memsz == 0) continue;
+                if (!(ph2->p_flags & PF_W)) continue;
+
+                void *save = kmalloc(ph2->p_memsz);
+                if (save) {
+                    memcpy(save, (void *)ph2->p_vaddr, ph2->p_memsz);
+                    fork_saves[fork_save_count].buf  = save;
+                    fork_saves[fork_save_count].addr = ph2->p_vaddr;
+                    fork_saves[fork_save_count].size = ph2->p_memsz;
+                    fork_save_count++;
+                    serial_puts("[ELF] Saved parent RW segment at 0x");
+                    serial_puthex(ph2->p_vaddr, 16);
+                    serial_puts(" (");
+                    serial_putdec(ph2->p_memsz);
+                    serial_puts(" bytes)\n");
+                }
+            }
         }
         base = (void *)vaddr_min;
         serial_puts("[ELF] Fixed load at vaddr 0x");
