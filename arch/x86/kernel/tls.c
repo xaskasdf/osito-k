@@ -86,12 +86,19 @@ static inline uint32_t get32(const uint8_t *p)
            ((uint32_t)p[2] << 8) | p[3];
 }
 
-/* ── Pseudo-random bytes (RDTSC-based, NOT cryptographic) ──── */
+/* ── Pseudo-random bytes (CCP TRNG → RDTSC fallback) ────────── */
+
+extern uint64_t ccp_random(void) __attribute__((weak));
+extern bool     ccp_is_ready(void) __attribute__((weak));
 
 static uint64_t prng_state;
 
 static void prng_seed(void)
 {
+    if (ccp_is_ready && ccp_is_ready()) {
+        prng_state = ccp_random();
+        return;
+    }
     uint32_t lo, hi;
     __asm__ volatile ("rdtsc" : "=a"(lo), "=d"(hi));
     prng_state = ((uint64_t)hi << 32) | lo;

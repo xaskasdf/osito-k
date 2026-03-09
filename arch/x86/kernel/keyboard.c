@@ -77,7 +77,7 @@ static const char sc_shifted[128] = {
 
 /* ── Push character into ring buffer ─────────────────────────── */
 
-static void kb_push(char c)
+void kb_push(char c)
 {
     uint32_t next = (kb_head + 1) % KB_BUF_SIZE;
     if (next != kb_tail) {  /* Not full */
@@ -91,7 +91,7 @@ static void kb_push(char c)
 static bool kb_extended;   /* true after 0xE0 prefix byte */
 
 /* Push VT100 escape sequence into ring buffer: ESC [ <suffix> */
-static void kb_push_esc(const char *seq)
+void kb_push_esc(const char *seq)
 {
     kb_push(27);   /* ESC */
     kb_push('[');
