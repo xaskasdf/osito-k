@@ -212,6 +212,72 @@ static inline uint32_t disp_win_class_for_gen(gpu_gen_t gen)
     }
 }
 
+/* ── I2C / DDC Registers (GPIO-based bit-bang) ───────────── */
+
+/* I2C port base registers (g94+). Each port has SCL/SDA bits. */
+#define NV_I2C_PORT1       0x0000E138
+#define NV_I2C_PORT2       0x0000E150
+#define NV_I2C_PORT3       0x0000E254
+#define NV_I2C_PORT4       0x0000E274
+#define NV_I2C_PORT_STRIDE 0x18
+
+/* I2C register bit layout */
+#define I2C_SCL_BIT        (1 << 0)   /* Clock line state */
+#define I2C_SDA_BIT        (1 << 1)   /* Data line state */
+#define I2C_SET_BIT        (1 << 2)   /* Write flag */
+
+/* DDC slave addresses */
+#define DDC_ADDR_EDID      0x50       /* EDID (write=0xA0, read=0xA1) */
+#define DDC_ADDR_EDID_EXT  0x30       /* Extended EDID (E-DDC) */
+
+/* ── EDID Structures ─────────────────────────────────────── */
+
+#define EDID_BLOCK_SIZE    128
+
+/* EDID header: 0x00 0xFF 0xFF 0xFF 0xFF 0xFF 0xFF 0x00 */
+#define EDID_HEADER_0      0x00
+#define EDID_HEADER_FILL   0xFF
+
+/* Detailed timing descriptor (18 bytes, up to 4 per block) */
+typedef struct __attribute__((packed)) {
+    uint16_t pixel_clock_10khz;  /* pixel clock in 10 kHz units */
+    uint8_t  h_active_lo;        /* horizontal active pixels [7:0] */
+    uint8_t  h_blank_lo;         /* horizontal blanking [7:0] */
+    uint8_t  h_active_blank_hi;  /* h_active[11:8] (hi nybble), h_blank[11:8] (lo nybble) */
+    uint8_t  v_active_lo;        /* vertical active lines [7:0] */
+    uint8_t  v_blank_lo;         /* vertical blanking [7:0] */
+    uint8_t  v_active_blank_hi;  /* v_active[11:8] (hi nybble), v_blank[11:8] (lo nybble) */
+    uint8_t  h_sync_off_lo;      /* horizontal sync offset [7:0] */
+    uint8_t  h_sync_pw_lo;       /* horizontal sync pulse width [7:0] */
+    uint8_t  v_sync_off_pw;      /* v_sync_off[3:0] (hi), v_sync_pw[3:0] (lo) */
+    uint8_t  sync_hi;            /* h_sync_off[9:8], h_sync_pw[9:8], v_sync_off[5:4], v_sync_pw[5:4] */
+    uint8_t  h_image_lo;         /* horizontal image size mm [7:0] */
+    uint8_t  v_image_lo;         /* vertical image size mm [7:0] */
+    uint8_t  image_hi;           /* h_image[11:8], v_image[11:8] */
+    uint8_t  h_border;
+    uint8_t  v_border;
+    uint8_t  flags;              /* interlace, stereo, sync type */
+} edid_detailed_timing_t;
+
+_Static_assert(sizeof(edid_detailed_timing_t) == 18, "EDID timing must be 18 bytes");
+
+/* Parsed mode from EDID */
+typedef struct {
+    uint32_t pixel_clock_hz;    /* pixel clock in Hz */
+    uint16_t h_active;
+    uint16_t h_blank;
+    uint16_t h_sync_offset;     /* front porch */
+    uint16_t h_sync_width;
+    uint16_t v_active;
+    uint16_t v_blank;
+    uint16_t v_sync_offset;     /* front porch */
+    uint16_t v_sync_width;
+    uint16_t h_total;           /* h_active + h_blank */
+    uint16_t v_total;           /* v_active + v_blank */
+    uint32_t refresh_hz;        /* calculated refresh rate */
+    bool     interlaced;
+} edid_mode_t;
+
 /* ── Public API ───────────────────────────────────────────── */
 
 /* Initialize display engine: claim ownership, allocate channels,
@@ -235,5 +301,31 @@ int gpu_display_is_ready(void);
 
 /* Get display state (for diagnostics). */
 display_state_t *gpu_display_get_state(void);
+
+/* ── Phase B: EDID + Modeset ─────────────────────────────── */
+
+/* Read EDID from the active output's DDC port.
+ * edid_buf: 128-byte buffer for the base EDID block.
+ * Returns: 0 on success, -1 on failure. */
+int gpu_display_read_edid(uint8_t *edid_buf);
+
+/* Parse EDID and extract the preferred mode.
+ * edid_buf: 128-byte EDID block.
+ * mode:     output parsed mode.
+ * Returns: 0 on success, -1 on failure. */
+int gpu_display_parse_edid(const uint8_t *edid_buf, edid_mode_t *mode);
+
+/* Set display mode (full modeset).
+ * mode:     desired mode (from EDID or manual).
+ * fb_addr:  physical address of framebuffer.
+ * fb_pitch: bytes per scanline.
+ * Returns: 0 on success, -1 on failure. */
+int gpu_display_set_mode(const edid_mode_t *mode, uint64_t fb_addr, uint32_t fb_pitch);
+
+/* Detect monitor and read preferred mode.
+ * Combines read_edid + parse_edid.
+ * mode: output parsed mode (NULL to just detect presence).
+ * Returns: 0 if monitor detected, -1 if no monitor. */
+int gpu_display_detect_monitor(edid_mode_t *mode);
 
 #endif /* OSITOK_GPU_DISPLAY_H */

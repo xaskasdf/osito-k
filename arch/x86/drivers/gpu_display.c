@@ -839,3 +839,467 @@ display_state_t *gpu_display_get_state(void)
 {
     return &disp;
 }
+
+/* ══════════════════════════════════════════════════════════════════
+ * Phase B: I2C Bit-Bang, EDID Read/Parse, Full Modeset
+ * ══════════════════════════════════════════════════════════════════ */
+
+/* ── I2C Port Registers ──────────────────────────────────────── */
+
+/* I2C port register addresses for g94+ NVIDIA GPUs.
+ * Each port has a control register with SCL/SDA/SET bits. */
+static const uint32_t i2c_port_regs[] = {
+    NV_I2C_PORT1,  /* port 0 */
+    NV_I2C_PORT2,  /* port 1 */
+    NV_I2C_PORT3,  /* port 2 */
+    NV_I2C_PORT4,  /* port 3 */
+};
+#define NUM_I2C_PORTS  4
+
+/* Small delay for I2C clock (~5 µs for 100 kHz).
+ * Uses TSC — assumes ~3 GHz CPU ≈ 15000 cycles per 5 µs. */
+static void i2c_delay(void)
+{
+    uint64_t start = rdtsc();
+    while (rdtsc() - start < 15000)
+        ;
+}
+
+/* Set SCL and SDA line states via GPIO bit-bang.
+ * val: combine I2C_SCL_BIT and/or I2C_SDA_BIT for lines to drive HIGH.
+ * Lines not set are driven LOW. */
+static void i2c_set_lines(uint32_t port_reg, int scl, int sda)
+{
+    uint32_t val = I2C_SET_BIT;
+    if (scl) val |= I2C_SCL_BIT;
+    if (sda) val |= I2C_SDA_BIT;
+    gpu_reg_write(port_reg, val);
+    i2c_delay();
+}
+
+/* Read SCL and SDA line states.
+ * Returns register value; check I2C_SCL_BIT / I2C_SDA_BIT. */
+static uint32_t i2c_read_lines(uint32_t port_reg)
+{
+    /* Read without SET bit to sample line states */
+    return gpu_reg_read(port_reg);
+}
+
+/* ── I2C Bit-Bang Protocol ───────────────────────────────────── */
+
+static void i2c_start(uint32_t port)
+{
+    /* START: SDA HIGH→LOW while SCL HIGH */
+    i2c_set_lines(port, 1, 1);
+    i2c_set_lines(port, 1, 0);  /* SDA low */
+    i2c_set_lines(port, 0, 0);  /* SCL low */
+}
+
+static void i2c_stop(uint32_t port)
+{
+    /* STOP: SDA LOW→HIGH while SCL HIGH */
+    i2c_set_lines(port, 0, 0);
+    i2c_set_lines(port, 1, 0);  /* SCL high, SDA low */
+    i2c_set_lines(port, 1, 1);  /* SDA high → STOP */
+}
+
+/* Send 8 bits MSB first. Returns 0 if ACK received, -1 if NACK. */
+static int i2c_write_byte(uint32_t port, uint8_t byte)
+{
+    for (int bit = 7; bit >= 0; bit--) {
+        int sda = (byte >> bit) & 1;
+        i2c_set_lines(port, 0, sda);    /* set data */
+        i2c_set_lines(port, 1, sda);    /* clock high */
+        i2c_set_lines(port, 0, sda);    /* clock low */
+    }
+
+    /* Read ACK: release SDA, clock high, sample SDA */
+    i2c_set_lines(port, 0, 1);          /* release SDA */
+    i2c_set_lines(port, 1, 1);          /* clock high */
+    uint32_t val = i2c_read_lines(port);
+    i2c_set_lines(port, 0, 1);          /* clock low */
+
+    return (val & I2C_SDA_BIT) ? -1 : 0;  /* ACK = SDA low */
+}
+
+/* Read 8 bits MSB first. Sends ACK if ack=1, NACK if ack=0. */
+static uint8_t i2c_read_byte(uint32_t port, int ack)
+{
+    uint8_t byte = 0;
+
+    for (int bit = 7; bit >= 0; bit--) {
+        i2c_set_lines(port, 0, 1);      /* release SDA */
+        i2c_set_lines(port, 1, 1);      /* clock high */
+        uint32_t val = i2c_read_lines(port);
+        if (val & I2C_SDA_BIT)
+            byte |= (1 << bit);
+        i2c_set_lines(port, 0, 1);      /* clock low */
+    }
+
+    /* Send ACK/NACK */
+    i2c_set_lines(port, 0, ack ? 0 : 1);  /* ACK = SDA low, NACK = SDA high */
+    i2c_set_lines(port, 1, ack ? 0 : 1);  /* clock high */
+    i2c_set_lines(port, 0, 1);             /* clock low, release SDA */
+
+    return byte;
+}
+
+/* ── DDC/EDID Read ───────────────────────────────────────────── */
+
+/*
+ * Read EDID block from DDC port via I2C.
+ *
+ * i2c_port_idx: which I2C port (0-3) to use
+ * edid_buf:     128-byte output buffer
+ *
+ * Returns: 0 on success, -1 on failure
+ */
+static int ddc_read_edid(int i2c_port_idx, uint8_t *edid_buf)
+{
+    if (i2c_port_idx < 0 || i2c_port_idx >= NUM_I2C_PORTS)
+        return -1;
+
+    uint32_t port = i2c_port_regs[i2c_port_idx];
+
+    /* Release bus */
+    i2c_set_lines(port, 1, 1);
+    i2c_delay();
+
+    /* Phase 1: Write address 0x00 (start of EDID) */
+    i2c_start(port);
+    if (i2c_write_byte(port, (DDC_ADDR_EDID << 1) | 0) < 0) {
+        /* NACK → no monitor on this port */
+        i2c_stop(port);
+        return -1;
+    }
+    if (i2c_write_byte(port, 0x00) < 0) {
+        i2c_stop(port);
+        return -1;
+    }
+    i2c_stop(port);
+
+    /* Phase 2: Read 128 bytes */
+    i2c_start(port);
+    if (i2c_write_byte(port, (DDC_ADDR_EDID << 1) | 1) < 0) {
+        i2c_stop(port);
+        return -1;
+    }
+
+    for (int i = 0; i < EDID_BLOCK_SIZE; i++) {
+        /* ACK all bytes except the last */
+        edid_buf[i] = i2c_read_byte(port, (i < EDID_BLOCK_SIZE - 1) ? 1 : 0);
+    }
+    i2c_stop(port);
+
+    /* Validate header */
+    if (edid_buf[0] != 0x00 || edid_buf[1] != 0xFF || edid_buf[2] != 0xFF ||
+        edid_buf[3] != 0xFF || edid_buf[4] != 0xFF || edid_buf[5] != 0xFF ||
+        edid_buf[6] != 0xFF || edid_buf[7] != 0x00) {
+        serial_puts("[DISP] EDID header invalid\n");
+        return -1;
+    }
+
+    /* Validate checksum */
+    uint8_t sum = 0;
+    for (int i = 0; i < EDID_BLOCK_SIZE; i++)
+        sum += edid_buf[i];
+    if (sum != 0) {
+        serial_puts("[DISP] EDID checksum failed\n");
+        return -1;
+    }
+
+    return 0;
+}
+
+/* ── EDID Parser ─────────────────────────────────────────────── */
+
+/*
+ * Parse a 128-byte EDID block and extract the preferred mode
+ * (first detailed timing descriptor).
+ */
+int gpu_display_parse_edid(const uint8_t *edid, edid_mode_t *mode)
+{
+    if (!edid || !mode) return -1;
+
+    /* First detailed timing descriptor starts at offset 0x36 */
+    const edid_detailed_timing_t *dt =
+        (const edid_detailed_timing_t *)(edid + 0x36);
+
+    /* A pixel clock of 0 means this is not a timing descriptor */
+    if (dt->pixel_clock_10khz == 0)
+        return -1;
+
+    /* Extract fields (multi-byte with hi-nybble packing) */
+    mode->h_active = (uint16_t)dt->h_active_lo |
+                     (uint16_t)((dt->h_active_blank_hi >> 4) & 0x0F) << 8;
+    mode->h_blank  = (uint16_t)dt->h_blank_lo |
+                     (uint16_t)(dt->h_active_blank_hi & 0x0F) << 8;
+    mode->v_active = (uint16_t)dt->v_active_lo |
+                     (uint16_t)((dt->v_active_blank_hi >> 4) & 0x0F) << 8;
+    mode->v_blank  = (uint16_t)dt->v_blank_lo |
+                     (uint16_t)(dt->v_active_blank_hi & 0x0F) << 8;
+
+    mode->h_sync_offset = (uint16_t)dt->h_sync_off_lo |
+                          (uint16_t)((dt->sync_hi >> 6) & 0x03) << 8;
+    mode->h_sync_width  = (uint16_t)dt->h_sync_pw_lo |
+                          (uint16_t)((dt->sync_hi >> 4) & 0x03) << 8;
+    mode->v_sync_offset = (uint16_t)((dt->v_sync_off_pw >> 4) & 0x0F) |
+                          (uint16_t)((dt->sync_hi >> 2) & 0x03) << 4;
+    mode->v_sync_width  = (uint16_t)(dt->v_sync_off_pw & 0x0F) |
+                          (uint16_t)(dt->sync_hi & 0x03) << 4;
+
+    mode->pixel_clock_hz = (uint32_t)dt->pixel_clock_10khz * 10000;
+    mode->h_total = mode->h_active + mode->h_blank;
+    mode->v_total = mode->v_active + mode->v_blank;
+    mode->interlaced = (dt->flags & 0x80) ? true : false;
+
+    /* Calculate refresh rate */
+    if (mode->h_total > 0 && mode->v_total > 0) {
+        mode->refresh_hz = mode->pixel_clock_hz / ((uint32_t)mode->h_total * mode->v_total);
+    } else {
+        mode->refresh_hz = 60;
+    }
+
+    serial_puts("[DISP] EDID preferred mode: ");
+    serial_putdec(mode->h_active);
+    serial_puts("x");
+    serial_putdec(mode->v_active);
+    serial_puts("@");
+    serial_putdec(mode->refresh_hz);
+    serial_puts("Hz pixel_clock=");
+    serial_putdec(mode->pixel_clock_hz / 1000);
+    serial_puts("kHz\n");
+
+    return 0;
+}
+
+/* ── Public: Read EDID ───────────────────────────────────────── */
+
+int gpu_display_read_edid(uint8_t *edid_buf)
+{
+    if (!edid_buf) return -1;
+
+    serial_puts("[DISP] Reading EDID via DDC...\n");
+
+    /* Try each I2C port until we find a monitor.
+     * In a proper implementation, DCB would tell us which port to use.
+     * For now, scan all ports (the active SOR is usually on port 0 or 1). */
+    for (int port = 0; port < NUM_I2C_PORTS; port++) {
+        serial_puts("[DISP]   Trying I2C port ");
+        serial_putdec(port);
+        serial_puts("... ");
+
+        if (ddc_read_edid(port, edid_buf) == 0) {
+            serial_puts("OK\n");
+
+            /* Log manufacturer */
+            uint16_t mfg = ((uint16_t)edid_buf[8] << 8) | edid_buf[9];
+            char mfg_str[4];
+            mfg_str[0] = ((mfg >> 10) & 0x1F) + 'A' - 1;
+            mfg_str[1] = ((mfg >>  5) & 0x1F) + 'A' - 1;
+            mfg_str[2] = (mfg & 0x1F) + 'A' - 1;
+            mfg_str[3] = '\0';
+            serial_puts("[DISP]   Manufacturer: ");
+            serial_puts(mfg_str);
+            serial_puts(" Product: 0x");
+            serial_puthex(((uint32_t)edid_buf[11] << 8) | edid_buf[10], 4);
+            serial_puts("\n");
+
+            return 0;
+        }
+        serial_puts("no response\n");
+    }
+
+    serial_puts("[DISP] No monitor found on any DDC port\n");
+    return -1;
+}
+
+/* ── Public: Detect Monitor ──────────────────────────────────── */
+
+int gpu_display_detect_monitor(edid_mode_t *mode)
+{
+    uint8_t edid[EDID_BLOCK_SIZE];
+
+    if (gpu_display_read_edid(edid) < 0)
+        return -1;
+
+    if (mode)
+        return gpu_display_parse_edid(edid, mode);
+
+    return 0;  /* monitor detected, no mode requested */
+}
+
+/* ── Full Modeset ────────────────────────────────────────────── */
+
+/*
+ * Set display mode with new timing parameters.
+ * Rebuilds core + window channel push buffers with the new timing,
+ * then submits UPDATE.
+ *
+ * Requires: gpu_display_init() already called (Phase A complete).
+ */
+int gpu_display_set_mode(const edid_mode_t *mode, uint64_t fb_addr, uint32_t fb_pitch)
+{
+    if (!disp.ready || !mode) return -1;
+
+    serial_puts("[DISP] Setting mode: ");
+    serial_putdec(mode->h_active);
+    serial_puts("x");
+    serial_putdec(mode->v_active);
+    serial_puts("@");
+    serial_putdec(mode->refresh_hz);
+    serial_puts("Hz\n");
+
+    /* Calculate raster parameters for NVDisplay method push.
+     *
+     * NVDisplay HEAD_SET_RASTER_* convention:
+     *   RASTER_SIZE     = (htotal, vtotal)
+     *   RASTER_SYNC_END = (hsync_end, vsync_end)
+     *     where hsync_end = h_active + h_sync_offset + h_sync_width
+     *           vsync_end = v_active + v_sync_offset + v_sync_width
+     *   RASTER_BLANK_END = (hblank_end, vblank_end)
+     *     where hblank_end = h_blank (total blanking period)
+     *           vblank_end = v_blank
+     *   RASTER_BLANK_START = (hblank_start, vblank_start)
+     *     where hblank_start = h_active
+     *           vblank_start = v_active
+     */
+    uint32_t htotal = mode->h_total;
+    uint32_t vtotal = mode->v_total;
+    uint32_t hsync_end = mode->h_active + mode->h_sync_offset + mode->h_sync_width;
+    uint32_t vsync_end = mode->v_active + mode->v_sync_offset + mode->v_sync_width;
+    uint32_t hblank_end = mode->h_blank;
+    uint32_t vblank_end = mode->v_blank;
+    uint32_t hblank_start = mode->h_active;
+    uint32_t vblank_start = mode->v_active;
+
+    uint32_t head = disp.active_head;
+    uint32_t sor = disp.active_sor;
+
+    serial_puts("[DISP]   htotal=");
+    serial_putdec(htotal);
+    serial_puts(" vtotal=");
+    serial_putdec(vtotal);
+    serial_puts(" pixclk=");
+    serial_putdec(mode->pixel_clock_hz / 1000);
+    serial_puts("kHz\n");
+
+    /* ── Rebuild Core Channel Push Buffer ─────────────────────── */
+
+    pushbuf_state_t *cpb = &disp.core_pb;
+    disp_pb_begin(cpb);
+
+    /* SOR_SET_CONTROL: assign SOR to head, protocol = SINGLE_TMDS_A */
+    disp_pb_mthd(cpb, DISP_SOR_SET_CONTROL(sor),
+                  (1 << head) | (0x01 << 8));
+
+    /* HEAD_SET_CONTROL: progressive */
+    disp_pb_mthd(cpb, DISP_HEAD_SET_CONTROL(head), 0x00);
+
+    /* HEAD_SET_PIXEL_CLOCK: Hz */
+    disp_pb_mthd(cpb, DISP_HEAD_SET_PIXEL_CLOCK(head),
+                  mode->pixel_clock_hz);
+
+    /* HEAD_SET_RASTER_SIZE */
+    disp_pb_mthd(cpb, DISP_HEAD_SET_RASTER_SIZE(head),
+                  (htotal & 0x7FFF) | ((vtotal & 0x7FFF) << 16));
+
+    /* HEAD_SET_RASTER_SYNC_END */
+    disp_pb_mthd(cpb, DISP_HEAD_SET_RASTER_SYNC_END(head),
+                  (hsync_end & 0x7FFF) | ((vsync_end & 0x7FFF) << 16));
+
+    /* HEAD_SET_RASTER_BLANK_END */
+    disp_pb_mthd(cpb, DISP_HEAD_SET_RASTER_BLANK_END(head),
+                  (hblank_end & 0x7FFF) | ((vblank_end & 0x7FFF) << 16));
+
+    /* HEAD_SET_RASTER_BLANK_START */
+    disp_pb_mthd(cpb, DISP_HEAD_SET_RASTER_BLANK_START(head),
+                  (hblank_start & 0x7FFF) | ((vblank_start & 0x7FFF) << 16));
+
+    /* SET_INTERLOCK_FLAGS: interlock with window channel 0 */
+    disp_pb_mthd(cpb, DISP_CORE_SET_INTERLOCK_FLAGS, (1 << 1));
+
+    /* UPDATE */
+    disp_pb_mthd(cpb, DISP_CORE_UPDATE, 0);
+
+    /* ── Rebuild Window Channel Push Buffer ───────────────────── */
+
+    pushbuf_state_t *wpb = &disp.win_pb;
+    disp_pb_begin(wpb);
+
+    /* SET_OFFSET: framebuffer address (256-byte aligned) */
+    disp_pb_mthd(wpb, DISP_WIN_SET_OFFSET(0), (uint32_t)(fb_addr >> 8));
+
+    /* SET_SIZE: width | (height << 16) */
+    disp_pb_mthd(wpb, DISP_WIN_SET_SIZE,
+                  mode->h_active | ((uint32_t)mode->v_active << 16));
+
+    /* SET_STORAGE: pitch mode, block_height = ONE_GOB */
+    disp_pb_mthd(wpb, DISP_WIN_SET_STORAGE, (0 << 0) | (1 << 4));
+
+    /* SET_PLANAR_STORAGE: encoded pitch (in 64-byte units) */
+    uint32_t pitch_enc = (fb_pitch >> 6) & 0x1FFF;
+    disp_pb_mthd(wpb, DISP_WIN_SET_PLANAR_STORAGE(0), pitch_enc);
+
+    /* SET_PARAMS: A8R8G8B8 format (0xCF), RGB color space */
+    disp_pb_mthd(wpb, DISP_WIN_SET_PARAMS, 0xCF);
+
+    /* SET_CONTEXT_DMA_ISO: physical addressing */
+    disp_pb_mthd(wpb, DISP_WIN_SET_CONTEXT_DMA_ISO(0), 0);
+
+    /* SET_POINT_IN: no source crop */
+    disp_pb_mthd(wpb, DISP_WIN_SET_POINT_IN(0), 0);
+
+    /* SET_SIZE_IN: source size */
+    disp_pb_mthd(wpb, DISP_WIN_SET_SIZE_IN,
+                  mode->h_active | ((uint32_t)mode->v_active << 16));
+
+    /* SET_SIZE_OUT: output size (no scaling) */
+    disp_pb_mthd(wpb, DISP_WIN_SET_SIZE_OUT,
+                  mode->h_active | ((uint32_t)mode->v_active << 16));
+
+    /* Window UPDATE */
+    disp_pb_mthd(wpb, DISP_WIN_UPDATE, 0);
+
+    /* ── Submit Both Channels ─────────────────────────────────── */
+
+    disp_wmb();
+
+    /* Write PUT pointers to advance channels */
+    uint32_t core_put = disp_pb_size_bytes(cpb);
+    uint32_t win_put  = disp_pb_size_bytes(wpb);
+
+    serial_puts("[DISP]   Core PB: ");
+    serial_putdec(cpb->pos);
+    serial_puts(" dwords, Window PB: ");
+    serial_putdec(wpb->pos);
+    serial_puts(" dwords\n");
+
+    /* Enable channels and write PUT */
+    gpu_reg_write(NV_PDISP_FE_CHNCTL_CORE, 0x01);  /* enable */
+    disp_wmb();
+    gpu_reg_write(NV_PDISP_FE_CHNCTL_CORE + 4, core_put);  /* PUT */
+
+    gpu_reg_write(NV_PDISP_FE_CHNCTL_WIN(0), 0x01);  /* enable */
+    disp_wmb();
+    gpu_reg_write(NV_PDISP_FE_CHNCTL_WIN(0) + 4, win_put);  /* PUT */
+
+    /* Poll for completion (GET catches up to PUT) */
+    uint64_t deadline = rdtsc() + 3000000000ULL;  /* ~1s */
+    while (rdtsc() < deadline) {
+        uint32_t core_get = gpu_reg_read(NV_PDISP_FE_CHNCTL_CORE + 8);
+        uint32_t win_get  = gpu_reg_read(NV_PDISP_FE_CHNCTL_WIN(0) + 8);
+        if (core_get >= core_put && win_get >= win_put) {
+            serial_puts("[DISP] Modeset complete\n");
+
+            /* Update state */
+            disp.width  = mode->h_active;
+            disp.height = mode->v_active;
+
+            return 0;
+        }
+    }
+
+    serial_puts("[DISP] Modeset timeout!\n");
+    return -1;
+}
