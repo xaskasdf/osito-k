@@ -1161,6 +1161,11 @@ Preemptive process creation via scheduler-based fork. Child gets own kernel stac
 - **syscall_user_rsp**: Global in syscall_entry.S BSS, saved before any pushes. Fork reads parent's complete register state from this frame.
 - **Memory allocator fix**: `mem_alloc_pages` and `mem_alloc_aligned` start at page 2048 (8MB) to avoid consuming the 0x400000-0x600000 range used by ET_EXEC ELF binaries. Without this, boot-time allocations (heap, page tables, crypto) consume the ELF load area and mem_reserve_range fails.
 - **ELF loader fix**: `mem_reserve_range` failure during ET_EXEC loading is non-fatal — allows fork+execve of the same binary (parent already owns those pages).
+- **Parent state save/restore** (identity-mapped fork+execve of same binary):
+  - `elf.c`: Before memset overwrites parent's ELF data, saves all PF_W segments (up to 4) via kmalloc. `elf_fork_restore()` restores them after child is reaped.
+  - `syscall.c`: `syscall_save_brk()` saves brk pointers + FS_BASE MSR + fd_table + sig_handlers + vma_table. `syscall_restore_brk()` restores all after child exit. Prevents: parent free() crash (wrong brk), TLS corruption (wrong FS_BASE), fd leak/loss, signal handler loss.
+  - `process.c`: Save called in `proc_fork()`, restore called in both `proc_wait4()` reap paths.
+  - `syscall_reset_process()` guards: skips `kfree(brk_base)` and mmap region freeing when `saved_parent.valid` (child's execve must not free parent's resources).
 - **proc_execve**: Redirects `/proc/self/exe` and `/proc/<pid>/exe` to current process name (busybox re-exec pattern). Forked children skip parent region freeing (identity-mapped OS, shared address space).
 - **Keyboard stdin**: `console_read` reads from PS/2 keyboard ring buffer. No kernel echo (apps handle their own terminal echo).
 - **Terminal ioctl**: TCGETS returns minimal termios for isatty() detection. TIOCGWINSZ returns 80×25. TCSETS/TCSETSW/TCSETSF accepted and ignored.
