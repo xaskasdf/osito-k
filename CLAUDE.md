@@ -383,14 +383,14 @@ Tasks:   idle, input, shell (3 of 8 slots used)
 | **X-VFS** | **Virtual filesystem layer** (/dev/null,zero,urandom,console + /proc/self/status,maps + getcwd/readlink/getdents64 syscalls, 7/7 QEMU tests pass) | Done |
 | **X-MUSL** | **musl libc port** (cross-compiled musl 1.2.5 static libc, +20 syscalls: arch_prctl/set_tid_address/clock_gettime/getrandom/nanosleep/getpid/gettid/futex/fcntl/prlimit64/etc, 9/9 QEMU tests pass) | Done |
 | **X-FORK** | **fork/wait4/getppid + busybox** (scheduler-based fork, wait4 memory clobber fix, execve /proc/self/exe, 8MB allocator boundary, ioctl/poll/vfork, busybox ash interactive, 3/3 QEMU tests pass) | Done |
+| **X-THREAD** | **clone(CLONE_THREAD) + futex** (per-thread TLS/FS_BASE save/restore, futex wait queue, PROC_BLOCKED state, clear_child_tid, thread exit cleanup, 2/2 QEMU tests pass) | Done |
 
 > Full GPU roadmap (X27-X40 + contingency): see [docs/x86-gpu-roadmap.md](docs/x86-gpu-roadmap.md)
 > Full OS roadmap (Tiers 0-9): see [docs/os-selfhost-roadmap.md](docs/os-selfhost-roadmap.md)
 > Binary compatibility roadmap: see [docs/binary-compat-roadmap.md](docs/binary-compat-roadmap.md)
 > Paths to Claude analysis: see [docs/paths-to-claude-on-ositok.md](docs/paths-to-claude-on-ositok.md)
 
-**Tier 7+ (next)**: X-THREAD (clone/futex threads),
-X-EDIT (port kilo editor), X-HTTPD (TCP server), X-SELF (self-hosting kernel compile).
+**Tier 7+ (next)**: X-EDIT (port kilo editor), X-HTTPD (TCP server), X-SELF (self-hosting kernel compile).
 See `docs/os-selfhost-roadmap.md` for full details and dependency chains.
 
 ### F12: DOOM Wireframe 2.5D
@@ -1189,6 +1189,19 @@ Post-X-FORK hardening for busybox stability. Three critical fixes + syscall expa
 - **Busybox verified applets**: echo, id, pwd, whoami, uname -a, true, false, env, basename, dirname, seq.
 - **Known issues**: Some applets (#UD at 0x401067 in busybox code), `cat /proc/self/status` (#PF at RIP=0xFFFFFFFFFFFFFFFF — corrupted function pointer).
 - **Files**: `arch/x86/kernel/idt.c` (exception kill + cascading guard), `arch/x86/kernel/process.c` (proc_exception_kill), `arch/x86/kernel/isr_stubs.S` (atomic XCHG), `arch/x86/kernel/smp.c` (AP timer removed), `arch/x86/kernel/syscall.c` (+35 syscalls)
+
+### X-THREAD: clone(CLONE_THREAD) + Futex Wait/Wake
+Linux-compatible thread creation via clone() with thread flags, plus futex-based synchronization.
+- **proc_clone_thread()** (`process.c`): Creates new thread sharing parent's address space. Reads parent's 14 saved registers from SYSCALL frame (syscall_user_rsp). Allocates 16KB kernel stack, builds 176-byte fake ISR frame (GPRs + IRETQ: RIP=parent's return point, RSP=child_stack, RAX=0). Thread auto-activates scheduler.
+- **Per-thread TLS** (`process.c`): `fs_base` field in process_t. `sched_tick()` saves/restores FS_BASE MSR (0xC0000100) on every context switch. `sys_arch_prctl(ARCH_SET_FS)` also calls `proc_set_fs_base()`.
+- **TGID semantics**: `sys_getpid()` returns `tgid` (thread group ID = leader's PID). `sys_gettid()` returns unique PID. Threads share parent's tgid.
+- **Futex wait queue** (`process.c`): 32-entry `futex_waiters[]` table. `futex_do_wait(uaddr, expected)` checks *uaddr==expected, registers waiter, sets PROC_BLOCKED, spins on `sti;hlt;cli` until woken. `futex_do_wake(uaddr, count)` scans table, sets PROC_READY for matching waiters.
+- **PROC_BLOCKED state**: Scheduler skips BLOCKED processes (like ZOMBIE). `sched_tick()` force-switches away from BLOCKED processes.
+- **clear_child_tid** (`process.c`): CLONE_CHILD_CLEARTID stores address in process_t. `thread_exit_cleanup()` writes 0 to address and does FUTEX_WAKE (pthread_join pattern). Called from proc_exit() and proc_exception_kill().
+- **sys_clone** (`syscall.c`): Dispatches to `proc_clone_thread()` when CLONE_THREAD flag set (requires child_stack). Falls back to `proc_fork()` otherwise. Handles CLONE_PARENT_SETTID, CLONE_CHILD_CLEARTID, CLONE_SETTLS flags.
+- **sys_futex** (`syscall.c`): FUTEX_WAIT → `futex_do_wait()`, FUTEX_WAKE → `futex_do_wake()`. Other ops return 0 (stub).
+- **Verified**: T1 clone+shared_counter (CLONE_VM), T2 futex wait/wake — 2/2 tests pass in QEMU.
+- **Files**: `arch/x86/kernel/process.c` (proc_clone_thread, futex, TLS, thread_exit_cleanup), `arch/x86/kernel/syscall.c` (sys_clone, sys_futex), `arch/x86/test/thread_test.c`
 
 ### AArch64/SM8350 Port (arch/arm/)
 Reference bare-metal code for ASUS ROG Phone 5 (Snapdragon 888).

@@ -29,6 +29,18 @@ extern void *mem_alloc_aligned(uint64_t size, uint64_t alignment);
 extern void  mem_free_pages(void *addr, uint64_t count);
 extern uint64_t paging_get_kernel_cr3(void);
 
+/* MSR access for per-thread TLS (X-THREAD) */
+#define MSR_FS_BASE 0xC0000100
+static inline uint64_t rdmsr(uint32_t msr) {
+    uint32_t lo, hi;
+    __asm__ volatile ("rdmsr" : "=a"(lo), "=d"(hi) : "c"(msr));
+    return ((uint64_t)hi << 32) | lo;
+}
+static inline void wrmsr(uint32_t msr, uint64_t val) {
+    __asm__ volatile ("wrmsr" : : "c"(msr),
+                      "a"((uint32_t)val), "d"((uint32_t)(val >> 32)));
+}
+
 /* ELF loader */
 extern int elf_exec(const char *filename, int argc, const char **argv);
 
@@ -103,6 +115,12 @@ typedef struct {
     uint64_t kernel_rsp;         /* saved RSP pointing to interrupt frame */
     uint32_t quantum;            /* ticks remaining in time slice */
 
+    /* Thread support (X-THREAD) */
+    uint32_t tgid;               /* thread group ID (= leader's PID) */
+    bool     is_thread;          /* true if created via CLONE_THREAD */
+    uint64_t fs_base;            /* per-thread FS_BASE (TLS) */
+    uint64_t *clear_child_tid;   /* set_tid_address / CLONE_CHILD_CLEARTID */
+
 } process_t;
 
 /* ── Process table ───────────────────────────────────────────── */
@@ -159,6 +177,12 @@ static process_t *proc_alloc(const char *name)
                 j++;
             }
             p->name[j] = '\0';
+
+            /* Thread group = own PID by default (changed for CLONE_THREAD) */
+            p->tgid = p->pid;
+            p->is_thread = false;
+            p->fs_base = 0;
+            p->clear_child_tid = NULL;
 
             /* Setup standard FDs */
             p->fds[0].open = true;
@@ -228,6 +252,26 @@ int32_t proc_current_ppid(void)
     return current_proc ? (int32_t)current_proc->ppid : 0;
 }
 
+/* Get current thread group ID (X-THREAD) */
+int32_t proc_current_tgid(void)
+{
+    return current_proc ? (int32_t)current_proc->tgid : 0;
+}
+
+/* Set clear_child_tid address (set_tid_address syscall) */
+void proc_set_clear_child_tid(uint64_t *addr)
+{
+    if (current_proc)
+        current_proc->clear_child_tid = addr;
+}
+
+/* Save FS_BASE to current process (called from arch_prctl SET_FS) */
+void proc_set_fs_base(uint64_t addr)
+{
+    if (current_proc)
+        current_proc->fs_base = addr;
+}
+
 /* Get current process name */
 const char *proc_current_name(void)
 {
@@ -244,6 +288,9 @@ process_t *proc_find(uint32_t pid)
     return NULL;
 }
 
+/* Forward declaration for thread exit cleanup (X-THREAD) */
+static void thread_exit_cleanup(process_t *p);
+
 /* Exception kill — safe to call from ISR context.
  * Marks the current process as ZOMBIE and enters HLT loop.
  * Uses no SSE/XMM instructions (compiled with -O0 for safety).
@@ -256,6 +303,7 @@ int proc_exception_kill(int32_t code)
 
     /* Forked/spawned process — mark ZOMBIE, scheduler will switch away */
     if (p->kernel_stack) {
+        thread_exit_cleanup(p);
         p->exit_code = code;
         p->state = PROC_ZOMBIE;
         __asm__ volatile ("sti");
@@ -279,6 +327,7 @@ void proc_exit(int32_t code)
     /* If this process has a kernel_stack, it was created by fork/sched_spawn.
      * Mark as ZOMBIE and let the scheduler switch away. Parent reaps via wait4. */
     if (p && p->kernel_stack) {
+        thread_exit_cleanup(p);  /* X-THREAD: clear_child_tid + futex wake */
         p->exit_code = code;
         p->state = PROC_ZOMBIE;
         /* DON'T free memory regions here — we're still running on the
@@ -450,8 +499,9 @@ void sched_tick(void *frame_ptr)
     process_t *cur = &proctab[sched_current_idx];
 
     /* Decrement quantum — if still running, continue.
-     * ZOMBIE processes always force-switch immediately. */
-    if (cur->state != PROC_ZOMBIE && cur->quantum > 1) {
+     * ZOMBIE and BLOCKED processes always force-switch immediately. */
+    if (cur->state != PROC_ZOMBIE && cur->state != PROC_BLOCKED
+        && cur->quantum > 1) {
         cur->quantum--;
         return;
     }
@@ -478,6 +528,7 @@ void sched_tick(void *frame_ptr)
      * GPRs on this process's stack (set by ISR stub before calling
      * isr_handler). Store it so we can restore later. */
     cur->kernel_rsp = (uint64_t)frame_ptr;
+    cur->fs_base = rdmsr(MSR_FS_BASE);  /* save per-thread TLS */
     /* Only mark as READY if currently RUNNING.
      * ZOMBIE processes must stay ZOMBIE — proc_wait4 relies on this. */
     if (cur->state == PROC_RUNNING)
@@ -489,6 +540,7 @@ void sched_tick(void *frame_ptr)
     next->quantum = SCHED_QUANTUM;
     current_proc = next;
     sched_current_idx = next_idx;
+    wrmsr(MSR_FS_BASE, next->fs_base);  /* restore per-thread TLS */
 
     /* Tell ISR stub to switch RSP before popping GPRs.
      * The stub will: mov sched_switch_rsp → RSP, then pop + iretq
@@ -865,6 +917,227 @@ int32_t proc_fork(void)
 
     /* Parent returns child PID immediately */
     return (int32_t)child->pid;
+}
+
+/*
+ * proc_clone_thread — create a new thread (X-THREAD).
+ *
+ * Unlike fork, threads share the parent's address space (identity-mapped
+ * OS means this is automatic). The child_stack parameter provides the
+ * thread's own stack. The thread runs fn(arg) by starting at user_rip
+ * (which should be the clone() return point in libc's __clone wrapper).
+ *
+ * clone flags: CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND |
+ *              CLONE_THREAD | CLONE_SYSVSEM | CLONE_SETTLS |
+ *              CLONE_PARENT_SETTID | CLONE_CHILD_CLEARTID
+ *
+ * Returns child TID to parent, 0 to child (via RAX in ISR frame).
+ */
+int32_t proc_clone_thread(uint64_t child_stack, uint64_t parent_tidptr,
+                          uint64_t child_tidptr, uint64_t tls)
+{
+    if (!current_proc) return -1;
+
+    process_t *parent = current_proc;
+
+    /* Read parent's register state from SYSCALL save frame */
+    uint64_t user_rsp = syscall_user_rsp;
+    uint64_t *frame_base = (uint64_t *)(user_rsp - 14 * 8);
+
+    uint64_t user_r9     = frame_base[0];
+    uint64_t user_r8     = frame_base[1];
+    uint64_t user_r10    = frame_base[2];
+    uint64_t user_rdx    = frame_base[3];
+    uint64_t user_rsi    = frame_base[4];
+    uint64_t user_rdi    = frame_base[5];
+    uint64_t user_rflags = frame_base[6];
+    uint64_t user_rip    = frame_base[7];
+    uint64_t r15         = frame_base[8];
+    uint64_t r14         = frame_base[9];
+    uint64_t r13         = frame_base[10];
+    uint64_t r12         = frame_base[11];
+    uint64_t rbx         = frame_base[12];
+    uint64_t rbp         = frame_base[13];
+
+    /* Allocate thread in process table */
+    process_t *thread = proc_alloc(parent->name);
+    if (!thread) {
+        serial_puts("[THREAD] Process table full\n");
+        return -1;
+    }
+
+    /* Thread shares parent's thread group */
+    thread->tgid = parent->tgid;
+    thread->ppid = parent->pid;
+    thread->is_thread = true;
+
+    /* Copy FD table from parent (shared semantics) */
+    for (int i = 0; i < MAX_FDS; i++)
+        thread->fds[i] = parent->fds[i];
+
+    thread->region_count = 0;
+
+    /* Set per-thread TLS */
+    thread->fs_base = tls;
+
+    /* CLONE_PARENT_SETTID: write child TID to parent's memory */
+    if (parent_tidptr) {
+        *(int *)parent_tidptr = (int)thread->pid;
+    }
+
+    /* CLONE_CHILD_CLEARTID: remember address for futex wake on exit */
+    if (child_tidptr) {
+        thread->clear_child_tid = (uint64_t *)child_tidptr;
+        /* Also write TID there now (CLONE_CHILD_SETTID behavior) */
+        *(int *)child_tidptr = (int)thread->pid;
+    }
+
+    /* Allocate kernel stack for the thread */
+    void *kstack = mem_alloc_aligned(KERNEL_STACK_SIZE, 4096);
+    if (!kstack) {
+        thread->state = PROC_FREE;
+        serial_puts("[THREAD] Kernel stack alloc failed\n");
+        return -1;
+    }
+    thread->kernel_stack = kstack;
+
+    uint64_t kstack_top = (uint64_t)kstack + KERNEL_STACK_SIZE;
+
+    /* Build fake interrupt frame */
+    uint64_t frame_addr = (kstack_top - 176) & ~0xFULL;
+    uint64_t *cf = (uint64_t *)frame_addr;
+    memset(cf, 0, 176);
+
+    /* GPRs — copy parent's values */
+    cf[0]  = r15;
+    cf[1]  = r14;
+    cf[2]  = r13;
+    cf[3]  = r12;
+    cf[4]  = user_rflags;
+    cf[5]  = user_r10;
+    cf[6]  = user_r9;
+    cf[7]  = user_r8;
+    cf[8]  = rbp;
+    cf[9]  = user_rdi;
+    cf[10] = user_rsi;
+    cf[11] = user_rdx;
+    cf[12] = user_rip;
+    cf[13] = rbx;
+    cf[14] = 0;             /* RAX = 0 → clone returns 0 to child */
+    cf[15] = 0;
+    cf[16] = 0;
+
+    /* IRETQ frame — child uses provided stack, NOT parent's */
+    cf[17] = user_rip;
+    cf[18] = 0x38;
+    cf[19] = user_rflags | 0x200;
+    cf[20] = child_stack;   /* Thread's own stack (provided by caller) */
+    cf[21] = 0x30;
+
+    /* Scheduler state */
+    thread->kernel_rsp = frame_addr;
+    thread->state = PROC_READY;
+    thread->quantum = SCHED_QUANTUM;
+
+    /* Ensure scheduler is tracking parent */
+    int parent_idx = (int)(parent - &proctab[0]);
+    sched_current_idx = parent_idx;
+    parent->quantum = SCHED_QUANTUM;
+
+    if (!sched_enabled) {
+        sched_enabled = true;
+        serial_puts("[SCHED] Preemptive scheduling activated (by clone)\n");
+    }
+
+    return (int32_t)thread->pid;
+}
+
+/* ── Futex wait queue (X-THREAD) ────────────────────────────── */
+
+#define FUTEX_HASH_SIZE  32
+#define MAX_FUTEX_WAITERS 32
+
+typedef struct {
+    uint64_t    addr;       /* futex user address */
+    int         proc_idx;   /* index into proctab (process waiting) */
+    bool        active;
+} futex_waiter_t;
+
+static futex_waiter_t futex_waiters[MAX_FUTEX_WAITERS];
+
+/* futex_wait — block current process until woken.
+ * Returns 0 on success, -EAGAIN if value mismatch. */
+int futex_do_wait(uint64_t uaddr, int expected)
+{
+    volatile int *addr = (volatile int *)uaddr;
+
+    /* Atomic check: if value changed, return immediately */
+    if (*addr != expected)
+        return -11; /* EAGAIN */
+
+    /* Find a free waiter slot */
+    int slot = -1;
+    for (int i = 0; i < MAX_FUTEX_WAITERS; i++) {
+        if (!futex_waiters[i].active) {
+            slot = i;
+            break;
+        }
+    }
+    if (slot < 0) return -12; /* ENOMEM — too many waiters */
+
+    process_t *cur = current_proc;
+    int cur_idx = (int)(cur - &proctab[0]);
+
+    /* Register waiter */
+    futex_waiters[slot].addr = uaddr;
+    futex_waiters[slot].proc_idx = cur_idx;
+    futex_waiters[slot].active = true;
+
+    /* Block: mark process as BLOCKED, yield to scheduler.
+     * sched_tick skips BLOCKED processes. We'll be woken by futex_wake. */
+    cur->state = PROC_BLOCKED;
+
+    /* Yield CPU — scheduler will switch away on next tick.
+     * We spin on HLT until the scheduler preempts us out. */
+    while (cur->state == PROC_BLOCKED) {
+        __asm__ volatile ("sti; hlt; cli" ::: "memory");
+    }
+
+    /* Woken — clear waiter slot (may already be cleared by wake) */
+    futex_waiters[slot].active = false;
+
+    return 0;
+}
+
+/* futex_wake — wake up to 'count' processes waiting on uaddr.
+ * Returns number of processes woken. */
+int futex_do_wake(uint64_t uaddr, int count)
+{
+    int woken = 0;
+    for (int i = 0; i < MAX_FUTEX_WAITERS && woken < count; i++) {
+        if (futex_waiters[i].active && futex_waiters[i].addr == uaddr) {
+            int idx = futex_waiters[i].proc_idx;
+            if (idx >= 0 && idx < MAX_PROCESSES &&
+                proctab[idx].state == PROC_BLOCKED) {
+                proctab[idx].state = PROC_READY;
+                woken++;
+            }
+            futex_waiters[i].active = false;
+        }
+    }
+    return woken;
+}
+
+/* Thread exit cleanup: clear_child_tid + futex wake (X-THREAD) */
+static void thread_exit_cleanup(process_t *p)
+{
+    if (p->clear_child_tid) {
+        /* Write 0 to the TID address (signals thread death to parent) */
+        *(int *)p->clear_child_tid = 0;
+        /* Wake any futex waiter on that address (pthread_join uses this) */
+        futex_do_wake((uint64_t)p->clear_child_tid, 1);
+        p->clear_child_tid = NULL;
+    }
 }
 
 /*

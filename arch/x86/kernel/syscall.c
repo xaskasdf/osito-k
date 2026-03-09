@@ -1403,9 +1403,12 @@ void syscall_check_signals(void)
 static int64_t sys_arch_prctl(uint64_t code, uint64_t addr)
 {
     switch (code) {
-    case ARCH_SET_FS:
+    case ARCH_SET_FS: {
+        extern void proc_set_fs_base(uint64_t addr);
         wrmsr(MSR_FS_BASE, addr);
+        proc_set_fs_base(addr);  /* save for context switch (X-THREAD) */
         return 0;
+    }
     case ARCH_GET_FS:
         if (!addr) return -EFAULT;
         *(uint64_t *)addr = rdmsr(MSR_FS_BASE);
@@ -1418,22 +1421,26 @@ static int64_t sys_arch_prctl(uint64_t code, uint64_t addr)
     }
 }
 
-/* set_tid_address — set pointer for child tid notification */
+/* set_tid_address — set pointer for child tid notification (X-THREAD) */
+extern void proc_set_clear_child_tid(uint64_t *addr);
 static int64_t sys_set_tid_address(uint64_t tidptr)
 {
-    (void)tidptr;  /* We don't implement CLONE_CHILD_CLEARTID yet */
+    proc_set_clear_child_tid((uint64_t *)tidptr);
     return (int64_t)proc_current_pid();  /* Return current TID */
 }
 
-/* getpid / gettid — return process/thread ID */
+/* getpid / gettid — return process/thread ID (X-THREAD) */
+extern int32_t proc_current_tgid(void);
 static int64_t sys_getpid(void)
 {
-    return (int64_t)proc_current_pid();
+    /* getpid returns TGID — all threads in a group see the same PID */
+    return (int64_t)proc_current_tgid();
 }
 
 static int64_t sys_gettid(void)
 {
-    return (int64_t)proc_current_pid();  /* TID = PID (no threads yet) */
+    /* gettid returns the thread's unique TID (= PID in process table) */
+    return (int64_t)proc_current_pid();
 }
 
 /* rt_sigprocmask — block/unblock signals (minimal stub) */
@@ -1626,6 +1633,10 @@ static int64_t sys_pwrite64(uint64_t fd, uint64_t buf, uint64_t count, uint64_t 
 #define FUTEX_WAKE 1
 #define FUTEX_PRIVATE_FLAG 128
 
+/* Futex — real wait queue implementation (X-THREAD) */
+extern int futex_do_wait(uint64_t uaddr, int expected);
+extern int futex_do_wake(uint64_t uaddr, int count);
+
 static int64_t sys_futex(uint64_t uaddr, uint64_t op, uint64_t val,
                           uint64_t timeout, uint64_t uaddr2)
 {
@@ -1633,18 +1644,13 @@ static int64_t sys_futex(uint64_t uaddr, uint64_t op, uint64_t val,
     int cmd = (int)(op & ~FUTEX_PRIVATE_FLAG);
 
     if (cmd == FUTEX_WAIT) {
-        /* Check if value matches, if so sleep briefly */
-        volatile int *addr = (volatile int *)uaddr;
-        if (*addr != (int)val) return -EAGAIN;
-        /* Single-threaded: just yield once */
-        __asm__ volatile ("hlt");
-        return 0;
+        return (int64_t)futex_do_wait(uaddr, (int)val);
     }
     if (cmd == FUTEX_WAKE) {
-        /* Single-threaded: nothing to wake */
-        return 0;
+        return (int64_t)futex_do_wake(uaddr, (int)val);
     }
-    return -ENOSYS;
+    /* FUTEX_REQUEUE, etc. — stub for now */
+    return 0;
 }
 
 /* set_robust_list — stub for thread-safety (musl calls at startup) */
@@ -1846,16 +1852,34 @@ extern int32_t proc_wait4(int32_t pid, int *wstatus, int options);
  * Busybox calls clone(SIGCHLD, NULL, NULL, NULL, 0) which is equivalent to fork().
  * Full CLONE_VM|CLONE_THREAD (threads) is NOT supported yet.
  */
+/* Clone flags (from Linux uapi) */
+#define CLONE_VM        0x00000100
+#define CLONE_FS        0x00000200
+#define CLONE_FILES     0x00000400
+#define CLONE_SIGHAND   0x00000800
+#define CLONE_THREAD    0x00010000
+#define CLONE_SYSVSEM   0x00040000
+#define CLONE_SETTLS    0x00080000
+#define CLONE_PARENT_SETTID  0x00100000
+#define CLONE_CHILD_CLEARTID 0x00200000
+#define CLONE_CHILD_SETTID   0x01000000
+
+extern int32_t proc_clone_thread(uint64_t child_stack, uint64_t parent_tidptr,
+                                 uint64_t child_tidptr, uint64_t tls);
+
 static int64_t sys_clone(uint64_t flags, uint64_t child_stack,
                           uint64_t ptid, uint64_t ctid, uint64_t tls)
 {
-    (void)child_stack; (void)ptid; (void)ctid; (void)tls;
-
-    /* Check for unsupported thread flags */
-    uint64_t thread_flags = 0x00010000 | 0x00000100 | 0x00002000;
-    /* CLONE_VM | CLONE_THREAD | CLONE_SIGHAND */
-    if (flags & thread_flags)
-        return -ENOSYS;  /* No thread support yet */
+    /* Thread creation: CLONE_VM | CLONE_THREAD (+ usually CLONE_SIGHAND etc.) */
+    if (flags & CLONE_THREAD) {
+        if (!child_stack) return -22; /* EINVAL: thread requires stack */
+        int32_t tid = proc_clone_thread(
+            child_stack,
+            (flags & CLONE_PARENT_SETTID) ? ptid : 0,
+            (flags & CLONE_CHILD_CLEARTID) ? ctid : 0,
+            (flags & CLONE_SETTLS) ? tls : 0);
+        return (int64_t)tid;
+    }
 
     /* Fork semantics: SIGCHLD flag (or bare CLONE_CHILD_CLEARTID etc.) */
     int32_t ret = proc_fork();
