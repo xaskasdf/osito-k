@@ -38,6 +38,17 @@ extern void fb_puts(const char *s);
 extern void fb_putc(char c, uint32_t color);
 extern void fb_putdec(uint64_t val);
 
+/* Direct serial I/O (no relocation, no FB noise) */
+static inline void dbg_serial_char(char c) {
+    while (!(inb(0x3FD) & 0x20)) {}
+    outb(0x3F8, c);
+}
+static inline void dbg_serial_hex8(uint8_t v) {
+    const char *h = "0123456789ABCDEF";
+    dbg_serial_char(h[v >> 4]);
+    dbg_serial_char(h[v & 0xF]);
+}
+
 /* OsitoFS */
 extern void *osfs2_find(const char *name);
 extern int   osfs2_read(void *file, uint64_t offset, void *buf, uint64_t len);
@@ -153,9 +164,14 @@ static inline void wrmsr(uint32_t msr, uint64_t val) {
 #define SYS_GETRANDOM   318
 #define SYS_RSEQ        334
 #define SYS_CLOSE_RANGE 436
+#define SYS_POLL        7
+#define SYS_PPOLL       271
+#define SYS_SELECT      23
 #define SYS_MADVISE     28
 #define SYS_STAT        4
 #define SYS_LSTAT       6
+#define SYS_DUP         32
+#define SYS_VFORK       58
 
 /* errno values */
 #define EPERM    1
@@ -288,12 +304,15 @@ static ssize_t console_write(const void *buf, size_t count)
     return (ssize_t)count;
 }
 
-/* stdin → stub (returns 0 = EOF for now, keyboard driver will fix) */
+/* stdin → read from PS/2 keyboard ring buffer */
+extern char kb_getchar(void);
 static ssize_t console_read(void *buf, size_t count)
 {
-    (void)buf;
-    (void)count;
-    return 0;  /* EOF — no keyboard yet */
+    if (count == 0) return 0;
+    uint8_t *dst = (uint8_t *)buf;
+    /* Block for at least one character (no kernel echo — app handles it) */
+    dst[0] = (uint8_t)kb_getchar();
+    return 1;
 }
 
 /* ── brk state (process heap) ────────────────────────────────── */
@@ -427,7 +446,6 @@ static int64_t sys_read(uint64_t fd, uint64_t buf, uint64_t count)
 {
     if (fd >= MAX_FDS || !fd_table[fd].open) return -EBADF;
     if (!buf && count > 0) return -EFAULT;
-
     fd_entry_t *f = &fd_table[fd];
 
     if (f->type == FD_TYPE_DEV) {
@@ -683,6 +701,15 @@ static int64_t sys_open(uint64_t path_addr, uint64_t flags, uint64_t mode)
     /* Strip leading "/" for OsitoFS lookup if not found */
     if (!file && path[0] == '/')
         file = osfs2_find(path + 1);
+
+    /* Try basename (flat FS: /bin/busybox → busybox, /etc/passwd → passwd) */
+    if (!file) {
+        const char *bn = path;
+        for (const char *p = path; *p; p++)
+            if (*p == '/') bn = p + 1;
+        if (bn != path && *bn)
+            file = osfs2_find(bn);
+    }
 
     if (!file && (flags & O_CREAT)) {
         file = osfs2_create(path, 0);
@@ -1011,11 +1038,131 @@ static int64_t sys_writev(uint64_t fd, uint64_t iov_addr, uint64_t iovcnt)
     return total;
 }
 
-/* ioctl stub — returns ENOTTY for everything */
+/* ioctl — terminal control */
+#define TIOCGWINSZ  0x5413
+#define TIOCSWINSZ  0x5414
+#define TCGETS      0x5401
+#define TCSETS      0x5402
+#define TCSETSW     0x5403
+#define TCSETSF     0x5404
+
+struct winsize {
+    uint16_t ws_row;
+    uint16_t ws_col;
+    uint16_t ws_xpixel;
+    uint16_t ws_ypixel;
+};
+
 static int64_t sys_ioctl(uint64_t fd, uint64_t request, uint64_t arg)
 {
-    (void)fd; (void)request; (void)arg;
-    return -ENOTTY;
+    (void)fd;
+    switch (request) {
+    case TIOCGWINSZ: {
+        if (!arg) return -EFAULT;
+        struct winsize *ws = (struct winsize *)arg;
+        ws->ws_row = 25;
+        ws->ws_col = 80;
+        ws->ws_xpixel = 640;
+        ws->ws_ypixel = 400;
+        return 0;
+    }
+    case TIOCSWINSZ:
+        return 0;  /* ignore set */
+    case TCGETS: {
+        if (!arg) return -EFAULT;
+        /* Fill minimal termios for isatty() detection */
+        struct { uint32_t c_iflag, c_oflag, c_cflag, c_lflag;
+                 uint8_t c_line; uint8_t c_cc[32];
+                 uint32_t c_ispeed, c_ospeed; } *t = (void *)arg;
+        memset(t, 0, sizeof(*t));
+        t->c_cflag = 0x00B2;  /* CS8|CREAD|HUPCL */
+        t->c_lflag = 0x8A3B;  /* ISIG|ICANON|ECHO|ECHOE|ECHOK|ECHOCTL|ECHOKE|IEXTEN */
+        t->c_iflag = 0x0500;  /* ICRNL|IXON */
+        t->c_oflag = 0x0005;  /* OPOST|ONLCR */
+        t->c_ispeed = 38400;
+        t->c_ospeed = 38400;
+        t->c_cc[0] = 3;   /* VINTR = Ctrl-C */
+        t->c_cc[1] = 28;  /* VQUIT */
+        t->c_cc[4] = 1;   /* VMIN */
+        return 0;
+    }
+    case TCSETS:
+    case TCSETSW:
+    case TCSETSF:
+        return 0;  /* accept but ignore termios changes */
+    default:
+        return -ENOTTY;
+    }
+}
+
+/* poll — check fd readiness */
+#define POLLIN   0x0001
+#define POLLOUT  0x0004
+#define POLLERR  0x0008
+#define POLLHUP  0x0010
+#define POLLNVAL 0x0020
+
+struct pollfd {
+    int   fd;
+    short events;
+    short revents;
+};
+
+extern bool kb_has_input(void);
+
+static int poll_check(struct pollfd *fds, uint64_t nfds)
+{
+    int ready = 0;
+    for (uint64_t i = 0; i < nfds; i++) {
+        fds[i].revents = 0;
+        if (fds[i].fd < 0 || (uint64_t)fds[i].fd >= MAX_FDS ||
+            !fd_table[fds[i].fd].open) {
+            fds[i].revents = POLLNVAL;
+            continue;
+        }
+        fd_entry_t *f = &fd_table[fds[i].fd];
+        /* Console stdin: POLLIN if keyboard has data */
+        if (f->type == FD_TYPE_CONSOLE && f->read) {
+            if ((fds[i].events & POLLIN) && kb_has_input())
+                fds[i].revents |= POLLIN;
+        }
+        /* Console stdout/stderr: always writable */
+        if (f->type == FD_TYPE_CONSOLE && f->write) {
+            if (fds[i].events & POLLOUT)
+                fds[i].revents |= POLLOUT;
+        }
+        /* Files/pipes: always ready */
+        if (f->type == FD_TYPE_FILE || f->type == FD_TYPE_PIPE)
+            fds[i].revents |= (fds[i].events & (POLLIN | POLLOUT));
+        if (fds[i].revents) ready++;
+    }
+    return ready;
+}
+
+extern uint64_t idt_get_ticks(void);
+
+static int64_t sys_poll(uint64_t fds_addr, uint64_t nfds, uint64_t timeout_ms)
+{
+    if (!fds_addr || nfds == 0) return 0;
+    struct pollfd *fds = (struct pollfd *)fds_addr;
+
+    int ready = poll_check(fds, nfds);
+    if (ready > 0 || (int64_t)timeout_ms == 0)
+        return ready;
+
+    /* Block until data or timeout */
+    uint64_t start = idt_get_ticks();
+    int64_t tmo = (int64_t)timeout_ms;
+    uint64_t max_ticks = (tmo < 0) ? 0xFFFFFFFFFFFFFFFFULL :
+                          (uint64_t)tmo / 10;  /* 100Hz timer */
+    for (;;) {
+        __asm__ volatile ("sti; hlt; cli");
+        ready = poll_check(fds, nfds);
+        if (ready > 0) return ready;
+        uint64_t elapsed = idt_get_ticks() - start;
+        if (tmo >= 0 && elapsed >= max_ticks)
+            return 0;  /* timeout */
+    }
 }
 
 /* access — check if file exists */
@@ -1026,7 +1173,18 @@ static int64_t sys_access(uint64_t path_addr, uint64_t mode)
     (void)mode;
     const char *path = (const char *)path_addr;
     if (!path) return -EFAULT;
-    return osfs2_find(path) ? 0 : -ENOENT;
+    if (osfs2_find(path)) return 0;
+    /* Try without leading slash */
+    if (path[0] == '/' && osfs2_find(path + 1)) return 0;
+    /* Try basename */
+    const char *bn = path;
+    for (const char *p = path; *p; p++)
+        if (*p == '/') bn = p + 1;
+    if (bn != path && *bn && osfs2_find(bn)) return 0;
+    /* Virtual paths that always "exist" */
+    if (str_startswith(path, "/dev/") || str_startswith(path, "/proc/"))
+        return 0;
+    return -ENOENT;
 }
 
 /* unlink — delete file from OsitoFS */
@@ -1506,8 +1664,6 @@ static int64_t sys_dup(uint64_t oldfd)
     return -EMFILE;
 }
 
-#define SYS_DUP 32
-
 /* ── Busybox/POSIX syscalls (X-SYSCALL40) ────────────────────── */
 
 /* openat — open relative to directory fd */
@@ -1720,14 +1876,20 @@ static int64_t sys_readlink(uint64_t path_addr, uint64_t buf_addr, uint64_t bufs
     char *buf = (char *)buf_addr;
     if (!path || !buf || bufsiz == 0) return -EFAULT;
 
-    /* /proc/self/exe → return current process name */
+    /* /proc/self/exe → return path to current binary */
     if (str_startswith(path, "/proc/self/exe") ||
         str_startswith(path, "/proc/") /* /proc/<pid>/exe */) {
         const char *name = proc_current_name();
         if (!name) name = "unknown";
-        uint64_t len = strlen(name);
+        /* Return "/name" as path — needed for busybox applet re-exec */
+        char tmp[128];
+        tmp[0] = '/';
+        uint64_t nlen = strlen(name);
+        if (nlen > 126) nlen = 126;
+        memcpy(tmp + 1, name, (size_t)nlen);
+        uint64_t len = 1 + nlen;
         if (len > bufsiz) len = bufsiz;
-        memcpy(buf, name, (size_t)len);
+        memcpy(buf, tmp, (size_t)len);
         return (int64_t)len;
     }
 
@@ -1809,32 +1971,16 @@ static int64_t sys_getdents64(uint64_t fd, uint64_t dirp_addr, uint64_t count)
 
 /* ── Syscall dispatch (called from assembly) ─────────────────── */
 
-/* Debug: serial port direct write (no function call, no relocation issues) */
-static inline void dbg_serial_char(char c) {
-    while (!(inb(0x3FD) & 0x20)) {}
-    outb(0x3F8, c);
-}
-static inline void dbg_serial_hex8(uint8_t v) {
-    const char *h = "0123456789ABCDEF";
-    dbg_serial_char(h[v >> 4]);
-    dbg_serial_char(h[v & 0xF]);
-}
-
 int64_t syscall_dispatch(uint64_t nr, uint64_t a1, uint64_t a2,
                          uint64_t a3, uint64_t a4, uint64_t a5)
 {
-    /* Debug: emit syscall number as hex to serial (PIE-safe) */
-    dbg_serial_char('<');
-    dbg_serial_hex8((uint8_t)(nr >> 8));
-    dbg_serial_hex8((uint8_t)nr);
-    dbg_serial_char('>');
-
     switch (nr) {
     case SYS_READ:       return sys_read(a1, a2, a3);
     case SYS_WRITE:      return sys_write(a1, a2, a3);
     case SYS_OPEN:       return sys_open(a1, a2, a3);
     case SYS_CLOSE:      return sys_close(a1);
     case SYS_FSTAT:      return sys_fstat(a1, a2);
+    case SYS_POLL:       return sys_poll(a1, a2, a3);
     case SYS_LSEEK:      return sys_lseek(a1, (int64_t)a2, a3);
     case SYS_MMAP:       return sys_mmap(a1, a2, a3, a4, a5, 0);
     case SYS_MPROTECT:   return sys_mprotect(a1, a2, a3);
@@ -1858,8 +2004,10 @@ int64_t syscall_dispatch(uint64_t nr, uint64_t a1, uint64_t a2,
     case SYS_STAT:       return sys_stat(a1, a2);
     case SYS_LSTAT:      return sys_stat(a1, a2);  /* no symlinks */
     case SYS_SENDFILE:   return sys_sendfile(a1, a2, a3, a4);
+    case SYS_SELECT:     return sys_poll(0, 0, 0);  /* stub: pretend nothing ready */
     case SYS_CLONE:      return sys_clone(a1, a2, a3, a4, a5);
     case SYS_FORK:       return sys_clone(17 /* SIGCHLD */, 0, 0, 0, 0);
+    case SYS_VFORK:      return sys_clone(17 /* SIGCHLD */, 0, 0, 0, 0);
     case SYS_EXECVE:     return sys_execve(a1, a2, a3);
     case SYS_EXIT:       return sys_exit(a1);
     case SYS_WAIT4:      return sys_wait4(a1, a2, a3, a4);
@@ -1893,6 +2041,7 @@ int64_t syscall_dispatch(uint64_t nr, uint64_t a1, uint64_t a2,
     case SYS_OPENAT:     return sys_openat(a1, a2, a3, a4);
     case SYS_NEWFSTATAT: return sys_newfstatat(a1, a2, a3, a4);
     case SYS_READLINKAT: return sys_readlinkat(a1, a2, a3, a4);
+    case SYS_PPOLL:      return sys_poll(a1, a2, -1);  /* ignore sigmask/timeout */
     case SYS_SET_ROBUST_LIST: return sys_set_robust_list(a1, a2);
     case SYS_DUP3:       return sys_dup3(a1, a2, a3);
     case SYS_PIPE2:      return sys_pipe2(a1, a2);

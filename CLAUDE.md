@@ -382,7 +382,7 @@ Tasks:   idle, input, shell (3 of 8 slots used)
 | **X-MMAP** | **mmap/munmap/mprotect** (MAP_ANONYMOUS identity-mapped, VMA tracking, page-level protection, CRT wrappers, 6/6 QEMU tests pass) | Done |
 | **X-VFS** | **Virtual filesystem layer** (/dev/null,zero,urandom,console + /proc/self/status,maps + getcwd/readlink/getdents64 syscalls, 7/7 QEMU tests pass) | Done |
 | **X-MUSL** | **musl libc port** (cross-compiled musl 1.2.5 static libc, +20 syscalls: arch_prctl/set_tid_address/clock_gettime/getrandom/nanosleep/getpid/gettid/futex/fcntl/prlimit64/etc, 9/9 QEMU tests pass) | Done |
-| **X-FORK** | **fork/wait4/getppid** (scheduler-based fork via fake ISR frames, child user stack copy + frame pointer relocation, ZOMBIE lifecycle, +25 busybox syscall stubs, 3/3 QEMU tests pass) | Done |
+| **X-FORK** | **fork/wait4/getppid + busybox** (scheduler-based fork, wait4 memory clobber fix, execve /proc/self/exe, 8MB allocator boundary, ioctl/poll/vfork, busybox ash interactive, 3/3 QEMU tests pass) | Done |
 
 > Full GPU roadmap (X27-X40 + contingency): see [docs/x86-gpu-roadmap.md](docs/x86-gpu-roadmap.md)
 > Full OS roadmap (Tiers 0-9): see [docs/os-selfhost-roadmap.md](docs/os-selfhost-roadmap.md)
@@ -1156,13 +1156,21 @@ Preemptive process creation via scheduler-based fork. Child gets own kernel stac
 - **proc_fork()**: Reads parent's registers from SYSCALL stack frame (14 pushes by syscall_entry.S). Allocates 16KB kernel stack, builds 176-byte fake ISR frame (22 × uint64_t: 15 GPRs + vector/error + RIP/CS/RFLAGS/RSP/SS). Allocates 64KB user stack, copies 32KB from parent, relocates saved frame pointers.
 - **Frame pointer relocation**: After memcpy of parent's user stack, scans copied region for any uint64_t value within parent's stack range [user_rsp .. user_rsp+32KB) and adjusts by parent→child delta. Without this, `pop %rbp` in function epilogues restores parent's frame pointer, causing child to write locals into parent's stack memory.
 - **proc_exit() dual path**: Processes with kernel_stack (fork/sched_spawn) → set ZOMBIE + halt for scheduler. Processes from proc_exec (shell) → longjmp to exec_jmpbuf. Memory region cleanup deferred to proc_wait4 (process still running on user stack during exit).
-- **proc_wait4()**: Non-blocking first scan, then blocking `sti;hlt;cli` loop. Reaps ZOMBIE children, frees kernel stack + memory regions, returns exit status in Linux format `(code & 0xFF) << 8`.
+- **proc_wait4()**: Non-blocking first scan, then blocking `sti;hlt;cli` loop. Reaps ZOMBIE children, frees kernel stack + memory regions, returns exit status in Linux format `(code & 0xFF) << 8`. **Critical**: `"memory"` clobber on the asm — without it, GCC `-O2` caches `proctab[i].state` in registers and parent never sees child ZOMBIE after context switch.
 - **Scheduler fixes**: ZOMBIE processes force-switch immediately (quantum=0 bypass). `sched_tick` preserves ZOMBIE state (only RUNNING→READY on preemption). BSP-only guard prevents SMP corruption.
 - **syscall_user_rsp**: Global in syscall_entry.S BSS, saved before any pushes. Fork reads parent's complete register state from this frame.
-- **New syscalls** (~25 stubs for busybox/musl): openat(257), readlinkat(267), uname(63), getuid/gid/euid/egid(102-108), setuid/setgid(105-106), getppid(110), getpgrp(111), setsid(112), getgroups(115), prctl(157), dup3(292), pipe2(293), rseq(334), close_range(436), madvise(28), stat/lstat(4/6), sendfile(40).
+- **Memory allocator fix**: `mem_alloc_pages` and `mem_alloc_aligned` start at page 2048 (8MB) to avoid consuming the 0x400000-0x600000 range used by ET_EXEC ELF binaries. Without this, boot-time allocations (heap, page tables, crypto) consume the ELF load area and mem_reserve_range fails.
+- **ELF loader fix**: `mem_reserve_range` failure during ET_EXEC loading is non-fatal — allows fork+execve of the same binary (parent already owns those pages).
+- **proc_execve**: Redirects `/proc/self/exe` and `/proc/<pid>/exe` to current process name (busybox re-exec pattern). Forked children skip parent region freeing (identity-mapped OS, shared address space).
+- **Keyboard stdin**: `console_read` reads from PS/2 keyboard ring buffer. No kernel echo (apps handle their own terminal echo).
+- **Terminal ioctl**: TCGETS returns minimal termios for isatty() detection. TIOCGWINSZ returns 80×25. TCSETS/TCSETSW/TCSETSF accepted and ignored.
+- **poll syscall**: Full implementation with keyboard POLLIN detection, file/pipe always-ready, timeout via `sti;hlt;cli` loop. ppoll and select stubs dispatch to poll.
+- **Basename lookup**: sys_open and sys_access try basename extraction for flat filesystem (e.g., `/bin/busybox` → `busybox`). Virtual paths `/dev/` and `/proc/` recognized by sys_access.
+- **sys_readlink**: Returns `"/name"` format for `/proc/self/exe` (busybox applet re-exec needs leading slash).
+- **New syscalls**: poll(7), vfork(58), dup(32), ppoll(271), select(23) stubs.
 - **getppid**: Per-process `ppid` field set in proc_alloc from current_proc->pid. proc_current_ppid() exported.
-- **Verified**: 3/3 QEMU tests — T1 fork+wait (exit 42), T2 fork+exit (exit 7), T3 getpid. Zero #GP faults. Shell returns cleanly.
-- **Files**: `arch/x86/kernel/process.c` (proc_fork, proc_wait4, proc_exit dual path), `arch/x86/kernel/syscall.c` (sys_clone, sys_wait4, +25 stubs), `arch/x86/kernel/syscall_entry.S` (syscall_user_rsp), `arch/x86/test/fork_test.c`
+- **Verified**: 3/3 QEMU tests — T1 fork+wait (exit 42), T2 fork+exit (exit 7), T3 getpid. Busybox ash interactive shell works with echo, uname, cat applets.
+- **Files**: `arch/x86/kernel/process.c` (proc_fork, proc_wait4, proc_execve), `arch/x86/kernel/syscall.c` (ioctl, poll, basename, +stubs), `arch/x86/kernel/elf.c` (reserve fallback), `arch/x86/kernel/memory.c` (8MB boundary), `arch/x86/test/fork_test.c`
 
 ### AArch64/SM8350 Port (arch/arm/)
 Reference bare-metal code for ASUS ROG Phone 5 (Snapdragon 888).

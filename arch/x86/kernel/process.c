@@ -888,9 +888,11 @@ int32_t proc_wait4(int32_t pid, int *wstatus, int options)
     /* Blocking wait: poll until a child becomes ZOMBIE.
      * SYSCALL entry disables interrupts (FMASK clears IF).
      * We MUST enable them so the scheduler can run the child.
-     * STI + HLT + CLI: allow one timer tick, then re-disable. */
+     * STI + HLT + CLI: allow one timer tick, then re-disable.
+     * "memory" clobber forces the compiler to re-read proctab
+     * from memory after each tick (state changes via scheduler). */
     for (int tries = 0; tries < 10000; tries++) {
-        __asm__ volatile ("sti; hlt; cli");
+        __asm__ volatile ("sti; hlt; cli" ::: "memory");
 
         for (int i = 0; i < MAX_PROCESSES; i++) {
             if (proctab[i].state != PROC_ZOMBIE) continue;
@@ -928,11 +930,25 @@ int32_t proc_wait4(int32_t pid, int *wstatus, int options)
  * Called from sys_execve. The current process gets a new ELF loaded.
  * For forked children: elf_exec gives them their own stack+segments.
  */
+extern int strcmp(const char *, const char *);
+extern int strncmp(const char *, const char *, uint64_t);
+
 int proc_execve(const char *path, char *const argv[])
 {
     if (!current_proc || !path) return -1;
 
     process_t *p = current_proc;
+
+    /* /proc/self/exe or /proc/<pid>/exe → re-exec current binary */
+    if (strcmp(path, "/proc/self/exe") == 0) {
+        path = p->name;
+    } else if (strncmp(path, "/proc/", 6) == 0) {
+        /* /proc/<pid>/exe — find last component */
+        const char *end = path + strlen(path);
+        if (end - path >= 4 && strcmp(end - 4, "/exe") == 0) {
+            path = p->name;
+        }
+    }
 
     serial_puts("[EXECVE] pid ");
     serial_putdec(p->pid);
@@ -951,10 +967,16 @@ int proc_execve(const char *path, char *const argv[])
     }
     p->name[j] = '\0';
 
-    /* Free old memory regions from previous exec (if any) */
-    for (int i = 0; i < p->region_count; i++) {
-        if (p->regions[i].base && p->regions[i].pages > 0)
-            mem_free_pages(p->regions[i].base, p->regions[i].pages);
+    /* Free old memory regions ONLY if this process owns them.
+     * Forked children share parent's memory (identity-mapped OS),
+     * so we must NOT free the parent's regions. Only free if this
+     * process has its own ELF regions (from a previous execve). */
+    if (!p->kernel_stack) {
+        /* Non-forked process (shell exec) — safe to free */
+        for (int i = 0; i < p->region_count; i++) {
+            if (p->regions[i].base && p->regions[i].pages > 0)
+                mem_free_pages(p->regions[i].base, p->regions[i].pages);
+        }
     }
     p->region_count = 0;
 

@@ -139,7 +139,12 @@ void *mem_alloc_pages(uint64_t count)
     uint64_t run_start = 0;
     uint64_t run_len = 0;
 
-    for (uint64_t p = 256; p < MAX_PHYS_PAGES; p++) {  /* Start above 1MB */
+    /* Start above 8MB to avoid collisions with:
+     * - Page tables (0x100000-0x110000)
+     * - Heap (0x10F000+)
+     * - ET_EXEC ELF load area (typically 0x400000-0x600000)
+     * This ensures first-fit doesn't consume the ELF VA range. */
+    for (uint64_t p = 2048; p < MAX_PHYS_PAGES; p++) {  /* Start above 8MB */
         if (bitmap_test(p)) {
             if (run_len == 0) run_start = p;
             run_len++;
@@ -203,8 +208,8 @@ void *mem_alloc_aligned(uint64_t size, uint64_t alignment)
     uint64_t align_pages = alignment >> PAGE_SHIFT;
     if (align_pages == 0) align_pages = 1;
 
-    /* Search for aligned contiguous pages */
-    for (uint64_t p = 256; p < MAX_PHYS_PAGES; p++) {
+    /* Search for aligned contiguous pages (above 8MB, skip ELF load area) */
+    for (uint64_t p = 2048; p < MAX_PHYS_PAGES; p++) {
         /* Align to required boundary */
         if (p % align_pages != 0) continue;
 

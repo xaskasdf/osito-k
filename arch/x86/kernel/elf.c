@@ -203,12 +203,13 @@ static int elf_load_segments(const uint8_t *data, uint64_t data_size,
     bool fixed_load = (hdr->e_type == ET_EXEC);
 
     if (fixed_load) {
-        /* Reserve the exact pages from the page allocator */
+        /* Reserve the exact pages from the page allocator.
+         * If pages are already allocated (fork+execve of same binary),
+         * proceed anyway — we'll overwrite in place. */
         if (mem_reserve_range(vaddr_min, total_pages) < 0) {
             serial_puts("[ELF] Fixed-load at 0x");
             serial_puthex(vaddr_min, 16);
-            serial_puts(" conflicts with allocated memory\n");
-            return -1;
+            serial_puts(" already mapped — reusing (fork+execve)\n");
         }
         base = (void *)vaddr_min;
         serial_puts("[ELF] Fixed load at vaddr 0x");
