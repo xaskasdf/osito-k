@@ -172,6 +172,42 @@ static inline void wrmsr(uint32_t msr, uint64_t val) {
 #define SYS_LSTAT       6
 #define SYS_DUP         32
 #define SYS_VFORK       58
+#define SYS_PAUSE       34
+#define SYS_CHDIR       80
+#define SYS_RENAME      82
+#define SYS_MKDIR       83
+#define SYS_RMDIR       84
+#define SYS_CHMOD       90
+#define SYS_FCHMOD      91
+#define SYS_CHOWN       92
+#define SYS_FCHOWN      93
+#define SYS_UMASK       95
+#define SYS_GETTIMEOFDAY 96
+#define SYS_GETRLIMIT   97
+#define SYS_SYSINFO     99
+#define SYS_TIMES       100
+#define SYS_GETRESUID   120
+#define SYS_GETRESGID   122  /* Linux: 120=getresuid, 121=setresgid, 122=getresgid */
+#define SYS_SETPGID     109
+#define SYS_GETPGID     121
+#define SYS_STATFS      137
+#define SYS_FSTATFS     138
+#define SYS_SETRLIMIT   160
+#define SYS_SYNC        162
+#define SYS_FCHDIR      81
+#define SYS_FTRUNCATE   77
+#define SYS_TRUNCATE    76
+#define SYS_WAITID      247
+#define SYS_UNLINKAT    263
+#define SYS_MKDIRAT     258
+#define SYS_FCHOWNAT    260
+#define SYS_FCHMODAT    268
+#define SYS_FACCESSAT   269
+#define SYS_PSELECT6    270
+#define SYS_UTIMENSAT   280
+#define SYS_RENAMEAT2   316
+#define SYS_STATX       332
+#define SYS_FACCESSAT2  439
 
 /* errno values */
 #define EPERM    1
@@ -1969,6 +2005,184 @@ static int64_t sys_getdents64(uint64_t fd, uint64_t dirp_addr, uint64_t count)
     return -ENOTDIR;
 }
 
+/* ── Trivial POSIX stubs for busybox/musl compatibility ──────── */
+
+extern uint64_t idt_get_ticks(void);
+
+static uint64_t current_umask = 022;
+
+static int64_t sys_pause(void)
+{
+    /* Sleep until signal — just do a short sleep and return -EINTR */
+    __asm__ volatile ("sti; hlt");
+    return -4;  /* EINTR */
+}
+
+static int64_t sys_chdir(uint64_t path_addr)
+{
+    (void)path_addr;
+    /* Single flat filesystem — chdir to "/" always succeeds, anything else ENOENT */
+    const char *p = (const char *)path_addr;
+    if (p && p[0] == '/' && p[1] == '\0') return 0;
+    return -ENOENT;
+}
+
+static int64_t sys_fchdir(uint64_t fd)
+{
+    (void)fd;
+    return 0;  /* pretend success */
+}
+
+static int64_t sys_umask(uint64_t mask)
+{
+    uint64_t old = current_umask;
+    current_umask = mask & 0777;
+    return (int64_t)old;
+}
+
+static int64_t sys_gettimeofday(uint64_t tv_addr, uint64_t tz_addr)
+{
+    (void)tz_addr;
+    if (tv_addr) {
+        uint64_t ticks = idt_get_ticks();
+        uint64_t secs = ticks / 100;
+        uint64_t usecs = (ticks % 100) * 10000;
+        uint64_t *tv = (uint64_t *)tv_addr;
+        tv[0] = secs;    /* tv_sec */
+        tv[1] = usecs;   /* tv_usec */
+    }
+    return 0;
+}
+
+struct linux_sysinfo {
+    int64_t uptime;
+    uint64_t loads[3];
+    uint64_t totalram;
+    uint64_t freeram;
+    uint64_t sharedram;
+    uint64_t bufferram;
+    uint64_t totalswap;
+    uint64_t freeswap;
+    uint16_t procs;
+    uint16_t pad;
+    uint32_t pad2;
+    uint64_t totalhigh;
+    uint64_t freehigh;
+    uint32_t mem_unit;
+};
+
+extern uint64_t mem_get_free(void);
+extern uint64_t mem_get_total(void);
+
+static int64_t sys_sysinfo(uint64_t info_addr)
+{
+    struct linux_sysinfo *si = (struct linux_sysinfo *)info_addr;
+    memset(si, 0, sizeof(*si));
+    si->uptime = (int64_t)(idt_get_ticks() / 100);
+    si->totalram = mem_get_total();
+    si->freeram = mem_get_free();
+    si->procs = 1;
+    si->mem_unit = 1;
+    return 0;
+}
+
+struct linux_statfs {
+    int64_t f_type;
+    int64_t f_bsize;
+    uint64_t f_blocks;
+    uint64_t f_bfree;
+    uint64_t f_bavail;
+    uint64_t f_files;
+    uint64_t f_ffree;
+    int32_t  f_fsid[2];
+    int64_t  f_namelen;
+    int64_t  f_frsize;
+    int64_t  f_flags;
+    int64_t  f_spare[4];
+};
+
+static int64_t sys_statfs(uint64_t path_addr, uint64_t buf_addr)
+{
+    (void)path_addr;
+    struct linux_statfs *st = (struct linux_statfs *)buf_addr;
+    memset(st, 0, sizeof(*st));
+    st->f_type = 0x4F534654;  /* "OSFT" magic */
+    st->f_bsize = 4096;
+    st->f_blocks = mem_get_total() / 4096;
+    st->f_bfree = mem_get_free() / 4096;
+    st->f_bavail = st->f_bfree;
+    st->f_namelen = 64;
+    st->f_frsize = 4096;
+    return 0;
+}
+
+static int64_t sys_setpgid(uint64_t pid, uint64_t pgid)
+{
+    (void)pid; (void)pgid;
+    return 0;  /* pretend success */
+}
+
+/* statx — modern stat replacement. Fill from fstat data. */
+struct linux_statx {
+    uint32_t stx_mask;
+    uint32_t stx_blksize;
+    uint64_t stx_attributes;
+    uint32_t stx_nlink;
+    uint32_t stx_uid;
+    uint32_t stx_gid;
+    uint16_t stx_mode;
+    uint16_t __spare0;
+    uint64_t stx_ino;
+    uint64_t stx_size;
+    uint64_t stx_blocks;
+    uint64_t stx_attributes_mask;
+    /* timestamps follow but we zero them */
+    uint8_t  __rest[128];
+};
+
+static int64_t sys_statx(uint64_t dirfd, uint64_t path_addr,
+                          uint64_t flags, uint64_t mask, uint64_t buf_addr)
+{
+    (void)flags; (void)mask;
+    struct linux_statx *sx = (struct linux_statx *)buf_addr;
+    memset(sx, 0, sizeof(*sx));
+    sx->stx_mask = 0x7FF;  /* STATX_BASIC_STATS */
+    sx->stx_blksize = 4096;
+    sx->stx_nlink = 1;
+
+    /* Use fstat internally if we have an fd */
+    const char *path = (const char *)path_addr;
+    if (path && path[0]) {
+        /* Try basename for flat FS */
+        const char *base = path;
+        for (const char *p = path; *p; p++)
+            if (*p == '/') base = p + 1;
+        if (*base) {
+            void *f = osfs2_find(base);
+            if (f) {
+                sx->stx_size = osfs2_file_size(f);
+                sx->stx_mode = 0100644;  /* S_IFREG|0644 */
+                sx->stx_blocks = (sx->stx_size + 511) / 512;
+                return 0;
+            }
+        }
+        /* Check /dev/, /proc/ prefixes */
+        if (path[0] == '/' && path[1] == 'd' && path[2] == 'e' && path[3] == 'v') {
+            sx->stx_mode = 020666;  /* S_IFCHR|0666 */
+            return 0;
+        }
+        if (path[0] == '/' && path[1] == 'p' && path[2] == 'r') {
+            sx->stx_mode = 0100444;  /* S_IFREG|0444 */
+            return 0;
+        }
+        if (path[0] == '/' && path[1] == '\0') {
+            sx->stx_mode = 040755;  /* S_IFDIR|0755 */
+            return 0;
+        }
+    }
+    return -ENOENT;
+}
+
 /* ── Syscall dispatch (called from assembly) ─────────────────── */
 
 int64_t syscall_dispatch(uint64_t nr, uint64_t a1, uint64_t a2,
@@ -2049,6 +2263,50 @@ int64_t syscall_dispatch(uint64_t nr, uint64_t a1, uint64_t a2,
     case SYS_GETRANDOM:  return sys_getrandom(a1, a2, a3);
     case SYS_RSEQ:       return -ENOSYS;  /* musl handles gracefully */
     case SYS_CLOSE_RANGE: return sys_close_range(a1, a2, a3);
+
+    /* ── Trivial POSIX stubs (busybox compatibility) ───────── */
+    case SYS_PAUSE:      return sys_pause();
+    case SYS_CHDIR:      return sys_chdir(a1);
+    case SYS_FCHDIR:     return sys_fchdir(a1);
+    case SYS_RENAME:     return -ENOSYS;  /* no rename in OsitoFS */
+    case SYS_MKDIR:      return -ENOSYS;  /* no directories */
+    case SYS_RMDIR:      return -ENOSYS;
+    case SYS_CHMOD:      return 0;   /* pretend success */
+    case SYS_FCHMOD:     return 0;
+    case SYS_CHOWN:      return 0;
+    case SYS_FCHOWN:     return 0;
+    case SYS_UMASK:      return sys_umask(a1);
+    case SYS_GETTIMEOFDAY: return sys_gettimeofday(a1, a2);
+    case SYS_GETRLIMIT:  return sys_prlimit64(0, a1, 0, a2);
+    case SYS_SYSINFO:    return sys_sysinfo(a1);
+    case SYS_TIMES:      return -1;  /* return -1 = no times data */
+    case SYS_SETPGID:    return sys_setpgid(a1, a2);
+    case SYS_GETPGID:    return (int64_t)proc_current_pid();
+    case SYS_GETRESUID:  if (a1) *(uint32_t *)a1 = 0;
+                         if (a2) *(uint32_t *)a2 = 0;
+                         if (a3) *(uint32_t *)a3 = 0;
+                         return 0;
+    case SYS_GETRESGID:  if (a1) *(uint32_t *)a1 = 0;
+                         if (a2) *(uint32_t *)a2 = 0;
+                         if (a3) *(uint32_t *)a3 = 0;
+                         return 0;
+    case SYS_STATFS:     return sys_statfs(a1, a2);
+    case SYS_FSTATFS:    return sys_statfs(0, a2);  /* reuse */
+    case SYS_SETRLIMIT:  return 0;   /* pretend success */
+    case SYS_SYNC:       return 0;   /* no-op */
+    case SYS_TRUNCATE:   return -ENOSYS;
+    case SYS_FTRUNCATE:  return 0;   /* pretend success */
+    case SYS_WAITID:     return sys_wait4(-1, a3, (uint64_t)(int)a4, 0);
+    case SYS_UNLINKAT:   return sys_unlink(a2);  /* ignore dirfd */
+    case SYS_MKDIRAT:    return -ENOSYS;
+    case SYS_FCHOWNAT:   return 0;
+    case SYS_FCHMODAT:   return 0;
+    case SYS_FACCESSAT:  return sys_access(a2, a3);  /* ignore dirfd */
+    case SYS_FACCESSAT2: return sys_access(a2, a3);
+    case SYS_PSELECT6:   return sys_poll(0, 0, 0);
+    case SYS_UTIMENSAT:  return 0;   /* pretend success */
+    case SYS_RENAMEAT2:  return -ENOSYS;
+    case SYS_STATX:      return sys_statx(a1, a2, a3, a4, a5);
     default:
         serial_puts("[SYSCALL] Unknown syscall ");
         serial_putdec(nr);

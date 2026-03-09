@@ -366,10 +366,11 @@ void smp_ap_entry(uint32_t cpu_index)
         /* Enable LAPIC with spurious vector 0xFF */
         apic_write_reg(apic, APIC_SVR, APIC_SVR_ENABLE | 0xFF);
 
-        /* Start APIC timer (same config as BSP) */
-        apic_write_reg(apic, APIC_TIMER_DIV, 0x03);  /* divide by 16 */
-        apic_write_reg(apic, APIC_LVT_TIMER, APIC_TIMER_PERIODIC | 32);
-        apic_write_reg(apic, APIC_TIMER_INIT, 100000);
+        /* Do NOT start APIC timer on APs. The scheduler only runs on
+         * the BSP, and AP timer interrupts cause sched_switch_rsp races
+         * where an AP steals the context switch value meant for the BSP,
+         * leading to #GP on IRETQ with corrupted CS/SS. APs stay in HLT
+         * loop and only wake on IPIs (future SMP work scheduling). */
     }
 
     /* Mark CPU as online */

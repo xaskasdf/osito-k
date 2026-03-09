@@ -244,6 +244,30 @@ process_t *proc_find(uint32_t pid)
     return NULL;
 }
 
+/* Exception kill — safe to call from ISR context.
+ * Marks the current process as ZOMBIE and enters HLT loop.
+ * Uses no SSE/XMM instructions (compiled with -O0 for safety).
+ * Returns 0 if the process was killed, -1 if not possible (kernel process). */
+__attribute__((optimize("O0")))
+int proc_exception_kill(int32_t code)
+{
+    process_t *p = current_proc;
+    if (!p) return -1;
+
+    /* Forked/spawned process — mark ZOMBIE, scheduler will switch away */
+    if (p->kernel_stack) {
+        p->exit_code = code;
+        p->state = PROC_ZOMBIE;
+        __asm__ volatile ("sti");
+        for (;;) __asm__ volatile ("hlt");
+    }
+
+    /* Shell-started process — longjmp back to proc_exec */
+    last_exit_code = code;
+    kern_longjmp(exec_jmpbuf, 1);
+    return 0; /* unreachable */
+}
+
 /* Process exit — called from sys_exit().
  * Two cases:
  *   1. Process started via proc_exec (shell) → longjmp back to shell

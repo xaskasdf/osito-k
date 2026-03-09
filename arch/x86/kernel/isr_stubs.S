@@ -53,11 +53,15 @@ isr_common:
     /* If sched_tick() set sched_switch_rsp, switch to new stack   */
     /* before popping GPRs — the new stack has the next process's  */
     /* saved interrupt frame, so pops + iretq resume that process. */
-    mov sched_switch_rsp(%rip), %rax
+    /* IMPORTANT: Use XCHG (implicit LOCK) to atomically read and  */
+    /* clear sched_switch_rsp. This prevents SMP race where an AP  */
+    /* reads the value set by BSP's sched_tick and switches to the */
+    /* wrong context. Only the first CPU to XCHG gets the value.   */
+    xor %rax, %rax
+    xchg sched_switch_rsp(%rip), %rax
     test %rax, %rax
     jz .Lno_switch
     mov %rax, %rsp
-    movq $0, sched_switch_rsp(%rip)
 .Lno_switch:
 
     /* Restore all GPRs */

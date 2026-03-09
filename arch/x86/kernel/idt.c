@@ -24,6 +24,11 @@ extern void fb_puthex(uint64_t val, int digits);
 /* X-SCHED: scheduler tick (process.c) */
 extern void sched_tick(void *frame);
 
+/* Process management (process.c) */
+extern void proc_exit(int32_t code);
+extern int  proc_exception_kill(int32_t code);
+extern uint32_t proc_current_pid(void);
+
 /* ── IDT structures (x86-64 long mode) ──────────────────────── */
 
 typedef struct __attribute__((packed)) {
@@ -393,7 +398,40 @@ void isr_handler(interrupt_frame_t *frame)
         fb_puthex(frame->rip, 16);
         fb_puts("\n");
 
-        /* Halt on exception — no recovery yet */
+        /* If a user process is running (PID > 1), kill it instead of
+         * halting the system. Uses proc_exception_kill which is compiled
+         * without SSE to be safe from ISR context. */
+        uint32_t pid = proc_current_pid();
+        if (pid > 1) {
+            /* Guard against cascading exceptions: if we're already
+             * killing this PID and another exception fires (e.g. in
+             * the kill path itself), just halt the process silently. */
+            static volatile uint32_t exception_kill_pid = 0;
+            if (exception_kill_pid == pid) {
+                serial_puts("  Cascading exception in PID ");
+                serial_putdec(pid);
+                serial_puts(" — halting\n");
+                __asm__ volatile ("sti");
+                for (;;) __asm__ volatile ("hlt");
+            }
+            exception_kill_pid = pid;
+
+            int sig = 11;  /* SIGSEGV default */
+            if (vec == 6) sig = 4;   /* SIGILL for #UD */
+            if (vec == 13) sig = 11; /* SIGSEGV for #GP */
+            if (vec == 14) sig = 11; /* SIGSEGV for #PF */
+            if (vec == 8) sig = 6;   /* SIGABRT for #DF */
+            serial_puts("  Killing process PID ");
+            serial_putdec(pid);
+            serial_puts(" with signal ");
+            serial_putdec((uint64_t)sig);
+            serial_puts("\n");
+            fb_puts_color(" Process killed\n", 0x00FF0000);
+            proc_exception_kill(128 + sig);
+            /* proc_exception_kill never returns */
+        }
+
+        /* Kernel exception (PID 0 or 1) — halt the system */
         serial_puts("  SYSTEM HALTED\n");
         fb_puts_color(" SYSTEM HALTED\n", 0x00FF0000);
         __asm__ volatile ("cli");
