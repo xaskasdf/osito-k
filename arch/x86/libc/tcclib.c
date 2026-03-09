@@ -1130,11 +1130,7 @@ long sysconf(int name)
     return -1;
 }
 
-int mprotect(void *addr, size_t len, int prot)
-{
-    (void)addr; (void)len; (void)prot;
-    return 0; /* pretend success — TCC uses it for JIT but we don't need that */
-}
+/* mprotect is in crt.o (real syscall) — do not duplicate here */
 
 /* ── Time stubs ── */
 

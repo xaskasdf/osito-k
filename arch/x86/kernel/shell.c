@@ -428,6 +428,7 @@ static void cmd_cc(int argc, char *argv[])
     if (argc < 2) {
         sh_puts("Usage: cc <file.c> [-run]    Compile and optionally run\n");
         sh_puts("       cc -run <file.c>      Compile + run immediately\n");
+        sh_puts("Auto-links with CRT+libc if crt.o/syscall.o/tcclib.o on disk\n");
         return;
     }
 
@@ -468,11 +469,34 @@ static void cmd_cc(int argc, char *argv[])
     sh_puts(outname);
     sh_puts("\n");
 
-    const char *tcc_argv[] = {
+    /* Check if CRT objects are available for libc-linked compilation */
+    int has_crt = osfs2_find("crt.o") && osfs2_find("syscall.o")
+               && osfs2_find("tcclib.o");
+
+    const char *tcc_argv_bare[] = {
         "tcc", "-nostdlib", "-nostdinc", "-static",
         source, "-o", outname
     };
-    int ret = proc_exec("tcc.elf", 7, tcc_argv);
+    const char *tcc_argv_crt[] = {
+        "tcc", "-nostdlib", "-nostdinc", "-static",
+        "-Wl,-Ttext,0x401000",
+        "-Wl,-section-alignment,0x1000",
+        "crt.o", "syscall.o", "tcclib.o",
+        source, "-o", outname
+    };
+
+    int tcc_argc;
+    const char **tcc_argv;
+    if (has_crt) {
+        sh_puts("  [CRT+libc linked]\n");
+        tcc_argv = tcc_argv_crt;
+        tcc_argc = 12;
+    } else {
+        tcc_argv = tcc_argv_bare;
+        tcc_argc = 7;
+    }
+
+    int ret = proc_exec("tcc.elf", tcc_argc, tcc_argv);
 
     if (ret != 0) {
         sh_puts_color("Compilation failed", 0x00FF0000);

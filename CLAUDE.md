@@ -189,8 +189,10 @@ arch/x86/libc/tcclib.c              Extended libc for TCC/QuickJS (FILE*, fprint
 arch/x86/libc/math.c               Freestanding x87 FPU math library (35+ functions: sin/cos/exp/log/pow/sqrt/etc)
 arch/x86/libc/qjs_main.c           QuickJS REPL wrapper (JS_NewRuntime2 custom allocator, console.log, file eval)
 arch/x86/libc/qjs_headers/          Freestanding shim headers (stdlib/stdio/math/string/etc for QuickJS)
+arch/x86/libc/ositok.h              Single-header libc for self-compiled programs (#include "ositok.h")
 arch/x86/test/tiny.c                Minimal test C program for TCC compilation test
 arch/x86/test/testmod.c              Test dynamic module (mod_hello, mod_add, mod_factorial, mod_square)
+arch/x86/test/selfbuild.c           Self-build test (printf, malloc, file I/O, qsort — 7 tests, compiled+run inside OsitoK)
 arch/x86/test/qjs.elf              QuickJS interpreter binary (1002KB, static ET_EXEC)
 
 # OsitoFS v2 Host Tools (tools/ositofs/)
@@ -386,13 +388,14 @@ Tasks:   idle, input, shell (3 of 8 slots used)
 | **X-THREAD** | **clone(CLONE_THREAD) + futex** (per-thread TLS/FS_BASE save/restore, futex wait queue, PROC_BLOCKED state, clear_child_tid, thread exit cleanup, 2/2 QEMU tests pass) | Done |
 | **X-EDIT** | **Kilo text editor port** (ANSI CSI escape parser in framebuffer, extended PS/2 scancodes→VT100, termios raw mode, kb_getchar_safe with sti;hlt;cli, Ctrl+S save to OsitoFS) | Done |
 | **X-HTTPD** | **HTTP file server** (TCP passive open listen/accept, SYN_RCVD state, scheduler thread, directory listing, file serving with cli/sti NVMe guard, MIME types, `httpd` shell command) | Done |
+| **X-SELF** | **Self-hosting C compilation** (cc auto-links CRT+libc, ositok.h single header, -Wl,-section-alignment,0x1000 compact ELF, printf/malloc/file I/O/qsort, 7/7 QEMU tests pass) | Done |
 
 > Full GPU roadmap (X27-X40 + contingency): see [docs/x86-gpu-roadmap.md](docs/x86-gpu-roadmap.md)
 > Full OS roadmap (Tiers 0-9): see [docs/os-selfhost-roadmap.md](docs/os-selfhost-roadmap.md)
 > Binary compatibility roadmap: see [docs/binary-compat-roadmap.md](docs/binary-compat-roadmap.md)
 > Paths to Claude analysis: see [docs/paths-to-claude-on-ositok.md](docs/paths-to-claude-on-ositok.md)
 
-**Tier 7+ (next)**: X-SELF (self-hosting kernel compile).
+**Tier 7+ (next)**: Full kernel self-compile (TCC compiles kernel .c sources inside OsitoK).
 See `docs/os-selfhost-roadmap.md` for full details and dependency chains.
 
 ### F12: DOOM Wireframe 2.5D
@@ -1226,6 +1229,16 @@ TCP passive open (listen/accept) + HTTP/1.1 file server running as a preemptive 
 - **Shell command**: `httpd [port]` starts server (default 8080), `httpd stop` stops it.
 - **Verified**: `curl http://localhost:8080/` returns directory listing, `curl http://localhost:8080/test.txt` returns file contents, 404 for missing files. All via QEMU SLIRP `hostfwd=tcp::8080-:8080`.
 - **Files**: `arch/x86/kernel/net.c` (TCP listen/accept), `arch/x86/kernel/net.h` (TCP server API), `arch/x86/kernel/shell.c` (HTTP server + httpd command)
+
+### X-SELF: Self-Hosting C Compilation
+Programs compiled AND executed entirely inside OsitoK — no host toolchain needed at runtime.
+- **cc command enhanced** (`shell.c`): Auto-detects CRT objects (crt.o, syscall.o, tcclib.o) on OsitoFS. When present, passes them to TCC along with `-Wl,-Ttext,0x401000` and `-Wl,-section-alignment,0x1000` for compact ELF layout. Without CRT objects, falls back to bare `-nostdlib` mode.
+- **ositok.h** (`libc/ositok.h`): Single header providing all libc prototypes for self-compiled programs. Includes: stdarg via builtins, stdio (printf/fprintf/fopen/fread), stdlib (malloc/free/qsort), string (strlen/strcmp/strcpy), ctype, POSIX I/O (open/close/read/write/lseek), mmap, signals, setjmp, time, errno. Programs just `#include "ositok.h"`.
+- **Section alignment fix**: TCC's default 0x200000 section alignment creates 4MB ELF span (text at 0x401000, data at 0x807000). `-Wl,-section-alignment,0x1000` compacts to 64KB span, avoiding conflicts with kernel heap at 0x800000.
+- **mprotect dedup**: Removed duplicate `mprotect` from tcclib.c (was stub returning 0). crt.o has the real syscall implementation.
+- **Build flow**: Upload crt.o + syscall.o + tcclib.o + ositok.h to OsitoFS disk. Then `cc -run myapp.c` compiles and runs in one step.
+- **Verified**: selfbuild.c — 7/7 tests pass: printf format strings, malloc+fibonacci, string reverse, snprintf+getpid, qsort, file I/O round-trip (create+write+read+verify+delete), argc/argv. All inside OsitoK QEMU.
+- **Files**: `arch/x86/kernel/shell.c` (cc command), `arch/x86/libc/ositok.h` (single header), `arch/x86/libc/tcclib.c` (mprotect fix), `arch/x86/test/selfbuild.c` (7-test program)
 
 ### AArch64/SM8350 Port (arch/arm/)
 Reference bare-metal code for ASUS ROG Phone 5 (Snapdragon 888).
