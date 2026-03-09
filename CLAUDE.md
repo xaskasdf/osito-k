@@ -389,7 +389,7 @@ Tasks:   idle, input, shell (3 of 8 slots used)
 > Binary compatibility roadmap: see [docs/binary-compat-roadmap.md](docs/binary-compat-roadmap.md)
 > Paths to Claude analysis: see [docs/paths-to-claude-on-ositok.md](docs/paths-to-claude-on-ositok.md)
 
-**Tier 7+ (next)**: X-BUSYBOX (static busybox binary execution),
+**Tier 7+ (next)**: X-THREAD (clone/futex threads),
 X-EDIT (port kilo editor), X-HTTPD (TCP server), X-SELF (self-hosting kernel compile).
 See `docs/os-selfhost-roadmap.md` for full details and dependency chains.
 
@@ -1176,6 +1176,19 @@ Preemptive process creation via scheduler-based fork. Child gets own kernel stac
 - **getppid**: Per-process `ppid` field set in proc_alloc from current_proc->pid. proc_current_ppid() exported.
 - **Verified**: 3/3 QEMU tests — T1 fork+wait (exit 42), T2 fork+exit (exit 7), T3 getpid. Busybox ash interactive shell works with echo, uname, cat applets.
 - **Files**: `arch/x86/kernel/process.c` (proc_fork, proc_wait4, proc_execve), `arch/x86/kernel/syscall.c` (ioctl, poll, basename, +stubs), `arch/x86/kernel/elf.c` (reserve fallback), `arch/x86/kernel/memory.c` (8MB boundary), `arch/x86/test/fork_test.c`
+
+### X-FORK fixes: Exception handler, SMP safety, +35 syscalls
+Post-X-FORK hardening for busybox stability. Three critical fixes + syscall expansion.
+- **Exception handler process-kill** (`idt.c`): Exceptions (#UD, #GP, #PF, #DF) in user processes (PID>1) now kill the process instead of halting the kernel. Maps vectors to signals (6→SIGILL, 13/14→SIGSEGV, 8→SIGABRT). Calls `proc_exception_kill()` which avoids SSE instructions.
+- **proc_exception_kill** (`process.c`): Compiled with `__attribute__((optimize("O0")))` to prevent GCC from auto-vectorizing with SSE (PXOR %xmm0). SSE in ISR context causes #UD cascade since FPU state isn't saved. Handles both forked (ZOMBIE+HLT) and non-forked (longjmp) process lifecycles.
+- **Cascading exception guard** (`idt.c`): Static `exception_kill_pid` tracks which PID is being killed. Re-entrant exceptions for the same PID silently `sti;hlt` instead of re-entering the kill path. Prevents infinite exception loops.
+- **SMP atomic XCHG** (`isr_stubs.S`): `sched_switch_rsp` read changed from `mov`+`movq $0` to `xchg` (implicit LOCK prefix on x86). Only one CPU can read the context switch target — prevents AP from "stealing" BSP's switch value and corrupting CS/SS on IRETQ.
+- **AP APIC timer disabled** (`smp.c`): Application Processors no longer start APIC timer. APs have no scheduled work; their timer ISRs only caused race conditions with BSP's scheduler. Eliminates the source of #GP crashes with corrupted CS=0x53EC.
+- **+35 syscall stubs** (`syscall.c`): pause(34), chdir(80), fchdir(81), rename(82), mkdir(83), rmdir(84), truncate(76), ftruncate(77), chmod(90), fchmod(91), chown(92), fchown(93), umask(95), gettimeofday(96), getrlimit(97), sysinfo(99), times(100), setpgid(109), getpgid(121), getresuid(120), getresgid(122), statfs(137), fstatfs(138), setrlimit(160), sync(162), waitid(247), unlinkat(263), mkdirat(258), fchownat(260), fchmodat(268), faccessat(269), pselect6(270), utimensat(280), renameat2(316), statx(332), faccessat2(439).
+- **Real implementations**: sys_pause (sti;hlt, -EINTR), sys_chdir (accept "/" only), sys_umask (tracks mask), sys_gettimeofday (APIC→seconds), sys_sysinfo (uptime/totalram/freeram), sys_statfs (OsitoFS stats), sys_statx (file stat via basename + dev/proc VFS).
+- **Busybox verified applets**: echo, id, pwd, whoami, uname -a, true, false, env, basename, dirname, seq.
+- **Known issues**: Some applets (#UD at 0x401067 in busybox code), `cat /proc/self/status` (#PF at RIP=0xFFFFFFFFFFFFFFFF — corrupted function pointer).
+- **Files**: `arch/x86/kernel/idt.c` (exception kill + cascading guard), `arch/x86/kernel/process.c` (proc_exception_kill), `arch/x86/kernel/isr_stubs.S` (atomic XCHG), `arch/x86/kernel/smp.c` (AP timer removed), `arch/x86/kernel/syscall.c` (+35 syscalls)
 
 ### AArch64/SM8350 Port (arch/arm/)
 Reference bare-metal code for ASUS ROG Phone 5 (Snapdragon 888).

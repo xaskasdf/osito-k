@@ -135,6 +135,7 @@ static inline void wrmsr(uint32_t msr, uint64_t val) {
 #define SYS_FSYNC       74
 #define SYS_SIGALTSTACK 131
 #define SYS_GETTID      186
+#define SYS_TKILL       200
 #define SYS_FUTEX       202
 #define SYS_SET_TID_ADDR 218
 #define SYS_CLOCK_GETTIME 228
@@ -2251,7 +2252,8 @@ int64_t syscall_dispatch(uint64_t nr, uint64_t a1, uint64_t a2,
     case SYS_SET_TID_ADDR: return sys_set_tid_address(a1);
     case SYS_CLOCK_GETTIME: return sys_clock_gettime(a1, a2);
     case SYS_EXIT_GROUP: return sys_exit_group(a1);
-    case SYS_TGKILL:     return sys_kill(a2, a3);  /* reuse kill */
+    case SYS_TKILL:      return sys_kill(a1, a2);  /* tkill(tid, sig) */
+    case SYS_TGKILL:     return sys_kill(a2, a3);  /* tgkill(tgid, tid, sig) */
     case SYS_OPENAT:     return sys_openat(a1, a2, a3, a4);
     case SYS_NEWFSTATAT: return sys_newfstatat(a1, a2, a3, a4);
     case SYS_READLINKAT: return sys_readlinkat(a1, a2, a3, a4);
