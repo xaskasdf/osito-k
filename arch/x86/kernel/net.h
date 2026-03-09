@@ -97,9 +97,11 @@ typedef struct __attribute__((packed)) {
 #define TCP_CLOSE_WAIT  5
 #define TCP_LAST_ACK    6
 #define TCP_TIME_WAIT   7
+#define TCP_LISTEN      8
+#define TCP_SYN_RCVD    9
 
 #define TCP_RX_BUF_SIZE 8192
-#define TCP_MAX_CONNS   4
+#define TCP_MAX_CONNS   8
 
 typedef struct {
     int       state;
@@ -140,12 +142,20 @@ void net_udp_listen(uint16_t port, udp_handler_t handler);
 void     net_icmp_send_echo(const uint8_t dst_ip[4], uint16_t seq);
 uint32_t net_icmp_get_rx_count(void);
 
-/* ── TCP API (client-only) ───────────────────────────────────── */
+/* ── TCP API ─────────────────────────────────────────────────── */
 
 /* Connect to remote host. Blocks until handshake completes or timeout.
  * Returns connection index (0..TCP_MAX_CONNS-1) or -1 on failure. */
 int  net_tcp_connect(const uint8_t dst_ip[4], uint16_t dst_port,
                      uint16_t src_port);
+
+/* Listen for incoming connections on a port.
+ * Returns listener index or -1 on failure. */
+int  net_tcp_listen(uint16_t port);
+
+/* Accept incoming connection on a listener. Blocks until SYN arrives
+ * or timeout. Returns connection index or -1 on timeout. */
+int  net_tcp_accept(int listener, uint32_t timeout_ticks);
 
 /* Send data on established connection. Blocks until sent or timeout.
  * Returns bytes sent, or -1 on error. */
@@ -159,6 +169,9 @@ int  net_tcp_recv(int conn, void *buf, uint32_t buf_size);
  * or timeout. Returns bytes read, 0 on timeout, -1 on closed. */
 int  net_tcp_recv_timeout(int conn, void *buf, uint32_t buf_size,
                           uint32_t timeout_ticks);
+
+/* Stop listening on a port */
+void net_tcp_stop_listen(int listener);
 
 /* Close TCP connection gracefully. Blocks for FIN handshake. */
 void net_tcp_close(int conn);

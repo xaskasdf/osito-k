@@ -76,6 +76,10 @@ extern int  net_tcp_recv_timeout(int conn, void *buf, uint32_t buf_size, uint32_
 extern void net_tcp_close(int conn);
 extern int  net_tcp_state(int conn);
 extern int  net_dns_resolve(const char *hostname, uint8_t ip_out[4]);
+extern int  net_tcp_listen(uint16_t port);
+extern int  net_tcp_accept(int listener, uint32_t timeout_ticks);
+extern void net_tcp_stop_listen(int listener);
+extern uint64_t osfs2_file_size(void *file);
 
 /* TLS — opaque pointer, allocated via kmalloc(tls_conn_size()) */
 extern uint32_t tls_conn_size(void);
@@ -233,6 +237,7 @@ static void cmd_help(void)
     sh_puts("  dl        Dynamic linker (dl load/sym/call/close/list)\n");
     sh_puts("  git       Version control (init/add/commit/log/status/diff/branch/checkout)\n");
     sh_puts("  sched     Scheduler test (sched [stats])\n");
+    sh_puts("  httpd     HTTP server (httpd [port] / httpd stop)\n");
     sh_puts("  clear     Clear screen\n");
     sh_puts("  reboot    Reboot system\n");
     sh_puts("  halt      Halt CPU\n");
@@ -1151,6 +1156,294 @@ extern int   dl_close(void *handle);
 extern void  dl_list_modules(void);
 extern void *dl_find(const char *name);
 
+/* ── HTTP Server (X-HTTPD) ───────────────────────────────────── */
+
+static volatile bool httpd_running;
+static int httpd_listener = -1;
+static uint16_t httpd_port = 8080;
+
+/* Simple integer to decimal string */
+static int int_to_str(int val, char *buf)
+{
+    if (val == 0) { buf[0] = '0'; return 1; }
+    char tmp[12];
+    int i = 0;
+    int neg = 0;
+    if (val < 0) { neg = 1; val = -val; }
+    while (val > 0) { tmp[i++] = '0' + (val % 10); val /= 10; }
+    int len = 0;
+    if (neg) buf[len++] = '-';
+    while (i > 0) buf[len++] = tmp[--i];
+    return len;
+}
+
+/* Content-Type from file extension */
+static const char *http_content_type(const char *name)
+{
+    int len = 0;
+    while (name[len]) len++;
+    if (len > 5 && name[len-5]=='.' && name[len-4]=='h' && name[len-3]=='t' &&
+        name[len-2]=='m' && name[len-1]=='l')
+        return "text/html";
+    if (len > 4 && name[len-4]=='.' && name[len-3]=='h' && name[len-2]=='t' &&
+        name[len-1]=='m')
+        return "text/html";
+    if (len > 3 && name[len-3]=='.' && name[len-2]=='j' && name[len-1]=='s')
+        return "application/javascript";
+    if (len > 4 && name[len-4]=='.' && name[len-3]=='c' && name[len-2]=='s' &&
+        name[len-1]=='s')
+        return "text/css";
+    if (len > 4 && name[len-4]=='.' && name[len-3]=='j' && name[len-2]=='s' &&
+        name[len-1]=='n')
+        return "application/json";
+    if (len > 2 && name[len-2]=='.' && name[len-1]=='c')
+        return "text/x-csrc";
+    if (len > 2 && name[len-2]=='.' && name[len-1]=='h')
+        return "text/x-chdr";
+    if (len > 4 && name[len-4]=='.' && name[len-3]=='t' && name[len-2]=='x' &&
+        name[len-1]=='t')
+        return "text/plain";
+    return "application/octet-stream";
+}
+
+/* Build directory listing HTML */
+static int http_build_index(char *buf, int max)
+{
+    extern void *osfs2_file_at(int index);
+    extern const char *osfs2_file_name(void *file);
+
+    int pos = 0;
+    const char *hdr =
+        "<!DOCTYPE html><html><head><title>OsitoK</title>"
+        "<style>body{font-family:monospace;background:#1a1a2e;color:#e0e0e0;padding:20px}"
+        "a{color:#0ff;text-decoration:none}a:hover{text-decoration:underline}"
+        "h1{color:#ff8800}table{border-collapse:collapse}td{padding:4px 16px}"
+        "</style></head><body><h1>OsitoK File Server</h1><table>";
+    while (*hdr && pos < max - 1) buf[pos++] = *hdr++;
+
+    for (int i = 0; ; i++) {
+        void *f = osfs2_file_at(i);
+        if (!f) break;
+        const char *name = osfs2_file_name(f);
+        int size = osfs2_file_size(f);
+        if (!name) continue;
+
+        const char *tr1 = "<tr><td><a href=\"/";
+        while (*tr1 && pos < max - 1) buf[pos++] = *tr1++;
+        const char *n = name;
+        while (*n && pos < max - 1) buf[pos++] = *n++;
+        const char *tr2 = "\">";
+        while (*tr2 && pos < max - 1) buf[pos++] = *tr2++;
+        n = name;
+        while (*n && pos < max - 1) buf[pos++] = *n++;
+        const char *tr3 = "</a></td><td>";
+        while (*tr3 && pos < max - 1) buf[pos++] = *tr3++;
+        char sz[16];
+        int slen = int_to_str(size, sz);
+        for (int j = 0; j < slen && pos < max - 1; j++) buf[pos++] = sz[j];
+        const char *tr4 = " B</td></tr>";
+        while (*tr4 && pos < max - 1) buf[pos++] = *tr4++;
+    }
+
+    const char *ftr = "</table><hr><em>OsitoK X-HTTPD</em></body></html>";
+    while (*ftr && pos < max - 1) buf[pos++] = *ftr++;
+    buf[pos] = '\0';
+    return pos;
+}
+
+/* Handle one HTTP request on an accepted connection */
+static void http_handle_request(int conn)
+{
+    /* Read request (wait up to 3s for data) */
+    char req[2048];
+    int total = 0;
+    uint64_t start = idt_get_ticks();
+
+    while (total < (int)sizeof(req) - 1 && (idt_get_ticks() - start) < 300) {
+        net_poll();
+        int r = net_tcp_recv(conn, req + total, sizeof(req) - 1 - total);
+        if (r > 0) {
+            total += r;
+            /* Check for end of headers */
+            req[total] = '\0';
+            bool found = false;
+            for (int i = 0; i < total - 3; i++) {
+                if (req[i]=='\r' && req[i+1]=='\n' && req[i+2]=='\r' && req[i+3]=='\n') {
+                    found = true;
+                    break;
+                }
+            }
+            if (found) break;
+        } else if (r < 0) {
+            return;  /* Connection closed */
+        }
+        __asm__ volatile ("hlt");
+    }
+
+    if (total <= 0) return;
+    req[total] = '\0';
+
+    /* Parse request line: "GET /path HTTP/1.x\r\n" */
+    if (req[0] != 'G' || req[1] != 'E' || req[2] != 'T' || req[3] != ' ') {
+        /* Only support GET */
+        const char *resp = "HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        net_tcp_send(conn, resp, strlen(resp));
+        return;
+    }
+
+    /* Extract path */
+    char path[128];
+    int pi = 0;
+    for (int i = 4; i < total && req[i] != ' ' && req[i] != '?' && pi < 127; i++)
+        path[pi++] = req[i];
+    path[pi] = '\0';
+
+    serial_puts("[HTTPD] GET ");
+    serial_puts(path);
+    serial_puts("\n");
+
+    /* Build response */
+    char hdr_buf[512];
+    int hdr_len;
+
+    if (path[0] == '/' && path[1] == '\0') {
+        /* Directory listing */
+        char *body = (char *)kmalloc(16384);
+        if (!body) return;
+        int body_len = http_build_index(body, 16384);
+
+        hdr_len = 0;
+        const char *h1 = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\nContent-Length: ";
+        while (*h1) hdr_buf[hdr_len++] = *h1++;
+        hdr_len += int_to_str(body_len, hdr_buf + hdr_len);
+        const char *h2 = "\r\nServer: OsitoK\r\n\r\n";
+        while (*h2) hdr_buf[hdr_len++] = *h2++;
+
+        net_tcp_send(conn, hdr_buf, hdr_len);
+        net_tcp_send(conn, body, body_len);
+        kfree(body);
+    } else {
+        /* Serve file from OsitoFS */
+        const char *fname = path + 1;  /* Skip leading / */
+        void *file = osfs2_find(fname);
+
+        if (!file) {
+            const char *not_found =
+                "HTTP/1.1 404 Not Found\r\nContent-Type: text/html\r\n"
+                "Connection: close\r\nContent-Length: 48\r\nServer: OsitoK\r\n\r\n"
+                "<html><body><h1>404 Not Found</h1></body></html>";
+            net_tcp_send(conn, not_found, strlen(not_found));
+        } else {
+            int file_size = osfs2_file_size(file);
+            const char *ctype = http_content_type(fname);
+
+            hdr_len = 0;
+            const char *h1 = "HTTP/1.1 200 OK\r\nContent-Type: ";
+            while (*h1) hdr_buf[hdr_len++] = *h1++;
+            while (*ctype) hdr_buf[hdr_len++] = *ctype++;
+            const char *h2 = "\r\nConnection: close\r\nContent-Length: ";
+            while (*h2) hdr_buf[hdr_len++] = *h2++;
+            hdr_len += int_to_str(file_size, hdr_buf + hdr_len);
+            const char *h3 = "\r\nServer: OsitoK\r\n\r\n";
+            while (*h3) hdr_buf[hdr_len++] = *h3++;
+
+            /* Read file into memory, then send headers+body together.
+             * Disable preemption during NVMe I/O — the NVMe driver's
+             * polling loop isn't safe under preemptive scheduling. */
+            int total_len = hdr_len + file_size;
+            char *resp = (char *)kmalloc(total_len + 1);
+            if (resp) {
+                memcpy(resp, hdr_buf, hdr_len);
+                if (file_size > 0) {
+                    __asm__ volatile ("cli");
+                    int rc = osfs2_read(file, 0, resp + hdr_len, file_size);
+                    __asm__ volatile ("sti");
+                    if (rc < 0) {
+                        serial_puts("[HTTPD] File read error\n");
+                        file_size = 0;
+                        total_len = hdr_len;
+                    }
+                }
+                net_tcp_send(conn, resp, total_len);
+                kfree(resp);
+            }
+        }
+    }
+}
+
+/* HTTP server thread (runs via scheduler) */
+static void httpd_thread(void)
+{
+    httpd_listener = net_tcp_listen(httpd_port);
+    if (httpd_listener < 0) {
+        serial_puts("[HTTPD] Failed to listen\n");
+        httpd_running = false;
+        return;
+    }
+
+    serial_puts("[HTTPD] Server started on port ");
+    serial_putdec(httpd_port);
+    serial_puts("\n");
+
+    while (httpd_running) {
+        int conn = net_tcp_accept(httpd_listener, 100);  /* 1s timeout */
+        if (conn >= 0) {
+            http_handle_request(conn);
+            /* Brief poll to let ACKs arrive before FIN */
+            for (int i = 0; i < 20; i++) {
+                net_poll();
+                __asm__ volatile ("hlt");
+            }
+            net_tcp_close(conn);
+        }
+    }
+
+    net_tcp_stop_listen(httpd_listener);
+    httpd_listener = -1;
+    serial_puts("[HTTPD] Server stopped\n");
+}
+
+static void cmd_httpd(int argc, char *argv[])
+{
+    if (argc >= 2 && strcmp(argv[1], "stop") == 0) {
+        if (httpd_running) {
+            httpd_running = false;
+            sh_puts("Stopping HTTP server...\n");
+        } else {
+            sh_puts("HTTP server not running.\n");
+        }
+        return;
+    }
+
+    if (httpd_running) {
+        sh_puts("HTTP server already running on port ");
+        sh_putdec(httpd_port);
+        sh_puts("\n");
+        return;
+    }
+
+    if (argc >= 2) {
+        /* Parse port number */
+        uint16_t port = 0;
+        const char *p = argv[1];
+        while (*p >= '0' && *p <= '9') {
+            port = port * 10 + (*p - '0');
+            p++;
+        }
+        if (port > 0) httpd_port = port;
+    }
+
+    httpd_running = true;
+    sched_spawn("httpd", httpd_thread);
+    sh_puts("HTTP server started on port ");
+    sh_putdec(httpd_port);
+    sh_puts("\n  Access: http://10.0.2.15:");
+    sh_putdec(httpd_port);
+    sh_puts("/\n");
+}
+
+/* ── Dynamic Linker (X-DYN) ─────────────────────────────────── */
+
 static void cmd_dl(int argc, char *argv[])
 {
     if (argc < 2) {
@@ -1416,6 +1709,8 @@ static void shell_exec(char *line)
             sh_puts("Spawned 2 test threads (printing A and B).\n");
             sh_puts("Use 'ps' to see processes, 'sched stats' for switch count.\n");
         }
+    } else if (strcmp(cmd, "httpd") == 0) {
+        cmd_httpd(argc, argv);
     } else if (strcmp(cmd, "clear") == 0) {
         cmd_clear();
     } else if (strcmp(cmd, "reboot") == 0) {

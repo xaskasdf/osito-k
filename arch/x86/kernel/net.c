@@ -66,6 +66,18 @@ static int udp_listener_count;
 
 static tcp_conn_t tcp_conns[TCP_MAX_CONNS];
 
+/* ── TCP Listeners (passive open) ────────────────────────────── */
+
+#define TCP_MAX_LISTENERS  4
+
+typedef struct {
+    uint16_t  port;
+    bool      active;
+    int       pending_conn;   /* conn index of accepted SYN_RCVD, or -1 */
+} tcp_listener_t;
+
+static tcp_listener_t tcp_listeners[TCP_MAX_LISTENERS];
+
 /* ── Network State ───────────────────────────────────────────── */
 
 extern uint64_t idt_get_ticks(void);
@@ -86,6 +98,7 @@ static const uint8_t bcast_mac[ETH_ALEN] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 
 /* Forward declarations */
 static void handle_tcp(const uint8_t *src_ip, const uint8_t *pkt, uint32_t len);
+static uint32_t tcp_isn_counter = 0x12345678;
 
 /* ── IP Checksum (RFC 1071) ──────────────────────────────────── */
 
@@ -702,7 +715,59 @@ static void handle_tcp(const uint8_t *src_ip, const uint8_t *pkt, uint32_t len)
     }
 
     if (!conn) {
-        /* No matching connection — ignore (client-only, no RST) */
+        /* No matching connection — check if a listener exists for this port */
+        if (!(flags & TCP_SYN) || (flags & TCP_ACK))
+            return;  /* Only accept bare SYN */
+
+        /* Find listener for this port */
+        tcp_listener_t *listener = NULL;
+        for (int i = 0; i < TCP_MAX_LISTENERS; i++) {
+            if (tcp_listeners[i].active && tcp_listeners[i].port == dst_port) {
+                listener = &tcp_listeners[i];
+                break;
+            }
+        }
+        if (!listener)
+            return;  /* No listener — silently drop */
+
+        /* Allocate connection slot for the incoming connection */
+        int new_idx = -1;
+        for (int i = 0; i < TCP_MAX_CONNS; i++) {
+            if (tcp_conns[i].state == TCP_CLOSED) {
+                new_idx = i;
+                break;
+            }
+        }
+        if (new_idx < 0) {
+            /* No free slots — send RST */
+            return;
+        }
+
+        /* Initialize server-side connection */
+        conn = &tcp_conns[new_idx];
+        conn_idx = new_idx;
+        memset(conn, 0, sizeof(tcp_conn_t));
+        memcpy(conn->remote_ip, src_ip, 4);
+        conn->local_port  = dst_port;
+        conn->remote_port = src_port;
+        conn->rcv_nxt     = seq + 1;       /* SYN consumes 1 seq byte */
+        conn->snd_nxt     = tcp_isn_counter;
+        tcp_isn_counter  += 64000;
+        conn->snd_una     = conn->snd_nxt;
+        conn->state       = TCP_SYN_RCVD;
+        conn->last_activity = idt_get_ticks();
+
+        /* Send SYN+ACK */
+        tcp_send_segment(conn, TCP_SYN | TCP_ACK, NULL, 0);
+
+        /* Notify listener */
+        listener->pending_conn = new_idx;
+
+        serial_puts("[TCP] SYN received, sent SYN+ACK (conn ");
+        serial_putdec(new_idx);
+        serial_puts(" port ");
+        serial_putdec(dst_port);
+        serial_puts(")\n");
         return;
     }
 
@@ -718,6 +783,17 @@ static void handle_tcp(const uint8_t *src_ip, const uint8_t *pkt, uint32_t len)
     }
 
     switch (conn->state) {
+    case TCP_SYN_RCVD:
+        /* Expecting ACK of our SYN+ACK → transition to ESTABLISHED */
+        if ((flags & TCP_ACK) && ack == conn->snd_nxt) {
+            conn->snd_una = ack;
+            conn->state = TCP_ESTABLISHED;
+            serial_puts("[TCP] Accepted (conn ");
+            serial_putdec(conn_idx);
+            serial_puts(")\n");
+        }
+        break;
+
     case TCP_SYN_SENT:
         /* Expecting SYN+ACK */
         if ((flags & (TCP_SYN | TCP_ACK)) == (TCP_SYN | TCP_ACK)) {
@@ -836,8 +912,6 @@ static void handle_tcp(const uint8_t *src_ip, const uint8_t *pkt, uint32_t len)
 }
 
 /* ── TCP: Public API ──────────────────────────────────────────── */
-
-static uint32_t tcp_isn_counter = 0x12345678;
 
 int net_tcp_connect(const uint8_t dst_ip[4], uint16_t dst_port,
                     uint16_t src_port)
@@ -1036,6 +1110,78 @@ int net_tcp_state(int conn_idx)
     if (conn_idx < 0 || conn_idx >= TCP_MAX_CONNS)
         return TCP_CLOSED;
     return tcp_conns[conn_idx].state;
+}
+
+/* ── TCP Server: Listen / Accept ─────────────────────────────── */
+
+int net_tcp_listen(uint16_t port)
+{
+    /* Check for duplicate listener */
+    for (int i = 0; i < TCP_MAX_LISTENERS; i++) {
+        if (tcp_listeners[i].active && tcp_listeners[i].port == port)
+            return i;  /* Already listening */
+    }
+
+    /* Find free listener slot */
+    for (int i = 0; i < TCP_MAX_LISTENERS; i++) {
+        if (!tcp_listeners[i].active) {
+            tcp_listeners[i].port = port;
+            tcp_listeners[i].active = true;
+            tcp_listeners[i].pending_conn = -1;
+            serial_puts("[TCP] Listening on port ");
+            serial_putdec(port);
+            serial_puts("\n");
+            return i;
+        }
+    }
+
+    serial_puts("[TCP] No free listener slots\n");
+    return -1;
+}
+
+int net_tcp_accept(int listener_idx, uint32_t timeout_ticks)
+{
+    if (listener_idx < 0 || listener_idx >= TCP_MAX_LISTENERS)
+        return -1;
+
+    tcp_listener_t *listener = &tcp_listeners[listener_idx];
+    if (!listener->active)
+        return -1;
+
+    /* Clear any stale pending_conn */
+    if (listener->pending_conn >= 0) {
+        int pc = listener->pending_conn;
+        if (tcp_conns[pc].state == TCP_CLOSED)
+            listener->pending_conn = -1;
+    }
+
+    uint64_t start = idt_get_ticks();
+
+    while ((idt_get_ticks() - start) < timeout_ticks) {
+        net_poll();
+
+        /* Check if a SYN was received and handshake is completing */
+        int pc = listener->pending_conn;
+        if (pc >= 0 && tcp_conns[pc].state == TCP_ESTABLISHED) {
+            listener->pending_conn = -1;
+            return pc;
+        }
+
+        __asm__ volatile ("hlt");
+    }
+
+    return -1;  /* Timeout */
+}
+
+void net_tcp_stop_listen(int listener_idx)
+{
+    if (listener_idx < 0 || listener_idx >= TCP_MAX_LISTENERS)
+        return;
+    tcp_listeners[listener_idx].active = false;
+    tcp_listeners[listener_idx].pending_conn = -1;
+    serial_puts("[TCP] Stopped listening on port ");
+    serial_putdec(tcp_listeners[listener_idx].port);
+    serial_puts("\n");
 }
 
 /* ── DNS Resolver ────────────────────────────────────────────── */

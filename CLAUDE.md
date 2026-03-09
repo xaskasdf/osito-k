@@ -385,13 +385,14 @@ Tasks:   idle, input, shell (3 of 8 slots used)
 | **X-FORK** | **fork/wait4/getppid + busybox** (scheduler-based fork, wait4 memory clobber fix, execve /proc/self/exe, 8MB allocator boundary, ioctl/poll/vfork, busybox ash interactive, 3/3 QEMU tests pass) | Done |
 | **X-THREAD** | **clone(CLONE_THREAD) + futex** (per-thread TLS/FS_BASE save/restore, futex wait queue, PROC_BLOCKED state, clear_child_tid, thread exit cleanup, 2/2 QEMU tests pass) | Done |
 | **X-EDIT** | **Kilo text editor port** (ANSI CSI escape parser in framebuffer, extended PS/2 scancodes→VT100, termios raw mode, kb_getchar_safe with sti;hlt;cli, Ctrl+S save to OsitoFS) | Done |
+| **X-HTTPD** | **HTTP file server** (TCP passive open listen/accept, SYN_RCVD state, scheduler thread, directory listing, file serving with cli/sti NVMe guard, MIME types, `httpd` shell command) | Done |
 
 > Full GPU roadmap (X27-X40 + contingency): see [docs/x86-gpu-roadmap.md](docs/x86-gpu-roadmap.md)
 > Full OS roadmap (Tiers 0-9): see [docs/os-selfhost-roadmap.md](docs/os-selfhost-roadmap.md)
 > Binary compatibility roadmap: see [docs/binary-compat-roadmap.md](docs/binary-compat-roadmap.md)
 > Paths to Claude analysis: see [docs/paths-to-claude-on-ositok.md](docs/paths-to-claude-on-ositok.md)
 
-**Tier 7+ (next)**: X-HTTPD (TCP server), X-SELF (self-hosting kernel compile).
+**Tier 7+ (next)**: X-SELF (self-hosting kernel compile).
 See `docs/os-selfhost-roadmap.md` for full details and dependency chains.
 
 ### F12: DOOM Wireframe 2.5D
@@ -1213,6 +1214,18 @@ Antirez's kilo editor (BSD, 1308 lines) runs natively on OsitoK. Three kernel in
 - **Kilo binary**: Compiled with musl-gcc (`musl-gcc -static -no-pie -O2 kilo.c -o kilo.elf`), 91KB static ELF. Uploaded to OsitoFS via `ositofs-write`.
 - **Verified**: Text input, arrow navigation, Ctrl+Q quit (with unsaved-changes warning), Ctrl+S save to OsitoFS (49 bytes written). Full QEMU test via monitor sendkey.
 - **Files**: `arch/x86/kernel/framebuffer.c` (ANSI parser), `arch/x86/kernel/keyboard.c` (extended scancodes), `arch/x86/kernel/syscall.c` (termios, kb_getchar_safe), `arch/x86/test/kilo.elf` (binary)
+
+### X-HTTPD: HTTP File Server
+TCP passive open (listen/accept) + HTTP/1.1 file server running as a preemptive scheduler thread.
+- **TCP listen/accept** (`net.c`): `tcp_listener_t` table (4 slots). `net_tcp_listen(port)` registers a port. `handle_tcp()` detects bare SYN on listened port → allocates connection, sends SYN+ACK, sets `TCP_SYN_RCVD`. On subsequent ACK → transitions to `TCP_ESTABLISHED`. `net_tcp_accept()` polls for established connections with timeout.
+- **TCP_MAX_CONNS**: Increased 4→8 to support concurrent connections.
+- **HTTP handler** (`shell.c`): `http_handle_request()` — reads request headers (3s timeout), parses GET path, dispatches to directory listing or file serving. MIME type detection by extension (.html, .txt, .js, .css, .json, .c, .h).
+- **Directory listing**: `http_build_index()` generates dark-theme HTML table with linked file names and sizes from OsitoFS file table.
+- **File serving**: Reads file into kmalloc'd buffer, sends headers+body in single `net_tcp_send()`. **Critical**: `osfs2_read()` wrapped with `cli`/`sti` — NVMe driver's polling loop in `nvme_io_submit_wait()` is not safe under preemptive scheduling (scheduler can preempt mid-NVMe-command, causing hang on resume).
+- **Scheduler thread**: `httpd_thread()` spawned via `sched_spawn()`. Accept loop with 1s timeout. Brief poll after response before FIN close.
+- **Shell command**: `httpd [port]` starts server (default 8080), `httpd stop` stops it.
+- **Verified**: `curl http://localhost:8080/` returns directory listing, `curl http://localhost:8080/test.txt` returns file contents, 404 for missing files. All via QEMU SLIRP `hostfwd=tcp::8080-:8080`.
+- **Files**: `arch/x86/kernel/net.c` (TCP listen/accept), `arch/x86/kernel/net.h` (TCP server API), `arch/x86/kernel/shell.c` (HTTP server + httpd command)
 
 ### AArch64/SM8350 Port (arch/arm/)
 Reference bare-metal code for ASUS ROG Phone 5 (Snapdragon 888).
