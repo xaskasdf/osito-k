@@ -411,6 +411,7 @@ Tasks:   idle, input, shell (3 of 8 slots used)
 > Full OS roadmap (Tiers 0-9): see [docs/os-selfhost-roadmap.md](docs/os-selfhost-roadmap.md)
 > Binary compatibility roadmap: see [docs/binary-compat-roadmap.md](docs/binary-compat-roadmap.md)
 > Paths to Claude analysis: see [docs/paths-to-claude-on-ositok.md](docs/paths-to-claude-on-ositok.md)
+> Kernel/bootloader separation + self-compiling road: see [docs/kernel-separation.md](docs/kernel-separation.md)
 
 **Tier 7+ (next)**: Full kernel self-compile (TCC compiles kernel .c sources inside OsitoK).
 See `docs/os-selfhost-roadmap.md` for full details and dependency chains.
