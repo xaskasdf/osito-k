@@ -69,8 +69,25 @@ extern void syscall_restore_brk(void);
 #define PROC_ZOMBIE     4
 
 /* Scheduler constants (X-SCHED) */
-#define SCHED_QUANTUM       5       /* ticks per time slice (50ms @ 100Hz) */
+#define SCHED_QUANTUM       5       /* default ticks per time slice (50ms @ 100Hz) */
 #define KERNEL_STACK_SIZE   16384   /* 16KB per kernel thread */
+
+/* QoS priority classes — higher value = higher priority */
+#define QOS_IDLE            0
+#define QOS_BACKGROUND      1
+#define QOS_DEFAULT         2
+#define QOS_INTERACTIVE     3
+#define QOS_REALTIME        4
+#define QOS_NUM_CLASSES     5
+
+/* Quantum per QoS class (in timer ticks @ 100Hz):
+ *   IDLE        = 20 ticks (200ms) — runs rarely, big slices when it does
+ *   BACKGROUND  = 10 ticks (100ms) — batch work
+ *   DEFAULT     =  5 ticks  (50ms) — normal processes
+ *   INTERACTIVE =  2 ticks  (20ms) — low-latency UI/input
+ *   REALTIME    =  1 tick   (10ms) — preempts everything, minimal slice
+ */
+static const uint32_t qos_quantum[QOS_NUM_CLASSES] = { 20, 10, 5, 2, 1 };
 
 /* ── File descriptor ─────────────────────────────────────────── */
 
@@ -114,6 +131,7 @@ typedef struct {
     void    *kernel_stack;       /* allocated kernel stack (NULL for kernel proc) */
     uint64_t kernel_rsp;         /* saved RSP pointing to interrupt frame */
     uint32_t quantum;            /* ticks remaining in time slice */
+    uint8_t  qos_class;          /* QOS_IDLE..QOS_REALTIME */
 
     /* Thread support (X-THREAD) */
     uint32_t tgid;               /* thread group ID (= leader's PID) */
@@ -177,6 +195,9 @@ static process_t *proc_alloc(const char *name)
                 j++;
             }
             p->name[j] = '\0';
+
+            /* QoS: default priority */
+            p->qos_class = QOS_DEFAULT;
 
             /* Thread group = own PID by default (changed for CLONE_THREAD) */
             p->tgid = p->pid;
@@ -498,28 +519,49 @@ void sched_tick(void *frame_ptr)
 
     process_t *cur = &proctab[sched_current_idx];
 
-    /* Decrement quantum — if still running, continue.
-     * ZOMBIE and BLOCKED processes always force-switch immediately. */
-    if (cur->state != PROC_ZOMBIE && cur->state != PROC_BLOCKED
-        && cur->quantum > 1) {
-        cur->quantum--;
-        return;
+    /* Check if a higher-priority process is READY (preemption).
+     * ZOMBIE/BLOCKED processes always force-switch immediately.
+     * Otherwise, only switch if quantum expired or preempted. */
+    bool force_switch = (cur->state == PROC_ZOMBIE || cur->state == PROC_BLOCKED);
+    bool quantum_expired = false;
+
+    if (!force_switch) {
+        if (cur->quantum > 1) {
+            cur->quantum--;
+        } else {
+            quantum_expired = true;
+        }
     }
 
-    /* Quantum expired — find next READY process (round-robin) */
+    /* Find best READY process: highest QoS class, round-robin within same class */
     int next_idx = -1;
+    uint8_t best_qos = 0;
     for (int i = 1; i <= MAX_PROCESSES; i++) {
         int idx = (sched_current_idx + i) % MAX_PROCESSES;
         if (proctab[idx].state == PROC_READY) {
-            next_idx = idx;
-            break;
+            if (proctab[idx].qos_class >= best_qos) {
+                best_qos = proctab[idx].qos_class;
+                next_idx = idx;
+            }
         }
     }
 
     if (next_idx < 0) {
         /* No other runnable process — reset quantum, continue */
-        cur->quantum = SCHED_QUANTUM;
+        if (quantum_expired)
+            cur->quantum = qos_quantum[cur->qos_class];
         return;
+    }
+
+    /* Decide whether to actually switch:
+     *  - force_switch (ZOMBIE/BLOCKED): always switch
+     *  - quantum_expired: switch to best_qos candidate
+     *  - preemption: higher-priority READY process preempts current */
+    if (!force_switch && !quantum_expired) {
+        /* Still have quantum — only preempt if candidate is strictly higher priority */
+        if (best_qos <= cur->qos_class)
+            return;
+        /* Preemption: higher priority process is waiting */
     }
 
     /* ── Context switch ────────────────────────────────────────── */
@@ -537,7 +579,7 @@ void sched_tick(void *frame_ptr)
     /* Load next process */
     process_t *next = &proctab[next_idx];
     next->state = PROC_RUNNING;
-    next->quantum = SCHED_QUANTUM;
+    next->quantum = qos_quantum[next->qos_class];
     current_proc = next;
     sched_current_idx = next_idx;
     wrmsr(MSR_FS_BASE, next->fs_base);  /* restore per-thread TLS */
@@ -594,12 +636,12 @@ int sched_spawn(const char *name, void (*entry)(void))
     /* Set initial scheduler state */
     p->kernel_rsp = frame_addr;
     p->state = PROC_READY;
-    p->quantum = SCHED_QUANTUM;
+    p->quantum = qos_quantum[p->qos_class];
 
     /* Auto-activate scheduler on first spawn */
     if (!sched_enabled) {
         /* Set up kernel process for scheduling */
-        proctab[sched_current_idx].quantum = SCHED_QUANTUM;
+        proctab[sched_current_idx].quantum = qos_quantum[proctab[sched_current_idx].qos_class];
         sched_enabled = true;
         serial_puts("[SCHED] Preemptive scheduling activated\n");
     }
@@ -888,17 +930,18 @@ int32_t proc_fork(void)
         }
     }
 
-    /* Set up scheduler state */
+    /* Set up scheduler state — child inherits parent's QoS class */
+    child->qos_class = parent->qos_class;
     child->kernel_rsp = child_frame_addr;
     child->state = PROC_READY;
-    child->quantum = SCHED_QUANTUM;
+    child->quantum = qos_quantum[child->qos_class];
 
     /* Ensure scheduler tracks the parent (currently running) process.
      * proc_exec started the parent outside the scheduler, so sched_current_idx
      * may still point to the kernel process. Fix that now. */
     int parent_idx = (int)(parent - &proctab[0]);
     sched_current_idx = parent_idx;
-    parent->quantum = SCHED_QUANTUM;
+    parent->quantum = qos_quantum[parent->qos_class];
 
     /* The parent (ELF process from proc_exec) doesn't have a kernel_stack
      * because it was started via the setjmp/longjmp lifecycle. It's running
@@ -1034,15 +1077,16 @@ int32_t proc_clone_thread(uint64_t child_stack, uint64_t parent_tidptr,
     cf[20] = child_stack;   /* Thread's own stack (provided by caller) */
     cf[21] = 0x30;
 
-    /* Scheduler state */
+    /* Scheduler state — thread inherits parent's QoS class */
+    thread->qos_class = parent->qos_class;
     thread->kernel_rsp = frame_addr;
     thread->state = PROC_READY;
-    thread->quantum = SCHED_QUANTUM;
+    thread->quantum = qos_quantum[thread->qos_class];
 
     /* Ensure scheduler is tracking parent */
     int parent_idx = (int)(parent - &proctab[0]);
     sched_current_idx = parent_idx;
-    parent->quantum = SCHED_QUANTUM;
+    parent->quantum = qos_quantum[parent->qos_class];
 
     if (!sched_enabled) {
         sched_enabled = true;
@@ -1323,6 +1367,60 @@ int proc_execve(const char *path, char *const argv[])
 }
 
 /* ── Initialize process subsystem ────────────────────────────── */
+
+/* ── QoS API ─────────────────────────────────────────────────── */
+
+/* Set QoS class for a process by PID. 0 = current process. */
+int sched_set_qos(uint32_t pid, uint8_t qos)
+{
+    if (qos >= QOS_NUM_CLASSES)
+        return -1;
+
+    process_t *target = NULL;
+    if (pid == 0) {
+        target = current_proc;
+    } else {
+        for (int i = 0; i < MAX_PROCESSES; i++) {
+            if (proctab[i].state != PROC_FREE && proctab[i].pid == pid) {
+                target = &proctab[i];
+                break;
+            }
+        }
+    }
+    if (!target) return -1;
+
+    target->qos_class = qos;
+    /* Adjust quantum immediately if upgrading */
+    uint32_t new_q = qos_quantum[qos];
+    if (new_q < target->quantum)
+        target->quantum = new_q;
+    return 0;
+}
+
+/* Get QoS class for a process by PID. 0 = current process. */
+uint8_t sched_get_qos(uint32_t pid)
+{
+    if (pid == 0 && current_proc)
+        return current_proc->qos_class;
+
+    for (int i = 0; i < MAX_PROCESSES; i++) {
+        if (proctab[i].state != PROC_FREE && proctab[i].pid == pid)
+            return proctab[i].qos_class;
+    }
+    return QOS_DEFAULT;
+}
+
+/* ── sched_spawn_qos: spawn with explicit QoS class ─────────── */
+
+int sched_spawn_qos(const char *name, void (*entry)(void), uint8_t qos)
+{
+    int pid = sched_spawn(name, entry);
+    if (pid > 0 && qos < QOS_NUM_CLASSES)
+        sched_set_qos((uint32_t)pid, qos);
+    return pid;
+}
+
+/* ── Process initialization ──────────────────────────────────── */
 
 void proc_init(void)
 {

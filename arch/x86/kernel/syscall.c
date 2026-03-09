@@ -71,6 +71,19 @@ extern int paging_map_page(uint64_t virt, uint64_t phys, uint64_t flags);
 extern int paging_unmap_page(uint64_t virt);
 extern int paging_set_flags(uint64_t virt, uint64_t flags);
 
+/* Shared memory (shm.c) — weak symbols for optional linkage */
+extern uint32_t shm_create(uint64_t size, uint32_t flags)        __attribute__((weak));
+extern void    *shm_map(uint32_t handle)                         __attribute__((weak));
+extern void     shm_unmap(uint32_t handle)                       __attribute__((weak));
+extern void     shm_destroy(uint32_t handle)                     __attribute__((weak));
+extern uint64_t shm_get_phys(uint32_t handle)                    __attribute__((weak));
+extern uint64_t shm_get_size(uint32_t handle)                    __attribute__((weak));
+extern uint32_t shm_create_surface(uint32_t w, uint32_t h, uint32_t f) __attribute__((weak));
+
+/* QoS scheduler (process.c) */
+extern int     sched_set_qos(uint32_t pid, uint8_t qos)         __attribute__((weak));
+extern uint8_t sched_get_qos(uint32_t pid)                      __attribute__((weak));
+
 /* ── MSR definitions ─────────────────────────────────────────── */
 
 #define MSR_FS_BASE 0xC0000100  /* FS segment base (for TLS) */
@@ -209,6 +222,17 @@ static inline void wrmsr(uint32_t msr, uint64_t val) {
 #define SYS_RENAMEAT2   316
 #define SYS_STATX       332
 #define SYS_FACCESSAT2  439
+
+/* OsitoK private syscalls (500+) */
+#define SYS_SHM_CREATE      500
+#define SYS_SHM_MAP         501
+#define SYS_SHM_UNMAP       502
+#define SYS_SHM_DESTROY     503
+#define SYS_SHM_GETPHYS     504
+#define SYS_SHM_GETSIZE     505
+#define SYS_SHM_MKSURFACE   506
+#define SYS_SCHED_SETQOS    510
+#define SYS_SCHED_GETQOS    511
 
 /* errno values */
 #define EPERM    1
@@ -436,11 +460,18 @@ static vma_t vma_table[MAX_VMAS];
 #define DEV_URANDOM     2
 #define DEV_CONSOLE     3
 
-/* RDTSC-based PRNG for /dev/urandom */
+/* PRNG for /dev/urandom — CCP TRNG if available, RDTSC fallback */
+extern uint64_t ccp_random(void) __attribute__((weak));
+extern bool     ccp_is_ready(void) __attribute__((weak));
+
 static uint64_t urandom_state;
 
 static uint64_t urandom_next(void)
 {
+    /* Use hardware TRNG when CCP driver is linked */
+    if (ccp_is_ready && ccp_is_ready())
+        return ccp_random();
+
     if (!urandom_state) {
         uint32_t lo, hi;
         __asm__ volatile ("rdtsc" : "=a"(lo), "=d"(hi));
@@ -2396,6 +2427,31 @@ int64_t syscall_dispatch(uint64_t nr, uint64_t a1, uint64_t a2,
     case SYS_UTIMENSAT:  return 0;   /* pretend success */
     case SYS_RENAMEAT2:  return -ENOSYS;
     case SYS_STATX:      return sys_statx(a1, a2, a3, a4, a5);
+
+    /* ── OsitoK private: shared memory ────────────────────────── */
+    case SYS_SHM_CREATE:
+        return shm_create ? (int64_t)shm_create(a1, (uint32_t)a2) : -ENOSYS;
+    case SYS_SHM_MAP:
+        return shm_map ? (int64_t)(uint64_t)shm_map((uint32_t)a1) : -ENOSYS;
+    case SYS_SHM_UNMAP:
+        if (shm_unmap) { shm_unmap((uint32_t)a1); return 0; }
+        return -ENOSYS;
+    case SYS_SHM_DESTROY:
+        if (shm_destroy) { shm_destroy((uint32_t)a1); return 0; }
+        return -ENOSYS;
+    case SYS_SHM_GETPHYS:
+        return shm_get_phys ? (int64_t)shm_get_phys((uint32_t)a1) : -ENOSYS;
+    case SYS_SHM_GETSIZE:
+        return shm_get_size ? (int64_t)shm_get_size((uint32_t)a1) : -ENOSYS;
+    case SYS_SHM_MKSURFACE:
+        return shm_create_surface ? (int64_t)shm_create_surface((uint32_t)a1, (uint32_t)a2, (uint32_t)a3) : -ENOSYS;
+
+    /* ── OsitoK private: QoS scheduler ────────────────────────── */
+    case SYS_SCHED_SETQOS:
+        return sched_set_qos ? (int64_t)sched_set_qos((uint32_t)a1, (uint8_t)a2) : -ENOSYS;
+    case SYS_SCHED_GETQOS:
+        return sched_get_qos ? (int64_t)sched_get_qos((uint32_t)a1) : -ENOSYS;
+
     default:
         serial_puts("[SYSCALL] Unknown syscall ");
         serial_putdec(nr);
