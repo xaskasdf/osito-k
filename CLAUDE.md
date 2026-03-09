@@ -181,6 +181,18 @@ arch/x86/kernel/smp.c               Multi-core startup (MADT parse, trampoline, 
 arch/x86/kernel/ap_trampoline.S     AP trampoline source (16→32→64 mode transition)
 arch/x86/kernel/dynlink.c            Dynamic linker (dl_open/dl_sym/dl_close, ELF relocation, kernel symbol export)
 arch/x86/kernel/shell.c             Interactive shell (18 builtins, argv parser, ELF exec)
+arch/x86/kernel/shm.c               Shared memory (handle-based, page-aligned, refcounted, GPU-scanout flag)
+arch/x86/kernel/compositor.c        Window compositor (60fps thread, surface list, damage tracking, direct scanout)
+arch/x86/kernel/display.c           Display subsystem (double buffer, VBlank sync, page flip, surface ops)
+arch/x86/kernel/input_events.c      Raw input event system (lock-free SPSC queue, TSC timestamps, coalescing)
+arch/x86/kernel/memcompress.c       WKdm page compression (4KB in-place, 2:1-4:1 ratio, ~1GB/s)
+arch/x86/drivers/ahci.c             SATA AHCI driver (detect, IDENTIFY, read/write/flush, polling)
+arch/x86/drivers/ahci.h             AHCI types + register definitions
+arch/x86/drivers/ccp.c              AMD CCP TRNG driver (PSP 1022:1486, hardware random from BAR2)
+arch/x86/drivers/xhci.c             xHCI USB 3.x driver (port enum, device address, HID mouse+keyboard polling)
+arch/x86/drivers/xhci.h             xHCI types + register definitions
+arch/x86/drivers/gpu_display.c      GPU display engine (GSP-RM channel alloc, push buffer, GOP takeover)
+arch/x86/drivers/gpu_display.h      GPU display types + API
 arch/x86/include/types.h            Freestanding types + MMIO + port I/O
 arch/x86/libc/crt.c                 Minimal CRT (_start, printf, malloc, POSIX I/O wrappers)
 arch/x86/libc/syscall.S             Raw SYSCALL instruction wrappers (__syscall1-4)
@@ -389,6 +401,11 @@ Tasks:   idle, input, shell (3 of 8 slots used)
 | **X-EDIT** | **Kilo text editor port** (ANSI CSI escape parser in framebuffer, extended PS/2 scancodes→VT100, termios raw mode, kb_getchar_safe with sti;hlt;cli, Ctrl+S save to OsitoFS) | Done |
 | **X-HTTPD** | **HTTP file server** (TCP passive open listen/accept, SYN_RCVD state, scheduler thread, directory listing, file serving with cli/sti NVMe guard, MIME types, `httpd` shell command) | Done |
 | **X-SELF** | **Self-hosting C compilation** (cc auto-links CRT+libc, ositok.h single header, -Wl,-section-alignment,0x1000 compact ELF, printf/malloc/file I/O/qsort, 7/7 QEMU tests pass) | Done |
+| **X-QOS** | **QoS priority scheduler** (5 classes IDLE→REALTIME, per-class quantum, priority preemption, sched_set/get_qos API, private syscalls 510-511) | Done |
+| **X-CCP** | **AMD CCP TRNG driver** (PSP [1022:1486], hardware random from BAR2, weak-linked into /dev/urandom + TLS PRNG) | Done |
+| **X-AHCI** | **SATA AHCI driver** (device detect, IDENTIFY, read/write/flush, polling-based, multi-port) | WIP |
+| **X-XHCI** | **xHCI USB 3.x driver** (port enum, device address, HID mouse+keyboard interrupt polling) | WIP |
+| **X-RETINA** | **Display pipeline** (shared memory IPC, input events, compositor thread, double-buffer display, WKdm page compression, GPU display engine) | WIP |
 
 > Full GPU roadmap (X27-X40 + contingency): see [docs/x86-gpu-roadmap.md](docs/x86-gpu-roadmap.md)
 > Full OS roadmap (Tiers 0-9): see [docs/os-selfhost-roadmap.md](docs/os-selfhost-roadmap.md)
@@ -1239,6 +1256,43 @@ Programs compiled AND executed entirely inside OsitoK — no host toolchain need
 - **Build flow**: Upload crt.o + syscall.o + tcclib.o + ositok.h to OsitoFS disk. Then `cc -run myapp.c` compiles and runs in one step.
 - **Verified**: selfbuild.c — 7/7 tests pass: printf format strings, malloc+fibonacci, string reverse, snprintf+getpid, qsort, file I/O round-trip (create+write+read+verify+delete), argc/argv. All inside OsitoK QEMU.
 - **Files**: `arch/x86/kernel/shell.c` (cc command), `arch/x86/libc/ositok.h` (single header), `arch/x86/libc/tcclib.c` (mprotect fix), `arch/x86/test/selfbuild.c` (7-test program)
+
+### X-QOS: QoS Priority Scheduler
+5-class priority scheduler with per-class quantum and priority preemption.
+- **QoS classes**: IDLE(0)=200ms, BACKGROUND(1)=100ms, DEFAULT(2)=50ms, INTERACTIVE(3)=20ms, REALTIME(4)=10ms. Higher class preempts lower even mid-quantum.
+- **Scheduler change** (`process.c`): `sched_tick()` now finds highest-QoS READY process (not just round-robin). Preemption: if a READY process has strictly higher QoS than current, it preempts immediately. Within same class, round-robin on quantum expiry.
+- **API**: `sched_set_qos(pid, qos)`, `sched_get_qos(pid)`, `sched_spawn_qos(name, entry, qos)`. pid=0 means current process.
+- **Inheritance**: fork and clone_thread inherit parent's QoS class.
+- **Syscalls**: Private SYS_SCHED_SETQOS(510), SYS_SCHED_GETQOS(511) in dispatch table (weak-linked).
+- **Files**: `arch/x86/kernel/process.c` (QoS classes, scheduler, API), `arch/x86/kernel/syscall.c` (private syscalls)
+
+### X-CCP: AMD CCP TRNG Driver
+Hardware true random number generator from AMD Cryptographic Co-Processor (PSP).
+- **Detection**: PCI device [1022:1486] (AMD family 17h CCP). BAR2 MMIO for TRNG registers.
+- **API**: `ccp_random()` returns fresh 64-bit hardware random value. `ccp_is_ready()` checks driver initialization.
+- **Integration**: Weak-linked into `/dev/urandom` PRNG (`syscall.c`) and TLS client PRNG (`tls.c`). Falls back to RDTSC xorshift64 when CCP not present.
+- **Files**: `arch/x86/drivers/ccp.c`, `arch/x86/kernel/syscall.c` (urandom integration), `arch/x86/kernel/tls.c` (TLS PRNG)
+
+### X-AHCI: SATA AHCI Driver (WIP)
+SATA host controller driver for AHCI-compatible controllers (Intel, AMD).
+- **Features**: Port detection, IDENTIFY command, read/write/flush via command list + FIS. Polling-based (no IRQs). Multiple port support.
+- **Files**: `arch/x86/drivers/ahci.c`, `arch/x86/drivers/ahci.h`
+
+### X-XHCI: xHCI USB 3.x Driver (WIP)
+USB host controller driver for xHCI (USB 3.x) controllers.
+- **Features**: Controller init, port enumeration, device addressing, USB HID mouse + keyboard polling via interrupt endpoints. Targets AMD 400 series [1022:43d5] and Matisse [1022:149c].
+- **Integration**: Injects input events into `input_events.c` and `keyboard.c` (kb_push/kb_push_esc exported).
+- **Files**: `arch/x86/drivers/xhci.c`, `arch/x86/drivers/xhci.h`
+
+### X-RETINA: Display Pipeline (WIP)
+Apple-inspired display and compositor infrastructure for native GUI support.
+- **Shared memory** (`shm.c`): Handle-based zero-copy IPC. Page-aligned regions, reference counted, GPU-scanout flag. Used by compositor to access application surfaces without pixel copies. Syscalls 500-506.
+- **Input events** (`input_events.c`): Lock-free SPSC ring buffer with TSC timestamps. Keyboard + mouse event types with coalescing. Sits between PS/2/xHCI hardware and compositor.
+- **Display subsystem** (`display.c`): Double-buffered display with VBlank synchronization. Phase 1: software double buffer over GOP framebuffer. Phase 2: GPU display engine page flip.
+- **Compositor** (`compositor.c`): 60fps kernel thread (QOS_INTERACTIVE). Composites application windows onto back buffer. Surface list, damage tracking, direct scanout optimization for fullscreen windows.
+- **GPU display engine** (`gpu_display.c`): GSP-RM display channel allocation, push buffer commands, GOP framebuffer takeover. Turing/Ampere/Ada support.
+- **Page compression** (`memcompress.c`): WKdm (Wilson-Kaplan Direct-Mapped) compression for 4KB RAM pages. 2:1–4:1 ratio, ~1GB/s. For memory pressure — compress background pages instead of eviction.
+- **Files**: `arch/x86/kernel/shm.c`, `arch/x86/kernel/input_events.c`, `arch/x86/kernel/display.c`, `arch/x86/kernel/compositor.c`, `arch/x86/drivers/gpu_display.c`, `arch/x86/drivers/gpu_display.h`, `arch/x86/kernel/memcompress.c`
 
 ### AArch64/SM8350 Port (arch/arm/)
 Reference bare-metal code for ASUS ROG Phone 5 (Snapdragon 888).
