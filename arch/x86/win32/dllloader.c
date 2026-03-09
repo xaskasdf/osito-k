@@ -302,16 +302,15 @@ PVOID dll_load(const char *dll_name, const BYTE *file_data, SIZE_T file_size)
 
     /* Call DllMain(DLL_PROCESS_ATTACH) if it has one */
     if (mod->dll_main && mod->image.IsDLL) {
-#ifdef TEST_HARNESS
-        /* In test harness, skip DllMain for PE32 DLLs — real 32-bit code
-         * can't execute in a 64-bit Linux process. We still validate import
-         * resolution; actual execution happens on bare metal via compat32. */
         if (mod->image.Is32Bit) {
-            serial_puts("[DLL] skipping DllMain for PE32 DLL (test harness)\n");
+            /* PE32 DLLs: DllMain is 32-bit code that can't be called from
+             * 64-bit mode directly. Defer initialization — the DLL will be
+             * used via compat32 thunks (INT 0x2E). Most DLLs work without
+             * DllMain, and UT99 DLLs use DllMain only for trivial setup.
+             * TODO: implement compat32_call() for proper 64→32 calls. */
+            serial_puts("[DLL] PE32 DLL — deferring DllMain (compat32)\n");
             mod->initialized = TRUE;
-        } else
-#endif
-        {
+        } else {
             serial_puts("[DLL] calling DllMain(ATTACH)\n");
 
             typedef BOOL (WINAPI *dll_main_fn)(PVOID hinstDLL, DWORD fdwReason, PVOID lpReserved);
@@ -341,8 +340,8 @@ void dll_unload(LOADED_MODULE *mod)
     mod->ref_count--;
     if (mod->ref_count > 0) return;
 
-    /* Call DllMain(DLL_PROCESS_DETACH) */
-    if (mod->dll_main && mod->initialized) {
+    /* Call DllMain(DLL_PROCESS_DETACH) — skip for PE32 DLLs */
+    if (mod->dll_main && mod->initialized && !mod->image.Is32Bit) {
         typedef BOOL (WINAPI *dll_main_fn)(PVOID, DWORD, PVOID);
         dll_main_fn entry = (dll_main_fn)mod->dll_main;
         entry(mod->image.ImageBase, DLL_PROCESS_DETACH, NULL);

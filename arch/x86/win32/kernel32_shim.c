@@ -551,6 +551,38 @@ BOOL WINAPI VirtualProtect(PVOID lpAddress, SIZE_T dwSize,
     return TRUE;
 }
 
+/* ── Memory query ──────────────────────────────────────────── */
+
+typedef struct _MEMORY_BASIC_INFORMATION_K32 {
+    PVOID       BaseAddress;
+    PVOID       AllocationBase;
+    ULONG       AllocationProtect;
+    USHORT      PartitionId;
+    USHORT      Padding0;
+    SIZE_T      RegionSize;
+    ULONG       State;
+    ULONG       Protect;
+    ULONG       Type;
+    ULONG       Padding1;
+} MEMORY_BASIC_INFORMATION_K32;
+
+SIZE_T WINAPI VirtualQuery(PVOID lpAddress, PVOID lpBuffer, SIZE_T dwLength)
+{
+    if (!lpBuffer || dwLength < sizeof(MEMORY_BASIC_INFORMATION_K32))
+        return 0;
+
+    SIZE_T ret_len = 0;
+    NTSTATUS status = NtQueryVirtualMemory(NT_CURRENT_PROCESS,
+                                            lpAddress, 0 /* MemoryBasicInformation */,
+                                            lpBuffer, dwLength, &ret_len);
+    if (!NT_SUCCESS(status)) {
+        set_last_error_from_status(status);
+        return 0;
+    }
+
+    return ret_len;
+}
+
 /* ── String API (commonly needed by CRT) ────────────────────── */
 
 int WINAPI lstrlenA(PCSTR lpString)
@@ -2063,6 +2095,7 @@ static const K32_EXPORT k32_exports[] = {
     { "SetFilePointer",          (PVOID)SetFilePointer },
     { "DuplicateHandle",         (PVOID)DuplicateHandle },
     { "VirtualProtect",          (PVOID)VirtualProtect },
+    { "VirtualQuery",            (PVOID)VirtualQuery },
     { "lstrlenA",                (PVOID)lstrlenA },
     { "lstrlenW",                (PVOID)lstrlenW },
     { "GetCommandLineA",         (PVOID)GetCommandLineA },

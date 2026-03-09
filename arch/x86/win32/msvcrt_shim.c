@@ -1524,6 +1524,31 @@ int* WINAPI crt_p_fmode(void)
     return &crt_fmode_val;
 }
 
+/* __C_specific_handler — x86-64 SEH handler (stub, no-op) */
+EXCEPTION_DISPOSITION WINAPI crt_C_specific_handler(
+    PEXCEPTION_RECORD ExceptionRecord,
+    PVOID EstablisherFrame,
+    PCONTEXT ContextRecord,
+    PVOID DispatcherContext)
+{
+    (void)ExceptionRecord; (void)EstablisherFrame;
+    (void)ContextRecord; (void)DispatcherContext;
+    return 1; /* ExceptionContinueSearch */
+}
+
+/* __initenv — pointer to initial environment (char **) */
+static char *crt_initenv_data[] = { NULL };
+static char **crt_initenv_val = crt_initenv_data;
+
+/* signal — install signal handler (stub, returns SIG_DFL) */
+typedef void (*crt_sighandler_t)(int);
+#define CRT_SIG_DFL ((crt_sighandler_t)0)
+crt_sighandler_t WINAPI crt_signal(int sig, crt_sighandler_t handler)
+{
+    (void)sig; (void)handler;
+    return CRT_SIG_DFL;
+}
+
 /* __setusermatherr — set math error handler (store, ignore) */
 static _UserMathErrFunc crt_usermatherr_handler = NULL;
 void WINAPI crt_setusermatherr(_UserMathErrFunc handler)
@@ -2120,6 +2145,11 @@ static const MSVCRT_EXPORT msvcrt_exports[] = {
     { "__dllonexit",         (PVOID)crt_dllonexit },
     { "__p__commode",        (PVOID)crt_p_commode },
     { "__p__fmode",          (PVOID)crt_p_fmode },
+    { "_commode",            (PVOID)&crt_commode_val },
+    { "_fmode",              (PVOID)&crt_fmode_val },
+    { "__C_specific_handler",(PVOID)crt_C_specific_handler },
+    { "__initenv",           (PVOID)&crt_initenv_val },
+    { "signal",              (PVOID)crt_signal },
     { "__setusermatherr",    (PVOID)crt_setusermatherr },
     { "_acmdln",             (PVOID)crt_acmdln },
     { "_adjust_fdiv",        (PVOID)crt_adjust_fdiv },
