@@ -140,18 +140,19 @@ JavaScript engine, y git nativo con SHA-1+zlib.
 Transformar OsitoK de un OS cooperative ring-0 a un OS preemptivo con las
 abstracciones necesarias para correr software real sin modificar.
 
-| ID | Feature | Descripción | ~Líneas | Deps |
-|----|---------|-------------|---------|------|
-| **X-SCHED** | **Scheduler preemptivo** | Timer-based context switch entre procesos. | ~800 | Ninguna | ✅ Done |
-| **X-MMAP** | **mmap/munmap/mprotect** | MAP_ANONYMOUS identity-mapped, VMA tracking. | ~1200 | X-SCHED | ✅ Done |
+| ID | Feature | Descripción | ~Líneas | Deps | Estado |
+|----|---------|-------------|---------|------|--------|
+| **X-SCHED** | **Scheduler preemptivo** | Timer-based round-robin, fake ISR frame spawn, RSP-swap context switch. | ~800 | Ninguna | ✅ Done |
+| **X-MMAP** | **mmap/munmap/mprotect** | MAP_ANONYMOUS identity-mapped, VMA tracking, page-level protection. | ~1200 | X-SCHED | ✅ Done |
 | **X-VFS** | **VFS layer** | /dev, /proc, getcwd, readlink, getdents64. | ~800 | Ninguna | ✅ Done |
 | **X-MUSL** | **Port musl libc** | musl 1.2.5 static + 20 new syscalls (TLS, time, signals). | ~500 glue | X-MMAP, X-VFS | ✅ Done |
+| **X-FORK** | **fork/wait4/execve** | Preemptive fork, parent state save/restore (RW segments, brk, FS_BASE, fd/sig/vma). | ~1200 | X-SCHED, X-MUSL | ✅ Done |
 | **X-THREAD** | **Threads (clone/futex)** | clone(CLONE_VM\|CLONE_THREAD), futex(WAIT/WAKE), set_tid_address, gettid. Per-thread stacks, TLS via arch_prctl ARCH_SET_FS. Usar SMP cores para threads reales. | ~1000 | X-SCHED, X-MMAP |
 | **X-EDIT** | **Port editor mínimo** | Portar un editor de texto (kilo ~1000LOC, o nano subset). Editar archivos desde OsitoK sin host. Necesita raw mode TTY + VT100 ANSI. | ~600 glue | X-MUSL |
 | **X-HTTPD** | **TCP server (listen/accept)** | Completar TCP stack: listen(), accept(), server sockets. Implementar HTTP server mínimo. Exponer servicios desde OsitoK a la red. | ~600 | Ninguna |
 | **X-SELF** | **Self-hosting completo** | Compilar el propio kernel x86 desde OsitoK. Requiere: TCC o GCC port, musl libc, gnu-efi headers, ld linker in-OS, make equivalent. Hito definitivo de un OS. | ~2000 | X-MUSL, X-EDIT |
 
-**Hito**: `busybox sh` (musl-static, ~1MB) corre dentro de OsitoK. Editor funcional.
+**Hito** ✅: `busybox sh` (musl-static, ~1MB) corre dentro de OsitoK. Applets cat/echo/uname funcionan.
 
 ### Tier 8: GPU + Inference Optimization
 
@@ -171,15 +172,114 @@ Cerrar el gap entre "funciona" y "es rápido". Validar en hardware real.
 
 Correr binarios Linux estáticos sin modificar. Ver `docs/binary-compat-roadmap.md`.
 
-| ID | Feature | Descripción | ~Líneas | Deps |
-|----|---------|-------------|---------|------|
-| **X-SYSCALL40** | **40 syscalls POSIX** | Completar las ~27 syscalls faltantes para binarios musl-static (stat, getdents64, clock_gettime, nanosleep, signals, fork/execve/wait4, socket API). | ~2000 | X-MMAP, X-THREAD |
-| **X-BUSYBOX** | **Run busybox** | Test target: `busybox sh`, `busybox ls`, `busybox cat`. Primer binario Linux no-trivial sin modificar. | ~200 test | X-SYSCALL40, X-MUSL |
+| ID | Feature | Descripción | ~Líneas | Deps | Estado |
+|----|---------|-------------|---------|------|--------|
+| **X-SYSCALL40** | **40 syscalls POSIX** | Completar las ~27 syscalls faltantes para binarios musl-static (stat, getdents64, clock_gettime, nanosleep, signals, fork/execve/wait4, socket API). | ~2000 | X-MMAP, X-THREAD | Parcial (~40 ya) |
+| **X-BUSYBOX** | **Run busybox** | Test target: `busybox sh`, `busybox ls`, `busybox cat`. Primer binario Linux no-trivial sin modificar. | ~200 test | X-SYSCALL40, X-MUSL | ✅ Parcial (ash+cat+echo+uname) |
 | **X-SOCKET** | **Socket syscalls** | socket(AF_INET), connect, sendto, recvfrom, bind, listen, accept. Wrapper sobre TCP/UDP stack existente. Expone red via interfaz POSIX. | ~800 | X-HTTPD |
 | **X-SIGNAL** | **Señales completas** | rt_sigaction, rt_sigprocmask, rt_sigreturn, sigframe en user stack. Signal delivery en syscall return + timer tick. | ~1000 | X-SCHED |
 | **X-PE** | **Windows PE loader** | PE/COFF loader + NT syscall translation (Phase 3 del binary-compat-roadmap). Largo plazo. | ~5000+ | X-SYSCALL40 |
 
-**Hito**: `busybox sh` interactivo. Luego: static Go binaries, toybox.
+**Hito** ✅ (parcial): `busybox sh` interactivo con cat/echo/uname. Falta: id, ls, más applets.
+
+---
+
+## Arquitectura MMU Virtual — Análisis y Diseño
+
+### Contexto: por qué considerar MMU virtual
+
+El modelo identity-mapped actual (virt == phys) funciona para inference y proceso
+único, pero causa problemas crecientes con fork+execve:
+- Parent state save/restore para RW segments, brk, FS_BASE, fd/sig/vma (~170 LOC de hacks)
+- No soporta dos instancias del mismo binario en paralelo (un solo set de páginas físicas)
+- Cada nueva pieza de estado per-proceso requiere agregar save/restore manual
+
+### Ventajas del MMU virtual (per-process address spaces)
+
+| Ventaja | Impacto |
+|---------|---------|
+| **Fork+execve trivial** | Child carga en 0x400000 → páginas físicas distintas. Parent intacto. Elimina TODO el save/restore. |
+| **COW fork** | fork() solo clona page tables (~20KB), marca páginas read-only. #PF copia on-write. Más rápido que copiar 32KB de stack. |
+| **brk/mmap aislados** | Cada proceso tiene su propio rango, naturalmente. No hay globals compartidos. |
+| **Seguridad** | User process no puede leer kernel memory (bit supervisor en PTEs). |
+| **Procesos concurrentes** | Múltiples binarios distintos pueden ejecutar en paralelo sin conflicto de VAs. |
+| **Elimina hacks** | `saved_parent`, `elf_fork_restore`, `mem_reserve_range` fallback, frame pointer relocation — todo innecesario. |
+
+### Desventajas del MMU virtual
+
+| Desventaja | Impacto |
+|------------|---------|
+| **Refactor extenso** | El kernel necesita higher-half mapping (0xFFFF800000000000+). ~30 archivos asumen phys==virt. |
+| **TLB flush** | CR3 switch en context switch invalida TLB. PCID mitiga pero es complejo. |
+| **Page tables por proceso** | ~20KB por proceso mínimo (PML4 + PDPT + PD + PT para mapear 0-8MB). |
+| **DMA/MMIO** | NVMe, GPU, I211 necesitan direcciones físicas. Hay que distinguir kernel VA vs phys addr. |
+| **Kernel↔user copies** | Necesita `copy_from_user`/`copy_to_user` explícitos (o mapear kernel en todos los address spaces). |
+| **GPU inference perf** | PRAMIN writes, CE DMA, tensor buffers — todo trabaja con direcciones físicas. Agregar traducción penaliza hot paths. |
+
+### Diseño propuesto: Split Address Space (sin afectar kernel hot paths)
+
+La clave es que el **kernel y los drivers se quedan identity-mapped** — solo el
+user-space vive en un address space virtual separado.
+
+```
+Per-process page tables (un CR3 por proceso):
+
+  0xFFFF800000000000+  Kernel identity map (compartido entre todos los procesos)
+  │                    Mismas PDPT entries, solo se clonan los primeros 2 niveles.
+  │                    phys == virt - KERNEL_VBASE  →  todos los drivers, DMA, GPU
+  │                    funcionan EXACTAMENTE igual. Solo cambian por un offset constante.
+  │
+  0x0000000000400000   User process A  →  mapea a phys pages libres (ej. 0x2000000)
+  0x0000000000400000   User process B  →  mapea a phys pages libres (ej. 0x2200000)
+                       Misma VA, distintas PA. CR3 switch en scheduler.
+```
+
+### Implementación en fases (sin romper nada existente)
+
+**Fase 0: Preparación (no-op funcional)**
+- Definir `KERNEL_VBASE 0xFFFF800000000000ULL`
+- Agregar macros `PHYS_TO_VIRT(p)` / `VIRT_TO_PHYS(v)` como identidad inicialmente
+- Ir reemplazando accesos a punteros crudos por las macros en drivers
+- **El kernel sigue funcionando igual** — las macros son no-op
+
+**Fase 1: Higher-half kernel mapping**
+- En `paging_init()`, mapear también la RAM en 0xFFFF800000000000+
+- Linker script: no cambiar nada, el kernel sigue cargando bajo en memoria
+- Test: acceder a datos via `PHYS_TO_VIRT(addr)` funciona idénticamente
+
+**Fase 2: Per-process page tables para user space**
+- `proc_create_address_space()`: crea PML4 con upper-half del kernel copiado
+- `elf_load_segments()`: alloca páginas libres, las mapea en el PML4 del proceso
+- `sched_tick()`: hace CR3 switch al PML4 del proceso siguiente
+- **El kernel code sigue usando identity-mapped addresses** — zero impact en inference
+
+**Fase 3: Fork con COW**
+- `proc_fork()`: clona page tables del lower half, marca pages read-only
+- #PF handler: si la página es COW, alloca nueva página, copia, remapea writable
+- Eliminar todo el save/restore de X-FORK
+
+### Invariante de rendimiento: kernel hot paths intactos
+
+El diseño garantiza que:
+- `nvme_read(lba, count, buf)` — `buf` es dirección física directa (identity map en upper half)
+- `gpu_write(reg, val)` — BAR0 MMIO sigue siendo phys addr directa
+- PRAMIN window reads/writes — idéntico
+- CE DMA transfers — src/dst son phys addr, no se traducen
+- tensor buffer allocation — `mem_alloc_pages()` devuelve phys, GPU ve la misma addr
+
+El único cambio es que el kernel accede a esas direcciones como `phys + KERNEL_VBASE`
+en vez de `phys`, pero el compilador optimiza `phys + constante` a una sola instrucción.
+No hay table walk, no hay TLB miss, no hay overhead medible.
+
+### Prioridad
+
+**No es urgente.** El save/restore actual funciona para busybox ash applets.
+Implementar cuando:
+1. Se necesiten dos binarios distintos ejecutando en paralelo con preemption
+2. El save/restore se vuelva insostenible (cada nuevo global = nuevo bug)
+3. Se implemente `clone(CLONE_VM)` para threads reales (requiere address space propio)
+
+**Estimación**: ~800 líneas total (Fase 0-2). ~400 líneas más para COW (Fase 3).
 
 ---
 
@@ -305,7 +405,7 @@ Cross-compilar primero, luego self-host. TCC es el path más rápido al bootstra
 | Tier 5 | 5 | ✅ Completo |
 | Tier 6 | 5 | ✅ Completo |
 | Extras | 4 | ✅ Completo |
-| **Tier 7** | **8** | **← Siguiente** |
-| **Tier 8** | **5** | Paralelizable |
-| **Tier 9** | **5** | Largo plazo |
-| **Total** | **52** | 34 done, 18 pendientes |
+| Tier 7 | 5/9 | ✅ Parcial (SCHED+MMAP+VFS+MUSL+FORK done) |
+| **Tier 8** | **5** | **Paralelizable** |
+| Tier 9 | 1/5 | Parcial (BUSYBOX ash parcial) |
+| **Total** | **53** | 39 done, 14 pendientes |
