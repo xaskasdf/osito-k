@@ -238,6 +238,7 @@ static void cmd_help(void)
     sh_puts("  git       Version control (init/add/commit/log/status/diff/branch/checkout)\n");
     sh_puts("  sched     Scheduler test (sched [stats])\n");
     sh_puts("  httpd     HTTP server (httpd [port] / httpd stop)\n");
+    sh_puts("  winexec   Run a Win32 PE executable (winexec file.exe)\n");
     sh_puts("  clear     Clear screen\n");
     sh_puts("  reboot    Reboot system\n");
     sh_puts("  halt      Halt CPU\n");
@@ -1735,6 +1736,13 @@ static void shell_exec(char *line)
         }
     } else if (strcmp(cmd, "httpd") == 0) {
         cmd_httpd(argc, argv);
+    } else if (strcmp(cmd, "winexec") == 0) {
+        if (argc < 2) {
+            sh_puts("Usage: winexec <file.exe>\n");
+        } else {
+            extern int win32_exec(const char *filename);
+            win32_exec(argv[1]);
+        }
     } else if (strcmp(cmd, "clear") == 0) {
         cmd_clear();
     } else if (strcmp(cmd, "reboot") == 0) {

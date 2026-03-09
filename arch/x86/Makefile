@@ -63,14 +63,26 @@ KERN_SRC = kernel/main.c kernel/serial.c kernel/framebuffer.c \
 ASM_SRC  = kernel/isr_stubs.S kernel/syscall_entry.S kernel/setjmp.S
 DRV_SRC  = drivers/nvme.c drivers/i211.c drivers/gpu.c drivers/gsp.c drivers/sass.c drivers/gmmu.c drivers/gpu_tensor.c drivers/gpu_inference.c
 FS_SRC   = fs/ositofs2.c fs/gpt.c fs/gguf.c
+WIN32_SRC = win32/win32_init.c win32/compat32.c win32/pe.c win32/winexec.c \
+            win32/handle.c win32/ntsyscall.c win32/ntprocess.c win32/ntsync.c \
+            win32/dllloader.c \
+            win32/kernel32_shim.c win32/ntdll_shim.c win32/msvcrt_shim.c \
+            win32/user32_shim.c win32/gdi32_shim.c win32/advapi32_shim.c \
+            win32/ddraw_shim.c win32/dsound_shim.c \
+            win32/ole32_shim.c win32/shell32_shim.c \
+            win32/comctl32_shim.c win32/comdlg32_shim.c \
+            win32/winmm_shim.c win32/wsock32_shim.c
+WIN32_ASM = win32/int2e_stub.S
 
 EFI_OBJ  = $(BUILD)/efi_main.o
 KERN_OBJ = $(KERN_SRC:%.c=$(BUILD)/%.o)
 ASM_OBJ  = $(ASM_SRC:%.S=$(BUILD)/%.o)
 DRV_OBJ  = $(DRV_SRC:%.c=$(BUILD)/%.o)
 FS_OBJ   = $(FS_SRC:%.c=$(BUILD)/%.o)
+WIN32_OBJ = $(WIN32_SRC:%.c=$(BUILD)/%.o)
+WIN32_ASM_OBJ = $(WIN32_ASM:%.S=$(BUILD)/%.o)
 
-ALL_OBJ  = $(EFI_OBJ) $(KERN_OBJ) $(ASM_OBJ) $(DRV_OBJ) $(FS_OBJ)
+ALL_OBJ  = $(EFI_OBJ) $(KERN_OBJ) $(ASM_OBJ) $(DRV_OBJ) $(FS_OBJ) $(WIN32_OBJ) $(WIN32_ASM_OBJ)
 
 TARGET   = $(BUILD)/ositok.efi
 SO       = $(BUILD)/ositok.so
@@ -115,8 +127,16 @@ $(BUILD)/drivers/%.o: drivers/%.c | $(BUILD)/drivers
 $(BUILD)/fs/%.o: fs/%.c | $(BUILD)/fs
 	$(CC) $(KCFLAGS) -c -o $@ $<
 
+# Win32 compatibility layer
+$(BUILD)/win32/%.o: win32/%.c | $(BUILD)/win32
+	$(CC) $(KCFLAGS) -Iwin32 -c -o $@ $<
+
+# Win32 assembly
+$(BUILD)/win32/%.o: win32/%.S | $(BUILD)/win32
+	$(CC) -c -o $@ $<
+
 # Create build directories
-$(BUILD)/boot $(BUILD)/kernel $(BUILD)/drivers $(BUILD)/fs:
+$(BUILD)/boot $(BUILD)/kernel $(BUILD)/drivers $(BUILD)/fs $(BUILD)/win32:
 	mkdir -p $@
 
 clean:

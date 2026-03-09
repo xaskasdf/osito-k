@@ -50,7 +50,7 @@ _Static_assert(sizeof(idt_entry_t) == 16, "IDT entry must be 16 bytes");
 
 /* ── IDT table (256 entries, 16 bytes each = 4KB) ───────────── */
 
-static idt_entry_t idt[256] __attribute__((aligned(16)));
+idt_entry_t idt[256] __attribute__((aligned(16)));
 static idt_ptr_t   idtr;
 
 /* ── Interrupt frame pushed by CPU + our stub ────────────────── */
@@ -203,9 +203,9 @@ static inline void wrmsr(uint32_t msr, uint64_t val) {
  */
 
 #define GDT_MAX_ENTRIES 32
-static uint64_t kernel_gdt[GDT_MAX_ENTRIES] __attribute__((aligned(16)));
+uint64_t kernel_gdt[GDT_MAX_ENTRIES] __attribute__((aligned(16)));
 
-static struct __attribute__((packed)) {
+struct __attribute__((packed)) {
     uint16_t limit;
     uint64_t base;
 } kernel_gdtr;

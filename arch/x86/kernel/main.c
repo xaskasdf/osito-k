@@ -52,6 +52,9 @@ extern void smp_init(void);
 /* Dynamic linker */
 extern void dl_init(void);
 
+/* Win32 compatibility layer */
+extern void win32_init(void);
+
 /* Serial */
 extern void serial_puts(const char *s);
 extern void serial_puthex(uint64_t val, int digits);
@@ -304,6 +307,9 @@ void kernel_entry(void *memory_map, uint64_t map_size,
 
     /* ── Step 1.10: Dynamic linker ── */
     dl_init();
+
+    /* ── Step 1.11: Win32 compatibility layer ── */
+    win32_init();
 
     /* ── Crypto self-test ── */
     {
