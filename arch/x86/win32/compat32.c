@@ -24,6 +24,12 @@ extern void serial_puts(const char *s);
 extern void serial_puthex(uint64_t val, int digits);
 extern void serial_putdec(uint64_t val);
 extern void *mem_alloc_pages(uint64_t count);
+extern int  kern_setjmp(uint64_t *buf);
+extern void kern_longjmp(uint64_t *buf, int val);
+
+/* ── Global compat32 mode flag ────────────────────────────────── */
+
+int g_compat32_mode = 0;
 
 /* ── Thunk state ─────────────────────────────────────────────── */
 
@@ -35,6 +41,53 @@ static uint8_t *thunk_pool = NULL;
 static uint32_t thunk_count = 0;
 
 static compat32_thunk_t thunk_table[COMPAT32_MAX_THUNKS];
+
+/* ── FName::Names diagnostic ────────────────────────────────── */
+/*
+ * Address of FName::Names TArray<FNameEntry*> in Core.dll.
+ * Stored during IAT patching for diagnostic dumps.
+ * Layout: { FNameEntry** Data; INT Num; INT Max; } — 12 bytes.
+ */
+uint32_t g_fname_names_addr = 0;
+uint32_t g_gmalloc_addr = 0;
+
+/* ── Callback mechanism (64-bit → 32-bit → 64-bit) ─────────── */
+
+/*
+ * Magic thunk index for callback return. When the INT 0x2E handler
+ * sees this index, it longjmps back to the caller instead of
+ * dispatching to a shim function.
+ */
+#define THUNK_CALLBACK_RETURN  0xFFFFFFFE
+
+/* Return stub address (32-bit code in thunk pool that INT 0x2Es back) */
+static uint32_t callback_return_stub_addr = 0;
+
+/*
+ * Reentrant callback support.
+ *
+ * DllMain's CRT init calls _initterm which invokes compat32_callback()
+ * for each C++ constructor — while the DllMain callback itself is still
+ * active. Without nesting support, the inner callback overwrites the
+ * outer's jmpbuf and stack, causing a #GP on return.
+ *
+ * We support up to MAX_CALLBACK_DEPTH nested callbacks, each with its
+ * own jmpbuf, return value, and stack.
+ */
+#define MAX_CALLBACK_DEPTH    32
+#define CALLBACK_STACK_SIZE   16384
+
+static int      callback_depth = 0;
+static uint64_t callback_jmpbufs[MAX_CALLBACK_DEPTH][8];
+static uint8_t  callback_stacks[MAX_CALLBACK_DEPTH][CALLBACK_STACK_SIZE]
+    __attribute__((aligned(16)));
+
+/*
+ * Single global retval written by the 32-bit return stub (MOV [addr], EAX).
+ * The stub uses a fixed address so we can't index by depth there.
+ * The dispatch handler reads this and stores it before longjmp.
+ */
+static uint32_t callback_retval = 0;
 
 /* ── Thunk code generation ───────────────────────────────────── */
 
@@ -60,56 +113,11 @@ static compat32_thunk_t thunk_table[COMPAT32_MAX_THUNKS];
  * This is the "Heaven's Gate" technique.
  */
 
-static void emit_thunk(uint8_t *code, uint64_t target, uint8_t num_args)
+static void emit_thunk(uint8_t *code, uint64_t target, uint8_t num_args, uint8_t callconv)
 {
     int p = 0;
 
-    /*
-     * Strategy: generate a small 64-bit stub that:
-     *   1. Saves the stack frame
-     *   2. Reads cdecl args from the old stack
-     *   3. Sets up ms_abi registers + shadow space
-     *   4. Calls the 64-bit target
-     *   5. Returns to caller
-     *
-     * On the test harness, this runs as 64-bit code directly.
-     * On OsitoK bare metal, the INT 0x2E path handles mode switching
-     * so the thunk itself is still 64-bit code placed in the IAT.
-     *
-     * For bare-metal compat mode, each IAT entry actually points to a
-     * small 32-bit stub that does:
-     *   push <syscall_number>
-     *   int 0x2E
-     *   ret <N*4>
-     * And the INT 0x2E handler on the kernel side does the marshaling.
-     * This is the Windows WoW64/ntdll model.
-     */
-
 #ifdef TEST_HARNESS
-    /*
-     * Test harness path: PE32 runs in 64-bit mode, IAT has 64-bit ptrs
-     * truncated to 32 bits. The PE32 code does CALL [IAT] which jumps here.
-     * We're in 64-bit mode, so we can just do the register marshaling.
-     *
-     * cdecl on x86-64: args are still on stack (PE32 code pushes them).
-     * Since PE32 code uses 32-bit PUSH, they're at [RSP+8], [RSP+12], etc.
-     * (after the 4-byte return address, zero-extended to 8 bytes by CPU).
-     *
-     * Actually: on x86-64 host, the PE32 code is loaded but runs as 64-bit.
-     * The CALL [IAT_entry] pushes an 8-byte return address.
-     * PE32 cdecl args were pushed as 4-byte values, but in 64-bit mode
-     * PUSH imm32 sign-extends to 8 bytes. So stack layout is:
-     *   [RSP+0]: return address (8 bytes)
-     *   [RSP+8]: arg1 (8 bytes, only low 32 valid)
-     *   [RSP+16]: arg2 ...
-     *
-     * We generate: movabs rax, <target>; jmp rax
-     * This works because the PE32 code already pushed args in the right
-     * order for cdecl, and our shim functions handle both conventions
-     * due to the ms_abi attribute (which on Linux x86-64 test harness
-     * is also the standard convention).
-     */
-
     /* movabs rax, target (10 bytes) */
     code[p++] = 0x48;  /* REX.W */
     code[p++] = 0xB8;  /* MOV RAX, imm64 */
@@ -124,17 +132,12 @@ static void emit_thunk(uint8_t *code, uint64_t target, uint8_t num_args)
     /*
      * OsitoK bare-metal path: PE32 code runs in 32-bit compat mode.
      * The thunk is 32-bit code that does INT 0x2E to enter the kernel.
-     * We use a convention: EAX = thunk index, ECX = arg count.
-     * The kernel's INT 0x2E handler reads the index, looks up the
-     * target function, marshals args, calls it in 64-bit mode.
-     *
-     * Alternatively (simpler): each thunk encodes a unique syscall
-     * number that maps to the shim function via a dispatch table.
+     * EAX = thunk index, ECX = arg count.
      */
 
-    /* MOV EAX, <thunk_index> — tells the kernel which function to call */
+    /* MOV EAX, <thunk_index> */
     code[p++] = 0xB8;
-    uint32_t idx = thunk_count;  /* will be incremented after emit */
+    uint32_t idx = thunk_count;
     code[p++] = (uint8_t)(idx);
     code[p++] = (uint8_t)(idx >> 8);
     code[p++] = (uint8_t)(idx >> 16);
@@ -151,14 +154,22 @@ static void emit_thunk(uint8_t *code, uint64_t target, uint8_t num_args)
     code[p++] = 0xCD;
     code[p++] = 0x2E;
 
-    /* RET <num_args * 4> (cdecl caller cleanup — some Win32 funcs are stdcall) */
-    if (num_args > 0) {
-        code[p++] = 0xC2;
+    /*
+     * Calling convention determines stack cleanup:
+     *   stdcall (Win32 API): callee cleans → RET N  (C2 xx xx)
+     *   cdecl   (MSVCRT):    caller cleans → RET    (C3)
+     *
+     * CRITICAL: Using RET N for cdecl functions causes double cleanup —
+     * the thunk pops N bytes, then the caller also does add esp,N or pop.
+     * This corrupts the stack and causes wild jumps after a few calls.
+     */
+    if (callconv == CC_CDECL || num_args == 0) {
+        code[p++] = 0xC3;  /* RET — caller will clean up args */
+    } else {
+        code[p++] = 0xC2;  /* RET imm16 — callee cleans (stdcall) */
         uint16_t cleanup = (uint16_t)(num_args * 4);
         code[p++] = (uint8_t)(cleanup);
         code[p++] = (uint8_t)(cleanup >> 8);
-    } else {
-        code[p++] = 0xC3;  /* RET */
     }
 #endif
 
@@ -196,9 +207,52 @@ void compat32_init(void)
     mprotect(thunk_pool, THUNK_POOL_PAGES * 4096,
              PROT_READ | PROT_WRITE | PROT_EXEC);
 #endif
+
+#ifndef TEST_HARNESS
+    /*
+     * Install a "callback return stub" at the END of the thunk pool.
+     * This is a 32-bit code snippet that a compat-mode function RETs to.
+     * It saves EAX (function return value) to a known address, then
+     * does INT 0x2E with a magic index to signal "callback complete".
+     *
+     * Code (18 bytes):
+     *   A3 xx xx xx xx       MOV [callback_retval], EAX  ; save return value
+     *   B8 FE FF FF FF       MOV EAX, 0xFFFFFFFE  (THUNK_CALLBACK_RETURN)
+     *   B9 00 00 00 00       MOV ECX, 0
+     *   CD 2E                INT 0x2E
+     *   F4                   HLT  (should never reach here)
+     */
+    {
+        uint8_t *stub = thunk_pool + (THUNK_POOL_PAGES * 4096) - 24;
+        uint32_t retval_addr = (uint32_t)(ULONG_PTR)&callback_retval;
+        int p = 0;
+        stub[p++] = 0xA3;  /* MOV [moffs32], EAX */
+        stub[p++] = (uint8_t)(retval_addr);
+        stub[p++] = (uint8_t)(retval_addr >> 8);
+        stub[p++] = (uint8_t)(retval_addr >> 16);
+        stub[p++] = (uint8_t)(retval_addr >> 24);
+        stub[p++] = 0xB8;  /* MOV EAX, imm32 */
+        stub[p++] = 0xFE; stub[p++] = 0xFF; stub[p++] = 0xFF; stub[p++] = 0xFF;
+        stub[p++] = 0xB9;  /* MOV ECX, 0 */
+        stub[p++] = 0x00; stub[p++] = 0x00; stub[p++] = 0x00; stub[p++] = 0x00;
+        stub[p++] = 0xCD; stub[p++] = 0x2E;  /* INT 0x2E */
+        stub[p++] = 0xF4;  /* HLT */
+        callback_return_stub_addr = (uint32_t)(ULONG_PTR)stub;
+        serial_puts("[COMPAT32] Callback return stub at 0x");
+        serial_puthex(callback_return_stub_addr, 8);
+        serial_puts("\n");
+    }
+#endif
 }
 
 uint32_t compat32_make_thunk(uint64_t target, const char *name, uint8_t num_args)
+{
+    /* Default to stdcall for backwards compatibility */
+    return compat32_make_thunk_ex(target, name, num_args, CC_STDCALL);
+}
+
+uint32_t compat32_make_thunk_ex(uint64_t target, const char *name,
+                                 uint8_t num_args, uint8_t callconv)
 {
     if (!thunk_pool) return 0;
     if (thunk_count >= COMPAT32_MAX_THUNKS) {
@@ -210,12 +264,13 @@ uint32_t compat32_make_thunk(uint64_t target, const char *name, uint8_t num_args
     uint8_t *stub = thunk_pool + (idx * THUNK_STUB_SIZE);
 
     /* Generate thunk code */
-    emit_thunk(stub, target, num_args);
+    emit_thunk(stub, target, num_args, callconv);
 
     /* Record in table */
     thunk_table[idx].thunk_addr  = (uint32_t)(ULONG_PTR)stub;
     thunk_table[idx].target_addr = target;
     thunk_table[idx].num_args    = num_args;
+    thunk_table[idx].callconv    = callconv;
     thunk_table[idx].name        = name;
 
     thunk_count++;
@@ -271,6 +326,46 @@ static uint8_t guess_num_args(const char *name)
         { "CreateDirectoryA",     2 }, { "SetCurrentDirectoryA",  1 },
         { "GetCurrentDirectoryA", 2 }, { "GetFullPathNameA",      4 },
         { "OutputDebugStringA",   1 },
+        { "MultiByteToWideChar",  6 }, { "WideCharToMultiByte",  8 },
+        { "GetModuleFileNameA",   3 }, { "GetModuleFileNameW",   3 },
+        { "GetStdHandle",         1 }, { "SetStdHandle",         2 },
+        { "GetFileType",          1 }, { "SetHandleCount",       1 },
+        { "GetEnvironmentStringsW", 0 }, { "FreeEnvironmentStringsW", 1 },
+        { "GetACP",               0 }, { "GetOEMCP",             0 },
+        { "GetCPInfo",            2 }, { "IsValidCodePage",      1 },
+        { "GetStringTypeW",       5 }, { "LCMapStringW",         6 },
+        { "GetLocaleInfoA",       4 }, { "GetLocaleInfoW",       4 },
+        { "GetUserDefaultLCID",   0 }, { "IsDBCSLeadByte",       1 },
+        { "FlushFileBuffers",     1 }, { "SetEndOfFile",         1 },
+        { "GetConsoleMode",       2 }, { "SetConsoleMode",       2 },
+        { "WriteConsoleA",        5 }, { "WriteConsoleW",        5 },
+        { "SetUnhandledExceptionFilter", 1 },
+        { "UnhandledExceptionFilter",    1 },
+        { "IsBadReadPtr",         2 }, { "IsBadWritePtr",        2 },
+        { "IsBadCodePtr",         1 },
+        { "HeapReAlloc",          4 }, { "HeapSize",             3 },
+        { "RtlUnwind",            4 },
+        { "CreateThread",         6 }, { "ExitThread",           1 },
+        { "ResumeThread",         1 }, { "SuspendThread",        1 },
+        { "SetThreadPriority",    2 }, { "GetThreadPriority",    1 },
+        { "GetExitCodeThread",    2 }, { "TerminateThread",      2 },
+        { "GetPrivateProfileStringA", 6 },
+        { "GetPrivateProfileIntA",    4 },
+        { "WritePrivateProfileStringA", 4 },
+        { "GlobalAlloc",          2 }, { "GlobalFree",           1 },
+        { "GlobalLock",           1 }, { "GlobalUnlock",         1 },
+        { "LocalAlloc",           2 }, { "LocalFree",            1 },
+        { "GetModuleHandleExA",   3 },
+        { "IsProcessorFeaturePresent", 1 },
+        { "GetTimeZoneInformation",    1 },
+        { "FormatMessageA",       7 }, { "FormatMessageW",        7 },
+        { "CompareStringA",       6 }, { "CompareStringW",        6 },
+        { "GetDiskFreeSpaceA",    5 }, { "GetVolumeInformationA", 8 },
+        { "GetTempPathA",         2 }, { "GetTempFileNameA",      4 },
+        { "MoveFileA",            2 }, { "CopyFileA",             3 },
+        { "GetFileAttributesA",   1 }, { "SetFileAttributesA",    2 },
+        { "GetPrivateProfileSectionNamesA", 3 },
+        { "GetComputerNameA",     2 },
 
         /* user32 */
         { "RegisterClassA",       1 }, { "RegisterClassExA",      1 },
@@ -316,9 +411,19 @@ static uint8_t guess_num_args(const char *name)
         { "strncpy",              3 }, { "strcmp",                 2 },
         { "strncmp",              3 }, { "strcat",                2 },
         { "strchr",               2 }, { "strrchr",               2 },
-        { "strstr",               2 }, { "sprintf",               0 },
-        { "printf",               0 }, { "fprintf",               0 },
-        { "sscanf",               0 }, { "atoi",                  1 },
+        { "strstr",               2 },
+        /* Variadic printf: nargs=12 to capture all possible args from
+         * the 32-bit stack. ms_va_start/ms_va_arg on the zero-extended
+         * args works correctly for int and pointer types. */
+        { "sprintf",             12 }, { "_snprintf",             12 },
+        { "printf",              12 }, { "fprintf",               12 },
+        { "sscanf",              12 },
+        /* v*printf: va_list is a 32-bit pointer (1 arg). The 64-bit
+         * shim walks it with uint32_t* via do_vformat32. */
+        { "vprintf",              2 }, { "vsprintf",               3 },
+        { "_vsnprintf",           4 }, { "vfprintf",               3 },
+        { "_vsnwprintf",          4 },
+        { "atoi",                  1 },
         { "atof",                 1 }, { "strtol",                3 },
         { "strtod",               2 }, { "abs",                   1 },
         { "fopen",                2 }, { "fclose",                1 },
@@ -329,6 +434,12 @@ static uint8_t guess_num_args(const char *name)
         { "time",                 1 }, { "clock",                 0 },
         { "srand",                1 }, { "rand",                  0 },
         { "_beginthreadex",       6 }, { "_endthreadex",          1 },
+        { "_CxxThrowException",   2 }, { "__CxxFrameHandler",     4 },
+        { "__CxxFrameHandler3",   4 }, { "__CxxFrameHandler4",    4 },
+        { "_except_handler3",     4 }, { "_except_handler4",      4 },
+        { "RaiseException",       4 }, { "_XcptFilter",           2 },
+        { "_purecall",            0 }, { "abort",                 0 },
+        { "_amsg_exit",           1 },
 
         /* ddraw */
         { "DirectDrawCreate",     3 }, { "DirectDrawCreateEx",    4 },
@@ -359,6 +470,87 @@ static uint8_t guess_num_args(const char *name)
 
     /* Default: assume 4 args (common for many Win32 APIs) */
     return 4;
+}
+
+/*
+ * Determine calling convention from DLL name.
+ * Win32 API DLLs use stdcall (callee cleanup).
+ * MSVCRT and C runtime DLLs use cdecl (caller cleanup).
+ */
+static uint8_t dll_calling_convention(const char *dll_name)
+{
+    if (!dll_name) return CC_STDCALL;
+
+    /* Case-insensitive prefix check for MSVCRT variants */
+    const char *d = dll_name;
+    char low[16];
+    int i;
+    for (i = 0; i < 15 && d[i]; i++) {
+        char c = d[i];
+        low[i] = (c >= 'A' && c <= 'Z') ? c + 32 : c;
+    }
+    low[i] = '\0';
+
+    /* MSVCRT, MSVCR70, MSVCR71, MSVCR80, MSVCR90, MSVCR100, MSVCR110, MSVCR120, MSVCR140 */
+    if (low[0]=='m' && low[1]=='s' && low[2]=='v' && low[3]=='c')
+        return CC_CDECL;
+
+    /* ucrtbase.dll (Universal CRT) */
+    if (low[0]=='u' && low[1]=='c' && low[2]=='r' && low[3]=='t')
+        return CC_CDECL;
+
+    return CC_STDCALL;
+}
+
+/*
+ * Check if a DLL name is one of our built-in shims (64-bit kernel code).
+ * Imports from shim DLLs need INT 0x2E thunks.
+ * Imports from real PE32 DLLs (e.g. Core.dll, Engine.dll) are direct 32-bit calls.
+ */
+static int is_shim_dll(const char *dll_name)
+{
+    if (!dll_name) return 0;
+
+    /* Lowercase first 16 chars */
+    char low[16];
+    int i;
+    for (i = 0; i < 15 && dll_name[i]; i++) {
+        char c = dll_name[i];
+        low[i] = (c >= 'A' && c <= 'Z') ? c + 32 : c;
+    }
+    low[i] = '\0';
+
+    /* Known shim DLLs (our 64-bit implementations) */
+    static const char *shim_names[] = {
+        "kernel32", "ntdll", "msvcrt", "msvcr",
+        "user32", "gdi32", "advapi32",
+        "ddraw", "dsound", "ole32", "oleaut32",
+        "shell32", "comctl32", "comdlg32",
+        "winmm", "wsock32", "ws2_32",
+        "ucrtbase", "vcruntime",
+        NULL
+    };
+
+    /* Strip .dll extension from low */
+    int len = i;
+    if (len > 4 && low[len-4]=='.' && low[len-3]=='d' &&
+        low[len-2]=='l' && low[len-1]=='l')
+        low[len-4] = '\0';
+
+    for (int j = 0; shim_names[j]; j++) {
+        const char *a = low, *b = shim_names[j];
+        while (*a && *b && *a == *b) { a++; b++; }
+        if (*a == '\0' && *b == '\0') return 1;
+        /* Also check prefix match for msvcr* */
+        if (shim_names[j][0]=='m' && shim_names[j][4]=='r' &&
+            shim_names[j][5]=='\0') {
+            /* "msvcr" prefix — check if low starts with it */
+            if (low[0]=='m' && low[1]=='s' && low[2]=='v' &&
+                low[3]=='c' && low[4]=='r')
+                return 1;
+        }
+    }
+    return 0;
 }
 
 /*
@@ -401,8 +593,12 @@ NTSTATUS compat32_patch_iat(PE_IMAGE_INFO *info)
 
     uint32_t patched = 0;
 
+    uint32_t direct = 0;  /* imports from real PE32 DLLs (no thunk) */
+
     for (; desc->Name != 0; desc++) {
         const char *dll_name = (const char *)(base + desc->Name);
+        uint8_t cc = dll_calling_convention(dll_name);
+        int shim = is_shim_dll(dll_name);
 
         PIMAGE_THUNK_DATA32 int_entry = (PIMAGE_THUNK_DATA32)(
             base + (desc->OriginalFirstThunk ? desc->OriginalFirstThunk
@@ -419,8 +615,7 @@ NTSTATUS compat32_patch_iat(PE_IMAGE_INFO *info)
                 func_name = name_entry->Name;
             }
 
-            /* Get the 64-bit shim address (currently truncated in IAT) */
-            uint64_t target64 = 0;
+            /* Resolve the import */
             PVOID resolved = NULL;
             if (func_name) {
                 USHORT hint = 0;
@@ -437,22 +632,62 @@ NTSTATUS compat32_patch_iat(PE_IMAGE_INFO *info)
 
             if (!resolved) continue;
 
-            target64 = (uint64_t)(ULONG_PTR)resolved;
+            if (shim) {
+                /*
+                 * Import from a shim DLL (64-bit kernel code).
+                 * Create an INT 0x2E thunk to bridge 32-bit → 64-bit.
+                 */
+                uint64_t target64 = (uint64_t)(ULONG_PTR)resolved;
+                uint8_t nargs = func_name ? guess_num_args(func_name) : 4;
+                uint32_t thunk_addr = compat32_make_thunk_ex(target64, func_name, nargs, cc);
+                if (thunk_addr) {
+                    iat_entry->u1.Function = thunk_addr;
+                    patched++;
+                }
+            } else {
+                /*
+                 * Import from a real PE32 DLL (32-bit code in same compat mode).
+                 * Write the address directly — no thunk needed.
+                 */
+                iat_entry->u1.Function = (ULONG)(ULONG_PTR)resolved;
+                direct++;
 
-            /* Create thunk */
-            uint8_t nargs = func_name ? guess_num_args(func_name) : 4;
-            uint32_t thunk_addr = compat32_make_thunk(target64, func_name, nargs);
-
-            if (thunk_addr) {
-                iat_entry->u1.Function = thunk_addr;
-                patched++;
+                /* Capture key data import addresses for diagnostics */
+                if (func_name) {
+                    /* Check for "Names@FName" substring */
+                    for (const char *p = func_name; *p; p++) {
+                        if (p[0]=='N' && p[1]=='a' && p[2]=='m' && p[3]=='e' &&
+                            p[4]=='s' && p[5]=='@' && p[6]=='F') {
+                            g_fname_names_addr = (uint32_t)(ULONG_PTR)resolved;
+                            serial_puts("[DIAG] FName::Names resolved at 0x");
+                            serial_puthex((uint64_t)g_fname_names_addr, 8);
+                            serial_puts(" IAT@0x");
+                            serial_puthex((uint64_t)(ULONG_PTR)&iat_entry->u1.Function, 8);
+                            serial_puts("\n");
+                            break;
+                        }
+                    }
+                    /* Check for "GMalloc" substring */
+                    for (const char *p = func_name; *p; p++) {
+                        if (p[0]=='G' && p[1]=='M' && p[2]=='a' && p[3]=='l' &&
+                            p[4]=='l' && p[5]=='o' && p[6]=='c') {
+                            g_gmalloc_addr = (uint32_t)(ULONG_PTR)resolved;
+                            serial_puts("[DIAG] GMalloc resolved at 0x");
+                            serial_puthex((uint64_t)g_gmalloc_addr, 8);
+                            serial_puts("\n");
+                            break;
+                        }
+                    }
+                }
             }
         }
     }
 
-    serial_puts("[COMPAT32] Patched ");
+    serial_puts("[COMPAT32] IAT: ");
     serial_putdec(patched);
-    serial_puts(" IAT entries with thunks\n");
+    serial_puts(" thunked (shim), ");
+    serial_putdec(direct);
+    serial_puts(" direct (PE32 DLL)\n");
 
     return STATUS_SUCCESS;
 }
@@ -546,6 +781,507 @@ void compat32_enter(uint32_t entry, uint32_t stack_top)
 #endif
 }
 
+/* ── Callback: call a 32-bit function from 64-bit code ─────── */
+
+/*
+ * Call a 32-bit function pointer from 64-bit kernel code.
+ * Used by _initterm to execute CRT initializers / C++ constructors.
+ *
+ * Mechanism:
+ *   1. kern_setjmp saves 64-bit state
+ *   2. LRETQ switches to compat mode at func_addr
+ *   3. 32-bit function executes and RETs
+ *   4. RET lands on callback_return_stub (pushed as return addr)
+ *   5. Stub does INT 0x2E with magic THUNK_CALLBACK_RETURN index
+ *   6. compat32_dispatch sees magic, restores segments, longjmps back
+ *   7. kern_setjmp returns 1, we continue
+ */
+void compat32_callback(uint32_t func_addr)
+{
+#ifndef TEST_HARNESS
+    if (!callback_return_stub_addr) return;
+
+    if (callback_depth >= MAX_CALLBACK_DEPTH) {
+        serial_puts("[CB32] FATAL: callback depth overflow!\n");
+        return;
+    }
+
+    int depth = callback_depth++;
+
+    serial_puts("[CB32] depth=");
+    serial_putdec(depth);
+    serial_puts(" calling 0x");
+    serial_puthex(func_addr, 8);
+    serial_puts("\n");
+
+    if (kern_setjmp(callback_jmpbufs[depth]) == 0) {
+        /*
+         * First return from setjmp — switch to compat mode.
+         * Set up a small stack with the return stub as return address,
+         * then LRETQ to the 32-bit function.
+         */
+        uint32_t *sp = (uint32_t *)(callback_stacks[depth] + CALLBACK_STACK_SIZE);
+        sp--;
+        *sp = callback_return_stub_addr;  /* return address for the function */
+
+        uint64_t cs64 = GDT_SEL_CODE32;
+        uint64_t ip64 = func_addr;
+        uint64_t sp64 = (uint64_t)(ULONG_PTR)sp;
+
+        __asm__ volatile (
+            "movw $0x48, %%ax\n"    /* GDT_SEL_DATA32 */
+            "mov %%ax, %%ds\n"
+            "mov %%ax, %%es\n"
+            "mov %%ax, %%ss\n"
+            "mov %[sp], %%rsp\n"
+            "push %[cs]\n"
+            "push %[ip]\n"
+            "lretq\n"
+            :
+            : [cs] "r"(cs64),
+              [ip] "r"(ip64),
+              [sp] "r"(sp64)
+            : "memory", "rax"
+        );
+        /* never reached — control flows via longjmp */
+    }
+
+    /* longjmp returned here — 32-bit function is done */
+    callback_depth--;
+    serial_puts("[CB32] depth=");
+    serial_putdec(depth);
+    serial_puts(" returned\n");
+#else
+    /* Test harness: call directly */
+    typedef void (*void_fn)(void);
+    ((void_fn)(ULONG_PTR)func_addr)();
+#endif
+}
+
+/*
+ * Call a 32-bit function with arguments, returning EAX.
+ * nargs: number of uint32_t arguments (0-8)
+ * args:  array of uint32_t arguments (pushed right-to-left)
+ * Returns: EAX from the 32-bit function.
+ */
+uint32_t compat32_callback_args(uint32_t func_addr, int nargs, const uint32_t *args)
+{
+#ifndef TEST_HARNESS
+    if (!callback_return_stub_addr) return 0;
+
+    if (callback_depth >= MAX_CALLBACK_DEPTH) {
+        serial_puts("[CB32] FATAL: callback depth overflow!\n");
+        return 0;
+    }
+
+    int depth = callback_depth++;
+
+    callback_retval = 0;
+
+    if (kern_setjmp(callback_jmpbufs[depth]) == 0) {
+        uint32_t *sp = (uint32_t *)(callback_stacks[depth] + CALLBACK_STACK_SIZE);
+
+        /* Push arguments right-to-left (cdecl/stdcall convention) */
+        for (int i = nargs - 1; i >= 0; i--) {
+            sp--;
+            *sp = args[i];
+        }
+
+        /* Push return stub as return address */
+        sp--;
+        *sp = callback_return_stub_addr;
+
+        uint64_t cs64 = GDT_SEL_CODE32;
+        uint64_t ip64 = func_addr;
+        uint64_t sp64 = (uint64_t)(ULONG_PTR)sp;
+
+        __asm__ volatile (
+            "movw $0x48, %%ax\n"    /* GDT_SEL_DATA32 */
+            "mov %%ax, %%ds\n"
+            "mov %%ax, %%es\n"
+            "mov %%ax, %%ss\n"
+            "mov %[sp], %%rsp\n"
+            "push %[cs]\n"
+            "push %[ip]\n"
+            "lretq\n"
+            :
+            : [cs] "r"(cs64),
+              [ip] "r"(ip64),
+              [sp] "r"(sp64)
+            : "memory", "rax"
+        );
+        /* never reached */
+    }
+
+    /* longjmp returned — 32-bit function is done */
+    callback_depth--;
+    return callback_retval;
+#else
+    /* Test harness: call directly */
+    typedef uint32_t (*fn0)(void);
+    typedef uint32_t (*fn1)(uint32_t);
+    typedef uint32_t (*fn2)(uint32_t, uint32_t);
+    typedef uint32_t (*fn3)(uint32_t, uint32_t, uint32_t);
+    typedef uint32_t (*fn4)(uint32_t, uint32_t, uint32_t, uint32_t);
+    uint64_t f = (uint64_t)(ULONG_PTR)func_addr;
+    switch (nargs) {
+    case 0:  return ((fn0)f)();
+    case 1:  return ((fn1)f)(args[0]);
+    case 2:  return ((fn2)f)(args[0], args[1]);
+    case 3:  return ((fn3)f)(args[0], args[1], args[2]);
+    default: return ((fn4)f)(args[0], args[1], args[2], args[3]);
+    }
+#endif
+}
+
+/*
+ * Look up a thunk entry by its 32-bit stub address.
+ * Returns the thunk index, or -1 if not found.
+ */
+int32_t compat32_find_thunk(uint32_t addr)
+{
+    for (uint32_t i = 0; i < thunk_count; i++) {
+        if (thunk_table[i].thunk_addr == addr)
+            return (int32_t)i;
+    }
+    return -1;
+}
+
+/*
+ * Get the name of a thunk by index.
+ */
+const char *compat32_get_name(uint32_t thunk_idx)
+{
+    if (thunk_idx >= thunk_count) return NULL;
+    return thunk_table[thunk_idx].name;
+}
+
+/* ── 32-bit SEH exception dispatch ────────────────────────────── */
+
+/*
+ * Walk the 32-bit SEH chain and dispatch an exception.
+ *
+ * PE32 (i386) code maintains the SEH chain via FS:[0] (= TEB.ExceptionList).
+ * The chain uses 32-bit structs:
+ *   EXCEPTION_REGISTRATION_RECORD32: { uint32_t Next; uint32_t Handler; }
+ *   EH3_EXCEPTION_REGISTRATION32:    { Next(4), Handler(4), ScopeTable(4), TryLevel(4) }
+ *   SCOPETABLE_ENTRY32:              { EnclosingLevel(4), FilterFunc(4), HandlerFunc(4) }
+ *
+ * Handlers in the chain are thunk addresses (32-bit stubs pointing to our
+ * 64-bit shims). We look up each handler in the thunk table to find the
+ * 64-bit target, then dispatch appropriately.
+ *
+ * For _except_handler3 targets: we read the 32-bit scopetable, call the
+ * 32-bit filter functions via compat32_callback_args, and if a filter returns
+ * EXCEPTION_EXECUTE_HANDLER, call the handler function (which does a local
+ * goto and never returns to us).
+ *
+ * Returns: 1 if handled (ContinueExecution), 0 if unhandled.
+ */
+
+extern TEB g_teb;
+extern TEB32 g_teb32;
+extern PVOID g_unhandled_filter;
+
+/* 32-bit EXCEPTION_RECORD for passing to 32-bit filter functions */
+typedef struct __attribute__((packed)) {
+    uint32_t ExceptionCode;
+    uint32_t ExceptionFlags;
+    uint32_t ExceptionRecord;     /* 32-bit ptr (self-referential) */
+    uint32_t ExceptionAddress;    /* 32-bit ptr */
+    uint32_t NumberParameters;
+    uint32_t ExceptionInformation[15];
+} EXCEPTION_RECORD32;
+
+/* 32-bit EXCEPTION_POINTERS for passing to 32-bit filter functions */
+typedef struct __attribute__((packed)) {
+    uint32_t ExceptionRecord;     /* 32-bit ptr to EXCEPTION_RECORD32 */
+    uint32_t ContextRecord;       /* 32-bit ptr (NULL for us) */
+} EXCEPTION_POINTERS32;
+
+/* Static buffers for 32-bit exception data (must be <4GB accessible) */
+static EXCEPTION_RECORD32 seh32_exception_record;
+static EXCEPTION_POINTERS32 seh32_exception_pointers;
+
+/* Accessor for msvcrt_shim.c's crt_except_handler3 compat32 path */
+PVOID seh32_ep_addr_for_filter(void)
+{
+    return (PVOID)&seh32_exception_pointers;
+}
+
+int compat32_seh_dispatch(PEXCEPTION_RECORD ExceptionRecord)
+{
+    /* Read the 32-bit ExceptionList from TEB32.
+     * 32-bit code writes FS:[0] — since FS base points to g_teb32,
+     * the SEH chain is at g_teb32.ExceptionList (4 bytes). */
+    uint32_t frame_addr = g_teb32.ExceptionList;
+
+    /* Diagnostic: read FS base from MSR to verify it points to g_teb32 */
+#ifndef TEST_HARNESS
+    {
+        uint32_t lo, hi;
+        __asm__ volatile (
+            "mov $0xC0000100, %%ecx\n"  /* MSR_FS_BASE */
+            "rdmsr\n"
+            : "=a"(lo), "=d"(hi)
+            :
+            : "ecx"
+        );
+        uint64_t fs_base = ((uint64_t)hi << 32) | lo;
+        serial_puts("[SEH32] FS_BASE MSR = 0x");
+        serial_puthex(fs_base, 16);
+        serial_puts(" g_teb32 = 0x");
+        serial_puthex((uint64_t)(ULONG_PTR)&g_teb32, 16);
+        uint32_t *fs0 = (uint32_t *)fs_base;
+        serial_puts(" *FS[0] = 0x");
+        serial_puthex(*fs0, 8);
+        serial_puts("\n");
+    }
+#endif
+
+    serial_puts("[SEH32] dispatch code=0x");
+    serial_puthex(ExceptionRecord->ExceptionCode, 8);
+    serial_puts(" chain=0x");
+    serial_puthex(frame_addr, 8);
+    serial_puts("\n");
+
+    if (frame_addr == 0 || frame_addr == 0xFFFFFFFF) {
+        serial_puts("[SEH32] empty chain\n");
+        return 0;
+    }
+
+    /* Build 32-bit EXCEPTION_RECORD for filter functions */
+    BYTE *p = (BYTE *)&seh32_exception_record;
+    for (SIZE_T i = 0; i < sizeof(seh32_exception_record); i++) p[i] = 0;
+    seh32_exception_record.ExceptionCode = ExceptionRecord->ExceptionCode;
+    seh32_exception_record.ExceptionFlags = ExceptionRecord->ExceptionFlags;
+    seh32_exception_record.NumberParameters = ExceptionRecord->NumberParameters;
+    for (DWORD i = 0; i < ExceptionRecord->NumberParameters && i < 15; i++)
+        seh32_exception_record.ExceptionInformation[i] =
+            (uint32_t)ExceptionRecord->ExceptionInformation[i];
+
+    /* Build 32-bit EXCEPTION_POINTERS */
+    seh32_exception_pointers.ExceptionRecord =
+        (uint32_t)(ULONG_PTR)&seh32_exception_record;
+    seh32_exception_pointers.ContextRecord = 0;  /* no context */
+
+    int frame_num = 0;
+    while (frame_addr != 0xFFFFFFFF && frame_addr != 0 && frame_num < 64) {
+        /* Read 32-bit EXCEPTION_REGISTRATION_RECORD:
+         *   offset 0: uint32_t Next
+         *   offset 4: uint32_t Handler */
+        uint32_t *frame32 = (uint32_t *)(ULONG_PTR)frame_addr;
+        uint32_t next32    = frame32[0];
+        uint32_t handler32 = frame32[1];
+
+        serial_puts("[SEH32] frame ");
+        serial_putdec(frame_num);
+        serial_puts(" @0x");
+        serial_puthex(frame_addr, 8);
+        serial_puts(" handler=0x");
+        serial_puthex(handler32, 8);
+
+        /* Look up handler in thunk table */
+        int32_t thunk_idx = compat32_find_thunk(handler32);
+
+        if (thunk_idx >= 0) {
+            const char *name = thunk_table[thunk_idx].name;
+            serial_puts(" → ");
+            if (name) serial_puts(name);
+            serial_puts("\n");
+
+            uint64_t target = thunk_table[thunk_idx].target_addr;
+
+            /*
+             * Check if this is _except_handler3 (our C SEH handler).
+             * For _except_handler3, the EH3 frame has additional fields:
+             *   +8:  uint32_t ScopeTable (pointer to 32-bit scopetable)
+             *   +12: uint32_t TryLevel
+             *
+             * We read the 32-bit scopetable and call filter functions
+             * via compat32_callback_args (in 32-bit compat mode).
+             */
+            extern EXCEPTION_DISPOSITION WINAPI crt_except_handler3(
+                PEXCEPTION_RECORD, PEH3_EXCEPTION_REGISTRATION,
+                PCONTEXT, PVOID);
+            extern EXCEPTION_DISPOSITION WINAPI crt_except_handler4(
+                PEXCEPTION_RECORD, PEH3_EXCEPTION_REGISTRATION,
+                PCONTEXT, PVOID);
+
+            if ((void *)(ULONG_PTR)target == (void *)crt_except_handler3 ||
+                (void *)(ULONG_PTR)target == (void *)crt_except_handler4)
+            {
+                /* Read 32-bit EH3 extra fields */
+                uint32_t scopetable32 = frame32[2];
+                uint32_t trylevel32   = frame32[3];
+
+                serial_puts("[SEH32] _except_handler3: scope=0x");
+                serial_puthex(scopetable32, 8);
+                serial_puts(" tryLevel=");
+                serial_putdec(trylevel32);
+                serial_puts("\n");
+
+                /* Walk scopetable (32-bit entries: 12 bytes each) */
+                uint32_t level = trylevel32;
+                while (level != (uint32_t)-1 && scopetable32 != 0) {
+                    /* 32-bit SCOPETABLE_ENTRY:
+                     *   +0: uint32_t EnclosingLevel
+                     *   +4: uint32_t FilterFunc (32-bit code ptr)
+                     *   +8: uint32_t HandlerFunc (32-bit code ptr) */
+                    uint32_t *se = (uint32_t *)(ULONG_PTR)(scopetable32 + level * 12);
+                    uint32_t enclosing = se[0];
+                    uint32_t filter32  = se[1];
+                    uint32_t handler_func32 = se[2];
+
+                    if (filter32) {
+                        serial_puts("[SEH32] calling filter @0x");
+                        serial_puthex(filter32, 8);
+                        serial_puts("\n");
+
+                        /* Call 32-bit filter: int filter(EXCEPTION_POINTERS *) */
+                        uint32_t ep_addr = (uint32_t)(ULONG_PTR)&seh32_exception_pointers;
+                        uint32_t filter_args[1] = { ep_addr };
+                        uint32_t result = compat32_callback_args(filter32, 1, filter_args);
+
+                        serial_puts("[SEH32] filter returned ");
+                        serial_putdec(result);
+                        serial_puts("\n");
+
+                        if ((int32_t)result == 1 /* EXCEPTION_EXECUTE_HANDLER */) {
+                            serial_puts("[SEH32] EXECUTE_HANDLER — calling handler @0x");
+                            serial_puthex(handler_func32, 8);
+                            serial_puts("\n");
+
+                            /* Update TryLevel on the 32-bit stack */
+                            frame32[3] = enclosing;
+
+                            /*
+                             * Unwind frames between chain head and this frame.
+                             * Send EXCEPTION_UNWINDING to each handler above us.
+                             */
+                            uint32_t uw_addr = g_teb32.ExceptionList;
+                            while (uw_addr != 0xFFFFFFFF && uw_addr != frame_addr) {
+                                uint32_t *uw32 = (uint32_t *)(ULONG_PTR)uw_addr;
+                                uw_addr = uw32[0]; /* skip to next */
+                            }
+                            /* Set this frame as new chain head */
+                            g_teb32.ExceptionList = frame_addr;
+
+                            /*
+                             * Call the 32-bit handler function.
+                             * In MSVC _except_handler3, this is a longjmp-style
+                             * transfer: the handler restores EBP to the establishing
+                             * frame and continues execution at the __except block.
+                             * It does NOT return to us.
+                             *
+                             * We call it via compat32_callback. If it does return
+                             * (unusual), we treat the exception as handled.
+                             */
+                            compat32_callback(handler_func32);
+
+                            /* If handler returned (unusual), exception is handled */
+                            serial_puts("[SEH32] handler returned — continuing\n");
+                            return 1;
+                        }
+                        else if ((int32_t)result == -1 /* EXCEPTION_CONTINUE_EXECUTION */) {
+                            serial_puts("[SEH32] CONTINUE_EXECUTION\n");
+                            return 1;
+                        }
+                        /* EXCEPTION_CONTINUE_SEARCH → try enclosing scope */
+                    }
+
+                    level = enclosing;
+                }
+            } else {
+                /* Other handler (e.g., __CxxFrameHandler3).
+                 * We can't easily dispatch C++ EH from here.
+                 * Try calling the 64-bit shim with a temporary 64-bit frame. */
+                serial_puts("[SEH32] calling 64-bit handler shim\n");
+
+                /* Build minimal temporary EH3 frame with 64-bit pointers */
+                EH3_EXCEPTION_REGISTRATION temp_eh3;
+                temp_eh3.registration.Next = EXCEPTION_CHAIN_END;
+                temp_eh3.registration.Handler = (PVOID)(ULONG_PTR)target;
+                temp_eh3.ScopeTable = NULL;
+                temp_eh3.TryLevel = (DWORD)-1;
+
+                CONTEXT ctx;
+                BYTE *cp = (BYTE *)&ctx;
+                for (SIZE_T ci = 0; ci < sizeof(ctx); ci++) cp[ci] = 0;
+                ctx.ContextFlags = CONTEXT_FULL;
+
+                typedef EXCEPTION_DISPOSITION (WINAPI *seh_handler_fn)(
+                    PEXCEPTION_RECORD, PEH3_EXCEPTION_REGISTRATION,
+                    PCONTEXT, PVOID);
+                seh_handler_fn handler = (seh_handler_fn)(ULONG_PTR)target;
+                EXCEPTION_DISPOSITION disp = handler(
+                    ExceptionRecord, &temp_eh3, &ctx, NULL);
+
+                if (disp == ExceptionContinueExecution) {
+                    serial_puts("[SEH32] handler: ContinueExecution\n");
+                    return 1;
+                }
+                serial_puts("[SEH32] handler: ContinueSearch\n");
+            }
+        } else {
+            serial_puts(" (PE32 handler, calling via compat32)\n");
+
+            /*
+             * This is a 32-bit handler installed by PE32 code directly
+             * (e.g., __CxxFrameHandler3 for MSVC C++ EH).
+             *
+             * 32-bit SEH handler signature (cdecl):
+             *   EXCEPTION_DISPOSITION handler(
+             *       EXCEPTION_RECORD *ExceptionRecord,
+             *       void *EstablisherFrame,
+             *       CONTEXT *ContextRecord,
+             *       void *DispatcherContext);
+             *
+             * Returns: 0=ContinueExecution, 1=ContinueSearch
+             * May also longjmp directly to catch block (no return).
+             */
+            uint32_t args[4];
+            args[0] = (uint32_t)(ULONG_PTR)&seh32_exception_record;
+            args[1] = frame_addr;
+            args[2] = 0;   /* no CONTEXT */
+            args[3] = 0;   /* no DispatcherContext */
+
+            uint32_t disp = compat32_callback_args(handler32, 4, args);
+
+            serial_puts("[SEH32] PE32 handler returned disp=");
+            serial_putdec(disp);
+            serial_puts("\n");
+
+            if (disp == 0 /* ExceptionContinueExecution */) {
+                serial_puts("[SEH32] PE32 handler: ContinueExecution\n");
+                return 1;
+            }
+            /* disp==1 → ContinueSearch, try next frame */
+        }
+
+        frame_addr = next32;
+        frame_num++;
+    }
+
+    /* Try unhandled exception filter */
+    if (g_unhandled_filter) {
+        serial_puts("[SEH32] calling UnhandledExceptionFilter\n");
+        EXCEPTION_POINTERS ep;
+        ep.ExceptionRecord = ExceptionRecord;
+        ep.ContextRecord   = NULL;
+
+        typedef LONG (WINAPI *uef_fn)(PEXCEPTION_POINTERS);
+        uef_fn filter = (uef_fn)g_unhandled_filter;
+        LONG result = filter(&ep);
+
+        if (result == EXCEPTION_CONTINUE_EXECUTION)
+            return 1;
+    }
+
+    serial_puts("[SEH32] UNHANDLED — no handler caught the exception\n");
+    return 0;
+}
+
 /* ── Kernel-side thunk dispatch (called from INT 0x2E handler) ── */
 
 /*
@@ -561,6 +1297,32 @@ void compat32_enter(uint32_t entry, uint32_t stack_top)
  */
 uint64_t compat32_dispatch(uint32_t thunk_idx, uint32_t *stack_args)
 {
+    /* Callback return: 32-bit function completed, longjmp back */
+    if (thunk_idx == THUNK_CALLBACK_RETURN) {
+        /* Restore 64-bit data segments (compat mode set them to 0x48) */
+        __asm__ volatile (
+            "mov $0x30, %%ax\n"
+            "mov %%ax, %%ds\n"
+            "mov %%ax, %%es\n"
+            "mov %%ax, %%ss\n"
+            ::: "ax"
+        );
+
+        int depth = callback_depth - 1;
+        serial_puts("[INT2E] callback return depth=");
+        serial_putdec(depth);
+        serial_puts("\n");
+
+        if (depth < 0 || depth >= MAX_CALLBACK_DEPTH) {
+            serial_puts("[INT2E] FATAL: invalid callback depth!\n");
+            return 0;
+        }
+
+        kern_longjmp(callback_jmpbufs[depth], 1);
+        /* never reached */
+        return 0;
+    }
+
     if (thunk_idx >= thunk_count) {
         serial_puts("[COMPAT32] Invalid thunk index ");
         serial_putdec(thunk_idx);
@@ -571,6 +1333,19 @@ uint64_t compat32_dispatch(uint32_t thunk_idx, uint32_t *stack_args)
     compat32_thunk_t *t = &thunk_table[thunk_idx];
     uint64_t target = t->target_addr;
     uint8_t nargs = t->num_args;
+
+    /* SEH-TRACK: disabled (corruption bug fixed, see X-WIN32) */
+
+    /* Debug: log every INT 0x2E dispatch */
+    serial_puts("[INT2E] #");
+    serial_putdec(thunk_idx);
+    serial_puts(" ");
+    if (t->name) serial_puts(t->name);
+    serial_puts(" (");
+    serial_putdec(nargs);
+    serial_puts(" args, ");
+    serial_puts(t->callconv == CC_CDECL ? "cdecl" : "stdcall");
+    serial_puts(")\n");
 
     /*
      * Call the 64-bit shim function with marshaled arguments.

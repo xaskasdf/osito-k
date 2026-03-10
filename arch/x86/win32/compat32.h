@@ -31,11 +31,16 @@
 /* Maximum number of thunked functions */
 #define COMPAT32_MAX_THUNKS  512
 
+/* Calling conventions for thunk generation */
+#define CC_STDCALL  0   /* callee cleans stack: ret N  (KERNEL32, USER32, ...) */
+#define CC_CDECL    1   /* caller cleans stack: ret    (MSVCRT) */
+
 /* Thunk entry: maps a 32-bit callable address to a 64-bit shim */
 typedef struct {
     uint32_t thunk_addr;    /* 32-bit address of the thunk stub */
     uint64_t target_addr;   /* 64-bit address of the real shim function */
-    uint8_t  num_args;      /* number of DWORD stack arguments (for cleanup) */
+    uint8_t  num_args;      /* number of DWORD stack arguments (for dispatch) */
+    uint8_t  callconv;      /* CC_STDCALL or CC_CDECL */
     const char *name;       /* function name (for debug) */
 } compat32_thunk_t;
 
@@ -56,6 +61,8 @@ void compat32_init(void);
  * Returns: 32-bit thunk address, or 0 on failure.
  */
 uint32_t compat32_make_thunk(uint64_t target, const char *name, uint8_t num_args);
+uint32_t compat32_make_thunk_ex(uint64_t target, const char *name,
+                                 uint8_t num_args, uint8_t callconv);
 
 /*
  * Patch PE32 IAT entries to use thunks instead of raw 64-bit addresses.
@@ -77,5 +84,50 @@ void compat32_setup_teb(void *teb_addr);
  * stack_top: 32-bit stack pointer
  */
 void compat32_enter(uint32_t entry, uint32_t stack_top);
+
+/*
+ * Call a 32-bit void function from 64-bit code.
+ * Switches to compat mode, calls the function, returns when it finishes.
+ * Used by _initterm to call CRT initializers / C++ constructors.
+ */
+void compat32_callback(uint32_t func_addr);
+
+/*
+ * Call a 32-bit function with arguments, returning EAX.
+ * Switches to compat mode, pushes args (right-to-left), calls func,
+ * captures EAX return value, returns to 64-bit code.
+ */
+uint32_t compat32_callback_args(uint32_t func_addr, int nargs, const uint32_t *args);
+
+/*
+ * Look up a thunk entry by its 32-bit stub address.
+ * Returns the thunk index, or -1 if not found.
+ */
+int32_t compat32_find_thunk(uint32_t addr);
+
+/*
+ * Get the name of a thunk by index.
+ */
+const char *compat32_get_name(uint32_t thunk_idx);
+
+/*
+ * Dispatch an exception through the 32-bit SEH chain.
+ * Walks TEB.ExceptionList reading 32-bit structs, calls handlers
+ * via thunk table lookup or compat32_callback.
+ * Returns: 1 if handled, 0 if unhandled.
+ */
+int compat32_seh_dispatch(PEXCEPTION_RECORD ExceptionRecord);
+
+/*
+ * Global flag: set to 1 when running a PE32 (i386) executable.
+ * Shim functions that write to output structs MUST check this flag
+ * and use 32-bit struct layouts when set.
+ *
+ * The problem: 64-bit shim structs have 8-byte pointers/handles,
+ * but 32-bit PE code allocates buffers with 4-byte pointer slots.
+ * Writing a 64-bit struct to a 32-bit buffer overflows, corrupting
+ * the stack (most commonly: SEH ExceptionList on the 32-bit stack).
+ */
+extern int g_compat32_mode;
 
 #endif /* COMPAT32_H */

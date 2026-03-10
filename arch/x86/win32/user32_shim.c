@@ -165,10 +165,70 @@ static void msg_enqueue(HWND hwnd, DWORD message, WPARAM wp, LPARAM lp)
     msg_tail = next;
 }
 
-static int msg_dequeue(MSG *out)
+/*
+ * Write MSG to caller buffer using 32-bit or 64-bit layout.
+ *
+ * 64-bit MSG is 48 bytes (HWND=8, WPARAM=8, LPARAM=8).
+ * 32-bit MSG is 28 bytes (HWND=4, WPARAM=4, LPARAM=4).
+ * Writing 48 bytes to a 28-byte buffer overflows 20 bytes.
+ *
+ * 32-bit MSG layout:
+ *   +0:  HWND(4) +4: message(4) +8: wParam(4) +12: lParam(4)
+ *   +16: time(4) +20: pt.x(4) +24: pt.y(4)
+ */
+/*
+ * Read MSG from a caller-provided buffer (may be 32-bit or 64-bit layout).
+ * Extracts fields into local 64-bit MSG for internal use.
+ */
+static void msg_read_from(const void *src, MSG *out)
+{
+    extern int g_compat32_mode;
+    if (g_compat32_mode) {
+        const uint32_t *p = (const uint32_t *)src;
+        out->hwnd    = (HWND)(ULONG_PTR)p[0];
+        out->message = p[1];
+        out->wParam  = (WPARAM)p[2];
+        out->lParam  = (LPARAM)(int32_t)p[3];
+        out->time    = p[4];
+        out->pt.x    = (LONG)p[5];
+        out->pt.y    = (LONG)p[6];
+    } else {
+        *out = *(const MSG *)src;
+    }
+}
+
+static void msg_write_to(void *dest, HWND hwnd, DWORD message,
+                          WPARAM wp, LPARAM lp, DWORD time,
+                          LONG ptx, LONG pty)
+{
+    extern int g_compat32_mode;
+    if (g_compat32_mode) {
+        uint32_t *p = (uint32_t *)dest;
+        p[0] = (uint32_t)(ULONG_PTR)hwnd;  /* HWND truncated to 32-bit */
+        p[1] = message;
+        p[2] = (uint32_t)wp;
+        p[3] = (uint32_t)lp;
+        p[4] = time;
+        p[5] = (uint32_t)ptx;
+        p[6] = (uint32_t)pty;
+    } else {
+        MSG *m = (MSG *)dest;
+        m->hwnd    = hwnd;
+        m->message = message;
+        m->wParam  = wp;
+        m->lParam  = lp;
+        m->time    = time;
+        m->pt.x    = ptx;
+        m->pt.y    = pty;
+    }
+}
+
+static int msg_dequeue(void *out)
 {
     if (msg_head == msg_tail) return 0;
-    *out = msg_queue[msg_head];
+    MSG *src = &msg_queue[msg_head];
+    msg_write_to(out, src->hwnd, src->message, src->wParam, src->lParam,
+                 src->time, src->pt.x, src->pt.y);
     msg_head = (msg_head + 1) % MSG_QUEUE_SIZE;
     return 1;
 }
@@ -239,21 +299,91 @@ static HWND  capture_hwnd = NULL;
 
 /* ── API Implementations ───────────────────────────────────── */
 
+/*
+ * Read WNDCLASSEXA from caller buffer (32-bit or 64-bit layout).
+ *
+ * 32-bit WNDCLASSEXA (48 bytes):
+ *   +0: cbSize(4) +4: style(4) +8: lpfnWndProc(4) +12: cbClsExtra(4)
+ *   +16: cbWndExtra(4) +20: hInstance(4) +24: hIcon(4) +28: hCursor(4)
+ *   +32: hbrBackground(4) +36: lpszMenuName(4) +40: lpszClassName(4)
+ *   +44: hIconSm(4)
+ *
+ * 64-bit WNDCLASSEXA (80 bytes):
+ *   +0: cbSize(4) +4: style(4) +8: lpfnWndProc(8) +16: cbClsExtra(4)
+ *   +20: cbWndExtra(4) +24: hInstance(8) +32: hIcon(8) +40: hCursor(8)
+ *   +48: hbrBackground(8) +56: lpszMenuName(8) +64: lpszClassName(8)
+ *   +72: hIconSm(8)
+ */
+static void wndclassex_read(const void *src, WNDCLASSEXA *out)
+{
+    extern int g_compat32_mode;
+    if (g_compat32_mode) {
+        const uint32_t *p = (const uint32_t *)src;
+        out->cbSize        = p[0];
+        out->style         = p[1];
+        out->lpfnWndProc   = (WNDPROC)(ULONG_PTR)p[2];
+        out->cbClsExtra    = (int)p[3];
+        out->cbWndExtra    = (int)p[4];
+        out->hInstance     = (HINSTANCE)(ULONG_PTR)p[5];
+        out->hIcon         = (HICON)(ULONG_PTR)p[6];
+        out->hCursor       = (HCURSOR)(ULONG_PTR)p[7];
+        out->hbrBackground = (HBRUSH)(ULONG_PTR)p[8];
+        out->lpszMenuName  = (PCSTR)(ULONG_PTR)p[9];
+        out->lpszClassName = (PCSTR)(ULONG_PTR)p[10];
+        out->hIconSm       = (HICON)(ULONG_PTR)p[11];
+    } else {
+        *out = *(const WNDCLASSEXA *)src;
+    }
+}
+
+/*
+ * Read WNDCLASSA from caller buffer (32-bit or 64-bit layout).
+ *
+ * 32-bit WNDCLASSA (40 bytes):
+ *   +0: style(4) +4: lpfnWndProc(4) +8: cbClsExtra(4) +12: cbWndExtra(4)
+ *   +16: hInstance(4) +20: hIcon(4) +24: hCursor(4) +28: hbrBackground(4)
+ *   +32: lpszMenuName(4) +36: lpszClassName(4)
+ */
+static void wndclass_read(const void *src, WNDCLASSA *out)
+{
+    extern int g_compat32_mode;
+    if (g_compat32_mode) {
+        const uint32_t *p = (const uint32_t *)src;
+        out->style         = p[0];
+        out->lpfnWndProc   = (WNDPROC)(ULONG_PTR)p[1];
+        out->cbClsExtra    = (int)p[2];
+        out->cbWndExtra    = (int)p[3];
+        out->hInstance     = (HINSTANCE)(ULONG_PTR)p[4];
+        out->hIcon         = (HICON)(ULONG_PTR)p[5];
+        out->hCursor       = (HCURSOR)(ULONG_PTR)p[6];
+        out->hbrBackground = (HBRUSH)(ULONG_PTR)p[7];
+        out->lpszMenuName  = (PCSTR)(ULONG_PTR)p[8];
+        out->lpszClassName = (PCSTR)(ULONG_PTR)p[9];
+    } else {
+        *out = *(const WNDCLASSA *)src;
+    }
+}
+
 WORD WINAPI RegisterClassExA(const WNDCLASSEXA *lpwcx)
 {
-    if (!lpwcx || !lpwcx->lpszClassName) return 0;
+    if (!lpwcx) return 0;
+
+    WNDCLASSEXA wcx;
+    wndclassex_read(lpwcx, &wcx);
+
+    if (!wcx.lpszClassName) return 0;
 
     serial_puts("[USER32] RegisterClassExA: ");
-    serial_puts(lpwcx->lpszClassName);
+    serial_puts(wcx.lpszClassName);
     serial_puts("\n");
 
     if (wndclass_count >= MAX_WNDCLASSES) return 0;
 
     WNDCLASS_ENTRY *e = &wndclasses[wndclass_count];
-    u32_strcpy(e->class_name, lpwcx->lpszClassName, 128);
-    e->wndproc    = lpwcx->lpfnWndProc;
-    e->style      = lpwcx->style;
-    e->cbWndExtra = lpwcx->cbWndExtra;
+    u32_strcpy(e->class_name, wcx.lpszClassName, 128);
+    e->wndproc    = wcx.lpfnWndProc;
+    e->style      = wcx.style;
+    e->cbWndExtra = wcx.cbWndExtra;
     e->used       = 1;
     wndclass_count++;
 
@@ -262,23 +392,38 @@ WORD WINAPI RegisterClassExA(const WNDCLASSEXA *lpwcx)
 
 WORD WINAPI RegisterClassA(const WNDCLASSA *lpwcx)
 {
-    if (!lpwcx || !lpwcx->lpszClassName) return 0;
+    if (!lpwcx) return 0;
+
+    WNDCLASSA wca;
+    wndclass_read(lpwcx, &wca);
+
+    if (!wca.lpszClassName) return 0;
 
     WNDCLASSEXA ex;
     BYTE *p = (BYTE *)&ex;
     for (SIZE_T i = 0; i < sizeof(ex); i++) p[i] = 0;
     ex.cbSize        = sizeof(WNDCLASSEXA);
-    ex.style         = lpwcx->style;
-    ex.lpfnWndProc   = lpwcx->lpfnWndProc;
-    ex.cbClsExtra    = lpwcx->cbClsExtra;
-    ex.cbWndExtra    = lpwcx->cbWndExtra;
-    ex.hInstance     = lpwcx->hInstance;
-    ex.hIcon         = lpwcx->hIcon;
-    ex.hCursor       = lpwcx->hCursor;
-    ex.hbrBackground = lpwcx->hbrBackground;
-    ex.lpszMenuName  = lpwcx->lpszMenuName;
-    ex.lpszClassName = lpwcx->lpszClassName;
-    return RegisterClassExA(&ex);
+    ex.style         = wca.style;
+    ex.lpfnWndProc   = wca.lpfnWndProc;
+    ex.cbClsExtra    = wca.cbClsExtra;
+    ex.cbWndExtra    = wca.cbWndExtra;
+    ex.hInstance     = wca.hInstance;
+    ex.hIcon         = wca.hIcon;
+    ex.hCursor       = wca.hCursor;
+    ex.hbrBackground = wca.hbrBackground;
+    ex.lpszMenuName  = wca.lpszMenuName;
+    ex.lpszClassName = wca.lpszClassName;
+
+    /* Call internal registration directly (not through thunk) */
+    if (wndclass_count >= MAX_WNDCLASSES) return 0;
+    WNDCLASS_ENTRY *e = &wndclasses[wndclass_count];
+    u32_strcpy(e->class_name, ex.lpszClassName, 128);
+    e->wndproc    = ex.lpfnWndProc;
+    e->style      = ex.style;
+    e->cbWndExtra = ex.cbWndExtra;
+    e->used       = 1;
+    wndclass_count++;
+    return (WORD)wndclass_count;
 }
 
 BOOL WINAPI UnregisterClassA(PCSTR lpClassName, HINSTANCE hInstance)
@@ -481,10 +626,7 @@ BOOL WINAPI PeekMessageA(LPMSG lpMsg, HWND hWnd, DWORD wMsgFilterMin,
     (void)wMsgFilterMax;
 
     if (quit_posted && msg_queue_empty()) {
-        lpMsg->hwnd    = NULL;
-        lpMsg->message = WM_QUIT;
-        lpMsg->wParam  = (WPARAM)quit_code;
-        lpMsg->lParam  = 0;
+        msg_write_to(lpMsg, NULL, WM_QUIT, (WPARAM)quit_code, 0, 0, 0, 0);
         if (wRemoveMsg & PM_REMOVE)
             quit_posted = 0;
         return TRUE;
@@ -496,7 +638,9 @@ BOOL WINAPI PeekMessageA(LPMSG lpMsg, HWND hWnd, DWORD wMsgFilterMin,
         return msg_dequeue(lpMsg) ? TRUE : FALSE;
     } else {
         /* Peek without removing */
-        *lpMsg = msg_queue[msg_head];
+        MSG *src = &msg_queue[msg_head];
+        msg_write_to(lpMsg, src->hwnd, src->message, src->wParam,
+                     src->lParam, src->time, src->pt.x, src->pt.y);
         return TRUE;
     }
 }
@@ -511,31 +655,38 @@ BOOL WINAPI GetMessageA(LPMSG lpMsg, HWND hWnd, DWORD wMsgFilterMin,
     /* Block until a message is available */
     /* In a real kernel, this would yield. In test mode, immediately check. */
     if (quit_posted) {
-        lpMsg->hwnd    = NULL;
-        lpMsg->message = WM_QUIT;
-        lpMsg->wParam  = (WPARAM)quit_code;
-        lpMsg->lParam  = 0;
+        msg_write_to(lpMsg, NULL, WM_QUIT, (WPARAM)quit_code, 0, 0, 0, 0);
         return FALSE; /* WM_QUIT → return FALSE to exit loop */
     }
 
     if (msg_dequeue(lpMsg))
         return TRUE;
 
-    /* No messages — in test harness, return WM_QUIT to prevent infinite loop */
-    lpMsg->hwnd    = NULL;
-    lpMsg->message = WM_QUIT;
-    lpMsg->wParam  = 0;
-    lpMsg->lParam  = 0;
+#ifdef TEST_HARNESS
+    /* In test harness, return WM_QUIT to prevent infinite loop */
+    msg_write_to(lpMsg, NULL, WM_QUIT, 0, 0, 0, 0, 0);
     return FALSE;
+#else
+    /* On bare metal, yield CPU and retry — real apps expect GetMessage to block.
+     * Post WM_TIMER periodically so the app's message loop keeps running. */
+    msg_write_to(lpMsg, NULL, 0x0113 /* WM_TIMER */, 1, 0, 0, 0, 0);
+    /* Brief yield — sti;hlt;cli lets pending interrupts fire */
+    __asm__ volatile ("sti; hlt; cli" ::: "memory");
+    return TRUE;
+#endif
 }
 
 BOOL WINAPI TranslateMessage(const MSG *lpMsg)
 {
+    /* Read MSG from caller buffer (handles 32-bit vs 64-bit layout) */
+    MSG m;
+    msg_read_from(lpMsg, &m);
+
     /* Generate WM_CHAR from WM_KEYDOWN — simplified */
-    if (lpMsg->message == WM_KEYDOWN) {
-        DWORD vk = (DWORD)lpMsg->wParam;
+    if (m.message == WM_KEYDOWN) {
+        DWORD vk = (DWORD)m.wParam;
         if (vk >= 0x20 && vk <= 0x7E) {
-            msg_enqueue(lpMsg->hwnd, WM_CHAR, lpMsg->wParam, lpMsg->lParam);
+            msg_enqueue(m.hwnd, WM_CHAR, m.wParam, m.lParam);
         }
     }
     return TRUE;
@@ -543,17 +694,19 @@ BOOL WINAPI TranslateMessage(const MSG *lpMsg)
 
 LRESULT WINAPI DispatchMessageA(const MSG *lpMsg)
 {
-    if (lpMsg->message == WM_QUIT)
+    /* Read MSG from caller buffer (handles 32-bit vs 64-bit layout) */
+    MSG m;
+    msg_read_from(lpMsg, &m);
+
+    if (m.message == WM_QUIT)
         return 0;
 
-    WINDOW *w = find_window(lpMsg->hwnd);
+    WINDOW *w = find_window(m.hwnd);
     if (w && w->wndproc) {
-        return w->wndproc(lpMsg->hwnd, lpMsg->message,
-                          lpMsg->wParam, lpMsg->lParam);
+        return w->wndproc(m.hwnd, m.message, m.wParam, m.lParam);
     }
 
-    return DefWindowProcA(lpMsg->hwnd, lpMsg->message,
-                          lpMsg->wParam, lpMsg->lParam);
+    return DefWindowProcA(m.hwnd, m.message, m.wParam, m.lParam);
 }
 
 void WINAPI PostQuitMessage(int nExitCode)
@@ -833,7 +986,22 @@ int WINAPI MessageBoxW(HWND hWnd, PCWSTR lpText, PCWSTR lpCaption, DWORD uType)
 {
     (void)hWnd;
     (void)uType;
-    serial_puts("[MSGBOX-W] (wide string message box)\n");
+    serial_puts("[MSGBOX-W] ");
+    /* Decode wide caption */
+    if (lpCaption) {
+        const WCHAR *w = lpCaption;
+        char tmp[2] = {0, 0};
+        while (*w) { tmp[0] = (*w <= 127) ? (char)*w : '?'; serial_puts(tmp); w++; }
+    }
+    serial_puts(": ");
+    /* Decode wide text (limit 500 chars) */
+    if (lpText) {
+        const WCHAR *w = lpText;
+        char tmp[2] = {0, 0};
+        int n = 0;
+        while (*w && n < 500) { tmp[0] = (*w <= 127) ? (char)*w : '?'; serial_puts(tmp); w++; n++; }
+    }
+    serial_puts("\n");
     return 1; /* IDOK */
 }
 

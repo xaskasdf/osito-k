@@ -6,9 +6,20 @@
  */
 
 #include "dllloader.h"
+#include "compat32.h"
+extern TEB32 g_teb32;
 
 extern void serial_puts(const char *s);
 extern void serial_puthex(uint64_t val, int digits);
+
+static void dump_seh_chain(const char *label)
+{
+    serial_puts("[SEH-TRACK] ");
+    serial_puts(label);
+    serial_puts(": TEB32.ExceptionList=0x");
+    serial_puthex(g_teb32.ExceptionList, 8);
+    serial_puts("\n");
+}
 
 /* ── Helpers ───────────────────────────────────────────────── */
 
@@ -276,39 +287,70 @@ PVOID dll_load(const char *dll_name, const BYTE *file_data, SIZE_T file_size)
     serial_puts(dll_name);
     serial_puts("\n");
 
-    /* Load the PE */
+    /*
+     * Reserve the module slot BEFORE pe_load().
+     * pe_load() can recursively trigger dll_load() for dependencies.
+     * Without this, the recursive call uses the same modules[module_count]
+     * slot, corrupting the parent's module entry.
+     */
     LOADED_MODULE *mod = &modules[module_count];
+    dl_strcpy_lower(mod->name, strip_path(dll_name), 64);
+    mod->ref_count   = 1;
+    mod->initialized = FALSE;
+    mod->dll_main    = NULL;
+    module_count++;  /* Reserve slot — recursive loads use next slot */
+
+    /* Load the PE (may trigger recursive dll_load for dependencies) */
     NTSTATUS status = pe_load(file_data, file_size, &mod->image);
 
     if (!NT_SUCCESS(status)) {
         serial_puts("[DLL] pe_load failed: ");
         serial_puthex((uint64_t)status, 8);
         serial_puts("\n");
+        module_count--;  /* Release reserved slot */
+        mod->name[0] = 0;
         return NULL;
     }
 
-    /* Fill module info */
-    dl_strcpy_lower(mod->name, strip_path(dll_name), 64);
-    mod->ref_count   = 1;
-    mod->initialized = FALSE;
+    /* Fill remaining module info (name already set above) */
     mod->dll_main    = (mod->image.IsDLL && mod->image.EntryPointRVA != 0)
                        ? mod->image.EntryPoint : NULL;
-
-    module_count++;
 
     serial_puts("[DLL] loaded at ");
     serial_puthex((uint64_t)(ULONG_PTR)mod->image.ImageBase, 16);
     serial_puts("\n");
 
+    /* PE32 DLLs: patch IAT to use compat32 thunks for shim DLL imports.
+     * Without this, imports from KERNEL32/MSVCRT etc. have truncated
+     * 64-bit addresses and the DLL jumps to garbage when calling them. */
+    if (mod->image.Is32Bit) {
+        NTSTATUS compat_st = compat32_patch_iat(&mod->image);
+        if (!NT_SUCCESS(compat_st)) {
+            serial_puts("[DLL] WARNING: compat32 IAT patch failed for ");
+            serial_puts(dll_name);
+            serial_puts("\n");
+        }
+    }
+
     /* Call DllMain(DLL_PROCESS_ATTACH) if it has one */
     if (mod->dll_main && mod->image.IsDLL) {
         if (mod->image.Is32Bit) {
-            /* PE32 DLLs: DllMain is 32-bit code that can't be called from
-             * 64-bit mode directly. Defer initialization — the DLL will be
-             * used via compat32 thunks (INT 0x2E). Most DLLs work without
-             * DllMain, and UT99 DLLs use DllMain only for trivial setup.
-             * TODO: implement compat32_call() for proper 64→32 calls. */
-            serial_puts("[DLL] PE32 DLL — deferring DllMain (compat32)\n");
+            /* PE32 DLLs: call DllMain via compat32 callback mechanism.
+             * Switches to 32-bit compat mode, calls DllMain(hInstance,
+             * DLL_PROCESS_ATTACH, NULL), returns to 64-bit via INT 0x2E. */
+            serial_puts("[DLL] PE32 DLL — calling DllMain via compat32\n");
+            dump_seh_chain("before DllMain");
+            uint32_t entry32 = (uint32_t)(uint64_t)mod->dll_main;
+            uint32_t args[3] = {
+                (uint32_t)(uint64_t)mod->image.ImageBase,
+                1,  /* DLL_PROCESS_ATTACH */
+                0   /* lpReserved = NULL */
+            };
+            uint32_t ok = compat32_callback_args(entry32, 3, args);
+            dump_seh_chain("after DllMain");
+            serial_puts("[DLL] DllMain returned ");
+            serial_puthex((uint64_t)ok, 8);
+            serial_puts("\n");
             mod->initialized = TRUE;
         } else {
             serial_puts("[DLL] calling DllMain(ATTACH)\n");

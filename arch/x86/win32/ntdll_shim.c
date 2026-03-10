@@ -160,9 +160,44 @@ NTSTATUS NtClose(HANDLE h)
     return sys_NtClose(args);
 }
 
+/*
+ * WoW64-style pointer-width thunking for NtAllocateVirtualMemory.
+ *
+ * When called from 32-bit PE32 code via INT 0x2E thunk, the `base` and
+ * `size` parameters are pointers to 4-byte DWORDs (PVOID32/SIZE_T32).
+ * But sys_NtAllocateVirtualMemory reads/writes them as 8-byte values.
+ * Without thunking, it reads 4 bytes of garbage above each DWORD and
+ * writes 4 bytes of corruption after each DWORD.
+ *
+ * Fix: detect compat32 mode, read DWORD→uint64_t, call syscall with
+ * 64-bit temporaries, then truncate results back to DWORD.
+ */
 NTSTATUS NtAllocateVirtualMemory(HANDLE proc, PVOID *base, ULONG_PTR zbits,
                                   SIZE_T *size, ULONG type, ULONG prot)
 {
+    extern int g_compat32_mode;
+
+    if (g_compat32_mode) {
+        /* base and size point to 4-byte DWORDs in 32-bit memory */
+        uint32_t *base32 = (uint32_t *)base;
+        uint32_t *size32 = (uint32_t *)size;
+
+        PVOID  base64 = (PVOID)(ULONG_PTR)*base32;
+        SIZE_T size64 = (SIZE_T)*size32;
+
+        ULONG_PTR args[6] = {
+            (ULONG_PTR)proc, (ULONG_PTR)&base64, zbits,
+            (ULONG_PTR)&size64, type, prot
+        };
+        NTSTATUS st = sys_NtAllocateVirtualMemory(args);
+
+        if (st == 0) {  /* STATUS_SUCCESS */
+            *base32 = (uint32_t)(ULONG_PTR)base64;
+            *size32 = (uint32_t)size64;
+        }
+        return st;
+    }
+
     ULONG_PTR args[6] = {
         (ULONG_PTR)proc, (ULONG_PTR)base, zbits,
         (ULONG_PTR)size, type, prot
@@ -172,6 +207,28 @@ NTSTATUS NtAllocateVirtualMemory(HANDLE proc, PVOID *base, ULONG_PTR zbits,
 
 NTSTATUS NtFreeVirtualMemory(HANDLE proc, PVOID *base, SIZE_T *size, ULONG type)
 {
+    extern int g_compat32_mode;
+
+    if (g_compat32_mode) {
+        uint32_t *base32 = (uint32_t *)base;
+        uint32_t *size32 = (uint32_t *)size;
+
+        PVOID  base64 = (PVOID)(ULONG_PTR)*base32;
+        SIZE_T size64 = size32 ? (SIZE_T)*size32 : 0;
+
+        ULONG_PTR args[4] = {
+            (ULONG_PTR)proc, (ULONG_PTR)&base64,
+            (ULONG_PTR)(size32 ? &size64 : NULL), type
+        };
+        NTSTATUS st = sys_NtFreeVirtualMemory(args);
+
+        if (st == 0) {
+            *base32 = (uint32_t)(ULONG_PTR)base64;
+            if (size32) *size32 = (uint32_t)size64;
+        }
+        return st;
+    }
+
     ULONG_PTR args[4] = {
         (ULONG_PTR)proc, (ULONG_PTR)base,
         (ULONG_PTR)size, type
@@ -241,6 +298,28 @@ NTSTATUS NtDuplicateObject(HANDLE src_proc, HANDLE src_handle,
 NTSTATUS NtProtectVirtualMemory(HANDLE proc, PVOID *base, SIZE_T *size,
                                  ULONG new_prot, ULONG *old_prot)
 {
+    extern int g_compat32_mode;
+
+    if (g_compat32_mode) {
+        uint32_t *base32 = (uint32_t *)base;
+        uint32_t *size32 = (uint32_t *)size;
+
+        PVOID  base64 = (PVOID)(ULONG_PTR)*base32;
+        SIZE_T size64 = (SIZE_T)*size32;
+
+        ULONG_PTR args[5] = {
+            (ULONG_PTR)proc, (ULONG_PTR)&base64, (ULONG_PTR)&size64,
+            (ULONG_PTR)new_prot, (ULONG_PTR)old_prot
+        };
+        NTSTATUS st = sys_NtProtectVirtualMemory(args);
+
+        if (st == 0) {
+            *base32 = (uint32_t)(ULONG_PTR)base64;
+            *size32 = (uint32_t)size64;
+        }
+        return st;
+    }
+
     ULONG_PTR args[5] = {
         (ULONG_PTR)proc, (ULONG_PTR)base, (ULONG_PTR)size,
         (ULONG_PTR)new_prot, (ULONG_PTR)old_prot

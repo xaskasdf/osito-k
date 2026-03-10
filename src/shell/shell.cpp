@@ -33,6 +33,7 @@
 #endif
 
 extern "C" {
+extern void game_doomgeneric(void);
 
 #if ENABLE_FORTH
 /* Forth REPL and file runner (from zf_host.cpp) */
@@ -833,6 +834,8 @@ static void process_command(const char *cmd)
 #endif
     else if (ets_strcmp(cmd, "uname") == 0)
         cmd_uname();
+    else if (ets_strcmp(cmd, "doomgen") == 0)
+        game_doomgeneric();
     else if (ets_strcmp(cmd, "reboot") == 0)
         cmd_reboot();
     else {

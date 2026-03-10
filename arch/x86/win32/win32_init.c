@@ -173,6 +173,10 @@ void win32_init(void)
     fb_puts(" Win32 compat layer ready\n");
 }
 
+/* ── Current PE name (for GetModuleFileName) ─────────────────── */
+
+char win32_exe_name[64] = "program.exe";
+
 /* ── Load and execute a PE from OsitoFS ──────────────────────── */
 
 int win32_exec(const char *filename)
@@ -221,6 +225,14 @@ int win32_exec(const char *filename)
         serial_puts("[WIN32] Failed to read file\n");
         mem_free_pages(buf, pages);
         return -1;
+    }
+
+    /* Set the PE name for GetModuleFileName */
+    {
+        int i;
+        for (i = 0; filename[i] && i < 63; i++)
+            win32_exe_name[i] = filename[i];
+        win32_exe_name[i] = 0;
     }
 
     /* Hand off to the PE execution engine */

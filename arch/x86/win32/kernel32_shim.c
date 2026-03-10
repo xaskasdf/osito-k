@@ -9,15 +9,25 @@
 #include "ntdll_shim.h"
 #include "dllloader.h"
 
+/* ── Kernel interfaces (forward declarations) ─────────────── */
+extern void serial_puts(const char *s);
+extern void serial_puthex(uint64_t val, int digits);
+extern void serial_putdec(uint64_t val);
+
 /* ── Per-thread last error (global for now, TEB-based later) ── */
 
 static DWORD g_last_error = 0;
+
+/* Sync to TEB32 so 32-bit code reading FS:[0x34] sees correct value */
+extern TEB32 g_teb32;
+static inline void sync_last_error(void) { g_teb32.LastErrorValue = g_last_error; }
 
 /* ── Helpers ────────────────────────────────────────────────── */
 
 static inline void set_last_error_from_status(NTSTATUS status)
 {
     g_last_error = RtlNtStatusToDosError(status);
+    sync_last_error();
 }
 
 /* Convert ASCII string to UNICODE_STRING (stack-based, temporary) */
@@ -240,11 +250,54 @@ DWORD WINAPI GetCurrentProcessId(void)
 
 /* ── Memory API ─────────────────────────────────────────────── */
 
+/* ── FName::Names watchpoint ─────────────────────────────────── */
+extern uint32_t g_fname_names_addr;
+
+static void fname_watch(const char *tag)
+{
+    if (!g_fname_names_addr) return;
+    uint32_t *tarray = (uint32_t *)(uintptr_t)g_fname_names_addr;
+    uint32_t data_ptr = tarray[0];
+    uint32_t num = tarray[1];
+    if (!data_ptr || data_ptr < 0x10000 || data_ptr > 0x20000000) return;
+    if (num == 0 || num > 0x10000) return;
+    uint32_t *entries = (uint32_t *)(uintptr_t)data_ptr;
+    /* Check if entry[0] has a value */
+    static uint32_t last_data_ptr = 0;
+    static uint32_t last_entry0 = 0;
+    static int transition_logged = 0;
+    if (entries[0] != last_entry0 || data_ptr != last_data_ptr) {
+        serial_puts("[FNW:");
+        serial_puts(tag);
+        serial_puts("] Data=0x");
+        serial_puthex(data_ptr, 8);
+        serial_puts(" Num=");
+        serial_putdec(num);
+        serial_puts(" [0]=0x");
+        serial_puthex(entries[0], 8);
+        serial_puts(" [1]=0x");
+        serial_puthex(entries[1], 8);
+        serial_puts(" [4]=0x");
+        serial_puthex(num > 4 ? entries[4] : 0, 8);
+        serial_puts("\n");
+        if (last_entry0 != 0 && entries[0] == 0 && !transition_logged) {
+            transition_logged = 1;
+            serial_puts("[FNW] *** ENTRY[0] WAS CLEARED! prev=0x");
+            serial_puthex(last_entry0, 8);
+            serial_puts(" ***\n");
+        }
+        last_entry0 = entries[0];
+        last_data_ptr = data_ptr;
+    }
+}
+
 PVOID WINAPI VirtualAlloc(PVOID lpAddress, SIZE_T dwSize,
                    DWORD flAllocationType, DWORD flProtect)
 {
     PVOID base = lpAddress;
     SIZE_T size = dwSize;
+
+    fname_watch("VA-pre");
 
     NTSTATUS status = NtAllocateVirtualMemory(
         NT_CURRENT_PROCESS, &base, 0, &size,
@@ -255,6 +308,8 @@ PVOID WINAPI VirtualAlloc(PVOID lpAddress, SIZE_T dwSize,
         return NULL;
     }
 
+    fname_watch("VA-post");
+
     return base;
 }
 
@@ -262,6 +317,8 @@ BOOL WINAPI VirtualFree(PVOID lpAddress, SIZE_T dwSize, DWORD dwFreeType)
 {
     PVOID base = lpAddress;
     SIZE_T size = dwSize;
+
+    fname_watch("VF-pre");
 
     NTSTATUS status = NtFreeVirtualMemory(
         NT_CURRENT_PROCESS, &base, &size, dwFreeType);
@@ -271,12 +328,21 @@ BOOL WINAPI VirtualFree(PVOID lpAddress, SIZE_T dwSize, DWORD dwFreeType)
         return FALSE;
     }
 
+    fname_watch("VF-post");
+
     return TRUE;
 }
 
-/* ── Heap API (simple bump allocator) ───────────────────────── */
+/* ── Heap API (bump allocator with size headers) ────────────── */
+/*
+ * HeapReAlloc/HeapSize expect an 8-byte size header at (ptr - 8).
+ * HeapAlloc MUST write this header so realloc can copy the right amount.
+ * Without it, HeapReAlloc reads garbage as old_size → data loss on grow.
+ * This was the root cause of UE1 FName::Names corruption: TArray::Realloc
+ * called appRealloc → HeapReAlloc, which failed to copy old entries.
+ */
 
-#define HEAP_POOL_SIZE  (1024 * 1024)  /* 1MB heap */
+#define HEAP_POOL_SIZE  (16 * 1024 * 1024)  /* 16MB heap (UE1 needs ~8MB) */
 
 static BYTE  heap_pool[HEAP_POOL_SIZE];
 static SIZE_T heap_offset = 0;
@@ -290,20 +356,37 @@ HANDLE WINAPI GetProcessHeap(void)
 PVOID WINAPI HeapAlloc(HANDLE hHeap, DWORD dwFlags, SIZE_T dwBytes)
 {
     (void)hHeap;
+    static int heap_log_count = 0;
 
-    /* Align to 16 bytes */
-    SIZE_T aligned = (dwBytes + 15) & ~(SIZE_T)15;
+    /* 8-byte header + data, aligned to 16 bytes */
+    SIZE_T total = (dwBytes + 8 + 15) & ~(SIZE_T)15;
 
-    if (heap_offset + aligned > HEAP_POOL_SIZE) {
+    if (heap_offset + total > HEAP_POOL_SIZE) {
         g_last_error = 8; /* ERROR_NOT_ENOUGH_MEMORY */
         return NULL;
     }
 
-    PVOID ptr = heap_pool + heap_offset;
-    heap_offset += aligned;
+    BYTE *block = heap_pool + heap_offset;
+    heap_offset += total;
+
+    /* Write size header (same format as crt_malloc) */
+    *(SIZE_T *)block = total;
+    PVOID ptr = block + 8;
 
     if (dwFlags & 0x00000008) /* HEAP_ZERO_MEMORY */
         RtlZeroMemory(ptr, dwBytes);
+
+    /* Log first few allocations to identify heap_pool base address */
+    if (heap_log_count < 5) {
+        heap_log_count++;
+        serial_puts("[HEAP] alloc 0x");
+        serial_puthex(dwBytes, 8);
+        serial_puts(" -> 0x");
+        serial_puthex((uint64_t)(ULONG_PTR)ptr, 16);
+        serial_puts(" (pool=0x");
+        serial_puthex((uint64_t)(ULONG_PTR)heap_pool, 16);
+        serial_puts(")\n");
+    }
 
     return ptr;
 }
@@ -327,6 +410,7 @@ DWORD WINAPI GetLastError(void)
 void WINAPI SetLastError(DWORD dwErrCode)
 {
     g_last_error = dwErrCode;
+    sync_last_error();
 }
 
 /* ── Misc API ───────────────────────────────────────────────── */
@@ -1048,12 +1132,18 @@ HANDLE WINAPI LoadLibraryA(PCSTR lpLibFileName)
 HANDLE WINAPI LoadLibraryW(PCWSTR lpLibFileName)
 {
     if (!lpLibFileName) return NULL;
+
     /* Convert wide to ASCII */
     char name[260];
     int i;
     for (i = 0; i < 259 && lpLibFileName[i]; i++)
         name[i] = (char)(lpLibFileName[i] & 0xFF);
     name[i] = 0;
+
+    serial_puts("[K32] LoadLibraryW: ");
+    serial_puts(name);
+    serial_puts("\n");
+
     return LoadLibraryA(name);
 }
 
@@ -1073,7 +1163,9 @@ BOOL WINAPI FreeLibrary(HANDLE hLibModule)
 DWORD WINAPI GetModuleFileNameA(HANDLE hModule, PSTR lpFilename, DWORD nSize)
 {
     (void)hModule;
-    const char *name = "program.exe";
+    /* Use the actual PE executable name set by win32_exec */
+    extern char win32_exe_name[64];
+    const char *name = win32_exe_name;
     DWORD len = 0;
     while (name[len]) len++;
     if (len >= nSize) len = nSize - 1;
@@ -1085,11 +1177,21 @@ DWORD WINAPI GetModuleFileNameA(HANDLE hModule, PSTR lpFilename, DWORD nSize)
 DWORD WINAPI GetModuleFileNameW(HANDLE hModule, PWSTR lpFilename, DWORD nSize)
 {
     (void)hModule;
-    (void)lpFilename;
-    (void)nSize;
-    /* Stub: return 0 (failure) */
-    g_last_error = 126; /* ERROR_MOD_NOT_FOUND */
-    return 0;
+    /* Build wide path from actual PE name: "C:\<name>" */
+    extern char win32_exe_name[64];
+    static const WCHAR prefix[] = {'C',':','\\'};
+    DWORD pos = 0;
+
+    /* Copy prefix "C:\" */
+    for (DWORD i = 0; i < 3 && pos < nSize - 1; i++)
+        lpFilename[pos++] = prefix[i];
+
+    /* Copy exe name as wide chars */
+    for (int i = 0; win32_exe_name[i] && pos < nSize - 1; i++)
+        lpFilename[pos++] = (WCHAR)(unsigned char)win32_exe_name[i];
+
+    lpFilename[pos] = 0;
+    return pos;
 }
 
 /* ── Timing ────────────────────────────────────────────────── */
@@ -1120,6 +1222,46 @@ void WINAPI GetSystemTimeAsFileTime(PVOID lpSystemTimeAsFileTime)
 void WINAPI GetSystemInfo(LPSYSTEM_INFO lpSystemInfo)
 {
     if (!lpSystemInfo) return;
+
+    /*
+     * PE32 (i386) code allocates a 32-bit SYSTEM_INFO (36 bytes) on the
+     * stack. Our 64-bit struct is 48 bytes (PVOID/ULONG_PTR are 8 bytes).
+     * Writing 48 bytes to a 36-byte buffer overflows 12 bytes, corrupting
+     * the caller's stack frame. Bytes 44-45 contain wProcessorLevel=6,
+     * which lands on the saved SEH ExceptionList → value 6 in SEH chain.
+     *
+     * Fix: write using 32-bit struct layout (all fields 4 bytes or less).
+     *
+     * 32-bit SYSTEM_INFO layout (36 bytes):
+     *   +0:  WORD  wProcessorArchitecture
+     *   +2:  WORD  wReserved
+     *   +4:  DWORD dwPageSize
+     *   +8:  DWORD lpMinimumApplicationAddress  (4-byte ptr!)
+     *   +12: DWORD lpMaximumApplicationAddress  (4-byte ptr!)
+     *   +16: DWORD dwActiveProcessorMask        (4-byte!)
+     *   +20: DWORD dwNumberOfProcessors
+     *   +24: DWORD dwProcessorType
+     *   +28: DWORD dwAllocationGranularity
+     *   +32: WORD  wProcessorLevel
+     *   +34: WORD  wProcessorRevision
+     */
+    extern int g_compat32_mode;
+    if (g_compat32_mode) {
+        uint8_t *p = (uint8_t *)lpSystemInfo;
+        for (int i = 0; i < 36; i++) p[i] = 0;
+        *(uint16_t *)(p + 0)  = 0;     /* PROCESSOR_ARCHITECTURE_INTEL (i386) */
+        *(uint32_t *)(p + 4)  = 4096;  /* dwPageSize */
+        *(uint32_t *)(p + 8)  = 0x10000;    /* lpMinimumApplicationAddress */
+        *(uint32_t *)(p + 12) = 0x7FFEFFFF; /* lpMaximumApplicationAddress */
+        *(uint32_t *)(p + 16) = 1;     /* dwActiveProcessorMask */
+        *(uint32_t *)(p + 20) = 1;     /* dwNumberOfProcessors */
+        *(uint32_t *)(p + 24) = 586;   /* dwProcessorType (PROCESSOR_INTEL_PENTIUM) */
+        *(uint32_t *)(p + 28) = 65536; /* dwAllocationGranularity */
+        *(uint16_t *)(p + 32) = 6;     /* wProcessorLevel */
+        *(uint16_t *)(p + 34) = 0;     /* wProcessorRevision */
+        return;
+    }
+
     lpSystemInfo->wProcessorArchitecture  = 9; /* PROCESSOR_ARCHITECTURE_AMD64 */
     lpSystemInfo->dwPageSize              = 4096;
     lpSystemInfo->lpMinimumApplicationAddress = (PVOID)(ULONG_PTR)0x10000;
@@ -1338,7 +1480,31 @@ BOOL WINAPI FindNextFileW(HANDLE hFindFile, LPWIN32_FIND_DATAW lpFindFileData)
 void WINAPI GetStartupInfoA(LPSTARTUPINFOA lpStartupInfo)
 {
     if (!lpStartupInfo) return;
-    /* Zero everything */
+
+    /*
+     * PE32 (i386) STARTUPINFOA is 68 bytes (4-byte pointers/handles).
+     * Our 64-bit version is 104 bytes (8-byte pointers/handles).
+     * Must write 32-bit layout to avoid 36-byte stack overflow.
+     *
+     * 32-bit layout (68 bytes):
+     *   +0:  DWORD cb               +4:  LPSTR lpReserved
+     *   +8:  LPSTR lpDesktop        +12: LPSTR lpTitle
+     *   +16: DWORD dwX              +20: DWORD dwY
+     *   +24: DWORD dwXSize          +28: DWORD dwYSize
+     *   +32: DWORD dwXCountChars    +36: DWORD dwYCountChars
+     *   +40: DWORD dwFillAttribute  +44: DWORD dwFlags
+     *   +48: WORD wShowWindow       +50: WORD cbReserved2
+     *   +52: LPBYTE lpReserved2     +56: HANDLE hStdInput
+     *   +60: HANDLE hStdOutput      +64: HANDLE hStdError
+     */
+    extern int g_compat32_mode;
+    if (g_compat32_mode) {
+        uint8_t *p = (uint8_t *)lpStartupInfo;
+        for (int i = 0; i < 68; i++) p[i] = 0;
+        *(uint32_t *)(p + 0) = 68;  /* cb = 32-bit sizeof */
+        return;
+    }
+
     BYTE *p = (BYTE *)lpStartupInfo;
     for (SIZE_T i = 0; i < sizeof(STARTUPINFOA); i++) p[i] = 0;
     lpStartupInfo->cb = sizeof(STARTUPINFOA);
@@ -1506,13 +1672,44 @@ PVOID WINAPI HeapReAlloc(HANDLE hHeap, DWORD dwFlags, PVOID lpMem, SIZE_T dwByte
     (void)hHeap;
     if (!lpMem) return HeapAlloc(hHeap, dwFlags, dwBytes);
 
-    SIZE_T old_size = HeapSize(hHeap, 0, lpMem);
+    /* Check if ptr is from our heap pool (has valid header) */
+    BYTE *block = (BYTE *)lpMem - 8;
+    int from_heap = (block >= heap_pool && block < heap_pool + HEAP_POOL_SIZE);
+
+    SIZE_T old_size;
+    if (from_heap) {
+        old_size = *(SIZE_T *)block - 8;
+    } else {
+        /* Not from heap pool — try VirtualAlloc page-aligned heuristic.
+         * Cannot determine exact size; use dwBytes as copy size (grow = copy all old) */
+        old_size = dwBytes;
+        serial_puts("[HEAP-RA] ptr not from heap_pool: 0x");
+        serial_puthex((uint64_t)(ULONG_PTR)lpMem, 8);
+        serial_puts(" new_size=0x");
+        serial_puthex(dwBytes, 8);
+        serial_puts("\n");
+    }
+
     PVOID new_mem = HeapAlloc(hHeap, dwFlags, dwBytes);
     if (!new_mem) return NULL;
 
     SIZE_T copy = old_size < dwBytes ? old_size : dwBytes;
     BYTE *d = (BYTE *)new_mem, *s = (BYTE *)lpMem;
     for (SIZE_T i = 0; i < copy; i++) d[i] = s[i];
+
+    /* Diagnostic: log realloc details for FName array debugging */
+    serial_puts("[HEAP-RA] 0x");
+    serial_puthex((uint64_t)(ULONG_PTR)lpMem, 8);
+    serial_puts(" -> 0x");
+    serial_puthex((uint64_t)(ULONG_PTR)new_mem, 8);
+    serial_puts(" old_sz=0x");
+    serial_puthex(old_size, 8);
+    serial_puts(" new_sz=0x");
+    serial_puthex(dwBytes, 8);
+    serial_puts(" copy=0x");
+    serial_puthex(copy, 8);
+    serial_puts("\n");
+
     return new_mem;
 }
 

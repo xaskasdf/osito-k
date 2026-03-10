@@ -519,4 +519,52 @@ typedef struct _TEB {
     ULONG       LastErrorValue;
 } TEB, *PTEB;
 
+/*
+ * 32-bit TEB for PE32 (i386) compatibility mode.
+ *
+ * Windows i386 uses FS:0 → TEB with 4-byte pointers.
+ * Our 64-bit TEB has 8-byte PVOID fields, so offsets are wrong.
+ * This struct matches the Win32 TEB layout at critical offsets:
+ *   +0x00 ExceptionList (SEH chain)
+ *   +0x18 Self
+ *   +0x20 ClientId
+ *   +0x30 ProcessEnvironmentBlock
+ *   +0x34 LastErrorValue
+ *
+ * Must be allocated in <4GB memory.
+ */
+typedef struct __attribute__((packed)) _TEB32 {
+    uint32_t    ExceptionList;              /* +0x00 SEH chain head */
+    uint32_t    StackBase;                  /* +0x04 */
+    uint32_t    StackLimit;                 /* +0x08 */
+    uint32_t    SubSystemTib;               /* +0x0C */
+    uint32_t    FiberData;                  /* +0x10 */
+    uint32_t    ArbitraryUserPointer;       /* +0x14 */
+    uint32_t    Self;                       /* +0x18 linear address of TEB32 */
+    uint32_t    EnvironmentPointer;         /* +0x1C */
+    uint32_t    ClientId_UniqueProcess;     /* +0x20 */
+    uint32_t    ClientId_UniqueThread;      /* +0x24 */
+    uint32_t    ActiveRpcHandle;            /* +0x28 */
+    uint32_t    ThreadLocalStoragePointer;  /* +0x2C */
+    uint32_t    ProcessEnvironmentBlock;    /* +0x30 → PEB32 */
+    uint32_t    LastErrorValue;             /* +0x34 */
+} TEB32, *PTEB32;
+
+/*
+ * 32-bit PEB for PE32 compatibility mode.
+ * Only the fields that UT99/UE1 actually access.
+ */
+typedef struct __attribute__((packed)) _PEB32 {
+    uint8_t     InheritedAddressSpace;      /* +0x00 */
+    uint8_t     ReadImageFileExecOptions;   /* +0x01 */
+    uint8_t     BeingDebugged;              /* +0x02 */
+    uint8_t     Spare;                      /* +0x03 */
+    uint32_t    Mutant;                     /* +0x04 */
+    uint32_t    ImageBaseAddress;           /* +0x08 */
+    uint32_t    Ldr;                        /* +0x0C */
+    uint32_t    ProcessParameters;          /* +0x10 */
+    uint32_t    SubSystemData;              /* +0x14 */
+    uint32_t    ProcessHeap;               /* +0x18 */
+} PEB32, *PPEB32;
+
 #endif /* NTTYPES_H */

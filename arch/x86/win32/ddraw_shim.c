@@ -49,18 +49,41 @@ static DWORD display_width  = 800;
 static DWORD display_height = 600;
 static DWORD display_bpp    = 16;  /* UT99 SoftDrv uses 16-bit (RGB565) */
 
-/* Framebuffer pointer — in real OsitoK, this points to the LFB.
- * In test harness mode, we allocate a buffer. */
+/* Framebuffer pointer — connect to real GOP LFB on OsitoK bare metal,
+ * or allocate a separate buffer in test harness mode. */
 static BYTE *framebuffer = NULL;
 static SIZE_T fb_size = 0;
+static uint32_t gop_pitch = 0;   /* GOP scanline pitch in pixels */
 static HANDLE ddraw_hwnd = NULL;  /* game window — saved by SetCooperativeLevel */
+
+/* GOP framebuffer accessors (defined in kernel/framebuffer.c) */
+extern uint32_t *fb_get_base(void)   __attribute__((weak));
+extern uint32_t  fb_get_width(void)  __attribute__((weak));
+extern uint32_t  fb_get_height(void) __attribute__((weak));
+extern uint32_t  fb_get_pitch(void)  __attribute__((weak));
 
 static void ensure_framebuffer(void)
 {
+    /* Try to use the real GOP framebuffer first */
+    if (!framebuffer && fb_get_base) {
+        uint32_t *gop = fb_get_base();
+        if (gop) {
+            framebuffer = (BYTE *)gop;
+            gop_pitch = fb_get_pitch ? fb_get_pitch() : display_width;
+            fb_size = (SIZE_T)gop_pitch * (fb_get_height ? fb_get_height() : display_height) * 4;
+            serial_puts("[DDRAW] Using GOP framebuffer at 0x");
+            serial_puthex((uint64_t)(ULONG_PTR)framebuffer, 16);
+            serial_puts("\n");
+            return;
+        }
+    }
+
+    /* Fallback: allocate system RAM buffer */
     SIZE_T needed = (SIZE_T)display_width * display_height * 4; /* 32bpp output */
     if (framebuffer && fb_size >= needed) return;
     if (framebuffer) mem_free_pages(framebuffer, (fb_size + 4095) / 4096);
     fb_size = needed;
+    gop_pitch = display_width;
     framebuffer = (BYTE *)mem_alloc_pages((fb_size + 4095) / 4096);
     if (framebuffer) dd_memset(framebuffer, 0, fb_size);
 }
@@ -225,26 +248,30 @@ static HRESULT WINAPI surf_Blt(IDirectDrawSurface7 *self, LPRECT destRect,
         dd_memcpy(dst->pixels, s->pixels, copy_size);
     }
 
-    /* If primary surface, blit to framebuffer */
+    /* If primary surface, blit to GOP framebuffer */
     if (dst->is_primary) {
         ensure_framebuffer();
         if (framebuffer && dst->pixels) {
-            /* Convert RGB565 → XRGB8888 if needed */
-            if (dst->bpp == 16 && framebuffer) {
+            /* Convert RGB565 → XRGB8888, respecting GOP pitch */
+            if (dst->bpp == 16) {
                 uint16_t *src16 = (uint16_t *)dst->pixels;
                 uint32_t *dst32 = (uint32_t *)framebuffer;
-                DWORD count = dst->width * dst->height;
-                for (DWORD i = 0; i < count; i++) {
-                    uint16_t c = src16[i];
-                    uint32_t r = ((c >> 11) & 0x1F) * 255 / 31;
-                    uint32_t g = ((c >> 5)  & 0x3F) * 255 / 63;
-                    uint32_t b = (c & 0x1F) * 255 / 31;
-                    dst32[i] = (r << 16) | (g << 8) | b;
+                DWORD pitch = gop_pitch ? gop_pitch : dst->width;
+                for (DWORD y = 0; y < dst->height; y++) {
+                    for (DWORD x = 0; x < dst->width; x++) {
+                        uint16_t c = src16[y * dst->width + x];
+                        uint32_t r = ((c >> 11) & 0x1F) * 255 / 31;
+                        uint32_t g = ((c >> 5)  & 0x3F) * 255 / 63;
+                        uint32_t b = (c & 0x1F) * 255 / 31;
+                        dst32[y * pitch + x] = (r << 16) | (g << 8) | b;
+                    }
                 }
             } else if (dst->bpp == 32) {
-                SIZE_T sz = (SIZE_T)dst->width * dst->height * 4;
-                if (sz > fb_size) sz = fb_size;
-                dd_memcpy(framebuffer, dst->pixels, sz);
+                uint32_t *src32 = (uint32_t *)dst->pixels;
+                uint32_t *dst32 = (uint32_t *)framebuffer;
+                DWORD pitch = gop_pitch ? gop_pitch : dst->width;
+                for (DWORD y = 0; y < dst->height; y++)
+                    dd_memcpy(&dst32[y * pitch], &src32[y * dst->width], dst->width * 4);
             }
         }
     }
@@ -277,19 +304,21 @@ static HRESULT WINAPI surf_Flip(IDirectDrawSurface7 *self,
     primary->pixels = back->pixels;
     back->pixels = tmp;
 
-    /* Blit primary to framebuffer */
+    /* Blit primary to GOP framebuffer */
     ensure_framebuffer();
     if (framebuffer && primary->pixels) {
         if (primary->bpp == 16) {
             uint16_t *src16 = (uint16_t *)primary->pixels;
             uint32_t *dst32 = (uint32_t *)framebuffer;
-            DWORD count = primary->width * primary->height;
-            for (DWORD i = 0; i < count; i++) {
-                uint16_t c = src16[i];
-                uint32_t r = ((c >> 11) & 0x1F) * 255 / 31;
-                uint32_t g = ((c >> 5)  & 0x3F) * 255 / 63;
-                uint32_t b = (c & 0x1F) * 255 / 31;
-                dst32[i] = (r << 16) | (g << 8) | b;
+            DWORD pitch = gop_pitch ? gop_pitch : primary->width;
+            for (DWORD y = 0; y < primary->height; y++) {
+                for (DWORD x = 0; x < primary->width; x++) {
+                    uint16_t c = src16[y * primary->width + x];
+                    uint32_t r = ((c >> 11) & 0x1F) * 255 / 31;
+                    uint32_t g = ((c >> 5)  & 0x3F) * 255 / 63;
+                    uint32_t b = (c & 0x1F) * 255 / 31;
+                    dst32[y * pitch + x] = (r << 16) | (g << 8) | b;
+                }
             }
         }
     }

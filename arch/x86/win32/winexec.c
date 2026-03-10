@@ -91,22 +91,45 @@ PVOID pe_resolve_import(const char *dll_name, const char *func_name,
 static PEB  g_peb;
 TEB  g_teb;   /* non-static: accessed by ntdll_shim.c for SEH dispatch */
 
-static void setup_environment(PVOID image_base)
+/*
+ * 32-bit TEB/PEB for PE32 compat mode.
+ * PE32 (i386) code accesses TEB via FS segment with 4-byte pointer offsets.
+ * The 64-bit TEB has 8-byte pointers, so offsets are all wrong for 32-bit code.
+ * Example: 32-bit TEB.Self is at +0x18, but 64-bit TEB.Self is at +0x30.
+ */
+static PEB32  g_peb32;
+TEB32  g_teb32;  /* non-static: accessed by ntdll_shim.c for SEH/LastError */
+
+static void setup_environment(PVOID image_base, int is32bit)
 {
-    /* Minimal PEB */
+    /* Minimal PEB (64-bit) */
     g_peb.BeingDebugged    = 0;
     g_peb.ImageBaseAddress = image_base;
     g_peb.Ldr              = NULL;  /* no module list yet */
     g_peb.ProcessParameters = NULL; /* no command line yet */
     g_peb.ProcessHeap      = (PVOID)(ULONG_PTR)0xBEEF0001; /* our heap sentinel */
 
-    /* Minimal TEB */
+    /* Minimal TEB (64-bit) */
     g_teb.Self                       = &g_teb;
     g_teb.ProcessEnvironmentBlock    = &g_peb;
     g_teb.ClientId.UniqueProcess     = (HANDLE)(ULONG_PTR)1;
     g_teb.ClientId.UniqueThread      = (HANDLE)(ULONG_PTR)1;
     g_teb.LastErrorValue             = 0;
     g_teb.ExceptionList              = (PVOID)(ULONG_PTR)-1; /* empty SEH chain */
+
+    if (is32bit) {
+        /*
+         * TEB32/PEB32 already pre-initialized before pe_load().
+         * Just update the image base address (now known) and log.
+         */
+        g_peb32.ImageBaseAddress = (uint32_t)(ULONG_PTR)image_base;
+
+        serial_puts("[WINEXEC] TEB32 at 0x");
+        serial_puthex((uint64_t)(ULONG_PTR)&g_teb32, 16);
+        serial_puts(" PEB32 at 0x");
+        serial_puthex((uint64_t)(ULONG_PTR)&g_peb32, 16);
+        serial_puts("\n");
+    }
 
     /*
      * Windows stores TEB pointer in GS:0x30 (x86-64).
@@ -175,6 +198,52 @@ int winexec_run(const uint8_t *file_data, uint64_t file_size)
     dll_register_shim("comctl32.dll", comctl32_resolve);
     dll_register_shim("comdlg32.dll", comdlg32_resolve);
 
+    /*
+     * Initialize compat32 thunk pool BEFORE pe_load(), because pe_load()
+     * recursively loads DLLs (via dll_resolve_import → dll_load) and those
+     * DLLs need the thunk pool to exist for IAT patching.
+     */
+    compat32_init();
+
+    /*
+     * Pre-initialize TEB32/PEB32 and set FS base BEFORE pe_load().
+     *
+     * pe_load() recursively loads DLLs and calls DllMain via compat32
+     * callbacks. DllMain's CRT startup code registers SEH handlers:
+     *   push dword ptr fs:[0]   ; save current ExceptionList
+     *   mov  fs:[0], esp        ; install new handler
+     *
+     * If FS_BASE isn't pointing to g_teb32 yet, fs:[0] reads garbage
+     * from whatever address FS_BASE points to (0 or stale kernel TLS).
+     * That garbage gets saved as the "previous" SEH chain link.
+     * Later, SEH unwind restores it: mov fs:[0], eax → ExceptionList
+     * becomes the garbage value (e.g. 0x6), corrupting the SEH chain.
+     *
+     * Fix: set up TEB32 with ExceptionList=0xFFFFFFFF and point
+     * FS_BASE to it before any 32-bit code executes.
+     */
+    {
+        uint8_t *p;
+
+        p = (uint8_t *)&g_peb32;
+        for (int i = 0; i < (int)sizeof(g_peb32); i++) p[i] = 0;
+        g_peb32.BeingDebugged = 0;
+        g_peb32.ProcessHeap   = 0xBEEF0001;
+
+        p = (uint8_t *)&g_teb32;
+        for (int i = 0; i < (int)sizeof(g_teb32); i++) p[i] = 0;
+        g_teb32.Self                    = (uint32_t)(ULONG_PTR)&g_teb32;
+        g_teb32.ProcessEnvironmentBlock = (uint32_t)(ULONG_PTR)&g_peb32;
+        g_teb32.ClientId_UniqueProcess  = 1;
+        g_teb32.ClientId_UniqueThread   = 1;
+        g_teb32.LastErrorValue          = 0;
+        g_teb32.ExceptionList           = 0xFFFFFFFF; /* empty SEH chain */
+
+        compat32_setup_teb(&g_teb32);
+
+        serial_puts("[WINEXEC] TEB32 pre-initialized, FS base set\n");
+    }
+
     serial_puts("[WINEXEC] loading PE...\n");
 
     /* Load PE */
@@ -195,14 +264,14 @@ int winexec_run(const uint8_t *file_data, uint64_t file_size)
                 ? " (console)\n" : " (other)\n");
 
     /* Set up PEB/TEB */
-    setup_environment(info.ImageBase);
+    setup_environment(info.ImageBase, info.Is32Bit);
     serial_puts("[WINEXEC] PEB/TEB initialized, GS base set\n");
 
-    /* For PE32 (i386): initialize compat32 thunk layer and patch IAT */
+    /* For PE32 (i386): patch EXE IAT and set up FS:TEB */
     if (info.Is32Bit) {
-        serial_puts("[WINEXEC] PE32 (i386) detected — setting up 32-bit compat\n");
-
-        compat32_init();
+        extern int g_compat32_mode;
+        g_compat32_mode = 1;
+        serial_puts("[WINEXEC] PE32 (i386) detected — patching EXE IAT\n");
 
         /* Patch IAT: replace truncated 64-bit ptrs with 32-bit thunk addrs */
         NTSTATUS compat_st = compat32_patch_iat(&info);
@@ -213,7 +282,11 @@ int winexec_run(const uint8_t *file_data, uint64_t file_size)
         }
 
         /* Set FS base for 32-bit TEB access (Windows i386 uses FS:0) */
-        compat32_setup_teb(&g_teb);
+        compat32_setup_teb(&g_teb32);
+
+        serial_puts("[WINEXEC] TEB32.ExceptionList after setup = 0x");
+        serial_puthex(g_teb32.ExceptionList, 8);
+        serial_puts("\n");
     }
 
     /* Allocate user stack */
@@ -232,6 +305,17 @@ int winexec_run(const uint8_t *file_data, uint64_t file_size)
     uint8_t *stack_top = stack_base + (stack_pages * 4096) - 64;
     /* Align to 16-byte boundary */
     stack_top = (uint8_t *)((uint64_t)stack_top & ~0xFULL);
+
+    if (info.Is32Bit) {
+        serial_puts("[WINEXEC] TEB32.ExceptionList before EXE entry = 0x");
+        serial_puthex(g_teb32.ExceptionList, 8);
+        serial_puts("\n");
+
+        /* Arm hardware watchpoint on TEB32.ExceptionList to catch
+         * the exact instruction that writes corrupt values (like 0x6) */
+        extern void idt_watch_write4(void *addr);
+        idt_watch_write4(&g_teb32.ExceptionList);
+    }
 
     serial_puts("[WINEXEC] jumping to entry point at ");
     serial_puthex((uint64_t)info.EntryPoint, 16);

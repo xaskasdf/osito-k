@@ -390,6 +390,10 @@ void fb_putc(char c, uint32_t color)
 
 uint32_t fb_get_cols(void) { return max_cols; }
 uint32_t fb_get_rows(void) { return max_rows; }
+uint32_t *fb_get_base(void)   { return fb_base; }
+uint32_t  fb_get_width(void)  { return fb_width; }
+uint32_t  fb_get_height(void) { return fb_height; }
+uint32_t  fb_get_pitch(void)  { return fb_pitch; }
 
 void fb_puts(const char *s)
 {

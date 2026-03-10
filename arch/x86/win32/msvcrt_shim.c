@@ -8,6 +8,7 @@
 #include "msvcrt_shim.h"
 #include "kernel32_shim.h"
 #include "ntdll_shim.h"
+#include "compat32.h"
 
 #ifdef TEST_HARNESS
 #include <math.h>
@@ -27,20 +28,73 @@ typedef __builtin_ms_va_list ms_va_list;
 /* ── Internal helpers ──────────────────────────────────────── */
 
 extern void serial_puts(const char *s);
+extern void serial_putchar(char c);
+extern void serial_puthex(uint64_t val, int digits);
+extern void serial_putdec(uint64_t val);
 extern void proc_exit(int32_t code);
+extern void compat32_callback(uint32_t func_addr);
 
 /* ── CRT Initialization ────────────────────────────────────── */
 
+/*
+ * _initterm walks an array of function pointers and calls each non-NULL one.
+ * CRITICAL: PE32 (i386) arrays contain 4-byte function pointers, but our
+ * 64-bit code would read them as 8-byte pointers, combining pairs and
+ * calling garbage addresses. We detect this by checking if the pointers
+ * are in low memory (<4GB) and iterate with 4-byte steps.
+ *
+ * Additionally, these function pointers are 32-bit compat-mode code that
+ * cannot be called directly from 64-bit. We use compat32_callback() which
+ * switches to compat mode, calls the function, and returns.
+ */
 void WINAPI _initterm(_PVFV *pfbegin, _PVFV *pfend)
 {
+#ifndef TEST_HARNESS
+    /* PE32 mode: treat as array of uint32_t function pointers */
+    uint32_t *begin32 = (uint32_t *)(ULONG_PTR)pfbegin;
+    uint32_t *end32   = (uint32_t *)(ULONG_PTR)pfend;
+
+    serial_puts("[MSVCRT] _initterm: ");
+    serial_putdec((uint64_t)(end32 - begin32));
+    serial_puts(" entries at 0x");
+    serial_puthex((uint64_t)(ULONG_PTR)begin32, 8);
+    serial_puts("\n");
+
+    for (uint32_t *p = begin32; p < end32; p++) {
+        if (*p) {
+            compat32_callback(*p);
+        }
+    }
+#else
     for (_PVFV *pfn = pfbegin; pfn < pfend; pfn++) {
         if (*pfn)
             (*pfn)();
     }
+#endif
 }
 
 int WINAPI _initterm_e(_PIFV *pfbegin, _PIFV *pfend)
 {
+#ifndef TEST_HARNESS
+    /* PE32 mode: same 32-bit pointer handling */
+    uint32_t *begin32 = (uint32_t *)(ULONG_PTR)pfbegin;
+    uint32_t *end32   = (uint32_t *)(ULONG_PTR)pfend;
+
+    serial_puts("[MSVCRT] _initterm_e: ");
+    serial_putdec((uint64_t)(end32 - begin32));
+    serial_puts(" entries at 0x");
+    serial_puthex((uint64_t)(ULONG_PTR)begin32, 8);
+    serial_puts("\n");
+
+    for (uint32_t *p = begin32; p < end32; p++) {
+        if (*p) {
+            /* For _initterm_e, we can't easily get the return value
+             * from a 32-bit callback. Treat as void for now. */
+            compat32_callback(*p);
+        }
+    }
+    return 0;
+#else
     for (_PIFV *pfn = pfbegin; pfn < pfend; pfn++) {
         if (*pfn) {
             int ret = (*pfn)();
@@ -49,6 +103,7 @@ int WINAPI _initterm_e(_PIFV *pfbegin, _PIFV *pfend)
         }
     }
     return 0;
+#endif
 }
 
 static char *g_argv0 = "program.exe";
@@ -282,8 +337,59 @@ PVOID WINAPI crt_memset(PVOID dst, int c, SIZE_T n)
     return dst;
 }
 
+extern void serial_puts(const char *s);
+extern void serial_puthex(uint64_t val, int digits);
+extern void serial_putdec(uint64_t val);
+extern uint32_t g_fname_names_addr;
+
 PVOID WINAPI crt_memmove(PVOID dst, PCVOID src, SIZE_T n)
 {
+    /* Log memmove calls with src/dst/size for debugging FName issue */
+    static int mm_log = 0;
+    if (mm_log < 20) {
+        mm_log++;
+        serial_puts("[MM] dst=0x");
+        serial_puthex((uint64_t)(ULONG_PTR)dst, 8);
+        serial_puts(" src=0x");
+        serial_puthex((uint64_t)(ULONG_PTR)src, 8);
+        serial_puts(" n=0x");
+        serial_puthex(n, 8);
+        serial_puts("\n");
+    }
+    /* Check if this memmove touches the FName::Names Data buffer */
+    if (g_fname_names_addr) {
+        uint32_t *tarray = (uint32_t *)(uintptr_t)g_fname_names_addr;
+        uint32_t data_ptr = tarray[0];
+        if (data_ptr >= 0x10000 && data_ptr < 0x20000000) {
+            uint32_t num = tarray[1];
+            uint32_t buf_size = num * 4;
+            uint64_t d = (uint64_t)(ULONG_PTR)dst;
+            uint64_t s = (uint64_t)(ULONG_PTR)src;
+            /* Check if src or dst overlaps with Data buffer */
+            if ((d >= data_ptr && d < data_ptr + buf_size) ||
+                (d + n > data_ptr && d < data_ptr + buf_size) ||
+                (s >= data_ptr && s < data_ptr + buf_size) ||
+                (s + n > data_ptr && s < data_ptr + buf_size)) {
+                serial_puts("[MM-FNAME!] TOUCHES FName Data=0x");
+                serial_puthex(data_ptr, 8);
+                serial_puts(" Num=");
+                serial_putdec(num);
+                serial_puts("\n");
+                /* Dump entries[0..3] before copy */
+                uint32_t *entries = (uint32_t *)(uintptr_t)data_ptr;
+                serial_puts("  PRE: [0]=0x");
+                serial_puthex(entries[0], 8);
+                serial_puts(" [1]=0x");
+                serial_puthex(entries[1], 8);
+                serial_puts(" [2]=0x");
+                serial_puthex(entries[2], 8);
+                serial_puts(" [3]=0x");
+                serial_puthex(entries[3], 8);
+                serial_puts("\n");
+            }
+        }
+    }
+
     BYTE *d = (BYTE *)dst;
     const BYTE *s = (const BYTE *)src;
     if (d < s) {
@@ -600,6 +706,273 @@ static int do_vformat(FMT_CTX *ctx, const char *fmt, ms_va_list ap)
         fmt++;
     }
 done:
+    if (ctx->buf && ctx->size > 0) {
+        SIZE_T end = ctx->pos < ctx->size - 1 ? ctx->pos : ctx->size - 1;
+        ctx->buf[end] = 0;
+    }
+    return (int)ctx->pos;
+}
+
+/*
+ * do_vformat32 — Format walker for 32-bit va_list (4-byte arg slots).
+ *
+ * When a 32-bit PE32 program calls vsprintf/vprintf/etc via INT 0x2E thunk,
+ * the va_list parameter is a pointer into the 32-bit stack where args are
+ * packed in 4-byte slots. ms_va_arg reads 8-byte slots which is WRONG.
+ * This version manually walks the 32-bit stack with uint32_t* increments.
+ */
+static int do_vformat32(FMT_CTX *ctx, const char *fmt, uint32_t *vp)
+{
+    while (*fmt) {
+        if (*fmt != '%') {
+            fmt_putc(ctx, *fmt++);
+            continue;
+        }
+        fmt++; /* skip '%' */
+
+        /* Flags */
+        int left_align = 0, zero_pad = 0, plus_sign = 0, space_sign = 0;
+        for (;;) {
+            if (*fmt == '-') { left_align = 1; fmt++; }
+            else if (*fmt == '0') { zero_pad = 1; fmt++; }
+            else if (*fmt == '+') { plus_sign = 1; fmt++; }
+            else if (*fmt == ' ') { space_sign = 1; fmt++; }
+            else break;
+        }
+
+        /* Width */
+        int width = 0;
+        if (*fmt == '*') { width = (int)(*vp++); fmt++; }
+        else { while (*fmt >= '0' && *fmt <= '9') { width = width * 10 + (*fmt - '0'); fmt++; } }
+
+        /* Precision */
+        int precision = -1;
+        if (*fmt == '.') {
+            fmt++;
+            precision = 0;
+            if (*fmt == '*') { precision = (int)(*vp++); fmt++; }
+            else { while (*fmt >= '0' && *fmt <= '9') { precision = precision * 10 + (*fmt - '0'); fmt++; } }
+        }
+
+        /* Length modifier */
+        int len_mod = 0; /* 0=int, 1=long, 2=long long, 3=size_t */
+        if (*fmt == 'l') {
+            fmt++; len_mod = 1;
+            if (*fmt == 'l') { fmt++; len_mod = 2; }
+        } else if (*fmt == 'z') {
+            fmt++; len_mod = 3;
+        } else if (*fmt == 'h') {
+            fmt++;
+            if (*fmt == 'h') fmt++;
+            /* treat as int */
+        } else if (*fmt == 'I') {
+            /* MSVC I64 prefix */
+            if (fmt[1] == '6' && fmt[2] == '4') {
+                fmt += 3; len_mod = 2;
+            }
+        }
+
+        /* Conversion */
+        char num_buf[24];
+        SIZE_T num_len;
+        const char *str;
+        SIZE_T str_len;
+        int negative = 0;
+
+        switch (*fmt) {
+        case 'd': case 'i': {
+            long long val;
+            if (len_mod == 2) {
+                /* 64-bit: two consecutive 32-bit values (lo, hi) */
+                uint32_t lo = *vp++, hi = *vp++;
+                val = (long long)((uint64_t)hi << 32 | lo);
+            } else {
+                val = (long long)(int32_t)(*vp++);
+            }
+
+            if (val < 0) { negative = 1; val = -val; }
+            num_len = uint_to_str(num_buf, (unsigned long long)val, 10, 0);
+
+            int total = (int)num_len + negative;
+            if (plus_sign || space_sign) total++;
+            char pad = (zero_pad && !left_align) ? '0' : ' ';
+
+            if (!left_align && pad == ' ') fmt_pad(ctx, width - total, ' ');
+            if (negative) fmt_putc(ctx, '-');
+            else if (plus_sign) fmt_putc(ctx, '+');
+            else if (space_sign) fmt_putc(ctx, ' ');
+            if (!left_align && pad == '0') fmt_pad(ctx, width - total, '0');
+            fmt_puts(ctx, num_buf, num_len);
+            if (left_align) fmt_pad(ctx, width - total, ' ');
+            break;
+        }
+        case 'u': {
+            unsigned long long val;
+            if (len_mod == 2) {
+                uint32_t lo = *vp++, hi = *vp++;
+                val = ((uint64_t)hi << 32) | lo;
+            } else {
+                val = (unsigned long long)(*vp++);
+            }
+
+            num_len = uint_to_str(num_buf, val, 10, 0);
+            if (!left_align) fmt_pad(ctx, width - (int)num_len, zero_pad ? '0' : ' ');
+            fmt_puts(ctx, num_buf, num_len);
+            if (left_align) fmt_pad(ctx, width - (int)num_len, ' ');
+            break;
+        }
+        case 'x': case 'X': {
+            unsigned long long val;
+            if (len_mod == 2) {
+                uint32_t lo = *vp++, hi = *vp++;
+                val = ((uint64_t)hi << 32) | lo;
+            } else {
+                val = (unsigned long long)(*vp++);
+            }
+
+            num_len = uint_to_str(num_buf, val, 16, (*fmt == 'X'));
+            if (!left_align) fmt_pad(ctx, width - (int)num_len, zero_pad ? '0' : ' ');
+            fmt_puts(ctx, num_buf, num_len);
+            if (left_align) fmt_pad(ctx, width - (int)num_len, ' ');
+            break;
+        }
+        case 'o': {
+            unsigned long long val;
+            if (len_mod >= 1) {
+                uint32_t lo = *vp++, hi = *vp++;
+                val = ((uint64_t)hi << 32) | lo;
+            } else {
+                val = (unsigned long long)(*vp++);
+            }
+
+            num_len = uint_to_str(num_buf, val, 8, 0);
+            if (!left_align) fmt_pad(ctx, width - (int)num_len, zero_pad ? '0' : ' ');
+            fmt_puts(ctx, num_buf, num_len);
+            if (left_align) fmt_pad(ctx, width - (int)num_len, ' ');
+            break;
+        }
+        case 'p': {
+            /* 32-bit pointer */
+            uint32_t val32 = *vp++;
+            num_len = uint_to_str(num_buf, (unsigned long long)val32, 16, 0);
+            int total = (int)num_len + 2; /* "0x" prefix */
+            if (!left_align) fmt_pad(ctx, width - total, ' ');
+            fmt_putc(ctx, '0'); fmt_putc(ctx, 'x');
+            fmt_pad(ctx, 8 - (int)num_len, '0');
+            fmt_puts(ctx, num_buf, num_len);
+            if (left_align) fmt_pad(ctx, width - total, ' ');
+            break;
+        }
+        case 's':
+            str = (const char *)(uintptr_t)(*vp++);
+            if (!str) str = "(null)";
+            str_len = crt_strlen(str);
+            if (precision >= 0 && (SIZE_T)precision < str_len)
+                str_len = (SIZE_T)precision;
+            if (!left_align) fmt_pad(ctx, width - (int)str_len, ' ');
+            fmt_puts(ctx, str, str_len);
+            if (left_align) fmt_pad(ctx, width - (int)str_len, ' ');
+            break;
+
+        case 'c': {
+            char ch = (char)(*vp++);
+            if (!left_align) fmt_pad(ctx, width - 1, ' ');
+            fmt_putc(ctx, ch);
+            if (left_align) fmt_pad(ctx, width - 1, ' ');
+            break;
+        }
+        case 'f': case 'e': case 'g': {
+            /* Double on 32-bit stack: 8 bytes = two consecutive uint32_t */
+            uint32_t lo = *vp++, hi = *vp++;
+            uint64_t bits = ((uint64_t)hi << 32) | lo;
+            double val;
+            __builtin_memcpy(&val, &bits, 8);
+            int prec = (precision >= 0) ? precision : 6;
+
+            int f_neg = 0;
+            if (val < 0) { f_neg = 1; val = -val; }
+
+            unsigned long long int_part = (unsigned long long)val;
+            double frac_part = val - (double)int_part;
+
+            char f_buf[80];
+            int f_pos = 0;
+            SIZE_T ip_len = uint_to_str(f_buf, int_part, 10, 0);
+            f_pos = (int)ip_len;
+
+            if (prec > 0) {
+                f_buf[f_pos++] = '.';
+                for (int fi = 0; fi < prec; fi++) {
+                    frac_part *= 10.0;
+                    int fdigit = (int)frac_part;
+                    if (fdigit > 9) fdigit = 9;
+                    f_buf[f_pos++] = '0' + fdigit;
+                    frac_part -= fdigit;
+                }
+                if (frac_part >= 0.5) {
+                    int ci = f_pos - 1;
+                    while (ci >= 0) {
+                        if (f_buf[ci] == '.') { ci--; continue; }
+                        if (f_buf[ci] < '9') { f_buf[ci]++; break; }
+                        f_buf[ci] = '0';
+                        ci--;
+                    }
+                    if (ci < 0) {
+                        for (int si = f_pos; si > 0; si--)
+                            f_buf[si] = f_buf[si - 1];
+                        f_buf[0] = '1';
+                        f_pos++;
+                    }
+                }
+            } else if (precision == 0) {
+                if (frac_part >= 0.5) {
+                    int_part++;
+                    f_pos = (int)uint_to_str(f_buf, int_part, 10, 0);
+                }
+            }
+            f_buf[f_pos] = 0;
+
+            int f_total = f_pos + f_neg;
+            if (!f_neg && plus_sign) f_total++;
+            else if (!f_neg && space_sign) f_total++;
+            char f_pad = (zero_pad && !left_align) ? '0' : ' ';
+
+            if (!left_align && f_pad == ' ') fmt_pad(ctx, width - f_total, ' ');
+            if (f_neg) fmt_putc(ctx, '-');
+            else if (plus_sign) fmt_putc(ctx, '+');
+            else if (space_sign) fmt_putc(ctx, ' ');
+            if (!left_align && f_pad == '0') fmt_pad(ctx, width - f_total, '0');
+            fmt_puts(ctx, f_buf, f_pos);
+            if (left_align) fmt_pad(ctx, width - f_total, ' ');
+            break;
+        }
+        case '%':
+            fmt_putc(ctx, '%');
+            break;
+
+        case 'n':
+            if (len_mod == 2) {
+                uint32_t addr32 = *vp++;
+                long long *p = (long long *)(uintptr_t)addr32;
+                *p = (long long)ctx->pos;
+            } else {
+                uint32_t addr32 = *vp++;
+                int *p = (int *)(uintptr_t)addr32;
+                *p = (int)ctx->pos;
+            }
+            break;
+
+        case 0:
+            goto done32;
+
+        default:
+            fmt_putc(ctx, '%');
+            fmt_putc(ctx, *fmt);
+            break;
+        }
+        fmt++;
+    }
+done32:
     if (ctx->buf && ctx->size > 0) {
         SIZE_T end = ctx->pos < ctx->size - 1 ? ctx->pos : ctx->size - 1;
         ctx->buf[end] = 0;
@@ -1369,17 +1742,109 @@ EXCEPTION_DISPOSITION WINAPI crt_except_handler3(
     PVOID DispatcherContext)
 {
     (void)DispatcherContext;
+    (void)ContextRecord;
+
+    /*
+     * Read ExceptionCode + ExceptionFlags.
+     * In compat32 mode, the ExceptionRecord pointer is a 32-bit address
+     * pointing to our static seh32_exception_record (EXCEPTION_RECORD32).
+     * ExceptionCode (+0) and ExceptionFlags (+4) are at the same offsets
+     * in both 32-bit and 64-bit layouts, so direct access is safe.
+     */
+    DWORD code  = ExceptionRecord->ExceptionCode;
+    DWORD flags = ExceptionRecord->ExceptionFlags;
 
     /* During unwind, just return — _except_handler3 doesn't do unwind cleanup */
-    if (ExceptionRecord->ExceptionFlags & EXCEPTION_UNWIND) {
+    if (flags & EXCEPTION_UNWIND) {
         return ExceptionContinueSearch;
     }
 
     serial_puts("[SEH] _except_handler3: code=0x");
-    serial_puthex(ExceptionRecord->ExceptionCode, 8);
+    serial_puthex(code, 8);
     serial_puts("\n");
 
-    /* Walk the scopetable from current TryLevel upward */
+    extern int g_compat32_mode;
+
+    /*
+     * Walk the scopetable from current TryLevel upward.
+     *
+     * In compat32 mode, EstablisherFrame points to a 32-bit struct:
+     *   +0:  uint32_t Next
+     *   +4:  uint32_t Handler
+     *   +8:  uint32_t ScopeTable   ← 32-bit pointer
+     *   +12: uint32_t TryLevel
+     *
+     * The 64-bit EH3_EXCEPTION_REGISTRATION has 8-byte pointers, so
+     * ScopeTable is at +16 and TryLevel at +24.  We must read manually.
+     *
+     * Scopetable entries are also 32-bit (12 bytes each):
+     *   +0: uint32_t EnclosingLevel
+     *   +4: uint32_t FilterFunc    ← 32-bit code pointer
+     *   +8: uint32_t HandlerFunc   ← 32-bit code pointer
+     */
+    if (g_compat32_mode) {
+        uint32_t *frame32 = (uint32_t *)(ULONG_PTR)EstablisherFrame;
+        uint32_t scope32  = frame32[2];   /* offset +8 */
+        uint32_t level    = frame32[3];   /* offset +12 */
+
+        serial_puts("[SEH] scope32=0x");
+        serial_puthex(scope32, 8);
+        serial_puts(" level=");
+        serial_putdec(level);
+        serial_puts("\n");
+
+        while (level != (uint32_t)-1 && scope32 != 0) {
+            /* 32-bit SCOPETABLE_ENTRY: 12 bytes each */
+            uint32_t *se = (uint32_t *)(ULONG_PTR)(scope32 + level * 12);
+            uint32_t enclosing = se[0];
+            uint32_t filter32  = se[1];
+            uint32_t handler32 = se[2];
+
+            if (filter32) {
+                serial_puts("[SEH] filter32 @0x");
+                serial_puthex(filter32, 8);
+                serial_puts("\n");
+
+                /*
+                 * Call 32-bit filter: int __cdecl filter(EXCEPTION_POINTERS32 *)
+                 * We already have seh32_exception_pointers set up by the caller.
+                 */
+                extern PVOID seh32_ep_addr_for_filter(void);
+                uint32_t ep_addr = (uint32_t)(ULONG_PTR)seh32_ep_addr_for_filter();
+                uint32_t fargs[1] = { ep_addr };
+                uint32_t result = compat32_callback_args(filter32, 1, fargs);
+
+                serial_puts("[SEH] filter returned ");
+                serial_putdec(result);
+                serial_puts("\n");
+
+                if ((int32_t)result == 1 /* EXCEPTION_EXECUTE_HANDLER */) {
+                    serial_puts("[SEH] EXECUTE_HANDLER @0x");
+                    serial_puthex(handler32, 8);
+                    serial_puts("\n");
+
+                    /* Update TryLevel to enclosing scope */
+                    frame32[3] = enclosing;
+
+                    /* Call the 32-bit handler (longjmp-style, may not return) */
+                    compat32_callback(handler32);
+
+                    serial_puts("[SEH] handler returned\n");
+                    return ExceptionContinueSearch;
+                }
+                else if ((int32_t)result == -1 /* EXCEPTION_CONTINUE_EXECUTION */) {
+                    return ExceptionContinueExecution;
+                }
+                /* EXCEPTION_CONTINUE_SEARCH → try enclosing scope */
+            }
+
+            level = enclosing;
+        }
+
+        return ExceptionContinueSearch;
+    }
+
+    /* ── 64-bit path (PE64 or test harness) ── */
     PSCOPETABLE_ENTRY scope_table = EstablisherFrame->ScopeTable;
     DWORD try_level = EstablisherFrame->TryLevel;
 
@@ -1387,11 +1852,6 @@ EXCEPTION_DISPOSITION WINAPI crt_except_handler3(
         PSCOPETABLE_ENTRY entry = &scope_table[try_level];
 
         if (entry->FilterFunc) {
-            /* Call the filter expression.
-             * Filter signature: int filter(PEXCEPTION_POINTERS info)
-             * It's called with the EXCEPTION_POINTERS struct.
-             * For simplicity in our single-threaded, identity-mapped model,
-             * we set up the pointers and call the filter. */
             EXCEPTION_POINTERS ep;
             ep.ExceptionRecord = ExceptionRecord;
             ep.ContextRecord   = ContextRecord;
@@ -1405,34 +1865,23 @@ EXCEPTION_DISPOSITION WINAPI crt_except_handler3(
             serial_puts("\n");
 
             if (result == EXCEPTION_EXECUTE_HANDLER) {
-                /* Found a handler — perform global unwind to this frame,
-                 * then jump to the handler block */
                 serial_puts("[SEH] executing handler\n");
-
-                /* Update TryLevel to enclosing scope */
                 EstablisherFrame->TryLevel = entry->EnclosingLevel;
 
-                /* Call the handler. In real Windows, this is a longjmp-style
-                 * transfer. In our simplified model, we call it and if it
-                 * returns, continue. Real handlers typically don't return. */
                 typedef void (WINAPI *handler_fn)(void);
                 handler_fn handler = (handler_fn)entry->HandlerFunc;
                 handler();
 
-                /* If handler returns (unusual), continue search */
                 return ExceptionContinueSearch;
             }
             else if (result == EXCEPTION_CONTINUE_EXECUTION) {
-                /* Resume execution at the faulting instruction */
                 return ExceptionContinueExecution;
             }
-            /* EXCEPTION_CONTINUE_SEARCH → try enclosing scope */
         }
 
         try_level = entry->EnclosingLevel;
     }
 
-    /* No handler found in this frame */
     return ExceptionContinueSearch;
 }
 
@@ -1479,26 +1928,246 @@ void WINAPI crt_type_info_dtor(PVOID _this)
     (void)_this;
 }
 
-/* _CxxThrowException — C++ throw (fatal for now) */
+/*
+ * _CxxThrowException — C++ throw.
+ *
+ * Builds an EXCEPTION_RECORD with MSVC C++ exception code (0xE06D7363)
+ * and dispatches through the 32-bit SEH chain. This allows __try/__except
+ * catch-all handlers (common in Unreal Engine) to intercept the exception.
+ *
+ * If no handler catches it, terminates the process.
+ */
+extern int compat32_seh_dispatch(PEXCEPTION_RECORD ExceptionRecord);
+
+/*
+ * Track the current in-flight C++ exception for re-throw support.
+ * When catch(...) calls throw; → _CxxThrowException(NULL, NULL),
+ * we re-use the saved exception record instead of creating a fresh one.
+ */
+static EXCEPTION_RECORD cxx_current_exception;
+static int cxx_exception_active = 0;
+
 void WINAPI crt_CxxThrowException(PVOID pExceptionObject, PVOID pThrowInfo)
 {
-    (void)pExceptionObject;
-    (void)pThrowInfo;
-    serial_puts("[MSVCRT] _CxxThrowException called — aborting\n");
+    serial_puts("[MSVCRT] _CxxThrowException: obj=0x");
+    serial_puthex((uint64_t)(ULONG_PTR)pExceptionObject, 8);
+    serial_puts(" throwInfo=0x");
+    serial_puthex((uint64_t)(ULONG_PTR)pThrowInfo, 8);
+    serial_puts("\n");
+
+    EXCEPTION_RECORD rec;
+    BYTE *p = (BYTE *)&rec;
+
+    if (pExceptionObject == NULL && pThrowInfo == NULL && cxx_exception_active) {
+        /* Re-throw (C++ "throw;") — reuse the saved exception */
+        serial_puts("[MSVCRT] re-throw — using saved exception\n");
+        for (SIZE_T i = 0; i < sizeof(rec); i++) p[i] = ((BYTE *)&cxx_current_exception)[i];
+    } else {
+        /* New throw — build MSVC C++ exception record */
+        for (SIZE_T i = 0; i < sizeof(rec); i++) p[i] = 0;
+        rec.ExceptionCode  = 0xE06D7363;  /* MSVC C++ exception 'msc' */
+        rec.ExceptionFlags = 0;           /* continuable */
+        rec.NumberParameters = 3;
+        rec.ExceptionInformation[0] = 0x19930520;  /* MSVC EH magic */
+        rec.ExceptionInformation[1] = (ULONG_PTR)pExceptionObject;
+        rec.ExceptionInformation[2] = (ULONG_PTR)pThrowInfo;
+
+        /* Save for potential re-throw */
+        for (SIZE_T i = 0; i < sizeof(rec); i++) ((BYTE *)&cxx_current_exception)[i] = p[i];
+        cxx_exception_active = 1;
+    }
+
+    /* Dispatch through the 32-bit SEH chain */
+    int handled = compat32_seh_dispatch(&rec);
+
+    if (handled) {
+        serial_puts("[MSVCRT] _CxxThrowException: handled by SEH\n");
+        cxx_exception_active = 0;
+        return;
+    }
+
+    /* Unhandled — terminate */
+    serial_puts("[MSVCRT] _CxxThrowException: UNHANDLED — aborting\n");
+    cxx_exception_active = 0;
     crt_abort();
 }
 
-/* __CxxFrameHandler — C++ exception frame handler */
+/*
+ * __CxxFrameHandler — MSVC 6 C++ exception frame handler.
+ *
+ * Called from handler stubs in PE32 DLLs:
+ *   mov eax, offset FuncInfo
+ *   jmp __CxxFrameHandler
+ *
+ * In compat32 mode, the EstablisherFrame is a 32-bit EH3 registration:
+ *   +0:  Next
+ *   +4:  Handler (stub address)
+ *   +8:  FuncInfo* (32-bit pointer to MSVC FuncInfo structure)
+ *   +12: TryLevel (current exception state, -1 = no try block active)
+ *
+ * FuncInfo layout (MSVC 6, 32-bit):
+ *   +0:  magic     (0x19930520 = VC5/6, 0x19930522 = VC7)
+ *   +4:  maxState
+ *   +8:  pUnwindMap
+ *   +12: nTryBlocks
+ *   +16: pTryBlockMap
+ *
+ * TryBlockMapEntry (20 bytes):
+ *   +0:  tryLow
+ *   +4:  tryHigh
+ *   +8:  catchHigh
+ *   +12: nCatches
+ *   +16: pHandlerArray
+ *
+ * HandlerType (16 bytes):
+ *   +0:  adjectives
+ *   +4:  pType (type_info*, 0 = catch(...))
+ *   +8:  dispCatchObj
+ *   +12: addressOfHandler
+ */
 EXCEPTION_DISPOSITION WINAPI crt_CxxFrameHandler(
     PEXCEPTION_RECORD ExceptionRecord,
     PVOID EstablisherFrame,
     PCONTEXT ContextRecord,
     PVOID DispatcherContext)
 {
-    (void)ExceptionRecord;
-    (void)EstablisherFrame;
     (void)ContextRecord;
     (void)DispatcherContext;
+
+    DWORD code  = ExceptionRecord->ExceptionCode;
+    DWORD flags = ExceptionRecord->ExceptionFlags;
+
+    if (flags & EXCEPTION_UNWIND)
+        return ExceptionContinueSearch;
+
+    extern int g_compat32_mode;
+    if (!g_compat32_mode || code != 0xE06D7363)
+        return ExceptionContinueSearch;
+
+    uint32_t *frame32 = (uint32_t *)(ULONG_PTR)EstablisherFrame;
+
+    /*
+     * MSVC 6 C++ EH frame layout (different from _except_handler3!):
+     *   frame+0: Next
+     *   frame+4: Handler (stub address with MOV EAX, FuncInfo; JMP __CxxFrameHandler)
+     *   frame+8: TryLevel (at EBP-4 of establishing function)
+     *
+     * FuncInfo is NOT in the frame — it's encoded in the handler stub's
+     * MOV EAX, imm32 instruction (opcode 0xB8).
+     */
+    uint32_t handler_addr = frame32[1];
+    int32_t  cur_state    = (int32_t)frame32[2];  /* TryLevel */
+
+    /* Extract FuncInfo from handler stub: MOV EAX, imm32 = B8 xx xx xx xx */
+    uint8_t *stub = (uint8_t *)(ULONG_PTR)handler_addr;
+    uint32_t func_info_addr = 0;
+    if (stub[0] == 0xB8) {
+        func_info_addr = *(uint32_t *)(stub + 1);
+    }
+
+    serial_puts("[CxxEH] handler=0x");
+    serial_puthex(handler_addr, 8);
+    serial_puts(" FuncInfo=0x");
+    serial_puthex(func_info_addr, 8);
+    serial_puts(" state=");
+    serial_putdec((uint32_t)cur_state);
+    serial_puts("\n");
+
+    if (!func_info_addr || cur_state == -1)
+        return ExceptionContinueSearch;
+
+    /* Validate FuncInfo magic */
+    uint32_t *fi = (uint32_t *)(ULONG_PTR)func_info_addr;
+    uint32_t magic = fi[0];
+    if (magic != 0x19930520 && magic != 0x19930522) {
+        serial_puts("[CxxEH] bad magic 0x");
+        serial_puthex(magic, 8);
+        serial_puts("\n");
+        return ExceptionContinueSearch;
+    }
+
+    uint32_t nTryBlocks   = fi[3];
+    uint32_t pTryBlockMap = fi[4];
+
+    serial_puts("[CxxEH] nTryBlocks=");
+    serial_putdec(nTryBlocks);
+    serial_puts("\n");
+
+    /* Walk try blocks looking for one that covers current state */
+    for (uint32_t i = 0; i < nTryBlocks && i < 64; i++) {
+        uint32_t *tb = (uint32_t *)(ULONG_PTR)(pTryBlockMap + i * 20);
+        int32_t tryLow    = (int32_t)tb[0];
+        int32_t tryHigh   = (int32_t)tb[1];
+        int32_t catchHigh = (int32_t)tb[2];
+        uint32_t nCatches  = tb[3];
+        uint32_t pHandlers = tb[4];
+
+        if (cur_state < tryLow || cur_state > tryHigh)
+            continue;
+
+        serial_puts("[CxxEH] try[");
+        serial_putdec(i);
+        serial_puts("] low=");
+        serial_putdec((uint32_t)tryLow);
+        serial_puts(" high=");
+        serial_putdec((uint32_t)tryHigh);
+        serial_puts(" nCatches=");
+        serial_putdec(nCatches);
+        serial_puts("\n");
+
+        /* Walk catch handlers */
+        for (uint32_t j = 0; j < nCatches && j < 16; j++) {
+            uint32_t *ht = (uint32_t *)(ULONG_PTR)(pHandlers + j * 16);
+            uint32_t adjectives  = ht[0];
+            uint32_t pType       = ht[1];  /* type_info*, 0 = catch(...) */
+            int32_t  dispCatchObj = (int32_t)ht[2];
+            uint32_t handlerAddr = ht[3];
+
+            serial_puts("[CxxEH] catch adj=0x");
+            serial_puthex(adjectives, 8);
+            serial_puts(" type=0x");
+            serial_puthex(pType, 8);
+            serial_puts(" handler=0x");
+            serial_puthex(handlerAddr, 8);
+            serial_puts("\n");
+
+            /*
+             * Match: catch(...) has pType==0.
+             * For typed catches, we'd need to compare type_info names
+             * between the thrown type and the catch type. For now, also
+             * match if adjectives has 0x40 (HT_IsComplusEh / catch-all).
+             */
+            if (pType == 0 || (adjectives & 0x40)) {
+                serial_puts("[CxxEH] MATCH catch(...) — executing handler @0x");
+                serial_puthex(handlerAddr, 8);
+                serial_puts("\n");
+
+                /* Update TryLevel to catchHigh+1 (entered catch block).
+                 * C++ EH frame: Next(+0), Handler(+4), TryLevel(+8) = frame32[2].
+                 * NOT frame32[3] — that's the _except_handler3 layout. */
+                frame32[2] = (uint32_t)(catchHigh + 1);
+
+                /*
+                 * Copy exception object if needed.
+                 * dispCatchObj is the offset from EBP where the catch
+                 * object should be stored. For catch(...), it's typically 0.
+                 */
+                (void)dispCatchObj;
+
+                /*
+                 * Call the 32-bit catch handler.
+                 * In MSVC, this does a longjmp-style transfer to the
+                 * catch block. It may not return.
+                 */
+                compat32_callback(handlerAddr);
+
+                /* If handler returned, exception was handled */
+                serial_puts("[CxxEH] catch handler returned\n");
+                return ExceptionContinueExecution;
+            }
+        }
+    }
+
     return ExceptionContinueSearch;
 }
 
@@ -1599,29 +2268,34 @@ void WINAPI crt_purecall(void)
 
 /* ── vprintf family (ms_abi va_list wrappers) ─────────────── */
 
+/*
+ * v*printf family — the va_list parameter is a 32-bit pointer to the
+ * 32-bit caller's stack (4-byte arg slots). Cast to uint32_t* and use
+ * do_vformat32 which walks 4-byte slots correctly.
+ */
 static int WINAPI crt_vprintf(const char *fmt, ms_va_list ap)
 {
     FMT_CTX ctx = { NULL, 0, 0 };
-    return do_vformat(&ctx, fmt, ap);
+    return do_vformat32(&ctx, fmt, (uint32_t *)(void *)ap);
 }
 
 static int WINAPI crt_vsprintf(char *buf, const char *fmt, ms_va_list ap)
 {
     FMT_CTX ctx = { buf, (SIZE_T)-1, 0 };
-    return do_vformat(&ctx, fmt, ap);
+    return do_vformat32(&ctx, fmt, (uint32_t *)(void *)ap);
 }
 
 static int WINAPI crt_vsnprintf(char *buf, SIZE_T size, const char *fmt, ms_va_list ap)
 {
     FMT_CTX ctx = { buf, size, 0 };
-    return do_vformat(&ctx, fmt, ap);
+    return do_vformat32(&ctx, fmt, (uint32_t *)(void *)ap);
 }
 
 static int WINAPI crt_vfprintf(PVOID stream, const char *fmt, ms_va_list ap)
 {
     (void)stream;
     FMT_CTX ctx = { NULL, 0, 0 };
-    return do_vformat(&ctx, fmt, ap);
+    return do_vformat32(&ctx, fmt, (uint32_t *)(void *)ap);
 }
 
 /* ── UT99 Core.dll / Engine.dll missing exports ────────────── */
@@ -1770,17 +2444,322 @@ WCHAR* WINAPI crt_wstrtime(WCHAR *buf)
     return buf;
 }
 
-/* _vsnwprintf — wide vsnprintf (simple stub) */
+/* _vsnwprintf — wide vsnprintf with format processing
+ *
+ * CRITICAL: This is called from 32-bit compat mode via INT 0x2E thunk.
+ * The va_list (ap) points to the 32-bit caller's stack where each vararg
+ * occupies 4 bytes. ms_va_arg() reads 8-byte slots (64-bit mode) which
+ * is WRONG — it combines two 4-byte args into one garbage value.
+ * We must manually walk 4-byte slots using a uint32_t pointer.
+ */
+static int vsnw_trace_count = 0;
+
 int WINAPI crt_vsnwprintf(WCHAR *buf, SIZE_T count, const WCHAR *fmt, ms_va_list ap)
 {
-    (void)ap;
-    /* Minimal stub: copy format string as-is (no format processing) */
     if (!buf || count == 0) return 0;
-    SIZE_T i;
-    for (i = 0; i < count - 1 && fmt[i]; i++)
-        buf[i] = fmt[i];
-    buf[i] = 0;
-    return (int)i;
+    if (!fmt) { buf[0] = 0; return 0; }
+
+    /* Walk the 32-bit va_list manually — 4 bytes per arg */
+    uint32_t *vp = (uint32_t *)(void *)ap;
+
+    /* Debug: trace first 30 calls to see what's going on */
+    if (vsnw_trace_count < 30) {
+        vsnw_trace_count++;
+        /* Dump narrow version of the wide format string */
+        serial_puts("[VSNW#");
+        serial_putdec(vsnw_trace_count);
+        serial_puts("] fmt=\"");
+        for (int k = 0; k < 40 && fmt[k]; k++)
+            serial_putchar((char)(fmt[k] & 0x7F));
+        serial_puts("\" ap=0x");
+        serial_puthex((uint64_t)(uintptr_t)vp, 8);
+        serial_puts(" vp[0..11]=");
+        for (int k = 0; k < 12; k++) {
+            serial_puts(" 0x");
+            serial_puthex((uint64_t)vp[k], 8);
+        }
+        serial_puts("\n");
+        /* If vp[1] looks like a small number (FString.Num?) check vp[3] as WCHAR* */
+        if (vp[1] < 0x100 && vp[3] >= 0x10000 && vp[3] < 0x20000000) {
+            const WCHAR *probe = (const WCHAR *)(uintptr_t)vp[3];
+            serial_puts("  [PROBE vp[3] as WCHAR*] -> \"");
+            for (int k = 0; k < 30 && probe[k]; k++)
+                serial_putchar((char)(probe[k] & 0x7F));
+            serial_puts("\"\n");
+        }
+    }
+
+    /* ── FName::Names diagnostic ── */
+    {
+        extern uint32_t g_fname_names_addr;
+        extern uint32_t g_gmalloc_addr;
+        static int fname_diag_count = 0;
+        int has_0c = 0;
+        for (int k = 0; k < 8; k++) {
+            if (vp[k] == 0x0000000C) { has_0c = 1; break; }
+        }
+        /* Also dump when "Name subsystem" message appears */
+        int is_namesys = 0;
+        {
+            const WCHAR *f = fmt;
+            if (f[0]=='N' && f[1]=='a' && f[2]=='m' && f[3]=='e' && f[4]==' ') is_namesys = 1;
+        }
+        if ((has_0c || is_namesys) && fname_diag_count < 3 && g_fname_names_addr) {
+            fname_diag_count++;
+            /*
+             * FName::Names is TArray<FNameEntry*>:
+             *   +0x00: FNameEntry** Data  (4 bytes)
+             *   +0x04: INT Num            (4 bytes)
+             *   +0x08: INT Max            (4 bytes)
+             */
+            uint32_t *tarray = (uint32_t *)(uintptr_t)g_fname_names_addr;
+            uint32_t data_ptr = tarray[0];
+            uint32_t num      = tarray[1];
+            uint32_t max      = tarray[2];
+            serial_puts("[FNAME-DIAG] FName::Names @ 0x");
+            serial_puthex(g_fname_names_addr, 8);
+            serial_puts(" Data=0x");
+            serial_puthex(data_ptr, 8);
+            serial_puts(" Num=");
+            serial_putdec(num);
+            serial_puts(" Max=");
+            serial_putdec(num > 0x10000 ? 0xBAD : max);
+            serial_puts("\n");
+            /* Dump entries 0-7 and scan for first 8 non-null entries */
+            if (data_ptr >= 0x10000 && data_ptr < 0x20000000 && num > 0 && num < 0x10000) {
+                uint32_t *entries = (uint32_t *)(uintptr_t)data_ptr;
+                /* First dump indices 0-7 */
+                int show = num < 8 ? (int)num : 8;
+                for (int k = 0; k < show; k++) {
+                    serial_puts("  Names[");
+                    serial_putdec(k);
+                    serial_puts("]=0x");
+                    serial_puthex(entries[k], 8);
+                    if (entries[k] >= 0x10000 && entries[k] < 0x20000000) {
+                        /* FNameEntry: +0x00 Index(4), +0x04 Flags(4), +0x08 HashNext(4), +0x0C Name[] */
+                        uint8_t *entry = (uint8_t *)(uintptr_t)entries[k];
+                        serial_puts(" W=\"");
+                        /* Try WCHAR: read 2 bytes at a time from +0x0C */
+                        const uint16_t *wn = (const uint16_t *)(entry + 0x0C);
+                        for (int j = 0; j < 16 && wn[j] && wn[j] < 128; j++)
+                            serial_putchar((char)wn[j]);
+                        serial_puts("\"");
+                    } else if (entries[k] == 0) {
+                        serial_puts(" (NULL!)");
+                    }
+                    serial_puts("\n");
+                }
+                /* Scan for non-null entries beyond index 7 */
+                int found_nonnull = 0;
+                int limit = (int)(num < 838 ? num : 838);
+                for (int k = 8; k < limit && found_nonnull < 4; k++) {
+                    if (entries[k] != 0) {
+                        serial_puts("  Names[");
+                        serial_putdec(k);
+                        serial_puts("]=0x");
+                        serial_puthex(entries[k], 8);
+                        if (entries[k] >= 0x10000 && entries[k] < 0x20000000) {
+                            uint8_t *entry = (uint8_t *)(uintptr_t)entries[k];
+                            serial_puts(" W=\"");
+                            const uint16_t *wn = (const uint16_t *)(entry + 0x0C);
+                            for (int j = 0; j < 16 && wn[j] && wn[j] < 128; j++)
+                                serial_putchar((char)wn[j]);
+                            serial_puts("\"");
+                        }
+                        serial_puts("\n");
+                        found_nonnull++;
+                    }
+                }
+                if (found_nonnull == 0)
+                    serial_puts("  (all entries 8..838 are NULL!)\n");
+                /* Count total non-null */
+                int total_nonnull = 0;
+                for (int k = 0; k < limit; k++)
+                    if (entries[k] != 0) total_nonnull++;
+                serial_puts("  total non-null: ");
+                serial_putdec(total_nonnull);
+                serial_puts(" / ");
+                serial_putdec(limit);
+                serial_puts("\n");
+            }
+            /* Also dump GMalloc */
+            if (g_gmalloc_addr) {
+                uint32_t *gm = (uint32_t *)(uintptr_t)g_gmalloc_addr;
+                serial_puts("[FNAME-DIAG] GMalloc @ 0x");
+                serial_puthex(g_gmalloc_addr, 8);
+                serial_puts(" -> 0x");
+                serial_puthex(*gm, 8);
+                serial_puts("\n");
+            }
+        }
+    }
+
+    SIZE_T pos = 0;
+    SIZE_T max = count - 1;
+
+    while (*fmt && pos < max) {
+        if (*fmt != '%') {
+            buf[pos++] = *fmt++;
+            continue;
+        }
+        fmt++; /* skip '%' */
+
+        /* Parse flags */
+        int left_align = 0, zero_pad = 0;
+        while (*fmt == '-' || *fmt == '0') {
+            if (*fmt == '-') left_align = 1;
+            if (*fmt == '0') zero_pad = 1;
+            fmt++;
+        }
+        (void)left_align;
+
+        /* Parse width */
+        int width = 0;
+        if (*fmt == '*') {
+            width = (int)(*vp++);
+            fmt++;
+        } else {
+            while (*fmt >= '0' && *fmt <= '9')
+                width = width * 10 + (*fmt++ - '0');
+        }
+
+        /* Parse precision */
+        int precision = -1;
+        if (*fmt == '.') {
+            fmt++;
+            precision = 0;
+            if (*fmt == '*') {
+                precision = (int)(*vp++);
+                fmt++;
+            } else {
+                while (*fmt >= '0' && *fmt <= '9')
+                    precision = precision * 10 + (*fmt++ - '0');
+            }
+        }
+
+        /* Parse length modifier */
+        int is_long = 0;
+        if (*fmt == 'l') { is_long = 1; fmt++; }
+        if (*fmt == 'l') { fmt++; } /* ll */
+
+        /* Conversion */
+        switch (*fmt) {
+        case 's': {
+            /* In MSVC _vsnwprintf: %s = WCHAR* (wide string).
+             * %ls is also wide string. We treat both the same. */
+            uint32_t raw_ptr = *vp++;
+            const WCHAR *ws = (const WCHAR *)(uintptr_t)raw_ptr;
+            if (vsnw_trace_count <= 30) {
+                serial_puts("  %s ptr=0x");
+                serial_puthex((uint64_t)raw_ptr, 8);
+                if (ws && raw_ptr >= 0x1000) {
+                    serial_puts(" -> \"");
+                    for (int k = 0; k < 20 && ws[k]; k++)
+                        serial_putchar((char)(ws[k] & 0x7F));
+                    serial_puts("\"");
+                }
+                serial_puts("\n");
+            }
+            if (!ws) ws = (const WCHAR[]){'(','n','u','l','l',')',0};
+            int n = 0;
+            while (ws[n]) n++;
+            if (precision >= 0 && n > precision) n = precision;
+            for (int i = 0; i < n && pos < max; i++)
+                buf[pos++] = ws[i];
+            fmt++;
+            break;
+        }
+        case 'S': {
+            /* %S = narrow string in wide printf (MSVC: %S or %hs = char*) */
+            const char *ns = (const char *)(uintptr_t)(*vp++);
+            if (!ns) ns = "(null)";
+            int n = 0;
+            while (ns[n]) n++;
+            if (precision >= 0 && n > precision) n = precision;
+            for (int i = 0; i < n && pos < max; i++)
+                buf[pos++] = (WCHAR)(unsigned char)ns[i];
+            fmt++;
+            break;
+        }
+        case 'c': {
+            WCHAR c = (WCHAR)(*vp++);
+            buf[pos++] = c;
+            fmt++;
+            break;
+        }
+        case 'd': case 'i': {
+            int32_t val32 = (int32_t)(*vp++);
+            long long val = (long long)val32;
+            int neg = 0;
+            if (val < 0) { neg = 1; val = -val; }
+            WCHAR tmp[24];
+            int len = 0;
+            if (val == 0) tmp[len++] = '0';
+            else while (val > 0) { tmp[len++] = '0' + (int)(val % 10); val /= 10; }
+            if (neg) tmp[len++] = '-';
+            int pad = width - len;
+            if (pad > 0 && zero_pad) for (int i = 0; i < pad && pos < max; i++) buf[pos++] = '0';
+            else if (pad > 0) for (int i = 0; i < pad && pos < max; i++) buf[pos++] = ' ';
+            for (int i = len - 1; i >= 0 && pos < max; i--) buf[pos++] = tmp[i];
+            fmt++;
+            break;
+        }
+        case 'u': {
+            uint32_t val = *vp++;
+            WCHAR tmp[24];
+            int len = 0;
+            if (val == 0) tmp[len++] = '0';
+            else while (val > 0) { tmp[len++] = '0' + (int)(val % 10); val /= 10; }
+            int pad = width - len;
+            if (pad > 0 && zero_pad) for (int i = 0; i < pad && pos < max; i++) buf[pos++] = '0';
+            else if (pad > 0) for (int i = 0; i < pad && pos < max; i++) buf[pos++] = ' ';
+            for (int i = len - 1; i >= 0 && pos < max; i--) buf[pos++] = tmp[i];
+            fmt++;
+            break;
+        }
+        case 'x': case 'X': {
+            int upper = (*fmt == 'X');
+            uint32_t val = *vp++;
+            const char *hex = upper ? "0123456789ABCDEF" : "0123456789abcdef";
+            WCHAR tmp[20];
+            int len = 0;
+            if (val == 0) tmp[len++] = '0';
+            else while (val > 0) { tmp[len++] = hex[val & 0xF]; val >>= 4; }
+            int pad = width - len;
+            if (pad > 0 && zero_pad) for (int i = 0; i < pad && pos < max; i++) buf[pos++] = '0';
+            else if (pad > 0) for (int i = 0; i < pad && pos < max; i++) buf[pos++] = ' ';
+            for (int i = len - 1; i >= 0 && pos < max; i--) buf[pos++] = tmp[i];
+            fmt++;
+            break;
+        }
+        case 'p': {
+            uint32_t val = *vp++;
+            const char *hex = "0123456789abcdef";
+            WCHAR tmp[20];
+            int len = 0;
+            if (val == 0) tmp[len++] = '0';
+            else while (val > 0) { tmp[len++] = hex[val & 0xF]; val >>= 4; }
+            for (int i = len - 1; i >= 0 && pos < max; i--) buf[pos++] = tmp[i];
+            fmt++;
+            break;
+        }
+        case '%':
+            buf[pos++] = '%';
+            fmt++;
+            break;
+        case 0:
+            break;
+        default:
+            /* Unknown format — output literal */
+            buf[pos++] = '%';
+            if (pos < max) buf[pos++] = *fmt;
+            fmt++;
+            break;
+        }
+    }
+
+    buf[pos] = 0;
+    return (int)pos;
 }
 
 /* _wcsicmp — case-insensitive wide string compare */
@@ -1789,8 +2768,32 @@ static WCHAR wchar_to_lower(WCHAR c)
     return (c >= 'A' && c <= 'Z') ? c + 32 : c;
 }
 
+static int wcsicmp_trace_count = 0;
+
 int WINAPI crt_wcsicmp(const WCHAR *a, const WCHAR *b)
 {
+    if (wcsicmp_trace_count < 20) {
+        wcsicmp_trace_count++;
+        serial_puts("[WCSICMP#");
+        serial_putdec(wcsicmp_trace_count);
+        serial_puts("] a=0x");
+        serial_puthex((uint64_t)(uintptr_t)a, 8);
+        serial_puts(" b=0x");
+        serial_puthex((uint64_t)(uintptr_t)b, 8);
+        if (a && (uintptr_t)a >= 0x1000) {
+            serial_puts(" a=\"");
+            for (int k = 0; k < 20 && a[k]; k++)
+                serial_putchar((char)(a[k] & 0x7F));
+            serial_puts("\"");
+        }
+        if (b && (uintptr_t)b >= 0x1000) {
+            serial_puts(" b=\"");
+            for (int k = 0; k < 20 && b[k]; k++)
+                serial_putchar((char)(b[k] & 0x7F));
+            serial_puts("\"");
+        }
+        serial_puts("\n");
+    }
     while (*a && *b) {
         WCHAR ca = wchar_to_lower(*a), cb = wchar_to_lower(*b);
         if (ca != cb) return (int)ca - (int)cb;
@@ -2031,8 +3034,13 @@ static const MSVCRT_EXPORT msvcrt_exports[] = {
     { "calloc",              (PVOID)crt_calloc },
     { "realloc",             (PVOID)crt_realloc },
     { "free",                (PVOID)crt_free },
-    { "?malloc@@YAPEAX_K@Z", (PVOID)crt_malloc },  /* C++ mangled */
+    { "?malloc@@YAPEAX_K@Z", (PVOID)crt_malloc },  /* C++ mangled (64-bit) */
     { "?free@@YAXPEAX@Z",   (PVOID)crt_free },
+    /* MSVC 32-bit operator new/delete — used by C++ code via MSVCRT */
+    { "??2@YAPAXI@Z",       (PVOID)crt_malloc },  /* operator new(unsigned int) */
+    { "??3@YAXPAX@Z",       (PVOID)crt_free },    /* operator delete(void*) */
+    { "??_U@YAPAXI@Z",      (PVOID)crt_malloc },  /* operator new[](unsigned int) */
+    { "??_V@YAXPAX@Z",      (PVOID)crt_free },    /* operator delete[](void*) */
 
     /* String */
     { "strlen",              (PVOID)crt_strlen },

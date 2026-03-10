@@ -261,6 +261,25 @@ static bool apic_enabled;
 
 uint64_t idt_get_ticks(void) { return tick_count; }
 
+/*
+ * Arm a hardware write watchpoint on a 4-byte address.
+ * Uses debug register DR0. #DB exception fires on every write.
+ */
+void idt_watch_write4(void *addr)
+{
+    uint64_t a = (uint64_t)addr;
+    /* DR0 = watch address */
+    __asm__ volatile ("mov %0, %%dr0" : : "r"(a));
+    /* Clear DR6 status */
+    __asm__ volatile ("mov %0, %%dr6" : : "r"((uint64_t)0));
+    /* DR7: L0=1 (local enable), RW0=01 (write only), LEN0=11 (4 bytes) */
+    uint64_t dr7 = (1ULL << 0) | (1ULL << 16) | (3ULL << 18);
+    __asm__ volatile ("mov %0, %%dr7" : : "r"(dr7));
+    serial_puts("[IDT] Hardware watchpoint armed on 0x");
+    serial_puthex(a, 16);
+    serial_puts("\n");
+}
+
 volatile uint32_t *idt_get_apic_base(void) { return apic_base; }
 
 /* ── Set one IDT entry ───────────────────────────────────────── */
@@ -314,6 +333,61 @@ void isr_handler(interrupt_frame_t *frame)
     if (vec >= 0x70 && vec < 0x80) {
         if (vec >= 0x78) outb(0xA0, 0x20);  /* Slave EOI */
         outb(0x20, 0x20);  /* Master EOI */
+        return;
+    }
+
+    /* #DB Debug exception — hardware watchpoint handler */
+    if (vec == 1) {
+        static int db_hit_count = 0;
+        uint64_t dr6;
+        __asm__ volatile ("mov %%dr6, %0" : "=r"(dr6));
+
+        if (dr6 & 0x1) {  /* B0: breakpoint 0 hit */
+            /* Read the watched address value (g_teb32.ExceptionList) */
+            uint64_t dr0;
+            __asm__ volatile ("mov %%dr0, %0" : "=r"(dr0));
+            uint32_t val = *(volatile uint32_t *)dr0;
+
+            /* Only log when value is suspiciously low (< 0x1000, not 0xFFFFFFFF) */
+            if (val < 0x1000 && val != 0xFFFFFFFF) {
+                serial_puts("[WP] FS:[0]=0x");
+                serial_puthex(val, 8);
+                serial_puts(" RIP=0x");
+                serial_puthex(frame->rip, 8);
+                serial_puts(" ESP=0x");
+                serial_puthex(frame->rsp & 0xFFFFFFFF, 8);
+
+                /* Dump instruction bytes at RIP for first 5 hits */
+                if (db_hit_count < 5) {
+                    serial_puts(" insn:");
+                    uint8_t *ip = (uint8_t *)(uint64_t)frame->rip;
+                    /* Back up 6 bytes to catch prefix+opcode before the write */
+                    for (int i = -6; i < 8; i++) {
+                        if (i == 0) serial_puts(" [");
+                        serial_puthex(ip[i], 2);
+                        if (i == 0) serial_puts("]");
+                        else serial_puts(" ");
+                    }
+
+                    /* Also show the stack around ESP to see saved SEH frame */
+                    serial_puts("\n  stack:");
+                    uint32_t *sp = (uint32_t *)(uint64_t)(frame->rsp & 0xFFFFFFFF);
+                    for (int i = 0; i < 8; i++) {
+                        serial_puts(" ");
+                        serial_puthex(sp[i], 8);
+                    }
+                }
+                db_hit_count++;
+                serial_puts("\n");
+            }
+
+            /* Clear DR6 status bits */
+            __asm__ volatile ("mov %0, %%dr6" : : "r"((uint64_t)0));
+            return;  /* non-fatal: resume execution */
+        }
+
+        /* Other debug reasons (single-step etc.) — clear and resume */
+        __asm__ volatile ("mov %0, %%dr6" : : "r"((uint64_t)0));
         return;
     }
 
@@ -389,6 +463,25 @@ void isr_handler(interrupt_frame_t *frame)
             else if (frame->error_code & 4) serial_puts(" (LDT)");
             else serial_puts(" (GDT)");
             serial_puts("\n");
+        }
+
+        /* Stack dump: show 16 dwords from RSP for crash diagnosis */
+        {
+            uint32_t *sp = (uint32_t *)(uint64_t)frame->rsp;
+            serial_puts("  Stack dump (RSP):\n");
+            for (int i = 0; i < 16; i++) {
+                serial_puts("    [RSP+");
+                serial_puthex((uint64_t)(i * 4), 2);
+                serial_puts("] = 0x");
+                serial_puthex((uint64_t)sp[i], 8);
+                serial_puts("\n");
+            }
+        }
+
+        /* Compat mode detection: CS == 0x40 means 32-bit PE code */
+        int is_compat_mode = ((frame->cs & 0xFFFF) == 0x0040);
+        if (is_compat_mode) {
+            serial_puts("  [COMPAT32] 32-bit code — exception in compat mode\n");
         }
 
         /* Framebuffer output */
