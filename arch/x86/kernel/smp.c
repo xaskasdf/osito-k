@@ -377,7 +377,8 @@ void smp_ap_entry(uint32_t cpu_index)
     if (cpu_index < SMP_MAX_CPUS)
         cpus[cpu_index].online = true;
 
-    __sync_fetch_and_add(&ap_started_count, 1);
+    /* Atomic increment — use lock xadd (TCC doesn't support __sync builtins) */
+    __asm__ volatile("lock incl %0" : "+m"(ap_started_count));
 
     serial_puts("[SMP] AP ");
     serial_putdec(cpu_index);

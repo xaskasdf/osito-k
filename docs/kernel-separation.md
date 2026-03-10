@@ -323,14 +323,20 @@ osito> reboot
 
 ## Resumen de fases y estimaciones
 
-| Fase | Descripción | ~LOC | Deps | Resultado |
-|------|-------------|------|------|-----------|
-| **0** | Separar boot.efi de kernel.bin | ~400 | Ninguna | Kernel sin restricciones EFI |
-| **1** | TCC cross-compila kernel desde host | ~50 test | Fase 0 | Verificar TCC genera kernel válido |
-| **2** | TCC compila kernel dentro de OsitoK | ~600 | Fase 1 | Self-compiling proof of concept |
-| **3** | Instalar + rebootear con kernel propio | ~200 | Fase 2 | Ciclo completo edit→build→boot |
+| Fase | Descripción | ~LOC | Deps | Resultado | Estado |
+|------|-------------|------|------|-----------|--------|
+| **0** | Separar boot.efi de kernel.elf | ~680 | Ninguna | Kernel sin restricciones EFI | **Done** |
+| **1** | TCC cross-compila kernel desde host | ~50 test | Fase 0 | Verificar TCC genera kernel válido | **Next** |
+| **2** | TCC compila kernel dentro de OsitoK | ~600 | Fase 1 | Self-compiling proof of concept | Planned |
+| **3** | Instalar + rebootear con kernel propio | ~200 | Fase 2 | Ciclo completo edit→build→boot | Planned |
 
-**Fase 0 es el paso crítico.** Todo lo demás fluye naturalmente después.
+### Fase 0 — Completada (2026-03-10)
+
+Commit `aca7071`: `boot.efi` (57KB) + `kernel.elf` (543KB ELF64 at 32MB).
+- boot.efi: standalone UEFI bootloader using LocateHandleBuffer (not LOADED_IMAGE_PROTOCOL)
+- kernel.elf: `-fno-pie`, custom `kernel.ld`, BSS zeroing, `boot_info_t` protocol
+- Verificado en QEMU: IDT, paging, SMP 4-core, SYSCALL, Win32, crypto, NIC, shell prompt
+- Restricciones EFI eliminadas del kernel: `-fPIE` y `-fno-jump-tables` ya no necesarios
 
 El hito definitivo: OsitoK se compila a sí mismo, se instala, y reboota
 con el kernel que acaba de compilar. Un OS que se auto-reproduce.

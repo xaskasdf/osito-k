@@ -92,7 +92,10 @@ src/main.cpp       kernel_main entry point
 
 ### x86-64 Bare-Metal AI OS (arch/x86/)
 ```
-boot/              efi_main.c — UEFI entry, GOP, serial, ExitBootServices
+boot/              boot_efi.c — UEFI bootloader (loads kernel.elf from ESP)
+                   efi_main.c — Legacy monolithic EFI entry (deprecated)
+include/           boot_info.h — Boot protocol struct (bootloader↔kernel)
+kernel.ld          — Kernel linker script (base 0x2000000)
 kernel/            main.c, serial.c, framebuffer.c, pci.c, memory.c, heap.c
                    idt.c, isr_stubs.S, paging.c — IDT + 4-level page tables
                    syscall.c, syscall_entry.S — SYSCALL/SYSRET + 100+ Linux syscalls
@@ -203,6 +206,10 @@ arch/arm/          SM8350 (ROG Phone 5) bare-metal port — see docs/aarch64-det
 | X-XHCI  | xHCI USB 3.x driver | WIP |
 | X-RETINA| Display pipeline (compositor, shared memory) | WIP |
 | X-WIN32 | Windows PE32 compat layer (15 DLL shims) | WIP |
+| **Phase 0** | **Kernel/bootloader separation** (boot.efi + kernel.elf) | **Done** |
+| Phase 1 | TCC cross-compiles kernel from host | Next |
+| Phase 2 | TCC compiles kernel inside OsitoK | Planned |
+| Phase 3 | Install + reboot self-compiled kernel | Planned |
 
 > Full GPU roadmap (X27-X40 + contingency): see [docs/x86-gpu-roadmap.md](docs/x86-gpu-roadmap.md)
 > Full OS roadmap (Tiers 0-9): see [docs/os-selfhost-roadmap.md](docs/os-selfhost-roadmap.md)
@@ -210,7 +217,7 @@ arch/arm/          SM8350 (ROG Phone 5) bare-metal port — see docs/aarch64-det
 > Paths to Claude analysis: see [docs/paths-to-claude-on-ositok.md](docs/paths-to-claude-on-ositok.md)
 > Kernel/bootloader separation + self-compiling road: see [docs/kernel-separation.md](docs/kernel-separation.md)
 
-**Tier 7+ (next)**: Full kernel self-compile (TCC compiles kernel .c sources inside OsitoK).
+**Next**: Phase 1 — TCC cross-compiles kernel.elf from Linux host (verify TCC can produce working kernel).
 
 ## Detailed Feature Documentation
 

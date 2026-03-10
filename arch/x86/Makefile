@@ -63,7 +63,9 @@ KERN_SRC = kernel/main.c kernel/serial.c kernel/framebuffer.c \
            kernel/keyboard.c kernel/terminal.c kernel/shell.c \
            kernel/crypto.c kernel/tls.c kernel/http.c kernel/claude.c \
            kernel/tokenizer.c kernel/smp.c kernel/dynlink.c \
-           kernel/zlib.c kernel/git.c
+           kernel/zlib.c kernel/git.c \
+           kernel/shm.c kernel/compositor.c kernel/display.c \
+           kernel/input_events.c kernel/memcompress.c
 ASM_SRC  = kernel/isr_stubs.S kernel/syscall_entry.S kernel/setjmp.S
 DRV_SRC  = drivers/nvme.c drivers/i211.c drivers/gpu.c drivers/gsp.c \
            drivers/sass.c drivers/gmmu.c drivers/gpu_tensor.c drivers/gpu_inference.c
@@ -93,7 +95,7 @@ ALL_KERN_OBJ = $(KERN_OBJ) $(ASM_OBJ) $(DRV_OBJ) $(FS_OBJ) $(WIN32_OBJ) $(WIN32_
 
 # ── Targets ───────────────────────────────────────────────────
 
-.PHONY: all clean check-deps legacy
+.PHONY: all clean check-deps legacy tcc tcc-clean
 
 all: check-deps $(BUILD)/boot.efi $(BUILD)/kernel.elf
 	@echo ""
@@ -149,6 +151,94 @@ $(BUILD)/win32/%.o: win32/%.c | $(BUILD)/win32
 # Win32 assembly
 $(BUILD)/win32/%.o: win32/%.S | $(BUILD)/win32
 	$(CC) -c -o $@ $<
+
+# ── TCC kernel build (Phase 1: verify TCC can produce working kernel) ────
+#
+# TCC compiles everything it can; GCC fills in for:
+#   - tensor.c, tensor_avx2.c (SSE/AVX2 intrinsics + asm constraints)
+#   - All .S files (iretq, lretq opcodes unknown to TCC assembler)
+#   - win32/compat32.c (lretq), win32/msvcrt_shim.c (__builtin_ms_va_list)
+#
+# Usage: make tcc    (builds boot.efi with GCC + kernel.elf with TCC/GCC mix)
+
+TCC      = tcc
+TCCDIR   = $(BUILD)/tcc
+TCCFLAGS = -c -nostdlib -Iinclude -I../../include/common -D__KERNEL_X86__=1
+
+# Files that MUST use GCC (SSE/AVX asm constraints, special builtins)
+GCC_ONLY_C = kernel/tensor.c kernel/tensor_avx2.c \
+             win32/compat32.c win32/msvcrt_shim.c
+
+# Everything else uses TCC
+TCC_KERN_SRC = $(filter-out $(GCC_ONLY_C),$(KERN_SRC))
+TCC_DRV_SRC  = $(DRV_SRC)
+TCC_FS_SRC   = $(FS_SRC)
+TCC_WIN32_SRC = $(filter-out $(GCC_ONLY_C),$(WIN32_SRC))
+
+# TCC object files
+TCC_KERN_OBJ  = $(TCC_KERN_SRC:%.c=$(TCCDIR)/%.o)
+TCC_DRV_OBJ   = $(TCC_DRV_SRC:%.c=$(TCCDIR)/%.o)
+TCC_FS_OBJ    = $(TCC_FS_SRC:%.c=$(TCCDIR)/%.o)
+TCC_WIN32_OBJ = $(TCC_WIN32_SRC:%.c=$(TCCDIR)/%.o)
+
+# GCC-only object files (in TCC build dir)
+GCC_TENSOR_OBJ    = $(TCCDIR)/kernel/tensor.o $(TCCDIR)/kernel/tensor_avx2.o
+GCC_WIN32_COMPAT  = $(TCCDIR)/win32/compat32.o $(TCCDIR)/win32/msvcrt_shim.o
+GCC_ASM_OBJ       = $(ASM_SRC:%.S=$(TCCDIR)/%.o)
+GCC_WIN32_ASM_OBJ = $(WIN32_ASM:%.S=$(TCCDIR)/%.o)
+
+ALL_TCC_OBJ = $(TCC_KERN_OBJ) $(TCC_DRV_OBJ) $(TCC_FS_OBJ) $(TCC_WIN32_OBJ) \
+              $(GCC_TENSOR_OBJ) $(GCC_WIN32_COMPAT) $(GCC_ASM_OBJ) $(GCC_WIN32_ASM_OBJ)
+
+.PHONY: tcc tcc-clean
+
+tcc: check-deps $(BUILD)/boot.efi $(TCCDIR)/kernel.elf
+	@echo ""
+	@echo "Built: $(BUILD)/boot.efi + $(TCCDIR)/kernel.elf (TCC kernel)"
+
+$(TCCDIR)/kernel.elf: $(ALL_TCC_OBJ) kernel.ld
+	$(LD) $(KLDFLAGS) -o $@ $(filter-out kernel.ld,$^)
+	@echo "Built (TCC): $@ ($$(stat -c%s $@) bytes)"
+
+# TCC rules for kernel C files
+$(TCCDIR)/kernel/%.o: kernel/%.c | $(TCCDIR)/kernel
+	$(TCC) $(TCCFLAGS) -o $@ $<
+
+$(TCCDIR)/drivers/%.o: drivers/%.c | $(TCCDIR)/drivers
+	$(TCC) $(TCCFLAGS) -o $@ $<
+
+$(TCCDIR)/fs/%.o: fs/%.c | $(TCCDIR)/fs
+	$(TCC) $(TCCFLAGS) -o $@ $<
+
+$(TCCDIR)/win32/%.o: win32/%.c | $(TCCDIR)/win32
+	$(TCC) $(TCCFLAGS) -Iwin32 -o $@ $<
+
+# GCC rules for files TCC can't handle
+$(TCCDIR)/kernel/tensor.o: kernel/tensor.c | $(TCCDIR)/kernel
+	$(CC) $(KCFLAGS) -c -o $@ $<
+
+$(TCCDIR)/kernel/tensor_avx2.o: kernel/tensor_avx2.c | $(TCCDIR)/kernel
+	$(CC) $(AVXFLAGS) -c -o $@ $<
+
+$(TCCDIR)/win32/compat32.o: win32/compat32.c | $(TCCDIR)/win32
+	$(CC) $(KCFLAGS) -Iwin32 -c -o $@ $<
+
+$(TCCDIR)/win32/msvcrt_shim.o: win32/msvcrt_shim.c | $(TCCDIR)/win32
+	$(CC) $(KCFLAGS) -Iwin32 -c -o $@ $<
+
+# Assembly always uses GCC (TCC assembler missing iretq/lretq)
+$(TCCDIR)/kernel/%.o: kernel/%.S | $(TCCDIR)/kernel
+	$(CC) -c -o $@ $<
+
+$(TCCDIR)/win32/%.o: win32/%.S | $(TCCDIR)/win32
+	$(CC) -c -o $@ $<
+
+# TCC build directories
+$(TCCDIR) $(TCCDIR)/kernel $(TCCDIR)/drivers $(TCCDIR)/fs $(TCCDIR)/win32:
+	mkdir -p $@
+
+tcc-clean:
+	rm -rf $(TCCDIR)
 
 # ── Legacy monolithic build (backward compat) ──────────────────
 

@@ -271,7 +271,7 @@ uint64_t mem_get_used(void)
     return (total_pages - free_pages) * PAGE_SIZE;
 }
 
-/* ── strncmp (needed by process.c, not in any linked libc) ──── */
+/* ── libc stubs (no linked libc — needed by kernel code + TCC codegen) ── */
 
 int strncmp(const char *a, const char *b, uint64_t n)
 {
@@ -280,4 +280,88 @@ int strncmp(const char *a, const char *b, uint64_t n)
         if (a[i] == '\0') return 0;
     }
     return 0;
+}
+
+/* TCC generates memmove calls for struct assignments (GCC inlines them) */
+void *memmove(void *dst, const void *src, uint64_t n)
+{
+    uint8_t *d = (uint8_t *)dst;
+    const uint8_t *s = (const uint8_t *)src;
+    if (d < s) {
+        for (uint64_t i = 0; i < n; i++) d[i] = s[i];
+    } else {
+        for (uint64_t i = n; i > 0; i--) d[i-1] = s[i-1];
+    }
+    return dst;
+}
+
+/* TCC soft-float/soft-int helpers (GCC uses libgcc or inlines these).
+ * These convert between uint64_t and float/double without using float
+ * intermediates (which would recursively call the same helpers). */
+
+float __floatundisf(uint64_t a)
+{
+    /* uint64_t → float: construct IEEE 754 float via integer math */
+    if (a == 0) return 0.0f;
+    /* If fits in int32, use hardware conversion */
+    if (a <= 0x7FFFFFUL) return (float)(uint32_t)a;
+    /* Find highest set bit (manual clz) */
+    int shift = 0;
+    uint64_t tmp = a;
+    while (tmp > 0xFFFFFF) { tmp >>= 1; shift++; }
+    /* Round: check the bits we're about to discard */
+    if (shift > 0 && (a & ((1ULL << (shift - 1))))) tmp++;
+    return (float)(uint32_t)tmp * (float)(1ULL << shift);
+}
+
+double __floatundidf(uint64_t a)
+{
+    /* uint64_t → double */
+    if (a == 0) return 0.0;
+    if (a <= 0x1FFFFFFFFFFFFFULL) return (double)(int64_t)a; /* fits in 53 mantissa bits */
+    /* Split into high and low 32-bit parts */
+    uint32_t hi = (uint32_t)(a >> 32);
+    uint32_t lo = (uint32_t)a;
+    return (double)hi * 4294967296.0 + (double)lo;
+}
+
+uint64_t __fixunssfdi(float a)
+{
+    /* float → uint64_t */
+    if (a <= 0.0f) return 0;
+    /* Extract via integer bit manipulation */
+    union { float f; uint32_t u; } u = { .f = a };
+    uint32_t exp = (u.u >> 23) & 0xFF;
+    uint32_t mant = (u.u & 0x7FFFFF) | 0x800000; /* add implicit 1 */
+    if (exp < 127) return 0;
+    int shift = (int)exp - 127 - 23;
+    if (shift >= 40) return ~0ULL; /* overflow */
+    if (shift >= 0) return (uint64_t)mant << shift;
+    return (uint64_t)mant >> (-shift);
+}
+
+uint64_t __fixunsdfdi(double a)
+{
+    /* double → uint64_t */
+    if (a <= 0.0) return 0;
+    union { double d; uint64_t u; } u = { .d = a };
+    uint32_t exp = (u.u >> 52) & 0x7FF;
+    uint64_t mant = (u.u & 0xFFFFFFFFFFFFFULL) | 0x10000000000000ULL;
+    if (exp < 1023) return 0;
+    int shift = (int)exp - 1023 - 52;
+    if (shift >= 11) return ~0ULL;
+    if (shift >= 0) return mant << shift;
+    return mant >> (-shift);
+}
+
+/* TCC doesn't support __builtin_unreachable — provide as infinite loop */
+void __builtin_unreachable(void)
+{
+    for (;;) __asm__ volatile("hlt");
+}
+
+/* proc_set_qos — stub (full implementation in scheduler, not yet linked) */
+void proc_set_qos(uint8_t qos)
+{
+    (void)qos;
 }
