@@ -20,7 +20,8 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 X86_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 BUILD_DIR="$X86_DIR/build"
-EFI_BIN="$BUILD_DIR/ositok.efi"
+EFI_BIN="$BUILD_DIR/boot.efi"
+KERN_BIN="$BUILD_DIR/kernel.elf"
 ESP_IMG="$BUILD_DIR/esp.img"
 
 # OVMF firmware paths (try common locations)
@@ -55,11 +56,12 @@ command -v mtools >/dev/null 2>&1 || command -v mcopy >/dev/null 2>&1 || error "
 # ── Build if needed ───────────────────────────────────────────
 
 if [ "$1" != "--no-build" ]; then
-    info "Building ositok.efi..."
-    make -C "$X86_DIR" -j$(nproc) 2>&1 | tail -3
+    info "Building boot.efi + kernel.elf..."
+    make -C "$X86_DIR" -j$(nproc) 2>&1 | tail -5
 fi
 
-[ -f "$EFI_BIN" ] || error "ositok.efi not found at $EFI_BIN"
+[ -f "$EFI_BIN" ]  || error "boot.efi not found at $EFI_BIN"
+[ -f "$KERN_BIN" ] || error "kernel.elf not found at $KERN_BIN"
 
 # ── Create ESP image ─────────────────────────────────────────
 
@@ -69,8 +71,9 @@ mformat -i "$ESP_IMG" -F ::
 mmd -i "$ESP_IMG" ::/EFI
 mmd -i "$ESP_IMG" ::/EFI/BOOT
 mcopy -i "$ESP_IMG" "$EFI_BIN" ::/EFI/BOOT/BOOTX64.EFI
+mcopy -i "$ESP_IMG" "$KERN_BIN" ::/EFI/BOOT/kernel.elf
 
-info "ESP image: $ESP_IMG ($(stat -c%s "$EFI_BIN") bytes EFI)"
+info "ESP image: boot.efi=$(stat -c%s "$EFI_BIN") kernel.elf=$(stat -c%s "$KERN_BIN")"
 
 # ── Launch QEMU ──────────────────────────────────────────────
 

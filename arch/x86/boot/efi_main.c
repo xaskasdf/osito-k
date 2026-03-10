@@ -11,18 +11,25 @@
 #include <efi.h>
 #include <efilib.h>
 
-/* Forward declarations for kernel functions */
-extern void serial_init(void);
-extern void serial_puts(const char *s);
-extern void serial_puthex(unsigned long long val, int digits);
+/* boot_info_t definition (must match include/boot_info.h) */
+typedef struct {
+    unsigned int magic;
+    unsigned int version;
+    unsigned long long fb_base;
+    unsigned int fb_width;
+    unsigned int fb_height;
+    unsigned int fb_pitch;
+    unsigned long long mmap_addr;
+    unsigned long long mmap_size;
+    unsigned long long mmap_desc_size;
+    unsigned int mmap_desc_ver;
+    unsigned int _pad0;
+    unsigned long long acpi_rsdp;
+    unsigned long long kernel_phys_base;
+    unsigned long long kernel_size;
+} boot_info_t;
 
-extern void fb_init(unsigned int *base, unsigned int w, unsigned int h, unsigned int pitch);
-extern void fb_clear(void);
-extern void fb_puts(const char *s);
-extern void fb_puts_color(const char *s, unsigned int color);
-
-extern void kernel_entry(void *memory_map, unsigned long long map_size,
-                         unsigned long long desc_size, unsigned long long desc_version);
+extern void kernel_entry(boot_info_t *info);
 
 /* ── GOP Framebuffer Setup ───────────────────────────────────── */
 
@@ -188,18 +195,24 @@ efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable)
     /* === We are now bare-metal === */
     /* No more UEFI Boot Services available */
 
-    /* Initialize our serial driver */
-    serial_init();
-    serial_puts("\r\n[OsitoK] Serial initialized (COM1 115200)\r\n");
+    /* Fill boot_info and hand off to kernel */
+    boot_info_t info;
+    info.magic           = 0x4F53544B;
+    info.version         = 1;
+    info.fb_base         = (unsigned long long)gop_fb_base;
+    info.fb_width        = gop_fb_width;
+    info.fb_height       = gop_fb_height;
+    info.fb_pitch        = gop_fb_pitch;
+    info.mmap_addr       = (unsigned long long)mmap_buf;
+    info.mmap_size       = (unsigned long long)mmap_size;
+    info.mmap_desc_size  = (unsigned long long)mmap_desc_size;
+    info.mmap_desc_ver   = mmap_desc_ver;
+    info._pad0           = 0;
+    info.acpi_rsdp       = efi_acpi_rsdp;
+    info.kernel_phys_base = 0;  /* Legacy build: kernel is part of EFI binary */
+    info.kernel_size      = 0;
 
-    /* Initialize our framebuffer driver */
-    fb_init(gop_fb_base, gop_fb_width, gop_fb_height, gop_fb_pitch);
-    fb_clear();
-
-    /* Hand off to kernel */
-    kernel_entry(mmap_buf, (unsigned long long)mmap_size,
-                 (unsigned long long)mmap_desc_size,
-                 (unsigned long long)mmap_desc_ver);
+    kernel_entry(&info);
 
     /* Should never reach here */
 halt:

@@ -34,8 +34,8 @@ extern uint64_t idt_get_ticks(void);
 /* From paging.c */
 extern uint64_t paging_get_kernel_cr3(void);
 
-/* From efi_main.c — RSDP address found in EFI configuration table */
-extern uint64_t efi_acpi_rsdp;
+/* From main.c — RSDP address set from boot_info */
+extern uint64_t kernel_acpi_rsdp;
 
 /* ── ACPI MADT Structures ────────────────────────────────────── */
 
@@ -215,11 +215,11 @@ static const uint8_t trampoline_code[] = {
 static acpi_rsdp_t *find_rsdp(void)
 {
     /* Prefer RSDP from EFI System Table (set by efi_main) */
-    if (efi_acpi_rsdp) {
+    if (kernel_acpi_rsdp) {
         serial_puts("[SMP] Using EFI RSDP at ");
-        serial_puthex(efi_acpi_rsdp, 16);
+        serial_puthex(kernel_acpi_rsdp, 16);
         serial_puts("\n");
-        return (acpi_rsdp_t *)efi_acpi_rsdp;
+        return (acpi_rsdp_t *)kernel_acpi_rsdp;
     }
 
     /* Fallback: scan BIOS ROM area for "RSD PTR " */

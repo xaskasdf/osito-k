@@ -129,6 +129,29 @@ void mem_init(void *mmap, uint64_t mmap_size, uint64_t desc_size)
     fb_puts(" MB usable\n");
 }
 
+/* ── Reserve kernel pages (prevent allocator from handing them out) ── */
+
+void mem_reserve_kernel(uint64_t phys_base, uint64_t size)
+{
+    uint64_t start_page = phys_base >> PAGE_SHIFT;
+    uint64_t num_pages = (size + PAGE_SIZE - 1) >> PAGE_SHIFT;
+
+    uint64_t reserved = 0;
+    for (uint64_t p = 0; p < num_pages && (start_page + p) < MAX_PHYS_PAGES; p++) {
+        if (bitmap_test(start_page + p)) {
+            bitmap_clear(start_page + p);
+            free_pages--;
+            reserved++;
+        }
+    }
+
+    serial_puts("[MEM] Reserved kernel region: 0x");
+    serial_puthex(phys_base, 16);
+    serial_puts(" (");
+    serial_putdec(reserved);
+    serial_puts(" pages)\n");
+}
+
 /* ── Allocate physical pages ─────────────────────────────────── */
 
 void *mem_alloc_pages(uint64_t count)
@@ -241,4 +264,20 @@ uint64_t mem_get_free(void)
 uint64_t mem_get_total(void)
 {
     return total_memory;
+}
+
+uint64_t mem_get_used(void)
+{
+    return (total_pages - free_pages) * PAGE_SIZE;
+}
+
+/* ── strncmp (needed by process.c, not in any linked libc) ──── */
+
+int strncmp(const char *a, const char *b, uint64_t n)
+{
+    for (uint64_t i = 0; i < n; i++) {
+        if (a[i] != b[i]) return (unsigned char)a[i] - (unsigned char)b[i];
+        if (a[i] == '\0') return 0;
+    }
+    return 0;
 }

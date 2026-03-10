@@ -6,6 +6,7 @@
  */
 
 #include "../include/types.h"
+#include "../include/boot_info.h"
 #include "../drivers/gpu.h"
 #include "../drivers/gpu_inference.h"
 #include "../fs/gguf.h"
@@ -56,11 +57,14 @@ extern void dl_init(void);
 extern void win32_init(void);
 
 /* Serial */
+extern void serial_init(void);
 extern void serial_puts(const char *s);
 extern void serial_puthex(uint64_t val, int digits);
 extern void serial_putdec(uint64_t val);
 
 /* Framebuffer */
+extern void fb_init(uint32_t *base, uint32_t w, uint32_t h, uint32_t pitch);
+extern void fb_clear(void);
 extern void fb_puts(const char *s);
 extern void fb_puts_color(const char *s, uint32_t color);
 extern void fb_putdec(uint64_t val);
@@ -68,6 +72,10 @@ extern void fb_puthex(uint64_t val, int digits);
 
 /* Memory */
 extern void mem_init(void *mmap, uint64_t mmap_size, uint64_t desc_size);
+extern void mem_reserve_kernel(uint64_t phys_base, uint64_t size);
+
+/* ACPI RSDP — set from boot_info, read by smp.c */
+uint64_t kernel_acpi_rsdp;
 
 /* PCI */
 extern void pci_scan(void);
@@ -275,17 +283,41 @@ static void print_banner(void)
 
 /* ── Kernel Entry Point ──────────────────────────────────────── */
 
-void kernel_entry(void *memory_map, uint64_t map_size,
-                  uint64_t desc_size, uint64_t desc_version)
+/* BSS symbols from kernel.ld */
+extern char __bss_start[], __bss_end[];
+
+void kernel_entry(boot_info_t *info)
 {
-    (void)desc_version;
+    /* ── Step -1: Zero BSS (UEFI AllocatePages returns zeroed memory, but
+     * the kernel's BSS extends beyond the file-backed data segment) ── */
+    {
+        uint64_t *p = (uint64_t *)__bss_start;
+        uint64_t *end = (uint64_t *)((uintptr_t)__bss_end & ~7ULL);
+        while (p < end)
+            *p++ = 0;
+    }
+
+    /* ── Step 0: Initialize serial + framebuffer (moved from boot) ── */
+    serial_init();
+    serial_puts("\r\n[OsitoK] Serial initialized (COM1 115200)\r\n");
+
+    fb_init((uint32_t *)(uintptr_t)info->fb_base,
+            info->fb_width, info->fb_height, info->fb_pitch);
+    fb_clear();
+
+    /* Store ACPI RSDP for smp.c */
+    kernel_acpi_rsdp = info->acpi_rsdp;
 
     print_banner();
 
     /* ── Step 1: Initialize memory manager ── */
     serial_puts("[KERN] Initializing memory manager...\n");
     fb_puts(" Initializing memory...\n");
-    mem_init(memory_map, map_size, desc_size);
+    mem_init((void *)(uintptr_t)info->mmap_addr, info->mmap_size, info->mmap_desc_size);
+
+    /* Reserve kernel pages so allocator doesn't hand them out */
+    if (info->kernel_phys_base && info->kernel_size)
+        mem_reserve_kernel(info->kernel_phys_base, info->kernel_size);
 
     /* ── Step 1.5: IDT + Exceptions + APIC timer ── */
     idt_init();
