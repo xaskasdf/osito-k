@@ -121,4 +121,5 @@ qemu-system-x86_64 \
     -netdev user,id=net0,hostfwd=udp::7777-:7777 \
     -display none \
     -serial file:"$SERIAL_LOG" \
+    -monitor unix:/tmp/qemu-monitor.sock,server,nowait \
     -no-reboot

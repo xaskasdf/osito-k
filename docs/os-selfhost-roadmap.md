@@ -150,7 +150,7 @@ abstracciones necesarias para correr software real sin modificar.
 | **X-THREAD** | **Threads (clone/futex)** | clone(CLONE_VM\|CLONE_THREAD), futex(WAIT/WAKE), set_tid_address, gettid. Per-thread stacks, TLS via arch_prctl ARCH_SET_FS. Usar SMP cores para threads reales. | ~1000 | X-SCHED, X-MMAP |
 | **X-EDIT** | **Port editor mínimo** | Portar un editor de texto (kilo ~1000LOC, o nano subset). Editar archivos desde OsitoK sin host. Necesita raw mode TTY + VT100 ANSI. | ~600 glue | X-MUSL |
 | **X-HTTPD** | **TCP server (listen/accept)** | Completar TCP stack: listen(), accept(), server sockets. Implementar HTTP server mínimo. Exponer servicios desde OsitoK a la red. | ~600 | Ninguna |
-| **X-SELF** | **Self-hosting completo** | Compilar el propio kernel x86 desde OsitoK. Requiere: TCC o GCC port, musl libc, gnu-efi headers, ld linker in-OS, make equivalent. Hito definitivo de un OS. | ~2000 | X-MUSL, X-EDIT |
+| **X-SELF** | **Self-hosting completo** | Compilar el propio kernel x86 desde OsitoK. Phase 2: TCC compila 62 .c + links 71 .o → kernel.elf (727KB). Phase 2.5: Extracted kernel boots in QEMU — all subsystems OK. Phase 3: install + reboot. | ~2000 | X-MUSL, X-EDIT | Phase 2.5 ✅ |
 
 **Hito** ✅: `busybox sh` (musl-static, ~1MB) corre dentro de OsitoK. Applets cat/echo/uname funcionan.
 
@@ -390,6 +390,60 @@ X-VFS (VFS layer)         — se puede hacer ya
 
 **Lección clave**: Todos portaron GCC/TCC en vez de escribir compilador propio.
 Cross-compilar primero, luego self-host. TCC es el path más rápido al bootstrap.
+
+---
+
+## OsitoFS v2 Block Reclamation + Futuro v3
+
+### v2 con reclamación (implementado)
+
+OsitoFS v2 originalmente era append-only: `osfs2_delete()` marcaba archivos como
+inválidos pero no liberaba los bloques en disco. Cada ciclo delete+create consumía
+espacio permanentemente — después de ~8 rebuilds en una partición de 512MB, se
+acababa el espacio.
+
+**Solución implementada**: bitmap de bloques en memoria (32KB), reconstruido al mount
+desde la file table. `delete()` libera bloques en el bitmap; `create()` busca
+huecos libres (first-fit) antes de hacer append. Sin cambio de formato en disco.
+
+Esto permite ciclos ilimitados de build (delete .o → create .o → link) sin leak.
+
+### v3 (futuro, no bloqueante)
+
+Limitaciones de v2 que v3 resolvería:
+
+| Limitación v2 | Impacto | Solución v3 |
+|---|---|---|
+| **Bloques de 1MB** | 38x desperdicio en archivos chicos (headers 2KB → 1MB) | Bloques de 4KB con extents |
+| **Sin directorios** | Flat namespace, basename stripping como workaround | Directorio como archivo especial (inode-like) |
+| **Bitmap solo en RAM** | Si crash antes de persist, se reconstruye al mount (OK) | Bitmap persistido en disco (bloque dedicado) |
+| **File table fija 1MB** | 4096 max files siempre, no crece | Tabla dinámica con overflow blocks |
+| **Sin timestamps** | No se sabe cuándo se modificó un archivo | mtime/ctime en file entry |
+| **Sin permisos** | Todo es root RW | uid/gid/mode en file entry |
+
+**Formato propuesto v3**:
+```
+Block 0:     Superblock (magic=OSF3, block_size=4096)
+Block 1-N:   Block bitmap (1 bit per 4KB block)
+Block N+1:   Root directory inode
+Block N+2+:  Data blocks (files, directories, indirect blocks)
+
+Inode (128 bytes):
+  - type (file/dir/symlink)
+  - size, uid, gid, mode
+  - mtime, ctime
+  - 12 direct block pointers
+  - 1 indirect, 1 double-indirect
+  - extent list (start_block, count) × 4 for contiguous files
+```
+
+**Prioridad**: Baja. v2 con reclamación es suficiente para self-build y operación
+normal. v3 sería necesario para:
+- Port de software que asume directorios (make, git, etc.)
+- Filesystem con >4096 archivos
+- Eficiencia de espacio para muchos archivos chicos
+
+**Estimación**: ~1000-1500 LOC kernel driver + ~500 LOC host tools (mkfs, fsck).
 
 ---
 

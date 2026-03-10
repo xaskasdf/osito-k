@@ -121,7 +121,7 @@ win32/             pe.c, winexec.c — PE32 loader + execution
                    compat32.c, int2e_stub.S — 32→64 mode switching (INT 0x2E)
                    dllloader.c — 15 DLL shims (kernel32, msvcrt, user32, etc.)
                    ntsyscall.c, handle.c — NT syscalls + handle table
-fs/                ositofs2.c, gpt.c, gguf.c — OsitoFS v2 + GPT + GGUF
+fs/                ositofs2.c, gpt.c, gguf.c — OsitoFS v2 (R/W + block reclaim) + GPT + GGUF
 libc/              crt.c, syscall.S, tcclib.c, math.c — CRT + extended libc
                    qjs_main.c, qjs_headers/ — QuickJS REPL
                    ositok.h — single-header libc for self-compiled programs
@@ -130,7 +130,7 @@ test/              various test programs + qjs.elf
 
 ### Host Tools (tools/)
 ```
-tools/ositofs/     mkfs.c, write.c, ls.c, info.c — OsitoFS v2 host tools
+tools/ositofs/     mkfs.c, write.c, read.c, ls.c, info.c — OsitoFS v2 host tools
 include/common/    ositofs2_format.h — shared on-disk format
 ```
 
@@ -199,7 +199,7 @@ arch/arm/          SM8350 (ROG Phone 5) bare-metal port — see docs/aarch64-det
 | X-THREAD| clone(CLONE_THREAD) + futex | Done |
 | X-EDIT  | Kilo text editor (ANSI CSI, termios) | Done |
 | X-HTTPD | HTTP file server (TCP listen/accept) | Done |
-| X-SELF  | Self-hosting C compilation (cc -run) | Done |
+| X-SELF  | Self-hosting: TCC builds kernel.elf in-OS (727KB, boots in QEMU) | Done |
 | X-QOS   | QoS priority scheduler (5 classes) | Done |
 | X-CCP   | AMD CCP TRNG driver | Done |
 | X-AHCI  | SATA AHCI driver | WIP |

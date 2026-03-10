@@ -283,8 +283,11 @@ static void print_banner(void)
 
 /* ── Kernel Entry Point ──────────────────────────────────────── */
 
-/* BSS symbols from kernel.ld */
-extern char __bss_start[], __bss_end[];
+/* BSS symbols: provided by kernel.ld when linking with ld, or by these
+ * weak fallbacks when linking with TCC's linker (BSS already zeroed by
+ * UEFI AllocatePages, so the zeroing loop becomes a no-op). */
+extern char __bss_start[] __attribute__((weak));
+extern char __bss_end[]   __attribute__((weak));
 
 void kernel_entry(boot_info_t *info)
 {

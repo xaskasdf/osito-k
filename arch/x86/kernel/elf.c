@@ -366,11 +366,20 @@ static uint64_t elf_setup_stack(elf_loaded_t *loaded,
      */
 
     /* Copy argument strings to stack */
-    uint64_t string_area = sp - 256;  /* Reserve 256 bytes for strings */
+    #define ELF_MAX_ARGS 256
+
+    /* Calculate string space needed */
+    int effective_argc = (argc > ELF_MAX_ARGS) ? ELF_MAX_ARGS : argc;
+    uint64_t str_need = 0;
+    for (int i = 0; i < effective_argc; i++)
+        str_need += strlen(argv[i]) + 1;
+    if (str_need < 256) str_need = 256;
+    str_need = (str_need + 15) & ~15ULL;
+
+    uint64_t string_area = sp - str_need;
     uint64_t str_ptr = string_area;
 
-    uint64_t argv_ptrs[16];
-    int effective_argc = (argc > 16) ? 16 : argc;
+    uint64_t argv_ptrs[ELF_MAX_ARGS];
 
     for (int i = 0; i < effective_argc; i++) {
         uint64_t len = strlen(argv[i]) + 1;

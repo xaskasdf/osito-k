@@ -1,8 +1,10 @@
 /*
  * OsitoK x86-64 — OsitoFS v2 Bare-Metal Driver
  *
- * Reads OsitoFS v2 from NVMe via the NVMe read driver.
- * Supports: mount (validate superblock), list files, read blocks.
+ * Full R/W driver with block reclamation.
+ * In-memory block bitmap rebuilt on mount — freed blocks are reused
+ * by subsequent creates (first-fit), eliminating the old append-only
+ * space leak. No on-disk format changes required.
  *
  * The partition byte offset must be provided at mount time
  * (from GPT table parsing or hardcoded).
@@ -36,6 +38,74 @@ static bool          mounted;
 
 /* Cached file table (first 4096 * 256 = 1MB — read on mount) */
 static osfs2_file_t *file_table;
+
+/* ── Block usage bitmap (in-memory, rebuilt on mount) ────────── */
+/* Tracks which 1MB blocks are in use. Enables block reclamation  */
+/* on delete — freed blocks can be reused by subsequent creates.  */
+
+#define BLK_BITMAP_BYTES  (OSFS2_MAX_BLOCKS / 8)  /* 32KB for 262144 blocks */
+static uint8_t blk_bitmap[BLK_BITMAP_BYTES];      /* 1 = used, 0 = free */
+
+static inline void blk_bitmap_set(uint32_t blk)
+{
+    if (blk < OSFS2_MAX_BLOCKS)
+        blk_bitmap[blk / 8] |= (1 << (blk % 8));
+}
+
+static inline void blk_bitmap_clear(uint32_t blk)
+{
+    if (blk < OSFS2_MAX_BLOCKS)
+        blk_bitmap[blk / 8] &= ~(1 << (blk % 8));
+}
+
+static inline int blk_bitmap_test(uint32_t blk)
+{
+    if (blk >= OSFS2_MAX_BLOCKS) return 1;
+    return (blk_bitmap[blk / 8] >> (blk % 8)) & 1;
+}
+
+/* Rebuild bitmap from file table (called on mount) */
+static void blk_bitmap_rebuild(void)
+{
+    memset(blk_bitmap, 0, sizeof(blk_bitmap));
+
+    /* Metadata blocks 0-3 always used */
+    for (uint32_t i = 0; i < OSFS2_DATA_START_BLK; i++)
+        blk_bitmap_set(i);
+
+    /* Mark each valid file's blocks */
+    for (uint32_t i = 0; i < OSFS2_MAX_FILES; i++) {
+        if (!(file_table[i].flags & OSFS2_FLAG_VALID)) continue;
+        osfs2_file_t *f = &file_table[i];
+        for (uint32_t b = 0; b < f->block_count; b++)
+            blk_bitmap_set(f->start_block + b);
+    }
+
+    /* Recompute used_blocks from bitmap (fixes stale superblock values) */
+    uint32_t used = 0;
+    for (uint32_t b = OSFS2_DATA_START_BLK; b < superblock.total_blocks; b++) {
+        if (blk_bitmap_test(b)) used++;
+    }
+    superblock.used_blocks = used + OSFS2_DATA_START_BLK;
+}
+
+/* Find contiguous free region (first-fit). Returns start block, or 0 if none. */
+static uint32_t blk_bitmap_find_free(uint32_t count)
+{
+    uint32_t run_start = 0;
+    uint32_t run_len = 0;
+
+    for (uint32_t b = OSFS2_DATA_START_BLK; b < superblock.total_blocks; b++) {
+        if (!blk_bitmap_test(b)) {
+            if (run_len == 0) run_start = b;
+            run_len++;
+            if (run_len == count) return run_start;
+        } else {
+            run_len = 0;
+        }
+    }
+    return 0;
+}
 
 /* ── Read from partition ─────────────────────────────────────── */
 
@@ -115,11 +185,32 @@ int osfs2_mount(uint64_t part_offset)
 
     mounted = true;
 
+    /* Build block usage bitmap from file table */
+    blk_bitmap_rebuild();
+
+    /* Shrink next_data_block if trailing blocks are free (recover from old append-only) */
+    while (superblock.next_data_block > OSFS2_DATA_START_BLK &&
+           !blk_bitmap_test(superblock.next_data_block - 1))
+        superblock.next_data_block--;
+
+    uint32_t data_blks = superblock.total_blocks - OSFS2_DATA_START_BLK;
+    uint32_t used_data = superblock.used_blocks - OSFS2_DATA_START_BLK;
+
+    serial_puts("[OsitoFS] Block bitmap built: ");
+    serial_putdec(used_data);
+    serial_puts("/");
+    serial_putdec(data_blks);
+    serial_puts(" data blocks used, ");
+    serial_putdec(data_blks - used_data);
+    serial_puts(" free\n");
+
     fb_puts("\n OsitoFS v2 [");
     fb_puts(superblock.label);
     fb_puts("] — ");
     fb_putdec(superblock.file_count);
-    fb_puts(" file(s)\n");
+    fb_puts(" file(s), ");
+    fb_putdec(data_blks - used_data);
+    fb_puts(" MB free\n");
 
     return 0;
 }
@@ -188,14 +279,16 @@ void osfs2_list(void)
         fb_puts("\n");
     }
 
-    /* Summary */
+    /* Summary — show actual used blocks (not high-water mark) */
     uint32_t data_blocks = superblock.total_blocks - OSFS2_DATA_START_BLK;
-    uint32_t used = superblock.next_data_block - OSFS2_DATA_START_BLK;
+    uint32_t used_data = superblock.used_blocks - OSFS2_DATA_START_BLK;
     fb_puts("  ");
-    fb_putdec(used);
+    fb_putdec(used_data);
     fb_puts("/");
     fb_putdec(data_blocks);
-    fb_puts(" MB used\n");
+    fb_puts(" MB used, ");
+    fb_putdec(data_blocks - used_data);
+    fb_puts(" MB free\n");
 }
 
 /* ── Find file by name ───────────────────────────────────────── */
@@ -315,26 +408,35 @@ osfs2_file_t *osfs2_create(const char *name, uint64_t size)
     uint32_t blocks = (uint32_t)((size + OSFS2_BLOCK_SIZE - 1) >> OSFS2_BLOCK_SHIFT);
     if (blocks == 0) blocks = 1;
 
-    /* Check space */
-    if (superblock.next_data_block + blocks > superblock.total_blocks) {
-        serial_puts("[OsitoFS] Not enough space: need ");
-        serial_putdec(blocks);
-        serial_puts(" blocks\n");
-        return NULL;
+    /* Try to reuse freed blocks first (first-fit in bitmap) */
+    uint32_t start = blk_bitmap_find_free(blocks);
+    if (!start) {
+        /* No reusable gap — append at high-water mark */
+        if (superblock.next_data_block + blocks > superblock.total_blocks) {
+            serial_puts("[OsitoFS] Not enough space: need ");
+            serial_putdec(blocks);
+            serial_puts(" blocks\n");
+            return NULL;
+        }
+        start = superblock.next_data_block;
+        superblock.next_data_block += blocks;
     }
+
+    /* Mark blocks as used in bitmap */
+    for (uint32_t b = 0; b < blocks; b++)
+        blk_bitmap_set(start + b);
 
     /* Fill file entry */
     osfs2_file_t *f = &file_table[slot];
     memset(f, 0, sizeof(*f));
     strcpy(f->name, name);
     f->size = size;
-    f->start_block = superblock.next_data_block;
+    f->start_block = start;
     f->block_count = blocks;
     f->flags = OSFS2_FLAG_VALID;
     f->layer_index_slot = 0xFFFF;
 
     /* Update superblock */
-    superblock.next_data_block += blocks;
     superblock.used_blocks += blocks;
     superblock.file_count++;
 
@@ -388,9 +490,21 @@ int osfs2_delete(const char *name)
     osfs2_file_t *f = osfs2_find(name);
     if (!f) return -1;
 
-    /* Mark as invalid (space not reclaimed — append-only allocator) */
+    uint32_t freed_blocks = f->block_count;
+
+    /* Free blocks in bitmap */
+    for (uint32_t b = 0; b < f->block_count; b++)
+        blk_bitmap_clear(f->start_block + b);
+
+    /* Mark file entry as invalid */
     f->flags = 0;
     superblock.file_count--;
+    superblock.used_blocks -= freed_blocks;
+
+    /* Shrink high-water mark if we freed trailing blocks */
+    while (superblock.next_data_block > OSFS2_DATA_START_BLK &&
+           !blk_bitmap_test(superblock.next_data_block - 1))
+        superblock.next_data_block--;
 
     if (osfs2_write_file_table() < 0 || osfs2_write_superblock() < 0)
         return -1;
@@ -399,7 +513,9 @@ int osfs2_delete(const char *name)
 
     serial_puts("[OsitoFS] Deleted '");
     serial_puts(name);
-    serial_puts("'\n");
+    serial_puts("' (freed ");
+    serial_putdec(freed_blocks);
+    serial_puts(" blocks)\n");
     return 0;
 }
 
@@ -410,6 +526,12 @@ uint32_t osfs2_file_count(void) { return mounted ? superblock.file_count : 0; }
 const char *osfs2_label(void) { return mounted ? superblock.label : ""; }
 uint64_t osfs2_file_size(osfs2_file_t *file) { return file ? file->size : 0; }
 const char *osfs2_file_name(osfs2_file_t *file) { return file ? file->name : NULL; }
+uint32_t osfs2_free_blocks(void) {
+    if (!mounted) return 0;
+    uint32_t total_data = superblock.total_blocks - OSFS2_DATA_START_BLK;
+    uint32_t used_data = superblock.used_blocks - OSFS2_DATA_START_BLK;
+    return total_data - used_data;
+}
 
 /* Get nth valid file (0-indexed). Returns NULL if out of range. */
 osfs2_file_t *osfs2_file_at(uint32_t index)

@@ -271,7 +271,7 @@ static inline void wrmsr(uint32_t msr, uint64_t val) {
 
 /* ── File descriptor table ───────────────────────────────────── */
 
-#define MAX_FDS 16
+#define MAX_FDS 128
 
 #define FD_TYPE_CONSOLE 1
 #define FD_TYPE_FILE    2
@@ -411,7 +411,7 @@ static ssize_t console_read(void *buf, size_t count)
 
 /* ── brk state (process heap) ────────────────────────────────── */
 
-#define BRK_HEAP_SIZE  (4ULL * 1024 * 1024)  /* 4MB process heap */
+#define BRK_HEAP_SIZE  (16ULL * 1024 * 1024)  /* 16MB process heap */
 
 static uint8_t *brk_base;      /* start of brk region */
 static uint8_t *brk_current;   /* current break */
@@ -816,7 +816,9 @@ static int64_t sys_open(uint64_t path_addr, uint64_t flags, uint64_t mode)
         file = osfs2_create(path, 0);
     }
 
-    if (!file) return -ENOENT;
+    if (!file) {
+        return -ENOENT;
+    }
 
     fd_entry_t *f = &fd_table[newfd];
     memset(f, 0, sizeof(*f));
@@ -1006,15 +1008,48 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
                          uint64_t flags, uint64_t fd, uint64_t offset)
 {
     (void)addr;    /* MAP_FIXED not supported yet */
-    (void)offset;
-
-    /* Only support anonymous private mappings */
-    if (!(flags & MAP_ANONYMOUS))
-        return -ENOSYS;  /* No file-backed mmap */
-    if (fd != (uint64_t)-1 && !(flags & MAP_ANONYMOUS))
-        return -EBADF;
 
     if (length == 0) return -EINVAL;
+
+    /* File-backed mmap: allocate pages + read file content */
+    if (!(flags & MAP_ANONYMOUS)) {
+        if (fd >= MAX_FDS || !fd_table[fd].open) return -EBADF;
+        fd_entry_t *f = &fd_table[fd];
+        if (f->type != FD_TYPE_FILE) return -EBADF;
+
+        uint64_t npages = (length + 4095) / 4096;
+
+        int vi = -1;
+        for (int i = 0; i < MAX_VMAS; i++) {
+            if (!vma_table[i].in_use) { vi = i; break; }
+        }
+        if (vi < 0) return -ENOMEM;
+
+        void *pages = mem_alloc_pages(npages);
+        if (!pages) return -ENOMEM;
+
+        memset(pages, 0, npages * 4096);
+
+        /* Read file data into the allocated pages */
+        uint64_t file_size = osfs2_file_size(f->file);
+        uint64_t to_read = length;
+        if (offset + to_read > file_size)
+            to_read = (offset < file_size) ? file_size - offset : 0;
+
+        if (to_read > 0)
+            osfs2_read(f->file, offset, pages, to_read);
+
+        vma_table[vi].base   = (uint64_t)pages;
+        vma_table[vi].pages  = npages;
+        vma_table[vi].prot   = (uint32_t)prot;
+        vma_table[vi].in_use = true;
+
+        return (int64_t)(uint64_t)pages;
+    }
+
+    /* Anonymous mapping */
+    if (fd != (uint64_t)-1 && !(flags & MAP_ANONYMOUS))
+        return -EBADF;
 
     /* Round up to page boundary */
     uint64_t npages = (length + 4095) / 4096;

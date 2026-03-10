@@ -10,7 +10,11 @@
 #ifndef NTTYPES_H
 #define NTTYPES_H
 
+#ifdef __KERNEL_X86__
+#include "types.h"
+#else
 #include <stdint.h>
+#endif
 
 /* ── Calling convention attributes ──────────────────────────── */
 /*
