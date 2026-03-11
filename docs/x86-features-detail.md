@@ -835,15 +835,40 @@ TCP passive open (listen/accept) + HTTP/1.1 file server running as a preemptive 
 - **Verified**: `curl http://localhost:8080/` returns directory listing, `curl http://localhost:8080/test.txt` returns file contents, 404 for missing files. All via QEMU SLIRP `hostfwd=tcp::8080-:8080`.
 - **Files**: `arch/x86/kernel/net.c` (TCP listen/accept), `arch/x86/kernel/net.h` (TCP server API), `arch/x86/kernel/shell.c` (HTTP server + httpd command)
 
-### X-SELF: Self-Hosting C Compilation
-Programs compiled AND executed entirely inside OsitoK — no host toolchain needed at runtime.
-- **cc command enhanced** (`shell.c`): Auto-detects CRT objects (crt.o, syscall.o, tcclib.o) on OsitoFS. When present, passes them to TCC along with `-Wl,-Ttext,0x401000` and `-Wl,-section-alignment,0x1000` for compact ELF layout. Without CRT objects, falls back to bare `-nostdlib` mode.
-- **ositok.h** (`libc/ositok.h`): Single header providing all libc prototypes for self-compiled programs. Includes: stdarg via builtins, stdio (printf/fprintf/fopen/fread), stdlib (malloc/free/qsort), string (strlen/strcmp/strcpy), ctype, POSIX I/O (open/close/read/write/lseek), mmap, signals, setjmp, time, errno. Programs just `#include "ositok.h"`.
-- **Section alignment fix**: TCC's default 0x200000 section alignment creates 4MB ELF span (text at 0x401000, data at 0x807000). `-Wl,-section-alignment,0x1000` compacts to 64KB span, avoiding conflicts with kernel heap at 0x800000.
-- **mprotect dedup**: Removed duplicate `mprotect` from tcclib.c (was stub returning 0). crt.o has the real syscall implementation.
-- **Build flow**: Upload crt.o + syscall.o + tcclib.o + ositok.h to OsitoFS disk. Then `cc -run myapp.c` compiles and runs in one step.
-- **Verified**: selfbuild.c — 7/7 tests pass: printf format strings, malloc+fibonacci, string reverse, snprintf+getpid, qsort, file I/O round-trip (create+write+read+verify+delete), argc/argv. All inside OsitoK QEMU.
-- **Files**: `arch/x86/kernel/shell.c` (cc command), `arch/x86/libc/ositok.h` (single header), `arch/x86/libc/tcclib.c` (mprotect fix), `arch/x86/test/selfbuild.c` (7-test program)
+### X-SELF: Self-Hosting C Compilation + Kernel Self-Build + kexec
+Programs compiled AND executed entirely inside OsitoK — no host toolchain needed at runtime. Full kernel self-compilation and boot.
+
+#### Phase 1: cc command + CRT
+- **cc command** (`shell.c`): Auto-detects CRT objects (crt.o, syscall.o, tcclib.o) on OsitoFS. Passes them to TCC along with `-Wl,-Ttext,0x401000` and `-Wl,-section-alignment,0x1000`.
+- **ositok.h** (`libc/ositok.h`): Single header providing all libc prototypes. Programs just `#include "ositok.h"`.
+- **Verified**: selfbuild.c — 7/7 tests pass (printf, malloc, string, file I/O, etc.).
+
+#### Phase 2: Kernel Self-Build (`build` command)
+- **`build` shell builtin** (`shell.c`): Compiles 62 .c kernel sources + links with 10 GCC-precompiled .o files → `kernel.elf` (733KB). TCC 0.9.28rc running inside OsitoK.
+- **GCC-precompiled .o files**: tensor.o, tensor_avx2.o (AVX2 intrinsics), compat32.o (lretq), msvcrt_shim.o (__builtin_ms_va_list), isr_stubs.o, syscall_entry.o, setjmp.o, kexec_tramp.o, int2e_stub.o, entry_alias.o (assembly — TCC assembler lacks iretq/lretq/sysret).
+- **Stack alignment fix** (`Makefile`): `KCFLAGS_PRECOMP` adds `-mincoming-stack-boundary=3` to GCC-precompiled .o files. TCC doesn't maintain 16-byte stack alignment (SysV ABI), so GCC code with `movaps` would #GP. This tells GCC to realign at function entry.
+- **prepare-selfbuild.sh**: Host script that creates NVMe image (OsitoFS v2) with all .c sources, .h headers, tcc.elf, and precompiled .o files.
+- **Build time**: ~20 seconds in QEMU (4 CPUs, 512MB).
+
+#### Phase 3: kexec (`kexec` command)
+- **`kexec <filename>` shell builtin** (`shell.c`): Loads ELF from OsitoFS, parses PT_LOAD segments, copies to temp area (0x8000000), preserves UEFI boot_info + mmap at safe addresses (0x10000000+), disables APIC/APs, jumps to trampoline.
+- **Trampoline** (`kexec_tramp.S`): Position-independent assembly. Copies segments from temp area to final addresses (0x2000000+), sets stack to 16MB, jumps to kernel entry with boot_info pointer in RDI.
+- **UEFI mmap preservation**: `saved_boot_info` + `saved_mmap[8192]` in main.c BSS, copied at kernel entry. kexec copies to 256MB (above trampoline temp area) to survive segment copy.
+- **Page table reservation** (`paging.c`): `reserve_old_page_tables()` walks active PML4→PDPT→PD tree and reserves all pages via `mem_reserve_range()` before building new tables. Prevents page allocator from handing out pages used by the active UEFI/kernel page tables (which are EFI_BOOT_SERVICES_DATA → marked "free"). Released after CR3 switch. **Without this: triple fault during paging_init** (memset of allocated page zeroes active PML4).
+
+#### Phase 4: Self-Built Kernel Boots from UEFI
+- **Verified**: Self-built kernel.elf extracted from OsitoFS, placed on ESP as `\EFI\BOOT\kernel.elf`, boots directly from UEFI without the GCC-compiled kernel.
+- **Full init sequence passes**: MEM (482MB), Paging (4-level, CR3 switch), IDT/GDT, SMP (4 CPUs), SYSCALL, Win32, Crypto (7/7), Tensor (7/8 — SiLU scalar precision diff), NVMe, OsitoFS → Shell prompt.
+- **Known**: Tensor SiLU test fails (TCC scalar fallback has different floating-point precision vs GCC vectorized code). Does not affect functionality.
+
+#### Files
+- `arch/x86/kernel/shell.c` — cc, build, kexec commands
+- `arch/x86/kernel/kexec_tramp.S` — kexec trampoline
+- `arch/x86/kernel/paging.c` — reserve_old_page_tables / free_old_page_tables
+- `arch/x86/kernel/main.c` — saved_boot_info + BSS zero
+- `arch/x86/scripts/prepare-selfbuild.sh` — NVMe image builder
+- `arch/x86/Makefile` — KCFLAGS_PRECOMP for TCC stack compat
+- `tools/ositofs/read.c` — Host tool to extract files from OsitoFS images
 
 ### X-QOS: QoS Priority Scheduler
 5-class priority scheduler with per-class quantum and priority preemption.

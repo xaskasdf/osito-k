@@ -77,6 +77,10 @@ extern void mem_reserve_kernel(uint64_t phys_base, uint64_t size);
 /* ACPI RSDP — set from boot_info, read by smp.c */
 uint64_t kernel_acpi_rsdp;
 
+/* Saved boot_info for kexec — preserved across kernel lifetime */
+boot_info_t saved_boot_info;
+static uint8_t saved_mmap[8192] __attribute__((aligned(16)));  /* copy of UEFI mmap */
+
 /* PCI */
 extern void pci_scan(void);
 extern gpu_device_t *pci_get_gpu(void);
@@ -298,6 +302,19 @@ void kernel_entry(boot_info_t *info)
         uint64_t *end = (uint64_t *)((uintptr_t)__bss_end & ~7ULL);
         while (p < end)
             *p++ = 0;
+    }
+
+    /* ── Save boot_info + UEFI mmap for kexec ── */
+    saved_boot_info = *info;
+    {
+        uint64_t mmap_copy_sz = info->mmap_size;
+        if (mmap_copy_sz > sizeof(saved_mmap))
+            mmap_copy_sz = sizeof(saved_mmap);
+        uint8_t *src = (uint8_t *)(uintptr_t)info->mmap_addr;
+        for (uint64_t i = 0; i < mmap_copy_sz; i++)
+            saved_mmap[i] = src[i];
+        saved_boot_info.mmap_addr = (uint64_t)(uintptr_t)saved_mmap;
+        saved_boot_info.mmap_size = mmap_copy_sz;
     }
 
     /* ── Step 0: Initialize serial + framebuffer (moved from boot) ── */

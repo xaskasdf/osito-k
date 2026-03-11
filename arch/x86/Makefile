@@ -36,8 +36,14 @@ KCFLAGS  = -std=c11 -ffreestanding -fno-stack-protector -mno-red-zone \
            -Wall -Wextra -O2 -fno-pie -Iinclude -I../../include/common \
            -D__KERNEL_X86__=1
 
+# Flags for precompiled .o files that may be called from TCC code.
+# TCC doesn't guarantee 16-byte stack alignment (SysV ABI requires it).
+# -mincoming-stack-boundary=3 tells GCC the stack may be 8-byte aligned,
+# so it inserts realignment in prologues before any movaps/movdqa.
+KCFLAGS_PRECOMP = $(KCFLAGS) -mincoming-stack-boundary=3
+
 # AVX2/FMA flags for tensor_avx2.c only
-AVXFLAGS = $(KCFLAGS) -mavx2 -mfma
+AVXFLAGS = $(KCFLAGS_PRECOMP) -mavx2 -mfma
 
 # EFI link flags (for boot.efi only)
 BLDFLAGS = -nostdlib -shared -Bsymbolic \
@@ -66,7 +72,7 @@ KERN_SRC = kernel/main.c kernel/serial.c kernel/framebuffer.c \
            kernel/zlib.c kernel/git.c \
            kernel/shm.c kernel/compositor.c kernel/display.c \
            kernel/input_events.c kernel/memcompress.c
-ASM_SRC  = kernel/isr_stubs.S kernel/syscall_entry.S kernel/setjmp.S
+ASM_SRC  = kernel/isr_stubs.S kernel/syscall_entry.S kernel/setjmp.S kernel/kexec_tramp.S
 DRV_SRC  = drivers/nvme.c drivers/i211.c drivers/gpu.c drivers/gsp.c \
            drivers/sass.c drivers/gmmu.c drivers/gpu_tensor.c drivers/gpu_inference.c
 FS_SRC   = fs/ositofs2.c fs/gpt.c fs/gguf.c
@@ -128,7 +134,11 @@ $(BUILD)/kernel.elf: $(ALL_KERN_OBJ) kernel.ld
 $(BUILD)/kernel/%.o: kernel/%.c | $(BUILD)/kernel
 	$(CC) $(KCFLAGS) -c -o $@ $<
 
-# tensor_avx2.c needs AVX2/FMA flags
+# GCC-only precompiled files: use KCFLAGS_PRECOMP (TCC stack compat)
+$(BUILD)/kernel/tensor.o: kernel/tensor.c | $(BUILD)/kernel
+	$(CC) $(KCFLAGS_PRECOMP) -c -o $@ $<
+
+# tensor_avx2.c needs AVX2/FMA flags (AVXFLAGS already uses KCFLAGS_PRECOMP)
 $(BUILD)/kernel/tensor_avx2.o: kernel/tensor_avx2.c | $(BUILD)/kernel
 	$(CC) $(AVXFLAGS) -c -o $@ $<
 
@@ -147,6 +157,13 @@ $(BUILD)/fs/%.o: fs/%.c | $(BUILD)/fs
 # Win32 compatibility layer
 $(BUILD)/win32/%.o: win32/%.c | $(BUILD)/win32
 	$(CC) $(KCFLAGS) -Iwin32 -c -o $@ $<
+
+# GCC-only Win32 precompiled files: use KCFLAGS_PRECOMP (TCC stack compat)
+$(BUILD)/win32/compat32.o: win32/compat32.c | $(BUILD)/win32
+	$(CC) $(KCFLAGS_PRECOMP) -Iwin32 -c -o $@ $<
+
+$(BUILD)/win32/msvcrt_shim.o: win32/msvcrt_shim.c | $(BUILD)/win32
+	$(CC) $(KCFLAGS_PRECOMP) -Iwin32 -c -o $@ $<
 
 # Win32 assembly
 $(BUILD)/win32/%.o: win32/%.S | $(BUILD)/win32
@@ -213,18 +230,18 @@ $(TCCDIR)/fs/%.o: fs/%.c | $(TCCDIR)/fs
 $(TCCDIR)/win32/%.o: win32/%.c | $(TCCDIR)/win32
 	$(TCC) $(TCCFLAGS) -Iwin32 -o $@ $<
 
-# GCC rules for files TCC can't handle
+# GCC rules for files TCC can't handle (KCFLAGS_PRECOMP for TCC stack compat)
 $(TCCDIR)/kernel/tensor.o: kernel/tensor.c | $(TCCDIR)/kernel
-	$(CC) $(KCFLAGS) -c -o $@ $<
+	$(CC) $(KCFLAGS_PRECOMP) -c -o $@ $<
 
 $(TCCDIR)/kernel/tensor_avx2.o: kernel/tensor_avx2.c | $(TCCDIR)/kernel
 	$(CC) $(AVXFLAGS) -c -o $@ $<
 
 $(TCCDIR)/win32/compat32.o: win32/compat32.c | $(TCCDIR)/win32
-	$(CC) $(KCFLAGS) -Iwin32 -c -o $@ $<
+	$(CC) $(KCFLAGS_PRECOMP) -Iwin32 -c -o $@ $<
 
 $(TCCDIR)/win32/msvcrt_shim.o: win32/msvcrt_shim.c | $(TCCDIR)/win32
-	$(CC) $(KCFLAGS) -Iwin32 -c -o $@ $<
+	$(CC) $(KCFLAGS_PRECOMP) -Iwin32 -c -o $@ $<
 
 # Assembly always uses GCC (TCC assembler missing iretq/lretq)
 $(TCCDIR)/kernel/%.o: kernel/%.S | $(TCCDIR)/kernel

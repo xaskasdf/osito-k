@@ -8,6 +8,7 @@
  */
 
 #include "../include/types.h"
+#include "../include/boot_info.h"
 
 /* ── External functions ──────────────────────────────────────── */
 
@@ -243,6 +244,7 @@ static void cmd_help(void)
     sh_puts("  httpd     HTTP server (httpd [port] / httpd stop)\n");
     sh_puts("  winexec   Run a Win32 PE executable (winexec file.exe)\n");
     sh_puts("  clear     Clear screen\n");
+    sh_puts("  kexec     Load + boot kernel from disk (kexec [file])\n");
     sh_puts("  reboot    Reboot system\n");
     sh_puts("  halt      Halt CPU\n");
     sh_puts_color("I/O Redirection:\n", 0x00FF8800);
@@ -557,7 +559,7 @@ static const char *build_tcc_sources[] = {
 /* GCC pre-compiled .o files (AVX2, assembly, compat32) */
 static const char *build_gcc_objects[] = {
     "tensor.o", "tensor_avx2.o",
-    "isr_stubs.o", "syscall_entry.o", "setjmp.o",
+    "isr_stubs.o", "syscall_entry.o", "setjmp.o", "kexec_tramp.o",
     "compat32.o", "msvcrt_shim.o", "int2e_stub.o",
     "entry_alias.o",
     NULL
@@ -1293,6 +1295,230 @@ static void cmd_chat(int argc, char *argv[])
     }
 }
 
+/* ── Builtin: kexec ──────────────────────────────────────────── */
+
+/* Trampoline symbol + size (from kexec_tramp.S) */
+extern void kexec_trampoline(void);
+extern void kexec_trampoline_end(void);
+
+/* Saved boot_info from main.c */
+extern boot_info_t saved_boot_info;
+
+/* ELF64 header (matching elf.c definitions) */
+typedef struct {
+    uint8_t  e_ident[16];
+    uint16_t e_type;
+    uint16_t e_machine;
+    uint32_t e_version;
+    uint64_t e_entry;
+    uint64_t e_phoff;
+    uint64_t e_shoff;
+    uint32_t e_flags;
+    uint16_t e_ehsize;
+    uint16_t e_phentsize;
+    uint16_t e_phnum;
+    uint16_t e_shentsize;
+    uint16_t e_shnum;
+    uint16_t e_shstrndx;
+} kexec_elf64_hdr_t;
+
+typedef struct {
+    uint32_t p_type;
+    uint32_t p_flags;
+    uint64_t p_offset;
+    uint64_t p_vaddr;
+    uint64_t p_paddr;
+    uint64_t p_filesz;
+    uint64_t p_memsz;
+    uint64_t p_align;
+} kexec_elf64_phdr_t;
+
+/* Segment copy descriptor for trampoline */
+typedef struct {
+    uint64_t src;
+    uint64_t dst;
+    uint64_t len;
+} kexec_seg_t;
+
+/* APIC registers for shutdown */
+#define KEXEC_APIC_BASE    0xFEE00000
+#define KEXEC_APIC_SVR     0xF0
+#define KEXEC_APIC_ICR_LO  0x300
+#define KEXEC_APIC_ICR_HI  0x310
+#define KEXEC_APIC_LVT_TMR 0x320
+
+static void cmd_kexec(const char *arg)
+{
+    const char *filename = (arg && *arg) ? arg : "kernel.elf";
+
+    sh_puts("kexec: loading ");
+    sh_puts(filename);
+    sh_puts(" from OsitoFS...\n");
+
+    /* Step 1: Read ELF from disk */
+    void *file = osfs2_find(filename);
+    if (!file) {
+        sh_puts_color("  File not found\n", 0x00FF0000);
+        return;
+    }
+
+    uint64_t file_size = osfs2_file_size(file);
+    if (file_size < 64 || file_size > 8 * 1024 * 1024) {
+        sh_puts_color("  Invalid file size\n", 0x00FF0000);
+        return;
+    }
+
+    uint8_t *elf_data = (uint8_t *)kmalloc(file_size);
+    if (!elf_data) {
+        sh_puts_color("  Out of memory\n", 0x00FF0000);
+        return;
+    }
+
+    if (osfs2_read(file, 0, elf_data, file_size) < 0) {
+        sh_puts_color("  Read failed\n", 0x00FF0000);
+        kfree(elf_data);
+        return;
+    }
+
+    /* Step 2: Validate ELF header */
+    kexec_elf64_hdr_t *ehdr = (kexec_elf64_hdr_t *)elf_data;
+    if (ehdr->e_ident[0] != 0x7F || ehdr->e_ident[1] != 'E' ||
+        ehdr->e_ident[2] != 'L'  || ehdr->e_ident[3] != 'F') {
+        sh_puts_color("  Not an ELF file\n", 0x00FF0000);
+        kfree(elf_data);
+        return;
+    }
+
+    sh_puts("  Entry: 0x");
+    serial_puthex(ehdr->e_entry, 8);
+    sh_puts(", ");
+    sh_putdec(ehdr->e_phnum);
+    sh_puts(" program headers\n");
+
+    /* Step 3: Parse PT_LOAD segments, copy to temp area at 0x8000000 (128MB) */
+    #define KEXEC_TEMP_BASE  0x8000000ULL
+    #define KEXEC_MAX_SEGS   8
+
+    kexec_seg_t segs[KEXEC_MAX_SEGS];
+    int nseg = 0;
+    uint64_t temp_off = 0;
+    uint64_t kernel_lo = ~0ULL, kernel_hi = 0;
+
+    for (int i = 0; i < ehdr->e_phnum && nseg < KEXEC_MAX_SEGS; i++) {
+        uint64_t phoff = ehdr->e_phoff + i * ehdr->e_phentsize;
+        if (phoff + sizeof(kexec_elf64_phdr_t) > file_size) break;
+
+        kexec_elf64_phdr_t *ph = (kexec_elf64_phdr_t *)(elf_data + phoff);
+        if (ph->p_type != 1 /* PT_LOAD */ || ph->p_memsz == 0) continue;
+
+        /* Copy file data to temp area */
+        uint64_t temp_addr = KEXEC_TEMP_BASE + temp_off;
+        uint8_t *dst = (uint8_t *)temp_addr;
+
+        /* Zero the full memsz range (covers BSS) */
+        for (uint64_t j = 0; j < ph->p_memsz; j++)
+            dst[j] = 0;
+
+        /* Copy filesz from ELF data */
+        if (ph->p_filesz > 0 && ph->p_offset + ph->p_filesz <= file_size) {
+            uint8_t *src = elf_data + ph->p_offset;
+            for (uint64_t j = 0; j < ph->p_filesz; j++)
+                dst[j] = src[j];
+        }
+
+        /* Record segment for trampoline */
+        segs[nseg].src = temp_addr;
+        segs[nseg].dst = ph->p_paddr;
+        segs[nseg].len = ph->p_memsz;  /* copy full memsz (includes zeroed BSS) */
+        nseg++;
+
+        sh_puts("  LOAD: 0x");
+        serial_puthex(ph->p_paddr, 8);
+        sh_puts(" (");
+        sh_putdec(ph->p_filesz);
+        sh_puts("/");
+        sh_putdec(ph->p_memsz);
+        sh_puts(" bytes)\n");
+
+        /* Track kernel extent */
+        if (ph->p_paddr < kernel_lo) kernel_lo = ph->p_paddr;
+        if (ph->p_paddr + ph->p_memsz > kernel_hi)
+            kernel_hi = ph->p_paddr + ph->p_memsz;
+
+        temp_off += (ph->p_memsz + 4095) & ~4095ULL;  /* page-align */
+    }
+
+    if (nseg == 0) {
+        sh_puts_color("  No LOAD segments found\n", 0x00FF0000);
+        kfree(elf_data);
+        return;
+    }
+
+    /* Step 4: Prepare boot_info_t + mmap copy at safe location */
+    /* Must be above temp range: temp starts at 0x8000000 (128MB), BSS expands ~23MB
+     * so temp ends around 0x9700000 (151MB). Place safe data at 256MB. */
+    #define KEXEC_INFO_ADDR  0x10010000ULL  /* 256MB + 64KB */
+    #define KEXEC_MMAP_ADDR  0x10000000ULL  /* 256MB (room for 64KB mmap) */
+
+    boot_info_t *new_info = (boot_info_t *)KEXEC_INFO_ADDR;
+    *new_info = saved_boot_info;
+    new_info->kernel_phys_base = kernel_lo;
+    new_info->kernel_size = kernel_hi - kernel_lo;
+
+    /* Copy UEFI memory map to safe location (it lives in kernel BSS which gets overwritten) */
+    {
+        uint8_t *mmap_src = (uint8_t *)(uintptr_t)saved_boot_info.mmap_addr;
+        uint8_t *mmap_dst = (uint8_t *)KEXEC_MMAP_ADDR;
+        uint64_t mmap_sz = saved_boot_info.mmap_size;
+        if (mmap_sz > 0x20000) mmap_sz = 0x20000;  /* cap at 128KB */
+        for (uint64_t i = 0; i < mmap_sz; i++)
+            mmap_dst[i] = mmap_src[i];
+        new_info->mmap_addr = KEXEC_MMAP_ADDR;
+        new_info->mmap_size = mmap_sz;
+    }
+
+    /* Step 5: Copy trampoline to safe location (above temp+safe data) */
+    #define KEXEC_TRAMP_ADDR 0x10020000ULL  /* 256MB + 128KB */
+    uint64_t tramp_size = (uint64_t)kexec_trampoline_end - (uint64_t)kexec_trampoline;
+    uint8_t *tramp_dst = (uint8_t *)KEXEC_TRAMP_ADDR;
+    uint8_t *tramp_src = (uint8_t *)(uint64_t)kexec_trampoline;
+    for (uint64_t i = 0; i < tramp_size; i++)
+        tramp_dst[i] = tramp_src[i];
+
+    /* Copy segment table next to trampoline */
+    kexec_seg_t *seg_copy = (kexec_seg_t *)(KEXEC_TRAMP_ADDR + 4096);
+    for (int i = 0; i < nseg; i++)
+        seg_copy[i] = segs[i];
+
+
+    sh_puts_color("\n  Jumping to new kernel...\n\n", 0x0000FF00);
+
+    /* Step 6: Shut down subsystems */
+
+    /* Disable APIC timer (prevent timer interrupts during copy) */
+    volatile uint32_t *apic = (volatile uint32_t *)KEXEC_APIC_BASE;
+    apic[KEXEC_APIC_LVT_TMR / 4] = (1 << 16);  /* mask timer LVT */
+
+    /* Send INIT IPI to all APs (puts them back to wait-for-SIPI state) */
+    apic[KEXEC_APIC_ICR_HI / 4] = 0;
+    apic[KEXEC_APIC_ICR_LO / 4] = 0x000C4500;  /* INIT, all-excluding-self */
+    /* Brief spin wait for INIT to take effect */
+    for (volatile int d = 0; d < 1000000; d++) {}
+
+    /* Disable interrupts */
+    __asm__ volatile ("cli");
+
+    /* Step 7: Jump to trampoline */
+    typedef void (*tramp_fn)(void *info, uint64_t entry,
+                             kexec_seg_t *segs, uint64_t nseg);
+    tramp_fn tramp = (tramp_fn)KEXEC_TRAMP_ADDR;
+
+    tramp(new_info, ehdr->e_entry, seg_copy, nseg);
+
+    /* Should never reach here */
+    for (;;) __asm__ volatile ("hlt");
+}
+
 /* ── Builtin: reboot ─────────────────────────────────────────── */
 
 static void cmd_reboot(void)
@@ -1935,6 +2161,8 @@ static void shell_exec(char *line)
         }
     } else if (strcmp(cmd, "clear") == 0) {
         cmd_clear();
+    } else if (strcmp(cmd, "kexec") == 0) {
+        cmd_kexec(argc > 1 ? argv[1] : NULL);
     } else if (strcmp(cmd, "reboot") == 0) {
         cmd_reboot();
     } else if (strcmp(cmd, "halt") == 0) {

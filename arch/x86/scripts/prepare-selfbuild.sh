@@ -178,6 +178,7 @@ write_file "$BUILD_DIR/win32/msvcrt_shim.o"
 write_file "$BUILD_DIR/kernel/isr_stubs.o"
 write_file "$BUILD_DIR/kernel/syscall_entry.o"
 write_file "$BUILD_DIR/kernel/setjmp.o"
+write_file "$BUILD_DIR/kernel/kexec_tramp.o"
 write_file "$BUILD_DIR/win32/int2e_stub.o"
 
 # TCC linker entry alias

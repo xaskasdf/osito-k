@@ -109,7 +109,8 @@ kernel/            main.c, serial.c, framebuffer.c, pci.c, memory.c, heap.c
                    smp.c, ap_trampoline.S — Multi-core SMP
                    dynlink.c — Dynamic linker (dl_open/sym/close)
                    git.c, zlib.c — Git VCS (SHA-1, DEFLATE)
-                   shell.c — 18+ builtins
+                   shell.c — 19+ builtins (incl. build, kexec)
+                   kexec_tramp.S — kexec trampoline (segment copy + jump)
                    shm.c, compositor.c, display.c, input_events.c, memcompress.c
 drivers/           nvme.c — NVMe read/write
                    gpu.c, gsp.c — NVIDIA GPU + GSP Falcon (Phases 1-10)
@@ -199,17 +200,18 @@ arch/arm/          SM8350 (ROG Phone 5) bare-metal port — see docs/aarch64-det
 | X-THREAD| clone(CLONE_THREAD) + futex | Done |
 | X-EDIT  | Kilo text editor (ANSI CSI, termios) | Done |
 | X-HTTPD | HTTP file server (TCP listen/accept) | Done |
-| X-SELF  | Self-hosting: TCC builds kernel.elf in-OS (727KB, boots in QEMU) | Done |
+| X-SELF  | Self-hosting: TCC builds kernel.elf in-OS + kexec boots it | Done |
 | X-QOS   | QoS priority scheduler (5 classes) | Done |
 | X-CCP   | AMD CCP TRNG driver | Done |
 | X-AHCI  | SATA AHCI driver | WIP |
-| X-XHCI  | xHCI USB 3.x driver | WIP |
+| X-XHCI  | xHCI USB 3.x driver (AMD 400/Matisse) | Next |
 | X-RETINA| Display pipeline (compositor, shared memory) | WIP |
 | X-WIN32 | Windows PE32 compat layer (15 DLL shims) | WIP |
 | **Phase 0** | **Kernel/bootloader separation** (boot.efi + kernel.elf) | **Done** |
-| Phase 1 | TCC cross-compiles kernel from host | Next |
-| Phase 2 | TCC compiles kernel inside OsitoK | Planned |
-| Phase 3 | Install + reboot self-compiled kernel | Planned |
+| **Phase 1** | **TCC cross-compiles kernel from host** | **Done** |
+| **Phase 2** | **TCC compiles kernel inside OsitoK** (62 .c → 733KB ELF) | **Done** |
+| **Phase 3** | **kexec: load + boot self-compiled kernel** | **Done** |
+| **Phase 4** | **Self-built kernel boots directly from UEFI** (verified in QEMU) | **Done** |
 
 > Full GPU roadmap (X27-X40 + contingency): see [docs/x86-gpu-roadmap.md](docs/x86-gpu-roadmap.md)
 > Full OS roadmap (Tiers 0-9): see [docs/os-selfhost-roadmap.md](docs/os-selfhost-roadmap.md)
@@ -217,7 +219,21 @@ arch/arm/          SM8350 (ROG Phone 5) bare-metal port — see docs/aarch64-det
 > Paths to Claude analysis: see [docs/paths-to-claude-on-ositok.md](docs/paths-to-claude-on-ositok.md)
 > Kernel/bootloader separation + self-compiling road: see [docs/kernel-separation.md](docs/kernel-separation.md)
 
-**Next**: Phase 1 — TCC cross-compiles kernel.elf from Linux host (verify TCC can produce working kernel).
+**Tier 8: Hardware Boot** — Boot OsitoK on real hardware (AMD Ryzen 7 5800X + RTX 3090).
+
+### Hardware Boot Plan (target: WD SN740 512GB NVMe)
+
+| Step | Task | Description | Deps |
+|------|------|-------------|------|
+| **H1** | **xHCI USB driver** | AMD 400/Matisse xHCI (`1022:43d5`, `1022:149c`). Enumerate ports, configure endpoints, USB HID for keyboard+mouse | None |
+| **H2** | **USB HID input** | Parse HID reports, scancode→ASCII, integrate with terminal line editor | H1 |
+| **H3** | **NVMe SN740 bring-up** | Test OsitoK NVMe driver with SN740 (`15b7:5016`, DRAM-less). May need CMB/SQ-in-CMB support | None |
+| **H4** | **Flash to NVMe** | Create GPT on nvme1n1: ESP partition (boot.efi + kernel.elf) + OsitoFS partition | H3 |
+| **H5** | **UEFI GOP display** | Verify framebuffer works on RTX 3090 GOP output (already obtained by boot.efi) | None |
+| **H6** | **Real hardware boot** | Boot from nvme1n1 via BIOS boot menu. Serial header for debug if needed | H1-H5 |
+| **H7** | **Nouveau modesetting** | Native display init for RTX 3090 (GA102). Resolution control, cursor | H6 |
+
+**Critical path**: H1 → H2 → H6 (xHCI is the blocker — no keyboard = no interaction)
 
 ## Detailed Feature Documentation
 

@@ -150,11 +150,45 @@ abstracciones necesarias para correr software real sin modificar.
 | **X-THREAD** | **Threads (clone/futex)** | clone(CLONE_VM\|CLONE_THREAD), futex(WAIT/WAKE), set_tid_address, gettid. Per-thread stacks, TLS via arch_prctl ARCH_SET_FS. Usar SMP cores para threads reales. | ~1000 | X-SCHED, X-MMAP |
 | **X-EDIT** | **Port editor mínimo** | Portar un editor de texto (kilo ~1000LOC, o nano subset). Editar archivos desde OsitoK sin host. Necesita raw mode TTY + VT100 ANSI. | ~600 glue | X-MUSL |
 | **X-HTTPD** | **TCP server (listen/accept)** | Completar TCP stack: listen(), accept(), server sockets. Implementar HTTP server mínimo. Exponer servicios desde OsitoK a la red. | ~600 | Ninguna |
-| **X-SELF** | **Self-hosting completo** | Compilar el propio kernel x86 desde OsitoK. Phase 2: TCC compila 62 .c + links 71 .o → kernel.elf (727KB). Phase 2.5: Extracted kernel boots in QEMU — all subsystems OK. Phase 3: install + reboot. | ~2000 | X-MUSL, X-EDIT | Phase 2.5 ✅ |
+| **X-SELF** | **Self-hosting completo** | Compilar el propio kernel x86 desde OsitoK + kexec boot. **DONE**: Phase 1 (TCC cross-compile) → Phase 2 (build in-OS: 62 .c → 733KB ELF) → Phase 3 (kexec: load+boot self-built kernel) → Phase 4 (self-built kernel boots directly from UEFI). | ~2000 | X-MUSL, X-EDIT | **Done** ✅ |
 
 **Hito** ✅: `busybox sh` (musl-static, ~1MB) corre dentro de OsitoK. Applets cat/echo/uname funcionan.
 
-### Tier 8: GPU + Inference Optimization
+**Hito** ✅: **Kernel self-compile + kexec + standalone boot**. OsitoK compila su propio kernel (TCC 0.9.28rc, 62 fuentes, 733KB ELF), lo bootea via kexec, y el kernel auto-compilado bootea directamente desde UEFI. El sistema es auto-replicable.
+
+### Tier 8: Hardware Boot — AMD Ryzen 7 5800X + RTX 3090
+
+Target: Boot OsitoK on real hardware from WD SN740 512GB NVMe.
+
+**Hardware inventory:**
+| Device | Model | PCI ID | OsitoK status |
+|--------|-------|--------|---------------|
+| CPU | AMD Ryzen 7 5800X (8C/16T) | — | SMP OK |
+| RAM | 48 GB DDR4 | — | Page alloc OK |
+| GPU | NVIDIA RTX 3090 (GA102) | `10de:2204` | GSP/SASS driver exists |
+| NVMe target | WD SN740 512GB | `15b7:5016` | NVMe driver exists (needs HW test) |
+| NIC | Intel I211 | `8086:1539` | I211 driver exists |
+| USB | AMD 400 xHCI + Matisse xHCI | `1022:43d5`, `1022:149c` | **X-XHCI needed** |
+| SATA | AMD RAID | `1022:43bd` | X-AHCI WIP |
+| Keyboard | SINO WEALTH Gaming KB (USB HID) | `258a:002a` | Needs xHCI |
+| Mouse | HyperX Pulsefire Core (USB HID) | `0951:16de` | Needs xHCI |
+| Serial | COM1 header on motherboard | — | Available for debug |
+
+**Step-by-step boot plan:**
+
+| Step | Task | Description | Deps |
+|------|------|-------------|------|
+| **H1** | xHCI USB driver | AMD 400/Matisse xHCI init, port enum, endpoint config. USB HID for keyboard+mouse | None |
+| **H2** | USB HID input | Parse HID reports, scancode→ASCII, integrate with terminal editor | H1 |
+| **H3** | NVMe SN740 bring-up | Test NVMe driver with SN740 (DRAM-less). May need CMB support | None |
+| **H4** | Flash to NVMe | Create GPT on nvme1n1: ESP (boot.efi+kernel.elf) + OsitoFS partition | H3 |
+| **H5** | UEFI GOP display | Verify framebuffer on RTX 3090 GOP output (already obtained by boot.efi) | None |
+| **H6** | Real hardware boot | Boot from nvme1n1 via BIOS boot menu. COM1 serial for debug | H1-H5 |
+| **H7** | Nouveau modesetting | Native display init for GA102. Resolution control, cursor | H6 |
+
+**Critical path**: H1 → H2 → H6 (xHCI blocker: no keyboard = no interaction on real HW)
+
+### Tier 9: GPU + Inference Optimization
 
 Cerrar el gap entre "funciona" y "es rápido". Validar en hardware real.
 

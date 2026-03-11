@@ -22,6 +22,7 @@ extern void fb_puthex(uint64_t val, int digits);
 
 extern void *mem_alloc_aligned(uint64_t size, uint64_t alignment);
 extern void  mem_free_pages(void *addr, uint64_t count);
+extern int   mem_reserve_range(uint64_t phys, uint64_t count);
 extern uint64_t mem_get_total(void);
 
 /* ── Page table constants ────────────────────────────────────── */
@@ -253,6 +254,70 @@ void paging_switch(uint64_t cr3)
     write_cr3(cr3);
 }
 
+/* ── Reserve active UEFI page table pages ─────────────────────
+ *
+ * After kexec (or even on first boot), the page allocator marks
+ * EFI_BOOT_SERVICES_DATA as free — but the active page tables
+ * (pointed to by CR3) live in that memory.  If pt_alloc_page()
+ * hands out one of those pages and memsets it to zero, the active
+ * address translation is destroyed → triple fault.
+ *
+ * Walk PML4 → PDPT → PD and reserve every page used by the
+ * current page table tree.  After CR3 switch we free them.
+ */
+
+#define OLD_PT_MAX 32
+static uint64_t old_pt_pages[OLD_PT_MAX];
+static uint32_t old_pt_count;
+
+static void reserve_old_page_tables(uint64_t cr3_phys)
+{
+    old_pt_count = 0;
+
+    uint64_t pml4_page = cr3_phys & ~(PAGE_SIZE - 1);
+    mem_reserve_range(pml4_page, 1);
+    if (old_pt_count < OLD_PT_MAX)
+        old_pt_pages[old_pt_count++] = pml4_page;
+
+    uint64_t *pml4 = (uint64_t *)pml4_page;
+    for (int i = 0; i < ENTRIES_PER_TABLE; i++) {
+        if (!(pml4[i] & PTE_PRESENT)) continue;
+
+        uint64_t pdpt_page = pml4[i] & PTE_ADDR_MASK;
+        mem_reserve_range(pdpt_page, 1);
+        if (old_pt_count < OLD_PT_MAX)
+            old_pt_pages[old_pt_count++] = pdpt_page;
+
+        uint64_t *pdpt = (uint64_t *)pdpt_page;
+        for (int j = 0; j < ENTRIES_PER_TABLE; j++) {
+            if (!(pdpt[j] & PTE_PRESENT)) continue;
+            if (pdpt[j] & PTE_LARGE) continue;  /* 1GB page, no PD */
+
+            uint64_t pd_page = pdpt[j] & PTE_ADDR_MASK;
+            mem_reserve_range(pd_page, 1);
+            if (old_pt_count < OLD_PT_MAX)
+                old_pt_pages[old_pt_count++] = pd_page;
+
+            /* Don't descend into PT level — 2MB large pages don't
+             * have PT entries, and 4KB PTs are unlikely in UEFI. */
+        }
+    }
+
+    serial_puts("[PAGE] Reserved ");
+    serial_putdec(old_pt_count);
+    serial_puts(" old page-table pages\n");
+}
+
+static void free_old_page_tables(void)
+{
+    for (uint32_t i = 0; i < old_pt_count; i++)
+        mem_free_pages((void *)old_pt_pages[i], 1);
+    serial_puts("[PAGE] Freed ");
+    serial_putdec(old_pt_count);
+    serial_puts(" old page-table pages\n");
+    old_pt_count = 0;
+}
+
 /* ── Initialize paging ───────────────────────────────────────── */
 
 void paging_init(void)
@@ -263,6 +328,10 @@ void paging_init(void)
     serial_puts("[PAGE] Current CR3: 0x");
     serial_puthex(old_cr3, 16);
     serial_puts("\n");
+
+    /* Reserve active UEFI/old page table pages so the allocator
+     * doesn't hand them out while we're still using them. */
+    reserve_old_page_tables(old_cr3);
 
     pt_pages_used = 0;
 
@@ -320,8 +389,9 @@ void paging_init(void)
     write_cr3(kernel_cr3);
     __asm__ volatile ("sti");
 
-    /* If we get here, paging is working */
+    /* If we get here, paging is working — release old UEFI tables */
     serial_puts("[PAGE] CR3 switch successful — kernel paging active\n");
+    free_old_page_tables();
 
     fb_puts(" Paging: 4-level, ");
     fb_putdec(pt_pages_used * 4);
