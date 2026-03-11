@@ -232,12 +232,14 @@ void osfs2_list(void)
 
     serial_puts("[OsitoFS] File listing:\n");
 
+    uint32_t file_count = 0;
     for (uint32_t i = 0; i < OSFS2_MAX_FILES; i++) {
         if (!(file_table[i].flags & OSFS2_FLAG_VALID)) continue;
 
         osfs2_file_t *f = &file_table[i];
+        file_count++;
 
-        /* Serial output */
+        /* Serial output only (per-file listing slows framebuffer on real HW) */
         serial_puts("  ");
         serial_puts(f->name);
         serial_puts("  size=");
@@ -249,46 +251,18 @@ void osfs2_list(void)
             serial_putdec(f->num_layers);
         }
         serial_puts("\n");
-
-        /* Framebuffer output */
-        fb_puts("  ");
-        fb_puts_color(f->name, 0x0000FF00); /* Green */
-
-        /* Size */
-        fb_puts("  ");
-        if (f->size >= (uint64_t)1024 * 1024 * 1024) {
-            fb_putdec(f->size / (1024 * 1024 * 1024));
-            fb_puts(".");
-            fb_putdec((f->size % (1024 * 1024 * 1024)) / (1024 * 1024 * 100));
-            fb_puts(" GB");
-        } else if (f->size >= 1024 * 1024) {
-            fb_putdec(f->size / (1024 * 1024));
-            fb_puts(" MB");
-        } else {
-            fb_putdec(f->size);
-            fb_puts(" B");
-        }
-
-        if (f->flags & OSFS2_FLAG_GGUF) {
-            fb_puts("  [");
-            fb_puts(f->model_name);
-            fb_puts(" ");
-            fb_putdec(f->num_layers);
-            fb_puts("L]");
-        }
-        fb_puts("\n");
     }
 
-    /* Summary — show actual used blocks (not high-water mark) */
+    /* Framebuffer: summary only */
     uint32_t data_blocks = superblock.total_blocks - OSFS2_DATA_START_BLK;
     uint32_t used_data = superblock.used_blocks - OSFS2_DATA_START_BLK;
     fb_puts("  ");
+    fb_putdec(file_count);
+    fb_puts(" files, ");
     fb_putdec(used_data);
     fb_puts("/");
     fb_putdec(data_blocks);
-    fb_puts(" MB used, ");
-    fb_putdec(data_blocks - used_data);
-    fb_puts(" MB free\n");
+    fb_puts(" MB used\n");
 }
 
 /* ── Find file by name ───────────────────────────────────────── */

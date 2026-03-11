@@ -242,6 +242,32 @@ int paging_map_mmio(uint64_t phys, uint64_t size)
     return 0;
 }
 
+/* Map a region as Write-Combining (for framebuffers).
+ * Requires PAT entry 1 = WC (call paging_setup_pat first). */
+int paging_map_wc(uint64_t phys, uint64_t size)
+{
+    if (!kernel_pml4) return -1;
+    /* PWT=1, PCD=0, PAT=0 → selects PAT entry 1 = WC */
+    paging_identity_map_range(phys, phys + size, PTE_PWT);
+    return 0;
+}
+
+/* Program PAT MSR: change entry 1 from WT to WC.
+ * This enables Write-Combining via PWT=1,PCD=0 page flags. */
+void paging_setup_pat(void)
+{
+    uint32_t lo, hi;
+    /* Read current PAT MSR (0x277) */
+    __asm__ volatile ("rdmsr" : "=a"(lo), "=d"(hi) : "c"(0x277));
+    serial_puts("[PAGE] PAT MSR: 0x");
+    serial_puthex(((uint64_t)hi << 32) | lo, 16);
+    serial_puts("\n");
+    /* Change PAT1 (bits 15:8) from WT (0x04) to WC (0x01) */
+    lo = (lo & ~0xFF00U) | 0x0100U;
+    __asm__ volatile ("wrmsr" : : "c"(0x277), "a"(lo), "d"(hi));
+    serial_puts("[PAGE] PAT1 set to WC\n");
+}
+
 /* Get the kernel PML4 physical address (for new processes to clone) */
 uint64_t paging_get_kernel_cr3(void)
 {

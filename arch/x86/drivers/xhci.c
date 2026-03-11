@@ -17,6 +17,8 @@ extern void serial_puts(const char *s);
 extern void serial_puthex(uint64_t val, int digits);
 extern void serial_putdec(uint64_t val);
 extern void fb_puts(const char *s);
+extern void fb_putdec(uint64_t val);
+extern void fb_puthex(uint64_t val, int digits);
 
 extern void *mem_alloc_aligned(uint64_t size, uint64_t alignment);
 extern void  mem_free_pages(void *addr, uint64_t count);
@@ -217,6 +219,42 @@ static void usb_kbd_handle_report(xhci_device_t *dev, uint8_t *r, uint32_t len)
     dev->prev_mods = mods;
 }
 
+/* ── Disable PCI MSI/MSI-X (prevent unhandled interrupts) ──── */
+
+/* Walk PCI capability list and disable MSI + MSI-X.  BIOS may have
+ * enabled them; without an IDT handler for the MSI vector, any
+ * interrupt fires into an unexpected entry → triple fault. */
+static void pci_disable_msi(uint8_t bus, uint8_t dev, uint8_t func)
+{
+    extern uint32_t pci_cfg_read32(uint8_t, uint8_t, uint8_t, uint16_t);
+    extern void     pci_cfg_write32(uint8_t, uint8_t, uint8_t, uint16_t, uint32_t);
+
+    uint32_t status = pci_cfg_read32(bus, dev, func, 0x06);
+    if (!(status & (1 << 20))) return; /* No capabilities list (bit 4 of status at byte 0x06) */
+
+    uint8_t cap_ptr = (uint8_t)(pci_cfg_read32(bus, dev, func, 0x34) & 0xFF);
+
+    for (int i = 0; i < 48 && cap_ptr >= 0x40; i++) {
+        uint32_t cap = pci_cfg_read32(bus, dev, func, cap_ptr);
+        uint8_t id = cap & 0xFF;
+        uint8_t next = (cap >> 8) & 0xFF;
+
+        if (id == 0x05) {
+            /* MSI: clear MSI Enable (bit 16 = bit 0 of Message Control at cap+2) */
+            cap &= ~(1 << 16);
+            pci_cfg_write32(bus, dev, func, cap_ptr, cap);
+            serial_puts("[xHCI] MSI disabled\n");
+        } else if (id == 0x11) {
+            /* MSI-X: clear MSI-X Enable (bit 31 of dword at cap+0) */
+            cap &= ~(1U << 31);
+            pci_cfg_write32(bus, dev, func, cap_ptr, cap);
+            serial_puts("[xHCI] MSI-X disabled\n");
+        }
+
+        cap_ptr = next;
+    }
+}
+
 /* ── BIOS Handoff ────────────────────────────────────────────── */
 
 static void xhci_bios_handoff(xhci_hc_t *hc)
@@ -328,10 +366,45 @@ static int cmd_wait(xhci_hc_t *hc, uint8_t *slot_out)
     return -1;
 }
 
+/* ── Diagnostic counters (used by evt_poll + xhci_poll) ──────── */
+
+static uint32_t diag_poll_count;
+static uint32_t diag_xfer_events;
+static uint32_t diag_kbd_events;
+static uint32_t diag_other_events;
+
 /* ── Event Ring Poll (non-blocking) ──────────────────────────── */
 
 static void evt_poll(xhci_hc_t *hc)
 {
+    /* Clear Interrupt Pending (IP) by writing 1 to bit 0, keep IE=1 (bit 1).
+     * This allows the controller to set IP again for new events.
+     * Required on AMD hardware where INTE+IE gate event ring generation. */
+    uint32_t iman = 0x3; /* IP=1 (W1C to clear) | IE=1 (keep enabled) */
+    rt_write(hc, XHCI_RT_IR0 + XHCI_IR_IMAN, iman);
+
+    /* Also clear STS.EINT (Event Interrupt) by writing 1 */
+    uint32_t usbsts = op_read(hc, XHCI_OP_USBSTS);
+    if (usbsts & (1 << 3)) /* EINT bit */
+        op_write(hc, XHCI_OP_USBSTS, (1 << 3)); /* W1C */
+
+    /* Safety: check controller is still running */
+    uint32_t sts = usbsts;
+    if (sts & (XHCI_STS_HCH | XHCI_STS_HSE)) {
+        static bool dead_printed;
+        if (!dead_printed) {
+            dead_printed = true;
+            serial_puts("[xHCI] Controller DEAD (USBSTS=");
+            serial_puthex(sts, 8);
+            serial_puts(")\n");
+            fb_puts("[xHCI DEAD ");
+            fb_puthex(sts, 8);
+            fb_puts("]\n");
+        }
+        hc->initialized = false; /* Controller dead, stop polling */
+        return;
+    }
+
     for (int rounds = 0; rounds < 16; rounds++) {
         uint32_t idx = hc->evt_deq;
         xhci_trb_t *e = &hc->evt_ring[idx];
@@ -343,6 +416,7 @@ static void evt_poll(xhci_hc_t *hc)
         uint8_t type = XHCI_TRB_GET_TYPE(e->control);
 
         if (type == TRB_TRANSFER_EVENT) {
+            diag_xfer_events++;
             /* Find which slot this belongs to */
             uint8_t slot = (e->control >> 24) & 0xFF;
             uint8_t ep_dci = (e->control >> 16) & 0x1F;
@@ -352,13 +426,39 @@ static void evt_poll(xhci_hc_t *hc)
             if (slot > 0 && slot <= XHCI_MAX_SLOTS) {
                 xhci_device_t *dev = &hc->devices[slot - 1];
                 if (dev->hid_active && ep_dci == dev->int_ep_dci && dev->report_buf) {
+                    /* Only process successful transfers (1=Success, 13=Short Packet) */
+                    if (code != 1 && code != 13) {
+                        static uint32_t err_count;
+                        if (err_count < 5) {
+                            err_count++;
+                            serial_puts("[xHCI] INT xfer err slot=");
+                            serial_putdec(slot);
+                            serial_puts(" code=");
+                            serial_putdec(code);
+                            serial_puts("\n");
+                        }
+                        goto advance;
+                    }
+
                     uint32_t actual = dev->int_max_pkt - len;
-                    (void)code; /* Success or Short Packet — process below */
 
                     uint8_t *r = dev->report_buf;
 
                     if (dev->hid_protocol == 1 && actual >= 8) {
                         /* ── Keyboard boot report ── */
+                        diag_kbd_events++;
+                        static uint32_t kbd_evt_count;
+                        kbd_evt_count++;
+                        if (kbd_evt_count <= 3) {
+                            serial_puts("[xHCI] KBD report #");
+                            serial_putdec(kbd_evt_count);
+                            serial_puts(": ");
+                            for (uint32_t bi = 0; bi < 8; bi++) {
+                                serial_puthex(r[bi], 2);
+                                serial_puts(" ");
+                            }
+                            serial_puts("\n");
+                        }
                         usb_kbd_handle_report(dev, r, actual);
                     } else if (actual >= 3) {
                         /* ── Mouse boot report ── */
@@ -404,9 +504,12 @@ static void evt_poll(xhci_hc_t *hc)
                     db_write(hc, slot, dev->int_ep_dci);
                 }
             }
+        } else {
+            diag_other_events++;
         }
         /* PORT_STATUS_CHANGE events — just consume */
 
+advance:
         /* Advance event dequeue */
         hc->evt_deq++;
         if (hc->evt_deq >= XHCI_EVT_RING_SIZE) {
@@ -473,8 +576,9 @@ static int ctrl_transfer(xhci_hc_t *hc, xhci_device_t *dev,
     /* Ring EP0 doorbell: slot N, target = DCI 1 (EP0) */
     db_write(hc, dev->slot_id, 1);
 
-    /* Wait for transfer completion */
-    for (int t = 0; t < 1000000; t++) {
+    /* Wait for transfer completion — Full Speed needs 50-500ms for retries.
+     * 20M iters ≈ 340ms at 3.8GHz. */
+    for (int t = 0; t < 20000000; t++) {
         uint32_t eidx = hc->evt_deq;
         xhci_trb_t *ev = &hc->evt_ring[eidx];
         rmb();
@@ -508,7 +612,7 @@ static int ctrl_transfer(xhci_hc_t *hc, xhci_device_t *dev,
 static uint16_t ep0_max_pkt(uint8_t speed)
 {
     if (speed == XHCI_SPEED_LOW)   return 8;
-    if (speed == XHCI_SPEED_FULL)  return 64;
+    if (speed == XHCI_SPEED_FULL)  return 8;   /* FS devices may only support 8; safe default */
     if (speed == XHCI_SPEED_HIGH)  return 64;
     if (speed == XHCI_SPEED_SUPER) return 512;
     return 64;
@@ -528,24 +632,53 @@ static void enumerate_port(xhci_hc_t *hc, int port)
     uint32_t portsc = op_read(hc, XHCI_PORTSC(port));
     if (!(portsc & XHCI_PORTSC_CCS)) return; /* No device */
 
+    /* Determine if this is a USB2 or USB3 port (1-based port number) */
+    uint8_t port1 = (uint8_t)(port + 1);
+    bool is_usb3 = (port1 >= hc->usb3_port_start &&
+                    port1 < hc->usb3_port_start + hc->usb3_port_count);
+    bool is_usb2 = (port1 >= hc->usb2_port_start &&
+                    port1 < hc->usb2_port_start + hc->usb2_port_count);
+
     uint8_t speed = (portsc >> XHCI_PORTSC_SPEED_SHIFT) & 0xF;
+    uint8_t pls = (portsc >> 5) & 0xF;
 
     serial_puts("[xHCI] Port ");
     serial_putdec(port);
+    serial_puts(is_usb3 ? " (USB3)" : is_usb2 ? " (USB2)" : " (?)");
     serial_puts(": ");
     serial_puts(speed_name(speed));
+    serial_puts(" PLS=");
+    serial_putdec(pls);
     serial_puts("\n");
+
+    fb_puts("  P");
+    fb_putdec(port);
+    fb_puts(is_usb3 ? "/SS" : "/HS");
+    fb_puts(": ");
+
+    /* USB 3.0 port with no SuperSpeed link (PLS != U0/U1/U2/U3):
+     * The device is likely USB 2.0 — it will enumerate on the companion
+     * USB 2.0 port. Skip to avoid wasting time on failed resets. */
+    if (is_usb3 && speed == 0) {
+        serial_puts("[xHCI] USB3 port ");
+        serial_putdec(port);
+        serial_puts(": no SS link, skip (USB2 companion will handle)\n");
+        fb_puts("no SS link, skip\n");
+        return;
+    }
 
     /* Port reset */
     portsc = op_read(hc, XHCI_PORTSC(port));
-    portsc &= ~XHCI_PORTSC_CHANGE_BITS; /* Preserve RW, don't clear RWC accidentally */
+    portsc &= ~XHCI_PORTSC_CHANGE_BITS;
     portsc |= XHCI_PORTSC_PR;
     op_write(hc, XHCI_PORTSC(port), portsc);
 
-    /* Wait for reset complete */
-    for (int t = 0; t < 500000; t++) {
+    /* Wait for reset complete — USB 2.0 needs 10-50ms, USB 3.0 up to 100ms.
+     * 10M iters ≈ 170ms at 3.8GHz (pause ~65 cycles on Zen 3). */
+    int reset_ok = 0;
+    for (int t = 0; t < 10000000; t++) {
         portsc = op_read(hc, XHCI_PORTSC(port));
-        if (portsc & XHCI_PORTSC_PRC) break;
+        if (portsc & XHCI_PORTSC_PRC) { reset_ok = 1; break; }
         __asm__ volatile ("pause");
     }
     /* Clear PRC */
@@ -554,6 +687,14 @@ static void enumerate_port(xhci_hc_t *hc, int port)
     portsc |= XHCI_PORTSC_PRC;
     op_write(hc, XHCI_PORTSC(port), portsc);
 
+    if (!reset_ok) {
+        serial_puts("[xHCI] Port ");
+        serial_putdec(port);
+        serial_puts(" reset TIMEOUT\n");
+        fb_puts("reset timeout\n");
+        return;
+    }
+
     /* Re-read speed after reset */
     portsc = op_read(hc, XHCI_PORTSC(port));
     speed = (portsc >> XHCI_PORTSC_SPEED_SHIFT) & 0xF;
@@ -561,7 +702,12 @@ static void enumerate_port(xhci_hc_t *hc, int port)
     if (!(portsc & XHCI_PORTSC_PED)) {
         serial_puts("[xHCI] Port ");
         serial_putdec(port);
-        serial_puts(" not enabled after reset\n");
+        serial_puts(" not enabled (PORTSC=");
+        serial_puthex(portsc, 8);
+        serial_puts(")\n");
+        fb_puts("not enabled ");
+        fb_puthex(portsc, 8);
+        fb_puts("\n");
         return;
     }
 
@@ -577,6 +723,9 @@ static void enumerate_port(xhci_hc_t *hc, int port)
         serial_puts("[xHCI] Enable Slot failed (code=");
         serial_putdec(code < 0 ? 0 : (uint64_t)code);
         serial_puts(")\n");
+        fb_puts(code < 0 ? "slot TIMEOUT" : "slot fail c=");
+        if (code >= 0) fb_putdec((uint64_t)code);
+        fb_puts("\n");
         return;
     }
 
@@ -647,15 +796,24 @@ static void enumerate_port(xhci_hc_t *hc, int port)
         serial_puts("[xHCI] Address Device failed (code=");
         serial_putdec(code < 0 ? 0 : (uint64_t)code);
         serial_puts(")\n");
+        fb_puts("addr fail c=");
+        fb_putdec(code < 0 ? 0 : (uint64_t)code);
+        fb_puts("\n");
         return;
     }
 
     dev->addressed = true;
+    fb_puts(speed_name(speed));
+    fb_puts(" ");
     serial_puts("[xHCI] Device addressed on slot ");
     serial_putdec(slot_id);
     serial_puts("\n");
 
-    /* ── GET_DEVICE_DESCRIPTOR ── */
+    /* Post-SET_ADDRESS recovery: USB spec requires up to 50ms
+     * for device to accept new address. 2M iters ≈ 34ms. */
+    spin(2000000);
+
+    /* ── GET_DEVICE_DESCRIPTOR (8-byte short read first) ── */
     uint8_t *desc_buf = (uint8_t *)mem_alloc_aligned(256, 64);
     if (!desc_buf) return;
     memset(desc_buf, 0, 256);
@@ -665,10 +823,93 @@ static void enumerate_port(xhci_hc_t *hc, int port)
     setup.bRequest = USB_REQ_GET_DESCRIPTOR;
     setup.wValue = (USB_DESC_DEVICE << 8);
     setup.wIndex = 0;
+    setup.wLength = 8;   /* Only first 8 bytes — safe for all EP0 sizes */
+
+    int xfer_ret = ctrl_transfer(hc, dev, &setup, desc_buf, 8, true);
+    if (xfer_ret < 0) {
+        serial_puts("[xHCI] GET_DEVICE_DESCRIPTOR(8) failed code=");
+        serial_putdec((uint64_t)(-(int64_t)xfer_ret));
+        serial_puts("\n");
+        fb_puts("DESC8 fail e=");
+        fb_putdec((uint64_t)(-(int64_t)xfer_ret));
+        fb_puts("\n");
+        return;
+    }
+
+    /* bMaxPacketSize0 is at offset 7 of the device descriptor */
+    uint8_t actual_mps = desc_buf[7];
+    if (actual_mps == 0) actual_mps = 8; /* Sanity */
+    serial_puts("[xHCI] bMaxPacketSize0=");
+    serial_putdec(actual_mps);
+    serial_puts("\n");
+
+    /* If actual max packet > what we configured, update EP0 via Evaluate Context */
+    uint16_t cur_mps = ep0_max_pkt(speed);
+    if (actual_mps > cur_mps) {
+        serial_puts("[xHCI] Updating EP0 max_pkt ");
+        serial_putdec(cur_mps);
+        serial_puts(" -> ");
+        serial_putdec(actual_mps);
+        serial_puts("\n");
+
+        /* Build Evaluate Context input */
+        uint32_t eval_ctx_total = hc->ctx_size * 33;
+        void *eval_ctx = mem_alloc_aligned(eval_ctx_total, 4096);
+        if (eval_ctx) {
+            memset(eval_ctx, 0, eval_ctx_total);
+
+            /* Input Control Context: evaluate EP0 (bit 1) */
+            xhci_input_ctrl_ctx_t *eval_icc =
+                (xhci_input_ctrl_ctx_t *)ctx_entry(hc, eval_ctx, 0);
+            eval_icc->add_flags = (1 << 1); /* EP0 only */
+
+            /* EP0 Context with updated max packet size */
+            xhci_ep_ctx_t *eval_ep0 =
+                (xhci_ep_ctx_t *)ctx_entry(hc, eval_ctx, 2);
+            eval_ep0->field2 = (3 << 1) | /* CErr = 3 */
+                               (EP_TYPE_CONTROL << 3) |
+                               ((uint32_t)actual_mps << 16);
+            /* Must also set tr_dequeue — copy from current state */
+            eval_ep0->tr_dequeue = (uint64_t)dev->ep0_ring |
+                                   (dev->ep0_cycle ? 1 : 0);
+            /* Re-read dequeue from output context if available */
+            xhci_ep_ctx_t *out_ep0 =
+                (xhci_ep_ctx_t *)ctx_entry(hc, dev->output_ctx, 1);
+            eval_ep0->tr_dequeue = out_ep0->tr_dequeue;
+            eval_ep0->field4 = 8;
+
+            xhci_trb_t eval_cmd;
+            memset(&eval_cmd, 0, sizeof(eval_cmd));
+            eval_cmd.param = (uint64_t)eval_ctx;
+            eval_cmd.control = XHCI_TRB_TYPE(TRB_EVALUATE_CONTEXT) |
+                               ((uint32_t)slot_id << 24);
+
+            cmd_submit(hc, &eval_cmd);
+            uint8_t edummy;
+            int ecode = cmd_wait(hc, &edummy);
+            if (ecode == 1) {
+                serial_puts("[xHCI] Evaluate Context OK\n");
+            } else {
+                serial_puts("[xHCI] Evaluate Context failed code=");
+                serial_putdec(ecode < 0 ? 0 : (uint64_t)ecode);
+                serial_puts("\n");
+            }
+        }
+    }
+
+    /* ── GET_DEVICE_DESCRIPTOR (full 18 bytes) ── */
+    spin(500000); /* ~8ms recovery between control transfers */
+    memset(desc_buf, 0, 256);
     setup.wLength = 18;
 
-    if (ctrl_transfer(hc, dev, &setup, desc_buf, 18, true) < 0) {
-        serial_puts("[xHCI] GET_DEVICE_DESCRIPTOR failed\n");
+    xfer_ret = ctrl_transfer(hc, dev, &setup, desc_buf, 18, true);
+    if (xfer_ret < 0) {
+        serial_puts("[xHCI] GET_DEVICE_DESCRIPTOR(18) failed code=");
+        serial_putdec((uint64_t)(-(int64_t)xfer_ret));
+        serial_puts("\n");
+        fb_puts("DESC18 fail e=");
+        fb_putdec((uint64_t)(-(int64_t)xfer_ret));
+        fb_puts("\n");
         return;
     }
 
@@ -686,9 +927,10 @@ static void enumerate_port(xhci_hc_t *hc, int port)
     serial_puthex(dev->class_code, 2);
     serial_puts("\n");
 
-    fb_puts(" USB: ");
-    if (dev->vendor_id == 0x0951) fb_puts("HyperX");
-    else { fb_puts("["); /* generic */ }
+    fb_puts(" ");
+    fb_puthex(dev->vendor_id, 4);
+    fb_puts(":");
+    fb_puthex(dev->product_id, 4);
     fb_puts(" ");
     serial_puts("\n");
 
@@ -699,6 +941,7 @@ static void enumerate_port(xhci_hc_t *hc, int port)
 
     if (ctrl_transfer(hc, dev, &setup, desc_buf, 9, true) < 0) {
         serial_puts("[xHCI] GET_CONFIG_DESC(header) failed\n");
+        fb_puts("CFG9 fail\n");
         return;
     }
 
@@ -711,15 +954,28 @@ static void enumerate_port(xhci_hc_t *hc, int port)
 
     if (ctrl_transfer(hc, dev, &setup, desc_buf, total_len, true) < 0) {
         serial_puts("[xHCI] GET_CONFIG_DESC(full) failed\n");
+        fb_puts("CFG fail\n");
         return;
     }
 
-    /* Parse for HID Interrupt IN endpoint */
+    /* Parse for HID Interrupt IN endpoint.
+     *
+     * USB composite devices (gaming keyboards) have multiple HID interfaces:
+     *   iface 0: keyboard (class=3, proto=1), EP 0x81 (EP1 IN, 8 bytes)
+     *   iface 1: consumer control (class=3, proto=0), EP 0x82 (EP2 IN, 16 bytes)
+     *   iface 2: vendor LED (class=3, proto=0), EP 0x83 (EP3 IN, 8 bytes)
+     *
+     * Endpoint descriptors follow their owning interface descriptor.
+     * We MUST only collect endpoints from the selected interface, otherwise
+     * we'd configure EP2/EP3 (consumer/vendor) instead of EP1 (keyboard)
+     * and get zero transfer events when normal keys are pressed.
+     */
     uint8_t hid_iface = 0xFF;
     uint8_t hid_proto = 0;   /* 1 = keyboard, 2 = mouse */
     uint8_t int_ep_addr = 0;
     uint16_t int_max_pkt_found = 0;
     uint8_t int_interval = 0;
+    bool collecting_eps = false; /* true = current interface is selected */
 
     uint32_t pos = 0;
     while (pos + 2 <= total_len) {
@@ -731,20 +987,31 @@ static void enumerate_port(xhci_hc_t *hc, int port)
             uint8_t iclass = desc_buf[pos + 5];
             uint8_t isub = desc_buf[pos + 6];
             uint8_t iproto = desc_buf[pos + 7];
+
+            /* New interface → stop collecting endpoints from previous */
+            collecting_eps = false;
+
             if (iclass == 3) { /* HID */
-                hid_iface = desc_buf[pos + 2]; /* interface number */
-                hid_proto = iproto; /* 1=keyboard, 2=mouse */
+                uint8_t this_iface = desc_buf[pos + 2];
                 serial_puts("[xHCI] HID interface ");
-                serial_putdec(hid_iface);
+                serial_putdec(this_iface);
                 serial_puts(" (subclass=");
                 serial_putdec(isub);
                 serial_puts(" proto=");
                 serial_putdec(iproto);
                 serial_puts(")\n");
+
+                /* Prefer keyboard (proto=1) or mouse (proto=2) over generic. */
+                if (iproto == 1 || iproto == 2 || hid_iface == 0xFF) {
+                    hid_iface = this_iface;
+                    hid_proto = iproto;
+                    int_ep_addr = 0; /* reset EP — pick from THIS interface */
+                    collecting_eps = true; /* Collect endpoints for this interface */
+                }
             }
         }
 
-        if (dtype == USB_DESC_ENDPOINT && pos + 7 <= total_len && hid_iface != 0xFF) {
+        if (dtype == USB_DESC_ENDPOINT && pos + 7 <= total_len && collecting_eps) {
             uint8_t ep_addr = desc_buf[pos + 2];
             uint8_t ep_attr = desc_buf[pos + 3];
             uint16_t ep_mps = (uint16_t)(desc_buf[pos + 4] | (desc_buf[pos + 5] << 8));
@@ -755,13 +1022,13 @@ static void enumerate_port(xhci_hc_t *hc, int port)
                 int_ep_addr = ep_addr;
                 int_max_pkt_found = ep_mps & 0x7FF;
                 int_interval = ep_int;
-                serial_puts("[xHCI] Interrupt IN EP: ");
+                serial_puts("[xHCI]  -> EP: ");
                 serial_puthex(ep_addr, 2);
                 serial_puts(" maxpkt=");
                 serial_putdec(int_max_pkt_found);
                 serial_puts(" interval=");
                 serial_putdec(int_interval);
-                serial_puts("\n");
+                serial_puts(" (selected)\n");
             }
         }
 
@@ -770,6 +1037,7 @@ static void enumerate_port(xhci_hc_t *hc, int port)
 
     if (int_ep_addr == 0) {
         serial_puts("[xHCI] No HID interrupt endpoint found\n");
+        fb_puts("no HID EP\n");
         return;
     }
 
@@ -782,6 +1050,7 @@ static void enumerate_port(xhci_hc_t *hc, int port)
 
     if (ctrl_transfer(hc, dev, &setup, NULL, 0, false) < 0) {
         serial_puts("[xHCI] SET_CONFIGURATION failed\n");
+        fb_puts("SETCFG fail\n");
         return;
     }
 
@@ -904,7 +1173,8 @@ static void enumerate_port(xhci_hc_t *hc, int port)
     dev->hid_protocol = hid_proto;
     hc->num_devices++;
 
-    const char *kind = (hid_proto == 1) ? "keyboard" : "mouse";
+    const char *kind = (hid_proto == 1) ? "keyboard" :
+                       (hid_proto == 2) ? "mouse" : "HID";
     serial_puts("[xHCI] HID ");
     serial_puts(kind);
     serial_puts(" active on slot ");
@@ -913,7 +1183,7 @@ static void enumerate_port(xhci_hc_t *hc, int port)
     serial_puthex(int_ep_addr, 2);
     serial_puts("\n");
 
-    fb_puts(" USB HID: ");
+    fb_puts(" ");
     fb_puts(kind);
     fb_puts(" ready\n");
 }
@@ -937,11 +1207,24 @@ int xhci_init(uint64_t bar0_phys, uint8_t bus, uint8_t dev, uint8_t func)
     serial_puthex(bar0_phys, 16);
     serial_puts("\n");
 
+    /* Validate BAR0 */
+    if (bar0_phys == 0 || bar0_phys == 0xFFFFFFFFFFFFFFFFULL) {
+        serial_puts("[xHCI] Invalid BAR0\n");
+        return -1;
+    }
+
     /* Enable PCI bus mastering + memory space */
     pci_enable_bus_master(bus, dev, func);
 
+    /* Disable MSI/MSI-X at PCI level — prevents unhandled interrupts */
+    pci_disable_msi(bus, dev, func);
+
     /* ── Read Capabilities ── */
     uint8_t caplength = (uint8_t)(xr32(hc, XHCI_CAP_CAPLENGTH) & 0xFF);
+    if (caplength == 0 || caplength == 0xFF) {
+        serial_puts("[xHCI] Invalid CAPLENGTH (BAR0 unmapped?)\n");
+        return -1;
+    }
     uint16_t version = (uint16_t)(xr32(hc, XHCI_CAP_CAPLENGTH) >> 16);
     uint32_t hcs1 = xr32(hc, XHCI_CAP_HCSPARAMS1);
     uint32_t hcs2 = xr32(hc, XHCI_CAP_HCSPARAMS2);
@@ -971,6 +1254,55 @@ int xhci_init(uint64_t bar0_phys, uint8_t bus, uint8_t dev, uint8_t func)
 
     /* ── BIOS Handoff ── */
     xhci_bios_handoff(hc);
+
+    /* ── Parse Extended Capabilities for USB2/USB3 port ranges ── */
+    {
+        uint32_t xecp = XHCI_HCC1_XECP(hcc1);
+        if (xecp) {
+            uint32_t off = xecp * 4;
+            for (int i = 0; i < 32; i++) {
+                uint32_t val = xr32(hc, off);
+                uint8_t id = val & 0xFF;
+                uint8_t next = (val >> 8) & 0xFF;
+
+                if (id == 2) { /* Supported Protocol */
+                    uint32_t rev_major = (val >> 24) & 0xFF;
+                    uint32_t word2 = xr32(hc, off + 8);
+                    uint8_t port_off = word2 & 0xFF;       /* 1-based */
+                    uint8_t port_cnt = (word2 >> 8) & 0xFF;
+
+                    if (rev_major == 2) {
+                        hc->usb2_port_start = port_off;
+                        hc->usb2_port_count = port_cnt;
+                    } else if (rev_major == 3) {
+                        hc->usb3_port_start = port_off;
+                        hc->usb3_port_count = port_cnt;
+                    }
+
+                    serial_puts("[xHCI] USB ");
+                    serial_putdec(rev_major);
+                    serial_puts(".x ports ");
+                    serial_putdec(port_off);
+                    serial_puts("-");
+                    serial_putdec(port_off + port_cnt - 1);
+                    serial_puts(" (");
+                    serial_putdec(port_cnt);
+                    serial_puts(")\n");
+
+                    fb_puts(" USB");
+                    fb_putdec(rev_major);
+                    fb_puts(": P");
+                    fb_putdec(port_off);
+                    fb_puts("-");
+                    fb_putdec(port_off + port_cnt - 1);
+                    fb_puts("\n");
+                }
+
+                if (next == 0) break;
+                off += next * 4;
+            }
+        }
+    }
 
     /* ── Halt Controller ── */
     uint32_t usbcmd = op_read(hc, XHCI_OP_USBCMD);
@@ -1042,7 +1374,7 @@ int xhci_init(uint64_t bar0_phys, uint8_t bus, uint8_t dev, uint8_t func)
     hc->cmd_enq = 0;
     hc->cmd_cycle = 1;
 
-    op_write64(hc, XHCI_OP_CRCR, (uint64_t)hc->cmd_ring);
+    op_write64(hc, XHCI_OP_CRCR, (uint64_t)hc->cmd_ring | 1); /* RCS=1 matches cmd_cycle=1 */
 
     /* ── Event Ring ── */
     uint32_t evt_bytes = XHCI_EVT_RING_SIZE * sizeof(xhci_trb_t);
@@ -1064,11 +1396,20 @@ int xhci_init(uint64_t bar0_phys, uint8_t bus, uint8_t dev, uint8_t func)
     rt_write64(hc, ir0 + XHCI_IR_ERDP, (uint64_t)hc->evt_ring | (1 << 3));
     rt_write64(hc, ir0 + XHCI_IR_ERSTBA, (uint64_t)hc->erst);
 
-    /* Enable interrupter */
-    rt_write(hc, ir0 + XHCI_IR_IMAN, 0x3); /* IP + IE */
-    rt_write(hc, ir0 + XHCI_IR_IMOD, 500); /* ~2ms moderation */
+    /* Interrupter: MUST enable IE (IMAN bit 1) and INTE (USBCMD bit 2).
+     * AMD xHCI controllers on real hardware require the interrupter to be
+     * enabled for the event ring to generate Transfer Events. Without IE+INTE,
+     * endpoints show "running" but the controller never writes events.
+     * QEMU's xHCI emulation works without these — real AMD hardware does NOT.
+     *
+     * MSI/MSI-X are already disabled at PCI level (pci_disable_msi), so no
+     * MSI vectors fire. INTx goes through IOAPIC which we haven't configured
+     * for PCI devices, so no actual CPU interrupts are delivered.
+     * We still use polling (xhci_poll) to consume the event ring. */
+    rt_write(hc, ir0 + XHCI_IR_IMAN, 0x2); /* IE=1 (bit 1), IP=0 (bit 0) */
+    rt_write(hc, ir0 + XHCI_IR_IMOD, 160); /* ~10µs moderation */
 
-    /* ── Start Controller ── */
+    /* ── Start Controller (INTE=1 required for AMD event ring) ── */
     op_write(hc, XHCI_OP_USBCMD, XHCI_CMD_RUN | XHCI_CMD_INTE);
 
     for (int t = 0; t < 100000; t++) {
@@ -1083,16 +1424,102 @@ int xhci_init(uint64_t bar0_phys, uint8_t bus, uint8_t dev, uint8_t func)
     hc->initialized = true;
     hc_count++;
 
-    serial_puts("[xHCI] Controller running, scanning ports...\n");
+    serial_puts("[xHCI] Controller running, powering ports...\n");
+
+    /* ── Power on all ports ──
+     * After HCRST, if PPC (Port Power Control) = 1 in HCCPARAMS1,
+     * PP bits in PORTSC are cleared → ports have no power → no devices.
+     * AMD 400-series xHCI has PPC=1. Must set PP=1 on every port. */
+    {
+        uint32_t pp_set = 0;
+        for (uint32_t p = 0; p < hc->max_ports; p++) {
+            uint32_t portsc = op_read(hc, XHCI_PORTSC(p));
+            if (!(portsc & XHCI_PORTSC_PP)) {
+                portsc &= ~XHCI_PORTSC_CHANGE_BITS;
+                portsc |= XHCI_PORTSC_PP;
+                op_write(hc, XHCI_PORTSC(p), portsc);
+                pp_set++;
+            }
+        }
+        serial_puts("[xHCI] Ports powered (");
+        serial_putdec(pp_set);
+        serial_puts(" were off)\n");
+    }
+
+    /* ── Wait for link training ──
+     * After HCRST + port power, USB devices need:
+     * 1. VBUS stabilization (~100ms)
+     * 2. USB 3.0 LFPS / link training (~100-360ms)
+     * 3. USB 2.0 connect detect (~100ms)
+     * 40M iters ≈ 1.0s at 3.8GHz. */
+    spin(40000000);
+
+    /* ── Drain pending Port Status Change events ──
+     * Controller generates PSC events when devices connect. If event
+     * ring isn't serviced, controller may stall. */
+    for (int rounds = 0; rounds < 64; rounds++) {
+        uint32_t idx = hc->evt_deq;
+        xhci_trb_t *e = &hc->evt_ring[idx];
+        rmb();
+        if ((e->control & TRB_CYCLE) != hc->evt_cycle) break;
+
+        hc->evt_deq++;
+        if (hc->evt_deq >= XHCI_EVT_RING_SIZE) {
+            hc->evt_deq = 0;
+            hc->evt_cycle ^= 1;
+        }
+        uint64_t erdp = (uint64_t)&hc->evt_ring[hc->evt_deq] | (1 << 3);
+        rt_write64(hc, XHCI_RT_IR0 + XHCI_IR_ERDP, erdp);
+    }
+
+    /* ── Diagnostic: dump all port status to serial ── */
+    uint32_t ccs_count = 0;
+    for (uint32_t p = 0; p < hc->max_ports; p++) {
+        uint32_t portsc = op_read(hc, XHCI_PORTSC(p));
+        uint8_t ccs = portsc & 1;
+        uint8_t ped = (portsc >> 1) & 1;
+        uint8_t pls = (portsc >> 5) & 0xF;
+        uint8_t pp  = (portsc >> 9) & 1;
+        uint8_t spd = (portsc >> 10) & 0xF;
+        if (ccs) ccs_count++;
+
+        serial_puts("  P");
+        serial_putdec(p);
+        serial_puts(": ");
+        serial_puthex(portsc, 8);
+        serial_puts(" PP=");
+        serial_putdec(pp);
+        serial_puts(" CCS=");
+        serial_putdec(ccs);
+        serial_puts(" PED=");
+        serial_putdec(ped);
+        serial_puts(" PLS=");
+        serial_putdec(pls);
+        serial_puts(" SPD=");
+        serial_putdec(spd);
+        serial_puts("\n");
+    }
+    serial_puts("[xHCI] ");
+    serial_putdec(ccs_count);
+    serial_puts("/");
+    serial_putdec(hc->max_ports);
+    serial_puts(" ports connected\n");
 
     /* ── Enumerate connected ports ── */
-    spin(50000); /* Let port detection settle */
     for (uint32_t p = 0; p < hc->max_ports; p++)
         enumerate_port(hc, (int)p);
 
     serial_puts("[xHCI] Init complete: ");
     serial_putdec(hc->num_devices);
     serial_puts(" device(s)\n");
+
+    fb_puts(" xHCI: ");
+    fb_putdec(hc->num_devices);
+    fb_puts(" USB dev, ");
+    fb_putdec(ccs_count);
+    fb_puts("/");
+    fb_putdec(hc->max_ports);
+    fb_puts(" connected\n");
 
     return 0;
 }
@@ -1101,9 +1528,106 @@ int xhci_init(uint64_t bar0_phys, uint8_t bus, uint8_t dev, uint8_t func)
 
 void xhci_poll(void)
 {
+    diag_poll_count++;
+
     for (int i = 0; i < hc_count; i++) {
         if (hc_list[i].initialized)
             evt_poll(&hc_list[i]);
+    }
+
+    /* One-shot diagnostic: after ~5s of polling (~500 calls at 100Hz),
+     * dump definitive state to framebuffer. */
+    if (diag_poll_count == 500) {
+        fb_puts("[xHCI diag: ");
+        fb_putdec(diag_poll_count);
+        fb_puts(" polls, ");
+        fb_putdec(diag_xfer_events);
+        fb_puts(" xfer, ");
+        fb_putdec(diag_kbd_events);
+        fb_puts(" kbd, ");
+        fb_putdec(diag_other_events);
+        fb_puts(" other]\n");
+
+        for (int i = 0; i < hc_count; i++) {
+            xhci_hc_t *hc = &hc_list[i];
+            if (!hc->initialized) {
+                fb_puts("[HC NOT INIT]\n");
+                continue;
+            }
+
+            /* Event ring state */
+            fb_puts("[evt: deq=");
+            fb_putdec(hc->evt_deq);
+            fb_puts(" cyc=");
+            fb_putdec(hc->evt_cycle);
+            xhci_trb_t *e = &hc->evt_ring[hc->evt_deq];
+            fb_puts(" nxt_c=");
+            fb_putdec(e->control & 1);
+            fb_puts(" t=");
+            fb_putdec(XHCI_TRB_GET_TYPE(e->control));
+            fb_puts("]\n");
+
+            /* Per-device state */
+            for (int s = 0; s < XHCI_MAX_SLOTS; s++) {
+                xhci_device_t *d = &hc->devices[s];
+                if (!d->hid_active) continue;
+
+                /* Read EP state from output context */
+                xhci_ep_ctx_t *ep_out = (xhci_ep_ctx_t *)ctx_entry(
+                    hc, d->output_ctx, d->int_ep_dci);
+                uint8_t ep_state = ep_out->field1 & 0x7;
+
+                fb_puts("[S");
+                fb_putdec(d->slot_id);
+                fb_puts(" p=");
+                fb_putdec(d->hid_protocol);
+                fb_puts(" dci=");
+                fb_putdec(d->int_ep_dci);
+                fb_puts(" EP=");
+                fb_putdec(ep_state);
+                fb_puts(" mps=");
+                fb_putdec(d->int_max_pkt);
+                fb_puts(" enq=");
+                fb_putdec(d->int_enq);
+                fb_puts("]\n");
+
+                /* Dump first bytes of report_buf */
+                fb_puts("[buf: ");
+                for (int b = 0; b < 8 && b < (int)d->int_max_pkt; b++) {
+                    fb_puthex(d->report_buf[b], 2);
+                    fb_puts(" ");
+                }
+                fb_puts("]\n");
+
+                /* Also to serial with full detail */
+                serial_puts("[xHCI] Diag slot=");
+                serial_putdec(d->slot_id);
+                serial_puts(" proto=");
+                serial_putdec(d->hid_protocol);
+                serial_puts(" dci=");
+                serial_putdec(d->int_ep_dci);
+                serial_puts(" EP_STATE=");
+                serial_putdec(ep_state);
+                serial_puts(" int_max_pkt=");
+                serial_putdec(d->int_max_pkt);
+                serial_puts(" enq=");
+                serial_putdec(d->int_enq);
+                serial_puts(" report_buf=");
+                serial_puthex((uint64_t)d->report_buf, 16);
+                serial_puts(" int_ring=");
+                serial_puthex((uint64_t)d->int_ring, 16);
+                serial_puts("\n");
+
+                /* Dump int_ring[0] TRB to see if it was consumed */
+                serial_puts("  TRB[0]: param=");
+                serial_puthex(d->int_ring[0].param, 16);
+                serial_puts(" status=");
+                serial_puthex(d->int_ring[0].status, 8);
+                serial_puts(" ctrl=");
+                serial_puthex(d->int_ring[0].control, 8);
+                serial_puts("\n");
+            }
+        }
     }
 }
 

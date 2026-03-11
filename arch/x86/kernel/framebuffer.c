@@ -9,7 +9,9 @@
 
 /* ── Framebuffer state ───────────────────────────────────────── */
 
-static uint32_t *fb_base;
+static uint32_t *fb_base;    /* active drawing target (shadow or vram) */
+static uint32_t *fb_vram;    /* physical VRAM (MMIO, slow uncached access) */
+static uint32_t *fb_shadow;  /* RAM shadow buffer (fast cached access) */
 static uint32_t  fb_width;
 static uint32_t  fb_height;
 static uint32_t  fb_pitch;    /* pixels per scanline */
@@ -18,6 +20,10 @@ static uint32_t  text_col;
 static uint32_t  text_row;
 static uint32_t  max_cols;
 static uint32_t  max_rows;
+
+/* Dirty region tracking (pixel rows) */
+static uint32_t  dirty_top;
+static uint32_t  dirty_bot;
 
 #define FONT_W  8
 #define FONT_H  16
@@ -132,6 +138,8 @@ static const uint8_t font8x16[95][16] = {
 void fb_init(uint32_t *base, uint32_t width, uint32_t height, uint32_t pitch)
 {
     fb_base   = base;
+    fb_vram   = base;
+    fb_shadow = NULL;
     fb_width  = width;
     fb_height = height;
     fb_pitch  = pitch;
@@ -139,6 +147,43 @@ void fb_init(uint32_t *base, uint32_t width, uint32_t height, uint32_t pitch)
     text_row  = 0;
     max_cols  = width / FONT_W;
     max_rows  = height / FONT_H;
+    dirty_top = 0;
+    dirty_bot = 0;
+}
+
+/* Enable shadow framebuffer (call after memory allocator is ready) */
+void fb_enable_shadow(void *buf)
+{
+    fb_shadow = (uint32_t *)buf;
+    /* Copy current VRAM to shadow (slow UC read, but one-time) */
+    uint32_t total = fb_height * fb_pitch;
+    for (uint32_t i = 0; i < total; i++)
+        fb_shadow[i] = fb_vram[i];
+    fb_base = fb_shadow;
+    dirty_top = 0;
+    dirty_bot = 0;
+}
+
+/* Flush dirty region from shadow to VRAM */
+void fb_flush(void)
+{
+    if (!fb_shadow || dirty_top >= dirty_bot) return;
+    /* Clamp to framebuffer bounds */
+    if (dirty_bot > fb_height) dirty_bot = fb_height;
+    /* Copy dirty rows: use 64-bit writes for efficiency on WC memory */
+    uint64_t *dst = (uint64_t *)(fb_vram + dirty_top * fb_pitch);
+    uint64_t *src = (uint64_t *)(fb_shadow + dirty_top * fb_pitch);
+    uint32_t qwords = (dirty_bot - dirty_top) * fb_pitch / 2;
+    for (uint32_t i = 0; i < qwords; i++)
+        dst[i] = src[i];
+    dirty_top = fb_height;
+    dirty_bot = 0;
+}
+
+static void fb_mark_dirty(uint32_t pixel_top, uint32_t pixel_bot)
+{
+    if (pixel_top < dirty_top) dirty_top = pixel_top;
+    if (pixel_bot > dirty_bot) dirty_bot = pixel_bot;
 }
 
 void fb_clear(void)
@@ -167,6 +212,7 @@ static void fb_putchar_at(uint32_t col, uint32_t row, char c, uint32_t fg)
                 fb_base[sy * fb_pitch + sx] = color;
         }
     }
+    fb_mark_dirty(py, py + FONT_H);
 }
 
 static void fb_scroll(void)
@@ -175,17 +221,22 @@ static void fb_scroll(void)
     uint32_t row_pixels = FONT_H * fb_pitch;
     uint32_t total_pixels = fb_height * fb_pitch;
 
-    /* Move rows up */
-    uint32_t *dst = fb_base;
-    uint32_t *src = fb_base + row_pixels;
-    uint32_t copy_count = total_pixels - row_pixels;
-    for (uint32_t i = 0; i < copy_count; i++)
+    /* Move rows up (works on shadow if available, else VRAM) */
+    uint64_t *dst = (uint64_t *)fb_base;
+    uint64_t *src = (uint64_t *)(fb_base + row_pixels);
+    uint32_t qwords = (total_pixels - row_pixels) / 2;
+    for (uint32_t i = 0; i < qwords; i++)
         dst[i] = src[i];
 
     /* Clear last row */
-    uint32_t *last = fb_base + (total_pixels - row_pixels);
-    for (uint32_t i = 0; i < row_pixels; i++)
-        last[i] = BG_COLOR;
+    uint64_t *last = (uint64_t *)(fb_base + (total_pixels - row_pixels));
+    uint32_t clear_qwords = row_pixels / 2;
+    for (uint32_t i = 0; i < clear_qwords; i++)
+        last[i] = 0;
+
+    /* Mark entire screen dirty */
+    fb_mark_dirty(0, fb_height);
+    fb_flush();
 }
 
 /* ── ANSI CSI escape sequence parser ────────────────────────── */
@@ -398,11 +449,13 @@ uint32_t  fb_get_pitch(void)  { return fb_pitch; }
 void fb_puts(const char *s)
 {
     while (*s) fb_putc(*s++, FG_COLOR);
+    fb_flush();
 }
 
 void fb_puts_color(const char *s, uint32_t color)
 {
     while (*s) fb_putc(*s++, color);
+    fb_flush();
 }
 
 void fb_puthex(uint64_t val, int digits)
@@ -428,4 +481,5 @@ void fb_putdec(uint64_t val)
 void fb_putchar(char c)
 {
     fb_putc(c, FG_COLOR);
+    fb_flush();
 }

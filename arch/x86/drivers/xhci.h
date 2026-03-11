@@ -66,8 +66,9 @@
 #define XHCI_PORTSC_CSC        (1 << 17)
 #define XHCI_PORTSC_PRC        (1 << 21)
 
-/* RWC change bits mask */
-#define XHCI_PORTSC_CHANGE_BITS (XHCI_PORTSC_CSC | (1<<18) | (1<<19) | \
+/* RW1C/RW1CS bits mask — must write 0 to preserve, writing 1 clears them.
+ * PED (bit 1) is RW1CS: writing 1 DISABLES the port! Always mask it out. */
+#define XHCI_PORTSC_CHANGE_BITS (XHCI_PORTSC_PED | XHCI_PORTSC_CSC | (1<<18) | (1<<19) | \
                                   (1<<20) | XHCI_PORTSC_PRC | (1<<22) | (1<<23))
 
 /* Speed encoding */
@@ -113,6 +114,7 @@ _Static_assert(sizeof(xhci_trb_t) == 16, "TRB must be 16 bytes");
 #define TRB_ENABLE_SLOT         9
 #define TRB_ADDRESS_DEVICE      11
 #define TRB_CONFIGURE_ENDPOINT  12
+#define TRB_EVALUATE_CONTEXT    13
 #define TRB_NOOP_CMD            23
 #define TRB_TRANSFER_EVENT      32
 #define TRB_CMD_COMPLETION      33
@@ -267,6 +269,12 @@ typedef struct {
 
     xhci_device_t devices[XHCI_MAX_SLOTS];
     uint32_t      num_devices;
+
+    /* Supported Protocol port ranges (from Extended Capabilities) */
+    uint8_t usb2_port_start; /* 1-based port number */
+    uint8_t usb2_port_count;
+    uint8_t usb3_port_start;
+    uint8_t usb3_port_count;
 
     uint8_t pci_bus, pci_dev, pci_func;
     bool    initialized;

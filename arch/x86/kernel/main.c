@@ -77,6 +77,7 @@ extern void fb_puthex(uint64_t val, int digits);
 /* Memory */
 extern void mem_init(void *mmap, uint64_t mmap_size, uint64_t desc_size);
 extern void mem_reserve_kernel(uint64_t phys_base, uint64_t size);
+extern void *mem_alloc_pages(uint64_t count);
 
 /* ACPI RSDP — set from boot_info, read by smp.c */
 uint64_t kernel_acpi_rsdp;
@@ -350,6 +351,33 @@ void kernel_entry(boot_info_t *info)
     /* ── Step 1.6: Kernel page tables ── */
     paging_init();
 
+    /* ── Step 1.6b: PAT WC + shadow framebuffer ── */
+    {
+        extern void paging_setup_pat(void);
+        extern int  paging_map_wc(uint64_t phys, uint64_t size);
+        extern void fb_enable_shadow(void *buf);
+
+        /* Program PAT entry 1 = WC for fast framebuffer writes */
+        paging_setup_pat();
+
+        /* Map framebuffer VRAM as Write-Combining */
+        uint64_t fb_phys = info->fb_base;
+        uint64_t fb_size = (uint64_t)info->fb_height * info->fb_pitch * 4;
+        fb_size = (fb_size + 0x1FFFFF) & ~0x1FFFFFULL; /* Round up to 2MB */
+        paging_map_wc(fb_phys, fb_size);
+        __asm__ volatile ("mov %%cr3, %%rax; mov %%rax, %%cr3" ::: "rax", "memory");
+
+        /* Allocate shadow buffer in RAM for fast drawing */
+        uint64_t shadow_pages = (fb_size + 4095) / 4096;
+        void *shadow = mem_alloc_pages(shadow_pages);
+        if (shadow) {
+            fb_enable_shadow(shadow);
+            serial_puts("[FB] Shadow framebuffer enabled (");
+            serial_putdec(fb_size / 1024);
+            serial_puts(" KB)\n");
+        }
+    }
+
     /* ── Step 1.7: Kernel heap ── */
     heap_init();
 
@@ -607,6 +635,43 @@ void kernel_entry(boot_info_t *info)
     /* ── Step 5: Keyboard + Terminal + Shell ── */
     kb_init();
     term_init();
+
+    /* ── Diagnostic summary (visible just before shell) ── */
+    {
+        extern uint64_t pci_get_ecam_base(void);
+        extern uint8_t  pci_get_ecam_end_bus(void);
+        extern int      pci_get_device_count(void);
+
+        fb_puts("\n --- HW Summary ---\n");
+        uint64_t ecam = pci_get_ecam_base();
+        fb_puts(" PCI: ");
+        if (ecam) {
+            fb_puts("ECAM ");
+            fb_puthex(ecam, 8);
+            fb_puts(" (bus 0-");
+            fb_putdec(pci_get_ecam_end_bus());
+            fb_puts(")");
+        } else {
+            fb_puts("legacy I/O (no ECAM)");
+        }
+        fb_puts(", ");
+        fb_putdec(pci_get_device_count());
+        fb_puts(" devs\n");
+
+        fb_puts(" GPU: ");
+        fb_puts(gpu ? "yes" : "no");
+        fb_puts("  NVMe: ");
+        fb_puts(nvme_pci ? "yes" : "no");
+        fb_puts("  NIC: ");
+        fb_puts(nic_pci ? "yes" : "no");
+        fb_puts("  xHCI: ");
+        fb_puts(xhci_pci ? "yes" : "no");
+        fb_puts("\n");
+
+        fb_puts(" RSDP: ");
+        fb_puthex(info->acpi_rsdp, 16);
+        fb_puts("\n");
+    }
 
     serial_puts("\n[KERN] Boot complete.\n");
     fb_puts("\n Boot complete.\n");
