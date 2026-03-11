@@ -56,6 +56,10 @@ extern void dl_init(void);
 /* Win32 compatibility layer */
 extern void win32_init(void);
 
+/* xHCI USB */
+extern int  xhci_init(uint64_t bar0_phys, uint8_t bus, uint8_t dev, uint8_t func);
+extern void xhci_poll(void);
+
 /* Serial */
 extern void serial_init(void);
 extern void serial_puts(const char *s);
@@ -86,6 +90,7 @@ extern void pci_scan(void);
 extern gpu_device_t *pci_get_gpu(void);
 extern void *pci_get_nvme(void); /* Returns pci_dev_t* */
 extern void *pci_get_nic(void);  /* Returns pci_dev_t* */
+extern void *pci_get_xhci(void); /* Returns pci_dev_t* */
 
 /* NVMe */
 extern int nvme_init(uint64_t bar0_phys);
@@ -406,6 +411,15 @@ void kernel_entry(boot_info_t *info)
         paging_map_mmio(nic_pci_early->bar[0], 128 * 1024);  /* 128KB igb */
     }
 
+    /* Map xHCI BAR0 */
+    pci_dev_t *xhci_pci = (pci_dev_t *)pci_get_xhci();
+    if (xhci_pci && xhci_pci->bar[0]) {
+        paging_map_mmio(xhci_pci->bar[0], 64 * 1024);  /* 64KB xHCI regs */
+        serial_puts("[KERN] Mapped xHCI BAR0 0x");
+        serial_puthex(xhci_pci->bar[0], 16);
+        serial_puts("\n");
+    }
+
     /* Flush TLB after all MMIO mappings */
     __asm__ volatile ("mov %%cr3, %%rax; mov %%rax, %%cr3" ::: "rax", "memory");
 
@@ -584,6 +598,11 @@ void kernel_entry(boot_info_t *info)
     }
 
     /* HTTP + Claude API available via shell commands (curl, apikey, ask) */
+
+    /* ── Step 4.5: xHCI USB init ── */
+    if (xhci_pci && xhci_pci->bar[0]) {
+        xhci_init(xhci_pci->bar[0], xhci_pci->bus, xhci_pci->dev, xhci_pci->func);
+    }
 
     /* ── Step 5: Keyboard + Terminal + Shell ── */
     kb_init();

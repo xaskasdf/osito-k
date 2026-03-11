@@ -84,10 +84,11 @@ typedef struct {
 static pci_dev_t pci_devices[MAX_PCI_DEVICES];
 static int       pci_device_count;
 
-/* GPU, NVMe, and NIC device pointers (set during scan) */
+/* GPU, NVMe, NIC, and xHCI device pointers (set during scan) */
 gpu_device_t gpu_dev;
 static pci_dev_t *nvme_dev;
 static pci_dev_t *nic_dev;
+static pci_dev_t *xhci_dev;
 
 /* ── Legacy PCI I/O access ───────────────────────────────────── */
 
@@ -325,6 +326,22 @@ static void pci_add_device(uint8_t bus, uint8_t dev, uint8_t func,
         nic_dev = d;
     }
 
+    /* Check if xHCI USB 3.x controller (class 0x0C, subclass 0x03, prog_if 0x30) */
+    if (class == 0x0C && subclass == 0x03) {
+        uint32_t reg2 = pci_read32(bus, dev, func, 8);
+        uint8_t prog_if = (reg2 >> 8) & 0xFF;
+        if (prog_if == 0x30 && !xhci_dev) {
+            xhci_dev = d;
+            serial_puts("[PCI] xHCI controller: ");
+            serial_puthex(vendor, 4);
+            serial_puts(":");
+            serial_puthex(device, 4);
+            serial_puts(" BAR0=");
+            serial_puthex(d->bar[0], 16);
+            serial_puts("\n");
+        }
+    }
+
     pci_device_count++;
 }
 
@@ -360,6 +377,7 @@ void pci_scan(void)
     memset(&gpu_dev, 0, sizeof(gpu_dev));
     nvme_dev = NULL;
     nic_dev = NULL;
+    xhci_dev = NULL;
 
     /* Try ECAM first */
     find_mcfg();
@@ -418,6 +436,8 @@ void pci_scan(void)
                     fb_puts(" (NVMe)");
                 if (class == PCI_CLASS_NETWORK)
                     fb_puts(" (NIC)");
+                if (class == 0x0C && subclass == 0x03)
+                    fb_puts(" (xHCI)");
                 fb_puts("\n");
 
                 /* If not multi-function, skip remaining functions */
@@ -451,7 +471,20 @@ pci_dev_t *pci_get_nic(void)
     return nic_dev;
 }
 
+pci_dev_t *pci_get_xhci(void)
+{
+    return xhci_dev;
+}
+
 int pci_get_device_count(void)
 {
     return pci_device_count;
+}
+
+/* Enable bus mastering + memory space for a PCI device */
+void pci_enable_bus_master(uint8_t bus, uint8_t dev, uint8_t func)
+{
+    uint32_t cmd = pci_read32(bus, dev, func, 0x04);
+    cmd |= (1 << 1) | (1 << 2);  /* Memory Space + Bus Master */
+    pci_write32(bus, dev, func, 0x04, cmd);
 }

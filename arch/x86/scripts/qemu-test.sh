@@ -80,6 +80,7 @@ info "ESP image: boot.efi=$(stat -c%s "$EFI_BIN") kernel.elf=$(stat -c%s "$KERN_
 info "Launching QEMU..."
 info "  OVMF: $OVMF"
 info "  NIC:  e1000e (Intel 82574L, igb family)"
+info "  USB:  xHCI + keyboard + mouse"
 info "  Net:  user-mode, UDP :7777 → guest 10.0.2.15:7777"
 info ""
 echo -e "${CYAN}  Test: echo \"hola osito\" | nc -u localhost 7777${NC}"
@@ -119,6 +120,9 @@ qemu-system-x86_64 \
     -smp 4 \
     -device e1000e,netdev=net0 \
     -netdev user,id=net0,hostfwd=udp::7777-:7777 \
+    -device qemu-xhci,id=usb \
+    -device usb-kbd,bus=usb.0 \
+    -device usb-mouse,bus=usb.0 \
     -display none \
     -serial file:"$SERIAL_LOG" \
     -monitor unix:/tmp/qemu-monitor.sock,server,nowait \

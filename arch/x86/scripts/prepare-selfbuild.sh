@@ -100,7 +100,7 @@ done
 
 # drivers/
 for f in nvme.c i211.c gpu.c gsp.c sass.c gmmu.c \
-         gpu_tensor.c gpu_inference.c; do
+         gpu_tensor.c gpu_inference.c xhci.c; do
     write_file "$X86_DIR/drivers/$f"
 done
 

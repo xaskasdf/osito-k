@@ -544,7 +544,7 @@ static const char *build_tcc_sources[] = {
     "shm.c", "compositor.c", "display.c", "input_events.c", "memcompress.c",
     /* drivers/ */
     "nvme.c", "i211.c", "gpu.c", "gsp.c", "sass.c", "gmmu.c",
-    "gpu_tensor.c", "gpu_inference.c",
+    "gpu_tensor.c", "gpu_inference.c", "xhci.c",
     /* fs/ */
     "ositofs2.c", "gpt.c", "gguf.c",
     /* win32/ (GCC-only: compat32.c, msvcrt_shim.c) */

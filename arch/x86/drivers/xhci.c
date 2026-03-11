@@ -20,6 +20,7 @@ extern void fb_puts(const char *s);
 
 extern void *mem_alloc_aligned(uint64_t size, uint64_t alignment);
 extern void  mem_free_pages(void *addr, uint64_t count);
+extern void  pci_enable_bus_master(uint8_t bus, uint8_t dev, uint8_t func);
 
 /* Input injection (input_events.c — mouse) */
 extern void input_post_mouse_move(int16_t dx, int16_t dy);
@@ -935,6 +936,9 @@ int xhci_init(uint64_t bar0_phys, uint8_t bus, uint8_t dev, uint8_t func)
     serial_puts(" BAR0=");
     serial_puthex(bar0_phys, 16);
     serial_puts("\n");
+
+    /* Enable PCI bus mastering + memory space */
+    pci_enable_bus_master(bus, dev, func);
 
     /* ── Read Capabilities ── */
     uint8_t caplength = (uint8_t)(xr32(hc, XHCI_CAP_CAPLENGTH) & 0xFF);

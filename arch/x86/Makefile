@@ -74,7 +74,8 @@ KERN_SRC = kernel/main.c kernel/serial.c kernel/framebuffer.c \
            kernel/input_events.c kernel/memcompress.c
 ASM_SRC  = kernel/isr_stubs.S kernel/syscall_entry.S kernel/setjmp.S kernel/kexec_tramp.S
 DRV_SRC  = drivers/nvme.c drivers/i211.c drivers/gpu.c drivers/gsp.c \
-           drivers/sass.c drivers/gmmu.c drivers/gpu_tensor.c drivers/gpu_inference.c
+           drivers/sass.c drivers/gmmu.c drivers/gpu_tensor.c drivers/gpu_inference.c \
+           drivers/xhci.c
 FS_SRC   = fs/ositofs2.c fs/gpt.c fs/gguf.c
 WIN32_SRC = win32/win32_init.c win32/compat32.c win32/pe.c win32/winexec.c \
             win32/handle.c win32/ntsyscall.c win32/ntprocess.c win32/ntsync.c \

@@ -204,7 +204,7 @@ arch/arm/          SM8350 (ROG Phone 5) bare-metal port — see docs/aarch64-det
 | X-QOS   | QoS priority scheduler (5 classes) | Done |
 | X-CCP   | AMD CCP TRNG driver | Done |
 | X-AHCI  | SATA AHCI driver | WIP |
-| X-XHCI  | xHCI USB 3.x driver (AMD 400/Matisse) | Next |
+| X-XHCI  | xHCI USB 3.x driver + HID keyboard/mouse | Done |
 | X-RETINA| Display pipeline (compositor, shared memory) | WIP |
 | X-WIN32 | Windows PE32 compat layer (15 DLL shims) | WIP |
 | **Phase 0** | **Kernel/bootloader separation** (boot.efi + kernel.elf) | **Done** |

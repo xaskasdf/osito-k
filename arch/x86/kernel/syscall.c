@@ -376,13 +376,20 @@ extern bool kb_has_input(void);
 static bool term_canonical = true;   /* ICANON: line-buffered input */
 static bool term_echo      = true;   /* ECHO: echo input chars */
 
+/* xHCI USB polling (weak: works without xHCI driver) */
+extern void xhci_poll(void) __attribute__((weak));
+
 /* Blocking keyboard read with interrupts enabled.
  * SYSCALL entry disables interrupts (FMASK clears IF). We must
  * re-enable them here so keyboard IRQs can actually fire. */
 static char kb_getchar_safe(void)
 {
-    while (!kb_has_input())
-        __asm__ volatile ("sti; hlt; cli" ::: "memory");
+    while (!kb_has_input()) {
+        __asm__ volatile ("sti" ::: "memory");
+        if (xhci_poll) xhci_poll();  /* Poll USB HID devices */
+        if (kb_has_input()) { __asm__ volatile ("cli" ::: "memory"); break; }
+        __asm__ volatile ("hlt; cli" ::: "memory");
+    }
     return kb_getchar();  /* non-blocking now, data is ready */
 }
 

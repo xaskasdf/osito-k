@@ -13,6 +13,9 @@
 extern void serial_puts(const char *s);
 extern void serial_puthex(uint64_t val, int digits);
 
+/* xHCI USB polling (weak: works without xHCI driver) */
+extern void xhci_poll(void) __attribute__((weak));
+
 /* ── PS/2 ports ──────────────────────────────────────────────── */
 
 #define KB_DATA_PORT    0x60
@@ -200,8 +203,11 @@ void keyboard_irq(void)
 /* Read one character (blocking) */
 char kb_getchar(void)
 {
-    while (kb_head == kb_tail)
+    while (kb_head == kb_tail) {
+        if (xhci_poll) xhci_poll();  /* Poll USB HID devices */
+        if (kb_head != kb_tail) break;
         __asm__ volatile ("hlt");  /* Wait for IRQ */
+    }
 
     char c = kb_buf[kb_tail];
     kb_tail = (kb_tail + 1) % KB_BUF_SIZE;
