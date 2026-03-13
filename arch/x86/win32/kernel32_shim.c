@@ -250,54 +250,11 @@ DWORD WINAPI GetCurrentProcessId(void)
 
 /* ── Memory API ─────────────────────────────────────────────── */
 
-/* ── FName::Names watchpoint ─────────────────────────────────── */
-extern uint32_t g_fname_names_addr;
-
-static void fname_watch(const char *tag)
-{
-    if (!g_fname_names_addr) return;
-    uint32_t *tarray = (uint32_t *)(uintptr_t)g_fname_names_addr;
-    uint32_t data_ptr = tarray[0];
-    uint32_t num = tarray[1];
-    if (!data_ptr || data_ptr < 0x10000 || data_ptr > 0x20000000) return;
-    if (num == 0 || num > 0x10000) return;
-    uint32_t *entries = (uint32_t *)(uintptr_t)data_ptr;
-    /* Check if entry[0] has a value */
-    static uint32_t last_data_ptr = 0;
-    static uint32_t last_entry0 = 0;
-    static int transition_logged = 0;
-    if (entries[0] != last_entry0 || data_ptr != last_data_ptr) {
-        serial_puts("[FNW:");
-        serial_puts(tag);
-        serial_puts("] Data=0x");
-        serial_puthex(data_ptr, 8);
-        serial_puts(" Num=");
-        serial_putdec(num);
-        serial_puts(" [0]=0x");
-        serial_puthex(entries[0], 8);
-        serial_puts(" [1]=0x");
-        serial_puthex(entries[1], 8);
-        serial_puts(" [4]=0x");
-        serial_puthex(num > 4 ? entries[4] : 0, 8);
-        serial_puts("\n");
-        if (last_entry0 != 0 && entries[0] == 0 && !transition_logged) {
-            transition_logged = 1;
-            serial_puts("[FNW] *** ENTRY[0] WAS CLEARED! prev=0x");
-            serial_puthex(last_entry0, 8);
-            serial_puts(" ***\n");
-        }
-        last_entry0 = entries[0];
-        last_data_ptr = data_ptr;
-    }
-}
-
 PVOID WINAPI VirtualAlloc(PVOID lpAddress, SIZE_T dwSize,
                    DWORD flAllocationType, DWORD flProtect)
 {
     PVOID base = lpAddress;
     SIZE_T size = dwSize;
-
-    fname_watch("VA-pre");
 
     NTSTATUS status = NtAllocateVirtualMemory(
         NT_CURRENT_PROCESS, &base, 0, &size,
@@ -308,8 +265,6 @@ PVOID WINAPI VirtualAlloc(PVOID lpAddress, SIZE_T dwSize,
         return NULL;
     }
 
-    fname_watch("VA-post");
-
     return base;
 }
 
@@ -318,8 +273,6 @@ BOOL WINAPI VirtualFree(PVOID lpAddress, SIZE_T dwSize, DWORD dwFreeType)
     PVOID base = lpAddress;
     SIZE_T size = dwSize;
 
-    fname_watch("VF-pre");
-
     NTSTATUS status = NtFreeVirtualMemory(
         NT_CURRENT_PROCESS, &base, &size, dwFreeType);
 
@@ -327,8 +280,6 @@ BOOL WINAPI VirtualFree(PVOID lpAddress, SIZE_T dwSize, DWORD dwFreeType)
         set_last_error_from_status(status);
         return FALSE;
     }
-
-    fname_watch("VF-post");
 
     return TRUE;
 }

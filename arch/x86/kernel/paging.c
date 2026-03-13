@@ -97,11 +97,18 @@ static int paging_map_4k(uint64_t virt, uint64_t phys, uint64_t flags)
     uint64_t *pd = pt_get_or_create(pdpt, PDPT_INDEX(virt));
     if (!pd) return -1;
 
-    /* Check if PD entry is already a 2MB large page — can't subdivide easily */
+    /* If PD entry is a 2MB large page, split into 512 × 4KB pages */
     int pd_idx = PD_INDEX(virt);
     if ((pd[pd_idx] & PTE_PRESENT) && (pd[pd_idx] & PTE_LARGE)) {
-        /* Already mapped as 2MB — skip (identity map matches anyway) */
-        return 0;
+        uint64_t large_phys = pd[pd_idx] & 0x000FFFFFFFE00000ULL;
+        uint64_t large_flags = pd[pd_idx] & ~(PTE_ADDR_MASK | PTE_LARGE);
+        uint64_t *pt = pt_alloc_page();
+        if (!pt) return -1;
+        /* Fill PT with 512 identity-mapped 4KB entries */
+        for (int i = 0; i < 512; i++)
+            pt[i] = (large_phys + i * PAGE_SIZE) | large_flags;
+        /* Replace 2MB entry with PT pointer */
+        pd[pd_idx] = (uint64_t)pt | PTE_PRESENT | PTE_WRITABLE;
     }
 
     uint64_t *pt = pt_get_or_create(pd, pd_idx);

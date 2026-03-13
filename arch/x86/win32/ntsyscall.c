@@ -42,51 +42,103 @@ extern void  mem_free_pages(void *addr, uint64_t count);
 
 /* Paging */
 extern int paging_map_page(uint64_t virt, uint64_t phys, uint64_t flags);
+extern int paging_unmap_page(uint64_t virt);
 extern int paging_set_flags(uint64_t virt, uint64_t flags);
 
-/* ── Virtual memory allocation tracking ────────────────────── */
+/* PTE flags (must match paging.c) */
+#define PTE_PRESENT   (1ULL << 0)
+#define PTE_WRITABLE  (1ULL << 1)
+#define PTE_NX        (1ULL << 63)
+
+/* ── Virtual address allocator for Win32 VirtualAlloc ────────── */
 /*
- * Track base→size for VirtualAlloc/VirtualFree.
- * Windows MEM_RELEASE with RegionSize=0 means "free the entire region"
- * as recorded at allocation time.  Without this table we'd only free 1 page.
+ * Win32 VirtualAlloc semantics: each allocation returns a UNIQUE virtual
+ * address mapped to freshly zeroed pages.  Previous implementation used
+ * identity-mapped mem_alloc_pages which recycled physical addresses,
+ * causing live data destruction (FName::Names bug in UT99).
+ *
+ * Fix: allocate physical pages + map at unique VA via paging_map_page().
+ * VA range: 0x40000000–0x7FFF0000 (Win32 user heap region, below 2GB).
  */
+#define WIN32_VA_BASE  0x40000000ULL
+#define WIN32_VA_LIMIT 0x7FFF0000ULL
+
+static uint64_t win32_va_next = WIN32_VA_BASE;
+
+/* Track VA→phys mapping for cleanup on VirtualFree */
 #define VM_TRACK_MAX 256
 
 typedef struct {
-    PVOID  base;
-    SIZE_T size;   /* rounded-up page-aligned size */
+    uint64_t va;
+    uint64_t phys;
+    SIZE_T   size;
 } vm_track_entry_t;
 
 static vm_track_entry_t vm_track[VM_TRACK_MAX];
 static int vm_track_count = 0;
 
-static void vm_track_add(PVOID base, SIZE_T size)
+static void vm_track_add(uint64_t va, uint64_t phys, SIZE_T size)
 {
-    /* Update existing entry if same base (recommit / grow) */
     for (int i = 0; i < vm_track_count; i++) {
-        if (vm_track[i].base == base) {
+        if (vm_track[i].va == va) {
             if (size > vm_track[i].size)
                 vm_track[i].size = size;
             return;
         }
     }
     if (vm_track_count < VM_TRACK_MAX) {
-        vm_track[vm_track_count].base = base;
+        vm_track[vm_track_count].va   = va;
+        vm_track[vm_track_count].phys = phys;
         vm_track[vm_track_count].size = size;
         vm_track_count++;
     }
 }
 
-static SIZE_T vm_track_remove(PVOID base)
+static SIZE_T vm_track_remove(uint64_t va, uint64_t *out_phys)
 {
     for (int i = 0; i < vm_track_count; i++) {
-        if (vm_track[i].base == base) {
+        if (vm_track[i].va == va) {
             SIZE_T size = vm_track[i].size;
+            if (out_phys) *out_phys = vm_track[i].phys;
             vm_track[i] = vm_track[--vm_track_count];
             return size;
         }
     }
-    return 0;  /* not found */
+    if (out_phys) *out_phys = 0;
+    return 0;
+}
+
+/* Forward declaration (defined below with other nt_* helpers) */
+static inline void nt_memset(void *s, int c, SIZE_T n);
+
+/* Allocate VA range and map physical pages into it */
+static PVOID win32_va_alloc(SIZE_T size, uint64_t *out_phys)
+{
+    uint64_t pages = size / 4096;
+    if (pages == 0) return NULL;
+
+    void *phys = mem_alloc_pages(pages);
+    if (!phys) return NULL;
+
+    uint64_t va = win32_va_next;
+    if (va + size > WIN32_VA_LIMIT) {
+        mem_free_pages(phys, pages);
+        return NULL;
+    }
+    win32_va_next = va + size;
+
+    /* Map each 4KB page: VA → PA */
+    uint64_t pa = (uint64_t)phys;
+    for (uint64_t i = 0; i < pages; i++) {
+        paging_map_page(va + i * 4096, pa + i * 4096,
+                        PTE_PRESENT | PTE_WRITABLE);
+    }
+
+    /* Zero via the new VA — safe, this address is fresh */
+    nt_memset((void *)va, 0, size);
+
+    if (out_phys) *out_phys = pa;
+    return (PVOID)va;
 }
 
 /* ── Per-process state ──────────────────────────────────────── */
@@ -409,6 +461,7 @@ NTSTATUS sys_NtAllocateVirtualMemory(ULONG_PTR *args)
         return STATUS_INVALID_PARAMETER;
 
     PVOID addr = NULL;
+    uint64_t phys = 0;
 
     if (*BaseAddress && (AllocationType & MEM_COMMIT)) {
         /* Fixed address — recommit already-mapped pages.
@@ -416,20 +469,15 @@ NTSTATUS sys_NtAllocateVirtualMemory(ULONG_PTR *args)
          * This is critical for UE1's TArray allocator which uses
          * VirtualAlloc(ptr, size, MEM_COMMIT) to grow arrays. */
         addr = *BaseAddress;
+        phys = 0;  /* no new physical alloc */
     } else {
-        addr = mem_alloc_pages(pages);
+        /* Allocate fresh VA + physical pages, zeroed via new VA */
+        addr = win32_va_alloc(size, &phys);
         if (!addr)
             return STATUS_NO_MEMORY;
-        /* nt_memset(addr, 0, size);  -- DISABLED: destroys live
-         * FMallocWindows sub-allocations when mem_alloc_pages returns
-         * recently-freed pages (root cause of FName::Names NULL entries).
-         * Boot pages are already zero from UEFI; re-allocated pages carry
-         * stale data from the same process which is fine.
-         * TODO: re-enable when kernel has proper virtual address space. */
     }
 
-    /* Track allocation for proper MEM_RELEASE with size=0 */
-    vm_track_add(addr, size);
+    vm_track_add((uint64_t)addr, phys, size);
 
     *BaseAddress = addr;
     *RegionSize  = size;
@@ -453,19 +501,13 @@ NTSTATUS sys_NtFreeVirtualMemory(ULONG_PTR *args)
         return STATUS_INVALID_PARAMETER;
 
     if (FreeType & MEM_RELEASE) {
-        /*
-         * Windows semantics: MEM_RELEASE with RegionSize=0 frees the
-         * entire region as recorded at allocation time.  With non-zero
-         * RegionSize, frees that many bytes (but we still use tracked size
-         * as minimum to avoid partial leaks).
-         */
-        SIZE_T tracked = vm_track_remove(*BaseAddress);
+        uint64_t phys = 0;
+        SIZE_T tracked = vm_track_remove((uint64_t)*BaseAddress, &phys);
         SIZE_T size;
 
         if (RegionSize && *RegionSize) {
             size = *RegionSize;
             size = (size + 0xFFF) & ~0xFFFULL;
-            /* Use whichever is larger to avoid leaking pages */
             if (tracked > size) size = tracked;
         } else {
             size = tracked ? tracked : 4096;
@@ -474,7 +516,14 @@ NTSTATUS sys_NtFreeVirtualMemory(ULONG_PTR *args)
         uint64_t pages = size / 4096;
         if (pages == 0) pages = 1;
 
-        mem_free_pages(*BaseAddress, pages);
+        /* Unmap VA pages from page tables */
+        uint64_t va = (uint64_t)*BaseAddress;
+        for (uint64_t i = 0; i < pages; i++)
+            paging_unmap_page(va + i * 4096);
+
+        /* Free the physical pages */
+        if (phys)
+            mem_free_pages((void *)phys, pages);
 
         nt_log_hex("NtFreeVirtualMemory: ", (ULONGLONG)*BaseAddress);
         nt_log_hex("  size = ", size);

@@ -38,10 +38,15 @@ extern void  proc_exit(int32_t code);
 
 /* ── PE allocator callbacks (used by pe.c) ──────────────────── */
 
+extern int paging_map_page(uint64_t virt, uint64_t phys, uint64_t flags);
+extern int paging_unmap_page(uint64_t virt);
+#define PTE_PRESENT  (1ULL << 0)
+#define PTE_WRITABLE (1ULL << 1)
+
 PVOID pe_alloc(PVOID preferred, SIZE_T size)
 {
+    uint64_t pages = (size + 0xFFF) / 4096;
 #ifdef TEST_HARNESS
-    /* In test harness, try to mmap at preferred address for fixed-base PEs */
     #include <sys/mman.h>
     if (preferred) {
         void *p = mmap(preferred, size, PROT_READ | PROT_WRITE | PROT_EXEC,
@@ -49,17 +54,33 @@ PVOID pe_alloc(PVOID preferred, SIZE_T size)
         if (p != MAP_FAILED)
             return p;
     }
-#else
-    (void)preferred; /* identity-mapped, can't guarantee address */
-#endif
-    uint64_t pages = (size + 0xFFF) / 4096;
     return mem_alloc_pages(pages);
+#else
+    void *phys = mem_alloc_pages(pages);
+    if (!phys) return NULL;
+
+    if (preferred) {
+        /* Map physical pages at the PE's preferred ImageBase */
+        uint64_t va = (uint64_t)preferred;
+        uint64_t pa = (uint64_t)phys;
+        for (uint64_t i = 0; i < pages; i++)
+            paging_map_page(va + i * 4096, pa + i * 4096,
+                            PTE_PRESENT | PTE_WRITABLE);
+        return preferred;
+    }
+    /* No preference — return identity-mapped phys addr */
+    return phys;
+#endif
 }
 
 void pe_free(PVOID addr, SIZE_T size)
 {
     uint64_t pages = (size + 0xFFF) / 4096;
-    mem_free_pages(addr, pages);
+    /* If this was a mapped PE, unmap the VA pages */
+    for (uint64_t i = 0; i < pages; i++)
+        paging_unmap_page((uint64_t)addr + i * 4096);
+    /* Note: physical pages leak here — pe_free is only called on error
+     * or process exit where the entire address space is torn down. */
 }
 
 void pe_log(const char *msg)
