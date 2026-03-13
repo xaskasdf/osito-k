@@ -79,7 +79,7 @@ docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
 PASSTHROUGH_ARGS=""
 SN740_BDF="0000:01:00.0"
 SN740_VID="15b7"
-SN740_PID="5017"
+SN740_PID="5016"
 
 if [ "$PASSTHROUGH" = "1" ]; then
     info "Setting up NVMe passthrough (SN740 @ $SN740_BDF)..."
@@ -152,6 +152,16 @@ fi
 
 SERIAL_LOG="/osito-k/arch/x86/build/serial.log"
 
+# VFIO passthrough: use 1G RAM (VFIO pins all guest memory) and skip
+# virtual xHCI (QEMU assigns adjacent BARs → BAR collision with NVMe VFIO)
+if [ "$PASSTHROUGH" = "1" ]; then
+    QEMU_MEM="1G"
+    USB_ARGS=""
+else
+    QEMU_MEM="4G"
+    USB_ARGS="-device qemu-xhci,id=usb -device usb-kbd,bus=usb.0 -device usb-mouse,bus=usb.0"
+fi
+
 QEMU_CMD="qemu-system-x86_64 \
     -enable-kvm \
     -cpu host \
@@ -159,14 +169,12 @@ QEMU_CMD="qemu-system-x86_64 \
     -drive file=/osito-k/arch/x86/build/esp.img,format=raw,if=ide \
     $NVME_QEMU_ARGS \
     $VFIO_QEMU_ARGS \
-    -m 4G \
+    -m $QEMU_MEM \
     -machine q35 \
     -smp 4 \
     -device e1000e,netdev=net0 \
     -netdev user,id=net0,hostfwd=udp::7777-:7777 \
-    -device qemu-xhci,id=usb \
-    -device usb-kbd,bus=usb.0 \
-    -device usb-mouse,bus=usb.0 \
+    $USB_ARGS \
     -display none \
     -serial file:$SERIAL_LOG \
     -monitor unix:/tmp/qemu-monitor.sock,server,nowait \
@@ -174,9 +182,14 @@ QEMU_CMD="qemu-system-x86_64 \
 
 # ── Common docker args ────────────────────────────────────────
 
+# VFIO needs unlimited memlock for DMA mapping
+MEMLOCK_ARGS=""
+[ "$PASSTHROUGH" = "1" ] && MEMLOCK_ARGS="--ulimit memlock=-1:-1"
+
 DOCKER_ARGS="--rm --name $CONTAINER_NAME \
     --device /dev/kvm \
     $PASSTHROUGH_ARGS \
+    $MEMLOCK_ARGS \
     -v $REPO_DIR:/osito-k \
     -w /osito-k"
 
