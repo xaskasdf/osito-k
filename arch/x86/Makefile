@@ -147,9 +147,10 @@ $(BUILD)/kernel/tensor_avx2.o: kernel/tensor_avx2.c | $(BUILD)/kernel
 $(BUILD)/kernel/%.o: kernel/%.S | $(BUILD)/kernel
 	$(CC) -c -o $@ $<
 
-# Drivers
+# Drivers — disable auto-vectorization to prevent GCC from generating
+# SSE instructions for MMIO struct copies (KVM can't emulate MMIO→XMM)
 $(BUILD)/drivers/%.o: drivers/%.c | $(BUILD)/drivers
-	$(CC) $(KCFLAGS) -c -o $@ $<
+	$(CC) $(KCFLAGS) -fno-tree-vectorize -c -o $@ $<
 
 # Filesystem
 $(BUILD)/fs/%.o: fs/%.c | $(BUILD)/fs
