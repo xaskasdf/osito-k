@@ -99,22 +99,81 @@ DWORD WINAPI shim_mciSendStringA(const char *cmd, char *ret, UINT retLen,
     return 0; /* success */
 }
 
+/* ── waveOut stubs (Galaxy.dll audio) ──────────────────────── */
+
+static UINT WINAPI shim_waveOutReset(PVOID hwo)       { (void)hwo; return 5; /* MMSYSERR_ERROR */ }
+static UINT WINAPI shim_waveOutUnprepareHeader(PVOID hwo, PVOID hdr, UINT sz)
+    { (void)hwo; (void)hdr; (void)sz; return 0; }
+static UINT WINAPI shim_waveOutGetPosition(PVOID hwo, PVOID mmt, UINT sz)
+    { (void)hwo; if (mmt) memset(mmt, 0, sz); return 0; }
+static UINT WINAPI shim_waveOutGetDevCapsA(UINT dev, PVOID caps, UINT sz)
+    { (void)dev; if (caps) memset(caps, 0, sz); return 5; }
+static UINT WINAPI shim_waveOutOpen(PVOID *phwo, UINT dev, PVOID fmt, ULONG_PTR cb,
+                                     ULONG_PTR inst, DWORD flags)
+    { (void)dev; (void)fmt; (void)cb; (void)inst; (void)flags;
+      if (phwo) *phwo = NULL; return 5; /* MMSYSERR_ERROR — no audio */ }
+static UINT WINAPI shim_waveOutClose(PVOID hwo)       { (void)hwo; return 0; }
+static UINT WINAPI shim_waveOutWrite(PVOID hwo, PVOID hdr, UINT sz)
+    { (void)hwo; (void)hdr; (void)sz; return 5; }
+static UINT WINAPI shim_waveOutPrepareHeader(PVOID hwo, PVOID hdr, UINT sz)
+    { (void)hwo; (void)hdr; (void)sz; return 0; }
+
+/* ── aux/mixer stubs ──────────────────────────────────────── */
+
+static UINT WINAPI shim_auxGetNumDevs(void)    { return 0; }
+static UINT WINAPI shim_auxGetDevCapsA(UINT dev, PVOID caps, UINT sz)
+    { (void)dev; if (caps) memset(caps, 0, sz); return 5; }
+static UINT WINAPI shim_auxSetVolume(UINT dev, DWORD vol)
+    { (void)dev; (void)vol; return 0; }
+
+static UINT WINAPI shim_mixerGetNumDevs(void)  { return 0; }
+static UINT WINAPI shim_mixerGetControlDetailsA(PVOID hmx, PVOID det, DWORD flags)
+    { (void)hmx; (void)det; (void)flags; return 5; }
+static UINT WINAPI shim_mixerGetDevCapsA(UINT dev, PVOID caps, UINT sz)
+    { (void)dev; if (caps) memset(caps, 0, sz); return 5; }
+static UINT WINAPI shim_mixerGetLineInfoA(PVOID hmx, PVOID info, DWORD flags)
+    { (void)hmx; (void)info; (void)flags; return 5; }
+static UINT WINAPI shim_mixerSetControlDetails(PVOID hmx, PVOID det, DWORD flags)
+    { (void)hmx; (void)det; (void)flags; return 5; }
+
+/* ── joyGetPosEx ──────────────────────────────────────────── */
+
+static UINT WINAPI shim_joyGetPosEx(UINT id, PVOID info)
+    { (void)id; (void)info; return 167; /* JOYERR_UNPLUGGED */ }
+
 /* ── Export table ──────────────────────────────────────────── */
 
 typedef struct { const char *name; PVOID func; } SHIM_EXPORT;
 
 static const SHIM_EXPORT winmm_exports[] = {
-    { "timeGetTime",        (PVOID)shim_timeGetTime },
-    { "timeBeginPeriod",    (PVOID)shim_timeBeginPeriod },
-    { "timeEndPeriod",      (PVOID)shim_timeEndPeriod },
-    { "timeSetEvent",       (PVOID)shim_timeSetEvent },
-    { "timeKillEvent",      (PVOID)shim_timeKillEvent },
-    { "joyGetNumDevs",      (PVOID)shim_joyGetNumDevs },
-    { "joyGetDevCapsA",     (PVOID)shim_joyGetDevCapsA },
-    { "PlaySoundA",         (PVOID)shim_PlaySoundA },
-    { "waveOutGetNumDevs",  (PVOID)shim_waveOutGetNumDevs },
-    { "mciSendCommandA",    (PVOID)shim_mciSendCommandA },
-    { "mciSendStringA",     (PVOID)shim_mciSendStringA },
+    { "timeGetTime",              (PVOID)shim_timeGetTime },
+    { "timeBeginPeriod",          (PVOID)shim_timeBeginPeriod },
+    { "timeEndPeriod",            (PVOID)shim_timeEndPeriod },
+    { "timeSetEvent",             (PVOID)shim_timeSetEvent },
+    { "timeKillEvent",            (PVOID)shim_timeKillEvent },
+    { "joyGetNumDevs",            (PVOID)shim_joyGetNumDevs },
+    { "joyGetDevCapsA",           (PVOID)shim_joyGetDevCapsA },
+    { "joyGetPosEx",              (PVOID)shim_joyGetPosEx },
+    { "PlaySoundA",               (PVOID)shim_PlaySoundA },
+    { "waveOutGetNumDevs",        (PVOID)shim_waveOutGetNumDevs },
+    { "waveOutReset",             (PVOID)shim_waveOutReset },
+    { "waveOutUnprepareHeader",   (PVOID)shim_waveOutUnprepareHeader },
+    { "waveOutGetPosition",       (PVOID)shim_waveOutGetPosition },
+    { "waveOutGetDevCapsA",       (PVOID)shim_waveOutGetDevCapsA },
+    { "waveOutOpen",              (PVOID)shim_waveOutOpen },
+    { "waveOutClose",             (PVOID)shim_waveOutClose },
+    { "waveOutWrite",             (PVOID)shim_waveOutWrite },
+    { "waveOutPrepareHeader",     (PVOID)shim_waveOutPrepareHeader },
+    { "auxGetNumDevs",            (PVOID)shim_auxGetNumDevs },
+    { "auxGetDevCapsA",           (PVOID)shim_auxGetDevCapsA },
+    { "auxSetVolume",             (PVOID)shim_auxSetVolume },
+    { "mixerGetNumDevs",          (PVOID)shim_mixerGetNumDevs },
+    { "mixerGetControlDetailsA",  (PVOID)shim_mixerGetControlDetailsA },
+    { "mixerGetDevCapsA",         (PVOID)shim_mixerGetDevCapsA },
+    { "mixerGetLineInfoA",        (PVOID)shim_mixerGetLineInfoA },
+    { "mixerSetControlDetails",   (PVOID)shim_mixerSetControlDetails },
+    { "mciSendCommandA",          (PVOID)shim_mciSendCommandA },
+    { "mciSendStringA",           (PVOID)shim_mciSendStringA },
     { NULL, NULL }
 };
 

@@ -454,6 +454,21 @@ UINT    WINAPI RegisterWindowMessageA(PCSTR lpString);
 UINT    WINAPI RegisterWindowMessageW(PCWSTR lpString);
 BOOL    WINAPI PostMessageW(HWND hWnd, DWORD Msg, WPARAM wParam, LPARAM lParam);
 
+/* Additional stubs */
+BOOL  WINAPI EnableWindow(HWND hWnd, BOOL bEnable);
+HMENU WINAPI GetMenu(HWND hWnd);
+DWORD WINAPI GetMessageTime(void);
+HWND  WINAPI GetFocus(void);
+BOOL  WINAPI IsWindowVisible(HWND hWnd);
+int   WINAPI MapWindowPoints(HWND hWndFrom, HWND hWndTo, LPPOINT lpPoints, UINT cPoints);
+BOOL  WINAPI RegisterHotKey(HWND hWnd, int id, UINT fsModifiers, UINT vk);
+BOOL  WINAPI SetMenu(HWND hWnd, HMENU hMenu);
+HWND  WINAPI SetParent(HWND hWndChild, HWND hWndNewParent);
+HWND  WINAPI SetActiveWindow(HWND hWnd);
+BOOL  WINAPI SystemParametersInfoW(UINT uiAction, UINT uiParam, PVOID pvParam, UINT fWinIni);
+BOOL  WINAPI UnregisterHotKey(HWND hWnd, int id);
+BOOL  WINAPI ValidateRect(HWND hWnd, const RECT *lpRect);
+
 /* ── Shim init / resolve ───────────────────────────────────── */
 
 PVOID user32_shim_init(void);

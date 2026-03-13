@@ -288,7 +288,9 @@ int osfs2_read(osfs2_file_t *file, uint64_t offset, void *buf, uint64_t len)
     if (offset + len > file->size) return -1;
 
     uint64_t abs_offset = ((uint64_t)file->start_block << OSFS2_BLOCK_SHIFT) + offset;
-    return osfs2_part_read(abs_offset, buf, len);
+    int rc = osfs2_part_read(abs_offset, buf, len);
+    if (rc < 0) return -1;
+    return (int)len;  /* nvme_read_bytes returns 0 on success, not byte count */
 }
 
 /* ── Read a full block from a file ───────────────────────────── */
@@ -500,6 +502,18 @@ uint32_t osfs2_file_count(void) { return mounted ? superblock.file_count : 0; }
 const char *osfs2_label(void) { return mounted ? superblock.label : ""; }
 uint64_t osfs2_file_size(osfs2_file_t *file) { return file ? file->size : 0; }
 const char *osfs2_file_name(osfs2_file_t *file) { return file ? file->name : NULL; }
+osfs2_file_t *osfs2_file_by_index(uint32_t idx)
+{
+    if (!mounted) return NULL;
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < OSFS2_MAX_FILES; i++) {
+        if (file_table[i].flags & OSFS2_FLAG_VALID) {
+            if (n == idx) return &file_table[i];
+            n++;
+        }
+    }
+    return NULL;
+}
 uint32_t osfs2_free_blocks(void) {
     if (!mounted) return 0;
     uint32_t total_data = superblock.total_blocks - OSFS2_DATA_START_BLK;

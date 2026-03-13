@@ -24,6 +24,20 @@ extern void fb_puthex(uint64_t val, int digits);
 /* X-SCHED: scheduler tick (process.c) */
 extern void sched_tick(void *frame);
 
+/* Paging (paging.c) */
+extern int  paging_set_flags(uint64_t virt, uint64_t flags);
+#define PTE_PRESENT  (1ULL << 0)
+#define PTE_WRITABLE (1ULL << 1)
+#define PTE_GLOBAL   (1ULL << 8)
+
+/* NULL page write-through: page 0 is read-only+NX. When compat32 code
+ * writes to NULL (e.g., FString copies), we temporarily make it writable,
+ * set TF (single-step), let the write execute, then in #DB re-protect
+ * and re-zero the page. This prevents corruption that turns NULL reads
+ * from 0 into garbage values like 1. */
+volatile int g_null_page_dirty = 0;
+#define PTE_NX (1ULL << 63)
+
 /* Process management (process.c) */
 extern void proc_exit(int32_t code);
 extern int  proc_exception_kill(int32_t code);
@@ -386,9 +400,68 @@ void isr_handler(interrupt_frame_t *frame)
             return;  /* non-fatal: resume execution */
         }
 
+        /* TF single-step after NULL page write: re-protect + re-zero page 0 */
+        if (g_null_page_dirty) {
+            g_null_page_dirty = 0;
+            frame->rflags &= ~(1ULL << 8);  /* clear TF */
+            /* Re-zero the page and re-protect as read-only+NX */
+            memset((void *)0, 0, 4096);
+            paging_set_flags(0, PTE_PRESENT | PTE_GLOBAL | PTE_NX);
+            __asm__ volatile ("invlpg (%0)" :: "r"((uint64_t)0) : "memory");
+            __asm__ volatile ("mov %0, %%dr6" : : "r"((uint64_t)0));
+            return;
+        }
+
         /* Other debug reasons (single-step etc.) — clear and resume */
         __asm__ volatile ("mov %0, %%dr6" : : "r"((uint64_t)0));
         return;
+    }
+
+    /* #PF on NULL page: page 0 is read-only+NX.
+     * - WRITE fault: temporarily make writable, set TF, let it write, re-protect in #DB
+     * - INSTRUCTION-FETCH: NULL function pointer call — log and crash */
+    if (vec == 14) {
+        uint64_t cr2;
+        __asm__ volatile ("mov %%cr2, %0" : "=r"(cr2));
+
+        /* WRITE fault on page 0: allow it via TF single-step */
+        if (cr2 < 0x1000 && (frame->error_code & 2) && !(frame->error_code & 16)) {
+            /* Make page 0 writable temporarily */
+            paging_set_flags(0, PTE_PRESENT | PTE_WRITABLE | PTE_GLOBAL | PTE_NX);
+            __asm__ volatile ("invlpg (%0)" :: "r"((uint64_t)0) : "memory");
+            /* Set TF to fire #DB after the write instruction completes */
+            frame->rflags |= (1ULL << 8);  /* TF bit */
+            g_null_page_dirty = 1;
+            return;  /* re-execute the write instruction */
+        }
+
+        if (cr2 < 0x1000 && (frame->error_code & 16)) {  /* INSTRUCTION-FETCH on page 0 */
+            /* NULL function pointer call in compat32: simulate RET 0.
+             * Pop the return address from the 32-bit stack and set RIP to it.
+             * Set EAX=0 (return value 0). This makes NULL calls safe. */
+            static int null_call_count = 0;
+            null_call_count++;
+            if (null_call_count <= 10) {
+                serial_puts("[NULL-CALL] addr=0x");
+                serial_puthex(cr2, 4);
+                if (frame->cs == 0x40 || frame->cs == 0x23) {
+                    uint32_t *sp32 = (uint32_t *)(frame->rsp & 0xFFFFFFFF);
+                    serial_puts(" ret=0x");
+                    serial_puthex(sp32[0], 8);
+                }
+                serial_puts(" #");
+                serial_putdec(null_call_count);
+                serial_puts("\n");
+            }
+            if (frame->cs == 0x40 || frame->cs == 0x23) {
+                /* compat32: pop return address, set EAX=0 */
+                uint32_t *sp32 = (uint32_t *)(frame->rsp & 0xFFFFFFFF);
+                frame->rip = sp32[0];  /* return address */
+                frame->rsp += 4;       /* pop */
+                frame->rax = 0;        /* return 0 */
+                return;
+            }
+        }
     }
 
     /* CPU exception (vectors 0-31) */
@@ -482,6 +555,23 @@ void isr_handler(interrupt_frame_t *frame)
         int is_compat_mode = ((frame->cs & 0xFFFF) == 0x0040);
         if (is_compat_mode) {
             serial_puts("  [COMPAT32] 32-bit code — exception in compat mode\n");
+            /* Walk EBP chain to reconstruct call stack (32-bit frames) */
+            uint32_t ebp = (uint32_t)frame->rbp;
+            serial_puts("  Call stack (EBP chain):\n");
+            for (int depth = 0; depth < 16 && ebp >= 0x10000 && ebp < 0x30000000; depth++) {
+                uint32_t *fp = (uint32_t *)(uint64_t)ebp;
+                uint32_t ret_addr = fp[1];
+                uint32_t prev_ebp = fp[0];
+                serial_puts("    [");
+                serial_putdec((uint64_t)depth);
+                serial_puts("] EBP=0x");
+                serial_puthex(ebp, 8);
+                serial_puts(" RET=0x");
+                serial_puthex(ret_addr, 8);
+                serial_puts("\n");
+                if (prev_ebp <= ebp) break;  /* prevent infinite loops */
+                ebp = prev_ebp;
+            }
         }
 
         /* Framebuffer output */

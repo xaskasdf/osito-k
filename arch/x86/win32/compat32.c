@@ -35,7 +35,7 @@ int g_compat32_mode = 0;
 
 #define THUNK_STUB_SIZE  64      /* bytes per thunk stub */
 #define THUNKS_PER_PAGE  (4096 / THUNK_STUB_SIZE)  /* 64 */
-#define THUNK_POOL_PAGES 8       /* 8 pages = 512 thunks */
+#define THUNK_POOL_PAGES 32      /* 32 pages = 2048 thunks */
 
 static uint8_t *thunk_pool = NULL;
 static uint32_t thunk_count = 0;
@@ -1334,18 +1334,21 @@ uint64_t compat32_dispatch(uint32_t thunk_idx, uint32_t *stack_args)
     uint64_t target = t->target_addr;
     uint8_t nargs = t->num_args;
 
-    /* SEH-TRACK: disabled (corruption bug fixed, see X-WIN32) */
-
-    /* Debug: log every INT 0x2E dispatch */
-    serial_puts("[INT2E] #");
-    serial_putdec(thunk_idx);
-    serial_puts(" ");
-    if (t->name) serial_puts(t->name);
-    serial_puts(" (");
-    serial_putdec(nargs);
-    serial_puts(" args, ");
-    serial_puts(t->callconv == CC_CDECL ? "cdecl" : "stdcall");
-    serial_puts(")\n");
+    /* Debug: log INT 0x2E dispatch (throttled to reduce log noise) */
+    {
+        static uint32_t int2e_call_count = 0;
+        int2e_call_count++;
+        /* Log first 200 calls, then every 100th */
+        if (int2e_call_count <= 200 || (int2e_call_count % 100) == 0) {
+            serial_puts("[INT2E] #");
+            serial_putdec(thunk_idx);
+            serial_puts(" ");
+            if (t->name) serial_puts(t->name);
+            serial_puts(" (");
+            serial_putdec(nargs);
+            serial_puts(" args)\n");
+        }
+    }
 
     /*
      * Call the 64-bit shim function with marshaled arguments.

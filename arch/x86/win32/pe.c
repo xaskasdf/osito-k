@@ -26,6 +26,7 @@ extern void  pe_free(PVOID addr, SIZE_T size);
 /* Debug output */
 extern void  pe_log(const char *msg);
 extern void  pe_log_hex(const char *prefix, ULONGLONG val);
+extern void  serial_puts(const char *s); /* for inline logging */
 
 /* Import resolution: look up a function by DLL name + function name.
  * Returns function pointer, or NULL if not found. */
@@ -314,7 +315,15 @@ static NTSTATUS pe_resolve_imports64(BYTE *image_base,
             }
 
             if (!resolved) {
-                pe_log("PE: WARN — unresolved import (stubbed)");
+                serial_puts("PE: WARN unresolved: ");
+                serial_puts(dll_name);
+                serial_puts("!");
+                if (!IMAGE_SNAP_BY_ORDINAL64(int_entry->u1.Ordinal)) {
+                    PIMAGE_IMPORT_BY_NAME n =
+                        (PIMAGE_IMPORT_BY_NAME)(image_base + (ULONG)int_entry->u1.AddressOfData);
+                    serial_puts(n->Name);
+                }
+                serial_puts("\n");
                 resolved = NULL;
             }
 
@@ -364,7 +373,15 @@ static NTSTATUS pe_resolve_imports32(BYTE *image_base,
             }
 
             if (!resolved) {
-                pe_log("PE: WARN — unresolved import (stubbed)");
+                serial_puts("PE: WARN unresolved: ");
+                serial_puts(dll_name);
+                serial_puts("!");
+                if (!IMAGE_SNAP_BY_ORDINAL32(int_entry->u1.Ordinal)) {
+                    PIMAGE_IMPORT_BY_NAME n =
+                        (PIMAGE_IMPORT_BY_NAME)(image_base + int_entry->u1.AddressOfData);
+                    serial_puts(n->Name);
+                }
+                serial_puts("\n");
                 resolved = NULL;
             }
 

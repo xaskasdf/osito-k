@@ -243,8 +243,20 @@ NTSTATUS sys_NtCreateFile(ULONG_PTR *args)
     unicode_to_ascii(ObjectAttributes->ObjectName, path_buf, sizeof(path_buf));
     const char *path = strip_nt_path(path_buf);
 
-    nt_log("NtCreateFile: ");
-    nt_log(path);
+    serial_puts("[NT] NtCreateFile: '");
+    serial_puts(path);
+    serial_puts("' buf=0x");
+    serial_puthex((uint64_t)(ObjectAttributes->ObjectName ?
+        (uint64_t)ObjectAttributes->ObjectName->Buffer : 0), 16);
+    serial_puts(" len=");
+    serial_puthex((uint64_t)(ObjectAttributes->ObjectName ?
+        ObjectAttributes->ObjectName->Length : 0), 4);
+    serial_puts(" raw[0]=0x");
+    if (ObjectAttributes->ObjectName && ObjectAttributes->ObjectName->Buffer)
+        serial_puthex((uint64_t)ObjectAttributes->ObjectName->Buffer[0], 4);
+    else
+        serial_puts("NULL");
+    serial_puts("\n");
 
     /* Try to find/create in OsitoFS */
     void *osfs_file = osfs2_find(path);
@@ -347,7 +359,24 @@ NTSTATUS sys_NtReadFile(ULONG_PTR *args)
     if (offset + to_read > (ULONGLONG)fobj->size)
         to_read = (ULONG)(fobj->size - offset);
 
+    serial_puts("[NtReadFile] h=0x");
+    serial_puthex((uint64_t)FileHandle, 4);
+    serial_puts(" buf=0x");
+    serial_puthex((uint64_t)Buffer, 8);
+    serial_puts(" len=");
+    serial_puthex(to_read, 4);
+    serial_puts(" off=");
+    serial_puthex(offset, 8);
+    serial_puts(" fsz=");
+    serial_puthex(fobj->size, 8);
+    serial_puts("\n");
+
     int result = osfs2_read(fobj->osfs_file, (uint64_t)offset, Buffer, to_read);
+
+    serial_puts("[NtReadFile] result=");
+    serial_puthex((uint64_t)(int64_t)result, 8);
+    serial_puts("\n");
+
     if (result < 0)
         return STATUS_UNSUCCESSFUL;
 
@@ -482,8 +511,15 @@ NTSTATUS sys_NtAllocateVirtualMemory(ULONG_PTR *args)
     *BaseAddress = addr;
     *RegionSize  = size;
 
-    nt_log_hex("NtAllocateVirtualMemory: ", (ULONGLONG)addr);
-    nt_log_hex("  size = ", size);
+    /* Throttle VA alloc logging to reduce noise */
+    {
+        static int va_log_count = 0;
+        va_log_count++;
+        if (va_log_count <= 10 || (va_log_count % 50) == 0) {
+            nt_log_hex("NtAllocateVirtualMemory: ", (ULONGLONG)addr);
+            nt_log_hex("  size = ", size);
+        }
+    }
 
     return STATUS_SUCCESS;
 }
@@ -500,33 +536,28 @@ NTSTATUS sys_NtFreeVirtualMemory(ULONG_PTR *args)
     if (!BaseAddress || !*BaseAddress)
         return STATUS_INVALID_PARAMETER;
 
+    nt_log_hex("NtFreeVirtualMemory: ", (ULONGLONG)*BaseAddress);
+    nt_log_hex("  FreeType = ", FreeType);
+
+    if (FreeType & MEM_DECOMMIT) {
+        /* MEM_DECOMMIT: pages become inaccessible but VA stays reserved.
+         * For now, keep pages mapped (no-op) — decommit would require
+         * tracking reserved vs committed state per page. */
+        SIZE_T size = (RegionSize && *RegionSize) ? *RegionSize : 4096;
+        nt_log_hex("  decommit size = ", size);
+        return STATUS_SUCCESS;
+    }
+
     if (FreeType & MEM_RELEASE) {
         uint64_t phys = 0;
         SIZE_T tracked = vm_track_remove((uint64_t)*BaseAddress, &phys);
-        SIZE_T size;
 
-        if (RegionSize && *RegionSize) {
-            size = *RegionSize;
-            size = (size + 0xFFF) & ~0xFFFULL;
-            if (tracked > size) size = tracked;
-        } else {
-            size = tracked ? tracked : 4096;
-        }
-
-        uint64_t pages = size / 4096;
-        if (pages == 0) pages = 1;
-
-        /* Unmap VA pages from page tables */
-        uint64_t va = (uint64_t)*BaseAddress;
-        for (uint64_t i = 0; i < pages; i++)
-            paging_unmap_page(va + i * 4096);
-
-        /* Free the physical pages */
-        if (phys)
-            mem_free_pages((void *)phys, pages);
-
-        nt_log_hex("NtFreeVirtualMemory: ", (ULONGLONG)*BaseAddress);
-        nt_log_hex("  size = ", size);
+        /* Keep pages mapped — Win32 apps may access freed VA briefly
+         * (FMallocWindows, UE1 TArray realloc patterns). Windows doesn't
+         * tear down PTEs immediately on MEM_RELEASE, and game code relies
+         * on this. We leak the physical pages; PE32 compat doesn't need
+         * to be memory-efficient. */
+        nt_log_hex("  release (lazy) size = ", tracked);
 
         *BaseAddress = NULL;
         if (RegionSize) *RegionSize = 0;

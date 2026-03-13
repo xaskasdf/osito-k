@@ -76,6 +76,10 @@ HANDLE WINAPI CreateFileA(PCSTR lpFileName, DWORD dwDesiredAccess,
     (void)dwFlagsAndAttributes;
     (void)hTemplateFile;
 
+    serial_puts("[CreateFileA] '");
+    if (lpFileName) serial_puts(lpFileName);
+    serial_puts("'\n");
+
     /* Build NT path from Win32 path */
     WCHAR name_buf[260];
     ascii_to_unicode_buf(lpFileName, name_buf, 260);
@@ -125,6 +129,19 @@ HANDLE WINAPI CreateFileW(PCWSTR lpFileName, DWORD dwDesiredAccess,
     (void)lpSecurityAttributes;
     (void)dwFlagsAndAttributes;
     (void)hTemplateFile;
+
+    /* Log wide filename as ASCII for debug */
+    serial_puts("[CreateFileW] ptr=0x");
+    serial_puthex((uint64_t)lpFileName, 16);
+    serial_puts(" '");
+    if (lpFileName) {
+        for (int i = 0; i < 80 && lpFileName[i]; i++) {
+            char c = (char)(lpFileName[i] & 0xFF);
+            char buf[2] = { c, 0 };
+            serial_puts(buf);
+        }
+    }
+    serial_puts("'\n");
 
     UNICODE_STRING name;
     RtlInitUnicodeString(&name, lpFileName);
@@ -2208,6 +2225,185 @@ DWORD WINAPI GetPrivateProfileSectionNamesA(PSTR lpszReturnBuffer,
     return 0;
 }
 
+/* ── Stubs for MSVCRT.dll CRT init dependencies ───────────── */
+
+/* These are called by the real MSVCRT.dll during CRT initialization.
+ * They need to exist as stubs to prevent NULL IAT entries → crashes. */
+
+static BOOL WINAPI HeapCompact_stub(HANDLE hHeap, DWORD dwFlags)
+{
+    (void)hHeap; (void)dwFlags;
+    return 1;  /* report success */
+}
+
+static BOOL WINAPI HeapWalk_stub(HANDLE hHeap, void *lpEntry)
+{
+    (void)hHeap; (void)lpEntry;
+    g_last_error = 0x12; /* ERROR_NO_MORE_ITEMS */
+    sync_last_error();
+    return FALSE;
+}
+
+static BOOL WINAPI ReadConsoleA_stub(HANDLE h, void *buf, DWORD n, DWORD *read, void *r)
+{
+    (void)h; (void)buf; (void)n; (void)r;
+    if (read) *read = 0;
+    return FALSE;
+}
+
+static BOOL WINAPI SetConsoleMode_stub(HANDLE h, DWORD mode)
+{
+    (void)h; (void)mode;
+    return TRUE;
+}
+
+static BOOL WINAPI GetConsoleMode_stub(HANDLE h, DWORD *mode)
+{
+    (void)h;
+    if (mode) *mode = 0x3; /* ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT */
+    return TRUE;
+}
+
+static BOOL WINAPI SetEndOfFile_stub(HANDLE h)
+{
+    (void)h;
+    return TRUE;
+}
+
+typedef struct _BY_HANDLE_FILE_INFORMATION {
+    DWORD dwFileAttributes;
+    uint64_t ftCreationTime;
+    uint64_t ftLastAccessTime;
+    uint64_t ftLastWriteTime;
+    DWORD dwVolumeSerialNumber;
+    DWORD nFileSizeHigh;
+    DWORD nFileSizeLow;
+    DWORD nNumberOfLinks;
+    DWORD nFileIndexHigh;
+    DWORD nFileIndexLow;
+} BY_HANDLE_FILE_INFORMATION;
+
+static BOOL WINAPI GetFileInformationByHandle_stub(HANDLE h, BY_HANDLE_FILE_INFORMATION *info)
+{
+    (void)h;
+    if (info) memset(info, 0, sizeof(*info));
+    return TRUE;
+}
+
+static BOOL WINAPI PeekNamedPipe_stub(HANDLE h, void *buf, DWORD sz,
+                                       DWORD *read, DWORD *avail, DWORD *left)
+{
+    (void)h; (void)buf; (void)sz;
+    if (read)  *read = 0;
+    if (avail) *avail = 0;
+    if (left)  *left = 0;
+    return TRUE;
+}
+
+typedef struct _INPUT_RECORD { WORD EventType; char pad[18]; } INPUT_RECORD;
+
+static BOOL WINAPI ReadConsoleInputA_stub(HANDLE h, INPUT_RECORD *buf, DWORD len, DWORD *read)
+{
+    (void)h; (void)buf; (void)len;
+    if (read) *read = 0;
+    return FALSE;
+}
+
+static BOOL WINAPI PeekConsoleInputA_stub(HANDLE h, INPUT_RECORD *buf, DWORD len, DWORD *read)
+{
+    (void)h; (void)buf; (void)len;
+    if (read) *read = 0;
+    return TRUE;
+}
+
+static BOOL WINAPI GetNumberOfConsoleInputEvents_stub(HANDLE h, DWORD *num)
+{
+    (void)h;
+    if (num) *num = 0;
+    return TRUE;
+}
+
+static BOOL WINAPI LockFile_stub(HANDLE h, DWORD lo, DWORD hi, DWORD nlo, DWORD nhi)
+{
+    (void)h; (void)lo; (void)hi; (void)nlo; (void)nhi;
+    return TRUE;
+}
+
+static BOOL WINAPI UnlockFile_stub(HANDLE h, DWORD lo, DWORD hi, DWORD nlo, DWORD nhi)
+{
+    (void)h; (void)lo; (void)hi; (void)nlo; (void)nhi;
+    return TRUE;
+}
+
+static BOOL WINAPI CreatePipe_stub(HANDLE *hRead, HANDLE *hWrite,
+                                    void *lpAttr, DWORD nSize)
+{
+    (void)lpAttr; (void)nSize;
+    if (hRead)  *hRead  = (HANDLE)(ULONG_PTR)0xDEAD0001;
+    if (hWrite) *hWrite = (HANDLE)(ULONG_PTR)0xDEAD0002;
+    return TRUE;
+}
+
+static BOOL WINAPI SetFileTime_stub(HANDLE h, const void *c, const void *a, const void *w)
+{
+    (void)h; (void)c; (void)a; (void)w;
+    return TRUE;
+}
+
+static BOOL WINAPI LocalFileTimeToFileTime_stub(const void *local, void *utc)
+{
+    if (utc) memset(utc, 0, 8);
+    (void)local;
+    return TRUE;
+}
+
+static BOOL WINAPI SystemTimeToFileTime_stub(const void *st, void *ft)
+{
+    if (ft) memset(ft, 0, 8);
+    (void)st;
+    return TRUE;
+}
+
+static void WINAPI GetSystemTime_stub(SYSTEMTIME *st)
+{
+    if (st) {
+        memset(st, 0, sizeof(*st));
+        st->wYear = 2026;
+        st->wMonth = 3;
+        st->wDay = 13;
+    }
+}
+
+static BOOL WINAPI SetLocalTime_stub(const SYSTEMTIME *st)
+{
+    (void)st;
+    return TRUE;
+}
+
+static BOOL WINAPI GlobalFree_stub(void *hMem)
+{
+    (void)hMem;
+    return 0;  /* success = NULL */
+}
+
+static BOOL WINAPI ReleaseMutex_stub(HANDLE h)
+{
+    (void)h;
+    return TRUE;
+}
+
+static void WINAPI OutputDebugStringW_stub(const WCHAR *s)
+{
+    (void)s;
+    /* Silent */
+}
+
+static DWORD WINAPI GlobalAddAtomW_stub(const WCHAR *s)
+{
+    (void)s;
+    return 0xC000;  /* fake atom */
+}
+
 /* ── Export resolution table ────────────────────────────────── */
 
 typedef struct {
@@ -2413,6 +2609,30 @@ static const K32_EXPORT k32_exports[] = {
     { "GetDriveTypeA",           (PVOID)GetDriveTypeA },
     { "GetDriveTypeW",           (PVOID)GetDriveTypeW },
     { "GetDiskFreeSpaceA",       (PVOID)GetDiskFreeSpaceA },
+    /* MSVCRT CRT init stubs */
+    { "HeapCompact",             (PVOID)HeapCompact_stub },
+    { "HeapWalk",                (PVOID)HeapWalk_stub },
+    { "ReadConsoleA",            (PVOID)ReadConsoleA_stub },
+    { "SetConsoleMode",          (PVOID)SetConsoleMode_stub },
+    { "GetConsoleMode",          (PVOID)GetConsoleMode_stub },
+    { "SetEndOfFile",            (PVOID)SetEndOfFile_stub },
+    { "GetFileInformationByHandle",(PVOID)GetFileInformationByHandle_stub },
+    { "PeekNamedPipe",           (PVOID)PeekNamedPipe_stub },
+    { "ReadConsoleInputA",       (PVOID)ReadConsoleInputA_stub },
+    { "PeekConsoleInputA",       (PVOID)PeekConsoleInputA_stub },
+    { "GetNumberOfConsoleInputEvents",(PVOID)GetNumberOfConsoleInputEvents_stub },
+    { "LockFile",                (PVOID)LockFile_stub },
+    { "UnlockFile",              (PVOID)UnlockFile_stub },
+    { "CreatePipe",              (PVOID)CreatePipe_stub },
+    { "SetFileTime",             (PVOID)SetFileTime_stub },
+    { "LocalFileTimeToFileTime", (PVOID)LocalFileTimeToFileTime_stub },
+    { "SystemTimeToFileTime",    (PVOID)SystemTimeToFileTime_stub },
+    { "GetSystemTime",           (PVOID)GetSystemTime_stub },
+    { "SetLocalTime",            (PVOID)SetLocalTime_stub },
+    { "GlobalFree",              (PVOID)GlobalFree_stub },
+    { "ReleaseMutex",            (PVOID)ReleaseMutex_stub },
+    { "OutputDebugStringW",      (PVOID)OutputDebugStringW_stub },
+    { "GlobalAddAtomW",          (PVOID)GlobalAddAtomW_stub },
     { NULL, NULL }
 };
 

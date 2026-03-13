@@ -1690,6 +1690,85 @@ BOOL WINAPI PostMessageW(HWND hWnd, DWORD Msg, WPARAM wParam, LPARAM lParam)
     return TRUE;
 }
 
+/* ── Additional stubs ──────────────────────────────────────── */
+
+BOOL WINAPI EnableWindow(HWND hWnd, BOOL bEnable)
+{
+    (void)hWnd; (void)bEnable;
+    return FALSE; /* window was previously enabled */
+}
+
+HMENU WINAPI GetMenu(HWND hWnd)
+{
+    (void)hWnd;
+    return NULL;
+}
+
+DWORD WINAPI GetMessageTime(void)
+{
+    return 0;
+}
+
+HWND WINAPI GetFocus(void)
+{
+    return NULL;
+}
+
+BOOL WINAPI IsWindowVisible(HWND hWnd)
+{
+    (void)hWnd;
+    return TRUE;
+}
+
+int WINAPI MapWindowPoints(HWND hWndFrom, HWND hWndTo, LPPOINT lpPoints, UINT cPoints)
+{
+    (void)hWndFrom; (void)hWndTo; (void)lpPoints; (void)cPoints;
+    return 0;
+}
+
+BOOL WINAPI RegisterHotKey(HWND hWnd, int id, UINT fsModifiers, UINT vk)
+{
+    (void)hWnd; (void)id; (void)fsModifiers; (void)vk;
+    return FALSE;
+}
+
+BOOL WINAPI SetMenu(HWND hWnd, HMENU hMenu)
+{
+    (void)hWnd; (void)hMenu;
+    return FALSE;
+}
+
+HWND WINAPI SetParent(HWND hWndChild, HWND hWndNewParent)
+{
+    (void)hWndChild; (void)hWndNewParent;
+    return NULL;
+}
+
+HWND WINAPI SetActiveWindow(HWND hWnd)
+{
+    (void)hWnd;
+    return NULL;
+}
+
+BOOL WINAPI SystemParametersInfoW(UINT uiAction, UINT uiParam,
+                                   PVOID pvParam, UINT fWinIni)
+{
+    (void)uiAction; (void)uiParam; (void)pvParam; (void)fWinIni;
+    return FALSE;
+}
+
+BOOL WINAPI UnregisterHotKey(HWND hWnd, int id)
+{
+    (void)hWnd; (void)id;
+    return FALSE;
+}
+
+BOOL WINAPI ValidateRect(HWND hWnd, const RECT *lpRect)
+{
+    (void)hWnd; (void)lpRect;
+    return TRUE;
+}
+
 /* ── Export table ──────────────────────────────────────────── */
 
 typedef struct { const char *name; PVOID func; } SHIM_EXPORT;
@@ -1834,6 +1913,20 @@ static const SHIM_EXPORT user32_exports[] = {
     { "RegisterWindowMessageA", (PVOID)RegisterWindowMessageA },
     { "RegisterWindowMessageW", (PVOID)RegisterWindowMessageW },
     { "PostMessageW",       (PVOID)PostMessageW },
+    /* Additional stubs */
+    { "EnableWindow",           (PVOID)EnableWindow },
+    { "GetMenu",                (PVOID)GetMenu },
+    { "GetMessageTime",         (PVOID)GetMessageTime },
+    { "GetFocus",               (PVOID)GetFocus },
+    { "IsWindowVisible",        (PVOID)IsWindowVisible },
+    { "MapWindowPoints",        (PVOID)MapWindowPoints },
+    { "RegisterHotKey",         (PVOID)RegisterHotKey },
+    { "SetMenu",                (PVOID)SetMenu },
+    { "SetParent",              (PVOID)SetParent },
+    { "SetActiveWindow",        (PVOID)SetActiveWindow },
+    { "SystemParametersInfoW",  (PVOID)SystemParametersInfoW },
+    { "UnregisterHotKey",       (PVOID)UnregisterHotKey },
+    { "ValidateRect",           (PVOID)ValidateRect },
     { NULL, NULL }
 };
 

@@ -332,8 +332,12 @@ PVOID dll_load(const char *dll_name, const BYTE *file_data, SIZE_T file_size)
         }
     }
 
-    /* Call DllMain(DLL_PROCESS_ATTACH) if it has one */
-    if (mod->dll_main && mod->image.IsDLL) {
+    /* Call DllMain(DLL_PROCESS_ATTACH) if it has one.
+     * Skip DllMain for DLLs that have a registered shim — the shim already
+     * provides all CRT/API functions and the real DllMain may crash trying
+     * to initialise Windows-internal data structures (e.g. bundled MSVCRT.dll
+     * tries to init __pioinfo tables that don't exist in OsitoK). */
+    if (mod->dll_main && mod->image.IsDLL && !find_shim(mod->name)) {
         if (mod->image.Is32Bit) {
             /* PE32 DLLs: call DllMain via compat32 callback mechanism.
              * Switches to 32-bit compat mode, calls DllMain(hInstance,

@@ -43,6 +43,35 @@ extern int paging_unmap_page(uint64_t virt);
 #define PTE_PRESENT  (1ULL << 0)
 #define PTE_WRITABLE (1ULL << 1)
 
+/* ── PE VA range tracker (detect ImageBase collisions) ───────── */
+
+#define PE_VA_MAX 32
+static struct {
+    uint64_t base;
+    uint64_t size;
+} pe_va_ranges[PE_VA_MAX];
+static int pe_va_count = 0;
+
+static int pe_va_conflict(uint64_t base, uint64_t size)
+{
+    uint64_t end = base + size;
+    for (int i = 0; i < pe_va_count; i++) {
+        uint64_t rend = pe_va_ranges[i].base + pe_va_ranges[i].size;
+        if (base < rend && end > pe_va_ranges[i].base)
+            return 1;
+    }
+    return 0;
+}
+
+static void pe_va_record(uint64_t base, uint64_t size)
+{
+    if (pe_va_count < PE_VA_MAX) {
+        pe_va_ranges[pe_va_count].base = base;
+        pe_va_ranges[pe_va_count].size = size;
+        pe_va_count++;
+    }
+}
+
 PVOID pe_alloc(PVOID preferred, SIZE_T size)
 {
     uint64_t pages = (size + 0xFFF) / 4096;
@@ -51,11 +80,23 @@ PVOID pe_alloc(PVOID preferred, SIZE_T size)
     if (preferred) {
         void *p = mmap(preferred, size, PROT_READ | PROT_WRITE | PROT_EXEC,
                        MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
-        if (p != MAP_FAILED)
+        if (p != MAP_FAILED) {
+            pe_va_record((uint64_t)p, size);
             return p;
+        }
     }
-    return mem_alloc_pages(pages);
+    void *r = mem_alloc_pages(pages);
+    if (r) pe_va_record((uint64_t)r, size);
+    return r;
 #else
+    /* Check for VA range conflict before mapping at preferred address */
+    if (preferred && pe_va_conflict((uint64_t)preferred, size)) {
+        serial_puts("[pe_alloc] CONFLICT: VA 0x");
+        serial_puthex((uint64_t)preferred, 8);
+        serial_puts(" already occupied, relocating\n");
+        preferred = NULL;  /* force relocation */
+    }
+
     void *phys = mem_alloc_pages(pages);
     if (!phys) return NULL;
 
@@ -63,12 +104,36 @@ PVOID pe_alloc(PVOID preferred, SIZE_T size)
         /* Map physical pages at the PE's preferred ImageBase */
         uint64_t va = (uint64_t)preferred;
         uint64_t pa = (uint64_t)phys;
-        for (uint64_t i = 0; i < pages; i++)
-            paging_map_page(va + i * 4096, pa + i * 4096,
-                            PTE_PRESENT | PTE_WRITABLE);
+        int fail = 0;
+        for (uint64_t i = 0; i < pages; i++) {
+            int r = paging_map_page(va + i * 4096, pa + i * 4096,
+                                    PTE_PRESENT | PTE_WRITABLE);
+            if (r != 0) fail++;
+        }
+        if (fail) {
+            serial_puts("[pe_alloc] WARN: ");
+            serial_puthex(fail, 4);
+            serial_puts("/");
+            serial_puthex(pages, 4);
+            serial_puts(" page maps failed for VA 0x");
+            serial_puthex(va, 16);
+            serial_puts("\n");
+            /* Fall back to identity-mapped phys */
+            pe_va_record((uint64_t)phys, size);
+            return phys;
+        }
+        serial_puts("[pe_alloc] mapped ");
+        serial_puthex(pages, 4);
+        serial_puts(" pages VA 0x");
+        serial_puthex(va, 8);
+        serial_puts(" -> PA 0x");
+        serial_puthex(pa, 8);
+        serial_puts("\n");
+        pe_va_record(va, size);
         return preferred;
     }
     /* No preference — return identity-mapped phys addr */
+    pe_va_record((uint64_t)phys, size);
     return phys;
 #endif
 }
@@ -178,6 +243,75 @@ static void setup_environment(PVOID image_base, int is32bit)
         arch_prctl(ARCH_SET_GS, (unsigned long)&g_teb);
     }
 #endif
+}
+
+/* ── Pre-load all DLLs from filesystem ──────────────────────── */
+/*
+ * Load all .dll files from OsitoFS before the EXE entry point runs.
+ * This ensures all native UE1 classes (IMPLEMENT_CLASS) are registered
+ * during _initterm, so ProcessRegistrants() finds them all.
+ * Without this, dynamic LoadLibrary fails due to FName corruption
+ * (VirtualAlloc identity-map recycling bug).
+ */
+extern void     *osfs2_find(const char *name);
+extern int       osfs2_read(void *file, uint64_t offset, void *buf, uint64_t len);
+extern uint64_t  osfs2_file_size(void *file);
+extern uint32_t  osfs2_file_count(void);
+extern void     *osfs2_file_by_index(uint32_t idx);
+extern const char *osfs2_file_name(void *file);
+
+static int str_ends_with_dll(const char *s)
+{
+    int len = 0;
+    while (s[len]) len++;
+    if (len < 4) return 0;
+    char c0 = s[len-4], c1 = s[len-3], c2 = s[len-2], c3 = s[len-1];
+    if (c0 >= 'A' && c0 <= 'Z') c0 += 32;
+    if (c1 >= 'A' && c1 <= 'Z') c1 += 32;
+    if (c2 >= 'A' && c2 <= 'Z') c2 += 32;
+    if (c3 >= 'A' && c3 <= 'Z') c3 += 32;
+    return c0 == '.' && c1 == 'd' && c2 == 'l' && c3 == 'l';
+}
+
+static void winexec_preload_dlls(void)
+{
+    uint32_t count = osfs2_file_count();
+    int loaded = 0;
+
+    serial_puts("[WINEXEC] pre-loading DLLs from filesystem...\n");
+
+    for (uint32_t i = 0; i < count; i++) {
+        void *f = osfs2_file_by_index(i);
+        if (!f) continue;
+        const char *name = osfs2_file_name(f);
+        if (!name || !str_ends_with_dll(name)) continue;
+
+        /* Skip if already loaded (import DLLs or shim DLLs) */
+        if (dll_find_module(name)) continue;
+
+        uint64_t fsize = osfs2_file_size(f);
+        if (fsize == 0) continue;
+
+        serial_puts("[WINEXEC] preload: ");
+        serial_puts(name);
+        serial_puts("\n");
+
+        uint64_t pages = (fsize + 0xFFF) / 4096;
+        uint8_t *buf = (uint8_t *)mem_alloc_pages(pages);
+        if (!buf) continue;
+
+        osfs2_read(f, 0, buf, fsize);
+        dll_load(name, (const BYTE *)buf, (SIZE_T)fsize);
+        /* Intentionally leak temp buffer — freeing pages allows
+         * mem_alloc_pages to recycle them for VirtualAlloc, which
+         * zero-fills, potentially corrupting live PE32 heap data
+         * (FName::Names entries, UClass objects, etc.) */
+        loaded++;
+    }
+
+    serial_puts("[WINEXEC] preloaded ");
+    serial_puthex(loaded, 2);
+    serial_puts(" DLLs\n");
 }
 
 /* ── Main execution entry ───────────────────────────────────── */
@@ -309,6 +443,9 @@ int winexec_run(const uint8_t *file_data, uint64_t file_size)
         serial_puthex(g_teb32.ExceptionList, 8);
         serial_puts("\n");
     }
+
+    /* Pre-load all DLLs from filesystem (registers native classes) */
+    winexec_preload_dlls();
 
     /* Allocate user stack */
     uint64_t stack_size = info.StackCommit;

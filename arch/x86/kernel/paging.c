@@ -21,6 +21,7 @@ extern void fb_putdec(uint64_t val);
 extern void fb_puthex(uint64_t val, int digits);
 
 extern void *mem_alloc_aligned(uint64_t size, uint64_t alignment);
+extern void *mem_alloc_pages(uint64_t count);
 extern void  mem_free_pages(void *addr, uint64_t count);
 extern int   mem_reserve_range(uint64_t phys, uint64_t count);
 extern uint64_t mem_get_total(void);
@@ -103,12 +104,22 @@ static int paging_map_4k(uint64_t virt, uint64_t phys, uint64_t flags)
         uint64_t large_phys = pd[pd_idx] & 0x000FFFFFFFE00000ULL;
         uint64_t large_flags = pd[pd_idx] & ~(PTE_ADDR_MASK | PTE_LARGE);
         uint64_t *pt = pt_alloc_page();
-        if (!pt) return -1;
+        if (!pt) {
+            serial_puts("[paging] FAIL: pt_alloc for 2MB split at 0x");
+            serial_puthex(virt, 16);
+            serial_puts("\n");
+            return -1;
+        }
         /* Fill PT with 512 identity-mapped 4KB entries */
         for (int i = 0; i < 512; i++)
             pt[i] = (large_phys + i * PAGE_SIZE) | large_flags;
         /* Replace 2MB entry with PT pointer */
         pd[pd_idx] = (uint64_t)pt | PTE_PRESENT | PTE_WRITABLE;
+        serial_puts("[paging] split 2MB @ 0x");
+        serial_puthex(large_phys, 8);
+        serial_puts(" -> PT 0x");
+        serial_puthex((uint64_t)pt, 8);
+        serial_puts("\n");
     }
 
     uint64_t *pt = pt_get_or_create(pd, pd_idx);
@@ -425,6 +436,27 @@ void paging_init(void)
     /* If we get here, paging is working — release old UEFI tables */
     serial_puts("[PAGE] CR3 switch successful — kernel paging active\n");
     free_old_page_tables();
+
+    /* NULL guard: remap VA 0 to a fresh zeroed physical page.
+     * Without this, VA 0 identity-maps to PA 0 (BIOS IVT) which
+     * contains stale vectors like 0x20008 → #GP when dereferenced.
+     * By pointing VA 0 at a fresh zeroed page:
+     * - NULL reads return 0 (safe: terminates hash chains, vtable=0)
+     * - NULL writes go to the fresh page (harmless, don't corrupt BIOS)
+     * - Subsequent reads may see written data, but it's from PE code,
+     *   not BIOS IVT garbage (no 0x8006-style vtable pointers). */
+    {
+        void *guard_phys = mem_alloc_pages(1);
+        if (guard_phys) {
+            memset(guard_phys, 0, PAGE_SIZE);
+            paging_map_4k(0, (uint64_t)guard_phys,
+                          PTE_PRESENT | PTE_GLOBAL | PTE_NX); /* read-only + NX */
+            invlpg(0);
+            serial_puts("[PAGE] Page 0: remapped to fresh zeroed PA 0x");
+            serial_puthex((uint64_t)guard_phys, 8);
+            serial_puts("\n");
+        }
+    }
 
     fb_puts(" Paging: 4-level, ");
     fb_putdec(pt_pages_used * 4);

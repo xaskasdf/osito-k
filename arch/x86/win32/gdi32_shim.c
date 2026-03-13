@@ -234,6 +234,46 @@ BOOL WINAPI GetTextExtentPoint32W(HDC hdc, PCWSTR lpString, int c, PVOID lpSize)
     return TRUE;
 }
 
+/* ── Stubs for additional GDI32 imports ───────────────────── */
+
+static PVOID WINAPI CreateFontA_stub(int h, int w, int esc, int orient, int weight,
+                                      DWORD italic, DWORD underline, DWORD strikeout,
+                                      DWORD charset, DWORD outprec, DWORD clipprec,
+                                      DWORD quality, DWORD pitch, const char *face)
+{
+    (void)h; (void)w; (void)esc; (void)orient; (void)weight;
+    (void)italic; (void)underline; (void)strikeout;
+    (void)charset; (void)outprec; (void)clipprec;
+    (void)quality; (void)pitch; (void)face;
+    return (PVOID)(ULONG_PTR)0xF0F0F001;  /* fake HFONT */
+}
+
+static PVOID WINAPI CreateFontW_stub(int h, int w, int esc, int orient, int weight,
+                                      DWORD italic, DWORD underline, DWORD strikeout,
+                                      DWORD charset, DWORD outprec, DWORD clipprec,
+                                      DWORD quality, DWORD pitch, const WCHAR *face)
+{
+    (void)h; (void)w; (void)esc; (void)orient; (void)weight;
+    (void)italic; (void)underline; (void)strikeout;
+    (void)charset; (void)outprec; (void)clipprec;
+    (void)quality; (void)pitch; (void)face;
+    return (PVOID)(ULONG_PTR)0xF0F0F002;  /* fake HFONT */
+}
+
+static PVOID WINAPI CreateDIBSection_stub(HDC hdc, PVOID pbmi, UINT usage,
+                                           void **ppvBits, PVOID hSection, DWORD offset)
+{
+    (void)hdc; (void)pbmi; (void)usage; (void)hSection; (void)offset;
+    if (ppvBits) *ppvBits = NULL;
+    return NULL;  /* failure */
+}
+
+static DWORD WINAPI GetPixel_stub(HDC hdc, int x, int y)
+{
+    (void)hdc; (void)x; (void)y;
+    return 0x00000000;  /* black pixel */
+}
+
 /* ── Export table ──────────────────────────────────────────── */
 
 typedef struct { const char *name; PVOID func; } SHIM_EXPORT;
@@ -271,6 +311,11 @@ static const SHIM_EXPORT gdi32_exports[] = {
     { "ExtTextOutA",              (PVOID)ExtTextOutA },
     { "GetTextExtentPoint32A",    (PVOID)GetTextExtentPoint32A },
     { "GetTextExtentPoint32W",    (PVOID)GetTextExtentPoint32W },
+    /* Additional stubs */
+    { "CreateFontA",              (PVOID)CreateFontA_stub },
+    { "CreateFontW",              (PVOID)CreateFontW_stub },
+    { "CreateDIBSection",         (PVOID)CreateDIBSection_stub },
+    { "GetPixel",                 (PVOID)GetPixel_stub },
     { NULL, NULL }
 };
 

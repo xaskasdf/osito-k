@@ -29,7 +29,7 @@
 #define GDT_SEL_CODE64  0x38    /* 64-bit code segment (IDT gate CS) */
 
 /* Maximum number of thunked functions */
-#define COMPAT32_MAX_THUNKS  512
+#define COMPAT32_MAX_THUNKS  2048
 
 /* Calling conventions for thunk generation */
 #define CC_STDCALL  0   /* callee cleans stack: ret N  (KERNEL32, USER32, ...) */

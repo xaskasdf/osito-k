@@ -535,6 +535,33 @@ static void wide_to_ansi(char *dst, const WCHAR *src, int max)
 
 /* ── Wide (W) registry API ────────────────────────────────── */
 
+LONG WINAPI RegCreateKeyExW(HKEY hKey, PCWSTR lpSubKey, DWORD Reserved,
+                            PWSTR lpClass, DWORD dwOptions, DWORD samDesired,
+                            PVOID lpSecurityAttributes, PHKEY phkResult,
+                            DWORD *lpdwDisposition)
+{
+    (void)lpClass;
+    char ansi_subkey[MAX_REG_PATH];
+    wide_to_ansi(ansi_subkey, lpSubKey, MAX_REG_PATH);
+    serial_puts("[REG] RegCreateKeyExW -> A: ");
+    serial_puts(ansi_subkey);
+    serial_puts("\n");
+    return RegCreateKeyExA(hKey, ansi_subkey, Reserved, NULL, dwOptions,
+                           samDesired, lpSecurityAttributes, phkResult,
+                           lpdwDisposition);
+}
+
+LONG WINAPI RegSetValueExW(HKEY hKey, PCWSTR lpValueName, DWORD Reserved,
+                           DWORD dwType, const BYTE *lpData, DWORD cbData)
+{
+    char ansi_name[128];
+    wide_to_ansi(ansi_name, lpValueName, 128);
+    serial_puts("[REG] RegSetValueExW -> A: ");
+    serial_puts(ansi_name);
+    serial_puts("\n");
+    return RegSetValueExA(hKey, ansi_name, Reserved, dwType, lpData, cbData);
+}
+
 LONG WINAPI RegOpenKeyExW(HKEY hKey, PCWSTR lpSubKey, DWORD ulOptions,
                           DWORD samDesired, PHKEY phkResult)
 {
@@ -600,6 +627,8 @@ static const SHIM_EXPORT advapi32_exports[] = {
     { "RegEnumValueA",      (PVOID)RegEnumValueA },
     { "RegOpenKeyExW",      (PVOID)RegOpenKeyExW },
     { "RegQueryValueExW",   (PVOID)RegQueryValueExW },
+    { "RegCreateKeyExW",    (PVOID)RegCreateKeyExW },
+    { "RegSetValueExW",     (PVOID)RegSetValueExW },
     { "GetUserNameA",       (PVOID)GetUserNameA },
     { "GetUserNameW",       (PVOID)GetUserNameW },
     { NULL, NULL }

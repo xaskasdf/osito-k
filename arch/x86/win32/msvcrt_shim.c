@@ -3013,6 +3013,12 @@ unsigned long WINAPI crt_wcstoul(const WCHAR *s, WCHAR **endptr, int base)
     return result;
 }
 
+/* ── Stubs for bundled MSVCRT.dll ────────────────────────────── */
+
+static int crt_getch_stub(void)  { return -1; /* EOF */ }
+static int crt_kbhit_stub(void)  { return 0;  /* no key pressed */ }
+static int crt_putenv_stub(const char *s) { (void)s; return -1; /* fail */ }
+
 /* ── Export resolution table ───────────────────────────────── */
 
 typedef struct {
@@ -3200,6 +3206,10 @@ static const MSVCRT_EXPORT msvcrt_exports[] = {
     { "wcsncpy",             (PVOID)crt_wcsncpy },
     { "wcsstr",              (PVOID)crt_wcsstr },
     { "wcstoul",             (PVOID)crt_wcstoul },
+    /* Stubs for bundled MSVCRT.dll imports */
+    { "_getch",              (PVOID)crt_getch_stub },
+    { "_kbhit",              (PVOID)crt_kbhit_stub },
+    { "_putenv",             (PVOID)crt_putenv_stub },
 
     { NULL, NULL }
 };
