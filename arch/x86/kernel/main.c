@@ -90,6 +90,8 @@ static uint8_t saved_mmap[8192] __attribute__((aligned(16)));  /* copy of UEFI m
 extern void pci_scan(void);
 extern gpu_device_t *pci_get_gpu(void);
 extern void *pci_get_nvme(void); /* Returns pci_dev_t* */
+extern int   pci_get_nvme_count(void);
+extern void *pci_get_nvme_idx(int idx); /* Returns pci_dev_t* */
 extern void *pci_get_nic(void);  /* Returns pci_dev_t* */
 extern void *pci_get_xhci(void); /* Returns pci_dev_t* */
 
@@ -426,14 +428,20 @@ void kernel_entry(boot_info_t *info)
         paging_map_mmio(gpu->bar0_base, 32ULL * 1024 * 1024);  /* 32MB */
     }
 
-    /* Map NVMe BAR0 */
-    pci_dev_t *nvme_pci = (pci_dev_t *)pci_get_nvme();
-    if (nvme_pci && nvme_pci->bar[0]) {
-        paging_map_mmio(nvme_pci->bar[0], 16 * 1024);  /* 16KB NVMe regs */
-        serial_puts("[KERN] Mapped NVMe BAR0 0x");
-        serial_puthex(nvme_pci->bar[0], 16);
-        serial_puts("\n");
+    /* Map NVMe BAR0 (all controllers) */
+    int nvme_count = pci_get_nvme_count();
+    for (int i = 0; i < nvme_count; i++) {
+        pci_dev_t *nd = (pci_dev_t *)pci_get_nvme_idx(i);
+        if (nd && nd->bar[0]) {
+            paging_map_mmio(nd->bar[0], 16 * 1024);
+            serial_puts("[KERN] Mapped NVMe[");
+            serial_putdec(i);
+            serial_puts("] BAR0 0x");
+            serial_puthex(nd->bar[0], 16);
+            serial_puts("\n");
+        }
     }
+    pci_dev_t *nvme_pci = (pci_dev_t *)pci_get_nvme(); /* first, for compat */
 
     /* Map NIC BAR0 */
     pci_dev_t *nic_pci_early = (pci_dev_t *)pci_get_nic();
@@ -461,150 +469,161 @@ void kernel_entry(boot_info_t *info)
         fb_puts("\n GPU: not detected\n");
     }
 
-    /* ── Step 3: NVMe init ── */
-    if (nvme_pci && nvme_pci->bar[0]) {
-        serial_puts("[KERN] Initializing NVMe...\n");
+    /* ── Step 3: NVMe init — try all controllers until OsitoFS found ── */
+    {
+        extern int gpt_find_ositofs(uint64_t *part_offset, uint64_t *part_size);
+        uint64_t part_offset, part_size;
+        bool fs_mounted = false;
+
+        serial_puts("[KERN] Initializing NVMe (");
+        serial_putdec(nvme_count);
+        serial_puts(" controller(s))...\n");
         fb_puts("\n Initializing NVMe...\n");
 
-        if (nvme_init(nvme_pci->bar[0]) == 0) {
-            serial_puts("[KERN] NVMe ready\n");
+        for (int i = 0; i < nvme_count && !fs_mounted; i++) {
+            pci_dev_t *nd = (pci_dev_t *)pci_get_nvme_idx(i);
+            if (!nd || !nd->bar[0]) continue;
 
-            /* ── Step 4: Mount OsitoFS via GPT ── */
-            extern int gpt_find_ositofs(uint64_t *part_offset, uint64_t *part_size);
+            serial_puts("[KERN] Trying NVMe[");
+            serial_putdec(i);
+            serial_puts("]...\n");
 
-            uint64_t part_offset, part_size;
-            bool fs_mounted = false;
+            if (nvme_init(nd->bar[0]) != 0) {
+                serial_puts("[KERN] NVMe[");
+                serial_putdec(i);
+                serial_puts("] init failed\n");
+                continue;
+            }
 
-            if (gpt_find_ositofs(&part_offset, &part_size) == 0) {
+            /* Try GPT + OsitoFS */
+            if (gpt_find_ositofs(&part_offset, &part_size) == 0)
                 fs_mounted = (osfs2_mount(part_offset) == 0);
-            }
 
-            /* Fallback: try raw OsitoFS at offset 0 (no GPT) */
-            if (!fs_mounted) {
-                serial_puts("[KERN] GPT not found, trying raw OsitoFS at offset 0...\n");
+            /* Fallback: raw OsitoFS at offset 0 */
+            if (!fs_mounted)
                 fs_mounted = (osfs2_mount(0) == 0);
-            }
 
             if (fs_mounted) {
-                osfs2_list();
-
-                /* Load GGUF model (if present) */
-                static gguf_model_t gguf_model;
-                static llama_state_t llama;
-                bool model_ready = false;
-
-                if (gguf_load(&gguf_model) == 0 && gguf_model.num_tensors > 0) {
-                    /* Load tokenizer from GGUF metadata */
-                    {
-                        static gguf_tokenizer_t gtok;
-                        if (gguf_load_tokenizer(&gguf_model, &gtok) == 0) {
-                            extern int tok_init(void *, const char **,
-                                const uint32_t *, uint32_t, const char **,
-                                const uint32_t *, uint32_t, uint32_t, uint32_t);
-                            extern char g_tokenizer[];
-                            tok_init(g_tokenizer,
-                                     gtok.tokens, gtok.token_lens, gtok.n_tokens,
-                                     gtok.merges, gtok.merge_lens, gtok.n_merges,
-                                     gtok.bos_id, gtok.eos_id);
-                        }
-                    }
-
-                    if (llama_init(&llama, &gguf_model, 256) == 0) {
-                        /* CPU inference (baseline) */
-                        uint32_t prompt[] = { 128000 };  /* BOS */
-                        llama_generate(&llama, prompt, 1, 32);
-                        model_ready = true;
-                    }
-                }
-
-                /* GSP firmware loading + boot */
-                gpu_probe_t *gp = gpu_get_probe();
-                if (gp && gp->gsp_present)
-                    gsp_probe();
-                gsp_load_firmware();
-                if (gp && gp->gsp_present)
-                    gsp_queue_init();
-                if (gp && gp->gsp_present)
-                    gsp_boot();
-
-                /* X40: GPU-accelerated inference (after GPU init) */
-                if (model_ready) {
-                    static gpu_llama_state_t gpu_llama;
-                    if (gpu_llama_init(&gpu_llama, &llama) == 0) {
-                        gpu_llama_benchmark(&gpu_llama);
-
-                        /* GPU-accelerated inference run */
-                        llama.pos = 0;  /* Reset position for fresh run */
-                        uint32_t prompt2[] = { 128000 };
-                        gpu_llama_generate(&gpu_llama, prompt2, 1, 32);
-
-                        gpu_llama_free(&gpu_llama);
-                    }
-                    /* Keep llama state alive for UDP prompt server */
-                    prompt_llama = &llama;
-                } else {
-                    /* No model — run standalone GPU benchmark */
-                    gpu_llama_benchmark_standalone();
-                }
-
-                /* ── Try executing ELF programs if present ── */
-                if (osfs2_find("hello.elf")) {
-                    serial_puts("[KERN] Found hello.elf — executing...\n");
-                    proc_exec("hello.elf", 0, NULL);
-                }
-
-                if (osfs2_find("fileio.elf")) {
-                    serial_puts("[KERN] Found fileio.elf — executing...\n");
-                    int ret = proc_exec("fileio.elf", 0, NULL);
-                    serial_puts("[KERN] fileio.elf exited with code ");
-                    serial_putdec(ret < 0 ? (uint64_t)(-(int64_t)ret) : (uint64_t)ret);
-                    serial_puts("\n");
-                }
-
-                if (osfs2_find("hello_c.elf")) {
-                    serial_puts("[KERN] Found hello_c.elf (TCC) — executing...\n");
-                    int ret = proc_exec("hello_c.elf", 0, NULL);
-                    serial_puts("[KERN] hello_c.elf exited with code ");
-                    serial_putdec(ret < 0 ? (uint64_t)(-(int64_t)ret) : (uint64_t)ret);
-                    serial_puts("\n");
-                }
-
-                if (osfs2_find("tcc.elf") && osfs2_find("selftest.c")) {
-                    /* Step 1: TCC compiles+links selftest.c → selftest.elf */
-                    serial_puts("[KERN] === Self-hosting test ===\n");
-                    serial_puts("[KERN] Step 1: TCC compiling selftest.c...\n");
-                    const char *tcc_argv[] = {
-                        "tcc", "-nostdlib", "-nostdinc", "-static",
-                        "selftest.c", "-o", "selftest.elf"
-                    };
-                    int ret = proc_exec("tcc.elf", 7, tcc_argv);
-                    serial_puts("[KERN] TCC exited with code ");
-                    serial_putdec(ret < 0 ? (uint64_t)(-(int64_t)ret) : (uint64_t)ret);
-                    serial_puts("\n");
-
-                    /* Step 2: Execute the freshly compiled binary */
-                    if (ret == 0 && osfs2_find("selftest.elf")) {
-                        serial_puts("[KERN] Step 2: Executing selftest.elf...\n");
-                        ret = proc_exec("selftest.elf", 0, NULL);
-                        serial_puts("[KERN] selftest.elf exited with code ");
-                        serial_putdec(ret < 0 ? (uint64_t)(-(int64_t)ret) : (uint64_t)ret);
-                        serial_puts("\n");
-                    } else if (ret == 0) {
-                        serial_puts("[KERN] selftest.elf not found on disk after compile\n");
-                    }
-                }
-            } else {
-                serial_puts("[KERN] OsitoFS not found (no GPT, no raw)\n");
-                fb_puts("\n OsitoFS: not found\n");
+                serial_puts("[KERN] OsitoFS found on NVMe[");
+                serial_putdec(i);
+                serial_puts("]\n");
             }
-        } else {
-            serial_puts("[KERN] NVMe init failed\n");
-            fb_puts(" NVMe: init failed\n");
         }
-    } else {
-        serial_puts("[KERN] No NVMe controller found\n");
-        fb_puts("\n NVMe: not detected\n");
-    }
+
+        /* If no OsitoFS but at least one NVMe works, init first for bare NVMe access */
+        if (!fs_mounted && nvme_count > 0) {
+            pci_dev_t *nd = (pci_dev_t *)pci_get_nvme_idx(0);
+            if (nd && nd->bar[0]) nvme_init(nd->bar[0]);
+        }
+
+        if (fs_mounted) {
+            osfs2_list();
+
+            /* Load GGUF model (if present) */
+            static gguf_model_t gguf_model;
+            static llama_state_t llama;
+            bool model_ready = false;
+
+            if (gguf_load(&gguf_model) == 0 && gguf_model.num_tensors > 0) {
+                /* Load tokenizer from GGUF metadata */
+                {
+                    static gguf_tokenizer_t gtok;
+                    if (gguf_load_tokenizer(&gguf_model, &gtok) == 0) {
+                        extern int tok_init(void *, const char **,
+                            const uint32_t *, uint32_t, const char **,
+                            const uint32_t *, uint32_t, uint32_t, uint32_t);
+                        extern char g_tokenizer[];
+                        tok_init(g_tokenizer,
+                                 gtok.tokens, gtok.token_lens, gtok.n_tokens,
+                                 gtok.merges, gtok.merge_lens, gtok.n_merges,
+                                 gtok.bos_id, gtok.eos_id);
+                    }
+                }
+
+                if (llama_init(&llama, &gguf_model, 256) == 0) {
+                    uint32_t prompt[] = { 128000 };
+                    llama_generate(&llama, prompt, 1, 32);
+                    model_ready = true;
+                }
+            }
+
+            /* GSP firmware loading + boot */
+            gpu_probe_t *gp = gpu_get_probe();
+            if (gp && gp->gsp_present)
+                gsp_probe();
+            gsp_load_firmware();
+            if (gp && gp->gsp_present)
+                gsp_queue_init();
+            if (gp && gp->gsp_present)
+                gsp_boot();
+
+            /* X40: GPU-accelerated inference (after GPU init) */
+            if (model_ready) {
+                static gpu_llama_state_t gpu_llama;
+                if (gpu_llama_init(&gpu_llama, &llama) == 0) {
+                    gpu_llama_benchmark(&gpu_llama);
+                    llama.pos = 0;
+                    uint32_t prompt2[] = { 128000 };
+                    gpu_llama_generate(&gpu_llama, prompt2, 1, 32);
+                    gpu_llama_free(&gpu_llama);
+                }
+                prompt_llama = &llama;
+            } else {
+                gpu_llama_benchmark_standalone();
+            }
+
+            /* ── Try executing ELF programs if present ── */
+            if (osfs2_find("hello.elf")) {
+                serial_puts("[KERN] Found hello.elf — executing...\n");
+                proc_exec("hello.elf", 0, NULL);
+            }
+
+            if (osfs2_find("fileio.elf")) {
+                serial_puts("[KERN] Found fileio.elf — executing...\n");
+                int ret = proc_exec("fileio.elf", 0, NULL);
+                serial_puts("[KERN] fileio.elf exited with code ");
+                serial_putdec(ret < 0 ? (uint64_t)(-(int64_t)ret) : (uint64_t)ret);
+                serial_puts("\n");
+            }
+
+            if (osfs2_find("hello_c.elf")) {
+                serial_puts("[KERN] Found hello_c.elf (TCC) — executing...\n");
+                int ret = proc_exec("hello_c.elf", 0, NULL);
+                serial_puts("[KERN] hello_c.elf exited with code ");
+                serial_putdec(ret < 0 ? (uint64_t)(-(int64_t)ret) : (uint64_t)ret);
+                serial_puts("\n");
+            }
+
+            if (osfs2_find("tcc.elf") && osfs2_find("selftest.c")) {
+                serial_puts("[KERN] === Self-hosting test ===\n");
+                serial_puts("[KERN] Step 1: TCC compiling selftest.c...\n");
+                const char *tcc_argv[] = {
+                    "tcc", "-nostdlib", "-nostdinc", "-static",
+                    "selftest.c", "-o", "selftest.elf"
+                };
+                int ret = proc_exec("tcc.elf", 7, tcc_argv);
+                serial_puts("[KERN] TCC exited with code ");
+                serial_putdec(ret < 0 ? (uint64_t)(-(int64_t)ret) : (uint64_t)ret);
+                serial_puts("\n");
+
+                if (ret == 0 && osfs2_find("selftest.elf")) {
+                    serial_puts("[KERN] Step 2: Executing selftest.elf...\n");
+                    ret = proc_exec("selftest.elf", 0, NULL);
+                    serial_puts("[KERN] selftest.elf exited with code ");
+                    serial_putdec(ret < 0 ? (uint64_t)(-(int64_t)ret) : (uint64_t)ret);
+                    serial_puts("\n");
+                } else if (ret == 0) {
+                    serial_puts("[KERN] selftest.elf not found on disk after compile\n");
+                }
+            }
+        } else if (nvme_count == 0) {
+            serial_puts("[KERN] No NVMe controller found\n");
+            fb_puts("\n NVMe: not detected\n");
+        } else {
+            serial_puts("[KERN] OsitoFS not found on any NVMe controller\n");
+            fb_puts("\n OsitoFS: not found\n");
+        }
+    } /* end Step 3 NVMe block */
 
     /* ── Step 4: Network (I211 Ethernet + UDP) ── */
     pci_dev_t *nic_pci = (pci_dev_t *)pci_get_nic();
@@ -613,10 +632,22 @@ void kernel_entry(boot_info_t *info)
         fb_puts("\n Initializing NIC...\n");
 
         if (i211_init(nic_pci->bar[0]) == 0) {
-            /* 10.0.2.15 = QEMU SLIRP default DHCP.
-             * Change to 192.168.1.100 for real hardware. */
-            uint8_t ip[] = {10, 0, 2, 15};
-            net_init(ip);
+            extern void net_set_gateway(const uint8_t gw[4]);
+            extern void net_dns_set_server(const uint8_t ip[4]);
+
+            /* Auto-detect: I211 (0x1539) = real hardware, else QEMU */
+            if (nic_pci->device_id == 0x1539) {
+                uint8_t ip[] = {192, 168, 0, 50};
+                net_init(ip);
+                uint8_t gw[] = {192, 168, 0, 1};
+                net_set_gateway(gw);
+                uint8_t dns[] = {8, 8, 8, 8};
+                net_dns_set_server(dns);
+            } else {
+                uint8_t ip[] = {10, 0, 2, 15};
+                net_init(ip);
+                /* gateway/DNS defaults in net.c match QEMU SLIRP */
+            }
             net_udp_listen(7777, prompt_handler);
         } else {
             serial_puts("[KERN] I211 init failed\n");

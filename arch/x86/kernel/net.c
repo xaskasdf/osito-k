@@ -476,6 +476,16 @@ void net_init(const uint8_t ip[4])
     fb_putdec(our_ip[3]); fb_puts("\n");
 }
 
+void net_set_gateway(const uint8_t gw[4])
+{
+    memcpy(gateway_ip, gw, 4);
+    serial_puts("[NET] Gateway: ");
+    serial_putdec(gw[0]); serial_puts(".");
+    serial_putdec(gw[1]); serial_puts(".");
+    serial_putdec(gw[2]); serial_puts(".");
+    serial_putdec(gw[3]); serial_puts("\n");
+}
+
 /* ── Poll for Incoming Packets ───────────────────────────────── */
 
 void net_poll(void)

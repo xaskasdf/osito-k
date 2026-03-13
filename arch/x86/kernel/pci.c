@@ -88,8 +88,11 @@ static int       pci_device_count;
 
 /* GPU, NVMe, NIC, and xHCI devices (set during scan) */
 gpu_device_t gpu_dev;
-static pci_dev_t nvme_dev_store, nic_dev_store, xhci_dev_store;
-static pci_dev_t *nvme_dev;
+#define MAX_NVME_DEVS 4
+static pci_dev_t nvme_dev_stores[MAX_NVME_DEVS];
+static int       nvme_dev_count;
+static pci_dev_t nic_dev_store, xhci_dev_store;
+static pci_dev_t *nvme_dev;   /* first NVMe (backward compat) */
 static pci_dev_t *nic_dev;
 static pci_dev_t *xhci_dev;
 
@@ -180,7 +183,7 @@ static uint64_t pci_read_bar_size(uint8_t bus, uint8_t dev, uint8_t func, int ba
     pci_write32(bus, dev, func, offset, 0xFFFFFFFF);
     uint32_t mask_lo = pci_read32(bus, dev, func, offset);
 
-    uint64_t mask = mask_lo & ~0xFULL;   /* Clear type/prefetch bits */
+    uint64_t mask;
 
     if (is_64bit) {
         pci_write32(bus, dev, func, offset + 4, 0xFFFFFFFF);
@@ -188,12 +191,15 @@ static uint64_t pci_read_bar_size(uint8_t bus, uint8_t dev, uint8_t func, int ba
         mask = ((uint64_t)mask_hi << 32) | (mask_lo & ~0xFULL);
         /* Restore high */
         pci_write32(bus, dev, func, offset + 4, orig_hi);
+    } else {
+        /* 32-bit BAR: set upper 32 bits so ~mask doesn't overflow */
+        mask = 0xFFFFFFFF00000000ULL | (mask_lo & ~0xFULL);
     }
 
     /* Restore original */
     pci_write32(bus, dev, func, offset, orig_lo);
 
-    if (mask == 0) return 0;
+    if (mask == (uint64_t)-1 || (mask & 0xFFFFFFFFULL) == 0xFFFFFFF0ULL) return 0;
     return (~mask) + 1;
 }
 
@@ -384,8 +390,10 @@ static void pci_add_device(uint8_t bus, uint8_t dev, uint8_t func,
 
     /* Check if NVMe controller */
     if (class == PCI_CLASS_STORAGE && subclass == PCI_SUBCLASS_NVME) {
-        nvme_dev_store = *d;
-        nvme_dev = &nvme_dev_store;
+        if (nvme_dev_count < MAX_NVME_DEVS) {
+            nvme_dev_stores[nvme_dev_count++] = *d;
+            if (!nvme_dev) nvme_dev = &nvme_dev_stores[0];
+        }
     }
 
     /* Check if Ethernet NIC */
@@ -446,6 +454,7 @@ void pci_scan(void)
     pci_device_count = 0;
     memset(&gpu_dev, 0, sizeof(gpu_dev));
     nvme_dev = NULL;
+    nvme_dev_count = 0;
     nic_dev = NULL;
     xhci_dev = NULL;
 
@@ -551,6 +560,16 @@ gpu_device_t *pci_get_gpu(void)
 pci_dev_t *pci_get_nvme(void)
 {
     return nvme_dev;
+}
+
+int pci_get_nvme_count(void)
+{
+    return nvme_dev_count;
+}
+
+pci_dev_t *pci_get_nvme_idx(int idx)
+{
+    return (idx >= 0 && idx < nvme_dev_count) ? &nvme_dev_stores[idx] : NULL;
 }
 
 pci_dev_t *pci_get_nic(void)

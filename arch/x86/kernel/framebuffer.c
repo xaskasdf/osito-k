@@ -198,11 +198,22 @@ static void fb_mark_dirty(uint32_t pixel_top, uint32_t pixel_bot)
 
 void fb_clear(void)
 {
-    for (uint32_t y = 0; y < fb_height; y++)
-        for (uint32_t x = 0; x < fb_width; x++)
-            fb_base[y * fb_pitch + x] = BG_COLOR;
+    /* Use 64-bit writes for speed */
+    uint64_t *p = (uint64_t *)fb_base;
+    uint32_t qwords = fb_height * fb_pitch / 2;
+    for (uint32_t i = 0; i < qwords; i++)
+        p[i] = 0;
     text_col = 0;
     text_row = 0;
+    /* Flush to VRAM if shadow buffer is active */
+    if (fb_shadow) {
+        uint64_t *dst = (uint64_t *)fb_vram;
+        uint64_t *src = (uint64_t *)fb_shadow;
+        for (uint32_t i = 0; i < qwords; i++)
+            dst[i] = src[i];
+    }
+    dirty_top = fb_height;
+    dirty_bot = 0;
 }
 
 static void fb_putchar_at(uint32_t col, uint32_t row, char c, uint32_t fg)
