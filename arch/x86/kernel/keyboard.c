@@ -147,29 +147,33 @@ void keyboard_irq(void)
     case SC_LSHIFT_PRESS:
     case SC_RSHIFT_PRESS:
         kb_shift = true;
-        return;
+        break;
     case SC_LSHIFT_RELEASE:
     case SC_RSHIFT_RELEASE:
         kb_shift = false;
-        return;
+        break;
     case SC_CTRL_PRESS:
         kb_ctrl = true;
-        return;
+        break;
     case SC_CTRL_RELEASE:
         kb_ctrl = false;
-        return;
+        break;
     case SC_ALT_PRESS:
         kb_alt = true;
-        return;
+        break;
     case SC_ALT_RELEASE:
         kb_alt = false;
-        return;
+        break;
     case SC_CAPS_PRESS:
         kb_caps = !kb_caps;
-        return;
+        break;
     }
 
-    /* Ignore key releases (bit 7 set) */
+    /* ── NEW: Post raw event to the input system for games (Doom) ── */
+    extern void input_post_key(uint8_t scancode, bool pressed, bool extended);
+    input_post_key(sc & 0x7F, !(sc & 0x80), kb_extended);
+
+    /* Ignore key releases for the ASCII buffer (bit 7 set) */
     if (sc & 0x80) return;
 
     /* Translate scancode to ASCII */

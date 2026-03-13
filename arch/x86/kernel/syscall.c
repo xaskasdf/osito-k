@@ -79,6 +79,8 @@ extern void     shm_destroy(uint32_t handle)                     __attribute__((
 extern uint64_t shm_get_phys(uint32_t handle)                    __attribute__((weak));
 extern uint64_t shm_get_size(uint32_t handle)                    __attribute__((weak));
 extern uint32_t shm_create_surface(uint32_t w, uint32_t h, uint32_t f) __attribute__((weak));
+extern void     shm_flush_surface(uint32_t handle)               __attribute__((weak));
+extern bool     input_pop_event(void *out_evt)                   __attribute__((weak));
 
 /* QoS scheduler (process.c) */
 extern int     sched_set_qos(uint32_t pid, uint8_t qos)         __attribute__((weak));
@@ -231,8 +233,10 @@ static inline void wrmsr(uint32_t msr, uint64_t val) {
 #define SYS_SHM_GETPHYS     504
 #define SYS_SHM_GETSIZE     505
 #define SYS_SHM_MKSURFACE   506
+#define SYS_GUI_FLIP        507
 #define SYS_SCHED_SETQOS    510
 #define SYS_SCHED_GETQOS    511
+#define SYS_GET_INPUT_EVENT 512
 
 /* errno values */
 #define EPERM    1
@@ -967,7 +971,7 @@ static int64_t sys_exit(uint64_t status)
 /* brk — manage per-process heap region.
  * brk(0) returns current break.
  * brk(addr) sets break to addr if within region. */
-static int64_t sys_brk(uint64_t addr)
+int64_t sys_brk(uint64_t addr)
 {
     /* Lazy init: allocate brk region on first call */
     if (!brk_base) {
@@ -2487,6 +2491,18 @@ int64_t syscall_dispatch(uint64_t nr, uint64_t a1, uint64_t a2,
         return shm_get_size ? (int64_t)shm_get_size((uint32_t)a1) : -ENOSYS;
     case SYS_SHM_MKSURFACE:
         return shm_create_surface ? (int64_t)shm_create_surface((uint32_t)a1, (uint32_t)a2, (uint32_t)a3) : -ENOSYS;
+    case SYS_GUI_FLIP:
+        if (shm_flush_surface) { shm_flush_surface((uint32_t)a1); return 0; }
+        return -ENOSYS;
+    case SYS_GET_INPUT_EVENT:
+        {
+            extern void xhci_poll(void) __attribute__((weak));
+            if (xhci_poll) xhci_poll();
+            if (input_pop_event && a1) {
+                return input_pop_event((void *)a1) ? 1 : 0;
+            }
+        }
+        return -ENOSYS;
 
     /* ── OsitoK private: QoS scheduler ────────────────────────── */
     case SYS_SCHED_SETQOS:

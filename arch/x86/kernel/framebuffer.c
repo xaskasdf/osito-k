@@ -180,6 +180,16 @@ void fb_flush(void)
     dirty_bot = 0;
 }
 
+void fb_flush_all(void)
+{
+    if (!fb_shadow) return;
+    uint64_t *dst = (uint64_t *)fb_vram;
+    uint64_t *src = (uint64_t *)fb_shadow;
+    uint32_t qwords = fb_height * fb_pitch / 2;
+    for (uint32_t i = 0; i < qwords; i++)
+        dst[i] = src[i];
+}
+
 static void fb_mark_dirty(uint32_t pixel_top, uint32_t pixel_bot)
 {
     if (pixel_top < dirty_top) dirty_top = pixel_top;

@@ -70,6 +70,12 @@ extern int git_checkout(const char *branch);
 
 /* Network */
 extern void net_poll(void);
+
+/* HW detection (set during boot, used in shell banner) */
+extern int  pci_get_device_count(void);
+extern bool nvme_is_ready(void);
+extern bool i211_link_up(void);
+extern bool xhci_is_ready(void);
 extern void     net_icmp_send_echo(const uint8_t dst_ip[4], uint16_t seq);
 extern uint32_t net_icmp_get_rx_count(void);
 extern int  net_tcp_connect(const uint8_t dst_ip[4], uint16_t dst_port, uint16_t src_port);
@@ -2219,7 +2225,18 @@ void shell_run(void)
     sh_puts_color(" \\____/ |___/_|\\__\\___/|_|\\_\\\n", 0x00FF8800);
     sh_puts("\n");
     sh_puts_color(" Welcome to OsitoK Shell\n", 0x0000FF88);
-    sh_puts(" Type 'help' for commands.\n\n");
+    sh_puts(" Type 'help' for commands.\n");
+
+    /* Compact HW summary */
+    sh_puts(" ");
+    sh_puts_color("[", 0x00666666);
+    fb_putdec(pci_get_device_count());
+    sh_puts_color(" PCI", 0x00666666);
+    if (nvme_is_ready()) sh_puts_color(" | NVMe", 0x00666666);
+    if (osfs2_is_mounted()) sh_puts_color(" | FS", 0x00666666);
+    if (i211_link_up()) sh_puts_color(" | NIC", 0x00666666);
+    if (xhci_is_ready()) sh_puts_color(" | USB", 0x00666666);
+    sh_puts_color("]\n\n", 0x00666666);
 
     for (;;) {
         int len = term_readline("osito> ", line, sizeof(line));

@@ -289,6 +289,14 @@ bool input_has_events(void)
     return input_head != input_tail;
 }
 
+bool input_pop_event(input_event_t *out_evt)
+{
+    if (input_head == input_tail) return false;
+    *out_evt = input_queue[input_tail & INPUT_QUEUE_MASK];
+    input_tail = (input_tail + 1) & INPUT_QUEUE_MASK;
+    return true;
+}
+
 uint32_t input_queue_count(void)
 {
     return (input_head - input_tail) & INPUT_QUEUE_MASK;

@@ -299,6 +299,7 @@ static void print_banner(void)
 extern char __bss_start[] __attribute__((weak));
 extern char __bss_end[]   __attribute__((weak));
 
+static void enable_sse(void) { uint64_t cr0, cr4; __asm__ volatile ("mov %%cr0, %0" : "=r"(cr0)); cr0 &= ~(1ULL << 2); cr0 |= (1ULL << 1); __asm__ volatile ("mov %0, %%cr0" : : "r"(cr0)); __asm__ volatile ("mov %%cr4, %0" : "=r"(cr4)); cr4 |= (1ULL << 9); cr4 |= (1ULL << 10); __asm__ volatile ("mov %0, %%cr4" : : "r"(cr4)); }
 void kernel_entry(boot_info_t *info)
 {
     /* ── Step -1: Zero BSS (UEFI AllocatePages returns zeroed memory, but
@@ -325,6 +326,7 @@ void kernel_entry(boot_info_t *info)
 
     /* ── Step 0: Initialize serial + framebuffer (moved from boot) ── */
     serial_init();
+    enable_sse();
     serial_puts("\r\n[OsitoK] Serial initialized (COM1 115200)\r\n");
 
     fb_init((uint32_t *)(uintptr_t)info->fb_base,

@@ -129,7 +129,7 @@ void elf_fork_restore(void)
 /* ── ELF state ───────────────────────────────────────────────── */
 
 #define ELF_MAX_SEGMENTS 16
-#define USER_STACK_SIZE  (64 * 1024)  /* 64 KB stack */
+#define USER_STACK_SIZE  (1024 * 1024)  /* 1 MB stack */
 
 typedef struct {
     uint64_t entry;

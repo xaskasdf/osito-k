@@ -248,11 +248,7 @@ static int find_mcfg(void)
     serial_puts(" rev=");
     serial_putdec(rsdp->revision);
     serial_puts("\n");
-    fb_puts(" PCI: RSDP ");
-    fb_puthex((uint64_t)rsdp, 16);
-    fb_puts(" rev=");
-    fb_putdec(rsdp->revision);
-    fb_puts("\n");
+    /* RSDP details go to serial only */
 
     /* Use XSDT if revision >= 2 */
     acpi_sdt_header_t *root;
@@ -263,11 +259,7 @@ static int find_mcfg(void)
     else
         root = (acpi_sdt_header_t *)(uint64_t)rsdp->rsdt_addr;
 
-    fb_puts(" PCI: ");
-    fb_puts(use_xsdt ? "XSDT" : "RSDT");
-    fb_puts(" at ");
-    fb_puthex((uint64_t)root, 16);
-    fb_puts("\n");
+    /* XSDT/RSDT details go to serial only */
 
     /* Map the XSDT/RSDT pages before accessing (may be above mapped RAM) */
     paging_map_mmio((uint64_t)root & ~0xFFFULL, 16384);
@@ -293,9 +285,7 @@ static int find_mcfg(void)
     int entries = (root->length - sizeof(acpi_sdt_header_t)) / entry_size;
     uint8_t *entry_ptr = (uint8_t *)root + sizeof(acpi_sdt_header_t);
 
-    fb_puts(" PCI: ");
-    fb_putdec(entries);
-    fb_puts(" ACPI tables, searching MCFG...\n");
+    /* ACPI table count goes to serial only */
 
     for (int i = 0; i < entries; i++) {
         uint64_t table_addr;
@@ -324,13 +314,7 @@ static int find_mcfg(void)
             serial_puts("-");
             serial_putdec(ecam_end_bus);
             serial_puts("\n");
-            fb_puts(" PCI: ECAM ");
-            fb_puthex(ecam_base, 8);
-            fb_puts(" bus ");
-            fb_putdec(ecam_start_bus);
-            fb_puts("-");
-            fb_putdec(ecam_end_bus);
-            fb_puts("\n");
+            /* ECAM details go to serial only */
 
             /* Map ECAM MMIO region into page tables.
              * Each bus uses 1MB of config space (32 devs × 8 funcs × 4KB).
@@ -479,7 +463,7 @@ void pci_scan(void)
     serial_puts(ecam_base ? "ECAM" : "legacy");
     serial_puts(")...\n");
 
-    fb_puts("\n PCIe devices:\n");
+    /* PCIe device list goes to serial only */
 
     /* Two-pass scan for legacy mode: first pass finds bridges on bus 0,
      * second pass scans subordinate buses discovered from bridges.
@@ -537,25 +521,7 @@ void pci_scan(void)
                     serial_puts(pci_class_name(class, subclass));
                     serial_puts("\n");
 
-                    /* Print to framebuffer (condensed) */
-                    fb_puts("  ");
-                    fb_puthex(bus, 2); fb_puts(":");
-                    fb_puthex(dev, 2); fb_puts(".");
-                    fb_putdec(func);
-                    fb_puts(" ");
-                    fb_puts(pci_class_name(class, subclass));
-                    if (vendor == PCI_VENDOR_NVIDIA && class == PCI_CLASS_DISPLAY) {
-                        fb_puts(" (NVIDIA ");
-                        fb_puts(gpu_gen_name(gpu_detect_gen(device)));
-                        fb_puts(")");
-                    }
-                    if (class == PCI_CLASS_STORAGE && subclass == PCI_SUBCLASS_NVME)
-                        fb_puts(" (NVMe)");
-                    if (class == PCI_CLASS_NETWORK)
-                        fb_puts(" (NIC)");
-                    if (class == 0x0C && subclass == 0x03)
-                        fb_puts(" (xHCI)");
-                    fb_puts("\n");
+                    /* Device list to framebuffer removed — use serial for details */
                 }
 
                 /* If not multi-function, skip remaining functions */
@@ -572,14 +538,7 @@ void pci_scan(void)
     serial_putdec((uint64_t)pci_device_count);
     serial_puts(" devices\n");
 
-    fb_puts(" PCI: ");
-    fb_putdec((uint64_t)pci_device_count);
-    fb_puts(" devs");
-    if (gpu_dev.vendor_id) fb_puts(" GPU");
-    if (nvme_dev) fb_puts(" NVMe");
-    if (nic_dev) fb_puts(" NIC");
-    if (xhci_dev) fb_puts(" xHCI");
-    fb_puts("\n");
+    /* PCI summary moved to main.c pre-shell display */
 }
 
 /* ── Accessors ───────────────────────────────────────────────── */

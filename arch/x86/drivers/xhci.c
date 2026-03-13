@@ -159,6 +159,7 @@ static const char hid_shifted[0x54] = {
 static void usb_kbd_handle_report(xhci_device_t *dev, uint8_t *r, uint32_t len)
 {
     if (len < 8) return;
+    // serial_puts("[USB-KB] Report received\n");
     if (!kb_push) return; /* keyboard.c not linked */
 
     uint8_t mods = r[0];
@@ -166,7 +167,39 @@ static void usb_kbd_handle_report(xhci_device_t *dev, uint8_t *r, uint32_t len)
     bool shift = (mods & (HID_MOD_LSHIFT | HID_MOD_RSHIFT)) != 0;
     bool ctrl  = (mods & (HID_MOD_LCTRL  | HID_MOD_RCTRL))  != 0;
 
-    /* Process each keycode in slots 2-7 */
+    /* Check for modifier changes (Ctrl, Shift, Alt, GUI) */
+    uint8_t changed_mods = mods ^ dev->prev_mods;
+    if (changed_mods) {
+        for (int i = 0; i < 8; i++) {
+            if (changed_mods & (1 << i)) {
+                bool pressed = (mods & (1 << i)) != 0;
+                /* Map HID modifier index to a virtual scancode (0xE0 + index) */
+                extern void input_post_key(uint8_t scancode, bool pressed, bool extended);
+                input_post_key(0xE0 + i, pressed, false);
+            }
+        }
+    }
+
+    /* Check for key releases (present in prev, missing in current) */
+    for (int i = 0; i < 6; i++) {
+        uint8_t prev_code = dev->prev_keys[i];
+        if (prev_code == 0 || prev_code == 1) continue;
+
+        bool still_pressed = false;
+        for (int j = 2; j < 8; j++) {
+            if (r[j] == prev_code) {
+                still_pressed = true;
+                break;
+            }
+        }
+        if (!still_pressed) {
+            /* Key released! */
+            extern void input_post_key(uint8_t scancode, bool pressed, bool extended);
+            input_post_key(prev_code, false, false);
+        }
+    }
+
+    /* Process each keycode in slots 2-7 (KeyPresses) */
     for (int i = 2; i < 8; i++) {
         uint8_t code = r[i];
         if (code == 0 || code == 1) continue; /* No event / ErrorRollOver */
@@ -180,6 +213,10 @@ static void usb_kbd_handle_report(xhci_device_t *dev, uint8_t *r, uint32_t len)
             }
         }
         if (was_pressed) continue; /* Key held — don't repeat */
+
+        /* ── NEW: Post raw event to input system for Doom ── */
+        extern void input_post_key(uint8_t scancode, bool pressed, bool extended);
+        input_post_key(code, true, false);
 
         /* Arrow keys → VT100 escape sequences */
         if (kb_push_esc) {
@@ -366,13 +403,6 @@ static int cmd_wait(xhci_hc_t *hc, uint8_t *slot_out)
     return -1;
 }
 
-/* ── Diagnostic counters (used by evt_poll + xhci_poll) ──────── */
-
-static uint32_t diag_poll_count;
-static uint32_t diag_xfer_events;
-static uint32_t diag_kbd_events;
-static uint32_t diag_other_events;
-
 /* ── Event Ring Poll (non-blocking) ──────────────────────────── */
 
 static void evt_poll(xhci_hc_t *hc)
@@ -397,9 +427,6 @@ static void evt_poll(xhci_hc_t *hc)
             serial_puts("[xHCI] Controller DEAD (USBSTS=");
             serial_puthex(sts, 8);
             serial_puts(")\n");
-            fb_puts("[xHCI DEAD ");
-            fb_puthex(sts, 8);
-            fb_puts("]\n");
         }
         hc->initialized = false; /* Controller dead, stop polling */
         return;
@@ -416,7 +443,6 @@ static void evt_poll(xhci_hc_t *hc)
         uint8_t type = XHCI_TRB_GET_TYPE(e->control);
 
         if (type == TRB_TRANSFER_EVENT) {
-            diag_xfer_events++;
             /* Find which slot this belongs to */
             uint8_t slot = (e->control >> 24) & 0xFF;
             uint8_t ep_dci = (e->control >> 16) & 0x1F;
@@ -427,41 +453,17 @@ static void evt_poll(xhci_hc_t *hc)
                 xhci_device_t *dev = &hc->devices[slot - 1];
                 if (dev->hid_active && ep_dci == dev->int_ep_dci && dev->report_buf) {
                     /* Only process successful transfers (1=Success, 13=Short Packet) */
-                    if (code != 1 && code != 13) {
-                        static uint32_t err_count;
-                        if (err_count < 5) {
-                            err_count++;
-                            serial_puts("[xHCI] INT xfer err slot=");
-                            serial_putdec(slot);
-                            serial_puts(" code=");
-                            serial_putdec(code);
-                            serial_puts("\n");
-                        }
+                    if (code != 1 && code != 13)
                         goto advance;
-                    }
 
                     uint32_t actual = dev->int_max_pkt - len;
-
                     uint8_t *r = dev->report_buf;
 
-                    if (dev->hid_protocol == 1 && actual >= 8) {
-                        /* ── Keyboard boot report ── */
-                        diag_kbd_events++;
-                        static uint32_t kbd_evt_count;
-                        kbd_evt_count++;
-                        if (kbd_evt_count <= 3) {
-                            serial_puts("[xHCI] KBD report #");
-                            serial_putdec(kbd_evt_count);
-                            serial_puts(": ");
-                            for (uint32_t bi = 0; bi < 8; bi++) {
-                                serial_puthex(r[bi], 2);
-                                serial_puts(" ");
-                            }
-                            serial_puts("\n");
-                        }
+                    if (actual >= 8) {
+                        /* ── Keyboard report (usually 8 bytes) ── */
                         usb_kbd_handle_report(dev, r, actual);
                     } else if (actual >= 3) {
-                        /* ── Mouse boot report ── */
+                        /* ── Mouse report (3-6 bytes) ── */
                         uint8_t buttons = r[0] & 0x07;
                         int16_t dx, dy;
 
@@ -504,10 +506,8 @@ static void evt_poll(xhci_hc_t *hc)
                     db_write(hc, slot, dev->int_ep_dci);
                 }
             }
-        } else {
-            diag_other_events++;
         }
-        /* PORT_STATUS_CHANGE events — just consume */
+        /* PORT_STATUS_CHANGE and other events — just consume */
 
 advance:
         /* Advance event dequeue */
@@ -651,11 +651,6 @@ static void enumerate_port(xhci_hc_t *hc, int port)
     serial_putdec(pls);
     serial_puts("\n");
 
-    fb_puts("  P");
-    fb_putdec(port);
-    fb_puts(is_usb3 ? "/SS" : "/HS");
-    fb_puts(": ");
-
     /* USB 3.0 port with no SuperSpeed link (PLS != U0/U1/U2/U3):
      * The device is likely USB 2.0 — it will enumerate on the companion
      * USB 2.0 port. Skip to avoid wasting time on failed resets. */
@@ -663,7 +658,6 @@ static void enumerate_port(xhci_hc_t *hc, int port)
         serial_puts("[xHCI] USB3 port ");
         serial_putdec(port);
         serial_puts(": no SS link, skip (USB2 companion will handle)\n");
-        fb_puts("no SS link, skip\n");
         return;
     }
 
@@ -691,7 +685,6 @@ static void enumerate_port(xhci_hc_t *hc, int port)
         serial_puts("[xHCI] Port ");
         serial_putdec(port);
         serial_puts(" reset TIMEOUT\n");
-        fb_puts("reset timeout\n");
         return;
     }
 
@@ -705,9 +698,6 @@ static void enumerate_port(xhci_hc_t *hc, int port)
         serial_puts(" not enabled (PORTSC=");
         serial_puthex(portsc, 8);
         serial_puts(")\n");
-        fb_puts("not enabled ");
-        fb_puthex(portsc, 8);
-        fb_puts("\n");
         return;
     }
 
@@ -723,9 +713,6 @@ static void enumerate_port(xhci_hc_t *hc, int port)
         serial_puts("[xHCI] Enable Slot failed (code=");
         serial_putdec(code < 0 ? 0 : (uint64_t)code);
         serial_puts(")\n");
-        fb_puts(code < 0 ? "slot TIMEOUT" : "slot fail c=");
-        if (code >= 0) fb_putdec((uint64_t)code);
-        fb_puts("\n");
         return;
     }
 
@@ -796,15 +783,10 @@ static void enumerate_port(xhci_hc_t *hc, int port)
         serial_puts("[xHCI] Address Device failed (code=");
         serial_putdec(code < 0 ? 0 : (uint64_t)code);
         serial_puts(")\n");
-        fb_puts("addr fail c=");
-        fb_putdec(code < 0 ? 0 : (uint64_t)code);
-        fb_puts("\n");
         return;
     }
 
     dev->addressed = true;
-    fb_puts(speed_name(speed));
-    fb_puts(" ");
     serial_puts("[xHCI] Device addressed on slot ");
     serial_putdec(slot_id);
     serial_puts("\n");
@@ -830,9 +812,6 @@ static void enumerate_port(xhci_hc_t *hc, int port)
         serial_puts("[xHCI] GET_DEVICE_DESCRIPTOR(8) failed code=");
         serial_putdec((uint64_t)(-(int64_t)xfer_ret));
         serial_puts("\n");
-        fb_puts("DESC8 fail e=");
-        fb_putdec((uint64_t)(-(int64_t)xfer_ret));
-        fb_puts("\n");
         return;
     }
 
@@ -907,9 +886,6 @@ static void enumerate_port(xhci_hc_t *hc, int port)
         serial_puts("[xHCI] GET_DEVICE_DESCRIPTOR(18) failed code=");
         serial_putdec((uint64_t)(-(int64_t)xfer_ret));
         serial_puts("\n");
-        fb_puts("DESC18 fail e=");
-        fb_putdec((uint64_t)(-(int64_t)xfer_ret));
-        fb_puts("\n");
         return;
     }
 
@@ -927,12 +903,7 @@ static void enumerate_port(xhci_hc_t *hc, int port)
     serial_puthex(dev->class_code, 2);
     serial_puts("\n");
 
-    fb_puts(" ");
-    fb_puthex(dev->vendor_id, 4);
-    fb_puts(":");
-    fb_puthex(dev->product_id, 4);
-    fb_puts(" ");
-    serial_puts("\n");
+    /* VID:PID details go to serial only */
 
     /* ── GET_CONFIGURATION_DESCRIPTOR ── */
     memset(desc_buf, 0, 256);
@@ -941,7 +912,6 @@ static void enumerate_port(xhci_hc_t *hc, int port)
 
     if (ctrl_transfer(hc, dev, &setup, desc_buf, 9, true) < 0) {
         serial_puts("[xHCI] GET_CONFIG_DESC(header) failed\n");
-        fb_puts("CFG9 fail\n");
         return;
     }
 
@@ -954,7 +924,6 @@ static void enumerate_port(xhci_hc_t *hc, int port)
 
     if (ctrl_transfer(hc, dev, &setup, desc_buf, total_len, true) < 0) {
         serial_puts("[xHCI] GET_CONFIG_DESC(full) failed\n");
-        fb_puts("CFG fail\n");
         return;
     }
 
@@ -1037,7 +1006,6 @@ static void enumerate_port(xhci_hc_t *hc, int port)
 
     if (int_ep_addr == 0) {
         serial_puts("[xHCI] No HID interrupt endpoint found\n");
-        fb_puts("no HID EP\n");
         return;
     }
 
@@ -1050,7 +1018,6 @@ static void enumerate_port(xhci_hc_t *hc, int port)
 
     if (ctrl_transfer(hc, dev, &setup, NULL, 0, false) < 0) {
         serial_puts("[xHCI] SET_CONFIGURATION failed\n");
-        fb_puts("SETCFG fail\n");
         return;
     }
 
@@ -1183,9 +1150,6 @@ static void enumerate_port(xhci_hc_t *hc, int port)
     serial_puthex(int_ep_addr, 2);
     serial_puts("\n");
 
-    fb_puts(" ");
-    fb_puts(kind);
-    fb_puts(" ready\n");
 }
 
 /* ── Init one xHCI controller ────────────────────────────────── */
@@ -1289,13 +1253,7 @@ int xhci_init(uint64_t bar0_phys, uint8_t bus, uint8_t dev, uint8_t func)
                     serial_putdec(port_cnt);
                     serial_puts(")\n");
 
-                    fb_puts(" USB");
-                    fb_putdec(rev_major);
-                    fb_puts(": P");
-                    fb_putdec(port_off);
-                    fb_puts("-");
-                    fb_putdec(port_off + port_cnt - 1);
-                    fb_puts("\n");
+                    /* USB port range details go to serial only */
                 }
 
                 if (next == 0) break;
@@ -1513,13 +1471,7 @@ int xhci_init(uint64_t bar0_phys, uint8_t bus, uint8_t dev, uint8_t func)
     serial_putdec(hc->num_devices);
     serial_puts(" device(s)\n");
 
-    fb_puts(" xHCI: ");
-    fb_putdec(hc->num_devices);
-    fb_puts(" USB dev, ");
-    fb_putdec(ccs_count);
-    fb_puts("/");
-    fb_putdec(hc->max_ports);
-    fb_puts(" connected\n");
+    /* xHCI summary goes to serial; main.c shows compact HW info */
 
     return 0;
 }
@@ -1528,106 +1480,9 @@ int xhci_init(uint64_t bar0_phys, uint8_t bus, uint8_t dev, uint8_t func)
 
 void xhci_poll(void)
 {
-    diag_poll_count++;
-
     for (int i = 0; i < hc_count; i++) {
         if (hc_list[i].initialized)
             evt_poll(&hc_list[i]);
-    }
-
-    /* One-shot diagnostic: after ~5s of polling (~500 calls at 100Hz),
-     * dump definitive state to framebuffer. */
-    if (diag_poll_count == 500) {
-        fb_puts("[xHCI diag: ");
-        fb_putdec(diag_poll_count);
-        fb_puts(" polls, ");
-        fb_putdec(diag_xfer_events);
-        fb_puts(" xfer, ");
-        fb_putdec(diag_kbd_events);
-        fb_puts(" kbd, ");
-        fb_putdec(diag_other_events);
-        fb_puts(" other]\n");
-
-        for (int i = 0; i < hc_count; i++) {
-            xhci_hc_t *hc = &hc_list[i];
-            if (!hc->initialized) {
-                fb_puts("[HC NOT INIT]\n");
-                continue;
-            }
-
-            /* Event ring state */
-            fb_puts("[evt: deq=");
-            fb_putdec(hc->evt_deq);
-            fb_puts(" cyc=");
-            fb_putdec(hc->evt_cycle);
-            xhci_trb_t *e = &hc->evt_ring[hc->evt_deq];
-            fb_puts(" nxt_c=");
-            fb_putdec(e->control & 1);
-            fb_puts(" t=");
-            fb_putdec(XHCI_TRB_GET_TYPE(e->control));
-            fb_puts("]\n");
-
-            /* Per-device state */
-            for (int s = 0; s < XHCI_MAX_SLOTS; s++) {
-                xhci_device_t *d = &hc->devices[s];
-                if (!d->hid_active) continue;
-
-                /* Read EP state from output context */
-                xhci_ep_ctx_t *ep_out = (xhci_ep_ctx_t *)ctx_entry(
-                    hc, d->output_ctx, d->int_ep_dci);
-                uint8_t ep_state = ep_out->field1 & 0x7;
-
-                fb_puts("[S");
-                fb_putdec(d->slot_id);
-                fb_puts(" p=");
-                fb_putdec(d->hid_protocol);
-                fb_puts(" dci=");
-                fb_putdec(d->int_ep_dci);
-                fb_puts(" EP=");
-                fb_putdec(ep_state);
-                fb_puts(" mps=");
-                fb_putdec(d->int_max_pkt);
-                fb_puts(" enq=");
-                fb_putdec(d->int_enq);
-                fb_puts("]\n");
-
-                /* Dump first bytes of report_buf */
-                fb_puts("[buf: ");
-                for (int b = 0; b < 8 && b < (int)d->int_max_pkt; b++) {
-                    fb_puthex(d->report_buf[b], 2);
-                    fb_puts(" ");
-                }
-                fb_puts("]\n");
-
-                /* Also to serial with full detail */
-                serial_puts("[xHCI] Diag slot=");
-                serial_putdec(d->slot_id);
-                serial_puts(" proto=");
-                serial_putdec(d->hid_protocol);
-                serial_puts(" dci=");
-                serial_putdec(d->int_ep_dci);
-                serial_puts(" EP_STATE=");
-                serial_putdec(ep_state);
-                serial_puts(" int_max_pkt=");
-                serial_putdec(d->int_max_pkt);
-                serial_puts(" enq=");
-                serial_putdec(d->int_enq);
-                serial_puts(" report_buf=");
-                serial_puthex((uint64_t)d->report_buf, 16);
-                serial_puts(" int_ring=");
-                serial_puthex((uint64_t)d->int_ring, 16);
-                serial_puts("\n");
-
-                /* Dump int_ring[0] TRB to see if it was consumed */
-                serial_puts("  TRB[0]: param=");
-                serial_puthex(d->int_ring[0].param, 16);
-                serial_puts(" status=");
-                serial_puthex(d->int_ring[0].status, 8);
-                serial_puts(" ctrl=");
-                serial_puthex(d->int_ring[0].control, 8);
-                serial_puts("\n");
-            }
-        }
     }
 }
 

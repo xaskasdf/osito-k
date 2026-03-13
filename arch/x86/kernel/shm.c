@@ -217,10 +217,73 @@ uint32_t shm_get_active_count(void) { return shm_active_count; }
 
 /* ── Convenience: Create a surface (width × height × 4 bytes) ── */
 
+extern uint32_t compositor_create_window(uint32_t shm_handle, int16_t x, int16_t y, uint16_t width, uint16_t height, uint32_t pid, const char *title);
+extern void compositor_set_fullscreen(uint32_t window_id, bool fullscreen);
+extern void compositor_signal_dirty(uint32_t window_id);
+
 uint32_t shm_create_surface(uint32_t width, uint32_t height, uint32_t flags)
 {
     uint64_t size = (uint64_t)width * height * 4;
-    return shm_create(size, flags);
+    uint32_t handle = shm_create(size, flags);
+    
+    if (handle && (flags & 4)) { /* SHM_FLAG_GPU_SCANOUT */
+        uint32_t wid = compositor_create_window(handle, 0, 0, width, height, 0, "Doom");
+        if (wid) {
+            compositor_set_fullscreen(wid, true);
+            /* Cheat: Store window_id in the shm_table so we can flush it later.
+               We can use the flags field or just assume window 1.
+               Let's just use a static var for the one and only surface */
+        }
+    }
+    return handle;
+}
+
+extern uint32_t *fb_get_base(void);
+extern void fb_flush(void);
+extern uint32_t fb_get_width(void);
+extern uint32_t fb_get_height(void);
+extern uint32_t fb_get_pitch(void);
+
+void shm_flush_surface(uint32_t handle)
+{
+    shm_region_t *r = shm_find(handle);
+    if (!r || !r->base) return;
+
+    uint32_t *back = fb_get_base();
+    if (back) {
+        uint32_t *src = (uint32_t *)r->base;
+        uint32_t dw = fb_get_width();
+        uint32_t dh = fb_get_height();
+        uint32_t pitch = fb_get_pitch();
+        
+        int scale = 1;
+        if (dw >= 640 && dh >= 400) scale = 2;
+        if (dw >= 960 && dh >= 600) scale = 3;
+
+        int sw = 320;
+        int sh = 200;
+        
+        int off_x = (dw - (sw * scale)) / 2;
+        int off_y = (dh - (sh * scale)) / 2;
+
+        for (int y = 0; y < sh; y++) {
+            for (int x = 0; x < sw; x++) {
+                uint32_t pixel = src[y * sw + x];
+                for (int sy = 0; sy < scale; sy++) {
+                    for (int sx = 0; sx < scale; sx++) {
+                        int dy = off_y + y * scale + sy;
+                        int dx = off_x + x * scale + sx;
+                        if (dx >= 0 && (uint32_t)dx < dw && dy >= 0 && (uint32_t)dy < dh) {
+                            back[dy * pitch + dx] = pixel;
+                        }
+                    }
+                }
+            }
+        }
+        
+        extern void fb_flush_all(void);
+        fb_flush_all();
+    }
 }
 
 /* ── Initialize ──────────────────────────────────────────────── */
