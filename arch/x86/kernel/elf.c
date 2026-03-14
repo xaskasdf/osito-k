@@ -936,18 +936,13 @@ int elf_exec(const char *filename, int argc, const char **argv)
                 serial_puts("\n");
             }
 
-            /* Call INIT_ARRAY constructors */
+            /* Skip main binary INIT_ARRAY — __libc_csu_init will call it
+             * via __libc_start_main. Calling it here would double-init
+             * (e.g. PartitionAlloc pool reservation would run twice). */
             if (dt_init_array && dt_init_arraysz > 0) {
-                uint64_t init_count = dt_init_arraysz / 8;
-                typedef void (*init_fn_t)(void);
-                init_fn_t *fns = (init_fn_t *)(loaded.load_bias + dt_init_array);
-                serial_puts("[ELF] Calling ");
-                serial_putdec(init_count);
-                serial_puts(" INIT_ARRAY constructors\n");
-                for (uint64_t ci = 0; ci < init_count; ci++) {
-                    if (fns[ci] && (uint64_t)fns[ci] != (uint64_t)-1)
-                        fns[ci]();
-                }
+                serial_puts("[ELF] Main binary has ");
+                serial_putdec(dt_init_arraysz / 8);
+                serial_puts(" INIT_ARRAY constructors (deferred to __libc_csu_init)\n");
             }
         }
     }

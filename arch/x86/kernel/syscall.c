@@ -1074,15 +1074,27 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
     }
     if (vi < 0) return -ENOMEM;
 
+    /* PROT_NONE: reserve virtual address space without allocating pages.
+     * Used by PartitionAlloc, jemalloc, etc. to reserve large VA pools.
+     * Pages are allocated later via mprotect(PROT_READ|PROT_WRITE). */
+    if (prot == 0 /* PROT_NONE */) {
+        static uint64_t reserve_base = 0x500000000ULL;  /* 20GB — above RAM */
+        uint64_t result = reserve_base;
+        reserve_base += npages * 4096;
+
+        vma_table[vi].base   = result;
+        vma_table[vi].pages  = npages;
+        vma_table[vi].prot   = 0;
+        vma_table[vi].in_use = true;
+
+        return (int64_t)result;
+    }
+
     /* Allocate physical pages */
     void *pages = mem_alloc_pages(npages);
     if (!pages) return -ENOMEM;
 
     uint64_t base = (uint64_t)pages;
-
-    /* Pages are already identity-mapped from paging_init (first 4GB at least).
-     * For pages above the initial identity map range, we'd need to map them.
-     * For now, paging_init maps all usable RAM, so allocated pages are mapped. */
 
     /* Zero the memory (MAP_ANONYMOUS guarantees zeroed pages) */
     memset(pages, 0, npages * 4096);
@@ -1132,6 +1144,8 @@ static int64_t sys_munmap(uint64_t addr, uint64_t length)
 }
 
 /* sys_mprotect — change protection flags on mapped pages */
+extern int paging_map_page(uint64_t virt, uint64_t phys, uint64_t flags);
+
 static int64_t sys_mprotect(uint64_t addr, uint64_t length, uint64_t prot)
 {
     if (!addr || (addr & 0xFFF)) return -EINVAL;
@@ -1146,13 +1160,23 @@ static int64_t sys_mprotect(uint64_t addr, uint64_t length, uint64_t prot)
         if (addr >= vma_table[i].base && addr + npages * 4096 <= vma_end) {
             uint64_t pte_flags = prot_to_pte_flags((uint32_t)prot);
 
-            /* Update page table entries */
-            for (uint64_t p = 0; p < npages; p++) {
-                uint64_t va = addr + p * 4096;
-                paging_set_flags(va, pte_flags);
+            /* Committing a PROT_NONE reservation: allocate real pages */
+            if (vma_table[i].prot == 0 && prot != 0) {
+                for (uint64_t p = 0; p < npages; p++) {
+                    uint64_t va = addr + p * 4096;
+                    void *page = mem_alloc_pages(1);
+                    if (!page) return -ENOMEM;
+                    memset(page, 0, 4096);
+                    paging_map_page(va, (uint64_t)page, pte_flags);
+                }
+            } else {
+                /* Update existing page table entries */
+                for (uint64_t p = 0; p < npages; p++) {
+                    uint64_t va = addr + p * 4096;
+                    paging_set_flags(va, pte_flags);
+                }
             }
 
-            /* Update VMA prot */
             vma_table[i].prot = (uint32_t)prot;
             return 0;
         }
