@@ -32,6 +32,9 @@
 #define DT_FINI_ARRAY   26
 #define DT_INIT_ARRAYSZ 27
 #define DT_FINI_ARRAYSZ 28
+#define DT_RELR         36
+#define DT_RELRSZ       35
+#define DT_RELRENT      37
 #define DT_GNU_HASH     0x6ffffef5
 
 /* ── Relocation types ──────────────────────────────────────── */
@@ -107,11 +110,21 @@ typedef struct {
     void      (*init_fn)(void);
     void      (*fini_fn)(void);
 
+    /* TLS (from PT_TLS) */
+    uint64_t    tls_filesz;        /* .tdata size */
+    uint64_t    tls_memsz;         /* .tdata + .tbss total */
+    uint64_t    tls_align;
+    uint64_t    tls_initimage;     /* load_bias-adjusted .tdata address */
+    uint64_t    tls_modid;         /* 1-based module ID for DTV */
+    int64_t     tls_offset;        /* offset from TP (negative, Variant II) */
+
     /* Deferred linking (for phased loading) */
     dl_rela_t  *defer_rela;
     uint64_t    defer_rela_count;
     dl_rela_t  *defer_jmprel;
     uint64_t    defer_jmprel_count;
+    uint64_t   *defer_relr;
+    uint64_t    defer_relr_count;
     uint64_t    defer_init_array;   /* load_bias-adjusted address */
     uint64_t    defer_init_arraysz;
     bool        linked;             /* relocations applied */
@@ -134,8 +147,12 @@ void  dl_list_modules(void);
 void *dl_open_flags(const char *filename, int flags);
 void  dl_link_all(void);   /* Apply relocs + call init for all unlinked modules */
 
+/* Module table access — for TLS setup in elf.c */
+dl_module_t *dl_get_module(int index);
+
 /* Relocation engine — used by elf.c for main binary */
 int      dl_apply_rela(dl_module_t *m, const dl_rela_t *rela, uint64_t count);
+uint64_t dl_apply_relr(uint64_t load_bias, const uint64_t *relr, uint64_t count);
 uint32_t dl_gnu_hash_nsyms(const uint32_t *gnu_hash);
 
 #endif /* DYNLINK_H */

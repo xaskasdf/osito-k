@@ -53,6 +53,7 @@ extern int   osfs2_read(void *file, uint64_t offset, void *buf, uint64_t len);
 #define DL_PT_NULL     0
 #define DL_PT_LOAD     1
 #define DL_PT_DYNAMIC  2
+#define DL_PT_TLS      7
 
 typedef struct {
     uint8_t  e_ident[DL_EI_NIDENT];
@@ -116,6 +117,19 @@ static int64_t stub_read(int fd, void *buf, uint64_t n)
 
 static int stub_noop(void) { return 0; }
 
+/* __tls_get_addr: reads DTV from %fs:8, returns dtv[module] + offset */
+static void *kern_tls_get_addr(void *ti_ptr)
+{
+    uint64_t *ti = (uint64_t *)ti_ptr;
+    uint64_t module = ti[0];
+    uint64_t offset = ti[1];
+    uint64_t dtv_ptr;
+    __asm__ volatile("movq %%fs:8, %0" : "=r"(dtv_ptr));
+    if (!dtv_ptr || module == 0) return (void *)0;
+    uint64_t *dtv = (uint64_t *)dtv_ptr;
+    return (void *)(dtv[module] + offset);
+}
+
 /* ── Kernel symbol export table ─────────────────────────────── */
 
 typedef struct {
@@ -159,6 +173,9 @@ static const ksym_entry_t ksym_table[] = {
     /* I/O (minimal stubs) */
     { "write",          (uint64_t)stub_write     },
     { "read",           (uint64_t)stub_read      },
+
+    /* TLS */
+    { "__tls_get_addr",        (uint64_t)kern_tls_get_addr },
 
     /* Threading (no-ops for single-threaded) */
     { "pthread_mutex_lock",    (uint64_t)stub_noop },
@@ -327,11 +344,45 @@ int dl_apply_rela(dl_module_t *m, const dl_rela_t *rela, uint64_t count)
             break;
         }
 
-        case R_X86_64_DTPMOD64:
-        case R_X86_64_DTPOFF64:
-        case R_X86_64_TPOFF32:
-            /* TLS relocations — skip silently (minimal TLS) */
+        case R_X86_64_DTPMOD64: {
+            /* TLS module ID */
+            uint64_t modid = m->tls_modid ? m->tls_modid : 1;
+            if (sym_idx > 0 && sym_idx < m->sym_count &&
+                m->symtab[sym_idx].st_shndx == SHN_UNDEF) {
+                /* Symbol from another module — search */
+                const char *sname = m->strtab + m->symtab[sym_idx].st_name;
+                for (int j = 0; j < DL_MAX_MODULES; j++) {
+                    if (!modules[j].loaded || !modules[j].tls_modid) continue;
+                    if (dl_sym(&modules[j], sname)) {
+                        modid = modules[j].tls_modid;
+                        break;
+                    }
+                }
+            }
+            *target = modid;
+            resolved++;
             break;
+        }
+
+        case R_X86_64_DTPOFF64: {
+            /* Offset within module's TLS block */
+            uint64_t off = 0;
+            if (sym_idx > 0 && sym_idx < m->sym_count)
+                off = m->symtab[sym_idx].st_value;
+            *target = off;
+            resolved++;
+            break;
+        }
+
+        case R_X86_64_TPOFF32: {
+            /* Signed 32-bit offset from TP */
+            int64_t off = m->tls_offset;
+            if (sym_idx > 0 && sym_idx < m->sym_count)
+                off += (int64_t)m->symtab[sym_idx].st_value;
+            *(int32_t *)target = (int32_t)off;
+            resolved++;
+            break;
+        }
 
         case R_X86_64_NONE:
             break;
@@ -356,6 +407,38 @@ int dl_apply_rela(dl_module_t *m, const dl_rela_t *rela, uint64_t count)
     serial_puts("\n");
 
     return (failed > 0) ? -1 : 0;
+}
+
+/* ── Apply RELR (compact RELATIVE relocations) ─────────────── */
+
+uint64_t dl_apply_relr(uint64_t load_bias, const uint64_t *relr, uint64_t count)
+{
+    uint64_t where = 0;
+    uint64_t applied = 0;
+
+    for (uint64_t i = 0; i < count; i++) {
+        uint64_t entry = relr[i];
+        if ((entry & 1) == 0) {
+            /* Base address: apply one RELATIVE, advance */
+            uint64_t *p = (uint64_t *)(load_bias + entry);
+            *p += load_bias;
+            applied++;
+            where = (uint64_t)(p + 1);
+        } else {
+            /* Bitmap: each set bit = one RELATIVE relocation */
+            uint64_t bitmap = entry >> 1;
+            for (int bit = 0; bitmap; bit++, bitmap >>= 1) {
+                if (bitmap & 1) {
+                    uint64_t *p = (uint64_t *)(where + (uint64_t)bit * 8);
+                    *p += load_bias;
+                    applied++;
+                }
+            }
+            where += 63 * 8;
+        }
+    }
+
+    return applied;
 }
 
 /* ── dl_open: load shared object ────────────────────────────── */
@@ -487,10 +570,12 @@ void *dl_open_flags(const char *filename, int flags)
             memcpy((uint8_t *)base + dest_off, data + ph->p_offset, ph->p_filesz);
     }
 
-    /* ── Pass 3: find PT_DYNAMIC ─────────────────────────────── */
+    /* ── Pass 3: find PT_DYNAMIC and PT_TLS ──────────────────── */
 
     dl_dyn_t *dynamic = NULL;
     uint64_t dyn_count = 0;
+    uint64_t pt_tls_filesz = 0, pt_tls_memsz = 0, pt_tls_align = 1;
+    uint64_t pt_tls_vaddr = 0;
 
     for (int i = 0; i < ehdr->e_phnum; i++) {
         uint64_t off = ehdr->e_phoff + (uint64_t)i * ehdr->e_phentsize;
@@ -500,7 +585,12 @@ void *dl_open_flags(const char *filename, int flags)
         if (ph->p_type == DL_PT_DYNAMIC) {
             dynamic = (dl_dyn_t *)((uint8_t *)base + (ph->p_vaddr - vmin));
             dyn_count = ph->p_memsz / sizeof(dl_dyn_t);
-            break;
+        }
+        if (ph->p_type == DL_PT_TLS && ph->p_memsz > 0) {
+            pt_tls_filesz = ph->p_filesz;
+            pt_tls_memsz  = ph->p_memsz;
+            pt_tls_align  = ph->p_align ? ph->p_align : 1;
+            pt_tls_vaddr  = ph->p_vaddr;
         }
     }
 
@@ -521,6 +611,7 @@ void *dl_open_flags(const char *filename, int flags)
     uint64_t dt_jmprel = 0, dt_pltrelsz = 0;
     uint64_t dt_init = 0, dt_fini = 0;
     uint64_t dt_init_array = 0, dt_init_arraysz = 0;
+    uint64_t dt_relr = 0, dt_relrsz = 0;
 
     for (uint64_t i = 0; i < dyn_count; i++) {
         if (dynamic[i].d_tag == DT_NULL) break;
@@ -538,6 +629,8 @@ void *dl_open_flags(const char *filename, int flags)
         case DT_FINI:        dt_fini        = dynamic[i].d_val; break;
         case DT_INIT_ARRAY:  dt_init_array  = dynamic[i].d_val; break;
         case DT_INIT_ARRAYSZ:dt_init_arraysz = dynamic[i].d_val; break;
+        case DT_RELR:        dt_relr        = dynamic[i].d_val; break;
+        case DT_RELRSZ:      dt_relrsz      = dynamic[i].d_val; break;
         }
     }
 
@@ -557,6 +650,12 @@ void *dl_open_flags(const char *filename, int flags)
         j++;
     }
     m->name[j] = '\0';
+
+    /* Store TLS info */
+    m->tls_filesz    = pt_tls_filesz;
+    m->tls_memsz     = pt_tls_memsz;
+    m->tls_align     = pt_tls_align;
+    m->tls_initimage = pt_tls_memsz ? (load_bias + pt_tls_vaddr) : 0;
 
     /* Resolve dynamic pointers (vaddr → loaded address) */
     if (dt_symtab)   m->symtab    = (dl_sym_t *)(load_bias + dt_symtab);
@@ -597,6 +696,10 @@ void *dl_open_flags(const char *filename, int flags)
         m->defer_jmprel = (dl_rela_t *)(load_bias + dt_jmprel);
         m->defer_jmprel_count = dt_pltrelsz / sizeof(dl_rela_t);
     }
+    if (dt_relr && dt_relrsz > 0) {
+        m->defer_relr = (uint64_t *)(load_bias + dt_relr);
+        m->defer_relr_count = dt_relrsz / 8;
+    }
     if (dt_init_array && dt_init_arraysz > 0) {
         m->defer_init_array = load_bias + dt_init_array;
         m->defer_init_arraysz = dt_init_arraysz;
@@ -612,6 +715,12 @@ void *dl_open_flags(const char *filename, int flags)
         serial_puts("'\n");
     } else {
         /* Immediate mode: apply relocations and call init now */
+        if (m->defer_relr_count > 0) {
+            uint64_t n = dl_apply_relr(m->load_bias, m->defer_relr, m->defer_relr_count);
+            serial_puts("[DL] .relr: ");
+            serial_putdec(n);
+            serial_puts(" RELATIVE\n");
+        }
         if (m->defer_rela_count > 0) {
             serial_puts("[DL] .rela.dyn: ");
             serial_putdec(m->defer_rela_count);
@@ -665,6 +774,13 @@ void dl_link_all(void)
         serial_puts(m->name);
         serial_puts("'\n");
 
+        /* RELR first (compact RELATIVE-only) */
+        if (m->defer_relr_count > 0) {
+            uint64_t n = dl_apply_relr(m->load_bias, m->defer_relr, m->defer_relr_count);
+            serial_puts("[DL] .relr: ");
+            serial_putdec(n);
+            serial_puts(" RELATIVE\n");
+        }
         if (m->defer_rela_count > 0) {
             serial_puts("[DL] .rela.dyn: ");
             serial_putdec(m->defer_rela_count);
@@ -709,6 +825,14 @@ void dl_link_all(void)
     }
 
     serial_puts("[DL] All modules linked\n");
+}
+
+/* ── dl_get_module: access module table from elf.c ──────────── */
+
+dl_module_t *dl_get_module(int index)
+{
+    if (index < 0 || index >= DL_MAX_MODULES) return NULL;
+    return modules[index].loaded ? &modules[index] : NULL;
 }
 
 /* ── dl_sym: look up symbol by name ─────────────────────────── */

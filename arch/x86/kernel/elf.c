@@ -53,6 +53,7 @@ extern void proc_add_region(void *base, uint64_t pages);
 #define PT_LOAD     1
 #define PT_DYNAMIC  2
 #define PT_NOTE     4
+#define PT_TLS      7
 #define PT_INTERP   3
 #define PT_PHDR     6
 
@@ -678,70 +679,6 @@ int elf_exec(const char *filename, int argc, const char **argv)
         }
     }
 
-    /* ── Minimal TLS setup (tcbhead_t for glibc) ────────────────────
-     * glibc expects %fs to point to a valid tcbhead_t with stack_guard
-     * and pointer_guard. Set this up before loading shared libs so
-     * INIT_ARRAY constructors can access TLS. */
-    {
-        extern void proc_set_fs_base(uint64_t addr);
-
-        #define TLS_DATA_SIZE  8192   /* space for TLS variables */
-        #define TCBHEAD_SIZE   0x80   /* tcbhead_t fields */
-
-        uint8_t *tls_area = (uint8_t *)mem_alloc_aligned(
-            TLS_DATA_SIZE + TCBHEAD_SIZE, 4096);
-        if (tls_area) {
-            memset(tls_area, 0, TLS_DATA_SIZE + TCBHEAD_SIZE);
-
-            /* Variant II: [TLS data...] [tcbhead_t at TP]
-             * FS_BASE = TP = start of tcbhead_t */
-            uint64_t tp = (uint64_t)(tls_area + TLS_DATA_SIZE);
-            uint64_t *tcb = (uint64_t *)tp;
-
-            /* tcbhead_t layout (x86-64):
-             *   +0x00 tcb        → TP itself
-             *   +0x08 dtv        → NULL (no dynamic TLS)
-             *   +0x10 self       → TP (pthread descriptor)
-             *   +0x18 multiple_threads(4) + gscope_flag(4)
-             *   +0x20 sysinfo    → 0
-             *   +0x28 stack_guard→ random canary
-             *   +0x30 pointer_guard → random XOR key */
-            tcb[0] = tp;       /* tcb → self */
-            tcb[1] = 0;        /* dtv */
-            tcb[2] = tp;       /* self (pthread) */
-            tcb[3] = 0;        /* multiple_threads=0, gscope=0 */
-            tcb[4] = 0;        /* sysinfo */
-
-            /* Random values from RDTSC */
-            uint64_t tsc_lo, tsc_hi;
-            __asm__ volatile("rdtsc" : "=a"(tsc_lo), "=d"(tsc_hi));
-            uint64_t seed = (tsc_hi << 32) | tsc_lo;
-            tcb[5] = seed ^ 0xDEADBEEFCAFEBABEULL;  /* stack_guard */
-            tcb[6] = seed ^ 0x1234567890ABCDEFULL;   /* pointer_guard */
-
-            /* Set MSR_FS_BASE */
-            __asm__ volatile(
-                "movl $0xC0000100, %%ecx\n"
-                "movl %0, %%eax\n"
-                "movl %1, %%edx\n"
-                "wrmsr\n"
-                : : "r"((uint32_t)(tp & 0xFFFFFFFF)),
-                    "r"((uint32_t)(tp >> 32))
-                : "ecx"
-            );
-
-            proc_set_fs_base(tp);
-            proc_add_region(tls_area,
-                (TLS_DATA_SIZE + TCBHEAD_SIZE + 4095) / 4096);
-
-            serial_puts("[TLS] FS_BASE=0x");
-            serial_puthex(tp, 16);
-            serial_puts(" guard=0x");
-            serial_puthex(tcb[5], 8);
-            serial_puts("\n");
-        }
-    }
-
     /* ── Dynamic linking ─────────────────────────────────────────────
      * If the binary has a PT_DYNAMIC segment, parse it to resolve
      * shared library dependencies and apply relocations. This bridges
@@ -826,7 +763,119 @@ int elf_exec(const char *filename, int argc, const char **argv)
                     }
                 }
 
-                /* All libs loaded — now link them (relocs + init) */
+                /* ── TLS setup (before linking, so DTPMOD/TPOFF work) ──── */
+                {
+                    extern void proc_set_fs_base(uint64_t addr);
+                    #define TCBHEAD_SIZE 0x80
+
+                    /* Scan main binary for PT_TLS */
+                    uint64_t main_tls_filesz = 0, main_tls_memsz = 0;
+                    uint64_t main_tls_align = 1, main_tls_initimg = 0;
+                    for (int ti = 0; ti < hdr->e_phnum; ti++) {
+                        uint64_t toff = hdr->e_phoff + (uint64_t)ti * hdr->e_phentsize;
+                        if (toff + sizeof(elf64_phdr_t) > file_size) break;
+                        const elf64_phdr_t *tph = (const elf64_phdr_t *)(data + toff);
+                        if (tph->p_type == PT_TLS && tph->p_memsz > 0) {
+                            main_tls_filesz = tph->p_filesz;
+                            main_tls_memsz  = tph->p_memsz;
+                            main_tls_align  = tph->p_align ? tph->p_align : 1;
+                            main_tls_initimg = loaded.load_bias + tph->p_vaddr;
+                        }
+                    }
+
+                    /* Compute total static TLS size (Variant II) */
+                    uint64_t tls_total = 0;
+                    uint64_t next_modid = 1;
+                    int64_t main_tls_off = 0;
+                    uint64_t main_tls_modid = 0;
+
+                    if (main_tls_memsz > 0) {
+                        uint64_t aligned = (main_tls_memsz + main_tls_align - 1)
+                                           & ~(main_tls_align - 1);
+                        tls_total += aligned;
+                        main_tls_modid = next_modid++;
+                        main_tls_off = -(int64_t)tls_total;
+                    }
+
+                    for (int mi = 0; mi < DL_MAX_MODULES; mi++) {
+                        dl_module_t *mod = dl_get_module(mi);
+                        if (!mod || mod->tls_memsz == 0) continue;
+                        uint64_t al = mod->tls_align ? mod->tls_align : 1;
+                        uint64_t aligned = (mod->tls_memsz + al - 1) & ~(al - 1);
+                        tls_total += aligned;
+                        mod->tls_modid = next_modid++;
+                        mod->tls_offset = -(int64_t)tls_total;
+                    }
+
+                    /* Allocate: [TLS data] [tcbhead_t] [DTV] */
+                    uint64_t dtv_slots = next_modid + 1;
+                    uint64_t alloc_sz = tls_total + TCBHEAD_SIZE +
+                                        dtv_slots * sizeof(uint64_t);
+                    alloc_sz = (alloc_sz + 4095) & ~4095ULL;
+
+                    uint8_t *tls_area = (uint8_t *)mem_alloc_aligned(alloc_sz, 4096);
+                    if (tls_area) {
+                        memset(tls_area, 0, alloc_sz);
+                        uint64_t tp = (uint64_t)(tls_area + tls_total);
+                        uint64_t *tcb = (uint64_t *)tp;
+                        uint64_t *dtv = (uint64_t *)(tp + TCBHEAD_SIZE);
+
+                        /* Copy .tdata init images */
+                        if (main_tls_memsz > 0 && main_tls_initimg) {
+                            memcpy((void *)(tp + main_tls_off),
+                                   (void *)main_tls_initimg, main_tls_filesz);
+                            dtv[main_tls_modid] = tp + main_tls_off;
+                        }
+                        for (int mi = 0; mi < DL_MAX_MODULES; mi++) {
+                            dl_module_t *mod = dl_get_module(mi);
+                            if (!mod || mod->tls_memsz == 0) continue;
+                            if (mod->tls_filesz > 0 && mod->tls_initimage) {
+                                memcpy((void *)(tp + mod->tls_offset),
+                                       (void *)mod->tls_initimage,
+                                       mod->tls_filesz);
+                            }
+                            dtv[mod->tls_modid] = tp + mod->tls_offset;
+                        }
+
+                        /* Fill tcbhead_t */
+                        tcb[0] = tp;                /* tcb → self */
+                        tcb[1] = (uint64_t)dtv;     /* DTV pointer */
+                        tcb[2] = tp;                /* self (pthread) */
+                        tcb[3] = 0;                 /* multiple_threads=0 */
+                        tcb[4] = 0;                 /* sysinfo */
+
+                        uint64_t tsc_lo, tsc_hi;
+                        __asm__ volatile("rdtsc" : "=a"(tsc_lo), "=d"(tsc_hi));
+                        uint64_t seed = (tsc_hi << 32) | tsc_lo;
+                        tcb[5] = seed ^ 0xDEADBEEFCAFEBABEULL; /* stack_guard */
+                        tcb[6] = seed ^ 0x1234567890ABCDEFULL;  /* pointer_guard */
+
+                        /* Set MSR_FS_BASE */
+                        __asm__ volatile(
+                            "movl $0xC0000100, %%ecx\n"
+                            "movl %0, %%eax\n"
+                            "movl %1, %%edx\n"
+                            "wrmsr\n"
+                            : : "r"((uint32_t)(tp & 0xFFFFFFFF)),
+                                "r"((uint32_t)(tp >> 32))
+                            : "ecx"
+                        );
+                        proc_set_fs_base(tp);
+                        proc_add_region(tls_area, alloc_sz / 4096);
+
+                        serial_puts("[TLS] TP=0x");
+                        serial_puthex(tp, 16);
+                        serial_puts(" size=");
+                        serial_putdec(tls_total);
+                        serial_puts(" mods=");
+                        serial_putdec(next_modid - 1);
+                        serial_puts(" DTV=0x");
+                        serial_puthex((uint64_t)dtv, 16);
+                        serial_puts("\n");
+                    }
+                }
+
+                /* All libs loaded + TLS ready — now link (relocs + init) */
                 dl_link_all();
             }
 
