@@ -268,6 +268,101 @@ static void gdt_init(void)
     serial_puts(" entries)\n");
 }
 
+/* ── TSS (Task State Segment) for IST ────────────────────────── */
+
+/*
+ * x86-64 TSS: 104 bytes minimum. We only need IST entries for
+ * dedicated interrupt stacks. IST1 is used by INT 0x2E (compat32).
+ */
+struct __attribute__((packed)) tss64 {
+    uint32_t reserved0;
+    uint64_t rsp0;      /* Ring 0 stack (unused — we're already ring 0) */
+    uint64_t rsp1;
+    uint64_t rsp2;
+    uint64_t reserved1;
+    uint64_t ist1;      /* IST1: INT 0x2E (compat32 dispatch) */
+    uint64_t ist2;      /* IST2: available for future use */
+    uint64_t ist3;
+    uint64_t ist4;
+    uint64_t ist5;
+    uint64_t ist6;
+    uint64_t ist7;
+    uint64_t reserved2;
+    uint16_t reserved3;
+    uint16_t iopb_offset;
+};
+
+struct tss64 kernel_tss __attribute__((aligned(16)));
+/* Exported for int2e_stub.S to update IST1 for re-entrant interrupts */
+uint64_t *tss_ist1_ptr;  /* = &kernel_tss.ist1, set in tss_init() */
+
+/* IST1 stack for INT 0x2E — 64KB (needs room for re-entrant callbacks) */
+#define IST1_STACK_SIZE 65536
+static uint8_t ist1_stack[IST1_STACK_SIZE] __attribute__((aligned(16)));
+
+/*
+ * Install TSS: write descriptor to GDT index 10-11 (selector 0x50),
+ * configure IST1, and load TR.
+ *
+ * TSS descriptor in 64-bit mode occupies 16 bytes (2 GDT entries):
+ *   Entry N:   [limit 15:0] [base 15:0] [base 23:16] [type=0x9,P=1] [limit 19:16] [base 31:24]
+ *   Entry N+1: [base 63:32] [reserved]
+ */
+static void tss_init(void)
+{
+    /* Zero TSS, set IST1 to top of dedicated stack */
+    memset(&kernel_tss, 0, sizeof(kernel_tss));
+    kernel_tss.ist1 = (uint64_t)(ist1_stack + IST1_STACK_SIZE);
+    kernel_tss.iopb_offset = sizeof(struct tss64);
+    tss_ist1_ptr = &kernel_tss.ist1;
+
+    /* Build TSS descriptor at GDT index 10 (selector 0x50) */
+    uint64_t base = (uint64_t)&kernel_tss;
+    uint32_t limit = sizeof(struct tss64) - 1;
+
+    /*
+     * GDT entry (low qword):
+     *   bits  0-15: limit[15:0]
+     *   bits 16-31: base[15:0]
+     *   bits 32-39: base[23:16]
+     *   bits 40-43: type (0x9 = 64-bit TSS available)
+     *   bit  44:    S=0 (system segment)
+     *   bits 45-46: DPL=0
+     *   bit  47:    P=1 (present)
+     *   bits 48-51: limit[19:16]
+     *   bits 52-55: flags (G=0, AVL=0)
+     *   bits 56-63: base[31:24]
+     */
+    uint64_t lo = 0;
+    lo |= (uint64_t)(limit & 0xFFFF);                    /* limit[15:0] */
+    lo |= (uint64_t)(base & 0xFFFF) << 16;               /* base[15:0] */
+    lo |= (uint64_t)((base >> 16) & 0xFF) << 32;         /* base[23:16] */
+    lo |= (uint64_t)0x89ULL << 40;                        /* type=0x9, P=1 */
+    lo |= (uint64_t)((limit >> 16) & 0xF) << 48;         /* limit[19:16] */
+    lo |= (uint64_t)((base >> 24) & 0xFF) << 56;         /* base[31:24] */
+
+    /* High qword: base[63:32] */
+    uint64_t hi = (base >> 32) & 0xFFFFFFFF;
+
+    kernel_gdt[10] = lo;
+    kernel_gdt[11] = hi;
+
+    /* Update GDT limit to include TSS descriptor (index 10-11 = 12 entries min) */
+    int current_entries = (kernel_gdtr.limit + 1) / 8;
+    if (current_entries < 12) {
+        kernel_gdtr.limit = 12 * 8 - 1;
+        __asm__ volatile ("lgdt %0" : : "m"(kernel_gdtr));
+    }
+
+    /* Load Task Register */
+    uint16_t tss_sel = 10 * 8;  /* 0x50 */
+    __asm__ volatile ("ltr %0" : : "r"(tss_sel));
+
+    serial_puts("[TSS] Installed at GDT 0x50, IST1=0x");
+    serial_puthex(kernel_tss.ist1, 16);
+    serial_puts("\n");
+}
+
 /* ── State ───────────────────────────────────────────────────── */
 
 static volatile uint64_t tick_count;
@@ -444,10 +539,26 @@ void isr_handler(interrupt_frame_t *frame)
             if (null_call_count <= 10) {
                 serial_puts("[NULL-CALL] addr=0x");
                 serial_puthex(cr2, 4);
+                serial_puts(" ESP=0x");
+                serial_puthex(frame->rsp, 8);
                 if (frame->cs == 0x40 || frame->cs == 0x23) {
                     uint32_t *sp32 = (uint32_t *)(frame->rsp & 0xFFFFFFFF);
-                    serial_puts(" ret=0x");
-                    serial_puthex(sp32[0], 8);
+                    serial_puts(" stack:");
+                    for (int si = 0; si < 16; si++) {
+                        if (si % 4 == 0) {
+                            serial_puts("\n  [+"); serial_putdec(si*4);
+                            serial_puts("] ");
+                        }
+                        serial_puthex(sp32[si], 8);
+                        serial_puts(" ");
+                    }
+                    serial_puts("\n  EAX=0x"); serial_puthex(frame->rax, 8);
+                    serial_puts(" EBX=0x"); serial_puthex(frame->rbx, 8);
+                    serial_puts(" ECX=0x"); serial_puthex(frame->rcx, 8);
+                    serial_puts(" EDX=0x"); serial_puthex(frame->rdx, 8);
+                    serial_puts("\n  ESI=0x"); serial_puthex(frame->rsi, 8);
+                    serial_puts(" EDI=0x"); serial_puthex(frame->rdi, 8);
+                    serial_puts(" EBP=0x"); serial_puthex(frame->rbp, 8);
                 }
                 serial_puts(" #");
                 serial_putdec(null_call_count);
@@ -726,6 +837,7 @@ void idt_init(void)
      * MUST happen before any page allocations (paging_init, heap_init)
      * that could overwrite the UEFI GDT in freed boot services memory. */
     gdt_init();
+    tss_init();
 
     /* Detect current CS selector from GDT */
     uint16_t cs = get_cs();

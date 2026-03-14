@@ -215,8 +215,14 @@ static const char *strip_nt_path(const char *path)
     if (path[0] && path[1] == ':' && path[2] == '\\')
         path += 3;
 
-    /* Convert remaining backslashes to forward slashes is done by caller */
-    return path;
+    /* OsitoFS is flat (no directories) — extract basename.
+     * Scan for last path separator (\ or /) and return the part after it. */
+    const char *base = path;
+    for (const char *p = path; *p; p++) {
+        if (*p == '\\' || *p == '/')
+            base = p + 1;
+    }
+    return base;
 }
 
 /* ── NtCreateFile ───────────────────────────────────────────── */

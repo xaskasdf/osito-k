@@ -422,7 +422,15 @@ PVOID WINAPI GetProcAddress(HANDLE hModule, PCSTR lpProcName)
     }
 
     /* Fall back to searching all shims and modules */
-    return dll_resolve_import("", lpProcName, 0, FALSE);
+    PVOID result = dll_resolve_import("", lpProcName, 0, FALSE);
+    if (!result) {
+        serial_puts("[GPA] UNRESOLVED: ");
+        serial_puts(lpProcName);
+        serial_puts(" hMod=0x");
+        serial_puthex((uint64_t)(ULONG_PTR)hModule, 8);
+        serial_puts("\n");
+    }
+    return result;
 }
 
 HANDLE WINAPI GetModuleHandleA(PCSTR lpModuleName)

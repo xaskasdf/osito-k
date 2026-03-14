@@ -60,11 +60,16 @@ void WINAPI _initterm(_PVFV *pfbegin, _PVFV *pfend)
     serial_puthex((uint64_t)(ULONG_PTR)begin32, 8);
     serial_puts("\n");
 
+    int cb_count = 0;
     for (uint32_t *p = begin32; p < end32; p++) {
         if (*p) {
             compat32_callback(*p);
+            cb_count++;
         }
     }
+    serial_puts("[MSVCRT] _initterm done: ");
+    serial_putdec(cb_count);
+    serial_puts(" callbacks executed\n");
 #else
     for (_PVFV *pfn = pfbegin; pfn < pfend; pfn++) {
         if (*pfn)
@@ -324,6 +329,25 @@ char* WINAPI crt_strrchr(const char *s, int c)
 
 PVOID WINAPI crt_memcpy(PVOID dst, PCVOID src, SIZE_T n)
 {
+    /* Log copies involving VirtualAlloc range (0x40000000+) for TArray debug */
+    {
+        uint64_t d64 = (uint64_t)(ULONG_PTR)dst;
+        uint64_t s64 = (uint64_t)(ULONG_PTR)src;
+        static int mc_log = 0;
+        if ((d64 >= 0x40000000 && d64 < 0x50000000) ||
+            (s64 >= 0x40000000 && s64 < 0x50000000)) {
+            if (mc_log < 50) {
+                mc_log++;
+                serial_puts("[MC] dst=0x");
+                serial_puthex(d64, 8);
+                serial_puts(" src=0x");
+                serial_puthex(s64, 8);
+                serial_puts(" n=");
+                serial_putdec(n);
+                serial_puts("\n");
+            }
+        }
+    }
     BYTE *d = (BYTE *)dst;
     const BYTE *s = (const BYTE *)src;
     while (n--) *d++ = *s++;
@@ -1954,6 +1978,154 @@ void WINAPI crt_CxxThrowException(PVOID pExceptionObject, PVOID pThrowInfo)
     serial_puts(" throwInfo=0x");
     serial_puthex((uint64_t)(ULONG_PTR)pThrowInfo, 8);
     serial_puts("\n");
+
+    /* ── Diagnostic: dump GObjRegistrants state ────────────── */
+    {
+        /* GObjRegistrants@UObject is a TArray<UObject*> at Core.dll export RVA 0x1A0360
+         * Core.dll base = 0x10100000, so VA = 0x102A0360
+         * TArray layout: { T* Data (+0), INT Num (+4), INT Max (+8) } */
+        uint32_t *gobjreg = (uint32_t *)(ULONG_PTR)0x102A0360;
+        uint32_t data_ptr = gobjreg[0];
+        int32_t  num      = (int32_t)gobjreg[1];
+        int32_t  max      = (int32_t)gobjreg[2];
+
+        serial_puts("[CXX-DIAG] GObjRegistrants: Data=0x");
+        serial_puthex(data_ptr, 8);
+        serial_puts(" Num=");
+        serial_putdec(num);
+        serial_puts(" Max=");
+        serial_putdec(max);
+        serial_puts("\n");
+
+        /* UObject::PrivateStaticClass at VA 0x102A1768 */
+        uint32_t *uobj = (uint32_t *)(ULONG_PTR)0x102A1768;
+        serial_puts("[CXX-DIAG] UObject.Index=0x");
+        serial_puthex(uobj[1], 8);  /* +0x04 = Index */
+        serial_puts("\n");
+
+        /* Dump first 16 bytes of UObject to check if registration changed anything */
+        serial_puts("[CXX-DIAG] UObject @0x102A1768 raw: ");
+        for (int i = 0; i < 16; i++) {
+            serial_puthex(uobj[i], 8);
+            serial_puts(" ");
+        }
+        serial_puts("\n");
+
+        /* Scan GObjRegistrants array: count zeros vs non-zero */
+        if (data_ptr && num > 0 && num < 10000) {
+            uint32_t *arr = (uint32_t *)(ULONG_PTR)data_ptr;
+            int zeros = 0, nonzeros = 0;
+            int first_nz = -1, last_nz = -1;
+            int uobj_idx = -1;
+            for (int i = 0; i < num && i < 300; i++) {
+                if (arr[i] == 0) {
+                    zeros++;
+                } else {
+                    nonzeros++;
+                    if (first_nz < 0) first_nz = i;
+                    last_nz = i;
+                }
+                if (arr[i] == 0x102A1768) uobj_idx = i;
+            }
+            serial_puts("[CXX-DIAG] zeros=");
+            serial_putdec(zeros);
+            serial_puts(" nonzeros=");
+            serial_putdec(nonzeros);
+            serial_puts(" first_nz=");
+            serial_putdec(first_nz >= 0 ? first_nz : -1);
+            serial_puts(" last_nz=");
+            serial_putdec(last_nz >= 0 ? last_nz : -1);
+            serial_puts(" UObject_idx=");
+            serial_putdec(uobj_idx >= 0 ? uobj_idx : -1);
+            serial_puts("\n");
+
+            /* Dump ALL non-zero entries (max 20) */
+            int shown = 0;
+            for (int i = 0; i < num && i < 300 && shown < 20; i++) {
+                if (arr[i] == 0) continue;
+                uint32_t ea = arr[i];
+                uint32_t *e = (uint32_t *)(ULONG_PTR)ea;
+                serial_puts("[CXX-DIAG] nz[");
+                serial_putdec(i);
+                serial_puts("] @0x");
+                serial_puthex(ea, 8);
+                serial_puts(": idx=");
+                serial_puthex(e[1], 8);
+                serial_puts(" flags=");
+                serial_puthex(e[7], 8);
+                serial_puts(" super=");
+                serial_puthex(e[10], 8);
+                serial_puts(" propSz=");
+                serial_puthex(*(uint32_t *)((uint8_t *)(ULONG_PTR)ea + 0x3C), 8);
+                serial_puts("\n");
+                shown++;
+            }
+
+            /* Also dump raw 32 bytes around the Data pointer to check alignment */
+            serial_puts("[CXX-DIAG] raw @Data+0x000:");
+            for (int i = 0; i < 8; i++) {
+                serial_puts(" ");
+                serial_puthex(arr[i], 8);
+            }
+            serial_puts("\n");
+            /* And at the end */
+            serial_puts("[CXX-DIAG] raw @Data+");
+            serial_puthex((num - 4) * 4, 4);
+            serial_puts(":");
+            for (int i = num - 4; i < num; i++) {
+                serial_puts(" ");
+                serial_puthex(arr[i < 0 ? 0 : i], 8);
+            }
+            serial_puts("\n");
+
+            /* Check the physical memory at the GObjRegistrants.Data address */
+            /* Read GObjNoRegister (at Core.dll RVA 0x1A21A0 → VA 0x102A21A0) */
+            uint32_t *noregister = (uint32_t *)(ULONG_PTR)0x102A21A0;
+            serial_puts("[CXX-DIAG] GObjNoRegister = ");
+            serial_putdec(*noregister);
+            serial_puts("\n");
+        }
+
+        /* Dump FName table: FName::Names is a TArray at 0x10295D30 (IAT resolved) */
+        /* Actually read the pointer from 0x10295D30 which is the Names TArray address */
+        uint32_t *fname_names = (uint32_t *)(ULONG_PTR)0x10295D30;
+        serial_puts("[CXX-DIAG] FName::Names: Data=0x");
+        serial_puthex(fname_names[0], 8);
+        serial_puts(" Num=");
+        serial_putdec((int32_t)fname_names[1]);
+        serial_puts(" Max=");
+        serial_putdec((int32_t)fname_names[2]);
+        serial_puts("\n");
+
+        /* Follow GetSuperClass JMP thunk to get actual implementation */
+        /* GetSuperClass VA=0x10103341, starts with E9 xx xx xx xx (JMP rel32) */
+        uint8_t *gsc = (uint8_t *)(ULONG_PTR)0x10103341;
+        if (gsc[0] == 0xE9) {
+            int32_t rel = *(int32_t *)(gsc + 1);
+            uint32_t target = 0x10103341 + 5 + rel;
+            uint8_t *impl = (uint8_t *)(ULONG_PTR)target;
+            serial_puts("[CXX-DIAG] GetSuperClass @0x");
+            serial_puthex(target, 8);
+            serial_puts(" bytes: ");
+            for (int i = 0; i < 8; i++) {
+                serial_puthex(impl[i], 2);
+                serial_puts(" ");
+            }
+            serial_puts("\n");
+            /* If mov eax,[ecx+XX]; ret → 8B 41 XX C3 */
+            if (impl[0] == 0x8B && impl[1] == 0x41) {
+                serial_puts("[CXX-DIAG] SuperField offset = +0x");
+                serial_puthex(impl[2], 2);
+                serial_puts("\n");
+            } else if (impl[0] == 0x8B && impl[1] == 0x81) {
+                int32_t off = *(int32_t *)(impl + 2);
+                serial_puts("[CXX-DIAG] SuperField offset = +0x");
+                serial_puthex(off, 8);
+                serial_puts("\n");
+            }
+        }
+    }
+    /* ── End diagnostic ────────────────────────────────────── */
 
     EXCEPTION_RECORD rec;
     BYTE *p = (BYTE *)&rec;

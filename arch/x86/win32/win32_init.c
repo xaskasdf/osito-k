@@ -142,7 +142,7 @@ static void idt_install_int2e(void)
     idt[vec].offset_mid  = (uint16_t)((addr >> 16) & 0xFFFF);
     idt[vec].offset_high = (uint32_t)((addr >> 32) & 0xFFFFFFFF);
     idt[vec].selector    = cs;
-    idt[vec].ist         = 0;
+    idt[vec].ist         = 1;     /* IST1: dedicated stack (avoids user stack pollution) */
     idt[vec].type_attr   = 0x8E;  /* present, DPL=0, 64-bit interrupt gate */
     idt[vec].reserved    = 0;
 

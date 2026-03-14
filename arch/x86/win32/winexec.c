@@ -32,6 +32,7 @@
 
 extern void  serial_puts(const char *s);
 extern void  serial_puthex(uint64_t val, int digits);
+extern void  serial_putdec(uint64_t val);
 extern void *mem_alloc_pages(uint64_t count);
 extern void  mem_free_pages(void *addr, uint64_t count);
 extern void  proc_exit(int32_t code);
@@ -446,6 +447,195 @@ int winexec_run(const uint8_t *file_data, uint64_t file_size)
 
     /* Pre-load all DLLs from filesystem (registers native classes) */
     winexec_preload_dlls();
+
+    /* ── Diagnostic: inspect UE1 GAutoRegister linked list ─────── */
+    {
+        LOADED_MODULE *core = dll_find_module("Core.dll");
+        if (!core) { serial_puts("[DIAG] Core.dll not found!\n"); }
+        else {
+            PVOID ar_ptr = dll_resolve_export(core,
+                "?GAutoRegister@UObject@@0PAV1@A", 0, FALSE);
+            PVOID uobj_psc = dll_resolve_export(core,
+                "?PrivateStaticClass@UObject@@0VUClass@@A", 0, FALSE);
+            /* GetSuperClass: read first few bytes to find SuperField offset */
+            PVOID gsc_fn = dll_resolve_export(core,
+                "?GetSuperClass@UClass@@QBEPAV1@XZ", 0, FALSE);
+
+            serial_puts("\n[DIAG] === GAutoRegister Inspection ===\n");
+            serial_puts("[DIAG] GAutoRegister @");
+            serial_puthex((uint64_t)(ULONG_PTR)ar_ptr, 8);
+            serial_puts("\n[DIAG] UObject::PrivateStaticClass @");
+            serial_puthex((uint64_t)(ULONG_PTR)uobj_psc, 8);
+            serial_puts("\n");
+
+            /* Disassemble GetSuperClass to find SuperField offset.
+             * Expected: mov eax,[ecx+XX]; ret  →  8B 41 XX C3 */
+            int super_offset = -1;
+            if (gsc_fn) {
+                uint8_t *code = (uint8_t *)gsc_fn;
+                serial_puts("[DIAG] GetSuperClass bytes:");
+                for (int b = 0; b < 8; b++) {
+                    serial_puts(" ");
+                    serial_puthex(code[b], 2);
+                }
+                serial_puts("\n");
+                if (code[0] == 0x8B && code[1] == 0x41) {
+                    super_offset = (int)(int8_t)code[2];
+                } else if (code[0] == 0x8B && code[1] == 0x81) {
+                    super_offset = *(int32_t *)(code + 2);
+                }
+                if (super_offset >= 0) {
+                    serial_puts("[DIAG] SuperField offset = +0x");
+                    serial_puthex(super_offset, 2);
+                    serial_puts("\n");
+                }
+            }
+
+            if (ar_ptr) {
+                uint32_t head = *(uint32_t *)ar_ptr;
+                serial_puts("[DIAG] GAutoRegister head = 0x");
+                serial_puthex(head, 8);
+                serial_puts("\n");
+
+                if (head == 0) {
+                    serial_puts("[DIAG] ** NULL — NO classes! **\n");
+                } else {
+                    /* Discover next offset */
+                    uint32_t first_vt = *(uint32_t *)(ULONG_PTR)head;
+                    int next_off = -1;
+                    for (int off = 4; off <= 32; off += 4) {
+                        uint32_t v = *(uint32_t *)((ULONG_PTR)head + off);
+                        if (v >= 0x100000 && v < 0x12000000
+                            && v != first_vt && v != head) {
+                            uint32_t pv = *(uint32_t *)(ULONG_PTR)v;
+                            if (pv == first_vt) { next_off = off; break; }
+                        }
+                    }
+                    serial_puts("[DIAG] next_off=+0x");
+                    serial_puthex(next_off >= 0 ? next_off : 0xFF, 2);
+                    serial_puts("\n");
+
+                    /* Count entries and find UObject's class */
+                    uint32_t cur = head;
+                    int total = 0;
+                    int uobj_idx = -1;
+                    uint32_t uobj_addr = uobj_psc
+                        ? (uint32_t)(ULONG_PTR)uobj_psc : 0;
+
+                    while (cur && total < 5000) {
+                        if (cur == uobj_addr) uobj_idx = total;
+                        total++;
+                        if (next_off < 0) break;
+                        uint32_t n = *(uint32_t *)((ULONG_PTR)cur + next_off);
+                        if (n == 0 || n < 0x1000) break;
+                        /* Validate: same vtable? */
+                        uint32_t nv = *(uint32_t *)(ULONG_PTR)n;
+                        if (nv != first_vt) break;
+                        cur = n;
+                    }
+
+                    serial_puts("[DIAG] total=");
+                    serial_putdec(total);
+                    serial_puts(" UObject_idx=");
+                    if (uobj_idx >= 0) serial_putdec(uobj_idx);
+                    else serial_puts("NOT_FOUND");
+                    serial_puts("\n");
+
+                    /* Dump UObject's PrivateStaticClass fields */
+                    if (uobj_psc) {
+                        uint8_t *p = (uint8_t *)uobj_psc;
+                        serial_puts("[DIAG] UObject UClass dump:\n");
+                        for (int j = 0; j < 64; j += 4) {
+                            uint32_t v = *(uint32_t *)(p + j);
+                            serial_puts("[DIAG]   +0x");
+                            serial_puthex(j, 2);
+                            serial_puts(": 0x");
+                            serial_puthex(v, 8);
+                            if (j == 0) serial_puts(" (vtable)");
+                            if (super_offset >= 0 && j == super_offset)
+                                serial_puts(" (SuperField)");
+                            if (j == 0x1C) serial_puts(" (flags?)");
+                            serial_puts("\n");
+                        }
+                    }
+
+                    /* Dump 3 entries: first, middle, last */
+                    int show_idx[] = {0, total/2, total-1};
+                    for (int si = 0; si < 3; si++) {
+                        int target = show_idx[si];
+                        cur = head;
+                        for (int k = 0; k < target && next_off >= 0; k++) {
+                            uint32_t n = *(uint32_t *)((ULONG_PTR)cur + next_off);
+                            if (n == 0 || n < 0x1000) break;
+                            cur = n;
+                        }
+                        serial_puts("[DIAG] entry[");
+                        serial_putdec(target);
+                        serial_puts("] @0x");
+                        serial_puthex(cur, 8);
+                        serial_puts(":\n");
+                        uint8_t *p = (uint8_t *)(ULONG_PTR)cur;
+                        for (int j = 0; j < 48; j += 4) {
+                            uint32_t v = *(uint32_t *)(p + j);
+                            serial_puts("[DIAG]   +0x");
+                            serial_puthex(j, 2);
+                            serial_puts(": 0x");
+                            serial_puthex(v, 8);
+                            if (super_offset >= 0 && j == super_offset)
+                                serial_puts(" <SuperField>");
+                            serial_puts("\n");
+                        }
+                    }
+                }
+            }
+            serial_puts("[DIAG] === End ===\n\n");
+        }
+    }
+
+    /*
+     * Pre-allocate GObjRegistrants TArray buffer to prevent realloc data loss.
+     *
+     * Root cause: FMallocWindows::Realloc during TArray growth fails to
+     * preserve existing entries (first 140 entries zeroed after growth from
+     * capacity 140→225). The native memcpy (MSVC intrinsic) loses data,
+     * possibly due to physical page aliasing between identity-mapped kernel
+     * VA and VirtualAlloc-mapped PE VA.
+     *
+     * Fix: pre-allocate a large buffer for GObjRegistrants before the PE
+     * entry point runs. With enough capacity, the TArray never needs to grow.
+     */
+    {
+        LOADED_MODULE *core = dll_find_module("Core.dll");
+        if (core) {
+            PVOID gobjreg_ptr = dll_resolve_export(core,
+                "?GObjRegistrants@UObject@@0V?$TArray@PAVUObject@@@@A", 0, FALSE);
+            if (gobjreg_ptr) {
+                uint32_t *tarray = (uint32_t *)gobjreg_ptr;
+                /* Use a page from the PE image range (already identity-mapped
+                 * and accessible from 32-bit compat mode). Allocate 1 page =
+                 * 4096 bytes = room for 1024 UObject* entries (4 bytes each). */
+                void *buf = mem_alloc_pages(1);
+                if (buf) {
+                    uint64_t pa = (uint64_t)buf;
+                    /* Zero via identity-mapped VA (PA == VA for kernel) */
+                    uint8_t *p = (uint8_t *)pa;
+                    for (int i = 0; i < 4096; i++) p[i] = 0;
+
+                    /* The buffer is at PA which is identity-mapped as VA=PA.
+                     * 32-bit PE code can access it since PA < 4GB. */
+                    tarray[0] = (uint32_t)pa;   /* Data pointer */
+                    tarray[1] = 0;              /* Num = 0 */
+                    tarray[2] = 1024;           /* Max = 1024 entries */
+
+                    serial_puts("[WINEXEC] Pre-allocated GObjRegistrants: Data=0x");
+                    serial_puthex(pa, 8);
+                    serial_puts(" Max=1024 @TArray=0x");
+                    serial_puthex((uint64_t)(ULONG_PTR)gobjreg_ptr, 8);
+                    serial_puts("\n");
+                }
+            }
+        }
+    }
 
     /* Allocate user stack */
     uint64_t stack_size = info.StackCommit;

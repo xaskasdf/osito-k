@@ -42,6 +42,8 @@ static uint32_t thunk_count = 0;
 
 static compat32_thunk_t thunk_table[COMPAT32_MAX_THUNKS];
 
+/* INT 0x2E now uses IST1 via TSS — no manual stack management needed */
+
 /* ── FName::Names diagnostic ────────────────────────────────── */
 /*
  * Address of FName::Names TArray<FNameEntry*> in Core.dll.
@@ -846,7 +848,7 @@ void compat32_callback(uint32_t func_addr)
         /* never reached — control flows via longjmp */
     }
 
-    /* longjmp returned here — 32-bit function is done */
+    /* longjmp returned here — 32-bit function is done. */
     callback_depth--;
     serial_puts("[CB32] depth=");
     serial_putdec(depth);
@@ -913,7 +915,7 @@ uint32_t compat32_callback_args(uint32_t func_addr, int nargs, const uint32_t *a
         /* never reached */
     }
 
-    /* longjmp returned — 32-bit function is done */
+    /* longjmp returned — 32-bit function is done. */
     callback_depth--;
     return callback_retval;
 #else
