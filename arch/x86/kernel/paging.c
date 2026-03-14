@@ -462,3 +462,106 @@ void paging_init(void)
     fb_putdec(pt_pages_used * 4);
     fb_puts(" KB tables\n");
 }
+
+/* ── Win32 per-process page table ────────────────────────────────
+ *
+ * Creates a separate PML4 for Win32 PE32 processes. The key difference:
+ * PDPT[1] (VAs 0x40000000-0x7FFFFFFF) has its own Page Directory so
+ * VirtualAlloc mappings don't alias with the kernel's identity map.
+ *
+ * Layout:
+ *   Win32 PML4 → shares kernel PML4 entries (0..511)
+ *     EXCEPT PML4[0] → new PDPT
+ *       PDPT[0] → shared with kernel (0x0-0x3FFFFFFF)
+ *       PDPT[1] → OWN PD (0x40000000-0x7FFFFFFF, VirtualAlloc range)
+ *       PDPT[2..3] → shared with kernel (0x80000000-0xFFFFFFFF)
+ *       (rest shared)
+ */
+
+static uint64_t *win32_pml4;
+static uint64_t  win32_cr3_val;
+static uint64_t *win32_pdpt;    /* Our own PDPT for PML4[0] */
+static uint64_t *win32_pd1;     /* Our own PD for PDPT[1] (VirtualAlloc) */
+
+uint64_t paging_create_win32_cr3(void)
+{
+    if (!kernel_pml4) return 0;
+
+    /* 1. Allocate new PML4 — copy all entries from kernel */
+    win32_pml4 = pt_alloc_page();
+    if (!win32_pml4) return 0;
+    memcpy(win32_pml4, kernel_pml4, PAGE_SIZE);
+
+    /* 2. Get kernel's PDPT for PML4[0] */
+    uint64_t *kernel_pdpt = (uint64_t *)(kernel_pml4[0] & PTE_ADDR_MASK);
+
+    /* 3. Allocate new PDPT for Win32, copy kernel's */
+    win32_pdpt = pt_alloc_page();
+    if (!win32_pdpt) return 0;
+    memcpy(win32_pdpt, kernel_pdpt, PAGE_SIZE);
+
+    /* 4. Allocate new PD for PDPT[1] (0x40000000-0x7FFFFFFF) */
+    win32_pd1 = pt_alloc_page();
+    if (!win32_pd1) return 0;
+
+    /* Copy kernel's PD for this range (identity-map entries) */
+    if (kernel_pdpt[1] & PTE_PRESENT) {
+        uint64_t *kernel_pd1 = (uint64_t *)(kernel_pdpt[1] & PTE_ADDR_MASK);
+        memcpy(win32_pd1, kernel_pd1, PAGE_SIZE);
+    }
+
+    /* 5. Wire up: Win32 PDPT[1] → our own PD */
+    win32_pdpt[1] = (uint64_t)win32_pd1 | PTE_PRESENT | PTE_WRITABLE;
+
+    /* 6. Wire up: Win32 PML4[0] → our PDPT */
+    win32_pml4[0] = (uint64_t)win32_pdpt | PTE_PRESENT | PTE_WRITABLE;
+
+    win32_cr3_val = (uint64_t)win32_pml4;
+
+    serial_puts("[PAGE] Win32 CR3 created: PML4=0x");
+    serial_puthex(win32_cr3_val, 8);
+    serial_puts(" PDPT=0x");
+    serial_puthex((uint64_t)win32_pdpt, 8);
+    serial_puts(" PD1=0x");
+    serial_puthex((uint64_t)win32_pd1, 8);
+    serial_puts("\n");
+
+    return win32_cr3_val;
+}
+
+/* Map a 4KB page in the Win32 address space (for VirtualAlloc) */
+int paging_win32_map_page(uint64_t virt, uint64_t phys, uint64_t flags)
+{
+    if (!win32_pml4) return -1;
+
+    /* VirtualAlloc VAs are in PDPT[1] range (0x40000000-0x7FFFFFFF).
+     * We use win32_pd1 directly. */
+    int pd_idx = PD_INDEX(virt);
+
+    /* If PD entry is a 2MB large page, split it */
+    if ((win32_pd1[pd_idx] & PTE_PRESENT) && (win32_pd1[pd_idx] & PTE_LARGE)) {
+        uint64_t large_phys = win32_pd1[pd_idx] & 0x000FFFFFFFE00000ULL;
+        uint64_t large_flags = win32_pd1[pd_idx] & ~(PTE_ADDR_MASK | PTE_LARGE);
+        uint64_t *pt = pt_alloc_page();
+        if (!pt) return -1;
+        for (int i = 0; i < 512; i++)
+            pt[i] = (large_phys + i * PAGE_SIZE) | large_flags;
+        win32_pd1[pd_idx] = (uint64_t)pt | PTE_PRESENT | PTE_WRITABLE;
+    }
+
+    /* Get or create PT */
+    uint64_t *pt;
+    if (win32_pd1[pd_idx] & PTE_PRESENT) {
+        pt = (uint64_t *)(win32_pd1[pd_idx] & PTE_ADDR_MASK);
+    } else {
+        pt = pt_alloc_page();
+        if (!pt) return -1;
+        win32_pd1[pd_idx] = (uint64_t)pt | PTE_PRESENT | PTE_WRITABLE;
+    }
+
+    pt[PT_INDEX(virt)] = (phys & PTE_ADDR_MASK) | flags;
+    invlpg(virt);
+    return 0;
+}
+
+uint64_t paging_get_win32_cr3(void) { return win32_cr3_val; }

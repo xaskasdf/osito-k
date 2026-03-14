@@ -42,6 +42,7 @@ extern void  mem_free_pages(void *addr, uint64_t count);
 
 /* Paging */
 extern int paging_map_page(uint64_t virt, uint64_t phys, uint64_t flags);
+extern int paging_win32_map_page(uint64_t virt, uint64_t phys, uint64_t flags);
 extern int paging_unmap_page(uint64_t virt);
 extern int paging_set_flags(uint64_t virt, uint64_t flags);
 
@@ -127,15 +128,17 @@ static PVOID win32_va_alloc(SIZE_T size, uint64_t *out_phys)
     }
     win32_va_next = va + size;
 
-    /* Map each 4KB page: VA → PA */
+    /* Map each 4KB page in Win32 page table ONLY (not kernel).
+     * This prevents identity-mapping aliasing: kernel can't see
+     * VirtualAlloc VAs, so recycled PAs don't corrupt live data. */
     uint64_t pa = (uint64_t)phys;
     for (uint64_t i = 0; i < pages; i++) {
-        paging_map_page(va + i * 4096, pa + i * 4096,
-                        PTE_PRESENT | PTE_WRITABLE);
+        paging_win32_map_page(va + i * 4096, pa + i * 4096,
+                              PTE_PRESENT | PTE_WRITABLE);
     }
 
-    /* Zero via the new VA — safe, this address is fresh */
-    nt_memset((void *)va, 0, size);
+    /* Zero via identity-mapped PA (works in both page tables) */
+    nt_memset((void *)pa, 0, size);
 
     if (out_phys) *out_phys = pa;
     return (PVOID)va;

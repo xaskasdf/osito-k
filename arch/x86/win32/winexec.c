@@ -329,6 +329,12 @@ int winexec_run(const uint8_t *file_data, uint64_t file_size)
 {
     serial_puts("\n=== OsitoK Windows Compatibility Layer ===\n");
 
+    /* Create Win32 per-process page table (fixes VirtualAlloc aliasing) */
+    {
+        extern uint64_t paging_create_win32_cr3(void);
+        paging_create_win32_cr3();
+    }
+
     /* Initialize subsystems */
     NT_SERVICE_TABLE ssdt;
     nt_syscall_init(&ssdt);
@@ -722,6 +728,12 @@ int winexec_run(const uint8_t *file_data, uint64_t file_size)
 
     /* If entry point returns (unusual — most call ExitProcess) */
     serial_puts("[WINEXEC] PE entry returned\n");
+
+    /* Restore kernel CR3 */
+    {
+        extern uint64_t paging_get_kernel_cr3(void);
+        __asm__ volatile ("mov %0, %%cr3" : : "r"(paging_get_kernel_cr3()) : "memory");
+    }
 
     /* Cleanup */
     mem_free_pages(stack_base, stack_pages);
