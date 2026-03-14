@@ -443,9 +443,11 @@ void RtlRaiseException(PEXCEPTION_RECORD ExceptionRecord)
     serial_puthex(ExceptionRecord->ExceptionCode, 8);
     serial_puts("\n");
 
-    /* Walk the exception handler chain from TEB */
+    /* Walk the exception handler chain from TEB32 (compat32 code writes
+     * SEH records via FS:[0] which points to g_teb32, not g_teb) */
+    extern TEB32 g_teb32;
     PEXCEPTION_REGISTRATION_RECORD frame =
-        (PEXCEPTION_REGISTRATION_RECORD)g_teb.ExceptionList;
+        (PEXCEPTION_REGISTRATION_RECORD)(ULONG_PTR)g_teb32.ExceptionList;
 
     while (frame && frame != EXCEPTION_CHAIN_END) {
         serial_puts("[SEH] trying handler at ");

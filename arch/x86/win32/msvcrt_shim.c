@@ -1979,6 +1979,60 @@ void WINAPI crt_CxxThrowException(PVOID pExceptionObject, PVOID pThrowInfo)
     serial_puthex((uint64_t)(ULONG_PTR)pThrowInfo, 8);
     serial_puts("\n");
 
+    /*
+     * _CxxThrowException MUST NOT RETURN. The MSVC implementation calls
+     * RaiseException(0xE06D7363, EXCEPTION_NONCONTINUABLE, 3, args)
+     * which triggers SEH dispatch → __CxxFrameHandler → catch block.
+     *
+     * We implement a minimal SEH dispatch: walk the chain from
+     * g_teb32.ExceptionList, call each handler via compat32_callback,
+     * looking for EXCEPTION_EXECUTE_HANDLER. If found, restore the
+     * handler's stack frame and longjmp to the catch block.
+     *
+     * For now: call RaiseException which walks the SEH chain from
+     * g_teb32 and dispatches to registered handlers.
+     */
+    {
+        extern TEB32 g_teb32;
+        uint32_t seh_head = g_teb32.ExceptionList;
+        serial_puts("[CXX] SEH chain head: 0x");
+        serial_puthex(seh_head, 8);
+        serial_puts("\n");
+
+        if (seh_head != 0xFFFFFFFF && seh_head != 0) {
+            /* Walk the SEH chain and dump handlers */
+            uint32_t *frame = (uint32_t *)(ULONG_PTR)seh_head;
+            for (int i = 0; i < 5 && frame && (uint32_t)(ULONG_PTR)frame != 0xFFFFFFFF; i++) {
+                uint32_t next = frame[0];
+                uint32_t handler = frame[1];
+                serial_puts("[CXX]  frame[");
+                serial_putdec(i);
+                serial_puts("] at 0x");
+                serial_puthex((uint64_t)(ULONG_PTR)frame, 8);
+                serial_puts(" handler=0x");
+                serial_puthex(handler, 8);
+                serial_puts(" next=0x");
+                serial_puthex(next, 8);
+                serial_puts("\n");
+                frame = (next == 0xFFFFFFFF) ? NULL : (uint32_t *)(ULONG_PTR)next;
+            }
+        }
+    }
+
+    /* Call RaiseException with the C++ exception code.
+     * This will dispatch through the SEH chain. */
+    {
+        ULONG_PTR args[3];
+        args[0] = 0x19930520;  /* EH_MAGIC_NUMBER1 */
+        args[1] = (ULONG_PTR)pExceptionObject;
+        args[2] = (ULONG_PTR)pThrowInfo;
+        RaiseException(0xE06D7363, 1 /* EXCEPTION_NONCONTINUABLE */, 3, args);
+    }
+
+    /* If RaiseException returns (shouldn't for noncontinuable), halt */
+    serial_puts("[CXX] FATAL: _CxxThrowException returned!\n");
+    for (;;) __asm__ volatile ("hlt");
+
     /* ── Diagnostic: dump GObjRegistrants state ────────────── */
     {
         /* GObjRegistrants@UObject is a TArray<UObject*> at Core.dll export RVA 0x1A0360

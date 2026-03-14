@@ -367,7 +367,9 @@ static uint8_t guess_num_args(const char *name)
         { "MoveFileA",            2 }, { "CopyFileA",             3 },
         { "GetFileAttributesA",   1 }, { "SetFileAttributesA",    2 },
         { "GetPrivateProfileSectionNamesA", 3 },
-        { "GetComputerNameA",     2 },
+        { "GetComputerNameA",     2 }, { "GetComputerNameW",     2 },
+        { "GetVersionExA",        1 }, { "GetVersionExW",        1 },
+        { "FormatMessageA",       7 }, { "FormatMessageW",       7 },
 
         /* user32 */
         { "RegisterClassA",       1 }, { "RegisterClassExA",      1 },
@@ -1349,15 +1351,27 @@ uint64_t compat32_dispatch(uint32_t thunk_idx, uint32_t *stack_args)
     {
         static uint32_t int2e_call_count = 0;
         int2e_call_count++;
-        /* Log first 200 calls, then every 100th */
-        if (int2e_call_count <= 200 || (int2e_call_count % 100) == 0) {
+        /* Log first 200, every 100th, AND last calls before crash
+         * (always log _CxxThrowException and RaiseException) */
+        int do_log = (int2e_call_count <= 200 || (int2e_call_count % 100) == 0);
+        /* Always log exception-related functions */
+        if (t->name && (t->name[0] == '_' && t->name[1] == 'C'))  /* _Cxx* */
+            do_log = 1;
+        if (t->name && t->name[0] == 'R' && t->name[1] == 'a')   /* Raise* */
+            do_log = 1;
+        /* Log last 20 calls before throttle boundary */
+        if (int2e_call_count > 1300)
+            do_log = 1;
+        if (do_log) {
             serial_puts("[INT2E] #");
             serial_putdec(thunk_idx);
             serial_puts(" ");
             if (t->name) serial_puts(t->name);
             serial_puts(" (");
             serial_putdec(nargs);
-            serial_puts(" args)\n");
+            serial_puts(" args) [call ");
+            serial_putdec(int2e_call_count);
+            serial_puts("]\n");
         }
     }
 
