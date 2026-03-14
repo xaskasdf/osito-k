@@ -158,6 +158,7 @@ static int64_t kern_write(int fd, const void *buf, uint64_t n)
 static void *kern_mmap(void *addr, uint64_t len, int prot,
                         int flags, int fd, int64_t off)
 {
+    (void)off;
     int64_t r = syscall_dispatch(9/*SYS_MMAP*/, (uint64_t)addr, len,
                                   (uint64_t)prot, (uint64_t)flags,
                                   (uint64_t)fd);
@@ -344,7 +345,14 @@ static uint64_t resolve_symbol(dl_module_t *m, uint32_t sym_idx)
     if (sym->st_shndx != SHN_UNDEF)
         return m->load_bias + sym->st_value;
 
-    /* Search other loaded modules */
+    /* Kernel exports FIRST — critical for ring 0 execution.
+     * Functions like mmap/open/write must go through kernel stubs
+     * (which call syscall_dispatch directly) instead of libc's
+     * wrappers (which use the SYSCALL instruction, broken in ring 0). */
+    uint64_t addr = ksym_resolve(name);
+    if (addr) return addr;
+
+    /* Then search other loaded modules */
     for (int i = 0; i < DL_MAX_MODULES; i++) {
         if (!modules[i].loaded) continue;
         if (&modules[i] == m) continue;
@@ -352,8 +360,7 @@ static uint64_t resolve_symbol(dl_module_t *m, uint32_t sym_idx)
         if (val) return (uint64_t)val;
     }
 
-    /* Look up in kernel export table */
-    uint64_t addr = ksym_resolve(name);
+    /* Not found anywhere */
     if (!addr) {
         static int unresolved_log = 0;
         if (unresolved_log < 20) {

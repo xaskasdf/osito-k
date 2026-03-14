@@ -1076,11 +1076,17 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
 
     /* PROT_NONE: reserve virtual address space without allocating pages.
      * Used by PartitionAlloc, jemalloc, etc. to reserve large VA pools.
-     * Pages are allocated later via mprotect(PROT_READ|PROT_WRITE). */
+     * Pages are allocated later via mprotect(PROT_READ|PROT_WRITE).
+     * Honor addr hint if given — PA needs specific alignment. */
     if (prot == 0 /* PROT_NONE */) {
         static uint64_t reserve_base = 0x500000000ULL;  /* 20GB — above RAM */
-        uint64_t result = reserve_base;
-        reserve_base += npages * 4096;
+        uint64_t result;
+        if (addr && (addr & 0xFFF) == 0) {
+            result = addr;  /* Honor the hint (no physical pages, so any VA works) */
+        } else {
+            result = reserve_base;
+            reserve_base += npages * 4096;
+        }
 
         vma_table[vi].base   = result;
         vma_table[vi].pages  = npages;
@@ -1185,6 +1191,48 @@ static int64_t sys_mprotect(uint64_t addr, uint64_t length, uint64_t prot)
     /* If addr is in identity-mapped region (not from mmap),
      * still allow mprotect as a no-op for compatibility */
     return 0;
+}
+
+/* ── Demand paging — called from #PF handler in idt.c ──────────
+ * If the faulting address is in a VMA (even PROT_NONE), allocate a
+ * physical page and map it. This implements lazy page commitment
+ * for mmap(PROT_NONE) reservations used by PartitionAlloc etc.
+ * Returns 0 on success (page mapped, resume execution), -1 on failure. */
+extern int paging_map_page(uint64_t virt, uint64_t phys, uint64_t flags);
+extern void *mem_alloc_pages(uint64_t count);
+
+static uint64_t prot_to_pte_flags(uint32_t prot);
+
+int demand_page_fault(uint64_t addr, uint64_t error_code)
+{
+    /* Only handle not-present faults (bit 0 clear) */
+    if (error_code & 1) return -1;  /* page present — protection violation */
+
+    uint64_t page_addr = addr & ~0xFFFULL;
+
+    for (int i = 0; i < MAX_VMAS; i++) {
+        if (!vma_table[i].in_use) continue;
+        uint64_t vma_end = vma_table[i].base + vma_table[i].pages * 4096;
+        if (addr >= vma_table[i].base && addr < vma_end) {
+            /* Found VMA — allocate and map the faulting page */
+            void *page = mem_alloc_pages(1);
+            if (!page) return -1;
+            memset(page, 0, 4096);
+
+            /* Use RW flags (the VMA was reserved, now being committed) */
+            uint64_t flags = 0x03; /* PTE_PRESENT | PTE_WRITABLE */
+            if (paging_map_page(page_addr, (uint64_t)page, flags) != 0)
+                return -1;
+
+            /* Update VMA prot if it was PROT_NONE */
+            if (vma_table[i].prot == 0)
+                vma_table[i].prot = 3; /* PROT_READ | PROT_WRITE */
+
+            return 0;  /* Success — resume execution */
+        }
+    }
+
+    return -1;  /* Address not in any VMA */
 }
 
 /* writev — gather write (used by printf/puts in newlib) */

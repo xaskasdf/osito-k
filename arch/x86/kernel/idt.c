@@ -639,10 +639,18 @@ void isr_handler(interrupt_frame_t *frame)
             serial_puts("\n");
         }
 
-        /* Page fault: decode CR2 */
+        /* Page fault: demand paging for mmap'd regions */
         if (vec == 14) {
             uint64_t cr2;
             __asm__ volatile ("mov %%cr2, %0" : "=r"(cr2));
+
+            /* Try demand paging: allocate page on fault within VMA */
+            {
+                extern int demand_page_fault(uint64_t addr, uint64_t error_code);
+                if (demand_page_fault(cr2, frame->error_code) == 0)
+                    return;  /* Page mapped — resume execution */
+            }
+
             serial_puts("  CR2 = 0x");
             serial_puthex(cr2, 16);
             serial_puts(" (faulting address)\n");
