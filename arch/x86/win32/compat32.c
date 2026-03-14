@@ -370,6 +370,7 @@ static uint8_t guess_num_args(const char *name)
         { "GetComputerNameA",     2 }, { "GetComputerNameW",     2 },
         { "GetVersionExA",        1 }, { "GetVersionExW",        1 },
         { "FormatMessageA",       7 }, { "FormatMessageW",       7 },
+        { "GetUserNameA",         2 }, { "GetUserNameW",         2 },
 
         /* user32 */
         { "RegisterClassA",       1 }, { "RegisterClassExA",      1 },
