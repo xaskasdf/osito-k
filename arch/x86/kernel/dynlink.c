@@ -9,11 +9,13 @@
  *   - PT_DYNAMIC parsing (DT_SYMTAB, DT_STRTAB, DT_HASH, DT_RELA, DT_JMPREL)
  *   - Relocations: R_X86_64_RELATIVE, R_X86_64_64, R_X86_64_GLOB_DAT, R_X86_64_JUMP_SLOT
  *   - Kernel symbol resolution via export table
+ *   - Cross-module symbol resolution for shared library dependencies
  *   - ELF SysV hash for O(1) symbol lookup
- *   - DT_INIT/DT_FINI constructor/destructor calls
+ *   - DT_INIT/DT_FINI/DT_INIT_ARRAY constructor/destructor calls
  */
 
 #include "../include/types.h"
+#include "../include/dynlink.h"
 
 /* ── External functions ──────────────────────────────────────── */
 
@@ -29,11 +31,18 @@ extern void  mem_free_pages(void *addr, uint64_t count);
 extern void *kmalloc(uint64_t size);
 extern void  kfree(void *ptr);
 
+/* Memory/string functions for kernel symbol export */
+extern void *kcalloc(uint64_t count, uint64_t size);
+extern void *krealloc(void *ptr, uint64_t new_size);
+extern void *memmove(void *dst, const void *src, uint64_t n);
+extern int   strncmp(const char *a, const char *b, uint64_t n);
+extern char *strcpy(char *dst, const char *src);
+
 /* OsitoFS */
 extern void *osfs2_find(const char *name);
 extern int   osfs2_read(void *file, uint64_t offset, void *buf, uint64_t len);
 
-/* ── ELF64 types (local to avoid conflict with elf.c) ───────── */
+/* ── ELF64 types (local to dl_open) ────────────────────────── */
 
 #define DL_EI_NIDENT   16
 #define DL_ELFCLASS64  2
@@ -44,41 +53,6 @@ extern int   osfs2_read(void *file, uint64_t offset, void *buf, uint64_t len);
 #define DL_PT_NULL     0
 #define DL_PT_LOAD     1
 #define DL_PT_DYNAMIC  2
-
-/* Dynamic tags */
-#define DT_NULL     0
-#define DT_HASH     4
-#define DT_STRTAB   5
-#define DT_SYMTAB   6
-#define DT_RELA     7
-#define DT_RELASZ   8
-#define DT_RELAENT  9
-#define DT_STRSZ    10
-#define DT_SYMENT   11
-#define DT_INIT     12
-#define DT_FINI     13
-#define DT_PLTREL   20
-#define DT_JMPREL   23
-#define DT_PLTRELSZ 2
-#define DT_GNU_HASH 0x6ffffef5
-
-/* Relocation types */
-#define R_X86_64_NONE      0
-#define R_X86_64_64        1
-#define R_X86_64_GLOB_DAT  6
-#define R_X86_64_JUMP_SLOT 7
-#define R_X86_64_RELATIVE  8
-
-#define ELF64_R_SYM(i)    ((uint32_t)((i) >> 32))
-#define ELF64_R_TYPE(i)   ((uint32_t)((i) & 0xffffffffULL))
-#define ELF64_ST_BIND(i)  ((i) >> 4)
-#define ELF64_ST_TYPE(i)  ((i) & 0xf)
-
-#define STB_GLOBAL  1
-#define STB_WEAK    2
-#define STT_FUNC    2
-#define STT_OBJECT  1
-#define SHN_UNDEF   0
 
 typedef struct {
     uint8_t  e_ident[DL_EI_NIDENT];
@@ -108,58 +82,39 @@ typedef struct {
     uint64_t p_align;
 } dl_phdr_t;
 
-typedef struct {
-    int64_t  d_tag;
-    uint64_t d_val;
-} dl_dyn_t;
-
-typedef struct {
-    uint32_t st_name;
-    uint8_t  st_info;
-    uint8_t  st_other;
-    uint16_t st_shndx;
-    uint64_t st_value;
-    uint64_t st_size;
-} dl_sym_t;
-
-typedef struct {
-    uint64_t r_offset;
-    uint64_t r_info;
-    int64_t  r_addend;
-} dl_rela_t;
-
 /* ── Module table ───────────────────────────────────────────── */
 
-#define MAX_MODULES     8
-#define MAX_MOD_NAME    64
+static dl_module_t modules[DL_MAX_MODULES];
 
-typedef struct {
-    bool        loaded;
-    char        name[MAX_MOD_NAME];
-    void       *base;
-    uint64_t    load_bias;     /* base - vaddr_min */
-    uint64_t    size;
-    uint64_t    pages;
+/* ── Stub functions for kernel symbol fallback ─────────────── */
 
-    /* Dynamic symbol table */
-    dl_sym_t   *symtab;
-    char       *strtab;
-    uint64_t    strtab_sz;
-    uint32_t    sym_count;
+static void stub_exit(int code)
+{
+    serial_puts("[DL] exit(");
+    serial_putdec((uint64_t)code);
+    serial_puts(")\n");
+    for (;;) __asm__ volatile("hlt");
+}
 
-    /* ELF SysV hash */
-    uint32_t   *hashtab;
-    uint32_t    nbucket;
-    uint32_t    nchain;
+static int64_t stub_write(int fd, const void *buf, uint64_t n)
+{
+    (void)fd;
+    char tmp[2] = {0, 0};
+    const char *p = (const char *)buf;
+    for (uint64_t i = 0; i < n; i++) {
+        tmp[0] = p[i];
+        serial_puts(tmp);
+    }
+    return (int64_t)n;
+}
 
-    /* Init/fini */
-    void      (*init_fn)(void);
-    void      (*fini_fn)(void);
+static int64_t stub_read(int fd, void *buf, uint64_t n)
+{
+    (void)fd; (void)buf; (void)n;
+    return 0;
+}
 
-    uint32_t    refcount;
-} dl_module_t;
-
-static dl_module_t modules[MAX_MODULES];
+static int stub_noop(void) { return 0; }
 
 /* ── Kernel symbol export table ─────────────────────────────── */
 
@@ -169,14 +124,48 @@ typedef struct {
 } ksym_entry_t;
 
 static const ksym_entry_t ksym_table[] = {
+    /* Kernel I/O */
     { "serial_puts",    (uint64_t)serial_puts    },
     { "serial_putdec",  (uint64_t)serial_putdec  },
     { "serial_puthex",  (uint64_t)serial_puthex  },
     { "fb_puts",        (uint64_t)fb_puts        },
     { "fb_puts_color",  (uint64_t)fb_puts_color  },
     { "fb_putdec",      (uint64_t)fb_putdec      },
+
+    /* Memory allocation */
     { "kmalloc",        (uint64_t)kmalloc        },
     { "kfree",          (uint64_t)kfree          },
+    { "malloc",         (uint64_t)kmalloc        },
+    { "free",           (uint64_t)kfree          },
+    { "calloc",         (uint64_t)kcalloc        },
+    { "realloc",        (uint64_t)krealloc       },
+
+    /* Memory ops */
+    { "memcpy",         (uint64_t)memcpy         },
+    { "memset",         (uint64_t)memset         },
+    { "memmove",        (uint64_t)memmove        },
+
+    /* String */
+    { "strlen",         (uint64_t)strlen         },
+    { "strcmp",          (uint64_t)strcmp          },
+    { "strncmp",        (uint64_t)strncmp        },
+    { "strcpy",         (uint64_t)strcpy         },
+
+    /* Process */
+    { "exit",           (uint64_t)stub_exit      },
+    { "_exit",          (uint64_t)stub_exit      },
+    { "abort",          (uint64_t)stub_exit      },
+
+    /* I/O (minimal stubs) */
+    { "write",          (uint64_t)stub_write     },
+    { "read",           (uint64_t)stub_read      },
+
+    /* Threading (no-ops for single-threaded) */
+    { "pthread_mutex_lock",    (uint64_t)stub_noop },
+    { "pthread_mutex_unlock",  (uint64_t)stub_noop },
+    { "pthread_mutex_init",    (uint64_t)stub_noop },
+    { "pthread_mutex_destroy", (uint64_t)stub_noop },
+
     { NULL, 0 }
 };
 
@@ -206,7 +195,7 @@ static uint32_t elf_hash(const char *name)
 
 /* ── GNU hash: compute symbol count ─────────────────────────── */
 
-static uint32_t gnu_hash_nsyms(const uint32_t *gnu_hash)
+uint32_t dl_gnu_hash_nsyms(const uint32_t *gnu_hash)
 {
     uint32_t nbuckets   = gnu_hash[0];
     uint32_t symoffset  = gnu_hash[1];
@@ -239,7 +228,7 @@ static uint32_t gnu_hash_nsyms(const uint32_t *gnu_hash)
 
 static dl_module_t *mod_alloc(void)
 {
-    for (int i = 0; i < MAX_MODULES; i++) {
+    for (int i = 0; i < DL_MAX_MODULES; i++) {
         if (!modules[i].loaded)
             return &modules[i];
     }
@@ -250,14 +239,14 @@ static dl_module_t *mod_alloc(void)
 
 static dl_module_t *mod_find(const char *name)
 {
-    for (int i = 0; i < MAX_MODULES; i++) {
+    for (int i = 0; i < DL_MAX_MODULES; i++) {
         if (modules[i].loaded && strcmp(modules[i].name, name) == 0)
             return &modules[i];
     }
     return NULL;
 }
 
-/* ── Resolve symbol for relocation ──────────────────────────── */
+/* ── Resolve symbol (with cross-module lookup) ──────────────── */
 
 static uint64_t resolve_symbol(dl_module_t *m, uint32_t sym_idx)
 {
@@ -267,23 +256,37 @@ static uint64_t resolve_symbol(dl_module_t *m, uint32_t sym_idx)
     dl_sym_t *sym = &m->symtab[sym_idx];
     const char *name = m->strtab + sym->st_name;
 
-    /* Defined in module */
+    /* Defined in this module */
     if (sym->st_shndx != SHN_UNDEF)
         return m->load_bias + sym->st_value;
+
+    /* Search other loaded modules */
+    for (int i = 0; i < DL_MAX_MODULES; i++) {
+        if (!modules[i].loaded) continue;
+        if (&modules[i] == m) continue;
+        void *val = dl_sym(&modules[i], name);
+        if (val) return (uint64_t)val;
+    }
 
     /* Look up in kernel export table */
     uint64_t addr = ksym_resolve(name);
     if (!addr) {
-        serial_puts("[DL] Unresolved: ");
-        serial_puts(name);
-        serial_puts("\n");
+        static int unresolved_log = 0;
+        if (unresolved_log < 20) {
+            serial_puts("[DL] Unresolved: ");
+            serial_puts(name);
+            serial_puts("\n");
+        } else if (unresolved_log == 20) {
+            serial_puts("[DL] (suppressing further unresolved)\n");
+        }
+        unresolved_log++;
     }
     return addr;
 }
 
 /* ── Apply relocations ──────────────────────────────────────── */
 
-static int apply_rela(dl_module_t *m, const dl_rela_t *rela, uint64_t count)
+int dl_apply_rela(dl_module_t *m, const dl_rela_t *rela, uint64_t count)
 {
     uint32_t resolved = 0, failed = 0;
 
@@ -315,6 +318,19 @@ static int apply_rela(dl_module_t *m, const dl_rela_t *rela, uint64_t count)
             break;
         }
 
+        case R_X86_64_IRELATIVE: {
+            /* IFUNC: call resolver to get optimal implementation */
+            typedef uint64_t (*ifunc_resolver_t)(void);
+            ifunc_resolver_t resolver = (ifunc_resolver_t)(m->load_bias + rela[i].r_addend);
+            *target = resolver();
+            resolved++;
+            break;
+        }
+
+        case R_X86_64_TPOFF32:
+            /* TLS offset — skip silently (no TLS support yet) */
+            break;
+
         case R_X86_64_NONE:
             break;
 
@@ -343,6 +359,11 @@ static int apply_rela(dl_module_t *m, const dl_rela_t *rela, uint64_t count)
 /* ── dl_open: load shared object ────────────────────────────── */
 
 void *dl_open(const char *filename)
+{
+    return dl_open_flags(filename, 0);
+}
+
+void *dl_open_flags(const char *filename, int flags)
 {
     serial_puts("[DL] Opening '");
     serial_puts(filename);
@@ -493,25 +514,28 @@ void *dl_open(const char *filename)
     /* ── Parse dynamic table ─────────────────────────────────── */
 
     uint64_t dt_symtab = 0, dt_strtab = 0, dt_strsz = 0;
-    uint64_t dt_hash = 0, dt_gnu_hash = 0;
+    uint64_t dt_hash = 0, dt_gnu_hash_val = 0;
     uint64_t dt_rela = 0, dt_relasz = 0;
     uint64_t dt_jmprel = 0, dt_pltrelsz = 0;
     uint64_t dt_init = 0, dt_fini = 0;
+    uint64_t dt_init_array = 0, dt_init_arraysz = 0;
 
     for (uint64_t i = 0; i < dyn_count; i++) {
         if (dynamic[i].d_tag == DT_NULL) break;
         switch (dynamic[i].d_tag) {
-        case DT_SYMTAB:    dt_symtab    = dynamic[i].d_val; break;
-        case DT_STRTAB:    dt_strtab    = dynamic[i].d_val; break;
-        case DT_STRSZ:     dt_strsz     = dynamic[i].d_val; break;
-        case DT_HASH:      dt_hash      = dynamic[i].d_val; break;
-        case DT_GNU_HASH:  dt_gnu_hash  = dynamic[i].d_val; break;
-        case DT_RELA:      dt_rela      = dynamic[i].d_val; break;
-        case DT_RELASZ:    dt_relasz    = dynamic[i].d_val; break;
-        case DT_JMPREL:    dt_jmprel    = dynamic[i].d_val; break;
-        case DT_PLTRELSZ:  dt_pltrelsz  = dynamic[i].d_val; break;
-        case DT_INIT:      dt_init      = dynamic[i].d_val; break;
-        case DT_FINI:      dt_fini      = dynamic[i].d_val; break;
+        case DT_SYMTAB:      dt_symtab      = dynamic[i].d_val; break;
+        case DT_STRTAB:      dt_strtab      = dynamic[i].d_val; break;
+        case DT_STRSZ:       dt_strsz       = dynamic[i].d_val; break;
+        case DT_HASH:        dt_hash        = dynamic[i].d_val; break;
+        case DT_GNU_HASH:    dt_gnu_hash_val = dynamic[i].d_val; break;
+        case DT_RELA:        dt_rela        = dynamic[i].d_val; break;
+        case DT_RELASZ:      dt_relasz      = dynamic[i].d_val; break;
+        case DT_JMPREL:      dt_jmprel      = dynamic[i].d_val; break;
+        case DT_PLTRELSZ:    dt_pltrelsz    = dynamic[i].d_val; break;
+        case DT_INIT:        dt_init        = dynamic[i].d_val; break;
+        case DT_FINI:        dt_fini        = dynamic[i].d_val; break;
+        case DT_INIT_ARRAY:  dt_init_array  = dynamic[i].d_val; break;
+        case DT_INIT_ARRAYSZ:dt_init_arraysz = dynamic[i].d_val; break;
         }
     }
 
@@ -526,7 +550,7 @@ void *dl_open(const char *filename)
 
     /* Copy name */
     int j = 0;
-    while (filename[j] && j < MAX_MOD_NAME - 1) {
+    while (filename[j] && j < DL_MAX_MOD_NAME - 1) {
         m->name[j] = filename[j];
         j++;
     }
@@ -544,9 +568,9 @@ void *dl_open(const char *filename)
         m->nbucket   = m->hashtab[0];
         m->nchain    = m->hashtab[1];
         m->sym_count = m->nchain;
-    } else if (dt_gnu_hash) {
-        uint32_t *gh = (uint32_t *)(load_bias + dt_gnu_hash);
-        m->sym_count = gnu_hash_nsyms(gh);
+    } else if (dt_gnu_hash_val) {
+        uint32_t *gh = (uint32_t *)(load_bias + dt_gnu_hash_val);
+        m->sym_count = dl_gnu_hash_nsyms(gh);
     } else {
         /* Heuristic: estimate from strtab proximity */
         if (dt_strtab > dt_symtab && dt_symtab != 0)
@@ -561,41 +585,62 @@ void *dl_open(const char *filename)
     serial_putdec(dt_strsz);
     serial_puts(" bytes\n");
 
-    /* ── Apply relocations ───────────────────────────────────── */
+    /* ── Store deferred linking info ─────────────────────────── */
 
-    int rela_ok = 0;
-
-    /* .rela.dyn */
     if (dt_rela && dt_relasz > 0) {
-        dl_rela_t *rela = (dl_rela_t *)(load_bias + dt_rela);
-        uint64_t count = dt_relasz / sizeof(dl_rela_t);
-        serial_puts("[DL] .rela.dyn: ");
-        serial_putdec(count);
-        serial_puts(" entries\n");
-        if (apply_rela(m, rela, count) < 0)
-            rela_ok = -1;
+        m->defer_rela = (dl_rela_t *)(load_bias + dt_rela);
+        m->defer_rela_count = dt_relasz / sizeof(dl_rela_t);
     }
-
-    /* .rela.plt (DT_JMPREL) */
     if (dt_jmprel && dt_pltrelsz > 0) {
-        dl_rela_t *rela = (dl_rela_t *)(load_bias + dt_jmprel);
-        uint64_t count = dt_pltrelsz / sizeof(dl_rela_t);
-        serial_puts("[DL] .rela.plt: ");
-        serial_putdec(count);
-        serial_puts(" entries\n");
-        if (apply_rela(m, rela, count) < 0)
-            rela_ok = -1;
+        m->defer_jmprel = (dl_rela_t *)(load_bias + dt_jmprel);
+        m->defer_jmprel_count = dt_pltrelsz / sizeof(dl_rela_t);
+    }
+    if (dt_init_array && dt_init_arraysz > 0) {
+        m->defer_init_array = load_bias + dt_init_array;
+        m->defer_init_arraysz = dt_init_arraysz;
     }
 
-    if (rela_ok < 0) {
-        serial_puts("[DL] Warning: some relocations failed\n");
-        /* Continue anyway — module may still be partially usable */
-    }
+    /* ── Apply relocations + init (or defer) ─────────────────── */
 
-    /* Call init function */
-    if (m->init_fn) {
-        serial_puts("[DL] Calling init\n");
-        m->init_fn();
+    if (flags & DL_DEFER_LINK) {
+        m->linked = false;
+        m->inited = false;
+        serial_puts("[DL] Deferred link for '");
+        serial_puts(m->name);
+        serial_puts("'\n");
+    } else {
+        /* Immediate mode: apply relocations and call init now */
+        if (m->defer_rela_count > 0) {
+            serial_puts("[DL] .rela.dyn: ");
+            serial_putdec(m->defer_rela_count);
+            serial_puts(" entries\n");
+            dl_apply_rela(m, m->defer_rela, m->defer_rela_count);
+        }
+        if (m->defer_jmprel_count > 0) {
+            serial_puts("[DL] .rela.plt: ");
+            serial_putdec(m->defer_jmprel_count);
+            serial_puts(" entries\n");
+            dl_apply_rela(m, m->defer_jmprel, m->defer_jmprel_count);
+        }
+        m->linked = true;
+
+        if (m->init_fn) {
+            serial_puts("[DL] Calling init\n");
+            m->init_fn();
+        }
+        if (m->defer_init_arraysz > 0) {
+            uint64_t init_count = m->defer_init_arraysz / 8;
+            typedef void (*init_fn_t)(void);
+            init_fn_t *fns = (init_fn_t *)m->defer_init_array;
+            serial_puts("[DL] Calling ");
+            serial_putdec(init_count);
+            serial_puts(" INIT_ARRAY constructors\n");
+            for (uint64_t ci = 0; ci < init_count; ci++) {
+                if (fns[ci] && (uint64_t)fns[ci] != (uint64_t)-1)
+                    fns[ci]();
+            }
+        }
+        m->inited = true;
     }
 
     serial_puts("[DL] Module '");
@@ -603,6 +648,65 @@ void *dl_open(const char *filename)
     serial_puts("' loaded OK\n");
 
     return m;
+}
+
+/* ── dl_link_all: apply relocations + init for deferred modules ── */
+
+void dl_link_all(void)
+{
+    /* Phase 1: apply relocations to all unlinked modules */
+    for (int i = 0; i < DL_MAX_MODULES; i++) {
+        dl_module_t *m = &modules[i];
+        if (!m->loaded || m->linked) continue;
+
+        serial_puts("[DL] Linking '");
+        serial_puts(m->name);
+        serial_puts("'\n");
+
+        if (m->defer_rela_count > 0) {
+            serial_puts("[DL] .rela.dyn: ");
+            serial_putdec(m->defer_rela_count);
+            serial_puts(" entries\n");
+            dl_apply_rela(m, m->defer_rela, m->defer_rela_count);
+        }
+        if (m->defer_jmprel_count > 0) {
+            serial_puts("[DL] .rela.plt: ");
+            serial_putdec(m->defer_jmprel_count);
+            serial_puts(" entries\n");
+            dl_apply_rela(m, m->defer_jmprel, m->defer_jmprel_count);
+        }
+        m->linked = true;
+    }
+
+    /* Phase 2: call constructors (reverse order = base libs first) */
+    for (int i = DL_MAX_MODULES - 1; i >= 0; i--) {
+        dl_module_t *m = &modules[i];
+        if (!m->loaded || m->inited) continue;
+
+        if (m->init_fn) {
+            serial_puts("[DL] init: ");
+            serial_puts(m->name);
+            serial_puts("\n");
+            m->init_fn();
+        }
+        if (m->defer_init_arraysz > 0) {
+            uint64_t count = m->defer_init_arraysz / 8;
+            typedef void (*init_fn_t)(void);
+            init_fn_t *fns = (init_fn_t *)m->defer_init_array;
+            serial_puts("[DL] INIT_ARRAY: ");
+            serial_puts(m->name);
+            serial_puts(" (");
+            serial_putdec(count);
+            serial_puts(")\n");
+            for (uint64_t ci = 0; ci < count; ci++) {
+                if (fns[ci] && (uint64_t)fns[ci] != (uint64_t)-1)
+                    fns[ci]();
+            }
+        }
+        m->inited = true;
+    }
+
+    serial_puts("[DL] All modules linked\n");
 }
 
 /* ── dl_sym: look up symbol by name ─────────────────────────── */
@@ -682,7 +786,7 @@ int dl_close(void *handle)
 void dl_list_modules(void)
 {
     int count = 0;
-    for (int i = 0; i < MAX_MODULES; i++) {
+    for (int i = 0; i < DL_MAX_MODULES; i++) {
         if (!modules[i].loaded) continue;
         count++;
     }
@@ -693,7 +797,7 @@ void dl_list_modules(void)
         return;
     }
 
-    for (int i = 0; i < MAX_MODULES; i++) {
+    for (int i = 0; i < DL_MAX_MODULES; i++) {
         dl_module_t *m = &modules[i];
         if (!m->loaded) continue;
 
@@ -765,6 +869,6 @@ void dl_init(void)
 {
     memset(modules, 0, sizeof(modules));
     serial_puts("[DL] Dynamic linker ready (");
-    serial_putdec(MAX_MODULES);
+    serial_putdec(DL_MAX_MODULES);
     serial_puts(" slots)\n");
 }

@@ -10,6 +10,7 @@
  */
 
 #include "../include/types.h"
+#include "../include/dynlink.h"
 
 /* ── External functions ──────────────────────────────────────── */
 
@@ -50,6 +51,7 @@ extern void proc_add_region(void *base, uint64_t pages);
 
 #define PT_NULL     0
 #define PT_LOAD     1
+#define PT_DYNAMIC  2
 #define PT_NOTE     4
 #define PT_INTERP   3
 #define PT_PHDR     6
@@ -149,6 +151,9 @@ typedef struct {
     uint64_t phdr_addr;
     uint16_t phdr_entsize;
     uint16_t phdr_count;
+    /* For dynamic linking */
+    uint64_t load_bias;      /* base - vaddr_min (0 for ET_EXEC) */
+    uint64_t vaddr_min;      /* lowest vaddr across all LOAD segments */
 } elf_loaded_t;
 
 /* ── Validate ELF header ─────────────────────────────────────── */
@@ -357,6 +362,10 @@ static int elf_load_segments(const uint8_t *data, uint64_t data_size,
         /* ET_DYN/PIE: adjust entry point */
         loaded->entry = (uint64_t)base + (hdr->e_entry - vaddr_min);
     }
+
+    /* Store for dynamic linking */
+    loaded->vaddr_min = vaddr_min;
+    loaded->load_bias = fixed_load ? 0 : ((uint64_t)base - vaddr_min);
 
     /* Program headers address for auxv AT_PHDR */
     loaded->phdr_addr = (uint64_t)base + hdr->e_phoff;
@@ -665,6 +674,172 @@ int elf_exec(const char *filename, int argc, const char **argv)
                     abi[3] = 0;  /* patch: 0 */
                 }
                 note = desc + ((descsz + 3) & ~3);
+            }
+        }
+    }
+
+    /* ── Dynamic linking ─────────────────────────────────────────────
+     * If the binary has a PT_DYNAMIC segment, parse it to resolve
+     * shared library dependencies and apply relocations. This bridges
+     * elf.c → dynlink.c for dynamically linked executables. */
+    {
+        const elf64_hdr_t *hdr = (const elf64_hdr_t *)data;
+        dl_dyn_t *dyn_table = NULL;
+        uint64_t dyn_count = 0;
+
+        for (int i = 0; i < hdr->e_phnum; i++) {
+            uint64_t phoff = hdr->e_phoff + (uint64_t)i * hdr->e_phentsize;
+            if (phoff + sizeof(elf64_phdr_t) > file_size) break;
+            const elf64_phdr_t *ph = (const elf64_phdr_t *)(data + phoff);
+            if (ph->p_type == PT_DYNAMIC) {
+                dyn_table = (dl_dyn_t *)(loaded.load_bias + ph->p_vaddr);
+                dyn_count = ph->p_memsz / sizeof(dl_dyn_t);
+                break;
+            }
+        }
+
+        if (dyn_table) {
+            serial_puts("[ELF] PT_DYNAMIC: ");
+            serial_putdec(dyn_count);
+            serial_puts(" entries\n");
+
+            /* Parse dynamic table */
+            uint64_t dt_symtab = 0, dt_strtab = 0, dt_strsz = 0;
+            uint64_t dt_hash = 0, dt_gnu_hash_val = 0;
+            uint64_t dt_rela = 0, dt_relasz = 0;
+            uint64_t dt_jmprel = 0, dt_pltrelsz = 0;
+            uint64_t dt_init_array = 0, dt_init_arraysz = 0;
+
+            #define MAX_DT_NEEDED 32
+            uint64_t needed_offsets[MAX_DT_NEEDED];
+            int needed_count = 0;
+
+            for (uint64_t di = 0; di < dyn_count; di++) {
+                if (dyn_table[di].d_tag == DT_NULL) break;
+                switch (dyn_table[di].d_tag) {
+                case DT_SYMTAB:      dt_symtab       = dyn_table[di].d_val; break;
+                case DT_STRTAB:      dt_strtab       = dyn_table[di].d_val; break;
+                case DT_STRSZ:       dt_strsz        = dyn_table[di].d_val; break;
+                case DT_HASH:        dt_hash         = dyn_table[di].d_val; break;
+                case DT_GNU_HASH:    dt_gnu_hash_val = dyn_table[di].d_val; break;
+                case DT_RELA:        dt_rela         = dyn_table[di].d_val; break;
+                case DT_RELASZ:      dt_relasz       = dyn_table[di].d_val; break;
+                case DT_JMPREL:      dt_jmprel       = dyn_table[di].d_val; break;
+                case DT_PLTRELSZ:    dt_pltrelsz     = dyn_table[di].d_val; break;
+                case DT_INIT_ARRAY:  dt_init_array   = dyn_table[di].d_val; break;
+                case DT_INIT_ARRAYSZ:dt_init_arraysz = dyn_table[di].d_val; break;
+                case DT_NEEDED:
+                    if (needed_count < MAX_DT_NEEDED)
+                        needed_offsets[needed_count++] = dyn_table[di].d_val;
+                    break;
+                }
+            }
+
+            /* Load DT_NEEDED shared libraries */
+            if (needed_count > 0 && dt_strtab) {
+                const char *strtab = (const char *)(loaded.load_bias + dt_strtab);
+                serial_puts("[ELF] ");
+                serial_putdec(needed_count);
+                serial_puts(" DT_NEEDED libraries\n");
+
+                for (int ni = 0; ni < needed_count; ni++) {
+                    const char *libname = strtab + needed_offsets[ni];
+
+                    /* Strip path prefix (/lib/x86_64-linux-gnu/libc.so.6 → libc.so.6) */
+                    const char *basename = libname;
+                    for (const char *p = libname; *p; p++) {
+                        if (*p == '/') basename = p + 1;
+                    }
+
+                    serial_puts("[ELF] Loading: ");
+                    serial_puts(basename);
+
+                    void *handle = dl_open_flags(basename, DL_DEFER_LINK);
+                    if (handle) {
+                        serial_puts(" OK\n");
+                    } else {
+                        serial_puts(" not found (kernel stubs)\n");
+                    }
+                }
+
+                /* All libs loaded — now link them (relocs + init) */
+                dl_link_all();
+            }
+
+            /* Build temporary module for the main binary and apply relocations */
+            uint64_t total_rela = 0;
+            if ((dt_rela && dt_relasz > 0) || (dt_jmprel && dt_pltrelsz > 0)) {
+                dl_module_t main_mod;
+                memset(&main_mod, 0, sizeof(main_mod));
+                main_mod.loaded = true;
+                main_mod.load_bias = loaded.load_bias;
+
+                if (dt_symtab)
+                    main_mod.symtab = (dl_sym_t *)(loaded.load_bias + dt_symtab);
+                if (dt_strtab) {
+                    main_mod.strtab = (char *)(loaded.load_bias + dt_strtab);
+                    main_mod.strtab_sz = dt_strsz;
+                }
+
+                /* Determine symbol count */
+                if (dt_hash) {
+                    uint32_t *ht = (uint32_t *)(loaded.load_bias + dt_hash);
+                    main_mod.hashtab = ht;
+                    main_mod.nbucket = ht[0];
+                    main_mod.nchain = ht[1];
+                    main_mod.sym_count = ht[1];
+                } else if (dt_gnu_hash_val) {
+                    uint32_t *gh = (uint32_t *)(loaded.load_bias + dt_gnu_hash_val);
+                    main_mod.sym_count = dl_gnu_hash_nsyms(gh);
+                } else if (dt_strtab > dt_symtab && dt_symtab != 0) {
+                    main_mod.sym_count = (uint32_t)((dt_strtab - dt_symtab) / sizeof(dl_sym_t));
+                } else {
+                    main_mod.sym_count = 256;
+                }
+
+                serial_puts("[ELF] Symbols: ");
+                serial_putdec(main_mod.sym_count);
+                serial_puts("\n");
+
+                /* Apply .rela.dyn */
+                if (dt_rela && dt_relasz > 0) {
+                    dl_rela_t *rela = (dl_rela_t *)(loaded.load_bias + dt_rela);
+                    uint64_t count = dt_relasz / sizeof(dl_rela_t);
+                    serial_puts("[ELF] .rela.dyn: ");
+                    serial_putdec(count);
+                    serial_puts(" entries\n");
+                    dl_apply_rela(&main_mod, rela, count);
+                    total_rela += count;
+                }
+
+                /* Apply .rela.plt */
+                if (dt_jmprel && dt_pltrelsz > 0) {
+                    dl_rela_t *jmprel = (dl_rela_t *)(loaded.load_bias + dt_jmprel);
+                    uint64_t count = dt_pltrelsz / sizeof(dl_rela_t);
+                    serial_puts("[ELF] .rela.plt: ");
+                    serial_putdec(count);
+                    serial_puts(" entries\n");
+                    dl_apply_rela(&main_mod, jmprel, count);
+                    total_rela += count;
+                }
+
+                serial_puts("[ELF] Total relocations: ");
+                serial_putdec(total_rela);
+                serial_puts("\n");
+            }
+
+            /* Call INIT_ARRAY constructors */
+            if (dt_init_array && dt_init_arraysz > 0) {
+                uint64_t init_count = dt_init_arraysz / 8;
+                typedef void (*init_fn_t)(void);
+                init_fn_t *fns = (init_fn_t *)(loaded.load_bias + dt_init_array);
+                serial_puts("[ELF] Calling ");
+                serial_putdec(init_count);
+                serial_puts(" INIT_ARRAY constructors\n");
+                for (uint64_t ci = 0; ci < init_count; ci++) {
+                    if (fns[ci] && (uint64_t)fns[ci] != (uint64_t)-1)
+                        fns[ci]();
+                }
             }
         }
     }
