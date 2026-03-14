@@ -349,6 +349,12 @@ void kernel_entry(boot_info_t *info)
     if (info->kernel_phys_base && info->kernel_size)
         mem_reserve_kernel(info->kernel_phys_base, info->kernel_size);
 
+    /* Compute system capabilities from actual hardware */
+    {
+        extern void sys_caps_init(void);
+        sys_caps_init();
+    }
+
     /* ── Step 1.5: IDT + Exceptions + APIC timer ── */
     idt_init();
 

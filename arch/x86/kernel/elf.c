@@ -560,10 +560,26 @@ int elf_exec(const char *filename, int argc, const char **argv)
     serial_putdec(file_size);
     serial_puts(" bytes\n");
 
-    /* Sanity check */
-    if (file_size < sizeof(elf64_hdr_t) || file_size > 1024ULL * 1024 * 1024) {
-        serial_puts("[ELF] Invalid file size (>1GB)\n");
+    /* Check against available memory */
+    if (file_size < sizeof(elf64_hdr_t)) {
+        serial_puts("[ELF] File too small\n");
         return -1;
+    }
+    {
+        extern int sys_caps_check_alloc(uint64_t bytes, const char *what);
+        extern uint64_t mem_get_free(void);
+        uint64_t avail = mem_get_free();
+        serial_puts("[ELF] ");
+        serial_puts(filename);
+        serial_puts(": ");
+        serial_putdec(file_size / (1024 * 1024));
+        serial_puts(" MB, available: ");
+        serial_putdec(avail / (1024 * 1024));
+        serial_puts(" MB\n");
+        /* Need ~2x file size (read buffer + load segments) */
+        if (!sys_caps_check_alloc(file_size * 2, filename)) {
+            return -1;
+        }
     }
 
     /* Read entire file into memory */

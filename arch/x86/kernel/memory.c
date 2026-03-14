@@ -6,6 +6,7 @@
  */
 
 #include "../include/types.h"
+#include "../include/sys_caps.h"
 
 /* ── Declarations ────────────────────────────────────────────── */
 
@@ -269,6 +270,72 @@ uint64_t mem_get_total(void)
 uint64_t mem_get_used(void)
 {
     return (total_pages - free_pages) * PAGE_SIZE;
+}
+
+/* ── System capabilities (hardware-derived resource limits) ──────── */
+
+#define CLAMP(val, lo, hi)  ((val) < (lo) ? (lo) : ((val) > (hi) ? (hi) : (val)))
+
+sys_caps_t g_sys_caps;
+
+void sys_caps_init(void)
+{
+    uint64_t total = total_memory;
+    uint64_t avail = free_pages * PAGE_SIZE;
+    uint64_t mb    = total / (1024 * 1024);
+
+    g_sys_caps.total_ram     = total;
+    g_sys_caps.available_ram = avail;
+    g_sys_caps.page_count    = (uint32_t)total_pages;
+    g_sys_caps.cpu_count     = 1;  /* updated by SMP init later */
+
+    /* Kernel heap: scale with RAM, 256KB min, 16MB max */
+    g_sys_caps.heap_init_size = CLAMP(total / 256, 256 * 1024, 16ULL * 1024 * 1024);
+    g_sys_caps.heap_grow_size = CLAMP(total / 1024, 64 * 1024, 4ULL * 1024 * 1024);
+
+    /* Per-process limits */
+    g_sys_caps.brk_heap_size   = CLAMP(total / 16, 16ULL * 1024 * 1024, 256ULL * 1024 * 1024);
+    g_sys_caps.user_stack_size = CLAMP(total / 64, 1ULL * 1024 * 1024, 8ULL * 1024 * 1024);
+    g_sys_caps.max_processes   = (uint32_t)CLAMP(mb / 16, 4, 256);
+    g_sys_caps.max_fds_global  = (uint32_t)CLAMP(total / (256 * 1024), 128, 4096);
+
+    /* ELF loader */
+    g_sys_caps.elf_max_size  = CLAMP(avail * 3 / 4, 64ULL * 1024 * 1024, 4ULL * 1024 * 1024 * 1024);
+    g_sys_caps.elf_max_alloc = avail / 2;
+
+    /* Win32 */
+    g_sys_caps.win32_heap_size = CLAMP(total / 8, 16ULL * 1024 * 1024, 256ULL * 1024 * 1024);
+    g_sys_caps.crt_pool_size   = CLAMP(total / 16, 4ULL * 1024 * 1024, 128ULL * 1024 * 1024);
+    g_sys_caps.win32_va_limit  = 0x7FFF0000ULL;
+
+    /* Networking */
+    g_sys_caps.tcp_max_conns = (uint32_t)CLAMP(mb / 4, 8, 256);
+
+    serial_puts("[CAPS] System capabilities (from ");
+    serial_putdec(mb);
+    serial_puts(" MB RAM):\n");
+    serial_puts("[CAPS]   heap_init=");  serial_putdec(g_sys_caps.heap_init_size / 1024); serial_puts("KB");
+    serial_puts("  brk=");   serial_putdec(g_sys_caps.brk_heap_size / (1024*1024)); serial_puts("MB");
+    serial_puts("  stack="); serial_putdec(g_sys_caps.user_stack_size / (1024*1024)); serial_puts("MB");
+    serial_puts("  procs="); serial_putdec(g_sys_caps.max_processes);
+    serial_puts("  elf_max="); serial_putdec(g_sys_caps.elf_max_size / (1024*1024)); serial_puts("MB");
+    serial_puts("\n");
+}
+
+int sys_caps_check_alloc(uint64_t bytes, const char *what)
+{
+    uint64_t avail = free_pages * PAGE_SIZE;
+    if (bytes <= avail) return 1;  /* OK */
+
+    serial_puts("[CAPS] ");
+    serial_puts(what);
+    serial_puts(": need ");
+    serial_putdec(bytes / (1024 * 1024));
+    serial_puts(" MB, available ");
+    serial_putdec(avail / (1024 * 1024));
+    serial_puts(" MB — INSUFFICIENT\n");
+    serial_puts("       Tip: free processes with 'kill' or add more RAM\n");
+    return 0;  /* not enough */
 }
 
 /* ── libc stubs (no linked libc — needed by kernel code + TCC codegen) ── */
