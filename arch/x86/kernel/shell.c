@@ -263,7 +263,7 @@ static void cmd_help(void)
 static void cmd_uname(void)
 {
     sh_puts_color("OsitoK", 0x00FF8800);
-    sh_puts(" x86-64 bare-metal AI OS (");
+    sh_puts(" x86-64 AI OS (");
     sh_puts("naranjositos.tech");
     sh_puts(")\n");
 }

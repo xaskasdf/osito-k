@@ -1885,8 +1885,8 @@ static int64_t sys_uname(uint64_t buf_addr)
     memset(u, 0, sizeof(*u));
     strcpy(u->sysname, "OsitoK");
     strcpy(u->nodename, "osito");
-    strcpy(u->release, "1.0.0");
-    strcpy(u->version, "bare-metal x86-64");
+    strcpy(u->release, "1.0.0-osito");
+    strcpy(u->version, "OsitoK x86-64");
     strcpy(u->machine, "x86_64");
     return 0;
 }

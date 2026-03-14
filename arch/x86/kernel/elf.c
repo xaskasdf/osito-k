@@ -50,8 +50,13 @@ extern void proc_add_region(void *base, uint64_t pages);
 
 #define PT_NULL     0
 #define PT_LOAD     1
+#define PT_NOTE     4
 #define PT_INTERP   3
 #define PT_PHDR     6
+
+/* NT_GNU_ABI_TAG note: glibc checks this at startup to verify
+ * minimum kernel version. We patch it to accept OsitoK. */
+#define NT_GNU_ABI_TAG  1
 
 #define PF_X        0x1
 #define PF_W        0x2
@@ -523,6 +528,49 @@ int elf_exec(const char *filename, int argc, const char **argv)
     if (elf_load_segments(data, file_size, &loaded) < 0) {
         kfree(data);
         return -1;
+    }
+
+    /* ── Patch NT_GNU_ABI_TAG notes ────────────────────────────────
+     * glibc binaries have a .note.ABI-tag that specifies the minimum
+     * Linux kernel version. Since OsitoK is not Linux, we patch the
+     * required version to 0.0.0 so the check always passes.
+     * This is done in-memory after loading, not on disk. */
+    {
+        elf64_hdr_t *hdr = (elf64_hdr_t *)data;
+        for (int i = 0; i < hdr->e_phnum; i++) {
+            elf64_phdr_t *ph = (elf64_phdr_t *)(data + hdr->e_phoff + i * hdr->e_phentsize);
+            if (ph->p_type != PT_NOTE) continue;
+
+            /* Walk notes in the loaded segment (already in memory at p_vaddr) */
+            uint8_t *note = (uint8_t *)(ph->p_vaddr);
+            uint8_t *end  = note + ph->p_filesz;
+
+            while (note + 12 <= end) {
+                uint32_t namesz = *(uint32_t *)(note + 0);
+                uint32_t descsz = *(uint32_t *)(note + 4);
+                uint32_t type   = *(uint32_t *)(note + 8);
+                uint8_t *name   = note + 12;
+                uint8_t *desc   = name + ((namesz + 3) & ~3);
+
+                if (type == NT_GNU_ABI_TAG && namesz == 4 &&
+                    name[0]=='G' && name[1]=='N' && name[2]=='U' && name[3]=='\0' &&
+                    descsz >= 16) {
+                    uint32_t *abi = (uint32_t *)desc;
+                    serial_puts("[ELF] Patching ABI tag: OS=");
+                    serial_putdec(abi[0]);
+                    serial_puts(" min=");
+                    serial_putdec(abi[1]); serial_puts(".");
+                    serial_putdec(abi[2]); serial_puts(".");
+                    serial_putdec(abi[3]);
+                    serial_puts(" -> OsitoK 1.0.0\n");
+                    abi[0] = 0;  /* OS: keep as Linux (0) for glibc compat */
+                    abi[1] = 1;  /* major: 1 (matches our uname) */
+                    abi[2] = 0;  /* minor: 0 */
+                    abi[3] = 0;  /* patch: 0 */
+                }
+                note = desc + ((descsz + 3) & ~3);
+            }
+        }
     }
 
     /* Set up stack */
