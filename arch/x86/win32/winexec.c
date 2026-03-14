@@ -659,10 +659,8 @@ int winexec_run(const uint8_t *file_data, uint64_t file_size)
         serial_puthex(g_teb32.ExceptionList, 8);
         serial_puts("\n");
 
-        /* Arm hardware watchpoint on TEB32.ExceptionList to catch
-         * the exact instruction that writes corrupt values (like 0x6) */
-        extern void idt_watch_write4(void *addr);
-        idt_watch_write4(&g_teb32.ExceptionList);
+        /* Hardware watchpoint on TEB32 removed — was causing #GP
+         * when #DB fires from compat mode during DLL init */
     }
 
     serial_puts("[WINEXEC] jumping to entry point at ");

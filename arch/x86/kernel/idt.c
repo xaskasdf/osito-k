@@ -300,6 +300,10 @@ uint64_t *tss_ist1_ptr;  /* = &kernel_tss.ist1, set in tss_init() */
 #define IST1_STACK_SIZE 65536
 static uint8_t ist1_stack[IST1_STACK_SIZE] __attribute__((aligned(16)));
 
+/* IST2 stack for #DB — 8KB (separate from INT 0x2E to avoid conflicts) */
+#define IST2_STACK_SIZE 8192
+static uint8_t ist2_stack[IST2_STACK_SIZE] __attribute__((aligned(16)));
+
 /*
  * Install TSS: write descriptor to GDT index 10-11 (selector 0x50),
  * configure IST1, and load TR.
@@ -313,6 +317,7 @@ static void tss_init(void)
     /* Zero TSS, set IST1 to top of dedicated stack */
     memset(&kernel_tss, 0, sizeof(kernel_tss));
     kernel_tss.ist1 = (uint64_t)(ist1_stack + IST1_STACK_SIZE);
+    kernel_tss.ist2 = (uint64_t)(ist2_stack + IST2_STACK_SIZE);
     kernel_tss.iopb_offset = sizeof(struct tss64);
     tss_ist1_ptr = &kernel_tss.ist1;
 
@@ -873,6 +878,9 @@ void idt_init(void)
         idt_set_entry(i, isr_stub_default, 0);
         idt[i].selector = cs;
     }
+
+    /* Note: #DB does NOT use IST. TF single-step from compat mode
+     * causes #GP(0x0A) — future fix needed for null-page tracking. */
 
     /* Override: vector 0x71 = keyboard IRQ (uses isr_stub_33) */
     idt_set_entry(0x71, isr_stub_33, 0);
