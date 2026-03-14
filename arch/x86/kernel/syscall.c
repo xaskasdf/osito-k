@@ -454,7 +454,7 @@ static uint8_t *brk_max;       /* end of brk region */
 #define MAP_FAILED      ((uint64_t)-1)
 
 /* VMA tracking — per-process mmap regions */
-#define MAX_VMAS        64
+#define MAX_VMAS        256
 
 typedef struct {
     uint64_t base;      /* virtual (== physical, identity-mapped) */
@@ -1126,8 +1126,13 @@ static int64_t sys_munmap(uint64_t addr, uint64_t length)
     for (int i = 0; i < MAX_VMAS; i++) {
         if (!vma_table[i].in_use) continue;
         if (vma_table[i].base == addr && vma_table[i].pages == npages) {
-            /* Free physical pages */
-            mem_free_pages((void *)addr, npages);
+            /* Only free physical pages if they were actually allocated
+             * (prot != 0). PROT_NONE reservations have no backing pages. */
+            if (vma_table[i].prot != 0) {
+                /* Unmap page table entries for committed pages */
+                for (uint64_t p = 0; p < npages; p++)
+                    paging_unmap_page(addr + p * 4096);
+            }
             vma_table[i].in_use = false;
             return 0;
         }
@@ -1138,9 +1143,10 @@ static int64_t sys_munmap(uint64_t addr, uint64_t length)
         if (!vma_table[i].in_use) continue;
         uint64_t vma_end = vma_table[i].base + vma_table[i].pages * 4096;
         if (addr >= vma_table[i].base && addr + npages * 4096 <= vma_end) {
-            /* For simplicity, free the pages and mark VMA as unused.
-             * Full partial-unmap (splitting VMAs) not needed yet. */
-            mem_free_pages((void *)addr, npages);
+            if (vma_table[i].prot != 0) {
+                for (uint64_t p = 0; p < npages; p++)
+                    paging_unmap_page(addr + p * 4096);
+            }
             vma_table[i].in_use = false;
             return 0;
         }
@@ -1206,33 +1212,23 @@ static uint64_t prot_to_pte_flags(uint32_t prot);
 int demand_page_fault(uint64_t addr, uint64_t error_code)
 {
     /* Only handle not-present faults (bit 0 clear) */
-    if (error_code & 1) return -1;  /* page present — protection violation */
+    if (error_code & 1) return -1;
+
+    /* Don't handle faults in low memory (kernel area) */
+    if (addr < 0x100000000ULL) return -1;
 
     uint64_t page_addr = addr & ~0xFFFULL;
 
-    for (int i = 0; i < MAX_VMAS; i++) {
-        if (!vma_table[i].in_use) continue;
-        uint64_t vma_end = vma_table[i].base + vma_table[i].pages * 4096;
-        if (addr >= vma_table[i].base && addr < vma_end) {
-            /* Found VMA — allocate and map the faulting page */
-            void *page = mem_alloc_pages(1);
-            if (!page) return -1;
-            memset(page, 0, 4096);
+    /* Allocate and map the page unconditionally for high addresses.
+     * This implements demand paging for mmap(PROT_NONE) reservations. */
+    void *page = mem_alloc_pages(1);
+    if (!page) return -1;
+    memset(page, 0, 4096);
 
-            /* Use RW flags (the VMA was reserved, now being committed) */
-            uint64_t flags = 0x03; /* PTE_PRESENT | PTE_WRITABLE */
-            if (paging_map_page(page_addr, (uint64_t)page, flags) != 0)
-                return -1;
+    if (paging_map_page(page_addr, (uint64_t)page, 0x03 /* RW */) != 0)
+        return -1;
 
-            /* Update VMA prot if it was PROT_NONE */
-            if (vma_table[i].prot == 0)
-                vma_table[i].prot = 3; /* PROT_READ | PROT_WRITE */
-
-            return 0;  /* Success — resume execution */
-        }
-    }
-
-    return -1;  /* Address not in any VMA */
+    return 0;
 }
 
 /* writev — gather write (used by printf/puts in newlib) */
