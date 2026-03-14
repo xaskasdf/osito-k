@@ -27,8 +27,10 @@ extern void  mem_free_pages(void *addr, uint64_t count);
 /* ── Constants ───────────────────────────────────────────────── */
 
 #define PAGE_SIZE       4096
-#define HEAP_INIT_PAGES 64      /* Initial heap: 256 KB */
-#define HEAP_GROW_PAGES 16      /* Grow by 64 KB at a time */
+/* Heap sizes: dynamic from sys_caps (scale with RAM) */
+#include "../include/sys_caps.h"
+#define HEAP_INIT_PAGES ((uint32_t)(g_sys_caps.heap_init_size ? g_sys_caps.heap_init_size / 4096 : 64))
+#define HEAP_GROW_PAGES ((uint32_t)(g_sys_caps.heap_grow_size ? g_sys_caps.heap_grow_size / 4096 : 16))
 #define MIN_ALLOC       16      /* Minimum allocation size (alignment) */
 #define ALIGNMENT       16      /* All allocations 16-byte aligned */
 

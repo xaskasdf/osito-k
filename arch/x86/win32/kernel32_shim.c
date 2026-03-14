@@ -310,10 +310,31 @@ BOOL WINAPI VirtualFree(PVOID lpAddress, SIZE_T dwSize, DWORD dwFreeType)
  * called appRealloc → HeapReAlloc, which failed to copy old entries.
  */
 
-#define HEAP_POOL_SIZE  (16 * 1024 * 1024)  /* 16MB heap (UE1 needs ~8MB) */
+/* Win32 heap: dynamic size from sys_caps (scales with RAM).
+ * Allocated lazily on first HeapAlloc call via kmalloc.
+ * Falls back to 16MB static pool if kmalloc unavailable. */
+#include "../include/sys_caps.h"
 
-static BYTE  heap_pool[HEAP_POOL_SIZE];
+static BYTE   heap_pool_static[16 * 1024 * 1024]; /* fallback */
+static BYTE  *heap_pool = NULL;
+static SIZE_T heap_pool_size = 0;
 static SIZE_T heap_offset = 0;
+
+static void heap_pool_init(void)
+{
+    if (heap_pool) return;
+    uint64_t target = g_sys_caps.win32_heap_size;
+    if (!target) target = 16ULL * 1024 * 1024;
+
+    extern void *kmalloc(uint64_t size);
+    heap_pool = (BYTE *)kmalloc(target);
+    if (heap_pool) {
+        heap_pool_size = target;
+    } else {
+        heap_pool = heap_pool_static;
+        heap_pool_size = sizeof(heap_pool_static);
+    }
+}
 
 HANDLE WINAPI GetProcessHeap(void)
 {
@@ -329,7 +350,8 @@ PVOID WINAPI HeapAlloc(HANDLE hHeap, DWORD dwFlags, SIZE_T dwBytes)
     /* 8-byte header + data, aligned to 16 bytes */
     SIZE_T total = (dwBytes + 8 + 15) & ~(SIZE_T)15;
 
-    if (heap_offset + total > HEAP_POOL_SIZE) {
+    if (!heap_pool) heap_pool_init();
+    if (heap_offset + total > heap_pool_size) {
         g_last_error = 8; /* ERROR_NOT_ENOUGH_MEMORY */
         return NULL;
     }
@@ -1650,7 +1672,7 @@ PVOID WINAPI HeapReAlloc(HANDLE hHeap, DWORD dwFlags, PVOID lpMem, SIZE_T dwByte
 
     /* Check if ptr is from our heap pool (has valid header) */
     BYTE *block = (BYTE *)lpMem - 8;
-    int from_heap = (block >= heap_pool && block < heap_pool + HEAP_POOL_SIZE);
+    int from_heap = (heap_pool && block >= heap_pool && block < heap_pool + heap_pool_size);
 
     SIZE_T old_size;
     if (from_heap) {

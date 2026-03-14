@@ -153,9 +153,28 @@ int  WINAPI _set_new_mode(int mode) { (void)mode; return 0; }
  * Each allocation: [8-byte size header][user data...]
  * Aligned to 16 bytes.
  */
-#define ALLOC_POOL_SIZE  (4 * 1024 * 1024)  /* 4MB CRT heap */
-static BYTE  crt_pool[ALLOC_POOL_SIZE];
+/* CRT heap: dynamic from sys_caps (scales with RAM) */
+#include "../include/sys_caps.h"
+
+static BYTE   crt_pool_static[4 * 1024 * 1024]; /* fallback */
+static BYTE  *crt_pool = NULL;
+static SIZE_T crt_pool_size = 0;
 static SIZE_T crt_pool_offset = 0;
+
+static void crt_pool_init(void)
+{
+    if (crt_pool) return;
+    uint64_t target = g_sys_caps.crt_pool_size;
+    if (!target) target = 4ULL * 1024 * 1024;
+    extern void *kmalloc(uint64_t size);
+    crt_pool = (BYTE *)kmalloc(target);
+    if (crt_pool) {
+        crt_pool_size = target;
+    } else {
+        crt_pool = crt_pool_static;
+        crt_pool_size = sizeof(crt_pool_static);
+    }
+}
 
 /* Free list for basic reuse */
 #define FREE_LIST_MAX 256
@@ -179,7 +198,8 @@ PVOID WINAPI crt_malloc(SIZE_T size)
         }
     }
 
-    if (crt_pool_offset + total > ALLOC_POOL_SIZE)
+    if (!crt_pool) crt_pool_init();
+    if (crt_pool_offset + total > crt_pool_size)
         return NULL;
 
     BYTE *block = crt_pool + crt_pool_offset;

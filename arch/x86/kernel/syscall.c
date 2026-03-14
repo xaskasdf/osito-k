@@ -422,7 +422,9 @@ static ssize_t console_read(void *buf, size_t count)
 
 /* ── brk state (process heap) ────────────────────────────────── */
 
-#define BRK_HEAP_SIZE  (16ULL * 1024 * 1024)  /* 16MB process heap */
+/* BRK heap size: dynamic from sys_caps (scales with RAM) */
+#include "../include/sys_caps.h"
+#define BRK_HEAP_SIZE  (g_sys_caps.brk_heap_size ? g_sys_caps.brk_heap_size : (16ULL * 1024 * 1024))
 
 static uint8_t *brk_base;      /* start of brk region */
 static uint8_t *brk_current;   /* current break */
