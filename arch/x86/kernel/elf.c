@@ -561,8 +561,8 @@ int elf_exec(const char *filename, int argc, const char **argv)
     serial_puts(" bytes\n");
 
     /* Sanity check */
-    if (file_size < sizeof(elf64_hdr_t) || file_size > 64 * 1024 * 1024) {
-        serial_puts("[ELF] Invalid file size\n");
+    if (file_size < sizeof(elf64_hdr_t) || file_size > 1024ULL * 1024 * 1024) {
+        serial_puts("[ELF] Invalid file size (>1GB)\n");
         return -1;
     }
 
