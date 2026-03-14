@@ -712,6 +712,19 @@ void isr_handler(interrupt_frame_t *frame)
         fb_puthex(frame->rip, 16);
         fb_puts("\n");
 
+        /* Fault recovery: if dl_fault_jmpbuf is set, longjmp back instead
+         * of killing. Used by INIT_ARRAY to survive unresolved calls. */
+        {
+            extern uint64_t *dl_fault_jmpbuf;
+            extern void kern_longjmp(uint64_t *buf, int val);
+            if (dl_fault_jmpbuf) {
+                serial_puts("  [DL] Recovering from fault in constructor\n");
+                uint64_t *jmp = dl_fault_jmpbuf;
+                dl_fault_jmpbuf = NULL;
+                kern_longjmp(jmp, 1);
+            }
+        }
+
         /* If a user process is running (PID > 1), kill it instead of
          * halting the system. Uses proc_exception_kill which is compiled
          * without SSE to be safe from ISR context. */

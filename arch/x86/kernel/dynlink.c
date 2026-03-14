@@ -87,6 +87,11 @@ typedef struct {
 
 static dl_module_t modules[DL_MAX_MODULES];
 
+/* Fault recovery for INIT_ARRAY — checked by exception handler in idt.c */
+uint64_t *dl_fault_jmpbuf = NULL;
+extern int  kern_setjmp(uint64_t *buf);
+extern void kern_longjmp(uint64_t *buf, int val);
+
 /* ── Stub functions for kernel symbol fallback ─────────────── */
 
 static void stub_exit(int code)
@@ -116,6 +121,9 @@ static int64_t stub_read(int fd, void *buf, uint64_t n)
 }
 
 static int stub_noop(void) { return 0; }
+
+/* Safe landing pad for unresolved PLT entries — returns 0 instead of NULL-CALL */
+static uint64_t stub_unresolved(void) { return 0; }
 
 /* __tls_get_addr: reads DTV from %fs:8, returns dtv[module] + offset */
 static void *kern_tls_get_addr(void *ti_ptr)
@@ -329,7 +337,11 @@ int dl_apply_rela(dl_module_t *m, const dl_rela_t *rela, uint64_t count)
         case R_X86_64_GLOB_DAT:
         case R_X86_64_JUMP_SLOT: {
             uint64_t val = resolve_symbol(m, sym_idx);
-            if (!val && sym_idx != 0) { failed++; break; }
+            if (!val && sym_idx != 0) {
+                *target = (uint64_t)stub_unresolved;
+                failed++;
+                break;
+            }
             *target = val;
             resolved++;
             break;
@@ -796,7 +808,10 @@ void dl_link_all(void)
         m->linked = true;
     }
 
-    /* Phase 2: call constructors (reverse order = base libs first) */
+    /* Phase 2: call constructors (reverse order = base libs first)
+     * Uses fault recovery: if a constructor crashes (e.g. NULL call),
+     * the exception handler longjmps back and we skip it. */
+    uint64_t init_jmpbuf[8];
     for (int i = DL_MAX_MODULES - 1; i >= 0; i--) {
         dl_module_t *m = &modules[i];
         if (!m->loaded || m->inited) continue;
@@ -805,7 +820,11 @@ void dl_link_all(void)
             serial_puts("[DL] init: ");
             serial_puts(m->name);
             serial_puts("\n");
-            m->init_fn();
+            dl_fault_jmpbuf = init_jmpbuf;
+            if (kern_setjmp(init_jmpbuf) == 0) {
+                m->init_fn();
+            }
+            dl_fault_jmpbuf = NULL;
         }
         if (m->defer_init_arraysz > 0) {
             uint64_t count = m->defer_init_arraysz / 8;
@@ -817,8 +836,13 @@ void dl_link_all(void)
             serial_putdec(count);
             serial_puts(")\n");
             for (uint64_t ci = 0; ci < count; ci++) {
-                if (fns[ci] && (uint64_t)fns[ci] != (uint64_t)-1)
-                    fns[ci]();
+                if (fns[ci] && (uint64_t)fns[ci] != (uint64_t)-1) {
+                    dl_fault_jmpbuf = init_jmpbuf;
+                    if (kern_setjmp(init_jmpbuf) == 0) {
+                        fns[ci]();
+                    }
+                    dl_fault_jmpbuf = NULL;
+                }
             }
         }
         m->inited = true;
