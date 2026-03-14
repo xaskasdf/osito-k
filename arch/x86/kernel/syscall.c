@@ -1545,8 +1545,11 @@ static int64_t sys_arch_prctl(uint64_t code, uint64_t addr)
     switch (code) {
     case ARCH_SET_FS: {
         extern void proc_set_fs_base(uint64_t addr);
+        serial_puts("[TLS] arch_prctl SET_FS=0x");
+        serial_puthex(addr, 16);
+        serial_puts("\n");
         wrmsr(MSR_FS_BASE, addr);
-        proc_set_fs_base(addr);  /* save for context switch (X-THREAD) */
+        proc_set_fs_base(addr);
         return 0;
     }
     case ARCH_GET_FS:

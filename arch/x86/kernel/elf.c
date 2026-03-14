@@ -143,6 +143,10 @@ typedef struct {
     void    *segments[ELF_MAX_SEGMENTS];
     int      segment_count;
     uint64_t segment_pages[ELF_MAX_SEGMENTS];
+    /* For auxv AT_PHDR/AT_PHENT/AT_PHNUM */
+    uint64_t phdr_addr;
+    uint16_t phdr_entsize;
+    uint16_t phdr_count;
 } elf_loaded_t;
 
 /* ── Validate ELF header ─────────────────────────────────────── */
@@ -189,6 +193,8 @@ static int elf_load_segments(const uint8_t *data, uint64_t data_size,
 
     loaded->entry = hdr->e_entry;
     loaded->segment_count = 0;
+    loaded->phdr_entsize = hdr->e_phentsize;
+    loaded->phdr_count = hdr->e_phnum;
 
     serial_puts("[ELF] Entry: 0x");
     serial_puthex(hdr->e_entry, 16);
@@ -336,6 +342,11 @@ static int elf_load_segments(const uint8_t *data, uint64_t data_size,
         loaded->entry = (uint64_t)base + (hdr->e_entry - vaddr_min);
     }
 
+    /* Program headers address for auxv AT_PHDR */
+    loaded->phdr_addr = (uint64_t)base + hdr->e_phoff;
+    if (hdr->e_type == ET_EXEC)
+        loaded->phdr_addr = vaddr_min + hdr->e_phoff;
+
     serial_puts("[ELF] Entry: 0x");
     serial_puthex(loaded->entry, 16);
     serial_puts("\n");
@@ -393,9 +404,62 @@ static uint64_t elf_setup_stack(elf_loaded_t *loaded,
         str_ptr += len;
     }
 
+    /* Place AT_RANDOM 16 bytes in the string area (glibc needs this
+     * for stack canary + PTR_MANGLE/PTR_DEMANGLE pointer guard) */
+    uint64_t at_random_addr = str_ptr;
+    {
+        uint8_t *rnd = (uint8_t *)str_ptr;
+        /* Simple PRNG seed from RDTSC — good enough for non-crypto use */
+        uint64_t tsc;
+        __asm__ volatile ("rdtsc" : "=A"(tsc));
+        for (int i = 0; i < 16; i++)
+            rnd[i] = (uint8_t)((tsc >> (i & 7)) ^ (tsc >> ((i + 3) & 7)) ^ i);
+        str_ptr += 16;
+    }
+
     /* Build stack frame below string area */
     sp = string_area;
     sp &= ~0xFULL;  /* Align to 16 bytes */
+
+    /* ── Auxiliary vector (auxv) ──
+     * Must come AFTER envp NULL terminator, BEFORE alignment.
+     * We build it top-down and then copy. */
+    #define AT_NULL     0
+    #define AT_PAGESZ   6
+    #define AT_RANDOM   25
+    #define AT_ENTRY    9
+    #define AT_PHDR     3
+    #define AT_PHENT    4
+    #define AT_PHNUM    5
+    #define AT_UID      11
+    #define AT_EUID     12
+    #define AT_GID      13
+    #define AT_EGID     14
+    #define AT_SECURE   23
+    #define AT_HWCAP    16
+    #define AT_CLKTCK   17
+
+    struct { uint64_t type; uint64_t val; } auxv[] = {
+        { AT_PHDR,    loaded->phdr_addr },
+        { AT_PHENT,   loaded->phdr_entsize },
+        { AT_PHNUM,   loaded->phdr_count },
+        { AT_PAGESZ,  4096 },
+        { AT_RANDOM,  at_random_addr },
+        { AT_ENTRY,   loaded->entry },
+        { AT_UID,     0 }, { AT_EUID, 0 },
+        { AT_GID,     0 }, { AT_EGID, 0 },
+        { AT_SECURE,  0 },
+        { AT_HWCAP,   0 },
+        { AT_CLKTCK,  100 },
+        { AT_NULL,    0 },
+    };
+    int auxv_count = sizeof(auxv) / sizeof(auxv[0]);
+
+    /* Push auxv (reverse order so AT_NULL is last/highest) */
+    for (int i = auxv_count - 1; i >= 0; i--) {
+        sp -= 8; *(uint64_t *)sp = auxv[i].val;
+        sp -= 8; *(uint64_t *)sp = auxv[i].type;
+    }
 
     /* Push envp terminator (NULL) */
     sp -= 8;

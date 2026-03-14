@@ -165,5 +165,6 @@ int main(int argc, char **argv)
     printf("\n=== Results: %d passed, %d failed ===\n",
            tests_passed, tests_failed);
 
+    fflush(stdout);
     return tests_failed > 0 ? 1 : 0;
 }
