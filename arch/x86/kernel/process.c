@@ -21,6 +21,7 @@ extern void serial_puthex(uint64_t val, int digits);
 extern void serial_putdec(uint64_t val);
 extern void fb_puts(const char *s);
 extern void fb_puts_color(const char *s, uint32_t color);
+extern uint64_t idt_get_ticks(void);
 extern void fb_putdec(uint64_t val);
 
 extern void *kmalloc(uint64_t size);
@@ -138,6 +139,10 @@ typedef struct {
     bool     is_thread;          /* true if created via CLONE_THREAD */
     uint64_t fs_base;            /* per-thread FS_BASE (TLS) */
     uint64_t *clear_child_tid;   /* set_tid_address / CLONE_CHILD_CLEARTID */
+
+    /* Memory compression (macOS-style) */
+    uint64_t last_active_tick;   /* tick when process last ran */
+    bool     pages_compressed;   /* true if RW pages are compressed */
 
 } process_t;
 
@@ -576,10 +581,52 @@ void sched_tick(void *frame_ptr)
     if (cur->state == PROC_RUNNING)
         cur->state = PROC_READY;
 
+    /* ── Memory compression: track idle time ── */
+    {
+        uint64_t now = idt_get_ticks();
+
+        /* Update departing process's activity timestamp */
+        cur->last_active_tick = now;
+
+        /* Compress pages of processes idle too long (macOS-style).
+         * Only do this occasionally (every 100 ticks = 1s) to avoid
+         * overhead in the hot scheduler path. */
+        extern uint32_t memcompress_idle_threshold(void);
+        extern int memcompress_process_pages(uint32_t, void*, uint64_t);
+        extern int memcompress_restore_process(uint32_t);
+
+        if ((now & 0xFF) == 0) {  /* ~every 2.5 seconds */
+            for (int i = 0; i < MAX_PROCESSES; i++) {
+                process_t *p = &proctab[i];
+                if (p->state == PROC_BLOCKED && !p->pages_compressed &&
+                    p->last_active_tick > 0 &&
+                    (now - p->last_active_tick) > memcompress_idle_threshold()) {
+                    /* Compress this idle process's pages */
+                    for (int r = 0; r < p->region_count; r++) {
+                        if (p->regions[r].base && p->regions[r].pages > 0) {
+                            memcompress_process_pages(p->pid,
+                                p->regions[r].base, p->regions[r].pages);
+                        }
+                    }
+                    p->pages_compressed = true;
+                }
+            }
+        }
+    }
+
     /* Load next process */
     process_t *next = &proctab[next_idx];
+
+    /* Decompress pages if needed before running */
+    if (next->pages_compressed) {
+        extern int memcompress_restore_process(uint32_t);
+        memcompress_restore_process(next->pid);
+        next->pages_compressed = false;
+    }
+
     next->state = PROC_RUNNING;
     next->quantum = qos_quantum[next->qos_class];
+    next->last_active_tick = idt_get_ticks();
     current_proc = next;
     sched_current_idx = next_idx;
     wrmsr(MSR_FS_BASE, next->fs_base);  /* restore per-thread TLS */
