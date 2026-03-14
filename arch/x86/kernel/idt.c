@@ -628,6 +628,17 @@ void isr_handler(interrupt_frame_t *frame)
         serial_puthex(frame->rflags, 16);
         serial_puts("\n");
 
+        /* Dump bytes at RIP (useful for crashes on stack/corrupted code) */
+        if (frame->rip < 0x100000000ULL) {
+            uint8_t *code = (uint8_t *)(frame->rip & 0xFFFFFFFF);
+            serial_puts("  Code @ RIP: ");
+            for (int bi = 0; bi < 16; bi++) {
+                serial_puthex(code[bi], 2);
+                serial_puts(" ");
+            }
+            serial_puts("\n");
+        }
+
         /* Page fault: decode CR2 */
         if (vec == 14) {
             uint64_t cr2;
@@ -883,8 +894,14 @@ void idt_init(void)
         idt[i].selector = cs;
     }
 
-    /* Note: #DB does NOT use IST. TF single-step from compat mode
-     * causes #GP(0x0A) — future fix needed for null-page tracking. */
+    /* Exceptions that can fire from compat32 mode need IST to avoid
+     * pushing 64-bit frames on the 32-bit user stack (which causes
+     * cascading #GP). Share IST1 with INT 0x2E — these handlers
+     * either halt (#UD) or return quickly (#PF null-page, #DB). */
+    idt[1].ist  = 1;  /* #DB — TF single-step from null-page tracking */
+    idt[6].ist  = 1;  /* #UD — invalid opcode (corrupted function pointer) */
+    idt[13].ist = 1;  /* #GP — general protection */
+    idt[14].ist = 1;  /* #PF — page fault (null-page write handling) */
 
     /* Override: vector 0x71 = keyboard IRQ (uses isr_stub_33) */
     idt_set_entry(0x71, isr_stub_33, 0);
