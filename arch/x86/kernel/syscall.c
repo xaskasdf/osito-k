@@ -2443,6 +2443,15 @@ int64_t syscall_dispatch(uint64_t nr, uint64_t a1, uint64_t a2,
     case SYS_FCHOWN:     return 0;
     case SYS_UMASK:      return sys_umask(a1);
     case SYS_GETTIMEOFDAY: return sys_gettimeofday(a1, a2);
+    case 201: { /* time(time_t *) — return seconds since epoch */
+        int64_t secs = sys_clock_gettime(0 /* CLOCK_REALTIME */, 0);
+        if (secs < 0) secs = 0;
+        /* clock_gettime with buf=0 just returns; use gettimeofday */
+        struct { uint64_t tv_sec; uint64_t tv_usec; } tv;
+        sys_gettimeofday((uint64_t)&tv, 0);
+        if (a1) *(int64_t *)a1 = (int64_t)tv.tv_sec;
+        return (int64_t)tv.tv_sec;
+    }
     case SYS_GETRLIMIT:  return sys_prlimit64(0, a1, 0, a2);
     case SYS_SYSINFO:    return sys_sysinfo(a1);
     case SYS_TIMES:      return -1;  /* return -1 = no times data */
