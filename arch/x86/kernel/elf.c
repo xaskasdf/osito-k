@@ -204,6 +204,20 @@ static int elf_load_segments(const uint8_t *data, uint64_t data_size,
     serial_putdec(hdr->e_phnum);
     serial_puts(" program headers\n");
 
+    /* Check for PT_INTERP (dynamic linker) */
+    const char *interp_path = NULL;
+    for (int i = 0; i < hdr->e_phnum; i++) {
+        uint64_t phoff = hdr->e_phoff + (uint64_t)i * hdr->e_phentsize;
+        if (phoff + sizeof(elf64_phdr_t) > data_size) break;
+        const elf64_phdr_t *ph = (const elf64_phdr_t *)(data + phoff);
+        if (ph->p_type == PT_INTERP && ph->p_filesz > 0 && ph->p_filesz < 256) {
+            interp_path = (const char *)(data + ph->p_offset);
+            serial_puts("[ELF] Interpreter: ");
+            serial_puts(interp_path);
+            serial_puts("\n");
+        }
+    }
+
     /* First pass: find min/max vaddr across all LOAD segments.
      * We allocate one contiguous block so RIP-relative addressing
      * between segments (e.g. .text → .rodata) works correctly. */
