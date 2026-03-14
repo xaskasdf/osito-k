@@ -317,7 +317,7 @@ static void tss_init(void)
     /* Zero TSS, set IST1 to top of dedicated stack */
     memset(&kernel_tss, 0, sizeof(kernel_tss));
     kernel_tss.ist1 = (uint64_t)(ist1_stack + IST1_STACK_SIZE);
-    kernel_tss.ist2 = (uint64_t)(ist2_stack + IST2_STACK_SIZE);
+    /* IST2 reserved for future use (e.g., #DB from compat mode) */
     kernel_tss.iopb_offset = sizeof(struct tss64);
     tss_ist1_ptr = &kernel_tss.ist1;
 
@@ -524,15 +524,19 @@ void isr_handler(interrupt_frame_t *frame)
         uint64_t cr2;
         __asm__ volatile ("mov %%cr2, %0" : "=r"(cr2));
 
-        /* WRITE fault on page 0: allow it via TF single-step */
+        /* WRITE fault on page 0: allow it via TF single-step.
+         * For compat32 (CS=0x40): skip TF — #DB delivery from compat mode
+         * causes #GP(0x0A) because the 64-bit exception frame can't be
+         * pushed on the 32-bit stack without IST. Just leave page writable. */
         if (cr2 < 0x1000 && (frame->error_code & 2) && !(frame->error_code & 16)) {
-            /* Make page 0 writable temporarily */
             paging_set_flags(0, PTE_PRESENT | PTE_WRITABLE | PTE_GLOBAL | PTE_NX);
             __asm__ volatile ("invlpg (%0)" :: "r"((uint64_t)0) : "memory");
-            /* Set TF to fire #DB after the write instruction completes */
-            frame->rflags |= (1ULL << 8);  /* TF bit */
+            if ((frame->cs & 0xFFFF) != 0x40) {
+                /* 64-bit mode: use TF single-step to re-protect after write */
+                frame->rflags |= (1ULL << 8);  /* TF bit */
+            }
             g_null_page_dirty = 1;
-            return;  /* re-execute the write instruction */
+            return;
         }
 
         if (cr2 < 0x1000 && (frame->error_code & 16)) {  /* INSTRUCTION-FETCH on page 0 */
