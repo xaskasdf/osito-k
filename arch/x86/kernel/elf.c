@@ -850,16 +850,11 @@ int elf_exec(const char *filename, int argc, const char **argv)
                         tcb[5] = seed ^ 0xDEADBEEFCAFEBABEULL; /* stack_guard */
                         tcb[6] = seed ^ 0x1234567890ABCDEFULL;  /* pointer_guard */
 
-                        /* Set MSR_FS_BASE */
-                        __asm__ volatile(
-                            "movl $0xC0000100, %%ecx\n"
-                            "movl %0, %%eax\n"
-                            "movl %1, %%edx\n"
-                            "wrmsr\n"
-                            : : "r"((uint32_t)(tp & 0xFFFFFFFF)),
-                                "r"((uint32_t)(tp >> 32))
-                            : "ecx"
-                        );
+                        /* Set MSR_FS_BASE (0xC0000100) */
+                        __asm__ volatile("wrmsr"
+                            : : "c"(0xC0000100U),
+                                "a"((uint32_t)(tp & 0xFFFFFFFF)),
+                                "d"((uint32_t)(tp >> 32)));
                         proc_set_fs_base(tp);
                         proc_add_region(tls_area, alloc_sz / 4096);
 
