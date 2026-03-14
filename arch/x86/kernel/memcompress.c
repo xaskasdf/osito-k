@@ -207,7 +207,7 @@ int wkdm_decompress(const uint8_t *src, uint32_t *dst)
  * is stored in this pool. On access, we decompress back to a
  * fresh 4KB page. */
 
-#define CPAGE_MAX 256
+#define CPAGE_MAX 1024
 
 typedef struct {
     uint8_t  *data;             /* compressed data (kmalloc'd) */

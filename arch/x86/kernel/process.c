@@ -57,10 +57,10 @@ extern void syscall_restore_brk(void);
 
 /* ── Constants ───────────────────────────────────────────────── */
 
-#define MAX_PROCESSES   16
-#define MAX_FDS         16
+#define MAX_PROCESSES   64  /* Increased from 16; further scaling via sys_caps planned */
+#define MAX_FDS         32
 #define MAX_NAME_LEN    64
-#define MAX_REGIONS     16
+#define MAX_REGIONS     32
 
 /* Process states */
 #define PROC_FREE       0
@@ -71,7 +71,7 @@ extern void syscall_restore_brk(void);
 
 /* Scheduler constants (X-SCHED) */
 #define SCHED_QUANTUM       5       /* default ticks per time slice (50ms @ 100Hz) */
-#define KERNEL_STACK_SIZE   16384   /* 16KB per kernel thread */
+#define KERNEL_STACK_SIZE   32768   /* 32KB per kernel thread */
 
 /* QoS priority classes — higher value = higher priority */
 #define QOS_IDLE            0

@@ -133,7 +133,7 @@ void elf_fork_restore(void)
 
 /* ── ELF state ───────────────────────────────────────────────── */
 
-#define ELF_MAX_SEGMENTS 16
+#define ELF_MAX_SEGMENTS 24
 /* User stack: dynamic from sys_caps (1-8MB based on RAM) */
 #include "../include/sys_caps.h"
 #define USER_STACK_SIZE  (g_sys_caps.user_stack_size ? g_sys_caps.user_stack_size : (1024 * 1024))

@@ -40,7 +40,7 @@ static inline uint32_t ntohl(uint32_t n) {
 
 /* ── ARP Table ───────────────────────────────────────────────── */
 
-#define ARP_TABLE_SIZE 16
+#define ARP_TABLE_SIZE 64
 
 typedef struct {
     uint8_t  ip[4];

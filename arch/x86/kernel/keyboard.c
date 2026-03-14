@@ -26,7 +26,7 @@ extern void xhci_poll(void) __attribute__((weak));
 
 /* ── Ring buffer ─────────────────────────────────────────────── */
 
-#define KB_BUF_SIZE  64
+#define KB_BUF_SIZE  256
 
 static char     kb_buf[KB_BUF_SIZE];
 static volatile uint32_t kb_head;   /* Write position */

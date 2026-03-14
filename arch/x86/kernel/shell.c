@@ -194,7 +194,7 @@ static void sh_putdec(uint64_t val)
 
 /* ── Parse command line into argv ────────────────────────────── */
 
-#define MAX_ARGS 16
+#define MAX_ARGS 64
 
 static int parse_args(char *line, char *argv[])
 {

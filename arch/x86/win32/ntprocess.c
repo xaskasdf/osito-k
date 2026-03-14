@@ -34,7 +34,7 @@ extern uint64_t idt_get_ticks(void);
 /* ── Thread state ───────────────────────────────────────────── */
 
 #define MAX_THREADS     16
-#define THREAD_STACK_SIZE  (64 * 1024)  /* 64KB per thread */
+#define THREAD_STACK_SIZE  (256 * 1024)  /* 256KB per thread */
 
 typedef enum _THREAD_STATE {
     THREAD_FREE     = 0,

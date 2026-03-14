@@ -413,7 +413,7 @@ extern void  mem_free_pages(void *addr, uint64_t count);
 
 /* Recursion guard to prevent infinite loops */
 static int load_depth = 0;
-#define MAX_LOAD_DEPTH 8
+#define MAX_LOAD_DEPTH 16
 
 /*
  * Try to load a DLL from the filesystem by name.

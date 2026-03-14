@@ -101,7 +101,7 @@ typedef struct __attribute__((packed)) {
 #define TCP_SYN_RCVD    9
 
 #define TCP_RX_BUF_SIZE 8192
-#define TCP_MAX_CONNS   8
+#define TCP_MAX_CONNS   32
 
 typedef struct {
     int       state;
