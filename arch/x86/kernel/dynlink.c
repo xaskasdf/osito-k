@@ -125,6 +125,57 @@ static int stub_noop(void) { return 0; }
 /* Safe landing pad for unresolved PLT entries — returns 0 instead of NULL-CALL */
 static uint64_t stub_unresolved(void) { return 0; }
 
+/* ── Direct kernel syscall stubs ─────────────────────────────
+ * Chrome runs in ring 0 — PLT entries can call kernel functions
+ * directly instead of going through the SYSCALL instruction.
+ * This also handles the case where libc's wrappers fail. */
+extern int64_t syscall_dispatch(uint64_t nr, uint64_t a1, uint64_t a2,
+                                 uint64_t a3, uint64_t a4, uint64_t a5);
+
+static int64_t kern_open(const char *path, int flags, int mode)
+{
+    return syscall_dispatch(2/*SYS_OPEN*/, (uint64_t)path,
+                            (uint64_t)flags, (uint64_t)mode, 0, 0);
+}
+
+static int64_t kern_close(int fd)
+{
+    return syscall_dispatch(3/*SYS_CLOSE*/, (uint64_t)fd, 0, 0, 0, 0);
+}
+
+static int64_t kern_read(int fd, void *buf, uint64_t n)
+{
+    return syscall_dispatch(0/*SYS_READ*/, (uint64_t)fd,
+                            (uint64_t)buf, n, 0, 0);
+}
+
+static int64_t kern_write(int fd, const void *buf, uint64_t n)
+{
+    return syscall_dispatch(1/*SYS_WRITE*/, (uint64_t)fd,
+                            (uint64_t)buf, n, 0, 0);
+}
+
+static void *kern_mmap(void *addr, uint64_t len, int prot,
+                        int flags, int fd, int64_t off)
+{
+    int64_t r = syscall_dispatch(9/*SYS_MMAP*/, (uint64_t)addr, len,
+                                  (uint64_t)prot, (uint64_t)flags,
+                                  (uint64_t)fd);
+    return (void *)r;
+}
+
+static int kern_mprotect(void *addr, uint64_t len, int prot)
+{
+    return (int)syscall_dispatch(10/*SYS_MPROTECT*/, (uint64_t)addr,
+                                 len, (uint64_t)prot, 0, 0);
+}
+
+static int kern_munmap(void *addr, uint64_t len)
+{
+    return (int)syscall_dispatch(11/*SYS_MUNMAP*/, (uint64_t)addr,
+                                 len, 0, 0, 0);
+}
+
 /* __tls_get_addr: reads DTV from %fs:8, returns dtv[module] + offset */
 static void *kern_tls_get_addr(void *ti_ptr)
 {
@@ -178,9 +229,17 @@ static const ksym_entry_t ksym_table[] = {
     { "_exit",          (uint64_t)stub_exit      },
     { "abort",          (uint64_t)stub_exit      },
 
-    /* I/O (minimal stubs) */
-    { "write",          (uint64_t)stub_write     },
-    { "read",           (uint64_t)stub_read      },
+    /* POSIX I/O — direct kernel calls (bypass SYSCALL instruction) */
+    { "open",           (uint64_t)kern_open      },
+    { "open64",         (uint64_t)kern_open      },
+    { "openat",         (uint64_t)stub_unresolved}, /* TODO */
+    { "close",          (uint64_t)kern_close     },
+    { "read",           (uint64_t)kern_read      },
+    { "write",          (uint64_t)kern_write     },
+    { "mmap",           (uint64_t)kern_mmap      },
+    { "mmap64",         (uint64_t)kern_mmap      },
+    { "mprotect",       (uint64_t)kern_mprotect  },
+    { "munmap",         (uint64_t)kern_munmap    },
 
     /* TLS */
     { "__tls_get_addr",        (uint64_t)kern_tls_get_addr },
