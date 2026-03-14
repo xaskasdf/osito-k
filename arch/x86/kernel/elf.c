@@ -678,6 +678,70 @@ int elf_exec(const char *filename, int argc, const char **argv)
         }
     }
 
+    /* ── Minimal TLS setup (tcbhead_t for glibc) ────────────────────
+     * glibc expects %fs to point to a valid tcbhead_t with stack_guard
+     * and pointer_guard. Set this up before loading shared libs so
+     * INIT_ARRAY constructors can access TLS. */
+    {
+        extern void proc_set_fs_base(uint64_t addr);
+
+        #define TLS_DATA_SIZE  8192   /* space for TLS variables */
+        #define TCBHEAD_SIZE   0x80   /* tcbhead_t fields */
+
+        uint8_t *tls_area = (uint8_t *)mem_alloc_aligned(
+            TLS_DATA_SIZE + TCBHEAD_SIZE, 4096);
+        if (tls_area) {
+            memset(tls_area, 0, TLS_DATA_SIZE + TCBHEAD_SIZE);
+
+            /* Variant II: [TLS data...] [tcbhead_t at TP]
+             * FS_BASE = TP = start of tcbhead_t */
+            uint64_t tp = (uint64_t)(tls_area + TLS_DATA_SIZE);
+            uint64_t *tcb = (uint64_t *)tp;
+
+            /* tcbhead_t layout (x86-64):
+             *   +0x00 tcb        → TP itself
+             *   +0x08 dtv        → NULL (no dynamic TLS)
+             *   +0x10 self       → TP (pthread descriptor)
+             *   +0x18 multiple_threads(4) + gscope_flag(4)
+             *   +0x20 sysinfo    → 0
+             *   +0x28 stack_guard→ random canary
+             *   +0x30 pointer_guard → random XOR key */
+            tcb[0] = tp;       /* tcb → self */
+            tcb[1] = 0;        /* dtv */
+            tcb[2] = tp;       /* self (pthread) */
+            tcb[3] = 0;        /* multiple_threads=0, gscope=0 */
+            tcb[4] = 0;        /* sysinfo */
+
+            /* Random values from RDTSC */
+            uint64_t tsc_lo, tsc_hi;
+            __asm__ volatile("rdtsc" : "=a"(tsc_lo), "=d"(tsc_hi));
+            uint64_t seed = (tsc_hi << 32) | tsc_lo;
+            tcb[5] = seed ^ 0xDEADBEEFCAFEBABEULL;  /* stack_guard */
+            tcb[6] = seed ^ 0x1234567890ABCDEFULL;   /* pointer_guard */
+
+            /* Set MSR_FS_BASE */
+            __asm__ volatile(
+                "movl $0xC0000100, %%ecx\n"
+                "movl %0, %%eax\n"
+                "movl %1, %%edx\n"
+                "wrmsr\n"
+                : : "r"((uint32_t)(tp & 0xFFFFFFFF)),
+                    "r"((uint32_t)(tp >> 32))
+                : "ecx"
+            );
+
+            proc_set_fs_base(tp);
+            proc_add_region(tls_area,
+                (TLS_DATA_SIZE + TCBHEAD_SIZE + 4095) / 4096);
+
+            serial_puts("[TLS] FS_BASE=0x");
+            serial_puthex(tp, 16);
+            serial_puts(" guard=0x");
+            serial_puthex(tcb[5], 8);
+            serial_puts("\n");
+        }
+    }
+
     /* ── Dynamic linking ─────────────────────────────────────────────
      * If the binary has a PT_DYNAMIC segment, parse it to resolve
      * shared library dependencies and apply relocations. This bridges

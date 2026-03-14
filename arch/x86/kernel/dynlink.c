@@ -327,8 +327,10 @@ int dl_apply_rela(dl_module_t *m, const dl_rela_t *rela, uint64_t count)
             break;
         }
 
+        case R_X86_64_DTPMOD64:
+        case R_X86_64_DTPOFF64:
         case R_X86_64_TPOFF32:
-            /* TLS offset — skip silently (no TLS support yet) */
+            /* TLS relocations — skip silently (minimal TLS) */
             break;
 
         case R_X86_64_NONE:
