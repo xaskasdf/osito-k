@@ -513,8 +513,10 @@ HWND WINAPI CreateWindowExA(DWORD dwExStyle, PCSTR lpClassName,
     serial_puthex(nHeight, 4);
     serial_puts("\n");
 
-    /* Send WM_NCCREATE + WM_CREATE */
+    /* Send WM_NCCREATE + WM_CREATE via compat32 callback.
+     * The WndProc is 32-bit code — can't call it directly from 64-bit. */
     if (wndproc) {
+        extern uint32_t compat32_callback_args(uint32_t func_addr, int nargs, const uint32_t *args);
         CREATESTRUCTA cs;
         BYTE *p = (BYTE *)&cs;
         for (SIZE_T i = 0; i < sizeof(cs); i++) p[i] = 0;
@@ -530,8 +532,16 @@ HWND WINAPI CreateWindowExA(DWORD dwExStyle, PCSTR lpClassName,
         cs.lpszClass = lpClassName;
         cs.dwExStyle = dwExStyle;
 
-        wndproc(w->handle, WM_NCCREATE, 0, (LPARAM)&cs);
-        wndproc(w->handle, WM_CREATE, 0, (LPARAM)&cs);
+        uint32_t wndproc32 = (uint32_t)(ULONG_PTR)wndproc;
+        uint32_t nccreate_args[4] = {
+            (uint32_t)(ULONG_PTR)w->handle, 0x0081 /*WM_NCCREATE*/, 0,
+            (uint32_t)(ULONG_PTR)&cs };
+        uint32_t create_args[4] = {
+            (uint32_t)(ULONG_PTR)w->handle, 0x0001 /*WM_CREATE*/, 0,
+            (uint32_t)(ULONG_PTR)&cs };
+
+        compat32_callback_args(wndproc32, 4, nccreate_args);
+        compat32_callback_args(wndproc32, 4, create_args);
     }
 
     return w->handle;

@@ -295,7 +295,9 @@ static void winexec_preload_dlls(void)
 
         serial_puts("[WINEXEC] preload: ");
         serial_puts(name);
-        serial_puts("\n");
+        serial_puts(" (");
+        serial_putdec(fsize / 1024);
+        serial_puts(" KB)...\n");
 
         uint64_t pages = (fsize + 0xFFF) / 4096;
         uint8_t *buf = (uint8_t *)mem_alloc_pages(pages);
@@ -303,6 +305,10 @@ static void winexec_preload_dlls(void)
 
         osfs2_read(f, 0, buf, fsize);
         dll_load(name, (const BYTE *)buf, (SIZE_T)fsize);
+        serial_puts("[WINEXEC] preload done: ");
+        serial_puts(name);
+        serial_puts("\n");
+        loaded++;
         /* Intentionally leak temp buffer — freeing pages allows
          * mem_alloc_pages to recycle them for VirtualAlloc, which
          * zero-fills, potentially corrupting live PE32 heap data
