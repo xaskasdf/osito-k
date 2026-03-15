@@ -1094,15 +1094,31 @@ HANDLE WINAPI LoadLibraryA(PCSTR lpLibFileName)
     (void)test; /* Just checking if shim exists */
 
     /* Try to load the DLL file from the filesystem */
-    void *fsfile = osfs2_find(lpLibFileName);
+    /* Extract basename and try with/without .dll extension */
+    const char *basename = lpLibFileName;
+    for (const char *p = lpLibFileName; *p; p++) {
+        if (*p == '\\' || *p == '/') basename = p + 1;
+    }
+
+    void *fsfile = osfs2_find(basename);
+    if (!fsfile)
+        fsfile = osfs2_find(lpLibFileName);
+
+    /* If not found, try appending .dll (engine often omits extension) */
     if (!fsfile) {
-        /* Try with just the filename (strip path) */
-        const char *basename = lpLibFileName;
-        for (const char *p = lpLibFileName; *p; p++) {
-            if (*p == '\\' || *p == '/') basename = p + 1;
+        char with_dll[128];
+        int j = 0;
+        int has_dot = 0;
+        for (const char *p = basename; *p && j < 120; p++, j++) {
+            with_dll[j] = *p;
+            if (*p == '.') has_dot = 1;
         }
-        if (basename != lpLibFileName)
-            fsfile = osfs2_find(basename);
+        if (!has_dot) {
+            with_dll[j++] = '.'; with_dll[j++] = 'd';
+            with_dll[j++] = 'l'; with_dll[j++] = 'l';
+        }
+        with_dll[j] = 0;
+        fsfile = osfs2_find(with_dll);
     }
 
     if (fsfile) {
