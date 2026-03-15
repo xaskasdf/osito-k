@@ -1435,42 +1435,144 @@ DWORD WINAPI GetWindowsDirectoryW(PWSTR lpBuffer, DWORD uSize)
 
 /* ── Find File ─────────────────────────────────────────────── */
 
+/* ── FindFirstFile/FindNextFile backed by OsitoFS ──────────── */
+
+extern int osfs2_find_first(const char *pattern, int start_idx);
+typedef struct { char name[64]; uint64_t size; } osfs2_file_t;
+extern osfs2_file_t *osfs2_get_file(int index);
+
+/* Find handle: store pattern + current index */
+#define MAX_FIND_HANDLES 8
+static struct {
+    char pattern[64];   /* e.g. "*.u" */
+    int  next_idx;      /* next OsitoFS index to search */
+    bool in_use;
+} find_handles[MAX_FIND_HANDLES];
+
+static void fill_find_data_a(LPWIN32_FIND_DATAA fd, osfs2_file_t *f)
+{
+    memset(fd, 0, sizeof(*fd));
+    fd->dwFileAttributes = 0x80; /* FILE_ATTRIBUTE_NORMAL */
+    fd->nFileSizeLow = (uint32_t)(f->size & 0xFFFFFFFF);
+    fd->nFileSizeHigh = (uint32_t)(f->size >> 32);
+    /* Copy name (max 260 chars) */
+    int i = 0;
+    while (f->name[i] && i < 259) { fd->cFileName[i] = f->name[i]; i++; }
+    fd->cFileName[i] = 0;
+}
+
+/* Extract basename pattern from "C:\System\*.u" → "*.u" */
+static const char *extract_pattern(const char *path)
+{
+    const char *p = path;
+    const char *last = path;
+    while (*p) { if (*p == '\\' || *p == '/') last = p + 1; p++; }
+    return last;
+}
+
 HANDLE WINAPI FindFirstFileA(PCSTR lpFileName, LPWIN32_FIND_DATAA lpFindFileData)
 {
-    (void)lpFileName;
-    (void)lpFindFileData;
-    g_last_error = 2; /* ERROR_FILE_NOT_FOUND */
-    return INVALID_HANDLE_VALUE;
+    if (!lpFileName || !lpFindFileData) {
+        g_last_error = 87; /* ERROR_INVALID_PARAMETER */
+        return INVALID_HANDLE_VALUE;
+    }
+
+    const char *pattern = extract_pattern(lpFileName);
+
+    int idx = osfs2_find_first(pattern, 0);
+    if (idx < 0) {
+        g_last_error = 2; /* ERROR_FILE_NOT_FOUND */
+        return INVALID_HANDLE_VALUE;
+    }
+
+    /* Allocate find handle */
+    int slot = -1;
+    for (int i = 0; i < MAX_FIND_HANDLES; i++) {
+        if (!find_handles[i].in_use) { slot = i; break; }
+    }
+    if (slot < 0) {
+        g_last_error = 4; /* ERROR_TOO_MANY_OPEN_FILES */
+        return INVALID_HANDLE_VALUE;
+    }
+
+    find_handles[slot].in_use = true;
+    int j = 0;
+    while (pattern[j] && j < 63) { find_handles[slot].pattern[j] = pattern[j]; j++; }
+    find_handles[slot].pattern[j] = 0;
+
+    osfs2_file_t *f = osfs2_get_file(idx);
+    fill_find_data_a(lpFindFileData, f);
+    find_handles[slot].next_idx = idx + 1;
+
+    return (HANDLE)(ULONG_PTR)(slot + 0x100);  /* offset to avoid NULL */
 }
 
 BOOL WINAPI FindNextFileA(HANDLE hFindFile, LPWIN32_FIND_DATAA lpFindFileData)
 {
-    (void)hFindFile;
-    (void)lpFindFileData;
-    g_last_error = 18; /* ERROR_NO_MORE_FILES */
-    return FALSE;
+    int slot = (int)(ULONG_PTR)hFindFile - 0x100;
+    if (slot < 0 || slot >= MAX_FIND_HANDLES || !find_handles[slot].in_use) {
+        g_last_error = 6; /* ERROR_INVALID_HANDLE */
+        return FALSE;
+    }
+
+    int idx = osfs2_find_first(find_handles[slot].pattern, find_handles[slot].next_idx);
+    if (idx < 0) {
+        g_last_error = 18; /* ERROR_NO_MORE_FILES */
+        return FALSE;
+    }
+
+    osfs2_file_t *f = osfs2_get_file(idx);
+    fill_find_data_a(lpFindFileData, f);
+    find_handles[slot].next_idx = idx + 1;
+    return TRUE;
 }
 
 BOOL WINAPI FindClose(HANDLE hFindFile)
 {
-    (void)hFindFile;
+    int slot = (int)(ULONG_PTR)hFindFile - 0x100;
+    if (slot >= 0 && slot < MAX_FIND_HANDLES)
+        find_handles[slot].in_use = false;
     return TRUE;
 }
 
 HANDLE WINAPI FindFirstFileW(PCWSTR lpFileName, LPWIN32_FIND_DATAW lpFindFileData)
 {
-    (void)lpFileName;
-    (void)lpFindFileData;
-    g_last_error = 2; /* ERROR_FILE_NOT_FOUND */
-    return INVALID_HANDLE_VALUE;
+    /* Convert wide to ASCII and delegate */
+    char narrow[260];
+    int i = 0;
+    while (lpFileName[i] && i < 259) { narrow[i] = (char)lpFileName[i]; i++; }
+    narrow[i] = 0;
+
+    WIN32_FIND_DATAA fdA;
+    HANDLE h = FindFirstFileA(narrow, &fdA);
+    if (h == INVALID_HANDLE_VALUE) return INVALID_HANDLE_VALUE;
+
+    /* Convert result to wide */
+    if (lpFindFileData) {
+        memset(lpFindFileData, 0, sizeof(*lpFindFileData));
+        lpFindFileData->dwFileAttributes = fdA.dwFileAttributes;
+        lpFindFileData->nFileSizeLow = fdA.nFileSizeLow;
+        lpFindFileData->nFileSizeHigh = fdA.nFileSizeHigh;
+        for (int j = 0; fdA.cFileName[j] && j < 259; j++)
+            lpFindFileData->cFileName[j] = (uint16_t)fdA.cFileName[j];
+    }
+    return h;
 }
 
 BOOL WINAPI FindNextFileW(HANDLE hFindFile, LPWIN32_FIND_DATAW lpFindFileData)
 {
-    (void)hFindFile;
-    (void)lpFindFileData;
-    g_last_error = 18; /* ERROR_NO_MORE_FILES */
-    return FALSE;
+    WIN32_FIND_DATAA fdA;
+    BOOL ok = FindNextFileA(hFindFile, &fdA);
+    if (!ok) return FALSE;
+    if (lpFindFileData) {
+        memset(lpFindFileData, 0, sizeof(*lpFindFileData));
+        lpFindFileData->dwFileAttributes = fdA.dwFileAttributes;
+        lpFindFileData->nFileSizeLow = fdA.nFileSizeLow;
+        lpFindFileData->nFileSizeHigh = fdA.nFileSizeHigh;
+        for (int j = 0; fdA.cFileName[j] && j < 259; j++)
+            lpFindFileData->cFileName[j] = (uint16_t)fdA.cFileName[j];
+    }
+    return TRUE;
 }
 
 /* ── Startup / Debug ───────────────────────────────────────── */

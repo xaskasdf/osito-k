@@ -265,6 +265,55 @@ void osfs2_list(void)
     fb_puts(" MB used\n");
 }
 
+/* ── Simple wildcard match (*.ext style) ─────────────────────── */
+
+static int osfs2_wildcard_match(const char *pattern, const char *name)
+{
+    /* Only support "*.ext" and "*" patterns */
+    if (pattern[0] == '*' && pattern[1] == '.') {
+        /* Match by extension */
+        const char *ext = pattern + 1;  /* ".ext" */
+        int elen = 0;
+        while (ext[elen]) elen++;
+        int nlen = 0;
+        while (name[nlen]) nlen++;
+        if (nlen < elen) return 0;
+        for (int i = 0; i < elen; i++) {
+            char a = name[nlen - elen + i];
+            char b = ext[i];
+            /* case-insensitive */
+            if (a >= 'A' && a <= 'Z') a += 32;
+            if (b >= 'A' && b <= 'Z') b += 32;
+            if (a != b) return 0;
+        }
+        return 1;
+    }
+    if (pattern[0] == '*' && pattern[1] == '\0')
+        return 1;  /* match everything */
+    /* Exact match fallback */
+    return strcmp(pattern, name) == 0;
+}
+
+/* Find first file matching a pattern. Returns file index or -1. */
+int osfs2_find_first(const char *pattern, int start_idx)
+{
+    if (!mounted) return -1;
+    for (int i = start_idx; i < OSFS2_MAX_FILES; i++) {
+        if (!(file_table[i].flags & OSFS2_FLAG_VALID)) continue;
+        if (osfs2_wildcard_match(pattern, file_table[i].name))
+            return i;
+    }
+    return -1;
+}
+
+/* Get file entry by index */
+osfs2_file_t *osfs2_get_file(int index)
+{
+    if (index < 0 || index >= OSFS2_MAX_FILES) return NULL;
+    if (!(file_table[index].flags & OSFS2_FLAG_VALID)) return NULL;
+    return &file_table[index];
+}
+
 /* ── Find file by name ───────────────────────────────────────── */
 
 osfs2_file_t *osfs2_find(const char *name)
