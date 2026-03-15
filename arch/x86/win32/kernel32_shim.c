@@ -1060,7 +1060,17 @@ HANDLE WINAPI CreateMutexW(PVOID lpMutexAttributes, BOOL bInitialOwner, PCWSTR l
 {
     (void)lpMutexAttributes;
     (void)bInitialOwner;
-    (void)lpName;
+    serial_puts("[K32] CreateMutexW called\n");
+    if (lpName) {
+        /* Print wide name as narrow for debug */
+        char nbuf[64]; int i;
+        for (i = 0; lpName[i] && i < 63; i++) nbuf[i] = (char)(lpName[i] & 0xFF);
+        nbuf[i] = 0;
+        serial_puts("[K32] Mutex name: ");
+        serial_puts(nbuf);
+        serial_puts("\n");
+    }
+    g_last_error = 0; /* NOT ERROR_ALREADY_EXISTS */
     return (HANDLE)(ULONG_PTR)0xBEEF0002;
 }
 

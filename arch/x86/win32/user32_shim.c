@@ -635,6 +635,12 @@ BOOL WINAPI PeekMessageA(LPMSG lpMsg, HWND hWnd, DWORD wMsgFilterMin,
     (void)wMsgFilterMin;
     (void)wMsgFilterMax;
 
+    static int peek_log_count = 0;
+    if (peek_log_count < 3) {
+        serial_puts("[USER32] PeekMessageA called\n");
+        peek_log_count++;
+    }
+
     if (quit_posted && msg_queue_empty()) {
         msg_write_to(lpMsg, NULL, WM_QUIT, (WPARAM)quit_code, 0, 0, 0, 0);
         if (wRemoveMsg & PM_REMOVE)

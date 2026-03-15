@@ -1432,7 +1432,10 @@ uint64_t compat32_dispatch(uint32_t thunk_idx, uint32_t *stack_args)
         int2e_call_count++;
         /* Log first 200, every 100th, AND last calls before crash
          * (always log _CxxThrowException and RaiseException) */
-        int do_log = (int2e_call_count <= 2000 || (int2e_call_count % 100000) == 0);
+        /* Log everything except timeGetTime (always log non-timeGetTime) */
+        int do_log = 1;
+        if (t->name && t->name[0] == 't' && t->name[1] == 'i' && t->name[2] == 'm' && t->name[3] == 'e')
+            do_log = (int2e_call_count <= 10 || (int2e_call_count % 500000) == 0);
         /* Always log exception-related functions */
         if (t->name && (t->name[0] == '_' && t->name[1] == 'C'))  /* _Cxx* */
             do_log = 1;
