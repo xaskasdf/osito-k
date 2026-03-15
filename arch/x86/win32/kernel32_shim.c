@@ -685,8 +685,8 @@ int WINAPI lstrlenW(PCWSTR lpString)
 
 /* ── Command line (stub) ────────────────────────────────────── */
 
-static char  g_cmdline_a[] = "program.exe";
-static WCHAR g_cmdline_w[] = {'p','r','o','g','r','a','m','.','e','x','e',0};
+static char  g_cmdline_a[] = "UnrealTournament.exe CityIntro.unr";
+static WCHAR g_cmdline_w[] = {'U','n','r','e','a','l','T','o','u','r','n','a','m','e','n','t','.','e','x','e',' ','C','i','t','y','I','n','t','r','o','.','u','n','r',0};
 
 PCSTR WINAPI GetCommandLineA(void)
 {
