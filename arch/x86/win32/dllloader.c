@@ -302,6 +302,7 @@ PVOID dll_load(const char *dll_name, const BYTE *file_data, SIZE_T file_size)
 
     /* Load the PE (may trigger recursive dll_load for dependencies) */
     NTSTATUS status = pe_load(file_data, file_size, &mod->image);
+    serial_puts("[DLL] pe_load returned\n");
 
     if (!NT_SUCCESS(status)) {
         serial_puts("[DLL] pe_load failed: ");
@@ -324,7 +325,11 @@ PVOID dll_load(const char *dll_name, const BYTE *file_data, SIZE_T file_size)
      * Without this, imports from KERNEL32/MSVCRT etc. have truncated
      * 64-bit addresses and the DLL jumps to garbage when calling them. */
     if (mod->image.Is32Bit) {
+        serial_puts("[DLL] IAT patching ");
+        serial_puts(dll_name);
+        serial_puts("...\n");
         NTSTATUS compat_st = compat32_patch_iat(&mod->image);
+        serial_puts("[DLL] IAT done\n");
         if (!NT_SUCCESS(compat_st)) {
             serial_puts("[DLL] WARNING: compat32 IAT patch failed for ");
             serial_puts(dll_name);
