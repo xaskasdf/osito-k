@@ -745,13 +745,23 @@ void isr_handler(interrupt_frame_t *frame)
             }
         }
 
-        /* If a user process is running (PID > 1) OR we're in compat32
-         * mode, kill/recover instead of halting. Win32 apps run as the
-         * shell process (PID 1) via winexec — halting would freeze the
-         * entire system for a game crash. */
+        /* Compat32 crash recovery: if a Win32 app crashes, longjmp back
+         * to the shell instead of halting. winexec sets the jmpbuf. */
+        {
+            extern uint64_t *compat32_crash_jmpbuf;
+            extern void kern_longjmp(uint64_t *buf, int val);
+            if (compat32_crash_jmpbuf && ((frame->cs & 0xFFFF) == 0x0040)) {
+                serial_puts("  [WIN32] Crash recovery — returning to shell\n");
+                uint64_t *jmp = compat32_crash_jmpbuf;
+                compat32_crash_jmpbuf = NULL;
+                kern_longjmp(jmp, 1);
+            }
+        }
+
+        /* If a user process is running (PID > 1), kill it instead of
+         * halting the system. */
         uint32_t pid = proc_current_pid();
-        int is_compat = ((frame->cs & 0xFFFF) == 0x0040);
-        if (pid > 1 || is_compat) {
+        if (pid > 1) {
             /* Guard against cascading exceptions: if we're already
              * killing this PID and another exception fires (e.g. in
              * the kill path itself), just halt the process silently. */

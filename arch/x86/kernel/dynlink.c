@@ -89,6 +89,7 @@ static dl_module_t modules[DL_MAX_MODULES];
 
 /* Fault recovery for INIT_ARRAY — checked by exception handler in idt.c */
 uint64_t *dl_fault_jmpbuf = NULL;
+uint64_t *compat32_crash_jmpbuf = NULL;
 extern int  kern_setjmp(uint64_t *buf);
 extern void kern_longjmp(uint64_t *buf, int val);
 

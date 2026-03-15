@@ -2163,7 +2163,16 @@ static void shell_exec(char *line)
             sh_puts("Usage: winexec <file.exe>\n");
         } else {
             extern int win32_exec(const char *filename);
-            win32_exec(argv[1]);
+            extern int  kern_setjmp(uint64_t *buf);
+            extern uint64_t *compat32_crash_jmpbuf;
+            static uint64_t winexec_jmpbuf[8];
+            compat32_crash_jmpbuf = winexec_jmpbuf;
+            if (kern_setjmp(winexec_jmpbuf) == 0) {
+                win32_exec(argv[1]);
+            } else {
+                sh_puts("\n [WIN32] Process crashed — returned to shell\n");
+            }
+            compat32_crash_jmpbuf = NULL;
         }
     } else if (strcmp(cmd, "clear") == 0) {
         cmd_clear();
