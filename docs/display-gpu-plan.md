@@ -189,6 +189,18 @@ Compositor displays window
 
 ---
 
+## Remote Display (VNC)
+
+QEMU built-in VNC for viewing OsitoK's framebuffer from macOS/remote:
+```bash
+# qemu-test.sh now includes -vnc :0,password=on
+# Password set via QEMU monitor: "change vnc password osito"
+# Connect from Mac: open vnc://<host-ip>:5900
+# UFW rule: sudo ufw allow 5900/tcp
+```
+
+---
+
 ## Implementation Priority
 
 | Priority | Task | Effort | Impact |

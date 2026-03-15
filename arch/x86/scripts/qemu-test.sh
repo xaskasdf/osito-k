@@ -123,7 +123,17 @@ qemu-system-x86_64 \
     -device qemu-xhci,id=usb \
     -device usb-kbd,bus=usb.0 \
     -device usb-mouse,bus=usb.0 \
-    -display none \
+    -vnc :0,password=on \
     -serial file:"$SERIAL_LOG" \
     -monitor unix:/tmp/qemu-monitor.sock,server,nowait \
-    -no-reboot
+    -no-reboot &
+
+QEMU_PID=$!
+sleep 1
+
+# Set VNC password via QEMU monitor
+echo "change vnc password osito" | socat - UNIX-CONNECT:/tmp/qemu-monitor.sock 2>/dev/null
+info "VNC: connect to $(hostname -I | awk '{print $1}'):5900 (password: osito)"
+info "  macOS: open vnc://\$(hostname -I | awk '{print \$1}'):5900"
+
+wait $QEMU_PID
