@@ -801,6 +801,78 @@ int WINAPI GetSystemMetrics(int nIndex)
     }
 }
 
+/* ── Display mode enumeration/change (for SoftDrv/DirectDraw) ──── */
+
+typedef struct {
+    char dmDeviceName[32];
+    uint16_t dmSpecVersion;
+    uint16_t dmDriverVersion;
+    uint16_t dmSize;
+    uint16_t dmDriverExtra;
+    uint32_t dmFields;
+    /* union { ... } — we just need position + display settings */
+    int32_t  dmPositionX, dmPositionY;
+    uint32_t dmDisplayOrientation;
+    uint32_t dmDisplayFixedOutput;
+    /* end union */
+    int16_t  dmColor;
+    int16_t  dmDuplex;
+    int16_t  dmYResolution;
+    int16_t  dmTTOption;
+    int16_t  dmCollate;
+    char     dmFormName[32];
+    uint16_t dmLogPixels;
+    uint32_t dmBitsPerPel;
+    uint32_t dmPelsWidth;
+    uint32_t dmPelsHeight;
+    uint32_t dmDisplayFlags;
+    uint32_t dmDisplayFrequency;
+} DEVMODEA;
+
+#define DM_BITSPERPEL  0x40000
+#define DM_PELSWIDTH   0x80000
+#define DM_PELSHEIGHT  0x100000
+#define DISP_CHANGE_SUCCESSFUL 0
+#define ENUM_CURRENT_SETTINGS  ((uint32_t)-1)
+
+LONG WINAPI ChangeDisplaySettingsA(DEVMODEA *dm, uint32_t flags)
+{
+    (void)dm; (void)flags;
+    /* Always succeed — we use the GOP framebuffer as-is */
+    return DISP_CHANGE_SUCCESSFUL;
+}
+
+LONG WINAPI ChangeDisplaySettingsW(void *dm, uint32_t flags)
+{
+    (void)dm; (void)flags;
+    return DISP_CHANGE_SUCCESSFUL;
+}
+
+BOOL WINAPI EnumDisplaySettingsA(const char *device, uint32_t mode, DEVMODEA *dm)
+{
+    (void)device;
+    if (!dm) return FALSE;
+
+    /* Return our single supported mode */
+    memset(dm, 0, sizeof(*dm));
+    dm->dmSize = sizeof(*dm);
+    dm->dmFields = DM_BITSPERPEL | DM_PELSWIDTH | DM_PELSHEIGHT;
+    dm->dmBitsPerPel = 32;
+    dm->dmPelsWidth = SCREEN_WIDTH;
+    dm->dmPelsHeight = SCREEN_HEIGHT;
+    dm->dmDisplayFrequency = 60;
+
+    /* Only mode index 0 and ENUM_CURRENT_SETTINGS are valid */
+    if (mode == 0 || mode == ENUM_CURRENT_SETTINGS)
+        return TRUE;
+    return FALSE;
+}
+
+BOOL WINAPI EnumDisplaySettingsW(const void *device, uint32_t mode, void *dm)
+{
+    return EnumDisplaySettingsA((const char *)device, mode, (DEVMODEA *)dm);
+}
+
 #define GWL_STYLE      (-16)
 #define GWL_EXSTYLE    (-20)
 #define GWL_USERDATA   (-21)
@@ -1800,7 +1872,11 @@ static const SHIM_EXPORT user32_exports[] = {
     { "GetWindowRect",      (PVOID)GetWindowRect },
     { "AdjustWindowRect",   (PVOID)AdjustWindowRect },
     { "AdjustWindowRectEx", (PVOID)AdjustWindowRectEx },
-    { "GetSystemMetrics",   (PVOID)GetSystemMetrics },
+    { "GetSystemMetrics",         (PVOID)GetSystemMetrics },
+    { "ChangeDisplaySettingsA",   (PVOID)ChangeDisplaySettingsA },
+    { "ChangeDisplaySettingsW",   (PVOID)ChangeDisplaySettingsW },
+    { "EnumDisplaySettingsA",     (PVOID)EnumDisplaySettingsA },
+    { "EnumDisplaySettingsW",     (PVOID)EnumDisplaySettingsW },
     { "GetWindowLongA",     (PVOID)GetWindowLongA },
     { "SetWindowLongA",     (PVOID)SetWindowLongA },
     { "GetForegroundWindow",(PVOID)GetForegroundWindow },
