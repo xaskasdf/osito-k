@@ -79,7 +79,10 @@ static uint32_t callback_return_stub_addr = 0;
 #define MAX_CALLBACK_DEPTH    32
 #define CALLBACK_STACK_SIZE   16384
 
-static int      callback_depth = 0;
+/* Force to .data section to change RIP-relative displacement encoding.
+ * In BSS, the displacement contained 0xCC at a critical code address,
+ * which QEMU TCG misinterpreted as INT3. */
+static int      callback_depth __attribute__((section(".data"))) = 0;
 static uint64_t callback_jmpbufs[MAX_CALLBACK_DEPTH][8];
 static uint8_t  callback_stacks[MAX_CALLBACK_DEPTH][CALLBACK_STACK_SIZE]
     __attribute__((aligned(16)));
