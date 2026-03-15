@@ -302,7 +302,6 @@ PVOID dll_load(const char *dll_name, const BYTE *file_data, SIZE_T file_size)
 
     /* Load the PE (may trigger recursive dll_load for dependencies) */
     NTSTATUS status = pe_load(file_data, file_size, &mod->image);
-    serial_puts("[DLL] pe_load returned\n");
 
     if (!NT_SUCCESS(status)) {
         serial_puts("[DLL] pe_load failed: ");

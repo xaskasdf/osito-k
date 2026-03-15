@@ -84,6 +84,7 @@ static uint32_t callback_return_stub_addr = 0;
  * which QEMU TCG misinterpreted as INT3. */
 static int      callback_depth __attribute__((section(".data"))) = 0;
 static uint64_t callback_jmpbufs[MAX_CALLBACK_DEPTH][8];
+static uint64_t callback_saved_ist1[MAX_CALLBACK_DEPTH];  /* IST1 before LRETQ */
 static uint8_t  callback_stacks[MAX_CALLBACK_DEPTH][CALLBACK_STACK_SIZE]
     __attribute__((aligned(16)));
 
@@ -882,6 +883,12 @@ void compat32_callback(uint32_t func_addr)
     serial_puthex(func_addr, 8);
     serial_puts("\n");
 
+    /* Save IST1 before callback — longjmp bypasses int2e_stub's restore */
+    {
+        extern uint64_t *tss_ist1_ptr;
+        if (tss_ist1_ptr) callback_saved_ist1[depth] = *tss_ist1_ptr;
+    }
+
     if (kern_setjmp(callback_jmpbufs[depth]) == 0) {
         /*
          * First return from setjmp — switch to compat mode.
@@ -943,6 +950,12 @@ uint32_t compat32_callback_args(uint32_t func_addr, int nargs, const uint32_t *a
     int depth = callback_depth++;
 
     callback_retval = 0;
+
+    /* Save IST1 before callback — longjmp bypasses int2e_stub's restore */
+    {
+        extern uint64_t *tss_ist1_ptr;
+        if (tss_ist1_ptr) callback_saved_ist1[depth] = *tss_ist1_ptr;
+    }
 
     if (kern_setjmp(callback_jmpbufs[depth]) == 0) {
         uint32_t *sp = (uint32_t *)(callback_stacks[depth] + CALLBACK_STACK_SIZE);
@@ -1382,6 +1395,16 @@ uint64_t compat32_dispatch(uint32_t thunk_idx, uint32_t *stack_args)
         if (depth < 0 || depth >= MAX_CALLBACK_DEPTH) {
             serial_puts("[INT2E] FATAL: invalid callback depth!\n");
             return 0;
+        }
+
+        /* CRITICAL: Restore IST1 before longjmp. The INT 0x2E handler
+         * saved old IST1 on stack and shifted it by -8192. kern_longjmp
+         * bypasses the handler's pop → IST1 drifts 8KB per callback.
+         * After 338 callbacks: 338×8192 = 2.76MB drift → stack corruption. */
+        {
+            extern uint64_t *tss_ist1_ptr;
+            if (tss_ist1_ptr && depth >= 0 && depth < MAX_CALLBACK_DEPTH)
+                *tss_ist1_ptr = callback_saved_ist1[depth];
         }
 
         kern_longjmp(callback_jmpbufs[depth], 1);
