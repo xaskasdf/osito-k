@@ -1161,30 +1161,29 @@ BOOL WINAPI FreeLibrary(HANDLE hLibModule)
 DWORD WINAPI GetModuleFileNameA(HANDLE hModule, PSTR lpFilename, DWORD nSize)
 {
     (void)hModule;
-    /* Use the actual PE executable name set by win32_exec */
+    /* Build full path: "C:\System\<exe_name>" so engine can derive install dir */
     extern char win32_exe_name[64];
-    const char *name = win32_exe_name;
-    DWORD len = 0;
-    while (name[len]) len++;
-    if (len >= nSize) len = nSize - 1;
-    for (DWORD i = 0; i < len; i++) lpFilename[i] = name[i];
-    lpFilename[len] = 0;
-    return len;
+    static const char prefix[] = "C:\\System\\";
+    DWORD pos = 0;
+
+    for (int i = 0; prefix[i] && pos < nSize - 1; i++)
+        lpFilename[pos++] = prefix[i];
+    for (int i = 0; win32_exe_name[i] && pos < nSize - 1; i++)
+        lpFilename[pos++] = win32_exe_name[i];
+    lpFilename[pos] = 0;
+    return pos;
 }
 
 DWORD WINAPI GetModuleFileNameW(HANDLE hModule, PWSTR lpFilename, DWORD nSize)
 {
     (void)hModule;
-    /* Build wide path from actual PE name: "C:\<name>" */
+    /* Build wide path: "C:\System\<name>" matching GetModuleFileNameA */
     extern char win32_exe_name[64];
-    static const WCHAR prefix[] = {'C',':','\\'};
+    static const WCHAR prefix[] = {'C',':','\\','S','y','s','t','e','m','\\'};
     DWORD pos = 0;
 
-    /* Copy prefix "C:\" */
-    for (DWORD i = 0; i < 3 && pos < nSize - 1; i++)
+    for (DWORD i = 0; i < 10 && pos < nSize - 1; i++)
         lpFilename[pos++] = prefix[i];
-
-    /* Copy exe name as wide chars */
     for (int i = 0; win32_exe_name[i] && pos < nSize - 1; i++)
         lpFilename[pos++] = (WCHAR)(unsigned char)win32_exe_name[i];
 
@@ -1311,8 +1310,8 @@ DWORD WINAPI GetFullPathNameA(PCSTR lpFileName, DWORD nBufferLength,
 
 DWORD WINAPI GetCurrentDirectoryA(DWORD nBufferLength, PSTR lpBuffer)
 {
-    const char *dir = "C:\\";
-    DWORD len = 3;
+    const char *dir = "C:\\System";
+    DWORD len = 9;
     if (nBufferLength > len) {
         for (DWORD i = 0; i <= len; i++) lpBuffer[i] = dir[i];
     }
@@ -1321,8 +1320,37 @@ DWORD WINAPI GetCurrentDirectoryA(DWORD nBufferLength, PSTR lpBuffer)
 
 DWORD WINAPI GetFileAttributesA(PCSTR lpFileName)
 {
-    (void)lpFileName;
-    return (DWORD)-1; /* INVALID_FILE_ATTRIBUTES — file not found */
+    if (!lpFileName) return (DWORD)-1;
+
+    /* Extract basename (OsitoFS is flat) */
+    const char *base = lpFileName;
+    int has_dot = 0;
+    for (const char *p = lpFileName; *p; p++) {
+        if (*p == '\\' || *p == '/') base = p + 1;
+        if (*p == '.') has_dot = 1;
+    }
+
+    /* Empty basename after stripping path = directory reference */
+    if (!*base || !has_dot) {
+        /* Treat as directory — UT99 checks ".", "..", "..\Maps", etc. */
+        return 0x10; /* FILE_ATTRIBUTE_DIRECTORY */
+    }
+
+    /* Check OsitoFS for the file */
+    void *f = osfs2_find(base);
+    if (f) return 0x80; /* FILE_ATTRIBUTE_NORMAL */
+
+    /* Also try the full relative path as-is */
+    if (base != lpFileName) {
+        f = osfs2_find(lpFileName);
+        if (f) return 0x80;
+    }
+
+    serial_puts("[K32] GetFileAttributesA NOT_FOUND: '");
+    serial_puts(lpFileName);
+    serial_puts("'\n");
+    g_last_error = 2; /* ERROR_FILE_NOT_FOUND */
+    return (DWORD)-1; /* INVALID_FILE_ATTRIBUTES */
 }
 
 BOOL WINAPI SetFileAttributesA(PCSTR lpFileName, DWORD dwFileAttributes)
@@ -1361,10 +1389,12 @@ BOOL WINAPI RemoveDirectoryW(PCWSTR lpPathName)
 
 DWORD WINAPI GetCurrentDirectoryW(DWORD nBufferLength, PWSTR lpBuffer)
 {
-    /* Stub: return empty string */
-    if (nBufferLength > 0 && lpBuffer)
-        lpBuffer[0] = 0;
-    return 0;
+    static const WCHAR dir[] = {'C',':','\\','S','y','s','t','e','m',0};
+    DWORD len = 9;
+    if (nBufferLength > len && lpBuffer) {
+        for (DWORD i = 0; i <= len; i++) lpBuffer[i] = dir[i];
+    }
+    return len;
 }
 
 BOOL WINAPI SetCurrentDirectoryA(PCSTR lpPathName)
@@ -1479,8 +1509,15 @@ HANDLE WINAPI FindFirstFileA(PCSTR lpFileName, LPWIN32_FIND_DATAA lpFindFileData
 
     const char *pattern = extract_pattern(lpFileName);
 
+    serial_puts("[K32] FindFirstFileA: '");
+    serial_puts(lpFileName);
+    serial_puts("' pattern='");
+    serial_puts(pattern);
+    serial_puts("'\n");
+
     int idx = osfs2_find_first(pattern, 0);
     if (idx < 0) {
+        serial_puts("[K32] FindFirstFileA: no match\n");
         g_last_error = 2; /* ERROR_FILE_NOT_FOUND */
         return INVALID_HANDLE_VALUE;
     }
@@ -2169,8 +2206,14 @@ DWORD WINAPI GetFullPathNameW(PCWSTR lpFileName, DWORD nBufferLength,
 
 DWORD WINAPI GetFileAttributesW(PCWSTR lpFileName)
 {
-    (void)lpFileName;
-    return (DWORD)-1;
+    if (!lpFileName) return (DWORD)-1;
+    /* Convert wide to narrow and delegate */
+    char narrow[260];
+    int i = 0;
+    for (; lpFileName[i] && i < 259; i++)
+        narrow[i] = (char)(lpFileName[i] & 0xFF);
+    narrow[i] = 0;
+    return GetFileAttributesA(narrow);
 }
 
 BOOL WINAPI FileTimeToLocalFileTime(PCVOID lpFileTime, PVOID lpLocalFileTime)
@@ -2221,10 +2264,10 @@ BOOL WINAPI GetDiskFreeSpaceA(PCSTR lpRoot, DWORD *lpSPC, DWORD *lpBPS,
  * File parameter is ignored (all INI data is in one global store).
  */
 
-#define INI_MAX_ENTRIES 512
+#define INI_MAX_ENTRIES 1024
 #define INI_MAX_SECTION  64
 #define INI_MAX_KEY      64
-#define INI_MAX_VALUE   256
+#define INI_MAX_VALUE   512
 
 typedef struct {
     char section[INI_MAX_SECTION];
@@ -2234,6 +2277,11 @@ typedef struct {
 
 static INI_ENTRY g_ini_store[INI_MAX_ENTRIES];
 static int       g_ini_count = 0;
+
+/* Track which INI files have been loaded from OsitoFS */
+#define INI_FILES_MAX 8
+static char ini_loaded_files[INI_FILES_MAX][64];
+static int  ini_loaded_count = 0;
 
 static int ini_stricmp(const char *a, const char *b)
 {
@@ -2272,11 +2320,110 @@ static INI_ENTRY *ini_find(const char *section, const char *key)
     return NULL;
 }
 
+/* Add INI entry (allows duplicates — UT99 uses multi-value keys like Paths=) */
+static void ini_add(const char *section, const char *key, const char *value)
+{
+    if (g_ini_count >= INI_MAX_ENTRIES) return;
+    INI_ENTRY *e = &g_ini_store[g_ini_count++];
+    ini_strcpy(e->section, section, INI_MAX_SECTION);
+    ini_strcpy(e->key, key, INI_MAX_KEY);
+    ini_strcpy(e->value, value, INI_MAX_VALUE);
+}
+
+/* Parse and load an INI file from OsitoFS into the INI store */
+static void ini_load_from_osfs(const char *filename)
+{
+    /* Check if already loaded */
+    const char *base = filename;
+    for (const char *p = filename; *p; p++) {
+        if (*p == '\\' || *p == '/') base = p + 1;
+    }
+    for (int i = 0; i < ini_loaded_count; i++) {
+        if (ini_stricmp(ini_loaded_files[i], base) == 0) return;
+    }
+
+    void *f = osfs2_find(base);
+    if (!f) return;
+
+    uint64_t fsize = osfs2_file_size(f);
+    if (fsize == 0 || fsize > 64 * 1024) return; /* sanity limit */
+
+    /* Allocate temp buffer and read */
+    extern void *kmalloc(uint64_t size);
+    extern void kfree(void *ptr);
+    char *buf = (char *)kmalloc(fsize + 1);
+    if (!buf) return;
+    osfs2_read(f, 0, buf, fsize);
+    buf[fsize] = 0;
+
+    serial_puts("[INI] Loading ");
+    serial_puts(base);
+    serial_puts(" (");
+    serial_putdec(fsize);
+    serial_puts(" bytes)\n");
+
+    /* Track as loaded */
+    if (ini_loaded_count < INI_FILES_MAX)
+        ini_strcpy(ini_loaded_files[ini_loaded_count++], base, 64);
+
+    /* Parse: [Section] and Key=Value lines */
+    char cur_section[INI_MAX_SECTION] = "";
+    char *p = buf;
+    while (*p) {
+        /* Skip whitespace */
+        while (*p == ' ' || *p == '\t') p++;
+
+        if (*p == '[') {
+            /* Section header */
+            p++;
+            char *start = p;
+            while (*p && *p != ']' && *p != '\r' && *p != '\n') p++;
+            int len = (int)(p - start);
+            if (len >= INI_MAX_SECTION) len = INI_MAX_SECTION - 1;
+            for (int i = 0; i < len; i++) cur_section[i] = start[i];
+            cur_section[len] = 0;
+            if (*p == ']') p++;
+        } else if (*p == ';' || *p == '#' || *p == '\r' || *p == '\n') {
+            /* Comment or empty line — skip */
+        } else if (cur_section[0]) {
+            /* Key=Value */
+            char key[INI_MAX_KEY] = "";
+            char val[INI_MAX_VALUE] = "";
+            char *start = p;
+            while (*p && *p != '=' && *p != '\r' && *p != '\n') p++;
+            if (*p == '=') {
+                int klen = (int)(p - start);
+                if (klen >= INI_MAX_KEY) klen = INI_MAX_KEY - 1;
+                for (int i = 0; i < klen; i++) key[i] = start[i];
+                key[klen] = 0;
+                p++; /* skip '=' */
+                start = p;
+                while (*p && *p != '\r' && *p != '\n') p++;
+                int vlen = (int)(p - start);
+                if (vlen >= INI_MAX_VALUE) vlen = INI_MAX_VALUE - 1;
+                for (int i = 0; i < vlen; i++) val[i] = start[i];
+                val[vlen] = 0;
+                ini_add(cur_section, key, val);
+            }
+        }
+        /* Skip to end of line */
+        while (*p && *p != '\n') p++;
+        if (*p == '\n') p++;
+    }
+
+    serial_puts("[INI] Loaded ");
+    serial_putdec(g_ini_count);
+    serial_puts(" total entries\n");
+    kfree(buf);
+}
+
 DWORD WINAPI GetPrivateProfileStringA(PCSTR lpAppName, PCSTR lpKeyName,
                                        PCSTR lpDefault, PSTR lpReturnedString,
                                        DWORD nSize, PCSTR lpFileName)
 {
-    (void)lpFileName;
+    /* Auto-load INI file from OsitoFS on first access */
+    if (lpFileName)
+        ini_load_from_osfs(lpFileName);
 
     /* If section is NULL, enumerate section names */
     if (!lpAppName) {

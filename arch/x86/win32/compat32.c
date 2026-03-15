@@ -482,6 +482,8 @@ static uint8_t guess_num_args(const char *name)
         { "atof",                 1 }, { "strtol",                3 },
         { "strtod",               2 }, { "abs",                   1 },
         { "fopen",                2 }, { "_wfopen",               2 },
+        { "_access",              2 }, { "_waccess",              2 },
+        { "_stat",                2 }, { "_wstat",                2 },
         { "fclose",                1 },
         { "fread",                4 }, { "fwrite",                4 },
         { "fseek",                3 }, { "ftell",                 1 },
@@ -1430,7 +1432,7 @@ uint64_t compat32_dispatch(uint32_t thunk_idx, uint32_t *stack_args)
         int2e_call_count++;
         /* Log first 200, every 100th, AND last calls before crash
          * (always log _CxxThrowException and RaiseException) */
-        int do_log = (int2e_call_count <= 200 || (int2e_call_count % 100000) == 0);
+        int do_log = (int2e_call_count <= 2000 || (int2e_call_count % 100000) == 0);
         /* Always log exception-related functions */
         if (t->name && (t->name[0] == '_' && t->name[1] == 'C'))  /* _Cxx* */
             do_log = 1;

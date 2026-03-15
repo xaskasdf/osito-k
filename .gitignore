@@ -26,3 +26,4 @@ tools/ositofs/ositofs-write
 
 # Claude Code session data
 .claude/
+.gitnexus

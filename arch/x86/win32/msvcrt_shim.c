@@ -2436,11 +2436,11 @@ EXCEPTION_DISPOSITION WINAPI crt_CxxFrameHandler(
     return ExceptionContinueSearch;
 }
 
-/* __dllonexit — register DLL exit callback (store and ignore) */
+/* __dllonexit — register DLL exit callback in caller's table */
 _PVFV_DLL WINAPI crt_dllonexit(_PVFV_DLL func, _PVFV_DLL **pbegin, _PVFV_DLL **pend)
 {
-    (void)pbegin;
-    (void)pend;
+    /* Real impl grows *pbegin..*pend table. We just use global atexit for simplicity. */
+    if (func) crt_atexit((void (*)(void))func);
     return func;
 }
 
@@ -2504,12 +2504,16 @@ int* WINAPI crt_adjust_fdiv(void)
     return &crt_adjust_fdiv_val;
 }
 
-/* _controlfp — control floating point (stub, return 0) */
+/* _controlfp — control floating point
+ * Default x87 control word: 0x027F (round nearest, double precision, all exceptions masked)
+ * We store and return a state but don't actually modify FPU — safe for single-threaded compat */
+static unsigned int crt_fpcontrol = 0x0009001F; /* MCW_EM=0x1F | MCW_RC=0 | MCW_PC=0x20000 */
 unsigned int WINAPI crt_controlfp(unsigned int newval, unsigned int mask)
 {
-    (void)newval;
-    (void)mask;
-    return 0;
+    if (mask) {
+        crt_fpcontrol = (crt_fpcontrol & ~mask) | (newval & mask);
+    }
+    return crt_fpcontrol;
 }
 
 /* _ftol — float to long conversion */
@@ -2518,9 +2522,10 @@ long WINAPI crt_ftol(double val)
     return (long)val;
 }
 
-/* _onexit — register exit callback (store and ignore) */
+/* _onexit — register exit callback */
 _onexit_t WINAPI crt_onexit(_onexit_t func)
 {
+    if (func) crt_atexit((void (*)(void))func);
     return func;
 }
 
@@ -2633,11 +2638,12 @@ double WINAPI crt_CIpow(double base, double exp)
 #endif
 }
 
-/* _isnan — check for NaN (stub: always returns 0) */
+/* _isnan — check for NaN (IEEE 754: exponent all 1s, mantissa non-zero) */
 int WINAPI crt_isnan(double x)
 {
-    (void)x;
-    return 0;
+    uint64_t bits;
+    __builtin_memcpy(&bits, &x, 8);
+    return ((bits >> 52) & 0x7FF) == 0x7FF && (bits & 0x000FFFFFFFFFFFFFULL) != 0;
 }
 
 /* _stat / _wstat — file stat (stub: file not found) */
@@ -2655,18 +2661,44 @@ struct crt_stat_buf {
     long st_ctime;
 };
 
+extern void *osfs2_find(const char *name);
+extern uint64_t osfs2_file_size(void *file);
+
 int WINAPI crt_stat(const char *path, PVOID buf)
 {
-    (void)path;
-    (void)buf;
-    return -1; /* file not found */
+    if (!path || !buf) return -1;
+
+    /* Extract basename (OsitoFS is flat) */
+    const char *base = path;
+    for (const char *p = path; *p; p++) {
+        if (*p == '\\' || *p == '/') base = p + 1;
+    }
+
+    void *f = osfs2_find(base);
+    if (!f && base != path)
+        f = osfs2_find(path);
+
+    if (!f) return -1;
+
+    struct crt_stat_buf *sb = (struct crt_stat_buf *)buf;
+    for (int i = 0; i < (int)sizeof(struct crt_stat_buf); i++)
+        ((char *)sb)[i] = 0;
+    sb->st_mode = 0x8000 | 0x0100 | 0x0080; /* _S_IFREG | _S_IREAD | _S_IWRITE */
+    sb->st_nlink = 1;
+    sb->st_size = (long)osfs2_file_size(f);
+    return 0;
 }
 
 int WINAPI crt_wstat(const WCHAR *path, PVOID buf)
 {
-    (void)path;
-    (void)buf;
-    return -1; /* file not found */
+    if (!path || !buf) return -1;
+    /* Convert wide to narrow */
+    char narrow[260];
+    int i = 0;
+    for (; path[i] && i < 259; i++)
+        narrow[i] = (char)(path[i] & 0xFF);
+    narrow[i] = 0;
+    return crt_stat(narrow, buf);
 }
 
 /* _strdate / _strtime — date/time strings (stub values) */
@@ -3278,6 +3310,45 @@ unsigned long WINAPI crt_wcstoul(const WCHAR *s, WCHAR **endptr, int base)
     return result;
 }
 
+/* _access — check file accessibility (0=exist, 2=write, 4=read, 6=r+w) */
+int WINAPI crt_access(const char *path, int mode)
+{
+    (void)mode;
+    if (!path) return -1;
+    const char *base = path;
+    for (const char *p = path; *p; p++) {
+        if (*p == '\\' || *p == '/') base = p + 1;
+    }
+    void *f = osfs2_find(base);
+    if (!f && base != path) f = osfs2_find(path);
+    return f ? 0 : -1;
+}
+
+int WINAPI crt_waccess(const WCHAR *path, int mode)
+{
+    if (!path) return -1;
+    char narrow[260];
+    int i = 0;
+    for (; path[i] && i < 259; i++)
+        narrow[i] = (char)(path[i] & 0xFF);
+    narrow[i] = 0;
+    return crt_access(narrow, mode);
+}
+
+/* _fltused — compiler marker for floating point usage */
+static int crt_fltused_val = 0x9875;
+int* WINAPI crt_fltused(void) { return &crt_fltused_val; }
+
+/* CRT version globals (Windows NT 5.0 = Windows 2000) */
+static unsigned int crt_osver_val = 2195;
+static unsigned int crt_winver_val = 0x0500;
+static unsigned int crt_winmajor_val = 5;
+static unsigned int crt_winminor_val = 0;
+unsigned int* WINAPI crt_p_osver(void) { return &crt_osver_val; }
+unsigned int* WINAPI crt_p_winver(void) { return &crt_winver_val; }
+unsigned int* WINAPI crt_p_winmajor(void) { return &crt_winmajor_val; }
+unsigned int* WINAPI crt_p_winminor(void) { return &crt_winminor_val; }
+
 /* ── Stubs for bundled MSVCRT.dll ────────────────────────────── */
 
 static int crt_getch_stub(void)  { return -1; /* EOF */ }
@@ -3472,6 +3543,17 @@ static const MSVCRT_EXPORT msvcrt_exports[] = {
     { "wcsncpy",             (PVOID)crt_wcsncpy },
     { "wcsstr",              (PVOID)crt_wcsstr },
     { "wcstoul",             (PVOID)crt_wcstoul },
+    /* File access */
+    { "_access",             (PVOID)crt_access },
+    { "_waccess",            (PVOID)crt_waccess },
+
+    /* CRT globals (as accessor functions through INT 0x2E) */
+    { "_fltused",            (PVOID)crt_fltused },
+    { "__p__osver",          (PVOID)crt_p_osver },
+    { "__p__winver",         (PVOID)crt_p_winver },
+    { "__p__winmajor",       (PVOID)crt_p_winmajor },
+    { "__p__winminor",       (PVOID)crt_p_winminor },
+
     /* Stubs for bundled MSVCRT.dll imports */
     { "_getch",              (PVOID)crt_getch_stub },
     { "_kbhit",              (PVOID)crt_kbhit_stub },
