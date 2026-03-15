@@ -399,6 +399,14 @@ static uint8_t guess_num_args(const char *name)
         { "LoadCursorW",          2 }, { "LoadIconW",             2 },
         { "MapVirtualKeyW",       2 }, { "MessageBoxW",           4 },
         { "GetObjectW",           3 },
+        /* MSVCRT — critical: _initterm with wrong args crashes! */
+        { "_initterm",            2 }, { "_initterm_e",           2 },
+        { "__dllonexit",          3 }, { "_onexit",               1 },
+        { "_atexit",              1 }, { "atexit",                1 },
+        { "_controlfp",           2 }, { "__set_app_type",        1 },
+        { "__p__fmode",           0 }, { "__p__commode",          0 },
+        { "_adjust_fdiv",         0 }, { "__setusermatherr",      1 },
+        { "_except_handler3",     4 }, { "_except_handler4",      4 },
         { "RegOpenKeyExW",        5 }, { "RegQueryValueExW",      6 },
         { "RegSetValueExW",       6 }, { "RegCreateKeyExW",       9 },
         /* Completely missing functions */
