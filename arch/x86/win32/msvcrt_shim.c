@@ -2956,7 +2956,7 @@ int WINAPI crt_vsnwprintf(WCHAR *buf, SIZE_T count, const WCHAR *fmt, ms_va_list
                 serial_puthex((uint64_t)raw_ptr, 8);
                 if (ws && raw_ptr >= 0x1000) {
                     serial_puts(" -> \"");
-                    for (int k = 0; k < 20 && ws[k]; k++)
+                    for (int k = 0; k < 80 && ws[k]; k++)
                         serial_putchar((char)(ws[k] & 0x7F));
                     serial_puts("\"");
                 }
