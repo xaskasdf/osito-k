@@ -1565,14 +1565,24 @@ WORD WINAPI RegisterClassExW(PVOID lpwcx)
 
 BOOL WINAPI GetClassInfoExA(HINSTANCE hInstance, PCSTR lpszClass, PVOID lpwcx)
 {
-    (void)hInstance; (void)lpszClass; (void)lpwcx;
-    return FALSE;
+    (void)hInstance; (void)lpwcx;
+    if (!lpszClass) return FALSE;
+    WNDCLASS_ENTRY *e = find_class(lpszClass);
+    return e ? TRUE : FALSE;
 }
 
 BOOL WINAPI GetClassInfoExW(HINSTANCE hInstance, PCWSTR lpszClass, PVOID lpwcx)
 {
-    (void)hInstance; (void)lpszClass; (void)lpwcx;
-    return FALSE;
+    (void)hInstance; (void)lpwcx;
+    if (!lpszClass) return FALSE;
+    /* Convert wide to narrow and look up */
+    char narrow[128];
+    int i = 0;
+    for (; lpszClass[i] && i < 127; i++)
+        narrow[i] = (char)(lpszClass[i] & 0xFF);
+    narrow[i] = 0;
+    WNDCLASS_ENTRY *e = find_class(narrow);
+    return e ? TRUE : FALSE;
 }
 
 LONG WINAPI GetWindowLongW(HWND hWnd, int nIndex)
