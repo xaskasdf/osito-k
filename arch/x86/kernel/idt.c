@@ -750,7 +750,7 @@ void isr_handler(interrupt_frame_t *frame)
         {
             extern uint64_t *compat32_crash_jmpbuf;
             extern void kern_longjmp(uint64_t *buf, int val);
-            if (compat32_crash_jmpbuf && ((frame->cs & 0xFFFF) == 0x0040)) {
+            if (compat32_crash_jmpbuf) {
                 serial_puts("  [WIN32] Crash recovery — returning to shell\n");
                 uint64_t *jmp = compat32_crash_jmpbuf;
                 compat32_crash_jmpbuf = NULL;
