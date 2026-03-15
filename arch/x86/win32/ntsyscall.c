@@ -256,6 +256,22 @@ NTSTATUS sys_NtCreateFile(ULONG_PTR *args)
         serial_puts("NULL");
     serial_puts("\n");
 
+    /* Skip splash/logo BMP files — their display crashes before InitEngine.
+     * The engine handles missing splash gracefully (just skips the splash). */
+    if (path[0]) {
+        int plen = 0;
+        while (path[plen]) plen++;
+        if (plen > 4 && path[plen-4]=='.' && path[plen-3]=='b' &&
+            path[plen-2]=='m' && path[plen-1]=='p') {
+            serial_puts(" [SKIP BMP]\n");
+            if (IoStatusBlock) {
+                IoStatusBlock->Status = STATUS_OBJECT_NAME_NOT_FOUND;
+                IoStatusBlock->Information = 0;
+            }
+            return STATUS_OBJECT_NAME_NOT_FOUND;
+        }
+    }
+
     /* Try to find/create in OsitoFS (case-insensitive for Win32) */
     void *osfs_file = osfs2_find_ci(path);
 
