@@ -38,7 +38,7 @@ int2e_stub:
      * Must leave room for compat32_dispatch + _initterm + compat32_callback
      * + kern_setjmp call chain (~1KB). Nested INTs push BELOW this. */
     movq %rsp, %r10
-    subq $8192, %r10
+    subq $32768, %r10
     movq %r10, (%r11)
 
     /*
