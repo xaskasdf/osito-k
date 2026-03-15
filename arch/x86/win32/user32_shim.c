@@ -790,6 +790,39 @@ BOOL WINAPI AdjustWindowRectEx(LPRECT lpRect, DWORD dwStyle, BOOL bMenu, DWORD d
     return AdjustWindowRect(lpRect, dwStyle, bMenu);
 }
 
+/* ── SystemParametersInfo / Timer stubs ──────────────────────── */
+
+#define SPI_GETWORKAREA 48
+
+BOOL WINAPI SystemParametersInfoA(UINT uiAction, UINT uiParam, PVOID pvParam, UINT fWinIni)
+{
+    (void)uiParam; (void)fWinIni;
+    if (uiAction == SPI_GETWORKAREA && pvParam) {
+        /* Return screen rect as work area */
+        int32_t *rect = (int32_t *)pvParam;
+        rect[0] = 0;              /* left */
+        rect[1] = 0;              /* top */
+        rect[2] = SCREEN_WIDTH;   /* right */
+        rect[3] = SCREEN_HEIGHT;  /* bottom */
+        return TRUE;
+    }
+    return TRUE;
+}
+
+static ULONG_PTR g_timer_id = 1;
+
+ULONG_PTR WINAPI SetTimer(HWND hWnd, ULONG_PTR nIDEvent, UINT uElapse, void *lpTimerFunc)
+{
+    (void)hWnd; (void)uElapse; (void)lpTimerFunc;
+    return nIDEvent ? nIDEvent : g_timer_id++;
+}
+
+BOOL WINAPI KillTimer(HWND hWnd, ULONG_PTR uIDEvent)
+{
+    (void)hWnd; (void)uIDEvent;
+    return TRUE;
+}
+
 int WINAPI GetSystemMetrics(int nIndex)
 {
     switch (nIndex) {
@@ -1872,7 +1905,11 @@ static const SHIM_EXPORT user32_exports[] = {
     { "GetWindowRect",      (PVOID)GetWindowRect },
     { "AdjustWindowRect",   (PVOID)AdjustWindowRect },
     { "AdjustWindowRectEx", (PVOID)AdjustWindowRectEx },
-    { "GetSystemMetrics",         (PVOID)GetSystemMetrics },
+    { "SystemParametersInfoA",(PVOID)SystemParametersInfoA },
+    { "SystemParametersInfoW",(PVOID)SystemParametersInfoA },
+    { "SetTimer",            (PVOID)SetTimer },
+    { "KillTimer",           (PVOID)KillTimer },
+    { "GetSystemMetrics",    (PVOID)GetSystemMetrics },
     { "ChangeDisplaySettingsA",   (PVOID)ChangeDisplaySettingsA },
     { "ChangeDisplaySettingsW",   (PVOID)ChangeDisplaySettingsW },
     { "EnumDisplaySettingsA",     (PVOID)EnumDisplaySettingsA },
