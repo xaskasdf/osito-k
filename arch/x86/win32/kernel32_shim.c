@@ -1831,12 +1831,14 @@ void WINAPI GlobalMemoryStatus(MEMORYSTATUS *lpBuffer)
     if (!lpBuffer) return;
     lpBuffer->dwLength         = sizeof(MEMORYSTATUS);
     lpBuffer->dwMemoryLoad     = 25;
-    lpBuffer->dwTotalPhys      = 4ULL * 1024 * 1024 * 1024; /* 4 GB */
-    lpBuffer->dwAvailPhys      = 3ULL * 1024 * 1024 * 1024;
-    lpBuffer->dwTotalPageFile   = 4ULL * 1024 * 1024 * 1024;
-    lpBuffer->dwAvailPageFile   = 3ULL * 1024 * 1024 * 1024;
-    lpBuffer->dwTotalVirtual   = 2ULL * 1024 * 1024 * 1024;
-    lpBuffer->dwAvailVirtual   = 2ULL * 1024 * 1024 * 1024;
+    /* Values must fit in 32-bit SIZE_T (UT99 reads 4 bytes).
+     * 4GB = 0x100000000 overflows to 0 → "Phys=0" → no rendering. */
+    lpBuffer->dwTotalPhys      = 512 * 1024 * 1024;  /* 512 MB */
+    lpBuffer->dwAvailPhys      = 384 * 1024 * 1024;
+    lpBuffer->dwTotalPageFile  = 1024 * 1024 * 1024;  /* 1 GB */
+    lpBuffer->dwAvailPageFile  = 768 * 1024 * 1024;
+    lpBuffer->dwTotalVirtual   = 2047 * 1024 * 1024;  /* ~2 GB */
+    lpBuffer->dwAvailVirtual   = 1536 * 1024 * 1024;
 }
 
 BOOL WINAPI SetConsoleCtrlHandler(PVOID HandlerRoutine, BOOL Add)
