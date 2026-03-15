@@ -1565,24 +1565,29 @@ WORD WINAPI RegisterClassExW(PVOID lpwcx)
 
 BOOL WINAPI GetClassInfoExA(HINSTANCE hInstance, PCSTR lpszClass, PVOID lpwcx)
 {
-    (void)hInstance; (void)lpwcx;
+    (void)hInstance;
     if (!lpszClass) return FALSE;
-    WNDCLASS_ENTRY *e = find_class(lpszClass);
-    return e ? TRUE : FALSE;
+    /* Fill WNDCLASSEX with defaults if provided */
+    if (lpwcx) {
+        uint8_t *p = (uint8_t *)lpwcx;
+        for (int i = 0; i < 48; i++) p[i] = 0; /* zero WNDCLASSEXA */
+        *(uint32_t *)p = 48; /* cbSize */
+    }
+    /* Always return TRUE — simulate all system window classes exist.
+     * The engine checks base classes (WinBase, etc.) before RegisterClassExW. */
+    return TRUE;
 }
 
 BOOL WINAPI GetClassInfoExW(HINSTANCE hInstance, PCWSTR lpszClass, PVOID lpwcx)
 {
-    (void)hInstance; (void)lpwcx;
+    (void)hInstance;
     if (!lpszClass) return FALSE;
-    /* Convert wide to narrow and look up */
-    char narrow[128];
-    int i = 0;
-    for (; lpszClass[i] && i < 127; i++)
-        narrow[i] = (char)(lpszClass[i] & 0xFF);
-    narrow[i] = 0;
-    WNDCLASS_ENTRY *e = find_class(narrow);
-    return e ? TRUE : FALSE;
+    if (lpwcx) {
+        uint8_t *p = (uint8_t *)lpwcx;
+        for (int i = 0; i < 48; i++) p[i] = 0;
+        *(uint32_t *)p = 48; /* cbSize */
+    }
+    return TRUE;
 }
 
 LONG WINAPI GetWindowLongW(HWND hWnd, int nIndex)
