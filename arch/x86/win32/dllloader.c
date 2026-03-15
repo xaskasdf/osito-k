@@ -516,6 +516,20 @@ PVOID dll_resolve_import(const char *dll_name, const char *func_name,
         }
     }
 
+    /* 6. UT99 appPow mangling fallback: SoftDrv imports float version
+     *    (?appPow@@YAMMM@Z) but Core.dll exports double version
+     *    (?appPow@@YANNN@Z). Provide a float wrapper. */
+    if (func_name && strcmp(func_name, "?appPow@@YAMMM@Z") == 0) {
+        /* Search for the double version in loaded modules */
+        for (int i = 0; i < module_count; i++) {
+            PVOID fn = dll_resolve_export(&modules[i], "?appPow@@YANNN@Z", 0, FALSE);
+            if (fn) {
+                serial_puts("[DLL] appPow float->double redirect\n");
+                return fn;  /* calling convention compatible (cdecl, x87 float promotion) */
+            }
+        }
+    }
+
     serial_puts("[DLL] unresolved: ");
     if (dll_name) serial_puts(dll_name);
     serial_puts(" -> ");
