@@ -2678,6 +2678,11 @@ int WINAPI crt_stat(const char *path, PVOID buf)
     if (!f && base != path)
         f = osfs2_find(path);
 
+    serial_puts("[CRT] _stat('");
+    serial_puts(path);
+    serial_puts("') -> ");
+    serial_puts(f ? "OK\n" : "FAIL\n");
+
     if (!f) return -1;
 
     struct crt_stat_buf *sb = (struct crt_stat_buf *)buf;

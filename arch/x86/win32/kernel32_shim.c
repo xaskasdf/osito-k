@@ -249,6 +249,9 @@ BOOL WINAPI WriteConsoleA(HANDLE hConsoleOutput, PCVOID lpBuffer,
 
 void WINAPI ExitProcess(DWORD uExitCode)
 {
+    serial_puts("[K32] ExitProcess called, code=");
+    serial_putdec(uExitCode);
+    serial_puts("\n");
     NtTerminateProcess(NT_CURRENT_PROCESS, (NTSTATUS)uExitCode);
     /* Never returns */
     for (;;) __asm__ volatile("hlt");

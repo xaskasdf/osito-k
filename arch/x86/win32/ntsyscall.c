@@ -894,11 +894,16 @@ NTSTATUS sys_NtQueryPerformanceCounter(ULONG_PTR *args)
     PLARGE_INTEGER PerformanceCounter   = (PLARGE_INTEGER)args[0];
     PLARGE_INTEGER PerformanceFrequency = (PLARGE_INTEGER)args[1];
 
-    if (PerformanceCounter)
-        PerformanceCounter->QuadPart = (LONGLONG)idt_get_ticks();
+    if (PerformanceCounter) {
+        /* Use rdtsc for monotonic counter — idt_get_ticks doesn't advance
+         * during compat32 (APIC timer blocked in compatibility mode) */
+        uint32_t lo, hi;
+        __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+        PerformanceCounter->QuadPart = (LONGLONG)(((uint64_t)hi << 32) | lo);
+    }
 
     if (PerformanceFrequency)
-        PerformanceFrequency->QuadPart = 100;  /* 100 Hz timer */
+        PerformanceFrequency->QuadPart = 3000000000LL;  /* ~3 GHz TSC */
 
     return STATUS_SUCCESS;
 }

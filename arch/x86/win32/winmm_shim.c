@@ -23,9 +23,27 @@ DWORD WINAPI shim_timeGetTime(void)
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (DWORD)(ts.tv_sec * 1000 + ts.tv_nsec / 1000000);
 #else
-    if (idt_get_ticks)
-        return (DWORD)(idt_get_ticks() * 10); /* 100 Hz ticks -> ms */
-    return 0;
+    /* Use rdtsc for monotonic time — idt_get_ticks doesn't advance
+     * during compat32 code because APIC timer interrupts are blocked.
+     * rdtsc always increments regardless of interrupt state. */
+    uint32_t lo, hi;
+    __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+    uint64_t tsc = ((uint64_t)hi << 32) | lo;
+
+    /* Assume ~3 GHz TSC → divide by 3M to get ms.
+     * This is approximate but monotonic, which is what matters. */
+    DWORD result = (DWORD)(tsc / 3000000ULL);
+
+    static int tgt_log = 0;
+    if (tgt_log < 3) {
+        extern void serial_puts(const char *s);
+        extern void serial_putdec(uint64_t val);
+        serial_puts("[WINMM] timeGetTime = ");
+        serial_putdec(result);
+        serial_puts("ms (rdtsc)\n");
+        tgt_log++;
+    }
+    return result;
 #endif
 }
 
