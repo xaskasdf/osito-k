@@ -745,11 +745,13 @@ void isr_handler(interrupt_frame_t *frame)
             }
         }
 
-        /* If a user process is running (PID > 1), kill it instead of
-         * halting the system. Uses proc_exception_kill which is compiled
-         * without SSE to be safe from ISR context. */
+        /* If a user process is running (PID > 1) OR we're in compat32
+         * mode, kill/recover instead of halting. Win32 apps run as the
+         * shell process (PID 1) via winexec — halting would freeze the
+         * entire system for a game crash. */
         uint32_t pid = proc_current_pid();
-        if (pid > 1) {
+        int is_compat = ((frame->cs & 0xFFFF) == 0x0040);
+        if (pid > 1 || is_compat) {
             /* Guard against cascading exceptions: if we're already
              * killing this PID and another exception fires (e.g. in
              * the kill path itself), just halt the process silently. */
