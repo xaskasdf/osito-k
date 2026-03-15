@@ -853,12 +853,12 @@ void compat32_callback(uint32_t func_addr)
 #ifndef TEST_HARNESS
     if (!callback_return_stub_addr) return;
 
-    if (callback_depth >= MAX_CALLBACK_DEPTH) {
-        /* UT99's message loop callbacks may not return via the stub
-         * (they loop internally via PeekMessage/DispatchMessage).
-         * Reset depth to allow further callbacks. */
-        callback_depth = 0;
-    }
+    /* Clamp depth — callbacks that don't return via the stub leak depth.
+     * UT99's message loop (PeekMessage/DispatchMessage/WndProc) does this.
+     * Always use slot 0 when overflowed — safe because the old callbacks
+     * are already gone (their stack frames were unwound by the game loop). */
+    if (callback_depth >= MAX_CALLBACK_DEPTH)
+        callback_depth = 1;  /* Reserve slot 0 for overflow reuse */
 
     int depth = callback_depth++;
 
@@ -923,9 +923,8 @@ uint32_t compat32_callback_args(uint32_t func_addr, int nargs, const uint32_t *a
 #ifndef TEST_HARNESS
     if (!callback_return_stub_addr) return 0;
 
-    if (callback_depth >= MAX_CALLBACK_DEPTH) {
-        callback_depth = 0;
-    }
+    if (callback_depth >= MAX_CALLBACK_DEPTH)
+        callback_depth = 1;
 
     int depth = callback_depth++;
 
