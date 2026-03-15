@@ -642,6 +642,9 @@ NTSTATUS compat32_patch_iat(PE_IMAGE_INFO *info)
     if (imp_dir->VirtualAddress == 0 || imp_dir->Size == 0)
         return STATUS_SUCCESS;
 
+    /* IAT patch trace removed — debug serial_puts changes code layout
+     * and can introduce 0xCC displacement bytes that QEMU TCG misinterprets */
+
     PIMAGE_IMPORT_DESCRIPTOR desc =
         (PIMAGE_IMPORT_DESCRIPTOR)(base + imp_dir->VirtualAddress);
 
