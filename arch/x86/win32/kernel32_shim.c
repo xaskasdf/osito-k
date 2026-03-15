@@ -824,18 +824,22 @@ HANDLE WINAPI CreateThread(PVOID lpThreadAttributes, SIZE_T dwStackSize,
     (void)lpThreadAttributes;
     (void)dwStackSize;
     (void)dwCreationFlags;
+    (void)lpStartAddress;
+    (void)lpParameter;
 
     /*
-     * Stub: single-threaded — run the thread function synchronously.
-     * Real implementation needs OsitoK scheduler integration.
+     * Stub: return a pseudo thread handle without running the function.
+     * Cannot call lpStartAddress directly — it's 32-bit PE code and
+     * we're in 64-bit mode. Would need compat32_callback_args to invoke.
+     * For now, skip thread execution (splash animation, etc. non-critical).
      */
     DWORD tid = ++g_thread_id_counter;
     if (lpThreadId) *lpThreadId = tid;
 
-    /* Run immediately in current context */
-    lpStartAddress(lpParameter);
+    serial_puts("[K32] CreateThread: stub (not executing), tid=");
+    serial_putdec(tid);
+    serial_puts("\n");
 
-    /* Return a pseudo-handle */
     return (HANDLE)(ULONG_PTR)tid;
 }
 
