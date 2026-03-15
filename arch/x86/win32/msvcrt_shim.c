@@ -1449,6 +1449,18 @@ CRT_FILE* WINAPI crt_fopen(const char *path, const char *mode)
     return NULL;
 }
 
+CRT_FILE* WINAPI crt_wfopen(const uint16_t *wpath, const uint16_t *wmode)
+{
+    /* Convert wide strings to narrow */
+    char path[260], mode[16];
+    int i;
+    for (i = 0; i < 259 && wpath[i]; i++) path[i] = (char)wpath[i];
+    path[i] = 0;
+    for (i = 0; i < 15 && wmode[i]; i++) mode[i] = (char)wmode[i];
+    mode[i] = 0;
+    return crt_fopen(path, mode);
+}
+
 SIZE_T WINAPI crt_fread(PVOID buf, SIZE_T size, SIZE_T count, CRT_FILE *f)
 {
     if (!f || !f->nt_handle || !(f->flags & 1)) return 0;
@@ -3336,6 +3348,7 @@ static const MSVCRT_EXPORT msvcrt_exports[] = {
 
     /* stdio FILE* */
     { "fopen",               (PVOID)crt_fopen },
+    { "_wfopen",             (PVOID)crt_wfopen },
     { "fread",               (PVOID)crt_fread },
     { "fwrite",              (PVOID)crt_fwrite },
     { "fclose",              (PVOID)crt_fclose },
