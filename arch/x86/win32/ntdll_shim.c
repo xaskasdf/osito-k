@@ -443,15 +443,28 @@ void RtlRaiseException(PEXCEPTION_RECORD ExceptionRecord)
     serial_puthex(ExceptionRecord->ExceptionCode, 8);
     serial_puts("\n");
 
-    /* Walk the exception handler chain from TEB32 (compat32 code writes
-     * SEH records via FS:[0] which points to g_teb32, not g_teb) */
+    /* Delegate to compat32 SEH dispatch which correctly reads 32-bit
+     * SEH frames (4-byte Next + 4-byte Handler). The previous code
+     * used 64-bit EXCEPTION_REGISTRATION_RECORD (8+8 bytes) which
+     * misread the 32-bit frame, concatenating Handler with stack garbage
+     * → non-canonical RIP → #GP. */
+    extern int compat32_seh_dispatch(PEXCEPTION_RECORD ExceptionRecord);
+    if (compat32_seh_dispatch(ExceptionRecord)) {
+        serial_puts("[SEH] exception handled by compat32\n");
+        return;
+    }
+
+    /* Fallback: walk 64-bit SEH chain (for native 64-bit handlers) */
     extern TEB32 g_teb32;
     PEXCEPTION_REGISTRATION_RECORD frame =
         (PEXCEPTION_REGISTRATION_RECORD)(ULONG_PTR)g_teb32.ExceptionList;
 
     while (frame && frame != EXCEPTION_CHAIN_END) {
-        serial_puts("[SEH] trying handler at ");
-        serial_puthex((uint64_t)(ULONG_PTR)frame->Handler, 16);
+        /* Read as 32-bit values to avoid size mismatch */
+        uint32_t *f32 = (uint32_t *)(ULONG_PTR)frame;
+        uint32_t handler32 = f32[1];
+        serial_puts("[SEH] trying handler at 0x");
+        serial_puthex(handler32, 8);
         serial_puts("\n");
 
         /* Build a minimal context */
@@ -460,12 +473,10 @@ void RtlRaiseException(PEXCEPTION_RECORD ExceptionRecord)
         for (SIZE_T i = 0; i < sizeof(CONTEXT); i++) p[i] = 0;
         ctx.ContextFlags = CONTEXT_FULL;
 
-        /* Call the handler:
-         * EXCEPTION_DISPOSITION handler(ExceptionRecord, EstablisherFrame,
-         *                               ContextRecord, DispatcherContext) */
+        /* Call the handler via zero-extended 32-bit address */
         typedef EXCEPTION_DISPOSITION (WINAPI *seh_handler_fn)(
             PEXCEPTION_RECORD, PVOID, PCONTEXT, PVOID);
-        seh_handler_fn handler = (seh_handler_fn)frame->Handler;
+        seh_handler_fn handler = (seh_handler_fn)(ULONG_PTR)handler32;
 
         EXCEPTION_DISPOSITION disp = handler(
             ExceptionRecord, frame, &ctx, NULL);
@@ -481,7 +492,9 @@ void RtlRaiseException(PEXCEPTION_RECORD ExceptionRecord)
             serial_puts("\n");
         }
 
-        frame = frame->Next;
+        /* Advance using 32-bit read (frame->Next is only 4 bytes in PE32) */
+        uint32_t next32 = *(uint32_t *)(ULONG_PTR)frame;
+        frame = (PEXCEPTION_REGISTRATION_RECORD)(ULONG_PTR)next32;
     }
 
     /* No handler caught the exception — try unhandled filter */
