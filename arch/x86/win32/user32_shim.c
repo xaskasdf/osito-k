@@ -1549,18 +1549,55 @@ HWND WINAPI CreateWindowExW(DWORD dwExStyle, PCWSTR lpClassName,
                              HWND hWndParent, HMENU hMenu,
                              HINSTANCE hInstance, PVOID lpParam)
 {
-    (void)dwExStyle; (void)lpClassName; (void)lpWindowName; (void)dwStyle;
-    (void)X; (void)Y; (void)nWidth; (void)nHeight;
-    (void)hWndParent; (void)hMenu; (void)hInstance; (void)lpParam;
-    serial_puts("[USER32] CreateWindowExW: stub\n");
-    return (HWND)(ULONG_PTR)0xBEEF9999;
+    /* Convert wide strings to narrow and delegate to A version */
+    char classA[128] = {0}, nameA[256] = {0};
+    if (lpClassName) {
+        for (int i = 0; i < 127 && lpClassName[i]; i++)
+            classA[i] = (char)(lpClassName[i] & 0xFF);
+    }
+    if (lpWindowName) {
+        for (int i = 0; i < 255 && lpWindowName[i]; i++)
+            nameA[i] = (char)(lpWindowName[i] & 0xFF);
+    }
+    return CreateWindowExA(dwExStyle, classA, nameA, dwStyle,
+                           X, Y, nWidth, nHeight,
+                           hWndParent, hMenu, hInstance, lpParam);
 }
 
 WORD WINAPI RegisterClassExW(PVOID lpwcx)
 {
-    (void)lpwcx;
-    serial_puts("[USER32] RegisterClassExW: stub\n");
-    return 1;
+    /* The WNDCLASSEXW structure has wide string pointers.
+     * Extract class name and WndProc, create a narrow entry. */
+    if (!lpwcx) return 0;
+
+    uint32_t *p = (uint32_t *)lpwcx;
+    /* WNDCLASSEXW layout (32-bit):
+     * +0: cbSize, +4: style, +8: lpfnWndProc, +12: cbClsExtra,
+     * +16: cbWndExtra, +20: hInstance, +24: hIcon, +28: hCursor,
+     * +32: hbrBackground, +36: lpszMenuName, +40: lpszClassName, +44: hIconSm */
+    uint32_t wndproc_addr = p[2];
+    uint32_t classname_ptr = p[10];
+
+    char classA[128] = {0};
+    if (classname_ptr) {
+        const uint16_t *ws = (const uint16_t *)(uintptr_t)classname_ptr;
+        for (int i = 0; i < 127 && ws[i]; i++)
+            classA[i] = (char)(ws[i] & 0xFF);
+    }
+
+    serial_puts("[USER32] RegisterClassExW: ");
+    serial_puts(classA);
+    serial_puts(" wndproc=0x");
+    serial_puthex(wndproc_addr, 8);
+    serial_puts("\n");
+
+    if (wndclass_count >= MAX_WNDCLASSES) return 0;
+    WNDCLASS_ENTRY *e = &wndclasses[wndclass_count];
+    u32_strcpy(e->class_name, classA, 128);
+    e->wndproc = (WNDPROC)(uintptr_t)wndproc_addr;
+    e->used = 1;
+    wndclass_count++;
+    return (WORD)(0xC100 + wndclass_count);
 }
 
 BOOL WINAPI GetClassInfoExA(HINSTANCE hInstance, PCSTR lpszClass, PVOID lpwcx)
