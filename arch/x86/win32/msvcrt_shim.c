@@ -2049,9 +2049,16 @@ void WINAPI crt_CxxThrowException(PVOID pExceptionObject, PVOID pThrowInfo)
         RaiseException(0xE06D7363, 1 /* EXCEPTION_NONCONTINUABLE */, 3, args);
     }
 
-    /* If RaiseException returns (shouldn't for noncontinuable), halt */
-    serial_puts("[CXX] FATAL: _CxxThrowException returned!\n");
-    for (;;) __asm__ volatile ("hlt");
+    /* If RaiseException returns (shouldn't for noncontinuable):
+     * For rethrow (NULL,NULL) after a catch handler consumed the exception,
+     * returning is acceptable — the catch block already handled it.
+     * For real throws, this indicates the exception was unhandled. */
+    if (!pExceptionObject && !pThrowInfo) {
+        serial_puts("[CXX] rethrow returned (exception consumed) — continuing\n");
+        return;
+    }
+    serial_puts("[CXX] WARNING: _CxxThrowException returned (unhandled)\n");
+    /* Don't halt — let the caller continue and fail gracefully */
 
     /* ── Diagnostic: dump GObjRegistrants state ────────────── */
     {
