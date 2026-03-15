@@ -329,6 +329,28 @@ osfs2_file_t *osfs2_find(const char *name)
     return NULL;
 }
 
+/* Case-insensitive find — for Win32 compat (Windows filenames are CI) */
+osfs2_file_t *osfs2_find_ci(const char *name)
+{
+    if (!mounted || !name) return NULL;
+
+    for (uint32_t i = 0; i < OSFS2_MAX_FILES; i++) {
+        if (!(file_table[i].flags & OSFS2_FLAG_VALID)) continue;
+        const char *a = file_table[i].name;
+        const char *b = name;
+        int match = 1;
+        while (*a && *b) {
+            char ca = *a, cb = *b;
+            if (ca >= 'A' && ca <= 'Z') ca += 32;
+            if (cb >= 'A' && cb <= 'Z') cb += 32;
+            if (ca != cb) { match = 0; break; }
+            a++; b++;
+        }
+        if (match && !*a && !*b) return &file_table[i];
+    }
+    return NULL;
+}
+
 /* ── Read file data ──────────────────────────────────────────── */
 
 int osfs2_read(osfs2_file_t *file, uint64_t offset, void *buf, uint64_t len)

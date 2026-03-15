@@ -207,25 +207,14 @@ static int unicode_to_ascii(PCUNICODE_STRING us, char *buf, int buf_size)
     return chars;
 }
 
-/* Strip NT path prefix: \??\C:\foo → foo, \Device\HarddiskN\foo → foo */
+/* VFS path resolution — replaces ad-hoc strip_nt_path */
+#include "../fs/vfs.h"
+extern void *osfs2_find_ci(const char *name);
+
 static const char *strip_nt_path(const char *path)
 {
-    /* Skip \??\ prefix */
-    if (path[0] == '\\' && path[1] == '?' && path[2] == '?' && path[3] == '\\')
-        path += 4;
-
-    /* Skip drive letter (C:\) */
-    if (path[0] && path[1] == ':' && path[2] == '\\')
-        path += 3;
-
-    /* OsitoFS is flat (no directories) — extract basename.
-     * Scan for last path separator (\ or /) and return the part after it. */
-    const char *base = path;
-    for (const char *p = path; *p; p++) {
-        if (*p == '\\' || *p == '/')
-            base = p + 1;
-    }
-    return base;
+    const char *resolved = vfs_resolve(path, VFS_MODE_WIN32);
+    return resolved ? resolved : path;
 }
 
 /* ── NtCreateFile ───────────────────────────────────────────── */
@@ -267,8 +256,8 @@ NTSTATUS sys_NtCreateFile(ULONG_PTR *args)
         serial_puts("NULL");
     serial_puts("\n");
 
-    /* Try to find/create in OsitoFS */
-    void *osfs_file = osfs2_find(path);
+    /* Try to find/create in OsitoFS (case-insensitive for Win32) */
+    void *osfs_file = osfs2_find_ci(path);
 
     if (!osfs_file && (CreateDisposition == FILE_CREATE ||
                        CreateDisposition == FILE_OPEN_IF ||
