@@ -1553,11 +1553,23 @@ int compat32_seh_dispatch(PEXCEPTION_RECORD ExceptionRecord)
                          */
                         in_catch_dispatch = 1;
                         g_compat32_unwind_eip = catch_handler;
-                        /* ESP must be BELOW EBP so handler's pushes don't
-                         * overwrite the frame. The establishing function's
-                         * locals are below EBP. Use EBP-0x100 to give the
-                         * catch handler stack space for its own operations. */
-                        g_compat32_unwind_esp = catch_ebp - 0x100;
+                        /*
+                         * The catch handler epilog does:
+                         *   pop edi; pop esi; pop ebx   ← pops from ESP
+                         *   mov esp, ebp                ← ESP = EBP
+                         *   pop ebp                     ← EBP = [EBP]
+                         *   ret N
+                         *
+                         * The pops before mov esp,ebp are irrelevant because
+                         * mov esp,ebp discards the stack pointer change.
+                         * The pop'd values go into EDI/ESI/EBX but the caller
+                         * of the establishing function will set them itself.
+                         *
+                         * Set ESP = EBP so the handler has a valid stack.
+                         * The catch handler's own pushes/calls use EBP-relative
+                         * addressing for locals, so ESP just needs to be valid.
+                         */
+                        g_compat32_unwind_esp = catch_ebp;
                         g_compat32_unwind_ebp = catch_ebp;
 
                         return 1;  /* handled — INT2E will apply unwind */

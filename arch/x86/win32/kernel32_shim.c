@@ -303,12 +303,26 @@ DWORD WINAPI GetCurrentProcessId(void)
 PVOID WINAPI VirtualAlloc(PVOID lpAddress, SIZE_T dwSize,
                    DWORD flAllocationType, DWORD flProtect)
 {
+    serial_puts("[VA] VirtualAlloc addr=0x");
+    serial_puthex((uint64_t)(ULONG_PTR)lpAddress, 8);
+    serial_puts(" size=0x");
+    serial_puthex(dwSize, 8);
+    serial_puts(" type=0x");
+    serial_puthex(flAllocationType, 4);
+    serial_puts("\n");
+
     PVOID base = lpAddress;
     SIZE_T size = dwSize;
 
     NTSTATUS status = NtAllocateVirtualMemory(
         NT_CURRENT_PROCESS, &base, 0, &size,
         flAllocationType, flProtect);
+
+    serial_puts("[VA] result=0x");
+    serial_puthex((uint64_t)(ULONG_PTR)base, 8);
+    serial_puts(" status=0x");
+    serial_puthex(status, 8);
+    serial_puts("\n");
 
     if (!NT_SUCCESS(status)) {
         set_last_error_from_status(status);
@@ -353,6 +367,16 @@ static BYTE  *heap_pool = NULL;
 static SIZE_T heap_pool_size = 0;
 static SIZE_T heap_offset = 0;
 
+/* Simple free-list for HeapFree.
+ * Free blocks are stored as a linked list: [size(8)] [next_ptr(8)] [padding...]
+ * Sorted by size for best-fit search. */
+typedef struct free_node {
+    SIZE_T size;           /* block size (including 8-byte header) */
+    struct free_node *next;
+} free_node_t;
+
+static free_node_t *free_list = NULL;
+
 static void heap_pool_init(void)
 {
     if (heap_pool) return;
@@ -382,8 +406,29 @@ PVOID WINAPI HeapAlloc(HANDLE hHeap, DWORD dwFlags, SIZE_T dwBytes)
 
     /* 8-byte header + data, aligned to 16 bytes */
     SIZE_T total = (dwBytes + 8 + 15) & ~(SIZE_T)15;
+    if (total < 32) total = 32;  /* min block size for free-list node */
 
     if (!heap_pool) heap_pool_init();
+
+    /* First-fit search in free-list */
+    free_node_t **prev = &free_list;
+    free_node_t *cur = free_list;
+    while (cur) {
+        if (cur->size >= total) {
+            /* Found a free block that fits — remove from list */
+            *prev = cur->next;
+            BYTE *block = (BYTE *)cur;
+            /* Size header already in place from original alloc */
+            PVOID ptr = block + 8;
+            if (dwFlags & 0x00000008) /* HEAP_ZERO_MEMORY */
+                RtlZeroMemory(ptr, dwBytes);
+            return ptr;
+        }
+        prev = &cur->next;
+        cur = cur->next;
+    }
+
+    /* No free block found — bump allocate */
     if (heap_offset + total > heap_pool_size) {
         g_last_error = 8; /* ERROR_NOT_ENOUGH_MEMORY */
         return NULL;
@@ -418,8 +463,25 @@ BOOL WINAPI HeapFree(HANDLE hHeap, DWORD dwFlags, PVOID lpMem)
 {
     (void)hHeap;
     (void)dwFlags;
-    (void)lpMem;
-    /* Bump allocator doesn't free — acceptable for Phase 0 */
+
+    if (!lpMem) return TRUE;
+
+    /* Block header is 8 bytes before the user pointer */
+    BYTE *block = (BYTE *)lpMem - 8;
+    SIZE_T block_size = *(SIZE_T *)block;
+
+    /* Sanity check — block must be within the heap pool */
+    if (block < heap_pool || block >= heap_pool + heap_pool_size ||
+        block_size < 32 || block_size > heap_pool_size) {
+        return TRUE;  /* ignore invalid frees silently */
+    }
+
+    /* Add to free-list (insert at head — simple & fast) */
+    free_node_t *node = (free_node_t *)block;
+    node->size = block_size;
+    node->next = free_list;
+    free_list = node;
+
     return TRUE;
 }
 

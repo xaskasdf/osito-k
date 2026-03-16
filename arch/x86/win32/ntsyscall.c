@@ -504,8 +504,10 @@ NTSTATUS sys_NtAllocateVirtualMemory(ULONG_PTR *args)
     } else {
         /* Allocate fresh VA + physical pages, zeroed via new VA */
         addr = win32_va_alloc(size, &phys);
-        if (!addr)
+        if (!addr) {
+            nt_log_hex("NtAllocateVirtualMemory FAILED: size=", size);
             return STATUS_NO_MEMORY;
+        }
     }
 
     vm_track_add((uint64_t)addr, phys, size);
@@ -513,15 +515,9 @@ NTSTATUS sys_NtAllocateVirtualMemory(ULONG_PTR *args)
     *BaseAddress = addr;
     *RegionSize  = size;
 
-    /* Throttle VA alloc logging to reduce noise */
-    {
-        static int va_log_count = 0;
-        va_log_count++;
-        if (va_log_count <= 10 || (va_log_count % 50) == 0) {
-            nt_log_hex("NtAllocateVirtualMemory: ", (ULONGLONG)addr);
-            nt_log_hex("  size = ", size);
-        }
-    }
+    /* Always log VA allocs for debugging */
+    nt_log_hex("NtAllocateVirtualMemory: ", (ULONGLONG)addr);
+    nt_log_hex("  size = ", size);
 
     return STATUS_SUCCESS;
 }
