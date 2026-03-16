@@ -375,9 +375,46 @@ NTSTATUS sys_NtReadFile(ULONG_PTR *args)
 
     int result = osfs2_read(fobj->osfs_file, (uint64_t)offset, Buffer, to_read);
 
+    /* Strip UTF-8 BOM (EF BB BF) from beginning of text files.
+     * Some .int files have BOM which breaks the INI parser.
+     * Shift data left and zero-fill the tail to avoid size mismatch
+     * (GetFileSize returns original size, ReadFile must match). */
+    if (result >= 3 && offset == 0) {
+        uint8_t *b = (uint8_t *)Buffer;
+        if (b[0] == 0xEF && b[1] == 0xBB && b[2] == 0xBF) {
+            for (int bi = 0; bi < result - 3; bi++)
+                b[bi] = b[bi + 3];
+            b[result - 3] = 0;
+            b[result - 2] = 0;
+            b[result - 1] = 0;
+            /* Don't change result — keep size consistent with GetFileSize */
+        }
+    }
+
     serial_puts("[NtReadFile] result=");
     serial_puthex((uint64_t)(int64_t)result, 8);
     serial_puts("\n");
+
+    /* Dump first 64 bytes of small file reads for localization debugging */
+    if (result > 0 && result <= 8192 && offset == 0) {
+        serial_puts("[NtReadFile] data: \"");
+        const char *d = (const char *)Buffer;
+        int dlen = result < 64 ? result : 64;
+        for (int di = 0; di < dlen; di++) {
+            char c = d[di];
+            if (c >= 32 && c < 127) {
+                char buf[2] = { c, 0 };
+                serial_puts(buf);
+            } else if (c == '\n') {
+                serial_puts("\\n");
+            } else if (c == '\r') {
+                serial_puts("\\r");
+            } else {
+                serial_puts(".");
+            }
+        }
+        serial_puts("\"\n");
+    }
 
     if (result < 0)
         return STATUS_UNSUCCESSFUL;
