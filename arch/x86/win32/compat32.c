@@ -77,7 +77,7 @@ static uint32_t callback_return_stub_addr = 0;
  * own jmpbuf, return value, and stack.
  */
 #define MAX_CALLBACK_DEPTH    32
-#define CALLBACK_STACK_SIZE   16384
+#define CALLBACK_STACK_SIZE   65536
 
 /* Force to .data section to change RIP-relative displacement encoding.
  * In BSS, the displacement contained 0xCC at a critical code address,

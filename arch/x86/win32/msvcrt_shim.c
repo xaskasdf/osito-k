@@ -2985,7 +2985,7 @@ int WINAPI crt_vsnwprintf(WCHAR *buf, SIZE_T count, const WCHAR *fmt, ms_va_list
         }
         case 'c': {
             WCHAR c = (WCHAR)(*vp++);
-            buf[pos++] = c;
+            if (pos < max) buf[pos++] = c;
             fmt++;
             break;
         }
@@ -3046,14 +3046,14 @@ int WINAPI crt_vsnwprintf(WCHAR *buf, SIZE_T count, const WCHAR *fmt, ms_va_list
             break;
         }
         case '%':
-            buf[pos++] = '%';
+            if (pos < max) buf[pos++] = '%';
             fmt++;
             break;
         case 0:
             break;
         default:
             /* Unknown format — output literal */
-            buf[pos++] = '%';
+            if (pos < max) buf[pos++] = '%';
             if (pos < max) buf[pos++] = *fmt;
             fmt++;
             break;
