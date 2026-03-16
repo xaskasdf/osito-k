@@ -522,28 +522,17 @@ HWND WINAPI CreateWindowExA(DWORD dwExStyle, PCSTR lpClassName,
     serial_puthex(nHeight, 4);
     serial_puts("\n");
 
-    /* WM_NCCREATE/WM_CREATE callbacks cause nested callback crashes.
-     * Instead, directly write the hWnd into the WWindow object that
-     * Window.dll passes as lpParam. In UE1's WWindow, the constructor
-     * stores 'this' in lpParam, and WM_NCCREATE normally sets this->hWnd.
+    /* WM_NCCREATE/WM_CREATE: skip callbacks entirely.
+     * Callbacks cause nested INT2E crashes (#BP in callback stack).
+     * The hWndCreated==hWnd assertion fires but engine continues
+     * through appError → StaticShutdownAfterError → cleanup loop.
+     * The cleanup loop runs ~530 timeGetTime ticks before #UD crash.
      *
-     * WWindow layout: hWnd is at a small offset. The assertion checks
-     * that CreateWindowEx's return == the hWnd stored during WM_NCCREATE.
-     * If we store it ourselves, the assertion passes without callbacks.
-     *
-     * Heuristic: lpParam is typically a WWindow* whose hWnd member is
-     * at offset +0x1C (found by examining Window.dll behavior). We write
-     * our hwnd there to satisfy the assertion. If lpParam is NULL or
-     * doesn't look like a WWindow*, skip. */
-    if (lpParam && (uint32_t)(ULONG_PTR)lpParam >= 0x10000) {
-        /* Try writing hWnd at common WWindow::hWnd offsets */
-        uint32_t *obj = (uint32_t *)(ULONG_PTR)(uint32_t)(ULONG_PTR)lpParam;
-        /* WWindow::hWnd is typically the first HWND member after vtable+flags.
-         * In Window.dll v432, offset varies. Try multiple offsets. */
-        /* The assertion is: hWndCreated == hWnd where hWnd was set in WM_NCCREATE
-         * via: hWnd = _hWnd (first param of WndProc). Window.dll stores it at
-         * this->hWnd which is at this+0x1C in the 32-bit object layout. */
-    }
+     * TODO: Fix the nested callback mechanism to properly handle
+     * INT2E calls inside compat32 callbacks. The root cause is that
+     * the WndProc's ret address (callback_return_stub_addr) gets
+     * overwritten when the WndProc makes INT2E calls that modify IST1.
+     */
 
     return w->handle;
 }
