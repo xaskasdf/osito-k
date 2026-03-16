@@ -1555,21 +1555,54 @@ int compat32_seh_dispatch(PEXCEPTION_RECORD ExceptionRecord)
                         g_compat32_unwind_eip = catch_handler;
                         /*
                          * The catch handler epilog does:
-                         *   pop edi; pop esi; pop ebx   ← pops from ESP
-                         *   mov esp, ebp                ← ESP = EBP
-                         *   pop ebp                     ← EBP = [EBP]
+                         *   pop edi; pop esi; pop ebx
+                         *   mov esp, ebp
+                         *   pop ebp
                          *   ret N
                          *
-                         * The pops before mov esp,ebp are irrelevant because
-                         * mov esp,ebp discards the stack pointer change.
-                         * The pop'd values go into EDI/ESI/EBX but the caller
-                         * of the establishing function will set them itself.
+                         * The pops MUST restore correct callee-saved values.
+                         * We write EDI/ESI/EBX from the establishing function's
+                         * stack frame into the area below EBP so the pops work.
                          *
-                         * Set ESP = EBP so the handler has a valid stack.
-                         * The catch handler's own pushes/calls use EBP-relative
-                         * addressing for locals, so ESP just needs to be valid.
+                         * The establishing function prologue does:
+                         *   push ebx; push esi; push edi
+                         * at [EBP-N-12], [EBP-N-8], [EBP-N-4] after sub esp,N.
+                         * We can't know N, but we can read the saved ESP from
+                         * [EBP-0x10] (mov [ebp-0x10], esp after all pushes).
+                         *
+                         * Alternative: write EDI/ESI/EBX just below EBP and
+                         * set ESP there. The catch handler pushes/calls use
+                         * their own stack (below ESP), and the pops at epilog
+                         * restore correct values before mov esp,ebp resets ESP.
                          */
-                        g_compat32_unwind_esp = catch_ebp;
+                        /* Write saved regs at EBP-12, EBP-8, EBP-4 area
+                         * which is the SEH registration (Next, Handler, State).
+                         * These are no longer needed after catch dispatch. */
+                        uint32_t *ebp_area = (uint32_t *)(uintptr_t)catch_ebp;
+
+                        /*
+                         * Read callee-saved registers from the establishing
+                         * function's stack. MSVC prologue stores ESP after
+                         * all pushes at [EBP-0x10]:
+                         *   [saved_esp + 0] = EDI
+                         *   [saved_esp + 4] = ESI
+                         *   [saved_esp + 8] = EBX
+                         */
+                        uint32_t saved_esp_val = ebp_area[-4]; /* [EBP-0x10] */
+                        uint32_t *reg_area = (uint32_t *)(uintptr_t)(catch_ebp - 12);
+
+                        if (saved_esp_val >= 0x10000 && saved_esp_val < catch_ebp) {
+                            uint32_t *saved = (uint32_t *)(uintptr_t)saved_esp_val;
+                            reg_area[0] = saved[0];  /* EDI */
+                            reg_area[1] = saved[1];  /* ESI */
+                            reg_area[2] = saved[2];  /* EBX */
+                        } else {
+                            reg_area[0] = 0;
+                            reg_area[1] = 0;
+                            reg_area[2] = 0;
+                        }
+
+                        g_compat32_unwind_esp = catch_ebp - 12;
                         g_compat32_unwind_ebp = catch_ebp;
 
                         return 1;  /* handled — INT2E will apply unwind */
