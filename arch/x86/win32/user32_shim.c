@@ -1570,13 +1570,21 @@ WORD WINAPI RegisterClassExW(PVOID lpwcx)
      * Extract class name and WndProc, create a narrow entry. */
     if (!lpwcx) return 0;
 
-    uint32_t *p = (uint32_t *)lpwcx;
-    /* WNDCLASSEXW layout (32-bit):
-     * +0: cbSize, +4: style, +8: lpfnWndProc, +12: cbClsExtra,
-     * +16: cbWndExtra, +20: hInstance, +24: hIcon, +28: hCursor,
-     * +32: hbrBackground, +36: lpszMenuName, +40: lpszClassName, +44: hIconSm */
-    uint32_t wndproc_addr = p[2];
-    uint32_t classname_ptr = p[10];
+    /* WNDCLASSEXW is passed as a 32-bit pointer to the struct.
+     * Read fields at byte offsets to be safe: */
+    uint8_t *raw = (uint8_t *)lpwcx;
+    uint32_t cb_size = *(uint32_t *)(raw + 0);
+    uint32_t wndproc_addr = *(uint32_t *)(raw + 8);
+    uint32_t classname_ptr = *(uint32_t *)(raw + 40);
+
+    extern void serial_putdec(uint64_t val);
+    serial_puts("[USER32] RegisterClassExW: cbSize=");
+    serial_putdec(cb_size);
+    serial_puts(" wndproc=0x");
+    serial_puthex(wndproc_addr, 8);
+    serial_puts(" classname_ptr=0x");
+    serial_puthex(classname_ptr, 8);
+    serial_puts("\n");
 
     char classA[128] = {0};
     if (classname_ptr) {
