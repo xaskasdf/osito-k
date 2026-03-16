@@ -1523,15 +1523,22 @@ BOOL WINAPI EndPaint(HWND hWnd, PVOID lpPaint)
 LRESULT WINAPI CallWindowProcA(PVOID lpPrevWndFunc, HWND hWnd, DWORD Msg,
                                 WPARAM wParam, LPARAM lParam)
 {
-    (void)lpPrevWndFunc; (void)hWnd; (void)Msg; (void)wParam; (void)lParam;
-    return 0;
+    uint32_t func = (uint32_t)(ULONG_PTR)lpPrevWndFunc;
+    /* Validate: PE code addresses are above 0x10000000; anything below
+     * is kernel/thunk/stack memory and would crash if called. */
+    if (!func || func < 0x10000000) return 0;
+    extern uint32_t compat32_callback_args(uint32_t func_addr, int nargs, const uint32_t *args);
+    uint32_t args[4] = {
+        (uint32_t)(ULONG_PTR)hWnd, (uint32_t)Msg,
+        (uint32_t)wParam, (uint32_t)lParam
+    };
+    return (LRESULT)compat32_callback_args(func, 4, args);
 }
 
 LRESULT WINAPI CallWindowProcW(PVOID lpPrevWndFunc, HWND hWnd, DWORD Msg,
                                 WPARAM wParam, LPARAM lParam)
 {
-    (void)lpPrevWndFunc; (void)hWnd; (void)Msg; (void)wParam; (void)lParam;
-    return 0;
+    return CallWindowProcA(lpPrevWndFunc, hWnd, Msg, wParam, lParam);
 }
 
 LRESULT WINAPI DefWindowProcW(HWND hWnd, DWORD Msg, WPARAM wParam, LPARAM lParam)
