@@ -441,18 +441,20 @@ void isr_handler(interrupt_frame_t *frame)
     if (vec == 32) {
         tick_count++;
 
-        /* Detect PE32 code running in compat32 mode (watchdog) */
-        if ((frame->cs & 0xFFFF) == 0x40) {
-            static int compat32_tick_count = 0;
-            compat32_tick_count++;
-            /* Log every 200 ticks (~2s) while in compat32 */
-            if ((compat32_tick_count % 200) == 1) {
-                serial_puts("[TIMER] compat32 RIP=0x");
-                serial_puthex(frame->rip, 8);
-                serial_puts(" ESP=0x");
-                serial_puthex(frame->rsp & 0xFFFFFFFF, 8);
-                serial_puts(" #");
-                serial_putdec(compat32_tick_count);
+        /* Watchdog: log where CPU is stuck (compat32 or kernel) */
+        {
+            static int watchdog_ticks = 0;
+            watchdog_ticks++;
+            if ((watchdog_ticks % 500) == 1) {  /* every ~5s */
+                uint16_t cs = (uint16_t)(frame->cs & 0xFFFF);
+                serial_puts("[TIMER] #");
+                serial_putdec(watchdog_ticks);
+                serial_puts(" CS=0x");
+                serial_puthex(cs, 4);
+                serial_puts(" RIP=0x");
+                serial_puthex(frame->rip, 16);
+                serial_puts(" RSP=0x");
+                serial_puthex(frame->rsp, 16);
                 serial_puts("\n");
             }
         }
