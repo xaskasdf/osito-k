@@ -1426,6 +1426,19 @@ uint64_t compat32_dispatch(uint32_t thunk_idx, uint32_t *stack_args)
     uint64_t target = t->target_addr;
     uint8_t nargs = t->num_args;
 
+    /* Stack alignment check: 32-bit caller's ESP must be 4-byte aligned.
+     * If misaligned, a stdcall RET N shifted the stack incorrectly. */
+    {
+        uint32_t esp32 = (uint32_t)(uintptr_t)stack_args - 4; /* stack_args = ESP+4 */
+        if (esp32 & 3) {
+            serial_puts("[COMPAT32] *** ESP MISALIGNED: 0x");
+            serial_puthex(esp32, 8);
+            serial_puts(" thunk=");
+            if (t->name) serial_puts(t->name);
+            serial_puts("\n");
+        }
+    }
+
     /* Debug: log INT 0x2E dispatch (throttled to reduce log noise) */
     {
         static uint32_t int2e_call_count = 0;

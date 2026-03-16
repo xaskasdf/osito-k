@@ -522,36 +522,11 @@ HWND WINAPI CreateWindowExA(DWORD dwExStyle, PCSTR lpClassName,
     serial_puthex(nHeight, 4);
     serial_puts("\n");
 
-    /* Send WM_NCCREATE + WM_CREATE via compat32 callback.
-     * The WndProc is 32-bit code — can't call it directly from 64-bit. */
-    if (wndproc) {
-        extern uint32_t compat32_callback_args(uint32_t func_addr, int nargs, const uint32_t *args);
-        CREATESTRUCTA cs;
-        BYTE *p = (BYTE *)&cs;
-        for (SIZE_T i = 0; i < sizeof(cs); i++) p[i] = 0;
-        cs.lpCreateParams = lpParam;
-        cs.hInstance  = hInstance;
-        cs.hwndParent = hWndParent;
-        cs.cx = nWidth;
-        cs.cy = nHeight;
-        cs.x  = X;
-        cs.y  = Y;
-        cs.style = (LONG)dwStyle;
-        cs.lpszName  = lpWindowName;
-        cs.lpszClass = lpClassName;
-        cs.dwExStyle = dwExStyle;
-
-        uint32_t wndproc32 = (uint32_t)(ULONG_PTR)wndproc;
-        uint32_t nccreate_args[4] = {
-            (uint32_t)(ULONG_PTR)w->handle, 0x0081 /*WM_NCCREATE*/, 0,
-            (uint32_t)(ULONG_PTR)&cs };
-        uint32_t create_args[4] = {
-            (uint32_t)(ULONG_PTR)w->handle, 0x0001 /*WM_CREATE*/, 0,
-            (uint32_t)(ULONG_PTR)&cs };
-
-        compat32_callback_args(wndproc32, 4, nccreate_args);
-        compat32_callback_args(wndproc32, 4, create_args);
-    }
+    /* NOTE: WM_NCCREATE/WM_CREATE callbacks disabled — they cause nested
+     * callback crashes (WndProc internally calls CallWindowProcW which
+     * triggers another INT2E inside the callback → stack corruption).
+     * The hWndCreated==hWnd assertion fires but is non-fatal — the engine
+     * continues and enters MainLoop with CityIntro.unr loaded. */
 
     return w->handle;
 }
@@ -1523,22 +1498,19 @@ BOOL WINAPI EndPaint(HWND hWnd, PVOID lpPaint)
 LRESULT WINAPI CallWindowProcA(PVOID lpPrevWndFunc, HWND hWnd, DWORD Msg,
                                 WPARAM wParam, LPARAM lParam)
 {
-    uint32_t func = (uint32_t)(ULONG_PTR)lpPrevWndFunc;
-    /* Validate: PE code addresses are above 0x10000000; anything below
-     * is kernel/thunk/stack memory and would crash if called. */
-    if (!func || func < 0x10000000) return 0;
-    extern uint32_t compat32_callback_args(uint32_t func_addr, int nargs, const uint32_t *args);
-    uint32_t args[4] = {
-        (uint32_t)(ULONG_PTR)hWnd, (uint32_t)Msg,
-        (uint32_t)wParam, (uint32_t)lParam
-    };
-    return (LRESULT)compat32_callback_args(func, 4, args);
+    (void)lpPrevWndFunc;
+    /* Delegate to DefWindowProc instead of invoking 32-bit WndProc via callback.
+     * Calling the WndProc via compat32_callback_args causes crashes because
+     * nested callbacks (CreateWindowEx already sent WM_NCCREATE via callback)
+     * corrupt the callback return stub addresses on the PE stack. */
+    return DefWindowProcA(hWnd, Msg, wParam, lParam);
 }
 
 LRESULT WINAPI CallWindowProcW(PVOID lpPrevWndFunc, HWND hWnd, DWORD Msg,
                                 WPARAM wParam, LPARAM lParam)
 {
-    return CallWindowProcA(lpPrevWndFunc, hWnd, Msg, wParam, lParam);
+    (void)lpPrevWndFunc;
+    return DefWindowProcA(hWnd, Msg, wParam, lParam);
 }
 
 LRESULT WINAPI DefWindowProcW(HWND hWnd, DWORD Msg, WPARAM wParam, LPARAM lParam)
@@ -1648,14 +1620,12 @@ BOOL WINAPI GetClassInfoExW(HINSTANCE hInstance, PCWSTR lpszClass, PVOID lpwcx)
 
 LONG WINAPI GetWindowLongW(HWND hWnd, int nIndex)
 {
-    (void)hWnd; (void)nIndex;
-    return 0;
+    return GetWindowLongA(hWnd, nIndex);
 }
 
 LONG WINAPI SetWindowLongW(HWND hWnd, int nIndex, LONG dwNewLong)
 {
-    (void)hWnd; (void)nIndex; (void)dwNewLong;
-    return 0;
+    return SetWindowLongA(hWnd, nIndex, dwNewLong);
 }
 
 BOOL WINAPI IsWindow(HWND hWnd)
