@@ -317,7 +317,7 @@ static void tss_init(void)
     /* Zero TSS, set IST1 to top of dedicated stack */
     memset(&kernel_tss, 0, sizeof(kernel_tss));
     kernel_tss.ist1 = (uint64_t)(ist1_stack + IST1_STACK_SIZE);
-    /* IST2 reserved for future use (e.g., #DB from compat mode) */
+    kernel_tss.ist2 = (uint64_t)(ist2_stack + IST2_STACK_SIZE);
     kernel_tss.iopb_offset = sizeof(struct tss64);
     tss_ist1_ptr = &kernel_tss.ist1;
 
@@ -440,6 +440,23 @@ void isr_handler(interrupt_frame_t *frame)
     /* APIC timer tick */
     if (vec == 32) {
         tick_count++;
+
+        /* Detect PE32 code running in compat32 mode (watchdog) */
+        if ((frame->cs & 0xFFFF) == 0x40) {
+            static int compat32_tick_count = 0;
+            compat32_tick_count++;
+            /* Log every 200 ticks (~2s) while in compat32 */
+            if ((compat32_tick_count % 200) == 1) {
+                serial_puts("[TIMER] compat32 RIP=0x");
+                serial_puthex(frame->rip, 8);
+                serial_puts(" ESP=0x");
+                serial_puthex(frame->rsp & 0xFFFFFFFF, 8);
+                serial_puts(" #");
+                serial_putdec(compat32_tick_count);
+                serial_puts("\n");
+            }
+        }
+
         /* X-SCHED: preemptive scheduler — check quantum, switch if expired.
          * frame points to saved GPRs on the current process's stack. */
         sched_tick(frame);
@@ -990,6 +1007,7 @@ void idt_init(void)
     idt[6].ist  = 1;  /* #UD — invalid opcode (corrupted function pointer) */
     idt[13].ist = 1;  /* #GP — general protection */
     idt[14].ist = 1;  /* #PF — page fault (null-page write handling) */
+    idt[32].ist = 2;  /* APIC timer — IST2 for safe compat32 preemption */
 
     /* Override: vector 0x71 = keyboard IRQ (uses isr_stub_33) */
     idt_set_entry(0x71, isr_stub_33, 0);
