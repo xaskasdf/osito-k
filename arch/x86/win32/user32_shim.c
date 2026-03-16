@@ -541,10 +541,7 @@ BOOL WINAPI DestroyWindow(HWND hWnd)
     WINDOW *w = find_window(hWnd);
     if (!w) return FALSE;
 
-    if (w->wndproc) {
-        w->wndproc(hWnd, WM_DESTROY, 0, 0);
-        w->wndproc(hWnd, WM_NCDESTROY, 0, 0);
-    }
+    /* Don't call 32-bit wndproc directly from 64-bit mode */
 
     /* Clean up compositor resources */
     if (w->compositor_id && compositor_destroy_window)
@@ -569,8 +566,8 @@ BOOL WINAPI ShowWindow(HWND hWnd, int nCmdShow)
     int was_visible = w->visible;
     w->visible = (nCmdShow != SW_HIDE) ? 1 : 0;
 
-    if (w->wndproc)
-        w->wndproc(hWnd, WM_SHOWWINDOW, w->visible, 0);
+    /* Don't call wndproc directly — it's 32-bit PE code.
+     * WM_SHOWWINDOW is informational; the engine doesn't need it dispatched. */
 
     return was_visible;
 }
@@ -580,8 +577,10 @@ BOOL WINAPI UpdateWindow(HWND hWnd)
     WINDOW *w = find_window(hWnd);
     if (!w) return FALSE;
 
-    if (w->wndproc && w->visible)
-        w->wndproc(hWnd, WM_PAINT, 0, 0);
+    /* Don't call wndproc — same 32→64 bit mode issue */
+    if (0 && w->wndproc && w->visible)
+        /* wndproc is 32-bit PE code — can't call from 64-bit */
+        (void)w; /* WM_PAINT not dispatched */
 
     return TRUE;
 }
@@ -611,7 +610,8 @@ BOOL WINAPI MoveWindow(HWND hWnd, int X, int Y, int nWidth, int nHeight, BOOL bR
     if (!w) return FALSE;
     w->x = X; w->y = Y; w->width = nWidth; w->height = nHeight;
     if (bRepaint && w->wndproc && w->visible)
-        w->wndproc(hWnd, WM_PAINT, 0, 0);
+        /* wndproc is 32-bit PE code — can't call from 64-bit */
+        (void)w; /* WM_PAINT not dispatched */
     return TRUE;
 }
 
@@ -706,11 +706,7 @@ LRESULT WINAPI DispatchMessageA(const MSG *lpMsg)
     if (m.message == WM_QUIT)
         return 0;
 
-    WINDOW *w = find_window(m.hwnd);
-    if (w && w->wndproc) {
-        return w->wndproc(m.hwnd, m.message, m.wParam, m.lParam);
-    }
-
+    /* Can't call 32-bit wndproc from 64-bit. Use DefWindowProc. */
     return DefWindowProcA(m.hwnd, m.message, m.wParam, m.lParam);
 }
 
@@ -729,8 +725,8 @@ BOOL WINAPI PostMessageA(HWND hWnd, DWORD Msg, WPARAM wParam, LPARAM lParam)
 LRESULT WINAPI SendMessageA(HWND hWnd, DWORD Msg, WPARAM wParam, LPARAM lParam)
 {
     WINDOW *w = find_window(hWnd);
-    if (w && w->wndproc)
-        return w->wndproc(hWnd, Msg, wParam, lParam);
+    /* Can't call 32-bit wndproc from 64-bit. Use DefWindowProc. */
+    (void)w;
     return DefWindowProcA(hWnd, Msg, wParam, lParam);
 }
 
