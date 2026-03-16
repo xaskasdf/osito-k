@@ -1399,58 +1399,179 @@ int compat32_seh_dispatch(PEXCEPTION_RECORD ExceptionRecord)
                 serial_puts("[SEH32] handler: ContinueSearch\n");
             }
         } else {
-            serial_puts(" (PE32 handler, calling via compat32)\n");
-
             /*
-             * This is a 32-bit handler installed by PE32 code directly
-             * (e.g., __CxxFrameHandler3 for MSVC C++ EH).
+             * PE32 handler — not in our thunk table.
              *
-             * 32-bit SEH handler signature (cdecl):
-             *   EXCEPTION_DISPOSITION handler(
-             *       EXCEPTION_RECORD *ExceptionRecord,
-             *       void *EstablisherFrame,
-             *       CONTEXT *ContextRecord,
-             *       void *DispatcherContext);
+             * Check for MSVC C++ EH handler thunk pattern:
+             *   B8 xx xx xx xx    MOV EAX, <FuncInfo_ptr>
+             *   E9 xx xx xx xx    JMP <__CxxFrameHandler>
              *
-             * Returns: 0=ContinueExecution, 1=ContinueSearch
-             * May also longjmp directly to catch block (no return).
+             * If detected, parse FuncInfo directly and dispatch
+             * to the matching catch block without calling the handler
+             * (which needs a valid CONTEXT we can't easily provide).
              */
-            /*
-             * Build a minimal 32-bit CONTEXT with EBP derived from the
-             * SEH frame address. In MSVC, the EH3_EXCEPTION_REGISTRATION
-             * is at EBP-0x10, so EBP = frame_addr + 0x10.
-             * CONTEXT layout (i386): EBP at offset 0xB4, ESP at 0xC4,
-             * EIP at 0xB8. ContextFlags at 0x00.
-             */
-            static uint8_t seh_ctx32[0x2CC];  /* sizeof(CONTEXT) on i386 */
-            for (int ci = 0; ci < (int)sizeof(seh_ctx32); ci++) seh_ctx32[ci] = 0;
-            uint32_t *ctx32 = (uint32_t *)seh_ctx32;
-            ctx32[0] = 0x10001F;  /* CONTEXT_FULL */
-            /* EBP at offset 0xB4 / 4 = 45 */
-            ctx32[45] = frame_addr + 0x10;  /* EBP */
-            /* ESP at offset 0xC4 / 4 = 49 */
-            ctx32[49] = frame_addr + 0x10 + 4;  /* ESP ≈ EBP+4 */
-            /* EIP at offset 0xB8 / 4 = 46 */
-            ctx32[46] = handler32;  /* approximate EIP */
+            uint8_t *hcode = (uint8_t *)(uintptr_t)handler32;
 
-            uint32_t args[4];
-            args[0] = (uint32_t)(ULONG_PTR)&seh32_exception_record;
-            args[1] = frame_addr;
-            args[2] = (uint32_t)(ULONG_PTR)seh_ctx32;
-            args[3] = 0;   /* no DispatcherContext */
+            if (hcode[0] == 0xB8 && hcode[5] == 0xE9) {
+                /* Extract FuncInfo pointer from MOV EAX, imm32 */
+                uint32_t func_info_addr = *(uint32_t *)(hcode + 1);
 
-            uint32_t disp = compat32_callback_args(handler32, 4, args);
+                serial_puts(" (CxxFrameHandler thunk)\n");
+                serial_puts("[SEH32] FuncInfo=0x");
+                serial_puthex(func_info_addr, 8);
 
-            serial_puts("[SEH32] PE32 handler returned disp=");
-            serial_putdec(disp);
-            serial_puts("\n");
+                /* Read FuncInfo: magic(4), maxState(4), pUnwindMap(4),
+                 *                nTryBlocks(4), pTryBlockMap(4) */
+                uint32_t *fi = (uint32_t *)(uintptr_t)func_info_addr;
+                uint32_t magic = fi[0];
+                /* int32_t maxState = (int32_t)fi[1]; */
+                /* uint32_t pUnwindMap = fi[2]; */
+                int32_t nTryBlocks = (int32_t)fi[3];
+                uint32_t pTryBlockMap = fi[4];
 
-            if (disp == 0 /* ExceptionContinueExecution */) {
-                serial_puts("[SEH32] PE32 handler: ContinueExecution\n");
-                return 1;
+                serial_puts(" magic=0x");
+                serial_puthex(magic, 8);
+                serial_puts(" nTry=");
+                serial_putdec((uint64_t)nTryBlocks);
+                serial_puts("\n");
+
+                if (magic != 0x19930520 && magic != 0x19930522) {
+                    serial_puts("[SEH32] bad FuncInfo magic, skipping\n");
+                    goto next_frame;
+                }
+
+                /* C++ EH frame layout (3 fields, NOT 4):
+                 *   frame_addr+0 = Next
+                 *   frame_addr+4 = Handler
+                 *   frame_addr+8 = State (current unwind state)
+                 * EBP = frame_addr + 0x0C */
+                int32_t cur_state = (int32_t)frame32[2];
+
+                serial_puts("[SEH32] state=");
+                serial_putdec((uint64_t)(uint32_t)cur_state);
+                serial_puts("\n");
+
+                /* Walk TryBlockMap looking for a catch that matches.
+                 * TryBlockMapEntry: tryLow(4), tryHigh(4), catchHigh(4),
+                 *                   nCatches(4), pHandlerArray(4) = 20 bytes */
+                for (int32_t t = 0; t < nTryBlocks; t++) {
+                    uint32_t *tb = (uint32_t *)(uintptr_t)(pTryBlockMap + t * 20);
+                    int32_t tryLow  = (int32_t)tb[0];
+                    int32_t tryHigh = (int32_t)tb[1];
+                    /* int32_t catchHigh = (int32_t)tb[2]; */
+                    int32_t nCatches = (int32_t)tb[3];
+                    uint32_t pHandlerArray = tb[4];
+
+                    if (cur_state < tryLow || cur_state > tryHigh)
+                        continue;
+
+                    serial_puts("[SEH32] try[");
+                    serial_putdec(t);
+                    serial_puts("] matches (state ");
+                    serial_putdec((uint64_t)(uint32_t)cur_state);
+                    serial_puts(" in [");
+                    serial_putdec((uint64_t)(uint32_t)tryLow);
+                    serial_puts(",");
+                    serial_putdec((uint64_t)(uint32_t)tryHigh);
+                    serial_puts("])\n");
+
+                    /* HandlerType: adjectives(4), pType(4),
+                     *              dispCatchObj(4), addressOfHandler(4) = 16 bytes
+                     * Look for catch(...) first (pType == 0), then typed catches */
+                    uint32_t catch_handler = 0;
+                    int32_t catch_disp = 0;
+                    for (int32_t c = 0; c < nCatches; c++) {
+                        uint32_t *ch = (uint32_t *)(uintptr_t)(pHandlerArray + c * 16);
+                        uint32_t pType = ch[1];
+                        int32_t disp = (int32_t)ch[2];
+                        uint32_t addr = ch[3];
+
+                        if (pType == 0) {
+                            /* catch(...) — always matches */
+                            catch_handler = addr;
+                            catch_disp = disp;
+                            serial_puts("[SEH32] catch(...) handler=0x");
+                            serial_puthex(addr, 8);
+                            serial_puts("\n");
+                            break;
+                        }
+                        /* TODO: typed catch matching */
+                    }
+
+                    /* Also accept first typed catch as fallback */
+                    if (!catch_handler && nCatches > 0) {
+                        uint32_t *ch = (uint32_t *)(uintptr_t)pHandlerArray;
+                        catch_handler = ch[3];
+                        catch_disp = (int32_t)ch[2];
+                        serial_puts("[SEH32] fallback catch handler=0x");
+                        serial_puthex(catch_handler, 8);
+                        serial_puts("\n");
+                    }
+
+                    if (catch_handler) {
+                        /* Update state to catchHigh (after the catch block) */
+                        frame32[2] = (uint32_t)((int32_t)tb[2]);
+
+                        /* Restore SEH chain */
+                        g_teb32.ExceptionList = frame_addr;
+
+                        /* EBP for the catch handler = frame_addr + 0x0C
+                         * (C++ EH frame is 3 fields: Next+Handler+State = 12 bytes) */
+                        uint32_t catch_ebp = frame_addr + 0x0C;
+
+                        /* If catch has a catch object (dispCatchObj != 0),
+                         * store the exception object pointer at EBP+disp */
+                        if (catch_disp != 0 && seh32_exception_record.NumberParameters >= 2) {
+                            uint32_t exc_obj = seh32_exception_record.ExceptionInformation[1];
+                            uint32_t *catch_obj_ptr = (uint32_t *)(uintptr_t)(catch_ebp + catch_disp);
+                            *catch_obj_ptr = exc_obj;
+                        }
+
+                        serial_puts("[SEH32] dispatching to catch @0x");
+                        serial_puthex(catch_handler, 8);
+                        serial_puts(" EBP=0x");
+                        serial_puthex(catch_ebp, 8);
+                        serial_puts("\n");
+
+                        /*
+                         * Call the catch handler via compat32_callback.
+                         * The MSVC catch handler expects EBP to be the
+                         * establishing function's frame pointer. We set
+                         * up the unwind globals so the INT2E return will
+                         * restore EBP before jumping to the handler.
+                         */
+                        g_compat32_unwind_eip = catch_handler;
+                        g_compat32_unwind_esp = catch_ebp + 4;
+                        g_compat32_unwind_ebp = catch_ebp;
+
+                        return 1;  /* handled — INT2E will apply unwind */
+                    }
+                }
+                /* No matching catch in this frame, try next */
+            } else {
+                serial_puts(" (PE32 handler, calling via compat32)\n");
+
+                /* Generic PE32 handler — call via compat32 with CONTEXT */
+                uint32_t args[4];
+                args[0] = (uint32_t)(ULONG_PTR)&seh32_exception_record;
+                args[1] = frame_addr;
+                args[2] = 0;
+                args[3] = 0;
+
+                uint32_t disp = compat32_callback_args(handler32, 4, args);
+
+                serial_puts("[SEH32] PE32 handler returned disp=");
+                serial_putdec(disp);
+                serial_puts("\n");
+
+                if (disp == 0) {
+                    serial_puts("[SEH32] PE32 handler: ContinueExecution\n");
+                    return 1;
+                }
             }
-            /* disp==1 → ContinueSearch, try next frame */
         }
+
+next_frame:
 
         frame_addr = next32;
         frame_num++;

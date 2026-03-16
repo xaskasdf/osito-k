@@ -539,7 +539,7 @@ DWORD WINAPI GetFileSize(HANDLE hFile, DWORD *lpFileSizeHigh)
 #define FILE_CURRENT 1
 #define FILE_END     2
 
-BOOL WINAPI SetFilePointer(HANDLE hFile, LONG lDistanceToMove,
+DWORD WINAPI SetFilePointer(HANDLE hFile, LONG lDistanceToMove,
                     LONG *lpDistanceToMoveHigh, DWORD dwMoveMethod)
 {
     /* First get current position and size */
@@ -570,7 +570,7 @@ BOOL WINAPI SetFilePointer(HANDLE hFile, LONG lDistanceToMove,
 
     default:
         g_last_error = 87; /* ERROR_INVALID_PARAMETER */
-        return FALSE;
+        return (DWORD)-1; /* INVALID_SET_FILE_POINTER */
     }
 
     pos_info.CurrentByteOffset.QuadPart = new_pos;
@@ -579,13 +579,13 @@ BOOL WINAPI SetFilePointer(HANDLE hFile, LONG lDistanceToMove,
                                             FilePositionInformation);
     if (!NT_SUCCESS(status)) {
         set_last_error_from_status(status);
-        return FALSE;
+        return (DWORD)-1; /* INVALID_SET_FILE_POINTER */
     }
 
     if (lpDistanceToMoveHigh)
         *lpDistanceToMoveHigh = (LONG)(new_pos >> 32);
 
-    return TRUE;
+    return (DWORD)(new_pos & 0xFFFFFFFF);
 }
 
 /* ── File copy/delete/move stubs (UT99) ─────────────────────── */

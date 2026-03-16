@@ -41,7 +41,7 @@ BOOL    WINAPI CloseHandle(HANDLE hObject);
 
 DWORD   WINAPI GetFileSize(HANDLE hFile, DWORD *lpFileSizeHigh);
 
-BOOL    WINAPI SetFilePointer(HANDLE hFile, LONG lDistanceToMove,
+DWORD   WINAPI SetFilePointer(HANDLE hFile, LONG lDistanceToMove,
                        LONG *lpDistanceToMoveHigh, DWORD dwMoveMethod);
 
 BOOL    WINAPI CopyFileA(PCSTR lpExistingFileName, PCSTR lpNewFileName, BOOL bFailIfExists);

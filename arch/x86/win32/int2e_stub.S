@@ -69,6 +69,31 @@ int2e_stub:
     call compat32_dispatch
     mov %rbp, %rsp
 
+    /*
+     * C++ EH catch dispatch: if compat32_seh_dispatch found a catch
+     * handler, g_compat32_unwind_eip/esp/ebp are set. Modify the iret
+     * frame to jump to the catch handler with the correct EBP/ESP.
+     */
+    leaq g_compat32_unwind_eip(%rip), %r10
+    movl (%r10), %r11d
+    testl %r11d, %r11d
+    jz .Lno_unwind
+
+    /* Overwrite iret RIP with catch handler EIP */
+    movq %r11, 120(%rsp)
+    movl $0, (%r10)                  /* clear */
+
+    /* Overwrite iret RSP */
+    leaq g_compat32_unwind_esp(%rip), %r10
+    movl (%r10), %r11d
+    movq %r11, 144(%rsp)
+
+    /* Set EBP in saved register area (RBP is at RSP+48 after 15 pushes) */
+    leaq g_compat32_unwind_ebp(%rip), %r10
+    movl (%r10), %r11d
+    movq %r11, 48(%rsp)              /* offset 48 = saved RBP */
+
+.Lno_unwind:
     /* Restore old IST1 from stack */
     movq tss_ist1_ptr(%rip), %r11
     popq (%r11)                      /* TSS.IST1 = saved old value */
