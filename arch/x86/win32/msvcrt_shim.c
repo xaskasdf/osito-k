@@ -2024,8 +2024,14 @@ void WINAPI crt_CxxThrowException(PVOID pExceptionObject, PVOID pThrowInfo)
      * This is NOT correct C++ semantics but lets the engine survive
      * past localization failures and similar non-fatal errors.
      */
+    /*
+     * WORKAROUND: Suppress throws — return immediately.
+     * This is semantically wrong (throw should never return) but the
+     * alternative (corrupted SEH unwind with wrong EBP offsets) is worse.
+     * The engine code after appThrowf() typically has fallback paths.
+     */
     if (pExceptionObject && pThrowInfo) {
-        serial_puts("[CXX] SUPPRESSED throw (C++ EH not fully implemented)\n");
+        serial_puts("[CXX] SUPPRESSED throw\n");
         return;
     }
     if (!pExceptionObject && !pThrowInfo) {

@@ -516,10 +516,23 @@ DWORD WINAPI GetFileSize(HANDLE hFile, DWORD *lpFileSizeHigh)
         return (DWORD)-1;
     }
 
+    DWORD result = (DWORD)(info.EndOfFile.QuadPart & 0xFFFFFFFF);
+
+    /* Log file size for debugging localization file reads */
+    static int gfs_log_count = 0;
+    if (gfs_log_count < 20) {
+        serial_puts("[GetFileSize] h=0x");
+        serial_puthex((uint64_t)(ULONG_PTR)hFile, 4);
+        serial_puts(" size=");
+        serial_putdec(result);
+        serial_puts("\n");
+        gfs_log_count++;
+    }
+
     if (lpFileSizeHigh)
         *lpFileSizeHigh = (DWORD)(info.EndOfFile.QuadPart >> 32);
 
-    return (DWORD)(info.EndOfFile.QuadPart & 0xFFFFFFFF);
+    return result;
 }
 
 #define FILE_BEGIN   0

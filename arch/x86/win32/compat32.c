@@ -31,6 +31,11 @@ extern void kern_longjmp(uint64_t *buf, int val);
 
 int g_compat32_mode = 0;
 
+/* ── C++ EH unwind state (set by _CxxThrowException) ────────── */
+uint32_t g_compat32_unwind_eip = 0;
+uint32_t g_compat32_unwind_esp = 0;
+uint32_t g_compat32_unwind_ebp = 0;
+
 /* ── Thunk state ─────────────────────────────────────────────── */
 
 #define THUNK_STUB_SIZE  64      /* bytes per thunk stub */
