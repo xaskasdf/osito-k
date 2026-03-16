@@ -134,14 +134,44 @@ HANDLE WINAPI CreateFileW(PCWSTR lpFileName, DWORD dwDesiredAccess,
     serial_puts("[CreateFileW] ptr=0x");
     serial_puthex((uint64_t)lpFileName, 16);
     serial_puts(" '");
+    char fname_ascii[260];
+    int fname_len = 0;
     if (lpFileName) {
-        for (int i = 0; i < 80 && lpFileName[i]; i++) {
+        for (int i = 0; i < 259 && lpFileName[i]; i++) {
             char c = (char)(lpFileName[i] & 0xFF);
+            fname_ascii[i] = c;
+            fname_len = i + 1;
             char buf[2] = { c, 0 };
             serial_puts(buf);
         }
+        fname_ascii[fname_len] = 0;
+    } else {
+        fname_ascii[0] = 0;
     }
     serial_puts("'\n");
+
+    /* WORKAROUND: Fail CreateFileW for "Running.ini" with GENERIC_WRITE.
+     * FFileManagerWindows::CreateFileWriter returns NULL on failure,
+     * avoiding the vtable=0 crash from FArchiveFileWriter with broken
+     * C++ constructor (C++ EH not fully implemented yet).
+     * Running.ini is just a "process running" flag file — not needed. */
+    if (dwDesiredAccess & GENERIC_WRITE) {
+        /* Check for "Running.ini" (case-insensitive) */
+        const char *fn = fname_ascii;
+        /* Skip path prefix */
+        for (int i = fname_len - 1; i >= 0; i--)
+            if (fn[i] == '\\' || fn[i] == '/') { fn = &fname_ascii[i+1]; break; }
+        if ((fn[0]=='R'||fn[0]=='r') && (fn[1]=='u'||fn[1]=='U') &&
+            (fn[2]=='n'||fn[2]=='N') && (fn[3]=='n'||fn[3]=='N') &&
+            (fn[4]=='i'||fn[4]=='I') && (fn[5]=='n'||fn[5]=='N') &&
+            (fn[6]=='g'||fn[6]=='G') && fn[7]=='.' &&
+            (fn[8]=='i'||fn[8]=='I') && (fn[9]=='n'||fn[9]=='N') &&
+            (fn[10]=='i'||fn[10]=='I') && fn[11]=='\0') {
+            serial_puts("[CreateFileW] BLOCKED Running.ini write (vtable fix)\n");
+            SetLastError(5); /* ERROR_ACCESS_DENIED */
+            return INVALID_HANDLE_VALUE;
+        }
+    }
 
     UNICODE_STRING name;
     RtlInitUnicodeString(&name, lpFileName);

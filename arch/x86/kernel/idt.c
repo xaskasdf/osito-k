@@ -751,6 +751,49 @@ void isr_handler(interrupt_frame_t *frame)
             extern uint64_t *compat32_crash_jmpbuf;
             extern void kern_longjmp(uint64_t *buf, int val);
             if (compat32_crash_jmpbuf) {
+                /*
+                 * Null vtable recovery: if the crash is from calling through
+                 * a null vtable pointer (RIP in low memory from [0x00000000]),
+                 * skip the call and continue PE execution. This happens when
+                 * an Unreal object was allocated but its constructor didn't
+                 * set the vtable (vtable=0 → [0]=garbage → #UD).
+                 *
+                 * Recovery: pop the return address from the 32-bit stack,
+                 * set EAX=0 (return 0 from the virtual call), and resume.
+                 */
+                /* Detect crash from null/corrupt vtable: RIP below PE load area.
+                 * Limit to 3 recoveries — beyond that, corruption is too deep. */
+                static int null_vcall_skip_count = 0;
+                if ((vec == 6 || vec == 13) &&
+                    frame->rip < 0x02000000 &&
+                    (frame->cs == 0x40 || frame->cs == 0x23) &&
+                    null_vcall_skip_count < 3) {
+                    null_vcall_skip_count++;
+                    uint32_t obj_addr = (uint32_t)frame->rax;
+                    serial_puts("  [WIN32] Null vtable call: obj=0x");
+                    serial_puthex(obj_addr, 8);
+                    if (obj_addr >= 0x10000 && obj_addr < 0x80000000UL) {
+                        uint32_t *obj = (uint32_t *)(uintptr_t)obj_addr;
+                        serial_puts(" vtbl=0x");
+                        serial_puthex(obj[0], 8);
+                    }
+                    serial_puts("\n");
+
+                    /* Pop return address from 32-bit stack */
+                    uint32_t *esp32 = (uint32_t *)(uintptr_t)(uint32_t)frame->rsp;
+                    uint32_t ret_addr = esp32[0];
+                    frame->rsp += 4;  /* pop return address */
+
+                    /* Also pop stdcall args if present (the push 1 before call) */
+                    /* Don't pop args — the caller pushed them and will clean up */
+
+                    frame->rip = ret_addr;
+                    frame->rax = 0;  /* return 0 from the "virtual call" */
+                    serial_puts("  [WIN32] Skipping null vcall → resuming at 0x");
+                    serial_puthex(ret_addr, 8);
+                    serial_puts("\n");
+                    return;  /* resume PE execution */
+                }
                 serial_puts("  [WIN32] Crash recovery — returning to shell\n");
                 uint64_t *jmp = compat32_crash_jmpbuf;
                 compat32_crash_jmpbuf = NULL;

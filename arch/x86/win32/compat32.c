@@ -65,6 +65,9 @@ uint32_t g_gmalloc_addr = 0;
 /* Return stub address (32-bit code in thunk pool that INT 0x2Es back) */
 static uint32_t callback_return_stub_addr = 0;
 
+/* Stub for unresolved imports: XOR EAX,EAX; RET (returns 0) */
+static uint32_t unresolved_stub_addr = 0;
+
 /*
  * Reentrant callback support.
  *
@@ -247,6 +250,18 @@ void compat32_init(void)
         serial_puts("[COMPAT32] Callback return stub at 0x");
         serial_puthex(callback_return_stub_addr, 8);
         serial_puts("\n");
+    }
+
+    /*
+     * Install "unresolved import" stub: XOR EAX,EAX; RET
+     * Used for IAT entries that couldn't be resolved — prevents
+     * wild jumps to RVA addresses left in the IAT.
+     */
+    {
+        uint8_t *stub = thunk_pool + (THUNK_POOL_PAGES * 4096) - 32;
+        stub[0] = 0x31; stub[1] = 0xC0;  /* XOR EAX, EAX */
+        stub[2] = 0xC3;                   /* RET */
+        unresolved_stub_addr = (uint32_t)(ULONG_PTR)stub;
     }
 #endif
 }
@@ -446,11 +461,58 @@ static uint8_t guess_num_args(const char *name)
         { "GetCursorPos",         1 }, { "ScreenToClient",        2 },
         { "ClientToScreen",       2 },
 
-        /* gdi32 */
+        /* user32 — recently added, were missing and caused RET N over-pop */
+        { "IsWindow",             1 }, { "IsIconic",              1 },
+        { "IsZoomed",             1 }, { "IsWindowEnabled",       1 },
+        { "GetParent",            1 }, { "EnableWindow",          2 },
+        { "BeginPaint",           2 }, { "EndPaint",              2 },
+        { "GetWindowLongW",       2 }, { "SetWindowLongW",        3 },
+        { "GetClassInfoExA",      3 }, { "GetClassInfoExW",       3 },
+        { "EnumChildWindows",     3 }, { "FillRect",              3 },
+        { "GetUpdateRect",        3 }, { "InvalidateRect",        3 },
+        { "ChangeDisplaySettingsA", 2 }, { "ChangeDisplaySettingsW", 2 },
+        { "EnumDisplaySettingsA",  3 }, { "EnumDisplaySettingsW",  3 },
+        { "SystemParametersInfoA", 4 }, { "SystemParametersInfoW", 4 },
+        { "CallWindowProcA",      5 }, { "CallWindowProcW",       5 },
+        { "DialogBoxParamW",      5 }, { "DialogBoxParamA",       5 },
+        { "RegisterWindowMessageA", 1 }, { "RegisterWindowMessageW", 1 },
+        { "PostThreadMessageW",   4 }, { "PostThreadMessageA",    4 },
+        { "SetPropA",             3 }, { "SetPropW",              3 },
+        { "GetPropA",             2 }, { "GetPropW",              2 },
+        { "RemovePropA",          2 }, { "RemovePropW",           2 },
+        { "GetClassLongA",        2 }, { "GetClassLongW",         2 },
+        { "SendMessageTimeoutW",  7 }, { "SendMessageTimeoutA",   7 },
+        { "GetWindowTextA",       3 }, { "GetWindowTextW",        3 },
+        { "GetWindowTextLengthA", 1 }, { "GetWindowTextLengthW",  1 },
+        { "DefWindowProcW",       4 }, { "DefMDIChildProcW",      4 },
+        { "UpdateWindow",         1 }, { "ShowCursor",            1 },
+        { "SetCapture",           1 }, { "ReleaseCapture",        0 },
+        { "GetForegroundWindow",  0 }, { "SetForegroundWindow",   1 },
+
+        /* winmm — timeGetTime was 0-arg but got RET 16 = 16 bytes over-pop per call! */
+        { "timeGetTime",          0 }, { "timeBeginPeriod",       1 },
+        { "timeEndPeriod",        1 }, { "timeSetEvent",          5 },
+        { "timeKillEvent",        1 },
+
+        /* gdi32 — extended */
         { "GetDeviceCaps",        2 }, { "CreateCompatibleDC",    1 },
         { "DeleteDC",             1 }, { "SelectObject",          2 },
         { "GetObjectA",           3 }, { "DeleteObject",          1 },
         { "ChoosePixelFormat",    2 }, { "SetPixelFormat",        3 },
+        { "CreateDIBitmap",       6 }, { "CreateBitmap",          5 },
+        { "CreatePatternBrush",   1 }, { "CreateSolidBrush",      1 },
+        { "GetStockObject",       1 }, { "GetObjectW",            3 },
+        { "CreateDIBSection",     6 }, { "BitBlt",                9 },
+
+        /* ddraw COM methods (called via thunks, stdcall with 'this') */
+        { "DD_QI",                3 }, { "DD_AddRef",             1 },
+        { "DD_Release",           1 }, { "DD_CreateSurface",      4 },
+        { "DD_GetDisplayMode",    2 }, { "DD_SetCoopLevel",       3 },
+        { "DD_SetDisplayMode",    6 },
+        { "Surf_QI",              3 }, { "Surf_AddRef",           1 },
+        { "Surf_Release",         1 }, { "Surf_Blt",              7 },
+        { "Surf_Flip",            3 }, { "Surf_GetDesc",          2 },
+        { "Surf_Lock",            5 }, { "Surf_Unlock",           2 },
 
         /* advapi32 */
         { "RegOpenKeyExA",        5 }, { "RegCloseKey",           1 },
@@ -467,6 +529,18 @@ static uint8_t guess_num_args(const char *name)
         { "strncmp",              3 }, { "strcat",                2 },
         { "strchr",               2 }, { "strrchr",               2 },
         { "strstr",               2 },
+        /* Wide string functions (cdecl, from msvcrt) */
+        { "wcslen",               1 }, { "wcscpy",                2 },
+        { "wcsncpy",              3 }, { "wcscmp",                2 },
+        { "wcsncmp",              3 }, { "wcscat",                2 },
+        { "wcschr",               2 }, { "wcsrchr",               2 },
+        { "wcsstr",               2 }, { "_wcsicmp",              2 },
+        { "_wcsnicmp",            3 }, { "_wcslwr",               1 },
+        { "_wcsupr",              1 }, { "wcstol",                3 },
+        { "wcstod",               2 }, { "swprintf",             12 },
+        { "_snwprintf",          12 }, { "towlower",              1 },
+        { "towupper",             1 }, { "iswspace",              1 },
+        { "iswdigit",             1 }, { "iswalpha",              1 },
         /* Variadic printf: nargs=12 to capture all possible args from
          * the 32-bit stack. ms_va_start/ms_va_arg on the zero-extended
          * args works correctly for int and pointer types. */
@@ -526,7 +600,12 @@ static uint8_t guess_num_args(const char *name)
             return known[i].args;
     }
 
-    /* Default: assume 4 args (common for many Win32 APIs) */
+    /* Default: 4 args → RET 16. With the comprehensive arg count table above,
+     * most functions have correct entries. The default of 4 is safer than 0
+     * because under-pop (stale args) is less destructive than the assertion
+     * failures caused by 0-arg defaults for stdcall functions that need cleanup.
+     * The critical missing entries (timeGetTime=0, IsWindow=1, etc.) are now
+     * all explicitly listed above. */
     return 4;
 }
 
@@ -691,7 +770,16 @@ NTSTATUS compat32_patch_iat(PE_IMAGE_INFO *info)
                 resolved = dll_resolve_import(dll_name, NULL, ordinal, TRUE);
             }
 
-            if (!resolved) continue;
+            if (!resolved) {
+                /*
+                 * Unresolved import — patch IAT with a stub that returns 0.
+                 * Without this, the IAT keeps the original RVA (e.g. 0x1F68)
+                 * and calling through it jumps to garbage → #UD.
+                 */
+                if (unresolved_stub_addr)
+                    iat_entry->u1.Function = unresolved_stub_addr;
+                continue;
+            }
 
             if (shim) {
                 /*
@@ -1322,10 +1410,28 @@ int compat32_seh_dispatch(PEXCEPTION_RECORD ExceptionRecord)
              * Returns: 0=ContinueExecution, 1=ContinueSearch
              * May also longjmp directly to catch block (no return).
              */
+            /*
+             * Build a minimal 32-bit CONTEXT with EBP derived from the
+             * SEH frame address. In MSVC, the EH3_EXCEPTION_REGISTRATION
+             * is at EBP-0x10, so EBP = frame_addr + 0x10.
+             * CONTEXT layout (i386): EBP at offset 0xB4, ESP at 0xC4,
+             * EIP at 0xB8. ContextFlags at 0x00.
+             */
+            static uint8_t seh_ctx32[0x2CC];  /* sizeof(CONTEXT) on i386 */
+            for (int ci = 0; ci < (int)sizeof(seh_ctx32); ci++) seh_ctx32[ci] = 0;
+            uint32_t *ctx32 = (uint32_t *)seh_ctx32;
+            ctx32[0] = 0x10001F;  /* CONTEXT_FULL */
+            /* EBP at offset 0xB4 / 4 = 45 */
+            ctx32[45] = frame_addr + 0x10;  /* EBP */
+            /* ESP at offset 0xC4 / 4 = 49 */
+            ctx32[49] = frame_addr + 0x10 + 4;  /* ESP ≈ EBP+4 */
+            /* EIP at offset 0xB8 / 4 = 46 */
+            ctx32[46] = handler32;  /* approximate EIP */
+
             uint32_t args[4];
             args[0] = (uint32_t)(ULONG_PTR)&seh32_exception_record;
             args[1] = frame_addr;
-            args[2] = 0;   /* no CONTEXT */
+            args[2] = (uint32_t)(ULONG_PTR)seh_ctx32;
             args[3] = 0;   /* no DispatcherContext */
 
             uint32_t disp = compat32_callback_args(handler32, 4, args);

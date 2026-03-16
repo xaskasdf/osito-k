@@ -2012,6 +2012,29 @@ void WINAPI crt_CxxThrowException(PVOID pExceptionObject, PVOID pThrowInfo)
     serial_puts("\n");
 
     /*
+     * WORKAROUND: Full C++ EH (SEH unwind + __CxxFrameHandler dispatch)
+     * is not yet implemented. Calling RaiseException without proper CONTEXT
+     * and DispatcherContext causes all handlers to return ContinueSearch,
+     * leaving the C++ runtime corrupted (_CxxThrowException returns when
+     * it should never return → undefined behavior → vtable=0 crashes).
+     *
+     * For now: suppress real throws and rethrows. Return immediately.
+     * The engine code after throw is technically unreachable, but MSVC
+     * often generates fall-through code that works as error cleanup.
+     * This is NOT correct C++ semantics but lets the engine survive
+     * past localization failures and similar non-fatal errors.
+     */
+    if (pExceptionObject && pThrowInfo) {
+        serial_puts("[CXX] SUPPRESSED throw (C++ EH not fully implemented)\n");
+        return;
+    }
+    if (!pExceptionObject && !pThrowInfo) {
+        serial_puts("[CXX] SUPPRESSED rethrow\n");
+        return;
+    }
+
+    /*
+     * ORIGINAL CODE (disabled):
      * _CxxThrowException MUST NOT RETURN. The MSVC implementation calls
      * RaiseException(0xE06D7363, EXCEPTION_NONCONTINUABLE, 3, args)
      * which triggers SEH dispatch → __CxxFrameHandler → catch block.
