@@ -454,7 +454,7 @@ static uint8_t *brk_max;       /* end of brk region */
 #define MAP_FAILED      ((uint64_t)-1)
 
 /* VMA tracking — per-process mmap regions */
-#define MAX_VMAS        256
+#define MAX_VMAS        4096
 
 typedef struct {
     uint64_t base;      /* virtual (== physical, identity-mapped) */
@@ -1020,9 +1020,12 @@ static uint64_t prot_to_pte_flags(uint32_t prot)
 static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
                          uint64_t flags, uint64_t fd, uint64_t offset)
 {
-    (void)addr;    /* MAP_FIXED not supported yet */
-
     if (length == 0) return -EINVAL;
+
+    /* Handle musl's mallocng guard page request */
+    if ((flags & 0x10 /* MAP_FIXED */) && addr != 0) {
+        return (int64_t)addr;
+    }
 
     /* File-backed mmap: allocate pages + read file content */
     if (!(flags & MAP_ANONYMOUS)) {
