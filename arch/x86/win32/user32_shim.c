@@ -1586,14 +1586,9 @@ WORD WINAPI RegisterClassExW(PVOID lpwcx)
     uint32_t wndproc_addr = *(uint32_t *)(raw + 8);
     uint32_t classname_ptr = *(uint32_t *)(raw + 40);
 
-    extern void serial_putdec(uint64_t val);
-    serial_puts("[USER32] RegisterClassExW: cbSize=");
-    serial_putdec(cb_size);
-    serial_puts(" wndproc=0x");
-    serial_puthex(wndproc_addr, 8);
-    serial_puts(" classname_ptr=0x");
-    serial_puthex(classname_ptr, 8);
-    serial_puts("\n");
+    /* Note: classname wide string has corrupted first char due to unknown
+     * alignment issue in compat32 struct passing. The WndProc fallback in
+     * CreateWindowExA handles this — classes matched by last-registered. */
 
     char classA[128] = {0};
     if (classname_ptr) {
