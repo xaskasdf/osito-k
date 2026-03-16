@@ -81,17 +81,19 @@ int2e_stub:
 
     /* Overwrite iret RIP with catch handler EIP */
     movq %r11, 120(%rsp)
-    movl $0, (%r10)                  /* clear */
+    movl $0, (%r10)                  /* clear eip */
 
     /* Overwrite iret RSP */
     leaq g_compat32_unwind_esp(%rip), %r10
     movl (%r10), %r11d
     movq %r11, 144(%rsp)
+    movl $0, (%r10)                  /* clear esp */
 
     /* Set EBP in saved register area (RBP is at RSP+48 after 15 pushes) */
     leaq g_compat32_unwind_ebp(%rip), %r10
     movl (%r10), %r11d
     movq %r11, 48(%rsp)              /* offset 48 = saved RBP */
+    movl $0, (%r10)                  /* clear ebp */
 
 .Lno_unwind:
     /* Restore old IST1 from stack */

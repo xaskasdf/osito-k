@@ -1186,6 +1186,17 @@ PVOID seh32_ep_addr_for_filter(void)
 
 int compat32_seh_dispatch(PEXCEPTION_RECORD ExceptionRecord)
 {
+    /* Guard against reentrant catch dispatch.
+     * When a catch handler runs and throws another exception (e.g.,
+     * appUnwindf calls appThrowf), we must NOT dispatch to another catch
+     * because the unwind globals are already set for the first catch.
+     * Suppress nested exceptions to prevent double-dispatch corruption. */
+    static int in_catch_dispatch = 0;
+    if (in_catch_dispatch) {
+        serial_puts("[SEH32] SUPPRESSED nested exception during catch\n");
+        return 1;  /* pretend handled */
+    }
+
     /* Read the 32-bit ExceptionList from TEB32.
      * 32-bit code writes FS:[0] — since FS base points to g_teb32,
      * the SEH chain is at g_teb32.ExceptionList (4 bytes). */
@@ -1540,8 +1551,13 @@ int compat32_seh_dispatch(PEXCEPTION_RECORD ExceptionRecord)
                          * up the unwind globals so the INT2E return will
                          * restore EBP before jumping to the handler.
                          */
+                        in_catch_dispatch = 1;
                         g_compat32_unwind_eip = catch_handler;
-                        g_compat32_unwind_esp = catch_ebp + 4;
+                        /* ESP must be BELOW EBP so handler's pushes don't
+                         * overwrite the frame. The establishing function's
+                         * locals are below EBP. Use EBP-0x100 to give the
+                         * catch handler stack space for its own operations. */
+                        g_compat32_unwind_esp = catch_ebp - 0x100;
                         g_compat32_unwind_ebp = catch_ebp;
 
                         return 1;  /* handled — INT2E will apply unwind */
