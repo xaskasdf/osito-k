@@ -522,17 +522,21 @@ HWND WINAPI CreateWindowExA(DWORD dwExStyle, PCSTR lpClassName,
     serial_puthex(nHeight, 4);
     serial_puts("\n");
 
-    /* WM_NCCREATE/WM_CREATE: skip callbacks entirely.
-     * Callbacks cause nested INT2E crashes (#BP in callback stack).
-     * The hWndCreated==hWnd assertion fires but engine continues
-     * through appError → StaticShutdownAfterError → cleanup loop.
-     * The cleanup loop runs ~530 timeGetTime ticks before #UD crash.
-     *
-     * TODO: Fix the nested callback mechanism to properly handle
-     * INT2E calls inside compat32 callbacks. The root cause is that
-     * the WndProc's ret address (callback_return_stub_addr) gets
-     * overwritten when the WndProc makes INT2E calls that modify IST1.
-     */
+    /* Simulate WM_NCCREATE effect without callbacks.
+     * Window.dll's WndProc for WM_NCCREATE does:
+     *   1. GetWindowLong(hWnd, -20) → gets WWindow* from GWLP_USERDATA
+     *   2. Reads lpCreateParams from CREATESTRUCT → WWindow* this
+     *   3. Sets this->hWnd = hWnd at some offset
+     * Instead of callback, we:
+     *   1. SetWindowLong(hWnd, GWLP_USERDATA, lpParam) — store WWindow*
+     *   2. Write hWnd directly into the WWindow object
+     * The hWnd member offset varies; Window.dll disassembly shows access
+     * patterns at this+0x04, this+0x08. We try SetWindowLong which the
+     * engine's assertion relies on indirectly. */
+    if (lpParam) {
+        /* Store lpParam (WWindow*) as GWLP_USERDATA so GetWindowLong finds it */
+        SetWindowLongA(w->handle, -21 /*GWL_USERDATA*/, (LONG)(ULONG_PTR)lpParam);
+    }
 
     return w->handle;
 }
