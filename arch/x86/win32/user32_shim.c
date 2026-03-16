@@ -522,20 +522,15 @@ HWND WINAPI CreateWindowExA(DWORD dwExStyle, PCSTR lpClassName,
     serial_puthex(nHeight, 4);
     serial_puts("\n");
 
-    /* Simulate WM_NCCREATE effect without callbacks.
-     * Window.dll's WndProc for WM_NCCREATE does:
-     *   1. GetWindowLong(hWnd, -20) → gets WWindow* from GWLP_USERDATA
-     *   2. Reads lpCreateParams from CREATESTRUCT → WWindow* this
-     *   3. Sets this->hWnd = hWnd at some offset
-     * Instead of callback, we:
-     *   1. SetWindowLong(hWnd, GWLP_USERDATA, lpParam) — store WWindow*
-     *   2. Write hWnd directly into the WWindow object
-     * The hWnd member offset varies; Window.dll disassembly shows access
-     * patterns at this+0x04, this+0x08. We try SetWindowLong which the
-     * engine's assertion relies on indirectly. */
-    if (lpParam) {
-        /* Store lpParam (WWindow*) as GWLP_USERDATA so GetWindowLong finds it */
-        SetWindowLongA(w->handle, -21 /*GWL_USERDATA*/, (LONG)(ULONG_PTR)lpParam);
+    /* Simulate WM_NCCREATE without callbacks.
+     * Window.dll's WndProc sets WindowCreate->hWnd = hWnd at offset +4
+     * of the WWindow object (confirmed by disassembly: mov [edi+4], edx
+     * at 0x11003b5b). lpParam is the WWindow 'this' pointer.
+     * Writing hWnd at this+4 satisfies the check(hWndCreated==hWnd)
+     * assertion at Window.h:1289 without needing compat32 callbacks. */
+    if (lpParam && (uint32_t)(ULONG_PTR)lpParam >= 0x10000) {
+        uint32_t *wwindow = (uint32_t *)(uintptr_t)(uint32_t)(uintptr_t)lpParam;
+        wwindow[1] = (uint32_t)(ULONG_PTR)w->handle;  /* this->hWnd at offset +4 */
     }
 
     return w->handle;
