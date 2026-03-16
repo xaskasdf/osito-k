@@ -56,7 +56,7 @@ static void u32_strcpy(char *dst, const char *src, int max)
 
 /* ── Window class registry ─────────────────────────────────── */
 
-#define MAX_WNDCLASSES 16
+#define MAX_WNDCLASSES 64
 
 typedef struct {
     char        class_name[128];
