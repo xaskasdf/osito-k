@@ -304,8 +304,8 @@ void sys_caps_init(void)
     g_sys_caps.elf_max_alloc = avail / 2;
 
     /* Win32 */
-    g_sys_caps.win32_heap_size = CLAMP(total / 8, 16ULL * 1024 * 1024, 256ULL * 1024 * 1024);
-    g_sys_caps.crt_pool_size   = CLAMP(total / 16, 4ULL * 1024 * 1024, 128ULL * 1024 * 1024);
+    g_sys_caps.win32_heap_size = CLAMP(total / 4, 32ULL * 1024 * 1024, 512ULL * 1024 * 1024);
+    g_sys_caps.crt_pool_size   = CLAMP(total / 8, 8ULL * 1024 * 1024, 256ULL * 1024 * 1024);
     g_sys_caps.win32_va_limit  = 0x7FFF0000ULL;
 
     /* Networking */

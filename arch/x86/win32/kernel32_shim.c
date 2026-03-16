@@ -428,10 +428,44 @@ PVOID WINAPI HeapAlloc(HANDLE hHeap, DWORD dwFlags, SIZE_T dwBytes)
         cur = cur->next;
     }
 
-    /* No free block found — bump allocate */
+    /* No free block found — bump allocate, grow if needed */
     if (heap_offset + total > heap_pool_size) {
-        g_last_error = 8; /* ERROR_NOT_ENOUGH_MEMORY */
-        return NULL;
+        /* Auto-grow: allocate a new chunk from kernel heap */
+        extern void *kmalloc(uint64_t size);
+        uint64_t grow = g_sys_caps.win32_heap_size;
+        if (!grow) grow = 64ULL * 1024 * 1024;
+        /* Grow by at least the request size */
+        if (grow < total) grow = total;
+
+        BYTE *new_pool = (BYTE *)kmalloc(grow);
+        if (new_pool) {
+            serial_puts("[HEAP] Auto-grow: +");
+            serial_putdec(grow / (1024 * 1024));
+            serial_puts(" MB (used ");
+            serial_putdec(heap_offset / (1024 * 1024));
+            serial_puts("/");
+            serial_putdec(heap_pool_size / (1024 * 1024));
+            serial_puts(" MB)\n");
+
+            /* Add remaining space from old pool to free-list */
+            SIZE_T remaining = heap_pool_size - heap_offset;
+            if (remaining >= 32) {
+                BYTE *tail = heap_pool + heap_offset;
+                *(SIZE_T *)tail = remaining;
+                free_node_t *fn = (free_node_t *)tail;
+                fn->size = remaining;
+                fn->next = free_list;
+                free_list = fn;
+            }
+
+            /* Switch to new pool */
+            heap_pool = new_pool;
+            heap_pool_size = grow;
+            heap_offset = 0;
+        } else {
+            g_last_error = 8; /* ERROR_NOT_ENOUGH_MEMORY */
+            return NULL;
+        }
     }
 
     BYTE *block = heap_pool + heap_offset;
