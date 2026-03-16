@@ -166,11 +166,25 @@ struct IDirectDrawSurface7Vtbl {
 
 /* Surface implementations */
 
+/* ── COM32 proxy types ────────────────────────────────────── */
+typedef struct {
+    uint32_t lpVtbl32;
+    uint32_t surf_index;
+} COM32_Surface;
+static COM32_Surface surf_proxy32[MAX_SURFACES];
+
+/* Forward declarations — defined later in file */
+static IDirectDrawSurface7 *com32_to_surface(uint32_t proxy_addr);
+
+/* All surf_* functions receive a COM32_Surface* as 'self' (via thunk).
+ * Convert to real surface with this macro. */
+#define REAL_SURF(self) com32_to_surface((uint32_t)(ULONG_PTR)(self))
+
 static HRESULT WINAPI surf_QueryInterface(IDirectDrawSurface7 *self, REFIID iid, PVOID *ppv)
 {
     (void)iid;
     if (!ppv) return E_INVALIDARG;
-    *ppv = self;
+    *ppv = self; /* return the proxy, not the real surface */
     return S_OK;
 }
 
@@ -181,32 +195,36 @@ static HRESULT WINAPI surf_Lock(IDirectDrawSurface7 *self, LPRECT destRect,
                                  DDSURFACEDESC2 *desc, DWORD flags, HANDLE hEvent)
 {
     (void)destRect; (void)flags; (void)hEvent;
-    DDSurface *s = &self->surf;
+    IDirectDrawSurface7 *real = REAL_SURF(self);
+    if (!real) return DDERR_INVALIDPARAMS;
+    DDSurface *s = &real->surf;
 
     if (!desc) return DDERR_INVALIDPARAMS;
 
-    dd_memset(desc, 0, sizeof(DDSURFACEDESC2));
-    desc->dwSize    = sizeof(DDSURFACEDESC2);
-    desc->dwFlags   = DDSD_WIDTH | DDSD_HEIGHT | DDSD_PITCH | DDSD_LPSURFACE | DDSD_PIXELFORMAT;
-    desc->dwWidth   = s->width;
-    desc->dwHeight  = s->height;
-    desc->lPitch    = s->pitch;
-    desc->lpSurface = s->pixels;
+    /* Write DDSURFACEDESC2 in 32-bit layout (4-byte pointers, 124 bytes total).
+     * Critical: lpSurface at offset 36 is 4 bytes (not 8). */
+    uint32_t *d = (uint32_t *)desc;
+    dd_memset(d, 0, 124);  /* 32-bit DDSURFACEDESC2 = 124 bytes */
+    d[0]  = 124;  /* dwSize */
+    d[1]  = DDSD_WIDTH | DDSD_HEIGHT | DDSD_PITCH | DDSD_LPSURFACE | DDSD_PIXELFORMAT;
+    d[2]  = s->height;              /* dwHeight at offset 8 */
+    d[3]  = s->width;               /* dwWidth at offset 12 */
+    d[4]  = (uint32_t)s->pitch;     /* lPitch at offset 16 */
+    d[9]  = (uint32_t)(ULONG_PTR)s->pixels; /* lpSurface at offset 36 */
 
-    desc->ddpfPixelFormat.dwSize        = sizeof(DDPIXELFORMAT);
-    desc->ddpfPixelFormat.dwFlags       = DDPF_RGB;
-    desc->ddpfPixelFormat.dwRGBBitCount = s->bpp;
+    /* ddpfPixelFormat at offset 72 (32-bit layout) */
+    d[18] = 32;  /* ddpfPixelFormat.dwSize at offset 72 */
+    d[19] = DDPF_RGB;  /* dwFlags at offset 76 */
+    d[22] = s->bpp;  /* dwRGBBitCount at offset 88 */
 
     if (s->bpp == 16) {
-        /* RGB565 */
-        desc->ddpfPixelFormat.dwRBitMask = 0xF800;
-        desc->ddpfPixelFormat.dwGBitMask = 0x07E0;
-        desc->ddpfPixelFormat.dwBBitMask = 0x001F;
+        d[23] = 0xF800;  /* dwRBitMask at offset 92 */
+        d[24] = 0x07E0;  /* dwGBitMask at offset 96 */
+        d[25] = 0x001F;  /* dwBBitMask at offset 100 */
     } else {
-        /* 32-bit XRGB8888 */
-        desc->ddpfPixelFormat.dwRBitMask = 0x00FF0000;
-        desc->ddpfPixelFormat.dwGBitMask = 0x0000FF00;
-        desc->ddpfPixelFormat.dwBBitMask = 0x000000FF;
+        d[23] = 0x00FF0000;
+        d[24] = 0x0000FF00;
+        d[25] = 0x000000FF;
     }
 
     s->locked = 1;
@@ -216,7 +234,8 @@ static HRESULT WINAPI surf_Lock(IDirectDrawSurface7 *self, LPRECT destRect,
 static HRESULT WINAPI surf_Unlock(IDirectDrawSurface7 *self, LPRECT lpRect)
 {
     (void)lpRect;
-    self->surf.locked = 0;
+    IDirectDrawSurface7 *real = REAL_SURF(self);
+    if (real) real->surf.locked = 0;
     return DD_OK;
 }
 
@@ -236,10 +255,13 @@ static HRESULT WINAPI surf_Blt(IDirectDrawSurface7 *self, LPRECT destRect,
                                 DWORD dwFlags, PVOID lpDDBltFx)
 {
     (void)destRect; (void)srcRect; (void)dwFlags; (void)lpDDBltFx;
-    DDSurface *dst = &self->surf;
+    IDirectDrawSurface7 *real_self = REAL_SURF(self);
+    if (!real_self) return DDERR_INVALIDPARAMS;
+    DDSurface *dst = &real_self->surf;
 
     if (src) {
-        DDSurface *s = &src->surf;
+        IDirectDrawSurface7 *real_src = REAL_SURF(src);
+        DDSurface *s = real_src ? &real_src->surf : dst;
         /* Copy source buffer to destination */
         SIZE_T copy_size = (SIZE_T)dst->height * dst->pitch;
         SIZE_T src_size  = (SIZE_T)s->height * s->pitch;
@@ -289,8 +311,17 @@ static HRESULT WINAPI surf_Flip(IDirectDrawSurface7 *self,
 {
     (void)flags;
 
-    DDSurface *primary = &self->surf;
-    DDSurface *back = override ? &override->surf : NULL;
+    IDirectDrawSurface7 *real_self = REAL_SURF(self);
+    if (!real_self) return DDERR_INVALIDPARAMS;
+    DDSurface *primary = &real_self->surf;
+    DDSurface *back = NULL;
+    if (override) {
+        IDirectDrawSurface7 *real_ov = REAL_SURF(override);
+        if (real_ov) back = &real_ov->surf;
+    }
+    /* If no override, try attached back buffer */
+    if (!back && primary->back_buffer)
+        back = (DDSurface *)primary->back_buffer;
 
     if (!back) {
         /* UT99 expects primary.Flip() to swap with the attached back buffer.
@@ -480,29 +511,60 @@ static HRESULT WINAPI dd_SetDisplayMode(IDirectDraw7 *self, DWORD w, DWORD h,
     return DD_OK;
 }
 
+/* Map COM32 surface proxy to real surface */
+static IDirectDrawSurface7 *com32_to_surface(uint32_t proxy_addr)
+{
+    /* The proxy_addr points to a COM32_Surface in surf_proxy32[] */
+    COM32_Surface *p = (COM32_Surface *)(uintptr_t)proxy_addr;
+    if (p >= surf_proxy32 && p < surf_proxy32 + MAX_SURFACES) {
+        uint32_t idx = p->surf_index;
+        if (idx < (uint32_t)surface_count)
+            return &surfaces[idx];
+    }
+    /* Fallback: try as direct surface pointer (backward compat) */
+    for (int i = 0; i < surface_count; i++) {
+        if ((uint32_t)(ULONG_PTR)&surfaces[i] == proxy_addr)
+            return &surfaces[i];
+    }
+    return surface_count > 0 ? &surfaces[0] : NULL;
+}
+
 static HRESULT WINAPI dd_CreateSurface(IDirectDraw7 *self, DDSURFACEDESC2 *desc,
                                         IDirectDrawSurface7 **surf, PVOID pUnkOuter)
 {
     (void)self; (void)pUnkOuter;
     if (!desc || !surf) return DDERR_INVALIDPARAMS;
 
-    DWORD w   = (desc->dwFlags & DDSD_WIDTH)  ? desc->dwWidth  : display_width;
-    DWORD h   = (desc->dwFlags & DDSD_HEIGHT) ? desc->dwHeight : display_height;
+    /* Read DDSURFACEDESC2 from 32-bit caller — use raw uint32_t access
+     * because the struct layout differs between 32 and 64 bit */
+    uint32_t *d32 = (uint32_t *)desc;
+    uint32_t flags32 = d32[1];   /* dwFlags at offset 4 */
+    uint32_t caps32  = d32[26];  /* ddsCaps.dwCaps at offset 104 */
+
+    DWORD w   = (flags32 & DDSD_WIDTH)  ? d32[3] : display_width;   /* offset 12 */
+    DWORD h   = (flags32 & DDSD_HEIGHT) ? d32[2] : display_height;  /* offset 8 */
     DWORD bpp = display_bpp;
-    int is_primary = (desc->ddsCaps.dwCaps & DDSCAPS_PRIMARYSURFACE) ? 1 : 0;
+    int is_primary = (caps32 & DDSCAPS_PRIMARYSURFACE) ? 1 : 0;
 
-    *surf = alloc_surface(w, h, bpp, is_primary);
-    if (!*surf) return E_OUTOFMEMORY;
+    IDirectDrawSurface7 *s = alloc_surface(w, h, bpp, is_primary);
+    if (!s) return E_OUTOFMEMORY;
 
-    /* If primary with back buffer count, create back buffer too */
-    if (is_primary && (desc->dwFlags & DDSD_BACKBUFFERCOUNT) && desc->dwBackBufferCount > 0) {
-        /* We don't implement a real flip chain, but create back buffer surface */
+    int idx = (int)(s - surfaces);
+
+    /* If primary with back buffer, create back buffer surface */
+    uint32_t bb_count = (flags32 & DDSD_BACKBUFFERCOUNT) ? d32[5] : 0; /* offset 20 */
+    if (is_primary && bb_count > 0) {
         IDirectDrawSurface7 *back = alloc_surface(w, h, bpp, 0);
         if (back) {
-            (*surf)->surf.back_buffer = (struct DDSurface *)back;
+            s->surf.back_buffer = (struct DDSurface *)back;
         }
     }
 
+    /* Return 32-bit proxy address */
+    *(uint32_t *)surf = (uint32_t)(ULONG_PTR)&surf_proxy32[idx];
+    serial_puts("[DDRAW] CreateSurface: proxy=0x");
+    serial_puthex((uint64_t)(ULONG_PTR)&surf_proxy32[idx], 8);
+    serial_puts("\n");
     return DD_OK;
 }
 
@@ -544,12 +606,97 @@ static IDirectDraw7 g_ddraw = { &dd_vtbl };
 
 /* ── DirectDraw entry points ───────────────────────────────── */
 
+/* ── 32-bit COM proxy for compat32 mode ───────────────────── */
+/*
+ * The 64-bit IDirectDraw7 vtable has 8-byte function pointers.
+ * 32-bit PE code reads 4-byte slots → reads wrong offsets.
+ * Solution: create a 32-bit proxy with a vtable of 4-byte thunk addrs.
+ * Each thunk does INT 0x2E → dispatches to the real 64-bit function.
+ *
+ * IDirectDraw vtable layout (22 methods, 4 bytes each):
+ *   0: QueryInterface   6: CreateSurface  12: GetCaps
+ *  13: GetDisplayMode  20: SetCooperativeLevel  21: SetDisplayMode
+ * IDirectDrawSurface vtable (33 methods):
+ *   5: Blt  11: Flip  12: GetAttachedSurface  17: GetDC
+ *  22: GetSurfaceDesc  25: Lock  26: ReleaseDC  32: Unlock
+ */
+
+/* 32-bit proxy objects — BSS, guaranteed < 4GB in our link layout */
+static uint32_t dd_vtbl32[23];  /* IDirectDraw vtable (23 slots) */
+static uint32_t dd_proxy32;     /* IDirectDraw COM object: just lpVtbl32 */
+
+static uint32_t surf_vtbl32[33]; /* IDirectDrawSurface vtable */
+static int com32_initialized = 0;
+
+static void ddraw_init_com32(void)
+{
+    if (com32_initialized) return;
+
+    extern uint32_t compat32_make_thunk_ex(uint64_t target, const char *name,
+                                            uint8_t num_args, uint8_t callconv);
+    #define CC_STDCALL 1
+
+    /* Zero all vtables */
+    for (int i = 0; i < 23; i++) dd_vtbl32[i] = 0;
+    for (int i = 0; i < 33; i++) surf_vtbl32[i] = 0;
+
+    /* IDirectDraw vtable thunks (stdcall, include 'this' in arg count) */
+    dd_vtbl32[0]  = compat32_make_thunk_ex((uint64_t)(ULONG_PTR)dd_QueryInterface,
+                                            "DD_QI", 3, CC_STDCALL);
+    dd_vtbl32[1]  = compat32_make_thunk_ex((uint64_t)(ULONG_PTR)dd_AddRef,
+                                            "DD_AddRef", 1, CC_STDCALL);
+    dd_vtbl32[2]  = compat32_make_thunk_ex((uint64_t)(ULONG_PTR)dd_Release,
+                                            "DD_Release", 1, CC_STDCALL);
+    dd_vtbl32[6]  = compat32_make_thunk_ex((uint64_t)(ULONG_PTR)dd_CreateSurface,
+                                            "DD_CreateSurface", 4, CC_STDCALL);
+    dd_vtbl32[13] = compat32_make_thunk_ex((uint64_t)(ULONG_PTR)dd_GetDisplayMode,
+                                            "DD_GetDisplayMode", 2, CC_STDCALL);
+    dd_vtbl32[20] = compat32_make_thunk_ex((uint64_t)(ULONG_PTR)dd_SetCooperativeLevel,
+                                            "DD_SetCoopLevel", 3, CC_STDCALL);
+    dd_vtbl32[21] = compat32_make_thunk_ex((uint64_t)(ULONG_PTR)dd_SetDisplayMode,
+                                            "DD_SetDisplayMode", 6, CC_STDCALL);
+
+    /* IDirectDrawSurface vtable thunks */
+    surf_vtbl32[0]  = compat32_make_thunk_ex((uint64_t)(ULONG_PTR)surf_QueryInterface,
+                                              "Surf_QI", 3, CC_STDCALL);
+    surf_vtbl32[1]  = compat32_make_thunk_ex((uint64_t)(ULONG_PTR)surf_AddRef,
+                                              "Surf_AddRef", 1, CC_STDCALL);
+    surf_vtbl32[2]  = compat32_make_thunk_ex((uint64_t)(ULONG_PTR)surf_Release,
+                                              "Surf_Release", 1, CC_STDCALL);
+    surf_vtbl32[5]  = compat32_make_thunk_ex((uint64_t)(ULONG_PTR)surf_Blt,
+                                              "Surf_Blt", 7, CC_STDCALL);
+    surf_vtbl32[11] = compat32_make_thunk_ex((uint64_t)(ULONG_PTR)surf_Flip,
+                                              "Surf_Flip", 3, CC_STDCALL);
+    surf_vtbl32[22] = compat32_make_thunk_ex((uint64_t)(ULONG_PTR)surf_GetSurfaceDesc,
+                                              "Surf_GetDesc", 2, CC_STDCALL);
+    surf_vtbl32[25] = compat32_make_thunk_ex((uint64_t)(ULONG_PTR)surf_Lock,
+                                              "Surf_Lock", 5, CC_STDCALL);
+    surf_vtbl32[32] = compat32_make_thunk_ex((uint64_t)(ULONG_PTR)surf_Unlock,
+                                              "Surf_Unlock", 2, CC_STDCALL);
+
+    /* Setup DD proxy object */
+    dd_proxy32 = (uint32_t)(ULONG_PTR)dd_vtbl32;
+
+    /* Setup surface proxies */
+    for (int i = 0; i < MAX_SURFACES; i++) {
+        surf_proxy32[i].lpVtbl32 = (uint32_t)(ULONG_PTR)surf_vtbl32;
+        surf_proxy32[i].surf_index = (uint32_t)i;
+    }
+
+    com32_initialized = 1;
+    serial_puts("[DDRAW] COM32 proxies initialized\n");
+}
+
 HRESULT WINAPI DirectDrawCreate(LPGUID lpGUID, PVOID *lplpDD, PVOID pUnkOuter)
 {
     (void)lpGUID; (void)pUnkOuter;
     serial_puts("[DDRAW] DirectDrawCreate\n");
     if (!lplpDD) return DDERR_INVALIDPARAMS;
-    *lplpDD = &g_ddraw;
+
+    ddraw_init_com32();
+
+    /* Return 32-bit proxy address (not the 64-bit g_ddraw) */
+    *(uint32_t *)lplpDD = (uint32_t)(ULONG_PTR)&dd_proxy32;
     return DD_OK;
 }
 
