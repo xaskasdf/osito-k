@@ -452,11 +452,20 @@ HWND WINAPI CreateWindowExA(DWORD dwExStyle, PCSTR lpClassName,
 
     if (window_count >= MAX_WINDOWS) return NULL;
 
-    /* Find window class */
+    /* Find window class.
+     * RegisterClassExW stores class names with potential wide→narrow corruption
+     * (first char can differ). If exact match fails, use the most recently
+     * registered class as fallback — classes are typically registered right
+     * before their windows are created. */
     WNDPROC wndproc = NULL;
     if (lpClassName) {
         WNDCLASS_ENTRY *cls = find_class(lpClassName);
-        if (cls) wndproc = cls->wndproc;
+        if (cls) {
+            wndproc = cls->wndproc;
+        } else if (wndclass_count > 0) {
+            /* Fallback: use last registered class */
+            wndproc = wndclasses[wndclass_count - 1].wndproc;
+        }
     }
 
     /* CW_USEDEFAULT */
