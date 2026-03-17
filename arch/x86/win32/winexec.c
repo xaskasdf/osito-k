@@ -138,13 +138,13 @@ PVOID pe_alloc(PVOID preferred, SIZE_T size)
         serial_puthex(pa, 8);
         serial_puts("\n");
         pe_va_record(va, size);
-        /* Return the PHYSICAL address (identity-mapped) for PE loading.
-         * All pe_memcpy/pe_memset/IAT patching operates on the PA.
-         * The VA mapping in both kernel and Win32 page tables ensures
-         * the PE code can access the same data via its preferred VA.
-         * This avoids the 2MB→4KB TLB split issue where writes via VA
-         * go to the identity-map PA instead of the remapped PA. */
-        return phys;
+        /* Return the VA (preferred address). The page table maps VA→PA
+         * and a full TLB flush after the 2MB→4KB split ensures the
+         * CPU uses the new 4KB PTEs. All pe_memcpy/pe_memset/IAT
+         * patching goes through the VA → correct PA. This also means
+         * delta = 0 (no relocations needed) since the PE is loaded
+         * at its preferred address. */
+        return (void *)va;
     }
     /* No preference — return identity-mapped phys addr */
     pe_va_record((uint64_t)phys, size);

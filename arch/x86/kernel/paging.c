@@ -120,30 +120,25 @@ static int paging_map_4k(uint64_t virt, uint64_t phys, uint64_t flags)
         serial_puts(" -> PT 0x");
         serial_puthex((uint64_t)pt, 8);
         serial_puts("\n");
+
+        /* Full TLB flush after 2MB→4KB split.
+         * invlpg alone doesn't reliably flush stale 2MB TLB entries
+         * in QEMU TCG. Toggle CR4.PGE + reload CR3 to flush ALL
+         * entries including global ones. */
+        {
+            uint64_t cr3_val, cr4;
+            __asm__ volatile ("mov %%cr3, %0" : "=r"(cr3_val));
+            __asm__ volatile ("mov %%cr4, %0" : "=r"(cr4));
+            __asm__ volatile ("mov %0, %%cr4" : : "r"(cr4 & ~(1ULL << 7)) : "memory");
+            __asm__ volatile ("mov %0, %%cr3" : : "r"(cr3_val) : "memory");
+            __asm__ volatile ("mov %0, %%cr4" : : "r"(cr4) : "memory");
+        }
     }
 
     uint64_t *pt = pt_get_or_create(pd, pd_idx);
     if (!pt) return -1;
 
     pt[PT_INDEX(virt)] = (phys & PTE_ADDR_MASK) | flags;
-
-    /* Debug: verify the full page walk for a specific VA */
-    if (virt == 0x10958000) {
-        extern void serial_puts(const char *);
-        extern void serial_puthex(uint64_t, int);
-        serial_puts("[PAGING] verify VA 0x10958000:\n");
-        serial_puts("  PML4["); serial_puthex(PML4_INDEX(virt), 1);
-        serial_puts("]=0x"); serial_puthex(kernel_pml4[PML4_INDEX(virt)], 16);
-        serial_puts("\n  PDPT["); serial_puthex(PDPT_INDEX(virt), 1);
-        serial_puts("]=0x"); serial_puthex(pdpt[PDPT_INDEX(virt)], 16);
-        serial_puts("\n  PD["); serial_puthex(pd_idx, 2);
-        serial_puts("]=0x"); serial_puthex(pd[pd_idx], 16);
-        serial_puts(" (LARGE="); serial_puthex((pd[pd_idx] >> 7) & 1, 1);
-        serial_puts(")\n  PT["); serial_puthex(PT_INDEX(virt), 2);
-        serial_puts("]=0x"); serial_puthex(pt[PT_INDEX(virt)], 16);
-        serial_puts("\n  Expected PA=0x"); serial_puthex(phys, 8);
-        serial_puts("\n");
-    }
 
     return 0;
 }
@@ -562,8 +557,13 @@ int paging_win32_map_page(uint64_t virt, uint64_t phys, uint64_t flags)
 {
     if (!win32_pml4) return -1;
 
-    /* VirtualAlloc VAs are in PDPT[1] range (0x40000000-0x7FFFFFFF).
-     * We use win32_pd1 directly. */
+    /* Only handle PDPT[1] range (0x40000000-0x7FFFFFFF) where Win32
+     * has its own PD (win32_pd1). VAs outside this range use the
+     * shared kernel PD via PDPT[0]/[2]/[3] — already mapped by
+     * paging_map_page(). */
+    if (virt < 0x40000000ULL || virt >= 0x80000000ULL)
+        return 0;  /* mapped via shared kernel PD */
+
     int pd_idx = PD_INDEX(virt);
 
     /* If PD entry is a 2MB large page, split it */

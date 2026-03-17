@@ -441,32 +441,26 @@ void isr_handler(interrupt_frame_t *frame)
     if (vec == 32) {
         tick_count++;
 
-        /* Watchdog: log where CPU is stuck (compat32 or kernel) */
+        /* Watchdog: detect PE32 code stuck in infinite loop */
         {
-            static int watchdog_ticks = 0;
-            watchdog_ticks++;
-            if ((watchdog_ticks % 500) == 1) {  /* every ~5s */
-                uint16_t cs = (uint16_t)(frame->cs & 0xFFFF);
-                serial_puts("[TIMER] #");
-                serial_putdec(watchdog_ticks);
-                serial_puts(" CS=0x");
-                serial_puthex(cs, 4);
-                serial_puts(" RIP=0x");
-                serial_puthex(frame->rip, 16);
-                serial_puts(" RSP=0x");
-                serial_puthex(frame->rsp, 16);
-                /* Probe GIsRunning (Core.dll VA 0x101E5698) and
-                 * GIsRunning IAT in UT.exe (0x10958C40) */
-                {
-                    /* Read IAT via VA and also via PA (identity-mapped) */
-                    uint32_t *iat_va = (uint32_t *)(uintptr_t)0x10958C40;
-                    uint32_t *iat_pa = (uint32_t *)(uintptr_t)0x01F3DC40;
-                    serial_puts(" IAT_VA=0x");
-                    serial_puthex(*iat_va, 8);
-                    serial_puts(" IAT_PA=0x");
-                    serial_puthex(*iat_pa, 8);
+            static uint64_t last_rip = 0;
+            static int same_count = 0;
+            uint16_t cs = (uint16_t)(frame->cs & 0xFFFF);
+
+            if (cs == 0x40) {
+                if (frame->rip == last_rip) {
+                    same_count++;
+                    if (same_count == 100) {  /* ~1s at 100Hz */
+                        serial_puts("[TIMER] PE32 stuck at RIP=0x");
+                        serial_puthex(frame->rip, 8);
+                        serial_puts(" RSP=0x");
+                        serial_puthex(frame->rsp, 8);
+                        serial_puts("\n");
+                    }
+                } else {
+                    last_rip = frame->rip;
+                    same_count = 0;
                 }
-                serial_puts("\n");
             }
         }
 

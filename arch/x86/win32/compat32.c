@@ -803,7 +803,9 @@ NTSTATUS compat32_patch_iat(PE_IMAGE_INFO *info)
                  * Import from a real PE32 DLL (32-bit code in same compat mode).
                  * Write the address directly — no thunk needed.
                  */
-                iat_entry->u1.Function = (ULONG)(ULONG_PTR)resolved;
+                /* Use volatile to ensure the write hits memory */
+                volatile uint32_t *iat_ptr = (volatile uint32_t *)&iat_entry->u1.Function;
+                *iat_ptr = (uint32_t)(ULONG_PTR)resolved;
                 direct++;
 
                 /* Log GIsRunning resolution for debugging */
@@ -1019,6 +1021,7 @@ void compat32_callback(uint32_t func_addr)
             "mov %%ax, %%es\n"
             "mov %%ax, %%ss\n"
             "mov %[sp], %%rsp\n"
+            "sti\n"                 /* Re-enable interrupts (INT 0x2E gate clears IF) */
             "push %[cs]\n"
             "push %[ip]\n"
             "lretq\n"
@@ -1090,6 +1093,7 @@ uint32_t compat32_callback_args(uint32_t func_addr, int nargs, const uint32_t *a
             "mov %%ax, %%es\n"
             "mov %%ax, %%ss\n"
             "mov %[sp], %%rsp\n"
+            "sti\n"                 /* Re-enable interrupts (INT 0x2E gate clears IF) */
             "push %[cs]\n"
             "push %[ip]\n"
             "lretq\n"
