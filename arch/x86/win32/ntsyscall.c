@@ -400,11 +400,41 @@ NTSTATUS sys_NtReadFile(ULONG_PTR *args)
                 serial_puthex((uint64_t)sys_buf, 16);
                 serial_puts("\n");
             }
-            /* Copy from kernel buffer to user buffer */
-            uint8_t *src = (uint8_t *)sys_buf;
-            uint8_t *dst = (uint8_t *)Buffer;
-            for (ULONG i = 0; i < to_read; i++)
-                dst[i] = src[i];
+            /* Copy from kernel buffer to user buffer.
+             * Switch to kernel CR3 for the copy, then back to Win32 CR3.
+             * Under Win32 CR3, VAs in 0x40000000+ are remapped by
+             * VirtualAlloc and don't match the identity map. The kernel
+             * CR3 has the identity map for ALL physical memory, so
+             * writing to PA via kernel CR3 always works. */
+            extern uint64_t paging_win32_va_to_pa(uint64_t va);
+            uint64_t dst_addr = (uint64_t)Buffer;
+            if (dst_addr >= 0x40000000ULL && dst_addr < 0x80000000ULL) {
+                /* Save Win32 CR3, switch to kernel */
+                uint64_t cur_cr3;
+                __asm__ volatile ("mov %%cr3, %0" : "=r"(cur_cr3));
+                extern uint64_t paging_get_kernel_cr3(void);
+                uint64_t kcr3 = paging_get_kernel_cr3();
+                if (kcr3)
+                    __asm__ volatile ("mov %0, %%cr3" : : "r"(kcr3) : "memory");
+
+                /* Copy via PA (identity-mapped under kernel CR3) */
+                uint8_t *src = (uint8_t *)sys_buf;
+                ULONG done = 0;
+                while (done < to_read) {
+                    uint64_t page_off = (dst_addr + done) & 0xFFF;
+                    uint64_t chunk = 4096 - page_off;
+                    if (chunk > to_read - done) chunk = to_read - done;
+                    uint64_t pa = paging_win32_va_to_pa(dst_addr + done);
+                    if (pa)
+                        nt_memcpy((void *)pa, src + done, chunk);
+                    done += (ULONG)chunk;
+                }
+
+                /* Switch back to Win32 CR3 (flushes TLB) */
+                __asm__ volatile ("mov %0, %%cr3" : : "r"(cur_cr3) : "memory");
+            } else {
+                nt_memcpy(Buffer, sys_buf, to_read);
+            }
         }
         kfree(sys_buf);
     } else {
