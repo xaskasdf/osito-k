@@ -138,14 +138,13 @@ PVOID pe_alloc(PVOID preferred, SIZE_T size)
         serial_puthex(pa, 8);
         serial_puts("\n");
         pe_va_record(va, size);
-        /* Full TLB flush — the 2MB→4KB split changes PD entries that
-         * may be cached as 2MB TLB entries. invlpg per-page is not
-         * sufficient because the CPU may have cached OTHER pages in
-         * the same 2MB range as 2MB TLB entries before the split. */
-        uint64_t cr3;
-        __asm__ volatile ("mov %%cr3, %0" : "=r"(cr3));
-        __asm__ volatile ("mov %0, %%cr3" : : "r"(cr3) : "memory");
-        return preferred;
+        /* Return the PHYSICAL address (identity-mapped) for PE loading.
+         * All pe_memcpy/pe_memset/IAT patching operates on the PA.
+         * The VA mapping in both kernel and Win32 page tables ensures
+         * the PE code can access the same data via its preferred VA.
+         * This avoids the 2MB→4KB TLB split issue where writes via VA
+         * go to the identity-map PA instead of the remapped PA. */
+        return phys;
     }
     /* No preference — return identity-mapped phys addr */
     pe_va_record((uint64_t)phys, size);
