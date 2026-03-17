@@ -487,7 +487,10 @@ uint64_t paging_create_win32_cr3(void)
 {
     if (!kernel_pml4) return 0;
 
-    /* 1. Allocate new PML4 — copy all entries from kernel */
+    /* 1. Allocate new PML4 — SHARE all entries from kernel.
+     * Instead of copying (which becomes stale when kernel heap grows),
+     * share the same PML4 entries. Only PML4[0] gets a custom PDPT
+     * so VirtualAlloc can have its own PD for 0x40000000-0x7FFFFFFF. */
     win32_pml4 = pt_alloc_page();
     if (!win32_pml4) return 0;
     memcpy(win32_pml4, kernel_pml4, PAGE_SIZE);
@@ -495,10 +498,16 @@ uint64_t paging_create_win32_cr3(void)
     /* 2. Get kernel's PDPT for PML4[0] */
     uint64_t *kernel_pdpt = (uint64_t *)(kernel_pml4[0] & PTE_ADDR_MASK);
 
-    /* 3. Allocate new PDPT for Win32, copy kernel's */
+    /* 3. Allocate new PDPT — SHARE all entries from kernel's PDPT.
+     * Only PDPT[1] is replaced with our own PD for VirtualAlloc VAs.
+     * PDPT[0] points to the SAME PD as the kernel, so identity-map
+     * updates (heap growth, new page mappings) are automatically
+     * visible in both page tables. */
     win32_pdpt = pt_alloc_page();
     if (!win32_pdpt) return 0;
-    memcpy(win32_pdpt, kernel_pdpt, PAGE_SIZE);
+    /* Copy all PDPT entries — they point to SHARED PDs (not copies) */
+    for (int i = 0; i < 512; i++)
+        win32_pdpt[i] = kernel_pdpt[i];
 
     /* 4. Allocate new PD for PDPT[1] (0x40000000-0x7FFFFFFF) */
     win32_pd1 = pt_alloc_page();
@@ -565,3 +574,25 @@ int paging_win32_map_page(uint64_t virt, uint64_t phys, uint64_t flags)
 }
 
 uint64_t paging_get_win32_cr3(void) { return win32_cr3_val; }
+
+/* Resolve a Win32 VirtualAlloc VA to its physical address.
+ * Walks the Win32 page table (PDPT[1] → PD → PT → PA). */
+uint64_t paging_win32_va_to_pa(uint64_t va)
+{
+    if (!win32_pd1) return 0;
+
+    int pd_idx = PD_INDEX(va);
+    uint64_t pde = win32_pd1[pd_idx];
+    if (!(pde & PTE_PRESENT)) return 0;
+
+    if (pde & PTE_LARGE) {
+        /* 2MB large page */
+        return (pde & 0x000FFFFFFFE00000ULL) | (va & 0x1FFFFF);
+    }
+
+    uint64_t *pt = (uint64_t *)(pde & PTE_ADDR_MASK);
+    uint64_t pte = pt[PT_INDEX(va)];
+    if (!(pte & PTE_PRESENT)) return 0;
+
+    return (pte & PTE_ADDR_MASK) | (va & 0xFFF);
+}
