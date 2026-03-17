@@ -137,8 +137,10 @@ static PVOID win32_va_alloc(SIZE_T size, uint64_t *out_phys)
                               PTE_PRESENT | PTE_WRITABLE);
     }
 
-    /* Zero via identity-mapped PA (works in both page tables) */
-    nt_memset((void *)pa, 0, size);
+    /* Zero via the newly mapped VA (not PA — under Win32 CR3,
+     * PA addresses in the 0x40000000+ range are aliased by
+     * VirtualAlloc mappings in PDPT[1], so identity-map access fails) */
+    nt_memset((void *)va, 0, size);
 
     if (out_phys) *out_phys = pa;
     return (PVOID)va;
