@@ -126,6 +126,25 @@ static int paging_map_4k(uint64_t virt, uint64_t phys, uint64_t flags)
     if (!pt) return -1;
 
     pt[PT_INDEX(virt)] = (phys & PTE_ADDR_MASK) | flags;
+
+    /* Debug: verify the full page walk for a specific VA */
+    if (virt == 0x10958000) {
+        extern void serial_puts(const char *);
+        extern void serial_puthex(uint64_t, int);
+        serial_puts("[PAGING] verify VA 0x10958000:\n");
+        serial_puts("  PML4["); serial_puthex(PML4_INDEX(virt), 1);
+        serial_puts("]=0x"); serial_puthex(kernel_pml4[PML4_INDEX(virt)], 16);
+        serial_puts("\n  PDPT["); serial_puthex(PDPT_INDEX(virt), 1);
+        serial_puts("]=0x"); serial_puthex(pdpt[PDPT_INDEX(virt)], 16);
+        serial_puts("\n  PD["); serial_puthex(pd_idx, 2);
+        serial_puts("]=0x"); serial_puthex(pd[pd_idx], 16);
+        serial_puts(" (LARGE="); serial_puthex((pd[pd_idx] >> 7) & 1, 1);
+        serial_puts(")\n  PT["); serial_puthex(PT_INDEX(virt), 2);
+        serial_puts("]=0x"); serial_puthex(pt[PT_INDEX(virt)], 16);
+        serial_puts("\n  Expected PA=0x"); serial_puthex(phys, 8);
+        serial_puts("\n");
+    }
+
     return 0;
 }
 
