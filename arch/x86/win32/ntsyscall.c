@@ -544,7 +544,10 @@ NTSTATUS sys_NtAllocateVirtualMemory(ULONG_PTR *args)
         return STATUS_INVALID_PARAMETER;
 
     SIZE_T size = *RegionSize;
-    /* Round up to page boundary */
+    /* Round up to page boundary. Minimum 1 page (4KB).
+     * Windows allows VirtualAlloc with size=0 for MEM_COMMIT on
+     * existing reservations, but for new allocations, treat 0 as 4KB. */
+    if (size == 0) size = 4096;
     size = (size + 0xFFF) & ~0xFFFULL;
     uint64_t pages = size / 4096;
 
