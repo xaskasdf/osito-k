@@ -373,42 +373,62 @@ NTSTATUS sys_NtReadFile(ULONG_PTR *args)
     serial_puthex(fobj->size, 8);
     serial_puts("\n");
 
-    int result = osfs2_read(fobj->osfs_file, (uint64_t)offset, Buffer, to_read);
-
-    /* Strip UTF-8 BOM (EF BB BF) from beginning of text files.
-     * Some .int files have BOM which breaks the INI parser.
-     * Shift data left and zero-fill the tail to avoid size mismatch
-     * (GetFileSize returns original size, ReadFile must match). */
-    if (result >= 3 && offset == 0) {
-        uint8_t *b = (uint8_t *)Buffer;
-        if (b[0] == 0xEF && b[1] == 0xBB && b[2] == 0xBF) {
-            for (int bi = 0; bi < result - 3; bi++)
-                b[bi] = b[bi + 3];
-            b[result - 3] = 0;
-            b[result - 2] = 0;
-            b[result - 1] = 0;
-            /* Don't change result — keep size consistent with GetFileSize */
+    /*
+     * Buffered I/O: read into a kernel-allocated temp buffer, then copy
+     * to the user buffer. This matches NT's DO_BUFFERED_IO approach and
+     * solves the Win32 page table issue: VirtualAlloc VAs (0x40000000+)
+     * are only mapped in the Win32 page table, and nvme_read_bytes does
+     * memcpy under kernel identity map where those VAs don't resolve.
+     *
+     * By reading to a kernel buffer first (identity-mapped, accessible
+     * from any CR3) and then copying to the user VA (accessible under
+     * the current Win32 CR3), we guarantee correct data delivery.
+     */
+    extern void *kmalloc(uint64_t size);
+    extern void kfree(void *ptr);
+    void *sys_buf = kmalloc(to_read);
+    int result;
+    if (sys_buf) {
+        result = osfs2_read(fobj->osfs_file, (uint64_t)offset, sys_buf, to_read);
+        if (result >= 0) {
+            /* Debug: check if sys_buf has data */
+            uint8_t *sb = (uint8_t *)sys_buf;
+            if (to_read <= 8192 && offset == 0 && sb[0] == 0 && sb[1] == 0) {
+                serial_puts("[NtReadFile] SYS_BUF ZERO! buf=0x");
+                serial_puthex((uint64_t)sys_buf, 16);
+                serial_puts("\n");
+            }
+            /* Copy from kernel buffer to user buffer */
+            uint8_t *src = (uint8_t *)sys_buf;
+            uint8_t *dst = (uint8_t *)Buffer;
+            for (ULONG i = 0; i < to_read; i++)
+                dst[i] = src[i];
         }
+        kfree(sys_buf);
+    } else {
+        /* Fallback: direct read (may fail for VirtualAlloc buffers) */
+        result = osfs2_read(fobj->osfs_file, (uint64_t)offset, Buffer, to_read);
     }
 
     serial_puts("[NtReadFile] result=");
     serial_puthex((uint64_t)(int64_t)result, 8);
     serial_puts("\n");
 
-    /* Dump first 64 bytes of small file reads for localization debugging */
+    /* Dump first 16 bytes as hex for localization debugging */
     if (result > 0 && result <= 8192 && offset == 0) {
-        serial_puts("[NtReadFile] data: \"");
-        const char *d = (const char *)Buffer;
-        int dlen = result < 64 ? result : 64;
+        serial_puts("[NtReadFile] hex: ");
+        const uint8_t *d = (const uint8_t *)Buffer;
+        int dlen = result < 16 ? result : 16;
+        for (int di = 0; di < dlen; di++) {
+            serial_puthex(d[di], 2);
+            serial_puts(" ");
+        }
+        serial_puts("= \"");
         for (int di = 0; di < dlen; di++) {
             char c = d[di];
             if (c >= 32 && c < 127) {
                 char buf[2] = { c, 0 };
                 serial_puts(buf);
-            } else if (c == '\n') {
-                serial_puts("\\n");
-            } else if (c == '\r') {
-                serial_puts("\\r");
             } else {
                 serial_puts(".");
             }

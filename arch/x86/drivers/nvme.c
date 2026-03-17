@@ -450,28 +450,7 @@ int nvme_read_bytes(uint64_t byte_offset, void *buf, uint64_t len)
 
         uint64_t avail = (uint64_t)read_lbas * nvme.lba_size - cur_offset;
         uint64_t copy = remaining < avail ? remaining : avail;
-        /*
-         * Copy data to user buffer. If running under Win32 CR3 (compat32
-         * mode), VirtualAlloc VAs (0x40000000+) may not be accessible
-         * from the kernel's memcpy. Switch to kernel CR3 for the copy,
-         * resolve VA→PA first, then copy via identity-mapped PA.
-         */
-        if ((uint64_t)dst >= 0x40000000ULL && (uint64_t)dst < 0x80000000ULL) {
-            extern uint64_t paging_win32_va_to_pa(uint64_t va);
-            /* Resolve each page's PA and copy chunk by chunk */
-            uint64_t done = 0;
-            while (done < copy) {
-                uint64_t page_off = ((uint64_t)(dst + done)) & 0xFFF;
-                uint64_t chunk = 4096 - page_off;
-                if (chunk > copy - done) chunk = copy - done;
-                uint64_t pa = paging_win32_va_to_pa((uint64_t)(dst + done));
-                if (pa)
-                    memcpy((void *)pa, temp + cur_offset + done, chunk);
-                done += chunk;
-            }
-        } else {
-            memcpy(dst, temp + cur_offset, copy);
-        }
+        memcpy(dst, temp + cur_offset, copy);
 
         dst += copy;
         remaining -= copy;
