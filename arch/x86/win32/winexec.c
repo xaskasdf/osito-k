@@ -712,6 +712,7 @@ int winexec_run(const uint8_t *file_data, uint64_t file_size)
         /* PE32 (i386): enter 32-bit compatibility mode */
         uint32_t entry32 = (uint32_t)(ULONG_PTR)info.EntryPoint;
         uint32_t sp32    = (uint32_t)(ULONG_PTR)stack_top;
+
         compat32_enter(entry32, sp32);
     } else {
         /* PE32+ (x86-64): direct 64-bit execution */

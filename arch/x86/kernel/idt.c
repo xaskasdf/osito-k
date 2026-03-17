@@ -382,15 +382,24 @@ uint64_t idt_get_ticks(void) { return tick_count; }
 void idt_watch_write4(void *addr)
 {
     uint64_t a = (uint64_t)addr;
-    /* DR0 = watch address */
     __asm__ volatile ("mov %0, %%dr0" : : "r"(a));
-    /* Clear DR6 status */
     __asm__ volatile ("mov %0, %%dr6" : : "r"((uint64_t)0));
-    /* DR7: L0=1 (local enable), RW0=01 (write only), LEN0=11 (4 bytes) */
+    /* DR7: L0=1, RW0=01 (write), LEN0=11 (4 bytes) */
     uint64_t dr7 = (1ULL << 0) | (1ULL << 16) | (3ULL << 18);
     __asm__ volatile ("mov %0, %%dr7" : : "r"(dr7));
-    serial_puts("[IDT] Hardware watchpoint armed on 0x");
+    serial_puts("[IDT] Watchpoint on 0x");
     serial_puthex(a, 16);
+    serial_puts("\n");
+}
+
+void idt_break_exec(uint64_t addr)
+{
+    __asm__ volatile ("mov %0, %%dr0" : : "r"(addr));
+    __asm__ volatile ("mov %0, %%dr6" : : "r"((uint64_t)0));
+    /* DR7: L0=1, RW0=00 (exec), LEN0=00 (1 byte) */
+    __asm__ volatile ("mov %0, %%dr7" : : "r"((uint64_t)(1ULL << 0)));
+    serial_puts("[IDT] Exec BP at 0x");
+    serial_puthex(addr, 8);
     serial_puts("\n");
 }
 
@@ -421,9 +430,67 @@ static uint16_t get_cs(void)
 
 /* ── Exception handler (called from isr_common in ASM) ─────── */
 
+/* Software breakpoint support */
+uint8_t  g_swbreak_saved = 0;
+uint32_t g_swbreak_addr = 0;
+
 void isr_handler(interrupt_frame_t *frame)
 {
     uint64_t vec = frame->vector;
+
+    /* #BP (INT3) — software breakpoint for tracing PE32 execution */
+    if (vec == 3 && g_swbreak_addr && (uint32_t)frame->rip == g_swbreak_addr + 1) {
+        serial_puts("[SWBREAK] Hit at 0x");
+        serial_puthex(g_swbreak_addr, 8);
+        /* Dump context based on breakpoint location */
+        if (g_swbreak_addr == 0x10915038) {
+            /* __except handler: dump EBP chain to find what threw */
+            uint32_t ebp = (uint32_t)frame->rbp;
+            serial_puts("\n[EXCEPT] __except handler fired!");
+            serial_puts(" EBP=0x");
+            serial_puthex(ebp, 8);
+            serial_puts(" ESP=0x");
+            serial_puthex(frame->rsp, 8);
+            /* Read [ebp-0x30] which has the exception info */
+            if (ebp > 0x10000) {
+                uint32_t *ebpp = (uint32_t *)(uintptr_t)ebp;
+                serial_puts("\n  [ebp-0x30]=0x");
+                serial_puthex(*(uint32_t *)(uintptr_t)(ebp - 0x30), 8);
+                serial_puts(" [ebp-0x2C]=0x");
+                serial_puthex(*(uint32_t *)(uintptr_t)(ebp - 0x2C), 8);
+                serial_puts("\n  caller=[ebp+4]=0x");
+                serial_puthex(ebpp[1], 8);
+            }
+            serial_puts("\n");
+        } else if (g_swbreak_addr == 0x10102CA2) {
+            uint32_t *sp = (uint32_t *)(uintptr_t)(frame->rsp & 0xFFFFFFFF);
+            uint32_t ret = sp[0], expr = sp[1], file = sp[2], line = sp[3];
+            serial_puts("\n[ASSERT] ");
+            if (expr) { const char *s = (const char *)(uintptr_t)expr; serial_puts(s); }
+            serial_puts(" @ ");
+            if (file) { const char *s = (const char *)(uintptr_t)file; serial_puts(s); }
+            serial_puts(":");
+            serial_putdec(line);
+            serial_puts("\n");
+        } else {
+            serial_puts(" ESP=0x");
+            serial_puthex(frame->rsp, 8);
+            serial_puts("\n");
+        }
+        /* Restore and re-execute (DON'T clear — catch ALL assertions) */
+        *(uint8_t *)(uintptr_t)g_swbreak_addr = g_swbreak_saved;
+        frame->rip = g_swbreak_addr;
+        /* Re-arm after single-step: set TF to re-patch after one instruction */
+        frame->rflags |= (1ULL << 8);  /* TF */
+        return;
+    }
+    /* Re-arm INT3 after single-step from appFailAssert */
+    if (vec == 1 && g_swbreak_addr) {
+        *(uint8_t *)(uintptr_t)g_swbreak_addr = 0xCC;
+        frame->rflags &= ~(1ULL << 8);
+        __asm__ volatile ("mov %0, %%dr6" : : "r"((uint64_t)0));
+        return;
+    }
 
     /* Demand paging — handle #PF for high addresses FIRST, before any output.
      * This must be the earliest possible check to avoid stack corruption. */
@@ -1031,6 +1098,7 @@ void idt_init(void)
      * cascading #GP). Share IST1 with INT 0x2E — these handlers
      * either halt (#UD) or return quickly (#PF null-page, #DB). */
     idt[1].ist  = 1;  /* #DB — TF single-step from null-page tracking */
+    idt[3].ist  = 1;  /* #BP — software breakpoint (INT3) from compat32 */
     idt[6].ist  = 1;  /* #UD — invalid opcode (corrupted function pointer) */
     idt[13].ist = 1;  /* #GP — general protection */
     idt[14].ist = 1;  /* #PF — page fault (null-page write handling) */
