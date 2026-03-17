@@ -458,12 +458,13 @@ void isr_handler(interrupt_frame_t *frame)
                 /* Probe GIsRunning (Core.dll VA 0x101E5698) and
                  * GIsRunning IAT in UT.exe (0x10958C40) */
                 {
-                    uint32_t *iat = (uint32_t *)(uintptr_t)0x10958C40;
-                    serial_puts(" IAT=0x");
-                    serial_puthex(*iat, 8);
-                    uint32_t *gir = (uint32_t *)(uintptr_t)0x101E5698;
-                    serial_puts(" GIsRunning=");
-                    serial_puthex(*gir, 8);
+                    /* Read IAT via VA and also via PA (identity-mapped) */
+                    uint32_t *iat_va = (uint32_t *)(uintptr_t)0x10958C40;
+                    uint32_t *iat_pa = (uint32_t *)(uintptr_t)0x01F3DC40;
+                    serial_puts(" IAT_VA=0x");
+                    serial_puthex(*iat_va, 8);
+                    serial_puts(" IAT_PA=0x");
+                    serial_puthex(*iat_pa, 8);
                 }
                 serial_puts("\n");
             }

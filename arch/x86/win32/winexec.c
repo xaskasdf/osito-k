@@ -102,7 +102,11 @@ PVOID pe_alloc(PVOID preferred, SIZE_T size)
     if (!phys) return NULL;
 
     if (preferred) {
-        /* Map physical pages at the PE's preferred ImageBase */
+        /* Map physical pages at the PE's preferred ImageBase.
+         * Map in BOTH kernel and Win32 page tables so the PE is
+         * visible from both contexts (kernel IAT patching uses
+         * kernel CR3, PE code runs under Win32 CR3). */
+        extern int paging_win32_map_page(uint64_t, uint64_t, uint64_t);
         uint64_t va = (uint64_t)preferred;
         uint64_t pa = (uint64_t)phys;
         int fail = 0;
@@ -110,6 +114,9 @@ PVOID pe_alloc(PVOID preferred, SIZE_T size)
             int r = paging_map_page(va + i * 4096, pa + i * 4096,
                                     PTE_PRESENT | PTE_WRITABLE);
             if (r != 0) fail++;
+            /* Also map in Win32 page table if it exists */
+            paging_win32_map_page(va + i * 4096, pa + i * 4096,
+                                  PTE_PRESENT | PTE_WRITABLE);
         }
         if (fail) {
             serial_puts("[pe_alloc] WARN: ");
@@ -131,6 +138,13 @@ PVOID pe_alloc(PVOID preferred, SIZE_T size)
         serial_puthex(pa, 8);
         serial_puts("\n");
         pe_va_record(va, size);
+        /* Full TLB flush — the 2MB→4KB split changes PD entries that
+         * may be cached as 2MB TLB entries. invlpg per-page is not
+         * sufficient because the CPU may have cached OTHER pages in
+         * the same 2MB range as 2MB TLB entries before the split. */
+        uint64_t cr3;
+        __asm__ volatile ("mov %%cr3, %0" : "=r"(cr3));
+        __asm__ volatile ("mov %0, %%cr3" : : "r"(cr3) : "memory");
         return preferred;
     }
     /* No preference — return identity-mapped phys addr */

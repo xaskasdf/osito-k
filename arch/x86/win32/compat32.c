@@ -806,6 +806,20 @@ NTSTATUS compat32_patch_iat(PE_IMAGE_INFO *info)
                 iat_entry->u1.Function = (ULONG)(ULONG_PTR)resolved;
                 direct++;
 
+                /* Log GIsRunning resolution for debugging */
+                if (func_name && func_name[0]=='?' && func_name[1]=='G' &&
+                    func_name[2]=='I' && func_name[3]=='s' && func_name[4]=='R') {
+                    serial_puts("[IAT] ");
+                    serial_puts(func_name);
+                    serial_puts(" → 0x");
+                    serial_puthex((uint64_t)(ULONG_PTR)resolved, 8);
+                    serial_puts(" IAT@0x");
+                    serial_puthex((uint64_t)(ULONG_PTR)&iat_entry->u1.Function, 8);
+                    serial_puts(" wrote=0x");
+                    serial_puthex(iat_entry->u1.Function, 8);
+                    serial_puts("\n");
+                }
+
                 /* Capture key data import addresses for diagnostics */
                 if (func_name) {
                     /* Check for "Names@FName" substring */
