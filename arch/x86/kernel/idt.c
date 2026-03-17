@@ -455,6 +455,16 @@ void isr_handler(interrupt_frame_t *frame)
                 serial_puthex(frame->rip, 16);
                 serial_puts(" RSP=0x");
                 serial_puthex(frame->rsp, 16);
+                /* Probe GIsRunning (Core.dll VA 0x101E5698) and
+                 * GIsRunning IAT in UT.exe (0x10958C40) */
+                {
+                    uint32_t *iat = (uint32_t *)(uintptr_t)0x10958C40;
+                    serial_puts(" IAT=0x");
+                    serial_puthex(*iat, 8);
+                    uint32_t *gir = (uint32_t *)(uintptr_t)0x101E5698;
+                    serial_puts(" GIsRunning=");
+                    serial_puthex(*gir, 8);
+                }
                 serial_puts("\n");
             }
         }
