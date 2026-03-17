@@ -494,7 +494,23 @@ NTSTATUS sys_NtWriteFile(ULONG_PTR *args)
         return STATUS_SUCCESS;
     }
 
-    /* Disk file */
+    /* Disk file — echo text content to serial for engine log capture */
+    {
+        const char *s = (const char *)Buffer;
+        if (Length > 0 && Length < 4096) {
+            serial_puts("[WRITE] ");
+            for (ULONG i = 0; i < Length && i < 300; i++) {
+                char c = s[i];
+                if (c >= 32 && c < 127) {
+                    serial_puts((const char[]){c, '\0'});
+                } else if (c == '\n') {
+                    serial_puts("\n[WRITE] ");
+                }
+            }
+            serial_puts("\n");
+        }
+    }
+
     LONGLONG offset = ByteOffset ? ByteOffset->QuadPart : fobj->position;
 
     int result = osfs2_write(fobj->osfs_file, (uint64_t)offset, Buffer, Length);

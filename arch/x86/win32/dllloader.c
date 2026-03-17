@@ -178,6 +178,13 @@ LOADED_MODULE *dll_find_module(const char *dll_name)
     return NULL;
 }
 
+/* Return module handle (ImageBase) for a named DLL */
+PVOID dll_get_module_handle(const char *name)
+{
+    LOADED_MODULE *mod = dll_find_module(name);
+    return mod ? mod->image.ImageBase : NULL;
+}
+
 /* ── Resolve export from PE export directory ───────────────── */
 
 PVOID dll_resolve_export(LOADED_MODULE *mod, const char *func_name,

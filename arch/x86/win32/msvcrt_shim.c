@@ -1477,6 +1477,23 @@ SIZE_T WINAPI crt_fwrite(PCVOID buf, SIZE_T size, SIZE_T count, CRT_FILE *f)
     DWORD total = (DWORD)(size * count);
     DWORD bytes_written = 0;
     WriteFile(f->nt_handle, buf, total, &bytes_written, NULL);
+
+    /* Echo text writes to serial (captures engine log output) */
+    if (total > 0 && total < 4096) {
+        const char *s = (const char *)buf;
+        serial_puts("[LOG] ");
+        for (DWORD i = 0; i < total && i < 200; i++) {
+            char c = s[i];
+            if (c >= 32 && c < 127) {
+                char b[2] = { c, 0 };
+                serial_puts(b);
+            } else if (c == '\n') {
+                serial_puts("\n[LOG] ");
+            }
+        }
+        serial_puts("\n");
+    }
+
     return bytes_written / size;
 }
 

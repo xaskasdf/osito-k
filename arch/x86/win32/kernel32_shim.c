@@ -387,6 +387,10 @@ static void heap_pool_init(void)
     heap_pool = (BYTE *)kmalloc(target);
     if (heap_pool) {
         heap_pool_size = target;
+        /* Zero the pool — Windows HeapAlloc returns pages from VirtualAlloc
+         * which are always zeroed. PE32 code (TArray, FString) depends on
+         * freshly allocated memory being zero-initialized. */
+        memset(heap_pool, 0, target);
     } else {
         heap_pool = heap_pool_static;
         heap_pool_size = sizeof(heap_pool_static);
@@ -439,6 +443,7 @@ PVOID WINAPI HeapAlloc(HANDLE hHeap, DWORD dwFlags, SIZE_T dwBytes)
 
         BYTE *new_pool = (BYTE *)kmalloc(grow);
         if (new_pool) {
+            memset(new_pool, 0, grow);
             serial_puts("[HEAP] Auto-grow: +");
             serial_putdec(grow / (1024 * 1024));
             serial_puts(" MB (used ");
@@ -588,17 +593,31 @@ PVOID WINAPI GetProcAddress(HANDLE hModule, PCSTR lpProcName)
     return result;
 }
 
+/* Actual EXE ImageBase — set by winexec after pe_load */
+extern uint32_t g_exe_image_base;
+
 HANDLE WINAPI GetModuleHandleA(PCSTR lpModuleName)
 {
-    (void)lpModuleName;
-    /* Stub: return sentinel for the main exe */
-    return (HANDLE)(ULONG_PTR)0x00400000;
+    if (!lpModuleName) {
+        /* NULL → return main EXE module handle (= ImageBase) */
+        return (HANDLE)(ULONG_PTR)(g_exe_image_base ? g_exe_image_base : 0x10900000);
+    }
+    /* Named module: try DLL lookup */
+    extern PVOID dll_get_module_handle(const char *name);
+    PVOID h = dll_get_module_handle(lpModuleName);
+    return h ? (HANDLE)h : (HANDLE)(ULONG_PTR)(g_exe_image_base ? g_exe_image_base : 0x10900000);
 }
 
 HANDLE WINAPI GetModuleHandleW(PCWSTR lpModuleName)
 {
-    (void)lpModuleName;
-    return (HANDLE)(ULONG_PTR)0x00400000;
+    if (!lpModuleName)
+        return (HANDLE)(ULONG_PTR)(g_exe_image_base ? g_exe_image_base : 0x10900000);
+    /* Convert to ASCII and delegate */
+    char narrow[260];
+    int i = 0;
+    while (lpModuleName[i] && i < 259) { narrow[i] = (char)lpModuleName[i]; i++; }
+    narrow[i] = 0;
+    return GetModuleHandleA(narrow);
 }
 
 /* ── File extended API ──────────────────────────────────────── */

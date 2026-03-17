@@ -72,6 +72,7 @@ static uint32_t callback_return_stub_addr = 0;
 
 /* Stub for unresolved imports: XOR EAX,EAX; RET (returns 0) */
 static uint32_t unresolved_stub_addr = 0;
+static uint32_t compat32_data_area = 0;
 
 /*
  * Reentrant callback support.
@@ -268,7 +269,74 @@ void compat32_init(void)
         stub[2] = 0xC3;                   /* RET */
         unresolved_stub_addr = (uint32_t)(ULONG_PTR)stub;
     }
+
+    /*
+     * Data export area — MSVC CRT data imports (_acmdln, _adjust_fdiv, etc.)
+     * These are VARIABLES, not functions. PE32 code reads them directly via
+     * the IAT (mov eax,[IAT]; mov val,[eax]). They must live in 32-bit
+     * addressable memory, NOT be thunked.
+     *
+     * Layout (at thunk_pool end - 128):
+     *   +0:  int    _adjust_fdiv = 0
+     *   +4:  char*  _acmdln = &cmdline[0]
+     *   +8:  int    _commode = 0
+     *   +12: int    _fmode = 0
+     *   +16: int    __mb_cur_max = 1
+     *   +20: char   cmdline[64] = "UnrealTournament.exe"
+     */
+    {
+        uint8_t *data = thunk_pool + (THUNK_POOL_PAGES * 4096) - 256;
+        memset(data, 0, 128);
+        /* _adjust_fdiv at +0 */
+        *(int32_t *)(data + 0) = 0;
+        /* _acmdln at +4: points to cmdline string at +20 */
+        *(uint32_t *)(data + 4) = (uint32_t)(ULONG_PTR)(data + 20);
+        /* _commode at +8 */
+        *(int32_t *)(data + 8) = 0;
+        /* _fmode at +12 */
+        *(int32_t *)(data + 12) = 0;
+        /* __mb_cur_max at +16 */
+        *(int32_t *)(data + 16) = 1;
+        /* cmdline at +20 */
+        extern char win32_exe_name[64];
+        const char *cmd = win32_exe_name[0] ? win32_exe_name : "UnrealTournament.exe";
+        int ci = 0;
+        while (cmd[ci] && ci < 60) { data[20 + ci] = cmd[ci]; ci++; }
+        data[20 + ci] = 0;
+
+        compat32_data_area = (uint32_t)(ULONG_PTR)data;
+        serial_puts("[COMPAT32] Data exports at 0x");
+        serial_puthex(compat32_data_area, 8);
+        serial_puts("\n");
+    }
 #endif
+}
+
+/* ── Data export resolution ──────────────────────────────────
+ *
+ * Returns a 32-bit address for known CRT data imports.
+ * These are written directly to the IAT (no thunk).
+ * Returns 0 if not a data import.
+ */
+
+uint32_t compat32_resolve_data_import(const char *name)
+{
+    if (!compat32_data_area || !name) return 0;
+    /* Compare function names for known data imports */
+    if (name[0] == '_') {
+        if (name[1] == 'a' && name[2] == 'c' && name[3] == 'm' &&
+            name[4] == 'd' && name[5] == 'l' && name[6] == 'n' && name[7] == 0)
+            return compat32_data_area + 4;  /* _acmdln */
+        if (name[1] == 'a' && name[2] == 'd' && name[3] == 'j') /* _adjust_fdiv */
+            return compat32_data_area + 0;
+        if (name[1] == 'c' && name[2] == 'o' && name[3] == 'm') /* _commode */
+            return compat32_data_area + 8;
+        if (name[1] == 'f' && name[2] == 'm' && name[3] == 'o') /* _fmode */
+            return compat32_data_area + 12;
+    }
+    if (name[0] == '_' && name[1] == '_' && name[2] == 'm' && name[3] == 'b')
+        return compat32_data_area + 16;  /* __mb_cur_max */
+    return 0;
 }
 
 uint32_t compat32_make_thunk(uint64_t target, const char *name, uint8_t num_args)
@@ -789,14 +857,30 @@ NTSTATUS compat32_patch_iat(PE_IMAGE_INFO *info)
             if (shim) {
                 /*
                  * Import from a shim DLL (64-bit kernel code).
-                 * Create an INT 0x2E thunk to bridge 32-bit → 64-bit.
+                 * Check for DATA imports first — these are variables, not
+                 * functions. Write the 32-bit data address directly.
                  */
-                uint64_t target64 = (uint64_t)(ULONG_PTR)resolved;
-                uint8_t nargs = func_name ? guess_num_args(func_name) : 4;
-                uint32_t thunk_addr = compat32_make_thunk_ex(target64, func_name, nargs, cc);
-                if (thunk_addr) {
-                    iat_entry->u1.Function = thunk_addr;
-                    patched++;
+                uint32_t data_addr = func_name ?
+                    compat32_resolve_data_import(func_name) : 0;
+                if (data_addr) {
+                    iat_entry->u1.Function = data_addr;
+                    direct++;
+                    if (func_name) {
+                        serial_puts("[IAT-DATA] ");
+                        serial_puts(func_name);
+                        serial_puts(" → 0x");
+                        serial_puthex(data_addr, 8);
+                        serial_puts("\n");
+                    }
+                } else {
+                    /* Function import — create INT 0x2E thunk */
+                    uint64_t target64 = (uint64_t)(ULONG_PTR)resolved;
+                    uint8_t nargs = func_name ? guess_num_args(func_name) : 4;
+                    uint32_t thunk_addr = compat32_make_thunk_ex(target64, func_name, nargs, cc);
+                    if (thunk_addr) {
+                        iat_entry->u1.Function = thunk_addr;
+                        patched++;
+                    }
                 }
             } else {
                 /*

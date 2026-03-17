@@ -14,6 +14,9 @@
 #include "kernel32_shim.h"
 #include "msvcrt_shim.h"
 #include "dllloader.h"
+
+/* EXE ImageBase — used by GetModuleHandleA(NULL) */
+uint32_t g_exe_image_base;
 #include "advapi32_shim.h"
 #include "user32_shim.h"
 #include "gdi32_shim.h"
@@ -438,6 +441,7 @@ int winexec_run(const uint8_t *file_data, uint64_t file_size)
         return -1;
     }
 
+    g_exe_image_base = (uint32_t)(ULONG_PTR)info.ImageBase;
     serial_puts("[WINEXEC] PE loaded successfully\n");
     serial_puts("[WINEXEC] subsystem: ");
     serial_puthex(info.Subsystem, 4);

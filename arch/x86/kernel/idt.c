@@ -459,24 +459,22 @@ void isr_handler(interrupt_frame_t *frame)
                     serial_putdec(compat32_ticks);
                     /* Stack dump: read 4 dwords from EBP to find return chain */
                     if (compat32_ticks <= 501) {
+                        /* Read GIsRunning (Core.dll export at 0x101E5698) */
+                        volatile uint32_t *gis = (volatile uint32_t *)(uintptr_t)0x101E5698;
+                        serial_puts("\n  GIsRunning=");
+                        serial_putdec(*gis);
+                        /* Stack walk */
                         uint32_t ebp = (uint32_t)frame->rbp;
                         uint32_t *stk = (uint32_t *)(uintptr_t)ebp;
-                        serial_puts("\n  [EBP]=0x");
-                        serial_puthex(stk[0], 8);  /* saved EBP */
                         serial_puts(" [EBP+4]=0x");
-                        serial_puthex(stk[1], 8);  /* return addr */
-                        /* Walk one frame up */
-                        uint32_t *prev = (uint32_t *)(uintptr_t)stk[0];
+                        serial_puthex(stk[1], 8);
                         if (stk[0] > 0x10000 && stk[0] < 0x7FFFFFFF) {
-                            serial_puts("\n  caller [EBP]=0x");
-                            serial_puthex(prev[0], 8);
-                            serial_puts(" [EBP+4]=0x");
+                            uint32_t *prev = (uint32_t *)(uintptr_t)stk[0];
+                            serial_puts(" caller=0x");
                             serial_puthex(prev[1], 8);
-                            uint32_t *prev2 = (uint32_t *)(uintptr_t)prev[0];
                             if (prev[0] > 0x10000 && prev[0] < 0x7FFFFFFF) {
-                                serial_puts("\n  caller2 [EBP]=0x");
-                                serial_puthex(prev2[0], 8);
-                                serial_puts(" [EBP+4]=0x");
+                                uint32_t *prev2 = (uint32_t *)(uintptr_t)prev[0];
+                                serial_puts(" caller2=0x");
                                 serial_puthex(prev2[1], 8);
                             }
                         }
