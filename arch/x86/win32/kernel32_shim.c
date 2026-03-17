@@ -534,8 +534,12 @@ void WINAPI SetLastError(DWORD dwErrCode)
 
 /* ── Misc API ───────────────────────────────────────────────── */
 
+/* Forward declaration — defined in Thread API section */
+static void run_deferred_thread(void);
+
 void WINAPI Sleep(DWORD dwMilliseconds)
 {
+    run_deferred_thread();  /* cooperative yield point */
     LARGE_INTEGER delay;
     /* Negative = relative time in 100ns units */
     delay.QuadPart = -(LONGLONG)dwMilliseconds * 10000LL;
@@ -955,6 +959,36 @@ BOOL WINAPI TlsSetValue(DWORD dwTlsIndex, PVOID lpTlsValue)
 
 static DWORD g_thread_id_counter = 1;
 
+/*
+ * Deferred thread execution: CreateThread stores the function pointer;
+ * the thread runs cooperatively when the main thread next yields
+ * (Sleep, WaitForSingleObject, GetMessage). This avoids blocking
+ * the main thread inline while still executing the thread function.
+ */
+static LPTHREAD_START_ROUTINE g_deferred_thread_func;
+static PVOID                  g_deferred_thread_param;
+static HANDLE                 g_deferred_thread_handle;
+static int                    g_deferred_thread_pending;
+
+/* Run deferred thread if one is pending. Called from yield points. */
+extern uint32_t compat32_callback_args(uint32_t func_addr, int nargs,
+                                        const uint32_t *args);
+
+static void run_deferred_thread(void)
+{
+    if (!g_deferred_thread_pending) return;
+    g_deferred_thread_pending = 0;
+
+    serial_puts("[K32] Running deferred thread at 0x");
+    serial_puthex((uint32_t)(ULONG_PTR)g_deferred_thread_func, 8);
+    serial_puts("\n");
+
+    uint32_t arg = (uint32_t)(ULONG_PTR)g_deferred_thread_param;
+    compat32_callback_args((uint32_t)(ULONG_PTR)g_deferred_thread_func, 1, &arg);
+
+    serial_puts("[K32] Deferred thread returned\n");
+}
+
 HANDLE WINAPI CreateThread(PVOID lpThreadAttributes, SIZE_T dwStackSize,
                            LPTHREAD_START_ROUTINE lpStartAddress,
                            PVOID lpParameter, DWORD dwCreationFlags,
@@ -962,22 +996,32 @@ HANDLE WINAPI CreateThread(PVOID lpThreadAttributes, SIZE_T dwStackSize,
 {
     (void)lpThreadAttributes;
     (void)dwStackSize;
-    (void)dwCreationFlags;
-    (void)lpStartAddress;
-    (void)lpParameter;
 
-    /*
-     * Stub: return a pseudo thread handle without running the function.
-     * Cannot call lpStartAddress directly — it's 32-bit PE code and
-     * we're in 64-bit mode. Would need compat32_callback_args to invoke.
-     * For now, skip thread execution (splash animation, etc. non-critical).
-     */
     DWORD tid = ++g_thread_id_counter;
     if (lpThreadId) *lpThreadId = tid;
 
-    serial_puts("[K32] CreateThread: stub (not executing), tid=");
+    serial_puts("[K32] CreateThread: func=0x");
+    serial_puthex((uint32_t)(ULONG_PTR)lpStartAddress, 8);
+    serial_puts(" param=0x");
+    serial_puthex((uint32_t)(ULONG_PTR)lpParameter, 8);
+    serial_puts(" tid=");
     serial_putdec(tid);
-    serial_puts("\n");
+
+    if (dwCreationFlags & 0x4 /* CREATE_SUSPENDED */) {
+        serial_puts(" (SUSPENDED — stored)\n");
+        g_deferred_thread_func = lpStartAddress;
+        g_deferred_thread_param = lpParameter;
+        g_deferred_thread_handle = (HANDLE)(ULONG_PTR)tid;
+        g_deferred_thread_pending = 1;
+    } else {
+        serial_puts(" (running inline)\n");
+        /* Execute thread function immediately via compat32 callback.
+         * This blocks the main thread until the function returns.
+         * For UT99, the thread typically does quick init work. */
+        uint32_t arg = (uint32_t)(ULONG_PTR)lpParameter;
+        compat32_callback_args((uint32_t)(ULONG_PTR)lpStartAddress, 1, &arg);
+        serial_puts("[K32] Thread func returned\n");
+    }
 
     return (HANDLE)(ULONG_PTR)tid;
 }
@@ -1011,6 +1055,7 @@ BOOL WINAPI TerminateThread(HANDLE hThread, DWORD dwExitCode)
 
 DWORD WINAPI WaitForSingleObject(HANDLE hHandle, DWORD dwMilliseconds)
 {
+    run_deferred_thread();  /* cooperative yield point */
     extern NTSTATUS NtWaitForSingleObject(HANDLE, BOOL, PLARGE_INTEGER);
 
     LARGE_INTEGER timeout;
@@ -1369,12 +1414,14 @@ extern uint64_t idt_get_ticks(void);
 
 DWORD WINAPI GetTickCount(void)
 {
-    return (DWORD)idt_get_ticks();
+    /* APIC timer fires at 100Hz (1 tick = 10ms).
+     * Windows GetTickCount returns milliseconds. */
+    return (DWORD)(idt_get_ticks() * 10);
 }
 
 ULONGLONG WINAPI GetTickCount64(void)
 {
-    return (ULONGLONG)idt_get_ticks();
+    return (ULONGLONG)(idt_get_ticks() * 10);
 }
 
 void WINAPI GetSystemTimeAsFileTime(PVOID lpSystemTimeAsFileTime)

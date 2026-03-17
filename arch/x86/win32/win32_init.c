@@ -143,7 +143,7 @@ static void idt_install_int2e(void)
     idt[vec].offset_high = (uint32_t)((addr >> 32) & 0xFFFFFFFF);
     idt[vec].selector    = cs;
     idt[vec].ist         = 1;     /* IST1: dedicated stack (avoids user stack pollution) */
-    idt[vec].type_attr   = 0x8E;  /* present, DPL=0, 64-bit interrupt gate */
+    idt[vec].type_attr   = 0x8F;  /* present, DPL=0, 64-bit trap gate (preserves IF) */
     idt[vec].reserved    = 0;
 
     serial_puts("[WIN32] IDT vector 0x2E → int2e_stub at 0x");
