@@ -535,18 +535,10 @@ void isr_handler(interrupt_frame_t *frame)
             serial_puthex(frame->rsp, 8);
             serial_puts("\n");
         }
-        /* Restore and re-execute (DON'T clear — catch ALL assertions) */
+        /* One-shot: restore and re-execute, don't re-arm */
         *(uint8_t *)(uintptr_t)g_swbreak_addr = g_swbreak_saved;
         frame->rip = g_swbreak_addr;
-        /* Re-arm after single-step: set TF to re-patch after one instruction */
-        frame->rflags |= (1ULL << 8);  /* TF */
-        return;
-    }
-    /* Re-arm INT3 after single-step from appFailAssert */
-    if (vec == 1 && g_swbreak_addr) {
-        *(uint8_t *)(uintptr_t)g_swbreak_addr = 0xCC;
-        frame->rflags &= ~(1ULL << 8);
-        __asm__ volatile ("mov %0, %%dr6" : : "r"((uint64_t)0));
+        g_swbreak_addr = 0;
         return;
     }
 

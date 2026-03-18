@@ -713,24 +713,6 @@ int winexec_run(const uint8_t *file_data, uint64_t file_size)
         uint32_t entry32 = (uint32_t)(ULONG_PTR)info.EntryPoint;
         uint32_t sp32    = (uint32_t)(ULONG_PTR)stack_top;
 
-        /* Intercept appMsgf (Core.dll 0x1010167C) to see engine errors */
-        {
-            extern uint8_t g_swbreak_saved;
-            extern uint32_t g_swbreak_addr;
-            /* appMsgf is a JMP thunk — follow it */
-            uint8_t *code = (uint8_t *)(uintptr_t)0x1010167C;
-            uint32_t target = 0x1010167C;
-            if (code[0] == 0xE9) {
-                int32_t rel = *(int32_t *)(code + 1);
-                target = 0x1010167C + 5 + rel;
-            }
-            g_swbreak_saved = *(uint8_t *)(uintptr_t)target;
-            g_swbreak_addr = target;
-            *(uint8_t *)(uintptr_t)target = 0xCC;
-            serial_puts("[WINEXEC] SW BP at appMsgf target 0x");
-            serial_puthex(target, 8);
-            serial_puts("\n");
-        }
 
         compat32_enter(entry32, sp32);
     } else {
