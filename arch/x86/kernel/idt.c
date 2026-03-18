@@ -612,27 +612,18 @@ void isr_handler(interrupt_frame_t *frame)
                     serial_puthex(frame->rbp, 8);
                     serial_puts(" t=");
                     serial_putdec(compat32_ticks);
-                    /* Stack dump: read 4 dwords from EBP to find return chain */
-                    if (compat32_ticks <= 501) {
-                        volatile uint32_t *gis = (volatile uint32_t *)(uintptr_t)0x101E5698;
-                        /* Read GIsClient and GIsEditor from their Core.dll addresses */
-                        volatile uint32_t *iat_client = (volatile uint32_t *)(uintptr_t)0x10958C44;
-                        volatile uint32_t *iat_editor = (volatile uint32_t *)(uintptr_t)0x10958C48;
-                        uint32_t client_addr = *iat_client;
-                        uint32_t editor_addr = *iat_editor;
-                        serial_puts("\n  GIsRunning=");
-                        serial_putdec(*gis);
-                        serial_puts(" GIsClient@0x");
-                        serial_puthex(client_addr, 8);
-                        if (client_addr > 0x10000 && client_addr < 0x7FFFFFFF) {
-                            serial_puts("=");
-                            serial_putdec(*(volatile uint32_t *)(uintptr_t)client_addr);
-                        }
-                        serial_puts(" GIsEditor@0x");
-                        serial_puthex(editor_addr, 8);
-                        if (editor_addr > 0x10000 && editor_addr < 0x7FFFFFFF) {
-                            serial_puts("=");
-                            serial_putdec(*(volatile uint32_t *)(uintptr_t)editor_addr);
+                    if (compat32_ticks <= 301) {
+                        /* Read GErrorHist to capture engine error message */
+                        volatile uint32_t *iat_hist = (volatile uint32_t *)(uintptr_t)0x10958C60;
+                        uint32_t hist_addr = *iat_hist;
+                        if (hist_addr > 0x10000 && hist_addr < 0x7FFFFFFF) {
+                            const uint16_t *ws = (const uint16_t *)(uintptr_t)hist_addr;
+                            if (ws[0] != 0) {
+                                serial_puts("\n  GErrorHist=\"");
+                                for (int k = 0; k < 200 && ws[k]; k++)
+                                    serial_puts((const char[]){(char)(ws[k] & 0x7F), 0});
+                                serial_puts("\"");
+                            }
                         }
                         /* Deep stack walk for stuck analysis */
                         if (compat32_ticks >= 201 && compat32_ticks <= 301) {
