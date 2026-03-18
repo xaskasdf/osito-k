@@ -1288,15 +1288,20 @@ PVOID seh32_ep_addr_for_filter(void)
 
 int compat32_seh_dispatch(PEXCEPTION_RECORD ExceptionRecord)
 {
-    /* Guard against reentrant catch dispatch.
-     * When a catch handler runs and throws another exception (e.g.,
-     * appUnwindf calls appThrowf), we must NOT dispatch to another catch
-     * because the unwind globals are already set for the first catch.
-     * Suppress nested exceptions to prevent double-dispatch corruption. */
+    /* Track reentrant catch dispatch.
+     * When a catch handler throws (e.g., appUnwindf re-throws), skip the
+     * current frame (which is corrupted by the first dispatch) and start
+     * searching from the NEXT frame in the SEH chain. */
     static int in_catch_dispatch = 0;
+    static uint32_t catch_frame_addr = 0;  /* frame that caught first exception */
     if (in_catch_dispatch) {
-        serial_puts("[SEH32] SUPPRESSED nested exception during catch\n");
-        return 1;  /* pretend handled */
+        serial_puts("[SEH32] Re-throw from catch — skipping to next frame\n");
+        in_catch_dispatch = 0;
+        /* Advance past the catching frame */
+        if (catch_frame_addr != 0 && catch_frame_addr != 0xFFFFFFFF) {
+            uint32_t *cf = (uint32_t *)(ULONG_PTR)catch_frame_addr;
+            g_teb32.ExceptionList = cf[0];  /* skip to next */
+        }
     }
 
     /* Read the 32-bit ExceptionList from TEB32.
@@ -1514,7 +1519,15 @@ int compat32_seh_dispatch(PEXCEPTION_RECORD ExceptionRecord)
         } else {
             /*
              * PE32 handler — not in our thunk table.
-             *
+             * Skip NULL/corrupted handlers (can happen when catch handler
+             * locals overlap with the SEH registration at [EBP-8]).
+             */
+            if (handler32 == 0) {
+                serial_puts(" (NULL — corrupted, skipping)\n");
+                goto next_frame;
+            }
+
+            /*
              * Check for MSVC C++ EH handler thunk pattern:
              *   B8 xx xx xx xx    MOV EAX, <FuncInfo_ptr>
              *   E9 xx xx xx xx    JMP <__CxxFrameHandler>
@@ -1625,8 +1638,12 @@ int compat32_seh_dispatch(PEXCEPTION_RECORD ExceptionRecord)
                         /* Update state to catchHigh (after the catch block) */
                         frame32[2] = (uint32_t)((int32_t)tb[2]);
 
-                        /* Restore SEH chain */
-                        g_teb32.ExceptionList = frame_addr;
+                        /* Unwind SEH chain to the NEXT frame after the catcher.
+                         * Windows removes all frames up to and including the
+                         * catching frame. The catch handler's locals overlap
+                         * with the SEH registration at [EBP-4/-8/-C], so the
+                         * frame must be unlinked before the handler runs. */
+                        g_teb32.ExceptionList = next32;
 
                         /* EBP for the catch handler = frame_addr + 0x0C
                          * (C++ EH frame is 3 fields: Next+Handler+State = 12 bytes) */
@@ -1654,6 +1671,7 @@ int compat32_seh_dispatch(PEXCEPTION_RECORD ExceptionRecord)
                          * restore EBP before jumping to the handler.
                          */
                         in_catch_dispatch = 1;
+                        catch_frame_addr = frame_addr;
                         g_compat32_unwind_eip = catch_handler;
                         /*
                          * The catch handler epilog does:
@@ -1677,34 +1695,16 @@ int compat32_seh_dispatch(PEXCEPTION_RECORD ExceptionRecord)
                          * their own stack (below ESP), and the pops at epilog
                          * restore correct values before mov esp,ebp resets ESP.
                          */
-                        /* Write saved regs at EBP-12, EBP-8, EBP-4 area
-                         * which is the SEH registration (Next, Handler, State).
-                         * These are no longer needed after catch dispatch. */
-                        uint32_t *ebp_area = (uint32_t *)(uintptr_t)catch_ebp;
-
-                        /*
-                         * Read callee-saved registers from the establishing
-                         * function's stack. MSVC prologue stores ESP after
-                         * all pushes at [EBP-0x10]:
-                         *   [saved_esp + 0] = EDI
-                         *   [saved_esp + 4] = ESI
-                         *   [saved_esp + 8] = EBX
-                         */
-                        uint32_t saved_esp_val = ebp_area[-4]; /* [EBP-0x10] */
-                        uint32_t *reg_area = (uint32_t *)(uintptr_t)(catch_ebp - 12);
-
-                        if (saved_esp_val >= 0x10000 && saved_esp_val < catch_ebp) {
-                            uint32_t *saved = (uint32_t *)(uintptr_t)saved_esp_val;
-                            reg_area[0] = saved[0];  /* EDI */
-                            reg_area[1] = saved[1];  /* ESI */
-                            reg_area[2] = saved[2];  /* EBX */
-                        } else {
-                            reg_area[0] = 0;
-                            reg_area[1] = 0;
-                            reg_area[2] = 0;
-                        }
-
-                        g_compat32_unwind_esp = catch_ebp - 12;
+                        /* C++ EH catch handler: EBP = frame_addr + 0x0C.
+                         * DON'T write callee-saved regs at EBP-12 = frame_addr
+                         * because that overwrites the SEH registration record
+                         * (Next, Handler, State) needed for re-throw dispatch.
+                         *
+                         * The catch handler in MSVC gets EBP from the establishing
+                         * function. Its epilog does mov esp,ebp; pop ebp; ret.
+                         * We set ESP = EBP (the handler allocates its own locals
+                         * below ESP as needed). */
+                        g_compat32_unwind_esp = catch_ebp;
                         g_compat32_unwind_ebp = catch_ebp;
 
                         return 1;  /* handled — INT2E will apply unwind */
