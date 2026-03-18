@@ -474,30 +474,6 @@ int winexec_run(const uint8_t *file_data, uint64_t file_size)
         serial_puts("\n");
     }
 
-    /* INT3 at 0x109090BC: write under Win32 CR3 to ensure QEMU TCG
-     * self-modifying code detection picks it up for the right AS */
-    {
-        extern uint8_t g_swbreak_saved;
-        extern uint32_t g_swbreak_addr;
-        extern uint64_t paging_get_win32_cr3(void);
-        uint64_t w32cr3 = paging_get_win32_cr3();
-        uint64_t old_cr3;
-        __asm__ volatile ("mov %%cr3, %0" : "=r"(old_cr3));
-        /* Switch to Win32 CR3 for the write */
-        if (w32cr3)
-            __asm__ volatile ("mov %0, %%cr3" : : "r"(w32cr3) : "memory");
-        g_swbreak_saved = *(volatile uint8_t *)(uintptr_t)0x1091ABB5;
-        g_swbreak_addr = 0x1091ABB5;
-        *(volatile uint8_t *)(uintptr_t)0x1091ABB5 = 0xCC;
-        /* Verify the write */
-        uint8_t verify = *(volatile uint8_t *)(uintptr_t)0x109090BC;
-        /* Switch back to kernel CR3 */
-        __asm__ volatile ("mov %0, %%cr3" : : "r"(old_cr3) : "memory");
-        serial_puts("[WINEXEC] INT3 at 0x109090BC under Win32 CR3, verify=0x");
-        serial_puthex(verify, 2);
-        serial_puts("\n");
-    }
-
     /* Pre-load all DLLs from filesystem (registers native classes) */
     winexec_preload_dlls();
 
@@ -690,11 +666,18 @@ int winexec_run(const uint8_t *file_data, uint64_t file_size)
         }
     }
 
-    /* Allocate user stack */
+    /* Allocate user stack — MUST be zeroed.
+     * On Windows, stack pages come from VirtualAlloc (MEM_COMMIT) which
+     * always zeroes pages. PE32 code relies on this: local variables of
+     * class types (FString, TArray) have constructors that expect zeroed
+     * memory for their fields (Data=NULL, ArrayNum=0, ArrayMax=0).
+     * Without zeroing, destructors read garbage → REP MOVSD 4GB hang. */
     uint64_t stack_size = info.StackCommit;
     if (stack_size < 65536) stack_size = 65536;  /* minimum 64KB */
     uint64_t stack_pages = (stack_size + 0xFFF) / 4096;
     uint8_t *stack_base = (uint8_t *)mem_alloc_pages(stack_pages);
+    if (stack_base)
+        memset(stack_base, 0, stack_pages * 4096);
 
     if (!stack_base) {
         serial_puts("[WINEXEC] failed to allocate stack\n");
