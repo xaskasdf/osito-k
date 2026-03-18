@@ -121,12 +121,17 @@ static PVOID win32_va_alloc(SIZE_T size, uint64_t *out_phys)
     void *phys = mem_alloc_pages(pages);
     if (!phys) return NULL;
 
-    uint64_t va = win32_va_next;
-    if (va + size > WIN32_VA_LIMIT) {
+    /* Align VA to 64KB boundary — Windows VirtualAlloc guarantees
+     * dwAllocationGranularity (64KB) alignment. FMallocWindows's
+     * binned pool allocator uses (ptr >> 16) & 0xFF for pool index;
+     * without 64KB alignment, pool lookups corrupt free-lists. */
+    uint64_t va = (win32_va_next + 0xFFFF) & ~0xFFFFULL;
+    uint64_t va_end = va + size;
+    if (va_end > WIN32_VA_LIMIT) {
         mem_free_pages(phys, pages);
         return NULL;
     }
-    win32_va_next = va + size;
+    win32_va_next = va_end;
 
     /* Map each 4KB page in Win32 page table ONLY (not kernel).
      * This prevents identity-mapping aliasing: kernel can't see
