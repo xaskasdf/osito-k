@@ -70,6 +70,15 @@ void WINAPI _initterm(_PVFV *pfbegin, _PVFV *pfend)
     serial_puts("[MSVCRT] _initterm done: ");
     serial_putdec(cb_count);
     serial_puts(" callbacks executed\n");
+
+    /* Diagnostic: check FMallocWindows vtable after EXE _initterm */
+    if ((uint64_t)(ULONG_PTR)begin32 >= 0x10920000 &&
+        (uint64_t)(ULONG_PTR)begin32 <= 0x10930000) {
+        volatile uint32_t *vtable = (volatile uint32_t *)(uintptr_t)0x1092F738;
+        serial_puts("[DIAG] FMallocWindows vtable = 0x");
+        serial_puthex(*vtable, 8);
+        serial_puts("\n");
+    }
 #else
     for (_PVFV *pfn = pfbegin; pfn < pfend; pfn++) {
         if (*pfn)

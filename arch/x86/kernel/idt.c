@@ -526,10 +526,15 @@ void isr_handler(interrupt_frame_t *frame)
                     serial_putdec(compat32_ticks);
                     /* Stack dump: read 4 dwords from EBP to find return chain */
                     if (compat32_ticks <= 501) {
-                        /* Read GIsRunning (Core.dll export at 0x101E5698) */
                         volatile uint32_t *gis = (volatile uint32_t *)(uintptr_t)0x101E5698;
+                        volatile uint32_t *vtbl_va = (volatile uint32_t *)(uintptr_t)0x1092F738;
+                        volatile uint32_t *vtbl_pa = (volatile uint32_t *)(uintptr_t)0x01F02738;
                         serial_puts("\n  GIsRunning=");
                         serial_putdec(*gis);
+                        serial_puts(" vtbl_VA=0x");
+                        serial_puthex(*vtbl_va, 8);
+                        serial_puts(" vtbl_PA=0x");
+                        serial_puthex(*vtbl_pa, 8);
                         /* Stack walk */
                         uint32_t ebp = (uint32_t)frame->rbp;
                         uint32_t *stk = (uint32_t *)(uintptr_t)ebp;
