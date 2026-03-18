@@ -2247,6 +2247,12 @@ void shell_run(void)
     if (xhci_is_ready()) sh_puts_color(" | USB", 0x00666666);
     sh_puts_color("]\n\n", 0x00666666);
 
+    /* Auto-launch UT99 if osfs2 is mounted and UnrealTournament.exe exists */
+    if (osfs2_is_mounted() && osfs2_find("UnrealTournament.exe")) {
+        sh_puts(" Auto-launching UnrealTournament.exe...\n");
+        shell_exec("winexec UnrealTournament.exe");
+    }
+
     for (;;) {
         int len = term_readline("osito> ", line, sizeof(line));
 

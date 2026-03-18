@@ -1053,8 +1053,25 @@ void isr_handler(interrupt_frame_t *frame)
 
             int handled = compat32_seh_dispatch((void *)&er64);
             if (handled) {
+                /* Apply unwind globals to the iretq frame.
+                 * int2e_stub.S does this for software exceptions (lines 77-96);
+                 * we must do it here for hardware exceptions since
+                 * isr_stubs.S doesn't check unwind globals. */
+                extern uint32_t g_compat32_unwind_eip;
+                extern uint32_t g_compat32_unwind_esp;
+                extern uint32_t g_compat32_unwind_ebp;
+
+                if (g_compat32_unwind_eip) {
+                    frame->rip = g_compat32_unwind_eip;
+                    frame->rsp = g_compat32_unwind_esp;
+                    frame->rbp = g_compat32_unwind_ebp;
+                    g_compat32_unwind_eip = 0;
+                    g_compat32_unwind_esp = 0;
+                    g_compat32_unwind_ebp = 0;
+                }
+
                 serial_puts("  [WIN32] SEH handled — resuming via unwind\n");
-                return;  /* unwind globals set → iretq redirects to handler */
+                return;  /* iretq will now jump to catch handler */
             }
             serial_puts("  [WIN32] SEH unhandled — falling through to recovery\n");
         }
