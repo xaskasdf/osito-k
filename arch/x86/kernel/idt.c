@@ -978,55 +978,92 @@ void isr_handler(interrupt_frame_t *frame)
             }
         }
 
-        /* Compat32 crash recovery: if a Win32 app crashes, longjmp back
-         * to the shell instead of halting. winexec sets the jmpbuf. */
+        /* Compat32 exception dispatch: for hardware exceptions in PE32 code,
+         * dispatch to the 32-bit SEH chain FIRST. This lets the engine's
+         * __except filters catch #PF/#UD/#GP and handle them properly
+         * (e.g., "General protection fault!" with call stack history).
+         *
+         * On Windows, the kernel dispatches hardware exceptions to the
+         * user-mode SEH chain. We replicate this by calling
+         * compat32_seh_dispatch() with the appropriate EXCEPTION_RECORD.
+         *
+         * If no SEH handler catches it, fall through to crash recovery. */
+        if ((frame->cs & 0xFFFF) == 0x40 || (frame->cs & 0xFFFF) == 0x23) {
+            /* Build EXCEPTION_RECORD for PE32 SEH dispatch */
+            typedef struct {
+                uint32_t ExceptionCode;
+                uint32_t ExceptionFlags;
+                uint32_t ExceptionRecord;
+                uint32_t ExceptionAddress;
+                uint32_t NumberParameters;
+                uint32_t ExceptionInformation[15];
+            } EXCEPTION_RECORD32;
+
+            EXCEPTION_RECORD32 er;
+            for (int i = 0; i < (int)sizeof(er)/4; i++)
+                ((uint32_t *)&er)[i] = 0;
+
+            if (vec == 14) {
+                /* #PF → STATUS_ACCESS_VIOLATION (but NOT for NULL page writes) */
+                uint64_t cr2;
+                __asm__ volatile ("mov %%cr2, %0" : "=r"(cr2));
+                if (cr2 < 0x1000) goto compat32_null_recovery; /* keep NULL page handling */
+                er.ExceptionCode = 0xC0000005;  /* STATUS_ACCESS_VIOLATION */
+                er.NumberParameters = 2;
+                er.ExceptionInformation[0] = (frame->error_code & 2) ? 1 : 0;
+                er.ExceptionInformation[1] = (uint32_t)cr2;
+            } else if (vec == 6) {
+                er.ExceptionCode = 0xC000001D;  /* STATUS_ILLEGAL_INSTRUCTION */
+            } else if (vec == 13) {
+                er.ExceptionCode = 0xC0000005;  /* STATUS_ACCESS_VIOLATION */
+            } else {
+                goto compat32_null_recovery;  /* other vectors: use old recovery */
+            }
+            er.ExceptionAddress = (uint32_t)frame->rip;
+            er.ExceptionFlags = 0;  /* continuable */
+
+            serial_puts("  [WIN32] Dispatching to PE32 SEH: code=0x");
+            serial_puthex(er.ExceptionCode, 8);
+            serial_puts(" addr=0x");
+            serial_puthex(er.ExceptionAddress, 8);
+            serial_puts("\n");
+
+            /* Dispatch to PE32 SEH chain */
+            extern int compat32_seh_dispatch(void *ExceptionRecord);
+            /* Cast to the 64-bit EXCEPTION_RECORD expected by dispatch.
+             * Build a temporary 64-bit version from our 32-bit one. */
+            typedef struct {
+                uint32_t ExceptionCode;
+                uint32_t ExceptionFlags;
+                uint64_t ExceptionRecord;
+                uint64_t ExceptionAddress;
+                uint32_t NumberParameters;
+                uint32_t pad;
+                uint64_t ExceptionInformation[15];
+            } EXCEPTION_RECORD64;
+            EXCEPTION_RECORD64 er64;
+            for (int i = 0; i < (int)sizeof(er64)/4; i++)
+                ((uint32_t *)&er64)[i] = 0;
+            er64.ExceptionCode = er.ExceptionCode;
+            er64.ExceptionFlags = er.ExceptionFlags;
+            er64.ExceptionAddress = (uint64_t)er.ExceptionAddress;
+            er64.NumberParameters = er.NumberParameters;
+            for (uint32_t i = 0; i < er.NumberParameters && i < 15; i++)
+                er64.ExceptionInformation[i] = er.ExceptionInformation[i];
+
+            int handled = compat32_seh_dispatch((void *)&er64);
+            if (handled) {
+                serial_puts("  [WIN32] SEH handled — resuming via unwind\n");
+                return;  /* unwind globals set → iretq redirects to handler */
+            }
+            serial_puts("  [WIN32] SEH unhandled — falling through to recovery\n");
+        }
+compat32_null_recovery:
+        /* Legacy crash recovery: longjmp back to shell */
         {
             extern uint64_t *compat32_crash_jmpbuf;
             extern void kern_longjmp(uint64_t *buf, int val);
             if (compat32_crash_jmpbuf) {
-                /*
-                 * Null vtable recovery: if the crash is from calling through
-                 * a null vtable pointer (RIP in low memory from [0x00000000]),
-                 * skip the call and continue PE execution. This happens when
-                 * an Unreal object was allocated but its constructor didn't
-                 * set the vtable (vtable=0 → [0]=garbage → #UD).
-                 *
-                 * Recovery: pop the return address from the 32-bit stack,
-                 * set EAX=0 (return 0 from the virtual call), and resume.
-                 */
-                /* Detect crash from null/corrupt vtable: RIP below PE load area.
-                 * Limit to 3 recoveries — beyond that, corruption is too deep. */
-                static int null_vcall_skip_count = 0;
-                if ((vec == 6 || vec == 13) &&
-                    frame->rip < 0x02000000 &&
-                    (frame->cs == 0x40 || frame->cs == 0x23) &&
-                    null_vcall_skip_count < 3) {
-                    null_vcall_skip_count++;
-                    uint32_t obj_addr = (uint32_t)frame->rax;
-                    serial_puts("  [WIN32] Null vtable call: obj=0x");
-                    serial_puthex(obj_addr, 8);
-                    if (obj_addr >= 0x10000 && obj_addr < 0x80000000UL) {
-                        uint32_t *obj = (uint32_t *)(uintptr_t)obj_addr;
-                        serial_puts(" vtbl=0x");
-                        serial_puthex(obj[0], 8);
-                    }
-                    serial_puts("\n");
-
-                    /* Pop return address from 32-bit stack */
-                    uint32_t *esp32 = (uint32_t *)(uintptr_t)(uint32_t)frame->rsp;
-                    uint32_t ret_addr = esp32[0];
-                    frame->rsp += 4;  /* pop return address */
-
-                    /* Also pop stdcall args if present (the push 1 before call) */
-                    /* Don't pop args — the caller pushed them and will clean up */
-
-                    frame->rip = ret_addr;
-                    frame->rax = 0;  /* return 0 from the "virtual call" */
-                    serial_puts("  [WIN32] Skipping null vcall → resuming at 0x");
-                    serial_puthex(ret_addr, 8);
-                    serial_puts("\n");
-                    return;  /* resume PE execution */
-                }
                 serial_puts("  [WIN32] Crash recovery — returning to shell\n");
                 uint64_t *jmp = compat32_crash_jmpbuf;
                 compat32_crash_jmpbuf = NULL;
