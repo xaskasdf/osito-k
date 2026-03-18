@@ -438,29 +438,54 @@ void isr_handler(interrupt_frame_t *frame)
 {
     uint64_t vec = frame->vector;
 
+    /* Log ALL compat32 exceptions (not timer/keyboard) for debugging */
+    if (vec < 32 && (frame->cs & 0xFFFF) == 0x40 && vec != 1 && vec != 3) {
+        static int exc_count = 0;
+        exc_count++;
+        if (exc_count <= 20) {
+            serial_puts("[EXC32] vec=");
+            serial_putdec(vec);
+            serial_puts(" RIP=0x");
+            serial_puthex(frame->rip, 8);
+            serial_puts(" err=0x");
+            serial_puthex(frame->error_code, 4);
+            if (vec == 14) {
+                uint64_t cr2;
+                __asm__ volatile ("mov %%cr2, %0" : "=r"(cr2));
+                serial_puts(" CR2=0x");
+                serial_puthex(cr2, 8);
+            }
+            serial_puts(" #");
+            serial_putdec(exc_count);
+            serial_puts("\n");
+        }
+    }
+
     /* #BP (INT3) — software breakpoint for tracing PE32 execution */
     if (vec == 3 && g_swbreak_addr && (uint32_t)frame->rip == g_swbreak_addr + 1) {
         serial_puts("[SWBREAK] Hit at 0x");
         serial_puthex(g_swbreak_addr, 8);
         /* Dump context based on breakpoint location */
-        /* appMsgf: read wide format string from stack */
-        {
-            uint32_t *sp = (uint32_t *)(uintptr_t)(frame->rsp & 0xFFFFFFFF);
-            /* cdecl: [esp+0]=retaddr, [esp+4]=fmt (wide string) */
-            uint32_t fmt_ptr = sp[1];
-            if (fmt_ptr > 0x10000 && fmt_ptr < 0x7FFFFFFF) {
-                const uint16_t *ws = (const uint16_t *)(uintptr_t)fmt_ptr;
-                serial_puts("\n[appMsgf] \"");
-                for (int k = 0; k < 120 && ws[k]; k++) {
+        if (g_swbreak_addr == 0x10909E92) {
+            /* WinMain catch(...) handler — dump GErrorHist */
+            serial_puts("\n[CATCH] WinMain catch(...) handler hit!\n");
+            /* GErrorHist is at IAT 0x10958C60 → points to WCHAR[] buffer */
+            volatile uint32_t *iat = (volatile uint32_t *)(uintptr_t)0x10958C60;
+            uint32_t hist_ptr = *iat;
+            if (hist_ptr > 0x10000 && hist_ptr < 0x7FFFFFFF) {
+                const uint16_t *ws = (const uint16_t *)(uintptr_t)hist_ptr;
+                serial_puts("[CATCH] GErrorHist: \"");
+                for (int k = 0; k < 500 && ws[k]; k++) {
                     char ch = (char)(ws[k] & 0x7F);
                     serial_puts((const char[]){ch, 0});
                 }
-                serial_puts("\"\n  caller=0x");
-                serial_puthex(sp[0], 8);
-                serial_puts("\n");
+                serial_puts("\"\n");
+            } else {
+                serial_puts("[CATCH] GErrorHist ptr=0x");
+                serial_puthex(hist_ptr, 8);
+                serial_puts(" (invalid)\n");
             }
-        }
-        if (g_swbreak_addr == 0x10902A6C) {
+        } else if (g_swbreak_addr == 0x10902A6C) {
             /* FMallocWindows::Free — log ptr being freed */
             uint32_t *sp = (uint32_t *)(uintptr_t)(frame->rsp & 0xFFFFFFFF);
             /* thiscall: ECX=this, [ESP+4]=ptr (after the PUSH EBP; MOV EBP,ESP; ...; prologue
