@@ -74,6 +74,9 @@ static uint32_t callback_return_stub_addr = 0;
 static uint32_t unresolved_stub_addr = 0;
 static uint32_t compat32_data_area = 0;
 
+/* Stub for C++ catch funclet return: JMP EAX (continues at funclet's return value) */
+static uint32_t catch_continue_stub_addr = 0;
+
 /*
  * Reentrant callback support.
  *
@@ -268,6 +271,18 @@ void compat32_init(void)
         stub[0] = 0x31; stub[1] = 0xC0;  /* XOR EAX, EAX */
         stub[2] = 0xC3;                   /* RET */
         unresolved_stub_addr = (uint32_t)(ULONG_PTR)stub;
+    }
+
+    /* Catch continuation stub: JMP EAX
+     * MSVC catch funclets return with EAX = continuation address.
+     * This stub is used as the return address for catch funclets —
+     * when the funclet does RET, it pops this stub's address, and
+     * JMP EAX continues execution at the establishing function's
+     * code after the try/catch block. */
+    {
+        uint8_t *stub = thunk_pool + (THUNK_POOL_PAGES * 4096) - 40;
+        stub[0] = 0xFF; stub[1] = 0xE0;  /* JMP EAX */
+        catch_continue_stub_addr = (uint32_t)(ULONG_PTR)stub;
     }
 
     /*
@@ -1696,17 +1711,25 @@ int compat32_seh_dispatch(PEXCEPTION_RECORD ExceptionRecord)
                          * their own stack (below ESP), and the pops at epilog
                          * restore correct values before mov esp,ebp resets ESP.
                          */
-                        /* C++ EH catch handler: EBP = frame_addr + 0x0C.
-                         * DON'T write callee-saved regs at EBP-12 = frame_addr
-                         * because that overwrites the SEH registration record
-                         * (Next, Handler, State) needed for re-throw dispatch.
+                        /* MSVC catch funclet:
+                         * - Gets EBP from establishing function
+                         * - Does work (error handling)
+                         * - Sets EAX = continuation address
+                         * - Does RET (returns to caller)
                          *
-                         * The catch handler in MSVC gets EBP from the establishing
-                         * function. Its epilog does mov esp,ebp; pop ebp; ret.
-                         * We set ESP = EBP (the handler allocates its own locals
-                         * below ESP as needed). */
-                        g_compat32_unwind_esp = catch_ebp;
-                        g_compat32_unwind_ebp = catch_ebp;
+                         * We push catch_continue_stub_addr as return address
+                         * so the funclet's RET jumps to our stub (JMP EAX)
+                         * which continues at the funclet's chosen address.
+                         *
+                         * Stack layout at funclet entry:
+                         *   [ESP+0] = catch_continue_stub_addr (return addr)
+                         */
+                        {
+                            uint32_t esp = catch_ebp - 4;
+                            *(uint32_t *)(uintptr_t)esp = catch_continue_stub_addr;
+                            g_compat32_unwind_esp = esp;
+                            g_compat32_unwind_ebp = catch_ebp;
+                        }
 
                         return 1;  /* handled — INT2E will apply unwind */
                     }
