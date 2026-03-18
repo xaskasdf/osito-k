@@ -443,7 +443,40 @@ void isr_handler(interrupt_frame_t *frame)
         serial_puts("[SWBREAK] Hit at 0x");
         serial_puthex(g_swbreak_addr, 8);
         /* Dump context based on breakpoint location */
-        if (g_swbreak_addr == 0x10915038) {
+        /* appMsgf: read wide format string from stack */
+        {
+            uint32_t *sp = (uint32_t *)(uintptr_t)(frame->rsp & 0xFFFFFFFF);
+            /* cdecl: [esp+0]=retaddr, [esp+4]=fmt (wide string) */
+            uint32_t fmt_ptr = sp[1];
+            if (fmt_ptr > 0x10000 && fmt_ptr < 0x7FFFFFFF) {
+                const uint16_t *ws = (const uint16_t *)(uintptr_t)fmt_ptr;
+                serial_puts("\n[appMsgf] \"");
+                for (int k = 0; k < 120 && ws[k]; k++) {
+                    char ch = (char)(ws[k] & 0x7F);
+                    serial_puts((const char[]){ch, 0});
+                }
+                serial_puts("\"\n  caller=0x");
+                serial_puthex(sp[0], 8);
+                serial_puts("\n");
+            }
+        }
+        if (g_swbreak_addr == 0x10902A6C) {
+            /* FMallocWindows::Free — log ptr being freed */
+            uint32_t *sp = (uint32_t *)(uintptr_t)(frame->rsp & 0xFFFFFFFF);
+            /* thiscall: ECX=this, [ESP+4]=ptr (after the PUSH EBP; MOV EBP,ESP; ...; prologue
+             * but we're at 0x10902A6C which is AFTER prologue, so [EBP+8]=ptr) */
+            static int free_log = 0;
+            free_log++;
+            if (free_log <= 5 || free_log == 100 || free_log == 1000) {
+                uint32_t ebp_val = (uint32_t)frame->rbp;
+                uint32_t ptr = *(uint32_t *)(uintptr_t)(ebp_val + 8);
+                serial_puts(" Free(0x");
+                serial_puthex(ptr, 8);
+                serial_puts(") #");
+                serial_putdec(free_log);
+            }
+            serial_puts("\n");
+        } else if (g_swbreak_addr == 0x10915038) {
             /* __except handler: dump EBP chain to find what threw */
             uint32_t ebp = (uint32_t)frame->rbp;
             serial_puts("\n[EXCEPT] __except handler fired!");
@@ -515,7 +548,7 @@ void isr_handler(interrupt_frame_t *frame)
 
             if (cs == 0x40) {
                 compat32_ticks++;
-                if ((compat32_ticks % 500) == 1) {  /* every ~5s */
+                if ((compat32_ticks % 100) == 1) {  /* every ~1s */
                     serial_puts("[TIMER] PE32 RIP=0x");
                     serial_puthex(frame->rip, 8);
                     serial_puts(" ECX=0x");
