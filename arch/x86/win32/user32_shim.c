@@ -548,9 +548,14 @@ HWND WINAPI CreateWindowExA(DWORD dwExStyle, PCSTR lpClassName,
             }
         }
 
+        /* Direct write: set this->hWnd = hwnd at offset +4.
+         * NOTE: currently lpParam arrives as 0 (off-by-one in compat32
+         * stack extraction needs investigation). The workaround using
+         * g_compat32_last_stack_arg13 is incorrect — it reads the class
+         * name pointer, not the WWindow this pointer. */
         if (wwindow_addr >= 0x10000) {
-            uint32_t *wwindow = (uint32_t *)(uintptr_t)wwindow_addr;
-            wwindow[1] = (uint32_t)(ULONG_PTR)w->handle;  /* this->hWnd = hwnd */
+            uint32_t *ww = (uint32_t *)(uintptr_t)wwindow_addr;
+            ww[1] = (uint32_t)(ULONG_PTR)w->handle;
         }
     }
 

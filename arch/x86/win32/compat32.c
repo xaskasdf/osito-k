@@ -1846,9 +1846,20 @@ uint64_t compat32_dispatch(uint32_t thunk_idx, uint32_t *stack_args)
     uint64_t target = t->target_addr;
     uint8_t nargs = t->num_args;
 
-    /* Save the 13th stack arg for CreateWindowExW workaround.
-     * Some PE32 callers place `this` at stack_args[12] (off-by-one). */
+    /* Save the 13th stack arg for CreateWindowExW workaround. */
     g_compat32_last_stack_arg13 = (nargs >= 12) ? stack_args[12] : 0;
+
+    /* Debug: dump full stack for 12-arg functions (CreateWindowExW) */
+    if (nargs >= 12 && t->name && t->name[0] == 'C' && t->name[6] == 'W') {
+        serial_puts("[STACK-CWW] retaddr=0x");
+        serial_puthex(stack_args[-1], 8);
+        serial_puts("\n  args:");
+        for (int si = 0; si < 14; si++) {
+            serial_puts(" ");
+            serial_puthex(stack_args[si], 8);
+        }
+        serial_puts("\n");
+    }
 
     /* Stack alignment check: 32-bit caller's ESP must be 4-byte aligned.
      * If misaligned, a stdcall RET N shifted the stack incorrectly. */
