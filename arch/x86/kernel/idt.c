@@ -585,14 +585,25 @@ void isr_handler(interrupt_frame_t *frame)
                     /* Stack dump: read 4 dwords from EBP to find return chain */
                     if (compat32_ticks <= 501) {
                         volatile uint32_t *gis = (volatile uint32_t *)(uintptr_t)0x101E5698;
-                        volatile uint32_t *vtbl_va = (volatile uint32_t *)(uintptr_t)0x1092F738;
-                        volatile uint32_t *vtbl_pa = (volatile uint32_t *)(uintptr_t)0x01F02738;
+                        /* Read GIsClient and GIsEditor from their Core.dll addresses */
+                        volatile uint32_t *iat_client = (volatile uint32_t *)(uintptr_t)0x10958C44;
+                        volatile uint32_t *iat_editor = (volatile uint32_t *)(uintptr_t)0x10958C48;
+                        uint32_t client_addr = *iat_client;
+                        uint32_t editor_addr = *iat_editor;
                         serial_puts("\n  GIsRunning=");
                         serial_putdec(*gis);
-                        serial_puts(" vtbl_VA=0x");
-                        serial_puthex(*vtbl_va, 8);
-                        serial_puts(" vtbl_PA=0x");
-                        serial_puthex(*vtbl_pa, 8);
+                        serial_puts(" GIsClient@0x");
+                        serial_puthex(client_addr, 8);
+                        if (client_addr > 0x10000 && client_addr < 0x7FFFFFFF) {
+                            serial_puts("=");
+                            serial_putdec(*(volatile uint32_t *)(uintptr_t)client_addr);
+                        }
+                        serial_puts(" GIsEditor@0x");
+                        serial_puthex(editor_addr, 8);
+                        if (editor_addr > 0x10000 && editor_addr < 0x7FFFFFFF) {
+                            serial_puts("=");
+                            serial_putdec(*(volatile uint32_t *)(uintptr_t)editor_addr);
+                        }
                         /* Stack walk */
                         uint32_t ebp = (uint32_t)frame->rbp;
                         uint32_t *stk = (uint32_t *)(uintptr_t)ebp;
