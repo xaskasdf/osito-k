@@ -466,7 +466,23 @@ void isr_handler(interrupt_frame_t *frame)
         serial_puts("[SWBREAK] Hit at 0x");
         serial_puthex(g_swbreak_addr, 8);
         /* Dump context based on breakpoint location */
-        if (g_swbreak_addr == 0x10909E92) {
+        if (g_swbreak_addr == 0x1014A4E5) {
+            /* FArray::Realloc vtable call — dump args */
+            uint32_t *sp = (uint32_t *)(uintptr_t)(frame->rsp & 0xFFFFFFFF);
+            uint32_t eax = (uint32_t)frame->rax;
+            serial_puts("\n[REALLOC] vtable=0x");
+            serial_puthex(eax, 8);
+            serial_puts(" [eax+4]=0x");
+            if (eax > 0x10000)
+                serial_puthex(*(uint32_t *)(uintptr_t)(eax + 4), 8);
+            serial_puts("\n  Data=0x");
+            serial_puthex(sp[0], 8);
+            serial_puts(" Size=0x");
+            serial_puthex(sp[1], 8);
+            serial_puts(" Name=0x");
+            serial_puthex(sp[2], 8);
+            serial_puts("\n");
+        } else if (g_swbreak_addr == 0x10909E92) {
             /* WinMain catch(...) handler — dump GErrorHist */
             serial_puts("\n[CATCH] WinMain catch(...) handler hit!\n");
             /* GErrorHist is at IAT 0x10958C60 → points to WCHAR[] buffer */
