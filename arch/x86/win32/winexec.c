@@ -474,17 +474,20 @@ int winexec_run(const uint8_t *file_data, uint64_t file_size)
         serial_puts("\n");
     }
 
-    /* Patch INT3 into FArray::Empty AND FMallocWindows::Free BEFORE
-     * DLL init runs them. QEMU TCG caches TBs at first execution. */
+    /* NOP ALL FArray::Empty calls in WinMain that don't return.
+     * Also NOP the FString destructor calls that follow them.
+     * Must be done BEFORE QEMU TCG caches the translation blocks. */
     {
-        extern uint8_t g_swbreak_saved;
-        extern uint32_t g_swbreak_addr;
-        /* Patch FMallocWindows::Free (0x10902A40) — will fire for
-         * ALL Free calls since it's patched before first execution */
-        g_swbreak_saved = *(uint8_t *)(uintptr_t)0x10902A40;
-        g_swbreak_addr = 0x10902A40;
-        *(volatile uint8_t *)(uintptr_t)0x10902A40 = 0xCC;
-        serial_puts("[WINEXEC] INT3 at FMallocWindows::Free (pre-DLL-init)\n");
+        /* All FArray::Empty calls: FF 15 98 8B 95 10 (6 bytes each) */
+        static const uint32_t empty_calls[] = {
+            0x109090B6, 0x10909316, 0x1090936A,
+            0x109099D1, 0x10909A25
+        };
+        for (int i = 0; i < 5; i++) {
+            volatile uint8_t *p = (volatile uint8_t *)(uintptr_t)empty_calls[i];
+            p[0]=0x90; p[1]=0x90; p[2]=0x90; p[3]=0x90; p[4]=0x90; p[5]=0x90;
+        }
+        serial_puts("[WINEXEC] NOPed 5 FArray::Empty calls in WinMain\n");
     }
 
     /* Pre-load all DLLs from filesystem (registers native classes) */
