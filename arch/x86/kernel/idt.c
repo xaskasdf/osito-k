@@ -466,22 +466,34 @@ void isr_handler(interrupt_frame_t *frame)
         serial_puts("[SWBREAK] Hit at 0x");
         serial_puthex(g_swbreak_addr, 8);
         /* Dump context based on breakpoint location */
-        if (g_swbreak_addr == 0x1014A4E5) {
-            /* FArray::Realloc vtable call — dump args */
+        if (g_swbreak_addr == 0x10902750) {
+            /* FMallocWindows::Realloc entry. INT3 is permanent — don't restore.
+             * Log args, restore byte, skip forward, then repatch. */
+            static int realloc_count = 0;
+            realloc_count++;
+            /* thiscall: ECX=this, [ESP+0]=retaddr, [ESP+4]=Data, [ESP+8]=Size, [ESP+12]=Name */
             uint32_t *sp = (uint32_t *)(uintptr_t)(frame->rsp & 0xFFFFFFFF);
-            uint32_t eax = (uint32_t)frame->rax;
-            serial_puts("\n[REALLOC] vtable=0x");
-            serial_puthex(eax, 8);
-            serial_puts(" [eax+4]=0x");
-            if (eax > 0x10000)
-                serial_puthex(*(uint32_t *)(uintptr_t)(eax + 4), 8);
-            serial_puts("\n  Data=0x");
-            serial_puthex(sp[0], 8);
-            serial_puts(" Size=0x");
-            serial_puthex(sp[1], 8);
-            serial_puts(" Name=0x");
-            serial_puthex(sp[2], 8);
-            serial_puts("\n");
+            uint32_t data = sp[1], sz = sp[2];
+            if (realloc_count <= 5 || sz == 0 || (realloc_count % 500) == 0) {
+                serial_puts("[RA#");
+                serial_putdec(realloc_count);
+                serial_puts("] D=0x");
+                serial_puthex(data, 8);
+                serial_puts(" S=0x");
+                serial_puthex(sz, 8);
+                serial_puts(" ret=0x");
+                serial_puthex(sp[0], 8);
+                serial_puts("\n");
+            }
+            /* Restore byte, execute, then we lose the BP (one-shot per-call chain).
+             * To make it permanent, we'd need TF which doesn't work.
+             * Instead: restore, set addr=0 so iretq goes to real function. */
+            *(uint8_t *)(uintptr_t)g_swbreak_addr = g_swbreak_saved;
+            frame->rip = g_swbreak_addr;
+            /* DON'T clear g_swbreak_addr — the #BP won't fire again since
+             * the byte is restored. But after Realloc returns, WinMain's next
+             * Realloc call won't hit either. This is effectively one-shot. */
+            g_swbreak_addr = 0;  /* prevent future match */
         } else if (g_swbreak_addr == 0x10909E92) {
             /* WinMain catch(...) handler — dump GErrorHist */
             serial_puts("\n[CATCH] WinMain catch(...) handler hit!\n");
@@ -551,7 +563,7 @@ void isr_handler(interrupt_frame_t *frame)
             serial_puthex(frame->rsp, 8);
             serial_puts("\n");
         }
-        /* One-shot: restore and re-execute, don't re-arm */
+        /* One-shot: restore and continue */
         *(uint8_t *)(uintptr_t)g_swbreak_addr = g_swbreak_saved;
         frame->rip = g_swbreak_addr;
         g_swbreak_addr = 0;
@@ -611,6 +623,18 @@ void isr_handler(interrupt_frame_t *frame)
                         if (editor_addr > 0x10000 && editor_addr < 0x7FFFFFFF) {
                             serial_puts("=");
                             serial_putdec(*(volatile uint32_t *)(uintptr_t)editor_addr);
+                        }
+                        /* Check FArray::Empty IAT + JMP thunk bytes */
+                        volatile uint32_t *iat_empty = (volatile uint32_t *)(uintptr_t)0x10958B98;
+                        serial_puts(" Empty=0x");
+                        serial_puthex(*iat_empty, 8);
+                        /* Read first 5 bytes of the JMP thunk at 0x10102865 */
+                        if (compat32_ticks <= 201) {
+                            volatile uint8_t *thunk = (volatile uint8_t *)(uintptr_t)0x10102865;
+                            serial_puts(" thunk:");
+                            for (int tb = 0; tb < 5; tb++) {
+                                serial_puthex(thunk[tb], 2);
+                            }
                         }
                         /* Stack walk */
                         uint32_t ebp = (uint32_t)frame->rbp;
@@ -1179,8 +1203,8 @@ void idt_init(void)
      * pushing 64-bit frames on the 32-bit user stack (which causes
      * cascading #GP). Share IST1 with INT 0x2E — these handlers
      * either halt (#UD) or return quickly (#PF null-page, #DB). */
-    idt[1].ist  = 1;  /* #DB — TF single-step from null-page tracking */
-    idt[3].ist  = 1;  /* #BP — software breakpoint (INT3) from compat32 */
+    idt[1].ist  = 2;  /* #DB — IST2 (TF single-step + null-page tracking) */
+    idt[3].ist  = 2;  /* #BP — IST2 (avoids IST1 collision with INT 0x2E) */
     idt[6].ist  = 1;  /* #UD — invalid opcode (corrupted function pointer) */
     idt[13].ist = 1;  /* #GP — general protection */
     idt[14].ist = 1;  /* #PF — page fault (null-page write handling) */
