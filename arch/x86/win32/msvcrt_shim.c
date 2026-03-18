@@ -2050,9 +2050,19 @@ void WINAPI crt_CxxThrowException(PVOID pExceptionObject, PVOID pThrowInfo)
      * This is NOT correct C++ semantics but lets the engine survive
      * past localization failures and similar non-fatal errors.
      */
-    /* Rethrow (throw;) without active exception — just suppress */
+    /* Rethrow (throw;) — re-dispatch the current exception.
+     * This happens inside catch handlers that do: throw;
+     * Re-use the saved exception record from the original throw. */
     if (!pExceptionObject && !pThrowInfo) {
-        serial_puts("[CXX] SUPPRESSED rethrow\n");
+        serial_puts("[CXX] rethrow → re-dispatching current exception\n");
+        if (cxx_exception_active) {
+            /* Dispatch the saved exception to the next handler */
+            compat32_seh_dispatch(&cxx_current_exception);
+            /* If dispatch handled it, the INT2E unwind will redirect execution */
+            return;
+        }
+        /* No active exception — just suppress */
+        serial_puts("[CXX] WARNING: rethrow without active exception\n");
         return;
     }
 
@@ -2097,6 +2107,19 @@ void WINAPI crt_CxxThrowException(PVOID pExceptionObject, PVOID pThrowInfo)
         }
     }
 
+    /* Build and save the exception record for re-throw support */
+    {
+        BYTE *p = (BYTE *)&cxx_current_exception;
+        for (SIZE_T i = 0; i < sizeof(cxx_current_exception); i++) p[i] = 0;
+        cxx_current_exception.ExceptionCode = 0xE06D7363;
+        cxx_current_exception.ExceptionFlags = 1; /* NONCONTINUABLE */
+        cxx_current_exception.NumberParameters = 3;
+        cxx_current_exception.ExceptionInformation[0] = 0x19930520;
+        cxx_current_exception.ExceptionInformation[1] = (ULONG_PTR)pExceptionObject;
+        cxx_current_exception.ExceptionInformation[2] = (ULONG_PTR)pThrowInfo;
+        cxx_exception_active = 1;
+    }
+
     /* Call RaiseException with the C++ exception code.
      * This will dispatch through the SEH chain. */
     {
@@ -2107,16 +2130,20 @@ void WINAPI crt_CxxThrowException(PVOID pExceptionObject, PVOID pThrowInfo)
         RaiseException(0xE06D7363, 1 /* EXCEPTION_NONCONTINUABLE */, 3, args);
     }
 
-    /* If RaiseException returns (shouldn't for noncontinuable):
-     * For rethrow (NULL,NULL) after a catch handler consumed the exception,
-     * returning is acceptable — the catch block already handled it.
-     * For real throws, this indicates the exception was unhandled. */
-    if (!pExceptionObject && !pThrowInfo) {
-        serial_puts("[CXX] rethrow returned (exception consumed) — continuing\n");
-        return;
+    /* RaiseException returned — check if the dispatch handled it.
+     * If unwind globals are set, the INT2E handler will redirect to the
+     * catch handler. The exception IS handled — keep cxx_exception_active
+     * so re-throws from the catch handler can propagate. */
+    {
+        extern uint32_t g_compat32_unwind_eip;
+        if (g_compat32_unwind_eip != 0) {
+            /* Dispatch handled it — INT2E will redirect to catch.
+             * Keep cxx_exception_active for re-throw support. */
+            return;
+        }
     }
     serial_puts("[CXX] WARNING: _CxxThrowException returned (unhandled)\n");
-    /* Don't halt — let the caller continue and fail gracefully */
+    cxx_exception_active = 0;
 
     /* ── Diagnostic: dump GObjRegistrants state ────────────── */
     {
