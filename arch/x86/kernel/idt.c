@@ -466,7 +466,17 @@ void isr_handler(interrupt_frame_t *frame)
         serial_puts("[SWBREAK] Hit at 0x");
         serial_puthex(g_swbreak_addr, 8);
         /* Dump context based on breakpoint location */
-        if (g_swbreak_addr == 0x10902750) {
+        if (g_swbreak_addr == 0x10902A40) {
+            /* FMallocWindows::Free — log ptr and caller */
+            uint32_t *sp = (uint32_t *)(uintptr_t)(frame->rsp & 0xFFFFFFFF);
+            serial_puts("\n[FREE] ptr=0x");
+            serial_puthex(sp[1], 8);  /* [ESP+4] after PUSH EBP = Data */
+            serial_puts(" ret=0x");
+            serial_puthex(sp[0], 8);  /* return address */
+            serial_puts(" ECX=0x");
+            serial_puthex((uint32_t)frame->rcx, 8);
+            serial_puts("\n");
+        } else if (g_swbreak_addr == 0x10902750) {
             /* FMallocWindows::Realloc entry. INT3 is permanent — don't restore.
              * Log args, restore byte, skip forward, then repatch. */
             static int realloc_count = 0;
@@ -624,6 +634,17 @@ void isr_handler(interrupt_frame_t *frame)
                             serial_puts("=");
                             serial_putdec(*(volatile uint32_t *)(uintptr_t)editor_addr);
                         }
+                        /* Deep stack walk for stuck analysis */
+                        if (compat32_ticks >= 201 && compat32_ticks <= 301) {
+                            uint32_t ebp = (uint32_t)frame->rbp;
+                            serial_puts("\n  STACK:");
+                            for (int depth = 0; depth < 8 && ebp > 0x10000 && ebp < 0x7FFFFFFF; depth++) {
+                                uint32_t *fp = (uint32_t *)(uintptr_t)ebp;
+                                serial_puts(" 0x");
+                                serial_puthex(fp[1], 8);  /* return address */
+                                ebp = fp[0];  /* next frame */
+                            }
+                        }
                         /* Check FArray::Empty IAT + JMP thunk bytes */
                         volatile uint32_t *iat_empty = (volatile uint32_t *)(uintptr_t)0x10958B98;
                         serial_puts(" Empty=0x");
@@ -632,9 +653,13 @@ void isr_handler(interrupt_frame_t *frame)
                         if (compat32_ticks <= 201) {
                             volatile uint8_t *thunk = (volatile uint8_t *)(uintptr_t)0x10102865;
                             serial_puts(" thunk:");
-                            for (int tb = 0; tb < 5; tb++) {
+                            for (int tb = 0; tb < 5; tb++)
                                 serial_puthex(thunk[tb], 2);
-                            }
+                            /* Read EXE code at 0x109090B0 (the call instruction) */
+                            volatile uint8_t *callsite = (volatile uint8_t *)(uintptr_t)0x109090B0;
+                            serial_puts(" call@90B0:");
+                            for (int tb = 0; tb < 12; tb++)
+                                serial_puthex(callsite[tb], 2);
                         }
                         /* Stack walk */
                         uint32_t ebp = (uint32_t)frame->rbp;

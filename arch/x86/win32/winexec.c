@@ -474,6 +474,19 @@ int winexec_run(const uint8_t *file_data, uint64_t file_size)
         serial_puts("\n");
     }
 
+    /* Patch INT3 into FArray::Empty AND FMallocWindows::Free BEFORE
+     * DLL init runs them. QEMU TCG caches TBs at first execution. */
+    {
+        extern uint8_t g_swbreak_saved;
+        extern uint32_t g_swbreak_addr;
+        /* Patch FMallocWindows::Free (0x10902A40) — will fire for
+         * ALL Free calls since it's patched before first execution */
+        g_swbreak_saved = *(uint8_t *)(uintptr_t)0x10902A40;
+        g_swbreak_addr = 0x10902A40;
+        *(volatile uint8_t *)(uintptr_t)0x10902A40 = 0xCC;
+        serial_puts("[WINEXEC] INT3 at FMallocWindows::Free (pre-DLL-init)\n");
+    }
+
     /* Pre-load all DLLs from filesystem (registers native classes) */
     winexec_preload_dlls();
 
@@ -712,6 +725,19 @@ int winexec_run(const uint8_t *file_data, uint64_t file_size)
         /* PE32 (i386): enter 32-bit compatibility mode */
         uint32_t entry32 = (uint32_t)(ULONG_PTR)info.EntryPoint;
         uint32_t sp32    = (uint32_t)(ULONG_PTR)stack_top;
+
+        /* The breakpoint at 0x10107070 doesn't fire because QEMU TCG
+         * caches translated blocks and our write doesn't invalidate them.
+         * The FArray::Empty call at 0x109090B6 apparently NEVER reaches
+         * Core.dll's real FArray::Empty because the DLL init callbacks
+         * call FArray::Empty first, QEMU caches the translation, and our
+         * later INT3 patch is invisible to the cached code.
+         *
+         * REAL QUESTION: Why does the call to FArray::Empty at 0x109090B6
+         * in WinMain not return to 0x109090BC? The function should be
+         * trivial (Empty a stack-local FString). Since we can't breakpoint
+         * INSIDE Core.dll functions (TCG caching), we need to use the
+         * one-shot approach at DIFFERENT addresses in the EXE. */
 
         compat32_enter(entry32, sp32);
     } else {
