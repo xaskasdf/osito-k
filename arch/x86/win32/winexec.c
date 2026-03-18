@@ -474,20 +474,28 @@ int winexec_run(const uint8_t *file_data, uint64_t file_size)
         serial_puts("\n");
     }
 
-    /* NOP ALL FArray::Empty calls in WinMain that don't return.
-     * Also NOP the FString destructor calls that follow them.
-     * Must be done BEFORE QEMU TCG caches the translation blocks. */
+    /* INT3 at 0x109090BC: write under Win32 CR3 to ensure QEMU TCG
+     * self-modifying code detection picks it up for the right AS */
     {
-        /* All FArray::Empty calls: FF 15 98 8B 95 10 (6 bytes each) */
-        static const uint32_t empty_calls[] = {
-            0x109090B6, 0x10909316, 0x1090936A,
-            0x109099D1, 0x10909A25
-        };
-        for (int i = 0; i < 5; i++) {
-            volatile uint8_t *p = (volatile uint8_t *)(uintptr_t)empty_calls[i];
-            p[0]=0x90; p[1]=0x90; p[2]=0x90; p[3]=0x90; p[4]=0x90; p[5]=0x90;
-        }
-        serial_puts("[WINEXEC] NOPed 5 FArray::Empty calls in WinMain\n");
+        extern uint8_t g_swbreak_saved;
+        extern uint32_t g_swbreak_addr;
+        extern uint64_t paging_get_win32_cr3(void);
+        uint64_t w32cr3 = paging_get_win32_cr3();
+        uint64_t old_cr3;
+        __asm__ volatile ("mov %%cr3, %0" : "=r"(old_cr3));
+        /* Switch to Win32 CR3 for the write */
+        if (w32cr3)
+            __asm__ volatile ("mov %0, %%cr3" : : "r"(w32cr3) : "memory");
+        g_swbreak_saved = *(volatile uint8_t *)(uintptr_t)0x109090CB;
+        g_swbreak_addr = 0x109090CB;
+        *(volatile uint8_t *)(uintptr_t)0x109090CB = 0xCC;
+        /* Verify the write */
+        uint8_t verify = *(volatile uint8_t *)(uintptr_t)0x109090BC;
+        /* Switch back to kernel CR3 */
+        __asm__ volatile ("mov %0, %%cr3" : : "r"(old_cr3) : "memory");
+        serial_puts("[WINEXEC] INT3 at 0x109090BC under Win32 CR3, verify=0x");
+        serial_puthex(verify, 2);
+        serial_puts("\n");
     }
 
     /* Pre-load all DLLs from filesystem (registers native classes) */
