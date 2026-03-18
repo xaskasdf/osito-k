@@ -673,6 +673,19 @@ void isr_handler(interrupt_frame_t *frame)
             }
         }
 
+        /* Re-zero NULL page for compat32: compat32 can't use TF single-step
+         * (#DB from compat mode causes #GP without IST), so page 0 stays
+         * writable after a compat32 write. Re-zero + re-protect here so that
+         * future NULL pointer derefs read 0 (vtable=0) instead of stale data.
+         * Without this, a NULL object pointer reads garbage from page 0 as a
+         * vtable and jumps to BIOS IVT addresses → #UD. */
+        if (g_null_page_dirty) {
+            g_null_page_dirty = 0;
+            memset((void *)0, 0, 4096);
+            paging_set_flags(0, PTE_PRESENT | PTE_GLOBAL | PTE_NX);
+            __asm__ volatile ("invlpg (%0)" :: "r"((uint64_t)0) : "memory");
+        }
+
         /* X-SCHED: preemptive scheduler — check quantum, switch if expired.
          * frame points to saved GPRs on the current process's stack. */
         sched_tick(frame);

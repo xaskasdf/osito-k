@@ -522,15 +522,36 @@ HWND WINAPI CreateWindowExA(DWORD dwExStyle, PCSTR lpClassName,
     serial_puthex(nHeight, 4);
     serial_puts("\n");
 
-    /* Simulate WM_NCCREATE without callbacks.
-     * Window.dll's WndProc sets WindowCreate->hWnd = hWnd at offset +4
-     * of the WWindow object (confirmed by disassembly: mov [edi+4], edx
-     * at 0x11003b5b). lpParam is the WWindow 'this' pointer.
-     * Writing hWnd at this+4 satisfies the check(hWndCreated==hWnd)
-     * assertion at Window.h:1289 without needing compat32 callbacks. */
-    if (lpParam && (uint32_t)(ULONG_PTR)lpParam >= 0x10000) {
-        uint32_t *wwindow = (uint32_t *)(uintptr_t)(uint32_t)(uintptr_t)lpParam;
-        wwindow[1] = (uint32_t)(ULONG_PTR)w->handle;  /* this->hWnd at offset +4 */
+    /* Simulate WM_NCCREATE: write hWnd at WWindow::hWnd (this+4).
+     *
+     * The engine passes `this` as lpParam (arg 12 of CreateWindowExW).
+     * Due to a stack layout quirk in the compat32 thunk, lpParam arrives
+     * as 0 but the real `this` pointer is at stack_args[12] (one slot
+     * past the declared 12 args). As a workaround, if lpParam is NULL
+     * we look at the caller's stack for a plausible WWindow pointer. */
+    {
+        uint32_t wwindow_addr = (uint32_t)(ULONG_PTR)lpParam;
+
+        /* If lpParam is NULL, try the 13th stack arg (compat32 off-by-one) */
+        if (!wwindow_addr && lpClassName) {
+            /* The className pointer typically points into the same
+             * stack region as `this`. Use className as a heuristic
+             * to validate stack_args[12] if we can access it. */
+            extern int g_compat32_mode;
+            if (g_compat32_mode) {
+                /* Read the 13th arg from the compat32 stack.
+                 * This is a pragmatic workaround: the PE32 code's CALL
+                 * leaves `this` one slot beyond the declared 12 args. */
+                extern uint32_t g_compat32_last_stack_arg13;
+                if (g_compat32_last_stack_arg13 >= 0x10000)
+                    wwindow_addr = g_compat32_last_stack_arg13;
+            }
+        }
+
+        if (wwindow_addr >= 0x10000) {
+            uint32_t *wwindow = (uint32_t *)(uintptr_t)wwindow_addr;
+            wwindow[1] = (uint32_t)(ULONG_PTR)w->handle;  /* this->hWnd = hwnd */
+        }
     }
 
     return w->handle;

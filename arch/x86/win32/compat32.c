@@ -33,6 +33,7 @@ int g_compat32_mode = 0;
 
 /* ── C++ EH unwind state (set by _CxxThrowException) ────────── */
 uint32_t g_compat32_unwind_eip = 0;
+uint32_t g_compat32_last_stack_arg13 = 0;  /* for CreateWindowExW lpParam workaround */
 uint32_t g_compat32_unwind_esp = 0;
 uint32_t g_compat32_unwind_ebp = 0;
 
@@ -1844,6 +1845,10 @@ uint64_t compat32_dispatch(uint32_t thunk_idx, uint32_t *stack_args)
     compat32_thunk_t *t = &thunk_table[thunk_idx];
     uint64_t target = t->target_addr;
     uint8_t nargs = t->num_args;
+
+    /* Save the 13th stack arg for CreateWindowExW workaround.
+     * Some PE32 callers place `this` at stack_args[12] (off-by-one). */
+    g_compat32_last_stack_arg13 = (nargs >= 12) ? stack_args[12] : 0;
 
     /* Stack alignment check: 32-bit caller's ESP must be 4-byte aligned.
      * If misaligned, a stdcall RET N shifted the stack incorrectly. */
