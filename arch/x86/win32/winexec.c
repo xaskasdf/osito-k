@@ -727,11 +727,26 @@ int winexec_run(const uint8_t *file_data, uint64_t file_size)
          * call FArray::Empty first, QEMU caches the translation, and our
          * later INT3 patch is invisible to the cached code.
          *
-         * REAL QUESTION: Why does the call to FArray::Empty at 0x109090B6
-         * in WinMain not return to 0x109090BC? The function should be
-         * trivial (Empty a stack-local FString). Since we can't breakpoint
-         * INSIDE Core.dll functions (TCG caching), we need to use the
-         * one-shot approach at DIFFERENT addresses in the EXE. */
+         * Win32 CR3 INT3 breakpoint for binary search.
+         * Must write under Win32 CR3 for QEMU TCG visibility. */
+        {
+            extern uint8_t g_swbreak_saved;
+            extern uint32_t g_swbreak_addr;
+            extern uint64_t paging_get_win32_cr3(void);
+            uint64_t w32cr3 = paging_get_win32_cr3();
+            uint64_t old_cr3;
+            __asm__ volatile ("mov %%cr3, %0" : "=r"(old_cr3));
+            if (w32cr3)
+                __asm__ volatile ("mov %0, %%cr3" : : "r"(w32cr3) : "memory");
+
+            /* Binary search target — change this address to narrow down */
+            uint32_t bp_addr = 0x10909570;
+            g_swbreak_saved = *(volatile uint8_t *)(uintptr_t)bp_addr;
+            g_swbreak_addr = bp_addr;
+            *(volatile uint8_t *)(uintptr_t)bp_addr = 0xCC;
+
+            __asm__ volatile ("mov %0, %%cr3" : : "r"(old_cr3) : "memory");
+        }
 
         compat32_enter(entry32, sp32);
     } else {
