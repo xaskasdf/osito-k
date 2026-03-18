@@ -486,9 +486,9 @@ int winexec_run(const uint8_t *file_data, uint64_t file_size)
         /* Switch to Win32 CR3 for the write */
         if (w32cr3)
             __asm__ volatile ("mov %0, %%cr3" : : "r"(w32cr3) : "memory");
-        g_swbreak_saved = *(volatile uint8_t *)(uintptr_t)0x109090CB;
-        g_swbreak_addr = 0x109090CB;
-        *(volatile uint8_t *)(uintptr_t)0x109090CB = 0xCC;
+        g_swbreak_saved = *(volatile uint8_t *)(uintptr_t)0x1091ABB5;
+        g_swbreak_addr = 0x1091ABB5;
+        *(volatile uint8_t *)(uintptr_t)0x1091ABB5 = 0xCC;
         /* Verify the write */
         uint8_t verify = *(volatile uint8_t *)(uintptr_t)0x109090BC;
         /* Switch back to kernel CR3 */
