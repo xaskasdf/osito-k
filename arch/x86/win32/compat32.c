@@ -1293,15 +1293,15 @@ int compat32_seh_dispatch(PEXCEPTION_RECORD ExceptionRecord)
      * current frame (which is corrupted by the first dispatch) and start
      * searching from the NEXT frame in the SEH chain. */
     static int in_catch_dispatch = 0;
-    static uint32_t catch_frame_addr = 0;  /* frame that caught first exception */
+    static uint32_t catch_frame_addr = 0;
+    static uint32_t saved_next_frame = 0;  /* saved Next BEFORE catch corrupts it */
     if (in_catch_dispatch) {
-        serial_puts("[SEH32] Re-throw from catch — skipping to next frame\n");
+        serial_puts("[SEH32] Re-throw from catch — using saved next frame 0x");
+        serial_puthex(saved_next_frame, 8);
+        serial_puts("\n");
         in_catch_dispatch = 0;
-        /* Advance past the catching frame */
-        if (catch_frame_addr != 0 && catch_frame_addr != 0xFFFFFFFF) {
-            uint32_t *cf = (uint32_t *)(ULONG_PTR)catch_frame_addr;
-            g_teb32.ExceptionList = cf[0];  /* skip to next */
-        }
+        /* Use the saved Next (from before the catch handler corrupted the frame) */
+        g_teb32.ExceptionList = saved_next_frame;
     }
 
     /* Read the 32-bit ExceptionList from TEB32.
@@ -1672,6 +1672,7 @@ int compat32_seh_dispatch(PEXCEPTION_RECORD ExceptionRecord)
                          */
                         in_catch_dispatch = 1;
                         catch_frame_addr = frame_addr;
+                        saved_next_frame = next32;  /* save BEFORE catch corrupts it */
                         g_compat32_unwind_eip = catch_handler;
                         /*
                          * The catch handler epilog does:
