@@ -815,17 +815,32 @@ void isr_handler(interrupt_frame_t *frame)
                 serial_puts("\n");
             }
             if ((frame->cs & 0xFFFF) == 0x40 || (frame->cs & 0xFFFF) == 0x23) {
-                /* Compat32: fall through to SEH dispatch below.
-                 * The engine's __except filter catches STATUS_ACCESS_VIOLATION. */
-                /* no-op: the SEH dispatch at the bottom handles compat32 #PF */
-            }
-            if (0) {
-                /* Dead code — kept for reference of old RET 0 approach */
-                uint32_t *sp32 = (uint32_t *)(frame->rsp & 0xFFFFFFFF);
-                frame->rip = sp32[0];  /* return address */
-                frame->rsp += 4;       /* pop */
-                frame->rax = 0;        /* return 0 */
-                return;
+                /* First NULL-CALL: dispatch to SEH so the engine can show
+                 * its error message and begin graceful shutdown.
+                 * Subsequent NULL-CALLs: simulate RET 0 to let cleanup
+                 * continue — the catch handler writes to NULL during
+                 * StaticShutdownAfterError, re-dirtying page 0, and
+                 * dispatching to SEH again would cause infinite recursion. */
+                if (null_call_count > 1) {
+                    uint32_t *sp32 = (uint32_t *)(uintptr_t)(frame->rsp & 0xFFFFFFFF);
+                    frame->rip = sp32[0];  /* return address */
+                    frame->rsp += 4;       /* pop */
+                    frame->rax = 0;        /* return 0 */
+                    if (g_null_page_dirty) {
+                        g_null_page_dirty = 0;
+                        memset((void *)0, 0, 4096);
+                        paging_set_flags(0, PTE_PRESENT | PTE_GLOBAL | PTE_NX);
+                        __asm__ volatile ("invlpg (%0)" :: "r"((uint64_t)0) : "memory");
+                    }
+                    return;
+                }
+                /* First NULL-CALL: re-zero page 0 and fall through to SEH */
+                if (g_null_page_dirty) {
+                    g_null_page_dirty = 0;
+                    memset((void *)0, 0, 4096);
+                    paging_set_flags(0, PTE_PRESENT | PTE_GLOBAL | PTE_NX);
+                    __asm__ volatile ("invlpg (%0)" :: "r"((uint64_t)0) : "memory");
+                }
             }
         }
     }
@@ -1056,6 +1071,18 @@ void isr_handler(interrupt_frame_t *frame)
             er64.NumberParameters = er.NumberParameters;
             for (uint32_t i = 0; i < er.NumberParameters && i < 15; i++)
                 er64.ExceptionInformation[i] = er.ExceptionInformation[i];
+
+            /* Re-zero null page before dispatching to SEH catch handlers.
+             * Compat32 writes to page 0 skip TF (would cause #GP), so page
+             * stays dirty until the next APIC timer tick. If an exception
+             * fires before the tick, catch handlers read stale data from
+             * page 0 (e.g., GMalloc vtable deref → cascading NULL call). */
+            if (g_null_page_dirty) {
+                g_null_page_dirty = 0;
+                memset((void *)0, 0, 4096);
+                paging_set_flags(0, PTE_PRESENT | PTE_GLOBAL | PTE_NX);
+                __asm__ volatile ("invlpg (%0)" :: "r"((uint64_t)0) : "memory");
+            }
 
             int handled = compat32_seh_dispatch((void *)&er64);
             if (handled) {
