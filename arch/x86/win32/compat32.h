@@ -130,4 +130,10 @@ int compat32_seh_dispatch(PEXCEPTION_RECORD ExceptionRecord);
  */
 extern int g_compat32_mode;
 
+/*
+ * Create a stub UObject with a valid vtable (all entries return 0).
+ * Returns 32-bit address of the object, or 0 on failure.
+ */
+uint32_t create_stub_uobject(const char *name);
+
 #endif /* COMPAT32_H */

@@ -1953,6 +1953,48 @@ uint64_t compat32_dispatch(uint32_t thunk_idx, uint32_t *stack_args)
     }
 }
 
+/* ── Stub UObject factory ────────────────────────────────────── */
+
+/*
+ * Create a minimal stub UObject with a valid vtable.
+ * All vtable entries point to XOR EAX,EAX; RET (returns 0).
+ * Used to initialize global USubsystem* pointers (e.g. GWindowManager)
+ * that would otherwise be NULL and cause virtual call crashes.
+ *
+ * Layout (single page):
+ *   [0x000..0x07F]  vtable (32 entries × 4 bytes)
+ *   [0x100..0x1FF]  object (vtable ptr at offset 0, rest zeroed)
+ */
+uint32_t create_stub_uobject(const char *name)
+{
+    if (!unresolved_stub_addr) return 0;
+
+    uint8_t *page = (uint8_t *)mem_alloc_pages(1);
+    if (!page) return 0;
+
+    memset(page, 0, 4096);
+
+    uint32_t *vtable = (uint32_t *)page;
+    uint32_t *object = (uint32_t *)(page + 256);
+
+    /* Fill 32 vtable entries with RET-0 stub */
+    for (int i = 0; i < 32; i++)
+        vtable[i] = unresolved_stub_addr;
+
+    /* Object[0] = vtable pointer */
+    object[0] = (uint32_t)(uintptr_t)vtable;
+
+    serial_puts("[WIN32] stub UObject '");
+    serial_puts(name);
+    serial_puts("' obj=0x");
+    serial_puthex((uint64_t)(uintptr_t)object, 8);
+    serial_puts(" vtbl=0x");
+    serial_puthex((uint64_t)(uintptr_t)vtable, 8);
+    serial_puts("\n");
+
+    return (uint32_t)(uintptr_t)object;
+}
+
 /* ── Query thunk table (for kernel INT 0x2E handler) ─────────── */
 
 uint64_t compat32_get_target(uint32_t thunk_idx)

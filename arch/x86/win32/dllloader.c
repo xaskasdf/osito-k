@@ -385,6 +385,36 @@ PVOID dll_load(const char *dll_name, const BYTE *file_data, SIZE_T file_size)
         }
     }
 
+    /* After Window.dll loads, initialize NULL global stubs.
+     * GWindowManager (USubsystem*) and GLogWindow (WLog*) are DATA
+     * exports that stay NULL because DllMain doesn't construct them.
+     * Virtual calls through NULL crash with #PF at address 0. */
+    if (dl_stricmp(mod->name, "window.dll") == 0) {
+        static const char *globals[] = {
+            "?GWindowManager@@3PAVUSubsystem@@A",
+            "?GLogWindow@@3PAVWLog@@A",
+        };
+        for (int gi = 0; gi < 2; gi++) {
+            PVOID addr = NULL;
+            for (int mi = 0; mi < module_count; mi++) {
+                addr = dll_resolve_export(&modules[mi], globals[gi], 0, FALSE);
+                if (addr) break;
+            }
+            const char *short_name = (gi == 0) ? "GWindowManager" : "GLogWindow";
+            if (addr && *(uint32_t *)(uintptr_t)addr == 0) {
+                uint32_t stub = create_stub_uobject(short_name);
+                if (stub) {
+                    *(uint32_t *)(uintptr_t)addr = stub;
+                    serial_puts("[WIN32] ");
+                    serial_puts(short_name);
+                    serial_puts(" -> 0x");
+                    serial_puthex(stub, 8);
+                    serial_puts("\n");
+                }
+            }
+        }
+    }
+
     return mod->image.ImageBase;
 }
 
