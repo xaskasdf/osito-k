@@ -108,7 +108,7 @@ NVME_IMG="$BUILD_DIR/nvme.img"
 NVME_ARGS=""
 if [ -f "$NVME_IMG" ]; then
     info "NVMe disk: $NVME_IMG ($(stat -c%s "$NVME_IMG") bytes)"
-    NVME_ARGS="-drive file=$NVME_IMG,format=raw,if=none,id=nvme0 -device nvme,serial=deadbeef,drive=nvme0"
+    NVME_ARGS="-drive file=$NVME_IMG,format=raw,if=none,id=nvme0,cache=none -device nvme,serial=deadbeef,drive=nvme0"
 fi
 
 qemu-system-x86_64 \

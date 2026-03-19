@@ -8,7 +8,7 @@ CC      = gcc
 CFLAGS  = -Wall -Wextra -O2 -std=c11 -D_GNU_SOURCE
 LDFLAGS =
 
-TOOLS   = mkfs.ositofs ositofs-write ositofs-ls ositofs-info ositofs-read
+TOOLS   = mkfs.ositofs ositofs-write ositofs-ls ositofs-info ositofs-read ositofs-delete
 COMMON  = common.o gguf.o
 
 all: $(TOOLS)
@@ -26,6 +26,9 @@ ositofs-info: info.o common.o
 	$(CC) $(LDFLAGS) -o $@ $^
 
 ositofs-read: read.o common.o
+	$(CC) $(LDFLAGS) -o $@ $^
+
+ositofs-delete: delete.o common.o
 	$(CC) $(LDFLAGS) -o $@ $^
 
 %.o: %.c common.h gguf.h ../../include/common/ositofs2_format.h
