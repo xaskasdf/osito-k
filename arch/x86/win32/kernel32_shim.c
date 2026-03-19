@@ -150,24 +150,23 @@ HANDLE WINAPI CreateFileW(PCWSTR lpFileName, DWORD dwDesiredAccess,
     }
     serial_puts("'\n");
 
-    /* WORKAROUND: Fail CreateFileW for "Running.ini" with GENERIC_WRITE.
-     * FFileManagerWindows::CreateFileWriter returns NULL on failure,
-     * avoiding the vtable=0 crash from FArchiveFileWriter with broken
-     * C++ constructor (C++ EH not fully implemented yet).
-     * Running.ini is just a "process running" flag file — not needed. */
+    /* Block writes to .ini files. The engine's shutdown writes a PARTIAL
+     * config (only modified sections) to UnrealTournament.ini, destroying
+     * the complete Default.ini we placed on the NVMe. Also block Running.ini. */
     if (dwDesiredAccess & GENERIC_WRITE) {
-        /* Check for "Running.ini" (case-insensitive) */
         const char *fn = fname_ascii;
-        /* Skip path prefix */
         for (int i = fname_len - 1; i >= 0; i--)
             if (fn[i] == '\\' || fn[i] == '/') { fn = &fname_ascii[i+1]; break; }
-        if ((fn[0]=='R'||fn[0]=='r') && (fn[1]=='u'||fn[1]=='U') &&
-            (fn[2]=='n'||fn[2]=='N') && (fn[3]=='n'||fn[3]=='N') &&
-            (fn[4]=='i'||fn[4]=='I') && (fn[5]=='n'||fn[5]=='N') &&
-            (fn[6]=='g'||fn[6]=='G') && fn[7]=='.' &&
-            (fn[8]=='i'||fn[8]=='I') && (fn[9]=='n'||fn[9]=='N') &&
-            (fn[10]=='i'||fn[10]=='I') && fn[11]=='\0') {
-            serial_puts("[CreateFileW] BLOCKED Running.ini write (vtable fix)\n");
+        int flen = 0;
+        while (fn[flen]) flen++;
+        if (flen > 4 &&
+            fn[flen-4] == '.' &&
+            (fn[flen-3]=='i'||fn[flen-3]=='I') &&
+            (fn[flen-2]=='n'||fn[flen-2]=='N') &&
+            (fn[flen-1]=='i'||fn[flen-1]=='I')) {
+            serial_puts("[CreateFileW] BLOCKED .ini write: ");
+            serial_puts(fn);
+            serial_puts("\n");
             SetLastError(5); /* ERROR_ACCESS_DENIED */
             return INVALID_HANDLE_VALUE;
         }

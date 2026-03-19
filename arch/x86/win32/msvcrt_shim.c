@@ -2043,6 +2043,36 @@ void WINAPI crt_CxxThrowException(PVOID pExceptionObject, PVOID pThrowInfo)
     serial_puthex((uint64_t)(ULONG_PTR)pThrowInfo, 8);
     serial_puts("\n");
 
+    /* Dump thrown object to identify the error message.
+     * Try reading the first few fields and interpret as string pointers. */
+    if (pExceptionObject) {
+        uint32_t obj32 = (uint32_t)(ULONG_PTR)pExceptionObject;
+        if (obj32 > 0x10000 && obj32 < 0x7FFFFFFF) {
+            uint32_t *f = (uint32_t *)(ULONG_PTR)obj32;
+            serial_puts("[CXX-OBJ] ");
+            for (int i = 0; i < 4; i++) {
+                serial_puthex(f[i], 8);
+                serial_puts(" ");
+            }
+            serial_puts("\n");
+            /* Try each field as a wide string pointer */
+            for (int fi = 0; fi < 3; fi++) {
+                if (f[fi] > 0x10000 && f[fi] < 0x7FFFFFFF) {
+                    uint16_t *ws = (uint16_t *)(ULONG_PTR)f[fi];
+                    if (ws[0] > 0x20 && ws[0] < 0x7F) {
+                        serial_puts("[CXX-F");
+                        serial_putdec(fi);
+                        serial_puts("] \"");
+                        for (int i = 0; i < 120 && ws[i] > 0 && ws[i] < 0x7F; i++)
+                            serial_putchar((char)ws[i]);
+                        serial_puts("\"\n");
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
     /*
      * WORKAROUND: Full C++ EH (SEH unwind + __CxxFrameHandler dispatch)
      * is not yet implemented. Calling RaiseException without proper CONTEXT
