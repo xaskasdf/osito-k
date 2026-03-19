@@ -278,6 +278,41 @@ NTSTATUS sys_NtCreateFile(ULONG_PTR *args)
     }
 
     if (!osfs_file) {
+        /* Check if this is a BMP file — provide minimal 1x1 BMP to avoid
+         * fatal assertion in Bitmap.LoadFile(). The engine asserts on
+         * missing splash/logo BMPs with no recovery path. */
+        int is_bmp = 0;
+        for (const char *p = path; *p; p++) {
+            if (p[0] == '.' && (p[1] == 'b' || p[1] == 'B') &&
+                (p[2] == 'm' || p[2] == 'M') && (p[3] == 'p' || p[3] == 'P') &&
+                p[4] == '\0') {
+                is_bmp = 1;
+                break;
+            }
+        }
+        if (is_bmp) {
+            serial_puts("[NT] BMP fallback: creating minimal ");
+            serial_puts(path);
+            serial_puts("\n");
+            osfs_file = osfs2_create(path, 0);
+            if (osfs_file) {
+                /* Write a valid 1x1 24-bit BMP (58 bytes) */
+                static const uint8_t bmp_1x1[] = {
+                    0x42, 0x4D, 0x3A, 0x00, 0x00, 0x00, 0x00, 0x00,
+                    0x00, 0x00, 0x36, 0x00, 0x00, 0x00, 0x28, 0x00,
+                    0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00,
+                    0x00, 0x00, 0x01, 0x00, 0x18, 0x00, 0x00, 0x00,
+                    0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00,
+                    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                    0x00, 0x00,
+                };
+                osfs2_write(osfs_file, 0, bmp_1x1, sizeof(bmp_1x1));
+            }
+        }
+    }
+
+    if (!osfs_file) {
         nt_log(" NOT FOUND\n");
         if (IoStatusBlock) {
             IoStatusBlock->Status = STATUS_OBJECT_NAME_NOT_FOUND;
