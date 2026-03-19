@@ -89,7 +89,7 @@ void dll_register_shim(const char *dll_name, shim_resolver_fn resolver)
 
 /* ── Find a shim by DLL name ───────────────────────────────── */
 
-static shim_resolver_fn find_shim(const char *dll_name)
+shim_resolver_fn find_shim(const char *dll_name)
 {
     char lower[64];
     dl_strcpy_lower(lower, strip_path(dll_name), 64);

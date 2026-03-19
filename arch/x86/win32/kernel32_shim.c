@@ -14,6 +14,16 @@ extern void serial_puts(const char *s);
 extern void serial_puthex(uint64_t val, int digits);
 extern void serial_putdec(uint64_t val);
 
+/* ── Shim handle table for dynamically loaded shim DLLs ────── */
+/* Maps sentinel handles (0xD110xxxx) to DLL names so GetProcAddress
+ * can route to the correct shim resolver (ddraw, dsound, etc.). */
+#define MAX_SHIM_HANDLES 16
+static struct {
+    PVOID  handle;
+    char   name[64];
+} shim_handles[MAX_SHIM_HANDLES];
+static int shim_handle_count = 0;
+
 /* ── Per-thread last error (global for now, TEB-based later) ── */
 
 static DWORD g_last_error = 0;
@@ -567,13 +577,22 @@ PVOID WINAPI GetProcAddress(HANDLE hModule, PCSTR lpProcName)
     if (!lpProcName) return NULL;
 
     /* If hModule is a loaded PE module, search its exports */
-    if (hModule && (ULONG_PTR)hModule != 0xD1100001 &&
-        (ULONG_PTR)hModule != 0x00400000) {
-        /* Check if this handle matches a loaded module's base */
-        LOADED_MODULE *mod = NULL;
-        /* Scan modules by base address */
-        extern LOADED_MODULE *dll_find_module(const char *);
-        /* Direct export directory search */
+    if (hModule && (ULONG_PTR)hModule >= 0xD1100000 &&
+        (ULONG_PTR)hModule < 0xD1100000 + MAX_SHIM_HANDLES) {
+        /* Shim handle — route to the correct shim DLL */
+        const char *shim_dll = NULL;
+        for (int i = 0; i < shim_handle_count; i++) {
+            if (shim_handles[i].handle == hModule) {
+                shim_dll = shim_handles[i].name;
+                break;
+            }
+        }
+        if (shim_dll) {
+            PVOID fn = dll_resolve_import(shim_dll, lpProcName, 0, FALSE);
+            if (fn) return fn;
+        }
+    } else if (hModule && (ULONG_PTR)hModule != 0x00400000) {
+        /* Regular PE module — search its export directory */
         LOADED_MODULE search_mod;
         search_mod.image.ImageBase = hModule;
         PVOID fn = dll_resolve_export(&search_mod, lpProcName, 0, FALSE);
@@ -1293,6 +1312,9 @@ extern void *osfs2_find(const char *name);
 extern int   osfs2_read(void *file, uint64_t offset, void *buf, uint64_t len);
 extern uint64_t osfs2_file_size(void *file);
 
+typedef PVOID (*shim_resolver_fn)(const char *, uint16_t, int);
+extern shim_resolver_fn find_shim(const char *);
+
 HANDLE WINAPI LoadLibraryA(PCSTR lpLibFileName)
 {
     if (!lpLibFileName) return NULL;
@@ -1301,19 +1323,39 @@ HANDLE WINAPI LoadLibraryA(PCSTR lpLibFileName)
     serial_puts(lpLibFileName);
     serial_puts("\n");
 
-    /* Check if it's a built-in shim DLL — return a sentinel handle */
+    /* Check if it's a loaded PE module */
     LOADED_MODULE *mod = dll_find_module(lpLibFileName);
     if (mod)
         return mod->image.ImageBase ? mod->image.ImageBase
                                     : (HANDLE)(ULONG_PTR)0xD1100001;
 
-    /* Check if there's a shim registered for this DLL */
-    /* (For ntdll/kernel32/msvcrt that don't have real PE modules) */
-    PVOID test = dll_resolve_import(lpLibFileName, NULL, 0, FALSE);
-    (void)test; /* Just checking if shim exists */
+    /* Check if there's a registered shim for this DLL (ddraw, dsound, etc.).
+     * Shims aren't PE modules — return a unique sentinel handle that
+     * GetProcAddress can map back to the shim resolver. */
+    {
+        shim_resolver_fn shim = find_shim(lpLibFileName);
+        if (shim && shim_handle_count < MAX_SHIM_HANDLES) {
+            HANDLE h = (HANDLE)(ULONG_PTR)(0xD1100000 + shim_handle_count);
+            /* Store basename for GetProcAddress lookup */
+            const char *bn = lpLibFileName;
+            for (const char *p = lpLibFileName; *p; p++)
+                if (*p == '\\' || *p == '/') bn = p + 1;
+            int k = 0;
+            while (bn[k] && k < 63) {
+                shim_handles[shim_handle_count].name[k] = bn[k];
+                k++;
+            }
+            shim_handles[shim_handle_count].name[k] = 0;
+            shim_handles[shim_handle_count].handle = h;
+            shim_handle_count++;
+            serial_puts("[K32] LoadLibrary: shim found for ");
+            serial_puts(lpLibFileName);
+            serial_puts("\n");
+            return h;
+        }
+    }
 
     /* Try to load the DLL file from the filesystem */
-    /* Extract basename and try with/without .dll extension */
     const char *basename = lpLibFileName;
     for (const char *p = lpLibFileName; *p; p++) {
         if (*p == '\\' || *p == '/') basename = p + 1;
