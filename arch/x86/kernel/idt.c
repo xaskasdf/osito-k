@@ -798,41 +798,29 @@ void isr_handler(interrupt_frame_t *frame)
         }
 
         if (cr2 < 0x1000 && (frame->error_code & 16)) {  /* INSTRUCTION-FETCH on page 0 */
-            /* NULL function pointer call in compat32: simulate RET 0.
-             * Pop the return address from the 32-bit stack and set RIP to it.
-             * Set EAX=0 (return value 0). This makes NULL calls safe. */
+            /* NULL function pointer call: dispatch to SEH as
+             * STATUS_ACCESS_VIOLATION. On Windows, executing at address 0
+             * is an access violation that the engine's SEH handles.
+             * Our previous approach (simulate RET 0) caused cascading NULLs
+             * because the caller used 0 as a valid return value. */
             static int null_call_count = 0;
             null_call_count++;
             if (null_call_count <= 10) {
-                serial_puts("[NULL-CALL] addr=0x");
+                serial_puts("[NULL-CALL] RIP=0x");
                 serial_puthex(cr2, 4);
-                serial_puts(" ESP=0x");
-                serial_puthex(frame->rsp, 8);
-                if (frame->cs == 0x40 || frame->cs == 0x23) {
-                    uint32_t *sp32 = (uint32_t *)(frame->rsp & 0xFFFFFFFF);
-                    serial_puts(" stack:");
-                    for (int si = 0; si < 16; si++) {
-                        if (si % 4 == 0) {
-                            serial_puts("\n  [+"); serial_putdec(si*4);
-                            serial_puts("] ");
-                        }
-                        serial_puthex(sp32[si], 8);
-                        serial_puts(" ");
-                    }
-                    serial_puts("\n  EAX=0x"); serial_puthex(frame->rax, 8);
-                    serial_puts(" EBX=0x"); serial_puthex(frame->rbx, 8);
-                    serial_puts(" ECX=0x"); serial_puthex(frame->rcx, 8);
-                    serial_puts(" EDX=0x"); serial_puthex(frame->rdx, 8);
-                    serial_puts("\n  ESI=0x"); serial_puthex(frame->rsi, 8);
-                    serial_puts(" EDI=0x"); serial_puthex(frame->rdi, 8);
-                    serial_puts(" EBP=0x"); serial_puthex(frame->rbp, 8);
-                }
+                serial_puts(" retaddr=0x");
+                serial_puthex(((uint32_t *)(uintptr_t)(frame->rsp & 0xFFFFFFFF))[0], 8);
                 serial_puts(" #");
                 serial_putdec(null_call_count);
                 serial_puts("\n");
             }
-            if (frame->cs == 0x40 || frame->cs == 0x23) {
-                /* compat32: pop return address, set EAX=0 */
+            if ((frame->cs & 0xFFFF) == 0x40 || (frame->cs & 0xFFFF) == 0x23) {
+                /* Compat32: fall through to SEH dispatch below.
+                 * The engine's __except filter catches STATUS_ACCESS_VIOLATION. */
+                /* no-op: the SEH dispatch at the bottom handles compat32 #PF */
+            }
+            if (0) {
+                /* Dead code — kept for reference of old RET 0 approach */
                 uint32_t *sp32 = (uint32_t *)(frame->rsp & 0xFFFFFFFF);
                 frame->rip = sp32[0];  /* return address */
                 frame->rsp += 4;       /* pop */
@@ -1017,10 +1005,15 @@ void isr_handler(interrupt_frame_t *frame)
                 ((uint32_t *)&er)[i] = 0;
 
             if (vec == 14) {
-                /* #PF → STATUS_ACCESS_VIOLATION (but NOT for NULL page writes) */
+                /* #PF → STATUS_ACCESS_VIOLATION.
+                 * NULL page WRITES (cr2 < 0x1000, !instruction-fetch) are handled
+                 * by the write-through handler above — skip SEH for those.
+                 * NULL page INSTRUCTION FETCHES (null function call) MUST go to SEH
+                 * because silently returning 0 causes cascading NULL pointer usage. */
                 uint64_t cr2;
                 __asm__ volatile ("mov %%cr2, %0" : "=r"(cr2));
-                if (cr2 < 0x1000) goto compat32_null_recovery; /* keep NULL page handling */
+                if (cr2 < 0x1000 && !(frame->error_code & 16))
+                    goto compat32_null_recovery; /* NULL page write: keep old handling */
                 er.ExceptionCode = 0xC0000005;  /* STATUS_ACCESS_VIOLATION */
                 er.NumberParameters = 2;
                 er.ExceptionInformation[0] = (frame->error_code & 2) ? 1 : 0;
