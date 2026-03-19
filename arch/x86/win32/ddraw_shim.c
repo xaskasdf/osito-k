@@ -13,6 +13,8 @@
 
 #include "ddraw_shim.h"
 
+extern uint32_t compat32_callback_args(uint32_t func_addr, int nargs, const uint32_t *args);
+
 /* Types we need from user32/gdi32 without pulling in the full headers */
 typedef struct tagRECT_DD { LONG left, top, right, bottom; } RECT_DD;
 typedef RECT_DD *LPRECT;
@@ -710,8 +712,17 @@ HRESULT WINAPI DirectDrawCreateEx(LPGUID lpGUID, PVOID *lplpDD,
 HRESULT WINAPI DirectDrawEnumerateA(LPDDENUMCALLBACKA lpCallback, PVOID lpContext)
 {
     if (lpCallback) {
-        /* Report one "display" driver */
-        lpCallback(NULL, "Primary Display Driver", "display", lpContext);
+        /* Call 32-bit callback via compat32 mode switch.
+         * lpCallback is a 32-bit function — can't call directly from 64-bit. */
+        static const char dd_driver_desc[] = "Primary Display Driver";
+        static const char dd_driver_name[] = "display";
+        uint32_t args[4] = {
+            0,                                          /* lpGUID = NULL */
+            (uint32_t)(uintptr_t)dd_driver_desc,        /* lpDriverDescription */
+            (uint32_t)(uintptr_t)dd_driver_name,        /* lpDriverName */
+            (uint32_t)(uintptr_t)lpContext               /* lpContext */
+        };
+        compat32_callback_args((uint32_t)(uintptr_t)lpCallback, 4, args);
     }
     return DD_OK;
 }
