@@ -1695,9 +1695,15 @@ static int atexit_count = 0;
 
 void WINAPI crt_exit(int code)
 {
-    /* Run atexit handlers in reverse order */
-    for (int i = atexit_count - 1; i >= 0; i--)
-        atexit_funcs[i]();
+    extern int g_compat32_mode;
+
+    /* In compat32 mode, skip atexit handlers — PE32 cleanup code
+     * tends to crash (NULL vtable calls, uninitialized subsystems).
+     * Just terminate cleanly. */
+    if (!g_compat32_mode) {
+        for (int i = atexit_count - 1; i >= 0; i--)
+            atexit_funcs[i]();
+    }
     ExitProcess((DWORD)code);
 }
 
