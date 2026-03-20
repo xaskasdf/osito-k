@@ -50,10 +50,31 @@ void fb_puts_color(const char *s, uint32_t color);
 void fb_putdec(uint64_t val);
 
 /* ========================================================================
- * Memory allocator
+ * Platform info
  * ======================================================================== */
-void *mem_alloc_pages(uint64_t count);
-void  mem_free_pages(void *ptr, uint64_t count);
+uint64_t platform_ram_base(void);
+uint64_t platform_ram_size(void);
+
+/* ========================================================================
+ * Memory manager (kernel/memory.c)
+ * ======================================================================== */
+void     mem_init(uint64_t base, uint64_t size);
+void    *mem_alloc_pages(uint64_t count);
+void    *mem_alloc_aligned(uint64_t size, uint64_t alignment);
+void     mem_free_pages(void *ptr, uint64_t count);
+int      mem_reserve_range(uint64_t phys, uint64_t count);
+uint64_t mem_get_total(void);
+uint64_t mem_get_free(void);
+uint64_t mem_get_used(void);
+
+/* ========================================================================
+ * Paging / MMU (kernel/paging.c)
+ * ======================================================================== */
+void     paging_init(void);
+int      paging_map_page(uint64_t virt, uint64_t phys, uint64_t flags);
+int      paging_unmap_page(uint64_t virt);
+int      paging_map_mmio(uint64_t phys, uint64_t size);
+uint64_t paging_get_kernel_ttbr0(void);
 
 /* ========================================================================
  * Heap

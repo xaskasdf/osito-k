@@ -90,6 +90,30 @@ irq_vector_entry:
     add     sp, sp, #272
     eret
 
+/*
+ * sched_start_asm -- Bootstrap first task without eret.
+ * x0 = task SP (context frame).
+ *
+ * QEMU doesn't support eret outside exception context (EC=0 fault).
+ * Workaround: switch stack, load callee-saved regs, enable IRQs,
+ * then branch to trampoline directly.
+ */
+.globl sched_start_asm
+sched_start_asm:
+    mov     sp, x0
+
+    /* Load x19 (func) and x20 (arg) from frame */
+    ldp     x18, x19, [sp, #144]
+    ldp     x20, x21, [sp, #160]
+
+    /* Pop the context frame */
+    add     sp, sp, #272
+
+    /* Enable IRQs (equivalent of SPSR.I=0 after eret) */
+    msr     DAIFClr, #0x2
+
+    /* Fall through to trampoline */
+
 /* Task entry trampoline — new tasks start here via eret */
 /* x19 = func pointer, x20 = arg (callee-saved, survive eret) */
 .globl task_entry_trampoline

@@ -15,6 +15,7 @@ static uint8_t stack_pool[MAX_TASKS][TASK_STACK_SIZE]
     __attribute__((aligned(16)));
 
 extern void task_entry_trampoline(void);
+extern void sched_start_asm(uint64_t sp);
 
 static void idle_task(void *arg) {
     (void)arg;
@@ -155,32 +156,9 @@ void sched_start(void) {
     serial_puts("[SCHED] Starting\n");
     schedule();  /* Pick first task */
 
-    /* Load its context and eret */
-    uint64_t sp = current_task->sp;
-    __asm__ volatile(
-        "mov    sp, %0          \n"
-        "ldp    x0, x1, [sp, #256]  \n"
-        "msr    ELR_EL1, x0    \n"
-        "msr    SPSR_EL1, x1   \n"
-        "ldp    x0,  x1,  [sp, #0]   \n"
-        "ldp    x2,  x3,  [sp, #16]  \n"
-        "ldp    x4,  x5,  [sp, #32]  \n"
-        "ldp    x6,  x7,  [sp, #48]  \n"
-        "ldp    x8,  x9,  [sp, #64]  \n"
-        "ldp    x10, x11, [sp, #80]  \n"
-        "ldp    x12, x13, [sp, #96]  \n"
-        "ldp    x14, x15, [sp, #112] \n"
-        "ldp    x16, x17, [sp, #128] \n"
-        "ldp    x18, x19, [sp, #144] \n"
-        "ldp    x20, x21, [sp, #160] \n"
-        "ldp    x22, x23, [sp, #176] \n"
-        "ldp    x24, x25, [sp, #192] \n"
-        "ldp    x26, x27, [sp, #208] \n"
-        "ldp    x28, x29, [sp, #224] \n"
-        "ldr    x30,      [sp, #240] \n"
-        "add    sp, sp, #272         \n"
-        "eret                        \n"
-        :: "r"(sp)
-    );
+    /* Bootstrap first task without eret (QEMU workaround).
+     * Subsequent context switches use eret from IRQ handler. */
+    irq_disable();
+    sched_start_asm(current_task->sp);
     __builtin_unreachable();
 }
