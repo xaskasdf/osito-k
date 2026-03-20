@@ -1084,7 +1084,7 @@ void compat32_enter(uint32_t entry, uint32_t stack_top)
         : [cs] "r"(cs64),
           [ip] "r"(ip64),
           [sp] "r"(sp64)
-        : "memory", "rax"
+        : "memory", "cc", "rax", "rbx", "r12", "r13", "r14", "r15"
     );
 #else
     /*
@@ -1170,7 +1170,7 @@ void compat32_callback(uint32_t func_addr)
             : [cs] "r"(cs64),
               [ip] "r"(ip64),
               [sp] "r"(sp64)
-            : "memory", "rax"
+            : "memory", "cc", "rax", "rbx", "r12", "r13", "r14", "r15"
         );
         /* never reached — control flows via longjmp */
     }
@@ -1242,7 +1242,7 @@ uint32_t compat32_callback_args(uint32_t func_addr, int nargs, const uint32_t *a
             : [cs] "r"(cs64),
               [ip] "r"(ip64),
               [sp] "r"(sp64)
-            : "memory", "rax"
+            : "memory", "cc", "rax", "rbx", "r12", "r13", "r14", "r15"
         );
         /* never reached */
     }
