@@ -843,20 +843,31 @@ void isr_handler(interrupt_frame_t *frame)
                  * continue — the catch handler writes to NULL during
                  * StaticShutdownAfterError, re-dirtying page 0, and
                  * dispatching to SEH again would cause infinite recursion. */
-                if (null_call_count > 1) {
-                    uint32_t *sp32 = (uint32_t *)(uintptr_t)(frame->rsp & 0xFFFFFFFF);
-                    frame->rip = sp32[0];  /* return address */
-                    frame->rsp += 4;       /* pop */
-                    frame->rax = 0;        /* return 0 */
-                    if (g_null_page_dirty) {
-                        g_null_page_dirty = 0;
-                        memset((void *)0, 0, 4096);
-                        paging_set_flags(0, PTE_PRESENT | PTE_GLOBAL | PTE_NX);
-                        __asm__ volatile ("invlpg (%0)" :: "r"((uint64_t)0) : "memory");
+                /* If SEH chain is corrupt, RET 0 directly — SEH dispatch would
+                 * fail and crash recovery fires. RET 0 lets the engine receive
+                 * NULL from the invalid function call and handle the error. */
+                {
+                    extern uint32_t g_teb32;  /* first field = ExceptionList */
+                    uint32_t seh = g_teb32;
+                    serial_puts("[NULL-CALL] SEH=0x");
+                    serial_puthex(seh, 8);
+                    serial_puts("\n");
+                    if (seh >= 0x10000000 && seh < 0x20000000) {
+                        /* SEH chain corrupt → RET 0 regardless of count */
+                        uint32_t *sp32 = (uint32_t *)(uintptr_t)(frame->rsp & 0xFFFFFFFF);
+                        frame->rip = sp32[0];
+                        frame->rsp += 4;
+                        frame->rax = 0;
+                        if (g_null_page_dirty) {
+                            g_null_page_dirty = 0;
+                            memset((void *)0, 0, 4096);
+                            paging_set_flags(0, PTE_PRESENT | PTE_GLOBAL | PTE_NX);
+                            __asm__ volatile ("invlpg (%0)" :: "r"((uint64_t)0) : "memory");
+                        }
+                        return;
                     }
-                    return;
                 }
-                /* First NULL-CALL: re-zero page 0 and fall through to SEH */
+                /* First NULL-CALL with valid SEH: re-zero page 0 and dispatch */
                 if (g_null_page_dirty) {
                     g_null_page_dirty = 0;
                     memset((void *)0, 0, 4096);
