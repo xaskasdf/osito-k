@@ -53,63 +53,112 @@ void matvec_q4_0_neon(float *out, const void *weight,
         float32x4_t acc3 = vdupq_n_f32(0.0f);
 
         for (int b = 0; b < blocks_per_row; b++) {
-            /* Read scale (f16) */
             float scale = f16_to_f32_neon(*(const uint16_t *)w);
             w += 2;
             float32x4_t scale_v = vdupq_n_f32(scale);
             const float *inp = input + b * Q4_0_VALUES;
 
-            /* Load 16 nibble bytes → 32 values */
+            /* Load 16 nibble bytes → extract lo/hi nibbles */
             uint8x16_t raw = vld1q_u8(w);
             uint8x16_t lo_nib = vandq_u8(raw, vdupq_n_u8(0x0F));
             uint8x16_t hi_nib = vshrq_n_u8(raw, 4);
 
-            /* Process lo nibbles (values 0,2,4,...,30) and hi nibbles (1,3,5,...,31)
-             * Interleave: pair[i] = {lo[i], hi[i]} → values[2i], values[2i+1] */
+            /*
+             * Q4_0 layout: byte j → val[2j] = lo nibble, val[2j+1] = hi nibble
+             * Scalar: sum += scale * (lo[j] * inp[2j] + hi[j] * inp[2j+1])
+             *
+             * We interleave: zip(lo[0..3], hi[0..3]) → {lo0,hi0,lo1,hi1,lo2,hi2,lo3,hi3}
+             * This matches val[0..7] and can be multiplied by inp[0..7] directly.
+             */
 
-            /* Group 0: values 0-3 (lo[0],hi[0],lo[1],hi[1]) */
-            uint8x8_t lo_low8 = vget_low_u8(lo_nib);   /* lo[0..7] */
-            uint8x8_t hi_low8 = vget_low_u8(hi_nib);   /* hi[0..7] */
+            /* Bytes 0-3 → values 0-7 */
+            uint8x8_t lo_low8 = vget_low_u8(lo_nib);
+            uint8x8_t hi_low8 = vget_low_u8(hi_nib);
 
-            /* Widen lo[0..3] to s32 and subtract bias */
-            uint16x8_t lo16 = vmovl_u8(lo_low8);        /* lo[0..7] as u16 */
-            int32x4_t v0 = vsubq_s32(vreinterpretq_s32_u32(vmovl_u16(vget_low_u16(lo16))), bias);
-            float32x4_t f0 = vmulq_f32(vcvtq_f32_s32(v0), scale_v);
-            acc0 = vfmaq_f32(acc0, f0, vld1q_f32(inp));        /* values 0,2,4,6 × input[0,2,4,6] */
+            /* Interleave: {lo[0],hi[0],lo[1],hi[1],...,lo[3],hi[3]} = values 0-7 */
+            uint8x8x2_t zip03 = vzip_u8(
+                vreinterpret_u8_u32(vdup_n_u32(0)),  /* placeholder */
+                vreinterpret_u8_u32(vdup_n_u32(0))
+            );
+            /* Manual interleave for first 4 bytes → 8 values */
+            {
+                uint8_t tmp[8];
+                uint8_t lo_arr[8], hi_arr[8];
+                vst1_u8(lo_arr, lo_low8);
+                vst1_u8(hi_arr, hi_low8);
+                for (int j = 0; j < 4; j++) {
+                    tmp[j * 2]     = lo_arr[j];
+                    tmp[j * 2 + 1] = hi_arr[j];
+                }
+                uint8x8_t interleaved_0 = vld1_u8(tmp);
+                uint16x8_t wide_0 = vmovl_u8(interleaved_0);
+                /* values 0-3 */
+                int32x4_t v0 = vsubq_s32(vreinterpretq_s32_u32(vmovl_u16(vget_low_u16(wide_0))), bias);
+                float32x4_t f0 = vmulq_f32(vcvtq_f32_s32(v0), scale_v);
+                acc0 = vfmaq_f32(acc0, f0, vld1q_f32(inp + 0));
+                /* values 4-7 */
+                int32x4_t v1 = vsubq_s32(vreinterpretq_s32_u32(vmovl_u16(vget_high_u16(wide_0))), bias);
+                float32x4_t f1 = vmulq_f32(vcvtq_f32_s32(v1), scale_v);
+                acc1 = vfmaq_f32(acc1, f1, vld1q_f32(inp + 4));
+            }
 
-            /* Group 1: hi[0..3] → values 1,3,5,7 */
-            uint16x8_t hi16 = vmovl_u8(hi_low8);
-            int32x4_t v1 = vsubq_s32(vreinterpretq_s32_u32(vmovl_u16(vget_low_u16(hi16))), bias);
-            float32x4_t f1 = vmulq_f32(vcvtq_f32_s32(v1), scale_v);
-            acc1 = vfmaq_f32(acc1, f1, vld1q_f32(inp + 1));    /* values 1,3,5,7 × input[1,3,5,7] */
+            /* Bytes 4-7 → values 8-15 */
+            {
+                uint8_t tmp[8];
+                uint8_t lo_arr[8], hi_arr[8];
+                vst1_u8(lo_arr, lo_low8);
+                vst1_u8(hi_arr, hi_low8);
+                for (int j = 0; j < 4; j++) {
+                    tmp[j * 2]     = lo_arr[4 + j];
+                    tmp[j * 2 + 1] = hi_arr[4 + j];
+                }
+                uint8x8_t interleaved_1 = vld1_u8(tmp);
+                uint16x8_t wide_1 = vmovl_u8(interleaved_1);
+                int32x4_t v2 = vsubq_s32(vreinterpretq_s32_u32(vmovl_u16(vget_low_u16(wide_1))), bias);
+                acc2 = vfmaq_f32(acc2, vmulq_f32(vcvtq_f32_s32(v2), scale_v), vld1q_f32(inp + 8));
+                int32x4_t v3 = vsubq_s32(vreinterpretq_s32_u32(vmovl_u16(vget_high_u16(wide_1))), bias);
+                acc3 = vfmaq_f32(acc3, vmulq_f32(vcvtq_f32_s32(v3), scale_v), vld1q_f32(inp + 12));
+            }
 
-            /* Group 2: lo[4..7] → values 8,10,12,14 */
-            int32x4_t v2 = vsubq_s32(vreinterpretq_s32_u32(vmovl_u16(vget_high_u16(lo16))), bias);
-            float32x4_t f2 = vmulq_f32(vcvtq_f32_s32(v2), scale_v);
-            acc2 = vfmaq_f32(acc2, f2, vld1q_f32(inp + 8));
+            /* Bytes 8-11 → values 16-23 */
+            {
+                uint8x8_t lo_high8 = vget_high_u8(lo_nib);
+                uint8x8_t hi_high8 = vget_high_u8(hi_nib);
+                uint8_t tmp[8];
+                uint8_t lo_arr[8], hi_arr[8];
+                vst1_u8(lo_arr, lo_high8);
+                vst1_u8(hi_arr, hi_high8);
+                for (int j = 0; j < 4; j++) {
+                    tmp[j * 2]     = lo_arr[j];
+                    tmp[j * 2 + 1] = hi_arr[j];
+                }
+                uint8x8_t interleaved_2 = vld1_u8(tmp);
+                uint16x8_t wide_2 = vmovl_u8(interleaved_2);
+                int32x4_t v4 = vsubq_s32(vreinterpretq_s32_u32(vmovl_u16(vget_low_u16(wide_2))), bias);
+                acc0 = vfmaq_f32(acc0, vmulq_f32(vcvtq_f32_s32(v4), scale_v), vld1q_f32(inp + 16));
+                int32x4_t v5 = vsubq_s32(vreinterpretq_s32_u32(vmovl_u16(vget_high_u16(wide_2))), bias);
+                acc1 = vfmaq_f32(acc1, vmulq_f32(vcvtq_f32_s32(v5), scale_v), vld1q_f32(inp + 20));
+            }
 
-            /* Group 3: hi[4..7] → values 9,11,13,15 */
-            int32x4_t v3 = vsubq_s32(vreinterpretq_s32_u32(vmovl_u16(vget_high_u16(hi16))), bias);
-            float32x4_t f3 = vmulq_f32(vcvtq_f32_s32(v3), scale_v);
-            acc3 = vfmaq_f32(acc3, f3, vld1q_f32(inp + 9));
-
-            /* Groups 4-7: hi nibble bytes 8-15 (values 16-31) */
-            uint8x8_t lo_high8 = vget_high_u8(lo_nib);
-            uint8x8_t hi_high8 = vget_high_u8(hi_nib);
-            uint16x8_t lo16h = vmovl_u8(lo_high8);
-            uint16x8_t hi16h = vmovl_u8(hi_high8);
-
-            int32x4_t v4 = vsubq_s32(vreinterpretq_s32_u32(vmovl_u16(vget_low_u16(lo16h))), bias);
-            acc0 = vfmaq_f32(acc0, vmulq_f32(vcvtq_f32_s32(v4), scale_v), vld1q_f32(inp + 16));
-
-            int32x4_t v5 = vsubq_s32(vreinterpretq_s32_u32(vmovl_u16(vget_low_u16(hi16h))), bias);
-            acc1 = vfmaq_f32(acc1, vmulq_f32(vcvtq_f32_s32(v5), scale_v), vld1q_f32(inp + 17));
-
-            int32x4_t v6 = vsubq_s32(vreinterpretq_s32_u32(vmovl_u16(vget_high_u16(lo16h))), bias);
-            acc2 = vfmaq_f32(acc2, vmulq_f32(vcvtq_f32_s32(v6), scale_v), vld1q_f32(inp + 24));
-
-            int32x4_t v7 = vsubq_s32(vreinterpretq_s32_u32(vmovl_u16(vget_high_u16(hi16h))), bias);
-            acc3 = vfmaq_f32(acc3, vmulq_f32(vcvtq_f32_s32(v7), scale_v), vld1q_f32(inp + 25));
+            /* Bytes 12-15 → values 24-31 */
+            {
+                uint8x8_t lo_high8 = vget_high_u8(lo_nib);
+                uint8x8_t hi_high8 = vget_high_u8(hi_nib);
+                uint8_t tmp[8];
+                uint8_t lo_arr[8], hi_arr[8];
+                vst1_u8(lo_arr, lo_high8);
+                vst1_u8(hi_arr, hi_high8);
+                for (int j = 0; j < 4; j++) {
+                    tmp[j * 2]     = lo_arr[4 + j];
+                    tmp[j * 2 + 1] = hi_arr[4 + j];
+                }
+                uint8x8_t interleaved_3 = vld1_u8(tmp);
+                uint16x8_t wide_3 = vmovl_u8(interleaved_3);
+                int32x4_t v6 = vsubq_s32(vreinterpretq_s32_u32(vmovl_u16(vget_low_u16(wide_3))), bias);
+                acc2 = vfmaq_f32(acc2, vmulq_f32(vcvtq_f32_s32(v6), scale_v), vld1q_f32(inp + 24));
+                int32x4_t v7 = vsubq_s32(vreinterpretq_s32_u32(vmovl_u16(vget_high_u16(wide_3))), bias);
+                acc3 = vfmaq_f32(acc3, vmulq_f32(vcvtq_f32_s32(v7), scale_v), vld1q_f32(inp + 28));
+            }
 
             w += 16;
         }
