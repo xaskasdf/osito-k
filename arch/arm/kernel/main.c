@@ -155,6 +155,9 @@ void kernel_main(void *dtb)
     }
     serial_puts("\n");
 
+    /* Step 2: GIC */
+    gic_init();
+
     serial_puts("[KERN] Boot complete. Halting.\n");
 
     for (;;)

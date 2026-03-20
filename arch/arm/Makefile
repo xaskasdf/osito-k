@@ -46,7 +46,7 @@ LDFLAGS := -nostdlib -T $(LDSCRIPT)
 
 # Sources
 ASM_SRCS := boot/start.S
-C_SRCS   := kernel/main.c kernel/serial.c \
+C_SRCS   := kernel/main.c kernel/serial.c kernel/gic.c \
             $(wildcard $(PLAT_DIR)/*.c)
 
 # Objects
