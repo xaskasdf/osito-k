@@ -16,6 +16,7 @@
  */
 
 #include "../include/types.h"
+#include "gui.h"
 
 /* ── External functions ──────────────────────────────────────── */
 
@@ -89,8 +90,7 @@ static int32_t  focused_window = -1;  /* index into windows[] */
 static int render_order[MAX_WINDOWS];
 static int render_count;
 
-/* Desktop background color */
-static uint32_t desktop_color = 0xFF1A1A2E;  /* Dark blue-gray */
+/* Desktop background now rendered by gui_desktop_render() */
 
 /* Cursor appearance (simple 8×8 white arrow) */
 static const uint8_t cursor_bitmap[8] = {
@@ -330,10 +330,11 @@ static void compositor_render_frame(void)
         }
     }
 
-    /* Fill desktop background */
-    for (uint32_t y = 0; y < h; y++)
-        for (uint32_t x = 0; x < w; x++)
-            back[y * p + x] = desktop_color;
+    /* Render elementaryOS-inspired desktop */
+    {
+        gui_surface_t screen = { back, w, h, p };
+        gui_desktop_render(&screen);
+    }
 
     /* Blit windows bottom-to-top */
     for (int i = 0; i < render_count; i++) {
@@ -462,6 +463,12 @@ void compositor_init(void)
     key_ring_tail = 0;
     comp_button_state = 0;
     comp_wheel_accum = 0;
+
+    /* Initialize GUI desktop layout */
+    uint32_t sw = display_get_width();
+    uint32_t sh = display_get_height();
+    if (sw && sh)
+        gui_desktop_init(sw, sh);
 
     serial_puts("[COMP] Compositor initialized (max ");
     serial_putdec(MAX_WINDOWS);

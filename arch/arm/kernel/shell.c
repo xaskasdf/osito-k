@@ -28,6 +28,7 @@ static void cmd_help(void)
     serial_puts("  mem      Show heap stats\n");
     serial_puts("  uname    Show system info\n");
     serial_puts("  uptime   Show uptime\n");
+    serial_puts("  desktop  Launch graphical desktop\n");
     serial_puts("  reboot   Reboot system\n");
     serial_puts("  clear    Clear screen\n");
 }
@@ -106,6 +107,15 @@ static void cmd_uptime(void)
     serial_puts(" ticks)\n");
 }
 
+/* Desktop GUI task (gui_task.c) */
+extern void gui_task(void *arg);
+
+static void cmd_desktop(void)
+{
+    serial_puts("[GUI ] Launching desktop...\n");
+    task_create("desktop", gui_task, (void *)0, 2);
+}
+
 void shell_run(void)
 {
     char buf[256];
@@ -125,6 +135,7 @@ void shell_run(void)
         else if (strcmp(argv[0], "mem") == 0)     cmd_mem();
         else if (strcmp(argv[0], "uname") == 0)   cmd_uname();
         else if (strcmp(argv[0], "uptime") == 0)  cmd_uptime();
+        else if (strcmp(argv[0], "desktop") == 0) cmd_desktop();
         else if (strcmp(argv[0], "reboot") == 0)  platform_reboot();
         else if (strcmp(argv[0], "clear") == 0)   serial_puts("\033[2J\033[H");
         else {

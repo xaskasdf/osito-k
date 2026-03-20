@@ -250,6 +250,7 @@ static void cmd_help(void)
     sh_puts("  httpd     HTTP server (httpd [port] / httpd stop)\n");
     sh_puts("  winexec   Run a Win32 PE executable (winexec file.exe)\n");
     sh_puts("  clear     Clear screen\n");
+    sh_puts("  desktop   Launch graphical desktop (elementaryOS style)\n");
     sh_puts("  kexec     Load + boot kernel from disk (kexec [file])\n");
     sh_puts("  reboot    Reboot system\n");
     sh_puts("  halt      Halt CPU\n");
@@ -2174,6 +2175,20 @@ static void shell_exec(char *line)
             }
             compat32_crash_jmpbuf = NULL;
         }
+    } else if (strcmp(cmd, "desktop") == 0) {
+        /* Launch compositor with elementaryOS desktop */
+        extern void display_init(void);
+        extern void input_events_init(void);
+        extern void shm_init(void);
+        extern void compositor_init(void);
+        extern void compositor_thread(void);
+
+        display_init();
+        input_events_init();
+        shm_init();
+        compositor_init();
+        sched_spawn("compositor", compositor_thread);
+        sh_puts("Desktop launched. Compositor running.\n");
     } else if (strcmp(cmd, "clear") == 0) {
         cmd_clear();
     } else if (strcmp(cmd, "kexec") == 0) {
@@ -2182,6 +2197,17 @@ static void shell_exec(char *line)
         cmd_reboot();
     } else if (strcmp(cmd, "halt") == 0) {
         cmd_halt();
+    } else if (strcmp(cmd, "beep") == 0) {
+        extern bool hda_is_ready(void);
+        extern void hda_play_tone(uint32_t, uint32_t);
+        if (!hda_is_ready()) {
+            sh_puts("HDA: not initialized\n");
+        } else {
+            uint32_t freq = 440, dur = 500;
+            if (argc > 1) { freq = 0; for (const char *p = argv[1]; *p >= '0' && *p <= '9'; p++) freq = freq * 10 + (*p - '0'); }
+            if (argc > 2) { dur = 0;  for (const char *p = argv[2]; *p >= '0' && *p <= '9'; p++) dur  = dur  * 10 + (*p - '0'); }
+            hda_play_tone(freq, dur);
+        }
     } else {
         sh_puts("Unknown command: ");
         sh_puts(cmd);

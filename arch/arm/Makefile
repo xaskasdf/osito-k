@@ -37,7 +37,7 @@ CFLAGS := -ffreestanding -nostdlib -nostartfiles \
           -march=armv8.2-a -mtune=cortex-a78 -O2 \
           -mgeneral-regs-only \
           -Wall -Wextra -Wno-unused-parameter \
-          -Iinclude -I$(PLAT_DIR)
+          -Iinclude -I$(PLAT_DIR) -I../../gui -D__KERNEL_ARM__=1
 
 ASFLAGS := -ffreestanding -nostdlib -nostartfiles \
            -march=armv8.2-a -D__ASSEMBLY__
@@ -47,13 +47,17 @@ LDFLAGS := -nostdlib -T $(LDSCRIPT)
 # Sources
 ASM_SRCS := boot/start.S kernel/context_switch.S
 C_SRCS   := kernel/main.c kernel/serial.c kernel/gic.c kernel/timer.c kernel/heap.c kernel/sched.c \
-            kernel/framebuffer.c kernel/term.c kernel/shell.c \
+            kernel/framebuffer.c kernel/term.c kernel/shell.c kernel/gui_task.c \
             $(wildcard $(PLAT_DIR)/*.c)
+GUI_SRCS := ../../gui/gui_draw.c ../../gui/gui_text.c \
+            ../../gui/gui_panel.c ../../gui/gui_dock.c \
+            ../../gui/gui_desktop.c ../../gui/gui_window.c
 
 # Objects
 ASM_OBJS := $(patsubst %.S,$(BUILD)/%.o,$(ASM_SRCS))
 C_OBJS   := $(patsubst %.c,$(BUILD)/%.o,$(C_SRCS))
-OBJS     := $(ASM_OBJS) $(C_OBJS)
+GUI_OBJS := $(patsubst ../../gui/%.c,$(BUILD)/gui/%.o,$(GUI_SRCS))
+OBJS     := $(ASM_OBJS) $(C_OBJS) $(GUI_OBJS)
 
 # Outputs
 ELF   := $(BUILD)/kernel.elf
@@ -86,6 +90,12 @@ $(BUILD)/%.o: %.S
 
 # C sources
 $(BUILD)/%.o: %.c
+	@echo "[CC] $<"
+	@mkdir -p $(dir $@)
+	@$(CC) $(CFLAGS) -c $< -o $@
+
+# GUI shared library
+$(BUILD)/gui/%.o: ../../gui/%.c
 	@echo "[CC] $<"
 	@mkdir -p $(dir $@)
 	@$(CC) $(CFLAGS) -c $< -o $@

@@ -34,7 +34,7 @@ BFLAGS   = -ffreestanding -fno-stack-protector -fshort-wchar \
 # Kernel flags — NO PIE, NO -fno-jump-tables (EFI restrictions lifted!)
 KCFLAGS  = -std=c11 -ffreestanding -fno-stack-protector -mno-red-zone \
            -Wall -Wextra -O2 -fno-pie -Iinclude -I../../include/common \
-           -D__KERNEL_X86__=1
+           -I../../gui -D__KERNEL_X86__=1
 
 # Flags for precompiled .o files that may be called from TCC code.
 # TCC doesn't guarantee 16-byte stack alignment (SysV ABI requires it).
@@ -75,7 +75,7 @@ KERN_SRC = kernel/main.c kernel/serial.c kernel/framebuffer.c \
 ASM_SRC  = kernel/isr_stubs.S kernel/syscall_entry.S kernel/setjmp.S kernel/kexec_tramp.S
 DRV_SRC  = drivers/nvme.c drivers/i211.c drivers/gpu.c drivers/gsp.c \
            drivers/sass.c drivers/gmmu.c drivers/gpu_tensor.c drivers/gpu_inference.c \
-           drivers/xhci.c
+           drivers/xhci.c drivers/hda.c
 FS_SRC   = fs/ositofs2.c fs/gpt.c fs/gguf.c fs/vfs.c
 WIN32_SRC = win32/win32_init.c win32/compat32.c win32/pe.c win32/winexec.c \
             win32/handle.c win32/ntsyscall.c win32/ntprocess.c win32/ntsync.c \
@@ -87,6 +87,9 @@ WIN32_SRC = win32/win32_init.c win32/compat32.c win32/pe.c win32/winexec.c \
             win32/comctl32_shim.c win32/comdlg32_shim.c \
             win32/winmm_shim.c win32/wsock32_shim.c
 WIN32_ASM = win32/int2e_stub.S
+GUI_SRC  = ../../gui/gui_draw.c ../../gui/gui_text.c \
+           ../../gui/gui_panel.c ../../gui/gui_dock.c \
+           ../../gui/gui_desktop.c ../../gui/gui_window.c
 
 # ── Object files ──────────────────────────────────────────────
 
@@ -97,8 +100,9 @@ DRV_OBJ   = $(DRV_SRC:%.c=$(BUILD)/%.o)
 FS_OBJ    = $(FS_SRC:%.c=$(BUILD)/%.o)
 WIN32_OBJ = $(WIN32_SRC:%.c=$(BUILD)/%.o)
 WIN32_ASM_OBJ = $(WIN32_ASM:%.S=$(BUILD)/%.o)
+GUI_OBJ   = $(patsubst ../../gui/%.c,$(BUILD)/gui/%.o,$(GUI_SRC))
 
-ALL_KERN_OBJ = $(KERN_OBJ) $(ASM_OBJ) $(DRV_OBJ) $(FS_OBJ) $(WIN32_OBJ) $(WIN32_ASM_OBJ)
+ALL_KERN_OBJ = $(KERN_OBJ) $(ASM_OBJ) $(DRV_OBJ) $(FS_OBJ) $(WIN32_OBJ) $(WIN32_ASM_OBJ) $(GUI_OBJ)
 
 # ── Targets ───────────────────────────────────────────────────
 
@@ -167,9 +171,19 @@ $(BUILD)/win32/compat32.o: win32/compat32.c | $(BUILD)/win32
 $(BUILD)/win32/msvcrt_shim.o: win32/msvcrt_shim.c | $(BUILD)/win32
 	$(CC) $(KCFLAGS_PRECOMP) -Iwin32 -c -o $@ $<
 
+$(BUILD)/win32/ddraw_shim.o: win32/ddraw_shim.c | $(BUILD)/win32
+	$(CC) $(KCFLAGS_PRECOMP) -Iwin32 -c -o $@ $<
+
+$(BUILD)/win32/dsound_shim.o: win32/dsound_shim.c | $(BUILD)/win32
+	$(CC) $(KCFLAGS_PRECOMP) -Iwin32 -c -o $@ $<
+
 # Win32 assembly
 $(BUILD)/win32/%.o: win32/%.S | $(BUILD)/win32
 	$(CC) -c -o $@ $<
+
+# GUI shared library
+$(BUILD)/gui/%.o: ../../gui/%.c | $(BUILD)/gui
+	$(CC) $(KCFLAGS) -c -o $@ $<
 
 # ── TCC kernel build (Phase 1: verify TCC can produce working kernel) ────
 #
@@ -287,7 +301,7 @@ $(BUILD)/efi_main.o: boot/efi_main.c | $(BUILD)/boot
 
 # ── Build directories ─────────────────────────────────────────
 
-$(BUILD) $(BUILD)/boot $(BUILD)/kernel $(BUILD)/drivers $(BUILD)/fs $(BUILD)/win32:
+$(BUILD) $(BUILD)/boot $(BUILD)/kernel $(BUILD)/drivers $(BUILD)/fs $(BUILD)/win32 $(BUILD)/gui:
 	mkdir -p $@
 
 clean:
