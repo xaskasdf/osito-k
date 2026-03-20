@@ -908,6 +908,21 @@ NTSTATUS compat32_patch_iat(PE_IMAGE_INFO *info)
                 *iat_ptr = (uint32_t)(ULONG_PTR)resolved;
                 direct++;
 
+                /* Catch imports resolved to VirtualAlloc range (never valid DLL code) */
+                {
+                    uint32_t val = (uint32_t)(ULONG_PTR)resolved;
+                    if (val >= 0x40000000 && val < 0x80000000) {
+                        serial_puts("[IAT-WARN] VirtualAlloc addr: ");
+                        if (func_name) serial_puts(func_name);
+                        serial_puts(" from ");
+                        serial_puts(dll_name);
+                        serial_puts(" -> 0x");
+                        serial_puthex(val, 8);
+                        serial_puts("\n");
+                        *iat_ptr = unresolved_stub_addr;
+                    }
+                }
+
                 /* Log GIsRunning resolution for debugging */
                 if (func_name && func_name[0]=='?' && func_name[1]=='G' &&
                     func_name[2]=='I' && func_name[3]=='s' && func_name[4]=='R') {
