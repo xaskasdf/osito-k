@@ -8,6 +8,18 @@
 
 #include "../include/hal.h"
 #include "../include/types.h"
+#include "../drivers/gpu.h"
+
+/* GPU device global (populated by PCI scan if GPU found) */
+gpu_device_t gpu_dev;
+
+/* GPU PCI accessor — returns pointer to gpu_dev if populated, else NULL */
+gpu_device_t *pci_get_gpu(void)
+{
+    if (gpu_dev.vendor_id != 0)
+        return &gpu_dev;
+    return (gpu_device_t *)0;
+}
 
 /* AVX2 tensor stubs (never called — avx2_detected=0 on ARM64) */
 void rmsnorm_avx2(float *o, const float *x, const float *w, int n) { (void)o; (void)x; (void)w; (void)n; }

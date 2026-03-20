@@ -56,6 +56,8 @@ C_SRCS   := kernel/main.c kernel/serial.c kernel/gic.c kernel/timer.c \
             kernel/git.c kernel/zlib.c kernel/memcompress.c kernel/input_events.c \
             kernel/stubs.c \
             drivers/hda.c drivers/virtio_blk.c drivers/virtio_net.c \
+            drivers/gpu.c drivers/gsp.c drivers/sass.c drivers/gmmu.c \
+            drivers/gpu_tensor.c drivers/gpu_inference.c drivers/gpu_display.c \
             fs/ositofs2.c fs/gguf.c fs/gpt.c \
             $(wildcard $(PLAT_DIR)/*.c)
 GUI_SRCS := ../../gui/gui_draw.c ../../gui/gui_text.c \
@@ -114,6 +116,14 @@ $(BUILD)/kernel/inference.o: kernel/inference.c
 	@mkdir -p $(dir $@)
 	@$(CC) $(FP_CFLAGS) -c $< -o $@
 $(BUILD)/kernel/tokenizer.o: kernel/tokenizer.c
+	@echo "[CC] $< (FP)"
+	@mkdir -p $(dir $@)
+	@$(CC) $(FP_CFLAGS) -c $< -o $@
+$(BUILD)/drivers/gpu_inference.o: drivers/gpu_inference.c
+	@echo "[CC] $< (FP)"
+	@mkdir -p $(dir $@)
+	@$(CC) $(FP_CFLAGS) -c $< -o $@
+$(BUILD)/drivers/gpu_tensor.o: drivers/gpu_tensor.c
 	@echo "[CC] $< (FP)"
 	@mkdir -p $(dir $@)
 	@$(CC) $(FP_CFLAGS) -c $< -o $@

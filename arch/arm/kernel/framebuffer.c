@@ -231,6 +231,18 @@ void fb_puts_color(const char *s, uint32_t color)
     }
 }
 
+void fb_puthex(uint64_t val, int digits)
+{
+    static const char hex[] = "0123456789abcdef";
+    for (int i = digits - 1; i >= 0; i--)
+        fb_putc(hex[(val >> (i * 4)) & 0xF]);
+}
+
+void fb_putchar(char c)
+{
+    fb_putc(c);
+}
+
 void fb_putdec(uint64_t val)
 {
     char buf[21];

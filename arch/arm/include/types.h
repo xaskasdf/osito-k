@@ -9,6 +9,25 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include <stdbool.h>
+
+/* ── MMIO helpers (portable, used by GPU drivers) ──────── */
+
+static inline uint32_t mmio_read32(uintptr_t addr) {
+    return *(volatile uint32_t *)addr;
+}
+static inline void mmio_write32(uintptr_t addr, uint32_t val) {
+    *(volatile uint32_t *)addr = val;
+}
+static inline uint64_t mmio_read64(uintptr_t addr) {
+    return *(volatile uint64_t *)addr;
+}
+
+/* ── Memory barriers (ARM64 equivalents of x86 fences) ── */
+
+static inline void mb(void)  { __asm__ volatile("dmb osh"   ::: "memory"); }
+static inline void rmb(void) { __asm__ volatile("dmb oshld" ::: "memory"); }
+static inline void wmb(void) { __asm__ volatile("dmb oshst" ::: "memory"); }
 
 static inline void *memset(void *s, int c, size_t n) {
     uint8_t *p = (uint8_t *)s;
