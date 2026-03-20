@@ -44,6 +44,11 @@ typedef struct {
     uint8_t   num_oss;
     uint8_t   stream_id;
 
+    /* Detected format */
+    uint32_t  sample_rate;
+    uint8_t   bits_per_sample;
+    uint16_t  fmt_reg;
+
     /* DMA */
     hda_bdl_entry_t *bdl;
     int16_t  *audio_buf;
@@ -231,6 +236,8 @@ static uint32_t hda_cmd(uint8_t nid, uint32_t verb, uint32_t parm)
     return resp;
 }
 
+static void hda_detect_format(void);
+
 /* ── Codec Discovery ───────────────────────────────────────────── */
 
 static int hda_codec_init(void)
@@ -313,7 +320,94 @@ static int hda_codec_init(void)
         return -1;
     }
 
+    /* Detect best format from DAC capabilities */
+    hda_detect_format();
+
     return 0;
+}
+
+/* ── Format Auto-Detection ─────────────────────────────────────── */
+
+static void hda_detect_format(void)
+{
+    uint32_t pcm = hda_cmd(hda.dac_nid, HDA_VERB_GET_PARAM, HDA_PARAM_PCM_RATES);
+
+    /* Log supported rates */
+    serial_puts("[HDA] DAC rates:");
+    if (pcm & HDA_RATE_192KHZ)  serial_puts(" 192k");
+    if (pcm & HDA_RATE_1764KHZ) serial_puts(" 176.4k");
+    if (pcm & HDA_RATE_96KHZ)   serial_puts(" 96k");
+    if (pcm & HDA_RATE_882KHZ)  serial_puts(" 88.2k");
+    if (pcm & HDA_RATE_48KHZ)   serial_puts(" 48k");
+    if (pcm & HDA_RATE_441KHZ)  serial_puts(" 44.1k");
+    if (pcm & HDA_RATE_32KHZ)   serial_puts(" 32k");
+    if (pcm & HDA_RATE_22KHZ)   serial_puts(" 22k");
+    if (pcm & HDA_RATE_16KHZ)   serial_puts(" 16k");
+    if (pcm & HDA_RATE_11KHZ)   serial_puts(" 11k");
+    if (pcm & HDA_RATE_8KHZ)    serial_puts(" 8k");
+    serial_puts(" | bits:");
+    if (pcm & HDA_BITS_32) serial_puts(" 32");
+    if (pcm & HDA_BITS_24) serial_puts(" 24");
+    if (pcm & HDA_BITS_20) serial_puts(" 20");
+    if (pcm & HDA_BITS_16) serial_puts(" 16");
+    if (pcm & HDA_BITS_8)  serial_puts(" 8");
+    serial_puts("\n");
+
+    /* Select best sample rate (prefer 48kHz family, highest first) */
+    uint16_t fmt_rate;
+    if (pcm & HDA_RATE_192KHZ) {
+        hda.sample_rate = 192000;
+        fmt_rate = HDA_FMT_BASE_48 | HDA_FMT_MUL_4;
+    } else if (pcm & HDA_RATE_96KHZ) {
+        hda.sample_rate = 96000;
+        fmt_rate = HDA_FMT_BASE_48 | HDA_FMT_MUL_2;
+    } else if (pcm & HDA_RATE_1764KHZ) {
+        hda.sample_rate = 176400;
+        fmt_rate = HDA_FMT_BASE_441 | HDA_FMT_MUL_4;
+    } else if (pcm & HDA_RATE_882KHZ) {
+        hda.sample_rate = 88200;
+        fmt_rate = HDA_FMT_BASE_441 | HDA_FMT_MUL_2;
+    } else if (pcm & HDA_RATE_48KHZ) {
+        hda.sample_rate = 48000;
+        fmt_rate = HDA_FMT_BASE_48 | HDA_FMT_MUL_1;
+    } else if (pcm & HDA_RATE_441KHZ) {
+        hda.sample_rate = 44100;
+        fmt_rate = HDA_FMT_BASE_441 | HDA_FMT_MUL_1;
+    } else {
+        /* Fallback: assume 48kHz */
+        hda.sample_rate = 48000;
+        fmt_rate = HDA_FMT_BASE_48 | HDA_FMT_MUL_1;
+    }
+
+    /* Select best bit depth */
+    uint16_t fmt_bits;
+    if (pcm & HDA_BITS_32) {
+        hda.bits_per_sample = 32;
+        fmt_bits = HDA_FMT_32BIT;
+    } else if (pcm & HDA_BITS_24) {
+        hda.bits_per_sample = 24;
+        fmt_bits = HDA_FMT_24BIT;
+    } else if (pcm & HDA_BITS_20) {
+        hda.bits_per_sample = 20;
+        fmt_bits = HDA_FMT_20BIT;
+    } else if (pcm & HDA_BITS_16) {
+        hda.bits_per_sample = 16;
+        fmt_bits = HDA_FMT_16BIT;
+    } else {
+        hda.bits_per_sample = 16;
+        fmt_bits = HDA_FMT_16BIT;
+    }
+
+    /* Build FMT register: rate + bits + stereo */
+    hda.fmt_reg = fmt_rate | HDA_FMT_DIV_1 | fmt_bits | HDA_FMT_STEREO;
+
+    serial_puts("[HDA] Selected: ");
+    serial_putdec(hda.sample_rate / 1000);
+    serial_puts("kHz/");
+    serial_putdec(hda.bits_per_sample);
+    serial_puts("bit stereo (FMT=0x");
+    serial_puthex(hda.fmt_reg, 4);
+    serial_puts(")\n");
 }
 
 /* ── Stream Setup ──────────────────────────────────────────────── */
@@ -332,8 +426,9 @@ static int hda_stream_init(void)
     hda_write8(sd + HDA_SD_STS,
                HDA_SD_STS_BCIS | HDA_SD_STS_FIFOE | HDA_SD_STS_DESE);
 
-    /* Allocate audio buffer (page-aligned) */
-    hda.buf_size = HDA_BUF_SIZE;
+    /* Allocate audio buffer: 1 second at detected rate/depth/stereo */
+    uint32_t bytes_per_sample = (hda.bits_per_sample + 7) / 8;  /* round up for 20-bit */
+    hda.buf_size = hda.sample_rate * bytes_per_sample * 2;       /* stereo */
     hda.audio_buf = (int16_t *)mem_alloc_aligned(hda.buf_size, 4096);
     if (!hda.audio_buf) {
         serial_puts("[HDA] Failed to allocate audio buffer\n");
@@ -361,12 +456,18 @@ static int hda_stream_init(void)
 
     hda_write32(sd + HDA_SD_CBL, hda.buf_size);
     hda_write16(sd + HDA_SD_LVI, 0);  /* 1 BDL entry: LVI = 0 */
-    hda_write16(sd + HDA_SD_FMT, HDA_FMT_DEFAULT);
+    hda_write16(sd + HDA_SD_FMT, hda.fmt_reg);
 
     hda_write32(sd + HDA_SD_BDLPL, (uint32_t)(uint64_t)hda.bdl);
     hda_write32(sd + HDA_SD_BDLPU, (uint32_t)((uint64_t)hda.bdl >> 32));
 
-    serial_puts("[HDA] Stream configured (48kHz/16bit/stereo)\n");
+    serial_puts("[HDA] Stream configured (");
+    serial_putdec(hda.sample_rate / 1000);
+    serial_puts("kHz/");
+    serial_putdec(hda.bits_per_sample);
+    serial_puts("bit/stereo, ");
+    serial_putdec(hda.buf_size / 1024);
+    serial_puts("KB buf)\n");
     return 0;
 }
 
@@ -379,7 +480,7 @@ static void hda_setup_output(void)
             (hda.stream_id << 4) | 0);
 
     /* Set DAC format to match stream */
-    hda_cmd(hda.dac_nid, HDA_VERB_SET_STREAM_FMT, HDA_FMT_DEFAULT);
+    hda_cmd(hda.dac_nid, HDA_VERB_SET_STREAM_FMT, hda.fmt_reg);
 
     /* Power up DAC */
     hda_cmd(hda.dac_nid, HDA_VERB_SET_POWER, 0x00);
@@ -547,7 +648,8 @@ void hda_play_buffer(const int16_t *samples, uint32_t num_samples)
 {
     if (!hda.initialized) return;
 
-    uint32_t bytes = num_samples * 2 * 2;  /* stereo 16-bit */
+    uint32_t bps = (hda.bits_per_sample + 7) / 8;  /* bytes per sample */
+    uint32_t bytes = num_samples * bps * 2;         /* stereo */
     if (bytes > hda.buf_size) bytes = hda.buf_size;
 
     /* Copy samples to DMA buffer */
@@ -577,7 +679,7 @@ void hda_play_buffer(const int16_t *samples, uint32_t num_samples)
     hda_write32(sd + HDA_SD_CTL, ctl);
 
     /* Re-set format (some controllers need this after stop) */
-    hda_write16(sd + HDA_SD_FMT, HDA_FMT_DEFAULT);
+    hda_write16(sd + HDA_SD_FMT, hda.fmt_reg);
 
     /* Configure codec output pipeline */
     hda_setup_output();
@@ -594,20 +696,34 @@ void hda_play_tone(uint32_t freq_hz, uint32_t duration_ms)
 {
     if (!hda.initialized) return;
 
-    uint32_t num_samples = HDA_SAMPLE_RATE * duration_ms / 1000;
-    uint32_t max_samples = hda.buf_size / 4;  /* stereo 16-bit = 4 bytes/sample */
+    uint32_t bps = (hda.bits_per_sample + 7) / 8;
+    uint32_t frame_size = bps * 2;  /* stereo frame */
+    uint32_t num_samples = hda.sample_rate * duration_ms / 1000;
+    uint32_t max_samples = hda.buf_size / frame_size;
     if (num_samples > max_samples)
         num_samples = max_samples;
 
-    /* Generate sine wave via phase accumulator (8.8 fixed-point) */
+    /* Generate sine wave via phase accumulator */
     uint32_t phase = 0;
-    uint32_t phase_inc = (freq_hz * 256) / HDA_SAMPLE_RATE;
+    uint32_t phase_inc = (freq_hz * 256) / hda.sample_rate;
+    uint8_t *buf = (uint8_t *)hda.audio_buf;
 
     for (uint32_t i = 0; i < num_samples; i++) {
-        int16_t val = sine_table[phase & 0xFF];
-        val = (int16_t)(val >> 1);  /* 50% volume to avoid clipping */
-        hda.audio_buf[i * 2]     = val;  /* Left */
-        hda.audio_buf[i * 2 + 1] = val;  /* Right */
+        int32_t val = sine_table[phase & 0xFF];
+        val >>= 1;  /* 50% volume */
+
+        if (hda.bits_per_sample <= 16) {
+            int16_t s = (int16_t)val;
+            int16_t *p = (int16_t *)(buf + i * frame_size);
+            p[0] = s;  /* Left */
+            p[1] = s;  /* Right */
+        } else {
+            /* Scale 16-bit sine to 32-bit range */
+            int32_t s32 = val << 16;
+            int32_t *p = (int32_t *)(buf + i * frame_size);
+            p[0] = s32;  /* Left */
+            p[1] = s32;  /* Right */
+        }
         phase += phase_inc;
     }
 
@@ -615,7 +731,11 @@ void hda_play_tone(uint32_t freq_hz, uint32_t duration_ms)
     serial_putdec(freq_hz);
     serial_puts(" Hz, ");
     serial_putdec(duration_ms);
-    serial_puts(" ms\n");
+    serial_puts(" ms @ ");
+    serial_putdec(hda.sample_rate / 1000);
+    serial_puts("kHz/");
+    serial_putdec(hda.bits_per_sample);
+    serial_puts("bit\n");
 
     hda_play_buffer(hda.audio_buf, num_samples);
 }

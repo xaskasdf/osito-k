@@ -95,7 +95,20 @@
 #define HDA_FMT_16BIT     (1 << 4)   /* 16 bits per sample */
 #define HDA_FMT_STEREO    1          /* 2 channels (N-1) */
 
-/* 48kHz, 16-bit, stereo = 0x0011 */
+/* Additional multiplier/divisor encodings */
+#define HDA_FMT_MUL_2     (1 << 11)  /* x2 multiplier */
+#define HDA_FMT_MUL_3     (2 << 11)  /* x3 multiplier */
+#define HDA_FMT_MUL_4     (3 << 11)  /* x4 multiplier */
+#define HDA_FMT_DIV_2     (1 << 8)   /* /2 divisor */
+#define HDA_FMT_DIV_3     (2 << 8)   /* /3 divisor */
+
+/* Additional bit depth encodings */
+#define HDA_FMT_8BIT      (0 << 4)   /* 8 bits per sample */
+#define HDA_FMT_20BIT     (2 << 4)   /* 20 bits per sample */
+#define HDA_FMT_24BIT     (3 << 4)   /* 24 bits per sample */
+#define HDA_FMT_32BIT     (4 << 4)   /* 32 bits per sample */
+
+/* 48kHz, 16-bit, stereo = 0x0011 (fallback default) */
 #define HDA_FMT_DEFAULT   (HDA_FMT_BASE_48 | HDA_FMT_MUL_1 | HDA_FMT_DIV_1 | \
                            HDA_FMT_16BIT | HDA_FMT_STEREO)
 
@@ -131,8 +144,29 @@
 #define HDA_PARAM_NODE_COUNT    0x04
 #define HDA_PARAM_FUNC_GRP_TYPE 0x05
 #define HDA_PARAM_AUDIO_WIDGET  0x09
-#define HDA_PARAM_PCM_RATES     0x0A
+#define HDA_PARAM_PCM_RATES     0x0A    /* Supported PCM sizes & rates */
+#define HDA_PARAM_STREAM_FMTS   0x0B    /* Supported stream formats */
 #define HDA_PARAM_PIN_CAP       0x0C
+
+/* PCM Size/Rates parameter (0x0A) bitmask — rates (bits 0-10) */
+#define HDA_RATE_8KHZ     (1 << 0)
+#define HDA_RATE_11KHZ    (1 << 1)
+#define HDA_RATE_16KHZ    (1 << 2)
+#define HDA_RATE_22KHZ    (1 << 3)
+#define HDA_RATE_32KHZ    (1 << 4)
+#define HDA_RATE_441KHZ   (1 << 5)
+#define HDA_RATE_48KHZ    (1 << 6)
+#define HDA_RATE_882KHZ   (1 << 7)
+#define HDA_RATE_96KHZ    (1 << 8)
+#define HDA_RATE_1764KHZ  (1 << 9)
+#define HDA_RATE_192KHZ   (1 << 10)
+
+/* PCM Size/Rates parameter (0x0A) bitmask — bit depths (bits 16-20) */
+#define HDA_BITS_8        (1 << 16)
+#define HDA_BITS_16       (1 << 17)
+#define HDA_BITS_20       (1 << 18)
+#define HDA_BITS_24       (1 << 19)
+#define HDA_BITS_32       (1 << 20)
 #define HDA_PARAM_CONN_LIST_LEN 0x0E
 #define HDA_PARAM_AMP_OUT_CAP   0x12
 
