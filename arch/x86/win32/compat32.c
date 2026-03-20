@@ -24,7 +24,7 @@ extern void serial_puts(const char *s);
 extern void serial_puthex(uint64_t val, int digits);
 extern void serial_putdec(uint64_t val);
 extern void *mem_alloc_pages(uint64_t count);
-extern int  kern_setjmp(uint64_t *buf);
+extern int  kern_setjmp(uint64_t *buf) __attribute__((returns_twice));
 extern void kern_longjmp(uint64_t *buf, int val);
 
 /* ── Global compat32 mode flag ────────────────────────────────── */

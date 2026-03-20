@@ -153,7 +153,7 @@ static process_t *current_proc;
 static uint32_t next_pid = 1;
 
 /* Kernel return context — saved before exec, restored on exit */
-extern int  kern_setjmp(uint64_t *buf);
+extern int  kern_setjmp(uint64_t *buf) __attribute__((returns_twice));
 extern void kern_longjmp(uint64_t *buf, int val);
 
 static uint64_t exec_jmpbuf[8];   /* setjmp/longjmp buffer */

@@ -2164,7 +2164,7 @@ static void shell_exec(char *line)
             sh_puts("Usage: winexec <file.exe>\n");
         } else {
             extern int win32_exec(const char *filename);
-            extern int  kern_setjmp(uint64_t *buf);
+            extern int  kern_setjmp(uint64_t *buf) __attribute__((returns_twice));
             extern uint64_t *compat32_crash_jmpbuf;
             static uint64_t winexec_jmpbuf[8];
             compat32_crash_jmpbuf = winexec_jmpbuf;
