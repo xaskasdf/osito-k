@@ -475,6 +475,30 @@ void isr_handler(interrupt_frame_t *frame)
             serial_puts(" #");
             serial_putdec(bytecode_fix_count);
             serial_puts("\n");
+            /* Full diagnostic for first hit */
+            if (bytecode_fix_count == 1) {
+                serial_puts("  EAX=0x"); serial_puthex((uint32_t)frame->rax, 8);
+                serial_puts(" EBX=0x"); serial_puthex((uint32_t)frame->rbx, 8);
+                serial_puts(" ECX=0x"); serial_puthex((uint32_t)frame->rcx, 8);
+                serial_puts(" EDX=0x"); serial_puthex((uint32_t)frame->rdx, 8);
+                serial_puts("\n  ESI=0x"); serial_puthex((uint32_t)frame->rsi, 8);
+                serial_puts(" EDI=0x"); serial_puthex((uint32_t)frame->rdi, 8);
+                serial_puts(" EBP=0x"); serial_puthex((uint32_t)frame->rbp, 8);
+                serial_puts(" ESP=0x"); serial_puthex((uint32_t)frame->rsp, 8);
+                uint32_t iat_val = *(volatile uint32_t *)(uintptr_t)0x105A5E08;
+                serial_puts("\n  IAT[5E08]=0x"); serial_puthex(iat_val, 8);
+                uint32_t *sp = (uint32_t *)(uintptr_t)(frame->rsp & 0xFFFFFFFF);
+                serial_puts(" retaddr=0x"); serial_puthex(sp[0], 8);
+                if (sp[0] > 0x10000000 && sp[0] < 0x20000000) {
+                    uint8_t *caller = (uint8_t *)(uintptr_t)(sp[0] - 8);
+                    serial_puts("\n  caller: ");
+                    for (int bi = 0; bi < 12; bi++) {
+                        serial_puthex(caller[bi], 2);
+                        serial_puts(" ");
+                    }
+                }
+                serial_puts("\n");
+            }
         }
         uint32_t *sp32 = (uint32_t *)(uintptr_t)(frame->rsp & 0xFFFFFFFF);
         frame->rip = sp32[0];
