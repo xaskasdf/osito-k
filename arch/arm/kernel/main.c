@@ -158,6 +158,9 @@ void kernel_main(void *dtb)
     /* Step 3: Timer (100 Hz) */
     timer_init(100);
 
+    /* Step 4: Heap */
+    heap_init();
+
     /* Enable IRQs */
     irq_enable();
     serial_puts("[KERN] IRQs enabled\n");
