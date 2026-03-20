@@ -84,6 +84,7 @@ _hang:
  * version (like ESP8266's context_switch.S) goes here.
  */
 .balign 0x800
+.globl _vectors
 _vectors:
     /* Current EL with SP0 */
     b       _exception_sync

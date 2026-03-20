@@ -51,6 +51,7 @@ C_SRCS   := kernel/main.c kernel/serial.c kernel/gic.c kernel/timer.c \
             kernel/syscall.c kernel/elf.c kernel/process.c \
             kernel/framebuffer.c kernel/term.c kernel/shell.c kernel/gui_task.c \
             kernel/pci.c kernel/net.c \
+            kernel/crypto.c kernel/tls.c kernel/http.c kernel/smp.c \
             drivers/hda.c drivers/virtio_blk.c drivers/virtio_net.c \
             fs/ositofs2.c \
             $(wildcard $(PLAT_DIR)/*.c)

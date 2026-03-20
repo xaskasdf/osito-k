@@ -241,7 +241,13 @@ void kernel_main(void *dtb)
         }
     }
 
-    /* Step 10: Scheduler + shell */
+    /* Step 10: SMP — boot secondary CPUs */
+    {
+        extern void smp_boot_aps(int num_cpus);
+        smp_boot_aps(4);  /* QEMU virt default: try 4 cores */
+    }
+
+    /* Step 11: Scheduler + shell */
     sched_init();
     term_init();
     task_create("shell", shell_wrapper, (void *)0, 1);
