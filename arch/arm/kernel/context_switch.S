@@ -112,7 +112,7 @@ sched_start_asm:
     /* Enable IRQs (equivalent of SPSR.I=0 after eret) */
     msr     DAIFClr, #0x2
 
-    /* Fall through to trampoline */
+    /* Fall through to task_entry_trampoline */
 
 /* Task entry trampoline — new tasks start here via eret */
 /* x19 = func pointer, x20 = arg (callee-saved, survive eret) */
@@ -123,3 +123,11 @@ task_entry_trampoline:
     bl      task_exit_handler   /* if func returns */
 1:  wfe
     b       1b
+
+/*
+ * proc_exit_trampoline -- eret target after sys_exit.
+ * Returns to C caller (proc_run's entry() call returns).
+ */
+.globl proc_exit_trampoline
+proc_exit_trampoline:
+    ret

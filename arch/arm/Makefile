@@ -48,6 +48,7 @@ LDFLAGS := -nostdlib -T $(LDSCRIPT)
 ASM_SRCS := boot/start.S kernel/context_switch.S
 C_SRCS   := kernel/main.c kernel/serial.c kernel/gic.c kernel/timer.c \
             kernel/memory.c kernel/paging.c kernel/heap.c kernel/sched.c \
+            kernel/syscall.c kernel/elf.c kernel/process.c \
             kernel/framebuffer.c kernel/term.c kernel/shell.c kernel/gui_task.c \
             kernel/pci.c drivers/hda.c drivers/virtio_blk.c \
             fs/ositofs2.c \

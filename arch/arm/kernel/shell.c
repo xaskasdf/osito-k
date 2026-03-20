@@ -8,6 +8,7 @@
 
 extern void hda_play_tone(uint32_t freq_hz, uint32_t duration_ms);
 extern bool hda_is_ready(void);
+extern int proc_run(const char *filename);
 
 #define MAX_ARGS 16
 
@@ -34,6 +35,7 @@ static void cmd_help(void)
     serial_puts("  uptime   Show uptime\n");
     serial_puts("  ls       List files\n");
     serial_puts("  cat      Show file contents\n");
+    serial_puts("  exec     Run ELF binary\n");
     serial_puts("  beep     Play a tone (beep [freq] [ms])\n");
     serial_puts("  desktop  Launch graphical desktop\n");
     serial_puts("  reboot   Reboot system\n");
@@ -206,6 +208,25 @@ void shell_run(void)
         else if (strcmp(argv[0], "uptime") == 0)  cmd_uptime();
         else if (strcmp(argv[0], "ls") == 0)      cmd_ls();
         else if (strcmp(argv[0], "cat") == 0)    cmd_cat(argc, argv);
+        else if (strcmp(argv[0], "exec") == 0) {
+            if (argc < 2) serial_puts("Usage: exec <filename>\n");
+            else proc_run(argv[1]);
+        }
+        else if (strcmp(argv[0], "svctest") == 0) {
+            /* Inline SVC test — no ELF loading */
+            serial_puts("[TEST] Calling SVC write...\n");
+            const char *msg = "SVC write works!\n";
+            register uint64_t x0 __asm__("x0") = 1;        /* fd */
+            register uint64_t x1 __asm__("x1") = (uint64_t)msg;
+            register uint64_t x2 __asm__("x2") = 17;       /* len */
+            register uint64_t x8 __asm__("x8") = 64;       /* SYS_write */
+            __asm__ volatile("svc #0" : "+r"(x0)
+                             : "r"(x1), "r"(x2), "r"(x8)
+                             : "memory");
+            serial_puts("[TEST] SVC returned, x0=");
+            serial_putdec(x0);
+            serial_puts("\n");
+        }
         else if (strcmp(argv[0], "beep") == 0)    cmd_beep(argc, argv);
         else if (strcmp(argv[0], "desktop") == 0) cmd_desktop();
         else if (strcmp(argv[0], "reboot") == 0)  platform_reboot();
