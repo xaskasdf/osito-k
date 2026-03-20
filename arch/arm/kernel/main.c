@@ -162,29 +162,13 @@ void serror_handler(uint64_t esr)
 }
 
 /* ========================================================================
- * Scheduler test tasks
+ * Shell wrapper (matches task_func_t signature)
  * ======================================================================== */
 
-static void test_task_a(void *arg) {
+static void shell_wrapper(void *arg)
+{
     (void)arg;
-    for (int i = 0; i < 5; i++) {
-        serial_puts("[A] tick=");
-        serial_putdec(timer_get_tick_count());
-        serial_puts("\n");
-        task_delay_ms(500);
-    }
-    serial_puts("[A] done\n");
-}
-
-static void test_task_b(void *arg) {
-    (void)arg;
-    for (int i = 0; i < 5; i++) {
-        serial_puts("[B] tick=");
-        serial_putdec(timer_get_tick_count());
-        serial_puts("\n");
-        task_delay_ms(700);
-    }
-    serial_puts("[B] done\n");
+    shell_run();
 }
 
 /* ========================================================================
@@ -209,10 +193,10 @@ void kernel_main(void *dtb)
     /* Step 4: Heap */
     heap_init();
 
-    /* Step 5: Scheduler */
+    /* Step 5: Scheduler + shell */
     sched_init();
-    task_create("taskA", test_task_a, (void *)0, 1);
-    task_create("taskB", test_task_b, (void *)0, 1);
+    term_init();
+    task_create("shell", shell_wrapper, (void *)0, 1);
 
     serial_puts("[KERN] Boot complete.\n");
     irq_enable();
