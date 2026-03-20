@@ -684,20 +684,86 @@ static void ddraw_init_com32(void)
                                               "Surf_Unlock", 2, CC_STDCALL);
 
     /* Fill unimplemented DD slots with stub thunks (return S_OK).
-     * Prevents NULL-CALL when engine calls GetCaps, CreateClipper, etc. */
+     * CRITICAL: each stub MUST have the correct stdcall arg count,
+     * otherwise RET N pops wrong number of bytes → stack corruption
+     * → SEH chain destroyed → engine can't catch exceptions. */
     {
-        uint32_t stub = compat32_make_thunk_ex(
-            (uint64_t)(ULONG_PTR)dd_com_stub, "DD_stub", 12, CC_STDCALL);
-        for (int i = 0; i < 23; i++)
-            if (dd_vtbl32[i] == 0) dd_vtbl32[i] = stub;
+        /* IDirectDraw7 arg counts (including 'this'): */
+        static const uint8_t dd_args[23] = {
+            3,1,1,  /* 0:QI 1:AddRef 2:Release (implemented) */
+            1,      /* 3:Compact */
+            4,      /* 4:CreateClipper */
+            5,      /* 5:CreatePalette */
+            4,      /* 6:CreateSurface (implemented) */
+            3,      /* 7:DuplicateSurface */
+            5,      /* 8:EnumDisplayModes */
+            4,      /* 9:EnumSurfaces */
+            1,      /* 10:FlipToGDISurface */
+            3,      /* 11:GetCaps */
+            2,      /* 12:GetDisplayMode (implemented as slot 13) */
+            2,      /* 13:GetDisplayMode */
+            3,      /* 14:GetFourCCCodes */
+            2,      /* 15:GetGDISurface */
+            2,      /* 16:GetMonitorFrequency */
+            2,      /* 17:GetScanLine */
+            2,      /* 18:GetVerticalBlankStatus */
+            2,      /* 19:Initialize */
+            3,      /* 20:SetCooperativeLevel (implemented) */
+            6,      /* 21:SetDisplayMode (implemented) */
+            3,      /* 22:WaitForVerticalBlank */
+        };
+        for (int i = 0; i < 23; i++) {
+            if (dd_vtbl32[i] == 0) {
+                dd_vtbl32[i] = compat32_make_thunk_ex(
+                    (uint64_t)(ULONG_PTR)dd_com_stub,
+                    "DD_stub", dd_args[i], CC_STDCALL);
+            }
+        }
     }
 
-    /* Fill unimplemented Surface slots with stub thunks */
+    /* Fill unimplemented Surface slots with correct arg counts */
     {
-        uint32_t stub = compat32_make_thunk_ex(
-            (uint64_t)(ULONG_PTR)dd_com_stub, "Surf_stub", 12, CC_STDCALL);
-        for (int i = 0; i < 33; i++)
-            if (surf_vtbl32[i] == 0) surf_vtbl32[i] = stub;
+        /* IDirectDrawSurface7 arg counts (including 'this'): */
+        static const uint8_t sf_args[33] = {
+            3,1,1,  /* 0:QI 1:AddRef 2:Release */
+            2,      /* 3:AddAttachedSurface */
+            2,      /* 4:AddOverlayDirtyRect */
+            7,      /* 5:Blt (implemented) */
+            4,      /* 6:BltBatch */
+            5,      /* 7:BltFast */
+            2,      /* 8:DeleteAttachedSurface */
+            3,      /* 9:EnumAttachedSurfaces */
+            3,      /* 10:EnumOverlayZOrders */
+            3,      /* 11:Flip (implemented) */
+            3,      /* 12:GetAttachedSurface */
+            2,      /* 13:GetBltStatus */
+            2,      /* 14:GetCaps */
+            2,      /* 15:GetClipper */
+            2,      /* 16:GetColorKey */
+            2,      /* 17:GetDC */
+            2,      /* 18:GetFlipStatus */
+            2,      /* 19:GetOverlayPosition */
+            2,      /* 20:GetPalette */
+            2,      /* 21:GetPixelFormat */
+            2,      /* 22:GetSurfaceDesc (implemented) */
+            3,      /* 23:Initialize */
+            1,      /* 24:IsLost */
+            5,      /* 25:Lock (implemented) */
+            2,      /* 26:ReleaseDC */
+            1,      /* 27:Restore */
+            2,      /* 28:SetClipper */
+            3,      /* 29:SetColorKey */
+            2,      /* 30:SetOverlayPosition */
+            2,      /* 31:SetPalette */
+            2,      /* 32:Unlock (implemented) */
+        };
+        for (int i = 0; i < 33; i++) {
+            if (surf_vtbl32[i] == 0) {
+                surf_vtbl32[i] = compat32_make_thunk_ex(
+                    (uint64_t)(ULONG_PTR)dd_com_stub,
+                    "Surf_stub", sf_args[i], CC_STDCALL);
+            }
+        }
     }
 
     /* Setup DD proxy object */
