@@ -777,6 +777,23 @@ static void ddraw_init_com32(void)
 
     com32_initialized = 1;
     serial_puts("[DDRAW] COM32 proxies initialized\n");
+
+    /* Hardware watchpoint on dd_vtbl32[0] to catch runtime corruption.
+     * The vtable is in kernel BSS and gets overwritten with VirtualAlloc
+     * bytecode addresses (0x4039C870) by an unknown writer. */
+    {
+        uint64_t watch = (uint64_t)(uintptr_t)dd_vtbl32;
+        __asm__ volatile (
+            "mov %0, %%dr0\n"
+            "mov $0x000D0001, %%rax\n"  /* DR7: L0=1, RW0=01(write), LEN0=11(4B) */
+            "mov %%rax, %%dr7\n"
+            :: "r"(watch) : "rax"
+        );
+        serial_puts("[DDRAW] DR0 watchpoint on dd_vtbl32 at 0x");
+        extern void serial_puthex(uint64_t val, int digits);
+        serial_puthex(watch, 8);
+        serial_puts("\n");
+    }
 }
 
 HRESULT WINAPI DirectDrawCreate(LPGUID lpGUID, PVOID *lplpDD, PVOID pUnkOuter)

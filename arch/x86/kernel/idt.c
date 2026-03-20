@@ -742,9 +742,9 @@ void isr_handler(interrupt_frame_t *frame)
             __asm__ volatile ("mov %%dr0, %0" : "=r"(dr0));
             uint32_t val = *(volatile uint32_t *)dr0;
 
-            /* Only log when value is suspiciously low (< 0x1000, not 0xFFFFFFFF) */
-            if (val < 0x1000 && val != 0xFFFFFFFF) {
-                serial_puts("[WP] FS:[0]=0x");
+            /* Log all watchpoint hits (catches dd_vtbl32 corruption) */
+            if (db_hit_count < 20) {
+                serial_puts("[WP] val=0x");
                 serial_puthex(val, 8);
                 serial_puts(" RIP=0x");
                 serial_puthex(frame->rip, 8);
