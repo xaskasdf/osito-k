@@ -109,13 +109,22 @@ void exception_handler(uint64_t esr, uint64_t elr, uint64_t far)
         __asm__ volatile("wfe");
 }
 
-__attribute__((weak))
 void irq_handler(void)
 {
-    serial_puts("\n[PANIC] Unhandled IRQ!\n");
+    uint32_t irqnr = gic_ack_irq();
 
-    for (;;)
-        __asm__ volatile("wfe");
+    if (irqnr == 30) {
+        timer_tick_handler();
+    } else if (irqnr == 0) {
+        /* SGI 0 — yield (handled later by scheduler) */
+    } else if (irqnr != 1023) {
+        serial_puts("[IRQ ] Unhandled INTID: ");
+        serial_putdec(irqnr);
+        serial_puts("\n");
+    }
+
+    if (irqnr != 1023)
+        gic_end_irq(irqnr);
 }
 
 __attribute__((weak))
@@ -143,20 +152,24 @@ void kernel_main(void *dtb)
     print_banner();
     print_cpu_info();
 
-    /* Timer frequency */
-    uint32_t freq = read_cntfrq_el0();
-    serial_puts("[KERN] Timer frequency: ");
-    serial_putdec(freq);
-    serial_puts(" Hz");
-    if (freq >= 1000000) {
-        serial_puts(" (");
-        serial_putdec(freq / 1000000);
-        serial_puts(" MHz)");
-    }
-    serial_puts("\n");
-
     /* Step 2: GIC */
     gic_init();
+
+    /* Step 3: Timer (100 Hz) */
+    timer_init(100);
+
+    /* Enable IRQs */
+    irq_enable();
+    serial_puts("[KERN] IRQs enabled\n");
+
+    /* Tick counter test */
+    serial_puts("[KERN] Tick test (3s)...\n");
+    for (int i = 0; i < 3; i++) {
+        mdelay(1000);
+        serial_puts("  ticks = ");
+        serial_putdec(timer_get_tick_count());
+        serial_puts("\n");
+    }
 
     serial_puts("[KERN] Boot complete. Halting.\n");
 
