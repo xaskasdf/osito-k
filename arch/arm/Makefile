@@ -54,7 +54,7 @@ C_SRCS   := kernel/main.c kernel/serial.c kernel/gic.c kernel/timer.c \
             kernel/crypto.c kernel/tls.c kernel/http.c kernel/smp.c \
             kernel/claude.c kernel/tokenizer.c kernel/tensor.c kernel/inference.c \
             kernel/git.c kernel/zlib.c kernel/memcompress.c kernel/input_events.c \
-            kernel/stubs.c \
+            kernel/stubs.c kernel/tensor_neon.c \
             drivers/hda.c drivers/virtio_blk.c drivers/virtio_net.c \
             drivers/gpu.c drivers/gsp.c drivers/sass.c drivers/gmmu.c \
             drivers/gpu_tensor.c drivers/gpu_inference.c drivers/gpu_display.c \
@@ -113,6 +113,10 @@ $(BUILD)/kernel/tensor.o: kernel/tensor.c
 	@$(CC) $(FP_CFLAGS) -c $< -o $@
 $(BUILD)/kernel/inference.o: kernel/inference.c
 	@echo "[CC] $< (FP)"
+	@mkdir -p $(dir $@)
+	@$(CC) $(FP_CFLAGS) -c $< -o $@
+$(BUILD)/kernel/tensor_neon.o: kernel/tensor_neon.c
+	@echo "[CC] $< (NEON)"
 	@mkdir -p $(dir $@)
 	@$(CC) $(FP_CFLAGS) -c $< -o $@
 $(BUILD)/kernel/tokenizer.o: kernel/tokenizer.c

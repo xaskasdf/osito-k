@@ -21,11 +21,16 @@ gpu_device_t *pci_get_gpu(void)
     return (gpu_device_t *)0;
 }
 
-/* AVX2 tensor stubs (never called — avx2_detected=0 on ARM64) */
-void rmsnorm_avx2(float *o, const float *x, const float *w, int n) { (void)o; (void)x; (void)w; (void)n; }
-void matvec_q4_0_avx2(float *out, const void *w, const float *x, int n, int d) { (void)out; (void)w; (void)x; (void)n; (void)d; }
-void vec_add_avx2(float *a, const float *b, int n) { (void)a; (void)b; (void)n; }
-void vec_mul_avx2(float *a, const float *b, int n) { (void)a; (void)b; (void)n; }
+/* AVX2 stubs → redirect to NEON implementations */
+extern void rmsnorm_neon(float *o, const float *x, const float *w, int n);
+extern void matvec_q4_0_neon(float *out, const void *w, const float *x, int n, int d);
+extern void vec_add_neon(float *a, const float *b, int n);
+extern void vec_mul_neon(float *a, const float *b, int n);
+
+void rmsnorm_avx2(float *o, const float *x, const float *w, int n) { rmsnorm_neon(o, x, w, n); }
+void matvec_q4_0_avx2(float *out, const void *w, const float *x, int n, int d) { matvec_q4_0_neon(out, w, x, n, d); }
+void vec_add_avx2(float *a, const float *b, int n) { vec_add_neon(a, b, n); }
+void vec_mul_avx2(float *a, const float *b, int n) { vec_mul_neon(a, b, n); }
 
 /* Process execution — redirect to ARM's proc_run */
 extern int proc_run(const char *filename);
