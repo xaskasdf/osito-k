@@ -1359,6 +1359,17 @@ int compat32_seh_dispatch(PEXCEPTION_RECORD ExceptionRecord)
         return 0;
     }
 
+    /* Validate ExceptionList points to a stack address, not code.
+     * Valid compat32 stack frames are in the 0x15xxxxxx or 0x022xxxxx range.
+     * If ExceptionList points to DLL code (0x10xxxxxx-0x12xxxxxx), the
+     * chain was corrupted — dispatching would call garbage as a handler. */
+    if (frame_addr >= 0x10000000 && frame_addr < 0x20000000) {
+        serial_puts("[SEH32] chain CORRUPT: ExceptionList 0x");
+        serial_puthex(frame_addr, 8);
+        serial_puts(" is in code range (not stack), skipping dispatch\n");
+        return 0;
+    }
+
     /* Build 32-bit EXCEPTION_RECORD for filter functions */
     BYTE *p = (BYTE *)&seh32_exception_record;
     for (SIZE_T i = 0; i < sizeof(seh32_exception_record); i++) p[i] = 0;
