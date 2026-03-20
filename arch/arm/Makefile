@@ -50,7 +50,8 @@ C_SRCS   := kernel/main.c kernel/serial.c kernel/gic.c kernel/timer.c \
             kernel/memory.c kernel/paging.c kernel/heap.c kernel/sched.c \
             kernel/syscall.c kernel/elf.c kernel/process.c \
             kernel/framebuffer.c kernel/term.c kernel/shell.c kernel/gui_task.c \
-            kernel/pci.c drivers/hda.c drivers/virtio_blk.c \
+            kernel/pci.c kernel/net.c \
+            drivers/hda.c drivers/virtio_blk.c drivers/virtio_net.c \
             fs/ositofs2.c \
             $(wildcard $(PLAT_DIR)/*.c)
 GUI_SRCS := ../../gui/gui_draw.c ../../gui/gui_text.c \

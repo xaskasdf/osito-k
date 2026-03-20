@@ -231,7 +231,17 @@ void kernel_main(void *dtb)
     if (virtio_blk_init(0, 0, 0, (uint64_t[]){0,0,0,0,0,0}) == 0)
         osfs2_mount(0);  /* Mount at offset 0 (no GPT) */
 
-    /* Step 9: Scheduler + shell */
+    /* Step 9: VirtIO-net + network stack */
+    {
+        extern int virtio_net_init(void);
+        extern void net_init(const uint8_t ip[4]);
+        if (virtio_net_init() == 0) {
+            uint8_t ip[] = {10, 0, 2, 15};  /* QEMU SLIRP default */
+            net_init(ip);
+        }
+    }
+
+    /* Step 10: Scheduler + shell */
     sched_init();
     term_init();
     task_create("shell", shell_wrapper, (void *)0, 1);

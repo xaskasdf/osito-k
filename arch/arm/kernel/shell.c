@@ -9,6 +9,8 @@
 extern void hda_play_tone(uint32_t freq_hz, uint32_t duration_ms);
 extern bool hda_is_ready(void);
 extern int proc_run(const char *filename);
+extern void net_icmp_send_echo(const uint8_t dst_ip[4], uint16_t seq);
+extern void net_poll(void);
 
 #define MAX_ARGS 16
 
@@ -36,6 +38,7 @@ static void cmd_help(void)
     serial_puts("  ls       List files\n");
     serial_puts("  cat      Show file contents\n");
     serial_puts("  exec     Run ELF binary\n");
+    serial_puts("  ping     Ping IP address\n");
     serial_puts("  beep     Play a tone (beep [freq] [ms])\n");
     serial_puts("  desktop  Launch graphical desktop\n");
     serial_puts("  reboot   Reboot system\n");
@@ -211,6 +214,26 @@ void shell_run(void)
         else if (strcmp(argv[0], "exec") == 0) {
             if (argc < 2) serial_puts("Usage: exec <filename>\n");
             else proc_run(argv[1]);
+        }
+        else if (strcmp(argv[0], "ping") == 0) {
+            if (argc < 2) { serial_puts("Usage: ping <ip>\n"); }
+            else {
+                uint8_t ip[4] = {0};
+                /* Simple IP parser: a.b.c.d */
+                const char *p = argv[1];
+                for (int i = 0; i < 4 && *p; i++) {
+                    uint32_t v = 0;
+                    while (*p >= '0' && *p <= '9') { v = v * 10 + (*p - '0'); p++; }
+                    ip[i] = (uint8_t)v;
+                    if (*p == '.') p++;
+                }
+                serial_puts("PING ");
+                serial_puts(argv[1]);
+                serial_puts("...\n");
+                net_icmp_send_echo(ip, 1);
+                /* Poll for reply */
+                for (int i = 0; i < 500000; i++) net_poll();
+            }
         }
         else if (strcmp(argv[0], "svctest") == 0) {
             /* Inline SVC test — no ELF loading */
