@@ -7,6 +7,21 @@
 #include "../include/hal.h"
 #include "../include/aarch64.h"
 #include "task.h"
+#include <stdbool.h>
+
+/* PCI + HDA */
+typedef struct {
+    uint8_t  bus, dev, func;
+    uint16_t vendor_id, device_id;
+    uint8_t  class_code, subclass;
+    uint64_t bar[6];
+} pci_dev_t;
+
+extern void pci_scan(void);
+extern pci_dev_t *pci_get_hda(void);
+extern int  hda_init(uint64_t bar0, uint8_t bus, uint8_t dev, uint8_t func);
+extern void hda_play_tone(uint32_t freq_hz, uint32_t duration_ms);
+extern bool hda_is_ready(void);
 
 /* ========================================================================
  * Banner
@@ -190,10 +205,25 @@ void kernel_main(void *dtb)
     /* Step 3: Timer (100 Hz) */
     timer_init(100);
 
-    /* Step 4: Heap */
+    /* Step 4: Memory manager */
+    mem_init(platform_ram_base(), platform_ram_size());
+
+    /* Step 5: Paging / MMU */
+    paging_init();
+
+    /* Step 6: Heap */
     heap_init();
 
-    /* Step 5: Scheduler + shell */
+    /* Step 7: PCI + HDA */
+    pci_scan();
+    {
+        pci_dev_t *hda = pci_get_hda();
+        if (hda && hda->bar[0]) {
+            hda_init(hda->bar[0], hda->bus, hda->dev, hda->func);
+        }
+    }
+
+    /* Step 8: Scheduler + shell */
     sched_init();
     term_init();
     task_create("shell", shell_wrapper, (void *)0, 1);

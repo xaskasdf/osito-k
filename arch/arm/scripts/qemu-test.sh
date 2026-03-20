@@ -41,4 +41,7 @@ exec qemu-system-aarch64 \
     -m 512M \
     -nographic \
     -kernel "$IMAGE" \
-    -no-reboot
+    -no-reboot \
+    -device intel-hda,id=hda0 \
+    -audiodev wav,id=wav0,path="$ARCH_DIR/build/audio.wav" \
+    -device hda-output,id=snd0,audiodev=wav0

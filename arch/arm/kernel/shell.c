@@ -4,6 +4,10 @@
 #include "../include/hal.h"
 #include "../include/types.h"
 #include "task.h"
+#include <stdbool.h>
+
+extern void hda_play_tone(uint32_t freq_hz, uint32_t duration_ms);
+extern bool hda_is_ready(void);
 
 #define MAX_ARGS 16
 
@@ -28,6 +32,7 @@ static void cmd_help(void)
     serial_puts("  mem      Show heap stats\n");
     serial_puts("  uname    Show system info\n");
     serial_puts("  uptime   Show uptime\n");
+    serial_puts("  beep     Play a tone (beep [freq] [ms])\n");
     serial_puts("  desktop  Launch graphical desktop\n");
     serial_puts("  reboot   Reboot system\n");
     serial_puts("  clear    Clear screen\n");
@@ -79,6 +84,13 @@ static void cmd_ps(void)
 
 static void cmd_mem(void)
 {
+    serial_puts("RAM:  ");
+    serial_putdec(mem_get_total() / (1024 * 1024));
+    serial_puts(" MB total, ");
+    serial_putdec(mem_get_free() / (1024 * 1024));
+    serial_puts(" MB free, ");
+    serial_putdec(mem_get_used() / (1024 * 1024));
+    serial_puts(" MB used\n");
     serial_puts("Heap: ");
     serial_putdec(heap_get_used() / 1024);
     serial_puts(" KB used / ");
@@ -116,6 +128,30 @@ static void cmd_desktop(void)
     task_create("desktop", gui_task, (void *)0, 2);
 }
 
+/* Simple atoi for shell args */
+static uint32_t shell_atoi(const char *s)
+{
+    uint32_t n = 0;
+    while (*s >= '0' && *s <= '9')
+        n = n * 10 + (*s++ - '0');
+    return n;
+}
+
+static void cmd_beep(int argc, char **argv)
+{
+    if (!hda_is_ready()) {
+        serial_puts("HDA not initialized\n");
+        return;
+    }
+    uint32_t freq = 440;
+    uint32_t ms   = 500;
+    if (argc >= 2) freq = shell_atoi(argv[1]);
+    if (argc >= 3) ms   = shell_atoi(argv[2]);
+    if (freq == 0) freq = 440;
+    if (ms == 0)   ms   = 500;
+    hda_play_tone(freq, ms);
+}
+
 void shell_run(void)
 {
     char buf[256];
@@ -135,6 +171,7 @@ void shell_run(void)
         else if (strcmp(argv[0], "mem") == 0)     cmd_mem();
         else if (strcmp(argv[0], "uname") == 0)   cmd_uname();
         else if (strcmp(argv[0], "uptime") == 0)  cmd_uptime();
+        else if (strcmp(argv[0], "beep") == 0)    cmd_beep(argc, argv);
         else if (strcmp(argv[0], "desktop") == 0) cmd_desktop();
         else if (strcmp(argv[0], "reboot") == 0)  platform_reboot();
         else if (strcmp(argv[0], "clear") == 0)   serial_puts("\033[2J\033[H");
