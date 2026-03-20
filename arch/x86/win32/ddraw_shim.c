@@ -630,6 +630,13 @@ static uint32_t dd_proxy32;     /* IDirectDraw COM object: just lpVtbl32 */
 static uint32_t surf_vtbl32[33]; /* IDirectDrawSurface vtable */
 static int com32_initialized = 0;
 
+/* Generic COM stub — returns S_OK for any unimplemented method */
+static HRESULT WINAPI dd_com_stub(PVOID this_ptr)
+{
+    (void)this_ptr;
+    return 0; /* S_OK */
+}
+
 static void ddraw_init_com32(void)
 {
     if (com32_initialized) return;
@@ -675,6 +682,23 @@ static void ddraw_init_com32(void)
                                               "Surf_Lock", 5, CC_STDCALL);
     surf_vtbl32[32] = compat32_make_thunk_ex((uint64_t)(ULONG_PTR)surf_Unlock,
                                               "Surf_Unlock", 2, CC_STDCALL);
+
+    /* Fill unimplemented DD slots with stub thunks (return S_OK).
+     * Prevents NULL-CALL when engine calls GetCaps, CreateClipper, etc. */
+    {
+        uint32_t stub = compat32_make_thunk_ex(
+            (uint64_t)(ULONG_PTR)dd_com_stub, "DD_stub", 12, CC_STDCALL);
+        for (int i = 0; i < 23; i++)
+            if (dd_vtbl32[i] == 0) dd_vtbl32[i] = stub;
+    }
+
+    /* Fill unimplemented Surface slots with stub thunks */
+    {
+        uint32_t stub = compat32_make_thunk_ex(
+            (uint64_t)(ULONG_PTR)dd_com_stub, "Surf_stub", 12, CC_STDCALL);
+        for (int i = 0; i < 33; i++)
+            if (surf_vtbl32[i] == 0) surf_vtbl32[i] = stub;
+    }
 
     /* Setup DD proxy object */
     dd_proxy32 = (uint32_t)(ULONG_PTR)dd_vtbl32;
