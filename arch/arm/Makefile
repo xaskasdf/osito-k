@@ -52,8 +52,11 @@ C_SRCS   := kernel/main.c kernel/serial.c kernel/gic.c kernel/timer.c \
             kernel/framebuffer.c kernel/term.c kernel/shell.c kernel/gui_task.c \
             kernel/pci.c kernel/net.c \
             kernel/crypto.c kernel/tls.c kernel/http.c kernel/smp.c \
+            kernel/claude.c kernel/tokenizer.c kernel/tensor.c kernel/inference.c \
+            kernel/git.c kernel/zlib.c kernel/memcompress.c kernel/input_events.c \
+            kernel/stubs.c \
             drivers/hda.c drivers/virtio_blk.c drivers/virtio_net.c \
-            fs/ositofs2.c \
+            fs/ositofs2.c fs/gguf.c fs/gpt.c \
             $(wildcard $(PLAT_DIR)/*.c)
 GUI_SRCS := ../../gui/gui_draw.c ../../gui/gui_text.c \
             ../../gui/gui_panel.c ../../gui/gui_dock.c \
@@ -99,6 +102,21 @@ $(BUILD)/%.o: %.c
 	@echo "[CC] $<"
 	@mkdir -p $(dir $@)
 	@$(CC) $(CFLAGS) -c $< -o $@
+
+# Float-using files need FP registers enabled (no -mgeneral-regs-only)
+FP_CFLAGS := $(filter-out -mgeneral-regs-only,$(CFLAGS))
+$(BUILD)/kernel/tensor.o: kernel/tensor.c
+	@echo "[CC] $< (FP)"
+	@mkdir -p $(dir $@)
+	@$(CC) $(FP_CFLAGS) -c $< -o $@
+$(BUILD)/kernel/inference.o: kernel/inference.c
+	@echo "[CC] $< (FP)"
+	@mkdir -p $(dir $@)
+	@$(CC) $(FP_CFLAGS) -c $< -o $@
+$(BUILD)/kernel/tokenizer.o: kernel/tokenizer.c
+	@echo "[CC] $< (FP)"
+	@mkdir -p $(dir $@)
+	@$(CC) $(FP_CFLAGS) -c $< -o $@
 
 # GUI shared library
 $(BUILD)/gui/%.o: ../../gui/%.c
