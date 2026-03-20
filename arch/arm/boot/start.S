@@ -1,17 +1,16 @@
 /*
- * start.S -- Osito-K AArch64 entry point for SM8350
+ * start.S -- Osito-K AArch64 entry point (shared by all platforms)
  *
- * Based on sm8350-boot (tested on real hardware, 2026-03-03/04).
+ * Entry conditions (common):
+ *   x0 = DTB physical address (or 0)
+ *   EL1, interrupts disabled
  *
- * ABL jumps here with:
- *   x0 = DTB physical address
- *   x1-x3 = 0
- *   EL1, caches ON, MMU may be ON (identity mapped), interrupts disabled
- *   UART at 0x98C000 already configured by ABL
+ * SM8350 (ABL): caches ON, MMU may be ON (identity mapped),
+ *   UART at 0x98C000 already configured. Actual load ~0xA0080000.
+ * QEMU virt: -kernel loads Image at RAM base (0x40000000).
  *
- * NOTE: ABL loads at ~0xA0080000, NOT 0x80080000. Linker script says
- * 0x80080000 but actual load is different. All code must be position-
- * independent (use ADRP/ADR, never stored pointers).
+ * All code must be position-independent (ADRP/ADR, no stored pointers).
+ * Stack address provided by linker script symbol _stack_top.
  */
 
 .section .text.boot
@@ -51,8 +50,8 @@ _entry:
     msr     VBAR_EL1, x0
     isb
 
-    /* Stack: 0x85000000 (inside DDR bank 0, below reserved regions) */
-    ldr     x0, =0x85000000
+    /* Stack: provided by linker script (_stack_top) */
+    ldr     x0, =_stack_top
     mov     sp, x0
 
     /* Clear BSS */
@@ -162,8 +161,4 @@ _exception_serror:
     ldp     x0, x1, [sp], #16
     b       _hang
 
-.section .bss
-.balign 16
-__bss_start:
-    .space  4096
-__bss_end:
+/* BSS symbols provided by linker script */

@@ -47,6 +47,9 @@ SECTIONS
 
     _image_end = .;
 
+    /* Stack top: 0x85000000 (inside DDR bank 0, below reserved regions) */
+    _stack_top = 0x85000000;
+
     /DISCARD/ : {
         *(.comment)
         *(.note*)
