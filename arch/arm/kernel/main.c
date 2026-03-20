@@ -6,6 +6,7 @@
 
 #include "../include/hal.h"
 #include "../include/aarch64.h"
+#include "task.h"
 
 /* ========================================================================
  * Banner
@@ -114,13 +115,34 @@ void irq_handler(void)
     uint32_t irqnr = gic_ack_irq();
 
     if (irqnr == 30) {
+        /* Timer PPI */
         timer_tick_handler();
+        if (current_task)
+            current_task->ticks_run++;
+
+        /* Wake sleeping tasks */
+        uint64_t now = timer_get_tick_count();
+        for (int i = 0; i < MAX_TASKS; i++) {
+            if (task_pool[i].state == TASK_STATE_BLOCKED &&
+                task_pool[i].wake_tick != 0 &&
+                (int64_t)(now - task_pool[i].wake_tick) >= 0) {
+                task_pool[i].wake_tick = 0;
+                task_pool[i].state = TASK_STATE_READY;
+            }
+        }
+        need_schedule = 1;
     } else if (irqnr == 0) {
-        /* SGI 0 — yield (handled later by scheduler) */
+        /* SGI 0 — yield */
+        need_schedule = 1;
     } else if (irqnr != 1023) {
         serial_puts("[IRQ ] Unhandled INTID: ");
         serial_putdec(irqnr);
         serial_puts("\n");
+    }
+
+    if (need_schedule && current_task) {
+        need_schedule = 0;
+        schedule();
     }
 
     if (irqnr != 1023)
@@ -137,6 +159,32 @@ void serror_handler(uint64_t esr)
 
     for (;;)
         __asm__ volatile("wfe");
+}
+
+/* ========================================================================
+ * Scheduler test tasks
+ * ======================================================================== */
+
+static void test_task_a(void *arg) {
+    (void)arg;
+    for (int i = 0; i < 5; i++) {
+        serial_puts("[A] tick=");
+        serial_putdec(timer_get_tick_count());
+        serial_puts("\n");
+        task_delay_ms(500);
+    }
+    serial_puts("[A] done\n");
+}
+
+static void test_task_b(void *arg) {
+    (void)arg;
+    for (int i = 0; i < 5; i++) {
+        serial_puts("[B] tick=");
+        serial_putdec(timer_get_tick_count());
+        serial_puts("\n");
+        task_delay_ms(700);
+    }
+    serial_puts("[B] done\n");
 }
 
 /* ========================================================================
@@ -161,21 +209,12 @@ void kernel_main(void *dtb)
     /* Step 4: Heap */
     heap_init();
 
-    /* Enable IRQs */
+    /* Step 5: Scheduler */
+    sched_init();
+    task_create("taskA", test_task_a, (void *)0, 1);
+    task_create("taskB", test_task_b, (void *)0, 1);
+
+    serial_puts("[KERN] Boot complete.\n");
     irq_enable();
-    serial_puts("[KERN] IRQs enabled\n");
-
-    /* Tick counter test */
-    serial_puts("[KERN] Tick test (3s)...\n");
-    for (int i = 0; i < 3; i++) {
-        mdelay(1000);
-        serial_puts("  ticks = ");
-        serial_putdec(timer_get_tick_count());
-        serial_puts("\n");
-    }
-
-    serial_puts("[KERN] Boot complete. Halting.\n");
-
-    for (;;)
-        __asm__ volatile("wfe");
+    sched_start();  /* Never returns */
 }
