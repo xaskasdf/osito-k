@@ -1004,6 +1004,31 @@ void isr_handler(interrupt_frame_t *frame)
          * compat32_seh_dispatch() with the appropriate EXCEPTION_RECORD.
          *
          * If no SEH handler catches it, fall through to crash recovery. */
+        /* Code execution outside DLL range: RIP is NOT in loaded PE modules
+         * (0x10000000-0x20000000). This means a corrupted vtable or function
+         * pointer jumped to VirtualAlloc data, stack data, or garbage address.
+         * Simulate RET 0 to let the engine handle the NULL return. */
+        if ((frame->cs & 0xFFFF) == 0x40 &&
+            (vec == 6 || vec == 13) &&
+            (frame->rip < 0x10000000 || frame->rip >= 0x20000000)) {
+            static int bytecode_fix_count = 0;
+            bytecode_fix_count++;
+            if (bytecode_fix_count <= 10) {
+                serial_puts("[UD-FIX] Bytecode exec at 0x");
+                serial_puthex((uint32_t)frame->rip, 8);
+                serial_puts(" vec=");
+                serial_putdec(vec);
+                serial_puts(" #");
+                serial_putdec(bytecode_fix_count);
+                serial_puts("\n");
+            }
+            uint32_t *sp32 = (uint32_t *)(uintptr_t)(frame->rsp & 0xFFFFFFFF);
+            frame->rip = sp32[0];  /* return to caller */
+            frame->rsp += 4;       /* pop return address */
+            frame->rax = 0;        /* return NULL */
+            return;
+        }
+
         if ((frame->cs & 0xFFFF) == 0x40 || (frame->cs & 0xFFFF) == 0x23) {
             /* Build EXCEPTION_RECORD for PE32 SEH dispatch */
             typedef struct {
