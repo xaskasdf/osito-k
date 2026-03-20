@@ -123,6 +123,9 @@ qemu-system-x86_64 \
     -device qemu-xhci,id=usb \
     -device usb-kbd,bus=usb.0 \
     -device usb-mouse,bus=usb.0 \
+    -audiodev wav,id=wav0,path=$BUILD_DIR/audio.wav \
+    -device intel-hda,id=hda0 \
+    -device hda-duplex,id=snd0,audiodev=wav0 \
     -vnc :0,password=on \
     -serial file:"$SERIAL_LOG" \
     -monitor unix:/tmp/qemu-monitor.sock,server,nowait \

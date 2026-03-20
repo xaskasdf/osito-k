@@ -91,10 +91,11 @@ gpu_device_t gpu_dev;
 #define MAX_NVME_DEVS 4
 static pci_dev_t nvme_dev_stores[MAX_NVME_DEVS];
 static int       nvme_dev_count;
-static pci_dev_t nic_dev_store, xhci_dev_store;
+static pci_dev_t nic_dev_store, xhci_dev_store, hda_dev_store;
 static pci_dev_t *nvme_dev;   /* first NVMe (backward compat) */
 static pci_dev_t *nic_dev;
 static pci_dev_t *xhci_dev;
+static pci_dev_t *hda_dev;
 
 /* ── Legacy PCI I/O access ───────────────────────────────────── */
 
@@ -419,6 +420,12 @@ static void pci_add_device(uint8_t bus, uint8_t dev, uint8_t func,
         }
     }
 
+    /* Check if HDA controller (class 0x04, subclass 0x03) */
+    if (class == 0x04 && subclass == 0x03 && !hda_dev) {
+        hda_dev_store = *d;
+        hda_dev = &hda_dev_store;
+    }
+
     if (pci_device_count < MAX_PCI_DEVICES)
         pci_device_count++;
 }
@@ -434,7 +441,10 @@ static const char *pci_class_name(uint8_t class, uint8_t subclass)
     }
     if (class == 0x02) return "Network";
     if (class == 0x03) return "Display";
-    if (class == 0x04) return "Multimedia";
+    if (class == 0x04) {
+        if (subclass == 0x03) return "HDA";
+        return "Multimedia";
+    }
     if (class == 0x06) {
         if (subclass == 0x00) return "Host Bridge";
         if (subclass == 0x01) return "ISA Bridge";
@@ -457,6 +467,7 @@ void pci_scan(void)
     nvme_dev_count = 0;
     nic_dev = NULL;
     xhci_dev = NULL;
+    hda_dev = NULL;
 
     /* Try ECAM first */
     find_mcfg();
@@ -580,6 +591,11 @@ pci_dev_t *pci_get_nic(void)
 pci_dev_t *pci_get_xhci(void)
 {
     return xhci_dev;
+}
+
+pci_dev_t *pci_get_hda(void)
+{
+    return hda_dev;
 }
 
 int pci_get_device_count(void)

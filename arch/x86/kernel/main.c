@@ -464,6 +464,13 @@ void kernel_entry(boot_info_t *info)
         serial_puts("\n");
     }
 
+    /* Map HDA BAR0 */
+    extern pci_dev_t *pci_get_hda(void);
+    pci_dev_t *hda_pci = (pci_dev_t *)pci_get_hda();
+    if (hda_pci && hda_pci->bar[0]) {
+        paging_map_mmio(hda_pci->bar[0], 32 * 1024);  /* 32KB HDA regs */
+    }
+
     /* Flush TLB after all MMIO mappings */
     __asm__ volatile ("mov %%cr3, %%rax; mov %%rax, %%cr3" ::: "rax", "memory");
 
@@ -669,6 +676,12 @@ void kernel_entry(boot_info_t *info)
     /* ── Step 4.5: xHCI USB init ── */
     if (xhci_pci && xhci_pci->bar[0]) {
         xhci_init(xhci_pci->bar[0], xhci_pci->bus, xhci_pci->dev, xhci_pci->func);
+    }
+
+    /* ── Step 4.6: HDA audio init ── */
+    if (hda_pci && hda_pci->bar[0]) {
+        extern int hda_init(uint64_t, uint8_t, uint8_t, uint8_t);
+        hda_init(hda_pci->bar[0], hda_pci->bus, hda_pci->dev, hda_pci->func);
     }
 
     /* ── Step 5: Keyboard + Terminal + Shell ── */
