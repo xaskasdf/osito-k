@@ -589,7 +589,21 @@ PVOID WINAPI GetProcAddress(HANDLE hModule, PCSTR lpProcName)
         }
         if (shim_dll) {
             PVOID fn = dll_resolve_import(shim_dll, lpProcName, 0, FALSE);
-            if (fn) return fn;
+            if (fn) {
+                /* PE32 code calls this directly in compat32 mode.
+                 * Must return a 32-bit thunk (INT 0x2E stub), not the
+                 * raw 64-bit pointer — otherwise the REX prefixes in
+                 * 64-bit code get misinterpreted as INC/DEC in 32-bit. */
+                extern int g_compat32_mode;
+                if (g_compat32_mode) {
+                    extern uint32_t compat32_make_thunk(uint64_t, const char *, uint8_t);
+                    uint32_t thunk = compat32_make_thunk(
+                        (uint64_t)(ULONG_PTR)fn, lpProcName, 4);
+                    if (thunk)
+                        return (PVOID)(ULONG_PTR)thunk;
+                }
+                return fn;
+            }
         }
     } else if (hModule && (ULONG_PTR)hModule != 0x00400000) {
         /* Regular PE module — search its export directory */
