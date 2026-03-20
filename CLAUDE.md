@@ -129,6 +129,18 @@ libc/              crt.c, syscall.S, tcclib.c, math.c — CRT + extended libc
 test/              various test programs + qjs.elf
 ```
 
+### Shared GUI (gui/)
+```
+gui/               Cross-architecture graphical desktop (elementaryOS-inspired)
+                   gui.h — shared header: surface_t, color palette, layout constants
+                   gui_draw.c — primitives: rect, alpha blend, gradient, rounded rect, circle
+                   gui_text.c — 8x16 bitmap font (shared) + text rendering
+                   gui_panel.c — top panel (Wingpanel style)
+                   gui_dock.c — bottom dock (Plank style) with icon placeholders
+                   gui_window.c — window decorations: title bar, traffic-light buttons, shadow
+                   gui_desktop.c — orchestrator: gradient bg + panel + demo windows + dock
+```
+
 ### Host Tools (tools/)
 ```
 tools/ositofs/     mkfs.c, write.c, read.c, ls.c, info.c — OsitoFS v2 host tools
@@ -138,6 +150,7 @@ include/common/    ositofs2_format.h — shared on-disk format
 ### AArch64 Port (arch/arm/)
 ```
 arch/arm/          SM8350 (ROG Phone 5) bare-metal port — see docs/aarch64-detail.md
+                   kernel/gui_task.c — desktop GUI scheduler task (renders to splash FB)
 ```
 
 ## Roadmap
@@ -205,7 +218,7 @@ arch/arm/          SM8350 (ROG Phone 5) bare-metal port — see docs/aarch64-det
 | X-CCP   | AMD CCP TRNG driver | Done |
 | X-AHCI  | SATA AHCI driver | WIP |
 | X-XHCI  | xHCI USB 3.x driver + HID keyboard/mouse | Done |
-| X-RETINA| Display pipeline (compositor, shared memory) | WIP |
+| X-RETINA| Display pipeline (compositor, shared memory, GUI desktop) | WIP |
 | X-WIN32 | Windows PE32 compat layer (15 DLL shims) | WIP |
 | **Phase 0** | **Kernel/bootloader separation** (boot.efi + kernel.elf) | **Done** |
 | **Phase 1** | **TCC cross-compiles kernel from host** | **Done** |
@@ -251,7 +264,7 @@ The user speaks Spanish. Communicate in Spanish when appropriate.
 <!-- gitnexus:start -->
 # GitNexus — Code Intelligence
 
-This project is indexed by GitNexus as **osito-k** (73201 symbols, 89272 relationships, 76 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
+This project is indexed by GitNexus as **osito-k** (73518 symbols, 89679 relationships, 76 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
 
 > If any GitNexus tool warns the index is stale, run `npx gitnexus analyze` in terminal first.
 
