@@ -833,10 +833,33 @@ void isr_handler(interrupt_frame_t *frame)
          * causes #GP(0x0A) because the 64-bit exception frame can't be
          * pushed on the 32-bit stack without IST. Just leave page writable. */
         if (cr2 < 0x1000 && (frame->error_code & 2) && !(frame->error_code & 16)) {
+            /* Bytecode-as-code: if RIP is in VirtualAlloc range AND writing
+             * to null page, the engine jumped to .u bytecode via a corrupted
+             * function pointer. Simulate RET 0 NOW while the stack still
+             * has the CORRECT return address from the original `call *reg`. */
+            if ((frame->cs & 0xFFFF) == 0x40 &&
+                frame->rip >= 0x40000000 && frame->rip < 0x80000000) {
+                static int bc_write_count = 0;
+                bc_write_count++;
+                uint32_t *sp = (uint32_t *)(uintptr_t)(frame->rsp & 0xFFFFFFFF);
+                if (bc_write_count <= 5) {
+                    serial_puts("[BC-FIX] RIP=0x");
+                    serial_puthex((uint32_t)frame->rip, 8);
+                    serial_puts(" retaddr=0x");
+                    serial_puthex(sp[0], 8);
+                    serial_puts(" CR2=0x");
+                    serial_puthex((uint32_t)cr2, 2);
+                    serial_puts("\n");
+                }
+                frame->rip = sp[0];  /* return to caller (CLEAN retaddr) */
+                frame->rsp += 4;
+                frame->rax = 0;      /* return NULL */
+                return;
+            }
+            /* Normal null-page write-through for legitimate code */
             paging_set_flags(0, PTE_PRESENT | PTE_WRITABLE | PTE_GLOBAL | PTE_NX);
             __asm__ volatile ("invlpg (%0)" :: "r"((uint64_t)0) : "memory");
             if ((frame->cs & 0xFFFF) != 0x40) {
-                /* 64-bit mode: use TF single-step to re-protect after write */
                 frame->rflags |= (1ULL << 8);  /* TF bit */
             }
             g_null_page_dirty = 1;
