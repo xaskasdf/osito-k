@@ -959,6 +959,32 @@ NTSTATUS compat32_patch_iat(PE_IMAGE_INFO *info)
     serial_putdec(direct);
     serial_puts(" direct (PE32 DLL)\n");
 
+    /* Post-patch validation: scan ALL IAT entries for unpatched RVAs.
+     * Unpatched entries still contain PE file RVAs (< 0x01000000) that
+     * get interpreted as VirtualAlloc addresses at runtime, causing the
+     * CPU to execute package bytecode as x86 → #UD. Replace with stub. */
+    {
+        uint32_t fixups = 0;
+        PIMAGE_IMPORT_DESCRIPTOR d2 =
+            (PIMAGE_IMPORT_DESCRIPTOR)(base + imp_dir->VirtualAddress);
+        for (; d2->Name != 0; d2++) {
+            PIMAGE_THUNK_DATA32 iat =
+                (PIMAGE_THUNK_DATA32)(base + d2->FirstThunk);
+            for (; iat->u1.Function != 0; iat++) {
+                uint32_t val = iat->u1.Function;
+                if (val > 0 && val < 0x01000000 && val != unresolved_stub_addr) {
+                    iat->u1.Function = unresolved_stub_addr;
+                    fixups++;
+                }
+            }
+        }
+        if (fixups) {
+            serial_puts("[COMPAT32] IAT fixup: ");
+            serial_putdec(fixups);
+            serial_puts(" stale RVA entries replaced with stub\n");
+        }
+    }
+
     return STATUS_SUCCESS;
 }
 
