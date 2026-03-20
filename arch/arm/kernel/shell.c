@@ -32,6 +32,8 @@ static void cmd_help(void)
     serial_puts("  mem      Show heap stats\n");
     serial_puts("  uname    Show system info\n");
     serial_puts("  uptime   Show uptime\n");
+    serial_puts("  ls       List files\n");
+    serial_puts("  cat      Show file contents\n");
     serial_puts("  beep     Play a tone (beep [freq] [ms])\n");
     serial_puts("  desktop  Launch graphical desktop\n");
     serial_puts("  reboot   Reboot system\n");
@@ -152,6 +154,37 @@ static void cmd_beep(int argc, char **argv)
     hda_play_tone(freq, ms);
 }
 
+static void cmd_ls(void)
+{
+    osfs2_list();
+}
+
+static void cmd_cat(int argc, char **argv)
+{
+    if (argc < 2) {
+        serial_puts("Usage: cat <filename>\n");
+        return;
+    }
+    osfs2_file_t *f = osfs2_find(argv[1]);
+    if (!f) {
+        serial_puts("File not found: ");
+        serial_puts(argv[1]);
+        serial_puts("\n");
+        return;
+    }
+    /* Read and print up to 4KB */
+    static char cat_buf[4096];
+    uint64_t to_read = f->size;
+    if (to_read > sizeof(cat_buf) - 1) to_read = sizeof(cat_buf) - 1;
+    if (osfs2_read(f, 0, cat_buf, to_read) < 0) {
+        serial_puts("Read error\n");
+        return;
+    }
+    cat_buf[to_read] = '\0';
+    serial_puts(cat_buf);
+    serial_puts("\n");
+}
+
 void shell_run(void)
 {
     char buf[256];
@@ -171,6 +204,8 @@ void shell_run(void)
         else if (strcmp(argv[0], "mem") == 0)     cmd_mem();
         else if (strcmp(argv[0], "uname") == 0)   cmd_uname();
         else if (strcmp(argv[0], "uptime") == 0)  cmd_uptime();
+        else if (strcmp(argv[0], "ls") == 0)      cmd_ls();
+        else if (strcmp(argv[0], "cat") == 0)    cmd_cat(argc, argv);
         else if (strcmp(argv[0], "beep") == 0)    cmd_beep(argc, argv);
         else if (strcmp(argv[0], "desktop") == 0) cmd_desktop();
         else if (strcmp(argv[0], "reboot") == 0)  platform_reboot();

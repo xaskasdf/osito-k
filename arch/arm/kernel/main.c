@@ -19,6 +19,7 @@ typedef struct {
 
 extern void pci_scan(void);
 extern pci_dev_t *pci_get_hda(void);
+extern pci_dev_t *pci_get_device(uint16_t vendor, uint16_t device);
 extern int  hda_init(uint64_t bar0, uint8_t bus, uint8_t dev, uint8_t func);
 extern void hda_play_tone(uint32_t freq_hz, uint32_t duration_ms);
 extern bool hda_is_ready(void);
@@ -223,12 +224,18 @@ void kernel_main(void *dtb)
         }
     }
 
-    /* Step 8: Scheduler + shell */
+    /* Enable IRQs early — needed for QEMU TCG DMA completion processing */
+    irq_enable();
+
+    /* Step 8: VirtIO-blk (MMIO transport) + OsitoFS */
+    if (virtio_blk_init(0, 0, 0, (uint64_t[]){0,0,0,0,0,0}) == 0)
+        osfs2_mount(0);  /* Mount at offset 0 (no GPT) */
+
+    /* Step 9: Scheduler + shell */
     sched_init();
     term_init();
     task_create("shell", shell_wrapper, (void *)0, 1);
 
     serial_puts("[KERN] Boot complete.\n");
-    irq_enable();
     sched_start();  /* Never returns */
 }

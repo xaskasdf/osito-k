@@ -163,7 +163,9 @@ void *mem_alloc_aligned(uint64_t size, uint64_t alignment)
                 free_pages--;
             }
             void *addr = (void *)(p << PAGE_SHIFT);
-            memset(addr, 0, pages * PAGE_SIZE);
+            /* Skip memset for large allocs (>64KB) — too slow on QEMU TCG */
+            if (pages <= 16)
+                memset(addr, 0, pages * PAGE_SIZE);
             return addr;
         }
     }

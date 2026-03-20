@@ -12,7 +12,18 @@
 
 static inline void *memset(void *s, int c, size_t n) {
     uint8_t *p = (uint8_t *)s;
-    while (n--) *p++ = (uint8_t)c;
+    uint8_t val = (uint8_t)c;
+    /* Use 64-bit stores for aligned bulk fills */
+    if (n >= 16 && ((uintptr_t)p & 7) == 0) {
+        uint64_t v64 = val;
+        v64 |= v64 << 8; v64 |= v64 << 16; v64 |= v64 << 32;
+        uint64_t *p64 = (uint64_t *)p;
+        size_t qwords = n / 8;
+        for (size_t i = 0; i < qwords; i++) p64[i] = v64;
+        p += qwords * 8;
+        n -= qwords * 8;
+    }
+    while (n--) *p++ = val;
     return s;
 }
 

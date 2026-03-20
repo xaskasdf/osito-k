@@ -34,7 +34,10 @@ typedef struct {
 
 /* ── State ────────────────────────────────────────────────────────── */
 
-static pci_dev_t hda_dev_store;
+#define PCI_MAX_DEVICES 32
+static pci_dev_t pci_devices[PCI_MAX_DEVICES];
+static int       pci_device_count;
+
 static pci_dev_t *hda_dev;
 
 /* ── External ─────────────────────────────────────────────────────── */
@@ -98,6 +101,9 @@ static uint64_t pci_assign_bar(uint8_t bus, uint8_t dev, uint8_t func, int bar_i
     /* I/O BAR — skip */
     if (mask & 1) return 0;
 
+    /* Check if 64-bit BAR (type bits [2:1] == 0b10) */
+    int is_64bit = ((mask >> 1) & 3) == 2;
+
     /* Calculate size from mask (invert non-flag bits, add 1) */
     uint32_t size = ~(mask & 0xFFFFFFF0) + 1;
     if (size == 0) return 0;
@@ -109,6 +115,10 @@ static uint64_t pci_assign_bar(uint8_t bus, uint8_t dev, uint8_t func, int bar_i
 
     /* Write assigned address to BAR */
     pci_ecam_write32(bus, dev, func, off, (uint32_t)addr);
+    if (is_64bit) {
+        /* Clear upper 32 bits (our allocations are in 32-bit MMIO window) */
+        pci_ecam_write32(bus, dev, func, off + 4, 0);
+    }
 
     /* Map the BAR region for MMIO access */
     paging_map_mmio(addr, size);
@@ -130,11 +140,13 @@ static void pci_enable_device(uint8_t bus, uint8_t dev, uint8_t func)
 void pci_scan(void)
 {
     hda_dev = (pci_dev_t *)0;
+    pci_device_count = 0;
 
     /* ECAM + PCI MMIO already mapped by paging_init() */
     serial_puts("[PCI ] Scanning bus 0...\n");
 
     for (int dev = 0; dev < 32; dev++) {
+        serial_puts(".");
         uint32_t id = pci_ecam_read32(0, dev, 0, PCI_VENDOR_ID);
         uint16_t vendor = (uint16_t)(id & 0xFFFF);
         uint16_t device = (uint16_t)(id >> 16);
@@ -158,28 +170,59 @@ void pci_scan(void)
         serial_putdec(dev);
         serial_puts(".0\n");
 
-        /* Check for HDA: class 0x04, subclass 0x03 */
-        if (class_code == PCI_CLASS_MULTIMEDIA && subclass == PCI_SUBCLASS_HDA && !hda_dev) {
-            hda_dev_store.bus = 0;
-            hda_dev_store.dev = (uint8_t)dev;
-            hda_dev_store.func = 0;
-            hda_dev_store.vendor_id = vendor;
-            hda_dev_store.device_id = device;
-            hda_dev_store.class_code = class_code;
-            hda_dev_store.subclass = subclass;
+        /* Store in device array (no BAR probing yet — only for known devices) */
+        if (pci_device_count < PCI_MAX_DEVICES) {
+            pci_dev_t *d = &pci_devices[pci_device_count];
+            d->bus = 0;
+            d->dev = (uint8_t)dev;
+            d->func = 0;
+            d->vendor_id = vendor;
+            d->device_id = device;
+            d->class_code = class_code;
+            d->subclass = subclass;
+            for (int b = 0; b < 6; b++) d->bar[b] = 0;
 
-            /* Assign BARs (no firmware does this on virt) */
-            for (int b = 0; b < 6; b++)
-                hda_dev_store.bar[b] = pci_assign_bar(0, dev, 0, b);
+            /* Only probe BARs for devices we use (avoid QEMU virt hangs) */
+            int probe_bars = 0;
+            if (class_code == PCI_CLASS_MULTIMEDIA && subclass == PCI_SUBCLASS_HDA)
+                probe_bars = 1;  /* HDA */
+            if (vendor == 0x1AF4 && (device == 0x1001 || device == 0x1042))
+                probe_bars = 1;  /* VirtIO-blk */
 
-            /* Enable bus master + memory */
-            pci_enable_device(0, dev, 0);
+            if (probe_bars) {
+                /* Read pre-assigned BARs (QEMU virt assigns during init).
+                 * BAR probing (write 0xFFFFFFFF) hangs on some QEMU virt devices. */
+                for (int b = 0; b < 6; b++) {
+                    uint32_t bar_raw = pci_ecam_read32(0, dev, 0, PCI_BAR0 + b * 4);
+                    if (bar_raw == 0) continue;
+                    if (bar_raw & 1) continue;  /* skip I/O BARs */
+                    int is_64bit = ((bar_raw >> 1) & 3) == 2;
+                    uint64_t addr = bar_raw & 0xFFFFFFF0UL;
+                    if (is_64bit && b + 1 < 6) {
+                        uint32_t bar_hi = pci_ecam_read32(0, dev, 0, PCI_BAR0 + (b + 1) * 4);
+                        addr |= (uint64_t)bar_hi << 32;
+                    }
+                    if (addr) {
+                        d->bar[b] = addr;
+                        paging_map_mmio(addr, 0x10000);  /* 64KB mapping */
+                    }
+                    if (is_64bit) {
+                        b++;
+                        if (b < 6) d->bar[b] = 0;
+                    }
+                }
+                /* Don't enable here — let the driver handle it after BAR assignment */
+            }
 
-            hda_dev = &hda_dev_store;
+            /* Check for HDA */
+            if (class_code == PCI_CLASS_MULTIMEDIA && subclass == PCI_SUBCLASS_HDA && !hda_dev) {
+                hda_dev = d;
+                serial_puts("[PCI ] HDA found, BAR0=");
+                serial_puthex(d->bar[0], 8);
+                serial_puts("\n");
+            }
 
-            serial_puts("[PCI ] HDA found, BAR0=");
-            serial_puthex(hda_dev_store.bar[0], 8);
-            serial_puts("\n");
+            pci_device_count++;
         }
     }
 
@@ -190,4 +233,13 @@ void pci_scan(void)
 pci_dev_t *pci_get_hda(void)
 {
     return hda_dev;
+}
+
+pci_dev_t *pci_get_device(uint16_t vendor, uint16_t device)
+{
+    for (int i = 0; i < pci_device_count; i++) {
+        if (pci_devices[i].vendor_id == vendor && pci_devices[i].device_id == device)
+            return &pci_devices[i];
+    }
+    return (pci_dev_t *)0;
 }

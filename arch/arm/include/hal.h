@@ -121,6 +121,27 @@ void task_delay_ms(uint32_t ms);
 void sched_start(void);
 
 /* ========================================================================
+ * VirtIO block device (drivers/virtio_blk.c)
+ * ======================================================================== */
+int      virtio_blk_init(uint8_t bus, uint8_t dev, uint8_t func, uint64_t bars[6]);
+int      virtio_blk_read_bytes(uint64_t byte_offset, void *buf, uint64_t len);
+int      virtio_blk_write_bytes(uint64_t byte_offset, const void *buf, uint64_t len);
+int      virtio_blk_flush(void);
+uint64_t virtio_blk_capacity(void);
+
+/* ========================================================================
+ * OsitoFS v2 (fs/ositofs2.c) — types from include/common/ositofs2_format.h
+ * ======================================================================== */
+#include "../../../include/common/ositofs2_format.h"
+
+int  osfs2_mount(uint64_t part_offset);
+void osfs2_list(void);
+osfs2_file_t *osfs2_find(const char *name);
+int  osfs2_read(osfs2_file_t *file, uint64_t offset, void *buf, uint64_t len);
+osfs2_file_t *osfs2_create(const char *name, uint64_t size);
+int  osfs2_delete(const char *name);
+
+/* ========================================================================
  * Shell
  * ======================================================================== */
 void shell_run(void);
