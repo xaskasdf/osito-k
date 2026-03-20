@@ -2055,18 +2055,25 @@ void WINAPI crt_CxxThrowException(PVOID pExceptionObject, PVOID pThrowInfo)
                 serial_puts(" ");
             }
             serial_puts("\n");
-            /* Try each field as a wide string pointer */
-            for (int fi = 0; fi < 3; fi++) {
+            /* Try ALL fields as wide and narrow strings */
+            for (int fi = 0; fi < 4; fi++) {
                 if (f[fi] > 0x10000 && f[fi] < 0x7FFFFFFF) {
                     uint16_t *ws = (uint16_t *)(ULONG_PTR)f[fi];
+                    char *ns = (char *)(ULONG_PTR)f[fi];
                     if (ws[0] > 0x20 && ws[0] < 0x7F) {
                         serial_puts("[CXX-F");
                         serial_putdec(fi);
-                        serial_puts("] \"");
-                        for (int i = 0; i < 120 && ws[i] > 0 && ws[i] < 0x7F; i++)
+                        serial_puts("] W\"");
+                        for (int i = 0; i < 200 && ws[i] > 0 && ws[i] < 0x7F; i++)
                             serial_putchar((char)ws[i]);
                         serial_puts("\"\n");
-                        break;
+                    } else if (ns[0] > 0x20 && ns[0] < 0x7F) {
+                        serial_puts("[CXX-F");
+                        serial_putdec(fi);
+                        serial_puts("] A\"");
+                        for (int i = 0; i < 200 && ns[i] >= 0x20 && ns[i] < 0x7F; i++)
+                            serial_putchar(ns[i]);
+                        serial_puts("\"\n");
                     }
                 }
             }
