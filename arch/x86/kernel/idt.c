@@ -917,11 +917,16 @@ void isr_handler(interrupt_frame_t *frame)
                     serial_puthex(seh, 8);
                     serial_puts("\n");
                     if (seh >= 0x10000000 && seh < 0x20000000) {
-                        /* SEH chain corrupt → RET 0 regardless of count */
+                        /* SEH chain corrupt → RET with safe value */
                         uint32_t *sp32 = (uint32_t *)(uintptr_t)(frame->rsp & 0xFFFFFFFF);
-                        frame->rip = sp32[0];
+                        uint32_t retaddr = sp32[0];
+                        frame->rip = retaddr;
                         frame->rsp += 4;
-                        frame->rax = 0;
+                        /* Return 1 for known vtable dispatch sites where 0
+                         * causes cascading failures (Browse → "Failed to enter").
+                         * 0x103888FB = Engine.dll call [edx+0xb0] vtable dispatch
+                         * 0x101581AD = Core.dll virtual method call */
+                        frame->rax = (retaddr == 0x103888FB || retaddr == 0x101581AD) ? 1 : 0;
                         if (g_null_page_dirty) {
                             g_null_page_dirty = 0;
                             memset((void *)0, 0, 4096);

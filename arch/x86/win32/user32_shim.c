@@ -656,6 +656,25 @@ BOOL WINAPI PeekMessageA(LPMSG lpMsg, HWND hWnd, DWORD wMsgFilterMin,
         peek_log_count++;
     }
 
+    /* One-shot: clear GErrorHist on first PeekMessage call.
+     * The engine's init phase triggers null-pointer faults (handled by our
+     * write-through) that set GErrorHist="General protection fault!".
+     * By the time PeekMessage is called, init is done. Clear the error
+     * so Browse() doesn't skip rendering. */
+    {
+        static int gerr_cleared = 0;
+        if (!gerr_cleared) {
+            volatile uint16_t *gerr = (volatile uint16_t *)(uintptr_t)0x101E3474;
+            volatile uint32_t *gcrit = (volatile uint32_t *)(uintptr_t)0x101E568C;
+            if (*gerr != 0) {
+                *gerr = 0;
+                *gcrit = 0;
+                serial_puts("[USER32] Cleared GErrorHist at first PeekMessage\n");
+            }
+            gerr_cleared = 1;
+        }
+    }
+
     if (quit_posted && msg_queue_empty()) {
         msg_write_to(lpMsg, NULL, WM_QUIT, (WPARAM)quit_code, 0, 0, 0, 0);
         if (wRemoveMsg & PM_REMOVE)

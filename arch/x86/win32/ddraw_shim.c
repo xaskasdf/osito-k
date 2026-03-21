@@ -493,6 +493,22 @@ static HRESULT WINAPI dd_SetCooperativeLevel(IDirectDraw7 *self, HANDLE hwnd, DW
     (void)self; (void)flags;
     ddraw_hwnd = hwnd;
     serial_puts("[DDRAW] SetCooperativeLevel\n");
+
+    /* Clear GErrorHist + GIsCriticalError. The engine's Client init phase
+     * triggers null-pointer faults (handled by our write-through) that set
+     * GErrorHist="General protection fault!". SetCooperativeLevel is called
+     * AFTER Client init and BEFORE Browse(). If GErrorHist is set, Browse()
+     * skips rendering → error exit. Clear both for a fresh start. */
+    {
+        volatile uint16_t *gerr = (volatile uint16_t *)(uintptr_t)0x101E3474;
+        volatile uint32_t *gcrit = (volatile uint32_t *)(uintptr_t)0x101E568C;
+        if (*gerr != 0 || *gcrit != 0) {
+            *gerr = 0;
+            *gcrit = 0;
+            serial_puts("[DDRAW] Cleared GErrorHist for Browse()\n");
+        }
+    }
+
     return DD_OK;
 }
 

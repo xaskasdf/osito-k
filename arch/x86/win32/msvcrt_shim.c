@@ -47,9 +47,115 @@ extern void compat32_callback(uint32_t func_addr);
  * cannot be called directly from 64-bit. We use compat32_callback() which
  * switches to compat mode, calls the function, and returns.
  */
+/* ── Stub FMalloc for early _initterm (before appInit sets up GMalloc) ── */
+
+extern void *kmalloc(uint64_t size);
+extern void kfree(void *ptr);
+
+/* Stub implementations dispatched from thiscall vtable.
+ * Args are stdcall (this in ECX, but we ignore it). */
+static uint64_t WINAPI stub_fmalloc_malloc(uint64_t _this, uint64_t count, uint64_t tag)
+{
+    (void)_this; (void)tag;
+    return (uint64_t)(uintptr_t)kmalloc(count ? count : 1);
+}
+
+static uint64_t WINAPI stub_fmalloc_realloc(uint64_t _this, uint64_t orig,
+                                              uint64_t count, uint64_t tag)
+{
+    (void)_this; (void)tag;
+    void *old = (void *)(uintptr_t)(uint32_t)orig;
+    void *nw = kmalloc(count ? count : 1);
+    if (nw && old) {
+        /* Copy old data — we don't know old size, copy up to new size */
+        uint8_t *s = (uint8_t *)old, *d = (uint8_t *)nw;
+        for (uint64_t i = 0; i < count; i++) d[i] = s[i];
+    }
+    /* Don't free old — we don't track sizes for safe realloc */
+    return (uint64_t)(uintptr_t)nw;
+}
+
+static uint64_t WINAPI stub_fmalloc_free(uint64_t _this, uint64_t ptr)
+{
+    (void)_this;
+    if (ptr) kfree((void *)(uintptr_t)(uint32_t)ptr);
+    return 0;
+}
+
+static uint64_t WINAPI stub_fmalloc_nop(uint64_t _this)
+{
+    (void)_this;
+    return 1; /* HeapCheck returns TRUE, others return 0/void */
+}
+
+/* Static stub object: [0]=vtable_ptr. Vtable: [Malloc,Realloc,Free,nop×4] */
+static uint32_t stub_fmalloc_vtbl[8];
+static uint32_t stub_fmalloc_obj[4]; /* [0]=vtbl ptr, [1-3]=padding */
+static int stub_gmalloc_installed = 0;
+
+static void ensure_gmalloc_stub(void)
+{
+    if (stub_gmalloc_installed) return;
+
+    /* GMalloc is at Core.dll + RVA 0xA7B90 (VA 0x101A7B90 when base=0x10100000).
+     * It's a FMalloc* pointer. On disk, it points to a BSS object (0x101E3450)
+     * whose vtable starts as 0 (zero-initialized). The pointer is NON-NULL but
+     * the vtable is NULL — so we check the vtable, not the pointer. */
+    volatile uint32_t *gmalloc = (volatile uint32_t *)(uintptr_t)0x101A7B90;
+
+    /* Check if Core.dll is loaded */
+    uint32_t obj_addr = *gmalloc;
+    if (obj_addr < 0x10000000 || obj_addr >= 0x20000000) return;
+
+    /* Check if the FMalloc object's vtable is already valid */
+    volatile uint32_t *obj_vtbl = (volatile uint32_t *)(uintptr_t)obj_addr;
+    if (*obj_vtbl != 0) return;  /* Already constructed by appInit */
+
+    /* Create thunks for each vtable method */
+    extern uint32_t compat32_make_thunk_ex(uint64_t target, const char *name,
+                                             uint8_t num_args, uint8_t callconv);
+    uint32_t t_malloc  = compat32_make_thunk_ex((uint64_t)(uintptr_t)stub_fmalloc_malloc,
+                                                  "GMalloc_Malloc", 2, 0);
+    uint32_t t_realloc = compat32_make_thunk_ex((uint64_t)(uintptr_t)stub_fmalloc_realloc,
+                                                  "GMalloc_Realloc", 3, 0);
+    uint32_t t_free    = compat32_make_thunk_ex((uint64_t)(uintptr_t)stub_fmalloc_free,
+                                                  "GMalloc_Free", 1, 0);
+    uint32_t t_nop     = compat32_make_thunk_ex((uint64_t)(uintptr_t)stub_fmalloc_nop,
+                                                  "GMalloc_nop", 0, 0);
+
+    /* FMalloc vtable: [Malloc, Realloc, Free, DumpAllocs, HeapCheck, Init, Exit] */
+    stub_fmalloc_vtbl[0] = t_malloc;
+    stub_fmalloc_vtbl[1] = t_realloc;
+    stub_fmalloc_vtbl[2] = t_free;
+    stub_fmalloc_vtbl[3] = t_nop;
+    stub_fmalloc_vtbl[4] = t_nop;
+    stub_fmalloc_vtbl[5] = t_nop;
+    stub_fmalloc_vtbl[6] = t_nop;
+    stub_fmalloc_vtbl[7] = 0;
+
+    /* Install stub vtable INTO the existing FMalloc object (at obj_addr).
+     * The object exists in BSS (zero-initialized). Its vtable pointer
+     * (first DWORD) is 0. We write our stub vtable there.
+     * When FMallocWindows is properly constructed later (EXE _initterm),
+     * its constructor overwrites the vtable with the real one. */
+    *obj_vtbl = (uint32_t)(uintptr_t)stub_fmalloc_vtbl;
+
+    stub_gmalloc_installed = 1;
+    serial_puts("[CRT] Stub GMalloc vtable at 0x");
+    serial_puthex(obj_addr, 8);
+    serial_puts(" -> vtbl 0x");
+    serial_puthex(*obj_vtbl, 8);
+    serial_puts("\n");
+}
+
 void WINAPI _initterm(_PVFV *pfbegin, _PVFV *pfend)
 {
 #ifndef TEST_HARNESS
+    /* Ensure GMalloc is valid before any callback can call appMalloc.
+     * Core.dll's global constructors and DLL _initterm callbacks may
+     * use appMalloc BEFORE the EXE's appInit() sets up FMallocWindows. */
+    ensure_gmalloc_stub();
+
     /* PE32 mode: treat as array of uint32_t function pointers */
     uint32_t *begin32 = (uint32_t *)(ULONG_PTR)pfbegin;
     uint32_t *end32   = (uint32_t *)(ULONG_PTR)pfend;
@@ -70,6 +176,22 @@ void WINAPI _initterm(_PVFV *pfbegin, _PVFV *pfend)
     serial_puts("[MSVCRT] _initterm done: ");
     serial_putdec(cb_count);
     serial_puts(" callbacks executed\n");
+
+    /* Clear GErrorHist after each _initterm batch. Null-pointer faults
+     * during global constructors (handled by our write-through handler)
+     * cause the engine's error handler to set GErrorHist="General
+     * protection fault!". If GErrorHist is set when WinMain's Browse()
+     * runs, the engine skips rendering → error exit. Clear it so the
+     * engine starts WinMain with clean error state. */
+    {
+        volatile uint16_t *gerr = (volatile uint16_t *)(uintptr_t)0x101E3474;
+        volatile uint32_t *gcrit = (volatile uint32_t *)(uintptr_t)0x101E568C;
+        if (*gerr != 0) {
+            *gerr = 0;
+            *gcrit = 0;
+            serial_puts("[CRT] Cleared GErrorHist after _initterm\n");
+        }
+    }
 
     /* Diagnostic: check FMallocWindows vtable after EXE _initterm */
     if ((uint64_t)(ULONG_PTR)begin32 >= 0x10920000 &&

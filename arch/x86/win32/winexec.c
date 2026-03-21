@@ -748,6 +748,24 @@ int winexec_run(const uint8_t *file_data, uint64_t file_size)
             }
         }
 
+        /* Clear GErrorHist and GIsCriticalError before WinMain.
+         * DLL _initterm callbacks trigger null-pointer faults (handled by our
+         * null-page write handler), which cause the engine's error handler to
+         * set GErrorHist="General protection fault!". If GErrorHist is set when
+         * the engine tries to Browse() a map, it skips rendering → error exit.
+         * Clear both so the engine starts fresh. */
+        {
+            /* GErrorHist: Core.dll + RVA 0xE3474 (TCHAR[1024], wide string) */
+            volatile uint16_t *gerr = (volatile uint16_t *)(uintptr_t)0x101E3474;
+            /* GIsCriticalError: Core.dll + RVA 0xE568C (INT, flag) */
+            volatile uint32_t *gcrit = (volatile uint32_t *)(uintptr_t)0x101E568C;
+            if (*gerr != 0 || *gcrit != 0) {
+                *gerr = 0;   /* Clear error string */
+                *gcrit = 0;  /* Clear critical error flag */
+                serial_puts("[WINEXEC] Cleared GErrorHist + GIsCriticalError\n");
+            }
+        }
+
         /* Set up exec_jmpbuf so proc_exit can longjmp back here.
          * compat32_enter never returns — proc_exit's kern_longjmp is the
          * only way back. Without this, exec_jmpbuf is uninitialized and
