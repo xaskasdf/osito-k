@@ -3399,8 +3399,24 @@ static int wcsicmp_trace_count = 0;
 
 int WINAPI crt_wcsicmp(const WCHAR *a, const WCHAR *b)
 {
-    if (wcsicmp_trace_count < 20) {
-        wcsicmp_trace_count++;
+    /* Detect infinite loop: if called with same (a,b) pair 1000+ times,
+     * force a match (return 0) to break the loop. This happens when the
+     * engine searches FName hash table for an empty string "" — the hash
+     * bucket is circular and the search never terminates. */
+    {
+        static uintptr_t prev_a, prev_b;
+        static int repeat_count;
+        if ((uintptr_t)a == prev_a && (uintptr_t)b == prev_b) {
+            if (++repeat_count > 1000) return 0;
+        } else {
+            prev_a = (uintptr_t)a;
+            prev_b = (uintptr_t)b;
+            repeat_count = 0;
+        }
+    }
+
+    wcsicmp_trace_count++;
+    if (wcsicmp_trace_count <= 20 || (wcsicmp_trace_count % 500000) == 0) {
         serial_puts("[WCSICMP#");
         serial_putdec(wcsicmp_trace_count);
         serial_puts("] a=0x");
