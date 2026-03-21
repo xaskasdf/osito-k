@@ -658,8 +658,9 @@ static void ddraw_init_com32(void)
                                             "DD_Release", 1, CC_STDCALL);
     dd_vtbl32[6]  = compat32_make_thunk_ex((uint64_t)(ULONG_PTR)dd_CreateSurface,
                                             "DD_CreateSurface", 4, CC_STDCALL);
-    dd_vtbl32[13] = compat32_make_thunk_ex((uint64_t)(ULONG_PTR)dd_GetDisplayMode,
+    dd_vtbl32[12] = compat32_make_thunk_ex((uint64_t)(ULONG_PTR)dd_GetDisplayMode,
                                             "DD_GetDisplayMode", 2, CC_STDCALL);
+    dd_vtbl32[13] = dd_vtbl32[12]; /* Same method, both IDirectDraw slots */
     dd_vtbl32[20] = compat32_make_thunk_ex((uint64_t)(ULONG_PTR)dd_SetCooperativeLevel,
                                             "DD_SetCoopLevel", 3, CC_STDCALL);
     dd_vtbl32[21] = compat32_make_thunk_ex((uint64_t)(ULONG_PTR)dd_SetDisplayMode,
