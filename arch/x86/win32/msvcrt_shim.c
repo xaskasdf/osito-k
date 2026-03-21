@@ -2163,6 +2163,22 @@ void WINAPI crt_CxxThrowException(PVOID pExceptionObject, PVOID pThrowInfo)
         cxx_exception_active = 1;
     }
 
+    /* Pre-check: if SEH chain head is corrupt (in PE image range), skip
+     * RaiseException entirely. No valid __CxxFrameHandler will be found.
+     * Returning from _CxxThrowException is UB in C++ but MSVC often generates
+     * fall-through cleanup code that handles the error gracefully. */
+    {
+        extern TEB32 g_teb32;
+        uint32_t head = g_teb32.ExceptionList;
+        if (head >= 0x10000000 && head < 0x14000000) {
+            serial_puts("[CXX] SEH chain corrupt (head=0x");
+            serial_puthex(head, 8);
+            serial_puts(") — suppressing throw\n");
+            cxx_exception_active = 0;
+            return;
+        }
+    }
+
     /* Call RaiseException with the C++ exception code.
      * This will dispatch through the SEH chain. */
     {

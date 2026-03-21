@@ -454,26 +454,45 @@ void RtlRaiseException(PEXCEPTION_RECORD ExceptionRecord)
         return;
     }
 
-    /* Fallback: walk 64-bit SEH chain (for native 64-bit handlers) */
+    /* Fallback: walk 64-bit SEH chain (for native 64-bit handlers).
+     * Validate handler addresses before calling — corrupt chain entries
+     * could have garbage handler values (e.g. 0xC5CAE910). */
     extern TEB32 g_teb32;
     PEXCEPTION_REGISTRATION_RECORD frame =
         (PEXCEPTION_REGISTRATION_RECORD)(ULONG_PTR)g_teb32.ExceptionList;
 
     while (frame && frame != EXCEPTION_CHAIN_END) {
-        /* Read as 32-bit values to avoid size mismatch */
         uint32_t *f32 = (uint32_t *)(ULONG_PTR)frame;
+        uint32_t frame_addr = (uint32_t)(ULONG_PTR)frame;
         uint32_t handler32 = f32[1];
+
+        /* Skip frames with invalid addresses or handlers */
+        if (frame_addr >= 0x10000000 && frame_addr < 0x14000000) {
+            serial_puts("[SEH] skipping corrupt frame at 0x");
+            serial_puthex(frame_addr, 8);
+            serial_puts("\n");
+            uint32_t next32 = f32[0];
+            frame = (next32 == 0 || next32 == 0xFFFFFFFF) ? NULL :
+                    (PEXCEPTION_REGISTRATION_RECORD)(ULONG_PTR)next32;
+            continue;
+        }
+        if (handler32 < 0x10000000 || handler32 >= 0x20000000) {
+            /* Handler not in PE DLL range — skip */
+            uint32_t next32 = f32[0];
+            frame = (next32 == 0 || next32 == 0xFFFFFFFF) ? NULL :
+                    (PEXCEPTION_REGISTRATION_RECORD)(ULONG_PTR)next32;
+            continue;
+        }
+
         serial_puts("[SEH] trying handler at 0x");
         serial_puthex(handler32, 8);
         serial_puts("\n");
 
-        /* Build a minimal context */
         CONTEXT ctx;
         BYTE *p = (BYTE *)&ctx;
         for (SIZE_T i = 0; i < sizeof(CONTEXT); i++) p[i] = 0;
         ctx.ContextFlags = CONTEXT_FULL;
 
-        /* Call the handler via zero-extended 32-bit address */
         typedef EXCEPTION_DISPOSITION (WINAPI *seh_handler_fn)(
             PEXCEPTION_RECORD, PVOID, PCONTEXT, PVOID);
         seh_handler_fn handler = (seh_handler_fn)(ULONG_PTR)handler32;
@@ -492,7 +511,6 @@ void RtlRaiseException(PEXCEPTION_RECORD ExceptionRecord)
             serial_puts("\n");
         }
 
-        /* Advance using 32-bit read (frame->Next is only 4 bytes in PE32) */
         uint32_t next32 = *(uint32_t *)(ULONG_PTR)frame;
         frame = (PEXCEPTION_REGISTRATION_RECORD)(ULONG_PTR)next32;
     }

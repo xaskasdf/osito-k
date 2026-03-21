@@ -761,47 +761,21 @@ void isr_handler(interrupt_frame_t *frame)
         __asm__ volatile ("mov %%dr6, %0" : "=r"(dr6));
 
         if (dr6 & 0x1) {  /* B0: breakpoint 0 hit */
-            /* Read the watched address value (g_teb32.ExceptionList) */
             uint64_t dr0;
             __asm__ volatile ("mov %%dr0, %0" : "=r"(dr0));
             uint32_t val = *(volatile uint32_t *)dr0;
 
-            /* Log all watchpoint hits (catches dd_vtbl32 corruption) */
             if (db_hit_count < 20) {
                 serial_puts("[WP] val=0x");
                 serial_puthex(val, 8);
                 serial_puts(" RIP=0x");
                 serial_puthex(frame->rip, 8);
-                serial_puts(" ESP=0x");
-                serial_puthex(frame->rsp & 0xFFFFFFFF, 8);
-
-                /* Dump instruction bytes at RIP for first 5 hits */
-                if (db_hit_count < 5) {
-                    serial_puts(" insn:");
-                    uint8_t *ip = (uint8_t *)(uint64_t)frame->rip;
-                    /* Back up 6 bytes to catch prefix+opcode before the write */
-                    for (int i = -6; i < 8; i++) {
-                        if (i == 0) serial_puts(" [");
-                        serial_puthex(ip[i], 2);
-                        if (i == 0) serial_puts("]");
-                        else serial_puts(" ");
-                    }
-
-                    /* Also show the stack around ESP to see saved SEH frame */
-                    serial_puts("\n  stack:");
-                    uint32_t *sp = (uint32_t *)(uint64_t)(frame->rsp & 0xFFFFFFFF);
-                    for (int i = 0; i < 8; i++) {
-                        serial_puts(" ");
-                        serial_puthex(sp[i], 8);
-                    }
-                }
-                db_hit_count++;
                 serial_puts("\n");
             }
+            db_hit_count++;
 
-            /* Clear DR6 status bits */
             __asm__ volatile ("mov %0, %%dr6" : : "r"((uint64_t)0));
-            return;  /* non-fatal: resume execution */
+            return;
         }
 
         /* TF single-step after NULL page write: re-protect + re-zero page 0 */
@@ -833,27 +807,70 @@ void isr_handler(interrupt_frame_t *frame)
          * causes #GP(0x0A) because the 64-bit exception frame can't be
          * pushed on the 32-bit stack without IST. Just leave page writable. */
         if (cr2 < 0x1000 && (frame->error_code & 2) && !(frame->error_code & 16)) {
-            /* Bytecode-as-code: if RIP is in VirtualAlloc range AND writing
-             * to null page, the engine jumped to .u bytecode via a corrupted
-             * function pointer. Simulate RET 0 NOW while the stack still
-             * has the CORRECT return address from the original `call *reg`. */
+            /* Bytecode-as-code: RIP is in VirtualAlloc range AND writing
+             * to null page — engine jumped to .u bytecode via a stale
+             * register. Try to redirect to the CORRECT function by scanning
+             * backwards for the IAT load instruction (mov reg, [imm32]). */
             if ((frame->cs & 0xFFFF) == 0x40 &&
                 frame->rip >= 0x40000000 && frame->rip < 0x80000000) {
-                static int bc_write_count = 0;
-                bc_write_count++;
+                static int bc_count = 0;
+                bc_count++;
                 uint32_t *sp = (uint32_t *)(uintptr_t)(frame->rsp & 0xFFFFFFFF);
-                if (bc_write_count <= 5) {
+                uint32_t retaddr = sp[0];
+
+                /* Try smart redirect: find the IAT load for the stale register */
+                uint8_t *caller = (uint8_t *)(uintptr_t)(retaddr - 2);
+                uint32_t iat_addr = 0;
+
+                /* Detect call reg opcode (FF Dx) and matching mov reg,[imm32] */
+                uint8_t mov_opcode = 0;
+                if (caller[0] == 0xFF && (caller[1] & 0xF8) == 0xD0) {
+                    /* FF D0=call eax, D1=ecx, D2=edx, D3=ebx, D6=esi, D7=edi */
+                    uint8_t reg = caller[1] & 0x07;
+                    /* mov reg,[imm32] = 8B <05+reg*8> for eax/ecx/edx/ebx/esi/edi
+                     * 8B 05=eax, 0D=ecx, 15=edx, 1D=ebx, 2D=ebp, 35=esi, 3D=edi */
+                    mov_opcode = 0x05 + reg * 8;
+                }
+
+                if (mov_opcode) {
+                    uint8_t *scan = caller - 1;
+                    for (int i = 0; i < 200 && !iat_addr; i++, scan--) {
+                        if (scan[0] == 0x8B && scan[1] == mov_opcode) {
+                            iat_addr = *(uint32_t *)(scan + 2);
+                        }
+                    }
+                }
+
+                if (iat_addr >= 0x10000000 && iat_addr < 0x20000000) {
+                    uint32_t correct_fn = *(uint32_t *)(uintptr_t)iat_addr;
+                    if (correct_fn >= 0x10000000 && correct_fn < 0x20000000) {
+                        if (bc_count <= 10) {
+                            serial_puts("[BC-REDIRECT] -> 0x");
+                            serial_puthex(correct_fn, 8);
+                            serial_puts(" (IAT 0x");
+                            serial_puthex(iat_addr, 8);
+                            serial_puts(") retaddr=0x");
+                            serial_puthex(retaddr, 8);
+                            serial_puts("\n");
+                        }
+                        frame->rip = correct_fn;
+                        return; /* Function returns to retaddr via its own RET */
+                    }
+                }
+
+                /* Fallback: generic BC-FIX (return NULL to caller) */
+                if (bc_count <= 5) {
                     serial_puts("[BC-FIX] RIP=0x");
                     serial_puthex((uint32_t)frame->rip, 8);
                     serial_puts(" retaddr=0x");
-                    serial_puthex(sp[0], 8);
+                    serial_puthex(retaddr, 8);
                     serial_puts(" CR2=0x");
                     serial_puthex((uint32_t)cr2, 2);
                     serial_puts("\n");
                 }
-                frame->rip = sp[0];  /* return to caller (CLEAN retaddr) */
+                frame->rip = retaddr;
                 frame->rsp += 4;
-                frame->rax = 0;      /* return NULL */
+                frame->rax = 0;
                 return;
             }
             /* Normal null-page write-through for legitimate code */

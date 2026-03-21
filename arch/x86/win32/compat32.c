@@ -1142,6 +1142,11 @@ void compat32_callback(uint32_t func_addr)
         if (tss_ist1_ptr) callback_saved_ist1[depth] = *tss_ist1_ptr;
     }
 
+    /* Save SEH ExceptionList — 32-bit code may push SEH frames on the
+     * callback stack. Restore on return so the main chain stays valid. */
+    extern TEB32 g_teb32;
+    uint32_t saved_seh = g_teb32.ExceptionList;
+
     if (kern_setjmp(callback_jmpbufs[depth]) == 0) {
         /*
          * First return from setjmp — switch to compat mode.
@@ -1176,6 +1181,7 @@ void compat32_callback(uint32_t func_addr)
     }
 
     /* longjmp returned here — 32-bit function is done. */
+    g_teb32.ExceptionList = saved_seh;  /* Restore SEH chain */
     callback_depth--;
     serial_puts("[CB32] depth=");
     serial_putdec(depth);
@@ -1210,6 +1216,11 @@ uint32_t compat32_callback_args(uint32_t func_addr, int nargs, const uint32_t *a
         extern uint64_t *tss_ist1_ptr;
         if (tss_ist1_ptr) callback_saved_ist1[depth] = *tss_ist1_ptr;
     }
+
+    /* Save SEH ExceptionList — 32-bit code may push SEH frames on the
+     * callback stack. Restore on return so the main chain stays valid. */
+    extern TEB32 g_teb32;
+    uint32_t saved_seh = g_teb32.ExceptionList;
 
     if (kern_setjmp(callback_jmpbufs[depth]) == 0) {
         uint32_t *sp = (uint32_t *)(callback_stacks[depth] + CALLBACK_STACK_SIZE);
@@ -1248,6 +1259,7 @@ uint32_t compat32_callback_args(uint32_t func_addr, int nargs, const uint32_t *a
     }
 
     /* longjmp returned — 32-bit function is done. */
+    g_teb32.ExceptionList = saved_seh;  /* Restore SEH chain */
     callback_depth--;
     return callback_retval;
 #else
