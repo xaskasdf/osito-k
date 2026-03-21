@@ -732,7 +732,22 @@ LRESULT WINAPI DispatchMessageA(const MSG *lpMsg)
     if (m.message == WM_QUIT)
         return 0;
 
-    /* Can't call 32-bit wndproc from 64-bit. Use DefWindowProc. */
+    /* Dispatch to 32-bit WndProc via compat32_callback_args.
+     * Previous code fell back to DefWindowProc with "can't call 32-bit
+     * from 64-bit" — but compat32_callback_args handles the mode switch. */
+    WINDOW *w = find_window(m.hwnd);
+    if (w && w->wndproc) {
+        extern uint32_t compat32_callback_args(uint32_t func, int nargs,
+                                                const uint32_t *args);
+        uint32_t args[4] = {
+            (uint32_t)(uintptr_t)m.hwnd,
+            (uint32_t)m.message,
+            (uint32_t)m.wParam,
+            (uint32_t)m.lParam
+        };
+        return (LRESULT)compat32_callback_args(
+            (uint32_t)(uintptr_t)w->wndproc, 4, args);
+    }
     return DefWindowProcA(m.hwnd, m.message, m.wParam, m.lParam);
 }
 
@@ -751,8 +766,18 @@ BOOL WINAPI PostMessageA(HWND hWnd, DWORD Msg, WPARAM wParam, LPARAM lParam)
 LRESULT WINAPI SendMessageA(HWND hWnd, DWORD Msg, WPARAM wParam, LPARAM lParam)
 {
     WINDOW *w = find_window(hWnd);
-    /* Can't call 32-bit wndproc from 64-bit. Use DefWindowProc. */
-    (void)w;
+    if (w && w->wndproc) {
+        extern uint32_t compat32_callback_args(uint32_t func, int nargs,
+                                                const uint32_t *args);
+        uint32_t args[4] = {
+            (uint32_t)(uintptr_t)hWnd,
+            (uint32_t)Msg,
+            (uint32_t)wParam,
+            (uint32_t)lParam
+        };
+        return (LRESULT)compat32_callback_args(
+            (uint32_t)(uintptr_t)w->wndproc, 4, args);
+    }
     return DefWindowProcA(hWnd, Msg, wParam, lParam);
 }
 
