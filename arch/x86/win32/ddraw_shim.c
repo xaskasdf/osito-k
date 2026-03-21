@@ -630,6 +630,59 @@ static uint32_t dd_proxy32;     /* IDirectDraw COM object: just lpVtbl32 */
 static uint32_t surf_vtbl32[33]; /* IDirectDrawSurface vtable */
 static int com32_initialized = 0;
 
+/* IDirectDraw7::EnumDisplayModes — report available display modes via callback.
+ * Args (stdcall, including this): this, dwFlags, lpDDSurfaceDesc, lpContext, lpCallback
+ * Callback: HRESULT CALLBACK(LPDDSURFACEDESC2 desc, LPVOID ctx)
+ *   Returns DDENUMRET_OK (1) to continue, DDENUMRET_CANCEL (0) to stop. */
+static uint64_t WINAPI dd_EnumDisplayModes(
+    uint64_t _this, uint64_t dwFlags, uint64_t lpDesc,
+    uint64_t lpContext, uint64_t lpCallback)
+{
+    (void)_this; (void)dwFlags; (void)lpDesc;
+    serial_puts("[DDRAW] EnumDisplayModes cb=0x");
+    serial_puthex((uint32_t)lpCallback, 8);
+    serial_puts("\n");
+
+    if (!lpCallback) return 0; /* DD_OK */
+
+    static const struct { uint32_t w, h, bpp; } modes[] = {
+        {640, 480, 16}, {800, 600, 16}, {1024, 768, 16},
+        {640, 480, 32}, {800, 600, 32}, {1024, 768, 32},
+    };
+
+    for (int i = 0; i < 6; i++) {
+        /* DDSURFACEDESC2 = 124 bytes. Use static buffer so the 32-bit
+         * callback can access it (must be in lower 4GB). */
+        static uint8_t desc_buf[128];
+        for (int j = 0; j < 128; j++) desc_buf[j] = 0;
+        uint32_t *d = (uint32_t *)desc_buf;
+        d[0]  = 124;                  /* dwSize */
+        d[1]  = 0x00001006;           /* DDSD_WIDTH|DDSD_HEIGHT|DDSD_PIXELFORMAT */
+        d[2]  = modes[i].h;           /* dwHeight */
+        d[3]  = modes[i].w;           /* dwWidth */
+        d[4]  = modes[i].w * (modes[i].bpp / 8); /* lPitch */
+        /* ddpfPixelFormat at offset 72 */
+        uint32_t *pf = (uint32_t *)(desc_buf + 72);
+        pf[0] = 32;                   /* dwSize of DDPIXELFORMAT */
+        pf[1] = 0x00000040;           /* DDPF_RGB */
+        pf[3] = modes[i].bpp;         /* dwRGBBitCount */
+        if (modes[i].bpp == 16) {
+            pf[4] = 0xF800;  pf[5] = 0x07E0;  pf[6] = 0x001F;
+        } else {
+            pf[4] = 0x00FF0000; pf[5] = 0x0000FF00; pf[6] = 0x000000FF;
+        }
+
+        uint32_t args[2] = {
+            (uint32_t)(uintptr_t)desc_buf,
+            (uint32_t)lpContext
+        };
+        uint32_t ret = compat32_callback_args((uint32_t)lpCallback, 2, args);
+        if (ret == 0) break; /* DDENUMRET_CANCEL */
+    }
+
+    return 0; /* DD_OK */
+}
+
 /* Generic COM stub — returns S_OK for any unimplemented method */
 static HRESULT WINAPI dd_com_stub(PVOID this_ptr)
 {
@@ -658,6 +711,8 @@ static void ddraw_init_com32(void)
                                             "DD_Release", 1, CC_STDCALL);
     dd_vtbl32[6]  = compat32_make_thunk_ex((uint64_t)(ULONG_PTR)dd_CreateSurface,
                                             "DD_CreateSurface", 4, CC_STDCALL);
+    dd_vtbl32[8]  = compat32_make_thunk_ex((uint64_t)(ULONG_PTR)dd_EnumDisplayModes,
+                                            "DD_EnumDisplayModes", 5, CC_STDCALL);
     dd_vtbl32[12] = compat32_make_thunk_ex((uint64_t)(ULONG_PTR)dd_GetDisplayMode,
                                             "DD_GetDisplayMode", 2, CC_STDCALL);
     dd_vtbl32[13] = dd_vtbl32[12]; /* Same method, both IDirectDraw slots */
