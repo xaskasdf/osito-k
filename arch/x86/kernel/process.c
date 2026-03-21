@@ -156,8 +156,8 @@ static uint32_t next_pid = 1;
 extern int  kern_setjmp(uint64_t *buf) __attribute__((returns_twice));
 extern void kern_longjmp(uint64_t *buf, int val);
 
-static uint64_t exec_jmpbuf[8];   /* setjmp/longjmp buffer */
-static int32_t  last_exit_code;
+uint64_t exec_jmpbuf[8];   /* setjmp/longjmp buffer — non-static for win32_exec */
+int32_t  last_exit_code;
 
 
 /* Console I/O (shared with syscall.c) */

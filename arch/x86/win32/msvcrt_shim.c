@@ -2242,31 +2242,37 @@ void WINAPI crt_CxxThrowException(PVOID pExceptionObject, PVOID pThrowInfo)
 
     /* _CxxThrowException MUST NOT RETURN — returning causes the 32-bit code
      * to execute unreachable instructions after 'throw' → null call → crash.
-     * Use the INT 0x2E unwind mechanism to redirect the 32-bit return to
-     * ExitProcess(1). This lets the int2e_stub do proper IST1 cleanup
-     * before redirecting (unlike calling ExitProcess directly which would
-     * kern_longjmp from within the INT handler context). */
+     *
+     * Call proc_exit directly instead of going through ExitProcess thunk.
+     * The thunk path creates a second INT 0x2E → kern_longjmp abandons the
+     * int2e_stub frame → NULL-CALL #3 from stale PE code. Direct proc_exit
+     * avoids the second INT 0x2E entirely.
+     *
+     * Must restore IST1 and 64-bit segments before longjmp. */
     {
-        extern uint32_t g_compat32_unwind_eip;
-        extern uint32_t g_compat32_unwind_ebp;
-        /* Find ExitProcess thunk by scanning thunk table for its target */
-        extern uint64_t compat32_get_target(uint32_t idx);
-        extern uint32_t compat32_get_thunk_addr(uint32_t idx);
-        extern uint32_t compat32_get_count(void);
-        extern void WINAPI ExitProcess(DWORD);
-        uint32_t n = compat32_get_count();
-        for (uint32_t i = 0; i < n; i++) {
-            if (compat32_get_target(i) == (uint64_t)(uintptr_t)ExitProcess) {
-                g_compat32_unwind_eip = compat32_get_thunk_addr(i);
-                serial_puts("[CXX] Redirecting to ExitProcess thunk at 0x");
-                serial_puthex(g_compat32_unwind_eip, 8);
-                serial_puts("\n");
-                return; /* int2e_stub will redirect to ExitProcess */
-            }
-        }
-        /* Fallback: direct call (risky, may corrupt IST1) */
-        serial_puts("[CXX] ExitProcess thunk not found — direct exit\n");
-        ExitProcess(1);
+        extern uint64_t *tss_ist1_ptr;
+        extern uint8_t ist1_stack[];
+        extern void proc_exit(int32_t code);
+
+        serial_puts("[CXX] Direct proc_exit(1)\n");
+
+        /* Restore IST1 to pristine — we're about to longjmp out of the
+         * INT 0x2E handler, bypassing int2e_stub's IST1 restore. */
+        if (tss_ist1_ptr)
+            *tss_ist1_ptr = (uint64_t)(ist1_stack + 65536);
+
+        /* Ensure 64-bit data segments (compat32_dispatch already set these,
+         * but be explicit in case of re-entrant calls). */
+        __asm__ volatile (
+            "mov $0x30, %%ax\n"
+            "mov %%ax, %%ds\n"
+            "mov %%ax, %%es\n"
+            "mov %%ax, %%ss\n"
+            ::: "ax"
+        );
+
+        proc_exit(1);
+        /* never reached — proc_exit does kern_longjmp */
     }
 
     /* ── Diagnostic: dump GObjRegistrants state ────────────── */

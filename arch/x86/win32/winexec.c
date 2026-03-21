@@ -748,7 +748,26 @@ int winexec_run(const uint8_t *file_data, uint64_t file_size)
             }
         }
 
+        /* Set up exec_jmpbuf so proc_exit can longjmp back here.
+         * compat32_enter never returns — proc_exit's kern_longjmp is the
+         * only way back. Without this, exec_jmpbuf is uninitialized and
+         * proc_exit longjmps to garbage → NULL-CALL crash. */
+        {
+            extern int kern_setjmp(uint64_t *buf) __attribute__((returns_twice));
+            extern uint64_t exec_jmpbuf[];
+            extern int32_t  last_exit_code;
+            if (kern_setjmp(exec_jmpbuf) != 0) {
+                /* proc_exit returned here — PE process has exited */
+                __asm__ volatile ("sti");
+                serial_puts("[WINEXEC] PE process exited, code=");
+                serial_putdec((uint32_t)last_exit_code);
+                serial_puts("\n");
+                return last_exit_code;
+            }
+        }
+
         compat32_enter(entry32, sp32);
+        /* never reached — control returns via proc_exit → longjmp above */
     } else {
         /* PE32+ (x86-64): direct 64-bit execution */
         typedef void (*pe_entry_fn)(void);
