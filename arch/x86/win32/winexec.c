@@ -389,6 +389,12 @@ int winexec_run(const uint8_t *file_data, uint64_t file_size)
      */
     compat32_init();
 
+    /* Create base SEH handler thunk (needs thunk pool from compat32_init) */
+    {
+        extern void crt_install_base_seh_thunk(void);
+        crt_install_base_seh_thunk();
+    }
+
     /*
      * Pre-initialize TEB32/PEB32 and set FS base BEFORE pe_load().
      *
@@ -719,6 +725,28 @@ int winexec_run(const uint8_t *file_data, uint64_t file_size)
         /* PE32 (i386): enter 32-bit compatibility mode */
         uint32_t entry32 = (uint32_t)(ULONG_PTR)info.EntryPoint;
         uint32_t sp32    = (uint32_t)(ULONG_PTR)stack_top;
+
+        /* Install permanent base SEH frame on PE stack.
+         * This sits at the bottom of the chain and survives all
+         * stack corruption from inner frames (WinDrv.dll bug). */
+        {
+            extern uint32_t crt_get_base_seh_thunk(void);
+            uint32_t handler = crt_get_base_seh_thunk();
+            if (handler) {
+                uint32_t *sp = (uint32_t *)(uintptr_t)sp32;
+                sp -= 3;
+                sp[0] = g_teb32.ExceptionList; /* Next = current head */
+                sp[1] = handler;               /* Handler = catch-all */
+                sp[2] = 0;                     /* Scope/state = 0 */
+                g_teb32.ExceptionList = (uint32_t)(uintptr_t)sp;
+                sp32 = (uint32_t)(uintptr_t)sp;
+                serial_puts("[WINEXEC] Base SEH frame at 0x");
+                serial_puthex((uint32_t)(uintptr_t)sp, 8);
+                serial_puts(" handler=0x");
+                serial_puthex(handler, 8);
+                serial_puts("\n");
+            }
+        }
 
         compat32_enter(entry32, sp32);
     } else {

@@ -2034,6 +2034,7 @@ extern int compat32_seh_dispatch(PEXCEPTION_RECORD ExceptionRecord);
  */
 static EXCEPTION_RECORD cxx_current_exception;
 static int cxx_exception_active = 0;
+uint32_t crt_get_base_seh_thunk(void); /* forward decl */
 
 void WINAPI crt_CxxThrowException(PVOID pExceptionObject, PVOID pThrowInfo)
 {
@@ -2163,19 +2164,54 @@ void WINAPI crt_CxxThrowException(PVOID pExceptionObject, PVOID pThrowInfo)
         cxx_exception_active = 1;
     }
 
-    /* Pre-check: if SEH chain head is corrupt (in PE image range), skip
-     * RaiseException entirely. No valid __CxxFrameHandler will be found.
-     * Returning from _CxxThrowException is UB in C++ but MSVC often generates
-     * fall-through cleanup code that handles the error gracefully. */
+    /* Pre-check: if SEH chain head is corrupt (in PE image range),
+     * try to repair by skipping corrupt entries. If no valid entry
+     * is found, suppress the throw (last resort). */
     {
         extern TEB32 g_teb32;
         uint32_t head = g_teb32.ExceptionList;
         if (head >= 0x10000000 && head < 0x14000000) {
-            serial_puts("[CXX] SEH chain corrupt (head=0x");
+            /* Try to repair: follow Next pointers past corrupt entries */
+            uint32_t *corrupt = (uint32_t *)(uintptr_t)head;
+            uint32_t next = corrupt[0];
+            serial_puts("[CXX] SEH chain head corrupt (0x");
             serial_puthex(head, 8);
-            serial_puts(") — suppressing throw\n");
-            cxx_exception_active = 0;
-            return;
+            serial_puts("), next=0x");
+            serial_puthex(next, 8);
+            serial_puts("\n");
+
+            if (next != 0 && next != 0xFFFFFFFF &&
+                (next < 0x10000000 || next >= 0x14000000)) {
+                /* Next is a valid non-PE address — repair chain.
+                 * Also insert our base SEH handler so there's at least
+                 * one handler to dispatch to (the original chain may only
+                 * have end sentinels after the corrupt entry). */
+                static uint32_t emergency_frame[3];
+                uint32_t base_handler = crt_get_base_seh_thunk();
+                if (base_handler) {
+                    emergency_frame[0] = next; /* chain to remaining frames */
+                    emergency_frame[1] = base_handler;
+                    emergency_frame[2] = 0;
+                    g_teb32.ExceptionList =
+                        (uint32_t)(uintptr_t)emergency_frame;
+                    serial_puts("[CXX] Repaired: emergency frame at 0x");
+                    serial_puthex((uint32_t)(uintptr_t)emergency_frame, 8);
+                    serial_puts(" -> 0x");
+                    serial_puthex(next, 8);
+                    serial_puts("\n");
+                } else {
+                    g_teb32.ExceptionList = next;
+                    serial_puts("[CXX] Repaired: chain head -> 0x");
+                    serial_puthex(next, 8);
+                    serial_puts("\n");
+                }
+                /* Fall through to RaiseException with repaired chain */
+            } else {
+                /* Can't repair — suppress throw */
+                serial_puts("[CXX] Cannot repair chain — suppressing throw\n");
+                cxx_exception_active = 0;
+                return;
+            }
         }
     }
 
@@ -2201,8 +2237,37 @@ void WINAPI crt_CxxThrowException(PVOID pExceptionObject, PVOID pThrowInfo)
             return;
         }
     }
-    serial_puts("[CXX] WARNING: _CxxThrowException returned (unhandled)\n");
+    serial_puts("[CXX] WARNING: _CxxThrowException unhandled — clean exit\n");
     cxx_exception_active = 0;
+
+    /* _CxxThrowException MUST NOT RETURN — returning causes the 32-bit code
+     * to execute unreachable instructions after 'throw' → null call → crash.
+     * Use the INT 0x2E unwind mechanism to redirect the 32-bit return to
+     * ExitProcess(1). This lets the int2e_stub do proper IST1 cleanup
+     * before redirecting (unlike calling ExitProcess directly which would
+     * kern_longjmp from within the INT handler context). */
+    {
+        extern uint32_t g_compat32_unwind_eip;
+        extern uint32_t g_compat32_unwind_ebp;
+        /* Find ExitProcess thunk by scanning thunk table for its target */
+        extern uint64_t compat32_get_target(uint32_t idx);
+        extern uint32_t compat32_get_thunk_addr(uint32_t idx);
+        extern uint32_t compat32_get_count(void);
+        extern void WINAPI ExitProcess(DWORD);
+        uint32_t n = compat32_get_count();
+        for (uint32_t i = 0; i < n; i++) {
+            if (compat32_get_target(i) == (uint64_t)(uintptr_t)ExitProcess) {
+                g_compat32_unwind_eip = compat32_get_thunk_addr(i);
+                serial_puts("[CXX] Redirecting to ExitProcess thunk at 0x");
+                serial_puthex(g_compat32_unwind_eip, 8);
+                serial_puts("\n");
+                return; /* int2e_stub will redirect to ExitProcess */
+            }
+        }
+        /* Fallback: direct call (risky, may corrupt IST1) */
+        serial_puts("[CXX] ExitProcess thunk not found — direct exit\n");
+        ExitProcess(1);
+    }
 
     /* ── Diagnostic: dump GObjRegistrants state ────────────── */
     {
@@ -3491,6 +3556,60 @@ unsigned int* WINAPI crt_p_winminor(void) { return &crt_winminor_val; }
 static int crt_getch_stub(void)  { return -1; /* EOF */ }
 static int crt_kbhit_stub(void)  { return 0;  /* no key pressed */ }
 static int crt_putenv_stub(const char *s) { (void)s; return -1; /* fail */ }
+
+/* ── Base SEH handler (catch-all for unhandled exceptions) ── */
+
+/*
+ * Installed as the bottom-most SEH frame before WinMain.
+ * When all inner handlers have been corrupted/popped, this
+ * handler catches the exception and returns EXECUTE_HANDLER
+ * so the SEH dispatcher does global unwind + handler execution.
+ *
+ * For C++ exceptions (0xE06D7363): return CONTINUE_SEARCH (0)
+ * because we can't properly unwind C++ catch blocks.
+ * For access violations: return CONTINUE_SEARCH so the kernel
+ * NULL-CALL handler catches it.
+ *
+ * The key benefit: this frame's PRESENCE in the chain ensures
+ * the chain always has a valid stack-based entry, even when
+ * WinDrv.dll's stack corruption overwrites inner frames.
+ */
+static uint64_t WINAPI crt_base_seh_handler(
+    uint64_t pExceptionRecord, uint64_t pEstablisherFrame,
+    uint64_t pContextRecord, uint64_t pDispatcherContext)
+{
+    (void)pEstablisherFrame;
+    (void)pContextRecord;
+    (void)pDispatcherContext;
+    uint32_t code = 0;
+    if (pExceptionRecord)
+        code = *(uint32_t *)(uintptr_t)pExceptionRecord;
+    serial_puts("[SEH-BASE] handler called, code=0x");
+    serial_puthex(code, 8);
+    serial_puts("\n");
+    /* Always continue search — we exist to anchor the chain, not to handle.
+     * The real handlers above us (if any) should handle. If none do,
+     * RtlRaiseException returns and _CxxThrowException suppresses. */
+    return 0; /* EXCEPTION_CONTINUE_SEARCH */
+}
+
+static uint32_t g_base_seh_thunk = 0;
+
+void crt_install_base_seh_thunk(void)
+{
+    extern uint32_t compat32_make_thunk(uint64_t target, const char *name,
+                                         uint8_t num_args);
+    g_base_seh_thunk = compat32_make_thunk(
+        (uint64_t)(uintptr_t)crt_base_seh_handler,
+        "__base_seh_handler", 4);
+    if (g_base_seh_thunk) {
+        serial_puts("[CRT] Base SEH handler thunk at 0x");
+        serial_puthex(g_base_seh_thunk, 8);
+        serial_puts("\n");
+    }
+}
+
+uint32_t crt_get_base_seh_thunk(void) { return g_base_seh_thunk; }
 
 /* ── Export resolution table ───────────────────────────────── */
 

@@ -1412,14 +1412,24 @@ int compat32_seh_dispatch(PEXCEPTION_RECORD ExceptionRecord)
         return 0;
     }
 
-    /* Validate ExceptionList points to a stack address, not code.
-     * Valid compat32 stack frames are in the 0x15xxxxxx or 0x022xxxxx range.
-     * If ExceptionList points to DLL code (0x10xxxxxx-0x12xxxxxx), the
-     * chain was corrupted — dispatching would call garbage as a handler. */
-    if (frame_addr >= 0x10000000 && frame_addr < 0x20000000) {
-        serial_puts("[SEH32] chain CORRUPT: ExceptionList 0x");
+    /* Validate ExceptionList — skip corrupt entries in PE image range.
+     * Walk forward through Next pointers to find a valid stack frame. */
+    while (frame_addr >= 0x10000000 && frame_addr < 0x14000000) {
+        serial_puts("[SEH32] skipping corrupt frame at 0x");
         serial_puthex(frame_addr, 8);
-        serial_puts(" is in code range (not stack), skipping dispatch\n");
+        uint32_t *f = (uint32_t *)(uintptr_t)frame_addr;
+        uint32_t next = f[0];
+        serial_puts(" next=0x");
+        serial_puthex(next, 8);
+        serial_puts("\n");
+        if (next == 0 || next == 0xFFFFFFFF) {
+            serial_puts("[SEH32] chain ends after corrupt entry\n");
+            return 0;
+        }
+        frame_addr = next;
+    }
+    if (frame_addr == 0 || frame_addr == 0xFFFFFFFF) {
+        serial_puts("[SEH32] empty chain (after skipping corrupt entries)\n");
         return 0;
     }
 
@@ -2071,6 +2081,12 @@ uint8_t compat32_get_nargs(uint32_t thunk_idx)
 {
     if (thunk_idx >= thunk_count) return 0;
     return thunk_table[thunk_idx].num_args;
+}
+
+uint32_t compat32_get_thunk_addr(uint32_t thunk_idx)
+{
+    if (thunk_idx >= thunk_count) return 0;
+    return thunk_table[thunk_idx].thunk_addr;
 }
 
 uint32_t compat32_get_count(void)
