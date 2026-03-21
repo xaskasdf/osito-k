@@ -298,7 +298,7 @@ uint64_t *tss_ist1_ptr;  /* = &kernel_tss.ist1, set in tss_init() */
 
 /* IST1 stack for INT 0x2E — 64KB (needs room for re-entrant callbacks) */
 #define IST1_STACK_SIZE 65536
-static uint8_t ist1_stack[IST1_STACK_SIZE] __attribute__((aligned(16)));
+uint8_t ist1_stack[IST1_STACK_SIZE] __attribute__((aligned(16)));
 
 /* IST2 stack for #DB — 8KB (separate from INT 0x2E to avoid conflicts) */
 #define IST2_STACK_SIZE 8192

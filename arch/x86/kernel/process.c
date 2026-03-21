@@ -367,6 +367,18 @@ void proc_exit(int32_t code)
     /* Normal exit — process started by proc_exec (shell's exec command).
      * longjmp back to proc_exec which cleans up. */
     last_exit_code = code;
+
+    /* Restore IST1 to pristine value before longjmp. If called from INT 0x2E
+     * context (ExitProcess → NtTerminateProcess → proc_exit), IST1 was modified
+     * by int2e_stub. kern_longjmp bypasses the stub's IST1 restore (popq).
+     * Without this, next INT 0x2E uses stale IST1 → stack corruption. */
+    {
+        extern uint64_t *tss_ist1_ptr;
+        extern uint8_t ist1_stack[];
+        if (tss_ist1_ptr)
+            *tss_ist1_ptr = (uint64_t)(ist1_stack + 65536);
+    }
+
     kern_longjmp(exec_jmpbuf, 1);
 }
 
