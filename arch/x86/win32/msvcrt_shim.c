@@ -52,33 +52,37 @@ extern void compat32_callback(uint32_t func_addr);
 extern void *kmalloc(uint64_t size);
 extern void kfree(void *ptr);
 
-/* Stub implementations dispatched from thiscall vtable.
- * Args are stdcall (this in ECX, but we ignore it). */
+/* Stub FMalloc implementations using Win32 HeapAlloc (NOT kmalloc).
+ * CRITICAL: FMallocWindows uses HeapReAlloc/HeapFree on these pointers
+ * after it takes over from the stub. If the stub used kmalloc (different
+ * pool), HeapReAlloc would fail → "FMallocWindows::Realloc" error.
+ * Using HeapAlloc ensures all allocations are on the same Win32 heap. */
+extern PVOID WINAPI HeapAlloc(HANDLE hHeap, DWORD dwFlags, SIZE_T dwBytes);
+extern BOOL  WINAPI HeapFree(HANDLE hHeap, DWORD dwFlags, PVOID lpMem);
+extern PVOID WINAPI HeapReAlloc(HANDLE hHeap, DWORD dwFlags, PVOID lpMem, SIZE_T dwBytes);
+extern HANDLE WINAPI GetProcessHeap(void);
+
 static uint64_t WINAPI stub_fmalloc_malloc(uint64_t _this, uint64_t count, uint64_t tag)
 {
     (void)_this; (void)tag;
-    return (uint64_t)(uintptr_t)kmalloc(count ? count : 1);
+    HANDLE heap = GetProcessHeap();
+    return (uint64_t)(uintptr_t)HeapAlloc(heap, 0, count ? count : 1);
 }
 
 static uint64_t WINAPI stub_fmalloc_realloc(uint64_t _this, uint64_t orig,
                                               uint64_t count, uint64_t tag)
 {
     (void)_this; (void)tag;
-    void *old = (void *)(uintptr_t)(uint32_t)orig;
-    void *nw = kmalloc(count ? count : 1);
-    if (nw && old) {
-        /* Copy old data — we don't know old size, copy up to new size */
-        uint8_t *s = (uint8_t *)old, *d = (uint8_t *)nw;
-        for (uint64_t i = 0; i < count; i++) d[i] = s[i];
-    }
-    /* Don't free old — we don't track sizes for safe realloc */
-    return (uint64_t)(uintptr_t)nw;
+    HANDLE heap = GetProcessHeap();
+    if (!orig) return (uint64_t)(uintptr_t)HeapAlloc(heap, 0, count ? count : 1);
+    return (uint64_t)(uintptr_t)HeapReAlloc(heap, 0,
+        (PVOID)(uintptr_t)(uint32_t)orig, count ? count : 1);
 }
 
 static uint64_t WINAPI stub_fmalloc_free(uint64_t _this, uint64_t ptr)
 {
     (void)_this;
-    if (ptr) kfree((void *)(uintptr_t)(uint32_t)ptr);
+    if (ptr) HeapFree(GetProcessHeap(), 0, (PVOID)(uintptr_t)(uint32_t)ptr);
     return 0;
 }
 
