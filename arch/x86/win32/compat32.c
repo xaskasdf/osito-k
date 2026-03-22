@@ -1873,6 +1873,23 @@ next_frame:
  */
 uint64_t compat32_dispatch(uint32_t thunk_idx, uint32_t *stack_args)
 {
+    /* Clean up null-page stale data from compat32 writes.
+     * In compat32 mode, TF single-step isn't used for null-page cleanup
+     * (#DB would cause #GP without IST). Stale data on page 0 from
+     * null-object writes (e.g. [eax+4] where eax=0) persists and gets
+     * read as vtable pointers when EDI=0. Clean up on every INT 0x2E. */
+    {
+        extern volatile int g_null_page_dirty;
+        if (g_null_page_dirty) {
+            g_null_page_dirty = 0;
+            memset((void *)0, 0, 4096);
+            extern void paging_set_flags(uint64_t va, uint64_t flags);
+            /* PTE_PRESENT=1, PTE_GLOBAL=0x100, PTE_NX=1<<63 */
+            paging_set_flags(0, (1ULL) | (1ULL << 8) | (1ULL << 63));
+            __asm__ volatile ("invlpg (%0)" :: "r"((uint64_t)0) : "memory");
+        }
+    }
+
     /* Callback return: 32-bit function completed, longjmp back */
     if (thunk_idx == THUNK_CALLBACK_RETURN) {
         /* Restore 64-bit data segments (compat mode set them to 0x48) */

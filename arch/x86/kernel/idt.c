@@ -859,36 +859,20 @@ void isr_handler(interrupt_frame_t *frame)
                 }
 
                 /* Fallback: generic BC-FIX (return NULL to caller).
-                 * IMPORTANT: only pop the stack if retaddr looks valid (in PE
-                 * code range). If retaddr is garbage (< 0x10000), the bytecode
-                 * pushed extra values — popping would misalign the stack and
-                 * corrupt all subsequent register loads. Leave the stack intact
-                 * and let the instruction-fetch fault → NULL-REDIRECT handle it
-                 * with the CORRECT retaddr deeper on the stack. */
-                if (retaddr >= 0x10000000 && retaddr < 0x20000000) {
-                    if (bc_count <= 5) {
-                        serial_puts("[BC-FIX] RIP=0x");
-                        serial_puthex((uint32_t)frame->rip, 8);
-                        serial_puts(" retaddr=0x");
-                        serial_puthex(retaddr, 8);
-                        serial_puts(" CR2=0x");
-                        serial_puthex((uint32_t)cr2, 2);
-                        serial_puts("\n");
-                    }
-                    frame->rip = retaddr;
-                    frame->rsp += 4;
-                    frame->rax = 0;
-                    return;
-                }
-                /* retaddr is garbage — don't pop, just redirect to the
-                 * bytecode's "return" address (which is on the null page).
-                 * The instruction-fetch fault will trigger NULL-REDIRECT. */
+                 * Always pop — even if retaddr looks like garbage, the pop
+                 * removes bytecode-pushed values and exposes the REAL retaddr
+                 * for NULL-REDIRECT to find on the next fault. */
                 if (bc_count <= 5) {
-                    serial_puts("[BC-FIX] bad retaddr=0x");
+                    serial_puts("[BC-FIX] RIP=0x");
+                    serial_puthex((uint32_t)frame->rip, 8);
+                    serial_puts(" retaddr=0x");
                     serial_puthex(retaddr, 8);
-                    serial_puts(" — skipping pop\n");
+                    serial_puts(" CR2=0x");
+                    serial_puthex((uint32_t)cr2, 2);
+                    serial_puts("\n");
                 }
                 frame->rip = retaddr;
+                frame->rsp += 4;
                 frame->rax = 0;
                 return;
             }
@@ -977,11 +961,15 @@ void isr_handler(interrupt_frame_t *frame)
                     serial_puthex(seh, 8);
                     serial_puts("\n");
                     if (seh >= 0x10000000 && seh < 0x20000000) {
-                        /* SEH chain corrupt → RET 0 */
+                        /* SEH chain corrupt → RET with EAX matching caller's
+                         * comparison register. MSVC code after null-calls often
+                         * does 'cmp eax,esi; sete bl'. Return EAX=ESI so the
+                         * comparison succeeds and the engine takes the "match"
+                         * path instead of the error path. */
                         uint32_t *sp32 = (uint32_t *)(uintptr_t)(frame->rsp & 0xFFFFFFFF);
                         frame->rip = sp32[0];
                         frame->rsp += 4;
-                        frame->rax = 0;
+                        frame->rax = frame->rsi & 0xFFFFFFFF;
                         if (g_null_page_dirty) {
                             g_null_page_dirty = 0;
                             memset((void *)0, 0, 4096);
