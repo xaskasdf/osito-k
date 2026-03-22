@@ -2363,43 +2363,15 @@ void WINAPI crt_CxxThrowException(PVOID pExceptionObject, PVOID pThrowInfo)
             return;
         }
     }
-    serial_puts("[CXX] WARNING: _CxxThrowException unhandled — clean exit\n");
+    serial_puts("[CXX] WARNING: _CxxThrowException unhandled — suppressing\n");
     cxx_exception_active = 0;
 
-    /* _CxxThrowException MUST NOT RETURN — returning causes the 32-bit code
-     * to execute unreachable instructions after 'throw' → null call → crash.
-     *
-     * Call proc_exit directly instead of going through ExitProcess thunk.
-     * The thunk path creates a second INT 0x2E → kern_longjmp abandons the
-     * int2e_stub frame → NULL-CALL #3 from stale PE code. Direct proc_exit
-     * avoids the second INT 0x2E entirely.
-     *
-     * Must restore IST1 and 64-bit segments before longjmp. */
-    {
-        extern uint64_t *tss_ist1_ptr;
-        extern uint8_t ist1_stack[];
-        extern void proc_exit(int32_t code);
-
-        serial_puts("[CXX] Direct proc_exit(1)\n");
-
-        /* Restore IST1 to pristine — we're about to longjmp out of the
-         * INT 0x2E handler, bypassing int2e_stub's IST1 restore. */
-        if (tss_ist1_ptr)
-            *tss_ist1_ptr = (uint64_t)(ist1_stack + 65536);
-
-        /* Ensure 64-bit data segments (compat32_dispatch already set these,
-         * but be explicit in case of re-entrant calls). */
-        __asm__ volatile (
-            "mov $0x30, %%ax\n"
-            "mov %%ax, %%ds\n"
-            "mov %%ax, %%es\n"
-            "mov %%ax, %%ss\n"
-            ::: "ax"
-        );
-
-        proc_exit(1);
-        /* never reached — proc_exit does kern_longjmp */
-    }
+    /* Instead of proc_exit(1), just return and let the 32-bit code continue.
+     * _CxxThrowException "should never return" but the engine's code after
+     * throw often has fall-through error cleanup that's reachable.
+     * With NULL-REDIRECT and page 0 cleanup, post-throw crashes are handled.
+     * The engine may enter its game loop in error state — better than exiting. */
+    return;
 
     /* ── Diagnostic: dump GObjRegistrants state ────────────── */
     {

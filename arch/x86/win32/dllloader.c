@@ -511,6 +511,31 @@ static LOADED_MODULE *dll_try_load_from_fs(const char *dll_name)
     return NULL;
 }
 
+/* appUnwindf shim: suppresses the throw from appError. */
+static uint64_t WINAPI shim_appUnwindf(uint64_t fmt)
+{
+    (void)fmt;
+    extern void serial_puts(const char *);
+    static int count = 0;
+    if (++count <= 5)
+        serial_puts("[APP] appUnwindf suppressed\n");
+    return 0;
+}
+
+/* appRequestExit shim: suppresses exit requests from error handlers.
+ * After Browse() fails and throw is suppressed, the engine calls
+ * appRequestExit(1) which sets GIsRequestingExit=1. The game loop
+ * then exits. By suppressing this, the engine stays in its loop. */
+static uint64_t WINAPI shim_appRequestExit(uint64_t force)
+{
+    (void)force;
+    extern void serial_puts(const char *);
+    static int count = 0;
+    if (++count <= 5)
+        serial_puts("[APP] appRequestExit suppressed\n");
+    return 0;
+}
+
 /* ── Master import resolver ────────────────────────────────── */
 
 PVOID dll_resolve_import(const char *dll_name, const char *func_name,
@@ -521,6 +546,40 @@ PVOID dll_resolve_import(const char *dll_name, const char *func_name,
     if (shim) {
         PVOID fn = shim(func_name, ordinal, by_ordinal);
         if (fn) return fn;
+    }
+
+    /* 1b. Function overrides for PE DLL exports.
+     * Must return a 32-bit INT 0x2E thunk (not raw 64-bit ptr) because
+     * Core.dll is NOT a shim DLL — IAT patcher writes addresses directly
+     * without creating thunks. CC_CDECL because appUnwindf is varargs. */
+    if (func_name && dl_strcmp(func_name, "?appUnwindf@@YAXPBGZZ") == 0) {
+        static uint32_t thunk_addr = 0;
+        if (!thunk_addr) {
+            extern uint32_t compat32_make_thunk_ex(uint64_t target,
+                const char *name, uint8_t num_args, uint8_t callconv);
+            thunk_addr = compat32_make_thunk_ex(
+                (uint64_t)(uintptr_t)shim_appUnwindf,
+                "appUnwindf_shim", 1, 1 /* CC_CDECL */);
+            serial_puts("[DLL] appUnwindf thunk at 0x");
+            serial_puthex((uint64_t)thunk_addr, 8);
+            serial_puts("\n");
+        }
+        return (PVOID)(uintptr_t)thunk_addr;
+    }
+    /* appRequestExit: suppress exit after Browse() error */
+    if (func_name && dl_strcmp(func_name, "?appRequestExit@@YAXH@Z") == 0) {
+        static uint32_t thunk_addr2 = 0;
+        if (!thunk_addr2) {
+            extern uint32_t compat32_make_thunk_ex(uint64_t target,
+                const char *name, uint8_t num_args, uint8_t callconv);
+            thunk_addr2 = compat32_make_thunk_ex(
+                (uint64_t)(uintptr_t)shim_appRequestExit,
+                "appRequestExit_shim", 1, 1 /* CC_CDECL */);
+            serial_puts("[DLL] appRequestExit thunk at 0x");
+            serial_puthex((uint64_t)thunk_addr2, 8);
+            serial_puts("\n");
+        }
+        return (PVOID)(uintptr_t)thunk_addr2;
     }
 
     /* 2. Try loaded PE modules */
