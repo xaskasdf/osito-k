@@ -884,13 +884,54 @@ void isr_handler(interrupt_frame_t *frame)
         }
 
         if (cr2 < 0x1000 && (frame->error_code & 16)) {  /* INSTRUCTION-FETCH on page 0 */
-            /* NULL function pointer call: dispatch to SEH as
-             * STATUS_ACCESS_VIOLATION. On Windows, executing at address 0
-             * is an access violation that the engine's SEH handles.
-             * Our previous approach (simulate RET 0) caused cascading NULLs
-             * because the caller used 0 as a valid return value. */
+            /* NULL function pointer call from stale register.
+             * Try IAT redirect first (same technique as BC-REDIRECT):
+             * scan backwards from retaddr to find the IAT load instruction
+             * and redirect to the correct function. */
             static int null_call_count = 0;
             null_call_count++;
+
+            if ((frame->cs & 0xFFFF) == 0x40) {
+                uint32_t *sp32 = (uint32_t *)(uintptr_t)(frame->rsp & 0xFFFFFFFF);
+                uint32_t retaddr = sp32[0];
+
+                /* Try IAT redirect: find 'call reg' (FF Dx) at retaddr-2,
+                 * then scan backwards for 'mov reg, [imm32]' (IAT load) */
+                uint8_t *caller = (uint8_t *)(uintptr_t)(retaddr - 2);
+                uint32_t iat_addr = 0;
+                uint8_t mov_opcode = 0;
+
+                if (caller[0] == 0xFF && (caller[1] & 0xF8) == 0xD0) {
+                    uint8_t reg = caller[1] & 0x07;
+                    mov_opcode = 0x05 + reg * 8;
+                }
+
+                if (mov_opcode) {
+                    uint8_t *scan = caller - 1;
+                    for (int i = 0; i < 200 && !iat_addr; i++, scan--) {
+                        if (scan[0] == 0x8B && scan[1] == mov_opcode)
+                            iat_addr = *(uint32_t *)(scan + 2);
+                    }
+                }
+
+                if (iat_addr >= 0x10000000 && iat_addr < 0x20000000) {
+                    uint32_t correct_fn = *(uint32_t *)(uintptr_t)iat_addr;
+                    if (correct_fn >= 0x10000000 && correct_fn < 0x20000000) {
+                        if (null_call_count <= 10) {
+                            serial_puts("[NULL-REDIRECT] -> 0x");
+                            serial_puthex(correct_fn, 8);
+                            serial_puts(" (IAT 0x");
+                            serial_puthex(iat_addr, 8);
+                            serial_puts(") retaddr=0x");
+                            serial_puthex(retaddr, 8);
+                            serial_puts("\n");
+                        }
+                        frame->rip = correct_fn;
+                        return;
+                    }
+                }
+            }
+
             if (null_call_count <= 10) {
                 serial_puts("[NULL-CALL] RIP=0x");
                 serial_puthex(cr2, 4);
@@ -917,16 +958,11 @@ void isr_handler(interrupt_frame_t *frame)
                     serial_puthex(seh, 8);
                     serial_puts("\n");
                     if (seh >= 0x10000000 && seh < 0x20000000) {
-                        /* SEH chain corrupt → RET with safe value */
+                        /* SEH chain corrupt → RET 0 */
                         uint32_t *sp32 = (uint32_t *)(uintptr_t)(frame->rsp & 0xFFFFFFFF);
-                        uint32_t retaddr = sp32[0];
-                        frame->rip = retaddr;
+                        frame->rip = sp32[0];
                         frame->rsp += 4;
-                        /* Return 1 for known vtable dispatch sites where 0
-                         * causes cascading failures (Browse → "Failed to enter").
-                         * 0x103888FB = Engine.dll call [edx+0xb0] vtable dispatch
-                         * 0x101581AD = Core.dll virtual method call */
-                        frame->rax = (retaddr == 0x103888FB || retaddr == 0x101581AD) ? 1 : 0;
+                        frame->rax = 0;
                         if (g_null_page_dirty) {
                             g_null_page_dirty = 0;
                             memset((void *)0, 0, 4096);
