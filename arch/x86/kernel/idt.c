@@ -858,18 +858,37 @@ void isr_handler(interrupt_frame_t *frame)
                     }
                 }
 
-                /* Fallback: generic BC-FIX (return NULL to caller) */
+                /* Fallback: generic BC-FIX (return NULL to caller).
+                 * IMPORTANT: only pop the stack if retaddr looks valid (in PE
+                 * code range). If retaddr is garbage (< 0x10000), the bytecode
+                 * pushed extra values — popping would misalign the stack and
+                 * corrupt all subsequent register loads. Leave the stack intact
+                 * and let the instruction-fetch fault → NULL-REDIRECT handle it
+                 * with the CORRECT retaddr deeper on the stack. */
+                if (retaddr >= 0x10000000 && retaddr < 0x20000000) {
+                    if (bc_count <= 5) {
+                        serial_puts("[BC-FIX] RIP=0x");
+                        serial_puthex((uint32_t)frame->rip, 8);
+                        serial_puts(" retaddr=0x");
+                        serial_puthex(retaddr, 8);
+                        serial_puts(" CR2=0x");
+                        serial_puthex((uint32_t)cr2, 2);
+                        serial_puts("\n");
+                    }
+                    frame->rip = retaddr;
+                    frame->rsp += 4;
+                    frame->rax = 0;
+                    return;
+                }
+                /* retaddr is garbage — don't pop, just redirect to the
+                 * bytecode's "return" address (which is on the null page).
+                 * The instruction-fetch fault will trigger NULL-REDIRECT. */
                 if (bc_count <= 5) {
-                    serial_puts("[BC-FIX] RIP=0x");
-                    serial_puthex((uint32_t)frame->rip, 8);
-                    serial_puts(" retaddr=0x");
+                    serial_puts("[BC-FIX] bad retaddr=0x");
                     serial_puthex(retaddr, 8);
-                    serial_puts(" CR2=0x");
-                    serial_puthex((uint32_t)cr2, 2);
-                    serial_puts("\n");
+                    serial_puts(" — skipping pop\n");
                 }
                 frame->rip = retaddr;
-                frame->rsp += 4;
                 frame->rax = 0;
                 return;
             }
