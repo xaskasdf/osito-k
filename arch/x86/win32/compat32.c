@@ -1438,6 +1438,8 @@ int compat32_seh_dispatch(PEXCEPTION_RECORD ExceptionRecord)
     for (SIZE_T i = 0; i < sizeof(seh32_exception_record); i++) p[i] = 0;
     seh32_exception_record.ExceptionCode = ExceptionRecord->ExceptionCode;
     seh32_exception_record.ExceptionFlags = ExceptionRecord->ExceptionFlags;
+    seh32_exception_record.ExceptionAddress =
+        (uint32_t)(ULONG_PTR)ExceptionRecord->ExceptionAddress;
     seh32_exception_record.NumberParameters = ExceptionRecord->NumberParameters;
     for (DWORD i = 0; i < ExceptionRecord->NumberParameters && i < 15; i++)
         seh32_exception_record.ExceptionInformation[i] =

@@ -876,6 +876,73 @@ void isr_handler(interrupt_frame_t *frame)
                 frame->rax = 0;
                 return;
             }
+            /* PE code null-object write (CR2 < 0x10): dispatch to SEH.
+             * On Windows, mov [esi+4],ebx with esi=0 causes ACCESS_VIOLATION
+             * caught by __try/__except. Write-through corrupts engine state. */
+            {
+                /* Only dispatch for PE DLL code (0x10-0x12M) with valid SEH */
+                extern uint32_t g_teb32;
+                uint32_t seh_val = g_teb32;
+                int is_pe_code = (frame->cs & 0xFFFF) == 0x40 &&
+                    frame->rip >= 0x10000000 && frame->rip < 0x12000000;
+                int seh_valid = (seh_val != 0 && seh_val != 0xFFFFFFFF &&
+                    (seh_val < 0x10000000 || seh_val >= 0x20000000));
+                if (is_pe_code && seh_valid && cr2 < 0x10) {
+                static int nw_seh_count = 0;
+                nw_seh_count++;
+                if (nw_seh_count <= 20) {
+                    serial_puts("[NULL-WRITE-SEH] RIP=0x");
+                    serial_puthex((uint32_t)frame->rip, 8);
+                    serial_puts(" CR2=0x");
+                    serial_puthex((uint32_t)cr2, 2);
+                    serial_puts(" #");
+                    serial_putdec(nw_seh_count);
+                    serial_puts("\n");
+                }
+                /* Re-zero page 0 before dispatch */
+                if (g_null_page_dirty) {
+                    g_null_page_dirty = 0;
+                    memset((void *)0, 0, 4096);
+                    paging_set_flags(0, PTE_PRESENT | PTE_GLOBAL | PTE_NX);
+                    __asm__ volatile ("invlpg (%0)" :: "r"((uint64_t)0) : "memory");
+                }
+                /* Build EXCEPTION_RECORD for ACCESS_VIOLATION.
+                 * Use raw struct — idt.c doesn't include Win32 headers. */
+                struct {
+                    uint32_t ExceptionCode;
+                    uint32_t ExceptionFlags;
+                    uint64_t ExceptionRecord;
+                    uint64_t ExceptionAddress;
+                    uint32_t NumberParameters;
+                    uint32_t _pad;
+                    uint64_t ExceptionInformation[15];
+                } er;
+                uint8_t *ep = (uint8_t *)&er;
+                for (int ei = 0; ei < (int)sizeof(er); ei++) ep[ei] = 0;
+                er.ExceptionCode = 0xC0000005; /* STATUS_ACCESS_VIOLATION */
+                er.ExceptionFlags = 0;         /* continuable */
+                er.ExceptionAddress = (uint64_t)(uint32_t)frame->rip;
+                er.NumberParameters = 2;
+                er.ExceptionInformation[0] = 1; /* write */
+                er.ExceptionInformation[1] = (uint64_t)cr2;
+
+                extern int compat32_seh_dispatch(void *);
+                int handled = compat32_seh_dispatch(&er);
+                if (handled) {
+                    extern uint32_t g_compat32_unwind_eip;
+                    extern uint32_t g_compat32_unwind_ebp;
+                    if (g_compat32_unwind_eip) {
+                        frame->rip = g_compat32_unwind_eip;
+                        frame->rbp = g_compat32_unwind_ebp;
+                        g_compat32_unwind_eip = 0;
+                        g_compat32_unwind_ebp = 0;
+                    }
+                    return;
+                }
+                /* Unhandled: fall through to write-through */
+            }
+            } /* end SEH dispatch block */
+
             /* Normal null-page write-through */
             paging_set_flags(0, PTE_PRESENT | PTE_WRITABLE | PTE_GLOBAL | PTE_NX);
             __asm__ volatile ("invlpg (%0)" :: "r"((uint64_t)0) : "memory");
