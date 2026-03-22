@@ -371,7 +371,7 @@ BOOL WINAPI VirtualFree(PVOID lpAddress, SIZE_T dwSize, DWORD dwFreeType)
  * Falls back to 16MB static pool if kmalloc unavailable. */
 #include "../include/sys_caps.h"
 
-static BYTE   heap_pool_static[16 * 1024 * 1024]; /* fallback */
+static BYTE   heap_pool_static[64 * 1024 * 1024]; /* fallback — 64MB for UT99 */
 static BYTE  *heap_pool = NULL;
 static SIZE_T heap_pool_size = 0;
 static SIZE_T heap_offset = 0;
@@ -404,6 +404,11 @@ static void heap_pool_init(void)
         heap_pool = heap_pool_static;
         heap_pool_size = sizeof(heap_pool_static);
     }
+    serial_puts("[WIN32-HEAP] pool=0x");
+    serial_puthex((uint64_t)(uintptr_t)heap_pool, 8);
+    serial_puts(" size=");
+    serial_putdec(heap_pool_size / (1024 * 1024));
+    serial_puts(" MB\n");
 }
 
 HANDLE WINAPI GetProcessHeap(void)
@@ -450,7 +455,14 @@ PVOID WINAPI HeapAlloc(HANDLE hHeap, DWORD dwFlags, SIZE_T dwBytes)
         /* Grow by at least the request size */
         if (grow < total) grow = total;
 
-        BYTE *new_pool = (BYTE *)kmalloc(grow);
+        BYTE *new_pool = NULL;
+        /* Try decreasing sizes until kmalloc succeeds */
+        uint64_t try_size = grow;
+        while (try_size >= total && try_size >= 1024 * 1024) {
+            new_pool = (BYTE *)kmalloc(try_size);
+            if (new_pool) { grow = try_size; break; }
+            try_size /= 2;
+        }
         if (new_pool) {
             memset(new_pool, 0, grow);
             serial_puts("[HEAP] Auto-grow: +");
@@ -477,6 +489,13 @@ PVOID WINAPI HeapAlloc(HANDLE hHeap, DWORD dwFlags, SIZE_T dwBytes)
             heap_pool_size = grow;
             heap_offset = 0;
         } else {
+            serial_puts("[WIN32-HEAP] EXHAUSTED! used=");
+            serial_putdec(heap_offset / 1024);
+            serial_puts("KB pool=");
+            serial_putdec(heap_pool_size / 1024);
+            serial_puts("KB req=");
+            serial_putdec(total);
+            serial_puts("\n");
             g_last_error = 8; /* ERROR_NOT_ENOUGH_MEMORY */
             return NULL;
         }

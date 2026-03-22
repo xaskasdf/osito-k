@@ -291,7 +291,7 @@ int  WINAPI _set_new_mode(int mode) { (void)mode; return 0; }
 /* CRT heap: dynamic from sys_caps (scales with RAM) */
 #include "../include/sys_caps.h"
 
-static BYTE   crt_pool_static[4 * 1024 * 1024]; /* fallback */
+static BYTE   crt_pool_static[64 * 1024 * 1024]; /* fallback — 64MB for UT99 */
 static BYTE  *crt_pool = NULL;
 static SIZE_T crt_pool_size = 0;
 static SIZE_T crt_pool_offset = 0;
@@ -300,7 +300,7 @@ static void crt_pool_init(void)
 {
     if (crt_pool) return;
     uint64_t target = g_sys_caps.crt_pool_size;
-    if (!target) target = 4ULL * 1024 * 1024;
+    if (!target) target = 64ULL * 1024 * 1024;
     extern void *kmalloc(uint64_t size);
     crt_pool = (BYTE *)kmalloc(target);
     if (crt_pool) {
