@@ -876,7 +876,7 @@ void isr_handler(interrupt_frame_t *frame)
                 frame->rax = 0;
                 return;
             }
-            /* Normal null-page write-through for legitimate code */
+            /* Normal null-page write-through */
             paging_set_flags(0, PTE_PRESENT | PTE_WRITABLE | PTE_GLOBAL | PTE_NX);
             __asm__ volatile ("invlpg (%0)" :: "r"((uint64_t)0) : "memory");
             if ((frame->cs & 0xFFFF) != 0x40) {
