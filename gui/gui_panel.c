@@ -93,9 +93,7 @@ void gui_panel_render(gui_surface_t *s, uint32_t screen_w)
         p = scat_num(line, p, dbg.mem_used_mb);
         p = scat(line, p, "/");
         p = scat_num(line, p, dbg.mem_used_mb + dbg.mem_free_mb);
-        p = scat(line, p, "MB  T:");
-        p = scat_num(line, p, dbg.ticks);
-        p = scat(line, p, "  P:");
+        p = scat(line, p, "MB  P:");
         p = scat_num(line, p, dbg.procs);
         line[p] = '\0';
 

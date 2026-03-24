@@ -16,8 +16,16 @@
 
 /* ── Boot info passed to kernel ─────────────────────────────── */
 
-#define BOOT_INFO_MAGIC   0x4F53544B  /* 'OSTK' */
-#define BOOT_INFO_VERSION 1
+#define BOOT_INFO_MAGIC        0x4F53544B  /* 'OSTK' */
+#define BOOT_INFO_VERSION      2
+#define BOOT_MAX_DISPLAY_MODES 16
+
+typedef struct {
+    UINT32 width;
+    UINT32 height;
+    UINT32 pitch;
+    UINT32 pixel_format;   /* 0=RGBX, 1=BGRX */
+} boot_display_mode_t;
 
 typedef struct {
     UINT32 magic;
@@ -37,6 +45,10 @@ typedef struct {
     UINT64 acpi_rsdp;
     UINT64 kernel_phys_base;
     UINT64 kernel_size;
+
+    UINT32 display_mode_count;
+    UINT32 display_current_mode;
+    boot_display_mode_t display_modes[BOOT_MAX_DISPLAY_MODES];
 } boot_info_t;
 
 /* ── Minimal ELF64 defs (self-contained, no elf.h) ──────────── */
@@ -80,6 +92,15 @@ static UINT32  gop_fb_width;
 static UINT32  gop_fb_height;
 static UINT32  gop_fb_pitch;
 
+/* Mode table filled during enumeration — passed to kernel via boot_info */
+static boot_display_mode_t gop_modes[BOOT_MAX_DISPLAY_MODES];
+static UINT32 gop_mode_count;
+static UINT32 gop_selected_mode;
+
+/* Preferred max resolution for optimal performance vs quality balance */
+#define GOP_PREFER_W 1024
+#define GOP_PREFER_H  768
+
 static EFI_STATUS init_gop(void)
 {
     EFI_GRAPHICS_OUTPUT_PROTOCOL *gop;
@@ -92,13 +113,57 @@ static EFI_STATUS init_gop(void)
         return status;
     }
 
+    /* Enumerate all modes — collect valid BGRX/RGBX modes */
+    UINT32 best_mode = gop->Mode->Mode;
+    UINT32 best_w = 0, best_h = 0;
+    gop_mode_count = 0;
+
+    for (UINT32 i = 0; i < gop->Mode->MaxMode && gop_mode_count < BOOT_MAX_DISPLAY_MODES; i++) {
+        EFI_GRAPHICS_OUTPUT_MODE_INFORMATION *info;
+        UINTN info_size = 0;
+        if (EFI_ERROR(uefi_call_wrapper(gop->QueryMode, 4, gop, i, &info_size, &info)))
+            continue;
+        /* Only RGBX (0) and BGRX (1) — skip BltOnly (3) and bitmask (2) */
+        if (info->PixelFormat > PixelBlueGreenRedReserved8BitPerColor)
+            continue;
+
+        UINT32 w = info->HorizontalResolution;
+        UINT32 h = info->VerticalResolution;
+        UINT32 pf = (info->PixelFormat == PixelBlueGreenRedReserved8BitPerColor) ? 1 : 0;
+
+        gop_modes[gop_mode_count].width        = w;
+        gop_modes[gop_mode_count].height       = h;
+        gop_modes[gop_mode_count].pitch        = info->PixelsPerScanLine;
+        gop_modes[gop_mode_count].pixel_format = pf;
+        gop_mode_count++;
+
+        /* Select: prefer exact GOP_PREFER_WxGOP_PREFER_H;
+         * fallback to largest resolution that fits within those bounds */
+        if (w <= GOP_PREFER_W && h <= GOP_PREFER_H) {
+            if (w * h > best_w * best_h) {
+                best_mode = i;
+                best_w = w;
+                best_h = h;
+            }
+        }
+        Print(L"  GOP mode %d: %dx%d pf=%d\r\n", i, w, h, pf);
+    }
+
+    /* Switch to the selected mode if different from current */
+    if (best_mode != gop->Mode->Mode) {
+        Print(L"GOP: switching to mode %d (%dx%d)\r\n", best_mode, best_w, best_h);
+        uefi_call_wrapper(gop->SetMode, 2, gop, best_mode);
+    }
+    gop_selected_mode = best_mode;
+
+    /* Read final active mode parameters */
     gop_fb_base   = gop->Mode->FrameBufferBase;
     gop_fb_width  = gop->Mode->Info->HorizontalResolution;
     gop_fb_height = gop->Mode->Info->VerticalResolution;
     gop_fb_pitch  = gop->Mode->Info->PixelsPerScanLine;
 
-    Print(L"GOP: %dx%d, pitch=%d, fb=0x%lx\r\n",
-          gop_fb_width, gop_fb_height, gop_fb_pitch, gop_fb_base);
+    Print(L"GOP: %dx%d pitch=%d fb=0x%lx (%d modes found)\r\n",
+          gop_fb_width, gop_fb_height, gop_fb_pitch, gop_fb_base, gop_mode_count);
 
     return EFI_SUCCESS;
 }
@@ -361,6 +426,10 @@ efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable)
     info.acpi_rsdp       = acpi_rsdp_addr;
     info.kernel_phys_base = kernel_phys_lo;
     info.kernel_size      = kernel_phys_hi - kernel_phys_lo;
+    info.display_mode_count   = gop_mode_count;
+    info.display_current_mode = gop_selected_mode;
+    for (UINT32 i = 0; i < gop_mode_count; i++)
+        info.display_modes[i] = gop_modes[i];
 
     Print(L"\r\nExiting boot services...\r\n");
 

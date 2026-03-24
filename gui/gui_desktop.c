@@ -98,6 +98,7 @@ void gui_desktop_init(uint32_t screen_w, uint32_t screen_h)
     demo_windows[1].content_color = GUI_WINDOW_BG;
     init_geom[1][0] = sx; init_geom[1][1] = sy;
     init_geom[1][2] = sw; init_geom[1][3] = sh;
+
 }
 
 /* ── Per-window content rendering ─────────────────────────── */

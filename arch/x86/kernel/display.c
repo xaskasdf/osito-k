@@ -10,6 +10,7 @@
  */
 
 #include "../include/types.h"
+#include "../include/boot_info.h"
 
 /* ── External functions ──────────────────────────────────────── */
 
@@ -52,6 +53,44 @@ typedef struct {
 } display_t;
 
 static display_t disp;
+
+/* ── Display mode state (multi-monitor placeholder) ──────────── */
+
+static boot_display_mode_t avail_modes[BOOT_MAX_DISPLAY_MODES];
+static uint32_t avail_mode_count;
+static uint32_t current_mode_idx;
+
+void display_set_available_modes(const boot_display_mode_t *modes,
+                                 uint32_t count, uint32_t current)
+{
+    if (!modes || count == 0) return;
+    if (count > BOOT_MAX_DISPLAY_MODES) count = BOOT_MAX_DISPLAY_MODES;
+    avail_mode_count = count;
+    current_mode_idx = current;
+    for (uint32_t i = 0; i < count; i++)
+        avail_modes[i] = modes[i];
+
+    serial_puts("[DISP] Available modes: ");
+    serial_putdec(count);
+    serial_puts(", current=");
+    serial_putdec(current);
+    serial_puts(" (");
+    serial_putdec(modes[current].width);
+    serial_puts("x");
+    serial_putdec(modes[current].height);
+    serial_puts(")\n");
+}
+
+uint32_t display_get_mode_count(void)
+{
+    return avail_mode_count;
+}
+
+const boot_display_mode_t *display_get_mode(uint32_t idx)
+{
+    if (idx >= avail_mode_count) return (void *)0;
+    return &avail_modes[idx];
+}
 
 /* ── Surface: a drawable rectangle ───────────────────────────── */
 
@@ -194,11 +233,45 @@ int display_init(uint32_t *gop_base, uint32_t width, uint32_t height,
     return 0;
 }
 
+/* ── Non-temporal MMIO blit ──────────────────────────────────── */
+
+/* Write-combining MMIO memory benefits from non-temporal stores:
+ * - movntdq bypasses the CPU cache entirely (no cache pollution)
+ * - The WC buffer aggregates writes into full cache-line bursts
+ * - sfence ensures all writes are flushed before returning
+ * 64-byte chunks match the cache line / WC buffer size exactly. */
+static void memcpy_nt(void *dst, const void *src, uint64_t size)
+{
+    const uint8_t *s = (const uint8_t *)src;
+    uint8_t *d = (uint8_t *)dst;
+    uint64_t chunks = size / 64;
+
+    for (uint64_t i = 0; i < chunks; i++) {
+        __asm__ volatile (
+            "movdqa   (%0), %%xmm0\n\t"
+            "movdqa 16(%0), %%xmm1\n\t"
+            "movdqa 32(%0), %%xmm2\n\t"
+            "movdqa 48(%0), %%xmm3\n\t"
+            "movntdq %%xmm0,   (%1)\n\t"
+            "movntdq %%xmm1, 16(%1)\n\t"
+            "movntdq %%xmm2, 32(%1)\n\t"
+            "movntdq %%xmm3, 48(%1)\n\t"
+            : : "r"(s), "r"(d) : "memory",
+                "xmm0", "xmm1", "xmm2", "xmm3"
+        );
+        s += 64; d += 64;
+    }
+    __asm__ volatile ("sfence" ::: "memory");
+
+    uint64_t rem = size % 64;
+    if (rem) memcpy(d, s, rem);
+}
+
 /* ── Page Flip ───────────────────────────────────────────────── */
 
 /* Flip back buffer to screen. Waits for VBlank to avoid tearing.
- * Uses memcpy for Phase 1 (GOP). Phase 2 (GPU) would change the
- * scanout address via SET_OFFSET in the window channel. */
+ * Uses non-temporal stores for Phase 1 (GOP MMIO write-combining).
+ * Phase 2 (GPU) would change the scanout address via SET_OFFSET. */
 
 void display_flip(void)
 {
@@ -207,9 +280,9 @@ void display_flip(void)
     /* Wait for VBlank */
     display_wait_vblank();
 
-    /* Copy back buffer → GOP framebuffer.
-     * For 800×600×4 = 1.875 MB, REP MOVSQ takes ~0.5ms on modern CPU. */
-    memcpy(disp.gop_fb, disp.back, disp.fb_size);
+    /* Blit back buffer → GOP MMIO using non-temporal stores.
+     * Bypasses CPU cache for WC memory; avoids cache pollution. */
+    memcpy_nt(disp.gop_fb, disp.back, disp.fb_size);
 
     /* Track timing */
     uint64_t now = idt_get_ticks();
@@ -227,7 +300,7 @@ void display_flip(void)
 void display_flip_nowait(void)
 {
     if (!disp.initialized || !disp.dirty) return;
-    memcpy(disp.gop_fb, disp.back, disp.fb_size);
+    memcpy_nt(disp.gop_fb, disp.back, disp.fb_size);
     disp.last_flip_tick = idt_get_ticks();
     disp.last_flip_tsc  = disp_rdtsc();
     disp.flip_count++;

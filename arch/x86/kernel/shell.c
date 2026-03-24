@@ -2205,6 +2205,13 @@ static void shell_exec(char *line)
         if (display_init(vram, w, h, p, 0) < 0) {
             sh_puts("ERROR: display_init failed\n");
         } else {
+            /* Pass GOP mode table from bootloader to display subsystem */
+            extern void display_set_available_modes(const boot_display_mode_t *,
+                                                    uint32_t, uint32_t);
+            if (saved_boot_info.display_mode_count > 0)
+                display_set_available_modes(saved_boot_info.display_modes,
+                                            saved_boot_info.display_mode_count,
+                                            saved_boot_info.display_current_mode);
             input_events_init(w, h);
             shm_init();
             compositor_init();

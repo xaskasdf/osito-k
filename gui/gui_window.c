@@ -22,9 +22,9 @@ void gui_window_render(gui_surface_t *s, const gui_win_desc_t *win, bool focused
     uint32_t sh_clr = focused ? 0x60000000 : 0x30000000;
     gui_box_shadow(s, fx, fy, fw, fh, 0, 4, blur, sh_clr);
 
-    /* ── Window border: 1px AA rounded rect ───────────────── */
-    gui_rounded_rect_aa(s, fx - 1, fy - 1, fw + 2, fh + 2,
-                        GUI_CORNER_RADIUS + 1, GUI_BORDER);
+    /* ── Window border: rounded rect (non-AA for performance) ── */
+    gui_rounded_rect_alpha(s, fx - 1, fy - 1, fw + 2, fh + 2,
+                           GUI_CORNER_RADIUS + 1, GUI_BORDER);
 
     /* ── Title bar: gradient fill (Phase 2.7) ─────────────── */
     uint32_t tb_top = focused ? 0xFF404048 : 0xFF353538;
@@ -32,8 +32,8 @@ void gui_window_render(gui_surface_t *s, const gui_win_desc_t *win, bool focused
 
     /* Rounded top corners only: draw full rounded rect for top half,
      * then fill the bottom part square */
-    gui_rounded_rect_aa(s, fx, fy, fw, GUI_TITLEBAR_H,
-                        GUI_CORNER_RADIUS, tb_top);
+    gui_rounded_rect_alpha(s, fx, fy, fw, GUI_TITLEBAR_H,
+                           GUI_CORNER_RADIUS, tb_top);
     /* Overlay a gradient from top to bottom of titlebar */
     gui_gradient_v(s, fx, fy, fw, GUI_TITLEBAR_H, tb_top, tb_bot);
     /* Clip the gradient corners out by re-applying the rounded mask */
