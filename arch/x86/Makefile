@@ -34,7 +34,7 @@ BFLAGS   = -ffreestanding -fno-stack-protector -fshort-wchar \
 # Kernel flags — NO PIE, NO -fno-jump-tables (EFI restrictions lifted!)
 KCFLAGS  = -std=c11 -ffreestanding -fno-stack-protector -mno-red-zone \
            -Wall -Wextra -O2 -fno-pie -Iinclude -I../../include/common \
-           -I../../gui -D__KERNEL_X86__=1
+           -I../../gui -D__KERNEL_X86__=1 -MMD -MP
 
 # Flags for precompiled .o files that may be called from TCC code.
 # TCC doesn't guarantee 16-byte stack alignment (SysV ABI requires it).
@@ -89,7 +89,8 @@ WIN32_SRC = win32/win32_init.c win32/compat32.c win32/pe.c win32/winexec.c \
 WIN32_ASM = win32/int2e_stub.S
 GUI_SRC  = ../../gui/gui_draw.c ../../gui/gui_text.c \
            ../../gui/gui_panel.c ../../gui/gui_dock.c \
-           ../../gui/gui_desktop.c ../../gui/gui_window.c
+           ../../gui/gui_desktop.c ../../gui/gui_window.c \
+           ../../gui/gui_anim.c
 
 # ── Object files ──────────────────────────────────────────────
 
@@ -120,8 +121,9 @@ check-deps:
 $(BUILD)/boot.efi: $(BUILD)/boot.so
 	$(OBJCOPY) -j .text -j .rodata -j .sdata -j .data -j .dynamic -j .dynsym \
 	           -j .rel -j .rela -j .reloc \
-	           --target=efi-app-x86_64 $< $@
-	@echo "Built: $@ ($$(stat -c%s $@) bytes)"
+	           --target=efi-app-x86_64 $< $@ 2>/dev/null || \
+	python3 scripts/elf2efi.py $< $@
+	@echo "Built: $@ ($$(stat -c%s $@ 2>/dev/null || stat -f%z $@ 2>/dev/null || wc -c < $@) bytes)"
 
 $(BUILD)/boot.so: $(BOOT_OBJ)
 	$(LD) $(BLDFLAGS) -o $@ $^ $(BLIBS)
@@ -303,6 +305,9 @@ $(BUILD)/efi_main.o: boot/efi_main.c | $(BUILD)/boot
 
 $(BUILD) $(BUILD)/boot $(BUILD)/kernel $(BUILD)/drivers $(BUILD)/fs $(BUILD)/win32 $(BUILD)/gui:
 	mkdir -p $@
+
+# Auto-generated header dependency files (produced by -MMD -MP)
+-include $(shell find $(BUILD) -name '*.d' 2>/dev/null)
 
 clean:
 	rm -rf $(BUILD)

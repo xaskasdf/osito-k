@@ -113,6 +113,20 @@ static inline uint32_t read_cntp_ctl_el0(void) {
     return (uint32_t)v;
 }
 
+/* Virtual timer (CNTV) — use on SM8350 where EL2 traps physical timer */
+static inline void write_cntv_tval_el0(uint32_t v) {
+    __asm__ volatile("msr CNTV_TVAL_EL0, %0" :: "r"((uint64_t)v));
+}
+
+static inline void write_cntv_ctl_el0(uint32_t v) {
+    __asm__ volatile("msr CNTV_CTL_EL0, %0" :: "r"((uint64_t)v));
+}
+
+static inline uint32_t read_cntv_ctl_el0(void) {
+    uint64_t v; __asm__ volatile("mrs %0, CNTV_CTL_EL0" : "=r"(v));
+    return (uint32_t)v;
+}
+
 /* ========================================================================
  * GICv3 system register interface (ICC)
  * ======================================================================== */

@@ -547,6 +547,41 @@ static IDirectDrawSurface7 *com32_to_surface(uint32_t proxy_addr)
     return surface_count > 0 ? &surfaces[0] : NULL;
 }
 
+/* GetAttachedSurface: returns back buffer attached to primary.
+ * Args (stdcall): this, lpDDSCaps (DDSCAPS2*), lplpDDAttachedSurface (ptr*).
+ * SoftDrv calls this after CreateSurface(PRIMARY+BACKBUFFERCOUNT=1) to get
+ * the back buffer for Lock/render/Flip. */
+static HRESULT WINAPI surf_GetAttachedSurface(IDirectDrawSurface7 *self,
+                                                PVOID lpDDSCaps,
+                                                uint32_t *lplpDDAttachedSurface)
+{
+    (void)lpDDSCaps;
+    IDirectDrawSurface7 *real = REAL_SURF(self);
+    if (!real || !lplpDDAttachedSurface)
+        return DDERR_INVALIDPARAMS;
+
+    DDSurface *ds = &real->surf;
+    if (!ds->back_buffer) {
+        serial_puts("[DDRAW] GetAttachedSurface: no back buffer\n");
+        return DDERR_NOTFOUND;
+    }
+
+    /* Find the back buffer's index in surfaces[] */
+    IDirectDrawSurface7 *back = (IDirectDrawSurface7 *)ds->back_buffer;
+    int idx = (int)(back - surfaces);
+    if (idx < 0 || idx >= surface_count) {
+        serial_puts("[DDRAW] GetAttachedSurface: bad back buffer index\n");
+        return DDERR_NOTFOUND;
+    }
+
+    /* Return COM32 proxy address (32-bit) */
+    *lplpDDAttachedSurface = (uint32_t)(ULONG_PTR)&surf_proxy32[idx];
+    serial_puts("[DDRAW] GetAttachedSurface: proxy=0x");
+    serial_puthex((uint64_t)*lplpDDAttachedSurface, 8);
+    serial_puts("\n");
+    return DD_OK;
+}
+
 static HRESULT WINAPI dd_CreateSurface(IDirectDraw7 *self, DDSURFACEDESC2 *desc,
                                         IDirectDrawSurface7 **surf, PVOID pUnkOuter)
 {
@@ -748,6 +783,8 @@ static void ddraw_init_com32(void)
                                               "Surf_Blt", 7, CC_STDCALL);
     surf_vtbl32[11] = compat32_make_thunk_ex((uint64_t)(ULONG_PTR)surf_Flip,
                                               "Surf_Flip", 3, CC_STDCALL);
+    surf_vtbl32[12] = compat32_make_thunk_ex((uint64_t)(ULONG_PTR)surf_GetAttachedSurface,
+                                              "Surf_GetAttached", 3, CC_STDCALL);
     surf_vtbl32[22] = compat32_make_thunk_ex((uint64_t)(ULONG_PTR)surf_GetSurfaceDesc,
                                               "Surf_GetDesc", 2, CC_STDCALL);
     surf_vtbl32[25] = compat32_make_thunk_ex((uint64_t)(ULONG_PTR)surf_Lock,
@@ -854,16 +891,23 @@ static void ddraw_init_com32(void)
      * The vtable is in kernel BSS and gets overwritten with VirtualAlloc
      * bytecode addresses (0x4039C870) by an unknown writer. */
     {
-        uint64_t watch = (uint64_t)(uintptr_t)dd_vtbl32;
+        uint64_t watch0 = (uint64_t)(uintptr_t)dd_vtbl32;
+        uint64_t watch1 = (uint64_t)0x101E568C;  /* GIsCriticalError in Core.dll */
+        /* DR7: L0=1(bit0) RW0=01(bits16-17) LEN0=11(bits18-19)
+         *      L1=1(bit2) RW1=01(bits20-21) LEN1=11(bits22-23)
+         * = 0x00DD0005 */
         __asm__ volatile (
             "mov %0, %%dr0\n"
-            "mov $0x000D0001, %%rax\n"  /* DR7: L0=1, RW0=01(write), LEN0=11(4B) */
+            "mov %1, %%dr1\n"
+            "mov $0x00DD0005, %%rax\n"
             "mov %%rax, %%dr7\n"
-            :: "r"(watch) : "rax"
+            :: "r"(watch0), "r"(watch1) : "rax"
         );
         serial_puts("[DDRAW] DR0 watchpoint on dd_vtbl32 at 0x");
         extern void serial_puthex(uint64_t val, int digits);
-        serial_puthex(watch, 8);
+        serial_puthex(watch0, 8);
+        serial_puts("\n[DDRAW] DR1 watchpoint on GIsCriticalError at 0x");
+        serial_puthex(watch1, 8);
         serial_puts("\n");
     }
 }

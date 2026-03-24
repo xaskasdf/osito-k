@@ -44,6 +44,7 @@ static uint8_t page_bitmap[BITMAP_SIZE];
 static uint64_t total_pages;
 static uint64_t free_pages;
 static uint64_t total_memory;
+static uint64_t max_tracked_page;  /* highest page ever marked free */
 
 /* ── Bitmap helpers ──────────────────────────────────────────── */
 
@@ -107,6 +108,9 @@ void mem_init(void *mmap, uint64_t mmap_size, uint64_t desc_size)
                 bitmap_set(start_page + p);
                 free_pages++;
             }
+            /* Track highest page for search bounds */
+            uint64_t last = start_page + num_pages;
+            if (last > max_tracked_page) max_tracked_page = last;
             total_pages += num_pages;
             usable_regions++;
         }
@@ -168,7 +172,8 @@ void *mem_alloc_pages(uint64_t count)
      * - Heap (0x10F000+)
      * - ET_EXEC ELF load area (typically 0x400000-0x600000)
      * This ensures first-fit doesn't consume the ELF VA range. */
-    for (uint64_t p = 2048; p < MAX_PHYS_PAGES; p++) {  /* Start above 8MB */
+    uint64_t limit = max_tracked_page ? max_tracked_page : MAX_PHYS_PAGES;
+    for (uint64_t p = 2048; p < limit; p++) {  /* Start above 8MB */
         if (bitmap_test(p)) {
             if (run_len == 0) run_start = p;
             run_len++;
@@ -232,24 +237,36 @@ void *mem_alloc_aligned(uint64_t size, uint64_t alignment)
     uint64_t align_pages = alignment >> PAGE_SHIFT;
     if (align_pages == 0) align_pages = 1;
 
-    /* Search for aligned contiguous pages (above 8MB, skip ELF load area) */
-    for (uint64_t p = 2048; p < MAX_PHYS_PAGES; p++) {
-        /* Align to required boundary */
-        if (p % align_pages != 0) continue;
+    if (free_pages < pages) return NULL;
 
-        /* Check if enough contiguous pages */
+    /* Search for aligned contiguous pages (above 8MB, skip ELF load area) */
+    uint64_t limit = max_tracked_page ? max_tracked_page : MAX_PHYS_PAGES;
+    uint64_t p = 2048;
+    /* Snap to first aligned candidate */
+    if (p % align_pages != 0)
+        p = ((p / align_pages) + 1) * align_pages;
+
+    while (p + pages <= limit) {
+        /* Check if enough contiguous pages starting at p */
         uint64_t ok = 1;
-        for (uint64_t i = 0; i < pages && ok; i++) {
-            if (!bitmap_test(p + i)) ok = 0;
+        uint64_t i;
+        for (i = 0; i < pages; i++) {
+            if (!bitmap_test(p + i)) { ok = 0; break; }
         }
 
         if (ok) {
-            for (uint64_t i = 0; i < pages; i++) {
+            for (i = 0; i < pages; i++) {
                 bitmap_clear(p + i);
                 free_pages--;
             }
             return (void *)(p << PAGE_SHIFT);
         }
+
+        /* Skip past the failed page to the next aligned candidate */
+        uint64_t fail = p + i + 1;
+        if (fail % align_pages != 0)
+            fail = ((fail / align_pages) + 1) * align_pages;
+        p = fail;
     }
 
     return NULL;

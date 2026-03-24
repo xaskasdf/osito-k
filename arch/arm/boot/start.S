@@ -24,7 +24,7 @@ _start:
     b       _entry                  // code0: branch to entry
     .word   0                       // code1: reserved
     .quad   0x0                     // text_offset: image load offset
-    .quad   _image_end - _start     // image_size
+    .quad   0                       // image_size: 0 = use actual file size
     .quad   0xa                     // flags: LE, 4KB pages, anywhere
     .quad   0                       // res2
     .quad   0                       // res3
@@ -39,11 +39,30 @@ _entry:
     /* Save DTB address (callee-saved register) */
     mov     x19, x0
 
+    /* === EARLY FB TEST: paint top-left 200px red === */
+    /* Splash FB at 0xE5000000, ARGB8888 */
+    ldr     x10, =0xE5000000
+    mov     w11, #0x00FF              /* Blue=0x00, Green=0x00 */
+    movk    w11, #0xFFFF, lsl #16     /* Alpha=0xFF, Red=0xFF → 0xFFFF0000 */
+    mov     x12, #200
+3:  str     w11, [x10], #4
+    subs    x12, x12, #1
+    b.ne    3b
+
     /* Verify EL1 */
     mrs     x1, CurrentEL
     lsr     x1, x1, #2
     cmp     x1, #1
     b.ne    _hang
+
+    /* === MARKER 2: green line = EL1 OK === */
+    ldr     x10, =0xE50010E0          /* row 1: 0xE5000000 + 4320 */
+    mov     w11, #0xFF00
+    movk    w11, #0xFF00, lsl #16     /* 0xFF00FF00 = green */
+    mov     x12, #200
+4:  str     w11, [x10], #4
+    subs    x12, x12, #1
+    b.ne    4b
 
     /* Set up exception vectors */
     adr     x0, _vectors
@@ -53,6 +72,15 @@ _entry:
     /* Stack: provided by linker script (_stack_top) */
     ldr     x0, =_stack_top
     mov     sp, x0
+
+    /* === MARKER 3: cyan line = stack OK === */
+    ldr     x10, =0xE50021C0          /* row 2: 0xE5000000 + 8640 */
+    mov     w11, #0xFFFF
+    movk    w11, #0xFF00, lsl #16     /* 0xFF00FFFF = cyan */
+    mov     x12, #200
+5:  str     w11, [x10], #4
+    subs    x12, x12, #1
+    b.ne    5b
 
     /* Clear BSS (use adrp+add for large BSS — adr only reaches ±1MB) */
     adrp    x0, __bss_start
@@ -64,6 +92,15 @@ _entry:
     str     xzr, [x0], #8
     b       1b
 2:
+
+    /* === MARKER 4: white line = BSS clear done === */
+    ldr     x10, =0xE50032A0          /* row 3: 0xE5000000 + 12960 */
+    mov     w11, #0xFFFF
+    movk    w11, #0xFFFF, lsl #16     /* 0xFFFFFFFF = white */
+    mov     x12, #200
+6:  str     w11, [x10], #4
+    subs    x12, x12, #1
+    b.ne    6b
 
     /* Jump to C kernel entry */
     mov     x0, x19                 // x0 = DTB

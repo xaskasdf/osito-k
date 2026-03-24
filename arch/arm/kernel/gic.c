@@ -41,7 +41,7 @@ static inline void gicr_write(uint32_t off, uint32_t val) {
 #define GICR_IGROUPR0       (GICR_SGI_BASE + 0x080)
 #define GICR_IGRPMODR0      (GICR_SGI_BASE + 0xD00)
 
-#define TIMER_PPI       30  /* Non-secure physical timer */
+#define TIMER_PPI       27  /* Virtual timer (CNTV) — EL2 traps physical PPI 30 */
 #define YIELD_SGI       0   /* SGI for task_yield */
 
 void gic_init(void) {

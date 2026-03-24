@@ -1853,6 +1853,10 @@ HANDLE WINAPI FindFirstFileA(PCSTR lpFileName, LPWIN32_FIND_DATAA lpFindFileData
     fill_find_data_a(lpFindFileData, f);
     find_handles[slot].next_idx = idx + 1;
 
+    serial_puts("[K32] FindFirst result: '");
+    serial_puts(f->name);
+    serial_puts("'\n");
+
     return (HANDLE)(ULONG_PTR)(slot + 0x100);  /* offset to avoid NULL */
 }
 
@@ -1873,6 +1877,21 @@ BOOL WINAPI FindNextFileA(HANDLE hFindFile, LPWIN32_FIND_DATAA lpFindFileData)
     osfs2_file_t *f = osfs2_get_file(idx);
     fill_find_data_a(lpFindFileData, f);
     find_handles[slot].next_idx = idx + 1;
+
+    /* Log .unr results to debug Entry.unr resolution */
+    {
+        const char *n = f->name;
+        int len = 0; while (n[len]) len++;
+        if (len > 4 && n[len-4] == '.' &&
+            (n[len-3]=='u'||n[len-3]=='U') &&
+            (n[len-2]=='n'||n[len-2]=='N') &&
+            (n[len-1]=='r'||n[len-1]=='R')) {
+            serial_puts("[K32] FindNext .unr: '");
+            serial_puts(f->name);
+            serial_puts("'\n");
+        }
+    }
+
     return TRUE;
 }
 

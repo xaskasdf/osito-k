@@ -42,6 +42,10 @@ typedef struct {
     uint32_t  target_fps;    /* target refresh rate */
     uint32_t  ticks_per_frame; /* ticks between frames at target_fps */
 
+    /* TSC-based frame pacing (sub-tick precision, true 60fps) */
+    uint64_t  tsc_per_frame;   /* TSC cycles per frame at target_fps */
+    uint64_t  last_flip_tsc;   /* TSC value at last flip */
+
     /* Stats */
     uint64_t  flip_count;
     uint64_t  frame_drops;   /* frames that took >1 vblank */
@@ -60,22 +64,61 @@ typedef struct {
     bool      allocated;     /* true if we own the memory */
 } surface_t;
 
+/* ── TSC helper ──────────────────────────────────────────────── */
+
+static inline uint64_t disp_rdtsc(void)
+{
+    uint32_t lo, hi;
+    __asm__ volatile ("rdtsc" : "=a"(lo), "=d"(hi));
+    return ((uint64_t)hi << 32) | lo;
+}
+
+/* Calibrate TSC frequency using APIC ticks as reference.
+ * Measures over N_CAL ticks (~100ms at 100Hz). */
+#define TSC_CAL_TICKS 10
+
+static uint64_t calibrate_tsc(void)
+{
+    /* Align to tick boundary */
+    uint64_t t0 = idt_get_ticks();
+    while (idt_get_ticks() == t0) __asm__ volatile ("hlt");
+
+    uint64_t tick_start = idt_get_ticks();
+    uint64_t tsc_start  = disp_rdtsc();
+
+    /* Wait for N_CAL more ticks */
+    while (idt_get_ticks() - tick_start < TSC_CAL_TICKS)
+        __asm__ volatile ("hlt");
+
+    uint64_t tsc_end  = disp_rdtsc();
+    uint64_t elapsed_tsc = tsc_end - tsc_start;
+
+    /* APIC fires at ~100Hz; TSC cycles per second = elapsed_tsc * (100 / N_CAL) */
+    return elapsed_tsc * 100 / TSC_CAL_TICKS;
+}
+
 /* ── VBlank simulation ───────────────────────────────────────── */
 
-/* Simulated VBlank using APIC timer ticks.
- * At 100Hz tick rate: 60fps → flip every ~1.67 ticks (round to 2).
- * This ensures we don't tear by flipping mid-scanout. */
-
-static inline bool display_vblank_ready(void)
-{
-    uint64_t now = idt_get_ticks();
-    return (now - disp.last_flip_tick) >= disp.ticks_per_frame;
-}
+/* TSC-based frame pacing: precise to microseconds, not limited by 100Hz APIC.
+ * Falls back to APIC-tick method if TSC calibration looks unreasonable. */
 
 void display_wait_vblank(void)
 {
-    while (!display_vblank_ready())
-        __asm__ volatile ("hlt");  /* sleep until next tick */
+    if (disp.tsc_per_frame) {
+        /* Spin-wait until target TSC value.
+         * Use HLT only if we're more than ~5ms away (5M cycles at 1GHz). */
+        uint64_t target = disp.last_flip_tsc + disp.tsc_per_frame;
+        while (disp_rdtsc() < target) {
+            uint64_t remaining = target - disp_rdtsc();
+            if (remaining > disp.tsc_per_frame / 4)
+                __asm__ volatile ("hlt");
+            /* else tight spin for last ~4ms */
+        }
+    } else {
+        /* Fallback: APIC tick-based (50fps cap at 100Hz) */
+        while ((idt_get_ticks() - disp.last_flip_tick) < disp.ticks_per_frame)
+            __asm__ volatile ("hlt");
+    }
     disp.vblank_count++;
 }
 
@@ -106,6 +149,23 @@ int display_init(uint32_t *gop_base, uint32_t width, uint32_t height,
     disp.frame_drops = 0;
     disp.vblank_count = 0;
     disp.dirty = false;
+
+    /* Calibrate TSC for sub-tick frame pacing (~100ms measurement window) */
+    serial_puts("[DISP] Calibrating TSC...\n");
+    uint64_t tsc_per_sec = calibrate_tsc();
+    /* Sanity check: expect 100MHz – 5GHz for any CPU we'll run on */
+    if (tsc_per_sec >= 100000000ULL && tsc_per_sec <= 5000000000ULL) {
+        disp.tsc_per_frame = tsc_per_sec / target_fps;
+        serial_puts("[DISP] TSC: ");
+        serial_putdec(tsc_per_sec / 1000000);
+        serial_puts(" MHz, ");
+        serial_putdec(disp.tsc_per_frame / 1000);
+        serial_puts(" kcy/frame\n");
+    } else {
+        disp.tsc_per_frame = 0;  /* use APIC fallback */
+        serial_puts("[DISP] TSC calibration out of range, using APIC ticks\n");
+    }
+    disp.last_flip_tsc = disp_rdtsc();
 
     /* Allocate back buffer (page-aligned for potential GPU use) */
     disp.back = (uint32_t *)mem_alloc_aligned(disp.fb_size, 4096);
@@ -158,6 +218,7 @@ void display_flip(void)
         disp.frame_drops++;
 
     disp.last_flip_tick = now;
+    disp.last_flip_tsc  = disp_rdtsc();
     disp.flip_count++;
     disp.dirty = false;
 }
@@ -168,6 +229,7 @@ void display_flip_nowait(void)
     if (!disp.initialized || !disp.dirty) return;
     memcpy(disp.gop_fb, disp.back, disp.fb_size);
     disp.last_flip_tick = idt_get_ticks();
+    disp.last_flip_tsc  = disp_rdtsc();
     disp.flip_count++;
     disp.dirty = false;
 }

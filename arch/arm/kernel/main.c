@@ -130,7 +130,7 @@ void irq_handler(void)
 {
     uint32_t irqnr = gic_ack_irq();
 
-    if (irqnr == 30) {
+    if (irqnr == 27) {  /* Virtual timer PPI (CNTV) */
         /* Timer PPI */
         timer_tick_handler();
         if (current_task)
@@ -191,26 +191,63 @@ static void shell_wrapper(void *arg)
  * Kernel entry
  * ======================================================================== */
 
+/* Debug: paint a fat bar on the framebuffer to show we reached C code */
+static void fb_debug_bar(int row, uint32_t color)
+{
+    volatile uint32_t *fb = (volatile uint32_t *)(0xE5000000UL + row * 4320);
+    for (int i = 0; i < 1080 * 4; i++)  /* 4 rows wide, full width */
+        fb[i] = color;
+}
+
 void kernel_main(void *dtb)
 {
+    /* === VISUAL DEBUG: 30px tall bars, colors from shim (0x00RRGGBB) === */
+
+    /* Bar 1: RED = kernel_main reached */
+    for (int r = 20; r < 50; r++) fb_debug_bar(r, 0x00FF0000);
+
     platform_init(dtb);
 
-    serial_puts("[KERN] Serial OK\n");
+    /* Bar 2: GREEN = platform_init OK */
+    for (int r = 60; r < 90; r++) fb_debug_bar(r, 0x0000FF00);
 
+    serial_puts("[KERN] Serial OK\n");
     print_banner();
     print_cpu_info();
+
+    /* Bar 3: BLUE = pre-GIC */
+    for (int r = 100; r < 130; r++) fb_debug_bar(r, 0x000000FF);
 
     /* Step 2: GIC */
     gic_init();
 
+    /* Bar 4: YELLOW = GIC OK */
+    for (int r = 140; r < 170; r++) fb_debug_bar(r, 0x00FFFF00);
+
     /* Step 3: Timer (100 Hz) */
     timer_init(100);
+
+    /* Bar 5: CYAN = timer OK */
+    for (int r = 180; r < 210; r++) fb_debug_bar(r, 0x0000FFFF);
 
     /* Step 4: Memory manager */
     mem_init(platform_ram_base(), platform_ram_size());
 
-    /* Step 5: Paging / MMU */
-    paging_init();
+    /* Bar 6: MAGENTA = mem OK */
+    for (int r = 220; r < 250; r++) fb_debug_bar(r, 0x00FF00FF);
+
+    /* Step 5: Paging / MMU
+     * SM8350: ABL leaves MMU ON with identity map + EL2 traps some
+     * system registers. Skip paging to avoid crash.
+     * QEMU virt (RAM at 0x40000000): needs paging_init. */
+    if (platform_ram_base() == 0x40000000UL) {
+        paging_init();  /* QEMU virt only */
+    } else {
+        serial_puts("[PAGE] Skipping (ABL identity map active)\n");
+    }
+
+    /* Bar 7: WHITE = ALL INIT OK! */
+    for (int r = 260; r < 290; r++) fb_debug_bar(r, 0x00FFFFFF);
 
     /* Step 6: Heap */
     heap_init();

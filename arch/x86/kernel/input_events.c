@@ -152,6 +152,33 @@ void input_post_mouse_move(int16_t dx, int16_t dy)
     input_enqueue(&evt);
 }
 
+void input_set_mouse_abs(int32_t abs_x, int32_t abs_y)
+{
+    /* Scale from tablet coords (0-32767) to screen coords */
+    int32_t new_x = (abs_x * screen_w) / 32768;
+    int32_t new_y = (abs_y * screen_h) / 32768;
+    if (new_x < 0) new_x = 0;
+    if (new_y < 0) new_y = 0;
+    if (new_x >= screen_w) new_x = screen_w - 1;
+    if (new_y >= screen_h) new_y = screen_h - 1;
+
+    int16_t dx = (int16_t)(new_x - mouse_x);
+    int16_t dy = (int16_t)(new_y - mouse_y);
+    mouse_x = new_x;
+    mouse_y = new_y;
+
+    if (dx != 0 || dy != 0) {
+        input_event_t evt;
+        memset(&evt, 0, sizeof(evt));
+        evt.type = INPUT_MOUSE_MOVE;
+        evt.dx = dx;
+        evt.dy = dy;
+        evt.buttons = mouse_buttons;
+        evt.timestamp = rdtsc();
+        input_enqueue(&evt);
+    }
+}
+
 void input_post_mouse_button(uint8_t buttons)
 {
     uint8_t changed = buttons ^ mouse_buttons;

@@ -1,7 +1,7 @@
 # Osito-K — AArch64 Port (Qualcomm SM8350)
 
 Target: ASUS ROG Phone 5 (I005DA), Qualcomm Snapdragon 888 (SM8350 "Lahaina")
-Status: Bootloader proven on real hardware (sm8350-boot v0.4), kernel port pending.
+Status: Bootloader proven on real hardware (sm8350-boot v0.8), Linux mainline boots. See `BUILDING-ROG5.md` for build & flash instructions.
 
 ## What's Here
 
@@ -89,8 +89,9 @@ mkbootimg --kernel Image --ramdisk /dev/null --dtb stock.dtb \
     --base 0x00000000 --kernel_offset 0x00080000 \
     --header_version 2 --pagesize 4096 \
     -o boot.img
-# Test without flashing:
-fastboot boot boot.img
+# MUST flash (fastboot boot does NOT work on ROG5):
+fastboot flash boot boot.img
+fastboot reboot
 ```
 
 ## Porting Priority

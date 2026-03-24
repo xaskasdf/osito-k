@@ -2366,6 +2366,16 @@ void WINAPI crt_CxxThrowException(PVOID pExceptionObject, PVOID pThrowInfo)
     serial_puts("[CXX] WARNING: _CxxThrowException unhandled — suppressing\n");
     cxx_exception_active = 0;
 
+    /* Clear GErrorHist + GIsCriticalError so Browse() doesn't see stale
+     * error state from suppressed exceptions during init. */
+    {
+        volatile uint16_t *gerr = (volatile uint16_t *)(uintptr_t)0x101E3474;
+        volatile uint32_t *gcrit = (volatile uint32_t *)(uintptr_t)0x101E568C;
+        *gerr = 0;
+        *gcrit = 0;
+        serial_puts("[CXX] cleared GErrorHist+GIsCriticalError\n");
+    }
+
     /* Instead of proc_exit(1), just return and let the 32-bit code continue.
      * _CxxThrowException "should never return" but the engine's code after
      * throw often has fall-through error cleanup that's reachable.

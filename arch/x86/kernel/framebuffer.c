@@ -25,6 +25,11 @@ static uint32_t  max_rows;
 static uint32_t  dirty_top;
 static uint32_t  dirty_bot;
 
+/* Redirect state: when active, fb_base points to an external surface
+ * (e.g. an shm terminal surface) and VRAM flushes are suppressed. */
+static bool      redirect_active;
+static uint32_t  fb_clear_clr = 0x00000000;  /* background fill color */
+
 #define FONT_W  8
 #define FONT_H  16
 
@@ -35,6 +40,14 @@ static uint32_t  dirty_bot;
 /* Font data now in gui/gui_text.c (shared across architectures) */
 extern const uint8_t gui_font8x16[95][16];
 #define font8x16 gui_font8x16
+
+/* ── GUI terminal text buffer (for rendering in desktop terminal window) ── */
+#define TERM_BUF_ROWS 200
+#define TERM_BUF_COLS 160
+static char  term_buf[TERM_BUF_ROWS][TERM_BUF_COLS];
+static int   term_cur_row;    /* current write row */
+static int   term_cur_col;    /* current write col */
+static int   term_total_rows; /* total rows written (for scrollback) */
 
 /* ── Public API ──────────────────────────────────────────────── */
 
@@ -70,6 +83,7 @@ void fb_enable_shadow(void *buf)
 /* Flush dirty region from shadow to VRAM */
 void fb_flush(void)
 {
+    if (redirect_active) return;  /* Surface owner blits to screen; no VRAM flush */
     if (!fb_shadow || dirty_top >= dirty_bot) return;
     /* Clamp to framebuffer bounds */
     if (dirty_bot > fb_height) dirty_bot = fb_height;
@@ -85,6 +99,7 @@ void fb_flush(void)
 
 void fb_flush_all(void)
 {
+    if (redirect_active) return;
     if (!fb_shadow) return;
     uint64_t *dst = (uint64_t *)fb_vram;
     uint64_t *src = (uint64_t *)fb_shadow;
@@ -101,13 +116,19 @@ static void fb_mark_dirty(uint32_t pixel_top, uint32_t pixel_bot)
 
 void fb_clear(void)
 {
-    /* Use 64-bit writes for speed */
+    uint32_t fill = fb_clear_clr;
+    uint64_t fill64 = (uint64_t)fill | ((uint64_t)fill << 32);
     uint64_t *p = (uint64_t *)fb_base;
     uint32_t qwords = fb_height * fb_pitch / 2;
     for (uint32_t i = 0; i < qwords; i++)
-        p[i] = 0;
+        p[i] = fill64;
     text_col = 0;
     text_row = 0;
+    if (redirect_active) {
+        dirty_top = fb_height;
+        dirty_bot = 0;
+        return;
+    }
     /* Flush to VRAM if shadow buffer is active */
     if (fb_shadow) {
         uint64_t *dst = (uint64_t *)fb_vram;
@@ -129,7 +150,7 @@ static void fb_putchar_at(uint32_t col, uint32_t row, char c, uint32_t fg)
     for (uint32_t y = 0; y < FONT_H; y++) {
         uint8_t bits = glyph[y];
         for (uint32_t x = 0; x < FONT_W; x++) {
-            uint32_t color = (bits & (0x80 >> x)) ? fg : BG_COLOR;
+            uint32_t color = (bits & (0x80 >> x)) ? fg : fb_clear_clr;
             uint32_t sx = px + x;
             uint32_t sy = py + y;
             if (sx < fb_width && sy < fb_height)
@@ -152,11 +173,13 @@ static void fb_scroll(void)
     for (uint32_t i = 0; i < qwords; i++)
         dst[i] = src[i];
 
-    /* Clear last row */
+    /* Clear last row with background color */
+    uint32_t fill = fb_clear_clr;
+    uint64_t fill64 = (uint64_t)fill | ((uint64_t)fill << 32);
     uint64_t *last = (uint64_t *)(fb_base + (total_pixels - row_pixels));
     uint32_t clear_qwords = row_pixels / 2;
     for (uint32_t i = 0; i < clear_qwords; i++)
-        last[i] = 0;
+        last[i] = fill64;
 
     /* Mark entire screen dirty */
     fb_mark_dirty(0, fb_height);
@@ -287,6 +310,21 @@ static void ansi_execute(char cmd)
     }
 }
 
+static void term_buf_newline(void)
+{
+    if (term_cur_row < TERM_BUF_ROWS - 1) {
+        term_cur_row++;
+    } else {
+        /* Shift rows up to make room (after ~200 lines) */
+        for (int i = 0; i < TERM_BUF_ROWS - 1; i++)
+            for (int j = 0; j < TERM_BUF_COLS; j++)
+                term_buf[i][j] = term_buf[i + 1][j];
+    }
+    term_total_rows++;
+    term_cur_col = 0;
+    term_buf[term_cur_row][0] = '\0';
+}
+
 void fb_putc(char c, uint32_t color)
 {
     if (!fb_base) return;
@@ -340,20 +378,38 @@ void fb_putc(char c, uint32_t color)
     if (c == '\n') {
         text_col = 0;
         text_row++;
+        term_buf[term_cur_row][term_cur_col] = '\0';
+        term_buf_newline();
     } else if (c == '\r') {
         text_col = 0;
+        term_cur_col = 0;
     } else if (c == '\b') {
         if (text_col > 0) text_col--;
+        if (term_cur_col > 0) {
+            term_cur_col--;
+            term_buf[term_cur_row][term_cur_col] = ' ';
+        }
     } else if (c == '\t') {
         text_col = (text_col + 4) & ~3;
+        int nc = (term_cur_col + 4) & ~3;
+        while (term_cur_col < nc && term_cur_col < TERM_BUF_COLS - 1)
+            term_buf[term_cur_row][term_cur_col++] = ' ';
+        if (term_cur_col < TERM_BUF_COLS)
+            term_buf[term_cur_row][term_cur_col] = '\0';
     } else {
         fb_putchar_at(text_col, text_row, c, fg);
         text_col++;
+        if (c >= 32 && c <= 126 && term_cur_col < TERM_BUF_COLS - 1) {
+            term_buf[term_cur_row][term_cur_col++] = c;
+            term_buf[term_cur_row][term_cur_col] = '\0';
+        }
     }
 
     if (text_col >= max_cols) {
         text_col = 0;
         text_row++;
+        term_buf[term_cur_row][term_cur_col] = '\0';
+        term_buf_newline();
     }
     if (text_row >= max_rows) {
         fb_scroll();
@@ -366,9 +422,44 @@ void fb_putc(char c, uint32_t color)
 uint32_t fb_get_cols(void) { return max_cols; }
 uint32_t fb_get_rows(void) { return max_rows; }
 uint32_t *fb_get_base(void)   { return fb_base; }
+uint32_t *fb_get_vram(void)   { return fb_vram; }
 uint32_t  fb_get_width(void)  { return fb_width; }
 uint32_t  fb_get_height(void) { return fb_height; }
 uint32_t  fb_get_pitch(void)  { return fb_pitch; }
+
+uint32_t fb_get_text_col(void) { return text_col; }
+uint32_t fb_get_text_row(void) { return text_row; }
+
+/* ── Surface redirect (for compositor terminal window) ──────── */
+
+/* Redirect fb_putc output to an external pixel surface.
+ * Called once from shell.c:desktop after creating the terminal shm surface.
+ * w/h are in pixels; pitch = w (tightly packed, no padding). */
+void fb_redirect(uint32_t *new_base, uint32_t w, uint32_t h, uint32_t pitch)
+{
+    fb_base        = new_base;
+    fb_width       = w;
+    fb_height      = h;
+    fb_pitch       = pitch;
+    max_cols       = w / FONT_W;
+    max_rows       = h / FONT_H;
+    text_col       = 0;
+    text_row       = 0;
+    redirect_active = true;
+    /* Caller is responsible for clearing the surface if needed */
+}
+
+void fb_set_clear_color(uint32_t color) { fb_clear_clr = color; }
+
+/* ── GUI terminal text buffer getters ───────────────────────── */
+
+const char *fb_get_term_line(int row)
+{
+    if (row < 0 || row >= TERM_BUF_ROWS) return "";
+    return term_buf[row];
+}
+int fb_get_term_rows(void)       { return term_cur_row; }
+int fb_get_term_cursor_col(void) { return term_cur_col; }
 
 void fb_puts(const char *s)
 {

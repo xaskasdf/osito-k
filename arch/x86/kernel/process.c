@@ -1501,3 +1501,13 @@ void proc_init(void)
 
     fb_puts(" Process subsystem ready\n");
 }
+
+uint32_t proc_count_active(void)
+{
+    uint32_t count = 0;
+    for (int i = 0; i < MAX_PROCESSES; i++) {
+        if (proctab[i].state != PROC_FREE)
+            count++;
+    }
+    return count;
+}

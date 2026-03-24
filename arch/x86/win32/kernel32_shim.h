@@ -239,11 +239,16 @@ DWORD WINAPI GetWindowsDirectoryW(PWSTR lpBuffer, DWORD uSize);
 
 /* ── Find File ─────────────────────────────────────────────── */
 
-typedef struct _WIN32_FIND_DATAA {
+/* CRITICAL: These structs are written by 64-bit code but read by 32-bit PE.
+ * FILETIME on 32-bit is two DWORDs (4-byte aligned), but ULONGLONG on 64-bit
+ * requires 8-byte alignment → 4 bytes padding after dwFileAttributes → cFileName
+ * shifts from offset 44 to 48 → 32-bit code reads empty filenames.
+ * Fix: use packed attribute to match 32-bit layout exactly. */
+typedef struct __attribute__((packed)) _WIN32_FIND_DATAA {
     DWORD    dwFileAttributes;
-    ULONGLONG ftCreationTime;
-    ULONGLONG ftLastAccessTime;
-    ULONGLONG ftLastWriteTime;
+    DWORD    ftCreationTimeLo, ftCreationTimeHi;
+    DWORD    ftLastAccessTimeLo, ftLastAccessTimeHi;
+    DWORD    ftLastWriteTimeLo, ftLastWriteTimeHi;
     DWORD    nFileSizeHigh;
     DWORD    nFileSizeLow;
     DWORD    dwReserved0;
@@ -252,11 +257,11 @@ typedef struct _WIN32_FIND_DATAA {
     char     cAlternateFileName[14];
 } WIN32_FIND_DATAA, *LPWIN32_FIND_DATAA;
 
-typedef struct _WIN32_FIND_DATAW {
+typedef struct __attribute__((packed)) _WIN32_FIND_DATAW {
     DWORD    dwFileAttributes;
-    ULONGLONG ftCreationTime;
-    ULONGLONG ftLastAccessTime;
-    ULONGLONG ftLastWriteTime;
+    DWORD    ftCreationTimeLo, ftCreationTimeHi;
+    DWORD    ftLastAccessTimeLo, ftLastAccessTimeHi;
+    DWORD    ftLastWriteTimeLo, ftLastWriteTimeHi;
     DWORD    nFileSizeHigh;
     DWORD    nFileSizeLow;
     DWORD    dwReserved0;

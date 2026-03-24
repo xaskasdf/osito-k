@@ -1892,6 +1892,22 @@ uint64_t compat32_dispatch(uint32_t thunk_idx, uint32_t *stack_args)
         }
     }
 
+    /* Continuously clear GIsCriticalError + GErrorHist[0].
+     * The engine's exception handlers (SEH catch, appError) set these
+     * during init whenever a null-object write or call is recovered.
+     * If GIsCriticalError is 1 when Browse() is called, it bails
+     * immediately without attempting to load the map file.
+     * Clearing on every INT 0x2E ensures Browse() always sees clean state.
+     * Addresses are in Core.dll data section, mapped at init time. */
+    {
+        volatile uint32_t *gcrit = (volatile uint32_t *)(uintptr_t)0x101E568C;
+        volatile uint16_t *gerr  = (volatile uint16_t *)(uintptr_t)0x101E3474;
+        if (*gcrit != 0) {
+            *gcrit = 0;
+            *gerr  = 0;
+        }
+    }
+
     /* Callback return: 32-bit function completed, longjmp back */
     if (thunk_idx == THUNK_CALLBACK_RETURN) {
         /* Restore 64-bit data segments (compat mode set them to 0x48) */

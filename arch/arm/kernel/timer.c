@@ -40,11 +40,14 @@ void timer_init(uint32_t hz) {
     serial_putdec(hz);
     serial_puts(" Hz tick)\n");
 
-    write_cntp_tval_el0(tick_interval);
-    write_cntp_ctl_el0(1);  /* ENABLE=1, IMASK=0 */
+    /* Use virtual timer (CNTV) — SM8350's EL2 hypervisor traps
+     * physical timer (CNTP) accesses, causing silent crash.
+     * Virtual timer PPI = 27 (vs physical PPI 30). */
+    write_cntv_tval_el0(tick_interval);
+    write_cntv_ctl_el0(1);  /* ENABLE=1, IMASK=0 */
 }
 
 void timer_tick_handler(void) {
     tick_count++;
-    write_cntp_tval_el0(tick_interval);  /* Reload for next tick */
+    write_cntv_tval_el0(tick_interval);  /* Reload for next tick */
 }

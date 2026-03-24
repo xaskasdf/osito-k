@@ -2177,18 +2177,57 @@ static void shell_exec(char *line)
         }
     } else if (strcmp(cmd, "desktop") == 0) {
         /* Launch compositor with elementaryOS desktop */
-        extern void display_init(void);
-        extern void input_events_init(void);
+        extern int  display_init(uint32_t *gop_base, uint32_t w, uint32_t h,
+                                 uint32_t pitch, uint32_t fps);
+        extern void input_events_init(uint32_t scr_width, uint32_t scr_height);
         extern void shm_init(void);
         extern void compositor_init(void);
         extern void compositor_thread(void);
+        extern uint32_t *fb_get_vram(void);
+        extern uint32_t  fb_get_width(void);
+        extern uint32_t  fb_get_height(void);
+        extern uint32_t  fb_get_pitch(void);
+        /* Terminal surface API */
+        extern void compositor_get_terminal_dims(uint32_t *tw, uint32_t *th);
+        extern void compositor_set_terminal_surface(uint32_t shm, uint32_t tw, uint32_t th);
+        extern void fb_redirect(uint32_t *new_base, uint32_t tw, uint32_t th, uint32_t pitch);
+        extern void fb_set_clear_color(uint32_t color);
+        extern void fb_clear(void);
+        /* SHM API */
+        extern uint32_t  shm_create(uint64_t size, uint32_t flags);
+        extern void     *shm_map(uint32_t handle);
 
-        display_init();
-        input_events_init();
-        shm_init();
-        compositor_init();
-        sched_spawn("compositor", compositor_thread);
-        sh_puts("Desktop launched. Compositor running.\n");
+        uint32_t *vram = fb_get_vram();
+        uint32_t  w    = fb_get_width();
+        uint32_t  h    = fb_get_height();
+        uint32_t  p    = fb_get_pitch();
+
+        if (display_init(vram, w, h, p, 0) < 0) {
+            sh_puts("ERROR: display_init failed\n");
+        } else {
+            input_events_init(w, h);
+            shm_init();
+            compositor_init();
+
+            /* Create terminal surface: same size as the Terminal window content area */
+            uint32_t tw, th;
+            compositor_get_terminal_dims(&tw, &th);
+
+            /* Allocate shm pixel buffer */
+            uint32_t term_shm = shm_create((uint64_t)tw * th * 4, 3 /* CPU_RW */);
+            uint32_t *term_px = (uint32_t *)shm_map(term_shm);
+
+            /* Register with compositor (it will blit this surface each frame) */
+            compositor_set_terminal_surface(term_shm, tw, th);
+
+            /* Redirect framebuffer output to the new surface */
+            fb_set_clear_color(0xFF1A1A2E);   /* dark terminal blue */
+            fb_redirect(term_px, tw, th, tw);
+            fb_clear();                        /* fill surface with background */
+
+            sched_spawn("compositor", compositor_thread);
+            sh_puts("Desktop launched. Compositor running.\n");
+        }
     } else if (strcmp(cmd, "clear") == 0) {
         cmd_clear();
     } else if (strcmp(cmd, "kexec") == 0) {

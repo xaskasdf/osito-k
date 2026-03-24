@@ -26,6 +26,7 @@ extern void  pci_enable_bus_master(uint8_t bus, uint8_t dev, uint8_t func);
 
 /* Input injection (input_events.c — mouse) */
 extern void input_post_mouse_move(int16_t dx, int16_t dy);
+extern void input_set_mouse_abs(int32_t abs_x, int32_t abs_y);
 extern void input_post_mouse_button(uint8_t buttons);
 
 /* Keyboard injection (keyboard.c — weak: works without PS/2 driver) */
@@ -463,20 +464,27 @@ static void evt_poll(xhci_hc_t *hc)
                         /* ── Keyboard report (usually 8 bytes) ── */
                         usb_kbd_handle_report(dev, r, actual);
                     } else if (actual >= 3) {
-                        /* ── Mouse report (3-6 bytes) ── */
+                        /* ── Mouse/tablet report (3-6 bytes) ── */
                         uint8_t buttons = r[0] & 0x07;
-                        int16_t dx, dy;
 
-                        if (actual >= 6) {
-                            dx = (int16_t)(r[1] | (r[2] << 8));
-                            dy = (int16_t)(r[3] | (r[4] << 8));
+                        if (actual >= 6 && dev->hid_protocol != 2) {
+                            /* USB tablet: 16-bit absolute coordinates (0-32767) */
+                            int32_t ax = (int32_t)(uint16_t)(r[1] | (r[2] << 8));
+                            int32_t ay = (int32_t)(uint16_t)(r[3] | (r[4] << 8));
+                            input_set_mouse_abs(ax, ay);
+                        } else if (actual >= 6) {
+                            /* 6-byte relative mouse */
+                            int16_t dx = (int16_t)(r[1] | (r[2] << 8));
+                            int16_t dy = (int16_t)(r[3] | (r[4] << 8));
+                            if (dx != 0 || dy != 0)
+                                input_post_mouse_move(dx, dy);
                         } else {
-                            dx = (int8_t)r[1];
-                            dy = (int8_t)r[2];
+                            /* 3-byte relative mouse */
+                            int16_t dx = (int8_t)r[1];
+                            int16_t dy = (int8_t)r[2];
+                            if (dx != 0 || dy != 0)
+                                input_post_mouse_move(dx, dy);
                         }
-
-                        if (dx != 0 || dy != 0)
-                            input_post_mouse_move(dx, dy);
                         input_post_mouse_button(buttons);
                     }
 
@@ -970,8 +978,8 @@ static void enumerate_port(xhci_hc_t *hc, int port)
                 serial_putdec(iproto);
                 serial_puts(")\n");
 
-                /* Prefer keyboard (proto=1) or mouse (proto=2) over generic. */
-                if (iproto == 1 || iproto == 2 || hid_iface == 0xFF) {
+                /* Accept keyboard (proto=1), mouse (proto=2), or tablet (proto=0 with HID class). */
+                if (iproto == 1 || iproto == 2 || iproto == 0 || hid_iface == 0xFF) {
                     hid_iface = this_iface;
                     hid_proto = iproto;
                     int_ep_addr = 0; /* reset EP — pick from THIS interface */
@@ -1141,7 +1149,8 @@ static void enumerate_port(xhci_hc_t *hc, int port)
     hc->num_devices++;
 
     const char *kind = (hid_proto == 1) ? "keyboard" :
-                       (hid_proto == 2) ? "mouse" : "HID";
+                       (hid_proto == 2) ? "mouse" :
+                       (hid_proto == 0) ? "tablet" : "HID";
     serial_puts("[xHCI] HID ");
     serial_puts(kind);
     serial_puts(" active on slot ");

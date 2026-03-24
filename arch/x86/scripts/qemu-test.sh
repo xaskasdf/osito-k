@@ -39,6 +39,25 @@ if [ -z "$OVMF" ] && [ -f /usr/share/OVMF/OVMF_CODE_4M.fd ]; then
     OVMF_PFLASH=1
 fi
 
+# macOS: Homebrew QEMU ships edk2 split firmware
+if [ -z "$OVMF" ]; then
+    QEMU_SHARE="$(qemu-system-x86_64 --version 2>/dev/null | head -1 | sed 's/.*version //')"
+    for d in /usr/local/Cellar/qemu/*/share/qemu \
+             /opt/homebrew/Cellar/qemu/*/share/qemu \
+             /opt/homebrew/share/qemu \
+             /usr/local/share/qemu; do
+        if [ -f "$d/edk2-x86_64-code.fd" ]; then
+            OVMF="$d/edk2-x86_64-code.fd"
+            # Use i386-vars (compatible with x86_64) or x86_64-specific if present
+            for varfile in "$d/edk2-i386-vars.fd" "$d/edk2-x86_64-vars.fd"; do
+                [ -f "$varfile" ] && OVMF_VARS="$varfile" && break
+            done
+            OVMF_PFLASH=1
+            break
+        fi
+    done
+fi
+
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 CYAN='\033[0;36m'
@@ -57,7 +76,19 @@ command -v mtools >/dev/null 2>&1 || command -v mcopy >/dev/null 2>&1 || error "
 
 if [ "$1" != "--no-build" ]; then
     info "Building boot.efi + kernel.elf..."
-    make -C "$X86_DIR" -j$(nproc) 2>&1 | tail -5
+    # On macOS, use cross-compiler and macOS gnu-efi paths
+    if [ "$(uname)" = "Darwin" ]; then
+        GNU_EFI="/private/tmp/gnu-efi"
+        make -C "$X86_DIR" -j$(sysctl -n hw.ncpu) \
+            CC=x86_64-elf-gcc LD=x86_64-elf-ld OBJCOPY=x86_64-elf-objcopy \
+            EFI_INC="$GNU_EFI/inc" EFI_INC_ARCH="$GNU_EFI/inc/x86_64" \
+            EFI_LIB="$GNU_EFI/x86_64/lib" \
+            EFI_CRT="$GNU_EFI/x86_64/gnuefi/crt0-efi-x86_64.o" \
+            EFI_LDS="$GNU_EFI/gnuefi/elf_x86_64_efi.lds" \
+            2>&1 | tail -5
+    else
+        make -C "$X86_DIR" -j$(nproc) 2>&1 | tail -5
+    fi
 fi
 
 [ -f "$EFI_BIN" ]  || error "boot.efi not found at $EFI_BIN"
@@ -72,8 +103,12 @@ mmd -i "$ESP_IMG" ::/EFI
 mmd -i "$ESP_IMG" ::/EFI/BOOT
 mcopy -i "$ESP_IMG" "$EFI_BIN" ::/EFI/BOOT/BOOTX64.EFI
 mcopy -i "$ESP_IMG" "$KERN_BIN" ::/EFI/BOOT/kernel.elf
+# startup.nsh: auto-boot via UEFI Shell (needed when VARS lacks boot order)
+printf 'FS0:\\EFI\\BOOT\\BOOTX64.EFI\r\n' > /tmp/startup.nsh
+mcopy -i "$ESP_IMG" /tmp/startup.nsh ::/startup.nsh
 
-info "ESP image: boot.efi=$(stat -c%s "$EFI_BIN") kernel.elf=$(stat -c%s "$KERN_BIN")"
+FSIZE() { stat -c%s "$1" 2>/dev/null || stat -f%z "$1" 2>/dev/null || wc -c < "$1"; }
+info "ESP image: boot.efi=$(FSIZE "$EFI_BIN") kernel.elf=$(FSIZE "$KERN_BIN")"
 
 # ── Launch QEMU ──────────────────────────────────────────────
 
@@ -107,8 +142,16 @@ info "  (tail -f $SERIAL_LOG to watch)"
 NVME_IMG="$BUILD_DIR/nvme.img"
 NVME_ARGS=""
 if [ -f "$NVME_IMG" ]; then
-    info "NVMe disk: $NVME_IMG ($(stat -c%s "$NVME_IMG") bytes)"
+    info "NVMe disk: $NVME_IMG ($(FSIZE "$NVME_IMG") bytes)"
     NVME_ARGS="-drive file=$NVME_IMG,format=raw,if=none,id=nvme0,cache=none -device nvme,serial=deadbeef,drive=nvme0"
+fi
+
+# Display: cocoa native window on macOS, VNC fallback on Linux
+if [ "$(uname)" = "Darwin" ]; then
+    DISPLAY_ARGS="-display cocoa,zoom-to-fit=off"
+    info "Display: native macOS window (cocoa)"
+else
+    DISPLAY_ARGS="-vnc :0,password=on"
 fi
 
 qemu-system-x86_64 \
@@ -126,17 +169,9 @@ qemu-system-x86_64 \
     -audiodev wav,id=wav0,path=$BUILD_DIR/audio.wav \
     -device intel-hda,id=hda0 \
     -device hda-duplex,id=snd0,audiodev=wav0 \
-    -vnc :0,password=on \
+    $DISPLAY_ARGS \
     -serial file:"$SERIAL_LOG" \
     -monitor unix:/tmp/qemu-monitor.sock,server,nowait \
-    -no-reboot &
+    -no-reboot
 
-QEMU_PID=$!
-sleep 1
-
-# Set VNC password via QEMU monitor
-echo "change vnc password osito" | socat - UNIX-CONNECT:/tmp/qemu-monitor.sock 2>/dev/null
-info "VNC: connect to $(hostname -I | awk '{print $1}'):5900 (password: osito)"
-info "  macOS: open vnc://\$(hostname -I | awk '{print \$1}'):5900"
-
-wait $QEMU_PID
+wait
