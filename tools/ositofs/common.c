@@ -11,7 +11,9 @@
 #include <unistd.h>
 #include <errno.h>
 #include <sys/ioctl.h>
+#ifdef __linux__
 #include <linux/fs.h>
+#endif
 #include <time.h>
 
 #include "common.h"
@@ -20,7 +22,10 @@
 
 int osfs2_open_device(const char *path, int readonly)
 {
-    int flags = (readonly ? O_RDONLY : O_RDWR) | O_DIRECT;
+    int flags = (readonly ? O_RDONLY : O_RDWR);
+#ifdef O_DIRECT
+    flags |= O_DIRECT;
+#endif
     int fd = open(path, flags);
     if (fd < 0) {
         fprintf(stderr, "osfs2: cannot open %s: %s\n", path, strerror(errno));
@@ -127,7 +132,11 @@ int osfs2_read_super(int fd, osfs2_super_t *sb)
 uint64_t osfs2_device_size(int fd)
 {
     uint64_t size = 0;
+#ifdef BLKGETSIZE64
     if (ioctl(fd, BLKGETSIZE64, &size) < 0) {
+#else
+    {
+#endif
         /* Might be a regular file */
         off_t pos = lseek(fd, 0, SEEK_END);
         if (pos < 0) return 0;
