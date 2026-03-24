@@ -196,6 +196,7 @@ void gui_desktop_init(uint32_t screen_w, uint32_t screen_h);
 void gui_desktop_render(gui_surface_t *screen);
 gui_win_desc_t *gui_desktop_get_windows(int *count);
 void gui_desktop_raise_window(int idx);
+void gui_desktop_show_window(int idx);   /* raise + restore if closed */
 int *gui_desktop_get_order(void);
 
 /* Register the terminal shm pixel buffer so gui_desktop blits it at the

@@ -207,6 +207,7 @@ void gui_rounded_rect_aa(gui_surface_t *s, int32_t x, int32_t y,
     if (r > h / 2) r = h / 2;
 
     uint32_t src_a = (color >> 24) & 0xFF;
+    if (src_a == 0) return;
     uint32_t rgb   = color & 0x00FFFFFF;
     int32_t r_fp8  = r << 8;  /* r in fixed-point */
 
@@ -280,26 +281,12 @@ void gui_box_shadow(gui_surface_t *s, int32_t x, int32_t y,
         gui_rounded_rect_alpha(s, x + offset_x, y + offset_y, w, h, 4, color);
         return;
     }
-    uint32_t base_alpha = (color >> 24) & 0xFF;
-    uint32_t rgb = color & 0x00FFFFFF;
-
-    /* Render N concentric expanding layers with exponentially decaying alpha */
-    for (int32_t i = blur; i >= 0; i--) {
-        int32_t expand = blur - i;
-        /* Alpha decays quadratically: outer layers get very little alpha */
-        int32_t weight = (i * i + i) / 2 + 1;        /* triangular-ish */
-        int32_t total  = (blur * blur + blur) / 2 + 1;
-        uint32_t a = (uint32_t)((uint64_t)base_alpha * weight / total);
-        if (a == 0) continue;
-
-        int32_t ex = x + offset_x - expand;
-        int32_t ey = y + offset_y - expand;
-        int32_t ew = w + 2 * expand;
-        int32_t eh = h + 2 * expand;
-        int32_t er = GUI_CORNER_RADIUS + expand;
-
-        gui_rounded_rect_alpha(s, ex, ey, ew, eh, er, (a << 24) | rgb);
-    }
+    /* Single-layer fast shadow: one expanded rounded rect.
+     * ~15x faster than the old multi-layer loop (was 15 passes → 1). */
+    int32_t expand = blur / 2;
+    int32_t er = GUI_CORNER_RADIUS + expand;
+    gui_rounded_rect_alpha(s, x + offset_x - expand, y + offset_y - expand,
+                           w + 2 * expand, h + 2 * expand, er, color);
 }
 
 /* ── Phase 2.7: Horizontal gradient ───────────────────────── */

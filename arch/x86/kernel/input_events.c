@@ -219,6 +219,7 @@ int input_drain_coalesced(int16_t *out_mouse_dx, int16_t *out_mouse_dy,
     int key_count = 0;
     int32_t mdx = 0, mdy = 0;
     int32_t wheel_accum = 0;
+    uint8_t btn_pressed_accum = 0;
     *out_buttons = mouse_buttons;
 
     while (input_tail != input_head) {
@@ -232,6 +233,9 @@ int input_drain_coalesced(int16_t *out_mouse_dx, int16_t *out_mouse_dy,
             mdy += e->dy;
             break;
         case INPUT_MOUSE_BTN:
+            /* Accumulate any transient press so a click within one frame
+             * isn't lost when the release also arrives in the same drain. */
+            btn_pressed_accum |= (e->buttons & ~(*out_buttons));
             *out_buttons = e->buttons;
             break;
         case INPUT_KEY_DOWN:
@@ -247,6 +251,9 @@ int input_drain_coalesced(int16_t *out_mouse_dx, int16_t *out_mouse_dy,
             break;
         }
     }
+
+    /* Re-assert any button pressed then released within this frame */
+    *out_buttons |= btn_pressed_accum;
 
     *out_mouse_dx = (int16_t)mdx;
     *out_mouse_dy = (int16_t)mdy;

@@ -444,8 +444,8 @@ void __builtin_unreachable(void)
     for (;;) __asm__ volatile("hlt");
 }
 
-/* proc_set_qos — stub (full implementation in scheduler, not yet linked) */
+extern int sched_set_qos(uint32_t pid, uint8_t qos);
 void proc_set_qos(uint8_t qos)
 {
-    (void)qos;
+    sched_set_qos(0, qos);  /* 0 = current process */
 }

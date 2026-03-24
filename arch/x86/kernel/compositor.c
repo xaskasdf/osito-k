@@ -563,7 +563,7 @@ static void process_mouse_input(void)
                 int count2;
                 gui_desktop_get_windows(&count2);
                 if (dock_hit < count2) {
-                    gui_desktop_raise_window(dock_hit);
+                    gui_desktop_show_window(dock_hit);
                     focused_demo_idx = dock_hit;
                     serial_puts("[COMP] Dock icon="); serial_putdec((uint64_t)dock_hit);
                     serial_puts(" raised\n");
@@ -851,12 +851,6 @@ void compositor_thread(void)
 
         /* 4. Flip (waits for VBlank) */
         display_flip();
-
-        /* Yield after each frame so shell/other threads get CPU time.
-         * Without this, IST-fix round-robin gives shell CPU only every
-         * 5 timer ticks (50ms); yield gives it every frame (~16ms). */
-        extern void sched_yield(void);
-        sched_yield();
 
         comp_frames++;
     }

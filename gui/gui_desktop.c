@@ -56,6 +56,9 @@ static gui_win_desc_t demo_windows[2];
 #define NUM_DEMO_WINDOWS 2
 static int demo_order[NUM_DEMO_WINDOWS] = {0, 1}; /* render order: last = on top */
 
+/* Initial geometry for each window — used to restore after close */
+static int32_t init_geom[NUM_DEMO_WINDOWS][4];  /* x, y, w, h */
+
 void gui_desktop_init(uint32_t screen_w, uint32_t screen_h)
 {
     scr_w = screen_w;
@@ -73,6 +76,8 @@ void gui_desktop_init(uint32_t screen_w, uint32_t screen_h)
     demo_windows[0].h = mh;
     demo_windows[0].title = "Terminal";
     demo_windows[0].content_color = 0xFF1A1A2E;  /* Dark terminal blue */
+    init_geom[0][0] = mx; init_geom[0][1] = my;
+    init_geom[0][2] = mw; init_geom[0][3] = mh;
 
     /* Secondary window: "System Info" — smaller, offset */
     int32_t sw = (int32_t)(screen_w * 2 / 5);
@@ -91,6 +96,8 @@ void gui_desktop_init(uint32_t screen_w, uint32_t screen_h)
     demo_windows[1].h = sh;
     demo_windows[1].title = "System Info";
     demo_windows[1].content_color = GUI_WINDOW_BG;
+    init_geom[1][0] = sx; init_geom[1][1] = sy;
+    init_geom[1][2] = sw; init_geom[1][3] = sh;
 }
 
 /* ── Per-window content rendering ─────────────────────────── */
@@ -129,8 +136,7 @@ static void render_window_content(gui_surface_t *screen, int idx)
                     const uint32_t *s = term_surface_px
                                         + (uint32_t)(sy + row) * term_surface_w
                                         + (uint32_t)sx;
-                    for (int32_t col = 0; col < bw; col++)
-                        d[col] = s[col];
+                    memcpy(d, s, (uint32_t)bw * 4);
                 }
             }
         }
@@ -212,6 +218,21 @@ void gui_desktop_raise_window(int idx)
     for (int i = pos; i < NUM_DEMO_WINDOWS - 1; i++)
         demo_order[i] = demo_order[i + 1];
     demo_order[NUM_DEMO_WINDOWS - 1] = idx;
+}
+
+/* Dock action: restore window to initial position if closed, then raise.
+ * "Closed" = moved offscreen via the X button (x < -1000). */
+void gui_desktop_show_window(int idx)
+{
+    if (idx < 0 || idx >= NUM_DEMO_WINDOWS) return;
+    gui_win_desc_t *w = &demo_windows[idx];
+    if (w->x < -1000) {
+        w->x = init_geom[idx][0];
+        w->y = init_geom[idx][1];
+        w->w = init_geom[idx][2];
+        w->h = init_geom[idx][3];
+    }
+    gui_desktop_raise_window(idx);
 }
 
 int *gui_desktop_get_order(void)

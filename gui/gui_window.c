@@ -42,10 +42,6 @@ void gui_window_render(gui_surface_t *s, const gui_win_desc_t *win, bool focused
     /* ── Content area ─────────────────────────────────────── */
     gui_fill_rect(s, fx, fy + GUI_TITLEBAR_H, fw, win->h, win->content_color);
 
-    /* ── Bottom rounded corners (border mask) ─────────────── */
-    gui_rounded_rect_aa(s, fx - 1, fy - 1, fw + 2, fh + 2,
-                        GUI_CORNER_RADIUS + 1, 0x00000000);  /* noop (just redraw border) */
-
     /* ── Traffic-light buttons (Phase 2 AA) ───────────────── */
     int32_t btn_y = fy + GUI_TITLEBAR_H / 2;
     int32_t btn_x = fx + 14;
