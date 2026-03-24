@@ -426,7 +426,12 @@ static void cmd_exec(int argc, char *argv[])
     sh_puts(argv[1]);
     sh_puts("\n");
 
-    proc_exec(argv[1], argc - 1, (const char **)(argv + 1));
+    int ret = proc_exec(argv[1], argc - 1, (const char **)(argv + 1));
+    if (ret != 0) {
+        sh_puts_color("[exec] exited with code ", 0x00FF4444);
+        sh_putdec((uint64_t)(ret < 0 ? (uint64_t)(-(int64_t)ret) : (uint64_t)ret));
+        sh_puts("\n");
+    }
 }
 
 /* ── Builtin: cc (compile C with TCC) ────────────────────────── */
