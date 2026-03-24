@@ -15,9 +15,8 @@ typedef struct {
 } dock_item_t;
 
 static const dock_item_t dock_items[] = {
-    { GUI_MAXIMIZE,  'T' },   /* Terminal (green) */
-    { GUI_ACCENT,    'F' },   /* Files (blue) */
-    { 0xFF808080,    'S' },   /* Settings (gray) */
+    { GUI_MAXIMIZE,  'T' },   /* Terminal (green) — window 0 */
+    { GUI_ACCENT,    'I' },   /* System Info (blue) — window 1 */
 };
 
 #define DOCK_ITEM_COUNT  (sizeof(dock_items) / sizeof(dock_items[0]))

@@ -11,10 +11,12 @@
 /* ── External functions ──────────────────────────────────────── */
 
 extern void serial_puts(const char *s);
-extern void serial_puthex(uint64_t val, int digits);
 
 /* xHCI USB polling (weak: works without xHCI driver) */
 extern void xhci_poll(void) __attribute__((weak));
+
+/* Compositor state (weak: absent if compositor not compiled) */
+extern bool compositor_is_running(void) __attribute__((weak));
 
 /* ── PS/2 ports ──────────────────────────────────────────────── */
 
@@ -85,6 +87,11 @@ void kb_push(char c)
     uint32_t next = (kb_head + 1) % KB_BUF_SIZE;
     if (next != kb_tail) {  /* Not full */
         kb_buf[kb_head] = c;
+        /* MFENCE: (1) "memory" clobber = compiler barrier (ensures buf write is
+         * not reordered past head advance by GCC optimizer); (2) MFENCE opcode =
+         * hardware full fence, translated by QEMU TCG to ARM DMB ISH, which
+         * gives cross-vCPU store visibility on Apple Silicon MTTCG host. */
+        __asm__ volatile ("mfence" ::: "memory");
         kb_head = next;
     }
 }
@@ -101,12 +108,10 @@ void kb_push_esc(const char *seq)
     while (*seq) kb_push(*seq++);
 }
 
-/* ── IRQ 1 handler (called from IDT vector 33) ──────────────── */
+/* ── Core scancode processing (shared by IRQ and inject) ─────── */
 
-void keyboard_irq(void)
+static void kb_process_scancode(uint8_t sc)
 {
-    uint8_t sc = inb(KB_DATA_PORT);
-
     /* Extended scancode prefix — set flag and wait for next byte */
     if (sc == 0xE0) {
         kb_extended = true;
@@ -169,10 +174,6 @@ void keyboard_irq(void)
         break;
     }
 
-    /* ── NEW: Post raw event to the input system for games (Doom) ── */
-    extern void input_post_key(uint8_t scancode, bool pressed, bool extended);
-    input_post_key(sc & 0x7F, !(sc & 0x80), kb_extended);
-
     /* Ignore key releases for the ASCII buffer (bit 7 set) */
     if (sc & 0x80) return;
 
@@ -202,15 +203,44 @@ void keyboard_irq(void)
     if (c) kb_push(c);
 }
 
+/* ── IRQ 1 handler (called from IDT vector 33) ──────────────── */
+
+void keyboard_irq(void)
+{
+    uint8_t sc = inb(KB_DATA_PORT);
+    /* Post to input event system for USB games / compositor key_ring.
+     * Only from hardware IRQ — kb_inject_scancode must NOT re-post
+     * or we get an infinite loop. Skip 0xE0 prefix byte. */
+    if (sc != 0xE0) {
+        extern void input_post_key(uint8_t scancode, bool pressed, bool extended);
+        input_post_key(sc & 0x7F, !(sc & 0x80), false);
+    }
+    kb_process_scancode(sc);
+}
+
+/* ── Inject scancode from compositor (no I/O port read) ──────── */
+
+void kb_inject_scancode(uint8_t sc)
+{
+    kb_process_scancode(sc);
+}
+
 /* ── Public API ──────────────────────────────────────────────── */
 
 /* Read one character (blocking) */
 char kb_getchar(void)
 {
     while (kb_head == kb_tail) {
-        if (xhci_poll) xhci_poll();  /* Poll USB HID devices */
+        /* Only poll USB directly when compositor isn't running.
+         * Concurrent xhci_poll() between compositor and shell threads
+         * corrupts USB endpoint state → kb_push() never fires.
+         * When compositor runs, it calls xhci_poll() every frame and
+         * pushes chars via kb_push(); shell just waits for HLT to wake. */
+        if (!(compositor_is_running && compositor_is_running())) {
+            if (xhci_poll) xhci_poll();
+        }
         if (kb_head != kb_tail) break;
-        __asm__ volatile ("hlt");  /* Wait for IRQ */
+        __asm__ volatile ("hlt");  /* Wait for IRQ or next timer tick */
     }
 
     char c = kb_buf[kb_tail];
@@ -232,6 +262,8 @@ bool kb_has_input(void)
 {
     return kb_head != kb_tail;
 }
+
+/* Diagnostic getters (safe to call from any thread context) */
 
 /* ── Initialize keyboard ────────────────────────────────────── */
 

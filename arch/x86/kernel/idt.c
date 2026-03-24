@@ -760,7 +760,7 @@ void isr_handler(interrupt_frame_t *frame)
         uint64_t dr6;
         __asm__ volatile ("mov %%dr6, %0" : "=r"(dr6));
 
-        if (dr6 & 0x1) {  /* B0: breakpoint 0 hit */
+        if (dr6 & 0x1) {  /* B0: breakpoint 0 hit (dd_vtbl32) */
             uint64_t dr0;
             __asm__ volatile ("mov %%dr0, %0" : "=r"(dr0));
             uint32_t val = *(volatile uint32_t *)dr0;
@@ -774,6 +774,26 @@ void isr_handler(interrupt_frame_t *frame)
             }
             db_hit_count++;
 
+            __asm__ volatile ("mov %0, %%dr6" : : "r"((uint64_t)0));
+            return;
+        }
+
+        if (dr6 & 0x2) {  /* B1: breakpoint 1 hit (GIsCriticalError) */
+            static int gcrit_hits = 0;
+            volatile uint32_t *gcrit = (volatile uint32_t *)(uintptr_t)0x101E568C;
+            uint32_t val = *gcrit;
+            if (val != 0 && gcrit_hits < 30) {
+                serial_puts("[GCrit-WP] SET to ");
+                serial_putdec(val);
+                serial_puts(" RIP=0x");
+                serial_puthex((uint32_t)frame->rip, 8);
+                serial_puts(" CS=0x");
+                serial_puthex(frame->cs & 0xFFFF, 4);
+                serial_puts("\n");
+                /* Force it back to 0 */
+                *gcrit = 0;
+            }
+            gcrit_hits++;
             __asm__ volatile ("mov %0, %%dr6" : : "r"((uint64_t)0));
             return;
         }
@@ -936,6 +956,20 @@ void isr_handler(interrupt_frame_t *frame)
                         frame->rbp = g_compat32_unwind_ebp;
                         g_compat32_unwind_eip = 0;
                         g_compat32_unwind_ebp = 0;
+                    }
+                    /* Clear GErrorHist + GIsCriticalError after SEH dispatch.
+                     * The engine's SEH handler sets these during exception
+                     * processing, but null-object writes during init are
+                     * expected (Windows lets them through). If we leave
+                     * GIsCriticalError set, Browse() bails before loading
+                     * any map file. */
+                    volatile uint16_t *gerr = (volatile uint16_t *)(uintptr_t)0x101E3474;
+                    volatile uint32_t *gcrit = (volatile uint32_t *)(uintptr_t)0x101E568C;
+                    if (*gerr != 0 || *gcrit != 0) {
+                        *gerr = 0;
+                        *gcrit = 0;
+                        if (nw_seh_count <= 5)
+                            serial_puts("[NULL-WRITE-SEH] cleared GErrorHist\n");
                     }
                     return;
                 }
@@ -1456,10 +1490,10 @@ static void apic_init(void)
 
     /* Set initial count — calibrate roughly:
      * APIC timer frequency = bus_freq / divider
-     * We want ~100 Hz. On most systems bus freq ~100-200 MHz.
-     * With div=16: timer_freq ~6-12 MHz. For 100 Hz: count ~60000-120000.
-     * Start with 100000 — will be refined with PIT calibration later. */
-    apic_write(APIC_TIMER_INIT, 100000);
+     * We want ~100 Hz. QEMU virtual bus ~1 GHz, div=16 → timer_freq ~62.5 MHz.
+     * For 100 Hz: count = 62.5M / 100 = 625000.
+     * Real hardware will need PIT calibration (TODO). */
+    apic_write(APIC_TIMER_INIT, 625000);
 
     apic_enabled = true;
 
@@ -1525,7 +1559,9 @@ void idt_init(void)
     idt[6].ist  = 1;  /* #UD — invalid opcode (corrupted function pointer) */
     idt[13].ist = 1;  /* #GP — general protection */
     idt[14].ist = 1;  /* #PF — page fault (null-page write handling) */
-    idt[32].ist = 2;  /* APIC timer — IST2 for safe compat32 preemption */
+    /* idt[32].ist intentionally 0: timer uses current process stack so
+     * kernel_rsp is unique per-process → context switch works correctly.
+     * compat32 ring-0 RSP is always a valid 64-bit kernel address, safe. */
 
     /* Override: vector 0x71 = keyboard IRQ (uses isr_stub_33) */
     idt_set_entry(0x71, isr_stub_33, 0);

@@ -46,9 +46,31 @@ extern void   *shm_map(uint32_t handle);
 extern void    shm_unmap(uint32_t handle);
 extern uint64_t shm_get_phys(uint32_t handle);
 
-/* Scheduler (process.c) */
+/* Scheduler / process (process.c) */
 extern void proc_set_qos(uint8_t qos);
 extern uint64_t idt_get_ticks(void);
+extern uint32_t proc_count_active(void);
+
+/* USB HID polling (xhci.c — weak: absent if no xHCI) */
+extern void xhci_poll(void) __attribute__((weak));
+
+
+/* ── CMOS RTC helpers ──────────────────────────────────────── */
+
+static inline uint8_t cmos_read(uint8_t reg)
+{
+    __asm__ volatile ("outb %0, %1" : : "a"(reg), "Nd"((uint16_t)0x70));
+    uint8_t val;
+    __asm__ volatile ("inb %1, %0" : "=a"(val) : "Nd"((uint16_t)0x71));
+    return val;
+}
+
+static inline uint8_t bcd2bin(uint8_t v) { return (v >> 4) * 10 + (v & 0x0F); }
+
+/* Memory (memory.c) */
+extern uint64_t mem_get_free(void);
+extern uint64_t mem_get_used(void);
+extern uint64_t mem_get_total(void);
 
 #define QOS_INTERACTIVE 3
 
@@ -90,19 +112,44 @@ static int32_t  focused_window = -1;  /* index into windows[] */
 static int render_order[MAX_WINDOWS];
 static int render_count;
 
+/* Mouse interaction state */
+static bool     dragging;
+static int32_t  drag_win_idx;       /* index into demo_windows[] */
+static int32_t  drag_off_x, drag_off_y;
+static uint8_t  prev_buttons;
+static int      focused_demo_idx = -1;  /* -1=none, 0=Terminal */
+
+/* Maximize / restore state (per demo window) */
+static bool    is_maximized[2];
+static int32_t saved_geom[2][4];    /* x, y, w, h before maximize */
+
+/* Alt+Tab state */
+static bool    alt_held;
+
+/* Terminal surface: shm pixel buffer written by the shell thread,
+ * blitted by the compositor over demo_windows[0] content area.
+ * Set once from shell.c after compositor_init() and before the thread starts. */
+static uint32_t  terminal_shm;
+static uint32_t *terminal_pixels;
+static uint32_t  terminal_w;
+static uint32_t  terminal_h;
+
 /* Desktop background now rendered by gui_desktop_render() */
 
-/* Cursor appearance (simple 8×8 white arrow) */
-static const uint8_t cursor_bitmap[8] = {
-    0x80, 0xC0, 0xE0, 0xF0, 0xF8, 0xE0, 0xA0, 0x10
-};
-#define CURSOR_W 8
-#define CURSOR_H 8
-#define CURSOR_COLOR 0xFFFFFFFF
+/* Cursor appearance: 16×16 ARGB pre-rendered arrow with AA outline + shadow.
+ * Built at init time by compositor_init_cursor(). */
+#define CURSOR_W 16
+#define CURSOR_H 16
+static uint32_t cursor_rgba[CURSOR_W * CURSOR_H];
 
 /* Stats */
 static uint64_t comp_frames;
 static uint64_t comp_direct_scanout;
+
+/* FPS tracking (updated once per second via APIC ticks @ 100Hz) */
+static uint64_t fps_last_tick;
+static uint64_t fps_frame_count;
+static uint64_t fps_display;  /* last computed FPS value */
 
 /* ── Keyboard Ring Buffer (for user32_shim consumption) ──────── */
 
@@ -281,23 +328,353 @@ static void blit_window(uint32_t *dst, uint32_t dst_pitch,
     }
 }
 
+/* ── Build AA cursor (called once at init) ───────────────────── */
+
+/* Pre-render a 16x16 macOS-style arrow cursor with AA outline and shadow.
+ * Arrow shape: tip at (0,0), body going to (0,14) and (10,10) with
+ * a diagonal return stroke. Built via SDF (signed distance field approach). */
+static void compositor_init_cursor(void)
+{
+    /* Arrow defined as fill mask: pixel (x,y) is inside arrow if:
+     *   y >= x  (left edge: diagonal from tip)
+     *   y <= 14 (bottom)
+     *   x <= 10 (right limit of lower triangle at row 10)
+     * Plus return stroke: x + y <= 14 for x >= 5 (approximate) */
+    for (int y = 0; y < CURSOR_H; y++) {
+        for (int x = 0; x < CURSOR_W; x++) {
+            /* Determine if pixel is inside the arrow shape */
+            bool inside = false;
+
+            /* Upper-left triangle: column 0 only (left edge = vertical spine) */
+            if (x == 0 && y <= 13) inside = true;
+            /* Main body: x in [0, y] for y in [0, 10] */
+            if (y <= 10 && x <= y) inside = true;
+            /* Lower triangle: converges at (10, 10) */
+            if (y > 10 && y <= 13 && x <= (13 - y) + 0) {
+                /* Narrow tail between (0,10) and (3,13) */
+                if (x <= 13 - y) inside = true;
+            }
+            /* Diagonal stroke: from (3,10) to (10,3) */
+            if (!inside && y >= 3 && y <= 10 && x >= 3 && x <= 10) {
+                int32_t d = x + y - 13;
+                if (d >= -1 && d <= 1) inside = true;
+            }
+
+            if (!inside) {
+                cursor_rgba[y * CURSOR_W + x] = 0x00000000;
+                continue;
+            }
+
+            /* Check if this is an edge pixel (has a transparent neighbor) */
+            bool edge = false;
+            if (x == 0 || y == 0 || x == CURSOR_W - 1 || y == CURSOR_H - 1)
+                edge = true;
+            else {
+                /* Simplified edge detection: check 4 neighbors */
+                bool n_inside[4];
+                int nx[4] = {x-1, x+1, x, x};
+                int ny[4] = {y, y, y-1, y+1};
+                for (int k = 0; k < 4; k++) {
+                    int bx = nx[k], by = ny[k];
+                    bool bi = false;
+                    if (bx == 0 && by <= 13) bi = true;
+                    if (by <= 10 && bx <= by) bi = true;
+                    if (by > 10 && by <= 13 && bx <= 13 - by) bi = true;
+                    if (!bi && by >= 3 && by <= 10 && bx >= 3 && bx <= 10) {
+                        int32_t d = bx + by - 13;
+                        if (d >= -1 && d <= 1) bi = true;
+                    }
+                    n_inside[k] = bi;
+                }
+                for (int k = 0; k < 4; k++)
+                    if (!n_inside[k]) { edge = true; break; }
+            }
+
+            if (edge) {
+                /* Outline: black semi-transparent */
+                cursor_rgba[y * CURSOR_W + x] = 0xCC000000;
+            } else {
+                /* Interior: white */
+                cursor_rgba[y * CURSOR_W + x] = 0xFFFFFFFF;
+            }
+        }
+    }
+}
+
 /* ── Draw Cursor ─────────────────────────────────────────────── */
+
+static inline uint32_t cursor_blend(uint32_t dst, uint32_t src)
+{
+    uint32_t a = src >> 24;
+    if (a == 0) return dst;
+    if (a == 0xFF) return src;
+    uint32_t inv = 255 - a;
+    uint32_t rb = (((src & 0x00FF00FF) * a + (dst & 0x00FF00FF) * inv) >> 8) & 0x00FF00FF;
+    uint32_t g  = (((src & 0x0000FF00) * a + (dst & 0x0000FF00) * inv) >> 8) & 0x0000FF00;
+    return 0xFF000000 | rb | g;
+}
 
 static void draw_cursor(uint32_t *dst, uint32_t pitch,
                         uint32_t scr_w, uint32_t scr_h,
                         int32_t cx, int32_t cy)
 {
+    /* Shadow pass: draw cursor pixels shifted (1,1) with reduced alpha */
+    for (int y = 0; y < CURSOR_H; y++) {
+        int32_t sy = cy + y + 1;
+        if (sy < 0 || sy >= (int32_t)scr_h) continue;
+        for (int x = 0; x < CURSOR_W; x++) {
+            int32_t sx = cx + x + 1;
+            if (sx < 0 || sx >= (int32_t)scr_w) continue;
+            uint32_t src = cursor_rgba[y * CURSOR_W + x];
+            uint32_t a = (src >> 24);
+            if (a == 0) continue;
+            uint32_t shadow = ((a >> 2) << 24); /* 25% alpha shadow */
+            uint32_t *p = &dst[(uint32_t)sy * pitch + (uint32_t)sx];
+            *p = cursor_blend(*p, shadow);
+        }
+    }
+
+    /* Main cursor pass */
     for (int y = 0; y < CURSOR_H; y++) {
         int32_t py = cy + y;
         if (py < 0 || py >= (int32_t)scr_h) continue;
-        uint8_t bits = cursor_bitmap[y];
         for (int x = 0; x < CURSOR_W; x++) {
-            if (!(bits & (0x80 >> x))) continue;
             int32_t px = cx + x;
             if (px < 0 || px >= (int32_t)scr_w) continue;
-            dst[(uint32_t)py * pitch + (uint32_t)px] = CURSOR_COLOR;
+            uint32_t src = cursor_rgba[y * CURSOR_W + x];
+            if ((src >> 24) == 0) continue;
+            uint32_t *p = &dst[(uint32_t)py * pitch + (uint32_t)px];
+            *p = cursor_blend(*p, src);
         }
     }
+}
+
+/* ── Hit-testing for demo windows ─────────────────────────────── */
+
+/* Check if point (mx,my) is inside a demo window (including titlebar).
+ * Returns window index into demo_windows[], checking top-to-bottom in render order. */
+static int hit_test_demo_window(int32_t mx, int32_t my)
+{
+    int count = 0;
+    gui_win_desc_t *dw = gui_desktop_get_windows(&count);
+    int *order = gui_desktop_get_order();
+
+    /* Check front-to-back (last in order = on top → check first) */
+    for (int i = count - 1; i >= 0; i--) {
+        int idx = order[i];
+        int32_t wx = dw[idx].x;
+        int32_t wy = dw[idx].y;
+        int32_t ww = dw[idx].w + GUI_BORDER_W * 2;
+        int32_t wh = dw[idx].h + GUI_TITLEBAR_H + GUI_BORDER_W * 2;
+        if (mx >= wx && mx < wx + ww && my >= wy && my < wy + wh)
+            return idx;
+    }
+    return -1;
+}
+
+/* Check if point hits a traffic-light button. Returns 1=close, 2=min, 3=max, 0=none */
+static int hit_test_buttons(gui_win_desc_t *w, int32_t mx, int32_t my)
+{
+    /* Button centers relative to window frame */
+    int32_t by = w->y + GUI_TITLEBAR_H / 2;
+    int32_t bx[3];
+    bx[0] = w->x + 14;           /* close */
+    bx[1] = bx[0] + GUI_BTN_RADIUS * 2 + 6; /* minimize */
+    bx[2] = bx[1] + GUI_BTN_RADIUS * 2 + 6; /* maximize */
+
+    for (int i = 0; i < 3; i++) {
+        int32_t dx = mx - bx[i];
+        int32_t dy = my - by;
+        if (dx * dx + dy * dy <= (GUI_BTN_RADIUS + 2) * (GUI_BTN_RADIUS + 2))
+            return i + 1;
+    }
+    return 0;
+}
+
+/* Hit-test the dock.
+ * Returns:
+ *   >= 0  : dock icon index (0, 1, 2, ...)
+ *   -2    : inside dock bounds but not on an icon (padding area) → consume click
+ *   -1    : completely outside dock → fall through to window hit test
+ *
+ * Geometry matches gui_dock_render() exactly. */
+static int hit_test_dock(int32_t mx, int32_t my)
+{
+    uint32_t scr_w = display_get_width();
+    uint32_t scr_h = display_get_height();
+    int32_t item_slot = GUI_DOCK_ICON_SIZE + GUI_DOCK_PADDING;
+    int32_t dock_w = 2 * item_slot + GUI_DOCK_PADDING;  /* 2 icons to match gui_dock.c */
+    int32_t dock_h = GUI_DOCK_HEIGHT;
+    int32_t dock_x = ((int32_t)scr_w - dock_w) / 2;
+    int32_t dock_y = (int32_t)scr_h - dock_h - 8;
+
+    static bool dock_geom_logged = false;
+    if (!dock_geom_logged) {
+        serial_puts("[DOCK] scr="); serial_putdec(scr_w);
+        serial_puts("x"); serial_putdec(scr_h);
+        serial_puts(" dock_x="); serial_putdec((uint64_t)dock_x);
+        serial_puts(" dock_y="); serial_putdec((uint64_t)dock_y);
+        serial_puts(" dock_w="); serial_putdec((uint64_t)dock_w);
+        serial_puts(" dock_h="); serial_putdec((uint64_t)dock_h);
+        serial_puts("\n");
+        dock_geom_logged = true;
+    }
+
+    /* Outside dock area entirely */
+    if (mx < dock_x || mx >= dock_x + dock_w) return -1;
+    if (my < dock_y || my >= dock_y + dock_h) return -1;
+
+    /* Inside dock bounds — check individual icon squares */
+    for (int i = 0; i < 2; i++) {
+        int32_t ix = dock_x + GUI_DOCK_PADDING + i * item_slot;
+        int32_t iy = dock_y + (dock_h - GUI_DOCK_ICON_SIZE) / 2;
+        if (mx >= ix && mx < ix + GUI_DOCK_ICON_SIZE &&
+            my >= iy && my < iy + GUI_DOCK_ICON_SIZE)
+            return i;
+    }
+    /* Inside dock background / padding — consume the click (dock is on top) */
+    return -2;
+}
+
+/* Process mouse clicks on demo windows */
+static void process_mouse_input(void)
+{
+    uint8_t pressed  = comp_button_state & ~prev_buttons;
+    uint8_t released = prev_buttons & ~comp_button_state;
+
+    if (pressed & 1) {  /* left button newly pressed */
+        int32_t cx, cy;
+        input_get_cursor(&cx, &cy);
+
+        serial_puts("[COMP] LMB cx="); serial_putdec((uint64_t)cx);
+        serial_puts(" cy="); serial_putdec((uint64_t)cy);
+        serial_puts("\n");
+
+        /* Check dock first — it renders on top of everything and should
+         * receive clicks even when a window overlaps the dock area.
+         * dock_hit >= 0 → icon index; -2 → dock padding (consume, no action);
+         * -1 → outside dock entirely, fall through to window hit test. */
+        int dock_hit = hit_test_dock(cx, cy);
+        if (dock_hit >= -2 && dock_hit != -1) {
+            if (dock_hit >= 0) {
+                /* Icon click: map icon index → demo_window index.
+                 * Dock icon 0 = Terminal (window 0), icon 1 = Files (window 1).
+                 * Icons beyond the window count are cosmetic only. */
+                int count2;
+                gui_desktop_get_windows(&count2);
+                if (dock_hit < count2) {
+                    gui_desktop_raise_window(dock_hit);
+                    focused_demo_idx = dock_hit;
+                    serial_puts("[COMP] Dock icon="); serial_putdec((uint64_t)dock_hit);
+                    serial_puts(" raised\n");
+                }
+            }
+            prev_buttons = comp_button_state;
+            return;  /* dock consumed the click */
+        }
+
+        int hit = hit_test_demo_window(cx, cy);
+        focused_demo_idx = hit;  /* -1 if missed all windows */
+
+        if (hit >= 0) {
+            int count;
+            gui_win_desc_t *dw = gui_desktop_get_windows(&count);
+
+            /* Check traffic-light buttons first */
+            int btn = hit_test_buttons(&dw[hit], cx, cy);
+            if (btn == 1) {
+                /* Close: hide by moving offscreen (demo windows can't be destroyed) */
+                dw[hit].x = -9999;
+                dw[hit].y = -9999;
+            } else if (btn == 3) {
+                /* Maximize / restore toggle — animated (Phase 3.3) */
+                if (is_maximized[hit]) {
+                    gui_anim_start(&dw[hit].x, saved_geom[hit][0], 280, gui_ease_out_cubic, NULL, NULL);
+                    gui_anim_start(&dw[hit].y, saved_geom[hit][1], 280, gui_ease_out_cubic, NULL, NULL);
+                    gui_anim_start(&dw[hit].w, saved_geom[hit][2], 280, gui_ease_out_cubic, NULL, NULL);
+                    gui_anim_start(&dw[hit].h, saved_geom[hit][3], 280, gui_ease_out_cubic, NULL, NULL);
+                    is_maximized[hit] = false;
+                } else {
+                    saved_geom[hit][0] = dw[hit].x;
+                    saved_geom[hit][1] = dw[hit].y;
+                    saved_geom[hit][2] = dw[hit].w;
+                    saved_geom[hit][3] = dw[hit].h;
+                    gui_anim_start(&dw[hit].x, 0, 300, gui_ease_out_cubic, NULL, NULL);
+                    gui_anim_start(&dw[hit].y, GUI_PANEL_HEIGHT, 300, gui_ease_out_cubic, NULL, NULL);
+                    gui_anim_start(&dw[hit].w, (int32_t)display_get_width(), 300, gui_ease_out_cubic, NULL, NULL);
+                    gui_anim_start(&dw[hit].h, (int32_t)display_get_height() - GUI_PANEL_HEIGHT
+                                              - GUI_DOCK_HEIGHT, 300, gui_ease_out_cubic, NULL, NULL);
+                    is_maximized[hit] = true;
+                }
+            } else if (cy < dw[hit].y + GUI_TITLEBAR_H) {
+                /* Titlebar click → start drag */
+                dragging = true;
+                drag_win_idx = hit;
+                drag_off_x = cx - dw[hit].x;
+                drag_off_y = cy - dw[hit].y;
+            }
+
+            /* Raise clicked window to front (changes render order, not struct data) */
+            gui_desktop_raise_window(hit);
+        }
+    }
+
+    /* Continue drag while button held */
+    if (dragging && (comp_button_state & 1)) {
+        int32_t cx, cy;
+        input_get_cursor(&cx, &cy);
+        int count;
+        gui_win_desc_t *dw = gui_desktop_get_windows(&count);
+        if (drag_win_idx >= 0 && drag_win_idx < count) {
+            dw[drag_win_idx].x = cx - drag_off_x;
+            dw[drag_win_idx].y = cy - drag_off_y;
+        }
+    }
+
+    /* Release */
+    if (released & 1) {
+        dragging = false;
+        drag_win_idx = -1;
+    }
+
+    prev_buttons = comp_button_state;
+}
+
+/* ── Terminal Surface ────────────────────────────────────────── */
+
+/* Return the pixel dimensions of the Terminal window content area.
+ * Called from shell.c to size the shm surface before fb_redirect(). */
+void compositor_get_terminal_dims(uint32_t *tw, uint32_t *th)
+{
+    int count;
+    gui_win_desc_t *dw = gui_desktop_get_windows(&count);
+    if (count > 0) {
+        *tw = (uint32_t)dw[0].w;
+        *th = (uint32_t)dw[0].h;
+    } else {
+        *tw = 640;
+        *th = 400;
+    }
+}
+
+/* Called from shell.c desktop command after compositor_init() and before
+ * spawning the compositor thread. Stores the shm surface that the shell
+ * renders into so the compositor can blit it each frame. */
+void compositor_set_terminal_surface(uint32_t shm, uint32_t tw, uint32_t th)
+{
+    terminal_shm    = shm;
+    terminal_pixels = (uint32_t *)shm_map(shm);
+    terminal_w      = tw;
+    terminal_h      = th;
+
+    /* Let gui_desktop blit the terminal at the correct z-order position */
+    gui_desktop_set_terminal_surface(terminal_pixels, tw, th);
+
+    serial_puts("[COMP] Terminal surface registered: ");
+    serial_putdec(tw);
+    serial_puts("x");
+    serial_putdec(th);
+    serial_puts("\n");
 }
 
 /* ── Render One Frame ────────────────────────────────────────── */
@@ -330,11 +707,42 @@ static void compositor_render_frame(void)
         }
     }
 
-    /* Render elementaryOS-inspired desktop */
+    /* Update FPS counter (APIC timer @ 100Hz → 100 ticks = 1 second) */
+    fps_frame_count++;
+    {
+        uint64_t now = idt_get_ticks();
+        if (now - fps_last_tick >= 100) {
+            fps_display = fps_frame_count;
+            fps_frame_count = 0;
+            fps_last_tick = now;
+        }
+    }
+
+    /* Push debug info into panel for rendering */
+    {
+        gui_debug_info_t info;
+        info.fps = fps_display;
+        info.mem_used_mb  = mem_get_used()  / (1024 * 1024);
+        info.mem_free_mb  = mem_get_free()  / (1024 * 1024);
+        info.mem_total_mb = mem_get_total() / (1024 * 1024);
+        info.ticks = idt_get_ticks();
+        info.procs = proc_count_active();
+        /* Read CMOS RTC (BCD mode, 24h), adjust to GMT-3 */
+        info.rtc_sec  = bcd2bin(cmos_read(0x00));
+        info.rtc_min  = bcd2bin(cmos_read(0x02));
+        { uint8_t raw_h = bcd2bin(cmos_read(0x04));
+          info.rtc_hour = (raw_h + 24 - 3) % 24; } /* UTC → GMT-3 */
+        gui_panel_set_debug(&info);
+    }
+
+    /* Render elementaryOS-inspired desktop (bg, panel, window chrome, dock) */
     {
         gui_surface_t screen = { back, w, h, p };
         gui_desktop_render(&screen);
     }
+
+    /* Terminal surface is now blitted by gui_desktop_render() at the correct
+     * z-order position (inside render_window_content for window 0). */
 
     /* Blit windows bottom-to-top */
     for (int i = 0; i < render_count; i++) {
@@ -364,6 +772,9 @@ void compositor_thread(void)
     serial_puts("[COMP] Compositor thread started (QOS_INTERACTIVE)\n");
 
     while (compositor_running) {
+        /* 0. Poll USB HID (xHCI) for new mouse/keyboard reports */
+        if (xhci_poll) xhci_poll();
+
         /* 1. Process input with coalescing */
         if (input_has_events()) {
             int16_t mdx, mdy, wheel;
@@ -374,9 +785,9 @@ void compositor_thread(void)
             int nkeys = input_drain_coalesced(&mdx, &mdy, &buttons,
                                               &wheel, key_buf, 32);
 
-            /* Update cursor from accumulated mouse deltas */
-            if (mdx || mdy)
-                input_post_mouse_move(mdx, mdy);
+            /* NOTE: Do NOT re-post mouse deltas here. input_set_mouse_abs()
+             * already updated mouse_x/mouse_y when xhci_poll processed the
+             * tablet report. Re-posting would double-count movement. */
 
             /* Store button and wheel state for focused window */
             comp_button_state = buttons;
@@ -386,10 +797,40 @@ void compositor_thread(void)
             /* Each key_buf entry is an input_event_t (24 bytes):
              *   offset 0: type (uint8_t)
              *   offset 1: scancode (uint8_t) */
+            if (nkeys > 0) {
+                serial_puts("[COMP] keys="); serial_putdec((uint64_t)nkeys); serial_puts("\n");
+            }
             for (int i = 0; i < nkeys; i++) {
                 uint8_t *evt = &key_buf[i * 24];
                 uint8_t type = evt[0];
                 uint8_t sc   = evt[1];
+
+                /* Track Alt key state.
+                 * USB: Left Alt = 0xE2, Right Alt = 0xE6 (HID modifier virtual scancodes).
+                 * PS/2: Alt = 0x38.
+                 * (input_post_key's kb_modifiers doesn't update for USB 0xE0+ virtual scancodes.) */
+                if (sc == 0xE2 || sc == 0xE6 || sc == 0x38) {
+                    alt_held = (type == 1);  /* INPUT_KEY_DOWN */
+                }
+
+                /* Alt+Tab: cycle through windows (USB Tab = HID 0x2B, PS/2 Tab = 0x0F) */
+                if (type == 1 && alt_held && (sc == 0x2B || sc == 0x0F)) {
+                    int count;
+                    gui_desktop_get_windows(&count);
+                    if (count > 1) {
+                        focused_demo_idx = (focused_demo_idx + 1) % count;
+                        if (focused_demo_idx < 0) focused_demo_idx = 0;
+                        gui_desktop_raise_window(focused_demo_idx);
+                        serial_puts("[COMP] Alt+Tab -> window ");
+                        serial_putdec((uint64_t)focused_demo_idx);
+                        serial_puts("\n");
+                    }
+                    continue;  /* don't push Tab into key ring while Alt is held */
+                }
+
+                /* NOTE: xhci.c already calls kb_push() directly for USB
+                 * keyboard input. No injection needed here — it would
+                 * double-push using wrong (HID) keycodes as PS/2 scancodes. */
                 uint32_t next = (key_ring_head + 1) & KEY_RING_MASK;
                 if (next == key_ring_tail)
                     break;  /* ring full, drop remaining */
@@ -399,11 +840,23 @@ void compositor_thread(void)
             }
         }
 
-        /* 2. Render frame */
+        /* 1b. Process mouse clicks on demo windows */
+        process_mouse_input();
+
+        /* 2. Tick animation engine (100 APIC ticks = 1000ms) */
+        gui_anim_tick(idt_get_ticks() * 10);  /* convert to ms (100Hz * 10 = ms) */
+
+        /* 3. Render frame */
         compositor_render_frame();
 
-        /* 3. Flip (waits for VBlank) */
+        /* 4. Flip (waits for VBlank) */
         display_flip();
+
+        /* Yield after each frame so shell/other threads get CPU time.
+         * Without this, IST-fix round-robin gives shell CPU only every
+         * 5 timer ticks (50ms); yield gives it every frame (~16ms). */
+        extern void sched_yield(void);
+        sched_yield();
 
         comp_frames++;
     }
@@ -463,6 +916,17 @@ void compositor_init(void)
     key_ring_tail = 0;
     comp_button_state = 0;
     comp_wheel_accum = 0;
+    focused_demo_idx = -1;
+    is_maximized[0] = false;
+    is_maximized[1] = false;
+    alt_held = false;
+    terminal_shm    = 0;
+    terminal_pixels = NULL;
+    terminal_w      = 0;
+    terminal_h      = 0;
+
+    /* Build AA cursor sprite */
+    compositor_init_cursor();
 
     /* Initialize GUI desktop layout */
     uint32_t sw = display_get_width();
