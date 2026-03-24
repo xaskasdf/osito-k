@@ -51,6 +51,8 @@ static inline void dbg_serial_hex8(uint8_t v) {
 
 /* OsitoFS */
 extern void *osfs2_find(const char *name);
+extern void *osfs2_find_ci(const char *name);      /* case-insensitive lookup */
+extern const char *osfs2_file_name(void *file);    /* get filename for hint */
 extern int   osfs2_read(void *file, uint64_t offset, void *buf, uint64_t len);
 extern int   osfs2_write(void *file, uint64_t offset, const void *buf, uint64_t len);
 extern void *osfs2_create(const char *name, uint64_t size);
@@ -429,6 +431,16 @@ static ssize_t console_read(void *buf, size_t count)
 static uint8_t *brk_base;      /* start of brk region */
 static uint8_t *brk_current;   /* current break */
 static uint8_t *brk_max;       /* end of brk region */
+
+/* Reset brk to base for a new process — called from proc_exec before elf_exec.
+ * Zeroes the heap so the new process starts with clean memory. */
+void sys_brk_reset(void)
+{
+    if (brk_base) {
+        memset(brk_base, 0, (uint64_t)(brk_current - brk_base));
+        brk_current = brk_base;
+    }
+}
 
 /* ── mmap/VFS shared definitions ───────────────────────────────── */
 
@@ -830,7 +842,27 @@ static int64_t sys_open(uint64_t path_addr, uint64_t flags, uint64_t mode)
     }
 
     if (!file) {
-        return -ENOENT;
+        /* Case-insensitive fallback: "doom.wad" opens "DOOM.WAD" */
+        void *ci = osfs2_find_ci(path);
+        if (!ci && path[0] == '/')
+            ci = osfs2_find_ci(path + 1);
+        if (!ci) {
+            const char *bn = path;
+            for (const char *q = path; *q; q++)
+                if (*q == '/') bn = q + 1;
+            if (bn != path && *bn)
+                ci = osfs2_find_ci(bn);
+        }
+        if (ci) {
+            serial_puts("[open] ci-match: '");
+            serial_puts(path);
+            serial_puts("' -> '");
+            serial_puts(osfs2_file_name(ci));
+            serial_puts("'\n");
+            file = ci;
+        } else {
+            return -ENOENT;
+        }
     }
 
     fd_entry_t *f = &fd_table[newfd];
@@ -1431,6 +1463,10 @@ static int64_t sys_access(uint64_t path_addr, uint64_t mode)
     for (const char *p = path; *p; p++)
         if (*p == '/') bn = p + 1;
     if (bn != path && *bn && osfs2_find(bn)) return 0;
+    /* Case-insensitive fallback */
+    if (osfs2_find_ci(path)) return 0;
+    if (path[0] == '/' && osfs2_find_ci(path + 1)) return 0;
+    if (bn != path && *bn && osfs2_find_ci(bn)) return 0;
     /* Virtual paths that always "exist" */
     if (str_startswith(path, "/dev/") || str_startswith(path, "/proc/"))
         return 0;

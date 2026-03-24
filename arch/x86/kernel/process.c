@@ -159,6 +159,12 @@ extern void kern_longjmp(uint64_t *buf, int val);
 uint64_t exec_jmpbuf[8];   /* setjmp/longjmp buffer — non-static for win32_exec */
 int32_t  last_exit_code;
 
+/* Target process for region registration during exec.
+ * Preemptive scheduler can change current_proc mid-exec; anchor to
+ * the newly-spawned process so proc_add_region() registers ELF
+ * segments to the right slot, preventing a page-free miss on exit. */
+static process_t *exec_target_proc;
+
 
 /* Console I/O (shared with syscall.c) */
 extern void serial_putc(char c);
@@ -236,6 +242,13 @@ static void proc_free(process_t *p)
             mem_free_pages(p->regions[i].base, p->regions[i].pages);
     }
 
+    /* Clean up compositor windows and SHM regions so the desktop
+     * remains intact after the process exits (even on crash). */
+    extern void compositor_cleanup_process(uint32_t pid);
+    extern void shm_cleanup_process(uint32_t pid);
+    compositor_cleanup_process(p->pid);
+    shm_cleanup_process(p->pid);
+
     /* Reset per-process syscall state (file FDs, brk heap) */
     syscall_reset_process();
 
@@ -250,8 +263,8 @@ static void proc_free(process_t *p)
 
 void proc_add_region(void *base, uint64_t pages)
 {
-    if (!current_proc) return;
-    process_t *p = current_proc;
+    process_t *p = exec_target_proc ? exec_target_proc : current_proc;
+    if (!p) return;
     if (p->region_count >= MAX_REGIONS) return;
     p->regions[p->region_count].base = base;
     p->regions[p->region_count].pages = pages;
@@ -413,9 +426,10 @@ int proc_exec(const char *filename, int argc, const char **argv)
         return -1;
     }
 
-    /* Set as current process */
+    /* Set as current process and pin region registration target */
     process_t *prev = current_proc;
     current_proc = p;
+    exec_target_proc = p;
     p->state = PROC_RUNNING;
 
     fb_puts_color(" [PID ", 0x0000AAFF);
@@ -430,11 +444,17 @@ int proc_exec(const char *filename, int argc, const char **argv)
          * SYSCALL disables interrupts (FMASK clears IF) and the longjmp
          * bypasses SYSRET which would re-enable them. Re-enable now. */
         __asm__ volatile ("sti");
+        exec_target_proc = NULL;
         int code = last_exit_code;
         current_proc = prev;
         proc_free(p);
         return code;
     }
+
+    /* Reset brk heap for the new process — prevents stale brk_current
+     * from a previous process giving malloc a corrupted heap pointer. */
+    extern void sys_brk_reset(void);
+    sys_brk_reset();
 
     /* Execute ELF — this calls elf_exec which does not return
      * on success (jumps to ELF entry). On failure, returns here. */
@@ -445,6 +465,7 @@ int proc_exec(const char *filename, int argc, const char **argv)
     serial_puts(filename);
     serial_puts("'\n");
 
+    exec_target_proc = NULL;
     current_proc = prev;
     proc_free(p);
 
