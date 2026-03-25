@@ -280,9 +280,9 @@ void display_flip(void)
     /* Wait for VBlank */
     display_wait_vblank();
 
-    /* Blit back buffer → GOP MMIO using non-temporal stores.
-     * Bypasses CPU cache for WC memory; avoids cache pollution. */
-    memcpy_nt(disp.gop_fb, disp.back, disp.fb_size);
+    /* Copy back buffer → GOP framebuffer.
+     * Regular memcpy so QEMU/HVF dirty-page tracking sees the writes. */
+    memcpy(disp.gop_fb, disp.back, disp.fb_size);
 
     /* Track timing */
     uint64_t now = idt_get_ticks();
@@ -300,7 +300,7 @@ void display_flip(void)
 void display_flip_nowait(void)
 {
     if (!disp.initialized || !disp.dirty) return;
-    memcpy_nt(disp.gop_fb, disp.back, disp.fb_size);
+    memcpy(disp.gop_fb, disp.back, disp.fb_size);
     disp.last_flip_tick = idt_get_ticks();
     disp.last_flip_tsc  = disp_rdtsc();
     disp.flip_count++;
