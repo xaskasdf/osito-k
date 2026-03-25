@@ -350,6 +350,14 @@ uint32_t input_queue_count(void)
     return (input_head - input_tail) & INPUT_QUEUE_MASK;
 }
 
+/* Discard all queued events — call before exec'ing a new process
+ * to prevent stale shell keystrokes from reaching the new process
+ * via SYS_GET_INPUT_EVENT. */
+void input_flush(void)
+{
+    input_tail = input_head;
+}
+
 /* ── Initialize ──────────────────────────────────────────────── */
 
 void input_events_init(uint32_t scr_width, uint32_t scr_height)

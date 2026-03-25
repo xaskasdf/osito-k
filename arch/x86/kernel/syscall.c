@@ -125,6 +125,7 @@ static inline void wrmsr(uint32_t msr, uint64_t val) {
 #define SYS_MPROTECT    10
 #define SYS_MUNMAP      11
 #define SYS_BRK         12
+#define SYS_MREMAP      25
 #define SYS_IOCTL       16
 #define SYS_WRITEV      20
 #define SYS_ACCESS      21
@@ -1238,6 +1239,40 @@ static int64_t sys_mprotect(uint64_t addr, uint64_t length, uint64_t prot)
     /* If addr is in identity-mapped region (not from mmap),
      * still allow mprotect as a no-op for compatibility */
     return 0;
+}
+
+/* sys_mremap — resize an existing mmap region.
+ * Q2's Hunk_End calls mremap(base, old_size, new_size, 0) to shrink
+ * a reservation to actual usage. We support in-place shrink only:
+ * if new_size <= old_size, just update the VMA and return same address.
+ * MREMAP_MAYMOVE (flag=1) with shrink still stays in place — we never
+ * move, so if caller needs move and new_size > old_size, return ENOMEM. */
+static int64_t sys_mremap(uint64_t old_addr, uint64_t old_size,
+                          uint64_t new_size, uint64_t flags)
+{
+    if (!old_addr || (old_addr & 0xFFF)) return -EINVAL;
+    if (new_size == 0) return -EINVAL;
+
+    uint64_t old_pages = (old_size + 4095) / 4096;
+    uint64_t new_pages = (new_size + 4095) / 4096;
+
+    /* Find matching VMA */
+    for (int i = 0; i < MAX_VMAS; i++) {
+        if (!vma_table[i].in_use) continue;
+        if (vma_table[i].base != old_addr) continue;
+        /* Allow approximate match (old_size may differ from VMA pages) */
+        if (new_pages <= vma_table[i].pages) {
+            /* Shrink: release tail pages, update VMA */
+            uint64_t free_start = old_addr + new_pages * 4096;
+            for (uint64_t p = new_pages; p < vma_table[i].pages; p++)
+                paging_unmap_page(free_start + (p - new_pages) * 4096);
+            vma_table[i].pages = new_pages;
+            return (int64_t)old_addr;
+        }
+        /* Grow: not supported without MREMAP_MAYMOVE + free space */
+        return -ENOMEM;
+    }
+    return -EFAULT;
 }
 
 /* ── Demand paging — called from #PF handler in idt.c ──────────
@@ -2482,6 +2517,7 @@ int64_t syscall_dispatch(uint64_t nr, uint64_t a1, uint64_t a2,
     case SYS_MMAP:       return sys_mmap(a1, a2, a3, a4, a5, 0);
     case SYS_MPROTECT:   return sys_mprotect(a1, a2, a3);
     case SYS_MUNMAP:     return sys_munmap(a1, a2);
+    case SYS_MREMAP:     return sys_mremap(a1, a2, a3, a4);
     case SYS_BRK:        return sys_brk(a1);
     case SYS_SIGACTION:  return sys_sigaction(a1, a2, a3);
     case SYS_SIGPROCMASK: return sys_rt_sigprocmask(a1, a2, a3, a4);
@@ -2622,6 +2658,10 @@ int64_t syscall_dispatch(uint64_t nr, uint64_t a1, uint64_t a2,
             extern uint32_t shm_surface_owner_pid;
             extern uint32_t proc_exec_pid(void);
             shm_surface_owner_pid = proc_exec_pid();
+            /* Capture keyboard: route events to input_events only, not kb_buf.
+             * The focused graphical process (Q2, game) reads via SYS_GET_INPUT_EVENT. */
+            extern void kbd_set_captured(bool);
+            kbd_set_captured(true);
             return shm_create_surface ? (int64_t)shm_create_surface((uint32_t)a1, (uint32_t)a2, (uint32_t)a3) : -ENOSYS;
         }
     case SYS_GUI_FLIP:

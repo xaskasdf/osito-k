@@ -203,6 +203,18 @@ static void kb_process_scancode(uint8_t sc)
     if (c) kb_push(c);
 }
 
+/* ── Keyboard capture flag ────────────────────────────────────
+ * When a graphical process (Q2, game) has focus, keyboard events
+ * go only to the input_events queue (SYS_GET_INPUT_EVENT), not to
+ * kb_buf. This prevents shell keystrokes from leaking into games.
+ * Set via kbd_set_captured(true) when process creates SHM surface,
+ * cleared via kbd_set_captured(false) on process exit. */
+
+static volatile bool g_keyboard_captured = false;
+
+void kbd_set_captured(bool captured) { g_keyboard_captured = captured; }
+bool kbd_is_captured(void)           { return g_keyboard_captured; }
+
 /* ── IRQ 1 handler (called from IDT vector 33) ──────────────── */
 
 void keyboard_irq(void)
@@ -215,7 +227,10 @@ void keyboard_irq(void)
         extern void input_post_key(uint8_t scancode, bool pressed, bool extended);
         input_post_key(sc & 0x7F, !(sc & 0x80), false);
     }
-    kb_process_scancode(sc);
+    /* When a graphical process has focus, skip kb_buf — keys go only
+     * to input_events so the shell doesn't see game keystrokes. */
+    if (!g_keyboard_captured)
+        kb_process_scancode(sc);
 }
 
 /* ── Inject scancode from compositor (no I/O port read) ──────── */
@@ -261,6 +276,13 @@ char kb_trygetchar(void)
 bool kb_has_input(void)
 {
     return kb_head != kb_tail;
+}
+
+/* Flush pending keyboard input — call before exec'ing a new process
+ * so stale shell keystrokes don't leak into the new program's stdin. */
+void kbd_flush(void)
+{
+    kb_tail = kb_head;
 }
 
 /* Diagnostic getters (safe to call from any thread context) */

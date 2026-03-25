@@ -536,6 +536,17 @@ void elf_free(elf_loaded_t *loaded)
 
 static void elf_jump(uint64_t entry, uint64_t sp)
 {
+    /* Capture keyboard before the new process starts: flush stale shell
+     * keystrokes from kb_buf, then route all future keyboard events to
+     * the input_events queue only (not kb_buf). The new process reads
+     * input via SYS_GET_INPUT_EVENT. Released in process cleanup. */
+    extern void kbd_flush(void);
+    extern void kbd_set_captured(bool);
+    extern void input_flush(void);
+    kbd_flush();
+    input_flush();
+    kbd_set_captured(true);
+
     serial_puts("[ELF] Jumping to entry 0x");
     serial_puthex(entry, 16);
     serial_puts(" with SP=0x");

@@ -249,6 +249,12 @@ static void proc_free(process_t *p)
     compositor_cleanup_process(p->pid);
     shm_cleanup_process(p->pid);
 
+    /* Release keyboard capture so the shell can receive keystrokes again. */
+    extern void kbd_set_captured(bool);
+    kbd_set_captured(false);
+    extern void kbd_flush(void);
+    kbd_flush();
+
     /* Reset per-process syscall state (file FDs, brk heap) */
     syscall_reset_process();
 
