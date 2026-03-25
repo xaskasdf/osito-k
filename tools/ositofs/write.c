@@ -127,7 +127,7 @@ int main(int argc, char **argv)
 
     /* Check for duplicate name */
     osfs2_file_t *ft = (osfs2_file_t *)ft_blk;
-    for (uint32_t i = 0; i < sb.file_count; i++) {
+    for (uint32_t i = 0; i < OSFS2_MAX_FILES; i++) {
         if ((ft[i].flags & OSFS2_FLAG_VALID) && strcmp(ft[i].name, namebuf) == 0) {
             fprintf(stderr, "ositofs-write: file '%s' already exists (write-once FS)\n", namebuf);
             goto fail;
@@ -205,8 +205,14 @@ int main(int argc, char **argv)
     }
     osfs2_free_block(crc_blk);
 
-    /* Fill file table entry */
+    /* Fill file table entry — find first invalid (freed) slot, or append */
     uint32_t file_idx = sb.file_count;
+    for (uint32_t i = 0; i < sb.file_count; i++) {
+        if (!(ft[i].flags & OSFS2_FLAG_VALID)) {
+            file_idx = i;
+            break;
+        }
+    }
     memset(&ft[file_idx], 0, sizeof(osfs2_file_t));
     strncpy(ft[file_idx].name, namebuf, OSFS2_NAME_LEN - 1);
     ft[file_idx].size = file_size;
@@ -256,7 +262,8 @@ int main(int argc, char **argv)
     if (osfs2_write_block(fd, OSFS2_FILETAB_BLK, ft_blk) < 0) goto fail;
 
     /* Update superblock */
-    sb.file_count = file_idx + 1;
+    if (file_idx >= sb.file_count)
+        sb.file_count = file_idx + 1;
     sb.next_data_block = start_block + blocks_needed;
     sb.used_blocks = sb.next_data_block;
 
