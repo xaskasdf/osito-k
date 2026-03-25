@@ -211,6 +211,21 @@ void shm_set_owner(uint32_t handle, uint32_t pid)
     if (r) r->owner_pid = pid;
 }
 
+/* Destroy all regions owned by a process (called on proc_free) */
+void shm_cleanup_process(uint32_t pid)
+{
+    for (int i = 0; i < SHM_MAX_REGIONS; i++) {
+        if (shm_table[i].active && shm_table[i].owner_pid == pid) {
+            serial_puts("[SHM] Cleanup pid=");
+            serial_putdec(pid);
+            serial_puts(" h=");
+            serial_putdec(shm_table[i].handle);
+            serial_puts("\n");
+            shm_destroy(shm_table[i].handle);
+        }
+    }
+}
+
 /* ── Stats ───────────────────────────────────────────────────── */
 
 uint32_t shm_get_active_count(void) { return shm_active_count; }
@@ -221,19 +236,21 @@ extern uint32_t compositor_create_window(uint32_t shm_handle, int16_t x, int16_t
 extern void compositor_set_fullscreen(uint32_t window_id, bool fullscreen);
 extern void compositor_signal_dirty(uint32_t window_id);
 
+/* Set before calling shm_create_surface — picked up by compositor_create_window
+ * so the window can be cleaned up when the owning process exits. */
+uint32_t shm_surface_owner_pid = 0;
+
 uint32_t shm_create_surface(uint32_t width, uint32_t height, uint32_t flags)
 {
     uint64_t size = (uint64_t)width * height * 4;
     uint32_t handle = shm_create(size, flags);
-    
+
     if (handle && (flags & 4)) { /* SHM_FLAG_GPU_SCANOUT */
-        uint32_t wid = compositor_create_window(handle, 0, 0, width, height, 0, "Doom");
-        if (wid) {
+        shm_set_owner(handle, shm_surface_owner_pid);
+        uint32_t wid = compositor_create_window(handle, 0, 0, width, height,
+                                                shm_surface_owner_pid, "Doom");
+        if (wid)
             compositor_set_fullscreen(wid, true);
-            /* Cheat: Store window_id in the shm_table so we can flush it later.
-               We can use the flags field or just assume window 1.
-               Let's just use a static var for the one and only surface */
-        }
     }
     return handle;
 }

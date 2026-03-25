@@ -77,6 +77,13 @@ static input_event_t input_queue[INPUT_QUEUE_SIZE];
 static volatile uint32_t input_head;   /* write index (ISR only) */
 static volatile uint32_t input_tail;   /* read index (consumer only) */
 
+/* Game mode: when a fullscreen compositor window is active (e.g. DOOM),
+ * the compositor's drain loop stops before keyboard events so the process
+ * can read them directly via SYS_GET_INPUT_EVENT → input_pop_event().
+ * Without this, the compositor drains KEY_DOWN/KEY_UP at 60fps and DOOM
+ * never sees them → keys appear stuck or need to be held very long. */
+bool input_game_mode = false;
+
 /* ── Mouse State ─────────────────────────────────────────────── */
 
 static int32_t  mouse_x, mouse_y;     /* absolute cursor position */
@@ -224,6 +231,13 @@ int input_drain_coalesced(int16_t *out_mouse_dx, int16_t *out_mouse_dy,
 
     while (input_tail != input_head) {
         input_event_t *e = &input_queue[input_tail & INPUT_QUEUE_MASK];
+
+        /* Game mode: stop drain before keyboard events so the running
+         * process can read them via SYS_GET_INPUT_EVENT. */
+        if (input_game_mode &&
+            (e->type == INPUT_KEY_DOWN || e->type == INPUT_KEY_UP))
+            break;
+
         input_tail = (input_tail + 1) & INPUT_QUEUE_MASK;
 
         switch (e->type) {

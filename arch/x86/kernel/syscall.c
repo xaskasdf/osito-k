@@ -2611,7 +2611,12 @@ int64_t syscall_dispatch(uint64_t nr, uint64_t a1, uint64_t a2,
     case SYS_SHM_GETSIZE:
         return shm_get_size ? (int64_t)shm_get_size((uint32_t)a1) : -ENOSYS;
     case SYS_SHM_MKSURFACE:
-        return shm_create_surface ? (int64_t)shm_create_surface((uint32_t)a1, (uint32_t)a2, (uint32_t)a3) : -ENOSYS;
+        {
+            /* Set owner PID so compositor_cleanup_process() can find the window */
+            extern uint32_t shm_surface_owner_pid;
+            shm_surface_owner_pid = (uint32_t)proc_current_pid();
+            return shm_create_surface ? (int64_t)shm_create_surface((uint32_t)a1, (uint32_t)a2, (uint32_t)a3) : -ENOSYS;
+        }
     case SYS_GUI_FLIP:
         if (shm_flush_surface) { shm_flush_surface((uint32_t)a1); return 0; }
         return -ENOSYS;

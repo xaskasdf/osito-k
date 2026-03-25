@@ -248,6 +248,15 @@ void compositor_destroy_window(uint32_t window_id)
     }
 }
 
+/* Destroy all windows owned by a process (called on proc_free) */
+void compositor_cleanup_process(uint32_t pid)
+{
+    for (int i = 0; i < MAX_WINDOWS; i++) {
+        if ((windows[i].flags & WND_ACTIVE) && windows[i].owner_pid == pid)
+            compositor_destroy_window(windows[i].id);
+    }
+}
+
 /* Signal that a window's surface has new content */
 void compositor_signal_dirty(uint32_t window_id)
 {
@@ -774,6 +783,22 @@ void compositor_thread(void)
     while (compositor_running) {
         /* 0. Poll USB HID (xHCI) for new mouse/keyboard reports */
         if (xhci_poll) xhci_poll();
+
+        /* Game mode: if a fullscreen window (e.g. DOOM) is active, stop
+         * draining keyboard events so the process can read them via
+         * SYS_GET_INPUT_EVENT. Only mouse/wheel events are coalesced. */
+        {
+            extern bool input_game_mode;
+            bool has_fullscreen = false;
+            for (int _i = 0; _i < MAX_WINDOWS; _i++) {
+                if ((windows[_i].flags & (WND_ACTIVE | WND_FULLSCREEN)) ==
+                    (WND_ACTIVE | WND_FULLSCREEN)) {
+                    has_fullscreen = true;
+                    break;
+                }
+            }
+            input_game_mode = has_fullscreen;
+        }
 
         /* 1. Process input with coalescing */
         if (input_has_events()) {
