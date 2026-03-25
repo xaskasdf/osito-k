@@ -307,6 +307,20 @@ void display_flip_nowait(void)
     disp.dirty = false;
 }
 
+/* Force-refresh: regular memcpy (not NT stores) to ensure QEMU/HVF
+ * dirty-page tracking detects the framebuffer write. Used after
+ * fullscreen→desktop transitions where NT stores may not trigger
+ * QEMU's Cocoa display refresh. */
+void display_force_refresh(void)
+{
+    if (!disp.initialized || !disp.back) return;
+    memcpy(disp.gop_fb, disp.back, disp.fb_size);
+    disp.last_flip_tick = idt_get_ticks();
+    disp.last_flip_tsc  = disp_rdtsc();
+    disp.flip_count++;
+    disp.dirty = false;
+}
+
 /* ── Back Buffer Access ──────────────────────────────────────── */
 
 uint32_t *display_get_back_buffer(void)
