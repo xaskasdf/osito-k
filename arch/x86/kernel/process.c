@@ -285,6 +285,16 @@ int32_t proc_current_pid(void)
     return current_proc ? (int32_t)current_proc->pid : 0;
 }
 
+/* Return the PID of the exec target if mid-exec, else current process.
+ * The preemptive scheduler can change current_proc at any time; during
+ * exec the newly-spawned process is pinned in exec_target_proc. */
+uint32_t proc_exec_pid(void)
+{
+    if (exec_target_proc)
+        return exec_target_proc->pid;
+    return current_proc ? current_proc->pid : 0;
+}
+
 /* Get current parent PID */
 int32_t proc_current_ppid(void)
 {

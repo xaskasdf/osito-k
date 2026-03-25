@@ -699,21 +699,58 @@ static void compositor_render_frame(void)
 
     build_render_order();
 
-    /* Direct scanout optimization: if exactly 1 fullscreen window,
-     * its surface covers the entire screen — no compositing needed. */
-    if (render_count == 1) {
-        int idx = render_order[0];
-        window_t *win = &windows[idx];
-        if ((win->flags & WND_FULLSCREEN) &&
-            win->width == (uint16_t)w && win->height == (uint16_t)h &&
-            win->pixels) {
-            /* Copy surface directly to back buffer (no desktop fill) */
+    /* Fullscreen window: bypass desktop UI, blit scaled to screen.
+     * Supports any source size via pixel-perfect integer upscaling. */
+    for (int _fi = 0; _fi < render_count; _fi++) {
+        window_t *win = &windows[render_order[_fi]];
+        if (!(win->flags & WND_FULLSCREEN) || !win->pixels) continue;
+
+        /* Direct scanout: source matches screen exactly */
+        if (win->width == (uint16_t)w && win->height == (uint16_t)h) {
             memcpy(back, win->pixels, (uint64_t)w * h * 4);
-            /* In GPU Phase A, this would be: SET_OFFSET = shm_phys */
             display_mark_dirty();
             comp_direct_scanout++;
             return;
         }
+
+        /* Pixel-perfect: largest integer scale that fits within the screen.
+         * For DOOM 320×200 on 1024×768: scale=3 → 960×600, centered. */
+        uint32_t _sw = (uint32_t)win->width;
+        uint32_t _sh = (uint32_t)win->height;
+        uint32_t _scx = w / _sw;
+        uint32_t _scy = h / _sh;
+        uint32_t _sc  = (_scx < _scy) ? _scx : _scy;
+        if (_sc == 0) _sc = 1;
+
+        uint32_t _dw = _sw * _sc;
+        uint32_t _dh = _sh * _sc;
+        uint32_t _ox = (w - _dw) / 2;
+        uint32_t _oy = (h - _dh) / 2;
+
+        /* Clear letterbox/pillarbox borders to black */
+        memset(back, 0, (uint64_t)p * h * 4);
+
+        /* Scale-blit: build one scaled row, then memcpy for repeated rows.
+         * Row-major traversal keeps writes sequential for cache efficiency. */
+        for (uint32_t _y = 0; _y < _sh; _y++) {
+            const uint32_t *_src = win->pixels + _y * _sw;
+            uint32_t *_row0 = back + (_oy + _y * _sc) * p + _ox;
+            /* Expand source row horizontally */
+            for (uint32_t _x = 0; _x < _sw; _x++) {
+                uint32_t _px = _src[_x];
+                uint32_t _base = _x * _sc;
+                for (uint32_t _rx = 0; _rx < _sc; _rx++)
+                    _row0[_base + _rx] = _px;
+            }
+            /* Duplicate expanded row for remaining scale-1 output rows */
+            for (uint32_t _ry = 1; _ry < _sc; _ry++)
+                memcpy(back + (_oy + _y * _sc + _ry) * p + _ox, _row0,
+                       (uint64_t)_dw * 4);
+        }
+
+        display_mark_dirty();
+        comp_direct_scanout++;
+        return;
     }
 
     /* Update FPS counter (APIC timer @ 100Hz → 100 ticks = 1 second) */
@@ -780,6 +817,8 @@ void compositor_thread(void)
 
     serial_puts("[COMP] Compositor thread started (QOS_INTERACTIVE)\n");
 
+    bool comp_was_fullscreen = false;
+
     while (compositor_running) {
         /* 0. Poll USB HID (xHCI) for new mouse/keyboard reports */
         if (xhci_poll) xhci_poll();
@@ -787,9 +826,9 @@ void compositor_thread(void)
         /* Game mode: if a fullscreen window (e.g. DOOM) is active, stop
          * draining keyboard events so the process can read them via
          * SYS_GET_INPUT_EVENT. Only mouse/wheel events are coalesced. */
+        bool has_fullscreen = false;
         {
             extern bool input_game_mode;
-            bool has_fullscreen = false;
             for (int _i = 0; _i < MAX_WINDOWS; _i++) {
                 if ((windows[_i].flags & (WND_ACTIVE | WND_FULLSCREEN)) ==
                     (WND_ACTIVE | WND_FULLSCREEN)) {
@@ -876,6 +915,18 @@ void compositor_thread(void)
 
         /* 4. Flip (waits for VBlank) */
         display_flip();
+
+        /* 5. Fullscreen→desktop transition: force a regular-memcpy refresh.
+         * memcpy_nt (non-temporal stores) in display_flip may not trigger
+         * QEMU/HVF dirty-page tracking on the frame immediately after a
+         * fullscreen window is destroyed. A regular memcpy guarantees the
+         * write is visible to the host display backend. */
+        if (comp_was_fullscreen && !has_fullscreen) {
+            serial_puts("[COMP] FS->desktop: force refresh\n");
+            extern void display_force_refresh(void);
+            display_force_refresh();
+        }
+        comp_was_fullscreen = has_fullscreen;
 
         comp_frames++;
     }
