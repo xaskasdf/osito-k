@@ -43,8 +43,14 @@ static const char *resolve_posix(const char *path)
     if (vfs_strncmp(path, "/proc/self/", 11) == 0)  return VFS_PROC_SELF;
     if (vfs_strncmp(path, "/proc/", 6) == 0)        return VFS_PROC_SELF;
 
-    /* Extract basename — OsitoFS is flat */
-    return extract_basename(path);
+    /* OsitoFS v2 supports subdirectories (e.g. "baseq2/pak0.pak").
+     * Strip leading "/" or "./" to get the relative OsitoFS path. */
+    if (path[0] == '/')
+        return path + 1;           /* "/baseq2/pak0.pak" → "baseq2/pak0.pak" */
+    if (path[0] == '.' && path[1] == '/')
+        return path + 2;           /* "./baseq2/pak0.pak" → "baseq2/pak0.pak" */
+
+    return path;                   /* already relative: "baseq2/pak0.pak" */
 }
 
 /* ── Win32 path resolution ───────────────────────────────── */

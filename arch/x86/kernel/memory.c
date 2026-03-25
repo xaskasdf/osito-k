@@ -167,13 +167,13 @@ void *mem_alloc_pages(uint64_t count)
     uint64_t run_start = 0;
     uint64_t run_len = 0;
 
-    /* Start above 8MB to avoid collisions with:
+    /* Start above 16MB to avoid collisions with:
      * - Page tables (0x100000-0x110000)
-     * - Heap (0x10F000+)
-     * - ET_EXEC ELF load area (typically 0x400000-0x600000)
-     * This ensures first-fit doesn't consume the ELF VA range. */
+     * - ET_EXEC ELF load area (0x400000+, up to ~14MB for large BSS)
+     *   e.g. Quake 2 has a 9.5MB BSS reaching 0xDF0000 (~14MB)
+     * Heap/general allocator must not overlap the fixed-load VA range. */
     uint64_t limit = max_tracked_page ? max_tracked_page : MAX_PHYS_PAGES;
-    for (uint64_t p = 2048; p < limit; p++) {  /* Start above 8MB */
+    for (uint64_t p = 4096; p < limit; p++) {  /* Start above 16MB */
         if (bitmap_test(p)) {
             if (run_len == 0) run_start = p;
             run_len++;
@@ -239,9 +239,9 @@ void *mem_alloc_aligned(uint64_t size, uint64_t alignment)
 
     if (free_pages < pages) return NULL;
 
-    /* Search for aligned contiguous pages (above 8MB, skip ELF load area) */
+    /* Search for aligned contiguous pages (above 16MB, clear of ELF load area) */
     uint64_t limit = max_tracked_page ? max_tracked_page : MAX_PHYS_PAGES;
-    uint64_t p = 2048;
+    uint64_t p = 4096;
     /* Snap to first aligned candidate */
     if (p % align_pages != 0)
         p = ((p / align_pages) + 1) * align_pages;
@@ -311,7 +311,7 @@ void sys_caps_init(void)
     g_sys_caps.heap_grow_size = CLAMP(total / 1024, 64 * 1024, 4ULL * 1024 * 1024);
 
     /* Per-process limits */
-    g_sys_caps.brk_heap_size   = CLAMP(total / 16, 16ULL * 1024 * 1024, 256ULL * 1024 * 1024);
+    g_sys_caps.brk_heap_size   = CLAMP(total / 16, 16ULL * 1024 * 1024, 64ULL * 1024 * 1024);
     g_sys_caps.user_stack_size = CLAMP(total / 64, 1ULL * 1024 * 1024, 8ULL * 1024 * 1024);
     g_sys_caps.max_processes   = (uint32_t)CLAMP(mb / 16, 4, 256);
     g_sys_caps.max_fds_global  = (uint32_t)CLAMP(total / (256 * 1024), 128, 4096);

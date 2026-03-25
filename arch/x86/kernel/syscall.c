@@ -828,6 +828,10 @@ static int64_t sys_open(uint64_t path_addr, uint64_t flags, uint64_t mode)
     if (!file && path[0] == '/')
         file = osfs2_find(path + 1);
 
+    /* Strip leading "./" for relative paths (e.g. "./baseq2/pak0.pak") */
+    if (!file && path[0] == '.' && path[1] == '/')
+        file = osfs2_find(path + 2);
+
     /* Try basename (flat FS: /bin/busybox → busybox, /etc/passwd → passwd) */
     if (!file) {
         const char *bn = path;
@@ -846,6 +850,8 @@ static int64_t sys_open(uint64_t path_addr, uint64_t flags, uint64_t mode)
         void *ci = osfs2_find_ci(path);
         if (!ci && path[0] == '/')
             ci = osfs2_find_ci(path + 1);
+        if (!ci && path[0] == '.' && path[1] == '/')
+            ci = osfs2_find_ci(path + 2);
         if (!ci) {
             const char *bn = path;
             for (const char *q = path; *q; q++)
