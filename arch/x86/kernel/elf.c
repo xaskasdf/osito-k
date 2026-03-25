@@ -329,7 +329,13 @@ static int elf_load_segments(const uint8_t *data, uint64_t data_size,
         serial_puts(" KB\n");
     }
 
-    /* Zero entire region (BSS segments need zeros) */
+    /* Zero + load segments atomically (no preemption window).
+     * ELF data is already in RAM; these are pure memory ops.
+     * cli prevents the compositor (or any thread) from running
+     * between the memset and the memcpy and writing stale data
+     * into the new process's BSS before it has a chance to use it. */
+    __asm__ volatile ("cli" ::: "memory");
+
     memset(base, 0, total_pages * 4096);
 
     loaded->segments[0] = base;
@@ -348,6 +354,7 @@ static int elf_load_segments(const uint8_t *data, uint64_t data_size,
 
         if (ph->p_filesz > 0) {
             if (ph->p_offset + ph->p_filesz > data_size) {
+                __asm__ volatile ("sti" ::: "memory");
                 serial_puts("[ELF] Segment data out of bounds\n");
                 return -1;
             }
@@ -355,6 +362,8 @@ static int elf_load_segments(const uint8_t *data, uint64_t data_size,
                    data + ph->p_offset, ph->p_filesz);
         }
     }
+
+    __asm__ volatile ("sti" ::: "memory");
 
     if (fixed_load) {
         /* ET_EXEC: use original entry point (absolute addresses) */
