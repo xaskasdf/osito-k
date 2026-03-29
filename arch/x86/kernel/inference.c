@@ -11,6 +11,10 @@
 #include "inference.h"
 #include "tensor.h"
 
+#ifdef __EMSCRIPTEN__
+#include <emscripten.h>
+#endif
+
 /* ── External functions ──────────────────────────────────────── */
 
 extern void serial_puts(const char *s);
@@ -33,9 +37,13 @@ extern const char *tok_global_decode(uint32_t id);
 
 static inline uint64_t rdtsc(void)
 {
+#ifndef __EMSCRIPTEN__
     uint32_t lo, hi;
     __asm__ volatile ("rdtsc" : "=a"(lo), "=d"(hi));
     return ((uint64_t)hi << 32) | lo;
+#else
+    return (uint64_t)emscripten_get_now();
+#endif
 }
 
 static uint64_t pages_for(uint64_t bytes)
@@ -149,7 +157,8 @@ int llama_init(llama_state_t *state, gguf_model_t *model, uint32_t max_seq)
     /* Derived dimensions */
     state->head_dim   = state->dim / state->n_heads;
     state->kv_dim     = state->n_kv_heads * state->head_dim;
-    state->gqa_ratio  = state->n_heads / state->n_kv_heads;
+    state->gqa_ratio     = state->n_heads / state->n_kv_heads;
+    state->rope_freq_base = model->rope_freq_base > 0.0f ? model->rope_freq_base : 10000.0f;
 
     /* Discover ffn_dim from first layer gate tensor */
     char nbuf[64];
@@ -186,6 +195,8 @@ int llama_init(llama_state_t *state, gguf_model_t *model, uint32_t max_seq)
     serial_putdec(state->vocab_size);
     serial_puts(" max_seq=");
     serial_putdec(state->max_seq);
+    serial_puts(" rope_theta=");
+    serial_putdec((uint64_t)state->rope_freq_base);
     serial_puts("\n");
 
     /* ── Resolve global tensors ── */
@@ -377,8 +388,8 @@ int llama_forward(llama_state_t *s, uint32_t token)
         matvec(s->v, ly->attn_v, s->xb, kv_dim, dim);
 
         /* RoPE */
-        rope(s->q, s->n_heads,    hd, pos, 500000.0f);
-        rope(s->k, s->n_kv_heads, hd, pos, 500000.0f);
+        rope(s->q, s->n_heads,    hd, pos, s->rope_freq_base);
+        rope(s->k, s->n_kv_heads, hd, pos, s->rope_freq_base);
 
         /* Store K, V in cache */
         float *kc = s->kv_cache[l].k + (uint64_t)pos * kv_dim;
@@ -740,10 +751,13 @@ void llama_generate(llama_state_t *state, const uint32_t *prompt,
  * ══════════════════════════════════════════════════════════════ */
 
 /* Tokenizer functions (tokenizer.c) */
-extern int tok_encode(const void *tok, const char *text, uint32_t text_len,
-                      uint32_t *out, uint32_t max_out);
-extern bool tok_is_ready(const void *tok);
-extern char g_tokenizer[];
+extern int      tok_encode(const void *tok, const char *text, uint32_t text_len,
+                            uint32_t *out, uint32_t max_out);
+extern bool     tok_is_ready(const void *tok);
+extern uint32_t tok_get_bos_id(const void *tok);
+extern uint32_t tok_get_eos_id(const void *tok);
+extern uint32_t tok_find_special(const void *tok, const char *s);
+extern char     g_tokenizer[];
 
 int llama_chat(llama_state_t *state, const char *text,
                uint32_t max_tokens,
@@ -751,69 +765,87 @@ int llama_chat(llama_state_t *state, const char *text,
 {
     if (!state || !text) return -1;
 
-    /* Compute text length */
     uint32_t text_len = 0;
     const char *p = text;
     while (*p++) text_len++;
 
-    /* Check tokenizer */
+    uint32_t bos_id = tok_get_bos_id(g_tokenizer);
+    uint32_t eos_id = tok_get_eos_id(g_tokenizer);
+
     if (!tok_is_ready(g_tokenizer)) {
-        serial_puts("[CHAT] Tokenizer not ready, falling back to BOS-only\n");
+        serial_puts("[CHAT] Tokenizer not ready, BOS-only fallback\n");
         state->pos = 0;
-        uint32_t bos[] = { 128000 };
+        uint32_t bos[] = { bos_id };
         llama_generate(state, bos, 1, max_tokens);
         return 0;
     }
 
-    /* Build Llama 3 chat template:
-     * <|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\n
-     * {text}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n
+    /*
+     * Auto-detect chat template by searching for special tokens in vocab.
      *
-     * Special tokens:
-     *   128000 = <|begin_of_text|> (BOS)
-     *   128006 = <|start_header_id|>
-     *   128007 = <|end_header_id|>
-     *   128009 = <|eot_id|>
+     * ChatML (SmolLM2, Qwen, Mistral-v3 ...):
+     *   <|im_start|>user\n{text}<|im_end|>\n<|im_start|>assistant\n
+     *
+     * Llama 3 (token IDs are always < vocab_size for real Llama 3 models):
+     *   <|begin_of_text|>...<|start_header_id|>user<|end_header_id|>...
+     *
+     * Fallback (base models / unknown): BOS + raw text
      */
+    uint32_t im_start = tok_find_special(g_tokenizer, "<|im_start|>");
+    uint32_t im_end   = tok_find_special(g_tokenizer, "<|im_end|>");
 
     uint32_t tokens[1024];
     uint32_t n = 0;
+    int r;
 
-    /* BOS + start header */
-    tokens[n++] = 128000;  /* <|begin_of_text|> */
-    tokens[n++] = 128006;  /* <|start_header_id|> */
+    if (im_start != UINT32_MAX && im_end != UINT32_MAX) {
+        /* ── ChatML template ── */
+        tokens[n++] = im_start;
+        r = tok_encode(g_tokenizer, "user\n", 5, tokens + n, 1024 - n);
+        if (r > 0) n += (uint32_t)r;
+        r = tok_encode(g_tokenizer, text, text_len, tokens + n, 1024 - n);
+        if (r > 0) n += (uint32_t)r;
+        tokens[n++] = im_end;
+        r = tok_encode(g_tokenizer, "\n", 1, tokens + n, 1024 - n);
+        if (r > 0) n += (uint32_t)r;
+        tokens[n++] = im_start;
+        r = tok_encode(g_tokenizer, "assistant\n", 10, tokens + n, 1024 - n);
+        if (r > 0) n += (uint32_t)r;
+        /* generation stops when model produces im_end */
+        eos_id = im_end;
 
-    /* Encode "user" */
-    int r = tok_encode(g_tokenizer, "user", 4, tokens + n, 1024 - n);
-    if (r > 0) n += (uint32_t)r;
+    } else if (bos_id >= 128000) {
+        /* ── Llama 3 template (BOS is a special high-ID token) ── */
+        uint32_t hdr_open  = bos_id + 6;   /* <|start_header_id|> */
+        uint32_t hdr_close = bos_id + 7;   /* <|end_header_id|> */
+        uint32_t eot       = bos_id + 9;   /* <|eot_id|> */
+        tokens[n++] = bos_id;
+        tokens[n++] = hdr_open;
+        r = tok_encode(g_tokenizer, "user", 4, tokens + n, 1024 - n);
+        if (r > 0) n += (uint32_t)r;
+        tokens[n++] = hdr_close;
+        r = tok_encode(g_tokenizer, "\n\n", 2, tokens + n, 1024 - n);
+        if (r > 0) n += (uint32_t)r;
+        r = tok_encode(g_tokenizer, text, text_len, tokens + n, 1024 - n);
+        if (r > 0) n += (uint32_t)r;
+        tokens[n++] = eot;
+        tokens[n++] = hdr_open;
+        r = tok_encode(g_tokenizer, "assistant", 9, tokens + n, 1024 - n);
+        if (r > 0) n += (uint32_t)r;
+        tokens[n++] = hdr_close;
+        r = tok_encode(g_tokenizer, "\n\n", 2, tokens + n, 1024 - n);
+        if (r > 0) n += (uint32_t)r;
 
-    tokens[n++] = 128007;  /* <|end_header_id|> */
+    } else {
+        /* ── Raw: BOS + text (base models) ── */
+        tokens[n++] = bos_id;
+        r = tok_encode(g_tokenizer, text, text_len, tokens + n, 1024 - n);
+        if (r > 0) n += (uint32_t)r;
+    }
 
-    /* Encode "\n\n" */
-    r = tok_encode(g_tokenizer, "\n\n", 2, tokens + n, 1024 - n);
-    if (r > 0) n += (uint32_t)r;
-
-    /* Encode user text */
-    r = tok_encode(g_tokenizer, text, text_len, tokens + n, 1024 - n);
-    if (r > 0) n += (uint32_t)r;
-
-    /* End user turn + start assistant */
-    tokens[n++] = 128009;  /* <|eot_id|> */
-    tokens[n++] = 128006;  /* <|start_header_id|> */
-
-    r = tok_encode(g_tokenizer, "assistant", 9, tokens + n, 1024 - n);
-    if (r > 0) n += (uint32_t)r;
-
-    tokens[n++] = 128007;  /* <|end_header_id|> */
-
-    r = tok_encode(g_tokenizer, "\n\n", 2, tokens + n, 1024 - n);
-    if (r > 0) n += (uint32_t)r;
-
-    serial_puts("[CHAT] Tokenized: ");
+    serial_puts("[CHAT] Prompt: ");
     serial_putdec(n);
-    serial_puts(" tokens (");
-    serial_putdec(text_len);
-    serial_puts(" chars)\n");
+    serial_puts(" tokens\n");
 
     /* Reset state */
     state->pos = 0;
@@ -825,7 +857,11 @@ int llama_chat(llama_state_t *state, const char *text,
     uint64_t t1 = rdtsc();
 
     serial_puts("[CHAT] Prefill: ");
+#ifdef __EMSCRIPTEN__
+    serial_putdec(t1 - t0);  /* emscripten_get_now() is already ms */
+#else
     serial_putdec((t1 - t0) / 3000000);
+#endif
     serial_puts(" ms\n");
 
     /* Generate */
@@ -834,7 +870,7 @@ int llama_chat(llama_state_t *state, const char *text,
     uint32_t gen = 0;
 
     for (uint32_t step = 0; step < max_tokens; step++) {
-        if (next == LLAMA_EOS_1 || next == LLAMA_EOS_2) break;
+        if (next == eos_id || next == LLAMA_EOS_1 || next == LLAMA_EOS_2) break;
         if (state->pos >= state->max_seq) break;
 
         /* Decode and deliver */
@@ -849,7 +885,11 @@ int llama_chat(llama_state_t *state, const char *text,
     }
 
     uint64_t t2 = rdtsc();
+#ifdef __EMSCRIPTEN__
+    uint64_t gen_ms = gen > 0 ? (t2 - t1) : 0;
+#else
     uint64_t gen_ms = gen > 0 ? (t2 - t1) / 3000000 : 0;
+#endif
     uint64_t ms_per_tok = gen > 0 ? gen_ms / gen : 0;
 
     serial_puts("[CHAT] Generated: ");

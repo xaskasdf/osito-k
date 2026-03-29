@@ -57,6 +57,11 @@ static int cur_u64(gguf_cursor_t *c, uint64_t *val)
     return cur_read(c, val, 8);
 }
 
+static int cur_f32(gguf_cursor_t *c, float *val)
+{
+    return cur_read(c, val, 4);
+}
+
 static int cur_skip(gguf_cursor_t *c, uint64_t n)
 {
     if (c->pos + n > c->size) return -1;
@@ -505,8 +510,8 @@ int gguf_load_tokenizer(gguf_model_t *model, gguf_tokenizer_t *tok)
     if (cur_u64(&c, &tensor_count) < 0) return -1;
     if (cur_u64(&c, &kv_count) < 0) return -1;
 
-    tok->bos_id = 128000;  /* Llama 3 defaults */
-    tok->eos_id = 128001;
+    tok->bos_id = 1;   /* Safe defaults (overwritten from GGUF metadata) */
+    tok->eos_id = 2;
 
     /* First pass: scan for tokenizer keys to get sizes */
     uint64_t tokens_offset = 0, merges_offset = 0;
@@ -550,13 +555,13 @@ int gguf_load_tokenizer(gguf_model_t *model, gguf_tokenizer_t *tok)
             for (uint64_t j = 0; j < arr_len; j++)
                 if (cur_string(&c, NULL, 0) < 0) return -1;
         } else if (key_eq(key, "tokenizer.ggml.bos_token_id")) {
-            if (val_type == GGUF_TYPE_UINT32) {
+            if (val_type == GGUF_TYPE_UINT32 || val_type == GGUF_TYPE_INT32) {
                 cur_u32(&c, &tok->bos_id);
             } else {
                 cur_skip_value(&c, val_type);
             }
         } else if (key_eq(key, "tokenizer.ggml.eos_token_id")) {
-            if (val_type == GGUF_TYPE_UINT32) {
+            if (val_type == GGUF_TYPE_UINT32 || val_type == GGUF_TYPE_INT32) {
                 cur_u32(&c, &tok->eos_id);
             } else {
                 cur_skip_value(&c, val_type);
@@ -634,4 +639,107 @@ void gguf_free_tokenizer(gguf_tokenizer_t *tok)
     (void)tok;
     /* Arrays allocated via mem_alloc_aligned — not individually freeable
      * with current allocator. Leak is acceptable (boot-time allocation). */
+}
+
+/* ── WASM: load from in-memory buffer ───────────────────────────
+ *
+ * Replaces gguf_load for the WASM build where OsitoFS is unavailable.
+ * The caller provides the raw GGUF file bytes already in RAM.
+ * Does two metadata passes:
+ *   1. gguf_extract_hyperparams — fills model->num_layers, hidden_size, etc.
+ *   2. gguf_parse_buffer        — fills model->tensors + data pointers
+ */
+
+/* Extract architecture hyperparameters from GGUF KV metadata. */
+static int gguf_extract_hyperparams(gguf_model_t *model)
+{
+    gguf_cursor_t c = {
+        .buf  = (const uint8_t *)model->file_data,
+        .size = model->file_size,
+        .pos  = 0
+    };
+
+    uint32_t magic, version;
+    uint64_t tensor_count, kv_count;
+    if (cur_u32(&c, &magic) < 0 || magic != GGUF_MAGIC) return -1;
+    if (cur_u32(&c, &version) < 0) return -1;
+    if (cur_u64(&c, &tensor_count) < 0) return -1;
+    if (cur_u64(&c, &kv_count) < 0) return -1;
+
+    for (uint64_t i = 0; i < kv_count; i++) {
+        char key[128];
+        if (cur_string(&c, key, sizeof(key)) < 0) return -1;
+
+        uint32_t val_type;
+        if (cur_u32(&c, &val_type) < 0) return -1;
+
+        if (key_eq(key, "general.name") && val_type == GGUF_TYPE_STRING) {
+            cur_string(&c, model->model_name, GGUF_MODEL_NAME_LEN);
+        } else if (key_eq(key, "llama.embedding_length") && val_type == GGUF_TYPE_UINT32) {
+            cur_u32(&c, &model->hidden_size);
+        } else if (key_eq(key, "llama.block_count") && val_type == GGUF_TYPE_UINT32) {
+            cur_u32(&c, &model->num_layers);
+        } else if (key_eq(key, "llama.attention.head_count") && val_type == GGUF_TYPE_UINT32) {
+            cur_u32(&c, &model->head_count);
+        } else if (key_eq(key, "llama.attention.head_count_kv") && val_type == GGUF_TYPE_UINT32) {
+            cur_u32(&c, &model->kv_head_count);
+        } else if (key_eq(key, "llama.context_length") && val_type == GGUF_TYPE_UINT32) {
+            cur_u32(&c, &model->context_length);
+        } else if (key_eq(key, "general.quantization_version") && val_type == GGUF_TYPE_UINT32) {
+            cur_u32(&c, &model->quant_type);
+        } else if (key_eq(key, "llama.rope.freq_base") && val_type == GGUF_TYPE_FLOAT32) {
+            cur_f32(&c, &model->rope_freq_base);
+        } else if (key_eq(key, "tokenizer.ggml.tokens") && val_type == GGUF_TYPE_ARRAY) {
+            uint32_t arr_type; uint64_t arr_len;
+            if (cur_u32(&c, &arr_type) < 0) return -1;
+            if (cur_u64(&c, &arr_len) < 0) return -1;
+            model->vocab_size = (uint32_t)arr_len;
+            for (uint64_t j = 0; j < arr_len; j++)
+                if (cur_skip_value(&c, arr_type) < 0) return -1;
+        } else {
+            if (cur_skip_value(&c, val_type) < 0) return -1;
+        }
+    }
+
+    if (model->kv_head_count == 0) model->kv_head_count = model->head_count;
+    if (model->rope_freq_base == 0.0f) model->rope_freq_base = 10000.0f;
+    return 0;
+}
+
+int gguf_load_from_mem(gguf_model_t *model, void *data, uint64_t size)
+{
+    memset(model, 0, sizeof(*model));
+    model->file_data = data;
+    model->file_size = size;
+
+    serial_puts("[GGUF] Parsing in-memory buffer (");
+    serial_putdec(size / (1024 * 1024));
+    serial_puts(" MB)...\n");
+
+    if (gguf_extract_hyperparams(model) < 0) {
+        serial_puts("[GGUF] Metadata extraction failed\n");
+        return -1;
+    }
+
+    serial_puts("[GGUF] \"");
+    serial_puts(model->model_name[0] ? model->model_name : "unnamed");
+    serial_puts("\" layers=");
+    serial_putdec(model->num_layers);
+    serial_puts(" dim=");
+    serial_putdec(model->hidden_size);
+    serial_puts(" vocab=");
+    serial_putdec(model->vocab_size);
+    serial_puts("\n");
+
+    if (gguf_parse_buffer(model) < 0) {
+        serial_puts("[GGUF] Tensor parse failed\n");
+        return -1;
+    }
+
+    serial_puts("[GGUF] ");
+    serial_putdec(model->num_tensors);
+    serial_puts(" tensors, ");
+    serial_putdec(model->tensor_data_size / (1024 * 1024));
+    serial_puts(" MB tensor data\n");
+    return 0;
 }

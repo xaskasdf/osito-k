@@ -141,6 +141,25 @@ extern int  llama_chat(void *state, const char *text, uint32_t max_tokens,
                        void (*on_token)(const char *text, void *ctx), void *ctx);
 extern void llama_set_sampling(float temperature, float top_p);
 
+/* ── WASM-compatibility shims ────────────────────────────────── */
+#ifdef __EMSCRIPTEN__
+#include <emscripten.h>
+static inline void sh_hlt(void)    { emscripten_sleep(0); }  /* yield to JS */
+static inline void sh_cli(void)    { /* no interrupts to disable */ }
+static inline void sh_sti(void)    { /* no interrupts to enable  */ }
+static inline void sh_reboot(void) { serial_puts("\n[WASM] Reboot: reload the page.\n"); }
+static inline void sh_halt(void)   { serial_puts("\n[WASM] Halted. Reload to restart.\n"); for(;;){} }
+#else
+static inline void sh_hlt(void)    { __asm__ volatile ("hlt"); }
+static inline void sh_cli(void)    { __asm__ volatile ("cli"); }
+static inline void sh_sti(void)    { __asm__ volatile ("sti"); }
+static inline void sh_reboot(void) {
+    struct { uint16_t limit; uint64_t base; } __attribute__((packed)) null_idt = { 0, 0 };
+    __asm__ volatile ("lidt %0; int3" : : "m"(null_idt));
+}
+static inline void sh_halt(void)   { __asm__ volatile ("cli"); for (;;) __asm__ volatile ("hlt"); }
+#endif
+
 /* ── Shell output helpers ────────────────────────────────────── */
 
 /* Output redirect hook (set by shell_exec for > and >> operators) */
@@ -264,7 +283,11 @@ static void cmd_help(void)
 static void cmd_uname(void)
 {
     sh_puts_color("OsitoK", 0x00FF8800);
+#ifdef WASM_BUILD
+    sh_puts(" wasm32 AI OS (");
+#else
     sh_puts(" x86-64 AI OS (");
+#endif
     sh_puts("naranjositos.tech");
     sh_puts(")\n");
 }
@@ -790,7 +813,7 @@ static void cmd_ping(int argc, char *argv[])
                 sh_puts("\n");
                 break;
             }
-            __asm__ volatile ("hlt");
+            sh_hlt();
         }
         if (net_icmp_get_rx_count() == old_count) {
             sh_puts("  timeout seq=");
@@ -1003,6 +1026,11 @@ static void cmd_tlstest(int argc, char *argv[])
 
 static void cmd_curl(int argc, char *argv[])
 {
+#ifdef WASM_BUILD
+    (void)argc; (void)argv;
+    sh_puts("curl: network not available in WASM\n");
+    return;
+#endif
     if (argc < 2) {
         sh_puts("Usage: curl <hostname> [path]\n");
         sh_puts("  Example: curl example.com /\n");
@@ -1518,7 +1546,7 @@ static void cmd_kexec(const char *arg)
     for (volatile int d = 0; d < 1000000; d++) {}
 
     /* Disable interrupts */
-    __asm__ volatile ("cli");
+    sh_cli();
 
     /* Step 7: Jump to trampoline */
     typedef void (*tramp_fn)(void *info, uint64_t entry,
@@ -1528,7 +1556,7 @@ static void cmd_kexec(const char *arg)
     tramp(new_info, ehdr->e_entry, seg_copy, nseg);
 
     /* Should never reach here */
-    for (;;) __asm__ volatile ("hlt");
+    for (;;) sh_hlt();
 }
 
 /* ── Builtin: reboot ─────────────────────────────────────────── */
@@ -1536,10 +1564,7 @@ static void cmd_kexec(const char *arg)
 static void cmd_reboot(void)
 {
     sh_puts("Rebooting...\n");
-    /* Triple fault — fastest way to reset on x86 */
-    /* Load a zero-length IDT and trigger an interrupt */
-    struct { uint16_t limit; uint64_t base; } __attribute__((packed)) null_idt = { 0, 0 };
-    __asm__ volatile ("lidt %0; int3" : : "m"(null_idt));
+    sh_reboot();
 }
 
 /* ── Builtin: halt ───────────────────────────────────────────── */
@@ -1547,8 +1572,7 @@ static void cmd_reboot(void)
 static void cmd_halt(void)
 {
     sh_puts_color("System halted.\n", 0x00FF8800);
-    __asm__ volatile ("cli");
-    for (;;) __asm__ volatile ("hlt");
+    sh_halt();
 }
 
 /* ── Builtin: clear ──────────────────────────────────────────── */
@@ -1728,7 +1752,7 @@ static void http_handle_request(int conn)
         } else if (r < 0) {
             return;  /* Connection closed */
         }
-        __asm__ volatile ("hlt");
+        sh_hlt();
     }
 
     if (total <= 0) return;
@@ -1806,9 +1830,9 @@ static void http_handle_request(int conn)
             if (resp) {
                 memcpy(resp, hdr_buf, hdr_len);
                 if (file_size > 0) {
-                    __asm__ volatile ("cli");
+                    sh_cli();
                     int rc = osfs2_read(file, 0, resp + hdr_len, file_size);
-                    __asm__ volatile ("sti");
+                    sh_sti();
                     if (rc < 0) {
                         serial_puts("[HTTPD] File read error\n");
                         file_size = 0;
@@ -1843,7 +1867,7 @@ static void httpd_thread(void)
             /* Brief poll to let ACKs arrive before FIN */
             for (int i = 0; i < 20; i++) {
                 net_poll();
-                __asm__ volatile ("hlt");
+                sh_hlt();
             }
             net_tcp_close(conn);
         }
@@ -2314,6 +2338,7 @@ void shell_run(void)
     sh_puts(" Type 'help' for commands.\n");
 
     /* Compact HW summary */
+#ifndef WASM_BUILD
     sh_puts(" ");
     sh_puts_color("[", 0x00666666);
     fb_putdec(pci_get_device_count());
@@ -2323,6 +2348,9 @@ void shell_run(void)
     if (i211_link_up()) sh_puts_color(" | NIC", 0x00666666);
     if (xhci_is_ready()) sh_puts_color(" | USB", 0x00666666);
     sh_puts_color("]\n\n", 0x00666666);
+#else
+    sh_puts_color(" [wasm32 | 256MB heap]\n\n", 0x00666666);
+#endif
 
     /* Auto-launch UT99 if osfs2 is mounted and UnrealTournament.exe exists */
     if (osfs2_is_mounted() && osfs2_find("UnrealTournament.exe")) {

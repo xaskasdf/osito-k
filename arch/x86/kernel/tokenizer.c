@@ -21,6 +21,126 @@ extern void serial_putdec(uint64_t val);
 extern void *kmalloc(uint64_t size);
 extern void  kfree(void *ptr);
 
+/* ── GPT-2 byte-level inverse mapping ───────────────────────── */
+
+/*
+ * GPT-2 BPE stores token strings with a bijective mapping from the 256
+ * possible bytes onto a set of printable Unicode characters:
+ *   - Printable ASCII (0x21-0x7E), ¡-¬ (0xA1-0xAC), ®-ÿ (0xAE-0xFF)
+ *     map to themselves (same Unicode code point as byte value).
+ *   - The remaining 68 "problem" bytes (0x00-0x20, 0x7F, 0x80-0xA0, 0xAD)
+ *     map to U+0100..U+0143 in order of their byte values.
+ *
+ * This table gives the actual byte for code points U+0100..U+0143:
+ *   index 0  = U+0100 (Ā) → byte 0x00
+ *   index 32 = U+0120 (Ġ) → byte 0x20  (SPACE — the common case)
+ *   index 33 = U+0121 (ġ) → byte 0x7F  (DEL)
+ *   index 34 = U+0122 (Ģ) → byte 0x80
+ *   ...
+ *   index 66 = U+0142 (ł) → byte 0xA0  (NBSP)
+ *   index 67 = U+0143 (Ń) → byte 0xAD  (soft hyphen)
+ */
+static const uint8_t gpt2_cp_to_byte[68] = {
+    /* 0x00-0x20: bytes 0..32 map to U+0100..U+0120 */
+    0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,
+    16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,
+    /* 0x7F: byte 127 → U+0121 */
+    127,
+    /* 0x80-0xA0: bytes 128..160 → U+0122..U+0142 */
+    128,129,130,131,132,133,134,135,136,137,138,139,
+    140,141,142,143,144,145,146,147,148,149,150,151,
+    152,153,154,155,156,157,158,159,160,
+    /* 0xAD: byte 173 → U+0143 */
+    173,
+};
+
+/*
+ * Decode one GPT-2-encoded token string (stored in GGUF as UTF-8)
+ * to the actual byte sequence it represents.
+ * Returns number of output bytes written to `out`.
+ */
+static uint32_t gpt2_decode_bytes(const uint8_t *in, uint16_t in_len,
+                                   uint8_t *out, uint32_t out_max)
+{
+    uint32_t r = 0, i = 0;
+    while (i < in_len && r < out_max) {
+        uint8_t  b0    = in[i];
+        uint32_t cp;
+        uint32_t width;
+
+        /* Decode UTF-8 to a Unicode code point */
+        if (b0 < 0x80) {
+            cp = b0; width = 1;
+        } else if ((b0 & 0xE0) == 0xC0 && i + 1 < in_len) {
+            cp = ((b0 & 0x1F) << 6) | (in[i+1] & 0x3F); width = 2;
+        } else if ((b0 & 0xF0) == 0xE0 && i + 2 < in_len) {
+            cp = ((b0 & 0x0F) << 12) | ((in[i+1] & 0x3F) << 6) | (in[i+2] & 0x3F); width = 3;
+        } else if ((b0 & 0xF8) == 0xF0 && i + 3 < in_len) {
+            cp = ((b0 & 0x07) << 18) | ((in[i+1] & 0x3F) << 12) |
+                 ((in[i+2] & 0x3F) << 6) | (in[i+3] & 0x3F); width = 4;
+        } else {
+            /* Invalid UTF-8 — pass through */
+            out[r++] = b0; i++; continue;
+        }
+        i += width;
+
+        /* Apply inverse GPT-2 mapping */
+        if (cp >= 0x0100 && cp <= 0x0143) {
+            /* Non-printable byte encoded in the Ā..Ń range */
+            out[r++] = gpt2_cp_to_byte[cp - 0x0100];
+        } else if (cp <= 0x00FF) {
+            /* Direct byte (printable ASCII, ¡-¬, ®-ÿ) */
+            out[r++] = (uint8_t)cp;
+        } else {
+            /* Real Unicode (e.g. in special tokens like <|im_start|>) — re-encode */
+            if (cp < 0x800 && r + 1 < out_max) {
+                out[r++] = 0xC0 | (cp >> 6);
+                out[r++] = 0x80 | (cp & 0x3F);
+            } else if (cp < 0x10000 && r + 2 < out_max) {
+                out[r++] = 0xE0 | (cp >> 12);
+                out[r++] = 0x80 | ((cp >> 6) & 0x3F);
+                out[r++] = 0x80 | (cp & 0x3F);
+            }
+        }
+    }
+    return r;
+}
+
+/*
+ * Encode raw bytes to GPT-2 vocab form (inverse of gpt2_decode_bytes).
+ * Each input byte → its GPT-2 Unicode code point → UTF-8.
+ * Used before vocab lookups so raw input bytes match the stored token strings.
+ */
+static uint32_t gpt2_encode_bytes(const uint8_t *in, uint32_t in_len,
+                                   uint8_t *out, uint32_t out_max)
+{
+    uint32_t r = 0;
+    for (uint32_t i = 0; i < in_len && r + 2 < out_max; i++) {
+        uint8_t  b  = in[i];
+        uint32_t cp;
+        /* Printable ranges map to themselves */
+        if ((b >= 33 && b <= 126) || (b >= 161 && b <= 172) || b >= 174) {
+            cp = b;
+        } else if (b <= 32) {
+            cp = 0x0100u + b;             /* 0x00-0x20 → U+0100-U+0120 */
+        } else if (b == 127) {
+            cp = 0x0121u;
+        } else if (b <= 160) {
+            cp = 0x0122u + (b - 128);     /* 0x80-0xA0 → U+0122-U+0142 */
+        } else {
+            cp = 0x0143u;                 /* 0xAD → U+0143 */
+        }
+        /* Emit UTF-8 */
+        if (cp < 0x80) {
+            out[r++] = (uint8_t)cp;
+        } else {                          /* U+0080-U+07FF: always 2 bytes here */
+            out[r++] = (uint8_t)(0xC0 | (cp >> 6));
+            out[r++] = (uint8_t)(0x80 | (cp & 0x3F));
+        }
+    }
+    return r;
+}
+
 /* Global tokenizer instance (initialized from GGUF metadata) */
 tokenizer_t g_tokenizer;
 
@@ -200,11 +320,11 @@ static uint32_t find_merge_rank(const tokenizer_t *tok, uint32_t a, uint32_t b)
 
 /* BPE encode a single word (byte sequence) into token IDs.
  *
- * Algorithm from tiktoken (OpenAI) / reason_agent:
- *   1. Start with one token per byte (or per known token)
- *   2. Find the pair with lowest merge rank
- *   3. Merge that pair (two tokens become one)
- *   4. Repeat until no more merges
+ * GPT-2 vocab stores token strings in byte-level Unicode encoding
+ * (e.g., space 0x20 → "Ġ" [0xC4,0xA0]).  Input raw bytes must be
+ * GPT-2-encoded before vocab lookup, which is what gpt2_encode_bytes does.
+ *
+ * Algorithm: greedy forward matching, then BPE merge loop.
  *
  * Returns number of tokens produced. */
 static int bpe_encode_word(const tokenizer_t *tok,
@@ -213,46 +333,36 @@ static int bpe_encode_word(const tokenizer_t *tok,
 {
     if (word_len == 0) return 0;
 
+    /* GPT-2 byte-encode the word (raw bytes → vocab-compatible UTF-8) */
+    uint8_t enc[TOK_MAX_TOKEN_LEN * 2 + 4];
+    uint32_t enc_len = gpt2_encode_bytes(word, word_len, enc, sizeof(enc));
+
     /* Fast path: entire word is a single known token */
-    uint32_t direct = tok_lookup(tok, word, word_len);
+    uint32_t direct = tok_lookup(tok, enc, enc_len);
     if (direct != (uint32_t)-1) {
         if (max_out < 1) return -1;
         out[0] = direct;
         return 1;
     }
 
-    /* Start with individual bytes */
     uint32_t ids[TOK_MAX_TOKEN_LEN + 1];
     uint32_t n_ids = 0;
 
-    /* Try to start with known multi-byte tokens using greedy forward matching */
+    /* Start with one token per GPT-2 character unit (proper BPE initialization).
+     * Each input byte → 1 or 2 encoded bytes → one vocab token.
+     * The BPE merge loop below will combine them according to merge rules. */
     uint32_t pos = 0;
-    while (pos < word_len && n_ids < TOK_MAX_TOKEN_LEN) {
-        /* Try decreasing lengths to find longest known token */
-        bool found = false;
-        uint32_t try_len = word_len - pos;
-        if (try_len > 16) try_len = 16;  /* Cap at reasonable token length */
-
-        for (uint32_t tl = try_len; tl >= 2; tl--) {
-            uint32_t tid = tok_lookup(tok, word + pos, tl);
-            if (tid != (uint32_t)-1) {
-                ids[n_ids++] = tid;
-                pos += tl;
-                found = true;
-                break;
-            }
+    while (pos < enc_len && n_ids < TOK_MAX_TOKEN_LEN) {
+        uint32_t unit_len = 1;
+        if ((enc[pos] & 0xE0) == 0xC0 && pos + 1 < enc_len)
+            unit_len = 2;  /* 2-byte UTF-8 for GPT-2 special byte */
+        uint32_t tid = tok_lookup(tok, enc + pos, unit_len);
+        if (tid != (uint32_t)-1) {
+            ids[n_ids++] = tid;
+        } else {
+            ids[n_ids++] = enc[pos];  /* fallback */
         }
-        if (!found) {
-            /* Single byte */
-            uint32_t tid = tok_lookup(tok, word + pos, 1);
-            if (tid != (uint32_t)-1) {
-                ids[n_ids++] = tid;
-            } else {
-                /* Unknown byte — use byte value directly (fallback) */
-                ids[n_ids++] = word[pos];
-            }
-            pos++;
-        }
+        pos += unit_len;
     }
 
     /* If we already have merges, apply BPE merge loop */
@@ -399,16 +509,17 @@ int tok_decode(const tokenizer_t *tok, const uint32_t *tokens, uint32_t n_tokens
         if (id >= tok->vocab_size) continue;
 
         const tok_entry_t *e = &tok->vocab[id];
-        uint32_t len = e->len;
-        if (written + len > max_out) break;
-        memcpy(out + written, e->bytes, len);
-        written += len;
+        uint32_t n = gpt2_decode_bytes(e->bytes, e->len,
+                                        (uint8_t *)(out + written),
+                                        max_out - written);
+        written += n;
     }
 
     return (int)written;
 }
 
-static char tok_decode_buf[TOK_MAX_TOKEN_LEN + 1];
+/* Decode buffer — twice the max token length to accommodate GPT-2 expansion */
+static uint8_t tok_decode_buf[TOK_MAX_TOKEN_LEN * 2 + 1];
 
 const char *tok_decode_one(const tokenizer_t *tok, uint32_t token_id)
 {
@@ -416,9 +527,40 @@ const char *tok_decode_one(const tokenizer_t *tok, uint32_t token_id)
         return NULL;
 
     const tok_entry_t *e = &tok->vocab[token_id];
-    memcpy(tok_decode_buf, e->bytes, e->len);
-    tok_decode_buf[e->len] = '\0';
-    return tok_decode_buf;
+    uint32_t n = gpt2_decode_bytes(e->bytes, e->len,
+                                    tok_decode_buf,
+                                    sizeof(tok_decode_buf) - 1);
+    tok_decode_buf[n] = '\0';
+    return (const char *)tok_decode_buf;
+}
+
+/* ── Special token helpers ───────────────────────────────────── */
+
+uint32_t tok_get_bos_id(const void *tok)
+{
+    return ((const tokenizer_t *)tok)->bos_id;
+}
+
+uint32_t tok_get_eos_id(const void *tok)
+{
+    return ((const tokenizer_t *)tok)->eos_id;
+}
+
+/*
+ * tok_find_special — search vocab for exact string s.
+ * Returns token ID if found, UINT32_MAX otherwise.
+ */
+uint32_t tok_find_special(const void *tok, const char *s)
+{
+    const tokenizer_t *t = (const tokenizer_t *)tok;
+    uint32_t slen = 0;
+    while (s[slen]) slen++;
+    for (uint32_t i = 0; i < t->vocab_size; i++) {
+        if (t->vocab[i].len == (uint16_t)slen &&
+            __builtin_memcmp(t->vocab[i].bytes, s, slen) == 0)
+            return i;
+    }
+    return UINT32_MAX;
 }
 
 /* ── Cleanup ─────────────────────────────────────────────────── */

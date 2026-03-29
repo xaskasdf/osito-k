@@ -17,6 +17,9 @@
 
 #include "../include/types.h"
 #include "gui.h"
+#ifdef __EMSCRIPTEN__
+#include <emscripten.h>
+#endif
 
 /* ── External functions ──────────────────────────────────────── */
 
@@ -57,6 +60,9 @@ extern void xhci_poll(void) __attribute__((weak));
 
 /* ── CMOS RTC helpers ──────────────────────────────────────── */
 
+#ifdef __EMSCRIPTEN__
+static inline uint8_t cmos_read(uint8_t reg) { (void)reg; return 0; }
+#else
 static inline uint8_t cmos_read(uint8_t reg)
 {
     __asm__ volatile ("outb %0, %1" : : "a"(reg), "Nd"((uint16_t)0x70));
@@ -64,6 +70,7 @@ static inline uint8_t cmos_read(uint8_t reg)
     __asm__ volatile ("inb %1, %0" : "=a"(val) : "Nd"((uint16_t)0x71));
     return val;
 }
+#endif
 
 static inline uint8_t bcd2bin(uint8_t v) { return (v >> 4) * 10 + (v & 0x0F); }
 
@@ -117,14 +124,16 @@ static bool     dragging;
 static int32_t  drag_win_idx;       /* index into demo_windows[] */
 static int32_t  drag_off_x, drag_off_y;
 static uint8_t  prev_buttons;
-static int      focused_demo_idx = -1;  /* -1=none, 0=Terminal */
+static int      focused_demo_idx = 0;   /* 0=Terminal (focused by default) */
 
 /* Maximize / restore state (per demo window) */
 static bool    is_maximized[2];
 static int32_t saved_geom[2][4];    /* x, y, w, h before maximize */
 
-/* Alt+Tab state */
+/* Modifier key state (tracked from HID virtual scancodes) */
 static bool    alt_held;
+static bool    comp_shift_held;
+static bool    comp_ctrl_held;
 
 /* Terminal surface: shm pixel buffer written by the shell thread,
  * blitted by the compositor over demo_windows[0] content area.
@@ -773,11 +782,19 @@ static void compositor_render_frame(void)
         info.mem_total_mb = mem_get_total() / (1024 * 1024);
         info.ticks = idt_get_ticks();
         info.procs = proc_count_active();
-        /* Read CMOS RTC (BCD mode, 24h), adjust to GMT-3 */
+        /* Read RTC time */
+#ifdef __EMSCRIPTEN__
+        /* Use JS Date object — already in local timezone */
+        info.rtc_hour = (uint8_t)EM_ASM_INT({ return new Date().getHours(); });
+        info.rtc_min  = (uint8_t)EM_ASM_INT({ return new Date().getMinutes(); });
+        info.rtc_sec  = (uint8_t)EM_ASM_INT({ return new Date().getSeconds(); });
+#else
+        /* CMOS RTC (BCD mode, 24h), adjust to GMT-3 */
         info.rtc_sec  = bcd2bin(cmos_read(0x00));
         info.rtc_min  = bcd2bin(cmos_read(0x02));
         { uint8_t raw_h = bcd2bin(cmos_read(0x04));
-          info.rtc_hour = (raw_h + 24 - 3) % 24; } /* UTC → GMT-3 */
+          info.rtc_hour = (raw_h + 24 - 3) % 24; }
+#endif
         gui_panel_set_debug(&info);
     }
 
@@ -869,13 +886,10 @@ void compositor_thread(void)
                 uint8_t type = evt[0];
                 uint8_t sc   = evt[1];
 
-                /* Track Alt key state.
-                 * USB: Left Alt = 0xE2, Right Alt = 0xE6 (HID modifier virtual scancodes).
-                 * PS/2: Alt = 0x38.
-                 * (input_post_key's kb_modifiers doesn't update for USB 0xE0+ virtual scancodes.) */
-                if (sc == 0xE2 || sc == 0xE6 || sc == 0x38) {
-                    alt_held = (type == 1);  /* INPUT_KEY_DOWN */
-                }
+                /* Track modifier key state from HID virtual scancodes (0xE0+index). */
+                if (sc == 0xE2 || sc == 0xE6 || sc == 0x38) alt_held        = (type == 1);
+                if (sc == 0xE1 || sc == 0xE5)               comp_shift_held = (type == 1);
+                if (sc == 0xE0 || sc == 0xE4)               comp_ctrl_held  = (type == 1);
 
                 /* Alt+Tab: cycle through windows (USB Tab = HID 0x2B, PS/2 Tab = 0x0F) */
                 if (type == 1 && alt_held && (sc == 0x2B || sc == 0x0F)) {
@@ -892,15 +906,44 @@ void compositor_thread(void)
                     continue;  /* don't push Tab into key ring while Alt is held */
                 }
 
-                /* NOTE: xhci.c already calls kb_push() directly for USB
-                 * keyboard input. No injection needed here — it would
-                 * double-push using wrong (HID) keycodes as PS/2 scancodes. */
+                /* Push event into key_ring (for games / GUI) */
                 uint32_t next = (key_ring_head + 1) & KEY_RING_MASK;
-                if (next == key_ring_tail)
-                    break;  /* ring full, drop remaining */
-                key_ring[key_ring_head].scancode = (uint32_t)sc;
-                key_ring[key_ring_head].pressed  = (type == 1); /* INPUT_KEY_DOWN */
-                key_ring_head = next;
+                if (next != key_ring_tail) {
+                    key_ring[key_ring_head].scancode = (uint32_t)sc;
+                    key_ring[key_ring_head].pressed  = (type == 1);
+                    key_ring_head = next;
+                }
+
+                /* Focus-based terminal routing: convert HID key-down events to
+                 * ASCII/VT100 and push to kb_buf ONLY when the terminal window
+                 * has focus (focused_demo_idx == 0). Other windows don't get
+                 * keyboard input — they'd need their own routing. */
+                if (!has_fullscreen && type == 1 && focused_demo_idx == 0) {
+                    extern void kb_push(char c);
+                    extern void kb_push_esc(const char *seq);
+                    extern const char hid_normal[];
+                    extern const char hid_shifted[];
+                    switch (sc) {
+                    case 0x4F: kb_push_esc("C");  break; /* Right */
+                    case 0x50: kb_push_esc("D");  break; /* Left */
+                    case 0x51: kb_push_esc("B");  break; /* Down */
+                    case 0x52: kb_push_esc("A");  break; /* Up */
+                    case 0x4A: kb_push_esc("H");  break; /* Home */
+                    case 0x4D: kb_push_esc("F");  break; /* End */
+                    case 0x49: kb_push_esc("2~"); break; /* Insert */
+                    case 0x4C: kb_push_esc("3~"); break; /* Delete */
+                    case 0x4B: kb_push_esc("5~"); break; /* Page Up */
+                    case 0x4E: kb_push_esc("6~"); break; /* Page Down */
+                    default:
+                        if (sc < 0x54) {
+                            char c = comp_shift_held ? hid_shifted[sc] : hid_normal[sc];
+                            if (comp_ctrl_held && c >= 'a' && c <= 'z') c = c - 'a' + 1;
+                            if (comp_ctrl_held && c >= 'A' && c <= 'Z') c = c - 'A' + 1;
+                            if (c) kb_push(c);
+                        }
+                        break;
+                    }
+                }
             }
         }
 
@@ -925,6 +968,9 @@ void compositor_thread(void)
             serial_puts("[COMP] FS->desktop: force refresh\n");
             extern void display_force_refresh(void);
             display_force_refresh();
+            /* Game exited — restore focus to terminal */
+            focused_demo_idx = 0;
+            gui_desktop_raise_window(0);
         }
         comp_was_fullscreen = has_fullscreen;
 
@@ -938,6 +984,52 @@ void compositor_stop(void)
 {
     compositor_running = false;
 }
+
+/* ── WASM: single-frame render (called from JS requestAnimationFrame) ── */
+
+#ifdef __EMSCRIPTEN__
+extern void display_flip_nowait(void);
+
+void compositor_start_wasm(void)
+{
+    compositor_running = true;
+    serial_puts("[COMP] WASM compositor started (rAF)\n");
+}
+
+EMSCRIPTEN_KEEPALIVE
+void wasm_compositor_frame(void)
+{
+    if (!compositor_running) return;
+
+    /* ── Input processing (mirrors the x86 main loop) ── */
+    if (input_has_events()) {
+        int16_t mdx, mdy, wheel;
+        uint8_t buttons;
+        uint8_t key_buf[32 * 24];
+        int nkeys = input_drain_coalesced(&mdx, &mdy, &buttons,
+                                          &wheel, key_buf, 32);
+        comp_button_state = buttons;
+        comp_wheel_accum += wheel;
+
+        /* Key events: route to focused window's shell */
+        for (int i = 0; i < nkeys; i++) {
+            uint8_t *evt = &key_buf[i * 24];
+            uint8_t type = evt[0];
+            uint8_t sc   = evt[1];
+            if (sc == 0xE2 || sc == 0xE6 || sc == 0x38) alt_held        = (type == 1);
+            if (sc == 0xE1 || sc == 0xE5)               comp_shift_held = (type == 1);
+            if (sc == 0xE0 || sc == 0xE4)               comp_ctrl_held  = (type == 1);
+        }
+    }
+    process_mouse_input();
+
+    /* ── Render ── */
+    gui_anim_tick(idt_get_ticks() * 10);
+    compositor_render_frame();
+    display_mark_dirty();
+    display_flip_nowait();
+}
+#endif
 
 bool compositor_is_running(void)
 {
@@ -986,10 +1078,12 @@ void compositor_init(void)
     key_ring_tail = 0;
     comp_button_state = 0;
     comp_wheel_accum = 0;
-    focused_demo_idx = -1;
+    focused_demo_idx = 0;   /* terminal has focus by default */
     is_maximized[0] = false;
     is_maximized[1] = false;
-    alt_held = false;
+    alt_held        = false;
+    comp_shift_held = false;
+    comp_ctrl_held  = false;
     terminal_shm    = 0;
     terminal_pixels = NULL;
     terminal_w      = 0;

@@ -1,0 +1,255 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>OsitoK — WebAssembly Shell</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+
+        body {
+            background: #0D0D0D;
+            color: #00FF88;
+            font-family: 'Courier New', 'VT323', monospace;
+            height: 100vh;
+            display: flex;
+            flex-direction: column;
+        }
+
+        .toolbar {
+            background: #161b22;
+            border-bottom: 1px solid #FF6B2C;
+            padding: 10px 20px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+
+        .toolbar h1 {
+            font-size: 14px;
+            color: #FF6B2C;
+            letter-spacing: 2px;
+            text-transform: uppercase;
+        }
+
+        .toolbar .badge {
+            font-size: 11px;
+            color: #00FF88;
+            border: 1px solid #00FF88;
+            padding: 2px 8px;
+        }
+
+        #terminal {
+            flex: 1;
+            padding: 16px;
+            overflow-y: auto;
+            white-space: pre-wrap;
+            word-break: break-all;
+            font-size: 13px;
+            line-height: 1.5;
+            color: #00FF88;
+            background: #0D0D0D;
+        }
+
+        .input-row {
+            display: flex;
+            align-items: center;
+            padding: 8px 16px;
+            border-top: 1px solid #222;
+            background: #111;
+        }
+
+        #prompt-label {
+            color: #FF6B2C;
+            font-size: 13px;
+            margin-right: 8px;
+            white-space: nowrap;
+        }
+
+        #input-field {
+            flex: 1;
+            background: transparent;
+            border: none;
+            outline: none;
+            color: #00FF88;
+            font-family: inherit;
+            font-size: 13px;
+            caret-color: #FFD93D;
+        }
+
+        .status-bar {
+            background: #161b22;
+            border-top: 1px solid #30363d;
+            padding: 4px 16px;
+            font-size: 11px;
+            color: #888;
+            display: flex;
+            gap: 16px;
+        }
+
+        .status-bar .ok { color: #00FF88; }
+        .status-bar .warn { color: #FFD93D; }
+    </style>
+</head>
+<body>
+
+<div class="toolbar">
+    <h1>[>_] OsitoK / WebAssembly</h1>
+    <span class="badge">WASM</span>
+</div>
+
+<div id="terminal">Loading kernel...</div>
+
+<div class="input-row">
+    <span id="prompt-label">></span>
+    <input id="input-field" type="text" autocomplete="off" autocorrect="off"
+           autocapitalize="off" spellcheck="false" placeholder="waiting for kernel..." disabled>
+</div>
+
+<div class="status-bar">
+    <span id="status-arch">arch: wasm32</span>
+    <span id="status-mem">mem: --</span>
+    <span id="status-fs">fs: --</span>
+</div>
+
+<script>
+    // ── Terminal output ──────────────────────────────────────────
+
+    const terminal = document.getElementById('terminal');
+    const inputField = document.getElementById('input-field');
+
+    terminal.textContent = '';
+
+    // UTF-8 accumulator: buffer bytes until a complete code point is ready.
+    var _utf8_buf = [];
+
+    function wasm_putchar(c) {
+        c = c & 0xFF;         // C char may be signed; normalize to 0-255
+        if (c === 13) return; // \r
+
+        _utf8_buf.push(c);
+
+        // Determine expected sequence length from the first byte.
+        var b0 = _utf8_buf[0];
+        var expected;
+        if      (b0 < 0x80)              expected = 1;
+        else if ((b0 & 0xE0) === 0xC0)  expected = 2;
+        else if ((b0 & 0xF0) === 0xE0)  expected = 3;
+        else if ((b0 & 0xF8) === 0xF0)  expected = 4;
+        else { _utf8_buf = []; return; } // invalid lead byte
+
+        if (_utf8_buf.length < expected) return; // need more bytes
+
+        // Decode the complete sequence.
+        var bytes = _utf8_buf.splice(0, expected);
+        var cp;
+        if (expected === 1) {
+            cp = bytes[0];
+        } else if (expected === 2) {
+            cp = ((bytes[0] & 0x1F) << 6)  | (bytes[1] & 0x3F);
+        } else if (expected === 3) {
+            cp = ((bytes[0] & 0x0F) << 12) | ((bytes[1] & 0x3F) << 6) | (bytes[2] & 0x3F);
+        } else {
+            cp = ((bytes[0] & 0x07) << 18) | ((bytes[1] & 0x3F) << 12) |
+                 ((bytes[2] & 0x3F) << 6)  | (bytes[3] & 0x3F);
+        }
+
+        if (cp === 10) {
+            terminal.textContent += '\n';
+        } else {
+            try { terminal.textContent += String.fromCodePoint(cp); }
+            catch(e) { terminal.textContent += '?'; }
+        }
+        terminal.scrollTop = terminal.scrollHeight;
+    }
+
+    function wasm_clear_terminal() {
+        terminal.textContent = '';
+        _utf8_buf = [];
+    }
+
+    // ── Keyboard input → C ring buffer ──────────────────────────
+
+    inputField.addEventListener('keydown', function(e) {
+        if (e.key === 'Enter') {
+            const line = inputField.value;
+            inputField.value = '';
+            // Push each character + newline into C ring buffer
+            for (let i = 0; i < line.length; i++) {
+                Module.ccall('wasm_kb_push', null, ['number'], [line.charCodeAt(i)]);
+            }
+            Module.ccall('wasm_kb_push', null, ['number'], [13]); // '\r' → enter
+            e.preventDefault();
+        } else if (e.key === 'Backspace') {
+            Module.ccall('wasm_kb_push', null, ['number'], [8]); // '\b'
+        } else if (e.ctrlKey && e.key === 'c') {
+            Module.ccall('wasm_kb_push', null, ['number'], [3]); // Ctrl+C
+            e.preventDefault();
+        }
+    });
+
+    // Enable input field once WASM is running
+    function wasm_enable_input() {
+        inputField.disabled = false;
+        inputField.placeholder = 'type a command...';
+        inputField.focus();
+        document.getElementById('prompt-label').textContent = '$';
+
+        // Update status bar
+        try {
+            const usedKb = Module.ccall('wasm_get_mem_used_kb', 'number', [], []);
+            document.getElementById('status-mem').textContent =
+                'mem: ' + (usedKb > 1024 ? (usedKb / 1024).toFixed(1) + ' MB' : usedKb + ' KB') + ' used';
+        } catch(e) {}
+        document.getElementById('status-fs').textContent = 'fs: stub';
+    }
+
+    // ── Model pre-fetch ─────────────────────────────────────────
+    // Start fetching the GGUF model immediately (parallel with WASM init).
+    // C side polls window.__modelFetchDone via emscripten_sleep.
+
+    window.__modelBuf      = null;   // Uint8Array once downloaded
+    window.__modelFetchDone = false; // true when fetch completes (success or fail)
+
+    (function() {
+        const MODEL_URL = 'https://factory.naranjositos.tech/models/smollm2-135m-instruct-q4_0.gguf';
+        fetch(MODEL_URL)
+            .then(function(r) {
+                if (!r.ok) throw new Error('HTTP ' + r.status);
+                return r.arrayBuffer();
+            })
+            .then(function(ab) {
+                window.__modelBuf = new Uint8Array(ab);
+                console.log('[WASM] model downloaded: ' + ab.byteLength + ' bytes');
+                window.__modelFetchDone = true;
+            })
+            .catch(function(e) {
+                console.error('[WASM] model fetch failed:', e);
+                window.__modelFetchDone = true;
+            });
+    })();
+
+    // ── Emscripten module config ─────────────────────────────────
+
+    var Module = {
+        print: function(text) {
+            for (let i = 0; i < text.length; i++) wasm_putchar(text.charCodeAt(i));
+            wasm_putchar(10); // newline
+        },
+        printErr: function(text) {
+            terminal.textContent += '[ERR] ' + text + '\n';
+        },
+        onRuntimeInitialized: function() {
+            // Input is enabled here so the user can type during model load.
+            // main() runs next and polls __modelFetchDone before shell_run().
+            wasm_enable_input();
+        },
+        noInitialRun: false,
+    };
+</script>
+
+<!-- Emscripten-generated JS bundle (injected by emcc) -->
+{{{ SCRIPT }}}
+
+</body>
+</html>

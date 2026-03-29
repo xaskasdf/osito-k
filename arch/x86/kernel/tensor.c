@@ -10,6 +10,11 @@
 
 #include "tensor.h"
 
+#ifdef __EMSCRIPTEN__
+#include <emscripten.h>
+#include <math.h>   /* expf, sinf, cosf, sqrtf, powf from hosted libc */
+#endif
+
 /* ── External functions ──────────────────────────────── */
 
 extern void serial_puts(const char *s);
@@ -24,6 +29,7 @@ extern void  mem_free_pages(void *addr, uint64_t count);
 
 static int avx2_detected = -1;  /* -1 = not checked yet */
 
+#ifndef __EMSCRIPTEN__
 int tensor_avx2_detect(void)
 {
     uint32_t eax, ebx, ecx, edx;
@@ -67,6 +73,9 @@ int tensor_avx2_detect(void)
     avx2_detected = (ebx >> 5) & 1;
     return avx2_detected;
 }
+#else
+int tensor_avx2_detect(void) { avx2_detected = 0; return 0; }
+#endif
 
 int tensor_has_avx2(void)
 {
@@ -79,9 +88,13 @@ int tensor_has_avx2(void)
 
 static inline uint64_t rdtsc(void)
 {
+#ifndef __EMSCRIPTEN__
     uint32_t lo, hi;
     __asm__ volatile ("rdtsc" : "=a"(lo), "=d"(hi));
     return ((uint64_t)hi << 32) | lo;
+#else
+    return (uint64_t)emscripten_get_now();
+#endif
 }
 
 static inline float fabsf_bare(float x)
@@ -150,40 +163,37 @@ float f16_to_f32(uint16_t h)
     return f;
 }
 
-/* SSE sqrtss — single instruction, IEEE 754 exact */
+/* sqrt — SSE sqrtss on x86, libc sqrtf on WASM */
 float sqrtf_bare(float x)
 {
+#ifndef __EMSCRIPTEN__
     float r;
     __asm__ ("sqrtss %1, %0" : "=x"(r) : "x"(x));
     return r;
+#else
+    return sqrtf(x);
+#endif
 }
 
-/*
- * exp(x) via x87 FPU
- *
- * Algorithm: exp(x) = 2^(x * log2(e))
- *   1. y = x * log2(e)           (fldl2e + fmulp)
- *   2. n = round(y)              (frndint)
- *   3. f = y - n                 (fsub, f in [-0.5, 0.5])
- *   4. 2^f via f2xm1 + 1        (f2xm1 valid for [-1,1])
- *   5. scale by 2^n              (fscale)
- */
+/* Math functions — x87 FPU on x86, libc on WASM */
+#ifndef __EMSCRIPTEN__
+
 float expf_bare(float x)
 {
     float result;
     __asm__ volatile (
         "flds   %[x]\n\t"
         "fldl2e\n\t"
-        "fmulp\n\t"                    /* ST(0) = x * log2(e) = y */
-        "fld    %%st(0)\n\t"           /* ST(0) = y, ST(1) = y */
-        "frndint\n\t"                  /* ST(0) = n, ST(1) = y */
-        "fsub   %%st, %%st(1)\n\t"     /* ST(1) = y - n = f */
-        "fxch   %%st(1)\n\t"           /* ST(0) = f, ST(1) = n */
-        "f2xm1\n\t"                    /* ST(0) = 2^f - 1 */
+        "fmulp\n\t"
+        "fld    %%st(0)\n\t"
+        "frndint\n\t"
+        "fsub   %%st, %%st(1)\n\t"
+        "fxch   %%st(1)\n\t"
+        "f2xm1\n\t"
         "fld1\n\t"
-        "faddp\n\t"                    /* ST(0) = 2^f */
-        "fscale\n\t"                   /* ST(0) = 2^f * 2^n = exp(x) */
-        "fstp   %%st(1)\n\t"           /* pop n */
+        "faddp\n\t"
+        "fscale\n\t"
+        "fstp   %%st(1)\n\t"
         "fstps  %[out]\n\t"
         : [out] "=m"(result)
         : [x] "m"(x)
@@ -191,7 +201,6 @@ float expf_bare(float x)
     return result;
 }
 
-/* x87 FPU sin(x) — for RoPE, not hot path */
 float sinf_bare(float x)
 {
     float result;
@@ -205,7 +214,6 @@ float sinf_bare(float x)
     return result;
 }
 
-/* x87 FPU cos(x) — for RoPE, not hot path */
 float cosf_bare(float x)
 {
     float result;
@@ -219,27 +227,21 @@ float cosf_bare(float x)
     return result;
 }
 
-/*
- * pow(base, exponent) via x87 FPU
- *
- * Algorithm: base^exp = 2^(exp * log2(base))
- *   fyl2x computes ST(1) * log2(ST(0)), then 2^result via f2xm1+fscale
- */
 float powf_bare(float base, float exponent)
 {
     float result;
     __asm__ volatile (
-        "flds   %[exp]\n\t"            /* ST(0) = exp */
-        "flds   %[base]\n\t"           /* ST(0) = base, ST(1) = exp */
-        "fyl2x\n\t"                    /* ST(0) = exp * log2(base) = y */
-        "fld    %%st(0)\n\t"           /* ST(0) = y, ST(1) = y */
-        "frndint\n\t"                  /* ST(0) = n, ST(1) = y */
-        "fsub   %%st, %%st(1)\n\t"     /* ST(1) = y - n = f */
-        "fxch   %%st(1)\n\t"           /* ST(0) = f, ST(1) = n */
-        "f2xm1\n\t"                    /* ST(0) = 2^f - 1 */
+        "flds   %[exp]\n\t"
+        "flds   %[base]\n\t"
+        "fyl2x\n\t"
+        "fld    %%st(0)\n\t"
+        "frndint\n\t"
+        "fsub   %%st, %%st(1)\n\t"
+        "fxch   %%st(1)\n\t"
+        "f2xm1\n\t"
         "fld1\n\t"
-        "faddp\n\t"                    /* ST(0) = 2^f */
-        "fscale\n\t"                   /* ST(0) = 2^f * 2^n */
+        "faddp\n\t"
+        "fscale\n\t"
         "fstp   %%st(1)\n\t"
         "fstps  %[out]\n\t"
         : [out] "=m"(result)
@@ -247,6 +249,15 @@ float powf_bare(float base, float exponent)
     );
     return result;
 }
+
+#else /* __EMSCRIPTEN__ — delegate to libc math */
+
+float expf_bare(float x)  { return expf(x); }
+float sinf_bare(float x)  { return sinf(x); }
+float cosf_bare(float x)  { return cosf(x); }
+float powf_bare(float base, float exponent) { return powf(base, exponent); }
+
+#endif /* __EMSCRIPTEN__ */
 
 /* ══════════════════════════════════════════════════════════
  *  Dequantization
@@ -263,8 +274,8 @@ void dequant_q4_0(const void *src, float *dst, uint64_t n)
         float scale = f16_to_f32(*(const uint16_t *)p);
         p += 2;
         for (int j = 0; j < 16; j++) {
-            dst[i + j * 2]     = ((int)(p[j] & 0xF) - 8) * scale;
-            dst[i + j * 2 + 1] = ((int)(p[j] >> 4)  - 8) * scale;
+            dst[i + j]      = ((int)(p[j] & 0xF) - 8) * scale;  /* low nibbles: [0..15]  */
+            dst[i + j + 16] = ((int)(p[j] >> 4)  - 8) * scale;  /* high nibbles: [16..31] */
         }
         p += 16;
     }
@@ -312,7 +323,7 @@ static void matvec_q4_0_scalar(float *out, const void *weight,
             for (int j = 0; j < 16; j++) {
                 int lo = (w[j] & 0xF) - 8;
                 int hi = (w[j] >> 4)  - 8;
-                sum += scale * (lo * inp[j * 2] + hi * inp[j * 2 + 1]);
+                sum += scale * (lo * inp[j] + hi * inp[j + 16]);
             }
             w += 16;
         }

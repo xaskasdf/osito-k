@@ -116,6 +116,7 @@ static void fb_mark_dirty(uint32_t pixel_top, uint32_t pixel_bot)
 
 void fb_clear(void)
 {
+    if (!fb_base) return;
     uint32_t fill = fb_clear_clr;
     uint64_t fill64 = (uint64_t)fill | ((uint64_t)fill << 32);
     uint64_t *p = (uint64_t *)fb_base;

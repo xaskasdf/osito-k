@@ -13,7 +13,7 @@
 #include "../include/types.h"
 
 /* GGUF magic */
-#define GGUF_MAGIC    0x46475547  /* "GGUF" */
+#define GGUF_MAGIC    0x46554747  /* "GGUF" — bytes 0x47,0x47,0x55,0x46 LE */
 
 /* GGUF value types (for skipping metadata) */
 #define GGUF_TYPE_UINT8    0
@@ -71,6 +71,7 @@ typedef struct gguf_model {
     uint32_t head_count;
     uint32_t kv_head_count;
     uint32_t context_length;
+    float    rope_freq_base;     /* RoPE theta (default 10000) */
 
     /* Raw file data in RAM */
     void    *file_data;         /* complete file buffer */

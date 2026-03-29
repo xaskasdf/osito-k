@@ -53,7 +53,8 @@ static inline uint64_t mmio_read64(volatile void *addr) {
     return *(volatile uint64_t *)addr;
 }
 
-/* Port I/O */
+/* Port I/O — x86 only; no-ops when compiling for WASM */
+#ifndef __EMSCRIPTEN__
 static inline void outb(uint16_t port, uint8_t val) {
     __asm__ volatile ("outb %0, %1" : : "a"(val), "Nd"(port));
 }
@@ -74,7 +75,7 @@ static inline uint32_t inl(uint16_t port) {
     return val;
 }
 
-/* Memory barriers */
+/* Memory barriers — x86 fence instructions */
 #define mb()  __asm__ volatile ("mfence" ::: "memory")
 #define wmb() __asm__ volatile ("sfence" ::: "memory")
 #define rmb() __asm__ volatile ("lfence" ::: "memory")
@@ -119,5 +120,20 @@ static inline int strcmp(const char *a, const char *b) {
     while (*a && *a == *b) { a++; b++; }
     return *(unsigned char *)a - *(unsigned char *)b;
 }
+
+#else /* __EMSCRIPTEN__ — use hosted libc, stub out port I/O */
+
+#include <string.h>
+
+static inline void     outb(uint16_t p, uint8_t v)  { (void)p; (void)v; }
+static inline uint8_t  inb(uint16_t p)              { (void)p; return 0; }
+static inline void     outl(uint16_t p, uint32_t v) { (void)p; (void)v; }
+static inline uint32_t inl(uint16_t p)              { (void)p; return 0; }
+
+#define mb()  __asm__ volatile ("" ::: "memory")
+#define wmb() __asm__ volatile ("" ::: "memory")
+#define rmb() __asm__ volatile ("" ::: "memory")
+
+#endif /* __EMSCRIPTEN__ */
 
 #endif /* OSITOK_X86_TYPES_H */

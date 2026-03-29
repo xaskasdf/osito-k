@@ -52,6 +52,7 @@ typedef struct {
     uint32_t dim, n_layers, n_heads, n_kv_heads;
     uint32_t head_dim, kv_dim, ffn_dim, vocab_size, max_seq;
     uint32_t gqa_ratio;     /* n_heads / n_kv_heads */
+    float    rope_freq_base; /* RoPE theta (10000 = default, 500000 = Llama 3) */
 
     /* Resolved weights */
     llama_weights_t weights;

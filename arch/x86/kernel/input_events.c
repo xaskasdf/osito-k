@@ -17,6 +17,9 @@
  */
 
 #include "../include/types.h"
+#ifdef __EMSCRIPTEN__
+#include <emscripten.h>
+#endif
 
 /* ── External functions ──────────────────────────────────────── */
 
@@ -28,9 +31,13 @@ extern void serial_putdec(uint64_t val);
 
 static inline uint64_t rdtsc(void)
 {
+#ifdef __EMSCRIPTEN__
+    return (uint64_t)emscripten_get_now();
+#else
     uint32_t lo, hi;
     __asm__ volatile ("rdtsc" : "=a"(lo), "=d"(hi));
     return ((uint64_t)hi << 32) | lo;
+#endif
 }
 
 /* ── Event Types ─────────────────────────────────────────────── */
