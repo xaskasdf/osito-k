@@ -180,9 +180,6 @@ int proc_exec(const char *filename, int argc, const char **argv)
     }
 
     serial_puts("[EXEC] Running entry...\n");
-    /* Call the entry point. With EMULATE_FUNCTION_POINTER_CASTS on the
-     * kernel, direct C function pointer calls go through the emulation
-     * wrapper which handles cross-module table entries. */
     int ret = entry(argc, (char **)argv);
     serial_puts("[EXEC] entry returned\n");
 
