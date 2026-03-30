@@ -192,16 +192,102 @@ int proc_exec(const char *filename, int argc, const char **argv)
     typedef void (*frame_fn)(void);
     frame_fn frame = (frame_fn)dlsym(handle, "q2_frame");
     if (frame) {
-        serial_puts("[EXEC] Setting up frame loop via rAF\n");
-        /* Store frame function pointer for JS to call */
+        serial_puts("[EXEC] Setting up frame loop + input via rAF\n");
+
+        /* Get input function pointers from side module */
+        void *pushkey = dlsym(handle, "q2_push_key");
+        void *pushmouse = dlsym(handle, "q2_push_mouse");
+
+        /* Set up frame loop + keyboard/mouse input in JS */
         EM_ASM({
             var framePtr = $0;
+            var keyPtr = $1;
+            var mousePtr = $2;
+
+            /* Frame loop */
             function __appFrame() {
                 try { dynCall('v', framePtr); } catch(e) { console.error('[EXEC] frame error:', e); return; }
                 requestAnimationFrame(__appFrame);
             }
             requestAnimationFrame(__appFrame);
-        }, frame);
+
+            /* Key mapping (replicates Q2's js_key_to_q2) */
+            function keyToQ2(e) {
+                var k = e.key;
+                if (k.length === 1) {
+                    var c = k.charCodeAt(0);
+                    if (c >= 65 && c <= 90) return c + 32;
+                    if ((c >= 97 && c <= 122) || (c >= 48 && c <= 57)) return c;
+                    if (c === 32) return 32;
+                    var punc = "-=[]\\;',./`~";
+                    if (punc.indexOf(k) >= 0) return (k === '~') ? 96 : c;
+                    return 0;
+                }
+                if (k==="Enter") return 13;
+                if (k==="Escape") return 27;
+                if (k==="Backspace") return 127;
+                if (k==="Tab") return 9;
+                if (k==="ArrowUp") return 128;
+                if (k==="ArrowDown") return 129;
+                if (k==="ArrowLeft") return 130;
+                if (k==="ArrowRight") return 131;
+                if (k==="Alt") return 132;
+                if (k==="Control") return 133;
+                if (k==="Shift") return 134;
+                if (k.length===2 && k[0]==="F") return 159+parseInt(k[1]);
+                if (k.length===3 && k[0]==="F") return 159+parseInt(k.substring(1));
+                if (k==="Insert") return 141;
+                if (k==="Delete") return 148;
+                if (k==="Home") return 143;
+                if (k==="End") return 145;
+                if (k==="PageUp") return 147;
+                if (k==="PageDown") return 149;
+                return 0;
+            }
+
+            /* Keyboard */
+            if (keyPtr) {
+                var held = {};
+                document.addEventListener('keydown', function(e) {
+                    if (e.repeat) { e.preventDefault(); return; }
+                    var k = keyToQ2(e);
+                    if (k > 0 && !held[k]) {
+                        held[k] = true;
+                        dynCall('vii', keyPtr, [k, 1]);
+                    }
+                    e.preventDefault();
+                });
+                document.addEventListener('keyup', function(e) {
+                    var k = keyToQ2(e);
+                    if (k > 0) {
+                        held[k] = false;
+                        dynCall('vii', keyPtr, [k, 0]);
+                    }
+                    e.preventDefault();
+                });
+            }
+
+            /* Mouse: pointer lock + movement + clicks */
+            var c = document.getElementById('q2-canvas');
+            if (c && mousePtr) {
+                c.addEventListener('click', function() { c.requestPointerLock(); });
+                document.addEventListener('mousemove', function(e) {
+                    if (document.pointerLockElement === c)
+                        dynCall('vii', mousePtr, [e.movementX, e.movementY]);
+                });
+            }
+            if (c && keyPtr) {
+                document.addEventListener('mousedown', function(e) {
+                    if (document.pointerLockElement === c)
+                        dynCall('vii', keyPtr, [200 + e.button, 1]);
+                });
+                document.addEventListener('mouseup', function(e) {
+                    if (document.pointerLockElement === c)
+                        dynCall('vii', keyPtr, [200 + e.button, 0]);
+                });
+            }
+        }, frame, pushkey, pushmouse);
+
         /* Don't dlclose — the module must stay loaded while frames run */
         return ret;
     }
