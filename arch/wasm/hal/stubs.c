@@ -153,8 +153,32 @@ int proc_exec(const char *filename, int argc, const char **argv)
         return -1;
     }
 
-    serial_puts("[EXEC] Running...\n");
+    serial_puts("[EXEC] Running entry...\n");
+    /* Call the entry point. With EMULATE_FUNCTION_POINTER_CASTS on the
+     * kernel, direct C function pointer calls go through the emulation
+     * wrapper which handles cross-module table entries. */
     int ret = entry(argc, (char **)argv);
+    serial_puts("[EXEC] entry returned\n");
+
+    /* Check if the app exported a frame function for rAF scheduling.
+     * Side modules can't use emscripten_set_main_loop — the kernel
+     * must schedule their frame callback via JS requestAnimationFrame. */
+    typedef void (*frame_fn)(void);
+    frame_fn frame = (frame_fn)dlsym(handle, "q2_frame");
+    if (frame) {
+        serial_puts("[EXEC] Setting up frame loop via rAF\n");
+        /* Store frame function pointer for JS to call */
+        EM_ASM({
+            var framePtr = $0;
+            function __appFrame() {
+                try { dynCall('v', framePtr); } catch(e) { console.error('[EXEC] frame error:', e); return; }
+                requestAnimationFrame(__appFrame);
+            }
+            requestAnimationFrame(__appFrame);
+        }, frame);
+        /* Don't dlclose — the module must stay loaded while frames run */
+        return ret;
+    }
 
     dlclose(handle);
     serial_puts("[EXEC] Exited with code ");
