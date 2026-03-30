@@ -10,8 +10,34 @@
 #include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdio.h>
+#include <stdarg.h>
 #include <dlfcn.h>
 #include <emscripten.h>
+
+/* ── Override printf/fprintf for dlopen compatibility ─────────── */
+/*
+ * Emscripten libc's vfprintf uses internal function pointers for FILE
+ * stream I/O that crash with "function signature mismatch" when called
+ * from dlopen'd side modules. Override printf/fprintf/fputs/puts in the
+ * kernel (MAIN_MODULE) to use serial_puts directly — this bypasses the
+ * broken vfprintf entirely. vsnprintf is safe (no function pointers).
+ *
+ * This override applies to ALL code (kernel + side modules) since the
+ * MAIN_MODULE's symbols take precedence.
+ */
+extern void serial_puts(const char *s);
+
+/* Safe printf that bypasses vfprintf — used by side modules */
+void safe_printf(const char *fmt, ...)
+{
+    char buf[2048];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    serial_puts(buf);
+}
 
 /* ── Tick counter (replaces APIC timer in idt.c) ─────────────── */
 

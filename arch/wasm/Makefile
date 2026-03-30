@@ -39,7 +39,7 @@ EMFLAGS := \
     -s ALLOW_MEMORY_GROWTH=1 \
     -s INITIAL_MEMORY=536870912 \
     -s MAIN_MODULE=1 \
-    -s EMULATE_FUNCTION_POINTER_CASTS=1 \
+    -Wl,--allow-multiple-definition \
     -s ASYNCIFY=1 \
     -s 'ASYNCIFY_IMPORTS=["emscripten_sleep"]' \
     -s 'EXPORTED_FUNCTIONS=["_main","_wasm_kb_push","_wasm_get_mem_used_kb","_wasm_compositor_frame","_input_set_mouse_abs","_input_post_mouse_button"]' \
@@ -89,7 +89,8 @@ WASM_SRCS := \
     drivers/kb.c \
     drivers/display.c
 
-ALL_SRCS := $(X86_SRCS) $(GUI_SRCS) $(WASM_SRCS)
+# WASM first so our printf overrides win over libc's
+ALL_SRCS := $(WASM_SRCS) $(X86_SRCS) $(GUI_SRCS)
 
 # ── Build targets ─────────────────────────────────────────────────
 
