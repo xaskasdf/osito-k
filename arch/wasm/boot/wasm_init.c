@@ -137,6 +137,56 @@ static void load_model(void)
     serial_puts("[WASM] Model ready — try 'chat hello'\n\n");
 }
 
+/* ── OsitoFS image loading ───────────────────────────────────── */
+
+/*
+ * Fetch OsitoFS .img from R2 and mount it.
+ * The image contains game data (PAK files etc.) accessible via `ls` and `exec`.
+ */
+
+#define FS_IMG_URL "https://factory.naranjositos.tech/images/q2_wasm.img"
+
+EM_JS(int, js_fsimg_ready, (), { return window.__fsImageDone ? 1 : 0; });
+EM_JS(uint32_t, js_fsimg_size, (), { return (window.__fsImageBuf ? window.__fsImageBuf.length : 0) >>> 0; });
+EM_JS(void, js_fsimg_copy, (uint8_t *dst), { if (window.__fsImageBuf) HEAPU8.set(window.__fsImageBuf, dst >>> 0); });
+
+extern int  osfs2_mount(uint64_t part_offset);
+extern void wasm_nvme_set_buffer(void *buf, uint64_t size);
+
+static void load_filesystem(void)
+{
+    serial_puts("[WASM] Waiting for filesystem image...\n");
+    while (!js_fsimg_ready())
+        emscripten_sleep(200);
+
+    uint32_t sz = js_fsimg_size();
+    if (sz < 4096) {
+        serial_puts("[WASM] No filesystem image (standalone mode)\n\n");
+        return;
+    }
+
+    void *buf = malloc(sz);
+    if (!buf) {
+        serial_puts("[WASM] Failed to allocate FS buffer\n\n");
+        return;
+    }
+
+    js_fsimg_copy((uint8_t *)buf);
+    serial_puts("[WASM] FS image: ");
+    serial_putdec((uint64_t)sz / (1024 * 1024));
+    serial_puts(" MB\n");
+
+    /* Set as NVMe backend for OsitoFS */
+    wasm_nvme_set_buffer(buf, (uint64_t)sz);
+
+    /* Mount OsitoFS (partition offset 0 = raw image, no GPT) */
+    if (osfs2_mount(0) < 0) {
+        serial_puts("[WASM] OsitoFS mount failed\n\n");
+    } else {
+        serial_puts("[WASM] OsitoFS mounted\n\n");
+    }
+}
+
 /* ── Entry point ─────────────────────────────────────────────── */
 
 int main(void)
@@ -150,6 +200,7 @@ int main(void)
     term_init();
 
     load_model();
+    load_filesystem();
 
     shell_run();
     return 0;

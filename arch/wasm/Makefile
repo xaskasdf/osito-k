@@ -38,6 +38,7 @@ EMFLAGS := \
     -s WASM=1 \
     -s ALLOW_MEMORY_GROWTH=1 \
     -s INITIAL_MEMORY=268435456 \
+    -s MAIN_MODULE=1 \
     -s ASYNCIFY=1 \
     -s 'ASYNCIFY_IMPORTS=["emscripten_sleep"]' \
     -s 'EXPORTED_FUNCTIONS=["_main","_wasm_kb_push","_wasm_get_mem_used_kb","_wasm_compositor_frame","_input_set_mouse_abs","_input_post_mouse_button"]' \
@@ -65,7 +66,8 @@ X86_SRCS := \
     ../x86/kernel/input_events.c \
     ../x86/kernel/shm.c \
     ../x86/kernel/framebuffer.c \
-    ../x86/fs/gguf.c
+    ../x86/fs/gguf.c \
+    ../x86/fs/ositofs2.c
 
 # GUI library (architecture-independent rendering)
 GUI_SRCS := \

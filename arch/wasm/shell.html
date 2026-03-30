@@ -229,6 +229,30 @@
             });
     })();
 
+    // ── Filesystem image pre-fetch ────────────────────────────────
+    // OsitoFS .img with game data (Q2 PAK files etc.)
+
+    window.__fsImageBuf  = null;
+    window.__fsImageDone = false;
+
+    (function() {
+        var FS_URL = 'https://factory.naranjositos.tech/images/q2_wasm.img';
+        fetch(FS_URL)
+            .then(function(r) {
+                if (!r.ok) throw new Error('HTTP ' + r.status);
+                return r.arrayBuffer();
+            })
+            .then(function(ab) {
+                window.__fsImageBuf = new Uint8Array(ab);
+                console.log('[WASM] FS image downloaded: ' + ab.byteLength + ' bytes');
+                window.__fsImageDone = true;
+            })
+            .catch(function(e) {
+                console.warn('[WASM] FS image fetch failed (standalone mode):', e);
+                window.__fsImageDone = true;
+            });
+    })();
+
     // ── Emscripten module config ─────────────────────────────────
 
     var Module = {

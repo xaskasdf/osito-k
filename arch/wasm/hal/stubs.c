@@ -8,7 +8,9 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdlib.h>
 #include <string.h>
+#include <dlfcn.h>
 #include <emscripten.h>
 
 /* ── Tick counter (replaces APIC timer in idt.c) ─────────────── */
@@ -45,12 +47,121 @@ void syscall_init(void) {}
 void proc_init(void) {}
 void proc_list(void) { extern void serial_puts(const char *); serial_puts("  (no processes in WASM mode)\n"); }
 
+/* ── Helper: extract file from OsitoFS to Emscripten MEMFS ───── */
+
+static void extract_to_memfs(const char *osfs_name, const char *memfs_path)
+{
+    extern void serial_puts(const char *);
+    extern void serial_putdec(uint64_t);
+    extern void *osfs2_find(const char *);
+    extern int   osfs2_read(void *, uint64_t, void *, uint64_t);
+    extern uint64_t osfs2_file_size(void *);
+
+    void *file = osfs2_find(osfs_name);
+    if (!file) return;
+
+    uint64_t size = osfs2_file_size(file);
+    serial_puts("[WASM] Extracting ");
+    serial_puts(osfs_name);
+    serial_puts(" (");
+    serial_putdec(size / (1024 * 1024));
+    serial_puts(" MB)...\n");
+
+    void *buf = malloc((size_t)size);
+    if (!buf) { serial_puts("[WASM] malloc failed\n"); return; }
+    osfs2_read(file, 0, buf, size);
+
+    EM_ASM({
+        try {
+            /* Create parent directories */
+            var path = UTF8ToString($2);
+            var parts = path.split('/').filter(function(p){ return p; });
+            var dir = '';
+            for (var i = 0; i < parts.length - 1; i++) {
+                dir += '/' + parts[i];
+                try { FS.mkdir(dir); } catch(e) {}
+            }
+            FS.writeFile(path, HEAPU8.subarray($0, $0 + $1));
+        } catch(e) { console.error('[WASM] extract failed:', e); }
+    }, buf, (uint32_t)size, memfs_path);
+    free(buf);
+}
+
+/* ── proc_exec: load and run WASM side modules via dlopen ────── */
+
 int proc_exec(const char *filename, int argc, const char **argv)
 {
-    (void)filename; (void)argc; (void)argv;
     extern void serial_puts(const char *);
-    serial_puts("[WASM] proc_exec: ELF execution not supported\n");
-    return -1;
+    extern void *osfs2_find(const char *);
+    extern uint64_t osfs2_file_size(void *);
+    extern int osfs2_read(void *, uint64_t, void *, uint64_t);
+
+    if (!filename) { serial_puts("[EXEC] No filename\n"); return -1; }
+
+    /* Find executable in OsitoFS */
+    void *file = osfs2_find(filename);
+    if (!file) {
+        serial_puts("[EXEC] Not found: ");
+        serial_puts(filename);
+        serial_puts("\n");
+        return -1;
+    }
+
+    uint64_t size = osfs2_file_size(file);
+    serial_puts("[EXEC] Loading ");
+    serial_puts(filename);
+    serial_puts("...\n");
+
+    /* Extract .so from OsitoFS to Emscripten MEMFS */
+    void *buf = malloc((size_t)size);
+    if (!buf) { serial_puts("[EXEC] malloc failed\n"); return -1; }
+    osfs2_read(file, 0, buf, size);
+
+    EM_ASM({
+        try { FS.mkdir('/tmp'); } catch(e) {}
+        FS.writeFile('/tmp/app.so', HEAPU8.subarray($0, $0 + $1));
+    }, buf, (uint32_t)size);
+    free(buf);
+
+    /* Extract game data if this is Q2 */
+    if (strstr(filename, "quake2")) {
+        extract_to_memfs("baseq2/pak0.pak", "/baseq2/pak0.pak");
+    }
+
+    /* dlopen: load the side module */
+    void *handle = dlopen("/tmp/app.so", RTLD_NOW);
+    if (!handle) {
+        serial_puts("[EXEC] dlopen failed: ");
+        const char *err = dlerror();
+        serial_puts(err ? err : "unknown error");
+        serial_puts("\n");
+        return -1;
+    }
+
+    /* Try known entry points */
+    typedef int (*entry_fn)(int, char **);
+    entry_fn entry = NULL;
+
+    /* Q2 entry */
+    entry = (entry_fn)dlsym(handle, "q2_main");
+    /* Generic entry */
+    if (!entry) entry = (entry_fn)dlsym(handle, "app_main");
+
+    if (!entry) {
+        serial_puts("[EXEC] No entry point found (tried q2_main, app_main)\n");
+        dlclose(handle);
+        return -1;
+    }
+
+    serial_puts("[EXEC] Running...\n");
+    int ret = entry(argc, (char **)argv);
+
+    dlclose(handle);
+    serial_puts("[EXEC] Exited with code ");
+    extern void serial_putdec(uint64_t);
+    serial_putdec((uint64_t)ret);
+    serial_puts("\n");
+    return ret;
 }
 
 /* ── Dynamic linker ──────────────────────────────────────────── */
@@ -77,6 +188,31 @@ int   pci_get_device_count(void) { return 0; }
 
 int  nvme_init(uint64_t bar0) { (void)bar0; return -1; }
 bool nvme_is_ready(void)      { return false; }
+
+/* ── NVMe memory backend for OsitoFS ─────────────────────────── */
+/* OsitoFS calls nvme_read_bytes/nvme_write_bytes for all I/O.
+ * On WASM, the .img file is fetched from R2 into this buffer. */
+static uint8_t *wasm_nvme_buf = NULL;
+static uint64_t wasm_nvme_size = 0;
+
+void wasm_nvme_set_buffer(void *buf, uint64_t size) {
+    wasm_nvme_buf = (uint8_t *)buf;
+    wasm_nvme_size = size;
+}
+
+int nvme_read_bytes(uint64_t offset, void *buf, uint64_t len) {
+    if (!wasm_nvme_buf || offset + len > wasm_nvme_size) return -1;
+    memcpy(buf, wasm_nvme_buf + offset, (size_t)len);
+    return 0;
+}
+
+int nvme_write_bytes(uint64_t offset, const void *buf, uint64_t len) {
+    if (!wasm_nvme_buf || offset + len > wasm_nvme_size) return -1;
+    memcpy(wasm_nvme_buf + offset, buf, (size_t)len);
+    return 0;
+}
+
+int nvme_flush(void) { return 0; }
 
 /* ── Network ─────────────────────────────────────────────────── */
 
@@ -188,7 +324,11 @@ void hda_init(void) {}
 
 /* ── OsitoFS: in-memory virtual filesystem ───────────────────── */
 
-/* Must start with char name[64] + uint64_t size to match osfs2_file_min_t */
+/* ── OsitoFS v2: now compiled from arch/x86/fs/ositofs2.c ────── */
+/* nvme_read_bytes above provides memory-backed I/O.
+ * osfs2_find_gguf and osfs2_read_layer_index are in ositofs2.c */
+
+#if 0  /* OLD mini VFS — replaced by real OsitoFS */
 typedef struct {
     char          name[64];
     uint64_t      size;
@@ -283,9 +423,7 @@ uint64_t osfs2_file_size(void *f)
     return vf ? vf->size : 0;
 }
 
-/* ── OsitoFS GGUF stubs (WASM loads model via fetch, not OsitoFS) */
-void *osfs2_find_gguf(void)                                       { return NULL; }
-int   osfs2_read_layer_index(uint16_t slot, void *li)             { (void)slot; (void)li; return -1; }
+#endif  /* OLD mini VFS */
 
 /* ── sys_caps (hardware-derived resource limits) ─────────────── */
 
@@ -464,22 +602,13 @@ void *dl_find(const char *name) { (void)name; return NULL; }
 bool hda_is_ready(void) { return false; }
 void hda_play_tone(uint32_t freq, uint32_t ms) { (void)freq; (void)ms; }
 
-/* ── OsitoFS write support ───────────────────────────────────── */
-
-void *osfs2_create(const char *name, uint64_t size)
-      { (void)name; (void)size; return NULL; }
-int   osfs2_write(void *file, uint64_t offset, const void *buf, uint64_t len)
-      { (void)file; (void)offset; (void)buf; (void)len; return -1; }
+/* ── OsitoFS write/create/file_at: now in ositofs2.c ─────────── */
 
 /* ── kexec trampoline (normally from kexec_tramp.S) ─────────── */
 
 void kexec_trampoline(void) {}
 void kexec_trampoline_end(void) {}
-
-/* ── OsitoFS file iteration ──────────────────────────────────── */
-
-void *osfs2_file_at(uint32_t index) { (void)index; return NULL; }
-const char *osfs2_file_name(void *file) { (void)file; return NULL; }
+/* osfs2_file_name: now in ositofs2.c */
 
 /* ── prompt_llama (set by main on x86; NULL until inference loads) */
 
