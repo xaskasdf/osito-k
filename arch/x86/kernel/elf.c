@@ -27,6 +27,9 @@ extern int   mem_reserve_range(uint64_t phys, uint64_t count);
 extern void *kmalloc(uint64_t size);
 extern void  kfree(void *ptr);
 
+extern int paging_map_page(uint64_t virt, uint64_t phys, uint64_t flags);
+extern int paging_unmap_page(uint64_t virt);
+
 /* OsitoFS */
 extern void *osfs2_find(const char *name);  /* returns osfs2_file_t* */
 extern int osfs2_read(void *file, uint64_t offset, void *buf, uint64_t len);
@@ -155,6 +158,7 @@ typedef struct {
     /* For dynamic linking */
     uint64_t load_bias;      /* base - vaddr_min (0 for ET_EXEC) */
     uint64_t vaddr_min;      /* lowest vaddr across all LOAD segments */
+    bool     virt_mapped;    /* true if ET_EXEC virt→phys remap was used */
 } elf_loaded_t;
 
 /* ── Validate ELF header ─────────────────────────────────────── */
@@ -229,6 +233,7 @@ static int elf_load_segments(const uint8_t *data, uint64_t data_size,
      * between segments (e.g. .text → .rodata) works correctly. */
     uint64_t vaddr_min = UINT64_MAX;
     uint64_t vaddr_max = 0;
+    uint64_t first_filesz = 0;  /* filesz of first LOAD segment (code+data) */
     int load_count = 0;
 
     for (int i = 0; i < hdr->e_phnum; i++) {
@@ -254,6 +259,8 @@ static int elf_load_segments(const uint8_t *data, uint64_t data_size,
             vaddr_min = ph->p_vaddr;
         if (ph->p_vaddr + ph->p_memsz > vaddr_max)
             vaddr_max = ph->p_vaddr + ph->p_memsz;
+        if (load_count == 0)
+            first_filesz = ph->p_filesz;
         load_count++;
     }
 
@@ -271,57 +278,49 @@ static int elf_load_segments(const uint8_t *data, uint64_t data_size,
      * For ET_DYN (PIE): allocate dynamic memory and adjust entry.
      */
     void *base;
+    void *phys_base;      /* physical base used for mem_free_pages */
     bool fixed_load = (hdr->e_type == ET_EXEC);
 
     if (fixed_load) {
-        /* Reserve the exact pages from the page allocator.
-         * If pages are already allocated (fork+execve of same binary),
-         * proceed anyway — we'll overwrite in place. */
-        if (mem_reserve_range(vaddr_min, total_pages) < 0) {
-            serial_puts("[ELF] Fixed-load at 0x");
-            serial_puthex(vaddr_min, 16);
-            serial_puts(" already mapped — reusing (fork+execve)\n");
-
-            /* Save PF_W segments before memset destroys the parent's
-             * runtime data. Restored in proc_wait4 after child exits. */
-            fork_save_count = 0;
-            for (int i = 0; i < hdr->e_phnum && fork_save_count < MAX_FORK_SAVES; i++) {
-                uint64_t phoff2 = hdr->e_phoff + (uint64_t)i * hdr->e_phentsize;
-                if (phoff2 + sizeof(elf64_phdr_t) > data_size) break;
-                const elf64_phdr_t *ph2 = (const elf64_phdr_t *)(data + phoff2);
-                if (ph2->p_type != PT_LOAD || ph2->p_memsz == 0) continue;
-                if (!(ph2->p_flags & PF_W)) continue;
-
-                void *save = kmalloc(ph2->p_memsz);
-                if (save) {
-                    memcpy(save, (void *)ph2->p_vaddr, ph2->p_memsz);
-                    fork_saves[fork_save_count].buf  = save;
-                    fork_saves[fork_save_count].addr = ph2->p_vaddr;
-                    fork_saves[fork_save_count].size = ph2->p_memsz;
-                    fork_save_count++;
-                    serial_puts("[ELF] Saved parent RW segment at 0x");
-                    serial_puthex(ph2->p_vaddr, 16);
-                    serial_puts(" (");
-                    serial_putdec(ph2->p_memsz);
-                    serial_puts(" bytes)\n");
-                }
-            }
+        /* ET_EXEC: binary has absolute virtual addresses that must be
+         * honoured.  Instead of identity-mapping (virtual == physical),
+         * allocate free physical pages anywhere in usable RAM and map
+         * them to Q2's requested virtual addresses via paging_map_page.
+         * This avoids conflicts with UEFI-reserved physical pages that
+         * happen to overlap the binary's fixed load range. */
+        phys_base = mem_alloc_aligned(total_pages * 4096, 4096);
+        if (!phys_base) {
+            serial_puts("[ELF] Failed to allocate ");
+            serial_putdec(total_pages);
+            serial_puts(" pages for ET_EXEC\n");
+            return -1;
         }
-        base = (void *)vaddr_min;
-        serial_puts("[ELF] Fixed load at vaddr 0x");
+        for (uint64_t i = 0; i < total_pages; i++) {
+            paging_map_page(vaddr_min + i * 4096,
+                            (uint64_t)phys_base + i * 4096,
+                            0x3 /* PRESENT | WRITABLE */);
+        }
+        base = (void *)vaddr_min;   /* access via virtual addresses */
+        loaded->virt_mapped = true;
+        serial_puts("[ELF] ET_EXEC virt 0x");
         serial_puthex(vaddr_min, 16);
+        serial_puts(" -> phys 0x");
+        serial_puthex((uint64_t)phys_base, 16);
         serial_puts(", ");
         serial_putdec(total_pages * 4);
         serial_puts(" KB\n");
+        fork_save_count = 0;
     } else {
         /* PIE/shared: allocate dynamic memory */
-        base = mem_alloc_aligned(total_pages * 4096, 4096);
-        if (!base) {
+        phys_base = mem_alloc_aligned(total_pages * 4096, 4096);
+        if (!phys_base) {
             serial_puts("[ELF] Failed to allocate ");
             serial_putdec(total_pages);
             serial_puts(" pages\n");
             return -1;
         }
+        base = phys_base;
+        loaded->virt_mapped = false;
         serial_puts("[ELF] Load base: 0x");
         serial_puthex((uint64_t)base, 16);
         serial_puts(", ");
@@ -338,7 +337,7 @@ static int elf_load_segments(const uint8_t *data, uint64_t data_size,
 
     memset(base, 0, total_pages * 4096);
 
-    loaded->segments[0] = base;
+    loaded->segments[0] = phys_base;   /* physical base for mem_free_pages */
     loaded->segment_pages[0] = total_pages;
     loaded->segment_count = 1;
 
@@ -364,6 +363,29 @@ static int elf_load_segments(const uint8_t *data, uint64_t data_size,
     }
 
     __asm__ volatile ("sti" ::: "memory");
+
+    /* Write-protect .text pages AFTER segment data has been copied.
+     * This catches any stray writes to code during rendering etc. */
+    if (fixed_load && first_filesz > 0) {
+        /* .text write-protection disabled: Q2 soft renderer has out-of-bounds
+         * writes (R_PolygonScanRightEdge) that hit .text addresses. With RO
+         * pages this causes unrecoverable triple fault. Without protection,
+         * the write silently corrupts a few bytes of code but doesn't crash.
+         * TODO: fix the actual OOB writes in r_poly.c instead. */
+#if 0
+        uint64_t code_rodata_size = (first_filesz * 3) / 4;
+        uint64_t text_pages = code_rodata_size / 4096;
+        if (text_pages > total_pages) text_pages = total_pages;
+        for (uint64_t i = 0; i < text_pages; i++) {
+            paging_map_page((uint64_t)phys_base + i * 4096,
+                            (uint64_t)phys_base + i * 4096,
+                            0x1);
+            paging_map_page(vaddr_min + i * 4096,
+                            (uint64_t)phys_base + i * 4096,
+                            0x1);
+        }
+#endif
+    }
 
     if (fixed_load) {
         /* ET_EXEC: use original entry point (absolute addresses) */
@@ -397,6 +419,11 @@ static uint64_t elf_setup_stack(elf_loaded_t *loaded,
     /* Allocate stack */
     uint64_t stack_pages = USER_STACK_SIZE / 4096;
     loaded->stack_base = mem_alloc_aligned(USER_STACK_SIZE, 4096);
+    serial_puts("[ELF] stack_base=0x");
+    serial_puthex((uint64_t)loaded->stack_base, 16);
+    serial_puts(" size=0x");
+    serial_puthex(USER_STACK_SIZE, 8);
+    serial_puts("\n");
     if (!loaded->stack_base) return 0;
 
     memset(loaded->stack_base, 0, USER_STACK_SIZE);
@@ -524,6 +551,13 @@ static uint64_t elf_setup_stack(elf_loaded_t *loaded,
 
 void elf_free(elf_loaded_t *loaded)
 {
+    /* For ET_EXEC with virtual→physical remapping: unmap virtual pages first
+     * so the virtual address range is free for the next launch, then free
+     * the physical pages (segments[0] holds the physical base). */
+    if (loaded->virt_mapped && loaded->vaddr_min && loaded->segment_pages[0] > 0) {
+        for (uint64_t i = 0; i < loaded->segment_pages[0]; i++)
+            paging_unmap_page(loaded->vaddr_min + i * 4096);
+    }
     for (int i = 0; i < loaded->segment_count; i++) {
         if (loaded->segments[i] && loaded->segment_pages[i] > 0)
             mem_free_pages(loaded->segments[i], loaded->segment_pages[i]);
@@ -536,16 +570,11 @@ void elf_free(elf_loaded_t *loaded)
 
 static void elf_jump(uint64_t entry, uint64_t sp)
 {
-    /* Capture keyboard before the new process starts: flush stale shell
-     * keystrokes from kb_buf, then route all future keyboard events to
-     * the input_events queue only (not kb_buf). The new process reads
-     * input via SYS_GET_INPUT_EVENT. Released in process cleanup. */
+    /* Flush stale shell keystrokes before new process starts. */
     extern void kbd_flush(void);
-    extern void kbd_set_captured(bool);
     extern void input_flush(void);
     kbd_flush();
     input_flush();
-    kbd_set_captured(true);
 
     serial_puts("[ELF] Jumping to entry 0x");
     serial_puthex(entry, 16);

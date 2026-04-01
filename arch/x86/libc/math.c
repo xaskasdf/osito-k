@@ -59,8 +59,9 @@ double fabs(double x)
 
 double sqrt(double x)
 {
+    /* Use SSE2 sqrtsd — avoids x87/SSE calling convention mismatch */
     double r;
-    __asm__ ("fldl %1; fsqrt; fstpl %0" : "=m"(r) : "m"(x));
+    __asm__ ("sqrtsd %1, %0" : "=x"(r) : "x"(x));
     return r;
 }
 
@@ -73,27 +74,30 @@ double copysign(double x, double y)
 
 /* ── Rounding ───────────────────────────────────────────────── */
 
-/* x87 rounding: set FPU control word bits 10-11, frndint, restore */
-static double x87_round_mode(double x, int mode)
+/* Pure C rounding — avoids x87/SSE calling convention mismatch on x86-64.
+ * GCC passes doubles in XMM registers but x87 inline asm reads from memory;
+ * with -O2 the compiler may not spill XMM to memory, giving x87 stale data. */
+double floor(double x)
 {
-    double r;
-    uint16_t cw_old, cw_new;
-    __asm__ volatile ("fnstcw %0" : "=m"(cw_old));
-    cw_new = (cw_old & ~0x0C00) | (mode << 10);
-    __asm__ volatile (
-        "fldcw %1; fldl %2; frndint; fstpl %0; fldcw %3"
-        : "=m"(r) : "m"(cw_new), "m"(x), "m"(cw_old)
-    );
+    double r = (double)(long long)x;
+    if (r > x) r -= 1.0;
     return r;
 }
 
-double floor(double x) { return x87_round_mode(x, 1); } /* 01 = round down */
-double ceil(double x)  { return x87_round_mode(x, 2); } /* 10 = round up */
-double trunc(double x) { return x87_round_mode(x, 3); } /* 11 = round toward zero */
+double ceil(double x)
+{
+    double r = (double)(long long)x;
+    if (r < x) r += 1.0;
+    return r;
+}
+
+double trunc(double x)
+{
+    return (double)(long long)x;
+}
 
 double round(double x)
 {
-    /* Round half away from zero (not x87's default round-to-even) */
     if (x >= 0.0)
         return floor(x + 0.5);
     else
@@ -102,9 +106,14 @@ double round(double x)
 
 double rint(double x)
 {
-    /* Round using current rounding mode (x87 default = round-to-even) */
-    double r;
-    __asm__ ("fldl %1; frndint; fstpl %0" : "=m"(r) : "m"(x));
+    /* Round to nearest even — match default x87 behavior */
+    double r = round(x);
+    /* Check tie-breaking: if exactly halfway, round to even */
+    double diff = x - floor(x);
+    if (diff == 0.5) {
+        long long i = (long long)r;
+        if (i & 1) r = (i > 0) ? r - 1.0 : r + 1.0;
+    }
     return r;
 }
 
@@ -163,42 +172,50 @@ double fmax(double x, double y) { if (__isnan(x)) return y; if (__isnan(y)) retu
 /* x87 fsin/fcos require |x| < 2^63, but we handle full range
  * since x87 sets C2 flag if argument is out of range. */
 
+/* Force argument spill to memory via volatile.  On x86-64, GCC passes
+ * doubles in XMM registers but x87 asm reads from memory.  Without
+ * volatile, -O2 may skip the spill, making fldl read stale stack data. */
+
 double sin(double x)
 {
+    volatile double vx = x;
     double r;
-    __asm__ ("fldl %1; fsin; fstpl %0" : "=m"(r) : "m"(x));
+    __asm__ ("fldl %1; fsin; fstpl %0" : "=m"(r) : "m"(vx));
     return r;
 }
 
 double cos(double x)
 {
+    volatile double vx = x;
     double r;
-    __asm__ ("fldl %1; fcos; fstpl %0" : "=m"(r) : "m"(x));
+    __asm__ ("fldl %1; fcos; fstpl %0" : "=m"(r) : "m"(vx));
     return r;
 }
 
 double tan(double x)
 {
+    volatile double vx = x;
     double r;
     __asm__ (
         "fldl %1\n\t"
         "fptan\n\t"
-        "fstp %%st(0)\n\t"  /* Pop the 1.0 that fptan pushes */
+        "fstp %%st(0)\n\t"
         "fstpl %0"
-        : "=m"(r) : "m"(x)
+        : "=m"(r) : "m"(vx)
     );
     return r;
 }
 
 double atan2(double y, double x)
 {
+    volatile double vy = y, vx = x;
     double r;
     __asm__ (
-        "fldl %1\n\t"   /* ST(0) = y */
-        "fldl %2\n\t"   /* ST(0) = x, ST(1) = y */
-        "fpatan\n\t"    /* ST(0) = atan2(y, x) */
+        "fldl %1\n\t"
+        "fldl %2\n\t"
+        "fpatan\n\t"
         "fstpl %0"
-        : "=m"(r) : "m"(y), "m"(x)
+        : "=m"(r) : "m"(vy), "m"(vx)
     );
     return r;
 }

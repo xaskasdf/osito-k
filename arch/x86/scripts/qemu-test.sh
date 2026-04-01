@@ -148,8 +148,8 @@ fi
 
 # Display: cocoa native window on macOS, VNC fallback on Linux
 if [ "$(uname)" = "Darwin" ]; then
-    DISPLAY_ARGS="-display cocoa,zoom-to-fit=off"
-    info "Display: native macOS window (cocoa)"
+    DISPLAY_ARGS="-display cocoa,zoom-to-fit=off -vnc :2"
+    info "Display: native macOS window (cocoa) + VNC on :5902"
 else
     DISPLAY_ARGS="-vnc :0,password=on"
 fi
