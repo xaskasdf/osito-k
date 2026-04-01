@@ -2201,6 +2201,16 @@ static void shell_exec(char *line)
                 win32_exec(argv[1]);
             } else {
                 sh_puts("\n [WIN32] Process crashed — returned to shell\n");
+                /* Restore IST1 after longjmp — the compat32 exception path
+                 * bypasses int2e_stub's IST1 restore, leaving it corrupted.
+                 * Without this, the next IST1 interrupt loads RSP=0. */
+                extern uint64_t *tss_ist1_ptr;
+                extern uint8_t ist1_stack[];
+                if (tss_ist1_ptr)
+                    *tss_ist1_ptr = (uint64_t)(ist1_stack + 65536);
+                /* Reset compat32 mode flag */
+                extern int g_compat32_mode;
+                g_compat32_mode = 0;
             }
             compat32_crash_jmpbuf = NULL;
         }

@@ -1161,6 +1161,16 @@ void compat32_callback(uint32_t func_addr)
         uint64_t ip64 = func_addr;
         uint64_t sp64 = (uint64_t)(ULONG_PTR)sp;
 
+        /* Mask APIC timer during callback to prevent RSP=0 crash.
+         * Callback stacks are 8KB mini-buffers — if the timer fires
+         * on them with IST=0, the ISR gets an invalid RSP. The timer
+         * ticks are not needed during 32-bit callbacks (single-threaded). */
+        {
+            extern volatile uint32_t *idt_get_apic_base(void);
+            volatile uint32_t *apic = idt_get_apic_base();
+            if (apic) apic[0x320/4] |= 0x10000;  /* LVT_TIMER |= MASKED */
+        }
+
         __asm__ volatile (
             "movw $0x48, %%ax\n"    /* GDT_SEL_DATA32 */
             "mov %%ax, %%ds\n"
@@ -1181,6 +1191,14 @@ void compat32_callback(uint32_t func_addr)
     }
 
     /* longjmp returned here — 32-bit function is done. */
+
+    /* Unmask APIC timer */
+    {
+        extern volatile uint32_t *idt_get_apic_base(void);
+        volatile uint32_t *apic = idt_get_apic_base();
+        if (apic) apic[0x320/4] &= ~0x10000;  /* LVT_TIMER &= ~MASKED */
+    }
+
     g_teb32.ExceptionList = saved_seh;  /* Restore SEH chain */
     callback_depth--;
     serial_puts("[CB32] depth=");

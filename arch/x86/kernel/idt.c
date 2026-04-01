@@ -1045,6 +1045,15 @@ void isr_handler(interrupt_frame_t *frame)
                 serial_putdec(null_call_count);
                 serial_puts("\n");
             }
+            /* After too many NULL calls, force crash recovery instead of
+             * looping forever. The engine's error cleanup calls NULL
+             * function pointers (GLog, GError) in a tight loop. */
+            if (null_call_count > 50) {
+                serial_puts("[NULL-CALL] Too many (#");
+                serial_putdec(null_call_count);
+                serial_puts(") — forcing crash recovery\n");
+                goto compat32_null_recovery;
+            }
             if ((frame->cs & 0xFFFF) == 0x40 || (frame->cs & 0xFFFF) == 0x23) {
                 /* First NULL-CALL: dispatch to SEH so the engine can show
                  * its error message and begin graceful shutdown.
@@ -1363,6 +1372,10 @@ compat32_null_recovery:
             extern void kern_longjmp(uint64_t *buf, int val);
             if (compat32_crash_jmpbuf) {
                 serial_puts("  [WIN32] Crash recovery — returning to shell\n");
+                /* Restore IST1 BEFORE longjmp — longjmp bypasses
+                 * int2e_stub's IST1 restore, leaving it corrupted. */
+                extern uint8_t ist1_stack[];
+                kernel_tss.ist1 = (uint64_t)(ist1_stack + IST1_STACK_SIZE);
                 uint64_t *jmp = compat32_crash_jmpbuf;
                 compat32_crash_jmpbuf = NULL;
                 kern_longjmp(jmp, 1);

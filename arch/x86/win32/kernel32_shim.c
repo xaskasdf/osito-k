@@ -352,6 +352,13 @@ PVOID WINAPI VirtualAlloc(PVOID lpAddress, SIZE_T dwSize,
 
 BOOL WINAPI VirtualFree(PVOID lpAddress, SIZE_T dwSize, DWORD dwFreeType)
 {
+    /* MEM_RELEASE (0x8000): no-op to prevent use-after-free.
+     * UT99's error cleanup frees FName::Names data via VirtualFree,
+     * then later code still accesses it → NULL deref → crash.
+     * Single-process app — no need to actually reclaim pages. */
+    if (dwFreeType == 0x8000) /* MEM_RELEASE */
+        return TRUE;
+
     PVOID base = lpAddress;
     SIZE_T size = dwSize;
 
