@@ -1907,6 +1907,25 @@ uint64_t compat32_dispatch(uint32_t thunk_idx, uint32_t *stack_args)
             *gerr  = 0;
         }
     }
+    /* Monitor FName::Names TArray for corruption.
+     * TArray<FNameEntry*> at Core.dll 0x10295D30: {Data, Num, Max}
+     * Normal: Num < 50000, Max < 100000. If larger, data is corrupted. */
+    {
+        static int fname_corrupted = 0;
+        volatile uint32_t *fname_arr = (volatile uint32_t *)(uintptr_t)0x10295D30;
+        uint32_t fdata = fname_arr[0], fnum = fname_arr[1], fmax = fname_arr[2];
+        if (fnum > 100000 && !fname_corrupted) {
+            fname_corrupted = 1;
+            serial_puts("[CORRUPT] FName::Names Num=");
+            serial_putdec(fnum);
+            serial_puts(" Max=");
+            serial_putdec(fmax);
+            serial_puts(" Data=0x");
+            serial_puthex(fdata, 8);
+            serial_puts(" at INT2E dispatch");
+            serial_puts("\n");
+        }
+    }
 
     /* Callback return: 32-bit function completed, longjmp back */
     if (thunk_idx == THUNK_CALLBACK_RETURN) {
@@ -1987,19 +2006,17 @@ uint64_t compat32_dispatch(uint32_t thunk_idx, uint32_t *stack_args)
     {
         static uint32_t int2e_call_count = 0;
         int2e_call_count++;
-        /* Log first 200, every 100th, AND last calls before crash
-         * (always log _CxxThrowException and RaiseException) */
-        /* Log everything except timeGetTime (always log non-timeGetTime) */
-        int do_log = 1;
-        if (t->name && t->name[0] == 't' && t->name[1] == 'i' && t->name[2] == 'm' && t->name[3] == 'e')
-            do_log = (int2e_call_count <= 10 || (int2e_call_count % 500000) == 0);
+        /* Throttle: first 200, every 1000th, exception-related always */
+        int do_log = 0;
+        if (int2e_call_count <= 200 || (int2e_call_count % 1000) == 0)
+            do_log = 1;
         /* Always log exception-related functions */
         if (t->name && (t->name[0] == '_' && t->name[1] == 'C'))  /* _Cxx* */
             do_log = 1;
         if (t->name && t->name[0] == 'R' && t->name[1] == 'a')   /* Raise* */
             do_log = 1;
-        /* Log last 20 calls before throttle boundary */
-        if (int2e_call_count > 1300)
+        /* Always log VirtualAlloc/Free */
+        if (t->name && t->name[0] == 'V' && t->name[1] == 'i')
             do_log = 1;
         if (do_log) {
             serial_puts("[INT2E] #");

@@ -312,13 +312,23 @@ DWORD WINAPI GetCurrentProcessId(void)
 PVOID WINAPI VirtualAlloc(PVOID lpAddress, SIZE_T dwSize,
                    DWORD flAllocationType, DWORD flProtect)
 {
-    serial_puts("[VA] VirtualAlloc addr=0x");
-    serial_puthex((uint64_t)(ULONG_PTR)lpAddress, 8);
-    serial_puts(" size=0x");
-    serial_puthex(dwSize, 8);
-    serial_puts(" type=0x");
-    serial_puthex(flAllocationType, 4);
-    serial_puts("\n");
+    /* Suppress normal VA logs — only log large/abnormal requests */
+    if (dwSize > 0x1000000) { /* > 16MB */
+        serial_puts("[VA] VirtualAlloc LARGE: size=0x");
+        serial_puthex(dwSize, 8);
+        serial_puts(" addr=0x");
+        serial_puthex((uint64_t)(ULONG_PTR)lpAddress, 8);
+        serial_puts("\n");
+    }
+
+    /* Reject absurd sizes (> 512MB) — corrupted TArray metadata */
+    if (dwSize > 0x20000000ULL) {
+        serial_puts("[VA] REJECTED: size=0x");
+        serial_puthex(dwSize, 8);
+        serial_puts(" (> 512MB, likely corruption)\n");
+        g_last_error = 8; /* ERROR_NOT_ENOUGH_MEMORY */
+        return NULL;
+    }
 
     PVOID base = lpAddress;
     SIZE_T size = dwSize;
@@ -327,13 +337,12 @@ PVOID WINAPI VirtualAlloc(PVOID lpAddress, SIZE_T dwSize,
         NT_CURRENT_PROCESS, &base, 0, &size,
         flAllocationType, flProtect);
 
-    serial_puts("[VA] result=0x");
-    serial_puthex((uint64_t)(ULONG_PTR)base, 8);
-    serial_puts(" status=0x");
-    serial_puthex(status, 8);
-    serial_puts("\n");
-
     if (!NT_SUCCESS(status)) {
+        serial_puts("[VA] FAILED: size=0x");
+        serial_puthex(dwSize, 8);
+        serial_puts(" status=0x");
+        serial_puthex(status, 8);
+        serial_puts("\n");
         set_last_error_from_status(status);
         return NULL;
     }

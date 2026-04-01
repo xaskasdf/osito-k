@@ -892,23 +892,22 @@ static void ddraw_init_com32(void)
      * bytecode addresses (0x4039C870) by an unknown writer. */
     {
         uint64_t watch0 = (uint64_t)(uintptr_t)dd_vtbl32;
-        uint64_t watch1 = (uint64_t)0x101E568C;  /* GIsCriticalError in Core.dll */
+        /* DR1 for GIsCriticalError DISABLED: Core.dll legitimately writes
+         * this flag during post-rendering init. The #DB handler can't advance
+         * RIP, creating an infinite #DB loop → triple fault. The flag is
+         * already cleared on every INT 0x2E in compat32_dispatch. */
         /* DR7: L0=1(bit0) RW0=01(bits16-17) LEN0=11(bits18-19)
-         *      L1=1(bit2) RW1=01(bits20-21) LEN1=11(bits22-23)
-         * = 0x00DD0005 */
+         * = 0x000D0001 (DR0 only, DR1 disabled) */
         __asm__ volatile (
             "mov %0, %%dr0\n"
-            "mov %1, %%dr1\n"
-            "mov $0x00DD0005, %%rax\n"
+            "mov $0x000D0001, %%rax\n"
             "mov %%rax, %%dr7\n"
-            :: "r"(watch0), "r"(watch1) : "rax"
+            :: "r"(watch0) : "rax"
         );
         serial_puts("[DDRAW] DR0 watchpoint on dd_vtbl32 at 0x");
         extern void serial_puthex(uint64_t val, int digits);
         serial_puthex(watch0, 8);
-        serial_puts("\n[DDRAW] DR1 watchpoint on GIsCriticalError at 0x");
-        serial_puthex(watch1, 8);
-        serial_puts("\n");
+        serial_puts(" (DR1/GIsCriticalError disabled)\n");
     }
 }
 
