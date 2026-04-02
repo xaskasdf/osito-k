@@ -336,14 +336,49 @@ static NTSTATUS pe_resolve_imports64(BYTE *image_base,
 
 /* ── Resolve imports (PE32 / 32-bit thunks) ────────────────── */
 
+/* Scan section headers for a section named ".idata" and return its RVA.
+ * Used as fallback when the PE data directory doesn't point to imports. */
+static ULONG pe_find_idata_rva(BYTE *image_base)
+{
+    PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)image_base;
+    ULONG pe_off = dos->e_lfanew;
+    PIMAGE_FILE_HEADER fh = (PIMAGE_FILE_HEADER)(image_base + pe_off + 4);
+    ULONG opt_size = fh->SizeOfOptionalHeader;
+    BYTE *sec_start = image_base + pe_off + 4 + sizeof(IMAGE_FILE_HEADER) + opt_size;
+
+    for (USHORT i = 0; i < fh->NumberOfSections; i++) {
+        PIMAGE_SECTION_HEADER sh = (PIMAGE_SECTION_HEADER)(sec_start + i * sizeof(IMAGE_SECTION_HEADER));
+        if (sh->Name[0] == '.' && sh->Name[1] == 'i' && sh->Name[2] == 'd' &&
+            sh->Name[3] == 'a' && sh->Name[4] == 't' && sh->Name[5] == 'a') {
+            /* Verify the section looks like it contains import descriptors:
+             * first entry should have non-zero Name and FirstThunk fields. */
+            PIMAGE_IMPORT_DESCRIPTOR probe =
+                (PIMAGE_IMPORT_DESCRIPTOR)(image_base + sh->VirtualAddress);
+            if (probe->Name != 0 && probe->FirstThunk != 0) {
+                pe_log_hex("PE: .idata fallback at RVA ", sh->VirtualAddress);
+                return sh->VirtualAddress;
+            }
+        }
+    }
+    return 0;
+}
+
 static NTSTATUS pe_resolve_imports32(BYTE *image_base,
                                      IMAGE_DATA_DIRECTORY *import_dir)
 {
-    if (import_dir->VirtualAddress == 0 || import_dir->Size == 0)
-        return STATUS_SUCCESS;
+    ULONG import_rva = import_dir->VirtualAddress;
+
+    /* Fallback: if data directory doesn't point to imports, scan for .idata
+     * section directly.  Unreal Engine 1 DLLs (Engine.dll, etc.) have valid
+     * import descriptors in .idata but set the data directory entry to 0. */
+    if (import_rva == 0 || import_dir->Size == 0) {
+        import_rva = pe_find_idata_rva(image_base);
+        if (import_rva == 0)
+            return STATUS_SUCCESS;
+    }
 
     PIMAGE_IMPORT_DESCRIPTOR desc =
-        (PIMAGE_IMPORT_DESCRIPTOR)(image_base + import_dir->VirtualAddress);
+        (PIMAGE_IMPORT_DESCRIPTOR)(image_base + import_rva);
 
     for (; desc->Name != 0; desc++) {
         const char *dll_name = (const char *)(image_base + desc->Name);

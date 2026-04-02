@@ -995,6 +995,55 @@ void isr_handler(interrupt_frame_t *frame)
             static int null_call_count = 0;
             null_call_count++;
 
+            /* Diagnostic: for indirect calls (call *offset(reg)), dump
+             * the vtable pointer and the target entry so we can see why
+             * the function pointer is NULL. */
+            if (null_call_count <= 5 && (frame->cs & 0xFFFF) == 0x40) {
+                uint32_t retaddr32 = ((uint32_t *)(uintptr_t)(frame->rsp & 0xFFFFFFFF))[0];
+                uint8_t *ca = (uint8_t *)(uintptr_t)(retaddr32 - 6);
+                /* call *disp32(%reg) = FF 92 xx xx xx xx (for edx) */
+                if (ca[0] == 0xFF && (ca[1] & 0xC0) == 0x80) {
+                    uint8_t modrm = ca[1];
+                    uint8_t reg = modrm & 0x07;
+                    uint32_t disp = *(uint32_t *)(ca + 2);
+                    /* Get register value that held the vtable */
+                    uint32_t regvals[8] = {
+                        (uint32_t)frame->rax, (uint32_t)frame->rcx,
+                        (uint32_t)frame->rdx, (uint32_t)frame->rbx,
+                        0/*esp*/, (uint32_t)frame->rbp,
+                        (uint32_t)frame->rsi, (uint32_t)frame->rdi
+                    };
+                    uint32_t vtbl = regvals[reg];
+                    serial_puts("[NULL-DIAG] call *0x");
+                    serial_puthex(disp, 4);
+                    serial_puts("(%");
+                    const char *rn[] = {"eax","ecx","edx","ebx","esp","ebp","esi","edi"};
+                    serial_puts(rn[reg]);
+                    serial_puts(") vtbl=0x"); serial_puthex(vtbl, 8);
+                    serial_puts(" this=0x"); serial_puthex((uint32_t)frame->rdi, 8);
+                    serial_puts(" [this+44]=0x");
+                    uint32_t this_ptr = (uint32_t)frame->rdi;
+                    if (this_ptr >= 0x10000 && this_ptr < 0x50000000) {
+                        uint32_t f44 = *(uint32_t *)(uintptr_t)(this_ptr + 0x44);
+                        serial_puthex(f44, 8);
+                    } else serial_puts("????????");
+                    serial_puts("\n");
+                    /* Dump vtable entries around the offset */
+                    if (vtbl >= 0x10000000 && vtbl < 0x20000000) {
+                        uint32_t *vt = (uint32_t *)(uintptr_t)vtbl;
+                        int idx = disp / 4;
+                        for (int i = (idx > 2 ? idx - 2 : 0); i <= idx + 2; i++) {
+                            serial_puts("  vt[0x");
+                            serial_puthex(i * 4, 3);
+                            serial_puts("]=0x");
+                            serial_puthex(vt[i], 8);
+                            if (i == idx) serial_puts(" *** NULL TARGET");
+                            serial_puts("\n");
+                        }
+                    }
+                }
+            }
+
             if ((frame->cs & 0xFFFF) == 0x40) {
                 uint32_t *sp32 = (uint32_t *)(uintptr_t)(frame->rsp & 0xFFFFFFFF);
                 uint32_t retaddr = sp32[0];
