@@ -372,7 +372,6 @@ static EFI_STATUS get_memory_map(void)
 /* ── EFI Main ───────────────────────────────────────────────── */
 
 EFI_STATUS
-EFIAPI
 efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable)
 {
     EFI_STATUS status;

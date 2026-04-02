@@ -56,6 +56,9 @@ extern void dl_init(void);
 /* Win32 compatibility layer */
 extern void win32_init(void);
 
+/* DOS 16-bit compatibility layer */
+extern void dos_init(void);
+
 /* xHCI USB */
 extern int  xhci_init(uint64_t bar0_phys, uint8_t bus, uint8_t dev, uint8_t func);
 extern void xhci_poll(void);
@@ -405,6 +408,9 @@ void kernel_entry(boot_info_t *info)
 
     /* ── Step 1.11: Win32 compatibility layer ── */
     win32_init();
+
+    /* ── Step 1.12: DOS 16-bit compatibility layer ── */
+    dos_init();
 
     /* ── Crypto self-test ── */
     {

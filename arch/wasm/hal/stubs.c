@@ -202,8 +202,12 @@ int proc_exec(const char *filename, int argc, const char **argv)
             var mousePtr = $2;
 
             /* Frame loop */
+            var __frameErrors = 0;
             function __appFrame() {
-                try { dynCall('v', framePtr); } catch(e) { console.error('[EXEC] frame error:', e); return; }
+                try { dynCall('v', framePtr); } catch(e) {
+                    __frameErrors++;
+                    if (__frameErrors <= 3) console.error('[EXEC] frame error #' + __frameErrors + ':', e.stack || e);
+                }
                 requestAnimationFrame(__appFrame);
             }
             requestAnimationFrame(__appFrame);

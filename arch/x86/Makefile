@@ -87,6 +87,9 @@ WIN32_SRC = win32/win32_init.c win32/compat32.c win32/pe.c win32/winexec.c \
             win32/comctl32_shim.c win32/comdlg32_shim.c \
             win32/winmm_shim.c win32/wsock32_shim.c
 WIN32_ASM = win32/int2e_stub.S
+DOS_SRC  = dos/dos_init.c dos/dos_exec.c dos/dos_loader.c \
+           dos/dos_mem.c dos/cpu8086.c dos/dos_int.c \
+           dos/dos_api.c dos/dos_bios.c dos/dos_vga.c dos/dos_io.c
 GUI_SRC  = ../../gui/gui_draw.c ../../gui/gui_text.c \
            ../../gui/gui_panel.c ../../gui/gui_dock.c \
            ../../gui/gui_desktop.c ../../gui/gui_window.c \
@@ -101,9 +104,10 @@ DRV_OBJ   = $(DRV_SRC:%.c=$(BUILD)/%.o)
 FS_OBJ    = $(FS_SRC:%.c=$(BUILD)/%.o)
 WIN32_OBJ = $(WIN32_SRC:%.c=$(BUILD)/%.o)
 WIN32_ASM_OBJ = $(WIN32_ASM:%.S=$(BUILD)/%.o)
+DOS_OBJ   = $(DOS_SRC:%.c=$(BUILD)/%.o)
 GUI_OBJ   = $(patsubst ../../gui/%.c,$(BUILD)/gui/%.o,$(GUI_SRC))
 
-ALL_KERN_OBJ = $(KERN_OBJ) $(ASM_OBJ) $(DRV_OBJ) $(FS_OBJ) $(WIN32_OBJ) $(WIN32_ASM_OBJ) $(GUI_OBJ)
+ALL_KERN_OBJ = $(KERN_OBJ) $(ASM_OBJ) $(DRV_OBJ) $(FS_OBJ) $(WIN32_OBJ) $(WIN32_ASM_OBJ) $(DOS_OBJ) $(GUI_OBJ)
 
 # ── Targets ───────────────────────────────────────────────────
 
@@ -183,6 +187,10 @@ $(BUILD)/win32/dsound_shim.o: win32/dsound_shim.c | $(BUILD)/win32
 $(BUILD)/win32/%.o: win32/%.S | $(BUILD)/win32
 	$(CC) -c -o $@ $<
 
+# DOS 16-bit compatibility layer
+$(BUILD)/dos/%.o: dos/%.c | $(BUILD)/dos
+	$(CC) $(KCFLAGS) -Idos -c -o $@ $<
+
 # GUI shared library
 $(BUILD)/gui/%.o: ../../gui/%.c | $(BUILD)/gui
 	$(CC) $(KCFLAGS) -c -o $@ $<
@@ -209,12 +217,14 @@ TCC_KERN_SRC = $(filter-out $(GCC_ONLY_C),$(KERN_SRC))
 TCC_DRV_SRC  = $(DRV_SRC)
 TCC_FS_SRC   = $(FS_SRC)
 TCC_WIN32_SRC = $(filter-out $(GCC_ONLY_C),$(WIN32_SRC))
+TCC_DOS_SRC   = $(DOS_SRC)
 
 # TCC object files
 TCC_KERN_OBJ  = $(TCC_KERN_SRC:%.c=$(TCCDIR)/%.o)
 TCC_DRV_OBJ   = $(TCC_DRV_SRC:%.c=$(TCCDIR)/%.o)
 TCC_FS_OBJ    = $(TCC_FS_SRC:%.c=$(TCCDIR)/%.o)
 TCC_WIN32_OBJ = $(TCC_WIN32_SRC:%.c=$(TCCDIR)/%.o)
+TCC_DOS_OBJ   = $(TCC_DOS_SRC:%.c=$(TCCDIR)/%.o)
 
 # GCC-only object files (in TCC build dir)
 GCC_TENSOR_OBJ    = $(TCCDIR)/kernel/tensor.o $(TCCDIR)/kernel/tensor_avx2.o
@@ -222,7 +232,7 @@ GCC_WIN32_COMPAT  = $(TCCDIR)/win32/compat32.o $(TCCDIR)/win32/msvcrt_shim.o
 GCC_ASM_OBJ       = $(ASM_SRC:%.S=$(TCCDIR)/%.o)
 GCC_WIN32_ASM_OBJ = $(WIN32_ASM:%.S=$(TCCDIR)/%.o)
 
-ALL_TCC_OBJ = $(TCC_KERN_OBJ) $(TCC_DRV_OBJ) $(TCC_FS_OBJ) $(TCC_WIN32_OBJ) \
+ALL_TCC_OBJ = $(TCC_KERN_OBJ) $(TCC_DRV_OBJ) $(TCC_FS_OBJ) $(TCC_WIN32_OBJ) $(TCC_DOS_OBJ) \
               $(GCC_TENSOR_OBJ) $(GCC_WIN32_COMPAT) $(GCC_ASM_OBJ) $(GCC_WIN32_ASM_OBJ)
 
 .PHONY: tcc tcc-clean
@@ -248,6 +258,9 @@ $(TCCDIR)/fs/%.o: fs/%.c | $(TCCDIR)/fs
 $(TCCDIR)/win32/%.o: win32/%.c | $(TCCDIR)/win32
 	$(TCC) $(TCCFLAGS) -Iwin32 -o $@ $<
 
+$(TCCDIR)/dos/%.o: dos/%.c | $(TCCDIR)/dos
+	$(TCC) $(TCCFLAGS) -Idos -o $@ $<
+
 # GCC rules for files TCC can't handle (KCFLAGS_PRECOMP for TCC stack compat)
 $(TCCDIR)/kernel/tensor.o: kernel/tensor.c | $(TCCDIR)/kernel
 	$(CC) $(KCFLAGS_PRECOMP) -c -o $@ $<
@@ -269,7 +282,7 @@ $(TCCDIR)/win32/%.o: win32/%.S | $(TCCDIR)/win32
 	$(CC) -c -o $@ $<
 
 # TCC build directories
-$(TCCDIR) $(TCCDIR)/kernel $(TCCDIR)/drivers $(TCCDIR)/fs $(TCCDIR)/win32:
+$(TCCDIR) $(TCCDIR)/kernel $(TCCDIR)/drivers $(TCCDIR)/fs $(TCCDIR)/win32 $(TCCDIR)/dos:
 	mkdir -p $@
 
 tcc-clean:
@@ -303,7 +316,7 @@ $(BUILD)/efi_main.o: boot/efi_main.c | $(BUILD)/boot
 
 # ── Build directories ─────────────────────────────────────────
 
-$(BUILD) $(BUILD)/boot $(BUILD)/kernel $(BUILD)/drivers $(BUILD)/fs $(BUILD)/win32 $(BUILD)/gui:
+$(BUILD) $(BUILD)/boot $(BUILD)/kernel $(BUILD)/drivers $(BUILD)/fs $(BUILD)/win32 $(BUILD)/dos $(BUILD)/gui:
 	mkdir -p $@
 
 # Auto-generated header dependency files (produced by -MMD -MP)

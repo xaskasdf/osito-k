@@ -38,6 +38,7 @@ EMFLAGS := \
     -s WASM=1 \
     -s ALLOW_MEMORY_GROWTH=1 \
     -s INITIAL_MEMORY=536870912 \
+    -s STACK_SIZE=1048576 \
     -s MAIN_MODULE=1 \
     -Wl,--allow-multiple-definition \
     -s ASYNCIFY=1 \
