@@ -116,7 +116,7 @@ static const char *speed_name(uint8_t spd)
 #define HID_MOD_RGUI    (1 << 7)
 
 /* Unshifted: HID usage 0x00..0x52 → ASCII */
-static const char hid_normal[0x54] = {
+const char hid_normal[0x54] = {
     /* 0x00-0x03: Reserved/Error */
     0, 0, 0, 0,
     /* 0x04-0x1D: a-z */
@@ -141,7 +141,7 @@ static const char hid_normal[0x54] = {
 };
 
 /* Shifted: HID usage 0x00..0x53 → ASCII */
-static const char hid_shifted[0x54] = {
+const char hid_shifted[0x54] = {
     0, 0, 0, 0,
     'A','B','C','D','E','F','G','H','I','J','K','L','M',
     'N','O','P','Q','R','S','T','U','V','W','X','Y','Z',

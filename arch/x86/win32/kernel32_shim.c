@@ -325,6 +325,9 @@ PVOID WINAPI VirtualAlloc(PVOID lpAddress, SIZE_T dwSize,
     if (dwSize > 0x20000000ULL) {
         serial_puts("[VA] REJECTED: size=0x");
         serial_puthex(dwSize, 8);
+        /* Dump the 32-bit caller's return address from the compat32 stack.
+         * The INT 0x2E thunk marshals args from the 32-bit stack. The
+         * return address is at [ESP+0] of the original call frame. */
         serial_puts(" (> 512MB, likely corruption)\n");
         g_last_error = 8; /* ERROR_NOT_ENOUGH_MEMORY */
         return NULL;

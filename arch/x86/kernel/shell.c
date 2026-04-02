@@ -268,6 +268,7 @@ static void cmd_help(void)
     sh_puts("  sched     Scheduler test (sched [stats])\n");
     sh_puts("  httpd     HTTP server (httpd [port] / httpd stop)\n");
     sh_puts("  winexec   Run a Win32 PE executable (winexec file.exe)\n");
+    sh_puts("  dosrun    Run a DOS 16-bit binary (dosrun file.com)\n");
     sh_puts("  clear     Clear screen\n");
     sh_puts("  desktop   Launch graphical desktop (elementaryOS style)\n");
     sh_puts("  kexec     Load + boot kernel from disk (kexec [file])\n");
@@ -2214,6 +2215,8 @@ static void shell_exec(char *line)
             }
             compat32_crash_jmpbuf = NULL;
         }
+    } else if (strcmp(cmd, "dosrun") == 0) {
+        sh_puts("DOS subsystem not compiled in this build\n");
     } else if (strcmp(cmd, "desktop") == 0) {
         /* Launch compositor with elementaryOS desktop */
         extern int  display_init(uint32_t *gop_base, uint32_t w, uint32_t h,

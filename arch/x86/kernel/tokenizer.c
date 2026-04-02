@@ -557,7 +557,7 @@ uint32_t tok_find_special(const void *tok, const char *s)
     while (s[slen]) slen++;
     for (uint32_t i = 0; i < t->vocab_size; i++) {
         if (t->vocab[i].len == (uint16_t)slen &&
-            __builtin_memcmp(t->vocab[i].bytes, s, slen) == 0)
+            memcmp(t->vocab[i].bytes, s, slen) == 0)
             return i;
     }
     return UINT32_MAX;
