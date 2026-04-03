@@ -143,6 +143,27 @@ static uint8_t  resize_edges;    /* combination of EDGE_* */
 static bool    is_maximized[2];
 static int32_t saved_geom[2][4];    /* x, y, w, h before maximize */
 
+/* ── Right-click context menu ────────────────────────────────── */
+
+enum {
+    CTX_CLOSE, CTX_MINIMIZE, CTX_MAXIMIZE, CTX_RESTORE,
+    CTX_SNAP_LEFT, CTX_SNAP_RIGHT,
+    CTX_SHOW_WIN0, CTX_SHOW_WIN1, CTX_SHOW_ALL
+};
+
+#define CTX_MAX_ITEMS  6
+#define CTX_ITEM_H     (GUI_FONT_H + 8)
+#define CTX_PAD_X      16
+
+static struct {
+    bool     visible;
+    int32_t  x, y, w, h;
+    int      count;
+    int      hover;       /* -1 = none */
+    int      target_win;  /* -1 = desktop */
+    struct { const char *label; uint8_t action; } items[CTX_MAX_ITEMS];
+} ctx_menu;
+
 /* Alt+Tab overlay: show window title briefly after switching */
 static uint64_t switcher_show_until;  /* tick when overlay disappears */
 
@@ -571,11 +592,181 @@ static int hit_test_dock(int32_t mx, int32_t my)
     return -2;
 }
 
+/* ── Context menu helpers ─────────────────────────────────── */
+
+static void ctx_menu_open_window(int32_t mx, int32_t my, int win_idx)
+{
+    ctx_menu.count = 0;
+    ctx_menu.target_win = win_idx;
+
+    ctx_menu.items[ctx_menu.count].label = "Cerrar";
+    ctx_menu.items[ctx_menu.count++].action = CTX_CLOSE;
+    ctx_menu.items[ctx_menu.count].label = "Minimizar";
+    ctx_menu.items[ctx_menu.count++].action = CTX_MINIMIZE;
+    if (is_maximized[win_idx]) {
+        ctx_menu.items[ctx_menu.count].label = "Restaurar";
+        ctx_menu.items[ctx_menu.count++].action = CTX_RESTORE;
+    } else {
+        ctx_menu.items[ctx_menu.count].label = "Maximizar";
+        ctx_menu.items[ctx_menu.count++].action = CTX_MAXIMIZE;
+    }
+    ctx_menu.items[ctx_menu.count].label = "Snap izquierda";
+    ctx_menu.items[ctx_menu.count++].action = CTX_SNAP_LEFT;
+    ctx_menu.items[ctx_menu.count].label = "Snap derecha";
+    ctx_menu.items[ctx_menu.count++].action = CTX_SNAP_RIGHT;
+
+    /* Calculate dimensions */
+    int max_tw = 0;
+    for (int i = 0; i < ctx_menu.count; i++) {
+        int tw = gui_text_width(ctx_menu.items[i].label);
+        if (tw > max_tw) max_tw = tw;
+    }
+    ctx_menu.w = max_tw + CTX_PAD_X * 2;
+    ctx_menu.h = ctx_menu.count * CTX_ITEM_H + 8;
+
+    /* Clamp to screen */
+    int32_t sw = (int32_t)display_get_width();
+    int32_t sh = (int32_t)display_get_height();
+    ctx_menu.x = (mx + ctx_menu.w > sw) ? sw - ctx_menu.w : mx;
+    ctx_menu.y = (my + ctx_menu.h > sh) ? sh - ctx_menu.h : my;
+    ctx_menu.hover = -1;
+    ctx_menu.visible = true;
+}
+
+static void ctx_menu_open_desktop(int32_t mx, int32_t my)
+{
+    ctx_menu.count = 0;
+    ctx_menu.target_win = -1;
+
+    ctx_menu.items[ctx_menu.count].label = "Mostrar Terminal";
+    ctx_menu.items[ctx_menu.count++].action = CTX_SHOW_WIN0;
+    ctx_menu.items[ctx_menu.count].label = "Mostrar System Info";
+    ctx_menu.items[ctx_menu.count++].action = CTX_SHOW_WIN1;
+    ctx_menu.items[ctx_menu.count].label = "Mostrar todo";
+    ctx_menu.items[ctx_menu.count++].action = CTX_SHOW_ALL;
+
+    int max_tw = 0;
+    for (int i = 0; i < ctx_menu.count; i++) {
+        int tw = gui_text_width(ctx_menu.items[i].label);
+        if (tw > max_tw) max_tw = tw;
+    }
+    ctx_menu.w = max_tw + CTX_PAD_X * 2;
+    ctx_menu.h = ctx_menu.count * CTX_ITEM_H + 8;
+
+    int32_t sw = (int32_t)display_get_width();
+    int32_t sh = (int32_t)display_get_height();
+    ctx_menu.x = (mx + ctx_menu.w > sw) ? sw - ctx_menu.w : mx;
+    ctx_menu.y = (my + ctx_menu.h > sh) ? sh - ctx_menu.h : my;
+    ctx_menu.hover = -1;
+    ctx_menu.visible = true;
+}
+
+static void ctx_menu_execute(int action_idx);  /* forward declaration */
+
 /* Callback: mark window hidden after shrink animation completes */
 static void on_shrink_complete(void *ctx)
 {
     gui_win_desc_t *w = (gui_win_desc_t *)ctx;
     w->hidden = true;
+}
+
+/* Helper: hide window with shrink animation (used by close, minimize, context menu) */
+static void hide_window_animated(gui_win_desc_t *dw, int hit, int count)
+{
+    gui_anim_cancel(&dw[hit].x);
+    gui_anim_cancel(&dw[hit].y);
+    gui_anim_cancel(&dw[hit].w);
+    gui_anim_cancel(&dw[hit].h);
+    if (focused_demo_idx == hit) {
+        focused_demo_idx = -1;
+        for (int fi = 0; fi < count; fi++)
+            if (!dw[fi].hidden) { focused_demo_idx = fi; break; }
+    }
+    int32_t mid_x = dw[hit].x + dw[hit].w / 2;
+    int32_t mid_y = dw[hit].y + dw[hit].h / 2;
+    gui_anim_start(&dw[hit].x, mid_x, 200, gui_ease_in_out_quad, NULL, NULL);
+    gui_anim_start(&dw[hit].y, mid_y, 200, gui_ease_in_out_quad, NULL, NULL);
+    gui_anim_start(&dw[hit].w, 0, 200, gui_ease_in_out_quad, NULL, NULL);
+    gui_anim_start(&dw[hit].h, 0, 200, gui_ease_in_out_quad,
+                   on_shrink_complete, &dw[hit]);
+}
+
+/* Helper: snap window to half-screen (used by shortcuts + context menu) */
+static void snap_window(gui_win_desc_t *dw, int idx, bool left)
+{
+    int32_t sw2 = (int32_t)display_get_width();
+    int32_t usable_h = (int32_t)display_get_height() - GUI_PANEL_HEIGHT - GUI_DOCK_HEIGHT;
+    gui_anim_start(&dw[idx].x, left ? 0 : sw2 / 2, 250, gui_ease_out_cubic, NULL, NULL);
+    gui_anim_start(&dw[idx].y, GUI_PANEL_HEIGHT, 250, gui_ease_out_cubic, NULL, NULL);
+    gui_anim_start(&dw[idx].w, sw2 / 2, 250, gui_ease_out_cubic, NULL, NULL);
+    gui_anim_start(&dw[idx].h, usable_h, 250, gui_ease_out_cubic, NULL, NULL);
+    is_maximized[idx] = false;
+}
+
+/* Execute context menu action */
+static void ctx_menu_execute(int action_idx)
+{
+    if (action_idx < 0 || action_idx >= ctx_menu.count) return;
+    uint8_t action = ctx_menu.items[action_idx].action;
+    int win = ctx_menu.target_win;
+    int count;
+    gui_win_desc_t *dw = gui_desktop_get_windows(&count);
+
+    switch (action) {
+    case CTX_CLOSE:
+    case CTX_MINIMIZE:
+        if (win >= 0 && win < count)
+            hide_window_animated(dw, win, count);
+        break;
+    case CTX_MAXIMIZE:
+        if (win >= 0 && win < count && !is_maximized[win]) {
+            saved_geom[win][0] = dw[win].x; saved_geom[win][1] = dw[win].y;
+            saved_geom[win][2] = dw[win].w; saved_geom[win][3] = dw[win].h;
+            int32_t sw2 = (int32_t)display_get_width();
+            int32_t uh = (int32_t)display_get_height() - GUI_PANEL_HEIGHT - GUI_DOCK_HEIGHT;
+            gui_anim_start(&dw[win].x, 0, 300, gui_ease_out_cubic, NULL, NULL);
+            gui_anim_start(&dw[win].y, GUI_PANEL_HEIGHT, 300, gui_ease_out_cubic, NULL, NULL);
+            gui_anim_start(&dw[win].w, sw2, 300, gui_ease_out_cubic, NULL, NULL);
+            gui_anim_start(&dw[win].h, uh, 300, gui_ease_out_cubic, NULL, NULL);
+            is_maximized[win] = true;
+        }
+        break;
+    case CTX_RESTORE:
+        if (win >= 0 && win < count && is_maximized[win]) {
+            gui_anim_start(&dw[win].x, saved_geom[win][0], 280, gui_ease_out_cubic, NULL, NULL);
+            gui_anim_start(&dw[win].y, saved_geom[win][1], 280, gui_ease_out_cubic, NULL, NULL);
+            gui_anim_start(&dw[win].w, saved_geom[win][2], 280, gui_ease_out_cubic, NULL, NULL);
+            gui_anim_start(&dw[win].h, saved_geom[win][3], 280, gui_ease_out_cubic, NULL, NULL);
+            is_maximized[win] = false;
+        }
+        break;
+    case CTX_SNAP_LEFT:
+        if (win >= 0 && win < count) snap_window(dw, win, true);
+        break;
+    case CTX_SNAP_RIGHT:
+        if (win >= 0 && win < count) snap_window(dw, win, false);
+        break;
+    case CTX_SHOW_WIN0:
+        gui_desktop_show_window(0);
+        is_maximized[0] = false;
+        focused_demo_idx = 0;
+        break;
+    case CTX_SHOW_WIN1:
+        gui_desktop_show_window(1);
+        is_maximized[1] = false;
+        focused_demo_idx = 1;
+        break;
+    case CTX_SHOW_ALL:
+        for (int i = 0; i < count; i++) {
+            if (dw[i].hidden) {
+                gui_desktop_show_window(i);
+                is_maximized[i] = false;
+            }
+        }
+        if (focused_demo_idx < 0) focused_demo_idx = 0;
+        break;
+    }
+    ctx_menu.visible = false;
 }
 
 /* Process mouse clicks on demo windows */
@@ -584,9 +775,36 @@ static void process_mouse_input(void)
     uint8_t pressed  = comp_button_state & ~prev_buttons;
     uint8_t released = prev_buttons & ~comp_button_state;
 
+    /* Context menu: right-click opens, any click outside closes */
+    if (pressed & 2) {  /* right-click: open context menu */
+        int32_t cx, cy;
+        input_get_cursor(&cx, &cy);
+        ctx_menu.visible = false;  /* close previous */
+        int hit = hit_test_demo_window(cx, cy);
+        if (hit >= 0)
+            ctx_menu_open_window(cx, cy, hit);
+        else
+            ctx_menu_open_desktop(cx, cy);
+        prev_buttons = comp_button_state;
+        return;
+    }
+
     if (pressed & 1) {  /* left button newly pressed */
         int32_t cx, cy;
         input_get_cursor(&cx, &cy);
+
+        /* If context menu is open, handle it first */
+        if (ctx_menu.visible) {
+            if (cx >= ctx_menu.x && cx < ctx_menu.x + ctx_menu.w &&
+                cy >= ctx_menu.y && cy < ctx_menu.y + ctx_menu.h) {
+                int idx = (cy - ctx_menu.y - 4) / CTX_ITEM_H;
+                if (idx >= 0 && idx < ctx_menu.count)
+                    ctx_menu_execute(idx);
+            }
+            ctx_menu.visible = false;
+            prev_buttons = comp_button_state;
+            return;  /* consume click */
+        }
 
         serial_puts("[COMP] LMB cx="); serial_putdec((uint64_t)cx);
         serial_puts(" cy="); serial_putdec((uint64_t)cy);
@@ -627,24 +845,7 @@ static void process_mouse_input(void)
             int btn = hit_test_buttons(&dw[hit], cx, cy);
             if (btn == 1 || btn == 2) {
                 /* Close/Minimize: animate shrink then hide via callback */
-                gui_anim_cancel(&dw[hit].x);
-                gui_anim_cancel(&dw[hit].y);
-                gui_anim_cancel(&dw[hit].w);
-                gui_anim_cancel(&dw[hit].h);
-                /* Shift focus immediately */
-                if (focused_demo_idx == hit) {
-                    focused_demo_idx = -1;
-                    for (int fi = 0; fi < count; fi++)
-                        if (!dw[fi].hidden) { focused_demo_idx = fi; break; }
-                }
-                /* Animate shrink to center — last anim hides via callback */
-                int32_t mid_x = dw[hit].x + dw[hit].w / 2;
-                int32_t mid_y = dw[hit].y + dw[hit].h / 2;
-                gui_anim_start(&dw[hit].x, mid_x, 200, gui_ease_in_out_quad, NULL, NULL);
-                gui_anim_start(&dw[hit].y, mid_y, 200, gui_ease_in_out_quad, NULL, NULL);
-                gui_anim_start(&dw[hit].w, 0, 200, gui_ease_in_out_quad, NULL, NULL);
-                gui_anim_start(&dw[hit].h, 0, 200, gui_ease_in_out_quad,
-                               on_shrink_complete, &dw[hit]);
+                hide_window_animated(dw, hit, count);
             } else if (btn == 3) {
                 /* Maximize / restore toggle — animated (Phase 3.3) */
                 if (is_maximized[hit]) {
@@ -935,6 +1136,41 @@ static void compositor_render_frame(void)
             gui_rounded_rect_alpha(&scr, bx, by, bw, bh, 8, 0xD0202028);
             gui_draw_text_centered(&scr, bx, by + 10, bw, title,
                                    0xFFFFFFFF, 0);
+        }
+    }
+
+    /* Context menu overlay */
+    if (ctx_menu.visible) {
+        gui_surface_t scr = { back, w, h, p };
+        /* Shadow */
+        gui_box_shadow(&scr, ctx_menu.x, ctx_menu.y, ctx_menu.w, ctx_menu.h,
+                       2, 3, 8, 0x40000000);
+        /* Background */
+        gui_rounded_rect_alpha(&scr, ctx_menu.x, ctx_menu.y,
+                               ctx_menu.w, ctx_menu.h, 6, 0xE8202028);
+        /* Border */
+        gui_rounded_rect_alpha(&scr, ctx_menu.x, ctx_menu.y,
+                               ctx_menu.w, ctx_menu.h, 6, 0x30FFFFFF);
+        /* Update hover based on cursor position */
+        int32_t cmx, cmy;
+        input_get_cursor(&cmx, &cmy);
+        ctx_menu.hover = -1;
+        if (cmx >= ctx_menu.x && cmx < ctx_menu.x + ctx_menu.w &&
+            cmy >= ctx_menu.y && cmy < ctx_menu.y + ctx_menu.h) {
+            ctx_menu.hover = (cmy - ctx_menu.y - 4) / CTX_ITEM_H;
+            if (ctx_menu.hover >= ctx_menu.count) ctx_menu.hover = -1;
+        }
+        /* Items */
+        for (int i = 0; i < ctx_menu.count; i++) {
+            int32_t iy = ctx_menu.y + 4 + i * CTX_ITEM_H;
+            if (i == ctx_menu.hover) {
+                gui_fill_rect_alpha(&scr, ctx_menu.x + 4, iy,
+                                    ctx_menu.w - 8, CTX_ITEM_H, 0x80007AFF);
+            }
+            gui_draw_text_aa(&scr, ctx_menu.x + CTX_PAD_X,
+                             iy + (CTX_ITEM_H - GUI_FONT_H) / 2,
+                             ctx_menu.items[i].label,
+                             (i == ctx_menu.hover) ? 0xFFFFFFFF : 0xFFE0E0E0);
         }
     }
 
