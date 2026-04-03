@@ -1352,39 +1352,10 @@ void compositor_thread(void)
                     key_ring_head = next;
                 }
 
-                /* Focus-based terminal routing: convert HID key-down events to
-                 * ASCII/VT100 and push to kb_buf ONLY when the terminal window
-                 * has focus (focused_demo_idx == 0). Other windows don't get
-                 * keyboard input — they'd need their own routing. */
-                int term_count;
-                gui_win_desc_t *dw_kb = gui_desktop_get_windows(&term_count);
-                bool term_visible = (term_count > 0 && !dw_kb[0].hidden);
-                if (!has_fullscreen && type == 1 && focused_demo_idx == 0 && term_visible) {
-                    extern void kb_push(char c);
-                    extern void kb_push_esc(const char *seq);
-                    extern const char hid_normal[];
-                    extern const char hid_shifted[];
-                    switch (sc) {
-                    case 0x4F: kb_push_esc("C");  break; /* Right */
-                    case 0x50: kb_push_esc("D");  break; /* Left */
-                    case 0x51: kb_push_esc("B");  break; /* Down */
-                    case 0x52: kb_push_esc("A");  break; /* Up */
-                    case 0x4A: kb_push_esc("H");  break; /* Home */
-                    case 0x4D: kb_push_esc("F");  break; /* End */
-                    case 0x49: kb_push_esc("2~"); break; /* Insert */
-                    case 0x4C: kb_push_esc("3~"); break; /* Delete */
-                    case 0x4B: kb_push_esc("5~"); break; /* Page Up */
-                    case 0x4E: kb_push_esc("6~"); break; /* Page Down */
-                    default:
-                        if (sc < 0x54) {
-                            char c = comp_shift_held ? hid_shifted[sc] : hid_normal[sc];
-                            if (comp_ctrl_held && c >= 'a' && c <= 'z') c = c - 'a' + 1;
-                            if (comp_ctrl_held && c >= 'A' && c <= 'Z') c = c - 'A' + 1;
-                            if (c) kb_push(c);
-                        }
-                        break;
-                    }
-                }
+                /* Terminal keyboard input is handled by PS/2 → kb_process_scancode
+                 * → kb_push (keyboard.c). The compositor does NOT re-route HID
+                 * events to kb_push — that caused double input when both PS/2
+                 * and USB HID keyboards are active (QEMU emulates both). */
             }
         }
 
