@@ -62,11 +62,21 @@ extern BOOL  WINAPI HeapFree(HANDLE hHeap, DWORD dwFlags, PVOID lpMem);
 extern PVOID WINAPI HeapReAlloc(HANDLE hHeap, DWORD dwFlags, PVOID lpMem, SIZE_T dwBytes);
 extern HANDLE WINAPI GetProcessHeap(void);
 
+static int fmalloc_log_count = 0;
 static uint64_t WINAPI stub_fmalloc_malloc(uint64_t _this, uint64_t count, uint64_t tag)
 {
     (void)_this; (void)tag;
     HANDLE heap = GetProcessHeap();
-    return (uint64_t)(uintptr_t)HeapAlloc(heap, 0, count ? count : 1);
+    PVOID result = HeapAlloc(heap, 0, count ? count : 1);
+    if (fmalloc_log_count < 20 || (count > 4096 && fmalloc_log_count < 200)) {
+        fmalloc_log_count++;
+        serial_puts("[FMALLOC] size=");
+        serial_putdec(count);
+        serial_puts(" -> 0x");
+        serial_puthex((uint64_t)(uintptr_t)result, 8);
+        serial_puts("\n");
+    }
+    return (uint64_t)(uintptr_t)result;
 }
 
 static uint64_t WINAPI stub_fmalloc_realloc(uint64_t _this, uint64_t orig,
@@ -309,6 +319,12 @@ static void crt_pool_init(void)
         crt_pool = crt_pool_static;
         crt_pool_size = sizeof(crt_pool_static);
     }
+    serial_puts("[CRT-POOL] addr=0x");
+    serial_puthex((uint64_t)(uintptr_t)crt_pool, 16);
+    serial_puts(" size=");
+    serial_putdec(crt_pool_size / (1024*1024));
+    serial_puts("MB ");
+    serial_puts(crt_pool == crt_pool_static ? "(static fallback)\n" : "(kmalloc)\n");
 }
 
 /* Free list for basic reuse */
@@ -317,6 +333,7 @@ typedef struct { PVOID addr; SIZE_T size; } FREE_ENTRY;
 static FREE_ENTRY free_list[FREE_LIST_MAX];
 static int free_list_count = 0;
 
+static int crt_malloc_log_count = 0;
 PVOID WINAPI crt_malloc(SIZE_T size)
 {
     if (size == 0) size = 1;
@@ -340,7 +357,17 @@ PVOID WINAPI crt_malloc(SIZE_T size)
     BYTE *block = crt_pool + crt_pool_offset;
     crt_pool_offset += total;
     *(SIZE_T *)block = total;
-    return block + 8;
+    PVOID result = block + 8;
+
+    if (crt_malloc_log_count < 10) {
+        crt_malloc_log_count++;
+        serial_puts("[CRT-MALLOC] size=");
+        serial_putdec(size);
+        serial_puts(" -> 0x");
+        serial_puthex((uint64_t)(uintptr_t)result, 16);
+        serial_puts("\n");
+    }
+    return result;
 }
 
 PVOID WINAPI crt_calloc(SIZE_T count, SIZE_T size)

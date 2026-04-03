@@ -678,8 +678,9 @@ int winexec_run(const uint8_t *file_data, uint64_t file_size)
      * class types (FString, TArray) have constructors that expect zeroed
      * memory for their fields (Data=NULL, ArrayNum=0, ArrayMax=0).
      * Without zeroing, destructors read garbage → REP MOVSD 4GB hang. */
-    uint64_t stack_size = info.StackCommit;
+    uint64_t stack_size = info.StackReserve;
     if (stack_size < 65536) stack_size = 65536;  /* minimum 64KB */
+    if (stack_size > 8ULL * 1024 * 1024) stack_size = 8ULL * 1024 * 1024;  /* cap 8MB */
     uint64_t stack_pages = (stack_size + 0xFFF) / 4096;
     uint8_t *stack_base = (uint8_t *)mem_alloc_pages(stack_pages);
     if (stack_base)

@@ -1021,13 +1021,24 @@ void isr_handler(interrupt_frame_t *frame)
                     serial_puts(rn[reg]);
                     serial_puts(") vtbl=0x"); serial_puthex(vtbl, 8);
                     serial_puts(" this=0x"); serial_puthex((uint32_t)frame->rdi, 8);
-                    serial_puts(" [this+44]=0x");
-                    uint32_t this_ptr = (uint32_t)frame->rdi;
-                    if (this_ptr >= 0x10000 && this_ptr < 0x50000000) {
-                        uint32_t f44 = *(uint32_t *)(uintptr_t)(this_ptr + 0x44);
-                        serial_puthex(f44, 8);
-                    } else serial_puts("????????");
                     serial_puts("\n");
+                    /* Dump registers and stack */
+                    serial_puts("  EBP=0x"); serial_puthex((uint32_t)frame->rbp, 8);
+                    serial_puts(" ESP=0x"); serial_puthex((uint32_t)(frame->rsp & 0xFFFFFFFF), 8);
+                    serial_puts(" ECX=0x"); serial_puthex((uint32_t)frame->rcx, 8);
+                    serial_puts(" EAX=0x"); serial_puthex((uint32_t)frame->rax, 8);
+                    serial_puts("\n");
+                    /* Dump stack words from ESP upward to find return addresses */
+                    uint32_t esp32 = (uint32_t)(frame->rsp & 0xFFFFFFFF);
+                    if (esp32 >= 0x10000 && esp32 < 0x50000000) {
+                        uint32_t *sp = (uint32_t *)(uintptr_t)esp32;
+                        serial_puts("  STACK:");
+                        for (int i = 0; i < 16; i++) {
+                            if (i % 4 == 0) { serial_puts("\n    +"); serial_puthex(i*4, 2); serial_puts(":"); }
+                            serial_puts(" 0x"); serial_puthex(sp[i], 8);
+                        }
+                        serial_puts("\n");
+                    }
                     /* Dump vtable entries around the offset */
                     if (vtbl >= 0x10000000 && vtbl < 0x20000000) {
                         uint32_t *vt = (uint32_t *)(uintptr_t)vtbl;
