@@ -173,7 +173,7 @@ typedef struct {
     uint32_t lpVtbl32;
     uint32_t surf_index;
 } COM32_Surface;
-static COM32_Surface surf_proxy32[MAX_SURFACES];
+static COM32_Surface *surf_proxy32;  /* allocated dynamically */
 
 /* Forward declarations — defined later in file */
 static IDirectDrawSurface7 *com32_to_surface(uint32_t proxy_addr);
@@ -674,11 +674,15 @@ static IDirectDraw7 g_ddraw = { &dd_vtbl };
  *  22: GetSurfaceDesc  25: Lock  26: ReleaseDC  32: Unlock
  */
 
-/* 32-bit proxy objects — BSS, guaranteed < 4GB in our link layout */
-static uint32_t dd_vtbl32[23];  /* IDirectDraw vtable (23 slots) */
-static uint32_t dd_proxy32;     /* IDirectDraw COM object: just lpVtbl32 */
+/* 32-bit COM proxy objects — allocated from PE32-accessible memory
+ * (mem_alloc_pages) so their addresses are in the PE32 address space,
+ * NOT in kernel BSS.  Previously these were BSS variables at ~0x025Dxxxx
+ * which caused UT99 to confuse the DD proxy with UGameEngine (their
+ * addresses overlapped with kernel globals the PE32 code was reading). */
+static uint32_t *dd_vtbl32;            /* IDirectDraw vtable (23 slots) */
+static uint32_t *dd_proxy32_ptr;       /* → 1 uint32_t: the lpVtbl32 */
 
-static uint32_t surf_vtbl32[33]; /* IDirectDrawSurface vtable */
+static uint32_t *surf_vtbl32;          /* IDirectDrawSurface vtable (33 slots) */
 static int com32_initialized = 0;
 
 /* IDirectDraw7::EnumDisplayModes — report available display modes via callback.
@@ -747,11 +751,24 @@ static void ddraw_init_com32(void)
 
     extern uint32_t compat32_make_thunk_ex(uint64_t target, const char *name,
                                             uint8_t num_args, uint8_t callconv);
+    extern void *mem_alloc_pages(uint64_t count);
     #define CC_STDCALL 1
 
-    /* Zero all vtables */
-    for (int i = 0; i < 23; i++) dd_vtbl32[i] = 0;
-    for (int i = 0; i < 33; i++) surf_vtbl32[i] = 0;
+    /* Allocate COM proxy objects from PE32-accessible memory.
+     * Layout in 1 page: dd_vtbl32[23] + dd_proxy32(1) + surf_vtbl32[33] + surf_proxy32[8] */
+    uint8_t *page = (uint8_t *)mem_alloc_pages(1);
+    if (!page) { serial_puts("[DDRAW] COM proxy alloc FAILED\n"); return; }
+    for (int i = 0; i < 4096; i++) page[i] = 0;
+
+    dd_vtbl32     = (uint32_t *)(page + 0);           /* 23 * 4 = 92 bytes */
+    dd_proxy32_ptr = (uint32_t *)(page + 96);          /* 4 bytes */
+    surf_vtbl32   = (uint32_t *)(page + 128);          /* 33 * 4 = 132 bytes */
+    surf_proxy32  = (COM32_Surface *)(page + 272);     /* 8 * 8 = 64 bytes */
+
+    serial_puts("[DDRAW] COM proxies at 0x");
+    extern void serial_puthex(uint64_t val, int digits);
+    serial_puthex((uint64_t)(uintptr_t)page, 8);
+    serial_puts("\n");
 
     /* IDirectDraw vtable thunks (stdcall, include 'this' in arg count) */
     dd_vtbl32[0]  = compat32_make_thunk_ex((uint64_t)(ULONG_PTR)dd_QueryInterface,
@@ -876,7 +893,7 @@ static void ddraw_init_com32(void)
     }
 
     /* Setup DD proxy object */
-    dd_proxy32 = (uint32_t)(ULONG_PTR)dd_vtbl32;
+    *dd_proxy32_ptr = (uint32_t)(ULONG_PTR)dd_vtbl32;
 
     /* Setup surface proxies */
     for (int i = 0; i < MAX_SURFACES; i++) {
@@ -887,9 +904,7 @@ static void ddraw_init_com32(void)
     com32_initialized = 1;
     serial_puts("[DDRAW] COM32 proxies initialized\n");
 
-    /* Hardware watchpoint on dd_vtbl32[0] to catch runtime corruption.
-     * The vtable is in kernel BSS and gets overwritten with VirtualAlloc
-     * bytecode addresses (0x4039C870) by an unknown writer. */
+    /* Hardware watchpoint on dd_vtbl32[0] to catch runtime corruption. */
     {
         uint64_t watch0 = (uint64_t)(uintptr_t)dd_vtbl32;
         /* DR1 for GIsCriticalError DISABLED: Core.dll legitimately writes
@@ -920,7 +935,7 @@ HRESULT WINAPI DirectDrawCreate(LPGUID lpGUID, PVOID *lplpDD, PVOID pUnkOuter)
     ddraw_init_com32();
 
     /* Return 32-bit proxy address (not the 64-bit g_ddraw) */
-    *(uint32_t *)lplpDD = (uint32_t)(ULONG_PTR)&dd_proxy32;
+    *(uint32_t *)lplpDD = (uint32_t)(ULONG_PTR)dd_proxy32_ptr;
     return DD_OK;
 }
 
