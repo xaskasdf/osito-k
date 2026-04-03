@@ -2216,7 +2216,12 @@ static void shell_exec(char *line)
             compat32_crash_jmpbuf = NULL;
         }
     } else if (strcmp(cmd, "dosrun") == 0) {
-        sh_puts("DOS subsystem not compiled in this build\n");
+        if (argc < 2) {
+            sh_puts("Usage: dosrun <file.com|file.exe>\n");
+        } else {
+            extern int dos_run(const char *filename, int argc, const char **argv);
+            dos_run(argv[1], argc - 1, (const char **)&argv[1]);
+        }
     } else if (strcmp(cmd, "desktop") == 0) {
         /* Launch compositor with elementaryOS desktop */
         extern int  display_init(uint32_t *gop_base, uint32_t w, uint32_t h,
@@ -2254,6 +2259,68 @@ static void shell_exec(char *line)
                 display_set_available_modes(saved_boot_info.display_modes,
                                             saved_boot_info.display_mode_count,
                                             saved_boot_info.display_current_mode);
+
+            /* Try GPU display engine takeover (Phase A: GOP → GPU scanout).
+             * On success, display_flip() will use page flips instead of memcpy.
+             * Falls back gracefully in QEMU or when no GPU is present. */
+            extern int gpu_display_init(uint32_t *gop_fb, uint32_t width,
+                                        uint32_t height, uint32_t pitch)
+                                        __attribute__((weak));
+            extern void display_enable_gpu_scanout(void);
+            if (gpu_display_init && gpu_display_init(vram, w, h, p * 4) == 0) {
+                display_enable_gpu_scanout();
+                sh_puts("GPU display engine active (page flip)\n");
+
+                /* Phase B: detect monitor EDID and modeset to native resolution */
+                typedef struct {
+                    uint32_t pixel_clock_hz;
+                    uint16_t h_active, h_blank, h_sync_offset, h_sync_width;
+                    uint16_t v_active, v_blank, v_sync_offset, v_sync_width;
+                    uint16_t h_total, v_total;
+                    uint32_t refresh_hz;
+                    _Bool    interlaced;
+                } edid_mode_t;
+                extern int gpu_display_detect_monitor(edid_mode_t *mode)
+                    __attribute__((weak));
+                extern int gpu_display_set_mode(const edid_mode_t *mode,
+                    uint64_t fb_addr, uint32_t fb_pitch)
+                    __attribute__((weak));
+                extern int display_resize(uint32_t nw, uint32_t nh, uint32_t np);
+                extern uint32_t *display_get_back_buffer(void);
+
+                edid_mode_t native;
+                if (gpu_display_detect_monitor &&
+                    gpu_display_detect_monitor(&native) == 0 &&
+                    (native.h_active != w || native.v_active != h)) {
+                    sh_puts("Monitor native: ");
+                    sh_putdec(native.h_active);
+                    sh_puts("x");
+                    sh_putdec(native.v_active);
+                    sh_puts("@");
+                    sh_putdec(native.refresh_hz);
+                    sh_puts("Hz\n");
+
+                    /* Resize display buffers to native resolution */
+                    if (display_resize(native.h_active, native.v_active,
+                                       native.h_active) == 0) {
+                        uint32_t *bb = display_get_back_buffer();
+                        uint32_t fb_pitch_bytes = native.h_active * 4;
+                        if (gpu_display_set_mode &&
+                            gpu_display_set_mode(&native,
+                                (uint64_t)(uintptr_t)bb, fb_pitch_bytes) == 0) {
+                            w = native.h_active;
+                            h = native.v_active;
+                            p = w;  /* our buffers have pitch == width */
+                            sh_puts("Modeset OK: ");
+                            sh_putdec(w);
+                            sh_puts("x");
+                            sh_putdec(h);
+                            sh_puts("\n");
+                        }
+                    }
+                }
+            }
+
             input_events_init(w, h);
             shm_init();
             compositor_init();

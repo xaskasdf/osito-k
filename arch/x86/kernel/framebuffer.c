@@ -444,8 +444,13 @@ void fb_redirect(uint32_t *new_base, uint32_t w, uint32_t h, uint32_t pitch)
     fb_pitch       = pitch;
     max_cols       = w / FONT_W;
     max_rows       = h / FONT_H;
+    /* Clamp to term_buf dimensions so scrollback stays in bounds */
+    if (max_cols > TERM_BUF_COLS) max_cols = TERM_BUF_COLS;
+    if (max_rows > TERM_BUF_ROWS) max_rows = TERM_BUF_ROWS;
     text_col       = 0;
     text_row       = 0;
+    term_cur_col   = 0;
+    term_cur_row   = 0;
     redirect_active = true;
     /* Caller is responsible for clearing the surface if needed */
 }

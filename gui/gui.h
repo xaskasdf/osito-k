@@ -88,6 +88,7 @@ typedef struct {
     int32_t  w, h;          /* content area dimensions */
     const char *title;
     uint32_t content_color;
+    bool     hidden;        /* window is closed/minimized — skip rendering */
 } gui_win_desc_t;
 
 /* ── Debug info (populated by kernel, rendered by panel) ──── */

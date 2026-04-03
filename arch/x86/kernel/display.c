@@ -25,6 +25,11 @@ extern void  kfree(void *ptr);
 extern void *mem_alloc_aligned(uint64_t size, uint64_t alignment);
 extern uint64_t idt_get_ticks(void);
 
+/* GPU display engine (gpu_display.c) — weak so we link without GPU driver */
+extern int      gpu_display_is_ready(void)  __attribute__((weak));
+extern int      gpu_display_flip(uint64_t fb_addr) __attribute__((weak));
+extern uint32_t gpu_display_vblank_count(void) __attribute__((weak));
+
 /* ── Display state ───────────────────────────────────────────── */
 
 typedef struct {
@@ -36,6 +41,13 @@ typedef struct {
     uint64_t  fb_size;       /* total bytes per buffer */
     bool      initialized;
     bool      dirty;         /* back buffer has changes */
+    bool      gpu_scanout;   /* GPU display engine active (page flip) */
+
+    /* Double buffer rotation (GPU scanout only).
+     * Two buffers alternate: compositor draws into back while GPU
+     * scans out from front. On flip, they swap roles — zero copy. */
+    uint32_t *buffers[2];    /* Two page-aligned framebuffers */
+    uint8_t   draw_idx;      /* Index compositor draws into (0 or 1) */
 
     /* VBlank simulation */
     uint64_t  vblank_count;
@@ -136,14 +148,25 @@ static uint64_t calibrate_tsc(void)
     return elapsed_tsc * 100 / TSC_CAL_TICKS;
 }
 
-/* ── VBlank simulation ───────────────────────────────────────── */
+/* ── VBlank synchronization ──────────────────────────────────── */
 
-/* TSC-based frame pacing: precise to microseconds, not limited by 100Hz APIC.
- * Falls back to APIC-tick method if TSC calibration looks unreasonable. */
+/* Three methods in priority order:
+ * 1. GPU hardware VBlank counter (real display timing, ~0 drift)
+ * 2. TSC-based frame pacing (precise to microseconds)
+ * 3. APIC tick-based (50fps cap at 100Hz, coarsest) */
 
 void display_wait_vblank(void)
 {
-    if (disp.tsc_per_frame) {
+    if (disp.gpu_scanout && gpu_display_vblank_count) {
+        /* Hardware VBlank: poll GPU display engine counter.
+         * Actual monitor refresh timing — no drift, no simulation. */
+        uint32_t start = gpu_display_vblank_count();
+        uint64_t spins = 0;
+        while (gpu_display_vblank_count() == start) {
+            if (++spins > 100000000ULL) break;  /* safety timeout ~1s */
+            __asm__ volatile ("pause");
+        }
+    } else if (disp.tsc_per_frame) {
         /* Spin-wait until target TSC value.
          * Use HLT only if we're more than ~5ms away (5M cycles at 1GHz). */
         uint64_t target = disp.last_flip_tsc + disp.tsc_per_frame;
@@ -206,17 +229,28 @@ int display_init(uint32_t *gop_base, uint32_t width, uint32_t height,
     }
     disp.last_flip_tsc = disp_rdtsc();
 
-    /* Allocate back buffer (page-aligned for potential GPU use) */
-    disp.back = (uint32_t *)mem_alloc_aligned(disp.fb_size, 4096);
-    if (!disp.back) {
-        serial_puts("[DISP] ERROR: Failed to allocate back buffer\n");
+    /* Allocate back buffers (page-aligned for GPU scanout) */
+    disp.buffers[0] = (uint32_t *)mem_alloc_aligned(disp.fb_size, 4096);
+    disp.buffers[1] = (uint32_t *)mem_alloc_aligned(disp.fb_size, 4096);
+    if (!disp.buffers[0] || !disp.buffers[1]) {
+        serial_puts("[DISP] ERROR: Failed to allocate back buffer(s)\n");
         return -1;
     }
+    disp.draw_idx = 0;
+    disp.back = disp.buffers[0];
 
-    /* Copy current GOP contents to back buffer */
-    memcpy(disp.back, disp.gop_fb, disp.fb_size);
+    /* Copy current GOP contents to both buffers */
+    memcpy(disp.buffers[0], disp.gop_fb, disp.fb_size);
+    memcpy(disp.buffers[1], disp.gop_fb, disp.fb_size);
 
     disp.initialized = true;
+    disp.gpu_scanout = false;
+
+    /* Check if GPU display engine is available for page flipping */
+    if (gpu_display_is_ready && gpu_display_flip &&
+        gpu_display_is_ready()) {
+        disp.gpu_scanout = true;
+    }
 
     serial_puts("[DISP] Double buffer: ");
     serial_putdec(width);
@@ -224,11 +258,15 @@ int display_init(uint32_t *gop_base, uint32_t width, uint32_t height,
     serial_putdec(height);
     serial_puts(" @ ");
     serial_putdec(disp.target_fps);
-    serial_puts("fps, back=0x");
-    serial_puthex((uint64_t)disp.back, 16);
+    serial_puts("fps, buf[0]=0x");
+    serial_puthex((uint64_t)disp.buffers[0], 16);
+    serial_puts(" buf[1]=0x");
+    serial_puthex((uint64_t)disp.buffers[1], 16);
     serial_puts(" (");
     serial_putdec(disp.fb_size / 1024);
-    serial_puts(" KB)\n");
+    serial_puts(" KB each)\n");
+    serial_puts("[DISP] Scanout: ");
+    serial_puts(disp.gpu_scanout ? "GPU page flip\n" : "CPU memcpy (GOP)\n");
 
     return 0;
 }
@@ -280,9 +318,19 @@ void display_flip(void)
     /* Wait for VBlank */
     display_wait_vblank();
 
-    /* Copy back buffer → GOP framebuffer.
-     * Regular memcpy so QEMU/HVF dirty-page tracking sees the writes. */
-    memcpy(disp.gop_fb, disp.back, disp.fb_size);
+    if (disp.gpu_scanout) {
+        /* GPU page flip: tell display engine to scan out from current draw buffer.
+         * Then swap to the other buffer for next frame's drawing.
+         * Compositor draws into buffers[draw_idx], GPU reads from the one we just flipped. */
+        gpu_display_flip((uint64_t)(uintptr_t)disp.buffers[disp.draw_idx]);
+        disp.draw_idx ^= 1;
+        disp.back = disp.buffers[disp.draw_idx];
+    } else {
+        /* Fallback: copy back buffer → GOP framebuffer (QEMU / no GPU).
+         * Regular memcpy so QEMU/HVF dirty-page tracking sees the writes.
+         * No rotation needed — single back buffer is always the draw target. */
+        memcpy(disp.gop_fb, disp.back, disp.fb_size);
+    }
 
     /* Track timing */
     uint64_t now = idt_get_ticks();
@@ -300,25 +348,89 @@ void display_flip(void)
 void display_flip_nowait(void)
 {
     if (!disp.initialized || !disp.dirty) return;
-    memcpy(disp.gop_fb, disp.back, disp.fb_size);
+    if (disp.gpu_scanout) {
+        gpu_display_flip((uint64_t)(uintptr_t)disp.buffers[disp.draw_idx]);
+        disp.draw_idx ^= 1;
+        disp.back = disp.buffers[disp.draw_idx];
+    } else {
+        memcpy(disp.gop_fb, disp.back, disp.fb_size);
+    }
     disp.last_flip_tick = idt_get_ticks();
     disp.last_flip_tsc  = disp_rdtsc();
     disp.flip_count++;
     disp.dirty = false;
 }
 
-/* Force-refresh: regular memcpy (not NT stores) to ensure QEMU/HVF
- * dirty-page tracking detects the framebuffer write. Used after
- * fullscreen→desktop transitions where NT stores may not trigger
- * QEMU's Cocoa display refresh. */
+/* Force-refresh: ensure the current back buffer is displayed.
+ * With GPU scanout: page flip to current buffer.
+ * Without GPU: regular memcpy to GOP (QEMU/HVF dirty-page tracking). */
 void display_force_refresh(void)
 {
     if (!disp.initialized || !disp.back) return;
-    memcpy(disp.gop_fb, disp.back, disp.fb_size);
+    if (disp.gpu_scanout)
+        gpu_display_flip((uint64_t)(uintptr_t)disp.back);
+    else
+        memcpy(disp.gop_fb, disp.back, disp.fb_size);
     disp.last_flip_tick = idt_get_ticks();
     disp.last_flip_tsc  = disp_rdtsc();
     disp.flip_count++;
     disp.dirty = false;
+}
+
+/* Resize display buffers after modeset.
+ * Re-allocates back buffers for the new resolution. */
+int display_resize(uint32_t new_width, uint32_t new_height, uint32_t new_pitch)
+{
+    if (!disp.initialized) return -1;
+
+    uint64_t new_size = (uint64_t)new_pitch * new_height * sizeof(uint32_t);
+
+    uint32_t *b0 = (uint32_t *)mem_alloc_aligned(new_size, 4096);
+    uint32_t *b1 = (uint32_t *)mem_alloc_aligned(new_size, 4096);
+    if (!b0 || !b1) {
+        serial_puts("[DISP] Resize failed: cannot allocate buffers\n");
+        if (b0) kfree(b0);
+        if (b1) kfree(b1);
+        return -1;
+    }
+
+    /* Clear new buffers */
+    memset(b0, 0, new_size);
+    memset(b1, 0, new_size);
+
+    /* Free old buffers */
+    if (disp.buffers[0]) kfree(disp.buffers[0]);
+    if (disp.buffers[1]) kfree(disp.buffers[1]);
+
+    disp.width  = new_width;
+    disp.height = new_height;
+    disp.pitch  = new_pitch;
+    disp.fb_size = new_size;
+    disp.buffers[0] = b0;
+    disp.buffers[1] = b1;
+    disp.draw_idx = 0;
+    disp.back = disp.buffers[0];
+
+    serial_puts("[DISP] Resized to ");
+    serial_putdec(new_width);
+    serial_puts("x");
+    serial_putdec(new_height);
+    serial_puts(" (");
+    serial_putdec(new_size / 1024);
+    serial_puts(" KB per buffer)\n");
+
+    return 0;
+}
+
+/* Enable GPU scanout (called after gpu_display_init succeeds) */
+void display_enable_gpu_scanout(void)
+{
+    if (!disp.initialized) return;
+    if (gpu_display_is_ready && gpu_display_flip &&
+        gpu_display_is_ready()) {
+        disp.gpu_scanout = true;
+        serial_puts("[DISP] GPU scanout enabled (page flip)\n");
+    }
 }
 
 /* ── Back Buffer Access ──────────────────────────────────────── */

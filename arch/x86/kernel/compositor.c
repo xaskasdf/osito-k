@@ -480,6 +480,7 @@ static int hit_test_demo_window(int32_t mx, int32_t my)
     /* Check front-to-back (last in order = on top → check first) */
     for (int i = count - 1; i >= 0; i--) {
         int idx = order[i];
+        if (dw[idx].hidden) continue;
         int32_t wx = dw[idx].x;
         int32_t wy = dw[idx].y;
         int32_t ww = dw[idx].w + GUI_BORDER_W * 2;
@@ -582,6 +583,7 @@ static void process_mouse_input(void)
                 gui_desktop_get_windows(&count2);
                 if (dock_hit < count2) {
                     gui_desktop_show_window(dock_hit);
+                    is_maximized[dock_hit] = false;  /* reset maximize state on reopen */
                     focused_demo_idx = dock_hit;
                     serial_puts("[COMP] Dock icon="); serial_putdec((uint64_t)dock_hit);
                     serial_puts(" raised\n");
@@ -600,10 +602,20 @@ static void process_mouse_input(void)
 
             /* Check traffic-light buttons first */
             int btn = hit_test_buttons(&dw[hit], cx, cy);
-            if (btn == 1) {
-                /* Close: hide by moving offscreen (demo windows can't be destroyed) */
-                dw[hit].x = -9999;
-                dw[hit].y = -9999;
+            if (btn == 1 || btn == 2) {
+                /* Close/Minimize: hide window (dock restores via gui_desktop_show_window) */
+                dw[hit].hidden = true;
+                /* Cancel any in-progress animations on this window's geometry */
+                gui_anim_cancel(&dw[hit].x);
+                gui_anim_cancel(&dw[hit].y);
+                gui_anim_cancel(&dw[hit].w);
+                gui_anim_cancel(&dw[hit].h);
+                /* Shift focus to next visible window */
+                if (focused_demo_idx == hit) {
+                    focused_demo_idx = -1;
+                    for (int fi = 0; fi < count; fi++)
+                        if (!dw[fi].hidden) { focused_demo_idx = fi; break; }
+                }
             } else if (btn == 3) {
                 /* Maximize / restore toggle — animated (Phase 3.3) */
                 if (is_maximized[hit]) {
@@ -643,9 +655,20 @@ static void process_mouse_input(void)
         input_get_cursor(&cx, &cy);
         int count;
         gui_win_desc_t *dw = gui_desktop_get_windows(&count);
-        if (drag_win_idx >= 0 && drag_win_idx < count) {
-            dw[drag_win_idx].x = cx - drag_off_x;
-            dw[drag_win_idx].y = cy - drag_off_y;
+        if (drag_win_idx >= 0 && drag_win_idx < count &&
+            !dw[drag_win_idx].hidden) {
+            int32_t nx = cx - drag_off_x;
+            int32_t ny = cy - drag_off_y;
+            int32_t ww = dw[drag_win_idx].w;
+            int32_t sw = (int32_t)display_get_width();
+            int32_t sh = (int32_t)display_get_height();
+            /* Clamp: keep titlebar partially on screen */
+            if (nx < -(ww - 50)) nx = -(ww - 50);
+            if (nx > sw - 50)    nx = sw - 50;
+            if (ny < 0)          ny = 0;
+            if (ny > sh - GUI_TITLEBAR_H) ny = sh - GUI_TITLEBAR_H;
+            dw[drag_win_idx].x = nx;
+            dw[drag_win_idx].y = ny;
         }
     }
 
@@ -894,10 +917,16 @@ void compositor_thread(void)
                 /* Alt+Tab: cycle through windows (USB Tab = HID 0x2B, PS/2 Tab = 0x0F) */
                 if (type == 1 && alt_held && (sc == 0x2B || sc == 0x0F)) {
                     int count;
-                    gui_desktop_get_windows(&count);
+                    gui_win_desc_t *dw_tab = gui_desktop_get_windows(&count);
                     if (count > 1) {
-                        focused_demo_idx = (focused_demo_idx + 1) % count;
-                        if (focused_demo_idx < 0) focused_demo_idx = 0;
+                        /* Cycle to next visible (non-hidden) window */
+                        int start = focused_demo_idx;
+                        for (int attempt = 0; attempt < count; attempt++) {
+                            focused_demo_idx = (focused_demo_idx + 1) % count;
+                            if (!dw_tab[focused_demo_idx].hidden) break;
+                        }
+                        if (dw_tab[focused_demo_idx].hidden)
+                            focused_demo_idx = start;  /* all hidden, stay put */
                         gui_desktop_raise_window(focused_demo_idx);
                         serial_puts("[COMP] Alt+Tab -> window ");
                         serial_putdec((uint64_t)focused_demo_idx);
@@ -918,7 +947,10 @@ void compositor_thread(void)
                  * ASCII/VT100 and push to kb_buf ONLY when the terminal window
                  * has focus (focused_demo_idx == 0). Other windows don't get
                  * keyboard input — they'd need their own routing. */
-                if (!has_fullscreen && type == 1 && focused_demo_idx == 0) {
+                int term_count;
+                gui_win_desc_t *dw_kb = gui_desktop_get_windows(&term_count);
+                bool term_visible = (term_count > 0 && !dw_kb[0].hidden);
+                if (!has_fullscreen && type == 1 && focused_demo_idx == 0 && term_visible) {
                     extern void kb_push(char c);
                     extern void kb_push_esc(const char *seq);
                     extern const char hid_normal[];

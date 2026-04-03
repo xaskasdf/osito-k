@@ -389,3 +389,13 @@ void input_events_init(uint32_t scr_width, uint32_t scr_height)
     serial_putdec(INPUT_QUEUE_SIZE);
     serial_puts(")\n");
 }
+
+/* Update screen bounds after modeset/resize.
+ * Re-clamps cursor to new dimensions. */
+void input_update_screen_bounds(uint32_t new_w, uint32_t new_h)
+{
+    screen_w = (int32_t)new_w;
+    screen_h = (int32_t)new_h;
+    if (mouse_x >= screen_w) mouse_x = screen_w - 1;
+    if (mouse_y >= screen_h) mouse_y = screen_h - 1;
+}

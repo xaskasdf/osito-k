@@ -106,6 +106,7 @@ void gui_desktop_init(uint32_t screen_w, uint32_t screen_h)
 static void render_window_content(gui_surface_t *screen, int idx)
 {
     gui_win_desc_t *w = &demo_windows[idx];
+    if (w->hidden) return;
     /* Focused = this window is last (topmost) in the render order */
     bool focused = (demo_order[NUM_DEMO_WINDOWS - 1] == idx);
     gui_window_render(screen, w, focused);
@@ -185,19 +186,23 @@ static void render_window_content(gui_surface_t *screen, int idx)
 
 void gui_desktop_render(gui_surface_t *screen)
 {
+    /* Use live screen dimensions (survives modeset) instead of cached scr_w/scr_h */
+    uint32_t sw = screen->width;
+    uint32_t sh = screen->height;
+
     /* 1. Gradient background */
-    gui_gradient_v(screen, 0, 0, (int32_t)scr_w, (int32_t)scr_h,
+    gui_gradient_v(screen, 0, 0, (int32_t)sw, (int32_t)sh,
                    GUI_BG_DARK, GUI_BG_LIGHT);
 
     /* 2. Top panel */
-    gui_panel_render(screen, scr_w);
+    gui_panel_render(screen, sw);
 
     /* 3. Demo windows (back to front using render order) */
     for (int i = 0; i < NUM_DEMO_WINDOWS; i++)
         render_window_content(screen, demo_order[i]);
 
     /* 4. Bottom dock */
-    gui_dock_render(screen, scr_w, scr_h);
+    gui_dock_render(screen, sw, sh);
 }
 
 gui_win_desc_t *gui_desktop_get_windows(int *count)
@@ -222,16 +227,17 @@ void gui_desktop_raise_window(int idx)
 }
 
 /* Dock action: restore window to initial position if closed, then raise.
- * "Closed" = moved offscreen via the X button (x < -1000). */
+ * Restores position if window was hidden (close/minimize). */
 void gui_desktop_show_window(int idx)
 {
     if (idx < 0 || idx >= NUM_DEMO_WINDOWS) return;
     gui_win_desc_t *w = &demo_windows[idx];
-    if (w->x < -1000) {
+    if (w->hidden) {
         w->x = init_geom[idx][0];
         w->y = init_geom[idx][1];
         w->w = init_geom[idx][2];
         w->h = init_geom[idx][3];
+        w->hidden = false;
     }
     gui_desktop_raise_window(idx);
 }
