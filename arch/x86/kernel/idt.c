@@ -780,22 +780,34 @@ void isr_handler(interrupt_frame_t *frame)
             return;
         }
 
-        if (dr6 & 0x2) {  /* B1: StaticLoadClass IAT watchpoint */
-            uint64_t dr1;
-            __asm__ volatile ("mov %%dr1, %0" : "=r"(dr1));
-            uint32_t new_val = *(volatile uint32_t *)(uintptr_t)dr1;
-            static int iat_wp_count = 0;
-            iat_wp_count++;
+        if (dr6 & 0x2) {  /* B1: ConstructObject execution breakpoint */
+            static int bp1_count = 0;
+            bp1_count++;
 
-            if (iat_wp_count <= 20) {
-                serial_puts("[IAT-WP] StaticLoadClass = 0x");
-                serial_puthex(new_val, 8);
-                serial_puts(" writer RIP=0x");
-                serial_puthex((uint32_t)frame->rip, 8);
-                serial_puts(" CS=0x");
-                serial_puthex(frame->cs & 0xFFFF, 4);
-                serial_puts(" #");
-                serial_putdec(iat_wp_count);
+            serial_puts("[CONSTRUCT-BP] hit #");
+            serial_putdec(bp1_count);
+            serial_puts(" RIP=0x");
+            serial_puthex((uint32_t)frame->rip, 8);
+            serial_puts(" ECX=0x");
+            serial_puthex((uint32_t)frame->rcx, 8);
+            serial_puts(" ESI=0x");
+            serial_puthex((uint32_t)frame->rsi, 8);
+            serial_puts(" ESP=0x");
+            serial_puthex((uint32_t)(frame->rsp & 0xFFFFFFFF), 8);
+            serial_puts("\n");
+
+            /* Dump the UClass* argument (ESI = first pushed arg for
+             * this specific call site at Engine.dll+0x84267) */
+            uint32_t esi = (uint32_t)frame->rsi;
+            if (esi >= 0x10000 && esi < 0x50000000) {
+                /* UClass has name at a known offset. The first few
+                 * dwords might reveal the class identity. */
+                uint32_t *cls = (uint32_t *)(uintptr_t)esi;
+                serial_puts("  UClass[0..3]: 0x");
+                serial_puthex(cls[0], 8);
+                serial_puts(" 0x"); serial_puthex(cls[1], 8);
+                serial_puts(" 0x"); serial_puthex(cls[2], 8);
+                serial_puts(" 0x"); serial_puthex(cls[3], 8);
                 serial_puts("\n");
             }
 
