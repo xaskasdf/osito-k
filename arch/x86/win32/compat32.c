@@ -1636,6 +1636,17 @@ int compat32_seh_dispatch(PEXCEPTION_RECORD ExceptionRecord)
                 serial_puts(" (NULL — corrupted, skipping)\n");
                 goto next_frame;
             }
+            /* Validate handler address: must be in executable code range
+             * (PE DLLs 0x01D-0x12M, thunks 0x01DC-0x01FE, heap 0x40-0x80M).
+             * Handlers at low addresses (<0x10000) or in data ranges are
+             * corrupt SEH frames — skip to avoid infinite NULL-CALL loops. */
+            if (handler32 < 0x01000000 ||
+                (handler32 >= 0x20000000 && handler32 < 0x40000000)) {
+                serial_puts(" (invalid addr 0x");
+                serial_puthex(handler32, 8);
+                serial_puts(" — skipping)\n");
+                goto next_frame;
+            }
 
             /*
              * Check for MSVC C++ EH handler thunk pattern:
@@ -1874,6 +1885,31 @@ next_frame:
             return 1;
     }
 
+    /* Try the base SEH frame as last resort — the normal chain may be
+     * corrupt but the base frame (installed by winexec) is always valid. */
+    {
+        extern uint32_t g_base_seh_frame_addr;
+        if (g_base_seh_frame_addr >= 0x1C000000 && g_base_seh_frame_addr < 0x50000000) {
+            uint32_t *bf = (uint32_t *)(uintptr_t)g_base_seh_frame_addr;
+            uint32_t base_handler = bf[1];
+            if (base_handler >= 0x01000000 && base_handler < 0x20000000) {
+                serial_puts("[SEH32] trying base SEH frame @0x");
+                serial_puthex(g_base_seh_frame_addr, 8);
+                serial_puts("\n");
+                /* Call the base handler */
+                uint32_t args[4];
+                args[0] = (uint32_t)(ULONG_PTR)&seh32_exception_record;
+                args[1] = g_base_seh_frame_addr;
+                args[2] = 0;
+                args[3] = 0;
+                uint32_t disp = compat32_callback_args(base_handler, 4, args);
+                if (disp == 0) { /* ContinueExecution */
+                    serial_puts("[SEH32] base handler: continue\n");
+                    return 1;
+                }
+            }
+        }
+    }
     serial_puts("[SEH32] UNHANDLED — no handler caught the exception\n");
     return 0;
 }
