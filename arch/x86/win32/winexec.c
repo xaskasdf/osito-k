@@ -740,6 +740,8 @@ int winexec_run(const uint8_t *file_data, uint64_t file_size)
                 sp[1] = handler;               /* Handler = catch-all */
                 sp[2] = 0;                     /* Scope/state = 0 */
                 g_teb32.ExceptionList = (uint32_t)(uintptr_t)sp;
+                extern uint32_t g_base_seh_frame_addr;
+                g_base_seh_frame_addr = (uint32_t)(uintptr_t)sp;
                 sp32 = (uint32_t)(uintptr_t)sp;
                 serial_puts("[WINEXEC] Base SEH frame at 0x");
                 serial_puthex((uint32_t)(uintptr_t)sp, 8);
