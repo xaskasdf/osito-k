@@ -682,9 +682,10 @@ int winexec_run(const uint8_t *file_data, uint64_t file_size)
     if (stack_size < 65536) stack_size = 65536;  /* minimum 64KB */
     if (stack_size > 8ULL * 1024 * 1024) stack_size = 8ULL * 1024 * 1024;  /* cap 8MB */
     uint64_t stack_pages = (stack_size + 0xFFF) / 4096;
-    uint8_t *stack_base = (uint8_t *)mem_alloc_pages(stack_pages);
+    /* Add 1 extra page at the bottom as a guard page */
+    uint8_t *stack_base = (uint8_t *)mem_alloc_pages(stack_pages + 1);
     if (stack_base)
-        memset(stack_base, 0, stack_pages * 4096);
+        memset(stack_base, 0, (stack_pages + 1) * 4096);
 
     if (!stack_base) {
         serial_puts("[WINEXEC] failed to allocate stack\n");
@@ -692,8 +693,23 @@ int winexec_run(const uint8_t *file_data, uint64_t file_size)
         return -1;
     }
 
+    /* Guard page: unmap the bottom page so stack overflow faults cleanly
+     * instead of silently corrupting adjacent memory. __chkstk probing
+     * will hit this guard page and trigger a page fault. */
+    extern int paging_set_flags(uint64_t virt, uint64_t flags);
+    paging_set_flags((uint64_t)stack_base, 0);  /* remove all flags → not present */
+
+    serial_puts("[WINEXEC] Stack: ");
+    serial_putdec(stack_size / 1024);
+    serial_puts("KB at 0x");
+    extern void serial_puthex(uint64_t val, int digits);
+    serial_puthex((uint64_t)stack_base, 8);
+    serial_puts(" (guard page at bottom)\n");
+
+    /* Usable stack starts after the guard page */
+    uint8_t *stack_usable = stack_base + 4096;
     /* Stack grows down — entry RSP/ESP points near top */
-    uint8_t *stack_top = stack_base + (stack_pages * 4096) - 64;
+    uint8_t *stack_top = stack_usable + (stack_pages * 4096) - 64;
     /* Align to 16-byte boundary */
     stack_top = (uint8_t *)((uint64_t)stack_top & ~0xFULL);
 
