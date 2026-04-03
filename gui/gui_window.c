@@ -56,10 +56,10 @@ void gui_window_render(gui_surface_t *s, const gui_win_desc_t *win, bool focused
     btn_x += GUI_BTN_RADIUS * 2 + 6;
     gui_fill_circle_aa(s, btn_x, btn_y, GUI_BTN_RADIUS, c_max | 0xFF000000);
 
-    /* ── Title text (centered in titlebar) ────────────────── */
+    /* ── Title text (centered in titlebar, AA) ──────────────── */
     if (win->title) {
         uint32_t txt_color = focused ? GUI_TITLEBAR_TEXT : GUI_TEXT_DIM;
-        gui_draw_text_centered(s, fx, fy + (GUI_TITLEBAR_H - GUI_FONT_H) / 2,
-                               fw, win->title, txt_color, 0);
+        gui_draw_text_centered_aa(s, fx, fy + (GUI_TITLEBAR_H - GUI_FONT_H) / 2,
+                                  fw, win->title, txt_color);
     }
 }

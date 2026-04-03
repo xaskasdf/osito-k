@@ -155,7 +155,7 @@ static void render_window_content(gui_surface_t *screen, int idx)
         /* System Info window content */
         int32_t tx = w->x + 12;
         int32_t ty = w->y + GUI_TITLEBAR_H + 12;
-        gui_draw_text(screen, tx, ty, "Kernel:  OsitoK", GUI_PANEL_TEXT, 0);
+        gui_draw_text_aa(screen, tx, ty, "Kernel:  OsitoK", GUI_PANEL_TEXT);
 
         const gui_debug_info_t *di = gui_panel_get_debug();
         char line[64];
@@ -167,27 +167,27 @@ static void render_window_content(gui_surface_t *screen, int idx)
         if (m  < 10) { line[p++] = '0'; } p = _scat_num(line, p, m);  line[p++] = ':';
         if (s2 < 10) { line[p++] = '0'; } p = _scat_num(line, p, s2);
         line[p] = '\0';
-        gui_draw_text(screen, tx, ty + 20, line, GUI_PANEL_TEXT, 0);
+        gui_draw_text_aa(screen, tx, ty + 20, line, GUI_PANEL_TEXT);
 
         p = 0;
         p = _scat(line, p, "Memory:  ");
         p = _scat_num(line, p, di->mem_total_mb);
         p = _scat(line, p, " MB");
         line[p] = '\0';
-        gui_draw_text(screen, tx, ty + 40, line, GUI_PANEL_TEXT, 0);
+        gui_draw_text_aa(screen, tx, ty + 40, line, GUI_PANEL_TEXT);
 
         p = 0;
         p = _scat(line, p, "Used:    ");
         p = _scat_num(line, p, di->mem_used_mb);
         p = _scat(line, p, " MB");
         line[p] = '\0';
-        gui_draw_text(screen, tx, ty + 60, line, GUI_PANEL_TEXT, 0);
+        gui_draw_text_aa(screen, tx, ty + 60, line, GUI_PANEL_TEXT);
 
         p = 0;
         p = _scat(line, p, "Procs:   ");
         p = _scat_num(line, p, di->procs);
         line[p] = '\0';
-        gui_draw_text(screen, tx, ty + 80, line, GUI_ACCENT, 0);
+        gui_draw_text_aa(screen, tx, ty + 80, line, GUI_ACCENT);
     }
 }
 

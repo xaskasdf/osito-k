@@ -64,8 +64,8 @@ void gui_panel_render(gui_surface_t *s, uint32_t screen_w)
     /* Subtle bottom border */
     gui_hline(s, 0, GUI_PANEL_HEIGHT - 1, (int32_t)screen_w, GUI_BORDER);
 
-    /* Left: "OsitoK" branding */
-    gui_draw_text(s, 12, text_y, "OsitoK", GUI_ACCENT, 0);
+    /* Left: "OsitoK" branding (AA) */
+    gui_draw_text_aa(s, 12, text_y, "OsitoK", GUI_ACCENT);
 
     /* Right: RTC clock (HH:MM:SS from CMOS RTC) */
     char clock[12];
@@ -80,8 +80,8 @@ void gui_panel_render(gui_surface_t *s, uint32_t screen_w)
         clock[ci] = '\0';
     }
     int cw = gui_text_width(clock);
-    gui_draw_text(s, (int32_t)screen_w - cw - 12, text_y,
-                  clock, GUI_PANEL_TEXT, 0);
+    gui_draw_text_aa(s, (int32_t)screen_w - cw - 12, text_y,
+                     clock, GUI_PANEL_TEXT);
 
     /* Center-right: debug stats (to the left of clock) */
     if (dbg.fps || dbg.mem_used_mb || dbg.ticks) {
@@ -99,6 +99,6 @@ void gui_panel_render(gui_surface_t *s, uint32_t screen_w)
 
         int tw = gui_text_width(line);
         int32_t x = (int32_t)screen_w - cw - 12 - tw - 20;
-        gui_draw_text(s, x, text_y, line, GUI_TEXT_DIM, 0);
+        gui_draw_text_aa(s, x, text_y, line, GUI_TEXT_DIM);
     }
 }

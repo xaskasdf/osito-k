@@ -154,6 +154,14 @@ void gui_draw_text_centered(gui_surface_t *s, int32_t x, int32_t y,
                             int32_t w, const char *str,
                             uint32_t fg, uint32_t bg);
 
+/* Anti-aliased text (edge-fringe AA, no background fill) */
+void gui_draw_char_aa(gui_surface_t *s, int32_t x, int32_t y,
+                      char c, uint32_t fg);
+void gui_draw_text_aa(gui_surface_t *s, int32_t x, int32_t y,
+                      const char *str, uint32_t fg);
+void gui_draw_text_centered_aa(gui_surface_t *s, int32_t x, int32_t y,
+                               int32_t w, const char *str, uint32_t fg);
+
 /* ── Panel (gui_panel.c) ──────────────────────────────────── */
 
 void gui_panel_render(gui_surface_t *s, uint32_t screen_w);

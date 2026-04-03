@@ -62,9 +62,8 @@ void gui_dock_render(gui_surface_t *s, uint32_t screen_w, uint32_t screen_h,
         /* Center the label character in the icon */
         char label[2] = { dock_items[i].label, 0 };
         uint32_t text_color = visible ? 0xFFFFFFFF : 0xFF888888;
-        gui_draw_text_centered(s, ix, iy + (GUI_DOCK_ICON_SIZE - GUI_FONT_H) / 2,
-                               GUI_DOCK_ICON_SIZE, label,
-                               text_color, 0);
+        gui_draw_text_centered_aa(s, ix, iy + (GUI_DOCK_ICON_SIZE - GUI_FONT_H) / 2,
+                                  GUI_DOCK_ICON_SIZE, label, text_color);
 
         /* Active indicator dot below icon (macOS-style) */
         if (visible) {

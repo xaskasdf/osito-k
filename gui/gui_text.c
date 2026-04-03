@@ -171,3 +171,82 @@ void gui_draw_text_centered(gui_surface_t *s, int32_t x, int32_t y,
     int32_t tx = x + (w - tw) / 2;
     gui_draw_text(s, tx, y, str, fg, bg);
 }
+
+/* ── Anti-aliased text rendering ──────────────────────────── */
+
+/* Blend foreground color at given alpha (0-255) over destination pixel */
+static inline uint32_t blend_aa(uint32_t dst, uint32_t fg, uint32_t a)
+{
+    if (a >= 255) return fg;
+    if (a == 0) return dst;
+    uint32_t inv = 255 - a;
+    uint32_t rb_f = fg  & 0x00FF00FF;
+    uint32_t g_f  = fg  & 0x0000FF00;
+    uint32_t rb_d = dst & 0x00FF00FF;
+    uint32_t g_d  = dst & 0x0000FF00;
+    uint32_t rb = ((rb_f * a + rb_d * inv) >> 8) & 0x00FF00FF;
+    uint32_t g  = ((g_f  * a + g_d  * inv) >> 8) & 0x0000FF00;
+    return 0xFF000000 | rb | g;
+}
+
+/* Draw a single character with edge anti-aliasing.
+ * ON pixels render fully opaque. OFF pixels adjacent to ON pixels
+ * get a soft fringe (partial alpha) for smooth edges. */
+void gui_draw_char_aa(gui_surface_t *s, int32_t x, int32_t y,
+                      char c, uint32_t fg)
+{
+    if (c < 32 || c > 126) return;
+    const uint8_t *glyph = gui_font8x16[c - 32];
+
+    for (int32_t row = 0; row < GUI_FONT_H; row++) {
+        int32_t py = y + row;
+        if (py < 0 || py >= (int32_t)s->height) continue;
+
+        uint8_t bits  = glyph[row];
+        uint8_t above = (row > 0)  ? glyph[row - 1] : 0;
+        uint8_t below = (row < 15) ? glyph[row + 1] : 0;
+
+        for (int32_t col = 0; col < GUI_FONT_W; col++) {
+            int32_t px = x + col;
+            if (px < 0 || px >= (int32_t)s->width) continue;
+
+            uint8_t mask = 0x80 >> col;
+            uint32_t *dst = &s->pixels[py * s->pitch + px];
+
+            if (bits & mask) {
+                /* ON pixel: fully opaque */
+                *dst = fg;
+            } else {
+                /* OFF pixel: count adjacent ON pixels for fringe */
+                int on = 0;
+                if (col > 0 && (bits & (mask << 1)))  on++;  /* left */
+                if (col < 7 && (bits & (mask >> 1)))   on++;  /* right */
+                if (above & mask)                      on++;  /* up */
+                if (below & mask)                      on++;  /* down */
+                if (on > 0) {
+                    /* Fringe: blend fg at partial alpha (more neighbors = more opaque) */
+                    uint32_t a = (uint32_t)on * 56;  /* 56-224 range */
+                    *dst = blend_aa(*dst, fg, a);
+                }
+            }
+        }
+    }
+}
+
+void gui_draw_text_aa(gui_surface_t *s, int32_t x, int32_t y,
+                      const char *str, uint32_t fg)
+{
+    while (*str) {
+        gui_draw_char_aa(s, x, y, *str, fg);
+        x += GUI_FONT_W;
+        str++;
+    }
+}
+
+void gui_draw_text_centered_aa(gui_surface_t *s, int32_t x, int32_t y,
+                               int32_t w, const char *str, uint32_t fg)
+{
+    int tw = gui_text_width(str);
+    int32_t tx = x + (w - tw) / 2;
+    gui_draw_text_aa(s, tx, y, str, fg);
+}
