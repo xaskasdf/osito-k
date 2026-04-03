@@ -1042,6 +1042,39 @@ void isr_handler(interrupt_frame_t *frame)
                 uint32_t *sp32 = (uint32_t *)(uintptr_t)(frame->rsp & 0xFFFFFFFF);
                 uint32_t retaddr = sp32[0];
 
+                /* Browse() redirect: Init() at Engine.dll+0x888F5 calls
+                 * Browse via call *0xB0(%edx) but the vtable is corrupt
+                 * (heap ini strings instead of C++ vtable). The REAL
+                 * Browse function is at Engine.dll+0xBC210 (0x1038C210).
+                 * Redirect the NULL-CALL to the real Browse. The args
+                 * are already pushed on the stack, ECX=this from EDI. */
+                if (retaddr >= 0x103888F0 && retaddr <= 0x10388900) {
+                    uint32_t real_browse = 0x1038C210;
+                    static int browse_fix_count = 0;
+                    browse_fix_count++;
+                    if (browse_fix_count <= 3) {
+                        serial_puts("[BROWSE-FIX] redirect to real Browse 0x");
+                        serial_puthex(real_browse, 8);
+                        serial_puts(" this=0x");
+                        serial_puthex((uint32_t)frame->rdi, 8);
+                        serial_puts("\n");
+                    }
+                    /* Also fix the vtable pointer so Browse can use it */
+                    uint32_t this_ptr = (uint32_t)frame->rdi;
+                    if (this_ptr >= 0x1000 && this_ptr < 0x50000000) {
+                        *(uint32_t *)(uintptr_t)this_ptr = 0x10434650; /* real UGameEngine vtable */
+                    }
+                    frame->rip = real_browse;
+                    frame->rcx = frame->rdi; /* this = GameEngine */
+                    if (g_null_page_dirty) {
+                        g_null_page_dirty = 0;
+                        memset((void *)0, 0, 4096);
+                        paging_set_flags(0, PTE_PRESENT | PTE_GLOBAL | PTE_NX);
+                        __asm__ volatile ("invlpg (%0)" :: "r"((uint64_t)0) : "memory");
+                    }
+                    return;
+                }
+
                 /* Stub object NULL-CALL: if retaddr is in Window.dll or
                  * any DLL that calls methods on our stub UObjects, RET 0.
                  * These are calls to unimplemented virtual methods on
