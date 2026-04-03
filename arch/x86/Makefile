@@ -89,7 +89,8 @@ WIN32_SRC = win32/win32_init.c win32/compat32.c win32/pe.c win32/winexec.c \
 WIN32_ASM = win32/int2e_stub.S
 DOS_SRC  = dos/dos_init.c dos/dos_exec.c dos/dos_loader.c \
            dos/dos_mem.c dos/cpu8086.c dos/dos_int.c \
-           dos/dos_api.c dos/dos_bios.c dos/dos_vga.c dos/dos_io.c
+           dos/dos_api.c dos/dos_bios.c dos/dos_vga.c dos/dos_io.c \
+           dos/dos_dpmi.c
 GUI_SRC  = ../../gui/gui_draw.c ../../gui/gui_text.c \
            ../../gui/gui_panel.c ../../gui/gui_dock.c \
            ../../gui/gui_desktop.c ../../gui/gui_window.c \

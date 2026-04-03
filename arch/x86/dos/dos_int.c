@@ -1,0 +1,158 @@
+/*
+ * OsitoK — DOS Interrupt Dispatch
+ *
+ * Routes software INT instructions to the appropriate handler:
+ *   INT 20h → terminate
+ *   INT 21h → DOS API (dos_api.c)
+ *   INT 10h → BIOS video (dos_bios.c)
+ *   INT 16h → BIOS keyboard (dos_bios.c)
+ *   INT 1Ah → BIOS timer (dos_bios.c)
+ *   Others  → fall through to IVT
+ */
+
+#include "cpu8086.h"
+
+extern void serial_puts(const char *s);
+extern void serial_puthex(uint64_t val, int digits);
+
+/* Forward declarations for service handlers */
+void dos_int21_dispatch(dos_vm_t *vm);
+void dos_int10_video(dos_vm_t *vm);
+void dos_int16_keyboard(dos_vm_t *vm);
+void dos_int1a_timer(dos_vm_t *vm);
+void dos_int2f_dispatch(dos_vm_t *vm);
+void dpmi_enter_protected_mode(dos_vm_t *vm);
+
+/* ── INT dispatch ───────────────────────────────────────────────── */
+
+void dos_int_dispatch(dos_vm_t *vm, uint8_t int_num)
+{
+    switch (int_num) {
+    case 0x10:
+        dos_int10_video(vm);
+        break;
+
+    case 0x16:
+        dos_int16_keyboard(vm);
+        break;
+
+    case 0x1A:
+        dos_int1a_timer(vm);
+        break;
+
+    case 0x20:
+        /* Terminate program */
+        vm->cpu->running = false;
+        vm->cpu->exit_code = 0;
+        break;
+
+    case 0x21:
+        dos_int21_dispatch(vm);
+        break;
+
+    case 0x2F:
+        dos_int2f_dispatch(vm);
+        break;
+
+    case 0x33:
+        /* Mouse stub: not installed */
+        vm->cpu->ax = 0x0000;
+        break;
+
+    case 0xFE:
+        /* DPMI entry trigger: switch to protected mode */
+        dpmi_enter_protected_mode(vm);
+        break;
+
+    default: {
+        /* Check IVT for user-installed handlers */
+        uint32_t ivt_addr = (uint32_t)int_num * 4;
+        uint16_t off = dos_mem_read16(vm, ivt_addr);
+        uint16_t seg = dos_mem_read16(vm, ivt_addr + 2);
+
+        if (seg >= (DOS_ROM_BASE >> 4)) {
+            /* Points to our ROM stub (IRET) — just return */
+            break;
+        }
+
+        /* User-installed handler: simulate CALL via stack */
+        cpu_push16(vm->cpu, vm->cpu->flags);
+        cpu_push16(vm->cpu, vm->cpu->cs);
+        cpu_push16(vm->cpu, vm->cpu->ip);
+        vm->cpu->cs = seg;
+        vm->cpu->ip = off;
+        vm->cpu->flags &= ~(FLAG_IF | FLAG_TF);
+        break;
+    }
+    }
+}
+
+/* ── Hardware interrupt delivery (timer, etc.) ──────────────────── */
+
+void cpu_deliver_hw_interrupt(dos_vm_t *vm, uint8_t int_num)
+{
+    cpu8086_state_t *cpu = vm->cpu;
+
+    /* In real mode, respect IF flag. In protected mode, always deliver
+     * (DOS4GW manages its own interrupt state via the PIC/IDT and
+     * may have IF=0 while still expecting timer ticks) */
+    if (!cpu->protected_mode && !(cpu->flags & FLAG_IF)) return;
+
+    if (cpu->protected_mode) {
+        /* Check DPMI pm_vectors first (DOS4GW hooks INT 8 via INT 31h/0205h) */
+        if (vm->dpmi.pm_vectors[int_num].sel != 0) {
+            cpu_push32(cpu, cpu->eflags);
+            cpu_push32(cpu, (uint32_t)cpu->cs);
+            cpu_push32(cpu, cpu->eip);
+            cpu->cs  = vm->dpmi.pm_vectors[int_num].sel;
+            cpu->eip = vm->dpmi.pm_vectors[int_num].off;
+            cpu->flags &= ~(FLAG_IF | FLAG_TF);
+            return;
+        }
+        /* Fallback: read guest IDT if base is within our memory */
+        if (cpu->idtr.base && cpu->idtr.base < vm->total_mem_size) {
+            uint32_t entry = cpu->idtr.base + (uint32_t)int_num * 8;
+            if (entry + 7 < vm->total_mem_size) {
+                uint16_t off_lo = dos_mem_read16(vm, entry);
+                uint16_t sel    = dos_mem_read16(vm, entry + 2);
+                uint16_t off_hi = dos_mem_read16(vm, entry + 6);
+                uint32_t handler = ((uint32_t)off_hi << 16) | off_lo;
+                if (sel != 0) {
+                    cpu_push32(cpu, cpu->eflags);
+                    cpu_push32(cpu, (uint32_t)cpu->cs);
+                    cpu_push32(cpu, cpu->eip);
+                    cpu->cs  = sel;
+                    cpu->eip = handler;
+                    cpu->flags &= ~(FLAG_IF | FLAG_TF);
+                    return;
+                }
+            }
+        }
+        /* Try IDT via paging (DOS4GW maps IDT at high virtual address) */
+        if (cpu->idtr.base) {
+            /* dpmi_translate will walk page tables if CR0.PG is set */
+            uint32_t entry = dpmi_translate(vm, 0, cpu->idtr.base + (uint32_t)int_num * 8);
+            if (entry + 7 < vm->total_mem_size) {
+                uint16_t off_lo = dos_mem_read16(vm, entry);
+                uint16_t sel    = dos_mem_read16(vm, entry + 2);
+                uint16_t off_hi = dos_mem_read16(vm, entry + 6);
+                uint32_t handler = ((uint32_t)off_hi << 16) | off_lo;
+                if (sel != 0 && handler != 0) {
+                    cpu_push32(cpu, cpu->eflags);
+                    cpu_push32(cpu, (uint32_t)cpu->cs);
+                    cpu_push32(cpu, cpu->eip);
+                    cpu->cs  = sel;
+                    cpu->eip = handler;
+                    cpu->flags &= ~(FLAG_IF | FLAG_TF);
+                }
+            }
+        }
+    } else {
+        /* Real mode: push flags/CS/IP and dispatch via IVT */
+        cpu_push16(cpu, cpu->flags | FLAGS_FIXED);
+        cpu_push16(cpu, cpu->cs);
+        cpu_push16(cpu, cpu->ip);
+        cpu->flags &= ~(FLAG_IF | FLAG_TF);
+        dos_int_dispatch(vm, int_num);
+    }
+}
