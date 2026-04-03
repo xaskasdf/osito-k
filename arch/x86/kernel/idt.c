@@ -848,57 +848,13 @@ void isr_handler(interrupt_frame_t *frame)
                     serial_puts(is_heap ? " (heap→SEH)\n" : " (DLL→wt)\n");
                 }
                 if (is_heap) {
-                    /* Dispatch directly to base SEH handler — skip the
-                     * corrupt chain. The base handler is a catch-all. */
-                    extern uint32_t g_base_seh_frame_addr;
-                    extern int compat32_seh_dispatch(void *);
-                    if (g_base_seh_frame_addr) {
-                        /* Repair ExceptionList to base frame */
-                        extern uint32_t g_teb32;
-                        g_teb32 = g_base_seh_frame_addr;
-
-                        /* Build ACCESS_VIOLATION exception record */
-                        struct {
-                            uint32_t ExceptionCode;
-                            uint32_t ExceptionFlags;
-                            uint64_t ExceptionRecord;
-                            uint64_t ExceptionAddress;
-                            uint32_t NumberParameters;
-                            uint32_t _pad;
-                            uint64_t ExceptionInformation[15];
-                        } er;
-                        uint8_t *ep = (uint8_t *)&er;
-                        for (int ei = 0; ei < (int)sizeof(er); ei++) ep[ei] = 0;
-                        er.ExceptionCode = 0xC0000005;
-                        er.ExceptionAddress = (uint64_t)(uint32_t)frame->rip;
-                        er.NumberParameters = 2;
-                        er.ExceptionInformation[0] = 1; /* write */
-                        er.ExceptionInformation[1] = (uint64_t)cr2;
-
-                        int handled = compat32_seh_dispatch(&er);
-                        if (handled) {
-                            extern uint32_t g_compat32_unwind_eip;
-                            extern uint32_t g_compat32_unwind_ebp;
-                            if (g_compat32_unwind_eip) {
-                                frame->rip = g_compat32_unwind_eip;
-                                frame->rbp = g_compat32_unwind_ebp;
-                                g_compat32_unwind_eip = 0;
-                                g_compat32_unwind_ebp = 0;
-                            }
-                            /* Make page 0 writable for ContinueExecution */
-                            paging_set_flags(0, PTE_PRESENT | PTE_WRITABLE | PTE_GLOBAL | PTE_NX);
-                            __asm__ volatile ("invlpg (%0)" :: "r"((uint64_t)0) : "memory");
-                            g_null_page_dirty = 1;
-                            return;
-                        }
-                        /* SEH unhandled for heap null-write: force crash recovery.
-                         * Write-through is dangerous for heap code — the engine
-                         * expects SEH to catch it and take the error path. Without
-                         * proper unwinding, execution falls through to CC padding. */
-                        serial_puts("[NULL-WRITE] heap SEH unhandled → crash recovery\n");
-                        goto compat32_null_recovery;
-                    }
-                    /* Non-heap: fallback to write-through */
+                    /* Heap code null-write → crash recovery. The engine
+                     * expects SEH to catch this and unwind to __except.
+                     * Our SEH chain is unreliable (corrupt frames), and
+                     * write-through causes the engine to fall through
+                     * into CC padding. Clean crash recovery is safest. */
+                    serial_puts("[NULL-WRITE] heap → crash recovery\n");
+                    goto compat32_null_recovery;
                 }
             }
 

@@ -3744,9 +3744,10 @@ static uint64_t WINAPI crt_base_seh_handler(
     serial_puts("[SEH-BASE] handler called, code=0x");
     serial_puthex(code, 8);
     serial_puts("\n");
-    /* Return ContinueSearch (1) so the SEH dispatcher continues to the
-     * next handler (or UNHANDLED). The base frame anchors the chain. */
-    return 1; /* ExceptionContinueSearch */
+    /* Return ContinueExecution (0) — the base handler absorbs all
+     * exceptions. The page fault handler makes page 0 writable before
+     * resuming so the retried instruction succeeds. */
+    return 0; /* ExceptionContinueExecution */
 }
 
 static uint32_t g_base_seh_thunk = 0;
