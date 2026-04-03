@@ -126,6 +126,19 @@ static int32_t  drag_off_x, drag_off_y;
 static uint8_t  prev_buttons;
 static int      focused_demo_idx = 0;   /* 0=Terminal (focused by default) */
 
+/* Window resize state */
+static bool     resizing;
+static int32_t  resize_win_idx;
+#define RESIZE_EDGE  6          /* px from border to trigger resize */
+#define RESIZE_MIN_W 100
+#define RESIZE_MIN_H 60
+/* Bitmask: which edges are being resized */
+#define EDGE_LEFT   1
+#define EDGE_RIGHT  2
+#define EDGE_TOP    4
+#define EDGE_BOTTOM 8
+static uint8_t  resize_edges;    /* combination of EDGE_* */
+
 /* Maximize / restore state (per demo window) */
 static bool    is_maximized[2];
 static int32_t saved_geom[2][4];    /* x, y, w, h before maximize */
@@ -655,6 +668,23 @@ static void process_mouse_input(void)
                 drag_win_idx = hit;
                 drag_off_x = cx - dw[hit].x;
                 drag_off_y = cy - dw[hit].y;
+            } else {
+                /* Check if click is near a window edge → start resize */
+                int32_t wx = dw[hit].x;
+                int32_t wy = dw[hit].y + GUI_TITLEBAR_H;
+                int32_t ww = dw[hit].w;
+                int32_t wh = dw[hit].h;
+                uint8_t edges = 0;
+                if (cx - wx < RESIZE_EDGE)          edges |= EDGE_LEFT;
+                if (wx + ww - cx < RESIZE_EDGE)     edges |= EDGE_RIGHT;
+                if (cy - wy < RESIZE_EDGE)          edges |= EDGE_TOP;
+                if (wy + wh - cy < RESIZE_EDGE)     edges |= EDGE_BOTTOM;
+                if (edges) {
+                    resizing = true;
+                    resize_win_idx = hit;
+                    resize_edges = edges;
+                    is_maximized[hit] = false;
+                }
             }
 
             /* Raise clicked window to front (changes render order, not struct data) */
@@ -685,10 +715,42 @@ static void process_mouse_input(void)
         }
     }
 
+    /* Continue resize while button held */
+    if (resizing && (comp_button_state & 1)) {
+        int32_t cx, cy;
+        input_get_cursor(&cx, &cy);
+        int count;
+        gui_win_desc_t *dw = gui_desktop_get_windows(&count);
+        if (resize_win_idx >= 0 && resize_win_idx < count &&
+            !dw[resize_win_idx].hidden) {
+            gui_win_desc_t *rw = &dw[resize_win_idx];
+            if (resize_edges & EDGE_RIGHT) {
+                int32_t nw = cx - rw->x;
+                if (nw >= RESIZE_MIN_W) rw->w = nw;
+            }
+            if (resize_edges & EDGE_BOTTOM) {
+                int32_t nh = cy - rw->y - GUI_TITLEBAR_H;
+                if (nh >= RESIZE_MIN_H) rw->h = nh;
+            }
+            if (resize_edges & EDGE_LEFT) {
+                int32_t right = rw->x + rw->w;
+                int32_t nw = right - cx;
+                if (nw >= RESIZE_MIN_W) { rw->x = cx; rw->w = nw; }
+            }
+            if (resize_edges & EDGE_TOP) {
+                int32_t bottom = rw->y + GUI_TITLEBAR_H + rw->h;
+                int32_t nh = bottom - cy - GUI_TITLEBAR_H;
+                if (nh >= RESIZE_MIN_H) { rw->y = cy; rw->h = nh; }
+            }
+        }
+    }
+
     /* Release */
     if (released & 1) {
         dragging = false;
         drag_win_idx = -1;
+        resizing = false;
+        resize_win_idx = -1;
     }
 
     prev_buttons = comp_button_state;
