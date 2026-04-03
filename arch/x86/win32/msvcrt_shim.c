@@ -3744,10 +3744,9 @@ static uint64_t WINAPI crt_base_seh_handler(
     serial_puts("[SEH-BASE] handler called, code=0x");
     serial_puthex(code, 8);
     serial_puts("\n");
-    /* Always continue search — we exist to anchor the chain, not to handle.
-     * The real handlers above us (if any) should handle. If none do,
-     * RtlRaiseException returns and _CxxThrowException suppresses. */
-    return 0; /* EXCEPTION_CONTINUE_SEARCH */
+    /* Return ContinueSearch (1) so the SEH dispatcher continues to the
+     * next handler (or UNHANDLED). The base frame anchors the chain. */
+    return 1; /* ExceptionContinueSearch */
 }
 
 static uint32_t g_base_seh_thunk = 0;

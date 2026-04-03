@@ -828,106 +828,79 @@ void isr_handler(interrupt_frame_t *frame)
          * causes #GP(0x0A) because the 64-bit exception frame can't be
          * pushed on the 32-bit stack without IST. Just leave page writable. */
         if (cr2 < 0x1000 && (frame->error_code & 2) && !(frame->error_code & 16)) {
-            /* PE code null-object write (CR2 < page size): dispatch to SEH.
-             * On Windows, mov [esi+4],ebx with esi=0 causes ACCESS_VIOLATION
-             * caught by __try/__except. This applies to ALL compat32 code —
-             * both DLL range (0x10000000+) and heap range (0x40000000+). */
+            /* Null-pointer writes from PE32 code.
+             * For code in DLL range (0x10-0x12M): write-through (safe,
+             * these are benign init-time writes the engine expects).
+             * For code in heap range (0x40-0x80M): dispatch to base SEH
+             * handler to trigger the engine's __except error path.
+             * Without SEH, heap code falls through to garbage after the
+             * write and hits CC padding → #BP crash. */
             {
-                extern uint32_t g_teb32;
-                uint32_t seh_val = g_teb32;
-                int is_pe_code = (frame->cs & 0xFFFF) == 0x40;
-                /* SEH chain valid if it points to stack (0x1C-0x50M range) */
-                int seh_valid = (seh_val >= 0x1C000000 && seh_val < 0x50000000);
-
-                /* If ExceptionList is corrupt (DLL range), try the base SEH
-                 * frame installed by winexec. The base frame is always at a
-                 * known stack location. */
-                if (is_pe_code && !seh_valid) {
-                    extern uint32_t g_base_seh_frame_addr;
-                    if (g_base_seh_frame_addr >= 0x1C000000 &&
-                        g_base_seh_frame_addr < 0x50000000) {
-                        /* Restore ExceptionList to the base frame */
-                        seh_val = g_base_seh_frame_addr;
-                        g_teb32 = seh_val;
-                        seh_valid = 1;
-                        static int seh_repair_count = 0;
-                        if (++seh_repair_count <= 5) {
-                            serial_puts("[SEH-REPAIR] ExceptionList -> 0x");
-                            serial_puthex(seh_val, 8);
-                            serial_puts("\n");
-                        }
-                    }
-                }
-
-                if (is_pe_code && seh_valid && cr2 < 0x10) {
-                static int nw_seh_count = 0;
-                nw_seh_count++;
-                if (nw_seh_count <= 20) {
-                    serial_puts("[NULL-WRITE-SEH] RIP=0x");
+                static int nw_count = 0;
+                nw_count++;
+                int is_heap = (frame->cs & 0xFFFF) == 0x40 &&
+                    frame->rip >= 0x40000000 && frame->rip < 0x80000000;
+                if (nw_count <= 5 && (frame->cs & 0xFFFF) == 0x40) {
+                    serial_puts("[NULL-WRITE] RIP=0x");
                     serial_puthex((uint32_t)frame->rip, 8);
                     serial_puts(" CR2=0x");
-                    serial_puthex((uint32_t)cr2, 2);
-                    serial_puts(" #");
-                    serial_putdec(nw_seh_count);
-                    serial_puts("\n");
+                    serial_puthex((uint32_t)cr2, 4);
+                    serial_puts(is_heap ? " (heap→SEH)\n" : " (DLL→wt)\n");
                 }
-                /* Re-zero page 0 before dispatch */
-                if (g_null_page_dirty) {
-                    g_null_page_dirty = 0;
-                    memset((void *)0, 0, 4096);
-                    paging_set_flags(0, PTE_PRESENT | PTE_GLOBAL | PTE_NX);
-                    __asm__ volatile ("invlpg (%0)" :: "r"((uint64_t)0) : "memory");
-                }
-                /* Build EXCEPTION_RECORD for ACCESS_VIOLATION.
-                 * Use raw struct — idt.c doesn't include Win32 headers. */
-                struct {
-                    uint32_t ExceptionCode;
-                    uint32_t ExceptionFlags;
-                    uint64_t ExceptionRecord;
-                    uint64_t ExceptionAddress;
-                    uint32_t NumberParameters;
-                    uint32_t _pad;
-                    uint64_t ExceptionInformation[15];
-                } er;
-                uint8_t *ep = (uint8_t *)&er;
-                for (int ei = 0; ei < (int)sizeof(er); ei++) ep[ei] = 0;
-                er.ExceptionCode = 0xC0000005; /* STATUS_ACCESS_VIOLATION */
-                er.ExceptionFlags = 0;         /* continuable */
-                er.ExceptionAddress = (uint64_t)(uint32_t)frame->rip;
-                er.NumberParameters = 2;
-                er.ExceptionInformation[0] = 1; /* write */
-                er.ExceptionInformation[1] = (uint64_t)cr2;
+                if (is_heap) {
+                    /* Dispatch directly to base SEH handler — skip the
+                     * corrupt chain. The base handler is a catch-all. */
+                    extern uint32_t g_base_seh_frame_addr;
+                    extern int compat32_seh_dispatch(void *);
+                    if (g_base_seh_frame_addr) {
+                        /* Repair ExceptionList to base frame */
+                        extern uint32_t g_teb32;
+                        g_teb32 = g_base_seh_frame_addr;
 
-                extern int compat32_seh_dispatch(void *);
-                int handled = compat32_seh_dispatch(&er);
-                if (handled) {
-                    extern uint32_t g_compat32_unwind_eip;
-                    extern uint32_t g_compat32_unwind_ebp;
-                    if (g_compat32_unwind_eip) {
-                        frame->rip = g_compat32_unwind_eip;
-                        frame->rbp = g_compat32_unwind_ebp;
-                        g_compat32_unwind_eip = 0;
-                        g_compat32_unwind_ebp = 0;
+                        /* Build ACCESS_VIOLATION exception record */
+                        struct {
+                            uint32_t ExceptionCode;
+                            uint32_t ExceptionFlags;
+                            uint64_t ExceptionRecord;
+                            uint64_t ExceptionAddress;
+                            uint32_t NumberParameters;
+                            uint32_t _pad;
+                            uint64_t ExceptionInformation[15];
+                        } er;
+                        uint8_t *ep = (uint8_t *)&er;
+                        for (int ei = 0; ei < (int)sizeof(er); ei++) ep[ei] = 0;
+                        er.ExceptionCode = 0xC0000005;
+                        er.ExceptionAddress = (uint64_t)(uint32_t)frame->rip;
+                        er.NumberParameters = 2;
+                        er.ExceptionInformation[0] = 1; /* write */
+                        er.ExceptionInformation[1] = (uint64_t)cr2;
+
+                        int handled = compat32_seh_dispatch(&er);
+                        if (handled) {
+                            extern uint32_t g_compat32_unwind_eip;
+                            extern uint32_t g_compat32_unwind_ebp;
+                            if (g_compat32_unwind_eip) {
+                                frame->rip = g_compat32_unwind_eip;
+                                frame->rbp = g_compat32_unwind_ebp;
+                                g_compat32_unwind_eip = 0;
+                                g_compat32_unwind_ebp = 0;
+                            }
+                            /* Make page 0 writable for ContinueExecution */
+                            paging_set_flags(0, PTE_PRESENT | PTE_WRITABLE | PTE_GLOBAL | PTE_NX);
+                            __asm__ volatile ("invlpg (%0)" :: "r"((uint64_t)0) : "memory");
+                            g_null_page_dirty = 1;
+                            return;
+                        }
+                        /* SEH unhandled for heap null-write: force crash recovery.
+                         * Write-through is dangerous for heap code — the engine
+                         * expects SEH to catch it and take the error path. Without
+                         * proper unwinding, execution falls through to CC padding. */
+                        serial_puts("[NULL-WRITE] heap SEH unhandled → crash recovery\n");
+                        goto compat32_null_recovery;
                     }
-                    /* Clear GErrorHist + GIsCriticalError after SEH dispatch.
-                     * The engine's SEH handler sets these during exception
-                     * processing, but null-object writes during init are
-                     * expected (Windows lets them through). If we leave
-                     * GIsCriticalError set, Browse() bails before loading
-                     * any map file. */
-                    volatile uint16_t *gerr = (volatile uint16_t *)(uintptr_t)0x101E3474;
-                    volatile uint32_t *gcrit = (volatile uint32_t *)(uintptr_t)0x101E568C;
-                    if (*gerr != 0 || *gcrit != 0) {
-                        *gerr = 0;
-                        *gcrit = 0;
-                        if (nw_seh_count <= 5)
-                            serial_puts("[NULL-WRITE-SEH] cleared GErrorHist\n");
-                    }
-                    return;
+                    /* Non-heap: fallback to write-through */
                 }
-                /* Unhandled: fall through to write-through */
             }
-            } /* end SEH dispatch block */
 
             /* Normal null-page write-through */
             paging_set_flags(0, PTE_PRESENT | PTE_WRITABLE | PTE_GLOBAL | PTE_NX);

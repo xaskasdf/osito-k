@@ -1857,10 +1857,23 @@ int compat32_seh_dispatch(PEXCEPTION_RECORD ExceptionRecord)
                 serial_putdec(disp);
                 serial_puts("\n");
 
-                if (disp == 0) {
-                    serial_puts("[SEH32] PE32 handler: ContinueExecution\n");
+                /* Win32 EXCEPTION_DISPOSITION:
+                 *  -1 (0xFFFFFFFF) = ExceptionContinueExecution
+                 *   0              = ExceptionContinueSearch
+                 *   1              = ExceptionExecuteHandler
+                 * Previously we treated 0 as ContinueExecution (bug). */
+                if (disp == 0xFFFFFFFF) {
+                    serial_puts("[SEH32] handler: ContinueExecution\n");
                     return 1;
                 }
+                if (disp == 1) {
+                    serial_puts("[SEH32] handler: ExecuteHandler\n");
+                    /* The handler wants its __except block to run.
+                     * For now, treat as handled — the handler frame's
+                     * filter/cleanup has already run. */
+                    return 1;
+                }
+                /* disp == 0 (ContinueSearch): try next frame */
             }
         }
 
@@ -1903,10 +1916,15 @@ next_frame:
                 args[2] = 0;
                 args[3] = 0;
                 uint32_t disp = compat32_callback_args(base_handler, 4, args);
-                if (disp == 0) { /* ContinueExecution */
-                    serial_puts("[SEH32] base handler: continue\n");
+                if (disp == 0xFFFFFFFF) { /* ContinueExecution */
+                    serial_puts("[SEH32] base handler: ContinueExecution\n");
                     return 1;
                 }
+                if (disp == 1) { /* ExecuteHandler */
+                    serial_puts("[SEH32] base handler: ExecuteHandler\n");
+                    return 1;
+                }
+                /* 0 = ContinueSearch — fall through to UNHANDLED */
             }
         }
     }
