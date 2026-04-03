@@ -108,32 +108,198 @@ const uint8_t gui_font8x16[95][16] = {
     /*126 '~' */ {0,0x76,0xDC,0,0,0,0,0,0,0,0,0,0,0,0,0},
 };
 
-/* ── Inline strlen for freestanding ────────────────────────── */
+/* ── UTF-8 decoder ────────────────────────────────────────── */
 
-static inline int gui_strlen(const char *s)
+/* Decode one UTF-8 codepoint from *p, advance *p past it.
+ * Returns codepoint (0-0x10FFFF) or 0xFFFD on invalid sequence. */
+static uint32_t utf8_decode(const char **p)
 {
-    int n = 0;
-    while (s[n]) n++;
-    return n;
+    const uint8_t *s = (const uint8_t *)*p;
+    uint32_t cp;
+    int len;
+
+    if (s[0] < 0x80)      { cp = s[0]; len = 1; }
+    else if (s[0] < 0xC0) { cp = 0xFFFD; len = 1; }  /* continuation byte */
+    else if (s[0] < 0xE0) { cp = s[0] & 0x1F; len = 2; }
+    else if (s[0] < 0xF0) { cp = s[0] & 0x0F; len = 3; }
+    else if (s[0] < 0xF8) { cp = s[0] & 0x07; len = 4; }
+    else                   { cp = 0xFFFD; len = 1; }
+
+    for (int i = 1; i < len; i++) {
+        if ((s[i] & 0xC0) != 0x80) { *p = (const char *)(s + 1); return 0xFFFD; }
+        cp = (cp << 6) | (s[i] & 0x3F);
+    }
+    *p = (const char *)(s + len);
+    return cp;
 }
 
-/* ── Draw single character ─────────────────────────────────── */
+/* ── Variable-width advance table (ASCII 32-126) ─────────── */
 
-void gui_draw_char(gui_surface_t *s, int32_t x, int32_t y,
-                   char c, uint32_t fg, uint32_t bg)
+/* Per-glyph horizontal advance in pixels. Computed from actual
+ * glyph density: narrow glyphs (i, l, !, |) get less space,
+ * wide glyphs (M, W, m, w) get full 8px. 1px inter-char gap included. */
+static const uint8_t ascii_advance[95] = {
+ /* sp ! " # $ % & ' ( ) * + , - . / */
+    4, 4, 6, 8, 7, 8, 8, 4, 5, 5, 7, 7, 4, 6, 4, 7,
+ /* 0  1  2  3  4  5  6  7  8  9  :  ;  <  =  >  ? */
+    7, 6, 7, 7, 7, 7, 7, 7, 7, 7, 4, 4, 7, 7, 7, 7,
+ /* @  A  B  C  D  E  F  G  H  I  J  K  L  M  N  O */
+    8, 8, 7, 7, 7, 7, 7, 7, 8, 5, 7, 8, 7, 8, 8, 8,
+ /* P  Q  R  S  T  U  V  W  X  Y  Z  [  \  ]  ^  _ */
+    7, 8, 8, 7, 7, 8, 8, 8, 8, 7, 7, 5, 7, 5, 7, 8,
+ /* `  a  b  c  d  e  f  g  h  i  j  k  l  m  n  o */
+    5, 7, 7, 7, 7, 7, 6, 7, 7, 4, 5, 7, 4, 8, 7, 7,
+ /* p  q  r  s  t  u  v  w  x  y  z  {  |  }  ~ */
+    7, 7, 7, 7, 6, 7, 7, 8, 7, 7, 7, 6, 4, 6, 8,
+};
+
+/* ── Latin-1 Supplement glyphs (codepoints 160-255) ──────── */
+
+/* 96 glyphs covering accented Latin characters, Spanish punctuation,
+ * common symbols. Same 8x16 bitmap format as ASCII glyphs. */
+static const uint8_t latin1_glyphs[96][16] = {
+    /* 160 NBSP */ {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0},
+    /* 161 ¡   */ {0,0,0x18,0,0x18,0x18,0x18,0x18,0x18,0x18,0,0,0,0,0,0},
+    /* 162 ¢   */ {0,0,0x18,0x7E,0xC0,0xC0,0x7E,0x18,0,0,0,0,0,0,0,0},
+    /* 163 £   */ {0,0,0x38,0x6C,0x60,0xF0,0x60,0x60,0xFE,0,0,0,0,0,0,0},
+    /* 164 ¤   */ {0,0,0,0x42,0x3C,0x24,0x3C,0x42,0,0,0,0,0,0,0,0},
+    /* 165 ¥   */ {0,0,0x66,0x66,0x3C,0x18,0x7E,0x18,0x18,0,0,0,0,0,0,0},
+    /* 166 ¦   */ {0,0,0x18,0x18,0x18,0,0x18,0x18,0x18,0,0,0,0,0,0,0},
+    /* 167 §   */ {0,0x7C,0xC0,0x7C,0xC6,0x7C,0x06,0x7C,0,0,0,0,0,0,0,0},
+    /* 168 ¨   */ {0x66,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0},
+    /* 169 ©   */ {0,0x3C,0x42,0x99,0xA1,0xA1,0x99,0x42,0x3C,0,0,0,0,0,0,0},
+    /* 170 ª   */ {0,0x3C,0x06,0x3E,0x66,0x3E,0,0x7E,0,0,0,0,0,0,0,0},
+    /* 171 «   */ {0,0,0,0x36,0x6C,0xD8,0x6C,0x36,0,0,0,0,0,0,0,0},
+    /* 172 ¬   */ {0,0,0,0,0x7E,0x06,0x06,0,0,0,0,0,0,0,0,0},
+    /* 173 SHY */ {0,0,0,0,0,0x7E,0,0,0,0,0,0,0,0,0,0},
+    /* 174 ®   */ {0,0x3C,0x42,0xB9,0xA5,0xB9,0xA5,0x42,0x3C,0,0,0,0,0,0,0},
+    /* 175 ¯   */ {0x7E,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0},
+    /* 176 °   */ {0,0x38,0x44,0x44,0x38,0,0,0,0,0,0,0,0,0,0,0},
+    /* 177 ±   */ {0,0,0x18,0x18,0x7E,0x18,0x18,0,0x7E,0,0,0,0,0,0,0},
+    /* 178 ²   */ {0x38,0x04,0x18,0x20,0x3C,0,0,0,0,0,0,0,0,0,0,0},
+    /* 179 ³   */ {0x38,0x04,0x18,0x04,0x38,0,0,0,0,0,0,0,0,0,0,0},
+    /* 180 ´   */ {0x0C,0x18,0,0,0,0,0,0,0,0,0,0,0,0,0,0},
+    /* 181 µ   */ {0,0,0,0,0xCC,0xCC,0xCC,0xCC,0xFE,0xC0,0xC0,0,0,0,0,0},
+    /* 182 ¶   */ {0,0x7F,0xDB,0xDB,0x7B,0x1B,0x1B,0x1B,0x1B,0,0,0,0,0,0,0},
+    /* 183 ·   */ {0,0,0,0,0x18,0x18,0,0,0,0,0,0,0,0,0,0},
+    /* 184 ¸   */ {0,0,0,0,0,0,0,0,0,0,0x18,0x0C,0,0,0,0},
+    /* 185 ¹   */ {0x10,0x30,0x10,0x10,0x38,0,0,0,0,0,0,0,0,0,0,0},
+    /* 186 º   */ {0,0x3C,0x66,0x66,0x3C,0,0x7E,0,0,0,0,0,0,0,0,0},
+    /* 187 »   */ {0,0,0,0xD8,0x6C,0x36,0x6C,0xD8,0,0,0,0,0,0,0,0},
+    /* 188 ¼   */ {0x40,0xC0,0x40,0x48,0x18,0x38,0x68,0xFC,0x08,0,0,0,0,0,0,0},
+    /* 189 ½   */ {0x40,0xC0,0x40,0x48,0x18,0x28,0x48,0x88,0x38,0,0,0,0,0,0,0},
+    /* 190 ¾   */ {0xC0,0x20,0x40,0x28,0xD8,0x38,0x68,0xFC,0x08,0,0,0,0,0,0,0},
+    /* 191 ¿   */ {0,0,0x18,0,0x18,0x30,0x60,0xC6,0x7C,0,0,0,0,0,0,0},
+    /* 192 À   */ {0x30,0x18,0x10,0x38,0x6C,0xC6,0xFE,0xC6,0xC6,0,0,0,0,0,0,0},
+    /* 193 Á   */ {0x0C,0x18,0x10,0x38,0x6C,0xC6,0xFE,0xC6,0xC6,0,0,0,0,0,0,0},
+    /* 194 Â   */ {0x38,0x6C,0x10,0x38,0x6C,0xC6,0xFE,0xC6,0xC6,0,0,0,0,0,0,0},
+    /* 195 Ã   */ {0x76,0xDC,0x10,0x38,0x6C,0xC6,0xFE,0xC6,0xC6,0,0,0,0,0,0,0},
+    /* 196 Ä   */ {0x66,0,0x10,0x38,0x6C,0xC6,0xFE,0xC6,0xC6,0,0,0,0,0,0,0},
+    /* 197 Å   */ {0x38,0x44,0x38,0x38,0x6C,0xC6,0xFE,0xC6,0xC6,0,0,0,0,0,0,0},
+    /* 198 Æ   */ {0,0,0x3E,0x6C,0xCC,0xFE,0xCC,0xCC,0xCE,0,0,0,0,0,0,0},
+    /* 199 Ç   */ {0,0,0x3C,0x66,0xC0,0xC0,0xC0,0x66,0x3C,0x18,0x0C,0,0,0,0,0},
+    /* 200 È   */ {0x30,0x18,0xFE,0x62,0x68,0x78,0x68,0x62,0xFE,0,0,0,0,0,0,0},
+    /* 201 É   */ {0x0C,0x18,0xFE,0x62,0x68,0x78,0x68,0x62,0xFE,0,0,0,0,0,0,0},
+    /* 202 Ê   */ {0x38,0x6C,0xFE,0x62,0x68,0x78,0x68,0x62,0xFE,0,0,0,0,0,0,0},
+    /* 203 Ë   */ {0x66,0,0xFE,0x62,0x68,0x78,0x68,0x62,0xFE,0,0,0,0,0,0,0},
+    /* 204 Ì   */ {0x30,0x18,0x3C,0x18,0x18,0x18,0x18,0x18,0x3C,0,0,0,0,0,0,0},
+    /* 205 Í   */ {0x0C,0x18,0x3C,0x18,0x18,0x18,0x18,0x18,0x3C,0,0,0,0,0,0,0},
+    /* 206 Î   */ {0x18,0x24,0x3C,0x18,0x18,0x18,0x18,0x18,0x3C,0,0,0,0,0,0,0},
+    /* 207 Ï   */ {0x66,0,0x3C,0x18,0x18,0x18,0x18,0x18,0x3C,0,0,0,0,0,0,0},
+    /* 208 Ð   */ {0,0,0xF8,0x6C,0x66,0xF6,0x66,0x6C,0xF8,0,0,0,0,0,0,0},
+    /* 209 Ñ   */ {0x76,0xDC,0xC6,0xE6,0xF6,0xDE,0xCE,0xC6,0xC6,0,0,0,0,0,0,0},
+    /* 210 Ò   */ {0x30,0x18,0x7C,0xC6,0xC6,0xC6,0xC6,0xC6,0x7C,0,0,0,0,0,0,0},
+    /* 211 Ó   */ {0x0C,0x18,0x7C,0xC6,0xC6,0xC6,0xC6,0xC6,0x7C,0,0,0,0,0,0,0},
+    /* 212 Ô   */ {0x38,0x6C,0x7C,0xC6,0xC6,0xC6,0xC6,0xC6,0x7C,0,0,0,0,0,0,0},
+    /* 213 Õ   */ {0x76,0xDC,0x7C,0xC6,0xC6,0xC6,0xC6,0xC6,0x7C,0,0,0,0,0,0,0},
+    /* 214 Ö   */ {0x66,0,0x7C,0xC6,0xC6,0xC6,0xC6,0xC6,0x7C,0,0,0,0,0,0,0},
+    /* 215 ×   */ {0,0,0,0x66,0x3C,0x18,0x3C,0x66,0,0,0,0,0,0,0,0},
+    /* 216 Ø   */ {0,0x02,0x7C,0xCE,0xDE,0xF6,0xE6,0xC6,0x7C,0x80,0,0,0,0,0,0},
+    /* 217 Ù   */ {0x30,0x18,0xC6,0xC6,0xC6,0xC6,0xC6,0xC6,0x7C,0,0,0,0,0,0,0},
+    /* 218 Ú   */ {0x0C,0x18,0xC6,0xC6,0xC6,0xC6,0xC6,0xC6,0x7C,0,0,0,0,0,0,0},
+    /* 219 Û   */ {0x38,0x6C,0xC6,0xC6,0xC6,0xC6,0xC6,0xC6,0x7C,0,0,0,0,0,0,0},
+    /* 220 Ü   */ {0x66,0,0xC6,0xC6,0xC6,0xC6,0xC6,0xC6,0x7C,0,0,0,0,0,0,0},
+    /* 221 Ý   */ {0x0C,0x18,0x66,0x66,0x3C,0x18,0x18,0x18,0x3C,0,0,0,0,0,0,0},
+    /* 222 Þ   */ {0,0xF0,0x60,0x7C,0x66,0x66,0x7C,0x60,0xF0,0,0,0,0,0,0,0},
+    /* 223 ß   */ {0,0,0x7C,0xC6,0xC6,0xFC,0xC6,0xC6,0xDC,0,0,0,0,0,0,0},
+    /* 224 à   */ {0x30,0x18,0,0x78,0x0C,0x7C,0xCC,0xCC,0x76,0,0,0,0,0,0,0},
+    /* 225 á   */ {0x0C,0x18,0,0x78,0x0C,0x7C,0xCC,0xCC,0x76,0,0,0,0,0,0,0},
+    /* 226 â   */ {0x38,0x6C,0,0x78,0x0C,0x7C,0xCC,0xCC,0x76,0,0,0,0,0,0,0},
+    /* 227 ã   */ {0x76,0xDC,0,0x78,0x0C,0x7C,0xCC,0xCC,0x76,0,0,0,0,0,0,0},
+    /* 228 ä   */ {0x66,0,0,0x78,0x0C,0x7C,0xCC,0xCC,0x76,0,0,0,0,0,0,0},
+    /* 229 å   */ {0x38,0x44,0x38,0x78,0x0C,0x7C,0xCC,0xCC,0x76,0,0,0,0,0,0,0},
+    /* 230 æ   */ {0,0,0,0x6C,0x92,0x7E,0x90,0x92,0x6C,0,0,0,0,0,0,0},
+    /* 231 ç   */ {0,0,0,0x7C,0xC6,0xC0,0xC0,0xC6,0x7C,0x18,0x0C,0,0,0,0,0},
+    /* 232 è   */ {0x30,0x18,0,0x7C,0xC6,0xFE,0xC0,0xC6,0x7C,0,0,0,0,0,0,0},
+    /* 233 é   */ {0x0C,0x18,0,0x7C,0xC6,0xFE,0xC0,0xC6,0x7C,0,0,0,0,0,0,0},
+    /* 234 ê   */ {0x38,0x6C,0,0x7C,0xC6,0xFE,0xC0,0xC6,0x7C,0,0,0,0,0,0,0},
+    /* 235 ë   */ {0x66,0,0,0x7C,0xC6,0xFE,0xC0,0xC6,0x7C,0,0,0,0,0,0,0},
+    /* 236 ì   */ {0x30,0x18,0,0x38,0x18,0x18,0x18,0x18,0x3C,0,0,0,0,0,0,0},
+    /* 237 í   */ {0x0C,0x18,0,0x38,0x18,0x18,0x18,0x18,0x3C,0,0,0,0,0,0,0},
+    /* 238 î   */ {0x18,0x24,0,0x38,0x18,0x18,0x18,0x18,0x3C,0,0,0,0,0,0,0},
+    /* 239 ï   */ {0x66,0,0,0x38,0x18,0x18,0x18,0x18,0x3C,0,0,0,0,0,0,0},
+    /* 240 ð   */ {0x34,0x18,0x2C,0x06,0x3E,0x66,0x66,0x66,0x3C,0,0,0,0,0,0,0},
+    /* 241 ñ   */ {0x76,0xDC,0,0xDC,0x66,0x66,0x66,0x66,0x66,0,0,0,0,0,0,0},
+    /* 242 ò   */ {0x30,0x18,0,0x7C,0xC6,0xC6,0xC6,0xC6,0x7C,0,0,0,0,0,0,0},
+    /* 243 ó   */ {0x0C,0x18,0,0x7C,0xC6,0xC6,0xC6,0xC6,0x7C,0,0,0,0,0,0,0},
+    /* 244 ô   */ {0x38,0x6C,0,0x7C,0xC6,0xC6,0xC6,0xC6,0x7C,0,0,0,0,0,0,0},
+    /* 245 õ   */ {0x76,0xDC,0,0x7C,0xC6,0xC6,0xC6,0xC6,0x7C,0,0,0,0,0,0,0},
+    /* 246 ö   */ {0x66,0,0,0x7C,0xC6,0xC6,0xC6,0xC6,0x7C,0,0,0,0,0,0,0},
+    /* 247 ÷   */ {0,0,0x18,0x18,0,0x7E,0,0x18,0x18,0,0,0,0,0,0,0},
+    /* 248 ø   */ {0,0,0x02,0x7C,0xCE,0xD6,0xE6,0xC6,0x7C,0x80,0,0,0,0,0,0},
+    /* 249 ù   */ {0x30,0x18,0,0xCC,0xCC,0xCC,0xCC,0xCC,0x76,0,0,0,0,0,0,0},
+    /* 250 ú   */ {0x0C,0x18,0,0xCC,0xCC,0xCC,0xCC,0xCC,0x76,0,0,0,0,0,0,0},
+    /* 251 û   */ {0x38,0x6C,0,0xCC,0xCC,0xCC,0xCC,0xCC,0x76,0,0,0,0,0,0,0},
+    /* 252 ü   */ {0x66,0,0,0xCC,0xCC,0xCC,0xCC,0xCC,0x76,0,0,0,0,0,0,0},
+    /* 253 ý   */ {0x0C,0x18,0,0xC6,0xC6,0xC6,0x7E,0x06,0x0C,0xF8,0,0,0,0,0,0},
+    /* 254 þ   */ {0,0xE0,0x60,0x7C,0x66,0x66,0x66,0x7C,0x60,0xF0,0,0,0,0,0,0},
+    /* 255 ÿ   */ {0x66,0,0,0xC6,0xC6,0xC6,0x7E,0x06,0x0C,0xF8,0,0,0,0,0,0},
+};
+
+/* Advance widths for Latin-1 Supplement (same proportional logic) */
+static const uint8_t latin1_advance[96] = {
+    4,4,7,7,7,7,4,7,6,8,6,7,7,6,8,7,  /* 160-175 */
+    6,7,5,5,4,7,7,4,4,5,6,7,8,8,8,7,  /* 176-191 */
+    8,8,8,8,8,8,8,7,7,7,7,7,5,5,5,5,  /* 192-207 */
+    7,8,8,8,8,8,8,7,8,8,8,8,8,7,7,7,  /* 208-223 */
+    7,7,7,7,7,7,7,7,7,7,7,7,5,5,5,5,  /* 224-239 */
+    7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,  /* 240-255 */
+};
+
+/* ── Unified glyph lookup ────────────────────────────────── */
+
+/* Returns pointer to 16-byte bitmap for a codepoint, and its advance width.
+ * Returns NULL for unsupported codepoints. */
+static const uint8_t *glyph_lookup(uint32_t cp, int *advance)
 {
-    if (c < 32 || c > 126) return;
-    const uint8_t *glyph = gui_font8x16[c - 32];
+    if (cp >= 32 && cp <= 126) {
+        *advance = ascii_advance[cp - 32];
+        return gui_font8x16[cp - 32];
+    }
+    if (cp >= 160 && cp <= 255) {
+        *advance = latin1_advance[cp - 160];
+        return latin1_glyphs[cp - 160];
+    }
+    /* Replacement character for unsupported codepoints */
+    if (cp == 0xFFFD || cp > 255) {
+        *advance = 7;
+        return gui_font8x16['?' - 32];
+    }
+    return NULL;
+}
 
+/* ── Draw single character (codepoint) ───────────────────── */
+
+static void draw_glyph(gui_surface_t *s, int32_t x, int32_t y,
+                       const uint8_t *glyph, uint32_t fg, uint32_t bg)
+{
     for (int32_t row = 0; row < GUI_FONT_H; row++) {
         int32_t py = y + row;
         if (py < 0 || py >= (int32_t)s->height) continue;
-
         uint8_t bits = glyph[row];
         for (int32_t col = 0; col < GUI_FONT_W; col++) {
             int32_t px = x + col;
             if (px < 0 || px >= (int32_t)s->width) continue;
-
             if (bits & (0x80 >> col))
                 s->pixels[py * s->pitch + px] = fg;
             else if (bg != 0)
@@ -142,23 +308,39 @@ void gui_draw_char(gui_surface_t *s, int32_t x, int32_t y,
     }
 }
 
-/* ── Draw string ───────────────────────────────────────────── */
+void gui_draw_char(gui_surface_t *s, int32_t x, int32_t y,
+                   char c, uint32_t fg, uint32_t bg)
+{
+    if (c < 32 || c > 126) return;
+    draw_glyph(s, x, y, gui_font8x16[c - 32], fg, bg);
+}
+
+/* ── Draw UTF-8 string (variable width) ──────────────────── */
 
 void gui_draw_text(gui_surface_t *s, int32_t x, int32_t y,
                    const char *str, uint32_t fg, uint32_t bg)
 {
     while (*str) {
-        gui_draw_char(s, x, y, *str, fg, bg);
-        x += GUI_FONT_W;
-        str++;
+        uint32_t cp = utf8_decode(&str);
+        int adv = GUI_FONT_W;
+        const uint8_t *g = glyph_lookup(cp, &adv);
+        if (g) draw_glyph(s, x, y, g, fg, bg);
+        x += adv;
     }
 }
 
-/* ── Text width in pixels ──────────────────────────────────── */
+/* ── Text width in pixels (UTF-8 aware, variable width) ──── */
 
 int gui_text_width(const char *str)
 {
-    return gui_strlen(str) * GUI_FONT_W;
+    int w = 0;
+    while (*str) {
+        uint32_t cp = utf8_decode(&str);
+        int adv = GUI_FONT_W;
+        glyph_lookup(cp, &adv);
+        w += adv;
+    }
+    return w;
 }
 
 /* ── Draw centered text ────────────────────────────────────── */
@@ -172,9 +354,8 @@ void gui_draw_text_centered(gui_surface_t *s, int32_t x, int32_t y,
     gui_draw_text(s, tx, y, str, fg, bg);
 }
 
-/* ── Anti-aliased text rendering ──────────────────────────── */
+/* ── Anti-aliased text rendering (UTF-8, variable width) ──── */
 
-/* Blend foreground color at given alpha (0-255) over destination pixel */
 static inline uint32_t blend_aa(uint32_t dst, uint32_t fg, uint32_t a)
 {
     if (a >= 255) return fg;
@@ -189,57 +370,51 @@ static inline uint32_t blend_aa(uint32_t dst, uint32_t fg, uint32_t a)
     return 0xFF000000 | rb | g;
 }
 
-/* Draw a single character with edge anti-aliasing.
- * ON pixels render fully opaque. OFF pixels adjacent to ON pixels
- * get a soft fringe (partial alpha) for smooth edges. */
+static void draw_glyph_aa(gui_surface_t *s, int32_t x, int32_t y,
+                           const uint8_t *glyph, uint32_t fg)
+{
+    for (int32_t row = 0; row < GUI_FONT_H; row++) {
+        int32_t py = y + row;
+        if (py < 0 || py >= (int32_t)s->height) continue;
+        uint8_t bits  = glyph[row];
+        uint8_t above = (row > 0)  ? glyph[row - 1] : 0;
+        uint8_t below = (row < 15) ? glyph[row + 1] : 0;
+        for (int32_t col = 0; col < GUI_FONT_W; col++) {
+            int32_t px = x + col;
+            if (px < 0 || px >= (int32_t)s->width) continue;
+            uint8_t mask = 0x80 >> col;
+            uint32_t *dst = &s->pixels[py * s->pitch + px];
+            if (bits & mask) {
+                *dst = fg;
+            } else {
+                int on = 0;
+                if (col > 0 && (bits & (mask << 1))) on++;
+                if (col < 7 && (bits & (mask >> 1))) on++;
+                if (above & mask) on++;
+                if (below & mask) on++;
+                if (on > 0)
+                    *dst = blend_aa(*dst, fg, (uint32_t)on * 56);
+            }
+        }
+    }
+}
+
 void gui_draw_char_aa(gui_surface_t *s, int32_t x, int32_t y,
                       char c, uint32_t fg)
 {
     if (c < 32 || c > 126) return;
-    const uint8_t *glyph = gui_font8x16[c - 32];
-
-    for (int32_t row = 0; row < GUI_FONT_H; row++) {
-        int32_t py = y + row;
-        if (py < 0 || py >= (int32_t)s->height) continue;
-
-        uint8_t bits  = glyph[row];
-        uint8_t above = (row > 0)  ? glyph[row - 1] : 0;
-        uint8_t below = (row < 15) ? glyph[row + 1] : 0;
-
-        for (int32_t col = 0; col < GUI_FONT_W; col++) {
-            int32_t px = x + col;
-            if (px < 0 || px >= (int32_t)s->width) continue;
-
-            uint8_t mask = 0x80 >> col;
-            uint32_t *dst = &s->pixels[py * s->pitch + px];
-
-            if (bits & mask) {
-                /* ON pixel: fully opaque */
-                *dst = fg;
-            } else {
-                /* OFF pixel: count adjacent ON pixels for fringe */
-                int on = 0;
-                if (col > 0 && (bits & (mask << 1)))  on++;  /* left */
-                if (col < 7 && (bits & (mask >> 1)))   on++;  /* right */
-                if (above & mask)                      on++;  /* up */
-                if (below & mask)                      on++;  /* down */
-                if (on > 0) {
-                    /* Fringe: blend fg at partial alpha (more neighbors = more opaque) */
-                    uint32_t a = (uint32_t)on * 56;  /* 56-224 range */
-                    *dst = blend_aa(*dst, fg, a);
-                }
-            }
-        }
-    }
+    draw_glyph_aa(s, x, y, gui_font8x16[c - 32], fg);
 }
 
 void gui_draw_text_aa(gui_surface_t *s, int32_t x, int32_t y,
                       const char *str, uint32_t fg)
 {
     while (*str) {
-        gui_draw_char_aa(s, x, y, *str, fg);
-        x += GUI_FONT_W;
-        str++;
+        uint32_t cp = utf8_decode(&str);
+        int adv = GUI_FONT_W;
+        const uint8_t *g = glyph_lookup(cp, &adv);
+        if (g) draw_glyph_aa(s, x, y, g, fg);
+        x += adv;
     }
 }
 
