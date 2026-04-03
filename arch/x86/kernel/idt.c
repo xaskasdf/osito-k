@@ -851,47 +851,38 @@ void isr_handler(interrupt_frame_t *frame)
                     serial_puts(is_heap ? " (heap→SEH)\n" : " (DLL→wt)\n");
                 }
                 if (is_heap) {
-                    /* Dump instruction bytes and registers for diagnosis */
-                    serial_puts("[NULL-WRITE-HEAP] RIP=0x");
-                    serial_puthex((uint32_t)frame->rip, 8);
-                    serial_puts(" CR2=0x");
-                    serial_puthex((uint32_t)cr2, 4);
-                    serial_puts("\n  regs: EAX=0x");
-                    serial_puthex((uint32_t)frame->rax, 8);
-                    serial_puts(" EBX=0x");
-                    serial_puthex((uint32_t)frame->rbx, 8);
-                    serial_puts(" ECX=0x");
-                    serial_puthex((uint32_t)frame->rcx, 8);
-                    serial_puts(" EDX=0x");
-                    serial_puthex((uint32_t)frame->rdx, 8);
-                    serial_puts(" ESI=0x");
-                    serial_puthex((uint32_t)frame->rsi, 8);
-                    serial_puts(" EDI=0x");
-                    serial_puthex((uint32_t)frame->rdi, 8);
-                    serial_puts(" EBP=0x");
-                    serial_puthex((uint32_t)frame->rbp, 8);
-                    /* Also check: what does the IAT entry CURRENTLY contain? */
+                    /* Heap code executing data as code → EBX was corrupted
+                     * by a callback, causing call *%ebx to jump to heap data.
+                     * Fix: reload EBX from the IAT entry it was supposed to
+                     * contain, and redirect to the CORRECT function. */
                     volatile uint32_t *iat = (volatile uint32_t *)(uintptr_t)0x105A5E08;
-                    serial_puts("\n  IAT[StaticLoadClass]=0x");
-                    serial_puthex(*iat, 8);
-                    serial_puts("\n  code:");
-                    uint8_t *pc = (uint8_t *)(uintptr_t)((uint32_t)frame->rip);
-                    for (int bi = 0; bi < 8; bi++) {
-                        serial_puts(" 0x");
-                        serial_puthex(pc[bi], 2);
+                    uint32_t correct_fn = *iat;
+                    static int heap_fix_count = 0;
+                    heap_fix_count++;
+
+                    if (heap_fix_count <= 5) {
+                        serial_puts("[HEAP-FIX] EBX=0x");
+                        serial_puthex((uint32_t)frame->rbx, 8);
+                        serial_puts(" → 0x");
+                        serial_puthex(correct_fn, 8);
+                        serial_puts(" RIP was 0x");
+                        serial_puthex((uint32_t)frame->rip, 8);
+                        serial_puts("\n");
                     }
-                    serial_puts("\n  stack[0..3]:");
-                    uint32_t *sp32 = (uint32_t *)(uintptr_t)((uint32_t)(frame->rsp));
-                    for (int si = 0; si < 4; si++) {
-                        serial_puts(" 0x");
-                        serial_puthex(sp32[si], 8);
-                    }
-                    serial_puts("\n");
-                    /* Allow write-through but set GIsCriticalError so
-                     * the engine takes the error path after the write. */
-                    volatile uint32_t *gcrit = (volatile uint32_t *)(uintptr_t)0x101E568C;
-                    *gcrit = 1;
-                    /* Fall through to write-through below */
+
+                    /* Fix EBX and redirect execution to the correct function.
+                     * The PE32 code did `call *%ebx` which jumped to garbage.
+                     * We undo the call: pop the return address from stack,
+                     * fix EBX, and redirect RIP to the correct function.
+                     * The retaddr on stack is the instruction after `call *%ebx`
+                     * in Init() — we leave it there so the function can RET. */
+                    frame->rbx = correct_fn;
+                    frame->rip = correct_fn;
+                    /* EAX was clobbered by executing garbage (add [eax],al).
+                     * Restore EAX to a sane value (0 is safe — it was the
+                     * null pointer that caused the fault). */
+                    frame->rax = 0;
+                    return;  /* resume at the correct function */
                 }
             }
 
