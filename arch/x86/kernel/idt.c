@@ -950,13 +950,23 @@ void isr_handler(interrupt_frame_t *frame)
                             serial_puts(" [EDI+48]="); serial_puthex(o[0x48/4], 8);
                             serial_puts("\n");
                         }
-                        /* Show what's at the stack above EBP (Init frame) */
+                        /* Init() caller return address */
                         uint32_t ebp = (uint32_t)frame->rbp;
                         if (ebp >= 0x1000 && ebp < 0x50000000) {
                             uint32_t *fp = (uint32_t *)(uintptr_t)ebp;
-                            serial_puts("  [EBP-18]=");
-                            serial_puthex(*(uint32_t *)(uintptr_t)(ebp - 0x18), 8);
-                            serial_puts(" (saved EDI in Init)\n");
+                            serial_puts("  Init caller: [EBP+4]=0x");
+                            serial_puthex(fp[1], 8);
+                            serial_puts(" [EBP]=0x");
+                            serial_puthex(fp[0], 8);
+                            serial_puts("\n");
+                            /* Walk one more frame */
+                            uint32_t caller_ebp = fp[0];
+                            if (caller_ebp >= 0x1000 && caller_ebp < 0x50000000) {
+                                uint32_t *cfp = (uint32_t *)(uintptr_t)caller_ebp;
+                                serial_puts("  Caller's caller: [EBP+4]=0x");
+                                serial_puthex(cfp[1], 8);
+                                serial_puts("\n");
+                            }
                         }
                     }
                     /* Dump registers and stack */
