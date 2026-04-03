@@ -51,6 +51,15 @@ void gui_desktop_set_terminal_surface(uint32_t *px, uint32_t w, uint32_t h)
     term_surface_h  = h;
 }
 
+/* Cursor position for dock hover (set by compositor each frame) */
+static int32_t desk_cursor_x, desk_cursor_y;
+
+void gui_desktop_set_cursor(int32_t x, int32_t y)
+{
+    desk_cursor_x = x;
+    desk_cursor_y = y;
+}
+
 /* Demo windows — positioned relative to screen size */
 static gui_win_desc_t demo_windows[2];
 #define NUM_DEMO_WINDOWS 2
@@ -202,7 +211,7 @@ void gui_desktop_render(gui_surface_t *screen)
         render_window_content(screen, demo_order[i]);
 
     /* 4. Bottom dock */
-    gui_dock_render(screen, sw, sh);
+    gui_dock_render(screen, sw, sh, desk_cursor_x, desk_cursor_y);
 }
 
 gui_win_desc_t *gui_desktop_get_windows(int *count)
@@ -233,11 +242,18 @@ void gui_desktop_show_window(int idx)
     if (idx < 0 || idx >= NUM_DEMO_WINDOWS) return;
     gui_win_desc_t *w = &demo_windows[idx];
     if (w->hidden) {
-        w->x = init_geom[idx][0];
-        w->y = init_geom[idx][1];
-        w->w = init_geom[idx][2];
-        w->h = init_geom[idx][3];
+        /* Start at 50% size centered on target — animate to full */
+        int32_t tx = init_geom[idx][0], ty = init_geom[idx][1];
+        int32_t tw = init_geom[idx][2], th = init_geom[idx][3];
+        w->x = tx + tw / 4;
+        w->y = ty + th / 4;
+        w->w = tw / 2;
+        w->h = th / 2;
         w->hidden = false;
+        gui_anim_start(&w->x, tx, 250, gui_ease_out_cubic, NULL, NULL);
+        gui_anim_start(&w->y, ty, 250, gui_ease_out_cubic, NULL, NULL);
+        gui_anim_start(&w->w, tw, 250, gui_ease_out_cubic, NULL, NULL);
+        gui_anim_start(&w->h, th, 250, gui_ease_out_cubic, NULL, NULL);
     }
     gui_desktop_raise_window(idx);
 }

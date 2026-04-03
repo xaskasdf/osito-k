@@ -162,7 +162,8 @@ const gui_debug_info_t *gui_panel_get_debug(void);
 
 /* ── Dock (gui_dock.c) ────────────────────────────────────── */
 
-void gui_dock_render(gui_surface_t *s, uint32_t screen_w, uint32_t screen_h);
+void gui_dock_render(gui_surface_t *s, uint32_t screen_w, uint32_t screen_h,
+                     int32_t cursor_x, int32_t cursor_y);
 
 /* ── Window decorations (gui_window.c) ────────────────────── */
 
@@ -196,6 +197,7 @@ bool gui_anim_any_active(void);
 void gui_desktop_init(uint32_t screen_w, uint32_t screen_h);
 void gui_desktop_render(gui_surface_t *screen);
 gui_win_desc_t *gui_desktop_get_windows(int *count);
+void gui_desktop_set_cursor(int32_t x, int32_t y);
 void gui_desktop_raise_window(int idx);
 void gui_desktop_show_window(int idx);   /* raise + restore if closed */
 int *gui_desktop_get_order(void);

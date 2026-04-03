@@ -23,7 +23,8 @@ static const dock_item_t dock_items[] = {
 
 /* ── Render ────────────────────────────────────────────────── */
 
-void gui_dock_render(gui_surface_t *s, uint32_t screen_w, uint32_t screen_h)
+void gui_dock_render(gui_surface_t *s, uint32_t screen_w, uint32_t screen_h,
+                     int32_t cursor_x, int32_t cursor_y)
 {
     int32_t item_slot = GUI_DOCK_ICON_SIZE + GUI_DOCK_PADDING;
     int32_t dock_w = (int32_t)DOCK_ITEM_COUNT * item_slot + GUI_DOCK_PADDING;
@@ -49,7 +50,10 @@ void gui_dock_render(gui_surface_t *s, uint32_t screen_w, uint32_t screen_h)
 
         /* Dim icon if window is hidden (closed/minimized) */
         bool visible = (i < win_count && !wins[i].hidden);
-        uint32_t icon_color = visible ? dock_items[i].color : 0xFF3A3A40;
+        bool hovered = (cursor_x >= ix && cursor_x < ix + GUI_DOCK_ICON_SIZE &&
+                        cursor_y >= iy && cursor_y < iy + GUI_DOCK_ICON_SIZE);
+        uint32_t icon_color = hovered ? GUI_DOCK_HOVER
+                            : (visible ? dock_items[i].color : 0xFF3A3A40);
 
         /* Icon square with rounded corners */
         gui_rounded_rect(s, ix, iy, GUI_DOCK_ICON_SIZE, GUI_DOCK_ICON_SIZE,

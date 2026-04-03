@@ -555,6 +555,13 @@ static int hit_test_dock(int32_t mx, int32_t my)
     return -2;
 }
 
+/* Callback: mark window hidden after shrink animation completes */
+static void on_shrink_complete(void *ctx)
+{
+    gui_win_desc_t *w = (gui_win_desc_t *)ctx;
+    w->hidden = true;
+}
+
 /* Process mouse clicks on demo windows */
 static void process_mouse_input(void)
 {
@@ -603,19 +610,25 @@ static void process_mouse_input(void)
             /* Check traffic-light buttons first */
             int btn = hit_test_buttons(&dw[hit], cx, cy);
             if (btn == 1 || btn == 2) {
-                /* Close/Minimize: hide window (dock restores via gui_desktop_show_window) */
-                dw[hit].hidden = true;
-                /* Cancel any in-progress animations on this window's geometry */
+                /* Close/Minimize: animate shrink then hide via callback */
                 gui_anim_cancel(&dw[hit].x);
                 gui_anim_cancel(&dw[hit].y);
                 gui_anim_cancel(&dw[hit].w);
                 gui_anim_cancel(&dw[hit].h);
-                /* Shift focus to next visible window */
+                /* Shift focus immediately */
                 if (focused_demo_idx == hit) {
                     focused_demo_idx = -1;
                     for (int fi = 0; fi < count; fi++)
                         if (!dw[fi].hidden) { focused_demo_idx = fi; break; }
                 }
+                /* Animate shrink to center — last anim hides via callback */
+                int32_t mid_x = dw[hit].x + dw[hit].w / 2;
+                int32_t mid_y = dw[hit].y + dw[hit].h / 2;
+                gui_anim_start(&dw[hit].x, mid_x, 200, gui_ease_in_out_quad, NULL, NULL);
+                gui_anim_start(&dw[hit].y, mid_y, 200, gui_ease_in_out_quad, NULL, NULL);
+                gui_anim_start(&dw[hit].w, 0, 200, gui_ease_in_out_quad, NULL, NULL);
+                gui_anim_start(&dw[hit].h, 0, 200, gui_ease_in_out_quad,
+                               on_shrink_complete, &dw[hit]);
             } else if (btn == 3) {
                 /* Maximize / restore toggle — animated (Phase 3.3) */
                 if (is_maximized[hit]) {
@@ -819,6 +832,13 @@ static void compositor_render_frame(void)
           info.rtc_hour = (raw_h + 24 - 3) % 24; }
 #endif
         gui_panel_set_debug(&info);
+    }
+
+    /* Pass cursor to desktop layer for dock hover effects */
+    {
+        int32_t mx, my;
+        input_get_cursor(&mx, &my);
+        gui_desktop_set_cursor(mx, my);
     }
 
     /* Render elementaryOS-inspired desktop (bg, panel, window chrome, dock) */
