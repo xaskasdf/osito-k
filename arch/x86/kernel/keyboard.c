@@ -220,19 +220,18 @@ bool kbd_is_captured(void)           { return g_keyboard_captured; }
 void keyboard_irq(void)
 {
     uint8_t sc = inb(KB_DATA_PORT);
-    /* Post to input event system for USB games / compositor key_ring.
-     * Only from hardware IRQ — kb_inject_scancode must NOT re-post
-     * or we get an infinite loop. Skip 0xE0 prefix byte. */
-    if (sc != 0xE0) {
+    /* Post to input event system for USB games / fullscreen apps.
+     * Skip when compositor is running — compositor gets HID events
+     * from xHCI instead, and PS/2 scancodes would be misinterpreted
+     * as HID codes. PS/2 → kb_process_scancode handles the shell. */
+    if (sc != 0xE0 &&
+        !(compositor_is_running && compositor_is_running())) {
         extern void input_post_key(uint8_t scancode, bool pressed, bool extended);
         input_post_key(sc & 0x7F, !(sc & 0x80), false);
     }
-    /* When compositor is running, it reads from input_events ring and
-     * pushes to kb_buf itself — skip kb_process_scancode to avoid
-     * double-inserting every character.
-     * When a graphical process has focus (captured), also skip. */
-    if (!g_keyboard_captured &&
-        !(compositor_is_running && compositor_is_running()))
+    /* Always process PS/2 scancodes to kb_buf for the shell/terminal.
+     * The compositor reads from kb_buf via the shell thread's kb_getchar(). */
+    if (!g_keyboard_captured)
         kb_process_scancode(sc);
 }
 
