@@ -14,6 +14,7 @@
 /* ── External functions ──────────────────────────────────────── */
 
 extern void serial_puts(const char *s);
+extern void serial_putchar(char c);
 extern void serial_puthex(uint64_t val, int digits);
 extern void serial_putdec(uint64_t val);
 extern void fb_puts(const char *s);
@@ -931,19 +932,32 @@ void isr_handler(interrupt_frame_t *frame)
                     serial_puts(") vtbl=0x"); serial_puthex(vtbl, 8);
                     serial_puts(" this=0x"); serial_puthex((uint32_t)frame->rdi, 8);
                     serial_puts("\n");
-                    /* Dump GNatives + dynamic vtable for Browse (disp=0xB0) */
-                    if (disp == 0xB0 && vtbl >= 0x10000 && vtbl < 0x80000000) {
-                        serial_puts("  GNatives[0..7]:");
-                        volatile uint32_t *gn = (volatile uint32_t *)(uintptr_t)0x101F3878;
-                        for (int gi = 0; gi < 8; gi++) {
-                            serial_puts(" 0x"); serial_puthex(gn[gi], 8);
-                        }
-                        serial_puts("\n  vtbl[0xA0..0xC0]:");
-                        uint32_t *dvt = (uint32_t *)(uintptr_t)vtbl;
-                        for (int di = 0xA0/4; di <= 0xC0/4; di++) {
-                            serial_puts(" 0x"); serial_puthex(dvt[di], 8);
-                        }
+                    /* Dump registers and object for Browse call */
+                    if (disp == 0xB0) {
+                        serial_puts("  ECX=0x"); serial_puthex((uint32_t)frame->rcx, 8);
+                        serial_puts(" EDI=0x"); serial_puthex((uint32_t)frame->rdi, 8);
+                        serial_puts(" EDX=0x"); serial_puthex((uint32_t)frame->rdx, 8);
+                        serial_puts(" EBP=0x"); serial_puthex((uint32_t)frame->rbp, 8);
                         serial_puts("\n");
+                        /* Dump both EDI and EDX targets */
+                        uint32_t edi_val = (uint32_t)frame->rdi;
+                        uint32_t edx_val = (uint32_t)frame->rdx;
+                        if (edi_val >= 0x1000 && edi_val < 0x50000000) {
+                            uint32_t *o = (uint32_t *)(uintptr_t)edi_val;
+                            serial_puts("  [EDI]="); serial_puthex(o[0], 8);
+                            serial_puts(" [EDI+4]="); serial_puthex(o[1], 8);
+                            serial_puts(" [EDI+44]="); serial_puthex(o[0x44/4], 8);
+                            serial_puts(" [EDI+48]="); serial_puthex(o[0x48/4], 8);
+                            serial_puts("\n");
+                        }
+                        /* Show what's at the stack above EBP (Init frame) */
+                        uint32_t ebp = (uint32_t)frame->rbp;
+                        if (ebp >= 0x1000 && ebp < 0x50000000) {
+                            uint32_t *fp = (uint32_t *)(uintptr_t)ebp;
+                            serial_puts("  [EBP-18]=");
+                            serial_puthex(*(uint32_t *)(uintptr_t)(ebp - 0x18), 8);
+                            serial_puts(" (saved EDI in Init)\n");
+                        }
                     }
                     /* Dump registers and stack */
                     serial_puts("  EBP=0x"); serial_puthex((uint32_t)frame->rbp, 8);
