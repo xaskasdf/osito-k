@@ -488,6 +488,63 @@ NT compatibility layer. ~100 lines of code, well-defined algorithm.
 | NT syscall numbers | Version-dependent | Pin to Windows 10 22H2 syscall table |
 | Structured exceptions | Needed for some PE | Implement via #UD/#GP → SEH dispatch |
 
+## Phase 4: DOS 16-bit Compatibility (implemented)
+
+### Architecture: software CPU emulation
+
+Unlike Phases 1-3 where native x86-64 code runs directly, DOS 16-bit binaries
+require a software CPU emulator because V86 mode is unavailable in x86-64 long mode.
+
+**Implementation** (`arch/x86/dos/`, 6941 lines):
+
+| Component | File | Lines | Description |
+|-----------|------|-------|-------------|
+| CPU emulator | cpu8086.c | 3493 | 8086/186/286/386 interpreter, ~120 opcodes |
+| DPMI host | dos_dpmi.c | 1055 | Protected mode services, LDT, page walker |
+| DOS API | dos_api.c | 486 | INT 21h (30+ functions, file I/O via OsitoFS) |
+| BIOS services | dos_bios.c | 345 | INT 10h/16h/1Ah (video, keyboard, timer) |
+| Binary loader | dos_loader.c | 230 | COM + MZ with relocations |
+| Memory manager | dos_mem.c | 168 | MCB chain (alloc/free/resize) |
+| Orchestrator | dos_exec.c | 250 | VM lifecycle (16MB, IVT, BDA, PSP) |
+| INT dispatch | dos_int.c | 158 | Router + HW interrupt delivery |
+| VGA text mode | dos_vga.c | 26 | Stub (Phase 5: GOP rendering) |
+| I/O ports | dos_io.c | 113 | VGA/PIT/keyboard port stubs |
+| Types | dos_types.h, cpu8086.h, dos_dpmi.h | 586 | Structures and helpers |
+
+**Key features**:
+- Software 8086→386 instruction interpreter (real + protected mode)
+- DPMI 0.9 host: INT 2Fh/1687h detection, INT 31h services (15+ functions)
+- 32-bit protected mode with GDT/LDT descriptor translation
+- x86 page table walker (4KB + 4MB pages) for DOS4GW paged addresses
+- Timer interrupt delivery (BDA counter + IDT-based INT 8 injection)
+- FPU instruction stubs (NOP with correct byte consumption)
+- OsitoFS integration for DOS file I/O
+
+**Test results**:
+- `dosrun HELLO.COM`: prints correctly, 6 instructions, exit 0
+- `dosrun DOOM.EXE`: DOS4GW enters 32-bit protected mode, executes 1.6B+
+  instructions with paged memory. DPMI INT 31h/0501h works. Pending: file
+  I/O reflection for DOOM.WAD loading, VGA mode 13h rendering.
+
+### What's needed for full DOOM
+
+1. **Timer interrupt delivery to guest IDT** — DOS4GW's IDT is at a paged
+   virtual address (0x93000000). The page walker resolves it but the handler
+   needs proper interrupt frame push/IRET coordination.
+2. **INT 31h/0300h reflection** — DOOM uses this to call INT 21h for file I/O
+   from protected mode. The DPMI host has this implemented but DOOM hasn't
+   reached that code path yet.
+3. **VGA mode 13h** (320x200 256-color) — render to GOP framebuffer.
+4. **Keyboard input** in protected mode — bridge PS/2 to DOS keyboard buffer.
+5. **Sound** — optional, Adlib/SB stubs.
+
+### Goal
+
+Run DOOM (shareware) from the Total DOS Collection interactively.
+Milestone: DOOM title screen renders on the GOP framebuffer.
+
+---
+
 ## Estimated syscall count
 
 ```
@@ -495,4 +552,5 @@ Current OsitoK:     13 syscalls
 Phase 1 target:    ~40 syscalls  (+27)
 Phase 2 target:    ~70 syscalls  (+30)
 Phase 3 adds:      ~30 NT syscalls + ~200 Win32 API functions
+Phase 4 adds:      ~30 INT 21h functions + 15 INT 31h DPMI services
 ```
