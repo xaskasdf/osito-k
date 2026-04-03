@@ -227,9 +227,12 @@ void keyboard_irq(void)
         extern void input_post_key(uint8_t scancode, bool pressed, bool extended);
         input_post_key(sc & 0x7F, !(sc & 0x80), false);
     }
-    /* When a graphical process has focus, skip kb_buf — keys go only
-     * to input_events so the shell doesn't see game keystrokes. */
-    if (!g_keyboard_captured)
+    /* When compositor is running, it reads from input_events ring and
+     * pushes to kb_buf itself — skip kb_process_scancode to avoid
+     * double-inserting every character.
+     * When a graphical process has focus (captured), also skip. */
+    if (!g_keyboard_captured &&
+        !(compositor_is_running && compositor_is_running()))
         kb_process_scancode(sc);
 }
 

@@ -133,25 +133,12 @@ static uint32_t utf8_decode(const char **p)
     return cp;
 }
 
-/* ── Variable-width advance table (ASCII 32-126) ─────────── */
+/* ── Advance width ────────────────────────────────────────── */
 
-/* Per-glyph horizontal advance in pixels. Computed from actual
- * glyph density: narrow glyphs (i, l, !, |) get less space,
- * wide glyphs (M, W, m, w) get full 8px. 1px inter-char gap included. */
-static const uint8_t ascii_advance[95] = {
- /* sp ! " # $ % & ' ( ) * + , - . / */
-    4, 4, 6, 8, 7, 8, 8, 4, 5, 5, 7, 7, 4, 6, 4, 7,
- /* 0  1  2  3  4  5  6  7  8  9  :  ;  <  =  >  ? */
-    7, 6, 7, 7, 7, 7, 7, 7, 7, 7, 4, 4, 7, 7, 7, 7,
- /* @  A  B  C  D  E  F  G  H  I  J  K  L  M  N  O */
-    8, 8, 7, 7, 7, 7, 7, 7, 8, 5, 7, 8, 7, 8, 8, 8,
- /* P  Q  R  S  T  U  V  W  X  Y  Z  [  \  ]  ^  _ */
-    7, 8, 8, 7, 7, 8, 8, 8, 8, 7, 7, 5, 7, 5, 7, 8,
- /* `  a  b  c  d  e  f  g  h  i  j  k  l  m  n  o */
-    5, 7, 7, 7, 7, 7, 6, 7, 7, 4, 5, 7, 4, 8, 7, 7,
- /* p  q  r  s  t  u  v  w  x  y  z  {  |  }  ~ */
-    7, 7, 7, 7, 6, 7, 7, 8, 7, 7, 7, 6, 4, 6, 8,
-};
+/* The 8x16 bitmap font is monospace — all glyphs occupy the full 8px cell.
+ * Variable advances cause overlapping because glyphs aren't left-aligned.
+ * Use uniform 8px advance for all characters. */
+#define GLYPH_ADVANCE GUI_FONT_W
 
 /* ── Latin-1 Supplement glyphs (codepoints 160-255) ──────── */
 
@@ -256,15 +243,7 @@ static const uint8_t latin1_glyphs[96][16] = {
     /* 255 ÿ   */ {0x66,0,0,0xC6,0xC6,0xC6,0x7E,0x06,0x0C,0xF8,0,0,0,0,0,0},
 };
 
-/* Advance widths for Latin-1 Supplement (same proportional logic) */
-static const uint8_t latin1_advance[96] = {
-    4,4,7,7,7,7,4,7,6,8,6,7,7,6,8,7,  /* 160-175 */
-    6,7,5,5,4,7,7,4,4,5,6,7,8,8,8,7,  /* 176-191 */
-    8,8,8,8,8,8,8,7,7,7,7,7,5,5,5,5,  /* 192-207 */
-    7,8,8,8,8,8,8,7,8,8,8,8,8,7,7,7,  /* 208-223 */
-    7,7,7,7,7,7,7,7,7,7,7,7,5,5,5,5,  /* 224-239 */
-    7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,  /* 240-255 */
-};
+/* Latin-1 uses same monospace advance */
 
 /* ── Unified glyph lookup ────────────────────────────────── */
 
@@ -272,19 +251,13 @@ static const uint8_t latin1_advance[96] = {
  * Returns NULL for unsupported codepoints. */
 static const uint8_t *glyph_lookup(uint32_t cp, int *advance)
 {
-    if (cp >= 32 && cp <= 126) {
-        *advance = ascii_advance[cp - 32];
+    *advance = GLYPH_ADVANCE;
+    if (cp >= 32 && cp <= 126)
         return gui_font8x16[cp - 32];
-    }
-    if (cp >= 160 && cp <= 255) {
-        *advance = latin1_advance[cp - 160];
+    if (cp >= 160 && cp <= 255)
         return latin1_glyphs[cp - 160];
-    }
-    /* Replacement character for unsupported codepoints */
-    if (cp == 0xFFFD || cp > 255) {
-        *advance = 7;
+    if (cp == 0xFFFD || cp > 255)
         return gui_font8x16['?' - 32];
-    }
     return NULL;
 }
 
@@ -393,7 +366,7 @@ static void draw_glyph_aa(gui_surface_t *s, int32_t x, int32_t y,
                 if (above & mask) on++;
                 if (below & mask) on++;
                 if (on > 0)
-                    *dst = blend_aa(*dst, fg, (uint32_t)on * 56);
+                    *dst = blend_aa(*dst, fg, (uint32_t)on * 28);
             }
         }
     }
