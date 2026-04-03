@@ -113,7 +113,7 @@ static SIZE_T vm_track_remove(uint64_t va, uint64_t *out_phys)
 static inline void nt_memset(void *s, int c, SIZE_T n);
 
 /* Allocate VA range and map physical pages into it */
-static PVOID win32_va_alloc(SIZE_T size, uint64_t *out_phys)
+static PVOID win32_va_alloc(SIZE_T size, uint64_t *out_phys, ULONG protect)
 {
     uint64_t pages = size / 4096;
     if (pages == 0) return NULL;
@@ -133,13 +133,18 @@ static PVOID win32_va_alloc(SIZE_T size, uint64_t *out_phys)
     }
     win32_va_next = va_end;
 
-    /* Map each 4KB page in Win32 page table ONLY (not kernel).
-     * This prevents identity-mapping aliasing: kernel can't see
-     * VirtualAlloc VAs, so recycled PAs don't corrupt live data. */
+    /* Map each 4KB page in Win32 page table.
+     * Set NX (no-execute) unless PAGE_EXECUTE* was requested.
+     * PAGE_EXECUTE_READWRITE = 0x40, PAGE_EXECUTE_READ = 0x20,
+     * PAGE_EXECUTE = 0x10, PAGE_EXECUTE_WRITECOPY = 0x80 */
+    int is_exec = (protect & 0xF0) != 0; /* any PAGE_EXECUTE* bit */
+    uint64_t pte_flags = PTE_PRESENT | PTE_WRITABLE;
+    if (!is_exec)
+        pte_flags |= PTE_NX;
+
     uint64_t pa = (uint64_t)phys;
     for (uint64_t i = 0; i < pages; i++) {
-        paging_win32_map_page(va + i * 4096, pa + i * 4096,
-                              PTE_PRESENT | PTE_WRITABLE);
+        paging_win32_map_page(va + i * 4096, pa + i * 4096, pte_flags);
     }
 
     /* Zero via the newly mapped VA (not PA — under Win32 CR3,
@@ -594,7 +599,7 @@ NTSTATUS sys_NtAllocateVirtualMemory(ULONG_PTR *args)
     /* ULONG_PTR ZeroBits   = args[2]; */
     SIZE_T  *RegionSize    = (SIZE_T *)args[3];
     ULONG    AllocationType = (ULONG)args[4];
-    /* ULONG  Protect       = (ULONG)args[5]; */
+    ULONG    Protect        = (ULONG)args[5];
 
     if (!BaseAddress || !RegionSize)
         return STATUS_INVALID_PARAMETER;
@@ -622,7 +627,7 @@ NTSTATUS sys_NtAllocateVirtualMemory(ULONG_PTR *args)
         phys = 0;  /* no new physical alloc */
     } else {
         /* Allocate fresh VA + physical pages, zeroed via new VA */
-        addr = win32_va_alloc(size, &phys);
+        addr = win32_va_alloc(size, &phys, Protect);
         if (!addr) {
             nt_log_hex("NtAllocateVirtualMemory FAILED: size=", size);
             return STATUS_NO_MEMORY;

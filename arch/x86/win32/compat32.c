@@ -37,6 +37,14 @@ uint32_t g_compat32_last_stack_arg13 = 0;  /* for CreateWindowExW lpParam workar
 uint32_t g_compat32_unwind_esp = 0;
 uint32_t g_compat32_unwind_ebp = 0;
 
+/* ── PE32 callee-saved register preservation ─────────────────── */
+/* int2e_stub saves PE32 EBX/ESI/EDI/EBP here before calling dispatch.
+ * After dispatch returns (which may involve callbacks that corrupt
+ * the IST1 saved-register area), the stub restores them.
+ * 32 slots × 4 regs × 8 bytes = 1024 bytes. */
+uint64_t g_pe32_saved_regs[32 * 4];
+uint32_t g_pe32_save_depth = 0;
+
 /* ── Thunk state ─────────────────────────────────────────────── */
 
 #define THUNK_STUB_SIZE  64      /* bytes per thunk stub */
