@@ -848,13 +848,39 @@ void isr_handler(interrupt_frame_t *frame)
                     serial_puts(is_heap ? " (heap→SEH)\n" : " (DLL→wt)\n");
                 }
                 if (is_heap) {
-                    /* Heap code null-write → crash recovery. The engine
-                     * expects SEH to catch this and unwind to __except.
-                     * Our SEH chain is unreliable (corrupt frames), and
-                     * write-through causes the engine to fall through
-                     * into CC padding. Clean crash recovery is safest. */
-                    serial_puts("[NULL-WRITE] heap → crash recovery\n");
-                    goto compat32_null_recovery;
+                    /* Dump instruction bytes and registers for diagnosis */
+                    serial_puts("[NULL-WRITE-HEAP] RIP=0x");
+                    serial_puthex((uint32_t)frame->rip, 8);
+                    serial_puts(" CR2=0x");
+                    serial_puthex((uint32_t)cr2, 4);
+                    serial_puts("\n  regs: EAX=0x");
+                    serial_puthex((uint32_t)frame->rax, 8);
+                    serial_puts(" ECX=0x");
+                    serial_puthex((uint32_t)frame->rcx, 8);
+                    serial_puts(" EDX=0x");
+                    serial_puthex((uint32_t)frame->rdx, 8);
+                    serial_puts(" ESI=0x");
+                    serial_puthex((uint32_t)frame->rsi, 8);
+                    serial_puts(" EDI=0x");
+                    serial_puthex((uint32_t)frame->rdi, 8);
+                    serial_puts("\n  code:");
+                    uint8_t *pc = (uint8_t *)(uintptr_t)((uint32_t)frame->rip);
+                    for (int bi = 0; bi < 8; bi++) {
+                        serial_puts(" 0x");
+                        serial_puthex(pc[bi], 2);
+                    }
+                    serial_puts("\n  stack[0..3]:");
+                    uint32_t *sp32 = (uint32_t *)(uintptr_t)((uint32_t)(frame->rsp));
+                    for (int si = 0; si < 4; si++) {
+                        serial_puts(" 0x");
+                        serial_puthex(sp32[si], 8);
+                    }
+                    serial_puts("\n");
+                    /* Allow write-through but set GIsCriticalError so
+                     * the engine takes the error path after the write. */
+                    volatile uint32_t *gcrit = (volatile uint32_t *)(uintptr_t)0x101E568C;
+                    *gcrit = 1;
+                    /* Fall through to write-through below */
                 }
             }
 
