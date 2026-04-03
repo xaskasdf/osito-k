@@ -934,6 +934,75 @@ void compositor_thread(void)
                 if (sc == 0xE1 || sc == 0xE5)               comp_shift_held = (type == 1);
                 if (sc == 0xE0 || sc == 0xE4)               comp_ctrl_held  = (type == 1);
 
+                /* Super (GUI key): HID 0xE3 left, 0xE7 right */
+                static bool super_held;
+                if (sc == 0xE3 || sc == 0xE7) super_held = (type == 1);
+
+                /* Super+H: hide focused window */
+                if (type == 1 && super_held && (sc == 0x0B /* HID H */)) {
+                    if (focused_demo_idx >= 0) {
+                        int count2;
+                        gui_win_desc_t *dw2 = gui_desktop_get_windows(&count2);
+                        if (focused_demo_idx < count2 && !dw2[focused_demo_idx].hidden) {
+                            gui_anim_cancel(&dw2[focused_demo_idx].x);
+                            gui_anim_cancel(&dw2[focused_demo_idx].y);
+                            gui_anim_cancel(&dw2[focused_demo_idx].w);
+                            gui_anim_cancel(&dw2[focused_demo_idx].h);
+                            int32_t mx2 = dw2[focused_demo_idx].x + dw2[focused_demo_idx].w / 2;
+                            int32_t my2 = dw2[focused_demo_idx].y + dw2[focused_demo_idx].h / 2;
+                            gui_anim_start(&dw2[focused_demo_idx].x, mx2, 200, gui_ease_in_out_quad, NULL, NULL);
+                            gui_anim_start(&dw2[focused_demo_idx].y, my2, 200, gui_ease_in_out_quad, NULL, NULL);
+                            gui_anim_start(&dw2[focused_demo_idx].w, 0, 200, gui_ease_in_out_quad, NULL, NULL);
+                            gui_anim_start(&dw2[focused_demo_idx].h, 0, 200, gui_ease_in_out_quad,
+                                           on_shrink_complete, &dw2[focused_demo_idx]);
+                            focused_demo_idx = -1;
+                            for (int fi = 0; fi < count2; fi++)
+                                if (!dw2[fi].hidden) { focused_demo_idx = fi; break; }
+                        }
+                    }
+                    continue;
+                }
+
+                /* Super+Left/Right: snap window to left/right half */
+                if (type == 1 && super_held && focused_demo_idx >= 0) {
+                    int cnt;
+                    gui_win_desc_t *dws = gui_desktop_get_windows(&cnt);
+                    if (focused_demo_idx < cnt && !dws[focused_demo_idx].hidden) {
+                        int32_t sw2 = (int32_t)display_get_width();
+                        int32_t sh2 = (int32_t)display_get_height();
+                        int32_t usable_h = sh2 - GUI_PANEL_HEIGHT - GUI_DOCK_HEIGHT;
+                        if (sc == 0x50 /* HID Left */) {
+                            gui_anim_start(&dws[focused_demo_idx].x, 0, 250, gui_ease_out_cubic, NULL, NULL);
+                            gui_anim_start(&dws[focused_demo_idx].y, GUI_PANEL_HEIGHT, 250, gui_ease_out_cubic, NULL, NULL);
+                            gui_anim_start(&dws[focused_demo_idx].w, sw2 / 2, 250, gui_ease_out_cubic, NULL, NULL);
+                            gui_anim_start(&dws[focused_demo_idx].h, usable_h, 250, gui_ease_out_cubic, NULL, NULL);
+                            is_maximized[focused_demo_idx] = false;
+                            continue;
+                        } else if (sc == 0x4F /* HID Right */) {
+                            gui_anim_start(&dws[focused_demo_idx].x, sw2 / 2, 250, gui_ease_out_cubic, NULL, NULL);
+                            gui_anim_start(&dws[focused_demo_idx].y, GUI_PANEL_HEIGHT, 250, gui_ease_out_cubic, NULL, NULL);
+                            gui_anim_start(&dws[focused_demo_idx].w, sw2 / 2, 250, gui_ease_out_cubic, NULL, NULL);
+                            gui_anim_start(&dws[focused_demo_idx].h, usable_h, 250, gui_ease_out_cubic, NULL, NULL);
+                            is_maximized[focused_demo_idx] = false;
+                            continue;
+                        } else if (sc == 0x52 /* HID Up */) {
+                            /* Super+Up = maximize */
+                            if (!is_maximized[focused_demo_idx]) {
+                                saved_geom[focused_demo_idx][0] = dws[focused_demo_idx].x;
+                                saved_geom[focused_demo_idx][1] = dws[focused_demo_idx].y;
+                                saved_geom[focused_demo_idx][2] = dws[focused_demo_idx].w;
+                                saved_geom[focused_demo_idx][3] = dws[focused_demo_idx].h;
+                                gui_anim_start(&dws[focused_demo_idx].x, 0, 300, gui_ease_out_cubic, NULL, NULL);
+                                gui_anim_start(&dws[focused_demo_idx].y, GUI_PANEL_HEIGHT, 300, gui_ease_out_cubic, NULL, NULL);
+                                gui_anim_start(&dws[focused_demo_idx].w, sw2, 300, gui_ease_out_cubic, NULL, NULL);
+                                gui_anim_start(&dws[focused_demo_idx].h, usable_h, 300, gui_ease_out_cubic, NULL, NULL);
+                                is_maximized[focused_demo_idx] = true;
+                            }
+                            continue;
+                        }
+                    }
+                }
+
                 /* Alt+Tab: cycle through windows (USB Tab = HID 0x2B, PS/2 Tab = 0x0F) */
                 if (type == 1 && alt_held && (sc == 0x2B || sc == 0x0F)) {
                     int count;

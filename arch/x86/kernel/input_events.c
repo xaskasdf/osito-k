@@ -146,11 +146,23 @@ void input_post_key(uint8_t scancode, bool pressed, bool extended)
 
 /* ── Mouse Events (called from mouse IRQ handler or PS/2 aux) ── */
 
+/* Simple mouse acceleration: small movements stay 1:1, fast movements
+ * get amplified. Threshold at 4 units, 2x multiplier above that.
+ * Feels natural without being jarring. */
+static int16_t accel(int16_t d)
+{
+    int16_t a = d < 0 ? -d : d;
+    if (a <= 4) return d;
+    /* Scale excess by 2x */
+    int16_t extra = (a - 4) * 2;
+    return d < 0 ? -(4 + extra) : (4 + extra);
+}
+
 void input_post_mouse_move(int16_t dx, int16_t dy)
 {
-    /* Update absolute position with clamping */
-    mouse_x += dx;
-    mouse_y += dy;
+    /* Apply acceleration curve then clamp */
+    mouse_x += accel(dx);
+    mouse_y += accel(dy);
     if (mouse_x < 0) mouse_x = 0;
     if (mouse_y < 0) mouse_y = 0;
     if (mouse_x >= screen_w) mouse_x = screen_w - 1;

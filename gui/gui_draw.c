@@ -281,12 +281,22 @@ void gui_box_shadow(gui_surface_t *s, int32_t x, int32_t y,
         gui_rounded_rect_alpha(s, x + offset_x, y + offset_y, w, h, 4, color);
         return;
     }
-    /* Single-layer fast shadow: one expanded rounded rect.
-     * ~15x faster than the old multi-layer loop (was 15 passes → 1). */
-    int32_t expand = blur / 2;
-    int32_t er = GUI_CORNER_RADIUS + expand;
-    gui_rounded_rect_alpha(s, x + offset_x - expand, y + offset_y - expand,
-                           w + 2 * expand, h + 2 * expand, er, color);
+    /* Multi-layer soft shadow: 4 concentric rounded rects with decreasing
+     * alpha and increasing expansion. Approximates Gaussian blur without
+     * a convolution kernel — each layer is ~1/4 of the total blur spread.
+     * Result: smooth falloff from opaque core to transparent edge. */
+    uint32_t base_a = (color >> 24) & 0xFF;
+    uint32_t rgb = color & 0x00FFFFFF;
+    int32_t layers = 4;
+    for (int32_t i = layers; i >= 1; i--) {
+        int32_t expand = (blur * i) / layers;
+        int32_t er = GUI_CORNER_RADIUS + expand;
+        /* Alpha decreases quadratically: outermost layer is faintest */
+        uint32_t a = (base_a * (uint32_t)i) / ((uint32_t)layers * 2);
+        uint32_t layer_color = (a << 24) | rgb;
+        gui_rounded_rect_alpha(s, x + offset_x - expand, y + offset_y - expand,
+                               w + 2 * expand, h + 2 * expand, er, layer_color);
+    }
 }
 
 /* ── Phase 2.7: Horizontal gradient ───────────────────────── */
