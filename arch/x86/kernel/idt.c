@@ -1012,12 +1012,52 @@ void isr_handler(interrupt_frame_t *frame)
                         }
                     }
 
+                    /* Self-referencing vtable (vtbl == this) or NULL vtable
+                     * call from Window.dll stub objects: RET 0 to caller.
+                     * Window.dll calls methods on stub GWindowManager/GLogWindow
+                     * that have no real implementation. Without RET 0, the
+                     * #UD/#GP cascade prevents the engine from reaching Init(). */
+                    {
+                        int is_self_ref = (vtbl == (uint32_t)frame->rdi && vtbl < 0x10000000);
+                        uint32_t *sp = (uint32_t *)(uintptr_t)(frame->rsp & 0xFFFFFFFF);
+                        uint32_t ret = sp[0];
+                        int from_window = (ret >= 0x11100000 && ret < 0x11200000);
+                        if (is_self_ref || from_window) {
+                            frame->rip = ret;
+                            frame->rsp += 4;
+                            frame->rax = 0;
+                            if (g_null_page_dirty) {
+                                g_null_page_dirty = 0;
+                                memset((void *)0, 0, 4096);
+                                paging_set_flags(0, PTE_PRESENT | PTE_GLOBAL | PTE_NX);
+                                __asm__ volatile ("invlpg (%0)" :: "r"((uint64_t)0) : "memory");
+                            }
+                            return;
+                        }
+                    }
                 }
             }
 
             if ((frame->cs & 0xFFFF) == 0x40) {
                 uint32_t *sp32 = (uint32_t *)(uintptr_t)(frame->rsp & 0xFFFFFFFF);
                 uint32_t retaddr = sp32[0];
+
+                /* Stub object NULL-CALL: if retaddr is in Window.dll or
+                 * any DLL that calls methods on our stub UObjects, RET 0.
+                 * These are calls to unimplemented virtual methods on
+                 * GWindowManager/GLogWindow stubs. */
+                if (retaddr >= 0x11100000 && retaddr < 0x11200000) {
+                    frame->rip = retaddr;
+                    frame->rsp += 4;
+                    frame->rax = 0;
+                    if (g_null_page_dirty) {
+                        g_null_page_dirty = 0;
+                        memset((void *)0, 0, 4096);
+                        paging_set_flags(0, PTE_PRESENT | PTE_GLOBAL | PTE_NX);
+                        __asm__ volatile ("invlpg (%0)" :: "r"((uint64_t)0) : "memory");
+                    }
+                    return;
+                }
 
                 /* Try IAT redirect: find 'call reg' (FF Dx) at retaddr-2,
                  * then scan backwards for 'mov reg, [imm32]' (IAT load) */

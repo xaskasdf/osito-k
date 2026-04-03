@@ -145,7 +145,7 @@ static void ensure_gmalloc_stub(void)
     stub_fmalloc_vtbl[4] = t_nop;
     stub_fmalloc_vtbl[5] = t_nop;
     stub_fmalloc_vtbl[6] = t_nop;
-    stub_fmalloc_vtbl[7] = 0;
+    stub_fmalloc_vtbl[7] = t_nop;  /* no NULL entries — causes crash if called */
 
     /* Install stub vtable INTO the existing FMalloc object (at obj_addr).
      * The object exists in BSS (zero-initialized). Its vtable pointer
@@ -2944,7 +2944,85 @@ double WINAPI crt_CIfmod(double x, double y)
     return x - (double)trunc_q * y;
 }
 
-/* _CIpow — compiler intrinsic wrapper for pow */
+/* ── Fast 32-bit x87 math (no INT 0x2E overhead) ──────────────
+ *
+ * _CIpow, _CIfmod, _CIacos use the MSVC _CI calling convention:
+ * arguments on the x87 FPU stack, result in ST(0).
+ * These run as native 32-bit code in compat mode — no mode switch. */
+
+uint32_t g_fast_CIpow_addr = 0;
+uint32_t g_fast_CIfmod_addr = 0;
+uint32_t g_fast_CIacos_addr = 0;
+
+void compat32_init_fast_math(void)
+{
+    extern void *mem_alloc_pages(uint64_t count);
+    uint8_t *page = (uint8_t *)mem_alloc_pages(1);
+    if (!page) { serial_puts("[FAST-MATH] alloc failed\n"); return; }
+
+    /* Zero and make executable (page from mem_alloc_pages is identity-mapped) */
+    for (int i = 0; i < 4096; i++) page[i] = 0xCC;  /* INT3 fill */
+
+    int p = 0;
+
+    /* _CIpow: ST(1)=base, ST(0)=exp → result in ST(0)
+     * Algorithm: pow(x,y) = 2^(y * log2(x))
+     * Using x87: fyl2x → f2xm1 → fscale */
+    g_fast_CIpow_addr = (uint32_t)(uintptr_t)(page + p);
+    /* fxch st(1) */          page[p++] = 0xD9; page[p++] = 0xC9;
+    /* fyl2x — ST(0) = ST(1) * log2(ST(0)), pop */
+                               page[p++] = 0xD9; page[p++] = 0xF1;
+    /* fld st(0) — dup */     page[p++] = 0xD9; page[p++] = 0xC0;
+    /* frndint — ST(0) = round(val) */ page[p++] = 0xD9; page[p++] = 0xFC;
+    /* fxch st(1) */          page[p++] = 0xD9; page[p++] = 0xC9;
+    /* fsub st(0), st(1) — frac = val - int_part */
+                               page[p++] = 0xD8; page[p++] = 0xE1;
+    /* f2xm1 — ST(0) = 2^frac - 1 */
+                               page[p++] = 0xD9; page[p++] = 0xF0;
+    /* fld1 */                page[p++] = 0xD9; page[p++] = 0xE8;
+    /* faddp st(1), st(0) — ST(0) = 2^frac */
+                               page[p++] = 0xDE; page[p++] = 0xC1;
+    /* fscale — ST(0) *= 2^ST(1) = 2^int_part */
+                               page[p++] = 0xD9; page[p++] = 0xFD;
+    /* fstp st(1) — pop int_part, result in ST(0) */
+                               page[p++] = 0xDD; page[p++] = 0xD9;
+    /* ret */                 page[p++] = 0xC3;
+
+    /* Align next function */
+    p = (p + 15) & ~15;
+
+    /* _CIfmod: ST(1)=x, ST(0)=y → result in ST(0) = x mod y */
+    g_fast_CIfmod_addr = (uint32_t)(uintptr_t)(page + p);
+    /* fxch st(1) */          page[p++] = 0xD9; page[p++] = 0xC9;
+    /* fprem */               page[p++] = 0xD9; page[p++] = 0xF8;
+    /* fstp st(1) */          page[p++] = 0xDD; page[p++] = 0xD9;
+    /* ret */                 page[p++] = 0xC3;
+
+    p = (p + 15) & ~15;
+
+    /* _CIacos: ST(0)=x → result in ST(0) = acos(x)
+     * acos(x) = atan2(sqrt(1-x^2), x) */
+    g_fast_CIacos_addr = (uint32_t)(uintptr_t)(page + p);
+    /* fld st(0) — dup x */   page[p++] = 0xD9; page[p++] = 0xC0;
+    /* fmul st(0), st(0) */   page[p++] = 0xD8; page[p++] = 0xC8;
+    /* fld1 */                page[p++] = 0xD9; page[p++] = 0xE8;
+    /* fsubrp st(1) */        page[p++] = 0xDE; page[p++] = 0xE9;
+    /* fsqrt */               page[p++] = 0xD9; page[p++] = 0xFA;
+    /* fxch st(1) */          page[p++] = 0xD9; page[p++] = 0xC9;
+    /* fpatan — atan2(ST(1), ST(0)) */
+                               page[p++] = 0xD9; page[p++] = 0xF3;
+    /* ret */                 page[p++] = 0xC3;
+
+    serial_puts("[FAST-MATH] pow=0x");
+    serial_puthex(g_fast_CIpow_addr, 8);
+    serial_puts(" fmod=0x");
+    serial_puthex(g_fast_CIfmod_addr, 8);
+    serial_puts(" acos=0x");
+    serial_puthex(g_fast_CIacos_addr, 8);
+    serial_puts("\n");
+}
+
+/* _CIpow — compiler intrinsic wrapper for pow (fallback via INT 0x2E) */
 double WINAPI crt_CIpow(double base, double exp)
 {
 #ifdef TEST_HARNESS

@@ -333,6 +333,11 @@ void compat32_init(void)
         serial_puthex(compat32_data_area, 8);
         serial_puts("\n");
     }
+
+    /* Initialize fast 32-bit x87 math functions (pow, fmod, acos).
+     * These run natively in compat mode without INT 0x2E overhead. */
+    extern void compat32_init_fast_math(void);
+    compat32_init_fast_math();
 #endif
 }
 
@@ -881,7 +886,34 @@ NTSTATUS compat32_patch_iat(PE_IMAGE_INFO *info)
             if (shim) {
                 /*
                  * Import from a shim DLL (64-bit kernel code).
-                 * Check for DATA imports first — these are variables, not
+                 * Check for fast-math native 32-bit implementations first.
+                 * These run directly in compat mode (no INT 0x2E overhead).
+                 */
+                extern uint32_t g_fast_CIpow_addr, g_fast_CIfmod_addr, g_fast_CIacos_addr;
+                if (func_name && g_fast_CIpow_addr) {
+                    uint32_t fast = 0;
+                    if (func_name[0]=='_' && func_name[1]=='C' && func_name[2]=='I') {
+                        if (func_name[3]=='p' && func_name[4]=='o' && func_name[5]=='w' && !func_name[6])
+                            fast = g_fast_CIpow_addr;
+                        else if (func_name[3]=='f' && func_name[4]=='m' && func_name[5]=='o' && func_name[6]=='d' && !func_name[7])
+                            fast = g_fast_CIfmod_addr;
+                        else if (func_name[3]=='a' && func_name[4]=='c' && func_name[5]=='o' && func_name[6]=='s' && !func_name[7])
+                            fast = g_fast_CIacos_addr;
+                    }
+                    if (fast) {
+                        iat_entry->u1.Function = fast;
+                        direct++;
+                        serial_puts("[FAST-IAT] ");
+                        serial_puts(func_name);
+                        serial_puts(" → 0x");
+                        serial_puthex(fast, 8);
+                        serial_puts("\n");
+                        continue;
+                    }
+                }
+
+                /*
+                 * Check for DATA imports — these are variables, not
                  * functions. Write the 32-bit data address directly.
                  */
                 uint32_t data_addr = func_name ?
@@ -2169,10 +2201,13 @@ uint32_t create_stub_uobject(const char *name)
     memset(page, 0, 4096);
 
     uint32_t *vtable = (uint32_t *)page;
-    uint32_t *object = (uint32_t *)(page + 256);
+    uint32_t *object = (uint32_t *)(page + 768);  /* after 128-entry vtable (512 bytes) + padding */
 
-    /* Fill 32 vtable entries with RET-0 stub */
-    for (int i = 0; i < 32; i++)
+    /* Fill 128 vtable entries with RET-0 stub.
+     * WinDrv.dll calls slot 61 (offset 0xF4) and beyond.
+     * With only 32 entries, slot 61 read past the vtable into zeroed
+     * memory, dispatching through address 0 → #UD/#GP cascade. */
+    for (int i = 0; i < 128; i++)
         vtable[i] = unresolved_stub_addr;
 
     /* Object[0] = vtable pointer */
