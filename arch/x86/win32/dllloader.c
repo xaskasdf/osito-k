@@ -336,6 +336,31 @@ PVOID dll_load(const char *dll_name, const BYTE *file_data, SIZE_T file_size)
         serial_puts("...\n");
         NTSTATUS compat_st = compat32_patch_iat(&mod->image);
         serial_puts("[DLL] IAT done\n");
+
+        /* Set DR1 watchpoint on Engine.dll's StaticLoadClass IAT entry.
+         * This catches the runtime overwrite (0x10101820 → 0x4027C870)
+         * that makes Init() execute heap data as code. */
+        if (dll_name[0] == 'E' && dll_name[1] == 'n' && dll_name[2] == 'g' &&
+            dll_name[3] == 'i' && dll_name[4] == 'n' && dll_name[5] == 'e' &&
+            dll_name[6] == '.') {
+            uint64_t iat_addr = (uint64_t)(uintptr_t)mod->image.ImageBase + 0x2A5E08;
+            serial_puts("[IAT-WP] DR1 on StaticLoadClass IAT @ 0x");
+            extern void serial_puthex(uint64_t val, int digits);
+            serial_puthex(iat_addr, 8);
+            serial_puts(" val=0x");
+            serial_puthex(*(uint32_t *)(uintptr_t)iat_addr, 8);
+            serial_puts("\n");
+            __asm__ volatile ("mov %0, %%dr1" :: "r"(iat_addr));
+            /* DR7: L0=1(bit0) L1=1(bit2)
+             *   RW0=01(bits16-17) LEN0=11(bits18-19) → DR0: 4-byte write
+             *   RW1=01(bits20-21) LEN1=11(bits22-23) → DR1: 4-byte write
+             * = 0x00D50005 */
+            __asm__ volatile (
+                "mov $0x00D50005, %%rax\n"
+                "mov %%rax, %%dr7\n"
+                ::: "rax"
+            );
+        }
         if (!NT_SUCCESS(compat_st)) {
             serial_puts("[DLL] WARNING: compat32 IAT patch failed for ");
             serial_puts(dll_name);

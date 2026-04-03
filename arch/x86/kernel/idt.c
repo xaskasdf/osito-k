@@ -779,22 +779,25 @@ void isr_handler(interrupt_frame_t *frame)
             return;
         }
 
-        if (dr6 & 0x2) {  /* B1: breakpoint 1 hit (GIsCriticalError) */
-            static int gcrit_hits = 0;
-            volatile uint32_t *gcrit = (volatile uint32_t *)(uintptr_t)0x101E568C;
-            uint32_t val = *gcrit;
-            if (val != 0 && gcrit_hits < 30) {
-                serial_puts("[GCrit-WP] SET to ");
-                serial_putdec(val);
-                serial_puts(" RIP=0x");
+        if (dr6 & 0x2) {  /* B1: StaticLoadClass IAT watchpoint */
+            uint64_t dr1;
+            __asm__ volatile ("mov %%dr1, %0" : "=r"(dr1));
+            uint32_t new_val = *(volatile uint32_t *)(uintptr_t)dr1;
+            static int iat_wp_count = 0;
+            iat_wp_count++;
+
+            if (iat_wp_count <= 20) {
+                serial_puts("[IAT-WP] StaticLoadClass = 0x");
+                serial_puthex(new_val, 8);
+                serial_puts(" writer RIP=0x");
                 serial_puthex((uint32_t)frame->rip, 8);
                 serial_puts(" CS=0x");
                 serial_puthex(frame->cs & 0xFFFF, 4);
+                serial_puts(" #");
+                serial_putdec(iat_wp_count);
                 serial_puts("\n");
-                /* Force it back to 0 */
-                *gcrit = 0;
             }
-            gcrit_hits++;
+
             __asm__ volatile ("mov %0, %%dr6" : : "r"((uint64_t)0));
             return;
         }
@@ -855,6 +858,8 @@ void isr_handler(interrupt_frame_t *frame)
                     serial_puthex((uint32_t)cr2, 4);
                     serial_puts("\n  regs: EAX=0x");
                     serial_puthex((uint32_t)frame->rax, 8);
+                    serial_puts(" EBX=0x");
+                    serial_puthex((uint32_t)frame->rbx, 8);
                     serial_puts(" ECX=0x");
                     serial_puthex((uint32_t)frame->rcx, 8);
                     serial_puts(" EDX=0x");
@@ -863,6 +868,12 @@ void isr_handler(interrupt_frame_t *frame)
                     serial_puthex((uint32_t)frame->rsi, 8);
                     serial_puts(" EDI=0x");
                     serial_puthex((uint32_t)frame->rdi, 8);
+                    serial_puts(" EBP=0x");
+                    serial_puthex((uint32_t)frame->rbp, 8);
+                    /* Also check: what does the IAT entry CURRENTLY contain? */
+                    volatile uint32_t *iat = (volatile uint32_t *)(uintptr_t)0x105A5E08;
+                    serial_puts("\n  IAT[StaticLoadClass]=0x");
+                    serial_puthex(*iat, 8);
                     serial_puts("\n  code:");
                     uint8_t *pc = (uint8_t *)(uintptr_t)((uint32_t)frame->rip);
                     for (int bi = 0; bi < 8; bi++) {
