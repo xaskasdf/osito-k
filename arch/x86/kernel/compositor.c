@@ -143,6 +143,9 @@ static uint8_t  resize_edges;    /* combination of EDGE_* */
 static bool    is_maximized[2];
 static int32_t saved_geom[2][4];    /* x, y, w, h before maximize */
 
+/* Alt+Tab overlay: show window title briefly after switching */
+static uint64_t switcher_show_until;  /* tick when overlay disappears */
+
 /* Modifier key state (tracked from HID virtual scancodes) */
 static bool    alt_held;
 static bool    comp_shift_held;
@@ -917,6 +920,24 @@ static void compositor_render_frame(void)
         blit_window(back, p, w, h, &windows[render_order[i]]);
     }
 
+    /* Alt+Tab window switcher overlay */
+    if (switcher_show_until > idt_get_ticks() && focused_demo_idx >= 0) {
+        int sw_count;
+        gui_win_desc_t *sw_dw = gui_desktop_get_windows(&sw_count);
+        if (focused_demo_idx < sw_count && sw_dw[focused_demo_idx].title) {
+            const char *title = sw_dw[focused_demo_idx].title;
+            int tw = gui_text_width(title);
+            int32_t bw = tw + 32;
+            int32_t bh = GUI_FONT_H + 20;
+            int32_t bx = ((int32_t)w - bw) / 2;
+            int32_t by = ((int32_t)h - bh) / 2;
+            gui_surface_t scr = { back, w, h, p };
+            gui_rounded_rect_alpha(&scr, bx, by, bw, bh, 8, 0xD0202028);
+            gui_draw_text_centered(&scr, bx, by + 10, bw, title,
+                                   0xFFFFFFFF, 0);
+        }
+    }
+
     /* Draw cursor on top */
     int32_t cx, cy;
     input_get_cursor(&cx, &cy);
@@ -1079,6 +1100,7 @@ void compositor_thread(void)
                         if (dw_tab[focused_demo_idx].hidden)
                             focused_demo_idx = start;  /* all hidden, stay put */
                         gui_desktop_raise_window(focused_demo_idx);
+                        switcher_show_until = idt_get_ticks() + 100; /* 1s at 100Hz */
                         serial_puts("[COMP] Alt+Tab -> window ");
                         serial_putdec((uint64_t)focused_demo_idx);
                         serial_puts("\n");
