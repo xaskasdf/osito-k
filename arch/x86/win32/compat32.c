@@ -1263,10 +1263,6 @@ uint32_t compat32_callback_args(uint32_t func_addr, int nargs, const uint32_t *a
 
     int depth = callback_depth++;
 
-    /* Sync PE32 register save depth with callback depth */
-    extern uint32_t g_pe32_save_depth;
-    g_pe32_save_depth = (uint32_t)depth;
-
     callback_retval = 0;
 
     /* Save IST1 before callback — longjmp bypasses int2e_stub's restore */
@@ -2062,11 +2058,11 @@ uint64_t compat32_dispatch(uint32_t thunk_idx, uint32_t *stack_args)
         if (depth >= 0 && depth < MAX_CALLBACK_DEPTH)
             callback_retval_per_depth[depth] = callback_retval;
 
-        /* Reset PE32 register save depth — longjmp bypasses int2e_stub's
-         * depth-- in the restore path, so the depth counter drifts up.
-         * Sync it to callback_depth which tracks the correct nesting. */
+        /* Compensate: longjmp bypasses int2e_stub's depth-- in the restore
+         * path, so decrement g_pe32_save_depth here to prevent drift. */
         extern uint32_t g_pe32_save_depth;
-        g_pe32_save_depth = (uint32_t)depth;
+        if (g_pe32_save_depth > 0)
+            g_pe32_save_depth--;
 
         kern_longjmp(callback_jmpbufs[depth], 1);
         /* never reached */
