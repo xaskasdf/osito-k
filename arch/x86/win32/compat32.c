@@ -1097,14 +1097,9 @@ void compat32_enter(uint32_t entry, uint32_t stack_top)
     serial_puthex(entry, 8);
     serial_puts("\n");
 
-    /* Switch to Win32 page table (VirtualAlloc VAs only visible here) */
-    {
-        extern uint64_t paging_get_win32_cr3(void);
-        uint64_t w32cr3 = paging_get_win32_cr3();
-        if (w32cr3) {
-            __asm__ volatile ("mov %0, %%cr3" : : "r"(w32cr3) : "memory");
-        }
-    }
+    /* Win32 now runs under kernel CR3 with shared page tables.
+     * VirtualAlloc maps via paging_map_page (kernel PTs) which is
+     * visible to all processes. No CR3 switch needed. */
 
     /* Set data segments to 32-bit data selector, then RETF to compat mode.
      * Hardcode 0x48 (GDT_SEL_DATA32) because GAS doesn't like C macros

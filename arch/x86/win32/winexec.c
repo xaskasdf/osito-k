@@ -362,7 +362,11 @@ int winexec_run(const uint8_t *file_data, uint64_t file_size)
                              char name[64]; int32_t exit_code; /* ... */ } proc_hdr_t;
             /* cr3 is at a known offset in process_t — use the accessor pattern */
             extern void proc_set_cr3(uint64_t cr3);
-            proc_set_cr3(w32cr3);
+            /* TEMPORARILY DISABLED: proc_set_cr3 causes PE32 to run under
+             * Win32 CR3 where many identity-mapped buffers aren't visible.
+             * Until the shared PDPT fix is verified, keep PE32 under kernel CR3. */
+            /* proc_set_cr3(w32cr3); */
+            (void)w32cr3;
         }
     }
 
@@ -747,15 +751,17 @@ int winexec_run(const uint8_t *file_data, uint64_t file_size)
         serial_puthex(*ue_iat, 8);
         serial_puts("\n");
 
-        /* Patch INT3 at EXE+0xBC72 (right after ConstructObject returns).
-         * EAX has the new UGameEngine pointer. #BP handler will dump it. */
-        uint8_t *bp_addr = (uint8_t *)((uintptr_t)info.ImageBase + 0xBC72);
-        serial_puts("[DIAG] Patching INT3 at 0x");
-        serial_puthex((uint64_t)(uintptr_t)bp_addr, 8);
-        serial_puts(" (was 0x");
-        serial_puthex(bp_addr[0], 2);
-        serial_puts(")\n");
-        bp_addr[0] = 0xCC;  /* INT3 */
+        /* Patch INT3 at EXE+0xBC72 (after ConstructObject) and at
+         * EXE+0xBC81 (load GEngine into ECX before Init call). */
+        uint8_t *bp1 = (uint8_t *)((uintptr_t)info.ImageBase + 0xBC72);
+        uint8_t *bp2 = (uint8_t *)((uintptr_t)info.ImageBase + 0xBC81);
+        serial_puts("[DIAG] INT3 at 0x");
+        serial_puthex((uint64_t)(uintptr_t)bp1, 8);
+        serial_puts(" + 0x");
+        serial_puthex((uint64_t)(uintptr_t)bp2, 8);
+        serial_puts("\n");
+        bp1[0] = 0xCC;
+        bp2[0] = 0xCC;
     }
 
     /*

@@ -661,44 +661,12 @@ uint64_t paging_create_win32_cr3(void)
     return win32_cr3_val;
 }
 
-/* Map a 4KB page in the Win32 address space (for VirtualAlloc) */
+/* Map a 4KB page in the Win32 address space (for VirtualAlloc).
+ * Now that Win32 runs under kernel CR3, this delegates directly
+ * to the kernel page mapper. */
 int paging_win32_map_page(uint64_t virt, uint64_t phys, uint64_t flags)
 {
-    if (!win32_pml4) return -1;
-
-    /* Only handle PDPT[1] range (0x40000000-0x7FFFFFFF) where Win32
-     * has its own PD (win32_pd1). VAs outside this range use the
-     * shared kernel PD via PDPT[0]/[2]/[3] — already mapped by
-     * paging_map_page(). */
-    if (virt < 0x40000000ULL || virt >= 0x80000000ULL)
-        return 0;  /* mapped via shared kernel PD */
-
-    int pd_idx = PD_INDEX(virt);
-
-    /* If PD entry is a 2MB large page, split it */
-    if ((win32_pd1[pd_idx] & PTE_PRESENT) && (win32_pd1[pd_idx] & PTE_LARGE)) {
-        uint64_t large_phys = win32_pd1[pd_idx] & 0x000FFFFFFFE00000ULL;
-        uint64_t large_flags = win32_pd1[pd_idx] & ~(PTE_ADDR_MASK | PTE_LARGE);
-        uint64_t *pt = pt_alloc_page();
-        if (!pt) return -1;
-        for (int i = 0; i < 512; i++)
-            pt[i] = (large_phys + i * PAGE_SIZE) | large_flags;
-        win32_pd1[pd_idx] = (uint64_t)pt | PTE_PRESENT | PTE_WRITABLE;
-    }
-
-    /* Get or create PT */
-    uint64_t *pt;
-    if (win32_pd1[pd_idx] & PTE_PRESENT) {
-        pt = (uint64_t *)(win32_pd1[pd_idx] & PTE_ADDR_MASK);
-    } else {
-        pt = pt_alloc_page();
-        if (!pt) return -1;
-        win32_pd1[pd_idx] = (uint64_t)pt | PTE_PRESENT | PTE_WRITABLE;
-    }
-
-    pt[PT_INDEX(virt)] = (phys & PTE_ADDR_MASK) | flags;
-    invlpg(virt);
-    return 0;
+    return paging_map_page(virt, phys, flags);
 }
 
 uint64_t paging_get_win32_cr3(void) { return win32_cr3_val; }
