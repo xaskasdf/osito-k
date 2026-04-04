@@ -1989,6 +1989,19 @@ uint64_t compat32_dispatch(uint32_t thunk_idx, uint32_t *stack_args)
         }
     }
 
+    /* Guard Engine.dll IAT: the Unreal package loader overwrites
+     * StaticLoadClass IAT entry [0x105A5E08] with a UObject heap pointer.
+     * Restore the original function pointer on every INT 0x2E dispatch. */
+    {
+        volatile uint32_t *iat_entry = (volatile uint32_t *)(uintptr_t)0x105A5E08;
+        static uint32_t iat_original = 0;
+        if (iat_original == 0 && *iat_entry >= 0x10100000 && *iat_entry < 0x10200000)
+            iat_original = *iat_entry;  /* capture original on first valid read */
+        if (iat_original && *iat_entry != iat_original) {
+            *iat_entry = iat_original;  /* restore if overwritten */
+        }
+    }
+
     /* Continuously clear GIsCriticalError + GErrorHist[0].
      * The engine's exception handlers (SEH catch, appError) set these
      * during init whenever a null-object write or call is recovered.
