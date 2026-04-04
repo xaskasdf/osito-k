@@ -158,6 +158,9 @@ typedef struct dos_vm {
 
     /* DPMI host state */
     dpmi_state_t     dpmi;
+
+    /* JIT/DBT state (NULL if not initialized) */
+    void            *jit;           /* jit_state_t* — forward ref avoids circular include */
 } dos_vm_t;
 
 /* ── CGA color palette ──────────────────────────────────────────── */

@@ -8,6 +8,7 @@
  */
 
 #include "cpu8086.h"
+#include "dos_jit.h"
 
 /* ── External interfaces ─────────────────────────────────────────── */
 
@@ -953,7 +954,40 @@ int cpu8086_run(dos_vm_t *vm)
     uint8_t modrm_byte;
     modrm_t m;
 
+    /* JIT engine (optional — NULL if not initialized) */
+    jit_state_t *jit = (jit_state_t *)vm->jit;
+
     while (cpu->running && !cpu->halted) {
+
+        /* ── Hybrid dispatcher: JIT cache → compile if hot → interpret ── */
+        if (jit && !cpu->protected_mode) {
+            /* Check hit counter for current IP */
+            uint16_t ip = cpu->ip;
+            jit->hit_count[ip]++;
+
+            if (jit->hit_count[ip] >= JIT_HOT_THRESHOLD) {
+                /* Hot path — look up or compile block */
+                jit_block_t *block = jit_get_block(jit, cpu->cs, ip);
+                if (block) {
+                    if (!block->compiled) {
+                        /* First time: decode + compile */
+                        jit_decode_block(vm, block);
+                        if (block->ir_count > 0) {
+                            jit_compile_block(jit, block);
+                        }
+                    }
+                    if (block->compiled) {
+                        /* Execute native code */
+                        jit_exec_block(vm, block);
+                        jit->jit_executed++;
+                        continue;  /* CS:IP updated by JIT, loop back */
+                    }
+                }
+            }
+            jit->interpreted++;
+        }
+
+        /* ── Interpreter: fetch-decode-execute ── */
 
         /* Reset prefix state */
         cpu->seg_override = -1;

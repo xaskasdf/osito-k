@@ -176,6 +176,22 @@ int dos_run(const char *filename, int argc, const char **argv)
     dos_mem_init(&vm);
     extern void dpmi_init(dos_vm_t *vm);
     dpmi_init(&vm);
+
+    /* Initialize JIT/DBT engine */
+    {
+        #include "dos_jit.h"
+        /* jit_state_t is large (~200KB+), allocate via pages */
+        uint64_t jit_pages = (sizeof(jit_state_t) + 4095) / 4096;
+        jit_state_t *jit = (jit_state_t *)mem_alloc_pages(jit_pages);
+        if (jit) {
+            uint8_t *p = (uint8_t *)jit;
+            for (uint64_t i = 0; i < jit_pages * 4096; i++) p[i] = 0;
+            jit_init(jit);
+            vm.jit = jit;
+            serial_puts("[DOS] JIT engine initialized\n");
+        }
+    }
+
     cpu8086_init(&cpu, &vm);
 
     /* Set defaults */
