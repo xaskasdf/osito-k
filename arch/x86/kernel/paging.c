@@ -635,20 +635,17 @@ uint64_t paging_create_win32_cr3(void)
     for (int i = 0; i < 512; i++)
         win32_pdpt[i] = kernel_pdpt[i];
 
-    /* 4. Allocate new PD for PDPT[1] (0x40000000-0x7FFFFFFF) */
-    win32_pd1 = pt_alloc_page();
-    if (!win32_pd1) return 0;
+    /* 4. PDPT[1] (0x40000000-0x7FFFFFFF): share kernel's PD by reference.
+     * This ensures identity-mapped buffers (stack, thunk pool, PE image)
+     * allocated with mem_alloc_pages() are visible under both CR3s.
+     * VirtualAlloc creates private PTs under this shared PD via
+     * paging_win32_map_page(), which splits 2MB pages as needed. */
+    win32_pd1 = (kernel_pdpt[1] & PTE_PRESENT)
+              ? (uint64_t *)(kernel_pdpt[1] & PTE_ADDR_MASK)
+              : NULL;
+    /* PDPT[1] already points to kernel's PD via the copy at line 636 */
 
-    /* Copy kernel's PD for this range (identity-map entries) */
-    if (kernel_pdpt[1] & PTE_PRESENT) {
-        uint64_t *kernel_pd1 = (uint64_t *)(kernel_pdpt[1] & PTE_ADDR_MASK);
-        memcpy(win32_pd1, kernel_pd1, PAGE_SIZE);
-    }
-
-    /* 5. Wire up: Win32 PDPT[1] → our own PD */
-    win32_pdpt[1] = (uint64_t)win32_pd1 | PTE_PRESENT | PTE_WRITABLE;
-
-    /* 6. Wire up: Win32 PML4[0] → our PDPT */
+    /* 5. Wire up: Win32 PML4[0] → our PDPT (all PDs shared by reference) */
     win32_pml4[0] = (uint64_t)win32_pdpt | PTE_PRESENT | PTE_WRITABLE;
 
     win32_cr3_val = (uint64_t)win32_pml4;
