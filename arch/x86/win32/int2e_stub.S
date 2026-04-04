@@ -63,14 +63,26 @@ int2e_stub:
     movq 144(%rsp), %rsi
     addq $4, %rsi
 
-    /* Save RSP to a global before aligning and calling C dispatcher.
-     * Cannot use RBP — kern_longjmp (inside callbacks) overwrites RBP
-     * with the callback_args frame pointer, corrupting our saved RSP.
-     * Use a global variable instead (safe: INT 0x2E is serialized). */
-    movq %rsp, g_int2e_saved_rsp(%rip)
+    /* Save RSP to per-depth stack before aligning and calling C dispatcher.
+     * Cannot use RBP (kern_longjmp overwrites it) or a single global
+     * (nested INT 0x2E from callback returns overwrites it). */
+    leaq g_int2e_rsp_stack(%rip), %r10
+    leaq g_int2e_rsp_depth(%rip), %r12
+    movl (%r12), %r13d
+    movq %rsp, (%r10,%r13,8)        /* save RSP at stack[depth] */
+    leal 1(%r13d), %r14d
+    movl %r14d, (%r12)               /* depth++ */
+
     and $~0xF, %rsp
     call compat32_dispatch
-    movq g_int2e_saved_rsp(%rip), %rsp
+
+    /* Restore RSP from per-depth stack */
+    leaq g_int2e_rsp_stack(%rip), %r10
+    leaq g_int2e_rsp_depth(%rip), %r12
+    movl (%r12), %r13d
+    subl $1, %r13d                    /* depth-- */
+    movl %r13d, (%r12)
+    movq (%r10,%r13,8), %rsp         /* restore RSP from stack[depth] */
 
     /*
      * C++ EH catch dispatch: if compat32_seh_dispatch found a catch
@@ -123,5 +135,7 @@ int2e_stub:
 
 .section .bss
 .align 8
-g_int2e_saved_rsp:
-    .quad 0
+g_int2e_rsp_stack:
+    .fill 32, 8, 0              /* 32 depth levels × 8 bytes */
+g_int2e_rsp_depth:
+    .long 0

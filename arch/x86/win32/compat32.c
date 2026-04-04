@@ -2072,6 +2072,15 @@ uint64_t compat32_dispatch(uint32_t thunk_idx, uint32_t *stack_args)
         if (depth >= 0 && depth < MAX_CALLBACK_DEPTH)
             callback_retval_per_depth[depth] = callback_retval;
 
+        /* Compensate: longjmp bypasses int2e_stub's depth-- for RSP stack.
+         * The callback-return INT 0x2E incremented g_int2e_rsp_depth but
+         * its restore path is skipped by longjmp. Decrement here. */
+        {
+            extern uint32_t g_int2e_rsp_depth;
+            if (g_int2e_rsp_depth > 0)
+                g_int2e_rsp_depth--;
+        }
+
         kern_longjmp(callback_jmpbufs[depth], 1);
         /* never reached */
         return 0;
