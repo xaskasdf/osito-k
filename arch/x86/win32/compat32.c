@@ -1121,7 +1121,7 @@ void compat32_enter(uint32_t entry, uint32_t stack_top)
         : [cs] "r"(cs64),
           [ip] "r"(ip64),
           [sp] "r"(sp64)
-        : "memory", "cc", "rax", "rbx", "r12", "r13", "r14", "r15"
+        : "memory", "cc", "rax"
     );
 #else
     /*
@@ -1300,7 +1300,7 @@ uint32_t compat32_callback_args(uint32_t func_addr, int nargs, const uint32_t *a
             "mov %%ax, %%es\n"
             "mov %%ax, %%ss\n"
             "mov %[sp], %%rsp\n"
-            "sti\n"                 /* Re-enable interrupts (INT 0x2E gate clears IF) */
+            "sti\n"
             "push %[cs]\n"
             "push %[ip]\n"
             "lretq\n"
@@ -1308,7 +1308,7 @@ uint32_t compat32_callback_args(uint32_t func_addr, int nargs, const uint32_t *a
             : [cs] "r"(cs64),
               [ip] "r"(ip64),
               [sp] "r"(sp64)
-            : "memory", "cc", "rax", "rbx", "r12", "r13", "r14", "r15"
+            : "memory", "cc", "rax"
         );
         /* never reached */
     }
