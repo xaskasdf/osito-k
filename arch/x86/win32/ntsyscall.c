@@ -25,6 +25,10 @@
 extern void serial_puts(const char *s);
 extern void serial_puthex(uint64_t val, int digits);
 
+/* Heap */
+extern void *kmalloc(uint64_t size);
+extern void  kfree(void *ptr);
+
 /* Framebuffer console */
 extern void fb_puts(const char *s);
 extern void fb_putc(char c, uint32_t color);
@@ -587,6 +591,14 @@ NTSTATUS sys_NtClose(ULONG_PTR *args)
         return STATUS_SUCCESS;
     }
 
+    /* Free section backing memory before closing handle */
+    HANDLE_ENTRY *entry = handle_get_entry(&g_handle_table, Handle);
+    if (entry && entry->type == OBJ_TYPE_SECTION && entry->object) {
+        /* backing is first pointer field after uint64_t size */
+        void **backing_ptr = (void **)((char *)entry->object + sizeof(uint64_t));
+        if (*backing_ptr) { kfree(*backing_ptr); *backing_ptr = NULL; }
+    }
+
     return handle_close(&g_handle_table, Handle);
 }
 
@@ -1044,19 +1056,31 @@ NTSTATUS sys_NtQueryPerformanceCounter(ULONG_PTR *args)
 
 typedef struct _SECTION_OBJECT {
     uint64_t    size;           /* section size in bytes */
-    void       *backing;        /* kmalloc'd memory backing */
+    void       *backing;        /* kmalloc'd memory backing (NULL = free slot) */
     uint32_t    flags;          /* SEC_COMMIT, SEC_IMAGE, SEC_RESERVE */
     uint32_t    protect;        /* PAGE_READWRITE, PAGE_READONLY, etc. */
     void       *file;           /* osfs2_file_t* if file-backed, NULL if pagefile */
 } SECTION_OBJECT;
 
-/* Pool of section objects (static — no dynamic allocator needed) */
 #define SECTION_POOL_MAX 64
 static SECTION_OBJECT section_pool[SECTION_POOL_MAX];
-static int section_pool_next = 0;
 
-extern void *kmalloc(uint64_t size);
-extern void  kfree(void *ptr);
+static SECTION_OBJECT *section_alloc(void)
+{
+    for (int i = 0; i < SECTION_POOL_MAX; i++)
+        if (!section_pool[i].backing)
+            return &section_pool[i];
+    return NULL;
+}
+
+void section_free(SECTION_OBJECT *sec)
+{
+    if (sec && sec->backing) {
+        kfree(sec->backing);
+        sec->backing = NULL;
+        sec->size = 0;
+    }
+}
 
 NTSTATUS sys_NtCreateSection(ULONG_PTR *args)
 {
@@ -1122,25 +1146,24 @@ NTSTATUS sys_NtCreateSection(ULONG_PTR *args)
     }
 
     /* Allocate a section object from pool */
-    if (section_pool_next >= SECTION_POOL_MAX) {
+    SECTION_OBJECT *sec = section_alloc();
+    if (!sec) {
         kfree(mem);
         nt_log("NtCreateSection: section pool exhausted");
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
-    SECTION_OBJECT *sec = &section_pool[section_pool_next++];
     sec->size    = size;
     sec->backing = mem;
     sec->flags   = AllocationAttributes;
     sec->protect = SectionPageProtection;
-    sec->file    = FileHandle ? (void *)1 : NULL; /* non-NULL = file-backed */
+    sec->file    = FileHandle ? (void *)1 : NULL;
 
     /* Allocate handle */
     NTSTATUS status = handle_alloc(&g_handle_table, OBJ_TYPE_SECTION,
                                    DesiredAccess, sec, SectionHandle);
     if (!NT_SUCCESS(status)) {
-        kfree(mem);
-        section_pool_next--;
+        section_free(sec);
         return status;
     }
 
