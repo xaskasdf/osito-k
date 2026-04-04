@@ -1262,12 +1262,40 @@ int cpu8086_run(dos_vm_t *vm)
                 }
                 case 2: { /* LGDT: load GDTR from m */
                     cpu->gdtr.limit = dos_mem_read16(vm, g7m.addr);
-                    cpu->gdtr.base  = dos_mem_read32(vm, g7m.addr + 2);
+                    if (op32) {
+                        cpu->gdtr.base = dos_mem_read32(vm, g7m.addr + 2);
+                    } else {
+                        /* 16-bit: 24-bit base (3 bytes), high byte forced to 0 */
+                        cpu->gdtr.base = dos_mem_read16(vm, g7m.addr + 2) |
+                                         ((uint32_t)dos_mem_read8(vm, g7m.addr + 4) << 16);
+                    }
+                    serial_puts("[CPU] LGDT base=");
+                    serial_puthex(cpu->gdtr.base, 8);
+                    serial_puts(" limit=");
+                    serial_puthex(cpu->gdtr.limit, 4);
+                    serial_puts("\n");
                     break;
                 }
                 case 3: { /* LIDT: load IDTR from m */
                     cpu->idtr.limit = dos_mem_read16(vm, g7m.addr);
-                    cpu->idtr.base  = dos_mem_read32(vm, g7m.addr + 2);
+                    if (op32) {
+                        cpu->idtr.base = dos_mem_read32(vm, g7m.addr + 2);
+                    } else {
+                        cpu->idtr.base = dos_mem_read16(vm, g7m.addr + 2) |
+                                         ((uint32_t)dos_mem_read8(vm, g7m.addr + 4) << 16);
+                    }
+                    serial_puts("[CPU] LIDT base=");
+                    serial_puthex(cpu->idtr.base, 8);
+                    serial_puts(" limit=");
+                    serial_puthex(cpu->idtr.limit, 4);
+                    serial_puts(op32 ? " [32]\n" : " [16]\n");
+                    serial_puts("  PM=");
+                    serial_putdec(cpu->protected_mode);
+                    serial_puts(" op_size_32=");
+                    serial_putdec(cpu->op_size_32);
+                    serial_puts(" #");
+                    serial_putdec(cpu->insn_count);
+                    serial_puts("\n");
                     break;
                 }
                 case 4: { /* SMSW: store machine status word */
@@ -1319,7 +1347,12 @@ int cpu8086_run(dos_vm_t *vm)
                         cpu->protected_mode = true;
                     break;
                 case 2: cpu->cr2 = cr_val; break;
-                case 3: cpu->cr3 = cr_val; break;
+                case 3:
+                    cpu->cr3 = cr_val;
+                    serial_puts("[CPU] MOV CR3, ");
+                    serial_puthex(cr_val, 8);
+                    serial_puts("\n");
+                    break;
                 }
                 break;
             }
@@ -2657,8 +2690,9 @@ int cpu8086_run(dos_vm_t *vm)
          * ════════════════════════════════════════════════════════════ */
         case 0xCD: { /* INT imm8 */
             uint8_t int_num = cpu_fetch8(cpu);
-            /* Log ALL INTs for debugging */
-            if (cpu->insn_count < 2000000) {
+            /* Log non-common INTs */
+            if (int_num != 0x21 && int_num != 0x10 && int_num != 0x16 &&
+                int_num != 0x08) {
                 serial_puts("[INT] ");
                 serial_puthex(int_num, 2);
                 serial_puts(" AH=");
@@ -3469,8 +3503,10 @@ int cpu8086_run(dos_vm_t *vm)
                 vm->bios_ticks++;
                 /* Update BIOS Data Area timer counter at 0040:006C (linear 0x46C) */
                 dos_mem_write32(vm, 0x46C, vm->bios_ticks);
-                /* Try to deliver INT 8 to the guest */
-                cpu_deliver_hw_interrupt(vm, 8);
+                /* Don't inject INT 8 — DOS4GW's IDT at base 0 has no valid
+                 * gate descriptors (just repeated 0x1308 pattern).
+                 * Instead, only update BDA tick counter. DOS4GW polls the
+                 * PIT port (0x40) and BDA tick count for timing. */
             }
         }
 

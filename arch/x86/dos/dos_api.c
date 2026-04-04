@@ -79,17 +79,6 @@ void dos_int21_dispatch(dos_vm_t *vm)
     cpu8086_state_t *cpu = vm->cpu;
     uint8_t ah = cpu->ah;
 
-    /* Log INT 21h calls with full AX for debugging */
-    if (cpu->insn_count < 2000000) {
-        serial_puts("[DOS21] AH=");
-        serial_puthex(ah, 2);
-        serial_puts(" AL=");
-        serial_puthex(cpu->al, 2);
-        serial_puts(" BX=");
-        serial_puthex(cpu->bx, 4);
-        serial_puts("\n");
-    }
-
     switch (ah) {
 
     /* ── AH=00h: Terminate ──────────────────────────────────────── */
@@ -476,6 +465,15 @@ void dos_int21_dispatch(dos_vm_t *vm)
 
     /* ── AH=4Ch: Exit with return code ──────────────────────────── */
     case 0x4C:
+        serial_puts("[DOS] Exit(");
+        serial_puthex(cpu->al, 2);
+        serial_puts(") at #");
+        serial_putdec(cpu->insn_count);
+        serial_puts(" CS:EIP=");
+        serial_puthex(cpu->cs, 4);
+        serial_puts(":");
+        serial_puthex(cpu->eip, 8);
+        serial_puts(cpu->protected_mode ? " [PM]\n" : " [RM]\n");
         cpu->running = false;
         cpu->exit_code = cpu->al;
         break;

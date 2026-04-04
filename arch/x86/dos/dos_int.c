@@ -114,15 +114,30 @@ void cpu_deliver_hw_interrupt(dos_vm_t *vm, uint8_t int_num)
             cpu->flags &= ~(FLAG_IF | FLAG_TF);
             return;
         }
-        /* Fallback: read guest IDT if base is within our memory */
-        if (cpu->idtr.base && cpu->idtr.base < vm->total_mem_size) {
-            uint32_t entry = cpu->idtr.base + (uint32_t)int_num * 8;
+        /* Read guest IDT via page walker (IDT may be at high virtual address) */
+        if (cpu->idtr.base) {
+            uint32_t idt_linear = cpu->idtr.base + (uint32_t)int_num * 8;
+            uint32_t entry = dpmi_translate(vm, 0, idt_linear);
             if (entry + 7 < vm->total_mem_size) {
                 uint16_t off_lo = dos_mem_read16(vm, entry);
                 uint16_t sel    = dos_mem_read16(vm, entry + 2);
                 uint16_t off_hi = dos_mem_read16(vm, entry + 6);
                 uint32_t handler = ((uint32_t)off_hi << 16) | off_lo;
-                if (sel != 0) {
+                if (sel != 0 && handler != 0) {
+                    /* Log first few timer deliveries */
+                    static int timer_log = 0;
+                    if (timer_log < 5) {
+                        serial_puts("[TIMER] INT ");
+                        serial_puthex(int_num, 2);
+                        serial_puts(" -> ");
+                        serial_puthex(sel, 4);
+                        serial_puts(":");
+                        serial_puthex(handler, 8);
+                        serial_puts(" IDTphys=");
+                        serial_puthex(entry, 8);
+                        serial_puts("\n");
+                        timer_log++;
+                    }
                     cpu_push32(cpu, cpu->eflags);
                     cpu_push32(cpu, (uint32_t)cpu->cs);
                     cpu_push32(cpu, cpu->eip);
