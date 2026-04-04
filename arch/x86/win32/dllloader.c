@@ -337,34 +337,36 @@ PVOID dll_load(const char *dll_name, const BYTE *file_data, SIZE_T file_size)
         NTSTATUS compat_st = compat32_patch_iat(&mod->image);
         serial_puts("[DLL] IAT done\n");
 
-        /* Protect IAT pages as read-only after patching.
-         * The Unreal package loader overwrites IAT entries during Init()
-         * which corrupts function pointers (e.g. StaticLoadClass).
-         * Making .idata read-only causes #PF on write which the
-         * page fault handler skips silently (advance RIP past write). */
+        /* Protect entire .idata section as read-only after patching.
+         * DataDirectory[1] only covers the Import Directory descriptors
+         * (small), but the IAT entries span the whole .idata section.
+         * Find the ".idata" section header and protect all its pages. */
         {
             uint8_t *base = (uint8_t *)mod->image.ImageBase;
             PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)base;
             PIMAGE_NT_HEADERS32 nt = (PIMAGE_NT_HEADERS32)(base + dos->e_lfanew);
-            if (nt->OptionalHeader.NumberOfRvaAndSizes > 1) {
-                uint32_t iat_rva  = nt->OptionalHeader.DataDirectory[1].VirtualAddress;
-                uint32_t iat_size = nt->OptionalHeader.DataDirectory[1].Size;
-                if (iat_rva && iat_size) {
-                    extern int paging_set_flags(uint64_t virt, uint64_t flags);
-                    uint64_t iat_start = (uint64_t)base + iat_rva;
-                    uint64_t iat_end   = iat_start + iat_size;
-                    /* Round to page boundaries */
-                    iat_start &= ~0xFFFULL;
-                    iat_end = (iat_end + 0xFFF) & ~0xFFFULL;
-                    for (uint64_t pg = iat_start; pg < iat_end; pg += 4096) {
-                        /* PTE_PRESENT | PTE_GLOBAL = read-only (no PTE_WRITABLE) */
-                        paging_set_flags(pg, 0x101);
-                    }
-                    serial_puts("[DLL] IAT protected: 0x");
-                    serial_puthex(iat_start, 8);
+            PIMAGE_SECTION_HEADER sec = (PIMAGE_SECTION_HEADER)(
+                (uint8_t *)&nt->OptionalHeader + nt->FileHeader.SizeOfOptionalHeader);
+            extern int paging_set_flags(uint64_t virt, uint64_t flags);
+            for (int si = 0; si < nt->FileHeader.NumberOfSections; si++) {
+                if (sec[si].Name[0] == '.' && sec[si].Name[1] == 'i' &&
+                    sec[si].Name[2] == 'd' && sec[si].Name[3] == 'a' &&
+                    sec[si].Name[4] == 't' && sec[si].Name[5] == 'a') {
+                    uint64_t idata_start = (uint64_t)base + sec[si].VirtualAddress;
+                    uint64_t idata_size  = sec[si].Misc.VirtualSize;
+                    if (!idata_size) idata_size = sec[si].SizeOfRawData;
+                    uint64_t pg_start = idata_start & ~0xFFFULL;
+                    uint64_t pg_end   = (idata_start + idata_size + 0xFFF) & ~0xFFFULL;
+                    for (uint64_t pg = pg_start; pg < pg_end; pg += 4096)
+                        paging_set_flags(pg, 0x101); /* read-only */
+                    serial_puts("[DLL] .idata protected: 0x");
+                    serial_puthex(pg_start, 8);
                     serial_puts("-0x");
-                    serial_puthex(iat_end, 8);
-                    serial_puts(" (read-only)\n");
+                    serial_puthex(pg_end, 8);
+                    serial_puts(" (");
+                    serial_puthex((pg_end - pg_start) / 4096, 1);
+                    serial_puts(" pages)\n");
+                    break;
                 }
             }
         }
