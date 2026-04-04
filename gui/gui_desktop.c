@@ -193,15 +193,42 @@ static void render_window_content(gui_surface_t *screen, int idx)
 
 /* ── Render complete desktop ───────────────────────────────── */
 
+/* Cached gradient background — rendered once, memcpy'd each frame.
+ * Much cheaper than recomputing per-pixel interpolation 60x/sec. */
+static uint32_t *bg_cache;
+static uint32_t  bg_cache_w, bg_cache_h;
+
+static void bg_cache_ensure(gui_surface_t *screen)
+{
+    uint32_t sw = screen->width, sh = screen->height;
+    if (bg_cache && bg_cache_w == sw && bg_cache_h == sh) return;
+
+    extern void *kmalloc(uint64_t size);
+    extern void  kfree(void *ptr);
+    if (bg_cache) kfree(bg_cache);
+    bg_cache = (uint32_t *)kmalloc((uint64_t)sw * sh * 4);
+    if (!bg_cache) return;
+    bg_cache_w = sw;
+    bg_cache_h = sh;
+
+    gui_surface_t tmp = { bg_cache, sw, sh, sw };
+    gui_gradient_v(&tmp, 0, 0, (int32_t)sw, (int32_t)sh,
+                   GUI_BG_DARK, GUI_BG_LIGHT);
+}
+
 void gui_desktop_render(gui_surface_t *screen)
 {
     /* Use live screen dimensions (survives modeset) instead of cached scr_w/scr_h */
     uint32_t sw = screen->width;
     uint32_t sh = screen->height;
 
-    /* 1. Gradient background */
-    gui_gradient_v(screen, 0, 0, (int32_t)sw, (int32_t)sh,
-                   GUI_BG_DARK, GUI_BG_LIGHT);
+    /* 1. Gradient background (cached — render once, memcpy each frame) */
+    bg_cache_ensure(screen);
+    if (bg_cache)
+        memcpy(screen->pixels, bg_cache, (uint64_t)sw * sh * 4);
+    else
+        gui_gradient_v(screen, 0, 0, (int32_t)sw, (int32_t)sh,
+                       GUI_BG_DARK, GUI_BG_LIGHT);
 
     /* 2. Top panel */
     gui_panel_render(screen, sw);
