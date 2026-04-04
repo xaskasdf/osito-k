@@ -11,6 +11,14 @@
 /* Winsock error */
 #define WSANOTINITIALISED   10093
 #define WSAENETDOWN         10050
+#define WSAEFAULT           10014
+#define WSAEMFILE           10024
+#define WSAENOTSOCK         10038
+#define WSAENOTCONN         10057
+#define WSAECONNREFUSED     10061
+#define WSAECONNRESET       10054
+#define WSAEWOULDBLOCK      10035
+#define WSAETIMEDOUT        10060
 #define SOCKET_ERROR        (-1)
 #define INVALID_SOCKET      (~(ULONG_PTR)0)
 

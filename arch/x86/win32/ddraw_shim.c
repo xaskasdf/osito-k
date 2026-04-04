@@ -100,6 +100,213 @@ typedef struct IDirectDrawSurface7 IDirectDrawSurface7;
 
 #define MAX_SURFACES 8
 
+/* ── IDirectDrawPalette ────────────────────────────────────── */
+
+typedef struct DDPalette {
+    uint32_t entries[256];   /* RGBQUAD: 0x00RRGGBB per entry */
+} DDPalette;
+
+static DDPalette g_ddpalette;  /* single shared palette instance */
+
+/* IDirectDrawPalette COM vtable (7 methods) */
+struct IDirectDrawPalette7;
+struct IDirectDrawPalette7Vtbl;
+
+struct IDirectDrawPalette7 {
+    struct IDirectDrawPalette7Vtbl *lpVtbl;
+    DDPalette *pal;
+};
+
+struct IDirectDrawPalette7Vtbl {
+    /* 0: QueryInterface */
+    HRESULT (WINAPI *QueryInterface)(struct IDirectDrawPalette7 *, REFIID, PVOID *);
+    /* 1: AddRef */
+    ULONG   (WINAPI *AddRef)(struct IDirectDrawPalette7 *);
+    /* 2: Release */
+    ULONG   (WINAPI *Release)(struct IDirectDrawPalette7 *);
+    /* 3: GetCaps */
+    HRESULT (WINAPI *GetCaps)(struct IDirectDrawPalette7 *, DWORD *);
+    /* 4: GetEntries */
+    HRESULT (WINAPI *GetEntries)(struct IDirectDrawPalette7 *, DWORD, DWORD, DWORD, PVOID);
+    /* 5: Initialize */
+    HRESULT (WINAPI *Initialize)(struct IDirectDrawPalette7 *, PVOID, DWORD, PVOID);
+    /* 6: SetEntries */
+    HRESULT (WINAPI *SetEntries)(struct IDirectDrawPalette7 *, DWORD, DWORD, DWORD, PVOID);
+};
+
+static HRESULT WINAPI pal_QueryInterface(struct IDirectDrawPalette7 *self, REFIID iid, PVOID *ppv)
+{
+    (void)iid;
+    if (!ppv) return E_INVALIDARG;
+    *ppv = self;
+    return S_OK;
+}
+static ULONG WINAPI pal_AddRef(struct IDirectDrawPalette7 *self) { (void)self; return 2; }
+static ULONG WINAPI pal_Release(struct IDirectDrawPalette7 *self) { (void)self; return 1; }
+static HRESULT WINAPI pal_GetCaps(struct IDirectDrawPalette7 *self, DWORD *caps)
+{
+    (void)self;
+    if (caps) *caps = 0x04; /* DDPCAPS_8BIT */
+    return S_OK;
+}
+
+static HRESULT WINAPI pal_GetEntries(struct IDirectDrawPalette7 *self,
+                                      DWORD dwFlags, DWORD dwBase,
+                                      DWORD dwNumEntries, PVOID lpEntries)
+{
+    (void)dwFlags;
+    if (!self || !self->pal || !lpEntries) return DDERR_INVALIDPARAMS;
+    if (dwBase + dwNumEntries > 256) dwNumEntries = 256 - dwBase;
+
+    /* PALETTEENTRY is { BYTE peRed, peGreen, peBlue, peFlags } = 4 bytes */
+    BYTE *out = (BYTE *)lpEntries;
+    for (DWORD i = 0; i < dwNumEntries; i++) {
+        uint32_t c = self->pal->entries[dwBase + i];
+        out[i * 4 + 0] = (BYTE)((c >> 16) & 0xFF); /* peRed */
+        out[i * 4 + 1] = (BYTE)((c >> 8)  & 0xFF); /* peGreen */
+        out[i * 4 + 2] = (BYTE)(c & 0xFF);          /* peBlue */
+        out[i * 4 + 3] = 0;                          /* peFlags */
+    }
+    return S_OK;
+}
+
+static HRESULT WINAPI pal_Initialize(struct IDirectDrawPalette7 *self,
+                                      PVOID dd, DWORD flags, PVOID entries)
+{
+    (void)self; (void)dd; (void)flags; (void)entries;
+    return S_OK;
+}
+
+static HRESULT WINAPI pal_SetEntries(struct IDirectDrawPalette7 *self,
+                                      DWORD dwFlags, DWORD dwStartingEntry,
+                                      DWORD dwCount, PVOID lpEntries)
+{
+    (void)dwFlags;
+    if (!self || !self->pal || !lpEntries) return DDERR_INVALIDPARAMS;
+    if (dwStartingEntry + dwCount > 256) dwCount = 256 - dwStartingEntry;
+
+    /* PALETTEENTRY: { BYTE peRed, peGreen, peBlue, peFlags } */
+    const BYTE *in = (const BYTE *)lpEntries;
+    for (DWORD i = 0; i < dwCount; i++) {
+        BYTE r = in[i * 4 + 0];
+        BYTE g = in[i * 4 + 1];
+        BYTE b = in[i * 4 + 2];
+        self->pal->entries[dwStartingEntry + i] = ((uint32_t)r << 16) |
+                                                   ((uint32_t)g << 8) | b;
+    }
+    serial_puts("[DDRAW] Palette SetEntries: ");
+    serial_puthex(dwStartingEntry, 2); serial_puts("+");
+    serial_puthex(dwCount, 2); serial_puts("\n");
+    return S_OK;
+}
+
+static struct IDirectDrawPalette7Vtbl palette_vtbl = {
+    pal_QueryInterface, pal_AddRef, pal_Release,
+    pal_GetCaps, pal_GetEntries, pal_Initialize, pal_SetEntries
+};
+
+static struct IDirectDrawPalette7 g_ddpalette_obj = { &palette_vtbl, &g_ddpalette };
+
+/* ── IDirectDrawClipper ───────────────────────────────────── */
+
+typedef struct DDClipper {
+    HANDLE hwnd;
+    LONG   clip_left, clip_top, clip_right, clip_bottom;
+    int    has_clip;
+} DDClipper;
+
+static DDClipper g_ddclipper;
+
+struct IDirectDrawClipper7;
+struct IDirectDrawClipper7Vtbl;
+
+struct IDirectDrawClipper7 {
+    struct IDirectDrawClipper7Vtbl *lpVtbl;
+    DDClipper *clip;
+};
+
+struct IDirectDrawClipper7Vtbl {
+    /* 0: QueryInterface */
+    HRESULT (WINAPI *QueryInterface)(struct IDirectDrawClipper7 *, REFIID, PVOID *);
+    /* 1: AddRef */
+    ULONG   (WINAPI *AddRef)(struct IDirectDrawClipper7 *);
+    /* 2: Release */
+    ULONG   (WINAPI *Release)(struct IDirectDrawClipper7 *);
+    /* 3: GetClipList */
+    HRESULT (WINAPI *GetClipList)(struct IDirectDrawClipper7 *, PVOID, PVOID, DWORD *);
+    /* 4: GetHWnd */
+    HRESULT (WINAPI *GetHWnd)(struct IDirectDrawClipper7 *, HANDLE *);
+    /* 5: Initialize */
+    HRESULT (WINAPI *Initialize)(struct IDirectDrawClipper7 *, PVOID, DWORD);
+    /* 6: IsClipListChanged */
+    HRESULT (WINAPI *IsClipListChanged)(struct IDirectDrawClipper7 *, BOOL *);
+    /* 7: SetClipList */
+    HRESULT (WINAPI *SetClipList)(struct IDirectDrawClipper7 *, PVOID, DWORD);
+    /* 8: SetHWnd */
+    HRESULT (WINAPI *SetHWnd)(struct IDirectDrawClipper7 *, DWORD, HANDLE);
+};
+
+static HRESULT WINAPI clip_QueryInterface(struct IDirectDrawClipper7 *self, REFIID iid, PVOID *ppv)
+{
+    (void)iid;
+    if (!ppv) return E_INVALIDARG;
+    *ppv = self;
+    return S_OK;
+}
+static ULONG WINAPI clip_AddRef(struct IDirectDrawClipper7 *self) { (void)self; return 2; }
+static ULONG WINAPI clip_Release(struct IDirectDrawClipper7 *self) { (void)self; return 1; }
+static HRESULT WINAPI clip_GetClipList(struct IDirectDrawClipper7 *self, PVOID r, PVOID d, DWORD *s)
+{
+    (void)self; (void)r; (void)d; (void)s;
+    return S_OK;
+}
+static HRESULT WINAPI clip_GetHWnd(struct IDirectDrawClipper7 *self, HANDLE *hwnd)
+{
+    if (!self || !hwnd) return DDERR_INVALIDPARAMS;
+    *hwnd = self->clip ? self->clip->hwnd : NULL;
+    return S_OK;
+}
+static HRESULT WINAPI clip_Initialize(struct IDirectDrawClipper7 *self, PVOID dd, DWORD flags)
+{
+    (void)self; (void)dd; (void)flags;
+    return S_OK;
+}
+static HRESULT WINAPI clip_IsClipListChanged(struct IDirectDrawClipper7 *self, BOOL *changed)
+{
+    (void)self;
+    if (changed) *changed = FALSE;
+    return S_OK;
+}
+static HRESULT WINAPI clip_SetClipList(struct IDirectDrawClipper7 *self, PVOID list, DWORD flags)
+{
+    (void)self; (void)list; (void)flags;
+    return S_OK;
+}
+static HRESULT WINAPI clip_SetHWnd(struct IDirectDrawClipper7 *self, DWORD flags, HANDLE hwnd)
+{
+    (void)flags;
+    if (!self || !self->clip) return DDERR_INVALIDPARAMS;
+    self->clip->hwnd = hwnd;
+    /* Set clip_rect to current display dimensions */
+    self->clip->clip_left   = 0;
+    self->clip->clip_top    = 0;
+    self->clip->clip_right  = (LONG)display_width;
+    self->clip->clip_bottom = (LONG)display_height;
+    self->clip->has_clip    = 1;
+    serial_puts("[DDRAW] Clipper SetHWnd\n");
+    return S_OK;
+}
+
+static struct IDirectDrawClipper7Vtbl clipper_vtbl = {
+    clip_QueryInterface, clip_AddRef, clip_Release,
+    clip_GetClipList, clip_GetHWnd, clip_Initialize,
+    clip_IsClipListChanged, clip_SetClipList, clip_SetHWnd
+};
+
+static struct IDirectDrawClipper7 g_ddclipper_obj = { &clipper_vtbl, &g_ddclipper };
+
+/* ── DDSurface ────────────────────────────────────────────── */
+
 typedef struct {
     BYTE  *pixels;      /* surface pixel buffer */
     DWORD  width;
@@ -110,6 +317,8 @@ typedef struct {
     int    locked;
     int    is_primary;
     struct DDSurface *back_buffer;  /* for primary with flip chain */
+    DDPalette        *palette;      /* attached palette (8bpp) */
+    DDClipper        *clipper;      /* attached clipper */
 } DDSurface;
 
 struct IDirectDrawSurface7Vtbl;
@@ -140,17 +349,26 @@ struct IDirectDrawSurface7Vtbl {
     HRESULT (WINAPI *Blt)(IDirectDrawSurface7 *self, LPRECT destRect,
                            IDirectDrawSurface7 *src, LPRECT srcRect,
                            DWORD dwFlags, PVOID lpDDBltFx);
-    /* 6-10 */
-    PVOID _pad6; PVOID _pad7; PVOID _pad8; PVOID _pad9; PVOID _pad10;
+    /* 6: BltBatch, 7: BltFast, 8-10 */
+    PVOID _pad6;
+    HRESULT (WINAPI *BltFast)(IDirectDrawSurface7 *self, DWORD dwX, DWORD dwY,
+                               IDirectDrawSurface7 *src, LPRECT srcRect, DWORD dwTrans);
+    PVOID _pad8; PVOID _pad9; PVOID _pad10;
     /* 11: Flip */
     HRESULT (WINAPI *Flip)(IDirectDrawSurface7 *self,
                             IDirectDrawSurface7 *override, DWORD flags);
-    /* 12-16 */
-    PVOID _pad12; PVOID _pad13; PVOID _pad14; PVOID _pad15; PVOID _pad16;
+    /* 12: GetAttachedSurface, 13: GetBltStatus, 14: GetCaps */
+    PVOID _pad12; PVOID _pad13; PVOID _pad14;
+    /* 15: GetClipper */
+    HRESULT (WINAPI *GetClipper)(IDirectDrawSurface7 *self, PVOID *lplpDDClipper);
+    PVOID _pad16;
     /* 17: GetDC */
     HRESULT (WINAPI *GetDC)(IDirectDrawSurface7 *self, HDC *hdc);
-    /* 18-21 */
-    PVOID _pad18; PVOID _pad19; PVOID _pad20; PVOID _pad21;
+    /* 18: GetFlipStatus, 19: GetOverlayPosition */
+    PVOID _pad18; PVOID _pad19;
+    /* 20: GetPalette */
+    HRESULT (WINAPI *GetPalette)(IDirectDrawSurface7 *self, PVOID *lplpDDPalette);
+    PVOID _pad21;
     /* 22: GetSurfaceDesc */
     HRESULT (WINAPI *GetSurfaceDesc)(IDirectDrawSurface7 *self, DDSURFACEDESC2 *desc);
     /* 23-24 */
@@ -160,8 +378,16 @@ struct IDirectDrawSurface7Vtbl {
                             DDSURFACEDESC2 *desc, DWORD flags, HANDLE hEvent);
     /* 26: ReleaseDC */
     HRESULT (WINAPI *ReleaseDC)(IDirectDrawSurface7 *self, HDC hdc);
-    /* 27-31 */
-    PVOID _pad27; PVOID _pad28; PVOID _pad29; PVOID _pad30; PVOID _pad31;
+    /* 27: Restore */
+    PVOID _pad27;
+    /* 28: SetClipper */
+    HRESULT (WINAPI *SetClipper)(IDirectDrawSurface7 *self, PVOID lpDDClipper);
+    /* 29: SetColorKey */
+    PVOID _pad29;
+    /* 30: SetOverlayPosition */
+    PVOID _pad30;
+    /* 31: SetPalette */
+    HRESULT (WINAPI *SetPalette)(IDirectDrawSurface7 *self, PVOID lpDDPalette);
     /* 32: Unlock */
     HRESULT (WINAPI *Unlock)(IDirectDrawSurface7 *self, LPRECT lpRect);
 };
@@ -216,14 +442,18 @@ static HRESULT WINAPI surf_Lock(IDirectDrawSurface7 *self, LPRECT destRect,
 
     /* ddpfPixelFormat at offset 72 (32-bit layout) */
     d[18] = 32;  /* ddpfPixelFormat.dwSize at offset 72 */
-    d[19] = DDPF_RGB;  /* dwFlags at offset 76 */
     d[22] = s->bpp;  /* dwRGBBitCount at offset 88 */
 
-    if (s->bpp == 16) {
+    if (s->bpp == 8) {
+        d[19] = 0x00000020;  /* DDPF_PALETTEINDEXED8 */
+        /* No bit masks for palettized mode */
+    } else if (s->bpp == 16) {
+        d[19] = DDPF_RGB;  /* dwFlags at offset 76 */
         d[23] = 0xF800;  /* dwRBitMask at offset 92 */
         d[24] = 0x07E0;  /* dwGBitMask at offset 96 */
         d[25] = 0x001F;  /* dwBBitMask at offset 100 */
     } else {
+        d[19] = DDPF_RGB;
         d[23] = 0x00FF0000;
         d[24] = 0x0000FF00;
         d[25] = 0x000000FF;
@@ -256,10 +486,33 @@ static HRESULT WINAPI surf_Blt(IDirectDrawSurface7 *self, LPRECT destRect,
                                 IDirectDrawSurface7 *src, LPRECT srcRect,
                                 DWORD dwFlags, PVOID lpDDBltFx)
 {
-    (void)destRect; (void)srcRect; (void)dwFlags; (void)lpDDBltFx;
+    (void)srcRect; (void)dwFlags; (void)lpDDBltFx;
     IDirectDrawSurface7 *real_self = REAL_SURF(self);
     if (!real_self) return DDERR_INVALIDPARAMS;
     DDSurface *dst = &real_self->surf;
+
+    /* Clipper intersection: if surface has clipper and destRect, clip destRect */
+    LONG clip_x = 0, clip_y = 0, clip_w = (LONG)dst->width, clip_h = (LONG)dst->height;
+    if (dst->clipper && dst->clipper->has_clip && destRect) {
+        /* Intersect destRect with clip_rect */
+        LONG dl = destRect->left, dt = destRect->top;
+        LONG dr = destRect->right, db = destRect->bottom;
+        LONG cl = dst->clipper->clip_left, ct = dst->clipper->clip_top;
+        LONG cr = dst->clipper->clip_right, cb = dst->clipper->clip_bottom;
+        clip_x = dl > cl ? dl : cl;
+        clip_y = dt > ct ? dt : ct;
+        LONG rx = dr < cr ? dr : cr;
+        LONG ry = db < cb ? db : cb;
+        clip_w = rx - clip_x;
+        clip_h = ry - clip_y;
+        if (clip_w <= 0 || clip_h <= 0) return DD_OK; /* fully clipped */
+    } else if (destRect) {
+        clip_x = destRect->left;
+        clip_y = destRect->top;
+        clip_w = destRect->right - destRect->left;
+        clip_h = destRect->bottom - destRect->top;
+    }
+    (void)clip_x; (void)clip_y; (void)clip_w; (void)clip_h;
 
     if (src) {
         IDirectDrawSurface7 *real_src = REAL_SURF(src);
@@ -276,11 +529,22 @@ static HRESULT WINAPI surf_Blt(IDirectDrawSurface7 *self, LPRECT destRect,
     if (dst->is_primary) {
         ensure_framebuffer();
         if (framebuffer && dst->pixels) {
-            /* Convert RGB565 → XRGB8888, respecting GOP pitch */
-            if (dst->bpp == 16) {
+            DWORD pitch = gop_pitch ? gop_pitch : dst->width;
+
+            if (dst->bpp == 8 && dst->palette) {
+                /* 8bpp palettized → XRGB8888 via palette lookup */
+                BYTE *src8 = dst->pixels;
+                uint32_t *dst32 = (uint32_t *)framebuffer;
+                for (DWORD y = 0; y < dst->height; y++) {
+                    for (DWORD x = 0; x < dst->width; x++) {
+                        uint8_t idx = src8[y * dst->width + x];
+                        dst32[y * pitch + x] = dst->palette->entries[idx];
+                    }
+                }
+            } else if (dst->bpp == 16) {
+                /* Convert RGB565 → XRGB8888, respecting GOP pitch */
                 uint16_t *src16 = (uint16_t *)dst->pixels;
                 uint32_t *dst32 = (uint32_t *)framebuffer;
-                DWORD pitch = gop_pitch ? gop_pitch : dst->width;
                 for (DWORD y = 0; y < dst->height; y++) {
                     for (DWORD x = 0; x < dst->width; x++) {
                         uint16_t c = src16[y * dst->width + x];
@@ -293,7 +557,6 @@ static HRESULT WINAPI surf_Blt(IDirectDrawSurface7 *self, LPRECT destRect,
             } else if (dst->bpp == 32) {
                 uint32_t *src32 = (uint32_t *)dst->pixels;
                 uint32_t *dst32 = (uint32_t *)framebuffer;
-                DWORD pitch = gop_pitch ? gop_pitch : dst->width;
                 for (DWORD y = 0; y < dst->height; y++)
                     dd_memcpy(&dst32[y * pitch], &src32[y * dst->width], dst->width * 4);
             }
@@ -304,6 +567,60 @@ static HRESULT WINAPI surf_Blt(IDirectDrawSurface7 *self, LPRECT destRect,
     if (dst->is_primary)
         ddraw_compositor_notify();
 
+    return DD_OK;
+}
+
+/* BltFast: fast rectangular blit without clipping or ROP */
+static HRESULT WINAPI surf_BltFast(IDirectDrawSurface7 *self,
+                                    DWORD dwX, DWORD dwY,
+                                    IDirectDrawSurface7 *src, LPRECT srcRect,
+                                    DWORD dwTrans)
+{
+    IDirectDrawSurface7 *real_self = REAL_SURF(self);
+    IDirectDrawSurface7 *real_src  = src ? REAL_SURF(src) : NULL;
+    if (!real_self || !real_src) return DDERR_INVALIDPARAMS;
+
+    DDSurface *dst = &real_self->surf;
+    DDSurface *s   = &real_src->surf;
+
+    /* Source rect (default: entire source surface) */
+    DWORD sx = 0, sy = 0, sw = s->width, sh = s->height;
+    if (srcRect) {
+        sx = (DWORD)srcRect->left;  sy = (DWORD)srcRect->top;
+        sw = (DWORD)(srcRect->right - srcRect->left);
+        sh = (DWORD)(srcRect->bottom - srcRect->top);
+    }
+
+    /* Clip to destination bounds */
+    if (dwX + sw > dst->width)  sw = dst->width - dwX;
+    if (dwY + sh > dst->height) sh = dst->height - dwY;
+    if (sx + sw > s->width)  sw = s->width - sx;
+    if (sy + sh > s->height) sh = s->height - sy;
+
+    DWORD bpp_bytes = dst->bpp / 8;
+    int use_src_colorkey = (dwTrans & 0x1); /* DDBLTFAST_SRCCOLORKEY */
+
+    for (DWORD y = 0; y < sh; y++) {
+        BYTE *dp = dst->pixels + (dwY + y) * dst->pitch + dwX * bpp_bytes;
+        BYTE *sp = s->pixels   + (sy + y)  * s->pitch   + sx * bpp_bytes;
+
+        if (!use_src_colorkey) {
+            dd_memcpy(dp, sp, sw * bpp_bytes);
+        } else {
+            /* Color key transparency: skip pixels matching color key */
+            if (bpp_bytes == 2) {
+                uint16_t *d16 = (uint16_t *)dp, *s16 = (uint16_t *)sp;
+                for (DWORD x = 0; x < sw; x++)
+                    if (s16[x] != 0) d16[x] = s16[x]; /* key=0 (black) */
+            } else {
+                uint32_t *d32 = (uint32_t *)dp, *s32 = (uint32_t *)sp;
+                for (DWORD x = 0; x < sw; x++)
+                    if (s32[x] & 0xFF000000) d32[x] = s32[x]; /* key=transparent alpha */
+            }
+        }
+    }
+
+    (void)dwTrans;
     return DD_OK;
 }
 
@@ -340,10 +657,21 @@ static HRESULT WINAPI surf_Flip(IDirectDrawSurface7 *self,
     /* Blit primary to GOP framebuffer */
     ensure_framebuffer();
     if (framebuffer && primary->pixels) {
-        if (primary->bpp == 16) {
+        DWORD pitch = gop_pitch ? gop_pitch : primary->width;
+
+        if (primary->bpp == 8 && primary->palette) {
+            /* 8bpp palettized → XRGB8888 via palette lookup */
+            BYTE *src8 = primary->pixels;
+            uint32_t *dst32 = (uint32_t *)framebuffer;
+            for (DWORD y = 0; y < primary->height; y++) {
+                for (DWORD x = 0; x < primary->width; x++) {
+                    uint8_t idx = src8[y * primary->width + x];
+                    dst32[y * pitch + x] = primary->palette->entries[idx];
+                }
+            }
+        } else if (primary->bpp == 16) {
             uint16_t *src16 = (uint16_t *)primary->pixels;
             uint32_t *dst32 = (uint32_t *)framebuffer;
-            DWORD pitch = gop_pitch ? gop_pitch : primary->width;
             for (DWORD y = 0; y < primary->height; y++) {
                 for (DWORD x = 0; x < primary->width; x++) {
                     uint16_t c = src16[y * primary->width + x];
@@ -353,6 +681,11 @@ static HRESULT WINAPI surf_Flip(IDirectDrawSurface7 *self,
                     dst32[y * pitch + x] = (r << 16) | (g << 8) | b;
                 }
             }
+        } else if (primary->bpp == 32) {
+            uint32_t *src32 = (uint32_t *)primary->pixels;
+            uint32_t *dst32 = (uint32_t *)framebuffer;
+            for (DWORD y = 0; y < primary->height; y++)
+                dd_memcpy(&dst32[y * pitch], &src32[y * primary->width], primary->width * 4);
         }
     }
 
@@ -382,6 +715,69 @@ static HRESULT WINAPI surf_ReleaseDC(IDirectDrawSurface7 *self, HDC hdc)
     return DD_OK;
 }
 
+/* SetClipper: attach clipper to surface (slot 28) */
+static HRESULT WINAPI surf_SetClipper(IDirectDrawSurface7 *self, PVOID lpDDClipper)
+{
+    IDirectDrawSurface7 *real = REAL_SURF(self);
+    if (!real) return DDERR_INVALIDPARAMS;
+    if (lpDDClipper) {
+        real->surf.clipper = &g_ddclipper;
+        serial_puts("[DDRAW] SetClipper on surface\n");
+    } else {
+        real->surf.clipper = NULL;
+    }
+    return DD_OK;
+}
+
+/* SetPalette: attach palette to surface (slot 31) */
+static HRESULT WINAPI surf_SetPalette(IDirectDrawSurface7 *self, PVOID lpDDPalette)
+{
+    IDirectDrawSurface7 *real = REAL_SURF(self);
+    if (!real) return DDERR_INVALIDPARAMS;
+    if (lpDDPalette) {
+        real->surf.palette = &g_ddpalette;
+        serial_puts("[DDRAW] SetPalette on surface\n");
+    } else {
+        real->surf.palette = NULL;
+    }
+    return DD_OK;
+}
+
+/* GetPalette: return attached palette (slot 20) */
+static HRESULT WINAPI surf_GetPalette(IDirectDrawSurface7 *self, PVOID *lplpDDPalette)
+{
+    IDirectDrawSurface7 *real = REAL_SURF(self);
+    if (!real || !lplpDDPalette) return DDERR_INVALIDPARAMS;
+    if (!real->surf.palette) {
+        *(uint32_t *)lplpDDPalette = 0;
+        return DDERR_NOPALETTEATTACHED;
+    }
+    /* Return palette COM32 proxy if available, or the palette object directly */
+    extern uint32_t *pal_proxy32_ptr;
+    if (pal_proxy32_ptr)
+        *(uint32_t *)lplpDDPalette = (uint32_t)(ULONG_PTR)pal_proxy32_ptr;
+    else
+        *(uint32_t *)lplpDDPalette = (uint32_t)(ULONG_PTR)&g_ddpalette_obj;
+    return S_OK;
+}
+
+/* GetClipper: return attached clipper (slot 15) */
+static HRESULT WINAPI surf_GetClipper(IDirectDrawSurface7 *self, PVOID *lplpDDClipper)
+{
+    IDirectDrawSurface7 *real = REAL_SURF(self);
+    if (!real || !lplpDDClipper) return DDERR_INVALIDPARAMS;
+    if (!real->surf.clipper) {
+        *(uint32_t *)lplpDDClipper = 0;
+        return DDERR_NOCLIPPERATTACHED;
+    }
+    extern uint32_t *clip_proxy32_ptr;
+    if (clip_proxy32_ptr)
+        *(uint32_t *)lplpDDClipper = (uint32_t)(ULONG_PTR)clip_proxy32_ptr;
+    else
+        *(uint32_t *)lplpDDClipper = (uint32_t)(ULONG_PTR)&g_ddclipper_obj;
+    return S_OK;
+}
+
 /* Shared vtable */
 static struct IDirectDrawSurface7Vtbl surface_vtbl = {
     surf_QueryInterface,
@@ -389,16 +785,26 @@ static struct IDirectDrawSurface7Vtbl surface_vtbl = {
     surf_Release,
     NULL, NULL,                 /* 3-4 */
     surf_Blt,                   /* 5 */
-    NULL, NULL, NULL, NULL, NULL, /* 6-10 */
+    NULL,                       /* 6: BltBatch */
+    surf_BltFast,               /* 7: BltFast */
+    NULL, NULL, NULL,           /* 8-10 */
     surf_Flip,                  /* 11 */
-    NULL, NULL, NULL, NULL, NULL, /* 12-16 */
+    NULL, NULL, NULL,           /* 12-14 */
+    surf_GetClipper,            /* 15 */
+    NULL,                       /* 16 */
     surf_GetDC,                 /* 17 */
-    NULL, NULL, NULL, NULL,     /* 18-21 */
+    NULL, NULL,                 /* 18-19 */
+    surf_GetPalette,            /* 20 */
+    NULL,                       /* 21 */
     surf_GetSurfaceDesc,        /* 22 */
     NULL, NULL,                 /* 23-24 */
     surf_Lock,                  /* 25 */
     surf_ReleaseDC,             /* 26 */
-    NULL, NULL, NULL, NULL, NULL, /* 27-31 */
+    NULL,                       /* 27: Restore */
+    surf_SetClipper,            /* 28 */
+    NULL,                       /* 29: SetColorKey */
+    NULL,                       /* 30: SetOverlayPosition */
+    surf_SetPalette,            /* 31 */
     surf_Unlock                 /* 32 */
 };
 
@@ -423,6 +829,8 @@ static IDirectDrawSurface7 *alloc_surface(DWORD w, DWORD h, DWORD bpp, int is_pr
     ds->locked     = 0;
     ds->is_primary = is_primary;
     ds->back_buffer = NULL;
+    ds->palette     = NULL;
+    ds->clipper     = NULL;
 
     if (ds->pixels) dd_memset(ds->pixels, 0, ds->buf_size);
 
@@ -451,9 +859,12 @@ struct IDirectDraw7Vtbl {
     /* 3: Compact */
     PVOID _pad3;
     /* 4: CreateClipper */
-    PVOID _pad4;
+    HRESULT (WINAPI *CreateClipper)(IDirectDraw7 *self, DWORD dwFlags,
+                                     PVOID *lplpDDClipper, PVOID pUnkOuter);
     /* 5: CreatePalette */
-    PVOID _pad5;
+    HRESULT (WINAPI *CreatePalette)(IDirectDraw7 *self, DWORD dwFlags,
+                                     PVOID lpDDColorArray,
+                                     PVOID *lplpDDPalette, PVOID pUnkOuter);
     /* 6: CreateSurface */
     HRESULT (WINAPI *CreateSurface)(IDirectDraw7 *self, DDSURFACEDESC2 *desc,
                                      IDirectDrawSurface7 **surf, PVOID pUnkOuter);
@@ -582,6 +993,58 @@ static HRESULT WINAPI surf_GetAttachedSurface(IDirectDrawSurface7 *self,
     return DD_OK;
 }
 
+/* CreateClipper: IDirectDraw7 slot 4 — creates an IDirectDrawClipper.
+ * Args (stdcall): this, dwFlags, lplpDDClipper, pUnkOuter */
+static HRESULT WINAPI dd_CreateClipper(IDirectDraw7 *self, DWORD dwFlags,
+                                        PVOID *lplpDDClipper, PVOID pUnkOuter)
+{
+    (void)self; (void)dwFlags; (void)pUnkOuter;
+    if (!lplpDDClipper) return DDERR_INVALIDPARAMS;
+    dd_memset(&g_ddclipper, 0, sizeof(g_ddclipper));
+    /* Return 32-bit proxy if COM32 is initialized */
+    extern uint32_t *clip_proxy32_ptr;
+    if (clip_proxy32_ptr)
+        *(uint32_t *)lplpDDClipper = (uint32_t)(ULONG_PTR)clip_proxy32_ptr;
+    else
+        *(uint32_t *)lplpDDClipper = (uint32_t)(ULONG_PTR)&g_ddclipper_obj;
+    serial_puts("[DDRAW] CreateClipper\n");
+    return DD_OK;
+}
+
+/* CreatePalette: IDirectDraw7 slot 5 — creates an IDirectDrawPalette.
+ * Args (stdcall): this, dwFlags, lpDDColorArray, lplpDDPalette, pUnkOuter */
+static HRESULT WINAPI dd_CreatePalette(IDirectDraw7 *self, DWORD dwFlags,
+                                        PVOID lpDDColorArray,
+                                        PVOID *lplpDDPalette, PVOID pUnkOuter)
+{
+    (void)self; (void)pUnkOuter;
+    if (!lplpDDPalette) return DDERR_INVALIDPARAMS;
+
+    /* Initialize palette entries from caller's color array if provided */
+    dd_memset(&g_ddpalette, 0, sizeof(g_ddpalette));
+    if (lpDDColorArray && (dwFlags & 0x04)) {
+        /* DDPCAPS_8BIT = 0x04 → 256 entries */
+        const BYTE *in = (const BYTE *)lpDDColorArray;
+        for (int i = 0; i < 256; i++) {
+            BYTE r = in[i * 4 + 0];
+            BYTE g = in[i * 4 + 1];
+            BYTE b = in[i * 4 + 2];
+            g_ddpalette.entries[i] = ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
+        }
+    }
+
+    /* Return 32-bit proxy if COM32 is initialized */
+    extern uint32_t *pal_proxy32_ptr;
+    if (pal_proxy32_ptr)
+        *(uint32_t *)lplpDDPalette = (uint32_t)(ULONG_PTR)pal_proxy32_ptr;
+    else
+        *(uint32_t *)lplpDDPalette = (uint32_t)(ULONG_PTR)&g_ddpalette_obj;
+    serial_puts("[DDRAW] CreatePalette flags=0x");
+    serial_puthex(dwFlags, 4);
+    serial_puts("\n");
+    return DD_OK;
+}
+
 static HRESULT WINAPI dd_CreateSurface(IDirectDraw7 *self, DDSURFACEDESC2 *desc,
                                         IDirectDrawSurface7 **surf, PVOID pUnkOuter)
 {
@@ -642,8 +1105,8 @@ static struct IDirectDraw7Vtbl dd_vtbl = {
     dd_AddRef,
     dd_Release,
     NULL,                       /* 3: Compact */
-    NULL,                       /* 4: CreateClipper */
-    NULL,                       /* 5: CreatePalette */
+    dd_CreateClipper,           /* 4 */
+    dd_CreatePalette,           /* 5 */
     dd_CreateSurface,           /* 6 */
     NULL, NULL, NULL,           /* 7-9 */
     NULL,                       /* 10: EnumSurfaces */
@@ -683,6 +1146,15 @@ static uint32_t *dd_vtbl32;            /* IDirectDraw vtable (23 slots) */
 static uint32_t *dd_proxy32_ptr;       /* → 1 uint32_t: the lpVtbl32 */
 
 static uint32_t *surf_vtbl32;          /* IDirectDrawSurface vtable (33 slots) */
+
+/* Palette COM32 proxy */
+static uint32_t *pal_vtbl32;           /* IDirectDrawPalette vtable (7 slots) */
+uint32_t *pal_proxy32_ptr;             /* → 1 uint32_t: the lpVtbl32 */
+
+/* Clipper COM32 proxy */
+static uint32_t *clip_vtbl32;          /* IDirectDrawClipper vtable (9 slots) */
+uint32_t *clip_proxy32_ptr;            /* → 1 uint32_t: the lpVtbl32 */
+
 static int com32_initialized = 0;
 
 /* IDirectDraw7::EnumDisplayModes — report available display modes via callback.
@@ -701,11 +1173,12 @@ static uint64_t WINAPI dd_EnumDisplayModes(
     if (!lpCallback) return 0; /* DD_OK */
 
     static const struct { uint32_t w, h, bpp; } modes[] = {
+        {640, 480, 8}, {800, 600, 8}, {1024, 768, 8},
         {640, 480, 16}, {800, 600, 16}, {1024, 768, 16},
         {640, 480, 32}, {800, 600, 32}, {1024, 768, 32},
     };
 
-    for (int i = 0; i < 6; i++) {
+    for (int i = 0; i < 9; i++) {
         /* DDSURFACEDESC2 = 124 bytes. Use static buffer so the 32-bit
          * callback can access it (must be in lower 4GB). */
         static uint8_t desc_buf[128];
@@ -719,11 +1192,14 @@ static uint64_t WINAPI dd_EnumDisplayModes(
         /* ddpfPixelFormat at offset 72 */
         uint32_t *pf = (uint32_t *)(desc_buf + 72);
         pf[0] = 32;                   /* dwSize of DDPIXELFORMAT */
-        pf[1] = 0x00000040;           /* DDPF_RGB */
         pf[3] = modes[i].bpp;         /* dwRGBBitCount */
-        if (modes[i].bpp == 16) {
+        if (modes[i].bpp == 8) {
+            pf[1] = 0x00000020;       /* DDPF_PALETTEINDEXED8 */
+        } else if (modes[i].bpp == 16) {
+            pf[1] = 0x00000040;       /* DDPF_RGB */
             pf[4] = 0xF800;  pf[5] = 0x07E0;  pf[6] = 0x001F;
         } else {
+            pf[1] = 0x00000040;       /* DDPF_RGB */
             pf[4] = 0x00FF0000; pf[5] = 0x0000FF00; pf[6] = 0x000000FF;
         }
 
@@ -755,15 +1231,28 @@ static void ddraw_init_com32(void)
     #define CC_STDCALL 1
 
     /* Allocate COM proxy objects from PE32-accessible memory.
-     * Layout in 1 page: dd_vtbl32[23] + dd_proxy32(1) + surf_vtbl32[33] + surf_proxy32[8] */
+     * Layout in 1 page:
+     *   dd_vtbl32[23]       @ 0     (92 bytes)
+     *   dd_proxy32          @ 96    (4 bytes)
+     *   surf_vtbl32[33]     @ 128   (132 bytes)
+     *   surf_proxy32[8]     @ 272   (64 bytes)
+     *   pal_vtbl32[7]       @ 340   (28 bytes)
+     *   pal_proxy32         @ 372   (4 bytes)
+     *   clip_vtbl32[9]      @ 380   (36 bytes)
+     *   clip_proxy32        @ 420   (4 bytes)
+     */
     uint8_t *page = (uint8_t *)mem_alloc_pages(1);
     if (!page) { serial_puts("[DDRAW] COM proxy alloc FAILED\n"); return; }
     for (int i = 0; i < 4096; i++) page[i] = 0;
 
-    dd_vtbl32     = (uint32_t *)(page + 0);           /* 23 * 4 = 92 bytes */
-    dd_proxy32_ptr = (uint32_t *)(page + 96);          /* 4 bytes */
-    surf_vtbl32   = (uint32_t *)(page + 128);          /* 33 * 4 = 132 bytes */
-    surf_proxy32  = (COM32_Surface *)(page + 272);     /* 8 * 8 = 64 bytes */
+    dd_vtbl32       = (uint32_t *)(page + 0);           /* 23 * 4 = 92 bytes */
+    dd_proxy32_ptr  = (uint32_t *)(page + 96);           /* 4 bytes */
+    surf_vtbl32     = (uint32_t *)(page + 128);          /* 33 * 4 = 132 bytes */
+    surf_proxy32    = (COM32_Surface *)(page + 272);     /* 8 * 8 = 64 bytes */
+    pal_vtbl32      = (uint32_t *)(page + 340);          /* 7 * 4 = 28 bytes */
+    pal_proxy32_ptr = (uint32_t *)(page + 372);          /* 4 bytes */
+    clip_vtbl32     = (uint32_t *)(page + 380);          /* 9 * 4 = 36 bytes */
+    clip_proxy32_ptr = (uint32_t *)(page + 420);         /* 4 bytes */
 
     serial_puts("[DDRAW] COM proxies at 0x");
     extern void serial_puthex(uint64_t val, int digits);
@@ -777,6 +1266,10 @@ static void ddraw_init_com32(void)
                                             "DD_AddRef", 1, CC_STDCALL);
     dd_vtbl32[2]  = compat32_make_thunk_ex((uint64_t)(ULONG_PTR)dd_Release,
                                             "DD_Release", 1, CC_STDCALL);
+    dd_vtbl32[4]  = compat32_make_thunk_ex((uint64_t)(ULONG_PTR)dd_CreateClipper,
+                                            "DD_CreateClipper", 4, CC_STDCALL);
+    dd_vtbl32[5]  = compat32_make_thunk_ex((uint64_t)(ULONG_PTR)dd_CreatePalette,
+                                            "DD_CreatePalette", 5, CC_STDCALL);
     dd_vtbl32[6]  = compat32_make_thunk_ex((uint64_t)(ULONG_PTR)dd_CreateSurface,
                                             "DD_CreateSurface", 4, CC_STDCALL);
     dd_vtbl32[8]  = compat32_make_thunk_ex((uint64_t)(ULONG_PTR)dd_EnumDisplayModes,
@@ -798,14 +1291,24 @@ static void ddraw_init_com32(void)
                                               "Surf_Release", 1, CC_STDCALL);
     surf_vtbl32[5]  = compat32_make_thunk_ex((uint64_t)(ULONG_PTR)surf_Blt,
                                               "Surf_Blt", 7, CC_STDCALL);
+    surf_vtbl32[7]  = compat32_make_thunk_ex((uint64_t)(ULONG_PTR)surf_BltFast,
+                                              "Surf_BltFast", 6, CC_STDCALL);
     surf_vtbl32[11] = compat32_make_thunk_ex((uint64_t)(ULONG_PTR)surf_Flip,
                                               "Surf_Flip", 3, CC_STDCALL);
     surf_vtbl32[12] = compat32_make_thunk_ex((uint64_t)(ULONG_PTR)surf_GetAttachedSurface,
                                               "Surf_GetAttached", 3, CC_STDCALL);
     surf_vtbl32[22] = compat32_make_thunk_ex((uint64_t)(ULONG_PTR)surf_GetSurfaceDesc,
                                               "Surf_GetDesc", 2, CC_STDCALL);
+    surf_vtbl32[15] = compat32_make_thunk_ex((uint64_t)(ULONG_PTR)surf_GetClipper,
+                                              "Surf_GetClipper", 2, CC_STDCALL);
+    surf_vtbl32[20] = compat32_make_thunk_ex((uint64_t)(ULONG_PTR)surf_GetPalette,
+                                              "Surf_GetPalette", 2, CC_STDCALL);
     surf_vtbl32[25] = compat32_make_thunk_ex((uint64_t)(ULONG_PTR)surf_Lock,
                                               "Surf_Lock", 5, CC_STDCALL);
+    surf_vtbl32[28] = compat32_make_thunk_ex((uint64_t)(ULONG_PTR)surf_SetClipper,
+                                              "Surf_SetClipper", 2, CC_STDCALL);
+    surf_vtbl32[31] = compat32_make_thunk_ex((uint64_t)(ULONG_PTR)surf_SetPalette,
+                                              "Surf_SetPalette", 2, CC_STDCALL);
     surf_vtbl32[32] = compat32_make_thunk_ex((uint64_t)(ULONG_PTR)surf_Unlock,
                                               "Surf_Unlock", 2, CC_STDCALL);
 
@@ -901,8 +1404,49 @@ static void ddraw_init_com32(void)
         surf_proxy32[i].surf_index = (uint32_t)i;
     }
 
+    /* IDirectDrawPalette COM32 vtable (7 methods) */
+    pal_vtbl32[0] = compat32_make_thunk_ex((uint64_t)(ULONG_PTR)pal_QueryInterface,
+                                            "Pal_QI", 3, CC_STDCALL);
+    pal_vtbl32[1] = compat32_make_thunk_ex((uint64_t)(ULONG_PTR)pal_AddRef,
+                                            "Pal_AddRef", 1, CC_STDCALL);
+    pal_vtbl32[2] = compat32_make_thunk_ex((uint64_t)(ULONG_PTR)pal_Release,
+                                            "Pal_Release", 1, CC_STDCALL);
+    pal_vtbl32[3] = compat32_make_thunk_ex((uint64_t)(ULONG_PTR)pal_GetCaps,
+                                            "Pal_GetCaps", 2, CC_STDCALL);
+    pal_vtbl32[4] = compat32_make_thunk_ex((uint64_t)(ULONG_PTR)pal_GetEntries,
+                                            "Pal_GetEntries", 5, CC_STDCALL);
+    pal_vtbl32[5] = compat32_make_thunk_ex((uint64_t)(ULONG_PTR)pal_Initialize,
+                                            "Pal_Init", 4, CC_STDCALL);
+    pal_vtbl32[6] = compat32_make_thunk_ex((uint64_t)(ULONG_PTR)pal_SetEntries,
+                                            "Pal_SetEntries", 5, CC_STDCALL);
+    *pal_proxy32_ptr = (uint32_t)(ULONG_PTR)pal_vtbl32;
+    /* Point the palette object at the proxy vtable for COM32 calls */
+    g_ddpalette_obj.pal = &g_ddpalette;
+
+    /* IDirectDrawClipper COM32 vtable (9 methods) */
+    clip_vtbl32[0] = compat32_make_thunk_ex((uint64_t)(ULONG_PTR)clip_QueryInterface,
+                                             "Clip_QI", 3, CC_STDCALL);
+    clip_vtbl32[1] = compat32_make_thunk_ex((uint64_t)(ULONG_PTR)clip_AddRef,
+                                             "Clip_AddRef", 1, CC_STDCALL);
+    clip_vtbl32[2] = compat32_make_thunk_ex((uint64_t)(ULONG_PTR)clip_Release,
+                                             "Clip_Release", 1, CC_STDCALL);
+    clip_vtbl32[3] = compat32_make_thunk_ex((uint64_t)(ULONG_PTR)dd_com_stub,
+                                             "Clip_stub", 4, CC_STDCALL); /* GetClipList */
+    clip_vtbl32[4] = compat32_make_thunk_ex((uint64_t)(ULONG_PTR)clip_GetHWnd,
+                                             "Clip_GetHWnd", 2, CC_STDCALL);
+    clip_vtbl32[5] = compat32_make_thunk_ex((uint64_t)(ULONG_PTR)dd_com_stub,
+                                             "Clip_stub", 3, CC_STDCALL); /* Initialize */
+    clip_vtbl32[6] = compat32_make_thunk_ex((uint64_t)(ULONG_PTR)dd_com_stub,
+                                             "Clip_stub", 2, CC_STDCALL); /* IsClipListChanged */
+    clip_vtbl32[7] = compat32_make_thunk_ex((uint64_t)(ULONG_PTR)dd_com_stub,
+                                             "Clip_stub", 3, CC_STDCALL); /* SetClipList */
+    clip_vtbl32[8] = compat32_make_thunk_ex((uint64_t)(ULONG_PTR)clip_SetHWnd,
+                                             "Clip_SetHWnd", 3, CC_STDCALL);
+    *clip_proxy32_ptr = (uint32_t)(ULONG_PTR)clip_vtbl32;
+    g_ddclipper_obj.clip = &g_ddclipper;
+
     com32_initialized = 1;
-    serial_puts("[DDRAW] COM32 proxies initialized\n");
+    serial_puts("[DDRAW] COM32 proxies initialized (surfaces+palette+clipper)\n");
 
     /* Hardware watchpoint on dd_vtbl32[0] to catch runtime corruption. */
     {
@@ -996,5 +1540,7 @@ PVOID ddraw_shim_init(void)
     surface_count = 0;
     framebuffer = NULL;
     fb_size = 0;
+    dd_memset(&g_ddpalette, 0, sizeof(g_ddpalette));
+    dd_memset(&g_ddclipper, 0, sizeof(g_ddclipper));
     return (PVOID)ddraw_exports;
 }
