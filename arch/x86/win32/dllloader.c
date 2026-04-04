@@ -494,9 +494,11 @@ static LOADED_MODULE *dll_try_load_from_fs(const char *dll_name)
     uint64_t fsize = osfs2_file_size(fsfile);
     if (fsize == 0) return NULL;
 
-    serial_puts("[DLL] auto-loading dependency: ");
+    serial_puts("[DLL] auto-load: ");
     serial_puts(basename);
-    serial_puts("\n");
+    serial_puts(" (depth ");
+    serial_puthex(load_depth, 1);
+    serial_puts(")\n");
 
     uint64_t pages = (fsize + 0xFFF) / 4096;
     uint8_t *buf = (uint8_t *)mem_alloc_pages(pages);
@@ -612,9 +614,19 @@ PVOID dll_resolve_import(const char *dll_name, const char *func_name,
 
     /* 5. Auto-load DLL from filesystem (recursive dependency resolution)
      *    Skip if we have a registered shim — trust the shim, don't load
-     *    conflicting PE DLLs (e.g. real MSVCRT.dll from game directory) */
-    if (dll_name && !find_shim(dll_name)) {
-        LOADED_MODULE *auto_mod = dll_try_load_from_fs(dll_name);
+     *    conflicting PE DLLs (e.g. real MSVCRT.dll from game directory).
+     *    Only auto-load actual .dll files to avoid loading .u packages
+     *    or other non-DLL files that waste heap memory. */
+    if (dll_name && !find_shim(dll_name) && dll_name[0]) {
+        /* Only auto-load if name ends with .dll (case-insensitive) */
+        int nlen = 0;
+        while (dll_name[nlen]) nlen++;
+        int is_dll = (nlen >= 4 &&
+            (dll_name[nlen-4] == '.' || dll_name[nlen-4] == '.') &&
+            (dll_name[nlen-3] == 'd' || dll_name[nlen-3] == 'D') &&
+            (dll_name[nlen-2] == 'l' || dll_name[nlen-2] == 'L') &&
+            (dll_name[nlen-1] == 'l' || dll_name[nlen-1] == 'L'));
+        LOADED_MODULE *auto_mod = is_dll ? dll_try_load_from_fs(dll_name) : NULL;
         if (auto_mod) {
             PVOID fn = dll_resolve_export(auto_mod, func_name, ordinal, by_ordinal);
             if (fn) return fn;
