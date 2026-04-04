@@ -354,7 +354,16 @@ int winexec_run(const uint8_t *file_data, uint64_t file_size)
     /* Create Win32 per-process page table (fixes VirtualAlloc aliasing) */
     {
         extern uint64_t paging_create_win32_cr3(void);
-        paging_create_win32_cr3();
+        uint64_t w32cr3 = paging_create_win32_cr3();
+        /* Store in current process so scheduler restores it on context switch */
+        if (w32cr3) {
+            extern void *proc_current(void);
+            typedef struct { uint32_t pid; uint32_t ppid; uint32_t state;
+                             char name[64]; int32_t exit_code; /* ... */ } proc_hdr_t;
+            /* cr3 is at a known offset in process_t — use the accessor pattern */
+            extern void proc_set_cr3(uint64_t cr3);
+            proc_set_cr3(w32cr3);
+        }
     }
 
     /* Initialize subsystems */
@@ -726,6 +735,28 @@ int winexec_run(const uint8_t *file_data, uint64_t file_size)
     serial_puthex((uint64_t)info.EntryPoint, 16);
     if (info.Is32Bit) serial_puts(" (32-bit compat mode)");
     serial_puts("\n");
+
+    /* Dump UGameEngine class hierarchy BEFORE EXE entry.
+     * ConstructObject fails because SuperField may be NULL at this point. */
+    {
+        volatile uint32_t *ge_cls = (volatile uint32_t *)(uintptr_t)0x105928A0;
+        volatile uint32_t *ue_iat = (volatile uint32_t *)(uintptr_t)0x10958D74;
+        serial_puts("[DIAG] Before EXE: UGameEngine::SC SuperField=0x");
+        serial_puthex(ge_cls[0x28/4], 8);
+        serial_puts(" UEngine::SC(IAT)=0x");
+        serial_puthex(*ue_iat, 8);
+        serial_puts("\n");
+
+        /* Patch INT3 at EXE+0xBC72 (right after ConstructObject returns).
+         * EAX has the new UGameEngine pointer. #BP handler will dump it. */
+        uint8_t *bp_addr = (uint8_t *)((uintptr_t)info.ImageBase + 0xBC72);
+        serial_puts("[DIAG] Patching INT3 at 0x");
+        serial_puthex((uint64_t)(uintptr_t)bp_addr, 8);
+        serial_puts(" (was 0x");
+        serial_puthex(bp_addr[0], 2);
+        serial_puts(")\n");
+        bp_addr[0] = 0xCC;  /* INT3 */
+    }
 
     /*
      * Windows CUI entry point signature:

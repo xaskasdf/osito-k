@@ -323,6 +323,11 @@ void proc_signal_pid(uint32_t pid, int sig) {
 }
 
 /* Get current PID */
+void proc_set_cr3(uint64_t cr3)
+{
+    if (current_proc) current_proc->cr3 = cr3;
+}
+
 int32_t proc_current_pid(void)
 {
     return current_proc ? (int32_t)current_proc->pid : 0;
