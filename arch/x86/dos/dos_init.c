@@ -72,16 +72,23 @@ void dos_init(void)
     /* Install IDT entries for native 32-bit INT handling.
      * When DOS4GW switches to PM and DOOM runs natively,
      * these INTs trap to our assembly stubs → C handlers. */
-    install_dos_idt_entry(0x08, dos_int08_stub);   /* Timer (IRQ 0) */
-    install_dos_idt_entry(0x10, dos_int10_stub);   /* BIOS Video */
-    install_dos_idt_entry(0x16, dos_int16_stub);   /* BIOS Keyboard */
-    install_dos_idt_entry(0x20, dos_int20_stub);   /* DOS Terminate */
-    install_dos_idt_entry(0x21, dos_int21_stub);   /* DOS API */
-    install_dos_idt_entry(0x2F, dos_int2f_stub);   /* DOS Multiplex */
-    install_dos_idt_entry(0x31, dos_int31_stub);   /* DPMI */
-    install_dos_idt_entry(0x33, dos_int33_stub);   /* Mouse */
+    /* IMPORTANT:
+     * Vectors 0x00-0x1F = CPU exceptions — NEVER overwrite
+     * Vector 0x20 (32) = APIC timer — NEVER overwrite
+     * Vectors 0x21-0x2F = kernel IRQs may use some — check first
+     *
+     * Safe DOS vectors (not used by kernel hardware):
+     * 0x21 (33) — not used by kernel (PIC remapped above 0x20)
+     * But to be safe, only install vectors >= 0x21 that the kernel
+     * doesn't use for hardware IRQs. The kernel uses 0x20 for APIC timer
+     * and 0x21-0x2F for PIC IRQs (keyboard at 0x21, etc.)
+     *
+     * Strategy: DON'T install any IDT entries at boot time.
+     * Instead, install them ONLY when entering native DOS 32-bit mode
+     * (dos_transfer_to_native), and restore originals on exit.
+     * This avoids ALL conflicts with the kernel. */
 
-    serial_puts("[DOS] IDT vectors installed: 08h,10h,16h,20h,21h,2Fh,31h,33h (IST2)\n");
+    serial_puts("[DOS] IDT entries deferred until native PM switch\n");
 
     dos_initialized = 1;
 
