@@ -18,6 +18,8 @@
 
 #include "common.h"
 
+uint32_t osfs2_block_sz = OSFS2_DEFAULT_BLOCK_SIZE;
+
 /* ── Device I/O ──────────────────────────────────────────────── */
 
 int osfs2_open_device(const char *path, int readonly)
@@ -41,9 +43,10 @@ void osfs2_close_device(int fd)
 
 int osfs2_read_block(int fd, uint32_t block, void *buf)
 {
-    uint64_t offset = (uint64_t)block << OSFS2_BLOCK_SHIFT;
-    ssize_t n = pread(fd, buf, OSFS2_BLOCK_SIZE, offset);
-    if (n != OSFS2_BLOCK_SIZE) {
+    uint32_t shift = osfs2_block_shift(osfs2_block_sz);
+    uint64_t offset = (uint64_t)block << shift;
+    ssize_t n = pread(fd, buf, osfs2_block_sz, offset);
+    if (n != (ssize_t)osfs2_block_sz) {
         fprintf(stderr, "osfs2: read block %u failed: %s\n",
                 block, n < 0 ? strerror(errno) : "short read");
         return -1;
@@ -53,9 +56,10 @@ int osfs2_read_block(int fd, uint32_t block, void *buf)
 
 int osfs2_write_block(int fd, uint32_t block, const void *buf)
 {
-    uint64_t offset = (uint64_t)block << OSFS2_BLOCK_SHIFT;
-    ssize_t n = pwrite(fd, buf, OSFS2_BLOCK_SIZE, offset);
-    if (n != OSFS2_BLOCK_SIZE) {
+    uint32_t shift = osfs2_block_shift(osfs2_block_sz);
+    uint64_t offset = (uint64_t)block << shift;
+    ssize_t n = pwrite(fd, buf, osfs2_block_sz, offset);
+    if (n != (ssize_t)osfs2_block_sz) {
         fprintf(stderr, "osfs2: write block %u failed: %s\n",
                 block, n < 0 ? strerror(errno) : "short write");
         return -1;
@@ -89,41 +93,48 @@ int osfs2_write_bytes(int fd, uint64_t offset, const void *buf, size_t len)
 
 /* ── Superblock ──────────────────────────────────────────────── */
 
+static int osfs2_validate_super(const osfs2_super_t *sb)
+{
+    if (sb->magic != OSFS2_MAGIC) return -1;
+    if (sb->version != OSFS2_VERSION) return -1;
+    uint32_t saved_crc = sb->crc32;
+    osfs2_super_t tmp;
+    memcpy(&tmp, sb, sizeof(tmp));
+    tmp.crc32 = 0;
+    uint32_t calc_crc = osfs2_crc32(&tmp, sizeof(tmp));
+    if (calc_crc != saved_crc) return -1;
+    if (!osfs2_valid_block_size(sb->block_size)) return -1;
+    return 0;
+}
+
 int osfs2_read_super(int fd, osfs2_super_t *sb)
 {
-    void *blk = osfs2_alloc_block();
-    if (!blk) return -1;
+    void *buf = osfs2_alloc_aligned(4096);
+    if (!buf) return -1;
 
-    if (osfs2_read_block(fd, OSFS2_SUPERBLOCK_BLK, blk) < 0) {
-        osfs2_free_block(blk);
+    if (osfs2_read_bytes(fd, 0, buf, 4096) < 0) {
+        free(buf);
         return -1;
     }
+    memcpy(sb, buf, sizeof(*sb));
 
-    memcpy(sb, blk, sizeof(*sb));
-    osfs2_free_block(blk);
-
-    if (sb->magic != OSFS2_MAGIC) {
-        fprintf(stderr, "osfs2: bad magic 0x%08X (expected 0x%08X)\n",
-                sb->magic, OSFS2_MAGIC);
-        return -1;
-    }
-    if (sb->version != OSFS2_VERSION) {
-        fprintf(stderr, "osfs2: unsupported version %u\n", sb->version);
-        return -1;
-    }
-
-    /* Verify CRC (covers everything except the crc32 field itself) */
-    uint32_t saved_crc = sb->crc32;
-    sb->crc32 = 0;
-    uint32_t calc_crc = osfs2_crc32(sb, sizeof(*sb));
-    sb->crc32 = saved_crc;
-
-    if (calc_crc != saved_crc) {
-        fprintf(stderr, "osfs2: superblock CRC mismatch (got 0x%08X, expected 0x%08X)\n",
-                calc_crc, saved_crc);
-        return -1;
+    if (osfs2_validate_super(sb) < 0) {
+        fprintf(stderr, "osfs2: primary superblock invalid, trying backup\n");
+        if (osfs2_read_bytes(fd, OSFS2_SUPER_BACKUP_OFF, buf, 4096) < 0) {
+            free(buf);
+            return -1;
+        }
+        memcpy(sb, buf, sizeof(*sb));
+        if (osfs2_validate_super(sb) < 0) {
+            fprintf(stderr, "osfs2: backup superblock also invalid\n");
+            free(buf);
+            return -1;
+        }
+        fprintf(stderr, "osfs2: WARNING — using backup superblock\n");
     }
 
+    free(buf);
+    osfs2_block_sz = sb->block_size;
     return 0;
 }
 
@@ -148,15 +159,20 @@ uint64_t osfs2_device_size(int fd)
 
 /* ── Aligned allocation ──────────────────────────────────────── */
 
-void *osfs2_alloc_block(void)
+void *osfs2_alloc_aligned(uint32_t size)
 {
     void *buf = NULL;
-    if (posix_memalign(&buf, 4096, OSFS2_BLOCK_SIZE) != 0) {
-        fprintf(stderr, "osfs2: out of memory (block alloc)\n");
+    if (posix_memalign(&buf, 4096, size) != 0) {
+        fprintf(stderr, "osfs2: out of memory (alloc %u)\n", size);
         return NULL;
     }
-    memset(buf, 0, OSFS2_BLOCK_SIZE);
+    memset(buf, 0, size);
     return buf;
+}
+
+void *osfs2_alloc_block(void)
+{
+    return osfs2_alloc_aligned(osfs2_block_sz);
 }
 
 void osfs2_free_block(void *buf)

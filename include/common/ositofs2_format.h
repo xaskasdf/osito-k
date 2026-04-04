@@ -4,13 +4,13 @@
  * Shared between host tools (Linux) and bare-metal kernel (x86-64).
  * Freestanding-compatible: no libc dependencies.
  *
- * Block size: 1MB (optimal for NVMe DMA)
- * Layout:
- *   Block 0: Superblock
- *   Block 1: File Table (4096 entries × 256 bytes)
- *   Block 2: Block CRC Table (262144 × uint32)
- *   Block 3: Layer Index Table (512 slots × 2048 bytes)
- *   Block 4..N: Data blocks
+ * Block size: configurable (default 1MB, min 64KB, stored in superblock)
+ * Metadata layout (fixed at 4MB, independent of data block size):
+ *   Offset 0:    Superblock (512 bytes)
+ *   Offset 1MB:  File Table (4096 entries × 256 bytes = 1MB)
+ *   Offset 2MB:  Block CRC Table (262144 × uint32 = 1MB)
+ *   Offset 3MB:  Layer Index Table (512 slots × 2048 bytes = 1MB)
+ *   Offset 4MB+: Data blocks (block_size from superblock)
  */
 
 #ifndef OSITOFS2_FORMAT_H
@@ -25,21 +25,35 @@
 
 /* ── Constants ───────────────────────────────────────────────── */
 
-#define OSFS2_MAGIC           0x4F534632   /* "OSF2" */
-#define OSFS2_VERSION         2
-#define OSFS2_BLOCK_SIZE      (1024 * 1024) /* 1MB */
-#define OSFS2_BLOCK_SHIFT     20
+#define OSFS2_MAGIC              0x4F534632      /* "OSF2" */
+#define OSFS2_VERSION            2
 
-#define OSFS2_SUPERBLOCK_BLK  0
-#define OSFS2_FILETAB_BLK     1
-#define OSFS2_CRCTAB_BLK      2
-#define OSFS2_LAYERIDX_BLK    3
-#define OSFS2_DATA_START_BLK  4
+/* Data block size — configurable per-filesystem, stored in superblock */
+#define OSFS2_DEFAULT_BLOCK_SIZE (1024 * 1024)    /* 1MB */
+#define OSFS2_MIN_BLOCK_SIZE     (64 * 1024)      /* 64KB */
+#define OSFS2_MAX_BLOCK_SIZE     (1024 * 1024)    /* 1MB */
+
+/* Superblock backup (4K-aligned, within first 1MB region) */
+#define OSFS2_SUPER_BACKUP_OFF   4096
+
+/* Fixed metadata byte offsets (4MB total, independent of data block size) */
+#define OSFS2_FILETAB_OFF        (1 * 1024 * 1024)
+#define OSFS2_CRCTAB_OFF         (2 * 1024 * 1024)
+#define OSFS2_LAYERIDX_OFF       (3 * 1024 * 1024)
+#define OSFS2_DATA_OFF           (4 * 1024 * 1024)
 
 #define OSFS2_MAX_FILES       4096
-#define OSFS2_MAX_BLOCKS      262144   /* CRC slots = 1MB / 4 */
+#define OSFS2_MAX_BLOCKS      262144   /* CRC slots (CRCTAB_SIZE / 4) */
 #define OSFS2_MAX_MODELS      512
 #define OSFS2_MAX_LAYERS      255
+
+/* Metadata region sizes (derived from MAX_* above) */
+#define OSFS2_FILETAB_SIZE       (OSFS2_MAX_FILES * 256)     /* 1MB */
+#define OSFS2_CRCTAB_SIZE        (OSFS2_MAX_BLOCKS * 4)      /* 1MB */
+#define OSFS2_LAYERIDX_SIZE      (OSFS2_MAX_MODELS * 2048)   /* 1MB */
+
+/* Streaming I/O chunk (GGUF/GSP readers — not tied to FS block size) */
+#define OSFS2_IO_CHUNK           (1024 * 1024)    /* 1MB */
 
 #define OSFS2_NAME_LEN        64
 #define OSFS2_MODEL_NAME_LEN  128
@@ -72,7 +86,7 @@
 typedef struct __attribute__((packed)) {
     uint32_t magic;              /* OSFS2_MAGIC */
     uint32_t version;            /* OSFS2_VERSION */
-    uint32_t block_size;         /* 1MB */
+    uint32_t block_size;         /* Data block size (from mkfs) */
     uint32_t total_blocks;       /* Total blocks on device */
     uint32_t used_blocks;        /* Blocks in use (metadata + data) */
     uint32_t file_count;         /* Number of valid files */
@@ -107,7 +121,9 @@ typedef struct __attribute__((packed)) {
     char     model_name[OSFS2_MODEL_NAME_LEN]; /* e.g. "llama-7b-q4_0" */
 
     uint16_t layer_index_slot;       /* Slot in Layer Index Table (0xFFFF = none) */
-    uint8_t  reserved[256 - 246];    /* Pad to 256 bytes */
+    uint32_t create_time;            /* Unix epoch seconds (0 = unknown) */
+    uint32_t modify_time;            /* Unix epoch seconds (0 = unknown) */
+    uint8_t  reserved[256 - 254];    /* Pad to 256 bytes */
 } osfs2_file_t;
 
 _Static_assert(sizeof(osfs2_file_t) == 256, "file entry must be 256 bytes");
@@ -125,6 +141,27 @@ typedef struct __attribute__((packed)) {
 } osfs2_layer_idx_t;
 
 _Static_assert(sizeof(osfs2_layer_idx_t) == 2048, "layer index must be 2048 bytes");
+
+/* ── Block size helpers ──────────────────────────────────────── */
+
+/* Compute log2(block_size) — block_size must be a power of 2 */
+static inline uint32_t osfs2_block_shift(uint32_t block_size) {
+    uint32_t shift = 0;
+    while ((1u << shift) < block_size) shift++;
+    return shift;
+}
+
+/* First data block number for a given block_size */
+static inline uint32_t osfs2_data_start_blk(uint32_t block_size) {
+    return OSFS2_DATA_OFF / block_size;
+}
+
+/* Validate block_size: power of 2 in [MIN, MAX] */
+static inline int osfs2_valid_block_size(uint32_t bs) {
+    return bs >= OSFS2_MIN_BLOCK_SIZE &&
+           bs <= OSFS2_MAX_BLOCK_SIZE &&
+           (bs & (bs - 1)) == 0;
+}
 
 /* ── CRC32 polynomial ────────────────────────────────────────── */
 

@@ -1,9 +1,15 @@
 /*
- * ositofs-read — Extract a file from OsitoFS v2 partition
+ * ositofs-read — Extract files from OsitoFS v2 partition
  *
- * Usage: ositofs-read <device> <filename> [output-path]
+ * Usage:
+ *   ositofs-read <device> <pattern> [--output-dir <dir>]
+ *   ositofs-read <device> <filename> [output-path]
  *
- * If output-path is omitted, writes to ./<filename>
+ * Supports wildcard patterns:
+ *   *          — extract all files
+ *   *.ext      — match by extension (case-insensitive)
+ *   prefix*    — match by prefix
+ *   exactname  — exact match (single file)
  */
 
 #include <stdio.h>
@@ -11,19 +17,143 @@
 #include <string.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <sys/stat.h>
 
 #include "common.h"
 
-int main(int argc, char **argv)
+static void fprint_size(FILE *fp, uint64_t bytes)
 {
-    if (argc < 3 || argc > 4) {
-        fprintf(stderr, "Usage: ositofs-read <device> <filename> [output-path]\n");
+    if (bytes >= (uint64_t)1024 * 1024 * 1024)
+        fprintf(fp, "%.1f GB", (double)bytes / (1024.0 * 1024.0 * 1024.0));
+    else if (bytes >= 1024 * 1024)
+        fprintf(fp, "%.1f MB", (double)bytes / (1024.0 * 1024.0));
+    else if (bytes >= 1024)
+        fprintf(fp, "%.1f KB", (double)bytes / 1024.0);
+    else
+        fprintf(fp, "%llu B", (unsigned long long)bytes);
+}
+
+/* ── Simple wildcard match (same style as kernel osfs2_wildcard_match) ── */
+
+static int wildcard_match(const char *pattern, const char *name)
+{
+    int plen = (int)strlen(pattern);
+    int nlen = (int)strlen(name);
+
+    /* "*" — match everything */
+    if (plen == 1 && pattern[0] == '*')
+        return 1;
+
+    /* "*.ext" — match by extension (case-insensitive) */
+    if (pattern[0] == '*' && pattern[1] == '.') {
+        const char *ext = pattern + 1;  /* ".ext" */
+        int elen = plen - 1;
+        if (nlen < elen) return 0;
+        for (int i = 0; i < elen; i++) {
+            char a = name[nlen - elen + i];
+            char b = ext[i];
+            if (a >= 'A' && a <= 'Z') a += 32;
+            if (b >= 'A' && b <= 'Z') b += 32;
+            if (a != b) return 0;
+        }
         return 1;
     }
 
-    const char *device = argv[1];
-    const char *filename = argv[2];
-    const char *output = argc > 3 ? argv[3] : filename;
+    /* "prefix*" — match by prefix */
+    if (plen > 1 && pattern[plen - 1] == '*') {
+        int prefix_len = plen - 1;
+        if (nlen < prefix_len) return 0;
+        return strncmp(pattern, name, prefix_len) == 0;
+    }
+
+    /* Exact match fallback */
+    return strcmp(pattern, name) == 0;
+}
+
+/* Returns 1 if pattern contains wildcard characters */
+static int is_wildcard(const char *pattern)
+{
+    return strchr(pattern, '*') != NULL;
+}
+
+/* ── Extract a single file to output path ────────────────────────────── */
+
+static int extract_file(int fd, osfs2_file_t *f, const char *output)
+{
+    uint64_t file_size = f->size;
+    uint32_t start_block = f->start_block;
+
+    int out_fd = open(output, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (out_fd < 0) {
+        perror("open output");
+        return -1;
+    }
+
+    void *data_blk = osfs2_alloc_block();
+    if (!data_blk) {
+        close(out_fd);
+        return -1;
+    }
+
+    uint64_t remaining = file_size;
+    uint32_t blk = start_block;
+    int ok = 1;
+
+    while (remaining > 0) {
+        if (osfs2_read_block(fd, blk, data_blk) < 0) {
+            fprintf(stderr, "ositofs-read: failed reading block %u\n", blk);
+            ok = 0;
+            break;
+        }
+
+        size_t to_write = remaining > osfs2_block_sz
+                        ? osfs2_block_sz : (size_t)remaining;
+        ssize_t n = write(out_fd, data_blk, to_write);
+        if (n != (ssize_t)to_write) {
+            perror("write output");
+            ok = 0;
+            break;
+        }
+
+        remaining -= to_write;
+        blk++;
+    }
+
+    close(out_fd);
+    osfs2_free_block(data_blk);
+    return ok ? 0 : -1;
+}
+
+/* ── Main ────────────────────────────────────────────────────────────── */
+
+int main(int argc, char **argv)
+{
+    if (argc < 3) {
+        fprintf(stderr,
+            "Usage: ositofs-read <device> <pattern> [--output-dir <dir>]\n"
+            "       ositofs-read <device> <filename> [output-path]\n"
+            "\n"
+            "Patterns: *  *.ext  prefix*  exact-name\n");
+        return 1;
+    }
+
+    const char *device     = argv[1];
+    const char *pattern    = argv[2];
+    const char *output_dir = NULL;
+    const char *output_path = NULL;
+
+    /* Parse optional arguments */
+    for (int i = 3; i < argc; i++) {
+        if (strcmp(argv[i], "--output-dir") == 0 && i + 1 < argc) {
+            output_dir = argv[++i];
+        } else if (!output_path && i == 3 && !is_wildcard(pattern)) {
+            /* Legacy: ositofs-read dev file.bin /tmp/out.bin */
+            output_path = argv[i];
+        } else {
+            fprintf(stderr, "ositofs-read: unknown argument '%s'\n", argv[i]);
+            return 1;
+        }
+    }
 
     int fd = osfs2_open_device(device, 1);
     if (fd < 0) return 1;
@@ -34,88 +164,94 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    /* Read file table */
-    void *ft_blk = osfs2_alloc_block();
+    /* Read file table (1MB at fixed offset) */
+    void *ft_blk = osfs2_alloc_aligned(OSFS2_FILETAB_SIZE);
     if (!ft_blk) { osfs2_close_device(fd); return 1; }
-    if (osfs2_read_block(fd, OSFS2_FILETAB_BLK, ft_blk) < 0) {
-        osfs2_free_block(ft_blk);
+    if (osfs2_read_bytes(fd, OSFS2_FILETAB_OFF, ft_blk, OSFS2_FILETAB_SIZE) < 0) {
+        free(ft_blk);
         osfs2_close_device(fd);
         return 1;
     }
 
     osfs2_file_t *ft = (osfs2_file_t *)ft_blk;
 
-    /* Find the file */
-    int found = -1;
+    /* Scan file table for all matches */
+    int matches[OSFS2_MAX_FILES];
+    int match_count = 0;
+
     for (uint32_t i = 0; i < OSFS2_MAX_FILES; i++) {
         if (!(ft[i].flags & OSFS2_FLAG_VALID)) continue;
-        if (strcmp(ft[i].name, filename) == 0) {
-            found = (int)i;
-            break;
-        }
+        if (wildcard_match(pattern, ft[i].name))
+            matches[match_count++] = (int)i;
     }
 
-    if (found < 0) {
-        fprintf(stderr, "ositofs-read: file '%s' not found\n", filename);
-        osfs2_free_block(ft_blk);
+    if (match_count == 0) {
+        fprintf(stderr, "ositofs-read: no files matching '%s'\n", pattern);
+        free(ft_blk);
         osfs2_close_device(fd);
         return 1;
     }
 
-    osfs2_file_t *f = &ft[found];
-    uint64_t file_size = f->size;
-    uint32_t start_block = f->start_block;
+    /* Single file with explicit output path (legacy mode) */
+    if (match_count == 1 && output_path) {
+        osfs2_file_t *f = &ft[matches[0]];
+        fprintf(stderr, "Extracting '%s' (", f->name);
+        fprint_size(stderr, f->size);
+        fprintf(stderr, ")...\n");
 
-    fprintf(stderr, "Extracting '%s' (%llu bytes, block %u)...\n",
-            filename, (unsigned long long)file_size, start_block);
-
-    /* Open output file */
-    int out_fd = open(output, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (out_fd < 0) {
-        perror("open output");
-        osfs2_free_block(ft_blk);
-        osfs2_close_device(fd);
-        return 1;
-    }
-
-    /* Read data blocks and write to output */
-    void *data_blk = osfs2_alloc_block();
-    if (!data_blk) {
-        close(out_fd);
-        osfs2_free_block(ft_blk);
-        osfs2_close_device(fd);
-        return 1;
-    }
-
-    uint64_t remaining = file_size;
-    uint32_t blk = start_block;
-
-    while (remaining > 0) {
-        if (osfs2_read_block(fd, blk, data_blk) < 0) {
-            fprintf(stderr, "ositofs-read: failed reading block %u\n", blk);
-            break;
+        int rc = extract_file(fd, f, output_path);
+        if (rc == 0) {
+            fprintf(stderr, "OK: %s -> %s (", f->name, output_path);
+            fprint_size(stderr, f->size);
+            fprintf(stderr, ")\n");
         }
 
-        size_t to_write = remaining > OSFS2_BLOCK_SIZE ? OSFS2_BLOCK_SIZE : (size_t)remaining;
-        ssize_t n = write(out_fd, data_blk, to_write);
-        if (n != (ssize_t)to_write) {
-            perror("write output");
-            break;
-        }
-
-        remaining -= to_write;
-        blk++;
+        free(ft_blk);
+        osfs2_close_device(fd);
+        return rc;
     }
 
-    close(out_fd);
-    osfs2_free_block(data_blk);
-    osfs2_free_block(ft_blk);
+    /* Batch extraction */
+    int extracted = 0;
+    int errors = 0;
+    uint64_t total_bytes = 0;
+
+    for (int m = 0; m < match_count; m++) {
+        osfs2_file_t *f = &ft[matches[m]];
+
+        /* Build output path */
+        char out_path[1024];
+        if (output_dir) {
+            snprintf(out_path, sizeof(out_path), "%s/%s", output_dir, f->name);
+        } else {
+            snprintf(out_path, sizeof(out_path), "%s", f->name);
+        }
+
+        fprintf(stderr, "[%d/%d] Extracting '%s' (",
+                m + 1, match_count, f->name);
+        fprint_size(stderr, f->size);
+        fprintf(stderr, ")...\n");
+
+        int rc = extract_file(fd, f, out_path);
+        if (rc == 0) {
+            extracted++;
+            total_bytes += f->size;
+        } else {
+            errors++;
+            fprintf(stderr, "  FAILED: %s\n", f->name);
+        }
+    }
+
+    /* Summary */
+    fprintf(stderr, "\nExtracted %d file%s (",
+            extracted, extracted == 1 ? "" : "s");
+    fprint_size(stderr, total_bytes);
+    fprintf(stderr, ")");
+    if (errors > 0)
+        fprintf(stderr, ", %d error%s", errors, errors == 1 ? "" : "s");
+    fprintf(stderr, "\n");
+
+    free(ft_blk);
     osfs2_close_device(fd);
-
-    if (remaining == 0) {
-        fprintf(stderr, "OK: %s → %s (%llu bytes)\n", filename, output,
-                (unsigned long long)file_size);
-        return 0;
-    }
-    return 1;
+    return errors > 0 ? 1 : 0;
 }

@@ -381,7 +381,7 @@ int gguf_load(gguf_model_t *model)
     uint64_t remaining = file->size;
 
     while (remaining > 0) {
-        uint64_t chunk = remaining < OSFS2_BLOCK_SIZE ? remaining : OSFS2_BLOCK_SIZE;
+        uint64_t chunk = remaining < OSFS2_IO_CHUNK ? remaining : OSFS2_IO_CHUNK;
         if (osfs2_read(file, offset, (uint8_t *)model->file_data + offset, chunk) < 0) {
             serial_puts("[GGUF] Read failed at offset ");
             serial_puthex(offset, 16);
