@@ -1343,8 +1343,23 @@ int cpu8086_run(dos_vm_t *vm)
                 switch (cr_num) {
                 case 0:
                     cpu->cr0 = cr_val;
-                    if (cr_val & 1)
+                    if ((cr_val & 1) && !cpu->protected_mode) {
                         cpu->protected_mode = true;
+                        serial_puts("[DOS] MOV CR0: PE bit set — switching to native execution\n");
+                        serial_puts("[DOS] GDT base=");
+                        serial_puthex(cpu->gdtr.base, 8);
+                        serial_puts(" IDT base=");
+                        serial_puthex(cpu->idtr.base, 8);
+                        serial_puts("\n");
+                        /* Transfer to native 32-bit execution.
+                         * The next instruction after MOV CR0 is typically a far JMP
+                         * to a 32-bit code segment. We let the interpreter execute
+                         * that JMP, then transfer on the next fetch in PM. */
+                        extern void dos_transfer_to_native(dos_vm_t *vm);
+                        dos_transfer_to_native(vm);
+                        /* If transfer succeeds, does not return here.
+                         * If it fails (e.g., can't set up GDT), continues interpreting. */
+                    }
                     break;
                 case 2: cpu->cr2 = cr_val; break;
                 case 3:

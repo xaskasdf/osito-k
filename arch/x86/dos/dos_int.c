@@ -192,18 +192,69 @@ typedef struct {
     uint64_t rbp, rdi, rsi, rdx, rcx, rbx, rax;
 } dos_native_regs_t;
 
+/*
+ * Global DOS VM state for native 32-bit execution.
+ * Set up by dos_transfer_to_native() before jumping to 32-bit code.
+ * The native dispatch reads/writes this to provide DOS services.
+ */
+static dos_vm_t *g_native_dos_vm = 0;
+static cpu8086_state_t g_native_cpu;
+
+void dos_set_native_vm(dos_vm_t *vm) { g_native_dos_vm = vm; }
+
 void dos_int_native_dispatch(uint64_t int_num, dos_native_regs_t *regs)
 {
-    /* TODO: Bridge to existing dos_int_dispatch by populating a
-     * temporary dos_vm_t/cpu8086_state_t from the native register frame,
-     * calling the handler, and copying results back.
-     * For now, log and return. */
-    extern void serial_puts(const char *s);
-    extern void serial_puthex(uint64_t val, int digits);
+    if (!g_native_dos_vm) return;
 
-    serial_puts("[DOS-NATIVE] INT ");
-    serial_puthex(int_num, 2);
-    serial_puts(" AH=");
-    serial_puthex((regs->rax >> 8) & 0xFF, 2);
-    serial_puts("\n");
+    dos_vm_t *vm = g_native_dos_vm;
+    cpu8086_state_t *cpu = &g_native_cpu;
+    vm->cpu = cpu;
+
+    /* Copy native registers → emulated CPU state for DOS handlers */
+    cpu->eax = (uint32_t)regs->rax;
+    cpu->ebx = (uint32_t)regs->rbx;
+    cpu->ecx = (uint32_t)regs->rcx;
+    cpu->edx = (uint32_t)regs->rdx;
+    cpu->esi = (uint32_t)regs->rsi;
+    cpu->edi = (uint32_t)regs->rdi;
+    cpu->ebp = (uint32_t)regs->rbp;
+    cpu->ds  = (uint16_t)regs->ds;
+    cpu->es  = (uint16_t)regs->es;
+    cpu->flags = 0x0202;  /* IF=1, fixed bits */
+    cpu->running = true;
+    cpu->protected_mode = true;
+    cpu->vm = vm;
+
+    /* Log non-trivial INTs */
+    static uint32_t native_int_count = 0;
+    if (native_int_count < 50) {
+        native_int_count++;
+        serial_puts("[DOS32] INT ");
+        serial_puthex(int_num, 2);
+        serial_puts("h AH=");
+        serial_puthex(cpu->ah, 2);
+        serial_puts("\n");
+    }
+
+    /* Dispatch to existing handlers (dos_api.c, dos_bios.c, etc.) */
+    dos_int_dispatch(vm, (uint8_t)int_num);
+
+    /* Copy results back → native registers */
+    regs->rax = cpu->eax;
+    regs->rbx = cpu->ebx;
+    regs->rcx = cpu->ecx;
+    regs->rdx = cpu->edx;
+    regs->rsi = cpu->esi;
+    regs->rdi = cpu->edi;
+    regs->rbp = cpu->ebp;
+    regs->ds  = cpu->ds;
+    regs->es  = cpu->es;
+
+    /* Handle terminate (INT 20h or INT 21h/4Ch) */
+    if (!cpu->running) {
+        serial_puts("[DOS32] Program terminated, exit code ");
+        serial_puthex(cpu->exit_code, 2);
+        serial_puts("\n");
+        /* TODO: return to kernel shell instead of hanging */
+    }
 }

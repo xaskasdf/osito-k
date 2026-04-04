@@ -248,3 +248,90 @@ int dos_run(const char *filename, int argc, const char **argv)
 
     return exit_code;
 }
+
+/* ── Transfer from 8086 interpreter to native 32-bit execution ──── */
+/*
+ * Called when the interpreter detects MOV CR0 with PE bit set.
+ * DOS4GW has set up its GDT/IDT in emulated memory and is switching
+ * to protected mode. We take over: install real GDT segments and
+ * jump to the 32-bit code natively via LRETQ.
+ *
+ * Pattern: same as win32/compat32.c:compat32_enter()
+ */
+
+extern void dos_set_native_vm(dos_vm_t *vm);
+
+void dos_transfer_to_native(dos_vm_t *vm)
+{
+    cpu8086_state_t *cpu = vm->cpu;
+
+    serial_puts("[DOS] Attempting native transfer...\n");
+    serial_puts("[DOS] CS=");
+    serial_puthex(cpu->cs, 4);
+    serial_puts(" EIP=");
+    serial_puthex(cpu->eip, 8);
+    serial_puts(" SS=");
+    serial_puthex(cpu->ss, 4);
+    serial_puts(" ESP=");
+    serial_puthex(cpu->esp, 8);
+    serial_puts("\n");
+
+    /* DOS4GW's GDT is in emulated memory. The GDT base was loaded via LGDT.
+     * For flat model (base=0, limit=4GB), we can use the existing kernel
+     * GDT entries at indices 8-9 (CODE32=0x40, DATA32=0x48) which are
+     * already installed by win32_init(). */
+
+    /* Validate: the GDT must be accessible */
+    if (cpu->gdtr.base == 0 || cpu->gdtr.base >= vm->total_mem_size) {
+        serial_puts("[DOS] GDT base invalid, staying in interpreter\n");
+        return;
+    }
+
+    /* Read DOS4GW's code segment descriptor to verify it's flat 32-bit */
+    uint16_t cs_idx = cpu->cs >> 3;
+    uint32_t cs_desc_addr = cpu->gdtr.base + cs_idx * 8;
+    if (cs_desc_addr + 7 >= vm->total_mem_size) {
+        serial_puts("[DOS] CS descriptor out of range, staying in interpreter\n");
+        return;
+    }
+
+    /* Log the descriptor */
+    serial_puts("[DOS] CS descriptor at GDT[");
+    serial_puthex(cs_idx, 4);
+    serial_puts("]: ");
+    for (int i = 0; i < 8; i++) {
+        serial_puthex(vm->mem[cs_desc_addr + i], 2);
+        serial_puts(" ");
+    }
+    serial_puts("\n");
+
+    /* Set up the native VM state for INT dispatch */
+    dos_set_native_vm(vm);
+
+    /* The emulated memory (vm->mem) IS the physical memory that the 32-bit
+     * code will access. Since OsitoK uses identity mapping, and the emulated
+     * memory is allocated via mem_alloc_pages(), the 32-bit code can access
+     * it directly IF it uses flat model (base=0).
+     *
+     * However, the emulated memory starts at some address in OsitoK's
+     * address space, NOT at physical address 0. DOS4GW expects base=0.
+     * We'd need to map the emulated memory at address 0 or adjust the
+     * GDT base to point to our emulated memory.
+     *
+     * For now, log the state and return to the interpreter. The full
+     * native transfer requires address space setup that we'll implement
+     * after verifying the concept works. */
+
+    serial_puts("[DOS] Native transfer: concept validated. ");
+    serial_puts("Need address space mapping for base=0 flat model.\n");
+    serial_puts("[DOS] Continuing in interpreter for now...\n");
+
+    /* TODO: The full implementation will:
+     * 1. Map emulated memory at linear address 0 (or adjust GDT bases)
+     * 2. Install DOS4GW's GDT entries (or use flat CODE32/DATA32)
+     * 3. Set up ESP from cpu->ss:cpu->esp
+     * 4. LRETQ to cpu->cs:cpu->eip in 32-bit compat mode
+     *
+     * This requires the kernel's paging to map the emulated memory
+     * region at virtual address 0, which needs paging.c changes. */
+}
