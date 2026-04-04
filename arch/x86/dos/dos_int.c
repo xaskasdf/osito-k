@@ -23,6 +23,7 @@ void dos_int1a_timer(dos_vm_t *vm);
 void dos_int2f_dispatch(dos_vm_t *vm);
 void dos_int31_dpmi(dos_vm_t *vm);
 void dpmi_enter_protected_mode(dos_vm_t *vm);
+void dos_int67_dispatch(dos_vm_t *vm);
 
 /* ── INT dispatch ───────────────────────────────────────────────── */
 
@@ -62,6 +63,10 @@ void dos_int_dispatch(dos_vm_t *vm, uint8_t int_num)
     case 0x33:
         /* Mouse stub: not installed */
         vm->cpu->ax = 0x0000;
+        break;
+
+    case 0x67:
+        dos_int67_dispatch(vm);
         break;
 
     case 0xFE:
