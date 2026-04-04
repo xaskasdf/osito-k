@@ -75,14 +75,14 @@ int2e_stub:
     movl %r14d, (%r12)               /* depth++ */
     shlq $5, %r13                    /* depth * 32 (4 regs × 8 bytes) */
     addq %r13, %r10                  /* &saved[depth] */
-    movq 112(%rsp), %r14             /* saved RBX from push area */
-    movq %r14, 0(%r10)               /* save RBX */
-    movq 88(%rsp), %r14              /* saved RSI */
-    movq %r14, 8(%r10)               /* save RSI */
-    movq 80(%rsp), %r14              /* saved RDI */
-    movq %r14, 16(%r10)              /* save RDI */
-    movq 48(%rsp), %r14              /* saved RBP (offset from R8 push) */
-    movq %r14, 24(%r10)              /* save RBP */
+    movq 112(%rsp), %r14             /* saved RBX (push #1, offset 112) */
+    movq %r14, 0(%r10)
+    movq 88(%rsp), %r14              /* saved RSI (push #4, offset 88) */
+    movq %r14, 8(%r10)
+    movq 80(%rsp), %r14              /* saved RDI (push #5, offset 80) */
+    movq %r14, 16(%r10)
+    movq 72(%rsp), %r14              /* saved RBP (push #6, offset 72) */
+    movq %r14, 24(%r10)
 
     /* Align and call */
     mov %rsp, %rbp
@@ -100,14 +100,14 @@ int2e_stub:
     movl %r13d, (%r12)
     shlq $5, %r13
     addq %r13, %r10
-    movq 0(%r10), %r14               /* restore RBX */
+    movq 0(%r10), %r14               /* restore RBX → offset 112 */
     movq %r14, 112(%rsp)
-    movq 8(%r10), %r14               /* restore RSI */
+    movq 8(%r10), %r14               /* restore RSI → offset 88 */
     movq %r14, 88(%rsp)
-    movq 16(%r10), %r14              /* restore RDI */
+    movq 16(%r10), %r14              /* restore RDI → offset 80 */
     movq %r14, 80(%rsp)
-    movq 24(%r10), %r14              /* restore RBP */
-    movq %r14, 48(%rsp)
+    movq 24(%r10), %r14              /* restore RBP → offset 72 */
+    movq %r14, 72(%rsp)
 
     /*
      * C++ EH catch dispatch: if compat32_seh_dispatch found a catch
@@ -129,10 +129,10 @@ int2e_stub:
     movq %r11, 144(%rsp)
     movl $0, (%r10)                  /* clear esp */
 
-    /* Set EBP in saved register area (RBP is at RSP+48 after 15 pushes) */
+    /* Set EBP in saved register area (RBP is at RSP+72 after 15 pushes + IST1) */
     leaq g_compat32_unwind_ebp(%rip), %r10
     movl (%r10), %r11d
-    movq %r11, 48(%rsp)              /* offset 48 = saved RBP */
+    movq %r11, 72(%rsp)              /* offset 72 = saved RBP */
     movl $0, (%r10)                  /* clear ebp */
 
 .Lno_unwind:
