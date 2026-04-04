@@ -22,6 +22,7 @@
 extern void     serial_puts(const char *s);
 extern void     serial_puthex(uint64_t val, int digits);
 extern uint64_t idt_get_ticks(void);
+extern void     sched_yield(void);
 extern HANDLE_TABLE g_handle_table;
 
 /* ── Event object ───────────────────────────────────────────── */
@@ -249,8 +250,15 @@ NTSTATUS sys_NtReleaseSemaphore(ULONG_PTR *args)
 }
 
 /* ── Wait helper: check if object is signaled ───────────────── */
+/*
+ * These are exported (non-static) so ntprocess.c can use them for
+ * NtWaitForSingleObject on event/mutant/semaphore handles.
+ */
 
-static BOOL is_signaled(HANDLE_ENTRY *entry)
+/* Forward declare THREAD_OBJECT state enum values for thread handle waits */
+#define THREAD_STATE_TERMINATED 4
+
+BOOL ntsync_is_signaled(HANDLE_ENTRY *entry)
 {
     switch (entry->type) {
     case OBJ_TYPE_EVENT: {
@@ -265,13 +273,19 @@ static BOOL is_signaled(HANDLE_ENTRY *entry)
         SEMAPHORE_OBJECT *sem = (SEMAPHORE_OBJECT *)entry->object;
         return sem->count > 0;
     }
+    case OBJ_TYPE_THREAD: {
+        /* Thread is signaled when it has terminated.
+         * THREAD_OBJECT layout: tid(4), state(4), ... */
+        int *state_ptr = (int *)((char *)entry->object + 4);
+        return (*state_ptr == THREAD_STATE_TERMINATED);
+    }
     default:
         return FALSE;
     }
 }
 
 /* Acquire a signaled object (consume the signal) */
-static void acquire_object(HANDLE_ENTRY *entry)
+void ntsync_acquire_object(HANDLE_ENTRY *entry)
 {
     switch (entry->type) {
     case OBJ_TYPE_EVENT: {
@@ -292,6 +306,9 @@ static void acquire_object(HANDLE_ENTRY *entry)
         sem->count--;
         break;
     }
+    case OBJ_TYPE_THREAD:
+        /* Nothing to consume for a thread — signaled = terminated */
+        break;
     default:
         break;
     }
@@ -336,8 +353,8 @@ NTSTATUS sys_NtWaitForMultipleObjects(ULONG_PTR *args)
         if (WaitType == 1) {
             /* WaitAny: return when ANY object is signaled */
             for (ULONG i = 0; i < Count; i++) {
-                if (is_signaled(entries[i])) {
-                    acquire_object(entries[i]);
+                if (ntsync_is_signaled(entries[i])) {
+                    ntsync_acquire_object(entries[i]);
                     return STATUS_WAIT_0 + i;
                 }
             }
@@ -345,14 +362,14 @@ NTSTATUS sys_NtWaitForMultipleObjects(ULONG_PTR *args)
             /* WaitAll: return when ALL objects are signaled */
             BOOL all_signaled = TRUE;
             for (ULONG i = 0; i < Count; i++) {
-                if (!is_signaled(entries[i])) {
+                if (!ntsync_is_signaled(entries[i])) {
                     all_signaled = FALSE;
                     break;
                 }
             }
             if (all_signaled) {
                 for (ULONG i = 0; i < Count; i++)
-                    acquire_object(entries[i]);
+                    ntsync_acquire_object(entries[i]);
                 return STATUS_WAIT_0;
             }
         }
@@ -367,7 +384,7 @@ NTSTATUS sys_NtWaitForMultipleObjects(ULONG_PTR *args)
         if (Timeout && Timeout->QuadPart == 0)
             return STATUS_TIMEOUT;
 
-        __asm__ volatile("sti; hlt; cli");
+        sched_yield();  /* yield to scheduler instead of busy-wait */
     }
 }
 

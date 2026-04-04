@@ -143,8 +143,17 @@ gui/               Cross-architecture graphical desktop (elementaryOS-inspired)
 
 ### Host Tools (tools/)
 ```
-tools/ositofs/     mkfs.c, write.c, read.c, ls.c, info.c — OsitoFS v2 host tools
-include/common/    ositofs2_format.h — shared on-disk format
+tools/ositofs/     mkfs.c — format (--block-size, --label)
+                   write.c — batch write, --from-list manifest, --overwrite
+                   read.c — extract with wildcards (*.ext, prefix*, *)
+                   ls.c — list with timestamps, block_size display
+                   info.c — filesystem info + fragmentation + file stats
+                   delete.c — batch delete with wildcards, --dry-run
+                   rename.c — metadata-only rename
+                   fsck.c — consistency check + --repair + --verbose CRC verify
+                   defrag.c — offline compaction, --dry-run, --verbose
+                   common.c/h — shared I/O, runtime block_size, superblock backup
+include/common/    ositofs2_format.h — shared on-disk format (configurable block_size 64K-1M)
 ```
 
 ### AArch64 Port (arch/arm/)
@@ -220,6 +229,9 @@ arch/arm/          SM8350 (ROG Phone 5) bare-metal port — see docs/aarch64-det
 | X-XHCI  | xHCI USB 3.x driver + HID keyboard/mouse | Done |
 | X-RETINA| Display pipeline (compositor, shared memory, GUI desktop) | WIP |
 | X-WIN32 | Windows PE32 compat layer (15 DLL shims) | WIP |
+| X-PGTBL | Per-process page tables (CR3 switch on context switch) | Done |
+| X-W32THR| Win32 real threading (CreateThread → sched_spawn) | Done |
+| X-OSFS3 | OsitoFS v2 overhaul (9 tools, block_size, timestamps, hash, CRC, fsck) | Done |
 | **Phase 0** | **Kernel/bootloader separation** (boot.efi + kernel.elf) | **Done** |
 | **Phase 1** | **TCC cross-compiles kernel from host** | **Done** |
 | **Phase 2** | **TCC compiles kernel inside OsitoK** (62 .c → 733KB ELF) | **Done** |
@@ -231,6 +243,8 @@ arch/arm/          SM8350 (ROG Phone 5) bare-metal port — see docs/aarch64-det
 > Binary compatibility roadmap: see [docs/binary-compat-roadmap.md](docs/binary-compat-roadmap.md)
 > Paths to Claude analysis: see [docs/paths-to-claude-on-ositok.md](docs/paths-to-claude-on-ositok.md)
 > Kernel/bootloader separation + self-compiling road: see [docs/kernel-separation.md](docs/kernel-separation.md)
+> Reference material (WRK, NT, DOS source): see [docs/reference-material.md](docs/reference-material.md)
+> OsitoFS v2 host tools (9 tools): see `tools/ositofs/`
 
 **Tier 8: Hardware Boot** — Boot OsitoK on real hardware (AMD Ryzen 7 5800X + RTX 3090).
 

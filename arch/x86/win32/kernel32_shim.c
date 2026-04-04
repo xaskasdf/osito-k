@@ -8,6 +8,7 @@
 #include "kernel32_shim.h"
 #include "ntdll_shim.h"
 #include "dllloader.h"
+#include "handle.h"
 
 /* ── Kernel interfaces (forward declarations) ─────────────── */
 extern void serial_puts(const char *s);
@@ -586,12 +587,10 @@ void WINAPI SetLastError(DWORD dwErrCode)
 
 /* ── Misc API ───────────────────────────────────────────────── */
 
-/* Forward declaration — defined in Thread API section */
-static void run_deferred_thread(void);
-
 void WINAPI Sleep(DWORD dwMilliseconds)
 {
-    run_deferred_thread();  /* cooperative yield point */
+    extern void sched_yield(void);
+    sched_yield();  /* give other threads a chance to run */
     LARGE_INTEGER delay;
     /* Negative = relative time in 100ns units */
     delay.QuadPart = -(LONGLONG)dwMilliseconds * 10000LL;
@@ -950,15 +949,18 @@ BOOL WINAPI FreeEnvironmentStringsA(PCSTR lpszEnvironmentBlock)
 
 /* ── Critical Section ───────────────────────────────────────── */
 /*
- * Single-threaded for now — no actual locking needed.
- * When OsitoK gets real threads, these become spinlocks + futex.
+ * Real spinlock-based critical sections for preemptive Win32 threads.
+ * Uses OwningThread to track the owning thread ID for recursive locking.
+ * Spins briefly then yields to the scheduler if the lock is held.
  */
+
+extern DWORD WINAPI GetCurrentThreadId(void);
 
 void WINAPI InitializeCriticalSection(LPCRITICAL_SECTION lpCS)
 {
     if (!lpCS) return;
     lpCS->DebugInfo      = NULL;
-    lpCS->LockCount      = -1;
+    lpCS->LockCount      = -1;  /* -1 = unlocked */
     lpCS->RecursionCount = 0;
     lpCS->OwningThread   = NULL;
     lpCS->LockSemaphore  = NULL;
@@ -974,15 +976,55 @@ void WINAPI InitializeCriticalSectionAndSpinCount(LPCRITICAL_SECTION lpCS, DWORD
 void WINAPI EnterCriticalSection(LPCRITICAL_SECTION lpCS)
 {
     if (!lpCS) return;
-    lpCS->LockCount++;
-    lpCS->RecursionCount++;
-    lpCS->OwningThread = (HANDLE)(ULONG_PTR)1; /* current thread */
+    extern void sched_yield(void);
+    HANDLE me = (HANDLE)(ULONG_PTR)GetCurrentThreadId();
+
+    /* Fast path: recursive lock by same thread */
+    if (lpCS->OwningThread == me) {
+        lpCS->RecursionCount++;
+        lpCS->LockCount++;
+        return;
+    }
+
+    /* Spin-then-yield acquisition */
+    for (;;) {
+        LONG old = __sync_val_compare_and_swap(&lpCS->LockCount, -1, 0);
+        if (old == -1) {
+            /* Acquired */
+            lpCS->OwningThread = me;
+            lpCS->RecursionCount = 1;
+            return;
+        }
+        /* Spin for a bit before yielding */
+        for (DWORD spin = 0; spin < (lpCS->SpinCount ? lpCS->SpinCount : 100); spin++) {
+            __asm__ volatile ("pause" ::: "memory");
+            if (lpCS->LockCount == -1) break;
+        }
+        if (lpCS->LockCount == -1) continue;
+        /* Yield to scheduler */
+        sched_yield();
+    }
 }
 
 BOOL WINAPI TryEnterCriticalSection(LPCRITICAL_SECTION lpCS)
 {
-    EnterCriticalSection(lpCS);
-    return TRUE;
+    if (!lpCS) return FALSE;
+    HANDLE me = (HANDLE)(ULONG_PTR)GetCurrentThreadId();
+
+    /* Recursive? */
+    if (lpCS->OwningThread == me) {
+        lpCS->RecursionCount++;
+        lpCS->LockCount++;
+        return TRUE;
+    }
+
+    LONG old = __sync_val_compare_and_swap(&lpCS->LockCount, -1, 0);
+    if (old == -1) {
+        lpCS->OwningThread = me;
+        lpCS->RecursionCount = 1;
+        return TRUE;
+    }
+    return FALSE;
 }
 
 void WINAPI LeaveCriticalSection(LPCRITICAL_SECTION lpCS)
@@ -991,8 +1033,11 @@ void WINAPI LeaveCriticalSection(LPCRITICAL_SECTION lpCS)
     lpCS->RecursionCount--;
     if (lpCS->RecursionCount == 0) {
         lpCS->OwningThread = NULL;
+        __sync_lock_release(&lpCS->LockCount);
+        lpCS->LockCount = -1;  /* mark unlocked */
+    } else {
+        lpCS->LockCount--;
     }
-    lpCS->LockCount--;
 }
 
 void WINAPI DeleteCriticalSection(LPCRITICAL_SECTION lpCS)
@@ -1044,38 +1089,158 @@ BOOL WINAPI TlsSetValue(DWORD dwTlsIndex, PVOID lpTlsValue)
     return TRUE;
 }
 
-/* ── Thread API ────────────────────────────────────────────── */
+/* ── Thread API — Real preemptive Win32 threads ────────────── */
+/*
+ * CreateThread creates REAL kernel threads via sched_spawn().
+ * Each Win32 thread runs as its own preemptively-scheduled kernel process.
+ *
+ * Threading model:
+ *   - sched_spawn() takes void(*entry)(void), no argument passing.
+ *     We use a static context table indexed by slot to pass thread params.
+ *   - compat32_callback_args() is NOT thread-safe (global callback stacks).
+ *     A global spinlock serializes 32-bit code execution across threads.
+ *   - THREAD_OBJECT from ntprocess.c tracks NT thread state.
+ *     We link it to the kernel PID so WaitForSingleObject works.
+ */
 
 static DWORD g_thread_id_counter = 1;
 
-/*
- * Deferred thread execution: CreateThread stores the function pointer;
- * the thread runs cooperatively when the main thread next yields
- * (Sleep, WaitForSingleObject, GetMessage). This avoids blocking
- * the main thread inline while still executing the thread function.
- */
-static LPTHREAD_START_ROUTINE g_deferred_thread_func;
-static PVOID                  g_deferred_thread_param;
-static HANDLE                 g_deferred_thread_handle;
-static int                    g_deferred_thread_pending;
-
-/* Run deferred thread if one is pending. Called from yield points. */
 extern uint32_t compat32_callback_args(uint32_t func_addr, int nargs,
                                         const uint32_t *args);
+extern void *kmalloc(uint64_t size);
+extern void  kfree(void *ptr);
+extern int   sched_spawn(const char *name, void (*entry)(void));
+extern void  sched_yield(void);
+extern uint64_t idt_get_ticks(void);
 
-static void run_deferred_thread(void)
+/* ── compat32 serialization lock ──────────────────────────────
+ * Only one thread may execute 32-bit code at a time because
+ * compat32_callback_args uses global state (callback stacks,
+ * depth counter, IST1 save slots). This spinlock protects it. */
+static volatile int g_compat32_lock = 0;
+
+void win32_compat32_lock(void)
 {
-    if (!g_deferred_thread_pending) return;
-    g_deferred_thread_pending = 0;
+    while (__sync_lock_test_and_set(&g_compat32_lock, 1)) {
+        for (int i = 0; i < 200; i++)
+            __asm__ volatile ("pause" ::: "memory");
+        sched_yield();
+    }
+}
 
-    serial_puts("[K32] Running deferred thread at 0x");
-    serial_puthex((uint32_t)(ULONG_PTR)g_deferred_thread_func, 8);
+void win32_compat32_unlock(void)
+{
+    __sync_lock_release(&g_compat32_lock);
+}
+
+/* ── Win32 thread context table ───────────────────────────────
+ * sched_spawn only takes void(*)(void), so we pass context via a
+ * static table. Each slot holds the 32-bit function address, parameter,
+ * and bookkeeping for the thread handle and NT THREAD_OBJECT. */
+
+#define MAX_WIN32_THREADS 16
+
+typedef struct {
+    volatile int    active;        /* 1 = slot in use */
+    uint32_t        func_addr;     /* 32-bit thread start routine */
+    uint32_t        param;         /* 32-bit parameter */
+    DWORD           tid;           /* Win32 thread ID */
+    HANDLE          handle;        /* handle into g_handle_table */
+    volatile int    terminated;    /* 1 = thread function returned */
+    int             kernel_pid;    /* kernel PID from sched_spawn */
+    int             suspended;     /* 1 = created suspended (CREATE_SUSPENDED) */
+} win32_thread_ctx_t;
+
+static win32_thread_ctx_t g_win32_threads[MAX_WIN32_THREADS];
+
+/* Look up context by kernel PID (called from thread entry) */
+static win32_thread_ctx_t *find_ctx_by_pid(int pid)
+{
+    for (int i = 0; i < MAX_WIN32_THREADS; i++) {
+        if (g_win32_threads[i].active && g_win32_threads[i].kernel_pid == pid)
+            return &g_win32_threads[i];
+    }
+    return NULL;
+}
+
+/* Look up context by Win32 HANDLE */
+static win32_thread_ctx_t *find_ctx_by_handle(HANDLE h)
+{
+    for (int i = 0; i < MAX_WIN32_THREADS; i++) {
+        if (g_win32_threads[i].active && g_win32_threads[i].handle == h)
+            return &g_win32_threads[i];
+    }
+    return NULL;
+}
+
+/* Allocate a free slot */
+static win32_thread_ctx_t *alloc_thread_ctx(void)
+{
+    for (int i = 0; i < MAX_WIN32_THREADS; i++) {
+        if (!g_win32_threads[i].active) {
+            g_win32_threads[i].active = 1;
+            g_win32_threads[i].terminated = 0;
+            g_win32_threads[i].suspended = 0;
+            return &g_win32_threads[i];
+        }
+    }
+    return NULL;
+}
+
+/* ── Thread entry points ──────────────────────────────────────
+ * sched_spawn wants void(*)(void). We create per-slot entry functions
+ * that find their context via the kernel PID of the running process. */
+
+extern int32_t proc_current_pid(void);   /* from process.c */
+
+static void win32_thread_entry_common(void)
+{
+    int my_pid = proc_current_pid();
+    win32_thread_ctx_t *ctx = find_ctx_by_pid(my_pid);
+
+    if (!ctx) {
+        serial_puts("[K32-THREAD] ERROR: no context for PID ");
+        serial_putdec((uint64_t)my_pid);
+        serial_puts("\n");
+        return;
+    }
+
+    /* If created suspended, spin until resumed */
+    while (ctx->suspended) {
+        sched_yield();
+    }
+
+    serial_puts("[K32-THREAD] Running thread TID=");
+    serial_putdec(ctx->tid);
+    serial_puts(" func=0x");
+    serial_puthex(ctx->func_addr, 8);
+    serial_puts(" param=0x");
+    serial_puthex(ctx->param, 8);
     serial_puts("\n");
 
-    uint32_t arg = (uint32_t)(ULONG_PTR)g_deferred_thread_param;
-    compat32_callback_args((uint32_t)(ULONG_PTR)g_deferred_thread_func, 1, &arg);
+    /* Acquire compat32 lock — only one thread in 32-bit mode at a time */
+    win32_compat32_lock();
 
-    serial_puts("[K32] Deferred thread returned\n");
+    uint32_t arg = ctx->param;
+    compat32_callback_args(ctx->func_addr, 1, &arg);
+
+    win32_compat32_unlock();
+
+    serial_puts("[K32-THREAD] Thread TID=");
+    serial_putdec(ctx->tid);
+    serial_puts(" returned\n");
+
+    /* Mark terminated — WaitForSingleObject checks this */
+    ctx->terminated = 1;
+
+    /* Also mark the NT THREAD_OBJECT as terminated if we have a handle */
+    if (ctx->handle) {
+        extern void win32_mark_thread_terminated(HANDLE h);
+        win32_mark_thread_terminated(ctx->handle);
+    }
+
+    /* Thread function returned — the sched_spawn wrapper will mark this
+     * kernel process as ZOMBIE when we return, which is correct. */
 }
 
 HANDLE WINAPI CreateThread(PVOID lpThreadAttributes, SIZE_T dwStackSize,
@@ -1096,44 +1261,121 @@ HANDLE WINAPI CreateThread(PVOID lpThreadAttributes, SIZE_T dwStackSize,
     serial_puts(" tid=");
     serial_putdec(tid);
 
-    if (dwCreationFlags & 0x4 /* CREATE_SUSPENDED */) {
-        serial_puts(" (SUSPENDED — stored)\n");
-        g_deferred_thread_func = lpStartAddress;
-        g_deferred_thread_param = lpParameter;
-        g_deferred_thread_handle = (HANDLE)(ULONG_PTR)tid;
-        g_deferred_thread_pending = 1;
-    } else {
-        serial_puts(" (running inline)\n");
-        /* Execute thread function immediately via compat32 callback.
-         * This blocks the main thread until the function returns.
-         * For UT99, the thread typically does quick init work. */
-        uint32_t arg = (uint32_t)(ULONG_PTR)lpParameter;
-        compat32_callback_args((uint32_t)(ULONG_PTR)lpStartAddress, 1, &arg);
-        serial_puts("[K32] Thread func returned\n");
+    /* Allocate thread context slot */
+    win32_thread_ctx_t *ctx = alloc_thread_ctx();
+    if (!ctx) {
+        serial_puts(" FAILED (no free slot)\n");
+        g_last_error = 8; /* ERROR_NOT_ENOUGH_MEMORY */
+        sync_last_error();
+        return NULL;
     }
 
-    return (HANDLE)(ULONG_PTR)tid;
+    ctx->func_addr = (uint32_t)(ULONG_PTR)lpStartAddress;
+    ctx->param     = (uint32_t)(ULONG_PTR)lpParameter;
+    ctx->tid       = tid;
+
+    if (dwCreationFlags & 0x4 /* CREATE_SUSPENDED */)
+        ctx->suspended = 1;
+
+    /* Create an NT THREAD_OBJECT and handle for WaitForSingleObject */
+    extern NTSTATUS sys_NtCreateThread(ULONG_PTR *args);
+
+    /* We build a minimal NtCreateThread call to get a handle.
+     * The THREAD_OBJECT tracks state for wait operations. */
+    HANDLE thread_handle = NULL;
+    CLIENT_ID client_id = {0};
+    ULONG_PTR nt_args[8] = {
+        (ULONG_PTR)&thread_handle,           /* ThreadHandle */
+        (ULONG_PTR)GENERIC_ALL,              /* DesiredAccess */
+        (ULONG_PTR)NULL,                     /* ObjectAttributes */
+        (ULONG_PTR)NT_CURRENT_PROCESS,       /* ProcessHandle */
+        (ULONG_PTR)&client_id,               /* ClientId */
+        (ULONG_PTR)NULL,                     /* ThreadContext */
+        (ULONG_PTR)NULL,                     /* InitialTeb */
+        (ULONG_PTR)FALSE                     /* CreateSuspended */
+    };
+
+    NTSTATUS status = sys_NtCreateThread(nt_args);
+    if (!NT_SUCCESS(status)) {
+        serial_puts(" (NT thread alloc failed, continuing with TID handle)\n");
+        /* Fall back to using the TID as a pseudo-handle */
+        thread_handle = (HANDLE)(ULONG_PTR)tid;
+    }
+
+    ctx->handle = thread_handle;
+
+    /* Spawn the real kernel thread */
+    int kpid = sched_spawn("win32_thread", win32_thread_entry_common);
+    if (kpid < 0) {
+        serial_puts(" FAILED (sched_spawn)\n");
+        ctx->active = 0;
+        g_last_error = 8; /* ERROR_NOT_ENOUGH_MEMORY */
+        sync_last_error();
+        return NULL;
+    }
+
+    ctx->kernel_pid = kpid;
+
+    if (ctx->suspended)
+        serial_puts(" (SUSPENDED)\n");
+    else
+        serial_puts(" (SCHEDULED)\n");
+
+    serial_puts("[K32] Thread kernel PID=");
+    serial_putdec((uint64_t)kpid);
+    serial_puts(" handle=0x");
+    serial_puthex((uint64_t)(ULONG_PTR)thread_handle, 8);
+    serial_puts("\n");
+
+    return thread_handle;
 }
 
-DWORD WINAPI GetCurrentThreadId(void) { return 1; }
+DWORD WINAPI GetCurrentThreadId(void)
+{
+    /* Check if the calling kernel process matches a Win32 thread */
+    int my_pid = proc_current_pid();
+    for (int i = 0; i < MAX_WIN32_THREADS; i++) {
+        if (g_win32_threads[i].active && g_win32_threads[i].kernel_pid == my_pid)
+            return g_win32_threads[i].tid;
+    }
+    return 1; /* main thread */
+}
+
 HANDLE WINAPI GetCurrentThread(void) { return NT_CURRENT_THREAD; }
 
 DWORD WINAPI SuspendThread(HANDLE hThread)
 {
-    (void)hThread;
-    return 0; /* previous suspend count */
+    win32_thread_ctx_t *ctx = find_ctx_by_handle(hThread);
+    if (ctx) {
+        ctx->suspended = 1;
+        return 0; /* previous suspend count */
+    }
+    return (DWORD)-1;
 }
 
 DWORD WINAPI ResumeThread(HANDLE hThread)
 {
-    (void)hThread;
+    win32_thread_ctx_t *ctx = find_ctx_by_handle(hThread);
+    if (ctx && ctx->suspended) {
+        ctx->suspended = 0;
+        serial_puts("[K32] ResumeThread TID=");
+        serial_putdec(ctx->tid);
+        serial_puts("\n");
+        return 1; /* previous suspend count was 1 */
+    }
     return 0;
 }
 
 BOOL WINAPI TerminateThread(HANDLE hThread, DWORD dwExitCode)
 {
-    (void)hThread;
     (void)dwExitCode;
+    win32_thread_ctx_t *ctx = find_ctx_by_handle(hThread);
+    if (ctx) {
+        ctx->terminated = 1;
+        serial_puts("[K32] TerminateThread TID=");
+        serial_putdec(ctx->tid);
+        serial_puts("\n");
+    }
     return TRUE;
 }
 
@@ -1144,9 +1386,28 @@ BOOL WINAPI TerminateThread(HANDLE hThread, DWORD dwExitCode)
 
 DWORD WINAPI WaitForSingleObject(HANDLE hHandle, DWORD dwMilliseconds)
 {
-    run_deferred_thread();  /* cooperative yield point */
     extern NTSTATUS NtWaitForSingleObject(HANDLE, BOOL, PLARGE_INTEGER);
 
+    /* Check if this handle is a Win32 thread — fast path using our table */
+    win32_thread_ctx_t *tctx = find_ctx_by_handle(hHandle);
+    if (tctx) {
+        /* Wait for this Win32 thread to terminate */
+        uint64_t start = idt_get_ticks();
+        uint64_t timeout_ticks = 0;
+        if (dwMilliseconds != INFINITE)
+            timeout_ticks = (uint64_t)dwMilliseconds / 10; /* 100Hz ticks */
+
+        while (!tctx->terminated) {
+            sched_yield();  /* give the thread CPU time */
+            if (dwMilliseconds != INFINITE && timeout_ticks > 0 &&
+                (idt_get_ticks() - start) >= timeout_ticks) {
+                return WAIT_TIMEOUT;
+            }
+        }
+        return WAIT_OBJECT_0;
+    }
+
+    /* Fall through to NT wait for events, mutexes, semaphores, etc. */
     LARGE_INTEGER timeout;
     PLARGE_INTEGER p_timeout = NULL;
 
@@ -1172,6 +1433,48 @@ DWORD WINAPI WaitForMultipleObjects(DWORD nCount, const HANDLE *lpHandles,
 {
     extern NTSTATUS sys_NtWaitForMultipleObjects(ULONG_PTR *args);
 
+    /* Quick check: if any handle is a Win32 thread, use polling path */
+    uint64_t start = idt_get_ticks();
+    uint64_t timeout_ticks = 0;
+    if (dwMilliseconds != INFINITE)
+        timeout_ticks = (uint64_t)dwMilliseconds / 10;
+
+    /* Check for Win32 thread handles — handle them specially */
+    int has_thread_handles = 0;
+    for (DWORD i = 0; i < nCount; i++) {
+        if (find_ctx_by_handle(lpHandles[i])) {
+            has_thread_handles = 1;
+            break;
+        }
+    }
+
+    if (has_thread_handles) {
+        /* Polling path for mixed thread/sync objects */
+        for (;;) {
+            if (bWaitAll) {
+                int all_done = 1;
+                for (DWORD i = 0; i < nCount; i++) {
+                    win32_thread_ctx_t *tc = find_ctx_by_handle(lpHandles[i]);
+                    if (tc && !tc->terminated) { all_done = 0; break; }
+                }
+                if (all_done) return WAIT_OBJECT_0;
+            } else {
+                for (DWORD i = 0; i < nCount; i++) {
+                    win32_thread_ctx_t *tc = find_ctx_by_handle(lpHandles[i]);
+                    if (tc && tc->terminated) return WAIT_OBJECT_0 + i;
+                }
+            }
+
+            if (dwMilliseconds != INFINITE && timeout_ticks > 0 &&
+                (idt_get_ticks() - start) >= timeout_ticks) {
+                return WAIT_TIMEOUT;
+            }
+            if (dwMilliseconds == 0) return WAIT_TIMEOUT;
+            sched_yield();
+        }
+    }
+
+    /* Standard NT path for sync objects */
     LARGE_INTEGER timeout;
     PLARGE_INTEGER p_timeout = NULL;
 

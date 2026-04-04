@@ -311,6 +311,12 @@ NTSTATUS sys_NtResumeThread(ULONG_PTR *args)
 
 /* ── NtWaitForSingleObject ──────────────────────────────────── */
 
+/* Import ntsync.c helpers for event/mutant/semaphore wait */
+extern BOOL ntsync_is_signaled(HANDLE_ENTRY *entry);
+extern void ntsync_acquire_object(HANDLE_ENTRY *entry);
+
+extern void sched_yield(void);
+
 NTSTATUS sys_NtWaitForSingleObject(ULONG_PTR *args)
 {
     HANDLE          Handle       = (HANDLE)args[0];
@@ -321,21 +327,21 @@ NTSTATUS sys_NtWaitForSingleObject(ULONG_PTR *args)
     if (!entry)
         return STATUS_INVALID_HANDLE;
 
+    /* Compute timeout in scheduler ticks (100Hz) */
+    uint64_t start = idt_get_ticks();
+    uint64_t timeout_ticks = 0;
+    if (Timeout) {
+        LONGLONG t = Timeout->QuadPart;
+        if (t < 0) t = -t;
+        timeout_ticks = (uint64_t)(t / 100000);  /* 100ns → 10ms ticks */
+    }
+
     /* Determine what we're waiting on */
     switch (entry->type) {
     case OBJ_TYPE_PROCESS: {
         PROCESS_OBJECT *proc = (PROCESS_OBJECT *)entry->object;
-        /* Poll until process exits */
-        uint64_t start = idt_get_ticks();
-        uint64_t timeout_ticks = 0;
-        if (Timeout) {
-            LONGLONG t = Timeout->QuadPart;
-            if (t < 0) t = -t;
-            timeout_ticks = (uint64_t)(t / 100000);
-        }
-
         while (proc->active) {
-            __asm__ volatile("sti; hlt; cli");
+            sched_yield();
             if (Timeout && timeout_ticks > 0 &&
                 (idt_get_ticks() - start) >= timeout_ticks) {
                 return STATUS_TIMEOUT;
@@ -346,16 +352,8 @@ NTSTATUS sys_NtWaitForSingleObject(ULONG_PTR *args)
 
     case OBJ_TYPE_THREAD: {
         THREAD_OBJECT *thread = (THREAD_OBJECT *)entry->object;
-        uint64_t start = idt_get_ticks();
-        uint64_t timeout_ticks = 0;
-        if (Timeout) {
-            LONGLONG t = Timeout->QuadPart;
-            if (t < 0) t = -t;
-            timeout_ticks = (uint64_t)(t / 100000);
-        }
-
         while (thread->state != THREAD_TERMINATED) {
-            __asm__ volatile("sti; hlt; cli");
+            sched_yield();
             if (Timeout && timeout_ticks > 0 &&
                 (idt_get_ticks() - start) >= timeout_ticks) {
                 return STATUS_TIMEOUT;
@@ -364,10 +362,24 @@ NTSTATUS sys_NtWaitForSingleObject(ULONG_PTR *args)
         return STATUS_SUCCESS;
     }
 
-    case OBJ_TYPE_EVENT: {
-        /* Events: poll the signaled flag */
-        /* TODO: implement when events are added */
-        return STATUS_NOT_IMPLEMENTED;
+    case OBJ_TYPE_EVENT:
+    case OBJ_TYPE_MUTANT:
+    case OBJ_TYPE_SEMAPHORE: {
+        /* Poll with yield for sync objects */
+        for (;;) {
+            if (ntsync_is_signaled(entry)) {
+                ntsync_acquire_object(entry);
+                return STATUS_SUCCESS;
+            }
+            /* Zero timeout = poll once */
+            if (Timeout && Timeout->QuadPart == 0)
+                return STATUS_TIMEOUT;
+            if (Timeout && timeout_ticks > 0 &&
+                (idt_get_ticks() - start) >= timeout_ticks) {
+                return STATUS_TIMEOUT;
+            }
+            sched_yield();
+        }
     }
 
     default:
@@ -445,4 +457,15 @@ void nt_process_register_syscalls(NT_SERVICE_TABLE *table)
 
     table->handlers[NTSYS_QueryInformationProcess] = sys_NtQueryInformationProcess;
     table->arg_counts[NTSYS_QueryInformationProcess] = 5;
+}
+
+/* Helper for kernel32 shim: mark a thread handle as terminated */
+void win32_mark_thread_terminated(HANDLE h)
+{
+    extern HANDLE_TABLE g_handle_table;
+    HANDLE_ENTRY *entry = handle_get_entry(&g_handle_table, h);
+    if (entry && entry->type == OBJ_TYPE_THREAD && entry->object) {
+        THREAD_OBJECT *th = (THREAD_OBJECT *)entry->object;
+        th->state = THREAD_TERMINATED;
+    }
 }
