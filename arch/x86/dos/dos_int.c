@@ -21,6 +21,7 @@ void dos_int10_video(dos_vm_t *vm);
 void dos_int16_keyboard(dos_vm_t *vm);
 void dos_int1a_timer(dos_vm_t *vm);
 void dos_int2f_dispatch(dos_vm_t *vm);
+void dos_int31_dpmi(dos_vm_t *vm);
 void dpmi_enter_protected_mode(dos_vm_t *vm);
 
 /* ── INT dispatch ───────────────────────────────────────────────── */
@@ -52,6 +53,10 @@ void dos_int_dispatch(dos_vm_t *vm, uint8_t int_num)
 
     case 0x2F:
         dos_int2f_dispatch(vm);
+        break;
+
+    case 0x31:
+        dos_int31_dpmi(vm);
         break;
 
     case 0x33:

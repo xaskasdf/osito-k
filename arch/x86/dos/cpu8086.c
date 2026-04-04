@@ -2657,16 +2657,12 @@ int cpu8086_run(dos_vm_t *vm)
          * ════════════════════════════════════════════════════════════ */
         case 0xCD: { /* INT imm8 */
             uint8_t int_num = cpu_fetch8(cpu);
-            /* Debug: log all INTs except common ones */
-            if (int_num != 0x21 && int_num != 0x10 && int_num != 0x16) {
-                serial_puts("[8086] INT ");
+            /* Log ALL INTs for debugging */
+            if (cpu->insn_count < 2000000) {
+                serial_puts("[INT] ");
                 serial_puthex(int_num, 2);
-                serial_puts(" AX=");
-                serial_puthex(cpu->ax, 4);
-                serial_puts(" at ");
-                serial_puthex(cpu->cs, 4);
-                serial_puts(":");
-                serial_puthex(cpu->eip, 8);
+                serial_puts(" AH=");
+                serial_puthex(cpu->ah, 2);
                 serial_puts(" #");
                 serial_putdec(cpu->insn_count);
                 serial_puts("\n");
@@ -2685,6 +2681,13 @@ int cpu8086_run(dos_vm_t *vm)
          * ════════════════════════════════════════════════════════════ */
         case 0xCE: /* INTO */
             if (cpu->flags & FLAG_OF) {
+                uint16_t h_seg = dos_mem_read16(vm, 4 * 4 + 2);
+                if (h_seg >= (DOS_ROM_BASE >> 4)) {
+                    /* ROM stub handler: push+IRET would be a balanced NOP,
+                     * but it interferes with DOS4GW's test sequence.
+                     * Skip silently — DOS4GW CPU feature test. */
+                    break;
+                }
                 cpu_push16(cpu, cpu->flags | FLAGS_FIXED);
                 cpu_push16(cpu, cpu->cs);
                 cpu_push16(cpu, cpu->ip);
@@ -3482,7 +3485,7 @@ int cpu8086_run(dos_vm_t *vm)
             serial_puts(cpu->protected_mode ? " [PM]\n" : " [RM]\n");
         }
         /* Safety: halt after 2 billion instructions */
-        if (cpu->insn_count > 2000000000ULL) {
+        if (cpu->insn_count > 500000000ULL) {
             serial_puts("[8086] 2B instruction limit reached, halting\n");
             cpu->running = false;
         }

@@ -79,6 +79,17 @@ void dos_int21_dispatch(dos_vm_t *vm)
     cpu8086_state_t *cpu = vm->cpu;
     uint8_t ah = cpu->ah;
 
+    /* Log INT 21h calls with full AX for debugging */
+    if (cpu->insn_count < 2000000) {
+        serial_puts("[DOS21] AH=");
+        serial_puthex(ah, 2);
+        serial_puts(" AL=");
+        serial_puthex(cpu->al, 2);
+        serial_puts(" BX=");
+        serial_puthex(cpu->bx, 4);
+        serial_puts("\n");
+    }
+
     switch (ah) {
 
     /* ── AH=00h: Terminate ──────────────────────────────────────── */

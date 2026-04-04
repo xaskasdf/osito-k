@@ -308,6 +308,15 @@ void dos_int31_dpmi(dos_vm_t *vm)
     dpmi_state_t *dpmi = &vm->dpmi;
     uint16_t func = cpu->ax;
 
+    /* Log all DPMI calls */
+    serial_puts("[DPMI] INT 31h AX=");
+    serial_puthex(func, 4);
+    serial_puts(" BX=");
+    serial_puthex(cpu->bx, 4);
+    serial_puts(" CX=");
+    serial_puthex(cpu->cx, 4);
+    serial_puts("\n");
+
     switch (func) {
 
     /* ── AX=0000h: Allocate LDT Descriptors ────────────────────── */
