@@ -540,13 +540,38 @@ void proc_list(void)
  * are saved/restored by the timer ISR.
  * ════════════════════════════════════════════════════════════════ */
 
-/* ISR stub sets RSP to this value when non-zero (defined in isr_stubs.S) */
-extern volatile uint64_t sched_switch_rsp;
-extern volatile uint64_t sched_switch_cr3;
+/* Per-CPU scheduler arrays (ISR reads from these via APIC ID lookup) */
+#define SCHED_MAX_CPUS 16
+volatile uint64_t sched_rsp_arr[SCHED_MAX_CPUS];
+volatile uint64_t sched_cr3_arr[SCHED_MAX_CPUS];
+static int        sched_idx_arr[SCHED_MAX_CPUS]; /* -1 = no process */
 
-static int      sched_current_idx = -1;
 static bool     sched_enabled = false;
 static uint64_t sched_switches = 0;
+
+/* Spinlock protecting proctab during search/modify */
+static volatile int sched_lock = 0;
+static inline void sched_lock_acquire(void) {
+    while (__sync_lock_test_and_set(&sched_lock, 1))
+        __asm__ volatile ("pause" ::: "memory");
+}
+static inline void sched_lock_release(void) {
+    __sync_lock_release(&sched_lock);
+}
+
+/* Get current CPU index via APIC ID */
+extern uint32_t smp_apic_to_index(uint32_t apic_id);
+extern volatile uint32_t *idt_get_apic_base(void);
+static uint32_t sched_my_cpu(void)
+{
+    volatile uint32_t *apic = idt_get_apic_base();
+    if (!apic) return 0;
+    uint32_t id = (apic[0x20/4] >> 24) & 0xFF;
+    return smp_apic_to_index(id);
+}
+
+/* Backward compat: sched_current_idx aliases CPU 0's slot */
+#define sched_current_idx (sched_idx_arr[0])
 
 /* Thread exit trampoline — if a kernel thread's entry function returns,
  * execution lands here (the return address was placed below the fake frame). */
@@ -574,12 +599,10 @@ void sched_tick(void *frame_ptr)
     if (!sched_enabled || sched_current_idx < 0)
         return;
 
-    /* Only BSP (LAPIC ID 0) runs the scheduler — APs have their own
-     * timer interrupts but must not touch single-CPU scheduler state */
-    if (sched_get_lapic_id() != 0)
-        return;
-
-    process_t *cur = &proctab[sched_current_idx];
+    /* Per-CPU scheduling: each CPU manages its own current process */
+    uint32_t this_cpu = sched_my_cpu();
+    int my_idx = sched_idx_arr[this_cpu];
+    process_t *cur = (my_idx >= 0) ? &proctab[my_idx] : NULL;
 
     /* Check if a higher-priority process is READY (preemption).
      * ZOMBIE/BLOCKED processes always force-switch immediately.
@@ -684,18 +707,15 @@ void sched_tick(void *frame_ptr)
     next->state = PROC_RUNNING;
     next->quantum = qos_quantum[next->qos_class];
     next->last_active_tick = idt_get_ticks();
-    current_proc = next;
-    sched_current_idx = next_idx;
-    wrmsr(MSR_FS_BASE, next->fs_base);  /* restore per-thread TLS */
+    sched_idx_arr[this_cpu] = next_idx;
+    if (this_cpu == 0) current_proc = next;  /* BSP compat */
+    wrmsr(MSR_FS_BASE, next->fs_base);
 
-    /* Tell ISR stub to switch RSP before popping GPRs.
-     * The stub will: mov sched_switch_rsp → RSP, then pop + iretq
-     * using the new process's saved interrupt frame. */
-    sched_switch_rsp = next->kernel_rsp;
-
-    /* Switch address space if CR3 differs */
+    /* Tell ISR stub to switch RSP/CR3 for THIS CPU */
+    uint32_t my_cpu = this_cpu;
+    sched_rsp_arr[my_cpu] = next->kernel_rsp;
     if (next->cr3 != cur->cr3)
-        sched_switch_cr3 = next->cr3;
+        sched_cr3_arr[my_cpu] = next->cr3;
 
     sched_switches++;
 }
@@ -1546,6 +1566,11 @@ void proc_init(void)
 
     memset(proctab, 0, sizeof(proctab));
     current_proc = NULL;
+    for (int i = 0; i < SCHED_MAX_CPUS; i++) {
+        sched_idx_arr[i] = -1;
+        sched_rsp_arr[i] = 0;
+        sched_cr3_arr[i] = 0;
+    }
     futex_init();
 
     /* Create PID 1 (kernel) */

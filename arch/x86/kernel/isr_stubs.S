@@ -49,24 +49,37 @@ isr_common:
     /* Restore stack (undo 16-byte alignment) */
     mov %rbp, %rsp
 
-    /* ── Scheduler: check for context switch (X-SCHED) ────────── */
-    /* If sched_tick() set sched_switch_rsp, switch to new stack   */
-    /* before popping GPRs — the new stack has the next process's  */
-    /* saved interrupt frame, so pops + iretq resume that process. */
-    /* IMPORTANT: Use XCHG (implicit LOCK) to atomically read and  */
-    /* clear sched_switch_rsp. This prevents SMP race where an AP  */
-    /* reads the value set by BSP's sched_tick and switches to the */
-    /* wrong context. Only the first CPU to XCHG gets the value.   */
+    /* ── Per-CPU scheduler context switch (X-SMP) ──────────────── */
+    /* Each CPU has its own slot in sched_rsp_arr/sched_cr3_arr.    */
+    /* We identify the current CPU by reading LAPIC ID from MMIO.   */
+
+    /* Step 1: Get APIC base. If not yet set (early boot), skip. */
+    mov apic_base_global(%rip), %rcx
+    test %rcx, %rcx
+    jz .Lno_cr3
+
+    /* Step 2: Read LAPIC ID register (offset 0x20, bits 31:24) */
+    mov 0x20(%rcx), %edx
+    shr $24, %edx
+
+    /* Step 3: Map APIC ID → cpu_index via lookup table */
+    lea apic_to_cpu_lut(%rip), %rcx
+    movzbl (%rcx,%rdx), %edx       /* edx = cpu_index (0-15) */
+    shl $3, %edx                    /* edx = cpu_index * 8 (sizeof uint64_t) */
+
+    /* Step 4: Atomic read-and-clear per-CPU sched_rsp_arr[cpu] */
+    lea sched_rsp_arr(%rip), %rcx
     xor %rax, %rax
-    xchg sched_switch_rsp(%rip), %rax
+    xchg (%rcx,%rdx), %rax
     test %rax, %rax
     jz .Lno_switch
     mov %rax, %rsp
 .Lno_switch:
 
-    /* Switch CR3 if sched_tick set sched_switch_cr3 */
+    /* Step 5: Atomic read-and-clear per-CPU sched_cr3_arr[cpu] */
+    lea sched_cr3_arr(%rip), %rcx
     xor %rax, %rax
-    xchg sched_switch_cr3(%rip), %rax
+    xchg (%rcx,%rdx), %rax
     test %rax, %rax
     jz .Lno_cr3
     mov %rax, %cr3
@@ -165,16 +178,16 @@ isr_stub_default:
     push $255            /* generic vector */
     jmp isr_common
 
-/* ── Scheduler RSP switch variable (X-SCHED) ──────────────── */
-/* When non-zero, ISR stub loads this as RSP before popping    */
-/* GPRs, effectively switching to another process's context.   */
+/* ── Per-CPU scheduler arrays (X-SMP) ─────────────────────── */
+/* sched_rsp_arr and sched_cr3_arr are defined in process.c    */
+/* apic_base_global and apic_to_cpu_lut are defined in smp.c   */
+/* Old global names kept for backward compatibility (unused).  */
 
 .section .bss
 .align 8
 .globl sched_switch_rsp
 sched_switch_rsp:
     .quad 0
-
 .globl sched_switch_cr3
 sched_switch_cr3:
     .quad 0

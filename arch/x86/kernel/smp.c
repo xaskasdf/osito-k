@@ -120,6 +120,22 @@ static cpu_info_t cpus[SMP_MAX_CPUS];
 static uint32_t   cpu_count;
 static uint32_t   bsp_apic_id;
 
+/* Per-CPU lookup (APIC ID → cpu_index). Set by smp_build_cpu_lut(). */
+uint64_t apic_base_global;           /* LAPIC MMIO base for ISR stub */
+uint8_t  apic_to_cpu_lut[256];       /* APIC ID → cpu_index */
+
+uint32_t smp_apic_to_index(uint32_t apic_id)
+{
+    return apic_to_cpu_lut[apic_id & 0xFF];
+}
+
+static void smp_build_cpu_lut(void)
+{
+    memset(apic_to_cpu_lut, 0, sizeof(apic_to_cpu_lut));
+    for (uint32_t i = 0; i < cpu_count; i++)
+        apic_to_cpu_lut[cpus[i].apic_id] = (uint8_t)i;
+}
+
 /* ── Trampoline ──────────────────────────────────────────────── */
 
 /*
@@ -366,11 +382,10 @@ void smp_ap_entry(uint32_t cpu_index)
         /* Enable LAPIC with spurious vector 0xFF */
         apic_write_reg(apic, APIC_SVR, APIC_SVR_ENABLE | 0xFF);
 
-        /* Do NOT start APIC timer on APs. The scheduler only runs on
-         * the BSP, and AP timer interrupts cause sched_switch_rsp races
-         * where an AP steals the context switch value meant for the BSP,
-         * leading to #GP on IRETQ with corrupted CS/SS. APs stay in HLT
-         * loop and only wake on IPIs (future SMP work scheduling). */
+        /* Start APIC timer — same config as BSP (periodic, 100Hz, vector 32) */
+        apic_write_reg(apic, 0x3E0, 0x03);    /* Divide by 16 */
+        apic_write_reg(apic, 0x320, 0x20020);  /* Periodic, vector 32 */
+        apic_write_reg(apic, 0x380, 625000);   /* Initial count (~100Hz) */
     }
 
     /* Mark CPU as online */
@@ -578,6 +593,10 @@ void smp_init(void)
     fb_puts(" SMP: ");
     fb_putdec(aps_started + 1);
     fb_puts(" CPUs online\n");
+
+    /* Build APIC ID → cpu_index lookup table for ISR per-CPU dispatch */
+    smp_build_cpu_lut();
+    apic_base_global = (uint64_t)idt_get_apic_base();
 }
 
 uint32_t smp_cpu_count(void)
