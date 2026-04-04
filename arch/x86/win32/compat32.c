@@ -2059,12 +2059,6 @@ uint64_t compat32_dispatch(uint32_t thunk_idx, uint32_t *stack_args)
         if (depth >= 0 && depth < MAX_CALLBACK_DEPTH)
             callback_retval_per_depth[depth] = callback_retval;
 
-        /* Compensate: longjmp bypasses int2e_stub's depth-- in the restore
-         * path, so decrement g_pe32_save_depth here to prevent drift. */
-        extern uint32_t g_pe32_save_depth;
-        if (g_pe32_save_depth > 0)
-            g_pe32_save_depth--;
-
         kern_longjmp(callback_jmpbufs[depth], 1);
         /* never reached */
         return 0;

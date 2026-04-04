@@ -63,51 +63,15 @@ int2e_stub:
     movq 144(%rsp), %rsi
     addq $4, %rsi
 
-    /* Save PE32 callee-saved registers to per-depth globals.
-     * Callbacks (compat32_callback_args → longjmp) can corrupt the
-     * saved register area on the IST1 stack. Save a snapshot here
-     * and restore after dispatch returns. Uses callback_depth as
-     * index (max 32 depths × 4 regs × 8 bytes = 1KB). */
-    leaq g_pe32_saved_regs(%rip), %r10
-    leaq g_pe32_save_depth(%rip), %r12
-    movl (%r12), %r13d               /* current depth */
-    leal 1(%r13d), %r14d
-    movl %r14d, (%r12)               /* depth++ */
-    shlq $5, %r13                    /* depth * 32 (4 regs × 8 bytes) */
-    addq %r13, %r10                  /* &saved[depth] */
-    movq 112(%rsp), %r14             /* saved RBX (push #1, offset 112) */
-    movq %r14, 0(%r10)
-    movq 88(%rsp), %r14              /* saved RSI (push #4, offset 88) */
-    movq %r14, 8(%r10)
-    movq 80(%rsp), %r14              /* saved RDI (push #5, offset 80) */
-    movq %r14, 16(%r10)
-    movq 72(%rsp), %r14              /* saved RBP (push #6, offset 72) */
-    movq %r14, 24(%r10)
-
-    /* Align and call */
+    /* Align stack and call C dispatcher.
+     * RBX/RSI/RDI/RBP are callee-saved in SysV ABI — compat32_dispatch
+     * preserves them. The push/pop frame above handles save/restore.
+     * No separate register snapshot needed (eliminates SMP race on
+     * g_pe32_saved_regs global array). */
     mov %rsp, %rbp
     and $~0xF, %rsp
     call compat32_dispatch
     mov %rbp, %rsp
-
-    /* Restore PE32 callee-saved registers from snapshot.
-     * Write them back to the push area so the pops below get
-     * the correct original PE32 values. */
-    leaq g_pe32_saved_regs(%rip), %r10
-    leaq g_pe32_save_depth(%rip), %r12
-    movl (%r12), %r13d
-    subl $1, %r13d                   /* depth-- */
-    movl %r13d, (%r12)
-    shlq $5, %r13
-    addq %r13, %r10
-    movq 0(%r10), %r14               /* restore RBX → offset 112 */
-    movq %r14, 112(%rsp)
-    movq 8(%r10), %r14               /* restore RSI → offset 88 */
-    movq %r14, 88(%rsp)
-    movq 16(%r10), %r14              /* restore RDI → offset 80 */
-    movq %r14, 80(%rsp)
-    movq 24(%r10), %r14              /* restore RBP → offset 72 */
-    movq %r14, 72(%rsp)
 
     /*
      * C++ EH catch dispatch: if compat32_seh_dispatch found a catch
