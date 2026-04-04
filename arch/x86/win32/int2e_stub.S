@@ -63,15 +63,14 @@ int2e_stub:
     movq 144(%rsp), %rsi
     addq $4, %rsi
 
-    /* Align stack and call C dispatcher.
-     * RBX/RSI/RDI/RBP are callee-saved in SysV ABI — compat32_dispatch
-     * preserves them. The push/pop frame above handles save/restore.
-     * No separate register snapshot needed (eliminates SMP race on
-     * g_pe32_saved_regs global array). */
-    mov %rsp, %rbp
+    /* Save RSP to a global before aligning and calling C dispatcher.
+     * Cannot use RBP — kern_longjmp (inside callbacks) overwrites RBP
+     * with the callback_args frame pointer, corrupting our saved RSP.
+     * Use a global variable instead (safe: INT 0x2E is serialized). */
+    movq %rsp, g_int2e_saved_rsp(%rip)
     and $~0xF, %rsp
     call compat32_dispatch
-    mov %rbp, %rsp
+    movq g_int2e_saved_rsp(%rip), %rsp
 
     /*
      * C++ EH catch dispatch: if compat32_seh_dispatch found a catch
@@ -121,3 +120,8 @@ int2e_stub:
     pop %rbx
 
     iretq
+
+.section .bss
+.align 8
+g_int2e_saved_rsp:
+    .quad 0
