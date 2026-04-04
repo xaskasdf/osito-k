@@ -181,3 +181,29 @@ void cpu_deliver_hw_interrupt(dos_vm_t *vm, uint8_t int_num)
         dos_int_dispatch(vm, int_num);
     }
 }
+
+/* ── Native 32-bit INT dispatch (called from dos_int_stub.S) ────── */
+/* Register frame layout matching the assembly stub's push order:
+ * ES, DS, R15-R8, RBP, RDI, RSI, RDX, RCX, RBX, RAX */
+
+typedef struct {
+    uint64_t es, ds;
+    uint64_t r15, r14, r13, r12, r11, r10, r9, r8;
+    uint64_t rbp, rdi, rsi, rdx, rcx, rbx, rax;
+} dos_native_regs_t;
+
+void dos_int_native_dispatch(uint64_t int_num, dos_native_regs_t *regs)
+{
+    /* TODO: Bridge to existing dos_int_dispatch by populating a
+     * temporary dos_vm_t/cpu8086_state_t from the native register frame,
+     * calling the handler, and copying results back.
+     * For now, log and return. */
+    extern void serial_puts(const char *s);
+    extern void serial_puthex(uint64_t val, int digits);
+
+    serial_puts("[DOS-NATIVE] INT ");
+    serial_puthex(int_num, 2);
+    serial_puts(" AH=");
+    serial_puthex((regs->rax >> 8) & 0xFF, 2);
+    serial_puts("\n");
+}

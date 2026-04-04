@@ -297,14 +297,15 @@ struct __attribute__((packed)) tss64 {
 struct tss64 kernel_tss __attribute__((aligned(16)));
 /* Exported for int2e_stub.S to update IST1 for re-entrant interrupts */
 uint64_t *tss_ist1_ptr;  /* = &kernel_tss.ist1, set in tss_init() */
+uint64_t *tss_ist2_ptr;  /* = &kernel_tss.ist2, for DOS INT stubs */
 
 /* IST1 stack for INT 0x2E — 64KB (needs room for re-entrant callbacks) */
 #define IST1_STACK_SIZE 65536
 uint8_t ist1_stack[IST1_STACK_SIZE] __attribute__((aligned(16)));
 
-/* IST2 stack for #DB — 8KB (separate from INT 0x2E to avoid conflicts) */
-#define IST2_STACK_SIZE 8192
-static uint8_t ist2_stack[IST2_STACK_SIZE] __attribute__((aligned(16)));
+/* IST2 stack for DOS INTs + #DB — 32KB */
+#define IST2_STACK_SIZE 32768
+uint8_t ist2_stack[IST2_STACK_SIZE] __attribute__((aligned(16)));
 
 /*
  * Install TSS: write descriptor to GDT index 10-11 (selector 0x50),
@@ -322,6 +323,7 @@ static void tss_init(void)
     kernel_tss.ist2 = (uint64_t)(ist2_stack + IST2_STACK_SIZE);
     kernel_tss.iopb_offset = sizeof(struct tss64);
     tss_ist1_ptr = &kernel_tss.ist1;
+    tss_ist2_ptr = &kernel_tss.ist2;
 
     /* Build TSS descriptor at GDT index 10 (selector 0x50) */
     uint64_t base = (uint64_t)&kernel_tss;
@@ -510,6 +512,43 @@ void isr_handler(interrupt_frame_t *frame)
     }
 
     /* #BP (INT3) — software breakpoint for tracing PE32 execution */
+    /* ConstructObject return trap — patched INT3 at EXE+0xBC72 */
+    if (vec == 3 && (frame->cs & 0xFFFF) == 0x40) {
+        uint32_t rip32 = (uint32_t)frame->rip;
+        /* INT3 advances RIP by 1, so RIP = breakpoint_addr + 1 */
+        uint32_t bp = rip32 - 1;
+        if ((bp & 0xFFFF0000) == 0x10900000 && ((bp & 0xFFFF) == 0xBC72 || (bp & 0xFFFF) == 0xBC81)) {
+            uint32_t off = bp & 0xFFFF;
+            if (off == 0xBC72) {
+                /* After ConstructObject: EAX = result */
+                serial_puts("[BP-BC72] EAX=0x");
+                serial_puthex((uint32_t)frame->rax, 8);
+                uint32_t eax = (uint32_t)frame->rax;
+                serial_puts(eax >= 0x40000000 ? " HEAP✓" : eax >= 0x1C000000 ? " STACK✗" : eax == 0 ? " NULL!" : " ???");
+                serial_puts(" EBP=0x");
+                serial_puthex((uint32_t)frame->rbp, 8);
+                serial_puts("\n");
+                uint8_t *code = (uint8_t *)(uintptr_t)bp;
+                *code = 0x89; /* restore: mov [ebp-0x7a4],eax */
+                frame->rip = bp;
+            } else {
+                /* Before Init: ECX should = [EBP-0x14] = GEngine */
+                uint32_t ebp = (uint32_t)frame->rbp;
+                uint32_t ge_local = *(volatile uint32_t *)(uintptr_t)(ebp - 0x14);
+                serial_puts("[BP-BC81] [EBP-14]=0x");
+                serial_puthex(ge_local, 8);
+                serial_puts(ge_local >= 0x40000000 ? " HEAP✓" : ge_local >= 0x1C000000 ? " STACK✗" : " ???");
+                serial_puts(" EBP=0x");
+                serial_puthex(ebp, 8);
+                serial_puts("\n");
+                uint8_t *code = (uint8_t *)(uintptr_t)bp;
+                *code = 0x8B; /* restore: mov -0x14(%ebp),%ecx */
+                frame->rip = bp;
+            }
+            return;
+        }
+    }
+
     if (vec == 3 && g_swbreak_addr && (uint32_t)frame->rip == g_swbreak_addr + 1) {
         serial_puts("[SWBREAK] Hit at 0x");
         serial_puthex(g_swbreak_addr, 8);
@@ -1053,10 +1092,38 @@ void isr_handler(interrupt_frame_t *frame)
                     static int browse_fix_count = 0;
                     browse_fix_count++;
                     if (browse_fix_count <= 3) {
-                        serial_puts("[BROWSE-FIX] redirect to real Browse 0x");
-                        serial_puthex(real_browse, 8);
-                        serial_puts(" this=0x");
+                        serial_puts("[BROWSE-FIX] this=0x");
                         serial_puthex((uint32_t)frame->rdi, 8);
+                        serial_puts("\n");
+                        /* Dump UClass hierarchy to diagnose ConstructObject failure */
+                        /* UGameEngine::PrivateStaticClass at 0x105928A0 */
+                        volatile uint32_t *ge_cls = (volatile uint32_t *)(uintptr_t)0x105928A0;
+                        serial_puts("  UGameEngine::SC vtbl=0x");
+                        serial_puthex(ge_cls[0], 8);
+                        serial_puts(" SuperField=0x");
+                        serial_puthex(ge_cls[0x28/4], 8);
+                        serial_puts(" Name=0x");
+                        serial_puthex(ge_cls[0x0C/4], 8);  /* FName at offset 0x0C in UObject */
+                        serial_puts("\n");
+                        /* GObjRegistrants: TArray at 0x102A0360 */
+                        volatile uint32_t *reg = (volatile uint32_t *)(uintptr_t)0x102A0360;
+                        serial_puts("  GObjRegistrants: Data=0x");
+                        serial_puthex(reg[0], 8);
+                        serial_puts(" Num=");
+                        serial_putdec(reg[1]);
+                        serial_puts(" Max=");
+                        serial_putdec(reg[2]);
+                        serial_puts("\n");
+                        /* UEngine::PrivateStaticClass — find from EXE IAT 0x10958D74 */
+                        volatile uint32_t *ue_iat = (volatile uint32_t *)(uintptr_t)0x10958D74;
+                        uint32_t ue_cls_addr = *ue_iat;
+                        serial_puts("  UEngine::SC (from IAT) = 0x");
+                        serial_puthex(ue_cls_addr, 8);
+                        if (ue_cls_addr >= 0x10000 && ue_cls_addr < 0x20000000) {
+                            volatile uint32_t *ue_cls = (volatile uint32_t *)(uintptr_t)ue_cls_addr;
+                            serial_puts(" SuperField=0x");
+                            serial_puthex(ue_cls[0x28/4], 8);
+                        }
                         serial_puts("\n");
                     }
                     /* Also fix the vtable pointer so Browse can use it */

@@ -87,6 +87,7 @@ WIN32_SRC = win32/win32_init.c win32/compat32.c win32/pe.c win32/winexec.c \
             win32/comctl32_shim.c win32/comdlg32_shim.c \
             win32/winmm_shim.c win32/wsock32_shim.c
 WIN32_ASM = win32/int2e_stub.S
+DOS_ASM  = dos/dos_int_stub.S
 DOS_SRC  = dos/dos_init.c dos/dos_exec.c dos/dos_loader.c \
            dos/dos_mem.c dos/cpu8086.c dos/dos_int.c \
            dos/dos_api.c dos/dos_bios.c dos/dos_vga.c dos/dos_io.c \
@@ -106,9 +107,10 @@ FS_OBJ    = $(FS_SRC:%.c=$(BUILD)/%.o)
 WIN32_OBJ = $(WIN32_SRC:%.c=$(BUILD)/%.o)
 WIN32_ASM_OBJ = $(WIN32_ASM:%.S=$(BUILD)/%.o)
 DOS_OBJ   = $(DOS_SRC:%.c=$(BUILD)/%.o)
+DOS_ASM_OBJ = $(DOS_ASM:%.S=$(BUILD)/%.o)
 GUI_OBJ   = $(patsubst ../../gui/%.c,$(BUILD)/gui/%.o,$(GUI_SRC))
 
-ALL_KERN_OBJ = $(KERN_OBJ) $(ASM_OBJ) $(DRV_OBJ) $(FS_OBJ) $(WIN32_OBJ) $(WIN32_ASM_OBJ) $(DOS_OBJ) $(GUI_OBJ)
+ALL_KERN_OBJ = $(KERN_OBJ) $(ASM_OBJ) $(DRV_OBJ) $(FS_OBJ) $(WIN32_OBJ) $(WIN32_ASM_OBJ) $(DOS_OBJ) $(DOS_ASM_OBJ) $(GUI_OBJ)
 
 # ── Targets ───────────────────────────────────────────────────
 
@@ -188,9 +190,13 @@ $(BUILD)/win32/dsound_shim.o: win32/dsound_shim.c | $(BUILD)/win32
 $(BUILD)/win32/%.o: win32/%.S | $(BUILD)/win32
 	$(CC) -c -o $@ $<
 
-# DOS 16-bit compatibility layer
+# DOS compatibility layer
 $(BUILD)/dos/%.o: dos/%.c | $(BUILD)/dos
 	$(CC) $(KCFLAGS) -Idos -c -o $@ $<
+
+# DOS assembly
+$(BUILD)/dos/%.o: dos/%.S | $(BUILD)/dos
+	$(CC) -c -o $@ $<
 
 # GUI shared library
 $(BUILD)/gui/%.o: ../../gui/%.c | $(BUILD)/gui
