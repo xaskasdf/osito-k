@@ -64,6 +64,14 @@ isr_common:
     mov %rax, %rsp
 .Lno_switch:
 
+    /* Switch CR3 if sched_tick set sched_switch_cr3 */
+    xor %rax, %rax
+    xchg sched_switch_cr3(%rip), %rax
+    test %rax, %rax
+    jz .Lno_cr3
+    mov %rax, %cr3
+.Lno_cr3:
+
     /* Restore all GPRs */
     pop %r15
     pop %r14
@@ -165,4 +173,8 @@ isr_stub_default:
 .align 8
 .globl sched_switch_rsp
 sched_switch_rsp:
+    .quad 0
+
+.globl sched_switch_cr3
+sched_switch_cr3:
     .quad 0

@@ -262,6 +262,13 @@ static void proc_free(process_t *p)
     for (int i = 0; i < MAX_FDS; i++)
         p->fds[i].open = false;
 
+    /* Free per-process page tables */
+    if (p->cr3 != paging_get_kernel_cr3()) {
+        extern void paging_free_process_cr3(uint64_t cr3);
+        paging_free_process_cr3(p->cr3);
+        p->cr3 = paging_get_kernel_cr3();
+    }
+
     p->state = PROC_FREE;
 }
 
@@ -535,6 +542,7 @@ void proc_list(void)
 
 /* ISR stub sets RSP to this value when non-zero (defined in isr_stubs.S) */
 extern volatile uint64_t sched_switch_rsp;
+extern volatile uint64_t sched_switch_cr3;
 
 static int      sched_current_idx = -1;
 static bool     sched_enabled = false;
@@ -684,6 +692,10 @@ void sched_tick(void *frame_ptr)
      * The stub will: mov sched_switch_rsp → RSP, then pop + iretq
      * using the new process's saved interrupt frame. */
     sched_switch_rsp = next->kernel_rsp;
+
+    /* Switch address space if CR3 differs */
+    if (next->cr3 != cur->cr3)
+        sched_switch_cr3 = next->cr3;
 
     sched_switches++;
 }
@@ -909,6 +921,12 @@ int32_t proc_fork(void)
     }
 
     child->ppid = parent->pid;
+
+    /* Per-process page tables (isolated user-space) */
+    extern uint64_t paging_create_process_cr3(void);
+    uint64_t child_cr3 = paging_create_process_cr3();
+    if (child_cr3)
+        child->cr3 = child_cr3;
 
     /* Copy FD table from parent */
     for (int i = 0; i < MAX_FDS; i++)
@@ -1192,77 +1210,81 @@ int32_t proc_clone_thread(uint64_t child_stack, uint64_t parent_tidptr,
     return (int32_t)thread->pid;
 }
 
-/* ── Futex wait queue (X-THREAD) ────────────────────────────── */
+/* ── Futex hash table (256 buckets, 256-entry pool) ─────────── */
 
-#define FUTEX_HASH_SIZE  32
-#define MAX_FUTEX_WAITERS 32
+#define FUTEX_HASH_BITS   8
+#define FUTEX_HASH_SIZE   (1 << FUTEX_HASH_BITS)
+#define FUTEX_MAX_WAITERS 256
 
-typedef struct {
-    uint64_t    addr;       /* futex user address */
-    int         proc_idx;   /* index into proctab (process waiting) */
-    bool        active;
+typedef struct futex_waiter {
+    uint64_t addr;
+    int      proc_idx;
+    struct futex_waiter *next;
 } futex_waiter_t;
 
-static futex_waiter_t futex_waiters[MAX_FUTEX_WAITERS];
+static futex_waiter_t  futex_pool[FUTEX_MAX_WAITERS];
+static futex_waiter_t *futex_buckets[FUTEX_HASH_SIZE];
+static futex_waiter_t *futex_free;
 
-/* futex_wait — block current process until woken.
- * Returns 0 on success, -EAGAIN if value mismatch. */
+static inline uint32_t futex_hash(uint64_t addr) {
+    return (uint32_t)((addr >> 2) & (FUTEX_HASH_SIZE - 1));
+}
+
+static void futex_init(void)
+{
+    memset(futex_buckets, 0, sizeof(futex_buckets));
+    futex_free = NULL;
+    for (int i = FUTEX_MAX_WAITERS - 1; i >= 0; i--) {
+        futex_pool[i].next = futex_free;
+        futex_free = &futex_pool[i];
+    }
+}
+
 int futex_do_wait(uint64_t uaddr, int expected)
 {
     volatile int *addr = (volatile int *)uaddr;
+    if (*addr != expected) return -11; /* EAGAIN */
 
-    /* Atomic check: if value changed, return immediately */
-    if (*addr != expected)
-        return -11; /* EAGAIN */
-
-    /* Find a free waiter slot */
-    int slot = -1;
-    for (int i = 0; i < MAX_FUTEX_WAITERS; i++) {
-        if (!futex_waiters[i].active) {
-            slot = i;
-            break;
-        }
-    }
-    if (slot < 0) return -12; /* ENOMEM — too many waiters */
+    if (!futex_free) return -12; /* ENOMEM */
+    futex_waiter_t *w = futex_free;
+    futex_free = w->next;
 
     process_t *cur = current_proc;
-    int cur_idx = (int)(cur - &proctab[0]);
+    w->addr = uaddr;
+    w->proc_idx = (int)(cur - &proctab[0]);
 
-    /* Register waiter */
-    futex_waiters[slot].addr = uaddr;
-    futex_waiters[slot].proc_idx = cur_idx;
-    futex_waiters[slot].active = true;
+    uint32_t bucket = futex_hash(uaddr);
+    w->next = futex_buckets[bucket];
+    futex_buckets[bucket] = w;
 
-    /* Block: mark process as BLOCKED, yield to scheduler.
-     * sched_tick skips BLOCKED processes. We'll be woken by futex_wake. */
     cur->state = PROC_BLOCKED;
-
-    /* Yield CPU — scheduler will switch away on next tick.
-     * We spin on HLT until the scheduler preempts us out. */
     while (cur->state == PROC_BLOCKED) {
         __asm__ volatile ("sti; hlt; cli" ::: "memory");
     }
 
-    /* Woken — clear waiter slot (may already be cleared by wake) */
-    futex_waiters[slot].active = false;
-
     return 0;
 }
 
-/* futex_wake — wake up to 'count' processes waiting on uaddr.
- * Returns number of processes woken. */
 int futex_do_wake(uint64_t uaddr, int count)
 {
+    uint32_t bucket = futex_hash(uaddr);
+    futex_waiter_t **pp = &futex_buckets[bucket];
     int woken = 0;
-    for (int i = 0; i < MAX_FUTEX_WAITERS && woken < count; i++) {
-        if (futex_waiters[i].active && futex_waiters[i].addr == uaddr) {
-            int idx = futex_waiters[i].proc_idx;
+
+    while (*pp && woken < count) {
+        futex_waiter_t *w = *pp;
+        if (w->addr == uaddr) {
+            int idx = w->proc_idx;
             if (idx >= 0 && idx < MAX_PROCESSES &&
                 proctab[idx].state == PROC_BLOCKED) {
                 proctab[idx].state = PROC_READY;
                 woken++;
             }
-            futex_waiters[i].active = false;
+            *pp = w->next;
+            w->next = futex_free;
+            futex_free = w;
+        } else {
+            pp = &w->next;
         }
     }
     return woken;
@@ -1524,6 +1546,7 @@ void proc_init(void)
 
     memset(proctab, 0, sizeof(proctab));
     current_proc = NULL;
+    futex_init();
 
     /* Create PID 1 (kernel) */
     process_t *kernel = proc_alloc("kernel");

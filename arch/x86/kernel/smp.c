@@ -212,7 +212,7 @@ static const uint8_t trampoline_code[] = {
 
 /* ── MADT Parsing ────────────────────────────────────────────── */
 
-static acpi_rsdp_t *find_rsdp(void)
+acpi_rsdp_t *find_rsdp(void)
 {
     /* Prefer RSDP from EFI System Table (set by efi_main) */
     if (kernel_acpi_rsdp) {
@@ -232,7 +232,7 @@ static acpi_rsdp_t *find_rsdp(void)
     return NULL;
 }
 
-static acpi_sdt_header_t *find_acpi_table(acpi_rsdp_t *rsdp, const char *sig4)
+acpi_sdt_header_t *find_acpi_table(acpi_rsdp_t *rsdp, const char *sig4)
 {
     int use_xsdt = (rsdp->revision >= 2 && rsdp->xsdt_addr != 0);
     acpi_sdt_header_t *root;
@@ -600,4 +600,77 @@ uint32_t smp_current_cpu(void)
         if (cpus[i].apic_id == id) return i;
     }
     return 0;
+}
+
+/* ── ACPI Power Management ──────────────────────────────────── */
+
+typedef struct __attribute__((packed)) {
+    acpi_sdt_header_t header;
+    uint32_t firmware_ctrl;
+    uint32_t dsdt;
+    uint8_t  reserved1;
+    uint8_t  preferred_pm_profile;
+    uint16_t sci_int;
+    uint32_t smi_cmd;
+    uint8_t  acpi_enable;
+    uint8_t  acpi_disable;
+    uint8_t  s4bios_req;
+    uint8_t  pstate_cnt;
+    uint32_t pm1a_evt_blk;
+    uint32_t pm1b_evt_blk;
+    uint32_t pm1a_cnt_blk;
+    uint32_t pm1b_cnt_blk;
+} acpi_fadt_min_t;
+
+void acpi_shutdown(void)
+{
+    acpi_rsdp_t *rsdp = find_rsdp();
+    if (!rsdp) { serial_puts("[ACPI] No RSDP\n"); goto hang; }
+
+    acpi_fadt_min_t *fadt = (acpi_fadt_min_t *)find_acpi_table(rsdp, "FACP");
+    if (!fadt) { serial_puts("[ACPI] No FADT\n"); goto hang; }
+
+    uint16_t pm1a_cnt = (uint16_t)fadt->pm1a_cnt_blk;
+    uint16_t slp_typ = 5;
+
+    uint32_t dsdt_addr = fadt->dsdt;
+    if (dsdt_addr) {
+        acpi_sdt_header_t *dsdt = (acpi_sdt_header_t *)(uint64_t)dsdt_addr;
+        uint8_t *p = (uint8_t *)dsdt;
+        for (uint32_t i = 36; i < dsdt->length - 4; i++) {
+            if (p[i]=='_' && p[i+1]=='S' && p[i+2]=='5' && p[i+3]=='_') {
+                uint8_t *pkg = &p[i + 4];
+                if (*pkg == 0x12) { pkg += 2; if (*pkg == 0x0A) pkg++; slp_typ = *pkg; }
+                break;
+            }
+        }
+    }
+
+    serial_puts("[ACPI] Shutdown (PM1a=");
+    serial_puthex(pm1a_cnt, 4);
+    serial_puts(" SLP=");
+    serial_putdec(slp_typ);
+    serial_puts(")\n");
+
+    __asm__ volatile ("cli");
+    uint16_t val = (slp_typ << 10) | 0x2000;
+    __asm__ volatile ("outw %0, %1" : : "a"(val), "Nd"(pm1a_cnt));
+    if (fadt->pm1b_cnt_blk) {
+        uint16_t pm1b = (uint16_t)fadt->pm1b_cnt_blk;
+        __asm__ volatile ("outw %0, %1" : : "a"(val), "Nd"(pm1b));
+    }
+
+hang:
+    for (;;) __asm__ volatile ("cli; hlt");
+}
+
+void acpi_reboot(void)
+{
+    serial_puts("[ACPI] Reboot\n");
+    __asm__ volatile ("cli");
+    __asm__ volatile ("outb %0, %1" : : "a"((uint8_t)0xFE), "Nd"((uint16_t)0x64));
+    for (volatile int i = 0; i < 10000000; i++);
+    struct { uint16_t limit; uint64_t base; } __attribute__((packed)) null_idt = {0, 0};
+    __asm__ volatile ("lidt %0; int3" : : "m"(null_idt));
+    for (;;) __asm__ volatile ("hlt");
 }

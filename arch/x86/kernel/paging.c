@@ -492,6 +492,60 @@ void paging_init(void)
  *       (rest shared)
  */
 
+/* ── Per-process page tables ─────────────────────────────────── */
+/* Creates a new PML4 that shares kernel mappings but has its own
+ * PDPT[1] PD for user-space allocations (0x40000000-0x7FFFFFFF).
+ * Kernel pages (heap, identity-map) are shared by reference,
+ * so updates in the kernel PD are automatically visible.          */
+
+uint64_t paging_create_process_cr3(void)
+{
+    if (!kernel_pml4) return 0;
+
+    /* New PML4 — copy kernel entries (shared by reference) */
+    uint64_t *pml4 = pt_alloc_page();
+    if (!pml4) return 0;
+    memcpy(pml4, kernel_pml4, PAGE_SIZE);
+
+    /* New PDPT for PML4[0] — share all kernel PDs except PDPT[1] */
+    uint64_t *kernel_pdpt = (uint64_t *)(kernel_pml4[0] & PTE_ADDR_MASK);
+    uint64_t *pdpt = pt_alloc_page();
+    if (!pdpt) return 0;
+    for (int i = 0; i < 512; i++)
+        pdpt[i] = kernel_pdpt[i];
+
+    /* Own PD for PDPT[1] (0x40000000-0x7FFFFFFF — user allocations) */
+    uint64_t *pd1 = pt_alloc_page();
+    if (!pd1) return 0;
+    if (kernel_pdpt[1] & PTE_PRESENT) {
+        uint64_t *kpd1 = (uint64_t *)(kernel_pdpt[1] & PTE_ADDR_MASK);
+        memcpy(pd1, kpd1, PAGE_SIZE);
+    }
+
+    pdpt[1] = (uint64_t)pd1 | PTE_PRESENT | PTE_WRITABLE;
+    pml4[0] = (uint64_t)pdpt | PTE_PRESENT | PTE_WRITABLE;
+
+    return (uint64_t)pml4;
+}
+
+void paging_free_process_cr3(uint64_t cr3)
+{
+    if (!cr3 || cr3 == kernel_cr3) return;
+
+    uint64_t *pml4 = (uint64_t *)cr3;
+    if (pml4[0] & PTE_PRESENT) {
+        uint64_t *pdpt = (uint64_t *)(pml4[0] & PTE_ADDR_MASK);
+        if (pdpt[1] & PTE_PRESENT) {
+            uint64_t *pd1 = (uint64_t *)(pdpt[1] & PTE_ADDR_MASK);
+            mem_free_pages(pd1, 1);
+        }
+        mem_free_pages(pdpt, 1);
+    }
+    mem_free_pages(pml4, 1);
+}
+
+/* ── Win32 page tables (legacy wrapper) ─────────────────────── */
+
 static uint64_t *win32_pml4;
 static uint64_t  win32_cr3_val;
 static uint64_t *win32_pdpt;    /* Our own PDPT for PML4[0] */

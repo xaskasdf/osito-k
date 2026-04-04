@@ -47,6 +47,9 @@ extern void *osfs2_find(const char *name);
 extern int  osfs2_read(void *file, uint64_t offset, void *buf, uint64_t len);
 extern int  osfs2_delete(const char *name);
 extern uint32_t osfs2_free_blocks(void);
+extern uint32_t osfs2_get_block_size(void);
+extern void acpi_shutdown(void);
+extern void acpi_reboot(void);
 
 /* Heap */
 extern void *kmalloc(uint64_t size);
@@ -747,8 +750,9 @@ static void cmd_build(void)
     sh_puts("  kernel.elf: ");
     sh_putdec(osfs2_file_size(kelf));
     sh_puts(" bytes\n");
+    uint64_t free_bytes = (uint64_t)osfs2_free_blocks() * osfs2_get_block_size();
     sh_puts("  Free: ");
-    sh_putdec((uint64_t)osfs2_free_blocks());
+    sh_putdec(free_bytes / (1024 * 1024));
     sh_puts(" MB\n");
 }
 
@@ -1565,15 +1569,15 @@ static void cmd_kexec(const char *arg)
 static void cmd_reboot(void)
 {
     sh_puts("Rebooting...\n");
-    sh_reboot();
+    acpi_reboot();
 }
 
-/* ── Builtin: halt ───────────────────────────────────────────── */
+/* ── Builtin: halt / shutdown ────────────────────────────────── */
 
 static void cmd_halt(void)
 {
-    sh_puts_color("System halted.\n", 0x00FF8800);
-    sh_halt();
+    sh_puts_color("Shutting down...\n", 0x00FF8800);
+    acpi_shutdown();
 }
 
 /* ── Builtin: clear ──────────────────────────────────────────── */
@@ -2350,7 +2354,7 @@ static void shell_exec(char *line)
         cmd_kexec(argc > 1 ? argv[1] : NULL);
     } else if (strcmp(cmd, "reboot") == 0) {
         cmd_reboot();
-    } else if (strcmp(cmd, "halt") == 0) {
+    } else if (strcmp(cmd, "halt") == 0 || strcmp(cmd, "shutdown") == 0) {
         cmd_halt();
     } else if (strcmp(cmd, "beep") == 0) {
         extern bool hda_is_ready(void);

@@ -49,6 +49,31 @@ static inline void dbg_serial_hex8(uint8_t v) {
     dbg_serial_char(h[v & 0xF]);
 }
 
+/* CMOS RTC — read boot epoch once */
+static inline uint8_t cmos_rd(uint8_t reg) {
+    __asm__ volatile ("outb %0, %1" : : "a"(reg), "Nd"((uint16_t)0x70));
+    uint8_t val;
+    __asm__ volatile ("inb %1, %0" : "=a"(val) : "Nd"((uint16_t)0x71));
+    return val;
+}
+static inline uint8_t bcd2b(uint8_t v) { return (v >> 4) * 10 + (v & 0x0F); }
+static uint64_t rtc_to_epoch(void) {
+    uint8_t sec=bcd2b(cmos_rd(0)),min=bcd2b(cmos_rd(2)),hour=bcd2b(cmos_rd(4));
+    uint8_t day=bcd2b(cmos_rd(7)),mon=bcd2b(cmos_rd(8)),year=bcd2b(cmos_rd(9));
+    uint32_t y = 2000 + year;
+    static const uint16_t mdays[] = {0,31,28,31,30,31,30,31,31,30,31,30,31};
+    uint32_t days = 0;
+    for (uint32_t i = 1970; i < y; i++)
+        days += (i%4==0 && (i%100!=0 || i%400==0)) ? 366 : 365;
+    for (uint8_t i = 1; i < mon; i++) {
+        days += mdays[i];
+        if (i==2 && (y%4==0 && (y%100!=0 || y%400==0))) days++;
+    }
+    days += day - 1;
+    return (uint64_t)days*86400 + hour*3600 + min*60 + sec;
+}
+static uint64_t boot_epoch_sec;
+
 /* OsitoFS */
 extern void *osfs2_find(const char *name);
 extern void *osfs2_find_ci(const char *name);      /* case-insensitive lookup */
@@ -291,6 +316,8 @@ typedef ssize_t (*fd_read_fn)(void *buf, size_t count);
 
 /* osfs2_file_t is opaque here — we get size via osfs2_file_size() */
 extern uint64_t osfs2_file_size(void *file);
+extern uint32_t osfs2_file_ctime(void *file);
+extern uint32_t osfs2_file_mtime(void *file);
 
 typedef struct {
     bool        open;
@@ -972,6 +999,9 @@ static int64_t sys_fstat(uint64_t fd, uint64_t statbuf_addr)
         st->st_blksize = 4096;
         st->st_blocks = (st->st_size + 511) / 512;
         st->st_nlink = 1;
+        st->st_ctime_sec = (uint64_t)osfs2_file_ctime(f->file);
+        st->st_mtime_sec = (uint64_t)osfs2_file_mtime(f->file);
+        st->st_atime_sec = st->st_mtime_sec;
     } else if (f->type == FD_TYPE_DEV) {
         st->st_mode = 0020666;  /* S_IFCHR | 0666 */
         int dev_id = (int)f->offset;
@@ -1785,14 +1815,15 @@ static int64_t sys_clock_gettime(uint64_t clk_id, uint64_t tp_addr)
     if (!tp_addr) return -EFAULT;
     timespec_t *tp = (timespec_t *)tp_addr;
 
-    /* Use APIC ticks (100Hz) for time base */
     uint64_t ticks = idt_get_ticks();
     uint64_t ms = ticks * 10;  /* 100Hz → 10ms per tick */
 
     tp->tv_sec  = (int64_t)(ms / 1000);
     tp->tv_nsec = (int64_t)((ms % 1000) * 1000000);
 
-    (void)clk_id;  /* Same time for REALTIME and MONOTONIC */
+    if (clk_id == CLOCK_REALTIME)
+        tp->tv_sec += (int64_t)boot_epoch_sec;
+
     return 0;
 }
 
@@ -2363,7 +2394,7 @@ static int64_t sys_gettimeofday(uint64_t tv_addr, uint64_t tz_addr)
     (void)tz_addr;
     if (tv_addr) {
         uint64_t ticks = idt_get_ticks();
-        uint64_t secs = ticks / 100;
+        uint64_t secs = boot_epoch_sec + ticks / 100;
         uint64_t usecs = (ticks % 100) * 10000;
         uint64_t *tv = (uint64_t *)tv_addr;
         tv[0] = secs;    /* tv_sec */
@@ -2879,6 +2910,8 @@ void syscall_init(void)
     brk_base = NULL;
     brk_current = NULL;
     brk_max = NULL;
+
+    boot_epoch_sec = rtc_to_epoch();
 
     serial_puts("[SYSCALL] Ready (LSTAR=0x");
     serial_puthex((uint64_t)syscall_entry, 16);

@@ -446,11 +446,20 @@ static uint64_t elf_setup_stack(elf_loaded_t *loaded,
     /* Copy argument strings to stack */
     #define ELF_MAX_ARGS 256
 
+    /* Default environment */
+    static const char *default_env[] = {
+        "HOME=/", "PATH=/", "USER=root", "TERM=xterm-256color",
+        "LANG=C", "PWD=/", "SHELL=/bin/sh"
+    };
+    #define DEFAULT_ENV_COUNT 7
+
     /* Calculate string space needed */
     int effective_argc = (argc > ELF_MAX_ARGS) ? ELF_MAX_ARGS : argc;
     uint64_t str_need = 0;
     for (int i = 0; i < effective_argc; i++)
         str_need += strlen(argv[i]) + 1;
+    for (int i = 0; i < DEFAULT_ENV_COUNT; i++)
+        str_need += strlen(default_env[i]) + 1;
     if (str_need < 256) str_need = 256;
     str_need = (str_need + 15) & ~15ULL;
 
@@ -477,6 +486,15 @@ static uint64_t elf_setup_stack(elf_loaded_t *loaded,
         for (int i = 0; i < 16; i++)
             rnd[i] = (uint8_t)((tsc >> (i & 7)) ^ (tsc >> ((i + 3) & 7)) ^ i);
         str_ptr += 16;
+    }
+
+    /* Copy env strings */
+    uint64_t env_ptrs[DEFAULT_ENV_COUNT];
+    for (int i = 0; i < DEFAULT_ENV_COUNT; i++) {
+        uint64_t len = strlen(default_env[i]) + 1;
+        memcpy((void *)str_ptr, default_env[i], len);
+        env_ptrs[i] = str_ptr;
+        str_ptr += len;
     }
 
     /* Build stack frame below string area */
@@ -523,9 +541,13 @@ static uint64_t elf_setup_stack(elf_loaded_t *loaded,
         sp -= 8; *(uint64_t *)sp = auxv[i].type;
     }
 
-    /* Push envp terminator (NULL) */
+    /* Push envp terminator (NULL) then envp pointers */
     sp -= 8;
     *(uint64_t *)sp = 0;
+    for (int i = DEFAULT_ENV_COUNT - 1; i >= 0; i--) {
+        sp -= 8;
+        *(uint64_t *)sp = env_ptrs[i];
+    }
 
     /* Push argv terminator (NULL) */
     sp -= 8;
