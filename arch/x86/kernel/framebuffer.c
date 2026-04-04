@@ -199,6 +199,9 @@ static int    ansi_params[8];
 static int    ansi_nparams;
 static int    ansi_cur_param;
 static uint32_t ansi_fg_color = FG_COLOR;
+static uint32_t ansi_bg_color = 0;  /* default bg = black */
+static int      ansi_bold = 0;
+static int      ansi_reverse = 0;
 
 /* Basic ANSI color palette (SGR 30-37) */
 static const uint32_t ansi_colors[8] = {
@@ -223,6 +226,20 @@ static const uint32_t ansi_bright[8] = {
     0x0044FFFF, /* 6: bright cyan */
     0x00FFFFFF, /* 7: bright white */
 };
+
+static uint32_t ansi_256_color(int n)
+{
+    if (n < 0) return 0;
+    if (n < 8)  return ansi_colors[n];
+    if (n < 16) return ansi_bright[n - 8];
+    if (n < 232) {
+        n -= 16;
+        uint32_t r = (n / 36) * 51, g = ((n / 6) % 6) * 51, b = (n % 6) * 51;
+        return (r << 16) | (g << 8) | b;
+    }
+    uint32_t v = (uint32_t)(n - 232) * 10 + 8;
+    return (v << 16) | (v << 8) | v;
+}
 
 static void fb_clear_line_from(uint32_t row, uint32_t col)
 {
@@ -287,16 +304,34 @@ static void ansi_execute(char cmd)
         break;
     case 'm': /* SGR — Select Graphic Rendition */
         if (ansi_nparams == 0) {
-            ansi_fg_color = FG_COLOR; /* Reset */
+            ansi_fg_color = FG_COLOR; ansi_bg_color = 0;
+            ansi_bold = 0; ansi_reverse = 0;
         }
         for (int i = 0; i < ansi_nparams; i++) {
             int p = ansi_params[i];
-            if (p == 0) ansi_fg_color = FG_COLOR;
-            else if (p == 1) { /* Bold — use bright version if available */ }
-            else if (p == 7) { /* Reverse — swap fg/bg (simplified) */ }
-            else if (p >= 30 && p <= 37) ansi_fg_color = ansi_colors[p - 30];
-            else if (p == 39) ansi_fg_color = FG_COLOR; /* Default fg */
+            if (p == 0) { ansi_fg_color = FG_COLOR; ansi_bg_color = 0; ansi_bold = 0; ansi_reverse = 0; }
+            else if (p == 1) ansi_bold = 1;
+            else if (p == 7) ansi_reverse = 1;
+            else if (p == 22) ansi_bold = 0;
+            else if (p == 27) ansi_reverse = 0;
+            else if (p >= 30 && p <= 37) ansi_fg_color = ansi_bold ? ansi_bright[p-30] : ansi_colors[p-30];
+            else if (p == 39) ansi_fg_color = FG_COLOR;
+            else if (p >= 40 && p <= 47) ansi_bg_color = ansi_colors[p - 40];
+            else if (p == 49) ansi_bg_color = 0;
             else if (p >= 90 && p <= 97) ansi_fg_color = ansi_bright[p - 90];
+            else if (p >= 100 && p <= 107) ansi_bg_color = ansi_bright[p - 100];
+            else if (p == 38 && i + 2 < ansi_nparams && ansi_params[i+1] == 5) {
+                ansi_fg_color = ansi_256_color(ansi_params[i+2]); i += 2;
+            }
+            else if (p == 48 && i + 2 < ansi_nparams && ansi_params[i+1] == 5) {
+                ansi_bg_color = ansi_256_color(ansi_params[i+2]); i += 2;
+            }
+            else if (p == 38 && i + 4 < ansi_nparams && ansi_params[i+1] == 2) {
+                ansi_fg_color = ((uint32_t)ansi_params[i+2]<<16)|((uint32_t)ansi_params[i+3]<<8)|ansi_params[i+4]; i += 4;
+            }
+            else if (p == 48 && i + 4 < ansi_nparams && ansi_params[i+1] == 2) {
+                ansi_bg_color = ((uint32_t)ansi_params[i+2]<<16)|((uint32_t)ansi_params[i+3]<<8)|ansi_params[i+4]; i += 4;
+            }
         }
         break;
     case 'n': /* Device Status Report */

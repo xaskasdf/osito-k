@@ -144,6 +144,15 @@ typedef struct {
     uint64_t last_active_tick;   /* tick when process last ran */
     bool     pages_compressed;   /* true if RW pages are compressed */
 
+    /* Signal handling (X-SIG) */
+    uint64_t sig_mask;           /* blocked signals bitmask */
+    uint64_t sig_pending;        /* pending signals bitmask */
+    struct {
+        uint64_t handler;        /* SIG_DFL=0, SIG_IGN=1, or function pointer */
+        uint64_t flags;
+        uint64_t restorer;
+    } sig_actions[32];
+
 } process_t;
 
 /* ── Process table ───────────────────────────────────────────── */
@@ -292,6 +301,27 @@ process_t *proc_current(void)
     return current_proc;
 }
 
+/* Signal accessors for syscall.c (opaque process_t access) */
+typedef struct { uint64_t handler; uint64_t flags; uint64_t restorer; } sig_act_t;
+sig_act_t *proc_get_sig_actions(void *proc) {
+    return (sig_act_t *)((process_t *)proc)->sig_actions;
+}
+uint64_t *proc_get_sig_pending_ptr(void *proc) {
+    return &((process_t *)proc)->sig_pending;
+}
+uint64_t *proc_get_sig_mask_ptr(void *proc) {
+    return &((process_t *)proc)->sig_mask;
+}
+void proc_signal_pid(uint32_t pid, int sig) {
+    if (sig < 0 || sig >= 32) return;
+    for (int i = 0; i < MAX_PROCESSES; i++) {
+        if (proctab[i].pid == pid && proctab[i].state != PROC_FREE) {
+            proctab[i].sig_pending |= (1ULL << sig);
+            return;
+        }
+    }
+}
+
 /* Get current PID */
 int32_t proc_current_pid(void)
 {
@@ -392,6 +422,15 @@ void proc_exit(int32_t code)
         thread_exit_cleanup(p);  /* X-THREAD: clear_child_tid + futex wake */
         p->exit_code = code;
         p->state = PROC_ZOMBIE;
+        /* Signal SIGCHLD to parent */
+        if (p->ppid > 0) {
+            for (int i = 0; i < MAX_PROCESSES; i++) {
+                if (proctab[i].pid == p->ppid && proctab[i].state != PROC_FREE) {
+                    proctab[i].sig_pending |= (1ULL << 17); /* SIGCHLD=17 */
+                    break;
+                }
+            }
+        }
         /* DON'T free memory regions here — we're still running on the
          * user stack (SYSCALL doesn't switch stacks in ring-0 OS).
          * proc_wait4 handles all cleanup after the process is reaped. */

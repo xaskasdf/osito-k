@@ -353,14 +353,23 @@ static pipe_buf_t pipes[MAX_PIPES];
 #define NSIG        32
 #define SIGINT       2
 #define SIGPIPE     13
+#define SIGCHLD     17
 #define SIGTERM     15
 #define SIGKILL      9
 
 #define SIG_DFL     ((uint64_t)0)
 #define SIG_IGN     ((uint64_t)1)
 
-static uint64_t sig_handlers[NSIG];     /* handler addresses (SIG_DFL/SIG_IGN/fn) */
-static uint32_t sig_pending;            /* bitmask of pending signals */
+static uint64_t sig_handlers[NSIG];     /* legacy — kept for save/restore compat */
+static uint32_t sig_pending;            /* legacy — kept for save/restore compat */
+
+/* Per-process signal accessors (process.c) */
+typedef struct { uint64_t handler; uint64_t flags; uint64_t restorer; } sig_act_t;
+extern void *proc_current(void);
+extern sig_act_t *proc_get_sig_actions(void *proc);
+extern uint64_t *proc_get_sig_pending_ptr(void *proc);
+extern uint64_t *proc_get_sig_mask_ptr(void *proc);
+extern void proc_signal_pid(uint32_t pid, int sig);
 
 /* ── Output capture (X-CL4: tool exec) ──────────────────────── */
 
@@ -1634,22 +1643,19 @@ extern int32_t proc_current_ppid(void);
 static int64_t sys_kill(uint64_t pid, uint64_t sig)
 {
     if (sig >= NSIG) return -EINVAL;
-
-    int32_t cur_pid = proc_current_pid();
-
-    /* Can only signal self or pid 0 (current process group) */
-    if (pid != 0 && (int64_t)pid != cur_pid)
-        return -ESRCH;
-
-    if (sig == SIGKILL || sig == SIGTERM) {
-        proc_exit(128 + (int32_t)sig);
-        /* unreachable */
-    }
-
     if (sig == 0) return 0;  /* Signal 0 = test if process exists */
 
-    /* Queue signal for delivery */
-    sig_pending |= (1U << sig);
+    uint32_t target_pid = (uint32_t)pid;
+    if (pid == 0) target_pid = (uint32_t)proc_current_pid(); /* signal self */
+
+    /* SIGKILL/SIGTERM on self → immediate exit */
+    if (target_pid == (uint32_t)proc_current_pid() &&
+        (sig == SIGKILL || sig == SIGTERM)) {
+        proc_exit(128 + (int32_t)sig);
+    }
+
+    /* Queue signal on target process */
+    proc_signal_pid(target_pid, (int)sig);
 
     return 0;
 }
@@ -1666,16 +1672,23 @@ typedef struct {
 static int64_t sys_sigaction(uint64_t sig, uint64_t act_addr, uint64_t oldact_addr)
 {
     if (sig >= NSIG || sig == SIGKILL) return -EINVAL;
+    void *proc = proc_current();
+    if (!proc) return -ESRCH;
+    sig_act_t *actions = proc_get_sig_actions(proc);
 
     if (oldact_addr) {
         sigaction_t *old = (sigaction_t *)oldact_addr;
         memset(old, 0, sizeof(*old));
-        old->sa_handler = sig_handlers[sig];
+        old->sa_handler = actions[sig].handler;
+        old->sa_flags   = actions[sig].flags;
+        old->sa_restorer = actions[sig].restorer;
     }
 
     if (act_addr) {
         const sigaction_t *act = (const sigaction_t *)act_addr;
-        sig_handlers[sig] = act->sa_handler;
+        actions[sig].handler  = act->sa_handler;
+        actions[sig].flags    = act->sa_flags;
+        actions[sig].restorer = act->sa_restorer;
     }
 
     return 0;
@@ -1685,19 +1698,27 @@ static int64_t sys_sigaction(uint64_t sig, uint64_t act_addr, uint64_t oldact_ad
 
 void syscall_check_signals(void)
 {
-    if (!sig_pending) return;
+    void *proc = proc_current();
+    if (!proc) return;
+
+    uint64_t *pending = proc_get_sig_pending_ptr(proc);
+    uint64_t *mask = proc_get_sig_mask_ptr(proc);
+    sig_act_t *actions = proc_get_sig_actions(proc);
+
+    uint64_t deliverable = *pending & ~(*mask);
+    if (!deliverable) return;
 
     for (uint32_t s = 1; s < NSIG; s++) {
-        if (!(sig_pending & (1U << s))) continue;
-        sig_pending &= ~(1U << s);
+        if (!(deliverable & (1ULL << s))) continue;
+        *pending &= ~(1ULL << s);
 
-        uint64_t handler = sig_handlers[s];
+        uint64_t handler = actions[s].handler;
 
         if (handler == SIG_IGN) continue;
+        if (s == SIGCHLD && handler == SIG_DFL) continue; /* SIGCHLD default = ignore */
 
         if (handler == SIG_DFL) {
-            /* Default action for most signals: terminate */
-            if (s == SIGINT || s == SIGTERM || s == SIGPIPE) {
+            if (s == SIGINT || s == SIGTERM || s == SIGPIPE || s == SIGKILL) {
                 serial_puts("[SIGNAL] Delivering signal ");
                 serial_putdec(s);
                 serial_puts(" (default: terminate)\n");
@@ -1706,7 +1727,7 @@ void syscall_check_signals(void)
             continue;
         }
 
-        /* Custom handler — call it (simple synchronous delivery) */
+        /* Custom handler — synchronous delivery (v1) */
         void (*fn)(int) = (void (*)(int))handler;
         fn((int)s);
     }
@@ -1766,20 +1787,36 @@ static int64_t sys_gettid(void)
     return (int64_t)proc_current_pid();
 }
 
-/* rt_sigprocmask — block/unblock signals (minimal stub) */
+/* rt_sigprocmask — block/unblock signals */
+#define SIG_BLOCK   0
+#define SIG_UNBLOCK 1
+#define SIG_SETMASK 2
+
 static int64_t sys_rt_sigprocmask(uint64_t how, uint64_t set_addr,
                                    uint64_t oldset_addr, uint64_t sigsetsize)
 {
-    (void)how; (void)sigsetsize;
+    (void)sigsetsize;
+    void *proc = proc_current();
+    if (!proc) return -ESRCH;
+    uint64_t *mask = proc_get_sig_mask_ptr(proc);
 
     /* Return old mask if requested */
     if (oldset_addr) {
         uint64_t *oldset = (uint64_t *)oldset_addr;
-        *oldset = 0;  /* No signals blocked */
+        *oldset = *mask;
     }
 
-    /* Accept but ignore the new mask for now */
-    (void)set_addr;
+    if (set_addr) {
+        uint64_t new_set = *(uint64_t *)set_addr;
+        /* Cannot block SIGKILL(9) or SIGSTOP(19) */
+        new_set &= ~((1ULL << 9) | (1ULL << 19));
+        switch (how) {
+        case SIG_BLOCK:   *mask |= new_set;  break;
+        case SIG_UNBLOCK: *mask &= ~new_set; break;
+        case SIG_SETMASK: *mask = new_set;   break;
+        default: return -EINVAL;
+        }
+    }
     return 0;
 }
 
@@ -2246,12 +2283,15 @@ static int64_t sys_stat(uint64_t path_addr, uint64_t statbuf_addr)
 
 /* ── VFS: getcwd, readlink, getdents64 (X-VFS) ──────────────── */
 
+extern char cwd[256];  /* defined below in sys_chdir section */
+
 static int64_t sys_getcwd(uint64_t buf_addr, uint64_t size)
 {
     if (!buf_addr || size < 2) return -EINVAL;
-    char *buf = (char *)buf_addr;
-    buf[0] = '/';
-    buf[1] = '\0';
+    uint64_t len = 0;
+    while (cwd[len]) len++;
+    if (len + 1 > size) return -ERANGE;
+    memcpy((char *)buf_addr, cwd, len + 1);
     return (int64_t)buf_addr;
 }
 
@@ -2359,6 +2399,7 @@ static int64_t sys_getdents64(uint64_t fd, uint64_t dirp_addr, uint64_t count)
 extern uint64_t idt_get_ticks(void);
 
 static uint64_t current_umask = 022;
+char cwd[256] = "/";
 
 static int64_t sys_pause(void)
 {
@@ -2369,11 +2410,29 @@ static int64_t sys_pause(void)
 
 static int64_t sys_chdir(uint64_t path_addr)
 {
-    (void)path_addr;
-    /* Single flat filesystem — chdir to "/" always succeeds, anything else ENOENT */
     const char *p = (const char *)path_addr;
-    if (p && p[0] == '/' && p[1] == '\0') return 0;
-    return -ENOENT;
+    if (!p) return -EFAULT;
+
+    /* Build new cwd */
+    char newcwd[256];
+    if (p[0] == '/') {
+        /* Absolute path */
+        int i = 0;
+        while (p[i] && i < 254) { newcwd[i] = p[i]; i++; }
+        if (i > 1 && newcwd[i-1] != '/') { newcwd[i++] = '/'; }
+        newcwd[i] = '\0';
+    } else {
+        /* Relative: append to cwd */
+        int ci = 0;
+        while (cwd[ci]) { newcwd[ci] = cwd[ci]; ci++; }
+        int pi = 0;
+        while (p[pi] && ci < 254) { newcwd[ci++] = p[pi++]; }
+        if (ci > 1 && newcwd[ci-1] != '/') newcwd[ci++] = '/';
+        newcwd[ci] = '\0';
+    }
+
+    memcpy(cwd, newcwd, 256);
+    return 0;
 }
 
 static int64_t sys_fchdir(uint64_t fd)
