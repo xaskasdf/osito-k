@@ -1326,16 +1326,25 @@ static uint64_t prot_to_pte_flags(uint32_t prot);
 
 int demand_page_fault(uint64_t addr, uint64_t error_code)
 {
-    /* Only handle not-present faults (bit 0 clear) */
-    if (error_code & 1) return -1;
+    uint64_t page_addr = addr & ~0xFFFULL;
+
+    /* COW: write fault on present read-only page → copy and remap writable */
+    if ((error_code & 0x03) == 0x03) { /* present + write fault */
+        extern int paging_is_cow(uint64_t virt);
+        extern int paging_cow_copy(uint64_t virt);
+        if (paging_is_cow(page_addr)) {
+            if (paging_cow_copy(page_addr) == 0)
+                return 0;  /* COW resolved */
+        }
+        return -1;  /* not COW — real protection fault */
+    }
+
+    /* Not-present fault → demand page (lazy commit for mmap reservations) */
+    if (error_code & 1) return -1;  /* present but not write → not our fault */
 
     /* Don't handle faults in low memory (kernel area) */
     if (addr < 0x100000000ULL) return -1;
 
-    uint64_t page_addr = addr & ~0xFFFULL;
-
-    /* Allocate and map the page unconditionally for high addresses.
-     * This implements demand paging for mmap(PROT_NONE) reservations. */
     void *page = mem_alloc_pages(1);
     if (!page) return -1;
     memset(page, 0, 4096);

@@ -45,6 +45,7 @@ extern uint64_t mem_get_total(void);
 #define PTE_DIRTY       (1ULL << 6)
 #define PTE_LARGE       (1ULL << 7)   /* 2MB page (in PD entry) */
 #define PTE_GLOBAL      (1ULL << 8)
+#define PTE_COW         (1ULL << 9)   /* Copy-on-write (software bit, AVL) */
 #define PTE_NX          (1ULL << 63)  /* No-execute */
 
 #define PTE_ADDR_MASK   0x000FFFFFFFFFF000ULL  /* bits 51:12 */
@@ -542,6 +543,63 @@ void paging_free_process_cr3(uint64_t cr3)
         mem_free_pages(pdpt, 1);
     }
     mem_free_pages(pml4, 1);
+}
+
+/* ── Copy-on-Write (COW) support ─────────────────────────────── */
+
+/* Walk current CR3's page tables to find the PTE for a virtual address.
+ * Returns pointer to the PTE, or NULL if not mapped. */
+static uint64_t *pte_walk(uint64_t *table, int index)
+{
+    if (!(table[index] & PTE_PRESENT)) return NULL;
+    return (uint64_t *)(table[index] & PTE_ADDR_MASK);
+}
+
+static uint64_t *paging_get_pte(uint64_t virt)
+{
+    uint64_t cr3;
+    __asm__ volatile ("mov %%cr3, %0" : "=r"(cr3));
+    uint64_t *pml4 = (uint64_t *)(cr3 & PTE_ADDR_MASK);
+
+    uint64_t *pdpt = pte_walk(pml4, PML4_INDEX(virt));
+    if (!pdpt) return NULL;
+    uint64_t *pd = pte_walk(pdpt, PDPT_INDEX(virt));
+    if (!pd) return NULL;
+    if (pd[PD_INDEX(virt)] & PTE_LARGE) return NULL;
+    uint64_t *pt = pte_walk(pd, PD_INDEX(virt));
+    if (!pt) return NULL;
+    return &pt[PT_INDEX(virt)];
+}
+
+/* Check if a virtual address is mapped as COW */
+int paging_is_cow(uint64_t virt)
+{
+    uint64_t *pte = paging_get_pte(virt);
+    if (!pte) return 0;
+    return (*pte & PTE_COW) && (*pte & PTE_PRESENT) && !(*pte & PTE_WRITABLE);
+}
+
+/* Handle COW fault: copy the page, remap as writable, clear COW bit */
+int paging_cow_copy(uint64_t virt)
+{
+    uint64_t *pte = paging_get_pte(virt);
+    if (!pte) return -1;
+
+    uint64_t old_phys = *pte & PTE_ADDR_MASK;
+    uint64_t flags = *pte & ~PTE_ADDR_MASK;
+
+    /* Allocate new page and copy contents */
+    void *new_page = mem_alloc_pages(1);
+    if (!new_page) return -1;
+    memcpy(new_page, (void *)old_phys, PAGE_SIZE);
+
+    /* Remap: new physical page, writable, no COW */
+    *pte = (uint64_t)new_page | (flags & ~PTE_COW) | PTE_WRITABLE;
+
+    /* Flush TLB for this address */
+    __asm__ volatile ("invlpg (%0)" : : "r"(virt) : "memory");
+
+    return 0;
 }
 
 /* ── Win32 page tables (legacy wrapper) ─────────────────────── */

@@ -379,6 +379,27 @@ static void ds_submit_to_hda(void)
     }
 }
 
+/* ── Audio mixer tick (call periodically for streaming playback) ── */
+
+void dsound_mixer_tick(void)
+{
+    int any_playing = 0;
+    for (int i = 0; i < MAX_SOUND_BUFFERS; i++) {
+        if (g_buffers[i].in_use && g_buffers[i].playing) {
+            any_playing = 1;
+            if (g_buffers[i].looping) {
+                uint32_t advance = g_buffers[i].sample_rate / 10;
+                uint32_t bps = (g_buffers[i].bits_per_sample / 8) * g_buffers[i].channels;
+                g_buffers[i].play_cursor += advance * bps;
+                if (g_buffers[i].play_cursor >= g_buffers[i].data_size)
+                    g_buffers[i].play_cursor %= g_buffers[i].data_size;
+            }
+        }
+    }
+    if (any_playing)
+        ds_submit_to_hda();
+}
+
 /* ── IDirectSoundBuffer method implementations ────────────── */
 
 static HRESULT WINAPI dsb_QueryInterface(PVOID self, LPCGUID iid, PVOID *ppv)
