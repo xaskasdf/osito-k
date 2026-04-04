@@ -282,10 +282,11 @@ void dos_transfer_to_native(dos_vm_t *vm)
      * already installed by win32_init(). */
 
     /* Validate: the GDT must be accessible */
-    if (cpu->gdtr.base == 0 || cpu->gdtr.base >= vm->total_mem_size) {
-        serial_puts("[DOS] GDT base invalid, staying in interpreter\n");
+    if (cpu->gdtr.base >= vm->total_mem_size) {
+        serial_puts("[DOS] GDT base out of range, staying in interpreter\n");
         return;
     }
+    /* GDT base=0 is valid — DOS4GW puts GDT at start of memory */
 
     /* Read DOS4GW's code segment descriptor to verify it's flat 32-bit */
     uint16_t cs_idx = cpu->cs >> 3;

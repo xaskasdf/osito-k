@@ -1306,8 +1306,10 @@ int cpu8086_run(dos_vm_t *vm)
                 case 6: { /* LMSW: load machine status word */
                     uint16_t msw = modrm_read16(cpu, &g7m);
                     cpu->cr0 = (cpu->cr0 & 0xFFFF0000U) | msw;
-                    if (msw & 1)
+                    if ((msw & 1) && !cpu->protected_mode) {
                         cpu->protected_mode = true;
+                        serial_puts("[DOS] LMSW: PE bit set. Waiting for FAR JMP to transfer.\n");
+                    }
                     break;
                 }
                 default:
@@ -2890,11 +2892,30 @@ int cpu8086_run(dos_vm_t *vm)
         /* ════════════════════════════════════════════════════════════
          *  JMP far  (0xEA)
          * ════════════════════════════════════════════════════════════ */
-        case 0xEA: { /* JMP far ptr16:16 */
-            uint16_t off = cpu_fetch16(cpu);
-            uint16_t seg = cpu_fetch16(cpu);
+        case 0xEA: { /* JMP far ptr16:16 or ptr16:32 */
+            uint32_t off;
+            uint16_t seg;
+            if (op32) {
+                off = cpu_fetch32(cpu);
+                seg = cpu_fetch16(cpu);
+            } else {
+                off = cpu_fetch16(cpu);
+                seg = cpu_fetch16(cpu);
+            }
             cpu->cs = seg;
-            cpu->ip = off;
+            cpu->eip = off;
+
+            /* If we just entered PM (via LMSW/MOV CR0) and this is the
+             * first FAR JMP, CS now has a proper PM selector. Transfer. */
+            if (cpu->protected_mode) {
+                serial_puts("[DOS] FAR JMP in PM: CS=");
+                serial_puthex(seg, 4);
+                serial_puts(" EIP=");
+                serial_puthex(off, 8);
+                serial_puts(" — attempting native transfer\n");
+                extern void dos_transfer_to_native(dos_vm_t *vm);
+                dos_transfer_to_native(vm);
+            }
             break;
         }
 
@@ -3220,15 +3241,32 @@ int cpu8086_run(dos_vm_t *vm)
                 cpu->ip = target;
                 break;
             }
-            case 5: { /* JMP FAR m16:16 (indirect) */
+            case 5: { /* JMP FAR m16:16/32 (indirect) */
                 if (m.is_reg) {
                     serial_puts("[8086] FF /5 on register\n");
                     break;
                 }
-                uint16_t off = dos_mem_read16(vm, m.addr);
-                uint16_t seg = dos_mem_read16(vm, m.addr + 2);
-                cpu->cs = seg;
-                cpu->ip = off;
+                if (op32) {
+                    uint32_t off32 = dos_mem_read32(vm, m.addr);
+                    uint16_t seg = dos_mem_read16(vm, m.addr + 4);
+                    cpu->cs = seg;
+                    cpu->eip = off32;
+                } else {
+                    uint16_t off = dos_mem_read16(vm, m.addr);
+                    uint16_t seg = dos_mem_read16(vm, m.addr + 2);
+                    cpu->cs = seg;
+                    cpu->ip = off;
+                }
+                /* Detect PM far jump after LMSW/MOV CR0 */
+                if (cpu->protected_mode) {
+                    serial_puts("[DOS] FAR JMP indirect in PM: CS=");
+                    serial_puthex(cpu->cs, 4);
+                    serial_puts(" EIP=");
+                    serial_puthex(cpu->eip, 8);
+                    serial_puts("\n");
+                    extern void dos_transfer_to_native(dos_vm_t *vm);
+                    dos_transfer_to_native(vm);
+                }
                 break;
             }
             case 6: { /* PUSH r/m16 */
