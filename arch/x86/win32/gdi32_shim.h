@@ -69,6 +69,7 @@ HDC        WINAPI CreateCompatibleDC(HDC hdc);
 HBRUSH_GDI WINAPI CreateSolidBrush(DWORD color);
 HBRUSH_GDI WINAPI CreatePatternBrush(HBITMAP hBitmap);
 HPEN       WINAPI CreatePen(int iStyle, int cWidth, DWORD color);
+HBITMAP    WINAPI CreateCompatibleBitmap(HDC hdc, int cx, int cy);
 HBITMAP    WINAPI CreateBitmap(int nWidth, int nHeight, UINT nPlanes,
                                UINT nBitCount, PVOID lpBits);
 HBITMAP    WINAPI CreateDIBitmap(HDC hdc, PVOID pbmih, DWORD flInit,
@@ -91,6 +92,10 @@ BOOL  WINAPI ExtTextOutA(HDC hdc, int x, int y, UINT options,
                          PVOID lprect, PCSTR lpString, UINT c, PVOID lpDx);
 BOOL  WINAPI GetTextExtentPoint32A(HDC hdc, PCSTR lpString, int c, PVOID lpSize);
 BOOL  WINAPI GetTextExtentPoint32W(HDC hdc, PCWSTR lpString, int c, PVOID lpSize);
+
+/* Screen DC helpers (for user32 GetDC/ReleaseDC) */
+HDC   gdi32_alloc_screen_dc(void);
+void  gdi32_free_screen_dc(HDC hdc);
 
 /* Shim */
 PVOID gdi32_shim_init(void);

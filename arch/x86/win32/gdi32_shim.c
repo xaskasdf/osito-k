@@ -1,16 +1,150 @@
 /*
  * OsitoK Windows Compatibility Layer — gdi32.dll Shim Implementation
  *
- * Reports framebuffer capabilities. UT99 uses DirectDraw, not GDI.
+ * Real GDI Device Contexts and BitBlt for Win32 compat layer.
+ * DCs back onto framebuffer (screen) or kmalloc'd pixel buffers (memory).
  */
 
 #include "gdi32_shim.h"
 
 extern void serial_puts(const char *s);
+extern void *kmalloc(uint64_t size);
+extern void  kfree(void *ptr);
+
+/* Framebuffer access (weak — may not be linked) */
+extern uint32_t *fb_get_base(void)   __attribute__((weak));
+extern uint32_t  fb_get_width(void)  __attribute__((weak));
+extern uint32_t  fb_get_height(void) __attribute__((weak));
+extern uint32_t  fb_get_pitch(void)  __attribute__((weak));
 
 #define SCREEN_WIDTH  800
 #define SCREEN_HEIGHT 600
 #define SCREEN_BPP    32
+
+/* ── Local helpers ───────────────────────────────────────────── */
+
+static void gdi_memcpy(void *dst, const void *src, SIZE_T n)
+{
+    BYTE *d = (BYTE *)dst;
+    const BYTE *s = (const BYTE *)src;
+    while (n--) *d++ = *s++;
+}
+
+static void gdi_memset(void *p, int v, SIZE_T n)
+{
+    BYTE *d = (BYTE *)p;
+    while (n--) *d++ = (BYTE)v;
+}
+
+/* ── GDI DC and Bitmap tables ────────────────────────────────── */
+
+#define MAX_GDI_DCS     16
+#define MAX_GDI_BITMAPS 32
+
+typedef struct {
+    int      in_use;
+    void    *surface;       /* pixel buffer (NULL = no bitmap selected yet) */
+    int      width, height;
+    int      bpp;
+    int      pitch;         /* bytes per scanline */
+    uint32_t text_color;
+    uint32_t bk_color;
+    int      bk_mode;       /* TRANSPARENT=1, OPAQUE=2 */
+    HGDIOBJ  prev_bitmap;   /* previously selected bitmap handle */
+} GDI_DC;
+
+typedef struct {
+    int      in_use;
+    void    *pixels;
+    int      width, height;
+    int      bpp;
+    int      pitch;
+} GDI_BITMAP;
+
+static GDI_DC     gdi_dcs[MAX_GDI_DCS];
+static GDI_BITMAP gdi_bmps[MAX_GDI_BITMAPS];
+
+/* Handle encoding:
+ *   HDC    = 0xDC000000 | index
+ *   HBITMAP = 0xBB000000 | index
+ * Extract index with & 0xFF.
+ */
+#define DC_TAG     0xDC000000u
+#define BMP_TAG    0xBB000000u
+#define TAG_MASK   0xFF000000u
+#define IDX_MASK   0x000000FFu
+
+#define IS_DC_HANDLE(h)  (((ULONG_PTR)(h) & TAG_MASK) == DC_TAG)
+#define IS_BMP_HANDLE(h) (((ULONG_PTR)(h) & TAG_MASK) == BMP_TAG)
+#define DC_INDEX(h)      ((int)((ULONG_PTR)(h) & IDX_MASK))
+#define BMP_INDEX(h)     ((int)((ULONG_PTR)(h) & IDX_MASK))
+
+static GDI_DC *dc_from_handle(HDC h)
+{
+    if (!IS_DC_HANDLE(h)) return NULL;
+    int idx = DC_INDEX(h);
+    if (idx < 0 || idx >= MAX_GDI_DCS) return NULL;
+    if (!gdi_dcs[idx].in_use) return NULL;
+    return &gdi_dcs[idx];
+}
+
+static GDI_BITMAP *bmp_from_handle(HBITMAP h)
+{
+    if (!IS_BMP_HANDLE(h)) return NULL;
+    int idx = BMP_INDEX(h);
+    if (idx < 0 || idx >= MAX_GDI_BITMAPS) return NULL;
+    if (!gdi_bmps[idx].in_use) return NULL;
+    return &gdi_bmps[idx];
+}
+
+static int alloc_dc(void)
+{
+    for (int i = 0; i < MAX_GDI_DCS; i++) {
+        if (!gdi_dcs[i].in_use) {
+            gdi_memset(&gdi_dcs[i], 0, sizeof(GDI_DC));
+            gdi_dcs[i].in_use = 1;
+            gdi_dcs[i].bk_mode = 2; /* OPAQUE */
+            return i;
+        }
+    }
+    return -1;
+}
+
+static int alloc_bmp(void)
+{
+    for (int i = 0; i < MAX_GDI_BITMAPS; i++) {
+        if (!gdi_bmps[i].in_use) {
+            gdi_memset(&gdi_bmps[i], 0, sizeof(GDI_BITMAP));
+            gdi_bmps[i].in_use = 1;
+            return i;
+        }
+    }
+    return -1;
+}
+
+/* Get framebuffer info, falling back to compile-time constants */
+static void *get_screen_surface(int *out_w, int *out_h, int *out_pitch)
+{
+    void *base = NULL;
+    int w = SCREEN_WIDTH, h = SCREEN_HEIGHT, p = SCREEN_WIDTH * 4;
+
+    if (fb_get_base) {
+        uint32_t *fb = fb_get_base();
+        if (fb) {
+            base = fb;
+            if (fb_get_width)  w = (int)fb_get_width();
+            if (fb_get_height) h = (int)fb_get_height();
+            if (fb_get_pitch)  p = (int)fb_get_pitch();
+        }
+    }
+
+    if (out_w)     *out_w = w;
+    if (out_h)     *out_h = h;
+    if (out_pitch) *out_pitch = p;
+    return base;
+}
+
+/* ── GetDeviceCaps ───────────────────────────────────────────── */
 
 int WINAPI GetDeviceCaps(HDC hdc, int index)
 {
@@ -26,20 +160,96 @@ int WINAPI GetDeviceCaps(HDC hdc, int index)
     }
 }
 
+/* ── DC creation / destruction ───────────────────────────────── */
+
 HDC WINAPI CreateDCA(PCSTR lpszDriver, PCSTR lpszDevice,
                      PCSTR lpszOutput, PCVOID lpInitData)
 {
     (void)lpszDriver; (void)lpszDevice;
     (void)lpszOutput; (void)lpInitData;
     serial_puts("[GDI32] CreateDCA\n");
-    return (HDC)(ULONG_PTR)0xDC000002;
+
+    /* Allocate a screen DC */
+    int idx = alloc_dc();
+    if (idx < 0) return NULL;
+
+    int w, h, p;
+    void *base = get_screen_surface(&w, &h, &p);
+
+    gdi_dcs[idx].surface = base;
+    gdi_dcs[idx].width   = w;
+    gdi_dcs[idx].height  = h;
+    gdi_dcs[idx].bpp     = 32;
+    gdi_dcs[idx].pitch   = p;
+
+    return (HDC)(ULONG_PTR)(DC_TAG | (unsigned)idx);
+}
+
+HDC WINAPI CreateCompatibleDC(HDC hdc)
+{
+    serial_puts("[GDI32] CreateCompatibleDC\n");
+
+    int idx = alloc_dc();
+    if (idx < 0) return NULL;
+
+    /* Inherit dimensions from source DC (or screen defaults) */
+    GDI_DC *src = dc_from_handle(hdc);
+    if (src) {
+        gdi_dcs[idx].width  = src->width;
+        gdi_dcs[idx].height = src->height;
+        gdi_dcs[idx].bpp    = src->bpp;
+        gdi_dcs[idx].pitch  = src->pitch;
+    } else {
+        /* Default to screen dimensions */
+        gdi_dcs[idx].width  = SCREEN_WIDTH;
+        gdi_dcs[idx].height = SCREEN_HEIGHT;
+        gdi_dcs[idx].bpp    = 32;
+        gdi_dcs[idx].pitch  = SCREEN_WIDTH * 4;
+    }
+    /* surface = NULL — no bitmap selected yet */
+
+    return (HDC)(ULONG_PTR)(DC_TAG | (unsigned)idx);
 }
 
 BOOL WINAPI DeleteDC(HDC hdc)
 {
-    (void)hdc;
+    GDI_DC *dc = dc_from_handle(hdc);
+    if (dc) {
+        dc->in_use = 0;
+        dc->surface = NULL;
+    }
     return TRUE;
 }
+
+/* ── Screen DC helpers (called from user32 GetDC/ReleaseDC) ──── */
+
+HDC gdi32_alloc_screen_dc(void)
+{
+    int idx = alloc_dc();
+    if (idx < 0) return NULL;
+
+    int w, h, p;
+    void *base = get_screen_surface(&w, &h, &p);
+
+    gdi_dcs[idx].surface = base;
+    gdi_dcs[idx].width   = w;
+    gdi_dcs[idx].height  = h;
+    gdi_dcs[idx].bpp     = 32;
+    gdi_dcs[idx].pitch   = p;
+
+    return (HDC)(ULONG_PTR)(DC_TAG | (unsigned)idx);
+}
+
+void gdi32_free_screen_dc(HDC hdc)
+{
+    GDI_DC *dc = dc_from_handle(hdc);
+    if (dc) {
+        dc->in_use = 0;
+        dc->surface = NULL;
+    }
+}
+
+/* ── Pixel format (passthrough stubs — DirectDraw uses these) ── */
 
 int WINAPI ChoosePixelFormat(HDC hdc, const PIXELFORMATDESCRIPTOR *ppfd)
 {
@@ -80,19 +290,126 @@ int WINAPI DescribePixelFormat(HDC hdc, int iPixelFormat, DWORD nBytes,
 BOOL WINAPI SwapBuffers(HDC hdc)
 {
     (void)hdc;
-    /* In real OsitoK, this would flip the framebuffer */
     return TRUE;
 }
 
+/* ── Bitmap creation ─────────────────────────────────────────── */
+
+HBITMAP WINAPI CreateCompatibleBitmap(HDC hdc, int cx, int cy)
+{
+    serial_puts("[GDI32] CreateCompatibleBitmap\n");
+
+    if (cx <= 0 || cy <= 0) return NULL;
+
+    int idx = alloc_bmp();
+    if (idx < 0) return NULL;
+
+    int bpp = 32;
+    GDI_DC *dc = dc_from_handle(hdc);
+    if (dc) bpp = dc->bpp;
+
+    int pitch = cx * (bpp / 8);
+    void *pixels = kmalloc((uint64_t)pitch * cy);
+    if (!pixels) {
+        gdi_bmps[idx].in_use = 0;
+        return NULL;
+    }
+    gdi_memset(pixels, 0, (SIZE_T)pitch * cy);
+
+    gdi_bmps[idx].pixels = pixels;
+    gdi_bmps[idx].width  = cx;
+    gdi_bmps[idx].height = cy;
+    gdi_bmps[idx].bpp    = bpp;
+    gdi_bmps[idx].pitch  = pitch;
+
+    return (HBITMAP)(ULONG_PTR)(BMP_TAG | (unsigned)idx);
+}
+
+HBITMAP WINAPI CreateBitmap(int nWidth, int nHeight, UINT nPlanes,
+                            UINT nBitCount, PVOID lpBits)
+{
+    (void)nPlanes;
+    serial_puts("[GDI32] CreateBitmap\n");
+
+    if (nWidth <= 0 || nHeight <= 0) return NULL;
+
+    int idx = alloc_bmp();
+    if (idx < 0) return NULL;
+
+    int bpp = (int)nBitCount;
+    if (bpp < 8) bpp = 32; /* default to 32bpp for monochrome requests */
+    int pitch = nWidth * (bpp / 8);
+    void *pixels = kmalloc((uint64_t)pitch * nHeight);
+    if (!pixels) {
+        gdi_bmps[idx].in_use = 0;
+        return NULL;
+    }
+
+    if (lpBits) {
+        gdi_memcpy(pixels, lpBits, (SIZE_T)pitch * nHeight);
+    } else {
+        gdi_memset(pixels, 0, (SIZE_T)pitch * nHeight);
+    }
+
+    gdi_bmps[idx].pixels = pixels;
+    gdi_bmps[idx].width  = nWidth;
+    gdi_bmps[idx].height = nHeight;
+    gdi_bmps[idx].bpp    = bpp;
+    gdi_bmps[idx].pitch  = pitch;
+
+    return (HBITMAP)(ULONG_PTR)(BMP_TAG | (unsigned)idx);
+}
+
+HBITMAP WINAPI CreateDIBitmap(HDC hdc, PVOID pbmih, DWORD flInit,
+                              PVOID pjBits, PVOID pbmi, UINT iUsage)
+{
+    (void)hdc; (void)pbmih; (void)flInit;
+    (void)pjBits; (void)pbmi; (void)iUsage;
+    serial_puts("[GDI32] CreateDIBitmap (stub)\n");
+    return (HBITMAP)(ULONG_PTR)(BMP_TAG | 0xFE); /* fake — no slot */
+}
+
+/* ── Object selection / deletion ─────────────────────────────── */
+
 HGDIOBJ WINAPI SelectObject(HDC hdc, HGDIOBJ h)
 {
-    (void)hdc;
+    GDI_DC *dc = dc_from_handle(hdc);
+    if (!dc) return h; /* unknown DC — passthrough */
+
+    /* Selecting a bitmap into the DC */
+    if (IS_BMP_HANDLE(h)) {
+        GDI_BITMAP *bmp = bmp_from_handle((HBITMAP)h);
+        if (bmp) {
+            HGDIOBJ prev = dc->prev_bitmap;
+            dc->surface     = bmp->pixels;
+            dc->width       = bmp->width;
+            dc->height      = bmp->height;
+            dc->bpp         = bmp->bpp;
+            dc->pitch       = bmp->pitch;
+            dc->prev_bitmap = h;
+            return prev ? prev : h;
+        }
+    }
+
+    /* For fonts, brushes, pens — just return the input (fake passthrough) */
     return h;
 }
 
 BOOL WINAPI DeleteObject(HGDIOBJ ho)
 {
-    (void)ho;
+    /* If it's a bitmap handle, free the pixels */
+    if (IS_BMP_HANDLE(ho)) {
+        GDI_BITMAP *bmp = bmp_from_handle((HBITMAP)ho);
+        if (bmp) {
+            if (bmp->pixels) {
+                kfree(bmp->pixels);
+                bmp->pixels = NULL;
+            }
+            bmp->in_use = 0;
+        }
+        return TRUE;
+    }
+    /* Other objects (fonts, pens, brushes) — just succeed */
     return TRUE;
 }
 
@@ -102,25 +419,18 @@ int WINAPI GetObjectA(HGDIOBJ h, int c, PVOID pv)
     return 0;
 }
 
-/* ── GDI object creation ─────────────────────────────────── */
-
-HDC WINAPI CreateCompatibleDC(HDC hdc)
-{
-    (void)hdc;
-    serial_puts("[GDI32] CreateCompatibleDC\n");
-    return (HDC)(ULONG_PTR)0xDC000002;
-}
+/* ── GDI object creation (brushes, pens, stock objects) ──────── */
 
 HBRUSH_GDI WINAPI CreateSolidBrush(DWORD color)
 {
     (void)color;
-    return (HBRUSH_GDI)(ULONG_PTR)0xBB000001;
+    return (HBRUSH_GDI)(ULONG_PTR)0xBE000001;
 }
 
 HBRUSH_GDI WINAPI CreatePatternBrush(HBITMAP hBitmap)
 {
     (void)hBitmap;
-    return (HBRUSH_GDI)(ULONG_PTR)0xBB000002;
+    return (HBRUSH_GDI)(ULONG_PTR)0xBE000002;
 }
 
 HPEN WINAPI CreatePen(int iStyle, int cWidth, DWORD color)
@@ -129,42 +439,102 @@ HPEN WINAPI CreatePen(int iStyle, int cWidth, DWORD color)
     return (HPEN)(ULONG_PTR)0xEE000001;
 }
 
-HBITMAP WINAPI CreateBitmap(int nWidth, int nHeight, UINT nPlanes,
-                            UINT nBitCount, PVOID lpBits)
-{
-    (void)nWidth; (void)nHeight; (void)nPlanes;
-    (void)nBitCount; (void)lpBits;
-    return (HBITMAP)(ULONG_PTR)0xBB000003;
-}
-
-HBITMAP WINAPI CreateDIBitmap(HDC hdc, PVOID pbmih, DWORD flInit,
-                              PVOID pjBits, PVOID pbmi, UINT iUsage)
-{
-    (void)hdc; (void)pbmih; (void)flInit;
-    (void)pjBits; (void)pbmi; (void)iUsage;
-    return (HBITMAP)(ULONG_PTR)0xBB000004;
-}
-
 HGDIOBJ WINAPI GetStockObject(int i)
 {
     return (HGDIOBJ)(ULONG_PTR)(0xAA000000 + i);
 }
 
-/* ── Drawing ─────────────────────────────────────────────── */
+/* ── BitBlt / PatBlt ─────────────────────────────────────────── */
+
+/* ROP codes */
+#define ROP_SRCCOPY    0x00CC0020
+#define ROP_BLACKNESS  0x00000042
+#define ROP_WHITENESS  0x00FF0062
+#define ROP_PATCOPY    0x00F00021
 
 BOOL WINAPI BitBlt(HDC hdcDest, int x, int y, int cx, int cy,
                    HDC hdcSrc, int x1, int y1, DWORD rop)
 {
-    (void)hdcDest; (void)x; (void)y; (void)cx; (void)cy;
-    (void)hdcSrc; (void)x1; (void)y1; (void)rop;
+    GDI_DC *dst = dc_from_handle(hdcDest);
+    if (!dst || !dst->surface) return FALSE;
+
+    /* Handle fill-only raster ops (no source needed) */
+    if (rop == ROP_BLACKNESS || rop == ROP_WHITENESS || rop == ROP_PATCOPY) {
+        uint32_t fill;
+        if (rop == ROP_BLACKNESS)     fill = 0x00000000;
+        else if (rop == ROP_WHITENESS) fill = 0xFFFFFFFF;
+        else                           fill = 0x00000000; /* PATCOPY: black brush */
+
+        /* Clip destination rectangle */
+        int dx = x, dy = y;
+        int dw = cx, dh = cy;
+        if (dx < 0) { dw += dx; dx = 0; }
+        if (dy < 0) { dh += dy; dy = 0; }
+        if (dx + dw > dst->width)  dw = dst->width - dx;
+        if (dy + dh > dst->height) dh = dst->height - dy;
+        if (dw <= 0 || dh <= 0) return TRUE;
+
+        BYTE *dst_base = (BYTE *)dst->surface;
+        int dst_pitch = dst->pitch;
+
+        for (int row = 0; row < dh; row++) {
+            uint32_t *dp = (uint32_t *)(dst_base + (dy + row) * dst_pitch) + dx;
+            for (int col = 0; col < dw; col++)
+                dp[col] = fill;
+        }
+        return TRUE;
+    }
+
+    /* SRCCOPY: requires valid source */
+    if (rop == ROP_SRCCOPY) {
+        GDI_DC *src = dc_from_handle(hdcSrc);
+        if (!src || !src->surface) return FALSE;
+
+        /* Clip source coordinates */
+        int sx = x1, sy = y1;
+        int dx = x, dy = y;
+        int w = cx, h = cy;
+
+        /* Clip to source bounds */
+        if (sx < 0) { w += sx; dx -= sx; sx = 0; }
+        if (sy < 0) { h += sy; dy -= sy; sy = 0; }
+        if (sx + w > src->width)  w = src->width - sx;
+        if (sy + h > src->height) h = src->height - sy;
+
+        /* Clip to dest bounds */
+        if (dx < 0) { w += dx; sx -= dx; dx = 0; }
+        if (dy < 0) { h += dy; sy -= dy; dy = 0; }
+        if (dx + w > dst->width)  w = dst->width - dx;
+        if (dy + h > dst->height) h = dst->height - dy;
+
+        if (w <= 0 || h <= 0) return TRUE;
+
+        BYTE *src_base = (BYTE *)src->surface;
+        BYTE *dst_base = (BYTE *)dst->surface;
+        int src_pitch = src->pitch;
+        int dst_pitch = dst->pitch;
+        int bpp_bytes = dst->bpp / 8;
+        int row_bytes = w * bpp_bytes;
+
+        for (int row = 0; row < h; row++) {
+            BYTE *sp = src_base + (sy + row) * src_pitch + sx * bpp_bytes;
+            BYTE *dp = dst_base + (dy + row) * dst_pitch + dx * bpp_bytes;
+            gdi_memcpy(dp, sp, (SIZE_T)row_bytes);
+        }
+        return TRUE;
+    }
+
+    /* Unknown ROP — succeed silently */
     return TRUE;
 }
 
 BOOL WINAPI PatBlt(HDC hdc, int x, int y, int w, int h, DWORD rop)
 {
-    (void)hdc; (void)x; (void)y; (void)w; (void)h; (void)rop;
-    return TRUE;
+    /* PatBlt is BitBlt with no source */
+    return BitBlt(hdc, x, y, w, h, NULL, 0, 0, rop);
 }
+
+/* ── Line drawing (stubs) ────────────────────────────────────── */
 
 BOOL WINAPI MoveToEx(HDC hdc, int x, int y, PVOID lppt)
 {
@@ -178,23 +548,38 @@ BOOL WINAPI LineTo(HDC hdc, int x, int y)
     return TRUE;
 }
 
-/* ── Text ────────────────────────────────────────────────── */
+/* ── Text ────────────────────────────────────────────────────── */
 
 DWORD WINAPI SetTextColor(HDC hdc, DWORD color)
 {
-    (void)hdc; (void)color;
+    GDI_DC *dc = dc_from_handle(hdc);
+    if (dc) {
+        DWORD prev = dc->text_color;
+        dc->text_color = color;
+        return prev;
+    }
     return 0;
 }
 
 DWORD WINAPI SetBkColor(HDC hdc, DWORD color)
 {
-    (void)hdc; (void)color;
+    GDI_DC *dc = dc_from_handle(hdc);
+    if (dc) {
+        DWORD prev = dc->bk_color;
+        dc->bk_color = color;
+        return prev;
+    }
     return 0;
 }
 
 int WINAPI SetBkMode(HDC hdc, int mode)
 {
-    (void)hdc; (void)mode;
+    GDI_DC *dc = dc_from_handle(hdc);
+    if (dc) {
+        int prev = dc->bk_mode;
+        dc->bk_mode = mode;
+        return prev;
+    }
     return 0;
 }
 
@@ -234,7 +619,7 @@ BOOL WINAPI GetTextExtentPoint32W(HDC hdc, PCWSTR lpString, int c, PVOID lpSize)
     return TRUE;
 }
 
-/* ── Stubs for additional GDI32 imports ───────────────────── */
+/* ── Stubs for additional GDI32 imports ───────────────────────── */
 
 static PVOID WINAPI CreateFontA_stub(int h, int w, int esc, int orient, int weight,
                                       DWORD italic, DWORD underline, DWORD strikeout,
@@ -270,11 +655,17 @@ static PVOID WINAPI CreateDIBSection_stub(HDC hdc, PVOID pbmi, UINT usage,
 
 static DWORD WINAPI GetPixel_stub(HDC hdc, int x, int y)
 {
-    (void)hdc; (void)x; (void)y;
+    GDI_DC *dc = dc_from_handle(hdc);
+    if (dc && dc->surface && x >= 0 && y >= 0 &&
+        x < dc->width && y < dc->height) {
+        BYTE *base = (BYTE *)dc->surface;
+        uint32_t *row = (uint32_t *)(base + y * dc->pitch);
+        return row[x];
+    }
     return 0x00000000;  /* black pixel */
 }
 
-/* ── Export table ──────────────────────────────────────────── */
+/* ── Export table ──────────────────────────────────────────────── */
 
 typedef struct { const char *name; PVOID func; } SHIM_EXPORT;
 
@@ -292,6 +683,7 @@ static const SHIM_EXPORT gdi32_exports[] = {
     { "GetObjectA",          (PVOID)GetObjectA },
     /* GDI object creation */
     { "CreateCompatibleDC",       (PVOID)CreateCompatibleDC },
+    { "CreateCompatibleBitmap",   (PVOID)CreateCompatibleBitmap },
     { "CreateSolidBrush",         (PVOID)CreateSolidBrush },
     { "CreatePatternBrush",       (PVOID)CreatePatternBrush },
     { "CreatePen",                (PVOID)CreatePen },

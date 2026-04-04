@@ -1202,16 +1202,20 @@ HICON WINAPI LoadIconW(HINSTANCE hInstance, PCWSTR lpIconName)
     return (HICON)(ULONG_PTR)0xC0000003;
 }
 
+/* Forward to gdi32 real DC allocator */
+extern HDC  gdi32_alloc_screen_dc(void);
+extern void gdi32_free_screen_dc(HDC hdc);
+
 HDC WINAPI GetDC(HWND hWnd)
 {
     (void)hWnd;
-    return (HDC)(ULONG_PTR)0xDC000001;
+    return gdi32_alloc_screen_dc();
 }
 
 int WINAPI ReleaseDC(HWND hWnd, HDC hDC)
 {
     (void)hWnd;
-    (void)hDC;
+    gdi32_free_screen_dc(hDC);
     return 1;
 }
 
