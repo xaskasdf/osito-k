@@ -1115,6 +1115,7 @@ void compat32_enter(uint32_t entry, uint32_t stack_top)
         "mov %[sp], %%rsp\n"
         "push %[cs]\n"
         "push %[ip]\n"
+        "sti\n"
         "lretq\n"
         :
         : [cs] "r"(cs64),
