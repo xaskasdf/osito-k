@@ -90,6 +90,24 @@ extern void syscall_restore_brk(void);
  */
 static const uint32_t qos_quantum[QOS_NUM_CLASSES] = { 20, 10, 5, 2, 1 };
 
+/* Per-QoS ready bitmask: bit N set = proctab[N] is READY at that class.
+ * Enables O(1) scheduler lookup via __builtin_ctzll instead of O(n) scan. */
+static uint64_t ready_mask[QOS_NUM_CLASSES];
+
+static inline void ready_mask_set(int idx, uint8_t qos)
+{
+    if (idx >= 0 && idx < 64 && qos < QOS_NUM_CLASSES)
+        ready_mask[qos] |= (1ULL << idx);
+}
+
+static inline void ready_mask_clear(int idx, uint8_t qos)
+{
+    if (idx >= 0 && idx < 64 && qos < QOS_NUM_CLASSES)
+        ready_mask[qos] &= ~(1ULL << idx);
+}
+
+/* proc_set_state: defined after proctab declaration (needs process_t) */
+
 /* ── File descriptor ─────────────────────────────────────────── */
 
 typedef ssize_t (*fd_read_fn)(void *buf, size_t count);
@@ -161,6 +179,17 @@ static process_t proctab[MAX_PROCESSES];
 static process_t *current_proc;
 static uint32_t next_pid = 1;
 
+/* Wrapper: change process state and update ready bitmask atomically */
+static inline void proc_set_state(process_t *p, uint8_t new_state)
+{
+    int idx = (int)(p - proctab);
+    if (p->state == PROC_READY)
+        ready_mask_clear(idx, p->qos_class);
+    p->state = new_state;
+    if (new_state == PROC_READY)
+        ready_mask_set(idx, p->qos_class);
+}
+
 /* Kernel return context — saved before exec, restored on exit */
 extern int  kern_setjmp(uint64_t *buf) __attribute__((returns_twice));
 extern void kern_longjmp(uint64_t *buf, int val);
@@ -205,7 +234,7 @@ static process_t *proc_alloc(const char *name)
             memset(p, 0, sizeof(*p));
             p->pid = next_pid++;
             p->ppid = current_proc ? current_proc->pid : 0;
-            p->state = PROC_READY;
+            proc_set_state(p, PROC_READY);
             p->cr3 = paging_get_kernel_cr3();
 
             /* Copy name */
@@ -278,7 +307,7 @@ static void proc_free(process_t *p)
         p->cr3 = paging_get_kernel_cr3();
     }
 
-    p->state = PROC_FREE;
+    proc_set_state(p, PROC_FREE);
 }
 
 /* ── Register memory region with current process (for cleanup) ── */
@@ -402,7 +431,7 @@ int proc_exception_kill(int32_t code)
     if (p->kernel_stack) {
         thread_exit_cleanup(p);
         p->exit_code = code;
-        p->state = PROC_ZOMBIE;
+        proc_set_state(p, PROC_ZOMBIE);
         __asm__ volatile ("sti");
         for (;;) __asm__ volatile ("hlt");
     }
@@ -426,7 +455,7 @@ void proc_exit(int32_t code)
     if (p && p->kernel_stack) {
         thread_exit_cleanup(p);  /* X-THREAD: clear_child_tid + futex wake */
         p->exit_code = code;
-        p->state = PROC_ZOMBIE;
+        proc_set_state(p, PROC_ZOMBIE);
         /* Signal SIGCHLD to parent */
         if (p->ppid > 0) {
             for (int i = 0; i < MAX_PROCESSES; i++) {
@@ -497,7 +526,7 @@ int proc_exec(const char *filename, int argc, const char **argv)
     process_t *prev = current_proc;
     current_proc = p;
     exec_target_proc = p;
-    p->state = PROC_RUNNING;
+    proc_set_state(p, PROC_RUNNING);
 
     fb_puts_color(" [PID ", 0x0000AAFF);
     fb_putdec(p->pid);
@@ -667,18 +696,30 @@ void sched_tick(void *frame_ptr)
 
     sched_lock_acquire();
 
-    /* Find best READY process: highest QoS class, round-robin within same class */
+    /* Find best READY process: highest QoS class, round-robin within class.
+     * O(1) via per-QoS ready bitmask — scan from highest class down. */
     int next_idx = -1;
     uint8_t best_qos = 0;
-    int start = (my_idx >= 0) ? my_idx : 0;
-    for (int i = 1; i <= MAX_PROCESSES; i++) {
-        int idx = (start + i) % MAX_PROCESSES;
-        if (proctab[idx].state == PROC_READY) {
-            if (proctab[idx].qos_class >= best_qos) {
-                best_qos = proctab[idx].qos_class;
-                next_idx = idx;
-            }
+    for (int q = QOS_NUM_CLASSES - 1; q >= 0; q--) {
+        uint64_t mask = ready_mask[q];
+        if (!mask) continue;
+        /* Round-robin: rotate mask to start after current process */
+        int start = (my_idx >= 0) ? my_idx + 1 : 0;
+        if (start >= MAX_PROCESSES) start = 0;
+        /* Rotate: check bits [start..63] then [0..start-1] */
+        uint64_t rotated = (mask >> start) | (mask << (64 - start));
+        int bit = __builtin_ctzll(rotated);
+        next_idx = (start + bit) % 64;
+        /* Skip self */
+        if (next_idx == my_idx) {
+            uint64_t without_self = mask & ~(1ULL << my_idx);
+            if (!without_self) continue;
+            rotated = (without_self >> start) | (without_self << (64 - start));
+            bit = __builtin_ctzll(rotated);
+            next_idx = (start + bit) % 64;
         }
+        best_qos = (uint8_t)q;
+        break;
     }
 
     if (next_idx < 0) {
@@ -712,7 +753,7 @@ void sched_tick(void *frame_ptr)
     /* Only mark as READY if currently RUNNING.
      * ZOMBIE processes must stay ZOMBIE — proc_wait4 relies on this. */
     if (cur->state == PROC_RUNNING)
-        cur->state = PROC_READY;
+        proc_set_state(cur, PROC_READY);
 
     /* ── Memory compression: track idle time ── */
     {
@@ -757,7 +798,7 @@ void sched_tick(void *frame_ptr)
         next->pages_compressed = false;
     }
 
-    next->state = PROC_RUNNING;
+    proc_set_state(next, PROC_RUNNING);
     next->quantum = qos_quantum[next->qos_class];
     next->last_active_tick = idt_get_ticks();
     sched_idx_arr[this_cpu] = next_idx;
@@ -787,7 +828,7 @@ int sched_spawn(const char *name, void (*entry)(void))
     /* Allocate kernel stack */
     void *stack = mem_alloc_aligned(KERNEL_STACK_SIZE, 4096);
     if (!stack) {
-        p->state = PROC_FREE;
+        proc_set_state(p, PROC_FREE);
         serial_puts("[SCHED] Stack allocation failed\n");
         return -1;
     }
@@ -817,7 +858,7 @@ int sched_spawn(const char *name, void (*entry)(void))
 
     /* Set initial scheduler state */
     p->kernel_rsp = frame_addr;
-    p->state = PROC_READY;
+    proc_set_state(p, PROC_READY);
     p->quantum = qos_quantum[p->qos_class];
 
     /* Auto-activate scheduler on first spawn */
@@ -1011,7 +1052,7 @@ int32_t proc_fork(void)
     /* Allocate kernel stack for the child */
     void *stack = mem_alloc_aligned(KERNEL_STACK_SIZE, 4096);
     if (!stack) {
-        child->state = PROC_FREE;
+        proc_set_state(child, PROC_FREE);
         serial_puts("[FORK] Stack alloc failed\n");
         return -1;
     }
@@ -1057,7 +1098,7 @@ int32_t proc_fork(void)
     void *child_ustack = mem_alloc_aligned(CHILD_USTACK_SIZE, 4096);
     if (!child_ustack) {
         mem_free_pages(stack, KERNEL_STACK_SIZE / 4096);
-        child->state = PROC_FREE;
+        proc_set_state(child, PROC_FREE);
         serial_puts("[FORK] User stack alloc failed\n");
         return -1;
     }
@@ -1121,7 +1162,7 @@ int32_t proc_fork(void)
     /* Set up scheduler state — child inherits parent's QoS class */
     child->qos_class = parent->qos_class;
     child->kernel_rsp = child_frame_addr;
-    child->state = PROC_READY;
+    proc_set_state(child, PROC_READY);
     child->quantum = qos_quantum[child->qos_class];
 
     /* Ensure scheduler tracks the parent (currently running) process.
@@ -1226,7 +1267,7 @@ int32_t proc_clone_thread(uint64_t child_stack, uint64_t parent_tidptr,
     /* Allocate kernel stack for the thread */
     void *kstack = mem_alloc_aligned(KERNEL_STACK_SIZE, 4096);
     if (!kstack) {
-        thread->state = PROC_FREE;
+        proc_set_state(thread, PROC_FREE);
         serial_puts("[THREAD] Kernel stack alloc failed\n");
         return -1;
     }
@@ -1268,7 +1309,7 @@ int32_t proc_clone_thread(uint64_t child_stack, uint64_t parent_tidptr,
     /* Scheduler state — thread inherits parent's QoS class */
     thread->qos_class = parent->qos_class;
     thread->kernel_rsp = frame_addr;
-    thread->state = PROC_READY;
+    proc_set_state(thread, PROC_READY);
     thread->quantum = qos_quantum[thread->qos_class];
 
     /* Ensure scheduler is tracking parent */
@@ -1331,7 +1372,7 @@ int futex_do_wait(uint64_t uaddr, int expected)
     w->next = futex_buckets[bucket];
     futex_buckets[bucket] = w;
 
-    cur->state = PROC_BLOCKED;
+    proc_set_state(cur, PROC_BLOCKED);
     while (cur->state == PROC_BLOCKED) {
         __asm__ volatile ("sti; hlt; cli" ::: "memory");
     }
@@ -1581,7 +1622,13 @@ int sched_set_qos(uint32_t pid, uint8_t qos)
     }
     if (!target) return -1;
 
+    /* Move between ready masks if process is READY */
+    int tidx = (int)(target - proctab);
+    if (target->state == PROC_READY)
+        ready_mask_clear(tidx, target->qos_class);
     target->qos_class = qos;
+    if (target->state == PROC_READY)
+        ready_mask_set(tidx, qos);
     /* Adjust quantum immediately if upgrading */
     uint32_t new_q = qos_quantum[qos];
     if (new_q < target->quantum)
@@ -1630,7 +1677,7 @@ void proc_init(void)
     /* Create PID 1 (kernel) */
     process_t *kernel = proc_alloc("kernel");
     if (kernel) {
-        kernel->state = PROC_RUNNING;
+        proc_set_state(kernel, PROC_RUNNING);
         current_proc = kernel;
         sched_current_idx = (int)(kernel - &proctab[0]);
         serial_puts("[PROC] Kernel process PID ");
