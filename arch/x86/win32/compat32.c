@@ -30,6 +30,7 @@ extern void kern_longjmp(uint64_t *buf, int val);
 /* ── Global compat32 mode flag ────────────────────────────────── */
 
 int g_compat32_mode = 0;
+uint32_t g_int2e_rsp_depth = 0;
 
 /* ── C++ EH unwind state (set by _CxxThrowException) ────────── */
 uint32_t g_compat32_unwind_eip = 0;
