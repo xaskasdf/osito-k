@@ -74,6 +74,14 @@ NTSTATUS NtPulseEvent(HANDLE EventHandle, LONG *PreviousState);
 NTSTATUS NtWaitForSingleObject(HANDLE Handle, BOOL Alertable,
                                 PLARGE_INTEGER Timeout);
 
+/* Section (memory-mapped files) */
+NTSTATUS NtCreateSection(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES,
+                         PLARGE_INTEGER, ULONG, ULONG, HANDLE);
+NTSTATUS NtMapViewOfSection(HANDLE, HANDLE, PVOID *, ULONG_PTR,
+                            SIZE_T, PLARGE_INTEGER, SIZE_T *,
+                            ULONG, ULONG, ULONG);
+NTSTATUS NtUnmapViewOfSection(HANDLE, PVOID);
+
 /* Rtl* utilities (run in user mode, no SYSCALL needed) */
 void     RtlInitUnicodeString(PUNICODE_STRING dest, PCWSTR src);
 NTSTATUS RtlUnicodeStringToAnsiString(PSTR dest, PCUNICODE_STRING src,

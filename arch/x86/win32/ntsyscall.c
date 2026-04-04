@@ -1032,6 +1032,182 @@ NTSTATUS sys_NtQueryPerformanceCounter(ULONG_PTR *args)
     return STATUS_SUCCESS;
 }
 
+/* ── Section objects (memory-mapped files) ──────────────────── */
+
+/*
+ * SEC_* allocation attributes (NtCreateSection AllocationAttributes).
+ * These match the Windows SDK values.
+ */
+#define SEC_COMMIT      0x8000000
+#define SEC_IMAGE       0x1000000
+#define SEC_RESERVE     0x4000000
+
+typedef struct _SECTION_OBJECT {
+    uint64_t    size;           /* section size in bytes */
+    void       *backing;        /* kmalloc'd memory backing */
+    uint32_t    flags;          /* SEC_COMMIT, SEC_IMAGE, SEC_RESERVE */
+    uint32_t    protect;        /* PAGE_READWRITE, PAGE_READONLY, etc. */
+    void       *file;           /* osfs2_file_t* if file-backed, NULL if pagefile */
+} SECTION_OBJECT;
+
+/* Pool of section objects (static — no dynamic allocator needed) */
+#define SECTION_POOL_MAX 64
+static SECTION_OBJECT section_pool[SECTION_POOL_MAX];
+static int section_pool_next = 0;
+
+extern void *kmalloc(uint64_t size);
+extern void  kfree(void *ptr);
+
+NTSTATUS sys_NtCreateSection(ULONG_PTR *args)
+{
+    PHANDLE             SectionHandle       = (PHANDLE)args[0];
+    ACCESS_MASK         DesiredAccess       = (ACCESS_MASK)args[1];
+    /* POBJECT_ATTRIBUTES ObjectAttributes  = (POBJECT_ATTRIBUTES)args[2]; -- ignored */
+    PLARGE_INTEGER      MaximumSize         = (PLARGE_INTEGER)args[3];
+    ULONG               SectionPageProtection = (ULONG)args[4];
+    ULONG               AllocationAttributes  = (ULONG)args[5];
+    HANDLE              FileHandle            = (HANDLE)args[6];
+
+    if (!SectionHandle)
+        return STATUS_INVALID_PARAMETER;
+
+    /* Determine section size */
+    uint64_t size = 0;
+
+    if (FileHandle) {
+        /* File-backed section: get size from the file handle */
+        FILE_OBJECT *fobj = NULL;
+        NTSTATUS st = handle_lookup(&g_handle_table, FileHandle,
+                                    OBJ_TYPE_FILE, (PVOID *)&fobj);
+        if (!NT_SUCCESS(st)) {
+            nt_log("NtCreateSection: invalid FileHandle");
+            return st;
+        }
+        size = (uint64_t)fobj->size;
+        /* If MaximumSize given and larger, use that */
+        if (MaximumSize && (uint64_t)MaximumSize->QuadPart > size)
+            size = (uint64_t)MaximumSize->QuadPart;
+    } else {
+        /* Pagefile-backed: MaximumSize is required */
+        if (!MaximumSize || MaximumSize->QuadPart == 0) {
+            nt_log("NtCreateSection: pagefile section requires MaximumSize");
+            return STATUS_INVALID_PARAMETER;
+        }
+        size = (uint64_t)MaximumSize->QuadPart;
+    }
+
+    /* Round up to page boundary */
+    size = (size + 0xFFF) & ~0xFFFULL;
+    if (size == 0) size = 4096;
+
+    /* Allocate physical backing memory */
+    void *mem = kmalloc(size);
+    if (!mem) {
+        nt_log_hex("NtCreateSection: kmalloc FAILED, size=", size);
+        return STATUS_NO_MEMORY;
+    }
+
+    /* Zero the backing memory */
+    nt_memset(mem, 0, size);
+
+    /* If file-backed, read file contents into section */
+    if (FileHandle) {
+        FILE_OBJECT *fobj = NULL;
+        handle_lookup(&g_handle_table, FileHandle, OBJ_TYPE_FILE, (PVOID *)&fobj);
+        if (fobj && fobj->osfs_file && fobj->size > 0) {
+            uint64_t to_read = (uint64_t)fobj->size;
+            if (to_read > size) to_read = size;
+            osfs2_read(fobj->osfs_file, 0, mem, to_read);
+        }
+    }
+
+    /* Allocate a section object from pool */
+    if (section_pool_next >= SECTION_POOL_MAX) {
+        kfree(mem);
+        nt_log("NtCreateSection: section pool exhausted");
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    SECTION_OBJECT *sec = &section_pool[section_pool_next++];
+    sec->size    = size;
+    sec->backing = mem;
+    sec->flags   = AllocationAttributes;
+    sec->protect = SectionPageProtection;
+    sec->file    = FileHandle ? (void *)1 : NULL; /* non-NULL = file-backed */
+
+    /* Allocate handle */
+    NTSTATUS status = handle_alloc(&g_handle_table, OBJ_TYPE_SECTION,
+                                   DesiredAccess, sec, SectionHandle);
+    if (!NT_SUCCESS(status)) {
+        kfree(mem);
+        section_pool_next--;
+        return status;
+    }
+
+    nt_log_hex("NtCreateSection: handle=", (ULONGLONG)*SectionHandle);
+    nt_log_hex("  size=", size);
+    nt_log_hex("  backing=", (ULONGLONG)(ULONG_PTR)mem);
+
+    return STATUS_SUCCESS;
+}
+
+NTSTATUS sys_NtMapViewOfSection(ULONG_PTR *args)
+{
+    HANDLE  SectionHandle  = (HANDLE)args[0];
+    /* HANDLE ProcessHandle = (HANDLE)args[1]; -- ignored, always current */
+    PVOID  *BaseAddress    = (PVOID *)args[2];
+    /* ULONG_PTR ZeroBits  = args[3]; */
+    /* SIZE_T CommitSize   = args[4]; */
+    /* PLARGE_INTEGER SectionOffset = (PLARGE_INTEGER)args[5]; */
+    SIZE_T *ViewSize       = (SIZE_T *)args[6];
+    /* ULONG InheritDisposition = (ULONG)args[7]; */
+    /* ULONG AllocationType = (ULONG)args[8]; */
+    /* ULONG Win32Protect  = (ULONG)args[9]; */
+
+    if (!BaseAddress)
+        return STATUS_INVALID_PARAMETER;
+
+    /* Look up section object */
+    SECTION_OBJECT *sec = NULL;
+    NTSTATUS status = handle_lookup(&g_handle_table, SectionHandle,
+                                    OBJ_TYPE_SECTION, (PVOID *)&sec);
+    if (!NT_SUCCESS(status)) {
+        nt_log("NtMapViewOfSection: invalid section handle");
+        return status;
+    }
+
+    /*
+     * Identity-mapped v1: return the kmalloc'd backing address directly.
+     * The backing memory lives in identity-mapped kernel space, so it's
+     * accessible from both kernel and Win32 page tables.
+     *
+     * Future: allocate a VA in the Win32 range and map section pages
+     * through paging_win32_map_page for proper per-process isolation.
+     */
+    *BaseAddress = sec->backing;
+    if (ViewSize)
+        *ViewSize = sec->size;
+
+    nt_log_hex("NtMapViewOfSection: base=", (ULONGLONG)(ULONG_PTR)sec->backing);
+    nt_log_hex("  size=", sec->size);
+
+    return STATUS_SUCCESS;
+}
+
+NTSTATUS sys_NtUnmapViewOfSection(ULONG_PTR *args)
+{
+    /* HANDLE ProcessHandle = (HANDLE)args[0]; */
+    /* PVOID BaseAddress    = (PVOID)args[1]; */
+
+    /*
+     * v1 stub: no-op. Section backing is kmalloc'd and stays valid
+     * until the section handle is closed. Proper unmap would remove
+     * VA mappings from the process page table.
+     */
+    nt_log("NtUnmapViewOfSection: stub (no-op)");
+    return STATUS_SUCCESS;
+}
+
 /* ── Unimplemented syscall stub ─────────────────────────────── */
 
 static NTSTATUS sys_NtStub(ULONG_PTR *args)
@@ -1077,6 +1253,11 @@ void nt_syscall_init(NT_SERVICE_TABLE *table)
 
     /* Process */
     REG(NTSYS_TerminateProcess,       sys_NtTerminateProcess,       2);
+
+    /* Section (memory-mapped files) */
+    REG(NTSYS_CreateSection,          sys_NtCreateSection,          7);
+    REG(NTSYS_MapViewOfSection,       sys_NtMapViewOfSection,      10);
+    REG(NTSYS_UnmapViewOfSection,     sys_NtUnmapViewOfSection,     2);
 
     /* Misc */
     REG(NTSYS_DelayExecution,         sys_NtDelayExecution,         2);

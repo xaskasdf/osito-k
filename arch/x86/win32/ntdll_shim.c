@@ -395,6 +395,52 @@ NTSTATUS NtWaitForSingleObject(HANDLE Handle, BOOL Alertable,
     return sys_NtWaitForMultipleObjects(args);
 }
 
+/* ── Section wrappers (memory-mapped files) ────────────────── */
+
+extern NTSTATUS sys_NtCreateSection(ULONG_PTR *args);
+extern NTSTATUS sys_NtMapViewOfSection(ULONG_PTR *args);
+extern NTSTATUS sys_NtUnmapViewOfSection(ULONG_PTR *args);
+
+NTSTATUS NtCreateSection(PHANDLE SectionHandle, ACCESS_MASK DesiredAccess,
+                         POBJECT_ATTRIBUTES ObjectAttributes,
+                         PLARGE_INTEGER MaximumSize,
+                         ULONG SectionPageProtection,
+                         ULONG AllocationAttributes,
+                         HANDLE FileHandle)
+{
+    ULONG_PTR args[7] = {
+        (ULONG_PTR)SectionHandle, (ULONG_PTR)DesiredAccess,
+        (ULONG_PTR)ObjectAttributes, (ULONG_PTR)MaximumSize,
+        (ULONG_PTR)SectionPageProtection, (ULONG_PTR)AllocationAttributes,
+        (ULONG_PTR)FileHandle
+    };
+    return sys_NtCreateSection(args);
+}
+
+NTSTATUS NtMapViewOfSection(HANDLE SectionHandle, HANDLE ProcessHandle,
+                            PVOID *BaseAddress, ULONG_PTR ZeroBits,
+                            SIZE_T CommitSize, PLARGE_INTEGER SectionOffset,
+                            SIZE_T *ViewSize, ULONG InheritDisposition,
+                            ULONG AllocationType, ULONG Win32Protect)
+{
+    ULONG_PTR args[10] = {
+        (ULONG_PTR)SectionHandle, (ULONG_PTR)ProcessHandle,
+        (ULONG_PTR)BaseAddress, (ULONG_PTR)ZeroBits,
+        (ULONG_PTR)CommitSize, (ULONG_PTR)SectionOffset,
+        (ULONG_PTR)ViewSize, (ULONG_PTR)InheritDisposition,
+        (ULONG_PTR)AllocationType, (ULONG_PTR)Win32Protect
+    };
+    return sys_NtMapViewOfSection(args);
+}
+
+NTSTATUS NtUnmapViewOfSection(HANDLE ProcessHandle, PVOID BaseAddress)
+{
+    ULONG_PTR args[2] = {
+        (ULONG_PTR)ProcessHandle, (ULONG_PTR)BaseAddress
+    };
+    return sys_NtUnmapViewOfSection(args);
+}
+
 /* ── SEH Support (Phase 17) ─────────────────────────────────── */
 
 extern void serial_puts(const char *s);
@@ -676,6 +722,13 @@ static const SHIM_EXPORT ntdll_exports[] = {
     { "NtDuplicateObject",         (PVOID)NtDuplicateObject },
     { "NtProtectVirtualMemory",    (PVOID)NtProtectVirtualMemory },
     { "NtQueryVirtualMemory",      (PVOID)NtQueryVirtualMemory },
+    /* Section (memory-mapped files) */
+    { "NtCreateSection",           (PVOID)NtCreateSection },
+    { "NtMapViewOfSection",        (PVOID)NtMapViewOfSection },
+    { "NtUnmapViewOfSection",      (PVOID)NtUnmapViewOfSection },
+    { "ZwCreateSection",           (PVOID)NtCreateSection },
+    { "ZwMapViewOfSection",        (PVOID)NtMapViewOfSection },
+    { "ZwUnmapViewOfSection",      (PVOID)NtUnmapViewOfSection },
     /* Synchronization (Phase 21) */
     { "NtCreateEvent",             (PVOID)NtCreateEvent },
     { "NtSetEvent",                (PVOID)NtSetEvent },

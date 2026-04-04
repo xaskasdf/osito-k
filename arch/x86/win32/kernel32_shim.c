@@ -377,6 +377,127 @@ BOOL WINAPI VirtualFree(PVOID lpAddress, SIZE_T dwSize, DWORD dwFreeType)
     return TRUE;
 }
 
+/* ── Memory-Mapped File API ────────────────────────────────── */
+
+/*
+ * CreateFileMappingA/W → NtCreateSection
+ * MapViewOfFile → NtMapViewOfSection
+ * UnmapViewOfFile → NtUnmapViewOfSection (stub)
+ */
+
+/* SEC_* constants for CreateFileMapping's flProtect high bits */
+#define K32_SEC_COMMIT   0x8000000
+#define K32_SEC_IMAGE    0x1000000
+#define K32_SEC_RESERVE  0x4000000
+
+HANDLE WINAPI CreateFileMappingA(HANDLE hFile, PVOID lpFileMappingAttributes,
+                                 DWORD flProtect, DWORD dwMaximumSizeHigh,
+                                 DWORD dwMaximumSizeLow, PCSTR lpName)
+{
+    (void)lpFileMappingAttributes;
+    (void)lpName;
+
+    extern NTSTATUS sys_NtCreateSection(ULONG_PTR *args);
+
+    LARGE_INTEGER max_size;
+    max_size.QuadPart = ((LONGLONG)dwMaximumSizeHigh << 32) | dwMaximumSizeLow;
+
+    /* Extract SEC_* flags from high bits of flProtect */
+    ULONG alloc_attrs = K32_SEC_COMMIT;
+    if (flProtect & K32_SEC_IMAGE)
+        alloc_attrs = K32_SEC_IMAGE;
+    else if (flProtect & K32_SEC_RESERVE)
+        alloc_attrs = K32_SEC_RESERVE;
+
+    /* Low bits of flProtect are PAGE_* constants */
+    ULONG page_prot = flProtect & 0xFF;
+
+    HANDLE section = NULL;
+    HANDLE file_h = (hFile == INVALID_HANDLE_VALUE) ? NULL : hFile;
+
+    ULONG_PTR args[7] = {
+        (ULONG_PTR)&section, (ULONG_PTR)GENERIC_ALL,
+        (ULONG_PTR)NULL, (ULONG_PTR)&max_size,
+        (ULONG_PTR)page_prot, (ULONG_PTR)alloc_attrs,
+        (ULONG_PTR)file_h
+    };
+
+    NTSTATUS status = sys_NtCreateSection(args);
+    if (!NT_SUCCESS(status)) {
+        set_last_error_from_status(status);
+        return NULL;
+    }
+
+    return section;
+}
+
+HANDLE WINAPI CreateFileMappingW(HANDLE hFile, PVOID lpFileMappingAttributes,
+                                 DWORD flProtect, DWORD dwMaximumSizeHigh,
+                                 DWORD dwMaximumSizeLow, PCWSTR lpName)
+{
+    /* Same as A variant — name is ignored for unnamed sections */
+    (void)lpName;
+    return CreateFileMappingA(hFile, lpFileMappingAttributes, flProtect,
+                              dwMaximumSizeHigh, dwMaximumSizeLow, NULL);
+}
+
+PVOID WINAPI MapViewOfFile(HANDLE hFileMappingObject, DWORD dwDesiredAccess,
+                           DWORD dwFileOffsetHigh, DWORD dwFileOffsetLow,
+                           SIZE_T dwNumberOfBytesToMap)
+{
+    extern NTSTATUS sys_NtMapViewOfSection(ULONG_PTR *args);
+
+    PVOID base = NULL;
+    SIZE_T view_size = dwNumberOfBytesToMap;
+
+    LARGE_INTEGER offset;
+    offset.QuadPart = ((LONGLONG)dwFileOffsetHigh << 32) | dwFileOffsetLow;
+
+    /* Map Win32 access flags to NT protection:
+     * FILE_MAP_READ = SECTION_MAP_READ (0x4)
+     * FILE_MAP_WRITE = SECTION_MAP_WRITE (0x2)
+     * FILE_MAP_ALL_ACCESS = SECTION_ALL_ACCESS */
+    ULONG prot = PAGE_READONLY;
+    if (dwDesiredAccess & 0x2) /* FILE_MAP_WRITE */
+        prot = PAGE_READWRITE;
+
+    ULONG_PTR args[10] = {
+        (ULONG_PTR)hFileMappingObject, (ULONG_PTR)NT_CURRENT_PROCESS,
+        (ULONG_PTR)&base, (ULONG_PTR)0,      /* ZeroBits */
+        (ULONG_PTR)0,                          /* CommitSize */
+        (ULONG_PTR)&offset,                    /* SectionOffset */
+        (ULONG_PTR)&view_size,                 /* ViewSize */
+        (ULONG_PTR)1,                          /* ViewShare */
+        (ULONG_PTR)0,                          /* AllocationType */
+        (ULONG_PTR)prot                        /* Win32Protect */
+    };
+
+    NTSTATUS status = sys_NtMapViewOfSection(args);
+    if (!NT_SUCCESS(status)) {
+        set_last_error_from_status(status);
+        return NULL;
+    }
+
+    return base;
+}
+
+BOOL WINAPI UnmapViewOfFile(PCVOID lpBaseAddress)
+{
+    extern NTSTATUS sys_NtUnmapViewOfSection(ULONG_PTR *args);
+
+    ULONG_PTR args[2] = {
+        (ULONG_PTR)NT_CURRENT_PROCESS, (ULONG_PTR)lpBaseAddress
+    };
+
+    NTSTATUS status = sys_NtUnmapViewOfSection(args);
+    if (!NT_SUCCESS(status)) {
+        set_last_error_from_status(status);
+        return FALSE;
+    }
+
+    return TRUE;
+}
+
 /* ── Heap API (bump allocator with size headers) ────────────── */
 /*
  * HeapReAlloc/HeapSize expect an 8-byte size header at (ptr - 8).
@@ -3374,6 +3495,10 @@ static const K32_EXPORT k32_exports[] = {
     { "DuplicateHandle",         (PVOID)DuplicateHandle },
     { "VirtualProtect",          (PVOID)VirtualProtect },
     { "VirtualQuery",            (PVOID)VirtualQuery },
+    { "CreateFileMappingA",      (PVOID)CreateFileMappingA },
+    { "CreateFileMappingW",      (PVOID)CreateFileMappingW },
+    { "MapViewOfFile",           (PVOID)MapViewOfFile },
+    { "UnmapViewOfFile",         (PVOID)UnmapViewOfFile },
     { "lstrlenA",                (PVOID)lstrlenA },
     { "lstrlenW",                (PVOID)lstrlenW },
     { "GetCommandLineA",         (PVOID)GetCommandLineA },

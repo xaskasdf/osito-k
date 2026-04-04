@@ -72,6 +72,22 @@ PVOID   WINAPI VirtualAlloc(PVOID lpAddress, SIZE_T dwSize,
 
 BOOL    WINAPI VirtualFree(PVOID lpAddress, SIZE_T dwSize, DWORD dwFreeType);
 
+/* ── Memory-Mapped File API ─────────────────────────────────── */
+
+HANDLE  WINAPI CreateFileMappingA(HANDLE hFile, PVOID lpFileMappingAttributes,
+                    DWORD flProtect, DWORD dwMaximumSizeHigh,
+                    DWORD dwMaximumSizeLow, PCSTR lpName);
+
+HANDLE  WINAPI CreateFileMappingW(HANDLE hFile, PVOID lpFileMappingAttributes,
+                    DWORD flProtect, DWORD dwMaximumSizeHigh,
+                    DWORD dwMaximumSizeLow, PCWSTR lpName);
+
+PVOID   WINAPI MapViewOfFile(HANDLE hFileMappingObject, DWORD dwDesiredAccess,
+                    DWORD dwFileOffsetHigh, DWORD dwFileOffsetLow,
+                    SIZE_T dwNumberOfBytesToMap);
+
+BOOL    WINAPI UnmapViewOfFile(PCVOID lpBaseAddress);
+
 /* ── Heap API ───────────────────────────────────────────────── */
 
 HANDLE  WINAPI GetProcessHeap(void);
