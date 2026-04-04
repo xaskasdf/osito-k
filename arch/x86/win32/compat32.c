@@ -114,7 +114,8 @@ static uint8_t  callback_stacks[MAX_CALLBACK_DEPTH][CALLBACK_STACK_SIZE]
  * The stub uses a fixed address so we can't index by depth there.
  * The dispatch handler reads this and stores it before longjmp.
  */
-static uint32_t callback_retval = 0;
+static uint32_t callback_retval = 0;           /* written by 32-bit return stub */
+static uint32_t callback_retval_per_depth[MAX_CALLBACK_DEPTH]; /* saved before longjmp */
 
 /* ── Thunk code generation ───────────────────────────────────── */
 
@@ -1319,7 +1320,7 @@ uint32_t compat32_callback_args(uint32_t func_addr, int nargs, const uint32_t *a
     /* longjmp returned — 32-bit function is done. */
     g_teb32.ExceptionList = saved_seh;  /* Restore SEH chain */
     callback_depth--;
-    return callback_retval;
+    return callback_retval_per_depth[depth];
 #else
     /* Test harness: call directly */
     typedef uint32_t (*fn0)(void);
@@ -2057,6 +2058,12 @@ uint64_t compat32_dispatch(uint32_t thunk_idx, uint32_t *stack_args)
             if (tss_ist1_ptr && depth >= 0 && depth < MAX_CALLBACK_DEPTH)
                 *tss_ist1_ptr = callback_saved_ist1[depth];
         }
+
+        /* Save retval per-depth BEFORE longjmp — prevents race with
+         * timer interrupts or SMP overwriting the global callback_retval
+         * between the 32-bit MOV [callback_retval],EAX and INT 0x2E. */
+        if (depth >= 0 && depth < MAX_CALLBACK_DEPTH)
+            callback_retval_per_depth[depth] = callback_retval;
 
         kern_longjmp(callback_jmpbufs[depth], 1);
         /* never reached */
