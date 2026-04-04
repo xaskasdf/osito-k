@@ -683,82 +683,23 @@ void isr_handler(interrupt_frame_t *frame)
     if (vec == 32) {
         tick_count++;
 
-        /* Watchdog: log PE32 execution every ~5s */
+#ifdef COMPAT32_TIMER_DEBUG
+        /* Watchdog: log PE32 execution state (enable with -DCOMPAT32_TIMER_DEBUG) */
         {
             static int compat32_ticks = 0;
             uint16_t cs = (uint16_t)(frame->cs & 0xFFFF);
-
             if (cs == 0x40) {
                 compat32_ticks++;
-                if ((compat32_ticks % 100) == 1) {  /* every ~1s */
+                if ((compat32_ticks % 100) == 1) {
                     serial_puts("[TIMER] PE32 RIP=0x");
                     serial_puthex(frame->rip, 8);
-                    serial_puts(" ECX=0x");
-                    serial_puthex(frame->rcx, 8);
-                    serial_puts(" EBP=0x");
-                    serial_puthex(frame->rbp, 8);
                     serial_puts(" t=");
                     serial_putdec(compat32_ticks);
-                    if (compat32_ticks <= 301) {
-                        /* Read GErrorHist to capture engine error message */
-                        volatile uint32_t *iat_hist = (volatile uint32_t *)(uintptr_t)0x10958C60;
-                        uint32_t hist_addr = *iat_hist;
-                        if (hist_addr > 0x10000 && hist_addr < 0x7FFFFFFF) {
-                            const uint16_t *ws = (const uint16_t *)(uintptr_t)hist_addr;
-                            if (ws[0] != 0) {
-                                serial_puts("\n  GErrorHist=\"");
-                                for (int k = 0; k < 200 && ws[k]; k++)
-                                    serial_puts((const char[]){(char)(ws[k] & 0x7F), 0});
-                                serial_puts("\"");
-                            }
-                        }
-                        /* Deep stack walk for stuck analysis */
-                        if (compat32_ticks >= 201 && compat32_ticks <= 301) {
-                            uint32_t ebp = (uint32_t)frame->rbp;
-                            serial_puts("\n  STACK:");
-                            for (int depth = 0; depth < 8 && ebp > 0x10000 && ebp < 0x7FFFFFFF; depth++) {
-                                uint32_t *fp = (uint32_t *)(uintptr_t)ebp;
-                                serial_puts(" 0x");
-                                serial_puthex(fp[1], 8);  /* return address */
-                                ebp = fp[0];  /* next frame */
-                            }
-                        }
-                        /* Check FArray::Empty IAT + JMP thunk bytes */
-                        volatile uint32_t *iat_empty = (volatile uint32_t *)(uintptr_t)0x10958B98;
-                        serial_puts(" Empty=0x");
-                        serial_puthex(*iat_empty, 8);
-                        /* Read first 5 bytes of the JMP thunk at 0x10102865 */
-                        if (compat32_ticks <= 201) {
-                            volatile uint8_t *thunk = (volatile uint8_t *)(uintptr_t)0x10102865;
-                            serial_puts(" thunk:");
-                            for (int tb = 0; tb < 5; tb++)
-                                serial_puthex(thunk[tb], 2);
-                            /* Read EXE code at 0x109090B0 (the call instruction) */
-                            volatile uint8_t *callsite = (volatile uint8_t *)(uintptr_t)0x109090B0;
-                            serial_puts(" call@90B0:");
-                            for (int tb = 0; tb < 12; tb++)
-                                serial_puthex(callsite[tb], 2);
-                        }
-                        /* Stack walk */
-                        uint32_t ebp = (uint32_t)frame->rbp;
-                        uint32_t *stk = (uint32_t *)(uintptr_t)ebp;
-                        serial_puts(" [EBP+4]=0x");
-                        serial_puthex(stk[1], 8);
-                        if (stk[0] > 0x10000 && stk[0] < 0x7FFFFFFF) {
-                            uint32_t *prev = (uint32_t *)(uintptr_t)stk[0];
-                            serial_puts(" caller=0x");
-                            serial_puthex(prev[1], 8);
-                            if (prev[0] > 0x10000 && prev[0] < 0x7FFFFFFF) {
-                                uint32_t *prev2 = (uint32_t *)(uintptr_t)prev[0];
-                                serial_puts(" caller2=0x");
-                                serial_puthex(prev2[1], 8);
-                            }
-                        }
-                    }
                     serial_puts("\n");
                 }
             }
         }
+#endif
 
         /* Re-zero NULL page for compat32: compat32 can't use TF single-step
          * (#DB from compat mode causes #GP without IST), so page 0 stays
@@ -1661,16 +1602,52 @@ static void apic_init(void)
     apic_write(APIC_TIMER_DIV, 0x03);  /* divide by 16 */
     apic_write(APIC_LVT_TIMER, APIC_TIMER_PERIODIC | 32);
 
-    /* Set initial count — calibrate roughly:
-     * APIC timer frequency = bus_freq / divider
-     * We want ~100 Hz. QEMU virtual bus ~1 GHz, div=16 → timer_freq ~62.5 MHz.
-     * For 100 Hz: count = 62.5M / 100 = 625000.
-     * Real hardware will need PIT calibration (TODO). */
-    apic_write(APIC_TIMER_INIT, 625000);
+    /* Calibrate APIC timer frequency using PIT channel 2.
+     * PIT runs at 1.193182 MHz (standard on all x86 hardware).
+     * Measure how many APIC ticks elapse in ~10ms (PIT count 11932). */
+    #define PIT_FREQ   1193182ULL
+    #define PIT_10MS   11932       /* PIT_FREQ / 100 */
+    #define PIT_CH2_GATE 0x61
+    #define PIT_CH2_MODE 0x43
+    #define PIT_CH2_DATA 0x42
+
+    /* Program PIT channel 2 for one-shot countdown */
+    outb(PIT_CH2_MODE, 0xB0);         /* ch2, lobyte/hibyte, mode 0, binary */
+    outb(PIT_CH2_DATA, PIT_10MS & 0xFF);
+    outb(PIT_CH2_DATA, PIT_10MS >> 8);
+
+    /* Gate on: start PIT countdown */
+    uint8_t gate = inb(PIT_CH2_GATE);
+    outb(PIT_CH2_GATE, (gate & 0xFD) | 0x01);  /* bit 0 = gate, bit 1 = spkr off */
+
+    /* Start APIC timer with max count */
+    apic_write(APIC_TIMER_INIT, 0xFFFFFFFF);
+
+    /* Wait for PIT to finish (bit 5 of port 0x61 goes high) */
+    while (!(inb(PIT_CH2_GATE) & 0x20))
+        __asm__ volatile ("pause");
+
+    /* Stop APIC timer, read elapsed ticks */
+    apic_write(APIC_LVT_TIMER, APIC_LVT_MASKED);
+    uint32_t elapsed = 0xFFFFFFFF - apic_read(APIC_TIMER_CURR);
+
+    /* APIC timer freq = elapsed * 100 (since PIT measured ~10ms).
+     * For 100Hz periodic: init_count = apic_freq / 100 = elapsed. */
+    uint32_t init_count = elapsed;
+
+    /* Sanity: if calibration looks broken, fall back to QEMU default */
+    if (init_count < 1000 || init_count > 100000000)
+        init_count = 625000;
+
+    /* Re-enable periodic timer with calibrated count */
+    apic_write(APIC_LVT_TIMER, APIC_TIMER_PERIODIC | 32);
+    apic_write(APIC_TIMER_INIT, init_count);
 
     apic_enabled = true;
 
-    serial_puts("[IDT] APIC timer: periodic, vector 32, ~100 Hz\n");
+    serial_puts("[IDT] APIC timer: calibrated init=");
+    serial_putdec(init_count);
+    serial_puts(" (~100 Hz)\n");
 }
 
 /* ── IDT init (public API) ───────────────────────────────────── */

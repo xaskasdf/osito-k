@@ -174,7 +174,8 @@ void display_wait_vblank(void)
             uint64_t remaining = target - disp_rdtsc();
             if (remaining > disp.tsc_per_frame / 4)
                 __asm__ volatile ("hlt");
-            /* else tight spin for last ~4ms */
+            else
+                __asm__ volatile ("pause");
         }
     } else {
         /* Fallback: APIC tick-based (50fps cap at 100Hz) */
@@ -215,8 +216,8 @@ int display_init(uint32_t *gop_base, uint32_t width, uint32_t height,
     /* Calibrate TSC for sub-tick frame pacing (~100ms measurement window) */
     serial_puts("[DISP] Calibrating TSC...\n");
     uint64_t tsc_per_sec = calibrate_tsc();
-    /* Sanity check: expect 100MHz – 5GHz for any CPU we'll run on */
-    if (tsc_per_sec >= 100000000ULL && tsc_per_sec <= 5000000000ULL) {
+    /* Sanity check: accept 10MHz – 8GHz (covers VMs, old CPUs, modern Xeons) */
+    if (tsc_per_sec >= 10000000ULL && tsc_per_sec <= 8000000000ULL) {
         disp.tsc_per_frame = tsc_per_sec / target_fps;
         serial_puts("[DISP] TSC: ");
         serial_putdec(tsc_per_sec / 1000000);
@@ -689,50 +690,6 @@ void display_blend_glyph_linear(surface_t *dst, const uint8_t *glyph,
 }
 
 /* ── Dithering (X-RETINA) ────────────────────────────────────── */
-
-/* Ordered 4×4 Bayer dithering for 6-bit panels.
- * Many TN panels only display 6 bits per channel (262K colors).
- * Dithering eliminates visible color banding in gradients. */
-
-static const int8_t bayer4x4[4][4] = {
-    { -8,  0, -6,  2},
-    {  4, -4,  6, -2},
-    { -5,  3, -7,  1},
-    {  7, -1,  5, -3}
-};
-
-/* Apply dithering to the back buffer (in-place).
- * Call before display_flip() for panels with <8-bit color depth. */
-void display_apply_dither(void)
-{
-    if (!disp.initialized) return;
-
-    for (uint32_t y = 0; y < disp.height; y++) {
-        for (uint32_t x = 0; x < disp.width; x++) {
-            uint32_t *p = &disp.back[y * disp.pitch + x];
-            uint32_t px = *p;
-
-            int8_t d = bayer4x4[y & 3][x & 3];
-
-            int r = ((px >> 16) & 0xFF) + d;
-            int g = ((px >> 8)  & 0xFF) + d;
-            int b = ( px        & 0xFF) + d;
-
-            /* Clamp */
-            if (r < 0) r = 0;
-            if (r > 255) r = 255;
-            if (g < 0) g = 0;
-            if (g > 255) g = 255;
-            if (b < 0) b = 0;
-            if (b > 255) b = 255;
-
-            /* Quantize to 6-bit (mask lower 2 bits) */
-            r &= 0xFC; g &= 0xFC; b &= 0xFC;
-
-            *p = 0xFF000000 | ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
-        }
-    }
-}
 
 /* ── Stats ───────────────────────────────────────────────────── */
 
