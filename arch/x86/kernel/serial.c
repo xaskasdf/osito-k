@@ -19,6 +19,15 @@
 #define LSR_TX_EMPTY  0x20
 #define LSR_RX_READY  0x01
 
+static volatile int serial_lock = 0;
+static inline void serial_acquire(void) {
+    while (__sync_lock_test_and_set(&serial_lock, 1))
+        __asm__ volatile ("pause" ::: "memory");
+}
+static inline void serial_release(void) {
+    __sync_lock_release(&serial_lock);
+}
+
 void serial_init(void)
 {
     outb(COM1_PORT + REG_IER, 0x00);   /* Disable interrupts */
@@ -45,10 +54,12 @@ void serial_putchar(char c)
 
 void serial_puts(const char *s)
 {
+    serial_acquire();
     while (*s) {
         if (*s == '\n') serial_putc('\r');
         serial_putc(*s++);
     }
+    serial_release();
 }
 
 void serial_puthex(uint64_t val, int digits)

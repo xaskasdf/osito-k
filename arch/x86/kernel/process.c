@@ -635,13 +635,16 @@ static inline uint32_t sched_get_lapic_id(void)
 
 void sched_tick(void *frame_ptr)
 {
-    if (!sched_enabled || sched_current_idx < 0)
+    if (!sched_enabled)
         return;
 
     /* Per-CPU scheduling: each CPU manages its own current process */
     uint32_t this_cpu = sched_my_cpu();
     int my_idx = sched_idx_arr[this_cpu];
     process_t *cur = (my_idx >= 0) ? &proctab[my_idx] : NULL;
+
+    /* AP with no process assigned yet — skip until BSP creates work */
+    if (!cur) return;
 
     /* Check if a higher-priority process is READY (preemption).
      * ZOMBIE/BLOCKED processes always force-switch immediately.
@@ -657,11 +660,14 @@ void sched_tick(void *frame_ptr)
         }
     }
 
+    sched_lock_acquire();
+
     /* Find best READY process: highest QoS class, round-robin within same class */
     int next_idx = -1;
     uint8_t best_qos = 0;
+    int start = (my_idx >= 0) ? my_idx : 0;
     for (int i = 1; i <= MAX_PROCESSES; i++) {
-        int idx = (sched_current_idx + i) % MAX_PROCESSES;
+        int idx = (start + i) % MAX_PROCESSES;
         if (proctab[idx].state == PROC_READY) {
             if (proctab[idx].qos_class >= best_qos) {
                 best_qos = proctab[idx].qos_class;
@@ -674,6 +680,7 @@ void sched_tick(void *frame_ptr)
         /* No other runnable process — reset quantum, continue */
         if (quantum_expired)
             cur->quantum = qos_quantum[cur->qos_class];
+        sched_lock_release();
         return;
     }
 
@@ -683,8 +690,10 @@ void sched_tick(void *frame_ptr)
      *  - preemption: higher-priority READY process preempts current */
     if (!force_switch && !quantum_expired) {
         /* Still have quantum — only preempt if candidate is strictly higher priority */
-        if (best_qos <= cur->qos_class)
+        if (best_qos <= cur->qos_class) {
+            sched_lock_release();
             return;
+        }
         /* Preemption: higher priority process is waiting */
     }
 
@@ -756,6 +765,7 @@ void sched_tick(void *frame_ptr)
     if (next->cr3 != cur->cr3)
         sched_cr3_arr[my_cpu] = next->cr3;
 
+    sched_lock_release();
     sched_switches++;
 }
 
