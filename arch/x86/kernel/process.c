@@ -13,6 +13,7 @@
  */
 
 #include "../include/types.h"
+#include "../include/sys_caps.h"
 
 /* ── External functions ──────────────────────────────────────── */
 
@@ -57,7 +58,8 @@ extern void syscall_restore_brk(void);
 
 /* ── Constants ───────────────────────────────────────────────── */
 
-#define MAX_PROCESSES   64  /* Increased from 16; further scaling via sys_caps planned */
+#define MAX_PROCESSES   256 /* Static max; g_sys_caps.max_processes limits at runtime */
+#define READY_MASK_WORDS (MAX_PROCESSES / 64)  /* 4 words for 256 procs */
 #define MAX_FDS         32
 #define MAX_NAME_LEN    64
 #define MAX_REGIONS     32
@@ -91,19 +93,20 @@ extern void syscall_restore_brk(void);
 static const uint32_t qos_quantum[QOS_NUM_CLASSES] = { 20, 10, 5, 2, 1 };
 
 /* Per-QoS ready bitmask: bit N set = proctab[N] is READY at that class.
- * Enables O(1) scheduler lookup via __builtin_ctzll instead of O(n) scan. */
-static uint64_t ready_mask[QOS_NUM_CLASSES];
+ * Enables O(1) scheduler lookup via __builtin_ctzll instead of O(n) scan.
+ * 256 bits = 4 × uint64_t words per QoS class. */
+static uint64_t ready_mask[QOS_NUM_CLASSES][READY_MASK_WORDS];
 
 static inline void ready_mask_set(int idx, uint8_t qos)
 {
-    if (idx >= 0 && idx < 64 && qos < QOS_NUM_CLASSES)
-        ready_mask[qos] |= (1ULL << idx);
+    if (idx >= 0 && idx < MAX_PROCESSES && qos < QOS_NUM_CLASSES)
+        ready_mask[qos][idx / 64] |= (1ULL << (idx % 64));
 }
 
 static inline void ready_mask_clear(int idx, uint8_t qos)
 {
-    if (idx >= 0 && idx < 64 && qos < QOS_NUM_CLASSES)
-        ready_mask[qos] &= ~(1ULL << idx);
+    if (idx >= 0 && idx < MAX_PROCESSES && qos < QOS_NUM_CLASSES)
+        ready_mask[qos][idx / 64] &= ~(1ULL << (idx % 64));
 }
 
 /* proc_set_state: defined after proctab declaration (needs process_t) */
@@ -228,7 +231,10 @@ static ssize_t console_read(void *buf, size_t count)
 
 static process_t *proc_alloc(const char *name)
 {
-    for (int i = 0; i < MAX_PROCESSES; i++) {
+    /* Use dynamic limit from sys_caps (clamped to static array size) */
+    int limit = (int)g_sys_caps.max_processes;
+    if (limit <= 0 || limit > MAX_PROCESSES) limit = MAX_PROCESSES;
+    for (int i = 0; i < limit; i++) {
         if (proctab[i].state == PROC_FREE) {
             process_t *p = &proctab[i];
             memset(p, 0, sizeof(*p));
@@ -697,30 +703,64 @@ void sched_tick(void *frame_ptr)
     sched_lock_acquire();
 
     /* Find best READY process: highest QoS class, round-robin within class.
-     * O(1) via per-QoS ready bitmask — scan from highest class down. */
+     * O(1) via per-QoS ready bitmask — scan from highest class down,
+     * then scan words starting after current process for round-robin. */
     int next_idx = -1;
     uint8_t best_qos = 0;
+    int start = (my_idx >= 0) ? my_idx + 1 : 0;
+    if (start >= MAX_PROCESSES) start = 0;
+
     for (int q = QOS_NUM_CLASSES - 1; q >= 0; q--) {
-        uint64_t mask = ready_mask[q];
-        if (!mask) continue;
-        /* Round-robin: rotate mask to start after current process */
-        int start = (my_idx >= 0) ? my_idx + 1 : 0;
-        if (start >= MAX_PROCESSES) start = 0;
-        /* Rotate: check bits [start..63] then [0..start-1] */
-        uint64_t rotated = (mask >> start) | (mask << (64 - start));
-        int bit = __builtin_ctzll(rotated);
-        next_idx = (start + bit) % 64;
-        /* Skip self */
-        if (next_idx == my_idx) {
-            uint64_t without_self = mask & ~(1ULL << my_idx);
-            if (!without_self) continue;
-            rotated = (without_self >> start) | (without_self << (64 - start));
-            bit = __builtin_ctzll(rotated);
-            next_idx = (start + bit) % 64;
+        /* Check if any process is ready at this QoS level */
+        bool any = false;
+        for (int ww = 0; ww < READY_MASK_WORDS; ww++)
+            if (ready_mask[q][ww]) { any = true; break; }
+        if (!any) continue;
+
+        /* Scan words starting from the word containing 'start' */
+        int start_word = start / 64;
+        int start_bit  = start % 64;
+
+        for (int wi = 0; wi < READY_MASK_WORDS; wi++) {
+            int w = (start_word + wi) % READY_MASK_WORDS;
+            uint64_t mask = ready_mask[q][w];
+            if (w == start_word && wi == 0)
+                mask &= ~((1ULL << start_bit) - 1);  /* skip bits before start */
+            /* Remove self from consideration */
+            if (my_idx / 64 == w)
+                mask &= ~(1ULL << (my_idx % 64));
+            if (!mask) continue;
+            int bit = __builtin_ctzll(mask);
+            next_idx = w * 64 + bit;
+            best_qos = (uint8_t)q;
+            goto found_next;
         }
-        best_qos = (uint8_t)q;
-        break;
+        /* Wrap: check words before start_word that we skipped */
+        for (int w = 0; w < start_word; w++) {
+            uint64_t mask = ready_mask[q][w];
+            if (my_idx / 64 == w)
+                mask &= ~(1ULL << (my_idx % 64));
+            if (!mask) continue;
+            int bit = __builtin_ctzll(mask);
+            next_idx = w * 64 + bit;
+            best_qos = (uint8_t)q;
+            goto found_next;
+        }
+        /* Check remaining bits in start_word before start_bit */
+        {
+            uint64_t mask = ready_mask[q][start_word] & ((1ULL << start_bit) - 1);
+            if (my_idx / 64 == start_word)
+                mask &= ~(1ULL << (my_idx % 64));
+            if (mask) {
+                int bit = __builtin_ctzll(mask);
+                next_idx = start_word * 64 + bit;
+                best_qos = (uint8_t)q;
+                goto found_next;
+            }
+        }
     }
+found_next:
+    (void)best_qos;
 
     if (next_idx < 0) {
         /* No other runnable process — reset quantum, continue */
