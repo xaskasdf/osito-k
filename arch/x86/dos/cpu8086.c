@@ -1342,7 +1342,23 @@ int cpu8086_run(dos_vm_t *vm)
                     cpu->cr0 = (cpu->cr0 & 0xFFFF0000U) | msw;
                     if ((msw & 1) && !cpu->protected_mode) {
                         cpu->protected_mode = true;
-                        serial_puts("[DOS] LMSW: PE bit set. Waiting for FAR JMP to transfer.\n");
+                        serial_puts("[DOS] LMSW: PE=1 CS=");
+                        serial_puthex(cpu->cs, 4);
+                        serial_puts(" EIP=");
+                        serial_puthex(cpu->eip, 8);
+                        serial_puts(" #");
+                        serial_putdec(cpu->insn_count);
+                        serial_puts("\n");
+                        /* Dump next 16 bytes to see the JMP FAR */
+                        {
+                            uint32_t next = dos_linear(cpu->cs, cpu->ip);
+                            serial_puts("[DOS] Next bytes: ");
+                            for (int ii = 0; ii < 16; ii++) {
+                                serial_puthex(dos_mem_read8(vm, next + ii), 2);
+                                serial_puts(" ");
+                            }
+                            serial_puts("\n");
+                        }
                     }
                     break;
                 }
@@ -2719,8 +2735,23 @@ int cpu8086_run(dos_vm_t *vm)
             break;
         }
         case 0xCB: /* RETF */
-            cpu->ip = cpu_pop16(cpu);
-            cpu->cs = cpu_pop16(cpu);
+            if (op32) {
+                cpu->eip = cpu_pop32(cpu);
+                cpu->cs  = (uint16_t)cpu_pop32(cpu);
+            } else {
+                cpu->ip = cpu_pop16(cpu);
+                cpu->cs = cpu_pop16(cpu);
+            }
+            if (cpu->protected_mode && !cpu->pm_cs_loaded) {
+                cpu->pm_cs_loaded = true;
+                cpu->op_size_32 = true;
+                cpu->addr_size_32 = true;
+                serial_puts("[DOS] PM RETF: CS=");
+                serial_puthex(cpu->cs, 4);
+                serial_puts(" EIP=");
+                serial_puthex(cpu->eip, 8);
+                serial_puts(" — PM selector loaded\n");
+            }
             break;
 
         /* ════════════════════════════════════════════════════════════
@@ -2939,16 +2970,17 @@ int cpu8086_run(dos_vm_t *vm)
             cpu->cs = seg;
             cpu->eip = off;
 
-            /* If we just entered PM (via LMSW/MOV CR0) and this is the
-             * first FAR JMP, CS now has a proper PM selector. Transfer. */
-            if (cpu->protected_mode) {
-                serial_puts("[DOS] FAR JMP in PM: CS=");
+            /* First FAR JMP in PM: CS now has a valid PM selector.
+             * Enable GDT translation for subsequent memory accesses. */
+            if (cpu->protected_mode && !cpu->pm_cs_loaded) {
+                cpu->pm_cs_loaded = true;
+                cpu->op_size_32 = true;
+                cpu->addr_size_32 = true;
+                serial_puts("[DOS] PM FAR JMP: CS=");
                 serial_puthex(seg, 4);
                 serial_puts(" EIP=");
                 serial_puthex(off, 8);
-                serial_puts(" — attempting native transfer\n");
-                extern void dos_transfer_to_native(dos_vm_t *vm);
-                dos_transfer_to_native(vm);
+                serial_puts(" — PM selector loaded, GDT translation active\n");
             }
             break;
         }
@@ -2983,7 +3015,21 @@ int cpu8086_run(dos_vm_t *vm)
          *  HLT  (0xF4)
          * ════════════════════════════════════════════════════════════ */
         case 0xF4: /* HLT */
-            cpu->halted = true;
+            if (cpu->protected_mode) {
+                /* In PM, HLT waits for an interrupt (typically timer).
+                 * Don't halt the emulator — just advance the BDA tick
+                 * counter and continue. DOS4GW uses STI;HLT to idle. */
+                extern uint64_t idt_get_ticks(void);
+                uint64_t now = idt_get_ticks();
+                if (now - vm->last_timer_tick >= 5) {
+                    vm->last_timer_tick = now;
+                    vm->bios_ticks++;
+                    dos_mem_write32(vm, 0x46C, vm->bios_ticks);
+                }
+                /* Don't halt — continue executing next instruction */
+            } else {
+                cpu->halted = true;
+            }
             break;
 
         /* ════════════════════════════════════════════════════════════
@@ -3575,6 +3621,18 @@ int cpu8086_run(dos_vm_t *vm)
         /* Increment instruction counter */
         cpu->insn_count++;
 
+        /* Trace first 30 PM instructions after LMSW */
+        if (cpu->protected_mode && cpu->insn_count >= 2670 && cpu->insn_count <= 2700) {
+            serial_puts("[PMTRACE] #");
+            serial_putdec(cpu->insn_count);
+            serial_puts(" op=");
+            serial_puthex(opcode, 2);
+            serial_puts(" CS=");
+            serial_puthex(cpu->cs, 4);
+            serial_puts(" EIP=");
+            serial_puthex(cpu->eip, 8);
+            serial_puts("\n");
+        }
 
 
         /* Periodic checks every 16K instructions */
@@ -3605,7 +3663,18 @@ int cpu8086_run(dos_vm_t *vm)
             serial_puthex(cpu->cs, 4);
             serial_puts(":");
             serial_puthex(cpu->eip, 8);
-            serial_puts(cpu->protected_mode ? " [PM]\n" : " [RM]\n");
+            serial_puts(cpu->protected_mode ? " [PM]" : " [RM]");
+            /* Dump: translated address + instruction bytes */
+            uint32_t dump_addr = dos_addr(vm, cpu->cs, cpu->eip);
+            serial_puts(" linear=");
+            serial_puthex(dump_addr, 8);
+            serial_puts(" op=");
+            serial_puthex(dos_mem_read8(vm, dump_addr), 2);
+            serial_puts(" GDT_idx=");
+            serial_puthex(cpu->cs >> 3, 4);
+            serial_puts("/lim=");
+            serial_puthex(cpu->gdtr.limit, 4);
+            serial_puts("\n");
         }
         /* Safety: halt after 2 billion instructions */
         if (cpu->insn_count > 500000000ULL) {

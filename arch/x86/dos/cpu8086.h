@@ -48,7 +48,8 @@ typedef struct cpu8086_state {
     struct { uint16_t limit; uint32_t base; } idtr;
 
     /* ── Mode state ───────────────────────────────────────────── */
-    bool     protected_mode;   /* true when CR0.PE=1 and DPMI active */
+    bool     protected_mode;   /* true when CR0.PE=1 */
+    bool     pm_cs_loaded;     /* true after first far JMP/RETF loads PM selector into CS */
     bool     op_size_32;       /* default operand size for current CS (D bit) */
     bool     addr_size_32;     /* default address size for current CS */
 
@@ -99,7 +100,10 @@ uint32_t dpmi_translate(dos_vm_t *vm, uint16_t selector, uint32_t offset);
 /* Unified address translation: real mode or protected mode */
 static inline uint32_t dos_addr(dos_vm_t *vm, uint16_t seg, uint32_t off)
 {
-    if (vm->cpu && vm->cpu->protected_mode)
+    /* Only use GDT translation after CS has been loaded with a PM selector
+     * (via far JMP/RETF). Between LMSW and the far JMP, the CPU still uses
+     * the cached real-mode segment base for fetches. */
+    if (vm->cpu && vm->cpu->protected_mode && vm->cpu->pm_cs_loaded)
         return dpmi_translate(vm, seg, off);
     return ((uint32_t)seg << 4) + (uint16_t)off;
 }
