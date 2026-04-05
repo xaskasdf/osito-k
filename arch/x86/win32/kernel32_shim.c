@@ -326,10 +326,31 @@ PVOID WINAPI VirtualAlloc(PVOID lpAddress, SIZE_T dwSize,
     if (dwSize > 0x20000000ULL) {
         serial_puts("[VA] REJECTED: size=0x");
         serial_puthex(dwSize, 8);
-        /* Dump the 32-bit caller's return address from the compat32 stack.
-         * The INT 0x2E thunk marshals args from the 32-bit stack. The
-         * return address is at [ESP+0] of the original call frame. */
-        serial_puts(" (> 512MB, likely corruption)\n");
+        serial_puts(" (> 512MB, corruption)\n");
+
+        /* Walk 32-bit EBP chain to dump caller stack trace.
+         * PE32 uses EBP-based stack frames: [EBP]=prev_EBP, [EBP+4]=ret_addr */
+        serial_puts("[VA] Call stack: ");
+        uint32_t ebp;
+        __asm__ volatile ("mov %%ebp, %0" : "=r"(ebp));
+        /* The 64-bit EBP isn't useful — read from the compat32 saved frame.
+         * The INT 0x2E IST1 frame has the 32-bit EBP. Use syscall_user_rsp
+         * to approximate the PE32 stack. Walk cautiously. */
+        extern uint64_t syscall_user_rsp;
+        uint32_t *pe32_stack = (uint32_t *)(uintptr_t)syscall_user_rsp;
+        if (pe32_stack && (uint64_t)pe32_stack > 0x10000 &&
+            (uint64_t)pe32_stack < 0x80000000ULL) {
+            /* Scan nearby stack for return addresses (in DLL code range) */
+            for (int i = 0; i < 32; i++) {
+                uint32_t val = pe32_stack[i];
+                if (val >= 0x10000000 && val < 0x20000000) {
+                    serial_puthex(val, 8);
+                    serial_puts(" ");
+                }
+            }
+        }
+        serial_puts("\n");
+
         g_last_error = 8; /* ERROR_NOT_ENOUGH_MEMORY */
         return NULL;
     }
