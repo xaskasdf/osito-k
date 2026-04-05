@@ -486,6 +486,68 @@ void net_set_gateway(const uint8_t gw[4])
     serial_putdec(gw[3]); serial_puts("\n");
 }
 
+void net_set_ip(const uint8_t ip[4])
+{
+    memcpy(our_ip, ip, 4);
+    serial_puts("[NET] IP updated: ");
+    serial_putdec(ip[0]); serial_puts(".");
+    serial_putdec(ip[1]); serial_puts(".");
+    serial_putdec(ip[2]); serial_puts(".");
+    serial_putdec(ip[3]); serial_puts("\n");
+}
+
+void net_set_netmask(const uint8_t mask[4])
+{
+    memcpy(netmask, mask, 4);
+}
+
+void net_get_mac(uint8_t mac_out[6])
+{
+    memcpy(mac_out, our_mac, 6);
+}
+
+/* Send raw UDP broadcast (src IP = 0.0.0.0, dst IP = 255.255.255.255).
+ * Used by DHCP before we have an IP address. */
+int net_udp_send_broadcast(uint16_t dst_port, uint16_t src_port,
+                           const void *data, uint32_t len)
+{
+    uint32_t udp_len = sizeof(udp_hdr_t) + len;
+    uint32_t ip_total = sizeof(ipv4_hdr_t) + udp_len;
+    if (ETH_HDR_LEN + ip_total > sizeof(tx_pkt)) return -1;
+
+    static const uint8_t bcast_mac[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
+    eth_hdr_t *eth = (eth_hdr_t *)tx_pkt;
+    memcpy(eth->dst, bcast_mac, 6);
+    memcpy(eth->src, our_mac, 6);
+    eth->ethertype = htons(ETH_TYPE_IP4);
+
+    ipv4_hdr_t *ip = (ipv4_hdr_t *)(tx_pkt + ETH_HDR_LEN);
+    ip->ver_ihl   = 0x45;
+    ip->tos       = 0;
+    ip->total_len = htons((uint16_t)ip_total);
+    ip->id        = htons(ip_id_counter++);
+    ip->frag      = 0;
+    ip->ttl       = 64;
+    ip->proto     = IP_PROTO_UDP;
+    ip->checksum  = 0;
+    memset(ip->src, 0, 4);                              /* 0.0.0.0 */
+    memset(ip->dst, 0xFF, 4);                           /* 255.255.255.255 */
+    ip->checksum  = ip_checksum(ip, sizeof(ipv4_hdr_t));
+
+    udp_hdr_t *udp = (udp_hdr_t *)(tx_pkt + ETH_HDR_LEN + sizeof(ipv4_hdr_t));
+    udp->src_port = htons(src_port);
+    udp->dst_port = htons(dst_port);
+    udp->length   = htons((uint16_t)udp_len);
+    udp->checksum = 0;
+
+    memcpy(tx_pkt + ETH_HDR_LEN + sizeof(ipv4_hdr_t) + sizeof(udp_hdr_t),
+           data, len);
+
+    uint32_t frame_len = ETH_HDR_LEN + ip_total;
+    if (frame_len < 60) { memset(tx_pkt + frame_len, 0, 60 - frame_len); frame_len = 60; }
+    return i211_send(tx_pkt, frame_len);
+}
+
 /* ── Poll for Incoming Packets ───────────────────────────────── */
 
 void net_poll(void)

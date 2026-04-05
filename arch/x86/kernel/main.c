@@ -653,20 +653,38 @@ void kernel_entry(boot_info_t *info)
         if (i211_init(nic_pci->bar[0]) == 0) {
             extern void net_set_gateway(const uint8_t gw[4]);
             extern void net_dns_set_server(const uint8_t ip[4]);
+            extern int  dhcp_discover(void);
+            extern int  ntp_sync(void);
 
-            /* Auto-detect: I211 (0x1539) = real hardware, else QEMU */
-            if (nic_pci->device_id == 0x1539) {
-                uint8_t ip[] = {192, 168, 0, 50};
-                net_init(ip);
-                uint8_t gw[] = {192, 168, 0, 1};
-                net_set_gateway(gw);
-                uint8_t dns[] = {8, 8, 8, 8};
-                net_dns_set_server(dns);
+            /* Initialize network with temporary 0.0.0.0 for DHCP */
+            uint8_t zero_ip[] = {0, 0, 0, 0};
+            net_init(zero_ip);
+
+            /* Try DHCP first — works on both QEMU SLIRP and real hardware */
+            if (dhcp_discover() == 0) {
+                /* DHCP configured IP/gateway/DNS automatically */
+                serial_puts("[KERN] Network configured via DHCP\n");
             } else {
-                uint8_t ip[] = {10, 0, 2, 15};
-                net_init(ip);
-                /* gateway/DNS defaults in net.c match QEMU SLIRP */
+                /* DHCP failed — fall back to static config */
+                serial_puts("[KERN] DHCP failed, using static IP\n");
+                if (nic_pci->device_id == 0x1539) {
+                    uint8_t ip[] = {192, 168, 0, 50};
+                    extern void net_set_ip(const uint8_t ip[4]);
+                    net_set_ip(ip);
+                    uint8_t gw[] = {192, 168, 0, 1};
+                    net_set_gateway(gw);
+                    uint8_t dns[] = {8, 8, 8, 8};
+                    net_dns_set_server(dns);
+                } else {
+                    uint8_t ip[] = {10, 0, 2, 15};
+                    extern void net_set_ip(const uint8_t ip[4]);
+                    net_set_ip(ip);
+                }
             }
+
+            /* Sync clock via NTP (requires DNS from DHCP) */
+            ntp_sync();
+
             net_udp_listen(7777, prompt_handler);
         } else {
             serial_puts("[KERN] I211 init failed\n");
