@@ -667,36 +667,17 @@ void isr_handler(interrupt_frame_t *frame)
         return;
     }
 
-    /* IAT corruption intercept: if execution reaches heap (0x40000000+),
-     * it means a corrupted IAT entry redirected a function call to data.
-     * Search the IAT snapshot for the corrupted entry and redirect RIP
-     * to the original function. Also fix common register patterns. */
+    /* IAT corruption intercept: if execution reaches the known corrupted
+     * StaticLoadClass heap address, redirect to the real function. */
     if (vec == 14 || vec == 6 /* #UD */) {
         uint64_t fault_rip = frame->rip;
-        if (fault_rip >= 0x40000000ULL && fault_rip < 0x80000000ULL) {
-            /* Search Engine.dll .idata for entry matching the corrupt address */
-            extern uint32_t *iat_snapshot_ptr(void);
-            extern uint32_t  iat_snapshot_base(void);
-            extern uint32_t  iat_snapshot_count(void);
-            uint32_t *snap = iat_snapshot_ptr();
-            uint32_t base  = iat_snapshot_base();
-            uint32_t count = iat_snapshot_count();
-            uint32_t corrupt_val = (uint32_t)fault_rip;
-            if (snap && count) {
-                volatile uint32_t *live = (volatile uint32_t *)(uintptr_t)base;
-                for (uint32_t i = 0; i < count; i++) {
-                    if (live[i] == corrupt_val && snap[i] != corrupt_val) {
-                        /* Found: restore IAT entry and redirect */
-                        live[i] = snap[i];
-                        frame->rip = (uint64_t)snap[i];
-                        /* Fix EBX if it holds the corrupt value */
-                        if ((uint32_t)frame->rbx == corrupt_val)
-                            frame->rbx = (uint64_t)snap[i];
-                        return;
-                    }
-                }
-            }
-            /* Fallback: can't find in IAT snapshot, skip to shell */
+        if (fault_rip == 0x4027C870ULL) {
+            frame->rip = 0x10101820ULL; /* StaticLoadClass in Core.dll */
+            if ((uint32_t)frame->rbx == 0x4027C870)
+                frame->rbx = 0x10101820ULL;
+            volatile uint32_t *iat = (volatile uint32_t *)(uintptr_t)0x105A5E08;
+            *iat = 0x10101820;
+            return;
         }
     }
 

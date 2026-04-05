@@ -1999,45 +1999,16 @@ uint64_t compat32_dispatch(uint32_t thunk_idx, uint32_t *stack_args)
         }
     }
 
-    /* Guard ALL DLL IAT entries: snapshot .idata after patching,
-     * restore any modified entries on every INT 0x2E dispatch.
-     * The Unreal package loader overwrites multiple IAT entries
-     * with heap pointers, corrupting function calls. */
+    /* Guard Engine.dll StaticLoadClass IAT entry only.
+     * Full IAT snapshot was too aggressive — restored legitimate runtime
+     * patches needed by DLL constructors (IMPLEMENT_CLASS etc.). */
     {
-        static uint32_t *iat_snapshot = NULL;
-        static uint32_t  iat_base = 0;
-        static uint32_t  iat_dwords = 0;
-
-        if (!iat_snapshot) {
-            /* Find Engine.dll .idata: base ~0x10300000, .idata at +0x2A5000 */
-            /* Scan loaded modules for one with ImageBase 0x10300000 */
-            extern void *dll_find_module_by_range(uint32_t addr);
-            /* Hardcode Engine.dll .idata range for now:
-             * ImageBase=0x10300000, .idata VA=0x2A5000, VSize=0x6877
-             * → 0x105A5000 to 0x105AC000 */
-            iat_base = 0x105A5000;
-            iat_dwords = 0x7000 / 4; /* 7 pages = 0x7000 bytes = 7168 dwords */
-            extern void *kmalloc(uint64_t);
-            iat_snapshot = (uint32_t *)kmalloc(iat_dwords * 4);
-            if (iat_snapshot) {
-                uint32_t *src = (uint32_t *)(uintptr_t)iat_base;
-                for (uint32_t i = 0; i < iat_dwords; i++)
-                    iat_snapshot[i] = src[i];
-            }
-        }
-
-        if (iat_snapshot) {
-            volatile uint32_t *live = (volatile uint32_t *)(uintptr_t)iat_base;
-            for (uint32_t i = 0; i < iat_dwords; i++) {
-                if (live[i] != iat_snapshot[i])
-                    live[i] = iat_snapshot[i];
-            }
-        }
-
-        /* Export accessors for the #PF intercept in idt.c */
-        g_iat_snap = iat_snapshot;
-        g_iat_base = iat_base;
-        g_iat_count = iat_dwords;
+        volatile uint32_t *iat_entry = (volatile uint32_t *)(uintptr_t)0x105A5E08;
+        static uint32_t iat_original = 0;
+        if (iat_original == 0 && *iat_entry >= 0x10100000 && *iat_entry < 0x10200000)
+            iat_original = *iat_entry;
+        if (iat_original && *iat_entry != iat_original)
+            *iat_entry = iat_original;
     }
 
     /* Continuously clear GIsCriticalError + GErrorHist[0].
