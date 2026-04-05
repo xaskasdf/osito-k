@@ -250,16 +250,28 @@ int dos_run(const char *filename, int argc, const char **argv)
      * buffer area. DOS4GW reads from env at PSP:0x2C then copies to its
      * own data area. We also write directly to 0x18A0 as a workaround. */
     {
-        /* Environment block at 0x500 */
+        /* Environment block at 0x500. Format:
+         * VAR=VALUE\0 ... \0\0  (double null = end of vars)
+         * \x01\x00              (word: 1 string follows)
+         * DOOM.EXE\0            (program name) */
         uint32_t env_addr = 0x500;
-        vm.mem[env_addr] = 0;              /* empty env vars */
-        vm.mem[env_addr + 1] = 0x01;       /* 1 string */
-        vm.mem[env_addr + 2] = 0x00;
+        uint32_t p = env_addr;
+
+        /* Empty environment variables: just double-null */
+        vm.mem[p++] = 0;   /* end of (empty) var list */
+        vm.mem[p++] = 0;   /* second null = end of environment */
+
+        /* Count word: 1 additional string follows */
+        vm.mem[p++] = 0x01;
+        vm.mem[p++] = 0x00;
+
+        /* Program name (full path as DOS4GW expects) */
         int k;
         for (k = 0; filename[k] && k < 60; k++)
-            vm.mem[env_addr + 3 + k] = filename[k];
-        vm.mem[env_addr + 3 + k] = 0;
-        serial_puts("[DOS] Env: '");
+            vm.mem[p++] = filename[k];
+        vm.mem[p] = 0;
+
+        serial_puts("[DOS] Env @0x500: '");
         serial_puts(filename);
         serial_puts("'\n");
     }

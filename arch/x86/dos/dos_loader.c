@@ -71,18 +71,19 @@ static void build_psp(dos_vm_t *vm, uint16_t psp_seg, uint16_t mem_top_seg,
 
         if (!progname) progname = "PROGRAM.EXE";
 
-        /* Empty environment: just a null byte */
-        vm->mem[env_addr] = 0;
+        /* Empty environment: double-null terminator */
+        vm->mem[env_addr]     = 0;    /* end of (empty) vars */
+        vm->mem[env_addr + 1] = 0;    /* second null = end of env */
 
         /* Count word: 1 string follows */
-        vm->mem[env_addr + 1] = 0x01;
-        vm->mem[env_addr + 2] = 0x00;
+        vm->mem[env_addr + 2] = 0x01;
+        vm->mem[env_addr + 3] = 0x00;
 
         /* Program name */
         int k;
         for (k = 0; progname[k] && k < 60; k++)
-            vm->mem[env_addr + 3 + k] = progname[k];
-        vm->mem[env_addr + 3 + k] = 0;
+            vm->mem[env_addr + 4 + k] = progname[k];
+        vm->mem[env_addr + 4 + k] = 0;
 
         psp->env_seg = env_seg;
     }
