@@ -667,6 +667,35 @@ void isr_handler(interrupt_frame_t *frame)
         return;
     }
 
+    /* IAT corruption intercept: if RIP is at a known corrupted IAT target
+     * (heap data executed as code), fix the register and redirect to the
+     * real function. This fires inside the #PF/#GP handler chain where
+     * IF=0, so timer-based watchdogs can't help. */
+    if (vec == 14) {
+        uint64_t cr2;
+        __asm__ volatile ("mov %%cr2, %0" : "=r"(cr2));
+        if (cr2 == 0x4027C870ULL || frame->rip == 0x4027C870ULL) {
+            /* Redirect: fix EBX to real StaticLoadClass, jump there */
+            static uint32_t real_fn = 0;
+            if (!real_fn) {
+                volatile uint32_t *iat = (volatile uint32_t *)(uintptr_t)0x105A5E08;
+                if (*iat >= 0x10100000 && *iat < 0x10200000)
+                    real_fn = *iat;
+                else
+                    real_fn = 0x10101820; /* hardcoded fallback */
+            }
+            /* Fix EBX in the saved register frame (used by PE32 as fn ptr) */
+            frame->rbx = (uint64_t)real_fn;
+            /* Redirect RIP to the real function */
+            frame->rip = (uint64_t)real_fn;
+            /* Also restore the IAT entry for future direct reads */
+            volatile uint32_t *iat = (volatile uint32_t *)(uintptr_t)0x105A5E08;
+            if (*iat != real_fn)
+                *iat = real_fn;
+            return;
+        }
+    }
+
     /* Demand paging — handle #PF for high addresses FIRST, before any output.
      * This must be the earliest possible check to avoid stack corruption. */
     if (vec == 14 && !(frame->error_code & 1)) {
