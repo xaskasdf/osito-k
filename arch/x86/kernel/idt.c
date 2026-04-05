@@ -667,32 +667,36 @@ void isr_handler(interrupt_frame_t *frame)
         return;
     }
 
-    /* IAT corruption intercept: if RIP is at a known corrupted IAT target
-     * (heap data executed as code), fix the register and redirect to the
-     * real function. This fires inside the #PF/#GP handler chain where
-     * IF=0, so timer-based watchdogs can't help. */
-    if (vec == 14) {
-        uint64_t cr2;
-        __asm__ volatile ("mov %%cr2, %0" : "=r"(cr2));
-        if (cr2 == 0x4027C870ULL || frame->rip == 0x4027C870ULL) {
-            /* Redirect: fix EBX to real StaticLoadClass, jump there */
-            static uint32_t real_fn = 0;
-            if (!real_fn) {
-                volatile uint32_t *iat = (volatile uint32_t *)(uintptr_t)0x105A5E08;
-                if (*iat >= 0x10100000 && *iat < 0x10200000)
-                    real_fn = *iat;
-                else
-                    real_fn = 0x10101820; /* hardcoded fallback */
+    /* IAT corruption intercept: if execution reaches heap (0x40000000+),
+     * it means a corrupted IAT entry redirected a function call to data.
+     * Search the IAT snapshot for the corrupted entry and redirect RIP
+     * to the original function. Also fix common register patterns. */
+    if (vec == 14 || vec == 6 /* #UD */) {
+        uint64_t fault_rip = frame->rip;
+        if (fault_rip >= 0x40000000ULL && fault_rip < 0x80000000ULL) {
+            /* Search Engine.dll .idata for entry matching the corrupt address */
+            extern uint32_t *iat_snapshot_ptr(void);
+            extern uint32_t  iat_snapshot_base(void);
+            extern uint32_t  iat_snapshot_count(void);
+            uint32_t *snap = iat_snapshot_ptr();
+            uint32_t base  = iat_snapshot_base();
+            uint32_t count = iat_snapshot_count();
+            uint32_t corrupt_val = (uint32_t)fault_rip;
+            if (snap && count) {
+                volatile uint32_t *live = (volatile uint32_t *)(uintptr_t)base;
+                for (uint32_t i = 0; i < count; i++) {
+                    if (live[i] == corrupt_val && snap[i] != corrupt_val) {
+                        /* Found: restore IAT entry and redirect */
+                        live[i] = snap[i];
+                        frame->rip = (uint64_t)snap[i];
+                        /* Fix EBX if it holds the corrupt value */
+                        if ((uint32_t)frame->rbx == corrupt_val)
+                            frame->rbx = (uint64_t)snap[i];
+                        return;
+                    }
+                }
             }
-            /* Fix EBX in the saved register frame (used by PE32 as fn ptr) */
-            frame->rbx = (uint64_t)real_fn;
-            /* Redirect RIP to the real function */
-            frame->rip = (uint64_t)real_fn;
-            /* Also restore the IAT entry for future direct reads */
-            volatile uint32_t *iat = (volatile uint32_t *)(uintptr_t)0x105A5E08;
-            if (*iat != real_fn)
-                *iat = real_fn;
-            return;
+            /* Fallback: can't find in IAT snapshot, skip to shell */
         }
     }
 
