@@ -30,7 +30,7 @@ int dos_detect_format(const uint8_t *data, uint64_t size)
 /* ── Build PSP at given segment ─────────────────────────────────── */
 
 static void build_psp(dos_vm_t *vm, uint16_t psp_seg, uint16_t mem_top_seg,
-                       const char *cmdline)
+                       const char *cmdline, const char *progname)
 {
     uint32_t psp_addr = (uint32_t)psp_seg << 4;
     dos_psp_t *psp = (dos_psp_t *)(vm->mem + psp_addr);
@@ -61,6 +61,31 @@ static void build_psp(dos_vm_t *vm, uint16_t psp_seg, uint16_t mem_top_seg,
     psp->dispatch[0] = 0xCD;  /* INT */
     psp->dispatch[1] = 0x21;
     psp->dispatch[2] = 0xCB;  /* RETF */
+
+    /* Environment block at fixed address 0x0050:0x0000 = linear 0x500.
+     * This is the DOS internal data area, safe to use for environment.
+     * Format: "VAR=VALUE\0...\0\0" + word(count) + "PROGRAM.EXE\0" */
+    {
+        uint16_t env_seg = 0x0050;  /* segment 0x50 = linear 0x500 */
+        uint32_t env_addr = 0x500;
+
+        if (!progname) progname = "PROGRAM.EXE";
+
+        /* Empty environment: just a null byte */
+        vm->mem[env_addr] = 0;
+
+        /* Count word: 1 string follows */
+        vm->mem[env_addr + 1] = 0x01;
+        vm->mem[env_addr + 2] = 0x00;
+
+        /* Program name */
+        int k;
+        for (k = 0; progname[k] && k < 60; k++)
+            vm->mem[env_addr + 3 + k] = progname[k];
+        vm->mem[env_addr + 3 + k] = 0;
+
+        psp->env_seg = env_seg;
+    }
 
     /* Command tail */
     if (cmdline && cmdline[0]) {
@@ -107,7 +132,7 @@ int dos_load_com(dos_vm_t *vm, const uint8_t *data, uint64_t size,
     uint16_t mem_top = seg + largest;
     vm->current_psp = psp_seg;
 
-    build_psp(vm, psp_seg, mem_top, cmdline);
+    build_psp(vm, psp_seg, mem_top, cmdline, 0);
 
     /* Load COM data at PSP:0100h */
     uint32_t load_addr = dos_linear(psp_seg, 0x0100);
@@ -182,7 +207,7 @@ int dos_load_mz(dos_vm_t *vm, const uint8_t *data, uint64_t size,
     /* Load segment = PSP + 16 paragraphs (256 bytes for PSP) */
     uint16_t load_seg = psp_seg + 0x10;
 
-    build_psp(vm, psp_seg, seg + largest, cmdline);
+    build_psp(vm, psp_seg, seg + largest, cmdline, 0);
 
     /* Copy code/data to load address */
     uint32_t load_addr = (uint32_t)load_seg << 4;

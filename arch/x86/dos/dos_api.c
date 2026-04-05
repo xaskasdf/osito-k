@@ -243,12 +243,37 @@ void dos_int21_dispatch(dos_vm_t *vm)
         dos_read_asciiz(vm, cpu->ds, cpu->dx, path, sizeof(path));
         dos_path_to_osfs(path, ospath, sizeof(ospath));
 
+        serial_puts("[DOS] Open DS=");
+        serial_puthex(cpu->ds, 4);
+        serial_puts(" DX=");
+        serial_puthex(cpu->dx, 4);
+        serial_puts(" -> '");
+        serial_puts(path);
+        serial_puts("' osfs='");
+        serial_puts(ospath);
+        serial_puts("' #");
+        serial_putdec(cpu->insn_count);
+
+        /* Hex dump at DS:DX-4 to DS:DX+20 */
+        {
+            uint32_t a = dos_linear(cpu->ds, cpu->dx);
+            serial_puts(" @");
+            serial_puthex(a, 8);
+            serial_puts(" [-4..+20]:");
+            for (int i = -4; i < 20; i++) {
+                serial_puts(" ");
+                serial_puthex(dos_mem_read8(vm, a + i), 2);
+            }
+        }
+
         void *file = osfs2_find(ospath);
         if (!file) {
+            serial_puts(" NOT FOUND\n");
             cpu->flags |= FLAG_CF;
             cpu->ax = 2;  /* File not found */
             break;
         }
+        serial_puts(" OK\n");
 
         /* Find free handle */
         int h = -1;

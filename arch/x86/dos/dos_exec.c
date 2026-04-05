@@ -246,6 +246,24 @@ int dos_run(const char *filename, int argc, const char **argv)
         return -1;
     }
 
+    /* Write program name to environment block AND to DOS4GW's internal
+     * buffer area. DOS4GW reads from env at PSP:0x2C then copies to its
+     * own data area. We also write directly to 0x18A0 as a workaround. */
+    {
+        /* Environment block at 0x500 */
+        uint32_t env_addr = 0x500;
+        vm.mem[env_addr] = 0;              /* empty env vars */
+        vm.mem[env_addr + 1] = 0x01;       /* 1 string */
+        vm.mem[env_addr + 2] = 0x00;
+        int k;
+        for (k = 0; filename[k] && k < 60; k++)
+            vm.mem[env_addr + 3 + k] = filename[k];
+        vm.mem[env_addr + 3 + k] = 0;
+        serial_puts("[DOS] Env: '");
+        serial_puts(filename);
+        serial_puts("'\n");
+    }
+
     /* DTA segment = PSP */
     vm.dta_seg = vm.current_psp;
 
