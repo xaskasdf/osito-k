@@ -563,6 +563,19 @@ PVOID WINAPI HeapAlloc(HANDLE hHeap, DWORD dwFlags, SIZE_T dwBytes)
     (void)hHeap;
     static int heap_log_count = 0;
 
+    /* Log allocations around UGameEngine size (0x3D8 = 984 bytes) */
+    if (dwBytes >= 900 && dwBytes <= 1100) {
+        static int ge_alloc_count = 0;
+        ge_alloc_count++;
+        if (ge_alloc_count <= 20) {
+            serial_puts("[HEAP-ALLOC] size=");
+            serial_putdec(dwBytes);
+            serial_puts(" #");
+            serial_putdec(ge_alloc_count);
+            serial_puts("\n");
+        }
+    }
+
     /* 8-byte header + data, aligned to 16 bytes */
     SIZE_T total = (dwBytes + 8 + 15) & ~(SIZE_T)15;
     if (total < 32) total = 32;  /* min block size for free-list node */
@@ -662,6 +675,17 @@ PVOID WINAPI HeapAlloc(HANDLE hHeap, DWORD dwFlags, SIZE_T dwBytes)
         serial_puts(" (pool=0x");
         serial_puthex((uint64_t)(ULONG_PTR)heap_pool, 16);
         serial_puts(")\n");
+    }
+
+    /* Log UGameEngine-sized allocations with returned pointer */
+    if (dwBytes >= 900 && dwBytes <= 1100) {
+        static int ge_result_count = 0;
+        ge_result_count++;
+        if (ge_result_count <= 10) {
+            serial_puts("[HEAP-984] → 0x");
+            serial_puthex((uint64_t)(ULONG_PTR)ptr, 8);
+            serial_puts("\n");
+        }
     }
 
     return ptr;
@@ -1791,9 +1815,44 @@ extern uint64_t osfs2_file_size(void *file);
 typedef PVOID (*shim_resolver_fn)(const char *, uint16_t, int);
 extern shim_resolver_fn find_shim(const char *);
 
+/* DLLs that are known to not exist — return NULL immediately to avoid
+ * deep recursive searches or stack overflows in dll_load. */
+static int is_unavailable_dll(const char *name)
+{
+    /* Extract basename */
+    const char *bn = name;
+    for (const char *p = name; *p; p++)
+        if (*p == '\\' || *p == '/') bn = p + 1;
+
+    /* Case-insensitive prefix match for known-missing DLLs */
+    static const char *skip[] = {
+        "RICHED32", "RICHED20", "COMCTL32", "HHCTRL", "VERSION",
+        "RPCRT4", "SHLWAPI", "SETUPAPI", "CRYPT32", "WLDAP32",
+        "SECUR32", "dinput", "XINPUT", "d3d8", "d3d9", "d3d11",
+        NULL
+    };
+    for (int i = 0; skip[i]; i++) {
+        const char *a = bn, *b = skip[i];
+        int match = 1;
+        while (*b) {
+            char ca = *a, cb = *b;
+            if (ca >= 'a' && ca <= 'z') ca -= 32;
+            if (cb >= 'a' && cb <= 'z') cb -= 32;
+            if (ca != cb) { match = 0; break; }
+            a++; b++;
+        }
+        if (match) return 1;
+    }
+    return 0;
+}
+
 HANDLE WINAPI LoadLibraryA(PCSTR lpLibFileName)
 {
     if (!lpLibFileName) return NULL;
+
+    /* Fast-reject known-missing DLLs */
+    if (is_unavailable_dll(lpLibFileName))
+        return NULL;
 
     serial_puts("[K32] LoadLibraryA: ");
     serial_puts(lpLibFileName);
@@ -3214,6 +3273,14 @@ DWORD WINAPI GetPrivateProfileStringA(PCSTR lpAppName, PCSTR lpKeyName,
     }
 
     const char *result = lpDefault ? lpDefault : "";
+
+    /* Filter out ServerActors — UT99 loads IpDrv/IpServer/UWeb DLLs
+     * which don't exist on OsitoK, causing ExecWarning + appError. */
+    if (lpKeyName && ini_stricmp(lpKeyName, "ServerActors") == 0) {
+        if (lpReturnedString && nSize > 0) lpReturnedString[0] = 0;
+        return 0;
+    }
+
     INI_ENTRY *entry = ini_find(lpAppName, lpKeyName);
     if (entry)
         result = entry->value;
