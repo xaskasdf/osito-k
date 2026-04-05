@@ -109,7 +109,6 @@ static int stub_gmalloc_installed = 0;
 
 static void ensure_gmalloc_stub(void)
 {
-    if (stub_gmalloc_installed) return;
 
     /* GMalloc is at Core.dll + RVA 0xA7B90 (VA 0x101A7B90 when base=0x10100000).
      * It's a FMalloc* pointer. On disk, it points to a BSS object (0x101E3450)
@@ -119,11 +118,21 @@ static void ensure_gmalloc_stub(void)
 
     /* Check if Core.dll is loaded */
     uint32_t obj_addr = *gmalloc;
-    if (obj_addr < 0x10000000 || obj_addr >= 0x20000000) return;
+    if (obj_addr < 0x10000000 || obj_addr >= 0x20000000) {
+        serial_puts("[CRT] GMalloc not in DLL range: 0x");
+        serial_puthex(obj_addr, 8);
+        serial_puts("\n");
+        return;
+    }
 
     /* Check if the FMalloc object's vtable is already valid */
     volatile uint32_t *obj_vtbl = (volatile uint32_t *)(uintptr_t)obj_addr;
-    if (*obj_vtbl != 0) return;  /* Already constructed by appInit */
+    if (*obj_vtbl != 0) {
+        serial_puts("[CRT] GMalloc vtable already set: 0x");
+        serial_puthex(*obj_vtbl, 8);
+        serial_puts("\n");
+        return;  /* Already constructed by appInit */
+    }
 
     /* Create thunks for each vtable method */
     extern uint32_t compat32_make_thunk_ex(uint64_t target, const char *name,
@@ -183,6 +192,7 @@ void WINAPI _initterm(_PVFV *pfbegin, _PVFV *pfend)
     int cb_count = 0;
     for (uint32_t *p = begin32; p < end32; p++) {
         if (*p) {
+            ensure_gmalloc_stub();  /* re-check before EACH callback */
             compat32_callback(*p);
             cb_count++;
         }
@@ -288,7 +298,7 @@ int WINAPI __wgetmainargs(int *argc, WCHAR ***argv, WCHAR ***env,
     return 0;
 }
 
-void WINAPI __set_app_type(int type) { (void)type; }
+void WINAPI __set_app_type(int type) { (void)type; serial_puts("[CRT] __set_app_type\n"); }
 int  WINAPI _set_new_mode(int mode) { (void)mode; return 0; }
 
 /* ── Heap-backed malloc/free ───────────────────────────────── */
