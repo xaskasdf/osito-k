@@ -328,6 +328,10 @@ PVOID WINAPI VirtualAlloc(PVOID lpAddress, SIZE_T dwSize,
         serial_puthex(dwSize, 8);
         serial_puts(" (> 512MB, corruption)\n");
 
+        /* Dump recent INT 0x2E callers from ring buffer */
+        extern void dump_call_trace(void);
+        dump_call_trace();
+
         /* Walk 32-bit EBP chain to dump caller stack trace.
          * PE32 uses EBP-based stack frames: [EBP]=prev_EBP, [EBP+4]=ret_addr */
         serial_puts("[VA] Call stack: ");

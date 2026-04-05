@@ -1980,8 +1980,37 @@ uint32_t *iat_snapshot_ptr(void)   { return g_iat_snap; }
 uint32_t  iat_snapshot_base(void)  { return g_iat_base; }
 uint32_t  iat_snapshot_count(void) { return g_iat_count; }
 
+/* Ring buffer of recent PE32 return addresses for crash diagnostics */
+#define CALL_TRACE_SIZE 64
+uint32_t g_call_trace[CALL_TRACE_SIZE];
+uint32_t g_call_trace_idx = 0;
+
+void dump_call_trace(void)
+{
+    extern void serial_puts(const char *);
+    extern void serial_puthex(uint64_t, int);
+    serial_puts("[TRACE] Last PE32 callers: ");
+    for (int i = 0; i < CALL_TRACE_SIZE; i++) {
+        int idx = (g_call_trace_idx - 1 - i + CALL_TRACE_SIZE) % CALL_TRACE_SIZE;
+        uint32_t addr = g_call_trace[idx];
+        if (addr >= 0x10000000 && addr < 0x20000000) {
+            serial_puthex(addr, 8);
+            serial_puts(" ");
+        }
+        if (addr == 0) break;
+    }
+    serial_puts("\n");
+}
+
 uint64_t compat32_dispatch(uint32_t thunk_idx, uint32_t *stack_args)
 {
+    /* Log PE32 caller return address (at stack_args[-1] = [ESP] on entry) */
+    if (stack_args && thunk_idx < 0xFFFFFFF0) {
+        uint32_t ret_addr = stack_args[-1]; /* return address pushed by CALL */
+        g_call_trace[g_call_trace_idx % CALL_TRACE_SIZE] = ret_addr;
+        g_call_trace_idx++;
+    }
+
     /* Clean up null-page stale data from compat32 writes.
      * In compat32 mode, TF single-step isn't used for null-page cleanup
      * (#DB would cause #GP without IST). Stale data on page 0 from
