@@ -3706,6 +3706,22 @@ int cpu8086_run(dos_vm_t *vm)
             }
         }
 
+        /* Milestones for debugging DOS4GW init */
+        if (cpu->insn_count == 5000) {
+            serial_puts("[8086] 5K insn, CS:EIP=");
+            serial_puthex(cpu->cs, 4);
+            serial_puts(":");
+            serial_puthex(cpu->eip, 8);
+            /* Dump 16 bytes at the loop */
+            uint32_t la = dos_linear(cpu->cs, (uint16_t)(cpu->eip - 8));
+            serial_puts(" bytes[-8..+8]:");
+            for (int i = 0; i < 16; i++) {
+                serial_puts(" ");
+                serial_puthex(dos_mem_read8(vm, la + i), 2);
+            }
+            serial_puts("\n");
+        }
+
         /* Periodic status log every 100M instructions */
         if ((cpu->insn_count % 100000000) == 0) {
             serial_puts("[8086] ");

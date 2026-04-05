@@ -14,6 +14,7 @@
 
 extern void serial_puts(const char *s);
 extern void serial_puthex(uint64_t val, int digits);
+extern void serial_putdec(uint64_t val);
 
 /* Forward declarations for service handlers */
 void dos_int21_dispatch(dos_vm_t *vm);
@@ -81,9 +82,14 @@ void dos_int_dispatch(dos_vm_t *vm, uint8_t int_num)
         uint16_t seg = dos_mem_read16(vm, ivt_addr + 2);
 
         if (seg >= (DOS_ROM_BASE >> 4)) {
-            /* Points to our ROM stub (IRET) — just return.
-             * case 0xCD already pushed a frame; we need to pop it
-             * since there's no real handler to IRET from it. */
+            /* ROM stub — log which INT hit it (may reveal missing handlers) */
+            if (vm->cpu->insn_count < 5000) {
+                serial_puts("[STUB] INT ");
+                serial_puthex(int_num, 2);
+                serial_puts(" -> ROM stub #");
+                serial_putdec(vm->cpu->insn_count);
+                serial_puts("\n");
+            }
             break;
         }
 
