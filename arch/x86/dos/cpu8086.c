@@ -2367,11 +2367,18 @@ int cpu8086_run(dos_vm_t *vm)
         /* ════════════════════════════════════════════════════════════
          *  PUSHF / POPF  (0x9C / 0x9D)
          * ════════════════════════════════════════════════════════════ */
-        case 0x9C: /* PUSHF */
-            cpu_push16(cpu, cpu->flags | FLAGS_FIXED);
+        case 0x9C: /* PUSHF / PUSHFD */
+            if (op32)
+                cpu_push32(cpu, cpu->eflags | FLAGS_FIXED);
+            else
+                cpu_push16(cpu, cpu->flags | FLAGS_FIXED);
             break;
-        case 0x9D: /* POPF */
-            cpu->flags = (cpu_pop16(cpu) & 0x0FFF) | FLAGS_FIXED;
+        case 0x9D: /* POPF / POPFD */
+            if (op32)
+                cpu->eflags = (cpu_pop32(cpu) & 0x003F7FD5) | FLAGS_FIXED;
+            else
+                cpu->flags = (cpu_pop16(cpu) & 0x7FD5) | FLAGS_FIXED;
+            /* Preserve IOPL (bits 12-13) for 386 CPU detection */
             break;
 
         /* ════════════════════════════════════════════════════════════
@@ -2758,6 +2765,7 @@ int cpu8086_run(dos_vm_t *vm)
          *  INT 3 (0xCC) — Breakpoint
          * ════════════════════════════════════════════════════════════ */
         case 0xCC: { /* INT 3 */
+            uint16_t s_cs = cpu->cs; uint32_t s_eip = cpu->eip;
             if (cpu->pm_cs_loaded) {
                 cpu_push32(cpu, cpu->eflags);
                 cpu_push32(cpu, (uint32_t)cpu->cs);
@@ -2770,6 +2778,10 @@ int cpu8086_run(dos_vm_t *vm)
             set_flag(cpu, FLAG_IF, false);
             set_flag(cpu, FLAG_TF, false);
             dos_int_dispatch(vm, 3);
+            if (cpu->cs == s_cs && cpu->eip == s_eip) {
+                if (cpu->pm_cs_loaded) cpu->esp += 12;
+                else cpu->sp += 6;
+            }
             break;
         }
 
@@ -2778,9 +2790,8 @@ int cpu8086_run(dos_vm_t *vm)
          * ════════════════════════════════════════════════════════════ */
         case 0xCD: { /* INT imm8 */
             uint8_t int_num = cpu_fetch8(cpu);
-            /* Log non-common INTs */
-            if (int_num != 0x21 && int_num != 0x10 && int_num != 0x16 &&
-                int_num != 0x08) {
+            /* Log ALL INTs */
+            if (cpu->insn_count < 5000) {
                 serial_puts("[INT] ");
                 serial_puthex(int_num, 2);
                 serial_puts(" AH=");
@@ -2789,6 +2800,11 @@ int cpu8086_run(dos_vm_t *vm)
                 serial_putdec(cpu->insn_count);
                 serial_puts("\n");
             }
+            /* Save return address for detecting C-handled vs IVT-redirect */
+            uint16_t saved_cs = cpu->cs;
+            uint32_t saved_eip = cpu->eip;
+
+            /* Push interrupt frame */
             if (cpu->pm_cs_loaded) {
                 cpu_push32(cpu, cpu->eflags);
                 cpu_push32(cpu, (uint32_t)cpu->cs);
@@ -2800,7 +2816,21 @@ int cpu8086_run(dos_vm_t *vm)
             }
             set_flag(cpu, FLAG_IF, false);
             set_flag(cpu, FLAG_TF, false);
+
             dos_int_dispatch(vm, int_num);
+
+            /* If C handler (CS:IP unchanged), discard the frame — no IRET.
+             * Keep current flags (handler set CF etc.), only restore SP.
+             * If IVT redirect (CS:IP changed), leave frame for handler's IRET. */
+            if (cpu->cs == saved_cs && cpu->eip == saved_eip) {
+                /* Discard the interrupt frame from stack */
+                if (cpu->pm_cs_loaded) {
+                    cpu->esp += 12;  /* 3 × 4 bytes (EIP + CS + EFLAGS) */
+                } else {
+                    cpu->sp += 6;    /* 3 × 2 bytes (IP + CS + FLAGS) */
+                }
+                /* Don't restore flags — handler's flags (CF etc.) are correct */
+            }
             break;
         }
 
@@ -2809,13 +2839,7 @@ int cpu8086_run(dos_vm_t *vm)
          * ════════════════════════════════════════════════════════════ */
         case 0xCE: /* INTO */
             if (cpu->flags & FLAG_OF) {
-                uint16_t h_seg = dos_mem_read16(vm, 4 * 4 + 2);
-                if (h_seg >= (DOS_ROM_BASE >> 4)) {
-                    /* ROM stub handler: push+IRET would be a balanced NOP,
-                     * but it interferes with DOS4GW's test sequence.
-                     * Skip silently — DOS4GW CPU feature test. */
-                    break;
-                }
+                uint16_t s_cs4 = cpu->cs; uint32_t s_eip4 = cpu->eip;
                 if (cpu->pm_cs_loaded) {
                     cpu_push32(cpu, cpu->eflags);
                     cpu_push32(cpu, (uint32_t)cpu->cs);
@@ -2828,6 +2852,10 @@ int cpu8086_run(dos_vm_t *vm)
                 set_flag(cpu, FLAG_IF, false);
                 set_flag(cpu, FLAG_TF, false);
                 dos_int_dispatch(vm, 4);
+                if (cpu->cs == s_cs4 && cpu->eip == s_eip4) {
+                    if (cpu->pm_cs_loaded) cpu->esp += 12;
+                    else cpu->sp += 6;
+                }
             }
             break;
 
@@ -3645,6 +3673,17 @@ int cpu8086_run(dos_vm_t *vm)
         /* Increment instruction counter */
         cpu->insn_count++;
 
+        /* Detect CS corruption: log when CS changes to null/invalid in PM */
+        if (cpu->pm_cs_loaded && cpu->cs == 0x0000 && cpu->insn_count < 50000) {
+            serial_puts("[BUG] CS=0 at #");
+            serial_putdec(cpu->insn_count);
+            serial_puts(" op=");
+            serial_puthex(opcode, 2);
+            serial_puts(" EIP=");
+            serial_puthex(cpu->eip, 8);
+            serial_puts("\n");
+            cpu->running = false; /* stop to analyze */
+        }
 
 
         /* Periodic checks every 16K instructions */

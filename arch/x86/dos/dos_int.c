@@ -81,14 +81,15 @@ void dos_int_dispatch(dos_vm_t *vm, uint8_t int_num)
         uint16_t seg = dos_mem_read16(vm, ivt_addr + 2);
 
         if (seg >= (DOS_ROM_BASE >> 4)) {
-            /* Points to our ROM stub (IRET) — just return */
+            /* Points to our ROM stub (IRET) — just return.
+             * case 0xCD already pushed a frame; we need to pop it
+             * since there's no real handler to IRET from it. */
             break;
         }
 
-        /* User-installed handler: simulate CALL via stack */
-        cpu_push16(vm->cpu, vm->cpu->flags);
-        cpu_push16(vm->cpu, vm->cpu->cs);
-        cpu_push16(vm->cpu, vm->cpu->ip);
+        /* User-installed handler: jump to it.
+         * case 0xCD already pushed the interrupt frame (flags/CS/IP).
+         * The handler's IRET will pop that frame and return. */
         vm->cpu->cs = seg;
         vm->cpu->ip = off;
         vm->cpu->flags &= ~(FLAG_IF | FLAG_TF);
