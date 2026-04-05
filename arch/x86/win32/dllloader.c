@@ -337,39 +337,10 @@ PVOID dll_load(const char *dll_name, const BYTE *file_data, SIZE_T file_size)
         NTSTATUS compat_st = compat32_patch_iat(&mod->image);
         serial_puts("[DLL] IAT done\n");
 
-        /* Protect entire .idata section as read-only after patching.
-         * DataDirectory[1] only covers the Import Directory descriptors
-         * (small), but the IAT entries span the whole .idata section.
-         * Find the ".idata" section header and protect all its pages. */
-        {
-            uint8_t *base = (uint8_t *)mod->image.ImageBase;
-            PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)base;
-            PIMAGE_NT_HEADERS32 nt = (PIMAGE_NT_HEADERS32)(base + dos->e_lfanew);
-            PIMAGE_SECTION_HEADER sec = (PIMAGE_SECTION_HEADER)(
-                (uint8_t *)&nt->OptionalHeader + nt->FileHeader.SizeOfOptionalHeader);
-            extern int paging_set_flags(uint64_t virt, uint64_t flags);
-            for (int si = 0; si < nt->FileHeader.NumberOfSections; si++) {
-                if (sec[si].Name[0] == '.' && sec[si].Name[1] == 'i' &&
-                    sec[si].Name[2] == 'd' && sec[si].Name[3] == 'a' &&
-                    sec[si].Name[4] == 't' && sec[si].Name[5] == 'a') {
-                    uint64_t idata_start = (uint64_t)base + sec[si].VirtualAddress;
-                    uint64_t idata_size  = sec[si].Misc.VirtualSize;
-                    if (!idata_size) idata_size = sec[si].SizeOfRawData;
-                    uint64_t pg_start = idata_start & ~0xFFFULL;
-                    uint64_t pg_end   = (idata_start + idata_size + 0xFFF) & ~0xFFFULL;
-                    for (uint64_t pg = pg_start; pg < pg_end; pg += 4096)
-                        paging_set_flags(pg, 0x101); /* read-only */
-                    serial_puts("[DLL] .idata protected: 0x");
-                    serial_puthex(pg_start, 8);
-                    serial_puts("-0x");
-                    serial_puthex(pg_end, 8);
-                    serial_puts(" (");
-                    serial_puthex((pg_end - pg_start) / 4096, 1);
-                    serial_puts(" pages)\n");
-                    break;
-                }
-            }
-        }
+        /* IAT protection: instead of page-level write protection (which
+         * requires x86 instruction decoding or single-step to handle #PF),
+         * we use the watchdog in compat32_dispatch to restore IAT entries
+         * on every INT 0x2E call. See the IAT guard block in compat32.c. */
 
         if (!NT_SUCCESS(compat_st)) {
             serial_puts("[DLL] WARNING: compat32 IAT patch failed for ");

@@ -667,39 +667,6 @@ void isr_handler(interrupt_frame_t *frame)
         return;
     }
 
-    /* IAT write protection: skip writes to read-only IAT pages silently.
-     * The Unreal package loader overwrites IAT entries; we made them
-     * read-only to protect function pointers. Error code bit 0=present,
-     * bit 1=write. Present + write = write to read-only page. */
-    if (vec == 14 && (frame->error_code & 0x03) == 0x03) {
-        uint64_t cr2;
-        __asm__ volatile ("mov %%cr2, %0" : "=r"(cr2));
-        /* IAT pages are in PE DLL range (0x10000000-0x20000000) */
-        if (cr2 >= 0x10000000ULL && cr2 < 0x20000000ULL) {
-            /* Skip the faulting instruction by advancing RIP.
-             * Most IAT writes are MOV [mem], reg (2-6 bytes) or
-             * MOV [mem], imm (6-10 bytes). Decode minimally. */
-            uint8_t *ip = (uint8_t *)frame->rip;
-            uint32_t len = 2; /* minimum instruction length */
-            /* ModRM-based MOV: look for displacement in ModRM byte */
-            if (ip[0] == 0x89 || ip[0] == 0x8B || ip[0] == 0xC7) {
-                uint8_t modrm = ip[1];
-                uint8_t mod = modrm >> 6;
-                uint8_t rm  = modrm & 7;
-                len = 2; /* opcode + modrm */
-                if (rm == 4) len++; /* SIB byte */
-                if (mod == 0 && rm == 5) len += 4; /* disp32 */
-                else if (mod == 1) len += 1; /* disp8 */
-                else if (mod == 2) len += 4; /* disp32 */
-                if (ip[0] == 0xC7) len += 4; /* imm32 for MOV [mem], imm */
-            } else {
-                len = 3; /* conservative fallback */
-            }
-            frame->rip += len;
-            return; /* silently skip the write */
-        }
-    }
-
     /* Demand paging — handle #PF for high addresses FIRST, before any output.
      * This must be the earliest possible check to avoid stack corruption. */
     if (vec == 14 && !(frame->error_code & 1)) {
@@ -715,6 +682,18 @@ void isr_handler(interrupt_frame_t *frame)
     /* APIC timer tick */
     if (vec == 32) {
         tick_count++;
+
+        /* IAT watchdog: restore Engine.dll StaticLoadClass on every tick.
+         * The Unreal package loader overwrites this between INT 0x2E calls,
+         * so the compat32_dispatch guard alone isn't fast enough. */
+        {
+            static uint32_t iat_orig = 0;
+            volatile uint32_t *iat = (volatile uint32_t *)(uintptr_t)0x105A5E08;
+            if (!iat_orig && *iat >= 0x10100000 && *iat < 0x10200000)
+                iat_orig = *iat;
+            if (iat_orig && *iat != iat_orig)
+                *iat = iat_orig;
+        }
 
 #ifdef COMPAT32_TIMER_DEBUG
         /* Watchdog: log PE32 execution state (enable with -DCOMPAT32_TIMER_DEBUG) */
