@@ -2348,6 +2348,36 @@ static void shell_exec(char *line)
             sched_spawn("compositor", compositor_thread);
             sh_puts("Desktop launched. Compositor running.\n");
         }
+    } else if (strcmp(cmd, "fatls") == 0) {
+        extern int fat32_ls(const char *path);
+        extern bool fat32_is_mounted(void);
+        if (!fat32_is_mounted())
+            sh_puts("FAT32 not mounted\n");
+        else
+            fat32_ls(argc > 1 ? argv[1] : NULL);
+    } else if (strcmp(cmd, "fatcat") == 0) {
+        extern int fat32_read_file(const char *name, uint64_t offset,
+                                   void *buf, uint64_t len);
+        extern int fat32_find(const char *name, uint32_t *cluster, uint32_t *size);
+        extern bool fat32_is_mounted(void);
+        if (argc < 2) {
+            sh_puts("Usage: fatcat <filename>\n");
+        } else if (!fat32_is_mounted()) {
+            sh_puts("FAT32 not mounted\n");
+        } else {
+            uint32_t fsize;
+            if (fat32_find(argv[1], NULL, &fsize) < 0) {
+                sh_puts("File not found: "); sh_puts(argv[1]); sh_puts("\n");
+            } else {
+                uint32_t to_read = fsize < 4096 ? fsize : 4096;
+                char *buf = (char *)kmalloc(to_read + 1);
+                if (buf) {
+                    int n = fat32_read_file(argv[1], 0, buf, to_read);
+                    if (n > 0) { buf[n] = '\0'; sh_puts(buf); }
+                    kfree(buf);
+                }
+            }
+        }
     } else if (strcmp(cmd, "clear") == 0) {
         cmd_clear();
     } else if (strcmp(cmd, "kexec") == 0) {
