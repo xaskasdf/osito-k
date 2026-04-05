@@ -2758,9 +2758,15 @@ int cpu8086_run(dos_vm_t *vm)
          *  INT 3 (0xCC) — Breakpoint
          * ════════════════════════════════════════════════════════════ */
         case 0xCC: { /* INT 3 */
-            cpu_push16(cpu, cpu->flags | FLAGS_FIXED);
-            cpu_push16(cpu, cpu->cs);
-            cpu_push16(cpu, cpu->ip);
+            if (cpu->pm_cs_loaded) {
+                cpu_push32(cpu, cpu->eflags);
+                cpu_push32(cpu, (uint32_t)cpu->cs);
+                cpu_push32(cpu, cpu->eip);
+            } else {
+                cpu_push16(cpu, cpu->flags | FLAGS_FIXED);
+                cpu_push16(cpu, cpu->cs);
+                cpu_push16(cpu, cpu->ip);
+            }
             set_flag(cpu, FLAG_IF, false);
             set_flag(cpu, FLAG_TF, false);
             dos_int_dispatch(vm, 3);
@@ -2783,9 +2789,15 @@ int cpu8086_run(dos_vm_t *vm)
                 serial_putdec(cpu->insn_count);
                 serial_puts("\n");
             }
-            cpu_push16(cpu, cpu->flags | FLAGS_FIXED);
-            cpu_push16(cpu, cpu->cs);
-            cpu_push16(cpu, cpu->ip);
+            if (cpu->pm_cs_loaded) {
+                cpu_push32(cpu, cpu->eflags);
+                cpu_push32(cpu, (uint32_t)cpu->cs);
+                cpu_push32(cpu, cpu->eip);
+            } else {
+                cpu_push16(cpu, cpu->flags | FLAGS_FIXED);
+                cpu_push16(cpu, cpu->cs);
+                cpu_push16(cpu, cpu->ip);
+            }
             set_flag(cpu, FLAG_IF, false);
             set_flag(cpu, FLAG_TF, false);
             dos_int_dispatch(vm, int_num);
@@ -2804,9 +2816,15 @@ int cpu8086_run(dos_vm_t *vm)
                      * Skip silently — DOS4GW CPU feature test. */
                     break;
                 }
-                cpu_push16(cpu, cpu->flags | FLAGS_FIXED);
-                cpu_push16(cpu, cpu->cs);
-                cpu_push16(cpu, cpu->ip);
+                if (cpu->pm_cs_loaded) {
+                    cpu_push32(cpu, cpu->eflags);
+                    cpu_push32(cpu, (uint32_t)cpu->cs);
+                    cpu_push32(cpu, cpu->eip);
+                } else {
+                    cpu_push16(cpu, cpu->flags | FLAGS_FIXED);
+                    cpu_push16(cpu, cpu->cs);
+                    cpu_push16(cpu, cpu->ip);
+                }
                 set_flag(cpu, FLAG_IF, false);
                 set_flag(cpu, FLAG_TF, false);
                 dos_int_dispatch(vm, 4);
@@ -2817,9 +2835,15 @@ int cpu8086_run(dos_vm_t *vm)
          *  IRET  (0xCF)
          * ════════════════════════════════════════════════════════════ */
         case 0xCF: /* IRET */
-            cpu->ip    = cpu_pop16(cpu);
-            cpu->cs    = cpu_pop16(cpu);
-            cpu->flags = (cpu_pop16(cpu) & 0x0FFF) | FLAGS_FIXED;
+            if (cpu->pm_cs_loaded) {
+                cpu->eip    = cpu_pop32(cpu);
+                cpu->cs     = (uint16_t)cpu_pop32(cpu);
+                cpu->eflags = (cpu_pop32(cpu) & 0x003FFFFF) | FLAGS_FIXED;
+            } else {
+                cpu->ip    = cpu_pop16(cpu);
+                cpu->cs    = cpu_pop16(cpu);
+                cpu->flags = (cpu_pop16(cpu) & 0x0FFF) | FLAGS_FIXED;
+            }
             break;
 
         /* ════════════════════════════════════════════════════════════
@@ -3621,18 +3645,6 @@ int cpu8086_run(dos_vm_t *vm)
         /* Increment instruction counter */
         cpu->insn_count++;
 
-        /* Trace first 30 PM instructions after LMSW */
-        if (cpu->protected_mode && cpu->insn_count >= 2670 && cpu->insn_count <= 2700) {
-            serial_puts("[PMTRACE] #");
-            serial_putdec(cpu->insn_count);
-            serial_puts(" op=");
-            serial_puthex(opcode, 2);
-            serial_puts(" CS=");
-            serial_puthex(cpu->cs, 4);
-            serial_puts(" EIP=");
-            serial_puthex(cpu->eip, 8);
-            serial_puts("\n");
-        }
 
 
         /* Periodic checks every 16K instructions */
