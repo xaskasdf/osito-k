@@ -548,6 +548,10 @@ int net_udp_send_broadcast(uint16_t dst_port, uint16_t src_port,
     return i211_send(tx_pkt, frame_len);
 }
 
+/* Forward declaration for retransmit in net_poll */
+static int tcp_send_segment(tcp_conn_t *conn, uint8_t flags,
+                            const void *data, uint32_t len);
+
 /* ── Poll for Incoming Packets ───────────────────────────────── */
 
 void net_poll(void)
@@ -573,6 +577,34 @@ void net_poll(void)
         }
     }
 
+    /* TCP retransmit check — process all connections with unACKed data */
+    uint64_t now = idt_get_ticks();
+    for (int ci = 0; ci < TCP_MAX_CONNS; ci++) {
+        tcp_conn_t *tc = &tcp_conns[ci];
+        if (tc->state != TCP_ESTABLISHED || tc->tx_len == 0) continue;
+        if (now < tc->rto_tick) continue;
+
+        /* Timeout — retransmit oldest unACKed segment */
+        uint32_t chunk = tc->tx_len;
+        if (chunk > TCP_MSS) chunk = TCP_MSS;
+        tcp_send_segment(tc, TCP_ACK | TCP_PSH, tc->tx_buf, chunk);
+        tc->rto_count++;
+
+        /* Exponential backoff: 3s, 6s, 12s, 24s, max 60s */
+        uint32_t backoff = 300;
+        for (uint32_t b = 0; b < tc->rto_count && backoff < 6000; b++)
+            backoff *= 2;
+        tc->rto_tick = now + backoff;
+
+        /* Give up after 8 retransmits (~4 minutes) */
+        if (tc->rto_count >= 8) {
+            serial_puts("[TCP] Retransmit limit, closing conn ");
+            serial_putdec((uint64_t)ci);
+            serial_puts("\n");
+            tc->state = TCP_CLOSED;
+            tc->tx_len = 0;
+        }
+    }
 }
 
 /* ── Send UDP Datagram ───────────────────────────────────────── */
@@ -883,9 +915,40 @@ static void handle_tcp(const uint8_t *src_ip, const uint8_t *pkt, uint32_t len)
         break;
 
     case TCP_ESTABLISHED:
-        /* ACK our data */
-        if (flags & TCP_ACK)
-            conn->snd_una = ack;
+        /* ACK processing with retransmit tracking */
+        if (flags & TCP_ACK) {
+            if (ack > conn->snd_una) {
+                /* New data ACKed — advance tx_buf, reset dup count */
+                uint32_t acked = ack - conn->snd_una;
+                conn->snd_una = ack;
+                conn->dup_ack_count = 0;
+                /* Shift retransmit buffer */
+                if (conn->tx_len > 0) {
+                    if (acked >= conn->tx_len) {
+                        conn->tx_len = 0;  /* all ACKed */
+                    } else {
+                        uint32_t remain = conn->tx_len - acked;
+                        for (uint32_t bi = 0; bi < remain; bi++)
+                            conn->tx_buf[bi] = conn->tx_buf[bi + acked];
+                        conn->tx_len = remain;
+                        conn->tx_seq += acked;
+                    }
+                    conn->rto_tick = idt_get_ticks() + 300;
+                    conn->rto_count = 0;
+                }
+            } else if (ack == conn->snd_una && conn->tx_len > 0) {
+                /* Duplicate ACK — fast retransmit at 3 dups (RFC 5681) */
+                conn->dup_ack_count++;
+                if (conn->dup_ack_count >= 3) {
+                    uint32_t chunk = conn->tx_len;
+                    if (chunk > TCP_MSS) chunk = TCP_MSS;
+                    tcp_send_segment(conn, TCP_ACK | TCP_PSH,
+                                     conn->tx_buf, chunk);
+                    conn->dup_ack_count = 0;
+                    conn->rto_tick = idt_get_ticks() + 300;
+                }
+            }
+        }
 
         /* Receive data */
         if (data_len > 0 && seq == conn->rcv_nxt) {
@@ -1079,15 +1142,22 @@ int net_tcp_send(int conn_idx, const void *data, uint32_t len)
 
         uint8_t flags = TCP_ACK | TCP_PSH;
         if (tcp_send_segment(conn, flags, ptr + sent, chunk) < 0) {
-            /* Poll and retry once */
             net_poll();
             if (tcp_send_segment(conn, flags, ptr + sent, chunk) < 0)
                 return sent > 0 ? (int)sent : -1;
         }
 
-        sent += chunk;
+        /* Save in retransmit buffer for potential retransmission */
+        if (conn->tx_len + chunk <= TCP_TX_BUF_SIZE) {
+            memcpy(conn->tx_buf + conn->tx_len, ptr + sent, chunk);
+            if (conn->tx_len == 0)
+                conn->tx_seq = conn->snd_nxt - chunk;
+            conn->tx_len += chunk;
+            conn->rto_tick = idt_get_ticks() + 300;  /* 3s initial RTO */
+            conn->rto_count = 0;
+        }
 
-        /* Brief poll to process ACKs and prevent deadlock */
+        sent += chunk;
         net_poll();
     }
 

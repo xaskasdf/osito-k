@@ -101,7 +101,9 @@ typedef struct __attribute__((packed)) {
 #define TCP_SYN_RCVD    9
 
 #define TCP_RX_BUF_SIZE 8192
+#define TCP_TX_BUF_SIZE 4096
 #define TCP_MAX_CONNS   32
+#define TCP_MSS         1460
 
 typedef struct {
     int       state;
@@ -115,6 +117,14 @@ typedef struct {
 
     uint8_t   rx_buf[TCP_RX_BUF_SIZE];
     uint32_t  rx_len;       /* bytes available in rx_buf */
+
+    /* Retransmit state (RFC 5681) */
+    uint8_t   tx_buf[TCP_TX_BUF_SIZE]; /* unACKed sent data */
+    uint32_t  tx_len;           /* bytes in tx_buf */
+    uint32_t  tx_seq;           /* sequence number of tx_buf[0] */
+    uint64_t  rto_tick;         /* next retransmit time (ticks) */
+    uint32_t  rto_count;        /* retransmit attempts */
+    uint32_t  dup_ack_count;    /* consecutive duplicate ACKs */
 
     uint64_t  last_activity;  /* tick of last packet */
 } tcp_conn_t;
