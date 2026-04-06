@@ -229,10 +229,18 @@ void keyboard_irq(void)
         input_post_key(sc & 0x7F, !(sc & 0x80), false);
     }
     /* PS/2 ALWAYS converts scancodes to ASCII for the shell.
-     * This is the primary keyboard path — compositor doesn't gate it.
-     * xHCI skips direct kb_push when compositor runs to avoid doubling.
      * Only skip when a graphical process has captured the keyboard
-     * (game mode: keys go via input_events ring instead). */
+     * (game mode: keys go via input_events ring instead).
+     * The compositor's fullscreen→desktop transition resets captured=false.
+     *
+     * Safety: if compositor is running and no fullscreen window is active,
+     * force captured=false so the terminal always receives input. */
+    if (g_keyboard_captured) {
+        /* Check if capture is stale (no fullscreen window) */
+        extern bool input_game_mode;
+        if (!input_game_mode)
+            g_keyboard_captured = false;  /* Auto-release stale capture */
+    }
     if (!g_keyboard_captured)
         kb_process_scancode(sc);
 
