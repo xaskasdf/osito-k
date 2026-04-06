@@ -2053,6 +2053,17 @@ uint64_t compat32_dispatch(uint32_t thunk_idx, uint32_t *stack_args)
                 if (live[i] != snap[i] &&
                     snap[i] >= 0x10000000 && snap[i] < 0x20000000 &&
                     live[i] >= 0x40000000 && live[i] < 0x80000000) {
+                    static int restore_log_count = 0;
+                    if (restore_log_count < 20) {
+                        serial_puts("[IAT-RESTORE] [");
+                        serial_puthex(IAT_BASE + i * 4, 8);
+                        serial_puts("] ");
+                        serial_puthex(live[i], 8);
+                        serial_puts(" -> ");
+                        serial_puthex(snap[i], 8);
+                        serial_puts("\n");
+                        restore_log_count++;
+                    }
                     live[i] = snap[i];
                 }
             }
