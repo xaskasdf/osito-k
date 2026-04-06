@@ -69,6 +69,8 @@ static uint8_t  offered_gw[4];
 static uint8_t  offered_dns[4];
 static uint32_t offered_lease;
 static volatile bool dhcp_got_reply;
+static uint64_t dhcp_lease_start;   /* tick when lease was acquired */
+static uint64_t dhcp_lease_ticks;   /* lease duration in 100Hz ticks */
 
 /* ── Helpers ─────────────────────────────────────────────────── */
 
@@ -296,5 +298,41 @@ int dhcp_discover(void)
     fb_puts(ipstr);
     fb_puts("\n");
 
+    /* Store lease timing for renewal */
+    dhcp_lease_start = idt_get_ticks();
+    dhcp_lease_ticks = (uint64_t)offered_lease * 100;  /* convert to 100Hz ticks */
+
     return 0;
+}
+
+/* Check if lease needs renewal. Call periodically from main loop.
+ * Renews at T1 = 50% of lease (RFC 2131 recommendation). */
+void dhcp_check_renewal(void)
+{
+    if (!dhcp_lease_ticks) return;
+    uint64_t elapsed = idt_get_ticks() - dhcp_lease_start;
+    uint64_t t1 = dhcp_lease_ticks / 2;  /* Renew at 50% of lease */
+
+    if (elapsed < t1) return;
+
+    serial_puts("[DHCP] Lease renewal...\n");
+    dhcp_got_reply = false;
+    dhcp_send(DHCP_REQUEST, offered_ip);
+
+    /* Brief wait for ACK (1s) */
+    uint64_t start = idt_get_ticks();
+    while (!dhcp_got_reply && (idt_get_ticks() - start) < 100) {
+        net_poll();
+        __asm__ volatile ("hlt");
+    }
+
+    if (dhcp_got_reply && dhcp_msg_type == DHCP_ACK) {
+        dhcp_lease_start = idt_get_ticks();
+        dhcp_lease_ticks = (uint64_t)offered_lease * 100;
+        serial_puts("[DHCP] Lease renewed (");
+        serial_putdec(offered_lease);
+        serial_puts("s)\n");
+    } else {
+        serial_puts("[DHCP] Renewal failed, will retry\n");
+    }
 }

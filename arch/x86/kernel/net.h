@@ -126,6 +126,11 @@ typedef struct {
     uint32_t  rto_count;        /* retransmit attempts */
     uint32_t  dup_ack_count;    /* consecutive duplicate ACKs */
 
+    /* Window scaling (RFC 7323) */
+    uint8_t   snd_wscale;      /* remote window scale factor */
+    uint8_t   rcv_wscale;      /* our window scale (log2 of RX buf) */
+    uint32_t  snd_wnd;         /* remote advertised window (scaled) */
+
     uint64_t  last_activity;  /* tick of last packet */
 } tcp_conn_t;
 

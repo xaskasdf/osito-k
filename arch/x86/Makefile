@@ -63,7 +63,8 @@ BOOT_SRC = boot/boot_efi.c
 
 KERN_SRC = kernel/main.c kernel/serial.c kernel/framebuffer.c \
            kernel/pci.c kernel/memory.c kernel/net.c \
-           kernel/dhcp.c kernel/ntp.c kernel/tensor.c \
+           kernel/dhcp.c kernel/ntp.c kernel/ipv6.c kernel/mdns.c \
+           kernel/tensor.c \
            kernel/tensor_avx2.c kernel/inference.c kernel/idt.c \
            kernel/paging.c kernel/heap.c kernel/syscall.c \
            kernel/elf.c kernel/process.c \
