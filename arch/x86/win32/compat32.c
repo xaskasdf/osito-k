@@ -2022,57 +2022,17 @@ uint64_t compat32_dispatch(uint32_t thunk_idx, uint32_t *stack_args)
         }
     }
 
-    /* Delayed IAT snapshot: taken AFTER appInit completes (class registration
-     * modifies IAT entries legitimately during ProcessRegistrants). We detect
-     * appInit completion by counting INT 0x2E calls after EXE _initterm —
-     * appInit does ~5000-10000 calls, then the engine is stable. Snapshot
-     * after 12000 calls to be safe. */
+    /* Single IAT entry guard: only protect StaticLoadClass [0x105A5E08].
+     * Full/delayed snapshot approaches all broke init by restoring
+     * legitimate runtime patches. This single guard is proven stable
+     * (16K+ lines, Client+Lighting+Rendering OK). */
     {
-        extern int g_iat_snapshot_ready;
-        static uint32_t *snap = NULL;
-        static uint32_t snap_count = 0;
-        static uint32_t calls_since_ready = 0;
-        #define IAT_BASE 0x105A5000
-        #define IAT_PAGES 7
-        #define IAT_DWORDS (IAT_PAGES * 1024)
-        #define IAT_SNAPSHOT_DELAY 12000  /* calls after _initterm flag */
-
-        if (g_iat_snapshot_ready && !snap) {
-            calls_since_ready++;
-            if (calls_since_ready >= IAT_SNAPSHOT_DELAY) {
-                extern void *mem_alloc_pages(uint64_t);
-                snap = (uint32_t *)mem_alloc_pages((IAT_DWORDS * 4 + 4095) / 4096);
-                if (snap) {
-                    uint32_t *src = (uint32_t *)(uintptr_t)IAT_BASE;
-                    for (uint32_t i = 0; i < IAT_DWORDS; i++)
-                        snap[i] = src[i];
-                    snap_count = IAT_DWORDS;
-                    serial_puts("[IAT] Snapshot taken (post-appInit, after ");
-                    serial_puthex(calls_since_ready, 4);
-                    serial_puts(" calls)\n");
-                }
-            }
-        }
-
-        if (snap) {
-            volatile uint32_t *live = (volatile uint32_t *)(uintptr_t)IAT_BASE;
-            for (uint32_t i = 0; i < snap_count; i++) {
-                if (live[i] != snap[i] && snap[i] != 0) {
-                    static int restore_log_count = 0;
-                    if (restore_log_count < 20) {
-                        serial_puts("[IAT-RESTORE] [");
-                        serial_puthex(IAT_BASE + i * 4, 8);
-                        serial_puts("] ");
-                        serial_puthex(live[i], 8);
-                        serial_puts(" -> ");
-                        serial_puthex(snap[i], 8);
-                        serial_puts("\n");
-                        restore_log_count++;
-                    }
-                    live[i] = snap[i];
-                }
-            }
-        }
+        volatile uint32_t *iat_entry = (volatile uint32_t *)(uintptr_t)0x105A5E08;
+        static uint32_t iat_original = 0;
+        if (iat_original == 0 && *iat_entry >= 0x10100000 && *iat_entry < 0x10200000)
+            iat_original = *iat_entry;
+        if (iat_original && *iat_entry != iat_original)
+            *iat_entry = iat_original;
     }
 
     /* Continuously clear GIsCriticalError + GErrorHist[0].
