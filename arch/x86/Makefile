@@ -76,7 +76,8 @@ KERN_SRC = kernel/main.c kernel/serial.c kernel/framebuffer.c \
            kernel/input_events.c kernel/memcompress.c \
            kernel/kmod.c kernel/wayland.c kernel/pty.c \
            kernel/socket.c kernel/timers.c kernel/power.c \
-           kernel/sysv_ipc.c kernel/vt.c
+           kernel/sysv_ipc.c kernel/vt.c \
+           kernel/blkdev.c kernel/strace.c kernel/caps.c
 ASM_SRC  = kernel/isr_stubs.S kernel/syscall_entry.S kernel/setjmp.S kernel/kexec_tramp.S
 DRV_SRC  = drivers/nvme.c drivers/i211.c drivers/gpu.c drivers/gsp.c \
            drivers/sass.c drivers/gmmu.c drivers/gpu_tensor.c drivers/gpu_inference.c \
