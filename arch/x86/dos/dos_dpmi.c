@@ -158,7 +158,7 @@ void dos_int2f_dispatch(dos_vm_t *vm)
         serial_puts("[DPMI] INT 2Fh/1687h: DPMI detected\n");
         cpu->ax = 0x0000;    /* DPMI host present */
         cpu->bx = 0x0001;    /* 32-bit programs supported */
-        cpu->cl = 0x05;      /* processor type: 586 */
+        cpu->cl = 0x03;      /* processor type: 386 */
         cpu->dh = 0x00;      /* version major: 0 */
         cpu->dl = 0x5A;      /* version minor: 90 (0x5A) */
         cpu->si = 0x0000;    /* no private data area needed */

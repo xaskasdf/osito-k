@@ -39,6 +39,44 @@ void dos_int_dispatch(dos_vm_t *vm, uint8_t int_num)
         dos_int16_keyboard(vm);
         break;
 
+    case 0x15: {
+        /* BIOS services — extended memory, system config */
+        cpu8086_state_t *c15 = vm->cpu;
+        switch (c15->ah) {
+        case 0x87: /* Move block (extended memory copy) */
+            c15->flags &= ~FLAG_CF;  /* success */
+            c15->ah = 0;
+            break;
+        case 0x88: /* Get extended memory size (KB above 1MB) */
+            c15->ax = (vm->total_mem_size > 0x100000) ?
+                      (uint16_t)((vm->total_mem_size - 0x100000) / 1024) : 0;
+            c15->flags &= ~FLAG_CF;
+            break;
+        case 0xBF: /* DOS4GW extended memory query */
+            /* Return: AX = extended memory in KB */
+            c15->ax = (vm->total_mem_size > 0x100000) ?
+                      (uint16_t)((vm->total_mem_size - 0x100000) / 1024) : 0;
+            c15->flags &= ~FLAG_CF;
+            break;
+        case 0xE8: /* Get memory map (E820h) */
+            if (c15->al == 0x01) {
+                /* E801h: Get memory size for >64MB */
+                c15->ax = 0x3C00;  /* 15MB in 1KB units */
+                c15->bx = 0;       /* 0 in 64KB units above 16MB */
+                c15->cx = 0x3C00;
+                c15->dx = 0;
+                c15->flags &= ~FLAG_CF;
+            } else {
+                c15->flags |= FLAG_CF;
+            }
+            break;
+        default:
+            c15->flags |= FLAG_CF;  /* unsupported */
+            break;
+        }
+        break;
+    }
+
     case 0x1A:
         dos_int1a_timer(vm);
         break;

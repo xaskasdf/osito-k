@@ -43,13 +43,20 @@ static void dos_init_ivt(dos_vm_t *vm)
     uint16_t rom_seg = DOS_ROM_BASE >> 4;  /* 0xF000 */
     uint16_t stub_off = 0;
 
+    /* Only initialize IVT entries for vectors 0x80+ (above the GDT range).
+     * DOS4GW puts its GDT at address 0 with limit 0x02FF (768 bytes = 96 entries).
+     * IVT entries 0-95 (addresses 0x000-0x17F) overlap with GDT space.
+     * Leave those as zero so DOS4GW can use them for GDT descriptors.
+     * Our INT dispatch handles vectors 0x00-0x7F via dos_int_dispatch anyway. */
     for (int i = 0; i < 256; i++) {
-        /* IVT entry: offset, segment */
-        dos_mem_write16(vm, i * 4, stub_off);
-        dos_mem_write16(vm, i * 4 + 2, rom_seg);
-
-        /* ROM stub: IRET (0xCF) */
+        /* ROM stub: IRET (0xCF) for all vectors */
         vm->mem[DOS_ROM_BASE + stub_off] = 0xCF;
+
+        /* Only write IVT entries above the GDT range */
+        if (i >= 0xC0) {  /* vectors 0xC0+ (address 0x300+) are above GDT limit 0x2FF */
+            dos_mem_write16(vm, i * 4, stub_off);
+            dos_mem_write16(vm, i * 4 + 2, rom_seg);
+        }
         stub_off++;
     }
 }
