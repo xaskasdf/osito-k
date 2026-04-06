@@ -211,9 +211,11 @@ static void kb_process_scancode(uint8_t sc)
  * cleared via kbd_set_captured(false) on process exit. */
 
 static volatile bool g_keyboard_captured = false;
+volatile bool g_ps2_detected = false;  /* Set true on first PS/2 IRQ */
 
 void kbd_set_captured(bool captured) { g_keyboard_captured = captured; }
 bool kbd_is_captured(void)           { return g_keyboard_captured; }
+bool kbd_ps2_detected(void)          { return g_ps2_detected; }
 
 /* ── IRQ 1 handler (called from IDT vector 33) ──────────────── */
 
@@ -226,13 +228,16 @@ void keyboard_irq(void)
         extern void input_post_key(uint8_t scancode, bool pressed, bool extended);
         input_post_key(sc & 0x7F, !(sc & 0x80), false);
     }
-    /* Process PS/2 scancode → ASCII → kb_buf for the shell.
-     * Skip when compositor is running (compositor handles HID→kb_push routing
-     * from the input_events ring to avoid double input with PS/2+USB).
-     * Also skip when a graphical process has captured the keyboard. */
-    if (!g_keyboard_captured &&
-        !(compositor_is_running && compositor_is_running()))
+    /* PS/2 ALWAYS converts scancodes to ASCII for the shell.
+     * This is the primary keyboard path — compositor doesn't gate it.
+     * xHCI skips direct kb_push when compositor runs to avoid doubling.
+     * Only skip when a graphical process has captured the keyboard
+     * (game mode: keys go via input_events ring instead). */
+    if (!g_keyboard_captured)
         kb_process_scancode(sc);
+
+    /* Mark PS/2 as detected (for xHCI fallback decision) */
+    g_ps2_detected = true;
 }
 
 /* ── Inject scancode from compositor (no I/O port read) ──────── */
