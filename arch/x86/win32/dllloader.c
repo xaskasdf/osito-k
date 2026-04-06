@@ -274,6 +274,92 @@ PVOID dll_resolve_export(LOADED_MODULE *mod, const char *func_name,
     return NULL;
 }
 
+/* ── IAT auto-recovery: resolve original function for corrupted IAT entry ── */
+
+uint32_t dll_resolve_iat_original(uint32_t iat_va)
+{
+    /* Find which DLL's .idata contains this IAT VA */
+    for (int m = 0; m < module_count; m++) {
+        BYTE *base = (BYTE *)modules[m].image.ImageBase;
+        if (!base) continue;
+        uint32_t base32 = (uint32_t)(uintptr_t)base;
+
+        PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)base;
+        if (dos->e_magic != IMAGE_DOS_SIGNATURE) continue;
+        PIMAGE_NT_HEADERS32 nt = (PIMAGE_NT_HEADERS32)(base + dos->e_lfanew);
+        if (nt->OptionalHeader.NumberOfRvaAndSizes <= 1) continue;
+
+        uint32_t imp_rva = nt->OptionalHeader.DataDirectory[1].VirtualAddress;
+        if (!imp_rva) continue;
+
+        /* Walk Import Descriptors */
+        typedef struct { uint32_t INT; uint32_t ts; uint32_t fwd; uint32_t name; uint32_t IAT; } ImpDesc;
+        ImpDesc *imp = (ImpDesc *)(base + imp_rva);
+
+        for (; imp->name; imp++) {
+            uint32_t iat_start = base32 + imp->IAT;
+            uint32_t int_rva = imp->INT ? imp->INT : imp->IAT;
+            uint32_t *iat_arr = (uint32_t *)(uintptr_t)(base32 + imp->IAT);
+            uint32_t *int_arr = (uint32_t *)(uintptr_t)(base32 + int_rva);
+            const char *dll_name = (const char *)(base + imp->name);
+
+            /* Walk IAT + INT in parallel */
+            for (int j = 0; iat_arr[j]; j++) {
+                uint32_t entry_va = iat_start + j * 4;
+                if (entry_va == iat_va) {
+                    /* Found! INT[j] has the import hint+name */
+                    uint32_t int_entry = int_arr[j];
+                    if (int_entry & 0x80000000) {
+                        /* Import by ordinal */
+                        uint16_t ord = (uint16_t)(int_entry & 0xFFFF);
+                        PVOID fn = dll_resolve_import(dll_name, NULL, ord, TRUE);
+                        return fn ? (uint32_t)(uintptr_t)fn : 0;
+                    } else {
+                        /* Import by name */
+                        typedef struct { uint16_t hint; char name[1]; } HintName;
+                        HintName *hn = (HintName *)(base + int_entry);
+                        PVOID fn = dll_resolve_import(dll_name, hn->name, 0, FALSE);
+                        return fn ? (uint32_t)(uintptr_t)fn : 0;
+                    }
+                }
+            }
+        }
+    }
+    return 0;
+}
+
+/* ── Dynamic IAT guard table ────────────────────────────────── */
+
+#define MAX_IAT_GUARDS 16
+static struct { uint32_t addr; uint32_t value; } iat_guards[MAX_IAT_GUARDS];
+static int iat_guard_count = 0;
+
+void iat_guard_add(uint32_t addr, uint32_t value)
+{
+    /* Check if already guarded */
+    for (int i = 0; i < iat_guard_count; i++)
+        if (iat_guards[i].addr == addr) return;
+    if (iat_guard_count < MAX_IAT_GUARDS) {
+        iat_guards[iat_guard_count].addr = addr;
+        iat_guards[iat_guard_count].value = value;
+        iat_guard_count++;
+        serial_puts("[IAT-GUARD] Added 0x");
+        serial_puthex(addr, 8);
+        serial_puts(" = 0x");
+        serial_puthex(value, 8);
+        serial_puts("\n");
+    }
+}
+
+void iat_guard_check(void)
+{
+    for (int i = 0; i < iat_guard_count; i++) {
+        volatile uint32_t *p = (volatile uint32_t *)(uintptr_t)iat_guards[i].addr;
+        if (*p != iat_guards[i].value)
+            *p = iat_guards[i].value;
+    }
+}
+
 /* ── Load a PE DLL ─────────────────────────────────────────── */
 
 PVOID dll_load(const char *dll_name, const BYTE *file_data, SIZE_T file_size)

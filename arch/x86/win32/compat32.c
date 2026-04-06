@@ -2014,17 +2014,20 @@ uint64_t compat32_dispatch(uint32_t thunk_idx, uint32_t *stack_args)
         }
     }
 
-    /* Single IAT entry guard: only protect StaticLoadClass [0x105A5E08].
-     * Full/delayed snapshot approaches all broke init by restoring
-     * legitimate runtime patches. This single guard is proven stable
-     * (16K+ lines, Client+Lighting+Rendering OK). */
+    /* Dynamic IAT guard: protects specific entries discovered via #PF
+     * auto-recovery. Also includes hardcoded StaticLoadClass for bootstrap. */
     {
+        /* Bootstrap guard: StaticLoadClass (always active) */
         volatile uint32_t *iat_entry = (volatile uint32_t *)(uintptr_t)0x105A5E08;
         static uint32_t iat_original = 0;
         if (iat_original == 0 && *iat_entry >= 0x10100000 && *iat_entry < 0x10200000)
             iat_original = *iat_entry;
         if (iat_original && *iat_entry != iat_original)
             *iat_entry = iat_original;
+
+        /* Dynamic guards: entries discovered by #PF intercept at runtime */
+        extern void iat_guard_check(void);
+        iat_guard_check();
     }
 
     /* Continuously clear GIsCriticalError + GErrorHist[0].

@@ -668,24 +668,35 @@ void isr_handler(interrupt_frame_t *frame)
         return;
     }
 
-    /* IAT corruption intercept: if execution reaches heap (0x40xxxxxx),
-     * scan Engine.dll .idata for the corrupted entry and restore it.
-     * Uses the delayed snapshot from compat32_dispatch (post-DLL-load). */
+    /* IAT auto-recovery: if execution reaches heap (0x40xxxxxx), the engine
+     * jumped to a corrupted IAT entry. Scan .idata for the corrupt value,
+     * resolve the original function via dll_resolve_iat_original(), fix it. */
     if (vec == 14 || vec == 6 /* #UD */) {
         uint64_t fault_rip = frame->rip;
         if (fault_rip >= 0x40000000ULL && fault_rip < 0x80000000ULL) {
-            /* Scan .idata for live entry matching corrupt RIP */
             uint32_t corrupt = (uint32_t)fault_rip;
+            /* Scan Engine.dll .idata (0x105A5000, 7 pages) */
             volatile uint32_t *idata = (volatile uint32_t *)(uintptr_t)0x105A5000;
             for (uint32_t i = 0; i < 7 * 1024; i++) {
-                if (idata[i] == corrupt &&
-                    idata[i] >= 0x40000000 && idata[i] < 0x80000000) {
-                    /* Can't know original value here without snapshot.
-                     * Fall through to SEH which may handle it. */
-                    break;
+                if (idata[i] == corrupt) {
+                    /* Try to resolve the original value */
+                    extern uint32_t dll_resolve_iat_original(uint32_t iat_va);
+                    uint32_t original = dll_resolve_iat_original(0x105A5000 + i * 4);
+                    if (original && original >= 0x10000000 && original < 0x20000000) {
+                        idata[i] = original;
+                        frame->rip = (uint64_t)original;
+                        if ((uint32_t)frame->rbx == corrupt)
+                            frame->rbx = (uint64_t)original;
+                        if ((uint32_t)frame->rdi == corrupt)
+                            frame->rdi = (uint64_t)original;
+                        /* Add to dynamic guard table */
+                        extern void iat_guard_add(uint32_t addr, uint32_t value);
+                        iat_guard_add(0x105A5000 + i * 4, original);
+                        return;
+                    }
                 }
             }
-            /* Hardcoded known case: StaticLoadClass */
+            /* Hardcoded fallback: StaticLoadClass */
             if (fault_rip == 0x4027C870ULL) {
                 frame->rip = 0x10101820ULL;
                 if ((uint32_t)frame->rbx == 0x4027C870)

@@ -3551,6 +3551,49 @@ static DWORD WINAPI GlobalAddAtomW_stub(const WCHAR *s)
     return 0xC000;  /* fake atom */
 }
 
+/* ── Path and file attribute APIs ────────────────────────────── */
+
+static DWORD WINAPI GetTempPathA_k32(DWORD nBufferLength, PSTR lpBuffer)
+{
+    const char *tmp = ".\\";
+    DWORD len = 2;
+    if (lpBuffer && nBufferLength > len) {
+        lpBuffer[0] = '.'; lpBuffer[1] = '\\'; lpBuffer[2] = 0;
+    }
+    return len;
+}
+
+static DWORD WINAPI GetSystemDirectoryA_k32(PSTR lpBuffer, DWORD uSize)
+{
+    const char *dir = "System";
+    DWORD len = 6;
+    if (lpBuffer && uSize > len) {
+        for (DWORD i = 0; i <= len; i++) lpBuffer[i] = dir[i];
+    }
+    return len;
+}
+
+static DWORD WINAPI GetWindowsDirectoryA_k32(PSTR lpBuffer, DWORD uSize)
+{
+    return GetSystemDirectoryA_k32(lpBuffer, uSize);
+}
+
+static DWORD WINAPI GetFileAttributesA_k32(PCSTR lpFileName)
+{
+    if (!lpFileName) return 0xFFFFFFFF; /* INVALID_FILE_ATTRIBUTES */
+    /* Check if file exists in OsitoFS */
+    extern void *osfs2_find(const char *name);
+    extern void *osfs2_find_ci(const char *name);
+    /* Strip path to basename */
+    const char *base = lpFileName;
+    for (const char *p = lpFileName; *p; p++)
+        if (*p == '\\' || *p == '/') base = p + 1;
+    void *f = osfs2_find(base);
+    if (!f) f = osfs2_find_ci(base);
+    if (f) return 0x80; /* FILE_ATTRIBUTE_NORMAL */
+    return 0xFFFFFFFF;  /* INVALID_FILE_ATTRIBUTES = file not found */
+}
+
 /* ── Export resolution table ────────────────────────────────── */
 
 typedef struct {
@@ -3784,6 +3827,11 @@ static const K32_EXPORT k32_exports[] = {
     { "ReleaseMutex",            (PVOID)ReleaseMutex_stub },
     { "OutputDebugStringW",      (PVOID)OutputDebugStringW_stub },
     { "GlobalAddAtomW",          (PVOID)GlobalAddAtomW_stub },
+    /* ── Path/attribute APIs (UT99 needs these) ── */
+    { "GetTempPathA",            (PVOID)GetTempPathA_k32 },
+    { "GetSystemDirectoryA",     (PVOID)GetSystemDirectoryA_k32 },
+    { "GetWindowsDirectoryA",    (PVOID)GetWindowsDirectoryA_k32 },
+    { "GetFileAttributesA",      (PVOID)GetFileAttributesA_k32 },
     { NULL, NULL }
 };
 
