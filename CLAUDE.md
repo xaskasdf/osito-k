@@ -137,6 +137,13 @@ kernel/            main.c, serial.c, framebuffer.c, pci.c, memory.c, heap.c
                    sched_rt.c — RT scheduler (FIFO, RR, Deadline)
                    dm.c — Device mapper (dm-linear)
                    power.c — ACPI shutdown/reboot + CPU freq
+                   tls13.c — TLS 1.3 client handshake
+                   sshd.c — SSH-2 server (version exchange, KEXINIT)
+                   evdev.c — Input event device (keyboard + mouse)
+                   sysctl.c — Kernel parameter tuning (/proc/sys)
+                   fuse.c — Filesystem in Userspace (request/response)
+                   kprof.c — Sampling profiler (RIP histogram)
+                   msync.c — MAP_SHARED writeback coherence
 drivers/           nvme.c — NVMe read/write
                    gpu.c, gsp.c — NVIDIA GPU + GSP Falcon (Phases 1-10)
                    sass.c, gmmu.c — SASS kernels + GPU MMU
@@ -311,6 +318,13 @@ arch/arm/          SM8350 (ROG Phone 5) bare-metal port — see docs/aarch64-det
 | X-VBLK  | Virtio block driver (read/write via split virtqueue) | Done |
 | X-VNET  | Virtio network driver (RX/TX queues, MAC config) | Done |
 | X-USBMS | USB mass storage (BBB protocol, SCSI READ/INQUIRY) | Done |
+| X-TLS13 | TLS 1.3 client (X25519 key share, ChaCha20-Poly1305) | Done |
+| X-SSHD  | SSH server (protocol exchange, KEXINIT, session mgmt) | Done |
+| X-EVDEV | Input event device (evdev, Linux struct input_event) | Done |
+| X-SYSCTL| Kernel sysctl (10+ tunable parameters, read/write) | Done |
+| X-FUSE  | FUSE userspace filesystem (request/response queues) | Done |
+| X-KPROF | Kernel profiler (sampling via timer ISR, histogram) | Done |
+| X-MSYNC | msync + MAP_SHARED coherence (writeback to disk) | Done |
 | **Phase 0** | **Kernel/bootloader separation** (boot.efi + kernel.elf) | **Done** |
 | **Phase 1** | **TCC cross-compiles kernel from host** | **Done** |
 | **Phase 2** | **TCC compiles kernel inside OsitoK** (62 .c → 733KB ELF) | **Done** |
