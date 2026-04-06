@@ -508,13 +508,58 @@ void dos_int21_dispatch(dos_vm_t *vm)
         cpu->bx = vm->current_psp;
         break;
 
+    /* ── AH=33h: Get/Set Ctrl+Break ──────────────────────────────── */
+    case 0x33:
+        if (cpu->al == 0x00) {
+            cpu->dl = 0;  /* Ctrl+Break checking OFF */
+        }
+        /* AL=01: set — ignore */
+        /* AL=05: get boot drive */
+        if (cpu->al == 0x05) {
+            cpu->dl = 3;  /* C: */
+        }
+        break;
+
+    /* ── AH=34h: Get InDOS flag pointer ───────────────────────────── */
+    case 0x34:
+        cpu->es = 0x0050;  /* point to our data area */
+        cpu->bx = 0x00F0;  /* offset within segment */
+        break;
+
+    /* ── AH=50h: Set PSP ──────────────────────────────────────────── */
+    case 0x50:
+        vm->current_psp = cpu->bx;
+        break;
+
+    /* ── AH=51h: Get PSP ──────────────────────────────────────────── */
+    case 0x51:
+        cpu->bx = vm->current_psp;
+        break;
+
+    /* ── AH=52h: Get List of Lists (SYSVARS) ──────────────────────── */
+    case 0x52:
+        /* Return pointer to a fake DOS internal variables block.
+         * Many programs just check that this doesn't crash. */
+        cpu->es = 0x0050;
+        cpu->bx = 0x0080;
+        break;
+
+    /* ── AH=58h: Get/Set memory allocation strategy ───────────────── */
+    case 0x58:
+        if (cpu->al == 0x00) {
+            cpu->ax = 0;  /* first fit */
+        } else if (cpu->al == 0x02) {
+            cpu->ax = 0;  /* no UMB link */
+        }
+        cpu->flags &= ~FLAG_CF;
+        break;
+
     /* ── Default: unhandled ─────────────────────────────────────── */
     default:
         serial_puts("[DOS] Unhandled INT 21h AH=");
         serial_puthex(ah, 2);
         serial_puts("\n");
-        cpu->flags |= FLAG_CF;
-        cpu->ax = 1;  /* invalid function */
+        /* Don't set CF for unhandled — some programs check CF and abort */
         break;
     }
 }
