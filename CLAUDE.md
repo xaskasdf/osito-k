@@ -118,6 +118,25 @@ kernel/            main.c, serial.c, framebuffer.c, pci.c, memory.c, heap.c
                    mdns.c — mDNS responder (osito-k.local)
                    kmod.c — Kernel module loader (.ko ELF64)
                    wayland.c — Wayland display protocol stub
+                   socket.c — BSD socket API (AF_INET TCP/UDP)
+                   timers.c — alarm/setitimer POSIX timers
+                   pty.c — Pseudo-terminal subsystem
+                   sysv_ipc.c — System V shared memory + semaphores
+                   vt.c — Virtual terminal multiplexer (4 VTs)
+                   blkdev.c — Block device abstraction layer
+                   strace.c — Syscall tracer (per-process)
+                   caps.c — Capabilities + cgroups
+                   klog.c — Kernel log ring buffer (dmesg)
+                   random.c — RNG with entropy pool + RDRAND
+                   oom.c — OOM killer + swap stub
+                   ns.c — Namespace isolation (containers)
+                   panic.c — Kernel panic + watchdog
+                   sysfs.c — /sys virtual filesystem
+                   netfilter.c — Packet filtering (iptables-like)
+                   crypto2.c — ChaCha20, Poly1305, SHA-512, HKDF
+                   sched_rt.c — RT scheduler (FIFO, RR, Deadline)
+                   dm.c — Device mapper (dm-linear)
+                   power.c — ACPI shutdown/reboot + CPU freq
 drivers/           nvme.c — NVMe read/write
                    gpu.c, gsp.c — NVIDIA GPU + GSP Falcon (Phases 1-10)
                    sass.c, gmmu.c — SASS kernels + GPU MMU
@@ -126,6 +145,9 @@ drivers/           nvme.c — NVMe read/write
                    ahci.c, ccp.c, xhci.c — SATA, AMD TRNG, USB 3.x
                    hda.c — Intel HD Audio (PCM playback, codec init)
                    virtio.c — Virtio PCI transport (split virtqueue)
+                   virtio_blk.c — Virtio block device (read/write)
+                   virtio_net.c — Virtio network (RX/TX queues)
+                   usb_storage.c — USB mass storage (BBB/SCSI)
 win32/             pe.c, winexec.c — PE32 loader + execution
                    compat32.c, int2e_stub.S — 32→64 mode switching (INT 0x2E)
                    dllloader.c — 15 DLL shims (kernel32, msvcrt, user32, etc.)
@@ -263,6 +285,32 @@ arch/arm/          SM8350 (ROG Phone 5) bare-metal port — see docs/aarch64-det
 | X-WL    | Wayland display protocol stub (surface create/commit/destroy) | Done |
 | X-AUDIO | HDA audio /dev/dsp + beep command | Done |
 | X-DOCKER| Dockerfile + Firecracker microVM containerization | Done |
+| X-SOCK  | BSD Socket API (socket/bind/listen/accept/connect/send/recv) | Done |
+| X-EPOLL | epoll + eventfd + poll syscalls | Done |
+| X-PTY   | Pseudo-terminal pairs (/dev/ptmx + /dev/pts/N) | Done |
+| X-TIMER | Timer subsystem (alarm, setitimer, SIGALRM delivery) | Done |
+| X-PROCFS| Full procfs (/proc/cpuinfo, meminfo, uptime, mounts, filesystems) | Done |
+| X-FB    | Framebuffer /dev/fb0 (mmap for direct pixel access) | Done |
+| X-POWER | ACPI shutdown/reboot + CPU freq query + MWAIT detection | Done |
+| X-IPC   | System V IPC (shmget/shmat/shmdt + semaphores) | Done |
+| X-VT    | Virtual terminal multiplexer (Alt+F1-F4, 4 VTs) | Done |
+| X-BLKDEV| Block device abstraction (NVMe/AHCI/virtio/USB unified API) | Done |
+| X-STRACE| Syscall tracer (per-process logging with decoded args) | Done |
+| X-CAPS  | Linux capabilities (38 caps, per-process effective/permitted) | Done |
+| X-CGROUP| cgroups basic (CPU quota + memory limits per group) | Done |
+| X-NS    | Namespaces (PID/mount/net/UTS/IPC isolation for containers) | Done |
+| X-KLOG  | Kernel log ring buffer (64KB dmesg, syslog syscall) | Done |
+| X-RNG   | Random number generator (entropy pool, RDRAND, /dev/random) | Done |
+| X-OOM   | OOM killer (score-based, PID 0/1 protected) + swap stub | Done |
+| X-PANIC | Kernel panic (register dump, stack trace, watchdog) | Done |
+| X-SYSFS | sysfs /sys (block devices, net, kernel info) | Done |
+| X-NF    | Netfilter packet filtering (32 rules, accept/drop) | Done |
+| X-CRYPTO2| ChaCha20-Poly1305 + SHA-512 + HKDF-SHA256 | Done |
+| X-SCHED2| RT scheduler (SCHED_FIFO, SCHED_RR, SCHED_DEADLINE) | Done |
+| X-DM    | Device mapper (dm-linear, foundation for LVM/dm-crypt) | Done |
+| X-VBLK  | Virtio block driver (read/write via split virtqueue) | Done |
+| X-VNET  | Virtio network driver (RX/TX queues, MAC config) | Done |
+| X-USBMS | USB mass storage (BBB protocol, SCSI READ/INQUIRY) | Done |
 | **Phase 0** | **Kernel/bootloader separation** (boot.efi + kernel.elf) | **Done** |
 | **Phase 1** | **TCC cross-compiles kernel from host** | **Done** |
 | **Phase 2** | **TCC compiles kernel inside OsitoK** (62 .c → 733KB ELF) | **Done** |
