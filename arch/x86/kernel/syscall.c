@@ -310,6 +310,10 @@ static inline void wrmsr(uint32_t msr, uint64_t val) {
 #define FD_TYPE_PIPE    3
 #define FD_TYPE_DEV     4   /* virtual device (/dev/null, /dev/zero, etc.) */
 #define FD_TYPE_PROC    5   /* virtual procfs (/proc/self/maps, etc.) */
+#define FD_TYPE_TMPFS   6   /* tmpfs file (/tmp/*) */
+#define FD_TYPE_FAT32   7   /* FAT32 file (/fat/*) */
+#define FD_TYPE_EXT2    8   /* ext2 file (/ext2/*) */
+#define FD_TYPE_ISO     9   /* ISO 9660 file (/iso/*) */
 
 typedef ssize_t (*fd_write_fn)(const void *buf, size_t count);
 typedef ssize_t (*fd_read_fn)(void *buf, size_t count);
@@ -582,6 +586,15 @@ static int64_t sys_write(uint64_t fd, uint64_t buf, uint64_t count)
         return (int64_t)count;
     }
 
+    if (f->type == FD_TYPE_TMPFS) {
+        extern int tmpfs_write(void *handle, uint64_t offset,
+                               const void *buf, uint64_t len);
+        int ret = tmpfs_write(f->file, f->offset, (const void *)buf, count);
+        if (ret < 0) return -ENOSPC;
+        f->offset += ret;
+        return (int64_t)ret;
+    }
+
     if (f->type == FD_TYPE_PIPE) {
         pipe_buf_t *p = (pipe_buf_t *)f->file;
         if (!p || !p->read_open) return -EPIPE;
@@ -658,6 +671,24 @@ static int64_t sys_read(uint64_t fd, uint64_t buf, uint64_t count)
         if (ret < 0) return -EFAULT;
         f->offset += count;
         return (int64_t)count;
+    }
+
+    if (f->type == FD_TYPE_TMPFS) {
+        extern int tmpfs_read(void *handle, uint64_t offset, void *buf, uint64_t len);
+        int ret = tmpfs_read(f->file, f->offset, (void *)buf, count);
+        if (ret <= 0) return ret == 0 ? 0 : -EFAULT;
+        f->offset += ret;
+        return (int64_t)ret;
+    }
+
+    if (f->type == FD_TYPE_FAT32) {
+        extern int fat32_read_file(const char *name, uint64_t offset,
+                                   void *buf, uint64_t len);
+        int ret = fat32_read_file((const char *)f->file, f->offset,
+                                  (void *)buf, count);
+        if (ret <= 0) return ret == 0 ? 0 : -EFAULT;
+        f->offset += ret;
+        return (int64_t)ret;
     }
 
     if (f->type == FD_TYPE_PIPE) {
@@ -854,6 +885,75 @@ static int64_t sys_open(uint64_t path_addr, uint64_t flags, uint64_t mode)
         f->type   = FD_TYPE_PROC;
         f->oflags = O_RDONLY;
         f->offset = 0;  /* read position */
+        return newfd;
+    }
+
+    /* ── VFS: tmpfs (/tmp/*) ──────────────────────────── */
+    if (str_startswith(path, "/tmp/")) {
+        extern void *tmpfs_open(const char *name);
+        extern void *tmpfs_create(const char *name);
+        const char *fname = path + 5;
+        void *th = tmpfs_open(fname);
+        if (!th && (flags & O_CREAT))
+            th = tmpfs_create(fname);
+        if (!th) return -ENOENT;
+        fd_entry_t *f = &fd_table[newfd];
+        memset(f, 0, sizeof(*f));
+        f->open   = true;
+        f->type   = FD_TYPE_TMPFS;
+        f->oflags = (uint16_t)(flags & 0xFFFF);
+        f->file   = th;
+        return newfd;
+    }
+
+    /* ── VFS: FAT32 (/fat/*) ─────────────────────────── */
+    if (str_startswith(path, "/fat/")) {
+        extern int fat32_find(const char *name, uint32_t *cluster, uint32_t *size);
+        extern bool fat32_is_mounted(void);
+        if (!fat32_is_mounted()) return -ENOENT;
+        const char *fname = path + 5;
+        uint32_t fsize;
+        if (fat32_find(fname, NULL, &fsize) < 0) return -ENOENT;
+        fd_entry_t *f = &fd_table[newfd];
+        memset(f, 0, sizeof(*f));
+        f->open   = true;
+        f->type   = FD_TYPE_FAT32;
+        f->oflags = (uint16_t)(flags & 0xFFFF);
+        f->file   = (void *)fname;
+        return newfd;
+    }
+
+    /* ── VFS: ext2 (/ext2/*) ─────────────────────────── */
+    if (str_startswith(path, "/ext2/")) {
+        extern int ext2_find(const char *name, uint32_t *ino);
+        extern bool ext2_is_mounted(void);
+        if (!ext2_is_mounted()) return -ENOENT;
+        const char *fname = path + 6;
+        uint32_t ino;
+        if (ext2_find(fname, &ino) < 0) return -ENOENT;
+        fd_entry_t *f = &fd_table[newfd];
+        memset(f, 0, sizeof(*f));
+        f->open   = true;
+        f->type   = FD_TYPE_EXT2;
+        f->oflags = (uint16_t)(flags & 0xFFFF);
+        f->file   = (void *)(uintptr_t)ino;
+        return newfd;
+    }
+
+    /* ── VFS: ISO 9660 (/iso/*) ──────────────────────── */
+    if (str_startswith(path, "/iso/")) {
+        extern int iso9660_find(const char *name, uint32_t *lba, uint32_t *size);
+        extern bool iso9660_is_mounted(void);
+        if (!iso9660_is_mounted()) return -ENOENT;
+        const char *fname = path + 5;
+        uint32_t lba, fsize;
+        if (iso9660_find(fname, &lba, &fsize) < 0) return -ENOENT;
+        fd_entry_t *f = &fd_table[newfd];
+        memset(f, 0, sizeof(*f));
+        f->open   = true;
+        f->type   = FD_TYPE_ISO;
+        f->oflags = (uint16_t)(flags & 0xFFFF);
+        f->file   = (void *)(uintptr_t)lba;
         return newfd;
     }
 

@@ -685,6 +685,16 @@ void kernel_entry(boot_info_t *info)
             /* Sync clock via NTP (requires DNS from DHCP) */
             ntp_sync();
 
+            /* IPv6 link-local + mDNS responder */
+            extern void ipv6_init(void);
+            extern void mdns_init(const uint8_t ip[4]);
+            ipv6_init();
+            {
+                extern uint8_t *net_get_ip_ptr(void);
+                uint8_t *cur_ip = net_get_ip_ptr();
+                if (cur_ip) mdns_init(cur_ip);
+            }
+
             net_udp_listen(7777, prompt_handler);
         } else {
             serial_puts("[KERN] I211 init failed\n");

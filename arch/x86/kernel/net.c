@@ -506,6 +506,8 @@ void net_get_mac(uint8_t mac_out[6])
     memcpy(mac_out, our_mac, 6);
 }
 
+uint8_t *net_get_ip_ptr(void) { return our_ip; }
+
 /* Send raw UDP broadcast (src IP = 0.0.0.0, dst IP = 255.255.255.255).
  * Used by DHCP before we have an IP address. */
 int net_udp_send_broadcast(uint16_t dst_port, uint16_t src_port,
@@ -574,6 +576,12 @@ void net_poll(void)
         case ETH_TYPE_IP4:
             handle_ipv4(payload, payload_len);
             break;
+        case 0x86DD: { /* ETH_TYPE_IP6 */
+            extern void ipv6_handle_packet(const uint8_t *data, uint32_t len,
+                                           const uint8_t *src_mac);
+            ipv6_handle_packet(payload, payload_len, eth->src);
+            break;
+        }
         }
     }
 
