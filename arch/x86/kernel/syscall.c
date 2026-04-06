@@ -275,6 +275,15 @@ static inline void wrmsr(uint32_t msr, uint64_t val) {
 #define SYS_ALARM         37
 #define SYS_SETITIMER     38
 #define SYS_GETITIMER     36
+#define SYS_IOPL          172
+#define SYS_IOPERM        173
+#define SYS_SHMGET        29
+#define SYS_SHMAT         30
+#define SYS_SHMCTL        31
+#define SYS_SHMDT         67
+#define SYS_SEMGET        64
+#define SYS_SEMOP         65
+#define SYS_SEMCTL        66
 
 /* OsitoK private syscalls (500+) */
 #define SYS_SHM_CREATE      500
@@ -3185,6 +3194,38 @@ int64_t syscall_dispatch(uint64_t nr, uint64_t a1, uint64_t a2,
         return timer_setitimer((int)a1, (const void *)a2, (void *)a3);
     }
     case SYS_GETITIMER: return 0;
+    /* ── I/O port access ─────────────────────────────────────── */
+    case SYS_IOPL:    return 0;  /* Grant full I/O privilege (bare-metal: always allowed) */
+    case SYS_IOPERM:  return 0;  /* Same — all ports accessible */
+    /* ── System V IPC ────────────────────────────────────────── */
+    case SYS_SHMGET: {
+        extern int sysv_shmget(int, uint64_t, int);
+        return sysv_shmget((int)a1, a2, (int)a3);
+    }
+    case SYS_SHMAT: {
+        extern void *sysv_shmat(int, const void *, int);
+        return (int64_t)(uint64_t)sysv_shmat((int)a1, (const void *)a2, (int)a3);
+    }
+    case SYS_SHMDT: {
+        extern int sysv_shmdt(const void *);
+        return sysv_shmdt((const void *)a1);
+    }
+    case SYS_SHMCTL: {
+        extern int sysv_shmctl(int, int, void *);
+        return sysv_shmctl((int)a1, (int)a2, (void *)a3);
+    }
+    case SYS_SEMGET: {
+        extern int sysv_semget(int, int, int);
+        return sysv_semget((int)a1, (int)a2, (int)a3);
+    }
+    case SYS_SEMOP: {
+        extern int sysv_semop(int, void *, uint32_t);
+        return sysv_semop((int)a1, (void *)a2, (uint32_t)a3);
+    }
+    case SYS_SEMCTL: {
+        extern int sysv_semctl(int, int, int);
+        return sysv_semctl((int)a1, (int)a2, (int)a3);
+    }
     case SYS_EPOLL_CREATE1: return sys_epoll_create1(a1);
     case SYS_EPOLL_CTL:     return sys_epoll_ctl(a1, a2, a3, a4);
     case SYS_EPOLL_WAIT:    return sys_epoll_wait(a1, a2, a3, a4);

@@ -2104,6 +2104,31 @@ static void shell_exec(char *line)
         cmd_cc(argc, argv);
     } else if (strcmp(cmd, "build") == 0) {
         cmd_build();
+    } else if (strcmp(cmd, "ifconfig") == 0) {
+        extern uint8_t *net_get_ip_ptr(void);
+        extern void net_get_mac(uint8_t mac[6]);
+        extern uint64_t mem_get_free(void);
+        uint8_t *ip = net_get_ip_ptr();
+        uint8_t mac[6];
+        net_get_mac(mac);
+        sh_puts("eth0: ");
+        sh_putdec(ip[0]); sh_puts("."); sh_putdec(ip[1]); sh_puts(".");
+        sh_putdec(ip[2]); sh_puts("."); sh_putdec(ip[3]); sh_puts("\n");
+        sh_puts("  HW ");
+        for (int i = 0; i < 6; i++) {
+            if (i > 0) sh_puts(":");
+            char h[3]; h[0] = "0123456789abcdef"[(mac[i]>>4)&0xF];
+            h[1] = "0123456789abcdef"[mac[i]&0xF]; h[2] = 0;
+            sh_puts(h);
+        }
+        sh_puts("\n");
+    } else if (strcmp(cmd, "route") == 0) {
+        sh_puts("Destination     Gateway         Flags  Iface\n");
+        sh_puts("0.0.0.0         (gateway)       UG     eth0\n");
+    } else if (strcmp(cmd, "netstat") == 0) {
+        sh_puts("Proto  Local     Remote    State\n");
+        /* TODO: iterate TCP connection table */
+        sh_puts("(use serial log for TCP connection details)\n");
     } else if (strcmp(cmd, "ping") == 0) {
         cmd_ping(argc, argv);
     } else if (strcmp(cmd, "tcptest") == 0) {
