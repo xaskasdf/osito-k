@@ -42,7 +42,7 @@ typedef struct {
 #define TRACE_IRQ_ENTER      0
 #define TRACE_IRQ_EXIT       1
 
-static trace_entry_t trace_buf[TRACE_BUF_SIZE];
+static trace_entry_t *trace_buf;  /* Lazy alloc (saves ~80KB BSS) */
 static uint32_t trace_head;
 static uint32_t trace_count;
 static bool     trace_enabled;
@@ -55,7 +55,15 @@ void trace_init(void)
     serial_puts("[TRACE] Tracepoint system ready\n");
 }
 
-void trace_start(void) { trace_enabled = true; trace_head = trace_count = 0; }
+void trace_start(void) {
+    if (!trace_buf) {
+        extern void *kmalloc(uint64_t);
+        trace_buf = (trace_entry_t *)kmalloc(TRACE_BUF_SIZE * sizeof(trace_entry_t));
+        if (!trace_buf) return;
+        memset(trace_buf, 0, TRACE_BUF_SIZE * sizeof(trace_entry_t));
+    }
+    trace_enabled = true; trace_head = trace_count = 0;
+}
 void trace_stop(void)  { trace_enabled = false; }
 void trace_set_mask(uint8_t mask) { trace_mask = mask; }
 

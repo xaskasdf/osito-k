@@ -57,12 +57,22 @@ typedef struct {
     uint64_t next_unique;
 } fuse_mount_t;
 
-static fuse_mount_t fuse_mounts[FUSE_MAX_MOUNTS];
+static fuse_mount_t *fuse_mounts;  /* Lazy alloc (saves ~280KB BSS) */
+
+static void fuse_ensure_init(void)
+{
+    if (fuse_mounts) return;
+    extern void *kmalloc(uint64_t);
+    fuse_mounts = (fuse_mount_t *)kmalloc(FUSE_MAX_MOUNTS * sizeof(fuse_mount_t));
+    if (fuse_mounts) memset(fuse_mounts, 0, FUSE_MAX_MOUNTS * sizeof(fuse_mount_t));
+}
 
 /* ── Public API ──────────────────────────────────────────────── */
 
 int fuse_register(const char *mountpoint, uint32_t daemon_pid)
 {
+    fuse_ensure_init();
+    if (!fuse_mounts) return -1;
     for (int i = 0; i < FUSE_MAX_MOUNTS; i++) {
         if (!fuse_mounts[i].active) {
             fuse_mount_t *m = &fuse_mounts[i];

@@ -13,13 +13,17 @@ extern uint64_t idt_get_ticks(void);
 
 #define KLOG_SIZE  (64 * 1024)  /* 64KB ring buffer */
 
-static char  klog_buf[KLOG_SIZE];
+static char *klog_buf;  /* Lazy alloc (saves ~64KB BSS) */
 static uint32_t klog_head;       /* Write position */
 static uint32_t klog_total;      /* Total bytes ever written */
 static bool     klog_initialized;
 
 void klog_init(void)
 {
+    extern void *kmalloc(uint64_t);
+    klog_buf = (char *)kmalloc(KLOG_SIZE);
+    if (!klog_buf) return;
+    memset(klog_buf, 0, KLOG_SIZE);
     klog_head = 0;
     klog_total = 0;
     klog_initialized = true;

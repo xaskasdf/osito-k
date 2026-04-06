@@ -28,7 +28,7 @@ typedef struct {
     bool     active;
 } vt_t;
 
-static vt_t vts[VT_MAX];
+static vt_t *vts;   /* Allocated on first init (saves ~160KB BSS) */
 static int  current_vt;
 static bool vt_initialized;
 
@@ -36,6 +36,9 @@ static bool vt_initialized;
 
 void vt_init(void)
 {
+    extern void *kmalloc(uint64_t);
+    vts = (vt_t *)kmalloc(VT_MAX * sizeof(vt_t));
+    if (!vts) { serial_puts("[VT] Failed to allocate\n"); return; }
     for (int i = 0; i < VT_MAX; i++) {
         memset(&vts[i], 0, sizeof(vt_t));
         vts[i].active = true;

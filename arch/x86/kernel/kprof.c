@@ -24,7 +24,7 @@ typedef struct {
     uint64_t tick;
 } kprof_sample_t;
 
-static kprof_sample_t samples[KPROF_MAX_SAMPLES];
+static kprof_sample_t *samples;  /* Lazy alloc (saves ~64KB BSS) */
 static uint32_t sample_head;
 static uint32_t sample_count;
 static uint32_t histogram[KPROF_BUCKETS];
@@ -35,7 +35,12 @@ static uint64_t prof_start_tick;
 
 void kprof_start(void)
 {
-    memset(samples, 0, sizeof(samples));
+    if (!samples) {
+        extern void *kmalloc(uint64_t);
+        samples = (kprof_sample_t *)kmalloc(KPROF_MAX_SAMPLES * sizeof(kprof_sample_t));
+        if (!samples) return;
+    }
+    memset(samples, 0, KPROF_MAX_SAMPLES * sizeof(kprof_sample_t));
     memset(histogram, 0, sizeof(histogram));
     sample_head = 0;
     sample_count = 0;
