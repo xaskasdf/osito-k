@@ -80,7 +80,7 @@ DRV_SRC  = drivers/nvme.c drivers/i211.c drivers/gpu.c drivers/gsp.c \
            drivers/xhci.c drivers/hda.c
 FS_SRC   = fs/ositofs2.c fs/gpt.c fs/gguf.c fs/vfs.c fs/fat32.c \
            fs/tmpfs.c fs/iso9660.c fs/ext2.c fs/exfat.c fs/ntfs.c \
-           fs/udf.c fs/squashfs.c
+           fs/udf.c fs/squashfs.c fs/hfsplus.c fs/btrfs.c
 WIN32_SRC = win32/win32_init.c win32/compat32.c win32/pe.c win32/winexec.c \
             win32/handle.c win32/ntsyscall.c win32/ntprocess.c win32/ntsync.c \
             win32/dllloader.c \

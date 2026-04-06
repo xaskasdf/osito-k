@@ -286,6 +286,7 @@ static inline void wrmsr(uint32_t msr, uint64_t val) {
 #define ERANGE  34
 #define ENOTSUP 95
 #define EAFNOSUPPORT 97
+#define ENODEV  19
 
 /* open flags (Linux values) */
 #define O_RDONLY    0x0000
@@ -525,6 +526,7 @@ static vma_t vma_table[MAX_VMAS];
 #define DEV_ZERO        1
 #define DEV_URANDOM     2
 #define DEV_CONSOLE     3
+#define DEV_DSP         4   /* /dev/dsp — PCM audio output via HDA */
 
 /* PRNG for /dev/urandom — CCP TRNG if available, RDTSC fallback */
 extern uint64_t ccp_random(void) __attribute__((weak));
@@ -570,6 +572,17 @@ static int64_t sys_write(uint64_t fd, uint64_t buf, uint64_t count)
             return (int64_t)count;  /* discard */
         case DEV_CONSOLE:
             return console_write((const void *)buf, (size_t)count);
+        case DEV_DSP: {
+            /* Write PCM samples (16-bit signed LE) to HDA audio output */
+            extern void hda_play_buffer(const int16_t *, uint32_t)
+                __attribute__((weak));
+            if (hda_play_buffer) {
+                uint32_t num_samples = (uint32_t)(count / 2);
+                hda_play_buffer((const int16_t *)buf, num_samples);
+                return (int64_t)count;
+            }
+            return -ENODEV;
+        }
         default:
             return -EBADF;  /* zero/urandom are read-only */
         }
@@ -843,6 +856,8 @@ static int64_t sys_open(uint64_t path_addr, uint64_t flags, uint64_t mode)
         else if (strcmp(devname, "random") == 0)  dev_id = DEV_URANDOM;
         else if (strcmp(devname, "console") == 0) dev_id = DEV_CONSOLE;
         else if (strcmp(devname, "tty") == 0)     dev_id = DEV_CONSOLE;
+        else if (strcmp(devname, "dsp") == 0)     dev_id = DEV_DSP;
+        else if (strcmp(devname, "audio") == 0)   dev_id = DEV_DSP;
         else return -ENOENT;
 
         fd_entry_t *f = &fd_table[newfd];
