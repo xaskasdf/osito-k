@@ -134,11 +134,43 @@ ALL_KERN_OBJ = $(KERN_OBJ) $(ASM_OBJ) $(DRV_OBJ) $(FS_OBJ) $(WIN32_OBJ) $(WIN32_
 
 # ── Targets ───────────────────────────────────────────────────
 
-.PHONY: all clean check-deps legacy tcc tcc-clean
+# Minimal kernel: excludes all new subsystems from Apr 2026 session.
+# Use when full kernel crashes (e.g., BSS overlap with NVMe DMA).
+KERN_MINIMAL = kernel/main.c kernel/serial.c kernel/framebuffer.c \
+               kernel/pci.c kernel/memory.c kernel/net.c \
+               kernel/tensor.c kernel/tensor_avx2.c kernel/inference.c \
+               kernel/idt.c kernel/paging.c kernel/heap.c kernel/syscall.c \
+               kernel/elf.c kernel/process.c \
+               kernel/keyboard.c kernel/terminal.c kernel/shell.c \
+               kernel/crypto.c kernel/tls.c kernel/http.c kernel/claude.c \
+               kernel/tokenizer.c kernel/smp.c kernel/dynlink.c \
+               kernel/zlib.c kernel/git.c \
+               kernel/shm.c kernel/compositor.c kernel/display.c \
+               kernel/input_events.c kernel/memcompress.c
+DRV_MINIMAL  = drivers/nvme.c drivers/i211.c drivers/gpu.c drivers/gsp.c \
+               drivers/sass.c drivers/gmmu.c drivers/gpu_tensor.c \
+               drivers/gpu_inference.c drivers/xhci.c drivers/hda.c
+FS_MINIMAL   = fs/ositofs2.c fs/gpt.c fs/gguf.c fs/vfs.c
+KERN_MIN_OBJ = $(KERN_MINIMAL:%.c=$(BUILD)/%.o)
+DRV_MIN_OBJ  = $(DRV_MINIMAL:%.c=$(BUILD)/%.o)
+FS_MIN_OBJ   = $(FS_MINIMAL:%.c=$(BUILD)/%.o)
+ALL_MIN_OBJ  = $(KERN_MIN_OBJ) $(ASM_OBJ) $(DRV_MIN_OBJ) $(FS_MIN_OBJ) \
+               $(WIN32_OBJ) $(WIN32_ASM_OBJ) $(DOS_OBJ) $(DOS_ASM_OBJ) $(GUI_OBJ)
+
+.PHONY: all clean check-deps legacy tcc tcc-clean minimal
 
 all: check-deps $(BUILD)/boot.efi $(BUILD)/kernel.elf
 	@echo ""
 	@echo "Built: $(BUILD)/boot.efi + $(BUILD)/kernel.elf"
+
+minimal: check-deps $(BUILD)/boot.efi $(BUILD)/kernel-minimal.elf
+	@echo ""
+	@echo "Built MINIMAL: $(BUILD)/boot.efi + $(BUILD)/kernel-minimal.elf"
+	@echo "Copy to kernel.elf: cp $(BUILD)/kernel-minimal.elf $(BUILD)/kernel.elf"
+
+$(BUILD)/kernel-minimal.elf: $(ALL_MIN_OBJ) kernel.ld
+	$(LD) $(KLDFLAGS) -o $@ $(filter-out kernel.ld,$^)
+	@echo "Built: $@ ($$(stat -c%s $@) bytes) [MINIMAL — no new subsystems]"
 
 check-deps:
 	@test -f $(EFI_CRT) || (echo "ERROR: gnu-efi not installed. Run: sudo apt install gnu-efi" && exit 1)
