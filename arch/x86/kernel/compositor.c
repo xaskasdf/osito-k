@@ -1376,10 +1376,43 @@ void compositor_thread(void)
                     key_ring_head = next;
                 }
 
-                /* Terminal keyboard input is handled by PS/2 → kb_process_scancode
-                 * → kb_push (keyboard.c). The compositor does NOT re-route HID
-                 * events to kb_push — that caused double input when both PS/2
-                 * and USB HID keyboards are active (QEMU emulates both). */
+                /* Terminal keyboard routing:
+                 * PS/2 → kb_process_scancode → kb_push handles most cases.
+                 * BUT: when kbd_captured is false AND the terminal is focused,
+                 * xHCI HID events also need routing to kb_push because xHCI
+                 * skips direct kb_push when compositor is running.
+                 * Only route if the event came from HID range (sc < 0xE0 = real keys,
+                 * 0xE0+ = modifiers already handled above). */
+                if (!has_fullscreen && type == 1 && focused_demo_idx == 0) {
+                    int term_count2;
+                    gui_win_desc_t *dw_kb2 = gui_desktop_get_windows(&term_count2);
+                    bool term_vis = (term_count2 > 0 && !dw_kb2[0].hidden);
+                    /* Only route HID scancodes (0x04-0x53), not PS/2 (which are
+                     * already handled by kb_process_scancode in keyboard.c) */
+                    if (term_vis && sc >= 0x04 && sc <= 0x53) {
+                        extern void kb_push(char c);
+                        extern void kb_push_esc(const char *seq);
+                        extern const char hid_normal[];
+                        extern const char hid_shifted[];
+                        switch (sc) {
+                        case 0x28: kb_push('\n');  break; /* Enter */
+                        case 0x2A: kb_push('\b');  break; /* Backspace */
+                        case 0x2B: kb_push('\t');  break; /* Tab */
+                        case 0x2C: kb_push(' ');   break; /* Space */
+                        case 0x4F: kb_push_esc("C"); break; /* Right */
+                        case 0x50: kb_push_esc("D"); break; /* Left */
+                        case 0x51: kb_push_esc("B"); break; /* Down */
+                        case 0x52: kb_push_esc("A"); break; /* Up */
+                        default:
+                            if (sc < 0x54) {
+                                char c = comp_shift_held ? hid_shifted[sc] : hid_normal[sc];
+                                if (comp_ctrl_held && c >= 'a' && c <= 'z') c = c - 'a' + 1;
+                                if (c) kb_push(c);
+                            }
+                            break;
+                        }
+                    }
+                }
             }
         }
 

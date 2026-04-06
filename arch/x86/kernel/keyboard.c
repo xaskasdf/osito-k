@@ -227,9 +227,11 @@ void keyboard_irq(void)
         input_post_key(sc & 0x7F, !(sc & 0x80), false);
     }
     /* Process PS/2 scancode → ASCII → kb_buf for the shell.
-     * Skip when a graphical process has captured the keyboard
-     * (game mode: keys go only via input_events, not kb_buf). */
-    if (!g_keyboard_captured)
+     * Skip when compositor is running (compositor handles HID→kb_push routing
+     * from the input_events ring to avoid double input with PS/2+USB).
+     * Also skip when a graphical process has captured the keyboard. */
+    if (!g_keyboard_captured &&
+        !(compositor_is_running && compositor_is_running()))
         kb_process_scancode(sc);
 }
 
