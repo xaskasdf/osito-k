@@ -382,10 +382,13 @@ void smp_ap_entry(uint32_t cpu_index)
         /* Enable LAPIC with spurious vector 0xFF */
         apic_write_reg(apic, APIC_SVR, APIC_SVR_ENABLE | 0xFF);
 
-        /* Start APIC timer — same config as BSP (periodic, 100Hz, vector 32) */
+        /* Start APIC timer — use BSP-calibrated init count for accurate 100Hz */
+        extern uint32_t idt_get_apic_timer_init(void);
+        uint32_t timer_init = idt_get_apic_timer_init();
+        if (timer_init == 0) timer_init = 625000;  /* fallback */
         apic_write_reg(apic, 0x3E0, 0x03);    /* Divide by 16 */
         apic_write_reg(apic, 0x320, 0x20020);  /* Periodic, vector 32 */
-        apic_write_reg(apic, 0x380, 625000);   /* Initial count (~100Hz) */
+        apic_write_reg(apic, 0x380, timer_init);
     }
 
     /* Mark CPU as online */

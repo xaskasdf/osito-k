@@ -376,6 +376,7 @@ static void tss_init(void)
 
 static volatile uint64_t tick_count;
 static bool apic_enabled;
+static uint32_t apic_timer_init_saved;
 
 uint64_t idt_get_ticks(void) { return tick_count; }
 
@@ -1668,6 +1669,7 @@ static void apic_init(void)
     /* Re-enable periodic timer with calibrated count */
     apic_write(APIC_LVT_TIMER, APIC_TIMER_PERIODIC | 32);
     apic_write(APIC_TIMER_INIT, init_count);
+    apic_timer_init_saved = init_count;
 
     apic_enabled = true;
 
@@ -1675,6 +1677,8 @@ static void apic_init(void)
     serial_putdec(init_count);
     serial_puts(" (~100 Hz)\n");
 }
+
+uint32_t idt_get_apic_timer_init(void) { return apic_timer_init_saved; }
 
 /* ── IDT init (public API) ───────────────────────────────────── */
 
