@@ -112,17 +112,36 @@ kernel/            main.c, serial.c, framebuffer.c, pci.c, memory.c, heap.c
                    shell.c — 19+ builtins (incl. build, kexec)
                    kexec_tramp.S — kexec trampoline (segment copy + jump)
                    shm.c, compositor.c, display.c, input_events.c, memcompress.c
+                   dhcp.c — DHCP client (discover/offer/request/ack + renewal)
+                   ntp.c — NTP time sync (pool.ntp.org)
+                   ipv6.c — IPv6 link-local + ICMPv6
+                   mdns.c — mDNS responder (osito-k.local)
+                   kmod.c — Kernel module loader (.ko ELF64)
+                   wayland.c — Wayland display protocol stub
 drivers/           nvme.c — NVMe read/write
                    gpu.c, gsp.c — NVIDIA GPU + GSP Falcon (Phases 1-10)
                    sass.c, gmmu.c — SASS kernels + GPU MMU
                    gpu_tensor.c, gpu_inference.c — GPU compute dispatch
                    gpu_display.c — GPU display engine
                    ahci.c, ccp.c, xhci.c — SATA, AMD TRNG, USB 3.x
+                   hda.c — Intel HD Audio (PCM playback, codec init)
+                   virtio.c — Virtio PCI transport (split virtqueue)
 win32/             pe.c, winexec.c — PE32 loader + execution
                    compat32.c, int2e_stub.S — 32→64 mode switching (INT 0x2E)
                    dllloader.c — 15 DLL shims (kernel32, msvcrt, user32, etc.)
                    ntsyscall.c, handle.c — NT syscalls + handle table
 fs/                ositofs2.c, gpt.c, gguf.c — OsitoFS v2 (R/W + block reclaim) + GPT + GGUF
+                   fat32.c — FAT32 R/W (LFN, create, delete, cluster alloc)
+                   tmpfs.c — RAM filesystem (/tmp, 128 files, 64MB)
+                   ext2.c — ext2/ext3/ext4 read-only (extents, indirect blocks)
+                   iso9660.c — ISO 9660 CD-ROM read-only
+                   exfat.c — exFAT read-only (USB/SD >32GB)
+                   ntfs.c — NTFS read-only (MFT, run lists, B+ tree index)
+                   udf.c — UDF read-only (DVD/Blu-ray)
+                   squashfs.c — SquashFS read-only (zlib decompression)
+                   hfsplus.c — HFS+ read-only (catalog B-tree, big-endian)
+                   btrfs.c — Btrfs read-only (chunk tree, extent data)
+                   apfs.c — APFS read-only (container + volume superblock)
 libc/              crt.c, syscall.S, tcclib.c, math.c — CRT + extended libc
                    qjs_main.c, qjs_headers/ — QuickJS REPL
                    ositok.h — single-header libc for self-compiled programs
@@ -133,10 +152,10 @@ test/              various test programs + qjs.elf
 ```
 gui/               Cross-architecture graphical desktop (elementaryOS-inspired)
                    gui.h — shared header: surface_t, color palette, layout constants
-                   gui_draw.c — primitives: rect, alpha blend, gradient, rounded rect, circle
-                   gui_text.c — 8x16 bitmap font (shared) + text rendering
-                   gui_panel.c — top panel (Wingpanel style)
-                   gui_dock.c — bottom dock (Plank style) with icon placeholders
+                   gui_draw.c — primitives: rect, alpha blend, gradient, rounded rect, circle, multi-layer shadows
+                   gui_text.c — 8x16 bitmap font + UTF-8 Unicode + AA text + Latin-1 Supplement (96 glyphs)
+                   gui_panel.c — top panel (Wingpanel style) with NTP-synced clock
+                   gui_dock.c — bottom dock (Plank style) with hover effects + active indicators
                    gui_window.c — window decorations: title bar, traffic-light buttons, shadow
                    gui_desktop.c — orchestrator: gradient bg + panel + demo windows + dock
 ```
@@ -225,13 +244,25 @@ arch/arm/          SM8350 (ROG Phone 5) bare-metal port — see docs/aarch64-det
 | X-SELF  | Self-hosting: TCC builds kernel.elf in-OS + kexec boots it | Done |
 | X-QOS   | QoS priority scheduler (5 classes) | Done |
 | X-CCP   | AMD CCP TRNG driver | Done |
-| X-AHCI  | SATA AHCI driver | WIP |
+| X-AHCI  | SATA AHCI driver | Done |
 | X-XHCI  | xHCI USB 3.x driver + HID keyboard/mouse | Done |
-| X-RETINA| Display pipeline (compositor, shared memory, GUI desktop) | WIP |
+| X-RETINA| Display pipeline (GPU page flip, compositor, animations, AA text) | Done |
 | X-WIN32 | Windows PE32 compat layer (15 DLL shims) | WIP |
 | X-PGTBL | Per-process page tables (CR3 switch on context switch) | Done |
 | X-W32THR| Win32 real threading (CreateThread → sched_spawn) | Done |
 | X-OSFS3 | OsitoFS v2 overhaul (9 tools, block_size, timestamps, hash, CRC, fsck) | Done |
+| X-DHCP  | DHCP client (auto IP, gateway, DNS, lease renewal) | Done |
+| X-NTP   | NTP time sync (pool.ntp.org, UTC offset, panel clock) | Done |
+| X-TCP2  | TCP fast retransmit + timeout backoff (RFC 5681) | Done |
+| X-IPV6  | IPv6 link-local + ICMPv6 + neighbor discovery | Done |
+| X-MDNS  | mDNS responder (osito-k.local on UDP 5353) | Done |
+| X-FS12  | 12 filesystems: FAT32 R/W, tmpfs, ext2/3/4, ISO9660, exFAT, NTFS, UDF, SquashFS, HFS+, Btrfs, APFS | Done |
+| X-VFS2  | VFS mount table (/tmp, /fat, /ext2, /iso) + syscall dispatch | Done |
+| X-VIRTIO| Virtio PCI transport (split virtqueue, device negotiation) | Done |
+| X-KMOD  | Kernel module loader (.ko ELF64, symbol resolution, relocations) | Done |
+| X-WL    | Wayland display protocol stub (surface create/commit/destroy) | Done |
+| X-AUDIO | HDA audio /dev/dsp + beep command | Done |
+| X-DOCKER| Dockerfile + Firecracker microVM containerization | Done |
 | **Phase 0** | **Kernel/bootloader separation** (boot.efi + kernel.elf) | **Done** |
 | **Phase 1** | **TCC cross-compiles kernel from host** | **Done** |
 | **Phase 2** | **TCC compiles kernel inside OsitoK** (62 .c → 733KB ELF) | **Done** |
@@ -245,6 +276,7 @@ arch/arm/          SM8350 (ROG Phone 5) bare-metal port — see docs/aarch64-det
 > Kernel/bootloader separation + self-compiling road: see [docs/kernel-separation.md](docs/kernel-separation.md)
 > Reference material (WRK, NT, DOS source): see [docs/reference-material.md](docs/reference-material.md)
 > OsitoFS v2 host tools (9 tools): see `tools/ositofs/`
+> Filesystem roadmap (12 current + 15 planned): see [docs/filesystem-roadmap.md](docs/filesystem-roadmap.md)
 
 **Tier 8: Hardware Boot** — Boot OsitoK on real hardware (AMD Ryzen 7 5800X + RTX 3090).
 
