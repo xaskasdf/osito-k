@@ -2049,10 +2049,7 @@ uint64_t compat32_dispatch(uint32_t thunk_idx, uint32_t *stack_args)
         if (snap) {
             volatile uint32_t *live = (volatile uint32_t *)(uintptr_t)IAT_BASE;
             for (uint32_t i = 0; i < snap_count; i++) {
-                /* Only restore if: original was DLL code, now is heap */
-                if (live[i] != snap[i] &&
-                    snap[i] >= 0x10000000 && snap[i] < 0x20000000 &&
-                    live[i] >= 0x40000000 && live[i] < 0x80000000) {
+                if (live[i] != snap[i] && snap[i] != 0) {
                     static int restore_log_count = 0;
                     if (restore_log_count < 20) {
                         serial_puts("[IAT-RESTORE] [");
