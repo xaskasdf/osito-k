@@ -964,6 +964,20 @@ static void process_mouse_input(void)
 
 /* Return the pixel dimensions of the Terminal window content area.
  * Called from shell.c to size the shm surface before fb_redirect(). */
+/* Get dimensions of a window by its SHM handle */
+uint32_t compositor_get_window_dims(uint32_t shm_handle,
+                                    uint16_t *out_w, uint16_t *out_h)
+{
+    for (int i = 0; i < MAX_WINDOWS; i++) {
+        if ((windows[i].flags & WND_ACTIVE) && windows[i].shm_handle == shm_handle) {
+            if (out_w) *out_w = windows[i].width;
+            if (out_h) *out_h = windows[i].height;
+            return 1;
+        }
+    }
+    return 0;
+}
+
 void compositor_get_terminal_dims(uint32_t *tw, uint32_t *th)
 {
     int count;

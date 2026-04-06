@@ -266,41 +266,93 @@ void shm_flush_surface(uint32_t handle)
     shm_region_t *r = shm_find(handle);
     if (!r || !r->base) return;
 
-    uint32_t *back = fb_get_base();
-    if (back) {
-        uint32_t *src = (uint32_t *)r->base;
-        uint32_t dw = fb_get_width();
-        uint32_t dh = fb_get_height();
-        uint32_t pitch = fb_get_pitch();
-        
-        int scale = 1;
-        if (dw >= 640 && dh >= 400) scale = 2;
-        if (dw >= 960 && dh >= 600) scale = 3;
+    /* Get the display back buffer (from display.c, not raw GOP) */
+    extern uint32_t *display_get_back_buffer(void);
+    extern uint32_t  display_get_width(void);
+    extern uint32_t  display_get_height(void);
+    extern uint32_t  display_get_pitch(void);
+    extern void      display_mark_dirty(void);
 
-        int sw = 320;
-        int sh = 200;
-        
-        int off_x = (dw - (sw * scale)) / 2;
-        int off_y = (dh - (sh * scale)) / 2;
+    uint32_t *back = display_get_back_buffer();
+    if (!back) return;
 
-        for (int y = 0; y < sh; y++) {
-            for (int x = 0; x < sw; x++) {
-                uint32_t pixel = src[y * sw + x];
-                for (int sy = 0; sy < scale; sy++) {
-                    for (int sx = 0; sx < scale; sx++) {
-                        int dy = off_y + y * scale + sy;
-                        int dx = off_x + x * scale + sx;
-                        if (dx >= 0 && (uint32_t)dx < dw && dy >= 0 && (uint32_t)dy < dh) {
-                            back[dy * pitch + dx] = pixel;
-                        }
-                    }
+    uint32_t *src = (uint32_t *)r->base;
+    uint32_t dw = display_get_width();
+    uint32_t dh = display_get_height();
+    uint32_t dp = display_get_pitch();
+
+    /* Derive source dimensions from SHM region size (ARGB = 4 bytes/pixel).
+     * Try to find matching compositor window for exact width; fallback to
+     * square root approximation for common resolutions. */
+    uint32_t total_pixels = (uint32_t)(r->size / 4);
+    uint32_t sw = 0, sh = 0;
+
+    /* Check compositor window for exact dimensions */
+    extern uint32_t compositor_get_window_dims(uint32_t shm_handle,
+                                               uint16_t *out_w, uint16_t *out_h)
+                                               __attribute__((weak));
+    if (compositor_get_window_dims) {
+        uint16_t cw, ch;
+        if (compositor_get_window_dims(handle, &cw, &ch)) {
+            sw = cw; sh = ch;
+        }
+    }
+
+    /* Fallback: common resolutions */
+    if (sw == 0 || sh == 0) {
+        if      (total_pixels == 320 * 200)  { sw = 320; sh = 200; }
+        else if (total_pixels == 320 * 240)  { sw = 320; sh = 240; }
+        else if (total_pixels == 640 * 400)  { sw = 640; sh = 400; }
+        else if (total_pixels == 640 * 480)  { sw = 640; sh = 480; }
+        else if (total_pixels == 800 * 600)  { sw = 800; sh = 600; }
+        else if (total_pixels == 1024 * 768) { sw = 1024; sh = 768; }
+        else if (total_pixels == 1280 * 720) { sw = 1280; sh = 720; }
+        else if (total_pixels == 1920 * 1080){ sw = 1920; sh = 1080; }
+        else {
+            /* Best guess: 4:3 aspect ratio */
+            for (sw = 320; sw <= 1920; sw += 16) {
+                if (total_pixels % sw == 0) {
+                    sh = total_pixels / sw;
+                    if (sh >= 200 && sh <= 1200) break;
                 }
             }
+            if (sh == 0) { sw = 320; sh = 200; }  /* Ultimate fallback */
         }
-        
-        extern void fb_flush_all(void);
-        fb_flush_all();
     }
+
+    /* Calculate integer scale factor */
+    uint32_t scx = dw / sw;
+    uint32_t scy = dh / sh;
+    uint32_t scale = (scx < scy) ? scx : scy;
+    if (scale == 0) scale = 1;
+
+    uint32_t out_w = sw * scale;
+    uint32_t out_h = sh * scale;
+    uint32_t off_x = (dw - out_w) / 2;
+    uint32_t off_y = (dh - out_h) / 2;
+
+    /* Clear letterbox borders */
+    if (off_x > 0 || off_y > 0)
+        memset(back, 0, (uint64_t)dp * dh * 4);
+
+    /* Scale-blit with row duplication (same algorithm as compositor) */
+    for (uint32_t y = 0; y < sh; y++) {
+        const uint32_t *row_src = src + y * sw;
+        uint32_t *row_dst = back + (off_y + y * scale) * dp + off_x;
+        /* Expand source row horizontally */
+        for (uint32_t x = 0; x < sw; x++) {
+            uint32_t px = row_src[x];
+            uint32_t base = x * scale;
+            for (uint32_t sx = 0; sx < scale; sx++)
+                row_dst[base + sx] = px;
+        }
+        /* Duplicate expanded row vertically */
+        for (uint32_t sy = 1; sy < scale; sy++)
+            memcpy(back + (off_y + y * scale + sy) * dp + off_x,
+                   row_dst, out_w * 4);
+    }
+
+    display_mark_dirty();
 }
 
 /* ── Initialize ──────────────────────────────────────────────── */
