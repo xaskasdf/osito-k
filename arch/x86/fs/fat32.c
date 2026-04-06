@@ -434,3 +434,209 @@ int fat32_read_file(const char *name, uint64_t offset, void *buf, uint64_t len)
     kfree(cbuf);
     return (int)(len - remaining);
 }
+
+/* ── Write Support ───────────────────────────────────────────── */
+
+extern int nvme_write(uint64_t lba, uint32_t count, const void *buf);
+extern int nvme_flush(void);
+
+static int fat32_write_sectors(uint64_t lba, uint32_t count, const void *buf)
+{
+    return nvme_write(fat.part_lba + lba, count, buf);
+}
+
+/* Write FAT entry for a cluster */
+static int fat32_set_cluster(uint32_t cluster, uint32_t value)
+{
+    uint32_t fat_offset = cluster * 4;
+    uint32_t fat_sector = fat.fat_lba + (fat_offset / fat.bytes_per_sector);
+    uint32_t entry_offset = fat_offset % fat.bytes_per_sector;
+
+    uint8_t buf[512];
+    if (fat32_read_sectors(fat_sector - fat.part_lba, 1, buf) < 0) return -1;
+
+    /* Preserve upper 4 bits */
+    uint32_t *entry = (uint32_t *)(buf + entry_offset);
+    *entry = (*entry & 0xF0000000) | (value & 0x0FFFFFFF);
+
+    return fat32_write_sectors(fat_sector - fat.part_lba, 1, buf);
+}
+
+/* Find a free cluster in the FAT */
+static uint32_t fat32_alloc_cluster(void)
+{
+    for (uint32_t c = 2; c < fat.total_clusters + 2; c++) {
+        uint32_t val = fat32_next_cluster(c);
+        if (val == FAT32_FREE) {
+            fat32_set_cluster(c, 0x0FFFFFFF);  /* Mark as end-of-chain */
+            return c;
+        }
+    }
+    return 0;  /* No free clusters */
+}
+
+/* Create a new file in root directory. Returns 0 on success. */
+int fat32_create(const char *name, const void *data, uint32_t size)
+{
+    if (!fat.mounted) return -1;
+
+    /* Check if file already exists */
+    if (fat32_find(name, NULL, NULL) == 0) {
+        serial_puts("[FAT32] File already exists: ");
+        serial_puts(name);
+        serial_puts("\n");
+        return -1;
+    }
+
+    /* Allocate clusters for the data */
+    uint32_t clusters_needed = (size + fat.cluster_size - 1) / fat.cluster_size;
+    if (clusters_needed == 0) clusters_needed = 1;
+
+    uint32_t first_cluster = 0, prev_cluster = 0;
+    for (uint32_t i = 0; i < clusters_needed; i++) {
+        uint32_t c = fat32_alloc_cluster();
+        if (c == 0) {
+            serial_puts("[FAT32] Out of space\n");
+            return -1;
+        }
+        if (i == 0) first_cluster = c;
+        if (prev_cluster) fat32_set_cluster(prev_cluster, c);
+        prev_cluster = c;
+    }
+
+    /* Write data to allocated clusters */
+    const uint8_t *src = (const uint8_t *)data;
+    uint32_t remaining = size;
+    uint32_t cluster = first_cluster;
+    uint8_t *cbuf = (uint8_t *)kmalloc(fat.cluster_size);
+    if (!cbuf) return -1;
+
+    while (remaining > 0 && cluster >= 2 && cluster < FAT32_EOC) {
+        uint32_t chunk = remaining < fat.cluster_size ? remaining : fat.cluster_size;
+        memset(cbuf, 0, fat.cluster_size);
+        memcpy(cbuf, src, chunk);
+        uint64_t lba = cluster_to_lba(cluster);
+        fat32_write_sectors(lba - fat.part_lba, fat.sectors_per_cluster, cbuf);
+        src += chunk;
+        remaining -= chunk;
+        cluster = fat32_next_cluster(cluster);
+    }
+    kfree(cbuf);
+
+    /* Add directory entry in root directory */
+    cbuf = (uint8_t *)kmalloc(fat.cluster_size);
+    if (!cbuf) return -1;
+
+    cluster = fat.root_cluster;
+    while (cluster >= 2 && cluster < FAT32_EOC) {
+        uint64_t lba = cluster_to_lba(cluster);
+        if (fat32_read_sectors(lba - fat.part_lba, fat.sectors_per_cluster, cbuf) < 0)
+            break;
+
+        uint32_t entries = fat.cluster_size / 32;
+        for (uint32_t i = 0; i < entries; i++) {
+            fat32_dirent_t *d = (fat32_dirent_t *)(cbuf + i * 32);
+            if (d->name[0] == 0x00 || (uint8_t)d->name[0] == 0xE5) {
+                /* Free slot — create 8.3 entry */
+                memset(d, 0, 32);
+                /* Build 8.3 name (uppercase, space-padded) */
+                int ni = 0, ext_start = -1;
+                for (int j = 0; name[j] && j < 12; j++) {
+                    if (name[j] == '.') { ext_start = j + 1; break; }
+                }
+                for (int j = 0; j < 8; j++) {
+                    if (j < (ext_start > 0 ? ext_start - 1 : 12) && name[j] && name[j] != '.') {
+                        char c = name[j];
+                        if (c >= 'a' && c <= 'z') c -= 32;
+                        d->name[ni++] = c;
+                    } else {
+                        d->name[ni++] = ' ';
+                    }
+                }
+                ni = 8;
+                if (ext_start > 0) {
+                    for (int j = 0; j < 3; j++) {
+                        if (name[ext_start + j]) {
+                            char c = name[ext_start + j];
+                            if (c >= 'a' && c <= 'z') c -= 32;
+                            d->name[ni++] = c;
+                        } else {
+                            d->name[ni++] = ' ';
+                        }
+                    }
+                } else {
+                    d->name[8] = ' '; d->name[9] = ' '; d->name[10] = ' ';
+                }
+                d->attr = FAT_ATTR_ARCHIVE;
+                d->cluster_hi = (uint16_t)(first_cluster >> 16);
+                d->cluster_lo = (uint16_t)(first_cluster & 0xFFFF);
+                d->size = size;
+
+                /* Write back directory cluster */
+                fat32_write_sectors(lba - fat.part_lba, fat.sectors_per_cluster, cbuf);
+                kfree(cbuf);
+                nvme_flush();
+
+                serial_puts("[FAT32] Created: ");
+                serial_puts(name);
+                serial_puts(" (");
+                serial_putdec(size);
+                serial_puts(" bytes)\n");
+                return 0;
+            }
+        }
+        cluster = fat32_next_cluster(cluster);
+    }
+
+    kfree(cbuf);
+    serial_puts("[FAT32] No free directory entries\n");
+    return -1;
+}
+
+/* Delete a file from root directory */
+int fat32_delete(const char *name)
+{
+    if (!fat.mounted) return -1;
+
+    uint32_t file_cluster;
+    if (fat32_find(name, &file_cluster, NULL) < 0) return -1;
+
+    /* Free cluster chain */
+    uint32_t cluster = file_cluster;
+    while (cluster >= 2 && cluster < FAT32_EOC) {
+        uint32_t next = fat32_next_cluster(cluster);
+        fat32_set_cluster(cluster, FAT32_FREE);
+        cluster = next;
+    }
+
+    /* Mark directory entry as deleted (0xE5) */
+    uint8_t *cbuf = (uint8_t *)kmalloc(fat.cluster_size);
+    if (!cbuf) return -1;
+
+    cluster = fat.root_cluster;
+    while (cluster >= 2 && cluster < FAT32_EOC) {
+        uint64_t lba = cluster_to_lba(cluster);
+        if (fat32_read_sectors(lba - fat.part_lba, fat.sectors_per_cluster, cbuf) < 0)
+            break;
+
+        uint32_t entries = fat.cluster_size / 32;
+        for (uint32_t i = 0; i < entries; i++) {
+            fat32_dirent_t *d = (fat32_dirent_t *)(cbuf + i * 32);
+            uint32_t fc = ((uint32_t)d->cluster_hi << 16) | d->cluster_lo;
+            if (d->name[0] != 0x00 && (uint8_t)d->name[0] != 0xE5 && fc == file_cluster) {
+                d->name[0] = (char)0xE5;  /* Mark deleted */
+                fat32_write_sectors(lba - fat.part_lba, fat.sectors_per_cluster, cbuf);
+                kfree(cbuf);
+                nvme_flush();
+                serial_puts("[FAT32] Deleted: ");
+                serial_puts(name);
+                serial_puts("\n");
+                return 0;
+            }
+        }
+        cluster = fat32_next_cluster(cluster);
+    }
+
+    kfree(cbuf);
+    return -1;
+}
