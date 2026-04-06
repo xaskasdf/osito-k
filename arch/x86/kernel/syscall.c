@@ -902,13 +902,63 @@ static int64_t sys_open(uint64_t path_addr, uint64_t flags, uint64_t mode)
         int proc_id = -1;
         if (strcmp(entry, "maps") == 0) proc_id = PROC_MAPS;
         else if (strcmp(entry, "status") == 0) proc_id = PROC_STATUS;
+        /* Global /proc entries (strip leading /proc/) */
+        else if (strcmp(path + 6, "cpuinfo") == 0 ||
+                 strcmp(path + 6, "meminfo") == 0 ||
+                 strcmp(path + 6, "uptime") == 0 ||
+                 strcmp(path + 6, "mounts") == 0 ||
+                 strcmp(path + 6, "version") == 0 ||
+                 strcmp(path + 6, "filesystems") == 0)
+            proc_id = 100;  /* Generic procfs */
         else return -ENOENT;
 
         /* Generate content on open */
         if (proc_id == PROC_MAPS)
             proc_buf_len = proc_gen_maps(proc_buf, PROC_BUF_SIZE);
-        else
+        else if (proc_id == PROC_STATUS)
             proc_buf_len = proc_gen_status(proc_buf, PROC_BUF_SIZE);
+        else {
+            /* Generate global /proc entries */
+            int p = 0;
+            const char *name = path + 6;
+            extern uint64_t mem_get_free(void);
+            extern uint64_t mem_get_total(void);
+            extern uint64_t mem_get_used(void);
+            extern uint32_t ntp_get_utc(void) __attribute__((weak));
+
+            /* Helper: append decimal to proc_buf */
+            #define PBUF_DEC(v) do { \
+                char _t[20]; int _n = 0; uint64_t _v = (v); \
+                if (_v == 0) { if (p < PROC_BUF_SIZE-1) proc_buf[p++] = '0'; } \
+                else { while (_v) { _t[_n++] = '0' + _v % 10; _v /= 10; } \
+                       for (int _i = _n-1; _i >= 0 && p < PROC_BUF_SIZE-1; _i--) \
+                           proc_buf[p++] = _t[_i]; } \
+            } while(0)
+            #define PBUF_STR(s) do { const char *_s = (s); \
+                while (*_s && p < PROC_BUF_SIZE-1) proc_buf[p++] = *_s++; } while(0)
+
+            if (strcmp(name, "cpuinfo") == 0) {
+                PBUF_STR("processor\t: 0\nvendor_id\t: OsitoK\nmodel name\t: OsitoK Bare-Metal x86_64\ncpu MHz\t\t: 3000\n\n");
+            } else if (strcmp(name, "meminfo") == 0) {
+                PBUF_STR("MemTotal:    "); PBUF_DEC(mem_get_total()/1024); PBUF_STR(" kB\n");
+                PBUF_STR("MemFree:     "); PBUF_DEC(mem_get_free()/1024); PBUF_STR(" kB\n");
+                PBUF_STR("MemAvailable: "); PBUF_DEC(mem_get_free()/1024); PBUF_STR(" kB\n");
+            } else if (strcmp(name, "uptime") == 0) {
+                PBUF_DEC(idt_get_ticks()/100); PBUF_STR(".00 ");
+                PBUF_DEC(idt_get_ticks()/100); PBUF_STR(".00\n");
+            } else if (strcmp(name, "mounts") == 0) {
+                const char *s = "ositofs / ositofs rw 0 0\ntmpfs /tmp tmpfs rw 0 0\n";
+                while (*s && p < PROC_BUF_SIZE - 1) proc_buf[p++] = *s++;
+            } else if (strcmp(name, "version") == 0) {
+                const char *s = "OsitoK version 1.0 (bare-metal x86_64)\n";
+                while (*s && p < PROC_BUF_SIZE - 1) proc_buf[p++] = *s++;
+            } else if (strcmp(name, "filesystems") == 0) {
+                const char *s = "\tositofs\n\tfat32\n\ttmpfs\n\text2\n\text4\n\tiso9660\n\texfat\n\tntfs\n\tudf\n\tsquashfs\n\thfsplus\n\tbtrfs\n\tapfs\n";
+                while (*s && p < PROC_BUF_SIZE - 1) proc_buf[p++] = *s++;
+            }
+            proc_buf[p] = '\0';
+            proc_buf_len = p;
+        }
 
         fd_entry_t *f = &fd_table[newfd];
         memset(f, 0, sizeof(*f));
@@ -1240,7 +1290,8 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
     if (!(flags & MAP_ANONYMOUS)) {
         if (fd >= MAX_FDS || !fd_table[fd].open) return -EBADF;
         fd_entry_t *f = &fd_table[fd];
-        if (f->type != FD_TYPE_FILE) return -EBADF;
+        if (f->type != FD_TYPE_FILE && f->type != FD_TYPE_TMPFS &&
+            f->type != FD_TYPE_FAT32) return -EBADF;
 
         uint64_t npages = (length + 4095) / 4096;
 
@@ -1256,13 +1307,20 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
         memset(pages, 0, npages * 4096);
 
         /* Read file data into the allocated pages */
-        uint64_t file_size = osfs2_file_size(f->file);
         uint64_t to_read = length;
-        if (offset + to_read > file_size)
-            to_read = (offset < file_size) ? file_size - offset : 0;
-
-        if (to_read > 0)
-            osfs2_read(f->file, offset, pages, to_read);
+        if (f->type == FD_TYPE_FILE) {
+            uint64_t file_size = osfs2_file_size(f->file);
+            if (offset + to_read > file_size)
+                to_read = (offset < file_size) ? file_size - offset : 0;
+            if (to_read > 0)
+                osfs2_read(f->file, offset, pages, to_read);
+        } else if (f->type == FD_TYPE_TMPFS) {
+            extern int tmpfs_read(void *, uint64_t, void *, uint64_t);
+            tmpfs_read(f->file, offset, pages, to_read);
+        } else if (f->type == FD_TYPE_FAT32) {
+            extern int fat32_read_file(const char *, uint64_t, void *, uint64_t);
+            fat32_read_file((const char *)f->file, offset, pages, to_read);
+        }
 
         vma_table[vi].base   = (uint64_t)pages;
         vma_table[vi].pages  = npages;
