@@ -1101,6 +1101,9 @@ int net_tcp_connect(const uint8_t dst_ip[4], uint16_t dst_port,
     conn->snd_nxt = tcp_isn_counter;
     tcp_isn_counter += 64000;  /* Simple ISN increment */
     conn->snd_una = conn->snd_nxt;
+    conn->rcv_wscale = 3;  /* We advertise window scale 3 (8KB << 3 = 64KB) */
+    conn->snd_wscale = 0;  /* Updated when we receive SYN+ACK with WS option */
+    conn->snd_wnd = TCP_RX_BUF_SIZE;
     conn->state = TCP_SYN_SENT;
     conn->last_activity = idt_get_ticks();
 

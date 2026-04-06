@@ -153,10 +153,97 @@ static int ext2_read_inode(uint32_t ino, ext2_inode_t *out)
     return 0;
 }
 
-/* ── Data block lookup (with indirect support) ───────────────── */
+/* ── ext4 Extent Tree (i_flags & 0x80000) ────────────────────── */
+
+#define EXT4_EXTENTS_FL  0x80000
+
+typedef struct __attribute__((packed)) {
+    uint16_t eh_magic;       /* 0xF30A */
+    uint16_t eh_entries;
+    uint16_t eh_max;
+    uint16_t eh_depth;       /* 0 = leaf, >0 = internal */
+    uint32_t eh_generation;
+} ext4_extent_header_t;
+
+typedef struct __attribute__((packed)) {
+    uint32_t ee_block;       /* First file block covered */
+    uint16_t ee_len;         /* Number of blocks (<=32768) */
+    uint16_t ee_start_hi;
+    uint32_t ee_start_lo;    /* Physical block */
+} ext4_extent_t;
+
+typedef struct __attribute__((packed)) {
+    uint32_t ei_block;       /* File block covered by this index */
+    uint32_t ei_leaf_lo;     /* Physical block of child node */
+    uint16_t ei_leaf_hi;
+    uint16_t ei_unused;
+} ext4_extent_idx_t;
+
+/* Lookup block via extent tree (depth=0: leaf extents in inode) */
+static uint32_t ext4_extent_lookup(const ext2_inode_t *inode, uint32_t idx)
+{
+    const ext4_extent_header_t *hdr = (const ext4_extent_header_t *)inode->i_block;
+    if (hdr->eh_magic != 0xF30A) return 0;
+
+    if (hdr->eh_depth == 0) {
+        /* Leaf: extents immediately follow header */
+        const ext4_extent_t *exts = (const ext4_extent_t *)(hdr + 1);
+        for (int i = 0; i < hdr->eh_entries; i++) {
+            uint32_t start = exts[i].ee_block;
+            uint32_t len   = exts[i].ee_len;
+            if (idx >= start && idx < start + len) {
+                uint64_t phys = ((uint64_t)exts[i].ee_start_hi << 32) | exts[i].ee_start_lo;
+                return (uint32_t)(phys + (idx - start));
+            }
+        }
+        return 0;
+    }
+
+    /* Depth > 0: find the right index, read child block, recurse.
+     * For simplicity, support depth=1 (single level of index nodes). */
+    if (hdr->eh_depth == 1) {
+        const ext4_extent_idx_t *idxs = (const ext4_extent_idx_t *)(hdr + 1);
+        /* Find last index where ei_block <= idx */
+        int best = -1;
+        for (int i = 0; i < hdr->eh_entries; i++) {
+            if (idxs[i].ei_block <= idx) best = i;
+        }
+        if (best < 0) return 0;
+
+        uint64_t child_blk = ((uint64_t)idxs[best].ei_leaf_hi << 32) | idxs[best].ei_leaf_lo;
+        uint8_t *buf = (uint8_t *)kmalloc(e2.block_size);
+        if (!buf) return 0;
+        ext2_read_block((uint32_t)child_blk, buf);
+
+        const ext4_extent_header_t *chdr = (const ext4_extent_header_t *)buf;
+        uint32_t result = 0;
+        if (chdr->eh_magic == 0xF30A && chdr->eh_depth == 0) {
+            const ext4_extent_t *exts = (const ext4_extent_t *)(chdr + 1);
+            for (int i = 0; i < chdr->eh_entries; i++) {
+                uint32_t start = exts[i].ee_block;
+                uint32_t len   = exts[i].ee_len;
+                if (idx >= start && idx < start + len) {
+                    uint64_t phys = ((uint64_t)exts[i].ee_start_hi << 32) | exts[i].ee_start_lo;
+                    result = (uint32_t)(phys + (idx - start));
+                    break;
+                }
+            }
+        }
+        kfree(buf);
+        return result;
+    }
+
+    return 0;  /* Depth > 1 not supported */
+}
+
+/* ── Data block lookup (with indirect + extent support) ──────── */
 
 static uint32_t ext2_get_block(const ext2_inode_t *inode, uint32_t idx)
 {
+    /* ext4 extent tree (inode flag 0x80000) */
+    if (inode->i_flags & EXT4_EXTENTS_FL)
+        return ext4_extent_lookup(inode, idx);
+
     uint32_t ptrs_per_block = e2.block_size / 4;
 
     /* Direct blocks (0-11) */

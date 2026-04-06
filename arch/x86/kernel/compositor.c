@@ -1091,11 +1091,21 @@ static void compositor_render_frame(void)
         info.rtc_min  = (uint8_t)EM_ASM_INT({ return new Date().getMinutes(); });
         info.rtc_sec  = (uint8_t)EM_ASM_INT({ return new Date().getSeconds(); });
 #else
-        /* CMOS RTC (BCD mode, 24h), adjust to GMT-3 */
-        info.rtc_sec  = bcd2bin(cmos_read(0x00));
-        info.rtc_min  = bcd2bin(cmos_read(0x02));
-        { uint8_t raw_h = bcd2bin(cmos_read(0x04));
-          info.rtc_hour = (raw_h + 24 - 3) % 24; }
+        /* Prefer NTP-synced time if available, else CMOS RTC */
+        extern uint32_t ntp_get_utc(void) __attribute__((weak));
+        extern bool     ntp_is_synced(void) __attribute__((weak));
+        if (ntp_is_synced && ntp_is_synced()) {
+            uint32_t utc = ntp_get_utc();
+            info.rtc_sec  = (uint8_t)(utc % 60);
+            info.rtc_min  = (uint8_t)((utc / 60) % 60);
+            info.rtc_hour = (uint8_t)(((utc / 3600) + 24 - 3) % 24);  /* GMT-3 */
+        } else {
+            /* CMOS RTC (BCD mode, 24h), adjust to GMT-3 */
+            info.rtc_sec  = bcd2bin(cmos_read(0x00));
+            info.rtc_min  = bcd2bin(cmos_read(0x02));
+            uint8_t raw_h = bcd2bin(cmos_read(0x04));
+            info.rtc_hour = (raw_h + 24 - 3) % 24;
+        }
 #endif
         gui_panel_set_debug(&info);
     }
