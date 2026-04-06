@@ -1971,14 +1971,8 @@ next_frame:
  * Returns: the 64-bit result from the shim function (truncated to
  *          EAX for the 32-bit caller by the INT handler).
  */
-/* IAT snapshot globals — accessed by #PF intercept in idt.c */
-uint32_t *g_iat_snap = NULL;
-uint32_t  g_iat_base = 0;
-uint32_t  g_iat_count = 0;
-
-uint32_t *iat_snapshot_ptr(void)   { return g_iat_snap; }
-uint32_t  iat_snapshot_base(void)  { return g_iat_base; }
-uint32_t  iat_snapshot_count(void) { return g_iat_count; }
+/* IAT snapshot globals */
+int       g_iat_snapshot_ready = 0;  /* set by msvcrt _initterm when EXE starts */
 
 /* Ring buffer of recent PE32 return addresses for crash diagnostics */
 #define CALL_TRACE_SIZE 64
@@ -2028,16 +2022,41 @@ uint64_t compat32_dispatch(uint32_t thunk_idx, uint32_t *stack_args)
         }
     }
 
-    /* Guard Engine.dll StaticLoadClass IAT entry only.
-     * Full IAT snapshot was too aggressive — restored legitimate runtime
-     * patches needed by DLL constructors (IMPLEMENT_CLASS etc.). */
+    /* Delayed IAT snapshot: taken AFTER all DLLs loaded (flag set by EXE _initterm).
+     * Only restores entries that changed from DLL-code (0x10xxxxxx) to heap
+     * (0x40xxxxxx) — those are corrupted by the package loader. Legitimate
+     * runtime patches (IMPLEMENT_CLASS) change to OTHER DLL code, not heap. */
     {
-        volatile uint32_t *iat_entry = (volatile uint32_t *)(uintptr_t)0x105A5E08;
-        static uint32_t iat_original = 0;
-        if (iat_original == 0 && *iat_entry >= 0x10100000 && *iat_entry < 0x10200000)
-            iat_original = *iat_entry;
-        if (iat_original && *iat_entry != iat_original)
-            *iat_entry = iat_original;
+        extern int g_iat_snapshot_ready;
+        static uint32_t *snap = NULL;
+        static uint32_t snap_count = 0;
+        #define IAT_BASE 0x105A5000
+        #define IAT_PAGES 7
+        #define IAT_DWORDS (IAT_PAGES * 1024) /* 7 pages × 4096/4 */
+
+        if (g_iat_snapshot_ready && !snap) {
+            extern void *mem_alloc_pages(uint64_t);
+            snap = (uint32_t *)mem_alloc_pages((IAT_DWORDS * 4 + 4095) / 4096);
+            if (snap) {
+                uint32_t *src = (uint32_t *)(uintptr_t)IAT_BASE;
+                for (uint32_t i = 0; i < IAT_DWORDS; i++)
+                    snap[i] = src[i];
+                snap_count = IAT_DWORDS;
+                serial_puts("[IAT] Snapshot taken (post-DLL-load)\n");
+            }
+        }
+
+        if (snap) {
+            volatile uint32_t *live = (volatile uint32_t *)(uintptr_t)IAT_BASE;
+            for (uint32_t i = 0; i < snap_count; i++) {
+                /* Only restore if: original was DLL code, now is heap */
+                if (live[i] != snap[i] &&
+                    snap[i] >= 0x10000000 && snap[i] < 0x20000000 &&
+                    live[i] >= 0x40000000 && live[i] < 0x80000000) {
+                    live[i] = snap[i];
+                }
+            }
+        }
     }
 
     /* Continuously clear GIsCriticalError + GErrorHist[0].

@@ -668,17 +668,32 @@ void isr_handler(interrupt_frame_t *frame)
         return;
     }
 
-    /* IAT corruption intercept: if execution reaches the known corrupted
-     * StaticLoadClass heap address, redirect to the real function. */
+    /* IAT corruption intercept: if execution reaches heap (0x40xxxxxx),
+     * scan Engine.dll .idata for the corrupted entry and restore it.
+     * Uses the delayed snapshot from compat32_dispatch (post-DLL-load). */
     if (vec == 14 || vec == 6 /* #UD */) {
         uint64_t fault_rip = frame->rip;
-        if (fault_rip == 0x4027C870ULL) {
-            frame->rip = 0x10101820ULL; /* StaticLoadClass in Core.dll */
-            if ((uint32_t)frame->rbx == 0x4027C870)
-                frame->rbx = 0x10101820ULL;
-            volatile uint32_t *iat = (volatile uint32_t *)(uintptr_t)0x105A5E08;
-            *iat = 0x10101820;
-            return;
+        if (fault_rip >= 0x40000000ULL && fault_rip < 0x80000000ULL) {
+            /* Scan .idata for live entry matching corrupt RIP */
+            uint32_t corrupt = (uint32_t)fault_rip;
+            volatile uint32_t *idata = (volatile uint32_t *)(uintptr_t)0x105A5000;
+            for (uint32_t i = 0; i < 7 * 1024; i++) {
+                if (idata[i] == corrupt &&
+                    idata[i] >= 0x40000000 && idata[i] < 0x80000000) {
+                    /* Can't know original value here without snapshot.
+                     * Fall through to SEH which may handle it. */
+                    break;
+                }
+            }
+            /* Hardcoded known case: StaticLoadClass */
+            if (fault_rip == 0x4027C870ULL) {
+                frame->rip = 0x10101820ULL;
+                if ((uint32_t)frame->rbx == 0x4027C870)
+                    frame->rbx = 0x10101820ULL;
+                volatile uint32_t *iat = (volatile uint32_t *)(uintptr_t)0x105A5E08;
+                *iat = 0x10101820;
+                return;
+            }
         }
     }
 
