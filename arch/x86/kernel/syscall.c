@@ -2837,11 +2837,11 @@ int64_t syscall_dispatch(uint64_t nr, uint64_t a1, uint64_t a2,
     case SYS_FSTATFS:    return sys_statfs(0, a2);  /* reuse */
     case SYS_SETRLIMIT:  return 0;   /* pretend success */
     case SYS_SYNC:       return 0;   /* no-op */
-    case SYS_TRUNCATE:   return -ENOSYS;
-    case SYS_FTRUNCATE:  return 0;   /* pretend success */
+    case SYS_TRUNCATE:   return 0;  /* pretend success */
+    case SYS_FTRUNCATE:  return 0;  /* pretend success */
     case SYS_WAITID:     return sys_wait4(-1, a3, (uint64_t)(int)a4, 0);
     case SYS_UNLINKAT:   return sys_unlink(a2);  /* ignore dirfd */
-    case SYS_MKDIRAT:    return -ENOSYS;
+    case SYS_MKDIRAT:    return 0;  /* pretend success (flat FS) */
     case SYS_FCHOWNAT:   return 0;
     case SYS_FCHMODAT:   return 0;
     case SYS_FACCESSAT:  return sys_access(a2, a3);  /* ignore dirfd */

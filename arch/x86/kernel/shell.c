@@ -2378,6 +2378,18 @@ static void shell_exec(char *line)
                 }
             }
         }
+    } else if (strcmp(cmd, "beep") == 0) {
+        extern void hda_play_tone(uint32_t freq, uint32_t duration_ms)
+            __attribute__((weak));
+        if (hda_play_tone) {
+            uint32_t freq = 440;
+            uint32_t dur = 500;
+            if (argc > 1) { freq = 0; for (const char *p = argv[1]; *p >= '0' && *p <= '9'; p++) freq = freq * 10 + (*p - '0'); }
+            if (argc > 2) { dur = 0; for (const char *p = argv[2]; *p >= '0' && *p <= '9'; p++) dur = dur * 10 + (*p - '0'); }
+            hda_play_tone(freq, dur);
+        } else {
+            sh_puts("HDA audio not available\n");
+        }
     } else if (strcmp(cmd, "clear") == 0) {
         cmd_clear();
     } else if (strcmp(cmd, "kexec") == 0) {
