@@ -151,6 +151,13 @@ kernel/            main.c, serial.c, framebuffer.c, pci.c, memory.c, heap.c
                    trace.c — Kernel tracepoints (ftrace-like)
                    seccomp.c — Syscall sandboxing
                    workqueue.c — Deferred work execution
+                   rcu.c — Read-Copy-Update (lock-free reads)
+                   slab.c — Slab allocator (kmem_cache)
+                   pci_hotplug.c — PCI device hotplug detection
+                   coredump.c — Crash dump (registers + stack)
+                   lockdep.c — Lock dependency validator
+                   psi.c — Pressure Stall Information
+                   kobject.c — Unified device model tree
 drivers/           nvme.c — NVMe read/write
                    gpu.c, gsp.c — NVIDIA GPU + GSP Falcon (Phases 1-10)
                    sass.c, gmmu.c — SASS kernels + GPU MMU
@@ -339,6 +346,13 @@ arch/arm/          SM8350 (ROG Phone 5) bare-metal port — see docs/aarch64-det
 | X-TRACE | Kernel tracepoints (sched/syscall/irq/net/fs/mm) | Done |
 | X-SECCOMP| Seccomp syscall filtering (strict + BPF filter) | Done |
 | X-WQ    | Workqueue subsystem (deferred + delayed work) | Done |
+| X-RCU   | RCU read-copy-update (lock-free reads, grace periods) | Done |
+| X-SLAB  | Slab allocator (kmem_cache, bitmap-based O(1) alloc) | Done |
+| X-PCIHP | PCI hotplug detection (rescan, add/remove callbacks) | Done |
+| X-CORE  | Kernel coredump (register dump, stack trace, code bytes) | Done |
+| X-LOCKD | Lock dependency validator (deadlock detection) | Done |
+| X-PSI   | Pressure Stall Information (CPU/memory/IO pressure) | Done |
+| X-KOBJ  | Unified device model (kobject tree, sysfs foundation) | Done |
 | **Phase 0** | **Kernel/bootloader separation** (boot.efi + kernel.elf) | **Done** |
 | **Phase 1** | **TCC cross-compiles kernel from host** | **Done** |
 | **Phase 2** | **TCC compiles kernel inside OsitoK** (62 .c → 733KB ELF) | **Done** |
