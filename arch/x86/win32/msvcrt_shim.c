@@ -183,14 +183,6 @@ void WINAPI _initterm(_PVFV *pfbegin, _PVFV *pfend)
     uint32_t *begin32 = (uint32_t *)(ULONG_PTR)pfbegin;
     uint32_t *end32   = (uint32_t *)(ULONG_PTR)pfend;
 
-    /* Signal IAT snapshot: if _initterm is from the EXE (address < 0x10000000),
-     * all DLLs are loaded and their IAT patches are done. Safe to snapshot. */
-    extern int g_iat_snapshot_ready;
-    if ((uint64_t)(ULONG_PTR)begin32 < 0x10000000ULL && !g_iat_snapshot_ready) {
-        g_iat_snapshot_ready = 1;
-        serial_puts("[IAT] Snapshot ready (EXE _initterm)\n");
-    }
-
     serial_puts("[MSVCRT] _initterm: ");
     serial_putdec((uint64_t)(end32 - begin32));
     serial_puts(" entries at 0x");

@@ -30,21 +30,13 @@ extern void kern_longjmp(uint64_t *buf, int val);
 /* ── Global compat32 mode flag ────────────────────────────────── */
 
 int g_compat32_mode = 0;
-uint32_t g_int2e_rsp_depth = 0;
+extern uint32_t g_int2e_rsp_depth; /* defined in int2e_stub.S */
 
 /* ── C++ EH unwind state (set by _CxxThrowException) ────────── */
 uint32_t g_compat32_unwind_eip = 0;
 uint32_t g_compat32_last_stack_arg13 = 0;  /* for CreateWindowExW lpParam workaround */
 uint32_t g_compat32_unwind_esp = 0;
 uint32_t g_compat32_unwind_ebp = 0;
-
-/* ── PE32 callee-saved register preservation ─────────────────── */
-/* int2e_stub saves PE32 EBX/ESI/EDI/EBP here before calling dispatch.
- * After dispatch returns (which may involve callbacks that corrupt
- * the IST1 saved-register area), the stub restores them.
- * 32 slots × 4 regs × 8 bytes = 1024 bytes. */
-uint64_t g_pe32_saved_regs[32 * 4];
-uint32_t g_pe32_save_depth = 0;
 
 /* ── Thunk state ─────────────────────────────────────────────── */
 
@@ -1972,7 +1964,7 @@ next_frame:
  *          EAX for the 32-bit caller by the INT handler).
  */
 /* IAT snapshot globals */
-int       g_iat_snapshot_ready = 0;  /* set by msvcrt _initterm when EXE starts */
+/* g_iat_snapshot_ready removed — all snapshot approaches reverted */
 
 /* Ring buffer of recent PE32 return addresses for crash diagnostics */
 #define CALL_TRACE_SIZE 64
