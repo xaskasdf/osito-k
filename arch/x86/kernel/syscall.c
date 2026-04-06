@@ -252,6 +252,11 @@ static inline void wrmsr(uint32_t msr, uint64_t val) {
 #define SYS_RENAMEAT2   316
 #define SYS_STATX       332
 #define SYS_FACCESSAT2  439
+#define SYS_EPOLL_CREATE1 291
+#define SYS_EPOLL_CTL     233
+#define SYS_EPOLL_WAIT    232
+#define SYS_EPOLL_PWAIT   281
+#define SYS_EVENTFD2      290
 
 /* OsitoK private syscalls (500+) */
 #define SYS_SHM_CREATE      500
@@ -314,7 +319,9 @@ static inline void wrmsr(uint32_t msr, uint64_t val) {
 #define FD_TYPE_TMPFS   6   /* tmpfs file (/tmp/*) */
 #define FD_TYPE_FAT32   7   /* FAT32 file (/fat/*) */
 #define FD_TYPE_EXT2    8   /* ext2 file (/ext2/*) */
-#define FD_TYPE_ISO     9   /* ISO 9660 file (/iso/*) */
+#define FD_TYPE_ISO     9
+#define FD_TYPE_EPOLL   10
+#define FD_TYPE_EVENTFD 11
 
 typedef ssize_t (*fd_write_fn)(const void *buf, size_t count);
 typedef ssize_t (*fd_read_fn)(void *buf, size_t count);
@@ -684,6 +691,15 @@ static int64_t sys_read(uint64_t fd, uint64_t buf, uint64_t count)
         if (ret < 0) return -EFAULT;
         f->offset += count;
         return (int64_t)count;
+    }
+
+    if (f->type == FD_TYPE_EVENTFD) {
+        if (count < 8) return -EINVAL;
+        uint64_t val = f->offset;
+        if (val == 0) return -EAGAIN;  /* Non-blocking: no events */
+        *(uint64_t *)buf = val;
+        f->offset = 0;  /* Reset counter after read */
+        return 8;
     }
 
     if (f->type == FD_TYPE_TMPFS) {
@@ -2559,6 +2575,128 @@ static int64_t sys_chdir(uint64_t path_addr)
     return 0;
 }
 
+/* ── epoll: minimal implementation using poll semantics ─────── */
+
+#define EPOLL_MAX_FDS  32
+
+/* epoll instance: tracks watched FDs */
+typedef struct {
+    int    fds[EPOLL_MAX_FDS];
+    uint32_t events[EPOLL_MAX_FDS];
+    int    count;
+} epoll_state_t;
+
+static epoll_state_t epoll_instances[8];
+static int epoll_count;
+
+static int64_t sys_epoll_create1(uint64_t flags)
+{
+    (void)flags;
+    int newfd = vfs_alloc_fd();
+    if (newfd < 0) return -EMFILE;
+    if (epoll_count >= 8) return -ENOMEM;
+
+    int ep_idx = epoll_count++;
+    memset(&epoll_instances[ep_idx], 0, sizeof(epoll_state_t));
+
+    fd_entry_t *f = &fd_table[newfd];
+    memset(f, 0, sizeof(*f));
+    f->open = true;
+    f->type = FD_TYPE_EPOLL;
+    f->offset = (uint64_t)ep_idx;
+    return newfd;
+}
+
+static int64_t sys_epoll_ctl(uint64_t epfd, uint64_t op,
+                              uint64_t fd, uint64_t event_addr)
+{
+    fd_entry_t *ef = &fd_table[epfd & 0xFF];
+    if (!ef->open || ef->type != FD_TYPE_EPOLL) return -EBADF;
+    epoll_state_t *ep = &epoll_instances[ef->offset];
+
+    if (op == 1 /* EPOLL_CTL_ADD */) {
+        if (ep->count >= EPOLL_MAX_FDS) return -ENOMEM;
+        ep->fds[ep->count] = (int)fd;
+        if (event_addr) ep->events[ep->count] = *(uint32_t *)event_addr;
+        ep->count++;
+    } else if (op == 2 /* EPOLL_CTL_DEL */) {
+        for (int i = 0; i < ep->count; i++) {
+            if (ep->fds[i] == (int)fd) {
+                ep->fds[i] = ep->fds[ep->count - 1];
+                ep->events[i] = ep->events[ep->count - 1];
+                ep->count--;
+                break;
+            }
+        }
+    }
+    return 0;
+}
+
+static int64_t sys_epoll_wait(uint64_t epfd, uint64_t events_addr,
+                               uint64_t maxevents, uint64_t timeout_ms)
+{
+    fd_entry_t *ef = &fd_table[epfd & 0xFF];
+    if (!ef->open || ef->type != FD_TYPE_EPOLL) return -EBADF;
+    epoll_state_t *ep = &epoll_instances[ef->offset];
+
+    /* Simple implementation: check each watched FD for readability.
+     * For pipes/files with data, report EPOLLIN. */
+    struct { uint32_t events; uint64_t data; } __attribute__((packed)) *out =
+        (void *)events_addr;
+    int ready = 0;
+
+    for (int i = 0; i < ep->count && ready < (int)maxevents; i++) {
+        int wfd = ep->fds[i];
+        if (wfd < 0 || wfd >= MAX_FDS) continue;
+        fd_entry_t *wf = &fd_table[wfd];
+        if (!wf->open) continue;
+
+        /* Pipes: check if data available */
+        bool has_data = false;
+        if (wf->type == FD_TYPE_PIPE) {
+            pipe_buf_t *p = (pipe_buf_t *)wf->file;
+            has_data = (p && p->count > 0);
+        } else if (wf->type == FD_TYPE_EVENTFD) {
+            has_data = (wf->offset > 0);  /* eventfd counter > 0 */
+        } else if (wf->type == FD_TYPE_FILE || wf->type == FD_TYPE_TMPFS) {
+            has_data = true;  /* Files always readable */
+        }
+
+        if (has_data) {
+            out[ready].events = 1; /* EPOLLIN */
+            out[ready].data = (uint64_t)wfd;
+            ready++;
+        }
+    }
+
+    /* If no events and timeout > 0, sleep briefly */
+    if (ready == 0 && timeout_ms > 0) {
+        uint64_t end = idt_get_ticks() + (timeout_ms / 10);
+        while (idt_get_ticks() < end) {
+            __asm__ volatile ("hlt");
+            /* Re-check (simplified — full impl would re-scan) */
+        }
+    }
+
+    return (int64_t)ready;
+}
+
+/* ── eventfd: simple counter-based IPC ───────────────────────── */
+
+static int64_t sys_eventfd2(uint64_t initval, uint64_t flags)
+{
+    (void)flags;
+    int newfd = vfs_alloc_fd();
+    if (newfd < 0) return -EMFILE;
+
+    fd_entry_t *f = &fd_table[newfd];
+    memset(f, 0, sizeof(*f));
+    f->open = true;
+    f->type = FD_TYPE_EVENTFD;
+    f->offset = initval;  /* Use offset as the counter */
+    return newfd;
+}
+
 static int64_t sys_fchdir(uint64_t fd)
 {
     (void)fd;
@@ -2863,6 +3001,11 @@ int64_t syscall_dispatch(uint64_t nr, uint64_t a1, uint64_t a2,
     case SYS_FACCESSAT2: return sys_access(a2, a3);
     case SYS_PSELECT6:   return sys_poll(0, 0, 0);
     case SYS_UTIMENSAT:  return 0;   /* pretend success */
+    case SYS_EPOLL_CREATE1: return sys_epoll_create1(a1);
+    case SYS_EPOLL_CTL:     return sys_epoll_ctl(a1, a2, a3, a4);
+    case SYS_EPOLL_WAIT:    return sys_epoll_wait(a1, a2, a3, a4);
+    case SYS_EPOLL_PWAIT:   return sys_epoll_wait(a1, a2, a3, a4);
+    case SYS_EVENTFD2:      return sys_eventfd2(a1, a2);
     case SYS_RENAMEAT2:  return -ENOSYS;
     case SYS_STATX:      return sys_statx(a1, a2, a3, a4, a5);
 

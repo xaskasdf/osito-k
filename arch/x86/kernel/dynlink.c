@@ -1089,3 +1089,39 @@ void dl_init(void)
     serial_putdec(DL_MAX_MODULES);
     serial_puts(" slots)\n");
 }
+
+/* ── DT_INIT / DT_FINI / DT_INIT_ARRAY callbacks ─────────────── */
+
+/* Call module constructors (DT_INIT + DT_INIT_ARRAY) */
+void dl_call_constructors(dl_module_t *m)
+{
+    if (!m || m->inited) return;
+
+    /* DT_INIT */
+    if (m->init_fn) {
+        serial_puts("[DL] Calling DT_INIT for ");
+        serial_puts(m->name);
+        serial_puts("\n");
+        m->init_fn();
+    }
+
+    /* DT_INIT_ARRAY */
+    if (m->defer_init_array && m->defer_init_arraysz) {
+        uint64_t count = m->defer_init_arraysz / 8;
+        void (**fns)(void) = (void (**)(void))m->defer_init_array;
+        for (uint64_t i = 0; i < count; i++) {
+            if (fns[i] && (uint64_t)fns[i] != 0xFFFFFFFFFFFFFFFFULL)
+                fns[i]();
+        }
+    }
+
+    m->inited = true;
+}
+
+/* Call module destructors (DT_FINI) */
+void dl_call_destructors(dl_module_t *m)
+{
+    if (!m) return;
+    if (m->fini_fn)
+        m->fini_fn();
+}
