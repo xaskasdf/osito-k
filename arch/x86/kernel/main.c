@@ -718,6 +718,29 @@ void kernel_entry(boot_info_t *info)
         hda_init(hda_pci->bar[0], hda_pci->bus, hda_pci->dev, hda_pci->func);
     }
 
+    /* ── Step 4b: Export kernel symbols for loadable modules ── */
+    {
+        extern void kmod_register_symbol(const char *name, uint64_t addr);
+        /* Core kernel functions available to .ko modules */
+        kmod_register_symbol("serial_puts", (uint64_t)serial_puts);
+        kmod_register_symbol("serial_putdec", (uint64_t)serial_putdec);
+        kmod_register_symbol("serial_puthex", (uint64_t)serial_puthex);
+        kmod_register_symbol("fb_puts", (uint64_t)fb_puts);
+        kmod_register_symbol("kmalloc", (uint64_t)kmalloc);
+        kmod_register_symbol("kfree", (uint64_t)kfree);
+        extern void *mem_alloc_aligned(uint64_t, uint64_t);
+        kmod_register_symbol("mem_alloc_aligned", (uint64_t)mem_alloc_aligned);
+        kmod_register_symbol("idt_get_ticks", (uint64_t)idt_get_ticks);
+        kmod_register_symbol("memset", (uint64_t)memset);
+        kmod_register_symbol("memcpy", (uint64_t)memcpy);
+        extern int nvme_read(uint64_t, uint32_t, void *);
+        extern int nvme_write(uint64_t, uint32_t, const void *);
+        kmod_register_symbol("nvme_read", (uint64_t)nvme_read);
+        kmod_register_symbol("nvme_write", (uint64_t)nvme_write);
+        kmod_register_symbol("net_poll", (uint64_t)net_poll);
+        serial_puts("[KERN] Kernel symbols exported for modules\n");
+    }
+
     /* ── Step 5: Keyboard + Terminal + Shell ── */
     kb_init();
     term_init();

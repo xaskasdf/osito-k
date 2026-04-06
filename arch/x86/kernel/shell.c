@@ -2390,6 +2390,32 @@ static void shell_exec(char *line)
         } else {
             sh_puts("HDA audio not available\n");
         }
+    } else if (strcmp(cmd, "insmod") == 0) {
+        extern int kmod_load(const char *name, const uint8_t *data, uint64_t len);
+        extern void *osfs2_find(const char *);
+        extern uint64_t osfs2_file_size(void *);
+        extern int osfs2_read(void *, uint64_t, void *, uint64_t);
+        if (argc < 2) { sh_puts("Usage: insmod <module.ko>\n"); }
+        else {
+            void *f = osfs2_find(argv[1]);
+            if (!f) { sh_puts("File not found: "); sh_puts(argv[1]); sh_puts("\n"); }
+            else {
+                uint64_t sz = osfs2_file_size(f);
+                uint8_t *buf = (uint8_t *)kmalloc(sz);
+                if (buf) {
+                    osfs2_read(f, 0, buf, sz);
+                    kmod_load(argv[1], buf, sz);
+                    kfree(buf);
+                }
+            }
+        }
+    } else if (strcmp(cmd, "rmmod") == 0) {
+        extern int kmod_unload(const char *name);
+        if (argc < 2) sh_puts("Usage: rmmod <name>\n");
+        else kmod_unload(argv[1]);
+    } else if (strcmp(cmd, "lsmod") == 0) {
+        extern void kmod_list(void);
+        kmod_list();
     } else if (strcmp(cmd, "clear") == 0) {
         cmd_clear();
     } else if (strcmp(cmd, "kexec") == 0) {
