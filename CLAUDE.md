@@ -144,6 +144,13 @@ kernel/            main.c, serial.c, framebuffer.c, pci.c, memory.c, heap.c
                    fuse.c — Filesystem in Userspace (request/response)
                    kprof.c — Sampling profiler (RIP histogram)
                    msync.c — MAP_SHARED writeback coherence
+                   io_uring.c — Async I/O (SQ/CQ rings)
+                   bpf.c — eBPF virtual machine
+                   kthread.c — Kernel thread lifecycle
+                   initramfs.c — CPIO archive loader
+                   trace.c — Kernel tracepoints (ftrace-like)
+                   seccomp.c — Syscall sandboxing
+                   workqueue.c — Deferred work execution
 drivers/           nvme.c — NVMe read/write
                    gpu.c, gsp.c — NVIDIA GPU + GSP Falcon (Phases 1-10)
                    sass.c, gmmu.c — SASS kernels + GPU MMU
@@ -325,6 +332,13 @@ arch/arm/          SM8350 (ROG Phone 5) bare-metal port — see docs/aarch64-det
 | X-FUSE  | FUSE userspace filesystem (request/response queues) | Done |
 | X-KPROF | Kernel profiler (sampling via timer ISR, histogram) | Done |
 | X-MSYNC | msync + MAP_SHARED coherence (writeback to disk) | Done |
+| X-IOURING| io_uring async I/O (SQ/CQ ring buffers) | Done |
+| X-BPF   | eBPF virtual machine (ALU64, JMP, LDX, helper calls) | Done |
+| X-KTHR  | Kernel threads API (kthread_create/stop) | Done |
+| X-INITRD| initramfs loader (cpio newc → tmpfs extraction) | Done |
+| X-TRACE | Kernel tracepoints (sched/syscall/irq/net/fs/mm) | Done |
+| X-SECCOMP| Seccomp syscall filtering (strict + BPF filter) | Done |
+| X-WQ    | Workqueue subsystem (deferred + delayed work) | Done |
 | **Phase 0** | **Kernel/bootloader separation** (boot.efi + kernel.elf) | **Done** |
 | **Phase 1** | **TCC cross-compiles kernel from host** | **Done** |
 | **Phase 2** | **TCC compiles kernel inside OsitoK** (62 .c → 733KB ELF) | **Done** |
