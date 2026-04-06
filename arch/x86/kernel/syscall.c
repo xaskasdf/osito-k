@@ -257,6 +257,24 @@ static inline void wrmsr(uint32_t msr, uint64_t val) {
 #define SYS_EPOLL_WAIT    232
 #define SYS_EPOLL_PWAIT   281
 #define SYS_EVENTFD2      290
+#define SYS_SOCKET        41
+#define SYS_CONNECT       42
+#define SYS_ACCEPT        43
+#define SYS_SENDTO        44
+#define SYS_RECVFROM      45
+#define SYS_SENDMSG       46
+#define SYS_RECVMSG       47
+#define SYS_SHUTDOWN      48
+#define SYS_BIND          49
+#define SYS_LISTEN        50
+#define SYS_GETSOCKNAME   51
+#define SYS_GETPEERNAME   52
+#define SYS_SETSOCKOPT    54
+#define SYS_GETSOCKOPT    55
+#define SYS_ACCEPT4       288
+#define SYS_ALARM         37
+#define SYS_SETITIMER     38
+#define SYS_GETITIMER     36
 
 /* OsitoK private syscalls (500+) */
 #define SYS_SHM_CREATE      500
@@ -322,6 +340,7 @@ static inline void wrmsr(uint32_t msr, uint64_t val) {
 #define FD_TYPE_ISO     9
 #define FD_TYPE_EPOLL   10
 #define FD_TYPE_EVENTFD 11
+#define FD_TYPE_SOCKET  12
 
 typedef ssize_t (*fd_write_fn)(const void *buf, size_t count);
 typedef ssize_t (*fd_read_fn)(void *buf, size_t count);
@@ -533,7 +552,8 @@ static vma_t vma_table[MAX_VMAS];
 #define DEV_ZERO        1
 #define DEV_URANDOM     2
 #define DEV_CONSOLE     3
-#define DEV_DSP         4   /* /dev/dsp — PCM audio output via HDA */
+#define DEV_DSP         4
+#define DEV_FB0         5   /* /dev/fb0 — framebuffer for direct pixel access */
 
 /* PRNG for /dev/urandom — CCP TRNG if available, RDTSC fallback */
 extern uint64_t ccp_random(void) __attribute__((weak));
@@ -604,6 +624,11 @@ static int64_t sys_write(uint64_t fd, uint64_t buf, uint64_t count)
         if (ret < 0) return -EFAULT;
         f->offset += count;
         return (int64_t)count;
+    }
+
+    if (f->type == FD_TYPE_SOCKET) {
+        extern int sock_send(int, const void *, uint32_t, int);
+        return sock_send((int)f->offset, (const void *)buf, (uint32_t)count, 0);
     }
 
     if (f->type == FD_TYPE_TMPFS) {
@@ -693,12 +718,17 @@ static int64_t sys_read(uint64_t fd, uint64_t buf, uint64_t count)
         return (int64_t)count;
     }
 
+    if (f->type == FD_TYPE_SOCKET) {
+        extern int sock_recv(int, void *, uint32_t, int);
+        return sock_recv((int)f->offset, (void *)buf, (uint32_t)count, 0);
+    }
+
     if (f->type == FD_TYPE_EVENTFD) {
         if (count < 8) return -EINVAL;
         uint64_t val = f->offset;
-        if (val == 0) return -EAGAIN;  /* Non-blocking: no events */
+        if (val == 0) return -EAGAIN;
         *(uint64_t *)buf = val;
-        f->offset = 0;  /* Reset counter after read */
+        f->offset = 0;
         return 8;
     }
 
@@ -874,6 +904,7 @@ static int64_t sys_open(uint64_t path_addr, uint64_t flags, uint64_t mode)
         else if (strcmp(devname, "tty") == 0)     dev_id = DEV_CONSOLE;
         else if (strcmp(devname, "dsp") == 0)     dev_id = DEV_DSP;
         else if (strcmp(devname, "audio") == 0)   dev_id = DEV_DSP;
+        else if (strcmp(devname, "fb0") == 0)     dev_id = DEV_FB0;
         else return -ENOENT;
 
         fd_entry_t *f = &fd_table[newfd];
@@ -1284,6 +1315,14 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
     /* Handle musl's mallocng guard page request */
     if ((flags & 0x10 /* MAP_FIXED */) && addr != 0) {
         return (int64_t)addr;
+    }
+
+    /* /dev/fb0 mmap: return pointer to display back buffer */
+    if (!(flags & MAP_ANONYMOUS) && fd < MAX_FDS && fd_table[fd].open &&
+        fd_table[fd].type == FD_TYPE_DEV && (int)fd_table[fd].offset == DEV_FB0) {
+        extern uint32_t *display_get_back_buffer(void);
+        uint32_t *bb = display_get_back_buffer();
+        return bb ? (int64_t)(uint64_t)bb : -ENODEV;
     }
 
     /* File-backed mmap: allocate pages + read file content */
@@ -3059,6 +3098,93 @@ int64_t syscall_dispatch(uint64_t nr, uint64_t a1, uint64_t a2,
     case SYS_FACCESSAT2: return sys_access(a2, a3);
     case SYS_PSELECT6:   return sys_poll(0, 0, 0);
     case SYS_UTIMENSAT:  return 0;   /* pretend success */
+    /* ── Socket syscalls ──────────────────────────────────────── */
+    case SYS_SOCKET: {
+        extern int sock_socket(int, int, int);
+        int si = sock_socket((int)a1, (int)a2, (int)a3);
+        if (si < 0) return (int64_t)si;
+        int nfd = vfs_alloc_fd();
+        if (nfd < 0) return -EMFILE;
+        fd_entry_t *sf = &fd_table[nfd];
+        memset(sf, 0, sizeof(*sf));
+        sf->open = true; sf->type = FD_TYPE_SOCKET;
+        sf->offset = (uint64_t)si;  /* socket index */
+        return nfd;
+    }
+    case SYS_BIND: {
+        extern int sock_bind(int, const void *);
+        fd_entry_t *sf = &fd_table[a1 & 0xFF];
+        if (!sf->open || sf->type != FD_TYPE_SOCKET) return -EBADF;
+        return sock_bind((int)sf->offset, (const void *)a2);
+    }
+    case SYS_LISTEN: {
+        extern int sock_listen(int, int);
+        fd_entry_t *sf = &fd_table[a1 & 0xFF];
+        if (!sf->open || sf->type != FD_TYPE_SOCKET) return -EBADF;
+        return sock_listen((int)sf->offset, (int)a2);
+    }
+    case SYS_ACCEPT:
+    case SYS_ACCEPT4: {
+        extern int sock_accept(int, void *, uint32_t *);
+        fd_entry_t *sf = &fd_table[a1 & 0xFF];
+        if (!sf->open || sf->type != FD_TYPE_SOCKET) return -EBADF;
+        int ni = sock_accept((int)sf->offset, (void *)a2, (uint32_t *)a3);
+        if (ni < 0) return (int64_t)ni;
+        int nfd = vfs_alloc_fd();
+        if (nfd < 0) return -EMFILE;
+        fd_entry_t *nf = &fd_table[nfd];
+        memset(nf, 0, sizeof(*nf));
+        nf->open = true; nf->type = FD_TYPE_SOCKET;
+        nf->offset = (uint64_t)ni;
+        return nfd;
+    }
+    case SYS_CONNECT: {
+        extern int sock_connect(int, const void *);
+        fd_entry_t *sf = &fd_table[a1 & 0xFF];
+        if (!sf->open || sf->type != FD_TYPE_SOCKET) return -EBADF;
+        return sock_connect((int)sf->offset, (const void *)a2);
+    }
+    case SYS_SENDTO: {
+        extern int sock_sendto(int, const void *, uint32_t, int, const void *);
+        fd_entry_t *sf = &fd_table[a1 & 0xFF];
+        if (!sf->open || sf->type != FD_TYPE_SOCKET) return -EBADF;
+        if (a5) return sock_sendto((int)sf->offset, (const void *)a2, (uint32_t)a3, (int)a4, (const void *)a5);
+        extern int sock_send(int, const void *, uint32_t, int);
+        return sock_send((int)sf->offset, (const void *)a2, (uint32_t)a3, (int)a4);
+    }
+    case SYS_RECVFROM: {
+        extern int sock_recvfrom(int, void *, uint32_t, int, void *, uint32_t *);
+        fd_entry_t *sf = &fd_table[a1 & 0xFF];
+        if (!sf->open || sf->type != FD_TYPE_SOCKET) return -EBADF;
+        return sock_recvfrom((int)sf->offset, (void *)a2, (uint32_t)a3, (int)a4, (void *)a5, NULL);
+    }
+    case SYS_SHUTDOWN: return 0;
+    case SYS_GETSOCKNAME: {
+        extern int sock_getsockname(int, void *, uint32_t *);
+        fd_entry_t *sf = &fd_table[a1 & 0xFF];
+        if (!sf->open || sf->type != FD_TYPE_SOCKET) return -EBADF;
+        return sock_getsockname((int)sf->offset, (void *)a2, (uint32_t *)a3);
+    }
+    case SYS_GETPEERNAME: return 0;
+    case SYS_SETSOCKOPT: {
+        extern int sock_setsockopt(int, int, int, const void *, uint32_t);
+        fd_entry_t *sf = &fd_table[a1 & 0xFF];
+        if (!sf->open || sf->type != FD_TYPE_SOCKET) return -EBADF;
+        return sock_setsockopt((int)sf->offset, (int)a2, (int)a3, (const void *)a4, (uint32_t)a5);
+    }
+    case SYS_GETSOCKOPT: return 0;
+    case SYS_SENDMSG:    return -ENOSYS;
+    case SYS_RECVMSG:    return -ENOSYS;
+    /* ── Timer syscalls ──────────────────────────────────────── */
+    case SYS_ALARM: {
+        extern uint32_t timer_alarm(uint32_t);
+        return (int64_t)timer_alarm((uint32_t)a1);
+    }
+    case SYS_SETITIMER: {
+        extern int timer_setitimer(int, const void *, void *);
+        return timer_setitimer((int)a1, (const void *)a2, (void *)a3);
+    }
+    case SYS_GETITIMER: return 0;
     case SYS_EPOLL_CREATE1: return sys_epoll_create1(a1);
     case SYS_EPOLL_CTL:     return sys_epoll_ctl(a1, a2, a3, a4);
     case SYS_EPOLL_WAIT:    return sys_epoll_wait(a1, a2, a3, a4);
