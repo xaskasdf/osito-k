@@ -228,10 +228,17 @@ static IDirectSoundBufferVtbl g_dsb_vtbl = {
 
 static IDirectSoundBufferObj g_dsb_objs[MAX_SOUND_BUFFERS];
 
-/* Static audio data backing store — avoid dynamic allocation for simplicity.
- * 8 buffers x 64KB each = 512KB total. UT99 typically uses 32-64KB buffers. */
+/* Audio data backing store — allocated per-buffer on CreateSoundBuffer.
+ * Was static 512KB BSS; now lazy-alloc to avoid boot-time memory pressure. */
 #define DSB_MAX_DATA_SIZE  65536
-static uint8_t g_dsb_data[MAX_SOUND_BUFFERS][DSB_MAX_DATA_SIZE];
+static uint8_t *g_dsb_data_ptrs[MAX_SOUND_BUFFERS];  /* Per-buffer pointers */
+#define g_dsb_data_get(i) (g_dsb_data_ptrs[i] ? g_dsb_data_ptrs[i] : dsb_alloc_data(i))
+static uint8_t *dsb_alloc_data(int idx) {
+    extern void *kmalloc(uint64_t);
+    g_dsb_data_ptrs[idx] = (uint8_t *)kmalloc(DSB_MAX_DATA_SIZE);
+    if (g_dsb_data_ptrs[idx]) memset(g_dsb_data_ptrs[idx], 0, DSB_MAX_DATA_SIZE);
+    return g_dsb_data_ptrs[idx];
+}
 
 /* ── Helper: get DSBuffer from COM self pointer ───────────── */
 
@@ -786,7 +793,7 @@ static HRESULT WINAPI ds_CreateSoundBuffer(PVOID self, PVOID desc, PVOID *ppDSB,
         if (alloc_size == 0)
             alloc_size = DSB_MAX_DATA_SIZE;
 
-        buf->data      = g_dsb_data[slot];
+        buf->data      = g_dsb_data_get(slot);
         buf->data_size = alloc_size;
         memset(buf->data, 0, alloc_size);
 

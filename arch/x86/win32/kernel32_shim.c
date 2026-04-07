@@ -515,7 +515,8 @@ BOOL WINAPI UnmapViewOfFile(PCVOID lpBaseAddress)
  * Falls back to 16MB static pool if kmalloc unavailable. */
 #include "../include/sys_caps.h"
 
-static BYTE   heap_pool_static[64 * 1024 * 1024]; /* fallback — 64MB for UT99 */
+/* Heap pool allocated dynamically via kmalloc (no static fallback).
+ * The 64MB static array was causing 134MB BSS and crashing NVMe boot. */
 static BYTE  *heap_pool = NULL;
 static SIZE_T heap_pool_size = 0;
 static SIZE_T heap_offset = 0;
@@ -545,8 +546,9 @@ static void heap_pool_init(void)
          * freshly allocated memory being zero-initialized. */
         memset(heap_pool, 0, target);
     } else {
-        heap_pool = heap_pool_static;
-        heap_pool_size = sizeof(heap_pool_static);
+        /* Dynamic alloc failed — try smaller fallback (1MB) */
+        heap_pool = (BYTE *)kmalloc(1024 * 1024);
+        heap_pool_size = heap_pool ? (1024 * 1024) : 0;
     }
     serial_puts("[WIN32-HEAP] pool=0x");
     serial_puthex((uint64_t)(uintptr_t)heap_pool, 8);

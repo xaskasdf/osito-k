@@ -311,7 +311,8 @@ int  WINAPI _set_new_mode(int mode) { (void)mode; return 0; }
 /* CRT heap: dynamic from sys_caps (scales with RAM) */
 #include "../include/sys_caps.h"
 
-static BYTE   crt_pool_static[64 * 1024 * 1024]; /* fallback — 64MB for UT99 */
+/* CRT pool allocated dynamically via kmalloc (no static fallback — saves 64MB BSS).
+ * Size scales with available RAM via sys_caps. */
 static BYTE  *crt_pool = NULL;
 static SIZE_T crt_pool_size = 0;
 static SIZE_T crt_pool_offset = 0;
@@ -326,15 +327,15 @@ static void crt_pool_init(void)
     if (crt_pool) {
         crt_pool_size = target;
     } else {
-        crt_pool = crt_pool_static;
-        crt_pool_size = sizeof(crt_pool_static);
+        /* Try smaller fallback */
+        crt_pool = (BYTE *)kmalloc(1024 * 1024);
+        crt_pool_size = crt_pool ? (1024 * 1024) : 0;
     }
     serial_puts("[CRT-POOL] addr=0x");
     serial_puthex((uint64_t)(uintptr_t)crt_pool, 16);
     serial_puts(" size=");
     serial_putdec(crt_pool_size / (1024*1024));
-    serial_puts("MB ");
-    serial_puts(crt_pool == crt_pool_static ? "(static fallback)\n" : "(kmalloc)\n");
+    serial_puts("MB\n");
 }
 
 /* Free list for basic reuse */

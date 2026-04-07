@@ -30,7 +30,7 @@ extern void kern_longjmp(uint64_t *buf, int val);
 /* ── Global compat32 mode flag ────────────────────────────────── */
 
 int g_compat32_mode = 0;
-extern uint32_t g_int2e_rsp_depth; /* defined in int2e_stub.S */
+uint32_t g_int2e_rsp_depth = 0; /* shared with int2e_stub.S */
 
 /* ── C++ EH unwind state (set by _CxxThrowException) ────────── */
 uint32_t g_compat32_unwind_eip = 0;
@@ -98,9 +98,21 @@ static uint32_t catch_continue_stub_addr = 0;
  * which QEMU TCG misinterpreted as INT3. */
 static int      callback_depth __attribute__((section(".data"))) = 0;
 static uint64_t callback_jmpbufs[MAX_CALLBACK_DEPTH][8];
-static uint64_t callback_saved_ist1[MAX_CALLBACK_DEPTH];  /* IST1 before LRETQ */
-static uint8_t  callback_stacks[MAX_CALLBACK_DEPTH][CALLBACK_STACK_SIZE]
-    __attribute__((aligned(16)));
+static uint64_t callback_saved_ist1[MAX_CALLBACK_DEPTH];
+/* Callback stacks allocated lazily (saves 2MB BSS).
+ * Each depth level gets its own 64KB stack on first use. */
+static uint8_t *callback_stacks_ptr[MAX_CALLBACK_DEPTH];
+
+static uint8_t *callback_stack_get(int depth) {
+    if (depth < 0 || depth >= MAX_CALLBACK_DEPTH) return NULL;
+    if (!callback_stacks_ptr[depth]) {
+        extern void *mem_alloc_aligned(uint64_t, uint64_t);
+        callback_stacks_ptr[depth] = (uint8_t *)mem_alloc_aligned(CALLBACK_STACK_SIZE, 16);
+    }
+    return callback_stacks_ptr[depth];
+}
+/* Compat macro: callback_stack_get(depth) → callback_stack_get(depth) */
+#define callback_stacks(d) callback_stack_get(d)
 
 /*
  * Single global retval written by the 32-bit return stub (MOV [addr], EAX).
@@ -1183,7 +1195,7 @@ void compat32_callback(uint32_t func_addr)
          * Set up a small stack with the return stub as return address,
          * then LRETQ to the 32-bit function.
          */
-        uint32_t *sp = (uint32_t *)(callback_stacks[depth] + CALLBACK_STACK_SIZE);
+        uint32_t *sp = (uint32_t *)(callback_stack_get(depth) + CALLBACK_STACK_SIZE);
         sp--;
         *sp = callback_return_stub_addr;  /* return address for the function */
 
@@ -1271,7 +1283,7 @@ uint32_t compat32_callback_args(uint32_t func_addr, int nargs, const uint32_t *a
     uint32_t saved_seh = g_teb32.ExceptionList;
 
     if (kern_setjmp(callback_jmpbufs[depth]) == 0) {
-        uint32_t *sp = (uint32_t *)(callback_stacks[depth] + CALLBACK_STACK_SIZE);
+        uint32_t *sp = (uint32_t *)(callback_stack_get(depth) + CALLBACK_STACK_SIZE);
 
         /* Push arguments right-to-left (cdecl/stdcall convention) */
         for (int i = nargs - 1; i >= 0; i--) {
