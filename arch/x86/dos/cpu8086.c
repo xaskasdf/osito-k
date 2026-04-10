@@ -171,6 +171,20 @@ typedef struct {
     bool     is_reg;      /* true if mod==11 (register operand) */
 } modrm_t;
 
+/* Update op/addr size from CS descriptor's D bit after CS load in PM */
+static void cpu_update_cs_mode(cpu8086_state_t *cpu)
+{
+    dos_vm_t *vm = cpu->vm;
+    if (!cpu->protected_mode) return;
+    uint16_t index = cpu->cs >> 3;
+    bool ti = (cpu->cs >> 2) & 1;
+    if (ti && index < DPMI_MAX_DESCRIPTORS) {
+        bool d32 = (vm->dpmi.ldt[index].flags_lim & 0x40) != 0; /* D bit */
+        cpu->op_size_32 = d32;
+        cpu->addr_size_32 = d32;
+    }
+}
+
 static modrm_t decode_modrm(cpu8086_state_t *cpu, uint8_t modrm)
 {
     modrm_t result;
@@ -181,7 +195,6 @@ static modrm_t decode_modrm(cpu8086_state_t *cpu, uint8_t modrm)
     result.addr      = 0;
 
     dos_vm_t *vm = cpu->vm;
-    (void)vm;
 
     if (result.mod_field == 3) {
         /* Register operand -- no memory access */
@@ -189,9 +202,62 @@ static modrm_t decode_modrm(cpu8086_state_t *cpu, uint8_t modrm)
         return result;
     }
 
-    /* Compute the effective address (offset within segment) */
+    bool adr32 = cpu->addr_size_32 ^ cpu->prefix_67;
+    bool use_ss = false;
+
+    if (adr32) {
+        /* ── 32-bit addressing mode ─────────────────────────────── */
+        uint32_t offset = 0;
+
+        if (result.rm_field == 4) {
+            /* SIB byte follows */
+            uint8_t sib   = cpu_fetch8(cpu);
+            uint8_t scale = (sib >> 6) & 3;
+            uint8_t index = (sib >> 3) & 7;
+            uint8_t base  = sib & 7;
+
+            /* Base register (base=5 with mod=0 means disp32 only) */
+            if (base == 5 && result.mod_field == 0) {
+                offset = cpu_fetch32(cpu);
+            } else {
+                offset = *reg32_ptr(cpu, base);
+                if (base == 4 || base == 5) use_ss = true; /* ESP/EBP */
+            }
+
+            /* Index register (index=4 means no index) */
+            if (index != 4)
+                offset += *reg32_ptr(cpu, index) << scale;
+
+        } else if (result.rm_field == 5 && result.mod_field == 0) {
+            /* [disp32] — absolute address */
+            offset = cpu_fetch32(cpu);
+        } else {
+            offset = *reg32_ptr(cpu, result.rm_field);
+            if (result.rm_field == 5) use_ss = true; /* EBP */
+        }
+
+        /* Displacement */
+        if (result.mod_field == 1) {
+            offset += (uint32_t)(int32_t)(int8_t)cpu_fetch8(cpu);
+        } else if (result.mod_field == 2) {
+            offset += cpu_fetch32(cpu);
+        }
+
+        /* Segment selection + address translation */
+        uint16_t seg;
+        if (cpu->seg_override >= 0)
+            seg = *seg_ptr(cpu, (uint8_t)cpu->seg_override);
+        else if (use_ss)
+            seg = cpu->ss;
+        else
+            seg = cpu->ds;
+
+        result.addr = dos_addr(vm, seg, offset);
+        return result;
+    }
+
+    /* ── 16-bit addressing mode ─────────────────────────────────── */
     uint16_t offset = 0;
-    bool use_ss = false; /* true when BP is base -> default segment is SS */
 
     switch (result.rm_field) {
     case 0: offset = cpu->bx + cpu->si; break;
@@ -202,7 +268,6 @@ static modrm_t decode_modrm(cpu8086_state_t *cpu, uint8_t modrm)
     case 5: offset = cpu->di; break;
     case 6:
         if (result.mod_field == 0) {
-            /* Direct address */
             offset = cpu_fetch16(cpu);
         } else {
             offset = cpu->bp;
@@ -212,7 +277,6 @@ static modrm_t decode_modrm(cpu8086_state_t *cpu, uint8_t modrm)
     case 7: offset = cpu->bx; break;
     }
 
-    /* Add displacement */
     if (result.mod_field == 1) {
         int8_t disp8 = (int8_t)cpu_fetch8(cpu);
         offset += (uint16_t)(int16_t)disp8;
@@ -221,7 +285,6 @@ static modrm_t decode_modrm(cpu8086_state_t *cpu, uint8_t modrm)
         offset += disp16;
     }
 
-    /* Determine segment */
     uint16_t seg;
     if (cpu->seg_override >= 0) {
         seg = *seg_ptr(cpu, (uint8_t)cpu->seg_override);
@@ -231,7 +294,7 @@ static modrm_t decode_modrm(cpu8086_state_t *cpu, uint8_t modrm)
         seg = cpu->ds;
     }
 
-    result.addr = dos_linear(seg, offset);
+    result.addr = dos_addr(vm, seg, (uint32_t)offset);
     return result;
 }
 
@@ -296,6 +359,41 @@ static void modrm_write32(cpu8086_state_t *cpu, modrm_t *m, uint32_t val)
         *reg32_ptr(cpu, m->rm_field) = val;
     else
         dos_mem_write32(cpu->vm, m->addr, val);
+}
+
+/* ── String operation helpers (16/32-bit addressing) ────────────── */
+
+static inline uint32_t str_src(dos_vm_t *vm, cpu8086_state_t *cpu,
+                               uint16_t seg, bool adr32)
+{
+    return adr32 ? dos_addr(vm, seg, cpu->esi)
+                 : dos_linear(seg, cpu->si);
+}
+
+static inline uint32_t str_dst(dos_vm_t *vm, cpu8086_state_t *cpu, bool adr32)
+{
+    return adr32 ? dos_addr(vm, cpu->es, cpu->edi)
+                 : dos_linear(cpu->es, cpu->di);
+}
+
+static inline void str_adv_si(cpu8086_state_t *cpu, int32_t d, bool adr32)
+{
+    if (adr32) cpu->esi += d; else cpu->si += (uint16_t)d;
+}
+
+static inline void str_adv_di(cpu8086_state_t *cpu, int32_t d, bool adr32)
+{
+    if (adr32) cpu->edi += d; else cpu->di += (uint16_t)d;
+}
+
+static inline void str_dec_cx(cpu8086_state_t *cpu, bool adr32)
+{
+    if (adr32) cpu->ecx--; else cpu->cx--;
+}
+
+static inline bool str_cx_nz(cpu8086_state_t *cpu, bool adr32)
+{
+    return adr32 ? (cpu->ecx != 0) : (cpu->cx != 0);
 }
 
 /* ── Flag helpers ────────────────────────────────────────────────── */
@@ -909,6 +1007,106 @@ static uint16_t shift_rotate16(cpu8086_state_t *cpu, uint8_t op, uint16_t val, u
     return result;
 }
 
+static uint32_t shift_rotate32(cpu8086_state_t *cpu, uint8_t op, uint32_t val, uint8_t count)
+{
+    count &= 0x1F;
+    if (count == 0)
+        return val;
+
+    uint32_t result = val;
+    uint8_t i;
+    bool cf;
+
+    switch (op) {
+    case 0: /* ROL */
+        for (i = 0; i < count; i++) {
+            cf = (result & 0x80000000u) != 0;
+            result = (result << 1) | (cf ? 1 : 0);
+        }
+        set_flag(cpu, FLAG_CF, result & 1);
+        if (count == 1)
+            set_flag(cpu, FLAG_OF, ((result ^ val) & 0x80000000u) != 0);
+        break;
+
+    case 1: /* ROR */
+        for (i = 0; i < count; i++) {
+            cf = (result & 1) != 0;
+            result = (result >> 1) | (cf ? 0x80000000u : 0);
+        }
+        set_flag(cpu, FLAG_CF, (result & 0x80000000u) != 0);
+        if (count == 1)
+            set_flag(cpu, FLAG_OF, ((result ^ (result << 1)) & 0x80000000u) != 0);
+        break;
+
+    case 2: /* RCL */
+        for (i = 0; i < count; i++) {
+            cf = get_flag(cpu, FLAG_CF);
+            set_flag(cpu, FLAG_CF, (result & 0x80000000u) != 0);
+            result = (result << 1) | (cf ? 1 : 0);
+        }
+        if (count == 1)
+            set_flag(cpu, FLAG_OF, ((result ^ val) & 0x80000000u) != 0);
+        break;
+
+    case 3: /* RCR */
+        for (i = 0; i < count; i++) {
+            cf = get_flag(cpu, FLAG_CF);
+            set_flag(cpu, FLAG_CF, (result & 1) != 0);
+            result = (result >> 1) | (cf ? 0x80000000u : 0);
+        }
+        if (count == 1)
+            set_flag(cpu, FLAG_OF, ((result ^ (result << 1)) & 0x80000000u) != 0);
+        break;
+
+    case 4: /* SHL / SAL */ {
+        uint64_t tmp = (uint64_t)result;
+        for (i = 0; i < count; i++) {
+            set_flag(cpu, FLAG_CF, (tmp & 0x80000000u) != 0);
+            tmp <<= 1;
+        }
+        result = (uint32_t)tmp;
+        update_flags_logic32(cpu, result);
+        set_flag(cpu, FLAG_CF, (count <= 32) ? ((val >> (32 - count)) & 1) : 0);
+        if (count == 1)
+            set_flag(cpu, FLAG_OF, ((result ^ val) & 0x80000000u) != 0);
+        break;
+    }
+
+    case 5: /* SHR */ {
+        uint64_t tmp = (uint64_t)result;
+        if (count == 1)
+            set_flag(cpu, FLAG_OF, (tmp & 0x80000000u) != 0);
+        for (i = 0; i < count; i++) {
+            set_flag(cpu, FLAG_CF, (tmp & 1) != 0);
+            tmp >>= 1;
+        }
+        result = (uint32_t)tmp;
+        update_flags_logic32(cpu, result);
+        set_flag(cpu, FLAG_CF, (count <= 32) ? ((val >> (count - 1)) & 1) : 0);
+        break;
+    }
+
+    case 7: /* SAR */ {
+        int32_t stmp = (int32_t)result;
+        if (count == 1)
+            set_flag(cpu, FLAG_OF, false);
+        for (i = 0; i < count; i++) {
+            set_flag(cpu, FLAG_CF, (stmp & 1) != 0);
+            stmp >>= 1;
+        }
+        result = (uint32_t)stmp;
+        update_flags_logic32(cpu, result);
+        set_flag(cpu, FLAG_CF, ((int32_t)val >> (count - 1)) & 1);
+        break;
+    }
+
+    default:
+        break;
+    }
+
+    return result;
+}
+
 /* ── Jcc condition code evaluation ───────────────────────────────── */
 
 static bool eval_condition(cpu8086_state_t *cpu, uint8_t cond)
@@ -1042,7 +1240,6 @@ int cpu8086_run(dos_vm_t *vm)
         /* Compute effective operand/address sizes (XOR with prefix) */
         bool op32  = cpu->op_size_32  ^ cpu->prefix_66;
         bool adr32 = cpu->addr_size_32 ^ cpu->prefix_67;
-        (void)adr32; /* used later as more opcodes get 32-bit addressing */
 
         /* ── Dispatch opcode ─────────────────────────────────────── */
 
@@ -1059,12 +1256,18 @@ int cpu8086_run(dos_vm_t *vm)
             modrm_write8(cpu, &m, alu_add8(cpu, val, reg));
             break;
         }
-        case 0x01: { /* ADD r/m16, r16 */
+        case 0x01: { /* ADD r/m16/32, r16/32 */
             modrm_byte = cpu_fetch8(cpu);
             m = decode_modrm(cpu, modrm_byte);
-            uint16_t val = modrm_read16(cpu, &m);
-            uint16_t reg = *reg16_ptr(cpu, m.reg_field);
-            modrm_write16(cpu, &m, alu_add16(cpu, val, reg));
+            if (op32) {
+                uint32_t val = modrm_read32(cpu, &m);
+                uint32_t reg = *reg32_ptr(cpu, m.reg_field);
+                modrm_write32(cpu, &m, alu_add32(cpu, val, reg));
+            } else {
+                uint16_t val = modrm_read16(cpu, &m);
+                uint16_t reg = *reg16_ptr(cpu, m.reg_field);
+                modrm_write16(cpu, &m, alu_add16(cpu, val, reg));
+            }
             break;
         }
         case 0x02: { /* ADD r8, r/m8 */
@@ -1075,12 +1278,18 @@ int cpu8086_run(dos_vm_t *vm)
             *dst = alu_add8(cpu, *dst, val);
             break;
         }
-        case 0x03: { /* ADD r16, r/m16 */
+        case 0x03: { /* ADD r16/32, r/m16/32 */
             modrm_byte = cpu_fetch8(cpu);
             m = decode_modrm(cpu, modrm_byte);
-            uint16_t *dst = reg16_ptr(cpu, m.reg_field);
-            uint16_t val = modrm_read16(cpu, &m);
-            *dst = alu_add16(cpu, *dst, val);
+            if (op32) {
+                uint32_t *dst = reg32_ptr(cpu, m.reg_field);
+                uint32_t val = modrm_read32(cpu, &m);
+                *dst = alu_add32(cpu, *dst, val);
+            } else {
+                uint16_t *dst = reg16_ptr(cpu, m.reg_field);
+                uint16_t val = modrm_read16(cpu, &m);
+                *dst = alu_add16(cpu, *dst, val);
+            }
             break;
         }
         case 0x04: { /* ADD AL, imm8 */
@@ -1098,10 +1307,12 @@ int cpu8086_run(dos_vm_t *vm)
          *  PUSH / POP segment registers
          * ════════════════════════════════════════════════════════════ */
         case 0x06: /* PUSH ES */
-            cpu_push16(cpu, cpu->es);
+            if (op32) cpu_push32(cpu, (uint32_t)cpu->es);
+            else cpu_push16(cpu, cpu->es);
             break;
         case 0x07: /* POP ES */
-            cpu->es = cpu_pop16(cpu);
+            if (op32) cpu->es = (uint16_t)cpu_pop32(cpu);
+            else cpu->es = cpu_pop16(cpu);
             break;
 
         /* ════════════════════════════════════════════════════════════
@@ -1115,12 +1326,18 @@ int cpu8086_run(dos_vm_t *vm)
             modrm_write8(cpu, &m, alu_or8(cpu, val, reg));
             break;
         }
-        case 0x09: { /* OR r/m16, r16 */
+        case 0x09: { /* OR r/m16/32, r16/32 */
             modrm_byte = cpu_fetch8(cpu);
             m = decode_modrm(cpu, modrm_byte);
-            uint16_t val = modrm_read16(cpu, &m);
-            uint16_t reg = *reg16_ptr(cpu, m.reg_field);
-            modrm_write16(cpu, &m, alu_or16(cpu, val, reg));
+            if (op32) {
+                uint32_t val = modrm_read32(cpu, &m);
+                uint32_t reg = *reg32_ptr(cpu, m.reg_field);
+                modrm_write32(cpu, &m, alu_or32(cpu, val, reg));
+            } else {
+                uint16_t val = modrm_read16(cpu, &m);
+                uint16_t reg = *reg16_ptr(cpu, m.reg_field);
+                modrm_write16(cpu, &m, alu_or16(cpu, val, reg));
+            }
             break;
         }
         case 0x0A: { /* OR r8, r/m8 */
@@ -1131,12 +1348,18 @@ int cpu8086_run(dos_vm_t *vm)
             *dst = alu_or8(cpu, *dst, val);
             break;
         }
-        case 0x0B: { /* OR r16, r/m16 */
+        case 0x0B: { /* OR r16/32, r/m16/32 */
             modrm_byte = cpu_fetch8(cpu);
             m = decode_modrm(cpu, modrm_byte);
-            uint16_t *dst = reg16_ptr(cpu, m.reg_field);
-            uint16_t val = modrm_read16(cpu, &m);
-            *dst = alu_or16(cpu, *dst, val);
+            if (op32) {
+                uint32_t *dst = reg32_ptr(cpu, m.reg_field);
+                uint32_t val = modrm_read32(cpu, &m);
+                *dst = alu_or32(cpu, *dst, val);
+            } else {
+                uint16_t *dst = reg16_ptr(cpu, m.reg_field);
+                uint16_t val = modrm_read16(cpu, &m);
+                *dst = alu_or16(cpu, *dst, val);
+            }
             break;
         }
         case 0x0C: { /* OR AL, imm8 */
@@ -1151,7 +1374,8 @@ int cpu8086_run(dos_vm_t *vm)
         }
 
         case 0x0E: /* PUSH CS */
-            cpu_push16(cpu, cpu->cs);
+            if (op32) cpu_push32(cpu, (uint32_t)cpu->cs);
+            else cpu_push16(cpu, cpu->cs);
             break;
 
         /* ════════════════════════════════════════════════════════════
@@ -1698,12 +1922,18 @@ int cpu8086_run(dos_vm_t *vm)
             modrm_write8(cpu, &m, alu_adc8(cpu, val, reg));
             break;
         }
-        case 0x11: { /* ADC r/m16, r16 */
+        case 0x11: { /* ADC r/m16/32, r16/32 */
             modrm_byte = cpu_fetch8(cpu);
             m = decode_modrm(cpu, modrm_byte);
-            uint16_t val = modrm_read16(cpu, &m);
-            uint16_t reg = *reg16_ptr(cpu, m.reg_field);
-            modrm_write16(cpu, &m, alu_adc16(cpu, val, reg));
+            if (op32) {
+                uint32_t val = modrm_read32(cpu, &m);
+                uint32_t reg = *reg32_ptr(cpu, m.reg_field);
+                modrm_write32(cpu, &m, alu_adc32(cpu, val, reg));
+            } else {
+                uint16_t val = modrm_read16(cpu, &m);
+                uint16_t reg = *reg16_ptr(cpu, m.reg_field);
+                modrm_write16(cpu, &m, alu_adc16(cpu, val, reg));
+            }
             break;
         }
         case 0x12: { /* ADC r8, r/m8 */
@@ -1714,12 +1944,18 @@ int cpu8086_run(dos_vm_t *vm)
             *dst = alu_adc8(cpu, *dst, val);
             break;
         }
-        case 0x13: { /* ADC r16, r/m16 */
+        case 0x13: { /* ADC r16/32, r/m16/32 */
             modrm_byte = cpu_fetch8(cpu);
             m = decode_modrm(cpu, modrm_byte);
-            uint16_t *dst = reg16_ptr(cpu, m.reg_field);
-            uint16_t val = modrm_read16(cpu, &m);
-            *dst = alu_adc16(cpu, *dst, val);
+            if (op32) {
+                uint32_t *dst = reg32_ptr(cpu, m.reg_field);
+                uint32_t val = modrm_read32(cpu, &m);
+                *dst = alu_adc32(cpu, *dst, val);
+            } else {
+                uint16_t *dst = reg16_ptr(cpu, m.reg_field);
+                uint16_t val = modrm_read16(cpu, &m);
+                *dst = alu_adc16(cpu, *dst, val);
+            }
             break;
         }
         case 0x14: { /* ADC AL, imm8 */
@@ -1734,10 +1970,12 @@ int cpu8086_run(dos_vm_t *vm)
         }
 
         case 0x16: /* PUSH SS */
-            cpu_push16(cpu, cpu->ss);
+            if (op32) cpu_push32(cpu, (uint32_t)cpu->ss);
+            else cpu_push16(cpu, cpu->ss);
             break;
         case 0x17: /* POP SS */
-            cpu->ss = cpu_pop16(cpu);
+            if (op32) cpu->ss = (uint16_t)cpu_pop32(cpu);
+            else cpu->ss = cpu_pop16(cpu);
             break;
 
         /* ════════════════════════════════════════════════════════════
@@ -1751,12 +1989,18 @@ int cpu8086_run(dos_vm_t *vm)
             modrm_write8(cpu, &m, alu_sbb8(cpu, val, reg));
             break;
         }
-        case 0x19: { /* SBB r/m16, r16 */
+        case 0x19: { /* SBB r/m16/32, r16/32 */
             modrm_byte = cpu_fetch8(cpu);
             m = decode_modrm(cpu, modrm_byte);
-            uint16_t val = modrm_read16(cpu, &m);
-            uint16_t reg = *reg16_ptr(cpu, m.reg_field);
-            modrm_write16(cpu, &m, alu_sbb16(cpu, val, reg));
+            if (op32) {
+                uint32_t val = modrm_read32(cpu, &m);
+                uint32_t reg = *reg32_ptr(cpu, m.reg_field);
+                modrm_write32(cpu, &m, alu_sbb32(cpu, val, reg));
+            } else {
+                uint16_t val = modrm_read16(cpu, &m);
+                uint16_t reg = *reg16_ptr(cpu, m.reg_field);
+                modrm_write16(cpu, &m, alu_sbb16(cpu, val, reg));
+            }
             break;
         }
         case 0x1A: { /* SBB r8, r/m8 */
@@ -1767,12 +2011,18 @@ int cpu8086_run(dos_vm_t *vm)
             *dst = alu_sbb8(cpu, *dst, val);
             break;
         }
-        case 0x1B: { /* SBB r16, r/m16 */
+        case 0x1B: { /* SBB r16/32, r/m16/32 */
             modrm_byte = cpu_fetch8(cpu);
             m = decode_modrm(cpu, modrm_byte);
-            uint16_t *dst = reg16_ptr(cpu, m.reg_field);
-            uint16_t val = modrm_read16(cpu, &m);
-            *dst = alu_sbb16(cpu, *dst, val);
+            if (op32) {
+                uint32_t *dst = reg32_ptr(cpu, m.reg_field);
+                uint32_t val = modrm_read32(cpu, &m);
+                *dst = alu_sbb32(cpu, *dst, val);
+            } else {
+                uint16_t *dst = reg16_ptr(cpu, m.reg_field);
+                uint16_t val = modrm_read16(cpu, &m);
+                *dst = alu_sbb16(cpu, *dst, val);
+            }
             break;
         }
         case 0x1C: { /* SBB AL, imm8 */
@@ -1787,10 +2037,12 @@ int cpu8086_run(dos_vm_t *vm)
         }
 
         case 0x1E: /* PUSH DS */
-            cpu_push16(cpu, cpu->ds);
+            if (op32) cpu_push32(cpu, (uint32_t)cpu->ds);
+            else cpu_push16(cpu, cpu->ds);
             break;
         case 0x1F: /* POP DS */
-            cpu->ds = cpu_pop16(cpu);
+            if (op32) cpu->ds = (uint16_t)cpu_pop32(cpu);
+            else cpu->ds = cpu_pop16(cpu);
             break;
 
         /* ════════════════════════════════════════════════════════════
@@ -1804,12 +2056,18 @@ int cpu8086_run(dos_vm_t *vm)
             modrm_write8(cpu, &m, alu_and8(cpu, val, reg));
             break;
         }
-        case 0x21: { /* AND r/m16, r16 */
+        case 0x21: { /* AND r/m16/32, r16/32 */
             modrm_byte = cpu_fetch8(cpu);
             m = decode_modrm(cpu, modrm_byte);
-            uint16_t val = modrm_read16(cpu, &m);
-            uint16_t reg = *reg16_ptr(cpu, m.reg_field);
-            modrm_write16(cpu, &m, alu_and16(cpu, val, reg));
+            if (op32) {
+                uint32_t val = modrm_read32(cpu, &m);
+                uint32_t reg = *reg32_ptr(cpu, m.reg_field);
+                modrm_write32(cpu, &m, alu_and32(cpu, val, reg));
+            } else {
+                uint16_t val = modrm_read16(cpu, &m);
+                uint16_t reg = *reg16_ptr(cpu, m.reg_field);
+                modrm_write16(cpu, &m, alu_and16(cpu, val, reg));
+            }
             break;
         }
         case 0x22: { /* AND r8, r/m8 */
@@ -1820,12 +2078,18 @@ int cpu8086_run(dos_vm_t *vm)
             *dst = alu_and8(cpu, *dst, val);
             break;
         }
-        case 0x23: { /* AND r16, r/m16 */
+        case 0x23: { /* AND r16/32, r/m16/32 */
             modrm_byte = cpu_fetch8(cpu);
             m = decode_modrm(cpu, modrm_byte);
-            uint16_t *dst = reg16_ptr(cpu, m.reg_field);
-            uint16_t val = modrm_read16(cpu, &m);
-            *dst = alu_and16(cpu, *dst, val);
+            if (op32) {
+                uint32_t *dst = reg32_ptr(cpu, m.reg_field);
+                uint32_t val = modrm_read32(cpu, &m);
+                *dst = alu_and32(cpu, *dst, val);
+            } else {
+                uint16_t *dst = reg16_ptr(cpu, m.reg_field);
+                uint16_t val = modrm_read16(cpu, &m);
+                *dst = alu_and16(cpu, *dst, val);
+            }
             break;
         }
         case 0x24: { /* AND AL, imm8 */
@@ -1876,12 +2140,18 @@ int cpu8086_run(dos_vm_t *vm)
             modrm_write8(cpu, &m, alu_sub8(cpu, val, reg));
             break;
         }
-        case 0x29: { /* SUB r/m16, r16 */
+        case 0x29: { /* SUB r/m16/32, r16/32 */
             modrm_byte = cpu_fetch8(cpu);
             m = decode_modrm(cpu, modrm_byte);
-            uint16_t val = modrm_read16(cpu, &m);
-            uint16_t reg = *reg16_ptr(cpu, m.reg_field);
-            modrm_write16(cpu, &m, alu_sub16(cpu, val, reg));
+            if (op32) {
+                uint32_t val = modrm_read32(cpu, &m);
+                uint32_t reg = *reg32_ptr(cpu, m.reg_field);
+                modrm_write32(cpu, &m, alu_sub32(cpu, val, reg));
+            } else {
+                uint16_t val = modrm_read16(cpu, &m);
+                uint16_t reg = *reg16_ptr(cpu, m.reg_field);
+                modrm_write16(cpu, &m, alu_sub16(cpu, val, reg));
+            }
             break;
         }
         case 0x2A: { /* SUB r8, r/m8 */
@@ -1892,12 +2162,18 @@ int cpu8086_run(dos_vm_t *vm)
             *dst = alu_sub8(cpu, *dst, val);
             break;
         }
-        case 0x2B: { /* SUB r16, r/m16 */
+        case 0x2B: { /* SUB r16/32, r/m16/32 */
             modrm_byte = cpu_fetch8(cpu);
             m = decode_modrm(cpu, modrm_byte);
-            uint16_t *dst = reg16_ptr(cpu, m.reg_field);
-            uint16_t val = modrm_read16(cpu, &m);
-            *dst = alu_sub16(cpu, *dst, val);
+            if (op32) {
+                uint32_t *dst = reg32_ptr(cpu, m.reg_field);
+                uint32_t val = modrm_read32(cpu, &m);
+                *dst = alu_sub32(cpu, *dst, val);
+            } else {
+                uint16_t *dst = reg16_ptr(cpu, m.reg_field);
+                uint16_t val = modrm_read16(cpu, &m);
+                *dst = alu_sub16(cpu, *dst, val);
+            }
             break;
         }
         case 0x2C: { /* SUB AL, imm8 */
@@ -1945,12 +2221,18 @@ int cpu8086_run(dos_vm_t *vm)
             modrm_write8(cpu, &m, alu_xor8(cpu, val, reg));
             break;
         }
-        case 0x31: { /* XOR r/m16, r16 */
+        case 0x31: { /* XOR r/m16/32, r16/32 */
             modrm_byte = cpu_fetch8(cpu);
             m = decode_modrm(cpu, modrm_byte);
-            uint16_t val = modrm_read16(cpu, &m);
-            uint16_t reg = *reg16_ptr(cpu, m.reg_field);
-            modrm_write16(cpu, &m, alu_xor16(cpu, val, reg));
+            if (op32) {
+                uint32_t val = modrm_read32(cpu, &m);
+                uint32_t reg = *reg32_ptr(cpu, m.reg_field);
+                modrm_write32(cpu, &m, alu_xor32(cpu, val, reg));
+            } else {
+                uint16_t val = modrm_read16(cpu, &m);
+                uint16_t reg = *reg16_ptr(cpu, m.reg_field);
+                modrm_write16(cpu, &m, alu_xor16(cpu, val, reg));
+            }
             break;
         }
         case 0x32: { /* XOR r8, r/m8 */
@@ -1961,12 +2243,18 @@ int cpu8086_run(dos_vm_t *vm)
             *dst = alu_xor8(cpu, *dst, val);
             break;
         }
-        case 0x33: { /* XOR r16, r/m16 */
+        case 0x33: { /* XOR r16/32, r/m16/32 */
             modrm_byte = cpu_fetch8(cpu);
             m = decode_modrm(cpu, modrm_byte);
-            uint16_t *dst = reg16_ptr(cpu, m.reg_field);
-            uint16_t val = modrm_read16(cpu, &m);
-            *dst = alu_xor16(cpu, *dst, val);
+            if (op32) {
+                uint32_t *dst = reg32_ptr(cpu, m.reg_field);
+                uint32_t val = modrm_read32(cpu, &m);
+                *dst = alu_xor32(cpu, *dst, val);
+            } else {
+                uint16_t *dst = reg16_ptr(cpu, m.reg_field);
+                uint16_t val = modrm_read16(cpu, &m);
+                *dst = alu_xor16(cpu, *dst, val);
+            }
             break;
         }
         case 0x34: { /* XOR AL, imm8 */
@@ -2007,12 +2295,18 @@ int cpu8086_run(dos_vm_t *vm)
             alu_cmp8(cpu, val, reg);
             break;
         }
-        case 0x39: { /* CMP r/m16, r16 */
+        case 0x39: { /* CMP r/m16/32, r16/32 */
             modrm_byte = cpu_fetch8(cpu);
             m = decode_modrm(cpu, modrm_byte);
-            uint16_t val = modrm_read16(cpu, &m);
-            uint16_t reg = *reg16_ptr(cpu, m.reg_field);
-            alu_cmp16(cpu, val, reg);
+            if (op32) {
+                uint32_t val = modrm_read32(cpu, &m);
+                uint32_t reg = *reg32_ptr(cpu, m.reg_field);
+                alu_cmp32(cpu, val, reg);
+            } else {
+                uint16_t val = modrm_read16(cpu, &m);
+                uint16_t reg = *reg16_ptr(cpu, m.reg_field);
+                alu_cmp16(cpu, val, reg);
+            }
             break;
         }
         case 0x3A: { /* CMP r8, r/m8 */
@@ -2023,12 +2317,18 @@ int cpu8086_run(dos_vm_t *vm)
             alu_cmp8(cpu, reg, val);
             break;
         }
-        case 0x3B: { /* CMP r16, r/m16 */
+        case 0x3B: { /* CMP r16/32, r/m16/32 */
             modrm_byte = cpu_fetch8(cpu);
             m = decode_modrm(cpu, modrm_byte);
-            uint16_t reg = *reg16_ptr(cpu, m.reg_field);
-            uint16_t val = modrm_read16(cpu, &m);
-            alu_cmp16(cpu, reg, val);
+            if (op32) {
+                uint32_t reg = *reg32_ptr(cpu, m.reg_field);
+                uint32_t val = modrm_read32(cpu, &m);
+                alu_cmp32(cpu, reg, val);
+            } else {
+                uint16_t reg = *reg16_ptr(cpu, m.reg_field);
+                uint16_t val = modrm_read16(cpu, &m);
+                alu_cmp16(cpu, reg, val);
+            }
             break;
         }
         case 0x3C: { /* CMP AL, imm8 */
@@ -2184,12 +2484,18 @@ int cpu8086_run(dos_vm_t *vm)
             update_flags_logic8(cpu, val & reg);
             break;
         }
-        case 0x85: { /* TEST r/m16, r16 */
+        case 0x85: { /* TEST r/m16/32, r16/32 */
             modrm_byte = cpu_fetch8(cpu);
             m = decode_modrm(cpu, modrm_byte);
-            uint16_t val = modrm_read16(cpu, &m);
-            uint16_t reg = *reg16_ptr(cpu, m.reg_field);
-            update_flags_logic16(cpu, val & reg);
+            if (op32) {
+                uint32_t val = modrm_read32(cpu, &m);
+                uint32_t reg = *reg32_ptr(cpu, m.reg_field);
+                update_flags_logic32(cpu, val & reg);
+            } else {
+                uint16_t val = modrm_read16(cpu, &m);
+                uint16_t reg = *reg16_ptr(cpu, m.reg_field);
+                update_flags_logic16(cpu, val & reg);
+            }
             break;
         }
 
@@ -2205,13 +2511,20 @@ int cpu8086_run(dos_vm_t *vm)
             *reg = val;
             break;
         }
-        case 0x87: { /* XCHG r/m16, r16 */
+        case 0x87: { /* XCHG r/m16/32, r16/32 */
             modrm_byte = cpu_fetch8(cpu);
             m = decode_modrm(cpu, modrm_byte);
-            uint16_t *reg = reg16_ptr(cpu, m.reg_field);
-            uint16_t val = modrm_read16(cpu, &m);
-            modrm_write16(cpu, &m, *reg);
-            *reg = val;
+            if (op32) {
+                uint32_t *rp = reg32_ptr(cpu, m.reg_field);
+                uint32_t mem_val = modrm_read32(cpu, &m);
+                modrm_write32(cpu, &m, *rp);
+                *rp = mem_val;
+            } else {
+                uint16_t *reg = reg16_ptr(cpu, m.reg_field);
+                uint16_t val = modrm_read16(cpu, &m);
+                modrm_write16(cpu, &m, *reg);
+                *reg = val;
+            }
             break;
         }
 
@@ -2260,39 +2573,69 @@ int cpu8086_run(dos_vm_t *vm)
             break;
         }
 
-        case 0x8D: { /* LEA r16, m */
+        case 0x8D: { /* LEA r16/32, m */
             modrm_byte = cpu_fetch8(cpu);
             uint8_t lea_mod = (modrm_byte >> 6) & 3;
             uint8_t lea_reg = (modrm_byte >> 3) & 7;
             uint8_t lea_rm  = modrm_byte & 7;
-            uint16_t ea = 0;
 
-            /* Compute offset without segment (LEA ignores segment) */
-            switch (lea_rm) {
-            case 0: ea = cpu->bx + cpu->si; break;
-            case 1: ea = cpu->bx + cpu->di; break;
-            case 2: ea = cpu->bp + cpu->si; break;
-            case 3: ea = cpu->bp + cpu->di; break;
-            case 4: ea = cpu->si; break;
-            case 5: ea = cpu->di; break;
-            case 6:
-                if (lea_mod == 0) {
-                    ea = cpu_fetch16(cpu);
+            if (adr32) {
+                /* 32-bit effective address (no segment applied for LEA) */
+                uint32_t ea32 = 0;
+                if (lea_rm == 4) {
+                    /* SIB */
+                    uint8_t sib   = cpu_fetch8(cpu);
+                    uint8_t scale = (sib >> 6) & 3;
+                    uint8_t index = (sib >> 3) & 7;
+                    uint8_t base  = sib & 7;
+                    if (base == 5 && lea_mod == 0)
+                        ea32 = cpu_fetch32(cpu);
+                    else
+                        ea32 = *reg32_ptr(cpu, base);
+                    if (index != 4)
+                        ea32 += *reg32_ptr(cpu, index) << scale;
+                } else if (lea_rm == 5 && lea_mod == 0) {
+                    ea32 = cpu_fetch32(cpu);
                 } else {
-                    ea = cpu->bp;
+                    ea32 = *reg32_ptr(cpu, lea_rm);
                 }
-                break;
-            case 7: ea = cpu->bx; break;
-            }
+                if (lea_mod == 1)
+                    ea32 += (uint32_t)(int32_t)(int8_t)cpu_fetch8(cpu);
+                else if (lea_mod == 2)
+                    ea32 += cpu_fetch32(cpu);
 
-            if (lea_mod == 1) {
-                ea += (uint16_t)(int16_t)(int8_t)cpu_fetch8(cpu);
-            } else if (lea_mod == 2) {
-                ea += cpu_fetch16(cpu);
-            }
-            /* mod==3 is technically invalid for LEA, but we handle it */
+                if (op32)
+                    *reg32_ptr(cpu, lea_reg) = ea32;
+                else
+                    *reg16_ptr(cpu, lea_reg) = (uint16_t)ea32;
+            } else {
+                /* 16-bit effective address */
+                uint16_t ea = 0;
+                switch (lea_rm) {
+                case 0: ea = cpu->bx + cpu->si; break;
+                case 1: ea = cpu->bx + cpu->di; break;
+                case 2: ea = cpu->bp + cpu->si; break;
+                case 3: ea = cpu->bp + cpu->di; break;
+                case 4: ea = cpu->si; break;
+                case 5: ea = cpu->di; break;
+                case 6:
+                    if (lea_mod == 0)
+                        ea = cpu_fetch16(cpu);
+                    else
+                        ea = cpu->bp;
+                    break;
+                case 7: ea = cpu->bx; break;
+                }
+                if (lea_mod == 1)
+                    ea += (uint16_t)(int16_t)(int8_t)cpu_fetch8(cpu);
+                else if (lea_mod == 2)
+                    ea += cpu_fetch16(cpu);
 
-            *reg16_ptr(cpu, lea_reg) = ea;
+                if (op32)
+                    *reg32_ptr(cpu, lea_reg) = (uint32_t)ea;
+                else
+                    *reg16_ptr(cpu, lea_reg) = ea;
+            }
             break;
         }
 
@@ -2342,13 +2685,25 @@ int cpu8086_run(dos_vm_t *vm)
         /* ════════════════════════════════════════════════════════════
          *  CALL far  (0x9A)
          * ════════════════════════════════════════════════════════════ */
-        case 0x9A: { /* CALL far ptr16:16 */
-            uint16_t off = cpu_fetch16(cpu);
-            uint16_t seg = cpu_fetch16(cpu);
-            cpu_push16(cpu, cpu->cs);
-            cpu_push16(cpu, cpu->ip);
+        case 0x9A: { /* CALL far ptr16:16/32 */
+            uint32_t off; uint16_t seg;
+            if (op32) {
+                off = cpu_fetch32(cpu);
+                seg = cpu_fetch16(cpu);
+                cpu_push32(cpu, (uint32_t)cpu->cs);
+                cpu_push32(cpu, cpu->eip);
+            } else {
+                off = cpu_fetch16(cpu);
+                seg = cpu_fetch16(cpu);
+                cpu_push16(cpu, cpu->cs);
+                cpu_push16(cpu, cpu->ip);
+            }
             cpu->cs = seg;
-            cpu->ip = off;
+            cpu->eip = off;
+            if (cpu->protected_mode) {
+                cpu->pm_cs_loaded = true;
+                cpu_update_cs_mode(cpu);
+            }
             break;
         }
 
@@ -2384,36 +2739,42 @@ int cpu8086_run(dos_vm_t *vm)
         /* ════════════════════════════════════════════════════════════
          *  MOV AL/AX, moffs  (0xA0 - 0xA3)
          * ════════════════════════════════════════════════════════════ */
-        case 0xA0: { /* MOV AL, [moffs16] */
-            uint16_t off = cpu_fetch16(cpu);
+        case 0xA0: { /* MOV AL, [moffs] */
+            uint32_t off = adr32 ? cpu_fetch32(cpu) : cpu_fetch16(cpu);
             uint16_t seg = (cpu->seg_override >= 0)
                            ? *seg_ptr(cpu, (uint8_t)cpu->seg_override)
                            : cpu->ds;
-            cpu->al = dos_mem_read8(vm, dos_linear(seg, off));
+            cpu->al = dos_mem_read8(vm, dos_addr(vm, seg, off));
             break;
         }
-        case 0xA1: { /* MOV AX, [moffs16] */
-            uint16_t off = cpu_fetch16(cpu);
+        case 0xA1: { /* MOV AX/EAX, [moffs] */
+            uint32_t off = adr32 ? cpu_fetch32(cpu) : cpu_fetch16(cpu);
             uint16_t seg = (cpu->seg_override >= 0)
                            ? *seg_ptr(cpu, (uint8_t)cpu->seg_override)
                            : cpu->ds;
-            cpu->ax = dos_mem_read16(vm, dos_linear(seg, off));
+            if (op32)
+                cpu->eax = dos_mem_read32(vm, dos_addr(vm, seg, off));
+            else
+                cpu->ax = dos_mem_read16(vm, dos_addr(vm, seg, off));
             break;
         }
-        case 0xA2: { /* MOV [moffs16], AL */
-            uint16_t off = cpu_fetch16(cpu);
+        case 0xA2: { /* MOV [moffs], AL */
+            uint32_t off = adr32 ? cpu_fetch32(cpu) : cpu_fetch16(cpu);
             uint16_t seg = (cpu->seg_override >= 0)
                            ? *seg_ptr(cpu, (uint8_t)cpu->seg_override)
                            : cpu->ds;
-            dos_mem_write8(vm, dos_linear(seg, off), cpu->al);
+            dos_mem_write8(vm, dos_addr(vm, seg, off), cpu->al);
             break;
         }
-        case 0xA3: { /* MOV [moffs16], AX */
-            uint16_t off = cpu_fetch16(cpu);
+        case 0xA3: { /* MOV [moffs], AX/EAX */
+            uint32_t off = adr32 ? cpu_fetch32(cpu) : cpu_fetch16(cpu);
             uint16_t seg = (cpu->seg_override >= 0)
                            ? *seg_ptr(cpu, (uint8_t)cpu->seg_override)
                            : cpu->ds;
-            dos_mem_write16(vm, dos_linear(seg, off), cpu->ax);
+            if (op32)
+                dos_mem_write32(vm, dos_addr(vm, seg, off), cpu->eax);
+            else
+                dos_mem_write16(vm, dos_addr(vm, seg, off), cpu->ax);
             break;
         }
 
@@ -2422,82 +2783,109 @@ int cpu8086_run(dos_vm_t *vm)
          * ════════════════════════════════════════════════════════════ */
         case 0xA4: { /* MOVSB */
             uint16_t src_seg = string_src_seg(cpu);
+            int32_t d1 = get_flag(cpu, FLAG_DF) ? -1 : 1;
             if (cpu->rep_active) {
-                while (cpu->cx != 0) {
-                    uint8_t val = dos_mem_read8(vm, dos_linear(src_seg, cpu->si));
-                    dos_mem_write8(vm, dos_linear(cpu->es, cpu->di), val);
-                    cpu->si += get_flag(cpu, FLAG_DF) ? (uint16_t)-1 : 1;
-                    cpu->di += get_flag(cpu, FLAG_DF) ? (uint16_t)-1 : 1;
-                    cpu->cx--;
+                while (str_cx_nz(cpu, adr32)) {
+                    uint8_t val = dos_mem_read8(vm, str_src(vm, cpu, src_seg, adr32));
+                    dos_mem_write8(vm, str_dst(vm, cpu, adr32), val);
+                    str_adv_si(cpu, d1, adr32);
+                    str_adv_di(cpu, d1, adr32);
+                    str_dec_cx(cpu, adr32);
                 }
             } else {
-                uint8_t val = dos_mem_read8(vm, dos_linear(src_seg, cpu->si));
-                dos_mem_write8(vm, dos_linear(cpu->es, cpu->di), val);
-                cpu->si += get_flag(cpu, FLAG_DF) ? (uint16_t)-1 : 1;
-                cpu->di += get_flag(cpu, FLAG_DF) ? (uint16_t)-1 : 1;
+                uint8_t val = dos_mem_read8(vm, str_src(vm, cpu, src_seg, adr32));
+                dos_mem_write8(vm, str_dst(vm, cpu, adr32), val);
+                str_adv_si(cpu, d1, adr32);
+                str_adv_di(cpu, d1, adr32);
             }
             break;
         }
-        case 0xA5: { /* MOVSW */
+        case 0xA5: { /* MOVSW/D */
             uint16_t src_seg = string_src_seg(cpu);
+            int32_t dsz = op32 ? 4 : 2;
+            int32_t d1 = get_flag(cpu, FLAG_DF) ? -dsz : dsz;
             if (cpu->rep_active) {
-                while (cpu->cx != 0) {
-                    uint16_t val = dos_mem_read16(vm, dos_linear(src_seg, cpu->si));
-                    dos_mem_write16(vm, dos_linear(cpu->es, cpu->di), val);
-                    cpu->si += get_flag(cpu, FLAG_DF) ? (uint16_t)-2 : 2;
-                    cpu->di += get_flag(cpu, FLAG_DF) ? (uint16_t)-2 : 2;
-                    cpu->cx--;
+                while (str_cx_nz(cpu, adr32)) {
+                    if (op32) {
+                        uint32_t val = dos_mem_read32(vm, str_src(vm, cpu, src_seg, adr32));
+                        dos_mem_write32(vm, str_dst(vm, cpu, adr32), val);
+                    } else {
+                        uint16_t val = dos_mem_read16(vm, str_src(vm, cpu, src_seg, adr32));
+                        dos_mem_write16(vm, str_dst(vm, cpu, adr32), val);
+                    }
+                    str_adv_si(cpu, d1, adr32);
+                    str_adv_di(cpu, d1, adr32);
+                    str_dec_cx(cpu, adr32);
                 }
             } else {
-                uint16_t val = dos_mem_read16(vm, dos_linear(src_seg, cpu->si));
-                dos_mem_write16(vm, dos_linear(cpu->es, cpu->di), val);
-                cpu->si += get_flag(cpu, FLAG_DF) ? (uint16_t)-2 : 2;
-                cpu->di += get_flag(cpu, FLAG_DF) ? (uint16_t)-2 : 2;
+                if (op32) {
+                    uint32_t val = dos_mem_read32(vm, str_src(vm, cpu, src_seg, adr32));
+                    dos_mem_write32(vm, str_dst(vm, cpu, adr32), val);
+                } else {
+                    uint16_t val = dos_mem_read16(vm, str_src(vm, cpu, src_seg, adr32));
+                    dos_mem_write16(vm, str_dst(vm, cpu, adr32), val);
+                }
+                str_adv_si(cpu, d1, adr32);
+                str_adv_di(cpu, d1, adr32);
             }
             break;
         }
         case 0xA6: { /* CMPSB */
             uint16_t src_seg = string_src_seg(cpu);
+            int32_t d1 = get_flag(cpu, FLAG_DF) ? -1 : 1;
             if (cpu->rep_active) {
-                while (cpu->cx != 0) {
-                    uint8_t s = dos_mem_read8(vm, dos_linear(src_seg, cpu->si));
-                    uint8_t d = dos_mem_read8(vm, dos_linear(cpu->es, cpu->di));
+                while (str_cx_nz(cpu, adr32)) {
+                    uint8_t s = dos_mem_read8(vm, str_src(vm, cpu, src_seg, adr32));
+                    uint8_t d = dos_mem_read8(vm, str_dst(vm, cpu, adr32));
                     alu_cmp8(cpu, s, d);
-                    cpu->si += get_flag(cpu, FLAG_DF) ? (uint16_t)-1 : 1;
-                    cpu->di += get_flag(cpu, FLAG_DF) ? (uint16_t)-1 : 1;
-                    cpu->cx--;
-                    /* REPZ: stop if ZF=0, REPNZ: stop if ZF=1 */
+                    str_adv_si(cpu, d1, adr32);
+                    str_adv_di(cpu, d1, adr32);
+                    str_dec_cx(cpu, adr32);
                     if (cpu->rep_type == 1 && !get_flag(cpu, FLAG_ZF)) break;
                     if (cpu->rep_type == 2 && get_flag(cpu, FLAG_ZF))  break;
                 }
             } else {
-                uint8_t s = dos_mem_read8(vm, dos_linear(src_seg, cpu->si));
-                uint8_t d = dos_mem_read8(vm, dos_linear(cpu->es, cpu->di));
+                uint8_t s = dos_mem_read8(vm, str_src(vm, cpu, src_seg, adr32));
+                uint8_t d = dos_mem_read8(vm, str_dst(vm, cpu, adr32));
                 alu_cmp8(cpu, s, d);
-                cpu->si += get_flag(cpu, FLAG_DF) ? (uint16_t)-1 : 1;
-                cpu->di += get_flag(cpu, FLAG_DF) ? (uint16_t)-1 : 1;
+                str_adv_si(cpu, d1, adr32);
+                str_adv_di(cpu, d1, adr32);
             }
             break;
         }
-        case 0xA7: { /* CMPSW */
+        case 0xA7: { /* CMPSW/D */
             uint16_t src_seg = string_src_seg(cpu);
+            int32_t dsz = op32 ? 4 : 2;
+            int32_t d1 = get_flag(cpu, FLAG_DF) ? -dsz : dsz;
             if (cpu->rep_active) {
-                while (cpu->cx != 0) {
-                    uint16_t s = dos_mem_read16(vm, dos_linear(src_seg, cpu->si));
-                    uint16_t d = dos_mem_read16(vm, dos_linear(cpu->es, cpu->di));
-                    alu_cmp16(cpu, s, d);
-                    cpu->si += get_flag(cpu, FLAG_DF) ? (uint16_t)-2 : 2;
-                    cpu->di += get_flag(cpu, FLAG_DF) ? (uint16_t)-2 : 2;
-                    cpu->cx--;
+                while (str_cx_nz(cpu, adr32)) {
+                    if (op32) {
+                        uint32_t s = dos_mem_read32(vm, str_src(vm, cpu, src_seg, adr32));
+                        uint32_t d = dos_mem_read32(vm, str_dst(vm, cpu, adr32));
+                        alu_cmp32(cpu, s, d);
+                    } else {
+                        uint16_t s = dos_mem_read16(vm, str_src(vm, cpu, src_seg, adr32));
+                        uint16_t d = dos_mem_read16(vm, str_dst(vm, cpu, adr32));
+                        alu_cmp16(cpu, s, d);
+                    }
+                    str_adv_si(cpu, d1, adr32);
+                    str_adv_di(cpu, d1, adr32);
+                    str_dec_cx(cpu, adr32);
                     if (cpu->rep_type == 1 && !get_flag(cpu, FLAG_ZF)) break;
                     if (cpu->rep_type == 2 && get_flag(cpu, FLAG_ZF))  break;
                 }
             } else {
-                uint16_t s = dos_mem_read16(vm, dos_linear(src_seg, cpu->si));
-                uint16_t d = dos_mem_read16(vm, dos_linear(cpu->es, cpu->di));
-                alu_cmp16(cpu, s, d);
-                cpu->si += get_flag(cpu, FLAG_DF) ? (uint16_t)-2 : 2;
-                cpu->di += get_flag(cpu, FLAG_DF) ? (uint16_t)-2 : 2;
+                if (op32) {
+                    uint32_t s = dos_mem_read32(vm, str_src(vm, cpu, src_seg, adr32));
+                    uint32_t d = dos_mem_read32(vm, str_dst(vm, cpu, adr32));
+                    alu_cmp32(cpu, s, d);
+                } else {
+                    uint16_t s = dos_mem_read16(vm, str_src(vm, cpu, src_seg, adr32));
+                    uint16_t d = dos_mem_read16(vm, str_dst(vm, cpu, adr32));
+                    alu_cmp16(cpu, s, d);
+                }
+                str_adv_si(cpu, d1, adr32);
+                str_adv_di(cpu, d1, adr32);
             }
             break;
         }
@@ -2517,90 +2905,121 @@ int cpu8086_run(dos_vm_t *vm)
         }
 
         case 0xAA: { /* STOSB */
+            int32_t d1 = get_flag(cpu, FLAG_DF) ? -1 : 1;
             if (cpu->rep_active) {
-                while (cpu->cx != 0) {
-                    dos_mem_write8(vm, dos_linear(cpu->es, cpu->di), cpu->al);
-                    cpu->di += get_flag(cpu, FLAG_DF) ? (uint16_t)-1 : 1;
-                    cpu->cx--;
+                while (str_cx_nz(cpu, adr32)) {
+                    dos_mem_write8(vm, str_dst(vm, cpu, adr32), cpu->al);
+                    str_adv_di(cpu, d1, adr32);
+                    str_dec_cx(cpu, adr32);
                 }
             } else {
-                dos_mem_write8(vm, dos_linear(cpu->es, cpu->di), cpu->al);
-                cpu->di += get_flag(cpu, FLAG_DF) ? (uint16_t)-1 : 1;
+                dos_mem_write8(vm, str_dst(vm, cpu, adr32), cpu->al);
+                str_adv_di(cpu, d1, adr32);
             }
             break;
         }
-        case 0xAB: { /* STOSW */
+        case 0xAB: { /* STOSW/D */
+            int32_t dsz = op32 ? 4 : 2;
+            int32_t d1 = get_flag(cpu, FLAG_DF) ? -dsz : dsz;
             if (cpu->rep_active) {
-                while (cpu->cx != 0) {
-                    dos_mem_write16(vm, dos_linear(cpu->es, cpu->di), cpu->ax);
-                    cpu->di += get_flag(cpu, FLAG_DF) ? (uint16_t)-2 : 2;
-                    cpu->cx--;
+                while (str_cx_nz(cpu, adr32)) {
+                    if (op32)
+                        dos_mem_write32(vm, str_dst(vm, cpu, adr32), cpu->eax);
+                    else
+                        dos_mem_write16(vm, str_dst(vm, cpu, adr32), cpu->ax);
+                    str_adv_di(cpu, d1, adr32);
+                    str_dec_cx(cpu, adr32);
                 }
             } else {
-                dos_mem_write16(vm, dos_linear(cpu->es, cpu->di), cpu->ax);
-                cpu->di += get_flag(cpu, FLAG_DF) ? (uint16_t)-2 : 2;
+                if (op32)
+                    dos_mem_write32(vm, str_dst(vm, cpu, adr32), cpu->eax);
+                else
+                    dos_mem_write16(vm, str_dst(vm, cpu, adr32), cpu->ax);
+                str_adv_di(cpu, d1, adr32);
             }
             break;
         }
         case 0xAC: { /* LODSB */
             uint16_t src_seg = string_src_seg(cpu);
+            int32_t d1 = get_flag(cpu, FLAG_DF) ? -1 : 1;
             if (cpu->rep_active) {
-                while (cpu->cx != 0) {
-                    cpu->al = dos_mem_read8(vm, dos_linear(src_seg, cpu->si));
-                    cpu->si += get_flag(cpu, FLAG_DF) ? (uint16_t)-1 : 1;
-                    cpu->cx--;
+                while (str_cx_nz(cpu, adr32)) {
+                    cpu->al = dos_mem_read8(vm, str_src(vm, cpu, src_seg, adr32));
+                    str_adv_si(cpu, d1, adr32);
+                    str_dec_cx(cpu, adr32);
                 }
             } else {
-                cpu->al = dos_mem_read8(vm, dos_linear(src_seg, cpu->si));
-                cpu->si += get_flag(cpu, FLAG_DF) ? (uint16_t)-1 : 1;
+                cpu->al = dos_mem_read8(vm, str_src(vm, cpu, src_seg, adr32));
+                str_adv_si(cpu, d1, adr32);
             }
             break;
         }
-        case 0xAD: { /* LODSW */
+        case 0xAD: { /* LODSW/D */
             uint16_t src_seg = string_src_seg(cpu);
+            int32_t dsz = op32 ? 4 : 2;
+            int32_t d1 = get_flag(cpu, FLAG_DF) ? -dsz : dsz;
             if (cpu->rep_active) {
-                while (cpu->cx != 0) {
-                    cpu->ax = dos_mem_read16(vm, dos_linear(src_seg, cpu->si));
-                    cpu->si += get_flag(cpu, FLAG_DF) ? (uint16_t)-2 : 2;
-                    cpu->cx--;
+                while (str_cx_nz(cpu, adr32)) {
+                    if (op32)
+                        cpu->eax = dos_mem_read32(vm, str_src(vm, cpu, src_seg, adr32));
+                    else
+                        cpu->ax = dos_mem_read16(vm, str_src(vm, cpu, src_seg, adr32));
+                    str_adv_si(cpu, d1, adr32);
+                    str_dec_cx(cpu, adr32);
                 }
             } else {
-                cpu->ax = dos_mem_read16(vm, dos_linear(src_seg, cpu->si));
-                cpu->si += get_flag(cpu, FLAG_DF) ? (uint16_t)-2 : 2;
+                if (op32)
+                    cpu->eax = dos_mem_read32(vm, str_src(vm, cpu, src_seg, adr32));
+                else
+                    cpu->ax = dos_mem_read16(vm, str_src(vm, cpu, src_seg, adr32));
+                str_adv_si(cpu, d1, adr32);
             }
             break;
         }
         case 0xAE: { /* SCASB */
+            int32_t d1 = get_flag(cpu, FLAG_DF) ? -1 : 1;
             if (cpu->rep_active) {
-                while (cpu->cx != 0) {
-                    uint8_t val = dos_mem_read8(vm, dos_linear(cpu->es, cpu->di));
+                while (str_cx_nz(cpu, adr32)) {
+                    uint8_t val = dos_mem_read8(vm, str_dst(vm, cpu, adr32));
                     alu_cmp8(cpu, cpu->al, val);
-                    cpu->di += get_flag(cpu, FLAG_DF) ? (uint16_t)-1 : 1;
-                    cpu->cx--;
+                    str_adv_di(cpu, d1, adr32);
+                    str_dec_cx(cpu, adr32);
                     if (cpu->rep_type == 1 && !get_flag(cpu, FLAG_ZF)) break;
                     if (cpu->rep_type == 2 && get_flag(cpu, FLAG_ZF))  break;
                 }
             } else {
-                uint8_t val = dos_mem_read8(vm, dos_linear(cpu->es, cpu->di));
+                uint8_t val = dos_mem_read8(vm, str_dst(vm, cpu, adr32));
                 alu_cmp8(cpu, cpu->al, val);
-                cpu->di += get_flag(cpu, FLAG_DF) ? (uint16_t)-1 : 1;
+                str_adv_di(cpu, d1, adr32);
             }
             break;
         }
-        case 0xAF: { /* SCASW */
+        case 0xAF: { /* SCASW/D */
+            int32_t dsz = op32 ? 4 : 2;
+            int32_t d1 = get_flag(cpu, FLAG_DF) ? -dsz : dsz;
             if (cpu->rep_active) {
-                while (cpu->cx != 0) {
-                    uint16_t val = dos_mem_read16(vm, dos_linear(cpu->es, cpu->di));
-                    alu_cmp16(cpu, cpu->ax, val);
-                    cpu->di += get_flag(cpu, FLAG_DF) ? (uint16_t)-2 : 2;
-                    cpu->cx--;
+                while (str_cx_nz(cpu, adr32)) {
+                    if (op32) {
+                        uint32_t val = dos_mem_read32(vm, str_dst(vm, cpu, adr32));
+                        alu_cmp32(cpu, cpu->eax, val);
+                    } else {
+                        uint16_t val = dos_mem_read16(vm, str_dst(vm, cpu, adr32));
+                        alu_cmp16(cpu, cpu->ax, val);
+                    }
+                    str_adv_di(cpu, d1, adr32);
+                    str_dec_cx(cpu, adr32);
                     if (cpu->rep_type == 1 && !get_flag(cpu, FLAG_ZF)) break;
                     if (cpu->rep_type == 2 && get_flag(cpu, FLAG_ZF))  break;
                 }
             } else {
-                uint16_t val = dos_mem_read16(vm, dos_linear(cpu->es, cpu->di));
-                alu_cmp16(cpu, cpu->ax, val);
-                cpu->di += get_flag(cpu, FLAG_DF) ? (uint16_t)-2 : 2;
+                if (op32) {
+                    uint32_t val = dos_mem_read32(vm, str_dst(vm, cpu, adr32));
+                    alu_cmp32(cpu, cpu->eax, val);
+                } else {
+                    uint16_t val = dos_mem_read16(vm, str_dst(vm, cpu, adr32));
+                    alu_cmp16(cpu, cpu->ax, val);
+                }
+                str_adv_di(cpu, d1, adr32);
             }
             break;
         }
@@ -2640,12 +3059,19 @@ int cpu8086_run(dos_vm_t *vm)
             modrm_write8(cpu, &m, shift_rotate8(cpu, m.reg_field, val, cnt));
             break;
         }
-        case 0xC1: { /* Group 2 r/m16, imm8 */
+        case 0xC1: { /* Group 2 r/m16/32, imm8 */
             modrm_byte = cpu_fetch8(cpu);
             m = decode_modrm(cpu, modrm_byte);
-            uint16_t val = modrm_read16(cpu, &m);
-            uint8_t cnt = cpu_fetch8(cpu);
-            modrm_write16(cpu, &m, shift_rotate16(cpu, m.reg_field, val, cnt));
+            uint8_t cnt;
+            if (op32) {
+                uint32_t val = modrm_read32(cpu, &m);
+                cnt = cpu_fetch8(cpu);
+                modrm_write32(cpu, &m, shift_rotate32(cpu, m.reg_field, val, cnt));
+            } else {
+                uint16_t val = modrm_read16(cpu, &m);
+                cnt = cpu_fetch8(cpu);
+                modrm_write16(cpu, &m, shift_rotate16(cpu, m.reg_field, val, cnt));
+            }
             break;
         }
 
@@ -2680,11 +3106,16 @@ int cpu8086_run(dos_vm_t *vm)
             modrm_write8(cpu, &m, imm);
             break;
         }
-        case 0xC7: { /* MOV r/m16, imm16 */
+        case 0xC7: { /* MOV r/m16/32, imm16/32 */
             modrm_byte = cpu_fetch8(cpu);
             m = decode_modrm(cpu, modrm_byte);
-            uint16_t imm = cpu_fetch16(cpu);
-            modrm_write16(cpu, &m, imm);
+            if (op32) {
+                uint32_t imm = cpu_fetch32(cpu);
+                modrm_write32(cpu, &m, imm);
+            } else {
+                uint16_t imm = cpu_fetch16(cpu);
+                modrm_write16(cpu, &m, imm);
+            }
             break;
         }
 
@@ -2712,7 +3143,7 @@ int cpu8086_run(dos_vm_t *vm)
                 if (nesting > 0) {
                     for (uint8_t i = 1; i < nesting; i++) {
                         cpu->bp -= 2;
-                        cpu_push16(cpu, dos_mem_read16(vm, dos_linear(cpu->ss, cpu->bp)));
+                        cpu_push16(cpu, dos_mem_read16(vm, dos_addr(vm, cpu->ss, cpu->bp)));
                     }
                     cpu_push16(cpu, frame);
                 }
@@ -2736,9 +3167,19 @@ int cpu8086_run(dos_vm_t *vm)
          * ════════════════════════════════════════════════════════════ */
         case 0xCA: { /* RETF, pop imm16 */
             uint16_t pop_bytes = cpu_fetch16(cpu);
-            cpu->ip = cpu_pop16(cpu);
-            cpu->cs = cpu_pop16(cpu);
-            cpu->sp += pop_bytes;
+            if (op32) {
+                cpu->eip = cpu_pop32(cpu);
+                cpu->cs  = (uint16_t)cpu_pop32(cpu);
+                cpu->esp += pop_bytes;
+            } else {
+                cpu->ip = cpu_pop16(cpu);
+                cpu->cs = cpu_pop16(cpu);
+                cpu->sp += pop_bytes;
+            }
+            if (cpu->protected_mode) {
+                cpu->pm_cs_loaded = true;
+                cpu_update_cs_mode(cpu);
+            }
             break;
         }
         case 0xCB: /* RETF */
@@ -2749,15 +3190,9 @@ int cpu8086_run(dos_vm_t *vm)
                 cpu->ip = cpu_pop16(cpu);
                 cpu->cs = cpu_pop16(cpu);
             }
-            if (cpu->protected_mode && !cpu->pm_cs_loaded) {
+            if (cpu->protected_mode) {
                 cpu->pm_cs_loaded = true;
-                cpu->op_size_32 = true;
-                cpu->addr_size_32 = true;
-                serial_puts("[DOS] PM RETF: CS=");
-                serial_puthex(cpu->cs, 4);
-                serial_puts(" EIP=");
-                serial_puthex(cpu->eip, 8);
-                serial_puts(" — PM selector loaded\n");
+                cpu_update_cs_mode(cpu);
             }
             break;
 
@@ -2872,6 +3307,8 @@ int cpu8086_run(dos_vm_t *vm)
                 cpu->cs    = cpu_pop16(cpu);
                 cpu->flags = (cpu_pop16(cpu) & 0x0FFF) | FLAGS_FIXED;
             }
+            if (cpu->protected_mode)
+                cpu_update_cs_mode(cpu);
             break;
 
         /* ════════════════════════════════════════════════════════════
@@ -2884,11 +3321,16 @@ int cpu8086_run(dos_vm_t *vm)
             modrm_write8(cpu, &m, shift_rotate8(cpu, m.reg_field, val, 1));
             break;
         }
-        case 0xD1: { /* Group 2 r/m16, 1 */
+        case 0xD1: { /* Group 2 r/m16/32, 1 */
             modrm_byte = cpu_fetch8(cpu);
             m = decode_modrm(cpu, modrm_byte);
-            uint16_t val = modrm_read16(cpu, &m);
-            modrm_write16(cpu, &m, shift_rotate16(cpu, m.reg_field, val, 1));
+            if (op32) {
+                uint32_t val = modrm_read32(cpu, &m);
+                modrm_write32(cpu, &m, shift_rotate32(cpu, m.reg_field, val, 1));
+            } else {
+                uint16_t val = modrm_read16(cpu, &m);
+                modrm_write16(cpu, &m, shift_rotate16(cpu, m.reg_field, val, 1));
+            }
             break;
         }
 
@@ -2902,11 +3344,16 @@ int cpu8086_run(dos_vm_t *vm)
             modrm_write8(cpu, &m, shift_rotate8(cpu, m.reg_field, val, cpu->cl));
             break;
         }
-        case 0xD3: { /* Group 2 r/m16, CL */
+        case 0xD3: { /* Group 2 r/m16/32, CL */
             modrm_byte = cpu_fetch8(cpu);
             m = decode_modrm(cpu, modrm_byte);
-            uint16_t val = modrm_read16(cpu, &m);
-            modrm_write16(cpu, &m, shift_rotate16(cpu, m.reg_field, val, cpu->cl));
+            if (op32) {
+                uint32_t val = modrm_read32(cpu, &m);
+                modrm_write32(cpu, &m, shift_rotate32(cpu, m.reg_field, val, cpu->cl));
+            } else {
+                uint16_t val = modrm_read16(cpu, &m);
+                modrm_write16(cpu, &m, shift_rotate16(cpu, m.reg_field, val, cpu->cl));
+            }
             break;
         }
 
@@ -2917,7 +3364,7 @@ int cpu8086_run(dos_vm_t *vm)
             uint16_t seg = (cpu->seg_override >= 0)
                            ? *seg_ptr(cpu, (uint8_t)cpu->seg_override)
                            : cpu->ds;
-            cpu->al = dos_mem_read8(vm, dos_linear(seg, cpu->bx + cpu->al));
+            cpu->al = dos_mem_read8(vm, dos_addr(vm, seg, (uint32_t)(adr32 ? cpu->ebx : cpu->bx) + cpu->al));
             break;
         }
 
@@ -3022,17 +3469,9 @@ int cpu8086_run(dos_vm_t *vm)
             cpu->cs = seg;
             cpu->eip = off;
 
-            /* First FAR JMP in PM: CS now has a valid PM selector.
-             * Enable GDT translation for subsequent memory accesses. */
-            if (cpu->protected_mode && !cpu->pm_cs_loaded) {
+            if (cpu->protected_mode) {
                 cpu->pm_cs_loaded = true;
-                cpu->op_size_32 = true;
-                cpu->addr_size_32 = true;
-                serial_puts("[DOS] PM FAR JMP: CS=");
-                serial_puthex(seg, 4);
-                serial_puts(" EIP=");
-                serial_puthex(off, 8);
-                serial_puts(" — PM selector loaded, GDT translation active\n");
+                cpu_update_cs_mode(cpu);
             }
             break;
         }
@@ -3355,17 +3794,30 @@ int cpu8086_run(dos_vm_t *vm)
                 cpu->ip = target;
                 break;
             }
-            case 3: { /* CALL FAR m16:16 (indirect) */
+            case 3: { /* CALL FAR m16:16/32 (indirect) */
                 if (m.is_reg) {
                     serial_puts("[8086] FF /3 on register\n");
                     break;
                 }
-                uint16_t off = dos_mem_read16(vm, m.addr);
-                uint16_t seg = dos_mem_read16(vm, m.addr + 2);
-                cpu_push16(cpu, cpu->cs);
-                cpu_push16(cpu, cpu->ip);
-                cpu->cs = seg;
-                cpu->ip = off;
+                if (op32) {
+                    uint32_t off32 = dos_mem_read32(vm, m.addr);
+                    uint16_t seg = dos_mem_read16(vm, m.addr + 4);
+                    cpu_push32(cpu, (uint32_t)cpu->cs);
+                    cpu_push32(cpu, cpu->eip);
+                    cpu->cs = seg;
+                    cpu->eip = off32;
+                } else {
+                    uint16_t off = dos_mem_read16(vm, m.addr);
+                    uint16_t seg = dos_mem_read16(vm, m.addr + 2);
+                    cpu_push16(cpu, cpu->cs);
+                    cpu_push16(cpu, cpu->ip);
+                    cpu->cs = seg;
+                    cpu->ip = off;
+                }
+                if (cpu->protected_mode) {
+                    cpu->pm_cs_loaded = true;
+                    cpu_update_cs_mode(cpu);
+                }
                 break;
             }
             case 4: { /* JMP r/m16 (near indirect) */
@@ -3389,13 +3841,9 @@ int cpu8086_run(dos_vm_t *vm)
                     cpu->cs = seg;
                     cpu->ip = off;
                 }
-                /* Detect PM far jump after LMSW/MOV CR0 */
                 if (cpu->protected_mode) {
-                    serial_puts("[DOS] FAR JMP indirect in PM: CS=");
-                    serial_puthex(cpu->cs, 4);
-                    serial_puts(" EIP=");
-                    serial_puthex(cpu->eip, 8);
-                    serial_puts("\n");
+                    cpu->pm_cs_loaded = true;
+                    cpu_update_cs_mode(cpu);
                     extern void dos_transfer_to_native(dos_vm_t *vm);
                     dos_transfer_to_native(vm);
                 }
@@ -3507,26 +3955,28 @@ int cpu8086_run(dos_vm_t *vm)
          * ════════════════════════════════════════════════════════════ */
         case 0x6C: { /* INSB: ES:[DI] <- port[DX] */
             uint8_t val = dos_io_read8(vm, cpu->dx);
-            dos_mem_write8(vm, dos_linear(cpu->es, cpu->di), val);
-            cpu->di += (cpu->flags & FLAG_DF) ? (uint16_t)-1 : 1;
+            dos_mem_write8(vm, str_dst(vm, cpu, adr32), val);
+            str_adv_di(cpu, (cpu->flags & FLAG_DF) ? -1 : 1, adr32);
             break;
         }
         case 0x6D: { /* INSW: ES:[DI] <- port[DX] */
             uint16_t val = dos_io_read16(vm, cpu->dx);
-            dos_mem_write16(vm, dos_linear(cpu->es, cpu->di), val);
-            cpu->di += (cpu->flags & FLAG_DF) ? (uint16_t)-2 : 2;
+            dos_mem_write16(vm, str_dst(vm, cpu, adr32), val);
+            str_adv_di(cpu, (cpu->flags & FLAG_DF) ? -2 : 2, adr32);
             break;
         }
         case 0x6E: { /* OUTSB: port[DX] <- DS:[SI] */
-            uint8_t val = dos_mem_read8(vm, dos_linear(cpu->ds, cpu->si));
+            uint16_t src_seg = string_src_seg(cpu);
+            uint8_t val = dos_mem_read8(vm, str_src(vm, cpu, src_seg, adr32));
             dos_io_write8(vm, cpu->dx, val);
-            cpu->si += (cpu->flags & FLAG_DF) ? (uint16_t)-1 : 1;
+            str_adv_si(cpu, (cpu->flags & FLAG_DF) ? -1 : 1, adr32);
             break;
         }
         case 0x6F: { /* OUTSW: port[DX] <- DS:[SI] */
-            uint16_t val = dos_mem_read16(vm, dos_linear(cpu->ds, cpu->si));
+            uint16_t src_seg = string_src_seg(cpu);
+            uint16_t val = dos_mem_read16(vm, str_src(vm, cpu, src_seg, adr32));
             dos_io_write16(vm, cpu->dx, val);
-            cpu->si += (cpu->flags & FLAG_DF) ? (uint16_t)-2 : 2;
+            str_adv_si(cpu, (cpu->flags & FLAG_DF) ? -2 : 2, adr32);
             break;
         }
 
@@ -3673,6 +4123,23 @@ int cpu8086_run(dos_vm_t *vm)
         /* Increment instruction counter */
         cpu->insn_count++;
 
+        /* Trace PM instructions for debugging */
+        if (cpu->pm_cs_loaded && cpu->insn_count >= 2978 && cpu->insn_count < 3100) {
+            serial_puts("[PM] #");
+            serial_putdec(cpu->insn_count);
+            serial_puts(" op=");
+            serial_puthex(opcode, 2);
+            serial_puts(" CS:EIP=");
+            serial_puthex(cpu->cs, 4);
+            serial_puts(":");
+            serial_puthex(cpu->eip, 8);
+            serial_puts(" ESP=");
+            serial_puthex(cpu->esp, 8);
+            serial_puts(" EAX=");
+            serial_puthex(cpu->eax, 8);
+            serial_puts("\n");
+        }
+
         /* Detect CS corruption: log when CS changes to null/invalid in PM */
         if (cpu->pm_cs_loaded && cpu->cs == 0x0000 && cpu->insn_count < 50000) {
             serial_puts("[BUG] CS=0 at #");
@@ -3713,7 +4180,7 @@ int cpu8086_run(dos_vm_t *vm)
             serial_puts(":");
             serial_puthex(cpu->eip, 8);
             /* Dump 16 bytes at the loop */
-            uint32_t la = dos_linear(cpu->cs, (uint16_t)(cpu->eip - 8));
+            uint32_t la = dos_addr(vm, cpu->cs, cpu->eip - 8);
             serial_puts(" bytes[-8..+8]:");
             for (int i = 0; i < 16; i++) {
                 serial_puts(" ");

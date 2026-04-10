@@ -226,26 +226,28 @@ void dpmi_enter_protected_mode(dos_vm_t *vm)
     serial_puts(" client\n");
 
     /* Allocate flat code descriptor: base=0, limit=4GB,
-     * code+readable, DPL=3, present, 32-bit, 4KB granularity */
+     * code+readable, DPL=3, present, USE16, 4KB granularity.
+     * Per DPMI spec, initial CS is always USE16 even for 32-bit clients.
+     * DOS4GW will allocate USE32 selectors via INT 31h later. */
     dpmi->sel_code = dpmi_alloc_descriptor(dpmi);
     {
         uint16_t idx = dpmi_sel_to_index(dpmi->sel_code);
         dpmi_descriptor_t *d = &dpmi->ldt[idx];
         uint8_t access = DESC_PRESENT | DESC_DPL3 | DESC_SEGMENT |
                          DESC_CODE | DESC_READABLE;
-        uint8_t flags = DESC_GRANULARITY | DESC_32BIT;
+        uint8_t flags = DESC_GRANULARITY;  /* USE16: no DESC_32BIT */
         dpmi_build_desc(d, 0x00000000, 0xFFFFFFFF, access, flags);
     }
 
     /* Allocate flat data descriptor: base=0, limit=4GB,
-     * data+writable, DPL=3, present, 32-bit, 4KB granularity */
+     * data+writable, DPL=3, present, USE16, 4KB granularity */
     dpmi->sel_data = dpmi_alloc_descriptor(dpmi);
     {
         uint16_t idx = dpmi_sel_to_index(dpmi->sel_data);
         dpmi_descriptor_t *d = &dpmi->ldt[idx];
         uint8_t access = DESC_PRESENT | DESC_DPL3 | DESC_SEGMENT |
                          DESC_WRITABLE;
-        uint8_t flags = DESC_GRANULARITY | DESC_32BIT;
+        uint8_t flags = DESC_GRANULARITY;  /* USE16 */
         dpmi_build_desc(d, 0x00000000, 0xFFFFFFFF, access, flags);
     }
 
@@ -256,7 +258,7 @@ void dpmi_enter_protected_mode(dos_vm_t *vm)
         dpmi_descriptor_t *d = &dpmi->ldt[idx];
         uint8_t access = DESC_PRESENT | DESC_DPL3 | DESC_SEGMENT |
                          DESC_WRITABLE;
-        uint8_t flags = DESC_GRANULARITY | DESC_32BIT;
+        uint8_t flags = DESC_GRANULARITY;  /* USE16 */
         dpmi_build_desc(d, 0x00000000, 0xFFFFFFFF, access, flags);
     }
 
@@ -272,10 +274,26 @@ void dpmi_enter_protected_mode(dos_vm_t *vm)
         dpmi_build_desc(d, psp_base, 0xFF, access, flags);
     }
 
-    /* Switch CPU to protected mode */
+    /* The DPMI entry stub was called via FAR CALL, then INT 0xFE.
+     * Stack layout (16-bit real mode, growing down):
+     *   SP+0: INT return IP (stub+2)
+     *   SP+2: INT return CS (F000)
+     *   SP+4: FLAGS
+     *   SP+6: caller IP (DOS4GW code after CALL FAR)
+     *   SP+8: caller CS
+     * Skip both frames — set EIP to the caller's flat return address. */
+    uint32_t stack_base = ((uint32_t)cpu->ss << 4) + cpu->sp;
+    uint16_t caller_ip = dos_mem_read16(vm, stack_base + 6);
+    uint16_t caller_cs = dos_mem_read16(vm, stack_base + 8);
+    uint32_t flat_eip = ((uint32_t)caller_cs << 4) + caller_ip;
+    uint32_t flat_esp = stack_base + 10;  /* skip INT frame (6) + CALL frame (4) */
+
+    /* Switch CPU to protected mode (USE16 initially — DOS4GW will
+     * switch to USE32 by loading a 32-bit code selector via INT 31h) */
     cpu->protected_mode = true;
-    cpu->op_size_32     = true;
-    cpu->addr_size_32   = true;
+    cpu->pm_cs_loaded   = true;
+    cpu->op_size_32     = false;  /* USE16 segment: default 16-bit */
+    cpu->addr_size_32   = false;  /* USE16 segment: default 16-bit */
     cpu->cr0           |= 1;  /* PE bit */
 
     /* Set segment registers to our new selectors */
@@ -286,6 +304,10 @@ void dpmi_enter_protected_mode(dos_vm_t *vm)
     cpu->fs = dpmi->sel_data;
     cpu->gs = dpmi->sel_data;
 
+    /* Set flat addresses */
+    cpu->eip = flat_eip;
+    cpu->esp = flat_esp;
+
     /* Return success in AX */
     cpu->eax = 0;
 
@@ -295,6 +317,19 @@ void dpmi_enter_protected_mode(dos_vm_t *vm)
     serial_puthex(cpu->ds, 4);
     serial_puts(" SS=");
     serial_puthex(cpu->ss, 4);
+    serial_puts(" EIP=");
+    serial_puthex(cpu->eip, 8);
+    serial_puts(" ESP=");
+    serial_puthex(cpu->esp, 8);
+    serial_puts("\n  caller_cs=");
+    serial_puthex(caller_cs, 4);
+    serial_puts(" caller_ip=");
+    serial_puthex(caller_ip, 4);
+    serial_puts(" bytes@EIP:");
+    for (int i = 0; i < 16; i++) {
+        serial_puts(" ");
+        serial_puthex(vm->mem[flat_eip + i], 2);
+    }
     serial_puts("\n");
 }
 
@@ -474,6 +509,71 @@ void dos_int31_dpmi(dos_vm_t *vm)
         break;
     }
 
+    /* ── AX=000Bh: Get Descriptor ────────────────────────────────── */
+    case 0x000B: {
+        uint16_t sel = cpu->bx;
+        uint16_t idx = dpmi_sel_to_index(sel);
+        if (idx >= DPMI_MAX_DESCRIPTORS || !(dpmi->ldt[idx].access & DESC_PRESENT)) {
+            cpu->eflags |= FLAG_CF;
+            cpu->ax = 0x8022;
+            break;
+        }
+        /* Copy 8-byte descriptor to ES:EDI (or ES:DI in 16-bit) */
+        uint32_t dst = dpmi_translate(vm, cpu->es,
+                       dpmi->is_32bit ? cpu->edi : cpu->di);
+        dpmi_descriptor_t *d = &dpmi->ldt[idx];
+        for (int i = 0; i < 8; i++)
+            dos_mem_write8(vm, dst + i, ((uint8_t *)d)[i]);
+        cpu->eflags &= ~FLAG_CF;
+        break;
+    }
+
+    /* ── AX=000Ch: Set Descriptor ────────────────────────────────── */
+    case 0x000C: {
+        uint16_t sel = cpu->bx;
+        uint16_t idx = dpmi_sel_to_index(sel);
+        if (idx >= DPMI_MAX_DESCRIPTORS) {
+            cpu->eflags |= FLAG_CF;
+            cpu->ax = 0x8022;
+            break;
+        }
+        /* Read 8-byte descriptor from ES:EDI (or ES:DI in 16-bit) */
+        uint32_t src = dpmi_translate(vm, cpu->es,
+                       dpmi->is_32bit ? cpu->edi : cpu->di);
+        dpmi_descriptor_t *d = &dpmi->ldt[idx];
+        for (int i = 0; i < 8; i++)
+            ((uint8_t *)d)[i] = dos_mem_read8(vm, src + i);
+        cpu->eflags &= ~FLAG_CF;
+        break;
+    }
+
+    /* ── AX=0305h: Get State Save/Restore Addresses ──────────────── */
+    case 0x0305:
+        /* Return dummy addresses — DOS4GW checks but rarely calls.
+         * BX:CX = real-mode save/restore address, SI:DI = PM address.
+         * AX = buffer size needed (0 = no state to save). */
+        cpu->ax = 0;  /* state buffer size = 0 */
+        cpu->bx = 0; cpu->cx = 0;
+        cpu->esi = 0; cpu->edi = 0;
+        cpu->eflags &= ~FLAG_CF;
+        break;
+
+    /* ── AX=0306h: Get Raw Mode Switch Addresses ─────────────────── */
+    case 0x0306:
+        /* Return dummy addresses — we handle mode switching via INT FE.
+         * BX:CX = real→PM switch, SI:DI = PM→real switch. */
+        cpu->bx = 0; cpu->cx = 0;
+        cpu->esi = 0; cpu->edi = 0;
+        cpu->eflags &= ~FLAG_CF;
+        break;
+
+    /* ── AX=0A00h: Get Vendor-Specific API Entry Point ───────────── */
+    case 0x0A00:
+        /* No vendor extensions — return error (carry set) */
+        cpu->eflags |= FLAG_CF;
+        cpu->ax = 0x8001;  /* unsupported */
+        break;
+
     /* ── AX=0100h: Allocate DOS Memory Block ───────────────────── */
     case 0x0100: {
         uint16_t paragraphs = cpu->bx;
@@ -543,6 +643,35 @@ void dos_int31_dpmi(dos_vm_t *vm)
         uint32_t ivt_addr = (uint32_t)int_num * 4;
         dos_mem_write16(vm, ivt_addr, cpu->dx);         /* offset */
         dos_mem_write16(vm, ivt_addr + 2, cpu->cx);     /* segment */
+        cpu->eflags &= ~FLAG_CF;
+        break;
+    }
+
+    /* ── AX=0202h: Get Processor Exception Handler Vector ────────── */
+    case 0x0202: {
+        uint8_t exc_num = cpu->bl;
+        if (exc_num > 31) {
+            cpu->eflags |= FLAG_CF;
+            cpu->ax = 0x8021;
+            break;
+        }
+        /* Return from pm_vectors — exceptions use vectors 0-31 */
+        cpu->cx  = dpmi->pm_vectors[exc_num].sel;
+        cpu->edx = dpmi->pm_vectors[exc_num].off;
+        cpu->eflags &= ~FLAG_CF;
+        break;
+    }
+
+    /* ── AX=0203h: Set Processor Exception Handler Vector ────────── */
+    case 0x0203: {
+        uint8_t exc_num = cpu->bl;
+        if (exc_num > 31) {
+            cpu->eflags |= FLAG_CF;
+            cpu->ax = 0x8021;
+            break;
+        }
+        dpmi->pm_vectors[exc_num].sel = cpu->cx;
+        dpmi->pm_vectors[exc_num].off = cpu->edx;
         cpu->eflags &= ~FLAG_CF;
         break;
     }
