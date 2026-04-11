@@ -543,6 +543,24 @@ void dos_int31_dpmi(dos_vm_t *vm)
         dpmi_descriptor_t *d = &dpmi->ldt[idx];
         for (int i = 0; i < 8; i++)
             ((uint8_t *)d)[i] = dos_mem_read8(vm, src + i);
+
+        /* Log descriptor details for debugging */
+        uint32_t base = dpmi_desc_get_base(d);
+        uint32_t limit = dpmi_desc_get_limit(d);
+        bool is_code = (d->access & DESC_CODE) != 0;
+        bool is_32 = (d->flags_lim & 0x40) != 0;
+        serial_puts("[DPMI] SetDesc sel=");
+        serial_puthex(sel, 4);
+        serial_puts(" base=");
+        serial_puthex(base, 8);
+        serial_puts(" lim=");
+        serial_puthex(limit, 8);
+        serial_puts(is_code ? " CODE" : " DATA");
+        serial_puts(is_32 ? " 32" : " 16");
+        serial_puts(" acc=");
+        serial_puthex(d->access, 2);
+        serial_puts("\n");
+
         cpu->eflags &= ~FLAG_CF;
         break;
     }

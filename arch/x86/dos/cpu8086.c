@@ -179,9 +179,21 @@ static void cpu_update_cs_mode(cpu8086_state_t *cpu)
     uint16_t index = cpu->cs >> 3;
     bool ti = (cpu->cs >> 2) & 1;
     if (ti && index < DPMI_MAX_DESCRIPTORS) {
-        bool d32 = (vm->dpmi.ldt[index].flags_lim & 0x40) != 0; /* D bit */
+        bool d32 = (vm->dpmi.ldt[index].flags_lim & 0x40) != 0;
+        bool old32 = cpu->op_size_32;
         cpu->op_size_32 = d32;
         cpu->addr_size_32 = d32;
+        if (d32 != old32) {
+            serial_puts("[DPMI] CS mode: ");
+            serial_puthex(cpu->cs, 4);
+            serial_puts(d32 ? " -> USE32" : " -> USE16");
+            serial_puts(" EIP=");
+            serial_puthex(cpu->eip, 8);
+            serial_puts(" base=");
+            uint32_t base = dpmi_desc_get_base(&vm->dpmi.ldt[index]);
+            serial_puthex(base, 8);
+            serial_puts("\n");
+        }
     }
 }
 
@@ -1155,6 +1167,8 @@ int cpu8086_run(dos_vm_t *vm)
     /* JIT engine (optional — NULL if not initialized) */
     jit_state_t *jit = (jit_state_t *)vm->jit;
 
+    uint16_t prev_cs = cpu->cs;
+
     while (cpu->running && !cpu->halted) {
 
         /* ── Hybrid dispatcher: JIT cache → compile if hot → interpret ── */
@@ -1621,20 +1635,16 @@ int cpu8086_run(dos_vm_t *vm)
                     cpu->cr0 = cr_val;
                     if ((cr_val & 1) && !cpu->protected_mode) {
                         cpu->protected_mode = true;
-                        serial_puts("[DOS] MOV CR0: PE bit set — switching to native execution\n");
-                        serial_puts("[DOS] GDT base=");
-                        serial_puthex(cpu->gdtr.base, 8);
-                        serial_puts(" IDT base=");
-                        serial_puthex(cpu->idtr.base, 8);
-                        serial_puts("\n");
-                        /* Transfer to native 32-bit execution.
-                         * The next instruction after MOV CR0 is typically a far JMP
-                         * to a 32-bit code segment. We let the interpreter execute
-                         * that JMP, then transfer on the next fetch in PM. */
+                        serial_puts("[DOS] MOV CR0: PE=1\n");
                         extern void dos_transfer_to_native(dos_vm_t *vm);
                         dos_transfer_to_native(vm);
-                        /* If transfer succeeds, does not return here.
-                         * If it fails (e.g., can't set up GDT), continues interpreting. */
+                    } else if (!(cr_val & 1) && cpu->protected_mode) {
+                        /* PM → RM transition (DOS4GW raw mode switch) */
+                        cpu->protected_mode = false;
+                        cpu->pm_cs_loaded   = false;
+                        cpu->op_size_32     = false;
+                        cpu->addr_size_32   = false;
+                        serial_puts("[DOS] MOV CR0: PE=0 -> real mode\n");
                     }
                     break;
                 case 2: cpu->cr2 = cr_val; break;
@@ -3225,8 +3235,9 @@ int cpu8086_run(dos_vm_t *vm)
          * ════════════════════════════════════════════════════════════ */
         case 0xCD: { /* INT imm8 */
             uint8_t int_num = cpu_fetch8(cpu);
-            /* Log ALL INTs */
-            if (cpu->insn_count < 5000) {
+            /* Log INTs: all for first 5K, then only INT 31h/21h */
+            if (cpu->insn_count < 5000 ||
+                (cpu->insn_count < 1000000 && (int_num == 0x31 || int_num == 0x21))) {
                 serial_puts("[INT] ");
                 serial_puthex(int_num, 2);
                 serial_puts(" AH=");
@@ -4124,7 +4135,7 @@ int cpu8086_run(dos_vm_t *vm)
         cpu->insn_count++;
 
         /* Trace PM instructions for debugging */
-        if (cpu->pm_cs_loaded && cpu->insn_count >= 2978 && cpu->insn_count < 3100) {
+        if (cpu->pm_cs_loaded && cpu->insn_count >= 38000 && cpu->insn_count < 39000) {
             serial_puts("[PM] #");
             serial_putdec(cpu->insn_count);
             serial_puts(" op=");
@@ -4140,7 +4151,21 @@ int cpu8086_run(dos_vm_t *vm)
             serial_puts("\n");
         }
 
-        /* Detect CS corruption: log when CS changes to null/invalid in PM */
+        /* Detect CS changes in PM */
+        if (cpu->pm_cs_loaded && cpu->cs != prev_cs && cpu->insn_count < 1000000) {
+            serial_puts("[CS] ");
+            serial_puthex(prev_cs, 4);
+            serial_puts(" -> ");
+            serial_puthex(cpu->cs, 4);
+            serial_puts(" at #");
+            serial_putdec(cpu->insn_count);
+            serial_puts(" op=");
+            serial_puthex(opcode, 2);
+            serial_puts(" EIP=");
+            serial_puthex(cpu->eip, 8);
+            serial_puts("\n");
+            prev_cs = cpu->cs;
+        }
         if (cpu->pm_cs_loaded && cpu->cs == 0x0000 && cpu->insn_count < 50000) {
             serial_puts("[BUG] CS=0 at #");
             serial_putdec(cpu->insn_count);
