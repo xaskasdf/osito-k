@@ -272,6 +272,47 @@ void *mem_alloc_aligned(uint64_t size, uint64_t alignment)
     return NULL;
 }
 
+/* ── High-memory allocator (for kernel structures) ────────────────
+ * Allocates from the top of available memory downward. Used by
+ * pt_alloc_page to keep kernel page tables out of the low-memory
+ * range (0x400000..0x10000000) where ET_EXEC binaries typically
+ * load. Without this, loading a binary whose vaddr overlaps the
+ * kernel's PML4 physical address corrupts the page tables. */
+void *mem_alloc_aligned_high(uint64_t size, uint64_t alignment)
+{
+    uint64_t pages = (size + PAGE_SIZE - 1) >> PAGE_SHIFT;
+    uint64_t align_pages = alignment >> PAGE_SHIFT;
+    if (align_pages == 0) align_pages = 1;
+
+    if (free_pages < pages) return NULL;
+
+    uint64_t limit = max_tracked_page ? max_tracked_page : MAX_PHYS_PAGES;
+    /* Start from the top and work down */
+    uint64_t p = (limit - pages) & ~(align_pages - 1);
+
+    while (p >= 4096) {
+        uint64_t ok = 1;
+        uint64_t i;
+        for (i = 0; i < pages; i++) {
+            if (!bitmap_test(p + i)) { ok = 0; break; }
+        }
+
+        if (ok) {
+            for (i = 0; i < pages; i++) {
+                bitmap_clear(p + i);
+                free_pages--;
+            }
+            return (void *)(p << PAGE_SHIFT);
+        }
+
+        /* Move down past the failed page */
+        if (p < align_pages) break;
+        p -= align_pages;
+    }
+
+    return NULL;
+}
+
 /* ── Info ────────────────────────────────────────────────────── */
 
 uint64_t mem_get_free(void)

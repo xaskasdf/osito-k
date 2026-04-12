@@ -64,9 +64,15 @@ static uint32_t  pt_pages_used;  /* Number of 4KB pages allocated for tables */
 
 /* ── Allocate a zeroed page for page tables ──────────────────── */
 
+extern void *mem_alloc_aligned_high(uint64_t size, uint64_t alignment);
+
 static uint64_t *pt_alloc_page(void)
 {
-    uint64_t *page = (uint64_t *)mem_alloc_aligned(PAGE_SIZE, PAGE_SIZE);
+    /* Allocate from high memory to avoid collisions with ET_EXEC
+     * binaries that load in low memory (typically 0x400000-0x10000000). */
+    uint64_t *page = (uint64_t *)mem_alloc_aligned_high(PAGE_SIZE, PAGE_SIZE);
+    if (!page)
+        page = (uint64_t *)mem_alloc_aligned(PAGE_SIZE, PAGE_SIZE);
     if (page) {
         memset(page, 0, PAGE_SIZE);
         pt_pages_used++;
