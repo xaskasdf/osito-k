@@ -27,9 +27,11 @@ extern void sched_tick(void *frame);
 
 /* Paging (paging.c) */
 extern int  paging_set_flags(uint64_t virt, uint64_t flags);
+extern uint64_t *paging_get_pte(uint64_t virt);
 #define PTE_PRESENT  (1ULL << 0)
 #define PTE_WRITABLE (1ULL << 1)
 #define PTE_GLOBAL   (1ULL << 8)
+#define PTE_NX       (1ULL << 63)
 
 /* NULL page write-through: page 0 is read-only+NX. When compat32 code
  * writes to NULL (e.g., FString copies), we temporarily make it writable,
@@ -38,7 +40,29 @@ extern int  paging_set_flags(uint64_t virt, uint64_t flags);
  * from 0 into garbage values like 1. */
 volatile int g_null_page_dirty = 0;
 uint32_t g_base_seh_frame_addr = 0;  /* winexec base SEH frame on PE32 stack */
-#define PTE_NX (1ULL << 63)
+
+/* Win32/PE compat32 helper: re-zero and re-protect the NULL page.
+ *
+ * Currently a NO-OP. The original implementation did
+ *   memset((void *)0, 0, 4096); paging_set_flags(0, RO|NX); invlpg(0);
+ * which crashed zsh during demand-paged ELF startup with #DF (the write
+ * to address 0 faulted even though the PTE was marked writable, possibly
+ * due to TLB / SMP coherence or stale large-page mapping at vaddr 0).
+ *
+ * This helper is only meaningful for the Win32/PE compat32 layer, where
+ * NULL pointer derefs are tolerated by temporarily marking page 0
+ * writable in the #PF handler. For non-PE workloads (zsh, GTA5, anything
+ * ELF-loaded), the post-write cleanup is unnecessary — those programs
+ * shouldn't be writing to NULL in the first place, and if they do it's a
+ * SIGSEGV.
+ *
+ * TODO: re-introduce the cleanup gated on a "compat32 active" flag set
+ * by winexec_main. Until then we just clear the dirty flag so subsequent
+ * timer ticks don't loop. */
+static void null_page_clean(void)
+{
+    g_null_page_dirty = 0;
+}
 
 /* Process management (process.c) */
 extern void proc_exit(int32_t code);
@@ -762,12 +786,7 @@ void isr_handler(interrupt_frame_t *frame)
          * future NULL pointer derefs read 0 (vtable=0) instead of stale data.
          * Without this, a NULL object pointer reads garbage from page 0 as a
          * vtable and jumps to BIOS IVT addresses → #UD. */
-        if (g_null_page_dirty) {
-            g_null_page_dirty = 0;
-            memset((void *)0, 0, 4096);
-            paging_set_flags(0, PTE_PRESENT | PTE_GLOBAL | PTE_NX);
-            __asm__ volatile ("invlpg (%0)" :: "r"((uint64_t)0) : "memory");
-        }
+        if (g_null_page_dirty) null_page_clean();
 
         /* X-SCHED: preemptive scheduler — check quantum, switch if expired.
          * frame points to saved GPRs on the current process's stack. */
@@ -852,12 +871,8 @@ void isr_handler(interrupt_frame_t *frame)
 
         /* TF single-step after NULL page write: re-protect + re-zero page 0 */
         if (g_null_page_dirty) {
-            g_null_page_dirty = 0;
             frame->rflags &= ~(1ULL << 8);  /* clear TF */
-            /* Re-zero the page and re-protect as read-only+NX */
-            memset((void *)0, 0, 4096);
-            paging_set_flags(0, PTE_PRESENT | PTE_GLOBAL | PTE_NX);
-            __asm__ volatile ("invlpg (%0)" :: "r"((uint64_t)0) : "memory");
+            null_page_clean();
             __asm__ volatile ("mov %0, %%dr6" : : "r"((uint64_t)0));
             return;
         }
@@ -1061,12 +1076,7 @@ void isr_handler(interrupt_frame_t *frame)
                             frame->rip = ret;
                             frame->rsp += 4;
                             frame->rax = 0;
-                            if (g_null_page_dirty) {
-                                g_null_page_dirty = 0;
-                                memset((void *)0, 0, 4096);
-                                paging_set_flags(0, PTE_PRESENT | PTE_GLOBAL | PTE_NX);
-                                __asm__ volatile ("invlpg (%0)" :: "r"((uint64_t)0) : "memory");
-                            }
+                            if (g_null_page_dirty) null_page_clean();
                             return;
                         }
                     }
@@ -1129,12 +1139,7 @@ void isr_handler(interrupt_frame_t *frame)
                     }
                     frame->rip = real_browse;
                     frame->rcx = frame->rdi; /* this = GameEngine */
-                    if (g_null_page_dirty) {
-                        g_null_page_dirty = 0;
-                        memset((void *)0, 0, 4096);
-                        paging_set_flags(0, PTE_PRESENT | PTE_GLOBAL | PTE_NX);
-                        __asm__ volatile ("invlpg (%0)" :: "r"((uint64_t)0) : "memory");
-                    }
+                    if (g_null_page_dirty) null_page_clean();
                     return;
                 }
 
@@ -1146,12 +1151,7 @@ void isr_handler(interrupt_frame_t *frame)
                     frame->rip = retaddr;
                     frame->rsp += 4;
                     frame->rax = 0;
-                    if (g_null_page_dirty) {
-                        g_null_page_dirty = 0;
-                        memset((void *)0, 0, 4096);
-                        paging_set_flags(0, PTE_PRESENT | PTE_GLOBAL | PTE_NX);
-                        __asm__ volatile ("invlpg (%0)" :: "r"((uint64_t)0) : "memory");
-                    }
+                    if (g_null_page_dirty) null_page_clean();
                     return;
                 }
 
@@ -1236,22 +1236,12 @@ void isr_handler(interrupt_frame_t *frame)
                         frame->rip = sp32[0];
                         frame->rsp += 4;
                         frame->rax = frame->rsi & 0xFFFFFFFF;
-                        if (g_null_page_dirty) {
-                            g_null_page_dirty = 0;
-                            memset((void *)0, 0, 4096);
-                            paging_set_flags(0, PTE_PRESENT | PTE_GLOBAL | PTE_NX);
-                            __asm__ volatile ("invlpg (%0)" :: "r"((uint64_t)0) : "memory");
-                        }
+                        if (g_null_page_dirty) null_page_clean();
                         return;
                     }
                 }
                 /* First NULL-CALL with valid SEH: re-zero page 0 and dispatch */
-                if (g_null_page_dirty) {
-                    g_null_page_dirty = 0;
-                    memset((void *)0, 0, 4096);
-                    paging_set_flags(0, PTE_PRESENT | PTE_GLOBAL | PTE_NX);
-                    __asm__ volatile ("invlpg (%0)" :: "r"((uint64_t)0) : "memory");
-                }
+                if (g_null_page_dirty) null_page_clean();
             }
         }
     }
@@ -1490,12 +1480,7 @@ void isr_handler(interrupt_frame_t *frame)
              * stays dirty until the next APIC timer tick. If an exception
              * fires before the tick, catch handlers read stale data from
              * page 0 (e.g., GMalloc vtable deref → cascading NULL call). */
-            if (g_null_page_dirty) {
-                g_null_page_dirty = 0;
-                memset((void *)0, 0, 4096);
-                paging_set_flags(0, PTE_PRESENT | PTE_GLOBAL | PTE_NX);
-                __asm__ volatile ("invlpg (%0)" :: "r"((uint64_t)0) : "memory");
-            }
+            if (g_null_page_dirty) null_page_clean();
 
             int handled = compat32_seh_dispatch((void *)&er64);
             if (handled) {

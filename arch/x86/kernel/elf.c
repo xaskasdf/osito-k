@@ -536,33 +536,57 @@ static uint64_t elf_setup_stack(elf_loaded_t *loaded,
     };
     int auxv_count = sizeof(auxv) / sizeof(auxv[0]);
 
-    /* Push auxv (reverse order so AT_NULL is last/highest) */
-    for (int i = auxv_count - 1; i >= 0; i--) {
-        sp -= 8; *(uint64_t *)sp = auxv[i].val;
-        sp -= 8; *(uint64_t *)sp = auxv[i].type;
+    /* Build the final stack frame in FORWARD order (low → high addresses).
+     *
+     * Linux ABI layout at process entry, growing upward from RSP:
+     *   argc
+     *   argv[0..argc-1]   pointers
+     *   NULL              argv terminator
+     *   envp[0..n-1]      pointers
+     *   NULL              envp terminator
+     *   auxv[0..n-1]      type+val pairs
+     *   AT_NULL/0         auxv terminator (already in auxv[])
+     *
+     * This used to be a series of backward push loops that GCC at -O2
+     * vectorized into SSE stores with loop bounds that wrapped rax past 0,
+     * faulting on a write to address -8. Forward construction with a
+     * single advancing pointer cannot be reordered into a backward loop. */
+
+    /* Compute total bytes for the frame */
+    uint64_t frame_bytes =
+        8                                    /* argc */
+        + (uint64_t)(effective_argc + 1) * 8 /* argv + NULL */
+        + (uint64_t)(DEFAULT_ENV_COUNT + 1) * 8 /* envp + NULL */
+        + (uint64_t)auxv_count * 16;         /* auxv pairs */
+
+    /* Allocate, then 16-byte align the bottom of the frame (where SP will
+     * point on entry — System V x86-64 ABI requires 16-byte alignment so
+     * that the first call instruction sees a 16-byte-aligned stack). */
+    sp -= frame_bytes;
+    sp &= ~0xFULL;
+
+    uint64_t *out = (uint64_t *)sp;
+
+    /* argc */
+    *out++ = (uint64_t)effective_argc;
+
+    /* argv pointers + NULL */
+    for (int i = 0; i < effective_argc; i++)
+        *out++ = argv_ptrs[i];
+    *out++ = 0;
+
+    /* envp pointers + NULL */
+    for (int i = 0; i < DEFAULT_ENV_COUNT; i++)
+        *out++ = env_ptrs[i];
+    *out++ = 0;
+
+    /* auxv pairs (already includes AT_NULL terminator at the end) */
+    for (int i = 0; i < auxv_count; i++) {
+        *out++ = auxv[i].type;
+        *out++ = auxv[i].val;
     }
 
-    /* Push envp terminator (NULL) then envp pointers */
-    sp -= 8;
-    *(uint64_t *)sp = 0;
-    for (int i = DEFAULT_ENV_COUNT - 1; i >= 0; i--) {
-        sp -= 8;
-        *(uint64_t *)sp = env_ptrs[i];
-    }
-
-    /* Push argv terminator (NULL) */
-    sp -= 8;
-    *(uint64_t *)sp = 0;
-
-    /* Push argv pointers (reverse order) */
-    for (int i = effective_argc - 1; i >= 0; i--) {
-        sp -= 8;
-        *(uint64_t *)sp = argv_ptrs[i];
-    }
-
-    /* Push argc */
-    sp -= 8;
-    *(uint64_t *)sp = (uint64_t)effective_argc;
+    #undef PUSH_U64
 
     loaded->stack_top = sp;
     (void)stack_pages;
