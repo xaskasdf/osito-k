@@ -414,6 +414,7 @@ static int elf_load_segments(const uint8_t *data, uint64_t data_size,
 
 /* ── Set up user stack ───────────────────────────────────────── */
 
+__attribute__((noinline))
 static uint64_t elf_setup_stack(elf_loaded_t *loaded,
                                 int argc, const char **argv)
 {
