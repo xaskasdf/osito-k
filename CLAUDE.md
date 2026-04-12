@@ -353,6 +353,12 @@ arch/arm/          SM8350 (ROG Phone 5) bare-metal port — see docs/aarch64-det
 | X-LOCKD | Lock dependency validator (deadlock detection) | Done |
 | X-PSI   | Pressure Stall Information (CPU/memory/IO pressure) | Done |
 | X-KOBJ  | Unified device model (kobject tree, sysfs foundation) | Done |
+| X-VFSU  | VFS unified layer (osfs2/osfs3 dual-dispatch, vfs_node_t) | Done |
+| X-OSFS3D| OsitoFS v3 driver (inodes, extents, hierarchical dirs, 1MB blocks) | Done |
+| X-DEMAND| Demand-paged ELF loader (header read + VMA_FILE_ELF + page-fault dispatch) | Done |
+| X-ETXTBSY| ETXTBSY on write-open of running binaries (proc_is_executing) | Done |
+| X-PIPEBLK| Pipes block by default (O_NONBLOCK honored) | Done |
+| X-HIGHMEM| High-memory allocator for kernel paging structures (avoid ELF collision) | Done |
 | **Phase 0** | **Kernel/bootloader separation** (boot.efi + kernel.elf) | **Done** |
 | **Phase 1** | **TCC cross-compiles kernel from host** | **Done** |
 | **Phase 2** | **TCC compiles kernel inside OsitoK** (62 .c → 733KB ELF) | **Done** |
@@ -367,6 +373,7 @@ arch/arm/          SM8350 (ROG Phone 5) bare-metal port — see docs/aarch64-det
 > Reference material (WRK, NT, DOS source): see [docs/reference-material.md](docs/reference-material.md)
 > OsitoFS v2 host tools (9 tools): see `tools/ositofs/`
 > Filesystem roadmap (12 current + 15 planned): see [docs/filesystem-roadmap.md](docs/filesystem-roadmap.md)
+> VFS + demand paging + ETXTBSY architecture (2026-04-12 sweep): see [docs/x86-vfs-demand-paging.md](docs/x86-vfs-demand-paging.md)
 
 **Tier 8: Hardware Boot** — Boot OsitoK on real hardware (AMD Ryzen 7 5800X + RTX 3090).
 

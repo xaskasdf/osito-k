@@ -1,6 +1,90 @@
 # OsitoK - Project Status
 
-## Current Platform
+> Two parallel platforms: x86-64 bare-metal AI OS (the active one) and the
+> original ESP8266 dev board. The x86 line is where the kernel grew up;
+> the ESP8266 line is preserved as the original substrate.
+
+## x86-64 Platform (active)
+
+UEFI-booted bare-metal kernel for QEMU/q35 and real hardware. ELF64,
+preemptive scheduler, 4-level paging, 100+ Linux syscalls, three filesystem
+drivers (osfs2/osfs3 native + FAT32/ext2/NTFS host), full TCP/IP+TLS, SMP,
+Win32 PE compat, GUI compositor, GPU compute (RTX), self-hosting via TCC.
+
+### Last stabilization sweep — 2026-04-12
+
+Eight commits (`be59c00..207900d`) brought the kernel from "loads small
+TCC binaries" to "runs static musl binaries up to 6.5 MB end-to-end". Full
+detail in [`x86-vfs-demand-paging.md`](x86-vfs-demand-paging.md).
+
+| Subsystem | Before | After |
+|-----------|--------|-------|
+| FS namespace | Flat (osfs2) | Hierarchical (osfs3) + flat (osfs2) via VFS |
+| ELF loader | `kmalloc(file_size)` eager (~10 MB ceiling) | Header-only read + demand paging |
+| `vma_t` | base/pages/prot only | + type / file_node / file_offset / file_size |
+| `demand_page_fault` | Stub: alloc-and-map any high addr | VMA-validated + file-backed page-in |
+| `proc_fd_t` per-process | Dead code (67 lines) | Removed |
+| Pipes | Always returned `EAGAIN` | Blocking by default, `O_NONBLOCK` honored |
+| Self-write of executing binary | Allowed (silent corruption) | `-ETXTBSY` |
+| Stdio FDs across exec | Could leak file handles to parent | Force-reset to console |
+| Kernel paging structs | Allocated bottom-up (collide with ELF loads) | High-memory allocator |
+| `getrusage`/`rt_sigsuspend`/`setitimer` | Unknown syscall (zsh hung) | Stubs |
+| `kthread_wrapper` | Empty stub | Reads func+data from kthreads table |
+| `io_uring` READ/WRITE | Hardcoded `-ENOSYS` | Wired to syscall dispatch |
+
+### Verified workloads
+
+- **`hello_ositok.elf`** (Zig 0.13.0, 9.6 KB static) — boots and prints
+  via two `write()` syscalls
+- **`zsh.elf`** (musl 5.9, 1.4 MB static) — boots, prints prompt, accepts
+  USB keyboard, fork+pipe subshell coordination, exits clean
+- **`GTA5.elf`** (RAGE engine, 6.5 MB static) — demand-pages instantly into
+  4476 KB R+X + 1188 KB R+W VMAs, runs to expected SIGSEGV in RAGE init
+  (no asset RPFs loaded)
+- All three: `md5(nvme.img/binary)` identical pre/post run thanks to ETXTBSY
+
+### x86-64 build / run
+
+```bash
+cd /Users/pc/osito-k/arch/x86
+make build/kernel.elf -j$(sysctl -n hw.ncpu) \
+     CC=x86_64-elf-gcc LD=x86_64-elf-ld OBJCOPY=x86_64-elf-objcopy
+bash scripts/qemu-test.sh --no-build
+```
+
+Full `make all` (including `boot.efi`) needs gnu-efi installed at
+`/private/tmp/gnu-efi/`. The qemu-test.sh script handles ESP image creation
+and pflash setup on macOS automatically.
+
+### Known issues (after this sweep)
+
+1. **Auxv setup loop crash** — `elf_setup_stack` can fault on a write to
+   address `-8` when GCC vectorizes the auxv build loop with a backward
+   iteration. Stack-frame-layout sensitive. zsh hits it in some builds,
+   GTA5 didn't. See `x86-vfs-demand-paging.md` for workaround candidates.
+2. **fork+execve of same binary on demand path** — child page faults
+   rewrite parent PTEs. Static binaries that fork+exec themselves should
+   link with `PT_DYNAMIC` to use the eager path.
+3. **Single shared address space** — no per-process PML4. Two processes
+   loading at the same vaddr (e.g. zsh and GTA5 both at 0x20000000) cannot
+   coexist concurrently.
+
+### Roadmap files
+
+- [`x86-features-detail.md`](x86-features-detail.md) — full feature catalog
+  (X9..X42, X-OS*, X-NET*, X-CL*, X-WIN32, …)
+- [`x86-vfs-demand-paging.md`](x86-vfs-demand-paging.md) — this sweep
+- [`ositofs2-spec.md`](ositofs2-spec.md) / [`ositofs3-spec.md`](ositofs3-spec.md) — FS specs
+- [`x86-gpu-roadmap.md`](x86-gpu-roadmap.md) — GPU compute (X27..X40)
+- [`os-selfhost-roadmap.md`](os-selfhost-roadmap.md) — Tier 0..9
+- [`binary-compat-roadmap.md`](binary-compat-roadmap.md) — Linux/Win32/PE/DOS
+- [`win32-improvements.md`](win32-improvements.md) — PE compat layer
+- [`game-rendering-guide.md`](game-rendering-guide.md) — porting guide
+
+---
+
+## ESP8266 Platform (preserved)
+
 Wemos D1 Mini (ESP8266EX, Xtensa LX106 @ 80MHz, 4MB SPI flash)
 
 ## Implemented Features
