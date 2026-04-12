@@ -2985,18 +2985,19 @@ void syscall_reset_process(void)
     brk_max = NULL;
 
     /* Free mmap regions belonging to the current process — walk PTEs
-     * for demand-paged VMAs. Don't free the parent's saved regions
-     * during fork+execve. X-PGTBL: keep sibling processes' VMAs intact. */
-    if (!saved_parent.valid) {
-        void *cur = proc_current();
-        for (int i = 0; i < MAX_VMAS; i++) {
-            if (!vma_table[i].in_use) continue;
-            if (vma_table[i].owner != NULL && vma_table[i].owner != cur)
-                continue;
-            vma_free_pages(&vma_table[i]);
-            vma_table[i].in_use = false;
-            vma_table[i].owner  = NULL;
-        }
+     * for demand-paged VMAs. The owner filter keeps sibling processes'
+     * VMAs intact (X-PGTBL). Unlike the old code, we run this cleanup
+     * even during fork+execve: the owner filter protects the parent's
+     * VMAs while freeing the child's own VMAs, preventing physical-
+     * page leaks when a fork'd child execve's a demand-paged binary. */
+    void *cur = proc_current();
+    for (int i = 0; i < MAX_VMAS; i++) {
+        if (!vma_table[i].in_use) continue;
+        if (vma_table[i].owner != NULL && vma_table[i].owner != cur)
+            continue;
+        vma_free_pages(&vma_table[i]);
+        vma_table[i].in_use = false;
+        vma_table[i].owner  = NULL;
     }
 }
 
