@@ -625,7 +625,15 @@ static void elf_jump(uint64_t entry, uint64_t sp)
 /* ── Demand-paged segment setup ────────────────────────────────
  * For static binaries (no PT_DYNAMIC), register VMAs that point
  * to the file on disk instead of reading the whole file into RAM.
- * The page fault handler reads pages on first access. */
+ * The page fault handler reads pages on first access.
+ *
+ * Limitation: fork+execve of the same binary is not supported on the
+ * demand-paged path. The eager path uses fork_saves[] (memcpy of PF_W
+ * segments) to preserve parent state across the child's segment reload,
+ * but with demand paging the child's per-page faults rewrite parent PTEs
+ * one at a time, leaking parent's pages and breaking the parent's view
+ * of its own data after the child is reaped. Static binaries that
+ * fork+exec themselves should use the eager path (link with PT_DYNAMIC). */
 
 #define VMA_FILE_ELF 1
 

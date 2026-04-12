@@ -726,47 +726,80 @@ static int64_t sys_read(uint64_t fd, uint64_t buf, uint64_t count)
 #define PROC_MAPS       0
 #define PROC_STATUS     1
 
-/* Generate /proc/self/maps content into buffer */
+/* Helper: write hex digits of `val` (always exactly `digits` chars) into buf */
+static int write_hex(char *buf, uint64_t val, int digits)
+{
+    for (int d = (digits - 1) * 4; d >= 0; d -= 4)
+        *buf++ = "0123456789abcdef"[(val >> d) & 0xF];
+    return digits;
+}
+
+/* Generate /proc/self/maps content into buffer.
+ * Format matches Linux: start-end perms offset dev inode pathname
+ * For file-backed VMAs, offset is the real file offset and pathname is
+ * the basename of the backing file (e.g. zsh.elf, GTA5.elf). */
 static int proc_gen_maps(char *buf, int max)
 {
+    extern const char *osfs2_file_name(void *file);
     int pos = 0;
-    /* List mmap VMAs */
-    for (int i = 0; i < MAX_VMAS && pos < max - 80; i++) {
+
+    for (int i = 0; i < MAX_VMAS && pos < max - 128; i++) {
         if (!vma_table[i].in_use) continue;
         uint64_t start = vma_table[i].base;
         uint64_t end = start + vma_table[i].pages * 4096;
         uint32_t p = vma_table[i].prot;
-        /* Format: start-end rwxp offset dev inode pathname */
-        /* Simple hex formatter inline */
-        char line[80];
+
+        char line[128];
         int lp = 0;
-        /* start address */
-        for (int d = 60; d >= 0; d -= 4) {
-            int nib = (start >> d) & 0xF;
-            if (nib || lp > 0 || d == 0)
-                line[lp++] = "0123456789abcdef"[nib];
-        }
+
+        /* start-end (12 hex digits = 48 bits, enough for our address space) */
+        lp += write_hex(line + lp, start, 12);
         line[lp++] = '-';
-        /* end address */
-        for (int d = 60; d >= 0; d -= 4) {
-            int nib = (end >> d) & 0xF;
-            if (nib || lp > (int)(line + lp - line) || d == 0) /* always print at least one digit */
-                line[lp++] = "0123456789abcdef"[nib];
-        }
+        lp += write_hex(line + lp, end, 12);
         line[lp++] = ' ';
+
+        /* perms */
         line[lp++] = (p & PROT_READ)  ? 'r' : '-';
         line[lp++] = (p & PROT_WRITE) ? 'w' : '-';
         line[lp++] = (p & PROT_EXEC)  ? 'x' : '-';
         line[lp++] = 'p';
         line[lp++] = ' ';
-        /* offset + dev + inode: all zeros */
-        for (int z = 0; z < 8; z++) line[lp++] = '0';
+
+        /* offset (file_offset for file-backed, 0 for anonymous) */
+        lp += write_hex(line + lp, vma_table[i].file_offset, 8);
         line[lp++] = ' ';
+
+        /* dev (we have no real block dev) */
         line[lp++] = '0'; line[lp++] = '0'; line[lp++] = ':';
         line[lp++] = '0'; line[lp++] = '0'; line[lp++] = ' ';
-        line[lp++] = '0';
+
+        /* inode (use VMA index as a stable id) */
+        {
+            int idx = i;
+            char d[8]; int nd = 0;
+            if (idx == 0) d[nd++] = '0';
+            else while (idx > 0) { d[nd++] = '0' + (idx % 10); idx /= 10; }
+            while (nd-- > 0) line[lp++] = d[nd];
+        }
+
+        /* pathname (basename of backing file, or [anon]/[heap]) */
+        line[lp++] = ' ';
+        if (vma_table[i].type == VMA_FILE_ELF ||
+            vma_table[i].type == VMA_FILE_MMAP) {
+            const char *name = NULL;
+            if (vma_table[i].file_node.fs_version == 2 &&
+                vma_table[i].file_node.data) {
+                name = osfs2_file_name(vma_table[i].file_node.data);
+            }
+            if (!name) name = "(file)";
+            while (*name && lp < (int)sizeof(line) - 2) line[lp++] = *name++;
+        } else {
+            const char *anon = (vma_table[i].prot == 0) ? "[reserved]" : "[anon]";
+            while (*anon && lp < (int)sizeof(line) - 2) line[lp++] = *anon++;
+        }
+
         line[lp++] = '\n';
-        line[lp] = 0;
+
         /* Copy to output */
         for (int c = 0; c < lp && pos < max - 1; c++)
             buf[pos++] = line[c];
@@ -1237,7 +1270,12 @@ static int64_t sys_munmap(uint64_t addr, uint64_t length)
     return -EINVAL;
 }
 
-/* sys_mprotect — change protection flags on mapped pages */
+/* sys_mprotect — change protection flags on mapped pages.
+ *
+ * Demand paging interaction: vma_table[i].prot is updated unconditionally
+ * (line below). Pages that are already faulted-in get their PTEs updated
+ * via paging_set_flags. Pages still not-present pick up the new flags
+ * automatically when demand_page_fault() consults the VMA's prot field. */
 extern int paging_map_page(uint64_t virt, uint64_t phys, uint64_t flags);
 
 static int64_t sys_mprotect(uint64_t addr, uint64_t length, uint64_t prot)
