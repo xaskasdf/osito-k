@@ -58,7 +58,6 @@ extern void syscall_restore_brk(void);
 /* ── Constants ───────────────────────────────────────────────── */
 
 #define MAX_PROCESSES   64  /* Increased from 16; further scaling via sys_caps planned */
-#define MAX_FDS         32
 #define MAX_NAME_LEN    64
 #define MAX_REGIONS     32
 
@@ -90,18 +89,6 @@ extern void syscall_restore_brk(void);
  */
 static const uint32_t qos_quantum[QOS_NUM_CLASSES] = { 20, 10, 5, 2, 1 };
 
-/* ── File descriptor ─────────────────────────────────────────── */
-
-typedef ssize_t (*fd_read_fn)(void *buf, size_t count);
-typedef ssize_t (*fd_write_fn)(const void *buf, size_t count);
-
-typedef struct {
-    bool        open;
-    fd_read_fn  read;
-    fd_write_fn write;
-    uint32_t    flags;
-} proc_fd_t;
-
 /* ── Memory region tracking ──────────────────────────────────── */
 
 typedef struct {
@@ -117,9 +104,6 @@ typedef struct {
     uint32_t    state;
     char        name[MAX_NAME_LEN];
     int32_t     exit_code;
-
-    /* File descriptors */
-    proc_fd_t   fds[MAX_FDS];
 
     /* Memory regions (for cleanup) */
     mem_region_t regions[MAX_REGIONS];
@@ -167,25 +151,6 @@ static process_t *exec_target_proc;
 
 
 /* Console I/O (shared with syscall.c) */
-extern void serial_putc(char c);
-extern void fb_putc(char c, uint32_t color);
-
-static ssize_t console_write(const void *buf, size_t count)
-{
-    const char *s = (const char *)buf;
-    for (size_t i = 0; i < count; i++) {
-        serial_putc(s[i]);
-        fb_putc(s[i], 0x00CCCCCC);
-    }
-    return (ssize_t)count;
-}
-
-static ssize_t console_read(void *buf, size_t count)
-{
-    (void)buf; (void)count;
-    return 0;  /* EOF until keyboard driver */
-}
-
 /* ── Allocate a process slot ─────────────────────────────────── */
 
 static process_t *proc_alloc(const char *name)
@@ -216,15 +181,8 @@ static process_t *proc_alloc(const char *name)
             p->fs_base = 0;
             p->clear_child_tid = NULL;
 
-            /* Setup standard FDs */
-            p->fds[0].open = true;
-            p->fds[0].read = console_read;
-
-            p->fds[1].open = true;
-            p->fds[1].write = console_write;
-
-            p->fds[2].open = true;
-            p->fds[2].write = console_write;
+            /* Note: file descriptors live in the global fd_table[] in
+             * syscall.c, not per-process. syscall_init() sets up stdio. */
 
             return p;
         }
@@ -255,9 +213,8 @@ static void proc_free(process_t *p)
     /* Reset per-process syscall state (file FDs, brk heap) */
     syscall_reset_process();
 
-    /* Close FDs */
-    for (int i = 0; i < MAX_FDS; i++)
-        p->fds[i].open = false;
+    /* FDs live in the global fd_table[] in syscall.c — closed via
+     * syscall_reset_process() which is called from compositor_cleanup_process. */
 
     p->state = PROC_FREE;
 }
@@ -927,9 +884,9 @@ int32_t proc_fork(void)
 
     child->ppid = parent->pid;
 
-    /* Copy FD table from parent */
-    for (int i = 0; i < MAX_FDS; i++)
-        child->fds[i] = parent->fds[i];
+    /* FDs live in the global fd_table[] in syscall.c — already shared
+     * between parent and child until syscall_save_parent() snapshots it
+     * for restore-on-exec. */
 
     child->region_count = 0;
 
@@ -1127,9 +1084,8 @@ int32_t proc_clone_thread(uint64_t child_stack, uint64_t parent_tidptr,
     thread->ppid = parent->pid;
     thread->is_thread = true;
 
-    /* Copy FD table from parent (shared semantics) */
-    for (int i = 0; i < MAX_FDS; i++)
-        thread->fds[i] = parent->fds[i];
+    /* FDs live in global fd_table[] in syscall.c — already shared
+     * across threads of the same process. */
 
     thread->region_count = 0;
 
@@ -1462,9 +1418,8 @@ int proc_execve(const char *path, char *const argv[])
     /* Reset per-process syscall state (brk, file FDs) */
     syscall_reset_process();
 
-    /* Close non-stdio FDs */
-    for (int i = 3; i < MAX_FDS; i++)
-        p->fds[i].open = false;
+    /* Non-stdio FDs are closed by syscall_reset_process() in syscall.c
+     * (which operates on the global fd_table). */
 
     /* Execute the ELF — does not return on success.
      * elf_exec loads segments, sets up stack, jumps to entry.
