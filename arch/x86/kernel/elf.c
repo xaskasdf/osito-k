@@ -595,19 +595,12 @@ static uint64_t elf_setup_stack(elf_loaded_t *loaded,
     return sp;
 }
 
-/* Counter of currently-running demand-paged processes (defined below).
- * Forward decl so elf_free can decrement it. */
-static volatile int demand_paged_active;
-
 /* ── Free loaded ELF resources ───────────────────────────────── */
 
 void elf_free(elf_loaded_t *loaded)
 {
     /* If this was a demand-paged process, release the slot. The actual
      * VMA cleanup is done by syscall_reset_process walking PTEs. */
-    if (loaded->demand_paged) {
-        if (demand_paged_active > 0) demand_paged_active--;
-    }
 
     /* For ET_EXEC with virtual→physical remapping: unmap virtual pages first
      * so the virtual address range is free for the next launch, then free
@@ -656,16 +649,6 @@ static void elf_jump(uint64_t entry, uint64_t sp)
 
     __builtin_unreachable();
 }
-
-/* Bug #3 workaround: OsitoK has a single shared PML4. If two demand-paged
- * processes load at the same vaddr (e.g. zsh and GTA5 both at 0x20000000),
- * the second one's VMAs and page-fault-installed PTEs would clobber the
- * first's. Until per-process page tables are wired up (X-PGTBL is dead
- * code in paging.c), allow at most ONE demand-paged process at a time.
- * Anything else falls back to the eager path.
- *
- * The counter `demand_paged_active` is forward-declared above so elf_free
- * can decrement it. It's bumped here after successful VMA registration. */
 
 /* ── Demand-paged segment setup ────────────────────────────────
  * For static binaries (no PT_DYNAMIC), register VMAs that point
@@ -759,19 +742,13 @@ static int elf_setup_demand_segments(const elf64_hdr_t *hdr,
     loaded->phdr_entsize = hdr->e_phentsize;
     loaded->phdr_count = hdr->e_phnum;
 
-    /* Bump active count: this process now owns the demand-paged VMAs.
-     * Decremented in elf_free when this process exits. */
-    demand_paged_active++;
-
     serial_puts("[ELF] Demand-paged: entry=0x");
     serial_puthex(loaded->entry, 16);
     serial_puts(", range 0x");
     serial_puthex(vaddr_min, 16);
     serial_puts("..0x");
     serial_puthex(vaddr_max, 16);
-    serial_puts(" (active=");
-    serial_putdec((uint64_t)demand_paged_active);
-    serial_puts(")\n");
+    serial_puts("\n");
 
     return 0;
 }
@@ -843,8 +820,7 @@ int elf_exec(const char *filename, int argc, const char **argv)
         if (ph->p_type == PT_DYNAMIC) { has_dynamic = true; break; }
     }
     bool use_demand = (hdr_buf.e_type == ET_EXEC) && !has_dynamic
-                      && !syscall_in_fork_exec()
-                      && (demand_paged_active == 0);  /* Bug #3 workaround */
+                      && !syscall_in_fork_exec();
 
     elf_loaded_t loaded;
     memset(&loaded, 0, sizeof(loaded));
