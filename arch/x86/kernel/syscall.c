@@ -153,8 +153,10 @@ static inline void wrmsr(uint32_t msr, uint64_t val) {
 #define SYS_CLONE       56
 #define SYS_FORK        57
 #define SYS_EXECVE      59
+#define SYS_SETITIMER   38
 #define SYS_FCNTL       72
 #define SYS_FSYNC       74
+#define SYS_RT_SIGSUSPEND 130
 #define SYS_SIGALTSTACK 131
 #define SYS_GETTID      186
 #define SYS_TKILL       200
@@ -207,6 +209,7 @@ static inline void wrmsr(uint32_t msr, uint64_t val) {
 #define SYS_UMASK       95
 #define SYS_GETTIMEOFDAY 96
 #define SYS_GETRLIMIT   97
+#define SYS_GETRUSAGE   98
 #define SYS_SYSINFO     99
 #define SYS_TIMES       100
 #define SYS_GETRESUID   120
@@ -265,6 +268,7 @@ static inline void wrmsr(uint32_t msr, uint64_t val) {
 #define ERANGE  34
 #define ENOTSUP 95
 #define EAFNOSUPPORT 97
+#define EINTR    4
 
 /* open flags (Linux values) */
 #define O_RDONLY    0x0000
@@ -2612,6 +2616,8 @@ int64_t syscall_dispatch(uint64_t nr, uint64_t a1, uint64_t a2,
     case SYS_GETPGRP:    return (int64_t)proc_current_pid();
     case SYS_SETSID:     return (int64_t)proc_current_pid();
     case SYS_GETGROUPS:  return 0;  /* no supplementary groups */
+    case SYS_RT_SIGSUSPEND: return -EINTR;  /* pretend a signal interrupted */
+    case SYS_SETITIMER:  return 0;  /* stub: pretend timer set */
     case SYS_SIGALTSTACK: return sys_sigaltstack(a1, a2);
     case SYS_PRCTL:      return sys_prctl(a1, a2, a3, a4, a5);
     case SYS_ARCH_PRCTL: return sys_arch_prctl(a1, a2);
@@ -2658,6 +2664,11 @@ int64_t syscall_dispatch(uint64_t nr, uint64_t a1, uint64_t a2,
         return (int64_t)tv.tv_sec;
     }
     case SYS_GETRLIMIT:  return sys_prlimit64(0, a1, 0, a2);
+    case SYS_GETRUSAGE: {
+        /* getrusage(who, usage) — zero-fill struct rusage (144 bytes on x86-64) */
+        if (a2) memset((void *)a2, 0, 144);
+        return 0;
+    }
     case SYS_SYSINFO:    return sys_sysinfo(a1);
     case SYS_TIMES:      return -1;  /* return -1 = no times data */
     case SYS_SETPGID:    return sys_setpgid(a1, a2);
