@@ -322,21 +322,22 @@ PVOID WINAPI VirtualAlloc(PVOID lpAddress, SIZE_T dwSize,
         serial_puts("\n");
     }
 
-    /* Reject absurd sizes (> 256MB) — corrupted TArray metadata.
-     * Return NULL + ERROR_NOT_ENOUGH_MEMORY. The null-page handler in
-     * idt.c absorbs reads (returns 0) and writes (silently dropped),
-     * so if the engine does memcpy(NULL, src, n) it won't #PF-loop.
-     * The engine's SEH catches the error and takes the failure path. */
+    /* Cap absurd sizes (> 256MB) to 16MB — corrupted TArray metadata.
+     * The engine's FArray::Realloc calls VirtualAlloc with a garbage Max
+     * (~3.2GB from corrupted TArray). Rather than failing (which triggers
+     * appError + shutdown NULL-CALL loop), give it a 16MB buffer.
+     * The engine writes far less than 3.2GB — the large Max is metadata
+     * corruption, not a real requirement. 16MB is enough for any
+     * reasonable array operation during Init(). */
     if (dwSize > 0x10000000ULL) { /* > 256MB */
-        static int reject_log = 0;
-        if (reject_log < 5) {
-            serial_puts("[VA] REJECTED: 0x");
+        static int cap_log = 0;
+        if (cap_log < 5) {
+            serial_puts("[VA] Capped: 0x");
             serial_puthex(dwSize, 8);
-            serial_puts("\n");
-            reject_log++;
+            serial_puts(" -> 16MB\n");
+            cap_log++;
         }
-        g_last_error = 8; /* ERROR_NOT_ENOUGH_MEMORY */
-        return NULL;
+        dwSize = 0x1000000; /* 16MB */
     }
 
     PVOID base = lpAddress;

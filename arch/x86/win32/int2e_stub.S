@@ -137,5 +137,4 @@ int2e_stub:
 .align 8
 g_int2e_rsp_stack:
     .fill 32, 8, 0              /* 32 depth levels × 8 bytes */
-g_int2e_rsp_depth:
-    .long 0
+/* g_int2e_rsp_depth defined in compat32.c */

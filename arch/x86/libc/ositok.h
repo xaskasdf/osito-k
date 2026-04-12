@@ -141,7 +141,30 @@ int     close(int fd);
 ssize_t read(int fd, void *buf, size_t count);
 ssize_t write(int fd, const void *buf, size_t count);
 off_t   lseek(int fd, off_t offset, int whence);
+int     stat(const char *path, void *buf);
+int     fstat(int fd, void *buf);
+int     lstat(const char *path, void *buf);
 int     access(const char *path, int mode);
+int     chdir(const char *path);
+int     umask(int mask);
+int     ioctl(int fd, unsigned long request, void *arg);
+
+#define POLLIN   0x0001
+#define POLLOUT  0x0004
+#define POLLERR  0x0008
+#define POLLHUP  0x0010
+#define POLLNVAL 0x0020
+
+struct pollfd {
+    int   fd;
+    short events;
+    short revents;
+};
+
+int     poll(struct pollfd *fds, unsigned long nfds, int timeout);
+
+int     fcntl(int fd, int cmd, ...);
+long    getdents64(int fd, void *dirp, size_t count);
 int     unlink(const char *path);
 int     pipe(int pipefd[2]);
 int     dup2(int oldfd, int newfd);

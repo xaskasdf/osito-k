@@ -10,6 +10,7 @@
 #include "../drivers/gpu.h"
 #include "../drivers/gpu_inference.h"
 #include "../fs/gguf.h"
+#include "../fs/vfs.h"
 #include "tensor.h"
 #include "inference.h"
 
@@ -55,9 +56,6 @@ extern void dl_init(void);
 
 /* Win32 compatibility layer */
 extern void win32_init(void);
-
-/* DOS 16-bit compatibility layer */
-extern void dos_init(void);
 
 /* xHCI USB */
 extern int  xhci_init(uint64_t bar0_phys, uint8_t bus, uint8_t dev, uint8_t func);
@@ -119,7 +117,14 @@ extern void net_udp_listen(uint16_t port, udp_handler_t handler);
 extern int osfs2_mount(uint64_t part_offset);
 extern void osfs2_list(void);
 extern bool osfs2_is_mounted(void);
-extern void *osfs2_find(const char *name);
+
+extern int osfs3_mount(uint64_t part_offset);
+extern uint32_t osfs3_resolve_path(const char *path);
+extern bool osfs3_is_mounted(void);
+
+static bool osfs_find(const char *n, vfs_node_t *node) {
+    return vfs_find(n, VFS_MODE_POSIX, node);
+}
 
 /* GSP Falcon */
 extern int  gsp_probe(void);
@@ -409,9 +414,6 @@ void kernel_entry(boot_info_t *info)
     /* ── Step 1.11: Win32 compatibility layer ── */
     win32_init();
 
-    /* ── Step 1.12: DOS 16-bit compatibility layer ── */
-    dos_init();
-
     /* ── Crypto self-test ── */
     {
         extern int crypto_selftest(void);
@@ -515,12 +517,16 @@ void kernel_entry(boot_info_t *info)
             }
 
             /* Try GPT + OsitoFS */
-            if (gpt_find_ositofs(&part_offset, &part_size) == 0)
-                fs_mounted = (osfs2_mount(part_offset) == 0);
+            if (gpt_find_ositofs(&part_offset, &part_size) == 0) {
+                if (osfs3_mount(part_offset) == 0) fs_mounted = true;
+                else fs_mounted = (osfs2_mount(part_offset) == 0);
+            }
 
             /* Fallback: raw OsitoFS at offset 0 */
-            if (!fs_mounted)
-                fs_mounted = (osfs2_mount(0) == 0);
+            if (!fs_mounted) {
+                if (osfs3_mount(0) == 0) fs_mounted = true;
+                else fs_mounted = (osfs2_mount(0) == 0);
+            }
 
             if (fs_mounted) {
                 serial_puts("[KERN] OsitoFS found on NVMe[");
@@ -592,12 +598,13 @@ void kernel_entry(boot_info_t *info)
             }
 
             /* ── Try executing ELF programs if present ── */
-            if (osfs2_find("hello.elf")) {
+            vfs_node_t fn;
+            if (osfs_find("hello.elf", &fn)) {
                 serial_puts("[KERN] Found hello.elf — executing...\n");
                 proc_exec("hello.elf", 0, NULL);
             }
 
-            if (osfs2_find("fileio.elf")) {
+            if (osfs_find("fileio.elf", &fn)) {
                 serial_puts("[KERN] Found fileio.elf — executing...\n");
                 int ret = proc_exec("fileio.elf", 0, NULL);
                 serial_puts("[KERN] fileio.elf exited with code ");
@@ -605,7 +612,7 @@ void kernel_entry(boot_info_t *info)
                 serial_puts("\n");
             }
 
-            if (osfs2_find("hello_c.elf")) {
+            if (osfs_find("hello_c.elf", &fn)) {
                 serial_puts("[KERN] Found hello_c.elf (TCC) — executing...\n");
                 int ret = proc_exec("hello_c.elf", 0, NULL);
                 serial_puts("[KERN] hello_c.elf exited with code ");
@@ -613,7 +620,8 @@ void kernel_entry(boot_info_t *info)
                 serial_puts("\n");
             }
 
-            if (osfs2_find("tcc.elf") && osfs2_find("selftest.c")) {
+            vfs_node_t tcc_n, self_n;
+            if (osfs_find("tcc.elf", &tcc_n) && osfs_find("selftest.c", &self_n)) {
                 serial_puts("[KERN] === Self-hosting test ===\n");
                 serial_puts("[KERN] Step 1: TCC compiling selftest.c...\n");
                 const char *tcc_argv[] = {
@@ -625,7 +633,8 @@ void kernel_entry(boot_info_t *info)
                 serial_putdec(ret < 0 ? (uint64_t)(-(int64_t)ret) : (uint64_t)ret);
                 serial_puts("\n");
 
-                if (ret == 0 && osfs2_find("selftest.elf")) {
+                vfs_node_t st_n;
+                if (ret == 0 && osfs_find("selftest.elf", &st_n)) {
                     serial_puts("[KERN] Step 2: Executing selftest.elf...\n");
                     ret = proc_exec("selftest.elf", 0, NULL);
                     serial_puts("[KERN] selftest.elf exited with code ");
@@ -653,48 +662,20 @@ void kernel_entry(boot_info_t *info)
         if (i211_init(nic_pci->bar[0]) == 0) {
             extern void net_set_gateway(const uint8_t gw[4]);
             extern void net_dns_set_server(const uint8_t ip[4]);
-            extern int  dhcp_discover(void);
-            extern int  ntp_sync(void);
 
-            /* Initialize network with temporary 0.0.0.0 for DHCP */
-            uint8_t zero_ip[] = {0, 0, 0, 0};
-            net_init(zero_ip);
-
-            /* Try DHCP first — works on both QEMU SLIRP and real hardware */
-            if (dhcp_discover() == 0) {
-                /* DHCP configured IP/gateway/DNS automatically */
-                serial_puts("[KERN] Network configured via DHCP\n");
+            /* Auto-detect: I211 (0x1539) = real hardware, else QEMU */
+            if (nic_pci->device_id == 0x1539) {
+                uint8_t ip[] = {192, 168, 0, 50};
+                net_init(ip);
+                uint8_t gw[] = {192, 168, 0, 1};
+                net_set_gateway(gw);
+                uint8_t dns[] = {8, 8, 8, 8};
+                net_dns_set_server(dns);
             } else {
-                /* DHCP failed — fall back to static config */
-                serial_puts("[KERN] DHCP failed, using static IP\n");
-                if (nic_pci->device_id == 0x1539) {
-                    uint8_t ip[] = {192, 168, 0, 50};
-                    extern void net_set_ip(const uint8_t ip[4]);
-                    net_set_ip(ip);
-                    uint8_t gw[] = {192, 168, 0, 1};
-                    net_set_gateway(gw);
-                    uint8_t dns[] = {8, 8, 8, 8};
-                    net_dns_set_server(dns);
-                } else {
-                    uint8_t ip[] = {10, 0, 2, 15};
-                    extern void net_set_ip(const uint8_t ip[4]);
-                    net_set_ip(ip);
-                }
+                uint8_t ip[] = {10, 0, 2, 15};
+                net_init(ip);
+                /* gateway/DNS defaults in net.c match QEMU SLIRP */
             }
-
-            /* Sync clock via NTP (requires DNS from DHCP) */
-            ntp_sync();
-
-            /* IPv6 link-local + mDNS responder */
-            extern void ipv6_init(void);
-            extern void mdns_init(const uint8_t ip[4]);
-            ipv6_init();
-            {
-                extern uint8_t *net_get_ip_ptr(void);
-                uint8_t *cur_ip = net_get_ip_ptr();
-                if (cur_ip) mdns_init(cur_ip);
-            }
-
             net_udp_listen(7777, prompt_handler);
         } else {
             serial_puts("[KERN] I211 init failed\n");
@@ -716,29 +697,6 @@ void kernel_entry(boot_info_t *info)
     if (hda_pci && hda_pci->bar[0]) {
         extern int hda_init(uint64_t, uint8_t, uint8_t, uint8_t);
         hda_init(hda_pci->bar[0], hda_pci->bus, hda_pci->dev, hda_pci->func);
-    }
-
-    /* ── Step 4b: Export kernel symbols for loadable modules ── */
-    {
-        extern void kmod_register_symbol(const char *name, uint64_t addr);
-        /* Core kernel functions available to .ko modules */
-        kmod_register_symbol("serial_puts", (uint64_t)serial_puts);
-        kmod_register_symbol("serial_putdec", (uint64_t)serial_putdec);
-        kmod_register_symbol("serial_puthex", (uint64_t)serial_puthex);
-        kmod_register_symbol("fb_puts", (uint64_t)fb_puts);
-        kmod_register_symbol("kmalloc", (uint64_t)kmalloc);
-        kmod_register_symbol("kfree", (uint64_t)kfree);
-        extern void *mem_alloc_aligned(uint64_t, uint64_t);
-        kmod_register_symbol("mem_alloc_aligned", (uint64_t)mem_alloc_aligned);
-        kmod_register_symbol("idt_get_ticks", (uint64_t)idt_get_ticks);
-        kmod_register_symbol("memset", (uint64_t)memset);
-        kmod_register_symbol("memcpy", (uint64_t)memcpy);
-        extern int nvme_read(uint64_t, uint32_t, void *);
-        extern int nvme_write(uint64_t, uint32_t, const void *);
-        kmod_register_symbol("nvme_read", (uint64_t)nvme_read);
-        kmod_register_symbol("nvme_write", (uint64_t)nvme_write);
-        kmod_register_symbol("net_poll", (uint64_t)net_poll);
-        serial_puts("[KERN] Kernel symbols exported for modules\n");
     }
 
     /* ── Step 5: Keyboard + Terminal + Shell ── */

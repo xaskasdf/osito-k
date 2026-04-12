@@ -154,7 +154,7 @@ int WINAPI WSAGetLastError(void) { return wsa_last_error; }
 
 /* ── socket() ────────────────────────────────────────────── */
 
-SOCKET WINAPI sock_socket(int af, int type, int protocol)
+SOCKET WINAPI wsock_socket(int af, int type, int protocol)
 {
     if (!wsa_initialized) { wsa_last_error = WSANOTINITIALISED; return INVALID_SOCKET; }
 
@@ -196,7 +196,7 @@ SOCKET WINAPI sock_socket(int af, int type, int protocol)
  *   +8: char sin_zero[8]
  */
 
-int WINAPI sock_connect(SOCKET s, PVOID name, int namelen)
+int WINAPI wsock_connect(SOCKET s, PVOID name, int namelen)
 {
     (void)namelen;
     int idx = sock_to_index(s);
@@ -244,7 +244,7 @@ int WINAPI sock_connect(SOCKET s, PVOID name, int namelen)
 
 /* ── send() ──────────────────────────────────────────────── */
 
-int WINAPI sock_send(SOCKET s, PCSTR buf, int len, int flags)
+int WINAPI wsock_send(SOCKET s, PCSTR buf, int len, int flags)
 {
     (void)flags;
     int idx = sock_to_index(s);
@@ -277,7 +277,7 @@ int WINAPI sock_send(SOCKET s, PCSTR buf, int len, int flags)
 
 /* ── recv() ──────────────────────────────────────────────── */
 
-int WINAPI sock_recv(SOCKET s, PSTR buf, int len, int flags)
+int WINAPI wsock_recv(SOCKET s, PSTR buf, int len, int flags)
 {
     (void)flags;
     int idx = sock_to_index(s);
@@ -347,7 +347,7 @@ int WINAPI closesocket(SOCKET s)
 
 /* Simplified select: poll kernel, then report all sockets as ready.
  * This is sufficient for most game networking patterns. */
-int WINAPI sock_select(int nfds, PVOID readfds, PVOID writefds,
+int WINAPI wsock_select(int nfds, PVOID readfds, PVOID writefds,
                        PVOID exceptfds, PVOID timeout)
 {
     (void)nfds; (void)exceptfds; (void)timeout;
@@ -394,7 +394,7 @@ static char     hostent_name[256];
 /* The actual struct returned to 32-bit callers */
 static uint8_t  hostent_buf[16];
 
-PVOID WINAPI sock_gethostbyname(PCSTR name)
+PVOID WINAPI wsock_gethostbyname(PCSTR name)
 {
     if (!name) { wsa_last_error = WSAEFAULT; return NULL; }
 
@@ -448,7 +448,7 @@ PVOID WINAPI sock_gethostbyname(PCSTR name)
 
 /* ── inet_addr() ─────────────────────────────────────────── */
 
-ULONG WINAPI sock_inet_addr(PCSTR cp)
+ULONG WINAPI wsock_inet_addr(PCSTR cp)
 {
     if (!cp) return 0xFFFFFFFF; /* INADDR_NONE */
 
@@ -482,7 +482,7 @@ static void itoa_simple(uint32_t v, char *buf, int *pos)
     buf[(*pos)++] = '0' + (char)v;
 }
 
-PSTR WINAPI sock_inet_ntoa(ULONG in)
+PSTR WINAPI wsock_inet_ntoa(ULONG in)
 {
     int pos = 0;
     itoa_simple((in >>  0) & 0xFF, inet_ntoa_buf, &pos);
@@ -498,7 +498,7 @@ PSTR WINAPI sock_inet_ntoa(ULONG in)
 
 /* ── Stubs (server sockets, not commonly needed for games) ── */
 
-int WINAPI sock_bind(SOCKET s, PVOID name, int namelen)
+int WINAPI wsock_bind(SOCKET s, PVOID name, int namelen)
 {
     (void)namelen;
     int idx = sock_to_index(s);
@@ -517,7 +517,7 @@ int WINAPI sock_bind(SOCKET s, PVOID name, int namelen)
     return 0; /* pretend success */
 }
 
-int WINAPI sock_listen(SOCKET s, int backlog)
+int WINAPI wsock_listen(SOCKET s, int backlog)
 {
     (void)s; (void)backlog;
     serial_puts("[WSOCK] listen (stub)\n");
@@ -525,7 +525,7 @@ int WINAPI sock_listen(SOCKET s, int backlog)
     return 0;
 }
 
-SOCKET WINAPI sock_accept(SOCKET s, PVOID addr, int *addrlen)
+SOCKET WINAPI wsock_accept(SOCKET s, PVOID addr, int *addrlen)
 {
     (void)s; (void)addr; (void)addrlen;
     serial_puts("[WSOCK] accept (stub — would block forever)\n");
@@ -533,7 +533,7 @@ SOCKET WINAPI sock_accept(SOCKET s, PVOID addr, int *addrlen)
     return INVALID_SOCKET;
 }
 
-int WINAPI sock_getpeername(SOCKET s, PVOID name, int *namelen)
+int WINAPI wsock_getpeername(SOCKET s, PVOID name, int *namelen)
 {
     int idx = sock_to_index(s);
     if (idx < 0) { wsa_last_error = WSAENOTSOCK; return SOCKET_ERROR; }
@@ -554,7 +554,7 @@ int WINAPI sock_getpeername(SOCKET s, PVOID name, int *namelen)
     return 0;
 }
 
-int WINAPI sock_getsockname(SOCKET s, PVOID name, int *namelen)
+int WINAPI wsock_getsockname(SOCKET s, PVOID name, int *namelen)
 {
     int idx = sock_to_index(s);
     if (idx < 0) { wsa_last_error = WSAENOTSOCK; return SOCKET_ERROR; }
@@ -572,21 +572,21 @@ int WINAPI sock_getsockname(SOCKET s, PVOID name, int *namelen)
     return 0;
 }
 
-int WINAPI sock_getsockopt(SOCKET s, int level, int optname, PSTR optval, int *optlen)
+int WINAPI wsock_getsockopt(SOCKET s, int level, int optname, PSTR optval, int *optlen)
 {
     (void)s; (void)level; (void)optname; (void)optval; (void)optlen;
     wsa_last_error = 0;
     return 0; /* pretend success */
 }
 
-int WINAPI sock_setsockopt(SOCKET s, int level, int optname,
+int WINAPI wsock_setsockopt(SOCKET s, int level, int optname,
                            PCSTR optval, int optlen)
 {
     (void)s; (void)level; (void)optname; (void)optval; (void)optlen;
     return 0; /* pretend it worked */
 }
 
-int WINAPI sock_shutdown(SOCKET s, int how)
+int WINAPI wsock_shutdown(SOCKET s, int how)
 {
     (void)how;
     int idx = sock_to_index(s);
@@ -598,15 +598,15 @@ int WINAPI sock_shutdown(SOCKET s, int how)
     return 0;
 }
 
-int WINAPI sock_recvfrom(SOCKET s, PSTR buf, int len, int flags,
+int WINAPI wsock_recvfrom(SOCKET s, PSTR buf, int len, int flags,
                          PVOID from, int *fromlen)
 {
     /* For connected UDP sockets, just do recv */
     (void)from; (void)fromlen;
-    return sock_recv(s, buf, len, flags);
+    return wsock_recv(s, buf, len, flags);
 }
 
-int WINAPI sock_sendto(SOCKET s, PCSTR buf, int len, int flags,
+int WINAPI wsock_sendto(SOCKET s, PCSTR buf, int len, int flags,
                        PVOID to, int tolen)
 {
     (void)flags; (void)tolen;
@@ -633,7 +633,7 @@ int WINAPI sock_sendto(SOCKET s, PCSTR buf, int len, int flags,
     }
 
     if (ws->type == SOCK_STREAM && ws->kern_conn_id >= 0) {
-        return sock_send(s, buf, len, flags);
+        return wsock_send(s, buf, len, flags);
     }
 
     /* UDP send */
@@ -660,25 +660,25 @@ static const SHIM_EXPORT wsock_exports[] = {
     { "WSAStartup",     (PVOID)WSAStartup },
     { "WSACleanup",     (PVOID)WSACleanup },
     { "WSAGetLastError",(PVOID)WSAGetLastError },
-    { "socket",         (PVOID)sock_socket },
-    { "accept",         (PVOID)sock_accept },
+    { "socket",         (PVOID)wsock_socket },
+    { "accept",         (PVOID)wsock_accept },
     { "closesocket",    (PVOID)closesocket },
-    { "connect",        (PVOID)sock_connect },
-    { "send",           (PVOID)sock_send },
-    { "recv",           (PVOID)sock_recv },
-    { "recvfrom",       (PVOID)sock_recvfrom },
-    { "sendto",         (PVOID)sock_sendto },
-    { "bind",           (PVOID)sock_bind },
-    { "listen",         (PVOID)sock_listen },
-    { "select",         (PVOID)sock_select },
-    { "getpeername",    (PVOID)sock_getpeername },
-    { "getsockname",    (PVOID)sock_getsockname },
-    { "getsockopt",     (PVOID)sock_getsockopt },
-    { "setsockopt",     (PVOID)sock_setsockopt },
-    { "shutdown",       (PVOID)sock_shutdown },
-    { "gethostbyname",  (PVOID)sock_gethostbyname },
-    { "inet_addr",      (PVOID)sock_inet_addr },
-    { "inet_ntoa",      (PVOID)sock_inet_ntoa },
+    { "connect",        (PVOID)wsock_connect },
+    { "send",           (PVOID)wsock_send },
+    { "recv",           (PVOID)wsock_recv },
+    { "recvfrom",       (PVOID)wsock_recvfrom },
+    { "sendto",         (PVOID)wsock_sendto },
+    { "bind",           (PVOID)wsock_bind },
+    { "listen",         (PVOID)wsock_listen },
+    { "select",         (PVOID)wsock_select },
+    { "getpeername",    (PVOID)wsock_getpeername },
+    { "getsockname",    (PVOID)wsock_getsockname },
+    { "getsockopt",     (PVOID)wsock_getsockopt },
+    { "setsockopt",     (PVOID)wsock_setsockopt },
+    { "shutdown",       (PVOID)wsock_shutdown },
+    { "gethostbyname",  (PVOID)wsock_gethostbyname },
+    { "inet_addr",      (PVOID)wsock_inet_addr },
+    { "inet_ntoa",      (PVOID)wsock_inet_ntoa },
     { "ntohl",          (PVOID)ntohl },
     { "htonl",          (PVOID)htonl },
     { "ntohs",          (PVOID)ntohs },
@@ -691,27 +691,27 @@ static const SHIM_EXPORT wsock_exports[] = {
 typedef struct { USHORT ordinal; PVOID func; } SHIM_ORDINAL;
 
 static const SHIM_ORDINAL wsock_ordinals[] = {
-    {   1, (PVOID)sock_accept       },  /* accept       */
-    {   2, (PVOID)sock_bind         },  /* bind         */
+    {   1, (PVOID)wsock_accept       },  /* accept       */
+    {   2, (PVOID)wsock_bind         },  /* bind         */
     {   3, (PVOID)closesocket       },  /* closesocket  */
-    {   4, (PVOID)sock_connect      },  /* connect      */
-    {   9, (PVOID)sock_getpeername  },  /* getpeername  */
-    {  10, (PVOID)sock_getsockname  },  /* getsockname  */
-    {  11, (PVOID)sock_getsockopt   },  /* getsockopt   */
+    {   4, (PVOID)wsock_connect      },  /* connect      */
+    {   9, (PVOID)wsock_getpeername  },  /* getpeername  */
+    {  10, (PVOID)wsock_getsockname  },  /* getsockname  */
+    {  11, (PVOID)wsock_getsockopt   },  /* getsockopt   */
     {  12, (PVOID)htonl             },  /* htonl        */
     {  13, (PVOID)htons             },  /* htons        */
-    {  14, (PVOID)sock_inet_addr    },  /* inet_addr    */
-    {  15, (PVOID)sock_inet_ntoa    },  /* inet_ntoa    */
-    {  16, (PVOID)sock_listen       },  /* listen       */
-    {  18, (PVOID)sock_recv         },  /* recv         */
-    {  19, (PVOID)sock_recvfrom     },  /* recvfrom     */
-    {  20, (PVOID)sock_select       },  /* select       */
-    {  21, (PVOID)sock_send         },  /* send         */
-    {  22, (PVOID)sock_sendto       },  /* sendto       */
-    {  23, (PVOID)sock_setsockopt   },  /* setsockopt   */
-    {  24, (PVOID)sock_shutdown     },  /* shutdown      */
-    {  25, (PVOID)sock_socket       },  /* socket       */
-    {  52, (PVOID)sock_gethostbyname},  /* gethostbyname */
+    {  14, (PVOID)wsock_inet_addr    },  /* inet_addr    */
+    {  15, (PVOID)wsock_inet_ntoa    },  /* inet_ntoa    */
+    {  16, (PVOID)wsock_listen       },  /* listen       */
+    {  18, (PVOID)wsock_recv         },  /* recv         */
+    {  19, (PVOID)wsock_recvfrom     },  /* recvfrom     */
+    {  20, (PVOID)wsock_select       },  /* select       */
+    {  21, (PVOID)wsock_send         },  /* send         */
+    {  22, (PVOID)wsock_sendto       },  /* sendto       */
+    {  23, (PVOID)wsock_setsockopt   },  /* setsockopt   */
+    {  24, (PVOID)wsock_shutdown     },  /* shutdown      */
+    {  25, (PVOID)wsock_socket       },  /* socket       */
+    {  52, (PVOID)wsock_gethostbyname},  /* gethostbyname */
     { 111, (PVOID)WSAStartup        },  /* WSAStartup   */
     { 116, (PVOID)WSACleanup        },  /* WSACleanup   */
     {   0, NULL }

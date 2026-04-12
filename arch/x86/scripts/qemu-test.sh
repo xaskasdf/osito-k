@@ -148,8 +148,8 @@ fi
 
 # Display: cocoa native window on macOS, VNC fallback on Linux
 if [ "$(uname)" = "Darwin" ]; then
-    DISPLAY_ARGS="-display cocoa,zoom-to-fit=off -vnc :2"
-    info "Display: native macOS window (cocoa) + VNC on :5902"
+    DISPLAY_ARGS="-display cocoa"
+    info "Display: native macOS window (cocoa)"
 else
     DISPLAY_ARGS="-vnc :0,password=on"
 fi
@@ -160,9 +160,10 @@ qemu-system-x86_64 \
     $NVME_ARGS \
     -m 512M \
     -machine q35 \
+    -cpu Nehalem \
     -smp 4 \
     -device e1000e,netdev=net0 \
-    -netdev user,id=net0,hostfwd=udp::7777-:7777 \
+    -netdev user,id=net0,hostfwd=udp::7778-:7777 \
     -device qemu-xhci,id=usb \
     -device usb-kbd,bus=usb.0 \
     -device usb-mouse,bus=usb.0 \
@@ -172,6 +173,6 @@ qemu-system-x86_64 \
     $DISPLAY_ARGS \
     -serial file:"$SERIAL_LOG" \
     -monitor unix:/tmp/qemu-monitor.sock,server,nowait \
-    -no-reboot
+    -no-reboot -no-shutdown
 
 wait

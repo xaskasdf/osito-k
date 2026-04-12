@@ -203,49 +203,23 @@ static void kb_process_scancode(uint8_t sc)
     if (c) kb_push(c);
 }
 
-/* ── Keyboard capture flag ────────────────────────────────────
- * When a graphical process (Q2, game) has focus, keyboard events
- * go only to the input_events queue (SYS_GET_INPUT_EVENT), not to
- * kb_buf. This prevents shell keystrokes from leaking into games.
- * Set via kbd_set_captured(true) when process creates SHM surface,
- * cleared via kbd_set_captured(false) on process exit. */
-
-static volatile bool g_keyboard_captured = false;
-volatile bool g_ps2_detected = false;  /* Set true on first PS/2 IRQ */
-
-void kbd_set_captured(bool captured) { g_keyboard_captured = captured; }
-bool kbd_is_captured(void)           { return g_keyboard_captured; }
-bool kbd_ps2_detected(void)          { return g_ps2_detected; }
-
 /* ── IRQ 1 handler (called from IDT vector 33) ──────────────── */
 
 void keyboard_irq(void)
 {
     uint8_t sc = inb(KB_DATA_PORT);
-    /* Post to input event system for games / compositor.
-     * Skip 0xE0 prefix byte (extended scancode marker). */
+    /* Post to input event system for USB games / compositor key_ring.
+     * Only from hardware IRQ — kb_inject_scancode must NOT re-post
+     * or we get an infinite loop. Skip 0xE0 prefix byte. */
     if (sc != 0xE0) {
         extern void input_post_key(uint8_t scancode, bool pressed, bool extended);
         input_post_key(sc & 0x7F, !(sc & 0x80), false);
     }
-    /* PS/2 ALWAYS converts scancodes to ASCII for the shell.
-     * Only skip when a graphical process has captured the keyboard
-     * (game mode: keys go via input_events ring instead).
-     * The compositor's fullscreen→desktop transition resets captured=false.
-     *
-     * Safety: if compositor is running and no fullscreen window is active,
-     * force captured=false so the terminal always receives input. */
-    if (g_keyboard_captured) {
-        /* Check if capture is stale (no fullscreen window) */
-        extern bool input_game_mode;
-        if (!input_game_mode)
-            g_keyboard_captured = false;  /* Auto-release stale capture */
-    }
-    if (!g_keyboard_captured)
+    /* When compositor is running it owns all input routing — it converts
+     * events and pushes to kb_buf for the terminal when appropriate.
+     * Without compositor (bare shell), process directly. */
+    if (!(compositor_is_running && compositor_is_running()))
         kb_process_scancode(sc);
-
-    /* Mark PS/2 as detected (for xHCI fallback decision) */
-    g_ps2_detected = true;
 }
 
 /* ── Inject scancode from compositor (no I/O port read) ──────── */

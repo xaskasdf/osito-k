@@ -11,6 +11,7 @@
 
 #include "../include/types.h"
 #include "../include/dynlink.h"
+#include "../fs/vfs.h"
 
 /* ── External functions ──────────────────────────────────────── */
 
@@ -30,9 +31,7 @@ extern void  kfree(void *ptr);
 extern int paging_map_page(uint64_t virt, uint64_t phys, uint64_t flags);
 extern int paging_unmap_page(uint64_t virt);
 
-/* OsitoFS */
-extern void *osfs2_find(const char *name);  /* returns osfs2_file_t* */
-extern int osfs2_read(void *file, uint64_t offset, void *buf, uint64_t len);
+/* VFS */
 
 /* Process — register memory for cleanup on exit */
 extern void proc_add_region(void *base, uint64_t pages);
@@ -633,16 +632,8 @@ int elf_exec(const char *filename, int argc, const char **argv)
     fb_puts(filename);
     fb_puts("\n");
 
-    /* Find file in OsitoFS */
-    /* We need the file size — osfs2_file_t has it at offset 64 */
-    typedef struct {
-        char     name[64];
-        uint64_t size;
-        /* ... more fields */
-    } osfs2_file_min_t;
-
-    void *file = osfs2_find(filename);
-    if (!file) {
+    vfs_node_t node;
+    if (!vfs_find(filename, VFS_MODE_POSIX, &node)) {
         serial_puts("[ELF] File not found: ");
         serial_puts(filename);
         serial_puts("\n");
@@ -650,8 +641,7 @@ int elf_exec(const char *filename, int argc, const char **argv)
         return -1;
     }
 
-    osfs2_file_min_t *finfo = (osfs2_file_min_t *)file;
-    uint64_t file_size = finfo->size;
+    uint64_t file_size = node.size;
 
     serial_puts("[ELF] File size: ");
     serial_putdec(file_size);
@@ -686,7 +676,7 @@ int elf_exec(const char *filename, int argc, const char **argv)
         return -1;
     }
 
-    if (osfs2_read(file, 0, data, file_size) < 0) {
+    if (vfs_read(&node, 0, data, file_size) < 0) {
         serial_puts("[ELF] Failed to read file\n");
         kfree(data);
         return -1;

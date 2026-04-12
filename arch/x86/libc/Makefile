@@ -37,7 +37,7 @@ QJS_CFLAGS = $(CFLAGS) $(QJS_HEADERS) -I$(QJS_SRC) \
 
 .PHONY: all clean
 
-all: $(LIBC)/crt.o $(LIBC)/syscall.o $(LIBC)/tcclib.o
+all: $(LIBC)/crt.o $(LIBC)/syscall.o $(LIBC)/tcclib.o $(LIBC)/malloc.o $(LIBC)/math.o
 
 $(LIBC):
 	mkdir -p $(LIBC)
@@ -45,6 +45,8 @@ $(LIBC):
 $(LIBC)/crt.o: crt.c | $(LIBC)
 	$(CC) $(CFLAGS) $(QJS_HEADERS) $< -o $@
 
+$(LIBC)/malloc.o: malloc.c | $(LIBC)
+	$(CC) $(CFLAGS) $(QJS_HEADERS) $< -o $@
 $(LIBC)/syscall.o: syscall.S | $(LIBC)
 	$(CC) -c -nostdlib $< -o $@
 

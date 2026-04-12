@@ -163,57 +163,34 @@ void *mem_alloc_pages(uint64_t count)
 {
     if (count == 0 || free_pages < count) return NULL;
 
-    /* First-fit with word-level skip: scan bitmap as uint64_t words.
-     * A zero word means 64 consecutive used pages — skip instantly.
-     * A full word (0xFF...FF) means 64 free pages — extend run fast. */
+    /* Simple first-fit search */
     uint64_t run_start = 0;
     uint64_t run_len = 0;
 
-    /* Start above 16MB to avoid ELF load area (0x400000-0xDF0000) */
+    /* Start above 16MB to avoid collisions with:
+     * - Page tables (0x100000-0x110000)
+     * - ET_EXEC ELF load area (0x400000+, up to ~14MB for large BSS)
+     *   e.g. Quake 2 has a 9.5MB BSS reaching 0xDF0000 (~14MB)
+     * Heap/general allocator must not overlap the fixed-load VA range. */
     uint64_t limit = max_tracked_page ? max_tracked_page : MAX_PHYS_PAGES;
-    uint64_t start_word = 4096 / 64;  /* 16MB in 64-page words */
-    uint64_t end_word = (limit + 63) / 64;
-
-    for (uint64_t w = start_word; w < end_word; w++) {
-        /* Read 8 bytes (64 pages) at once */
-        uint64_t word = *(uint64_t *)&page_bitmap[w * 8];
-
-        if (word == 0) {
-            /* All 64 pages used — reset run, skip */
-            run_len = 0;
-            continue;
-        }
-
-        if (word == 0xFFFFFFFFFFFFFFFFULL && run_len > 0 &&
-            run_len + 64 <= count) {
-            /* All 64 pages free and we're building a run — extend fast */
-            run_len += 64;
-            if (run_len >= count) goto found;
-            continue;
-        }
-
-        /* Partial word — check individual bits */
-        for (int b = 0; b < 64; b++) {
-            uint64_t page = w * 64 + b;
-            if (page >= limit) break;
-            if (word & (1ULL << b)) {
-                if (run_len == 0) run_start = page;
-                run_len++;
-                if (run_len >= count) goto found;
-            } else {
-                run_len = 0;
+    for (uint64_t p = 4096; p < limit; p++) {  /* Start above 16MB */
+        if (bitmap_test(p)) {
+            if (run_len == 0) run_start = p;
+            run_len++;
+            if (run_len == count) {
+                /* Found a contiguous run */
+                for (uint64_t i = 0; i < count; i++) {
+                    bitmap_clear(run_start + i);
+                    free_pages--;
+                }
+                return (void *)(run_start << PAGE_SHIFT);
             }
+        } else {
+            run_len = 0;
         }
     }
 
     return NULL; /* Out of contiguous pages */
-
-found:
-    for (uint64_t i = 0; i < count; i++) {
-        bitmap_clear(run_start + i);
-        free_pages--;
-    }
-    return (void *)(run_start << PAGE_SHIFT);
 }
 
 /* ── Reserve specific physical pages (for ET_EXEC fixed loads) ─ */
@@ -461,11 +438,13 @@ uint64_t __fixunsdfdi(double a)
     return mant >> (-shift);
 }
 
+#ifdef __TCC__
 /* TCC doesn't support __builtin_unreachable — provide as infinite loop */
 void __builtin_unreachable(void)
 {
     for (;;) __asm__ volatile("hlt");
 }
+#endif
 
 extern int sched_set_qos(uint32_t pid, uint8_t qos);
 void proc_set_qos(uint8_t qos)

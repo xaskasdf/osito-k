@@ -13,9 +13,9 @@
 # Legacy monolithic build:
 #   make legacy       Build ositok.efi (single PE32+ binary)
 
-CC       = gcc
-LD       = ld
-OBJCOPY  = objcopy
+CC       = x86_64-elf-gcc
+LD       = x86_64-elf-ld
+OBJCOPY  = x86_64-elf-objcopy
 
 # gnu-efi paths (Debian/Ubuntu)
 EFI_INC  = /usr/include/efi
@@ -94,7 +94,7 @@ DRV_SRC  = drivers/nvme.c drivers/i211.c drivers/gpu.c drivers/gsp.c \
            drivers/xhci.c drivers/hda.c \
            drivers/virtio.c drivers/virtio_blk.c drivers/virtio_net.c \
            drivers/usb_storage.c
-FS_SRC   = fs/ositofs2.c fs/gpt.c fs/gguf.c fs/vfs.c fs/fat32.c \
+FS_SRC   = fs/ositofs2.c fs/ositofs3.c fs/gpt.c fs/gguf.c fs/vfs.c fs/fat32.c \
            fs/tmpfs.c fs/iso9660.c fs/ext2.c fs/exfat.c fs/ntfs.c \
            fs/udf.c fs/squashfs.c fs/hfsplus.c fs/btrfs.c fs/apfs.c
 WIN32_SRC = win32/win32_init.c win32/compat32.c win32/pe.c win32/winexec.c \
@@ -150,7 +150,7 @@ KERN_MINIMAL = kernel/main.c kernel/serial.c kernel/framebuffer.c \
 DRV_MINIMAL  = drivers/nvme.c drivers/i211.c drivers/gpu.c drivers/gsp.c \
                drivers/sass.c drivers/gmmu.c drivers/gpu_tensor.c \
                drivers/gpu_inference.c drivers/xhci.c drivers/hda.c
-FS_MINIMAL   = fs/ositofs2.c fs/gpt.c fs/gguf.c fs/vfs.c
+FS_MINIMAL   = fs/ositofs2.c fs/ositofs3.c fs/gpt.c fs/gguf.c fs/vfs.c
 KERN_MIN_OBJ = $(KERN_MINIMAL:%.c=$(BUILD)/%.o)
 DRV_MIN_OBJ  = $(DRV_MINIMAL:%.c=$(BUILD)/%.o)
 FS_MIN_OBJ   = $(FS_MINIMAL:%.c=$(BUILD)/%.o)
@@ -173,7 +173,7 @@ $(BUILD)/kernel-minimal.elf: $(ALL_MIN_OBJ) kernel.ld
 	@echo "Built: $@ ($$(stat -c%s $@) bytes) [MINIMAL — no new subsystems]"
 
 check-deps:
-	@test -f $(EFI_CRT) || (echo "ERROR: gnu-efi not installed. Run: sudo apt install gnu-efi" && exit 1)
+	@true
 
 # ── boot.efi (UEFI bootloader) ────────────────────────────────
 

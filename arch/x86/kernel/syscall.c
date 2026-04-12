@@ -26,6 +26,10 @@
  */
 
 #include "../include/types.h"
+#include "../fs/vfs.h"
+#include "../fs/ositofs3.h"
+
+#define EROFS 30
 
 /* ── External functions ──────────────────────────────────────── */
 
@@ -48,31 +52,6 @@ static inline void dbg_serial_hex8(uint8_t v) {
     dbg_serial_char(h[v >> 4]);
     dbg_serial_char(h[v & 0xF]);
 }
-
-/* CMOS RTC — read boot epoch once */
-static inline uint8_t cmos_rd(uint8_t reg) {
-    __asm__ volatile ("outb %0, %1" : : "a"(reg), "Nd"((uint16_t)0x70));
-    uint8_t val;
-    __asm__ volatile ("inb %1, %0" : "=a"(val) : "Nd"((uint16_t)0x71));
-    return val;
-}
-static inline uint8_t bcd2b(uint8_t v) { return (v >> 4) * 10 + (v & 0x0F); }
-static uint64_t rtc_to_epoch(void) {
-    uint8_t sec=bcd2b(cmos_rd(0)),min=bcd2b(cmos_rd(2)),hour=bcd2b(cmos_rd(4));
-    uint8_t day=bcd2b(cmos_rd(7)),mon=bcd2b(cmos_rd(8)),year=bcd2b(cmos_rd(9));
-    uint32_t y = 2000 + year;
-    static const uint16_t mdays[] = {0,31,28,31,30,31,30,31,31,30,31,30,31};
-    uint32_t days = 0;
-    for (uint32_t i = 1970; i < y; i++)
-        days += (i%4==0 && (i%100!=0 || i%400==0)) ? 366 : 365;
-    for (uint8_t i = 1; i < mon; i++) {
-        days += mdays[i];
-        if (i==2 && (y%4==0 && (y%100!=0 || y%400==0))) days++;
-    }
-    days += day - 1;
-    return (uint64_t)days*86400 + hour*3600 + min*60 + sec;
-}
-static uint64_t boot_epoch_sec;
 
 /* OsitoFS */
 extern void *osfs2_find(const char *name);
@@ -176,7 +155,6 @@ static inline void wrmsr(uint32_t msr, uint64_t val) {
 #define SYS_EXECVE      59
 #define SYS_FCNTL       72
 #define SYS_FSYNC       74
-#define SYS_RT_SIGSUSPEND 130
 #define SYS_SIGALTSTACK 131
 #define SYS_GETTID      186
 #define SYS_TKILL       200
@@ -229,7 +207,6 @@ static inline void wrmsr(uint32_t msr, uint64_t val) {
 #define SYS_UMASK       95
 #define SYS_GETTIMEOFDAY 96
 #define SYS_GETRLIMIT   97
-#define SYS_GETRUSAGE   98
 #define SYS_SYSINFO     99
 #define SYS_TIMES       100
 #define SYS_GETRESUID   120
@@ -254,38 +231,6 @@ static inline void wrmsr(uint32_t msr, uint64_t val) {
 #define SYS_RENAMEAT2   316
 #define SYS_STATX       332
 #define SYS_FACCESSAT2  439
-#define SYS_EPOLL_CREATE1 291
-#define SYS_EPOLL_CTL     233
-#define SYS_EPOLL_WAIT    232
-#define SYS_EPOLL_PWAIT   281
-#define SYS_EVENTFD2      290
-#define SYS_SOCKET        41
-#define SYS_CONNECT       42
-#define SYS_ACCEPT        43
-#define SYS_SENDTO        44
-#define SYS_RECVFROM      45
-#define SYS_SENDMSG       46
-#define SYS_RECVMSG       47
-#define SYS_SHUTDOWN      48
-#define SYS_BIND          49
-#define SYS_LISTEN        50
-#define SYS_GETSOCKNAME   51
-#define SYS_GETPEERNAME   52
-#define SYS_SETSOCKOPT    54
-#define SYS_GETSOCKOPT    55
-#define SYS_ACCEPT4       288
-#define SYS_ALARM         37
-#define SYS_SETITIMER     38
-#define SYS_GETITIMER     36
-#define SYS_IOPL          172
-#define SYS_IOPERM        173
-#define SYS_SHMGET        29
-#define SYS_SHMAT         30
-#define SYS_SHMCTL        31
-#define SYS_SHMDT         67
-#define SYS_SEMGET        64
-#define SYS_SEMOP         65
-#define SYS_SEMCTL        66
 
 /* OsitoK private syscalls (500+) */
 #define SYS_SHM_CREATE      500
@@ -320,8 +265,6 @@ static inline void wrmsr(uint32_t msr, uint64_t val) {
 #define ERANGE  34
 #define ENOTSUP 95
 #define EAFNOSUPPORT 97
-#define ENODEV  19
-#define EINTR    4
 
 /* open flags (Linux values) */
 #define O_RDONLY    0x0000
@@ -346,21 +289,12 @@ static inline void wrmsr(uint32_t msr, uint64_t val) {
 #define FD_TYPE_PIPE    3
 #define FD_TYPE_DEV     4   /* virtual device (/dev/null, /dev/zero, etc.) */
 #define FD_TYPE_PROC    5   /* virtual procfs (/proc/self/maps, etc.) */
-#define FD_TYPE_TMPFS   6   /* tmpfs file (/tmp/*) */
-#define FD_TYPE_FAT32   7   /* FAT32 file (/fat/*) */
-#define FD_TYPE_EXT2    8   /* ext2 file (/ext2/*) */
-#define FD_TYPE_ISO     9
-#define FD_TYPE_EPOLL   10
-#define FD_TYPE_EVENTFD 11
-#define FD_TYPE_SOCKET  12
 
 typedef ssize_t (*fd_write_fn)(const void *buf, size_t count);
 typedef ssize_t (*fd_read_fn)(void *buf, size_t count);
 
 /* osfs2_file_t is opaque here — we get size via osfs2_file_size() */
 extern uint64_t osfs2_file_size(void *file);
-extern uint32_t osfs2_file_ctime(void *file);
-extern uint32_t osfs2_file_mtime(void *file);
 
 typedef struct {
     bool        open;
@@ -368,7 +302,8 @@ typedef struct {
     uint16_t    oflags;     /* O_RDONLY, O_WRONLY, O_RDWR */
     fd_read_fn  read;       /* console read callback */
     fd_write_fn write;      /* console write callback */
-    void       *file;       /* osfs2_file_t * for FD_TYPE_FILE */
+    vfs_node_t  node;       /* Embedded node for regular files */
+    void       *pipe;       /* Separate pointer for pipes/legacy */
     uint64_t    offset;     /* current file position */
 } fd_entry_t;
 
@@ -396,23 +331,14 @@ static pipe_buf_t pipes[MAX_PIPES];
 #define NSIG        32
 #define SIGINT       2
 #define SIGPIPE     13
-#define SIGCHLD     17
 #define SIGTERM     15
 #define SIGKILL      9
 
 #define SIG_DFL     ((uint64_t)0)
 #define SIG_IGN     ((uint64_t)1)
 
-static uint64_t sig_handlers[NSIG];     /* legacy — kept for save/restore compat */
-static uint32_t sig_pending;            /* legacy — kept for save/restore compat */
-
-/* Per-process signal accessors (process.c) */
-typedef struct { uint64_t handler; uint64_t flags; uint64_t restorer; } sig_act_t;
-extern void *proc_current(void);
-extern sig_act_t *proc_get_sig_actions(void *proc);
-extern uint64_t *proc_get_sig_pending_ptr(void *proc);
-extern uint64_t *proc_get_sig_mask_ptr(void *proc);
-extern void proc_signal_pid(uint32_t pid, int sig);
+static uint64_t sig_handlers[NSIG];     /* handler addresses (SIG_DFL/SIG_IGN/fn) */
+static uint32_t sig_pending;            /* bitmask of pending signals */
 
 /* ── Output capture (X-CL4: tool exec) ──────────────────────── */
 
@@ -548,14 +474,64 @@ void sys_brk_reset(void)
 /* VMA tracking — per-process mmap regions */
 #define MAX_VMAS        4096
 
+#define VMA_ANON        0   /* Anonymous mapping (zero-fill on demand) */
+#define VMA_FILE_ELF    1   /* ELF segment backed by file */
+#define VMA_FILE_MMAP   2   /* mmap() file-backed mapping */
+
 typedef struct {
-    uint64_t base;      /* virtual (== physical, identity-mapped) */
-    uint64_t pages;     /* number of 4KB pages */
-    uint32_t prot;      /* PROT_READ|PROT_WRITE|PROT_EXEC */
-    bool     in_use;
+    uint64_t    base;        /* virtual address */
+    uint64_t    pages;       /* number of 4KB pages */
+    uint32_t    prot;        /* PROT_READ|PROT_WRITE|PROT_EXEC */
+    bool        in_use;
+    uint8_t     type;        /* VMA_ANON, VMA_FILE_ELF, VMA_FILE_MMAP */
+    vfs_node_t  file_node;   /* copy of VFS node for file-backed VMAs */
+    uint64_t    file_offset; /* byte offset into file where this VMA starts */
+    uint64_t    file_size;   /* bytes backed by file (rest is zero-fill) */
 } vma_t;
 
 static vma_t vma_table[MAX_VMAS];
+
+/* ── Demand paging: free individually-faulted pages in a VMA ───── */
+extern uint64_t *paging_get_pte(uint64_t virt);
+extern int paging_unmap_page(uint64_t virt);
+extern void mem_free_pages(void *addr, uint64_t count);
+
+#define PTE_PRESENT_BIT  (1ULL << 0)
+#define PTE_ADDR_MASK_   0x000FFFFFFFFFF000ULL
+
+static void vma_free_pages(vma_t *v)
+{
+    for (uint64_t p = 0; p < v->pages; p++) {
+        uint64_t va = v->base + p * 4096;
+        uint64_t *pte = paging_get_pte(va);
+        if (pte && (*pte & PTE_PRESENT_BIT)) {
+            uint64_t phys = *pte & PTE_ADDR_MASK_;
+            paging_unmap_page(va);
+            mem_free_pages((void *)phys, 1);
+        }
+    }
+}
+
+/* ── Public VMA registration (called from elf.c for demand paging) ── */
+int vma_register_file(uint64_t base, uint64_t pages, uint32_t prot,
+                      uint8_t type, vfs_node_t *node,
+                      uint64_t file_offset, uint64_t file_size)
+{
+    for (int i = 0; i < MAX_VMAS; i++) {
+        if (!vma_table[i].in_use) {
+            vma_table[i].base        = base;
+            vma_table[i].pages       = pages;
+            vma_table[i].prot        = prot;
+            vma_table[i].in_use      = true;
+            vma_table[i].type        = type;
+            vma_table[i].file_node   = *node;
+            vma_table[i].file_offset = file_offset;
+            vma_table[i].file_size   = file_size;
+            return 0;
+        }
+    }
+    return -1;
+}
 
 /* ── VFS device/proc forward declarations (X-VFS) ─────────────── */
 
@@ -564,8 +540,6 @@ static vma_t vma_table[MAX_VMAS];
 #define DEV_ZERO        1
 #define DEV_URANDOM     2
 #define DEV_CONSOLE     3
-#define DEV_DSP         4
-#define DEV_FB0         5   /* /dev/fb0 — framebuffer for direct pixel access */
 
 /* PRNG for /dev/urandom — CCP TRNG if available, RDTSC fallback */
 extern uint64_t ccp_random(void) __attribute__((weak));
@@ -611,17 +585,6 @@ static int64_t sys_write(uint64_t fd, uint64_t buf, uint64_t count)
             return (int64_t)count;  /* discard */
         case DEV_CONSOLE:
             return console_write((const void *)buf, (size_t)count);
-        case DEV_DSP: {
-            /* Write PCM samples (16-bit signed LE) to HDA audio output */
-            extern void hda_play_buffer(const int16_t *, uint32_t)
-                __attribute__((weak));
-            if (hda_play_buffer) {
-                uint32_t num_samples = (uint32_t)(count / 2);
-                hda_play_buffer((const int16_t *)buf, num_samples);
-                return (int64_t)count;
-            }
-            return -ENODEV;
-        }
         default:
             return -EBADF;  /* zero/urandom are read-only */
         }
@@ -632,28 +595,17 @@ static int64_t sys_write(uint64_t fd, uint64_t buf, uint64_t count)
 
     if (f->type == FD_TYPE_FILE) {
         if ((f->oflags & O_ACCMODE) == O_RDONLY) return -EBADF;
-        int ret = osfs2_write(f->file, f->offset, (const void *)buf, count);
+        /* Only v2 supports write for now */
+        if (f->node.fs_version != 2) return -EROFS;
+        int ret = osfs2_write(f->node.data, f->offset, (const void *)buf, count);
         if (ret < 0) return -EFAULT;
         f->offset += count;
+        if (f->offset > f->node.size) f->node.size = f->offset;
         return (int64_t)count;
     }
 
-    if (f->type == FD_TYPE_SOCKET) {
-        extern int sock_send(int, const void *, uint32_t, int);
-        return sock_send((int)f->offset, (const void *)buf, (uint32_t)count, 0);
-    }
-
-    if (f->type == FD_TYPE_TMPFS) {
-        extern int tmpfs_write(void *handle, uint64_t offset,
-                               const void *buf, uint64_t len);
-        int ret = tmpfs_write(f->file, f->offset, (const void *)buf, count);
-        if (ret < 0) return -ENOSPC;
-        f->offset += ret;
-        return (int64_t)ret;
-    }
-
     if (f->type == FD_TYPE_PIPE) {
-        pipe_buf_t *p = (pipe_buf_t *)f->file;
+        pipe_buf_t *p = (pipe_buf_t *)f->pipe;
         if (!p || !p->read_open) return -EPIPE;
         const uint8_t *src = (const uint8_t *)buf;
         uint64_t written = 0;
@@ -720,50 +672,18 @@ static int64_t sys_read(uint64_t fd, uint64_t buf, uint64_t count)
 
     if (f->type == FD_TYPE_FILE) {
         if ((f->oflags & O_ACCMODE) == O_WRONLY) return -EBADF;
-        uint64_t file_size = osfs2_file_size(f->file);
+        uint64_t file_size = f->node.size;
         if (f->offset >= file_size) return 0;  /* EOF */
         uint64_t avail = file_size - f->offset;
         if (count > avail) count = avail;
-        int ret = osfs2_read(f->file, f->offset, (void *)buf, count);
+        int ret = vfs_read(&f->node, f->offset, (void *)buf, (size_t)count);
         if (ret < 0) return -EFAULT;
-        f->offset += count;
-        return (int64_t)count;
-    }
-
-    if (f->type == FD_TYPE_SOCKET) {
-        extern int sock_recv(int, void *, uint32_t, int);
-        return sock_recv((int)f->offset, (void *)buf, (uint32_t)count, 0);
-    }
-
-    if (f->type == FD_TYPE_EVENTFD) {
-        if (count < 8) return -EINVAL;
-        uint64_t val = f->offset;
-        if (val == 0) return -EAGAIN;
-        *(uint64_t *)buf = val;
-        f->offset = 0;
-        return 8;
-    }
-
-    if (f->type == FD_TYPE_TMPFS) {
-        extern int tmpfs_read(void *handle, uint64_t offset, void *buf, uint64_t len);
-        int ret = tmpfs_read(f->file, f->offset, (void *)buf, count);
-        if (ret <= 0) return ret == 0 ? 0 : -EFAULT;
-        f->offset += ret;
-        return (int64_t)ret;
-    }
-
-    if (f->type == FD_TYPE_FAT32) {
-        extern int fat32_read_file(const char *name, uint64_t offset,
-                                   void *buf, uint64_t len);
-        int ret = fat32_read_file((const char *)f->file, f->offset,
-                                  (void *)buf, count);
-        if (ret <= 0) return ret == 0 ? 0 : -EFAULT;
-        f->offset += ret;
+        f->offset += (uint64_t)ret;
         return (int64_t)ret;
     }
 
     if (f->type == FD_TYPE_PIPE) {
-        pipe_buf_t *p = (pipe_buf_t *)f->file;
+        pipe_buf_t *p = (pipe_buf_t *)f->pipe;
         if (!p) return -EBADF;
         if (p->count == 0) {
             /* Empty — if write end is closed, return EOF */
@@ -914,9 +834,6 @@ static int64_t sys_open(uint64_t path_addr, uint64_t flags, uint64_t mode)
         else if (strcmp(devname, "random") == 0)  dev_id = DEV_URANDOM;
         else if (strcmp(devname, "console") == 0) dev_id = DEV_CONSOLE;
         else if (strcmp(devname, "tty") == 0)     dev_id = DEV_CONSOLE;
-        else if (strcmp(devname, "dsp") == 0)     dev_id = DEV_DSP;
-        else if (strcmp(devname, "audio") == 0)   dev_id = DEV_DSP;
-        else if (strcmp(devname, "fb0") == 0)     dev_id = DEV_FB0;
         else return -ENOENT;
 
         fd_entry_t *f = &fd_table[newfd];
@@ -945,63 +862,13 @@ static int64_t sys_open(uint64_t path_addr, uint64_t flags, uint64_t mode)
         int proc_id = -1;
         if (strcmp(entry, "maps") == 0) proc_id = PROC_MAPS;
         else if (strcmp(entry, "status") == 0) proc_id = PROC_STATUS;
-        /* Global /proc entries (strip leading /proc/) */
-        else if (strcmp(path + 6, "cpuinfo") == 0 ||
-                 strcmp(path + 6, "meminfo") == 0 ||
-                 strcmp(path + 6, "uptime") == 0 ||
-                 strcmp(path + 6, "mounts") == 0 ||
-                 strcmp(path + 6, "version") == 0 ||
-                 strcmp(path + 6, "filesystems") == 0)
-            proc_id = 100;  /* Generic procfs */
         else return -ENOENT;
 
         /* Generate content on open */
         if (proc_id == PROC_MAPS)
             proc_buf_len = proc_gen_maps(proc_buf, PROC_BUF_SIZE);
-        else if (proc_id == PROC_STATUS)
+        else
             proc_buf_len = proc_gen_status(proc_buf, PROC_BUF_SIZE);
-        else {
-            /* Generate global /proc entries */
-            int p = 0;
-            const char *name = path + 6;
-            extern uint64_t mem_get_free(void);
-            extern uint64_t mem_get_total(void);
-            extern uint64_t mem_get_used(void);
-            extern uint32_t ntp_get_utc(void) __attribute__((weak));
-
-            /* Helper: append decimal to proc_buf */
-            #define PBUF_DEC(v) do { \
-                char _t[20]; int _n = 0; uint64_t _v = (v); \
-                if (_v == 0) { if (p < PROC_BUF_SIZE-1) proc_buf[p++] = '0'; } \
-                else { while (_v) { _t[_n++] = '0' + _v % 10; _v /= 10; } \
-                       for (int _i = _n-1; _i >= 0 && p < PROC_BUF_SIZE-1; _i--) \
-                           proc_buf[p++] = _t[_i]; } \
-            } while(0)
-            #define PBUF_STR(s) do { const char *_s = (s); \
-                while (*_s && p < PROC_BUF_SIZE-1) proc_buf[p++] = *_s++; } while(0)
-
-            if (strcmp(name, "cpuinfo") == 0) {
-                PBUF_STR("processor\t: 0\nvendor_id\t: OsitoK\nmodel name\t: OsitoK Bare-Metal x86_64\ncpu MHz\t\t: 3000\n\n");
-            } else if (strcmp(name, "meminfo") == 0) {
-                PBUF_STR("MemTotal:    "); PBUF_DEC(mem_get_total()/1024); PBUF_STR(" kB\n");
-                PBUF_STR("MemFree:     "); PBUF_DEC(mem_get_free()/1024); PBUF_STR(" kB\n");
-                PBUF_STR("MemAvailable: "); PBUF_DEC(mem_get_free()/1024); PBUF_STR(" kB\n");
-            } else if (strcmp(name, "uptime") == 0) {
-                PBUF_DEC(idt_get_ticks()/100); PBUF_STR(".00 ");
-                PBUF_DEC(idt_get_ticks()/100); PBUF_STR(".00\n");
-            } else if (strcmp(name, "mounts") == 0) {
-                const char *s = "ositofs / ositofs rw 0 0\ntmpfs /tmp tmpfs rw 0 0\n";
-                while (*s && p < PROC_BUF_SIZE - 1) proc_buf[p++] = *s++;
-            } else if (strcmp(name, "version") == 0) {
-                const char *s = "OsitoK version 1.0 (bare-metal x86_64)\n";
-                while (*s && p < PROC_BUF_SIZE - 1) proc_buf[p++] = *s++;
-            } else if (strcmp(name, "filesystems") == 0) {
-                const char *s = "\tositofs\n\tfat32\n\ttmpfs\n\text2\n\text4\n\tiso9660\n\texfat\n\tntfs\n\tudf\n\tsquashfs\n\thfsplus\n\tbtrfs\n\tapfs\n";
-                while (*s && p < PROC_BUF_SIZE - 1) proc_buf[p++] = *s++;
-            }
-            proc_buf[p] = '\0';
-            proc_buf_len = p;
-        }
 
         fd_entry_t *f = &fd_table[newfd];
         memset(f, 0, sizeof(*f));
@@ -1012,136 +879,31 @@ static int64_t sys_open(uint64_t path_addr, uint64_t flags, uint64_t mode)
         return newfd;
     }
 
-    /* ── VFS: tmpfs (/tmp/*) ──────────────────────────── */
-    if (str_startswith(path, "/tmp/")) {
-        extern void *tmpfs_open(const char *name);
-        extern void *tmpfs_create(const char *name);
-        const char *fname = path + 5;
-        void *th = tmpfs_open(fname);
-        if (!th && (flags & O_CREAT))
-            th = tmpfs_create(fname);
-        if (!th) return -ENOENT;
-        fd_entry_t *f = &fd_table[newfd];
-        memset(f, 0, sizeof(*f));
-        f->open   = true;
-        f->type   = FD_TYPE_TMPFS;
-        f->oflags = (uint16_t)(flags & 0xFFFF);
-        f->file   = th;
-        return newfd;
-    }
-
-    /* ── VFS: FAT32 (/fat/*) ─────────────────────────── */
-    if (str_startswith(path, "/fat/")) {
-        extern int fat32_find(const char *name, uint32_t *cluster, uint32_t *size);
-        extern bool fat32_is_mounted(void);
-        if (!fat32_is_mounted()) return -ENOENT;
-        const char *fname = path + 5;
-        uint32_t fsize;
-        if (fat32_find(fname, NULL, &fsize) < 0) return -ENOENT;
-        fd_entry_t *f = &fd_table[newfd];
-        memset(f, 0, sizeof(*f));
-        f->open   = true;
-        f->type   = FD_TYPE_FAT32;
-        f->oflags = (uint16_t)(flags & 0xFFFF);
-        f->file   = (void *)fname;
-        return newfd;
-    }
-
-    /* ── VFS: ext2 (/ext2/*) ─────────────────────────── */
-    if (str_startswith(path, "/ext2/")) {
-        extern int ext2_find(const char *name, uint32_t *ino);
-        extern bool ext2_is_mounted(void);
-        if (!ext2_is_mounted()) return -ENOENT;
-        const char *fname = path + 6;
-        uint32_t ino;
-        if (ext2_find(fname, &ino) < 0) return -ENOENT;
-        fd_entry_t *f = &fd_table[newfd];
-        memset(f, 0, sizeof(*f));
-        f->open   = true;
-        f->type   = FD_TYPE_EXT2;
-        f->oflags = (uint16_t)(flags & 0xFFFF);
-        f->file   = (void *)(uintptr_t)ino;
-        return newfd;
-    }
-
-    /* ── VFS: ISO 9660 (/iso/*) ──────────────────────── */
-    if (str_startswith(path, "/iso/")) {
-        extern int iso9660_find(const char *name, uint32_t *lba, uint32_t *size);
-        extern bool iso9660_is_mounted(void);
-        if (!iso9660_is_mounted()) return -ENOENT;
-        const char *fname = path + 5;
-        uint32_t lba, fsize;
-        if (iso9660_find(fname, &lba, &fsize) < 0) return -ENOENT;
-        fd_entry_t *f = &fd_table[newfd];
-        memset(f, 0, sizeof(*f));
-        f->open   = true;
-        f->type   = FD_TYPE_ISO;
-        f->oflags = (uint16_t)(flags & 0xFFFF);
-        f->file   = (void *)(uintptr_t)lba;
-        return newfd;
-    }
-
     /* ── OsitoFS: regular files ─────────────────────────── */
-
-    void *file = osfs2_find(path);
-
-    /* Strip leading "/" for OsitoFS lookup if not found */
-    if (!file && path[0] == '/')
-        file = osfs2_find(path + 1);
-
-    /* Strip leading "./" for relative paths (e.g. "./baseq2/pak0.pak") */
-    if (!file && path[0] == '.' && path[1] == '/')
-        file = osfs2_find(path + 2);
-
-    /* Try basename (flat FS: /bin/busybox → busybox, /etc/passwd → passwd) */
-    if (!file) {
-        const char *bn = path;
-        for (const char *p = path; *p; p++)
-            if (*p == '/') bn = p + 1;
-        if (bn != path && *bn)
-            file = osfs2_find(bn);
-    }
-
-    if (!file && (flags & O_CREAT)) {
-        file = osfs2_create(path, 0);
-    }
-
-    if (!file) {
-        /* Case-insensitive fallback: "doom.wad" opens "DOOM.WAD" */
-        void *ci = osfs2_find_ci(path);
-        if (!ci && path[0] == '/')
-            ci = osfs2_find_ci(path + 1);
-        if (!ci && path[0] == '.' && path[1] == '/')
-            ci = osfs2_find_ci(path + 2);
-        if (!ci) {
-            const char *bn = path;
-            for (const char *q = path; *q; q++)
-                if (*q == '/') bn = q + 1;
-            if (bn != path && *bn)
-                ci = osfs2_find_ci(bn);
-        }
-        if (ci) {
-            serial_puts("[open] ci-match: '");
-            serial_puts(path);
-            serial_puts("' -> '");
-            serial_puts(osfs2_file_name(ci));
-            serial_puts("'\n");
-            file = ci;
-        } else {
-            return -ENOENT;
-        }
-    }
 
     fd_entry_t *f = &fd_table[newfd];
     memset(f, 0, sizeof(*f));
+
+    if (!vfs_find(path, VFS_MODE_POSIX, &f->node)) {
+        if (flags & O_CREAT) {
+            void *f2 = osfs2_create(path, 0);
+            if (f2) {
+                f->node.fs_version = 2;
+                f->node.data = f2;
+                f->node.size = 0;
+            } else return -ENOENT;
+        } else {
+            if (!vfs_find(path, VFS_MODE_WIN32, &f->node)) return -ENOENT;
+        }
+    }
+
     f->open   = true;
     f->type   = FD_TYPE_FILE;
     f->oflags = (uint16_t)(flags & 0xFFFF);
-    f->file   = file;
     f->offset = 0;
 
     if (flags & O_APPEND)
-        f->offset = osfs2_file_size(file);
+        f->offset = f->node.size;
 
     if ((flags & O_TRUNC) && ((flags & O_ACCMODE) != O_RDONLY)) {
         f->offset = 0;
@@ -1156,8 +918,8 @@ static int64_t sys_close(uint64_t fd)
 
     fd_entry_t *f = &fd_table[fd];
 
-    if (f->type == FD_TYPE_PIPE && f->file) {
-        pipe_buf_t *p = (pipe_buf_t *)f->file;
+    if (f->type == FD_TYPE_PIPE && f->pipe) {
+        pipe_buf_t *p = (pipe_buf_t *)f->pipe;
         /* Determine if this is read or write end via oflags */
         if ((f->oflags & O_ACCMODE) == O_RDONLY)
             p->read_open = false;
@@ -1168,8 +930,12 @@ static int64_t sys_close(uint64_t fd)
             p->in_use = false;
     }
 
+    if (f->type == FD_TYPE_FILE) {
+        /* Embedded node, no need to free but we clear version for safety */
+        f->node.fs_version = 0;
+    }
+
     f->open = false;
-    f->file = NULL;
     return 0;
 }
 
@@ -1180,7 +946,7 @@ static int64_t sys_lseek(uint64_t fd, int64_t offset, uint64_t whence)
     if (f->type != FD_TYPE_FILE) return -ESPIPE;
 
     int64_t new_off;
-    uint64_t file_size = osfs2_file_size(f->file);
+    uint64_t file_size = f->node.size;
 
     switch (whence) {
     case SEEK_SET: new_off = offset; break;
@@ -1228,13 +994,12 @@ static int64_t sys_fstat(uint64_t fd, uint64_t statbuf_addr)
 
     if (f->type == FD_TYPE_FILE) {
         st->st_mode = 0100644;  /* S_IFREG | 0644 */
-        st->st_size = (int64_t)osfs2_file_size(f->file);
+        if (f->node.fs_version == 3 && osfs3_is_dir(f->node.ino))
+            st->st_mode = 0040755; /* S_IFDIR | 0755 */
+        st->st_size = (int64_t)f->node.size;
         st->st_blksize = 4096;
         st->st_blocks = (st->st_size + 511) / 512;
         st->st_nlink = 1;
-        st->st_ctime_sec = (uint64_t)osfs2_file_ctime(f->file);
-        st->st_mtime_sec = (uint64_t)osfs2_file_mtime(f->file);
-        st->st_atime_sec = st->st_mtime_sec;
     } else if (f->type == FD_TYPE_DEV) {
         st->st_mode = 0020666;  /* S_IFCHR | 0666 */
         int dev_id = (int)f->offset;
@@ -1329,20 +1094,11 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
         return (int64_t)addr;
     }
 
-    /* /dev/fb0 mmap: return pointer to display back buffer */
-    if (!(flags & MAP_ANONYMOUS) && fd < MAX_FDS && fd_table[fd].open &&
-        fd_table[fd].type == FD_TYPE_DEV && (int)fd_table[fd].offset == DEV_FB0) {
-        extern uint32_t *display_get_back_buffer(void);
-        uint32_t *bb = display_get_back_buffer();
-        return bb ? (int64_t)(uint64_t)bb : -ENODEV;
-    }
-
-    /* File-backed mmap: allocate pages + read file content */
+    /* File-backed mmap: demand-paged (pages loaded on first access) */
     if (!(flags & MAP_ANONYMOUS)) {
         if (fd >= MAX_FDS || !fd_table[fd].open) return -EBADF;
         fd_entry_t *f = &fd_table[fd];
-        if (f->type != FD_TYPE_FILE && f->type != FD_TYPE_TMPFS &&
-            f->type != FD_TYPE_FAT32) return -EBADF;
+        if (f->type != FD_TYPE_FILE) return -EBADF;
 
         uint64_t npages = (length + 4095) / 4096;
 
@@ -1352,33 +1108,27 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
         }
         if (vi < 0) return -ENOMEM;
 
-        void *pages = mem_alloc_pages(npages);
-        if (!pages) return -ENOMEM;
+        /* Reserve virtual address range (no physical pages allocated) */
+        static uint64_t mmap_file_base = 0x600000000ULL;
+        uint64_t result = mmap_file_base;
+        mmap_file_base += npages * 4096;
 
-        memset(pages, 0, npages * 4096);
+        /* How much of this mapping is backed by file data? */
+        uint64_t fsize = f->node.size;
+        uint64_t backing = length;
+        if (offset + backing > fsize)
+            backing = (offset < fsize) ? fsize - offset : 0;
 
-        /* Read file data into the allocated pages */
-        uint64_t to_read = length;
-        if (f->type == FD_TYPE_FILE) {
-            uint64_t file_size = osfs2_file_size(f->file);
-            if (offset + to_read > file_size)
-                to_read = (offset < file_size) ? file_size - offset : 0;
-            if (to_read > 0)
-                osfs2_read(f->file, offset, pages, to_read);
-        } else if (f->type == FD_TYPE_TMPFS) {
-            extern int tmpfs_read(void *, uint64_t, void *, uint64_t);
-            tmpfs_read(f->file, offset, pages, to_read);
-        } else if (f->type == FD_TYPE_FAT32) {
-            extern int fat32_read_file(const char *, uint64_t, void *, uint64_t);
-            fat32_read_file((const char *)f->file, offset, pages, to_read);
-        }
+        vma_table[vi].base        = result;
+        vma_table[vi].pages       = npages;
+        vma_table[vi].prot        = (uint32_t)prot;
+        vma_table[vi].in_use      = true;
+        vma_table[vi].type        = VMA_FILE_MMAP;
+        vma_table[vi].file_node   = f->node;
+        vma_table[vi].file_offset = offset;
+        vma_table[vi].file_size   = backing;
 
-        vma_table[vi].base   = (uint64_t)pages;
-        vma_table[vi].pages  = npages;
-        vma_table[vi].prot   = (uint32_t)prot;
-        vma_table[vi].in_use = true;
-
-        return (int64_t)(uint64_t)pages;
+        return (int64_t)result;
     }
 
     /* Anonymous mapping */
@@ -1435,39 +1185,23 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
     return (int64_t)base;
 }
 
-/* sys_munmap — unmap pages allocated by mmap */
+/* sys_munmap — unmap pages allocated by mmap.
+ * Walks PTEs to free individually-faulted pages (demand paging safe). */
 static int64_t sys_munmap(uint64_t addr, uint64_t length)
 {
-    if (!addr || (addr & 0xFFF)) return -EINVAL;  /* must be page-aligned */
+    if (!addr || (addr & 0xFFF)) return -EINVAL;
     if (length == 0) return -EINVAL;
 
     uint64_t npages = (length + 4095) / 4096;
 
-    /* Find matching VMA */
-    for (int i = 0; i < MAX_VMAS; i++) {
-        if (!vma_table[i].in_use) continue;
-        if (vma_table[i].base == addr && vma_table[i].pages == npages) {
-            /* Only free physical pages if they were actually allocated
-             * (prot != 0). PROT_NONE reservations have no backing pages. */
-            if (vma_table[i].prot != 0) {
-                /* Unmap page table entries for committed pages */
-                for (uint64_t p = 0; p < npages; p++)
-                    paging_unmap_page(addr + p * 4096);
-            }
-            vma_table[i].in_use = false;
-            return 0;
-        }
-    }
-
-    /* Partial unmap: find VMA containing this range */
+    /* Find matching VMA (exact or containing) */
     for (int i = 0; i < MAX_VMAS; i++) {
         if (!vma_table[i].in_use) continue;
         uint64_t vma_end = vma_table[i].base + vma_table[i].pages * 4096;
-        if (addr >= vma_table[i].base && addr + npages * 4096 <= vma_end) {
-            if (vma_table[i].prot != 0) {
-                for (uint64_t p = 0; p < npages; p++)
-                    paging_unmap_page(addr + p * 4096);
-            }
+        bool exact = (vma_table[i].base == addr && vma_table[i].pages == npages);
+        bool contains = (addr >= vma_table[i].base && addr + npages * 4096 <= vma_end);
+        if (exact || contains) {
+            vma_free_pages(&vma_table[i]);
             vma_table[i].in_use = false;
             return 0;
         }
@@ -1555,42 +1289,62 @@ static int64_t sys_mremap(uint64_t old_addr, uint64_t old_size,
 }
 
 /* ── Demand paging — called from #PF handler in idt.c ──────────
- * If the faulting address is in a VMA (even PROT_NONE), allocate a
- * physical page and map it. This implements lazy page commitment
- * for mmap(PROT_NONE) reservations used by PartitionAlloc etc.
- * Returns 0 on success (page mapped, resume execution), -1 on failure. */
+ * Validates fault address against VMA table. For file-backed VMAs,
+ * reads the specific 4KB page from NVMe. For anonymous VMAs, returns
+ * a zero-filled page. Returns 0 on success, -1 on failure (SIGSEGV). */
 extern int paging_map_page(uint64_t virt, uint64_t phys, uint64_t flags);
 extern void *mem_alloc_pages(uint64_t count);
+extern void  mem_free_pages(void *addr, uint64_t count);
 
 static uint64_t prot_to_pte_flags(uint32_t prot);
 
 int demand_page_fault(uint64_t addr, uint64_t error_code)
 {
+    /* Only handle not-present faults (bit 0 clear) */
+    if (error_code & 1) return -1;
+
     uint64_t page_addr = addr & ~0xFFFULL;
 
-    /* COW: write fault on present read-only page → copy and remap writable */
-    if ((error_code & 0x03) == 0x03) { /* present + write fault */
-        extern int paging_is_cow(uint64_t virt);
-        extern int paging_cow_copy(uint64_t virt);
-        if (paging_is_cow(page_addr)) {
-            if (paging_cow_copy(page_addr) == 0)
-                return 0;  /* COW resolved */
+    /* Find VMA containing this address */
+    vma_t *vma = NULL;
+    for (int i = 0; i < MAX_VMAS; i++) {
+        if (!vma_table[i].in_use) continue;
+        uint64_t vma_end = vma_table[i].base + vma_table[i].pages * 4096;
+        if (addr >= vma_table[i].base && addr < vma_end) {
+            vma = &vma_table[i];
+            break;
         }
-        return -1;  /* not COW — real protection fault */
     }
+    if (!vma) return -1;  /* No VMA → SIGSEGV */
 
-    /* Not-present fault → demand page (lazy commit for mmap reservations) */
-    if (error_code & 1) return -1;  /* present but not write → not our fault */
-
-    /* Don't handle faults in low memory (kernel area) */
-    if (addr < 0x100000000ULL) return -1;
-
+    /* Allocate a physical page, zero-filled */
     void *page = mem_alloc_pages(1);
     if (!page) return -1;
     memset(page, 0, 4096);
 
-    if (paging_map_page(page_addr, (uint64_t)page, 0x03 /* RW */) != 0)
+    /* For file-backed VMAs, read file data into the page */
+    if (vma->type == VMA_FILE_ELF || vma->type == VMA_FILE_MMAP) {
+        uint64_t offset_in_vma = page_addr - vma->base;
+        if (offset_in_vma < vma->file_size) {
+            uint64_t to_read = 4096;
+            if (offset_in_vma + 4096 > vma->file_size)
+                to_read = vma->file_size - offset_in_vma;
+            vfs_node_t node_copy = vma->file_node;
+            if (vfs_read(&node_copy, vma->file_offset + offset_in_vma,
+                         page, to_read) < 0) {
+                mem_free_pages(page, 1);
+                return -1;
+            }
+        }
+        /* Pages beyond file_size stay zero (BSS) */
+    }
+
+    /* Map with protection flags from VMA */
+    uint64_t pte_flags = prot_to_pte_flags(vma->prot);
+    if (paging_map_page(page_addr, (uint64_t)page, pte_flags) != 0) {
+        mem_free_pages(page, 1);
         return -1;
+    }
 
     return 0;
 }
@@ -1847,7 +1601,7 @@ static int64_t sys_pipe(uint64_t pipefd_addr)
     rf->open   = true;
     rf->type   = FD_TYPE_PIPE;
     rf->oflags = O_RDONLY;
-    rf->file   = p;
+    rf->pipe   = p;
 
     /* Write end */
     fd_entry_t *wf = &fd_table[wfd];
@@ -1855,7 +1609,7 @@ static int64_t sys_pipe(uint64_t pipefd_addr)
     wf->open   = true;
     wf->type   = FD_TYPE_PIPE;
     wf->oflags = O_WRONLY;
-    wf->file   = p;
+    wf->pipe   = p;
 
     pipefd[0] = rfd;
     pipefd[1] = wfd;
@@ -1892,21 +1646,33 @@ extern int32_t proc_current_ppid(void);
 static int64_t sys_kill(uint64_t pid, uint64_t sig)
 {
     if (sig >= NSIG) return -EINVAL;
-    if (sig == 0) return 0;  /* Signal 0 = test if process exists */
 
-    uint32_t target_pid = (uint32_t)pid;
-    if (pid == 0) target_pid = (uint32_t)proc_current_pid(); /* signal self */
+    int32_t cur_pid = proc_current_pid();
 
-    /* SIGKILL/SIGTERM on self → immediate exit */
-    if (target_pid == (uint32_t)proc_current_pid() &&
-        (sig == SIGKILL || sig == SIGTERM)) {
+    /* Can only signal self or pid 0 (current process group) */
+    if (pid != 0 && (int64_t)pid != cur_pid)
+        return -ESRCH;
+
+    if (sig == SIGKILL || sig == SIGTERM) {
         proc_exit(128 + (int32_t)sig);
+        /* unreachable */
     }
 
-    /* Queue signal on target process */
-    proc_signal_pid(target_pid, (int)sig);
+    if (sig == 0) return 0;  /* Signal 0 = test if process exists */
+
+    /* Queue signal for delivery */
+    sig_pending |= (1U << sig);
 
     return 0;
+}
+
+/* ── proc_signal_pid — send signal to a process (used by timers) ── */
+void proc_signal_pid(uint32_t pid, int sig)
+{
+    /* For now only support signaling current process */
+    if ((int32_t)pid == proc_current_pid()) {
+        sig_pending |= (1U << sig);
+    }
 }
 
 /* ── sigaction(sig, act, oldact) — install signal handler ──── */
@@ -1921,23 +1687,16 @@ typedef struct {
 static int64_t sys_sigaction(uint64_t sig, uint64_t act_addr, uint64_t oldact_addr)
 {
     if (sig >= NSIG || sig == SIGKILL) return -EINVAL;
-    void *proc = proc_current();
-    if (!proc) return -ESRCH;
-    sig_act_t *actions = proc_get_sig_actions(proc);
 
     if (oldact_addr) {
         sigaction_t *old = (sigaction_t *)oldact_addr;
         memset(old, 0, sizeof(*old));
-        old->sa_handler = actions[sig].handler;
-        old->sa_flags   = actions[sig].flags;
-        old->sa_restorer = actions[sig].restorer;
+        old->sa_handler = sig_handlers[sig];
     }
 
     if (act_addr) {
         const sigaction_t *act = (const sigaction_t *)act_addr;
-        actions[sig].handler  = act->sa_handler;
-        actions[sig].flags    = act->sa_flags;
-        actions[sig].restorer = act->sa_restorer;
+        sig_handlers[sig] = act->sa_handler;
     }
 
     return 0;
@@ -1947,27 +1706,19 @@ static int64_t sys_sigaction(uint64_t sig, uint64_t act_addr, uint64_t oldact_ad
 
 void syscall_check_signals(void)
 {
-    void *proc = proc_current();
-    if (!proc) return;
-
-    uint64_t *pending = proc_get_sig_pending_ptr(proc);
-    uint64_t *mask = proc_get_sig_mask_ptr(proc);
-    sig_act_t *actions = proc_get_sig_actions(proc);
-
-    uint64_t deliverable = *pending & ~(*mask);
-    if (!deliverable) return;
+    if (!sig_pending) return;
 
     for (uint32_t s = 1; s < NSIG; s++) {
-        if (!(deliverable & (1ULL << s))) continue;
-        *pending &= ~(1ULL << s);
+        if (!(sig_pending & (1U << s))) continue;
+        sig_pending &= ~(1U << s);
 
-        uint64_t handler = actions[s].handler;
+        uint64_t handler = sig_handlers[s];
 
         if (handler == SIG_IGN) continue;
-        if (s == SIGCHLD && handler == SIG_DFL) continue; /* SIGCHLD default = ignore */
 
         if (handler == SIG_DFL) {
-            if (s == SIGINT || s == SIGTERM || s == SIGPIPE || s == SIGKILL) {
+            /* Default action for most signals: terminate */
+            if (s == SIGINT || s == SIGTERM || s == SIGPIPE) {
                 serial_puts("[SIGNAL] Delivering signal ");
                 serial_putdec(s);
                 serial_puts(" (default: terminate)\n");
@@ -1976,7 +1727,7 @@ void syscall_check_signals(void)
             continue;
         }
 
-        /* Custom handler — synchronous delivery (v1) */
+        /* Custom handler — call it (simple synchronous delivery) */
         void (*fn)(int) = (void (*)(int))handler;
         fn((int)s);
     }
@@ -2036,36 +1787,20 @@ static int64_t sys_gettid(void)
     return (int64_t)proc_current_pid();
 }
 
-/* rt_sigprocmask — block/unblock signals */
-#define SIG_BLOCK   0
-#define SIG_UNBLOCK 1
-#define SIG_SETMASK 2
-
+/* rt_sigprocmask — block/unblock signals (minimal stub) */
 static int64_t sys_rt_sigprocmask(uint64_t how, uint64_t set_addr,
                                    uint64_t oldset_addr, uint64_t sigsetsize)
 {
-    (void)sigsetsize;
-    void *proc = proc_current();
-    if (!proc) return -ESRCH;
-    uint64_t *mask = proc_get_sig_mask_ptr(proc);
+    (void)how; (void)sigsetsize;
 
     /* Return old mask if requested */
     if (oldset_addr) {
         uint64_t *oldset = (uint64_t *)oldset_addr;
-        *oldset = *mask;
+        *oldset = 0;  /* No signals blocked */
     }
 
-    if (set_addr) {
-        uint64_t new_set = *(uint64_t *)set_addr;
-        /* Cannot block SIGKILL(9) or SIGSTOP(19) */
-        new_set &= ~((1ULL << 9) | (1ULL << 19));
-        switch (how) {
-        case SIG_BLOCK:   *mask |= new_set;  break;
-        case SIG_UNBLOCK: *mask &= ~new_set; break;
-        case SIG_SETMASK: *mask = new_set;   break;
-        default: return -EINVAL;
-        }
-    }
+    /* Accept but ignore the new mask for now */
+    (void)set_addr;
     return 0;
 }
 
@@ -2101,15 +1836,14 @@ static int64_t sys_clock_gettime(uint64_t clk_id, uint64_t tp_addr)
     if (!tp_addr) return -EFAULT;
     timespec_t *tp = (timespec_t *)tp_addr;
 
+    /* Use APIC ticks (100Hz) for time base */
     uint64_t ticks = idt_get_ticks();
     uint64_t ms = ticks * 10;  /* 100Hz → 10ms per tick */
 
     tp->tv_sec  = (int64_t)(ms / 1000);
     tp->tv_nsec = (int64_t)((ms % 1000) * 1000000);
 
-    if (clk_id == CLOCK_REALTIME)
-        tp->tv_sec += (int64_t)boot_epoch_sec;
-
+    (void)clk_id;  /* Same time for REALTIME and MONOTONIC */
     return 0;
 }
 
@@ -2532,15 +2266,12 @@ static int64_t sys_stat(uint64_t path_addr, uint64_t statbuf_addr)
 
 /* ── VFS: getcwd, readlink, getdents64 (X-VFS) ──────────────── */
 
-extern char cwd[256];  /* defined below in sys_chdir section */
-
 static int64_t sys_getcwd(uint64_t buf_addr, uint64_t size)
 {
     if (!buf_addr || size < 2) return -EINVAL;
-    uint64_t len = 0;
-    while (cwd[len]) len++;
-    if (len + 1 > size) return -ERANGE;
-    memcpy((char *)buf_addr, cwd, len + 1);
+    char *buf = (char *)buf_addr;
+    buf[0] = '/';
+    buf[1] = '\0';
     return (int64_t)buf_addr;
 }
 
@@ -2648,7 +2379,6 @@ static int64_t sys_getdents64(uint64_t fd, uint64_t dirp_addr, uint64_t count)
 extern uint64_t idt_get_ticks(void);
 
 static uint64_t current_umask = 022;
-char cwd[256] = "/";
 
 static int64_t sys_pause(void)
 {
@@ -2659,151 +2389,11 @@ static int64_t sys_pause(void)
 
 static int64_t sys_chdir(uint64_t path_addr)
 {
+    (void)path_addr;
+    /* Single flat filesystem — chdir to "/" always succeeds, anything else ENOENT */
     const char *p = (const char *)path_addr;
-    if (!p) return -EFAULT;
-
-    /* Build new cwd */
-    char newcwd[256];
-    if (p[0] == '/') {
-        /* Absolute path */
-        int i = 0;
-        while (p[i] && i < 254) { newcwd[i] = p[i]; i++; }
-        if (i > 1 && newcwd[i-1] != '/') { newcwd[i++] = '/'; }
-        newcwd[i] = '\0';
-    } else {
-        /* Relative: append to cwd */
-        int ci = 0;
-        while (cwd[ci]) { newcwd[ci] = cwd[ci]; ci++; }
-        int pi = 0;
-        while (p[pi] && ci < 254) { newcwd[ci++] = p[pi++]; }
-        if (ci > 1 && newcwd[ci-1] != '/') newcwd[ci++] = '/';
-        newcwd[ci] = '\0';
-    }
-
-    memcpy(cwd, newcwd, 256);
-    return 0;
-}
-
-/* ── epoll: minimal implementation using poll semantics ─────── */
-
-#define EPOLL_MAX_FDS  32
-
-/* epoll instance: tracks watched FDs */
-typedef struct {
-    int    fds[EPOLL_MAX_FDS];
-    uint32_t events[EPOLL_MAX_FDS];
-    int    count;
-} epoll_state_t;
-
-static epoll_state_t epoll_instances[8];
-static int epoll_count;
-
-static int64_t sys_epoll_create1(uint64_t flags)
-{
-    (void)flags;
-    int newfd = vfs_alloc_fd();
-    if (newfd < 0) return -EMFILE;
-    if (epoll_count >= 8) return -ENOMEM;
-
-    int ep_idx = epoll_count++;
-    memset(&epoll_instances[ep_idx], 0, sizeof(epoll_state_t));
-
-    fd_entry_t *f = &fd_table[newfd];
-    memset(f, 0, sizeof(*f));
-    f->open = true;
-    f->type = FD_TYPE_EPOLL;
-    f->offset = (uint64_t)ep_idx;
-    return newfd;
-}
-
-static int64_t sys_epoll_ctl(uint64_t epfd, uint64_t op,
-                              uint64_t fd, uint64_t event_addr)
-{
-    fd_entry_t *ef = &fd_table[epfd & 0xFF];
-    if (!ef->open || ef->type != FD_TYPE_EPOLL) return -EBADF;
-    epoll_state_t *ep = &epoll_instances[ef->offset];
-
-    if (op == 1 /* EPOLL_CTL_ADD */) {
-        if (ep->count >= EPOLL_MAX_FDS) return -ENOMEM;
-        ep->fds[ep->count] = (int)fd;
-        if (event_addr) ep->events[ep->count] = *(uint32_t *)event_addr;
-        ep->count++;
-    } else if (op == 2 /* EPOLL_CTL_DEL */) {
-        for (int i = 0; i < ep->count; i++) {
-            if (ep->fds[i] == (int)fd) {
-                ep->fds[i] = ep->fds[ep->count - 1];
-                ep->events[i] = ep->events[ep->count - 1];
-                ep->count--;
-                break;
-            }
-        }
-    }
-    return 0;
-}
-
-static int64_t sys_epoll_wait(uint64_t epfd, uint64_t events_addr,
-                               uint64_t maxevents, uint64_t timeout_ms)
-{
-    fd_entry_t *ef = &fd_table[epfd & 0xFF];
-    if (!ef->open || ef->type != FD_TYPE_EPOLL) return -EBADF;
-    epoll_state_t *ep = &epoll_instances[ef->offset];
-
-    /* Simple implementation: check each watched FD for readability.
-     * For pipes/files with data, report EPOLLIN. */
-    struct { uint32_t events; uint64_t data; } __attribute__((packed)) *out =
-        (void *)events_addr;
-    int ready = 0;
-
-    for (int i = 0; i < ep->count && ready < (int)maxevents; i++) {
-        int wfd = ep->fds[i];
-        if (wfd < 0 || wfd >= MAX_FDS) continue;
-        fd_entry_t *wf = &fd_table[wfd];
-        if (!wf->open) continue;
-
-        /* Pipes: check if data available */
-        bool has_data = false;
-        if (wf->type == FD_TYPE_PIPE) {
-            pipe_buf_t *p = (pipe_buf_t *)wf->file;
-            has_data = (p && p->count > 0);
-        } else if (wf->type == FD_TYPE_EVENTFD) {
-            has_data = (wf->offset > 0);  /* eventfd counter > 0 */
-        } else if (wf->type == FD_TYPE_FILE || wf->type == FD_TYPE_TMPFS) {
-            has_data = true;  /* Files always readable */
-        }
-
-        if (has_data) {
-            out[ready].events = 1; /* EPOLLIN */
-            out[ready].data = (uint64_t)wfd;
-            ready++;
-        }
-    }
-
-    /* If no events and timeout > 0, sleep briefly */
-    if (ready == 0 && timeout_ms > 0) {
-        uint64_t end = idt_get_ticks() + (timeout_ms / 10);
-        while (idt_get_ticks() < end) {
-            __asm__ volatile ("hlt");
-            /* Re-check (simplified — full impl would re-scan) */
-        }
-    }
-
-    return (int64_t)ready;
-}
-
-/* ── eventfd: simple counter-based IPC ───────────────────────── */
-
-static int64_t sys_eventfd2(uint64_t initval, uint64_t flags)
-{
-    (void)flags;
-    int newfd = vfs_alloc_fd();
-    if (newfd < 0) return -EMFILE;
-
-    fd_entry_t *f = &fd_table[newfd];
-    memset(f, 0, sizeof(*f));
-    f->open = true;
-    f->type = FD_TYPE_EVENTFD;
-    f->offset = initval;  /* Use offset as the counter */
-    return newfd;
+    if (p && p[0] == '/' && p[1] == '\0') return 0;
+    return -ENOENT;
 }
 
 static int64_t sys_fchdir(uint64_t fd)
@@ -2824,7 +2414,7 @@ static int64_t sys_gettimeofday(uint64_t tv_addr, uint64_t tz_addr)
     (void)tz_addr;
     if (tv_addr) {
         uint64_t ticks = idt_get_ticks();
-        uint64_t secs = boot_epoch_sec + ticks / 100;
+        uint64_t secs = ticks / 100;
         uint64_t usecs = (ticks % 100) * 10000;
         uint64_t *tv = (uint64_t *)tv_addr;
         tv[0] = secs;    /* tv_sec */
@@ -3022,7 +2612,6 @@ int64_t syscall_dispatch(uint64_t nr, uint64_t a1, uint64_t a2,
     case SYS_GETPGRP:    return (int64_t)proc_current_pid();
     case SYS_SETSID:     return (int64_t)proc_current_pid();
     case SYS_GETGROUPS:  return 0;  /* no supplementary groups */
-    case SYS_RT_SIGSUSPEND: return -EINTR;  /* pretend a signal interrupted */
     case SYS_SIGALTSTACK: return sys_sigaltstack(a1, a2);
     case SYS_PRCTL:      return sys_prctl(a1, a2, a3, a4, a5);
     case SYS_ARCH_PRCTL: return sys_arch_prctl(a1, a2);
@@ -3050,24 +2639,9 @@ int64_t syscall_dispatch(uint64_t nr, uint64_t a1, uint64_t a2,
     case SYS_PAUSE:      return sys_pause();
     case SYS_CHDIR:      return sys_chdir(a1);
     case SYS_FCHDIR:     return sys_fchdir(a1);
-    case SYS_RENAME: {
-        /* Rename: only supported for tmpfs (/tmp/ prefix) */
-        const char *oldpath = (const char *)a1;
-        const char *newpath = (const char *)a2;
-        if (oldpath && newpath &&
-            str_startswith(oldpath, "/tmp/") && str_startswith(newpath, "/tmp/")) {
-            extern void *tmpfs_open(const char *name);
-            extern void *tmpfs_create(const char *name);
-            extern int tmpfs_delete(const char *name);
-            /* Create new, copy content reference, delete old */
-            /* For now: just return success (tmpfs files are ephemeral) */
-        }
-        return 0;  /* pretend success for compatibility */
-    }
-    case SYS_MKDIR:
-        /* mkdir: no-op success for /tmp (flat FS, dirs implicit) */
-        return 0;
-    case SYS_RMDIR:      return 0;
+    case SYS_RENAME:     return -ENOSYS;  /* no rename in OsitoFS */
+    case SYS_MKDIR:      return -ENOSYS;  /* no directories */
+    case SYS_RMDIR:      return -ENOSYS;
     case SYS_CHMOD:      return 0;   /* pretend success */
     case SYS_FCHMOD:     return 0;
     case SYS_CHOWN:      return 0;
@@ -3082,11 +2656,6 @@ int64_t syscall_dispatch(uint64_t nr, uint64_t a1, uint64_t a2,
         sys_gettimeofday((uint64_t)&tv, 0);
         if (a1) *(int64_t *)a1 = (int64_t)tv.tv_sec;
         return (int64_t)tv.tv_sec;
-    }
-    case SYS_GETRUSAGE: {
-        /* getrusage(who, usage) — zero-fill struct rusage (144 bytes on x86-64) */
-        if (a2) memset((void *)a2, 0, 144);
-        return 0;
     }
     case SYS_GETRLIMIT:  return sys_prlimit64(0, a1, 0, a2);
     case SYS_SYSINFO:    return sys_sysinfo(a1);
@@ -3105,141 +2674,17 @@ int64_t syscall_dispatch(uint64_t nr, uint64_t a1, uint64_t a2,
     case SYS_FSTATFS:    return sys_statfs(0, a2);  /* reuse */
     case SYS_SETRLIMIT:  return 0;   /* pretend success */
     case SYS_SYNC:       return 0;   /* no-op */
-    case SYS_TRUNCATE:   return 0;  /* pretend success */
-    case SYS_FTRUNCATE:  return 0;  /* pretend success */
+    case SYS_TRUNCATE:   return -ENOSYS;
+    case SYS_FTRUNCATE:  return 0;   /* pretend success */
     case SYS_WAITID:     return sys_wait4(-1, a3, (uint64_t)(int)a4, 0);
     case SYS_UNLINKAT:   return sys_unlink(a2);  /* ignore dirfd */
-    case SYS_MKDIRAT:    return 0;  /* pretend success (flat FS) */
+    case SYS_MKDIRAT:    return -ENOSYS;
     case SYS_FCHOWNAT:   return 0;
     case SYS_FCHMODAT:   return 0;
     case SYS_FACCESSAT:  return sys_access(a2, a3);  /* ignore dirfd */
     case SYS_FACCESSAT2: return sys_access(a2, a3);
     case SYS_PSELECT6:   return sys_poll(0, 0, 0);
     case SYS_UTIMENSAT:  return 0;   /* pretend success */
-    /* ── Socket syscalls ──────────────────────────────────────── */
-    case SYS_SOCKET: {
-        extern int sock_socket(int, int, int);
-        int si = sock_socket((int)a1, (int)a2, (int)a3);
-        if (si < 0) return (int64_t)si;
-        int nfd = vfs_alloc_fd();
-        if (nfd < 0) return -EMFILE;
-        fd_entry_t *sf = &fd_table[nfd];
-        memset(sf, 0, sizeof(*sf));
-        sf->open = true; sf->type = FD_TYPE_SOCKET;
-        sf->offset = (uint64_t)si;  /* socket index */
-        return nfd;
-    }
-    case SYS_BIND: {
-        extern int sock_bind(int, const void *);
-        fd_entry_t *sf = &fd_table[a1 & 0xFF];
-        if (!sf->open || sf->type != FD_TYPE_SOCKET) return -EBADF;
-        return sock_bind((int)sf->offset, (const void *)a2);
-    }
-    case SYS_LISTEN: {
-        extern int sock_listen(int, int);
-        fd_entry_t *sf = &fd_table[a1 & 0xFF];
-        if (!sf->open || sf->type != FD_TYPE_SOCKET) return -EBADF;
-        return sock_listen((int)sf->offset, (int)a2);
-    }
-    case SYS_ACCEPT:
-    case SYS_ACCEPT4: {
-        extern int sock_accept(int, void *, uint32_t *);
-        fd_entry_t *sf = &fd_table[a1 & 0xFF];
-        if (!sf->open || sf->type != FD_TYPE_SOCKET) return -EBADF;
-        int ni = sock_accept((int)sf->offset, (void *)a2, (uint32_t *)a3);
-        if (ni < 0) return (int64_t)ni;
-        int nfd = vfs_alloc_fd();
-        if (nfd < 0) return -EMFILE;
-        fd_entry_t *nf = &fd_table[nfd];
-        memset(nf, 0, sizeof(*nf));
-        nf->open = true; nf->type = FD_TYPE_SOCKET;
-        nf->offset = (uint64_t)ni;
-        return nfd;
-    }
-    case SYS_CONNECT: {
-        extern int sock_connect(int, const void *);
-        fd_entry_t *sf = &fd_table[a1 & 0xFF];
-        if (!sf->open || sf->type != FD_TYPE_SOCKET) return -EBADF;
-        return sock_connect((int)sf->offset, (const void *)a2);
-    }
-    case SYS_SENDTO: {
-        extern int sock_sendto(int, const void *, uint32_t, int, const void *);
-        fd_entry_t *sf = &fd_table[a1 & 0xFF];
-        if (!sf->open || sf->type != FD_TYPE_SOCKET) return -EBADF;
-        if (a5) return sock_sendto((int)sf->offset, (const void *)a2, (uint32_t)a3, (int)a4, (const void *)a5);
-        extern int sock_send(int, const void *, uint32_t, int);
-        return sock_send((int)sf->offset, (const void *)a2, (uint32_t)a3, (int)a4);
-    }
-    case SYS_RECVFROM: {
-        extern int sock_recvfrom(int, void *, uint32_t, int, void *, uint32_t *);
-        fd_entry_t *sf = &fd_table[a1 & 0xFF];
-        if (!sf->open || sf->type != FD_TYPE_SOCKET) return -EBADF;
-        return sock_recvfrom((int)sf->offset, (void *)a2, (uint32_t)a3, (int)a4, (void *)a5, NULL);
-    }
-    case SYS_SHUTDOWN: return 0;
-    case SYS_GETSOCKNAME: {
-        extern int sock_getsockname(int, void *, uint32_t *);
-        fd_entry_t *sf = &fd_table[a1 & 0xFF];
-        if (!sf->open || sf->type != FD_TYPE_SOCKET) return -EBADF;
-        return sock_getsockname((int)sf->offset, (void *)a2, (uint32_t *)a3);
-    }
-    case SYS_GETPEERNAME: return 0;
-    case SYS_SETSOCKOPT: {
-        extern int sock_setsockopt(int, int, int, const void *, uint32_t);
-        fd_entry_t *sf = &fd_table[a1 & 0xFF];
-        if (!sf->open || sf->type != FD_TYPE_SOCKET) return -EBADF;
-        return sock_setsockopt((int)sf->offset, (int)a2, (int)a3, (const void *)a4, (uint32_t)a5);
-    }
-    case SYS_GETSOCKOPT: return 0;
-    case SYS_SENDMSG:    return -ENOSYS;
-    case SYS_RECVMSG:    return -ENOSYS;
-    /* ── Timer syscalls ──────────────────────────────────────── */
-    case SYS_ALARM: {
-        extern uint32_t timer_alarm(uint32_t);
-        return (int64_t)timer_alarm((uint32_t)a1);
-    }
-    case SYS_SETITIMER: {
-        extern int timer_setitimer(int, const void *, void *);
-        return timer_setitimer((int)a1, (const void *)a2, (void *)a3);
-    }
-    case SYS_GETITIMER: return 0;
-    /* ── I/O port access ─────────────────────────────────────── */
-    case SYS_IOPL:    return 0;  /* Grant full I/O privilege (bare-metal: always allowed) */
-    case SYS_IOPERM:  return 0;  /* Same — all ports accessible */
-    /* ── System V IPC ────────────────────────────────────────── */
-    case SYS_SHMGET: {
-        extern int sysv_shmget(int, uint64_t, int);
-        return sysv_shmget((int)a1, a2, (int)a3);
-    }
-    case SYS_SHMAT: {
-        extern void *sysv_shmat(int, const void *, int);
-        return (int64_t)(uint64_t)sysv_shmat((int)a1, (const void *)a2, (int)a3);
-    }
-    case SYS_SHMDT: {
-        extern int sysv_shmdt(const void *);
-        return sysv_shmdt((const void *)a1);
-    }
-    case SYS_SHMCTL: {
-        extern int sysv_shmctl(int, int, void *);
-        return sysv_shmctl((int)a1, (int)a2, (void *)a3);
-    }
-    case SYS_SEMGET: {
-        extern int sysv_semget(int, int, int);
-        return sysv_semget((int)a1, (int)a2, (int)a3);
-    }
-    case SYS_SEMOP: {
-        extern int sysv_semop(int, void *, uint32_t);
-        return sysv_semop((int)a1, (void *)a2, (uint32_t)a3);
-    }
-    case SYS_SEMCTL: {
-        extern int sysv_semctl(int, int, int);
-        return sysv_semctl((int)a1, (int)a2, (int)a3);
-    }
-    case SYS_EPOLL_CREATE1: return sys_epoll_create1(a1);
-    case SYS_EPOLL_CTL:     return sys_epoll_ctl(a1, a2, a3, a4);
-    case SYS_EPOLL_WAIT:    return sys_epoll_wait(a1, a2, a3, a4);
-    case SYS_EPOLL_PWAIT:   return sys_epoll_wait(a1, a2, a3, a4);
-    case SYS_EVENTFD2:      return sys_eventfd2(a1, a2);
     case SYS_RENAMEAT2:  return -ENOSYS;
     case SYS_STATX:      return sys_statx(a1, a2, a3, a4, a5);
 
@@ -3264,10 +2709,6 @@ int64_t syscall_dispatch(uint64_t nr, uint64_t a1, uint64_t a2,
             extern uint32_t shm_surface_owner_pid;
             extern uint32_t proc_exec_pid(void);
             shm_surface_owner_pid = proc_exec_pid();
-            /* Capture keyboard: route events to input_events only, not kb_buf.
-             * The focused graphical process (Q2, game) reads via SYS_GET_INPUT_EVENT. */
-            extern void kbd_set_captured(bool);
-            kbd_set_captured(true);
             return shm_create_surface ? (int64_t)shm_create_surface((uint32_t)a1, (uint32_t)a2, (uint32_t)a3) : -ENOSYS;
         }
     case SYS_GUI_FLIP:
@@ -3399,13 +2840,12 @@ void syscall_reset_process(void)
     brk_current = NULL;
     brk_max = NULL;
 
-    /* Free mmap regions — but NOT the parent's saved regions.
-     * When a forked child does execve, saved_parent.valid is true and
-     * the vma_table contains the parent's regions. Don't free those. */
+    /* Free mmap regions — walk PTEs for demand-paged VMAs.
+     * Don't free the parent's saved regions during fork+execve. */
     if (!saved_parent.valid) {
         for (int i = 0; i < MAX_VMAS; i++) {
             if (vma_table[i].in_use) {
-                mem_free_pages((void *)vma_table[i].base, vma_table[i].pages);
+                vma_free_pages(&vma_table[i]);
                 vma_table[i].in_use = false;
             }
         }
@@ -3485,8 +2925,6 @@ void syscall_init(void)
     brk_base = NULL;
     brk_current = NULL;
     brk_max = NULL;
-
-    boot_epoch_sec = rtc_to_epoch();
 
     serial_puts("[SYSCALL] Ready (LSTAR=0x");
     serial_puthex((uint64_t)syscall_entry, 16);

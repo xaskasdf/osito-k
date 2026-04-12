@@ -555,7 +555,7 @@ static uint64_t *pte_walk(uint64_t *table, int index)
     return (uint64_t *)(table[index] & PTE_ADDR_MASK);
 }
 
-static uint64_t *paging_get_pte(uint64_t virt)
+uint64_t *paging_get_pte(uint64_t virt)
 {
     uint64_t cr3;
     __asm__ volatile ("mov %%cr3, %0" : "=r"(cr3));

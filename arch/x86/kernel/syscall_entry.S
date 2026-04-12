@@ -116,7 +116,7 @@ syscall_entry:
 
 /* ── Data section: user RSP saved on SYSCALL entry ─────────── */
 
-.section .bss
+.bss
 .align 8
 syscall_user_rsp:
     .quad 0

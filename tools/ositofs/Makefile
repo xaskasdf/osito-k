@@ -1,4 +1,4 @@
-# OsitoFS v2 host tools — build with standard gcc
+# OsitoFS host tools — v2 and v3
 #
 # Usage:
 #   make              Build all tools
@@ -8,10 +8,13 @@ CC      = gcc
 CFLAGS  = -Wall -Wextra -O2 -std=c11 -D_GNU_SOURCE
 LDFLAGS =
 
-TOOLS   = mkfs.ositofs ositofs-write ositofs-ls ositofs-info ositofs-read ositofs-delete ositofs-fsck ositofs-rename ositofs-defrag
-COMMON  = common.o gguf.o
+TOOLS_V2 = mkfs.ositofs ositofs-write ositofs-ls ositofs-info ositofs-read \
+           ositofs-delete ositofs-fsck ositofs-rename ositofs-defrag
+TOOLS_V3 = mkfs.ositofs3 ositofs-write3
 
-all: $(TOOLS)
+all: $(TOOLS_V2) $(TOOLS_V3)
+
+# ── v2 Tools ──────────────────────────────────────────────────
 
 mkfs.ositofs: mkfs.o common.o
 	$(CC) $(LDFLAGS) -o $@ $^
@@ -40,10 +43,20 @@ ositofs-rename: rename.o common.o
 ositofs-defrag: defrag.o common.o
 	$(CC) $(LDFLAGS) -o $@ $^
 
-%.o: %.c common.h gguf.h ../../include/common/ositofs2_format.h
+# ── v3 Tools ──────────────────────────────────────────────────
+
+mkfs.ositofs3: mkfs3.o common_v3.o
+	$(CC) $(LDFLAGS) -o $@ $^
+
+ositofs-write3: write3.o common_v3.o
+	$(CC) $(LDFLAGS) -o $@ $^
+
+# ── Common rules ──────────────────────────────────────────────
+
+%.o: %.c common.h gguf.h ../../include/common/ositofs2_format.h ../../include/common/ositofs3_format.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 clean:
-	rm -f *.o $(TOOLS)
+	rm -f *.o $(TOOLS_V2) $(TOOLS_V3)
 
 .PHONY: all clean

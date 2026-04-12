@@ -32,7 +32,6 @@ extern void input_post_mouse_button(uint8_t buttons);
 /* Keyboard injection (keyboard.c — weak: works without PS/2 driver) */
 extern void kb_push(char c)     __attribute__((weak));
 extern void kb_push_esc(const char *seq) __attribute__((weak));
-extern bool compositor_is_running(void) __attribute__((weak));
 
 /* ── Controller instances ────────────────────────────────────── */
 
@@ -216,15 +215,15 @@ static void usb_kbd_handle_report(xhci_device_t *dev, uint8_t *r, uint32_t len)
         }
         if (was_pressed) continue; /* Key held — don't repeat */
 
-        /* ── NEW: Post raw event to input system for Doom ── */
+        /* Post raw HID event to input system (for games: DOOM, Q2, etc.) */
         extern void input_post_key(uint8_t scancode, bool pressed, bool extended);
         input_post_key(code, true, false);
 
-        /* When compositor is running, it reads HID events from the
-         * input_events ring (posted above) and routes to kb_push itself.
-         * Skip direct kb_push here to avoid double input. */
-        if (compositor_is_running && compositor_is_running())
-            continue;
+        /* When compositor is running it owns all input routing.
+         * Skip kb_push — compositor will convert and push to kb_buf
+         * for the terminal when that window has focus. */
+        extern bool compositor_is_running(void) __attribute__((weak));
+        if (compositor_is_running && compositor_is_running()) continue;
 
         /* Arrow keys → VT100 escape sequences */
         if (kb_push_esc) {

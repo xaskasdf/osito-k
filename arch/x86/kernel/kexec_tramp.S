@@ -11,7 +11,7 @@
  * before execution (above all kernel segments).
  */
 
-.section .text
+.text
 .global kexec_trampoline
 .global kexec_trampoline_end
 

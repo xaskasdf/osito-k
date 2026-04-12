@@ -708,12 +708,14 @@ void isr_handler(interrupt_frame_t *frame)
         }
     }
 
-    /* Demand paging — handle #PF for high addresses FIRST, before any output.
-     * This must be the earliest possible check to avoid stack corruption. */
+    /* Demand paging — handle #PF FIRST, before any diagnostic output.
+     * Validates against VMA table. Covers ELF segments (0x400000+),
+     * mmap regions, and anonymous reservations (0x500000000+).
+     * Skip first 1MB (BIOS/bootloader) and null page (handled below). */
     if (vec == 14 && !(frame->error_code & 1)) {
         uint64_t cr2;
         __asm__ volatile ("mov %%cr2, %0" : "=r"(cr2));
-        if (cr2 >= 0x100000000ULL) {
+        if (cr2 >= 0x100000ULL) {
             extern int demand_page_fault(uint64_t addr, uint64_t error_code);
             if (demand_page_fault(cr2, frame->error_code) == 0)
                 return;

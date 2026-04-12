@@ -17,9 +17,6 @@
 
 #include "../include/types.h"
 #include "gui.h"
-#ifdef __EMSCRIPTEN__
-#include <emscripten.h>
-#endif
 
 /* ── External functions ──────────────────────────────────────── */
 
@@ -60,9 +57,6 @@ extern void xhci_poll(void) __attribute__((weak));
 
 /* ── CMOS RTC helpers ──────────────────────────────────────── */
 
-#ifdef __EMSCRIPTEN__
-static inline uint8_t cmos_read(uint8_t reg) { (void)reg; return 0; }
-#else
 static inline uint8_t cmos_read(uint8_t reg)
 {
     __asm__ volatile ("outb %0, %1" : : "a"(reg), "Nd"((uint16_t)0x70));
@@ -70,7 +64,6 @@ static inline uint8_t cmos_read(uint8_t reg)
     __asm__ volatile ("inb %1, %0" : "=a"(val) : "Nd"((uint16_t)0x71));
     return val;
 }
-#endif
 
 static inline uint8_t bcd2bin(uint8_t v) { return (v >> 4) * 10 + (v & 0x0F); }
 
@@ -126,46 +119,9 @@ static int32_t  drag_off_x, drag_off_y;
 static uint8_t  prev_buttons;
 static int      focused_demo_idx = 0;   /* 0=Terminal (focused by default) */
 
-/* Window resize state */
-static bool     resizing;
-static int32_t  resize_win_idx;
-#define RESIZE_EDGE  6          /* px from border to trigger resize */
-#define RESIZE_MIN_W 100
-#define RESIZE_MIN_H 60
-/* Bitmask: which edges are being resized */
-#define EDGE_LEFT   1
-#define EDGE_RIGHT  2
-#define EDGE_TOP    4
-#define EDGE_BOTTOM 8
-static uint8_t  resize_edges;    /* combination of EDGE_* */
-
 /* Maximize / restore state (per demo window) */
 static bool    is_maximized[2];
 static int32_t saved_geom[2][4];    /* x, y, w, h before maximize */
-
-/* ── Right-click context menu ────────────────────────────────── */
-
-enum {
-    CTX_CLOSE, CTX_MINIMIZE, CTX_MAXIMIZE, CTX_RESTORE,
-    CTX_SNAP_LEFT, CTX_SNAP_RIGHT,
-    CTX_SHOW_WIN0, CTX_SHOW_WIN1, CTX_SHOW_ALL
-};
-
-#define CTX_MAX_ITEMS  6
-#define CTX_ITEM_H     (GUI_FONT_H + 8)
-#define CTX_PAD_X      16
-
-static struct {
-    bool     visible;
-    int32_t  x, y, w, h;
-    int      count;
-    int      hover;       /* -1 = none */
-    int      target_win;  /* -1 = desktop */
-    struct { const char *label; uint8_t action; } items[CTX_MAX_ITEMS];
-} ctx_menu;
-
-/* Alt+Tab overlay: show window title briefly after switching */
-static uint64_t switcher_show_until;  /* tick when overlay disappears */
 
 /* Modifier key state (tracked from HID virtual scancodes) */
 static bool    alt_held;
@@ -517,7 +473,6 @@ static int hit_test_demo_window(int32_t mx, int32_t my)
     /* Check front-to-back (last in order = on top → check first) */
     for (int i = count - 1; i >= 0; i--) {
         int idx = order[i];
-        if (dw[idx].hidden) continue;
         int32_t wx = dw[idx].x;
         int32_t wy = dw[idx].y;
         int32_t ww = dw[idx].w + GUI_BORDER_W * 2;
@@ -592,219 +547,15 @@ static int hit_test_dock(int32_t mx, int32_t my)
     return -2;
 }
 
-/* ── Context menu helpers ─────────────────────────────────── */
-
-static void ctx_menu_open_window(int32_t mx, int32_t my, int win_idx)
-{
-    ctx_menu.count = 0;
-    ctx_menu.target_win = win_idx;
-
-    ctx_menu.items[ctx_menu.count].label = "Cerrar";
-    ctx_menu.items[ctx_menu.count++].action = CTX_CLOSE;
-    ctx_menu.items[ctx_menu.count].label = "Minimizar";
-    ctx_menu.items[ctx_menu.count++].action = CTX_MINIMIZE;
-    if (is_maximized[win_idx]) {
-        ctx_menu.items[ctx_menu.count].label = "Restaurar";
-        ctx_menu.items[ctx_menu.count++].action = CTX_RESTORE;
-    } else {
-        ctx_menu.items[ctx_menu.count].label = "Maximizar";
-        ctx_menu.items[ctx_menu.count++].action = CTX_MAXIMIZE;
-    }
-    ctx_menu.items[ctx_menu.count].label = "Snap izquierda";
-    ctx_menu.items[ctx_menu.count++].action = CTX_SNAP_LEFT;
-    ctx_menu.items[ctx_menu.count].label = "Snap derecha";
-    ctx_menu.items[ctx_menu.count++].action = CTX_SNAP_RIGHT;
-
-    /* Calculate dimensions */
-    int max_tw = 0;
-    for (int i = 0; i < ctx_menu.count; i++) {
-        int tw = gui_text_width(ctx_menu.items[i].label);
-        if (tw > max_tw) max_tw = tw;
-    }
-    ctx_menu.w = max_tw + CTX_PAD_X * 2;
-    ctx_menu.h = ctx_menu.count * CTX_ITEM_H + 8;
-
-    /* Clamp to screen */
-    int32_t sw = (int32_t)display_get_width();
-    int32_t sh = (int32_t)display_get_height();
-    ctx_menu.x = (mx + ctx_menu.w > sw) ? sw - ctx_menu.w : mx;
-    ctx_menu.y = (my + ctx_menu.h > sh) ? sh - ctx_menu.h : my;
-    ctx_menu.hover = -1;
-    ctx_menu.visible = true;
-}
-
-static void ctx_menu_open_desktop(int32_t mx, int32_t my)
-{
-    ctx_menu.count = 0;
-    ctx_menu.target_win = -1;
-
-    ctx_menu.items[ctx_menu.count].label = "Mostrar Terminal";
-    ctx_menu.items[ctx_menu.count++].action = CTX_SHOW_WIN0;
-    ctx_menu.items[ctx_menu.count].label = "Mostrar System Info";
-    ctx_menu.items[ctx_menu.count++].action = CTX_SHOW_WIN1;
-    ctx_menu.items[ctx_menu.count].label = "Mostrar todo";
-    ctx_menu.items[ctx_menu.count++].action = CTX_SHOW_ALL;
-
-    int max_tw = 0;
-    for (int i = 0; i < ctx_menu.count; i++) {
-        int tw = gui_text_width(ctx_menu.items[i].label);
-        if (tw > max_tw) max_tw = tw;
-    }
-    ctx_menu.w = max_tw + CTX_PAD_X * 2;
-    ctx_menu.h = ctx_menu.count * CTX_ITEM_H + 8;
-
-    int32_t sw = (int32_t)display_get_width();
-    int32_t sh = (int32_t)display_get_height();
-    ctx_menu.x = (mx + ctx_menu.w > sw) ? sw - ctx_menu.w : mx;
-    ctx_menu.y = (my + ctx_menu.h > sh) ? sh - ctx_menu.h : my;
-    ctx_menu.hover = -1;
-    ctx_menu.visible = true;
-}
-
-static void ctx_menu_execute(int action_idx);  /* forward declaration */
-
-/* Callback: mark window hidden after shrink animation completes */
-static void on_shrink_complete(void *ctx)
-{
-    gui_win_desc_t *w = (gui_win_desc_t *)ctx;
-    w->hidden = true;
-}
-
-/* Helper: hide window with shrink animation (used by close, minimize, context menu) */
-static void hide_window_animated(gui_win_desc_t *dw, int hit, int count)
-{
-    gui_anim_cancel(&dw[hit].x);
-    gui_anim_cancel(&dw[hit].y);
-    gui_anim_cancel(&dw[hit].w);
-    gui_anim_cancel(&dw[hit].h);
-    if (focused_demo_idx == hit) {
-        focused_demo_idx = -1;
-        for (int fi = 0; fi < count; fi++)
-            if (!dw[fi].hidden) { focused_demo_idx = fi; break; }
-    }
-    int32_t mid_x = dw[hit].x + dw[hit].w / 2;
-    int32_t mid_y = dw[hit].y + dw[hit].h / 2;
-    gui_anim_start(&dw[hit].x, mid_x, 200, gui_ease_in_out_quad, NULL, NULL);
-    gui_anim_start(&dw[hit].y, mid_y, 200, gui_ease_in_out_quad, NULL, NULL);
-    gui_anim_start(&dw[hit].w, 0, 200, gui_ease_in_out_quad, NULL, NULL);
-    gui_anim_start(&dw[hit].h, 0, 200, gui_ease_in_out_quad,
-                   on_shrink_complete, &dw[hit]);
-}
-
-/* Helper: snap window to half-screen (used by shortcuts + context menu) */
-static void snap_window(gui_win_desc_t *dw, int idx, bool left)
-{
-    int32_t sw2 = (int32_t)display_get_width();
-    int32_t usable_h = (int32_t)display_get_height() - GUI_PANEL_HEIGHT - GUI_DOCK_HEIGHT;
-    gui_anim_start(&dw[idx].x, left ? 0 : sw2 / 2, 250, gui_ease_out_cubic, NULL, NULL);
-    gui_anim_start(&dw[idx].y, GUI_PANEL_HEIGHT, 250, gui_ease_out_cubic, NULL, NULL);
-    gui_anim_start(&dw[idx].w, sw2 / 2, 250, gui_ease_out_cubic, NULL, NULL);
-    gui_anim_start(&dw[idx].h, usable_h, 250, gui_ease_out_cubic, NULL, NULL);
-    is_maximized[idx] = false;
-}
-
-/* Execute context menu action */
-static void ctx_menu_execute(int action_idx)
-{
-    if (action_idx < 0 || action_idx >= ctx_menu.count) return;
-    uint8_t action = ctx_menu.items[action_idx].action;
-    int win = ctx_menu.target_win;
-    int count;
-    gui_win_desc_t *dw = gui_desktop_get_windows(&count);
-
-    switch (action) {
-    case CTX_CLOSE:
-    case CTX_MINIMIZE:
-        if (win >= 0 && win < count)
-            hide_window_animated(dw, win, count);
-        break;
-    case CTX_MAXIMIZE:
-        if (win >= 0 && win < count && !is_maximized[win]) {
-            saved_geom[win][0] = dw[win].x; saved_geom[win][1] = dw[win].y;
-            saved_geom[win][2] = dw[win].w; saved_geom[win][3] = dw[win].h;
-            int32_t sw2 = (int32_t)display_get_width();
-            int32_t uh = (int32_t)display_get_height() - GUI_PANEL_HEIGHT - GUI_DOCK_HEIGHT;
-            gui_anim_start(&dw[win].x, 0, 300, gui_ease_out_cubic, NULL, NULL);
-            gui_anim_start(&dw[win].y, GUI_PANEL_HEIGHT, 300, gui_ease_out_cubic, NULL, NULL);
-            gui_anim_start(&dw[win].w, sw2, 300, gui_ease_out_cubic, NULL, NULL);
-            gui_anim_start(&dw[win].h, uh, 300, gui_ease_out_cubic, NULL, NULL);
-            is_maximized[win] = true;
-        }
-        break;
-    case CTX_RESTORE:
-        if (win >= 0 && win < count && is_maximized[win]) {
-            gui_anim_start(&dw[win].x, saved_geom[win][0], 280, gui_ease_out_cubic, NULL, NULL);
-            gui_anim_start(&dw[win].y, saved_geom[win][1], 280, gui_ease_out_cubic, NULL, NULL);
-            gui_anim_start(&dw[win].w, saved_geom[win][2], 280, gui_ease_out_cubic, NULL, NULL);
-            gui_anim_start(&dw[win].h, saved_geom[win][3], 280, gui_ease_out_cubic, NULL, NULL);
-            is_maximized[win] = false;
-        }
-        break;
-    case CTX_SNAP_LEFT:
-        if (win >= 0 && win < count) snap_window(dw, win, true);
-        break;
-    case CTX_SNAP_RIGHT:
-        if (win >= 0 && win < count) snap_window(dw, win, false);
-        break;
-    case CTX_SHOW_WIN0:
-        gui_desktop_show_window(0);
-        is_maximized[0] = false;
-        focused_demo_idx = 0;
-        break;
-    case CTX_SHOW_WIN1:
-        gui_desktop_show_window(1);
-        is_maximized[1] = false;
-        focused_demo_idx = 1;
-        break;
-    case CTX_SHOW_ALL:
-        for (int i = 0; i < count; i++) {
-            if (dw[i].hidden) {
-                gui_desktop_show_window(i);
-                is_maximized[i] = false;
-            }
-        }
-        if (focused_demo_idx < 0) focused_demo_idx = 0;
-        break;
-    }
-    ctx_menu.visible = false;
-}
-
 /* Process mouse clicks on demo windows */
 static void process_mouse_input(void)
 {
     uint8_t pressed  = comp_button_state & ~prev_buttons;
     uint8_t released = prev_buttons & ~comp_button_state;
 
-    /* Context menu: right-click opens, any click outside closes */
-    if (pressed & 2) {  /* right-click: open context menu */
-        int32_t cx, cy;
-        input_get_cursor(&cx, &cy);
-        ctx_menu.visible = false;  /* close previous */
-        int hit = hit_test_demo_window(cx, cy);
-        if (hit >= 0)
-            ctx_menu_open_window(cx, cy, hit);
-        else
-            ctx_menu_open_desktop(cx, cy);
-        prev_buttons = comp_button_state;
-        return;
-    }
-
     if (pressed & 1) {  /* left button newly pressed */
         int32_t cx, cy;
         input_get_cursor(&cx, &cy);
-
-        /* If context menu is open, handle it first */
-        if (ctx_menu.visible) {
-            if (cx >= ctx_menu.x && cx < ctx_menu.x + ctx_menu.w &&
-                cy >= ctx_menu.y && cy < ctx_menu.y + ctx_menu.h) {
-                int idx = (cy - ctx_menu.y - 4) / CTX_ITEM_H;
-                if (idx >= 0 && idx < ctx_menu.count)
-                    ctx_menu_execute(idx);
-            }
-            ctx_menu.visible = false;
-            prev_buttons = comp_button_state;
-            return;  /* consume click */
-        }
 
         serial_puts("[COMP] LMB cx="); serial_putdec((uint64_t)cx);
         serial_puts(" cy="); serial_putdec((uint64_t)cy);
@@ -824,7 +575,6 @@ static void process_mouse_input(void)
                 gui_desktop_get_windows(&count2);
                 if (dock_hit < count2) {
                     gui_desktop_show_window(dock_hit);
-                    is_maximized[dock_hit] = false;  /* reset maximize state on reopen */
                     focused_demo_idx = dock_hit;
                     serial_puts("[COMP] Dock icon="); serial_putdec((uint64_t)dock_hit);
                     serial_puts(" raised\n");
@@ -843,9 +593,10 @@ static void process_mouse_input(void)
 
             /* Check traffic-light buttons first */
             int btn = hit_test_buttons(&dw[hit], cx, cy);
-            if (btn == 1 || btn == 2) {
-                /* Close/Minimize: animate shrink then hide via callback */
-                hide_window_animated(dw, hit, count);
+            if (btn == 1) {
+                /* Close: hide by moving offscreen (demo windows can't be destroyed) */
+                dw[hit].x = -9999;
+                dw[hit].y = -9999;
             } else if (btn == 3) {
                 /* Maximize / restore toggle — animated (Phase 3.3) */
                 if (is_maximized[hit]) {
@@ -872,23 +623,6 @@ static void process_mouse_input(void)
                 drag_win_idx = hit;
                 drag_off_x = cx - dw[hit].x;
                 drag_off_y = cy - dw[hit].y;
-            } else {
-                /* Check if click is near a window edge → start resize */
-                int32_t wx = dw[hit].x;
-                int32_t wy = dw[hit].y + GUI_TITLEBAR_H;
-                int32_t ww = dw[hit].w;
-                int32_t wh = dw[hit].h;
-                uint8_t edges = 0;
-                if (cx - wx < RESIZE_EDGE)          edges |= EDGE_LEFT;
-                if (wx + ww - cx < RESIZE_EDGE)     edges |= EDGE_RIGHT;
-                if (cy - wy < RESIZE_EDGE)          edges |= EDGE_TOP;
-                if (wy + wh - cy < RESIZE_EDGE)     edges |= EDGE_BOTTOM;
-                if (edges) {
-                    resizing = true;
-                    resize_win_idx = hit;
-                    resize_edges = edges;
-                    is_maximized[hit] = false;
-                }
             }
 
             /* Raise clicked window to front (changes render order, not struct data) */
@@ -902,50 +636,9 @@ static void process_mouse_input(void)
         input_get_cursor(&cx, &cy);
         int count;
         gui_win_desc_t *dw = gui_desktop_get_windows(&count);
-        if (drag_win_idx >= 0 && drag_win_idx < count &&
-            !dw[drag_win_idx].hidden) {
-            int32_t nx = cx - drag_off_x;
-            int32_t ny = cy - drag_off_y;
-            int32_t ww = dw[drag_win_idx].w;
-            int32_t sw = (int32_t)display_get_width();
-            int32_t sh = (int32_t)display_get_height();
-            /* Clamp: keep titlebar partially on screen */
-            if (nx < -(ww - 50)) nx = -(ww - 50);
-            if (nx > sw - 50)    nx = sw - 50;
-            if (ny < 0)          ny = 0;
-            if (ny > sh - GUI_TITLEBAR_H) ny = sh - GUI_TITLEBAR_H;
-            dw[drag_win_idx].x = nx;
-            dw[drag_win_idx].y = ny;
-        }
-    }
-
-    /* Continue resize while button held */
-    if (resizing && (comp_button_state & 1)) {
-        int32_t cx, cy;
-        input_get_cursor(&cx, &cy);
-        int count;
-        gui_win_desc_t *dw = gui_desktop_get_windows(&count);
-        if (resize_win_idx >= 0 && resize_win_idx < count &&
-            !dw[resize_win_idx].hidden) {
-            gui_win_desc_t *rw = &dw[resize_win_idx];
-            if (resize_edges & EDGE_RIGHT) {
-                int32_t nw = cx - rw->x;
-                if (nw >= RESIZE_MIN_W) rw->w = nw;
-            }
-            if (resize_edges & EDGE_BOTTOM) {
-                int32_t nh = cy - rw->y - GUI_TITLEBAR_H;
-                if (nh >= RESIZE_MIN_H) rw->h = nh;
-            }
-            if (resize_edges & EDGE_LEFT) {
-                int32_t right = rw->x + rw->w;
-                int32_t nw = right - cx;
-                if (nw >= RESIZE_MIN_W) { rw->x = cx; rw->w = nw; }
-            }
-            if (resize_edges & EDGE_TOP) {
-                int32_t bottom = rw->y + GUI_TITLEBAR_H + rw->h;
-                int32_t nh = bottom - cy - GUI_TITLEBAR_H;
-                if (nh >= RESIZE_MIN_H) { rw->y = cy; rw->h = nh; }
-            }
+        if (drag_win_idx >= 0 && drag_win_idx < count) {
+            dw[drag_win_idx].x = cx - drag_off_x;
+            dw[drag_win_idx].y = cy - drag_off_y;
         }
     }
 
@@ -953,8 +646,6 @@ static void process_mouse_input(void)
     if (released & 1) {
         dragging = false;
         drag_win_idx = -1;
-        resizing = false;
-        resize_win_idx = -1;
     }
 
     prev_buttons = comp_button_state;
@@ -964,20 +655,6 @@ static void process_mouse_input(void)
 
 /* Return the pixel dimensions of the Terminal window content area.
  * Called from shell.c to size the shm surface before fb_redirect(). */
-/* Get dimensions of a window by its SHM handle */
-uint32_t compositor_get_window_dims(uint32_t shm_handle,
-                                    uint16_t *out_w, uint16_t *out_h)
-{
-    for (int i = 0; i < MAX_WINDOWS; i++) {
-        if ((windows[i].flags & WND_ACTIVE) && windows[i].shm_handle == shm_handle) {
-            if (out_w) *out_w = windows[i].width;
-            if (out_h) *out_h = windows[i].height;
-            return 1;
-        }
-    }
-    return 0;
-}
-
 void compositor_get_terminal_dims(uint32_t *tw, uint32_t *th)
 {
     int count;
@@ -1098,37 +775,12 @@ static void compositor_render_frame(void)
         info.mem_total_mb = mem_get_total() / (1024 * 1024);
         info.ticks = idt_get_ticks();
         info.procs = proc_count_active();
-        /* Read RTC time */
-#ifdef __EMSCRIPTEN__
-        /* Use JS Date object — already in local timezone */
-        info.rtc_hour = (uint8_t)EM_ASM_INT({ return new Date().getHours(); });
-        info.rtc_min  = (uint8_t)EM_ASM_INT({ return new Date().getMinutes(); });
-        info.rtc_sec  = (uint8_t)EM_ASM_INT({ return new Date().getSeconds(); });
-#else
-        /* Prefer NTP-synced time if available, else CMOS RTC */
-        extern uint32_t ntp_get_utc(void) __attribute__((weak));
-        extern bool     ntp_is_synced(void) __attribute__((weak));
-        if (ntp_is_synced && ntp_is_synced()) {
-            uint32_t utc = ntp_get_utc();
-            info.rtc_sec  = (uint8_t)(utc % 60);
-            info.rtc_min  = (uint8_t)((utc / 60) % 60);
-            info.rtc_hour = (uint8_t)(((utc / 3600) + 24 - 3) % 24);  /* GMT-3 */
-        } else {
-            /* CMOS RTC (BCD mode, 24h), adjust to GMT-3 */
-            info.rtc_sec  = bcd2bin(cmos_read(0x00));
-            info.rtc_min  = bcd2bin(cmos_read(0x02));
-            uint8_t raw_h = bcd2bin(cmos_read(0x04));
-            info.rtc_hour = (raw_h + 24 - 3) % 24;
-        }
-#endif
+        /* Read CMOS RTC (BCD mode, 24h), adjust to GMT-3 */
+        info.rtc_sec  = bcd2bin(cmos_read(0x00));
+        info.rtc_min  = bcd2bin(cmos_read(0x02));
+        { uint8_t raw_h = bcd2bin(cmos_read(0x04));
+          info.rtc_hour = (raw_h + 24 - 3) % 24; } /* UTC → GMT-3 */
         gui_panel_set_debug(&info);
-    }
-
-    /* Pass cursor to desktop layer for dock hover effects */
-    {
-        int32_t mx, my;
-        input_get_cursor(&mx, &my);
-        gui_desktop_set_cursor(mx, my);
     }
 
     /* Render elementaryOS-inspired desktop (bg, panel, window chrome, dock) */
@@ -1143,59 +795,6 @@ static void compositor_render_frame(void)
     /* Blit windows bottom-to-top */
     for (int i = 0; i < render_count; i++) {
         blit_window(back, p, w, h, &windows[render_order[i]]);
-    }
-
-    /* Alt+Tab window switcher overlay */
-    if (switcher_show_until > idt_get_ticks() && focused_demo_idx >= 0) {
-        int sw_count;
-        gui_win_desc_t *sw_dw = gui_desktop_get_windows(&sw_count);
-        if (focused_demo_idx < sw_count && sw_dw[focused_demo_idx].title) {
-            const char *title = sw_dw[focused_demo_idx].title;
-            int tw = gui_text_width(title);
-            int32_t bw = tw + 32;
-            int32_t bh = GUI_FONT_H + 20;
-            int32_t bx = ((int32_t)w - bw) / 2;
-            int32_t by = ((int32_t)h - bh) / 2;
-            gui_surface_t scr = { back, w, h, p };
-            gui_rounded_rect_alpha(&scr, bx, by, bw, bh, 8, 0xD0202028);
-            gui_draw_text_centered(&scr, bx, by + 10, bw, title,
-                                   0xFFFFFFFF, 0);
-        }
-    }
-
-    /* Context menu overlay */
-    if (ctx_menu.visible) {
-        gui_surface_t scr = { back, w, h, p };
-        /* Shadow */
-        gui_box_shadow(&scr, ctx_menu.x, ctx_menu.y, ctx_menu.w, ctx_menu.h,
-                       2, 3, 8, 0x40000000);
-        /* Background */
-        gui_rounded_rect_alpha(&scr, ctx_menu.x, ctx_menu.y,
-                               ctx_menu.w, ctx_menu.h, 6, 0xE8202028);
-        /* Border */
-        gui_rounded_rect_alpha(&scr, ctx_menu.x, ctx_menu.y,
-                               ctx_menu.w, ctx_menu.h, 6, 0x30FFFFFF);
-        /* Update hover based on cursor position */
-        int32_t cmx, cmy;
-        input_get_cursor(&cmx, &cmy);
-        ctx_menu.hover = -1;
-        if (cmx >= ctx_menu.x && cmx < ctx_menu.x + ctx_menu.w &&
-            cmy >= ctx_menu.y && cmy < ctx_menu.y + ctx_menu.h) {
-            ctx_menu.hover = (cmy - ctx_menu.y - 4) / CTX_ITEM_H;
-            if (ctx_menu.hover >= ctx_menu.count) ctx_menu.hover = -1;
-        }
-        /* Items */
-        for (int i = 0; i < ctx_menu.count; i++) {
-            int32_t iy = ctx_menu.y + 4 + i * CTX_ITEM_H;
-            if (i == ctx_menu.hover) {
-                gui_fill_rect_alpha(&scr, ctx_menu.x + 4, iy,
-                                    ctx_menu.w - 8, CTX_ITEM_H, 0x80007AFF);
-            }
-            gui_draw_text_aa(&scr, ctx_menu.x + CTX_PAD_X,
-                             iy + (CTX_ITEM_H - GUI_FONT_H) / 2,
-                             ctx_menu.items[i].label,
-                             (i == ctx_menu.hover) ? 0xFFFFFFFF : 0xFFE0E0E0);
-        }
     }
 
     /* Draw cursor on top */
@@ -1277,90 +876,14 @@ void compositor_thread(void)
                 if (sc == 0xE1 || sc == 0xE5)               comp_shift_held = (type == 1);
                 if (sc == 0xE0 || sc == 0xE4)               comp_ctrl_held  = (type == 1);
 
-                /* Super (GUI key): HID 0xE3 left, 0xE7 right */
-                static bool super_held;
-                if (sc == 0xE3 || sc == 0xE7) super_held = (type == 1);
-
-                /* Super+H: hide focused window */
-                if (type == 1 && super_held && (sc == 0x0B /* HID H */)) {
-                    if (focused_demo_idx >= 0) {
-                        int count2;
-                        gui_win_desc_t *dw2 = gui_desktop_get_windows(&count2);
-                        if (focused_demo_idx < count2 && !dw2[focused_demo_idx].hidden) {
-                            gui_anim_cancel(&dw2[focused_demo_idx].x);
-                            gui_anim_cancel(&dw2[focused_demo_idx].y);
-                            gui_anim_cancel(&dw2[focused_demo_idx].w);
-                            gui_anim_cancel(&dw2[focused_demo_idx].h);
-                            int32_t mx2 = dw2[focused_demo_idx].x + dw2[focused_demo_idx].w / 2;
-                            int32_t my2 = dw2[focused_demo_idx].y + dw2[focused_demo_idx].h / 2;
-                            gui_anim_start(&dw2[focused_demo_idx].x, mx2, 200, gui_ease_in_out_quad, NULL, NULL);
-                            gui_anim_start(&dw2[focused_demo_idx].y, my2, 200, gui_ease_in_out_quad, NULL, NULL);
-                            gui_anim_start(&dw2[focused_demo_idx].w, 0, 200, gui_ease_in_out_quad, NULL, NULL);
-                            gui_anim_start(&dw2[focused_demo_idx].h, 0, 200, gui_ease_in_out_quad,
-                                           on_shrink_complete, &dw2[focused_demo_idx]);
-                            focused_demo_idx = -1;
-                            for (int fi = 0; fi < count2; fi++)
-                                if (!dw2[fi].hidden) { focused_demo_idx = fi; break; }
-                        }
-                    }
-                    continue;
-                }
-
-                /* Super+Left/Right: snap window to left/right half */
-                if (type == 1 && super_held && focused_demo_idx >= 0) {
-                    int cnt;
-                    gui_win_desc_t *dws = gui_desktop_get_windows(&cnt);
-                    if (focused_demo_idx < cnt && !dws[focused_demo_idx].hidden) {
-                        int32_t sw2 = (int32_t)display_get_width();
-                        int32_t sh2 = (int32_t)display_get_height();
-                        int32_t usable_h = sh2 - GUI_PANEL_HEIGHT - GUI_DOCK_HEIGHT;
-                        if (sc == 0x50 /* HID Left */) {
-                            gui_anim_start(&dws[focused_demo_idx].x, 0, 250, gui_ease_out_cubic, NULL, NULL);
-                            gui_anim_start(&dws[focused_demo_idx].y, GUI_PANEL_HEIGHT, 250, gui_ease_out_cubic, NULL, NULL);
-                            gui_anim_start(&dws[focused_demo_idx].w, sw2 / 2, 250, gui_ease_out_cubic, NULL, NULL);
-                            gui_anim_start(&dws[focused_demo_idx].h, usable_h, 250, gui_ease_out_cubic, NULL, NULL);
-                            is_maximized[focused_demo_idx] = false;
-                            continue;
-                        } else if (sc == 0x4F /* HID Right */) {
-                            gui_anim_start(&dws[focused_demo_idx].x, sw2 / 2, 250, gui_ease_out_cubic, NULL, NULL);
-                            gui_anim_start(&dws[focused_demo_idx].y, GUI_PANEL_HEIGHT, 250, gui_ease_out_cubic, NULL, NULL);
-                            gui_anim_start(&dws[focused_demo_idx].w, sw2 / 2, 250, gui_ease_out_cubic, NULL, NULL);
-                            gui_anim_start(&dws[focused_demo_idx].h, usable_h, 250, gui_ease_out_cubic, NULL, NULL);
-                            is_maximized[focused_demo_idx] = false;
-                            continue;
-                        } else if (sc == 0x52 /* HID Up */) {
-                            /* Super+Up = maximize */
-                            if (!is_maximized[focused_demo_idx]) {
-                                saved_geom[focused_demo_idx][0] = dws[focused_demo_idx].x;
-                                saved_geom[focused_demo_idx][1] = dws[focused_demo_idx].y;
-                                saved_geom[focused_demo_idx][2] = dws[focused_demo_idx].w;
-                                saved_geom[focused_demo_idx][3] = dws[focused_demo_idx].h;
-                                gui_anim_start(&dws[focused_demo_idx].x, 0, 300, gui_ease_out_cubic, NULL, NULL);
-                                gui_anim_start(&dws[focused_demo_idx].y, GUI_PANEL_HEIGHT, 300, gui_ease_out_cubic, NULL, NULL);
-                                gui_anim_start(&dws[focused_demo_idx].w, sw2, 300, gui_ease_out_cubic, NULL, NULL);
-                                gui_anim_start(&dws[focused_demo_idx].h, usable_h, 300, gui_ease_out_cubic, NULL, NULL);
-                                is_maximized[focused_demo_idx] = true;
-                            }
-                            continue;
-                        }
-                    }
-                }
-
                 /* Alt+Tab: cycle through windows (USB Tab = HID 0x2B, PS/2 Tab = 0x0F) */
                 if (type == 1 && alt_held && (sc == 0x2B || sc == 0x0F)) {
                     int count;
-                    gui_win_desc_t *dw_tab = gui_desktop_get_windows(&count);
+                    gui_desktop_get_windows(&count);
                     if (count > 1) {
-                        /* Cycle to next visible (non-hidden) window */
-                        int start = focused_demo_idx;
-                        for (int attempt = 0; attempt < count; attempt++) {
-                            focused_demo_idx = (focused_demo_idx + 1) % count;
-                            if (!dw_tab[focused_demo_idx].hidden) break;
-                        }
-                        if (dw_tab[focused_demo_idx].hidden)
-                            focused_demo_idx = start;  /* all hidden, stay put */
+                        focused_demo_idx = (focused_demo_idx + 1) % count;
+                        if (focused_demo_idx < 0) focused_demo_idx = 0;
                         gui_desktop_raise_window(focused_demo_idx);
-                        switcher_show_until = idt_get_ticks() + 100; /* 1s at 100Hz */
                         serial_puts("[COMP] Alt+Tab -> window ");
                         serial_putdec((uint64_t)focused_demo_idx);
                         serial_puts("\n");
@@ -1376,32 +899,31 @@ void compositor_thread(void)
                     key_ring_head = next;
                 }
 
-                /* Terminal keyboard routing:
-                 * PS/2 → kb_process_scancode → kb_push ALWAYS handles this.
-                 * On hardware with ONLY xHCI (no PS/2), the compositor must
-                 * do HID→ASCII→kb_push as fallback. Check ps2_detected flag. */
-                extern bool kbd_ps2_detected(void) __attribute__((weak));
-                if (!has_fullscreen && type == 1 && sc >= 0x04 && sc <= 0x53 &&
-                    kbd_ps2_detected && !kbd_ps2_detected()) {
-                    /* No PS/2 keyboard — xHCI is the only input source.
-                     * Route HID→kb_push for the shell/terminal. */
+                /* Focus-based terminal routing: convert HID key-down events to
+                 * ASCII/VT100 and push to kb_buf ONLY when the terminal window
+                 * has focus (focused_demo_idx == 0). Other windows don't get
+                 * keyboard input — they'd need their own routing. */
+                if (!has_fullscreen && type == 1 && focused_demo_idx == 0) {
                     extern void kb_push(char c);
                     extern void kb_push_esc(const char *seq);
                     extern const char hid_normal[];
                     extern const char hid_shifted[];
                     switch (sc) {
-                    case 0x28: kb_push('\n');  break;
-                    case 0x2A: kb_push('\b');  break;
-                    case 0x2B: kb_push('\t');  break;
-                    case 0x2C: kb_push(' ');   break;
-                    case 0x4F: kb_push_esc("C"); break;
-                    case 0x50: kb_push_esc("D"); break;
-                    case 0x51: kb_push_esc("B"); break;
-                    case 0x52: kb_push_esc("A"); break;
+                    case 0x4F: kb_push_esc("C");  break; /* Right */
+                    case 0x50: kb_push_esc("D");  break; /* Left */
+                    case 0x51: kb_push_esc("B");  break; /* Down */
+                    case 0x52: kb_push_esc("A");  break; /* Up */
+                    case 0x4A: kb_push_esc("H");  break; /* Home */
+                    case 0x4D: kb_push_esc("F");  break; /* End */
+                    case 0x49: kb_push_esc("2~"); break; /* Insert */
+                    case 0x4C: kb_push_esc("3~"); break; /* Delete */
+                    case 0x4B: kb_push_esc("5~"); break; /* Page Up */
+                    case 0x4E: kb_push_esc("6~"); break; /* Page Down */
                     default:
                         if (sc < 0x54) {
                             char c = comp_shift_held ? hid_shifted[sc] : hid_normal[sc];
                             if (comp_ctrl_held && c >= 'a' && c <= 'z') c = c - 'a' + 1;
+                            if (comp_ctrl_held && c >= 'A' && c <= 'Z') c = c - 'A' + 1;
                             if (c) kb_push(c);
                         }
                         break;
@@ -1447,52 +969,6 @@ void compositor_stop(void)
 {
     compositor_running = false;
 }
-
-/* ── WASM: single-frame render (called from JS requestAnimationFrame) ── */
-
-#ifdef __EMSCRIPTEN__
-extern void display_flip_nowait(void);
-
-void compositor_start_wasm(void)
-{
-    compositor_running = true;
-    serial_puts("[COMP] WASM compositor started (rAF)\n");
-}
-
-EMSCRIPTEN_KEEPALIVE
-void wasm_compositor_frame(void)
-{
-    if (!compositor_running) return;
-
-    /* ── Input processing (mirrors the x86 main loop) ── */
-    if (input_has_events()) {
-        int16_t mdx, mdy, wheel;
-        uint8_t buttons;
-        uint8_t key_buf[32 * 24];
-        int nkeys = input_drain_coalesced(&mdx, &mdy, &buttons,
-                                          &wheel, key_buf, 32);
-        comp_button_state = buttons;
-        comp_wheel_accum += wheel;
-
-        /* Key events: route to focused window's shell */
-        for (int i = 0; i < nkeys; i++) {
-            uint8_t *evt = &key_buf[i * 24];
-            uint8_t type = evt[0];
-            uint8_t sc   = evt[1];
-            if (sc == 0xE2 || sc == 0xE6 || sc == 0x38) alt_held        = (type == 1);
-            if (sc == 0xE1 || sc == 0xE5)               comp_shift_held = (type == 1);
-            if (sc == 0xE0 || sc == 0xE4)               comp_ctrl_held  = (type == 1);
-        }
-    }
-    process_mouse_input();
-
-    /* ── Render ── */
-    gui_anim_tick(idt_get_ticks() * 10);
-    compositor_render_frame();
-    display_mark_dirty();
-    display_flip_nowait();
-}
-#endif
 
 bool compositor_is_running(void)
 {

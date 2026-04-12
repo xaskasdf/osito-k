@@ -13,7 +13,6 @@
  */
 
 #include "../include/types.h"
-#include "../include/sys_caps.h"
 
 /* ── External functions ──────────────────────────────────────── */
 
@@ -58,8 +57,7 @@ extern void syscall_restore_brk(void);
 
 /* ── Constants ───────────────────────────────────────────────── */
 
-#define MAX_PROCESSES   256 /* Static max; g_sys_caps.max_processes limits at runtime */
-#define READY_MASK_WORDS (MAX_PROCESSES / 64)  /* 4 words for 256 procs */
+#define MAX_PROCESSES   64  /* Increased from 16; further scaling via sys_caps planned */
 #define MAX_FDS         32
 #define MAX_NAME_LEN    64
 #define MAX_REGIONS     32
@@ -91,25 +89,6 @@ extern void syscall_restore_brk(void);
  *   REALTIME    =  1 tick   (10ms) — preempts everything, minimal slice
  */
 static const uint32_t qos_quantum[QOS_NUM_CLASSES] = { 20, 10, 5, 2, 1 };
-
-/* Per-QoS ready bitmask: bit N set = proctab[N] is READY at that class.
- * Enables O(1) scheduler lookup via __builtin_ctzll instead of O(n) scan.
- * 256 bits = 4 × uint64_t words per QoS class. */
-static uint64_t ready_mask[QOS_NUM_CLASSES][READY_MASK_WORDS];
-
-static inline void ready_mask_set(int idx, uint8_t qos)
-{
-    if (idx >= 0 && idx < MAX_PROCESSES && qos < QOS_NUM_CLASSES)
-        ready_mask[qos][idx / 64] |= (1ULL << (idx % 64));
-}
-
-static inline void ready_mask_clear(int idx, uint8_t qos)
-{
-    if (idx >= 0 && idx < MAX_PROCESSES && qos < QOS_NUM_CLASSES)
-        ready_mask[qos][idx / 64] &= ~(1ULL << (idx % 64));
-}
-
-/* proc_set_state: defined after proctab declaration (needs process_t) */
 
 /* ── File descriptor ─────────────────────────────────────────── */
 
@@ -165,15 +144,6 @@ typedef struct {
     uint64_t last_active_tick;   /* tick when process last ran */
     bool     pages_compressed;   /* true if RW pages are compressed */
 
-    /* Signal handling (X-SIG) */
-    uint64_t sig_mask;           /* blocked signals bitmask */
-    uint64_t sig_pending;        /* pending signals bitmask */
-    struct {
-        uint64_t handler;        /* SIG_DFL=0, SIG_IGN=1, or function pointer */
-        uint64_t flags;
-        uint64_t restorer;
-    } sig_actions[32];
-
 } process_t;
 
 /* ── Process table ───────────────────────────────────────────── */
@@ -181,17 +151,6 @@ typedef struct {
 static process_t proctab[MAX_PROCESSES];
 static process_t *current_proc;
 static uint32_t next_pid = 1;
-
-/* Wrapper: change process state and update ready bitmask atomically */
-static inline void proc_set_state(process_t *p, uint8_t new_state)
-{
-    int idx = (int)(p - proctab);
-    if (p->state == PROC_READY)
-        ready_mask_clear(idx, p->qos_class);
-    p->state = new_state;
-    if (new_state == PROC_READY)
-        ready_mask_set(idx, p->qos_class);
-}
 
 /* Kernel return context — saved before exec, restored on exit */
 extern int  kern_setjmp(uint64_t *buf) __attribute__((returns_twice));
@@ -231,16 +190,13 @@ static ssize_t console_read(void *buf, size_t count)
 
 static process_t *proc_alloc(const char *name)
 {
-    /* Use dynamic limit from sys_caps (clamped to static array size) */
-    int limit = (int)g_sys_caps.max_processes;
-    if (limit <= 0 || limit > MAX_PROCESSES) limit = MAX_PROCESSES;
-    for (int i = 0; i < limit; i++) {
+    for (int i = 0; i < MAX_PROCESSES; i++) {
         if (proctab[i].state == PROC_FREE) {
             process_t *p = &proctab[i];
             memset(p, 0, sizeof(*p));
             p->pid = next_pid++;
             p->ppid = current_proc ? current_proc->pid : 0;
-            proc_set_state(p, PROC_READY);
+            p->state = PROC_READY;
             p->cr3 = paging_get_kernel_cr3();
 
             /* Copy name */
@@ -293,9 +249,6 @@ static void proc_free(process_t *p)
     compositor_cleanup_process(p->pid);
     shm_cleanup_process(p->pid);
 
-    /* Release keyboard capture so the shell can receive keystrokes again. */
-    extern void kbd_set_captured(bool);
-    kbd_set_captured(false);
     extern void kbd_flush(void);
     kbd_flush();
 
@@ -306,14 +259,7 @@ static void proc_free(process_t *p)
     for (int i = 0; i < MAX_FDS; i++)
         p->fds[i].open = false;
 
-    /* Free per-process page tables */
-    if (p->cr3 != paging_get_kernel_cr3()) {
-        extern void paging_free_process_cr3(uint64_t cr3);
-        paging_free_process_cr3(p->cr3);
-        p->cr3 = paging_get_kernel_cr3();
-    }
-
-    proc_set_state(p, PROC_FREE);
+    p->state = PROC_FREE;
 }
 
 /* ── Register memory region with current process (for cleanup) ── */
@@ -336,33 +282,7 @@ process_t *proc_current(void)
     return current_proc;
 }
 
-/* Signal accessors for syscall.c (opaque process_t access) */
-typedef struct { uint64_t handler; uint64_t flags; uint64_t restorer; } sig_act_t;
-sig_act_t *proc_get_sig_actions(void *proc) {
-    return (sig_act_t *)((process_t *)proc)->sig_actions;
-}
-uint64_t *proc_get_sig_pending_ptr(void *proc) {
-    return &((process_t *)proc)->sig_pending;
-}
-uint64_t *proc_get_sig_mask_ptr(void *proc) {
-    return &((process_t *)proc)->sig_mask;
-}
-void proc_signal_pid(uint32_t pid, int sig) {
-    if (sig < 0 || sig >= 32) return;
-    for (int i = 0; i < MAX_PROCESSES; i++) {
-        if (proctab[i].pid == pid && proctab[i].state != PROC_FREE) {
-            proctab[i].sig_pending |= (1ULL << sig);
-            return;
-        }
-    }
-}
-
 /* Get current PID */
-void proc_set_cr3(uint64_t cr3)
-{
-    if (current_proc) current_proc->cr3 = cr3;
-}
-
 int32_t proc_current_pid(void)
 {
     return current_proc ? (int32_t)current_proc->pid : 0;
@@ -437,7 +357,7 @@ int proc_exception_kill(int32_t code)
     if (p->kernel_stack) {
         thread_exit_cleanup(p);
         p->exit_code = code;
-        proc_set_state(p, PROC_ZOMBIE);
+        p->state = PROC_ZOMBIE;
         __asm__ volatile ("sti");
         for (;;) __asm__ volatile ("hlt");
     }
@@ -461,16 +381,7 @@ void proc_exit(int32_t code)
     if (p && p->kernel_stack) {
         thread_exit_cleanup(p);  /* X-THREAD: clear_child_tid + futex wake */
         p->exit_code = code;
-        proc_set_state(p, PROC_ZOMBIE);
-        /* Signal SIGCHLD to parent */
-        if (p->ppid > 0) {
-            for (int i = 0; i < MAX_PROCESSES; i++) {
-                if (proctab[i].pid == p->ppid && proctab[i].state != PROC_FREE) {
-                    proctab[i].sig_pending |= (1ULL << 17); /* SIGCHLD=17 */
-                    break;
-                }
-            }
-        }
+        p->state = PROC_ZOMBIE;
         /* DON'T free memory regions here — we're still running on the
          * user stack (SYSCALL doesn't switch stacks in ring-0 OS).
          * proc_wait4 handles all cleanup after the process is reaped. */
@@ -532,7 +443,7 @@ int proc_exec(const char *filename, int argc, const char **argv)
     process_t *prev = current_proc;
     current_proc = p;
     exec_target_proc = p;
-    proc_set_state(p, PROC_RUNNING);
+    p->state = PROC_RUNNING;
 
     fb_puts_color(" [PID ", 0x0000AAFF);
     fb_putdec(p->pid);
@@ -619,38 +530,12 @@ void proc_list(void)
  * are saved/restored by the timer ISR.
  * ════════════════════════════════════════════════════════════════ */
 
-/* Per-CPU scheduler arrays (ISR reads from these via APIC ID lookup) */
-#define SCHED_MAX_CPUS 16
-volatile uint64_t sched_rsp_arr[SCHED_MAX_CPUS];
-volatile uint64_t sched_cr3_arr[SCHED_MAX_CPUS];
-static int        sched_idx_arr[SCHED_MAX_CPUS]; /* -1 = no process */
+/* ISR stub sets RSP to this value when non-zero (defined in isr_stubs.S) */
+extern volatile uint64_t sched_switch_rsp;
 
+static int      sched_current_idx = -1;
 static bool     sched_enabled = false;
 static uint64_t sched_switches = 0;
-
-/* Spinlock protecting proctab during search/modify */
-static volatile int sched_lock = 0;
-static inline void sched_lock_acquire(void) {
-    while (__sync_lock_test_and_set(&sched_lock, 1))
-        __asm__ volatile ("pause" ::: "memory");
-}
-static inline void sched_lock_release(void) {
-    __sync_lock_release(&sched_lock);
-}
-
-/* Get current CPU index via APIC ID */
-extern uint32_t smp_apic_to_index(uint32_t apic_id);
-extern volatile uint32_t *idt_get_apic_base(void);
-static uint32_t sched_my_cpu(void)
-{
-    volatile uint32_t *apic = idt_get_apic_base();
-    if (!apic) return 0;
-    uint32_t id = (apic[0x20/4] >> 24) & 0xFF;
-    return smp_apic_to_index(id);
-}
-
-/* Backward compat: sched_current_idx aliases CPU 0's slot */
-#define sched_current_idx (sched_idx_arr[0])
 
 /* Thread exit trampoline — if a kernel thread's entry function returns,
  * execution lands here (the return address was placed below the fake frame). */
@@ -675,16 +560,15 @@ static inline uint32_t sched_get_lapic_id(void)
 
 void sched_tick(void *frame_ptr)
 {
-    if (!sched_enabled)
+    if (!sched_enabled || sched_current_idx < 0)
         return;
 
-    /* Per-CPU scheduling: each CPU manages its own current process */
-    uint32_t this_cpu = sched_my_cpu();
-    int my_idx = sched_idx_arr[this_cpu];
-    process_t *cur = (my_idx >= 0) ? &proctab[my_idx] : NULL;
+    /* Only BSP (LAPIC ID 0) runs the scheduler — APs have their own
+     * timer interrupts but must not touch single-CPU scheduler state */
+    if (sched_get_lapic_id() != 0)
+        return;
 
-    /* AP with no process assigned yet — skip until BSP creates work */
-    if (!cur) return;
+    process_t *cur = &proctab[sched_current_idx];
 
     /* Check if a higher-priority process is READY (preemption).
      * ZOMBIE/BLOCKED processes always force-switch immediately.
@@ -700,73 +584,23 @@ void sched_tick(void *frame_ptr)
         }
     }
 
-    sched_lock_acquire();
-
-    /* Find best READY process: highest QoS class, round-robin within class.
-     * O(1) via per-QoS ready bitmask — scan from highest class down,
-     * then scan words starting after current process for round-robin. */
+    /* Find best READY process: highest QoS class, round-robin within same class */
     int next_idx = -1;
     uint8_t best_qos = 0;
-    int start = (my_idx >= 0) ? my_idx + 1 : 0;
-    if (start >= MAX_PROCESSES) start = 0;
-
-    for (int q = QOS_NUM_CLASSES - 1; q >= 0; q--) {
-        /* Check if any process is ready at this QoS level */
-        bool any = false;
-        for (int ww = 0; ww < READY_MASK_WORDS; ww++)
-            if (ready_mask[q][ww]) { any = true; break; }
-        if (!any) continue;
-
-        /* Scan words starting from the word containing 'start' */
-        int start_word = start / 64;
-        int start_bit  = start % 64;
-
-        for (int wi = 0; wi < READY_MASK_WORDS; wi++) {
-            int w = (start_word + wi) % READY_MASK_WORDS;
-            uint64_t mask = ready_mask[q][w];
-            if (w == start_word && wi == 0)
-                mask &= ~((1ULL << start_bit) - 1);  /* skip bits before start */
-            /* Remove self from consideration */
-            if (my_idx / 64 == w)
-                mask &= ~(1ULL << (my_idx % 64));
-            if (!mask) continue;
-            int bit = __builtin_ctzll(mask);
-            next_idx = w * 64 + bit;
-            best_qos = (uint8_t)q;
-            goto found_next;
-        }
-        /* Wrap: check words before start_word that we skipped */
-        for (int w = 0; w < start_word; w++) {
-            uint64_t mask = ready_mask[q][w];
-            if (my_idx / 64 == w)
-                mask &= ~(1ULL << (my_idx % 64));
-            if (!mask) continue;
-            int bit = __builtin_ctzll(mask);
-            next_idx = w * 64 + bit;
-            best_qos = (uint8_t)q;
-            goto found_next;
-        }
-        /* Check remaining bits in start_word before start_bit */
-        {
-            uint64_t mask = ready_mask[q][start_word] & ((1ULL << start_bit) - 1);
-            if (my_idx / 64 == start_word)
-                mask &= ~(1ULL << (my_idx % 64));
-            if (mask) {
-                int bit = __builtin_ctzll(mask);
-                next_idx = start_word * 64 + bit;
-                best_qos = (uint8_t)q;
-                goto found_next;
+    for (int i = 1; i <= MAX_PROCESSES; i++) {
+        int idx = (sched_current_idx + i) % MAX_PROCESSES;
+        if (proctab[idx].state == PROC_READY) {
+            if (proctab[idx].qos_class >= best_qos) {
+                best_qos = proctab[idx].qos_class;
+                next_idx = idx;
             }
         }
     }
-found_next:
-    (void)best_qos;
 
     if (next_idx < 0) {
         /* No other runnable process — reset quantum, continue */
         if (quantum_expired)
             cur->quantum = qos_quantum[cur->qos_class];
-        sched_lock_release();
         return;
     }
 
@@ -776,10 +610,8 @@ found_next:
      *  - preemption: higher-priority READY process preempts current */
     if (!force_switch && !quantum_expired) {
         /* Still have quantum — only preempt if candidate is strictly higher priority */
-        if (best_qos <= cur->qos_class) {
-            sched_lock_release();
+        if (best_qos <= cur->qos_class)
             return;
-        }
         /* Preemption: higher priority process is waiting */
     }
 
@@ -793,7 +625,7 @@ found_next:
     /* Only mark as READY if currently RUNNING.
      * ZOMBIE processes must stay ZOMBIE — proc_wait4 relies on this. */
     if (cur->state == PROC_RUNNING)
-        proc_set_state(cur, PROC_READY);
+        cur->state = PROC_READY;
 
     /* ── Memory compression: track idle time ── */
     {
@@ -838,20 +670,18 @@ found_next:
         next->pages_compressed = false;
     }
 
-    proc_set_state(next, PROC_RUNNING);
+    next->state = PROC_RUNNING;
     next->quantum = qos_quantum[next->qos_class];
     next->last_active_tick = idt_get_ticks();
-    sched_idx_arr[this_cpu] = next_idx;
-    if (this_cpu == 0) current_proc = next;  /* BSP compat */
-    wrmsr(MSR_FS_BASE, next->fs_base);
+    current_proc = next;
+    sched_current_idx = next_idx;
+    wrmsr(MSR_FS_BASE, next->fs_base);  /* restore per-thread TLS */
 
-    /* Tell ISR stub to switch RSP/CR3 for THIS CPU */
-    uint32_t my_cpu = this_cpu;
-    sched_rsp_arr[my_cpu] = next->kernel_rsp;
-    if (next->cr3 != cur->cr3)
-        sched_cr3_arr[my_cpu] = next->cr3;
+    /* Tell ISR stub to switch RSP before popping GPRs.
+     * The stub will: mov sched_switch_rsp → RSP, then pop + iretq
+     * using the new process's saved interrupt frame. */
+    sched_switch_rsp = next->kernel_rsp;
 
-    sched_lock_release();
     sched_switches++;
 }
 
@@ -868,7 +698,7 @@ int sched_spawn(const char *name, void (*entry)(void))
     /* Allocate kernel stack */
     void *stack = mem_alloc_aligned(KERNEL_STACK_SIZE, 4096);
     if (!stack) {
-        proc_set_state(p, PROC_FREE);
+        p->state = PROC_FREE;
         serial_puts("[SCHED] Stack allocation failed\n");
         return -1;
     }
@@ -898,7 +728,7 @@ int sched_spawn(const char *name, void (*entry)(void))
 
     /* Set initial scheduler state */
     p->kernel_rsp = frame_addr;
-    proc_set_state(p, PROC_READY);
+    p->state = PROC_READY;
     p->quantum = qos_quantum[p->qos_class];
 
     /* Auto-activate scheduler on first spawn */
@@ -1077,12 +907,6 @@ int32_t proc_fork(void)
 
     child->ppid = parent->pid;
 
-    /* Per-process page tables (isolated user-space) */
-    extern uint64_t paging_create_process_cr3(void);
-    uint64_t child_cr3 = paging_create_process_cr3();
-    if (child_cr3)
-        child->cr3 = child_cr3;
-
     /* Copy FD table from parent */
     for (int i = 0; i < MAX_FDS; i++)
         child->fds[i] = parent->fds[i];
@@ -1092,7 +916,7 @@ int32_t proc_fork(void)
     /* Allocate kernel stack for the child */
     void *stack = mem_alloc_aligned(KERNEL_STACK_SIZE, 4096);
     if (!stack) {
-        proc_set_state(child, PROC_FREE);
+        child->state = PROC_FREE;
         serial_puts("[FORK] Stack alloc failed\n");
         return -1;
     }
@@ -1138,7 +962,7 @@ int32_t proc_fork(void)
     void *child_ustack = mem_alloc_aligned(CHILD_USTACK_SIZE, 4096);
     if (!child_ustack) {
         mem_free_pages(stack, KERNEL_STACK_SIZE / 4096);
-        proc_set_state(child, PROC_FREE);
+        child->state = PROC_FREE;
         serial_puts("[FORK] User stack alloc failed\n");
         return -1;
     }
@@ -1202,7 +1026,7 @@ int32_t proc_fork(void)
     /* Set up scheduler state — child inherits parent's QoS class */
     child->qos_class = parent->qos_class;
     child->kernel_rsp = child_frame_addr;
-    proc_set_state(child, PROC_READY);
+    child->state = PROC_READY;
     child->quantum = qos_quantum[child->qos_class];
 
     /* Ensure scheduler tracks the parent (currently running) process.
@@ -1307,7 +1131,7 @@ int32_t proc_clone_thread(uint64_t child_stack, uint64_t parent_tidptr,
     /* Allocate kernel stack for the thread */
     void *kstack = mem_alloc_aligned(KERNEL_STACK_SIZE, 4096);
     if (!kstack) {
-        proc_set_state(thread, PROC_FREE);
+        thread->state = PROC_FREE;
         serial_puts("[THREAD] Kernel stack alloc failed\n");
         return -1;
     }
@@ -1349,7 +1173,7 @@ int32_t proc_clone_thread(uint64_t child_stack, uint64_t parent_tidptr,
     /* Scheduler state — thread inherits parent's QoS class */
     thread->qos_class = parent->qos_class;
     thread->kernel_rsp = frame_addr;
-    proc_set_state(thread, PROC_READY);
+    thread->state = PROC_READY;
     thread->quantum = qos_quantum[thread->qos_class];
 
     /* Ensure scheduler is tracking parent */
@@ -1365,81 +1189,77 @@ int32_t proc_clone_thread(uint64_t child_stack, uint64_t parent_tidptr,
     return (int32_t)thread->pid;
 }
 
-/* ── Futex hash table (256 buckets, 256-entry pool) ─────────── */
+/* ── Futex wait queue (X-THREAD) ────────────────────────────── */
 
-#define FUTEX_HASH_BITS   8
-#define FUTEX_HASH_SIZE   (1 << FUTEX_HASH_BITS)
-#define FUTEX_MAX_WAITERS 256
+#define FUTEX_HASH_SIZE  32
+#define MAX_FUTEX_WAITERS 32
 
-typedef struct futex_waiter {
-    uint64_t addr;
-    int      proc_idx;
-    struct futex_waiter *next;
+typedef struct {
+    uint64_t    addr;       /* futex user address */
+    int         proc_idx;   /* index into proctab (process waiting) */
+    bool        active;
 } futex_waiter_t;
 
-static futex_waiter_t  futex_pool[FUTEX_MAX_WAITERS];
-static futex_waiter_t *futex_buckets[FUTEX_HASH_SIZE];
-static futex_waiter_t *futex_free;
+static futex_waiter_t futex_waiters[MAX_FUTEX_WAITERS];
 
-static inline uint32_t futex_hash(uint64_t addr) {
-    return (uint32_t)((addr >> 2) & (FUTEX_HASH_SIZE - 1));
-}
-
-static void futex_init(void)
-{
-    memset(futex_buckets, 0, sizeof(futex_buckets));
-    futex_free = NULL;
-    for (int i = FUTEX_MAX_WAITERS - 1; i >= 0; i--) {
-        futex_pool[i].next = futex_free;
-        futex_free = &futex_pool[i];
-    }
-}
-
+/* futex_wait — block current process until woken.
+ * Returns 0 on success, -EAGAIN if value mismatch. */
 int futex_do_wait(uint64_t uaddr, int expected)
 {
     volatile int *addr = (volatile int *)uaddr;
-    if (*addr != expected) return -11; /* EAGAIN */
 
-    if (!futex_free) return -12; /* ENOMEM */
-    futex_waiter_t *w = futex_free;
-    futex_free = w->next;
+    /* Atomic check: if value changed, return immediately */
+    if (*addr != expected)
+        return -11; /* EAGAIN */
+
+    /* Find a free waiter slot */
+    int slot = -1;
+    for (int i = 0; i < MAX_FUTEX_WAITERS; i++) {
+        if (!futex_waiters[i].active) {
+            slot = i;
+            break;
+        }
+    }
+    if (slot < 0) return -12; /* ENOMEM — too many waiters */
 
     process_t *cur = current_proc;
-    w->addr = uaddr;
-    w->proc_idx = (int)(cur - &proctab[0]);
+    int cur_idx = (int)(cur - &proctab[0]);
 
-    uint32_t bucket = futex_hash(uaddr);
-    w->next = futex_buckets[bucket];
-    futex_buckets[bucket] = w;
+    /* Register waiter */
+    futex_waiters[slot].addr = uaddr;
+    futex_waiters[slot].proc_idx = cur_idx;
+    futex_waiters[slot].active = true;
 
-    proc_set_state(cur, PROC_BLOCKED);
+    /* Block: mark process as BLOCKED, yield to scheduler.
+     * sched_tick skips BLOCKED processes. We'll be woken by futex_wake. */
+    cur->state = PROC_BLOCKED;
+
+    /* Yield CPU — scheduler will switch away on next tick.
+     * We spin on HLT until the scheduler preempts us out. */
     while (cur->state == PROC_BLOCKED) {
         __asm__ volatile ("sti; hlt; cli" ::: "memory");
     }
 
+    /* Woken — clear waiter slot (may already be cleared by wake) */
+    futex_waiters[slot].active = false;
+
     return 0;
 }
 
+/* futex_wake — wake up to 'count' processes waiting on uaddr.
+ * Returns number of processes woken. */
 int futex_do_wake(uint64_t uaddr, int count)
 {
-    uint32_t bucket = futex_hash(uaddr);
-    futex_waiter_t **pp = &futex_buckets[bucket];
     int woken = 0;
-
-    while (*pp && woken < count) {
-        futex_waiter_t *w = *pp;
-        if (w->addr == uaddr) {
-            int idx = w->proc_idx;
+    for (int i = 0; i < MAX_FUTEX_WAITERS && woken < count; i++) {
+        if (futex_waiters[i].active && futex_waiters[i].addr == uaddr) {
+            int idx = futex_waiters[i].proc_idx;
             if (idx >= 0 && idx < MAX_PROCESSES &&
                 proctab[idx].state == PROC_BLOCKED) {
                 proctab[idx].state = PROC_READY;
                 woken++;
             }
-            *pp = w->next;
-            w->next = futex_free;
-            futex_free = w;
-        } else {
-            pp = &w->next;
+            futex_waiters[i].active = false;
         }
     }
     return woken;
@@ -1662,13 +1482,7 @@ int sched_set_qos(uint32_t pid, uint8_t qos)
     }
     if (!target) return -1;
 
-    /* Move between ready masks if process is READY */
-    int tidx = (int)(target - proctab);
-    if (target->state == PROC_READY)
-        ready_mask_clear(tidx, target->qos_class);
     target->qos_class = qos;
-    if (target->state == PROC_READY)
-        ready_mask_set(tidx, qos);
     /* Adjust quantum immediately if upgrading */
     uint32_t new_q = qos_quantum[qos];
     if (new_q < target->quantum)
@@ -1707,17 +1521,11 @@ void proc_init(void)
 
     memset(proctab, 0, sizeof(proctab));
     current_proc = NULL;
-    for (int i = 0; i < SCHED_MAX_CPUS; i++) {
-        sched_idx_arr[i] = -1;
-        sched_rsp_arr[i] = 0;
-        sched_cr3_arr[i] = 0;
-    }
-    futex_init();
 
     /* Create PID 1 (kernel) */
     process_t *kernel = proc_alloc("kernel");
     if (kernel) {
-        proc_set_state(kernel, PROC_RUNNING);
+        kernel->state = PROC_RUNNING;
         current_proc = kernel;
         sched_current_idx = (int)(kernel - &proctab[0]);
         serial_puts("[PROC] Kernel process PID ");

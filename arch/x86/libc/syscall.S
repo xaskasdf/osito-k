@@ -8,6 +8,12 @@
 .code64
 .text
 
+.globl __syscall0
+__syscall0:
+    mov %rdi, %rax      /* nr */
+    syscall
+    ret
+
 .globl __syscall1
 __syscall1:
     mov %rdi, %rax      /* nr */
@@ -99,12 +105,21 @@ _start:
     xor %rbp, %rbp          /* Clear frame pointer (ABI requirement) */
     mov (%rsp), %rdi         /* argc */
     lea 8(%rsp), %rsi        /* argv = &sp[1] */
+    
+    /* Set up environ: envp starts after argv NULL terminator */
+    mov %rdi, %rax
+    lea 16(%rsp, %rax, 8), %rdx /* rdx = &sp[argc + 2] */
+    movq %rdx, environ(%rip)
+
     and $-16, %rsp           /* Align stack to 16 bytes */
     call main
     mov %eax, %edi           /* exit(main return value) */
     mov $60, %eax            /* SYS_exit */
     syscall
     jmp .                    /* unreachable */
+
+.extern environ
+
 
 .globl longjmp
 longjmp:
