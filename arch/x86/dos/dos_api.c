@@ -453,7 +453,34 @@ void dos_int21_dispatch(dos_vm_t *vm)
     /* ── AH=48h: Allocate memory ────────────────────────────────── */
     case 0x48: {
         uint16_t largest = 0;
+        /* Dump MCB chain before allocation */
+        {
+            uint16_t s = vm->first_mcb;
+            serial_puts("[MCB] Chain before 48h alloc(");
+            serial_putdec(cpu->bx);
+            serial_puts("):");
+            for (int i = 0; i < 10 && s; i++) {
+                uint32_t a = (uint32_t)s << 4;
+                dos_mcb_t *m = (dos_mcb_t *)(vm->mem + a);
+                serial_puts(" [");
+                serial_puthex(s, 4);
+                serial_puts(" ");
+                serial_puts(m->owner ? "USED" : "FREE");
+                serial_puts(" sz=");
+                serial_puthex(m->size, 4);
+                serial_puts("]");
+                if (m->type == 'Z') break;
+                s += m->size + 1;
+            }
+            serial_puts("\n");
+        }
         uint16_t seg = dos_mem_alloc(vm, cpu->bx, &largest);
+        serial_puts("[DOS] INT 21/48: alloc ");
+        serial_putdec(cpu->bx);
+        serial_puts(" para -> seg=");
+        serial_puthex(seg, 4);
+        serial_puts(seg ? " OK" : " FAIL");
+        serial_puts("\n");
         if (seg) {
             cpu->ax = seg;
             cpu->flags &= ~FLAG_CF;
@@ -477,6 +504,11 @@ void dos_int21_dispatch(dos_vm_t *vm)
 
     /* ── AH=4Ah: Resize memory ──────────────────────────────────── */
     case 0x4A: {
+        serial_puts("[DOS] INT 21/4A: resize seg=");
+        serial_puthex(cpu->es, 4);
+        serial_puts(" to ");
+        serial_putdec(cpu->bx);
+        serial_puts(" para\n");
         uint16_t max_avail = 0;
         if (dos_mem_resize(vm, cpu->es, cpu->bx, &max_avail) == 0) {
             cpu->flags &= ~FLAG_CF;

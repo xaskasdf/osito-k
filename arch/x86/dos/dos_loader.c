@@ -192,6 +192,10 @@ int dos_load_mz(dos_vm_t *vm, const uint8_t *data, uint64_t size,
     uint32_t want_paras = code_paras + hdr->e_maxalloc + 16;
     if (want_paras > 0xFFFF) want_paras = 0xFFFF;
 
+    /* Set a temporary PSP so the MCB owner is non-zero (marks block as USED).
+     * We'll update current_psp to the actual value after allocation. */
+    vm->current_psp = 0x0008;  /* temporary non-zero owner */
+
     uint16_t largest = 0;
     uint16_t seg = dos_mem_alloc(vm, (uint16_t)want_paras, &largest);
     if (!seg && largest >= need_paras) {
@@ -204,6 +208,13 @@ int dos_load_mz(dos_vm_t *vm, const uint8_t *data, uint64_t size,
 
     uint16_t psp_seg = seg;
     vm->current_psp = psp_seg;
+
+    /* Fix MCB owner to actual PSP segment */
+    {
+        uint32_t mcb_addr = (uint32_t)(seg - 1) << 4;
+        dos_mcb_t *mcb = (dos_mcb_t *)(vm->mem + mcb_addr);
+        mcb->owner = psp_seg;
+    }
 
     /* Load segment = PSP + 16 paragraphs (256 bytes for PSP) */
     uint16_t load_seg = psp_seg + 0x10;

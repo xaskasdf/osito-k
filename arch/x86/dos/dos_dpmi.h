@@ -104,6 +104,7 @@ typedef struct dpmi_state {
     uint16_t sel_data;            /* flat data segment selector */
     uint16_t sel_stack;           /* stack segment selector */
     uint16_t sel_psp;             /* PSP data selector */
+    uint16_t sel_es;              /* ES segment selector */
 
     /* Saved real-mode state (for return from protected mode) */
     uint16_t saved_cs, saved_ip;

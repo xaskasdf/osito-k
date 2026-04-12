@@ -35,6 +35,20 @@ void dos_mem_write8(dos_vm_t *vm, uint32_t addr, uint8_t val)
 {
     if (addr >= DOS_MEM_SIZE)
         return;
+    /* Watchpoint: catch MCB owner corruption at 0x600-0x604 */
+    if (addr >= 0x600 && addr <= 0x604) {
+        serial_puts("[WATCH] write @");
+        serial_puthex(addr, 4);
+        serial_puts("=");
+        serial_puthex(val, 2);
+        serial_puts(" EIP=");
+        serial_puthex(vm->cpu->eip, 8);
+        serial_puts(" CS=");
+        serial_puthex(vm->cpu->cs, 4);
+        serial_puts(" #");
+        serial_putdec(vm->cpu->insn_count);
+        serial_puts("\n");
+    }
     vm->mem[addr] = val;
     if (addr >= DOS_VRAM_BASE && addr < DOS_VRAM_BASE + DOS_VRAM_SIZE)
         dos_vga_mark_dirty(vm, addr);
@@ -4135,7 +4149,7 @@ int cpu8086_run(dos_vm_t *vm)
         cpu->insn_count++;
 
         /* Trace PM instructions for debugging */
-        if (cpu->pm_cs_loaded && cpu->insn_count >= 38000 && cpu->insn_count < 39000) {
+        if (cpu->pm_cs_loaded && cpu->insn_count >= 38640 && cpu->insn_count < 38670) {
             serial_puts("[PM] #");
             serial_putdec(cpu->insn_count);
             serial_puts(" op=");
@@ -4148,6 +4162,12 @@ int cpu8086_run(dos_vm_t *vm)
             serial_puthex(cpu->esp, 8);
             serial_puts(" EAX=");
             serial_puthex(cpu->eax, 8);
+            serial_puts(" EBX=");
+            serial_puthex(cpu->ebx, 8);
+            serial_puts(" ECX=");
+            serial_puthex(cpu->ecx, 8);
+            serial_puts(" DS=");
+            serial_puthex(cpu->ds, 4);
             serial_puts("\n");
         }
 

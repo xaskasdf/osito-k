@@ -225,44 +225,43 @@ void dpmi_enter_protected_mode(dos_vm_t *vm)
     serial_puts(dpmi->is_32bit ? "32-bit" : "16-bit");
     serial_puts(" client\n");
 
-    /* Allocate flat code descriptor: base=0, limit=4GB,
-     * code+readable, DPL=3, present, USE16, 4KB granularity.
-     * Per DPMI spec, initial CS is always USE16 even for 32-bit clients.
-     * DOS4GW will allocate USE32 selectors via INT 31h later. */
+    /* Per DPMI spec, initial selectors map the client's real-mode segments.
+     * cpu->cs is F000 (the stub), so read the CALLER's CS from the stack.
+     * DS/ES/SS are the client's original values (unchanged by CALL FAR). */
+    uint32_t stack_linear_pre = ((uint32_t)cpu->ss << 4) + cpu->sp;
+    uint16_t caller_cs_val = dos_mem_read16(vm, stack_linear_pre + 8);
+    uint32_t cs_base = (uint32_t)caller_cs_val << 4;
+    uint32_t ds_base = (uint32_t)cpu->ds << 4;
+    uint32_t ss_base = (uint32_t)cpu->ss << 4;
+    uint32_t es_base = (uint32_t)cpu->es << 4;
+
     dpmi->sel_code = dpmi_alloc_descriptor(dpmi);
     {
         uint16_t idx = dpmi_sel_to_index(dpmi->sel_code);
         dpmi_descriptor_t *d = &dpmi->ldt[idx];
         uint8_t access = DESC_PRESENT | DESC_DPL3 | DESC_SEGMENT |
                          DESC_CODE | DESC_READABLE;
-        uint8_t flags = DESC_GRANULARITY;  /* USE16: no DESC_32BIT */
-        dpmi_build_desc(d, 0x00000000, 0xFFFFFFFF, access, flags);
+        dpmi_build_desc(d, cs_base, 0xFFFF, access, 0);  /* USE16, byte gran */
     }
 
-    /* Allocate flat data descriptor: base=0, limit=4GB,
-     * data+writable, DPL=3, present, USE16, 4KB granularity */
     dpmi->sel_data = dpmi_alloc_descriptor(dpmi);
     {
         uint16_t idx = dpmi_sel_to_index(dpmi->sel_data);
         dpmi_descriptor_t *d = &dpmi->ldt[idx];
         uint8_t access = DESC_PRESENT | DESC_DPL3 | DESC_SEGMENT |
                          DESC_WRITABLE;
-        uint8_t flags = DESC_GRANULARITY;  /* USE16 */
-        dpmi_build_desc(d, 0x00000000, 0xFFFFFFFF, access, flags);
+        dpmi_build_desc(d, ds_base, 0xFFFF, access, 0);  /* USE16 */
     }
 
-    /* Allocate stack descriptor: same as data */
     dpmi->sel_stack = dpmi_alloc_descriptor(dpmi);
     {
         uint16_t idx = dpmi_sel_to_index(dpmi->sel_stack);
         dpmi_descriptor_t *d = &dpmi->ldt[idx];
         uint8_t access = DESC_PRESENT | DESC_DPL3 | DESC_SEGMENT |
                          DESC_WRITABLE;
-        uint8_t flags = DESC_GRANULARITY;  /* USE16 */
-        dpmi_build_desc(d, 0x00000000, 0xFFFFFFFF, access, flags);
+        dpmi_build_desc(d, ss_base, 0xFFFF, access, 0);  /* USE16 */
     }
 
-    /* Allocate PSP descriptor: base = current_psp * 16, limit = 0xFF */
     dpmi->sel_psp = dpmi_alloc_descriptor(dpmi);
     {
         uint16_t idx = dpmi_sel_to_index(dpmi->sel_psp);
@@ -270,43 +269,48 @@ void dpmi_enter_protected_mode(dos_vm_t *vm)
         uint32_t psp_base = (uint32_t)vm->current_psp << 4;
         uint8_t access = DESC_PRESENT | DESC_DPL3 | DESC_SEGMENT |
                          DESC_WRITABLE;
-        uint8_t flags = DESC_32BIT;  /* byte granularity for small segment */
-        dpmi_build_desc(d, psp_base, 0xFF, access, flags);
+        dpmi_build_desc(d, psp_base, 0xFF, access, 0);
     }
 
-    /* The DPMI entry stub was called via FAR CALL, then INT 0xFE.
+    /* ES selector maps the PSP (per DPMI spec) */
+    dpmi->sel_es = dpmi_alloc_descriptor(dpmi);
+    {
+        uint16_t idx = dpmi_sel_to_index(dpmi->sel_es);
+        dpmi_descriptor_t *d = &dpmi->ldt[idx];
+        uint8_t access = DESC_PRESENT | DESC_DPL3 | DESC_SEGMENT |
+                         DESC_WRITABLE;
+        dpmi_build_desc(d, es_base, 0xFFFF, access, 0);
+    }
+
+    /* Read caller's return address from the stack.
      * Stack layout (16-bit real mode, growing down):
      *   SP+0: INT return IP (stub+2)
      *   SP+2: INT return CS (F000)
      *   SP+4: FLAGS
      *   SP+6: caller IP (DOS4GW code after CALL FAR)
      *   SP+8: caller CS
-     * Skip both frames — set EIP to the caller's flat return address. */
-    uint32_t stack_base = ((uint32_t)cpu->ss << 4) + cpu->sp;
-    uint16_t caller_ip = dos_mem_read16(vm, stack_base + 6);
-    uint16_t caller_cs = dos_mem_read16(vm, stack_base + 8);
-    uint32_t flat_eip = ((uint32_t)caller_cs << 4) + caller_ip;
-    uint32_t flat_esp = stack_base + 10;  /* skip INT frame (6) + CALL frame (4) */
+     * Skip both frames. EIP/ESP are offsets within their segments. */
+    uint16_t caller_ip = dos_mem_read16(vm, stack_linear_pre + 6);
+    uint16_t orig_sp = cpu->sp + 10;  /* skip INT frame (6) + CALL frame (4) */
 
-    /* Switch CPU to protected mode (USE16 initially — DOS4GW will
-     * switch to USE32 by loading a 32-bit code selector via INT 31h) */
+    /* Switch CPU to protected mode (USE16) */
     cpu->protected_mode = true;
     cpu->pm_cs_loaded   = true;
-    cpu->op_size_32     = false;  /* USE16 segment: default 16-bit */
-    cpu->addr_size_32   = false;  /* USE16 segment: default 16-bit */
-    cpu->cr0           |= 1;  /* PE bit */
+    cpu->op_size_32     = false;
+    cpu->addr_size_32   = false;
+    cpu->cr0           |= 1;
 
-    /* Set segment registers to our new selectors */
+    /* Set segment registers to PM selectors */
     cpu->cs = dpmi->sel_code;
     cpu->ds = dpmi->sel_data;
-    cpu->es = dpmi->sel_data;
+    cpu->es = dpmi->sel_es;
     cpu->ss = dpmi->sel_stack;
     cpu->fs = dpmi->sel_data;
     cpu->gs = dpmi->sel_data;
 
-    /* Set flat addresses */
-    cpu->eip = flat_eip;
-    cpu->esp = flat_esp;
+    /* EIP = offset within CS, ESP = offset within SS */
+    cpu->eip = caller_ip;
+    cpu->esp = orig_sp;
 
     /* Return success in AX */
     cpu->eax = 0;
@@ -321,14 +325,14 @@ void dpmi_enter_protected_mode(dos_vm_t *vm)
     serial_puthex(cpu->eip, 8);
     serial_puts(" ESP=");
     serial_puthex(cpu->esp, 8);
-    serial_puts("\n  caller_cs=");
-    serial_puthex(caller_cs, 4);
+    serial_puts("\n  cs_base=");
+    serial_puthex(cs_base, 8);
     serial_puts(" caller_ip=");
     serial_puthex(caller_ip, 4);
-    serial_puts(" bytes@EIP:");
+    serial_puts(" bytes@CS:EIP:");
     for (int i = 0; i < 16; i++) {
         serial_puts(" ");
-        serial_puthex(vm->mem[flat_eip + i], 2);
+        serial_puthex(vm->mem[cs_base + caller_ip + i], 2);
     }
     serial_puts("\n");
 }

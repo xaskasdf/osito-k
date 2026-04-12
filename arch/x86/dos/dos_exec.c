@@ -109,8 +109,8 @@ static int ends_with_com(const char *name)
 int dos_run(const char *filename, int argc, const char **argv)
 {
     if (!dos_is_initialized()) {
-        serial_puts("[DOS] Not initialized — call dos_init() first\n");
-        return -1;
+        extern void dos_init(void);
+        dos_init();
     }
 
     if (!osfs2_is_mounted()) {

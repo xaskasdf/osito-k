@@ -60,6 +60,15 @@ uint16_t dos_mem_alloc(dos_vm_t *vm, uint16_t paragraphs, uint16_t *largest)
             }
 
             mcb->owner = vm->current_psp;
+            serial_puts("[MCB] alloc: mcb@");
+            serial_puthex(seg, 4);
+            serial_puts(" owner=");
+            serial_puthex(mcb->owner, 4);
+            serial_puts(" sz=");
+            serial_puthex(mcb->size, 4);
+            serial_puts(" -> seg=");
+            serial_puthex(seg + 1, 4);
+            serial_puts("\n");
             return seg + 1;  /* return segment after MCB */
         }
 
@@ -113,6 +122,16 @@ int dos_mem_resize(dos_vm_t *vm, uint16_t segment, uint16_t new_size, uint16_t *
     uint16_t mcb_seg = segment - 1;
     uint32_t addr = (uint32_t)mcb_seg << 4;
     dos_mcb_t *mcb = (dos_mcb_t *)(vm->mem + addr);
+
+    serial_puts("[MCB] resize: mcb@");
+    serial_puthex(mcb_seg, 4);
+    serial_puts(" owner=");
+    serial_puthex(mcb->owner, 4);
+    serial_puts(" sz=");
+    serial_puthex(mcb->size, 4);
+    serial_puts(" -> ");
+    serial_puthex(new_size, 4);
+    serial_puts("\n");
 
     if (new_size == mcb->size) return 0;  /* no change */
 
