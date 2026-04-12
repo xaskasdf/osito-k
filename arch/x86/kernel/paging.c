@@ -207,6 +207,50 @@ static inline void invlpg(uint64_t addr)
     __asm__ volatile ("invlpg (%0)" : : "r"(addr) : "memory");
 }
 
+/* Forward decl: pte_walk is defined further down (used by paging_get_pte
+ * and the per-process variants below). */
+static uint64_t *pte_walk(uint64_t *table, int index);
+
+/* ── Per-process variant of paging_map_4k ─────────────────────── */
+
+/* Same as paging_map_4k but operates on the given PML4 instead of
+ * kernel_pml4. Used by paging_map_page_in_cr3 to map pages into a
+ * specific process's address space. Auto-creates intermediate tables. */
+static int paging_map_4k_in(uint64_t *pml4, uint64_t virt, uint64_t phys, uint64_t flags)
+{
+    uint64_t *pdpt = pt_get_or_create(pml4, PML4_INDEX(virt));
+    if (!pdpt) return -1;
+
+    uint64_t *pd = pt_get_or_create(pdpt, PDPT_INDEX(virt));
+    if (!pd) return -1;
+
+    int pd_idx = PD_INDEX(virt);
+    if ((pd[pd_idx] & PTE_PRESENT) && (pd[pd_idx] & PTE_LARGE)) {
+        /* 2 MB → 4 KB split */
+        uint64_t large_phys = pd[pd_idx] & 0x000FFFFFFFE00000ULL;
+        uint64_t large_flags = pd[pd_idx] & ~(PTE_ADDR_MASK | PTE_LARGE);
+        uint64_t *pt = pt_alloc_page();
+        if (!pt) return -1;
+        for (int i = 0; i < 512; i++)
+            pt[i] = (large_phys + i * PAGE_SIZE) | large_flags;
+        pd[pd_idx] = (uint64_t)pt | PTE_PRESENT | PTE_WRITABLE;
+
+        /* Full TLB flush after split */
+        uint64_t cr3_val, cr4;
+        __asm__ volatile ("mov %%cr3, %0" : "=r"(cr3_val));
+        __asm__ volatile ("mov %%cr4, %0" : "=r"(cr4));
+        __asm__ volatile ("mov %0, %%cr4" : : "r"(cr4 & ~(1ULL << 7)) : "memory");
+        __asm__ volatile ("mov %0, %%cr3" : : "r"(cr3_val) : "memory");
+        __asm__ volatile ("mov %0, %%cr4" : : "r"(cr4) : "memory");
+    }
+
+    uint64_t *pt = pt_get_or_create(pd, pd_idx);
+    if (!pt) return -1;
+
+    pt[PT_INDEX(virt)] = (phys & PTE_ADDR_MASK) | flags;
+    return 0;
+}
+
 /* ── Public API ──────────────────────────────────────────────── */
 
 /* Map a page in the kernel address space (for drivers, MMIO, etc.) */
@@ -216,6 +260,59 @@ int paging_map_page(uint64_t virt, uint64_t phys, uint64_t flags)
     int ret = paging_map_4k(virt, phys, flags | PTE_PRESENT);
     if (ret == 0) invlpg(virt);
     return ret;
+}
+
+/* Map a page in a specific process's address space (used by
+ * demand_page_fault for per-process ELF segments). cr3 must point at
+ * a valid PML4 created by paging_create_process_cr3. */
+int paging_map_page_in_cr3(uint64_t cr3, uint64_t virt, uint64_t phys, uint64_t flags)
+{
+    if (!cr3) return -1;
+    uint64_t *pml4 = (uint64_t *)(cr3 & PTE_ADDR_MASK);
+    int ret = paging_map_4k_in(pml4, virt, phys, flags | PTE_PRESENT);
+    if (ret == 0) invlpg(virt);
+    return ret;
+}
+
+/* Unmap a single 4KB page in a specific process's address space. */
+int paging_unmap_page_in_cr3(uint64_t cr3, uint64_t virt)
+{
+    if (!cr3) return -1;
+    uint64_t *pml4 = (uint64_t *)(cr3 & PTE_ADDR_MASK);
+    uint64_t *pdpt, *pd, *pt;
+    int idx;
+
+    idx = PML4_INDEX(virt);
+    if (!(pml4[idx] & PTE_PRESENT)) return -1;
+    pdpt = (uint64_t *)(pml4[idx] & PTE_ADDR_MASK);
+
+    idx = PDPT_INDEX(virt);
+    if (!(pdpt[idx] & PTE_PRESENT)) return -1;
+    pd = (uint64_t *)(pdpt[idx] & PTE_ADDR_MASK);
+
+    idx = PD_INDEX(virt);
+    if (!(pd[idx] & PTE_PRESENT)) return -1;
+    if (pd[idx] & PTE_LARGE) return -1;
+    pt = (uint64_t *)(pd[idx] & PTE_ADDR_MASK);
+
+    pt[PT_INDEX(virt)] = 0;
+    invlpg(virt);
+    return 0;
+}
+
+/* Read a PTE from a specific process's address space. */
+uint64_t *paging_get_pte_in_cr3(uint64_t cr3, uint64_t virt)
+{
+    if (!cr3) return NULL;
+    uint64_t *pml4 = (uint64_t *)(cr3 & PTE_ADDR_MASK);
+    uint64_t *pdpt = pte_walk(pml4, PML4_INDEX(virt));
+    if (!pdpt) return NULL;
+    uint64_t *pd = pte_walk(pdpt, PDPT_INDEX(virt));
+    if (!pd) return NULL;
+    if (pd[PD_INDEX(virt)] & PTE_LARGE) return NULL;
+    uint64_t *pt = pte_walk(pd, PD_INDEX(virt));
+    if (!pt) return NULL;
+    return &pt[PT_INDEX(virt)];
 }
 
 /* Unmap a single 4KB page — clears PTE, invalidates TLB */
@@ -505,6 +602,21 @@ void paging_init(void)
  * Kernel pages (heap, identity-map) are shared by reference,
  * so updates in the kernel PD are automatically visible.          */
 
+/* Helper: clone a kernel PD into a private per-process PD.
+ * If the kernel PD entry is PRESENT, copies its 4KB page contents
+ * (which contains 512 PD-level entries — large pages or PT pointers).
+ * Returns the new PD page, or NULL on failure. */
+static uint64_t *clone_pd(uint64_t kernel_pd_entry)
+{
+    uint64_t *new_pd = pt_alloc_page();
+    if (!new_pd) return NULL;
+    if (kernel_pd_entry & PTE_PRESENT) {
+        uint64_t *src = (uint64_t *)(kernel_pd_entry & PTE_ADDR_MASK);
+        memcpy(new_pd, src, PAGE_SIZE);
+    }
+    return new_pd;
+}
+
 uint64_t paging_create_process_cr3(void)
 {
     if (!kernel_pml4) return 0;
@@ -514,22 +626,29 @@ uint64_t paging_create_process_cr3(void)
     if (!pml4) return 0;
     memcpy(pml4, kernel_pml4, PAGE_SIZE);
 
-    /* New PDPT for PML4[0] — share all kernel PDs except PDPT[1] */
+    /* New PDPT for PML4[0] — covers vaddr 0..512 GB.
+     * Process binaries typically load in 0x00000000..0x40000000
+     * (covered by PDPT[0] entries 0..0). Anything per-process must
+     * have its own PD here. */
     uint64_t *kernel_pdpt = (uint64_t *)(kernel_pml4[0] & PTE_ADDR_MASK);
     uint64_t *pdpt = pt_alloc_page();
     if (!pdpt) return 0;
     for (int i = 0; i < 512; i++)
         pdpt[i] = kernel_pdpt[i];
 
-    /* Own PD for PDPT[1] (0x40000000-0x7FFFFFFF — user allocations) */
-    uint64_t *pd1 = pt_alloc_page();
-    if (!pd1) return 0;
-    if (kernel_pdpt[1] & PTE_PRESENT) {
-        uint64_t *kpd1 = (uint64_t *)(kernel_pdpt[1] & PTE_ADDR_MASK);
-        memcpy(pd1, kpd1, PAGE_SIZE);
-    }
+    /* Own PD for PDPT[0] (0x00000000-0x3FFFFFFF — covers BIOS, kernel
+     * identity-map, and ELF binary load range). Required so that
+     * demand-paged ELF segments at e.g. 0x20000000 don't clobber
+     * sibling processes that also load there. */
+    uint64_t *pd0 = clone_pd(kernel_pdpt[0]);
+    if (!pd0) return 0;
+    pdpt[0] = (uint64_t)pd0 | PTE_PRESENT | PTE_WRITABLE;
 
+    /* Own PD for PDPT[1] (0x40000000-0x7FFFFFFF — user mmap allocations) */
+    uint64_t *pd1 = clone_pd(kernel_pdpt[1]);
+    if (!pd1) return 0;
     pdpt[1] = (uint64_t)pd1 | PTE_PRESENT | PTE_WRITABLE;
+
     pml4[0] = (uint64_t)pdpt | PTE_PRESENT | PTE_WRITABLE;
 
     return (uint64_t)pml4;
@@ -542,9 +661,22 @@ void paging_free_process_cr3(uint64_t cr3)
     uint64_t *pml4 = (uint64_t *)cr3;
     if (pml4[0] & PTE_PRESENT) {
         uint64_t *pdpt = (uint64_t *)(pml4[0] & PTE_ADDR_MASK);
+        /* Free PDPT[0]'s private PD (BIOS / kernel id-map / ELF range) */
+        if (pdpt[0] & PTE_PRESENT) {
+            uint64_t *pd0 = (uint64_t *)(pdpt[0] & PTE_ADDR_MASK);
+            /* Only free if this PD is owned by the process (not the
+             * kernel's shared PD). Cheap test: compare against the
+             * kernel's PDPT[0]→PD[0] entry. */
+            uint64_t *kpdpt = (uint64_t *)(kernel_pml4[0] & PTE_ADDR_MASK);
+            if ((uint64_t)pd0 != (kpdpt[0] & PTE_ADDR_MASK))
+                mem_free_pages(pd0, 1);
+        }
+        /* Free PDPT[1]'s private PD */
         if (pdpt[1] & PTE_PRESENT) {
             uint64_t *pd1 = (uint64_t *)(pdpt[1] & PTE_ADDR_MASK);
-            mem_free_pages(pd1, 1);
+            uint64_t *kpdpt = (uint64_t *)(kernel_pml4[0] & PTE_ADDR_MASK);
+            if ((uint64_t)pd1 != (kpdpt[1] & PTE_ADDR_MASK))
+                mem_free_pages(pd1, 1);
         }
         mem_free_pages(pdpt, 1);
     }

@@ -216,6 +216,15 @@ static void proc_free(process_t *p)
     /* FDs live in the global fd_table[] in syscall.c — closed via
      * syscall_reset_process() which is called from compositor_cleanup_process. */
 
+    /* X-PGTBL: release the per-process page tables if this process owns
+     * one. Must run *after* syscall_reset_process because VMA cleanup
+     * needs to walk the per-process PML4 to free faulted pages. */
+    if (p->cr3 && p->cr3 != paging_get_kernel_cr3()) {
+        extern void paging_free_process_cr3(uint64_t cr3);
+        paging_free_process_cr3(p->cr3);
+        p->cr3 = 0;
+    }
+
     p->state = PROC_FREE;
 }
 
@@ -237,6 +246,12 @@ void proc_add_region(void *base, uint64_t pages)
 process_t *proc_current(void)
 {
     return current_proc;
+}
+
+/* X-PGTBL: CR3 of the currently-running process (0 if none). */
+uint64_t proc_current_cr3(void)
+{
+    return current_proc ? current_proc->cr3 : 0;
 }
 
 /* Get current PID */
@@ -416,6 +431,19 @@ int proc_exec(const char *filename, int argc, const char **argv)
         return -1;
     }
 
+    /* X-PGTBL: give the new process its own PML4. Cloned from the
+     * kernel's PML4 with private PDPT[0] PD[0] (covers vaddr 0..1 GB,
+     * where ELF binaries typically load) and PDPT[1] PD (user mmap
+     * range). Modifications to per-process page tables don't affect
+     * the kernel or sibling processes. */
+    extern uint64_t paging_create_process_cr3(void);
+    extern void     paging_switch(uint64_t cr3);
+    uint64_t new_cr3 = paging_create_process_cr3();
+    if (new_cr3) {
+        p->cr3 = new_cr3;
+        paging_switch(new_cr3);  /* activate before elf_exec maps pages */
+    }
+
     /* Set as current process and pin region registration target */
     process_t *prev = current_proc;
     current_proc = p;
@@ -437,6 +465,11 @@ int proc_exec(const char *filename, int argc, const char **argv)
         exec_target_proc = NULL;
         int code = last_exit_code;
         current_proc = prev;
+        /* Switch back to the parent's CR3 (kernel CR3 if no parent). */
+        if (prev && prev->cr3)
+            paging_switch(prev->cr3);
+        else
+            paging_switch(paging_get_kernel_cr3());
         proc_free(p);
         return code;
     }
@@ -653,6 +686,16 @@ void sched_tick(void *frame_ptr)
     current_proc = next;
     sched_current_idx = next_idx;
     wrmsr(MSR_FS_BASE, next->fs_base);  /* restore per-thread TLS */
+
+    /* X-PGTBL: switch CR3 to the new process's PML4 if it has one.
+     * Threads of the same process share cr3 (proc_clone_thread copies
+     * parent->cr3). Processes started before X-PGTBL was wired (or by
+     * sched_spawn for kernel threads) have cr3 == kernel_cr3, in which
+     * case paging_switch is a no-op load of the same value. */
+    if (next->cr3) {
+        extern void paging_switch(uint64_t cr3);
+        paging_switch(next->cr3);
+    }
 
     /* Tell ISR stub to switch RSP before popping GPRs.
      * The stub will: mov sched_switch_rsp → RSP, then pop + iretq

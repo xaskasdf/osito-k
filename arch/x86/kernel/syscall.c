@@ -491,26 +491,49 @@ typedef struct {
     vfs_node_t  file_node;   /* copy of VFS node for file-backed VMAs */
     uint64_t    file_offset; /* byte offset into file where this VMA starts */
     uint64_t    file_size;   /* bytes backed by file (rest is zero-fill) */
+    void       *owner;       /* X-PGTBL: process_t* that owns this VMA */
 } vma_t;
 
 static vma_t vma_table[MAX_VMAS];
 
+/* X-PGTBL: current process accessors (defined in process.c). */
+extern void    *proc_current(void);
+extern uint64_t proc_current_cr3(void);
+
+/* True if a VMA belongs to the currently-running process (or is
+ * ownerless, for backward compat with legacy allocators). */
+static inline bool vma_owned_by_current(const vma_t *v)
+{
+    void *cur = proc_current();
+    return v->owner == NULL || v->owner == cur;
+}
+
 /* ── Demand paging: free individually-faulted pages in a VMA ───── */
 extern uint64_t *paging_get_pte(uint64_t virt);
+extern uint64_t *paging_get_pte_in_cr3(uint64_t cr3, uint64_t virt);
 extern int paging_unmap_page(uint64_t virt);
+extern int paging_unmap_page_in_cr3(uint64_t cr3, uint64_t virt);
 extern void mem_free_pages(void *addr, uint64_t count);
 
 #define PTE_PRESENT_BIT  (1ULL << 0)
 #define PTE_ADDR_MASK_   0x000FFFFFFFFFF000ULL
 
+/* Free faulted-in pages for a VMA. X-PGTBL: walks the current process's
+ * CR3 if it has one, falling back to kernel_pml4. Callers ensure the
+ * owning process is current (cleanup runs from sys_exit on its own
+ * context; sys_munmap is called by the owning process directly). */
 static void vma_free_pages(vma_t *v)
 {
+    uint64_t cr3 = v->owner ? proc_current_cr3() : 0;
+
     for (uint64_t p = 0; p < v->pages; p++) {
         uint64_t va = v->base + p * 4096;
-        uint64_t *pte = paging_get_pte(va);
+        uint64_t *pte = cr3 ? paging_get_pte_in_cr3(cr3, va)
+                            : paging_get_pte(va);
         if (pte && (*pte & PTE_PRESENT_BIT)) {
             uint64_t phys = *pte & PTE_ADDR_MASK_;
-            paging_unmap_page(va);
+            if (cr3) paging_unmap_page_in_cr3(cr3, va);
+            else     paging_unmap_page(va);
             mem_free_pages((void *)phys, 1);
         }
     }
@@ -531,6 +554,7 @@ int vma_register_file(uint64_t base, uint64_t pages, uint32_t prot,
             vma_table[i].file_node   = *node;
             vma_table[i].file_offset = file_offset;
             vma_table[i].file_size   = file_size;
+            vma_table[i].owner       = proc_current();
             return 0;
         }
     }
@@ -1187,6 +1211,7 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
         vma_table[vi].file_node   = f->node;
         vma_table[vi].file_offset = offset;
         vma_table[vi].file_size   = backing;
+        vma_table[vi].owner       = proc_current();
 
         return (int64_t)result;
     }
@@ -1223,6 +1248,7 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
         vma_table[vi].pages  = npages;
         vma_table[vi].prot   = 0;
         vma_table[vi].in_use = true;
+        vma_table[vi].owner  = proc_current();
 
         return (int64_t)result;
     }
@@ -1241,6 +1267,7 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
     vma_table[vi].pages  = npages;
     vma_table[vi].prot   = (uint32_t)prot;
     vma_table[vi].in_use = true;
+    vma_table[vi].owner  = proc_current();
 
     return (int64_t)base;
 }
@@ -1254,9 +1281,10 @@ static int64_t sys_munmap(uint64_t addr, uint64_t length)
 
     uint64_t npages = (length + 4095) / 4096;
 
-    /* Find matching VMA (exact or containing) */
+    /* Find matching VMA (exact or containing) owned by current process */
     for (int i = 0; i < MAX_VMAS; i++) {
         if (!vma_table[i].in_use) continue;
+        if (!vma_owned_by_current(&vma_table[i])) continue;
         uint64_t vma_end = vma_table[i].base + vma_table[i].pages * 4096;
         bool exact = (vma_table[i].base == addr && vma_table[i].pages == npages);
         bool contains = (addr >= vma_table[i].base && addr + npages * 4096 <= vma_end);
@@ -1285,9 +1313,10 @@ static int64_t sys_mprotect(uint64_t addr, uint64_t length, uint64_t prot)
 
     uint64_t npages = (length + 4095) / 4096;
 
-    /* Find VMA containing this range */
+    /* Find VMA containing this range owned by current process */
     for (int i = 0; i < MAX_VMAS; i++) {
         if (!vma_table[i].in_use) continue;
+        if (!vma_owned_by_current(&vma_table[i])) continue;
         uint64_t vma_end = vma_table[i].base + vma_table[i].pages * 4096;
         if (addr >= vma_table[i].base && addr + npages * 4096 <= vma_end) {
             uint64_t pte_flags = prot_to_pte_flags((uint32_t)prot);
@@ -1334,9 +1363,10 @@ static int64_t sys_mremap(uint64_t old_addr, uint64_t old_size,
     uint64_t old_pages = (old_size + 4095) / 4096;
     uint64_t new_pages = (new_size + 4095) / 4096;
 
-    /* Find matching VMA */
+    /* Find matching VMA owned by current process */
     for (int i = 0; i < MAX_VMAS; i++) {
         if (!vma_table[i].in_use) continue;
+        if (!vma_owned_by_current(&vma_table[i])) continue;
         if (vma_table[i].base != old_addr) continue;
         /* Allow approximate match (old_size may differ from VMA pages) */
         if (new_pages <= vma_table[i].pages) {
@@ -1363,6 +1393,9 @@ extern void  mem_free_pages(void *addr, uint64_t count);
 
 static uint64_t prot_to_pte_flags(uint32_t prot);
 
+extern int paging_map_page_in_cr3(uint64_t cr3, uint64_t virt,
+                                  uint64_t phys, uint64_t flags);
+
 int demand_page_fault(uint64_t addr, uint64_t error_code)
 {
     /* Only handle not-present faults (bit 0 clear) */
@@ -1370,10 +1403,14 @@ int demand_page_fault(uint64_t addr, uint64_t error_code)
 
     uint64_t page_addr = addr & ~0xFFFULL;
 
-    /* Find VMA containing this address */
+    /* Find VMA containing this address, owned by the current process.
+     * X-PGTBL: multiple demand-paged processes may have overlapping VMA
+     * ranges (e.g. two musl statics both loaded at 0x400000), so the
+     * owner filter is essential to pick the right one. */
     vma_t *vma = NULL;
     for (int i = 0; i < MAX_VMAS; i++) {
         if (!vma_table[i].in_use) continue;
+        if (!vma_owned_by_current(&vma_table[i])) continue;
         uint64_t vma_end = vma_table[i].base + vma_table[i].pages * 4096;
         if (addr >= vma_table[i].base && addr < vma_end) {
             vma = &vma_table[i];
@@ -1404,9 +1441,14 @@ int demand_page_fault(uint64_t addr, uint64_t error_code)
         /* Pages beyond file_size stay zero (BSS) */
     }
 
-    /* Map with protection flags from VMA */
+    /* Map with protection flags from VMA, into the current process's
+     * page tables (X-PGTBL). Fall back to kernel mapping for processes
+     * without a per-process CR3 (e.g. the idle/kernel task). */
     uint64_t pte_flags = prot_to_pte_flags(vma->prot);
-    if (paging_map_page(page_addr, (uint64_t)page, pte_flags) != 0) {
+    uint64_t cr3 = proc_current_cr3();
+    int rc = cr3 ? paging_map_page_in_cr3(cr3, page_addr, (uint64_t)page, pte_flags)
+                 : paging_map_page(page_addr, (uint64_t)page, pte_flags);
+    if (rc != 0) {
         mem_free_pages(page, 1);
         return -1;
     }
@@ -2942,17 +2984,20 @@ void syscall_reset_process(void)
     brk_current = NULL;
     brk_max = NULL;
 
-    /* Free mmap regions — walk PTEs for demand-paged VMAs.
-     * Don't free the parent's saved regions during fork+execve. */
+    /* Free mmap regions belonging to the current process — walk PTEs
+     * for demand-paged VMAs. Don't free the parent's saved regions
+     * during fork+execve. X-PGTBL: keep sibling processes' VMAs intact. */
     if (!saved_parent.valid) {
+        void *cur = proc_current();
         for (int i = 0; i < MAX_VMAS; i++) {
-            if (vma_table[i].in_use) {
-                vma_free_pages(&vma_table[i]);
-                vma_table[i].in_use = false;
-            }
+            if (!vma_table[i].in_use) continue;
+            if (vma_table[i].owner != NULL && vma_table[i].owner != cur)
+                continue;
+            vma_free_pages(&vma_table[i]);
+            vma_table[i].in_use = false;
+            vma_table[i].owner  = NULL;
         }
     }
-    memset(vma_table, 0, sizeof(vma_table));
 }
 
 /* ── Initialize syscall interface ────────────────────────────── */
