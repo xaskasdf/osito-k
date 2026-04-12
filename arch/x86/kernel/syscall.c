@@ -286,48 +286,20 @@ static inline void wrmsr(uint32_t msr, uint64_t val) {
 
 /* ── File descriptor table ───────────────────────────────────── */
 
-#define MAX_FDS 128
-
-#define FD_TYPE_CONSOLE 1
-#define FD_TYPE_FILE    2
-#define FD_TYPE_PIPE    3
-#define FD_TYPE_DEV     4   /* virtual device (/dev/null, /dev/zero, etc.) */
-#define FD_TYPE_PROC    5   /* virtual procfs (/proc/self/maps, etc.) */
-
-typedef ssize_t (*fd_write_fn)(const void *buf, size_t count);
-typedef ssize_t (*fd_read_fn)(void *buf, size_t count);
+#include "../include/fd.h"
 
 /* osfs2_file_t is opaque here — we get size via osfs2_file_size() */
 extern uint64_t osfs2_file_size(void *file);
 
-typedef struct {
-    bool        open;
-    uint8_t     type;       /* FD_TYPE_* */
-    uint16_t    oflags;     /* O_RDONLY, O_WRONLY, O_RDWR */
-    fd_read_fn  read;       /* console read callback */
-    fd_write_fn write;      /* console write callback */
-    vfs_node_t  node;       /* Embedded node for regular files */
-    void       *pipe;       /* Separate pointer for pipes/legacy */
-    uint64_t    offset;     /* current file position */
-} fd_entry_t;
+/* Per-process fd_table shim: `fd_table` resolves to the current
+ * process's fds[] array via syscall_fds() (defined in process.c).
+ * This lets all 66 existing `fd_table[fd]` call sites stay textually
+ * unchanged while each process has its own copy of 8 KB. */
+extern fd_entry_t *syscall_fds(void);
+#define fd_table (syscall_fds())
 
-static fd_entry_t fd_table[MAX_FDS];
-
-/* ── Pipe buffers ───────────────────────────────────────────── */
-
-#define PIPE_BUF_SIZE   4096
-#define MAX_PIPES       8
-
-typedef struct {
-    uint8_t  buf[PIPE_BUF_SIZE];
-    uint32_t head;          /* write position */
-    uint32_t tail;          /* read position */
-    uint32_t count;         /* bytes in buffer */
-    bool     write_open;    /* write end still open */
-    bool     read_open;     /* read end still open */
-    bool     in_use;
-} pipe_buf_t;
-
+/* Pipe pool stays global (only 8 slots), but each pipe_buf_t now
+ * carries refcounts instead of open booleans. */
 static pipe_buf_t pipes[MAX_PIPES];
 
 /* ── Signal state ───────────────────────────────────────────── */
@@ -430,6 +402,30 @@ static ssize_t console_read(void *buf, size_t count)
     /* Canonical mode: block for one character */
     dst[0] = (uint8_t)kb_getchar_safe();
     return 1;
+}
+
+/* Seed an fd table with stdio (fd 0/1/2 → console). Called by
+ * proc_init() after it creates the kernel process, and by
+ * syscall_reset_process() after wiping the current process's fds
+ * on execve. Keeps console_read/write static to this file. */
+void syscall_seed_stdio(fd_entry_t *fds)
+{
+    if (!fds) return;
+    memset(&fds[0], 0, sizeof(fds[0]));
+    memset(&fds[1], 0, sizeof(fds[1]));
+    memset(&fds[2], 0, sizeof(fds[2]));
+
+    fds[0].open = true;
+    fds[0].type = FD_TYPE_CONSOLE;
+    fds[0].read = console_read;
+
+    fds[1].open = true;
+    fds[1].type = FD_TYPE_CONSOLE;
+    fds[1].write = console_write;
+
+    fds[2].open = true;
+    fds[2].type = FD_TYPE_CONSOLE;
+    fds[2].write = console_write;
 }
 
 /* ── brk state (process heap) ────────────────────────────────── */
@@ -634,7 +630,7 @@ static int64_t sys_write(uint64_t fd, uint64_t buf, uint64_t count)
 
     if (f->type == FD_TYPE_PIPE) {
         pipe_buf_t *p = (pipe_buf_t *)f->pipe;
-        if (!p || !p->read_open) return -EPIPE;
+        if (!p || p->read_refs == 0) return -EPIPE;
 
         bool nonblock = (f->oflags & 04000 /* O_NONBLOCK */) != 0;
         const uint8_t *src = (const uint8_t *)buf;
@@ -646,7 +642,7 @@ static int64_t sys_write(uint64_t fd, uint64_t buf, uint64_t count)
                 if (written > 0) return (int64_t)written;
                 if (nonblock) return -EAGAIN;
                 __asm__ volatile ("sti; hlt; cli" ::: "memory");
-                if (!p->read_open) return -EPIPE;
+                if (p->read_refs == 0) return -EPIPE;
                 continue;
             }
             p->buf[p->head] = src[written++];
@@ -724,7 +720,7 @@ static int64_t sys_read(uint64_t fd, uint64_t buf, uint64_t count)
          * Non-blocking mode (O_NONBLOCK) returns EAGAIN immediately. */
         bool nonblock = (f->oflags & 04000 /* O_NONBLOCK */) != 0;
         while (p->count == 0) {
-            if (!p->write_open) return 0;  /* EOF */
+            if (p->write_refs == 0) return 0;  /* EOF */
             if (nonblock) return -EAGAIN;
             __asm__ volatile ("sti; hlt; cli" ::: "memory");
         }
@@ -1005,12 +1001,13 @@ static int64_t sys_close(uint64_t fd)
     if (f->type == FD_TYPE_PIPE && f->pipe) {
         pipe_buf_t *p = (pipe_buf_t *)f->pipe;
         /* Determine if this is read or write end via oflags */
-        if ((f->oflags & O_ACCMODE) == O_RDONLY)
-            p->read_open = false;
-        else
-            p->write_open = false;
-        /* Free pipe when both ends closed */
-        if (!p->read_open && !p->write_open)
+        if ((f->oflags & O_ACCMODE) == O_RDONLY) {
+            if (p->read_refs > 0) p->read_refs--;
+        } else {
+            if (p->write_refs > 0) p->write_refs--;
+        }
+        /* Free pipe when both ends have no more references */
+        if (p->read_refs == 0 && p->write_refs == 0)
             p->in_use = false;
     }
 
@@ -1699,8 +1696,8 @@ static int64_t sys_pipe(uint64_t pipefd_addr)
     pipe_buf_t *p = &pipes[pi];
     memset(p, 0, sizeof(*p));
     p->in_use = true;
-    p->read_open = true;
-    p->write_open = true;
+    p->read_refs = 1;
+    p->write_refs = 1;
 
     /* Read end */
     fd_entry_t *rf = &fd_table[rfd];
@@ -1739,8 +1736,16 @@ static int64_t sys_dup2(uint64_t oldfd, uint64_t newfd)
     /* Copy fd entry */
     fd_table[newfd] = fd_table[oldfd];
 
-    /* For pipes, both ends now reference same buffer */
-    /* No refcount needed — pipe_buf tracks read_open/write_open */
+    /* Bump pipe refcount: the new fd entry holds an additional
+     * reference to the underlying pipe_buf_t. sys_close will
+     * decrement it. */
+    if (fd_table[newfd].type == FD_TYPE_PIPE && fd_table[newfd].pipe) {
+        pipe_buf_t *p = (pipe_buf_t *)fd_table[newfd].pipe;
+        if ((fd_table[newfd].oflags & O_ACCMODE) == O_RDONLY)
+            p->read_refs++;
+        else
+            p->write_refs++;
+    }
 
     return (int64_t)newfd;
 }
@@ -2024,6 +2029,13 @@ static int64_t sys_fcntl(uint64_t fd, uint64_t cmd, uint64_t arg)
         for (uint64_t i = arg; i < MAX_FDS; i++) {
             if (!fd_table[i].open) {
                 fd_table[i] = fd_table[fd];
+                if (fd_table[i].type == FD_TYPE_PIPE && fd_table[i].pipe) {
+                    pipe_buf_t *p = (pipe_buf_t *)fd_table[i].pipe;
+                    if ((fd_table[i].oflags & O_ACCMODE) == O_RDONLY)
+                        p->read_refs++;
+                    else
+                        p->write_refs++;
+                }
                 return (int64_t)i;
             }
         }
@@ -2152,6 +2164,13 @@ static int64_t sys_dup(uint64_t oldfd)
     for (int i = 0; i < MAX_FDS; i++) {
         if (!fd_table[i].open) {
             fd_table[i] = fd_table[oldfd];
+            if (fd_table[i].type == FD_TYPE_PIPE && fd_table[i].pipe) {
+                pipe_buf_t *p = (pipe_buf_t *)fd_table[i].pipe;
+                if ((fd_table[i].oflags & O_ACCMODE) == O_RDONLY)
+                    p->read_refs++;
+                else
+                    p->write_refs++;
+            }
             return (int64_t)i;
         }
     }
@@ -2868,16 +2887,19 @@ static uint16_t get_cs(void)
  * frees the brk heap — destroying the parent's malloc state. We save
  * the parent's brk pointers before the child's execve and restore them
  * after the child is reaped in proc_wait4.
+ *
+ * NOTE: fd_table is now per-process (lives inline in process_t), so it
+ * no longer needs save/restore — the parent's fds are naturally untouched
+ * when the child runs execve. Same for vmas (owner-filtered cleanup).
  */
 
-/* Saved parent state — all per-process globals that syscall_reset_process
- * would destroy when the forked child calls execve. */
+/* Saved parent state — globals that syscall_reset_process would destroy
+ * when the forked child calls execve. */
 static struct {
     uint8_t  *brk_base;
     uint8_t  *brk_current;
     uint8_t  *brk_max;
     uint64_t  fs_base;
-    fd_entry_t fds[MAX_FDS];
     uint64_t  sigs[NSIG];
     uint32_t  sig_pend;
     vma_t     vmas[MAX_VMAS];
@@ -2890,7 +2912,6 @@ void syscall_save_brk(void)
     saved_parent.brk_current = brk_current;
     saved_parent.brk_max     = brk_max;
     saved_parent.fs_base     = rdmsr(MSR_FS_BASE);
-    memcpy(saved_parent.fds,  fd_table,     sizeof(fd_table));
     memcpy(saved_parent.sigs, sig_handlers, sizeof(sig_handlers));
     saved_parent.sig_pend = sig_pending;
     memcpy(saved_parent.vmas, vma_table,    sizeof(vma_table));
@@ -2925,8 +2946,8 @@ void syscall_restore_brk(void)
     if (saved_parent.fs_base)
         wrmsr(MSR_FS_BASE, saved_parent.fs_base);
 
-    /* Restore FD table, signal handlers, VMA table */
-    memcpy(fd_table,     saved_parent.fds,  sizeof(fd_table));
+    /* Restore signal handlers, VMA table. fd_table is per-process so no
+     * restore needed — parent's fds were never touched by the child. */
     memcpy(sig_handlers, saved_parent.sigs, sizeof(sig_handlers));
     sig_pending = saved_parent.sig_pend;
     memcpy(vma_table,    saved_parent.vmas, sizeof(vma_table));
@@ -2947,22 +2968,9 @@ void syscall_reset_process(void)
     /* Force-reset stdin/stdout/stderr to console.
      * A child process may have done dup2(file_fd, 1) to redirect stdout
      * to a file. Without this reset, the parent shell would write to
-     * that file when it next prints (corrupting on-disk data). */
-    memset(&fd_table[0], 0, sizeof(fd_table[0]));
-    memset(&fd_table[1], 0, sizeof(fd_table[1]));
-    memset(&fd_table[2], 0, sizeof(fd_table[2]));
-
-    fd_table[0].open  = true;
-    fd_table[0].type  = FD_TYPE_CONSOLE;
-    fd_table[0].read  = console_read;
-
-    fd_table[1].open  = true;
-    fd_table[1].type  = FD_TYPE_CONSOLE;
-    fd_table[1].write = console_write;
-
-    fd_table[2].open  = true;
-    fd_table[2].type  = FD_TYPE_CONSOLE;
-    fd_table[2].write = console_write;
+     * that file when it next prints (corrupting on-disk data).
+     * Per-process fd_table: this only affects the current process. */
+    syscall_seed_stdio(fd_table);
 
     /* Reset signal state */
     memset(sig_handlers, 0, sizeof(sig_handlers));
@@ -3054,20 +3062,9 @@ void syscall_init(void)
     /* FMASK: RFLAGS bits cleared on SYSCALL (mask IF + DF + TF) */
     wrmsr(MSR_FMASK, 0x700);  /* IF=0x200, DF=0x400, TF=0x100 */
 
-    /* Initialize FD table with stdin/stdout/stderr */
-    memset(fd_table, 0, sizeof(fd_table));
-
-    fd_table[0].open  = true;
-    fd_table[0].type  = FD_TYPE_CONSOLE;
-    fd_table[0].read  = console_read;
-
-    fd_table[1].open  = true;
-    fd_table[1].type  = FD_TYPE_CONSOLE;
-    fd_table[1].write = console_write;
-
-    fd_table[2].open  = true;
-    fd_table[2].type  = FD_TYPE_CONSOLE;
-    fd_table[2].write = console_write;
+    /* FD table is now per-process (inline in process_t). The kernel
+     * process's stdio fds are seeded by proc_init() after it calls
+     * proc_alloc("kernel"). */
 
     /* Reset brk state */
     brk_base = NULL;

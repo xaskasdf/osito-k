@@ -13,6 +13,7 @@
  */
 
 #include "../include/types.h"
+#include "../include/fd.h"
 
 /* ── External functions ──────────────────────────────────────── */
 
@@ -128,6 +129,9 @@ typedef struct {
     uint64_t last_active_tick;   /* tick when process last ran */
     bool     pages_compressed;   /* true if RW pages are compressed */
 
+    /* Per-process file descriptor table. 8 KB. Last member so
+     * any additions go above and the struct layout stays stable. */
+    fd_entry_t fds[MAX_FDS];
 } process_t;
 
 /* ── Process table ───────────────────────────────────────────── */
@@ -246,6 +250,14 @@ void proc_add_region(void *base, uint64_t pages)
 process_t *proc_current(void)
 {
     return current_proc;
+}
+
+/* Per-process fd_table accessor — used by syscall.c's `fd_table` macro.
+ * Returns the current process's inline fds[] array. Every user-mode
+ * syscall dispatch guarantees current_proc != NULL, so no null check. */
+fd_entry_t *syscall_fds(void)
+{
+    return current_proc->fds;
 }
 
 /* X-PGTBL: CR3 of the currently-running process (0 if none). */
@@ -449,6 +461,11 @@ int proc_exec(const char *filename, int argc, const char **argv)
     current_proc = p;
     exec_target_proc = p;
     p->state = PROC_RUNNING;
+
+    /* Seed stdio — proc_alloc zeros the fd table, so the new process
+     * has no fds until we give it 0/1/2 = console. */
+    extern void syscall_seed_stdio(fd_entry_t *fds);
+    syscall_seed_stdio(p->fds);
 
     fb_puts_color(" [PID ", 0x0000AAFF);
     fb_putdec(p->pid);
@@ -927,9 +944,21 @@ int32_t proc_fork(void)
 
     child->ppid = parent->pid;
 
-    /* FDs live in the global fd_table[] in syscall.c — already shared
-     * between parent and child until syscall_save_parent() snapshots it
-     * for restore-on-exec. */
+    /* Clone parent's fd_table into the child. Each inherited pipe fd
+     * bumps the corresponding read_refs/write_refs on the shared
+     * pipe_buf_t, so sys_close in one process doesn't kill the pipe
+     * end in the other. This is the fix for zsh's subshell pipe. */
+    memcpy(child->fds, parent->fds, sizeof(child->fds));
+    for (int i = 0; i < MAX_FDS; i++) {
+        if (!child->fds[i].open) continue;
+        if (child->fds[i].type == FD_TYPE_PIPE && child->fds[i].pipe) {
+            pipe_buf_t *p = (pipe_buf_t *)child->fds[i].pipe;
+            if ((child->fds[i].oflags & 0x3) == 0 /* O_RDONLY */)
+                p->read_refs++;
+            else
+                p->write_refs++;
+        }
+    }
 
     child->region_count = 0;
 
@@ -1127,8 +1156,22 @@ int32_t proc_clone_thread(uint64_t child_stack, uint64_t parent_tidptr,
     thread->ppid = parent->pid;
     thread->is_thread = true;
 
-    /* FDs live in global fd_table[] in syscall.c — already shared
-     * across threads of the same process. */
+    /* Clone parent's fd_table into the thread. Same pattern as fork —
+     * bump pipe refcounts for every inherited pipe end. Thread-local
+     * fd divergence is accepted (POSIX would require sharing via an
+     * fd_owner pointer; follow-up if a real multithreaded-fd test
+     * needs it). */
+    memcpy(thread->fds, parent->fds, sizeof(thread->fds));
+    for (int i = 0; i < MAX_FDS; i++) {
+        if (!thread->fds[i].open) continue;
+        if (thread->fds[i].type == FD_TYPE_PIPE && thread->fds[i].pipe) {
+            pipe_buf_t *p = (pipe_buf_t *)thread->fds[i].pipe;
+            if ((thread->fds[i].oflags & 0x3) == 0 /* O_RDONLY */)
+                p->read_refs++;
+            else
+                p->write_refs++;
+        }
+    }
 
     thread->region_count = 0;
 
@@ -1546,6 +1589,10 @@ void proc_init(void)
         kernel->state = PROC_RUNNING;
         current_proc = kernel;
         sched_current_idx = (int)(kernel - &proctab[0]);
+        /* Seed kernel process with stdin/stdout/stderr = console.
+         * All future processes inherit or reset these via execve. */
+        extern void syscall_seed_stdio(fd_entry_t *fds);
+        syscall_seed_stdio(kernel->fds);
         serial_puts("[PROC] Kernel process PID ");
         serial_putdec(kernel->pid);
         serial_puts("\n");
