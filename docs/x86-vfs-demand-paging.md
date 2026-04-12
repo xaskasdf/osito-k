@@ -252,17 +252,40 @@ Workaround candidates (not yet applied):
 - Build auxv in forward order then reverse
 - Compile elf.c with `-mincoming-stack-boundary=3` or equivalent
 
-### fork+execve of the same binary on the demand path
-Eager loader uses `fork_saves[]` to memcpy parent PF_W segments before the
-child overwrites them. Demand loader has no equivalent — child page faults
-rewrite parent PTEs one at a time, leaking parent's pages and breaking the
-parent's view of its own data after reap. Static binaries that fork+exec
-themselves should link with `PT_DYNAMIC` to get the eager path.
+### fork+execve of the same binary on the demand path ✅ RESOLVED (2026-04-12 pm)
+Originally a known hazard: the eager loader used `fork_saves[]` to memcpy
+parent PF_W segments, but the demand loader had no equivalent. Fixed by
+X-PGTBL (per-process CR3): `demand_page_fault` now installs PTEs via
+`paging_map_page_in_cr3(proc_current_cr3(), …)`, so a child's fault-in
+writes go into its own CR3 without touching the parent's. The
+`!syscall_in_fork_exec()` gate in `use_demand` has been removed
+(commit `18b21ce`). Parent's VMAs are protected by the `vma_t.owner`
+filter during `syscall_reset_process` cleanup.
 
-### Per-process address space
-There is no per-process page table. All processes share the kernel's PML4,
-so `vaddr_min` collisions between processes are possible. zsh and GTA5 both
-load at 0x20000000; running them concurrently is undefined.
+### Per-process address space ✅ RESOLVED (2026-04-12 pm, X-PGTBL commit `199ba97`)
+Each process now has its own CR3: `paging_create_process_cr3()` clones
+`kernel_pml4` and builds private PDs for PDPT[0] and PDPT[1] (covering
+0..2GB where user binaries and mmap ranges live). Scheduler switches
+CR3 on context change. `vma_t.owner` filters each process's mmap
+regions so siblings don't see each other's VMAs. Concurrent zsh + any
+static-PIE binary can run without interference.
+
+### Per-process fd_table ✅ RESOLVED (2026-04-12 pm, commit `5876fe0`)
+`fd_table[MAX_FDS]` moved from static global into
+`process_t.fds[MAX_FDS]`. `pipe_buf_t` gained `int read_refs/write_refs`
+replacing the old booleans; fork clones the parent's table and bumps
+refs on every inherited pipe fd. Zsh fork+exec of external commands
+now works — previously the parent closing one end of a subshell pipe
+also killed the child's view because both processes shared the same
+global table entry.
+
+### User binaries now default to static-PIE (ET_DYN)
+`zsh.elf` is linked as `ET_DYN` via `-Wl,-pie` with `rcrt1.o` self-
+relocation from musl-1.2.6 rebuilt with `-fPIC`. The linker script no
+longer hardcodes a load address; the kernel loader picks it via the
+eager path (`elf_load_segments()` for ET_DYN). Hello world test
+binaries follow the same pattern. See
+`/Users/pc/ok-ported/zsh-5.9/Makefile.ositok` for the exact flags.
 
 ## File index
 
@@ -294,3 +317,21 @@ c42531e  syscall: re-add getrusage (98), rt_sigsuspend (130), setitimer (38)
 24accd9  Stabilize: fix kthread wrapper + wire io_uring READ/WRITE
 be59c00  Kernel: VFS unificado, OsitoFS v3, demand paging, compositor, crt.c
 ```
+
+## Follow-up sweep (2026-04-12 pm)
+
+X-PGTBL + static-PIE + per-process fd_table — removes the Bug #3
+workaround and fixes zsh fork+exec:
+
+```
+5876fe0  x86: per-process fd_table — fix zsh fork+exec pipe sharing
+18b21ce  elf+syscall: remove fork+exec gate — X-PGTBL handles isolation
+4aa4c69  elf: remove demand_paged_active workaround
+199ba97  x86: X-PGTBL per-process page tables — CR3 per proceso
+a0e6413  elf: noinline elf_setup_stack to fix Bug #1 regression
+```
+
+Plus the user-space changes (musl rebuilt with `-fPIC`, `rcrt1.o`
+installed in sysroot, zsh linker script cleaned up, `zsh.elf`
+recompiled as `ET_DYN`) — these live in the `ok-ported/zsh-5.9`
+submodule commit `2c9ca5e8e0`.

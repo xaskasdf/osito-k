@@ -270,6 +270,19 @@ Per-process page tables (un CR3 por proceso):
 
 ### Implementación en fases (sin romper nada existente)
 
+> **Status update (2026-04-12 pm)**: Fase 2 (per-process page tables) is
+> **DONE** as the X-PGTBL commit (`199ba97`). Each process now has its
+> own CR3 with cloned PDPT[0] + PDPT[1] PDs, scheduler switches on
+> context change, proc_exec creates + activates, proc_free releases.
+> VMA `owner` filtering keeps sibling processes' mmap regions isolated.
+> Also: per-process fd_table (`5876fe0`) moves `fd_table[MAX_FDS]`
+> inline into process_t with pipe_buf_t refcounting — fork clones
+> parent's table, zsh fork+exec of external commands works. **Still
+> pending**: Fase 0 (VBASE macros no-op) and Fase 1 (higher-half kernel
+> mapping with AT() linker script + bootstrap stub) — the kernel itself
+> still lives at physical 0x02000000 identity-mapped, and drivers still
+> use direct PA == VA pointers. Higher-half is the next refactor.
+
 **Fase 0: Preparación (no-op funcional)**
 - Definir `KERNEL_VBASE 0xFFFF800000000000ULL`
 - Agregar macros `PHYS_TO_VIRT(p)` / `VIRT_TO_PHYS(v)` como identidad inicialmente
@@ -281,7 +294,7 @@ Per-process page tables (un CR3 por proceso):
 - Linker script: no cambiar nada, el kernel sigue cargando bajo en memoria
 - Test: acceder a datos via `PHYS_TO_VIRT(addr)` funciona idénticamente
 
-**Fase 2: Per-process page tables para user space**
+**Fase 2: Per-process page tables para user space ✅ DONE (2026-04-12)**
 - `proc_create_address_space()`: crea PML4 con upper-half del kernel copiado
 - `elf_load_segments()`: alloca páginas libres, las mapea en el PML4 del proceso
 - `sched_tick()`: hace CR3 switch al PML4 del proceso siguiente
