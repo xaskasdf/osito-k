@@ -157,7 +157,9 @@ typedef struct {
     /* For dynamic linking */
     uint64_t load_bias;      /* base - vaddr_min (0 for ET_EXEC) */
     uint64_t vaddr_min;      /* lowest vaddr across all LOAD segments */
+    uint64_t vaddr_max;      /* highest vaddr + memsz (demand path only) */
     bool     virt_mapped;    /* true if ET_EXEC virt→phys remap was used */
+    bool     demand_paged;   /* true if segments are demand-paged */
 } elf_loaded_t;
 
 /* ── Validate ELF header ─────────────────────────────────────── */
@@ -620,6 +622,101 @@ static void elf_jump(uint64_t entry, uint64_t sp)
     __builtin_unreachable();
 }
 
+/* ── Demand-paged segment setup ────────────────────────────────
+ * For static binaries (no PT_DYNAMIC), register VMAs that point
+ * to the file on disk instead of reading the whole file into RAM.
+ * The page fault handler reads pages on first access. */
+
+#define VMA_FILE_ELF 1
+
+extern int vma_register_file(uint64_t base, uint64_t pages, uint32_t prot,
+                             uint8_t type, vfs_node_t *node,
+                             uint64_t file_offset, uint64_t file_size);
+
+static int elf_setup_demand_segments(const elf64_hdr_t *hdr,
+                                     const uint8_t *phdr_buf,
+                                     vfs_node_t *file_node,
+                                     elf_loaded_t *loaded)
+{
+    /* Pass 1: find vaddr range across all PT_LOAD segments */
+    uint64_t vaddr_min = ~0ULL, vaddr_max = 0;
+    int load_count = 0;
+
+    for (int i = 0; i < hdr->e_phnum; i++) {
+        const elf64_phdr_t *ph = (const elf64_phdr_t *)(phdr_buf + (uint64_t)i * hdr->e_phentsize);
+        if (ph->p_type != PT_LOAD || ph->p_memsz == 0) continue;
+
+        uint64_t seg_start = ph->p_vaddr & ~0xFFFULL;
+        uint64_t seg_end = (ph->p_vaddr + ph->p_memsz + 0xFFF) & ~0xFFFULL;
+        if (seg_start < vaddr_min) vaddr_min = seg_start;
+        if (seg_end > vaddr_max)   vaddr_max = seg_end;
+        load_count++;
+    }
+
+    if (load_count == 0) {
+        serial_puts("[ELF] No LOAD segments\n");
+        return -1;
+    }
+
+    loaded->vaddr_min = vaddr_min;
+    loaded->vaddr_max = vaddr_max;
+    loaded->demand_paged = true;
+    loaded->load_bias = 0;          /* ET_EXEC only — PIE goes through eager */
+    loaded->virt_mapped = true;
+    loaded->segment_count = 0;
+
+    /* Pass 2: register a VMA per PT_LOAD segment */
+    for (int i = 0; i < hdr->e_phnum; i++) {
+        const elf64_phdr_t *ph = (const elf64_phdr_t *)(phdr_buf + (uint64_t)i * hdr->e_phentsize);
+        if (ph->p_type != PT_LOAD || ph->p_memsz == 0) continue;
+
+        uint64_t seg_vaddr = ph->p_vaddr & ~0xFFFULL;
+        uint64_t seg_end = (ph->p_vaddr + ph->p_memsz + 0xFFF) & ~0xFFFULL;
+        uint64_t seg_pages = (seg_end - seg_vaddr) / 4096;
+
+        /* File offset aligned to page boundary; in-page bias preserved */
+        uint64_t in_page = ph->p_vaddr & 0xFFF;
+        uint64_t file_off = ph->p_offset - in_page;
+        uint64_t file_sz  = ph->p_filesz + in_page;
+
+        /* Convert ELF flags to PROT_* */
+        uint32_t prot = 0;
+        if (ph->p_flags & PF_R) prot |= 0x1; /* PROT_READ */
+        if (ph->p_flags & PF_W) prot |= 0x2; /* PROT_WRITE */
+        if (ph->p_flags & PF_X) prot |= 0x4; /* PROT_EXEC */
+
+        if (vma_register_file(seg_vaddr, seg_pages, prot,
+                              VMA_FILE_ELF, file_node,
+                              file_off, file_sz) < 0) {
+            serial_puts("[ELF] VMA table full\n");
+            return -1;
+        }
+
+        serial_puts("[ELF] Demand VMA: 0x");
+        serial_puthex(seg_vaddr, 16);
+        serial_puts(" (");
+        serial_putdec(seg_pages * 4);
+        serial_puts(" KB) flags=0x");
+        serial_puthex(prot, 1);
+        serial_puts("\n");
+    }
+
+    loaded->entry = hdr->e_entry;
+    loaded->phdr_addr = vaddr_min + hdr->e_phoff;
+    loaded->phdr_entsize = hdr->e_phentsize;
+    loaded->phdr_count = hdr->e_phnum;
+
+    serial_puts("[ELF] Demand-paged: entry=0x");
+    serial_puthex(loaded->entry, 16);
+    serial_puts(", range 0x");
+    serial_puthex(vaddr_min, 16);
+    serial_puts("..0x");
+    serial_puthex(vaddr_max, 16);
+    serial_puts("\n");
+
+    return 0;
+}
+
 /* ── Public API: Load and execute ELF from OsitoFS ───────────── */
 
 int elf_exec(const char *filename, int argc, const char **argv)
@@ -647,62 +744,94 @@ int elf_exec(const char *filename, int argc, const char **argv)
     serial_putdec(file_size);
     serial_puts(" bytes\n");
 
-    /* Check against available memory */
     if (file_size < sizeof(elf64_hdr_t)) {
         serial_puts("[ELF] File too small\n");
         return -1;
     }
-    {
-        extern int sys_caps_check_alloc(uint64_t bytes, const char *what);
-        extern uint64_t mem_get_free(void);
-        uint64_t avail = mem_get_free();
-        serial_puts("[ELF] ");
-        serial_puts(filename);
-        serial_puts(": ");
-        serial_putdec(file_size / (1024 * 1024));
-        serial_puts(" MB, available: ");
-        serial_putdec(avail / (1024 * 1024));
-        serial_puts(" MB\n");
-        /* Need ~2x file size (read buffer + load segments) */
-        if (!sys_caps_check_alloc(file_size * 2, filename)) {
-            return -1;
-        }
-    }
 
-    /* Read entire file into memory */
-    uint8_t *data = (uint8_t *)kmalloc(file_size);
-    if (!data) {
-        serial_puts("[ELF] Failed to allocate read buffer\n");
+    /* Read only the ELF header (64 bytes) — enough to determine layout */
+    elf64_hdr_t hdr_buf;
+    if (vfs_read(&node, 0, &hdr_buf, sizeof(hdr_buf)) < 0) {
+        serial_puts("[ELF] Failed to read header\n");
+        return -1;
+    }
+    if (elf_validate(&hdr_buf) < 0) return -1;
+
+    /* Read program headers (typically <1KB) */
+    uint64_t phdr_size = (uint64_t)hdr_buf.e_phnum * hdr_buf.e_phentsize;
+    uint8_t *phdr_buf = (uint8_t *)kmalloc(phdr_size);
+    if (!phdr_buf) return -1;
+    if (vfs_read(&node, hdr_buf.e_phoff, phdr_buf, phdr_size) < 0) {
+        kfree(phdr_buf);
         return -1;
     }
 
-    if (vfs_read(&node, 0, data, file_size) < 0) {
-        serial_puts("[ELF] Failed to read file\n");
-        kfree(data);
-        return -1;
+    /* Decide path: ET_EXEC without PT_DYNAMIC → demand-paged
+     * ET_DYN or anything with PT_DYNAMIC → eager (needs dynamic linker) */
+    bool has_dynamic = false;
+    for (int i = 0; i < hdr_buf.e_phnum; i++) {
+        const elf64_phdr_t *ph = (const elf64_phdr_t *)(phdr_buf + (uint64_t)i * hdr_buf.e_phentsize);
+        if (ph->p_type == PT_DYNAMIC) { has_dynamic = true; break; }
     }
+    bool use_demand = (hdr_buf.e_type == ET_EXEC) && !has_dynamic;
 
-    /* Validate ELF header */
-    if (elf_validate((const elf64_hdr_t *)data) < 0) {
-        kfree(data);
-        return -1;
-    }
-
-    /* Load segments */
     elf_loaded_t loaded;
     memset(&loaded, 0, sizeof(loaded));
+    uint8_t *data = NULL;
 
-    if (elf_load_segments(data, file_size, &loaded) < 0) {
-        kfree(data);
-        return -1;
+    if (use_demand) {
+        serial_puts("[ELF] Path: demand-paged (static binary, ");
+        serial_putdec(file_size / (1024 * 1024));
+        serial_puts(" MB)\n");
+        if (elf_setup_demand_segments(&hdr_buf, phdr_buf, &node, &loaded) < 0) {
+            kfree(phdr_buf);
+            return -1;
+        }
+        kfree(phdr_buf);
+    } else {
+        serial_puts("[ELF] Path: eager (");
+        serial_puts(has_dynamic ? "dynamic" : "PIE");
+        serial_puts(")\n");
+        kfree(phdr_buf);
+
+        {
+            extern int sys_caps_check_alloc(uint64_t bytes, const char *what);
+            extern uint64_t mem_get_free(void);
+            uint64_t avail = mem_get_free();
+            serial_puts("[ELF] ");
+            serial_puts(filename);
+            serial_puts(": ");
+            serial_putdec(file_size / (1024 * 1024));
+            serial_puts(" MB, available: ");
+            serial_putdec(avail / (1024 * 1024));
+            serial_puts(" MB\n");
+            if (!sys_caps_check_alloc(file_size * 2, filename))
+                return -1;
+        }
+
+        data = (uint8_t *)kmalloc(file_size);
+        if (!data) {
+            serial_puts("[ELF] Failed to allocate read buffer\n");
+            return -1;
+        }
+        if (vfs_read(&node, 0, data, file_size) < 0) {
+            serial_puts("[ELF] Failed to read file\n");
+            kfree(data);
+            return -1;
+        }
+
+        if (elf_load_segments(data, file_size, &loaded) < 0) {
+            kfree(data);
+            return -1;
+        }
     }
 
     /* ── Patch NT_GNU_ABI_TAG notes ────────────────────────────────
      * glibc binaries have a .note.ABI-tag that specifies the minimum
      * Linux kernel version. Since OsitoK is not Linux, we patch the
      * required version to 0.0.0 so the check always passes.
-     * This is done in-memory after loading, not on disk. */
-    {
+     * Eager path only — demand-paged binaries have no in-memory data buffer. */
+    if (data) {
         elf64_hdr_t *hdr = (elf64_hdr_t *)data;
         for (int i = 0; i < hdr->e_phnum; i++) {
             elf64_phdr_t *ph = (elf64_phdr_t *)(data + hdr->e_phoff + i * hdr->e_phentsize);
@@ -740,11 +869,10 @@ int elf_exec(const char *filename, int argc, const char **argv)
         }
     }
 
-    /* ── Dynamic linking ─────────────────────────────────────────────
+    /* ── Dynamic linking (eager path only) ───────────────────────────
      * If the binary has a PT_DYNAMIC segment, parse it to resolve
-     * shared library dependencies and apply relocations. This bridges
-     * elf.c → dynlink.c for dynamically linked executables. */
-    {
+     * shared library dependencies and apply relocations. */
+    if (data) {
         const elf64_hdr_t *hdr = (const elf64_hdr_t *)data;
         dl_dyn_t *dyn_table = NULL;
         uint64_t dyn_count = 0;
@@ -1015,20 +1143,22 @@ int elf_exec(const char *filename, int argc, const char **argv)
     uint64_t sp = elf_setup_stack(&loaded, argc, argv);
     if (sp == 0) {
         serial_puts("[ELF] Failed to set up stack\n");
-        kfree(data);
+        if (data) kfree(data);
         elf_free(&loaded);
         return -1;
     }
 
-    /* Free the read buffer (segments are already copied) */
-    kfree(data);
+    /* Free the read buffer (eager path only — demand-paged has no buffer) */
+    if (data) kfree(data);
 
     /* Register ELF memory with the process for cleanup on exit.
-     * After elf_jump, the loaded struct is on the abandoned stack,
-     * so proc_free needs its own copy of the regions. */
-    for (int i = 0; i < loaded.segment_count; i++) {
-        if (loaded.segments[i] && loaded.segment_pages[i] > 0)
-            proc_add_region(loaded.segments[i], loaded.segment_pages[i]);
+     * Demand-paged segments are tracked via the global VMA table and
+     * freed by syscall_reset_process; only register eager segments. */
+    if (!loaded.demand_paged) {
+        for (int i = 0; i < loaded.segment_count; i++) {
+            if (loaded.segments[i] && loaded.segment_pages[i] > 0)
+                proc_add_region(loaded.segments[i], loaded.segment_pages[i]);
+        }
     }
     if (loaded.stack_base)
         proc_add_region(loaded.stack_base, USER_STACK_SIZE / 4096);
