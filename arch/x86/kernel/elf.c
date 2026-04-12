@@ -799,13 +799,24 @@ int elf_exec(const char *filename, int argc, const char **argv)
     }
 
     /* Decide path: ET_EXEC without PT_DYNAMIC → demand-paged
-     * ET_DYN or anything with PT_DYNAMIC → eager (needs dynamic linker) */
+     * ET_DYN or anything with PT_DYNAMIC → eager (needs dynamic linker)
+     *
+     * Special case: a forked child running execv cannot use demand
+     * paging because OsitoK shares a single PML4 across processes. The
+     * child's per-page faults would rewrite the parent's PTEs and
+     * corrupt the parent's modified pages. The eager path uses
+     * fork_saves[] to memcpy the parent's PF_W segments before the
+     * child overwrites them, preserving the parent's view across the
+     * exec window. So: if syscall_in_fork_exec() reports we're inside
+     * a fork+exec, force the eager path. */
+    extern bool syscall_in_fork_exec(void);
     bool has_dynamic = false;
     for (int i = 0; i < hdr_buf.e_phnum; i++) {
         const elf64_phdr_t *ph = (const elf64_phdr_t *)(phdr_buf + (uint64_t)i * hdr_buf.e_phentsize);
         if (ph->p_type == PT_DYNAMIC) { has_dynamic = true; break; }
     }
-    bool use_demand = (hdr_buf.e_type == ET_EXEC) && !has_dynamic;
+    bool use_demand = (hdr_buf.e_type == ET_EXEC) && !has_dynamic
+                      && !syscall_in_fork_exec();
 
     elf_loaded_t loaded;
     memset(&loaded, 0, sizeof(loaded));

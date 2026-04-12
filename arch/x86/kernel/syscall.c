@@ -2855,6 +2855,16 @@ void syscall_save_brk(void)
     saved_parent.valid = true;
 }
 
+/* True between syscall_save_brk and syscall_restore_brk: a forked child
+ * is about to run (or has just run) execve. Used by the ELF loader to
+ * refuse the demand-paged path during fork+execve — demand paging shares
+ * the parent's PML4 and would corrupt the parent's RW data when the
+ * child page-faults rewrite the shared PTEs. */
+bool syscall_in_fork_exec(void)
+{
+    return saved_parent.valid;
+}
+
 void syscall_restore_brk(void)
 {
     if (!saved_parent.valid) return;
