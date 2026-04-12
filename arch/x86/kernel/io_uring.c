@@ -11,10 +11,15 @@
 extern void serial_puts(const char *s);
 extern void serial_putdec(uint64_t val);
 extern void *mem_alloc_aligned(uint64_t size, uint64_t alignment);
-extern int osfs2_read(void *file, uint64_t offset, void *buf, uint64_t len)
-    __attribute__((weak));
-extern int osfs2_write(void *file, uint64_t offset, const void *buf, uint64_t len)
-    __attribute__((weak));
+
+/* Dispatch through the main syscall handler for FD-aware I/O */
+extern int64_t syscall_dispatch(uint64_t nr, uint64_t a1, uint64_t a2,
+                                uint64_t a3, uint64_t a4, uint64_t a5,
+                                uint64_t a6);
+#define SYS_READ_NR   0
+#define SYS_WRITE_NR  1
+#define SYS_PREAD_NR  17
+#define SYS_PWRITE_NR 18
 
 /* ── SQE / CQE Structures (Linux ABI) ───────────────────────── */
 
@@ -129,11 +134,23 @@ int io_uring_process(int ring_idx)
             result = 0;
             break;
         case IORING_OP_READ:
-            /* TODO: dispatch to FD table read */
-            result = -38;  /* ENOSYS for now */
+            /* Use pread if offset specified, otherwise read */
+            if (sqe->off != 0 && sqe->off != (uint64_t)-1) {
+                result = (int32_t)syscall_dispatch(SYS_PREAD_NR, (uint64_t)sqe->fd,
+                                                   sqe->addr, sqe->len, sqe->off, 0, 0);
+            } else {
+                result = (int32_t)syscall_dispatch(SYS_READ_NR, (uint64_t)sqe->fd,
+                                                   sqe->addr, sqe->len, 0, 0, 0);
+            }
             break;
         case IORING_OP_WRITE:
-            result = -38;
+            if (sqe->off != 0 && sqe->off != (uint64_t)-1) {
+                result = (int32_t)syscall_dispatch(SYS_PWRITE_NR, (uint64_t)sqe->fd,
+                                                   sqe->addr, sqe->len, sqe->off, 0, 0);
+            } else {
+                result = (int32_t)syscall_dispatch(SYS_WRITE_NR, (uint64_t)sqe->fd,
+                                                   sqe->addr, sqe->len, 0, 0, 0);
+            }
             break;
         default:
             result = -22;  /* EINVAL */

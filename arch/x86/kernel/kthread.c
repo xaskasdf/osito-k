@@ -26,12 +26,16 @@ typedef struct {
 
 static kthread_t kthreads[KTHREAD_MAX];
 
-/* Wrapper that calls the actual function with data */
+/* Index of the kthread being launched (set before sched_spawn, read by wrapper) */
+static volatile int kthread_launching = -1;
+
+/* Wrapper that calls the actual function with its data argument */
 static void kthread_wrapper(void)
 {
-    /* Find our kthread entry by matching current thread */
-    /* Simplified: use a global for the last-created kthread */
-    /* In production, use TLS or per-CPU current_kthread pointer */
+    int idx = kthread_launching;
+    if (idx < 0 || idx >= KTHREAD_MAX || !kthreads[idx].active) return;
+    kthreads[idx].func(kthreads[idx].data);
+    kthreads[idx].active = false;
 }
 
 /* Create and start a kernel thread */
@@ -48,8 +52,8 @@ int kthread_create(const char *name, void (*func)(void *), void *data)
             while (name[j] && j < 31) { kt->name[j] = name[j]; j++; }
             kt->name[j] = '\0';
 
-            /* Spawn via scheduler (func cast: data passed via global) */
-            kt->pid = sched_spawn(name, (void (*)(void))func);
+            kthread_launching = i;
+            kt->pid = sched_spawn(name, kthread_wrapper);
 
             serial_puts("[KTHREAD] Created: ");
             serial_puts(name);
