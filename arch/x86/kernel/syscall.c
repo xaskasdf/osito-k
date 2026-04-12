@@ -901,6 +901,18 @@ static int64_t sys_open(uint64_t path_addr, uint64_t flags, uint64_t mode)
         }
     }
 
+    /* ETXTBSY: refuse write access to a binary that is being executed.
+     * Linux returns -ETXTBSY (-26) for open(O_WRONLY/O_RDWR) on a running
+     * binary. zsh and similar programs may try this — without the check,
+     * they corrupt their own .text segment on disk. */
+    if ((flags & O_ACCMODE) != O_RDONLY) {
+        extern bool proc_is_executing(const char *name);
+        if (proc_is_executing(path)) {
+            memset(f, 0, sizeof(*f));
+            return -26; /* ETXTBSY */
+        }
+    }
+
     f->open   = true;
     f->type   = FD_TYPE_FILE;
     f->oflags = (uint16_t)(flags & 0xFFFF);
@@ -2825,11 +2837,31 @@ void syscall_restore_brk(void)
 
 void syscall_reset_process(void)
 {
-    /* Close file/pipe FDs (keep console on 0/1/2) */
+    /* Close all FDs >= 3 */
     for (int i = 3; i < MAX_FDS; i++) {
         if (fd_table[i].open)
             sys_close((uint64_t)i);
     }
+
+    /* Force-reset stdin/stdout/stderr to console.
+     * A child process may have done dup2(file_fd, 1) to redirect stdout
+     * to a file. Without this reset, the parent shell would write to
+     * that file when it next prints (corrupting on-disk data). */
+    memset(&fd_table[0], 0, sizeof(fd_table[0]));
+    memset(&fd_table[1], 0, sizeof(fd_table[1]));
+    memset(&fd_table[2], 0, sizeof(fd_table[2]));
+
+    fd_table[0].open  = true;
+    fd_table[0].type  = FD_TYPE_CONSOLE;
+    fd_table[0].read  = console_read;
+
+    fd_table[1].open  = true;
+    fd_table[1].type  = FD_TYPE_CONSOLE;
+    fd_table[1].write = console_write;
+
+    fd_table[2].open  = true;
+    fd_table[2].type  = FD_TYPE_CONSOLE;
+    fd_table[2].write = console_write;
 
     /* Reset signal state */
     memset(sig_handlers, 0, sizeof(sig_handlers));

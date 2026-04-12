@@ -330,6 +330,26 @@ const char *proc_current_name(void)
     return current_proc ? current_proc->name : "kernel";
 }
 
+/* Check if any live process is currently executing a binary with this name.
+ * Used by sys_open to enforce ETXTBSY on writes to executing binaries. */
+bool proc_is_executing(const char *name)
+{
+    if (!name || !*name) return false;
+    /* Skip leading "/" if present */
+    if (*name == '/') name++;
+    for (int i = 0; i < MAX_PROCESSES; i++) {
+        if (proctab[i].state == PROC_FREE) continue;
+        if (proctab[i].state == PROC_ZOMBIE) continue;
+        const char *pname = proctab[i].name;
+        if (!*pname) continue;
+        /* Compare basenames */
+        int j = 0;
+        while (name[j] && pname[j] && name[j] == pname[j]) j++;
+        if (name[j] == '\0' && pname[j] == '\0') return true;
+    }
+    return false;
+}
+
 /* Get process by PID */
 process_t *proc_find(uint32_t pid)
 {
