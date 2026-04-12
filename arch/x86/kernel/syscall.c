@@ -611,13 +611,19 @@ static int64_t sys_write(uint64_t fd, uint64_t buf, uint64_t count)
     if (f->type == FD_TYPE_PIPE) {
         pipe_buf_t *p = (pipe_buf_t *)f->pipe;
         if (!p || !p->read_open) return -EPIPE;
+
+        bool nonblock = (f->oflags & 04000 /* O_NONBLOCK */) != 0;
         const uint8_t *src = (const uint8_t *)buf;
         uint64_t written = 0;
         while (written < count) {
             if (p->count >= PIPE_BUF_SIZE) {
-                /* Buffer full — return what we have (non-blocking) */
+                /* Buffer full — block until reader drains, or return
+                 * partial / EAGAIN if non-blocking. */
                 if (written > 0) return (int64_t)written;
-                return -EAGAIN;
+                if (nonblock) return -EAGAIN;
+                __asm__ volatile ("sti; hlt; cli" ::: "memory");
+                if (!p->read_open) return -EPIPE;
+                continue;
             }
             p->buf[p->head] = src[written++];
             p->head = (p->head + 1) % PIPE_BUF_SIZE;
@@ -689,11 +695,16 @@ static int64_t sys_read(uint64_t fd, uint64_t buf, uint64_t count)
     if (f->type == FD_TYPE_PIPE) {
         pipe_buf_t *p = (pipe_buf_t *)f->pipe;
         if (!p) return -EBADF;
-        if (p->count == 0) {
-            /* Empty — if write end is closed, return EOF */
-            if (!p->write_open) return 0;
-            return -EAGAIN;
+
+        /* Block until data is available or write end is closed.
+         * Non-blocking mode (O_NONBLOCK) returns EAGAIN immediately. */
+        bool nonblock = (f->oflags & 04000 /* O_NONBLOCK */) != 0;
+        while (p->count == 0) {
+            if (!p->write_open) return 0;  /* EOF */
+            if (nonblock) return -EAGAIN;
+            __asm__ volatile ("sti; hlt; cli" ::: "memory");
         }
+
         uint8_t *dst = (uint8_t *)buf;
         uint64_t nread = 0;
         while (nread < count && p->count > 0) {
