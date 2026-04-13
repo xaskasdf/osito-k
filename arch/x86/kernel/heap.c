@@ -12,6 +12,7 @@
  */
 
 #include "../include/types.h"
+#include "../include/paging.h"
 
 /* ── External functions ──────────────────────────────────────── */
 
@@ -139,12 +140,14 @@ static int heap_grow(uint64_t min_bytes)
     uint64_t pages = (min_bytes + PAGE_SIZE - 1) / PAGE_SIZE;
     if (pages < HEAP_GROW_PAGES) pages = HEAP_GROW_PAGES;
 
-    /* Try to get pages adjacent to current heap end */
-    void *new_pages = mem_alloc_pages(pages);
-    if (!new_pages) {
+    /* Allocate fresh physical pages and view them through the
+     * upper-half direct map so the whole heap runs at KERNEL_VBASE+. */
+    void *phys = mem_alloc_pages(pages);
+    if (!phys) {
         serial_puts("[HEAP] Failed to grow heap\n");
         return -1;
     }
+    void *new_pages = PHYS_TO_VIRT(phys);
 
     uint64_t new_size = pages * PAGE_SIZE;
 
@@ -305,13 +308,15 @@ void heap_init(void)
 {
     serial_puts("[HEAP] Initializing kernel heap...\n");
 
-    /* Allocate initial heap pages */
+    /* Allocate initial heap pages and keep them through the upper-half
+     * direct map — the entire heap lives at KERNEL_VBASE+. */
     uint64_t init_size = HEAP_INIT_PAGES * PAGE_SIZE;  /* 256 KB */
-    heap_start = (uint8_t *)mem_alloc_pages(HEAP_INIT_PAGES);
-    if (!heap_start) {
+    void *phys = mem_alloc_pages(HEAP_INIT_PAGES);
+    if (!phys) {
         serial_puts("[HEAP] FATAL: Cannot allocate initial heap\n");
         return;
     }
+    heap_start = (uint8_t *)PHYS_TO_VIRT(phys);
 
     heap_end = heap_start + init_size;
     heap_size = init_size;
