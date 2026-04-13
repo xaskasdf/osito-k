@@ -686,11 +686,18 @@ static void elf_jump(uint64_t entry, uint64_t sp)
     /* Switch CR3 to the new process and jump in one asm block. After
      * the CR3 switch the lower-half boot kernel stack is no longer
      * mapped, so we must NOT touch the C stack until the asm has
-     * loaded the new RSP. The asm does:
+     * loaded the new RSP. A timer IRQ firing between the CR3 switch
+     * and the RSP load would try to push the interrupt frame to the
+     * old (boot) stack and fault, so we disable interrupts across
+     * the whole critical section and re-enable them just before the
+     * jmp into user code (sti has a 1-instruction delay, so the jmp
+     * runs first and the user binary starts with IF=1). The asm does:
+     *   cli
      *   mov new_cr3, %cr3   ;; switch address space
      *   mov sp, %rsp        ;; switch to user stack (upper-half)
      *   xor %rbp, %rbp
-     *   jmp *entry          ;; into user code
+     *   sti
+     *   jmp *entry          ;; into user code (IF becomes 1 here)
      * The instruction fetches between mov %cr3 and jmp succeed because
      * kernel text lives at the upper-half mirror (PML4[256], shared
      * across all CR3s). */
@@ -698,12 +705,14 @@ static void elf_jump(uint64_t entry, uint64_t sp)
     uint64_t pcr3 = proc_current_cr3();
 
     __asm__ volatile (
+        "cli\n"
         "test %2, %2\n"
         "jz   1f\n"
         "mov  %2, %%cr3\n"
         "1:\n"
         "mov %0, %%rsp\n"
         "xor %%rbp, %%rbp\n"
+        "sti\n"
         "jmp *%1\n"
         : : "r"(sp), "r"(entry), "r"(pcr3)
         : "memory"

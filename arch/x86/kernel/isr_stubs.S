@@ -39,14 +39,35 @@ isr_common:
     /* Pass frame pointer as argument (RSP points to saved regs) */
     mov %rsp, %rdi
 
-    /* Align stack to 16 bytes (ABI requirement) */
+    /* Remember the GPR-area rsp in %rbp so we can restore cleanly
+     * after the fxsave buffer and 16-byte alignment padding below.
+     * %rbp is callee-saved by the C handler, and the bottom of the
+     * ISR pops %rbp from the saved GPR area so its original value
+     * (from the interrupted code) is restored at iretq time. */
     mov %rsp, %rbp
-    and $~0xF, %rsp
 
-    /* Call C handler */
+    /* Save FPU/SSE state. The C handler may call memset/memcpy which
+     * GCC -O2 implements using xmm registers, clobbering the
+     * interrupted code's xmm state. Without this save/restore, a
+     * user-mode SSE instruction (e.g. a movaps doing a struct copy)
+     * that triggers a demand-page-fault would have its xmm register
+     * silently zeroed by the handler's memset, causing the retried
+     * store to write zeros to the page — the exact bug that was
+     * corrupting Q2's `ri = rimp` struct copy in GetRefAPI.
+     *
+     * fxsave needs a 512-byte 16-aligned buffer. Reserve 512+16 on
+     * the stack so there's slack to align rsp down. */
+    sub $528, %rsp
+    and $~0xF, %rsp          /* rsp now 16-aligned */
+    fxsave64 (%rsp)
+    mov %rsp, %r15           /* r15 = fxsave buffer, callee-saved */
+
+    /* Call C handler — rsp is already 16-aligned as required by ABI */
     call isr_handler
 
-    /* Restore stack (undo 16-byte alignment) */
+    /* Restore FPU/SSE state from the fxsave buffer, then unwind rsp
+     * back to the GPR save area. */
+    fxrstor64 (%r15)
     mov %rbp, %rsp
 
     /* ── Scheduler: check for context switch (X-SCHED) ────────── */
