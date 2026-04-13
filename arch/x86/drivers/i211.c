@@ -8,6 +8,7 @@
  */
 
 #include "../include/types.h"
+#include "../include/paging.h"
 #include "i211.h"
 
 /* ── External Functions ──────────────────────────────────────── */
@@ -36,8 +37,9 @@ typedef struct {
 
     /* TX ring */
     i211_tx_desc_t *tx_ring;
-    uint8_t        *tx_bufs;     /* TX_RING_SIZE * PKT_BUF_SIZE */
-    uint32_t        tx_tail;     /* Next descriptor to use */
+    uint8_t        *tx_bufs;       /* TX_RING_SIZE * PKT_BUF_SIZE (virt view) */
+    uint64_t        tx_bufs_phys;  /* Physical base — handed to the controller */
+    uint32_t        tx_tail;       /* Next descriptor to use */
 
     bool initialized;
 } i211_state_t;
@@ -86,25 +88,31 @@ static int i211_setup_rx(void)
     uint64_t ring_bytes = (uint64_t)I211_RX_RING_SIZE * sizeof(i211_rx_desc_t);
     uint64_t bufs_bytes = (uint64_t)I211_RX_RING_SIZE * I211_PKT_BUF_SIZE;
 
-    /* Allocate ring (must be 128-byte aligned per Intel spec) */
-    nic.rx_ring = (i211_rx_desc_t *)mem_alloc_aligned(ring_bytes, 4096);
-    if (!nic.rx_ring) return -1;
+    /* Allocate ring (must be 128-byte aligned per Intel spec). Driver
+     * keeps virt pointers (CPU access) and converts to phys for the
+     * hardware programming below. */
+    void *rx_ring_phys = mem_alloc_aligned(ring_bytes, 4096);
+    if (!rx_ring_phys) return -1;
+    nic.rx_ring = (i211_rx_desc_t *)PHYS_TO_VIRT(rx_ring_phys);
 
     /* Allocate packet buffers */
-    nic.rx_bufs = (uint8_t *)mem_alloc_aligned(bufs_bytes, 4096);
-    if (!nic.rx_bufs) return -1;
+    void *rx_bufs_phys = mem_alloc_aligned(bufs_bytes, 4096);
+    if (!rx_bufs_phys) return -1;
+    nic.rx_bufs = (uint8_t *)PHYS_TO_VIRT(rx_bufs_phys);
 
     memset(nic.rx_ring, 0, ring_bytes);
     memset(nic.rx_bufs, 0, bufs_bytes);
 
-    /* Fill each descriptor with buffer address */
+    /* Fill each descriptor with buffer phys address (hardware DMAs
+     * incoming packets into these). */
+    uint64_t rx_bufs_phys_addr = (uint64_t)rx_bufs_phys;
     for (int i = 0; i < I211_RX_RING_SIZE; i++) {
-        nic.rx_ring[i].addr = (uint64_t)(nic.rx_bufs + (uint64_t)i * I211_PKT_BUF_SIZE);
+        nic.rx_ring[i].addr = rx_bufs_phys_addr + (uint64_t)i * I211_PKT_BUF_SIZE;
         nic.rx_ring[i].status = 0;
     }
 
     /* Program ring base address */
-    uint64_t ring_phys = (uint64_t)nic.rx_ring;
+    uint64_t ring_phys = (uint64_t)rx_ring_phys;
     i211_write(I211_RDBAL0, (uint32_t)(ring_phys & 0xFFFFFFFF));
     i211_write(I211_RDBAH0, (uint32_t)(ring_phys >> 32));
 
@@ -148,17 +156,24 @@ static int i211_setup_tx(void)
     uint64_t ring_bytes = (uint64_t)I211_TX_RING_SIZE * sizeof(i211_tx_desc_t);
     uint64_t bufs_bytes = (uint64_t)I211_TX_RING_SIZE * I211_PKT_BUF_SIZE;
 
-    nic.tx_ring = (i211_tx_desc_t *)mem_alloc_aligned(ring_bytes, 4096);
-    if (!nic.tx_ring) return -1;
+    void *tx_ring_phys = mem_alloc_aligned(ring_bytes, 4096);
+    if (!tx_ring_phys) return -1;
+    nic.tx_ring = (i211_tx_desc_t *)PHYS_TO_VIRT(tx_ring_phys);
 
-    nic.tx_bufs = (uint8_t *)mem_alloc_aligned(bufs_bytes, 4096);
-    if (!nic.tx_bufs) return -1;
+    void *tx_bufs_phys = mem_alloc_aligned(bufs_bytes, 4096);
+    if (!tx_bufs_phys) return -1;
+    nic.tx_bufs = (uint8_t *)PHYS_TO_VIRT(tx_bufs_phys);
 
     memset(nic.tx_ring, 0, ring_bytes);
     memset(nic.tx_bufs, 0, bufs_bytes);
 
+    /* Stash tx_bufs phys for descriptor fill in i211_send (we need the
+     * physical address to hand to the controller, but the CPU access
+     * goes through nic.tx_bufs which is the upper-half view). */
+    nic.tx_bufs_phys = (uint64_t)tx_bufs_phys;
+
     /* Program ring base address */
-    uint64_t ring_phys = (uint64_t)nic.tx_ring;
+    uint64_t ring_phys = (uint64_t)tx_ring_phys;
     i211_write(I211_TDBAL0, (uint32_t)(ring_phys & 0xFFFFFFFF));
     i211_write(I211_TDBAH0, (uint32_t)(ring_phys >> 32));
 
@@ -315,8 +330,8 @@ int i211_send(const void *data, uint32_t len)
     uint8_t *buf = nic.tx_bufs + (uint64_t)tail * I211_PKT_BUF_SIZE;
     memcpy(buf, data, len);
 
-    /* Fill descriptor */
-    desc->addr = (uint64_t)buf;
+    /* Fill descriptor — controller needs the physical address. */
+    desc->addr = nic.tx_bufs_phys + (uint64_t)tail * I211_PKT_BUF_SIZE;
     desc->length = (uint16_t)len;
     desc->cso = 0;
     desc->cmd = I211_TXD_CMD_EOP | I211_TXD_CMD_IFCS | I211_TXD_CMD_RS;
