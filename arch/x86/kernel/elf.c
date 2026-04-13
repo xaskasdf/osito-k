@@ -406,6 +406,29 @@ static int elf_load_segments(const uint8_t *data, uint64_t data_size,
     if (hdr->e_type == ET_EXEC)
         loaded->phdr_addr = vaddr_min + hdr->e_phoff;
 
+    /* Install the eager-loaded ELF pages into the *current process's*
+     * PML4. Both the ET_EXEC and ET_DYN paths above wrote to phys
+     * (relying on the kernel identity map for code execution). After
+     * Phase C, user PML4s have an empty PDPT[0], so the binary needs
+     * to be explicitly mapped at its target VA in the per-process
+     * PML4. For ET_EXEC we use vaddr_min..vaddr_min+size; for ET_DYN
+     * we use base (which is phys_base treated as VA — the binary is
+     * position-independent so any VA works as long as PTEs match). */
+    {
+        extern int paging_map_page_in_cr3(uint64_t cr3, uint64_t virt,
+                                          uint64_t phys, uint64_t flags);
+        extern uint64_t proc_current_cr3(void);
+        uint64_t cr3 = proc_current_cr3();
+        if (cr3) {
+            uint64_t va = fixed_load ? vaddr_min : (uint64_t)base;
+            uint64_t pa = (uint64_t)phys_base;
+            uint64_t flags = 0x3; /* PRESENT | WRITABLE */
+            for (uint64_t i = 0; i < total_pages; i++)
+                paging_map_page_in_cr3(cr3, va + i * 4096,
+                                       pa + i * 4096, flags);
+        }
+    }
+
     serial_puts("[ELF] Entry: 0x");
     serial_puthex(loaded->entry, 16);
     serial_puts("\n");
