@@ -9,6 +9,7 @@
  */
 
 #include "../include/types.h"
+#include "../include/paging.h"
 #include "xhci.h"
 
 /* ── External functions ──────────────────────────────────────── */
@@ -355,8 +356,8 @@ static void cmd_submit(xhci_hc_t *hc, xhci_trb_t *trb)
 
     hc->cmd_enq++;
     if (hc->cmd_enq >= XHCI_CMD_RING_SIZE - 1) {
-        /* Write Link TRB */
-        hc->cmd_ring[hc->cmd_enq].param = (uint64_t)hc->cmd_ring;
+        /* Write Link TRB — controller follows it back to ring start */
+        hc->cmd_ring[hc->cmd_enq].param = hc->cmd_ring_phys;
         hc->cmd_ring[hc->cmd_enq].status = 0;
         hc->cmd_ring[hc->cmd_enq].control =
             XHCI_TRB_TYPE(TRB_LINK) | TRB_TC |
@@ -398,7 +399,7 @@ static int cmd_wait(xhci_hc_t *hc, uint8_t *slot_out)
         }
 
         /* Update ERDP */
-        uint64_t erdp = (uint64_t)&hc->evt_ring[hc->evt_deq] | (1 << 3);
+        uint64_t erdp = (hc->evt_ring_phys + hc->evt_deq * sizeof(xhci_trb_t)) | (1 << 3);
         rt_write64(hc, XHCI_RT_IR0 + XHCI_IR_ERDP, erdp);
 
         if (type == TRB_CMD_COMPLETION)
@@ -496,7 +497,7 @@ static void evt_poll(xhci_hc_t *hc)
 
                     /* Re-submit Normal TRB for next poll */
                     uint32_t ei = dev->int_enq;
-                    dev->int_ring[ei].param = (uint64_t)dev->report_buf;
+                    dev->int_ring[ei].param = dev->report_buf_phys;
                     dev->int_ring[ei].status = dev->int_max_pkt;
                     wmb();
                     dev->int_ring[ei].control =
@@ -506,7 +507,7 @@ static void evt_poll(xhci_hc_t *hc)
 
                     dev->int_enq++;
                     if (dev->int_enq >= XHCI_XFER_RING_SIZE - 1) {
-                        dev->int_ring[dev->int_enq].param = (uint64_t)dev->int_ring;
+                        dev->int_ring[dev->int_enq].param = dev->int_ring_phys;
                         dev->int_ring[dev->int_enq].status = 0;
                         dev->int_ring[dev->int_enq].control =
                             XHCI_TRB_TYPE(TRB_LINK) | TRB_TC |
@@ -531,7 +532,7 @@ advance:
             hc->evt_cycle ^= 1;
         }
 
-        uint64_t erdp = (uint64_t)&hc->evt_ring[hc->evt_deq] | (1 << 3);
+        uint64_t erdp = (hc->evt_ring_phys + hc->evt_deq * sizeof(xhci_trb_t)) | (1 << 3);
         rt_write64(hc, XHCI_RT_IR0 + XHCI_IR_ERDP, erdp);
     }
 }
@@ -559,9 +560,10 @@ static int ctrl_transfer(xhci_hc_t *hc, xhci_device_t *dev,
     ei++;
     if (ei >= XHCI_XFER_RING_SIZE - 1) { ei = 0; dev->ep0_cycle ^= 1; }
 
-    /* Data TRB (if any) */
+    /* Data TRB (if any). data is a kernel virt pointer (upper-half
+     * direct map); the controller needs the physical address. */
     if (len > 0 && data) {
-        dev->ep0_ring[ei].param = (uint64_t)data;
+        dev->ep0_ring[ei].param = VIRT_TO_PHYS(data);
         dev->ep0_ring[ei].status = len;
         dev->ep0_ring[ei].control =
             XHCI_TRB_TYPE(TRB_DATA) |
@@ -609,7 +611,7 @@ static int ctrl_transfer(xhci_hc_t *hc, xhci_device_t *dev,
             hc->evt_deq = 0;
             hc->evt_cycle ^= 1;
         }
-        uint64_t erdp = (uint64_t)&hc->evt_ring[hc->evt_deq] | (1 << 3);
+        uint64_t erdp = (hc->evt_ring_phys + hc->evt_deq * sizeof(xhci_trb_t)) | (1 << 3);
         rt_write64(hc, XHCI_RT_IR0 + XHCI_IR_ERDP, erdp);
 
         if (etype == TRB_TRANSFER_EVENT)
@@ -746,24 +748,29 @@ static void enumerate_port(xhci_hc_t *hc, int port)
 
     /* ── Allocate Output Context ── */
     uint32_t ctx_total = hc->ctx_size * 32; /* 32 entries (1 slot + 31 EPs) */
-    dev->output_ctx = mem_alloc_aligned(ctx_total, 4096);
-    if (!dev->output_ctx) return;
+    void *output_ctx_phys = mem_alloc_aligned(ctx_total, 4096);
+    if (!output_ctx_phys) return;
+    dev->output_ctx = PHYS_TO_VIRT(output_ctx_phys);
+    dev->output_ctx_phys = (uint64_t)output_ctx_phys;
     memset(dev->output_ctx, 0, ctx_total);
-    hc->dcbaa[slot_id] = (uint64_t)dev->output_ctx;
+    hc->dcbaa[slot_id] = dev->output_ctx_phys;
     wmb();
 
     /* ── Allocate EP0 Transfer Ring ── */
     uint32_t ring_bytes = XHCI_XFER_RING_SIZE * sizeof(xhci_trb_t);
-    dev->ep0_ring = (xhci_trb_t *)mem_alloc_aligned(ring_bytes, 4096);
-    if (!dev->ep0_ring) return;
+    void *ep0_ring_phys = mem_alloc_aligned(ring_bytes, 4096);
+    if (!ep0_ring_phys) return;
+    dev->ep0_ring = (xhci_trb_t *)PHYS_TO_VIRT(ep0_ring_phys);
+    dev->ep0_ring_phys = (uint64_t)ep0_ring_phys;
     memset(dev->ep0_ring, 0, ring_bytes);
     dev->ep0_enq = 0;
     dev->ep0_cycle = 1;
 
     /* ── Build Input Context for Address Device ── */
     uint32_t in_ctx_total = hc->ctx_size * 33; /* input ctrl ctx + 32 entries */
-    void *in_ctx = mem_alloc_aligned(in_ctx_total, 4096);
-    if (!in_ctx) return;
+    void *in_ctx_phys = mem_alloc_aligned(in_ctx_total, 4096);
+    if (!in_ctx_phys) return;
+    void *in_ctx = PHYS_TO_VIRT(in_ctx_phys);
     memset(in_ctx, 0, in_ctx_total);
 
     /* Input Control Context (entry 0) */
@@ -781,12 +788,12 @@ static void enumerate_port(xhci_hc_t *hc, int port)
     ep0_ctx->field2 = (3 << 1) | /* CErr = 3 */
                       (EP_TYPE_CONTROL << 3) |
                       ((uint32_t)mps << 16);
-    ep0_ctx->tr_dequeue = (uint64_t)dev->ep0_ring | 1; /* DCS = 1 */
+    ep0_ctx->tr_dequeue = dev->ep0_ring_phys | 1; /* DCS = 1 (controller reads phys) */
     ep0_ctx->field4 = 8; /* Average TRB length (8 for control) */
 
     /* ── Address Device (BSR=0) ── */
     memset(&cmd, 0, sizeof(cmd));
-    cmd.param = (uint64_t)in_ctx;
+    cmd.param = (uint64_t)in_ctx_phys;
     cmd.control = XHCI_TRB_TYPE(TRB_ADDRESS_DEVICE) |
                   ((uint32_t)slot_id << 24);
 
@@ -810,8 +817,9 @@ static void enumerate_port(xhci_hc_t *hc, int port)
     spin(2000000);
 
     /* ── GET_DEVICE_DESCRIPTOR (8-byte short read first) ── */
-    uint8_t *desc_buf = (uint8_t *)mem_alloc_aligned(256, 64);
-    if (!desc_buf) return;
+    void *desc_buf_phys = mem_alloc_aligned(256, 64);
+    if (!desc_buf_phys) return;
+    uint8_t *desc_buf = (uint8_t *)PHYS_TO_VIRT(desc_buf_phys);
     memset(desc_buf, 0, 256);
 
     usb_setup_t setup;
@@ -847,8 +855,9 @@ static void enumerate_port(xhci_hc_t *hc, int port)
 
         /* Build Evaluate Context input */
         uint32_t eval_ctx_total = hc->ctx_size * 33;
-        void *eval_ctx = mem_alloc_aligned(eval_ctx_total, 4096);
-        if (eval_ctx) {
+        void *eval_ctx_phys = mem_alloc_aligned(eval_ctx_total, 4096);
+        if (eval_ctx_phys) {
+            void *eval_ctx = PHYS_TO_VIRT(eval_ctx_phys);
             memset(eval_ctx, 0, eval_ctx_total);
 
             /* Input Control Context: evaluate EP0 (bit 1) */
@@ -863,7 +872,7 @@ static void enumerate_port(xhci_hc_t *hc, int port)
                                (EP_TYPE_CONTROL << 3) |
                                ((uint32_t)actual_mps << 16);
             /* Must also set tr_dequeue — copy from current state */
-            eval_ep0->tr_dequeue = (uint64_t)dev->ep0_ring |
+            eval_ep0->tr_dequeue = dev->ep0_ring_phys |
                                    (dev->ep0_cycle ? 1 : 0);
             /* Re-read dequeue from output context if available */
             xhci_ep_ctx_t *out_ep0 =
@@ -873,7 +882,7 @@ static void enumerate_port(xhci_hc_t *hc, int port)
 
             xhci_trb_t eval_cmd;
             memset(&eval_cmd, 0, sizeof(eval_cmd));
-            eval_cmd.param = (uint64_t)eval_ctx;
+            eval_cmd.param = (uint64_t)eval_ctx_phys;
             eval_cmd.control = XHCI_TRB_TYPE(TRB_EVALUATE_CONTEXT) |
                                ((uint32_t)slot_id << 24);
 
@@ -1054,9 +1063,11 @@ static void enumerate_port(xhci_hc_t *hc, int port)
     uint8_t ep_dci = ep_num * 2 + 1; /* IN endpoint DCI */
 
     /* Allocate interrupt transfer ring */
-    dev->int_ring = (xhci_trb_t *)mem_alloc_aligned(
+    void *int_ring_phys = mem_alloc_aligned(
         XHCI_XFER_RING_SIZE * sizeof(xhci_trb_t), 4096);
-    if (!dev->int_ring) return;
+    if (!int_ring_phys) return;
+    dev->int_ring = (xhci_trb_t *)PHYS_TO_VIRT(int_ring_phys);
+    dev->int_ring_phys = (uint64_t)int_ring_phys;
     memset(dev->int_ring, 0, XHCI_XFER_RING_SIZE * sizeof(xhci_trb_t));
     dev->int_enq = 0;
     dev->int_cycle = 1;
@@ -1064,8 +1075,10 @@ static void enumerate_port(xhci_hc_t *hc, int port)
     dev->int_max_pkt = int_max_pkt_found;
 
     /* Allocate report buffer */
-    dev->report_buf = (uint8_t *)mem_alloc_aligned(int_max_pkt_found, 64);
-    if (!dev->report_buf) return;
+    void *report_buf_phys = mem_alloc_aligned(int_max_pkt_found, 64);
+    if (!report_buf_phys) return;
+    dev->report_buf = (uint8_t *)PHYS_TO_VIRT(report_buf_phys);
+    dev->report_buf_phys = (uint64_t)report_buf_phys;
     memset(dev->report_buf, 0, int_max_pkt_found);
 
     /* Build Input Context for Configure Endpoint */
@@ -1106,12 +1119,12 @@ static void enumerate_port(xhci_hc_t *hc, int port)
     int_ep->field2 = (3 << 1) | /* CErr = 3 */
                      (EP_TYPE_INTERRUPT_IN << 3) |
                      ((uint32_t)int_max_pkt_found << 16);
-    int_ep->tr_dequeue = (uint64_t)dev->int_ring | 1; /* DCS = 1 */
+    int_ep->tr_dequeue = dev->int_ring_phys | 1; /* DCS = 1 */
     int_ep->field4 = int_max_pkt_found; /* Average TRB length */
 
     /* Submit Configure Endpoint command */
     memset(&cmd, 0, sizeof(cmd));
-    cmd.param = (uint64_t)in_ctx;
+    cmd.param = (uint64_t)in_ctx_phys;
     cmd.control = XHCI_TRB_TYPE(TRB_CONFIGURE_ENDPOINT) |
                   ((uint32_t)slot_id << 24);
 
@@ -1127,7 +1140,7 @@ static void enumerate_port(xhci_hc_t *hc, int port)
     /* ── Submit initial interrupt IN TRBs ── */
     for (int i = 0; i < 4; i++) {
         uint32_t ei2 = dev->int_enq;
-        dev->int_ring[ei2].param = (uint64_t)dev->report_buf;
+        dev->int_ring[ei2].param = dev->report_buf_phys;
         dev->int_ring[ei2].status = int_max_pkt_found;
         dev->int_ring[ei2].control =
             XHCI_TRB_TYPE(TRB_NORMAL) | TRB_IOC |
@@ -1136,7 +1149,7 @@ static void enumerate_port(xhci_hc_t *hc, int port)
 
         dev->int_enq++;
         if (dev->int_enq >= XHCI_XFER_RING_SIZE - 1) {
-            dev->int_ring[dev->int_enq].param = (uint64_t)dev->int_ring;
+            dev->int_ring[dev->int_enq].param = dev->int_ring_phys;
             dev->int_ring[dev->int_enq].status = 0;
             dev->int_ring[dev->int_enq].control =
                 XHCI_TRB_TYPE(TRB_LINK) | TRB_TC |
@@ -1311,8 +1324,10 @@ int xhci_init(uint64_t bar0_phys, uint8_t bus, uint8_t dev, uint8_t func)
 
     /* ── Allocate DCBAA ── */
     uint32_t dcbaa_size = (hc->max_slots + 1) * 8;
-    hc->dcbaa = (uint64_t *)mem_alloc_aligned(dcbaa_size, 4096);
-    if (!hc->dcbaa) return -1;
+    void *dcbaa_phys = mem_alloc_aligned(dcbaa_size, 4096);
+    if (!dcbaa_phys) return -1;
+    hc->dcbaa = (uint64_t *)PHYS_TO_VIRT(dcbaa_phys);
+    hc->dcbaa_phys = (uint64_t)dcbaa_phys;
     memset(hc->dcbaa, 0, dcbaa_size);
 
     /* ── Scratchpad Buffers ── */
@@ -1325,49 +1340,55 @@ int xhci_init(uint64_t bar0_phys, uint8_t bus, uint8_t dev, uint8_t func)
         serial_putdec(scratch_count);
         serial_puts(" scratchpad buffers\n");
 
-        hc->scratchpad = (uint64_t *)mem_alloc_aligned(scratch_count * 8, 4096);
-        if (!hc->scratchpad) return -1;
+        void *scratchpad_phys = mem_alloc_aligned(scratch_count * 8, 4096);
+        if (!scratchpad_phys) return -1;
+        hc->scratchpad = (uint64_t *)PHYS_TO_VIRT(scratchpad_phys);
 
         for (uint32_t i = 0; i < scratch_count; i++) {
-            void *page = mem_alloc_aligned(4096, 4096);
-            if (!page) return -1;
-            memset(page, 0, 4096);
-            hc->scratchpad[i] = (uint64_t)page;
+            void *page_phys = mem_alloc_aligned(4096, 4096);
+            if (!page_phys) return -1;
+            memset(PHYS_TO_VIRT(page_phys), 0, 4096);
+            hc->scratchpad[i] = (uint64_t)page_phys;
         }
-        hc->dcbaa[0] = (uint64_t)hc->scratchpad;
+        hc->dcbaa[0] = (uint64_t)scratchpad_phys;
     }
 
-    op_write64(hc, XHCI_OP_DCBAAP, (uint64_t)hc->dcbaa);
+    op_write64(hc, XHCI_OP_DCBAAP, (uint64_t)dcbaa_phys);
 
     /* ── Command Ring ── */
     uint32_t cmd_bytes = XHCI_CMD_RING_SIZE * sizeof(xhci_trb_t);
-    hc->cmd_ring = (xhci_trb_t *)mem_alloc_aligned(cmd_bytes, 4096);
-    if (!hc->cmd_ring) return -1;
+    void *cmd_ring_phys = mem_alloc_aligned(cmd_bytes, 4096);
+    if (!cmd_ring_phys) return -1;
+    hc->cmd_ring = (xhci_trb_t *)PHYS_TO_VIRT(cmd_ring_phys);
+    hc->cmd_ring_phys = (uint64_t)cmd_ring_phys;
     memset(hc->cmd_ring, 0, cmd_bytes);
     hc->cmd_enq = 0;
     hc->cmd_cycle = 1;
 
-    op_write64(hc, XHCI_OP_CRCR, (uint64_t)hc->cmd_ring | 1); /* RCS=1 matches cmd_cycle=1 */
+    op_write64(hc, XHCI_OP_CRCR, hc->cmd_ring_phys | 1); /* RCS=1 matches cmd_cycle=1 */
 
     /* ── Event Ring ── */
     uint32_t evt_bytes = XHCI_EVT_RING_SIZE * sizeof(xhci_trb_t);
-    hc->evt_ring = (xhci_trb_t *)mem_alloc_aligned(evt_bytes, 4096);
-    if (!hc->evt_ring) return -1;
+    void *evt_ring_phys = mem_alloc_aligned(evt_bytes, 4096);
+    if (!evt_ring_phys) return -1;
+    hc->evt_ring = (xhci_trb_t *)PHYS_TO_VIRT(evt_ring_phys);
+    hc->evt_ring_phys = (uint64_t)evt_ring_phys;
     memset(hc->evt_ring, 0, evt_bytes);
     hc->evt_deq = 0;
     hc->evt_cycle = 1;
 
-    hc->erst = (xhci_erste_t *)mem_alloc_aligned(sizeof(xhci_erste_t), 64);
-    if (!hc->erst) return -1;
-    hc->erst->ring_base = (uint64_t)hc->evt_ring;
+    void *erst_phys = mem_alloc_aligned(sizeof(xhci_erste_t), 64);
+    if (!erst_phys) return -1;
+    hc->erst = (xhci_erste_t *)PHYS_TO_VIRT(erst_phys);
+    hc->erst->ring_base = (uint64_t)evt_ring_phys;
     hc->erst->ring_size = XHCI_EVT_RING_SIZE;
     hc->erst->reserved = 0;
 
     /* Configure interrupter 0 */
     uint32_t ir0 = XHCI_RT_IR0;
     rt_write(hc, ir0 + XHCI_IR_ERSTSZ, 1);
-    rt_write64(hc, ir0 + XHCI_IR_ERDP, (uint64_t)hc->evt_ring | (1 << 3));
-    rt_write64(hc, ir0 + XHCI_IR_ERSTBA, (uint64_t)hc->erst);
+    rt_write64(hc, ir0 + XHCI_IR_ERDP, (uint64_t)evt_ring_phys | (1 << 3));
+    rt_write64(hc, ir0 + XHCI_IR_ERSTBA, (uint64_t)erst_phys);
 
     /* Interrupter: MUST enable IE (IMAN bit 1) and INTE (USBCMD bit 2).
      * AMD xHCI controllers on real hardware require the interrupter to be
@@ -1441,7 +1462,7 @@ int xhci_init(uint64_t bar0_phys, uint8_t bus, uint8_t dev, uint8_t func)
             hc->evt_deq = 0;
             hc->evt_cycle ^= 1;
         }
-        uint64_t erdp = (uint64_t)&hc->evt_ring[hc->evt_deq] | (1 << 3);
+        uint64_t erdp = (hc->evt_ring_phys + hc->evt_deq * sizeof(xhci_trb_t)) | (1 << 3);
         rt_write64(hc, XHCI_RT_IR0 + XHCI_IR_ERDP, erdp);
     }
 

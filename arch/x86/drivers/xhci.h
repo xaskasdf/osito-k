@@ -216,16 +216,20 @@ typedef struct {
     uint8_t  speed;
     bool     addressed;
 
-    /* Output context (written by HC) */
+    /* Output context (written by HC). Both views: virt for kernel CPU
+     * access, phys for the value the controller stores in DCBAA. */
     void    *output_ctx;
+    uint64_t output_ctx_phys;
 
     /* EP0 transfer ring */
     xhci_trb_t *ep0_ring;
+    uint64_t    ep0_ring_phys;
     uint32_t    ep0_enq;
     uint8_t     ep0_cycle;
 
     /* Interrupt IN ring (HID) */
     xhci_trb_t *int_ring;
+    uint64_t    int_ring_phys;
     uint32_t    int_enq;
     uint8_t     int_cycle;
     uint8_t     int_ep_dci;     /* Device Context Index */
@@ -234,6 +238,7 @@ typedef struct {
 
     /* HID report DMA buffer */
     uint8_t    *report_buf;
+    uint64_t    report_buf_phys;
 
     /* HID type: 1 = keyboard, 2 = mouse */
     uint8_t     hid_protocol;
@@ -256,13 +261,16 @@ typedef struct {
     uint32_t ctx_size;         /* 32 or 64 */
 
     uint64_t *dcbaa;
+    uint64_t  dcbaa_phys;
     uint64_t *scratchpad;
 
     xhci_trb_t  *cmd_ring;
+    uint64_t     cmd_ring_phys;
     uint32_t     cmd_enq;
     uint8_t      cmd_cycle;
 
     xhci_trb_t  *evt_ring;
+    uint64_t     evt_ring_phys;
     xhci_erste_t *erst;
     uint32_t     evt_deq;
     uint8_t      evt_cycle;
