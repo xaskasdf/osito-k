@@ -290,9 +290,9 @@ Per-process page tables (un CR3 por proceso):
   - `heap.c` — commit `65820fc`: todo el heap kernel vive en upper-half
     (`[HEAP] Heap at 0xFFFF800001401000`).
   - `paging.c` — commit `14b1d5b`: NULL guard y COW copy usan la mirror.
-  - `syscall.c` — commit `e8ecea7`: `sys_mmap` MAP_ANON, `sys_mprotect`
-    PROT_NONE→RW, y `demand_page_fault` hacen memset/vfs_read vía
-    upper-half; el phys sigue siendo lo que se instala en el PTE user.
+  - `syscall.c` — commit `e8ecea7`: `sys_mprotect` PROT_NONE→RW y
+    `demand_page_fault` hacen memset/vfs_read vía upper-half; el phys
+    sigue siendo lo que se instala en el PTE user.
   - `main.c` — commit `40fcbb9`: shadow framebuffer (4 MB) en upper-half,
     `fb_enable_shadow(PHYS_TO_VIRT(shadow_phys))`.
   - `inference.c` — commit `5fedcef`: LLaMA state (layer table, kv
@@ -303,13 +303,38 @@ Per-process page tables (un CR3 por proceso):
   - `win32/dllloader.c` — commit `1f29896`: buffer temporal para leer
     PE de disco; `dll_load` parsea headers y mapea segmentos PE32
     aparte, así que el buffer sólo vive kernel-side.
-- **Pendientes identificados y aún en identity map**: drivers (NVMe,
-  xHCI, i211, GPU, virtio), Win32 compat thunk pool (`compat32.c`),
-  thread stacks (`ntprocess.c`), ddraw framebuffer y surfaces
-  (`ddraw_shim.c` — el proxy COM PE32 NO debe migrar), `sys_mmap` user
-  return VA (requiere proper user VA allocator antes de mover).
+  - **`syscall.c sys_mmap` — commit `74b074d`**: deja de devolver
+    phys-as-VA. Reserva una VA de un pool compartido (≥ 20 GB) y crea
+    una VMA sin páginas; `demand_page_fault` aloca la phys en el
+    primer acceso y la instala en el PML4 del proceso via
+    `paging_map_page_in_cr3`. Unifica PROT_NONE y PROT_READ|WRITE en
+    un único path lazy. Último caller que usaba la identity map como
+    "VA allocator" para user space.
+  - `drivers/gpu.c` VBIOS — commit `894bae4`: 256 KB scratch buffer
+    parseado CPU-side. Único sitio migrable de todos los drivers
+    (ver abajo).
+
+**Driver audit (2026-04-12)**: 50+ sitios `mem_alloc_pages`/
+`mem_alloc_aligned` en `drivers/` (NVMe, xHCI, i211, GSP, virtio,
+hda, usb_storage, gpu_tensor, sass, gmmu). **Todos son DMA** y
+deben permanecer en phys para que los dispositivos puedan
+dereferenciarlos (descriptor rings, command queues, packet buffers,
+GPU MMU radix3, firmware pushbuffers, etc.). Único caller kernel-CPU-
+only: el buffer de parseo de VBIOS en `gpu.c` — migrado. Los drivers
+NO bloquean la eventual eliminación del identity map del PML4 de
+user processes.
+
+**Pendientes aún en identity map (no-driver)**: Win32 compat thunk
+pool (`compat32.c`), thread stacks (`ntprocess.c`), ddraw framebuffer
+y surfaces (`ddraw_shim.c` — el proxy COM PE32 NO debe migrar). Sin
+regression test de PE binaries, quedan diferidos.
+
 - El resto del kernel sigue funcionando via identity map lower-half;
-  cada subsistema se migra cuando le toca.
+  el kernel text todavía corre ahí y los drivers todavía acceden sus
+  DMA buffers por su phys vía identity. Para quitar el identity map
+  del PML4 de user processes se necesita primero decidir cómo el
+  kernel accede a sus DMA buffers cuando corre en contexto user
+  (CR3 switch en syscall entry vs relocar kernel text al upper-half).
 
 **Fase 1: Higher-half kernel mapping ✅ DONE (2026-04-12)**
 - `paging_init()` instala un segundo mapeo del total de RAM a
