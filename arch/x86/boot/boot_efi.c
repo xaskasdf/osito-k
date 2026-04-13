@@ -430,6 +430,62 @@ efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable)
     for (UINT32 i = 0; i < gop_mode_count; i++)
         info.display_modes[i] = gop_modes[i];
 
+    /* Step 5.5: Build a new PML4 that clones UEFI's mappings and adds
+     * an upper-half direct map at 0xFFFF800000000000+ so the relocated
+     * kernel can be entered at VA = KERNEL_VBASE + phys.
+     *
+     * We cannot patch UEFI's PML4 in place — it is marked read-only in
+     * UEFI's own tables — so we allocate our own PML4 page, copy the
+     * 512 entries, append PML4[256] → new PDPT (1GB huge pages 0..16 GB),
+     * and switch CR3.
+     *
+     * This is a preparatory no-op as long as kernel_entry_addr still
+     * points to the lower half; once kernel.ld relocates, the jump
+     * below lands on the new PML4[256] entry and this path becomes
+     * load-bearing. The kernel's own paging_init builds an equivalent
+     * mirror (Fase 1) in its replacement CR3, so the handoff is
+     * seamless. */
+    {
+        UINT64 old_cr3;
+        __asm__ volatile ("mov %%cr3, %0" : "=r"(old_cr3));
+        UINT64 *old_pml4 = (UINT64 *)(old_cr3 & ~0xFFFULL);
+
+        EFI_PHYSICAL_ADDRESS my_pml4_phys = 0;
+        EFI_STATUS st = uefi_call_wrapper(BS->AllocatePages, 4,
+                                          AllocateAnyPages, EfiLoaderData,
+                                          1, &my_pml4_phys);
+        if (EFI_ERROR(st)) {
+            Print(L"FATAL: AllocatePages PML4 failed: %r\r\n", st);
+            goto halt;
+        }
+
+        EFI_PHYSICAL_ADDRESS pdpt_phys = 0;
+        st = uefi_call_wrapper(BS->AllocatePages, 4,
+                               AllocateAnyPages, EfiLoaderData,
+                               1, &pdpt_phys);
+        if (EFI_ERROR(st)) {
+            Print(L"FATAL: AllocatePages PDPT failed: %r\r\n", st);
+            goto halt;
+        }
+
+        UINT64 *my_pml4 = (UINT64 *)my_pml4_phys;
+        UINT64 *pdpt    = (UINT64 *)pdpt_phys;
+
+        for (int i = 0; i < 512; i++) my_pml4[i] = old_pml4[i];
+
+        for (int i = 0; i < 512; i++) pdpt[i] = 0;
+        /* 1GB huge pages covering 0..16 GB. PRESENT | WRITABLE | PS. */
+        for (int gb = 0; gb < 16; gb++)
+            pdpt[gb] = ((UINT64)gb << 30) | 0x83;
+
+        my_pml4[256] = pdpt_phys | 0x3; /* PRESENT | WRITABLE */
+
+        __asm__ volatile ("mov %0, %%cr3" : : "r"(my_pml4_phys) : "memory");
+
+        Print(L"Upper-half PML4[256] -> PDPT 0x%lx (16 GB) via new PML4 0x%lx\r\n",
+              pdpt_phys, my_pml4_phys);
+    }
+
     Print(L"\r\nExiting boot services...\r\n");
 
     /* Step 6: ExitBootServices — point of no return */
