@@ -330,11 +330,30 @@ y surfaces (`ddraw_shim.c` — el proxy COM PE32 NO debe migrar). Sin
 regression test de PE binaries, quedan diferidos.
 
 - El resto del kernel sigue funcionando via identity map lower-half;
-  el kernel text todavía corre ahí y los drivers todavía acceden sus
-  DMA buffers por su phys vía identity. Para quitar el identity map
-  del PML4 de user processes se necesita primero decidir cómo el
-  kernel accede a sus DMA buffers cuando corre en contexto user
-  (CR3 switch en syscall entry vs relocar kernel text al upper-half).
+  los drivers todavía acceden sus DMA buffers por su phys vía identity.
+
+**Kernel text relocation (Option C) ✅ DONE (2026-04-13)**
+
+- `boot.efi` (commit `ab9d59d`): antes de `ExitBootServices` clona la
+  PML4 de UEFI (que es read-only en sus propias tablas), añade
+  `PML4[256] -> PDPT` con páginas 1GB cubriendo 0..16 GB del upper-half
+  direct map, y switchea CR3 a la nueva PML4. El kernel ahora puede
+  saltar a una entry high desde UEFI.
+- `kernel.ld` + `Makefile` (commit `cd1c2a1`): kernel text/rodata/
+  data/bss linkados a `VMA = KERNEL_VBASE + 0x2000000` con
+  `AT(ADDR(...) - KERNEL_VBASE)` para que `p_paddr` siga siendo low.
+  ELF entry pasa a `0xFFFF8000020007F0`. Compilación con
+  `-mcmodel=large` (32-bit displacements no caben en VAs upper-half;
+  ~17% slower hot loops, aceptable para esta fase).
+- El kernel sigue corriendo el lower-half identity map en `kernel_pml4`
+  por compatibilidad con paging code que dereferencia phys-as-virt y
+  con drivers que tocan DMA buffers via phys. La eliminación final del
+  identity map es un paso futuro independiente.
+
+**Pendientes aún en identity map (no-driver)**: Win32 compat thunk
+pool (`compat32.c`), thread stacks (`ntprocess.c`), ddraw framebuffer
+y surfaces (`ddraw_shim.c` — el proxy COM PE32 NO debe migrar). Sin
+regression test de PE binaries, quedan diferidos.
 
 **Fase 1: Higher-half kernel mapping ✅ DONE (2026-04-12)**
 - `paging_init()` instala un segundo mapeo del total de RAM a
