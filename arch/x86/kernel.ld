@@ -1,36 +1,45 @@
 /*
- * OsitoK x86-64 Kernel Linker Script
+ * OsitoK x86-64 Kernel Linker Script — higher-half kernel
  *
- * Kernel loaded at 2MB by boot.efi (ELF PT_LOAD segments).
- * No EFI restrictions — no PIE, no objcopy PE32+, jump tables OK.
+ * Kernel loaded by boot.efi at LMA 0x2000000 (32 MB phys), but linked
+ * to run at VMA = KERNEL_VBASE + LMA so all symbol references resolve
+ * to the upper half. boot.efi installs an upper-half direct map in its
+ * PML4 before ExitBootServices so the high entry point is reachable
+ * through the PE32 entry symbol; once paging_init runs, the kernel's
+ * own kernel_pml4 (Fase 1 mirror) takes over.
+ *
+ * KERNEL_VBASE = 0xFFFF800000000000 (must match arch/x86/include/paging.h).
  */
 
 OUTPUT_FORMAT("elf64-x86-64")
 ENTRY(kernel_entry)
 
+KERNEL_VBASE = 0xFFFF800000000000;
+KERNEL_LMA   = 0x2000000;       /* 32MB — above OVMF reserved regions */
+
 SECTIONS
 {
-    . = 0x2000000;  /* 32MB — above OVMF reserved regions (16MB occupied in QEMU) */
+    . = KERNEL_VBASE + KERNEL_LMA;
 
-    .text : ALIGN(4096) {
+    .text : AT(ADDR(.text) - KERNEL_VBASE) ALIGN(4096) {
         __text_start = .;
         *(.text .text.*)
         __text_end = .;
     }
 
-    .rodata : ALIGN(4096) {
+    .rodata : AT(ADDR(.rodata) - KERNEL_VBASE) ALIGN(4096) {
         __rodata_start = .;
         *(.rodata .rodata.*)
         __rodata_end = .;
     }
 
-    .data : ALIGN(4096) {
+    .data : AT(ADDR(.data) - KERNEL_VBASE) ALIGN(4096) {
         __data_start = .;
         *(.data .data.*)
         __data_end = .;
     }
 
-    .bss : ALIGN(4096) {
+    .bss : AT(ADDR(.bss) - KERNEL_VBASE) ALIGN(4096) {
         __bss_start = .;
         *(.bss .bss.*)
         *(COMMON)

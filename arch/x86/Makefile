@@ -33,6 +33,7 @@ BFLAGS   = -ffreestanding -fno-stack-protector -fshort-wchar \
 
 # Kernel flags — NO PIE, NO -fno-jump-tables (EFI restrictions lifted!)
 KCFLAGS  = -std=c11 -ffreestanding -fno-stack-protector -mno-red-zone \
+           -mcmodel=large \
            -Wall -Wextra -O2 -fno-pie -Iinclude -I../../include/common \
            -I../../gui -D__KERNEL_X86__=1 -MMD -MP
 
