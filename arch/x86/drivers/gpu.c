@@ -9,6 +9,7 @@
  */
 
 #include "../include/types.h"
+#include "../include/paging.h"
 #include "gpu.h"
 
 /* ── External Functions ──────────────────────────────────────── */
@@ -500,12 +501,17 @@ int gpu_read_vbios(void)
 
     serial_puts("[GPU] VBIOS: reading via PRAMIN...\n");
 
-    /* Allocate 256KB buffer */
-    vbios.data = (uint8_t *)mem_alloc_aligned(VBIOS_MAX_SIZE, 4096);
-    if (!vbios.data) {
+    /* Allocate 256KB buffer. Kernel-side scratch: the VBIOS image is
+     * parsed by CPU here (`fw->data` in gsp.c walks it and memcpy's
+     * the relevant segments into a separate DMA buffer), never handed
+     * to the GPU directly, so it lives happily in the upper-half
+     * mirror. */
+    void *vbios_phys = mem_alloc_aligned(VBIOS_MAX_SIZE, 4096);
+    if (!vbios_phys) {
         serial_puts("[GPU] VBIOS: failed to allocate 256KB buffer\n");
         return -1;
     }
+    vbios.data = (uint8_t *)PHYS_TO_VIRT(vbios_phys);
     memset(vbios.data, 0, VBIOS_MAX_SIZE);
 
     /* Save original PRAMIN window */
