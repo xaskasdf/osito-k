@@ -2225,7 +2225,7 @@ static void shell_exec(char *line)
             extern int win32_exec(const char *filename);
             extern int  kern_setjmp(uint64_t *buf) __attribute__((returns_twice));
             extern uint64_t *compat32_crash_jmpbuf;
-            static uint64_t winexec_jmpbuf[8];
+            static uint64_t winexec_jmpbuf[9];
             compat32_crash_jmpbuf = winexec_jmpbuf;
             if (kern_setjmp(winexec_jmpbuf) == 0) {
                 win32_exec(argv[1]);

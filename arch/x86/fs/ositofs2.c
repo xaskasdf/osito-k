@@ -11,6 +11,7 @@
  */
 
 #include "../include/types.h"
+#include "../include/paging.h"
 #include "../../../include/common/ositofs2_format.h"
 
 /* ── Declarations ────────────────────────────────────────────── */
@@ -288,12 +289,15 @@ superblock_ok:
     serial_putdec(blk_size);
     serial_puts("\n");
 
-    /* Read file table (1MB at fixed offset) */
-    file_table = (osfs2_file_t *)mem_alloc_aligned(OSFS2_FILETAB_SIZE, 4096);
-    if (!file_table) {
+    /* Read file table (1MB at fixed offset). Stored as upper-half virt
+     * so it stays reachable after the lower-half identity map is gone
+     * from user PML4s. */
+    void *ft_phys = mem_alloc_aligned(OSFS2_FILETAB_SIZE, 4096);
+    if (!ft_phys) {
         serial_puts("[OsitoFS] Failed to allocate file table\n");
         return -1;
     }
+    file_table = (osfs2_file_t *)PHYS_TO_VIRT(ft_phys);
 
     if (osfs2_part_read(OSFS2_FILETAB_OFF, file_table, OSFS2_FILETAB_SIZE) < 0) {
         serial_puts("[OsitoFS] Failed to read file table\n");
@@ -301,11 +305,12 @@ superblock_ok:
     }
 
     /* Read block CRC table (1MB at fixed offset) */
-    crc_table = (uint32_t *)mem_alloc_aligned(OSFS2_CRCTAB_SIZE, 4096);
-    if (crc_table) {
+    void *crc_phys = mem_alloc_aligned(OSFS2_CRCTAB_SIZE, 4096);
+    if (crc_phys) {
+        crc_table = (uint32_t *)PHYS_TO_VIRT(crc_phys);
         if (osfs2_part_read(OSFS2_CRCTAB_OFF, crc_table, OSFS2_CRCTAB_SIZE) < 0) {
             serial_puts("[OsitoFS] CRC table read failed (verification disabled)\n");
-            mem_free_pages(crc_table, OSFS2_CRCTAB_SIZE / 4096);
+            mem_free_pages(crc_phys, OSFS2_CRCTAB_SIZE / 4096);
             crc_table = NULL;
         }
     }
@@ -543,8 +548,9 @@ int osfs2_read_verified(osfs2_file_t *file, uint64_t offset, void *buf, uint64_t
     uint64_t remaining = len;
 
     /* Temporary block buffer for CRC verification */
-    void *blk_buf = mem_alloc_aligned(blk_size, 4096);
-    if (!blk_buf) return osfs2_read(file, offset, buf, len);
+    void *blk_phys = mem_alloc_aligned(blk_size, 4096);
+    if (!blk_phys) return osfs2_read(file, offset, buf, len);
+    void *blk_buf = PHYS_TO_VIRT(blk_phys);
 
     while (remaining > 0) {
         uint32_t blk_idx = (uint32_t)(pos >> blk_shift);
@@ -552,7 +558,7 @@ int osfs2_read_verified(osfs2_file_t *file, uint64_t offset, void *buf, uint64_t
         uint32_t abs_block = file->start_block + blk_idx;
 
         if (osfs2_read_block_data(abs_block, blk_buf) < 0) {
-            mem_free_pages(blk_buf, blk_size / 4096);
+            mem_free_pages(blk_phys, blk_size / 4096);
             return -1;
         }
 
@@ -563,7 +569,7 @@ int osfs2_read_verified(osfs2_file_t *file, uint64_t offset, void *buf, uint64_t
                 serial_puts("[OsitoFS] CRC MISMATCH block ");
                 serial_putdec(abs_block);
                 serial_puts("\n");
-                mem_free_pages(blk_buf, blk_size / 4096);
+                mem_free_pages(blk_phys, blk_size / 4096);
                 return -2;
             }
         }
@@ -577,7 +583,7 @@ int osfs2_read_verified(osfs2_file_t *file, uint64_t offset, void *buf, uint64_t
         remaining -= chunk;
     }
 
-    mem_free_pages(blk_buf, blk_size / 4096);
+    mem_free_pages(blk_phys, blk_size / 4096);
     return (int)len;
 }
 

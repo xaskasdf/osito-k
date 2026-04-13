@@ -638,17 +638,29 @@ static void elf_jump(uint64_t entry, uint64_t sp)
     serial_puthex(sp, 16);
     serial_puts("\n");
 
-    /*
-     * Set up stack pointer and jump to ELF entry.
-     * The entry point expects:
-     *   RSP → argc, argv[0], ..., argv[n-1], NULL, envp[0], ..., NULL
-     * We call it like a regular function but with RSP set to our stack.
-     */
+    /* Switch CR3 to the new process and jump in one asm block. After
+     * the CR3 switch the lower-half boot kernel stack is no longer
+     * mapped, so we must NOT touch the C stack until the asm has
+     * loaded the new RSP. The asm does:
+     *   mov new_cr3, %cr3   ;; switch address space
+     *   mov sp, %rsp        ;; switch to user stack (upper-half)
+     *   xor %rbp, %rbp
+     *   jmp *entry          ;; into user code
+     * The instruction fetches between mov %cr3 and jmp succeed because
+     * kernel text lives at the upper-half mirror (PML4[256], shared
+     * across all CR3s). */
+    extern uint64_t proc_current_cr3(void);
+    uint64_t pcr3 = proc_current_cr3();
+
     __asm__ volatile (
+        "test %2, %2\n"
+        "jz   1f\n"
+        "mov  %2, %%cr3\n"
+        "1:\n"
         "mov %0, %%rsp\n"
-        "xor %%rbp, %%rbp\n"  /* Clear frame pointer */
+        "xor %%rbp, %%rbp\n"
         "jmp *%1\n"
-        : : "r"(sp), "r"(entry)
+        : : "r"(sp), "r"(entry), "r"(pcr3)
         : "memory"
     );
 

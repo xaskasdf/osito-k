@@ -5,6 +5,7 @@
  */
 
 #include "../include/types.h"
+#include "../include/paging.h"
 #include "../../../include/common/ositofs3_format.h"
 
 /* ── External Declarations ──────────────────────────────────── */
@@ -60,12 +61,13 @@ static uint32_t osfs3_find_in_dir(uint32_t dir_ino, const char *name)
 
     /* Use a smaller, stack-allocated or reusable buffer if possible. 
      * For now, let's keep the allocation but ensure it's handled carefully. */
-    void *blk = mem_alloc_aligned(4096, 4096); /* Read only the first 4KB of dentry data */
-    if (!blk) return 0;
+    void *blk_phys = mem_alloc_aligned(4096, 4096); /* Read only the first 4KB of dentry data */
+    if (!blk_phys) return 0;
+    void *blk = PHYS_TO_VIRT(blk_phys);
 
     /* Most directories fit in the first 4KB */
     if (osfs3_part_read((uint64_t)dir->extents[0].start_block << OSFS3_BLOCK_SHIFT, blk, 4096) < 0) {
-        mem_free_pages(blk, 1);
+        mem_free_pages(blk_phys, 1);
         return 0;
     }
 
@@ -89,7 +91,7 @@ static uint32_t osfs3_find_in_dir(uint32_t dir_ino, const char *name)
         de = (osfs3_dentry_t *)((char *)de + de->rec_len);
     }
 
-    mem_free_pages(blk, 1);
+    mem_free_pages(blk_phys, 1);
     return found_ino;
 }
 
@@ -145,10 +147,14 @@ int osfs3_mount(uint64_t part_offset)
         return -1;
     }
 
-    /* Load bitmaps and first inode block */
-    inode_bitmap = (uint8_t *)mem_alloc_aligned(OSFS3_BLOCK_SIZE, 4096);
-    block_bitmap = (uint8_t *)mem_alloc_aligned(OSFS3_BLOCK_SIZE, 4096);
-    inode_table  = (osfs3_inode_t *)mem_alloc_aligned(OSFS3_BLOCK_SIZE, 4096);
+    /* Load bitmaps and first inode block (upper-half virt for CPU access). */
+    void *ib_phys = mem_alloc_aligned(OSFS3_BLOCK_SIZE, 4096);
+    void *bb_phys = mem_alloc_aligned(OSFS3_BLOCK_SIZE, 4096);
+    void *it_phys = mem_alloc_aligned(OSFS3_BLOCK_SIZE, 4096);
+    if (!ib_phys || !bb_phys || !it_phys) return -1;
+    inode_bitmap = (uint8_t *)PHYS_TO_VIRT(ib_phys);
+    block_bitmap = (uint8_t *)PHYS_TO_VIRT(bb_phys);
+    inode_table  = (osfs3_inode_t *)PHYS_TO_VIRT(it_phys);
 
     if (osfs3_read_block(1, inode_bitmap) < 0 ||
         osfs3_read_block(2, block_bitmap) < 0 ||
@@ -199,11 +205,12 @@ void osfs3_list_dir(uint32_t dir_ino)
     osfs3_inode_t *dir = osfs3_get_inode(dir_ino);
     if (!dir || !(dir->mode & OSFS3_S_IFDIR)) return;
 
-    void *blk = mem_alloc_aligned(4096, 4096);
-    if (!blk) return;
+    void *blk_phys = mem_alloc_aligned(4096, 4096);
+    if (!blk_phys) return;
+    void *blk = PHYS_TO_VIRT(blk_phys);
 
     if (osfs3_part_read((uint64_t)dir->extents[0].start_block << OSFS3_BLOCK_SHIFT, blk, 4096) < 0) {
-        mem_free_pages(blk, 1);
+        mem_free_pages(blk_phys, 1);
         return;
     }
 
@@ -218,7 +225,7 @@ void osfs3_list_dir(uint32_t dir_ino)
             serial_puts("  ");
             if (ino && (ino->mode & OSFS3_S_IFDIR)) serial_puts("<DIR> ");
             else serial_puts("      ");
-            
+
             /* Print name */
             char name[OSFS3_NAME_MAX + 1];
             uint32_t nlen = de->name_len;
@@ -226,7 +233,7 @@ void osfs3_list_dir(uint32_t dir_ino)
             memcpy(name, de->name, nlen);
             name[nlen] = '\0';
             serial_puts(name);
-            
+
             if (ino) {
                 serial_puts("  size=");
                 serial_putdec(ino->size);
@@ -237,7 +244,7 @@ void osfs3_list_dir(uint32_t dir_ino)
         de = (osfs3_dentry_t *)((char *)de + de->rec_len);
     }
 
-    mem_free_pages(blk, 1);
+    mem_free_pages(blk_phys, 1);
 }
 
 uint64_t osfs3_get_size(uint32_t ino)

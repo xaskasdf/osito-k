@@ -10,6 +10,7 @@
  */
 
 #include "../include/types.h"
+#include "../include/paging.h"
 
 /* ── External functions ──────────────────────────────────────── */
 
@@ -752,8 +753,11 @@ void isr_handler(interrupt_frame_t *frame)
 
         /* IAT watchdog: restore Engine.dll StaticLoadClass on every tick.
          * The Unreal package loader overwrites this between INT 0x2E calls,
-         * so the compat32_dispatch guard alone isn't fast enough. */
-        {
+         * so the compat32_dispatch guard alone isn't fast enough. Only
+         * runs when a PE32 binary is loaded — without this gate the
+         * watchdog would touch unmapped low VA from any process CR3. */
+        extern int g_compat32_mode;
+        if (g_compat32_mode) {
             static uint32_t iat_orig = 0;
             volatile uint32_t *iat = (volatile uint32_t *)(uintptr_t)0x105A5E08;
             if (!iat_orig && *iat >= 0x10100000 && *iat < 0x10200000)
@@ -1626,7 +1630,13 @@ static void apic_init(void)
         wrmsr(APIC_BASE_MSR, apic_msr | APIC_BASE_ENABLE);
     }
 
-    apic_base = (volatile uint32_t *)apic_phys;
+    /* APIC MMIO via the upper-half mirror so reads/writes work from
+     * any process CR3. paging_init's first-4GB mirror covers this
+     * range; explicitly map as MMIO (uncacheable) just in case the
+     * mirror flags don't already include WT/CD. */
+    extern int paging_map_mmio(uint64_t phys, uint64_t size);
+    paging_map_mmio(apic_phys, 4096);
+    apic_base = (volatile uint32_t *)PHYS_TO_VIRT(apic_phys);
 
     serial_puts("[IDT] APIC base: 0x");
     serial_puthex(apic_phys, 16);

@@ -1188,7 +1188,9 @@ int xhci_init(uint64_t bar0_phys, uint8_t bus, uint8_t dev, uint8_t func)
 
     xhci_hc_t *hc = &hc_list[hc_count];
     memset(hc, 0, sizeof(*hc));
-    hc->base = (volatile void *)bar0_phys;
+    /* MMIO via the upper-half alias (PML4[256] is shared across all
+     * process CR3s once the lower-half identity map is dropped). */
+    hc->base = (volatile void *)PHYS_TO_VIRT(bar0_phys);
     hc->pci_bus = bus;
     hc->pci_dev = dev;
     hc->pci_func = func;

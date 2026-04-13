@@ -206,7 +206,9 @@ static int i211_setup_tx(void)
 int i211_init(uint64_t bar0_phys)
 {
     memset(&nic, 0, sizeof(nic));
-    nic.bar0 = (volatile void *)bar0_phys;
+    /* MMIO via the upper-half alias so register access works from
+     * any process CR3. */
+    nic.bar0 = (volatile void *)PHYS_TO_VIRT(bar0_phys);
 
     serial_puts("[I211] Initializing, BAR0=");
     serial_puthex(bar0_phys, 16);

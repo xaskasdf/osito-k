@@ -340,7 +340,10 @@ void kernel_entry(boot_info_t *info)
     enable_sse();
     serial_puts("\r\n[OsitoK] Serial initialized (COM1 115200)\r\n");
 
-    fb_init((uint32_t *)(uintptr_t)info->fb_base,
+    /* Map VRAM through the upper-half mirror so the fb driver can
+     * write pixels from any process's CR3 (PML4[256] is shared, the
+     * lower-half identity map is per-process). */
+    fb_init((uint32_t *)PHYS_TO_VIRT(info->fb_base),
             info->fb_width, info->fb_height, info->fb_pitch);
     fb_clear();
 

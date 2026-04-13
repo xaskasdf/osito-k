@@ -395,7 +395,12 @@ int paging_map_mmio(uint64_t phys, uint64_t size)
 {
     if (!kernel_pml4) return -1;
     uint64_t flags = PTE_PWT | PTE_PCD;  /* uncacheable */
+    /* Install at both the low identity VA (legacy callers that still
+     * dereference phys) and at the upper-half mirror (PML4[256], shared
+     * across every process's CR3 once the lower-half identity map is
+     * dropped from user PML4s). */
     paging_identity_map_range(phys, phys + size, flags);
+    paging_map_range_at(phys, phys + size, KERNEL_VBASE, flags);
     return 0;
 }
 
@@ -404,8 +409,13 @@ int paging_map_mmio(uint64_t phys, uint64_t size)
 int paging_map_wc(uint64_t phys, uint64_t size)
 {
     if (!kernel_pml4) return -1;
-    /* PWT=1, PCD=0, PAT=0 → selects PAT entry 1 = WC */
+    /* PWT=1, PCD=0, PAT=0 → selects PAT entry 1 = WC.
+     * Install at both the low-identity VA (legacy callers + drivers
+     * that haven't been migrated to PHYS_TO_VIRT) AND at the upper-
+     * half mirror VA so the mapping is reachable from any CR3 once
+     * the lower-half identity map disappears from user PML4s. */
     paging_identity_map_range(phys, phys + size, PTE_PWT);
+    paging_map_range_at(phys, phys + size, KERNEL_VBASE, PTE_PWT);
     return 0;
 }
 
@@ -644,49 +654,48 @@ void paging_init(void)
  * If the kernel PD entry is PRESENT, copies its 4KB page contents
  * (which contains 512 PD-level entries — large pages or PT pointers).
  * Returns the new PD page, or NULL on failure. */
-static uint64_t *clone_pd(uint64_t kernel_pd_entry)
+/* Recursively free the per-process lower-half page-table tree. Walks
+ * PDPT[0..511] and for each present PDPT entry walks its PD freeing
+ * any present PT pages, then the PD itself. The actual data pages
+ * (the things the PTEs map to) are NOT freed here — those belong to
+ * the VMA layer in syscall.c which has already cleaned them up by
+ * the time this runs from proc_free. */
+static void free_user_pdpt(uint64_t *pdpt)
 {
-    uint64_t *new_pd = pt_alloc_page();
-    if (!new_pd) return NULL;
-    if (kernel_pd_entry & PTE_PRESENT) {
-        uint64_t *src = (uint64_t *)PHYS_TO_VIRT(kernel_pd_entry & PTE_ADDR_MASK);
-        memcpy(new_pd, src, PAGE_SIZE);
+    for (int i = 0; i < 512; i++) {
+        if (!(pdpt[i] & PTE_PRESENT)) continue;
+        if (pdpt[i] & PTE_LARGE) continue;  /* 1GB huge page — no PD */
+        uint64_t pd_phys = pdpt[i] & PTE_ADDR_MASK;
+        uint64_t *pd = (uint64_t *)PHYS_TO_VIRT(pd_phys);
+        for (int j = 0; j < 512; j++) {
+            if (!(pd[j] & PTE_PRESENT)) continue;
+            if (pd[j] & PTE_LARGE) continue;  /* 2MB large page — no PT */
+            uint64_t pt_phys = pd[j] & PTE_ADDR_MASK;
+            mem_free_pages((void *)pt_phys, 1);
+        }
+        mem_free_pages((void *)pd_phys, 1);
     }
-    return new_pd;
 }
 
 uint64_t paging_create_process_cr3(void)
 {
     if (!kernel_pml4) return 0;
 
-    /* New PML4 — copy kernel entries (shared by reference) */
+    /* New PML4 — copy kernel entries (shared by reference). The upper
+     * half (PML4[256+]) gives the process the kernel direct map and
+     * kernel text via shared upper PDPTs. The lower half (PML4[0]) is
+     * replaced below with an empty PDPT so user processes get a
+     * pristine lower-half address space with NO kernel identity map. */
     uint64_t *pml4 = pt_alloc_page();
     if (!pml4) return 0;
     memcpy(pml4, kernel_pml4, PAGE_SIZE);
 
-    /* New PDPT for PML4[0] — covers vaddr 0..512 GB.
-     * Process binaries typically load in 0x00000000..0x40000000
-     * (covered by PDPT[0] entries 0..0). Anything per-process must
-     * have its own PD here. */
-    uint64_t *kernel_pdpt = (uint64_t *)PHYS_TO_VIRT(kernel_pml4[0] & PTE_ADDR_MASK);
+    /* Empty PDPT for PML4[0]. ELF demand-paging and sys_mmap demand-
+     * fault install PD/PT/PTE entries via paging_map_4k_in as the
+     * process actually touches addresses. Until then the lower half
+     * is unmapped — accessing it triggers SIGSEGV semantics. */
     uint64_t *pdpt = pt_alloc_page();
     if (!pdpt) return 0;
-    for (int i = 0; i < 512; i++)
-        pdpt[i] = kernel_pdpt[i];
-
-    /* Own PD for PDPT[0] (0x00000000-0x3FFFFFFF — covers BIOS, kernel
-     * identity-map, and ELF binary load range). Required so that
-     * demand-paged ELF segments at e.g. 0x20000000 don't clobber
-     * sibling processes that also load there. */
-    uint64_t *pd0 = clone_pd(kernel_pdpt[0]);
-    if (!pd0) return 0;
-    pdpt[0] = (uint64_t)VIRT_TO_PHYS(pd0) | PTE_PRESENT | PTE_WRITABLE;
-
-    /* Own PD for PDPT[1] (0x40000000-0x7FFFFFFF — user mmap allocations) */
-    uint64_t *pd1 = clone_pd(kernel_pdpt[1]);
-    if (!pd1) return 0;
-    pdpt[1] = (uint64_t)VIRT_TO_PHYS(pd1) | PTE_PRESENT | PTE_WRITABLE;
-
     pml4[0] = (uint64_t)VIRT_TO_PHYS(pdpt) | PTE_PRESENT | PTE_WRITABLE;
 
     /* Return phys for the CR3 register */
@@ -702,22 +711,7 @@ void paging_free_process_cr3(uint64_t cr3)
     if (pml4[0] & PTE_PRESENT) {
         uint64_t pdpt_phys = pml4[0] & PTE_ADDR_MASK;
         uint64_t *pdpt = (uint64_t *)PHYS_TO_VIRT(pdpt_phys);
-        /* Free PDPT[0]'s private PD (BIOS / kernel id-map / ELF range) */
-        if (pdpt[0] & PTE_PRESENT) {
-            uint64_t pd0_phys = pdpt[0] & PTE_ADDR_MASK;
-            /* Only free if this PD is owned by the process (not the
-             * kernel's shared PD). Compare phys-to-phys. */
-            uint64_t *kpdpt = (uint64_t *)PHYS_TO_VIRT(kernel_pml4[0] & PTE_ADDR_MASK);
-            if (pd0_phys != (kpdpt[0] & PTE_ADDR_MASK))
-                mem_free_pages((void *)pd0_phys, 1);
-        }
-        /* Free PDPT[1]'s private PD */
-        if (pdpt[1] & PTE_PRESENT) {
-            uint64_t pd1_phys = pdpt[1] & PTE_ADDR_MASK;
-            uint64_t *kpdpt = (uint64_t *)PHYS_TO_VIRT(kernel_pml4[0] & PTE_ADDR_MASK);
-            if (pd1_phys != (kpdpt[1] & PTE_ADDR_MASK))
-                mem_free_pages((void *)pd1_phys, 1);
-        }
+        free_user_pdpt(pdpt);
         mem_free_pages((void *)pdpt_phys, 1);
     }
     mem_free_pages((void *)(cr3 & PTE_ADDR_MASK), 1);

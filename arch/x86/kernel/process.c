@@ -145,7 +145,7 @@ static uint32_t next_pid = 1;
 extern int  kern_setjmp(uint64_t *buf) __attribute__((returns_twice));
 extern void kern_longjmp(uint64_t *buf, int val);
 
-uint64_t exec_jmpbuf[8];   /* setjmp/longjmp buffer — non-static for win32_exec */
+uint64_t exec_jmpbuf[9];   /* setjmp/longjmp buffer — slot[8] holds saved CR3 */
 int32_t  last_exit_code;
 
 /* Target process for region registration during exec.
@@ -451,10 +451,14 @@ int proc_exec(const char *filename, int argc, const char **argv)
      * the kernel or sibling processes. */
     extern uint64_t paging_create_process_cr3(void);
     extern void     paging_switch(uint64_t cr3);
+    (void)paging_switch;  /* still referenced below for setjmp restore */
     uint64_t new_cr3 = paging_create_process_cr3();
     if (new_cr3) {
         p->cr3 = new_cr3;
-        paging_switch(new_cr3);  /* activate before elf_exec maps pages */
+        /* Don't activate the new CR3 yet — the kernel is still running
+         * on the boot kernel stack at low phys, which the user PML4
+         * deliberately does NOT map. elf_jump() switches CR3 right
+         * before jumping into the user binary. */
     }
 
     /* Set as current process and pin region registration target */

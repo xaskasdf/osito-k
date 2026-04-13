@@ -214,7 +214,10 @@ static int nvme_io_submit_wait(nvme_sqe_t *cmd)
 int nvme_init(uint64_t bar0_phys)
 {
     memset(&nvme, 0, sizeof(nvme));
-    nvme.bar0 = (volatile void *)bar0_phys;
+    /* Use the upper-half MMIO alias so register accesses work from
+     * any CR3 (paging_map_mmio installs BAR pages at both identity
+     * and KERNEL_VBASE+phys). */
+    nvme.bar0 = (volatile void *)PHYS_TO_VIRT(bar0_phys);
 
     serial_puts("[NVMe] Initializing, BAR0=");
     serial_puthex(bar0_phys, 16);
