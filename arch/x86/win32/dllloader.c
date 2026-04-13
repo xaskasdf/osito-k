@@ -7,6 +7,7 @@
 
 #include "dllloader.h"
 #include "compat32.h"
+#include "../include/paging.h"
 extern TEB32 g_teb32;
 
 extern void serial_puts(const char *s);
@@ -588,8 +589,12 @@ static LOADED_MODULE *dll_try_load_from_fs(const char *dll_name)
     serial_puts(")\n");
 
     uint64_t pages = (fsize + 0xFFF) / 4096;
-    uint8_t *buf = (uint8_t *)mem_alloc_pages(pages);
-    if (!buf) return NULL;
+    void *buf_phys = mem_alloc_pages(pages);
+    if (!buf_phys) return NULL;
+    /* Temporary kernel-side read buffer — dll_load parses the PE
+     * headers and maps the actual segments into PE32 space itself,
+     * so this buffer is safe to live in the upper-half mirror. */
+    uint8_t *buf = (uint8_t *)PHYS_TO_VIRT(buf_phys);
 
     osfs2_read(fsfile, 0, buf, fsize);
 
@@ -597,7 +602,7 @@ static LOADED_MODULE *dll_try_load_from_fs(const char *dll_name)
     PVOID base = dll_load(dll_name, (const BYTE *)buf, (SIZE_T)fsize);
     load_depth--;
 
-    mem_free_pages(buf, pages);
+    mem_free_pages(buf_phys, pages);
 
     if (base)
         return dll_find_module(dll_name);
