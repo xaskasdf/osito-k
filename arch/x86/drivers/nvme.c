@@ -8,6 +8,7 @@
  */
 
 #include "../include/types.h"
+#include "../include/paging.h"
 
 /* ── Declarations ────────────────────────────────────────────── */
 
@@ -241,13 +242,18 @@ int nvme_init(uint64_t bar0_phys)
         __asm__ volatile ("pause");
     }
 
-    /* Allocate admin queues (page-aligned) */
-    nvme.asq = (nvme_sqe_t *)mem_alloc_aligned(ADMIN_QUEUE_SIZE * sizeof(nvme_sqe_t), 4096);
-    nvme.acq = (nvme_cqe_t *)mem_alloc_aligned(ADMIN_QUEUE_SIZE * sizeof(nvme_cqe_t), 4096);
-    if (!nvme.asq || !nvme.acq) {
+    /* Allocate admin queues (page-aligned). The struct fields hold
+     * upper-half virt pointers so kernel CPU code can read/write the
+     * queue entries via the direct map; the hardware register writes
+     * below convert back to phys via VIRT_TO_PHYS. */
+    void *asq_phys = mem_alloc_aligned(ADMIN_QUEUE_SIZE * sizeof(nvme_sqe_t), 4096);
+    void *acq_phys = mem_alloc_aligned(ADMIN_QUEUE_SIZE * sizeof(nvme_cqe_t), 4096);
+    if (!asq_phys || !acq_phys) {
         serial_puts("[NVMe] Failed to allocate admin queues\n");
         return -1;
     }
+    nvme.asq = (nvme_sqe_t *)PHYS_TO_VIRT(asq_phys);
+    nvme.acq = (nvme_cqe_t *)PHYS_TO_VIRT(acq_phys);
     memset(nvme.asq, 0, ADMIN_QUEUE_SIZE * sizeof(nvme_sqe_t));
     memset(nvme.acq, 0, ADMIN_QUEUE_SIZE * sizeof(nvme_cqe_t));
 
@@ -255,10 +261,10 @@ int nvme_init(uint64_t bar0_phys)
     nvme.acq_head = 0;
     nvme.acq_phase = 1;
 
-    /* Configure admin queues */
+    /* Configure admin queues — hardware needs the physical addresses. */
     nvme_write32(NVME_REG_AQA, ((ADMIN_QUEUE_SIZE - 1) << 16) | (ADMIN_QUEUE_SIZE - 1));
-    nvme_write64(NVME_REG_ASQ, (uint64_t)nvme.asq);
-    nvme_write64(NVME_REG_ACQ, (uint64_t)nvme.acq);
+    nvme_write64(NVME_REG_ASQ, VIRT_TO_PHYS(nvme.asq));
+    nvme_write64(NVME_REG_ACQ, VIRT_TO_PHYS(nvme.acq));
 
     /* Enable controller */
     uint32_t cc = NVME_CC_EN | NVME_CC_CSS_NVM | NVME_CC_MPS_4K |
@@ -277,15 +283,17 @@ int nvme_init(uint64_t bar0_phys)
 
     serial_puts("[NVMe] Controller ready\n");
 
-    /* Identify controller */
-    void *identify_buf = mem_alloc_aligned(4096, 4096);
-    if (!identify_buf) return -1;
+    /* Identify controller — DMA buffer (controller fills it). CPU reads
+     * the model name etc. afterwards, so we keep both views handy. */
+    void *identify_phys = mem_alloc_aligned(4096, 4096);
+    if (!identify_phys) return -1;
+    void *identify_buf  = PHYS_TO_VIRT(identify_phys);
     memset(identify_buf, 0, 4096);
 
     nvme_sqe_t cmd;
     memset(&cmd, 0, sizeof(cmd));
     cmd.cdw0 = NVME_ADMIN_IDENTIFY;
-    cmd.prp1 = (uint64_t)identify_buf;
+    cmd.prp1 = (uint64_t)identify_phys;
     cmd.cdw10 = 1; /* Controller identify */
 
     if (nvme_admin_submit_wait(&cmd) < 0) {
@@ -314,7 +322,7 @@ int nvme_init(uint64_t bar0_phys)
     memset(&cmd, 0, sizeof(cmd));
     cmd.cdw0 = NVME_ADMIN_IDENTIFY;
     cmd.nsid = 1;
-    cmd.prp1 = (uint64_t)identify_buf;
+    cmd.prp1 = (uint64_t)identify_phys;
     cmd.cdw10 = 0; /* Namespace identify */
 
     if (nvme_admin_submit_wait(&cmd) < 0) {
@@ -341,13 +349,14 @@ int nvme_init(uint64_t bar0_phys)
     serial_puts(" GB\n");
 
     /* Create I/O Completion Queue (ID=1) */
-    nvme.iocq = (nvme_cqe_t *)mem_alloc_aligned(IO_QUEUE_SIZE * sizeof(nvme_cqe_t), 4096);
-    if (!nvme.iocq) return -1;
+    void *iocq_phys = mem_alloc_aligned(IO_QUEUE_SIZE * sizeof(nvme_cqe_t), 4096);
+    if (!iocq_phys) return -1;
+    nvme.iocq = (nvme_cqe_t *)PHYS_TO_VIRT(iocq_phys);
     memset(nvme.iocq, 0, IO_QUEUE_SIZE * sizeof(nvme_cqe_t));
 
     memset(&cmd, 0, sizeof(cmd));
     cmd.cdw0 = NVME_ADMIN_CREATE_IOCQ;
-    cmd.prp1 = (uint64_t)nvme.iocq;
+    cmd.prp1 = (uint64_t)iocq_phys;
     cmd.cdw10 = ((IO_QUEUE_SIZE - 1) << 16) | 1;  /* QID=1, size */
     cmd.cdw11 = 1; /* Physically contiguous */
 
@@ -357,13 +366,14 @@ int nvme_init(uint64_t bar0_phys)
     }
 
     /* Create I/O Submission Queue (ID=1, CQ=1) */
-    nvme.iosq = (nvme_sqe_t *)mem_alloc_aligned(IO_QUEUE_SIZE * sizeof(nvme_sqe_t), 4096);
-    if (!nvme.iosq) return -1;
+    void *iosq_phys = mem_alloc_aligned(IO_QUEUE_SIZE * sizeof(nvme_sqe_t), 4096);
+    if (!iosq_phys) return -1;
+    nvme.iosq = (nvme_sqe_t *)PHYS_TO_VIRT(iosq_phys);
     memset(nvme.iosq, 0, IO_QUEUE_SIZE * sizeof(nvme_sqe_t));
 
     memset(&cmd, 0, sizeof(cmd));
     cmd.cdw0 = NVME_ADMIN_CREATE_IOSQ;
-    cmd.prp1 = (uint64_t)nvme.iosq;
+    cmd.prp1 = (uint64_t)iosq_phys;
     cmd.cdw10 = ((IO_QUEUE_SIZE - 1) << 16) | 1;  /* QID=1, size */
     cmd.cdw11 = (1 << 16) | 1; /* CQID=1, physically contiguous */
 
@@ -429,10 +439,12 @@ int nvme_read_bytes(uint64_t byte_offset, void *buf, uint64_t len)
     uint64_t lba = byte_offset / nvme.lba_size;
     uint64_t lba_offset = byte_offset % nvme.lba_size;
 
-    /* Allocate a temporary aligned buffer for the read */
-    /* Read in chunks */
-    uint8_t *temp = (uint8_t *)mem_alloc_aligned(4096 * 2, 4096);
-    if (!temp) return -1;
+    /* Allocate a temporary aligned DMA buffer for the read.
+     * temp_phys is what nvme_read hands to the controller as PRP1;
+     * temp_virt is the kernel CPU view used for the memcpy below. */
+    void *temp_phys = mem_alloc_aligned(4096 * 2, 4096);
+    if (!temp_phys) return -1;
+    uint8_t *temp_virt = (uint8_t *)PHYS_TO_VIRT(temp_phys);
 
     uint8_t *dst = (uint8_t *)buf;
     uint64_t remaining = len;
@@ -443,14 +455,14 @@ int nvme_read_bytes(uint64_t byte_offset, void *buf, uint64_t len)
         uint32_t read_lbas = (uint32_t)((cur_offset + remaining + nvme.lba_size - 1) / nvme.lba_size);
         if (read_lbas > 8) read_lbas = 8;  /* 4KB at a time */
 
-        if (nvme_read(cur_lba, read_lbas, temp) < 0) {
-            mem_free_pages(temp, 2);
+        if (nvme_read(cur_lba, read_lbas, temp_phys) < 0) {
+            mem_free_pages(temp_phys, 2);
             return -1;
         }
 
         uint64_t avail = (uint64_t)read_lbas * nvme.lba_size - cur_offset;
         uint64_t copy = remaining < avail ? remaining : avail;
-        memcpy(dst, temp + cur_offset, copy);
+        memcpy(dst, temp_virt + cur_offset, copy);
 
         dst += copy;
         remaining -= copy;
@@ -458,7 +470,7 @@ int nvme_read_bytes(uint64_t byte_offset, void *buf, uint64_t len)
         cur_offset = 0;
     }
 
-    mem_free_pages(temp, 2);
+    mem_free_pages(temp_phys, 2);
     return 0;
 }
 
@@ -509,8 +521,9 @@ int nvme_write_bytes(uint64_t byte_offset, const void *buf, uint64_t len)
     uint64_t lba = byte_offset / nvme.lba_size;
     uint64_t lba_offset = byte_offset % nvme.lba_size;
 
-    uint8_t *temp = (uint8_t *)mem_alloc_aligned(4096 * 2, 4096);
-    if (!temp) return -1;
+    void *temp_phys = mem_alloc_aligned(4096 * 2, 4096);
+    if (!temp_phys) return -1;
+    uint8_t *temp_virt = (uint8_t *)PHYS_TO_VIRT(temp_phys);
 
     const uint8_t *src = (const uint8_t *)buf;
     uint64_t remaining = len;
@@ -523,18 +536,18 @@ int nvme_write_bytes(uint64_t byte_offset, const void *buf, uint64_t len)
 
         /* Read-modify-write if not aligned */
         if (cur_offset != 0 || remaining < (uint64_t)rw_lbas * nvme.lba_size) {
-            if (nvme_read(cur_lba, rw_lbas, temp) < 0) {
-                mem_free_pages(temp, 2);
+            if (nvme_read(cur_lba, rw_lbas, temp_phys) < 0) {
+                mem_free_pages(temp_phys, 2);
                 return -1;
             }
         }
 
         uint64_t avail = (uint64_t)rw_lbas * nvme.lba_size - cur_offset;
         uint64_t copy = remaining < avail ? remaining : avail;
-        memcpy(temp + cur_offset, src, copy);
+        memcpy(temp_virt + cur_offset, src, copy);
 
-        if (nvme_write(cur_lba, rw_lbas, temp) < 0) {
-            mem_free_pages(temp, 2);
+        if (nvme_write(cur_lba, rw_lbas, temp_phys) < 0) {
+            mem_free_pages(temp_phys, 2);
             return -1;
         }
 
@@ -544,7 +557,7 @@ int nvme_write_bytes(uint64_t byte_offset, const void *buf, uint64_t len)
         cur_offset = 0;
     }
 
-    mem_free_pages(temp, 2);
+    mem_free_pages(temp_phys, 2);
     return 0;
 }
 
