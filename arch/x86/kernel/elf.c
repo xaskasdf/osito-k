@@ -36,6 +36,11 @@ extern int paging_unmap_page(uint64_t virt);
 
 /* Process — register memory for cleanup on exit */
 extern void proc_add_region(void *base, uint64_t pages);
+extern void *proc_current(void);
+extern void  user_symtab_set(void *pp,
+                             void *symtab, uint64_t symtab_size,
+                             char *strtab, uint64_t strtab_size,
+                             uint64_t load_bias);
 
 /* ── ELF64 structures ───────────────────────────────────────── */
 
@@ -84,6 +89,23 @@ typedef struct {
     uint16_t e_shnum;
     uint16_t e_shstrndx;
 } elf64_hdr_t;
+
+typedef struct {
+    uint32_t sh_name;
+    uint32_t sh_type;
+    uint64_t sh_flags;
+    uint64_t sh_addr;
+    uint64_t sh_offset;
+    uint64_t sh_size;
+    uint32_t sh_link;
+    uint32_t sh_info;
+    uint64_t sh_addralign;
+    uint64_t sh_entsize;
+} elf64_shdr_t;
+
+#define SHT_SYMTAB  2
+#define SHT_STRTAB  3
+#define SHT_DYNSYM  11
 
 typedef struct {
     uint32_t p_type;
@@ -793,6 +815,222 @@ static int elf_setup_demand_segments(const elf64_hdr_t *hdr,
     return 0;
 }
 
+/* ── Symbol-table capture for crash-dump symbolizer ──────────────
+ *
+ * Walks the section headers of an already-loaded ELF image in `data`
+ * and copies `.symtab`+`.strtab` (or `.dynsym`+`.dynstr` as a fallback
+ * for stripped PIEs) into kmalloc'd kernel buffers, then hands them
+ * off to `user_symtab_set()` on the current process. Safe to call on
+ * any ELF — if the section tables are missing or malformed, it just
+ * leaves the process's symtab fields NULL and the symbolizer will
+ * return false at crash time.
+ *
+ * Call site: eager-load path only, right before `kfree(data)`.
+ * Demand-paged ELFs skip this (no `data` buffer), which means stripped
+ * and demand-paged binaries are symbol-less — acceptable for now. */
+static void elf_capture_symtab(const uint8_t *data, uint64_t data_size,
+                               uint64_t load_bias)
+{
+    if (!data || data_size < sizeof(elf64_hdr_t)) return;
+
+    const elf64_hdr_t *hdr = (const elf64_hdr_t *)data;
+    if (hdr->e_shoff == 0 || hdr->e_shnum == 0) return;
+    if (hdr->e_shentsize < sizeof(elf64_shdr_t)) return;
+
+    uint64_t shtab_bytes = (uint64_t)hdr->e_shnum * hdr->e_shentsize;
+    if (hdr->e_shoff + shtab_bytes > data_size) return;
+
+    const elf64_shdr_t *shdrs = (const elf64_shdr_t *)(data + hdr->e_shoff);
+
+    /* Section-name string table: e_shstrndx indexes into shdrs[] and
+     * the referenced section is itself a string table. */
+    const char *shstrtab = NULL;
+    uint64_t    shstrtab_size = 0;
+    if (hdr->e_shstrndx < hdr->e_shnum) {
+        const elf64_shdr_t *sh = &shdrs[hdr->e_shstrndx];
+        if (sh->sh_type == SHT_STRTAB &&
+            sh->sh_offset + sh->sh_size <= data_size) {
+            shstrtab      = (const char *)(data + sh->sh_offset);
+            shstrtab_size = sh->sh_size;
+        }
+    }
+    if (!shstrtab) return;
+
+    /* Locate .symtab/.strtab first; fall back to .dynsym/.dynstr
+     * for stripped PIEs where the static symbol table was removed. */
+    const elf64_shdr_t *sym_sh = NULL;
+    const elf64_shdr_t *str_sh = NULL;
+    const elf64_shdr_t *dynsym_sh = NULL;
+    const elf64_shdr_t *dynstr_sh = NULL;
+
+    for (uint16_t i = 0; i < hdr->e_shnum; i++) {
+        const elf64_shdr_t *sh = &shdrs[i];
+        if (sh->sh_name >= shstrtab_size) continue;
+        const char *name = shstrtab + sh->sh_name;
+
+        if (sh->sh_type == SHT_SYMTAB) {
+            /* .symtab: its sh_link points at the matching .strtab */
+            sym_sh = sh;
+            if (sh->sh_link < hdr->e_shnum) {
+                const elf64_shdr_t *linked = &shdrs[sh->sh_link];
+                if (linked->sh_type == SHT_STRTAB)
+                    str_sh = linked;
+            }
+        } else if (sh->sh_type == SHT_DYNSYM) {
+            dynsym_sh = sh;
+            if (sh->sh_link < hdr->e_shnum) {
+                const elf64_shdr_t *linked = &shdrs[sh->sh_link];
+                if (linked->sh_type == SHT_STRTAB)
+                    dynstr_sh = linked;
+            }
+        }
+        (void)name;
+    }
+
+    const elf64_shdr_t *chosen_sym = sym_sh    ? sym_sh    : dynsym_sh;
+    const elf64_shdr_t *chosen_str = sym_sh    ? str_sh    : dynstr_sh;
+    if (!chosen_sym || !chosen_str) return;
+    if (chosen_sym->sh_size == 0 || chosen_str->sh_size == 0) return;
+    if (chosen_sym->sh_offset + chosen_sym->sh_size > data_size) return;
+    if (chosen_str->sh_offset + chosen_str->sh_size > data_size) return;
+
+    void *sym_copy = kmalloc(chosen_sym->sh_size);
+    if (!sym_copy) return;
+    char *str_copy = (char *)kmalloc(chosen_str->sh_size);
+    if (!str_copy) { kfree(sym_copy); return; }
+
+    memcpy(sym_copy, data + chosen_sym->sh_offset, chosen_sym->sh_size);
+    memcpy(str_copy, data + chosen_str->sh_offset, chosen_str->sh_size);
+
+    user_symtab_set(proc_current(),
+                    sym_copy, chosen_sym->sh_size,
+                    str_copy, chosen_str->sh_size,
+                    load_bias);
+
+    serial_puts("[ELF] symtab captured: ");
+    serial_putdec(chosen_sym->sh_size / sizeof(uint64_t) / 3);
+    serial_puts(" entries, strtab ");
+    serial_putdec(chosen_str->sh_size);
+    serial_puts(" B\n");
+}
+
+/* ── Symbol-table capture (demand-paged variant, reads via vfs) ──
+ *
+ * Same contract as `elf_capture_symtab()` but reads the section
+ * header table and the selected symtab/strtab sections from the file
+ * on disk via vfs_read(). Used by the demand-paged load path where
+ * the whole ELF is never pulled into memory.
+ */
+static void elf_capture_symtab_vfs(vfs_node_t *node, uint64_t file_size,
+                                   const elf64_hdr_t *hdr, uint64_t load_bias)
+{
+    if (!node || !hdr) return;
+    if (hdr->e_shoff == 0 || hdr->e_shnum == 0) return;
+    if (hdr->e_shentsize < sizeof(elf64_shdr_t)) return;
+
+    uint64_t shtab_bytes = (uint64_t)hdr->e_shnum * hdr->e_shentsize;
+    if (hdr->e_shoff + shtab_bytes > file_size) return;
+
+    elf64_shdr_t *shdrs = (elf64_shdr_t *)kmalloc(shtab_bytes);
+    if (!shdrs) return;
+    if (vfs_read(node, hdr->e_shoff, shdrs, shtab_bytes) < 0) {
+        kfree(shdrs);
+        return;
+    }
+
+    /* Read the section-name string table. */
+    char    *shstrtab      = NULL;
+    uint64_t shstrtab_size = 0;
+    if (hdr->e_shstrndx < hdr->e_shnum) {
+        elf64_shdr_t *sh = &shdrs[hdr->e_shstrndx];
+        if (sh->sh_type == SHT_STRTAB && sh->sh_size > 0 &&
+            sh->sh_offset + sh->sh_size <= file_size) {
+            shstrtab = (char *)kmalloc(sh->sh_size);
+            if (shstrtab && vfs_read(node, sh->sh_offset, shstrtab,
+                                     sh->sh_size) >= 0) {
+                shstrtab_size = sh->sh_size;
+            } else if (shstrtab) {
+                kfree(shstrtab);
+                shstrtab = NULL;
+            }
+        }
+    }
+    if (!shstrtab) { kfree(shdrs); return; }
+
+    /* Locate .symtab/.strtab (preferred) or .dynsym/.dynstr fallback. */
+    elf64_shdr_t *sym_sh    = NULL;
+    elf64_shdr_t *str_sh    = NULL;
+    elf64_shdr_t *dynsym_sh = NULL;
+    elf64_shdr_t *dynstr_sh = NULL;
+
+    for (uint16_t i = 0; i < hdr->e_shnum; i++) {
+        elf64_shdr_t *sh = &shdrs[i];
+        if (sh->sh_name >= shstrtab_size) continue;
+
+        if (sh->sh_type == SHT_SYMTAB) {
+            sym_sh = sh;
+            if (sh->sh_link < hdr->e_shnum) {
+                elf64_shdr_t *linked = &shdrs[sh->sh_link];
+                if (linked->sh_type == SHT_STRTAB) str_sh = linked;
+            }
+        } else if (sh->sh_type == SHT_DYNSYM) {
+            dynsym_sh = sh;
+            if (sh->sh_link < hdr->e_shnum) {
+                elf64_shdr_t *linked = &shdrs[sh->sh_link];
+                if (linked->sh_type == SHT_STRTAB) dynstr_sh = linked;
+            }
+        }
+    }
+
+    elf64_shdr_t *chosen_sym = sym_sh ? sym_sh : dynsym_sh;
+    elf64_shdr_t *chosen_str = sym_sh ? str_sh : dynstr_sh;
+    if (!chosen_sym || !chosen_str ||
+        chosen_sym->sh_size == 0 || chosen_str->sh_size == 0 ||
+        chosen_sym->sh_offset + chosen_sym->sh_size > file_size ||
+        chosen_str->sh_offset + chosen_str->sh_size > file_size) {
+        kfree(shdrs);
+        kfree(shstrtab);
+        return;
+    }
+
+    void *sym_copy = kmalloc(chosen_sym->sh_size);
+    char *str_copy = sym_copy ? (char *)kmalloc(chosen_str->sh_size) : NULL;
+    if (!sym_copy || !str_copy) {
+        if (sym_copy) kfree(sym_copy);
+        kfree(shdrs);
+        kfree(shstrtab);
+        return;
+    }
+
+    if (vfs_read(node, chosen_sym->sh_offset, sym_copy,
+                 chosen_sym->sh_size) < 0 ||
+        vfs_read(node, chosen_str->sh_offset, str_copy,
+                 chosen_str->sh_size) < 0) {
+        kfree(sym_copy);
+        kfree(str_copy);
+        kfree(shdrs);
+        kfree(shstrtab);
+        return;
+    }
+
+    uint64_t sym_bytes = chosen_sym->sh_size;
+    uint64_t str_bytes = chosen_str->sh_size;
+
+    user_symtab_set(proc_current(),
+                    sym_copy, sym_bytes,
+                    str_copy, str_bytes,
+                    load_bias);
+
+    kfree(shdrs);
+    kfree(shstrtab);
+
+    serial_puts("[ELF] symtab captured (vfs): ");
+    serial_putdec(sym_bytes / sizeof(uint64_t) / 3);
+    serial_puts(" entries, strtab ");
+    serial_putdec(str_bytes);
+    serial_puts(" B\n");
+}
+
 /* ── Public API: Load and execute ELF from OsitoFS ───────────── */
 
 int elf_exec(const char *filename, int argc, const char **argv)
@@ -871,6 +1109,11 @@ int elf_exec(const char *filename, int argc, const char **argv)
             return -1;
         }
         kfree(phdr_buf);
+
+        /* Capture symbol tables via VFS for the crash-dump symbolizer.
+         * No in-memory data buffer in this path — read sections on
+         * demand. load_bias stays 0 for ET_EXEC demand-paged binaries. */
+        elf_capture_symtab_vfs(&node, file_size, &hdr_buf, loaded.load_bias);
     } else {
         serial_puts("[ELF] Path: eager (");
         serial_puts(has_dynamic ? "dynamic" : "PIE");
@@ -1230,6 +1473,12 @@ int elf_exec(const char *filename, int argc, const char **argv)
         elf_free(&loaded);
         return -1;
     }
+
+    /* Capture symbol tables for crash-dump symbolization before the
+     * ELF buffer is released. Only the eager path has `data` here;
+     * demand-paged binaries run without symbols. */
+    if (data)
+        elf_capture_symtab(data, file_size, loaded.load_bias);
 
     /* Free the read buffer (eager path only — demand-paged has no buffer) */
     if (data) kfree(data);

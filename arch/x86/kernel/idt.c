@@ -1272,6 +1272,28 @@ void isr_handler(interrupt_frame_t *frame)
         serial_puthex(frame->cs, 4);
         serial_puts("\n");
 
+        /* Symbolize RIP for native ELF user crashes (CS=0x28). The
+         * symbolizer is kmalloc-safe and reads the per-process symbol
+         * tables captured at elf_load time. For unmatched addresses or
+         * demand-paged binaries (no symtab) it prints nothing. */
+        {
+            extern void *proc_current(void);
+            extern bool user_symbolize(void *p, uint64_t addr,
+                                       const char **name, uint64_t *off);
+            if ((frame->cs & 0xFFFF) == 0x28) {
+                const char *sym_name = 0;
+                uint64_t    sym_off  = 0;
+                if (user_symbolize(proc_current(), frame->rip,
+                                   &sym_name, &sym_off)) {
+                    serial_puts("  in ");
+                    serial_puts(sym_name);
+                    serial_puts("+0x");
+                    serial_puthex(sym_off, 4);
+                    serial_puts("\n");
+                }
+            }
+        }
+
         serial_puts("  ERR = 0x");
         serial_puthex(frame->error_code, 16);
         serial_puts("  RSP = 0x");
@@ -1371,6 +1393,62 @@ void isr_handler(interrupt_frame_t *frame)
                 serial_puts("] = 0x");
                 serial_puthex((uint64_t)sp[i], 8);
                 serial_puts("\n");
+            }
+        }
+
+        /* Native ELF backtrace via RBP walking (CS=0x28).
+         *
+         * Reads `[rbp] = prev_rbp, [rbp+8] = ret_addr` up to 16 frames,
+         * symbolizing each return address. Safety: RBP must be
+         * 8-aligned and stay within the 8MB user stack window anchored
+         * at the faulting RSP. This avoids walking page tables (which
+         * don't handle the 1GB huge pages in the upper-half direct map
+         * correctly) while still preventing cascade faults when RBP is
+         * garbage from -fomit-frame-pointer code.
+         *
+         * Binaries compiled without `-fno-omit-frame-pointer` usually
+         * yield only frame #0 reliably (RIP via the symbolize hook
+         * above); the walk bails out at the first RBP out-of-window. */
+        if ((frame->cs & 0xFFFF) == 0x28) {
+            extern void *proc_current(void);
+            extern bool  user_symbolize(void *p, uint64_t addr,
+                                        const char **name, uint64_t *off);
+
+            serial_puts("  Backtrace:\n");
+            uint64_t       rbp  = frame->rbp;
+            const uint64_t rsp  = frame->rsp;
+            const uint64_t WIN  = 8ULL * 1024 * 1024;  /* USER_STACK_SIZE */
+            void          *proc = proc_current();
+
+            for (int depth = 0; depth < 16; depth++) {
+                if (rbp == 0) break;
+                if (rbp & 0x7) break;                  /* unaligned */
+                /* Keep RBP within ±8MB of the faulting RSP — the
+                 * kernel-allocated user stack window. Anything else is
+                 * either garbage or points outside the stack. */
+                if (rbp + 16 < rbp) break;             /* overflow guard */
+                if (rbp < rsp - 256 || rbp > rsp + WIN) break;
+
+                uint64_t prev_rbp = ((uint64_t *)rbp)[0];
+                uint64_t ret      = ((uint64_t *)rbp)[1];
+
+                serial_puts("    #");
+                serial_putdec((uint64_t)depth);
+                serial_puts(" 0x");
+                serial_puthex(ret, 16);
+
+                const char *nm  = 0;
+                uint64_t    off = 0;
+                if (user_symbolize(proc, ret, &nm, &off)) {
+                    serial_puts(" ");
+                    serial_puts(nm);
+                    serial_puts("+0x");
+                    serial_puthex(off, 4);
+                }
+                serial_puts("\n");
+
+                if (prev_rbp <= rbp) break;            /* loop / end */
+                rbp = prev_rbp;
             }
         }
 

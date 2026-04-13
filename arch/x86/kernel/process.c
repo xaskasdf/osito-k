@@ -130,6 +130,16 @@ typedef struct {
     uint64_t last_active_tick;   /* tick when process last ran */
     bool     pages_compressed;   /* true if RW pages are compressed */
 
+    /* User-space symbol table (captured at elf_load time from the
+     * binary's .symtab/.strtab). Used by the crash-dump symbolizer
+     * in idt.c and the user backtrace walker. NULL if symbols are
+     * unavailable (stripped binary, demand-paged, or capture failed). */
+    void     *user_symtab;       /* kmalloc'd copy of .symtab */
+    uint64_t  user_symtab_size;  /* bytes */
+    char     *user_strtab;       /* kmalloc'd copy of .strtab */
+    uint64_t  user_strtab_size;  /* bytes */
+    uint64_t  user_load_bias;    /* PIE: rip = st_value + bias */
+
     /* Per-process file descriptor table. 8 KB. Last member so
      * any additions go above and the struct layout stays stable. */
     fd_entry_t fds[MAX_FDS];
@@ -230,6 +240,13 @@ static void proc_free(process_t *p)
         p->cr3 = 0;
     }
 
+    /* Release the user-symbol-table copies captured at elf_load time. */
+    if (p->user_symtab) { kfree(p->user_symtab); p->user_symtab = NULL; }
+    if (p->user_strtab) { kfree(p->user_strtab); p->user_strtab = NULL; }
+    p->user_symtab_size = 0;
+    p->user_strtab_size = 0;
+    p->user_load_bias = 0;
+
     p->state = PROC_FREE;
 }
 
@@ -265,6 +282,34 @@ fd_entry_t *syscall_fds(void)
 uint64_t proc_current_cr3(void)
 {
     return current_proc ? current_proc->cr3 : 0;
+}
+
+/* User-symbol-table accessors — used by usym.c so it doesn't have to
+ * know the layout of process_t. Take/return void* so usym.c stays
+ * decoupled from this struct's anonymous tag. */
+void     *user_symtab_get(void *pp)      { process_t *p = pp; return p ? p->user_symtab      : NULL; }
+uint64_t  user_symtab_size_get(void *pp) { process_t *p = pp; return p ? p->user_symtab_size : 0; }
+char     *user_strtab_get(void *pp)      { process_t *p = pp; return p ? p->user_strtab      : NULL; }
+uint64_t  user_strtab_size_get(void *pp) { process_t *p = pp; return p ? p->user_strtab_size : 0; }
+uint64_t  user_load_bias_get(void *pp)   { process_t *p = pp; return p ? p->user_load_bias   : 0; }
+
+/* Setter used by elf.c after capturing .symtab/.strtab from the loaded
+ * binary. Takes ownership of the kmalloc'd buffers — proc_free will
+ * kfree them later. */
+void user_symtab_set(void *pp,
+                     void *symtab, uint64_t symtab_size,
+                     char *strtab, uint64_t strtab_size,
+                     uint64_t load_bias)
+{
+    process_t *p = pp;
+    if (!p) return;
+    if (p->user_symtab) kfree(p->user_symtab);
+    if (p->user_strtab) kfree(p->user_strtab);
+    p->user_symtab      = symtab;
+    p->user_symtab_size = symtab_size;
+    p->user_strtab      = strtab;
+    p->user_strtab_size = strtab_size;
+    p->user_load_bias   = load_bias;
 }
 
 /* Get current PID */
