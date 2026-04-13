@@ -295,6 +295,19 @@ Per-process page tables (un CR3 por proceso):
     upper-half; el phys sigue siendo lo que se instala en el PTE user.
   - `main.c` — commit `40fcbb9`: shadow framebuffer (4 MB) en upper-half,
     `fb_enable_shadow(PHYS_TO_VIRT(shadow_phys))`.
+  - `inference.c` — commit `5fedcef`: LLaMA state (layer table, kv
+    cache, scratch) en upper-half. Tensors puramente CPU-only.
+  - `tensor.c` — commit `7c0b9e0`: 17 allocations del benchmark suite
+    (Q4_0 matvec, Q8_0 matvec, perf 2048x2048, AVX2 vs scalar). Valida
+    al boot: Q4_0/Q8_0 matvec OK, perf corre.
+  - `win32/dllloader.c` — commit `1f29896`: buffer temporal para leer
+    PE de disco; `dll_load` parsea headers y mapea segmentos PE32
+    aparte, así que el buffer sólo vive kernel-side.
+- **Pendientes identificados y aún en identity map**: drivers (NVMe,
+  xHCI, i211, GPU, virtio), Win32 compat thunk pool (`compat32.c`),
+  thread stacks (`ntprocess.c`), ddraw framebuffer y surfaces
+  (`ddraw_shim.c` — el proxy COM PE32 NO debe migrar), `sys_mmap` user
+  return VA (requiere proper user VA allocator antes de mover).
 - El resto del kernel sigue funcionando via identity map lower-half;
   cada subsistema se migra cuando le toca.
 
