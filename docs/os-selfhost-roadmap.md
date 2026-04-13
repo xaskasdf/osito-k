@@ -332,6 +332,25 @@ regression test de PE binaries, quedan diferidos.
 - El resto del kernel sigue funcionando via identity map lower-half;
   los drivers todavía acceden sus DMA buffers por su phys vía identity.
 
+**Identity-map removal — Phase A ✅ DONE (2026-04-13)**
+
+- `paging.c` (commit `3600e21`): page-table walks ya no dependen del
+  identity map. `pt_alloc_page` devuelve un puntero upper-half (virt),
+  todos los walks `(uint64_t *)(table[idx] & PTE_ADDR_MASK)` van vía
+  `PHYS_TO_VIRT(...)`, todas las stores en PTEs padre usan
+  `VIRT_TO_PHYS(child_table)` para que el hardware lea phys, y
+  `kernel_cr3 = VIRT_TO_PHYS(kernel_pml4)`. ~30 sitios migrados,
+  funciones afectadas: pt_alloc_page, pt_get_or_create, paging_map_4k,
+  paging_map_4k_in, paging_map_page_in_cr3, paging_unmap_page,
+  paging_unmap_page_in_cr3, paging_get_pte, paging_get_pte_in_cr3,
+  paging_set_flags, pte_walk, clone_pd, paging_create_process_cr3,
+  paging_free_process_cr3, paging_create_win32_cr3, paging_win32_va_to_pa,
+  reserve_old_page_tables.
+- Identity map sigue activo en `kernel_pml4` como red de seguridad;
+  paging.c es ahora self-consistent sobre cualquiera de los dos
+  mapeos. Próximo bloqueante para borrar el identity map: drivers
+  (Phase B, ~81 sitios CPU-access en NVMe/xHCI/i211/GSP/virtio/hda).
+
 **Kernel text relocation (Option C) ✅ DONE (2026-04-13)**
 
 - `boot.efi` (commit `ab9d59d`): antes de `ExitBootServices` clona la
