@@ -963,7 +963,15 @@ void isr_handler(interrupt_frame_t *frame)
             return;
         }
 
-        if (cr2 < 0x1000 && (frame->error_code & 16)) {  /* INSTRUCTION-FETCH on page 0 */
+        /* The NULL-CALL recovery path below is Win32 PE32 specific: it
+         * reads from `frame->rsp & 0xFFFFFFFF` (truncated 32-bit RSP)
+         * to recover the return address, dispatches to the engine SEH
+         * chain, scans the IAT for redirect candidates, etc. Native
+         * x86_64 user code (CS=0x38) with a NULL function pointer
+         * should just take the regular #PF path and die. */
+        if (cr2 < 0x1000 && (frame->error_code & 16) &&
+            ((frame->cs & 0xFFFF) == 0x40 ||
+             (frame->cs & 0xFFFF) == 0x23)) {  /* INSTRUCTION-FETCH on page 0 */
             /* NULL function pointer call from stale register.
              * Try IAT redirect first (same technique as BC-REDIRECT):
              * scan backwards from retaddr to find the IAT load instruction
@@ -1294,8 +1302,14 @@ void isr_handler(interrupt_frame_t *frame)
         serial_puthex(frame->rflags, 16);
         serial_puts("\n");
 
-        /* Dump bytes at RIP (useful for crashes on stack/corrupted code) */
-        if (frame->rip < 0x100000000ULL) {
+        /* Dump bytes at RIP (useful for crashes on stack/corrupted code).
+         * Skip the NULL page (Phase C: user PML4s have no mapping there),
+         * and skip when not running compat32 user code — the dump is
+         * primarily a Win32 debug aid and dereferencing arbitrary user
+         * pointers can fault re-entrantly into the handler. */
+        if (frame->rip >= 0x10000ULL && frame->rip < 0x100000000ULL &&
+            ((frame->cs & 0xFFFF) == 0x40 ||
+             (frame->cs & 0xFFFF) == 0x23)) {
             uint8_t *code = (uint8_t *)(frame->rip & 0xFFFFFFFF);
             serial_puts("  Code @ RIP: ");
             for (int bi = 0; bi < 16; bi++) {
@@ -1343,8 +1357,12 @@ void isr_handler(interrupt_frame_t *frame)
             serial_puts("\n");
         }
 
-        /* Stack dump: show 16 dwords from RSP for crash diagnosis */
-        {
+        /* Stack dump: show 16 dwords from RSP for crash diagnosis.
+         * Only dump for compat32 contexts — native x86_64 user crashes
+         * have RSP in the upper-half mirror and dumping it here can
+         * fault again on unmigrated mappings, which would cascade. */
+        if ((frame->cs & 0xFFFF) == 0x40 ||
+            (frame->cs & 0xFFFF) == 0x23) {
             uint32_t *sp = (uint32_t *)(uint64_t)frame->rsp;
             serial_puts("  Stack dump (RSP):\n");
             for (int i = 0; i < 16; i++) {
