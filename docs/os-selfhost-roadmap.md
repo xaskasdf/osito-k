@@ -283,16 +283,22 @@ Per-process page tables (un CR3 por proceso):
 > still lives at physical 0x02000000 identity-mapped, and drivers still
 > use direct PA == VA pointers. Higher-half is the next refactor.
 
-**Fase 0: Preparación (no-op funcional)**
-- Definir `KERNEL_VBASE 0xFFFF800000000000ULL`
-- Agregar macros `PHYS_TO_VIRT(p)` / `VIRT_TO_PHYS(v)` como identidad inicialmente
-- Ir reemplazando accesos a punteros crudos por las macros en drivers
-- **El kernel sigue funcionando igual** — las macros son no-op
+**Fase 0: Preparación (no-op funcional) ✅ DONE (2026-04-12)**
+- `arch/x86/include/paging.h`: `KERNEL_VBASE 0xFFFF800000000000ULL`,
+  `PHYS_TO_VIRT(p)` = `p + KERNEL_VBASE`, `VIRT_TO_PHYS(v)` = `v - KERNEL_VBASE`.
+- Drivers migran a las macros uno a uno. Primer caller: `heap.c` (commit
+  `65820fc`) — el heap completo vive ahora en upper-half.
+- El resto del kernel sigue funcionando via identity map lower-half.
 
-**Fase 1: Higher-half kernel mapping**
-- En `paging_init()`, mapear también la RAM en 0xFFFF800000000000+
-- Linker script: no cambiar nada, el kernel sigue cargando bajo en memoria
-- Test: acceder a datos via `PHYS_TO_VIRT(addr)` funciona idénticamente
+**Fase 1: Higher-half kernel mapping ✅ DONE (2026-04-12)**
+- `paging_init()` instala un segundo mapeo del total de RAM a
+  `VA = phys + KERNEL_VBASE` (PML4[256]) además del identity map bajo.
+- Helper interno generalizado: `paging_map_range_at(phys_s, phys_e, virt_offset, flags)`.
+  `paging_identity_map_range` pasa a ser wrapper con offset 0.
+- Linker script sin tocar; el kernel text corre identity-mapped como siempre.
+- Overhead del mirror: ~5 page-table pages adicionales (PDPT + PDs),
+  `[PAGE] Page tables built: 11 pages (44 KB)`.
+- Commits: `fdb93e3` (mirror), `c80aa0e` (macros activas), `65820fc` (heap migrated).
 
 **Fase 2: Per-process page tables para user space ✅ DONE (2026-04-12)**
 - `proc_create_address_space()`: crea PML4 con upper-half del kernel copiado
