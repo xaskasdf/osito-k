@@ -9,6 +9,7 @@
  */
 
 #include "tensor.h"
+#include "../include/paging.h"
 
 #ifdef __EMSCRIPTEN__
 #include <emscripten.h>
@@ -576,13 +577,18 @@ void tensor_benchmark(void)
         uint32_t w_pg   = pages_for(w_bytes);
         uint32_t v_pg   = pages_for(cols * sizeof(float));
 
-        uint8_t *weights = (uint8_t *)mem_alloc_pages(w_pg);
-        float   *input   = (float *)mem_alloc_pages(v_pg);
-        float   *output  = (float *)mem_alloc_pages(v_pg);
-        float   *ref     = (float *)mem_alloc_pages(v_pg);
-        float   *tmp     = (float *)mem_alloc_pages(v_pg);
+        void *weights_phys = mem_alloc_pages(w_pg);
+        void *input_phys   = mem_alloc_pages(v_pg);
+        void *output_phys  = mem_alloc_pages(v_pg);
+        void *ref_phys     = mem_alloc_pages(v_pg);
+        void *tmp_phys     = mem_alloc_pages(v_pg);
 
-        if (weights && input && output && ref && tmp) {
+        if (weights_phys && input_phys && output_phys && ref_phys && tmp_phys) {
+            uint8_t *weights = (uint8_t *)PHYS_TO_VIRT(weights_phys);
+            float   *input   = (float *)PHYS_TO_VIRT(input_phys);
+            float   *output  = (float *)PHYS_TO_VIRT(output_phys);
+            float   *ref     = (float *)PHYS_TO_VIRT(ref_phys);
+            float   *tmp     = (float *)PHYS_TO_VIRT(tmp_phys);
             fill_q4_0(weights, rows, cols);
             for (uint32_t i = 0; i < cols; i++)
                 input[i] = (float)((i % 5) + 1) * 0.1f;
@@ -619,11 +625,11 @@ void tensor_benchmark(void)
             serial_puts("[TENSOR] Q4_0 matvec: SKIP (alloc failed)\n");
         }
 
-        if (weights) mem_free_pages(weights, w_pg);
-        if (input)   mem_free_pages(input, v_pg);
-        if (output)  mem_free_pages(output, v_pg);
-        if (ref)     mem_free_pages(ref, v_pg);
-        if (tmp)     mem_free_pages(tmp, v_pg);
+        if (weights_phys) mem_free_pages(weights_phys, w_pg);
+        if (input_phys)   mem_free_pages(input_phys,   v_pg);
+        if (output_phys)  mem_free_pages(output_phys,  v_pg);
+        if (ref_phys)     mem_free_pages(ref_phys,     v_pg);
+        if (tmp_phys)     mem_free_pages(tmp_phys,     v_pg);
     }
 
     /* ── Test 5: Q8_0 matvec 256x256 ─────────────────── */
@@ -633,13 +639,18 @@ void tensor_benchmark(void)
         uint32_t w_pg   = pages_for(w_bytes);
         uint32_t v_pg   = pages_for(cols * sizeof(float));
 
-        uint8_t *weights = (uint8_t *)mem_alloc_pages(w_pg);
-        float   *input   = (float *)mem_alloc_pages(v_pg);
-        float   *output  = (float *)mem_alloc_pages(v_pg);
-        float   *ref     = (float *)mem_alloc_pages(v_pg);
-        float   *tmp     = (float *)mem_alloc_pages(v_pg);
+        void *weights_phys = mem_alloc_pages(w_pg);
+        void *input_phys   = mem_alloc_pages(v_pg);
+        void *output_phys  = mem_alloc_pages(v_pg);
+        void *ref_phys     = mem_alloc_pages(v_pg);
+        void *tmp_phys     = mem_alloc_pages(v_pg);
 
-        if (weights && input && output && ref && tmp) {
+        if (weights_phys && input_phys && output_phys && ref_phys && tmp_phys) {
+            uint8_t *weights = (uint8_t *)PHYS_TO_VIRT(weights_phys);
+            float   *input   = (float *)PHYS_TO_VIRT(input_phys);
+            float   *output  = (float *)PHYS_TO_VIRT(output_phys);
+            float   *ref     = (float *)PHYS_TO_VIRT(ref_phys);
+            float   *tmp     = (float *)PHYS_TO_VIRT(tmp_phys);
             fill_q8_0(weights, rows, cols);
             for (uint32_t i = 0; i < cols; i++)
                 input[i] = (float)((i % 5) + 1) * 0.1f;
@@ -671,11 +682,11 @@ void tensor_benchmark(void)
             serial_puts("[TENSOR] Q8_0 matvec: SKIP (alloc failed)\n");
         }
 
-        if (weights) mem_free_pages(weights, w_pg);
-        if (input)   mem_free_pages(input, v_pg);
-        if (output)  mem_free_pages(output, v_pg);
-        if (ref)     mem_free_pages(ref, v_pg);
-        if (tmp)     mem_free_pages(tmp, v_pg);
+        if (weights_phys) mem_free_pages(weights_phys, w_pg);
+        if (input_phys)   mem_free_pages(input_phys,   v_pg);
+        if (output_phys)  mem_free_pages(output_phys,  v_pg);
+        if (ref_phys)     mem_free_pages(ref_phys,     v_pg);
+        if (tmp_phys)     mem_free_pages(tmp_phys,     v_pg);
     }
 
     /* ── Test 6: RMSNorm ─────────────────────────────── */
@@ -740,11 +751,14 @@ void tensor_benchmark(void)
         uint32_t w_pg   = pages_for(w_bytes);
         uint32_t v_pg   = pages_for(cols * sizeof(float));
 
-        uint8_t *weights = (uint8_t *)mem_alloc_pages(w_pg);
-        float   *input   = (float *)mem_alloc_pages(v_pg);
-        float   *output  = (float *)mem_alloc_pages(v_pg);
+        void *weights_phys = mem_alloc_pages(w_pg);
+        void *input_phys   = mem_alloc_pages(v_pg);
+        void *output_phys  = mem_alloc_pages(v_pg);
 
-        if (weights && input && output) {
+        if (weights_phys && input_phys && output_phys) {
+            uint8_t *weights = (uint8_t *)PHYS_TO_VIRT(weights_phys);
+            float   *input   = (float *)PHYS_TO_VIRT(input_phys);
+            float   *output  = (float *)PHYS_TO_VIRT(output_phys);
             fill_q4_0(weights, rows, cols);
             for (uint32_t i = 0; i < cols; i++)
                 input[i] = (float)((i % 7) + 1) * 0.1f;
@@ -764,9 +778,9 @@ void tensor_benchmark(void)
             serial_puts("[TENSOR] Perf: SKIP (alloc failed)\n");
         }
 
-        if (weights) mem_free_pages(weights, w_pg);
-        if (input)   mem_free_pages(input, v_pg);
-        if (output)  mem_free_pages(output, v_pg);
+        if (weights_phys) mem_free_pages(weights_phys, w_pg);
+        if (input_phys)   mem_free_pages(input_phys,   v_pg);
+        if (output_phys)  mem_free_pages(output_phys,  v_pg);
     }
 
     /* ── Perf: AVX2 vs scalar comparison (if AVX2 available) ── */
@@ -776,12 +790,16 @@ void tensor_benchmark(void)
         uint32_t w_pg   = pages_for(w_bytes);
         uint32_t v_pg   = pages_for(cols * sizeof(float));
 
-        uint8_t *weights = (uint8_t *)mem_alloc_pages(w_pg);
-        float   *input2  = (float *)mem_alloc_pages(v_pg);
-        float   *out_s   = (float *)mem_alloc_pages(v_pg);
-        float   *out_a   = (float *)mem_alloc_pages(v_pg);
+        void *weights_phys = mem_alloc_pages(w_pg);
+        void *input2_phys  = mem_alloc_pages(v_pg);
+        void *out_s_phys   = mem_alloc_pages(v_pg);
+        void *out_a_phys   = mem_alloc_pages(v_pg);
 
-        if (weights && input2 && out_s && out_a) {
+        if (weights_phys && input2_phys && out_s_phys && out_a_phys) {
+            uint8_t *weights = (uint8_t *)PHYS_TO_VIRT(weights_phys);
+            float   *input2  = (float *)PHYS_TO_VIRT(input2_phys);
+            float   *out_s   = (float *)PHYS_TO_VIRT(out_s_phys);
+            float   *out_a   = (float *)PHYS_TO_VIRT(out_a_phys);
             fill_q4_0(weights, rows, cols);
             for (uint32_t i = 0; i < cols; i++)
                 input2[i] = (float)((i % 7) + 1) * 0.1f;
@@ -824,10 +842,10 @@ void tensor_benchmark(void)
             if (max_diff >= 0.01f) pass = 0;
         }
 
-        if (weights) mem_free_pages(weights, w_pg);
-        if (input2)  mem_free_pages(input2, v_pg);
-        if (out_s)   mem_free_pages(out_s, v_pg);
-        if (out_a)   mem_free_pages(out_a, v_pg);
+        if (weights_phys) mem_free_pages(weights_phys, w_pg);
+        if (input2_phys)  mem_free_pages(input2_phys,  v_pg);
+        if (out_s_phys)   mem_free_pages(out_s_phys,   v_pg);
+        if (out_a_phys)   mem_free_pages(out_a_phys,   v_pg);
     }
 
     /* ── Summary ─────────────────────────────────────── */
