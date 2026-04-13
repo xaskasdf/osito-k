@@ -10,6 +10,7 @@
  */
 
 #include "../include/types.h"
+#include "../include/paging.h"
 
 /* ── External functions ──────────────────────────────────────── */
 
@@ -164,28 +165,42 @@ static int paging_map_2m(uint64_t virt, uint64_t phys, uint64_t flags)
     return 0;
 }
 
-/* ── Identity map a range (auto-selects 2MB or 4KB pages) ───── */
+/* ── Map a range with an arbitrary virt = phys + virt_offset ── */
 
-static void paging_identity_map_range(uint64_t start, uint64_t end, uint64_t extra_flags)
+/* Maps [phys_start, phys_end) into the kernel PML4 at
+ * virt = phys + virt_offset. Auto-selects 2 MB or 4 KB pages.
+ * - virt_offset == 0 gives an identity map (the old behavior).
+ * - virt_offset == KERNEL_VBASE gives the upper-half direct map.
+ * Both can coexist — the kernel currently installs both. */
+static void paging_map_range_at(uint64_t phys_start, uint64_t phys_end,
+                                uint64_t virt_offset, uint64_t extra_flags)
 {
     uint64_t flags_2m = PTE_PRESENT | PTE_WRITABLE | PTE_GLOBAL | extra_flags;
     uint64_t flags_4k = PTE_PRESENT | PTE_WRITABLE | PTE_GLOBAL | extra_flags;
 
     /* Align start down and end up to 4KB boundaries */
-    start &= ~(PAGE_SIZE - 1);
-    end = (end + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+    phys_start &= ~(PAGE_SIZE - 1);
+    phys_end = (phys_end + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
 
-    uint64_t addr = start;
-    while (addr < end) {
+    uint64_t phys = phys_start;
+    while (phys < phys_end) {
+        uint64_t virt = phys + virt_offset;
         /* Use 2MB page if aligned and enough space */
-        if ((addr & (LARGE_PAGE_SIZE - 1)) == 0 && (end - addr) >= LARGE_PAGE_SIZE) {
-            paging_map_2m(addr, addr, flags_2m);
-            addr += LARGE_PAGE_SIZE;
+        if ((phys & (LARGE_PAGE_SIZE - 1)) == 0 && (phys_end - phys) >= LARGE_PAGE_SIZE) {
+            paging_map_2m(virt, phys, flags_2m);
+            phys += LARGE_PAGE_SIZE;
         } else {
-            paging_map_4k(addr, addr, flags_4k);
-            addr += PAGE_SIZE;
+            paging_map_4k(virt, phys, flags_4k);
+            phys += PAGE_SIZE;
         }
     }
+}
+
+/* ── Identity map a range (thin wrapper) ────────────────────── */
+
+static void paging_identity_map_range(uint64_t start, uint64_t end, uint64_t extra_flags)
+{
+    paging_map_range_at(start, end, 0, extra_flags);
 }
 
 /* ── CR3 helpers ─────────────────────────────────────────────── */
@@ -532,6 +547,21 @@ void paging_init(void)
     /* Note: actual BAR addresses vary by system. The PCI scan
      * discovers them at runtime. For now we pre-map common ranges.
      * Individual drivers can also call paging_map_mmio() later. */
+
+    /* 4. Upper-half direct map (Fase 1): mirror all of RAM at
+     *    VA = phys + KERNEL_VBASE. This populates PML4[256] so that
+     *    drivers migrated to PHYS_TO_VIRT(phys) can dereference the
+     *    upper-half alias. The lower-half identity map above stays
+     *    active — kernel text still runs identity-mapped. */
+    serial_puts("[PAGE] Mapping upper-half mirror at 0x");
+    serial_puthex(KERNEL_VBASE, 16);
+    serial_puts("...\n");
+    paging_map_range_at(0, 4ULL * 1024 * 1024 * 1024, KERNEL_VBASE, 0);
+    if (total > 4ULL * 1024 * 1024 * 1024) {
+        uint64_t extended = total;
+        extended = (extended + (1ULL << 30) - 1) & ~((1ULL << 30) - 1);
+        paging_map_range_at(4ULL * 1024 * 1024 * 1024, extended, KERNEL_VBASE, 0);
+    }
 
     serial_puts("[PAGE] Page tables built: ");
     serial_putdec(pt_pages_used);
