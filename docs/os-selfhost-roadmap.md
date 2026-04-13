@@ -332,6 +332,58 @@ regression test de PE binaries, quedan diferidos.
 - El resto del kernel sigue funcionando via identity map lower-half;
   los drivers todavía acceden sus DMA buffers por su phys vía identity.
 
+**Identity-map removal — Phase C ✅ DONE (2026-04-13)**
+
+User processes now get a pristine lower-half address space — no
+kernel pollution. `paging_create_process_cr3()` allocates an empty
+PDPT for `PML4[0]` (instead of cloning kernel's identity entries),
+and ELF demand-paging + sys_mmap demand-fault install per-process
+PTEs lazily as the process touches addresses. Each process's lower
+half is purely its own; the kernel direct map at `PML4[256]` is the
+only shared piece.
+
+To make this work, several supporting pieces had to land first
+(commits `33ef71a`, `f8bd01c`, `edd2011`):
+
+- **Kernel + user stacks via PHYS_TO_VIRT**: `sched_spawn`,
+  `proc_fork` (kernel + child user stack), `proc_clone_thread`, and
+  `elf_setup_stack` allocate via `mem_alloc_aligned` and store the
+  upper-half view. The user RSP is universally accessible via
+  PML4[256].
+- **`setjmp/longjmp` save/restore CR3**: `jmp_buf` extended to 9 slots
+  (slot[8] = CR3). `kern_setjmp` captures the active CR3, `kern_longjmp`
+  restores it BEFORE touching the C stack — required because
+  `proc_exit` longjmps from the user's CR3 back to `proc_exec` which
+  runs on the boot kernel stack at low phys.
+- **`elf_jump` CR3 switch in asm**: the very last operation before the
+  user binary runs is `mov new_cr3, %cr3; mov sp, %rsp; jmp *entry` —
+  three instructions with no C stack touches between them.
+- **`paging_map_mmio` + `paging_map_wc` dual-install**: both helpers
+  now also call `paging_map_range_at(phys, ..., KERNEL_VBASE, flags)`
+  so MMIO regions show up at PML4[256]+phys for any CR3.
+- **Drivers MMIO via PHYS_TO_VIRT**: `nvme.bar0`, `nic.bar0`,
+  `hc->base` store upper-half virt pointers so register access works
+  from any process CR3.
+- **OsitoFS v2/v3 state via PHYS_TO_VIRT**: `file_table`, `crc_table`,
+  `inode_bitmap`, `block_bitmap`, `inode_table`, dir scan blk all
+  live at upper-half. `osfs2_read` runs from `demand_page_fault` in
+  the user's CR3, so file-table accesses needed migration.
+- **APIC base via `PHYS_TO_VIRT`**: timer ISR's `apic_write(APIC_EOI,...)`
+  works from any CR3.
+- **idt.c gates**: IAT watchdog gated on `g_compat32_mode`;
+  NULL-CALL recovery and post-fault diagnostic dumps gated on
+  compat32 CS so they don't fault re-entrantly while handling a
+  native x86_64 user crash.
+
+Validated in QEMU: NVMe + OsitoFS mount + I211 NIC + DHCP + xHCI HID
++ tensor benchmarks all pass. `exec quake2.elf` (freshly rebuilt
+against the current libc) demand-pages through the new layout, runs
+Q2's full init sequence (Sys_Init, NET_Init, Netchan_Init, SV_Init,
+CL_Init, Con_Init, S_Init, VID_Init, Loading refresh, R_FindImage)
+and hits an unrelated Q2-internal NULL function pointer in the
+software renderer — the kernel reports the trap frame, kills PID 2
+with signal 11, the shell prompt returns. Single fault, no cascade.
+
 **Identity-map removal — Phase B (drivers) en progreso (2026-04-13)**
 
 Drivers boot-tested migrados a PHYS_TO_VIRT (struct fields = upper-half
