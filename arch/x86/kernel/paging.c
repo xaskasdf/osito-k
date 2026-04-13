@@ -596,7 +596,7 @@ void paging_init(void)
     {
         void *guard_phys = mem_alloc_pages(1);
         if (guard_phys) {
-            memset(guard_phys, 0, PAGE_SIZE);
+            memset(PHYS_TO_VIRT(guard_phys), 0, PAGE_SIZE);
             paging_map_4k(0, (uint64_t)guard_phys,
                           PTE_PRESENT | PTE_GLOBAL | PTE_NX); /* read-only + NX */
             invlpg(0);
@@ -756,13 +756,15 @@ int paging_cow_copy(uint64_t virt)
     uint64_t old_phys = *pte & PTE_ADDR_MASK;
     uint64_t flags = *pte & ~PTE_ADDR_MASK;
 
-    /* Allocate new page and copy contents */
-    void *new_page = mem_alloc_pages(1);
-    if (!new_page) return -1;
-    memcpy(new_page, (void *)old_phys, PAGE_SIZE);
+    /* Allocate new page and copy contents via the upper-half mirror
+     * (old_phys is still live under its own PTE so we copy it through
+     * the kernel direct map, not the identity map). */
+    void *new_phys = mem_alloc_pages(1);
+    if (!new_phys) return -1;
+    memcpy(PHYS_TO_VIRT(new_phys), PHYS_TO_VIRT(old_phys), PAGE_SIZE);
 
     /* Remap: new physical page, writable, no COW */
-    *pte = (uint64_t)new_page | (flags & ~PTE_COW) | PTE_WRITABLE;
+    *pte = (uint64_t)new_phys | (flags & ~PTE_COW) | PTE_WRITABLE;
 
     /* Flush TLB for this address */
     __asm__ volatile ("invlpg (%0)" : : "r"(virt) : "memory");
