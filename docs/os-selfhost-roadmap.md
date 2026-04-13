@@ -332,6 +332,31 @@ regression test de PE binaries, quedan diferidos.
 - El resto del kernel sigue funcionando via identity map lower-half;
   los drivers todavía acceden sus DMA buffers por su phys vía identity.
 
+**Identity-map removal — Phase B (drivers) en progreso (2026-04-13)**
+
+Drivers boot-tested migrados a PHYS_TO_VIRT (struct fields = upper-half
+virt para CPU access, struct field cacheado `_phys` para cuando el
+hardware necesita la dirección física):
+
+- `nvme.c` — commit `039844f`: admin SQ/CQ, identify buffer, I/O CQ/SQ,
+  nvme_read_bytes/nvme_write_bytes temp DMA staging buffers. Validado:
+  controlador inicializa, NS1 reportada correctamente, OsitoFS monta.
+- `i211.c` — commit `48e6acd`: RX/TX descriptor rings y packet buffers.
+  Nuevo campo `tx_bufs_phys` para evitar VIRT_TO_PHYS en el hot path
+  de TX. Validado: NIC up, DHCP IP obtenida (TX exercise), UDP listening.
+- `xhci.c` + `xhci.h` — commit `4653846`: el driver más grande del
+  conjunto. Cacheo de phys en `xhci_hc_t.{dcbaa,cmd_ring,evt_ring}_phys`
+  y `xhci_device_t.{output_ctx,ep0_ring,int_ring,report_buf}_phys`.
+  Migrados: DCBAAP/CRCR/ERDP/ERSTBA register writes, scratchpad
+  indirection, link TRBs en wrap, ctrl_transfer data param, eval_ctx,
+  HID interrupt rings + report buffers, evt_poll re-arm. ERDP recompute
+  (4 sitios) usa `evt_ring_phys + offset`. Validado: 2 HID devices
+  (keyboard + mouse) enumerados completos.
+
+**Pendiente Phase B**: drivers no boot-tested (gsp, virtio, hda).
+Migración mecánica posible pero sin regression test hasta correr el
+hardware/qemu device correspondiente.
+
 **Identity-map removal — Phase A ✅ DONE (2026-04-13)**
 
 - `paging.c` (commit `3600e21`): page-table walks ya no dependen del
