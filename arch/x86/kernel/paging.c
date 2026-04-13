@@ -67,18 +67,24 @@ static uint32_t  pt_pages_used;  /* Number of 4KB pages allocated for tables */
 
 extern void *mem_alloc_aligned_high(uint64_t size, uint64_t alignment);
 
+/* Allocate a fresh page-table page and return an UPPER-HALF (virt)
+ * pointer to it. The hardware always sees the physical address (stored
+ * via VIRT_TO_PHYS in parent PTEs); kernel C code reads/writes the
+ * page through the upper-half mirror so it does not depend on the
+ * lower-half identity map. */
 static uint64_t *pt_alloc_page(void)
 {
     /* Allocate from high memory to avoid collisions with ET_EXEC
      * binaries that load in low memory (typically 0x400000-0x10000000). */
-    uint64_t *page = (uint64_t *)mem_alloc_aligned_high(PAGE_SIZE, PAGE_SIZE);
-    if (!page)
-        page = (uint64_t *)mem_alloc_aligned(PAGE_SIZE, PAGE_SIZE);
-    if (page) {
-        memset(page, 0, PAGE_SIZE);
-        pt_pages_used++;
-    }
-    return page;
+    void *phys = mem_alloc_aligned_high(PAGE_SIZE, PAGE_SIZE);
+    if (!phys)
+        phys = mem_alloc_aligned(PAGE_SIZE, PAGE_SIZE);
+    if (!phys)
+        return NULL;
+    uint64_t *virt = (uint64_t *)PHYS_TO_VIRT(phys);
+    memset(virt, 0, PAGE_SIZE);
+    pt_pages_used++;
+    return virt;
 }
 
 /* ── Get or create next-level table ──────────────────────────── */
@@ -86,13 +92,13 @@ static uint64_t *pt_alloc_page(void)
 static uint64_t *pt_get_or_create(uint64_t *table, int index)
 {
     if (table[index] & PTE_PRESENT) {
-        return (uint64_t *)(table[index] & PTE_ADDR_MASK);
+        return (uint64_t *)PHYS_TO_VIRT(table[index] & PTE_ADDR_MASK);
     }
 
     uint64_t *new_table = pt_alloc_page();
     if (!new_table) return NULL;
 
-    table[index] = (uint64_t)new_table | PTE_PRESENT | PTE_WRITABLE;
+    table[index] = (uint64_t)VIRT_TO_PHYS(new_table) | PTE_PRESENT | PTE_WRITABLE;
     return new_table;
 }
 
@@ -121,12 +127,12 @@ static int paging_map_4k(uint64_t virt, uint64_t phys, uint64_t flags)
         /* Fill PT with 512 identity-mapped 4KB entries */
         for (int i = 0; i < 512; i++)
             pt[i] = (large_phys + i * PAGE_SIZE) | large_flags;
-        /* Replace 2MB entry with PT pointer */
-        pd[pd_idx] = (uint64_t)pt | PTE_PRESENT | PTE_WRITABLE;
+        /* Replace 2MB entry with PT pointer (store phys, hardware reads it) */
+        pd[pd_idx] = (uint64_t)VIRT_TO_PHYS(pt) | PTE_PRESENT | PTE_WRITABLE;
         serial_puts("[paging] split 2MB @ 0x");
         serial_puthex(large_phys, 8);
         serial_puts(" -> PT 0x");
-        serial_puthex((uint64_t)pt, 8);
+        serial_puthex((uint64_t)VIRT_TO_PHYS(pt), 8);
         serial_puts("\n");
 
         /* Full TLB flush after 2MB→4KB split.
@@ -248,7 +254,7 @@ static int paging_map_4k_in(uint64_t *pml4, uint64_t virt, uint64_t phys, uint64
         if (!pt) return -1;
         for (int i = 0; i < 512; i++)
             pt[i] = (large_phys + i * PAGE_SIZE) | large_flags;
-        pd[pd_idx] = (uint64_t)pt | PTE_PRESENT | PTE_WRITABLE;
+        pd[pd_idx] = (uint64_t)VIRT_TO_PHYS(pt) | PTE_PRESENT | PTE_WRITABLE;
 
         /* Full TLB flush after split */
         uint64_t cr3_val, cr4;
@@ -283,7 +289,7 @@ int paging_map_page(uint64_t virt, uint64_t phys, uint64_t flags)
 int paging_map_page_in_cr3(uint64_t cr3, uint64_t virt, uint64_t phys, uint64_t flags)
 {
     if (!cr3) return -1;
-    uint64_t *pml4 = (uint64_t *)(cr3 & PTE_ADDR_MASK);
+    uint64_t *pml4 = (uint64_t *)PHYS_TO_VIRT(cr3 & PTE_ADDR_MASK);
     int ret = paging_map_4k_in(pml4, virt, phys, flags | PTE_PRESENT);
     if (ret == 0) invlpg(virt);
     return ret;
@@ -293,22 +299,22 @@ int paging_map_page_in_cr3(uint64_t cr3, uint64_t virt, uint64_t phys, uint64_t 
 int paging_unmap_page_in_cr3(uint64_t cr3, uint64_t virt)
 {
     if (!cr3) return -1;
-    uint64_t *pml4 = (uint64_t *)(cr3 & PTE_ADDR_MASK);
+    uint64_t *pml4 = (uint64_t *)PHYS_TO_VIRT(cr3 & PTE_ADDR_MASK);
     uint64_t *pdpt, *pd, *pt;
     int idx;
 
     idx = PML4_INDEX(virt);
     if (!(pml4[idx] & PTE_PRESENT)) return -1;
-    pdpt = (uint64_t *)(pml4[idx] & PTE_ADDR_MASK);
+    pdpt = (uint64_t *)PHYS_TO_VIRT(pml4[idx] & PTE_ADDR_MASK);
 
     idx = PDPT_INDEX(virt);
     if (!(pdpt[idx] & PTE_PRESENT)) return -1;
-    pd = (uint64_t *)(pdpt[idx] & PTE_ADDR_MASK);
+    pd = (uint64_t *)PHYS_TO_VIRT(pdpt[idx] & PTE_ADDR_MASK);
 
     idx = PD_INDEX(virt);
     if (!(pd[idx] & PTE_PRESENT)) return -1;
     if (pd[idx] & PTE_LARGE) return -1;
-    pt = (uint64_t *)(pd[idx] & PTE_ADDR_MASK);
+    pt = (uint64_t *)PHYS_TO_VIRT(pd[idx] & PTE_ADDR_MASK);
 
     pt[PT_INDEX(virt)] = 0;
     invlpg(virt);
@@ -319,7 +325,7 @@ int paging_unmap_page_in_cr3(uint64_t cr3, uint64_t virt)
 uint64_t *paging_get_pte_in_cr3(uint64_t cr3, uint64_t virt)
 {
     if (!cr3) return NULL;
-    uint64_t *pml4 = (uint64_t *)(cr3 & PTE_ADDR_MASK);
+    uint64_t *pml4 = (uint64_t *)PHYS_TO_VIRT(cr3 & PTE_ADDR_MASK);
     uint64_t *pdpt = pte_walk(pml4, PML4_INDEX(virt));
     if (!pdpt) return NULL;
     uint64_t *pd = pte_walk(pdpt, PDPT_INDEX(virt));
@@ -340,16 +346,16 @@ int paging_unmap_page(uint64_t virt)
 
     idx = PML4_INDEX(virt);
     if (!(kernel_pml4[idx] & PTE_PRESENT)) return -1;
-    pdpt = (uint64_t *)(kernel_pml4[idx] & PTE_ADDR_MASK);
+    pdpt = (uint64_t *)PHYS_TO_VIRT(kernel_pml4[idx] & PTE_ADDR_MASK);
 
     idx = PDPT_INDEX(virt);
     if (!(pdpt[idx] & PTE_PRESENT)) return -1;
-    pd = (uint64_t *)(pdpt[idx] & PTE_ADDR_MASK);
+    pd = (uint64_t *)PHYS_TO_VIRT(pdpt[idx] & PTE_ADDR_MASK);
 
     idx = PD_INDEX(virt);
     if (!(pd[idx] & PTE_PRESENT)) return -1;
     if (pd[idx] & PTE_LARGE) return -1;  /* Can't unmap within 2MB page */
-    pt = (uint64_t *)(pd[idx] & PTE_ADDR_MASK);
+    pt = (uint64_t *)PHYS_TO_VIRT(pd[idx] & PTE_ADDR_MASK);
 
     pt[PT_INDEX(virt)] = 0;
     invlpg(virt);
@@ -366,16 +372,16 @@ int paging_set_flags(uint64_t virt, uint64_t flags)
 
     idx = PML4_INDEX(virt);
     if (!(kernel_pml4[idx] & PTE_PRESENT)) return -1;
-    pdpt = (uint64_t *)(kernel_pml4[idx] & PTE_ADDR_MASK);
+    pdpt = (uint64_t *)PHYS_TO_VIRT(kernel_pml4[idx] & PTE_ADDR_MASK);
 
     idx = PDPT_INDEX(virt);
     if (!(pdpt[idx] & PTE_PRESENT)) return -1;
-    pd = (uint64_t *)(pdpt[idx] & PTE_ADDR_MASK);
+    pd = (uint64_t *)PHYS_TO_VIRT(pdpt[idx] & PTE_ADDR_MASK);
 
     idx = PD_INDEX(virt);
     if (!(pd[idx] & PTE_PRESENT)) return -1;
     if (pd[idx] & PTE_LARGE) return -1;  /* Can't change 2MB page flags */
-    pt = (uint64_t *)(pd[idx] & PTE_ADDR_MASK);
+    pt = (uint64_t *)PHYS_TO_VIRT(pd[idx] & PTE_ADDR_MASK);
 
     idx = PT_INDEX(virt);
     uint64_t phys = pt[idx] & PTE_ADDR_MASK;
@@ -456,7 +462,7 @@ static void reserve_old_page_tables(uint64_t cr3_phys)
     if (old_pt_count < OLD_PT_MAX)
         old_pt_pages[old_pt_count++] = pml4_page;
 
-    uint64_t *pml4 = (uint64_t *)pml4_page;
+    uint64_t *pml4 = (uint64_t *)PHYS_TO_VIRT(pml4_page);
     for (int i = 0; i < ENTRIES_PER_TABLE; i++) {
         if (!(pml4[i] & PTE_PRESENT)) continue;
 
@@ -465,7 +471,7 @@ static void reserve_old_page_tables(uint64_t cr3_phys)
         if (old_pt_count < OLD_PT_MAX)
             old_pt_pages[old_pt_count++] = pdpt_page;
 
-        uint64_t *pdpt = (uint64_t *)pdpt_page;
+        uint64_t *pdpt = (uint64_t *)PHYS_TO_VIRT(pdpt_page);
         for (int j = 0; j < ENTRIES_PER_TABLE; j++) {
             if (!(pdpt[j] & PTE_PRESENT)) continue;
             if (pdpt[j] & PTE_LARGE) continue;  /* 1GB page, no PD */
@@ -570,7 +576,9 @@ void paging_init(void)
     serial_puts(" KB)\n");
 
     /* ── Switch CR3 ── */
-    kernel_cr3 = (uint64_t)kernel_pml4;
+    /* kernel_pml4 is now an upper-half virt pointer; the CR3 register
+     * needs the underlying physical address. */
+    kernel_cr3 = VIRT_TO_PHYS(kernel_pml4);
 
     serial_puts("[PAGE] Switching CR3 to 0x");
     serial_puthex(kernel_cr3, 16);
@@ -641,7 +649,7 @@ static uint64_t *clone_pd(uint64_t kernel_pd_entry)
     uint64_t *new_pd = pt_alloc_page();
     if (!new_pd) return NULL;
     if (kernel_pd_entry & PTE_PRESENT) {
-        uint64_t *src = (uint64_t *)(kernel_pd_entry & PTE_ADDR_MASK);
+        uint64_t *src = (uint64_t *)PHYS_TO_VIRT(kernel_pd_entry & PTE_ADDR_MASK);
         memcpy(new_pd, src, PAGE_SIZE);
     }
     return new_pd;
@@ -660,7 +668,7 @@ uint64_t paging_create_process_cr3(void)
      * Process binaries typically load in 0x00000000..0x40000000
      * (covered by PDPT[0] entries 0..0). Anything per-process must
      * have its own PD here. */
-    uint64_t *kernel_pdpt = (uint64_t *)(kernel_pml4[0] & PTE_ADDR_MASK);
+    uint64_t *kernel_pdpt = (uint64_t *)PHYS_TO_VIRT(kernel_pml4[0] & PTE_ADDR_MASK);
     uint64_t *pdpt = pt_alloc_page();
     if (!pdpt) return 0;
     for (int i = 0; i < 512; i++)
@@ -672,45 +680,47 @@ uint64_t paging_create_process_cr3(void)
      * sibling processes that also load there. */
     uint64_t *pd0 = clone_pd(kernel_pdpt[0]);
     if (!pd0) return 0;
-    pdpt[0] = (uint64_t)pd0 | PTE_PRESENT | PTE_WRITABLE;
+    pdpt[0] = (uint64_t)VIRT_TO_PHYS(pd0) | PTE_PRESENT | PTE_WRITABLE;
 
     /* Own PD for PDPT[1] (0x40000000-0x7FFFFFFF — user mmap allocations) */
     uint64_t *pd1 = clone_pd(kernel_pdpt[1]);
     if (!pd1) return 0;
-    pdpt[1] = (uint64_t)pd1 | PTE_PRESENT | PTE_WRITABLE;
+    pdpt[1] = (uint64_t)VIRT_TO_PHYS(pd1) | PTE_PRESENT | PTE_WRITABLE;
 
-    pml4[0] = (uint64_t)pdpt | PTE_PRESENT | PTE_WRITABLE;
+    pml4[0] = (uint64_t)VIRT_TO_PHYS(pdpt) | PTE_PRESENT | PTE_WRITABLE;
 
-    return (uint64_t)pml4;
+    /* Return phys for the CR3 register */
+    return VIRT_TO_PHYS(pml4);
 }
 
 void paging_free_process_cr3(uint64_t cr3)
 {
     if (!cr3 || cr3 == kernel_cr3) return;
 
-    uint64_t *pml4 = (uint64_t *)cr3;
+    /* cr3 is a phys address; resolve it via the upper-half mirror. */
+    uint64_t *pml4 = (uint64_t *)PHYS_TO_VIRT(cr3 & PTE_ADDR_MASK);
     if (pml4[0] & PTE_PRESENT) {
-        uint64_t *pdpt = (uint64_t *)(pml4[0] & PTE_ADDR_MASK);
+        uint64_t pdpt_phys = pml4[0] & PTE_ADDR_MASK;
+        uint64_t *pdpt = (uint64_t *)PHYS_TO_VIRT(pdpt_phys);
         /* Free PDPT[0]'s private PD (BIOS / kernel id-map / ELF range) */
         if (pdpt[0] & PTE_PRESENT) {
-            uint64_t *pd0 = (uint64_t *)(pdpt[0] & PTE_ADDR_MASK);
+            uint64_t pd0_phys = pdpt[0] & PTE_ADDR_MASK;
             /* Only free if this PD is owned by the process (not the
-             * kernel's shared PD). Cheap test: compare against the
-             * kernel's PDPT[0]→PD[0] entry. */
-            uint64_t *kpdpt = (uint64_t *)(kernel_pml4[0] & PTE_ADDR_MASK);
-            if ((uint64_t)pd0 != (kpdpt[0] & PTE_ADDR_MASK))
-                mem_free_pages(pd0, 1);
+             * kernel's shared PD). Compare phys-to-phys. */
+            uint64_t *kpdpt = (uint64_t *)PHYS_TO_VIRT(kernel_pml4[0] & PTE_ADDR_MASK);
+            if (pd0_phys != (kpdpt[0] & PTE_ADDR_MASK))
+                mem_free_pages((void *)pd0_phys, 1);
         }
         /* Free PDPT[1]'s private PD */
         if (pdpt[1] & PTE_PRESENT) {
-            uint64_t *pd1 = (uint64_t *)(pdpt[1] & PTE_ADDR_MASK);
-            uint64_t *kpdpt = (uint64_t *)(kernel_pml4[0] & PTE_ADDR_MASK);
-            if ((uint64_t)pd1 != (kpdpt[1] & PTE_ADDR_MASK))
-                mem_free_pages(pd1, 1);
+            uint64_t pd1_phys = pdpt[1] & PTE_ADDR_MASK;
+            uint64_t *kpdpt = (uint64_t *)PHYS_TO_VIRT(kernel_pml4[0] & PTE_ADDR_MASK);
+            if (pd1_phys != (kpdpt[1] & PTE_ADDR_MASK))
+                mem_free_pages((void *)pd1_phys, 1);
         }
-        mem_free_pages(pdpt, 1);
+        mem_free_pages((void *)pdpt_phys, 1);
     }
-    mem_free_pages(pml4, 1);
+    mem_free_pages((void *)(cr3 & PTE_ADDR_MASK), 1);
 }
 
 /* ── Copy-on-Write (COW) support ─────────────────────────────── */
@@ -720,14 +730,14 @@ void paging_free_process_cr3(uint64_t cr3)
 static uint64_t *pte_walk(uint64_t *table, int index)
 {
     if (!(table[index] & PTE_PRESENT)) return NULL;
-    return (uint64_t *)(table[index] & PTE_ADDR_MASK);
+    return (uint64_t *)PHYS_TO_VIRT(table[index] & PTE_ADDR_MASK);
 }
 
 uint64_t *paging_get_pte(uint64_t virt)
 {
     uint64_t cr3;
     __asm__ volatile ("mov %%cr3, %0" : "=r"(cr3));
-    uint64_t *pml4 = (uint64_t *)(cr3 & PTE_ADDR_MASK);
+    uint64_t *pml4 = (uint64_t *)PHYS_TO_VIRT(cr3 & PTE_ADDR_MASK);
 
     uint64_t *pdpt = pte_walk(pml4, PML4_INDEX(virt));
     if (!pdpt) return NULL;
@@ -792,7 +802,7 @@ uint64_t paging_create_win32_cr3(void)
     memcpy(win32_pml4, kernel_pml4, PAGE_SIZE);
 
     /* 2. Get kernel's PDPT for PML4[0] */
-    uint64_t *kernel_pdpt = (uint64_t *)(kernel_pml4[0] & PTE_ADDR_MASK);
+    uint64_t *kernel_pdpt = (uint64_t *)PHYS_TO_VIRT(kernel_pml4[0] & PTE_ADDR_MASK);
 
     /* 3. Allocate new PDPT — SHARE all entries from kernel's PDPT.
      * Only PDPT[1] is replaced with our own PD for VirtualAlloc VAs.
@@ -811,21 +821,21 @@ uint64_t paging_create_win32_cr3(void)
      * VirtualAlloc creates private PTs under this shared PD via
      * paging_win32_map_page(), which splits 2MB pages as needed. */
     win32_pd1 = (kernel_pdpt[1] & PTE_PRESENT)
-              ? (uint64_t *)(kernel_pdpt[1] & PTE_ADDR_MASK)
+              ? (uint64_t *)PHYS_TO_VIRT(kernel_pdpt[1] & PTE_ADDR_MASK)
               : NULL;
     /* PDPT[1] already points to kernel's PD via the copy at line 636 */
 
     /* 5. Wire up: Win32 PML4[0] → our PDPT (all PDs shared by reference) */
-    win32_pml4[0] = (uint64_t)win32_pdpt | PTE_PRESENT | PTE_WRITABLE;
+    win32_pml4[0] = (uint64_t)VIRT_TO_PHYS(win32_pdpt) | PTE_PRESENT | PTE_WRITABLE;
 
-    win32_cr3_val = (uint64_t)win32_pml4;
+    win32_cr3_val = VIRT_TO_PHYS(win32_pml4);
 
     serial_puts("[PAGE] Win32 CR3 created: PML4=0x");
     serial_puthex(win32_cr3_val, 8);
     serial_puts(" PDPT=0x");
-    serial_puthex((uint64_t)win32_pdpt, 8);
+    serial_puthex(VIRT_TO_PHYS(win32_pdpt), 8);
     serial_puts(" PD1=0x");
-    serial_puthex((uint64_t)win32_pd1, 8);
+    serial_puthex(win32_pd1 ? VIRT_TO_PHYS(win32_pd1) : 0, 8);
     serial_puts("\n");
 
     return win32_cr3_val;
@@ -856,7 +866,7 @@ uint64_t paging_win32_va_to_pa(uint64_t va)
         return (pde & 0x000FFFFFFFE00000ULL) | (va & 0x1FFFFF);
     }
 
-    uint64_t *pt = (uint64_t *)(pde & PTE_ADDR_MASK);
+    uint64_t *pt = (uint64_t *)PHYS_TO_VIRT(pde & PTE_ADDR_MASK);
     uint64_t pte = pt[PT_INDEX(va)];
     if (!(pte & PTE_PRESENT)) return 0;
 
