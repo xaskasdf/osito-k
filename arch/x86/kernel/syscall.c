@@ -26,6 +26,7 @@
  */
 
 #include "../include/types.h"
+#include "../include/paging.h"
 #include "../fs/vfs.h"
 #include "../fs/ositofs3.h"
 
@@ -1256,8 +1257,11 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
 
     uint64_t base = (uint64_t)pages;
 
-    /* Zero the memory (MAP_ANONYMOUS guarantees zeroed pages) */
-    memset(pages, 0, npages * 4096);
+    /* Zero the memory via the upper-half mirror (MAP_ANONYMOUS
+     * guarantees zeroed pages). The returned VA is still the phys
+     * under the lower-half identity map — user space accesses it
+     * there until the identity map is eventually removed. */
+    memset(PHYS_TO_VIRT(pages), 0, npages * 4096);
 
     /* Track the VMA */
     vma_table[vi].base   = base;
@@ -1322,10 +1326,10 @@ static int64_t sys_mprotect(uint64_t addr, uint64_t length, uint64_t prot)
             if (vma_table[i].prot == 0 && prot != 0) {
                 for (uint64_t p = 0; p < npages; p++) {
                     uint64_t va = addr + p * 4096;
-                    void *page = mem_alloc_pages(1);
-                    if (!page) return -ENOMEM;
-                    memset(page, 0, 4096);
-                    paging_map_page(va, (uint64_t)page, pte_flags);
+                    void *phys = mem_alloc_pages(1);
+                    if (!phys) return -ENOMEM;
+                    memset(PHYS_TO_VIRT(phys), 0, 4096);
+                    paging_map_page(va, (uint64_t)phys, pte_flags);
                 }
             } else {
                 /* Update existing page table entries */
@@ -1416,10 +1420,14 @@ int demand_page_fault(uint64_t addr, uint64_t error_code)
     }
     if (!vma) return -1;  /* No VMA → SIGSEGV */
 
-    /* Allocate a physical page, zero-filled */
-    void *page = mem_alloc_pages(1);
-    if (!page) return -1;
-    memset(page, 0, 4096);
+    /* Allocate a physical page, zero-filled via the upper-half mirror.
+     * CPU writes (memset + vfs_read) go through the kernel direct map;
+     * the phys value below is what later gets written into the user
+     * PTE by paging_map_page_in_cr3. */
+    void *phys = mem_alloc_pages(1);
+    if (!phys) return -1;
+    void *page_virt = PHYS_TO_VIRT(phys);
+    memset(page_virt, 0, 4096);
 
     /* For file-backed VMAs, read file data into the page */
     if (vma->type == VMA_FILE_ELF || vma->type == VMA_FILE_MMAP) {
@@ -1430,8 +1438,8 @@ int demand_page_fault(uint64_t addr, uint64_t error_code)
                 to_read = vma->file_size - offset_in_vma;
             vfs_node_t node_copy = vma->file_node;
             if (vfs_read(&node_copy, vma->file_offset + offset_in_vma,
-                         page, to_read) < 0) {
-                mem_free_pages(page, 1);
+                         page_virt, to_read) < 0) {
+                mem_free_pages(phys, 1);
                 return -1;
             }
         }
@@ -1443,10 +1451,10 @@ int demand_page_fault(uint64_t addr, uint64_t error_code)
      * without a per-process CR3 (e.g. the idle/kernel task). */
     uint64_t pte_flags = prot_to_pte_flags(vma->prot);
     uint64_t cr3 = proc_current_cr3();
-    int rc = cr3 ? paging_map_page_in_cr3(cr3, page_addr, (uint64_t)page, pte_flags)
-                 : paging_map_page(page_addr, (uint64_t)page, pte_flags);
+    int rc = cr3 ? paging_map_page_in_cr3(cr3, page_addr, (uint64_t)phys, pte_flags)
+                 : paging_map_page(page_addr, (uint64_t)phys, pte_flags);
     if (rc != 0) {
-        mem_free_pages(page, 1);
+        mem_free_pages(phys, 1);
         return -1;
     }
 
