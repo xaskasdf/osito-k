@@ -10,6 +10,7 @@
 
 #include "inference.h"
 #include "tensor.h"
+#include "../include/paging.h"
 
 #ifdef __EMSCRIPTEN__
 #include <emscripten.h>
@@ -221,11 +222,12 @@ int llama_init(llama_state_t *state, gguf_model_t *model, uint32_t max_seq)
     /* ── Allocate layer table ── */
     uint64_t layer_table_size = state->n_layers * sizeof(llama_layer_t);
     uint64_t layer_table_pages = pages_for(layer_table_size);
-    state->weights.layers = (llama_layer_t *)mem_alloc_pages(layer_table_pages);
-    if (!state->weights.layers) {
+    void *layer_phys = mem_alloc_pages(layer_table_pages);
+    if (!layer_phys) {
         serial_puts("[LLAMA] ERROR: failed to alloc layer table\n");
         return -1;
     }
+    state->weights.layers = (llama_layer_t *)PHYS_TO_VIRT(layer_phys);
     memset(state->weights.layers, 0, (size_t)layer_table_size);
 
     /* ── Resolve per-layer tensors ── */
@@ -282,11 +284,12 @@ int llama_init(llama_state_t *state, gguf_model_t *model, uint32_t max_seq)
     /* ── Allocate KV cache ── */
     uint64_t kv_table_size = state->n_layers * sizeof(llama_kv_layer_t);
     uint64_t kv_table_pages = pages_for(kv_table_size);
-    state->kv_cache = (llama_kv_layer_t *)mem_alloc_pages(kv_table_pages);
-    if (!state->kv_cache) {
+    void *kv_table_phys = mem_alloc_pages(kv_table_pages);
+    if (!kv_table_phys) {
         serial_puts("[LLAMA] ERROR: failed to alloc KV table\n");
         return -1;
     }
+    state->kv_cache = (llama_kv_layer_t *)PHYS_TO_VIRT(kv_table_phys);
     memset(state->kv_cache, 0, (size_t)kv_table_size);
 
     uint64_t kv_layer_bytes = (uint64_t)max_seq * state->kv_dim * sizeof(float);
@@ -294,14 +297,16 @@ int llama_init(llama_state_t *state, gguf_model_t *model, uint32_t max_seq)
     uint64_t kv_total_pages = 0;
 
     for (uint32_t l = 0; l < state->n_layers; l++) {
-        state->kv_cache[l].k = (float *)mem_alloc_pages(kv_layer_pages);
-        state->kv_cache[l].v = (float *)mem_alloc_pages(kv_layer_pages);
-        if (!state->kv_cache[l].k || !state->kv_cache[l].v) {
+        void *k_phys = mem_alloc_pages(kv_layer_pages);
+        void *v_phys = mem_alloc_pages(kv_layer_pages);
+        if (!k_phys || !v_phys) {
             serial_puts("[LLAMA] ERROR: failed to alloc KV cache layer ");
             serial_putdec(l);
             serial_puts("\n");
             return -1;
         }
+        state->kv_cache[l].k = (float *)PHYS_TO_VIRT(k_phys);
+        state->kv_cache[l].v = (float *)PHYS_TO_VIRT(v_phys);
         memset(state->kv_cache[l].k, 0, (size_t)kv_layer_bytes);
         memset(state->kv_cache[l].v, 0, (size_t)kv_layer_bytes);
         kv_total_pages += kv_layer_pages * 2;
@@ -331,13 +336,14 @@ int llama_init(llama_state_t *state, gguf_model_t *model, uint32_t max_seq)
         (uint64_t)state->vocab_size * sizeof(float);     /* logits */
 
     uint64_t scratch_pages = pages_for(scratch_size);
-    state->scratch = (float *)mem_alloc_pages(scratch_pages);
-    if (!state->scratch) {
+    void *scratch_phys = mem_alloc_pages(scratch_pages);
+    if (!scratch_phys) {
         serial_puts("[LLAMA] ERROR: failed to alloc scratch (");
         serial_putdec(scratch_size / 1024);
         serial_puts(" KB)\n");
         return -1;
     }
+    state->scratch = (float *)PHYS_TO_VIRT(scratch_phys);
     memset(state->scratch, 0, (size_t)(scratch_pages * PAGE_SZ));
 
     /* Partition scratch */
