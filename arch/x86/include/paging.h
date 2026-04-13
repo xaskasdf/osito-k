@@ -27,10 +27,15 @@
  * for any machine OsitoK currently targets. */
 #define KERNEL_VBASE  0xFFFF800000000000ULL
 
-/* Fase 0: both macros are the identity. No caller sees any difference
- * yet. Fase 1 flips PHYS_TO_VIRT to add KERNEL_VBASE once paging_init
- * has mirrored all of RAM at the upper-half address. */
-#define PHYS_TO_VIRT(p) ((void *)(uintptr_t)(p))
-#define VIRT_TO_PHYS(v) ((uint64_t)(uintptr_t)(v))
+/* paging_init() installs the upper-half mirror, so these macros now
+ * translate to/from the high virtual view. They are only valid for
+ * addresses that point into RAM — MMIO and framebuffer ranges still
+ * need explicit paging_map_mmio() + identity-mapped access.
+ *
+ * Callers in this Fase still mostly use physical addresses directly
+ * (via the lower-half identity map that paging_init also installs).
+ * The macros exist so drivers can migrate one at a time. */
+#define PHYS_TO_VIRT(p) ((void *)((uintptr_t)(p) + KERNEL_VBASE))
+#define VIRT_TO_PHYS(v) ((uint64_t)((uintptr_t)(v) - KERNEL_VBASE))
 
 #endif /* _OSITOK_PAGING_H */
