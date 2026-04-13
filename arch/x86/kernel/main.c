@@ -7,6 +7,7 @@
 
 #include "../include/types.h"
 #include "../include/boot_info.h"
+#include "../include/paging.h"
 #include "../drivers/gpu.h"
 #include "../drivers/gpu_inference.h"
 #include "../fs/gguf.h"
@@ -385,11 +386,13 @@ void kernel_entry(boot_info_t *info)
         paging_map_wc(fb_phys, fb_size);
         __asm__ volatile ("mov %%cr3, %%rax; mov %%rax, %%cr3" ::: "rax", "memory");
 
-        /* Allocate shadow buffer in RAM for fast drawing */
+        /* Allocate shadow buffer in RAM for fast drawing. CPU-only
+         * buffer: accessed via the upper-half mirror so we stay aligned
+         * with heap.c and other migrated subsystems. */
         uint64_t shadow_pages = (fb_size + 4095) / 4096;
-        void *shadow = mem_alloc_pages(shadow_pages);
-        if (shadow) {
-            fb_enable_shadow(shadow);
+        void *shadow_phys = mem_alloc_pages(shadow_pages);
+        if (shadow_phys) {
+            fb_enable_shadow(PHYS_TO_VIRT(shadow_phys));
             serial_puts("[FB] Shadow framebuffer enabled (");
             serial_putdec(fb_size / 1024);
             serial_puts(" KB)\n");
