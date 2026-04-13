@@ -286,9 +286,17 @@ Per-process page tables (un CR3 por proceso):
 **Fase 0: Preparación (no-op funcional) ✅ DONE (2026-04-12)**
 - `arch/x86/include/paging.h`: `KERNEL_VBASE 0xFFFF800000000000ULL`,
   `PHYS_TO_VIRT(p)` = `p + KERNEL_VBASE`, `VIRT_TO_PHYS(v)` = `v - KERNEL_VBASE`.
-- Drivers migran a las macros uno a uno. Primer caller: `heap.c` (commit
-  `65820fc`) — el heap completo vive ahora en upper-half.
-- El resto del kernel sigue funcionando via identity map lower-half.
+- Drivers migran a las macros uno a uno. Callers migrados hasta ahora:
+  - `heap.c` — commit `65820fc`: todo el heap kernel vive en upper-half
+    (`[HEAP] Heap at 0xFFFF800001401000`).
+  - `paging.c` — commit `14b1d5b`: NULL guard y COW copy usan la mirror.
+  - `syscall.c` — commit `e8ecea7`: `sys_mmap` MAP_ANON, `sys_mprotect`
+    PROT_NONE→RW, y `demand_page_fault` hacen memset/vfs_read vía
+    upper-half; el phys sigue siendo lo que se instala en el PTE user.
+  - `main.c` — commit `40fcbb9`: shadow framebuffer (4 MB) en upper-half,
+    `fb_enable_shadow(PHYS_TO_VIRT(shadow_phys))`.
+- El resto del kernel sigue funcionando via identity map lower-half;
+  cada subsistema se migra cuando le toca.
 
 **Fase 1: Higher-half kernel mapping ✅ DONE (2026-04-12)**
 - `paging_init()` instala un segundo mapeo del total de RAM a
