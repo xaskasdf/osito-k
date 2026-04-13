@@ -11,6 +11,7 @@
 
 #include "../include/types.h"
 #include "../include/dynlink.h"
+#include "../include/paging.h"
 #include "../fs/vfs.h"
 
 /* ── External functions ──────────────────────────────────────── */
@@ -418,15 +419,18 @@ __attribute__((noinline))
 static uint64_t elf_setup_stack(elf_loaded_t *loaded,
                                 int argc, const char **argv)
 {
-    /* Allocate stack */
+    /* Allocate stack via the upper-half mirror — the user RSP needs
+     * to be reachable from the user process's CR3 (only PML4[256]
+     * is shared once the lower-half identity map disappears). */
     uint64_t stack_pages = USER_STACK_SIZE / 4096;
-    loaded->stack_base = mem_alloc_aligned(USER_STACK_SIZE, 4096);
+    void *stack_phys = mem_alloc_aligned(USER_STACK_SIZE, 4096);
+    if (!stack_phys) return 0;
+    loaded->stack_base = PHYS_TO_VIRT(stack_phys);
     serial_puts("[ELF] stack_base=0x");
     serial_puthex((uint64_t)loaded->stack_base, 16);
     serial_puts(" size=0x");
     serial_puthex(USER_STACK_SIZE, 8);
     serial_puts("\n");
-    if (!loaded->stack_base) return 0;
 
     memset(loaded->stack_base, 0, USER_STACK_SIZE);
 
@@ -614,7 +618,8 @@ void elf_free(elf_loaded_t *loaded)
             mem_free_pages(loaded->segments[i], loaded->segment_pages[i]);
     }
     if (loaded->stack_base)
-        mem_free_pages(loaded->stack_base, USER_STACK_SIZE / 4096);
+        mem_free_pages((void *)VIRT_TO_PHYS(loaded->stack_base),
+                       USER_STACK_SIZE / 4096);
 }
 
 /* ── Execute ELF entry point ─────────────────────────────────── */
@@ -1204,7 +1209,8 @@ int elf_exec(const char *filename, int argc, const char **argv)
         }
     }
     if (loaded.stack_base)
-        proc_add_region(loaded.stack_base, USER_STACK_SIZE / 4096);
+        proc_add_region((void *)VIRT_TO_PHYS(loaded.stack_base),
+                        USER_STACK_SIZE / 4096);
 
     /* Jump to entry — does not return */
     elf_jump(loaded.entry, sp);

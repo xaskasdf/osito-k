@@ -14,6 +14,7 @@
 
 #include "../include/types.h"
 #include "../include/fd.h"
+#include "../include/paging.h"
 
 /* ── External functions ──────────────────────────────────────── */
 
@@ -732,13 +733,19 @@ int sched_spawn(const char *name, void (*entry)(void))
         return -1;
     }
 
-    /* Allocate kernel stack */
-    void *stack = mem_alloc_aligned(KERNEL_STACK_SIZE, 4096);
-    if (!stack) {
+    /* Allocate kernel stack via the upper-half direct map. The stack
+     * top RSP needs to be reachable from any process's CR3, and only
+     * PML4[256] (the kernel mirror) is shared across all CR3s once the
+     * lower-half identity map disappears. Storing the upper-half view
+     * in p->kernel_stack also means writes to the fake interrupt frame
+     * below go through PML4[256]. */
+    void *stack_phys = mem_alloc_aligned(KERNEL_STACK_SIZE, 4096);
+    if (!stack_phys) {
         p->state = PROC_FREE;
         serial_puts("[SCHED] Stack allocation failed\n");
         return -1;
     }
+    void *stack = PHYS_TO_VIRT(stack_phys);
     p->kernel_stack = stack;
 
     uint64_t stack_top = (uint64_t)stack + KERNEL_STACK_SIZE;
@@ -962,13 +969,14 @@ int32_t proc_fork(void)
 
     child->region_count = 0;
 
-    /* Allocate kernel stack for the child */
-    void *stack = mem_alloc_aligned(KERNEL_STACK_SIZE, 4096);
-    if (!stack) {
+    /* Allocate kernel stack for the child via the upper-half mirror. */
+    void *stack_phys = mem_alloc_aligned(KERNEL_STACK_SIZE, 4096);
+    if (!stack_phys) {
         child->state = PROC_FREE;
         serial_puts("[FORK] Stack alloc failed\n");
         return -1;
     }
+    void *stack = PHYS_TO_VIRT(stack_phys);
     child->kernel_stack = stack;
 
     uint64_t stack_top = (uint64_t)stack + KERNEL_STACK_SIZE;
@@ -1008,13 +1016,14 @@ int32_t proc_fork(void)
 #define CHILD_USTACK_SIZE  (64 * 1024)  /* Same size as ELF loader */
 #define CHILD_USTACK_COPY  (32 * 1024)  /* Copy top 32KB of used stack */
 
-    void *child_ustack = mem_alloc_aligned(CHILD_USTACK_SIZE, 4096);
-    if (!child_ustack) {
-        mem_free_pages(stack, KERNEL_STACK_SIZE / 4096);
+    void *child_ustack_phys = mem_alloc_aligned(CHILD_USTACK_SIZE, 4096);
+    if (!child_ustack_phys) {
+        mem_free_pages(stack_phys, KERNEL_STACK_SIZE / 4096);
         child->state = PROC_FREE;
         serial_puts("[FORK] User stack alloc failed\n");
         return -1;
     }
+    void *child_ustack = PHYS_TO_VIRT(child_ustack_phys);
     memset(child_ustack, 0, CHILD_USTACK_SIZE);
 
     /* The parent's stack grows downward. user_rsp is the current top of the
@@ -1029,9 +1038,10 @@ int32_t proc_fork(void)
     /* Child's RSP = same offset from top as parent's */
     uint64_t child_user_rsp = child_ustack_top - copy_size;
 
-    /* Register child user stack for cleanup on exit */
+    /* Register child user stack for cleanup on exit. region.base is
+     * the phys address handed to mem_free_pages later. */
     if (child->region_count < MAX_REGIONS) {
-        child->regions[child->region_count].base = child_ustack;
+        child->regions[child->region_count].base = child_ustack_phys;
         child->regions[child->region_count].pages = CHILD_USTACK_SIZE / 4096;
         child->region_count++;
     }
@@ -1190,13 +1200,14 @@ int32_t proc_clone_thread(uint64_t child_stack, uint64_t parent_tidptr,
         *(int *)child_tidptr = (int)thread->pid;
     }
 
-    /* Allocate kernel stack for the thread */
-    void *kstack = mem_alloc_aligned(KERNEL_STACK_SIZE, 4096);
-    if (!kstack) {
+    /* Allocate kernel stack for the thread via the upper-half mirror. */
+    void *kstack_phys = mem_alloc_aligned(KERNEL_STACK_SIZE, 4096);
+    if (!kstack_phys) {
         thread->state = PROC_FREE;
         serial_puts("[THREAD] Kernel stack alloc failed\n");
         return -1;
     }
+    void *kstack = PHYS_TO_VIRT(kstack_phys);
     thread->kernel_stack = kstack;
 
     uint64_t kstack_top = (uint64_t)kstack + KERNEL_STACK_SIZE;
@@ -1375,7 +1386,7 @@ int32_t proc_wait4(int32_t pid, int *wstatus, int options)
             }
             proctab[i].region_count = 0;
             if (proctab[i].kernel_stack) {
-                mem_free_pages(proctab[i].kernel_stack,
+                mem_free_pages((void *)VIRT_TO_PHYS(proctab[i].kernel_stack),
                                KERNEL_STACK_SIZE / 4096);
                 proctab[i].kernel_stack = NULL;
             }
@@ -1424,7 +1435,7 @@ int32_t proc_wait4(int32_t pid, int *wstatus, int options)
             }
             proctab[i].region_count = 0;
             if (proctab[i].kernel_stack) {
-                mem_free_pages(proctab[i].kernel_stack,
+                mem_free_pages((void *)VIRT_TO_PHYS(proctab[i].kernel_stack),
                                KERNEL_STACK_SIZE / 4096);
                 proctab[i].kernel_stack = NULL;
             }
