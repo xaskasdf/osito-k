@@ -41,13 +41,27 @@ extern void  mem_free_pages(void *addr, uint64_t count);
 
 /* ── Block header ────────────────────────────────────────────── */
 
+/* Block header. The `next`/`prev` slots are only used for free-list
+ * linking while the block is FREE. While USED, those 16 bytes are dead
+ * space, so we repurpose them as a `(alloc_ra, alloc_ra2)` pair filled
+ * by `kmalloc()` from `__builtin_return_address(0/1)`. On double-free
+ * the diagnostic in `kfree()` reads them to identify the original
+ * allocator's call site (resolved via kallsyms). */
 typedef struct block_hdr {
     uint16_t            magic;      /* BLOCK_MAGIC for corruption check */
     uint16_t            flags;      /* BLOCK_FREE or BLOCK_USED */
     uint32_t            _pad;
     uint64_t            size;       /* Usable size (excludes header) */
-    struct block_hdr   *next;       /* Next block in free list (if free) */
-    struct block_hdr   *prev;       /* Prev block in free list (if free) */
+    union {
+        struct {
+            struct block_hdr *next; /* free-list link (only when FREE) */
+            struct block_hdr *prev; /* free-list link (only when FREE) */
+        };
+        struct {
+            uint64_t  alloc_ra;     /* kmalloc caller (only when USED) */
+            uint64_t  alloc_ra2;    /* one frame above (only when USED) */
+        };
+    };
 } block_hdr_t;
 
 _Static_assert(sizeof(block_hdr_t) == 32, "block header must be 32 bytes");
@@ -100,7 +114,17 @@ static void free_list_remove(block_hdr_t *block)
     if (block->prev) block->prev->next = block->next;
     else free_list = block->next;
 
-    if (block->next) block->next->prev = block;
+    /* Pre-existing typo: this used to assign `block->next->prev = block`
+     * (pointing the successor's prev BACK at the block being removed),
+     * which left the doubly-linked list inconsistent. The bug was
+     * dormant until the block-header union turned the prev/next slots
+     * of USED blocks into alloc_ra1/alloc_ra2 (return addresses). After
+     * that change, any free-list walker that traversed a stale prev
+     * pointer into a now-USED block read a non-NULL garbage pointer
+     * (the saved RA) and faulted on the next deref — observed as a
+     * non-canonical CR2 inside elf_exec on the second `exec quake2.elf`
+     * after a clean Q2 shutdown. */
+    if (block->next) block->next->prev = block->prev;
 
     block->next = NULL;
     block->prev = NULL;
@@ -203,7 +227,10 @@ static void block_split(block_hdr_t *block, uint64_t needed)
 
 /* ── malloc ──────────────────────────────────────────────────── */
 
-void *kmalloc(uint64_t size)
+/* Internal allocator: receives a pre-captured caller RA so the public
+ * `kmalloc()` wrapper can stamp it into the block header. The grow-path
+ * recursion stays here so the original RA is preserved across retry. */
+static void *_kmalloc_with_ra(uint64_t size, uint64_t alloc_ra, uint64_t alloc_ra2)
 {
     if (size == 0) return NULL;
 
@@ -218,7 +245,9 @@ void *kmalloc(uint64_t size)
             /* Found a fit — split if much larger */
             block_split(block, size);
             free_list_remove(block);
-            block->flags = BLOCK_USED;
+            block->flags     = BLOCK_USED;
+            block->alloc_ra  = alloc_ra;   /* diagnostic — see kfree() */
+            block->alloc_ra2 = alloc_ra2;
             heap_used += block->size;
             alloc_count++;
             return (void *)((uint8_t *)block + sizeof(block_hdr_t));
@@ -231,11 +260,32 @@ void *kmalloc(uint64_t size)
     if (heap_grow(needed) < 0)
         return NULL;
 
-    /* Retry after growing */
-    return kmalloc(size);
+    return _kmalloc_with_ra(size, alloc_ra, alloc_ra2);
+}
+
+void *kmalloc(uint64_t size)
+{
+    return _kmalloc_with_ra(size,
+                            (uint64_t)__builtin_return_address(0),
+                            (uint64_t)__builtin_return_address(1));
 }
 
 /* ── free ────────────────────────────────────────────────────── */
+
+/* Print "(symbol+0xoffset)" or nothing if kallsyms doesn't know `addr`.
+ * Declared local so heap.c doesn't need a header for kallsyms. */
+extern const char *kallsyms_lookup(uint64_t addr, uint64_t *offset_out);
+static void heap_print_sym(uint64_t addr)
+{
+    uint64_t off = 0;
+    const char *sym = kallsyms_lookup(addr, &off);
+    if (!sym) return;
+    serial_puts(" (");
+    serial_puts(sym);
+    serial_puts("+0x");
+    serial_puthex(off, 4);
+    serial_puts(")");
+}
 
 void kfree(void *ptr)
 {
@@ -247,13 +297,35 @@ void kfree(void *ptr)
     if (block->magic != BLOCK_MAGIC) {
         serial_puts("[HEAP] !!! CORRUPTION: bad magic at 0x");
         serial_puthex((uint64_t)block, 16);
+        serial_puts(" caller=0x");
+        serial_puthex((uint64_t)__builtin_return_address(0), 16);
+        heap_print_sym((uint64_t)__builtin_return_address(0));
         serial_puts("\n");
         return;
     }
 
     if (block->flags != BLOCK_USED) {
+        /* Read alloc_ra/alloc_ra2 BEFORE anything else — coalesce or
+         * free_list_insert from a later iteration may have stomped
+         * the next/prev union members already. We are early-returning
+         * here so the read is safe. */
+        uint64_t orig_ra  = block->alloc_ra;
+        uint64_t orig_ra2 = block->alloc_ra2;
+        uint64_t free_ra  = (uint64_t)__builtin_return_address(0);
+
         serial_puts("[HEAP] !!! DOUBLE FREE at 0x");
         serial_puthex((uint64_t)ptr, 16);
+        serial_puts(" size=");
+        serial_putdec(block->size);
+        serial_puts("\n  freed by 0x");
+        serial_puthex(free_ra, 16);
+        heap_print_sym(free_ra);
+        serial_puts("\n  originally allocated from 0x");
+        serial_puthex(orig_ra, 16);
+        heap_print_sym(orig_ra);
+        serial_puts("\n                     parent 0x");
+        serial_puthex(orig_ra2, 16);
+        heap_print_sym(orig_ra2);
         serial_puts("\n");
         return;
     }

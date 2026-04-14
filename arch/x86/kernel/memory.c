@@ -223,7 +223,25 @@ int mem_reserve_range(uint64_t phys, uint64_t count)
 void mem_free_pages(void *addr, uint64_t count)
 {
     uint64_t start_page = (uint64_t)addr >> PAGE_SHIFT;
+    static int dfree_warned = 0;
     for (uint64_t i = 0; i < count; i++) {
+        if (bitmap_test(start_page + i)) {
+            /* Page was already free — double-free of a phys page.
+             * This is the smoking gun for "heap arena got reused
+             * while the original holder still had a pointer". Warn
+             * loudly the first few times so the caller can be found,
+             * but DO NOT increment free_pages or set the bit again
+             * (would corrupt the page accounting). */
+            if (dfree_warned < 8) {
+                dfree_warned++;
+                serial_puts("[MEM] !!! DOUBLE PAGE-FREE phys=0x");
+                serial_puthex((start_page + i) << PAGE_SHIFT, 16);
+                serial_puts(" caller=0x");
+                serial_puthex((uint64_t)__builtin_return_address(0), 16);
+                serial_puts("\n");
+            }
+            continue;
+        }
         bitmap_set(start_page + i);
         free_pages++;
     }
