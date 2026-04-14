@@ -46,14 +46,15 @@ extern void  mem_free_pages(void *addr, uint64_t count);
 /* ── Shared Memory Region ────────────────────────────────────── */
 
 typedef struct {
-    void       *base;          /* virtual/physical address (identity-mapped) */
-    uint64_t    size;          /* size in bytes */
-    uint64_t    pages;         /* size in pages */
-    uint32_t    handle;        /* unique handle for IPC */
-    uint32_t    flags;         /* SHM_FLAG_* */
-    uint32_t    owner_pid;     /* creating process */
-    int32_t     refcount;      /* number of active mappings */
-    bool        active;        /* slot in use */
+    void       *base;            /* upper-half mirror (PHYS_TO_VIRT) */
+    uint64_t    size;            /* size in bytes */
+    uint64_t    pages;           /* size in pages */
+    uint32_t    handle;          /* unique handle for IPC */
+    uint32_t    flags;           /* SHM_FLAG_* */
+    uint32_t    owner_pid;       /* creating process */
+    int32_t     refcount;        /* number of active mappings */
+    bool        active;          /* slot in use */
+    bool        pending_destroy; /* shm_destroy pending until refcount==0 */
 } shm_region_t;
 
 /* ── State ───────────────────────────────────────────────────── */
@@ -121,14 +122,15 @@ uint32_t shm_create(uint64_t size, uint32_t flags)
     /* Zero the memory via the upper-half mirror */
     memset(base, 0, alloc_size);
 
-    r->base       = base;
-    r->size       = alloc_size;
-    r->pages      = pages;
-    r->handle     = shm_next_handle++;
-    r->flags      = flags;
-    r->owner_pid  = 0;  /* Set by caller if needed */
-    r->refcount   = 1;
-    r->active     = true;
+    r->base            = base;
+    r->size            = alloc_size;
+    r->pages           = pages;
+    r->handle          = shm_next_handle++;
+    r->flags           = flags;
+    r->owner_pid       = 0;  /* Set by caller if needed */
+    r->refcount        = 1;
+    r->active          = true;
+    r->pending_destroy = false;
 
     shm_active_count++;
 
@@ -157,34 +159,58 @@ void *shm_map(uint32_t handle)
     return r->base;
 }
 
-/* Unmap a shared region (decrement refcount) */
+/* Unmap a shared region (decrement refcount). If the region was already
+ * marked for destroy by an explicit shm_destroy() call AND we drop the
+ * last reference, free the underlying pages here so that the original
+ * destroy doesn't have to wait for refcount to reach zero before it
+ * answers to the caller. */
+static void shm_release_pages(shm_region_t *r)
+{
+    if (r->base && r->pages > 0)
+        mem_free_pages((void *)VIRT_TO_PHYS(r->base), r->pages);
+    r->base = NULL;
+    r->pages = 0;
+    r->active = false;
+    shm_active_count--;
+}
+
 void shm_unmap(uint32_t handle)
 {
     shm_region_t *r = shm_find(handle);
     if (!r) return;
     if (r->refcount > 0) r->refcount--;
+    /* Deferred destroy: the creator already asked us to destroy this
+     * region (r->pending_destroy=true) but other holders kept a
+     * reference. When the last one drops, finish the job. */
+    if (r->pending_destroy && r->refcount == 0)
+        shm_release_pages(r);
 }
 
-/* Destroy a shared region (must have refcount <= 1) */
+/* Destroy a shared region. Refcount-aware: if other holders still have
+ * a reference (compositor's win->pixels, peer mappings, etc.), DO NOT
+ * free the underlying pages — that would leave the other holders with
+ * dangling pointers into pages that mem_free_pages handed back to the
+ * page allocator, which `heap_grow()` could then re-use as a heap
+ * arena page → silent heap corruption. Instead, mark the region
+ * pending_destroy and let the last shm_unmap finish the job. */
 void shm_destroy(uint32_t handle)
 {
     shm_region_t *r = shm_find(handle);
     if (!r) return;
 
-    if (r->refcount > 1) {
-        serial_puts("[SHM] Warning: destroying region h=");
-        serial_putdec(handle);
-        serial_puts(" with refcount=");
-        serial_putdec((uint64_t)r->refcount);
-        serial_puts("\n");
+    /* The creator counts as one reference. Drop it now so a "destroy
+     * with no other holders" path collapses to refcount==0 below. */
+    if (r->refcount > 0) r->refcount--;
+
+    if (r->refcount > 0) {
+        /* Other holders still around — defer the page free. They will
+         * call shm_unmap() when they're done; the last one triggers
+         * shm_release_pages() via the pending_destroy flag. */
+        r->pending_destroy = true;
+        return;
     }
 
-    if (r->base && r->pages > 0)
-        mem_free_pages((void *)VIRT_TO_PHYS(r->base), r->pages);
-
-    r->active = false;
-    r->base = NULL;
-    shm_active_count--;
+    shm_release_pages(r);
 }
 
 /* Get the physical address of a shared region (for GPU scanout) */
@@ -218,18 +244,36 @@ void shm_set_owner(uint32_t handle, uint32_t pid)
     if (r) r->owner_pid = pid;
 }
 
-/* Destroy all regions owned by a process (called on proc_free) */
+/* Destroy all regions owned by a process (called on proc_free).
+ *
+ * Two cases:
+ *   - The process never called shm_destroy on its region (crash, kill,
+ *     or just left it dangling) → pending_destroy is false. We must
+ *     drop the creator ref ourselves, which we do by calling
+ *     shm_destroy(handle).
+ *   - The process did call shm_destroy explicitly (e.g. Q2 in
+ *     SWimp_Shutdown) → pending_destroy is true. The creator ref was
+ *     already decremented; calling shm_destroy again would
+ *     over-decrement. compositor_cleanup_process will run shortly
+ *     after this and drop the remaining holder refs via shm_unmap,
+ *     and the last one finishes the release via the pending flag.
+ *     Just log and skip. */
 void shm_cleanup_process(uint32_t pid)
 {
     for (int i = 0; i < SHM_MAX_REGIONS; i++) {
-        if (shm_table[i].active && shm_table[i].owner_pid == pid) {
-            serial_puts("[SHM] Cleanup pid=");
-            serial_putdec(pid);
-            serial_puts(" h=");
-            serial_putdec(shm_table[i].handle);
-            serial_puts("\n");
-            shm_destroy(shm_table[i].handle);
+        if (!shm_table[i].active) continue;
+        if (shm_table[i].owner_pid != pid) continue;
+
+        serial_puts("[SHM] Cleanup pid=");
+        serial_putdec(pid);
+        serial_puts(" h=");
+        serial_putdec(shm_table[i].handle);
+        if (shm_table[i].pending_destroy) {
+            serial_puts(" (already pending destroy)\n");
+            continue;
         }
+        serial_puts("\n");
+        shm_destroy(shm_table[i].handle);
     }
 }
 
