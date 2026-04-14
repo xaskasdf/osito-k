@@ -16,6 +16,7 @@
  */
 
 #include "../include/types.h"
+#include "../include/paging.h"
 
 /* ── External functions ──────────────────────────────────────── */
 
@@ -102,16 +103,22 @@ uint32_t shm_create(uint64_t size, uint32_t flags)
     uint64_t alloc_size = pages * SHM_PAGE_SIZE;
 
     /* GPU scanout requires 256-byte alignment (NVIDIA SET_OFFSET >> 8).
-     * Page alignment (4096) satisfies this. */
-    void *base = mem_alloc_aligned(alloc_size, SHM_PAGE_SIZE);
-    if (!base) {
+     * Page alignment (4096) satisfies this. mem_alloc_aligned returns
+     * a physical address; convert to the upper-half mirror (PML4[256],
+     * shared across every process's CR3 post-Phase-C) so CPU accesses
+     * via this handle work regardless of which CR3 is live when the
+     * syscall runs. shm_get_phys still returns the phys via
+     * VIRT_TO_PHYS for GPU scanout callers. */
+    void *phys = mem_alloc_aligned(alloc_size, SHM_PAGE_SIZE);
+    if (!phys) {
         serial_puts("[SHM] Allocation failed (");
         serial_putdec(alloc_size / 1024);
         serial_puts(" KB)\n");
         return 0;
     }
+    void *base = PHYS_TO_VIRT(phys);
 
-    /* Zero the memory */
+    /* Zero the memory via the upper-half mirror */
     memset(base, 0, alloc_size);
 
     r->base       = base;
@@ -173,7 +180,7 @@ void shm_destroy(uint32_t handle)
     }
 
     if (r->base && r->pages > 0)
-        mem_free_pages(r->base, r->pages);
+        mem_free_pages((void *)VIRT_TO_PHYS(r->base), r->pages);
 
     r->active = false;
     r->base = NULL;
@@ -184,8 +191,8 @@ void shm_destroy(uint32_t handle)
 uint64_t shm_get_phys(uint32_t handle)
 {
     shm_region_t *r = shm_find(handle);
-    if (!r) return 0;
-    return (uint64_t)r->base;  /* identity-mapped: virt == phys */
+    if (!r || !r->base) return 0;
+    return VIRT_TO_PHYS(r->base);
 }
 
 /* Get region size */

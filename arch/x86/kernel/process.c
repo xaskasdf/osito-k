@@ -140,6 +140,13 @@ typedef struct {
     uint64_t  user_strtab_size;  /* bytes */
     uint64_t  user_load_bias;    /* PIE: rip = st_value + bias */
 
+    /* x87 + SSE state buffer used by isr_common's fxsave64/fxrstor64.
+     * 512 bytes, 16-aligned. Points-to is stored in fpu_state_ptr while
+     * this process is current, so interrupts save/restore into the
+     * owning process's slot and context switches atomically change
+     * which slot the ISR touches next. */
+    __attribute__((aligned(16))) uint8_t fpu_state[512];
+
     /* Per-process file descriptor table. 8 KB. Last member so
      * any additions go above and the struct layout stays stable. */
     fd_entry_t fds[MAX_FDS];
@@ -150,6 +157,29 @@ typedef struct {
 static process_t proctab[MAX_PROCESSES];
 static process_t *current_proc;
 static uint32_t next_pid = 1;
+
+/* ── Per-process FPU/SSE state ────────────────────────────────
+ * `isr_common` does `fxsave64 (%rax)` / `fxrstor64 (%rax)` where
+ * %rax is loaded from `fpu_state_ptr`. That pointer tracks the
+ * currently scheduled process's `fpu_state` field, so an ISR that
+ * fires while process A is running saves A's FPU state on entry;
+ * if the scheduler chooses to switch to process B inside the C
+ * handler, we also rewrite `fpu_state_ptr` to B's slot, and the
+ * exit path's `fxrstor64` restores B's state on the way out via
+ * IRETQ. For the boot window (before any process exists) and for
+ * kernel threads that never got a process_t, the pointer points
+ * at `fpu_state_kernel` below. */
+__attribute__((aligned(16))) uint8_t fpu_state_kernel[512];
+uint8_t *fpu_state_ptr = fpu_state_kernel;
+
+/* Update both current_proc and fpu_state_ptr together so the ISR
+ * save/restore path and the scheduler agree about which FPU slot
+ * is live. NULL means "back to the kernel-default slot". */
+static inline void set_current_proc(process_t *p)
+{
+    current_proc = p;
+    fpu_state_ptr = p ? p->fpu_state : fpu_state_kernel;
+}
 
 /* Kernel return context — saved before exec, restored on exit */
 extern int  kern_setjmp(uint64_t *buf) __attribute__((returns_twice));
@@ -508,7 +538,7 @@ int proc_exec(const char *filename, int argc, const char **argv)
 
     /* Set as current process and pin region registration target */
     process_t *prev = current_proc;
-    current_proc = p;
+    set_current_proc(p);
     exec_target_proc = p;
     p->state = PROC_RUNNING;
 
@@ -531,7 +561,7 @@ int proc_exec(const char *filename, int argc, const char **argv)
         __asm__ volatile ("sti");
         exec_target_proc = NULL;
         int code = last_exit_code;
-        current_proc = prev;
+        set_current_proc(prev);
         /* Switch back to the parent's CR3 (kernel CR3 if no parent). */
         if (prev && prev->cr3)
             paging_switch(prev->cr3);
@@ -556,7 +586,7 @@ int proc_exec(const char *filename, int argc, const char **argv)
     serial_puts("'\n");
 
     exec_target_proc = NULL;
-    current_proc = prev;
+    set_current_proc(prev);
     proc_free(p);
 
     return ret;
@@ -750,7 +780,7 @@ void sched_tick(void *frame_ptr)
     next->state = PROC_RUNNING;
     next->quantum = qos_quantum[next->qos_class];
     next->last_active_tick = idt_get_ticks();
-    current_proc = next;
+    set_current_proc(next);
     sched_current_idx = next_idx;
     wrmsr(MSR_FS_BASE, next->fs_base);  /* restore per-thread TLS */
 
@@ -1641,13 +1671,13 @@ void proc_init(void)
     serial_puts("[PROC] Initializing process subsystem...\n");
 
     memset(proctab, 0, sizeof(proctab));
-    current_proc = NULL;
+    set_current_proc(NULL);
 
     /* Create PID 1 (kernel) */
     process_t *kernel = proc_alloc("kernel");
     if (kernel) {
         kernel->state = PROC_RUNNING;
-        current_proc = kernel;
+        set_current_proc(kernel);
         sched_current_idx = (int)(kernel - &proctab[0]);
         /* Seed kernel process with stdin/stdout/stderr = console.
          * All future processes inherit or reset these via execve. */
