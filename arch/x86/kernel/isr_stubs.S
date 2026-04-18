@@ -51,7 +51,17 @@ isr_common:
      * instructions below. For the boot window before any process exists,
      * `fpu_state_ptr` points at the kernel-default buffer in process.c. */
     mov fpu_state_ptr(%rip), %rax
+    /* Guard: skip fxsave if fpu_state_ptr is corrupt.
+     * Check 16-aligned AND sign bit set (upper-half = 0xFFFF8000...). */
+    test $0xF, %rax
+    jnz .Lskip_fxsave
+    bt $63, %rax            /* test sign bit (upper-half addresses have bit 63 set) */
+    jnc .Lskip_fxsave
     fxsave64 (%rax)
+    jmp .Lfxsave_done
+.Lskip_fxsave:
+    mov %rax, fpu_corrupt_val(%rip)
+.Lfxsave_done:
 
     /* Align RSP to 16 bytes for the C ABI. Use %rbp as a scratch to
      * save the GPR-area rsp so we can restore cleanly after the call;
@@ -69,7 +79,12 @@ isr_common:
      * `fpu_state_ptr` while we were in C). */
     mov %rbp, %rsp
     mov fpu_state_ptr(%rip), %rax
+    test $0xF, %rax
+    jnz .Lskip_fxrstor
+    bt $63, %rax
+    jnc .Lskip_fxrstor
     fxrstor64 (%rax)
+.Lskip_fxrstor:
 
     /* ── Scheduler: check for context switch (X-SCHED) ────────── */
     /* If sched_tick() set sched_switch_rsp, switch to new stack   */

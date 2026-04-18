@@ -72,7 +72,7 @@ extern void syscall_restore_brk(void);
 
 /* Scheduler constants (X-SCHED) */
 #define SCHED_QUANTUM       5       /* default ticks per time slice (50ms @ 100Hz) */
-#define KERNEL_STACK_SIZE   32768   /* 32KB per kernel thread */
+#define KERNEL_STACK_SIZE   262144  /* 256KB per kernel thread */
 
 /* QoS priority classes — higher value = higher priority */
 #define QOS_IDLE            0
@@ -147,6 +147,12 @@ typedef struct {
      * which slot the ISR touches next. */
     __attribute__((aligned(16))) uint8_t fpu_state[512];
 
+    /* Debug: saved CS from frame at preemption time.
+     * If this differs from frame[18] at restore time,
+     * the frame was overwritten. */
+    uint64_t saved_frame_cs;
+    uint64_t saved_frame_rip;
+
     /* Per-process file descriptor table. 8 KB. Last member so
      * any additions go above and the struct layout stays stable. */
     fd_entry_t fds[MAX_FDS];
@@ -171,6 +177,7 @@ static uint32_t next_pid = 1;
  * at `fpu_state_kernel` below. */
 __attribute__((aligned(16))) uint8_t fpu_state_kernel[512];
 uint8_t *fpu_state_ptr = fpu_state_kernel;
+uint64_t fpu_corrupt_val;  /* set by isr_common when fpu_state_ptr is corrupt */
 
 /* Update both current_proc and fpu_state_ptr together so the ISR
  * save/restore path and the scheduler agree about which FPU slot
@@ -728,6 +735,26 @@ void sched_tick(void *frame_ptr)
      * GPRs on this process's stack (set by ISR stub before calling
      * isr_handler). Store it so we can restore later. */
     cur->kernel_rsp = (uint64_t)frame_ptr;
+
+    /* Save-time canary: verify frame is valid NOW and plant a canary
+     * below it so we can detect post-save corruption at restore time. */
+    {
+        uint64_t *f = (uint64_t *)frame_ptr;
+        uint64_t cs = f[18];
+        if (cs != 0x38 && cs != 0x28 && cs != 0x43 && cs != 0x40) {
+            serial_puts("[SCHED] BAD SAVE PID ");
+            serial_putdec(cur->pid);
+            serial_puts(": CS=0x"); serial_puthex(cs, 8);
+            serial_puts(" RIP=0x"); serial_puthex(f[17], 16);
+            serial_puts(" vec="); serial_putdec(f[15]);
+            serial_puts("\n");
+        }
+        /* Save CS+RIP in process_t so we can detect frame corruption
+         * at restore time (process_t is in BSS, not on the stack). */
+        cur->saved_frame_cs  = f[18];
+        cur->saved_frame_rip = f[17];
+    }
+
     cur->fs_base = rdmsr(MSR_FS_BASE);  /* save per-thread TLS */
     /* Only mark as READY if currently RUNNING.
      * ZOMBIE processes must stay ZOMBIE — proc_wait4 relies on this. */
@@ -794,6 +821,34 @@ void sched_tick(void *frame_ptr)
         paging_switch(next->cr3);
     }
 
+    /* Sanity check: verify the interrupt frame at kernel_rsp has
+     * a valid CS selector and the canary we planted at save time. */
+    {
+        uint64_t *frame = (uint64_t *)next->kernel_rsp;
+        uint64_t cs = frame[18];
+
+        uint64_t rip = frame[17];
+        uint64_t ss  = frame[21];
+        uint64_t rsp_saved = frame[20];
+        bool bad_cs  = (cs != 0x38 && cs != 0x28 && cs != 0x43 && cs != 0x40);
+        bool bad_ss  = (ss != 0x30 && ss != 0x3B && ss != 0x00);
+        bool bad_rip = (rip < 0xFFFF800000000000ULL && cs == 0x38);
+
+        if (bad_cs || bad_ss || bad_rip) {
+            serial_puts("[SCHED] CORRUPT PID ");
+            serial_putdec(next->pid);
+            serial_puts(": CS=0x"); serial_puthex(cs, 4);
+            serial_puts(" SS=0x"); serial_puthex(ss, 4);
+            serial_puts(" RIP=0x"); serial_puthex(rip, 16);
+            serial_puts(" fRSP=0x"); serial_puthex(rsp_saved, 16);
+            serial_puts(" | was CS=0x"); serial_puthex(next->saved_frame_cs, 4);
+            serial_puts(" RIP=0x"); serial_puthex(next->saved_frame_rip, 16);
+            serial_puts("\n");
+            next->state = PROC_ZOMBIE;
+            return;
+        }
+    }
+
     /* Tell ISR stub to switch RSP before popping GPRs.
      * The stub will: mov sched_switch_rsp → RSP, then pop + iretq
      * using the new process's saved interrupt frame. */
@@ -826,6 +881,11 @@ int sched_spawn(const char *name, void (*entry)(void))
     }
     void *stack = PHYS_TO_VIRT(stack_phys);
     p->kernel_stack = stack;
+
+    /* Guard page: unmap the bottom 4KB so stack overflow triggers #PF
+     * instead of silently corrupting adjacent memory. */
+    extern int paging_unmap_page(uint64_t virt);
+    paging_unmap_page((uint64_t)stack);
 
     uint64_t stack_top = (uint64_t)stack + KERNEL_STACK_SIZE;
 

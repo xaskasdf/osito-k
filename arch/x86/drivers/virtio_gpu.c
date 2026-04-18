@@ -160,6 +160,7 @@ static struct {
     uint8_t  pci_bus, pci_dev, pci_func;
 
     bool initialized;
+    bool scanout_active;
 } gpu;
 
 /* ── PCI Config Read via ECAM ─────────────────────────────────── */
@@ -225,7 +226,7 @@ static int parse_capabilities(uint64_t *bars) {
             uint64_t bar_addr = bars[bar];
             if (!bar_addr) { cap_ptr = cap_next; continue; }
 
-            volatile uint8_t *mapped = (volatile uint8_t *)(bar_addr + offset);
+            volatile uint8_t *mapped = (volatile uint8_t *)PHYS_TO_VIRT(bar_addr + offset);
 
             switch (cfg_type) {
             case VIRTIO_PCI_CAP_COMMON_CFG:
@@ -275,22 +276,28 @@ static int setup_controlq(void) {
     serial_putdec(gpu.vq_size);
     serial_puts("\n");
 
-    /* Allocate descriptor table */
+    /* Allocate descriptor table — physical for device, virtual for CPU */
     uint64_t desc_bytes = (uint64_t)gpu.vq_size * 16;
-    gpu.desc = (vq_desc_t *)mem_alloc_aligned(desc_bytes, 4096);
-    if (!gpu.desc) return -1;
+    void *desc_raw = mem_alloc_aligned(desc_bytes, 4096);
+    if (!desc_raw) return -1;
+    uint64_t desc_phys = (uint64_t)desc_raw;
+    gpu.desc = (vq_desc_t *)PHYS_TO_VIRT((uint64_t)desc_raw);
     memset(gpu.desc, 0, desc_bytes);
 
     /* Allocate available ring */
     uint64_t avail_bytes = 6 + 2 * (uint64_t)gpu.vq_size;
-    gpu.avail = (vq_avail_t *)mem_alloc_aligned(avail_bytes, 4096);
-    if (!gpu.avail) return -1;
+    void *avail_raw = mem_alloc_aligned(avail_bytes, 4096);
+    if (!avail_raw) return -1;
+    uint64_t avail_phys = (uint64_t)avail_raw;
+    gpu.avail = (vq_avail_t *)PHYS_TO_VIRT((uint64_t)avail_raw);
     memset(gpu.avail, 0, avail_bytes);
 
     /* Allocate used ring */
     uint64_t used_bytes = 6 + 8 * (uint64_t)gpu.vq_size;
-    gpu.used = (vq_used_t *)mem_alloc_aligned(used_bytes, 4096);
-    if (!gpu.used) return -1;
+    void *used_raw = mem_alloc_aligned(used_bytes, 4096);
+    if (!used_raw) return -1;
+    uint64_t used_phys = (uint64_t)used_raw;
+    gpu.used = (vq_used_t *)PHYS_TO_VIRT((uint64_t)used_raw);
     memset(gpu.used, 0, used_bytes);
 
     /* Chain free descriptors */
@@ -301,17 +308,8 @@ static int setup_controlq(void) {
     gpu.free_head = 0;
     gpu.last_used = 0;
 
-    /* Write queue addresses to device */
-    uint64_t desc_phys  = (uint64_t)gpu.desc;
-    uint64_t avail_phys = (uint64_t)gpu.avail;
-    uint64_t used_phys  = (uint64_t)gpu.used;
-
-    *(volatile uint16_t *)(cfg + 0x16) = 0;  /* select queue 0 */
-    *(volatile uint16_t *)(cfg + 0x18) = gpu.vq_size;
-    *(volatile uint32_t *)(cfg + 0x08) = (uint32_t)desc_phys;
-    *(volatile uint32_t *)(cfg + 0x0C) = (uint32_t)(desc_phys >> 32);
-    *(volatile uint32_t *)(cfg + 0x10) = (uint32_t)avail_phys;
-    *(volatile uint32_t *)(cfg + 0x14) = 0; /* high bits for avail — but 0x14 is queue_select! */
+    /* Write queue physical addresses to device (desc_phys/avail_phys/used_phys
+     * were captured above from mem_alloc_aligned before PHYS_TO_VIRT). */
 
     /* Actually: virtio common config layout (v1.0):
      * 0x00: device_feature_select (u32)
@@ -351,7 +349,7 @@ static int setup_controlq(void) {
     serial_puts("[VIRTIO-GPU] controlq desc_virt=0x");
     serial_puthex((uint64_t)gpu.desc, 16);
     serial_puts(" desc_phys=0x");
-    serial_puthex((uint64_t)gpu.desc, 16);
+    serial_puthex(desc_phys, 16);
     serial_puts("\n");
     serial_puts("[VIRTIO-GPU] controlq configured\n");
     return 0;
@@ -388,13 +386,7 @@ static int gpu_send_cmd(void *cmd, uint32_t cmd_len, void *resp, uint32_t resp_l
     /* Notify device — write queue index to notify register */
     uint16_t notify_off = *(volatile uint16_t *)(gpu.common_cfg + 0x1E);
     volatile uint16_t *notify_addr = (volatile uint16_t *)(gpu.notify_base + notify_off * gpu.notify_off_mult);
-    serial_puts("[VIRTIO-GPU] notify: off=");
-    serial_putdec(notify_off);
-    serial_puts(" addr=0x");
-    serial_puthex((uint64_t)notify_addr, 16);
-    serial_puts(" desc_phys=0x");
-    serial_puthex((uint64_t)gpu.desc, 16);
-    serial_puts("\n");
+    __asm__ volatile ("mfence" ::: "memory");
     *notify_addr = 0;  /* queue 0 */
     __asm__ volatile ("mfence" ::: "memory");
 
@@ -418,19 +410,22 @@ static int gpu_send_cmd(void *cmd, uint32_t cmd_len, void *resp, uint32_t resp_l
 
 /* ── Public Interface ─────────────────────────────────────────── */
 
-void virtio_gpu_init(uint64_t bar_phys)
+void virtio_gpu_init(uint64_t ecam, uint8_t bus, uint8_t dev, uint8_t func,
+                     uint32_t fb_width, uint32_t fb_height)
 {
-    serial_puts("[VIRTIO-GPU] Initializing...\n");
+    serial_puts("[VIRTIO-GPU] Initializing at ");
+    serial_putdec(bus); serial_puts(":");
+    serial_putdec(dev); serial_puts(".");
+    serial_putdec(func); serial_puts("\n");
     gpu.initialized = false;
 
-    /* TODO: receive bus/dev/func + ecam_base from caller.
-     * For now, hardcode ECAM base and bus 0 dev 6 func 0 (from PCI scan).
-     */
-    gpu.ecam_base = 0xE0000000ULL;  /* from MCFG in boot log */
-    gpu.pci_bus = 0; gpu.pci_dev = 6; gpu.pci_func = 0;
+    gpu.ecam_base = ecam;
+    gpu.pci_bus = bus;
+    gpu.pci_dev = dev;
+    gpu.pci_func = func;
 
-    /* Need ECAM mapped */
-    paging_map_mmio(gpu.ecam_base + (0 << 20) + (6 << 15), 4096);
+    /* Need ECAM page for this BDF mapped */
+    paging_map_mmio(gpu.ecam_base | ((uint64_t)bus << 20) | ((uint64_t)dev << 15) | ((uint64_t)func << 12), 4096);
 
     /* Enable PCI memory space + bus master if not already */
     uint16_t pci_cmd = (uint16_t)ecam_read32(0x04);
@@ -442,19 +437,29 @@ void virtio_gpu_init(uint64_t bar_phys)
         serial_puts("[VIRTIO-GPU] Enabled PCI memory + bus master\n");
     }
 
-    /* If BAR4 is 0, program it manually to a free MMIO region */
+    /* Program any unassigned BARs. UEFI assigns BARs for known devices but
+     * skips virtio. We check all 6 BARs and assign from a pool starting at
+     * 0x81100000 (well above QEMU's normal MMIO). */
     {
-        uint32_t bar4_raw = ecam_read32(0x20);
-        serial_puts("[VIRTIO-GPU] BAR4 raw=0x");
-        serial_puthex(bar4_raw, 8);
-        serial_puts("\n");
-        if ((bar4_raw & ~0xF) == 0) {
-            /* BAR4 is 64-bit (type bits = 0b10). Program both BAR4 + BAR5. */
-            uint64_t cfg_base = gpu.ecam_base | (gpu.pci_bus << 20) | (gpu.pci_dev << 15) | (gpu.pci_func << 12);
-            *(volatile uint32_t *)(cfg_base + 0x20) = 0x81100000 | (bar4_raw & 0xF);  /* preserve type bits */
-            *(volatile uint32_t *)(cfg_base + 0x24) = 0;  /* BAR5 = upper 32 bits = 0 */
-            __asm__ volatile ("mfence" ::: "memory");
-            serial_puts("[VIRTIO-GPU] Programmed BAR4=0x81100000 (64-bit)\n");
+        uint64_t cfg_base = gpu.ecam_base | ((uint64_t)gpu.pci_bus << 20)
+                          | ((uint64_t)gpu.pci_dev << 15) | ((uint64_t)gpu.pci_func << 12);
+        uint64_t next_addr = 0x81100000ULL;
+        for (int i = 0; i < 6; i++) {
+            uint32_t raw = ecam_read32(0x10 + i * 4);
+            serial_puts("[VIRTIO-GPU] BAR"); serial_putdec(i);
+            serial_puts(" raw=0x"); serial_puthex(raw, 8); serial_puts("\n");
+            if ((raw & 1) == 0 && (raw & ~0xFU) == 0) {
+                /* Unassigned memory BAR — program it */
+                bool is_64 = ((raw & 0x6) == 0x4) && (i < 5);
+                *(volatile uint32_t *)(cfg_base + 0x10 + i * 4) = (uint32_t)(next_addr | (raw & 0xF));
+                if (is_64)
+                    *(volatile uint32_t *)(cfg_base + 0x10 + (i+1) * 4) = (uint32_t)(next_addr >> 32);
+                __asm__ volatile ("mfence" ::: "memory");
+                serial_puts("[VIRTIO-GPU] Programmed BAR"); serial_putdec(i);
+                serial_puts("=0x"); serial_puthex(next_addr, 8); serial_puts("\n");
+                next_addr += 0x100000;  /* 1 MB per BAR */
+                if (is_64) i++;  /* skip high half */
+            }
         }
     }
 
@@ -536,11 +541,9 @@ void virtio_gpu_init(uint64_t bar_phys)
 
     if (gpu_send_cmd(&cmd_info, sizeof(cmd_info), &resp_info, sizeof(resp_info)) == 0) {
         if (resp_info.hdr.type == VIRTIO_GPU_RESP_OK_DISPLAY_INFO) {
-            gpu.width = resp_info.pmodes[0].r.width;
-            gpu.height = resp_info.pmodes[0].r.height;
-            serial_puts("[VIRTIO-GPU] Display: ");
-            serial_putdec(gpu.width); serial_puts("x");
-            serial_putdec(gpu.height); serial_puts("\n");
+            serial_puts("[VIRTIO-GPU] Native display: ");
+            serial_putdec(resp_info.pmodes[0].r.width); serial_puts("x");
+            serial_putdec(resp_info.pmodes[0].r.height); serial_puts("\n");
         } else {
             serial_puts("[VIRTIO-GPU] GET_DISPLAY_INFO failed\n");
             return;
@@ -549,9 +552,12 @@ void virtio_gpu_init(uint64_t bar_phys)
         return;
     }
 
-    if (gpu.width == 0 || gpu.height == 0) {
-        gpu.width = 1024; gpu.height = 768;
-    }
+    /* Use kernel's framebuffer dimensions to match GOP resolution */
+    gpu.width = fb_width ? fb_width : 1024;
+    gpu.height = fb_height ? fb_height : 768;
+    serial_puts("[VIRTIO-GPU] Resource size: ");
+    serial_putdec(gpu.width); serial_puts("x");
+    serial_putdec(gpu.height); serial_puts("\n");
 
     /* ── CREATE 2D RESOURCE ───────────────────────────────────── */
     static struct virtio_gpu_resource_create_2d cmd_create;
@@ -570,9 +576,10 @@ void virtio_gpu_init(uint64_t bar_phys)
     /* ── ATTACH BACKING MEMORY ────────────────────────────────── */
     uint64_t fb_size = (uint64_t)gpu.width * gpu.height * 4;
     uint64_t fb_pages = (fb_size + 4095) / 4096;
-    gpu.framebuffer = (uint32_t *)mem_alloc_aligned(fb_size, 4096);
-    if (!gpu.framebuffer) { serial_puts("[VIRTIO-GPU] OOM for framebuffer\n"); return; }
-    gpu.fb_phys = (uint64_t)gpu.framebuffer;
+    void *fb_raw = mem_alloc_aligned(fb_size, 4096);
+    if (!fb_raw) { serial_puts("[VIRTIO-GPU] OOM for framebuffer\n"); return; }
+    gpu.fb_phys = (uint64_t)fb_raw;  /* physical addr for DMA */
+    gpu.framebuffer = (uint32_t *)PHYS_TO_VIRT((uint64_t)fb_raw);  /* virtual for CPU */
     memset(gpu.framebuffer, 0, fb_size);
 
     /* Command + 1 mem_entry in a single buffer */
@@ -592,58 +599,10 @@ void virtio_gpu_init(uint64_t bar_phys)
         return;
     serial_puts("[VIRTIO-GPU] Backing attached\n");
 
-    /* ── SET SCANOUT ──────────────────────────────────────────── */
-    static struct virtio_gpu_set_scanout cmd_scanout;
-    static struct virtio_gpu_ctrl_hdr resp_scanout;
-    memset(&cmd_scanout, 0, sizeof(cmd_scanout));
-    cmd_scanout.hdr.type = VIRTIO_GPU_CMD_SET_SCANOUT;
-    cmd_scanout.r.x = 0; cmd_scanout.r.y = 0;
-    cmd_scanout.r.width = gpu.width;
-    cmd_scanout.r.height = gpu.height;
-    cmd_scanout.scanout_id = 0;
-    cmd_scanout.resource_id = 1;
-
-    if (gpu_send_cmd(&cmd_scanout, sizeof(cmd_scanout), &resp_scanout, sizeof(resp_scanout)) < 0)
-        return;
-    serial_puts("[VIRTIO-GPU] Scanout set\n");
-
-    /* ── Fill with test pattern and flush ──────────────────────── */
-    for (uint32_t y = 0; y < gpu.height; y++) {
-        for (uint32_t x = 0; x < gpu.width; x++) {
-            /* Blue gradient */
-            uint8_t r = (x * 255) / gpu.width;
-            uint8_t g = (y * 255) / gpu.height;
-            uint8_t b = 128;
-            gpu.framebuffer[y * gpu.width + x] = (0xFF << 24) | (r << 16) | (g << 8) | b;
-        }
-    }
-
-    /* TRANSFER_TO_HOST_2D */
-    static struct virtio_gpu_transfer_to_host_2d cmd_xfer;
-    static struct virtio_gpu_ctrl_hdr resp_xfer;
-    memset(&cmd_xfer, 0, sizeof(cmd_xfer));
-    cmd_xfer.hdr.type = VIRTIO_GPU_CMD_TRANSFER_TO_HOST_2D;
-    cmd_xfer.r.x = 0; cmd_xfer.r.y = 0;
-    cmd_xfer.r.width = gpu.width;
-    cmd_xfer.r.height = gpu.height;
-    cmd_xfer.offset = 0;
-    cmd_xfer.resource_id = 1;
-
-    if (gpu_send_cmd(&cmd_xfer, sizeof(cmd_xfer), &resp_xfer, sizeof(resp_xfer)) < 0)
-        return;
-
-    /* RESOURCE_FLUSH */
-    static struct virtio_gpu_resource_flush cmd_flush;
-    static struct virtio_gpu_ctrl_hdr resp_flush;
-    memset(&cmd_flush, 0, sizeof(cmd_flush));
-    cmd_flush.hdr.type = VIRTIO_GPU_CMD_RESOURCE_FLUSH;
-    cmd_flush.r.x = 0; cmd_flush.r.y = 0;
-    cmd_flush.r.width = gpu.width;
-    cmd_flush.r.height = gpu.height;
-    cmd_flush.resource_id = 1;
-
-    if (gpu_send_cmd(&cmd_flush, sizeof(cmd_flush), &resp_flush, sizeof(resp_flush)) < 0)
-        return;
+    /* SET_SCANOUT is deferred to the first virtio_gpu_flush() call.
+     * This keeps VGA output visible during boot; the compositor takes
+     * over when it starts calling display_flip → virtio_gpu_flush. */
+    gpu.scanout_active = false;
 
     gpu.initialized = true;
     serial_puts("[VIRTIO-GPU] ============================\n");
@@ -663,6 +622,22 @@ bool      virtio_gpu_ready(void)     { return gpu.initialized; }
 /* ── Flush (call after drawing to framebuffer) ────────────────── */
 void virtio_gpu_flush(void) {
     if (!gpu.initialized) return;
+
+    /* Lazy SET_SCANOUT: activate on first flush so VGA stays visible during boot */
+    if (!gpu.scanout_active) {
+        static struct virtio_gpu_set_scanout cmd_scanout;
+        static struct virtio_gpu_ctrl_hdr resp_scanout;
+        memset(&cmd_scanout, 0, sizeof(cmd_scanout));
+        cmd_scanout.hdr.type = VIRTIO_GPU_CMD_SET_SCANOUT;
+        cmd_scanout.r.width = gpu.width;
+        cmd_scanout.r.height = gpu.height;
+        cmd_scanout.scanout_id = 0;
+        cmd_scanout.resource_id = 1;
+        if (gpu_send_cmd(&cmd_scanout, sizeof(cmd_scanout), &resp_scanout, sizeof(resp_scanout)) == 0) {
+            gpu.scanout_active = true;
+            serial_puts("[VIRTIO-GPU] Scanout activated (first flush)\n");
+        }
+    }
 
     static struct virtio_gpu_transfer_to_host_2d cmd_xfer;
     static struct virtio_gpu_ctrl_hdr resp_xfer;

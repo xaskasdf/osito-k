@@ -468,6 +468,23 @@ void isr_handler(interrupt_frame_t *frame)
 {
     uint64_t vec = frame->vector;
 
+    /* Report fpu_state_ptr corruption (detected by isr_common guard) */
+    {
+        extern uint64_t fpu_corrupt_val;
+        if (fpu_corrupt_val) {
+            serial_puts("[ISR] !!! fpu_state_ptr CORRUPT: 0x");
+            serial_puthex(fpu_corrupt_val, 16);
+            serial_puts(" (vec=");
+            serial_putdec(vec);
+            serial_puts(")\n");
+            /* Reset so we only report once per corruption event */
+            extern uint8_t *fpu_state_ptr;
+            extern uint8_t fpu_state_kernel[];
+            fpu_state_ptr = fpu_state_kernel;  /* restore safe default */
+            fpu_corrupt_val = 0;
+        }
+    }
+
     /* Log ALL compat32 exceptions (not timer/keyboard) for debugging */
     if (vec < 32 && (frame->cs & 0xFFFF) == 0x40 && vec != 1 && vec != 3) {
         static int exc_count = 0;

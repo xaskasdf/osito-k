@@ -170,6 +170,7 @@ qemu-system-x86_64 \
     -audiodev wav,id=wav0,path=$BUILD_DIR/audio.wav \
     -device intel-hda,id=hda0 \
     -device hda-duplex,id=snd0,audiodev=wav0 \
+    -device virtio-vga \
     $DISPLAY_ARGS \
     -serial file:"$SERIAL_LOG" \
     -monitor unix:/tmp/qemu-monitor.sock,server,nowait \

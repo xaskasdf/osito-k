@@ -30,6 +30,15 @@ extern int      gpu_display_is_ready(void)  __attribute__((weak));
 extern int      gpu_display_flip(uint64_t fb_addr) __attribute__((weak));
 extern uint32_t gpu_display_vblank_count(void) __attribute__((weak));
 
+/* Virtio-GPU 2D scanout (virtio_gpu.c) — weak so we link without virtio driver */
+extern bool     virtio_gpu_ready(void)      __attribute__((weak));
+extern uint32_t *virtio_gpu_get_fb(void)    __attribute__((weak));
+extern uint32_t virtio_gpu_get_width(void)  __attribute__((weak));
+extern uint32_t virtio_gpu_get_height(void) __attribute__((weak));
+extern void     virtio_gpu_flush(void)      __attribute__((weak));
+
+static void virtio_blit(const uint32_t *src);
+
 /* ── Display state ───────────────────────────────────────────── */
 
 typedef struct {
@@ -42,6 +51,8 @@ typedef struct {
     bool      initialized;
     bool      dirty;         /* back buffer has changes */
     bool      gpu_scanout;   /* GPU display engine active (page flip) */
+    bool      virtio_scanout; /* virtio-gpu 2D active (copy + flush) */
+    uint32_t *virtio_fb;     /* virtio-gpu framebuffer pointer */
 
     /* Double buffer rotation (GPU scanout only).
      * Two buffers alternate: compositor draws into back while GPU
@@ -253,6 +264,19 @@ int display_init(uint32_t *gop_base, uint32_t width, uint32_t height,
         disp.gpu_scanout = true;
     }
 
+    /* Check if virtio-GPU 2D is available for scanout */
+    disp.virtio_scanout = false;
+    disp.virtio_fb = NULL;
+    if (virtio_gpu_ready && virtio_gpu_ready()) {
+        disp.virtio_fb = virtio_gpu_get_fb();
+        if (disp.virtio_fb) {
+            disp.virtio_scanout = true;
+            /* Initial blit: copy current GOP contents to virtio-gpu */
+            virtio_blit(disp.gop_fb);
+            serial_puts("[DISP] virtio-GPU scanout enabled\n");
+        }
+    }
+
     serial_puts("[DISP] Double buffer: ");
     serial_putdec(width);
     serial_puts("x");
@@ -306,6 +330,29 @@ static void memcpy_nt(void *dst, const void *src, uint64_t size)
     if (rem) memcpy(d, s, rem);
 }
 
+/* ── Virtio-GPU blit helper ──────────────────────────────────── */
+
+static void virtio_blit(const uint32_t *src)
+{
+    extern uint64_t idt_get_ticks(void);
+
+    uint32_t vw = virtio_gpu_get_width();
+    uint32_t vh = virtio_gpu_get_height();
+    uint32_t cw = disp.width < vw ? disp.width : vw;
+    uint32_t ch = disp.height < vh ? disp.height : vh;
+    uint32_t *dst = disp.virtio_fb;
+    for (uint32_t y = 0; y < ch; y++)
+        memcpy(dst + y * vw, src + y * disp.pitch, cw * 4);
+
+    /* Throttle: flush at most ~30fps to avoid overwhelming virtqueue */
+    static uint64_t last_flush_tick;
+    uint64_t now = idt_get_ticks();
+    if (now - last_flush_tick >= 3) {  /* 100Hz ticks → ~33ms */
+        virtio_gpu_flush();
+        last_flush_tick = now;
+    }
+}
+
 /* ── Page Flip ───────────────────────────────────────────────── */
 
 /* Flip back buffer to screen. Waits for VBlank to avoid tearing.
@@ -333,6 +380,10 @@ void display_flip(void)
         memcpy(disp.gop_fb, disp.back, disp.fb_size);
     }
 
+    /* Virtio-GPU: also blit to virtio framebuffer and flush to host */
+    if (disp.virtio_scanout)
+        virtio_blit(disp.back);
+
     /* Track timing */
     uint64_t now = idt_get_ticks();
     uint64_t elapsed = now - disp.last_flip_tick;
@@ -356,6 +407,8 @@ void display_flip_nowait(void)
     } else {
         memcpy(disp.gop_fb, disp.back, disp.fb_size);
     }
+    if (disp.virtio_scanout)
+        virtio_blit(disp.back);
     disp.last_flip_tick = idt_get_ticks();
     disp.last_flip_tsc  = disp_rdtsc();
     disp.flip_count++;
@@ -372,6 +425,8 @@ void display_force_refresh(void)
         gpu_display_flip((uint64_t)(uintptr_t)disp.back);
     else
         memcpy(disp.gop_fb, disp.back, disp.fb_size);
+    if (disp.virtio_scanout)
+        virtio_blit(disp.back);
     disp.last_flip_tick = idt_get_ticks();
     disp.last_flip_tsc  = disp_rdtsc();
     disp.flip_count++;

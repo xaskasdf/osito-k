@@ -498,17 +498,13 @@ void kernel_entry(boot_info_t *info)
     /* Virtio GPU probe */
     {
         extern pci_dev_t *pci_get_virtio_gpu(void);
-        extern void virtio_gpu_init(uint64_t bar0_phys);
+        extern uint64_t   pci_get_ecam_base(void);
+        extern void virtio_gpu_init(uint64_t ecam, uint8_t bus, uint8_t dev, uint8_t func,
+                                    uint32_t fb_w, uint32_t fb_h);
         pci_dev_t *vgpu = pci_get_virtio_gpu();
-        /* virtio modern uses capabilities via BAR1/4, not BAR0 */
-        uint64_t vgpu_bar = 0;
         if (vgpu) {
-            for (int b = 0; b < 6; b++)
-                if (vgpu->bar[b]) { vgpu_bar = vgpu->bar[b]; break; }
-        }
-        if (vgpu && vgpu_bar) {
-            paging_map_mmio(vgpu_bar, 64 * 1024);
-            virtio_gpu_init(vgpu_bar);
+            virtio_gpu_init(pci_get_ecam_base(), vgpu->bus, vgpu->dev, vgpu->func,
+                           info->fb_width, info->fb_height);
         } else {
             serial_puts("[KERN] No virtio-GPU found\n");
         }
