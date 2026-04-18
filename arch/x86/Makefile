@@ -71,7 +71,7 @@ KERN_SRC = kernel/main.c kernel/serial.c kernel/framebuffer.c \
            kernel/elf.c kernel/process.c \
            kernel/keyboard.c kernel/terminal.c kernel/shell.c \
            kernel/crypto.c kernel/tls.c kernel/http.c kernel/claude.c \
-           kernel/tokenizer.c kernel/smp.c kernel/smp_work.c kernel/dynlink.c \
+           kernel/tokenizer.c kernel/smp.c kernel/smp_work.c kernel/spec_prefetch.c kernel/dynlink.c \
            kernel/zlib.c kernel/git.c \
            kernel/shm.c kernel/compositor.c kernel/display.c \
            kernel/input_events.c kernel/memcompress.c \

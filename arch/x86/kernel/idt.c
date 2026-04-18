@@ -1883,6 +1883,11 @@ void idt_init(void)
     idt_set_entry(0x71, isr_stub_33, 0);
     idt[0x71].selector = cs;
 
+    /* SMP work IPI: lightweight stub, no fxsave (safe for APs) */
+    extern void isr_stub_smp_ipi(void);
+    idt_set_entry(0xFE, isr_stub_smp_ipi, 0);
+    idt[0xFE].selector = cs;
+
     /* Load IDT */
     idtr.limit = sizeof(idt) - 1;
     idtr.base  = (uint64_t)&idt[0];

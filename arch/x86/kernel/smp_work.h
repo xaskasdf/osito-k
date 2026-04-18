@@ -54,6 +54,6 @@ void smp_wait(int ap_idx);
 void smp_barrier(void);
 
 /* AP-side worker loop (called from smp_ap_entry, never returns). */
-void ap_worker_loop(void);
+void ap_worker_loop(uint32_t cpu_idx);
 
 #endif

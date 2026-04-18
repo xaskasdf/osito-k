@@ -724,8 +724,13 @@ void sched_tick(void *frame_ptr)
      *  - preemption: higher-priority READY process preempts current */
     if (!force_switch && !quantum_expired) {
         /* Still have quantum — only preempt if candidate is strictly higher priority */
-        if (best_qos <= cur->qos_class)
+        if (best_qos <= cur->qos_class) {
+            /* No switch — speculatively prefetch code ahead on an idle AP */
+            extern void spec_prefetch_ahead(uint64_t rip, uint64_t cr3);
+            uint64_t *f = (uint64_t *)frame_ptr;
+            spec_prefetch_ahead(f[17] /* RIP */, cur->cr3);
             return;
+        }
         /* Preemption: higher priority process is waiting */
     }
 
@@ -776,16 +781,29 @@ void sched_tick(void *frame_ptr)
         extern int memcompress_restore_process(uint32_t);
 
         if ((now & 0xFF) == 0) {  /* ~every 2.5 seconds */
+            extern int smp_submit_any(void (*)(void*, void*), void*, void*);
+            extern int ap_worker_count;
             for (int i = 0; i < MAX_PROCESSES; i++) {
                 process_t *p = &proctab[i];
                 if (p->state == PROC_BLOCKED && !p->pages_compressed &&
                     p->last_active_tick > 0 &&
                     (now - p->last_active_tick) > memcompress_idle_threshold()) {
-                    /* Compress this idle process's pages */
-                    for (int r = 0; r < p->region_count; r++) {
-                        if (p->regions[r].base && p->regions[r].pages > 0) {
-                            memcompress_process_pages(p->pid,
-                                p->regions[r].base, p->regions[r].pages);
+                    /* Offload compression to an AP worker if available,
+                     * otherwise compress inline (fallback for single-CPU). */
+                    if (ap_worker_count > 0) {
+                        /* Pack pid + first region into a static arg block.
+                         * AP will call memcompress_process_pages for us. */
+                        static struct { uint32_t pid; void *base; uint64_t pages; } mc_arg;
+                        mc_arg.pid = p->pid;
+                        mc_arg.base = (p->region_count > 0) ? p->regions[0].base : 0;
+                        mc_arg.pages = (p->region_count > 0) ? p->regions[0].pages : 0;
+                        extern void memcompress_worker(void *arg, void *result);
+                        smp_submit_any(memcompress_worker, &mc_arg, 0);
+                    } else {
+                        for (int r = 0; r < p->region_count; r++) {
+                            if (p->regions[r].base && p->regions[r].pages > 0)
+                                memcompress_process_pages(p->pid,
+                                    p->regions[r].base, p->regions[r].pages);
                         }
                     }
                     p->pages_compressed = true;

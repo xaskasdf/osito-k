@@ -332,13 +332,93 @@ static void matvec_q4_0_scalar(float *out, const void *weight,
     }
 }
 
+/* SMP parallel matvec — split rows across AP workers */
+typedef struct {
+    float       *out;
+    const void  *weight;
+    const float *input;
+    uint32_t     row_start, row_end, cols;
+    int          use_avx2;
+} matvec_chunk_t;
+
+static void matvec_q4_0_chunk(void *arg, void *result)
+{
+    (void)result;
+    matvec_chunk_t *c = (matvec_chunk_t *)arg;
+    /* Advance weight pointer to row_start */
+    uint32_t bytes_per_row = (c->cols / 32) * 18; /* Q4_0: 18 bytes per 32 values */
+    const void *w = (const uint8_t *)c->weight + (uint64_t)c->row_start * bytes_per_row;
+    uint32_t chunk_rows = c->row_end - c->row_start;
+    if (c->use_avx2) {
+        extern void matvec_q4_0_avx2(float*, const void*, const float*, uint32_t, uint32_t);
+        matvec_q4_0_avx2(c->out + c->row_start, w, c->input, chunk_rows, c->cols);
+    } else {
+        matvec_q4_0_scalar(c->out + c->row_start, w, c->input, chunk_rows, c->cols);
+    }
+}
+
 void matvec_q4_0(float *out, const void *weight,
                  const float *input, uint32_t rows, uint32_t cols)
 {
-    if (tensor_has_avx2())
-        matvec_q4_0_avx2(out, weight, input, rows, cols);
+    extern int ap_worker_count;
+    extern int smp_submit(int, void (*)(void*, void*), void*, void*);
+    extern void smp_wait(int);
+
+    int avx2 = tensor_has_avx2();
+    int workers = ap_worker_count;
+
+    /* Only parallelize if APs are actually ready.
+     * Check first AP's state (offset 0 in 64-byte aligned struct). */
+    {
+        extern volatile int ap_controls;  /* first field = state */
+        /* ap_controls is the array start — state at offset 0 of each 64-byte block */
+        volatile int *states = &ap_controls;
+        int ready = 0;
+        for (int i = 0; i < workers && i < 3; i++)
+            if (states[i * 16] == 1 /* AP_IDLE */) ready++;  /* 64/4=16 ints per block */
+        if (ready == 0) workers = 0;
+    }
+
+    /* Only parallelize large matvecs (overhead not worth it for small) */
+    if (workers <= 0 || rows < 128) {
+        if (avx2)
+            matvec_q4_0_avx2(out, weight, input, rows, cols);
+        else
+            matvec_q4_0_scalar(out, weight, input, rows, cols);
+        return;
+    }
+
+    /* Cap at 3 workers (diminishing returns) */
+    if (workers > 3) workers = 3;
+    int total_parts = workers + 1;  /* workers + BSP */
+    uint32_t chunk = rows / total_parts;
+
+    /* Submit chunks to APs */
+    matvec_chunk_t chunks[3];
+    int submitted[3];
+    for (int i = 0; i < workers; i++) {
+        chunks[i].out       = out;
+        chunks[i].weight    = weight;
+        chunks[i].input     = input;
+        chunks[i].row_start = i * chunk;
+        chunks[i].row_end   = (i + 1) * chunk;
+        chunks[i].cols      = cols;
+        chunks[i].use_avx2  = avx2;
+        submitted[i] = smp_submit(i, matvec_q4_0_chunk, &chunks[i], 0);
+    }
+
+    /* BSP does the last chunk */
+    uint32_t bsp_start = workers * chunk;
+    uint32_t bytes_per_row = (cols / 32) * 18;
+    const void *bsp_w = (const uint8_t *)weight + (uint64_t)bsp_start * bytes_per_row;
+    if (avx2)
+        matvec_q4_0_avx2(out + bsp_start, bsp_w, input, rows - bsp_start, cols);
     else
-        matvec_q4_0_scalar(out, weight, input, rows, cols);
+        matvec_q4_0_scalar(out + bsp_start, bsp_w, input, rows - bsp_start, cols);
+
+    /* Wait for all APs */
+    for (int i = 0; i < workers; i++)
+        if (submitted[i] == 0) smp_wait(i);
 }
 
 void matvec_q8_0(float *out, const void *weight,

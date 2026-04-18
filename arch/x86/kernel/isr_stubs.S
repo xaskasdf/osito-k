@@ -50,12 +50,18 @@ isr_common:
      * process's state into the FPU — atomic with the GPR swap a few
      * instructions below. For the boot window before any process exists,
      * `fpu_state_ptr` points at the kernel-default buffer in process.c. */
+    /* Check if we're BSP (LAPIC ID 0) — only BSP needs fxsave because
+     * fpu_state_ptr is a global (not per-CPU). APs skip FPU save/restore. */
+    movabs $0xFFFF800000000000 + 0xFEE00020, %rax  /* PHYS_TO_VIRT(LAPIC_ID) */
+    movl   (%rax), %eax
+    shrl   $24, %eax
+    testl  %eax, %eax
+    jnz    .Lfxsave_done    /* Non-zero LAPIC ID = AP → skip */
+
     mov fpu_state_ptr(%rip), %rax
-    /* Guard: skip fxsave if fpu_state_ptr is corrupt.
-     * Check 16-aligned AND sign bit set (upper-half = 0xFFFF8000...). */
     test $0xF, %rax
     jnz .Lskip_fxsave
-    bt $63, %rax            /* test sign bit (upper-half addresses have bit 63 set) */
+    bt $63, %rax
     jnc .Lskip_fxsave
     fxsave64 (%rax)
     jmp .Lfxsave_done
@@ -78,6 +84,14 @@ isr_common:
      * process is live *now* (the scheduler may have rewritten
      * `fpu_state_ptr` while we were in C). */
     mov %rbp, %rsp
+
+    /* Skip fxrstor on APs (same reason as fxsave above) */
+    movabs $0xFFFF800000000000 + 0xFEE00020, %rax
+    movl   (%rax), %eax
+    shrl   $24, %eax
+    testl  %eax, %eax
+    jnz    .Lskip_fxrstor
+
     mov fpu_state_ptr(%rip), %rax
     test $0xF, %rax
     jnz .Lskip_fxrstor
@@ -179,12 +193,47 @@ ISR_ERR   30    /* #SX Security Exception */
 ISR_NOERR 31
 
 /* ── Vector 32: APIC timer ───────────────────────────────────── */
+/* On APs (LAPIC ID != 0), just EOI and return without touching
+ * any shared state. On BSP, go through full isr_common. */
 
-ISR_NOERR 32
+.globl isr_stub_32
+isr_stub_32:
+    push %rax
+    /* Check LAPIC ID — if non-zero, we're an AP: fast EOI path */
+    movabs $0xFFFF800000000000 + 0xFEE00020, %rax
+    movl   (%rax), %eax
+    shrl   $24, %eax
+    testl  %eax, %eax
+    jnz    .Ltimer_ap_eoi
+    pop    %rax
+    /* BSP: normal ISR path */
+    push   $0
+    push   $32
+    jmp    isr_common
+.Ltimer_ap_eoi:
+    /* AP: just EOI and return */
+    movabs $0xFFFF800000000000 + 0xFEE000B0, %rax
+    movl   $0, (%rax)
+    pop    %rax
+    iretq
 
 /* ── Vector 33: Keyboard IRQ (IRQ 1) ────────────────────────── */
 
 ISR_NOERR 33
+
+/* ── Vector 0xFE: SMP work IPI (lightweight, no fxsave) ─────── */
+/* APs receive this to wake from HLT. Only does APIC EOI — no GPR
+ * save, no FPU save, no scheduler. The AP's work loop polls
+ * work_pending after waking, so the ISR itself is a no-op. */
+
+.globl isr_stub_smp_ipi
+isr_stub_smp_ipi:
+    push %rax
+    /* APIC EOI: write 0 to PHYS_TO_VIRT(0xFEE000B0) */
+    movabs $0xFFFF800000000000 + 0xFEE000B0, %rax
+    movl   $0, (%rax)
+    pop    %rax
+    iretq
 
 /* ── Default stub for vectors 34-255 ─────────────────────────── */
 

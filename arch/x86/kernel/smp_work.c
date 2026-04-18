@@ -75,6 +75,10 @@ void smp_work_init(void)
     __asm__ volatile ("mfence" ::: "memory");
     ap_work_system_ready = 1;
 
+    /* Don't IPI APs yet — they'll wake on the next timer tick
+     * or when first work is submitted. The wait loop uses sti;hlt
+     * so any interrupt (including spurious) will wake them. */
+
     serial_puts("[SMP-WORK] Initialized, ");
     serial_putdec((uint64_t)ap_worker_count);
     serial_puts(" APs as workers\n");
@@ -133,15 +137,18 @@ void smp_barrier(void)
 
 /* ── AP-side worker loop ────────────────────────────────────── */
 
-void ap_worker_loop(void)
+void ap_worker_loop(uint32_t cpu_idx)
 {
-    /* Wait for BSP to call smp_work_init() and populate control blocks */
+    /* Wait for BSP to call smp_work_init() and populate control blocks.
+     * Use sti;hlt so QEMU doesn't waste host CPU on busy-wait.
+     * ISR fxsave/fxrstor is now per-CPU safe (skipped on APs). */
     while (!ap_work_system_ready)
         __asm__ volatile ("sti; hlt" ::: "memory");
 
-    /* Find our control block by LAPIC ID */
-    volatile uint32_t *apic = idt_get_apic_base();
-    uint32_t my_id = apic ? (apic[0x020 / 4] >> 24) & 0xFF : 0;
+    /* Find our control block — match by LAPIC ID using the cpu_idx
+     * we received from smp_ap_entry. */
+    extern uint32_t smp_get_cpu_apic_id(uint32_t index);
+    uint32_t my_id = smp_get_cpu_apic_id(cpu_idx);
     int my_idx = -1;
 
     for (int i = 0; i < ap_worker_count; i++) {
@@ -153,20 +160,14 @@ void ap_worker_loop(void)
 
     if (my_idx < 0) {
         /* Orphan AP — not in our control table, just idle */
-        for (;;) __asm__ volatile ("sti; hlt");
+        for (;;) __asm__ volatile ("pause");
     }
 
     ap_control_t *me = &ap_controls[my_idx];
     me->state = AP_IDLE;
 
-    serial_puts("[SMP-WORK] AP ");
-    serial_putdec((uint64_t)my_idx);
-    serial_puts(" (LAPIC ");
-    serial_putdec((uint64_t)my_id);
-    serial_puts(") worker ready\n");
-
     for (;;) {
-        /* Wait for work — HLT is woken by IPI or timer */
+        /* Wait for work — HLT until IPI or timer wakes us */
         while (!me->work_pending)
             __asm__ volatile ("sti; hlt" ::: "memory");
 

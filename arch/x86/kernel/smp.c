@@ -382,10 +382,12 @@ void smp_ap_entry(uint32_t cpu_index)
         /* Enable LAPIC with spurious vector 0xFF */
         apic_write_reg(apic, APIC_SVR, APIC_SVR_ENABLE | 0xFF);
 
-        /* Start APIC timer — use BSP-calibrated init count for accurate 100Hz */
+        /* Start APIC timer — use BSP-calibrated init count for accurate 100Hz.
+         * APs need timer ticks so HLT can wake periodically. The fpu_state_ptr
+         * race is handled in isr_common by checking LAPIC ID. */
         extern uint32_t idt_get_apic_timer_init(void);
         uint32_t timer_init = idt_get_apic_timer_init();
-        if (timer_init == 0) timer_init = 625000;  /* fallback */
+        if (timer_init == 0) timer_init = 625000;
         apic_write_reg(apic, 0x3E0, 0x03);    /* Divide by 16 */
         apic_write_reg(apic, 0x320, 0x20020);  /* Periodic, vector 32 */
         apic_write_reg(apic, 0x380, timer_init);
@@ -398,15 +400,9 @@ void smp_ap_entry(uint32_t cpu_index)
     /* Atomic increment — use lock xadd (TCC doesn't support __sync builtins) */
     __asm__ volatile("lock incl %0" : "+m"(ap_started_count));
 
-    serial_puts("[SMP] AP ");
-    serial_putdec(cpu_index);
-    serial_puts(" online (APIC ID ");
-    serial_putdec(apic ? (apic_read_reg(apic, APIC_ID) >> 24) & 0xFF : 0);
-    serial_puts(")\n");
-
-    /* Enter worker loop — AP processes tasks submitted by BSP */
-    extern void ap_worker_loop(void);
-    ap_worker_loop();  /* never returns */
+    /* Idle loop — AP waits for work */
+    for (;;)
+        __asm__ volatile ("sti; hlt" ::: "memory");
 }
 
 /* ── AP Startup (INIT-SIPI-SIPI) ─────────────────────────────── */
