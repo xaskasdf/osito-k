@@ -158,7 +158,7 @@ qemu-system-x86_64 \
     $BIOS_ARGS \
     -drive file="$ESP_IMG",format=raw,if=ide \
     $NVME_ARGS \
-    -m 512M \
+    -m 4G \
     -machine q35 \
     -cpu Nehalem \
     -smp 4 \

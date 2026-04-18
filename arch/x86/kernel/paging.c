@@ -74,11 +74,12 @@ extern void *mem_alloc_aligned_high(uint64_t size, uint64_t alignment);
  * lower-half identity map. */
 static uint64_t *pt_alloc_page(void)
 {
-    /* Allocate from high memory to avoid collisions with ET_EXEC
-     * binaries that load in low memory (typically 0x400000-0x10000000). */
-    void *phys = mem_alloc_aligned_high(PAGE_SIZE, PAGE_SIZE);
+    /* Allocate from low memory (< 4GB) so the PML4 physical address
+     * fits in the 32-bit CR3 loaded by the AP trampoline. High-memory
+     * allocation (> 4GB) would be truncated by the 32-bit mov cr3. */
+    void *phys = mem_alloc_aligned(PAGE_SIZE, PAGE_SIZE);
     if (!phys)
-        phys = mem_alloc_aligned(PAGE_SIZE, PAGE_SIZE);
+        phys = mem_alloc_aligned_high(PAGE_SIZE, PAGE_SIZE);
     if (!phys)
         return NULL;
     uint64_t *virt = (uint64_t *)PHYS_TO_VIRT(phys);
@@ -537,47 +538,30 @@ void paging_init(void)
 
     /* ── Identity map memory regions ── */
 
-    /* 1. First 4GB: covers all conventional RAM, legacy MMIO,
-     *    APIC (0xFEE00000), IOAPIC (0xFEC00000), PCI config, etc.
-     *    Use 2MB pages for the bulk. */
-    serial_puts("[PAGE] Mapping first 4 GB...\n");
-    paging_identity_map_range(0, 4ULL * 1024 * 1024 * 1024, 0);
+    /* Determine the highest physical address that needs mapping.
+     * With QEMU -m 4G, RAM may extend above the 4GB MMIO hole
+     * (e.g., 0x100000000..0x17FFFFFFF). We must map all of it
+     * so pt_alloc_page's PHYS_TO_VIRT works for any allocated page. */
+    extern uint64_t mem_get_highest_address(void);
+    uint64_t highest = mem_get_highest_address();
+    /* Always cover at least 4GB (for MMIO: APIC, IOAPIC, PCI config) */
+    if (highest < 4ULL * 1024 * 1024 * 1024)
+        highest = 4ULL * 1024 * 1024 * 1024;
+    /* Round up to GB boundary */
+    highest = (highest + (1ULL << 30) - 1) & ~((1ULL << 30) - 1);
 
-    /* 2. Extended RAM: if system has >4GB, map up to total_memory.
-     *    Our UEFI systems typically have 8-32GB. */
-    uint64_t total = mem_get_total();
-    if (total > 4ULL * 1024 * 1024 * 1024) {
-        uint64_t extended = total;
-        /* Round up to next GB boundary */
-        extended = (extended + (1ULL << 30) - 1) & ~((1ULL << 30) - 1);
-        serial_puts("[PAGE] Mapping extended RAM up to ");
-        serial_putdec(extended / (1024 * 1024));
-        serial_puts(" MB...\n");
-        paging_identity_map_range(4ULL * 1024 * 1024 * 1024, extended, 0);
-    }
+    serial_puts("[PAGE] Mapping ");
+    serial_putdec(highest / (1024 * 1024 * 1024));
+    serial_puts(" GB physical...\n");
+    paging_identity_map_range(0, highest, 0);
 
-    /* 3. GPU BAR0/BAR1 regions (typically above 4GB).
-     *    These are large MMIO windows — map as uncacheable.
-     *    Common locations: BAR0 ~256MB, BAR1 ~256MB-16GB.
-     *    We map a generous range; unused entries are harmless. */
-    /* Note: actual BAR addresses vary by system. The PCI scan
-     * discovers them at runtime. For now we pre-map common ranges.
-     * Individual drivers can also call paging_map_mmio() later. */
-
-    /* 4. Upper-half direct map (Fase 1): mirror all of RAM at
-     *    VA = phys + KERNEL_VBASE. This populates PML4[256] so that
-     *    drivers migrated to PHYS_TO_VIRT(phys) can dereference the
-     *    upper-half alias. The lower-half identity map above stays
-     *    active — kernel text still runs identity-mapped. */
+    /* Upper-half direct map: mirror all of physical space at
+     * VA = phys + KERNEL_VBASE. This populates PML4[256] so that
+     * PHYS_TO_VIRT works for any physical address. */
     serial_puts("[PAGE] Mapping upper-half mirror at 0x");
     serial_puthex(KERNEL_VBASE, 16);
     serial_puts("...\n");
-    paging_map_range_at(0, 4ULL * 1024 * 1024 * 1024, KERNEL_VBASE, 0);
-    if (total > 4ULL * 1024 * 1024 * 1024) {
-        uint64_t extended = total;
-        extended = (extended + (1ULL << 30) - 1) & ~((1ULL << 30) - 1);
-        paging_map_range_at(4ULL * 1024 * 1024 * 1024, extended, KERNEL_VBASE, 0);
-    }
+    paging_map_range_at(0, highest, KERNEL_VBASE, 0);
 
     serial_puts("[PAGE] Page tables built: ");
     serial_putdec(pt_pages_used);

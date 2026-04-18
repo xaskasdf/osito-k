@@ -1404,7 +1404,7 @@ int32_t proc_clone_thread(uint64_t child_stack, uint64_t parent_tidptr,
 /* ── Futex wait queue (X-THREAD) ────────────────────────────── */
 
 #define FUTEX_HASH_SIZE  32
-#define MAX_FUTEX_WAITERS 32
+#define MAX_FUTEX_WAITERS 256
 
 typedef struct {
     uint64_t    addr;       /* futex user address */

@@ -404,10 +404,9 @@ void smp_ap_entry(uint32_t cpu_index)
     serial_putdec(apic ? (apic_read_reg(apic, APIC_ID) >> 24) & 0xFF : 0);
     serial_puts(")\n");
 
-    /* Idle loop — AP waits for work */
-    for (;;) {
-        __asm__ volatile ("sti; hlt" ::: "memory");
-    }
+    /* Enter worker loop — AP processes tasks submitted by BSP */
+    extern void ap_worker_loop(void);
+    ap_worker_loop();  /* never returns */
 }
 
 /* ── AP Startup (INIT-SIPI-SIPI) ─────────────────────────────── */
@@ -611,6 +610,13 @@ cpu_info_t *smp_cpu_info(uint32_t index)
 {
     if (index >= cpu_count) return NULL;
     return &cpus[index];
+}
+
+uint32_t smp_get_cpu_count(void)  { return cpu_count; }
+uint32_t smp_get_bsp_apic_id(void) { return bsp_apic_id; }
+uint32_t smp_get_cpu_apic_id(uint32_t index)
+{
+    return (index < cpu_count) ? cpus[index].apic_id : 0;
 }
 
 uint32_t smp_current_cpu(void)

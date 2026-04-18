@@ -343,6 +343,13 @@ uint64_t mem_get_total(void)
     return total_memory;
 }
 
+/* Highest physical address that may contain usable RAM.
+ * Used by paging_init to size the identity + upper-half maps. */
+uint64_t mem_get_highest_address(void)
+{
+    return max_tracked_page * PAGE_SIZE;
+}
+
 uint64_t mem_get_used(void)
 {
     return (total_pages - free_pages) * PAGE_SIZE;

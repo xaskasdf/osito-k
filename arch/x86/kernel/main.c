@@ -408,6 +408,12 @@ void kernel_entry(boot_info_t *info)
     /* ── Step 1.75: SMP — wake AP cores ── */
     smp_init();
 
+    /* ── Step 1.76: SMP work distribution — activate AP workers ── */
+    {
+        extern void smp_work_init(void);
+        smp_work_init();
+    }
+
     /* ── Step 1.8: Syscall interface ── */
     syscall_init();
 
