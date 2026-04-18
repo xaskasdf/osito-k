@@ -92,6 +92,8 @@ gpu_device_t gpu_dev;
 static pci_dev_t nvme_dev_stores[MAX_NVME_DEVS];
 static int       nvme_dev_count;
 static pci_dev_t nic_dev_store, xhci_dev_store, hda_dev_store;
+static pci_dev_t virtio_gpu_dev_store;
+static int       has_virtio_gpu;
 static pci_dev_t *nvme_dev;   /* first NVMe (backward compat) */
 static pci_dev_t *nic_dev;
 static pci_dev_t *xhci_dev;
@@ -389,6 +391,26 @@ static void pci_add_device(uint8_t bus, uint8_t dev, uint8_t func,
         serial_puts(" MB\n");
     }
 
+    /* Check if virtio-gpu (vendor 0x1AF4, device 0x1050) */
+    if (vendor == 0x1AF4 && device == 0x1050) {
+        /* Read BARs directly — the generic scan may have missed them */
+        for (int b = 0; b < 4; b++) {
+            uint32_t raw = pci_read32(bus, dev, func, 0x10 + b*4);
+            serial_puts("[PCI] virtio-gpu raw BAR"); serial_putdec(b);
+            serial_puts("=0x"); serial_puthex(raw, 8); serial_puts("\n");
+            if (raw && !d->bar[b])
+                d->bar[b] = raw & ~0xFULL;
+        }
+        virtio_gpu_dev_store = *d;
+        has_virtio_gpu = 1;
+        serial_puts("[PCI] virtio-gpu at ");
+        serial_putdec(bus); serial_puts(":"); serial_putdec(dev);
+        serial_puts("."); serial_putdec(func);
+        serial_puts(" BAR0=0x"); serial_puthex(d->bar[0], 16);
+        serial_puts(" BAR1=0x"); serial_puthex(d->bar[1], 16);
+        serial_puts("\n");
+    }
+
     /* Check if NVMe controller */
     if (class == PCI_CLASS_STORAGE && subclass == PCI_SUBCLASS_NVME) {
         if (nvme_dev_count < MAX_NVME_DEVS) {
@@ -566,6 +588,11 @@ void pci_scan(void)
 gpu_device_t *pci_get_gpu(void)
 {
     return gpu_dev.vendor_id ? &gpu_dev : NULL;
+}
+
+pci_dev_t *pci_get_virtio_gpu(void)
+{
+    return has_virtio_gpu ? &virtio_gpu_dev_store : NULL;
 }
 
 pci_dev_t *pci_get_nvme(void)
