@@ -91,6 +91,28 @@ void smp_work_init(void)
     serial_puts("[SMP-WORK] Initialized, ");
     serial_putdec((uint64_t)ap_worker_count);
     serial_puts(" APs as workers\n");
+
+    /* Smoke test: submit a no-op to AP 0 to verify IPI delivery works */
+    if (ap_worker_count > 0 && ap_controls[0].state == AP_IDLE) {
+        static volatile int test_done;
+        test_done = 0;
+        smp_submit(0, (smp_work_func_t)(void (*)(void*,void*))0, NULL, NULL);
+
+        /* Wait with timeout */
+        int tout = 10000000;
+        while (!ap_controls[0].done && --tout > 0)
+            __asm__ volatile ("pause");
+
+        if (ap_controls[0].done) {
+            serial_puts("[SMP-WORK] AP 0 smoke test: OK\n");
+        } else {
+            serial_puts("[SMP-WORK] AP 0 smoke test: TIMEOUT (state=");
+            serial_putdec((uint64_t)ap_controls[0].state);
+            serial_puts(" pending=");
+            serial_putdec((uint64_t)ap_controls[0].work_pending);
+            serial_puts(")\n");
+        }
+    }
 }
 
 int smp_submit(int ap_idx, smp_work_func_t func, void *arg, void *result)
@@ -132,8 +154,17 @@ int smp_submit_any(smp_work_func_t func, void *arg, void *result)
 void smp_wait(int ap_idx)
 {
     if (ap_idx < 0 || ap_idx >= ap_worker_count) return;
-    while (!ap_controls[ap_idx].done)
+    int timeout = 100000000;  /* ~seconds at pause speed */
+    while (!ap_controls[ap_idx].done && --timeout > 0)
         __asm__ volatile ("pause" ::: "memory");
+    if (timeout <= 0) {
+        serial_puts("[SMP-WORK] TIMEOUT waiting for AP ");
+        serial_putdec((uint64_t)ap_idx);
+        serial_puts(" (state="); serial_putdec((uint64_t)ap_controls[ap_idx].state);
+        serial_puts(" pending="); serial_putdec((uint64_t)ap_controls[ap_idx].work_pending);
+        serial_puts(" done="); serial_putdec((uint64_t)ap_controls[ap_idx].done);
+        serial_puts(")\n");
+    }
 }
 
 void smp_barrier(void)
@@ -148,9 +179,24 @@ void smp_barrier(void)
 
 void ap_worker_loop(uint32_t cpu_idx)
 {
-    /* Wait for BSP to call smp_work_init() and populate control blocks.
-     * Use sti;hlt so QEMU doesn't waste host CPU on busy-wait.
-     * ISR fxsave/fxrstor is now per-CPU safe (skipped on APs). */
+    /* Initialize FPU/SSE on this AP — required before any float work.
+     * Without this, the AP's FPU state is undefined and float ops
+     * may generate #MF/#XM exceptions that loop forever in the
+     * AP fast-path ISR (EOI + iretq → retry → exception → ...). */
+    __asm__ volatile ("fninit");
+    /* Enable SSE: set CR0.MP, clear CR0.EM, set CR4.OSFXSR+OSXMMEXCPT */
+    {
+        uint64_t cr0;
+        __asm__ volatile ("mov %%cr0, %0" : "=r"(cr0));
+        cr0 = (cr0 | (1 << 1)) & ~(1ULL << 2);  /* MP=1, EM=0 */
+        __asm__ volatile ("mov %0, %%cr0" :: "r"(cr0));
+        uint64_t cr4;
+        __asm__ volatile ("mov %%cr4, %0" : "=r"(cr4));
+        cr4 |= (1 << 9) | (1 << 10);  /* OSFXSR + OSXMMEXCPT */
+        __asm__ volatile ("mov %0, %%cr4" :: "r"(cr4));
+    }
+
+    /* Wait for BSP to call smp_work_init() and populate control blocks. */
     while (!ap_work_system_ready)
         __asm__ volatile ("sti; hlt" ::: "memory");
 

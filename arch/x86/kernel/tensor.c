@@ -365,8 +365,7 @@ void matvec_q4_0(float *out, const void *weight,
     extern void smp_wait(int);
 
     int avx2 = tensor_has_avx2();
-    int workers = 0;  /* TODO: enable SMP matvec after AP worker validation */
-    (void)ap_worker_count;
+    int workers = ap_worker_count;
 
     /* Only parallelize if APs are actually ready.
      * Check first AP's state (offset 0 in 64-byte aligned struct). */
