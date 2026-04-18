@@ -75,9 +75,18 @@ void smp_work_init(void)
     __asm__ volatile ("mfence" ::: "memory");
     ap_work_system_ready = 1;
 
-    /* Don't IPI APs yet — they'll wake on the next timer tick
-     * or when first work is submitted. The wait loop uses sti;hlt
-     * so any interrupt (including spurious) will wake them. */
+    /* Wait for APs to enter their worker loops and report AP_IDLE.
+     * They wake from HLT via timer ticks (EOI-only fast path). */
+    {
+        int timeout = 100000;
+        while (timeout-- > 0) {
+            int ready = 0;
+            for (int i = 0; i < ap_worker_count; i++)
+                if (ap_controls[i].state == AP_IDLE) ready++;
+            if (ready == ap_worker_count) break;
+            __asm__ volatile ("pause");
+        }
+    }
 
     serial_puts("[SMP-WORK] Initialized, ");
     serial_putdec((uint64_t)ap_worker_count);

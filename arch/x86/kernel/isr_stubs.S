@@ -19,7 +19,24 @@
 
 .globl isr_common
 isr_common:
-    /* Save all GPRs */
+    /* AP fast-path: APs must not enter isr_handler (it accesses BSP-only
+     * state like sched_switch_rsp, process table, null page, etc.).
+     * Check LAPIC ID and do EOI + iretq immediately for non-BSP CPUs. */
+    push %rax
+    movabs $0xFFFF800000000000 + 0xFEE00020, %rax
+    movl   (%rax), %eax
+    shrl   $24, %eax
+    testl  %eax, %eax
+    jz     1f
+    /* AP: EOI and return */
+    movabs $0xFFFF800000000000 + 0xFEE000B0, %rax
+    movl   $0, (%rax)
+    pop    %rax
+    add    $16, %rsp    /* skip vector + error_code */
+    iretq
+1:  pop    %rax
+
+    /* Save all GPRs (BSP only from here) */
     push %rax
     push %rbx
     push %rcx
@@ -50,24 +67,22 @@ isr_common:
      * process's state into the FPU — atomic with the GPR swap a few
      * instructions below. For the boot window before any process exists,
      * `fpu_state_ptr` points at the kernel-default buffer in process.c. */
-    /* Check if we're BSP (LAPIC ID 0) — only BSP needs fxsave because
-     * fpu_state_ptr is a global (not per-CPU). APs skip FPU save/restore. */
-    movabs $0xFFFF800000000000 + 0xFEE00020, %rax  /* PHYS_TO_VIRT(LAPIC_ID) */
+    /* Per-CPU fxsave: read LAPIC ID, index into fpu_state_ptrs[],
+     * and fxsave to the per-CPU buffer. Safe for both BSP and APs. */
+    push %rcx
+    movabs $0xFFFF800000000000 + 0xFEE00020, %rax
     movl   (%rax), %eax
-    shrl   $24, %eax
-    testl  %eax, %eax
-    jnz    .Lfxsave_done    /* Non-zero LAPIC ID = AP → skip */
-
-    mov fpu_state_ptr(%rip), %rax
-    test $0xF, %rax
-    jnz .Lskip_fxsave
-    bt $63, %rax
-    jnc .Lskip_fxsave
+    shrl   $24, %eax           /* eax = LAPIC ID (0..15) */
+    andl   $0xF, %eax          /* safety clamp */
+    leaq   fpu_state_ptrs(%rip), %rcx
+    movq   (%rcx, %rax, 8), %rax  /* rax = fpu_state_ptrs[lapic_id] */
+    test   %rax, %rax
+    jz     .Lfxsave_done
+    test   $0xF, %rax
+    jnz    .Lfxsave_done
     fxsave64 (%rax)
-    jmp .Lfxsave_done
-.Lskip_fxsave:
-    mov %rax, fpu_corrupt_val(%rip)
 .Lfxsave_done:
+    pop    %rcx
 
     /* Align RSP to 16 bytes for the C ABI. Use %rbp as a scratch to
      * save the GPR-area rsp so we can restore cleanly after the call;
@@ -85,29 +100,34 @@ isr_common:
      * `fpu_state_ptr` while we were in C). */
     mov %rbp, %rsp
 
-    /* Skip fxrstor on APs (same reason as fxsave above) */
+    /* Per-CPU fxrstor: same LAPIC-indexed lookup as fxsave.
+     * For BSP, the scheduler may have rewritten fpu_state_ptrs[0]
+     * to the incoming process's FPU slot. */
+    push %rcx
+    movabs $0xFFFF800000000000 + 0xFEE00020, %rax
+    movl   (%rax), %eax
+    shrl   $24, %eax
+    andl   $0xF, %eax
+    leaq   fpu_state_ptrs(%rip), %rcx
+    movq   (%rcx, %rax, 8), %rax
+    test   %rax, %rax
+    jz     .Lskip_fxrstor
+    test   $0xF, %rax
+    jnz    .Lskip_fxrstor
+    fxrstor64 (%rax)
+.Lskip_fxrstor:
+    pop    %rcx
+
+    /* ── Scheduler: check for context switch (X-SCHED) ────────── */
+    /* Only BSP (LAPIC 0) does context switches. APs must NOT touch
+     * sched_switch_rsp — it's set by BSP's sched_tick for BSP's
+     * own context switch. An AP reading it would steal the switch. */
     movabs $0xFFFF800000000000 + 0xFEE00020, %rax
     movl   (%rax), %eax
     shrl   $24, %eax
     testl  %eax, %eax
-    jnz    .Lskip_fxrstor
+    jnz    .Lno_switch       /* AP → skip context switch */
 
-    mov fpu_state_ptr(%rip), %rax
-    test $0xF, %rax
-    jnz .Lskip_fxrstor
-    bt $63, %rax
-    jnc .Lskip_fxrstor
-    fxrstor64 (%rax)
-.Lskip_fxrstor:
-
-    /* ── Scheduler: check for context switch (X-SCHED) ────────── */
-    /* If sched_tick() set sched_switch_rsp, switch to new stack   */
-    /* before popping GPRs — the new stack has the next process's  */
-    /* saved interrupt frame, so pops + iretq resume that process. */
-    /* IMPORTANT: Use XCHG (implicit LOCK) to atomically read and  */
-    /* clear sched_switch_rsp. This prevents SMP race where an AP  */
-    /* reads the value set by BSP's sched_tick and switches to the */
-    /* wrong context. Only the first CPU to XCHG gets the value.   */
     xor %rax, %rax
     xchg sched_switch_rsp(%rip), %rax
     test %rax, %rax
@@ -193,29 +213,9 @@ ISR_ERR   30    /* #SX Security Exception */
 ISR_NOERR 31
 
 /* ── Vector 32: APIC timer ───────────────────────────────────── */
-/* On APs (LAPIC ID != 0), just EOI and return without touching
- * any shared state. On BSP, go through full isr_common. */
+/* Per-CPU safe now: isr_common uses fpu_state_ptrs[lapic_id]. */
 
-.globl isr_stub_32
-isr_stub_32:
-    push %rax
-    /* Check LAPIC ID — if non-zero, we're an AP: fast EOI path */
-    movabs $0xFFFF800000000000 + 0xFEE00020, %rax
-    movl   (%rax), %eax
-    shrl   $24, %eax
-    testl  %eax, %eax
-    jnz    .Ltimer_ap_eoi
-    pop    %rax
-    /* BSP: normal ISR path */
-    push   $0
-    push   $32
-    jmp    isr_common
-.Ltimer_ap_eoi:
-    /* AP: just EOI and return */
-    movabs $0xFFFF800000000000 + 0xFEE000B0, %rax
-    movl   $0, (%rax)
-    pop    %rax
-    iretq
+ISR_NOERR 32
 
 /* ── Vector 33: Keyboard IRQ (IRQ 1) ────────────────────────── */
 

@@ -405,6 +405,12 @@ void kernel_entry(boot_info_t *info)
     /* ── Step 1.7: Kernel heap ── */
     heap_init();
 
+    /* ── Step 1.74: Per-CPU FPU state (must be before SMP) ── */
+    {
+        extern void fpu_percpu_init(void);
+        fpu_percpu_init();
+    }
+
     /* ── Step 1.75: SMP — wake AP cores ── */
     smp_init();
 

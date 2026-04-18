@@ -176,8 +176,25 @@ static uint32_t next_pid = 1;
  * kernel threads that never got a process_t, the pointer points
  * at `fpu_state_kernel` below. */
 __attribute__((aligned(16))) uint8_t fpu_state_kernel[512];
-uint8_t *fpu_state_ptr = fpu_state_kernel;
+uint8_t *fpu_state_ptr = fpu_state_kernel;  /* BSP default (legacy, index 0) */
 uint64_t fpu_corrupt_val;  /* set by isr_common when fpu_state_ptr is corrupt */
+
+/* Per-CPU FPU state pointers — indexed by LAPIC ID (0..15).
+ * BSP (LAPIC 0) uses fpu_state_ptrs[0] = process's fpu_state.
+ * APs use fpu_state_ptrs[lapic_id] = their own static buffer.
+ * The ISR stub reads LAPIC ID and indexes into this array. */
+#define FPU_MAX_CPUS 16
+uint8_t *fpu_state_ptrs[FPU_MAX_CPUS];
+__attribute__((aligned(16))) uint8_t fpu_state_ap_bufs[FPU_MAX_CPUS][512];
+
+void fpu_percpu_init(void)
+{
+    /* BSP (index 0) starts with kernel default */
+    fpu_state_ptrs[0] = fpu_state_kernel;
+    /* APs get their own static buffers */
+    for (int i = 1; i < FPU_MAX_CPUS; i++)
+        fpu_state_ptrs[i] = fpu_state_ap_bufs[i];
+}
 
 /* Update both current_proc and fpu_state_ptr together so the ISR
  * save/restore path and the scheduler agree about which FPU slot
@@ -185,7 +202,9 @@ uint64_t fpu_corrupt_val;  /* set by isr_common when fpu_state_ptr is corrupt */
 static inline void set_current_proc(process_t *p)
 {
     current_proc = p;
-    fpu_state_ptr = p ? p->fpu_state : fpu_state_kernel;
+    uint8_t *fpu = p ? p->fpu_state : fpu_state_kernel;
+    fpu_state_ptr = fpu;           /* legacy global (BSP only) */
+    fpu_state_ptrs[0] = fpu;      /* per-CPU array slot for BSP */
 }
 
 /* Kernel return context — saved before exec, restored on exit */

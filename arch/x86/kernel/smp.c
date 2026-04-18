@@ -400,9 +400,10 @@ void smp_ap_entry(uint32_t cpu_index)
     /* Atomic increment — use lock xadd (TCC doesn't support __sync builtins) */
     __asm__ volatile("lock incl %0" : "+m"(ap_started_count));
 
-    /* Idle loop — AP waits for work */
-    for (;;)
-        __asm__ volatile ("sti; hlt" ::: "memory");
+    /* Enter worker loop — isr_common now uses per-CPU fpu_state_ptrs[]
+     * so APs can safely receive interrupts without corrupting BSP FPU. */
+    extern void ap_worker_loop(uint32_t cpu_idx);
+    ap_worker_loop(cpu_index);
 }
 
 /* ── AP Startup (INIT-SIPI-SIPI) ─────────────────────────────── */
