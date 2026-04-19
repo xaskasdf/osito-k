@@ -144,6 +144,11 @@ static uint32_t  terminal_h;
 #define CURSOR_H 16
 static uint32_t cursor_rgba[CURSOR_W * CURSOR_H];
 
+/* Frame-level dirty tracking: skip render when nothing changed */
+static bool     comp_frame_dirty = true;
+static int32_t  comp_last_cx = -1, comp_last_cy = -1;
+static uint64_t comp_dirty_tick;  /* force dirty once/sec for RTC clock */
+
 /* Stats */
 static uint64_t comp_frames;
 static uint64_t comp_direct_scanout;
@@ -191,6 +196,7 @@ uint32_t compositor_create_window(uint32_t shm_handle,
     }
     if (!w) return 0;
 
+    comp_frame_dirty = true;
     w->id = next_window_id++;
     w->x = x;
     w->y = y;
@@ -238,6 +244,7 @@ void compositor_destroy_window(uint32_t window_id)
 {
     for (int i = 0; i < MAX_WINDOWS; i++) {
         if ((windows[i].flags & WND_ACTIVE) && windows[i].id == window_id) {
+            comp_frame_dirty = true;
             if (windows[i].shm_handle)
                 shm_unmap(windows[i].shm_handle);
             windows[i].flags = 0;
@@ -262,6 +269,7 @@ void compositor_cleanup_process(uint32_t pid)
 /* Signal that a window's surface has new content */
 void compositor_signal_dirty(uint32_t window_id)
 {
+    comp_frame_dirty = true;
     for (int i = 0; i < MAX_WINDOWS; i++) {
         if ((windows[i].flags & WND_ACTIVE) && windows[i].id == window_id) {
             windows[i].flags |= WND_DIRTY;
@@ -777,6 +785,23 @@ static void compositor_render_frame(void)
 
     if (!back) return;
 
+    /* Frame-level dirty skip: if nothing changed and cursor didn't move,
+     * skip the entire render. Force dirty once per second for RTC clock. */
+    {
+        int32_t cx, cy;
+        input_get_cursor(&cx, &cy);
+        uint64_t now_tick = idt_get_ticks();
+        bool cursor_moved = (cx != comp_last_cx || cy != comp_last_cy);
+        bool clock_tick   = (now_tick - comp_dirty_tick >= 100); /* 1 sec @ 100Hz */
+        if (!comp_frame_dirty && !cursor_moved && !clock_tick)
+            return;
+        comp_last_cx = cx;
+        comp_last_cy = cy;
+        if (clock_tick)
+            comp_dirty_tick = now_tick;
+        comp_frame_dirty = false;
+    }
+
     build_render_order();
 
     /* Fullscreen window: bypass desktop UI, blit scaled to screen.
@@ -1068,6 +1093,15 @@ void compositor_thread(void)
 
         /* 1b. Process mouse clicks on demo windows */
         process_mouse_input();
+
+        /* Mark frame dirty on mouse movement (keyboard input dirtied via
+         * compositor_signal_dirty when terminal/app writes new pixels) */
+        {
+            int32_t _cx, _cy;
+            input_get_cursor(&_cx, &_cy);
+            if (_cx != comp_last_cx || _cy != comp_last_cy)
+                comp_frame_dirty = true;
+        }
 
         /* 2. Tick animation engine (100 APIC ticks = 1000ms) */
         gui_anim_tick(idt_get_ticks() * 10);  /* convert to ms (100Hz * 10 = ms) */

@@ -329,16 +329,54 @@ size_t strlen(const char *s)
 
 void *memset(void *dst, int c, size_t n)
 {
-    char *d = (char *)dst;
-    for (size_t i = 0; i < n; i++) d[i] = (char)c;
+    unsigned char *d = (unsigned char *)dst;
+    unsigned char val = (unsigned char)c;
+
+    /* Small fills: byte loop (avoids REP setup overhead) */
+    if (n < 64) {
+        /* Word-fill for aligned runs >= 8 bytes */
+        if (n >= 8) {
+            unsigned long w = val;
+            w |= w << 8;  w |= w << 16;  w |= w << 32;
+            while (((unsigned long)d & 7) && n) { *d++ = val; n--; }
+            while (n >= 8) { *(unsigned long *)d = w; d += 8; n -= 8; }
+        }
+        while (n--) *d++ = val;
+        return dst;
+    }
+
+    /* Large fills: REP STOSB (ERMS — 256-bit internal stores on modern CPUs) */
+    __asm__ volatile (
+        "rep stosb"
+        : "+D"(d), "+c"(n)
+        : "a"(val)
+        : "memory"
+    );
     return dst;
 }
 
 void *memcpy(void *dst, const void *src, size_t n)
 {
-    char *d = (char *)dst;
-    const char *s = (const char *)src;
-    for (size_t i = 0; i < n; i++) d[i] = s[i];
+    unsigned char *d = (unsigned char *)dst;
+    const unsigned char *s = (const unsigned char *)src;
+
+    /* Small copies: word-at-a-time then byte tail */
+    if (n < 64) {
+        while (n >= 8 && !((unsigned long)d & 7) && !((unsigned long)s & 7)) {
+            *(unsigned long *)d = *(const unsigned long *)s;
+            d += 8; s += 8; n -= 8;
+        }
+        while (n--) *d++ = *s++;
+        return dst;
+    }
+
+    /* Large copies: REP MOVSB (ERMS — 256-bit internal stores on modern CPUs) */
+    __asm__ volatile (
+        "rep movsb"
+        : "+D"(d), "+S"(s), "+c"(n)
+        :
+        : "memory"
+    );
     return dst;
 }
 

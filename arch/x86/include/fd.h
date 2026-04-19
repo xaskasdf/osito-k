@@ -34,6 +34,13 @@ typedef struct {
     uint64_t    offset;     /* file position */
 } fd_entry_t;
 
+/* Refcounted fd table: shared between threads (CLONE_FILES),
+ * separate copies for fork. */
+typedef struct {
+    int         refcount;
+    fd_entry_t  entries[MAX_FDS];
+} fd_table_t;
+
 /* ── Pipe buffer ─────────────────────────────────────────────── */
 
 #define PIPE_BUF_SIZE    4096
