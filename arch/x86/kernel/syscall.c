@@ -2944,9 +2944,113 @@ static int64_t sys_cmdring_init(uint64_t ring_addr)
     return (int64_t)(uint64_t)ring;  /* return ring address as confirmation */
 }
 
+/* ── VDSO — kernel-maintained shared data page ─────────────────
+ *
+ * One physical page, mapped read-only into every process at
+ * VDSO_USER_VA.  Kernel updates it on every timer tick.  Processes
+ * read time/system info directly — zero syscalls.
+ *
+ * Seqlock: odd seq = update in progress.  Reader retries if seq
+ * changed or is odd. */
+
+#define VDSO_USER_VA  0x7FFFE000ULL
+
+typedef struct __attribute__((aligned(4096))) {
+    volatile uint32_t seq;
+    uint32_t _pad0;
+    uint64_t monotonic_ns;
+    uint64_t tsc_at_update;
+    uint64_t tsc_per_sec;
+    int64_t  unix_timestamp;
+    uint64_t boot_ticks;
+    uint32_t cpu_count;
+    uint32_t page_size;
+    uint64_t total_memory;
+    uint64_t free_memory;
+    uint64_t random_seed;
+    uint8_t  _reserved[4096 - 80];
+} vdso_data_t;
+
+static vdso_data_t *vdso_page;
+static uint64_t     vdso_phys;
+
+static inline uint64_t vdso_rdtsc(void)
+{
+    uint32_t lo, hi;
+    __asm__ volatile ("rdtsc" : "=a"(lo), "=d"(hi));
+    return ((uint64_t)hi << 32) | lo;
+}
+
+void vdso_init(void)
+{
+    void *page = mem_alloc_pages(1);
+    if (!page) { serial_puts("[VDSO] alloc failed\n"); return; }
+    vdso_phys = (uint64_t)page;
+    vdso_page = (vdso_data_t *)PHYS_TO_VIRT(page);
+    memset(vdso_page, 0, 4096);
+
+    extern uint32_t smp_cpu_count(void);
+    extern uint64_t mem_get_total(void);
+
+    vdso_page->cpu_count    = smp_cpu_count();
+    vdso_page->page_size    = 4096;
+    vdso_page->total_memory = mem_get_total() * 4096;
+
+    /* Calibrate TSC: wait for one APIC tick, measure TSC elapsed */
+    extern uint64_t idt_get_ticks(void);
+    uint64_t t0 = idt_get_ticks();
+    while (idt_get_ticks() == t0) __asm__ volatile ("pause");
+    uint64_t tick_start = idt_get_ticks();
+    uint64_t tsc_start  = vdso_rdtsc();
+    while (idt_get_ticks() - tick_start < 10) __asm__ volatile ("pause");
+    uint64_t tsc_end = vdso_rdtsc();
+    vdso_page->tsc_per_sec = (tsc_end - tsc_start) * 10;  /* 10 ticks = 100ms */
+    vdso_page->seq = 0;
+
+    serial_puts("[VDSO] Initialized, TSC ");
+    serial_putdec(vdso_page->tsc_per_sec / 1000000);
+    serial_puts(" MHz\n");
+}
+
+void vdso_update(void)
+{
+    if (!vdso_page) return;
+
+    uint32_t s = vdso_page->seq;
+    vdso_page->seq = s + 1;  /* odd = updating */
+    __asm__ volatile ("" ::: "memory");
+
+    extern uint64_t idt_get_ticks(void);
+    vdso_page->boot_ticks   = idt_get_ticks();
+    vdso_page->monotonic_ns = idt_get_ticks() * 10000000ULL;
+    vdso_page->tsc_at_update = vdso_rdtsc();
+
+    extern uint32_t ntp_get_utc(void);
+    extern bool     ntp_is_synced(void);
+    if (ntp_is_synced())
+        vdso_page->unix_timestamp = (int64_t)ntp_get_utc();
+
+    vdso_page->free_memory  = mem_get_free() * 4096;
+    vdso_page->random_seed ^= vdso_page->tsc_at_update;
+
+    __asm__ volatile ("" ::: "memory");
+    vdso_page->seq = s + 2;  /* even = consistent */
+}
+
+int vdso_map_process(uint64_t cr3)
+{
+    if (!vdso_phys) return -1;
+    extern int paging_map_page_in_cr3(uint64_t cr3, uint64_t virt,
+                                      uint64_t phys, uint64_t flags);
+    #define PTE_PRESENT_LOCAL  (1ULL << 0)
+    #define PTE_USER_LOCAL     (1ULL << 2)
+    return paging_map_page_in_cr3(cr3, VDSO_USER_VA, vdso_phys,
+                                  PTE_PRESENT_LOCAL | PTE_USER_LOCAL);
+}
+
 /* ── Syscall dispatch (called from assembly) ─────────────────── */
 
-int64_t syscall_dispatch(uint64_t nr, uint64_t a1, uint64_t a2,
+int64_t __hot syscall_dispatch(uint64_t nr, uint64_t a1, uint64_t a2,
                          uint64_t a3, uint64_t a4, uint64_t a5)
 {
     switch (nr) {

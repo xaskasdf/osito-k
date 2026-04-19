@@ -147,6 +147,7 @@ extern void isr_stub_30(void);
 extern void isr_stub_31(void);
 extern void isr_stub_32(void);   /* APIC timer */
 extern void isr_stub_33(void);   /* Keyboard IRQ */
+extern void isr_stub_40(void);   /* I211 NIC MSI */
 extern void isr_stub_default(void);  /* vectors 34-255 */
 
 /* Keyboard handler */
@@ -403,7 +404,23 @@ static volatile uint64_t tick_count;
 static bool apic_enabled;
 static uint32_t apic_timer_init_saved;
 
+/* TSC-deadline mode state */
+static bool     tsc_deadline_mode;
+static uint64_t tsc_freq;              /* TSC cycles per second */
+static uint64_t tsc_last_tick;         /* TSC value of last virtual 100Hz tick */
+#define MSR_IA32_TSC_DEADLINE  0x6E0
+#define APIC_TIMER_TSC_DEADLINE  0x40000  /* LVT bits 18:17 = 10b */
+
+static inline uint64_t idt_rdtsc(void)
+{
+    uint32_t lo, hi;
+    __asm__ volatile ("rdtsc" : "=a"(lo), "=d"(hi));
+    return ((uint64_t)hi << 32) | lo;
+}
+
 uint64_t idt_get_ticks(void) { return tick_count; }
+uint64_t idt_get_tsc_freq(void) { return tsc_freq; }
+bool     idt_tsc_deadline_active(void) { return tsc_deadline_mode; }
 
 /*
  * Arm a hardware write watchpoint on a 4-byte address.
@@ -766,7 +783,24 @@ void isr_handler(interrupt_frame_t *frame)
 
     /* APIC timer tick */
     if (vec == 32) {
-        tick_count++;
+        /* In TSC-deadline mode, advance tick_count based on elapsed TSC
+         * to maintain a stable ~100Hz virtual tick for TCP/timers/display.
+         * In periodic mode, simply increment. */
+        if (tsc_deadline_mode) {
+            uint64_t now_tsc = idt_rdtsc();
+            uint64_t tsc_per_tick = tsc_freq / 100;
+            if (tsc_last_tick == 0) tsc_last_tick = now_tsc;
+            while (now_tsc - tsc_last_tick >= tsc_per_tick) {
+                tick_count++;
+                tsc_last_tick += tsc_per_tick;
+            }
+        } else {
+            tick_count++;
+        }
+
+        /* VDSO: update shared data page (seqlock, ~20 instructions) */
+        extern void vdso_update(void);
+        vdso_update();
 
         /* IAT watchdog: restore Engine.dll StaticLoadClass on every tick.
          * The Unreal package loader overwrites this between INT 0x2E calls,
@@ -818,6 +852,20 @@ void isr_handler(interrupt_frame_t *frame)
         /* X-SCHED: preemptive scheduler — check quantum, switch if expired.
          * frame points to saved GPRs on the current process's stack. */
         sched_tick(frame);
+
+        /* TSC-deadline: reprogram next deadline based on current process's QoS.
+         * In periodic mode, the APIC timer auto-reloads — nothing to do. */
+        if (tsc_deadline_mode) {
+            extern uint64_t sched_get_next_deadline_us(void);
+            uint64_t next_us = sched_get_next_deadline_us();
+            if (next_us > 0) {
+                uint64_t deadline = idt_rdtsc() + (tsc_freq * next_us / 1000000);
+                wrmsr(MSR_IA32_TSC_DEADLINE, deadline);
+            }
+            /* next_us == 0: tickless idle — no deadline, CPU will HLT
+             * until NIC/keyboard/IPI interrupt wakes it */
+        }
+
         if (apic_enabled)
             apic_write(APIC_EOI, 0);
         return;
@@ -827,6 +875,14 @@ void isr_handler(interrupt_frame_t *frame)
     if (vec == 33) {
         keyboard_irq();
         outb(0x20, 0x20);  /* PIC EOI to master */
+        return;
+    }
+
+    /* I211 NIC MSI interrupt */
+    if (vec == 40) {
+        extern void i211_isr(void);
+        i211_isr();
+        apic_write(APIC_EOI, 0);
         return;
     }
 
@@ -1767,13 +1823,21 @@ static void apic_init(void)
     /* Clear ESR */
     apic_write(APIC_ESR, 0);
 
-    /* Setup timer: periodic, vector 32, divide by 16 */
-    apic_write(APIC_TIMER_DIV, 0x03);  /* divide by 16 */
-    apic_write(APIC_LVT_TIMER, APIC_TIMER_PERIODIC | 32);
+    /* ── Detect TSC-deadline support ── */
+    {
+        uint32_t eax, ebx, ecx, edx;
+        __asm__ volatile ("cpuid" : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx) : "a"(1));
+        bool has_tsc_deadline = (ecx >> 24) & 1;
 
-    /* Calibrate APIC timer frequency using PIT channel 2.
-     * PIT runs at 1.193182 MHz (standard on all x86 hardware).
-     * Measure how many APIC ticks elapse in ~10ms (PIT count 11932). */
+        /* Also require invariant TSC (CPUID.80000007H:EDX bit 8) */
+        bool has_invariant_tsc = false;
+        __asm__ volatile ("cpuid" : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx) : "a"(0x80000007));
+        has_invariant_tsc = (edx >> 8) & 1;
+
+        tsc_deadline_mode = has_tsc_deadline && has_invariant_tsc;
+    }
+
+    /* ── PIT-based calibration (used for both periodic and TSC-deadline) ── */
     #define PIT_FREQ   1193182ULL
     #define PIT_10MS   11932       /* PIT_FREQ / 100 */
     #define PIT_CH2_GATE 0x61
@@ -1789,42 +1853,62 @@ static void apic_init(void)
     uint8_t gate = inb(PIT_CH2_GATE);
     outb(PIT_CH2_GATE, (gate & 0xFD) | 0x01);  /* bit 0 = gate, bit 1 = spkr off */
 
-    /* Start APIC timer with max count */
+    /* Start APIC timer with max count + record TSC */
+    apic_write(APIC_TIMER_DIV, 0x03);  /* divide by 16 */
+    apic_write(APIC_LVT_TIMER, APIC_TIMER_PERIODIC | 32);
     apic_write(APIC_TIMER_INIT, 0xFFFFFFFF);
+    uint64_t tsc_cal_start = idt_rdtsc();
 
     /* Wait for PIT to finish (bit 5 of port 0x61 goes high) */
     while (!(inb(PIT_CH2_GATE) & 0x20))
         __asm__ volatile ("pause");
 
-    /* Stop APIC timer, read elapsed ticks */
+    /* Stop APIC timer, read elapsed ticks + TSC */
     apic_write(APIC_LVT_TIMER, APIC_LVT_MASKED);
     uint32_t elapsed = 0xFFFFFFFF - apic_read(APIC_TIMER_CURR);
+    uint64_t tsc_cal_end = idt_rdtsc();
 
-    /* APIC timer freq = elapsed * 100 (since PIT measured ~10ms).
-     * For 100Hz periodic: init_count = apic_freq / 100 = elapsed. */
-    uint32_t init_count = elapsed;
+    /* Calibrate TSC: PIT measured ~10ms, so TSC freq = elapsed_tsc * 100 */
+    tsc_freq = (tsc_cal_end - tsc_cal_start) * 100;
 
-    /* Sanity: if calibration looks broken, fall back to QEMU default */
-    if (init_count < 1000 || init_count > 100000000)
-        init_count = 625000;
+    if (tsc_deadline_mode) {
+        /* ── TSC-Deadline mode: sub-microsecond precision ── */
+        apic_write(APIC_LVT_TIMER, APIC_TIMER_TSC_DEADLINE | 32);
 
-    /* Re-enable periodic timer with calibrated count */
-    apic_write(APIC_LVT_TIMER, APIC_TIMER_PERIODIC | 32);
-    apic_write(APIC_TIMER_INIT, init_count);
-    apic_timer_init_saved = init_count;
+        /* Program initial 10ms deadline */
+        tsc_last_tick = idt_rdtsc();
+        wrmsr(MSR_IA32_TSC_DEADLINE, tsc_last_tick + tsc_freq / 100);
 
-    apic_enabled = true;
+        apic_timer_init_saved = 0;
+        apic_enabled = true;
 
-    serial_puts("[IDT] APIC timer: calibrated init=");
-    serial_putdec(init_count);
-    serial_puts(" (~100 Hz)\n");
+        serial_puts("[IDT] TSC-deadline mode, freq=");
+        serial_putdec(tsc_freq / 1000000);
+        serial_puts(" MHz\n");
+    } else {
+        /* ── Periodic mode fallback ── */
+        uint32_t init_count = elapsed;
+        if (init_count < 1000 || init_count > 100000000)
+            init_count = 625000;
+
+        apic_write(APIC_LVT_TIMER, APIC_TIMER_PERIODIC | 32);
+        apic_write(APIC_TIMER_INIT, init_count);
+        apic_timer_init_saved = init_count;
+        apic_enabled = true;
+
+        serial_puts("[IDT] APIC timer: periodic, init=");
+        serial_putdec(init_count);
+        serial_puts(" (~100 Hz), TSC ");
+        serial_putdec(tsc_freq / 1000000);
+        serial_puts(" MHz\n");
+    }
 }
 
 uint32_t idt_get_apic_timer_init(void) { return apic_timer_init_saved; }
 
 /* ── IDT init (public API) ───────────────────────────────────── */
 
-void idt_init(void)
+void __initk idt_init(void)
 {
     serial_puts("[IDT] Setting up interrupt descriptor table...\n");
 
@@ -1888,6 +1972,10 @@ void idt_init(void)
     /* Override: vector 0x71 = keyboard IRQ (uses isr_stub_33) */
     idt_set_entry(0x71, isr_stub_33, 0);
     idt[0x71].selector = cs;
+
+    /* Vector 40: I211 NIC MSI interrupt */
+    idt_set_entry(40, isr_stub_40, 0);
+    idt[40].selector = cs;
 
     /* SMP work IPI: lightweight stub, no fxsave (safe for APs) */
     extern void isr_stub_smp_ipi(void);

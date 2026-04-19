@@ -17,9 +17,9 @@ CC       = x86_64-elf-gcc
 LD       = x86_64-elf-ld
 OBJCOPY  = x86_64-elf-objcopy
 
-# gnu-efi paths (Debian/Ubuntu)
-EFI_INC  = /usr/include/efi
-EFI_INC_ARCH = /usr/include/efi/x86_64
+# gnu-efi paths (Debian/Ubuntu or local clone)
+EFI_INC  ?= /usr/include/efi
+EFI_INC_ARCH ?= /usr/include/efi/x86_64
 EFI_LIB  = /usr/lib
 EFI_CRT  = /usr/lib/crt0-efi-x86_64.o
 EFI_LDS  = /usr/lib/elf_x86_64_efi.lds
@@ -43,8 +43,8 @@ KCFLAGS  = -std=c11 -ffreestanding -fno-stack-protector -mno-red-zone \
 # so it inserts realignment in prologues before any movaps/movdqa.
 KCFLAGS_PRECOMP = $(KCFLAGS) -mincoming-stack-boundary=3
 
-# AVX2/FMA flags for tensor_avx2.c only
-AVXFLAGS = $(KCFLAGS_PRECOMP) -mavx2 -mfma
+# AVX2/FMA/F16C flags for tensor_avx2.c only
+AVXFLAGS = $(KCFLAGS_PRECOMP) -mavx2 -mfma -mf16c
 
 # EFI link flags (for boot.efi only)
 BLDFLAGS = -nostdlib -shared -Bsymbolic \

@@ -78,6 +78,12 @@ typedef struct {
     float *att_scratch[LLAMA_MAX_AP_SCRATCH]; /* [max_seq] each, NULL if unused */
 
     uint32_t pos;       /* Current sequence position */
+
+    /* NVMe-direct layer streaming (optional — NULL if all weights in RAM) */
+    tensor_dma_map_t *dma_map;
+    void *layer_buf[2];            /* Ping-pong layer weight buffers */
+    uint64_t layer_buf_size;       /* Bytes per layer buffer */
+    uint32_t layer_tensor_start[256]; /* First tensor index per layer */
 } llama_state_t;
 
 /* ── Public API ────────────────────────────────────────────── */
@@ -87,5 +93,46 @@ int  llama_forward(llama_state_t *state, uint32_t token);
 void llama_generate(llama_state_t *state, const uint32_t *prompt,
                     uint32_t prompt_len, uint32_t max_tokens);
 void llama_free(llama_state_t *state);
+
+/* NVMe-direct layer streaming */
+int  llama_init_streaming(llama_state_t *state);
+int  llama_forward_streaming(llama_state_t *state, uint32_t token);
+
+/* ── Speculative token execution ──────────────────────────── */
+
+#define SPEC_MAX_LAYERS  4
+
+typedef struct {
+    float *shadow_k[SPEC_MAX_LAYERS];  /* [kv_dim] per speculated layer */
+    float *shadow_v[SPEC_MAX_LAYERS];
+    float *spec_x;                     /* [dim] speculative activation */
+    float *spec_xb, *spec_xb2;        /* [dim] scratch */
+    float *spec_q, *spec_k, *spec_v;  /* [dim], [kv_dim], [kv_dim] */
+    float *spec_att;                   /* [max_seq] */
+    float *spec_hb, *spec_hb2;        /* [ffn_dim] */
+    uint32_t predicted_token;
+    uint32_t spec_layers_done;
+    uint32_t spec_pos;
+    volatile int spec_complete;        /* 0=running, 1=done, -1=cancelled */
+    uint64_t hits, misses;
+} spec_state_t;
+
+int  llama_spec_init(llama_state_t *state);
+
+/* ── KV Cache checkpoint/restore ──────────────────────────── */
+
+#define LLAMA_CKPT_MAGIC  0x4F534B4C  /* "OSKL" */
+
+typedef struct __attribute__((packed)) {
+    uint32_t magic;
+    uint32_t version;
+    uint32_t pos;
+    uint32_t n_layers;
+    uint32_t kv_dim;
+    uint32_t max_seq;
+} llama_ckpt_header_t;
+
+int  llama_checkpoint_kv(llama_state_t *state, const char *filename);
+int  llama_restore_kv(llama_state_t *state, const char *filename);
 
 #endif /* OSITOK_INFERENCE_H */

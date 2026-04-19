@@ -514,7 +514,7 @@ static void free_old_page_tables(void)
 
 /* ── Initialize paging ───────────────────────────────────────── */
 
-void paging_init(void)
+void __initk paging_init(void)
 {
     serial_puts("[PAGE] Setting up kernel page tables...\n");
 

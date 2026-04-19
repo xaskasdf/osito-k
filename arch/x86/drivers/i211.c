@@ -203,7 +203,7 @@ static int i211_setup_tx(void)
 
 /* ── Initialize I211 ─────────────────────────────────────────── */
 
-int i211_init(uint64_t bar0_phys)
+int __initk i211_init(uint64_t bar0_phys)
 {
     memset(&nic, 0, sizeof(nic));
     /* MMIO via the upper-half alias so register access works from
@@ -400,3 +400,61 @@ bool i211_link_up(void)
     if (!nic.initialized) return false;
     return (i211_read(I211_STATUS) & I211_STATUS_LU) != 0;
 }
+
+/* ── Interrupt-driven receive (NAPI hybrid) ────────────────────
+ *
+ * Flow: packet arrives → MSI vector 40 → i211_isr() →
+ *       set irq_pending, disable RX interrupt → net_poll()
+ *       drains ring → re-enable RX interrupt.
+ * ───────────────────────────────────────────────────────────── */
+
+volatile bool i211_irq_pending;
+
+void i211_enable_interrupts(uint8_t pci_bus, uint8_t pci_dev, uint8_t pci_func)
+{
+    if (!nic.initialized) return;
+
+    /* Configure MSI via PCI (vector 40) */
+    extern int pci_enable_msi(uint8_t bus, uint8_t dev, uint8_t func, uint8_t vector);
+    pci_enable_msi(pci_bus, pci_dev, pci_func, 40);
+
+    /* Interrupt throttle: ~100us between interrupts (~10K/sec) */
+    i211_write(I211_EITR0, 390 << 2);
+
+    /* Enable RX and link status change interrupts */
+    i211_write(I211_IMS, I211_ICR_RXT0 | I211_ICR_LSC);
+
+    i211_irq_pending = false;
+    serial_puts("[I211] Interrupts enabled (MSI vector 40, NAPI)\n");
+}
+
+void i211_isr(void)
+{
+    if (!nic.initialized) return;
+
+    /* Read ICR — auto-clears on read */
+    uint32_t cause = i211_read(I211_ICR);
+
+    if (cause & I211_ICR_RXT0) {
+        /* RX packet: disable RX interrupt, set pending flag.
+         * net_poll() will drain the ring and re-enable. */
+        i211_write(I211_IMC, I211_ICR_RXT0);
+        i211_irq_pending = true;
+    }
+
+    if (cause & I211_ICR_LSC) {
+        bool up = (i211_read(I211_STATUS) & I211_STATUS_LU) != 0;
+        serial_puts("[I211] Link ");
+        serial_puts(up ? "UP\n" : "DOWN\n");
+    }
+}
+
+void i211_rx_irq_reenable(void)
+{
+    if (nic.initialized)
+        i211_write(I211_IMS, I211_ICR_RXT0);
+}
+
+/* i211_napi_poll is not used — NAPI drain happens inside net_poll()
+ * which already has the full packet processing switch. The ISR sets
+ * irq_pending, net_poll drains, then calls i211_rx_irq_reenable(). */

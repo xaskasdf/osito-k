@@ -839,3 +839,11 @@ osfs2_file_t *osfs2_file_at(uint32_t index)
     }
     return NULL;
 }
+
+/* Return the absolute byte offset of a file's data on the NVMe device.
+ * Used by tensor DMA to compute LBA addresses for direct NVMe reads. */
+uint64_t osfs2_file_byte_offset(osfs2_file_t *file)
+{
+    if (!mounted || !file) return 0;
+    return partition_offset + ((uint64_t)file->start_block << blk_shift);
+}

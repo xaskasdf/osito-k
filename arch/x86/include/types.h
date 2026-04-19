@@ -121,6 +121,14 @@ static inline int strcmp(const char *a, const char *b) {
     return *(unsigned char *)a - *(unsigned char *)b;
 }
 
+/* ── Section placement hints for linker hot/cold ordering ────── */
+/* __hot     → .text.hot   (fits in L1i 32KB, first in image)
+ * __cold    → .text.cold  (rarely called, after normal .text)
+ * __initk   → .text.init  (called once at boot, reclaimable)  */
+#define __hot       __attribute__((section(".text.hot")))
+#define __cold      __attribute__((section(".text.cold")))
+#define __initk     __attribute__((section(".text.init")))
+
 #else /* __EMSCRIPTEN__ — use hosted libc, stub out port I/O */
 
 #include <string.h>

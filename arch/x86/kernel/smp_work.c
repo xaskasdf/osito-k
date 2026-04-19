@@ -236,7 +236,7 @@ int smp_submit(int ap_idx, smp_work_func_t func, void *arg, void *result)
     return submit_internal((int)my_cpu, func, arg, result, 0);
 }
 
-int smp_submit_any(smp_work_func_t func, void *arg, void *result)
+int __hot smp_submit_any(smp_work_func_t func, void *arg, void *result)
 {
     uint32_t my_cpu = current_cpu();
     return submit_internal((int)my_cpu, func, arg, result, 0);
@@ -248,7 +248,7 @@ int smp_submit_ff(smp_work_func_t func, void *arg, void *result)
     return submit_internal((int)my_cpu, func, arg, result, 1);
 }
 
-void smp_wait(int task_id)
+void __hot smp_wait(int task_id)
 {
     if (task_id < 0 || task_id >= TASK_POOL_SIZE) return;
 

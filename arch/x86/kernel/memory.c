@@ -68,7 +68,7 @@ static int bitmap_test(uint64_t page)
 
 /* ── Initialize from UEFI memory map ────────────────────────── */
 
-void mem_init(void *mmap, uint64_t mmap_size, uint64_t desc_size)
+void __initk mem_init(void *mmap, uint64_t mmap_size, uint64_t desc_size)
 {
     /* Start with everything reserved */
     memset(page_bitmap, 0, sizeof(page_bitmap));
@@ -245,6 +245,25 @@ void mem_free_pages(void *addr, uint64_t count)
         bitmap_set(start_page + i);
         free_pages++;
     }
+}
+
+/* ── Reclaim init-only code after boot ──────────────────────── */
+
+void reclaim_init_memory(void)
+{
+    extern char __init_start[], __init_end[];
+    uint64_t start = (uint64_t)__init_start;
+    uint64_t end   = (uint64_t)__init_end;
+    if (start >= end) return;
+
+    /* Convert upper-half VA to physical address */
+    uint64_t phys = start - 0xFFFF800000000000ULL;
+    uint64_t pages = (end - start) / PAGE_SIZE;
+
+    mem_free_pages((void *)phys, pages);
+    serial_puts("[INIT] Reclaimed ");
+    serial_putdec(pages * 4);
+    serial_puts(" KB of init memory\n");
 }
 
 /* ── Allocate aligned buffer (for DMA, NVMe queues, etc.) ───── */

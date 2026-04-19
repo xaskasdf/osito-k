@@ -23,7 +23,23 @@ SECTIONS
 
     .text : AT(ADDR(.text) - KERNEL_VBASE) ALIGN(4096) {
         __text_start = .;
-        *(.text .text.*)
+        /* Hot path first — fits in L1i cache (32KB) */
+        __text_hot_start = .;
+        *(.text.hot)
+        __text_hot_end = .;
+        /* Normal text + any GCC-generated subsections */
+        *(.text .text.unlikely .text.startup .text.exit)
+        /* Cold path */
+        *(.text.cold)
+        /* Init code — page-aligned so it can be reclaimed after boot.
+         * MUST appear before the .text.* catch-all below. */
+        . = ALIGN(4096);
+        __init_start = .;
+        *(.text.init)
+        . = ALIGN(4096);
+        __init_end = .;
+        /* Remaining .text.* subsections */
+        *(.text.*)
         __text_end = .;
     }
 

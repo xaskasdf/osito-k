@@ -743,3 +743,45 @@ int gguf_load_from_mem(gguf_model_t *model, void *data, uint64_t size)
     serial_puts(" MB tensor data\n");
     return 0;
 }
+
+/* ── Tensor DMA map — build LBA-to-tensor mapping for NVMe-direct ── */
+
+int tensor_dma_build_map(gguf_model_t *model, tensor_dma_map_t *map)
+{
+    if (!model || !map || model->num_tensors == 0) return -1;
+
+    extern uint64_t osfs2_file_byte_offset(osfs2_file_t *file);
+    extern uint32_t nvme_get_lba_size(void);
+
+    /* Find the GGUF file entry to get its byte offset on NVMe */
+    osfs2_file_t *gguf_file = osfs2_find_gguf();
+    if (!gguf_file) return -1;
+
+    uint64_t file_abs_offset = osfs2_file_byte_offset(gguf_file);
+    uint32_t lba_size = nvme_get_lba_size();
+    if (lba_size == 0) return -1;
+
+    map->file_lba_base = file_abs_offset / lba_size;
+    map->tensor_data_offset = model->tensor_data_offset;
+    map->num_entries = model->num_tensors;
+
+    /* Allocate entry table */
+    void *phys = mem_alloc_aligned(model->num_tensors * sizeof(tensor_dma_entry_t), 8);
+    map->entries = (tensor_dma_entry_t *)((uintptr_t)phys + 0xFFFF800000000000ULL);
+    if (!map->entries) return -1;
+
+    for (uint32_t i = 0; i < model->num_tensors; i++) {
+        gguf_tensor_t *t = &model->tensors[i];
+        uint64_t byte_off = model->tensor_data_offset + t->offset;
+        map->entries[i].lba = map->file_lba_base + byte_off / lba_size;
+        map->entries[i].lba_count = (t->size + lba_size - 1) / lba_size;
+        map->entries[i].size = t->size;
+    }
+
+    serial_puts("[GGUF] DMA map built: ");
+    serial_putdec(map->num_entries);
+    serial_puts(" tensors, file LBA base ");
+    serial_putdec(map->file_lba_base);
+    serial_puts("\n");
+    return 0;
+}

@@ -209,9 +209,90 @@ static int nvme_io_submit_wait(nvme_sqe_t *cmd)
     return -1;
 }
 
+/* ── Async I/O: submit without waiting ─────────────────────── */
+
+/* Submit an I/O command and return immediately with the cmd_id.
+ * Caller must later call nvme_poll_cq() or nvme_wait_cq() to
+ * check/wait for completion. Max 2 in-flight for ping-pong. */
+
+static volatile uint32_t nvme_inflight;
+
+uint16_t nvme_io_submit_async(nvme_sqe_t *cmd)
+{
+    uint16_t cid = nvme.cmd_id++;
+    cmd->cdw0 = (cmd->cdw0 & 0xFFFF) | ((uint32_t)cid << 16);
+
+    nvme.iosq[nvme.iosq_tail] = *cmd;
+    nvme.iosq_tail = (nvme.iosq_tail + 1) % IO_QUEUE_SIZE;
+    wmb();
+    nvme_ring_sq_doorbell(1, nvme.iosq_tail);
+    nvme_inflight++;
+    return cid;
+}
+
+/* Non-blocking: check if a specific command completed. Returns:
+ *   0 = completed OK,  -1 = not yet,  -2 = error */
+int nvme_poll_cq(uint16_t expected_cid)
+{
+    nvme_cqe_t *cqe = &nvme.iocq[nvme.iocq_head];
+    if ((cqe->status & 1) != nvme.iocq_phase)
+        return -1;  /* no completion yet */
+
+    uint16_t cid = cqe->cid;
+    uint16_t status = cqe->status >> 1;
+    nvme.iocq_head = (nvme.iocq_head + 1) % IO_QUEUE_SIZE;
+    if (nvme.iocq_head == 0) nvme.iocq_phase ^= 1;
+    nvme_ring_cq_doorbell(1, nvme.iocq_head);
+    if (nvme_inflight > 0) nvme_inflight--;
+
+    if (cid != expected_cid) {
+        /* Out-of-order completion — shouldn't happen with 1-2 in-flight
+         * on the same queue, but handle gracefully */
+        return (status == 0) ? 0 : -2;
+    }
+    return (status == 0) ? 0 : -2;
+}
+
+/* Blocking: spin until the command completes */
+int nvme_wait_cq(uint16_t cid)
+{
+    for (uint32_t timeout = 0; timeout < 50000000; timeout++) {
+        int r = nvme_poll_cq(cid);
+        if (r >= -1 && r != -1) return r;  /* 0 or -2 */
+        __asm__ volatile ("pause");
+    }
+    serial_puts("[NVMe] Async wait timeout\n");
+    return -2;
+}
+
+/* High-level: async read of LBAs to a physical address.
+ * Returns cmd_id (use nvme_wait_cq to wait). Limits to 2 pages. */
+int nvme_read_async(uint64_t lba, uint32_t count, uint64_t phys_addr)
+{
+    if (!nvme.initialized || count == 0) return -1;
+    uint32_t lbas_per_page = 4096 / nvme.lba_size;
+    if (count > lbas_per_page * 2) count = lbas_per_page * 2;
+
+    nvme_sqe_t cmd;
+    memset(&cmd, 0, sizeof(cmd));
+    cmd.cdw0 = NVME_IO_READ;
+    cmd.nsid = 1;
+    cmd.prp1 = phys_addr;
+    if ((uint64_t)count * nvme.lba_size > 4096)
+        cmd.prp2 = phys_addr + 4096;
+    cmd.cdw10 = (uint32_t)(lba & 0xFFFFFFFF);
+    cmd.cdw11 = (uint32_t)(lba >> 32);
+    cmd.cdw12 = count - 1;
+
+    return (int)nvme_io_submit_async(&cmd);
+}
+
+/* Accessor for external code */
+uint32_t nvme_get_lba_size(void) { return nvme.initialized ? nvme.lba_size : 512; }
+
 /* ── Initialize NVMe controller ──────────────────────────────── */
 
-int nvme_init(uint64_t bar0_phys)
+int __initk nvme_init(uint64_t bar0_phys)
 {
     memset(&nvme, 0, sizeof(nvme));
     /* Use the upper-half MMIO alias so register accesses work from

@@ -374,10 +374,11 @@ void display_flip(void)
         disp.draw_idx ^= 1;
         disp.back = disp.buffers[disp.draw_idx];
     } else {
-        /* Fallback: copy back buffer → GOP framebuffer (QEMU / no GPU).
-         * Regular memcpy so QEMU/HVF dirty-page tracking sees the writes.
-         * No rotation needed — single back buffer is always the draw target. */
-        memcpy(disp.gop_fb, disp.back, disp.fb_size);
+        /* Fallback: NT-store back buffer → GOP framebuffer (QEMU / no GPU).
+         * movntdq bypasses L1/L2/L3 cache pollution (~3MB freed for compute).
+         * sfence is inside memcpy_nt. display_force_refresh() uses regular
+         * memcpy as fallback for QEMU/HVF dirty-page tracking. */
+        memcpy_nt(disp.gop_fb, disp.back, disp.fb_size);
     }
 
     /* Virtio-GPU: also blit to virtio framebuffer and flush to host */

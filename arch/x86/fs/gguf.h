@@ -91,6 +91,23 @@ typedef struct gguf_model {
     uint64_t layer_offsets[255];
 } gguf_model_t;
 
+/* ── Tensor DMA map for NVMe-direct streaming ──────────────── */
+
+typedef struct {
+    uint64_t lba;           /* Starting LBA on NVMe */
+    uint32_t lba_count;     /* Number of LBAs to read */
+    uint64_t size;          /* Exact byte size */
+} tensor_dma_entry_t;
+
+typedef struct {
+    tensor_dma_entry_t *entries;  /* [num_tensors] */
+    uint32_t num_entries;
+    uint64_t file_lba_base;       /* LBA of file start on NVMe */
+    uint64_t tensor_data_offset;  /* Byte offset of tensor data in file */
+} tensor_dma_map_t;
+
+int tensor_dma_build_map(gguf_model_t *model, tensor_dma_map_t *map);
+
 /*
  * gguf_load — Load first GGUF file from OsitoFS into RAM
  *

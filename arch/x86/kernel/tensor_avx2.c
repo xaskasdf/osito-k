@@ -35,67 +35,76 @@ static inline float hsum256(__m256 v)
  *    4. Accumulate across 4 groups of 8
  * ══════════════════════════════════════════════════════════ */
 
-void matvec_q4_0_avx2(float *out, const void *weight,
+/* Process one Q4_0 block (32 values): F16C scale + nibble unpack + 4×FMA.
+ * Shared between the unrolled and remainder loops. */
+static inline void __attribute__((always_inline))
+process_q4_block(const uint8_t **wp, const float **inp,
+                 __m256 *acc, const __m256i bias, const __m128i nibmask)
+{
+    /* Scale: F16C hardware conversion (2 instructions vs ~20 software) */
+    __m128i sh = _mm_cvtsi32_si128(*(const uint16_t *)*wp);
+    __m256 scale_v = _mm256_broadcastss_ps(_mm_cvtph_ps(sh));
+    *wp += 2;
+
+    /* Load 16 nibble bytes, extract lo/hi, interleave */
+    __m128i raw = _mm_loadu_si128((const __m128i *)*wp);
+    __m128i lo_nib = _mm_and_si128(raw, nibmask);
+    __m128i hi_nib = _mm_and_si128(_mm_srli_epi16(raw, 4), nibmask);
+    __m128i ilo = _mm_unpacklo_epi8(lo_nib, hi_nib);
+    __m128i ihi = _mm_unpackhi_epi8(lo_nib, hi_nib);
+
+    /* 4 groups of 8 values: dequant + FMA */
+    __m256 f0 = _mm256_mul_ps(_mm256_cvtepi32_ps(
+        _mm256_sub_epi32(_mm256_cvtepu8_epi32(ilo), bias)), scale_v);
+    *acc = _mm256_fmadd_ps(f0, _mm256_loadu_ps(*inp), *acc);
+
+    __m256 f1 = _mm256_mul_ps(_mm256_cvtepi32_ps(
+        _mm256_sub_epi32(_mm256_cvtepu8_epi32(_mm_bsrli_si128(ilo, 8)), bias)), scale_v);
+    *acc = _mm256_fmadd_ps(f1, _mm256_loadu_ps(*inp + 8), *acc);
+
+    __m256 f2 = _mm256_mul_ps(_mm256_cvtepi32_ps(
+        _mm256_sub_epi32(_mm256_cvtepu8_epi32(ihi), bias)), scale_v);
+    *acc = _mm256_fmadd_ps(f2, _mm256_loadu_ps(*inp + 16), *acc);
+
+    __m256 f3 = _mm256_mul_ps(_mm256_cvtepi32_ps(
+        _mm256_sub_epi32(_mm256_cvtepu8_epi32(_mm_bsrli_si128(ihi, 8)), bias)), scale_v);
+    *acc = _mm256_fmadd_ps(f3, _mm256_loadu_ps(*inp + 24), *acc);
+
+    *wp += 16;
+    *inp += 32;
+}
+
+void __hot matvec_q4_0_avx2(float *out, const void *weight,
                        const float *input, uint32_t rows, uint32_t cols)
 {
     const uint8_t *w = (const uint8_t *)weight;
     uint32_t blocks_per_row = cols / 32;
+    uint32_t unrolled = blocks_per_row / 4;
+    uint32_t remainder = blocks_per_row & 3;
     const __m256i bias = _mm256_set1_epi32(8);
+    const __m128i nibmask = _mm_set1_epi8(0x0F);
 
     for (uint32_t r = 0; r < rows; r++) {
-        __m256 acc = _mm256_setzero_ps();
+        __m256 acc0 = _mm256_setzero_ps();
+        __m256 acc1 = _mm256_setzero_ps();
+        const float *inp = input;
 
-        for (uint32_t b = 0; b < blocks_per_row; b++) {
-            /* Scale: f16 → f32, broadcast */
-            float scale = f16_to_f32(*(const uint16_t *)w);
-            w += 2;
-            __m256 scale_v = _mm256_set1_ps(scale);
-            const float *inp = input + b * 32;
-
-            /*
-             * Load all 16 nibble bytes for this block.
-             * Layout: byte[j] has lo nibble (bits 0-3) and hi nibble (bits 4-7).
-             * Output ordering: dst[j*2] = lo, dst[j*2+1] = hi.
-             */
-            __m128i raw = _mm_loadu_si128((const __m128i *)w);
-
-            /* Extract lo nibbles (bits 0-3) and hi nibbles (bits 4-7) */
-            __m128i lo_nib = _mm_and_si128(raw, _mm_set1_epi8(0x0F));
-            __m128i hi_nib = _mm_and_si128(_mm_srli_epi16(raw, 4),
-                                           _mm_set1_epi8(0x0F));
-
-            /* Interleave: lo0,hi0,lo1,hi1,... (matches scalar output order) */
-            __m128i interleaved_lo = _mm_unpacklo_epi8(lo_nib, hi_nib); /* bytes 0-7 → 16 values */
-            __m128i interleaved_hi = _mm_unpackhi_epi8(lo_nib, hi_nib); /* bytes 8-15 → 16 values */
-
-            /* Group 0: values 0-7 (from interleaved_lo low 8 bytes) */
-            __m256i v0 = _mm256_sub_epi32(
-                _mm256_cvtepu8_epi32(interleaved_lo), bias);
-            __m256 f0 = _mm256_mul_ps(_mm256_cvtepi32_ps(v0), scale_v);
-            acc = _mm256_fmadd_ps(f0, _mm256_loadu_ps(inp), acc);
-
-            /* Group 1: values 8-15 (from interleaved_lo high 8 bytes) */
-            __m256i v1 = _mm256_sub_epi32(
-                _mm256_cvtepu8_epi32(_mm_bsrli_si128(interleaved_lo, 8)), bias);
-            __m256 f1 = _mm256_mul_ps(_mm256_cvtepi32_ps(v1), scale_v);
-            acc = _mm256_fmadd_ps(f1, _mm256_loadu_ps(inp + 8), acc);
-
-            /* Group 2: values 16-23 (from interleaved_hi low 8 bytes) */
-            __m256i v2 = _mm256_sub_epi32(
-                _mm256_cvtepu8_epi32(interleaved_hi), bias);
-            __m256 f2 = _mm256_mul_ps(_mm256_cvtepi32_ps(v2), scale_v);
-            acc = _mm256_fmadd_ps(f2, _mm256_loadu_ps(inp + 16), acc);
-
-            /* Group 3: values 24-31 (from interleaved_hi high 8 bytes) */
-            __m256i v3 = _mm256_sub_epi32(
-                _mm256_cvtepu8_epi32(_mm_bsrli_si128(interleaved_hi, 8)), bias);
-            __m256 f3 = _mm256_mul_ps(_mm256_cvtepi32_ps(v3), scale_v);
-            acc = _mm256_fmadd_ps(f3, _mm256_loadu_ps(inp + 24), acc);
-
-            w += 16;
+        /* 4-block unrolled loop: 128 values per iteration, 2 accumulators
+         * to hide FMA latency (5 cycles on Haswell, 4 on Skylake+).
+         * For dim=2048: 64 blocks / 4 = 16 iterations. */
+        for (uint32_t u = 0; u < unrolled; u++) {
+            process_q4_block(&w, &inp, &acc0, bias, nibmask);
+            process_q4_block(&w, &inp, &acc1, bias, nibmask);
+            process_q4_block(&w, &inp, &acc0, bias, nibmask);
+            process_q4_block(&w, &inp, &acc1, bias, nibmask);
         }
 
-        out[r] = hsum256(acc);
+        /* Remainder: 0-3 blocks */
+        for (uint32_t b = 0; b < remainder; b++) {
+            process_q4_block(&w, &inp, &acc0, bias, nibmask);
+        }
+
+        out[r] = hsum256(_mm256_add_ps(acc0, acc1));
     }
 }
 

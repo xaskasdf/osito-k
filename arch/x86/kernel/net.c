@@ -640,13 +640,17 @@ static int tcp_send_segment(tcp_conn_t *conn, uint8_t flags,
 
 static volatile bool in_net_poll;
 
-void net_poll(void)
+void __hot net_poll(void)
 {
     /* Reentrancy guard: sched_tick may call net_poll() while a process
      * is already inside it.  Skip if we're already polling. */
     if (__sync_lock_test_and_set(&in_net_poll, 1)) return;
 
     uint32_t len = 0;
+
+    /* NAPI: check if interrupt flagged pending packets */
+    extern volatile bool i211_irq_pending;
+    bool was_irq = i211_irq_pending;
 
     while (i211_recv(rx_pkt, &len) == 0) {
         if (len < ETH_HDR_LEN)
@@ -671,6 +675,13 @@ void net_poll(void)
             break;
         }
         }
+    }
+
+    /* NAPI: ring drained — re-enable RX interrupt if it was the trigger */
+    if (was_irq) {
+        i211_irq_pending = false;
+        extern void i211_rx_irq_reenable(void);
+        i211_rx_irq_reenable();
     }
 
     /* TCP retransmit check — process all connections with unACKed data */

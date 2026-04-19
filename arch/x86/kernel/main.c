@@ -49,6 +49,12 @@ extern void kb_init(void);
 extern void term_init(void);
 extern void shell_run(void);
 
+/* Memory reclaim */
+extern void reclaim_init_memory(void);
+
+/* VDSO */
+extern void vdso_init(void);
+
 /* SMP */
 extern void smp_init(void);
 
@@ -311,7 +317,7 @@ extern char __bss_start[] __attribute__((weak));
 extern char __bss_end[]   __attribute__((weak));
 
 static void enable_sse(void) { uint64_t cr0, cr4; __asm__ volatile ("mov %%cr0, %0" : "=r"(cr0)); cr0 &= ~(1ULL << 2); cr0 |= (1ULL << 1); __asm__ volatile ("mov %0, %%cr0" : : "r"(cr0)); __asm__ volatile ("mov %%cr4, %0" : "=r"(cr4)); cr4 |= (1ULL << 9); cr4 |= (1ULL << 10); __asm__ volatile ("mov %0, %%cr4" : : "r"(cr4)); }
-void kernel_entry(boot_info_t *info)
+void __initk kernel_entry(boot_info_t *info)
 {
     /* ── Step -1: Zero BSS (UEFI AllocatePages returns zeroed memory, but
      * the kernel's BSS extends beyond the file-backed data segment) ── */
@@ -422,6 +428,9 @@ void kernel_entry(boot_info_t *info)
 
     /* ── Step 1.8: Syscall interface ── */
     syscall_init();
+
+    /* ── Step 1.8b: VDSO shared data page ── */
+    vdso_init();
 
     /* ── Step 1.9: Process subsystem ── */
     proc_init();
@@ -716,6 +725,10 @@ void kernel_entry(boot_info_t *info)
                 /* gateway/DNS defaults in net.c match QEMU SLIRP */
             }
             net_udp_listen(7777, prompt_handler);
+
+            /* Enable interrupt-driven NIC receive (NAPI hybrid) */
+            extern void i211_enable_interrupts(uint8_t bus, uint8_t dev, uint8_t func);
+            i211_enable_interrupts(nic_pci->bus, nic_pci->dev, nic_pci->func);
         } else {
             serial_puts("[KERN] I211 init failed\n");
             fb_puts(" NIC: init failed\n");
@@ -781,6 +794,9 @@ void kernel_entry(boot_info_t *info)
 
     serial_puts("\n[KERN] Boot complete.\n");
     fb_puts("\n Boot complete.\n");
+
+    /* Reclaim init-only code pages */
+    reclaim_init_memory();
 
     /* Run interactive shell (never returns) */
     shell_run();

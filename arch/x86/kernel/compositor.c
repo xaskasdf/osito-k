@@ -776,7 +776,7 @@ void scaleblit_worker(void *arg, void *result)
 
 /* ── Render One Frame ────────────────────────────────────────── */
 
-static void compositor_render_frame(void)
+static void __hot compositor_render_frame(void)
 {
     uint32_t *back = display_get_back_buffer();
     uint32_t w = display_get_width();

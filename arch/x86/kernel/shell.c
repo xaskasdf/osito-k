@@ -2500,7 +2500,7 @@ static void shell_exec(char *line)
 
 /* ── Shell main loop ─────────────────────────────────────────── */
 
-void shell_run(void)
+void __cold shell_run(void)
 {
     char line[256];
 

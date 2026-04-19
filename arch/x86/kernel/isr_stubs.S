@@ -221,6 +221,10 @@ ISR_NOERR 32
 
 ISR_NOERR 33
 
+/* ── Vector 40: I211 NIC MSI interrupt ────────────────────────── */
+
+ISR_NOERR 40
+
 /* ── Vector 0xFE: SMP work IPI (lightweight, no fxsave) ─────── */
 /* APs receive this to wake from HLT. Only does APIC EOI — no GPR
  * save, no FPU save, no scheduler. The AP's work loop polls

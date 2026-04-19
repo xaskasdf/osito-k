@@ -481,7 +481,7 @@ static const char *pci_class_name(uint8_t class, uint8_t subclass)
     return "Other";
 }
 
-void pci_scan(void)
+void __initk pci_scan(void)
 {
     pci_device_count = 0;
     memset(&gpu_dev, 0, sizeof(gpu_dev));
@@ -651,4 +651,66 @@ void pci_enable_bus_master(uint8_t bus, uint8_t dev, uint8_t func)
     uint32_t cmd = pci_read32(bus, dev, func, 0x04);
     cmd |= (1 << 1) | (1 << 2);  /* Memory Space + Bus Master */
     pci_write32(bus, dev, func, 0x04, cmd);
+}
+
+/* Enable MSI for a PCI device — program MSI message address/data and set enable.
+ * MSI writes directly to LAPIC (bypasses IOAPIC). vector = IDT vector number. */
+int pci_enable_msi(uint8_t bus, uint8_t dev, uint8_t func, uint8_t vector)
+{
+    /* Walk capability list to find MSI capability (Cap ID = 0x05) */
+    uint32_t status = pci_read32(bus, dev, func, 0x06);
+    if (!(status & (1 << 20))) {
+        serial_puts("[PCI] No capability list\n");
+        return -1;  /* No capabilities list */
+    }
+
+    uint8_t cap_ptr = (uint8_t)(pci_read32(bus, dev, func, 0x34) & 0xFF);
+    while (cap_ptr) {
+        uint32_t cap_hdr = pci_read32(bus, dev, func, cap_ptr);
+        uint8_t cap_id   = cap_hdr & 0xFF;
+        uint8_t next_ptr = (cap_hdr >> 8) & 0xFF;
+
+        if (cap_id == 0x05) {
+            /* Found MSI capability */
+            uint16_t msg_ctrl = (uint16_t)(cap_hdr >> 16);
+
+            /* Message Address (cap+4): target BSP LAPIC (ID 0) */
+            uint32_t msg_addr = 0xFEE00000;  /* LAPIC base, BSP ID 0 */
+            pci_write32(bus, dev, func, cap_ptr + 4, msg_addr);
+
+            /* 64-bit address? Check bit 7 of Message Control */
+            uint16_t data_offset = (msg_ctrl & (1 << 7)) ? 12 : 8;
+            if (msg_ctrl & (1 << 7))
+                pci_write32(bus, dev, func, cap_ptr + 8, 0);  /* upper 32 bits = 0 */
+
+            /* Message Data (cap+8 or cap+12): vector number, edge trigger, fixed delivery */
+            pci_write32(bus, dev, func, cap_ptr + data_offset, (uint32_t)vector);
+
+            /* Enable MSI: set bit 0 of Message Control (at cap+2) */
+            uint32_t ctrl_dword = pci_read32(bus, dev, func, cap_ptr);
+            ctrl_dword |= (1 << 16);  /* MSI Enable = bit 0 of msg_ctrl = bit 16 of dword */
+            pci_write32(bus, dev, func, cap_ptr, ctrl_dword);
+
+            /* Disable INTx (prevent legacy interrupt alongside MSI) */
+            uint32_t cmd = pci_read32(bus, dev, func, 0x04);
+            cmd |= (1 << 10);  /* Interrupt Disable */
+            pci_write32(bus, dev, func, 0x04, cmd);
+
+            serial_puts("[PCI] MSI enabled: vector ");
+            serial_putdec(vector);
+            serial_puts(" for ");
+            serial_putdec(bus);
+            serial_puts(":");
+            serial_putdec(dev);
+            serial_puts(".");
+            serial_putdec(func);
+            serial_puts("\n");
+            return 0;
+        }
+
+        cap_ptr = next_ptr;
+    }
+
+    serial_puts("[PCI] MSI capability not found\n");
+    return -1;
 }

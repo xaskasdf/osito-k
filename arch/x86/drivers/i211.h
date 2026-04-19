@@ -22,8 +22,15 @@
 
 /* Interrupt */
 #define I211_ICR        0x000C0   /* Interrupt Cause Read */
+#define I211_ICS        0x000C8   /* Interrupt Cause Set (test) */
 #define I211_IMS        0x000D0   /* Interrupt Mask Set */
 #define I211_IMC        0x000D8   /* Interrupt Mask Clear */
+#define I211_EITR0      0x01680   /* Interrupt Throttling (queue 0) */
+
+/* Interrupt cause bits */
+#define I211_ICR_TXDW   (1 << 0)    /* TX Descriptor Written Back */
+#define I211_ICR_LSC    (1 << 2)    /* Link Status Change */
+#define I211_ICR_RXT0   (1 << 7)    /* RX Timer Interrupt */
 
 /* Receive */
 #define I211_RCTL       0x00100   /* Receive Control */
@@ -129,5 +136,11 @@ void i211_get_mac(uint8_t mac[6]);
 int  i211_send(const void *data, uint32_t len);
 int  i211_recv(void *buf, uint32_t *len);
 bool i211_link_up(void);
+
+/* Interrupt-driven receive (NAPI hybrid) */
+void i211_enable_interrupts(uint8_t pci_bus, uint8_t pci_dev, uint8_t pci_func);
+void i211_isr(void);           /* Called from IDT vector 40 */
+int  i211_napi_poll(int budget);
+extern volatile bool i211_irq_pending;
 
 #endif /* OSITOK_I211_H */

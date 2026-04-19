@@ -91,6 +91,16 @@ extern void syscall_restore_brk(void);
  */
 static const uint32_t qos_quantum[QOS_NUM_CLASSES] = { 20, 10, 5, 2, 1 };
 
+/* TSC-deadline mode: quanta in microseconds (100x finer than periodic).
+ *   IDLE        = 100ms
+ *   BACKGROUND  =  20ms
+ *   DEFAULT     =   5ms
+ *   INTERACTIVE =   2ms
+ *   REALTIME    = 100us  ← 100x more precise than the 10ms periodic tick */
+static const uint32_t qos_quantum_us[QOS_NUM_CLASSES] = {
+    100000, 20000, 5000, 2000, 100
+};
+
 /* ── Memory region tracking ──────────────────────────────────── */
 
 typedef struct {
@@ -688,6 +698,10 @@ int proc_exec(const char *filename, int argc, const char **argv)
          * on the boot kernel stack at low phys, which the user PML4
          * deliberately does NOT map. elf_jump() switches CR3 right
          * before jumping into the user binary. */
+
+        /* Map VDSO page read-only into this process's address space */
+        extern int vdso_map_process(uint64_t cr3);
+        vdso_map_process(new_cr3);
     }
 
     /* Set as current process and pin region registration target */
@@ -819,7 +833,7 @@ static inline uint32_t sched_get_lapic_id(void)
     return apic[0x020 / 4] >> 24;
 }
 
-void sched_tick(void *frame_ptr)
+void __hot sched_tick(void *frame_ptr)
 {
     if (!sched_enabled || sched_current_idx < 0)
         return;
@@ -845,7 +859,12 @@ void sched_tick(void *frame_ptr)
     bool quantum_expired = false;
 
     if (!force_switch) {
-        if (cur->quantum > 1) {
+        extern bool idt_tsc_deadline_active(void);
+        if (idt_tsc_deadline_active()) {
+            /* In TSC-deadline mode, every timer interrupt IS a quantum expiry —
+             * the deadline was programmed for exactly one quantum duration. */
+            quantum_expired = true;
+        } else if (cur->quantum > 1) {
             cur->quantum--;
         } else {
             quantum_expired = true;
@@ -1139,6 +1158,21 @@ void sched_yield(void)
 
 uint64_t sched_get_switches(void) { return sched_switches; }
 bool sched_is_enabled(void) { return sched_enabled; }
+
+/* TSC-deadline: return microseconds until next preemption.
+ * Returns 0 for tickless idle (no READY processes). */
+uint64_t sched_get_next_deadline_us(void)
+{
+    if (!sched_enabled || sched_current_idx < 0)
+        return 10000;  /* 10ms default if scheduler not active yet */
+
+    /* Check if any process is READY */
+    if (ready_bitmap == 0)
+        return 0;  /* tickless idle — no deadline */
+
+    process_t *cur = &proctab[sched_current_idx];
+    return qos_quantum_us[cur->qos_class];
+}
 
 /* ── Net-blocking helpers ───────────────────────────────────────
  * Used by net.c to block the current process while waiting for
