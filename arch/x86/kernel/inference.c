@@ -393,7 +393,6 @@ int llama_init(llama_state_t *state, gguf_model_t *model, uint32_t max_seq)
  *  SMP helpers for inference-layer parallelism
  * ══════════════════════════════════════════════════════════════ */
 
-extern volatile int inference_parallel_mode;  /* tensor.c */
 extern int smp_submit_any(void (*)(void*, void*), void*, void*);
 extern void smp_wait(int);
 extern int ap_worker_count;
@@ -479,9 +478,6 @@ int llama_forward(llama_state_t *s, uint32_t token)
 
         /* Q, K, V projections — K and V on APs, Q on BSP */
         if (ap_worker_count > 0) {
-            inference_parallel_mode = 1;
-            __asm__ volatile ("mfence" ::: "memory");
-
             matvec_arg_t k_arg = {s->k, ly->attn_k, s->xb, kv_dim, dim};
             matvec_arg_t v_arg = {s->v, ly->attn_v, s->xb, kv_dim, dim};
             int k_ap = smp_submit_any(matvec_worker, &k_arg, NULL);
@@ -494,8 +490,6 @@ int llama_forward(llama_state_t *s, uint32_t token)
             else matvec(s->v, ly->attn_v, s->xb, kv_dim, dim);
             if (k_ap < 0) matvec(s->k, ly->attn_k, s->xb, kv_dim, dim);
 
-            inference_parallel_mode = 0;
-            __asm__ volatile ("mfence" ::: "memory");
         } else {
             matvec(s->q, ly->attn_q, s->xb, dim, dim);
             matvec(s->k, ly->attn_k, s->xb, kv_dim, dim);
@@ -614,9 +608,6 @@ int llama_forward(llama_state_t *s, uint32_t token)
 
         /* Gate + Up projections — Up on AP, Gate on BSP */
         if (ap_worker_count > 0) {
-            inference_parallel_mode = 1;
-            __asm__ volatile ("mfence" ::: "memory");
-
             matvec_arg_t up_arg = {s->hb2, ly->ffn_up, s->xb, s->ffn_dim, dim};
             int up_ap = smp_submit_any(matvec_worker, &up_arg, NULL);
 
@@ -625,8 +616,6 @@ int llama_forward(llama_state_t *s, uint32_t token)
             if (up_ap >= 0) smp_wait(up_ap);
             else matvec(s->hb2, ly->ffn_up, s->xb, s->ffn_dim, dim);
 
-            inference_parallel_mode = 0;
-            __asm__ volatile ("mfence" ::: "memory");
         } else {
             matvec(s->hb,  ly->ffn_gate, s->xb, s->ffn_dim, dim);
             matvec(s->hb2, ly->ffn_up,   s->xb, s->ffn_dim, dim);

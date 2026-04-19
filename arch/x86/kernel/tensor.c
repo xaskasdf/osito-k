@@ -357,11 +357,6 @@ static void matvec_q4_0_chunk(void *arg, void *result)
     }
 }
 
-/* When inference.c is running multiple independent matvecs on separate APs,
- * each AP calls matvec() which calls us. Disable row-level parallelism to
- * avoid APs trying to smp_submit (nested, not supported). */
-volatile int inference_parallel_mode = 0;
-
 void matvec_q4_0(float *out, const void *weight,
                  const float *input, uint32_t rows, uint32_t cols)
 {
@@ -372,20 +367,8 @@ void matvec_q4_0(float *out, const void *weight,
     int avx2 = tensor_has_avx2();
     int workers = ap_worker_count;
 
-    /* Only parallelize if APs are actually ready.
-     * Check first AP's state (offset 0 in 64-byte aligned struct). */
-    {
-        extern volatile int ap_controls;  /* first field = state */
-        /* ap_controls is the array start — state at offset 0 of each 64-byte block */
-        volatile int *states = &ap_controls;
-        int ready = 0;
-        for (int i = 0; i < workers && i < 3; i++)
-            if (states[i * 16] == 1 /* AP_IDLE */) ready++;  /* 64/4=16 ints per block */
-        if (ready == 0) workers = 0;
-    }
-
-    /* Skip row-level SMP when inference layer is doing its own parallelism */
-    if (workers <= 0 || rows < 128 || inference_parallel_mode) {
+    /* Only parallelize large matvecs (IPI overhead not worth it for small) */
+    if (workers <= 0 || rows < 128) {
         if (avx2)
             matvec_q4_0_avx2(out, weight, input, rows, cols);
         else
@@ -398,9 +381,11 @@ void matvec_q4_0(float *out, const void *weight,
     int total_parts = workers + 1;  /* workers + BSP */
     uint32_t chunk = rows / total_parts;
 
-    /* Submit chunks to APs */
+    /* Submit chunks to APs — work-stealing handles nesting:
+     * if called from an AP, sub-tasks go to our deque and
+     * idle cores (or BSP in smp_wait) steal them. */
     matvec_chunk_t chunks[3];
-    int submitted[3];
+    int tids[3];
     for (int i = 0; i < workers; i++) {
         chunks[i].out       = out;
         chunks[i].weight    = weight;
@@ -409,7 +394,7 @@ void matvec_q4_0(float *out, const void *weight,
         chunks[i].row_end   = (i + 1) * chunk;
         chunks[i].cols      = cols;
         chunks[i].use_avx2  = avx2;
-        submitted[i] = smp_submit(i, matvec_q4_0_chunk, &chunks[i], 0);
+        tids[i] = smp_submit(i, matvec_q4_0_chunk, &chunks[i], 0);
     }
 
     /* BSP does the last chunk */
@@ -421,9 +406,9 @@ void matvec_q4_0(float *out, const void *weight,
     else
         matvec_q4_0_scalar(out + bsp_start, bsp_w, input, rows - bsp_start, cols);
 
-    /* Wait for all APs */
+    /* Wait — smp_wait does useful work (steals from others) while waiting */
     for (int i = 0; i < workers; i++)
-        if (submitted[i] == 0) smp_wait(i);
+        if (tids[i] >= 0) smp_wait(tids[i]);
 }
 
 void matvec_q8_0(float *out, const void *weight,

@@ -73,7 +73,7 @@ static void prefetch_worker(void *arg, void *result)
 void spec_prefetch_ahead(uint64_t rip, uint64_t cr3)
 {
     extern uint64_t idt_get_ticks(void);
-    extern int smp_submit_any(void (*)(void*, void*), void*, void*);
+    extern int smp_submit_ff(void (*)(void*, void*), void*, void*);
     extern int ap_worker_count;
 
     uint64_t now = idt_get_ticks();
@@ -86,7 +86,7 @@ void spec_prefetch_ahead(uint64_t rip, uint64_t cr3)
 
     __asm__ volatile ("mfence" ::: "memory");
 
-    if (smp_submit_any(prefetch_worker, &prefetch_arg, 0) >= 0) {
+    if (smp_submit_ff(prefetch_worker, &prefetch_arg, 0) >= 0) {
         last_prefetch_tick = now;
         prefetch_count++;
     }

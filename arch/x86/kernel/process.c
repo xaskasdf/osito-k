@@ -850,7 +850,8 @@ void sched_tick(void *frame_ptr)
                         mc_args[slot].base = (p->region_count > 0) ? p->regions[0].base : 0;
                         mc_args[slot].pages = (p->region_count > 0) ? p->regions[0].pages : 0;
                         extern void memcompress_worker(void *arg, void *result);
-                        if (smp_submit_any(memcompress_worker, &mc_args[slot], 0) < 0)
+                        extern int smp_submit_ff(void (*)(void*, void*), void*, void*);
+                        if (smp_submit_ff(memcompress_worker, &mc_args[slot], 0) < 0)
                             __sync_lock_release(&mc_args[slot].in_use);  /* no AP free */
                     }
                     /* No inline fallback — never compress inside the ISR.

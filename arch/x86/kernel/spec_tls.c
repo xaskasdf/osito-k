@@ -101,7 +101,7 @@ int tls_parallel_for(int64_t start, int64_t end, int64_t step,
         chunks[i].done       = 0;
         chunks[i].result     = 0;
 
-        smp_submit(i, tls_chunk_worker, &chunks[i], NULL);
+        chunks[i].done = smp_submit(i, tls_chunk_worker, &chunks[i], NULL);
     }
 
     /* BSP does the last chunk */
@@ -109,9 +109,9 @@ int tls_parallel_for(int64_t start, int64_t end, int64_t step,
     for (int64_t i = bsp_start; i < end; i += step)
         body(i, ctx);
 
-    /* Wait for APs */
+    /* Wait for APs (smp_wait does useful work while waiting) */
     for (int i = 0; i < workers; i++)
-        smp_wait(i);
+        if (chunks[i].done >= 0) smp_wait(chunks[i].done);
 
     return 0;
 }
@@ -172,9 +172,7 @@ int64_t tls_parallel_reduce(int64_t start, int64_t end, int64_t step,
         chunks[i].body       = body;
         chunks[i].ctx        = ctx;
         chunks[i].partial_result = 0;
-        chunks[i].done       = 0;
-
-        smp_submit(i, tls_reduce_worker, &chunks[i], NULL);
+        chunks[i].done       = smp_submit(i, tls_reduce_worker, &chunks[i], NULL);
     }
 
     /* BSP chunk */
@@ -186,7 +184,7 @@ int64_t tls_parallel_reduce(int64_t start, int64_t end, int64_t step,
     /* Collect partial results */
     int64_t total_result = bsp_accum;
     for (int i = 0; i < workers; i++) {
-        smp_wait(i);
+        if (chunks[i].done >= 0) smp_wait(chunks[i].done);
         total_result += chunks[i].partial_result;
     }
 
