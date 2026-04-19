@@ -199,6 +199,88 @@ static void runq_dequeue(int idx);
 static inline void proc_transition(process_t *p, uint32_t new_state);
 static void runq_init(void);
 
+/* ── Exec cache: reuse read-only ELF segments across exec() ─── */
+
+#define EXEC_CACHE_SIZE 8
+#define EXEC_CACHE_MAX_SEGS 4
+
+typedef struct {
+    char     name[64];
+    uint32_t name_hash;
+    uint64_t file_size;
+    struct {
+        void    *phys_base;
+        uint64_t vaddr;
+        uint64_t pages;
+    } segs[EXEC_CACHE_MAX_SEGS];
+    int      seg_count;
+    uint32_t refcount;
+    uint64_t last_used_tick;
+} exec_cache_entry_t;
+
+static exec_cache_entry_t exec_cache[EXEC_CACHE_SIZE];
+
+static uint32_t exec_hash(const char *s)
+{
+    uint32_t h = 5381;
+    while (*s) h = h * 33 + (uint8_t)*s++;
+    return h;
+}
+
+exec_cache_entry_t *exec_cache_lookup(const char *name, uint64_t fsize)
+{
+    uint32_t h = exec_hash(name);
+    for (int i = 0; i < EXEC_CACHE_SIZE; i++) {
+        if (exec_cache[i].name_hash == h &&
+            exec_cache[i].file_size == fsize &&
+            strcmp(exec_cache[i].name, name) == 0)
+            return &exec_cache[i];
+    }
+    return NULL;
+}
+
+void exec_cache_store(const char *name, uint64_t fsize,
+                      void *phys, uint64_t vaddr, uint64_t pages)
+{
+    int best = 0;
+    uint64_t oldest = ~0ULL;
+    for (int i = 0; i < EXEC_CACHE_SIZE; i++) {
+        if (exec_cache[i].name_hash == 0) { best = i; break; }
+        if (exec_cache[i].refcount == 0 &&
+            exec_cache[i].last_used_tick < oldest) {
+            oldest = exec_cache[i].last_used_tick;
+            best = i;
+        }
+    }
+    exec_cache_entry_t *e = &exec_cache[best];
+    if (e->refcount > 0) return;
+    memset(e, 0, sizeof(*e));
+    int j = 0;
+    while (name[j] && j < 63) { e->name[j] = name[j]; j++; }
+    e->name_hash = exec_hash(name);
+    e->file_size = fsize;
+    e->segs[0].phys_base = phys;
+    e->segs[0].vaddr = vaddr;
+    e->segs[0].pages = pages;
+    e->seg_count = 1;
+    e->refcount = 1;
+    extern uint64_t idt_get_ticks(void);
+    e->last_used_tick = idt_get_ticks();
+}
+
+void exec_cache_release(const char *name)
+{
+    uint32_t h = exec_hash(name);
+    for (int i = 0; i < EXEC_CACHE_SIZE; i++) {
+        if (exec_cache[i].name_hash == h &&
+            strcmp(exec_cache[i].name, name) == 0) {
+            if (exec_cache[i].refcount > 0)
+                exec_cache[i].refcount--;
+            return;
+        }
+    }
+}
+
 /* ── Per-process FPU/SSE state ────────────────────────────────
  * `isr_common` does `fxsave64 (%rax)` / `fxrstor64 (%rax)` where
  * %rax is loaded from `fpu_state_ptr`. That pointer tracks the

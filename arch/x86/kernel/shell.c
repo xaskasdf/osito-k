@@ -2216,6 +2216,43 @@ static void shell_exec(char *line)
             sh_puts("Spawned 2 test threads (printing A and B).\n");
             sh_puts("Use 'ps' to see processes, 'sched stats' for switch count.\n");
         }
+    } else if (strcmp(cmd, "tensor") == 0) {
+        /* Tensor benchmark and info */
+        if (argc >= 2 && strcmp(argv[1], "bench") == 0) {
+            extern void tensor_benchmark(void);
+            tensor_benchmark();
+        } else if (argc >= 2 && strcmp(argv[1], "info") == 0) {
+            extern void *prompt_llama;
+            if (prompt_llama) {
+                /* Access llama_state_t fields via known offsets */
+                sh_puts("Model loaded, use 'chat' for inference\n");
+            } else {
+                sh_puts("No model loaded\n");
+            }
+        } else {
+            sh_puts("Usage: tensor bench|info\n");
+        }
+    } else if (strcmp(cmd, "kprof") == 0) {
+        /* Always-on profiling: show RIP histogram */
+        extern void kprof_report(void);
+        kprof_report();
+    } else if (strcmp(cmd, "crashdump") == 0) {
+        /* List saved crash reports */
+        extern void *osfs2_find(const char *name);
+        char fname[32] = "crash_000.bin";
+        int found = 0;
+        for (int i = 1; i <= 100; i++) {
+            fname[6] = '0' + (i / 100) % 10;
+            fname[7] = '0' + (i / 10) % 10;
+            fname[8] = '0' + i % 10;
+            if (osfs2_find(fname)) {
+                sh_puts("  ");
+                sh_puts(fname);
+                sh_puts("\n");
+                found++;
+            }
+        }
+        if (!found) sh_puts("No crash reports saved\n");
     } else if (strcmp(cmd, "httpd") == 0) {
         cmd_httpd(argc, argv);
     } else if (strcmp(cmd, "winexec") == 0) {

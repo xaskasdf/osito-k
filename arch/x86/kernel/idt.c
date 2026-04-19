@@ -1724,6 +1724,17 @@ compat32_null_recovery:
             if (vec == 13) sig = 11; /* SIGSEGV for #GP */
             if (vec == 14) sig = 11; /* SIGSEGV for #PF */
             if (vec == 8) sig = 6;   /* SIGABRT for #DF */
+            /* Save structured crash report to OsitoFS */
+            {
+                extern void crash_report_save(uint64_t *frame, uint32_t vec,
+                    uint64_t fault, const char *name, uint32_t pid);
+                extern const char *proc_current_name(void);
+                uint64_t cr2 = 0;
+                if (vec == 14) __asm__ volatile ("mov %%cr2, %0" : "=r"(cr2));
+                crash_report_save((uint64_t *)frame, vec, cr2,
+                                  proc_current_name(), (uint32_t)pid);
+            }
+
             serial_puts("  Killing process PID ");
             serial_putdec(pid);
             serial_puts(" with signal ");

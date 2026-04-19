@@ -28,6 +28,12 @@ extern void fb_putdec(uint64_t val);
 
 extern void *mem_alloc_aligned(uint64_t size, uint64_t alignment);
 extern osfs2_file_t *osfs2_find_gguf(void);
+
+/* Tracked for kexec state preservation */
+static void    *g_gguf_mmap_base;
+static uint64_t g_gguf_mmap_size;
+void    *gguf_get_mmap_base(void) { return g_gguf_mmap_base; }
+uint64_t gguf_get_mmap_size(void) { return g_gguf_mmap_size; }
 extern int osfs2_read_layer_index(uint16_t slot, osfs2_layer_idx_t *li);
 extern int osfs2_read(osfs2_file_t *file, uint64_t offset, void *buf, uint64_t len);
 
@@ -369,6 +375,8 @@ int gguf_load(gguf_model_t *model)
 
     /* Allocate contiguous RAM for entire file */
     model->file_data = mem_alloc_aligned(file->size, 4096);
+    g_gguf_mmap_base = model->file_data;
+    g_gguf_mmap_size = file->size;
     if (!model->file_data) {
         serial_puts("[GGUF] Failed to allocate ");
         serial_putdec(file->size / (1024 * 1024));

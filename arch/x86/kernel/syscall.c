@@ -1565,6 +1565,39 @@ int demand_page_fault(uint64_t addr, uint64_t error_code)
         return -1;
     }
 
+    /* Speculative prefetch: pre-fault the next 3 pages if they're within
+     * the same VMA and not yet present. Spatial locality means sequential
+     * code/data access patterns will hit these pages shortly. Each
+     * prefault is ~10us of NVMe DMA vs ~10ms of demand fault latency. */
+    if (cr3 && vma->type == VMA_FILE_ELF) {
+        uint64_t vma_end = vma->base + vma->pages * 4096;
+        for (int pf = 1; pf <= 3; pf++) {
+            uint64_t next_va = page_addr + (uint64_t)pf * 4096;
+            if (next_va >= vma_end) break;
+
+            /* Check if page already mapped (avoid double-fault) */
+            extern uint64_t *paging_get_pte_in_cr3(uint64_t cr3, uint64_t va);
+            uint64_t *pte = paging_get_pte_in_cr3(cr3, next_va);
+            if (pte && (*pte & 1)) continue;  /* already present */
+
+            void *pf_phys = mem_alloc_pages(1);
+            if (!pf_phys) break;
+            void *pf_virt = PHYS_TO_VIRT(pf_phys);
+            memset(pf_virt, 0, 4096);
+
+            uint64_t off_in_vma = next_va - vma->base;
+            if (off_in_vma < vma->file_size) {
+                uint64_t to_read = 4096;
+                if (off_in_vma + 4096 > vma->file_size)
+                    to_read = vma->file_size - off_in_vma;
+                vfs_node_t nc = vma->file_node;
+                vfs_read(&nc, vma->file_offset + off_in_vma, pf_virt, to_read);
+            }
+
+            paging_map_page_in_cr3(cr3, next_va, (uint64_t)pf_phys, pte_flags);
+        }
+    }
+
     return 0;
 }
 
