@@ -657,6 +657,11 @@ process_t *proc_find(uint32_t pid)
     return NULL;
 }
 
+/* Opaque accessors for pred_sched — avoids leaking process_t layout. */
+void *proc_find_ptr(uint16_t pid) { return proc_find((uint32_t)pid); }
+uint64_t proc_kernel_rsp(void *p) { return p ? ((process_t *)p)->kernel_rsp : 0; }
+void *proc_fpu_state_ptr(void *p) { return p ? ((process_t *)p)->fpu_state : 0; }
+
 /* Forward declaration for thread exit cleanup (X-THREAD) */
 static void thread_exit_cleanup(process_t *p);
 
@@ -1145,6 +1150,21 @@ void __hot sched_tick(void *frame_ptr)
             proc_transition(next, PROC_ZOMBIE);
             return;
         }
+    }
+
+    /* Markov scheduler hooks (Phase 6 of plan):
+     *   1. Record the transition so the model learns this pattern.
+     *   2. Predict the PID we'll switch to next quantum and prefetch
+     *      its kernel_rsp + FPU state so the upcoming switch sees hot
+     *      cache lines instead of 20-cycle L2/L3 loads per field. */
+    {
+        extern void pred_record(uint16_t, uint16_t, uint8_t);
+        extern uint16_t pred_next(uint16_t, uint8_t);
+        extern void pred_prewarm(uint16_t);
+        uint8_t trig = 0 /* PRED_TRIGGER_QUANTUM */;
+        pred_record((uint16_t)cur->pid, (uint16_t)next->pid, trig);
+        uint16_t pred = pred_next((uint16_t)next->pid, trig);
+        if (pred) pred_prewarm(pred);
     }
 
     /* Tell ISR stub to switch RSP before popping GPRs.

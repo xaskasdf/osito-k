@@ -241,4 +241,93 @@ int *__errno_location(void);
 #define ENOSYS 38
 #define EAGAIN 11
 
+/* ── OsitoK inference-as-a-syscall (SYS_INFERENCE 530-534) ───────
+ *
+ * The kernel exposes Llama forward pass + BPE tokenizer as syscalls.
+ * Any ELF can do:
+ *
+ *   uint32_t toks[128], out[64];
+ *   int n_in = oi_tokenize("hello world", toks, 128);
+ *   int n_out = oi_inference(toks, n_in, out, 64, 0.7f);
+ *   char text[512];
+ *   oi_detokenize(out, n_out, text, sizeof text);
+ *   puts(text);
+ *
+ * No library, no framework, no Python, no CUDA. */
+
+#define SYS_INFERENCE            530
+#define SYS_INFERENCE_RESET      531
+#define SYS_INFERENCE_STATE      532
+#define SYS_INFERENCE_TOKENIZE   533
+#define SYS_INFERENCE_DETOKENIZE 534
+
+typedef struct {
+    unsigned int loaded;
+    unsigned int vocab_size;
+    unsigned int ctx_len;
+    unsigned int current_pos;
+    unsigned long long tokens_generated_total;
+} oi_state_t;
+
+static inline long oi_inference(const unsigned int *prompt, unsigned int n,
+                                unsigned int *out, unsigned int max_out,
+                                float temperature)
+{
+    long ret;
+    unsigned int temp_x1000 = (unsigned int)(temperature * 1000.0f);
+    register unsigned int _r10 __asm__("r10") = max_out;
+    register unsigned int _r8  __asm__("r8")  = temp_x1000;
+    __asm__ volatile("syscall"
+        : "=a"(ret)
+        : "0"((long)SYS_INFERENCE), "D"(prompt), "S"((long)n), "d"(out),
+          "r"(_r10), "r"(_r8)
+        : "rcx", "r11", "memory");
+    return ret;
+}
+
+static inline long oi_inference_reset(void)
+{
+    long ret;
+    __asm__ volatile("syscall"
+        : "=a"(ret)
+        : "0"((long)SYS_INFERENCE_RESET)
+        : "rcx", "r11", "memory");
+    return ret;
+}
+
+static inline long oi_inference_state(oi_state_t *out)
+{
+    long ret;
+    __asm__ volatile("syscall"
+        : "=a"(ret)
+        : "0"((long)SYS_INFERENCE_STATE), "D"(out), "S"((long)sizeof *out)
+        : "rcx", "r11", "memory");
+    return ret;
+}
+
+static inline long oi_tokenize(const char *text, unsigned int *out,
+                               unsigned int max_out)
+{
+    long ret;
+    __asm__ volatile("syscall"
+        : "=a"(ret)
+        : "0"((long)SYS_INFERENCE_TOKENIZE), "D"(text), "S"(out),
+          "d"((long)max_out)
+        : "rcx", "r11", "memory");
+    return ret;
+}
+
+static inline long oi_detokenize(const unsigned int *toks, unsigned int n,
+                                 char *dst, unsigned long dst_size)
+{
+    long ret;
+    register unsigned long _r10 __asm__("r10") = dst_size;
+    __asm__ volatile("syscall"
+        : "=a"(ret)
+        : "0"((long)SYS_INFERENCE_DETOKENIZE), "D"(toks), "S"((long)n),
+          "d"(dst), "r"(_r10)
+        : "rcx", "r11", "memory");
+    return ret;
+}
+
 #endif /* OSITOK_H */

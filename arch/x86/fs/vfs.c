@@ -78,6 +78,10 @@ bool vfs_find(const char *path, int mode, vfs_node_t *out_node)
             out_node->fs_version = 3;
             out_node->ino = ino;
             out_node->size = osfs3_get_size(ino);
+            {
+                extern void io_predict_observe(const char *);
+                io_predict_observe(lookup_path);
+            }
             return true;
         }
     }
@@ -89,6 +93,10 @@ bool vfs_find(const char *path, int mode, vfs_node_t *out_node)
             out_node->fs_version = 2;
             out_node->data = f;
             out_node->size = osfs2_file_size(f);
+            {
+                extern void io_predict_observe(const char *);
+                io_predict_observe(lookup_path);
+            }
             return true;
         }
     }

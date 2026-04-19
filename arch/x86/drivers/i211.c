@@ -313,6 +313,66 @@ void i211_get_mac(uint8_t mac[6])
 
 /* ── Send Packet ─────────────────────────────────────────────── */
 
+/* ── Scatter-gather send (Phase 8: zero-copy) ──────────────────
+ *
+ * Chains N descriptors (1 per fragment). Only the last carries EOP and
+ * RS so we wait for exactly one completion. Legacy descriptor format
+ * supports this: the controller concatenates fragments into one wire
+ * frame before transmitting.
+ *
+ * Caller must pass physical addresses for each fragment. Use
+ * VIRT_TO_PHYS for upper-half kernel buffers, or pass identity-mapped
+ * low-half pointers directly. Total length must fit one Ethernet frame.
+ */
+int i211_send_sg(const uint64_t frag_phys[], const uint32_t lens[], int n_frags)
+{
+    if (!nic.initialized || n_frags <= 0 || n_frags > 4) return -1;
+    uint32_t total = 0;
+    for (int i = 0; i < n_frags; i++) total += lens[i];
+    if (total == 0 || total > I211_PKT_BUF_SIZE) return -1;
+
+    /* Wait for enough free descriptors in the ring */
+    uint32_t tail = nic.tx_tail;
+    for (int spin = 0; spin < 1000000; spin++) {
+        uint32_t count_free = 0;
+        for (int i = 0; i < n_frags; i++) {
+            i211_tx_desc_t *d = &nic.tx_ring[(tail + i) % I211_TX_RING_SIZE];
+            if ((d->status & I211_TXD_STAT_DD) || d->cmd == 0) count_free++;
+            else break;
+        }
+        if ((int)count_free >= n_frags) break;
+        __asm__ volatile ("pause");
+    }
+
+    for (int i = 0; i < n_frags; i++) {
+        uint32_t idx = (tail + i) % I211_TX_RING_SIZE;
+        i211_tx_desc_t *d = &nic.tx_ring[idx];
+        d->addr = frag_phys[i];
+        d->length = (uint16_t)lens[i];
+        d->cso = 0;
+        uint8_t cmd = I211_TXD_CMD_IFCS;
+        if (i == n_frags - 1) cmd |= I211_TXD_CMD_EOP | I211_TXD_CMD_RS;
+        d->cmd = cmd;
+        d->status = 0;
+        d->css = 0;
+        d->special = 0;
+    }
+
+    nic.tx_tail = (tail + n_frags) % I211_TX_RING_SIZE;
+    wmb();
+    i211_write(I211_TDT0, nic.tx_tail);
+
+    /* Poll completion on the last descriptor */
+    uint32_t last_idx = (nic.tx_tail + I211_TX_RING_SIZE - 1) % I211_TX_RING_SIZE;
+    i211_tx_desc_t *last = &nic.tx_ring[last_idx];
+    for (int i = 0; i < 1000000; i++) {
+        if (last->status & I211_TXD_STAT_DD) return 0;
+        __asm__ volatile ("pause");
+    }
+    serial_puts("[I211] SG TX timeout\n");
+    return -1;
+}
+
 int i211_send(const void *data, uint32_t len)
 {
     if (!nic.initialized || len == 0 || len > I211_PKT_BUF_SIZE)

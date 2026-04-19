@@ -2090,6 +2090,100 @@ static void shell_exec(char *line)
         cmd_cpus();
     } else if (strcmp(cmd, "mem") == 0) {
         cmd_mem();
+    } else if (strcmp(cmd, "cpu") == 0) {
+        extern void cpu_features_dump(void);
+        cpu_features_dump();
+    } else if (strcmp(cmd, "perf") == 0) {
+        extern void cmd_perf(int, char **);
+        cmd_perf(argc, argv);
+    } else if (strcmp(cmd, "pred") == 0) {
+        extern void pred_stats(void);
+        extern void pred_reset(void);
+        if (argc >= 2 && strcmp(argv[1], "reset") == 0) pred_reset();
+        else pred_stats();
+    } else if (strcmp(cmd, "io_predict") == 0) {
+        extern void io_predict_stats(void);
+        extern void io_predict_reset(void);
+        if (argc >= 2 && strcmp(argv[1], "reset") == 0) io_predict_reset();
+        else io_predict_stats();
+    } else if (strcmp(cmd, "hwbp") == 0) {
+        extern void hwbp_list(void);
+        hwbp_list();
+    } else if (strcmp(cmd, "watch") == 0) {
+        /* Usage: watch <addr_hex> [w|rw|x] [len]
+         * Defaults: write, len=8. Slot is auto-allocated. */
+        extern int hwbp_set(int slot, uint64_t addr, int cond, int len, const char *name);
+        struct hwbp_entry_public {
+            uint64_t    addr;
+            int         cond, len;
+            bool        active;
+            uint64_t    hit_count;
+            char        name[32];
+        };
+        extern struct hwbp_entry_public hwbps[4];
+        if (argc < 2) {
+            serial_puts("usage: watch <addr_hex> [w|rw|x] [1|2|4|8]\n");
+        } else {
+            uint64_t addr = 0;
+            const char *s = argv[1];
+            if (s[0]=='0' && (s[1]=='x'||s[1]=='X')) s += 2;
+            while (*s) {
+                char c = *s++;
+                addr <<= 4;
+                if (c >= '0' && c <= '9') addr |= c - '0';
+                else if (c >= 'a' && c <= 'f') addr |= c - 'a' + 10;
+                else if (c >= 'A' && c <= 'F') addr |= c - 'A' + 10;
+            }
+            int cond = 1; /* HWBP_WRITE */
+            if (argc >= 3) {
+                if (strcmp(argv[2], "x") == 0) cond = 0;
+                else if (strcmp(argv[2], "rw") == 0) cond = 3;
+                else cond = 1;
+            }
+            int len_code = 2; /* HWBP_LEN_8 */
+            if (argc >= 4) {
+                int bytes = argv[3][0] - '0';
+                if (bytes == 1) len_code = 0;
+                else if (bytes == 2) len_code = 1;
+                else if (bytes == 4) len_code = 3;
+                else if (bytes == 8) len_code = 2;
+            }
+            /* find free slot */
+            int slot = -1;
+            for (int i = 0; i < 4; i++) if (!hwbps[i].active) { slot = i; break; }
+            if (slot < 0) { serial_puts("All 4 HW breakpoint slots in use\n"); }
+            else if (hwbp_set(slot, addr, cond, len_code, argv[1]) == 0) {
+                serial_puts("Set hwbp slot ");
+                serial_putdec(slot);
+                serial_puts(" on 0x");
+                serial_puthex(addr, 12);
+                serial_puts("\n");
+            }
+        }
+    } else if (strcmp(cmd, "unwatch") == 0) {
+        extern int hwbp_clear(int);
+        int slot = (argc >= 2) ? (argv[1][0] - '0') : 0;
+        if (hwbp_clear(slot) == 0) {
+            serial_puts("Cleared hwbp slot ");
+            serial_putdec(slot);
+            serial_puts("\n");
+        }
+    } else if (strcmp(cmd, "self_opt") == 0) {
+        extern void self_opt_stats(void);
+        extern void self_opt_apply(void);
+        extern void self_opt_undo_all(void);
+        extern bool self_opt_enabled;
+        if (argc >= 2 && strcmp(argv[1], "apply") == 0) self_opt_apply();
+        else if (argc >= 2 && strcmp(argv[1], "undo") == 0) self_opt_undo_all();
+        else if (argc >= 2 && strcmp(argv[1], "enable") == 0) {
+            self_opt_enabled = true;
+            serial_puts("[SELF-OPT] enabled\n");
+        }
+        else if (argc >= 2 && strcmp(argv[1], "disable") == 0) {
+            self_opt_enabled = false;
+            serial_puts("[SELF-OPT] disabled\n");
+        }
+        else self_opt_stats();
     } else if (strcmp(cmd, "uptime") == 0) {
         cmd_uptime();
     } else if (strcmp(cmd, "echo") == 0) {

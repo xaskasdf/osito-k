@@ -11,6 +11,7 @@
 #include "inference.h"
 #include "tensor.h"
 #include "../include/paging.h"
+#include "../include/tensor_arena.h"
 
 #ifdef __EMSCRIPTEN__
 #include <emscripten.h>
@@ -302,20 +303,33 @@ int llama_init(llama_state_t *state, gguf_model_t *model, uint32_t max_seq)
     uint64_t kv_layer_pages = pages_for(kv_layer_bytes);
     uint64_t kv_total_pages = 0;
 
-    for (uint32_t l = 0; l < state->n_layers; l++) {
-        void *k_phys = mem_alloc_pages(kv_layer_pages);
-        void *v_phys = mem_alloc_pages(kv_layer_pages);
-        if (!k_phys || !v_phys) {
-            serial_puts("[LLAMA] ERROR: failed to alloc KV cache layer ");
-            serial_putdec(l);
-            serial_puts("\n");
-            return -1;
+    /* Try superpage-backed arena first (2MB pages → ~0 TLB misses during
+     * attention). Fall back to regular allocator if arena unavailable. */
+    {
+        for (uint32_t l = 0; l < state->n_layers; l++) {
+            void *k = 0, *v = 0;
+            if (g_tensor_arena.virt_base) {
+                k = tensor_arena_alloc(&g_tensor_arena, kv_layer_bytes, 64);
+                v = tensor_arena_alloc(&g_tensor_arena, kv_layer_bytes, 64);
+            }
+            if (!k || !v) {
+                void *k_phys = mem_alloc_pages(kv_layer_pages);
+                void *v_phys = mem_alloc_pages(kv_layer_pages);
+                if (!k_phys || !v_phys) {
+                    serial_puts("[LLAMA] ERROR: failed to alloc KV cache layer ");
+                    serial_putdec(l);
+                    serial_puts("\n");
+                    return -1;
+                }
+                k = PHYS_TO_VIRT(k_phys);
+                v = PHYS_TO_VIRT(v_phys);
+            }
+            state->kv_cache[l].k = (float *)k;
+            state->kv_cache[l].v = (float *)v;
+            memset(state->kv_cache[l].k, 0, (size_t)kv_layer_bytes);
+            memset(state->kv_cache[l].v, 0, (size_t)kv_layer_bytes);
+            kv_total_pages += kv_layer_pages * 2;
         }
-        state->kv_cache[l].k = (float *)PHYS_TO_VIRT(k_phys);
-        state->kv_cache[l].v = (float *)PHYS_TO_VIRT(v_phys);
-        memset(state->kv_cache[l].k, 0, (size_t)kv_layer_bytes);
-        memset(state->kv_cache[l].v, 0, (size_t)kv_layer_bytes);
-        kv_total_pages += kv_layer_pages * 2;
     }
 
     serial_puts("[LLAMA] KV cache: ");
@@ -355,14 +369,27 @@ int llama_init(llama_state_t *state, gguf_model_t *model, uint32_t max_seq)
         (uint64_t)state->vocab_size * sizeof(float);     /* logits */
 
     uint64_t scratch_pages = pages_for(scratch_size);
-    void *scratch_phys = mem_alloc_pages(scratch_pages);
-    if (!scratch_phys) {
-        serial_puts("[LLAMA] ERROR: failed to alloc scratch (");
-        serial_putdec(scratch_size / 1024);
-        serial_puts(" KB)\n");
-        return -1;
+
+    /* Prefer superpage arena for scratch — this is the hottest memory in
+     * the forward pass, so TLB coverage matters most here. */
+    {
+        state->scratch = 0;
+        if (g_tensor_arena.virt_base) {
+            state->scratch = (float *)tensor_arena_alloc(&g_tensor_arena,
+                                                          scratch_pages * PAGE_SZ,
+                                                          2 * 1024 * 1024);
+        }
+        if (!state->scratch) {
+            void *scratch_phys = mem_alloc_pages(scratch_pages);
+            if (!scratch_phys) {
+                serial_puts("[LLAMA] ERROR: failed to alloc scratch (");
+                serial_putdec(scratch_size / 1024);
+                serial_puts(" KB)\n");
+                return -1;
+            }
+            state->scratch = (float *)PHYS_TO_VIRT(scratch_phys);
+        }
     }
-    state->scratch = (float *)PHYS_TO_VIRT(scratch_phys);
     memset(state->scratch, 0, (size_t)(scratch_pages * PAGE_SZ));
 
     /* Partition scratch (cache-colored: pad between concurrent buffers) */
@@ -495,6 +522,10 @@ int llama_forward(llama_state_t *s, uint32_t token)
     uint32_t kv_dim  = s->kv_dim;
     uint32_t hd      = s->head_dim;
     uint32_t pos     = s->pos;
+
+    /* Tag whole forward pass for PMU profiling (shell cmd: `perf`). */
+    extern void perf_phase_enter(int slot, const char *name);
+    perf_phase_enter(0 /* PERF_PHASE_FORWARD */, "llama_forward");
 
     /* ── Embed token ── */
     embed_token(s->x, s->weights.token_embd, token, dim);
@@ -677,6 +708,9 @@ int llama_forward(llama_state_t *s, uint32_t token)
     matvec(s->logits, s->weights.output, s->x, s->vocab_size, dim);
 
     s->pos++;
+
+    extern void perf_phase_exit(int slot);
+    perf_phase_exit(0 /* PERF_PHASE_FORWARD */);
     return 0;
 }
 

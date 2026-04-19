@@ -364,6 +364,17 @@ arch/arm/          SM8350 (ROG Phone 5) bare-metal port — see docs/aarch64-det
 | **Phase 2** | **TCC compiles kernel inside OsitoK** (62 .c → 733KB ELF) | **Done** |
 | **Phase 3** | **kexec: load + boot self-compiled kernel** | **Done** |
 | **Phase 4** | **Self-built kernel boots directly from UEFI** (verified in QEMU) | **Done** |
+| X-CPUF  | Centralized CPU feature detection (`cpu_features.h`), vendor/cache/PMU/SIMD caps | Done |
+| X-PMU   | Hardware perf counters (3 fixed + 4 PMCs: L1d/L2/TLB/branch miss), RDPMC via CR4.PCE | Done |
+| X-TARENA| Superpage tensor arena (512MB on 256 × 2MB pages) for scratch + KV cache | Done |
+| X-DISP  | Boot-time CPUID dispatch table (AVX2/AVX-512 select, ERMS memcpy) | Done |
+| X-SYSINF| `sys_inference` syscall family (530-534) + `ositok.h` `oi_*` wrappers | Done |
+| X-ASLRL | ASLR-lite stack jitter (0-4080B, RDRAND-driven) for cache diversification | Done |
+| X-PREDS | Markov predictive scheduling + kernel_rsp/FPU prefetch (`pred_record`/`pred_prewarm`) | Done |
+| X-IOPRE | Speculative I/O prefetch: pattern table hooked into `vfs_find`, APs prefetch via `smp_submit_ff` | Done |
+| X-SGTX  | Zero-copy scatter-gather TX on I211 (`i211_send_sg`, legacy descriptor chaining) | Done |
+| X-HWBP  | Hardware breakpoints (DR0-DR3), `watch`/`unwatch`/`hwbp` shell commands | Done |
+| X-SELF  | Self-optimizing kernel (dry-run v1: static branch site registration + `self_opt apply`) | Done |
 
 > Full GPU roadmap (X27-X40 + contingency): see [docs/x86-gpu-roadmap.md](docs/x86-gpu-roadmap.md)
 > Full OS roadmap (Tiers 0-9): see [docs/os-selfhost-roadmap.md](docs/os-selfhost-roadmap.md)
@@ -396,6 +407,7 @@ arch/arm/          SM8350 (ROG Phone 5) bare-metal port — see docs/aarch64-det
 For implementation details, API specifics, register-level documentation, and debugging notes:
 
 - **[docs/x86-features-detail.md](docs/x86-features-detail.md)** — All x86-64 feature descriptions (X9-X42, X-OS*, X-NET*, X-CL*, X-WIN32, etc.)
+- **[docs/kernel-demencial.md](docs/kernel-demencial.md)** — 10 features avanzadas: cpu_features, PMU counters, superpage tensor arena, multipath dispatch, sys_inference syscall, ASLR lite, predictive scheduling, speculative I/O, zero-copy SG TX, hardware breakpoints, self-optimizing kernel
 - **[docs/esp8266-detail.md](docs/esp8266-detail.md)** — Math library API, zForth integration, resource budget, DOOM/Elite details
 - **[docs/aarch64-detail.md](docs/aarch64-detail.md)** — AArch64/SM8350 (ROG Phone 5) port details
 - **[docs/x86-gpu-roadmap.md](docs/x86-gpu-roadmap.md)** — GPU compute roadmap (X27-X40)

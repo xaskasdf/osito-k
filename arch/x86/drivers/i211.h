@@ -134,6 +134,9 @@ typedef struct __attribute__((packed)) {
 int  i211_init(uint64_t bar0_phys);
 void i211_get_mac(uint8_t mac[6]);
 int  i211_send(const void *data, uint32_t len);
+/* Scatter-gather TX: up to 4 fragments described by (phys_addr, length).
+ * Zero-copy — controller DMAs each fragment directly. Returns 0 on success. */
+int  i211_send_sg(const uint64_t frag_phys[], const uint32_t lens[], int n_frags);
 int  i211_recv(void *buf, uint32_t *len);
 bool i211_link_up(void);
 

@@ -393,6 +393,13 @@ void smp_ap_entry(uint32_t cpu_index)
         apic_write_reg(apic, 0x380, timer_init);
     }
 
+    /* Enable this AP's PMU counters (CR4.PCE + event select MSRs).
+     * Must be done per-CPU; PMU MSRs are not shared across cores. */
+    {
+        extern void perf_init_ap(void);
+        perf_init_ap();
+    }
+
     /* Mark CPU as online */
     if (cpu_index < SMP_MAX_CPUS)
         cpus[cpu_index].online = true;

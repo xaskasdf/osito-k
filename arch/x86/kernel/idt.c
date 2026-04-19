@@ -895,6 +895,15 @@ void isr_handler(interrupt_frame_t *frame)
 
     /* #DB Debug exception — hardware watchpoint handler */
     if (vec == 1) {
+        /* Phase 9: dispatch to generic hwbp manager first. If any slot
+         * in the user-visible hwbps[] table is active and DR6 matches,
+         * we've handled it. Otherwise fall through to the PE32-specific
+         * debug path below. */
+        {
+            extern bool hwbp_dispatch(void *frame);
+            if (hwbp_dispatch(frame)) return;
+        }
+
         static int db_hit_count = 0;
         uint64_t dr6;
         __asm__ volatile ("mov %%dr6, %0" : "=r"(dr6));

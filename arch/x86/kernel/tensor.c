@@ -27,62 +27,30 @@ extern void *mem_alloc_pages(uint64_t count);
 extern void  mem_free_pages(void *addr, uint64_t count);
 
 /* ── AVX2 Detection + Enable ────────────────────────── */
-
-static int avx2_detected = -1;  /* -1 = not checked yet */
+/* Thin wrappers over cpu_features. cpu_features_detect() runs early
+ * in main.c:kernel_entry() and handles CR4.OSXSAVE + XCR0 setup.
+ * These stay for backward compatibility; prefer reading cpu_features
+ * directly in new code. */
 
 #ifndef __EMSCRIPTEN__
+#include "../include/cpu_features.h"
+
 int tensor_avx2_detect(void)
 {
-    uint32_t eax, ebx, ecx, edx;
-
-    /* CPUID.1: check XSAVE (bit 26), AVX (bit 28), FMA (bit 12) */
-    __asm__ volatile("cpuid"
-        : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx)
-        : "a"(1), "c"(0));
-
-    int has_xsave = (ecx >> 26) & 1;
-    int has_avx   = (ecx >> 28) & 1;
-    int has_fma   = (ecx >> 12) & 1;
-
-    if (!has_xsave || !has_avx || !has_fma) {
-        avx2_detected = 0;
-        return 0;
-    }
-
-    /* Enable CR4.OSXSAVE (bit 18) if not already set */
-    int os_xsave = (ecx >> 27) & 1;
-    if (!os_xsave) {
-        uint64_t cr4;
-        __asm__ volatile("mov %%cr4, %0" : "=r"(cr4));
-        cr4 |= (1ULL << 18);
-        __asm__ volatile("mov %0, %%cr4" :: "r"(cr4));
-    }
-
-    /* Enable SSE + AVX state saving in XCR0 (bits 0=x87, 1=SSE, 2=AVX) */
-    uint32_t xcr0_lo, xcr0_hi;
-    __asm__ volatile("xgetbv" : "=a"(xcr0_lo), "=d"(xcr0_hi) : "c"(0));
-    if ((xcr0_lo & 0x7) != 0x7) {
-        xcr0_lo |= 0x7;
-        __asm__ volatile("xsetbv" :: "a"(xcr0_lo), "d"(xcr0_hi), "c"(0));
-    }
-
-    /* CPUID.7: check AVX2 (EBX bit 5) */
-    __asm__ volatile("cpuid"
-        : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx)
-        : "a"(7), "c"(0));
-
-    avx2_detected = (ebx >> 5) & 1;
-    return avx2_detected;
+    /* cpu_features_detect() already ran at boot; just read the cached result */
+    return cpu_features.avx2 && cpu_features.fma;
 }
 #else
-int tensor_avx2_detect(void) { avx2_detected = 0; return 0; }
+int tensor_avx2_detect(void) { return 0; }
 #endif
 
 int tensor_has_avx2(void)
 {
-    if (avx2_detected < 0)
-        tensor_avx2_detect();
-    return avx2_detected;
+#ifdef __EMSCRIPTEN__
+    return 0;
+#else
+    return cpu_features.avx2 && cpu_features.fma;
+#endif
 }
 
 /* ── Utility helpers ─────────────────────────────────── */

@@ -479,8 +479,17 @@ static uint64_t elf_setup_stack(elf_loaded_t *loaded,
 
     memset(loaded->stack_base, 0, USER_STACK_SIZE);
 
-    /* Stack grows downward. Top = base + size. */
-    uint64_t sp = (uint64_t)loaded->stack_base + USER_STACK_SIZE;
+    /* Stack grows downward. Top = base + size.
+     *
+     * ASLR-lite: randomize stack top by 0..4080 bytes (256-slot granularity,
+     * 16-byte aligned to preserve System V stack alignment). Not a security
+     * feature (full trust model) — the benefit is cache-set diversification
+     * across processes and surfacing layout-dependent bugs in user code that
+     * would otherwise only trigger on alternate runs.
+     * Source: hw_random64() uses RDRAND when available, TSC mix otherwise. */
+    extern uint64_t hw_random64(void);
+    uint64_t sp_jitter = (hw_random64() & 0xFF) * 16;   /* 0..4080, 16-aligned */
+    uint64_t sp = (uint64_t)loaded->stack_base + USER_STACK_SIZE - sp_jitter;
 
     /* Push strings first (below stack top), then pointers.
      * Layout (growing downward):

@@ -3373,6 +3373,34 @@ int64_t __hot syscall_dispatch(uint64_t nr, uint64_t a1, uint64_t a2,
     case SYS_CMDRING_INIT:
         return sys_cmdring_init(a1);
 
+    /* ── OsitoK private: inference as a kernel syscall (530-534).
+     * Numbers chosen to sit above SYS_BATCH (520) / SYS_CMDRING_INIT (521)
+     * and clear of the SYS_SHM_* block at 500-506. */
+    case 530: {
+        extern int64_t sys_inference(uint32_t *, uint32_t, uint32_t *,
+                                      uint32_t, uint32_t);
+        return sys_inference((uint32_t *)a1, (uint32_t)a2,
+                             (uint32_t *)a3, (uint32_t)a4, (uint32_t)a5);
+    }
+    case 531: {
+        extern int64_t sys_inference_reset(void);
+        return sys_inference_reset();
+    }
+    case 532: {
+        extern int64_t sys_inference_state(void *, uint64_t);
+        return sys_inference_state((void *)a1, a2);
+    }
+    case 533: {
+        extern int64_t sys_inference_tokenize(const char *, uint32_t *, uint32_t);
+        return sys_inference_tokenize((const char *)a1, (uint32_t *)a2, (uint32_t)a3);
+    }
+    case 534: {
+        extern int64_t sys_inference_detokenize(const uint32_t *, uint32_t,
+                                                 char *, uint64_t);
+        return sys_inference_detokenize((const uint32_t *)a1, (uint32_t)a2,
+                                         (char *)a3, a4);
+    }
+
     default:
         serial_puts("[SYSCALL] Unknown syscall ");
         serial_putdec(nr);

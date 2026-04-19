@@ -8,6 +8,7 @@
 #include "../include/types.h"
 #include "../include/boot_info.h"
 #include "../include/paging.h"
+#include "../include/tensor_arena.h"
 #include "../drivers/gpu.h"
 #include "../drivers/gpu_inference.h"
 #include "../fs/gguf.h"
@@ -359,6 +360,18 @@ void __initk kernel_entry(boot_info_t *info)
 
     print_banner();
 
+    /* ── Step 0.5: CPU feature detection (must run before any AVX/PMU use) ── */
+    {
+        extern void cpu_features_detect(void);
+        extern void cpu_features_dump(void);
+        extern void perf_init(void);
+        extern void dispatch_init(void);
+        cpu_features_detect();
+        cpu_features_dump();
+        perf_init();
+        dispatch_init();
+    }
+
     /* ── Step 1: Initialize memory manager ── */
     serial_puts("[KERN] Initializing memory manager...\n");
     fb_puts(" Initializing memory...\n");
@@ -626,10 +639,17 @@ void __initk kernel_entry(boot_info_t *info)
                     }
                 }
 
+                /* Reserve a 512 MB superpage arena BEFORE llama_init so
+                 * its scratch + KV cache land on 2 MB pages (0 TLB misses). */
+                if (!g_tensor_arena.virt_base)
+                    tensor_arena_init(&g_tensor_arena, 512);
+
                 if (llama_init(&llama, &gguf_model, 256) == 0) {
                     model_ready = true;
                     /* Model loaded — inference available via 'chat' command.
                      * No auto-generate at boot (user runs it on demand). */
+                    if (g_tensor_arena.virt_base)
+                        tensor_arena_stats(&g_tensor_arena, "post-llama_init");
                 }
             }
 
