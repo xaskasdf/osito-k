@@ -449,8 +449,13 @@ void kernel_entry(boot_info_t *info)
         else crypto_selftest();  /* fallback: no AP available */
     }
 
-    /* ── Tensor compute self-test (uses SMP matvec internally, run after PCI) ── */
-    tensor_benchmark();
+    /* ── Tensor benchmark on AP + BAR mapping on BSP in parallel ── */
+    int tensor_ap;
+    {
+        extern int smp_submit_any(void (*)(void*, void*), void*, void*);
+        extern void tensor_benchmark_worker(void *, void *);
+        tensor_ap = smp_submit_any(tensor_benchmark_worker, NULL, NULL);
+    }
 
     /* ── Map PCI device BARs into page tables ── */
     typedef struct {
@@ -505,6 +510,13 @@ void kernel_entry(boot_info_t *info)
 
     /* Flush TLB after all MMIO mappings */
     __asm__ volatile ("mov %%cr3, %%rax; mov %%rax, %%cr3" ::: "rax", "memory");
+
+    /* Wait for tensor benchmark (was running on AP during BAR mapping) */
+    {
+        extern void smp_wait(int);
+        if (tensor_ap >= 0) smp_wait(tensor_ap);
+        else tensor_benchmark();
+    }
 
     /* GPU MMIO probe (Phase 1) */
     if (gpu && gpu->bar0_base) {

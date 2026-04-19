@@ -4,15 +4,32 @@
  * Linux-compatible io_uring for high-performance async I/O.
  * Submission Queue (SQ) + Completion Queue (CQ) in shared memory.
  * Supports: IORING_OP_READ, IORING_OP_WRITE, IORING_OP_NOP.
+ *
+ * File-backed READ/WRITE ops are offloaded to AP workers via the
+ * Chase-Lev work-stealing scheduler (smp_work.h). Non-file ops
+ * (pipes, devices, console) execute inline on the BSP.
  */
 
 #include "../include/types.h"
+#include "../include/fd.h"
 
 extern void serial_puts(const char *s);
 extern void serial_putdec(uint64_t val);
 extern void *mem_alloc_aligned(uint64_t size, uint64_t alignment);
 
-/* Dispatch through the main syscall handler for FD-aware I/O */
+/* SMP work-stealing API */
+extern int smp_submit_any(void (*func)(void*, void*), void *arg, void *result);
+extern void smp_wait(int task_id);
+extern int ap_worker_count;
+
+/* VFS direct I/O (bypasses fd_table — safe on APs) */
+extern int vfs_read(vfs_node_t *node, uint64_t offset, void *buf, uint64_t len);
+
+/* Per-process fd_table accessor (only valid on BSP) */
+extern fd_entry_t *syscall_fds(void);
+#define fd_table (syscall_fds())
+
+/* Dispatch through the main syscall handler for non-file FDs */
 extern int64_t syscall_dispatch(uint64_t nr, uint64_t a1, uint64_t a2,
                                 uint64_t a3, uint64_t a4, uint64_t a5,
                                 uint64_t a6);
@@ -53,14 +70,25 @@ typedef struct __attribute__((packed)) {
 #define IOURING_MAX       4
 #define IOURING_ENTRIES  64
 
-/* In-flight SQE slot for deferred/retried operations */
-#define IOURING_MAX_INFLIGHT 8
+/* In-flight SQE slot for async or deferred operations */
+#define IOURING_MAX_INFLIGHT 16
 
 typedef struct {
     bool            active;
     io_uring_sqe_t  sqe;
     uint8_t         retries;
+    /* Async offload fields */
+    int             smp_task_id;    /* -1 = not offloaded, >= 0 = on AP */
+    int32_t         result;         /* AP writes result here */
 } io_uring_inflight_t;
+
+/* AP worker argument — pre-resolved from fd_table on BSP */
+typedef struct {
+    vfs_node_t  node;       /* copy of VFS node */
+    uint64_t    offset;
+    void       *buf;
+    uint32_t    len;
+} iouring_vfs_arg_t;
 
 typedef struct {
     bool             active;
@@ -73,8 +101,10 @@ typedef struct {
     uint32_t         cq_head;
     uint32_t         cq_tail;
     uint32_t         entries;
-    /* In-flight: SQEs deferred due to -EAGAIN */
+    /* In-flight: SQEs offloaded to APs or deferred due to -EAGAIN */
     io_uring_inflight_t inflight[IOURING_MAX_INFLIGHT];
+    /* Per-slot AP worker args (static to avoid stack/heap alloc) */
+    iouring_vfs_arg_t   vfs_args[IOURING_MAX_INFLIGHT];
 } io_uring_t;
 
 static io_uring_t rings[IOURING_MAX];
@@ -99,6 +129,10 @@ int io_uring_setup(uint32_t entries)
             r->sq_head = r->sq_tail = 0;
             r->cq_head = r->cq_tail = 0;
             r->entries = entries;
+            for (int j = 0; j < IOURING_MAX_INFLIGHT; j++) {
+                r->inflight[j].active = false;
+                r->inflight[j].smp_task_id = -1;
+            }
             r->active = true;
             serial_puts("[IOURING] Created ring ");
             serial_putdec((uint64_t)i);
@@ -127,7 +161,7 @@ int io_uring_submit(int ring_idx, const io_uring_sqe_t *sqe)
     return 0;
 }
 
-/* ── Execute one SQE, return result ─────────────────────────── */
+/* ── Execute one SQE inline (for non-file or fallback) ─────── */
 
 static int32_t io_uring_exec_sqe(const io_uring_sqe_t *sqe)
 {
@@ -163,6 +197,62 @@ static int io_uring_post_cqe(io_uring_t *r, uint64_t user_data, int32_t res)
     return 0;
 }
 
+/* ── AP worker for VFS file reads ───────────────────────────── */
+
+static void iouring_vfs_read_worker(void *arg, void *result_ptr)
+{
+    iouring_vfs_arg_t *a = (iouring_vfs_arg_t *)arg;
+    int32_t *out = (int32_t *)result_ptr;
+    *out = (int32_t)vfs_read(&a->node, a->offset, a->buf, a->len);
+}
+
+/* ── Try to snapshot fd and offload to AP ───────────────────── */
+
+static bool io_uring_try_offload(io_uring_t *r, int slot,
+                                 const io_uring_sqe_t *sqe)
+{
+    if (ap_worker_count <= 0) return false;
+    if (sqe->opcode != IORING_OP_READ) return false;  /* only reads for now */
+
+    int32_t fd = sqe->fd;
+    if (fd < 0 || fd >= MAX_FDS || !fd_table[fd].open) return false;
+
+    fd_entry_t *f = &fd_table[fd];
+    if (f->type != FD_TYPE_FILE) return false;
+
+    /* Snapshot the VFS node and offset on BSP (fd_table is valid here) */
+    iouring_vfs_arg_t *varg = &r->vfs_args[slot];
+    varg->node = f->node;  /* struct copy — 32 bytes */
+    varg->buf  = (void *)sqe->addr;
+    varg->len  = sqe->len;
+
+    if (sqe->off != 0 && sqe->off != (uint64_t)-1) {
+        varg->offset = sqe->off;
+    } else {
+        varg->offset = f->offset;
+        f->offset += sqe->len;  /* consume offset now (Linux semantics) */
+    }
+
+    io_uring_inflight_t *inf = &r->inflight[slot];
+    inf->sqe = *sqe;
+    inf->retries = 0;
+    inf->result = 0;
+    inf->active = true;
+
+    /* Submit to AP — result written to inf->result */
+    inf->smp_task_id = smp_submit_any(iouring_vfs_read_worker,
+                                       varg, &inf->result);
+    if (inf->smp_task_id < 0) {
+        /* All APs busy — undo offset advance and fall back to inline */
+        if (sqe->off == 0 || sqe->off == (uint64_t)-1)
+            f->offset -= sqe->len;
+        inf->active = false;
+        return false;
+    }
+
+    return true;  /* offloaded */
+}
+
 /* ── Process (execute pending SQEs) ──────────────────────────── */
 
 #define EAGAIN 11
@@ -177,10 +267,27 @@ int io_uring_process(int ring_idx)
 
     int processed = 0;
 
-    /* Phase 1: retry deferred in-flight SQEs */
+    /* Phase 1: reap completed async operations from APs */
     for (int i = 0; i < IOURING_MAX_INFLIGHT; i++) {
         io_uring_inflight_t *inf = &r->inflight[i];
-        if (!inf->active) continue;
+        if (!inf->active || inf->smp_task_id < 0) continue;
+
+        /* Check if AP has finished (non-blocking) */
+        extern bool smp_task_done(int task_id);
+        if (!smp_task_done(inf->smp_task_id)) continue;
+
+        /* Reap: post CQE with result, free task + slot */
+        smp_wait(inf->smp_task_id);  /* free the task slot */
+        io_uring_post_cqe(r, inf->sqe.user_data, inf->result);
+        inf->active = false;
+        inf->smp_task_id = -1;
+        processed++;
+    }
+
+    /* Phase 2: retry deferred in-flight SQEs (EAGAIN, not offloaded) */
+    for (int i = 0; i < IOURING_MAX_INFLIGHT; i++) {
+        io_uring_inflight_t *inf = &r->inflight[i];
+        if (!inf->active || inf->smp_task_id >= 0) continue;
 
         int32_t result = io_uring_exec_sqe(&inf->sqe);
         if (result == -EAGAIN && inf->retries < IOURING_MAX_RETRIES) {
@@ -192,28 +299,35 @@ int io_uring_process(int ring_idx)
         processed++;
     }
 
-    /* Phase 2: process new SQEs from submission queue */
+    /* Phase 3: process new SQEs from submission queue */
     int batch = 0;
     while (r->sq_head != r->sq_tail && batch < IOURING_BATCH_LIMIT) {
         io_uring_sqe_t *sqe = &r->sq[r->sq_head];
-        int32_t result = io_uring_exec_sqe(sqe);
 
-        if (result == -EAGAIN) {
-            /* Defer: find a free inflight slot */
-            int slot = -1;
-            for (int i = 0; i < IOURING_MAX_INFLIGHT; i++) {
-                if (!r->inflight[i].active) { slot = i; break; }
-            }
-            if (slot >= 0) {
+        /* Try async offload for file-backed reads */
+        int slot = -1;
+        for (int i = 0; i < IOURING_MAX_INFLIGHT; i++) {
+            if (!r->inflight[i].active) { slot = i; break; }
+        }
+
+        if (slot >= 0 && io_uring_try_offload(r, slot, sqe)) {
+            /* Offloaded to AP — will be reaped in Phase 1 next call */
+        } else {
+            /* Inline execution: NOP, non-file FDs, AP-busy fallback */
+            int32_t result = io_uring_exec_sqe(sqe);
+
+            if (result == -EAGAIN && slot >= 0) {
+                /* Defer: use the inflight slot for retry */
                 r->inflight[slot].sqe = *sqe;
                 r->inflight[slot].retries = 0;
+                r->inflight[slot].smp_task_id = -1;
                 r->inflight[slot].active = true;
-            } else {
+            } else if (result == -EAGAIN) {
                 /* No inflight slots — return EAGAIN to caller */
                 io_uring_post_cqe(r, sqe->user_data, -EAGAIN);
+            } else {
+                io_uring_post_cqe(r, sqe->user_data, result);
             }
-        } else {
-            io_uring_post_cqe(r, sqe->user_data, result);
         }
 
         r->sq_head = (r->sq_head + 1) % r->entries;

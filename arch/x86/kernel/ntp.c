@@ -121,8 +121,8 @@ int ntp_sync(void)
         /* Wait for response (2s timeout = 200 ticks) */
         uint64_t start = idt_get_ticks();
         while (!ntp_got_reply && (idt_get_ticks() - start) < 200) {
-            net_poll();
-            __asm__ volatile ("hlt");
+            extern void net_poll_wait(void);
+            net_poll_wait();
         }
 
         if (ntp_got_reply) break;

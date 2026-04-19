@@ -863,6 +863,16 @@ void sched_tick(void *frame_ptr)
         }
     }
 
+    /* Drive network stack if any process is blocked on net I/O.
+     * net_poll() has a reentrancy guard (in_net_poll) so this is safe
+     * even if the interrupted process was inside net_poll(). */
+    {
+        extern bool net_has_active_waiters(void);
+        extern void net_poll(void);
+        if (net_has_active_waiters())
+            net_poll();
+    }
+
     /* Load next process */
     process_t *next = &proctab[next_idx];
 
@@ -1013,6 +1023,27 @@ void sched_yield(void)
 
 uint64_t sched_get_switches(void) { return sched_switches; }
 bool sched_is_enabled(void) { return sched_enabled; }
+
+/* ── Net-blocking helpers ───────────────────────────────────────
+ * Used by net.c to block the current process while waiting for
+ * network events (ARP replies, TCP handshakes, data arrival).
+ * The packet handler (handle_tcp/handle_arp) calls sched_unblock()
+ * to wake the process when the expected event occurs.
+ */
+int sched_block_current(void)
+{
+    if (!sched_enabled || sched_current_idx < 0) return -1;
+    proctab[sched_current_idx].state = PROC_BLOCKED;
+    __asm__ volatile ("mfence" ::: "memory");
+    return sched_current_idx;
+}
+
+void sched_unblock(int proc_idx)
+{
+    if (proc_idx >= 0 && proc_idx < MAX_PROCESSES &&
+        proctab[proc_idx].state == PROC_BLOCKED)
+        proctab[proc_idx].state = PROC_READY;
+}
 
 /* ── Test threads (used by shell 'sched' command) ────────────── */
 

@@ -630,6 +630,16 @@ int llama_forward(llama_state_t *s, uint32_t token)
 
         /* Residual connection */
         vec_add(s->x, s->x, s->xb, dim);
+
+        /* Prefetch next layer's weights into cache while we loop back.
+         * The attn_q weight matrix is the first thing accessed in the
+         * next iteration — prefetch its start and the norm weights. */
+        if (l + 1 < s->n_layers) {
+            llama_layer_t *next = &s->weights.layers[l + 1];
+            __builtin_prefetch(norm_data(next->attn_norm), 0, 1);
+            __builtin_prefetch(next->attn_q->data, 0, 0);
+            __builtin_prefetch(next->attn_k->data, 0, 0);
+        }
     }
 
     /* ── Final norm + logits ── */

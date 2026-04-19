@@ -314,6 +314,28 @@ static void build_render_order(void)
 
 /* ── Blit Window to Back Buffer ──────────────────────────────── */
 
+/* Band-parallel blit worker — same pattern as scaleblit_worker */
+typedef struct {
+    uint32_t       *dst;
+    uint32_t        dst_pitch;
+    const uint32_t *src;
+    uint32_t        src_width;
+    int32_t         sx, sy, dx, dy;
+    int32_t         bw;
+    int32_t         y_start, y_end;
+} blit_band_arg_t;
+
+static void blit_band_worker(void *arg, void *result)
+{
+    (void)result;
+    blit_band_arg_t *a = (blit_band_arg_t *)arg;
+    for (int32_t y = a->y_start; y < a->y_end; y++) {
+        uint32_t *d = a->dst + (uint32_t)(a->dy + y) * a->dst_pitch + (uint32_t)a->dx;
+        const uint32_t *s = a->src + (uint32_t)(a->sy + y) * a->src_width + (uint32_t)a->sx;
+        memcpy(d, s, (uint64_t)a->bw * sizeof(uint32_t));
+    }
+}
+
 static void blit_window(uint32_t *dst, uint32_t dst_pitch,
                         uint32_t dst_w, uint32_t dst_h,
                         const window_t *w)
@@ -331,11 +353,41 @@ static void blit_window(uint32_t *dst, uint32_t dst_pitch,
     if (dy + bh > (int32_t)dst_h) bh = (int32_t)dst_h - dy;
     if (bw <= 0 || bh <= 0) return;
 
-    /* Fast opaque blit (scanline memcpy) */
-    for (int32_t y = 0; y < bh; y++) {
-        uint32_t *d = dst + ((uint32_t)(dy + y)) * dst_pitch + (uint32_t)dx;
-        const uint32_t *s = w->pixels + ((uint32_t)(sy + y)) * w->width + (uint32_t)sx;
-        memcpy(d, s, (uint64_t)bw * sizeof(uint32_t));
+    extern int ap_worker_count;
+
+    if (bh >= 256 && ap_worker_count > 0) {
+        /* Parallel blit: split scanlines into bands across APs + BSP */
+        extern int smp_submit_any(void (*)(void*, void*), void*, void*);
+        extern void smp_wait(int);
+
+        int n_ap = ap_worker_count;
+        if (n_ap > 2) n_ap = 2;  /* diminishing returns for memcpy */
+        int32_t band = bh / (n_ap + 1);
+        static blit_band_arg_t bb_args[2];
+        int bb_ids[2];
+
+        for (int i = 0; i < n_ap; i++) {
+            bb_args[i] = (blit_band_arg_t){
+                dst, dst_pitch, w->pixels, w->width,
+                sx, sy, dx, dy, bw, i * band, (i + 1) * band
+            };
+            bb_ids[i] = smp_submit_any(blit_band_worker, &bb_args[i], NULL);
+        }
+        /* BSP handles remainder */
+        for (int32_t y = n_ap * band; y < bh; y++) {
+            uint32_t *d = dst + (uint32_t)(dy + y) * dst_pitch + (uint32_t)dx;
+            const uint32_t *s = w->pixels + (uint32_t)(sy + y) * w->width + (uint32_t)sx;
+            memcpy(d, s, (uint64_t)bw * sizeof(uint32_t));
+        }
+        for (int i = 0; i < n_ap; i++)
+            if (bb_ids[i] >= 0) smp_wait(bb_ids[i]);
+    } else {
+        /* Serial blit (small windows or no APs) */
+        for (int32_t y = 0; y < bh; y++) {
+            uint32_t *d = dst + ((uint32_t)(dy + y)) * dst_pitch + (uint32_t)dx;
+            const uint32_t *s = w->pixels + ((uint32_t)(sy + y)) * w->width + (uint32_t)sx;
+            memcpy(d, s, (uint64_t)bw * sizeof(uint32_t));
+        }
     }
 }
 

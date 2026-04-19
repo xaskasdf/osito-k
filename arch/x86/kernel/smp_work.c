@@ -272,6 +272,14 @@ void smp_wait(int task_id)
     task_free((uint32_t)task_id);
 }
 
+/* Non-blocking check: has this task completed?
+ * Used by io_uring to poll for async completion without blocking. */
+bool smp_task_done(int task_id)
+{
+    if (task_id < 0 || task_id >= TASK_POOL_SIZE) return true;
+    return __atomic_load_n(&task_pool[task_id].completed, __ATOMIC_ACQUIRE);
+}
+
 void smp_barrier(void)
 {
     ws_cpu_t *me = &ws_cpus[current_cpu()];

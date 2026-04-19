@@ -572,6 +572,13 @@ static uint32_t pages_for(uint32_t bytes)
     return (bytes + PAGE_SZ - 1) / PAGE_SZ;
 }
 
+/* SMP worker wrapper for boot parallelism (called from main.c) */
+void tensor_benchmark_worker(void *arg, void *result)
+{
+    (void)arg; (void)result;
+    tensor_benchmark();
+}
+
 void tensor_benchmark(void)
 {
     serial_puts("\n[TENSOR] === Tensor Compute Engine ===\n");

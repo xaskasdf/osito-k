@@ -224,8 +224,8 @@ int dhcp_discover(void)
         /* Wait for OFFER (3s timeout = 300 ticks at 100Hz) */
         uint64_t start = idt_get_ticks();
         while (!dhcp_got_reply && (idt_get_ticks() - start) < 300) {
-            net_poll();
-            __asm__ volatile ("hlt");
+            extern void net_poll_wait(void);
+            net_poll_wait();
         }
 
         if (dhcp_got_reply && dhcp_msg_type == DHCP_OFFER) {
@@ -254,8 +254,8 @@ int dhcp_discover(void)
     /* Wait for ACK (3s timeout) */
     uint64_t start = idt_get_ticks();
     while (!dhcp_got_reply && (idt_get_ticks() - start) < 300) {
-        net_poll();
-        __asm__ volatile ("hlt");
+        extern void net_poll_wait(void);
+        net_poll_wait();
     }
 
     if (!dhcp_got_reply || dhcp_msg_type != DHCP_ACK) {
@@ -322,8 +322,8 @@ void dhcp_check_renewal(void)
     /* Brief wait for ACK (1s) */
     uint64_t start = idt_get_ticks();
     while (!dhcp_got_reply && (idt_get_ticks() - start) < 100) {
-        net_poll();
-        __asm__ volatile ("hlt");
+        extern void net_poll_wait(void);
+        net_poll_wait();
     }
 
     if (dhcp_got_reply && dhcp_msg_type == DHCP_ACK) {

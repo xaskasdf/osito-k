@@ -62,6 +62,81 @@ typedef struct {
 static udp_listener_t udp_listeners[MAX_UDP_LISTENERS];
 static int udp_listener_count;
 
+/* ── Scheduler integration (for async net) ──────────────────── */
+
+extern bool sched_is_enabled(void);
+extern void sched_yield(void);
+extern int  sched_block_current(void);  /* returns proc_idx, sets PROC_BLOCKED */
+extern void sched_unblock(int proc_idx);
+
+/* ── Net waiter table (PROC_BLOCKED wakeup from packet handlers) ── */
+
+#define NET_MAX_WAITERS 16
+
+typedef enum {
+    NETWAIT_NONE = 0,
+    NETWAIT_ARP,
+    NETWAIT_TCP_ESTABLISHED,
+    NETWAIT_TCP_RX,
+    NETWAIT_TCP_CLOSED,
+    NETWAIT_TCP_ACCEPT,
+} netwait_type_t;
+
+typedef struct {
+    netwait_type_t type;
+    int            target;      /* conn_idx, listener_idx, or -1 for ARP */
+    int            proc_idx;    /* index in proctab[] to wake */
+    uint64_t       deadline;    /* absolute tick deadline */
+} net_waiter_t;
+
+static net_waiter_t net_waiters[NET_MAX_WAITERS];
+static volatile int net_waiter_count;
+
+static int net_waiter_register(netwait_type_t type, int target,
+                               uint64_t deadline)
+{
+    int pidx = sched_block_current();
+    if (pidx < 0) return -1;
+    for (int i = 0; i < NET_MAX_WAITERS; i++) {
+        if (net_waiters[i].type == NETWAIT_NONE) {
+            net_waiters[i].type = type;
+            net_waiters[i].target = target;
+            net_waiters[i].proc_idx = pidx;
+            net_waiters[i].deadline = deadline;
+            __sync_fetch_and_add(&net_waiter_count, 1);
+            return i;
+        }
+    }
+    /* No free slot — unblock ourselves */
+    sched_unblock(pidx);
+    return -1;
+}
+
+static void net_waiter_clear(int slot)
+{
+    if (slot >= 0 && slot < NET_MAX_WAITERS &&
+        net_waiters[slot].type != NETWAIT_NONE) {
+        net_waiters[slot].type = NETWAIT_NONE;
+        __sync_fetch_and_sub(&net_waiter_count, 1);
+    }
+}
+
+/* Wake all waiters matching type+target */
+static void net_waiter_wake(netwait_type_t type, int target)
+{
+    for (int i = 0; i < NET_MAX_WAITERS; i++) {
+        if (net_waiters[i].type == type &&
+            (target < 0 || net_waiters[i].target == target)) {
+            sched_unblock(net_waiters[i].proc_idx);
+            net_waiters[i].type = NETWAIT_NONE;
+            __sync_fetch_and_sub(&net_waiter_count, 1);
+        }
+    }
+}
+
+/* Called by sched_tick to check if net_poll should be invoked */
+bool net_has_active_waiters(void) { return net_waiter_count > 0; }
+
 /* ── Forward declarations ────────────────────────────────────── */
 
 static void net_async_check(void);
@@ -252,6 +327,9 @@ static void handle_arp(const uint8_t *pkt, uint32_t len)
 
     /* Always learn sender */
     arp_update(arp->spa, arp->sha);
+
+    /* Wake any process blocked on ARP resolution */
+    net_waiter_wake(NETWAIT_ARP, -1);  /* -1 = wake all ARP waiters */
 
     if (ntohs(arp->oper) == ARP_OP_REQUEST && ip_eq(arp->tpa, our_ip)) {
         /* ARP request for our IP — send reply */
@@ -560,8 +638,14 @@ static int tcp_send_segment(tcp_conn_t *conn, uint8_t flags,
 
 /* ── Poll for Incoming Packets ───────────────────────────────── */
 
+static volatile bool in_net_poll;
+
 void net_poll(void)
 {
+    /* Reentrancy guard: sched_tick may call net_poll() while a process
+     * is already inside it.  Skip if we're already polling. */
+    if (__sync_lock_test_and_set(&in_net_poll, 1)) return;
+
     uint32_t len = 0;
 
     while (i211_recv(rx_pkt, &len) == 0) {
@@ -620,6 +704,19 @@ void net_poll(void)
 
     /* Advance async operations (DNS wait, ARP wait, SYN wait) */
     net_async_check();
+
+    __sync_lock_release(&in_net_poll);
+}
+
+/* ── Scheduler-aware poll+yield ─────────────────────────────── */
+
+void net_poll_wait(void)
+{
+    net_poll();
+    if (sched_is_enabled())
+        sched_yield();
+    else
+        __asm__ volatile ("hlt");
 }
 
 /* ── Send UDP Datagram ───────────────────────────────────────── */
@@ -898,6 +995,9 @@ static void handle_tcp(const uint8_t *src_ip, const uint8_t *pkt, uint32_t len)
         serial_putdec(conn_idx);
         serial_puts("\n");
         conn->state = TCP_CLOSED;
+        net_waiter_wake(NETWAIT_TCP_CLOSED, conn_idx);
+        net_waiter_wake(NETWAIT_TCP_ESTABLISHED, conn_idx);
+        net_waiter_wake(NETWAIT_TCP_RX, conn_idx);
         return;
     }
 
@@ -907,6 +1007,8 @@ static void handle_tcp(const uint8_t *src_ip, const uint8_t *pkt, uint32_t len)
         if ((flags & TCP_ACK) && ack == conn->snd_nxt) {
             conn->snd_una = ack;
             conn->state = TCP_ESTABLISHED;
+            net_waiter_wake(NETWAIT_TCP_ESTABLISHED, conn_idx);
+            net_waiter_wake(NETWAIT_TCP_ACCEPT, -1);  /* wake all accept waiters */
             serial_puts("[TCP] Accepted (conn ");
             serial_putdec(conn_idx);
             serial_puts(")\n");
@@ -920,6 +1022,7 @@ static void handle_tcp(const uint8_t *src_ip, const uint8_t *pkt, uint32_t len)
                 conn->rcv_nxt = seq + 1;
                 conn->snd_una = ack;
                 conn->state = TCP_ESTABLISHED;
+                net_waiter_wake(NETWAIT_TCP_ESTABLISHED, conn_idx);
                 /* Send ACK */
                 tcp_send_segment(conn, TCP_ACK, NULL, 0);
                 serial_puts("[TCP] Connected (conn ");
@@ -976,6 +1079,8 @@ static void handle_tcp(const uint8_t *src_ip, const uint8_t *pkt, uint32_t len)
             conn->rcv_nxt += data_len;
             /* ACK the data */
             tcp_send_segment(conn, TCP_ACK, NULL, 0);
+            /* Wake any process blocked on recv */
+            net_waiter_wake(NETWAIT_TCP_RX, conn_idx);
         }
 
         /* FIN from remote */
@@ -983,6 +1088,8 @@ static void handle_tcp(const uint8_t *src_ip, const uint8_t *pkt, uint32_t len)
             conn->rcv_nxt = seq + data_len + 1;
             conn->state = TCP_CLOSE_WAIT;
             tcp_send_segment(conn, TCP_ACK, NULL, 0);
+            net_waiter_wake(NETWAIT_TCP_RX, conn_idx);
+            net_waiter_wake(NETWAIT_TCP_CLOSED, conn_idx);
             serial_puts("[TCP] Remote FIN (conn ");
             serial_putdec(conn_idx);
             serial_puts(")\n");
@@ -1009,12 +1116,14 @@ static void handle_tcp(const uint8_t *src_ip, const uint8_t *pkt, uint32_t len)
             conn->rcv_nxt = seq + data_len + 1;
             conn->state = TCP_TIME_WAIT;
             tcp_send_segment(conn, TCP_ACK, NULL, 0);
+            net_waiter_wake(NETWAIT_TCP_CLOSED, conn_idx);
         } else if (flags & TCP_ACK) {
             conn->state = TCP_FIN_WAIT_2;
         } else if (flags & TCP_FIN) {
             conn->rcv_nxt = seq + data_len + 1;
             conn->state = TCP_TIME_WAIT;
             tcp_send_segment(conn, TCP_ACK, NULL, 0);
+            net_waiter_wake(NETWAIT_TCP_CLOSED, conn_idx);
         }
         break;
 
@@ -1034,12 +1143,14 @@ static void handle_tcp(const uint8_t *src_ip, const uint8_t *pkt, uint32_t len)
             conn->rcv_nxt = seq + data_len + 1;
             conn->state = TCP_TIME_WAIT;
             tcp_send_segment(conn, TCP_ACK, NULL, 0);
+            net_waiter_wake(NETWAIT_TCP_CLOSED, conn_idx);
         }
         break;
 
     case TCP_LAST_ACK:
         if ((flags & TCP_ACK) && ack == conn->snd_nxt) {
             conn->state = TCP_CLOSED;
+            net_waiter_wake(NETWAIT_TCP_CLOSED, conn_idx);
             serial_puts("[TCP] Closed (conn ");
             serial_putdec(conn_idx);
             serial_puts(")\n");
@@ -1085,9 +1196,17 @@ int net_tcp_connect(const uint8_t dst_ip[4], uint16_t dst_port,
         arp_send_request(nexthop);
         /* Poll for ARP reply (2s timeout, 200 ticks) */
         uint64_t arp_start = idt_get_ticks();
-        while (!arp_lookup(nexthop) && (idt_get_ticks() - arp_start) < 200) {
-            net_poll();
-            __asm__ volatile ("hlt");
+        uint64_t arp_deadline = arp_start + 200;
+        if (sched_is_enabled()) {
+            int slot = net_waiter_register(NETWAIT_ARP, -1, arp_deadline);
+            if (slot >= 0) {
+                while (!arp_lookup(nexthop) && idt_get_ticks() < arp_deadline)
+                    __asm__ volatile ("sti; hlt; cli" ::: "memory");
+                net_waiter_clear(slot);
+            }
+        } else {
+            while (!arp_lookup(nexthop) && idt_get_ticks() < arp_deadline)
+                net_poll_wait();
         }
         if (!arp_lookup(nexthop)) {
             serial_puts("[TCP] ARP timeout for ");
@@ -1127,9 +1246,18 @@ int net_tcp_connect(const uint8_t dst_ip[4], uint16_t dst_port,
 
     /* Wait for SYN-ACK (5s timeout = 500 ticks at 100Hz) */
     uint64_t start = idt_get_ticks();
-    while (conn->state == TCP_SYN_SENT && (idt_get_ticks() - start) < 500) {
-        net_poll();
-        __asm__ volatile ("hlt");
+    uint64_t syn_deadline = start + 500;
+    if (sched_is_enabled()) {
+        int slot = net_waiter_register(NETWAIT_TCP_ESTABLISHED, idx,
+                                       syn_deadline);
+        if (slot >= 0) {
+            while (conn->state == TCP_SYN_SENT && idt_get_ticks() < syn_deadline)
+                __asm__ volatile ("sti; hlt; cli" ::: "memory");
+            net_waiter_clear(slot);
+        }
+    } else {
+        while (conn->state == TCP_SYN_SENT && idt_get_ticks() < syn_deadline)
+            net_poll_wait();
     }
 
     if (conn->state != TCP_ESTABLISHED) {
@@ -1217,16 +1345,42 @@ int net_tcp_recv_timeout(int conn_idx, void *buf, uint32_t buf_size,
     if (conn_idx < 0 || conn_idx >= TCP_MAX_CONNS)
         return -1;
 
-    uint64_t start = idt_get_ticks();
+    uint64_t deadline = idt_get_ticks() + timeout_ticks;
 
-    while ((idt_get_ticks() - start) < timeout_ticks) {
+    while (idt_get_ticks() < deadline) {
         net_poll();
 
         int r = net_tcp_recv(conn_idx, buf, buf_size);
         if (r != 0)
             return r;  /* Data or closed */
 
-        __asm__ volatile ("hlt");
+        if (sched_is_enabled()) {
+            int slot = net_waiter_register(NETWAIT_TCP_RX, conn_idx, deadline);
+            if (slot >= 0) {
+                /* PROC_BLOCKED — scheduler runs other procs; woken by
+                 * handle_tcp when data arrives or by timeout in
+                 * net_async_check */
+                while (idt_get_ticks() < deadline) {
+                    __asm__ volatile ("sti; hlt; cli" ::: "memory");
+                    net_poll();
+                    r = net_tcp_recv(conn_idx, buf, buf_size);
+                    if (r != 0) { net_waiter_clear(slot); return r; }
+                    /* If we were woken but no data yet, re-register */
+                    if (net_waiters[slot].type == NETWAIT_NONE) {
+                        /* Waiter was cleared (wakeup or timeout) */
+                        break;
+                    }
+                }
+                net_waiter_clear(slot);
+                /* Re-check after wakeup */
+                r = net_tcp_recv(conn_idx, buf, buf_size);
+                if (r != 0) return r;
+            } else {
+                sched_yield();
+            }
+        } else {
+            __asm__ volatile ("hlt");
+        }
     }
 
     return 0;  /* Timeout */
@@ -1254,11 +1408,20 @@ void net_tcp_close(int conn_idx)
     }
 
     /* Wait for close to complete (3s = 300 ticks) */
-    uint64_t start = idt_get_ticks();
-    while (conn->state != TCP_CLOSED && conn->state != TCP_TIME_WAIT &&
-           (idt_get_ticks() - start) < 300) {
-        net_poll();
-        __asm__ volatile ("hlt");
+    uint64_t close_deadline = idt_get_ticks() + 300;
+    if (sched_is_enabled()) {
+        int slot = net_waiter_register(NETWAIT_TCP_CLOSED, conn_idx,
+                                       close_deadline);
+        if (slot >= 0) {
+            while (conn->state != TCP_CLOSED && conn->state != TCP_TIME_WAIT &&
+                   idt_get_ticks() < close_deadline)
+                __asm__ volatile ("sti; hlt; cli" ::: "memory");
+            net_waiter_clear(slot);
+        }
+    } else {
+        while (conn->state != TCP_CLOSED && conn->state != TCP_TIME_WAIT &&
+               idt_get_ticks() < close_deadline)
+            net_poll_wait();
     }
 
     /* TIME_WAIT → CLOSED immediately (we don't need 2MSL in bare-metal) */
@@ -1315,9 +1478,9 @@ int net_tcp_accept(int listener_idx, uint32_t timeout_ticks)
             listener->pending_conn = -1;
     }
 
-    uint64_t start = idt_get_ticks();
+    uint64_t accept_deadline = idt_get_ticks() + timeout_ticks;
 
-    while ((idt_get_ticks() - start) < timeout_ticks) {
+    while (idt_get_ticks() < accept_deadline) {
         net_poll();
 
         /* Check if a SYN was received and handshake is completing */
@@ -1327,7 +1490,28 @@ int net_tcp_accept(int listener_idx, uint32_t timeout_ticks)
             return pc;
         }
 
-        __asm__ volatile ("hlt");
+        if (sched_is_enabled()) {
+            int slot = net_waiter_register(NETWAIT_TCP_ACCEPT, listener_idx,
+                                           accept_deadline);
+            if (slot >= 0) {
+                while (idt_get_ticks() < accept_deadline) {
+                    __asm__ volatile ("sti; hlt; cli" ::: "memory");
+                    net_poll();
+                    pc = listener->pending_conn;
+                    if (pc >= 0 && tcp_conns[pc].state == TCP_ESTABLISHED) {
+                        net_waiter_clear(slot);
+                        listener->pending_conn = -1;
+                        return pc;
+                    }
+                    if (net_waiters[slot].type == NETWAIT_NONE) break;
+                }
+                net_waiter_clear(slot);
+            } else {
+                sched_yield();
+            }
+        } else {
+            __asm__ volatile ("hlt");
+        }
     }
 
     return -1;  /* Timeout */
@@ -1643,6 +1827,18 @@ static void net_async_check(void)
 
         default:
             break;
+        }
+    }
+
+    /* ── Check net waiter deadlines ─────────────────────────────── */
+    if (net_waiter_count > 0) {
+        for (int i = 0; i < NET_MAX_WAITERS; i++) {
+            if (net_waiters[i].type == NETWAIT_NONE) continue;
+            if (now >= net_waiters[i].deadline) {
+                sched_unblock(net_waiters[i].proc_idx);
+                net_waiters[i].type = NETWAIT_NONE;
+                __sync_fetch_and_sub(&net_waiter_count, 1);
+            }
         }
     }
 }
