@@ -147,6 +147,9 @@ typedef struct {
      * which slot the ISR touches next. */
     __attribute__((aligned(16))) uint8_t fpu_state[512];
 
+    /* Speculation analysis — populated at ELF load time (spec_analyze.c) */
+    void        *spec_info;          /* spec_analysis_t* or NULL */
+
     /* Debug: saved CS from frame at preemption time.
      * If this differs from frame[18] at restore time,
      * the frame was overwritten. */
@@ -316,6 +319,12 @@ void proc_add_region(void *base, uint64_t pages)
     p->regions[p->region_count].base = base;
     p->regions[p->region_count].pages = pages;
     p->region_count++;
+}
+
+void proc_set_spec_info(void *info)
+{
+    process_t *p = exec_target_proc ? exec_target_proc : current_proc;
+    if (p) p->spec_info = info;
 }
 
 /* ── Public API ──────────────────────────────────────────────── */

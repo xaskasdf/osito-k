@@ -1505,6 +1505,29 @@ int elf_exec(const char *filename, int argc, const char **argv)
         proc_add_region((void *)VIRT_TO_PHYS(loaded.stack_base),
                         USER_STACK_SIZE / 4096);
 
+    /* Analyze .text for speculation hints (basic blocks, loops, syscalls).
+     * Results stored in process_t for use by spec_prefetch and future TLS. */
+    {
+        extern int spec_analyze_text(uint64_t base, uint64_t size, void *out);
+        extern void *kmalloc(uint64_t size);
+        /* Use first PT_LOAD segment as .text approximation */
+        if (loaded.segment_count > 0 && loaded.entry) {
+            void *analysis = kmalloc(sizeof(uint64_t) * 16);  /* spec_analysis_t */
+            if (analysis) {
+                /* Analyze 64KB around entry point as a reasonable .text estimate */
+                uint64_t text_base = loaded.entry & ~0xFFFULL;
+                uint64_t text_size = 65536;
+                int blocks = spec_analyze_text(text_base, text_size, analysis);
+                if (blocks > 0) {
+                    extern void proc_set_spec_info(void *info);
+                    proc_set_spec_info(analysis);
+                } else {
+                    kfree(analysis);
+                }
+            }
+        }
+    }
+
     /* Jump to entry — does not return */
     elf_jump(loaded.entry, sp);
 
