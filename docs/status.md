@@ -11,6 +11,12 @@ preemptive scheduler, 4-level paging, 100+ Linux syscalls, three filesystem
 drivers (osfs2/osfs3 native + FAT32/ext2/NTFS host), full TCP/IP+TLS, SMP,
 Win32 PE compat, GUI compositor, GPU compute (RTX), self-hosting via TCC.
 
+### Final four — 2026-04-19 (commit 9dcdada)
+
+4 previously-deferred features now complete:
+syscall memoization with buffer replay, OsitoFS inline small files,
+speculative token decode loop integration, VDSO code thunks for GOT patching.
+
 ### Kernel subsystems — 2026-04-19 (commit 94dbe19)
 
 8 new kernel subsystems, 5 new source files, +953 lines:
