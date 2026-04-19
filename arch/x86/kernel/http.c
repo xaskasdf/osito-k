@@ -459,3 +459,135 @@ int http_read_body_full(http_session_t *s, const http_response_t *resp,
     if (r < 0) return -1;
     return (int)ctx.pos;
 }
+
+/* ══════════════════════════════════════════════════════════════
+ *  Async HTTP open — DNS → TCP → TLS callback chain
+ * ══════════════════════════════════════════════════════════════ */
+
+extern int net_dns_resolve_async(const char *, uint8_t *, void (*)(int, void*), void*);
+extern int net_tcp_connect_async(const uint8_t *, uint16_t, uint16_t,
+                                 void (*)(int, void*), void*);
+
+/* Private context threaded through the callback chain */
+typedef struct {
+    http_session_t *session;
+    const char     *hostname;
+    http_open_cb_t  done_cb;
+    void           *done_ctx;
+    uint8_t         resolved_ip[4];
+    uint16_t        src_port;
+} http_async_ctx_t;
+
+/* We use a small static pool (2 slots) since HTTP opens are rare */
+#define HTTP_ASYNC_SLOTS 2
+static http_async_ctx_t http_async_pool[HTTP_ASYNC_SLOTS];
+
+static http_async_ctx_t *http_async_alloc(void)
+{
+    for (int i = 0; i < HTTP_ASYNC_SLOTS; i++)
+        if (!http_async_pool[i].session) return &http_async_pool[i];
+    return NULL;
+}
+
+/* Phase 3: TLS handshake done (still synchronous — TLS is stateful) */
+static void http_async_tls_done(http_async_ctx_t *ac, int result)
+{
+    http_session_t *s = ac->session;
+    http_open_cb_t cb = ac->done_cb;
+    void *ctx = ac->done_ctx;
+
+    ac->session = NULL;  /* release slot */
+
+    if (result < 0) {
+        serial_puts("[HTTP-ASYNC] TLS failed\n");
+        net_tcp_close(s->tcp_conn);
+        if (cb) cb(-1, ctx);
+        return;
+    }
+
+    serial_puts("[HTTP-ASYNC] HTTPS ready\n");
+    s->connected = true;
+    if (cb) cb(0, ctx);
+}
+
+/* Phase 2: TCP connected → start TLS handshake */
+static void http_async_tcp_done(int result, void *arg)
+{
+    http_async_ctx_t *ac = (http_async_ctx_t *)arg;
+    http_session_t *s = ac->session;
+
+    if (result < 0) {
+        serial_puts("[HTTP-ASYNC] TCP connect failed\n");
+        http_open_cb_t cb = ac->done_cb;
+        void *ctx = ac->done_ctx;
+        ac->session = NULL;
+        if (cb) cb(-1, ctx);
+        return;
+    }
+
+    s->tcp_conn = result;
+    serial_puts("[HTTP-ASYNC] TCP connected, starting TLS...\n");
+
+    /* TLS handshake is still synchronous (complex state machine).
+     * This blocks briefly but DNS+TCP were async. */
+    int tls_result = tls_connect(&s->tls, s->tcp_conn, ac->hostname);
+    http_async_tls_done(ac, tls_result);
+}
+
+/* Phase 1: DNS resolved → start TCP connect */
+static void http_async_dns_done(int result, void *arg)
+{
+    http_async_ctx_t *ac = (http_async_ctx_t *)arg;
+
+    if (result < 0) {
+        serial_puts("[HTTP-ASYNC] DNS failed\n");
+        http_open_cb_t cb = ac->done_cb;
+        void *ctx = ac->done_ctx;
+        ac->session = NULL;
+        if (cb) cb(-1, ctx);
+        return;
+    }
+
+    serial_puts("[HTTP-ASYNC] DNS resolved: ");
+    serial_putdec(ac->resolved_ip[0]); serial_puts(".");
+    serial_putdec(ac->resolved_ip[1]); serial_puts(".");
+    serial_putdec(ac->resolved_ip[2]); serial_puts(".");
+    serial_putdec(ac->resolved_ip[3]); serial_puts("\n");
+
+    /* Start async TCP connect */
+    if (net_tcp_connect_async(ac->resolved_ip, 443, ac->src_port,
+                              http_async_tcp_done, ac) < 0) {
+        serial_puts("[HTTP-ASYNC] TCP connect queue failed\n");
+        http_open_cb_t cb = ac->done_cb;
+        void *ctx = ac->done_ctx;
+        ac->session = NULL;
+        if (cb) cb(-1, ctx);
+    }
+}
+
+int http_open_async(http_session_t *s, const char *hostname,
+                    http_open_cb_t cb, void *ctx)
+{
+    hmemset(s, 0, sizeof(*s));
+
+    http_async_ctx_t *ac = http_async_alloc();
+    if (!ac) return -1;
+
+    ac->session  = s;
+    ac->hostname = hostname;
+    ac->done_cb  = cb;
+    ac->done_ctx = ctx;
+    ac->src_port = next_port++;
+
+    serial_puts("[HTTP-ASYNC] Resolving ");
+    serial_puts(hostname);
+    serial_puts("...\n");
+
+    if (net_dns_resolve_async(hostname, ac->resolved_ip,
+                              http_async_dns_done, ac) < 0) {
+        ac->session = NULL;
+        return -1;
+    }
+
+    return 0;
+}

@@ -1090,3 +1090,10 @@ int crypto_selftest(void)
 
     return fail;
 }
+
+/* SMP wrapper for boot-time parallel crypto selftest on AP */
+void boot_crypto_worker(void *arg, void *result)
+{
+    (void)arg; (void)result;
+    crypto_selftest();
+}

@@ -500,6 +500,15 @@ void proc_exit(int32_t code)
         /* DON'T free memory regions here — we're still running on the
          * user stack (SYSCALL doesn't switch stacks in ring-0 OS).
          * proc_wait4 handles all cleanup after the process is reaped. */
+
+        /* Wake parent if it's blocked in wait4 */
+        for (int i = 0; i < MAX_PROCESSES; i++) {
+            if (proctab[i].pid == p->ppid && proctab[i].state == PROC_BLOCKED) {
+                proctab[i].state = PROC_READY;
+                break;
+            }
+        }
+
         /* Halt — scheduler will pick another process on next tick */
         __asm__ volatile ("sti");
         for (;;) __asm__ volatile ("hlt");
@@ -811,29 +820,42 @@ void sched_tick(void *frame_ptr)
         if ((now & 0xFF) == 0) {  /* ~every 2.5 seconds */
             extern int smp_submit_any(void (*)(void*, void*), void*, void*);
             extern int ap_worker_count;
+
+            /* Pool of arg blocks — fixes single-static-arg race where
+             * two eligible processes in the same tick clobber each other's
+             * args before the AP reads them. */
+            #define MC_SLOTS 4
+            static struct mc_arg_s {
+                uint32_t pid; void *base; uint64_t pages;
+                volatile int in_use;
+            } mc_args[MC_SLOTS];
+
             for (int i = 0; i < MAX_PROCESSES; i++) {
                 process_t *p = &proctab[i];
                 if (p->state == PROC_BLOCKED && !p->pages_compressed &&
                     p->last_active_tick > 0 &&
                     (now - p->last_active_tick) > memcompress_idle_threshold()) {
-                    /* Offload compression to an AP worker if available,
-                     * otherwise compress inline (fallback for single-CPU). */
                     if (ap_worker_count > 0) {
-                        /* Pack pid + first region into a static arg block.
-                         * AP will call memcompress_process_pages for us. */
-                        static struct { uint32_t pid; void *base; uint64_t pages; } mc_arg;
-                        mc_arg.pid = p->pid;
-                        mc_arg.base = (p->region_count > 0) ? p->regions[0].base : 0;
-                        mc_arg.pages = (p->region_count > 0) ? p->regions[0].pages : 0;
-                        extern void memcompress_worker(void *arg, void *result);
-                        smp_submit_any(memcompress_worker, &mc_arg, 0);
-                    } else {
-                        for (int r = 0; r < p->region_count; r++) {
-                            if (p->regions[r].base && p->regions[r].pages > 0)
-                                memcompress_process_pages(p->pid,
-                                    p->regions[r].base, p->regions[r].pages);
+                        /* Find a free arg slot */
+                        int slot = -1;
+                        for (int s = 0; s < MC_SLOTS; s++) {
+                            if (__sync_lock_test_and_set(&mc_args[s].in_use, 1) == 0) {
+                                slot = s;
+                                break;
+                            }
                         }
+                        if (slot < 0) break;  /* all slots busy, retry next cycle */
+
+                        mc_args[slot].pid = p->pid;
+                        mc_args[slot].base = (p->region_count > 0) ? p->regions[0].base : 0;
+                        mc_args[slot].pages = (p->region_count > 0) ? p->regions[0].pages : 0;
+                        extern void memcompress_worker(void *arg, void *result);
+                        if (smp_submit_any(memcompress_worker, &mc_args[slot], 0) < 0)
+                            __sync_lock_release(&mc_args[slot].in_use);  /* no AP free */
                     }
+                    /* No inline fallback — never compress inside the ISR.
+                     * Single-CPU systems skip compression entirely (acceptable:
+                     * compression is an optimization, not a correctness requirement). */
                     p->pages_compressed = true;
                 }
             }
@@ -1592,45 +1614,62 @@ int32_t proc_wait4(int32_t pid, int *wstatus, int options)
     if (options & WNOHANG)
         return 0;
 
-    /* Blocking wait: poll until a child becomes ZOMBIE.
-     * SYSCALL entry disables interrupts (FMASK clears IF).
-     * We MUST enable them so the scheduler can run the child.
-     * STI + HLT + CLI: allow one timer tick, then re-disable.
-     * "memory" clobber forces the compiler to re-read proctab
-     * from memory after each tick (state changes via scheduler). */
-    for (int tries = 0; tries < 10000; tries++) {
-        __asm__ volatile ("sti; hlt; cli" ::: "memory");
+    /* Event-driven wait: block this process and let proc_exit() wake us
+     * when a child becomes ZOMBIE, instead of polling every tick. */
+    current_proc->state = PROC_BLOCKED;
+    __asm__ volatile ("mfence" ::: "memory");
 
+    /* Re-scan immediately: a child may have exited between the initial
+     * scan above and our PROC_BLOCKED assignment (close the race window). */
+    {
+        bool found_early = false;
         for (int i = 0; i < MAX_PROCESSES; i++) {
             if (proctab[i].state != PROC_ZOMBIE) continue;
             if (proctab[i].ppid != my_pid) continue;
             if (pid > 0 && proctab[i].pid != (uint32_t)pid) continue;
-
-            int32_t child_pid = (int32_t)proctab[i].pid;
-            if (wstatus)
-                *wstatus = (proctab[i].exit_code & 0xFF) << 8;
-
-            proctab[i].state = PROC_FREE;
-            /* Free memory regions (user stack, ELF segments) */
-            for (int r = 0; r < proctab[i].region_count; r++) {
-                if (proctab[i].regions[r].base &&
-                    proctab[i].regions[r].pages > 0)
-                    mem_free_pages(proctab[i].regions[r].base,
-                                   proctab[i].regions[r].pages);
-            }
-            proctab[i].region_count = 0;
-            if (proctab[i].kernel_stack) {
-                mem_free_pages((void *)VIRT_TO_PHYS(proctab[i].kernel_stack),
-                               KERNEL_STACK_SIZE / 4096);
-                proctab[i].kernel_stack = NULL;
-            }
-
-            /* Restore parent's RW data and brk heap after reaping forked child */
-            elf_fork_restore();
-            syscall_restore_brk();
-
-            return child_pid;
+            found_early = true;
+            break;
         }
+        if (!found_early) {
+            /* Sleep until proc_exit() sets us back to PROC_READY.
+             * Keep the 10000-tick safety timeout (~100s) to avoid permanent hang
+             * if a child is killed without going through proc_exit(). */
+            for (int tries = 0; tries < 10000; tries++) {
+                __asm__ volatile ("sti; hlt; cli" ::: "memory");
+                if (current_proc->state == PROC_READY) break;
+            }
+        }
+    }
+    current_proc->state = PROC_READY;
+
+    /* Scan for the zombie child */
+    for (int i = 0; i < MAX_PROCESSES; i++) {
+        if (proctab[i].state != PROC_ZOMBIE) continue;
+        if (proctab[i].ppid != my_pid) continue;
+        if (pid > 0 && proctab[i].pid != (uint32_t)pid) continue;
+
+        int32_t child_pid = (int32_t)proctab[i].pid;
+        if (wstatus)
+            *wstatus = (proctab[i].exit_code & 0xFF) << 8;
+
+        proctab[i].state = PROC_FREE;
+        for (int r = 0; r < proctab[i].region_count; r++) {
+            if (proctab[i].regions[r].base &&
+                proctab[i].regions[r].pages > 0)
+                mem_free_pages(proctab[i].regions[r].base,
+                               proctab[i].regions[r].pages);
+        }
+        proctab[i].region_count = 0;
+        if (proctab[i].kernel_stack) {
+            mem_free_pages((void *)VIRT_TO_PHYS(proctab[i].kernel_stack),
+                           KERNEL_STACK_SIZE / 4096);
+            proctab[i].kernel_stack = NULL;
+        }
+
+        elf_fork_restore();
+        syscall_restore_brk();
+
+        return child_pid;
     }
 
     return -ECHILD;

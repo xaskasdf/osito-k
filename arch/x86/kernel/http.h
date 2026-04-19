@@ -81,4 +81,15 @@ void http_close(http_session_t *s);
  * Returns pointer to value string, or NULL if not found. */
 const char *http_get_header(const http_response_t *resp, const char *name);
 
+/* ── Async HTTP API ─────────────────────────────────────────── */
+
+typedef void (*http_open_cb_t)(int result, void *ctx);
+
+/* Async version of http_open: DNS → TCP → TLS as callback chain.
+ * Calls cb(0, ctx) on success, cb(-1, ctx) on failure.
+ * hostname must remain valid until callback fires.
+ * Returns 0 if initiated, -1 if resources unavailable. */
+int http_open_async(http_session_t *s, const char *hostname,
+                    http_open_cb_t cb, void *ctx);
+
 #endif /* OSITOK_HTTP_H */

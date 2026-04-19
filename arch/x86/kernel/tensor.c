@@ -357,6 +357,11 @@ static void matvec_q4_0_chunk(void *arg, void *result)
     }
 }
 
+/* When inference.c is running multiple independent matvecs on separate APs,
+ * each AP calls matvec() which calls us. Disable row-level parallelism to
+ * avoid APs trying to smp_submit (nested, not supported). */
+volatile int inference_parallel_mode = 0;
+
 void matvec_q4_0(float *out, const void *weight,
                  const float *input, uint32_t rows, uint32_t cols)
 {
@@ -379,8 +384,8 @@ void matvec_q4_0(float *out, const void *weight,
         if (ready == 0) workers = 0;
     }
 
-    /* Only parallelize large matvecs (overhead not worth it for small) */
-    if (workers <= 0 || rows < 128) {
+    /* Skip row-level SMP when inference layer is doing its own parallelism */
+    if (workers <= 0 || rows < 128 || inference_parallel_mode) {
         if (avx2)
             matvec_q4_0_avx2(out, weight, input, rows, cols);
         else

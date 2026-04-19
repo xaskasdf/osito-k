@@ -68,10 +68,14 @@ typedef struct {
     float *q;           /* [dim] query */
     float *k;           /* [kv_dim] key (current step) */
     float *v;           /* [kv_dim] value (current step) */
-    float *att;         /* [max_seq] attention scores */
+    float *att;         /* [max_seq] attention scores (BSP) */
     float *hb;          /* [ffn_dim] gate */
     float *hb2;         /* [ffn_dim] up */
     float *logits;      /* [vocab_size] output */
+
+    /* Per-AP scratch for parallel attention heads */
+    #define LLAMA_MAX_AP_SCRATCH 4
+    float *att_scratch[LLAMA_MAX_AP_SCRATCH]; /* [max_seq] each, NULL if unused */
 
     uint32_t pos;       /* Current sequence position */
 } llama_state_t;

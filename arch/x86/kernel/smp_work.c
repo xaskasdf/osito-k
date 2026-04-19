@@ -120,7 +120,11 @@ int smp_submit(int ap_idx, smp_work_func_t func, void *arg, void *result)
     if (ap_idx < 0 || ap_idx >= ap_worker_count) return -1;
     ap_control_t *ap = &ap_controls[ap_idx];
 
-    if (ap->state != AP_IDLE) return -1;
+    /* Atomic IDLE→BUSY transition — prevents TOCTOU race when ISR
+     * (memcompress offload) and kernel thread (inference) both target
+     * the same AP simultaneously. */
+    if (__sync_val_compare_and_swap(&ap->state, AP_IDLE, AP_BUSY) != AP_IDLE)
+        return -1;
 
     ap->func       = func;
     ap->arg        = arg;
@@ -130,7 +134,6 @@ int smp_submit(int ap_idx, smp_work_func_t func, void *arg, void *result)
     __asm__ volatile ("mfence" ::: "memory");
 
     ap->work_pending = 1;
-    ap->state = AP_BUSY;
 
     __asm__ volatile ("mfence" ::: "memory");
 

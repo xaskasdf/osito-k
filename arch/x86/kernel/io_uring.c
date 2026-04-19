@@ -53,6 +53,15 @@ typedef struct __attribute__((packed)) {
 #define IOURING_MAX       4
 #define IOURING_ENTRIES  64
 
+/* In-flight SQE slot for deferred/retried operations */
+#define IOURING_MAX_INFLIGHT 8
+
+typedef struct {
+    bool            active;
+    io_uring_sqe_t  sqe;
+    uint8_t         retries;
+} io_uring_inflight_t;
+
 typedef struct {
     bool             active;
     /* Submission queue */
@@ -64,6 +73,8 @@ typedef struct {
     uint32_t         cq_head;
     uint32_t         cq_tail;
     uint32_t         entries;
+    /* In-flight: SQEs deferred due to -EAGAIN */
+    io_uring_inflight_t inflight[IOURING_MAX_INFLIGHT];
 } io_uring_t;
 
 static io_uring_t rings[IOURING_MAX];
@@ -116,7 +127,47 @@ int io_uring_submit(int ring_idx, const io_uring_sqe_t *sqe)
     return 0;
 }
 
+/* ── Execute one SQE, return result ─────────────────────────── */
+
+static int32_t io_uring_exec_sqe(const io_uring_sqe_t *sqe)
+{
+    switch (sqe->opcode) {
+    case IORING_OP_NOP:
+        return 0;
+    case IORING_OP_READ:
+        if (sqe->off != 0 && sqe->off != (uint64_t)-1)
+            return (int32_t)syscall_dispatch(SYS_PREAD_NR, (uint64_t)sqe->fd,
+                                             sqe->addr, sqe->len, sqe->off, 0, 0);
+        return (int32_t)syscall_dispatch(SYS_READ_NR, (uint64_t)sqe->fd,
+                                         sqe->addr, sqe->len, 0, 0, 0);
+    case IORING_OP_WRITE:
+        if (sqe->off != 0 && sqe->off != (uint64_t)-1)
+            return (int32_t)syscall_dispatch(SYS_PWRITE_NR, (uint64_t)sqe->fd,
+                                             sqe->addr, sqe->len, sqe->off, 0, 0);
+        return (int32_t)syscall_dispatch(SYS_WRITE_NR, (uint64_t)sqe->fd,
+                                         sqe->addr, sqe->len, 0, 0, 0);
+    default:
+        return -22;  /* EINVAL */
+    }
+}
+
+/* Post a CQE; returns 0 on success, -1 if CQ is full */
+static int io_uring_post_cqe(io_uring_t *r, uint64_t user_data, int32_t res)
+{
+    uint32_t cq_next = (r->cq_tail + 1) % r->entries;
+    if (cq_next == r->cq_head) return -1;  /* CQ full */
+    r->cq[r->cq_tail].user_data = user_data;
+    r->cq[r->cq_tail].res = res;
+    r->cq[r->cq_tail].flags = 0;
+    r->cq_tail = cq_next;
+    return 0;
+}
+
 /* ── Process (execute pending SQEs) ──────────────────────────── */
+
+#define EAGAIN 11
+#define IOURING_BATCH_LIMIT 8  /* max SQEs per call to avoid long blocking */
+#define IOURING_MAX_RETRIES 16
 
 int io_uring_process(int ring_idx)
 {
@@ -125,50 +176,51 @@ int io_uring_process(int ring_idx)
     if (!r->active) return 0;
 
     int processed = 0;
-    while (r->sq_head != r->sq_tail) {
-        io_uring_sqe_t *sqe = &r->sq[r->sq_head];
-        int32_t result = 0;
 
-        switch (sqe->opcode) {
-        case IORING_OP_NOP:
-            result = 0;
-            break;
-        case IORING_OP_READ:
-            /* Use pread if offset specified, otherwise read */
-            if (sqe->off != 0 && sqe->off != (uint64_t)-1) {
-                result = (int32_t)syscall_dispatch(SYS_PREAD_NR, (uint64_t)sqe->fd,
-                                                   sqe->addr, sqe->len, sqe->off, 0, 0);
-            } else {
-                result = (int32_t)syscall_dispatch(SYS_READ_NR, (uint64_t)sqe->fd,
-                                                   sqe->addr, sqe->len, 0, 0, 0);
-            }
-            break;
-        case IORING_OP_WRITE:
-            if (sqe->off != 0 && sqe->off != (uint64_t)-1) {
-                result = (int32_t)syscall_dispatch(SYS_PWRITE_NR, (uint64_t)sqe->fd,
-                                                   sqe->addr, sqe->len, sqe->off, 0, 0);
-            } else {
-                result = (int32_t)syscall_dispatch(SYS_WRITE_NR, (uint64_t)sqe->fd,
-                                                   sqe->addr, sqe->len, 0, 0, 0);
-            }
-            break;
-        default:
-            result = -22;  /* EINVAL */
-            break;
+    /* Phase 1: retry deferred in-flight SQEs */
+    for (int i = 0; i < IOURING_MAX_INFLIGHT; i++) {
+        io_uring_inflight_t *inf = &r->inflight[i];
+        if (!inf->active) continue;
+
+        int32_t result = io_uring_exec_sqe(&inf->sqe);
+        if (result == -EAGAIN && inf->retries < IOURING_MAX_RETRIES) {
+            inf->retries++;
+            continue;  /* still blocked, retry next time */
         }
+        io_uring_post_cqe(r, inf->sqe.user_data, result);
+        inf->active = false;
+        processed++;
+    }
 
-        /* Post CQE */
-        uint32_t cq_next = (r->cq_tail + 1) % r->entries;
-        if (cq_next != r->cq_head) {
-            r->cq[r->cq_tail].user_data = sqe->user_data;
-            r->cq[r->cq_tail].res = result;
-            r->cq[r->cq_tail].flags = 0;
-            r->cq_tail = cq_next;
+    /* Phase 2: process new SQEs from submission queue */
+    int batch = 0;
+    while (r->sq_head != r->sq_tail && batch < IOURING_BATCH_LIMIT) {
+        io_uring_sqe_t *sqe = &r->sq[r->sq_head];
+        int32_t result = io_uring_exec_sqe(sqe);
+
+        if (result == -EAGAIN) {
+            /* Defer: find a free inflight slot */
+            int slot = -1;
+            for (int i = 0; i < IOURING_MAX_INFLIGHT; i++) {
+                if (!r->inflight[i].active) { slot = i; break; }
+            }
+            if (slot >= 0) {
+                r->inflight[slot].sqe = *sqe;
+                r->inflight[slot].retries = 0;
+                r->inflight[slot].active = true;
+            } else {
+                /* No inflight slots — return EAGAIN to caller */
+                io_uring_post_cqe(r, sqe->user_data, -EAGAIN);
+            }
+        } else {
+            io_uring_post_cqe(r, sqe->user_data, result);
         }
 
         r->sq_head = (r->sq_head + 1) % r->entries;
         processed++;
+        batch++;
     }
+
     return processed;
 }
 

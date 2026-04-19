@@ -17,7 +17,7 @@
 #include "../../include/common/ositofs2_format.h"
 
 /* GGUF magic and version */
-#define GGUF_MAGIC    0x46475547  /* "GGUF" */
+#define GGUF_MAGIC    0x46554747  /* "GGUF" — bytes 0x47,0x47,0x55,0x46 LE */
 #define GGUF_VERSION  3
 
 /* GGUF value types */

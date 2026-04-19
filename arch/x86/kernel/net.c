@@ -62,6 +62,10 @@ typedef struct {
 static udp_listener_t udp_listeners[MAX_UDP_LISTENERS];
 static int udp_listener_count;
 
+/* ── Forward declarations ────────────────────────────────────── */
+
+static void net_async_check(void);
+
 /* ── TCP Connections ─────────────────────────────────────────── */
 
 static tcp_conn_t tcp_conns[TCP_MAX_CONNS];
@@ -613,6 +617,9 @@ void net_poll(void)
             tc->tx_len = 0;
         }
     }
+
+    /* Advance async operations (DNS wait, ARP wait, SYN wait) */
+    net_async_check();
 }
 
 /* ── Send UDP Datagram ───────────────────────────────────────── */
@@ -1501,6 +1508,260 @@ int net_dns_resolve(const char *hostname, uint8_t ip_out[4])
 
     serial_puts("[DNS] Timeout\n");
     return -1;
+}
+
+/* ══════════════════════════════════════════════════════════════
+ *  Async Network Operations
+ *
+ *  Non-blocking variants of DNS, TCP connect, etc.
+ *  net_poll() drives progress by checking pending async ops
+ *  after processing incoming packets.
+ * ══════════════════════════════════════════════════════════════ */
+
+typedef enum {
+    NETOP_IDLE = 0,
+    NETOP_DNS_WAIT,         /* waiting for dns_got_reply */
+    NETOP_ARP_WAIT,         /* waiting for ARP resolution */
+    NETOP_TCP_SYN_WAIT,     /* waiting for SYN-ACK (TCP_ESTABLISHED) */
+} netop_type_t;
+
+typedef struct {
+    netop_type_t    type;
+    uint64_t        deadline;       /* absolute tick timeout */
+    net_async_cb_t  callback;
+    void           *ctx;
+
+    union {
+        struct {                    /* DNS */
+            uint8_t *ip_out;       /* caller's buffer */
+        } dns;
+        struct {                    /* TCP connect */
+            uint8_t  dst_ip[4];
+            uint16_t dst_port;
+            uint16_t src_port;
+            int      conn_idx;     /* allocated slot, -1 until ARP done */
+            uint8_t  phase;        /* 0=ARP, 1=SYN */
+        } tcp;
+    };
+} net_async_op_t;
+
+#define NET_MAX_ASYNC_OPS 8
+static net_async_op_t async_ops[NET_MAX_ASYNC_OPS];
+
+static int async_alloc(void)
+{
+    for (int i = 0; i < NET_MAX_ASYNC_OPS; i++)
+        if (async_ops[i].type == NETOP_IDLE) return i;
+    return -1;
+}
+
+/* Called at the end of net_poll() to advance async operations */
+static void net_async_check(void)
+{
+    uint64_t now = idt_get_ticks();
+
+    for (int i = 0; i < NET_MAX_ASYNC_OPS; i++) {
+        net_async_op_t *op = &async_ops[i];
+        if (op->type == NETOP_IDLE) continue;
+
+        /* Timeout check */
+        if (now >= op->deadline) {
+            net_async_cb_t cb = op->callback;
+            void *ctx = op->ctx;
+            op->type = NETOP_IDLE;
+            if (cb) cb(-1, ctx);  /* timeout = error */
+            continue;
+        }
+
+        switch (op->type) {
+        case NETOP_DNS_WAIT:
+            if (dns_got_reply) {
+                memcpy(op->dns.ip_out, dns_result_ip, 4);
+                net_async_cb_t cb = op->callback;
+                void *ctx = op->ctx;
+                op->type = NETOP_IDLE;
+                if (cb) cb(0, ctx);
+            }
+            break;
+
+        case NETOP_ARP_WAIT: {
+            const uint8_t *nexthop = arp_nexthop(op->tcp.dst_ip);
+            if (arp_lookup(nexthop)) {
+                /* ARP resolved — now send SYN */
+                int idx = -1;
+                for (int c = 0; c < TCP_MAX_CONNS; c++)
+                    if (tcp_conns[c].state == TCP_CLOSED) { idx = c; break; }
+                if (idx < 0) {
+                    net_async_cb_t cb = op->callback;
+                    void *ctx = op->ctx;
+                    op->type = NETOP_IDLE;
+                    if (cb) cb(-1, ctx);
+                    break;
+                }
+
+                tcp_conn_t *conn = &tcp_conns[idx];
+                memset(conn, 0, sizeof(tcp_conn_t));
+                memcpy(conn->remote_ip, op->tcp.dst_ip, 4);
+                conn->local_port  = op->tcp.src_port;
+                conn->remote_port = op->tcp.dst_port;
+
+                conn->snd_nxt = tcp_isn_counter;
+                tcp_isn_counter += 64000;
+                conn->snd_una = conn->snd_nxt;
+                conn->rcv_wscale = 3;
+                conn->snd_wnd = TCP_RX_BUF_SIZE;
+                conn->state = TCP_SYN_SENT;
+                conn->last_activity = now;
+
+                tcp_send_segment(conn, TCP_SYN, NULL, 0);
+
+                op->tcp.conn_idx = idx;
+                op->tcp.phase = 1;
+                op->type = NETOP_TCP_SYN_WAIT;
+                op->deadline = now + 500;  /* 5s for SYN-ACK */
+            }
+            break;
+        }
+
+        case NETOP_TCP_SYN_WAIT: {
+            int ci = op->tcp.conn_idx;
+            if (ci >= 0 && tcp_conns[ci].state == TCP_ESTABLISHED) {
+                net_async_cb_t cb = op->callback;
+                void *ctx = op->ctx;
+                int conn_idx = ci;
+                op->type = NETOP_IDLE;
+                if (cb) cb(conn_idx, ctx);
+            } else if (ci >= 0 && tcp_conns[ci].state == TCP_CLOSED) {
+                /* RST received */
+                net_async_cb_t cb = op->callback;
+                void *ctx = op->ctx;
+                op->type = NETOP_IDLE;
+                if (cb) cb(-1, ctx);
+            }
+            break;
+        }
+
+        default:
+            break;
+        }
+    }
+}
+
+int net_dns_resolve_async(const char *hostname, uint8_t ip_out[4],
+                          net_async_cb_t cb, void *ctx)
+{
+    int slot = async_alloc();
+    if (slot < 0) return -1;
+
+    /* Build and send DNS query (reuse logic from sync version) */
+    uint8_t query[256];
+    uint32_t qlen = 0;
+
+    dns_query_id++;
+    query[0] = (uint8_t)(dns_query_id >> 8);
+    query[1] = (uint8_t)(dns_query_id & 0xFF);
+    query[2] = 0x01; query[3] = 0x00;
+    query[4] = 0x00; query[5] = 0x01;
+    query[6] = 0x00; query[7] = 0x00;
+    query[8] = 0x00; query[9] = 0x00;
+    query[10] = 0x00; query[11] = 0x00;
+    qlen = 12;
+
+    const char *p = hostname;
+    while (*p) {
+        const char *dot = p;
+        while (*dot && *dot != '.') dot++;
+        uint32_t label_len = (uint32_t)(dot - p);
+        if (label_len == 0 || label_len > 63 || qlen + 1 + label_len > 250)
+            return -1;
+        query[qlen++] = (uint8_t)label_len;
+        for (uint32_t i = 0; i < label_len; i++)
+            query[qlen++] = (uint8_t)p[i];
+        p = dot;
+        if (*p == '.') p++;
+    }
+    query[qlen++] = 0;
+    query[qlen++] = 0x00; query[qlen++] = 0x01;  /* TYPE A */
+    query[qlen++] = 0x00; query[qlen++] = 0x01;  /* CLASS IN */
+
+    dns_got_reply = 0;
+    net_udp_listen(10053, dns_handler);
+
+    for (int attempt = 0; attempt < 3; attempt++) {
+        if (net_udp_send(dns_server, 53, 10053, query, qlen) == 0)
+            break;
+        net_poll();
+    }
+
+    async_ops[slot].type = NETOP_DNS_WAIT;
+    async_ops[slot].deadline = idt_get_ticks() + 300;  /* 3s */
+    async_ops[slot].callback = cb;
+    async_ops[slot].ctx = ctx;
+    async_ops[slot].dns.ip_out = ip_out;
+    return 0;
+}
+
+int net_tcp_connect_async(const uint8_t dst_ip[4], uint16_t dst_port,
+                          uint16_t src_port,
+                          net_async_cb_t cb, void *ctx)
+{
+    int slot = async_alloc();
+    if (slot < 0) return -1;
+
+    const uint8_t *nexthop = arp_nexthop(dst_ip);
+
+    if (arp_lookup(nexthop)) {
+        /* ARP already resolved — go straight to SYN */
+        int idx = -1;
+        for (int c = 0; c < TCP_MAX_CONNS; c++)
+            if (tcp_conns[c].state == TCP_CLOSED) { idx = c; break; }
+        if (idx < 0) return -1;
+
+        tcp_conn_t *conn = &tcp_conns[idx];
+        memset(conn, 0, sizeof(tcp_conn_t));
+        memcpy(conn->remote_ip, dst_ip, 4);
+        conn->local_port  = src_port;
+        conn->remote_port = dst_port;
+        extern uint32_t tcp_isn_counter;
+        conn->snd_nxt = tcp_isn_counter;
+        tcp_isn_counter += 64000;
+        conn->snd_una = conn->snd_nxt;
+        conn->rcv_wscale = 3;
+        conn->snd_wnd = TCP_RX_BUF_SIZE;
+        conn->state = TCP_SYN_SENT;
+        conn->last_activity = idt_get_ticks();
+
+        tcp_send_segment(conn, TCP_SYN, NULL, 0);
+
+        async_ops[slot].type = NETOP_TCP_SYN_WAIT;
+        async_ops[slot].deadline = idt_get_ticks() + 500;
+        async_ops[slot].callback = cb;
+        async_ops[slot].ctx = ctx;
+        async_ops[slot].tcp.conn_idx = idx;
+        async_ops[slot].tcp.phase = 1;
+    } else {
+        /* Need ARP first */
+        arp_send_request(nexthop);
+
+        async_ops[slot].type = NETOP_ARP_WAIT;
+        async_ops[slot].deadline = idt_get_ticks() + 200;  /* 2s ARP */
+        async_ops[slot].callback = cb;
+        async_ops[slot].ctx = ctx;
+        memcpy(async_ops[slot].tcp.dst_ip, dst_ip, 4);
+        async_ops[slot].tcp.dst_port = dst_port;
+        async_ops[slot].tcp.src_port = src_port;
+        async_ops[slot].tcp.conn_idx = -1;
+        async_ops[slot].tcp.phase = 0;
+    }
+
+    return 0;
+}
+
+int net_async_pending(void)
+{
+    for (int i = 0; i < NET_MAX_ASYNC_OPS; i++)
+        if (async_ops[i].type != NETOP_IDLE) return 1;
+    return 0;
 }
 
 /* ── Register UDP Listener ───────────────────────────────────── */

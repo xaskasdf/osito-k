@@ -203,4 +203,24 @@ int  net_dns_resolve(const char *hostname, uint8_t ip_out[4]);
 /* Set DNS server IP (default: 10.0.2.3 for QEMU SLIRP) */
 void net_dns_set_server(const uint8_t ip[4]);
 
+/* ── Async Network API ───────────────────────────────────────── */
+
+/* Callback: result is operation-specific (conn_idx, 0=success, -1=error) */
+typedef void (*net_async_cb_t)(int result, void *ctx);
+
+/* Async DNS resolve — returns immediately, calls cb when done.
+ * ip_out must remain valid until callback fires.
+ * Returns 0 if queued, -1 if no slots available. */
+int net_dns_resolve_async(const char *hostname, uint8_t ip_out[4],
+                          net_async_cb_t cb, void *ctx);
+
+/* Async TCP connect — returns immediately, calls cb(conn_idx, ctx).
+ * Returns 0 if queued, -1 if no slots available. */
+int net_tcp_connect_async(const uint8_t dst_ip[4], uint16_t dst_port,
+                          uint16_t src_port,
+                          net_async_cb_t cb, void *ctx);
+
+/* Check if any async operations are pending */
+int net_async_pending(void);
+
 #endif /* OSITOK_NET_H */

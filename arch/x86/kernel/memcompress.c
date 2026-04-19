@@ -489,11 +489,14 @@ uint32_t memcompress_pid_count(uint32_t pid)
 
 uint32_t memcompress_idle_threshold(void) { return IDLE_COMPRESS_TICKS; }
 
-/* SMP worker wrapper — called on AP via smp_submit_any */
+/* SMP worker wrapper — called on AP via smp_submit_any.
+ * Arg block comes from the mc_args[] pool in process.c sched_tick;
+ * we must release the in_use flag when done. */
 void memcompress_worker(void *arg, void *result)
 {
     (void)result;
-    struct { uint32_t pid; void *base; uint64_t pages; } *a = arg;
+    struct { uint32_t pid; void *base; uint64_t pages; volatile int in_use; } *a = arg;
     if (a->base && a->pages > 0)
         memcompress_process_pages(a->pid, a->base, a->pages);
+    __sync_lock_release(&a->in_use);
 }

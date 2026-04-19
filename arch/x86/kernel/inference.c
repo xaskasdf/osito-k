@@ -362,9 +362,98 @@ int llama_init(llama_state_t *state, gguf_model_t *model, uint32_t max_seq)
     serial_puts("[LLAMA] Scratch: ");
     serial_putdec(scratch_size / 1024);
     serial_puts(" KB\n");
+
+    /* ── Allocate per-AP attention scratch buffers ── */
+    {
+        extern int ap_worker_count;
+        int n_ap = ap_worker_count;
+        if (n_ap > LLAMA_MAX_AP_SCRATCH) n_ap = LLAMA_MAX_AP_SCRATCH;
+        for (int i = 0; i < n_ap; i++) {
+            uint64_t att_bytes = (uint64_t)max_seq * sizeof(float);
+            uint64_t att_pages = pages_for(att_bytes);
+            void *att_phys = mem_alloc_pages(att_pages);
+            if (att_phys) {
+                state->att_scratch[i] = (float *)PHYS_TO_VIRT(att_phys);
+                memset(state->att_scratch[i], 0, (size_t)att_bytes);
+            }
+        }
+        if (n_ap > 0) {
+            serial_puts("[LLAMA] Attention scratch: ");
+            serial_putdec((uint64_t)n_ap);
+            serial_puts(" AP buffers\n");
+        }
+    }
+
     serial_puts("[LLAMA] Init complete. Ready for inference.\n");
 
     return 0;
+}
+
+/* ══════════════════════════════════════════════════════════════
+ *  SMP helpers for inference-layer parallelism
+ * ══════════════════════════════════════════════════════════════ */
+
+extern volatile int inference_parallel_mode;  /* tensor.c */
+extern int smp_submit_any(void (*)(void*, void*), void*, void*);
+extern void smp_wait(int);
+extern int ap_worker_count;
+
+typedef struct {
+    float         *out;
+    gguf_tensor_t *tensor;
+    const float   *input;
+    uint32_t       rows, cols;
+} matvec_arg_t;
+
+static void matvec_worker(void *arg, void *result)
+{
+    (void)result;
+    matvec_arg_t *a = (matvec_arg_t *)arg;
+    matvec(a->out, a->tensor, a->input, a->rows, a->cols);
+}
+
+/* Attention head chunk — processes a range of heads on an AP */
+typedef struct {
+    const float    *q;          /* [dim] */
+    float          *xb2;        /* [dim] output concat */
+    const float    *kv_k;       /* kv_cache[l].k */
+    const float    *kv_v;       /* kv_cache[l].v */
+    float          *att_buf;    /* per-AP attention scratch [max_seq] */
+    uint32_t        h_start, h_end;
+    uint32_t        pos, hd, kv_dim, gqa_ratio;
+    float           scale;
+} attn_chunk_t;
+
+static void attention_heads_worker(void *arg, void *result)
+{
+    (void)result;
+    attn_chunk_t *c = (attn_chunk_t *)arg;
+
+    for (uint32_t h = c->h_start; h < c->h_end; h++) {
+        uint32_t kv_h = h / c->gqa_ratio;
+        const float *q_head = c->q + h * c->hd;
+
+        /* Attention scores */
+        for (uint32_t p = 0; p <= c->pos; p++) {
+            const float *k_pos = c->kv_k + (uint64_t)p * c->kv_dim + kv_h * c->hd;
+            float dot = 0.0f;
+            for (uint32_t i = 0; i < c->hd; i++)
+                dot += q_head[i] * k_pos[i];
+            c->att_buf[p] = dot * c->scale;
+        }
+
+        softmax(c->att_buf, c->pos + 1);
+
+        /* Weighted sum of values */
+        float *out_head = c->xb2 + h * c->hd;
+        memset(out_head, 0, c->hd * sizeof(float));
+        for (uint32_t p = 0; p <= c->pos; p++) {
+            const float *v_pos = c->kv_v + (uint64_t)p * c->kv_dim + kv_h * c->hd;
+            float a = c->att_buf[p];
+            for (uint32_t i = 0; i < c->hd; i++)
+                out_head[i] += a * v_pos[i];
+        }
+    }
 }
 
 /* ══════════════════════════════════════════════════════════════
@@ -388,10 +477,30 @@ int llama_forward(llama_state_t *s, uint32_t token)
         /* Attention norm */
         rmsnorm(s->xb, s->x, norm_data(ly->attn_norm), dim);
 
-        /* Q, K, V projections */
-        matvec(s->q, ly->attn_q, s->xb, dim, dim);
-        matvec(s->k, ly->attn_k, s->xb, kv_dim, dim);
-        matvec(s->v, ly->attn_v, s->xb, kv_dim, dim);
+        /* Q, K, V projections — K and V on APs, Q on BSP */
+        if (ap_worker_count > 0) {
+            inference_parallel_mode = 1;
+            __asm__ volatile ("mfence" ::: "memory");
+
+            matvec_arg_t k_arg = {s->k, ly->attn_k, s->xb, kv_dim, dim};
+            matvec_arg_t v_arg = {s->v, ly->attn_v, s->xb, kv_dim, dim};
+            int k_ap = smp_submit_any(matvec_worker, &k_arg, NULL);
+            int v_ap = (k_ap >= 0) ? smp_submit_any(matvec_worker, &v_arg, NULL) : -1;
+
+            matvec(s->q, ly->attn_q, s->xb, dim, dim);  /* BSP does Q (largest) */
+
+            if (k_ap >= 0) smp_wait(k_ap);
+            if (v_ap >= 0) smp_wait(v_ap);
+            else matvec(s->v, ly->attn_v, s->xb, kv_dim, dim);
+            if (k_ap < 0) matvec(s->k, ly->attn_k, s->xb, kv_dim, dim);
+
+            inference_parallel_mode = 0;
+            __asm__ volatile ("mfence" ::: "memory");
+        } else {
+            matvec(s->q, ly->attn_q, s->xb, dim, dim);
+            matvec(s->k, ly->attn_k, s->xb, kv_dim, dim);
+            matvec(s->v, ly->attn_v, s->xb, kv_dim, dim);
+        }
 
         /* RoPE */
         rope(s->q, s->n_heads,    hd, pos, s->rope_freq_base);
@@ -406,31 +515,91 @@ int llama_forward(llama_state_t *s, uint32_t token)
         /* ── Grouped Query Attention ── */
         float scale = 1.0f / sqrtf_bare((float)hd);
 
-        for (uint32_t h = 0; h < s->n_heads; h++) {
-            uint32_t kv_h = h / s->gqa_ratio;
+        /* Partition heads across APs + BSP */
+        {
+            int n_workers = ap_worker_count;
+            if (n_workers > LLAMA_MAX_AP_SCRATCH)
+                n_workers = LLAMA_MAX_AP_SCRATCH;
+            /* Only use APs that have scratch buffers allocated */
+            while (n_workers > 0 && !s->att_scratch[n_workers - 1])
+                n_workers--;
 
-            float *q_head = s->q + h * hd;
+            if (n_workers > 0 && s->n_heads >= 4) {
+                int total_parts = n_workers + 1;
+                uint32_t chunk = s->n_heads / total_parts;
+                if (chunk == 0) { chunk = 1; n_workers = s->n_heads - 1; }
 
-            /* Compute attention scores for all positions */
-            for (uint32_t p = 0; p <= pos; p++) {
-                float *k_pos = s->kv_cache[l].k + (uint64_t)p * kv_dim + kv_h * hd;
-                float dot = 0.0f;
-                for (uint32_t i = 0; i < hd; i++)
-                    dot += q_head[i] * k_pos[i];
-                s->att[p] = dot * scale;
-            }
+                attn_chunk_t chunks[LLAMA_MAX_AP_SCRATCH];
+                int ap_ids[LLAMA_MAX_AP_SCRATCH];
 
-            /* Softmax over scores */
-            softmax(s->att, pos + 1);
+                for (int w = 0; w < n_workers; w++) {
+                    chunks[w].q         = s->q;
+                    chunks[w].xb2       = s->xb2;
+                    chunks[w].kv_k      = s->kv_cache[l].k;
+                    chunks[w].kv_v      = s->kv_cache[l].v;
+                    chunks[w].att_buf   = s->att_scratch[w];
+                    chunks[w].h_start   = w * chunk;
+                    chunks[w].h_end     = (w + 1) * chunk;
+                    chunks[w].pos       = pos;
+                    chunks[w].hd        = hd;
+                    chunks[w].kv_dim    = kv_dim;
+                    chunks[w].gqa_ratio = s->gqa_ratio;
+                    chunks[w].scale     = scale;
+                    ap_ids[w] = smp_submit_any(attention_heads_worker, &chunks[w], NULL);
+                }
 
-            /* Weighted sum of values */
-            float *out_head = s->xb2 + h * hd;
-            memset(out_head, 0, hd * sizeof(float));
-            for (uint32_t p = 0; p <= pos; p++) {
-                float *v_pos = s->kv_cache[l].v + (uint64_t)p * kv_dim + kv_h * hd;
-                float a = s->att[p];
-                for (uint32_t i = 0; i < hd; i++)
-                    out_head[i] += a * v_pos[i];
+                /* BSP handles the remaining heads */
+                uint32_t bsp_start = n_workers * chunk;
+                for (uint32_t h = bsp_start; h < s->n_heads; h++) {
+                    uint32_t kv_h = h / s->gqa_ratio;
+                    const float *q_head = s->q + h * hd;
+
+                    for (uint32_t p = 0; p <= pos; p++) {
+                        const float *k_pos = s->kv_cache[l].k + (uint64_t)p * kv_dim + kv_h * hd;
+                        float dot = 0.0f;
+                        for (uint32_t i = 0; i < hd; i++)
+                            dot += q_head[i] * k_pos[i];
+                        s->att[p] = dot * scale;
+                    }
+                    softmax(s->att, pos + 1);
+
+                    float *out_head = s->xb2 + h * hd;
+                    memset(out_head, 0, hd * sizeof(float));
+                    for (uint32_t p = 0; p <= pos; p++) {
+                        const float *v_pos = s->kv_cache[l].v + (uint64_t)p * kv_dim + kv_h * hd;
+                        float a = s->att[p];
+                        for (uint32_t i = 0; i < hd; i++)
+                            out_head[i] += a * v_pos[i];
+                    }
+                }
+
+                /* Wait for AP workers */
+                for (int w = 0; w < n_workers; w++)
+                    if (ap_ids[w] >= 0) smp_wait(ap_ids[w]);
+            } else {
+                /* Serial fallback */
+                for (uint32_t h = 0; h < s->n_heads; h++) {
+                    uint32_t kv_h = h / s->gqa_ratio;
+                    const float *q_head = s->q + h * hd;
+
+                    for (uint32_t p = 0; p <= pos; p++) {
+                        const float *k_pos = s->kv_cache[l].k + (uint64_t)p * kv_dim + kv_h * hd;
+                        float dot = 0.0f;
+                        for (uint32_t i = 0; i < hd; i++)
+                            dot += q_head[i] * k_pos[i];
+                        s->att[p] = dot * scale;
+                    }
+                    softmax(s->att, pos + 1);
+
+                    float *out_head = s->xb2 + h * hd;
+                    memset(out_head, 0, hd * sizeof(float));
+                    for (uint32_t p = 0; p <= pos; p++) {
+                        const float *v_pos = s->kv_cache[l].v + (uint64_t)p * kv_dim + kv_h * hd;
+                        float a = s->att[p];
+                        for (uint32_t i = 0; i < hd; i++)
+                            out_head[i] += a * v_pos[i];
+                    }
+                }
             }
         }
 
@@ -443,9 +612,25 @@ int llama_forward(llama_state_t *s, uint32_t token)
         /* ── FFN ── */
         rmsnorm(s->xb, s->x, norm_data(ly->ffn_norm), dim);
 
-        /* Gate + Up projections */
-        matvec(s->hb,  ly->ffn_gate, s->xb, s->ffn_dim, dim);
-        matvec(s->hb2, ly->ffn_up,   s->xb, s->ffn_dim, dim);
+        /* Gate + Up projections — Up on AP, Gate on BSP */
+        if (ap_worker_count > 0) {
+            inference_parallel_mode = 1;
+            __asm__ volatile ("mfence" ::: "memory");
+
+            matvec_arg_t up_arg = {s->hb2, ly->ffn_up, s->xb, s->ffn_dim, dim};
+            int up_ap = smp_submit_any(matvec_worker, &up_arg, NULL);
+
+            matvec(s->hb, ly->ffn_gate, s->xb, s->ffn_dim, dim);  /* BSP does gate */
+
+            if (up_ap >= 0) smp_wait(up_ap);
+            else matvec(s->hb2, ly->ffn_up, s->xb, s->ffn_dim, dim);
+
+            inference_parallel_mode = 0;
+            __asm__ volatile ("mfence" ::: "memory");
+        } else {
+            matvec(s->hb,  ly->ffn_gate, s->xb, s->ffn_dim, dim);
+            matvec(s->hb2, ly->ffn_up,   s->xb, s->ffn_dim, dim);
+        }
 
         /* SwiGLU: SiLU(gate) * up */
         silu_inplace(s->hb, s->ffn_dim);

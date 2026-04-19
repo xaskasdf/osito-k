@@ -172,10 +172,10 @@ void display_wait_vblank(void)
         /* Hardware VBlank: poll GPU display engine counter.
          * Actual monitor refresh timing — no drift, no simulation. */
         uint32_t start = gpu_display_vblank_count();
-        uint64_t spins = 0;
+        uint64_t deadline = idt_get_ticks() + 100;  /* ~1s at 100Hz */
         while (gpu_display_vblank_count() == start) {
-            if (++spins > 100000000ULL) break;  /* safety timeout ~1s */
-            __asm__ volatile ("pause");
+            if (idt_get_ticks() >= deadline) break;
+            __asm__ volatile ("hlt");  /* sleep until next interrupt */
         }
     } else if (disp.tsc_per_frame) {
         /* Spin-wait until target TSC value.

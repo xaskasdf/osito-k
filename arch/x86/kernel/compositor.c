@@ -688,6 +688,32 @@ void compositor_set_terminal_surface(uint32_t shm, uint32_t tw, uint32_t th)
     serial_puts("\n");
 }
 
+/* ── Scale-blit SMP worker ──────────────────────────────────── */
+
+void scaleblit_worker(void *arg, void *result)
+{
+    (void)result;
+    struct {
+        const uint32_t *src; uint32_t *dst;
+        uint32_t dst_pitch, sw, sc, ox, oy, dw;
+        uint32_t y_start, y_end;
+    } *a = arg;
+
+    for (uint32_t _y = a->y_start; _y < a->y_end; _y++) {
+        const uint32_t *_src = a->src + _y * a->sw;
+        uint32_t *_row0 = a->dst + (a->oy + _y * a->sc) * a->dst_pitch + a->ox;
+        for (uint32_t _x = 0; _x < a->sw; _x++) {
+            uint32_t _px = _src[_x];
+            uint32_t _base = _x * a->sc;
+            for (uint32_t _rx = 0; _rx < a->sc; _rx++)
+                _row0[_base + _rx] = _px;
+        }
+        for (uint32_t _ry = 1; _ry < a->sc; _ry++)
+            memcpy(a->dst + (a->oy + _y * a->sc + _ry) * a->dst_pitch + a->ox,
+                   _row0, (uint64_t)a->dw * 4);
+    }
+}
+
 /* ── Render One Frame ────────────────────────────────────────── */
 
 static void compositor_render_frame(void)
@@ -733,21 +759,77 @@ static void compositor_render_frame(void)
         memset(back, 0, (uint64_t)p * h * 4);
 
         /* Scale-blit: build one scaled row, then memcpy for repeated rows.
-         * Row-major traversal keeps writes sequential for cache efficiency. */
-        for (uint32_t _y = 0; _y < _sh; _y++) {
-            const uint32_t *_src = win->pixels + _y * _sw;
-            uint32_t *_row0 = back + (_oy + _y * _sc) * p + _ox;
-            /* Expand source row horizontally */
-            for (uint32_t _x = 0; _x < _sw; _x++) {
-                uint32_t _px = _src[_x];
-                uint32_t _base = _x * _sc;
-                for (uint32_t _rx = 0; _rx < _sc; _rx++)
-                    _row0[_base + _rx] = _px;
+         * Row-major traversal keeps writes sequential for cache efficiency.
+         * Parallel path partitions source rows into bands across APs. */
+        {
+            extern int ap_worker_count;
+            extern int smp_submit_any(void (*)(void*, void*), void*, void*);
+            extern void smp_wait(int);
+            extern void scaleblit_worker(void *, void *);
+
+            int n_ap = ap_worker_count;
+            /* Only parallelize if enough rows to amortize IPI overhead */
+            if (n_ap > 0 && _sh >= 64) {
+                if (n_ap > 3) n_ap = 3;
+                int total = n_ap + 1;
+                uint32_t band = _sh / total;
+
+                typedef struct {
+                    const uint32_t *src; uint32_t *dst;
+                    uint32_t dst_pitch, sw, sc, ox, oy, dw;
+                    uint32_t y_start, y_end;
+                } scaleblit_arg_t;
+
+                scaleblit_arg_t sb_args[3];
+                int sb_ap[3];
+
+                for (int i = 0; i < n_ap; i++) {
+                    sb_args[i].src = win->pixels;
+                    sb_args[i].dst = back;
+                    sb_args[i].dst_pitch = p;
+                    sb_args[i].sw = _sw;
+                    sb_args[i].sc = _sc;
+                    sb_args[i].ox = _ox;
+                    sb_args[i].oy = _oy;
+                    sb_args[i].dw = _dw;
+                    sb_args[i].y_start = i * band;
+                    sb_args[i].y_end = (i + 1) * band;
+                    sb_ap[i] = smp_submit_any(scaleblit_worker, &sb_args[i], NULL);
+                }
+
+                /* BSP handles the last band */
+                for (uint32_t _y = n_ap * band; _y < _sh; _y++) {
+                    const uint32_t *_src2 = win->pixels + _y * _sw;
+                    uint32_t *_row0 = back + (_oy + _y * _sc) * p + _ox;
+                    for (uint32_t _x = 0; _x < _sw; _x++) {
+                        uint32_t _px = _src2[_x];
+                        uint32_t _base = _x * _sc;
+                        for (uint32_t _rx = 0; _rx < _sc; _rx++)
+                            _row0[_base + _rx] = _px;
+                    }
+                    for (uint32_t _ry = 1; _ry < _sc; _ry++)
+                        memcpy(back + (_oy + _y * _sc + _ry) * p + _ox, _row0,
+                               (uint64_t)_dw * 4);
+                }
+
+                for (int i = 0; i < n_ap; i++)
+                    if (sb_ap[i] >= 0) smp_wait(sb_ap[i]);
+            } else {
+                /* Serial path */
+                for (uint32_t _y = 0; _y < _sh; _y++) {
+                    const uint32_t *_src2 = win->pixels + _y * _sw;
+                    uint32_t *_row0 = back + (_oy + _y * _sc) * p + _ox;
+                    for (uint32_t _x = 0; _x < _sw; _x++) {
+                        uint32_t _px = _src2[_x];
+                        uint32_t _base = _x * _sc;
+                        for (uint32_t _rx = 0; _rx < _sc; _rx++)
+                            _row0[_base + _rx] = _px;
+                    }
+                    for (uint32_t _ry = 1; _ry < _sc; _ry++)
+                        memcpy(back + (_oy + _y * _sc + _ry) * p + _ox, _row0,
+                               (uint64_t)_dw * 4);
+                }
             }
-            /* Duplicate expanded row for remaining scale-1 output rows */
-            for (uint32_t _ry = 1; _ry < _sc; _ry++)
-                memcpy(back + (_oy + _y * _sc + _ry) * p + _ox, _row0,
-                       (uint64_t)_dw * 4);
         }
 
         display_mark_dirty();

@@ -432,19 +432,25 @@ void kernel_entry(boot_info_t *info)
     /* ── Step 1.11: Win32 compatibility layer ── */
     win32_init();
 
-    /* ── Crypto self-test ── */
+    /* ── Crypto self-test (on AP) + PCI scan (on BSP) in parallel ── */
     {
         extern int crypto_selftest(void);
-        crypto_selftest();
+        extern int smp_submit_any(void (*)(void*, void*), void*, void*);
+        extern void smp_wait(int);
+        extern void boot_crypto_worker(void *, void *);
+        int crypto_ap = smp_submit_any(boot_crypto_worker, NULL, NULL);
+
+        /* Step 2: PCI enumeration (BSP, while crypto runs on AP) */
+        serial_puts("[KERN] Scanning PCIe bus...\n");
+        fb_puts(" Scanning PCIe...\n");
+        pci_scan();
+
+        if (crypto_ap >= 0) smp_wait(crypto_ap);
+        else crypto_selftest();  /* fallback: no AP available */
     }
 
-    /* ── Tensor compute self-test ── */
+    /* ── Tensor compute self-test (uses SMP matvec internally, run after PCI) ── */
     tensor_benchmark();
-
-    /* ── Step 2: PCI enumeration ── */
-    serial_puts("[KERN] Scanning PCIe bus...\n");
-    fb_puts(" Scanning PCIe...\n");
-    pci_scan();
 
     /* ── Map PCI device BARs into page tables ── */
     typedef struct {
