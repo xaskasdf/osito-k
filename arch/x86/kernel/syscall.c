@@ -3081,17 +3081,106 @@ int vdso_map_process(uint64_t cr3)
                                   PTE_PRESENT_LOCAL | PTE_USER_LOCAL);
 }
 
+/* ── Syscall memoization with buffer replay ─────────────────── */
+
+#define MEMO_SLOTS     32
+#define MEMO_SLOTS_MASK (MEMO_SLOTS - 1)
+#define MEMO_BUF_SIZE  400   /* utsname = 390 bytes, largest memoized */
+
+typedef struct {
+    uint64_t nr;
+    uint64_t args_hash;
+    int64_t  result;
+    uint8_t  buf[MEMO_BUF_SIZE];
+    uint32_t buf_len;          /* bytes to replay (0 = return-only) */
+    uint64_t buf_dst_arg;      /* which syscall arg holds the dest pointer */
+    uint64_t valid_until;      /* tick expiry, 0 = never */
+    bool     active;
+} memo_entry_t;
+
+static memo_entry_t memo_cache[MEMO_SLOTS];
+
+static uint64_t memo_hash(uint64_t nr, uint64_t a1, uint64_t a2)
+{
+    uint64_t h = 0xcbf29ce484222325ULL;
+    h ^= nr;   h *= 0x100000001b3ULL;
+    h ^= a1;   h *= 0x100000001b3ULL;
+    h ^= a2;   h *= 0x100000001b3ULL;
+    return h;
+}
+
+static bool memo_lookup(uint64_t nr, uint64_t hash, uint64_t dst_addr,
+                        int64_t *result)
+{
+    uint32_t slot = (uint32_t)(hash & MEMO_SLOTS_MASK);
+    memo_entry_t *e = &memo_cache[slot];
+    if (!e->active || e->nr != nr || e->args_hash != hash) return false;
+    if (e->valid_until && idt_get_ticks() > e->valid_until) {
+        e->active = false;
+        return false;
+    }
+    /* Replay buffer write to user destination */
+    if (e->buf_len > 0 && dst_addr)
+        memcpy((void *)dst_addr, e->buf, e->buf_len);
+    *result = e->result;
+    return true;
+}
+
+static void memo_store(uint64_t nr, uint64_t hash, int64_t result,
+                       const void *buf_src, uint32_t buf_len, uint64_t ttl)
+{
+    uint32_t slot = (uint32_t)(hash & MEMO_SLOTS_MASK);
+    memo_entry_t *e = &memo_cache[slot];
+    e->nr = nr;
+    e->args_hash = hash;
+    e->result = result;
+    if (buf_len > 0 && buf_len <= MEMO_BUF_SIZE && buf_src)
+        memcpy(e->buf, buf_src, buf_len);
+    e->buf_len = (buf_len <= MEMO_BUF_SIZE) ? buf_len : 0;
+    e->valid_until = ttl ? (idt_get_ticks() + ttl) : 0;
+    e->active = true;
+}
+
+/* Invalidate all entries for a given syscall number */
+static void memo_invalidate_nr(uint64_t nr)
+{
+    for (int i = 0; i < MEMO_SLOTS; i++)
+        if (memo_cache[i].active && memo_cache[i].nr == nr)
+            memo_cache[i].active = false;
+}
+
 /* ── Syscall dispatch (called from assembly) ─────────────────── */
 
 int64_t __hot syscall_dispatch(uint64_t nr, uint64_t a1, uint64_t a2,
                          uint64_t a3, uint64_t a4, uint64_t a5)
 {
+    /* Memoization: check cache for known-memoizable syscalls.
+     * Buffer-writing syscalls replay via memcpy on cache hit. */
+    if (nr == SYS_UNAME || nr == SYS_GETCWD || nr == SYS_FSTAT ||
+        nr == SYS_STAT) {
+        uint64_t hash = memo_hash(nr, a1, a2);
+        /* For uname/getcwd: buf is a1. For stat/fstat: buf is a2. */
+        uint64_t dst = (nr == SYS_UNAME || nr == SYS_GETCWD) ? a1 : a2;
+        int64_t cached;
+        if (memo_lookup(nr, hash, dst, &cached))
+            return cached;
+    }
+
     switch (nr) {
     case SYS_READ:       return sys_read(a1, a2, a3);
-    case SYS_WRITE:      return sys_write(a1, a2, a3);
+    case SYS_WRITE: {
+        int64_t r = sys_write(a1, a2, a3);
+        /* Invalidate fstat cache for this fd on write */
+        if (r >= 0) memo_invalidate_nr(SYS_FSTAT);
+        return r;
+    }
     case SYS_OPEN:       return sys_open(a1, a2, a3);
     case SYS_CLOSE:      return sys_close(a1);
-    case SYS_FSTAT:      return sys_fstat(a1, a2);
+    case SYS_FSTAT: {
+        int64_t r = sys_fstat(a1, a2);
+        if (r == 0) memo_store(nr, memo_hash(nr, a1, a2), r, (void *)a2, 144, 10);
+        return r;
+    }
     case SYS_POLL:       return sys_poll(a1, a2, a3);
     case SYS_LSEEK:      return sys_lseek(a1, (int64_t)a2, a3);
     case SYS_MMAP:       return sys_mmap(a1, a2, a3, a4, a5, 0);
@@ -3114,7 +3203,11 @@ int64_t __hot syscall_dispatch(uint64_t nr, uint64_t a1, uint64_t a2,
     case SYS_NANOSLEEP:  return sys_nanosleep(a1, a2);
     case SYS_GETPID:     return sys_getpid();
     case SYS_MADVISE:    return 0;  /* ignore hints */
-    case SYS_STAT:       return sys_stat(a1, a2);
+    case SYS_STAT: {
+        int64_t r = sys_stat(a1, a2);
+        if (r == 0) memo_store(nr, memo_hash(nr, a1, a2), r, (void *)a2, 144, 10);
+        return r;
+    }
     case SYS_LSTAT:      return sys_stat(a1, a2);  /* no symlinks */
     case SYS_SENDFILE:   return sys_sendfile(a1, a2, a3, a4);
     case SYS_SELECT:     return sys_poll(0, 0, 0);  /* stub: pretend nothing ready */
@@ -3125,10 +3218,18 @@ int64_t __hot syscall_dispatch(uint64_t nr, uint64_t a1, uint64_t a2,
     case SYS_EXIT:       return sys_exit(a1);
     case SYS_WAIT4:      return sys_wait4(a1, a2, a3, a4);
     case SYS_KILL:       return sys_kill(a1, a2);
-    case SYS_UNAME:      return sys_uname(a1);
+    case SYS_UNAME: {
+        int64_t r = sys_uname(a1);
+        if (r == 0) memo_store(nr, memo_hash(nr, a1, 0), r, (void *)a1, 390, 0);
+        return r;
+    }
     case SYS_FCNTL:      return sys_fcntl(a1, a2, a3);
     case SYS_FSYNC:      return 0;  /* no-op */
-    case SYS_GETCWD:     return sys_getcwd(a1, a2);
+    case SYS_GETCWD: {
+        int64_t r = sys_getcwd(a1, a2);
+        if (r > 0) memo_store(nr, memo_hash(nr, a1, a2), r, (void *)a1, 2, 0);
+        return r;
+    }
     case SYS_UNLINK:     return sys_unlink(a1);
     case SYS_READLINK:   return sys_readlink(a1, a2, a3);
     case SYS_GETUID:     return 0;

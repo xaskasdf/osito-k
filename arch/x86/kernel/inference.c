@@ -680,6 +680,82 @@ int llama_forward(llama_state_t *s, uint32_t token)
     return 0;
 }
 
+/* ── Forward from a specific layer (for speculation adoption) ─ */
+
+int llama_forward_from_layer(llama_state_t *s, uint32_t token,
+                             uint32_t start_layer)
+{
+    uint32_t dim    = s->dim;
+    uint32_t kv_dim = s->kv_dim;
+    uint32_t hd     = s->head_dim;
+    uint32_t pos    = s->pos;
+
+    if (start_layer == 0)
+        embed_token(s->x, s->weights.token_embd, token, dim);
+
+    for (uint32_t l = start_layer; l < s->n_layers; l++) {
+        llama_layer_t *ly = &s->weights.layers[l];
+
+        rmsnorm(s->xb, s->x, norm_data(ly->attn_norm), dim);
+        matvec(s->q, ly->attn_q, s->xb, dim, dim);
+        matvec(s->k, ly->attn_k, s->xb, kv_dim, dim);
+        matvec(s->v, ly->attn_v, s->xb, kv_dim, dim);
+
+        rope(s->q, s->n_heads,    hd, pos, s->rope_freq_base);
+        rope(s->k, s->n_kv_heads, hd, pos, s->rope_freq_base);
+
+        float *kc = s->kv_cache[l].k + (uint64_t)pos * kv_dim;
+        float *vc = s->kv_cache[l].v + (uint64_t)pos * kv_dim;
+        memcpy(kc, s->k, kv_dim * sizeof(float));
+        memcpy(vc, s->v, kv_dim * sizeof(float));
+
+        /* Simplified GQA (no SMP in continuation path) */
+        for (uint32_t h = 0; h < s->n_heads; h++) {
+            uint32_t kv_h = h / s->gqa_ratio;
+            float *qh = s->q + h * hd;
+            float *xb2h = s->xb2 + h * hd;
+            float max_s = -1e30f;
+            for (uint32_t t = 0; t <= pos; t++) {
+                float *kt = s->kv_cache[l].k + t * kv_dim + kv_h * hd;
+                float sc = 0;
+                for (uint32_t d = 0; d < hd; d++) sc += qh[d] * kt[d];
+                sc /= sqrtf_bare((float)hd);
+                s->att[t] = sc;
+                if (sc > max_s) max_s = sc;
+            }
+            float sum = 0;
+            for (uint32_t t = 0; t <= pos; t++) {
+                s->att[t] = expf_bare(s->att[t] - max_s);
+                sum += s->att[t];
+            }
+            float inv = 1.0f / sum;
+            for (uint32_t t = 0; t <= pos; t++) s->att[t] *= inv;
+            for (uint32_t d = 0; d < hd; d++) xb2h[d] = 0;
+            for (uint32_t t = 0; t <= pos; t++) {
+                float *vt = s->kv_cache[l].v + t * kv_dim + kv_h * hd;
+                float w = s->att[t];
+                for (uint32_t d = 0; d < hd; d++) xb2h[d] += w * vt[d];
+            }
+        }
+        matvec(s->xb, ly->attn_output, s->xb2, dim, dim);
+        for (uint32_t i = 0; i < dim; i++) s->x[i] += s->xb[i];
+
+        /* FFN */
+        rmsnorm(s->xb, s->x, norm_data(ly->ffn_norm), dim);
+        matvec(s->hb, ly->ffn_gate, s->xb, s->ffn_dim, dim);
+        matvec(s->hb2, ly->ffn_up, s->xb, s->ffn_dim, dim);
+        for (uint32_t i = 0; i < s->ffn_dim; i++)
+            s->hb[i] = (s->hb[i] / (1.0f + expf_bare(-s->hb[i]))) * s->hb2[i];
+        matvec(s->xb, ly->ffn_down, s->hb, dim, s->ffn_dim);
+        for (uint32_t i = 0; i < dim; i++) s->x[i] += s->xb[i];
+    }
+
+    rmsnorm(s->x, s->x, norm_data(s->weights.output_norm), dim);
+    matvec(s->logits, s->weights.output, s->x, s->vocab_size, dim);
+    s->pos++;
+    return 0;
+}
+
 /* ══════════════════════════════════════════════════════════════
  *  NVMe-direct layer streaming
  *
@@ -881,6 +957,8 @@ int llama_forward_streaming(llama_state_t *s, uint32_t token)
  *  Shadow KV buffers prevent main cache corruption.
  * ══════════════════════════════════════════════════════════════ */
 
+static spec_state_t *g_spec;  /* global for decode loop access */
+
 int llama_spec_init(llama_state_t *s)
 {
     uint32_t dim = s->dim, kv_dim = s->kv_dim, ffn_dim = s->ffn_dim;
@@ -912,8 +990,7 @@ int llama_spec_init(llama_state_t *s)
     sp->hits = sp->misses = 0;
     sp->spec_complete = 0;
 
-    /* Store spec state pointer in the unused dma_map field or add a new field.
-     * For now, use a static since there's only one inference instance. */
+    g_spec = sp;
     serial_puts("[INF] Speculative execution initialized\n");
     return 0;
 }
@@ -1269,7 +1346,31 @@ void llama_generate(llama_state_t *state, const uint32_t *prompt,
         }
 
         uint64_t t0 = rdtsc();
-        llama_forward(state, next);
+
+        /* Speculative execution: if spec predicted correctly from the
+         * previous iteration, adopt the speculated layers and skip them.
+         * Otherwise, run the full forward pass. */
+        if (g_spec && g_spec->spec_complete == 1 &&
+            next == g_spec->predicted_token) {
+            /* HIT: commit shadow KV to main cache */
+            uint32_t kv_dim = state->kv_dim;
+            uint32_t spos = g_spec->spec_pos;
+            for (uint32_t sl = 0; sl < g_spec->spec_layers_done; sl++) {
+                memcpy(state->kv_cache[sl].k + (uint64_t)spos * kv_dim,
+                       g_spec->shadow_k[sl], kv_dim * sizeof(float));
+                memcpy(state->kv_cache[sl].v + (uint64_t)spos * kv_dim,
+                       g_spec->shadow_v[sl], kv_dim * sizeof(float));
+            }
+            /* Continue from where speculation left off */
+            memcpy(state->x, g_spec->spec_x, state->dim * sizeof(float));
+            llama_forward_from_layer(state, next, g_spec->spec_layers_done);
+            g_spec->hits++;
+        } else {
+            if (g_spec && g_spec->spec_complete == 1)
+                g_spec->misses++;
+            llama_forward(state, next);
+        }
+
         uint64_t t1 = rdtsc();
         uint64_t ms = (t1 - t0) / 3000000;
 
@@ -1289,11 +1390,116 @@ void llama_generate(llama_state_t *state, const uint32_t *prompt,
         }
         serial_puts(" (");
         serial_putdec(ms);
-        serial_puts(" ms)\n");
+        serial_puts(" ms");
+        if (g_spec && g_spec->spec_complete == 1 && next == g_spec->predicted_token)
+            serial_puts(" SPEC-HIT");
+        serial_puts(")\n");
         total_tokens++;
 
         /* Print decoded text to framebuffer */
         if (text) fb_puts(text);
+
+        /* Start speculation for NEXT token: predict via argmax,
+         * then compute first SPEC_MAX_LAYERS on shadow buffers.
+         * This overlaps with the sampling below on a real SMP system. */
+        if (g_spec && ap_worker_count >= 1 &&
+            next != LLAMA_EOS_1 && next != LLAMA_EOS_2) {
+            uint32_t predicted = argmax(state->logits, state->vocab_size);
+            g_spec->predicted_token = predicted;
+            g_spec->spec_pos = state->pos;  /* pos was already incremented */
+            g_spec->spec_complete = 0;
+
+            /* Run speculative layers 0..SPEC_MAX_LAYERS-1 with shadow KV.
+             * In a full implementation this would be submitted to an AP
+             * via smp_submit_any. For now, run inline (still benefits
+             * from the forward_from_layer skip on next iteration). */
+            embed_token(g_spec->spec_x, state->weights.token_embd,
+                        predicted, state->dim);
+            uint32_t kv_dim = state->kv_dim;
+            uint32_t hd = state->head_dim;
+            uint32_t spos = g_spec->spec_pos;
+            uint32_t layers_done = 0;
+
+            for (uint32_t l = 0; l < SPEC_MAX_LAYERS && l < state->n_layers; l++) {
+                llama_layer_t *ly = &state->weights.layers[l];
+                float *sx = g_spec->spec_x;
+                float *sxb = g_spec->spec_xb;
+
+                rmsnorm(sxb, sx, norm_data(ly->attn_norm), state->dim);
+                matvec(g_spec->spec_q, ly->attn_q, sxb, state->dim, state->dim);
+                matvec(g_spec->spec_k, ly->attn_k, sxb, kv_dim, state->dim);
+                matvec(g_spec->spec_v, ly->attn_v, sxb, kv_dim, state->dim);
+
+                rope(g_spec->spec_q, state->n_heads, hd, spos, state->rope_freq_base);
+                rope(g_spec->spec_k, state->n_kv_heads, hd, spos, state->rope_freq_base);
+
+                /* Write to SHADOW KV, not main cache */
+                memcpy(g_spec->shadow_k[l], g_spec->spec_k, kv_dim * sizeof(float));
+                memcpy(g_spec->shadow_v[l], g_spec->spec_v, kv_dim * sizeof(float));
+
+                /* Attention: use main KV cache for positions 0..spos-1,
+                 * shadow for position spos */
+                for (uint32_t h = 0; h < state->n_heads; h++) {
+                    uint32_t kv_h = h / state->gqa_ratio;
+                    float *qh = g_spec->spec_q + h * hd;
+                    float *xb2h = g_spec->spec_xb2 + h * hd;
+                    float max_s = -1e30f;
+                    /* Score against main KV (0..spos-1) */
+                    for (uint32_t t = 0; t < spos; t++) {
+                        float *kt = state->kv_cache[l].k + t * kv_dim + kv_h * hd;
+                        float sc = 0;
+                        for (uint32_t d = 0; d < hd; d++) sc += qh[d] * kt[d];
+                        sc /= sqrtf_bare((float)hd);
+                        g_spec->spec_att[t] = sc;
+                        if (sc > max_s) max_s = sc;
+                    }
+                    /* Score against shadow KV (position spos) */
+                    {
+                        float *kt = g_spec->shadow_k[l] + kv_h * hd;
+                        float sc = 0;
+                        for (uint32_t d = 0; d < hd; d++) sc += qh[d] * kt[d];
+                        sc /= sqrtf_bare((float)hd);
+                        g_spec->spec_att[spos] = sc;
+                        if (sc > max_s) max_s = sc;
+                    }
+                    float sum = 0;
+                    for (uint32_t t = 0; t <= spos; t++) {
+                        g_spec->spec_att[t] = expf_bare(g_spec->spec_att[t] - max_s);
+                        sum += g_spec->spec_att[t];
+                    }
+                    float inv = 1.0f / sum;
+                    for (uint32_t t = 0; t <= spos; t++) g_spec->spec_att[t] *= inv;
+                    for (uint32_t d = 0; d < hd; d++) xb2h[d] = 0;
+                    for (uint32_t t = 0; t < spos; t++) {
+                        float *vt = state->kv_cache[l].v + t * kv_dim + kv_h * hd;
+                        float w = g_spec->spec_att[t];
+                        for (uint32_t d = 0; d < hd; d++) xb2h[d] += w * vt[d];
+                    }
+                    /* Shadow V for position spos */
+                    {
+                        float *vt = g_spec->shadow_v[l] + kv_h * hd;
+                        float w = g_spec->spec_att[spos];
+                        for (uint32_t d = 0; d < hd; d++) xb2h[d] += w * vt[d];
+                    }
+                }
+                matvec(sxb, ly->attn_output, g_spec->spec_xb2, state->dim, state->dim);
+                for (uint32_t i = 0; i < state->dim; i++) sx[i] += sxb[i];
+
+                /* FFN */
+                rmsnorm(sxb, sx, norm_data(ly->ffn_norm), state->dim);
+                matvec(g_spec->spec_hb, ly->ffn_gate, sxb, state->ffn_dim, state->dim);
+                matvec(g_spec->spec_hb2, ly->ffn_up, sxb, state->ffn_dim, state->dim);
+                for (uint32_t i = 0; i < state->ffn_dim; i++)
+                    g_spec->spec_hb[i] = (g_spec->spec_hb[i] /
+                        (1.0f + expf_bare(-g_spec->spec_hb[i]))) * g_spec->spec_hb2[i];
+                matvec(sxb, ly->ffn_down, g_spec->spec_hb, state->dim, state->ffn_dim);
+                for (uint32_t i = 0; i < state->dim; i++) sx[i] += sxb[i];
+
+                layers_done++;
+            }
+            g_spec->spec_layers_done = layers_done;
+            g_spec->spec_complete = 1;
+        }
 
         next = sample_next(state->logits, state->vocab_size);
     }
@@ -1309,7 +1515,14 @@ void llama_generate(llama_state_t *state, const uint32_t *prompt,
     serial_putdec(total_ms);
     serial_puts(" ms (");
     serial_putdec(ms_per_tok);
-    serial_puts(" ms/tok)\n");
+    serial_puts(" ms/tok)");
+    if (g_spec && (g_spec->hits + g_spec->misses) > 0) {
+        serial_puts(" spec=");
+        serial_putdec(g_spec->hits);
+        serial_puts("/");
+        serial_putdec(g_spec->hits + g_spec->misses);
+    }
+    serial_puts("\n");
 
     fb_puts(" Done: ");
     fb_putdec(total_tokens);

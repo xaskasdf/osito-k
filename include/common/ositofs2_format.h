@@ -63,6 +63,8 @@
 #define OSFS2_FLAG_VALID      (1 << 0)
 #define OSFS2_FLAG_GGUF       (1 << 1)
 #define OSFS2_FLAG_RAW        (1 << 2)
+#define OSFS2_FLAG_INLINE     (1 << 3)  /* data stored inline in model_name[128] */
+#define OSFS2_INLINE_MAX      128       /* max inline bytes */
 
 /* GGUF quantization types (subset) */
 #define OSFS2_QUANT_NONE      0

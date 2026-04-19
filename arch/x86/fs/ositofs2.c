@@ -500,6 +500,12 @@ int osfs2_read(osfs2_file_t *file, uint64_t offset, void *buf, uint64_t len)
     if (!mounted || !file) return -1;
     if (offset + len > file->size) return -1;
 
+    /* Inline files: data stored in model_name[128] field */
+    if (file->flags & OSFS2_FLAG_INLINE) {
+        memcpy(buf, file->model_name + offset, len);
+        return (int)len;
+    }
+
     uint64_t abs_offset = ((uint64_t)file->start_block << blk_shift) + offset;
     int rc = osfs2_part_read(abs_offset, buf, len);
     if (rc < 0) return -1;
@@ -666,6 +672,27 @@ osfs2_file_t *osfs2_create(const char *name, uint64_t size)
         return NULL;
     }
 
+    /* Inline small files: store data directly in the file table entry
+     * (reusing model_name[128] field, which is unused for non-GGUF files).
+     * No block allocation needed — read/write go to the inode itself. */
+    if (size <= OSFS2_INLINE_MAX) {
+        osfs2_file_t *f = &file_table[slot];
+        memset(f, 0, sizeof(*f));
+        strcpy(f->name, name);
+        f->size = size;
+        f->start_block = 0;
+        f->block_count = 0;
+        f->flags = OSFS2_FLAG_VALID | OSFS2_FLAG_INLINE;
+        f->layer_index_slot = 0xFFFF;
+        f->create_time = osfs2_get_time();
+        f->modify_time = f->create_time;
+        osfs2_hash_insert((uint16_t)slot);
+        superblock.file_count++;
+        osfs2_write_file_table();
+        osfs2_write_superblock();
+        return f;
+    }
+
     /* Calculate blocks needed */
     uint32_t blocks = (uint32_t)((size + blk_size - 1) >> blk_shift);
     if (blocks == 0) blocks = 1;
@@ -731,6 +758,19 @@ osfs2_file_t *osfs2_create(const char *name, uint64_t size)
 int osfs2_write(osfs2_file_t *file, uint64_t offset, const void *buf, uint64_t len)
 {
     if (!mounted || !file || !buf) return -1;
+
+    /* Inline files: write to model_name field, persist via file table */
+    if (file->flags & OSFS2_FLAG_INLINE) {
+        if (offset + len > OSFS2_INLINE_MAX) return -1;
+        memcpy(file->model_name + offset, buf, len);
+        if (offset + len > file->size) {
+            file->size = offset + len;
+            file->modify_time = osfs2_get_time();
+        }
+        osfs2_write_file_table();
+        return 0;
+    }
+
     if (offset + len > (uint64_t)file->block_count << blk_shift) return -1;
 
     uint64_t abs_offset = ((uint64_t)file->start_block << blk_shift) + offset;

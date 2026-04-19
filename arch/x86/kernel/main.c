@@ -54,6 +54,7 @@ extern void reclaim_init_memory(void);
 
 /* VDSO */
 extern void vdso_init(void);
+extern void vdso_thunks_init(void);
 
 /* SMP */
 extern void smp_init(void);
@@ -429,8 +430,9 @@ void __initk kernel_entry(boot_info_t *info)
     /* ── Step 1.8: Syscall interface ── */
     syscall_init();
 
-    /* ── Step 1.8b: VDSO shared data page ── */
+    /* ── Step 1.8b: VDSO shared data page + code thunks ── */
     vdso_init();
+    vdso_thunks_init();
 
     /* ── Step 1.9: Process subsystem ── */
     proc_init();

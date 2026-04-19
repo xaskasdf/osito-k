@@ -781,9 +781,11 @@ int proc_exec(const char *filename, int argc, const char **argv)
          * deliberately does NOT map. elf_jump() switches CR3 right
          * before jumping into the user binary. */
 
-        /* Map VDSO page read-only into this process's address space */
+        /* Map VDSO data + code pages into this process's address space */
         extern int vdso_map_process(uint64_t cr3);
+        extern int vdso_thunks_map_process(uint64_t cr3);
         vdso_map_process(new_cr3);
+        vdso_thunks_map_process(new_cr3);
     }
 
     /* Set as current process and pin region registration target */
