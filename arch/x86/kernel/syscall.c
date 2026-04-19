@@ -249,6 +249,7 @@ static inline void wrmsr(uint32_t msr, uint64_t val) {
 #define SYS_SCHED_GETQOS    511
 #define SYS_GET_INPUT_EVENT 512
 #define SYS_BATCH           520  /* Execute array of syscalls in one trap */
+#define SYS_CMDRING_INIT    521  /* Set up syscall-free command ring */
 
 /* errno values */
 #define EPERM    1
@@ -520,9 +521,110 @@ extern void mem_free_pages(void *addr, uint64_t count);
  * CR3 if it has one, falling back to kernel_pml4. Callers ensure the
  * owning process is current (cleanup runs from sys_exit on its own
  * context; sys_munmap is called by the owning process directly). */
+/* ── Memory quarantine: catch use-after-free at page granularity ──
+ *
+ * When a VMA is freed, pages are unmapped (immediate #PF on access)
+ * but the physical page is held in quarantine for QUARANTINE_TICKS.
+ * If the process accesses it before expiry, the #PF handler detects
+ * the UAF and reports the address + freed-RIP with symbolized backtrace.
+ * Zero overhead in normal execution (only in munmap + #PF slow paths). */
+
+#define QUARANTINE_SIZE   256
+#define QUARANTINE_TICKS  500   /* 5 seconds at 100Hz */
+
+typedef struct {
+    uint64_t phys;
+    uint64_t virt;
+    uint64_t freed_tick;
+    uint64_t freed_rip;     /* caller's return address at free time */
+    uint32_t pid;
+    bool     active;
+} quarantine_entry_t;
+
+static quarantine_entry_t quarantine_ring[QUARANTINE_SIZE];
+static uint32_t quarantine_head;
+static bool     quarantine_enabled;
+
+/* Shell command: `quarantine on` / `quarantine off` */
+void quarantine_set(bool enable) { quarantine_enabled = enable; }
+bool quarantine_is_enabled(void) { return quarantine_enabled; }
+
+static void quarantine_page(uint64_t phys, uint64_t virt, uint32_t pid)
+{
+    /* Recycle oldest entry if slot is occupied */
+    quarantine_entry_t *slot = &quarantine_ring[quarantine_head % QUARANTINE_SIZE];
+    if (slot->active && slot->phys)
+        mem_free_pages((void *)slot->phys, 1);
+
+    slot->phys = phys;
+    slot->virt = virt;
+    slot->pid = pid;
+    slot->freed_tick = idt_get_ticks();
+    slot->freed_rip = (uint64_t)__builtin_return_address(1);
+    slot->active = true;
+    quarantine_head++;
+}
+
+/* Expire old quarantine entries (called periodically) */
+static void quarantine_expire(void)
+{
+    uint64_t now = idt_get_ticks();
+    for (int i = 0; i < QUARANTINE_SIZE; i++) {
+        if (quarantine_ring[i].active &&
+            now - quarantine_ring[i].freed_tick > QUARANTINE_TICKS) {
+            mem_free_pages((void *)quarantine_ring[i].phys, 1);
+            quarantine_ring[i].active = false;
+        }
+    }
+}
+
+/* Check if a faulting address hits a quarantined page → use-after-free */
+int quarantine_check_uaf(uint64_t fault_addr, uint32_t pid)
+{
+    if (!quarantine_enabled) return 0;
+
+    uint64_t fault_page = fault_addr & ~0xFFFULL;
+    for (int i = 0; i < QUARANTINE_SIZE; i++) {
+        quarantine_entry_t *q = &quarantine_ring[i];
+        if (!q->active || q->pid != pid) continue;
+        if (q->virt == fault_page) {
+            serial_puts("\n[UAF] *** USE-AFTER-FREE DETECTED ***\n");
+            serial_puts("[UAF] Address: 0x");
+            serial_puthex(fault_addr, 16);
+            serial_puts("\n[UAF] Page freed at RIP: 0x");
+            serial_puthex(q->freed_rip, 16);
+            serial_puts(" (");
+            serial_putdec(idt_get_ticks() - q->freed_tick);
+            serial_puts(" ticks ago)\n");
+            /* Symbolize via usym if available */
+            {
+                extern bool user_symbolize(void *p, uint64_t addr,
+                                           const char **name, uint64_t *off);
+                const char *name = NULL;
+                uint64_t off = 0;
+                if (user_symbolize(proc_current(), q->freed_rip, &name, &off) && name) {
+                    serial_puts("[UAF] Freed in: ");
+                    serial_puts(name);
+                    serial_puts("+0x");
+                    serial_puthex(off, 4);
+                    serial_puts("\n");
+                }
+            }
+            return 1;  /* UAF confirmed */
+        }
+    }
+    return 0;
+}
+
 static void vma_free_pages(vma_t *v)
 {
     uint64_t cr3 = v->owner ? proc_current_cr3() : 0;
+    extern int32_t proc_current_pid(void);
+    uint32_t pid = (uint32_t)proc_current_pid();
+
+    /* Expire old quarantine entries periodically */
+    if (quarantine_enabled)
+        quarantine_expire();
 
     for (uint64_t p = 0; p < v->pages; p++) {
         uint64_t va = v->base + p * 4096;
@@ -532,7 +634,11 @@ static void vma_free_pages(vma_t *v)
             uint64_t phys = *pte & PTE_ADDR_MASK_;
             if (cr3) paging_unmap_page_in_cr3(cr3, va);
             else     paging_unmap_page(va);
-            mem_free_pages((void *)phys, 1);
+
+            if (quarantine_enabled)
+                quarantine_page(phys, va, pid);
+            else
+                mem_free_pages((void *)phys, 1);
         }
     }
 }
@@ -1414,7 +1520,12 @@ int demand_page_fault(uint64_t addr, uint64_t error_code)
             break;
         }
     }
-    if (!vma) return -1;  /* No VMA → SIGSEGV */
+    if (!vma) {
+        /* Check quarantine before killing — may be use-after-free */
+        extern int32_t proc_current_pid(void);
+        quarantine_check_uaf(addr, (uint32_t)proc_current_pid());
+        return -1;  /* No VMA → SIGSEGV (quarantine_check_uaf logged if UAF) */
+    }
 
     /* Allocate a physical page, zero-filled via the upper-half mirror.
      * CPU writes (memset + vfs_read) go through the kernel direct map;
@@ -2723,6 +2834,116 @@ static int64_t sys_batch(uint64_t entries_addr, uint64_t count)
     return (int64_t)count;
 }
 
+/* ── Syscall-free command ring for trusted processes ──────────
+ *
+ * A process allocates a cmd_ring_t in its address space and registers
+ * it via SYS_CMDRING_INIT. Instead of trapping into the kernel per
+ * I/O operation, it writes cmd_entry_t records to the ring and the
+ * kernel drains them during the process's quantum (called from
+ * sched_tick context where current_proc is already correct, so
+ * fd_table resolves to this process's fds). Zero SYSCALL overhead.
+ *
+ * Userspace fallback: if the ring isn't set up, regular SYSCALL works.
+ * ────────────────────────────────────────────────────────────────── */
+
+#define CMDRING_SIZE     64
+#define CMD_FREE         0
+#define CMD_PENDING      1
+#define CMD_DONE         2
+
+#define CMD_WRITE        1
+#define CMD_READ         2
+#define CMD_CLOSE        3
+#define CMD_LSEEK        4
+
+typedef struct {
+    uint32_t opcode;
+    uint32_t flags;
+    int32_t  fd;
+    uint32_t _pad;
+    uint64_t addr;       /* buffer address (in shared address space) */
+    uint64_t len;
+    int64_t  result;     /* written by kernel when CMD_DONE */
+    volatile uint32_t state;  /* CMD_FREE / CMD_PENDING / CMD_DONE */
+    uint32_t _pad2;
+} cmd_entry_t;
+
+typedef struct {
+    volatile uint32_t head;    /* process writes here (mod CMDRING_SIZE) */
+    volatile uint32_t tail;    /* kernel reads here */
+    uint32_t          magic;   /* 0x434D4452 = "CMDR" */
+    uint32_t          _pad;
+    cmd_entry_t       entries[CMDRING_SIZE];
+} cmd_ring_t;
+
+#define CMDRING_MAGIC 0x434D4452
+
+/* Per-process ring pointer — stored alongside process_t.
+ * For now, use a simple global indexed by proctab slot.
+ * Only one process at a time can have an active ring. */
+#define MAX_CMD_RINGS 64
+static cmd_ring_t *cmd_rings[MAX_CMD_RINGS];
+
+/* Drain pending commands from a process's ring.
+ * Called from sched_tick context (current_proc valid, interrupts off). */
+void cmdring_drain(int proc_idx)
+{
+    if (proc_idx < 0 || proc_idx >= MAX_CMD_RINGS) return;
+    cmd_ring_t *ring = cmd_rings[proc_idx];
+    if (!ring || ring->magic != CMDRING_MAGIC) return;
+
+    /* Process up to 8 commands per tick to avoid hogging the ISR */
+    int drained = 0;
+    while (ring->tail != ring->head && drained < 8) {
+        uint32_t idx = ring->tail % CMDRING_SIZE;
+        cmd_entry_t *e = &ring->entries[idx];
+
+        if (e->state != CMD_PENDING) break;
+
+        switch (e->opcode) {
+        case CMD_WRITE:
+            e->result = sys_write((uint64_t)e->fd, e->addr, e->len);
+            break;
+        case CMD_READ:
+            e->result = sys_read((uint64_t)e->fd, e->addr, e->len);
+            break;
+        case CMD_CLOSE:
+            e->result = sys_close((uint64_t)e->fd);
+            break;
+        case CMD_LSEEK:
+            e->result = sys_lseek((uint64_t)e->fd, e->addr, e->len);
+            break;
+        default:
+            e->result = -ENOSYS;
+            break;
+        }
+
+        __asm__ volatile ("mfence" ::: "memory");
+        e->state = CMD_DONE;
+        ring->tail++;
+        drained++;
+    }
+}
+
+static int64_t sys_cmdring_init(uint64_t ring_addr)
+{
+    if (!ring_addr) return -EINVAL;
+
+    cmd_ring_t *ring = (cmd_ring_t *)ring_addr;
+    ring->magic = CMDRING_MAGIC;
+    ring->head = 0;
+    ring->tail = 0;
+    memset(ring->entries, 0, sizeof(ring->entries));
+
+    /* Register for current process via PID-indexed slot */
+    extern int32_t proc_current_pid(void);
+    int32_t pid = proc_current_pid();
+    if (pid <= 0 || pid >= MAX_CMD_RINGS) return -EINVAL;
+    cmd_rings[pid] = ring;
+
+    return (int64_t)(uint64_t)ring;  /* return ring address as confirmation */
+}
+
 /* ── Syscall dispatch (called from assembly) ─────────────────── */
 
 int64_t syscall_dispatch(uint64_t nr, uint64_t a1, uint64_t a2,
@@ -2908,9 +3129,11 @@ int64_t syscall_dispatch(uint64_t nr, uint64_t a1, uint64_t a2,
     case SYS_SCHED_GETQOS:
         return sched_get_qos ? (int64_t)sched_get_qos((uint32_t)a1) : -ENOSYS;
 
-    /* ── OsitoK private: batched syscalls ─────────────────────── */
+    /* ── OsitoK private: batched syscalls + command ring ─────── */
     case SYS_BATCH:
         return sys_batch(a1, a2);
+    case SYS_CMDRING_INIT:
+        return sys_cmdring_init(a1);
 
     default:
         serial_puts("[SYSCALL] Unknown syscall ");

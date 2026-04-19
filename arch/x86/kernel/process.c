@@ -831,6 +831,13 @@ void sched_tick(void *frame_ptr)
 
     process_t *cur = &proctab[sched_current_idx];
 
+    /* Drain syscall-free command ring for current process (if registered).
+     * fd_table macro resolves via current_proc which is correct here. */
+    {
+        extern void cmdring_drain(int proc_idx);
+        cmdring_drain((int)cur->pid);
+    }
+
     /* Check if a higher-priority process is READY (preemption).
      * ZOMBIE/BLOCKED processes always force-switch immediately.
      * Otherwise, only switch if quantum expired or preempted. */
