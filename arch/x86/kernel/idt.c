@@ -809,6 +809,12 @@ void isr_handler(interrupt_frame_t *frame)
          * vtable and jumps to BIOS IVT addresses → #UD. */
         if (g_null_page_dirty) null_page_clean();
 
+        /* Always-on profiling: record RIP at each timer tick (~3 cycles) */
+        {
+            extern void kprof_record(uint64_t rip);
+            kprof_record(frame->rip);
+        }
+
         /* X-SCHED: preemptive scheduler — check quantum, switch if expired.
          * frame points to saved GPRs on the current process's stack. */
         sched_tick(frame);

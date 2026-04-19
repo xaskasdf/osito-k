@@ -248,6 +248,7 @@ static inline void wrmsr(uint32_t msr, uint64_t val) {
 #define SYS_SCHED_SETQOS    510
 #define SYS_SCHED_GETQOS    511
 #define SYS_GET_INPUT_EVENT 512
+#define SYS_BATCH           520  /* Execute array of syscalls in one trap */
 
 /* errno values */
 #define EPERM    1
@@ -638,17 +639,22 @@ static int64_t sys_write(uint64_t fd, uint64_t buf, uint64_t count)
         uint64_t written = 0;
         while (written < count) {
             if (p->count >= PIPE_BUF_SIZE) {
-                /* Buffer full — block until reader drains, or return
-                 * partial / EAGAIN if non-blocking. */
                 if (written > 0) return (int64_t)written;
                 if (nonblock) return -EAGAIN;
                 __asm__ volatile ("sti; hlt; cli" ::: "memory");
                 if (p->read_refs == 0) return -EPIPE;
                 continue;
             }
-            p->buf[p->head] = src[written++];
-            p->head = (p->head + 1) % PIPE_BUF_SIZE;
-            p->count++;
+            /* Bulk copy: contiguous chunk from head to end-of-buffer */
+            uint32_t space = PIPE_BUF_SIZE - p->count;
+            uint32_t contig = PIPE_BUF_SIZE - p->head;
+            uint32_t remain = (uint32_t)(count - written);
+            uint32_t chunk = space < contig ? space : contig;
+            if (chunk > remain) chunk = remain;
+            memcpy(&p->buf[p->head], src + written, chunk);
+            p->head = (p->head + chunk) % PIPE_BUF_SIZE;
+            p->count += chunk;
+            written += chunk;
         }
         return (int64_t)written;
     }
@@ -729,9 +735,15 @@ static int64_t sys_read(uint64_t fd, uint64_t buf, uint64_t count)
         uint8_t *dst = (uint8_t *)buf;
         uint64_t nread = 0;
         while (nread < count && p->count > 0) {
-            dst[nread++] = p->buf[p->tail];
-            p->tail = (p->tail + 1) % PIPE_BUF_SIZE;
-            p->count--;
+            /* Bulk copy: contiguous chunk from tail to end-of-buffer */
+            uint32_t contig = PIPE_BUF_SIZE - p->tail;
+            uint32_t remain = (uint32_t)(count - nread);
+            uint32_t chunk = p->count < contig ? p->count : contig;
+            if (chunk > remain) chunk = remain;
+            memcpy(dst + nread, &p->buf[p->tail], chunk);
+            p->tail = (p->tail + chunk) % PIPE_BUF_SIZE;
+            p->count -= chunk;
+            nread += chunk;
         }
         return (int64_t)nread;
     }
@@ -2670,6 +2682,47 @@ static int64_t sys_statx(uint64_t dirfd, uint64_t path_addr,
     return -ENOENT;
 }
 
+/* ── Batched syscall: execute multiple operations in one trap ── */
+
+typedef struct {
+    uint64_t nr;         /* syscall number */
+    uint64_t args[6];    /* arguments */
+    int64_t  result;     /* filled by kernel */
+    uint32_t flags;      /* BATCH_STOP_ON_ERROR, etc */
+    uint32_t _pad;
+} batch_entry_t;
+
+#define BATCH_STOP_ON_ERROR    (1 << 0)
+#define BATCH_USE_PREV_RESULT  0xFFFFFFFFFFFFFFFFULL  /* magic arg value */
+#define BATCH_MAX_ENTRIES      32
+
+/* Forward decl — defined immediately below */
+int64_t syscall_dispatch(uint64_t nr, uint64_t a1, uint64_t a2,
+                         uint64_t a3, uint64_t a4, uint64_t a5);
+
+static int64_t sys_batch(uint64_t entries_addr, uint64_t count)
+{
+    if (count == 0 || count > BATCH_MAX_ENTRIES) return -EINVAL;
+    batch_entry_t *entries = (batch_entry_t *)entries_addr;
+    int64_t prev_result = 0;
+
+    for (uint64_t i = 0; i < count; i++) {
+        batch_entry_t *e = &entries[i];
+
+        /* Substitute BATCH_USE_PREV_RESULT magic in args */
+        uint64_t a[6];
+        for (int j = 0; j < 6; j++)
+            a[j] = (e->args[j] == BATCH_USE_PREV_RESULT) ? (uint64_t)prev_result : e->args[j];
+
+        e->result = syscall_dispatch(e->nr, a[0], a[1], a[2], a[3], a[4]);
+        prev_result = e->result;
+
+        if ((e->flags & BATCH_STOP_ON_ERROR) && e->result < 0)
+            return -(int64_t)(i + 1);  /* negative = 1-based failed entry index */
+    }
+    return (int64_t)count;
+}
+
 /* ── Syscall dispatch (called from assembly) ─────────────────── */
 
 int64_t syscall_dispatch(uint64_t nr, uint64_t a1, uint64_t a2,
@@ -2854,6 +2907,10 @@ int64_t syscall_dispatch(uint64_t nr, uint64_t a1, uint64_t a2,
         return sched_set_qos ? (int64_t)sched_set_qos((uint32_t)a1, (uint8_t)a2) : -ENOSYS;
     case SYS_SCHED_GETQOS:
         return sched_get_qos ? (int64_t)sched_get_qos((uint32_t)a1) : -ENOSYS;
+
+    /* ── OsitoK private: batched syscalls ─────────────────────── */
+    case SYS_BATCH:
+        return sys_batch(a1, a2);
 
     default:
         serial_puts("[SYSCALL] Unknown syscall ");

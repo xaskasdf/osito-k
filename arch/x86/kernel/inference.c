@@ -322,17 +322,30 @@ int llama_init(llama_state_t *state, gguf_model_t *model, uint32_t max_seq)
     serial_putdec(state->kv_dim);
     serial_puts(" kv_dim)\n");
 
-    /* ── Allocate scratch buffers (single allocation) ── */
+    /* ── Allocate scratch buffers (single allocation, cache-colored) ──
+     *
+     * Buffers used concurrently on different cores (Q on BSP, K on AP0,
+     * V on AP1; gate on BSP, up on AP0) are separated by L2_COLOR_PAD
+     * bytes to avoid L2 cache set aliasing. On a typical x86-64 L2
+     * (256KB, 8-way, 64B lines, 512 sets), bits [6:14] of the address
+     * determine the set. Two buffers that differ by <32KB in address
+     * alias to the same sets and evict each other. The padding ensures
+     * concurrent buffers map to different set regions. */
+#define L2_COLOR_PAD  (32 * 1024)  /* 32KB — one full L2 set stride */
+
     uint64_t scratch_size =
         (uint64_t)state->dim * sizeof(float) +          /* x */
         (uint64_t)state->dim * sizeof(float) +          /* xb */
         (uint64_t)state->dim * sizeof(float) +          /* xb2 */
         (uint64_t)state->dim * sizeof(float) +          /* q */
-        (uint64_t)state->kv_dim * sizeof(float) +       /* k */
-        (uint64_t)state->kv_dim * sizeof(float) +       /* v */
+        L2_COLOR_PAD +                                   /* ── color boundary ── */
+        (uint64_t)state->kv_dim * sizeof(float) +       /* k (AP0) */
+        L2_COLOR_PAD +                                   /* ── color boundary ── */
+        (uint64_t)state->kv_dim * sizeof(float) +       /* v (AP1) */
         (uint64_t)max_seq * sizeof(float) +              /* att */
-        (uint64_t)state->ffn_dim * sizeof(float) +      /* hb */
-        (uint64_t)state->ffn_dim * sizeof(float) +      /* hb2 */
+        (uint64_t)state->ffn_dim * sizeof(float) +      /* hb (BSP) */
+        L2_COLOR_PAD +                                   /* ── color boundary ── */
+        (uint64_t)state->ffn_dim * sizeof(float) +      /* hb2 (AP0) */
         (uint64_t)state->vocab_size * sizeof(float);     /* logits */
 
     uint64_t scratch_pages = pages_for(scratch_size);
@@ -346,16 +359,19 @@ int llama_init(llama_state_t *state, gguf_model_t *model, uint32_t max_seq)
     state->scratch = (float *)PHYS_TO_VIRT(scratch_phys);
     memset(state->scratch, 0, (size_t)(scratch_pages * PAGE_SZ));
 
-    /* Partition scratch */
+    /* Partition scratch (cache-colored: pad between concurrent buffers) */
     float *ptr = state->scratch;
     state->x      = ptr; ptr += state->dim;
     state->xb     = ptr; ptr += state->dim;
     state->xb2    = ptr; ptr += state->dim;
     state->q      = ptr; ptr += state->dim;
+    ptr = (float *)((uint64_t)ptr + L2_COLOR_PAD);  /* Q↔K color boundary */
     state->k      = ptr; ptr += state->kv_dim;
+    ptr = (float *)((uint64_t)ptr + L2_COLOR_PAD);  /* K↔V color boundary */
     state->v      = ptr; ptr += state->kv_dim;
     state->att    = ptr; ptr += max_seq;
     state->hb     = ptr; ptr += state->ffn_dim;
+    ptr = (float *)((uint64_t)ptr + L2_COLOR_PAD);  /* gate↔up color boundary */
     state->hb2    = ptr; ptr += state->ffn_dim;
     state->logits = ptr;
 
@@ -408,6 +424,10 @@ static void matvec_worker(void *arg, void *result)
 {
     (void)result;
     matvec_arg_t *a = (matvec_arg_t *)arg;
+    /* Prefetch input vector into this AP's L2 — it's hot in BSP's cache
+     * from rmsnorm but cold here. 16 floats = 64 bytes = 1 cache line. */
+    for (uint32_t i = 0; i < a->cols; i += 16)
+        __builtin_prefetch(a->input + i, 0, 1);
     matvec(a->out, a->tensor, a->input, a->rows, a->cols);
 }
 
@@ -427,6 +447,10 @@ static void attention_heads_worker(void *arg, void *result)
 {
     (void)result;
     attn_chunk_t *c = (attn_chunk_t *)arg;
+
+    /* Prefetch Q vector for our head range into this AP's cache */
+    for (uint32_t i = c->h_start * c->hd; i < c->h_end * c->hd; i += 16)
+        __builtin_prefetch(c->q + i, 0, 1);
 
     for (uint32_t h = c->h_start; h < c->h_end; h++) {
         uint32_t kv_h = h / c->gqa_ratio;

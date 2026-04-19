@@ -28,7 +28,8 @@ static kprof_sample_t *samples;  /* Lazy alloc (saves ~64KB BSS) */
 static uint32_t sample_head;
 static uint32_t sample_count;
 static uint32_t histogram[KPROF_BUCKETS];
-static bool     profiling;
+static uint64_t histogram_samples;  /* always-on sample counter */
+static bool     profiling;          /* ring buffer recording (opt-in) */
 static uint64_t prof_start_tick;
 
 /* ── Control ─────────────────────────────────────────────────── */
@@ -66,28 +67,29 @@ bool kprof_is_active(void) { return profiling; }
 
 void kprof_record(uint64_t rip)
 {
-    if (!profiling) return;
+    /* Always-on: histogram records every tick (~3 cycles, one array write) */
+    uint32_t bucket = (uint32_t)(rip >> KPROF_BUCKET_SHIFT);
+    if (bucket < KPROF_BUCKETS)
+        histogram[bucket]++;
+    histogram_samples++;
 
-    /* Store raw sample */
+    /* Detailed ring buffer: only when explicitly profiling */
+    if (!profiling) return;
     if (sample_count < KPROF_MAX_SAMPLES) {
         samples[sample_head].rip = rip;
         samples[sample_head].tick = idt_get_ticks();
         sample_head = (sample_head + 1) % KPROF_MAX_SAMPLES;
         sample_count++;
     }
-
-    /* Update histogram */
-    uint32_t bucket = (uint32_t)(rip >> KPROF_BUCKET_SHIFT);
-    if (bucket < KPROF_BUCKETS)
-        histogram[bucket]++;
 }
 
 /* ── Report ──────────────────────────────────────────────────── */
 
 void kprof_report(void)
 {
+    uint64_t total = histogram_samples ? histogram_samples : sample_count;
     serial_puts("[KPROF] Hotspot report (");
-    serial_putdec(sample_count);
+    serial_putdec(total);
     serial_puts(" samples):\n");
 
     /* Find top 10 buckets */
@@ -103,7 +105,7 @@ void kprof_report(void)
         if (max_idx < 0 || max_count == 0) break;
 
         uint64_t addr = (uint64_t)max_idx << KPROF_BUCKET_SHIFT;
-        uint32_t pct = (sample_count > 0) ? (max_count * 100 / sample_count) : 0;
+        uint32_t pct = (total > 0) ? (uint32_t)(max_count * 100 / total) : 0;
 
         serial_puts("  0x");
         serial_puthex(addr, 12);
