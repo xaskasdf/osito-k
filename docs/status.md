@@ -11,6 +11,30 @@ preemptive scheduler, 4-level paging, 100+ Linux syscalls, three filesystem
 drivers (osfs2/osfs3 native + FAT32/ext2/NTFS host), full TCP/IP+TLS, SMP,
 Win32 PE compat, GUI compositor, GPU compute (RTX), self-hosting via TCC.
 
+### Deep kernel optimizations — 2026-04-19
+
+Commit `4475141` on `experiment`. 10 hardware-level features, 25 files,
++1104 -105 lines. Full details in `docs/deep-kernel-optimizations.md`.
+
+1. **Hot/cold/init code splitting** — `__hot`/`__cold`/`__initk` section
+   macros, linker script restructured. Hot section ~17KB at text start
+   (L1i-resident). Init section 20KB reclaimable after boot.
+2. **VDSO page** — kernel-maintained 4KB at `0x7FFFE000`, seqlock-updated
+   at 100Hz. Zero-syscall clock_gettime for userspace.
+3. **TSC-deadline scheduling** — LAPIC deadline mode with 100us RT quanta
+   (was 10ms). Tickless idle. PIT-based TSC calibration.
+4. **Interrupt-driven NIC (NAPI)** — PCI MSI support (generic capability
+   walk), I211 vector 40, ~1-5us packet latency (was 10ms polling).
+5. **WC compositor flip** — `memcpy_nt` in GOP fallback, frees ~3MB L3.
+6. **F16C + 4-block unrolled matvec** — `vcvtph2ps` replaces 20-instr
+   software f16-to-f32. 2 accumulators hide FMA latency.
+7. **NVMe async DMA + tensor streaming** — async submit/poll/wait,
+   tensor-to-LBA map, ping-pong layer buffers. Models larger than RAM.
+8. **Speculative token execution** — shadow KV buffers, separate scratch.
+   Infrastructure for argmax prediction overlap with sampling.
+9. **KV cache checkpoint/restore** — serialize pos + KV to OsitoFS file.
+   Instant prompt resume without recompute (~32MB, ~16ms for 512 tokens).
+
 ### Architecture + experimental features — 2026-04-18/19
 
 Three commits (`259bc58`, `a56fdd5`, `e1d2d6a`) implement 14 kernel
