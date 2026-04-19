@@ -11,6 +11,28 @@ preemptive scheduler, 4-level paging, 100+ Linux syscalls, three filesystem
 drivers (osfs2/osfs3 native + FAT32/ext2/NTFS host), full TCP/IP+TLS, SMP,
 Win32 PE compat, GUI compositor, GPU compute (RTX), self-hosting via TCC.
 
+### Architecture + experimental features — 2026-04-18/19
+
+Three commits (`259bc58`, `a56fdd5`, `e1d2d6a`) implement 14 kernel
+optimizations across 8 files (+661 -123 lines). Full detail in
+[`kernel-architecture.md`](kernel-architecture.md).
+
+| Category | Feature | Files | Impact |
+|----------|---------|-------|--------|
+| **Performance** | REP MOVSB memcpy/memset | crt.c | 4-16x large copies |
+| **Performance** | Compositor frame-level dirty skip | compositor.c | 0% idle CPU (was 100%) |
+| **Performance** | Pipe bulk memcpy | syscall.c | 4096 iterations → 1-2 memcpy |
+| **Scheduler** | O(1) run queue (bitmap + per-QoS lists) | process.c | O(5) vs O(64) per tick |
+| **Scheduler** | O(1) `proc_find` via `pid_to_idx[]` | process.c | O(1) vs O(64) |
+| **Correctness** | Shared `fd_table_t` for threads | fd.h, process.c | POSIX CLONE_FILES |
+| **Correctness** | Futex hash buckets (32 buckets) | process.c | O(8) avg vs O(256) |
+| **Profiling** | Always-on kprof histogram | kprof.c, idt.c | Zero-cost 100Hz sampling |
+| **Inference** | AP input vector L2 prefetch | inference.c | Warm AP caches before matvec |
+| **Inference** | Tensor scratch cache coloring | inference.c | 32KB L2 padding between Q/K/V |
+| **Syscall** | `SYS_BATCH` (520) — batched syscalls | syscall.c | N ops in 1 trap + chaining |
+| **Syscall** | `SYS_CMDRING_INIT` (521) — command ring | syscall.c, process.c | Zero-trap I/O |
+| **Debug** | Memory quarantine (UAF detection) | syscall.c | Symbolized use-after-free reports |
+
 ### Last stabilization sweep — 2026-04-12
 
 Eight commits (`be59c00..207900d`) brought the kernel from "loads small
@@ -65,9 +87,10 @@ and pflash setup on macOS automatically.
 2. **fork+execve of same binary on demand path** — child page faults
    rewrite parent PTEs. Static binaries that fork+exec themselves should
    link with `PT_DYNAMIC` to use the eager path.
-3. **Single shared address space** — no per-process PML4. Two processes
-   loading at the same vaddr (e.g. zsh and GTA5 both at 0x20000000) cannot
-   coexist concurrently.
+3. ~~**Single shared address space**~~ — **RESOLVED** (Apr 13, wave 8).
+   Per-process PML4 with empty lower-half PDPT. Processes have isolated
+   address spaces. COW infrastructure exists (`PTE_COW` + `paging_cow_copy`)
+   but fork still uses vfork semantics + `syscall_save_brk` workaround.
 
 ### Roadmap files
 

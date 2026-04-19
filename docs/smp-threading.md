@@ -33,20 +33,37 @@ BSP (CPU 0)                    AP 1-3
 
 ## API
 
+### Work-Stealing via Chase-Lev Deques (Apr 18)
+
+Replaced flat submit/wait model with lock-free per-CPU deques:
+
+```
+BSP Deque          AP0 Deque          AP1 Deque
+[task3]            [stolen]           [stolen]
+[task2]  ←pop      [task5]  ←pop      [task7]  ←pop
+[task1]            [task4]            [task6]
+  ↑ steal            ↑ steal            ↑ steal
+```
+
+- **Owner** pushes/pops from bottom (LIFO — cache-warm)
+- **Thieves** steal from top (FIFO — oldest first)
+- Lock-free: MFENCE in pop, CAS in steal, 128-byte aligned
+- `DEQUE_CAPACITY = 16` per CPU
+- `smp_wait()` pops own deque (does useful work) — prevents circular waits
+
 ### Low-level: smp_submit / smp_wait
 
 ```c
 #include "smp_work.h"
 
-// Submit to specific AP
+// Submit to caller's own deque (ap_idx hint ignored — work-stealing distributes)
 int smp_submit(int ap_idx, smp_work_func_t func, void *arg, void *result);
 
-// Submit to any idle AP
+// Submit to caller's deque (any AP steals)
 int smp_submit_any(smp_work_func_t func, void *arg, void *result);
 
-// Wait for completion
-void smp_wait(int ap_idx);
-void smp_barrier(void);  // wait for all
+// Wait — pops own deque while waiting (work-stealing)
+void smp_wait(int task_id);
 ```
 
 ### High-level: tls_parallel_for / tls_parallel_reduce
@@ -70,6 +87,32 @@ Q4_0 matvec 2048x2048 (tensor inference hot path):
 - Single-core: 256M cycles (~85ms)
 - 4-core SMP:   65M cycles (~21ms)
 - **Speedup: 4x** (linear scaling)
+
+## Inference Optimizations (Apr 19)
+
+### AP Input Vector Prefetch
+
+AP workers (`matvec_worker`, `attention_heads_worker`) prefetch the input
+vector into their local L2 before computing. The vector is hot in BSP's
+cache from `rmsnorm` but cold on APs:
+
+```c
+for (uint32_t i = 0; i < a->cols; i += 16)  /* 16 floats = 64B = 1 cache line */
+    __builtin_prefetch(a->input + i, 0, 1);
+```
+
+### Tensor Scratch Cache Coloring
+
+Buffers used concurrently on different cores (Q on BSP, K on AP0, V on AP1)
+are separated by 32KB `L2_COLOR_PAD` to avoid L2 set aliasing:
+
+```
+[x][xb][xb2][q]  ──32KB──  [k]  ──32KB──  [v][att][hb]  ──32KB──  [hb2][logits]
+     BSP only      pad     AP0     pad     AP1              pad      AP0
+```
+
+Scratch grows from 215KB → 311KB (+96KB padding, 3 color boundaries).
+Only measurable benefit on real hardware — structurally correct regardless.
 
 ## Speculative Prefetch
 
