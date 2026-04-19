@@ -11,6 +11,12 @@ preemptive scheduler, 4-level paging, 100+ Linux syscalls, three filesystem
 drivers (osfs2/osfs3 native + FAT32/ext2/NTFS host), full TCP/IP+TLS, SMP,
 Win32 PE compat, GUI compositor, GPU compute (RTX), self-hosting via TCC.
 
+### Kernel subsystems — 2026-04-19 (commit 94dbe19)
+
+8 new kernel subsystems, 5 new source files, +953 lines:
+crash reports, exec cache, demand prefetch, audio scheduling,
+DMA coordination, trie tokenizer, kexec state, shell commands.
+
 ### Deep kernel optimizations — 2026-04-19
 
 Commit `4475141` on `experiment`. 10 hardware-level features, 25 files,
