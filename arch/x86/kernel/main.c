@@ -604,9 +604,9 @@ void kernel_entry(boot_info_t *info)
                 }
 
                 if (llama_init(&llama, &gguf_model, 256) == 0) {
-                    uint32_t prompt[] = { 128000 };
-                    llama_generate(&llama, prompt, 1, 32);
                     model_ready = true;
+                    /* Model loaded — inference available via 'chat' command.
+                     * No auto-generate at boot (user runs it on demand). */
                 }
             }
 
@@ -620,20 +620,9 @@ void kernel_entry(boot_info_t *info)
             if (gp && gp->gsp_present)
                 gsp_boot();
 
-            /* X40: GPU-accelerated inference (after GPU init) */
-            if (model_ready) {
-                static gpu_llama_state_t gpu_llama;
-                if (gpu_llama_init(&gpu_llama, &llama) == 0) {
-                    gpu_llama_benchmark(&gpu_llama);
-                    llama.pos = 0;
-                    uint32_t prompt2[] = { 128000 };
-                    gpu_llama_generate(&gpu_llama, prompt2, 1, 32);
-                    gpu_llama_free(&gpu_llama);
-                }
+            /* Make model available for shell 'chat' command */
+            if (model_ready)
                 prompt_llama = &llama;
-            } else {
-                gpu_llama_benchmark_standalone();
-            }
 
             /* ── Try executing ELF programs if present ── */
             vfs_node_t fn;
