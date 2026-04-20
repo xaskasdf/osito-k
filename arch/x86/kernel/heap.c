@@ -211,18 +211,11 @@ static void block_split(block_hdr_t *block, uint64_t needed)
     new_block->flags = BLOCK_FREE;
     new_block->size = remaining - sizeof(block_hdr_t);
 
-    /* Shrink original block */
+    /* Shrink original block (stays in free list — caller removes it) */
     block->size = needed;
 
-    /* Insert new block into free list after current */
-    new_block->next = block->next;
-    new_block->prev = block->prev;
-
-    if (block->next) block->next->prev = new_block;
-    if (block->prev) block->prev->next = new_block;
-    if (free_list == block) free_list = new_block;
-
-    /* Original block is being removed from free list by caller */
+    /* Insert new_block into free list as a NEW entry (don't replace block) */
+    free_list_insert(new_block);
 }
 
 /* ── malloc ──────────────────────────────────────────────────── */
