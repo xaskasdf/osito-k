@@ -3424,6 +3424,16 @@ int64_t __hot syscall_dispatch(uint64_t nr, uint64_t a1, uint64_t a2,
     case SYS_GPU_CTX_DESTROY: {  /* 602: gpu_ctx_destroy(ctx_id) */
         return vg3d_ctx_destroy((uint32_t)proc_current_pid(), (uint32_t)a1);
     }
+    case SYS_GPU_RES_CREATE: {   /* 603: (ctx_id, args *) */
+        const struct gpu_res_create_args *a =
+            (const struct gpu_res_create_args *)a2;
+        return vg3d_res_create((uint32_t)proc_current_pid(),
+                               (uint32_t)a1, a);
+    }
+    case SYS_GPU_RES_MAP: {      /* 604: (res_id) -> user VA */
+        return (int64_t)vg3d_res_map((uint32_t)proc_current_pid(),
+                                     (uint32_t)a1);
+    }
 
     default:
         serial_puts("[SYSCALL] Unknown syscall ");
