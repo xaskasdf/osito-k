@@ -559,6 +559,14 @@ void __initk kernel_entry(boot_info_t *info)
         if (vgpu) {
             virtio_gpu_init(pci_get_ecam_base(), vgpu->bus, vgpu->dev, vgpu->func,
                            info->fb_width, info->fb_height);
+
+            /* Vulkan Phase 1 -- Wave 1: 3D extension + selftest */
+            extern void virtio_gpu_3d_init(void);
+            extern void virtio_gpu_3d_selftest(void);
+            extern void nvk_backend_init_hook(void);
+            virtio_gpu_3d_init();
+            nvk_backend_init_hook();
+            virtio_gpu_3d_selftest();
         } else {
             serial_puts("[KERN] No virtio-GPU found\n");
         }

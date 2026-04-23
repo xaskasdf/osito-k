@@ -24,6 +24,23 @@ EFI_BIN="$BUILD_DIR/boot.efi"
 KERN_BIN="$BUILD_DIR/kernel.elf"
 ESP_IMG="$BUILD_DIR/esp.img"
 
+# -- Vulkan Wave 1: virtio-gpu-gl-pci is the default display device so
+# the guest can negotiate VIRTIO_GPU_F_VIRGL. `--no-gl` falls back to the
+# plain 2D virtio-vga for hosts that lack virglrenderer. --
+USE_GL="true"
+NO_BUILD="false"
+for arg in "$@"; do
+    case "$arg" in
+        --no-gl)    USE_GL="false" ;;
+        --no-build) NO_BUILD="true" ;;
+    esac
+done
+if [ "$USE_GL" = "true" ]; then
+    GPU_DEVICE="-device virtio-gpu-gl-pci,hostmem=256M,blob=on"
+else
+    GPU_DEVICE="-device virtio-vga"
+fi
+
 # OVMF firmware paths (try common locations)
 # Prefer the combined OVMF.fd (works with -bios), then split CODE+VARS (needs pflash)
 for f in /usr/share/qemu/OVMF.fd \
@@ -74,7 +91,7 @@ command -v mtools >/dev/null 2>&1 || command -v mcopy >/dev/null 2>&1 || error "
 
 # ── Build if needed ───────────────────────────────────────────
 
-if [ "$1" != "--no-build" ]; then
+if [ "$NO_BUILD" != "true" ]; then
     info "Building boot.efi + kernel.elf..."
     # On macOS, use cross-compiler and macOS gnu-efi paths
     if [ "$(uname)" = "Darwin" ]; then
@@ -170,7 +187,7 @@ qemu-system-x86_64 \
     -audiodev wav,id=wav0,path=$BUILD_DIR/audio.wav \
     -device intel-hda,id=hda0 \
     -device hda-duplex,id=snd0,audiodev=wav0 \
-    -device virtio-vga \
+    $GPU_DEVICE \
     $DISPLAY_ARGS \
     -serial file:"$SERIAL_LOG" \
     -monitor unix:/tmp/qemu-monitor.sock,server,nowait \
