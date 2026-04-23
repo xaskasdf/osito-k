@@ -408,6 +408,7 @@ For implementation details, API specifics, register-level documentation, and deb
 
 - **[docs/x86-features-detail.md](docs/x86-features-detail.md)** — All x86-64 feature descriptions (X9-X42, X-OS*, X-NET*, X-CL*, X-WIN32, etc.)
 - **[docs/kernel-demencial.md](docs/kernel-demencial.md)** — 10 features avanzadas: cpu_features, PMU counters, superpage tensor arena, multipath dispatch, sys_inference syscall, ASLR lite, predictive scheduling, speculative I/O, zero-copy SG TX, hardware breakpoints, self-optimizing kernel
+- **[docs/kernel-diagram.md](docs/kernel-diagram.md)** — 5 diagramas Mermaid: arquitectura completa (111 archivos en 12 subsistemas), secuencia de boot (22 pasos), dispatch de syscalls, forward pass de inference, y mapa de integración de las 10 features
 - **[docs/esp8266-detail.md](docs/esp8266-detail.md)** — Math library API, zForth integration, resource budget, DOOM/Elite details
 - **[docs/aarch64-detail.md](docs/aarch64-detail.md)** — AArch64/SM8350 (ROG Phone 5) port details
 - **[docs/x86-gpu-roadmap.md](docs/x86-gpu-roadmap.md)** — GPU compute roadmap (X27-X40)
