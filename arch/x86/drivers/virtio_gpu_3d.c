@@ -225,8 +225,35 @@ int32_t vg3d_fence_wait(uint64_t fence, uint64_t timeout_ns) {
     if (fence <= g_fence_signaled) return 0;
     return -110;        /* ETIMEDOUT -- shouldn't happen in Wave 1 */
 }
-int32_t vg3d_present(uint32_t pid, uint32_t ctx_id, uint32_t res_id, uint32_t shm_handle) {
-    (void)pid; (void)ctx_id; (void)res_id; (void)shm_handle; return -ENOSYS;
+extern void *shm_map(uint32_t handle);
+extern void  compositor_signal_dirty(uint32_t window_id);
+/* Our lookup: shm_handle == window_id in the current compositor impl.
+ * If that changes, we'll need an explicit shm->window mapping. */
+
+int32_t vg3d_present(uint32_t pid, uint32_t ctx_id,
+                     uint32_t res_id, uint32_t shm_handle) {
+    if (!g_3d_ready) return -EINVAL;
+    if (!find_ctx(pid, ctx_id)) return -ESRCH;
+
+    struct vg3d_res *r = 0;
+    for (int i = 0; i < VG3D_RES_MAX; i++) {
+        if (g_res_tab[i].id == res_id && g_res_tab[i].pid == pid) {
+            r = &g_res_tab[i]; break;
+        }
+    }
+    if (!r) return -ESRCH;
+    if (r->kind != GPU_RES_KIND_IMAGE2D) return -EINVAL;
+
+    void *dst = shm_map(shm_handle);
+    if (!dst) return -EINVAL;
+
+    /* Wave 1: CPU memcpy. Wave 2 replaces with GPU-side
+     * transfer_to_host_3d + blob alias when sizes match. */
+    for (uint64_t i = 0; i < r->size / 8; i++)
+        ((volatile uint64_t *)dst)[i] = ((volatile uint64_t *)r->backing_va)[i];
+
+    compositor_signal_dirty(shm_handle);
+    return 0;
 }
 void vg3d_cleanup_process(uint32_t pid) {
     for (int i = 0; i < VG3D_CTX_MAX; i++) {
@@ -287,6 +314,31 @@ static void vg3d_t4_ctx(void) {
     serial_puts("[VG3D-T4] ctx-lifecycle OK (id=");
     serial_putdec((uint32_t)id);
     serial_puts(")\n");
+}
+
+static void vg3d_t8_present(void) {
+    if (!g_3d_ready) { serial_puts("[VG3D-T8] present SKIP\n"); return; }
+    extern uint32_t shm_create_surface(uint32_t w, uint32_t h, uint32_t flags);
+    uint32_t shm = shm_create_surface(64, 64, 0);
+    if (!shm) { serial_puts("[VG3D-T8] present FAIL (shm)\n"); return; }
+
+    int32_t cid = vg3d_ctx_create(1, GPU_CTX_VENUS);
+    struct gpu_res_create_args args = {
+        .kind = GPU_RES_KIND_IMAGE2D, .flags = GPU_RES_FLAG_HOST_COHERENT,
+        .format = 0, .width = 64, .height = 64, .pitch = 64*4, .size = 0,
+    };
+    int32_t rid = vg3d_res_create(1, (uint32_t)cid, &args);
+    if (rid <= 0) { serial_puts("[VG3D-T8] present FAIL (res)\n"); return; }
+
+    int32_t err = vg3d_present(1, (uint32_t)cid, (uint32_t)rid, shm);
+    if (err < 0) {
+        serial_puts("[VG3D-T8] present FAIL err=");
+        serial_putdec((uint32_t)-err);
+        serial_puts("\n");
+    } else {
+        serial_puts("[VG3D-T8] present OK\n");
+    }
+    vg3d_ctx_destroy(1, (uint32_t)cid);
 }
 
 static void vg3d_t7_fence(void) {
@@ -378,6 +430,7 @@ void virtio_gpu_3d_selftest(void) {
     vg3d_t5_res();
     vg3d_t6_submit();
     vg3d_t7_fence();
+    vg3d_t8_present();
     /* Later tasks append more markers here. */
     serial_puts("[VG3D] selftest end\n");
 }
