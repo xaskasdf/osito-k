@@ -3418,6 +3418,14 @@ int64_t __hot syscall_dispatch(uint64_t nr, uint64_t a1, uint64_t a2,
     }
 
     /* -- Vulkan Phase 1 / Wave 1: GPU 3D syscalls (600..607) -- */
+    case SYS_GPU_CAPS: {         /* 600: caps(*out) */
+        extern bool nvk_backend_ready(void);
+        uint32_t caps = 0;
+        if (vg3d_caps() & GPU_CAP_VENUS_READY) caps |= GPU_CAP_VENUS_READY;
+        if (nvk_backend_ready())               caps |= GPU_CAP_NVK_READY;
+        if (a1) *(uint32_t *)a1 = caps;
+        return caps;
+    }
     case SYS_GPU_CTX_CREATE: {   /* 601: gpu_ctx_create(flags) */
         return vg3d_ctx_create((uint32_t)proc_current_pid(), (uint32_t)a1);
     }

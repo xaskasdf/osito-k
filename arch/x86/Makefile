@@ -118,7 +118,7 @@ DRV_SRC  = drivers/nvme.c drivers/i211.c drivers/gpu.c drivers/gsp.c \
            drivers/sass.c drivers/gmmu.c drivers/gpu_tensor.c drivers/gpu_inference.c \
            drivers/xhci.c drivers/hda.c \
            drivers/virtio.c drivers/virtio_blk.c drivers/virtio_net.c drivers/virtio_gpu.c \
-           drivers/virtio_gpu_3d.c \
+           drivers/virtio_gpu_3d.c drivers/nvk_backend.c \
            drivers/usb_storage.c
 FS_SRC   = fs/ositofs2.c fs/ositofs3.c fs/gpt.c fs/gguf.c fs/vfs.c fs/fat32.c \
            fs/tmpfs.c fs/iso9660.c fs/ext2.c fs/exfat.c fs/ntfs.c \

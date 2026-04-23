@@ -316,6 +316,19 @@ static void vg3d_t4_ctx(void) {
     serial_puts(")\n");
 }
 
+static void vg3d_t9_caps(void) {
+    uint32_t caps = vg3d_caps();
+    extern bool nvk_backend_ready(void);
+    bool nvk = nvk_backend_ready();
+    serial_puts("[VG3D-T9] caps venus=");
+    serial_puts((caps & GPU_CAP_VENUS_READY) ? "1" : "0");
+    serial_puts(" nvk=");
+    serial_puts(nvk ? "1" : "0");
+    /* Wave 1 expectation: nvk=0 always. Fail if stub lies. */
+    if (!nvk) serial_puts(" OK\n");
+    else      serial_puts(" FAIL (stub should report 0)\n");
+}
+
 static void vg3d_t8_present(void) {
     if (!g_3d_ready) { serial_puts("[VG3D-T8] present SKIP\n"); return; }
     extern uint32_t shm_create_surface(uint32_t w, uint32_t h, uint32_t flags);
@@ -431,6 +444,7 @@ void virtio_gpu_3d_selftest(void) {
     vg3d_t6_submit();
     vg3d_t7_fence();
     vg3d_t8_present();
+    vg3d_t9_caps();
     /* Later tasks append more markers here. */
     serial_puts("[VG3D] selftest end\n");
 }
