@@ -62,6 +62,12 @@ struct vg3d_ctrl_hdr {
  * signaled synchronously because vgpu_controlq_submit already waits on
  * the used-ring entry before returning. */
 static uint64_t g_fence_next = 1;
+static uint64_t g_fence_signaled = 0;
+
+/* Called by vg3d_submit on successful return. */
+static void vg3d_fence_signal(uint64_t fence) {
+    if (fence > g_fence_signaled) g_fence_signaled = fence;
+}
 
 static bool g_3d_ready = false;
 
@@ -210,9 +216,15 @@ int32_t vg3d_submit(uint32_t pid, uint32_t ctx_id,
     mem_free_pages(buf, pages);
     if (rc < 0) return -5;   /* -EIO */
     *out_fence = fence;
+    vg3d_fence_signal(fence);
     return 0;
 }
-int32_t vg3d_fence_wait(uint64_t fence, uint64_t timeout_ns) { (void)fence; (void)timeout_ns; return -ENOSYS; }
+int32_t vg3d_fence_wait(uint64_t fence, uint64_t timeout_ns) {
+    (void)timeout_ns;   /* polling is synchronous in Wave 1 */
+    if (fence == 0 || fence >= g_fence_next) return -EINVAL;
+    if (fence <= g_fence_signaled) return 0;
+    return -110;        /* ETIMEDOUT -- shouldn't happen in Wave 1 */
+}
 int32_t vg3d_present(uint32_t pid, uint32_t ctx_id, uint32_t res_id, uint32_t shm_handle) {
     (void)pid; (void)ctx_id; (void)res_id; (void)shm_handle; return -ENOSYS;
 }
@@ -275,6 +287,26 @@ static void vg3d_t4_ctx(void) {
     serial_puts("[VG3D-T4] ctx-lifecycle OK (id=");
     serial_putdec((uint32_t)id);
     serial_puts(")\n");
+}
+
+static void vg3d_t7_fence(void) {
+    if (!g_3d_ready) { serial_puts("[VG3D-T7] fence SKIP\n"); return; }
+    int32_t cid = vg3d_ctx_create(1, GPU_CTX_VENUS);
+    uint8_t nop[16] = {0};
+    uint64_t fence = 0;
+    vg3d_submit(1, (uint32_t)cid, nop, sizeof(nop), &fence);
+    /* Expect fence to be signaled within 1 second (since controlq submit
+     * already waited for the used-ring entry, the fence is already
+     * effectively retired -- wait should return 0 immediately). */
+    int32_t err = vg3d_fence_wait(fence, 1000000000ull /* 1s */);
+    if (err == 0) {
+        serial_puts("[VG3D-T7] fence-wait OK\n");
+    } else {
+        serial_puts("[VG3D-T7] fence-wait FAIL err=");
+        serial_putdec((uint32_t)-err);
+        serial_puts("\n");
+    }
+    vg3d_ctx_destroy(1, (uint32_t)cid);
 }
 
 static void vg3d_t6_submit(void) {
@@ -345,6 +377,7 @@ void virtio_gpu_3d_selftest(void) {
     vg3d_t4_ctx();
     vg3d_t5_res();
     vg3d_t6_submit();
+    vg3d_t7_fence();
     /* Later tasks append more markers here. */
     serial_puts("[VG3D] selftest end\n");
 }

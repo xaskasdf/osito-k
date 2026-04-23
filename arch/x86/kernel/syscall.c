@@ -3441,6 +3441,9 @@ int64_t __hot syscall_dispatch(uint64_t nr, uint64_t a1, uint64_t a2,
         return vg3d_submit((uint32_t)proc_current_pid(), a->ctx_id,
                            a->cmd_bytes, a->cmd_len, a->out_fence);
     }
+    case SYS_GPU_FENCE_WAIT: {   /* 606: (fence, timeout_ns) */
+        return vg3d_fence_wait((uint64_t)a1, (uint64_t)a2);
+    }
 
     default:
         serial_puts("[SYSCALL] Unknown syscall ");
