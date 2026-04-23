@@ -3434,6 +3434,13 @@ int64_t __hot syscall_dispatch(uint64_t nr, uint64_t a1, uint64_t a2,
         return (int64_t)vg3d_res_map((uint32_t)proc_current_pid(),
                                      (uint32_t)a1);
     }
+    case SYS_GPU_SUBMIT: {       /* 605: (args *) */
+        const struct gpu_submit_args *a =
+            (const struct gpu_submit_args *)a1;
+        if (!a) return -22; /* EINVAL */
+        return vg3d_submit((uint32_t)proc_current_pid(), a->ctx_id,
+                           a->cmd_bytes, a->cmd_len, a->out_fence);
+    }
 
     default:
         serial_puts("[SYSCALL] Unknown syscall ");

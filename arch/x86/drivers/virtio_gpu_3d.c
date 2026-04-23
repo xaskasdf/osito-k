@@ -49,6 +49,20 @@ static uint32_t g_res_next_id = 1;
 extern void *mem_alloc_pages(uint64_t count);   /* 4 KiB pages */
 extern void  mem_free_pages(void *addr, uint64_t count);
 
+/* -- virtio-gpu 3D command header (matches 2D hdr layout) --- */
+struct vg3d_ctrl_hdr {
+    uint32_t type;
+    uint32_t flags;
+    uint64_t fence_id;
+    uint32_t ctx_id;
+    uint32_t padding;
+} __attribute__((packed));
+
+/* Monotonic fence counter. Every SUBMIT allocates the next id; it is
+ * signaled synchronously because vgpu_controlq_submit already waits on
+ * the used-ring entry before returning. */
+static uint64_t g_fence_next = 1;
+
 static bool g_3d_ready = false;
 
 void virtio_gpu_3d_init(void) {
@@ -159,8 +173,44 @@ uint64_t vg3d_res_map(uint32_t pid, uint32_t res_id) {
 int32_t vg3d_submit(uint32_t pid, uint32_t ctx_id,
                     const void *cmd_bytes, uint64_t cmd_len,
                     uint64_t *out_fence) {
-    (void)pid; (void)ctx_id; (void)cmd_bytes; (void)cmd_len; (void)out_fence;
-    return -ENOSYS;
+    if (!g_3d_ready || !cmd_bytes || !out_fence) return -EINVAL;
+    if (cmd_len == 0 || cmd_len > (1u << 20)) return -EINVAL;  /* 1 MiB cap */
+    if (!find_ctx(pid, ctx_id)) return -ESRCH;
+
+    /* Build a SUBMIT_3D command. Layout:
+     *   vg3d_ctrl_hdr (type=VIRTIO_GPU_CMD_SUBMIT_3D, fence_id, ctx_id)
+     *   uint32_t size (cmd_len)
+     *   uint32_t padding
+     *   raw command bytes
+     */
+    uint64_t fence = g_fence_next++;
+    uint32_t hdr_len = sizeof(struct vg3d_ctrl_hdr) + 8;
+    uint32_t total = hdr_len + (uint32_t)cmd_len;
+    uint64_t pages = (total + 4095) >> 12;
+    uint8_t *buf = (uint8_t *)mem_alloc_pages(pages);
+    if (!buf) return -ENOMEM;
+
+    struct vg3d_ctrl_hdr *h = (struct vg3d_ctrl_hdr *)buf;
+    h->type = VIRTIO_GPU_CMD_SUBMIT_3D;
+    h->flags = 1;           /* VIRTIO_GPU_FLAG_FENCE */
+    h->fence_id = fence;
+    h->ctx_id = ctx_id;
+    h->padding = 0;
+    *(uint32_t *)(buf + sizeof(*h)) = (uint32_t)cmd_len;
+    *(uint32_t *)(buf + sizeof(*h) + 4) = 0;
+    /* Copy user bytes into kernel staging (byte-by-byte is fine; Wave 2
+     * will replace with copy_from_user). */
+    for (uint64_t i = 0; i < cmd_len; i++)
+        buf[hdr_len + i] = ((const uint8_t *)cmd_bytes)[i];
+
+    struct vg3d_ctrl_hdr resp;
+    resp.type = 0; resp.flags = 0; resp.fence_id = 0;
+    resp.ctx_id = 0; resp.padding = 0;
+    int rc = vgpu_controlq_submit(buf, total, &resp, sizeof(resp));
+    mem_free_pages(buf, pages);
+    if (rc < 0) return -5;   /* -EIO */
+    *out_fence = fence;
+    return 0;
 }
 int32_t vg3d_fence_wait(uint64_t fence, uint64_t timeout_ns) { (void)fence; (void)timeout_ns; return -ENOSYS; }
 int32_t vg3d_present(uint32_t pid, uint32_t ctx_id, uint32_t res_id, uint32_t shm_handle) {
@@ -227,6 +277,29 @@ static void vg3d_t4_ctx(void) {
     serial_puts(")\n");
 }
 
+static void vg3d_t6_submit(void) {
+    if (!g_3d_ready) { serial_puts("[VG3D-T6] submit SKIP\n"); return; }
+    int32_t cid = vg3d_ctx_create(1, GPU_CTX_VENUS);
+    if (cid <= 0) { serial_puts("[VG3D-T6] submit FAIL (ctx)\n"); return; }
+    /* A venus "nop" is an empty command stream -- just enough to exercise
+     * the virtqueue path. For Wave 1 we send 16 bytes of zeros and expect
+     * the kernel to ACK with a fence id; the host either drops it or
+     * sends a response ring entry. */
+    uint8_t nop[16] = {0};
+    uint64_t fence = 0;
+    int32_t err = vg3d_submit(1, (uint32_t)cid, nop, sizeof(nop), &fence);
+    if (err < 0) {
+        serial_puts("[VG3D-T6] submit FAIL err=");
+        serial_putdec((uint32_t)-err);
+        serial_puts("\n");
+    } else {
+        serial_puts("[VG3D-T6] submit OK fence=");
+        serial_putdec(fence);
+        serial_puts("\n");
+    }
+    vg3d_ctx_destroy(1, (uint32_t)cid);
+}
+
 static void vg3d_t5_res(void) {
     if (!g_3d_ready) { serial_puts("[VG3D-T5] res SKIP\n"); return; }
     int32_t cid = vg3d_ctx_create(1, GPU_CTX_VENUS);
@@ -271,6 +344,7 @@ void virtio_gpu_3d_selftest(void) {
     vg3d_t3_virgl();
     vg3d_t4_ctx();
     vg3d_t5_res();
+    vg3d_t6_submit();
     /* Later tasks append more markers here. */
     serial_puts("[VG3D] selftest end\n");
 }

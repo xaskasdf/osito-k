@@ -21,4 +21,9 @@ uint64_t          vgpu_device_features(void);
 /* Read a u32 from the GPU's PCI config via ECAM. */
 uint32_t          vgpu_ecam_read32(uint16_t offset);
 
+/* Submit a command buffer on the control virtqueue and wait for the
+ * response synchronously. Returns 0 on success, <0 on error. */
+int vgpu_controlq_submit(const void *cmd, uint32_t cmd_len,
+                         void *resp, uint32_t resp_len);
+
 #endif

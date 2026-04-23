@@ -698,3 +698,9 @@ uint32_t          vgpu_notify_off_mult(void) { return gpu.notify_off_mult; }
 bool              vgpu_is_initialized(void)  { return gpu.initialized; }
 uint64_t          vgpu_device_features(void) { return gpu.device_features; }
 uint32_t          vgpu_ecam_read32(uint16_t offset) { return ecam_read32(offset); }
+
+int vgpu_controlq_submit(const void *cmd, uint32_t cmd_len,
+                         void *resp, uint32_t resp_len) {
+    /* gpu_send_cmd wants non-const void*; the hardware only reads cmd. */
+    return gpu_send_cmd((void *)cmd, cmd_len, resp, resp_len);
+}
