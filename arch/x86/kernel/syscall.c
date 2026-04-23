@@ -93,6 +93,22 @@ extern bool     input_pop_event(void *out_evt)                   __attribute__((
 extern int     sched_set_qos(uint32_t pid, uint8_t qos)         __attribute__((weak));
 extern uint8_t sched_get_qos(uint32_t pid)                      __attribute__((weak));
 
+/* GPU 3D driver (Vulkan Phase 1 / Wave 1) */
+#include "../include/sys/gpu_syscalls.h"
+extern int32_t proc_current_pid(void);
+extern uint32_t vg3d_caps(void);
+extern int32_t  vg3d_ctx_create(uint32_t pid, uint32_t flags);
+extern int32_t  vg3d_ctx_destroy(uint32_t pid, uint32_t ctx_id);
+extern int32_t  vg3d_res_create(uint32_t pid, uint32_t ctx_id,
+                                const struct gpu_res_create_args *args);
+extern uint64_t vg3d_res_map(uint32_t pid, uint32_t res_id);
+extern int32_t  vg3d_submit(uint32_t pid, uint32_t ctx_id,
+                            const void *cmd_bytes, uint64_t cmd_len,
+                            uint64_t *out_fence);
+extern int32_t  vg3d_fence_wait(uint64_t fence, uint64_t timeout_ns);
+extern int32_t  vg3d_present(uint32_t pid, uint32_t ctx_id,
+                             uint32_t res_id, uint32_t shm_handle);
+
 /* ── MSR definitions ─────────────────────────────────────────── */
 
 #define MSR_FS_BASE 0xC0000100  /* FS segment base (for TLS) */
@@ -3399,6 +3415,14 @@ int64_t __hot syscall_dispatch(uint64_t nr, uint64_t a1, uint64_t a2,
                                                  char *, uint64_t);
         return sys_inference_detokenize((const uint32_t *)a1, (uint32_t)a2,
                                          (char *)a3, a4);
+    }
+
+    /* -- Vulkan Phase 1 / Wave 1: GPU 3D syscalls (600..607) -- */
+    case SYS_GPU_CTX_CREATE: {   /* 601: gpu_ctx_create(flags) */
+        return vg3d_ctx_create((uint32_t)proc_current_pid(), (uint32_t)a1);
+    }
+    case SYS_GPU_CTX_DESTROY: {  /* 602: gpu_ctx_destroy(ctx_id) */
+        return vg3d_ctx_destroy((uint32_t)proc_current_pid(), (uint32_t)a1);
     }
 
     default:
