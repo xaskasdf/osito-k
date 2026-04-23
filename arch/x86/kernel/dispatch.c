@@ -80,4 +80,15 @@ void dispatch_init(void)
     serial_puts(disp.path_name);
     if (cpu_features.erms) serial_puts(" +ERMS-memcpy");
     serial_puts("\n");
+
+    /* Register our feature-gate branches with the self-optimizer so that
+     * after the boot stabilizes (tick > 1000) they can be patched to
+     * unconditional JMPs. Currently dry-run — see self_optimize.c. */
+    extern void self_opt_register_branch(void *site, const char *desc);
+    self_opt_register_branch((void *)&disp.matvec_q4_0,
+                             "dispatch.matvec_q4_0 (AVX2/AVX512 select)");
+    self_opt_register_branch((void *)&disp.memcpy_fast,
+                             "dispatch.memcpy_fast (ERMS select)");
+    self_opt_register_branch((void *)&cpu_features.avx2,
+                             "cpu_features.avx2 tensor_has_avx2() cache");
 }

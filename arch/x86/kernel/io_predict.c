@@ -38,10 +38,15 @@ typedef struct {
 } io_pattern_t;
 
 static io_pattern_t patterns[IO_PATTERN_MAX];
-static char last_opened[IO_NAME_MAX];
+
+/* Fallback for callers outside any process context (early boot, kernel
+ * threads before scheduler is up). The primary storage is per-process
+ * via proc_current_last_opened() in process.c. */
+static char kernel_last_opened[IO_NAME_MAX];
 
 bool io_predict_enabled = true;
 extern uint64_t idt_get_ticks(void);
+extern char *proc_current_last_opened(void);
 
 static int str_eq(const char *a, const char *b)
 {
@@ -174,6 +179,12 @@ void io_predict_observe(const char *path)
     while (path[len] && len < IO_NAME_MAX) len++;
     if (len == IO_NAME_MAX) return;
 
+    /* Per-process scratch when available; fall back to the kernel global
+     * for callers outside process context. This avoids cross-process
+     * pattern contamination (TCC vs compositor). */
+    char *last_opened = proc_current_last_opened();
+    if (!last_opened) last_opened = kernel_last_opened;
+
     if (last_opened[0]) {
         record_transition(last_opened, path);
     }
@@ -188,7 +199,9 @@ void io_predict_reset(void)
         patterns[i].total = 0;
         patterns[i].last_tick = 0;
     }
-    last_opened[0] = 0;
+    kernel_last_opened[0] = 0;
+    /* Per-process last_opened[] fields are not cleared here — they get
+     * overwritten naturally on next open(). Reset is coarse by design. */
 }
 
 void io_predict_stats(void)

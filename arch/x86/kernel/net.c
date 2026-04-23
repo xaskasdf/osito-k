@@ -6,6 +6,7 @@
  */
 
 #include "../include/types.h"
+#include "../include/paging.h"
 #include "net.h"
 #include "../drivers/i211.h"
 
@@ -778,12 +779,32 @@ int net_udp_send(const uint8_t dst_ip[4], uint16_t dst_port,
     udp->length   = htons((uint16_t)udp_len);
     udp->checksum = 0;  /* UDP checksum optional for IPv4 */
 
-    /* Copy payload */
-    memcpy(tx_pkt + ETH_HDR_LEN + sizeof(ipv4_hdr_t) + sizeof(udp_hdr_t),
-           data, len);
+    /* Pad small frames (Ethernet requires ≥60 bytes on the wire). */
+    uint32_t hdr_total = ETH_HDR_LEN + sizeof(ipv4_hdr_t) + sizeof(udp_hdr_t);
+    uint32_t frame_len = ETH_HDR_LEN + ip_total;
+
+    /* Zero-copy scatter-gather path: header on stack, payload streamed
+     * directly from caller's buffer. Only used when payload is big
+     * enough that skipping the memcpy matters (≥256 B) and total frame
+     * doesn't need padding. Otherwise keep the legacy single-buffer
+     * path for correctness simplicity. */
+    extern int i211_send_sg(const uint64_t frag_phys[],
+                            const uint32_t lens[], int n_frags);
+    if (len >= 256 && frame_len >= 60) {
+        uint64_t frags[2] = {
+            (uint64_t)VIRT_TO_PHYS(tx_pkt),
+            (uint64_t)VIRT_TO_PHYS((void *)data)
+        };
+        uint32_t lens_arr[2] = { hdr_total, len };
+        int sg = i211_send_sg(frags, lens_arr, 2);
+        if (sg == 0) return 0;
+        /* On SG failure (e.g. NIC busy), fall through to copy path. */
+    }
+
+    /* Copy payload into tx_pkt */
+    memcpy(tx_pkt + hdr_total, data, len);
 
     /* Pad and send */
-    uint32_t frame_len = ETH_HDR_LEN + ip_total;
     if (frame_len < 60) {
         memset(tx_pkt + frame_len, 0, 60 - frame_len);
         frame_len = 60;

@@ -20,9 +20,38 @@ backup/
 # Object files and compiled tools
 *.o
 tools/ositofs/mkfs.ositofs
+tools/ositofs/mkfs.ositofs3
 tools/ositofs/ositofs-info
 tools/ositofs/ositofs-ls
 tools/ositofs/ositofs-write
+tools/ositofs/ositofs-write3
+tools/ositofs/ositofs-delete
+tools/ositofs/ositofs-read
+tools/ositofs/ositofs-rename
+tools/ositofs/ositofs-defrag
+tools/ositofs/ositofs-fsck
+tools/uzdecomp/uzdecomp
+
+# Game / workload artifacts (binaries, discs, NVMe images)
+*.WAD
+*.wad
+*.iso
+*.ISO
+nvme_*.img
+doom.elf
+quake2.elf
+kernel.elf
+UnrealTournament.ini
+"DOOM v1.9"*.zip
+
+# UnrealEngine .int localization files
+*.int
+
+# ARM test scratch area
+arch/arm/test/models/
+
+# macOS Finder metadata
+.DS_Store
 
 # Claude Code session data
 .claude/

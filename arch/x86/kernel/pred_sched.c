@@ -25,6 +25,12 @@ static markov_entry_t markov[MARKOV_BUCKETS][MARKOV_PER_BUCKET];
 uint64_t pred_total_predictions;
 uint64_t pred_correct_predictions;
 
+/* NOTE: sched_tick() (process.c:925) early-returns on non-BSP LAPIC, so
+ * pred_record() / pred_next() / pred_prewarm() only run on the BSP. The
+ * non-atomic globals below (last_prediction_from/next) are therefore
+ * safe — never touched concurrently. If you ever allow scheduler on
+ * APs, make these per-CPU via smp_apic_to_index(sched_get_lapic_id()). */
+
 /* FNV-like hash */
 static uint32_t markov_hash(uint16_t pid, uint8_t trigger)
 {

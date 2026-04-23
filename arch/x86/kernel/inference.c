@@ -12,6 +12,7 @@
 #include "tensor.h"
 #include "../include/paging.h"
 #include "../include/tensor_arena.h"
+#include "../include/dispatch.h"
 
 #ifdef __EMSCRIPTEN__
 #include <emscripten.h>
@@ -117,10 +118,12 @@ static void matvec(float *out, gguf_tensor_t *tensor,
 {
     switch (tensor->type) {
     case GGML_TYPE_Q4_0:
-        matvec_q4_0(out, tensor->data, input, rows, cols);
+        /* Go through the boot-selected dispatch table so any future
+         * SIMD variant (AVX-512) gets picked up without re-linking. */
+        disp.matvec_q4_0(out, tensor->data, input, rows, cols);
         break;
     case GGML_TYPE_Q8_0:
-        matvec_q8_0(out, tensor->data, input, rows, cols);
+        disp.matvec_q8_0(out, tensor->data, input, rows, cols);
         break;
     case GGML_TYPE_F32: {
         const float *w = (const float *)tensor->data;

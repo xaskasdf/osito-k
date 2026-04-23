@@ -316,3 +316,18 @@ Compilar: `cc test_inf.c -o test_inf.elf` dentro del OsitoK shell (TCC in-OS) o 
 - **NUMA-aware tensor arena** — una arena por socket en multi-socket
 - **GPU PMU counters** — NVIDIA PM counters, plan separado
 - **Sub-phase instrumentation** de `llama_forward` (QKV / ATTN / FFN / SAMPLE como slots separados)
+
+## Post-auditoría (commit de fix)
+
+Auditoría tras merge identificó 5 gaps de integración; todos cerrados:
+
+| Gap | Fix |
+|-----|-----|
+| `i211_send_sg` sin callers | `net_udp_send` usa SG cuando `len ≥ 256 && frame_len ≥ 60`; fallback a memcpy si SG falla |
+| `self_opt_register_branch` sin callers | `dispatch_init` registra 3 sites demo (`disp.matvec_q4_0`, `disp.memcpy_fast`, `cpu_features.avx2`) |
+| Tabla `disp` no leída | `inference.c:matvec` ahora llama `disp.matvec_q4_0` / `disp.matvec_q8_0` para los dos tipos quantizados |
+| pred_sched SMP race aparente | Falsa alarma — `sched_tick` ya early-returns en non-BSP (process.c:932). Comment añadido para claridad |
+| io_predict cross-contamination | `last_opened[32]` movido a `process_t`; accesor `proc_current_last_opened()` con fallback a kernel global para early-boot |
+
+### .gitignore actualizado
+Añadidas 12 entradas (tools v3: `mkfs.ositofs3`, `defrag`, `fsck`, `rename`, `write3`; game assets: WAD/ISO/elf/img; UnrealEngine `.int`; `.DS_Store`; `arm/test/models/`).

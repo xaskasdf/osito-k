@@ -170,6 +170,11 @@ typedef struct {
     /* Refcounted file descriptor table (shared between threads).
      * Allocated separately via kmalloc to avoid bloating process_t. */
     fd_table_t *fd_table;
+
+    /* io_predict per-process "last file opened" for speculative prefetch.
+     * Kept in-struct so TCC/compositor/shell don't pollute each other's
+     * observed sequences. See arch/x86/kernel/io_predict.c. */
+    char         last_opened[32];
 } process_t;
 
 /* ── Process table ───────────────────────────────────────────── */
@@ -1297,6 +1302,16 @@ void sched_unblock(int proc_idx)
     if (proc_idx >= 0 && proc_idx < MAX_PROCESSES &&
         proctab[proc_idx].state == PROC_BLOCKED)
         proc_transition(&proctab[proc_idx], PROC_READY);
+}
+
+/* Accessor for io_predict — returns pointer to the current process's
+ * 32-byte last_opened scratch buffer, or NULL if no current proc. */
+char *proc_current_last_opened(void)
+{
+    if (sched_current_idx < 0 || sched_current_idx >= MAX_PROCESSES) return 0;
+    process_t *p = &proctab[sched_current_idx];
+    if (p->state == PROC_FREE) return 0;
+    return p->last_opened;
 }
 
 /* ── Test threads (used by shell 'sched' command) ────────────── */
