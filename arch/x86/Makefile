@@ -17,12 +17,19 @@ CC       = x86_64-elf-gcc
 LD       = x86_64-elf-ld
 OBJCOPY  = x86_64-elf-objcopy
 
-# gnu-efi paths (Debian/Ubuntu or local clone)
-EFI_INC  ?= /usr/include/efi
-EFI_INC_ARCH ?= /usr/include/efi/x86_64
-EFI_LIB  = /usr/lib
-EFI_CRT  = /usr/lib/crt0-efi-x86_64.o
-EFI_LDS  = /usr/lib/elf_x86_64_efi.lds
+# gnu-efi paths. Auto-detect macOS (/usr/local via ncroxon/gnu-efi from
+# source) vs Debian/Ubuntu (/usr via apt-get install gnu-efi). Override
+# any var on the make command line to force a custom location.
+ifneq ($(wildcard /usr/local/lib/elf_x86_64_efi.lds),)
+    EFI_PREFIX ?= /usr/local
+else
+    EFI_PREFIX ?= /usr
+endif
+EFI_INC      ?= $(EFI_PREFIX)/include/efi
+EFI_INC_ARCH ?= $(EFI_PREFIX)/include/efi/x86_64
+EFI_LIB      ?= $(EFI_PREFIX)/lib
+EFI_CRT      ?= $(EFI_PREFIX)/lib/crt0-efi-x86_64.o
+EFI_LDS      ?= $(EFI_PREFIX)/lib/elf_x86_64_efi.lds
 
 # Boot flags (gnu-efi, PIE — only for boot.efi)
 BFLAGS   = -ffreestanding -fno-stack-protector -fshort-wchar \
