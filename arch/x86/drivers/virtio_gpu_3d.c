@@ -4,6 +4,7 @@
  * and the corresponding selftest marker prints FAIL.
  */
 #include "virtio_gpu_3d.h"
+#include "virtio_gpu_internal.h"
 #include "../include/paging.h"
 
 extern void serial_puts(const char *s);
@@ -15,8 +16,19 @@ extern void serial_putdec(uint64_t val);
 static bool g_3d_ready = false;
 
 void virtio_gpu_3d_init(void) {
-    serial_puts("[VG3D] skipped (Wave 1 skeleton -- feature negotiation not wired)\n");
-    g_3d_ready = false;
+    if (!vgpu_is_initialized()) {
+        serial_puts("[VG3D] skipped (2D driver not initialized)\n");
+        g_3d_ready = false;
+        return;
+    }
+    uint64_t feat = vgpu_device_features();
+    if (!(feat & (1ull << VIRTIO_GPU_F_VIRGL))) {
+        serial_puts("[VG3D] skipped (VIRGL feature not offered by host)\n");
+        g_3d_ready = false;
+        return;
+    }
+    serial_puts("[VG3D] ready -- VIRGL negotiated\n");
+    g_3d_ready = true;
 }
 
 uint32_t vg3d_caps(void) {
@@ -49,9 +61,18 @@ static void vg3d_t2_skeleton(void) {
     serial_puts("[VG3D-T2] skeleton OK\n");
 }
 
+static void vg3d_t3_virgl(void) {
+    if (g_3d_ready) {
+        serial_puts("[VG3D-T3] virgl-negotiated OK\n");
+    } else {
+        serial_puts("[VG3D-T3] virgl-negotiated FAIL (feature bit 0 not set)\n");
+    }
+}
+
 void virtio_gpu_3d_selftest(void) {
     serial_puts("[VG3D] selftest begin\n");
     vg3d_t2_skeleton();
+    vg3d_t3_virgl();
     /* Later tasks append more markers here. */
     serial_puts("[VG3D] selftest end\n");
 }

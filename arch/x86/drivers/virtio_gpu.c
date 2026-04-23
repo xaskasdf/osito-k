@@ -161,6 +161,10 @@ static struct {
 
     bool initialized;
     bool scanout_active;
+
+    /* Negotiated device feature vector (64-bit). Populated before FEATURES_OK
+     * so the 3D driver can probe VIRTIO_GPU_F_VIRGL. */
+    uint64_t device_features;
 } gpu;
 
 /* ── PCI Config Read via ECAM ─────────────────────────────────── */
@@ -514,6 +518,33 @@ void virtio_gpu_init(uint64_t ecam, uint8_t bus, uint8_t dev, uint8_t func,
     __asm__ volatile ("mfence" ::: "memory");
     cfg[0x14] |= VIRTIO_STATUS_DRIVER;
     __asm__ volatile ("mfence" ::: "memory");
+
+    /* Read the 64-bit device feature vector via the common_cfg window.
+     * Offsets 0x00..0x07 are device_feature_select + device_feature.
+     * We read lo (select=0) then hi (select=1). */
+    *(volatile uint32_t *)(cfg + 0x00) = 0; /* device_feature_select = 0 */
+    __asm__ volatile ("mfence" ::: "memory");
+    uint32_t feat_lo = *(volatile uint32_t *)(cfg + 0x04);
+    *(volatile uint32_t *)(cfg + 0x00) = 1; /* select = 1 (hi half) */
+    __asm__ volatile ("mfence" ::: "memory");
+    uint32_t feat_hi = *(volatile uint32_t *)(cfg + 0x04);
+    gpu.device_features = ((uint64_t)feat_hi << 32) | feat_lo;
+    serial_puts("[VIRTIO-GPU] device_features=0x");
+    serial_puthex(gpu.device_features, 16);
+    serial_puts("\n");
+
+    /* Accept VIRGL (bit 0) if offered -- enables 3D path. */
+    if (gpu.device_features & (1ull << 0)) {
+        *(volatile uint32_t *)(cfg + 0x08) = 0; /* driver_feature_select */
+        __asm__ volatile ("mfence" ::: "memory");
+        *(volatile uint32_t *)(cfg + 0x0C) = (uint32_t)((1ull << 0) | feat_lo);
+        *(volatile uint32_t *)(cfg + 0x08) = 1;
+        __asm__ volatile ("mfence" ::: "memory");
+        *(volatile uint32_t *)(cfg + 0x0C) = feat_hi;
+        __asm__ volatile ("mfence" ::: "memory");
+        serial_puts("[VIRTIO-GPU] VIRGL accepted\n");
+    }
+
     cfg[0x14] |= VIRTIO_STATUS_FEATURES_OK;
     __asm__ volatile ("mfence" ::: "memory");
     if (!(cfg[0x14] & VIRTIO_STATUS_FEATURES_OK)) {
@@ -657,3 +688,13 @@ void virtio_gpu_flush(void) {
     cmd_flush.resource_id = 1;
     gpu_send_cmd(&cmd_flush, sizeof(cmd_flush), &resp_flush, sizeof(resp_flush));
 }
+
+/* -- Internal accessors exposed to virtio_gpu_3d.c ------------ */
+#include "virtio_gpu_internal.h"
+
+volatile uint8_t *vgpu_common_cfg(void)      { return gpu.common_cfg; }
+volatile uint8_t *vgpu_notify_base(void)     { return gpu.notify_base; }
+uint32_t          vgpu_notify_off_mult(void) { return gpu.notify_off_mult; }
+bool              vgpu_is_initialized(void)  { return gpu.initialized; }
+uint64_t          vgpu_device_features(void) { return gpu.device_features; }
+uint32_t          vgpu_ecam_read32(uint16_t offset) { return ecam_read32(offset); }
