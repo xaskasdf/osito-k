@@ -390,6 +390,7 @@ int dos_native_emulate_lretw(void *frame_ptr)
     uint8_t opc_modrm  = 0;
     int opc_is_ff_5    = 0;     /* JMP FAR indirect */
     int opc_is_ff_3    = 0;     /* CALL FAR indirect */
+    int opc_is_mov_seg = 0;     /* 0x8E: MOV Sreg, r/m16 */
     if (opc == 0x66 && fault_linear + 1 < vm->total_mem_size) {
         opc_prefix = 0x66;
         opc = vm->mem[fault_linear + 1];
@@ -401,6 +402,14 @@ int dos_native_emulate_lretw(void *frame_ptr)
         if (reg == 5) opc_is_ff_5 = 1;
         else if (reg == 3) opc_is_ff_3 = 1;
         else DOS_NT_EMU_FAIL;
+    } else if (opc == 0x8E) {
+        /* MOV Sreg, r/m16 — #GPs when the source holds a selector that
+         * doesn't resolve in our LDT. Skip it: advance RIP past the insn
+         * and leave the segment register unchanged. The value DOOM
+         * intended is usually benign (e.g. recomputed on the next use). */
+        if (fault_linear + 1 >= vm->total_mem_size) DOS_NT_EMU_FAIL;
+        opc_modrm = vm->mem[fault_linear + 1 + (opc_prefix ? 1 : 0)];
+        opc_is_mov_seg = 1;
     } else if (opc != 0xCB && opc != 0xCA && opc != 0xCF && opc != 0xEA) {
         DOS_NT_EMU_FAIL;
     }
@@ -413,6 +422,49 @@ int dos_native_emulate_lretw(void *frame_ptr)
     int uses_stack    = 1;      /* LRETW/IRET pop from stack */
     int is_iretd      = 0;
     int pushes_retaddr = 0;     /* CALL FAR variants */
+
+    if (opc_is_mov_seg) {
+        /* Compute instruction length. */
+        uint8_t mod = (opc_modrm >> 6) & 3;
+        uint8_t rm  = opc_modrm & 7;
+        uint32_t len = (opc_prefix ? 1 : 0) + 1 /*opcode*/ + 1 /*modrm*/;
+        if (mod == 0) {
+            if (rm == 6) len += 2;
+        } else if (mod == 1) {
+            len += 1;
+        } else if (mod == 2) {
+            len += 2;
+        }
+        /* Skipping isn't enough — DOOM actually uses the segreg right
+         * after. Load a known-valid selector (current DS, which was set
+         * up during the native transfer) into the target segreg so the
+         * subsequent memory access doesn't re-fault. This loses DOOM's
+         * intended selector, but keeps forward progress for DOS4GW's
+         * quirky patterns. */
+        uint8_t sreg = (opc_modrm >> 3) & 7;
+        uint16_t safe_sel = (uint16_t)vm->cpu->ds;
+        if ((safe_sel & 0x04) == 0) safe_sel = (uint16_t)f->cs;  /* fallback */
+        /* Load the target segment register NOW. iretq won't restore
+         * ES/DS/FS/GS in same-CPL transitions, so this sticks. */
+        switch (sreg) {
+            case 0: __asm__ volatile ("movw %0, %%es" :: "r"(safe_sel)); break;
+            case 3: __asm__ volatile ("movw %0, %%ds" :: "r"(safe_sel)); break;
+            case 4: __asm__ volatile ("movw %0, %%fs" :: "r"(safe_sel)); break;
+            case 5: __asm__ volatile ("movw %0, %%gs" :: "r"(safe_sel)); break;
+            /* SS (reg=2) and CS (reg=1) we don't touch. */
+            default: break;
+        }
+        f->rip += len;
+        serial_puts("[DOS-NT] emu 0x8E sreg=");
+        serial_putdec(sreg); serial_puts(" <- 0x");
+        serial_puthex(safe_sel, 4);
+        serial_puts(" (was err=0x");
+        serial_puthex((uint64_t)f->error_code, 4);
+        serial_puts(") skip len="); serial_putdec(len); serial_puts("\n");
+        if (kcr3 && saved_cr3 != kcr3)
+            __asm__ volatile ("mov %0, %%cr3" :: "r"(saved_cr3) : "memory");
+        return 1;
+    }
 
     if (opc_is_ff_5 || opc_is_ff_3) {
         /* FF /5 or /3 with ModR/M. Only handle mod=00 rm=6 (disp16) for now
