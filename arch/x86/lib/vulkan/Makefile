@@ -24,6 +24,7 @@ SRC := \
   icd/nvk_stub/nvk_stub.c \
   icd/venus/venus_instance.c \
   icd/venus/venus_device.c \
+  icd/venus/venus_w3b4_objects.c \
   icd/venus/venus_entry.c \
   icd/venus/venus_wire.c \
   icd/venus/venus_cmd_CreateInstance.c \
@@ -40,7 +41,33 @@ SRC := \
   icd/venus/venus_cmd_CreateBuffer.c \
   icd/venus/venus_cmd_DestroyBuffer.c \
   icd/venus/venus_cmd_GetBufferMemoryRequirements.c \
-  icd/venus/venus_cmd_BindBufferMemory.c
+  icd/venus/venus_cmd_BindBufferMemory.c \
+  icd/venus/venus_cmd_CreateShaderModule.c \
+  icd/venus/venus_cmd_DestroyShaderModule.c \
+  icd/venus/venus_cmd_CreateRenderPass.c \
+  icd/venus/venus_cmd_DestroyRenderPass.c \
+  icd/venus/venus_cmd_CreateImage.c \
+  icd/venus/venus_cmd_DestroyImage.c \
+  icd/venus/venus_cmd_CreateImageView.c \
+  icd/venus/venus_cmd_DestroyImageView.c \
+  icd/venus/venus_cmd_GetImageMemoryRequirements.c \
+  icd/venus/venus_cmd_BindImageMemory.c \
+  icd/venus/venus_cmd_CreateFramebuffer.c \
+  icd/venus/venus_cmd_DestroyFramebuffer.c \
+  icd/venus/venus_cmd_CreatePipelineLayout.c \
+  icd/venus/venus_cmd_DestroyPipelineLayout.c \
+  icd/venus/venus_cmd_CreateGraphicsPipelines.c \
+  icd/venus/venus_cmd_DestroyPipeline.c \
+  icd/venus/venus_cmd_CreateCommandPool.c \
+  icd/venus/venus_cmd_DestroyCommandPool.c \
+  icd/venus/venus_cmd_AllocateCommandBuffers.c \
+  icd/venus/venus_cmd_FreeCommandBuffers.c \
+  icd/venus/venus_cmd_BeginCommandBuffer.c \
+  icd/venus/venus_cmd_EndCommandBuffer.c \
+  icd/venus/venus_cmd_CmdBeginRenderPass.c \
+  icd/venus/venus_cmd_CmdEndRenderPass.c \
+  icd/venus/venus_cmd_CmdBindPipeline.c \
+  icd/venus/venus_cmd_CmdDraw.c
 
 OBJ := $(patsubst %.c,$(BUILD_ROOT)/%.o,$(SRC))
 
