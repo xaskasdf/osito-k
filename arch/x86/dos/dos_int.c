@@ -250,6 +250,13 @@ void dos_set_native_vm(dos_vm_t *vm)
     g_native_dos_vm = vm;
     extern void dos_vga_set_native_vm(dos_vm_t *vm);
     dos_vga_set_native_vm(vm);
+    /* Prime the keyboard buffer with a few synthetic keystrokes so DOS
+     * programs that block on INT 16h AH=00 or INT 21h AH=07/08 can make
+     * initial progress in headless tests. Harmless if consumed or not. */
+    extern void kb_push(char c);
+    kb_push('\r');   /* ENTER — dismisses prompts */
+    kb_push(' ');    /* SPACE — skips DOOM intro sometimes */
+    kb_push('\r');
 }
 
 void dos_int_native_dispatch(uint64_t int_num, dos_native_regs_t *regs)
