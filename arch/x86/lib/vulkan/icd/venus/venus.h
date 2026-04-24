@@ -20,10 +20,16 @@
 #define VENUS_GPU_CAP_VENUS_READY  (1u << 0)
 #define VENUS_GPU_CTX_VENUS        0x00u
 
+/* Forward decl — real definition in venus_wire.c (production) or
+ * venus_wire_test_shim.c (test binary). Callers treat it as opaque. */
+struct venus_wire;
+
 struct venus_instance {
     VK_LOADER_DATA loader_data;
     uint32_t       caps;          /* SYS_GPU_CAPS snapshot */
     int32_t        ctx_id;        /* kernel GPU ctx, 0 if none */
+    struct venus_wire *wire;      /* guest-side ring wrapper (W3b.1) */
+    uint64_t       host_handle;   /* host VkInstance handle-id (W3b.1) */
 };
 
 struct venus_device {

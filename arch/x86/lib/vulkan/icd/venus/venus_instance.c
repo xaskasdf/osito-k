@@ -33,6 +33,27 @@ venus_CreateInstance(const VkInstanceCreateInfo *pCreateInfo,
         long rc = __syscall1(VENUS_SYS_GPU_CTX_CREATE, (long)VENUS_GPU_CTX_VENUS);
         if (rc > 0) {
             self->ctx_id = (int32_t)rc;
+
+            /* Open the wire and issue the real CreateInstance call (W3b.1). */
+            extern struct venus_wire *venus_wire_open(int32_t);
+            extern int venus_cmd_encode_CreateInstance(struct venus_wire *,
+                                                       const VkInstanceCreateInfo *,
+                                                       uint64_t *);
+            self->wire = venus_wire_open(self->ctx_id);
+            if (self->wire) {
+                uint64_t host_handle = 0;
+                int r = venus_cmd_encode_CreateInstance(self->wire, pCreateInfo,
+                                                        &host_handle);
+                if (r == 0 /* VK_SUCCESS */ && host_handle != 0) {
+                    self->host_handle = host_handle;
+                } else {
+                    /* Host rejected or wire stalled — fall back to guest-local
+                     * instance (no rendering but enumeration still returns 0). */
+                    self->caps &= ~VENUS_GPU_CAP_VENUS_READY;
+                }
+            } else {
+                self->caps &= ~VENUS_GPU_CAP_VENUS_READY;
+            }
         } else {
             /* Kernel reported ready but context creation failed — treat as
              * not-ready for this instance. No reason to fail the whole call. */
@@ -49,6 +70,11 @@ venus_DestroyInstance(VkInstance instance, const VkAllocationCallbacks *pAllocat
     (void)pAllocator;
     if (!instance) return;
     struct venus_instance *self = (struct venus_instance *)instance;
+    if (self->wire) {
+        extern void venus_wire_close(struct venus_wire *);
+        venus_wire_close(self->wire);
+        self->wire = 0;
+    }
     if (self->ctx_id > 0) {
         (void)__syscall1(VENUS_SYS_GPU_CTX_DESTROY, (long)(uint32_t)self->ctx_id);
         self->ctx_id = 0;
