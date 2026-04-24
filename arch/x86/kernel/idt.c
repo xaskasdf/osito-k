@@ -502,6 +502,40 @@ void isr_handler(interrupt_frame_t *frame)
         }
     }
 
+#ifdef COMPAT_TRACE
+    /* Panorama probe: any exception taken while RSP lies inside IST1 (Win32
+     * INT 0x2E) or IST2 (DOS native INTs). A hit on a page fault here is the
+     * single line that confirms risk #3 (lower-half identity map dropped
+     * in commit f8bd01c) is actually biting inside compat dispatch. */
+    if (vec < 32) {
+        extern uint8_t ist1_stack[];
+        extern uint8_t ist2_stack[];
+        uint64_t _sp = frame->rsp;
+        uint64_t _i1 = (uint64_t)ist1_stack;
+        uint64_t _i2 = (uint64_t)ist2_stack;
+        const char *_zone = 0;
+        if (_sp >= _i1 && _sp < _i1 + 65536)      _zone = "IST1";
+        else if (_sp >= _i2 && _sp < _i2 + 32768) _zone = "IST2";
+        if (_zone) {
+            serial_puts("[pf-ist] on ");
+            serial_puts(_zone);
+            serial_puts(" vec=");
+            serial_putdec(vec);
+            serial_puts(" rip=0x");
+            serial_puthex(frame->rip, 16);
+            if (vec == 14) {
+                uint64_t _cr2;
+                __asm__ volatile ("mov %%cr2, %0" : "=r"(_cr2));
+                serial_puts(" cr2=0x");
+                serial_puthex(_cr2, 16);
+            }
+            serial_puts(" err=0x");
+            serial_puthex(frame->error_code, 4);
+            serial_puts("\n");
+        }
+    }
+#endif
+
     /* Log ALL compat32 exceptions (not timer/keyboard) for debugging */
     if (vec < 32 && (frame->cs & 0xFFFF) == 0x40 && vec != 1 && vec != 3) {
         static int exc_count = 0;

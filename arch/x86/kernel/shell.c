@@ -2665,6 +2665,11 @@ void __cold shell_run(void)
         sh_puts(" Auto-launching UnrealTournament.exe...\n");
         shell_exec("winexec UnrealTournament.exe");
     }
+    /* Panorama: auto-launch DOOM.EXE (DOS4GW embedded) when no UT99 present */
+    else if (osfs2_is_mounted() && osfs2_find("DOOM.EXE")) {
+        sh_puts(" Auto-launching DOOM.EXE...\n");
+        shell_exec("dosrun DOOM.EXE");
+    }
 
     for (;;) {
         int len = term_readline("osito> ", line, sizeof(line));

@@ -188,6 +188,13 @@ void dos_int21_dispatch(dos_vm_t *vm)
         }
         break;
 
+    /* ── AH=0Dh: Disk Reset ─────────────────────────────────────── */
+    /* MS-DOS flushes disk buffers. Our VM has no write-back cache,
+     * so there's nothing to flush. Clear carry and return. */
+    case 0x0D:
+        cpu->flags &= ~0x0001; /* CF = 0 */
+        break;
+
     /* ── AH=19h: Get current drive ──────────────────────────────── */
     case 0x19:
         cpu->al = vm->current_drive;  /* 2 = C: */

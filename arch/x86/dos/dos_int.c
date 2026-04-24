@@ -249,6 +249,23 @@ void dos_set_native_vm(dos_vm_t *vm) { g_native_dos_vm = vm; }
 
 void dos_int_native_dispatch(uint64_t int_num, dos_native_regs_t *regs)
 {
+#ifdef COMPAT_TRACE
+    /* Panorama probe: mirrors the [int2e] probe for DOS native INT path.
+     * Silent on -smp 1; any line with cpu != 0 confirms risk #1. */
+    {
+        volatile uint32_t *_apic_id =
+            (volatile uint32_t *)(uintptr_t)(0xFFFF800000000000ULL + 0xFEE00020ULL);
+        uint32_t _cpu = (*_apic_id >> 24) & 0xFF;
+        if (_cpu != 0) {
+            serial_puts("[dos-int] cpu=");
+            serial_putdec(_cpu);
+            serial_puts(" vec=0x");
+            serial_puthex(int_num, 2);
+            serial_puts("\n");
+        }
+    }
+#endif
+
     if (!g_native_dos_vm) return;
 
     dos_vm_t *vm = g_native_dos_vm;

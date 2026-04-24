@@ -2002,6 +2002,30 @@ void dump_call_trace(void)
 
 uint64_t compat32_dispatch(uint32_t thunk_idx, uint32_t *stack_args)
 {
+#ifdef COMPAT_TRACE
+    /* Panorama probe: confirms risk #1 (compat INT soft-int has no LAPIC
+     * fast-path). On -smp 1 this is silent (BSP is LAPIC 0). On -smp 2+,
+     * the first dispatch taken on an AP prints `[int2e] cpu=N ...`. Also
+     * bursts the first few calls for sanity. Reads LAPIC ID directly via
+     * higher-half MMIO (same window as isr_stubs.S). */
+    {
+        volatile uint32_t *_apic_id =
+            (volatile uint32_t *)(uintptr_t)(0xFFFF800000000000ULL + 0xFEE00020ULL);
+        uint32_t _cpu = (*_apic_id >> 24) & 0xFF;
+        static uint32_t _tr_seen = 0;
+        if (_cpu != 0 || _tr_seen < 4) {
+            _tr_seen++;
+            serial_puts("[int2e] cpu=");
+            serial_putdec(_cpu);
+            serial_puts(" depth=");
+            serial_putdec(g_int2e_rsp_depth);
+            serial_puts(" idx=0x");
+            serial_puthex(thunk_idx, 4);
+            serial_puts("\n");
+        }
+    }
+#endif
+
     /* Log PE32 caller return address (at stack_args[-1] = [ESP] on entry) */
     if (stack_args && thunk_idx < 0xFFFFFFF0) {
         uint32_t ret_addr = stack_args[-1]; /* return address pushed by CALL */

@@ -3249,9 +3249,11 @@ int cpu8086_run(dos_vm_t *vm)
          * ════════════════════════════════════════════════════════════ */
         case 0xCD: { /* INT imm8 */
             uint8_t int_num = cpu_fetch8(cpu);
-            /* Log INTs: all for first 5K, then only INT 31h/21h */
-            if (cpu->insn_count < 5000 ||
-                (cpu->insn_count < 1000000 && (int_num == 0x31 || int_num == 0x21))) {
+            /* Log INTs during early boot only. Post-5K insns the serial
+             * spam dominates wall-clock (every [INT] is ~40 bytes at 115200
+             * baud → caps the emulator at ~3000 insns/s). Unhandled INTs
+             * still print via default: cases in dos_api.c / dos_dpmi.c. */
+            if (cpu->insn_count < 5000) {
                 serial_puts("[INT] ");
                 serial_puthex(int_num, 2);
                 serial_puts(" AH=");
