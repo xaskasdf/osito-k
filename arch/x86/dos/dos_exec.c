@@ -585,13 +585,12 @@ void dos_transfer_to_native(dos_vm_t *vm)
     uint64_t es64    = DOS_NT_SEL_OK(cpu->es) ? cpu->es : cpu->ds;
     uint64_t sp64    = cpu->esp;
 
-    /* Ring 3 transition: selectors keep RPL=3 (DOS4GW's DPMI convention),
-     * descriptors keep DPL=3. Force RPL bits to 3 in case they got masked
-     * to 0 by emulator bugkeeping. */
-    cs64 = (cs64 & ~3ULL) | 3ULL;
-    ds64 = (ds64 & ~3ULL) | 3ULL;
-    ss64 = (ss64 & ~3ULL) | 3ULL;
-    es64 = (es64 & ~3ULL) | 3ULL;
+    /* Ring-0 (CPL=0) transition: selectors must have RPL=0 to match
+     * the promoted DPL=0 descriptors. */
+    cs64 &= ~3ULL;
+    ds64 &= ~3ULL;
+    ss64 &= ~3ULL;
+    es64 &= ~3ULL;
 
     serial_puts("[DOS-NT] LRETQ cs:eip=0x");
     serial_puthex(cs64, 4); serial_puts(":0x");
@@ -600,10 +599,26 @@ void dos_transfer_to_native(dos_vm_t *vm)
     serial_puthex(sp64, 8); serial_puts(" ds=0x");
     serial_puthex(ds64, 4); serial_puts("\n");
 
-    /* DOS4GW expects ring 3 (DPMI spec). Keep LDT DPL=3 and do a proper
-     * inter-privilege transition via IRETQ. */
+    /* DOS4GW is a ring-0 DPMI client: it expects CPL=0 with DPL=0
+     * descriptors and RPL=0 selectors. Promote all LDT entries to
+     * DPL=0 so segment register loads from DOS code work under CPL=0. */
+    {
+        dpmi_descriptor_t *ldt = vm->dpmi.ldt;
+        int promoted = 0;
+        for (int i = 0; i < DPMI_MAX_DESCRIPTORS; i++) {
+            if ((ldt[i].access & 0x80) && (ldt[i].access & 0x60) != 0) {
+                ldt[i].access &= ~0x60;  /* clear DPL → DPL=0 */
+                promoted++;
+            }
+        }
+        if (promoted) {
+            serial_puts("[DOS-NT] promoted ");
+            serial_putdec(promoted);
+            serial_puts(" LDT entries to DPL=0 (ring-0 DPMI)\n");
+        }
+    }
 
-    /* Dump LDT entries for cs/ds/ss/es to verify they're sane before IRETQ */
+    /* Dump LDT entries for cs/ds/ss/es to verify they're sane before LRETQ */
     {
         dpmi_descriptor_t *ldt = vm->dpmi.ldt;
         uint16_t sels[4] = { (uint16_t)cs64, (uint16_t)ds64,
@@ -695,27 +710,24 @@ void dos_transfer_to_native(dos_vm_t *vm)
             }
         }
     }
+    (void)rflags;
     uint64_t reax = cpu->eax, rebx = cpu->ebx, recx = cpu->ecx, redx = cpu->edx;
     uint64_t resi = cpu->esi, redi = cpu->edi, rebp = cpu->ebp;
 
+    /* Same-CPL (ring 0) transition via LRETQ. All LDT descriptors were
+     * promoted to DPL=0 and selectors masked to RPL=0, so SS/DS/ES loads
+     * in kernel context work. LRETQ pops only RIP:CS; RSP set manually. */
     __asm__ volatile (
         "cli\n"
         "lldt %w[ldt]\n"
-        /* Switch CR3 while still in ring 0 — DS/ES/SS remain kernel. */
         "mov %[cr3], %%rax\n"
         "mov %%rax, %%cr3\n"
-        /* Pre-load DS/ES with ring-3 LDT selectors (CPL=0 can load data
-         * descriptors where max(RPL,CPL) <= DPL — 3<=3 ok). SS must not
-         * be pre-loaded (DPL=3 vs CPL=0 fails); iretq will set it. */
         "mov %w[ds], %%ax\n  mov %%ax, %%ds\n"
         "mov %w[es], %%ax\n  mov %%ax, %%es\n"
-        /* IRETQ stack frame (top = RIP) */
-        "pushq %[ss_q]\n"      /* SS  */
-        "pushq %[sp_q]\n"      /* RSP */
-        "pushq %[flags]\n"     /* RFLAGS */
-        "pushq %[cs_q]\n"      /* CS  */
-        "pushq %[ip_q]\n"      /* RIP */
-        /* Load GPRs from emulated CPU state */
+        "mov %w[ss], %%ax\n  mov %%ax, %%ss\n"
+        "mov %[sp], %%rsp\n"
+        "pushq %[cs_q]\n"
+        "pushq %[ip_q]\n"
         "mov %[r_ax], %%rax\n"
         "mov %[r_bx], %%rbx\n"
         "mov %[r_cx], %%rcx\n"
@@ -723,15 +735,15 @@ void dos_transfer_to_native(dos_vm_t *vm)
         "mov %[r_si], %%rsi\n"
         "mov %[r_di], %%rdi\n"
         "mov %[r_bp], %%rbp\n"
-        "iretq\n"
+        "sti\n"
+        "lretq\n"
         :
         : [ldt]   "r"(ldt_sel),
           [cr3]   "r"(cr3_new),
           [ds]    "r"(ds64),
           [es]    "r"(es64),
-          [ss_q]  "r"(ss64),
-          [sp_q]  "r"(sp64),
-          [flags] "r"(rflags),
+          [ss]    "r"(ss64),
+          [sp]    "r"(sp64),
           [cs_q]  "r"(cs64),
           [ip_q]  "r"(ip64),
           [r_ax]  "m"(reax),
