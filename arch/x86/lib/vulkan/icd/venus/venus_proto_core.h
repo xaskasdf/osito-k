@@ -33,4 +33,33 @@
 #define VN_CMD_vkGetBufferMemoryRequirements            0x7FFFFFFFu
 #define VN_CMD_vkBindBufferMemory                       0x80000000u
 
+/* W3b.4 additions — shader + render pass + image + framebuffer + pipeline
+ * + command buffer opcodes. Same Mesa-25.0.0 caveat. */
+#define VN_CMD_vkCreateShaderModule                     0x80000001u
+#define VN_CMD_vkDestroyShaderModule                    0x80000002u
+#define VN_CMD_vkCreateRenderPass                       0x80000003u
+#define VN_CMD_vkDestroyRenderPass                      0x80000004u
+#define VN_CMD_vkCreateImage                            0x80000005u
+#define VN_CMD_vkDestroyImage                           0x80000006u
+#define VN_CMD_vkCreateImageView                        0x80000007u
+#define VN_CMD_vkDestroyImageView                       0x80000008u
+#define VN_CMD_vkCreateFramebuffer                      0x80000009u
+#define VN_CMD_vkDestroyFramebuffer                     0x8000000Au
+#define VN_CMD_vkCreatePipelineLayout                   0x8000000Bu
+#define VN_CMD_vkDestroyPipelineLayout                  0x8000000Cu
+#define VN_CMD_vkCreateGraphicsPipelines                0x8000000Du
+#define VN_CMD_vkDestroyPipeline                        0x8000000Eu
+#define VN_CMD_vkCreateCommandPool                      0x8000000Fu
+#define VN_CMD_vkDestroyCommandPool                     0x80000010u
+#define VN_CMD_vkAllocateCommandBuffers                 0x80000011u
+#define VN_CMD_vkFreeCommandBuffers                     0x80000012u
+#define VN_CMD_vkBeginCommandBuffer                     0x80000013u
+#define VN_CMD_vkEndCommandBuffer                       0x80000014u
+#define VN_CMD_vkCmdBeginRenderPass                     0x80000015u
+#define VN_CMD_vkCmdEndRenderPass                       0x80000016u
+#define VN_CMD_vkCmdBindPipeline                        0x80000017u
+#define VN_CMD_vkCmdDraw                                0x80000018u
+#define VN_CMD_vkGetImageMemoryRequirements             0x80000019u
+#define VN_CMD_vkBindImageMemory                        0x8000001Au
+
 #endif
