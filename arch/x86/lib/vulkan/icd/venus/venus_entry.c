@@ -32,5 +32,23 @@ venus_icdGetInstanceProcAddr(VkInstance instance, const char *name) {
     if (strcmp(name, "vkGetDeviceQueue") == 0)
         return (PFN_vkVoidFunction)venus_GetDeviceQueue;
 
+    /* W3b.3 — memory + buffer entry points. */
+    if (strcmp(name, "vkAllocateMemory") == 0)
+        return (PFN_vkVoidFunction)venus_AllocateMemory;
+    if (strcmp(name, "vkFreeMemory") == 0)
+        return (PFN_vkVoidFunction)venus_FreeMemory;
+    if (strcmp(name, "vkMapMemory") == 0)
+        return (PFN_vkVoidFunction)venus_MapMemory;
+    if (strcmp(name, "vkUnmapMemory") == 0)
+        return (PFN_vkVoidFunction)venus_UnmapMemory;
+    if (strcmp(name, "vkCreateBuffer") == 0)
+        return (PFN_vkVoidFunction)venus_CreateBuffer;
+    if (strcmp(name, "vkDestroyBuffer") == 0)
+        return (PFN_vkVoidFunction)venus_DestroyBuffer;
+    if (strcmp(name, "vkGetBufferMemoryRequirements") == 0)
+        return (PFN_vkVoidFunction)venus_GetBufferMemoryRequirements;
+    if (strcmp(name, "vkBindBufferMemory") == 0)
+        return (PFN_vkVoidFunction)venus_BindBufferMemory;
+
     return NULL;
 }
