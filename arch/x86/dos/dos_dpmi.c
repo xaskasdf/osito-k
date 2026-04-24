@@ -73,7 +73,24 @@ void dpmi_init(dos_vm_t *vm)
         vm->mem[stub_addr + 2] = 0xCB;  /* RETF */
     }
 
-    serial_puts("[DPMI] Host initialized, entry at F000:0100\n");
+    /* Save/restore & mode-switch stubs for INT 31h AX=0305h and 0x0306h.
+     * All are one-byte 0xCB (RETF) — the client calls FAR into the stub,
+     * it immediately returns via the pushed return frame. In 16-bit mode
+     * the RETF pops 16-bit IP:CS; in 32-bit it pops 32-bit EIP:CS. Both
+     * work, so a single byte serves all four roles.
+     *
+     *   F000:0110  RETF — save/restore stub (used for both RM and PM)
+     *   F000:0118  RETF — raw mode-switch stub (RM↔PM)
+     */
+    uint32_t save_stub = dos_linear(DPMI_ENTRY_SEG, 0x0110);
+    uint32_t ms_stub   = dos_linear(DPMI_ENTRY_SEG, 0x0118);
+    if (ms_stub + 1 <= vm->total_mem_size) {
+        vm->mem[save_stub] = 0xCB;  /* RETF — save/restore */
+        vm->mem[ms_stub]   = 0xCB;  /* RETF — mode switch */
+    }
+
+    serial_puts("[DPMI] Host initialized, entry at F000:0100,"
+                " save F000:0110, mode-switch F000:0118\n");
 }
 
 /* ══════════════════════════════════════════════════════════════════
@@ -571,21 +588,28 @@ void dos_int31_dpmi(dos_vm_t *vm)
 
     /* ── AX=0305h: Get State Save/Restore Addresses ──────────────── */
     case 0x0305:
-        /* Return dummy addresses — DOS4GW checks but rarely calls.
-         * BX:CX = real-mode save/restore address, SI:DI = PM address.
-         * AX = buffer size needed (0 = no state to save). */
-        cpu->ax = 0;  /* state buffer size = 0 */
-        cpu->bx = 0; cpu->cx = 0;
-        cpu->esi = 0; cpu->edi = 0;
+        /* Point RM and PM save/restore routines at our 1-byte RETF stub
+         * at F000:0110 (set up in dpmi_init). AX=0 means no state save
+         * buffer is needed — the stubs just return immediately when the
+         * client calls through them. This stops DOOM from reading 0:0
+         * and later CALL-FARing to an invalid address. */
+        cpu->ax  = 0;                   /* state buffer size = 0 */
+        cpu->bx  = DPMI_ENTRY_SEG;      /* RM seg */
+        cpu->cx  = 0x0110;              /* RM off */
+        cpu->esi = DPMI_ENTRY_SEG;      /* PM seg (treat as 16-bit) */
+        cpu->edi = 0x0110;              /* PM off */
         cpu->eflags &= ~FLAG_CF;
         break;
 
     /* ── AX=0306h: Get Raw Mode Switch Addresses ─────────────────── */
     case 0x0306:
-        /* Return dummy addresses — we handle mode switching via INT FE.
-         * BX:CX = real→PM switch, SI:DI = PM→real switch. */
-        cpu->bx = 0; cpu->cx = 0;
-        cpu->esi = 0; cpu->edi = 0;
+        /* Point mode-switch routines at the RETF stub at F000:0118. We
+         * already handle mode switching via INT FEh; DOOM rarely calls
+         * these but now it won't see 0:0 if it does. */
+        cpu->bx  = DPMI_ENTRY_SEG;      /* RM→PM seg */
+        cpu->cx  = 0x0118;              /* RM→PM off */
+        cpu->esi = DPMI_ENTRY_SEG;      /* PM→RM seg */
+        cpu->edi = 0x0118;              /* PM→RM off */
         cpu->eflags &= ~FLAG_CF;
         break;
 
