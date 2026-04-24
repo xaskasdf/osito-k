@@ -236,7 +236,23 @@ venus_FreeMemory(VkDevice device, VkDeviceMemory memory,
         (void)venus_cmd_encode_FreeMemory(dev->parent->wire,
                                           dev->host_handle, m->host_id);
     }
-    if (m->local_ptr) { free(m->local_ptr); m->local_ptr = 0; }
+    /* W3b.5: SHM-backed memory was obtained via SYS_SHM_MKSURFACE +
+     * SYS_SHM_MAP, not malloc. Unmap and destroy the kernel surface
+     * instead of calling free() on the kernel-owned pointer. */
+    if (m->is_shm_backed) {
+        extern long __syscall1(long, long);
+        if (m->local_ptr) {
+            (void)__syscall1(502L /* SYS_SHM_UNMAP */,
+                             (long)m->shm_handle);
+            m->local_ptr = 0;
+        }
+        if (m->shm_handle) {
+            (void)__syscall1(503L /* SYS_SHM_DESTROY */,
+                             (long)m->shm_handle);
+        }
+    } else if (m->local_ptr) {
+        free(m->local_ptr); m->local_ptr = 0;
+    }
     memset(m, 0, sizeof(*m));
 }
 

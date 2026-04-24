@@ -100,6 +100,8 @@ static inline int nd_handle_slot(uint64_t h) {
 
 /* ---- Syscall constants. ---- */
 #define SYS_SHM_MAP              501L
+#define SYS_SHM_UNMAP            502L
+#define SYS_SHM_DESTROY          503L
 #define SYS_SHM_MKSURFACE        506L
 #define SHM_FMT_BGRA             0x41524742L   /* 'BGRA' LE */
 
@@ -441,6 +443,10 @@ venus_BindImageMemory(VkDevice device, VkImage image, VkDeviceMemory memory,
                 m->shm_handle    = (uint32_t)shm;
                 m->shm_width     = w;
                 m->shm_height    = h;
+            } else {
+                /* MAP failed — release the just-created SHM surface so
+                 * it doesn't leak in the compositor pool. */
+                (void)__syscall1(SYS_SHM_DESTROY, shm);
             }
         }
     }

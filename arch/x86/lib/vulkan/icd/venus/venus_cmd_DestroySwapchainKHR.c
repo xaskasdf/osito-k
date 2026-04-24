@@ -25,7 +25,7 @@ int venus_cmd_encode_DestroySwapchainKHR(struct venus_device *dev, int sc_slot) 
     struct venus_swapchain *sc = &dev->swapchains[sc_slot];
     if (!sc->in_use) return 0;
 
-    for (uint32_t i = 0; i < VENUS_MAX_SWAPCHAIN_IMAGES; i++) {
+    for (uint32_t i = 0; i < sc->image_count; i++) {
         int s = sc->image_slots[i];
         if (s < 0 || s >= (int)VENUS_MAX_IMAGE_OBJECTS) continue;
         struct venus_image *img = &dev->images[s];
