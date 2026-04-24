@@ -29,6 +29,7 @@ static uint8_t *put_u32(uint8_t *p, uint32_t v) {
     return p + 4;
 }
 
+__attribute__((unused))
 static uint8_t *put_u64(uint8_t *p, uint64_t v) {
     ((uint64_t *)p)[0] = v;
     return p + 8;
@@ -36,11 +37,15 @@ static uint8_t *put_u64(uint8_t *p, uint64_t v) {
 
 static uint8_t *put_str(uint8_t *p, const char *s) {
     uint32_t n = s ? (uint32_t)strlen(s) + 1 : 0;
-    p = put_u32(p, n);
-    if (n) memcpy(p, s, n);
-    /* Pad to 8. */
-    while (((unsigned long)p + n) & 7u) { p[n++] = 0; }
-    return p + n;
+    /* Field total: 4-byte length + n bytes + pad so (4 + n) rounds to 8. */
+    uint32_t field_total = (4u + n + 7u) & ~7u;
+    uint32_t pad = field_total - 4u - n;
+    ((uint32_t *)p)[0] = n;
+    p += 4;
+    if (n) { memcpy(p, s, n); p += n; }
+    /* Zero the pad bytes so we don't leak stack garbage into the wire. */
+    for (uint32_t i = 0; i < pad; i++) p[i] = 0;
+    return p + pad;
 }
 
 static uint32_t str_wire_len(const char *s) {
@@ -92,7 +97,6 @@ int venus_cmd_encode_CreateInstance(struct venus_wire *w,
     c = put_u32(c, 0);                                 /* enabledExtensionCount */
     c = put_u32(c, 0);                                 /* pAllocator null */
     c = put_u32(c, 0);                                 /* pInstance null (reply fills) */
-    (void)put_u64;                                     /* reserved for future use */
 
     int rc = venus_wire_submit(w);
     if (rc < 0) return rc;

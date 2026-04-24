@@ -93,6 +93,10 @@ void *venus_wire_alloc_cmd(struct venus_wire *w,
                            uint32_t cmd_id, uint16_t flags,
                            uint32_t payload_size, uint64_t *out_reply_id) {
     if (!w) return 0;
+    /* Single-in-flight contract: if a prior alloc_cmd wasn't followed by
+     * submit, refuse to start a new one. Prevents silently overwriting
+     * the previous command's payload. */
+    if (w->pending_head_advance != 0) return 0;
     /* Round payload to 8 bytes for wire alignment. */
     uint32_t aligned = (payload_size + 7) & ~7u;
     uint32_t total = sizeof(struct venus_cmd_header) + aligned;
@@ -153,8 +157,12 @@ int venus_wire_wait_reply(struct venus_wire *w, uint64_t reply_id,
             struct venus_cmd_header *rh =
                 (struct venus_cmd_header *)(w->reply_area + w->hdr->reply_tail);
             if (rh->reply_id != reply_id) {
-                /* Out-of-order replies: not supported in W3b.1. Fail
-                 * cleanly so W3b.2 can extend. */
+                /* Drop the mismatched reply to unstick the ring. Caller's
+                 * contract is single-in-flight in W3b.1, so this path
+                 * means something went wrong (host reply to a destroyed
+                 * instance, host out-of-sequence). */
+                uint32_t aligned = (rh->payload_size + 7) & ~7u;
+                w->hdr->reply_tail += sizeof(*rh) + aligned;
                 return -5 /* EIO */;
             }
             uint32_t copy = rh->payload_size;
