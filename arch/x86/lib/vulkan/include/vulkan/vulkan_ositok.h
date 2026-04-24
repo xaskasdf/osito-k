@@ -35,7 +35,14 @@ typedef VkResult (VKAPI_PTR *PFN_vkCreateOsitoCompositorSurfaceOSITOK)(
     const VkAllocationCallbacks*                     pAllocator,
     VkSurfaceKHR*                                    pSurface);
 
-/* Wave 3 adds the actual entry point. Wave 2 only reserves the ABI shape. */
+/* Wave 3b.5 — entry point declaration. */
+#ifndef VK_NO_PROTOTYPES
+VKAPI_ATTR VkResult VKAPI_CALL vkCreateOsitokCompositorSurfaceKHR(
+    VkInstance instance,
+    const VkOsitoCompositorSurfaceCreateInfoOSITOK *pCreateInfo,
+    const VkAllocationCallbacks *pAllocator,
+    VkSurfaceKHR *pSurface);
+#endif
 
 #ifdef __cplusplus
 }
