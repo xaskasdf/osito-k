@@ -26,7 +26,11 @@ SRC := \
   icd/venus/venus_device.c \
   icd/venus/venus_entry.c \
   icd/venus/venus_wire.c \
-  icd/venus/venus_cmd_CreateInstance.c
+  icd/venus/venus_cmd_CreateInstance.c \
+  icd/venus/venus_cmd_GetPhysicalDeviceProperties.c \
+  icd/venus/venus_cmd_GetPhysicalDeviceFeatures.c \
+  icd/venus/venus_cmd_GetPhysicalDeviceQueueFamilyProperties.c \
+  icd/venus/venus_cmd_GetPhysicalDeviceMemoryProperties.c
 
 OBJ := $(patsubst %.c,$(BUILD_ROOT)/%.o,$(SRC))
 
