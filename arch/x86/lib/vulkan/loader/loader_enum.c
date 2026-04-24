@@ -46,28 +46,28 @@ vkEnumeratePhysicalDevices(VkInstance instance,
                                                                    "vkEnumeratePhysicalDevices");
         if (!enum_fn) continue;
 
+        /* Heap-allocate scratch to exact first-pass size — avoids the
+         * 16-handle stack cap that silently truncated ICDs exposing more
+         * than 16 physical devices. malloc failure here is graceful: we
+         * skip this ICD and mark the overall result INCOMPLETE. */
         uint32_t want = per_icd_count[i];
-        uint32_t room = cap - written;
-        uint32_t ask = want < room ? want : room;
+        VkPhysicalDevice *raw = malloc((unsigned long)want * sizeof(VkPhysicalDevice));
+        if (!raw) { overall = VK_INCOMPLETE; continue; }
 
-        /* Use a small stack scratch for ICD handles, then wrap into
-         * the app's buffer. Keep the scratch under the Q2 stack
-         * guideline (≪ 200 KiB). 16 handles * 8 bytes = 128 B. */
-        VkPhysicalDevice scratch[16];
-        uint32_t pass = ask;
-        if (pass > 16) pass = 16;
-        VkResult rc = enum_fn(ci->handle, &pass, scratch);
+        uint32_t got = want;
+        VkResult rc = enum_fn(ci->handle, &got, raw);
         if (rc == VK_INCOMPLETE) overall = VK_INCOMPLETE;
 
-        for (uint32_t j = 0; j < pass && written < cap; j++) {
+        for (uint32_t j = 0; j < got && written < cap; j++) {
             struct osito_phys_device *pw = malloc(sizeof(*pw));
             if (!pw) { overall = VK_ERROR_OUT_OF_HOST_MEMORY; break; }
             memset(pw, 0, sizeof(*pw));
             set_loader_magic_value(pw);
             pw->owner = ci;
-            pw->real  = scratch[j];
+            pw->real  = raw[j];
             pPhysicalDevices[written++] = osito_phys_to(pw);
         }
+        free(raw);
     }
 
     *pPhysicalDeviceCount = written;

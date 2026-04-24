@@ -55,11 +55,16 @@ vkDestroyInstance(VkInstance instance, const VkAllocationCallbacks *pAllocator) 
     if (!instance) return;
     struct osito_instance *self = osito_instance_from(instance);
 
-    /* NOTE (W3b.2): we don't iterate + free osito_phys_device /
-     * osito_device wrappers here because the instance doesn't yet
-     * track them. Apps must destroy any VkDevice before the parent
-     * VkInstance or the handle-owner wrappers leak. W3b.3 will add a
-     * per-instance wrapper registry so destroy-in-any-order is safe. */
+    /*
+     * W3b.2 NOTE: device wrappers are not registered with the instance, so
+     * vkDestroyInstance cannot free outstanding VkDevice wrappers. Worse,
+     * such devices stay LIVE in the owning ICD — vkDestroyInstance walks
+     * the ICDs and tells each to destroy its own instance, but ICD-side
+     * devices already borrowed out remain. App must destroy devices before
+     * instances (Vulkan spec already requires this). Full wrapper tracking
+     * + orphan teardown lands in W3b.3 when queue handle lifetime becomes
+     * load-bearing for present/submit.
+     */
     for (unsigned i = 0; i < self->icd_instance_count; i++) {
         struct osito_icd_inst *ci = &self->icd_instances[i];
         PFN_vkDestroyInstance destroy =

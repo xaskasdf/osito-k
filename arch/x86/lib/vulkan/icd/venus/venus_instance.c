@@ -140,6 +140,15 @@ extern int venus_cmd_encode_GetPhysicalDeviceQueueFamilyProperties(
 extern int venus_cmd_encode_GetPhysicalDeviceMemoryProperties(
         struct venus_wire *, uint64_t, VkPhysicalDeviceMemoryProperties *);
 
+/* TODO(w3b.3): in the real venus protocol, physical-device handles are
+ * distinct from instance handles and are obtained via a separate
+ * enumeration handshake. W3a reuses the instance pointer as the
+ * VkPhysicalDevice token; here we correspondingly pass the host
+ * instance id as `pd_id`, which a real host will likely reject. Until
+ * W3b.3 adds proper physical-device-id bookkeeping, expect these wire
+ * calls to fail on a virgl host and the guest-local fallback path to
+ * fire. The fallback produces spec-legal zero/stub values, so callers
+ * don't observe UB. */
 VKAPI_ATTR void VKAPI_CALL
 venus_GetPhysicalDeviceProperties(VkPhysicalDevice physicalDevice,
                                   VkPhysicalDeviceProperties *pProperties) {
