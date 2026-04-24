@@ -1,4 +1,5 @@
 #include "loader.h"
+#include <vulkan/vulkan_ositok.h>
 
 VKAPI_ATTR VkResult VKAPI_CALL vkCreateInstance(
     const VkInstanceCreateInfo *, const VkAllocationCallbacks *, VkInstance *);
@@ -110,6 +111,51 @@ VKAPI_ATTR void VKAPI_CALL vkCmdBindPipeline(
 VKAPI_ATTR void VKAPI_CALL vkCmdDraw(
     VkCommandBuffer, uint32_t, uint32_t, uint32_t, uint32_t);
 
+/* W3b.5 — WSI + surface + swapchain + queue + sync + present. */
+VKAPI_ATTR VkResult VKAPI_CALL vkCreateOsitokCompositorSurfaceKHR(
+    VkInstance, const VkOsitoCompositorSurfaceCreateInfoOSITOK *,
+    const VkAllocationCallbacks *, VkSurfaceKHR *);
+VKAPI_ATTR void VKAPI_CALL vkDestroySurfaceKHR(
+    VkInstance, VkSurfaceKHR, const VkAllocationCallbacks *);
+VKAPI_ATTR VkResult VKAPI_CALL vkQueueSubmit(
+    VkQueue, uint32_t, const VkSubmitInfo *, VkFence);
+VKAPI_ATTR VkResult VKAPI_CALL vkQueueWaitIdle(VkQueue);
+VKAPI_ATTR VkResult VKAPI_CALL vkDeviceWaitIdle(VkDevice);
+VKAPI_ATTR VkResult VKAPI_CALL vkCreateFence(
+    VkDevice, const VkFenceCreateInfo *,
+    const VkAllocationCallbacks *, VkFence *);
+VKAPI_ATTR void VKAPI_CALL vkDestroyFence(
+    VkDevice, VkFence, const VkAllocationCallbacks *);
+VKAPI_ATTR VkResult VKAPI_CALL vkResetFences(
+    VkDevice, uint32_t, const VkFence *);
+VKAPI_ATTR VkResult VKAPI_CALL vkWaitForFences(
+    VkDevice, uint32_t, const VkFence *, VkBool32, uint64_t);
+VKAPI_ATTR VkResult VKAPI_CALL vkGetFenceStatus(VkDevice, VkFence);
+VKAPI_ATTR VkResult VKAPI_CALL vkCreateSemaphore(
+    VkDevice, const VkSemaphoreCreateInfo *,
+    const VkAllocationCallbacks *, VkSemaphore *);
+VKAPI_ATTR void VKAPI_CALL vkDestroySemaphore(
+    VkDevice, VkSemaphore, const VkAllocationCallbacks *);
+VKAPI_ATTR VkResult VKAPI_CALL vkCreateSwapchainKHR(
+    VkDevice, const VkSwapchainCreateInfoKHR *,
+    const VkAllocationCallbacks *, VkSwapchainKHR *);
+VKAPI_ATTR void VKAPI_CALL vkDestroySwapchainKHR(
+    VkDevice, VkSwapchainKHR, const VkAllocationCallbacks *);
+VKAPI_ATTR VkResult VKAPI_CALL vkGetSwapchainImagesKHR(
+    VkDevice, VkSwapchainKHR, uint32_t *, VkImage *);
+VKAPI_ATTR VkResult VKAPI_CALL vkAcquireNextImageKHR(
+    VkDevice, VkSwapchainKHR, uint64_t, VkSemaphore, VkFence, uint32_t *);
+VKAPI_ATTR VkResult VKAPI_CALL vkQueuePresentKHR(
+    VkQueue, const VkPresentInfoKHR *);
+VKAPI_ATTR VkResult VKAPI_CALL vkGetPhysicalDeviceSurfaceCapabilitiesKHR(
+    VkPhysicalDevice, VkSurfaceKHR, VkSurfaceCapabilitiesKHR *);
+VKAPI_ATTR VkResult VKAPI_CALL vkGetPhysicalDeviceSurfaceFormatsKHR(
+    VkPhysicalDevice, VkSurfaceKHR, uint32_t *, VkSurfaceFormatKHR *);
+VKAPI_ATTR VkResult VKAPI_CALL vkGetPhysicalDeviceSurfacePresentModesKHR(
+    VkPhysicalDevice, VkSurfaceKHR, uint32_t *, VkPresentModeKHR *);
+VKAPI_ATTR VkResult VKAPI_CALL vkGetPhysicalDeviceSurfaceSupportKHR(
+    VkPhysicalDevice, uint32_t, VkSurfaceKHR, VkBool32 *);
+
 PFN_vkVoidFunction
 osito_loader_get_instance_proc_addr(VkInstance instance, const char *pName) {
     if (!pName) return NULL;
@@ -216,6 +262,50 @@ osito_loader_get_instance_proc_addr(VkInstance instance, const char *pName) {
     if (strcmp(pName, "vkCmdDraw") == 0)
         return (PFN_vkVoidFunction)vkCmdDraw;
 
+    /* W3b.5 additions — WSI + surface + swapchain + queue + sync. */
+    if (strcmp(pName, "vkCreateOsitokCompositorSurfaceKHR") == 0)
+        return (PFN_vkVoidFunction)vkCreateOsitokCompositorSurfaceKHR;
+    if (strcmp(pName, "vkDestroySurfaceKHR") == 0)
+        return (PFN_vkVoidFunction)vkDestroySurfaceKHR;
+    if (strcmp(pName, "vkQueueSubmit") == 0)
+        return (PFN_vkVoidFunction)vkQueueSubmit;
+    if (strcmp(pName, "vkQueueWaitIdle") == 0)
+        return (PFN_vkVoidFunction)vkQueueWaitIdle;
+    if (strcmp(pName, "vkDeviceWaitIdle") == 0)
+        return (PFN_vkVoidFunction)vkDeviceWaitIdle;
+    if (strcmp(pName, "vkCreateFence") == 0)
+        return (PFN_vkVoidFunction)vkCreateFence;
+    if (strcmp(pName, "vkDestroyFence") == 0)
+        return (PFN_vkVoidFunction)vkDestroyFence;
+    if (strcmp(pName, "vkResetFences") == 0)
+        return (PFN_vkVoidFunction)vkResetFences;
+    if (strcmp(pName, "vkWaitForFences") == 0)
+        return (PFN_vkVoidFunction)vkWaitForFences;
+    if (strcmp(pName, "vkGetFenceStatus") == 0)
+        return (PFN_vkVoidFunction)vkGetFenceStatus;
+    if (strcmp(pName, "vkCreateSemaphore") == 0)
+        return (PFN_vkVoidFunction)vkCreateSemaphore;
+    if (strcmp(pName, "vkDestroySemaphore") == 0)
+        return (PFN_vkVoidFunction)vkDestroySemaphore;
+    if (strcmp(pName, "vkCreateSwapchainKHR") == 0)
+        return (PFN_vkVoidFunction)vkCreateSwapchainKHR;
+    if (strcmp(pName, "vkDestroySwapchainKHR") == 0)
+        return (PFN_vkVoidFunction)vkDestroySwapchainKHR;
+    if (strcmp(pName, "vkGetSwapchainImagesKHR") == 0)
+        return (PFN_vkVoidFunction)vkGetSwapchainImagesKHR;
+    if (strcmp(pName, "vkAcquireNextImageKHR") == 0)
+        return (PFN_vkVoidFunction)vkAcquireNextImageKHR;
+    if (strcmp(pName, "vkQueuePresentKHR") == 0)
+        return (PFN_vkVoidFunction)vkQueuePresentKHR;
+    if (strcmp(pName, "vkGetPhysicalDeviceSurfaceCapabilitiesKHR") == 0)
+        return (PFN_vkVoidFunction)vkGetPhysicalDeviceSurfaceCapabilitiesKHR;
+    if (strcmp(pName, "vkGetPhysicalDeviceSurfaceFormatsKHR") == 0)
+        return (PFN_vkVoidFunction)vkGetPhysicalDeviceSurfaceFormatsKHR;
+    if (strcmp(pName, "vkGetPhysicalDeviceSurfacePresentModesKHR") == 0)
+        return (PFN_vkVoidFunction)vkGetPhysicalDeviceSurfacePresentModesKHR;
+    if (strcmp(pName, "vkGetPhysicalDeviceSurfaceSupportKHR") == 0)
+        return (PFN_vkVoidFunction)vkGetPhysicalDeviceSurfaceSupportKHR;
+
     /* Unknown — fall through to the first ICD that resolves it. Matches
      * the spec's language that unknown queries may return NULL when no
      * extension is enabled, but a forward is a friendlier default for
@@ -296,13 +386,25 @@ vkDestroyDevice(VkDevice device, const VkAllocationCallbacks *pAllocator) {
 VKAPI_ATTR void VKAPI_CALL
 vkGetDeviceQueue(VkDevice device, uint32_t queueFamilyIndex,
                  uint32_t queueIndex, VkQueue *pQueue) {
-    if (!device || !pQueue) return;
+    if (!device || !pQueue) { if (pQueue) *pQueue = VK_NULL_HANDLE; return; }
     struct osito_device    *dw = osito_device_from(device);
     struct osito_icd_inst  *ci = dw->owner;
-    if (!ci) return;
+    if (!ci) { *pQueue = VK_NULL_HANDLE; return; }
     PFN_vkGetDeviceQueue fn = (PFN_vkGetDeviceQueue)
         ci->icd->get_proc_addr(ci->handle, "vkGetDeviceQueue");
-    if (fn) fn(dw->real, queueFamilyIndex, queueIndex, pQueue);
+    if (!fn) { *pQueue = VK_NULL_HANDLE; return; }
+    VkQueue real = VK_NULL_HANDLE;
+    fn(dw->real, queueFamilyIndex, queueIndex, &real);
+    if (!real) { *pQueue = VK_NULL_HANDLE; return; }
+    /* W3b.5: wrap the ICD-returned queue so QueueSubmit / QueuePresent
+     * trampolines can find the owning device via a back-pointer. */
+    struct osito_queue *w = malloc(sizeof(*w));
+    if (!w) { *pQueue = VK_NULL_HANDLE; return; }
+    memset(w, 0, sizeof(*w));
+    set_loader_magic_value(w);
+    w->owner = dw;
+    w->real  = real;
+    *pQueue = (VkQueue)w;
 }
 
 /* Tiny unwrap helper for the phys-dev trampolines below. */
@@ -1043,3 +1145,541 @@ vkCmdDraw(VkCommandBuffer cb, uint32_t vertexCount,
     if (!fn) return;
     fn(w->real, vertexCount, instanceCount, firstVertex, firstInstance);
 }
+
+/* ---------------- W3b.5 trampolines ---------------------------------------
+ *
+ * Surface is instance-scoped (creates a wrapper owned by the VkInstance).
+ * Queue is dispatchable — wrapped similarly to VkCommandBuffer.
+ * Fence/Semaphore/Swapchain are non-dispatchable, same {owner, real}
+ * wrappers as the W3b.3/W3b.4 pattern.
+ */
+
+typedef VkResult (VKAPI_PTR *PFN_vkCreateOsitokCompositorSurfaceKHR)(
+    VkInstance, const VkOsitoCompositorSurfaceCreateInfoOSITOK *,
+    const VkAllocationCallbacks *, VkSurfaceKHR *);
+typedef void (VKAPI_PTR *PFN_vkDestroySurfaceKHR)(
+    VkInstance, VkSurfaceKHR, const VkAllocationCallbacks *);
+typedef VkResult (VKAPI_PTR *PFN_vkQueueSubmit)(
+    VkQueue, uint32_t, const VkSubmitInfo *, VkFence);
+typedef VkResult (VKAPI_PTR *PFN_vkQueueWaitIdle)(VkQueue);
+typedef VkResult (VKAPI_PTR *PFN_vkDeviceWaitIdle)(VkDevice);
+typedef VkResult (VKAPI_PTR *PFN_vkCreateFence)(
+    VkDevice, const VkFenceCreateInfo *,
+    const VkAllocationCallbacks *, VkFence *);
+typedef void (VKAPI_PTR *PFN_vkDestroyFence)(
+    VkDevice, VkFence, const VkAllocationCallbacks *);
+typedef VkResult (VKAPI_PTR *PFN_vkResetFences)(
+    VkDevice, uint32_t, const VkFence *);
+typedef VkResult (VKAPI_PTR *PFN_vkWaitForFences)(
+    VkDevice, uint32_t, const VkFence *, VkBool32, uint64_t);
+typedef VkResult (VKAPI_PTR *PFN_vkGetFenceStatus)(VkDevice, VkFence);
+typedef VkResult (VKAPI_PTR *PFN_vkCreateSemaphore)(
+    VkDevice, const VkSemaphoreCreateInfo *,
+    const VkAllocationCallbacks *, VkSemaphore *);
+typedef void (VKAPI_PTR *PFN_vkDestroySemaphore)(
+    VkDevice, VkSemaphore, const VkAllocationCallbacks *);
+typedef VkResult (VKAPI_PTR *PFN_vkCreateSwapchainKHR)(
+    VkDevice, const VkSwapchainCreateInfoKHR *,
+    const VkAllocationCallbacks *, VkSwapchainKHR *);
+typedef void (VKAPI_PTR *PFN_vkDestroySwapchainKHR)(
+    VkDevice, VkSwapchainKHR, const VkAllocationCallbacks *);
+typedef VkResult (VKAPI_PTR *PFN_vkGetSwapchainImagesKHR)(
+    VkDevice, VkSwapchainKHR, uint32_t *, VkImage *);
+typedef VkResult (VKAPI_PTR *PFN_vkAcquireNextImageKHR)(
+    VkDevice, VkSwapchainKHR, uint64_t, VkSemaphore, VkFence, uint32_t *);
+typedef VkResult (VKAPI_PTR *PFN_vkQueuePresentKHR)(
+    VkQueue, const VkPresentInfoKHR *);
+typedef VkResult (VKAPI_PTR *PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR)(
+    VkPhysicalDevice, VkSurfaceKHR, VkSurfaceCapabilitiesKHR *);
+typedef VkResult (VKAPI_PTR *PFN_vkGetPhysicalDeviceSurfaceFormatsKHR)(
+    VkPhysicalDevice, VkSurfaceKHR, uint32_t *, VkSurfaceFormatKHR *);
+typedef VkResult (VKAPI_PTR *PFN_vkGetPhysicalDeviceSurfacePresentModesKHR)(
+    VkPhysicalDevice, VkSurfaceKHR, uint32_t *, VkPresentModeKHR *);
+typedef VkResult (VKAPI_PTR *PFN_vkGetPhysicalDeviceSurfaceSupportKHR)(
+    VkPhysicalDevice, uint32_t, VkSurfaceKHR, VkBool32 *);
+
+/* Wrappers for non-dispatchable types. */
+static inline struct osito_surface   *surf_from(VkSurfaceKHR h) { return (struct osito_surface *)(uintptr_t)h; }
+static inline VkSurfaceKHR            surf_to(struct osito_surface *w) { return (VkSurfaceKHR)(uintptr_t)w; }
+static inline struct osito_fence     *fence_from(VkFence h) { return (struct osito_fence *)(uintptr_t)h; }
+static inline VkFence                 fence_to(struct osito_fence *w) { return (VkFence)(uintptr_t)w; }
+static inline struct osito_semaphore *sem_from(VkSemaphore h) { return (struct osito_semaphore *)(uintptr_t)h; }
+static inline VkSemaphore             sem_to(struct osito_semaphore *w) { return (VkSemaphore)(uintptr_t)w; }
+static inline struct osito_swapchain *swp_from(VkSwapchainKHR h) { return (struct osito_swapchain *)(uintptr_t)h; }
+static inline VkSwapchainKHR          swp_to(struct osito_swapchain *w) { return (VkSwapchainKHR)(uintptr_t)w; }
+
+/* --- Surface --- */
+
+VKAPI_ATTR VkResult VKAPI_CALL
+vkCreateOsitokCompositorSurfaceKHR(
+        VkInstance instance,
+        const VkOsitoCompositorSurfaceCreateInfoOSITOK *pCreateInfo,
+        const VkAllocationCallbacks *pAllocator,
+        VkSurfaceKHR *pSurface) {
+    if (!instance || !pCreateInfo || !pSurface) return VK_ERROR_INITIALIZATION_FAILED;
+    struct osito_instance *self = osito_instance_from(instance);
+    if (self->icd_instance_count == 0) return VK_ERROR_INITIALIZATION_FAILED;
+    /* First ICD wins — surface is OsitoK-private so there's exactly one
+     * legitimate provider (venus). */
+    struct osito_icd_inst *ci = &self->icd_instances[0];
+    PFN_vkCreateOsitokCompositorSurfaceKHR fn =
+        (PFN_vkCreateOsitokCompositorSurfaceKHR)ci->icd->get_proc_addr(
+            ci->handle, "vkCreateOsitokCompositorSurfaceKHR");
+    if (!fn) return VK_ERROR_INITIALIZATION_FAILED;
+    VkSurfaceKHR real = VK_NULL_HANDLE;
+    VkResult rc = fn(ci->handle, pCreateInfo, pAllocator, &real);
+    if (rc != VK_SUCCESS || !real) return rc;
+    struct osito_surface *w = malloc(sizeof(*w));
+    if (!w) {
+        PFN_vkDestroySurfaceKHR drop = (PFN_vkDestroySurfaceKHR)
+            ci->icd->get_proc_addr(ci->handle, "vkDestroySurfaceKHR");
+        if (drop) drop(ci->handle, real, NULL);
+        return VK_ERROR_OUT_OF_HOST_MEMORY;
+    }
+    memset(w, 0, sizeof(*w));
+    w->owner_inst = self;
+    w->owner_icd  = ci;
+    w->real       = real;
+    *pSurface = surf_to(w);
+    return VK_SUCCESS;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+vkDestroySurfaceKHR(VkInstance instance, VkSurfaceKHR surface,
+                    const VkAllocationCallbacks *pAllocator) {
+    if (!instance || !surface) return;
+    struct osito_surface *w = surf_from(surface);
+    if (w->owner_icd) {
+        PFN_vkDestroySurfaceKHR fn = (PFN_vkDestroySurfaceKHR)
+            w->owner_icd->icd->get_proc_addr(w->owner_icd->handle,
+                                             "vkDestroySurfaceKHR");
+        if (fn) fn(w->owner_icd->handle, w->real, pAllocator);
+    }
+    free(w);
+}
+
+/* --- Queue (dispatchable — wraps each GetDeviceQueue result). --- */
+
+VKAPI_ATTR void VKAPI_CALL
+vkGetDeviceQueue_W3b5(VkDevice device, uint32_t queueFamilyIndex,
+                      uint32_t queueIndex, VkQueue *pQueue) {
+    /* vkGetDeviceQueue trampoline lives in the W3a section; this is a
+     * W3b.5-specific helper for wrapping the real queue. Not called
+     * directly from the dispatch table — the W3a vkGetDeviceQueue now
+     * must wrap the returned VkQueue. See the updated vkGetDeviceQueue
+     * at the top of this file. */
+    (void)device; (void)queueFamilyIndex; (void)queueIndex; (void)pQueue;
+}
+
+/* vkGetDeviceQueue is already defined above in the W3a section. We
+ * need to wrap its result now. The W3a body writes *pQueue directly
+ * — patch path: W3b.5 loader-side trampoline re-wraps the returned
+ * VkQueue in an osito_queue struct so subsequent QueueSubmit /
+ * QueuePresent trampolines can unwrap the owning device. */
+
+static inline VkQueue unwrap_queue(VkQueue q) {
+    if (!q) return q;
+    struct osito_queue *w = (struct osito_queue *)q;
+    return w->real;
+}
+
+static inline struct osito_device *queue_owner(VkQueue q) {
+    if (!q) return 0;
+    struct osito_queue *w = (struct osito_queue *)q;
+    return w->owner;
+}
+
+/* --- Queue submit + wait-idle. --- */
+
+VKAPI_ATTR VkResult VKAPI_CALL
+vkQueueSubmit(VkQueue queue, uint32_t submitCount,
+              const VkSubmitInfo *pSubmits, VkFence fence) {
+    if (!queue) return VK_ERROR_INITIALIZATION_FAILED;
+    struct osito_device *dw = queue_owner(queue);
+    if (!dw || !dw->owner) return VK_ERROR_INITIALIZATION_FAILED;
+    struct osito_icd_inst *ci = dw->owner;
+    PFN_vkQueueSubmit fn = (PFN_vkQueueSubmit)
+        ci->icd->get_proc_addr(ci->handle, "vkQueueSubmit");
+    if (!fn) return VK_ERROR_INITIALIZATION_FAILED;
+
+    /* Unwrap the VkSubmitInfo pointers: wait/signal semaphores +
+     * command buffers. Allocate scratch on the stack (W3b.5 caps
+     * semaphore counts to VENUS_MAX_SEMA_OBJECTS, cmd buffer count
+     * to VENUS_MAX_CMD_BUFFER_OBJECTS; enforce 8 per submit for
+     * scratch). */
+    #define OSITO_QS_MAX_SUBMITS      4u
+    #define OSITO_QS_MAX_PER_SUBMIT   8u
+    if (submitCount > OSITO_QS_MAX_SUBMITS) return VK_ERROR_INITIALIZATION_FAILED;
+    VkSubmitInfo locals[OSITO_QS_MAX_SUBMITS];
+    VkSemaphore  waits[OSITO_QS_MAX_SUBMITS][OSITO_QS_MAX_PER_SUBMIT];
+    VkSemaphore  sigs [OSITO_QS_MAX_SUBMITS][OSITO_QS_MAX_PER_SUBMIT];
+    VkCommandBuffer cbs[OSITO_QS_MAX_SUBMITS][OSITO_QS_MAX_PER_SUBMIT];
+    for (uint32_t i = 0; i < submitCount; i++) {
+        locals[i] = pSubmits[i];
+        uint32_t nw = locals[i].waitSemaphoreCount;
+        uint32_t ns = locals[i].signalSemaphoreCount;
+        uint32_t nc = locals[i].commandBufferCount;
+        if (nw > OSITO_QS_MAX_PER_SUBMIT) nw = OSITO_QS_MAX_PER_SUBMIT;
+        if (ns > OSITO_QS_MAX_PER_SUBMIT) ns = OSITO_QS_MAX_PER_SUBMIT;
+        if (nc > OSITO_QS_MAX_PER_SUBMIT) nc = OSITO_QS_MAX_PER_SUBMIT;
+        for (uint32_t j = 0; j < nw; j++)
+            waits[i][j] = pSubmits[i].pWaitSemaphores[j]
+                ? sem_from(pSubmits[i].pWaitSemaphores[j])->real : 0;
+        for (uint32_t j = 0; j < ns; j++)
+            sigs[i][j] = pSubmits[i].pSignalSemaphores[j]
+                ? sem_from(pSubmits[i].pSignalSemaphores[j])->real : 0;
+        for (uint32_t j = 0; j < nc; j++) {
+            struct osito_cmd_buffer *cbw =
+                (struct osito_cmd_buffer *)pSubmits[i].pCommandBuffers[j];
+            cbs[i][j] = cbw ? cbw->real : 0;
+        }
+        locals[i].waitSemaphoreCount   = nw;
+        locals[i].signalSemaphoreCount = ns;
+        locals[i].commandBufferCount   = nc;
+        locals[i].pWaitSemaphores      = waits[i];
+        locals[i].pSignalSemaphores    = sigs [i];
+        locals[i].pCommandBuffers      = cbs  [i];
+    }
+    VkFence real_fence = fence ? fence_from(fence)->real : VK_NULL_HANDLE;
+    return fn(unwrap_queue(queue), submitCount, locals, real_fence);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+vkQueueWaitIdle(VkQueue queue) {
+    if (!queue) return VK_ERROR_INITIALIZATION_FAILED;
+    struct osito_device *dw = queue_owner(queue);
+    if (!dw || !dw->owner) return VK_ERROR_INITIALIZATION_FAILED;
+    struct osito_icd_inst *ci = dw->owner;
+    PFN_vkQueueWaitIdle fn = (PFN_vkQueueWaitIdle)
+        ci->icd->get_proc_addr(ci->handle, "vkQueueWaitIdle");
+    if (!fn) return VK_ERROR_INITIALIZATION_FAILED;
+    return fn(unwrap_queue(queue));
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+vkDeviceWaitIdle(VkDevice device) {
+    if (!device) return VK_ERROR_INITIALIZATION_FAILED;
+    struct osito_device *dw = osito_device_from(device);
+    struct osito_icd_inst *ci = dw->owner;
+    if (!ci) return VK_ERROR_INITIALIZATION_FAILED;
+    PFN_vkDeviceWaitIdle fn = (PFN_vkDeviceWaitIdle)
+        ci->icd->get_proc_addr(ci->handle, "vkDeviceWaitIdle");
+    if (!fn) return VK_ERROR_INITIALIZATION_FAILED;
+    return fn(dw->real);
+}
+
+/* --- Fence --- */
+
+VKAPI_ATTR VkResult VKAPI_CALL
+vkCreateFence(VkDevice device, const VkFenceCreateInfo *pCI,
+              const VkAllocationCallbacks *pAllocator, VkFence *pFence) {
+    if (!device || !pCI || !pFence) return VK_ERROR_INITIALIZATION_FAILED;
+    struct osito_device *dw = osito_device_from(device);
+    struct osito_icd_inst *ci = dw->owner;
+    if (!ci) return VK_ERROR_INITIALIZATION_FAILED;
+    PFN_vkCreateFence fn = (PFN_vkCreateFence)
+        ci->icd->get_proc_addr(ci->handle, "vkCreateFence");
+    if (!fn) return VK_ERROR_INITIALIZATION_FAILED;
+    VkFence real = VK_NULL_HANDLE;
+    VkResult rc = fn(dw->real, pCI, pAllocator, &real);
+    if (rc != VK_SUCCESS || !real) return rc;
+    struct osito_fence *w = malloc(sizeof(*w));
+    if (!w) return VK_ERROR_OUT_OF_HOST_MEMORY;
+    w->owner = dw; w->real = real;
+    *pFence = fence_to(w);
+    return VK_SUCCESS;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+vkDestroyFence(VkDevice device, VkFence fence,
+               const VkAllocationCallbacks *pAllocator) {
+    if (!device || !fence) return;
+    struct osito_device *dw = osito_device_from(device);
+    struct osito_icd_inst *ci = dw->owner;
+    struct osito_fence *w = fence_from(fence);
+    if (ci) {
+        PFN_vkDestroyFence fn = (PFN_vkDestroyFence)
+            ci->icd->get_proc_addr(ci->handle, "vkDestroyFence");
+        if (fn) fn(dw->real, w->real, pAllocator);
+    }
+    free(w);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+vkResetFences(VkDevice device, uint32_t count, const VkFence *pFences) {
+    if (!device || !pFences || count == 0) return VK_SUCCESS;
+    struct osito_device *dw = osito_device_from(device);
+    struct osito_icd_inst *ci = dw->owner;
+    if (!ci) return VK_ERROR_INITIALIZATION_FAILED;
+    PFN_vkResetFences fn = (PFN_vkResetFences)
+        ci->icd->get_proc_addr(ci->handle, "vkResetFences");
+    if (!fn) return VK_ERROR_INITIALIZATION_FAILED;
+    #define OSITO_RF_MAX 32u
+    VkFence reals[OSITO_RF_MAX];
+    uint32_t n = count < OSITO_RF_MAX ? count : OSITO_RF_MAX;
+    for (uint32_t i = 0; i < n; i++)
+        reals[i] = pFences[i] ? fence_from(pFences[i])->real : 0;
+    return fn(dw->real, n, reals);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+vkWaitForFences(VkDevice device, uint32_t count, const VkFence *pFences,
+                VkBool32 waitAll, uint64_t timeout) {
+    if (!device || !pFences || count == 0) return VK_SUCCESS;
+    struct osito_device *dw = osito_device_from(device);
+    struct osito_icd_inst *ci = dw->owner;
+    if (!ci) return VK_ERROR_INITIALIZATION_FAILED;
+    PFN_vkWaitForFences fn = (PFN_vkWaitForFences)
+        ci->icd->get_proc_addr(ci->handle, "vkWaitForFences");
+    if (!fn) return VK_ERROR_INITIALIZATION_FAILED;
+    #define OSITO_WF_MAX 32u
+    VkFence reals[OSITO_WF_MAX];
+    uint32_t n = count < OSITO_WF_MAX ? count : OSITO_WF_MAX;
+    for (uint32_t i = 0; i < n; i++)
+        reals[i] = pFences[i] ? fence_from(pFences[i])->real : 0;
+    return fn(dw->real, n, reals, waitAll, timeout);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+vkGetFenceStatus(VkDevice device, VkFence fence) {
+    if (!device || !fence) return VK_ERROR_INITIALIZATION_FAILED;
+    struct osito_device *dw = osito_device_from(device);
+    struct osito_icd_inst *ci = dw->owner;
+    struct osito_fence *w = fence_from(fence);
+    if (!ci) return VK_ERROR_INITIALIZATION_FAILED;
+    PFN_vkGetFenceStatus fn = (PFN_vkGetFenceStatus)
+        ci->icd->get_proc_addr(ci->handle, "vkGetFenceStatus");
+    if (!fn) return VK_ERROR_INITIALIZATION_FAILED;
+    return fn(dw->real, w->real);
+}
+
+/* --- Semaphore --- */
+
+VKAPI_ATTR VkResult VKAPI_CALL
+vkCreateSemaphore(VkDevice device, const VkSemaphoreCreateInfo *pCI,
+                  const VkAllocationCallbacks *pAllocator,
+                  VkSemaphore *pSem) {
+    if (!device || !pCI || !pSem) return VK_ERROR_INITIALIZATION_FAILED;
+    struct osito_device *dw = osito_device_from(device);
+    struct osito_icd_inst *ci = dw->owner;
+    if (!ci) return VK_ERROR_INITIALIZATION_FAILED;
+    PFN_vkCreateSemaphore fn = (PFN_vkCreateSemaphore)
+        ci->icd->get_proc_addr(ci->handle, "vkCreateSemaphore");
+    if (!fn) return VK_ERROR_INITIALIZATION_FAILED;
+    VkSemaphore real = VK_NULL_HANDLE;
+    VkResult rc = fn(dw->real, pCI, pAllocator, &real);
+    if (rc != VK_SUCCESS || !real) return rc;
+    struct osito_semaphore *w = malloc(sizeof(*w));
+    if (!w) return VK_ERROR_OUT_OF_HOST_MEMORY;
+    w->owner = dw; w->real = real;
+    *pSem = sem_to(w);
+    return VK_SUCCESS;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+vkDestroySemaphore(VkDevice device, VkSemaphore sem,
+                   const VkAllocationCallbacks *pAllocator) {
+    if (!device || !sem) return;
+    struct osito_device *dw = osito_device_from(device);
+    struct osito_icd_inst *ci = dw->owner;
+    struct osito_semaphore *w = sem_from(sem);
+    if (ci) {
+        PFN_vkDestroySemaphore fn = (PFN_vkDestroySemaphore)
+            ci->icd->get_proc_addr(ci->handle, "vkDestroySemaphore");
+        if (fn) fn(dw->real, w->real, pAllocator);
+    }
+    free(w);
+}
+
+/* --- Swapchain --- */
+
+VKAPI_ATTR VkResult VKAPI_CALL
+vkCreateSwapchainKHR(VkDevice device,
+                     const VkSwapchainCreateInfoKHR *pCI,
+                     const VkAllocationCallbacks *pAllocator,
+                     VkSwapchainKHR *pSwapchain) {
+    if (!device || !pCI || !pSwapchain) return VK_ERROR_INITIALIZATION_FAILED;
+    struct osito_device *dw = osito_device_from(device);
+    struct osito_icd_inst *ci = dw->owner;
+    if (!ci) return VK_ERROR_INITIALIZATION_FAILED;
+    PFN_vkCreateSwapchainKHR fn = (PFN_vkCreateSwapchainKHR)
+        ci->icd->get_proc_addr(ci->handle, "vkCreateSwapchainKHR");
+    if (!fn) return VK_ERROR_INITIALIZATION_FAILED;
+    VkSwapchainCreateInfoKHR tmp = *pCI;
+    if (tmp.surface) tmp.surface = surf_from(tmp.surface)->real;
+    if (tmp.oldSwapchain) tmp.oldSwapchain = swp_from(tmp.oldSwapchain)->real;
+    VkSwapchainKHR real = VK_NULL_HANDLE;
+    VkResult rc = fn(dw->real, &tmp, pAllocator, &real);
+    if (rc != VK_SUCCESS || !real) return rc;
+    struct osito_swapchain *w = malloc(sizeof(*w));
+    if (!w) return VK_ERROR_OUT_OF_HOST_MEMORY;
+    w->owner = dw; w->real = real;
+    *pSwapchain = swp_to(w);
+    return VK_SUCCESS;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+vkDestroySwapchainKHR(VkDevice device, VkSwapchainKHR swapchain,
+                      const VkAllocationCallbacks *pAllocator) {
+    if (!device || !swapchain) return;
+    struct osito_device *dw = osito_device_from(device);
+    struct osito_icd_inst *ci = dw->owner;
+    struct osito_swapchain *w = swp_from(swapchain);
+    if (ci) {
+        PFN_vkDestroySwapchainKHR fn = (PFN_vkDestroySwapchainKHR)
+            ci->icd->get_proc_addr(ci->handle, "vkDestroySwapchainKHR");
+        if (fn) fn(dw->real, w->real, pAllocator);
+    }
+    free(w);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+vkGetSwapchainImagesKHR(VkDevice device, VkSwapchainKHR swapchain,
+                        uint32_t *pCount, VkImage *pImages) {
+    if (!device || !swapchain || !pCount) return VK_ERROR_INITIALIZATION_FAILED;
+    struct osito_device *dw = osito_device_from(device);
+    struct osito_icd_inst *ci = dw->owner;
+    struct osito_swapchain *w = swp_from(swapchain);
+    if (!ci) return VK_ERROR_INITIALIZATION_FAILED;
+    PFN_vkGetSwapchainImagesKHR fn = (PFN_vkGetSwapchainImagesKHR)
+        ci->icd->get_proc_addr(ci->handle, "vkGetSwapchainImagesKHR");
+    if (!fn) return VK_ERROR_INITIALIZATION_FAILED;
+    /* First call (pImages==NULL) just returns the count. */
+    if (!pImages) {
+        return fn(dw->real, w->real, pCount, NULL);
+    }
+    /* Second call: collect real VkImages from the ICD, then wrap each
+     * in an osito_image {owner, real} so subsequent vkBindImageMemory
+     * / vkDestroyImageView trampolines can unwrap correctly. */
+    #define OSITO_SW_MAX 8u
+    VkImage reals[OSITO_SW_MAX] = {0};
+    uint32_t n = (*pCount < OSITO_SW_MAX) ? *pCount : OSITO_SW_MAX;
+    uint32_t req = n;
+    VkResult rc = fn(dw->real, w->real, &req, reals);
+    if (rc != VK_SUCCESS && rc != VK_INCOMPLETE) return rc;
+    for (uint32_t i = 0; i < req; i++) {
+        struct osito_image *iw = malloc(sizeof(*iw));
+        if (!iw) {
+            /* Roll back previous wrappers. */
+            for (uint32_t j = 0; j < i; j++) free((void *)pImages[j]);
+            return VK_ERROR_OUT_OF_HOST_MEMORY;
+        }
+        iw->owner = dw; iw->real = reals[i];
+        pImages[i] = (VkImage)(uintptr_t)iw;
+    }
+    *pCount = req;
+    return rc;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+vkAcquireNextImageKHR(VkDevice device, VkSwapchainKHR swapchain,
+                      uint64_t timeout, VkSemaphore sem, VkFence fence,
+                      uint32_t *pImageIndex) {
+    if (!device || !swapchain || !pImageIndex) return VK_ERROR_INITIALIZATION_FAILED;
+    struct osito_device *dw = osito_device_from(device);
+    struct osito_icd_inst *ci = dw->owner;
+    struct osito_swapchain *w = swp_from(swapchain);
+    if (!ci) return VK_ERROR_INITIALIZATION_FAILED;
+    PFN_vkAcquireNextImageKHR fn = (PFN_vkAcquireNextImageKHR)
+        ci->icd->get_proc_addr(ci->handle, "vkAcquireNextImageKHR");
+    if (!fn) return VK_ERROR_INITIALIZATION_FAILED;
+    VkSemaphore real_sem   = sem   ? sem_from(sem)->real   : VK_NULL_HANDLE;
+    VkFence     real_fence = fence ? fence_from(fence)->real : VK_NULL_HANDLE;
+    return fn(dw->real, w->real, timeout, real_sem, real_fence, pImageIndex);
+}
+
+/* --- Present --- */
+
+VKAPI_ATTR VkResult VKAPI_CALL
+vkQueuePresentKHR(VkQueue queue, const VkPresentInfoKHR *pPresentInfo) {
+    if (!queue || !pPresentInfo) return VK_ERROR_INITIALIZATION_FAILED;
+    struct osito_device *dw = queue_owner(queue);
+    if (!dw || !dw->owner) return VK_ERROR_INITIALIZATION_FAILED;
+    struct osito_icd_inst *ci = dw->owner;
+    PFN_vkQueuePresentKHR fn = (PFN_vkQueuePresentKHR)
+        ci->icd->get_proc_addr(ci->handle, "vkQueuePresentKHR");
+    if (!fn) return VK_ERROR_INITIALIZATION_FAILED;
+
+    #define OSITO_PR_MAX 4u
+    VkSemaphore    waits [OSITO_PR_MAX];
+    VkSwapchainKHR sws   [OSITO_PR_MAX];
+    uint32_t nw = pPresentInfo->waitSemaphoreCount;
+    uint32_t nsc = pPresentInfo->swapchainCount;
+    if (nw  > OSITO_PR_MAX) nw  = OSITO_PR_MAX;
+    if (nsc > OSITO_PR_MAX) nsc = OSITO_PR_MAX;
+    for (uint32_t i = 0; i < nw; i++)
+        waits[i] = pPresentInfo->pWaitSemaphores[i]
+            ? sem_from(pPresentInfo->pWaitSemaphores[i])->real : 0;
+    for (uint32_t i = 0; i < nsc; i++)
+        sws[i] = pPresentInfo->pSwapchains[i]
+            ? swp_from(pPresentInfo->pSwapchains[i])->real : 0;
+    VkPresentInfoKHR tmp = *pPresentInfo;
+    tmp.waitSemaphoreCount = nw;
+    tmp.pWaitSemaphores    = waits;
+    tmp.swapchainCount     = nsc;
+    tmp.pSwapchains        = sws;
+    return fn(unwrap_queue(queue), &tmp);
+}
+
+/* --- Physical-device surface queries. --- */
+
+VKAPI_ATTR VkResult VKAPI_CALL
+vkGetPhysicalDeviceSurfaceCapabilitiesKHR(
+        VkPhysicalDevice physicalDevice, VkSurfaceKHR surface,
+        VkSurfaceCapabilitiesKHR *pCaps) {
+    struct osito_icd_inst *ci = 0; VkPhysicalDevice real = 0;
+    if (!osito_unwrap_phys(physicalDevice, &ci, &real))
+        return VK_ERROR_INITIALIZATION_FAILED;
+    PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR fn =
+        (PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR)ci->icd->get_proc_addr(
+            ci->handle, "vkGetPhysicalDeviceSurfaceCapabilitiesKHR");
+    if (!fn) return VK_ERROR_INITIALIZATION_FAILED;
+    VkSurfaceKHR real_s = surface ? surf_from(surface)->real : 0;
+    return fn(real, real_s, pCaps);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+vkGetPhysicalDeviceSurfaceFormatsKHR(
+        VkPhysicalDevice physicalDevice, VkSurfaceKHR surface,
+        uint32_t *pCount, VkSurfaceFormatKHR *pFormats) {
+    struct osito_icd_inst *ci = 0; VkPhysicalDevice real = 0;
+    if (!osito_unwrap_phys(physicalDevice, &ci, &real))
+        return VK_ERROR_INITIALIZATION_FAILED;
+    PFN_vkGetPhysicalDeviceSurfaceFormatsKHR fn =
+        (PFN_vkGetPhysicalDeviceSurfaceFormatsKHR)ci->icd->get_proc_addr(
+            ci->handle, "vkGetPhysicalDeviceSurfaceFormatsKHR");
+    if (!fn) return VK_ERROR_INITIALIZATION_FAILED;
+    VkSurfaceKHR real_s = surface ? surf_from(surface)->real : 0;
+    return fn(real, real_s, pCount, pFormats);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+vkGetPhysicalDeviceSurfacePresentModesKHR(
+        VkPhysicalDevice physicalDevice, VkSurfaceKHR surface,
+        uint32_t *pCount, VkPresentModeKHR *pModes) {
+    struct osito_icd_inst *ci = 0; VkPhysicalDevice real = 0;
+    if (!osito_unwrap_phys(physicalDevice, &ci, &real))
+        return VK_ERROR_INITIALIZATION_FAILED;
+    PFN_vkGetPhysicalDeviceSurfacePresentModesKHR fn =
+        (PFN_vkGetPhysicalDeviceSurfacePresentModesKHR)ci->icd->get_proc_addr(
+            ci->handle, "vkGetPhysicalDeviceSurfacePresentModesKHR");
+    if (!fn) return VK_ERROR_INITIALIZATION_FAILED;
+    VkSurfaceKHR real_s = surface ? surf_from(surface)->real : 0;
+    return fn(real, real_s, pCount, pModes);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+vkGetPhysicalDeviceSurfaceSupportKHR(
+        VkPhysicalDevice physicalDevice, uint32_t queueFamilyIndex,
+        VkSurfaceKHR surface, VkBool32 *pSupported) {
+    struct osito_icd_inst *ci = 0; VkPhysicalDevice real = 0;
+    if (!osito_unwrap_phys(physicalDevice, &ci, &real))
+        return VK_ERROR_INITIALIZATION_FAILED;
+    PFN_vkGetPhysicalDeviceSurfaceSupportKHR fn =
+        (PFN_vkGetPhysicalDeviceSurfaceSupportKHR)ci->icd->get_proc_addr(
+            ci->handle, "vkGetPhysicalDeviceSurfaceSupportKHR");
+    if (!fn) return VK_ERROR_INITIALIZATION_FAILED;
+    VkSurfaceKHR real_s = surface ? surf_from(surface)->real : 0;
+    return fn(real, queueFamilyIndex, real_s, pSupported);
+}
+

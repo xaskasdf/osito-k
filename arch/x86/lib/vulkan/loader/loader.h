@@ -139,6 +139,32 @@ struct osito_cmd_buffer {
     VkCommandBuffer       real;
 };
 
+/* W3b.5 — WSI + sync + queue wrappers. Surface is instance-scoped;
+ * queue is dispatchable; fence/sema/swapchain are non-dispatchable. */
+struct osito_surface {
+    struct osito_instance *owner_inst;
+    struct osito_icd_inst *owner_icd;
+    VkSurfaceKHR           real;
+};
+/* VkQueue is dispatchable — carries VK_LOADER_DATA. */
+struct osito_queue {
+    VK_LOADER_DATA        loader_data;
+    struct osito_device  *owner;
+    VkQueue               real;
+};
+struct osito_fence {
+    struct osito_device  *owner;
+    VkFence               real;
+};
+struct osito_semaphore {
+    struct osito_device  *owner;
+    VkSemaphore           real;
+};
+struct osito_swapchain {
+    struct osito_device  *owner;
+    VkSwapchainKHR        real;
+};
+
 static inline struct osito_phys_device *osito_phys_from(VkPhysicalDevice h) {
     return (struct osito_phys_device *)h;
 }
