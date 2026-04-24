@@ -547,6 +547,28 @@ void dos_transfer_to_native(dos_vm_t *vm)
     /* Record the VM pointer so native INT handlers can find it. */
     dos_set_native_vm(vm);
 
+    /* Safety net for uninitialised DOS function-pointer tables: plant
+     * a near-RET (0xC3) at CS:0 so a bad `callw *[X]` with a zero
+     * target returns harmlessly instead of crashing on invalid opcodes
+     * deeper in the data area. Touches one byte of DOOM's data but its
+     * offset 0 is typically padding/zero. */
+    {
+        uint16_t cs_idx = (cpu->cs >> 3) & 0x1FFF;
+        if (cs_idx < DPMI_MAX_DESCRIPTORS) {
+            dpmi_descriptor_t *d = &vm->dpmi.ldt[cs_idx];
+            uint32_t base = (uint32_t)d->base_lo
+                          | ((uint32_t)d->base_mid << 16)
+                          | ((uint32_t)d->base_hi  << 24);
+            if (base + 1 < vm->total_mem_size) {
+                uint8_t orig = vm->mem[base];
+                if (orig == 0x71 || orig == 0x00) {  /* padding-looking */
+                    vm->mem[base] = 0xC3;  /* RET near */
+                    serial_puts("[DOS-NT] patched CS:0 with C3 (RET) safety\n");
+                }
+            }
+        }
+    }
+
     /* Set TSS.RSP0 so ring-3→ring-0 transitions (timer interrupt and any
      * other non-IST vector) land on a valid kernel stack. Without this
      * the CPU pushes the iret frame at offset 0 and faults at -8. */
