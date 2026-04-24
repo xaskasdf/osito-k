@@ -278,6 +278,20 @@ void compositor_signal_dirty(uint32_t window_id)
     }
 }
 
+/* Reverse lookup: find window_id of the window whose backing SHM surface
+ * equals `shm_handle`. Returns 0 if no active window owns that handle. */
+uint32_t compositor_find_window_by_shm(uint32_t shm_handle)
+{
+    if (!shm_handle) return 0;
+    for (int i = 0; i < MAX_WINDOWS; i++) {
+        if ((windows[i].flags & WND_ACTIVE) &&
+            windows[i].shm_handle == shm_handle) {
+            return windows[i].id;
+        }
+    }
+    return 0;
+}
+
 /* Set fullscreen mode */
 void compositor_set_fullscreen(uint32_t window_id, bool fullscreen)
 {

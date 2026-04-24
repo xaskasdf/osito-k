@@ -3427,26 +3427,40 @@ int64_t __hot syscall_dispatch(uint64_t nr, uint64_t a1, uint64_t a2,
         return caps;
     }
     case SYS_GPU_CTX_CREATE: {   /* 601: gpu_ctx_create(flags) */
-        return vg3d_ctx_create((uint32_t)proc_current_pid(), (uint32_t)a1);
+        int32_t pid = proc_current_pid();
+        if (pid < 0) return -1;  /* EPERM */
+        return vg3d_ctx_create((uint32_t)pid, (uint32_t)a1);
     }
     case SYS_GPU_CTX_DESTROY: {  /* 602: gpu_ctx_destroy(ctx_id) */
-        return vg3d_ctx_destroy((uint32_t)proc_current_pid(), (uint32_t)a1);
+        int32_t pid = proc_current_pid();
+        if (pid < 0) return -1;
+        return vg3d_ctx_destroy((uint32_t)pid, (uint32_t)a1);
     }
     case SYS_GPU_RES_CREATE: {   /* 603: (ctx_id, args *) */
+        if (!a2) return -22;
+        int32_t pid = proc_current_pid();
+        if (pid < 0) return -1;
         const struct gpu_res_create_args *a =
             (const struct gpu_res_create_args *)a2;
-        return vg3d_res_create((uint32_t)proc_current_pid(),
-                               (uint32_t)a1, a);
+        return vg3d_res_create((uint32_t)pid, (uint32_t)a1, a);
     }
     case SYS_GPU_RES_MAP: {      /* 604: (res_id) -> user VA */
-        return (int64_t)vg3d_res_map((uint32_t)proc_current_pid(),
-                                     (uint32_t)a1);
+        int32_t pid = proc_current_pid();
+        if (pid < 0) return -1;
+        return (int64_t)vg3d_res_map((uint32_t)pid, (uint32_t)a1);
     }
     case SYS_GPU_SUBMIT: {       /* 605: (args *) */
         const struct gpu_submit_args *a =
             (const struct gpu_submit_args *)a1;
         if (!a) return -22; /* EINVAL */
-        return vg3d_submit((uint32_t)proc_current_pid(), a->ctx_id,
+        /* Defence-in-depth: also reject null pointers inside the struct
+         * here. vg3d_submit rejects them too, but validating at the
+         * syscall boundary means we never dereference through the NULL
+         * pointer value in a deeper callee. */
+        if (!a->cmd_bytes || !a->out_fence) return -22;
+        int32_t pid = proc_current_pid();
+        if (pid < 0) return -1;
+        return vg3d_submit((uint32_t)pid, a->ctx_id,
                            a->cmd_bytes, a->cmd_len, a->out_fence);
     }
     case SYS_GPU_FENCE_WAIT: {   /* 606: (fence, timeout_ns) */
@@ -3456,7 +3470,9 @@ int64_t __hot syscall_dispatch(uint64_t nr, uint64_t a1, uint64_t a2,
         const struct gpu_present_args *a =
             (const struct gpu_present_args *)a1;
         if (!a) return -22;
-        return vg3d_present((uint32_t)proc_current_pid(),
+        int32_t pid = proc_current_pid();
+        if (pid < 0) return -1;
+        return vg3d_present((uint32_t)pid,
                             a->ctx_id, a->res_id, a->shm_handle);
     }
 

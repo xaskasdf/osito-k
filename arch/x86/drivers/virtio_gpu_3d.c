@@ -15,6 +15,8 @@ extern void serial_putdec(uint64_t val);
 #define EINVAL 22
 #define ENOMEM 12
 #define ESRCH   3
+#define EIO     5
+#define EPERM   1
 
 /* -- Context table ---------------------------------------- */
 #define VG3D_CTX_MAX 64
@@ -142,10 +144,20 @@ int32_t vg3d_res_create(uint32_t pid, uint32_t ctx_id,
     if (sz == 0 || sz > (256u << 20)) return -EINVAL;   /* clamp to 256 MiB */
 
     uint64_t pages = (sz + 4095) >> 12;
-    void *backing = mem_alloc_pages(pages);
-    if (!backing) return -ENOMEM;
-    /* Zero the backing (musl-style cleared memory) */
-    for (uint64_t i = 0; i < sz / 8; i++) ((volatile uint64_t *)backing)[i] = 0;
+    void *phys_raw = mem_alloc_pages(pages);
+    if (!phys_raw) return -ENOMEM;
+    uint64_t phys = (uint64_t)phys_raw;
+    /* Upper-half VA view of the just-allocated phys range via PML4[256]
+     * direct map. All CPU access happens through `backing`; the raw phys
+     * goes to `backing_phys` for future DMA descriptor fills. */
+    void *backing = PHYS_TO_VIRT(phys);
+
+    /* Zero the backing — qword pass + byte tail to handle sz % 8. */
+    uint64_t qwords = sz >> 3;
+    for (uint64_t i = 0; i < qwords; i++)
+        ((volatile uint64_t *)backing)[i] = 0;
+    for (uint64_t i = qwords << 3; i < sz; i++)
+        ((volatile uint8_t *)backing)[i] = 0;
 
     for (int i = 0; i < VG3D_RES_MAX; i++) {
         if (g_res_tab[i].id == 0) {
@@ -156,12 +168,12 @@ int32_t vg3d_res_create(uint32_t pid, uint32_t ctx_id,
             g_res_tab[i].flags = args->flags;
             g_res_tab[i].format = args->format;
             g_res_tab[i].size = sz;
-            g_res_tab[i].backing_va = (uint64_t)backing;
-            g_res_tab[i].backing_phys = VIRT_TO_PHYS((uint64_t)backing);
+            g_res_tab[i].backing_va = (uint64_t)backing;   /* upper-half VA */
+            g_res_tab[i].backing_phys = phys;              /* phys, no conv */
             return (int32_t)g_res_tab[i].id;
         }
     }
-    mem_free_pages(backing, pages);
+    mem_free_pages(phys_raw, pages);
     return -ENOMEM;
 }
 
@@ -214,7 +226,7 @@ int32_t vg3d_submit(uint32_t pid, uint32_t ctx_id,
     resp.ctx_id = 0; resp.padding = 0;
     int rc = vgpu_controlq_submit(buf, total, &resp, sizeof(resp));
     mem_free_pages(buf, pages);
-    if (rc < 0) return -5;   /* -EIO */
+    if (rc < 0) return -EIO;
     *out_fence = fence;
     vg3d_fence_signal(fence);
     return 0;
@@ -225,10 +237,9 @@ int32_t vg3d_fence_wait(uint64_t fence, uint64_t timeout_ns) {
     if (fence <= g_fence_signaled) return 0;
     return -110;        /* ETIMEDOUT -- shouldn't happen in Wave 1 */
 }
-extern void *shm_map(uint32_t handle);
-extern void  compositor_signal_dirty(uint32_t window_id);
-/* Our lookup: shm_handle == window_id in the current compositor impl.
- * If that changes, we'll need an explicit shm->window mapping. */
+extern void    *shm_map(uint32_t handle);
+extern uint32_t compositor_find_window_by_shm(uint32_t shm_handle);
+extern void     compositor_signal_dirty(uint32_t window_id);
 
 int32_t vg3d_present(uint32_t pid, uint32_t ctx_id,
                      uint32_t res_id, uint32_t shm_handle) {
@@ -244,15 +255,27 @@ int32_t vg3d_present(uint32_t pid, uint32_t ctx_id,
     if (!r) return -ESRCH;
     if (r->kind != GPU_RES_KIND_IMAGE2D) return -EINVAL;
 
+    /* Resolve shm_handle -> window_id BEFORE any work so a bad handle
+     * short-circuits. shm_handle and window_id are decoupled IDs. */
+    uint32_t window_id = compositor_find_window_by_shm(shm_handle);
+    if (!window_id) return -EINVAL;
+
     void *dst = shm_map(shm_handle);
     if (!dst) return -EINVAL;
 
-    /* Wave 1: CPU memcpy. Wave 2 replaces with GPU-side
-     * transfer_to_host_3d + blob alias when sizes match. */
-    for (uint64_t i = 0; i < r->size / 8; i++)
-        ((volatile uint64_t *)dst)[i] = ((volatile uint64_t *)r->backing_va)[i];
+    /* Wave 1: CPU memcpy — qword pass then byte tail for sz % 8.
+     * Wave 2 replaces with GPU-side transfer_to_host_3d + blob alias
+     * when sizes match. */
+    uint64_t sz = r->size;
+    uint64_t qwords = sz >> 3;
+    volatile uint64_t       *d64 = (volatile uint64_t *)dst;
+    const volatile uint64_t *s64 = (const volatile uint64_t *)r->backing_va;
+    for (uint64_t i = 0; i < qwords; i++) d64[i] = s64[i];
+    volatile uint8_t       *d8 = (volatile uint8_t *)dst;
+    const volatile uint8_t *s8 = (const volatile uint8_t *)r->backing_va;
+    for (uint64_t i = qwords << 3; i < sz; i++) d8[i] = s8[i];
 
-    compositor_signal_dirty(shm_handle);
+    compositor_signal_dirty(window_id);
     return 0;
 }
 void vg3d_cleanup_process(uint32_t pid) {
@@ -266,7 +289,9 @@ void vg3d_cleanup_process(uint32_t pid) {
     for (int i = 0; i < VG3D_RES_MAX; i++) {
         if (g_res_tab[i].id && g_res_tab[i].pid == pid) {
             uint64_t pages = (g_res_tab[i].size + 4095) >> 12;
-            mem_free_pages((void *)g_res_tab[i].backing_va, pages);
+            /* mem_free_pages expects phys (same contract as mem_alloc_pages);
+             * backing_phys cached at create time. */
+            mem_free_pages((void *)g_res_tab[i].backing_phys, pages);
             g_res_tab[i].id = 0;
             g_res_tab[i].ctx_id = 0;
             g_res_tab[i].pid = 0;

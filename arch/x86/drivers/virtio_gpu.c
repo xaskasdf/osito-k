@@ -533,7 +533,11 @@ void virtio_gpu_init(uint64_t ecam, uint8_t bus, uint8_t dev, uint8_t func,
     serial_puthex(gpu.device_features, 16);
     serial_puts("\n");
 
-    /* Accept VIRGL (bit 0) if offered -- enables 3D path. */
+    /* Accept all offered features (incl. VIRGL bit 0) when VIRGL is
+     * present. The 2D path worked without any feature negotiation, so
+     * this wider accept is fine for Wave 1; the relevant bit is VIRGL
+     * itself. If a host advertises a feature the kernel doesn't know
+     * how to drive, this would need narrowing to a known-safe mask. */
     if (gpu.device_features & (1ull << 0)) {
         *(volatile uint32_t *)(cfg + 0x08) = 0; /* driver_feature_select */
         __asm__ volatile ("mfence" ::: "memory");
@@ -542,7 +546,7 @@ void virtio_gpu_init(uint64_t ecam, uint8_t bus, uint8_t dev, uint8_t func,
         __asm__ volatile ("mfence" ::: "memory");
         *(volatile uint32_t *)(cfg + 0x0C) = feat_hi;
         __asm__ volatile ("mfence" ::: "memory");
-        serial_puts("[VIRTIO-GPU] VIRGL accepted\n");
+        serial_puts("[VIRTIO-GPU] VIRGL accepted (full feature echo)\n");
     }
 
     cfg[0x14] |= VIRTIO_STATUS_FEATURES_OK;
