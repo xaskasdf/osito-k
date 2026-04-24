@@ -88,3 +88,84 @@ void venus_wire_close(struct venus_wire *w) {
      * Wave 1's syscall set. Just release guest struct. */
     free(w);
 }
+
+void *venus_wire_alloc_cmd(struct venus_wire *w,
+                           uint32_t cmd_id, uint16_t flags,
+                           uint32_t payload_size, uint64_t *out_reply_id) {
+    if (!w) return 0;
+    /* Round payload to 8 bytes for wire alignment. */
+    uint32_t aligned = (payload_size + 7) & ~7u;
+    uint32_t total = sizeof(struct venus_cmd_header) + aligned;
+
+    /* Simple bumped head — no wraparound in W3b.1. Ring must not fill. */
+    uint32_t head = w->hdr->head;
+    if (head + total > VENUS_RING_CMD_BYTES) return 0;
+
+    struct venus_cmd_header *h = (struct venus_cmd_header *)(w->cmd_area + head);
+    h->cmd_id = cmd_id;
+    h->flags  = flags;
+    h->_reserved = 0;
+    h->payload_size = payload_size;
+    h->reply_id = w->next_reply_id++;
+    if (out_reply_id) *out_reply_id = h->reply_id;
+
+    w->pending_head_advance = total;
+    /* Caller writes payload directly after the header. */
+    return (void *)(w->cmd_area + head + sizeof(*h));
+}
+
+int venus_wire_submit(struct venus_wire *w) {
+    if (!w || w->pending_head_advance == 0) return -22 /* EINVAL */;
+
+    /* Make the command visible to the host BEFORE bumping head. */
+    __asm__ volatile("mfence" ::: "memory");
+    w->hdr->head += w->pending_head_advance;
+    __asm__ volatile("mfence" ::: "memory");
+    w->pending_head_advance = 0;
+
+    /* Send a single-byte "ping" via SYS_GPU_SUBMIT so the kernel pokes
+     * the virtio-gpu virtqueue. Actual command bytes live in the ring;
+     * this submission just tells the host to drain. */
+    uint64_t fence = 0;
+    uint8_t ping = 0;
+    struct gpu_submit_args sa = {
+        .ctx_id = (uint32_t)w->ctx_id,
+        .cmd_bytes = &ping,
+        .cmd_len = 1,
+        .out_fence = &fence,
+    };
+    long rc = __syscall1(VENUS_SYS_GPU_SUBMIT, (long)&sa);
+    if (rc < 0) return (int)rc;
+    /* Fence wait is deferred — the *reply* is how we know the command
+     * was consumed. We don't need to fence-wait here. */
+    return 0;
+}
+
+int venus_wire_wait_reply(struct venus_wire *w, uint64_t reply_id,
+                          void *out_buf, uint32_t buf_size) {
+    if (!w) return -22;
+
+    /* Poll reply_head for up to ~1 second of busy-spin. Real driver
+     * should back off; W3b.1 keeps it simple. */
+    for (int attempt = 0; attempt < 100000000; attempt++) {
+        __asm__ volatile("lfence" ::: "memory");
+        if (w->hdr->reply_head > w->hdr->reply_tail) {
+            struct venus_cmd_header *rh =
+                (struct venus_cmd_header *)(w->reply_area + w->hdr->reply_tail);
+            if (rh->reply_id != reply_id) {
+                /* Out-of-order replies: not supported in W3b.1. Fail
+                 * cleanly so W3b.2 can extend. */
+                return -5 /* EIO */;
+            }
+            uint32_t copy = rh->payload_size;
+            if (copy > buf_size) copy = buf_size;
+            const uint8_t *src = (const uint8_t *)(rh + 1);
+            for (uint32_t i = 0; i < copy; i++)
+                ((uint8_t *)out_buf)[i] = src[i];
+            uint32_t aligned = (rh->payload_size + 7) & ~7u;
+            w->hdr->reply_tail += sizeof(*rh) + aligned;
+            return (int)copy;
+        }
+    }
+    return -110 /* ETIMEDOUT */;
+}
