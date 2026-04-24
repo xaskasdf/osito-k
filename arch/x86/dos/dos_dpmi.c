@@ -481,10 +481,30 @@ void dos_int31_dpmi(dos_vm_t *vm)
         uint16_t idx = dpmi_sel_to_index(sel);
         if (idx < DPMI_MAX_DESCRIPTORS) {
             dpmi_descriptor_t *d = &dpmi->ldt[idx];
-            d->access = cpu->cl;
-            /* CH contains flags_lim upper nibble merged with limit hi nibble.
-             * Preserve the limit bits (low nibble), replace flags (high nibble). */
-            d->flags_lim = (d->flags_lim & 0x0F) | (cpu->ch & 0xF0);
+            /* Observed DOOM behavior: calls AX=0009h with CL=0 for a
+             * previously-valid descriptor, which would clear P=0 and
+             * break any later segment load that uses this selector.
+             * Rather than follow the spec literally (which produces a
+             * null descriptor and subsequent #GP inside DOOM), preserve
+             * the Present bit: if the new access drops P while the old
+             * had it, keep the old. */
+            uint8_t new_acc = cpu->cl;
+            if (!(new_acc & DESC_PRESENT) && (d->access & DESC_PRESENT)) {
+                serial_puts("[DPMI] SetAccess sel=0x");
+                serial_puthex(sel, 4);
+                serial_puts(" WOULD CLEAR P — keeping old access\n");
+            } else {
+                d->access = new_acc;
+                /* CH contains flags_lim upper nibble merged with limit hi nibble.
+                 * Preserve the limit bits (low nibble), replace flags (high nibble). */
+                d->flags_lim = (d->flags_lim & 0x0F) | (cpu->ch & 0xF0);
+                serial_puts("[DPMI] SetAccess sel=0x");
+                serial_puthex(sel, 4);
+                serial_puts(" acc=0x"); serial_puthex(new_acc, 2);
+                serial_puts(" flags=0x"); serial_puthex(cpu->ch, 2);
+                serial_puts((new_acc & DESC_CODE) ? " CODE" : " DATA");
+                serial_puts("\n");
+            }
             cpu->eflags &= ~FLAG_CF;
         } else {
             cpu->ax = 0x8022;
