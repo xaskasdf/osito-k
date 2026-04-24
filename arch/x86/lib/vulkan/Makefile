@@ -30,7 +30,17 @@ SRC := \
   icd/venus/venus_cmd_GetPhysicalDeviceProperties.c \
   icd/venus/venus_cmd_GetPhysicalDeviceFeatures.c \
   icd/venus/venus_cmd_GetPhysicalDeviceQueueFamilyProperties.c \
-  icd/venus/venus_cmd_GetPhysicalDeviceMemoryProperties.c
+  icd/venus/venus_cmd_GetPhysicalDeviceMemoryProperties.c \
+  icd/venus/venus_cmd_CreateDevice.c \
+  icd/venus/venus_cmd_DestroyDevice.c \
+  icd/venus/venus_cmd_AllocateMemory.c \
+  icd/venus/venus_cmd_FreeMemory.c \
+  icd/venus/venus_cmd_MapMemory.c \
+  icd/venus/venus_cmd_UnmapMemory.c \
+  icd/venus/venus_cmd_CreateBuffer.c \
+  icd/venus/venus_cmd_DestroyBuffer.c \
+  icd/venus/venus_cmd_GetBufferMemoryRequirements.c \
+  icd/venus/venus_cmd_BindBufferMemory.c
 
 OBJ := $(patsubst %.c,$(BUILD_ROOT)/%.o,$(SRC))
 
