@@ -640,8 +640,12 @@ void dos_transfer_to_native(dos_vm_t *vm)
      * We push in reverse: SS, RSP, RFLAGS, CS, RIP.
      * Also propagate emulated GPRs (EAX/EBX/ECX/EDX/ESI/EDI/EBP) so DOS4GW
      * starts with its expected register state instead of kernel leftovers. */
-    uint64_t rflags = 0x202;  /* IF=1, bit 1 reserved-always-1 */
-    (void)rflags;
+    /* RFLAGS: IF=1 (bit 9), IOPL=3 (bits 12-13), reserved-1 (bit 1).
+     * IOPL=3 lets the ring-3 DOS code execute IN/OUT freely, so DOS4GW
+     * and DOOM can write to the VGA DAC ports (0x3C8/0x3C9), PIC, etc.
+     * The emulated chipset in QEMU absorbs the writes; future work can
+     * snoop specific ports via a #GP-handler port trap. */
+    uint64_t rflags = 0x3202;
 
     /* Debug: show page-table entries along the walk for CS:RIP target
      * (linear = CS_base + EIP) to verify USER/PRESENT/WRITABLE. */
