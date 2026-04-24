@@ -55,25 +55,41 @@ static int venus_buf_slot_alloc(struct venus_device *dev) {
  * low 48 bits = device pointer. This keeps sign-extension clean on
  * x86-64 canonical addresses. */
 
+/* Handle layout (64-bit non-dispatchable):
+ *   bit 63     : marker (always 1 for venus ICD handles)
+ *   bit 62     : object tag (0 = memory, 1 = buffer)
+ *   bits 61:60 : reserved (0)
+ *   bits 59:48 : slot index (12 bits, VENUS_MAX_* << 4096)
+ *   bits 47:0  : device pointer (canonical low 48 bits)
+ *
+ * Decoders MUST mask out bits 63..60 so the slot doesn't pick up the
+ * marker/tag (which would make every slot >= 0x8000 and fail the
+ * `slot >= VENUS_MAX_*` guard).
+ */
+#define VENUS_H_MARKER_MEM   0x8000000000000000ull
+#define VENUS_H_MARKER_BUF   0xC000000000000000ull
+#define VENUS_H_SLOT_MASK    0x0FFFull   /* 12 bits — plenty of headroom */
+#define VENUS_H_PTR_MASK     0x0000FFFFFFFFFFFFull
+
 static inline VkDeviceMemory mem_slot_to_handle(struct venus_device *dev, int slot) {
-    uint64_t h = ((uint64_t)(uint32_t)slot & 0xFFFF) << 48
-               | ((uint64_t)(uintptr_t)dev & 0x0000FFFFFFFFFFFFull);
-    h |= 0x8000000000000000ull; /* marker bit to disambiguate from host ids */
+    uint64_t h = ((uint64_t)(uint32_t)slot & VENUS_H_SLOT_MASK) << 48
+               | ((uint64_t)(uintptr_t)dev & VENUS_H_PTR_MASK);
+    h |= VENUS_H_MARKER_MEM;
     return (VkDeviceMemory)h;
 }
 static inline VkBuffer buf_slot_to_handle(struct venus_device *dev, int slot) {
-    uint64_t h = ((uint64_t)(uint32_t)slot & 0xFFFF) << 48
-               | ((uint64_t)(uintptr_t)dev & 0x0000FFFFFFFFFFFFull);
-    h |= 0xC000000000000000ull; /* different tag from memory */
+    uint64_t h = ((uint64_t)(uint32_t)slot & VENUS_H_SLOT_MASK) << 48
+               | ((uint64_t)(uintptr_t)dev & VENUS_H_PTR_MASK);
+    h |= VENUS_H_MARKER_BUF;
     return (VkBuffer)h;
 }
 static inline int mem_handle_to_slot(VkDeviceMemory h) {
     uint64_t v = (uint64_t)h;
-    return (int)((v >> 48) & 0xFFFF);
+    return (int)((v >> 48) & VENUS_H_SLOT_MASK);  /* strip marker/tag bits */
 }
 static inline int buf_handle_to_slot(VkBuffer h) {
     uint64_t v = (uint64_t)h;
-    return (int)((v >> 48) & 0xFFFF);
+    return (int)((v >> 48) & VENUS_H_SLOT_MASK);  /* strip marker/tag bits */
 }
 
 /* --- Device lifecycle --------------------------------------------------- */
