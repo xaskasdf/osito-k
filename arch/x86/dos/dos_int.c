@@ -391,6 +391,8 @@ int dos_native_emulate_lretw(void *frame_ptr)
     int opc_is_ff_5    = 0;     /* JMP FAR indirect */
     int opc_is_ff_3    = 0;     /* CALL FAR indirect */
     int opc_is_mov_seg = 0;     /* 0x8E: MOV Sreg, r/m16 */
+    int opc_is_les     = 0;     /* 0xC4: LES r16, m16:16 */
+    int opc_is_lds     = 0;     /* 0xC5: LDS r16, m16:16 */
     if (opc == 0x66 && fault_linear + 1 < vm->total_mem_size) {
         opc_prefix = 0x66;
         opc = vm->mem[fault_linear + 1];
@@ -410,6 +412,15 @@ int dos_native_emulate_lretw(void *frame_ptr)
         if (fault_linear + 1 >= vm->total_mem_size) DOS_NT_EMU_FAIL;
         opc_modrm = vm->mem[fault_linear + 1 + (opc_prefix ? 1 : 0)];
         opc_is_mov_seg = 1;
+    } else if (opc == 0xC4 || opc == 0xC5) {
+        /* LES r16, m16:16 (0xC4) or LDS r16, m16:16 (0xC5). #GPs when
+         * the segment part of the memory operand doesn't resolve.
+         * Treat like MOV Sreg: advance RIP and load ES/DS with a safe
+         * alias. The offset-register load (into the ModR/M reg field)
+         * is skipped — DOOM usually recomputes or overwrites that reg. */
+        if (fault_linear + 1 >= vm->total_mem_size) DOS_NT_EMU_FAIL;
+        opc_modrm = vm->mem[fault_linear + 1 + (opc_prefix ? 1 : 0)];
+        if (opc == 0xC4) opc_is_les = 1; else opc_is_lds = 1;
     } else if (opc != 0xCB && opc != 0xCA && opc != 0xCF && opc != 0xEA) {
         DOS_NT_EMU_FAIL;
     }
@@ -423,7 +434,7 @@ int dos_native_emulate_lretw(void *frame_ptr)
     int is_iretd      = 0;
     int pushes_retaddr = 0;     /* CALL FAR variants */
 
-    if (opc_is_mov_seg) {
+    if (opc_is_mov_seg || opc_is_les || opc_is_lds) {
         /* Compute instruction length. */
         uint8_t mod = (opc_modrm >> 6) & 3;
         uint8_t rm  = opc_modrm & 7;
@@ -441,7 +452,12 @@ int dos_native_emulate_lretw(void *frame_ptr)
          * subsequent memory access doesn't re-fault. This loses DOOM's
          * intended selector, but keeps forward progress for DOS4GW's
          * quirky patterns. */
-        uint8_t sreg = (opc_modrm >> 3) & 7;
+        /* Select target segreg:
+         *   MOV Sreg: ModR/M reg field (0=ES,3=DS,4=FS,5=GS).
+         *   LES: ES.  LDS: DS. */
+        uint8_t sreg = opc_is_mov_seg ? ((opc_modrm >> 3) & 7)
+                     : opc_is_les     ? 0
+                     :                  3; /* lds */
         uint16_t safe_sel = (uint16_t)vm->cpu->ds;
         if ((safe_sel & 0x04) == 0) safe_sel = (uint16_t)f->cs;  /* fallback */
         /* Load the target segment register NOW. iretq won't restore
@@ -451,15 +467,15 @@ int dos_native_emulate_lretw(void *frame_ptr)
             case 3: __asm__ volatile ("movw %0, %%ds" :: "r"(safe_sel)); break;
             case 4: __asm__ volatile ("movw %0, %%fs" :: "r"(safe_sel)); break;
             case 5: __asm__ volatile ("movw %0, %%gs" :: "r"(safe_sel)); break;
-            /* SS (reg=2) and CS (reg=1) we don't touch. */
             default: break;
         }
         f->rip += len;
-        serial_puts("[DOS-NT] emu 0x8E sreg=");
-        serial_putdec(sreg); serial_puts(" <- 0x");
-        serial_puthex(safe_sel, 4);
-        serial_puts(" (was err=0x");
-        serial_puthex((uint64_t)f->error_code, 4);
+        serial_puts("[DOS-NT] emu ");
+        serial_puts(opc_is_les ? "0xC4(LES)" :
+                    opc_is_lds ? "0xC5(LDS)" : "0x8E(MOV)");
+        serial_puts(" sreg="); serial_putdec(sreg);
+        serial_puts(" <- 0x");  serial_puthex(safe_sel, 4);
+        serial_puts(" (err=0x"); serial_puthex((uint64_t)f->error_code, 4);
         serial_puts(") skip len="); serial_putdec(len); serial_puts("\n");
         if (kcr3 && saved_cr3 != kcr3)
             __asm__ volatile ("mov %0, %%cr3" :: "r"(saved_cr3) : "memory");
