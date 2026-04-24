@@ -245,7 +245,12 @@ typedef struct {
 static dos_vm_t *g_native_dos_vm = 0;
 static cpu8086_state_t g_native_cpu;
 
-void dos_set_native_vm(dos_vm_t *vm) { g_native_dos_vm = vm; }
+void dos_set_native_vm(dos_vm_t *vm)
+{
+    g_native_dos_vm = vm;
+    extern void dos_vga_set_native_vm(dos_vm_t *vm);
+    dos_vga_set_native_vm(vm);
+}
 
 void dos_int_native_dispatch(uint64_t int_num, dos_native_regs_t *regs)
 {

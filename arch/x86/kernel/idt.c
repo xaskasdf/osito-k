@@ -817,6 +817,10 @@ void isr_handler(interrupt_frame_t *frame)
 
     /* APIC timer tick */
     if (vec == 32) {
+        /* Present DOS VGA mode 13h vram to the real framebuffer (no-op
+         * unless a native DOS VM is active and in mode 13h). */
+        extern void dos_vga_mode13_present(void);
+        dos_vga_mode13_present();
         /* In TSC-deadline mode, advance tick_count based on elapsed TSC
          * to maintain a stable ~100Hz virtual tick for TCP/timers/display.
          * In periodic mode, simply increment. */
