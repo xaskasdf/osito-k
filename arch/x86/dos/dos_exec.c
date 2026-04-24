@@ -358,6 +358,7 @@ static inline uint64_t dos_nt_va_to_pa(const void *va)
 #define PTE_PRESENT   (1ULL << 0)
 #define PTE_WRITABLE  (1ULL << 1)
 #endif
+#define PTE_USER      (1ULL << 2)
 
 /* GDT slot reserved for the DOS LDT descriptor (2 slots, 16 bytes).
  * Slots 0-9 are claimed (null, kernel CS/DS, 64-bit CS/DS, CODE32, DATA32);
@@ -399,7 +400,7 @@ void dos_transfer_to_native(dos_vm_t *vm)
         uint64_t mapped = 0;
         for (uint64_t off = 0; off < vm->total_mem_size; off += 4096) {
             if (paging_map_page_in_cr3(dos_cr3, off, mem_pa + off,
-                                       PTE_PRESENT | PTE_WRITABLE) != 0) {
+                                       PTE_PRESENT | PTE_WRITABLE | PTE_USER) != 0) {
                 serial_puts("[DOS-NT] map FAILED at off=0x");
                 serial_puthex(off, 8); serial_puts("\n");
                 return;
@@ -422,7 +423,7 @@ void dos_transfer_to_native(dos_vm_t *vm)
         for (uint64_t va = vm_pbase; va < vm_end; va += 4096) {
             uint64_t pa = dos_nt_va_to_pa((void *)va);
             if (paging_map_page_in_cr3(dos_cr3, va, pa,
-                                       PTE_PRESENT | PTE_WRITABLE) != 0) {
+                                       PTE_PRESENT | PTE_WRITABLE | PTE_USER) != 0) {
                 serial_puts("[DOS-NT] vm-struct map FAILED va=0x");
                 serial_puthex(va, 16); serial_puts("\n");
                 return;
@@ -486,12 +487,13 @@ void dos_transfer_to_native(dos_vm_t *vm)
     uint64_t es64    = DOS_NT_SEL_OK(cpu->es) ? cpu->es : cpu->ds;
     uint64_t sp64    = cpu->esp;
 
-    /* Mask RPL bits — we run DOS in ring 0 (DPL=0 descriptors) so selectors
-     * must have RPL=0 to satisfy max(RPL,CPL) <= DPL at load time. */
-    cs64 &= ~3ULL;
-    ds64 &= ~3ULL;
-    ss64 &= ~3ULL;
-    es64 &= ~3ULL;
+    /* Ring 3 transition: selectors keep RPL=3 (DOS4GW's DPMI convention),
+     * descriptors keep DPL=3. Force RPL bits to 3 in case they got masked
+     * to 0 by emulator bugkeeping. */
+    cs64 = (cs64 & ~3ULL) | 3ULL;
+    ds64 = (ds64 & ~3ULL) | 3ULL;
+    ss64 = (ss64 & ~3ULL) | 3ULL;
+    es64 = (es64 & ~3ULL) | 3ULL;
 
     serial_puts("[DOS-NT] LRETQ cs:eip=0x");
     serial_puthex(cs64, 4); serial_puts(":0x");
@@ -500,26 +502,10 @@ void dos_transfer_to_native(dos_vm_t *vm)
     serial_puthex(sp64, 8); serial_puts(" ds=0x");
     serial_puthex(ds64, 4); serial_puts("\n");
 
-    /* Promote all valid LDT descriptors from DPL=3 to DPL=0 so segment
-     * register loads in CPL=0 succeed. DOOM/DPMI runs at whatever ring
-     * we give it; kernel ring is fine for a single-process system. */
-    {
-        dpmi_descriptor_t *ldt = vm->dpmi.ldt;
-        int promoted = 0;
-        for (int i = 0; i < DPMI_MAX_DESCRIPTORS; i++) {
-            if ((ldt[i].access & 0x80) && (ldt[i].access & 0x60) == 0x60) {
-                ldt[i].access &= ~0x60;  /* clear DPL bits → DPL=0 */
-                promoted++;
-            }
-        }
-        if (promoted) {
-            serial_puts("[DOS-NT] promoted ");
-            serial_putdec(promoted);
-            serial_puts(" LDT entries from DPL=3 to DPL=0\n");
-        }
-    }
+    /* DOS4GW expects ring 3 (DPMI spec). Keep LDT DPL=3 and do a proper
+     * inter-privilege transition via IRETQ. */
 
-    /* Dump LDT entries for cs/ds/ss/es to verify they're sane before LRETQ */
+    /* Dump LDT entries for cs/ds/ss/es to verify they're sane before IRETQ */
     {
         dpmi_descriptor_t *ldt = vm->dpmi.ldt;
         uint16_t sels[4] = { (uint16_t)cs64, (uint16_t)ds64,
@@ -551,31 +537,59 @@ void dos_transfer_to_native(dos_vm_t *vm)
         }
     }
 
+    /* Build IRETQ frame for ring 0 → ring 3 transition.
+     * IRETQ pops (from low addr up): RIP, CS, RFLAGS, RSP, SS.
+     * We push in reverse: SS, RSP, RFLAGS, CS, RIP.
+     * Also propagate emulated GPRs (EAX/EBX/ECX/EDX/ESI/EDI/EBP) so DOS4GW
+     * starts with its expected register state instead of kernel leftovers. */
+    uint64_t rflags = 0x202;  /* IF=1, bit 1 reserved-always-1 */
+    uint64_t reax = cpu->eax, rebx = cpu->ebx, recx = cpu->ecx, redx = cpu->edx;
+    uint64_t resi = cpu->esi, redi = cpu->edi, rebp = cpu->ebp;
+
     __asm__ volatile (
         "cli\n"
         "lldt %w[ldt]\n"
-        "mov %%rax, %%rcx\n"            /* preserve rax temporarily... */
+        /* Switch CR3 while still in ring 0 — DS/ES/SS remain kernel. */
         "mov %[cr3], %%rax\n"
         "mov %%rax, %%cr3\n"
-        "mov %%rcx, %%rax\n"
+        /* Pre-load DS/ES with ring-3 LDT selectors (CPL=0 can load data
+         * descriptors where max(RPL,CPL) <= DPL — 3<=3 ok). SS must not
+         * be pre-loaded (DPL=3 vs CPL=0 fails); iretq will set it. */
         "mov %w[ds], %%ax\n  mov %%ax, %%ds\n"
         "mov %w[es], %%ax\n  mov %%ax, %%es\n"
-        "mov %w[ss], %%ax\n  mov %%ax, %%ss\n"
-        "mov %[sp], %%rsp\n"
-        "pushq %[cs]\n"
-        "pushq %[ip]\n"
-        "sti\n"
-        "lretq\n"
+        /* IRETQ stack frame (top = RIP) */
+        "pushq %[ss_q]\n"      /* SS  */
+        "pushq %[sp_q]\n"      /* RSP */
+        "pushq %[flags]\n"     /* RFLAGS */
+        "pushq %[cs_q]\n"      /* CS  */
+        "pushq %[ip_q]\n"      /* RIP */
+        /* Load GPRs from emulated CPU state */
+        "mov %[r_ax], %%rax\n"
+        "mov %[r_bx], %%rbx\n"
+        "mov %[r_cx], %%rcx\n"
+        "mov %[r_dx], %%rdx\n"
+        "mov %[r_si], %%rsi\n"
+        "mov %[r_di], %%rdi\n"
+        "mov %[r_bp], %%rbp\n"
+        "iretq\n"
         :
-        : [ldt] "r"(ldt_sel),
-          [cr3] "r"(cr3_new),
-          [ds]  "r"(ds64),
-          [es]  "r"(es64),
-          [ss]  "r"(ss64),
-          [sp]  "r"(sp64),
-          [cs]  "r"(cs64),
-          [ip]  "r"(ip64)
-        : "memory", "cc", "rax", "rcx"
+        : [ldt]   "r"(ldt_sel),
+          [cr3]   "r"(cr3_new),
+          [ds]    "r"(ds64),
+          [es]    "r"(es64),
+          [ss_q]  "r"(ss64),
+          [sp_q]  "r"(sp64),
+          [flags] "r"(rflags),
+          [cs_q]  "r"(cs64),
+          [ip_q]  "r"(ip64),
+          [r_ax]  "m"(reax),
+          [r_bx]  "m"(rebx),
+          [r_cx]  "m"(recx),
+          [r_dx]  "m"(redx),
+          [r_si]  "m"(resi),
+          [r_di]  "m"(redi),
+          [r_bp]  "m"(rebp)
+        : "memory", "cc"
     );
     /* NOTREACHED */
 }
