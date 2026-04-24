@@ -96,6 +96,49 @@ struct osito_buffer {
     VkBuffer              real;
 };
 
+/* W3b.4 — remaining non-dispatchable wrappers.
+ *
+ * Same shape as W3b.3: {owner, real}. Same leak caveat (app must destroy
+ * before DestroyDevice). */
+struct osito_shader {
+    struct osito_device *owner;
+    VkShaderModule        real;
+};
+struct osito_render_pass {
+    struct osito_device *owner;
+    VkRenderPass          real;
+};
+struct osito_image {
+    struct osito_device *owner;
+    VkImage               real;
+};
+struct osito_image_view {
+    struct osito_device *owner;
+    VkImageView           real;
+};
+struct osito_framebuffer {
+    struct osito_device *owner;
+    VkFramebuffer         real;
+};
+struct osito_pipeline_layout {
+    struct osito_device *owner;
+    VkPipelineLayout      real;
+};
+struct osito_pipeline {
+    struct osito_device *owner;
+    VkPipeline            real;
+};
+struct osito_cmd_pool {
+    struct osito_device *owner;
+    VkCommandPool         real;
+};
+/* Command buffer is a dispatchable handle — VK_LOADER_DATA first. */
+struct osito_cmd_buffer {
+    VK_LOADER_DATA        loader_data;
+    struct osito_device  *owner;
+    VkCommandBuffer       real;
+};
+
 static inline struct osito_phys_device *osito_phys_from(VkPhysicalDevice h) {
     return (struct osito_phys_device *)h;
 }

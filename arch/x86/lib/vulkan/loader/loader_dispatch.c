@@ -49,6 +49,67 @@ VKAPI_ATTR void VKAPI_CALL vkGetBufferMemoryRequirements(
 VKAPI_ATTR VkResult VKAPI_CALL vkBindBufferMemory(
     VkDevice, VkBuffer, VkDeviceMemory, VkDeviceSize);
 
+/* W3b.4 — shader + render pass + image + framebuffer + pipeline + command. */
+VKAPI_ATTR VkResult VKAPI_CALL vkCreateShaderModule(
+    VkDevice, const VkShaderModuleCreateInfo *,
+    const VkAllocationCallbacks *, VkShaderModule *);
+VKAPI_ATTR void VKAPI_CALL vkDestroyShaderModule(
+    VkDevice, VkShaderModule, const VkAllocationCallbacks *);
+VKAPI_ATTR VkResult VKAPI_CALL vkCreateRenderPass(
+    VkDevice, const VkRenderPassCreateInfo *,
+    const VkAllocationCallbacks *, VkRenderPass *);
+VKAPI_ATTR void VKAPI_CALL vkDestroyRenderPass(
+    VkDevice, VkRenderPass, const VkAllocationCallbacks *);
+VKAPI_ATTR VkResult VKAPI_CALL vkCreateImage(
+    VkDevice, const VkImageCreateInfo *,
+    const VkAllocationCallbacks *, VkImage *);
+VKAPI_ATTR void VKAPI_CALL vkDestroyImage(
+    VkDevice, VkImage, const VkAllocationCallbacks *);
+VKAPI_ATTR void VKAPI_CALL vkGetImageMemoryRequirements(
+    VkDevice, VkImage, VkMemoryRequirements *);
+VKAPI_ATTR VkResult VKAPI_CALL vkBindImageMemory(
+    VkDevice, VkImage, VkDeviceMemory, VkDeviceSize);
+VKAPI_ATTR VkResult VKAPI_CALL vkCreateImageView(
+    VkDevice, const VkImageViewCreateInfo *,
+    const VkAllocationCallbacks *, VkImageView *);
+VKAPI_ATTR void VKAPI_CALL vkDestroyImageView(
+    VkDevice, VkImageView, const VkAllocationCallbacks *);
+VKAPI_ATTR VkResult VKAPI_CALL vkCreateFramebuffer(
+    VkDevice, const VkFramebufferCreateInfo *,
+    const VkAllocationCallbacks *, VkFramebuffer *);
+VKAPI_ATTR void VKAPI_CALL vkDestroyFramebuffer(
+    VkDevice, VkFramebuffer, const VkAllocationCallbacks *);
+VKAPI_ATTR VkResult VKAPI_CALL vkCreatePipelineLayout(
+    VkDevice, const VkPipelineLayoutCreateInfo *,
+    const VkAllocationCallbacks *, VkPipelineLayout *);
+VKAPI_ATTR void VKAPI_CALL vkDestroyPipelineLayout(
+    VkDevice, VkPipelineLayout, const VkAllocationCallbacks *);
+VKAPI_ATTR VkResult VKAPI_CALL vkCreateGraphicsPipelines(
+    VkDevice, VkPipelineCache, uint32_t,
+    const VkGraphicsPipelineCreateInfo *,
+    const VkAllocationCallbacks *, VkPipeline *);
+VKAPI_ATTR void VKAPI_CALL vkDestroyPipeline(
+    VkDevice, VkPipeline, const VkAllocationCallbacks *);
+VKAPI_ATTR VkResult VKAPI_CALL vkCreateCommandPool(
+    VkDevice, const VkCommandPoolCreateInfo *,
+    const VkAllocationCallbacks *, VkCommandPool *);
+VKAPI_ATTR void VKAPI_CALL vkDestroyCommandPool(
+    VkDevice, VkCommandPool, const VkAllocationCallbacks *);
+VKAPI_ATTR VkResult VKAPI_CALL vkAllocateCommandBuffers(
+    VkDevice, const VkCommandBufferAllocateInfo *, VkCommandBuffer *);
+VKAPI_ATTR void VKAPI_CALL vkFreeCommandBuffers(
+    VkDevice, VkCommandPool, uint32_t, const VkCommandBuffer *);
+VKAPI_ATTR VkResult VKAPI_CALL vkBeginCommandBuffer(
+    VkCommandBuffer, const VkCommandBufferBeginInfo *);
+VKAPI_ATTR VkResult VKAPI_CALL vkEndCommandBuffer(VkCommandBuffer);
+VKAPI_ATTR void VKAPI_CALL vkCmdBeginRenderPass(
+    VkCommandBuffer, const VkRenderPassBeginInfo *, VkSubpassContents);
+VKAPI_ATTR void VKAPI_CALL vkCmdEndRenderPass(VkCommandBuffer);
+VKAPI_ATTR void VKAPI_CALL vkCmdBindPipeline(
+    VkCommandBuffer, VkPipelineBindPoint, VkPipeline);
+VKAPI_ATTR void VKAPI_CALL vkCmdDraw(
+    VkCommandBuffer, uint32_t, uint32_t, uint32_t, uint32_t);
+
 PFN_vkVoidFunction
 osito_loader_get_instance_proc_addr(VkInstance instance, const char *pName) {
     if (!pName) return NULL;
@@ -100,6 +161,60 @@ osito_loader_get_instance_proc_addr(VkInstance instance, const char *pName) {
         return (PFN_vkVoidFunction)vkGetBufferMemoryRequirements;
     if (strcmp(pName, "vkBindBufferMemory") == 0)
         return (PFN_vkVoidFunction)vkBindBufferMemory;
+
+    /* W3b.4 additions. */
+    if (strcmp(pName, "vkCreateShaderModule") == 0)
+        return (PFN_vkVoidFunction)vkCreateShaderModule;
+    if (strcmp(pName, "vkDestroyShaderModule") == 0)
+        return (PFN_vkVoidFunction)vkDestroyShaderModule;
+    if (strcmp(pName, "vkCreateRenderPass") == 0)
+        return (PFN_vkVoidFunction)vkCreateRenderPass;
+    if (strcmp(pName, "vkDestroyRenderPass") == 0)
+        return (PFN_vkVoidFunction)vkDestroyRenderPass;
+    if (strcmp(pName, "vkCreateImage") == 0)
+        return (PFN_vkVoidFunction)vkCreateImage;
+    if (strcmp(pName, "vkDestroyImage") == 0)
+        return (PFN_vkVoidFunction)vkDestroyImage;
+    if (strcmp(pName, "vkGetImageMemoryRequirements") == 0)
+        return (PFN_vkVoidFunction)vkGetImageMemoryRequirements;
+    if (strcmp(pName, "vkBindImageMemory") == 0)
+        return (PFN_vkVoidFunction)vkBindImageMemory;
+    if (strcmp(pName, "vkCreateImageView") == 0)
+        return (PFN_vkVoidFunction)vkCreateImageView;
+    if (strcmp(pName, "vkDestroyImageView") == 0)
+        return (PFN_vkVoidFunction)vkDestroyImageView;
+    if (strcmp(pName, "vkCreateFramebuffer") == 0)
+        return (PFN_vkVoidFunction)vkCreateFramebuffer;
+    if (strcmp(pName, "vkDestroyFramebuffer") == 0)
+        return (PFN_vkVoidFunction)vkDestroyFramebuffer;
+    if (strcmp(pName, "vkCreatePipelineLayout") == 0)
+        return (PFN_vkVoidFunction)vkCreatePipelineLayout;
+    if (strcmp(pName, "vkDestroyPipelineLayout") == 0)
+        return (PFN_vkVoidFunction)vkDestroyPipelineLayout;
+    if (strcmp(pName, "vkCreateGraphicsPipelines") == 0)
+        return (PFN_vkVoidFunction)vkCreateGraphicsPipelines;
+    if (strcmp(pName, "vkDestroyPipeline") == 0)
+        return (PFN_vkVoidFunction)vkDestroyPipeline;
+    if (strcmp(pName, "vkCreateCommandPool") == 0)
+        return (PFN_vkVoidFunction)vkCreateCommandPool;
+    if (strcmp(pName, "vkDestroyCommandPool") == 0)
+        return (PFN_vkVoidFunction)vkDestroyCommandPool;
+    if (strcmp(pName, "vkAllocateCommandBuffers") == 0)
+        return (PFN_vkVoidFunction)vkAllocateCommandBuffers;
+    if (strcmp(pName, "vkFreeCommandBuffers") == 0)
+        return (PFN_vkVoidFunction)vkFreeCommandBuffers;
+    if (strcmp(pName, "vkBeginCommandBuffer") == 0)
+        return (PFN_vkVoidFunction)vkBeginCommandBuffer;
+    if (strcmp(pName, "vkEndCommandBuffer") == 0)
+        return (PFN_vkVoidFunction)vkEndCommandBuffer;
+    if (strcmp(pName, "vkCmdBeginRenderPass") == 0)
+        return (PFN_vkVoidFunction)vkCmdBeginRenderPass;
+    if (strcmp(pName, "vkCmdEndRenderPass") == 0)
+        return (PFN_vkVoidFunction)vkCmdEndRenderPass;
+    if (strcmp(pName, "vkCmdBindPipeline") == 0)
+        return (PFN_vkVoidFunction)vkCmdBindPipeline;
+    if (strcmp(pName, "vkCmdDraw") == 0)
+        return (PFN_vkVoidFunction)vkCmdDraw;
 
     /* Unknown — fall through to the first ICD that resolves it. Matches
      * the spec's language that unknown queries may return NULL when no
@@ -411,4 +526,520 @@ vkBindBufferMemory(VkDevice device, VkBuffer buffer,
         ci->icd->get_proc_addr(ci->handle, "vkBindBufferMemory");
     if (!fn) return VK_ERROR_INITIALIZATION_FAILED;
     return fn(dw->real, bw->real, mw->real, memoryOffset);
+}
+
+/* ---------------- W3b.4 trampolines ---------------------------------------
+ *
+ * All remaining W3b.4 non-dispatchable objects wrap as {owner, real}.
+ * Command buffers are dispatchable — they get VK_LOADER_DATA.
+ */
+
+#define NDH_FROM(T, h) ((struct T *)(uintptr_t)(h))
+#define NDH_TO(T, w)   ((T)(uintptr_t)(w))
+
+static inline struct osito_shader *sm_from(VkShaderModule h) { return (struct osito_shader *)(uintptr_t)h; }
+static inline VkShaderModule      sm_to(struct osito_shader *w) { return (VkShaderModule)(uintptr_t)w; }
+static inline struct osito_render_pass *rp_from(VkRenderPass h) { return (struct osito_render_pass *)(uintptr_t)h; }
+static inline VkRenderPass             rp_to(struct osito_render_pass *w) { return (VkRenderPass)(uintptr_t)w; }
+static inline struct osito_image *img_from(VkImage h) { return (struct osito_image *)(uintptr_t)h; }
+static inline VkImage            img_to(struct osito_image *w) { return (VkImage)(uintptr_t)w; }
+static inline struct osito_image_view *iv_from(VkImageView h) { return (struct osito_image_view *)(uintptr_t)h; }
+static inline VkImageView             iv_to(struct osito_image_view *w) { return (VkImageView)(uintptr_t)w; }
+static inline struct osito_framebuffer *fb_from(VkFramebuffer h) { return (struct osito_framebuffer *)(uintptr_t)h; }
+static inline VkFramebuffer            fb_to(struct osito_framebuffer *w) { return (VkFramebuffer)(uintptr_t)w; }
+static inline struct osito_pipeline_layout *pl_from(VkPipelineLayout h) { return (struct osito_pipeline_layout *)(uintptr_t)h; }
+static inline VkPipelineLayout             pl_to(struct osito_pipeline_layout *w) { return (VkPipelineLayout)(uintptr_t)w; }
+static inline struct osito_pipeline *pip_from(VkPipeline h) { return (struct osito_pipeline *)(uintptr_t)h; }
+static inline VkPipeline            pip_to(struct osito_pipeline *w) { return (VkPipeline)(uintptr_t)w; }
+static inline struct osito_cmd_pool *cp_from(VkCommandPool h) { return (struct osito_cmd_pool *)(uintptr_t)h; }
+static inline VkCommandPool         cp_to(struct osito_cmd_pool *w) { return (VkCommandPool)(uintptr_t)w; }
+
+/* Shader module */
+VKAPI_ATTR VkResult VKAPI_CALL
+vkCreateShaderModule(VkDevice device, const VkShaderModuleCreateInfo *pCI,
+                     const VkAllocationCallbacks *pAllocator,
+                     VkShaderModule *pShader) {
+    if (!device || !pCI || !pShader) return VK_ERROR_INITIALIZATION_FAILED;
+    struct osito_device *dw = osito_device_from(device);
+    struct osito_icd_inst *ci = dw->owner;
+    if (!ci) return VK_ERROR_INITIALIZATION_FAILED;
+    PFN_vkCreateShaderModule fn = (PFN_vkCreateShaderModule)
+        ci->icd->get_proc_addr(ci->handle, "vkCreateShaderModule");
+    if (!fn) return VK_ERROR_INITIALIZATION_FAILED;
+    VkShaderModule real = VK_NULL_HANDLE;
+    VkResult rc = fn(dw->real, pCI, pAllocator, &real);
+    if (rc != VK_SUCCESS || !real) return rc;
+    struct osito_shader *w = malloc(sizeof(*w));
+    if (!w) return VK_ERROR_OUT_OF_HOST_MEMORY;
+    w->owner = dw; w->real = real;
+    *pShader = sm_to(w);
+    return VK_SUCCESS;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+vkDestroyShaderModule(VkDevice device, VkShaderModule shader,
+                      const VkAllocationCallbacks *pAllocator) {
+    if (!device || !shader) return;
+    struct osito_device *dw = osito_device_from(device);
+    struct osito_icd_inst *ci = dw->owner;
+    struct osito_shader *w = sm_from(shader);
+    if (ci) {
+        PFN_vkDestroyShaderModule fn = (PFN_vkDestroyShaderModule)
+            ci->icd->get_proc_addr(ci->handle, "vkDestroyShaderModule");
+        if (fn) fn(dw->real, w->real, pAllocator);
+    }
+    free(w);
+}
+
+/* Render pass */
+VKAPI_ATTR VkResult VKAPI_CALL
+vkCreateRenderPass(VkDevice device, const VkRenderPassCreateInfo *pCI,
+                   const VkAllocationCallbacks *pAllocator,
+                   VkRenderPass *pRP) {
+    if (!device || !pCI || !pRP) return VK_ERROR_INITIALIZATION_FAILED;
+    struct osito_device *dw = osito_device_from(device);
+    struct osito_icd_inst *ci = dw->owner;
+    if (!ci) return VK_ERROR_INITIALIZATION_FAILED;
+    PFN_vkCreateRenderPass fn = (PFN_vkCreateRenderPass)
+        ci->icd->get_proc_addr(ci->handle, "vkCreateRenderPass");
+    if (!fn) return VK_ERROR_INITIALIZATION_FAILED;
+    VkRenderPass real = VK_NULL_HANDLE;
+    VkResult rc = fn(dw->real, pCI, pAllocator, &real);
+    if (rc != VK_SUCCESS || !real) return rc;
+    struct osito_render_pass *w = malloc(sizeof(*w));
+    if (!w) return VK_ERROR_OUT_OF_HOST_MEMORY;
+    w->owner = dw; w->real = real;
+    *pRP = rp_to(w);
+    return VK_SUCCESS;
+}
+VKAPI_ATTR void VKAPI_CALL
+vkDestroyRenderPass(VkDevice device, VkRenderPass rpH,
+                    const VkAllocationCallbacks *pAllocator) {
+    if (!device || !rpH) return;
+    struct osito_device *dw = osito_device_from(device);
+    struct osito_icd_inst *ci = dw->owner;
+    struct osito_render_pass *w = rp_from(rpH);
+    if (ci) {
+        PFN_vkDestroyRenderPass fn = (PFN_vkDestroyRenderPass)
+            ci->icd->get_proc_addr(ci->handle, "vkDestroyRenderPass");
+        if (fn) fn(dw->real, w->real, pAllocator);
+    }
+    free(w);
+}
+
+/* Image */
+VKAPI_ATTR VkResult VKAPI_CALL
+vkCreateImage(VkDevice device, const VkImageCreateInfo *pCI,
+              const VkAllocationCallbacks *pAllocator, VkImage *pImage) {
+    if (!device || !pCI || !pImage) return VK_ERROR_INITIALIZATION_FAILED;
+    struct osito_device *dw = osito_device_from(device);
+    struct osito_icd_inst *ci = dw->owner;
+    if (!ci) return VK_ERROR_INITIALIZATION_FAILED;
+    PFN_vkCreateImage fn = (PFN_vkCreateImage)
+        ci->icd->get_proc_addr(ci->handle, "vkCreateImage");
+    if (!fn) return VK_ERROR_INITIALIZATION_FAILED;
+    VkImage real = VK_NULL_HANDLE;
+    VkResult rc = fn(dw->real, pCI, pAllocator, &real);
+    if (rc != VK_SUCCESS || !real) return rc;
+    struct osito_image *w = malloc(sizeof(*w));
+    if (!w) return VK_ERROR_OUT_OF_HOST_MEMORY;
+    w->owner = dw; w->real = real;
+    *pImage = img_to(w);
+    return VK_SUCCESS;
+}
+VKAPI_ATTR void VKAPI_CALL
+vkDestroyImage(VkDevice device, VkImage image,
+               const VkAllocationCallbacks *pAllocator) {
+    if (!device || !image) return;
+    struct osito_device *dw = osito_device_from(device);
+    struct osito_icd_inst *ci = dw->owner;
+    struct osito_image *w = img_from(image);
+    if (ci) {
+        PFN_vkDestroyImage fn = (PFN_vkDestroyImage)
+            ci->icd->get_proc_addr(ci->handle, "vkDestroyImage");
+        if (fn) fn(dw->real, w->real, pAllocator);
+    }
+    free(w);
+}
+VKAPI_ATTR void VKAPI_CALL
+vkGetImageMemoryRequirements(VkDevice device, VkImage image,
+                             VkMemoryRequirements *pReqs) {
+    if (!device || !image || !pReqs) return;
+    struct osito_device *dw = osito_device_from(device);
+    struct osito_icd_inst *ci = dw->owner;
+    struct osito_image *w = img_from(image);
+    if (!ci) return;
+    PFN_vkGetImageMemoryRequirements fn = (PFN_vkGetImageMemoryRequirements)
+        ci->icd->get_proc_addr(ci->handle, "vkGetImageMemoryRequirements");
+    if (fn) fn(dw->real, w->real, pReqs);
+}
+VKAPI_ATTR VkResult VKAPI_CALL
+vkBindImageMemory(VkDevice device, VkImage image, VkDeviceMemory memory,
+                  VkDeviceSize memoryOffset) {
+    if (!device || !image || !memory) return VK_ERROR_INITIALIZATION_FAILED;
+    struct osito_device *dw = osito_device_from(device);
+    struct osito_icd_inst *ci = dw->owner;
+    struct osito_image *w = img_from(image);
+    struct osito_memory *mw = mem_from(memory);
+    if (!ci) return VK_ERROR_INITIALIZATION_FAILED;
+    PFN_vkBindImageMemory fn = (PFN_vkBindImageMemory)
+        ci->icd->get_proc_addr(ci->handle, "vkBindImageMemory");
+    if (!fn) return VK_ERROR_INITIALIZATION_FAILED;
+    return fn(dw->real, w->real, mw->real, memoryOffset);
+}
+
+/* Image view */
+VKAPI_ATTR VkResult VKAPI_CALL
+vkCreateImageView(VkDevice device, const VkImageViewCreateInfo *pCI,
+                  const VkAllocationCallbacks *pAllocator, VkImageView *pView) {
+    if (!device || !pCI || !pView) return VK_ERROR_INITIALIZATION_FAILED;
+    struct osito_device *dw = osito_device_from(device);
+    struct osito_icd_inst *ci = dw->owner;
+    if (!ci) return VK_ERROR_INITIALIZATION_FAILED;
+    PFN_vkCreateImageView fn = (PFN_vkCreateImageView)
+        ci->icd->get_proc_addr(ci->handle, "vkCreateImageView");
+    if (!fn) return VK_ERROR_INITIALIZATION_FAILED;
+    /* Unwrap image handle in the create info. */
+    VkImageViewCreateInfo tmp = *pCI;
+    if (pCI->image) {
+        struct osito_image *iw = img_from(pCI->image);
+        tmp.image = iw->real;
+    }
+    VkImageView real = VK_NULL_HANDLE;
+    VkResult rc = fn(dw->real, &tmp, pAllocator, &real);
+    if (rc != VK_SUCCESS || !real) return rc;
+    struct osito_image_view *w = malloc(sizeof(*w));
+    if (!w) return VK_ERROR_OUT_OF_HOST_MEMORY;
+    w->owner = dw; w->real = real;
+    *pView = iv_to(w);
+    return VK_SUCCESS;
+}
+VKAPI_ATTR void VKAPI_CALL
+vkDestroyImageView(VkDevice device, VkImageView view,
+                   const VkAllocationCallbacks *pAllocator) {
+    if (!device || !view) return;
+    struct osito_device *dw = osito_device_from(device);
+    struct osito_icd_inst *ci = dw->owner;
+    struct osito_image_view *w = iv_from(view);
+    if (ci) {
+        PFN_vkDestroyImageView fn = (PFN_vkDestroyImageView)
+            ci->icd->get_proc_addr(ci->handle, "vkDestroyImageView");
+        if (fn) fn(dw->real, w->real, pAllocator);
+    }
+    free(w);
+}
+
+/* Framebuffer */
+VKAPI_ATTR VkResult VKAPI_CALL
+vkCreateFramebuffer(VkDevice device, const VkFramebufferCreateInfo *pCI,
+                    const VkAllocationCallbacks *pAllocator, VkFramebuffer *pFB) {
+    if (!device || !pCI || !pFB) return VK_ERROR_INITIALIZATION_FAILED;
+    struct osito_device *dw = osito_device_from(device);
+    struct osito_icd_inst *ci = dw->owner;
+    if (!ci) return VK_ERROR_INITIALIZATION_FAILED;
+    PFN_vkCreateFramebuffer fn = (PFN_vkCreateFramebuffer)
+        ci->icd->get_proc_addr(ci->handle, "vkCreateFramebuffer");
+    if (!fn) return VK_ERROR_INITIALIZATION_FAILED;
+
+    /* Unwrap rp + view handles into a local copy. Limit to 8 atts. */
+    #define OSITO_FB_MAX_ATTS 8u
+    VkImageView real_views[OSITO_FB_MAX_ATTS] = {0};
+    uint32_t n = pCI->attachmentCount;
+    if (n > OSITO_FB_MAX_ATTS) n = OSITO_FB_MAX_ATTS;
+    for (uint32_t i = 0; i < n; i++) {
+        struct osito_image_view *vw = iv_from(pCI->pAttachments[i]);
+        real_views[i] = vw ? vw->real : 0;
+    }
+    struct osito_render_pass *rpw = rp_from(pCI->renderPass);
+    VkFramebufferCreateInfo tmp = *pCI;
+    tmp.renderPass = rpw ? rpw->real : 0;
+    tmp.attachmentCount = n;
+    tmp.pAttachments = real_views;
+
+    VkFramebuffer real = VK_NULL_HANDLE;
+    VkResult rc = fn(dw->real, &tmp, pAllocator, &real);
+    if (rc != VK_SUCCESS || !real) return rc;
+    struct osito_framebuffer *w = malloc(sizeof(*w));
+    if (!w) return VK_ERROR_OUT_OF_HOST_MEMORY;
+    w->owner = dw; w->real = real;
+    *pFB = fb_to(w);
+    return VK_SUCCESS;
+}
+VKAPI_ATTR void VKAPI_CALL
+vkDestroyFramebuffer(VkDevice device, VkFramebuffer fbH,
+                     const VkAllocationCallbacks *pAllocator) {
+    if (!device || !fbH) return;
+    struct osito_device *dw = osito_device_from(device);
+    struct osito_icd_inst *ci = dw->owner;
+    struct osito_framebuffer *w = fb_from(fbH);
+    if (ci) {
+        PFN_vkDestroyFramebuffer fn = (PFN_vkDestroyFramebuffer)
+            ci->icd->get_proc_addr(ci->handle, "vkDestroyFramebuffer");
+        if (fn) fn(dw->real, w->real, pAllocator);
+    }
+    free(w);
+}
+
+/* Pipeline layout */
+VKAPI_ATTR VkResult VKAPI_CALL
+vkCreatePipelineLayout(VkDevice device, const VkPipelineLayoutCreateInfo *pCI,
+                       const VkAllocationCallbacks *pAllocator,
+                       VkPipelineLayout *pLayout) {
+    if (!device || !pCI || !pLayout) return VK_ERROR_INITIALIZATION_FAILED;
+    struct osito_device *dw = osito_device_from(device);
+    struct osito_icd_inst *ci = dw->owner;
+    if (!ci) return VK_ERROR_INITIALIZATION_FAILED;
+    PFN_vkCreatePipelineLayout fn = (PFN_vkCreatePipelineLayout)
+        ci->icd->get_proc_addr(ci->handle, "vkCreatePipelineLayout");
+    if (!fn) return VK_ERROR_INITIALIZATION_FAILED;
+    VkPipelineLayout real = VK_NULL_HANDLE;
+    VkResult rc = fn(dw->real, pCI, pAllocator, &real);
+    if (rc != VK_SUCCESS || !real) return rc;
+    struct osito_pipeline_layout *w = malloc(sizeof(*w));
+    if (!w) return VK_ERROR_OUT_OF_HOST_MEMORY;
+    w->owner = dw; w->real = real;
+    *pLayout = pl_to(w);
+    return VK_SUCCESS;
+}
+VKAPI_ATTR void VKAPI_CALL
+vkDestroyPipelineLayout(VkDevice device, VkPipelineLayout layout,
+                        const VkAllocationCallbacks *pAllocator) {
+    if (!device || !layout) return;
+    struct osito_device *dw = osito_device_from(device);
+    struct osito_icd_inst *ci = dw->owner;
+    struct osito_pipeline_layout *w = pl_from(layout);
+    if (ci) {
+        PFN_vkDestroyPipelineLayout fn = (PFN_vkDestroyPipelineLayout)
+            ci->icd->get_proc_addr(ci->handle, "vkDestroyPipelineLayout");
+        if (fn) fn(dw->real, w->real, pAllocator);
+    }
+    free(w);
+}
+
+/* Graphics pipelines */
+VKAPI_ATTR VkResult VKAPI_CALL
+vkCreateGraphicsPipelines(VkDevice device, VkPipelineCache pipelineCache,
+                          uint32_t createInfoCount,
+                          const VkGraphicsPipelineCreateInfo *pCreateInfos,
+                          const VkAllocationCallbacks *pAllocator,
+                          VkPipeline *pPipelines) {
+    if (!device || !pCreateInfos || !pPipelines || createInfoCount != 1)
+        return VK_ERROR_INITIALIZATION_FAILED;
+    struct osito_device *dw = osito_device_from(device);
+    struct osito_icd_inst *ci = dw->owner;
+    if (!ci) return VK_ERROR_INITIALIZATION_FAILED;
+    PFN_vkCreateGraphicsPipelines fn = (PFN_vkCreateGraphicsPipelines)
+        ci->icd->get_proc_addr(ci->handle, "vkCreateGraphicsPipelines");
+    if (!fn) return VK_ERROR_INITIALIZATION_FAILED;
+
+    /* Unwrap: layout, rp, stage modules. Copy inputs into locals because
+     * VkGraphicsPipelineCreateInfo contains pointers we don't own. */
+    VkGraphicsPipelineCreateInfo tmp = pCreateInfos[0];
+    VkPipelineShaderStageCreateInfo stages[2];
+    if (tmp.stageCount > 2) return VK_ERROR_INITIALIZATION_FAILED;
+    for (uint32_t i = 0; i < tmp.stageCount; i++) {
+        stages[i] = tmp.pStages[i];
+        if (stages[i].module) {
+            struct osito_shader *sw = sm_from(stages[i].module);
+            stages[i].module = sw->real;
+        }
+    }
+    tmp.pStages = stages;
+    if (tmp.layout) tmp.layout = pl_from(tmp.layout)->real;
+    if (tmp.renderPass) tmp.renderPass = rp_from(tmp.renderPass)->real;
+
+    VkPipeline real = VK_NULL_HANDLE;
+    VkResult rc = fn(dw->real, pipelineCache, 1, &tmp, pAllocator, &real);
+    if (rc != VK_SUCCESS || !real) return rc;
+    struct osito_pipeline *w = malloc(sizeof(*w));
+    if (!w) return VK_ERROR_OUT_OF_HOST_MEMORY;
+    w->owner = dw; w->real = real;
+    pPipelines[0] = pip_to(w);
+    return VK_SUCCESS;
+}
+VKAPI_ATTR void VKAPI_CALL
+vkDestroyPipeline(VkDevice device, VkPipeline pipeline,
+                  const VkAllocationCallbacks *pAllocator) {
+    if (!device || !pipeline) return;
+    struct osito_device *dw = osito_device_from(device);
+    struct osito_icd_inst *ci = dw->owner;
+    struct osito_pipeline *w = pip_from(pipeline);
+    if (ci) {
+        PFN_vkDestroyPipeline fn = (PFN_vkDestroyPipeline)
+            ci->icd->get_proc_addr(ci->handle, "vkDestroyPipeline");
+        if (fn) fn(dw->real, w->real, pAllocator);
+    }
+    free(w);
+}
+
+/* Command pool */
+VKAPI_ATTR VkResult VKAPI_CALL
+vkCreateCommandPool(VkDevice device, const VkCommandPoolCreateInfo *pCI,
+                    const VkAllocationCallbacks *pAllocator,
+                    VkCommandPool *pPool) {
+    if (!device || !pCI || !pPool) return VK_ERROR_INITIALIZATION_FAILED;
+    struct osito_device *dw = osito_device_from(device);
+    struct osito_icd_inst *ci = dw->owner;
+    if (!ci) return VK_ERROR_INITIALIZATION_FAILED;
+    PFN_vkCreateCommandPool fn = (PFN_vkCreateCommandPool)
+        ci->icd->get_proc_addr(ci->handle, "vkCreateCommandPool");
+    if (!fn) return VK_ERROR_INITIALIZATION_FAILED;
+    VkCommandPool real = VK_NULL_HANDLE;
+    VkResult rc = fn(dw->real, pCI, pAllocator, &real);
+    if (rc != VK_SUCCESS || !real) return rc;
+    struct osito_cmd_pool *w = malloc(sizeof(*w));
+    if (!w) return VK_ERROR_OUT_OF_HOST_MEMORY;
+    w->owner = dw; w->real = real;
+    *pPool = cp_to(w);
+    return VK_SUCCESS;
+}
+VKAPI_ATTR void VKAPI_CALL
+vkDestroyCommandPool(VkDevice device, VkCommandPool pool,
+                     const VkAllocationCallbacks *pAllocator) {
+    if (!device || !pool) return;
+    struct osito_device *dw = osito_device_from(device);
+    struct osito_icd_inst *ci = dw->owner;
+    struct osito_cmd_pool *w = cp_from(pool);
+    if (ci) {
+        PFN_vkDestroyCommandPool fn = (PFN_vkDestroyCommandPool)
+            ci->icd->get_proc_addr(ci->handle, "vkDestroyCommandPool");
+        if (fn) fn(dw->real, w->real, pAllocator);
+    }
+    free(w);
+}
+
+/* Command buffers (dispatchable). */
+VKAPI_ATTR VkResult VKAPI_CALL
+vkAllocateCommandBuffers(VkDevice device,
+                         const VkCommandBufferAllocateInfo *pInfo,
+                         VkCommandBuffer *pCmdBuffers) {
+    if (!device || !pInfo || !pCmdBuffers) return VK_ERROR_INITIALIZATION_FAILED;
+    struct osito_device *dw = osito_device_from(device);
+    struct osito_icd_inst *ci = dw->owner;
+    if (!ci) return VK_ERROR_INITIALIZATION_FAILED;
+    PFN_vkAllocateCommandBuffers fn = (PFN_vkAllocateCommandBuffers)
+        ci->icd->get_proc_addr(ci->handle, "vkAllocateCommandBuffers");
+    if (!fn) return VK_ERROR_INITIALIZATION_FAILED;
+
+    uint32_t count = pInfo->commandBufferCount;
+    if (count == 0) return VK_SUCCESS;
+    /* Unwrap pool. */
+    VkCommandBufferAllocateInfo tmp = *pInfo;
+    if (tmp.commandPool) tmp.commandPool = cp_from(tmp.commandPool)->real;
+    #define OSITO_CB_MAX 32u
+    VkCommandBuffer reals[OSITO_CB_MAX] = {0};
+    if (count > OSITO_CB_MAX) return VK_ERROR_INITIALIZATION_FAILED;
+    VkResult rc = fn(dw->real, &tmp, reals);
+    if (rc != VK_SUCCESS) return rc;
+    for (uint32_t i = 0; i < count; i++) {
+        struct osito_cmd_buffer *w = malloc(sizeof(*w));
+        if (!w) {
+            /* Best-effort rollback: free preceding wrappers. */
+            for (uint32_t j = 0; j < i; j++)
+                free((void *)pCmdBuffers[j]);
+            return VK_ERROR_OUT_OF_HOST_MEMORY;
+        }
+        memset(w, 0, sizeof(*w));
+        set_loader_magic_value(w);
+        w->owner = dw;
+        w->real  = reals[i];
+        pCmdBuffers[i] = (VkCommandBuffer)w;
+    }
+    return VK_SUCCESS;
+}
+VKAPI_ATTR void VKAPI_CALL
+vkFreeCommandBuffers(VkDevice device, VkCommandPool pool,
+                     uint32_t count, const VkCommandBuffer *pCmdBuffers) {
+    if (!device || !pCmdBuffers || count == 0) return;
+    struct osito_device *dw = osito_device_from(device);
+    struct osito_icd_inst *ci = dw->owner;
+    if (!ci) return;
+    PFN_vkFreeCommandBuffers fn = (PFN_vkFreeCommandBuffers)
+        ci->icd->get_proc_addr(ci->handle, "vkFreeCommandBuffers");
+    if (!fn) return;
+    VkCommandPool real_pool = pool ? cp_from(pool)->real : 0;
+    #define OSITO_CB_FREE_MAX 32u
+    VkCommandBuffer reals[OSITO_CB_FREE_MAX] = {0};
+    uint32_t n = count < OSITO_CB_FREE_MAX ? count : OSITO_CB_FREE_MAX;
+    for (uint32_t i = 0; i < n; i++) {
+        struct osito_cmd_buffer *w = (struct osito_cmd_buffer *)pCmdBuffers[i];
+        reals[i] = w ? w->real : 0;
+    }
+    fn(dw->real, real_pool, n, reals);
+    for (uint32_t i = 0; i < n; i++)
+        free((void *)pCmdBuffers[i]);
+}
+
+/* Command recording — cb is dispatchable; get device via back-pointer. */
+VKAPI_ATTR VkResult VKAPI_CALL
+vkBeginCommandBuffer(VkCommandBuffer cb, const VkCommandBufferBeginInfo *pBegin) {
+    if (!cb) return VK_ERROR_INITIALIZATION_FAILED;
+    struct osito_cmd_buffer *w = (struct osito_cmd_buffer *)cb;
+    struct osito_icd_inst *ci = w->owner ? w->owner->owner : 0;
+    if (!ci) return VK_ERROR_INITIALIZATION_FAILED;
+    PFN_vkBeginCommandBuffer fn = (PFN_vkBeginCommandBuffer)
+        ci->icd->get_proc_addr(ci->handle, "vkBeginCommandBuffer");
+    if (!fn) return VK_ERROR_INITIALIZATION_FAILED;
+    return fn(w->real, pBegin);
+}
+VKAPI_ATTR VkResult VKAPI_CALL
+vkEndCommandBuffer(VkCommandBuffer cb) {
+    if (!cb) return VK_ERROR_INITIALIZATION_FAILED;
+    struct osito_cmd_buffer *w = (struct osito_cmd_buffer *)cb;
+    struct osito_icd_inst *ci = w->owner ? w->owner->owner : 0;
+    if (!ci) return VK_ERROR_INITIALIZATION_FAILED;
+    PFN_vkEndCommandBuffer fn = (PFN_vkEndCommandBuffer)
+        ci->icd->get_proc_addr(ci->handle, "vkEndCommandBuffer");
+    if (!fn) return VK_ERROR_INITIALIZATION_FAILED;
+    return fn(w->real);
+}
+VKAPI_ATTR void VKAPI_CALL
+vkCmdBeginRenderPass(VkCommandBuffer cb,
+                     const VkRenderPassBeginInfo *pBegin,
+                     VkSubpassContents contents) {
+    if (!cb || !pBegin) return;
+    struct osito_cmd_buffer *w = (struct osito_cmd_buffer *)cb;
+    struct osito_icd_inst *ci = w->owner ? w->owner->owner : 0;
+    if (!ci) return;
+    PFN_vkCmdBeginRenderPass fn = (PFN_vkCmdBeginRenderPass)
+        ci->icd->get_proc_addr(ci->handle, "vkCmdBeginRenderPass");
+    if (!fn) return;
+    VkRenderPassBeginInfo tmp = *pBegin;
+    if (tmp.renderPass)  tmp.renderPass  = rp_from(tmp.renderPass)->real;
+    if (tmp.framebuffer) tmp.framebuffer = fb_from(tmp.framebuffer)->real;
+    fn(w->real, &tmp, contents);
+}
+VKAPI_ATTR void VKAPI_CALL
+vkCmdEndRenderPass(VkCommandBuffer cb) {
+    if (!cb) return;
+    struct osito_cmd_buffer *w = (struct osito_cmd_buffer *)cb;
+    struct osito_icd_inst *ci = w->owner ? w->owner->owner : 0;
+    if (!ci) return;
+    PFN_vkCmdEndRenderPass fn = (PFN_vkCmdEndRenderPass)
+        ci->icd->get_proc_addr(ci->handle, "vkCmdEndRenderPass");
+    if (fn) fn(w->real);
+}
+VKAPI_ATTR void VKAPI_CALL
+vkCmdBindPipeline(VkCommandBuffer cb, VkPipelineBindPoint bp, VkPipeline pipeline) {
+    if (!cb) return;
+    struct osito_cmd_buffer *w = (struct osito_cmd_buffer *)cb;
+    struct osito_icd_inst *ci = w->owner ? w->owner->owner : 0;
+    if (!ci) return;
+    PFN_vkCmdBindPipeline fn = (PFN_vkCmdBindPipeline)
+        ci->icd->get_proc_addr(ci->handle, "vkCmdBindPipeline");
+    if (!fn) return;
+    VkPipeline real = pipeline ? pip_from(pipeline)->real : 0;
+    fn(w->real, bp, real);
+}
+VKAPI_ATTR void VKAPI_CALL
+vkCmdDraw(VkCommandBuffer cb, uint32_t vertexCount,
+          uint32_t instanceCount, uint32_t firstVertex, uint32_t firstInstance) {
+    if (!cb) return;
+    struct osito_cmd_buffer *w = (struct osito_cmd_buffer *)cb;
+    struct osito_icd_inst *ci = w->owner ? w->owner->owner : 0;
+    if (!ci) return;
+    PFN_vkCmdDraw fn = (PFN_vkCmdDraw)
+        ci->icd->get_proc_addr(ci->handle, "vkCmdDraw");
+    if (!fn) return;
+    fn(w->real, vertexCount, instanceCount, firstVertex, firstInstance);
 }
