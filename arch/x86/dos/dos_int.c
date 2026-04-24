@@ -345,6 +345,11 @@ int dos_native_emulate_lretw(void *frame_ptr)
 {
     dos_nt_iframe_t *f = (dos_nt_iframe_t *)frame_ptr;
     dos_vm_t *vm = g_native_dos_vm;
+    serial_puts("[emu] enter cs=0x"); serial_puthex(f->cs & 0xFFFF, 4);
+    serial_puts(" rip=0x"); serial_puthex(f->rip, 8);
+    serial_puts(" mode=");
+    serial_puts((vm && vm->dos4gw_mode) ? "1" : "0");
+    serial_puts("\n");
     if (!vm || !vm->dos4gw_mode) return 0;
 
     /* Must be an LDT selector fault (DOS native). */
@@ -372,43 +377,207 @@ int dos_native_emulate_lretw(void *frame_ptr)
             __asm__ volatile ("mov %0, %%cr3" :: "r"(saved_cr3) : "memory"); \
         return 0; } while (0)
 
+    /* Support a few far-control opcodes DOS4GW triggers #GP on:
+     *   0xCB              — RETF (pop IP:CS, 4 bytes)
+     *   0xCA imm16        — RETF <imm16> (pop IP:CS, 4 + imm)
+     *   0xCF              — IRET (pop IP:CS:FLAGS, 6 bytes)
+     *   0x66 0xCF         — IRETD (pop EIP:CS:EFLAGS, 12 bytes)
+     *   0xEA off16:seg16  — JMP FAR direct (no stack pop)
+     *   0xFF /5 m16:16    — JMP FAR [mem] (indirect) — read IP:CS from [DS:disp16]
+     *   0xFF /3 m16:16    — CALL FAR [mem] (indirect) — push CS:IP, then jump */
     uint8_t opc = vm->mem[fault_linear];
-    if (opc != 0xCB && opc != 0xCA) DOS_NT_EMU_FAIL;
+    uint8_t opc_prefix = 0;
+    uint8_t opc_modrm  = 0;
+    int opc_is_ff_5    = 0;     /* JMP FAR indirect */
+    int opc_is_ff_3    = 0;     /* CALL FAR indirect */
+    if (opc == 0x66 && fault_linear + 1 < vm->total_mem_size) {
+        opc_prefix = 0x66;
+        opc = vm->mem[fault_linear + 1];
+    }
+    if (opc == 0xFF) {
+        if (fault_linear + 1 >= vm->total_mem_size) DOS_NT_EMU_FAIL;
+        opc_modrm = vm->mem[fault_linear + 1 + (opc_prefix ? 1 : 0)];
+        uint8_t reg = (opc_modrm >> 3) & 7;
+        if (reg == 5) opc_is_ff_5 = 1;
+        else if (reg == 3) opc_is_ff_3 = 1;
+        else DOS_NT_EMU_FAIL;
+    } else if (opc != 0xCB && opc != 0xCA && opc != 0xCF && opc != 0xEA) {
+        DOS_NT_EMU_FAIL;
+    }
 
-    uint16_t pop_imm = 0;
-    if (opc == 0xCA) {
+    uint16_t pop_imm  = 0;
+    uint16_t new_ip   = 0;
+    uint16_t new_cs   = 0;
+    uint32_t new_eip  = 0;
+    uint32_t insn_len = 1;
+    int uses_stack    = 1;      /* LRETW/IRET pop from stack */
+    int is_iretd      = 0;
+    int pushes_retaddr = 0;     /* CALL FAR variants */
+
+    if (opc_is_ff_5 || opc_is_ff_3) {
+        /* FF /5 or /3 with ModR/M. Only handle mod=00 rm=6 (disp16) for now
+         * — the common DOS-tables pattern. Bail on other addressing modes. */
+        uint8_t mod = (opc_modrm >> 6) & 3;
+        uint8_t rm  = opc_modrm & 7;
+        if (mod != 0 || rm != 6) DOS_NT_EMU_FAIL;
+        uint32_t modrm_off = 1 + (opc_prefix ? 1 : 0);
+        if (fault_linear + modrm_off + 3 >= vm->total_mem_size) DOS_NT_EMU_FAIL;
+        uint16_t disp16 = (uint16_t)vm->mem[fault_linear + modrm_off + 1]
+                        | ((uint16_t)vm->mem[fault_linear + modrm_off + 2] << 8);
+        /* Effective address is DS:disp16. Read 4 bytes: IP (2) + CS (2).
+         * DS isn't in the iret frame; grab it from the CPU (isr_common
+         * doesn't clobber DS before calling us). Fall back to vm->cpu->ds
+         * if the current DS doesn't look like a DOOM LDT selector. */
+        uint16_t ds_sel;
+        __asm__ volatile ("mov %%ds, %0" : "=r"(ds_sel));
+        if ((ds_sel & 0x04) == 0) ds_sel = (uint16_t)vm->cpu->ds;
+        uint32_t ds_base = dos_nt_ldt_base(vm, ds_sel);
+        uint32_t ea = ds_base + disp16;
+        if (opc_prefix == 0x66) {
+            /* 32-bit operand: read EIP (4) + CS (2) = 6 bytes at ea. */
+            if (ea + 5 >= vm->total_mem_size) DOS_NT_EMU_FAIL;
+            new_eip = (uint32_t)vm->mem[ea]
+                    | ((uint32_t)vm->mem[ea+1] << 8)
+                    | ((uint32_t)vm->mem[ea+2] << 16)
+                    | ((uint32_t)vm->mem[ea+3] << 24);
+            new_cs  = (uint16_t)vm->mem[ea+4] | ((uint16_t)vm->mem[ea+5] << 8);
+        } else {
+            if (ea + 3 >= vm->total_mem_size) DOS_NT_EMU_FAIL;
+            new_ip = (uint16_t)vm->mem[ea]     | ((uint16_t)vm->mem[ea+1] << 8);
+            new_cs = (uint16_t)vm->mem[ea + 2] | ((uint16_t)vm->mem[ea+3] << 8);
+        }
+        insn_len = modrm_off + 3;   /* opcode[+pfx] + modrm + disp16 */
+        uses_stack = 0;
+        if (opc_is_ff_3) {
+            /* CALL FAR: push current CS:IP of the byte AFTER this insn.
+             * 16-bit stack: PUSH CS (2B), then PUSH IP (2B). SP -= 4. */
+            uint16_t ret_ip = (uint16_t)((uint32_t)f->rip + insn_len);
+            uint16_t ret_cs = (uint16_t)f->cs;
+            uint32_t ss_base0 = dos_nt_ldt_base(vm, (uint16_t)f->ss);
+            uint32_t sp_off0  = (uint32_t)(f->rsp & 0xFFFF);
+            uint32_t new_sp_off = (sp_off0 - 4) & 0xFFFF;
+            uint32_t stk0 = ss_base0 + new_sp_off;
+            if (stk0 + 3 < vm->total_mem_size) {
+                vm->mem[stk0]     = (uint8_t)(ret_ip);
+                vm->mem[stk0 + 1] = (uint8_t)(ret_ip >> 8);
+                vm->mem[stk0 + 2] = (uint8_t)(ret_cs);
+                vm->mem[stk0 + 3] = (uint8_t)(ret_cs >> 8);
+            }
+            f->rsp = (f->rsp & ~0xFFFFULL) | new_sp_off;
+            pushes_retaddr = 1;
+        }
+    } else if (opc == 0xCA) {
         if (fault_linear + 2 >= vm->total_mem_size) DOS_NT_EMU_FAIL;
         pop_imm = (uint16_t)vm->mem[fault_linear + 1]
                 | ((uint16_t)vm->mem[fault_linear + 2] << 8);
+        insn_len = 3;
+    } else if (opc == 0xEA) {
+        /* JMP FAR imm16:imm16 (or imm32:imm16 w/ 66h). */
+        if (opc_prefix == 0x66) {
+            if (fault_linear + 7 >= vm->total_mem_size) DOS_NT_EMU_FAIL;
+            new_eip = (uint32_t)vm->mem[fault_linear + 2]
+                    | ((uint32_t)vm->mem[fault_linear + 3] << 8)
+                    | ((uint32_t)vm->mem[fault_linear + 4] << 16)
+                    | ((uint32_t)vm->mem[fault_linear + 5] << 24);
+            new_cs  = (uint16_t)vm->mem[fault_linear + 6]
+                    | ((uint16_t)vm->mem[fault_linear + 7] << 8);
+            insn_len = 8;
+        } else {
+            if (fault_linear + 4 >= vm->total_mem_size) DOS_NT_EMU_FAIL;
+            new_ip  = (uint16_t)vm->mem[fault_linear + 1]
+                    | ((uint16_t)vm->mem[fault_linear + 2] << 8);
+            new_cs  = (uint16_t)vm->mem[fault_linear + 3]
+                    | ((uint16_t)vm->mem[fault_linear + 4] << 8);
+            insn_len = 5;
+        }
+        uses_stack = 0;
+    } else if (opc == 0xCF && opc_prefix == 0x66) {
+        is_iretd = 1;
+        insn_len = 2;
+    } else if (opc == 0xCF) {
+        insn_len = 1;
     }
 
-    /* Read IP:CS from DOS stack. SS base from LDT, SP from iret frame. */
+    /* Read IP:CS (:FLAGS) from DOS stack if this opcode pops. */
     uint32_t ss_base = dos_nt_ldt_base(vm, (uint16_t)f->ss);
     uint32_t sp_off  = (uint32_t)(f->rsp & 0xFFFF);
     uint32_t stk     = ss_base + sp_off;
-    if (stk + 3 >= vm->total_mem_size) DOS_NT_EMU_FAIL;
+    uint32_t stack_advance = 0;
+    if (uses_stack) {
+        if (is_iretd) {
+            if (stk + 11 >= vm->total_mem_size) DOS_NT_EMU_FAIL;
+            new_eip = (uint32_t)vm->mem[stk]
+                    | ((uint32_t)vm->mem[stk+1] << 8)
+                    | ((uint32_t)vm->mem[stk+2] << 16)
+                    | ((uint32_t)vm->mem[stk+3] << 24);
+            new_cs  = (uint16_t)vm->mem[stk+4]
+                    | ((uint16_t)vm->mem[stk+5] << 8);
+            /* Skip EFLAGS (bytes 8-11) */
+            stack_advance = 12;
+        } else if (opc == 0xCF) {
+            if (stk + 5 >= vm->total_mem_size) DOS_NT_EMU_FAIL;
+            new_ip = (uint16_t)vm->mem[stk]     | ((uint16_t)vm->mem[stk+1] << 8);
+            new_cs = (uint16_t)vm->mem[stk + 2] | ((uint16_t)vm->mem[stk+3] << 8);
+            stack_advance = 6;
+        } else {
+            if (stk + 3 >= vm->total_mem_size) DOS_NT_EMU_FAIL;
+            new_ip = (uint16_t)vm->mem[stk]     | ((uint16_t)vm->mem[stk+1] << 8);
+            new_cs = (uint16_t)vm->mem[stk + 2] | ((uint16_t)vm->mem[stk+3] << 8);
+            stack_advance = 4 + pop_imm;
+        }
+    }
+    (void)insn_len;
 
-    uint16_t new_ip = (uint16_t)vm->mem[stk]     | ((uint16_t)vm->mem[stk+1] << 8);
-    uint16_t new_cs = (uint16_t)vm->mem[stk + 2] | ((uint16_t)vm->mem[stk+3] << 8);
+    /* Pick the effective offset: 32-bit for IRETD / 0x66 0xEA / 0x66 FF/5.
+     * FF /3 CALL FAR uses whichever matches its operand size too. */
+    int use_eip = is_iretd
+               || (opc == 0xEA && opc_prefix == 0x66)
+               || ((opc_is_ff_5 || opc_is_ff_3) && opc_prefix == 0x66);
+    uint32_t eff_ip = use_eip ? new_eip : (uint32_t)new_ip;
 
-    /* Compute target linear via the intended CS's base in DOOM's LDT. */
+    /* Compute target linear via the intended CS's base in DOOM's LDT.
+     * If new_cs doesn't resolve to any LDT entry (tgt_base == 0 for a
+     * non-zero selector), assume the code lives in the current CS — a
+     * common DOS4GW quirk where stale/garbage CS selectors get pushed
+     * but the target offset is still valid relative to the active CS. */
     uint32_t tgt_base = dos_nt_ldt_base(vm, new_cs);
-    uint32_t tgt_lin  = tgt_base + new_ip;
+    int target_cs_unresolved = 0;
+    if (new_cs != 0 && tgt_base == 0) {
+        tgt_base = cs_base;
+        target_cs_unresolved = 1;
+    }
+    uint32_t tgt_lin = tgt_base + eff_ip;
 
     /* Map target linear back into CURRENT CS (valid CODE) so the iretq
      * from this handler lands at the right byte without a CS load. */
-    if (tgt_lin < cs_base) DOS_NT_EMU_FAIL;
+    if (tgt_lin < cs_base) {
+        serial_puts("[emu] FAIL tgt_lin=0x"); serial_puthex(tgt_lin, 8);
+        serial_puts(" < cs_base=0x");        serial_puthex(cs_base, 8);
+        serial_puts(" new_cs=0x");           serial_puthex(new_cs, 4);
+        serial_puts(" eff_ip=0x");           serial_puthex(eff_ip, 8);
+        serial_puts("\n");
+        DOS_NT_EMU_FAIL;
+    }
+    (void)target_cs_unresolved;
     uint64_t new_rip_in_current_cs = tgt_lin - cs_base;
 
-    /* Advance DOS SP: 4 bytes popped + optional imm16 release. */
-    uint16_t new_sp = (uint16_t)(sp_off + 4 + pop_imm);
-    f->rsp = (f->rsp & ~0xFFFFULL) | new_sp;
+    /* Advance DOS SP by the amount the opcode would have popped. */
+    if (uses_stack) {
+        uint16_t new_sp = (uint16_t)(sp_off + stack_advance);
+        f->rsp = (f->rsp & ~0xFFFFULL) | new_sp;
+    }
     f->rip = new_rip_in_current_cs;
 
-    serial_puts("[DOS-NT] LRETW emulated: popped ");
+    serial_puts("[DOS-NT] emu opc=0x");
+    serial_puthex(opc, 2);
+    if (opc_is_ff_5) serial_puts("/5");
+    if (opc_is_ff_3) serial_puts("/3");
+    if (pushes_retaddr) serial_puts(" CALL");
+    if (opc_prefix) { serial_puts(" pfx=0x"); serial_puthex(opc_prefix, 2); }
+    serial_puts(" -> ");
     serial_puthex(new_cs, 4); serial_puts(":");
-    serial_puthex(new_ip, 8); serial_puts(" (linear 0x");
-    serial_puthex(tgt_lin, 8); serial_puts(") -> current CS RIP=0x");
+    serial_puthex(eff_ip, 8); serial_puts(" (linear 0x");
+    serial_puthex(tgt_lin, 8); serial_puts(") RIP=0x");
     serial_puthex(new_rip_in_current_cs, 8);
     serial_puts("\n");
 
