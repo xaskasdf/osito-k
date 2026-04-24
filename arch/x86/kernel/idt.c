@@ -531,7 +531,24 @@ void isr_handler(interrupt_frame_t *frame)
             }
             serial_puts(" err=0x");
             serial_puthex(frame->error_code, 4);
+            serial_puts(" cs=0x"); serial_puthex(frame->cs & 0xFFFF, 4);
             serial_puts("\n");
+
+            /* If a DOS native program faulted (CS is its LDT selector,
+             * low 3 bits indicate TI=1 LDT), long-jump back to the shell
+             * instead of halting. Restores kernel CR3 + kernel GDTR.  */
+            if ((frame->cs & 0x04) || (_zone && _zone[3] == '2')) {
+                extern uint64_t *dos_native_exit_jmpbuf;
+                extern uint64_t paging_get_kernel_cr3(void);
+                extern void kern_longjmp(uint64_t *buf, int val);
+                if (dos_native_exit_jmpbuf) {
+                    serial_puts("[DOS-NT] crash -> long-jump to shell\n");
+                    uint64_t kcr3 = paging_get_kernel_cr3();
+                    if (kcr3) __asm__ volatile ("mov %0, %%cr3"
+                                                 :: "r"(kcr3) : "memory");
+                    kern_longjmp(dos_native_exit_jmpbuf, 2);
+                }
+            }
         }
     }
 #endif
