@@ -53,6 +53,17 @@ venus_EnumeratePhysicalDevices(VkInstance, uint32_t *, VkPhysicalDevice *);
 VKAPI_ATTR void VKAPI_CALL
 venus_GetPhysicalDeviceProperties(VkPhysicalDevice, VkPhysicalDeviceProperties *);
 
+VKAPI_ATTR void VKAPI_CALL
+venus_GetPhysicalDeviceFeatures(VkPhysicalDevice, VkPhysicalDeviceFeatures *);
+
+VKAPI_ATTR void VKAPI_CALL
+venus_GetPhysicalDeviceQueueFamilyProperties(VkPhysicalDevice, uint32_t *,
+                                             VkQueueFamilyProperties *);
+
+VKAPI_ATTR void VKAPI_CALL
+venus_GetPhysicalDeviceMemoryProperties(VkPhysicalDevice,
+                                        VkPhysicalDeviceMemoryProperties *);
+
 VKAPI_ATTR VkResult VKAPI_CALL
 venus_CreateDevice(VkPhysicalDevice, const VkDeviceCreateInfo *,
                    const VkAllocationCallbacks *, VkDevice *);

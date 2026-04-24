@@ -16,6 +16,12 @@ venus_icdGetInstanceProcAddr(VkInstance instance, const char *name) {
         return (PFN_vkVoidFunction)venus_EnumeratePhysicalDevices;
     if (strcmp(name, "vkGetPhysicalDeviceProperties") == 0)
         return (PFN_vkVoidFunction)venus_GetPhysicalDeviceProperties;
+    if (strcmp(name, "vkGetPhysicalDeviceFeatures") == 0)
+        return (PFN_vkVoidFunction)venus_GetPhysicalDeviceFeatures;
+    if (strcmp(name, "vkGetPhysicalDeviceQueueFamilyProperties") == 0)
+        return (PFN_vkVoidFunction)venus_GetPhysicalDeviceQueueFamilyProperties;
+    if (strcmp(name, "vkGetPhysicalDeviceMemoryProperties") == 0)
+        return (PFN_vkVoidFunction)venus_GetPhysicalDeviceMemoryProperties;
 
     /* Device-scoped entry points — loader resolves via GIPA with instance
      * arg in the Khronos convention, so we must still answer here. */

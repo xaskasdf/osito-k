@@ -112,24 +112,80 @@ venus_EnumeratePhysicalDevices(VkInstance instance,
     return VK_SUCCESS;
 }
 
-/* Hard-coded reasonable defaults. W3b's venus protocol will pull real
- * values from the host. */
-VKAPI_ATTR void VKAPI_CALL
-venus_GetPhysicalDeviceProperties(VkPhysicalDevice physicalDevice,
-                                  VkPhysicalDeviceProperties *pProperties) {
-    (void)physicalDevice;
-    if (!pProperties) return;
+/* Guest-local fallback used when the wire is absent or a round-trip
+ * fails. Matches the W3a hardcoded identity so apps that don't have a
+ * real virgl host still see a predictable device. */
+static void venus_props_fallback(VkPhysicalDeviceProperties *pProperties) {
     memset(pProperties, 0, sizeof(*pProperties));
     pProperties->apiVersion       = VK_API_VERSION_1_4;
     pProperties->driverVersion    = VK_MAKE_VERSION(0, 3, 0);
     pProperties->vendorID         = 0x1AF4;  /* Red Hat / virtio */
     pProperties->deviceID         = 0x1050;  /* virtio-gpu */
     pProperties->deviceType       = VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU;
-    /* deviceName: fixed string 'OsitoK venus virtio-gpu' (NUL-terminated). */
     static const char name[] = "OsitoK venus virtio-gpu";
     unsigned long i;
     for (i = 0; i < sizeof(name) && i < VK_MAX_PHYSICAL_DEVICE_NAME_SIZE - 1; i++)
         pProperties->deviceName[i] = name[i];
     pProperties->deviceName[i] = '\0';
-    /* Limits and sparse properties zeroed — W3b fills them. */
+}
+
+/* W3b.2: real host query, fallback on any wire error. */
+extern int venus_cmd_encode_GetPhysicalDeviceProperties(
+        struct venus_wire *, uint64_t, VkPhysicalDeviceProperties *);
+extern int venus_cmd_encode_GetPhysicalDeviceFeatures(
+        struct venus_wire *, uint64_t, VkPhysicalDeviceFeatures *);
+extern int venus_cmd_encode_GetPhysicalDeviceQueueFamilyProperties(
+        struct venus_wire *, uint64_t, uint32_t *,
+        VkQueueFamilyProperties *);
+extern int venus_cmd_encode_GetPhysicalDeviceMemoryProperties(
+        struct venus_wire *, uint64_t, VkPhysicalDeviceMemoryProperties *);
+
+VKAPI_ATTR void VKAPI_CALL
+venus_GetPhysicalDeviceProperties(VkPhysicalDevice physicalDevice,
+                                  VkPhysicalDeviceProperties *pProperties) {
+    if (!pProperties) return;
+    struct venus_instance *self = (struct venus_instance *)physicalDevice;
+    if (!self || !self->wire) {
+        venus_props_fallback(pProperties);
+        return;
+    }
+    int rc = venus_cmd_encode_GetPhysicalDeviceProperties(
+            self->wire, self->host_handle, pProperties);
+    if (rc != 0) venus_props_fallback(pProperties);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+venus_GetPhysicalDeviceFeatures(VkPhysicalDevice physicalDevice,
+                                VkPhysicalDeviceFeatures *pFeatures) {
+    if (!pFeatures) return;
+    memset(pFeatures, 0, sizeof(*pFeatures));
+    struct venus_instance *self = (struct venus_instance *)physicalDevice;
+    if (!self || !self->wire) return;   /* zero-features fallback */
+    int rc = venus_cmd_encode_GetPhysicalDeviceFeatures(
+            self->wire, self->host_handle, pFeatures);
+    if (rc != 0) memset(pFeatures, 0, sizeof(*pFeatures));
+}
+
+VKAPI_ATTR void VKAPI_CALL
+venus_GetPhysicalDeviceQueueFamilyProperties(VkPhysicalDevice physicalDevice,
+                                             uint32_t *pCount,
+                                             VkQueueFamilyProperties *pFamilies) {
+    if (!pCount) return;
+    struct venus_instance *self = (struct venus_instance *)physicalDevice;
+    if (!self || !self->wire) { *pCount = 0; return; }
+    int rc = venus_cmd_encode_GetPhysicalDeviceQueueFamilyProperties(
+            self->wire, self->host_handle, pCount, pFamilies);
+    if (rc != 0) *pCount = 0;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+venus_GetPhysicalDeviceMemoryProperties(VkPhysicalDevice physicalDevice,
+                                        VkPhysicalDeviceMemoryProperties *pMem) {
+    if (!pMem) return;
+    memset(pMem, 0, sizeof(*pMem));
+    struct venus_instance *self = (struct venus_instance *)physicalDevice;
+    if (!self || !self->wire) return;   /* count=0/count=0 fallback */
+    int rc = venus_cmd_encode_GetPhysicalDeviceMemoryProperties(
+            self->wire, self->host_handle, pMem);
+    if (rc != 0) memset(pMem, 0, sizeof(*pMem));
 }
