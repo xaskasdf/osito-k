@@ -11,12 +11,18 @@
  *            pipeline layout / graphics pipeline / command pool / command
  *            buffer. hello-pipeline smoke. Cmd* recording is guest-local
  *            no-op (real submission lands in W3b.5 with WSI+swapchain).
+ *   W3b.5  — WSI: surface / swapchain / queue / sync primitives /
+ *            present via SYS_GUI_FLIP (OsitoK compositor). All entries
+ *            have guest-local fallbacks. hello-swapchain smoke. Memory
+ *            slots can be upgraded to SHM-backed when bound to a
+ *            swapchain-owned image (VkBindImageMemory upgrades path).
  */
 #ifndef OSITOK_VK_VENUS_H
 #define OSITOK_VK_VENUS_H
 
 #include <vulkan/vulkan.h>
 #include <vulkan/vk_icd.h>
+#include <vulkan/vulkan_ositok.h>
 
 /* Matches kernel ABI from arch/x86/include/sys/gpu_syscalls.h. We do NOT
  * include that header here because it's kernel-tree; duplicate the minimum
@@ -31,18 +37,37 @@
  * venus_wire_test_shim.c (test binary). Callers treat it as opaque. */
 struct venus_wire;
 
+/* Guest-local memory tracking (W3b.3). Sized for hello-memory plus a
+ * little headroom — not a general-purpose allocator. */
+#define VENUS_MAX_MEM_OBJECTS  32u
+#define VENUS_MAX_BUF_OBJECTS  32u
+
+/* W3b.5 object tables. */
+#define VENUS_MAX_SURFACE_OBJECTS     16u
+#define VENUS_MAX_QUEUE_OBJECTS        4u
+#define VENUS_MAX_FENCE_OBJECTS       32u
+#define VENUS_MAX_SEMA_OBJECTS        32u
+#define VENUS_MAX_SWAPCHAIN_OBJECTS    8u
+#define VENUS_MAX_SWAPCHAIN_IMAGES     4u
+
+/* W3b.5 surface (declared early because venus_instance embeds an array
+ * of them). */
+struct venus_surface {
+    uint32_t in_use;
+    uint32_t window_id;                /* opaque app-chosen compositor window id */
+    uint32_t width;
+    uint32_t height;
+};
+
 struct venus_instance {
     VK_LOADER_DATA loader_data;
     uint32_t       caps;          /* SYS_GPU_CAPS snapshot */
     int32_t        ctx_id;        /* kernel GPU ctx, 0 if none */
     struct venus_wire *wire;      /* guest-side ring wrapper (W3b.1) */
     uint64_t       host_handle;   /* host VkInstance handle-id (W3b.1) */
+    /* W3b.5 — surface slot table (guest-local). */
+    struct venus_surface surfaces[VENUS_MAX_SURFACE_OBJECTS];
 };
-
-/* Guest-local memory tracking (W3b.3). Sized for hello-memory plus a
- * little headroom — not a general-purpose allocator. */
-#define VENUS_MAX_MEM_OBJECTS  32u
-#define VENUS_MAX_BUF_OBJECTS  32u
 
 /* W3b.4 object tables. */
 #define VENUS_MAX_SHADER_OBJECTS       32u
@@ -58,11 +83,14 @@ struct venus_instance {
 struct venus_memory {
     uint64_t host_id;       /* host VkDeviceMemory id (0 if guest-local fallback) */
     uint64_t size;
-    void    *local_ptr;     /* guest-side backing buffer (malloc'd) */
+    void    *local_ptr;     /* guest-side backing buffer (malloc'd OR SHM-mapped) */
     uint32_t type_index;
     uint32_t in_use;
     uint32_t mapped;
-    uint32_t _pad;
+    uint32_t is_shm_backed; /* W3b.5: 1 when local_ptr points to a mapped SHM surface */
+    uint32_t shm_handle;    /* W3b.5: SHM handle from SYS_SHM_MKSURFACE (0 if none) */
+    uint32_t shm_width;     /* W3b.5: width of the SHM surface */
+    uint32_t shm_height;    /* W3b.5: height of the SHM surface */
 };
 
 struct venus_buffer {
@@ -95,7 +123,8 @@ struct venus_image {
     uint32_t height;
     uint32_t format;
     int32_t  bound_mem_slot;
-    uint32_t _pad;
+    uint32_t usage;                /* W3b.5: cached VkImageUsageFlags */
+    uint32_t is_swapchain_owned;   /* W3b.5: 1 if owned by a VkSwapchain */
     uint64_t bound_offset;
 };
 
@@ -141,6 +170,40 @@ struct venus_cmd_buffer {
     uint32_t _pad;
 };
 
+/* W3b.5 — WSI + sync primitives (queue/fence/sema/swapchain; the
+ * surface struct is declared earlier for the venus_instance table). */
+struct venus_queue {
+    VK_LOADER_DATA       loader_data;  /* dispatchable — VkQueue is dispatchable */
+    struct venus_device *owner;
+    uint32_t             in_use;
+    uint32_t             queue_family_index;
+    uint32_t             queue_index;
+    uint32_t             _pad;
+};
+
+struct venus_fence {
+    uint32_t in_use;
+    uint32_t signaled;
+};
+
+struct venus_semaphore {
+    uint32_t in_use;
+    uint32_t signaled;
+};
+
+struct venus_swapchain {
+    uint32_t in_use;
+    int32_t  surface_slot;
+    uint32_t image_count;
+    uint32_t current_index;
+    int32_t  image_slots[VENUS_MAX_SWAPCHAIN_IMAGES];   /* slot of venus_image */
+    int32_t  memory_slots[VENUS_MAX_SWAPCHAIN_IMAGES];  /* slot of venus_memory backing */
+    uint32_t width;
+    uint32_t height;
+    uint32_t format;
+    uint32_t _pad;
+};
+
 struct venus_device {
     VK_LOADER_DATA loader_data;
     struct venus_instance *parent;
@@ -159,6 +222,11 @@ struct venus_device {
     struct venus_pipeline        pipelines     [VENUS_MAX_PIPELINE_OBJECTS];
     struct venus_cmd_pool        cmd_pools     [VENUS_MAX_CMD_POOL_OBJECTS];
     struct venus_cmd_buffer      cmd_buffers   [VENUS_MAX_CMD_BUFFER_OBJECTS];
+    /* W3b.5 slot tables. */
+    struct venus_queue           queues        [VENUS_MAX_QUEUE_OBJECTS];
+    struct venus_fence           fences        [VENUS_MAX_FENCE_OBJECTS];
+    struct venus_semaphore       semaphores    [VENUS_MAX_SEMA_OBJECTS];
+    struct venus_swapchain       swapchains    [VENUS_MAX_SWAPCHAIN_OBJECTS];
 };
 
 /* Entry points. */
@@ -298,6 +366,76 @@ VKAPI_ATTR void VKAPI_CALL
 venus_CmdBindPipeline(VkCommandBuffer, VkPipelineBindPoint, VkPipeline);
 VKAPI_ATTR void VKAPI_CALL
 venus_CmdDraw(VkCommandBuffer, uint32_t, uint32_t, uint32_t, uint32_t);
+
+/* W3b.5 — WSI + surface + swapchain + queue + sync + present. */
+
+/* Surface (instance-scoped, OsitoK-specific). */
+VKAPI_ATTR VkResult VKAPI_CALL
+venus_CreateOsitokCompositorSurfaceKHR(VkInstance,
+        const VkOsitoCompositorSurfaceCreateInfoOSITOK *,
+        const VkAllocationCallbacks *, VkSurfaceKHR *);
+VKAPI_ATTR void VKAPI_CALL
+venus_DestroySurfaceKHR(VkInstance, VkSurfaceKHR,
+                        const VkAllocationCallbacks *);
+
+/* Queue + device-wait. */
+VKAPI_ATTR VkResult VKAPI_CALL
+venus_QueueSubmit(VkQueue, uint32_t, const VkSubmitInfo *, VkFence);
+VKAPI_ATTR VkResult VKAPI_CALL
+venus_QueueWaitIdle(VkQueue);
+VKAPI_ATTR VkResult VKAPI_CALL
+venus_DeviceWaitIdle(VkDevice);
+
+/* Fence. */
+VKAPI_ATTR VkResult VKAPI_CALL
+venus_CreateFence(VkDevice, const VkFenceCreateInfo *,
+                  const VkAllocationCallbacks *, VkFence *);
+VKAPI_ATTR void VKAPI_CALL
+venus_DestroyFence(VkDevice, VkFence, const VkAllocationCallbacks *);
+VKAPI_ATTR VkResult VKAPI_CALL
+venus_ResetFences(VkDevice, uint32_t, const VkFence *);
+VKAPI_ATTR VkResult VKAPI_CALL
+venus_WaitForFences(VkDevice, uint32_t, const VkFence *, VkBool32, uint64_t);
+VKAPI_ATTR VkResult VKAPI_CALL
+venus_GetFenceStatus(VkDevice, VkFence);
+
+/* Semaphore. */
+VKAPI_ATTR VkResult VKAPI_CALL
+venus_CreateSemaphore(VkDevice, const VkSemaphoreCreateInfo *,
+                      const VkAllocationCallbacks *, VkSemaphore *);
+VKAPI_ATTR void VKAPI_CALL
+venus_DestroySemaphore(VkDevice, VkSemaphore, const VkAllocationCallbacks *);
+
+/* Swapchain. */
+VKAPI_ATTR VkResult VKAPI_CALL
+venus_CreateSwapchainKHR(VkDevice, const VkSwapchainCreateInfoKHR *,
+                         const VkAllocationCallbacks *, VkSwapchainKHR *);
+VKAPI_ATTR void VKAPI_CALL
+venus_DestroySwapchainKHR(VkDevice, VkSwapchainKHR,
+                          const VkAllocationCallbacks *);
+VKAPI_ATTR VkResult VKAPI_CALL
+venus_GetSwapchainImagesKHR(VkDevice, VkSwapchainKHR, uint32_t *, VkImage *);
+VKAPI_ATTR VkResult VKAPI_CALL
+venus_AcquireNextImageKHR(VkDevice, VkSwapchainKHR, uint64_t, VkSemaphore,
+                          VkFence, uint32_t *);
+
+/* Present. */
+VKAPI_ATTR VkResult VKAPI_CALL
+venus_QueuePresentKHR(VkQueue, const VkPresentInfoKHR *);
+
+/* Physical-device surface queries. */
+VKAPI_ATTR VkResult VKAPI_CALL
+venus_GetPhysicalDeviceSurfaceCapabilitiesKHR(
+        VkPhysicalDevice, VkSurfaceKHR, VkSurfaceCapabilitiesKHR *);
+VKAPI_ATTR VkResult VKAPI_CALL
+venus_GetPhysicalDeviceSurfaceFormatsKHR(
+        VkPhysicalDevice, VkSurfaceKHR, uint32_t *, VkSurfaceFormatKHR *);
+VKAPI_ATTR VkResult VKAPI_CALL
+venus_GetPhysicalDeviceSurfacePresentModesKHR(
+        VkPhysicalDevice, VkSurfaceKHR, uint32_t *, VkPresentModeKHR *);
+VKAPI_ATTR VkResult VKAPI_CALL
+venus_GetPhysicalDeviceSurfaceSupportKHR(
+        VkPhysicalDevice, uint32_t, VkSurfaceKHR, VkBool32 *);
 
 VKAPI_ATTR PFN_vkVoidFunction VKAPI_PTR
 venus_icdGetInstanceProcAddr(VkInstance, const char *);

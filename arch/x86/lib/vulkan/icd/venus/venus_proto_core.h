@@ -62,4 +62,25 @@
 #define VN_CMD_vkGetImageMemoryRequirements             0x80000019u
 #define VN_CMD_vkBindImageMemory                        0x8000001Au
 
+/* W3b.5 additions — queue + sync + WSI. Same Mesa-25.0.0 caveat.
+ * The WSI opcodes (swapchain + present) are guest-local today; the
+ * values are reserved so future wire forwarding can reuse them. */
+#define VN_CMD_vkGetDeviceQueue                         0x8000001Bu
+#define VN_CMD_vkQueueSubmit                            0x8000001Cu
+#define VN_CMD_vkQueueWaitIdle                          0x8000001Du
+#define VN_CMD_vkDeviceWaitIdle                         0x8000001Eu
+#define VN_CMD_vkCreateFence                            0x8000001Fu
+#define VN_CMD_vkDestroyFence                           0x80000020u
+#define VN_CMD_vkResetFences                            0x80000021u
+#define VN_CMD_vkWaitForFences                          0x80000022u
+#define VN_CMD_vkGetFenceStatus                         0x80000023u
+#define VN_CMD_vkCreateSemaphore                        0x80000024u
+#define VN_CMD_vkDestroySemaphore                       0x80000025u
+/* WSI — guest-local only in W3b.5. */
+#define VN_CMD_vkCreateSwapchainKHR                     0x80000026u
+#define VN_CMD_vkDestroySwapchainKHR                    0x80000027u
+#define VN_CMD_vkGetSwapchainImagesKHR                  0x80000028u
+#define VN_CMD_vkAcquireNextImageKHR                    0x80000029u
+#define VN_CMD_vkQueuePresentKHR                        0x8000002Au
+
 #endif
