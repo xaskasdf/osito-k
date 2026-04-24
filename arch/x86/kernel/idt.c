@@ -557,6 +557,25 @@ void isr_handler(interrupt_frame_t *frame)
                                     frame->rsp);
             }
 
+            /* DOS-native #DB (vec=1) recovery: DOOM does
+             *   POPF; INT 21h; PUSHF
+             * with TF=1 in the popped flags. After the INT handler's
+             * IRETQ restores TF, the next instruction triggers a
+             * single-step #DB. We don't have a userspace debugger
+             * attached to DOOM, so just clear TF in the saved RFLAGS
+             * and resume — DOOM keeps running without spurious traps.
+             * Also clear DR6 single-step bit so a subsequent debug
+             * exception doesn't latch on stale state. */
+            if (vec == 1 && (frame->cs & 0x04) /* DOS-native code */) {
+                frame->rflags &= ~(uint64_t)0x100;  /* TF off */
+                uint64_t dr6 = 0xFFFF0FF0; /* clear B0-B3, BS, BT */
+                __asm__ volatile ("mov %0, %%dr6" :: "r"(dr6));
+                serial_puts("[DOS-NT] #DB caught at rip=0x");
+                serial_puthex(frame->rip, 8);
+                serial_puts(" — TF cleared, resuming\n");
+                return;
+            }
+
             /* DOS4GW surgical recovery — try LRETW software emulation
              * first (keeps current CS, rewrites RIP to target linear),
              * then fall back to descriptor promote+retry. */

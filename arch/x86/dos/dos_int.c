@@ -385,41 +385,51 @@ int dos_native_emulate_lretw(void *frame_ptr)
      *   0xEA off16:seg16  — JMP FAR direct (no stack pop)
      *   0xFF /5 m16:16    — JMP FAR [mem] (indirect) — read IP:CS from [DS:disp16]
      *   0xFF /3 m16:16    — CALL FAR [mem] (indirect) — push CS:IP, then jump */
+    /* Skip up to 4 instruction prefixes (segment-override + operand-/
+     * address-size). Track the operand-size override (0x66) explicitly
+     * since some opcode variants change behavior based on it. */
     uint8_t opc = vm->mem[fault_linear];
     uint8_t opc_prefix = 0;
     uint8_t opc_modrm  = 0;
+    uint32_t prefix_bytes = 0;
     int opc_is_ff_5    = 0;     /* JMP FAR indirect */
     int opc_is_ff_3    = 0;     /* CALL FAR indirect */
     int opc_is_mov_seg = 0;     /* 0x8E: MOV Sreg, r/m16 */
     int opc_is_les     = 0;     /* 0xC4: LES r16, m16:16 */
     int opc_is_lds     = 0;     /* 0xC5: LDS r16, m16:16 */
-    if (opc == 0x66 && fault_linear + 1 < vm->total_mem_size) {
-        opc_prefix = 0x66;
-        opc = vm->mem[fault_linear + 1];
+    for (int p = 0; p < 4; p++) {
+        if (fault_linear + prefix_bytes >= vm->total_mem_size) break;
+        uint8_t b = vm->mem[fault_linear + prefix_bytes];
+        if (b == 0x66) {                 /* operand-size override */
+            opc_prefix = 0x66;
+            prefix_bytes++;
+        } else if (b == 0x67 ||          /* addr-size override */
+                   b == 0x26 || b == 0x2E || b == 0x36 ||
+                   b == 0x3E || b == 0x64 || b == 0x65 ||
+                   b == 0xF0 || b == 0xF2 || b == 0xF3) {
+            prefix_bytes++;              /* skip but don't track */
+        } else {
+            break;
+        }
     }
+    /* op_off = absolute address of the opcode byte (fault_linear is the
+     * first byte of the instruction, which may include prefixes). */
+    uint32_t op_off = fault_linear + prefix_bytes;
+    opc = vm->mem[op_off];
     if (opc == 0xFF) {
-        if (fault_linear + 1 >= vm->total_mem_size) DOS_NT_EMU_FAIL;
-        opc_modrm = vm->mem[fault_linear + 1 + (opc_prefix ? 1 : 0)];
+        if (op_off + 1 >= vm->total_mem_size) DOS_NT_EMU_FAIL;
+        opc_modrm = vm->mem[op_off + 1];
         uint8_t reg = (opc_modrm >> 3) & 7;
         if (reg == 5) opc_is_ff_5 = 1;
         else if (reg == 3) opc_is_ff_3 = 1;
         else DOS_NT_EMU_FAIL;
     } else if (opc == 0x8E) {
-        /* MOV Sreg, r/m16 — #GPs when the source holds a selector that
-         * doesn't resolve in our LDT. Skip it: advance RIP past the insn
-         * and leave the segment register unchanged. The value DOOM
-         * intended is usually benign (e.g. recomputed on the next use). */
-        if (fault_linear + 1 >= vm->total_mem_size) DOS_NT_EMU_FAIL;
-        opc_modrm = vm->mem[fault_linear + 1 + (opc_prefix ? 1 : 0)];
+        if (op_off + 1 >= vm->total_mem_size) DOS_NT_EMU_FAIL;
+        opc_modrm = vm->mem[op_off + 1];
         opc_is_mov_seg = 1;
     } else if (opc == 0xC4 || opc == 0xC5) {
-        /* LES r16, m16:16 (0xC4) or LDS r16, m16:16 (0xC5). #GPs when
-         * the segment part of the memory operand doesn't resolve.
-         * Treat like MOV Sreg: advance RIP and load ES/DS with a safe
-         * alias. The offset-register load (into the ModR/M reg field)
-         * is skipped — DOOM usually recomputes or overwrites that reg. */
-        if (fault_linear + 1 >= vm->total_mem_size) DOS_NT_EMU_FAIL;
-        opc_modrm = vm->mem[fault_linear + 1 + (opc_prefix ? 1 : 0)];
+        if (op_off + 1 >= vm->total_mem_size) DOS_NT_EMU_FAIL;
+        opc_modrm = vm->mem[op_off + 1];
         if (opc == 0xC4) opc_is_les = 1; else opc_is_lds = 1;
     } else if (opc != 0xCB && opc != 0xCA && opc != 0xCF && opc != 0xEA) {
         DOS_NT_EMU_FAIL;
@@ -435,10 +445,10 @@ int dos_native_emulate_lretw(void *frame_ptr)
     int pushes_retaddr = 0;     /* CALL FAR variants */
 
     if (opc_is_mov_seg || opc_is_les || opc_is_lds) {
-        /* Compute instruction length. */
+        /* Compute instruction length: prefixes + opcode + modrm + addr. */
         uint8_t mod = (opc_modrm >> 6) & 3;
         uint8_t rm  = opc_modrm & 7;
-        uint32_t len = (opc_prefix ? 1 : 0) + 1 /*opcode*/ + 1 /*modrm*/;
+        uint32_t len = prefix_bytes + 1 /*opcode*/ + 1 /*modrm*/;
         if (mod == 0) {
             if (rm == 6) len += 2;
         } else if (mod == 1) {
@@ -488,10 +498,9 @@ int dos_native_emulate_lretw(void *frame_ptr)
         uint8_t mod = (opc_modrm >> 6) & 3;
         uint8_t rm  = opc_modrm & 7;
         if (mod != 0 || rm != 6) DOS_NT_EMU_FAIL;
-        uint32_t modrm_off = 1 + (opc_prefix ? 1 : 0);
-        if (fault_linear + modrm_off + 3 >= vm->total_mem_size) DOS_NT_EMU_FAIL;
-        uint16_t disp16 = (uint16_t)vm->mem[fault_linear + modrm_off + 1]
-                        | ((uint16_t)vm->mem[fault_linear + modrm_off + 2] << 8);
+        if (op_off + 3 >= vm->total_mem_size) DOS_NT_EMU_FAIL;
+        uint16_t disp16 = (uint16_t)vm->mem[op_off + 2]
+                        | ((uint16_t)vm->mem[op_off + 3] << 8);
         /* Effective address is DS:disp16. Read 4 bytes: IP (2) + CS (2).
          * DS isn't in the iret frame; grab it from the CPU (isr_common
          * doesn't clobber DS before calling us). Fall back to vm->cpu->ds
@@ -514,7 +523,7 @@ int dos_native_emulate_lretw(void *frame_ptr)
             new_ip = (uint16_t)vm->mem[ea]     | ((uint16_t)vm->mem[ea+1] << 8);
             new_cs = (uint16_t)vm->mem[ea + 2] | ((uint16_t)vm->mem[ea+3] << 8);
         }
-        insn_len = modrm_off + 3;   /* opcode[+pfx] + modrm + disp16 */
+        insn_len = prefix_bytes + 1 + 1 + 2; /* prefixes + opcode + modrm + disp16 */
         uses_stack = 0;
         if (opc_is_ff_3) {
             /* CALL FAR: push current CS:IP of the byte AFTER this insn.
@@ -535,35 +544,37 @@ int dos_native_emulate_lretw(void *frame_ptr)
             pushes_retaddr = 1;
         }
     } else if (opc == 0xCA) {
-        if (fault_linear + 2 >= vm->total_mem_size) DOS_NT_EMU_FAIL;
-        pop_imm = (uint16_t)vm->mem[fault_linear + 1]
-                | ((uint16_t)vm->mem[fault_linear + 2] << 8);
-        insn_len = 3;
+        if (op_off + 2 >= vm->total_mem_size) DOS_NT_EMU_FAIL;
+        pop_imm = (uint16_t)vm->mem[op_off + 1]
+                | ((uint16_t)vm->mem[op_off + 2] << 8);
+        insn_len = prefix_bytes + 3;
     } else if (opc == 0xEA) {
         /* JMP FAR imm16:imm16 (or imm32:imm16 w/ 66h). */
         if (opc_prefix == 0x66) {
-            if (fault_linear + 7 >= vm->total_mem_size) DOS_NT_EMU_FAIL;
-            new_eip = (uint32_t)vm->mem[fault_linear + 2]
-                    | ((uint32_t)vm->mem[fault_linear + 3] << 8)
-                    | ((uint32_t)vm->mem[fault_linear + 4] << 16)
-                    | ((uint32_t)vm->mem[fault_linear + 5] << 24);
-            new_cs  = (uint16_t)vm->mem[fault_linear + 6]
-                    | ((uint16_t)vm->mem[fault_linear + 7] << 8);
-            insn_len = 8;
+            if (op_off + 6 >= vm->total_mem_size) DOS_NT_EMU_FAIL;
+            new_eip = (uint32_t)vm->mem[op_off + 1]
+                    | ((uint32_t)vm->mem[op_off + 2] << 8)
+                    | ((uint32_t)vm->mem[op_off + 3] << 16)
+                    | ((uint32_t)vm->mem[op_off + 4] << 24);
+            new_cs  = (uint16_t)vm->mem[op_off + 5]
+                    | ((uint16_t)vm->mem[op_off + 6] << 8);
+            insn_len = prefix_bytes + 7;
         } else {
-            if (fault_linear + 4 >= vm->total_mem_size) DOS_NT_EMU_FAIL;
-            new_ip  = (uint16_t)vm->mem[fault_linear + 1]
-                    | ((uint16_t)vm->mem[fault_linear + 2] << 8);
-            new_cs  = (uint16_t)vm->mem[fault_linear + 3]
-                    | ((uint16_t)vm->mem[fault_linear + 4] << 8);
-            insn_len = 5;
+            if (op_off + 4 >= vm->total_mem_size) DOS_NT_EMU_FAIL;
+            new_ip  = (uint16_t)vm->mem[op_off + 1]
+                    | ((uint16_t)vm->mem[op_off + 2] << 8);
+            new_cs  = (uint16_t)vm->mem[op_off + 3]
+                    | ((uint16_t)vm->mem[op_off + 4] << 8);
+            insn_len = prefix_bytes + 5;
         }
         uses_stack = 0;
     } else if (opc == 0xCF && opc_prefix == 0x66) {
         is_iretd = 1;
-        insn_len = 2;
+        insn_len = prefix_bytes + 1;
     } else if (opc == 0xCF) {
-        insn_len = 1;
+        insn_len = prefix_bytes + 1;
+    } else if (opc == 0xCB) {
+        insn_len = prefix_bytes + 1;
     }
 
     /* Read IP:CS (:FLAGS) from DOS stack if this opcode pops. */
