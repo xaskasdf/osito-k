@@ -5,10 +5,11 @@
 
 extern PFN_vkVoidFunction VKAPI_PTR
 nvk_stub_icdGetInstanceProcAddr(VkInstance instance, const char *name);
-
-/* Wave 3 will add venus entry here. For now, only nvk-stub registers. */
+extern PFN_vkVoidFunction VKAPI_PTR
+venus_icdGetInstanceProcAddr(VkInstance instance, const char *name);
 
 const struct osito_icd_entry osito_icd_table[] = {
+    { "venus",    venus_icdGetInstanceProcAddr    },  /* preferred when VIRGL is up */
     { "nvk-stub", nvk_stub_icdGetInstanceProcAddr },
 };
 const unsigned osito_icd_count =
