@@ -24,6 +24,7 @@ SRC := \
   icd/nvk_stub/nvk_stub.c \
   icd/venus/venus_instance.c \
   icd/venus/venus_device.c \
+  icd/venus/venus_w3b5_objects.c \
   icd/venus/venus_w3b4_objects.c \
   icd/venus/venus_entry.c \
   icd/venus/venus_wire.c \
@@ -67,7 +68,29 @@ SRC := \
   icd/venus/venus_cmd_CmdBeginRenderPass.c \
   icd/venus/venus_cmd_CmdEndRenderPass.c \
   icd/venus/venus_cmd_CmdBindPipeline.c \
-  icd/venus/venus_cmd_CmdDraw.c
+  icd/venus/venus_cmd_CmdDraw.c \
+  icd/venus/venus_cmd_CreateOsitokCompositorSurface.c \
+  icd/venus/venus_cmd_DestroySurface.c \
+  icd/venus/venus_cmd_GetDeviceQueue.c \
+  icd/venus/venus_cmd_QueueSubmit.c \
+  icd/venus/venus_cmd_QueueWaitIdle.c \
+  icd/venus/venus_cmd_DeviceWaitIdle.c \
+  icd/venus/venus_cmd_CreateFence.c \
+  icd/venus/venus_cmd_DestroyFence.c \
+  icd/venus/venus_cmd_ResetFences.c \
+  icd/venus/venus_cmd_WaitForFences.c \
+  icd/venus/venus_cmd_GetFenceStatus.c \
+  icd/venus/venus_cmd_CreateSemaphore.c \
+  icd/venus/venus_cmd_DestroySemaphore.c \
+  icd/venus/venus_cmd_CreateSwapchainKHR.c \
+  icd/venus/venus_cmd_DestroySwapchainKHR.c \
+  icd/venus/venus_cmd_GetSwapchainImagesKHR.c \
+  icd/venus/venus_cmd_AcquireNextImageKHR.c \
+  icd/venus/venus_cmd_QueuePresentKHR.c \
+  icd/venus/venus_cmd_GetPhysicalDeviceSurfaceCapabilitiesKHR.c \
+  icd/venus/venus_cmd_GetPhysicalDeviceSurfaceFormatsKHR.c \
+  icd/venus/venus_cmd_GetPhysicalDeviceSurfacePresentModesKHR.c \
+  icd/venus/venus_cmd_GetPhysicalDeviceSurfaceSupportKHR.c
 
 OBJ := $(patsubst %.c,$(BUILD_ROOT)/%.o,$(SRC))
 
