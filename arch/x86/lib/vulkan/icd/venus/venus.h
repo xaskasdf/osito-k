@@ -1,9 +1,16 @@
 /*
  * venus.h — userland venus ICD for OsitoK.
  *
- * Wave 3a: skeleton only. No protocol wire encoding yet. Validates the
- * kernel handshake path (SYS_GPU_CAPS / CTX_CREATE / CTX_DESTROY) and
- * hosts the Vulkan dispatch for instance+device lifecycles.
+ * Wave history:
+ *   W3a    — skeleton + kernel handshake (SYS_GPU_CAPS / CTX_CREATE
+ *            / CTX_DESTROY), instance+device lifecycle.
+ *   W3b.1  — venus wire-protocol ring (guest-host command + reply).
+ *   W3b.2  — physical-device queries over the wire.
+ *   W3b.3  — VkDeviceMemory + VkBuffer lifecycle + hello-memory.
+ *   W3b.4  — shader / render pass / image / image view / framebuffer /
+ *            pipeline layout / graphics pipeline / command pool / command
+ *            buffer. hello-pipeline smoke. Cmd* recording is guest-local
+ *            no-op (real submission lands in W3b.5 with WSI+swapchain).
  */
 #ifndef OSITOK_VK_VENUS_H
 #define OSITOK_VK_VENUS_H
