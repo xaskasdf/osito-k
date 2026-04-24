@@ -62,7 +62,7 @@ int venus_cmd_encode_CreateInstance(struct venus_wire *w,
     sz += 4;                 /* flags */
     sz += 4;                 /* appInfo_present */
     if (app) {
-        sz += 4 * 4;         /* api/app/engine versions + name-len tag trios */
+        sz += 4 * 3;         /* apiVersion + applicationVersion + engineVersion */
         sz += str_wire_len(app->pApplicationName);
         sz += str_wire_len(app->pEngineName);
     }
