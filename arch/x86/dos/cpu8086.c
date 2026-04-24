@@ -3844,6 +3844,10 @@ int cpu8086_run(dos_vm_t *vm)
                 if (cpu->protected_mode) {
                     cpu->pm_cs_loaded = true;
                     cpu_update_cs_mode(cpu);
+                    /* DOS4GW typically uses FF /3 (CALL FAR) to enter its
+                     * 32-bit code. Attempt native handoff. */
+                    extern void dos_transfer_to_native(dos_vm_t *vm);
+                    dos_transfer_to_native(vm);
                 }
                 break;
             }

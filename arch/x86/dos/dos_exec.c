@@ -314,78 +314,268 @@ int dos_run(const char *filename, int argc, const char **argv)
 
 extern void dos_set_native_vm(dos_vm_t *vm);
 
+/* ── Native transfer: emulator → 32-bit compat mode ──────────────
+ *
+ * Approach: LDT-based. DOS4GW installs segment descriptors in an LDT
+ * (TI=1 in selectors like 0x47, 0x4F). The dpmi->ldt[] array in the
+ * dos_vm_t is already in Intel 8-byte descriptor format, so we can
+ * point the hardware LDTR at it directly.
+ *
+ * Mapping: a dedicated DOS CR3 (via paging_create_process_cr3) maps
+ * vm->mem physical pages at VA 0..total_mem_size, giving DOS4GW a
+ * flat base=0 address space it expects. The kernel higher-half is
+ * preserved so IDT handlers (INT 21h, etc.) can run normally from
+ * the IST2 stack when DOS code issues software interrupts.
+ *
+ * After LRETQ, DOS native code runs at hardware speed. INTs trap via
+ * dos_int_stub.S → dos_int_native_dispatch, handle the DOS API call,
+ * and IRETQ back into DOS. */
+
+extern uint64_t paging_create_process_cr3(void);
+extern int      paging_map_page_in_cr3(uint64_t cr3, uint64_t virt,
+                                       uint64_t phys, uint64_t flags);
+
+/* Kernel GDT and its GDTR (shared with idt.c/win32_init.c) */
+extern uint64_t kernel_gdt[] __attribute__((weak));
+extern struct __attribute__((packed)) {
+    uint16_t limit;
+    uint64_t base;
+} kernel_gdtr __attribute__((weak));
+
+/* PHYS_TO_VIRT / VIRT_TO_PHYS: KERNEL_VBASE = 0xFFFF800000000000.
+ * Addresses above KERNEL_VBASE are in the kernel direct map (use
+ * subtraction). Addresses below are identity-mapped (PA == VA). */
+#define DOS_NT_KERNEL_VBASE  0xFFFF800000000000ULL
+static inline uint64_t dos_nt_va_to_pa(const void *va)
+{
+    uint64_t v = (uint64_t)(uintptr_t)va;
+    if (v >= DOS_NT_KERNEL_VBASE) return v - DOS_NT_KERNEL_VBASE;
+    return v;  /* lower-half: identity-mapped, PA == VA */
+}
+
+/* PTE flags (duplicated from idt.c since they aren't in paging.h) */
+#ifndef PTE_PRESENT
+#define PTE_PRESENT   (1ULL << 0)
+#define PTE_WRITABLE  (1ULL << 1)
+#endif
+
+/* GDT slot reserved for the DOS LDT descriptor (2 slots, 16 bytes).
+ * Slots 0-9 are claimed (null, kernel CS/DS, 64-bit CS/DS, CODE32, DATA32);
+ * slots 10-11 hold the TSS descriptor (see idt.c:382-383). Slots 12-13
+ * are free. Selector = 12 << 3 = 0x60. */
+#define DOS_LDT_GDT_SLOT   12
+#define DOS_LDT_SELECTOR   (DOS_LDT_GDT_SLOT << 3)
+
+static uint64_t dos_cr3    = 0;
+static int      dos_ldt_ok = 0;
+
 void dos_transfer_to_native(dos_vm_t *vm)
 {
     cpu8086_state_t *cpu = vm->cpu;
 
-    serial_puts("[DOS] Attempting native transfer...\n");
-    serial_puts("[DOS] CS=");
-    serial_puthex(cpu->cs, 4);
-    serial_puts(" EIP=");
-    serial_puthex(cpu->eip, 8);
-    serial_puts(" SS=");
-    serial_puthex(cpu->ss, 4);
-    serial_puts(" ESP=");
-    serial_puthex(cpu->esp, 8);
+    serial_puts("[DOS-NT] enter cs=0x");  serial_puthex(cpu->cs, 4);
+    serial_puts(" eip=0x");                serial_puthex(cpu->eip, 8);
+    serial_puts(" ss=0x");                 serial_puthex(cpu->ss, 4);
+    serial_puts(" esp=0x");                serial_puthex(cpu->esp, 8);
+    serial_puts(" ds=0x");                 serial_puthex(cpu->ds, 4);
     serial_puts("\n");
 
-    /* DOS4GW's GDT is in emulated memory. The GDT base was loaded via LGDT.
-     * For flat model (base=0, limit=4GB), we can use the existing kernel
-     * GDT entries at indices 8-9 (CODE32=0x40, DATA32=0x48) which are
-     * already installed by win32_init(). */
-
-    /* Validate: the GDT must be accessible */
-    if (cpu->gdtr.base >= vm->total_mem_size) {
-        serial_puts("[DOS] GDT base out of range, staying in interpreter\n");
-        return;
-    }
-    /* GDT base=0 is valid — DOS4GW puts GDT at start of memory */
-
-    /* Read DOS4GW's code segment descriptor to verify it's flat 32-bit */
-    uint16_t cs_idx = cpu->cs >> 3;
-    uint32_t cs_desc_addr = cpu->gdtr.base + cs_idx * 8;
-    if (cs_desc_addr + 7 >= vm->total_mem_size) {
-        serial_puts("[DOS] CS descriptor out of range, staying in interpreter\n");
+    /* Skip if DOS4GW isn't using LDT yet — stay in interpreter. */
+    if ((cpu->cs & 0x04) == 0) {
+        serial_puts("[DOS-NT] CS is GDT selector (not LDT), skipping\n");
         return;
     }
 
-    /* Log the descriptor */
-    serial_puts("[DOS] CS descriptor at GDT[");
-    serial_puthex(cs_idx, 4);
-    serial_puts("]: ");
-    for (int i = 0; i < 8; i++) {
-        serial_puthex(vm->mem[cs_desc_addr + i], 2);
-        serial_puts(" ");
-    }
-    serial_puts("\n");
+    /* ── One-time CR3 + LDT-descriptor setup ────────────────── */
+    if (!dos_cr3) {
+        dos_cr3 = paging_create_process_cr3();
+        if (!dos_cr3) {
+            serial_puts("[DOS-NT] paging_create_process_cr3 FAILED\n");
+            return;
+        }
 
-    /* Set up the native VM state for INT dispatch */
+        /* Identity-map vm->mem pages at DOS CR3 VA 0..total_mem_size. */
+        uint64_t mem_pa = dos_nt_va_to_pa(vm->mem);
+        uint64_t mapped = 0;
+        for (uint64_t off = 0; off < vm->total_mem_size; off += 4096) {
+            if (paging_map_page_in_cr3(dos_cr3, off, mem_pa + off,
+                                       PTE_PRESENT | PTE_WRITABLE) != 0) {
+                serial_puts("[DOS-NT] map FAILED at off=0x");
+                serial_puthex(off, 8); serial_puts("\n");
+                return;
+            }
+            mapped += 4096;
+        }
+        serial_puts("[DOS-NT] CR3=0x");    serial_puthex(dos_cr3, 16);
+        serial_puts(" vm->mem pa=0x");     serial_puthex(mem_pa, 16);
+        serial_puts(" mapped=");           serial_putdec(mapped >> 10);
+        serial_puts(" KB @ VA 0\n");
+
+        /* Also map the dos_vm_t struct pages at their own kernel VA in
+         * dos_cr3. The LDT (dpmi->ldt) and VM state live here; hardware
+         * LDT access on segment-register loads dereferences the kernel
+         * VA, and INT handlers read the VM pointer through this mapping. */
+        uint64_t vm_va    = (uint64_t)vm;
+        uint64_t vm_end   = vm_va + sizeof(*vm);
+        uint64_t vm_pbase = vm_va & ~0xFFFULL;
+        uint64_t vm_pages = 0;
+        for (uint64_t va = vm_pbase; va < vm_end; va += 4096) {
+            uint64_t pa = dos_nt_va_to_pa((void *)va);
+            if (paging_map_page_in_cr3(dos_cr3, va, pa,
+                                       PTE_PRESENT | PTE_WRITABLE) != 0) {
+                serial_puts("[DOS-NT] vm-struct map FAILED va=0x");
+                serial_puthex(va, 16); serial_puts("\n");
+                return;
+            }
+            vm_pages++;
+        }
+        serial_puts("[DOS-NT] vm struct mapped: ");
+        serial_putdec(vm_pages); serial_puts(" pages @ VA 0x");
+        serial_puthex(vm_pbase, 16); serial_puts("\n");
+
+        /* Build the long-mode LDT descriptor pointing at dpmi->ldt[].
+         * System descriptor, 16 bytes. Low 64 bits hold base[31:0] +
+         * limit[19:0] + access/flags; high 64 bits hold base[63:32]. */
+        uint64_t ldt_base = (uint64_t)&vm->dpmi.ldt[0];
+        uint32_t ldt_limit = (uint32_t)(sizeof(vm->dpmi.ldt) - 1);
+
+        uint64_t desc_lo =
+              ((uint64_t)(ldt_limit & 0xFFFF))
+            | (((uint64_t)(ldt_base) & 0xFFFFFF) << 16)
+            | ((uint64_t)0x82 << 40)                       /* P=1, Type=2 LDT */
+            | ((uint64_t)((ldt_limit >> 16) & 0xF) << 48)
+            | (((uint64_t)(ldt_base >> 24) & 0xFF) << 56);
+        uint64_t desc_hi = (ldt_base >> 32);               /* base[63:32] */
+
+        kernel_gdt[DOS_LDT_GDT_SLOT]     = desc_lo;
+        kernel_gdt[DOS_LDT_GDT_SLOT + 1] = desc_hi;
+
+        /* Extend GDTR limit to cover slot 13 and reload. */
+        uint16_t needed = ((DOS_LDT_GDT_SLOT + 2) * 8) - 1;
+        if (kernel_gdtr.limit < needed) {
+            kernel_gdtr.limit = needed;
+            __asm__ volatile ("lgdt %0" : : "m"(kernel_gdtr));
+        }
+
+        serial_puts("[DOS-NT] LDT installed: sel=0x");
+        serial_puthex(DOS_LDT_SELECTOR, 4);
+        serial_puts(" base=0x");  serial_puthex(ldt_base, 16);
+        serial_puts(" limit=0x"); serial_puthex(ldt_limit, 4);
+        serial_puts("\n");
+        dos_ldt_ok = 1;
+    }
+
+    if (!dos_ldt_ok) return;
+
+    /* Record the VM pointer so native INT handlers can find it. */
     dos_set_native_vm(vm);
 
-    /* The emulated memory (vm->mem) IS the physical memory that the 32-bit
-     * code will access. Since OsitoK uses identity mapping, and the emulated
-     * memory is allocated via mem_alloc_pages(), the 32-bit code can access
-     * it directly IF it uses flat model (base=0).
-     *
-     * However, the emulated memory starts at some address in OsitoK's
-     * address space, NOT at physical address 0. DOS4GW expects base=0.
-     * We'd need to map the emulated memory at address 0 or adjust the
-     * GDT base to point to our emulated memory.
-     *
-     * For now, log the state and return to the interpreter. The full
-     * native transfer requires address space setup that we'll implement
-     * after verifying the concept works. */
+    /* ── The jump ───────────────────────────────────────────── */
+    /* Load DS/ES/SS from DOS4GW's LDT selectors first (they refer to
+     * the LDT we're about to LLDT). Then switch CR3 so VA 0 maps to
+     * vm->mem. Finally LRETQ to cs:eip in 32-bit compat mode. */
+    uint64_t cr3_new = dos_cr3;
+    uint16_t ldt_sel = DOS_LDT_SELECTOR;
+    uint64_t cs64    = cpu->cs;
+    uint64_t ip64    = cpu->eip;
+    uint64_t ds64    = cpu->ds;
+    /* For SS/ES, fall back to DS if the emulated value isn't a valid LDT
+     * selector (e.g. stale real-mode DOS segment like 0x147D). */
+    #define DOS_NT_SEL_OK(s) (((s) & 0x04) && (((s) >> 3) < DPMI_MAX_DESCRIPTORS))
+    uint64_t ss64    = DOS_NT_SEL_OK(cpu->ss) ? cpu->ss : cpu->ds;
+    uint64_t es64    = DOS_NT_SEL_OK(cpu->es) ? cpu->es : cpu->ds;
+    uint64_t sp64    = cpu->esp;
 
-    serial_puts("[DOS] Native transfer: concept validated. ");
-    serial_puts("Need address space mapping for base=0 flat model.\n");
-    serial_puts("[DOS] Continuing in interpreter for now...\n");
+    /* Mask RPL bits — we run DOS in ring 0 (DPL=0 descriptors) so selectors
+     * must have RPL=0 to satisfy max(RPL,CPL) <= DPL at load time. */
+    cs64 &= ~3ULL;
+    ds64 &= ~3ULL;
+    ss64 &= ~3ULL;
+    es64 &= ~3ULL;
 
-    /* TODO: The full implementation will:
-     * 1. Map emulated memory at linear address 0 (or adjust GDT bases)
-     * 2. Install DOS4GW's GDT entries (or use flat CODE32/DATA32)
-     * 3. Set up ESP from cpu->ss:cpu->esp
-     * 4. LRETQ to cpu->cs:cpu->eip in 32-bit compat mode
-     *
-     * This requires the kernel's paging to map the emulated memory
-     * region at virtual address 0, which needs paging.c changes. */
+    serial_puts("[DOS-NT] LRETQ cs:eip=0x");
+    serial_puthex(cs64, 4); serial_puts(":0x");
+    serial_puthex(ip64, 8); serial_puts(" ss:esp=0x");
+    serial_puthex(ss64, 4); serial_puts(":0x");
+    serial_puthex(sp64, 8); serial_puts(" ds=0x");
+    serial_puthex(ds64, 4); serial_puts("\n");
+
+    /* Promote all valid LDT descriptors from DPL=3 to DPL=0 so segment
+     * register loads in CPL=0 succeed. DOOM/DPMI runs at whatever ring
+     * we give it; kernel ring is fine for a single-process system. */
+    {
+        dpmi_descriptor_t *ldt = vm->dpmi.ldt;
+        int promoted = 0;
+        for (int i = 0; i < DPMI_MAX_DESCRIPTORS; i++) {
+            if ((ldt[i].access & 0x80) && (ldt[i].access & 0x60) == 0x60) {
+                ldt[i].access &= ~0x60;  /* clear DPL bits → DPL=0 */
+                promoted++;
+            }
+        }
+        if (promoted) {
+            serial_puts("[DOS-NT] promoted ");
+            serial_putdec(promoted);
+            serial_puts(" LDT entries from DPL=3 to DPL=0\n");
+        }
+    }
+
+    /* Dump LDT entries for cs/ds/ss/es to verify they're sane before LRETQ */
+    {
+        dpmi_descriptor_t *ldt = vm->dpmi.ldt;
+        uint16_t sels[4] = { (uint16_t)cs64, (uint16_t)ds64,
+                             (uint16_t)ss64, (uint16_t)es64 };
+        const char *names[4] = { "CS", "DS", "SS", "ES" };
+        for (int i = 0; i < 4; i++) {
+            uint16_t sel = sels[i];
+            uint16_t idx = sel >> 3;
+            if ((sel & 0x04) == 0 || idx >= DPMI_MAX_DESCRIPTORS) {
+                serial_puts("[DOS-NT] "); serial_puts(names[i]);
+                serial_puts("=0x"); serial_puthex(sel, 4);
+                serial_puts(" NOT LDT or OOB\n");
+                continue;
+            }
+            dpmi_descriptor_t *d = &ldt[idx];
+            serial_puts("[DOS-NT] "); serial_puts(names[i]);
+            serial_puts("=0x"); serial_puthex(sel, 4);
+            serial_puts(" ldt["); serial_putdec(idx); serial_puts("]");
+            serial_puts(" base=0x");
+            serial_puthex((uint32_t)d->base_lo |
+                          ((uint32_t)d->base_mid << 16) |
+                          ((uint32_t)d->base_hi << 24), 8);
+            serial_puts(" limit=0x");
+            serial_puthex((uint32_t)d->limit_lo |
+                          ((uint32_t)(d->flags_lim & 0xF) << 16), 5);
+            serial_puts(" access=0x"); serial_puthex(d->access, 2);
+            serial_puts(" flags=0x"); serial_puthex(d->flags_lim, 2);
+            serial_puts("\n");
+        }
+    }
+
+    __asm__ volatile (
+        "cli\n"
+        "lldt %w[ldt]\n"
+        "mov %%rax, %%rcx\n"            /* preserve rax temporarily... */
+        "mov %[cr3], %%rax\n"
+        "mov %%rax, %%cr3\n"
+        "mov %%rcx, %%rax\n"
+        "mov %w[ds], %%ax\n  mov %%ax, %%ds\n"
+        "mov %w[es], %%ax\n  mov %%ax, %%es\n"
+        "mov %w[ss], %%ax\n  mov %%ax, %%ss\n"
+        "mov %[sp], %%rsp\n"
+        "pushq %[cs]\n"
+        "pushq %[ip]\n"
+        "sti\n"
+        "lretq\n"
+        :
+        : [ldt] "r"(ldt_sel),
+          [cr3] "r"(cr3_new),
+          [ds]  "r"(ds64),
+          [es]  "r"(es64),
+          [ss]  "r"(ss64),
+          [sp]  "r"(sp64),
+          [cs]  "r"(cs64),
+          [ip]  "r"(ip64)
+        : "memory", "cc", "rax", "rcx"
+    );
+    /* NOTREACHED */
 }
