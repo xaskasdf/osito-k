@@ -106,6 +106,9 @@ static const uint32_t qos_quantum_us[QOS_NUM_CLASSES] = {
 typedef struct {
     void    *base;
     uint64_t pages;
+    uint64_t virt_base;   /* VA mapped via paging_map_page for ET_EXEC,
+                            * or 0 if identity/upper-half only (no unmap
+                            * needed at execve). */
 } mem_region_t;
 
 /* ── Process structure ───────────────────────────────────────── */
@@ -521,6 +524,23 @@ void proc_add_region(void *base, uint64_t pages)
     if (p->region_count >= MAX_REGIONS) return;
     p->regions[p->region_count].base = base;
     p->regions[p->region_count].pages = pages;
+    p->regions[p->region_count].virt_base = 0;
+    p->region_count++;
+}
+
+/* Virt-aware variant: records a separate VA base for ET_EXEC segments
+ * that were mapped via paging_map_page. execve uses virt_base to unmap
+ * stale PTEs before loading a new ELF, otherwise VAs that the old ELF
+ * touched but the new ELF doesn't map would still resolve to recycled
+ * physical pages with stale data. */
+void proc_add_region_virt(void *base, uint64_t pages, uint64_t virt_base)
+{
+    process_t *p = exec_target_proc ? exec_target_proc : current_proc;
+    if (!p) return;
+    if (p->region_count >= MAX_REGIONS) return;
+    p->regions[p->region_count].base = base;
+    p->regions[p->region_count].pages = pages;
+    p->regions[p->region_count].virt_base = virt_base;
     p->region_count++;
 }
 
@@ -2056,11 +2076,32 @@ int proc_execve(const char *path, char *const argv[])
      * so we must NOT free the parent's regions. Only free if this
      * process has its own ELF regions (from a previous execve). */
     if (!p->kernel_stack) {
-        /* Non-forked process (shell exec) — safe to free */
+        /* Non-forked process (shell exec) — safe to free.
+         *
+         * FIX: unmap the virtual addresses FIRST before freeing the
+         * physical pages. Without this, stale PTEs persist in the PML4
+         * when ET_EXEC segments of the previous binary don't overlap
+         * the new binary's VA layout. The recycled physical pages get
+         * handed to the new process for unrelated allocations, but any
+         * access by the new ELF to the old VAs (e.g. via a global the
+         * linker placed at the same address but with a different initial
+         * value) reads stale data from the recycled page or #PFs on a
+         * freed frame. Observed: two ELFs executed in series leaked
+         * data via VA 0x200020F0. */
+        extern int paging_unmap_page(uint64_t virt);
         for (int i = 0; i < p->region_count; i++) {
-            if (p->regions[i].base && p->regions[i].pages > 0)
-                mem_free_pages(p->regions[i].base, p->regions[i].pages);
+            mem_region_t *r = &p->regions[i];
+            if (r->virt_base) {
+                for (uint64_t pg = 0; pg < r->pages; pg++)
+                    paging_unmap_page(r->virt_base + pg * 4096);
+            }
+            if (r->base && r->pages > 0)
+                mem_free_pages(r->base, r->pages);
         }
+        /* Global TLB flush — cheaper than per-page invlpg when unmapping
+         * hundreds of pages and the VA space is about to be rewritten. */
+        __asm__ volatile ("mov %%cr3, %%rax; mov %%rax, %%cr3"
+                          ::: "rax", "memory");
     }
     p->region_count = 0;
 

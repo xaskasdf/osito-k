@@ -36,6 +36,7 @@ extern int paging_unmap_page(uint64_t virt);
 
 /* Process — register memory for cleanup on exit */
 extern void proc_add_region(void *base, uint64_t pages);
+extern void proc_add_region_virt(void *base, uint64_t pages, uint64_t virt_base);
 extern void *proc_current(void);
 extern void  user_symtab_set(void *pp,
                              void *symtab, uint64_t symtab_size,
@@ -1503,11 +1504,24 @@ int elf_exec(const char *filename, int argc, const char **argv)
 
     /* Register ELF memory with the process for cleanup on exit.
      * Demand-paged segments are tracked via the global VMA table and
-     * freed by syscall_reset_process; only register eager segments. */
+     * freed by syscall_reset_process; only register eager segments.
+     *
+     * For ET_EXEC (virt_mapped=true) we stash the vaddr_min on the FIRST
+     * region so proc_execve can unmap the stale PTE range before freeing
+     * the physical backing. Without this, VAs the old ELF installed
+     * outlive the free and leak stale bytes into the next exec. */
     if (!loaded.demand_paged) {
         for (int i = 0; i < loaded.segment_count; i++) {
-            if (loaded.segments[i] && loaded.segment_pages[i] > 0)
-                proc_add_region(loaded.segments[i], loaded.segment_pages[i]);
+            if (loaded.segments[i] && loaded.segment_pages[i] > 0) {
+                if (i == 0 && loaded.virt_mapped) {
+                    proc_add_region_virt(loaded.segments[i],
+                                         loaded.segment_pages[i],
+                                         loaded.vaddr_min);
+                } else {
+                    proc_add_region(loaded.segments[i],
+                                    loaded.segment_pages[i]);
+                }
+            }
         }
     }
     if (loaded.stack_base)
