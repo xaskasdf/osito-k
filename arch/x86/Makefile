@@ -183,11 +183,15 @@ FS_MIN_OBJ   = $(FS_MINIMAL:%.c=$(BUILD)/%.o)
 ALL_MIN_OBJ  = $(KERN_MIN_OBJ) $(ASM_OBJ) $(DRV_MIN_OBJ) $(FS_MIN_OBJ) \
                $(WIN32_OBJ) $(WIN32_ASM_OBJ) $(DOS_OBJ) $(DOS_ASM_OBJ) $(GUI_OBJ)
 
-.PHONY: all clean check-deps legacy tcc tcc-clean minimal
+.PHONY: all clean check-deps legacy tcc tcc-clean minimal libvulkan
 
-all: check-deps $(BUILD)/boot.efi $(BUILD)/kernel.elf
+all: check-deps $(BUILD)/boot.efi $(BUILD)/kernel.elf libvulkan
 	@echo ""
-	@echo "Built: $(BUILD)/boot.efi + $(BUILD)/kernel.elf"
+	@echo "Built: $(BUILD)/boot.efi + $(BUILD)/kernel.elf + lib/vulkan/libvulkan.a"
+
+# ── Wave 2: Vulkan SDK library ────────────────────────────────
+libvulkan:
+	$(MAKE) -C lib/vulkan
 
 minimal: check-deps $(BUILD)/boot.efi $(BUILD)/kernel-minimal.elf
 	@echo ""
