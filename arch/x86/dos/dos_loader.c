@@ -173,6 +173,33 @@ int dos_load_mz(dos_vm_t *vm, const uint8_t *data, uint64_t size,
 
     const mz_header_t *hdr = (const mz_header_t *)data;
 
+    /* Detect DOS/4GW embedded extender. Rational Systems stamps
+     * "DOS/4G " (without the W) in the stub's copyright string very
+     * early in the binary, and "DOS/4GW" later in the extender image.
+     * Scan the full file for either — the match merely enables
+     * surgical workarounds, so a false positive is harmless. */
+    {
+        const char *sigs[] = { "DOS/4G ", "DOS/4GW", "Rational" };
+        for (int s = 0; s < 3 && !vm->dos4gw_mode; s++) {
+            const char *sig = sigs[s];
+            int slen = 0; while (sig[slen]) slen++;
+            for (uint64_t i = 0; i + slen <= size; i++) {
+                int ok = 1;
+                for (int k = 0; k < slen; k++)
+                    if (data[i + k] != (uint8_t)sig[k]) { ok = 0; break; }
+                if (ok) {
+                    vm->dos4gw_mode = true;
+                    serial_puts("[DOS] DOS/4GW extender detected (sig '");
+                    serial_puts(sig);
+                    serial_puts("' @0x");
+                    serial_puthex(i, 8);
+                    serial_puts(") — enabling surgical workarounds\n");
+                    break;
+                }
+            }
+        }
+    }
+
     /* Calculate load image size */
     uint32_t total_pages = hdr->e_cp;
     uint32_t image_size;

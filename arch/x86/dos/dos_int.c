@@ -264,12 +264,23 @@ void dos_set_native_vm(dos_vm_t *vm)
  * so DOS crashes / exits return cleanly to the shell prompt. */
 uint64_t *dos_native_exit_jmpbuf = 0;
 
-/* Attempt to recover from a #GP where the DOS client loaded a DATA
- * selector into CS (via RETF/CALL FAR/IRET). Promote the LDT entry
- * to a CODE readable segment and return 1 — the caller re-enters the
- * faulting instruction. Returns 0 if the selector isn't a DOS LDT
- * entry or the promotion would be unsafe.  Rate-limited so a genuine
- * infinite-promote loop can't deadlock the system. */
+/* DOS4GW-specific surgical LRETW emulation. Reads the target IP:CS
+ * from the DOS stack and rewrites the iret frame so the IRETQ from
+ * the kernel's #GP handler lands at the target linear address — but
+ * IN THE CURRENT CS, not the popped one. Works as long as target
+ * linear falls inside current CS's base..base+limit window, which is
+ * true in practice for DOS4GW's overlapping code segments.
+ *
+ * Returns 1 if emulation succeeded (caller returns from ISR normally);
+ * 0 if not applicable (caller falls back to long-jump crash recovery).
+ *
+ * Why this works: x86_64 hardware strictly validates CS descriptors on
+ * RETF/IRET/JMP FAR (CODE bit, DPL, limit). DOS4GW pre-dates strict
+ * 64-bit validation and pushes DATA selectors as CS. By keeping the
+ * current (valid) CS and only adjusting RIP, we skip the hardware
+ * check without sacrificing universality: only DOS4GW mode triggers. */
+int dos_native_emulate_lretw(void *frame_ptr);
+
 int dos_native_promote_to_code(uint16_t sel)
 {
     if (!g_native_dos_vm) return 0;
@@ -307,6 +318,103 @@ int dos_native_promote_to_code(uint16_t sel)
     serial_puts("/flags 0x");      serial_puthex(old_flg, 2);
     serial_puts(" -> 0x9B/0x");    serial_puthex(d->flags_lim, 2);
     serial_puts(" limit=4GB flat (CODE readable)\n");
+    return 1;
+}
+
+/* Minimal mirror of the kernel interrupt_frame_t. Kept local so this
+ * file doesn't need to include the kernel IDT header. Layout must
+ * match isr_stubs.S / idt.c's interrupt_frame_t. */
+typedef struct __attribute__((packed)) {
+    uint64_t r15, r14, r13, r12, r11, r10, r9, r8;
+    uint64_t rsi, rdi, rbp, rdx, rcx, rbx, rax;
+    uint64_t vector, error_code;
+    uint64_t rip, cs, rflags, rsp, ss;
+} dos_nt_iframe_t;
+
+static uint32_t dos_nt_ldt_base(dos_vm_t *vm, uint16_t sel)
+{
+    uint16_t idx = (sel >> 3) & 0x1FFF;
+    if (idx >= DPMI_MAX_DESCRIPTORS) return 0;
+    dpmi_descriptor_t *d = &vm->dpmi.ldt[idx];
+    return ((uint32_t)d->base_lo)
+         | ((uint32_t)d->base_mid << 16)
+         | ((uint32_t)d->base_hi  << 24);
+}
+
+int dos_native_emulate_lretw(void *frame_ptr)
+{
+    dos_nt_iframe_t *f = (dos_nt_iframe_t *)frame_ptr;
+    dos_vm_t *vm = g_native_dos_vm;
+    if (!vm || !vm->dos4gw_mode) return 0;
+
+    /* Must be an LDT selector fault (DOS native). */
+    if ((f->cs & 0x04) == 0) return 0;
+
+    /* vm->mem is a PA that is identity-mapped only in the kernel CR3,
+     * so switch temporarily to read/write it safely. */
+    extern uint64_t paging_get_kernel_cr3(void);
+    uint64_t saved_cr3;
+    __asm__ volatile ("mov %%cr3, %0" : "=r"(saved_cr3));
+    uint64_t kcr3 = paging_get_kernel_cr3();
+    if (kcr3 && saved_cr3 != kcr3)
+        __asm__ volatile ("mov %0, %%cr3" :: "r"(kcr3) : "memory");
+
+    /* Verify the faulting instruction is a far return variant that
+     * reads 4 bytes (IP16:CS16) from the stack:
+     *   0xCB            — RETF (no imm)
+     *   0xCA imm16      — RETF <imm>
+     * Other forms (CALLF/IRET) are left alone for now. */
+    uint32_t cs_base = dos_nt_ldt_base(vm, (uint16_t)f->cs);
+    uint32_t fault_linear = cs_base + (uint32_t)f->rip;
+    if (fault_linear >= vm->total_mem_size) return 0;
+    #define DOS_NT_EMU_FAIL do { \
+        if (kcr3 && saved_cr3 != kcr3) \
+            __asm__ volatile ("mov %0, %%cr3" :: "r"(saved_cr3) : "memory"); \
+        return 0; } while (0)
+
+    uint8_t opc = vm->mem[fault_linear];
+    if (opc != 0xCB && opc != 0xCA) DOS_NT_EMU_FAIL;
+
+    uint16_t pop_imm = 0;
+    if (opc == 0xCA) {
+        if (fault_linear + 2 >= vm->total_mem_size) DOS_NT_EMU_FAIL;
+        pop_imm = (uint16_t)vm->mem[fault_linear + 1]
+                | ((uint16_t)vm->mem[fault_linear + 2] << 8);
+    }
+
+    /* Read IP:CS from DOS stack. SS base from LDT, SP from iret frame. */
+    uint32_t ss_base = dos_nt_ldt_base(vm, (uint16_t)f->ss);
+    uint32_t sp_off  = (uint32_t)(f->rsp & 0xFFFF);
+    uint32_t stk     = ss_base + sp_off;
+    if (stk + 3 >= vm->total_mem_size) DOS_NT_EMU_FAIL;
+
+    uint16_t new_ip = (uint16_t)vm->mem[stk]     | ((uint16_t)vm->mem[stk+1] << 8);
+    uint16_t new_cs = (uint16_t)vm->mem[stk + 2] | ((uint16_t)vm->mem[stk+3] << 8);
+
+    /* Compute target linear via the intended CS's base in DOOM's LDT. */
+    uint32_t tgt_base = dos_nt_ldt_base(vm, new_cs);
+    uint32_t tgt_lin  = tgt_base + new_ip;
+
+    /* Map target linear back into CURRENT CS (valid CODE) so the iretq
+     * from this handler lands at the right byte without a CS load. */
+    if (tgt_lin < cs_base) DOS_NT_EMU_FAIL;
+    uint64_t new_rip_in_current_cs = tgt_lin - cs_base;
+
+    /* Advance DOS SP: 4 bytes popped + optional imm16 release. */
+    uint16_t new_sp = (uint16_t)(sp_off + 4 + pop_imm);
+    f->rsp = (f->rsp & ~0xFFFFULL) | new_sp;
+    f->rip = new_rip_in_current_cs;
+
+    serial_puts("[DOS-NT] LRETW emulated: popped ");
+    serial_puthex(new_cs, 4); serial_puts(":");
+    serial_puthex(new_ip, 8); serial_puts(" (linear 0x");
+    serial_puthex(tgt_lin, 8); serial_puts(") -> current CS RIP=0x");
+    serial_puthex(new_rip_in_current_cs, 8);
+    serial_puts("\n");
+
+    /* Restore CR3 so the IRETQ resumes in DOS CR3. */
+    if (kcr3 && saved_cr3 != kcr3)
+        __asm__ volatile ("mov %0, %%cr3" :: "r"(saved_cr3) : "memory");
     return 1;
 }
 

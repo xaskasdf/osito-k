@@ -547,15 +547,17 @@ void isr_handler(interrupt_frame_t *frame)
                                     frame->rsp);
             }
 
-            /* Last-ditch recovery: DOS4GW often pushes a DATA selector
-             * where the CPU expects CODE (CALL FAR / RETF / IRET).
-             * If this #GP's error code identifies an LDT DATA descriptor,
-             * flip it to a CODE-readable segment and retry — DOS4GW code
-             * will then execute from the same base, and if the underlying
-             * memory holds real code the jump will succeed. */
-            if (vec == 13 && (frame->error_code & 0x04) /* LDT */ ) {
+            /* DOS4GW surgical recovery — try LRETW software emulation
+             * first (keeps current CS, rewrites RIP to target linear),
+             * then fall back to descriptor promote+retry. */
+            if (vec == 13 && (frame->cs & 0x04) /* DOS-native code */) {
+                extern int dos_native_emulate_lretw(void *frame);
+                if (dos_native_emulate_lretw(frame)) {
+                    return;  /* iretq will land at emulated target */
+                }
                 extern int dos_native_promote_to_code(uint16_t sel);
-                if (dos_native_promote_to_code((uint16_t)frame->error_code)) {
+                if ((frame->error_code & 0x04) &&
+                    dos_native_promote_to_code((uint16_t)frame->error_code)) {
                     serial_puts("[pf-ist] promoted sel 0x");
                     serial_puthex(frame->error_code & 0xFFFF, 4);
                     serial_puts(" DATA→CODE, resuming\n");

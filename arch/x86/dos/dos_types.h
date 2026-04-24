@@ -161,6 +161,13 @@ typedef struct dos_vm {
 
     /* JIT/DBT state (NULL if not initialized) */
     void            *jit;           /* jit_state_t* — forward ref avoids circular include */
+
+    /* DOS4GW quirk flag: set by MZ loader when the "DOS/4GW" signature
+     * is found in the binary. Enables surgical workarounds (e.g. LRETW
+     * software emulation on #GP) that let DOS4GW titles progress past
+     * the extender's CPU-laxity assumptions without affecting other
+     * DOS binaries. */
+    bool             dos4gw_mode;
 } dos_vm_t;
 
 /* ── CGA color palette ──────────────────────────────────────────── */
