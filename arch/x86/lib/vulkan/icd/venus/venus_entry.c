@@ -50,5 +50,59 @@ venus_icdGetInstanceProcAddr(VkInstance instance, const char *name) {
     if (strcmp(name, "vkBindBufferMemory") == 0)
         return (PFN_vkVoidFunction)venus_BindBufferMemory;
 
+    /* W3b.4 — shader + render pass + image + framebuffer + pipeline + cmd. */
+    if (strcmp(name, "vkCreateShaderModule") == 0)
+        return (PFN_vkVoidFunction)venus_CreateShaderModule;
+    if (strcmp(name, "vkDestroyShaderModule") == 0)
+        return (PFN_vkVoidFunction)venus_DestroyShaderModule;
+    if (strcmp(name, "vkCreateRenderPass") == 0)
+        return (PFN_vkVoidFunction)venus_CreateRenderPass;
+    if (strcmp(name, "vkDestroyRenderPass") == 0)
+        return (PFN_vkVoidFunction)venus_DestroyRenderPass;
+    if (strcmp(name, "vkCreateImage") == 0)
+        return (PFN_vkVoidFunction)venus_CreateImage;
+    if (strcmp(name, "vkDestroyImage") == 0)
+        return (PFN_vkVoidFunction)venus_DestroyImage;
+    if (strcmp(name, "vkGetImageMemoryRequirements") == 0)
+        return (PFN_vkVoidFunction)venus_GetImageMemoryRequirements;
+    if (strcmp(name, "vkBindImageMemory") == 0)
+        return (PFN_vkVoidFunction)venus_BindImageMemory;
+    if (strcmp(name, "vkCreateImageView") == 0)
+        return (PFN_vkVoidFunction)venus_CreateImageView;
+    if (strcmp(name, "vkDestroyImageView") == 0)
+        return (PFN_vkVoidFunction)venus_DestroyImageView;
+    if (strcmp(name, "vkCreateFramebuffer") == 0)
+        return (PFN_vkVoidFunction)venus_CreateFramebuffer;
+    if (strcmp(name, "vkDestroyFramebuffer") == 0)
+        return (PFN_vkVoidFunction)venus_DestroyFramebuffer;
+    if (strcmp(name, "vkCreatePipelineLayout") == 0)
+        return (PFN_vkVoidFunction)venus_CreatePipelineLayout;
+    if (strcmp(name, "vkDestroyPipelineLayout") == 0)
+        return (PFN_vkVoidFunction)venus_DestroyPipelineLayout;
+    if (strcmp(name, "vkCreateGraphicsPipelines") == 0)
+        return (PFN_vkVoidFunction)venus_CreateGraphicsPipelines;
+    if (strcmp(name, "vkDestroyPipeline") == 0)
+        return (PFN_vkVoidFunction)venus_DestroyPipeline;
+    if (strcmp(name, "vkCreateCommandPool") == 0)
+        return (PFN_vkVoidFunction)venus_CreateCommandPool;
+    if (strcmp(name, "vkDestroyCommandPool") == 0)
+        return (PFN_vkVoidFunction)venus_DestroyCommandPool;
+    if (strcmp(name, "vkAllocateCommandBuffers") == 0)
+        return (PFN_vkVoidFunction)venus_AllocateCommandBuffers;
+    if (strcmp(name, "vkFreeCommandBuffers") == 0)
+        return (PFN_vkVoidFunction)venus_FreeCommandBuffers;
+    if (strcmp(name, "vkBeginCommandBuffer") == 0)
+        return (PFN_vkVoidFunction)venus_BeginCommandBuffer;
+    if (strcmp(name, "vkEndCommandBuffer") == 0)
+        return (PFN_vkVoidFunction)venus_EndCommandBuffer;
+    if (strcmp(name, "vkCmdBeginRenderPass") == 0)
+        return (PFN_vkVoidFunction)venus_CmdBeginRenderPass;
+    if (strcmp(name, "vkCmdEndRenderPass") == 0)
+        return (PFN_vkVoidFunction)venus_CmdEndRenderPass;
+    if (strcmp(name, "vkCmdBindPipeline") == 0)
+        return (PFN_vkVoidFunction)venus_CmdBindPipeline;
+    if (strcmp(name, "vkCmdDraw") == 0)
+        return (PFN_vkVoidFunction)venus_CmdDraw;
+
     return NULL;
 }
