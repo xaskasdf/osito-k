@@ -136,13 +136,31 @@ venus_DestroyDevice(VkDevice device, const VkAllocationCallbacks *pAllocator) {
     if (!device) return;
     struct venus_device *dev = (struct venus_device *)device;
 
-    /* Best-effort free of any still-allocated guest-local memory slots.
-     * Host-side cleanup is handled by DestroyDevice wire call below. */
-    for (uint32_t i = 0; i < VENUS_MAX_MEM_OBJECTS; i++) {
-        if (dev->memories[i].in_use && dev->memories[i].local_ptr) {
-            free(dev->memories[i].local_ptr);
-            dev->memories[i].local_ptr = 0;
+    /* Orphan-cleanup: apps SHOULD destroy children first (Vulkan spec), but
+     * if they don't, do not leak host-side state. Walk both tables and issue
+     * DestroyBuffer / FreeMemory wire calls for in-use slots with a real
+     * host id, then drop local_ptr + mark slot free. */
+    for (uint32_t i = 0; i < VENUS_MAX_BUF_OBJECTS; i++) {
+        struct venus_buffer *b = &dev->buffers[i];
+        if (!b->in_use) continue;
+        if (dev->parent && dev->parent->wire && b->host_id != 0 && dev->host_handle != 0) {
+            (void)venus_cmd_encode_DestroyBuffer(dev->parent->wire,
+                                                 dev->host_handle, b->host_id);
         }
+        b->in_use = 0;
+        b->host_id = 0;
+    }
+    for (uint32_t i = 0; i < VENUS_MAX_MEM_OBJECTS; i++) {
+        struct venus_memory *m = &dev->memories[i];
+        if (!m->in_use) continue;
+        if (dev->parent && dev->parent->wire && m->host_id != 0 && dev->host_handle != 0) {
+            (void)venus_cmd_encode_FreeMemory(dev->parent->wire,
+                                              dev->host_handle, m->host_id);
+        }
+        if (m->local_ptr) { free(m->local_ptr); m->local_ptr = 0; }
+        m->in_use = 0;
+        m->host_id = 0;
+        m->size = 0;
     }
 
     if (dev->parent && dev->parent->wire && dev->host_handle != 0) {
@@ -356,6 +374,10 @@ venus_BindBufferMemory(VkDevice device, VkBuffer buffer,
                                                    dev->host_handle,
                                                    b->host_id, m->host_id,
                                                    (uint64_t)memoryOffset);
+        /* Transport negatives (-EINVAL / -ENOMEM / -EIO) must not leak to
+         * the Vulkan caller as an undefined VkResult enum. Map to a known
+         * failure; positive/zero is already a VkResult (0 == VK_SUCCESS). */
+        if (rc < 0) return VK_ERROR_DEVICE_LOST;
         if (rc != 0) return (VkResult)rc;
     }
     return VK_SUCCESS;
