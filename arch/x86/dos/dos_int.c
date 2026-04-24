@@ -264,6 +264,42 @@ void dos_set_native_vm(dos_vm_t *vm)
  * so DOS crashes / exits return cleanly to the shell prompt. */
 uint64_t *dos_native_exit_jmpbuf = 0;
 
+/* Called from the IDT [pf-ist] probe when a DOS native program faults.
+ * Dumps the 16 bytes at CS:RIP linear address so the log shows what
+ * opcode the CPU tried to decode. CR3 switched to kernel so vm->mem
+ * identity map is reachable. */
+void dos_native_dump_rip(uint16_t cs, uint32_t rip)
+{
+    if (!g_native_dos_vm) return;
+    extern uint64_t paging_get_kernel_cr3(void);
+    uint64_t saved_cr3;
+    __asm__ volatile ("mov %%cr3, %0" : "=r"(saved_cr3));
+    uint64_t kcr3 = paging_get_kernel_cr3();
+    if (kcr3 && saved_cr3 != kcr3)
+        __asm__ volatile ("mov %0, %%cr3" :: "r"(kcr3) : "memory");
+
+    uint16_t idx = (cs >> 3) & 0x1FFF;
+    if (idx < DPMI_MAX_DESCRIPTORS) {
+        dpmi_descriptor_t *d = &g_native_dos_vm->dpmi.ldt[idx];
+        uint32_t base = (uint32_t)d->base_lo
+                      | ((uint32_t)d->base_mid << 16)
+                      | ((uint32_t)d->base_hi  << 24);
+        uint64_t linear = (uint64_t)base + rip;
+        serial_puts("[pf-ist] linear=0x");
+        serial_puthex(linear, 8);
+        serial_puts(" bytes:");
+        for (int i = 0; i < 16 &&
+             (linear + i) < g_native_dos_vm->total_mem_size; i++) {
+            serial_puts(" ");
+            serial_puthex(g_native_dos_vm->mem[linear + i], 2);
+        }
+        serial_puts("\n");
+    }
+
+    if (kcr3 && saved_cr3 != kcr3)
+        __asm__ volatile ("mov %0, %%cr3" :: "r"(saved_cr3) : "memory");
+}
+
 void dos_int_native_dispatch(uint64_t int_num, dos_native_regs_t *regs)
 {
 #ifdef COMPAT_TRACE
