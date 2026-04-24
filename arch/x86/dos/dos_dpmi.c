@@ -204,8 +204,16 @@ static uint16_t dpmi_alloc_descriptor(dpmi_state_t *dpmi)
         dpmi_descriptor_t *d = &dpmi->ldt[i];
         /* A slot is free if its access byte has the present bit clear */
         if (!(d->access & DESC_PRESENT)) {
-            /* Mark as allocated (present, but minimal -- caller fills in) */
-            d->access = DESC_PRESENT;
+            /* Initialize with a valid default: 16-bit DATA read/write, DPL=3,
+             * base=0, limit=0xFFFF. DOS4GW often calls SetLimit/SetBase
+             * without a preceding SetAccess, expecting the alloc to yield a
+             * usable DATA descriptor. This matches observed behavior where
+             * SetLimit targets indices that were only allocated, not fully
+             * SetDesc'd. */
+            dpmi_build_desc(d, 0, 0xFFFF,
+                            DESC_PRESENT | DESC_DPL3 | DESC_SEGMENT |
+                            DESC_WRITABLE,
+                            0);
             dpmi->next_free_index = (i + 1) % DPMI_MAX_DESCRIPTORS;
             return dpmi_index_to_sel(i);
         }
@@ -452,6 +460,10 @@ void dos_int31_dpmi(dos_vm_t *vm)
         if (idx < DPMI_MAX_DESCRIPTORS) {
             uint32_t base = ((uint32_t)cpu->cx << 16) | cpu->dx;
             dpmi_desc_set_base(&dpmi->ldt[idx], base);
+            serial_puts("[DPMI] SetBase sel=0x");
+            serial_puthex(sel, 4);
+            serial_puts(" base=0x"); serial_puthex(base, 8);
+            serial_puts("\n");
             cpu->eflags &= ~FLAG_CF;
         } else {
             cpu->ax = 0x8022;
@@ -467,6 +479,10 @@ void dos_int31_dpmi(dos_vm_t *vm)
         if (idx < DPMI_MAX_DESCRIPTORS) {
             uint32_t limit = ((uint32_t)cpu->cx << 16) | cpu->dx;
             dpmi_desc_set_limit(&dpmi->ldt[idx], limit);
+            serial_puts("[DPMI] SetLimit sel=0x");
+            serial_puthex(sel, 4);
+            serial_puts(" limit=0x"); serial_puthex(limit, 8);
+            serial_puts("\n");
             cpu->eflags &= ~FLAG_CF;
         } else {
             cpu->ax = 0x8022;
