@@ -16,6 +16,20 @@
  *            have guest-local fallbacks. hello-swapchain smoke. Memory
  *            slots can be upgraded to SHM-backed when bound to a
  *            swapchain-owned image (VkBindImageMemory upgrades path).
+ *
+ * W3b.5 handle markers (keep in lockstep with venus_w3b5_objects.c):
+ *   SURFACE    0xFE00
+ *   QUEUE      dispatchable  (VK_LOADER_DATA pointer)
+ *   FENCE      0xFE02
+ *   SEMAPHORE  0xFE03
+ *   SWAPCHAIN  0xFE04
+ * Slot decode: (handle >> 48) & 0x0FFF — see the W3b.3-fix lesson.
+ *
+ * W3b.5 linker invariant: venus_w3b5_objects.c MUST appear before
+ * venus_w3b4_objects.c in the Makefile SRC list. Both TUs define
+ * `venus_BindImageMemory`; --allow-multiple-definition picks the
+ * first, and w3b5's variant injects the SHM surface upgrade when
+ * the image is_swapchain_owned.
  */
 #ifndef OSITOK_VK_VENUS_H
 #define OSITOK_VK_VENUS_H
