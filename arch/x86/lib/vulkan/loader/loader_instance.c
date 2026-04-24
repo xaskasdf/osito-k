@@ -24,12 +24,20 @@ vkCreateInstance(const VkInstanceCreateInfo *pCreateInfo,
         if (!create) continue;
 
         VkInstance child = VK_NULL_HANDLE;
-        VkResult rc = create(pCreateInfo, pAllocator, &child);
-        if (rc == VK_SUCCESS && child && self->icd_instance_count < OSITOK_VK_LOADER_MAX_ICDS) {
-            self->icd_instances[self->icd_instance_count].icd = e;
-            self->icd_instances[self->icd_instance_count].handle = child;
-            self->icd_instance_count++;
+        VkResult rc = create(pCreateInfo, NULL, &child);  /* Wave 2 ignores custom allocators. */
+        if (rc != VK_SUCCESS || !child) continue;
+
+        if (self->icd_instance_count >= OSITOK_VK_LOADER_MAX_ICDS) {
+            /* Table full — destroy the orphan instead of leaking it. */
+            PFN_vkDestroyInstance orphan_destroy =
+                (PFN_vkDestroyInstance)e->get_proc_addr(child, "vkDestroyInstance");
+            if (orphan_destroy) orphan_destroy(child, NULL);
+            continue;
         }
+
+        self->icd_instances[self->icd_instance_count].icd = e;
+        self->icd_instances[self->icd_instance_count].handle = child;
+        self->icd_instance_count++;
     }
 
     if (self->icd_instance_count == 0) {
@@ -43,6 +51,7 @@ vkCreateInstance(const VkInstanceCreateInfo *pCreateInfo,
 
 VKAPI_ATTR void VKAPI_CALL
 vkDestroyInstance(VkInstance instance, const VkAllocationCallbacks *pAllocator) {
+    (void)pAllocator;  /* Wave 2 ignores custom allocators. */
     if (!instance) return;
     struct osito_instance *self = osito_instance_from(instance);
 
@@ -51,7 +60,7 @@ vkDestroyInstance(VkInstance instance, const VkAllocationCallbacks *pAllocator) 
         PFN_vkDestroyInstance destroy =
             (PFN_vkDestroyInstance)ci->icd->get_proc_addr(ci->handle,
                                                           "vkDestroyInstance");
-        if (destroy) destroy(ci->handle, pAllocator);
+        if (destroy) destroy(ci->handle, NULL);
         ci->icd = NULL;
         ci->handle = VK_NULL_HANDLE;
     }
