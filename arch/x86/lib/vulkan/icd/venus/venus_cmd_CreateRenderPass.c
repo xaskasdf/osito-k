@@ -15,12 +15,12 @@
  *   attachment[0] flattened  (9 * u32 + pad = 40 bytes)
  *     flags, format, samples, loadOp, storeOp,
  *     stencilLoadOp, stencilStoreOp, initialLayout, finalLayout, pad
- *   subpass[0] flattened     (72 bytes)
+ *   subpass[0] flattened     (40 bytes = 10 * u32)
  *     flags, pipelineBindPoint, inputAttachmentCount,
  *     colorAttachmentCount (must be 1),
  *     colorAttachment[0] attachment/layout (2 * u32),
  *     depthStencilAttachment_present (u32), ds_attachment, ds_layout,
- *     preserveAttachmentCount (u32), pad
+ *     preserveAttachmentCount (u32)
  *   dependencies[] flattened (28 bytes each)
  *     srcSubpass, dstSubpass, srcStage, dstStage, srcAccess, dstAccess, flags
  *   pAllocator_present       (u32)  always 0

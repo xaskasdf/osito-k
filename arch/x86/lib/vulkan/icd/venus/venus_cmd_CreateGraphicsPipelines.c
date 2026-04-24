@@ -67,6 +67,7 @@ int venus_cmd_encode_CreateGraphicsPipelines(
 
     uint32_t dyn_count = ds ? ds->dynamicStateCount : 0u;
     if (dyn_count > 8u) dyn_count = 8u;
+    if (ds && !ds->pDynamicStates) dyn_count = 0u;
 
     /* Payload layout (all u32 unless annotated):
      *   dev_id (u64)
@@ -105,8 +106,9 @@ int venus_cmd_encode_CreateGraphicsPipelines(
           8u + 8u + 4u + 4u + 4u + 4u
         + (4u + 8u + 4u + 4u) * 2u   /* stages */
         + 8u + 8u + 4u + 4u + 8u     /* layout + rp + subpass + baseIndex + basePipeline */
-        + 4u + 4u + 4u + 4u          /* VI header */
+        + 4u + 4u + 4u + 4u          /* VI header: flags, pad, bindingCount, pad */
         + 16u                         /* binding[0] */
+        + 4u + 4u                     /* attrCount, pad */
         + 16u                         /* attr[0] */
         + 16u                         /* IA */
         + 16u                         /* VP header */
@@ -167,7 +169,9 @@ int venus_cmd_encode_CreateGraphicsPipelines(
         *(uint32_t *)(p + off) = (uint32_t)b->inputRate; off += 4;
         *(uint32_t *)(p + off) = 0u;                   off += 4;
     }
-    /* attrCount: embedded above with VI header, now attr[0]. */
+    /* attrCount + pad, then attr[0]. */
+    *(uint32_t *)(p + off) = 1u;                                       off += 4;
+    *(uint32_t *)(p + off) = 0u;                                       off += 4;
     {
         const VkVertexInputAttributeDescription *a = &vi->pVertexAttributeDescriptions[0];
         *(uint32_t *)(p + off) = a->location;          off += 4;
