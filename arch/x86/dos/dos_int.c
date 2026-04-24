@@ -264,6 +264,36 @@ void dos_set_native_vm(dos_vm_t *vm)
  * so DOS crashes / exits return cleanly to the shell prompt. */
 uint64_t *dos_native_exit_jmpbuf = 0;
 
+/* Attempt to recover from a #GP where the DOS client loaded a DATA
+ * selector into CS (via RETF/CALL FAR/IRET). Promote the LDT entry
+ * to a CODE readable segment and return 1 — the caller re-enters the
+ * faulting instruction. Returns 0 if the selector isn't a DOS LDT
+ * entry or the promotion would be unsafe.  Rate-limited so a genuine
+ * infinite-promote loop can't deadlock the system. */
+int dos_native_promote_to_code(uint16_t sel)
+{
+    if (!g_native_dos_vm) return 0;
+    if ((sel & 0x04) == 0) return 0;              /* must be LDT */
+    uint16_t idx = (sel >> 3) & 0x1FFF;
+    if (idx >= DPMI_MAX_DESCRIPTORS) return 0;
+
+    dpmi_descriptor_t *d = &g_native_dos_vm->dpmi.ldt[idx];
+    if (!(d->access & 0x80))         return 0;    /* not present */
+    if (d->access & 0x08)            return 0;    /* already CODE */
+
+    static uint32_t promote_count = 0;
+    if (++promote_count > 32) return 0;            /* rate-limit */
+
+    /* Flip DATA → CODE readable, keep DPL=0 (matches our transfer).
+     * 0x9A = P(1) DPL(00) S(1) type(1010=code-readable-non-conforming) */
+    uint8_t old = d->access;
+    d->access = 0x9A;
+    serial_puts("[DOS-NT] LDT[");  serial_putdec(idx);
+    serial_puts("] access 0x");    serial_puthex(old, 2);
+    serial_puts(" -> 0x9A (DATA promoted to CODE readable)\n");
+    return 1;
+}
+
 /* Called from the IDT [pf-ist] probe when a DOS native program faults.
  * Dumps the 16 bytes at CS:RIP plus the top of the caller's stack so
  * we can see what opcode faulted AND trace the CALL history. CR3 is
