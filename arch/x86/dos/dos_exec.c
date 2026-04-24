@@ -492,6 +492,53 @@ void dos_transfer_to_native(dos_vm_t *vm)
         serial_puts(" base=0x");  serial_puthex(ldt_base, 16);
         serial_puts(" limit=0x"); serial_puthex(ldt_limit, 4);
         serial_puts("\n");
+
+        /* Install DOS INT handlers in the IDT with DPL=3 so ring-3 DOS
+         * code can invoke them via the INT instruction. Without DPL=3
+         * the CPU raises #GP on INT 21h etc. */
+        extern void dos_int08_stub(void);
+        extern void dos_int10_stub(void);
+        extern void dos_int16_stub(void);
+        extern void dos_int20_stub(void);
+        extern void dos_int21_stub(void);
+        extern void dos_int2f_stub(void);
+        extern void dos_int31_stub(void);
+        extern void dos_int33_stub(void);
+        struct __attribute__((packed)) idt_entry_64 {
+            uint16_t offset_low;
+            uint16_t selector;
+            uint8_t  ist;
+            uint8_t  type_attr;
+            uint16_t offset_mid;
+            uint32_t offset_high;
+            uint32_t reserved;
+        };
+        extern struct idt_entry_64 idt[];
+        uint16_t cs;
+        __asm__ volatile ("mov %%cs, %0" : "=r"(cs));
+        /* Vector 0x20 is the APIC timer — MUST NOT overwrite. DOS programs
+         * rarely use INT 20h (they use INT 21h AH=4Ch). Vector 0x08 is the
+         * legacy PIC IRQ0 (also timer); skip it too for safety. */
+        struct { uint8_t vec; void (*h)(void); } dos_gates[] = {
+            { 0x10, dos_int10_stub },
+            { 0x16, dos_int16_stub },
+            { 0x21, dos_int21_stub }, { 0x2F, dos_int2f_stub },
+            { 0x31, dos_int31_stub }, { 0x33, dos_int33_stub },
+        };
+        (void)dos_int08_stub; (void)dos_int20_stub;
+        for (unsigned i = 0; i < sizeof(dos_gates)/sizeof(dos_gates[0]); i++) {
+            uint64_t addr = (uint64_t)dos_gates[i].h;
+            uint8_t v = dos_gates[i].vec;
+            idt[v].offset_low  = (uint16_t)(addr & 0xFFFF);
+            idt[v].offset_mid  = (uint16_t)((addr >> 16) & 0xFFFF);
+            idt[v].offset_high = (uint32_t)((addr >> 32) & 0xFFFFFFFF);
+            idt[v].selector    = cs;
+            idt[v].ist         = 2;    /* IST2 for DOS */
+            idt[v].type_attr   = 0xEF; /* P=1, DPL=3, 64-bit trap gate */
+            idt[v].reserved    = 0;
+        }
+        serial_puts("[DOS-NT] DOS IDT gates installed (DPL=3) on IST2\n");
+
         dos_ldt_ok = 1;
     }
 
@@ -499,6 +546,28 @@ void dos_transfer_to_native(dos_vm_t *vm)
 
     /* Record the VM pointer so native INT handlers can find it. */
     dos_set_native_vm(vm);
+
+    /* Set TSS.RSP0 so ring-3→ring-0 transitions (timer interrupt and any
+     * other non-IST vector) land on a valid kernel stack. Without this
+     * the CPU pushes the iret frame at offset 0 and faults at -8. */
+    {
+        extern struct __attribute__((packed)) {
+            uint32_t reserved0;
+            uint64_t rsp0;
+            uint64_t rsp1;
+            uint64_t rsp2;
+            uint64_t reserved1;
+            uint64_t ist1, ist2, ist3, ist4, ist5, ist6, ist7;
+            uint64_t reserved2;
+            uint16_t reserved3;
+            uint16_t iopb_offset;
+        } kernel_tss;
+        extern uint8_t ist1_stack[];
+        /* Reuse top of IST1 — it's 64 KB, plenty even with nested ints. */
+        kernel_tss.rsp0 = (uint64_t)(ist1_stack + 65536);
+        serial_puts("[DOS-NT] TSS.RSP0 set to IST1 top = 0x");
+        serial_puthex(kernel_tss.rsp0, 16); serial_puts("\n");
+    }
 
     /* ── The jump ───────────────────────────────────────────── */
     /* Load DS/ES/SS from DOS4GW's LDT selectors first (they refer to
@@ -581,6 +650,18 @@ void dos_transfer_to_native(dos_vm_t *vm)
                          | ((uint32_t)vm->dpmi.ldt[cs64 >> 3].base_mid << 16)
                          | ((uint32_t)vm->dpmi.ldt[cs64 >> 3].base_hi << 24);
         uint64_t target_linear = cs_base + ip64;
+
+        /* Dump first 16 instruction bytes at the target linear address.
+         * vm->mem is a PA identity-mapped in kernel CR3, so we can index
+         * directly from the kernel side to read the DOS code. */
+        serial_puts("[DOS-NT] bytes @linear=0x");
+        serial_puthex(target_linear, 8);
+        serial_puts(":");
+        for (int i = 0; i < 16 && (target_linear + i) < vm->total_mem_size; i++) {
+            serial_puts(" ");
+            serial_puthex(vm->mem[target_linear + i], 2);
+        }
+        serial_puts("\n");
         serial_puts("[DOS-NT] target linear=0x");
         serial_puthex(target_linear, 16); serial_puts("\n");
         uint64_t *pml4 = DOS_NT_PHYS_TO_VIRT(cr3_new & PTE_ADDR_MASK);

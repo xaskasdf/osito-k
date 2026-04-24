@@ -266,7 +266,22 @@ void dos_int_native_dispatch(uint64_t int_num, dos_native_regs_t *regs)
     }
 #endif
 
-    if (!g_native_dos_vm) return;
+    /* Switch to kernel CR3 so handlers can access vm->mem via its PA
+     * (identity-mapped <4 GB in kernel CR3) and any other kernel-side
+     * structures that aren't mapped in the DOS CR3. Restored before return. */
+    extern uint64_t paging_get_kernel_cr3(void);
+    uint64_t saved_cr3;
+    __asm__ volatile ("mov %%cr3, %0" : "=r"(saved_cr3));
+    uint64_t kcr3 = paging_get_kernel_cr3();
+    if (kcr3 && saved_cr3 != kcr3) {
+        __asm__ volatile ("mov %0, %%cr3" : : "r"(kcr3) : "memory");
+    }
+
+    if (!g_native_dos_vm) {
+        if (kcr3 && saved_cr3 != kcr3)
+            __asm__ volatile ("mov %0, %%cr3" : : "r"(saved_cr3) : "memory");
+        return;
+    }
 
     dos_vm_t *vm = g_native_dos_vm;
     cpu8086_state_t *cpu = &g_native_cpu;
@@ -317,6 +332,12 @@ void dos_int_native_dispatch(uint64_t int_num, dos_native_regs_t *regs)
         serial_puts("[DOS32] Program terminated, exit code ");
         serial_puthex(cpu->exit_code, 2);
         serial_puts("\n");
-        /* TODO: return to kernel shell instead of hanging */
+        /* Halt forever — return-to-shell via setjmp is a separate task. */
+        __asm__ volatile ("cli\nhlt\n");
+    }
+
+    /* Restore DOS CR3 before returning to ring-3 DOS code. */
+    if (kcr3 && saved_cr3 != kcr3) {
+        __asm__ volatile ("mov %0, %%cr3" : : "r"(saved_cr3) : "memory");
     }
 }
