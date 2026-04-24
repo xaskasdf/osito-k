@@ -2380,7 +2380,23 @@ static void shell_exec(char *line)
             sh_puts("Usage: dosrun <file.com|file.exe>\n");
         } else {
             extern int dos_run(const char *filename, int argc, const char **argv);
-            dos_run(argv[1], argc - 1, (const char **)&argv[1]);
+            extern int  kern_setjmp(uint64_t *buf) __attribute__((returns_twice));
+            extern uint64_t *dos_native_exit_jmpbuf;
+            extern uint64_t *tss_ist1_ptr;
+            extern uint8_t   ist1_stack[];
+            static uint64_t dosrun_jmpbuf[9];
+            dos_native_exit_jmpbuf = dosrun_jmpbuf;
+            int rc = kern_setjmp(dosrun_jmpbuf);
+            if (rc == 0) {
+                dos_run(argv[1], argc - 1, (const char **)&argv[1]);
+            } else {
+                sh_puts("\n [DOS] Program exited (");
+                sh_puts(rc == 2 ? "crash" : "normal");
+                sh_puts(") — returned to shell\n");
+                if (tss_ist1_ptr)
+                    *tss_ist1_ptr = (uint64_t)(ist1_stack + 65536);
+            }
+            dos_native_exit_jmpbuf = NULL;
         }
     } else if (strcmp(cmd, "desktop") == 0) {
         /* Launch compositor with elementaryOS desktop */
