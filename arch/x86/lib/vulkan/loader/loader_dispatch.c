@@ -29,6 +29,26 @@ VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceQueueFamilyProperties(
 VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceMemoryProperties(
     VkPhysicalDevice, VkPhysicalDeviceMemoryProperties *);
 
+/* W3b.3 — memory + buffer lifecycle. */
+VKAPI_ATTR VkResult VKAPI_CALL vkAllocateMemory(
+    VkDevice, const VkMemoryAllocateInfo *,
+    const VkAllocationCallbacks *, VkDeviceMemory *);
+VKAPI_ATTR void VKAPI_CALL vkFreeMemory(
+    VkDevice, VkDeviceMemory, const VkAllocationCallbacks *);
+VKAPI_ATTR VkResult VKAPI_CALL vkMapMemory(
+    VkDevice, VkDeviceMemory, VkDeviceSize, VkDeviceSize,
+    VkMemoryMapFlags, void **);
+VKAPI_ATTR void VKAPI_CALL vkUnmapMemory(VkDevice, VkDeviceMemory);
+VKAPI_ATTR VkResult VKAPI_CALL vkCreateBuffer(
+    VkDevice, const VkBufferCreateInfo *,
+    const VkAllocationCallbacks *, VkBuffer *);
+VKAPI_ATTR void VKAPI_CALL vkDestroyBuffer(
+    VkDevice, VkBuffer, const VkAllocationCallbacks *);
+VKAPI_ATTR void VKAPI_CALL vkGetBufferMemoryRequirements(
+    VkDevice, VkBuffer, VkMemoryRequirements *);
+VKAPI_ATTR VkResult VKAPI_CALL vkBindBufferMemory(
+    VkDevice, VkBuffer, VkDeviceMemory, VkDeviceSize);
+
 PFN_vkVoidFunction
 osito_loader_get_instance_proc_addr(VkInstance instance, const char *pName) {
     if (!pName) return NULL;
@@ -62,6 +82,24 @@ osito_loader_get_instance_proc_addr(VkInstance instance, const char *pName) {
         return (PFN_vkVoidFunction)vkGetPhysicalDeviceQueueFamilyProperties;
     if (strcmp(pName, "vkGetPhysicalDeviceMemoryProperties") == 0)
         return (PFN_vkVoidFunction)vkGetPhysicalDeviceMemoryProperties;
+
+    /* W3b.3 additions — device memory + buffer. */
+    if (strcmp(pName, "vkAllocateMemory") == 0)
+        return (PFN_vkVoidFunction)vkAllocateMemory;
+    if (strcmp(pName, "vkFreeMemory") == 0)
+        return (PFN_vkVoidFunction)vkFreeMemory;
+    if (strcmp(pName, "vkMapMemory") == 0)
+        return (PFN_vkVoidFunction)vkMapMemory;
+    if (strcmp(pName, "vkUnmapMemory") == 0)
+        return (PFN_vkVoidFunction)vkUnmapMemory;
+    if (strcmp(pName, "vkCreateBuffer") == 0)
+        return (PFN_vkVoidFunction)vkCreateBuffer;
+    if (strcmp(pName, "vkDestroyBuffer") == 0)
+        return (PFN_vkVoidFunction)vkDestroyBuffer;
+    if (strcmp(pName, "vkGetBufferMemoryRequirements") == 0)
+        return (PFN_vkVoidFunction)vkGetBufferMemoryRequirements;
+    if (strcmp(pName, "vkBindBufferMemory") == 0)
+        return (PFN_vkVoidFunction)vkBindBufferMemory;
 
     /* Unknown — fall through to the first ICD that resolves it. Matches
      * the spec's language that unknown queries may return NULL when no
@@ -206,4 +244,171 @@ vkGetPhysicalDeviceMemoryProperties(
         (PFN_vkGetPhysicalDeviceMemoryProperties)ci->icd->get_proc_addr(
             ci->handle, "vkGetPhysicalDeviceMemoryProperties");
     if (fn) fn(real, pMem);
+}
+
+/* ---------------- W3b.3 trampolines ---------------------------------------
+ *
+ * Memory + buffer handles are non-dispatchable (plain u64). The loader
+ * wraps each returned handle in a heap-allocated struct so trampolines
+ * can recover the owning device/ICD and unwrap the ICD-side real handle.
+ *
+ * See W3b.2 for the matching VkDevice wrapping; these helpers reuse that
+ * per-device dispatch machinery. */
+
+static inline struct osito_memory *mem_from(VkDeviceMemory h) {
+    return (struct osito_memory *)(uintptr_t)h;
+}
+static inline VkDeviceMemory mem_to(struct osito_memory *w) {
+    return (VkDeviceMemory)(uintptr_t)w;
+}
+static inline struct osito_buffer *buf_from(VkBuffer h) {
+    return (struct osito_buffer *)(uintptr_t)h;
+}
+static inline VkBuffer buf_to(struct osito_buffer *w) {
+    return (VkBuffer)(uintptr_t)w;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+vkAllocateMemory(VkDevice device, const VkMemoryAllocateInfo *pAI,
+                 const VkAllocationCallbacks *pAllocator,
+                 VkDeviceMemory *pMemory) {
+    if (!device || !pAI || !pMemory) return VK_ERROR_INITIALIZATION_FAILED;
+    struct osito_device    *dw = osito_device_from(device);
+    struct osito_icd_inst  *ci = dw->owner;
+    if (!ci) return VK_ERROR_INITIALIZATION_FAILED;
+    PFN_vkAllocateMemory fn = (PFN_vkAllocateMemory)
+        ci->icd->get_proc_addr(ci->handle, "vkAllocateMemory");
+    if (!fn) return VK_ERROR_INITIALIZATION_FAILED;
+
+    VkDeviceMemory real = VK_NULL_HANDLE;
+    VkResult rc = fn(dw->real, pAI, pAllocator, &real);
+    if (rc != VK_SUCCESS || !real) return rc;
+
+    struct osito_memory *mw = malloc(sizeof(*mw));
+    if (!mw) {
+        PFN_vkFreeMemory drop = (PFN_vkFreeMemory)
+            ci->icd->get_proc_addr(ci->handle, "vkFreeMemory");
+        if (drop) drop(dw->real, real, NULL);
+        return VK_ERROR_OUT_OF_HOST_MEMORY;
+    }
+    memset(mw, 0, sizeof(*mw));
+    mw->owner = dw;
+    mw->real  = real;
+    *pMemory = mem_to(mw);
+    return VK_SUCCESS;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+vkFreeMemory(VkDevice device, VkDeviceMemory memory,
+             const VkAllocationCallbacks *pAllocator) {
+    if (!device || !memory) return;
+    struct osito_device    *dw = osito_device_from(device);
+    struct osito_icd_inst  *ci = dw->owner;
+    struct osito_memory    *mw = mem_from(memory);
+    if (ci) {
+        PFN_vkFreeMemory fn = (PFN_vkFreeMemory)
+            ci->icd->get_proc_addr(ci->handle, "vkFreeMemory");
+        if (fn) fn(dw->real, mw->real, pAllocator);
+    }
+    free(mw);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+vkMapMemory(VkDevice device, VkDeviceMemory memory,
+            VkDeviceSize offset, VkDeviceSize size,
+            VkMemoryMapFlags flags, void **ppData) {
+    if (!device || !memory || !ppData) return VK_ERROR_INITIALIZATION_FAILED;
+    struct osito_device    *dw = osito_device_from(device);
+    struct osito_icd_inst  *ci = dw->owner;
+    struct osito_memory    *mw = mem_from(memory);
+    if (!ci) return VK_ERROR_INITIALIZATION_FAILED;
+    PFN_vkMapMemory fn = (PFN_vkMapMemory)
+        ci->icd->get_proc_addr(ci->handle, "vkMapMemory");
+    if (!fn) return VK_ERROR_INITIALIZATION_FAILED;
+    return fn(dw->real, mw->real, offset, size, flags, ppData);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+vkUnmapMemory(VkDevice device, VkDeviceMemory memory) {
+    if (!device || !memory) return;
+    struct osito_device    *dw = osito_device_from(device);
+    struct osito_icd_inst  *ci = dw->owner;
+    struct osito_memory    *mw = mem_from(memory);
+    if (!ci) return;
+    PFN_vkUnmapMemory fn = (PFN_vkUnmapMemory)
+        ci->icd->get_proc_addr(ci->handle, "vkUnmapMemory");
+    if (fn) fn(dw->real, mw->real);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+vkCreateBuffer(VkDevice device, const VkBufferCreateInfo *pCI,
+               const VkAllocationCallbacks *pAllocator, VkBuffer *pBuffer) {
+    if (!device || !pCI || !pBuffer) return VK_ERROR_INITIALIZATION_FAILED;
+    struct osito_device    *dw = osito_device_from(device);
+    struct osito_icd_inst  *ci = dw->owner;
+    if (!ci) return VK_ERROR_INITIALIZATION_FAILED;
+    PFN_vkCreateBuffer fn = (PFN_vkCreateBuffer)
+        ci->icd->get_proc_addr(ci->handle, "vkCreateBuffer");
+    if (!fn) return VK_ERROR_INITIALIZATION_FAILED;
+
+    VkBuffer real = VK_NULL_HANDLE;
+    VkResult rc = fn(dw->real, pCI, pAllocator, &real);
+    if (rc != VK_SUCCESS || !real) return rc;
+
+    struct osito_buffer *bw = malloc(sizeof(*bw));
+    if (!bw) {
+        PFN_vkDestroyBuffer drop = (PFN_vkDestroyBuffer)
+            ci->icd->get_proc_addr(ci->handle, "vkDestroyBuffer");
+        if (drop) drop(dw->real, real, NULL);
+        return VK_ERROR_OUT_OF_HOST_MEMORY;
+    }
+    memset(bw, 0, sizeof(*bw));
+    bw->owner = dw;
+    bw->real  = real;
+    *pBuffer = buf_to(bw);
+    return VK_SUCCESS;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+vkDestroyBuffer(VkDevice device, VkBuffer buffer,
+                const VkAllocationCallbacks *pAllocator) {
+    if (!device || !buffer) return;
+    struct osito_device    *dw = osito_device_from(device);
+    struct osito_icd_inst  *ci = dw->owner;
+    struct osito_buffer    *bw = buf_from(buffer);
+    if (ci) {
+        PFN_vkDestroyBuffer fn = (PFN_vkDestroyBuffer)
+            ci->icd->get_proc_addr(ci->handle, "vkDestroyBuffer");
+        if (fn) fn(dw->real, bw->real, pAllocator);
+    }
+    free(bw);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+vkGetBufferMemoryRequirements(VkDevice device, VkBuffer buffer,
+                              VkMemoryRequirements *pReqs) {
+    if (!device || !buffer || !pReqs) return;
+    struct osito_device    *dw = osito_device_from(device);
+    struct osito_icd_inst  *ci = dw->owner;
+    struct osito_buffer    *bw = buf_from(buffer);
+    if (!ci) return;
+    PFN_vkGetBufferMemoryRequirements fn =
+        (PFN_vkGetBufferMemoryRequirements)ci->icd->get_proc_addr(
+            ci->handle, "vkGetBufferMemoryRequirements");
+    if (fn) fn(dw->real, bw->real, pReqs);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+vkBindBufferMemory(VkDevice device, VkBuffer buffer,
+                   VkDeviceMemory memory, VkDeviceSize memoryOffset) {
+    if (!device || !buffer || !memory) return VK_ERROR_INITIALIZATION_FAILED;
+    struct osito_device    *dw = osito_device_from(device);
+    struct osito_icd_inst  *ci = dw->owner;
+    struct osito_buffer    *bw = buf_from(buffer);
+    struct osito_memory    *mw = mem_from(memory);
+    if (!ci) return VK_ERROR_INITIALIZATION_FAILED;
+    PFN_vkBindBufferMemory fn = (PFN_vkBindBufferMemory)
+        ci->icd->get_proc_addr(ci->handle, "vkBindBufferMemory");
+    if (!fn) return VK_ERROR_INITIALIZATION_FAILED;
+    return fn(dw->real, bw->real, mw->real, memoryOffset);
 }

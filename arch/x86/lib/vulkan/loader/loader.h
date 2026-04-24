@@ -80,6 +80,22 @@ struct osito_device {
     VkDevice                   real;
 };
 
+/* W3b.3 — non-dispatchable wrappers. These don't carry VK_LOADER_DATA
+ * because non-dispatchable handles are plain u64 as far as Vulkan is
+ * concerned. We still allocate a heap struct so the handle encodes a
+ * pointer the loader can follow, and we rely on the owning device to
+ * dispatch to the correct ICD. Same wrapper-leak caveat as W3b.2 —
+ * cleaned up in W3b.4. */
+struct osito_memory {
+    struct osito_device *owner;
+    VkDeviceMemory        real;
+};
+
+struct osito_buffer {
+    struct osito_device *owner;
+    VkBuffer              real;
+};
+
 static inline struct osito_phys_device *osito_phys_from(VkPhysicalDevice h) {
     return (struct osito_phys_device *)h;
 }
