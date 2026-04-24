@@ -21,7 +21,10 @@ SRC := \
   loader/loader_instance.c \
   loader/loader_enum.c \
   loader/loader_dispatch.c \
-  icd/nvk_stub/nvk_stub.c
+  icd/nvk_stub/nvk_stub.c \
+  icd/venus/venus_instance.c \
+  icd/venus/venus_device.c \
+  icd/venus/venus_entry.c
 
 OBJ := $(patsubst %.c,$(BUILD_ROOT)/%.o,$(SRC))
 
@@ -29,7 +32,7 @@ OBJ := $(patsubst %.c,$(BUILD_ROOT)/%.o,$(SRC))
 all: $(OUT)
 
 $(BUILD_ROOT):
-	@mkdir -p $(BUILD_ROOT)/loader $(BUILD_ROOT)/icd/nvk_stub
+	@mkdir -p $(BUILD_ROOT)/loader $(BUILD_ROOT)/icd/nvk_stub $(BUILD_ROOT)/icd/venus
 
 $(BUILD_ROOT)/%.o: %.c | $(BUILD_ROOT)
 	@mkdir -p $(dir $@)
