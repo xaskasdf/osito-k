@@ -285,12 +285,28 @@ int dos_native_promote_to_code(uint16_t sel)
     if (++promote_count > 32) return 0;            /* rate-limit */
 
     /* Flip DATA → CODE readable, keep DPL=0 (matches our transfer).
-     * 0x9A = P(1) DPL(00) S(1) type(1010=code-readable-non-conforming) */
-    uint8_t old = d->access;
-    d->access = 0x9A;
+     * 0x9B = P(1) DPL(00) S(1) type(1011=code-readable-non-conforming-ACCESSED).
+     * A (bit 0) is set preemptively — some CPU validation paths refuse
+     * to load a descriptor without the A bit if the LDT page isn't
+     * confirmed writable to the CPU's access-bit update.
+     * Also expand the segment limit to 4GB. The original descriptor was
+     * SetDesc'd with lim=0, which rejects any EIP>0 after the CS load.
+     * Set G=1 (4KB granularity) and limit[19:16]=0xF, limit[15:0]=0xFFFF
+     * for a 4GB flat segment. */
+    uint8_t old_acc = d->access;
+    uint8_t old_flg = d->flags_lim;
+    d->access    = 0x9B;
+    d->limit_lo  = 0xFFFF;
+    /* flags_lim: high nibble = G|D|L|AVL; low nibble = limit[19:16]. */
+    /* G=1 (4KB granularity) + D=0 (16-bit default — match DOOM's current
+     * 16-bit LDT[0] CS so a CALL/RET can transition without operand-size
+     * mismatch) + limit[19:16]=0xF → flags_lim = 0x8F. */
+    d->flags_lim = 0x8F;
     serial_puts("[DOS-NT] LDT[");  serial_putdec(idx);
-    serial_puts("] access 0x");    serial_puthex(old, 2);
-    serial_puts(" -> 0x9A (DATA promoted to CODE readable)\n");
+    serial_puts("] access 0x");    serial_puthex(old_acc, 2);
+    serial_puts("/flags 0x");      serial_puthex(old_flg, 2);
+    serial_puts(" -> 0x9B/0x");    serial_puthex(d->flags_lim, 2);
+    serial_puts(" limit=4GB flat (CODE readable)\n");
     return 1;
 }
 
