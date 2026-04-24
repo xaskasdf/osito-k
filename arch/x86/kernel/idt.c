@@ -1840,6 +1840,25 @@ compat32_null_recovery:
             /* proc_exception_kill never returns */
         }
 
+        /* DOS-native fallback: if a DOS native session is active
+         * (dos_native_exit_jmpbuf is set by `dosrun` before LRETQ to
+         * DOOM), longjmp to the shell instead of halting. The [pf-ist]
+         * probe above only fires when RSP is inside one of our IST
+         * stacks, but DOS-native code can fault with RSP pointing at
+         * DOOM's own SS (stack outside the IST window). Catch that here. */
+        {
+            extern uint64_t *dos_native_exit_jmpbuf;
+            extern uint64_t paging_get_kernel_cr3(void);
+            extern void kern_longjmp(uint64_t *buf, int val);
+            if (dos_native_exit_jmpbuf) {
+                serial_puts("  [DOS-NT] panic recovery -> long-jump to shell\n");
+                uint64_t kcr3 = paging_get_kernel_cr3();
+                if (kcr3) __asm__ volatile ("mov %0, %%cr3"
+                                             :: "r"(kcr3) : "memory");
+                kern_longjmp(dos_native_exit_jmpbuf, 3);
+            }
+        }
+
         /* Kernel exception (PID 0 or 1) — halt the system */
         serial_puts("  SYSTEM HALTED\n");
         fb_puts_color(" SYSTEM HALTED\n", 0x00FF0000);
