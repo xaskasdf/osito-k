@@ -604,30 +604,40 @@ int dos_native_emulate_lretw(void *frame_ptr)
     uint32_t eff_ip = use_eip ? new_eip : (uint32_t)new_ip;
 
     /* Compute target linear via the intended CS's base in DOOM's LDT.
-     * If new_cs doesn't resolve to any LDT entry (tgt_base == 0 for a
-     * non-zero selector), assume the code lives in the current CS — a
-     * common DOS4GW quirk where stale/garbage CS selectors get pushed
-     * but the target offset is still valid relative to the active CS. */
+     * Several conditions force a fallback to "stay in current CS":
+     *   1. new_cs is a GDT selector (TI=0) — DOS user code shouldn't be
+     *      jumping into kernel GDT entries; the offset is more likely a
+     *      DOOM-relative one with a stale/wrong CS push.
+     *   2. tgt_base resolves but the result lands BELOW current CS base —
+     *      that always means the popped CS was bogus.
+     *   3. tgt_base resolves but the result lands ABOVE vm->total_mem_size.
+     * In all those cases, treat eff_ip as a current-CS relative offset
+     * so DOOM stays in its own code segment.  This is the same DOS4GW
+     * quirk the simpler "tgt_base == 0" branch already handled. */
     uint32_t tgt_base = dos_nt_ldt_base(vm, new_cs);
+    int new_cs_is_gdt = (new_cs != 0) && ((new_cs & 0x04) == 0);
     int target_cs_unresolved = 0;
-    if (new_cs != 0 && tgt_base == 0) {
+    if (new_cs != 0 && (tgt_base == 0 || new_cs_is_gdt)) {
         tgt_base = cs_base;
         target_cs_unresolved = 1;
     }
     uint32_t tgt_lin = tgt_base + eff_ip;
-
-    /* Map target linear back into CURRENT CS (valid CODE) so the iretq
-     * from this handler lands at the right byte without a CS load. */
-    if (tgt_lin < cs_base) {
-        serial_puts("[emu] FAIL tgt_lin=0x"); serial_puthex(tgt_lin, 8);
-        serial_puts(" < cs_base=0x");        serial_puthex(cs_base, 8);
-        serial_puts(" new_cs=0x");           serial_puthex(new_cs, 4);
-        serial_puts(" eff_ip=0x");           serial_puthex(eff_ip, 8);
-        serial_puts("\n");
-        DOS_NT_EMU_FAIL;
+    if (tgt_lin < cs_base || tgt_lin >= vm->total_mem_size) {
+        /* Last-chance: re-base on current CS. */
+        tgt_lin = cs_base + eff_ip;
+        target_cs_unresolved = 1;
+        if (tgt_lin >= vm->total_mem_size) {
+            serial_puts("[emu] FAIL tgt_lin=0x"); serial_puthex(tgt_lin, 8);
+            serial_puts(" out-of-range new_cs=0x");
+            serial_puthex(new_cs, 4);
+            serial_puts(" eff_ip=0x");
+            serial_puthex(eff_ip, 8);
+            serial_puts("\n");
+            DOS_NT_EMU_FAIL;
+        }
     }
-    (void)target_cs_unresolved;
     uint64_t new_rip_in_current_cs = tgt_lin - cs_base;
+    (void)target_cs_unresolved;
 
     /* Advance DOS SP by the amount the opcode would have popped. */
     if (uses_stack) {

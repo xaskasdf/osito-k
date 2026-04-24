@@ -506,16 +506,26 @@ void isr_handler(interrupt_frame_t *frame)
     /* Panorama probe: any exception taken while RSP lies inside IST1 (Win32
      * INT 0x2E) or IST2 (DOS native INTs). A hit on a page fault here is the
      * single line that confirms risk #3 (lower-half identity map dropped
-     * in commit f8bd01c) is actually biting inside compat dispatch. */
+     * in commit f8bd01c) is actually biting inside compat dispatch.
+     *
+     * Also covers DOS-native faults when RSP is OUTSIDE both IST windows —
+     * DOOM occasionally faults with its own SS:RSP active, in which case
+     * neither IST zone matches but we still want the surgical emulator
+     * (and the long-jump recovery) to run. The "_dos_active" guard lets
+     * the block enter when a DOS native session is in flight. */
     if (vec < 32) {
         extern uint8_t ist1_stack[];
         extern uint8_t ist2_stack[];
+        extern uint64_t *dos_native_exit_jmpbuf;
         uint64_t _sp = frame->rsp;
         uint64_t _i1 = (uint64_t)ist1_stack;
         uint64_t _i2 = (uint64_t)ist2_stack;
         const char *_zone = 0;
         if (_sp >= _i1 && _sp < _i1 + 65536)      _zone = "IST1";
         else if (_sp >= _i2 && _sp < _i2 + 32768) _zone = "IST2";
+        int _dos_active = (dos_native_exit_jmpbuf != 0)
+                       && (frame->cs & 0x04);  /* CS is an LDT selector */
+        if (!_zone && _dos_active) _zone = "DOS";
         if (_zone) {
             serial_puts("[pf-ist] on ");
             serial_puts(_zone);
