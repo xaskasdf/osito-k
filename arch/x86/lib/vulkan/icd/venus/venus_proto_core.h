@@ -20,4 +20,17 @@
 #define VN_CMD_vkGetPhysicalDeviceQueueFamilyProperties 0x7FFFFFF5u
 #define VN_CMD_vkGetPhysicalDeviceMemoryProperties      0x7FFFFFF6u
 
+/* W3b.3 additions — device + memory + buffer opcodes.
+ * Same Mesa-25.0.0 caveat as W3b.2. */
+#define VN_CMD_vkCreateDevice                           0x7FFFFFF7u
+#define VN_CMD_vkDestroyDevice                          0x7FFFFFF8u
+#define VN_CMD_vkAllocateMemory                         0x7FFFFFF9u
+#define VN_CMD_vkFreeMemory                             0x7FFFFFFAu
+#define VN_CMD_vkMapMemory                              0x7FFFFFFBu
+#define VN_CMD_vkUnmapMemory                            0x7FFFFFFCu
+#define VN_CMD_vkCreateBuffer                           0x7FFFFFFDu
+#define VN_CMD_vkDestroyBuffer                          0x7FFFFFFEu
+#define VN_CMD_vkGetBufferMemoryRequirements            0x7FFFFFFFu
+#define VN_CMD_vkBindBufferMemory                       0x80000000u
+
 #endif
