@@ -466,8 +466,12 @@ static void proc_free(process_t *p)
      * remains intact after the process exits (even on crash). */
     extern void compositor_cleanup_process(uint32_t pid);
     extern void shm_cleanup_process(uint32_t pid);
+    extern void vg3d_cleanup_process(uint32_t pid);
     compositor_cleanup_process(p->pid);
     shm_cleanup_process(p->pid);
+    /* Release any GPU 3D contexts + resources owned by this process so
+     * backing pages aren't leaked. Must run while p->pid is still valid. */
+    vg3d_cleanup_process(p->pid);
 
     extern void kbd_flush(void);
     kbd_flush();
