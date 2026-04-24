@@ -85,3 +85,25 @@ venus_EnumeratePhysicalDevices(VkInstance instance,
     *pPhysicalDeviceCount = count;
     return VK_SUCCESS;
 }
+
+/* Hard-coded reasonable defaults. W3b's venus protocol will pull real
+ * values from the host. */
+VKAPI_ATTR void VKAPI_CALL
+venus_GetPhysicalDeviceProperties(VkPhysicalDevice physicalDevice,
+                                  VkPhysicalDeviceProperties *pProperties) {
+    (void)physicalDevice;
+    if (!pProperties) return;
+    memset(pProperties, 0, sizeof(*pProperties));
+    pProperties->apiVersion       = VK_API_VERSION_1_4;
+    pProperties->driverVersion    = VK_MAKE_VERSION(0, 3, 0);
+    pProperties->vendorID         = 0x1AF4;  /* Red Hat / virtio */
+    pProperties->deviceID         = 0x1050;  /* virtio-gpu */
+    pProperties->deviceType       = VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU;
+    /* deviceName: fixed string 'OsitoK venus virtio-gpu' (NUL-terminated). */
+    static const char name[] = "OsitoK venus virtio-gpu";
+    unsigned long i;
+    for (i = 0; i < sizeof(name) && i < VK_MAX_PHYSICAL_DEVICE_NAME_SIZE - 1; i++)
+        pProperties->deviceName[i] = name[i];
+    pProperties->deviceName[i] = '\0';
+    /* Limits and sparse properties zeroed — W3b fills them. */
+}
