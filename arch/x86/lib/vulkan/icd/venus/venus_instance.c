@@ -55,3 +55,33 @@ venus_DestroyInstance(VkInstance instance, const VkAllocationCallbacks *pAllocat
     }
     free(self);
 }
+
+/* Single-device model for W3a. The physical-device handle IS the instance
+ * pointer; loader dispatch follows `VK_LOADER_DATA` magic either way. */
+
+VKAPI_ATTR VkResult VKAPI_CALL
+venus_EnumeratePhysicalDevices(VkInstance instance,
+                               uint32_t *pPhysicalDeviceCount,
+                               VkPhysicalDevice *pPhysicalDevices) {
+    if (!instance || !pPhysicalDeviceCount) return VK_ERROR_INITIALIZATION_FAILED;
+    struct venus_instance *self = (struct venus_instance *)instance;
+
+    uint32_t count = (self->caps & VENUS_GPU_CAP_VENUS_READY) ? 1u : 0u;
+
+    if (!pPhysicalDevices) {
+        *pPhysicalDeviceCount = count;
+        return VK_SUCCESS;
+    }
+    if (*pPhysicalDeviceCount < count) {
+        *pPhysicalDeviceCount = count;
+        return VK_INCOMPLETE;
+    }
+    if (count > 0) {
+        /* Reuse the instance pointer as the physical-device handle.
+         * Dispatchable-object magic works either way because both structs
+         * begin with VK_LOADER_DATA. */
+        pPhysicalDevices[0] = (VkPhysicalDevice)self;
+    }
+    *pPhysicalDeviceCount = count;
+    return VK_SUCCESS;
+}
