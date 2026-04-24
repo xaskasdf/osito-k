@@ -59,6 +59,40 @@ static inline VkInstance osito_instance_to(struct osito_instance *s) {
     return (VkInstance)s;
 }
 
+/* W3b.2 — wrappers for VkPhysicalDevice / VkDevice so the loader can
+ * dispatch to the correct owning ICD (fixes the "first ICD wins"
+ * gotcha from W3a). Each wrapper stores the ICD-returned handle plus
+ * a pointer back to the ICD's state inside the owning instance.
+ *
+ * Handle lifetime: wrappers are leaked if the app destroys the
+ * owning VkInstance without destroying its devices / enumerated phys
+ * devices first. W3b.3 will track them on the instance; for W3b.2
+ * we document that restriction. */
+struct osito_phys_device {
+    VK_LOADER_DATA             loader_data;
+    struct osito_icd_inst     *owner;
+    VkPhysicalDevice           real;
+};
+
+struct osito_device {
+    VK_LOADER_DATA             loader_data;
+    struct osito_icd_inst     *owner;
+    VkDevice                   real;
+};
+
+static inline struct osito_phys_device *osito_phys_from(VkPhysicalDevice h) {
+    return (struct osito_phys_device *)h;
+}
+static inline VkPhysicalDevice osito_phys_to(struct osito_phys_device *s) {
+    return (VkPhysicalDevice)s;
+}
+static inline struct osito_device *osito_device_from(VkDevice h) {
+    return (struct osito_device *)h;
+}
+static inline VkDevice osito_device_to(struct osito_device *s) {
+    return (VkDevice)s;
+}
+
 /* From loader_dispatch.c. */
 PFN_vkVoidFunction osito_loader_get_instance_proc_addr(VkInstance, const char *);
 

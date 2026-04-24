@@ -30,7 +30,9 @@ vkEnumeratePhysicalDevices(VkInstance instance,
         return VK_SUCCESS;
     }
 
-    /* Second pass: actually collect handles, capped by app's buffer size. */
+    /* Second pass: actually collect handles, capped by app's buffer size.
+     * Each ICD-returned handle gets wrapped in an osito_phys_device so
+     * downstream trampolines can unwrap and dispatch to the owning ICD. */
     uint32_t cap = *pPhysicalDeviceCount;
     uint32_t written = 0;
     VkResult overall = VK_SUCCESS;
@@ -47,9 +49,25 @@ vkEnumeratePhysicalDevices(VkInstance instance,
         uint32_t want = per_icd_count[i];
         uint32_t room = cap - written;
         uint32_t ask = want < room ? want : room;
-        VkResult rc = enum_fn(ci->handle, &ask, &pPhysicalDevices[written]);
+
+        /* Use a small stack scratch for ICD handles, then wrap into
+         * the app's buffer. Keep the scratch under the Q2 stack
+         * guideline (≪ 200 KiB). 16 handles * 8 bytes = 128 B. */
+        VkPhysicalDevice scratch[16];
+        uint32_t pass = ask;
+        if (pass > 16) pass = 16;
+        VkResult rc = enum_fn(ci->handle, &pass, scratch);
         if (rc == VK_INCOMPLETE) overall = VK_INCOMPLETE;
-        written += ask;
+
+        for (uint32_t j = 0; j < pass && written < cap; j++) {
+            struct osito_phys_device *pw = malloc(sizeof(*pw));
+            if (!pw) { overall = VK_ERROR_OUT_OF_HOST_MEMORY; break; }
+            memset(pw, 0, sizeof(*pw));
+            set_loader_magic_value(pw);
+            pw->owner = ci;
+            pw->real  = scratch[j];
+            pPhysicalDevices[written++] = osito_phys_to(pw);
+        }
     }
 
     *pPhysicalDeviceCount = written;
