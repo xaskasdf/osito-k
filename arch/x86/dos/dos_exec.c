@@ -359,6 +359,33 @@ static inline uint64_t dos_nt_va_to_pa(const void *va)
 #define PTE_WRITABLE  (1ULL << 1)
 #endif
 #define PTE_USER      (1ULL << 2)
+#define PTE_ADDR_MASK 0x000FFFFFFFFFF000ULL
+#define DOS_NT_PHYS_TO_VIRT(p) ((uint64_t *)((uintptr_t)(p) + DOS_NT_KERNEL_VBASE))
+
+/* Walk all 4 levels of the page table for `va` in `cr3` and OR PTE_USER
+ * into each live entry. Needed because paging_map_page_in_cr3 creates
+ * intermediate PDPT/PD/PT entries with just PRESENT|WRITABLE. Ring-3
+ * access requires USER=1 at every level of the walk. */
+static void dos_nt_propagate_user(uint64_t cr3, uint64_t va)
+{
+    uint64_t *pml4 = DOS_NT_PHYS_TO_VIRT(cr3 & PTE_ADDR_MASK);
+    int i4 = (va >> 39) & 0x1FF;
+    if (!(pml4[i4] & PTE_PRESENT)) return;
+    pml4[i4] |= PTE_USER;
+    uint64_t *pdpt = DOS_NT_PHYS_TO_VIRT(pml4[i4] & PTE_ADDR_MASK);
+    int i3 = (va >> 30) & 0x1FF;
+    if (!(pdpt[i3] & PTE_PRESENT)) return;
+    pdpt[i3] |= PTE_USER;
+    uint64_t *pd = DOS_NT_PHYS_TO_VIRT(pdpt[i3] & PTE_ADDR_MASK);
+    int i2 = (va >> 21) & 0x1FF;
+    if (!(pd[i2] & PTE_PRESENT)) return;
+    pd[i2] |= PTE_USER;
+    if (pd[i2] & (1ULL << 7)) return;  /* 2 MB large page, no PT */
+    uint64_t *pt = DOS_NT_PHYS_TO_VIRT(pd[i2] & PTE_ADDR_MASK);
+    int i1 = (va >> 12) & 0x1FF;
+    if (!(pt[i1] & PTE_PRESENT)) return;
+    pt[i1] |= PTE_USER;
+}
 
 /* GDT slot reserved for the DOS LDT descriptor (2 slots, 16 bytes).
  * Slots 0-9 are claimed (null, kernel CS/DS, 64-bit CS/DS, CODE32, DATA32);
@@ -405,6 +432,7 @@ void dos_transfer_to_native(dos_vm_t *vm)
                 serial_puthex(off, 8); serial_puts("\n");
                 return;
             }
+            dos_nt_propagate_user(dos_cr3, off);
             mapped += 4096;
         }
         serial_puts("[DOS-NT] CR3=0x");    serial_puthex(dos_cr3, 16);
@@ -428,6 +456,7 @@ void dos_transfer_to_native(dos_vm_t *vm)
                 serial_puthex(va, 16); serial_puts("\n");
                 return;
             }
+            dos_nt_propagate_user(dos_cr3, va);
             vm_pages++;
         }
         serial_puts("[DOS-NT] vm struct mapped: ");
@@ -543,6 +572,44 @@ void dos_transfer_to_native(dos_vm_t *vm)
      * Also propagate emulated GPRs (EAX/EBX/ECX/EDX/ESI/EDI/EBP) so DOS4GW
      * starts with its expected register state instead of kernel leftovers. */
     uint64_t rflags = 0x202;  /* IF=1, bit 1 reserved-always-1 */
+    (void)rflags;
+
+    /* Debug: show page-table entries along the walk for CS:RIP target
+     * (linear = CS_base + EIP) to verify USER/PRESENT/WRITABLE. */
+    {
+        uint64_t cs_base = (uint32_t)vm->dpmi.ldt[cs64 >> 3].base_lo
+                         | ((uint32_t)vm->dpmi.ldt[cs64 >> 3].base_mid << 16)
+                         | ((uint32_t)vm->dpmi.ldt[cs64 >> 3].base_hi << 24);
+        uint64_t target_linear = cs_base + ip64;
+        serial_puts("[DOS-NT] target linear=0x");
+        serial_puthex(target_linear, 16); serial_puts("\n");
+        uint64_t *pml4 = DOS_NT_PHYS_TO_VIRT(cr3_new & PTE_ADDR_MASK);
+        int i4 = (target_linear >> 39) & 0x1FF;
+        serial_puts("[DOS-NT] PML4[");  serial_putdec(i4);
+        serial_puts("]=0x");             serial_puthex(pml4[i4], 16);
+        serial_puts("\n");
+        if (pml4[i4] & PTE_PRESENT) {
+            uint64_t *pdpt = DOS_NT_PHYS_TO_VIRT(pml4[i4] & PTE_ADDR_MASK);
+            int i3 = (target_linear >> 30) & 0x1FF;
+            serial_puts("[DOS-NT] PDPT["); serial_putdec(i3);
+            serial_puts("]=0x");           serial_puthex(pdpt[i3], 16);
+            serial_puts("\n");
+            if (pdpt[i3] & PTE_PRESENT) {
+                uint64_t *pd = DOS_NT_PHYS_TO_VIRT(pdpt[i3] & PTE_ADDR_MASK);
+                int i2 = (target_linear >> 21) & 0x1FF;
+                serial_puts("[DOS-NT] PD[");  serial_putdec(i2);
+                serial_puts("]=0x");          serial_puthex(pd[i2], 16);
+                serial_puts("\n");
+                if ((pd[i2] & PTE_PRESENT) && !(pd[i2] & (1ULL<<7))) {
+                    uint64_t *pt = DOS_NT_PHYS_TO_VIRT(pd[i2] & PTE_ADDR_MASK);
+                    int i1 = (target_linear >> 12) & 0x1FF;
+                    serial_puts("[DOS-NT] PT["); serial_putdec(i1);
+                    serial_puts("]=0x");         serial_puthex(pt[i1], 16);
+                    serial_puts("\n");
+                }
+            }
+        }
+    }
     uint64_t reax = cpu->eax, rebx = cpu->ebx, recx = cpu->ecx, redx = cpu->edx;
     uint64_t resi = cpu->esi, redi = cpu->edi, rebp = cpu->ebp;
 
