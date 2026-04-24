@@ -265,11 +265,13 @@ void dos_set_native_vm(dos_vm_t *vm)
 uint64_t *dos_native_exit_jmpbuf = 0;
 
 /* Called from the IDT [pf-ist] probe when a DOS native program faults.
- * Dumps the 16 bytes at CS:RIP linear address so the log shows what
- * opcode the CPU tried to decode. CR3 switched to kernel so vm->mem
- * identity map is reachable. */
-void dos_native_dump_rip(uint16_t cs, uint32_t rip)
+ * Dumps the 16 bytes at CS:RIP plus the top of the caller's stack so
+ * we can see what opcode faulted AND trace the CALL history. CR3 is
+ * switched to kernel so vm->mem's PA identity-map is reachable. */
+void dos_native_dump_rip(uint16_t cs, uint32_t rip, uint16_t ss_hint,
+                         uint64_t frame_rsp)
 {
+    (void)ss_hint; (void)frame_rsp;
     if (!g_native_dos_vm) return;
     extern uint64_t paging_get_kernel_cr3(void);
     uint64_t saved_cr3;
@@ -278,9 +280,10 @@ void dos_native_dump_rip(uint16_t cs, uint32_t rip)
     if (kcr3 && saved_cr3 != kcr3)
         __asm__ volatile ("mov %0, %%cr3" :: "r"(kcr3) : "memory");
 
+    dos_vm_t *vm = g_native_dos_vm;
     uint16_t idx = (cs >> 3) & 0x1FFF;
     if (idx < DPMI_MAX_DESCRIPTORS) {
-        dpmi_descriptor_t *d = &g_native_dos_vm->dpmi.ldt[idx];
+        dpmi_descriptor_t *d = &vm->dpmi.ldt[idx];
         uint32_t base = (uint32_t)d->base_lo
                       | ((uint32_t)d->base_mid << 16)
                       | ((uint32_t)d->base_hi  << 24);
@@ -289,11 +292,41 @@ void dos_native_dump_rip(uint16_t cs, uint32_t rip)
         serial_puthex(linear, 8);
         serial_puts(" bytes:");
         for (int i = 0; i < 16 &&
-             (linear + i) < g_native_dos_vm->total_mem_size; i++) {
+             (linear + i) < vm->total_mem_size; i++) {
             serial_puts(" ");
-            serial_puthex(g_native_dos_vm->mem[linear + i], 2);
+            serial_puthex(vm->mem[linear + i], 2);
         }
         serial_puts("\n");
+
+        /* Stack dump: the iret frame has the DOS SS:RSP where DOOM was
+         * pushing. Read up to 16 bytes from it to see the caller's
+         * return address pushed by CALL FAR. We can't access the iret
+         * frame from here without more plumbing, so use cpu8086's
+         * stored state as a fallback (pre-transfer cpu->esp). */
+        uint16_t ss_sel = vm->cpu->ss & ~3;
+        uint16_t ss_idx = (ss_sel >> 3) & 0x1FFF;
+        if (ss_idx < DPMI_MAX_DESCRIPTORS) {
+            dpmi_descriptor_t *sd = &vm->dpmi.ldt[ss_idx];
+            uint32_t ss_base = (uint32_t)sd->base_lo
+                             | ((uint32_t)sd->base_mid << 16)
+                             | ((uint32_t)sd->base_hi  << 24);
+            /* Use the iret-frame RSP (passed as frame_rsp) so we see
+             * the actual stack state at fault time, not the snapshot
+             * from before the native transfer. */
+            uint32_t rt_esp = (uint32_t)(frame_rsp & 0xFFFFFFFF);
+            uint64_t sp_linear = (uint64_t)ss_base + rt_esp;
+            serial_puts("[pf-ist] ss_base=0x");
+            serial_puthex(ss_base, 8);
+            serial_puts(" rt_esp=0x");
+            serial_puthex(rt_esp, 8);
+            serial_puts(" stack[0..15]:");
+            for (int i = 0; i < 16 &&
+                 (sp_linear + i) < vm->total_mem_size; i++) {
+                serial_puts(" ");
+                serial_puthex(vm->mem[sp_linear + i], 2);
+            }
+            serial_puts("\n");
+        }
     }
 
     if (kcr3 && saved_cr3 != kcr3)

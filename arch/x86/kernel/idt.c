@@ -535,11 +535,16 @@ void isr_handler(interrupt_frame_t *frame)
             serial_puts("\n");
 
             /* For DOS native faults with CS = LDT sel, delegate to the
-             * DOS layer to dump the instruction bytes (CR3 switched inside
-             * the helper to reach vm->mem in the kernel identity map). */
+             * DOS layer to dump the instruction bytes AND the caller's
+             * stack top so we can see who CALL-FAR'd into the bad RIP. */
             if (frame->cs & 0x04) {
-                extern void dos_native_dump_rip(uint16_t cs, uint32_t rip);
-                dos_native_dump_rip((uint16_t)frame->cs, (uint32_t)frame->rip);
+                extern void dos_native_dump_rip(uint16_t cs, uint32_t rip,
+                                                uint16_t ss_hint,
+                                                uint64_t frame_rsp);
+                dos_native_dump_rip((uint16_t)frame->cs,
+                                    (uint32_t)frame->rip,
+                                    (uint16_t)frame->ss,
+                                    frame->rsp);
             }
 
             /* If a DOS native program faulted (CS is its LDT selector,
