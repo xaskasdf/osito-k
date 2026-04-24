@@ -104,5 +104,49 @@ venus_icdGetInstanceProcAddr(VkInstance instance, const char *name) {
     if (strcmp(name, "vkCmdDraw") == 0)
         return (PFN_vkVoidFunction)venus_CmdDraw;
 
+    /* W3b.5 — WSI + surface + swapchain + queue + sync + present. */
+    if (strcmp(name, "vkCreateOsitokCompositorSurfaceKHR") == 0)
+        return (PFN_vkVoidFunction)venus_CreateOsitokCompositorSurfaceKHR;
+    if (strcmp(name, "vkDestroySurfaceKHR") == 0)
+        return (PFN_vkVoidFunction)venus_DestroySurfaceKHR;
+    if (strcmp(name, "vkQueueSubmit") == 0)
+        return (PFN_vkVoidFunction)venus_QueueSubmit;
+    if (strcmp(name, "vkQueueWaitIdle") == 0)
+        return (PFN_vkVoidFunction)venus_QueueWaitIdle;
+    if (strcmp(name, "vkDeviceWaitIdle") == 0)
+        return (PFN_vkVoidFunction)venus_DeviceWaitIdle;
+    if (strcmp(name, "vkCreateFence") == 0)
+        return (PFN_vkVoidFunction)venus_CreateFence;
+    if (strcmp(name, "vkDestroyFence") == 0)
+        return (PFN_vkVoidFunction)venus_DestroyFence;
+    if (strcmp(name, "vkResetFences") == 0)
+        return (PFN_vkVoidFunction)venus_ResetFences;
+    if (strcmp(name, "vkWaitForFences") == 0)
+        return (PFN_vkVoidFunction)venus_WaitForFences;
+    if (strcmp(name, "vkGetFenceStatus") == 0)
+        return (PFN_vkVoidFunction)venus_GetFenceStatus;
+    if (strcmp(name, "vkCreateSemaphore") == 0)
+        return (PFN_vkVoidFunction)venus_CreateSemaphore;
+    if (strcmp(name, "vkDestroySemaphore") == 0)
+        return (PFN_vkVoidFunction)venus_DestroySemaphore;
+    if (strcmp(name, "vkCreateSwapchainKHR") == 0)
+        return (PFN_vkVoidFunction)venus_CreateSwapchainKHR;
+    if (strcmp(name, "vkDestroySwapchainKHR") == 0)
+        return (PFN_vkVoidFunction)venus_DestroySwapchainKHR;
+    if (strcmp(name, "vkGetSwapchainImagesKHR") == 0)
+        return (PFN_vkVoidFunction)venus_GetSwapchainImagesKHR;
+    if (strcmp(name, "vkAcquireNextImageKHR") == 0)
+        return (PFN_vkVoidFunction)venus_AcquireNextImageKHR;
+    if (strcmp(name, "vkQueuePresentKHR") == 0)
+        return (PFN_vkVoidFunction)venus_QueuePresentKHR;
+    if (strcmp(name, "vkGetPhysicalDeviceSurfaceCapabilitiesKHR") == 0)
+        return (PFN_vkVoidFunction)venus_GetPhysicalDeviceSurfaceCapabilitiesKHR;
+    if (strcmp(name, "vkGetPhysicalDeviceSurfaceFormatsKHR") == 0)
+        return (PFN_vkVoidFunction)venus_GetPhysicalDeviceSurfaceFormatsKHR;
+    if (strcmp(name, "vkGetPhysicalDeviceSurfacePresentModesKHR") == 0)
+        return (PFN_vkVoidFunction)venus_GetPhysicalDeviceSurfacePresentModesKHR;
+    if (strcmp(name, "vkGetPhysicalDeviceSurfaceSupportKHR") == 0)
+        return (PFN_vkVoidFunction)venus_GetPhysicalDeviceSurfaceSupportKHR;
+
     return NULL;
 }
