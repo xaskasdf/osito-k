@@ -12,11 +12,15 @@
 #include "util_error.h"
 
 extern "C" void exit(int);
+extern "C" int  puts(const char *);
 
 namespace dxvk {
 
   [[noreturn]] void DxvkError::abort_ositok(const char *msg) {
-    (void)msg;
+    /* W5.1-fix: emit msg to serial before exiting so failed shader
+     * translation isn't a silent crash. Caller passes a fixed string
+     * "DXVK throw" today; future waves can pass actual error text. */
+    if (msg) puts(msg);
     exit(1);
     for (;;) { }  /* unreachable; placates [[noreturn]] under -O0 */
   }

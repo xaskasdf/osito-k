@@ -40,9 +40,9 @@
  * been hand-edited in W5.1 to expand to `DxvkError::abort_ositok(...)`
  * when `__OSITO_K__` is defined. Helper below. Noreturn so compilers
  * stop emitting dead code after it. */
-#if defined(__cplusplus)
-extern "C" void dxvk_throw_abort(const char *msg) __attribute__((noreturn));
-#endif
+/* dxvk_throw_abort declaration removed (W5.1-fix): never defined,
+ * never called. The actual scaffolding is dxvk::DxvkError::abort_ositok
+ * defined in osito_compat/util_error_ositok.cpp. */
 
 #ifdef __cplusplus
 #include <atomic>
