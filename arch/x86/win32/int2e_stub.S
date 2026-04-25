@@ -71,6 +71,18 @@ int2e_stub:
     movq 72(%rsp), %r10
     movq %r10, g_int2e_user_rbp(%rip)
 
+    /* Also stash ECX (=this for __thiscall), EDX, ESI, EDI for
+     * deep instrumentation of FArray::Realloc and similar engine
+     * methods. Stack offsets per the layout above. */
+    movq 104(%rsp), %r10            /* RCX */
+    movq %r10, g_int2e_user_rcx(%rip)
+    movq  96(%rsp), %r10            /* RDX */
+    movq %r10, g_int2e_user_rdx(%rip)
+    movq  88(%rsp), %r10            /* RSI */
+    movq %r10, g_int2e_user_rsi(%rip)
+    movq  80(%rsp), %r10            /* RDI */
+    movq %r10, g_int2e_user_rdi(%rip)
+
     /* Save RSP to per-depth stack before aligning and calling C dispatcher.
      * Cannot use RBP (kern_longjmp overwrites it) or a single global
      * (nested INT 0x2E from callback returns overwrites it). */

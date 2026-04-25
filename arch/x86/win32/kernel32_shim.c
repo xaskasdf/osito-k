@@ -392,6 +392,54 @@ PVOID WINAPI VirtualAlloc(PVOID lpAddress, SIZE_T dwSize,
             if (saved <= cur) break;
             cur = saved;
         }
+
+        /* Dump user-mode regs at INT 0x2E entry. ECX = `this` for any
+         * __thiscall method. If the bad NewSize is computed inside
+         * FArray::Realloc as Num*ElementSize, then this->Num and
+         * this->ElementSize live in the FArray struct that ECX points
+         * to. UE1 FArray is { void* Data; INT Num; INT Max; }, with
+         * ElementSize stored separately by the templated TArray<T>. */
+        extern uint32_t compat32_get_last_user_ecx(void);
+        extern uint32_t compat32_get_last_user_edx(void);
+        extern uint32_t compat32_get_last_user_esi(void);
+        extern uint32_t compat32_get_last_user_edi(void);
+        uint32_t ecx = compat32_get_last_user_ecx();
+        uint32_t edx = compat32_get_last_user_edx();
+        uint32_t esi = compat32_get_last_user_esi();
+        uint32_t edi = compat32_get_last_user_edi();
+        serial_puts("[VA]   user regs: ECX=0x"); serial_puthex(ecx, 8);
+        serial_puts(" EDX=0x"); serial_puthex(edx, 8);
+        serial_puts(" ESI=0x"); serial_puthex(esi, 8);
+        serial_puts(" EDI=0x"); serial_puthex(edi, 8);
+        serial_puts("\n");
+
+        /* If ECX (this) looks like a valid pointer in heap range,
+         * dump the first 32 bytes — that's enough to see Data/Num/Max
+         * and any extra TArray fields. */
+        if (ecx >= 0x100000 && ecx < 0x80000000) {
+            uint32_t *t = (uint32_t *)(uintptr_t)ecx;
+            serial_puts("[VA]   *ECX:");
+            for (int i = 0; i < 8; i++) {
+                serial_puts(" ["); serial_putdec((uint64_t)i);
+                serial_puts("]=0x"); serial_puthex(t[i], 8);
+            }
+            serial_puts("\n");
+        }
+
+        /* Dump user stack from RSP_user — first 16 dwords = 64 bytes.
+         * That's the args + saved EBP + ret + outer args. */
+        extern uint32_t compat32_get_last_stack_args(void);
+        uint32_t sa = compat32_get_last_stack_args();
+        if (sa >= 0x100000 && sa < 0xFFFE0000 && (sa & 3) == 0) {
+            uint32_t *s = (uint32_t *)(uintptr_t)sa;
+            serial_puts("[VA]   user stack@0x"); serial_puthex(sa, 8);
+            serial_puts(":");
+            for (int i = 0; i < 16; i++) {
+                if (i % 4 == 0) { serial_puts("\n[VA]    +"); serial_puthex((uint32_t)(i * 4), 2); serial_puts(":"); }
+                serial_puts(" 0x"); serial_puthex(s[i], 8);
+            }
+            serial_puts("\n");
+        }
     }
 
     /* Cap absurd sizes (> 256MB) to 256MB. Empirical sweet spot vs
