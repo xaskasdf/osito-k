@@ -389,6 +389,39 @@ PVOID WINAPI VirtualAlloc(PVOID lpAddress, SIZE_T dwSize,
                 serial_puts("]=0x"); serial_puthex(fp[a], 8);
             }
             serial_puts("\n");
+
+            /* Per disasm of Core.dll FArray::Realloc @ 0x1014A4A0:
+             *   1014a4bd: mov esi, ecx        (save this in ESI)
+             *   1014a4da: mov [ebp-0x18], esi (spill this to stack)
+             * So frame 1's saved `this` (FArray *) lives at [EBP-0x18].
+             * Dump it + this->{+0..+0x10} to see the FArray fields. */
+            if (f == 1 || f == 2) {
+                int32_t *neg = (int32_t *)(uintptr_t)cur;
+                /* fp[i] = ebp + i*4. neg[-i] = ebp - i*4. */
+                serial_puts("[VA]   frame ");
+                serial_putdec(f);
+                serial_puts(" locals:");
+                for (int n = 1; n <= 8; n++) {
+                    serial_puts(" [-"); serial_puthex((uint32_t)(n * 4), 2);
+                    serial_puts("]=0x"); serial_puthex((uint32_t)*(neg - n), 8);
+                }
+                serial_puts("\n");
+
+                /* If [EBP-0x18] looks like a heap pointer, dump *this[0..+0x14] */
+                uint32_t this_ptr = (uint32_t)*(neg - 6); /* -0x18 / 4 = -6 */
+                if (this_ptr >= 0x100000 && this_ptr < 0x80000000) {
+                    uint32_t *t = (uint32_t *)(uintptr_t)this_ptr;
+                    serial_puts("[VA]   frame ");
+                    serial_putdec(f);
+                    serial_puts(" *this@0x"); serial_puthex(this_ptr, 8);
+                    serial_puts(":");
+                    for (int i = 0; i < 6; i++) {
+                        serial_puts(" [+"); serial_puthex((uint32_t)(i * 4), 2);
+                        serial_puts("]=0x"); serial_puthex(t[i], 8);
+                    }
+                    serial_puts("\n");
+                }
+            }
             if (saved <= cur) break;
             cur = saved;
         }
