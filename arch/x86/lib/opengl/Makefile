@@ -170,6 +170,46 @@ CFLAGS_ZINK := \
   $(INCLUDES_ZINK) \
   -isystem $(GCC_INC)
 
+# W4.4 — CXXFLAGS_ZINK for gallium/drivers/zink/{zink_draw,zink_synchronization}.cpp.
+# Mirrors CFLAGS_ZINK but for C++17 + hosted libstdc++ (W4.2 pattern, used
+# also by DXVK W5.0). Mesa's zink C++ TUs need <atomic>, template
+# instantiations, and pull libstdc++ headers transparently via -isystem.
+# Same -Wno-* set as CFLAGS_ZINK plus C++ specific quiets.
+CXXFLAGS_ZINK := \
+  -std=gnu++17 -fno-exceptions -fno-rtti \
+  -ffreestanding -fno-stack-protector -mno-red-zone \
+  -Wall -Wextra -Wno-unused-parameter -Wno-unused-function \
+  -Wno-missing-field-initializers -Wno-pointer-arith \
+  -Wno-sign-compare -Wno-unused-variable -Wno-unused-but-set-variable \
+  -Wno-non-virtual-dtor -Wno-deprecated-declarations \
+  -Wno-class-memaccess -Wno-stringop-truncation \
+  -Wno-implicit-fallthrough -Wno-switch -Wno-empty-body \
+  -Wno-cast-function-type \
+  -O2 -fno-pic -fvisibility=hidden \
+  -D__OSITO_K__ -DZINK -DGALLIUM_HAVE_VK=1 \
+  -DHAVE_FUNC_ATTRIBUTE_PACKED \
+  -DHAVE_FUNC_ATTRIBUTE_FLATTEN \
+  -DHAVE_FUNC_ATTRIBUTE_FORMAT \
+  -DHAVE_FUNC_ATTRIBUTE_UNUSED \
+  -DHAVE_FUNC_ATTRIBUTE_NORETURN \
+  -DHAVE_FUNC_ATTRIBUTE_WARN_UNUSED_RESULT \
+  -include $(OPENGL_ROOT)/osito_compat/mesa_compat.h \
+  -I$(OPENGL_ROOT)/include \
+  -I$(OPENGL_ROOT)/osito_compat \
+  -I$(MESA_ROOT)/include \
+  -I$(MESA_ROOT)/src \
+  -I$(MESA_ROOT)/src/util \
+  -I$(MESA_ROOT)/src/gallium/include \
+  -I$(MESA_ROOT)/src/gallium/auxiliary \
+  -I$(MESA_ROOT)/src/gallium/drivers/zink \
+  -I$(MESA_ROOT)/src/gallium/auxiliary/nir \
+  -I$(MESA_ROOT)/src/vulkan/util \
+  -I$(MESA_ROOT)/src/compiler \
+  -I$(MESA_ROOT)/src/compiler/nir \
+  -I$(MESA_ROOT)/src/compiler/spirv \
+  -I$(OSITOK_ROOT)/arch/x86/lib/vulkan/include \
+  -isystem $(GCC_INC)
+
 # W4.2 — CXXFLAGS for compiler/glsl/.  Hosted libstdc++ (no -nostdinc).
 # Same flag pattern as DXVK's W5.0 build:
 #   -std=gnu++17 -fno-exceptions -fno-rtti
@@ -452,7 +492,14 @@ ZINK_C_SRCS := \
   mesa/src/gallium/drivers/zink/zink_resource.c \
   mesa/src/gallium/drivers/zink/zink_program.c
 
-ZINK_OBJS := $(patsubst %.c,$(BUILD_DIR)/%.o,$(ZINK_C_SRCS))
+# W4.4 — C++17 zink TUs. Built with hosted libstdc++ (CXXFLAGS_ZINK).
+ZINK_CXX_SRCS := \
+  mesa/src/gallium/drivers/zink/zink_draw.cpp \
+  mesa/src/gallium/drivers/zink/zink_synchronization.cpp
+
+ZINK_C_OBJS   := $(patsubst %.c,$(BUILD_DIR)/%.o,$(ZINK_C_SRCS))
+ZINK_CXX_OBJS := $(patsubst %.cpp,$(BUILD_DIR)/%.o,$(ZINK_CXX_SRCS))
+ZINK_OBJS     := $(ZINK_C_OBJS) $(ZINK_CXX_OBJS)
 
 .PHONY: all clean util gallium compiler zink
 all: $(OUT) $(OUT_GALLIUM) $(OUT_COMPILER) $(OUT_ZINK)
@@ -535,6 +582,12 @@ $(BUILD_DIR)/mesa/src/gallium/drivers/zink/%.o: $(MESA_ROOT)/src/gallium/drivers
 	@mkdir -p $(dir $@)
 	@echo "  CC    zink/$*"
 	@$(CC) $(CFLAGS_ZINK) -c -o $@ $<
+
+# W4.4 pattern rule for gallium/drivers/zink/*.cpp -> CXXFLAGS_ZINK.
+$(BUILD_DIR)/mesa/src/gallium/drivers/zink/%.o: $(MESA_ROOT)/src/gallium/drivers/zink/%.cpp | $(BUILD_DIR)
+	@mkdir -p $(dir $@)
+	@echo "  CXX   zink/$*"
+	@$(CXX) $(CXXFLAGS_ZINK) -c -o $@ $<
 
 $(BUILD_DIR):
 	@mkdir -p $(BUILD_DIR)
