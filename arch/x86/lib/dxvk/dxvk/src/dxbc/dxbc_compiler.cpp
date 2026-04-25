@@ -957,7 +957,7 @@ namespace dxvk {
         case DxbcResourceReturnType::Float: return DxbcScalarType::Float32;
         case DxbcResourceReturnType::Sint:  return DxbcScalarType::Sint32;
         case DxbcResourceReturnType::Uint:  return DxbcScalarType::Uint32;
-        default: throw DxvkError(str::format("DxbcCompiler: Invalid sampled type: ", xType));
+        default: dxvk::DxvkError::abort_ositok("DXVK throw");
       }
     }();
     
@@ -1291,7 +1291,7 @@ namespace dxvk {
         case DxbcPrimitive::Triangle:    return spv::ExecutionModeTriangles;
         case DxbcPrimitive::LineAdj:     return spv::ExecutionModeInputLinesAdjacency;
         case DxbcPrimitive::TriangleAdj: return spv::ExecutionModeInputTrianglesAdjacency;
-        default: throw DxvkError("DxbcCompiler: Unsupported primitive type");
+        default: dxvk::DxvkError::abort_ositok("DXVK throw");
       }
     }();
     
@@ -1314,7 +1314,7 @@ namespace dxvk {
         case DxbcPrimitiveTopology::PointList:     return std::make_pair(VK_PRIMITIVE_TOPOLOGY_POINT_LIST,    spv::ExecutionModeOutputPoints);
         case DxbcPrimitiveTopology::LineStrip:     return std::make_pair(VK_PRIMITIVE_TOPOLOGY_LINE_LIST,     spv::ExecutionModeOutputLineStrip);
         case DxbcPrimitiveTopology::TriangleStrip: return std::make_pair(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, spv::ExecutionModeOutputTriangleStrip);
-        default: throw DxvkError("DxbcCompiler: Unsupported primitive topology");
+        default: dxvk::DxvkError::abort_ositok("DXVK throw");
       }
     }();
     
@@ -1371,7 +1371,7 @@ namespace dxvk {
         case DxbcTessDomain::Isolines:  return std::make_pair(VK_PRIMITIVE_TOPOLOGY_LINE_LIST,     spv::ExecutionModeIsolines);
         case DxbcTessDomain::Triangles: return std::make_pair(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, spv::ExecutionModeTriangles);
         case DxbcTessDomain::Quads:     return std::make_pair(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, spv::ExecutionModeQuads);
-        default: throw DxvkError("Dxbc: Invalid tess domain");
+        default: dxvk::DxvkError::abort_ositok("DXVK throw");
       }
     }();
     
@@ -1387,7 +1387,7 @@ namespace dxvk {
         case DxbcTessPartitioning::Integer:   return spv::ExecutionModeSpacingEqual;
         case DxbcTessPartitioning::FractOdd:  return spv::ExecutionModeSpacingFractionalOdd;
         case DxbcTessPartitioning::FractEven: return spv::ExecutionModeSpacingFractionalEven;
-        default: throw DxvkError("Dxbc: Invalid tess partitioning");
+        default: dxvk::DxvkError::abort_ositok("DXVK throw");
       }
     }();
     
@@ -1413,7 +1413,7 @@ namespace dxvk {
         break;
       
       default:
-        throw DxvkError("Dxbc: Invalid tess output primitive");
+        dxvk::DxvkError::abort_ositok("DXVK throw");
     }
   }
   
@@ -1483,10 +1483,10 @@ namespace dxvk {
   
   void DxbcCompiler::emitDclImmediateConstantBuffer(const DxbcShaderInstruction& ins) {
     if (m_immConstBuf != 0)
-      throw DxvkError("DxbcCompiler: Immediate constant buffer already declared");
+      dxvk::DxvkError::abort_ositok("DXVK throw");
     
     if ((ins.customDataSize & 0x3) != 0)
-      throw DxvkError("DxbcCompiler: Immediate constant buffer size not a multiple of four DWORDs");
+      dxvk::DxvkError::abort_ositok("DXVK throw");
     
     if (ins.customDataSize <= Icb_MaxBakedDwords) {
       this->emitDclImmediateConstantBufferBaked(
@@ -2917,7 +2917,7 @@ namespace dxvk {
             resultId = m_module.opImageRead(resultTypeId,
               bufferId, elementIndexAdjusted, imageOperands);
           } else {
-            throw DxvkError("DxbcCompiler: Invalid operand type for strucured/raw load");
+            dxvk::DxvkError::abort_ositok("DXVK throw");
           }
 
           // Only read sparse feedback once. This may be somewhat inaccurate
@@ -3126,7 +3126,7 @@ namespace dxvk {
               4, srcVectorIds.data()),
             imageOperands);
         } else {
-          throw DxvkError("DxbcCompiler: Invalid operand type for strucured/raw store");
+          dxvk::DxvkError::abort_ositok("DXVK throw");
         }
 
         writeMask &= writeMask - 1u;
@@ -4182,7 +4182,7 @@ namespace dxvk {
     if (m_controlFlowBlocks.size() == 0
      || m_controlFlowBlocks.back().type != DxbcCfgBlockType::If
      || m_controlFlowBlocks.back().b_if.labelElse != 0)
-      throw DxvkError("DxbcCompiler: 'Else' without 'If' found");
+      dxvk::DxvkError::abort_ositok("DXVK throw");
     
     // Set the 'Else' flag so that we do
     // not insert a dummy block on 'EndIf'
@@ -4199,7 +4199,7 @@ namespace dxvk {
   void DxbcCompiler::emitControlFlowEndIf(const DxbcShaderInstruction& ins) {
     if (m_controlFlowBlocks.size() == 0
      || m_controlFlowBlocks.back().type != DxbcCfgBlockType::If)
-      throw DxvkError("DxbcCompiler: 'EndIf' without 'If' found");
+      dxvk::DxvkError::abort_ositok("DXVK throw");
     
     // Remove the block from the stack, it's closed
     DxbcCfgBlock block = m_controlFlowBlocks.back();
@@ -4253,11 +4253,11 @@ namespace dxvk {
   void DxbcCompiler::emitControlFlowCase(const DxbcShaderInstruction& ins) {
     if (m_controlFlowBlocks.size() == 0
      || m_controlFlowBlocks.back().type != DxbcCfgBlockType::Switch)
-      throw DxvkError("DxbcCompiler: 'Case' without 'Switch' found");
+      dxvk::DxvkError::abort_ositok("DXVK throw");
     
     // The source operand must be a 32-bit immediate.
     if (ins.src[0].type != DxbcOperandType::Imm32)
-      throw DxvkError("DxbcCompiler: Invalid operand type for 'Case'");
+      dxvk::DxvkError::abort_ositok("DXVK throw");
 
     // Use the last label allocated for 'case'.
     DxbcCfgBlockSwitch* block = &m_controlFlowBlocks.back().b_switch;
@@ -4280,7 +4280,7 @@ namespace dxvk {
   void DxbcCompiler::emitControlFlowDefault(const DxbcShaderInstruction& ins) {
     if (m_controlFlowBlocks.size() == 0
      || m_controlFlowBlocks.back().type != DxbcCfgBlockType::Switch)
-      throw DxvkError("DxbcCompiler: 'Default' without 'Switch' found");
+      dxvk::DxvkError::abort_ositok("DXVK throw");
     
     DxbcCfgBlockSwitch* block = &m_controlFlowBlocks.back().b_switch;
 
@@ -4299,7 +4299,7 @@ namespace dxvk {
   void DxbcCompiler::emitControlFlowEndSwitch(const DxbcShaderInstruction& ins) {
     if (m_controlFlowBlocks.size() == 0
      || m_controlFlowBlocks.back().type != DxbcCfgBlockType::Switch)
-      throw DxvkError("DxbcCompiler: 'EndSwitch' without 'Switch' found");
+      dxvk::DxvkError::abort_ositok("DXVK throw");
     
     // Remove the block from the stack, it's closed
     DxbcCfgBlock block = m_controlFlowBlocks.back();
@@ -4371,7 +4371,7 @@ namespace dxvk {
   void DxbcCompiler::emitControlFlowEndLoop(const DxbcShaderInstruction& ins) {
     if (m_controlFlowBlocks.size() == 0
      || m_controlFlowBlocks.back().type != DxbcCfgBlockType::Loop)
-      throw DxvkError("DxbcCompiler: 'EndLoop' without 'Loop' found");
+      dxvk::DxvkError::abort_ositok("DXVK throw");
     
     // Remove the block from the stack, it's closed
     const DxbcCfgBlock block = m_controlFlowBlocks.back();
@@ -4395,7 +4395,7 @@ namespace dxvk {
       : cfgFindBlock({ DxbcCfgBlockType::Loop });
     
     if (cfgBlock == nullptr)
-      throw DxvkError("DxbcCompiler: 'Break' or 'Continue' outside 'Loop' or 'Switch' found");
+      dxvk::DxvkError::abort_ositok("DXVK throw");
     
     if (cfgBlock->type == DxbcCfgBlockType::Loop) {
       m_module.opBranch(isBreak
@@ -4425,7 +4425,7 @@ namespace dxvk {
       : cfgFindBlock({ DxbcCfgBlockType::Loop });
     
     if (cfgBlock == nullptr)
-      throw DxvkError("DxbcCompiler: 'Breakc' or 'Continuec' outside 'Loop' or 'Switch' found");
+      dxvk::DxvkError::abort_ositok("DXVK throw");
     
     // Perform zero test on the first component of the condition
     const DxbcRegisterValue condition = emitRegisterLoad(
@@ -4777,7 +4777,7 @@ namespace dxvk {
       case DxbcScalarType::Float32: result.id = m_module.constf32(0.0f); break;
       case DxbcScalarType::Uint32:  result.id = m_module.constu32(0u); break;
       case DxbcScalarType::Sint32:  result.id = m_module.consti32(0); break;
-      default: throw DxvkError("DxbcCompiler: Invalid scalar type");
+      default: dxvk::DxvkError::abort_ositok("DXVK throw");
     }
 
     return emitBuildVector(result, type.ccount);
@@ -5281,7 +5281,7 @@ namespace dxvk {
         indices.size(), indices.data());
       return result;
     } else {
-      throw DxvkError("DxbcCompiler: Immediate constant buffer not defined");
+      dxvk::DxvkError::abort_ositok("DXVK throw");
     }
   }
   
@@ -5403,9 +5403,7 @@ namespace dxvk {
           m_ps.builtinInnerCoverageId };
         
       default:
-        throw DxvkError(str::format(
-          "DxbcCompiler: Unhandled operand type: ",
-          operand.type));
+        dxvk::DxvkError::abort_ositok("DXVK throw");
     }
   }
   
@@ -5441,14 +5439,14 @@ namespace dxvk {
         
         case DxbcResourceType::Typed: {
           if (isTgsm)
-            throw DxvkError("DxbcCompiler: TGSM cannot be typed");
+            dxvk::DxvkError::abort_ositok("DXVK throw");
           
           return emitLoadTexCoord(address,
             m_uavs.at(registerId).imageInfo);
         }
         
         default:
-          throw DxvkError("DxbcCompiler: Unhandled resource type");
+          dxvk::DxvkError::abort_ositok("DXVK throw");
       }
     }();
     
@@ -5869,7 +5867,7 @@ namespace dxvk {
         
       } else {
         // Something went horribly wrong in the decoder or the shader is broken
-        throw DxvkError("DxbcCompiler: Invalid component count for immediate operand");
+        dxvk::DxvkError::abort_ositok("DXVK throw");
       }
       
       // Cast constants to the requested type
@@ -5961,7 +5959,7 @@ namespace dxvk {
         switch (m_programInfo.type()) {
           case DxbcProgramType::VertexShader:   return emitVsSystemValueLoad(map.sv, map.regMask);
           case DxbcProgramType::PixelShader:    return emitPsSystemValueLoad(map.sv, map.regMask);
-          default: throw DxvkError(str::format("DxbcCompiler: Unexpected stage: ", m_programInfo.type()));
+          default: dxvk::DxvkError::abort_ositok("DXVK throw");
         }
       }();
       
@@ -6019,7 +6017,7 @@ namespace dxvk {
         const DxbcRegisterValue value = [&] {
           switch (m_programInfo.type()) {
             case DxbcProgramType::GeometryShader: return emitGsSystemValueLoad(map.sv, map.regMask, v);
-            default: throw DxvkError(str::format("DxbcCompiler: Unexpected stage: ", m_programInfo.type()));
+            default: dxvk::DxvkError::abort_ositok("DXVK throw");
           }
         }();
         
@@ -6244,8 +6242,7 @@ namespace dxvk {
       } break;
       
       default:
-        throw DxvkError(str::format(
-          "DxbcCompiler: Unhandled VS SV input: ", sv));
+        dxvk::DxvkError::abort_ositok("DXVK throw");
     }
   }
   
@@ -6277,8 +6274,7 @@ namespace dxvk {
       } break;
       
       default:
-        throw DxvkError(str::format(
-          "DxbcCompiler: Unhandled GS SV input: ", sv));
+        dxvk::DxvkError::abort_ositok("DXVK throw");
     }
   }
   
@@ -6416,8 +6412,7 @@ namespace dxvk {
       } break;
       
       default:
-        throw DxvkError(str::format(
-          "DxbcCompiler: Unhandled PS SV input: ", sv));
+        dxvk::DxvkError::abort_ositok("DXVK throw");
     }
   }
   
@@ -7694,7 +7689,7 @@ namespace dxvk {
       } break;
         
       default:
-        throw DxvkError(str::format("DxbcCompiler: Invalid operand type for buffer: ", reg.type));
+        dxvk::DxvkError::abort_ositok("DXVK throw");
     }
   }
   
@@ -7706,7 +7701,7 @@ namespace dxvk {
       case spv::Dim2D:      return 2 + imageType.array;
       case spv::Dim3D:      return 3 + imageType.array;
       case spv::DimCube:    return 2 + imageType.array;
-      default: throw DxvkError("DxbcCompiler: getTexLayerDim: Unsupported image dimension");
+      default: dxvk::DxvkError::abort_ositok("DXVK throw");
     }
   }
   
@@ -7718,7 +7713,7 @@ namespace dxvk {
       case spv::Dim2D:      return 2;
       case spv::Dim3D:      return 3;
       case spv::DimCube:    return 3;
-      default: throw DxvkError("DxbcCompiler: getTexLayerDim: Unsupported image dimension");
+      default: dxvk::DxvkError::abort_ositok("DXVK throw");
     }
   }
   
@@ -7855,7 +7850,7 @@ namespace dxvk {
       case DxbcResourceDim::Texture3D:      return { spv::Dim3D,     0, 0, isUav ? 2u : 1u, VK_IMAGE_VIEW_TYPE_3D         };
       case DxbcResourceDim::TextureCube:    return { spv::DimCube,   0, 0, isUav ? 2u : 1u, VK_IMAGE_VIEW_TYPE_CUBE       };
       case DxbcResourceDim::TextureCubeArr: return { spv::DimCube,   1, 0, isUav ? 2u : 1u, VK_IMAGE_VIEW_TYPE_CUBE_ARRAY };
-      default: throw DxvkError(str::format("DxbcCompiler: Unsupported resource type: ", resourceType));
+      default: dxvk::DxvkError::abort_ositok("DXVK throw");
     }
   }
   
@@ -7865,7 +7860,7 @@ namespace dxvk {
       case DxbcScalarType::Float32: return spv::ImageFormatR32f;
       case DxbcScalarType::Sint32:  return spv::ImageFormatR32i;
       case DxbcScalarType::Uint32:  return spv::ImageFormatR32ui;
-      default: throw DxvkError("DxbcCompiler: Unhandled scalar resource type");
+      default: dxvk::DxvkError::abort_ositok("DXVK throw");
     }
   }
   
@@ -7959,7 +7954,7 @@ namespace dxvk {
       case DxbcScalarType::Bool:    return m_module.defBoolType();
     }
 
-    throw DxvkError("DxbcCompiler: Invalid scalar type");
+    dxvk::DxvkError::abort_ositok("DXVK throw");
   }
   
   

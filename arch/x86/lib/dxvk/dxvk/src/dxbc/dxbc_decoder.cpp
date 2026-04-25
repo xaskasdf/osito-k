@@ -4,35 +4,35 @@ namespace dxvk {
   
   const uint32_t* DxbcCodeSlice::ptrAt(uint32_t id) const {
     if (m_ptr + id >= m_end)
-      throw DxvkError("DxbcCodeSlice: End of stream");
+      dxvk::DxvkError::abort_ositok("DXVK throw");
     return m_ptr + id;
   }
   
   
   uint32_t DxbcCodeSlice::at(uint32_t id) const {
     if (m_ptr + id >= m_end)
-      throw DxvkError("DxbcCodeSlice: End of stream");
+      dxvk::DxvkError::abort_ositok("DXVK throw");
     return m_ptr[id];
   }
   
   
   uint32_t DxbcCodeSlice::read() {
     if (m_ptr >= m_end)
-      throw DxvkError("DxbcCodeSlice: End of stream");
+      dxvk::DxvkError::abort_ositok("DXVK throw");
     return *(m_ptr++);
   }
   
   
   DxbcCodeSlice DxbcCodeSlice::take(uint32_t n) const {
     if (m_ptr + n > m_end)
-      throw DxvkError("DxbcCodeSlice: End of stream");
+      dxvk::DxvkError::abort_ositok("DXVK throw");
     return DxbcCodeSlice(m_ptr, m_ptr + n);
   }
   
   
   DxbcCodeSlice DxbcCodeSlice::skip(uint32_t n) const {
     if (m_ptr + n > m_end)
-      throw DxvkError("DxbcCodeSlice: End of stream");
+      dxvk::DxvkError::abort_ositok("DXVK throw");
     return DxbcCodeSlice(m_ptr + n, m_end);
   }
   
@@ -353,7 +353,7 @@ namespace dxvk {
       } break;
       
       default:
-        throw DxvkError("DxbcDecodeContext: Invalid operand format");
+        dxvk::DxvkError::abort_ositok("DXVK throw");
     }
   }
   

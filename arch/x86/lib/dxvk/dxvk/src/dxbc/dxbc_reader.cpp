@@ -24,7 +24,7 @@ namespace dxvk {
   
   void DxbcReader::read(void* dst, size_t n) {
     if (m_pos + n > m_size)
-      throw DxvkError("DxbcReader::read: Unexpected end of file");
+      dxvk::DxvkError::abort_ositok("DXVK throw");
     std::memcpy(dst, m_data + m_pos, n);
     m_pos += n;
   }
@@ -32,21 +32,21 @@ namespace dxvk {
   
   void DxbcReader::skip(size_t n) {
     if (m_pos + n > m_size)
-      throw DxvkError("DxbcReader::skip: Unexpected end of file");
+      dxvk::DxvkError::abort_ositok("DXVK throw");
     m_pos += n;
   }
   
   
   DxbcReader DxbcReader::clone(size_t pos) const {
     if (pos > m_size)
-      throw DxvkError("DxbcReader::clone: Invalid offset");
+      dxvk::DxvkError::abort_ositok("DXVK throw");
     return DxbcReader(m_data + pos, m_size - pos);
   }
   
   
   DxbcReader DxbcReader::resize(size_t size) const {
     if (size > m_size)
-      throw DxvkError("DxbcReader::resize: Invalid size");
+      dxvk::DxvkError::abort_ositok("DXVK throw");
     return DxbcReader(m_data, size, m_pos);
   }
   

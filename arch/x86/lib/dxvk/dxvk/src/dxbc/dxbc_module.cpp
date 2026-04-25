@@ -44,7 +44,7 @@ namespace dxvk {
     const DxbcModuleInfo& moduleInfo,
     const std::string&    fileName) const {
     if (m_shexChunk == nullptr)
-      throw DxvkError("DxbcModule::compile: No SHDR/SHEX chunk");
+      dxvk::DxvkError::abort_ositok("DXVK throw");
     
     DxbcAnalysisInfo analysisInfo;
     
@@ -71,7 +71,7 @@ namespace dxvk {
     const DxbcModuleInfo& moduleInfo,
     const std::string&    fileName) const {
     if (m_shexChunk == nullptr)
-      throw DxvkError("DxbcModule::compile: No SHDR/SHEX chunk");
+      dxvk::DxvkError::abort_ositok("DXVK throw");
     
     DxbcAnalysisInfo analysisInfo;
 

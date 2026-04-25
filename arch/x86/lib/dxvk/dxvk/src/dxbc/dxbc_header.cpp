@@ -7,7 +7,7 @@ namespace dxvk {
     DxbcTag fourcc = reader.readTag();
     
     if (fourcc != "DXBC")
-      throw DxvkError("DxbcHeader::DxbcHeader: Invalid fourcc, expected 'DXBC'");
+      dxvk::DxvkError::abort_ositok("DXVK throw");
     
     // Stuff we don't actually need to store
     reader.skip(4 * sizeof(uint32_t)); // Check sum

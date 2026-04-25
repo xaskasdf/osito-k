@@ -12,7 +12,7 @@ namespace dxvk {
       case DxbcProgramType::ComputeShader  : return VK_SHADER_STAGE_COMPUTE_BIT;
     }
     
-    throw DxvkError("DxbcProgramInfo::shaderStage: Unsupported program type");
+    dxvk::DxvkError::abort_ositok("DXVK throw");
   }
   
   
@@ -26,7 +26,7 @@ namespace dxvk {
       case DxbcProgramType::ComputeShader  : return spv::ExecutionModelGLCompute;
     }
     
-    throw DxvkError("DxbcProgramInfo::executionModel: Unsupported program type");
+    dxvk::DxvkError::abort_ositok("DXVK throw");
   }
   
 }
