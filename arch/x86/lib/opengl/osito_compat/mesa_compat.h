@@ -306,6 +306,32 @@ static inline char *dirname_compat(char *path) {
 #define basename(p) basename_compat(p)
 #define dirname(p)  dirname_compat(p)
 
+/* W4.4 — dlfcn.h stubs.  Mesa zink_screen.c has a setup_renderdoc()
+ * helper gated by ZINK_RENDERDOC=... env var; without that env var the
+ * function returns early before calling dlopen.  Provide RTLD_* macros
+ * and dlopen/dlsym stubs so the file builds.  Calls return NULL because
+ * we never reach this code path on OsitoK (getenv() always NULL). */
+#define RTLD_LAZY   0x1
+#define RTLD_NOW    0x2
+#define RTLD_LOCAL  0x4
+#define RTLD_GLOBAL 0x8
+#define RTLD_NOLOAD 0x10
+static inline void *dlopen(const char *file, int flag) { (void)file; (void)flag; return (void *)0; }
+static inline void *dlsym(void *handle, const char *name) { (void)handle; (void)name; return (void *)0; }
+static inline int   dlclose(void *handle) { (void)handle; return 0; }
+static inline char *dlerror(void) { return (char *)0; }
+
+/* W4.4 — sscanf / vasprintf are referenced by zink_screen.c (gated
+ * behind ZINK_RENDERDOC and the debug marker callback respectively).
+ * Stubs return -1 to mimic "no-match" / "format error". */
+typedef __builtin_va_list __mesa_va_list;
+static inline int sscanf(const char *str, const char *fmt, ...) {
+    (void)str; (void)fmt; return -1;
+}
+static inline int vasprintf(char **strp, const char *fmt, __mesa_va_list ap) {
+    (void)fmt; (void)ap; if (strp) *strp = (char *)0; return -1;
+}
+
 /* mmap stubs — Mesa shader cache uses mmap on Linux for file-backed
  * pages. On OsitoK we have no shader cache (no fs persistence beyond
  * the read-only ROM), so make every mmap fail and the caller will

@@ -490,7 +490,8 @@ ZINK_C_SRCS := \
   mesa/src/gallium/drivers/zink/zink_blit.c \
   mesa/src/gallium/drivers/zink/zink_clear.c \
   mesa/src/gallium/drivers/zink/zink_resource.c \
-  mesa/src/gallium/drivers/zink/zink_program.c
+  mesa/src/gallium/drivers/zink/zink_program.c \
+  mesa/src/gallium/drivers/zink/zink_screen.c
 
 # W4.4 — C++17 zink TUs. Built with hosted libstdc++ (CXXFLAGS_ZINK).
 ZINK_CXX_SRCS := \
