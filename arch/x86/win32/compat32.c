@@ -1259,12 +1259,13 @@ void compat32_callback(uint32_t func_addr)
 
     /* longjmp returned here — 32-bit function is done. */
 
-    /* Unmask APIC timer */
-    {
-        extern volatile uint32_t *idt_get_apic_base(void);
-        volatile uint32_t *apic = idt_get_apic_base();
-        if (apic) apic[0x320/4] &= ~0x10000;  /* LVT_TIMER &= ~MASKED */
-    }
+    /* DON'T unmask the APIC timer here. compat32_enter masked it for
+     * the entire UT99 lifetime (commit 0311d5f); the per-callback
+     * mask added in commit 6702735 was originally paired with this
+     * unmask, but with the lifetime mask in place, unmasking here
+     * re-exposes the exact race that lifetime mask was meant to
+     * close: any subsequent UT99 user-mode code that gets preempted
+     * onto a low-half stack would corrupt PID 1's saved frame. */
 
     g_teb32.ExceptionList = saved_seh;  /* Restore SEH chain */
     callback_depth--;

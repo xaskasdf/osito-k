@@ -322,22 +322,21 @@ PVOID WINAPI VirtualAlloc(PVOID lpAddress, SIZE_T dwSize,
         serial_puts("\n");
     }
 
-    /* Cap absurd sizes (> 256MB) to 16MB — corrupted TArray metadata.
-     * The engine's FArray::Realloc calls VirtualAlloc with a garbage Max
-     * (~3.2GB from corrupted TArray). Rather than failing (which triggers
-     * appError + shutdown NULL-CALL loop), give it a 16MB buffer.
-     * The engine writes far less than 3.2GB — the large Max is metadata
-     * corruption, not a real requirement. 16MB is enough for any
-     * reasonable array operation during Init(). */
+    /* Cap absurd sizes (> 256MB) to 256MB. Returning NULL caused UT99
+     * to NULL-call-loop because its FArray::Realloc doesn't check the
+     * return value (or has a separate code path for failure that we
+     * don't implement). 256MB is the sweet spot — large enough to
+     * survive the bogus 2GB-class memcpy that follows for a few
+     * seconds before UT99 moves on. */
     if (dwSize > 0x10000000ULL) { /* > 256MB */
         static int cap_log = 0;
         if (cap_log < 5) {
             serial_puts("[VA] Capped: 0x");
             serial_puthex(dwSize, 8);
-            serial_puts(" -> 16MB\n");
+            serial_puts(" -> 256MB\n");
             cap_log++;
         }
-        dwSize = 0x1000000; /* 16MB */
+        dwSize = 0x10000000; /* 256MB */
     }
 
     PVOID base = lpAddress;
