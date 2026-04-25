@@ -333,6 +333,14 @@ uint8_t ist1_stack[IST1_STACK_SIZE] __attribute__((aligned(16)));
 #define IST2_STACK_SIZE 32768
 uint8_t ist2_stack[IST2_STACK_SIZE] __attribute__((aligned(16)));
 
+/* IST3 stack for #PF / #UD / #GP — 32KB.
+ * Dedicated to fault handlers so they DON'T share IST1 with INT 0x2E.
+ * Sharing IST1 caused the kernel-#PF inside isr_handler crash: nested
+ * INT 0x2E entries lower IST1, leaving a #PF that fires later to load
+ * a corrupt RSP from the lowered IST1 → garbage RBP → kernel deref. */
+#define IST3_STACK_SIZE 32768
+uint8_t ist3_stack[IST3_STACK_SIZE] __attribute__((aligned(16)));
+
 /*
  * Install TSS: write descriptor to GDT index 10-11 (selector 0x50),
  * configure IST1, and load TR.
@@ -347,6 +355,7 @@ static void tss_init(void)
     memset(&kernel_tss, 0, sizeof(kernel_tss));
     kernel_tss.ist1 = (uint64_t)(ist1_stack + IST1_STACK_SIZE);
     kernel_tss.ist2 = (uint64_t)(ist2_stack + IST2_STACK_SIZE);
+    kernel_tss.ist3 = (uint64_t)(ist3_stack + IST3_STACK_SIZE);
     kernel_tss.iopb_offset = sizeof(struct tss64);
     tss_ist1_ptr = &kernel_tss.ist1;
     tss_ist2_ptr = &kernel_tss.ist2;
@@ -2217,9 +2226,11 @@ void __initk idt_init(void)
      * either halt (#UD) or return quickly (#PF null-page, #DB). */
     idt[1].ist  = 2;  /* #DB — IST2 (TF single-step + null-page tracking) */
     idt[3].ist  = 2;  /* #BP — IST2 (avoids IST1 collision with INT 0x2E) */
-    idt[6].ist  = 1;  /* #UD — invalid opcode (corrupted function pointer) */
-    idt[13].ist = 1;  /* #GP — general protection */
-    idt[14].ist = 1;  /* #PF — page fault (null-page write handling) */
+    idt[6].ist  = 3;  /* #UD — IST3 (decoupled from INT 0x2E IST1 drift) */
+    idt[13].ist = 3;  /* #GP — IST3 */
+    idt[14].ist = 3;  /* #PF — IST3 (was IST1 — caused garbage-RBP crash
+                       * when nested INT 0x2E lowered IST1 then a #PF
+                       * fired and re-loaded RSP from the stale value) */
     /* idt[32].ist intentionally 0: timer uses current process stack so
      * kernel_rsp is unique per-process → context switch works correctly.
      * compat32 ring-0 RSP is always a valid 64-bit kernel address, safe. */
