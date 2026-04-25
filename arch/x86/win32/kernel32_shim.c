@@ -371,6 +371,27 @@ PVOID WINAPI VirtualAlloc(PVOID lpAddress, SIZE_T dwSize,
             if (saved_ebp <= cur) break;  /* not strictly increasing → stop */
             cur = saved_ebp;
         }
+
+        /* Dump the args at each frame's [EBP+8..EBP+24] to catch the
+         * actual count/element_size/tag passed to FArray::Realloc.
+         * FArray::Realloc(void*, INT count, INT element_size, const char* tag).
+         * The first non-wrapper frame above us SHOULD have these args. */
+        cur = ebp;
+        for (int f = 0; f < 4; f++) {
+            if (cur < 0x100000 || cur >= 0xFFFE0000 || (cur & 3)) break;
+            uint32_t *fp = (uint32_t *)(uintptr_t)cur;
+            uint32_t saved = fp[0];
+            serial_puts("[VA]   frame ");
+            serial_putdec(f);
+            serial_puts(" args:");
+            for (int a = 2; a <= 6; a++) {
+                serial_puts(" [+"); serial_puthex((uint32_t)(a * 4), 2);
+                serial_puts("]=0x"); serial_puthex(fp[a], 8);
+            }
+            serial_puts("\n");
+            if (saved <= cur) break;
+            cur = saved;
+        }
     }
 
     /* Cap absurd sizes (> 256MB) to 256MB. Empirical sweet spot vs
