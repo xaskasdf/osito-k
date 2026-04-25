@@ -3,12 +3,32 @@
 
 /* Force-included shim that papers over the gap between Mesa's
  * Linux/glibc expectations and OsitoK's freestanding environment.
- * Edited as we add more Mesa subdirs. */
+ * Edited as we add more Mesa subdirs.
+ *
+ * In W4.2 we extended scope to compile C++ files (compiler/glsl/).
+ * Those compile with the hosted gcc:12 libstdc++ (no -nostdinc),
+ * which means glibc <stdint.h>, <time.h>, etc. are visible. We
+ * gate the OsitoK qjs-libc-only bits with __cplusplus checks so
+ * the same header is force-included into both C and C++ TUs. */
 
-#include <stdint.h>
-#include <stddef.h>
-#include <time.h>   /* OsitoK libc — provides time_t and struct tm */
+#ifndef __cplusplus
+#  include <stdint.h>
+#  include <stddef.h>
+#  include <time.h>   /* OsitoK libc — provides time_t and struct tm */
+#else
+   /* C++ side: pull <ctime> via libstdc++ (NOT mesa's src/c11/time.h
+    * which is a polyfill that itself recursively #includes <time.h>).
+    * <ctime> brings in glibc time.h which defines struct timespec
+    * + time_t. We also pull <pthread.h> early so mesa's c11/threads.h
+    * sees PTHREAD_ONCE_INIT, pthread_t, etc. (HAVE_PTHREAD branch). */
+#  include <cstdint>
+#  include <cstddef>
+#  include <ctime>
+#  include <sched.h>     /* cpu_set_t (used by glibc pthread.h) */
+#  include <pthread.h>
+#endif
 
+#ifndef __cplusplus
 /* Tell Mesa's src/c11/time.h not to redefine struct timespec — we'll
  * define it once below from libc primitives. */
 #define HAVE_STRUCT_TIMESPEC 1
@@ -17,9 +37,17 @@
 #define _STRUCT_TIMESPEC_DEFINED
 struct timespec { time_t tv_sec; long tv_nsec; };
 #endif
+#else
+/* glibc time.h already gave us struct timespec */
+#define HAVE_STRUCT_TIMESPEC 1
+#endif
 
 /* errno comes from libc */
+#ifndef __cplusplus
 extern int errno;
+#else
+#  include <errno.h>
+#endif
 
 /* errno values that OsitoK libc errno.h doesn't define yet — Mesa references
  * a few here and there. Add as needed. */
@@ -31,19 +59,25 @@ extern int errno;
 #endif
 
 /* OsitoK has no concept of users — return 0 ("root") so any "are we
- * privileged?" check reads as true. */
+ * privileged?" check reads as true. In C++ mode hosted glibc <unistd.h>
+ * (pulled by libstdc++) supplies these prototypes; only enable shim
+ * in C TUs to avoid signature collisions. */
+#ifndef __cplusplus
 static inline int geteuid(void) { return 0; }
 static inline int getuid(void)  { return 0; }
 static inline int getegid(void) { return 0; }
 static inline int getgid(void)  { return 0; }
 static inline int getpid(void)  { return 1; }
+#endif
 
 /* clock_nanosleep — Mesa os_time.c uses it for sleep/yield loops. We just
  * return (no kernel sleep API exposed in this layer yet). */
+#ifndef __cplusplus
 static inline int clock_nanosleep(int clk, int flags, const struct timespec *req, struct timespec *rem) {
     (void)clk; (void)flags; (void)req; (void)rem;
     return 0;
 }
+#endif
 
 /* Endian — we are unconditionally little-endian on x86-64. */
 #define UTIL_ARCH_LITTLE_ENDIAN 1
@@ -51,6 +85,7 @@ static inline int clock_nanosleep(int clk, int flags, const struct timespec *req
 
 /* lrintf is missing from OsitoK libc math.h — declare here so Mesa can use
  * it. We also provide a simple inline fallback that calls lrint(double). */
+#ifndef __cplusplus
 extern long lrint(double);
 static inline long lrintf(float f) { return lrint((double)f); }
 /* llrint / llrintf — not in libc math.h. u_pack_color.h uses them for
@@ -63,10 +98,17 @@ static inline float rintf(float x) { return (float)rint((double)x); }
 /* strtoll / strtoull — OsitoK libc has strtol/strtoul; extend to 64-bit. */
 extern long long strtoll(const char *s, char **end, int base);
 extern unsigned long long strtoull(const char *s, char **end, int base);
+#else
+/* C++ side: hosted glibc <math.h>, <stdlib.h> have these. Pull headers. */
+#  include <math.h>
+#  include <stdlib.h>
+#  include <string.h>
+#endif
 
 /* posix_memalign: wrap libc malloc with manual over-allocation + align.
  * Mesa's ralloc/blob/SIMD codepaths pass alignments of 16/32/64 bytes;
  * returning 8-byte-aligned mem to those would cause #GP on movaps. */
+#ifndef __cplusplus
 extern void *malloc(size_t);
 extern void  free(void *);
 static inline int posix_memalign(void **out, size_t a, size_t s) {
@@ -78,6 +120,7 @@ static inline int posix_memalign(void **out, size_t a, size_t s) {
     *out = aligned;
     return 0;
 }
+#endif
 /* Companion: callers that mix posix_memalign + free won't recover the raw
  * pointer; for now we live with that — Mesa's util/blob.c uses ralloc which
  * is its own pool so doesn't hit free() on an aligned alloc. Document the
@@ -86,9 +129,19 @@ static inline int posix_memalign(void **out, size_t a, size_t s) {
 
 /* atexit stub: Mesa's os_misc.c registers options_tbl_fini; on OsitoK we
  * don't run global destructors anyway. No-op preserves link compatibility. */
+#ifndef __cplusplus
 static inline int atexit(void (*f)(void)) { (void)f; return 0; }
+#endif
 
-/* pthread no-ops — Mesa is well-tested in single-threaded mode */
+/* pthread no-ops — Mesa is well-tested in single-threaded mode.
+ * In C mode we provide our own trivial typedefs. In C++ mode the
+ * hosted glibc + libstdc++ already define pthread_t etc, so we
+ * just provide the no-op INLINE wrappers (they don't conflict
+ * because they're at namespace scope and inline). The pthread_*
+ * functions on glibc are real prototypes — but our static inlines
+ * are weak overrides if linked with -Wl,--allow-multiple-definition,
+ * else they're not actually emitted (static inline = TU-local). */
+#ifndef __cplusplus
 typedef int pthread_mutex_t;
 typedef int pthread_cond_t;
 typedef int pthread_t;
@@ -115,8 +168,10 @@ static inline int pthread_create(pthread_t *t, const void *a, void *(*f)(void *)
     (void)t; (void)a; (void)f; (void)arg; return 11; /* EAGAIN — refuse to spawn */
 }
 static inline int pthread_join(pthread_t t, void **r) { (void)t; (void)r; return 0; }
+#endif
 
 /* clock_gettime CLOCK_MONOTONIC: reuse our gettimeofday syscall (96) */
+#ifndef __cplusplus
 #define CLOCK_MONOTONIC 1
 #define CLOCK_REALTIME  0
 typedef int clockid_t;
@@ -129,8 +184,12 @@ static inline int clock_gettime(int clk, struct timespec *ts) {
     ts->tv_nsec = tv.usec * 1000;
     return 0;
 }
+#endif
 
-/* sysconf — names per glibc bits/confname.h, just enough for Mesa util/ */
+/* sysconf — names per glibc bits/confname.h, just enough for Mesa util/.
+ * In C++ mode glibc's <unistd.h> (pulled by libstdc++ headers) defines
+ * these; only enable our shim in pure C TUs. */
+#ifndef __cplusplus
 #define _SC_PAGE_SIZE        30
 #define _SC_PAGESIZE         _SC_PAGE_SIZE
 #define _SC_PHYS_PAGES       85
@@ -145,20 +204,121 @@ static inline long sysconf(int name) {
     default:                   return -1;
     }
 }
+#endif
 
-/* C11 _Static_assert keyword — qjs_headers/assert.h doesn't define static_assert
- * (it is a C11 keyword via assert.h). Provide it here. */
-#ifndef static_assert
+/* C11 _Static_assert keyword — qjs_headers/assert.h doesn't define
+ * static_assert (it is a C11 keyword via assert.h). Provide it here.
+ * In C++ static_assert is a builtin keyword, no shim needed. */
+#if !defined(__cplusplus) && !defined(static_assert)
 #define static_assert(cond, msg) _Static_assert((cond), msg)
 #endif
 
 /* getenv: always NULL on OsitoK */
+#ifndef __cplusplus
 static inline char *getenv(const char *name) { (void)name; return (char *)0; }
+#endif
 
 /* strndup / strnlen — provided by mesa_libc_stubs.c, declared here. */
+#ifndef __cplusplus
 extern size_t strnlen(const char *s, size_t maxlen);
 extern char  *strndup(const char *s, size_t n);
 extern int    rand(void);
+#endif
+
+/* W4.2 — math constants (libc math.h is freestanding-light) */
+#ifndef M_PI
+#define M_PI       3.14159265358979323846
+#endif
+#ifndef M_PI_2
+#define M_PI_2     1.57079632679489661923
+#endif
+#ifndef M_PI_4
+#define M_PI_4     0.78539816339744830962
+#endif
+#ifndef M_E
+#define M_E        2.7182818284590452354
+#endif
+/* M_LOG2E is provided by qjs_headers/math.h (C) or glibc <math.h> (C++).
+ * Don't define it from this force-included header — would always warn on
+ * redefinition since this header is processed before any libc math.h. */
+#ifndef M_LN2
+#define M_LN2      0.69314718055994530942
+#endif
+#ifndef M_SQRT2
+#define M_SQRT2    1.41421356237309504880
+#endif
+#ifndef HUGE_VAL
+#define HUGE_VAL   (__builtin_huge_val())
+#endif
+#ifndef HUGE_VALF
+#define HUGE_VALF  (__builtin_huge_valf())
+#endif
+#ifndef NAN
+#define NAN        (__builtin_nanf(""))
+#endif
+#ifndef INFINITY
+#define INFINITY   (__builtin_inff())
+#endif
+
+/* W4.2 — extra glibc-isms used by compiler/{glsl,nir,spirv}/ */
+#ifndef __cplusplus
+extern char *strdup(const char *s);
+extern char *strcasestr(const char *haystack, const char *needle);
+extern int   strcasecmp(const char *a, const char *b);
+extern int   strncasecmp(const char *a, const char *b, size_t n);
+#endif
+
+/* basename / dirname — Mesa shader cache and disk layout helpers.
+ * We don't have a filesystem layer for shader caches anyway; provide
+ * the simplest correct implementations. NOTE: glibc dirname() mutates
+ * its input; we follow that convention.
+ *
+ * In C++ mode the hosted glibc <libgen.h> may already declare these;
+ * we don't force-define our versions there. Mesa C++ files don't seem
+ * to call basename/dirname directly. */
+#ifndef __cplusplus
+static inline char *basename_compat(char *path) {
+    if (!path || !*path) return (char *)".";
+    char *p, *last = path;
+    for (p = path; *p; ++p) if (*p == '/') last = p + 1;
+    return last;
+}
+static inline char *dirname_compat(char *path) {
+    if (!path || !*path) return (char *)".";
+    int len = 0;
+    while (path[len]) len++;
+    while (len > 0 && path[len - 1] == '/') len--;
+    while (len > 0 && path[len - 1] != '/') len--;
+    if (len == 0) return (char *)".";
+    while (len > 1 && path[len - 1] == '/') len--;
+    path[len] = '\0';
+    return path;
+}
+#define basename(p) basename_compat(p)
+#define dirname(p)  dirname_compat(p)
+
+/* mmap stubs — Mesa shader cache uses mmap on Linux for file-backed
+ * pages. On OsitoK we have no shader cache (no fs persistence beyond
+ * the read-only ROM), so make every mmap fail and the caller will
+ * fall through to the in-memory path. */
+#define PROT_NONE   0x0
+#define PROT_READ   0x1
+#define PROT_WRITE  0x2
+#define PROT_EXEC   0x4
+#define MAP_SHARED  0x01
+#define MAP_PRIVATE 0x02
+#define MAP_FIXED   0x10
+#define MAP_ANONYMOUS 0x20
+#define MAP_ANON    MAP_ANONYMOUS
+#define MAP_FAILED  ((void *)-1)
+typedef long off_t;
+static inline void *mmap(void *addr, size_t len, int prot, int flags, int fd, off_t off) {
+    (void)addr; (void)len; (void)prot; (void)flags; (void)fd; (void)off;
+    return MAP_FAILED;
+}
+static inline int munmap(void *addr, size_t len) { (void)addr; (void)len; return 0; }
+static inline int mprotect(void *addr, size_t len, int prot) { (void)addr; (void)len; (void)prot; return 0; }
+#endif
 
 /* Tell Mesa code which features are on. HAVE_PTHREAD=1 forces Mesa's
  * c11/threads.h to take the pthread branch — which #include's <pthread.h>;
@@ -166,5 +326,10 @@ extern int    rand(void);
  * the actual pthread surface is provided above by this very header. */
 #define HAVE_PTHREAD 1
 #define USE_X86_64   1
+/* W4.2 — In C++ mode hosted glibc supplies real secure_getenv.
+ * Tell Mesa not to redefine it as static inline. */
+#ifdef __cplusplus
+#  define HAVE_SECURE_GETENV 1
+#endif
 
 #endif

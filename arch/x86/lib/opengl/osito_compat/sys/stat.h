@@ -1,9 +1,18 @@
 /* OsitoK shim — sys/stat.h
  * Minimal stat surface for Mesa src/util/. We expose just enough types
  * for u_hash_table.c (which only references stat fields in debug paths
- * we never enable). All functions are no-ops returning -1. */
+ * we never enable). All functions are no-ops returning -1.
+ *
+ * In C++ mode (W4.2+) we use the hosted glibc <sys/stat.h> directly
+ * via include_next, since libstdc++ headers may pull it transitively
+ * and any divergence (struct layout, function signatures) would break
+ * compilation. */
 #ifndef OSITO_SYS_STAT_H
 #define OSITO_SYS_STAT_H 1
+
+#ifdef __cplusplus
+#  include_next <sys/stat.h>
+#else
 
 #include <stddef.h>
 
@@ -49,5 +58,7 @@ static inline int mkdir(const char *p, mode_t m) { (void)p; (void)m; return -1; 
 #define S_IRWXU 0700
 #define S_ISDIR(m) (((m) & 0170000) == 0040000)
 #define S_ISREG(m) (((m) & 0170000) == 0100000)
+
+#endif /* !__cplusplus */
 
 #endif
