@@ -235,6 +235,9 @@ typedef struct {
     uint64_t es, ds;
     uint64_t r15, r14, r13, r12, r11, r10, r9, r8;
     uint64_t rbp, rdi, rsi, rdx, rcx, rbx, rax;
+    /* IRET frame (pushed by CPU on INT entry, popped by IRETQ on return).
+     * Layout matches dos_int_stub.S after the GPR area. */
+    uint64_t iret_rip, iret_cs, iret_rflags, iret_rsp, iret_ss;
 } dos_native_regs_t;
 
 /*
@@ -345,11 +348,17 @@ int dos_native_emulate_lretw(void *frame_ptr)
 {
     dos_nt_iframe_t *f = (dos_nt_iframe_t *)frame_ptr;
     dos_vm_t *vm = g_native_dos_vm;
-    serial_puts("[emu] enter cs=0x"); serial_puthex(f->cs & 0xFFFF, 4);
-    serial_puts(" rip=0x"); serial_puthex(f->rip, 8);
-    serial_puts(" mode=");
-    serial_puts((vm && vm->dos4gw_mode) ? "1" : "0");
-    serial_puts("\n");
+    /* Rate-limit the entry trace so the segment-load loops don't drown
+     * out the rest of the run. Show first 32 calls in full, then sample
+     * 1 in every 1024 thereafter. */
+    static uint32_t emu_calls = 0;
+    int verbose = (++emu_calls < 32) || ((emu_calls & 0x3FF) == 0);
+    if (verbose) {
+        serial_puts("[emu] enter cs=0x"); serial_puthex(f->cs & 0xFFFF, 4);
+        serial_puts(" rip=0x"); serial_puthex(f->rip, 8);
+        serial_puts(" #"); serial_putdec(emu_calls);
+        serial_puts("\n");
+    }
     if (!vm || !vm->dos4gw_mode) return 0;
 
     /* Must be an LDT selector fault (DOS native). */
@@ -480,13 +489,15 @@ int dos_native_emulate_lretw(void *frame_ptr)
             default: break;
         }
         f->rip += len;
-        serial_puts("[DOS-NT] emu ");
-        serial_puts(opc_is_les ? "0xC4(LES)" :
-                    opc_is_lds ? "0xC5(LDS)" : "0x8E(MOV)");
-        serial_puts(" sreg="); serial_putdec(sreg);
-        serial_puts(" <- 0x");  serial_puthex(safe_sel, 4);
-        serial_puts(" (err=0x"); serial_puthex((uint64_t)f->error_code, 4);
-        serial_puts(") skip len="); serial_putdec(len); serial_puts("\n");
+        if (verbose) {
+            serial_puts("[DOS-NT] emu ");
+            serial_puts(opc_is_les ? "0xC4(LES)" :
+                        opc_is_lds ? "0xC5(LDS)" : "0x8E(MOV)");
+            serial_puts(" sreg="); serial_putdec(sreg);
+            serial_puts(" <- 0x");  serial_puthex(safe_sel, 4);
+            serial_puts(" (err=0x"); serial_puthex((uint64_t)f->error_code, 4);
+            serial_puts(") skip len="); serial_putdec(len); serial_puts("\n");
+        }
         if (kcr3 && saved_cr3 != kcr3)
             __asm__ volatile ("mov %0, %%cr3" :: "r"(saved_cr3) : "memory");
         return 1;
@@ -669,6 +680,9 @@ int dos_native_emulate_lretw(void *frame_ptr)
     serial_puthex(tgt_lin, 8); serial_puts(") RIP=0x");
     serial_puthex(new_rip_in_current_cs, 8);
     serial_puts("\n");
+    /* Wrap the per-success log only when verbose so the segment-load
+     * loops don't drown out the trace.  The verbose flag was set at the
+     * top of this function. */
 
     /* Restore CR3 so the IRETQ resumes in DOS CR3. */
     if (kcr3 && saved_cr3 != kcr3)
@@ -685,6 +699,14 @@ void dos_native_dump_rip(uint16_t cs, uint32_t rip, uint16_t ss_hint,
 {
     (void)ss_hint; (void)frame_rsp;
     if (!g_native_dos_vm) return;
+    /* Rate-limit: same RIP back-to-back gets sampled instead of dumped
+     * every time. The pf-ist line itself still prints unconditionally
+     * (idt.c handles that); we only suppress this 32-byte dump here. */
+    static uint32_t dump_calls = 0;
+    static uint32_t last_rip   = 0xFFFFFFFFu;
+    if (rip == last_rip && (++dump_calls & 0x3FF) != 0) return;
+    last_rip = rip;
+    dump_calls = 0;
     extern uint64_t paging_get_kernel_cr3(void);
     uint64_t saved_cr3;
     __asm__ volatile ("mov %%cr3, %0" : "=r"(saved_cr3));
@@ -824,6 +846,18 @@ void dos_int_native_dispatch(uint64_t int_num, dos_native_regs_t *regs)
     regs->rbp = cpu->ebp;
     regs->ds  = cpu->ds;
     regs->es  = cpu->es;
+
+    /* Force IF=1 and clear TF in the saved RFLAGS that IRETQ will pop.
+     * DOOM does CLI/STI sequences and POPF runs that occasionally leave
+     * the flags with IF=0; without external IRQ delivery the program
+     * gets stuck in a busy-poll loop with no way to make progress. The
+     * 0x202 base (IF=1 + reserved bit) plus IOPL=3 keeps DOOM able to
+     * issue IN/OUT freely. Preserve other flags (CF/ZF/SF/etc) so DOS
+     * function results are visible to the caller. */
+    regs->iret_rflags = (regs->iret_rflags & ~(uint64_t)0x100ULL) /* clear TF */
+                      | 0x200ULL  /* IF=1 */
+                      | 0x3000ULL /* IOPL=3 */
+                      | 0x002ULL; /* reserved bit 1 */
 
     /* Handle terminate (INT 20h or INT 21h/4Ch) */
     if (!cpu->running) {

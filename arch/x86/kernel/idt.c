@@ -527,6 +527,18 @@ void isr_handler(interrupt_frame_t *frame)
                        && (frame->cs & 0x04);  /* CS is an LDT selector */
         if (!_zone && _dos_active) _zone = "DOS";
         if (_zone) {
+            /* Rate-limit: when the same RIP keeps faulting (e.g. a
+             * segment-load loop), sample 1-of-1024 to keep the trace
+             * readable. Different RIPs always print. */
+            static uint64_t _last_rip   = 0xFFFFFFFFFFFFFFFFULL;
+            static uint32_t _same_count = 0;
+            int _verbose_pf = (frame->rip != _last_rip)
+                           || ((++_same_count & 0x3FF) == 0);
+            if (frame->rip != _last_rip) {
+                _last_rip = frame->rip;
+                _same_count = 0;
+            }
+            if (!_verbose_pf) goto pf_ist_skip_log;
             serial_puts("[pf-ist] on ");
             serial_puts(_zone);
             serial_puts(" vec=");
@@ -556,6 +568,8 @@ void isr_handler(interrupt_frame_t *frame)
                                     (uint16_t)frame->ss,
                                     frame->rsp);
             }
+        pf_ist_skip_log:
+            (void)_verbose_pf;
 
             /* DOS-native #DB (vec=1) recovery: DOOM does
              *   POPF; INT 21h; PUSHF
