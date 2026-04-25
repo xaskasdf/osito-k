@@ -1011,13 +1011,28 @@ NTSTATUS sys_NtDelayExecution(ULONG_PTR *args)
     LONGLONG delay_100ns = DelayInterval->QuadPart;
     if (delay_100ns < 0) delay_100ns = -delay_100ns;
 
-    /* Convert to ticks (assuming 100Hz timer = 10ms per tick) */
-    uint64_t delay_ticks = (uint64_t)(delay_100ns / 100000);
-    if (delay_ticks == 0) delay_ticks = 1;
+    /* Use RDTSC instead of idt_get_ticks(): the APIC timer is masked
+     * for the entire compat32 lifetime (commit 0311d5f) so kernel ticks
+     * don't advance while UT99 is in user code, and a sti/hlt wait
+     * here would never wake. RDTSC always increments regardless of
+     * interrupt state. Assume ~3 GHz TSC, so 100ns = 300 cycles. */
+    uint64_t delay_cycles = (uint64_t)delay_100ns * 300ULL;
+    if (delay_cycles == 0) delay_cycles = 300;  /* min 100ns */
 
-    uint64_t start = idt_get_ticks();
-    while (idt_get_ticks() - start < delay_ticks) {
-        __asm__ volatile("sti; hlt; cli");
+    uint32_t lo, hi;
+    __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+    uint64_t start = ((uint64_t)hi << 32) | lo;
+
+    /* Cooperative yield once so other in-flight callbacks get a turn,
+     * then spin on RDTSC. We can't sti/hlt because no IRQ wakes us. */
+    extern void sched_yield(void);
+    sched_yield();
+
+    for (;;) {
+        __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+        uint64_t now = ((uint64_t)hi << 32) | lo;
+        if (now - start >= delay_cycles) break;
+        __asm__ volatile("pause" ::: "memory");
     }
 
     return STATUS_SUCCESS;
