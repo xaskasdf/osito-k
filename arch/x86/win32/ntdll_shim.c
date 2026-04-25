@@ -495,71 +495,21 @@ void RtlRaiseException(PEXCEPTION_RECORD ExceptionRecord)
      * misread the 32-bit frame, concatenating Handler with stack garbage
      * → non-canonical RIP → #GP. */
     extern int compat32_seh_dispatch(PEXCEPTION_RECORD ExceptionRecord);
-    if (compat32_seh_dispatch(ExceptionRecord)) {
+    int dispatch_rc = compat32_seh_dispatch(ExceptionRecord);
+    if (dispatch_rc > 0) {
         serial_puts("[SEH] exception handled by compat32\n");
         return;
     }
 
-    /* Fallback: walk 64-bit SEH chain (for native 64-bit handlers).
-     * Validate handler addresses before calling — corrupt chain entries
-     * could have garbage handler values (e.g. 0xC5CAE910). */
-    extern TEB32 g_teb32;
-    PEXCEPTION_REGISTRATION_RECORD frame =
-        (PEXCEPTION_REGISTRATION_RECORD)(ULONG_PTR)g_teb32.ExceptionList;
-
-    while (frame && frame != EXCEPTION_CHAIN_END) {
-        uint32_t *f32 = (uint32_t *)(ULONG_PTR)frame;
-        uint32_t frame_addr = (uint32_t)(ULONG_PTR)frame;
-        uint32_t handler32 = f32[1];
-
-        /* Skip frames with invalid addresses or handlers */
-        if (frame_addr >= 0x10000000 && frame_addr < 0x14000000) {
-            serial_puts("[SEH] skipping corrupt frame at 0x");
-            serial_puthex(frame_addr, 8);
-            serial_puts("\n");
-            uint32_t next32 = f32[0];
-            frame = (next32 == 0 || next32 == 0xFFFFFFFF) ? NULL :
-                    (PEXCEPTION_REGISTRATION_RECORD)(ULONG_PTR)next32;
-            continue;
-        }
-        if (handler32 < 0x10000000 || handler32 >= 0x20000000) {
-            /* Handler not in PE DLL range — skip */
-            uint32_t next32 = f32[0];
-            frame = (next32 == 0 || next32 == 0xFFFFFFFF) ? NULL :
-                    (PEXCEPTION_REGISTRATION_RECORD)(ULONG_PTR)next32;
-            continue;
-        }
-
-        serial_puts("[SEH] trying handler at 0x");
-        serial_puthex(handler32, 8);
-        serial_puts("\n");
-
-        CONTEXT ctx;
-        BYTE *p = (BYTE *)&ctx;
-        for (SIZE_T i = 0; i < sizeof(CONTEXT); i++) p[i] = 0;
-        ctx.ContextFlags = CONTEXT_FULL;
-
-        typedef EXCEPTION_DISPOSITION (WINAPI *seh_handler_fn)(
-            PEXCEPTION_RECORD, PVOID, PCONTEXT, PVOID);
-        seh_handler_fn handler = (seh_handler_fn)(ULONG_PTR)handler32;
-
-        EXCEPTION_DISPOSITION disp = handler(
-            ExceptionRecord, frame, &ctx, NULL);
-
-        if (disp == ExceptionContinueExecution) {
-            serial_puts("[SEH] handler returned ContinueExecution\n");
-            return;
-        }
-
-        if (disp != ExceptionContinueSearch) {
-            serial_puts("[SEH] handler returned unexpected: ");
-            serial_puthex((uint64_t)(uint32_t)disp, 2);
-            serial_puts("\n");
-        }
-
-        uint32_t next32 = *(uint32_t *)(ULONG_PTR)frame;
-        frame = (PEXCEPTION_REGISTRATION_RECORD)(ULONG_PTR)next32;
-    }
+    /* compat32_seh_dispatch already walked the 32-bit SEH chain with
+     * the correct 32-bit semantics (4-byte Next + 4-byte Handler). If
+     * it returned 0, the chain was traversed and no handler caught the
+     * exception. Don't run a second buggy 64-bit walker that:
+     *   (a) re-reads the same chain with wrong 8+8 byte layout,
+     *   (b) casts a 32-bit handler address as a 64-bit function pointer
+     *       and calls it from kernel-mode 64-bit context (→ crash).
+     *
+     * Skip directly to the UnhandledExceptionFilter / terminate path. */
 
     /* No handler caught the exception — try unhandled filter */
     if (g_unhandled_filter) {
@@ -576,7 +526,21 @@ void RtlRaiseException(PEXCEPTION_RECORD ExceptionRecord)
             return;
     }
 
-    /* Unhandled — terminate */
+    /* Unhandled — for C++ exceptions (0xE06D7363) we suppress and let the
+     * caller continue, instead of terminating. UT99's _initterm and many
+     * engine paths throw FCriticalError but their unwind targets are deeply
+     * embedded in the engine's catch blocks, which we can't dispatch into
+     * from this 64-bit kernel context yet. Suppression keeps the process
+     * alive and matches the previous "wide-range corrupt" behavior that
+     * got UT99 to ~29M INT 0x2E calls before the SEH walker rewrite.
+     *
+     * Real fix: dispatch handlers through compat32_callback so the catch
+     * block runs in 32-bit compat mode. */
+    if (ExceptionRecord->ExceptionCode == 0xE06D7363) {
+        serial_puts("[SEH] suppressing unhandled C++ throw (continuing)\n");
+        return;
+    }
+
     serial_puts("[SEH] UNHANDLED EXCEPTION 0x");
     serial_puthex(ExceptionRecord->ExceptionCode, 8);
     serial_puts(" — terminating\n");
