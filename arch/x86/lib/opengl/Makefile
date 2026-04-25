@@ -47,6 +47,7 @@ OUT_GALLIUM  := $(BUILD_DIR)/libmesa_gallium.a
 OUT_COMPILER := $(BUILD_DIR)/libmesa_compiler.a
 OUT_ZINK     := $(BUILD_DIR)/libmesa_zink.a
 OUT_MAIN     := $(BUILD_DIR)/libmesa_main.a
+OUT_GL       := $(BUILD_DIR)/libGL.a
 
 CC          ?= gcc
 CXX         ?= g++
@@ -55,6 +56,7 @@ GCC_INC     := $(shell $(CC) -print-file-name=include)
 
 INCLUDES := \
   -I$(OPENGL_ROOT)/include \
+  -I$(OPENGL_ROOT)/include/GL \
   -I$(OPENGL_ROOT)/osito_compat \
   -I$(OSITOK_ROOT)/arch/x86/libc/qjs_headers \
   -I$(OSITOK_ROOT)/arch/x86/libc \
@@ -587,9 +589,13 @@ ZINK_CXX_SRCS := \
 # W4.4 — OsitoK-specific zink loader bridge + screen entrypoint.
 # These live under osito_compat/ and become part of libmesa_zink.a so
 # any zink-using ELF gets them transparently from one archive.
+#
+# W4.6 — okGL context API (osito_compat/okgl_context.c) is also in this
+# list so libGL.a (and libmesa_zink.a) carry it transparently.
 ZINK_LOADER_SRCS := \
   osito_compat/zink_vk_loader.c \
-  osito_compat/zink_screen_ositok.c
+  osito_compat/zink_screen_ositok.c \
+  osito_compat/okgl_context.c
 
 ZINK_C_OBJS      := $(patsubst %.c,$(BUILD_DIR)/%.o,$(ZINK_C_SRCS))
 ZINK_CXX_OBJS    := $(patsubst %.cpp,$(BUILD_DIR)/%.o,$(ZINK_CXX_SRCS))
@@ -678,13 +684,14 @@ ST_C_SRCS          := $(patsubst $(OPENGL_ROOT)/%,%,$(ST_C_SRCS_ABS))
 MAIN_C_SRCS_ALL_LIST := $(MAIN_C_SRCS) $(MAPI_C_SRCS) $(PROGRAM_C_SRCS) $(VBO_C_SRCS) $(ST_C_SRCS)
 MAIN_C_OBJS        := $(patsubst %.c,$(BUILD_DIR)/%.o,$(MAIN_C_SRCS_ALL_LIST))
 
-.PHONY: all clean util gallium compiler zink main
-all: $(OUT) $(OUT_GALLIUM) $(OUT_COMPILER) $(OUT_ZINK) $(OUT_MAIN)
+.PHONY: all clean util gallium compiler zink main libgl
+all: $(OUT) $(OUT_GALLIUM) $(OUT_COMPILER) $(OUT_ZINK) $(OUT_MAIN) $(OUT_GL)
 util: $(OUT)
 gallium: $(OUT_GALLIUM)
 compiler: $(OUT_COMPILER)
 zink: $(OUT_ZINK)
 main: $(OUT_MAIN)
+libgl: $(OUT_GL)
 
 $(OUT): $(UTIL_OBJS) | $(BUILD_DIR)
 	@echo "  AR    $(notdir $@)"
@@ -710,6 +717,23 @@ $(OUT_MAIN): $(MAIN_C_OBJS) | $(BUILD_DIR)
 	@echo "  AR    $(notdir $@)"
 	@$(AR) rcs $@ $(MAIN_C_OBJS)
 	@echo "  -> $$($(AR) t $@ | wc -l) objects in $@"
+
+# ---------------------------------------------------------------------------
+# W4.6 — libGL.a super-archive
+# ---------------------------------------------------------------------------
+# Single archive that combines util + gallium + compiler + zink + main +
+# osito_compat objects.  Built via an `ar -M` MRI script that does a true
+# member-merge (no nested archives, which `ld` would happily ignore).
+#
+# Resulting archive carries every Mesa .o the prior 5 archives carry.
+# Consumers link `libGL.a libvulkan.a` and pick up the entire stack.
+$(OUT_GL): $(OUT) $(OUT_GALLIUM) $(OUT_COMPILER) $(OUT_ZINK) $(OUT_MAIN) | $(BUILD_DIR)
+	@echo "  MRI   $(notdir $@)"
+	@rm -f $@
+	@printf 'CREATE %s\nADDLIB %s\nADDLIB %s\nADDLIB %s\nADDLIB %s\nADDLIB %s\nSAVE\nEND\n' \
+	  "$@" "$(OUT)" "$(OUT_GALLIUM)" "$(OUT_COMPILER)" "$(OUT_ZINK)" "$(OUT_MAIN)" \
+	  | $(AR) -M
+	@echo "  -> $$($(AR) t $@ | wc -l) objects in $@ ($$(du -h $@ | cut -f1))"
 
 # W4.4 — bridge code for libmesa_zink.a uses CFLAGS_ZINK so the v305
 # vulkan_core.h is in scope (matches the rest of the zink build).  Must
