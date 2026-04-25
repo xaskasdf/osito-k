@@ -1113,6 +1113,24 @@ void compat32_enter(uint32_t entry, uint32_t stack_top)
      * VirtualAlloc maps via paging_map_page (kernel PTs) which is
      * visible to all processes. No CR3 switch needed. */
 
+    /* Mask APIC timer for the duration of compat32 execution. UT99
+     * (PID 1) runs almost entirely in 32-bit user code on a low-half
+     * stack; if the timer ISR fires there, it saves the GP frame on
+     * that low-half stack and the scheduler stores frame_ptr (a low-
+     * half address) in PID 1->kernel_rsp. Subsequent user-mode writes
+     * to that same memory overwrite the saved frame, and the next
+     * dispatch reads garbage as CS/RIP/SS/RSP — `[SCHED] CORRUPT PID
+     * 1 CS=0x1F10` style triple-fault.
+     *
+     * The timer is unmasked transiently by INT 0x2E handlers (so
+     * cooperative thread yield works inside compat32_callback_args),
+     * and by sched_yield from the spinlock loop. */
+    {
+        extern volatile uint32_t *idt_get_apic_base(void);
+        volatile uint32_t *apic = idt_get_apic_base();
+        if (apic) apic[0x320/4] |= 0x10000;  /* LVT_TIMER |= MASKED */
+    }
+
     /* Set data segments to 32-bit data selector, then RETF to compat mode.
      * Hardcode 0x48 (GDT_SEL_DATA32) because GAS doesn't like C macros
      * in mov-to-segment operands with PIE. */
@@ -1305,8 +1323,27 @@ uint32_t compat32_callback_args(uint32_t func_addr, int nargs, const uint32_t *a
         if (apic) apic[0x320/4] |= 0x10000;  /* LVT_TIMER |= MASKED */
     }
 
+    /* Pick the callback stack slot. PID 1 (UT99 main) uses slot=depth
+     * as before. Worker threads spawned via CreateThread use a HIGH
+     * slot offset (8 + thread_index) so their stack writes can't
+     * overlap PID 1's saved interrupt frames on slot=depth. Without
+     * this isolation, the timer-mask only narrows the race window —
+     * PID 1 may still have been preempted onto callback_stack[0]
+     * BEFORE the thread acquired the lock and TID=2's later push of
+     * arguments overwrites the saved frame. Out of MAX_CALLBACK_DEPTH
+     * = 32 slots we reserve [0..7] for PID 1 and [8..31] for threads. */
+    int stack_slot;
+    {
+        extern int32_t proc_current_pid(void);
+        int my_pid = proc_current_pid();
+        stack_slot = (my_pid == 1)
+                   ? depth
+                   : (8 + (my_pid & 0xF));
+        if (stack_slot >= MAX_CALLBACK_DEPTH) stack_slot = depth;
+    }
+
     if (kern_setjmp(callback_jmpbufs[depth]) == 0) {
-        uint32_t *sp = (uint32_t *)(callback_stack_get(depth) + CALLBACK_STACK_SIZE);
+        uint32_t *sp = (uint32_t *)(callback_stack_get(stack_slot) + CALLBACK_STACK_SIZE);
 
         /* Push arguments right-to-left (cdecl/stdcall convention) */
         for (int i = nargs - 1; i >= 0; i--) {
@@ -1341,13 +1378,9 @@ uint32_t compat32_callback_args(uint32_t func_addr, int nargs, const uint32_t *a
         /* never reached */
     }
 
-    /* longjmp returned — 32-bit function is done. Unmask the timer
-     * so other processes can be preempted again. */
-    {
-        extern volatile uint32_t *idt_get_apic_base(void);
-        volatile uint32_t *apic = idt_get_apic_base();
-        if (apic) apic[0x320/4] &= ~0x10000;  /* LVT_TIMER &= ~MASKED */
-    }
+    /* longjmp returned — 32-bit function is done. The APIC timer was
+     * masked by compat32_enter and stays masked while UT99 is in
+     * compat32 mode; we don't unmask here. */
 
     g_teb32.ExceptionList = saved_seh;  /* Restore SEH chain */
     callback_depth--;
