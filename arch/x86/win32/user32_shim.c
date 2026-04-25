@@ -717,11 +717,24 @@ BOOL WINAPI GetMessageA(LPMSG lpMsg, HWND hWnd, DWORD wMsgFilterMin,
     msg_write_to(lpMsg, NULL, WM_QUIT, 0, 0, 0, 0, 0);
     return FALSE;
 #else
-    /* On bare metal, yield CPU and retry — real apps expect GetMessage to block.
-     * Post WM_TIMER periodically so the app's message loop keeps running. */
+    /* On bare metal, post a synthetic WM_TIMER so the app's message
+     * loop keeps running. Cooperatively yield rather than `sti;hlt;cli`
+     * — the APIC timer is masked for the entire compat32 lifetime
+     * (commit 0311d5f), so a hlt would never wake. RDTSC pacing keeps
+     * the loop from running flat out and starving other work. */
     msg_write_to(lpMsg, NULL, 0x0113 /* WM_TIMER */, 1, 0, 0, 0, 0);
-    /* Brief yield — sti;hlt;cli lets pending interrupts fire */
-    __asm__ volatile ("sti; hlt; cli" ::: "memory");
+    extern void sched_yield(void);
+    sched_yield();
+    /* ~1 ms TSC pace at 3 GHz between message-loop iterations */
+    uint32_t lo, hi;
+    __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+    uint64_t start = ((uint64_t)hi << 32) | lo;
+    while (1) {
+        __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+        uint64_t now = ((uint64_t)hi << 32) | lo;
+        if (now - start > 3000000ULL) break;
+        __asm__ volatile("pause" ::: "memory");
+    }
     return TRUE;
 #endif
 }
