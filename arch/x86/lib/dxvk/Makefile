@@ -40,6 +40,7 @@ GCC_CXX_INC := $(shell $(CXX) -print-file-name=include) # placeholder
 INCLUDES := \
   -I$(DXVK_ROOT)/com_stub \
   -I$(DXVK_ROOT)/include \
+  -I$(DXVK_ROOT)/include/generated \
   -I$(DXVK_SRC) \
   -I$(DXVK_SRC)/util \
   -I$(DXVK_SRC)/util/com \
@@ -207,7 +208,9 @@ CORE_SRCS := \
   dxvk/src/dxvk/dxvk_stats.cpp \
   dxvk/src/dxvk/dxvk_swapchain_blitter.cpp \
   dxvk/src/dxvk/dxvk_unbound.cpp \
-  dxvk/src/dxvk/dxvk_util.cpp
+  dxvk/src/dxvk/dxvk_util.cpp \
+  dxvk/src/wsi/wsi_platform_ositok.cpp \
+  dxvk/src/wsi/wsi_edid_ositok.cpp
 
 UTIL_OBJS    := $(patsubst %.cpp,$(BUILD_DIR)/%.o,$(UTIL_SRCS))
 UTIL_C_OBJS  := $(patsubst %.c,$(BUILD_DIR)/%.o,$(UTIL_C_SRCS))

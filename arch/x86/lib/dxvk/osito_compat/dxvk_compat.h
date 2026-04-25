@@ -202,8 +202,44 @@ typedef void *PSECURITY_ATTRIBUTES;
 typedef void *PSECURITY_DESCRIPTOR;
 typedef int SECURITY_DESCRIPTOR_REVISION;
 
+/* Win32 registry handle stub. dxvk_openvr.h declares an HKEY field even
+ * though we never compile the .cpp that uses it. */
+typedef void *HKEY;
+
 /* GUID — full definition lives in com_stub/IUnknown.h.  We do NOT
  * forward-declare it here to avoid a struct/typedef-name clash with the
  * `typedef struct _GUID { ... } GUID;` form in IUnknown.h. */
+
+/* INVALID_HANDLE_VALUE — Win32 sentinel. DXVK initialises shareable
+ * resource handles to this in dxvk_memory.h, dxvk_fence.h, etc. We
+ * never share resources across processes on OsitoK, so any non-null
+ * value works. Pick the canonical -1 cast. */
+#ifndef INVALID_HANDLE_VALUE
+#define INVALID_HANDLE_VALUE ((HANDLE)(intptr_t)-1)
+#endif
+
+/* -- Vulkan Win32 / FSE extension name stubs --------------------------
+ * dxvk_extensions.h initialises a table of every extension name DXVK
+ * could possibly request. The Win32-specific and full-screen-exclusive
+ * extension names are not declared by our libvulkan headers (we only
+ * vendored the linux/X11 surface). DXVK never enables these on OsitoK
+ * (the runtime check rejects unsupported extensions), but the table
+ * literal still has to compile. Provide the upstream Khronos string
+ * values verbatim — DxvkExt.name is just a `const char *`. */
+#ifndef VK_EXT_FULL_SCREEN_EXCLUSIVE_EXTENSION_NAME
+#define VK_EXT_FULL_SCREEN_EXCLUSIVE_EXTENSION_NAME "VK_EXT_full_screen_exclusive"
+#endif
+#ifndef VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME
+#define VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME "VK_KHR_external_memory_win32"
+#endif
+#ifndef VK_KHR_EXTERNAL_SEMAPHORE_WIN32_EXTENSION_NAME
+#define VK_KHR_EXTERNAL_SEMAPHORE_WIN32_EXTENSION_NAME "VK_KHR_external_semaphore_win32"
+#endif
+#ifndef VK_KHR_WIN32_KEYED_MUTEX_EXTENSION_NAME
+#define VK_KHR_WIN32_KEYED_MUTEX_EXTENSION_NAME "VK_KHR_win32_keyed_mutex"
+#endif
+#ifndef VK_KHR_WIN32_SURFACE_EXTENSION_NAME
+#define VK_KHR_WIN32_SURFACE_EXTENSION_NAME "VK_KHR_win32_surface"
+#endif
 
 #endif /* DXVK_OSITOK_COMPAT_H */

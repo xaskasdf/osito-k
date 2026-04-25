@@ -161,7 +161,10 @@ namespace dxvk {
     // them in order to potentially reduce lock contention.
     std::vector<DxvkCsChunkRef> chunks;
 
-    try {
+    /* OsitoK W5.2: -fno-exceptions, so the upstream try/catch becomes a
+     * plain block. abort_ositok is noreturn, so a thrown DxvkError would
+     * never reach the original catch anyway. */
+    {
       while (!m_stopped.load()) {
         { std::unique_lock<dxvk::mutex> lock(m_mutex);
 
@@ -193,9 +196,6 @@ namespace dxvk {
 
         chunks.clear();
       }
-    } catch (const DxvkError& e) {
-      Logger::err("Exception on CS thread!");
-      Logger::err(e.message());
     }
   }
   
