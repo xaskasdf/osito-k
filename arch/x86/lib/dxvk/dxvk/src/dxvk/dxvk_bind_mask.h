@@ -1,12 +1,5 @@
 #pragma once
 
-/* OsitoK W5.1: this header pulls dxvk_buffer/descriptor/image/sampler.h
- * which haven't been vendored yet (W5.2 work). Guard to surface a clear
- * error message if someone in W5.1 accidentally includes this. */
-#if defined(__OSITO_K__) && !defined(DXVK_W5_2_HEADERS_AVAILABLE)
-#error "dxvk_bind_mask.h needs dxvk_buffer/descriptor/image/sampler — vendor in W5.2"
-#endif
-
 #include <type_traits>
 
 #include "dxvk_buffer.h"
