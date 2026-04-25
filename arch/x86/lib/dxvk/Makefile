@@ -85,6 +85,10 @@ UTIL_SRCS := \
   dxvk/src/util/sync/sync_recursive.cpp \
   dxvk/src/util/thread.cpp
 
+# C sources (sha1.c is the SHA-1 reference impl in plain C).
+UTIL_C_SRCS := \
+  dxvk/src/util/sha1/sha1.c
+
 # Files deferred (need additional shims or have unconditional throw/try
 # blocks incompatible with -fno-exceptions; tracked so we can lift them
 # wave by wave):
@@ -108,8 +112,9 @@ SPIRV_SRCS := \
   dxvk/src/spirv/spirv_compression.cpp \
   dxvk/src/spirv/spirv_module.cpp
 
-UTIL_OBJS  := $(patsubst %.cpp,$(BUILD_DIR)/%.o,$(UTIL_SRCS))
-SPIRV_OBJS := $(patsubst %.cpp,$(BUILD_DIR)/%.o,$(SPIRV_SRCS))
+UTIL_OBJS    := $(patsubst %.cpp,$(BUILD_DIR)/%.o,$(UTIL_SRCS))
+UTIL_C_OBJS  := $(patsubst %.c,$(BUILD_DIR)/%.o,$(UTIL_C_SRCS))
+SPIRV_OBJS   := $(patsubst %.cpp,$(BUILD_DIR)/%.o,$(SPIRV_SRCS))
 
 .PHONY: all clean util spirv
 all: util spirv
@@ -117,9 +122,9 @@ all: util spirv
 util:  $(UTIL_OUT)
 spirv: $(SPIRV_OUT)
 
-$(UTIL_OUT): $(UTIL_OBJS) | $(BUILD_DIR)
+$(UTIL_OUT): $(UTIL_OBJS) $(UTIL_C_OBJS) | $(BUILD_DIR)
 	@echo "  AR    $(notdir $@)"
-	@$(AR) rcs $@ $(UTIL_OBJS)
+	@$(AR) rcs $@ $(UTIL_OBJS) $(UTIL_C_OBJS)
 	@echo "  -> $$($(AR) t $@ | wc -l) objects in $@"
 
 $(SPIRV_OUT): $(SPIRV_OBJS) | $(BUILD_DIR)
@@ -132,6 +137,17 @@ $(BUILD_DIR)/%.o: $(DXVK_ROOT)/%.cpp | $(BUILD_DIR)
 	@mkdir -p $(dir $@)
 	@echo "  CXX   $*"
 	@$(CXX) $(CXX_FLAGS) -c -o $@ $<
+
+# Plain C path (sha1.c). Same warning posture, different std.
+CC ?= gcc
+$(BUILD_DIR)/%.o: $(DXVK_ROOT)/%.c | $(BUILD_DIR)
+	@mkdir -p $(dir $@)
+	@echo "  CC    $*"
+	@$(CC) -std=gnu11 -ffreestanding -fno-stack-protector -mno-red-zone \
+	       -fno-pic -O2 -Wall \
+	       -D__OSITO_K__ \
+	       $(INCLUDES) -isystem $(GCC_INC) \
+	       -c -o $@ $<
 
 $(BUILD_DIR):
 	@mkdir -p $(BUILD_DIR)
