@@ -46,7 +46,7 @@ namespace dxvk {
     info.subresourceRange = vk::makeSubresourceRange(dstSubresources);
 
     if ((m_vkd->vkCreateImageView(m_vkd->device(), &info, nullptr, &m_dstImageView)))
-      throw DxvkError("DxvkMetaCopyViews: Failed to create destination image view");
+      dxvk::DxvkError::abort_ositok("DxvkMetaCopyViews: Failed to create destination image view");
 
     // Create source image views
     usageInfo.usage = VK_IMAGE_USAGE_SAMPLED_BIT;
@@ -58,13 +58,13 @@ namespace dxvk {
     info.subresourceRange.aspectMask = srcAspects & (VK_IMAGE_ASPECT_COLOR_BIT | VK_IMAGE_ASPECT_DEPTH_BIT);
 
     if ((m_vkd->vkCreateImageView(m_vkd->device(), &info, nullptr, &m_srcImageView)))
-      throw DxvkError("DxvkMetaCopyViews: Failed to create source image view");
+      dxvk::DxvkError::abort_ositok("DxvkMetaCopyViews: Failed to create source image view");
 
     if (srcAspects & VK_IMAGE_ASPECT_STENCIL_BIT) {
       info.subresourceRange.aspectMask = VK_IMAGE_ASPECT_STENCIL_BIT;
 
       if ((m_vkd->vkCreateImageView(m_vkd->device(), &info, nullptr, &m_srcStencilView)))
-        throw DxvkError("DxvkMetaCopyViews: Failed to create source stencil view");
+        dxvk::DxvkError::abort_ositok("DxvkMetaCopyViews: Failed to create source stencil view");
     }
   }
   
@@ -185,7 +185,7 @@ namespace dxvk {
     
     VkShaderModule result = VK_NULL_HANDLE;
     if (m_vkd->vkCreateShaderModule(m_vkd->device(), &info, nullptr, &result) != VK_SUCCESS)
-      throw DxvkError("DxvkMetaCopyObjects: Failed to create shader module");
+      dxvk::DxvkError::abort_ositok("DxvkMetaCopyObjects: Failed to create shader module");
     return result;
   }
 
@@ -203,7 +203,7 @@ namespace dxvk {
     setLayoutInfo.pBindings = bindings.data();
 
     if (m_vkd->vkCreateDescriptorSetLayout(m_vkd->device(), &setLayoutInfo, nullptr, &pipeline.dsetLayout) != VK_SUCCESS)
-      throw DxvkError("DxvkMetaCopyObjects: Failed to create descriptor set layout");
+      dxvk::DxvkError::abort_ositok("DxvkMetaCopyObjects: Failed to create descriptor set layout");
 
     VkPushConstantRange pushRange = { VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(DxvkCopyBufferImageArgs) };
 
@@ -214,7 +214,7 @@ namespace dxvk {
     pipelineLayoutInfo.pPushConstantRanges = &pushRange;
 
     if (m_vkd->vkCreatePipelineLayout(m_vkd->device(), &pipelineLayoutInfo, nullptr, &pipeline.pipeLayout) != VK_SUCCESS)
-      throw DxvkError("DxvkMetaCopyObjects: Failed to create pipeline layout");
+      dxvk::DxvkError::abort_ositok("DxvkMetaCopyObjects: Failed to create pipeline layout");
 
     VkShaderModule shaderModule = createShaderModule(dxvk_copy_buffer_image);
 
@@ -228,7 +228,7 @@ namespace dxvk {
 
     if (m_vkd->vkCreateComputePipelines(m_vkd->device(), VK_NULL_HANDLE,
         1, &pipelineInfo, nullptr, &pipeline.pipeHandle) != VK_SUCCESS)
-      throw DxvkError("DxvkMetaCopyObjects: Failed to create compute pipeline");
+      dxvk::DxvkError::abort_ositok("DxvkMetaCopyObjects: Failed to create compute pipeline");
 
     m_vkd->vkDestroyShaderModule(m_vkd->device(), shaderModule, nullptr);
     return pipeline;
@@ -258,7 +258,7 @@ namespace dxvk {
 
     VkDescriptorSetLayout result = VK_NULL_HANDLE;
     if (m_vkd->vkCreateDescriptorSetLayout(m_vkd->device(), &info, nullptr, &result) != VK_SUCCESS)
-      throw DxvkError("DxvkMetaCopyObjects: Failed to create descriptor set layout");
+      dxvk::DxvkError::abort_ositok("DxvkMetaCopyObjects: Failed to create descriptor set layout");
     return result;
   }
 
@@ -275,7 +275,7 @@ namespace dxvk {
     
     VkPipelineLayout result = VK_NULL_HANDLE;
     if (m_vkd->vkCreatePipelineLayout(m_vkd->device(), &info, nullptr, &result) != VK_SUCCESS)
-      throw DxvkError("DxvkMetaCopyObjects: Failed to create pipeline layout");
+      dxvk::DxvkError::abort_ositok("DxvkMetaCopyObjects: Failed to create pipeline layout");
     return result;
   }
   
@@ -312,7 +312,7 @@ namespace dxvk {
     }
 
     if (!shaderSet)
-      throw DxvkError(str::format("DxvkMetaCopyObjects: Unsupported aspect mask: ", aspect));
+      dxvk::DxvkError::abort_ositok(str::format("DxvkMetaCopyObjects: Unsupported aspect mask: ", aspect));
 
     VkShaderModule psModule = VK_NULL_HANDLE;
 
@@ -410,7 +410,7 @@ namespace dxvk {
     
     VkPipeline result = VK_NULL_HANDLE;
     if (m_vkd->vkCreateGraphicsPipelines(m_vkd->device(), VK_NULL_HANDLE, 1, &info, nullptr, &result) != VK_SUCCESS)
-      throw DxvkError("DxvkMetaCopyObjects: Failed to create graphics pipeline");
+      dxvk::DxvkError::abort_ositok("DxvkMetaCopyObjects: Failed to create graphics pipeline");
     return result;
   }
   

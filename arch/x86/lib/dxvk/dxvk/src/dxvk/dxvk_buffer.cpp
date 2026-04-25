@@ -105,7 +105,7 @@ namespace dxvk {
     DxvkBufferHandle handle;
 
     if (m_vkd->vkCreateBuffer(m_vkd->device(), &info, nullptr, &handle.buffer)) {
-      throw DxvkError(str::format(
+      dxvk::DxvkError::abort_ositok(str::format(
         "DxvkBuffer: Failed to create buffer:"
         "\n  flags: ", std::hex, info.flags,
         "\n  size:  ", std::dec, info.size,
@@ -154,7 +154,7 @@ namespace dxvk {
     
     if (m_vkd->vkBindBufferMemory(m_vkd->device(), handle.buffer,
         handle.memory.memory(), handle.memory.offset()) != VK_SUCCESS)
-      throw DxvkError("DxvkBuffer: Failed to bind device memory");
+      dxvk::DxvkError::abort_ositok("DxvkBuffer: Failed to bind device memory");
     
     if (clear && (m_memFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT))
       std::memset(handle.memory.mapPtr(0), 0, info.size);
@@ -174,7 +174,7 @@ namespace dxvk {
 
     if (m_vkd->vkCreateBuffer(m_vkd->device(),
           &info, nullptr, &handle.buffer) != VK_SUCCESS) {
-      throw DxvkError(str::format(
+      dxvk::DxvkError::abort_ositok(str::format(
         "DxvkBuffer: Failed to create buffer:"
         "\n  flags: ", std::hex, info.flags,
         "\n  size:  ", std::dec, info.size,
@@ -261,7 +261,7 @@ namespace dxvk {
 
     if (m_vkd->vkCreateBufferView(m_vkd->device(),
           &viewInfo, nullptr, &result) != VK_SUCCESS) {
-      throw DxvkError(str::format(
+      dxvk::DxvkError::abort_ositok(str::format(
         "DxvkBufferView: Failed to create buffer view:",
         "\n  Offset: ", viewInfo.offset,
         "\n  Range:  ", viewInfo.range,

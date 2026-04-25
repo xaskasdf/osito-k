@@ -47,7 +47,7 @@ namespace dxvk {
 
     if (m_vkd->vkCreateSampler(m_vkd->device(),
         &samplerInfo, nullptr, &m_sampler) != VK_SUCCESS)
-      throw DxvkError("DxvkSampler::DxvkSampler: Failed to create sampler");
+      dxvk::DxvkError::abort_ositok("DxvkSampler::DxvkSampler: Failed to create sampler");
   }
   
   

@@ -91,7 +91,7 @@ namespace dxvk {
 
     VkImageView result;
     if (m_vkd->vkCreateImageView(m_vkd->device(), &info, nullptr, &result) != VK_SUCCESS)
-      throw DxvkError("DxvkMetaBlitRenderPass: Failed to create image view");
+      dxvk::DxvkError::abort_ositok("DxvkMetaBlitRenderPass: Failed to create image view");
     return result;
   }
 
@@ -109,7 +109,7 @@ namespace dxvk {
 
     VkImageView result;
     if (m_vkd->vkCreateImageView(m_vkd->device(), &info, nullptr, &result) != VK_SUCCESS)
-      throw DxvkError("DxvkMetaBlitRenderPass: Failed to create image view");
+      dxvk::DxvkError::abort_ositok("DxvkMetaBlitRenderPass: Failed to create image view");
     return result;
   }
 
@@ -190,7 +190,7 @@ namespace dxvk {
     
     VkSampler result = VK_NULL_HANDLE;
     if (m_vkd->vkCreateSampler(m_vkd->device(), &info, nullptr, &result) != VK_SUCCESS)
-      throw DxvkError("DxvkMetaBlitObjects: Failed to create sampler");
+      dxvk::DxvkError::abort_ositok("DxvkMetaBlitObjects: Failed to create sampler");
     return result;
   }
   
@@ -202,7 +202,7 @@ namespace dxvk {
     
     VkShaderModule result = VK_NULL_HANDLE;
     if (m_vkd->vkCreateShaderModule(m_vkd->device(), &info, nullptr, &result) != VK_SUCCESS)
-      throw DxvkError("DxvkMetaBlitObjects: Failed to create shader module");
+      dxvk::DxvkError::abort_ositok("DxvkMetaBlitObjects: Failed to create shader module");
     return result;
   }
   
@@ -229,7 +229,7 @@ namespace dxvk {
     
     VkDescriptorSetLayout result = VK_NULL_HANDLE;
     if (m_vkd->vkCreateDescriptorSetLayout(m_vkd->device(), &info, nullptr, &result) != VK_SUCCESS)
-      throw DxvkError("DxvkMetaBlitObjects: Failed to create descriptor set layout");
+      dxvk::DxvkError::abort_ositok("DxvkMetaBlitObjects: Failed to create descriptor set layout");
     return result;
   }
   
@@ -246,7 +246,7 @@ namespace dxvk {
     
     VkPipelineLayout result = VK_NULL_HANDLE;
     if (m_vkd->vkCreatePipelineLayout(m_vkd->device(), &info, nullptr, &result) != VK_SUCCESS)
-      throw DxvkError("DxvkMetaBlitObjects: Failed to create pipeline layout");
+      dxvk::DxvkError::abort_ositok("DxvkMetaBlitObjects: Failed to create pipeline layout");
     return result;
   }
   
@@ -275,7 +275,7 @@ namespace dxvk {
       case VK_IMAGE_VIEW_TYPE_1D_ARRAY: psModule = m_shaderFrag1D; break;
       case VK_IMAGE_VIEW_TYPE_2D_ARRAY: psModule = m_shaderFrag2D; break;
       case VK_IMAGE_VIEW_TYPE_3D:       psModule = m_shaderFrag3D; break;
-      default: throw DxvkError("DxvkMetaBlitObjects: Invalid view type");
+      default: dxvk::DxvkError::abort_ositok("DxvkMetaBlitObjects: Invalid view type");
     }
     
     stages[stageCount++] = VkPipelineShaderStageCreateInfo {
@@ -338,7 +338,7 @@ namespace dxvk {
     
     VkPipeline result = VK_NULL_HANDLE;
     if (m_vkd->vkCreateGraphicsPipelines(m_vkd->device(), VK_NULL_HANDLE, 1, &info, nullptr, &result) != VK_SUCCESS)
-      throw DxvkError("DxvkMetaBlitObjects: Failed to create graphics pipeline");
+      dxvk::DxvkError::abort_ositok("DxvkMetaBlitObjects: Failed to create graphics pipeline");
     return result;
   }
   

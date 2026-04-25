@@ -181,7 +181,7 @@ namespace dxvk {
     layoutInfo.pBindings = bindingInfos.data();
 
     if (vk->vkCreateDescriptorSetLayout(vk->device(), &layoutInfo, nullptr, &m_layout) != VK_SUCCESS)
-      throw DxvkError("DxvkBindingSetLayoutKey: Failed to create descriptor set layout");
+      dxvk::DxvkError::abort_ositok("DxvkBindingSetLayoutKey: Failed to create descriptor set layout");
 
     if (layoutInfo.bindingCount) {
       VkDescriptorUpdateTemplateCreateInfo templateInfo = { VK_STRUCTURE_TYPE_DESCRIPTOR_UPDATE_TEMPLATE_CREATE_INFO };
@@ -191,7 +191,7 @@ namespace dxvk {
       templateInfo.descriptorSetLayout = m_layout;
 
       if (vk->vkCreateDescriptorUpdateTemplate(vk->device(), &templateInfo, nullptr, &m_template) != VK_SUCCESS)
-        throw DxvkError("DxvkBindingLayoutObjects: Failed to create descriptor update template");
+        dxvk::DxvkError::abort_ositok("DxvkBindingLayoutObjects: Failed to create descriptor update template");
     }
   }
 
@@ -359,7 +359,7 @@ namespace dxvk {
     // If the full set is defined, create a layout without INDEPENDENT_SET_BITS
     if (m_layout.getSetMask() == (1u << setCount) - 1) {
       if (vk->vkCreatePipelineLayout(vk->device(), &pipelineLayoutInfo, nullptr, &m_completeLayout))
-        throw DxvkError("DxvkBindingLayoutObjects: Failed to create pipeline layout");
+        dxvk::DxvkError::abort_ositok("DxvkBindingLayoutObjects: Failed to create pipeline layout");
     }
 
     // If graphics pipeline libraries are supported, also create a variand with the
@@ -373,7 +373,7 @@ namespace dxvk {
       }
 
       if (vk->vkCreatePipelineLayout(vk->device(), &pipelineLayoutInfo, nullptr, &m_independentLayout))
-        throw DxvkError("DxvkBindingLayoutObjects: Failed to create pipeline layout");
+        dxvk::DxvkError::abort_ositok("DxvkBindingLayoutObjects: Failed to create pipeline layout");
     }
   }
 

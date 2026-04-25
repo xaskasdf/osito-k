@@ -34,13 +34,13 @@ namespace dxvk {
     info.subresourceRange = vk::makeSubresourceRange(dstSubresources);
 
     if (m_vkd->vkCreateImageView(m_vkd->device(), &info, nullptr, &m_dstImageView))
-      throw DxvkError("DxvkMetaResolveViews: Failed to create destination view");
+      dxvk::DxvkError::abort_ositok("DxvkMetaResolveViews: Failed to create destination view");
 
     info.image = srcImage->handle();
     info.subresourceRange = vk::makeSubresourceRange(srcSubresources);
 
     if (m_vkd->vkCreateImageView(m_vkd->device(), &info, nullptr, &m_srcImageView))
-      throw DxvkError("DxvkMetaResolveViews: Failed to create source view");
+      dxvk::DxvkError::abort_ositok("DxvkMetaResolveViews: Failed to create source view");
   }
 
 
@@ -120,7 +120,7 @@ namespace dxvk {
     
     VkShaderModule result = VK_NULL_HANDLE;
     if (m_vkd->vkCreateShaderModule(m_vkd->device(), &info, nullptr, &result) != VK_SUCCESS)
-      throw DxvkError("DxvkMetaCopyObjects: Failed to create shader module");
+      dxvk::DxvkError::abort_ositok("DxvkMetaCopyObjects: Failed to create shader module");
     return result;
   }
 
@@ -148,7 +148,7 @@ namespace dxvk {
 
     VkDescriptorSetLayout result = VK_NULL_HANDLE;
     if (m_vkd->vkCreateDescriptorSetLayout(m_vkd->device(), &info, nullptr, &result) != VK_SUCCESS)
-      throw DxvkError("DxvkMetaResolveObjects: Failed to create descriptor set layout");
+      dxvk::DxvkError::abort_ositok("DxvkMetaResolveObjects: Failed to create descriptor set layout");
     return result;
   }
   
@@ -165,7 +165,7 @@ namespace dxvk {
     
     VkPipelineLayout result = VK_NULL_HANDLE;
     if (m_vkd->vkCreatePipelineLayout(m_vkd->device(), &info, nullptr, &result) != VK_SUCCESS)
-      throw DxvkError("DxvkMetaCopyObjects: Failed to create pipeline layout");
+      dxvk::DxvkError::abort_ositok("DxvkMetaCopyObjects: Failed to create pipeline layout");
     return result;
   }
   
@@ -303,7 +303,7 @@ namespace dxvk {
     
     VkPipeline result = VK_NULL_HANDLE;
     if (m_vkd->vkCreateGraphicsPipelines(m_vkd->device(), VK_NULL_HANDLE, 1, &info, nullptr, &result) != VK_SUCCESS)
-      throw DxvkError("DxvkMetaCopyObjects: Failed to create graphics pipeline");
+      dxvk::DxvkError::abort_ositok("DxvkMetaCopyObjects: Failed to create graphics pipeline");
     return result;
   }
 

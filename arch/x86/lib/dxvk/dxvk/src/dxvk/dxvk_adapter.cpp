@@ -299,7 +299,7 @@ namespace dxvk {
           devExtensionList.size(),
           devExtensionList.data(),
           &extensionsEnabled))
-      throw DxvkError("DxvkAdapter: Failed to create device");
+      dxvk::DxvkError::abort_ositok("DxvkAdapter: Failed to create device");
     
     // Enable additional extensions if necessary
     extensionsEnabled.merge(m_extraExtensions);
@@ -499,7 +499,7 @@ namespace dxvk {
     }
 
     if (vr != VK_SUCCESS)
-      throw DxvkError("DxvkAdapter: Failed to create device");
+      dxvk::DxvkError::abort_ositok("DxvkAdapter: Failed to create device");
     
     Rc<vk::DeviceFn> vkd = new vk::DeviceFn(m_vki, true, device);
 
@@ -519,7 +519,7 @@ namespace dxvk {
     auto devExtensionList = getExtensionList(devExtensions);
 
     if (!m_deviceExtensions.enableExtensions(devExtensionList.size(), devExtensionList.data(), nullptr))
-      throw DxvkError("DxvkAdapter: Failed to create device");
+      dxvk::DxvkError::abort_ositok("DxvkAdapter: Failed to create device");
     
     DxvkNameList extensionNameList(args.extensionCount, args.extensionNames);
 

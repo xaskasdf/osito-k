@@ -125,7 +125,7 @@ namespace dxvk {
     VkDescriptorSetLayout result = VK_NULL_HANDLE;
     if (m_vkd->vkCreateDescriptorSetLayout(m_vkd->device(),
           &dsetInfo, nullptr, &result) != VK_SUCCESS)
-      throw DxvkError("Dxvk: Failed to create meta clear descriptor set layout");
+      dxvk::DxvkError::abort_ositok("Dxvk: Failed to create meta clear descriptor set layout");
     return result;
   }
   
@@ -143,7 +143,7 @@ namespace dxvk {
     VkPipelineLayout result = VK_NULL_HANDLE;
     if (m_vkd->vkCreatePipelineLayout(m_vkd->device(),
           &pipeInfo, nullptr, &result) != VK_SUCCESS)
-      throw DxvkError("Dxvk: Failed to create meta clear pipeline layout");
+      dxvk::DxvkError::abort_ositok("Dxvk: Failed to create meta clear pipeline layout");
     return result;
   }
   
@@ -158,7 +158,7 @@ namespace dxvk {
     VkShaderModule shaderModule = VK_NULL_HANDLE;
     if (m_vkd->vkCreateShaderModule(m_vkd->device(),
           &shaderInfo, nullptr, &shaderModule) != VK_SUCCESS)
-      throw DxvkError("Dxvk: Failed to create meta clear shader module");
+      dxvk::DxvkError::abort_ositok("Dxvk: Failed to create meta clear shader module");
     
     VkPipelineShaderStageCreateInfo stageInfo = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO };
     stageInfo.stage               = VK_SHADER_STAGE_COMPUTE_BIT;
@@ -179,7 +179,7 @@ namespace dxvk {
     m_vkd->vkDestroyShaderModule(m_vkd->device(), shaderModule, nullptr);
     
     if (status != VK_SUCCESS)
-      throw DxvkError("Dxvk: Failed to create meta clear compute pipeline");
+      dxvk::DxvkError::abort_ositok("Dxvk: Failed to create meta clear compute pipeline");
     return result;
   }
   

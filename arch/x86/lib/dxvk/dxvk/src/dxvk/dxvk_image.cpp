@@ -43,7 +43,7 @@ namespace dxvk {
       externalInfo.pNext = std::exchange(info.pNext, &externalInfo);
 
     if (m_vkd->vkCreateImage(m_vkd->device(), &info, nullptr, &m_image.image)) {
-      throw DxvkError(str::format(
+      dxvk::DxvkError::abort_ositok(str::format(
         "DxvkImage: Failed to create image:",
         "\n  Type:            ", info.imageType,
         "\n  Format:          ", info.format,
@@ -115,7 +115,7 @@ namespace dxvk {
       // Try to bind the allocated memory slice to the image
       if (m_vkd->vkBindImageMemory(m_vkd->device(), m_image.image,
           m_image.memory.memory(), m_image.memory.offset()) != VK_SUCCESS)
-        throw DxvkError("DxvkImage::DxvkImage: Failed to bind device memory");
+        dxvk::DxvkError::abort_ositok("DxvkImage::DxvkImage: Failed to bind device memory");
     } else {
       // Initialize sparse info. We do not immediately bind the metadata
       // aspects of the image here, the caller needs to explicitly do that.
@@ -271,7 +271,7 @@ namespace dxvk {
       } break;
       
       default:
-        throw DxvkError(str::format("DxvkImageView: Invalid view type: ", m_info.type));
+        dxvk::DxvkError::abort_ositok(str::format("DxvkImageView: Invalid view type: ", m_info.type));
     }
   }
   
@@ -308,7 +308,7 @@ namespace dxvk {
     
     if (m_vkd->vkCreateImageView(m_vkd->device(),
           &viewInfo, nullptr, &m_views[type]) != VK_SUCCESS) {
-      throw DxvkError(str::format(
+      dxvk::DxvkError::abort_ositok(str::format(
         "DxvkImageView: Failed to create image view:"
         "\n  View type:       ", viewInfo.viewType,
         "\n  View format:     ", viewInfo.format,

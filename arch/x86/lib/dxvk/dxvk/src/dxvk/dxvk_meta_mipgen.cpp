@@ -65,7 +65,7 @@ namespace dxvk {
     viewInfo.subresourceRange = srcSubresources;
 
     if (m_vkd->vkCreateImageView(m_vkd->device(), &viewInfo, nullptr, &result.src) != VK_SUCCESS)
-      throw DxvkError("DxvkMetaMipGenRenderPass: Failed to create source image view");
+      dxvk::DxvkError::abort_ositok("DxvkMetaMipGenRenderPass: Failed to create source image view");
     
     // Create destination image view, which points
     // to the mip level we're going to render to.
@@ -89,7 +89,7 @@ namespace dxvk {
     viewInfo.subresourceRange = dstSubresources;
     
     if (m_vkd->vkCreateImageView(m_vkd->device(), &viewInfo, nullptr, &result.dst) != VK_SUCCESS)
-      throw DxvkError("DxvkMetaMipGenRenderPass: Failed to create destination image view");
+      dxvk::DxvkError::abort_ositok("DxvkMetaMipGenRenderPass: Failed to create destination image view");
 
     return result;
   }

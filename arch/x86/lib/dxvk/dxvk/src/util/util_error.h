@@ -24,10 +24,13 @@ namespace dxvk {
 
 #ifdef __OSITO_K__
     /* OsitoK: build with -fno-exceptions. `throw DxvkError(msg)` statements
-     * in DXVK .cpp files are rewritten by a helper macro in
-     * dxbc_include.h / dxvk_include.h that funnels through this noreturn
-     * member. Defined in ositok_dxvk_throw.cpp or cxx_stubs.c. */
+     * in DXVK .cpp files are rewritten (W5.2) to call this noreturn helper
+     * with the original constructor argument. Two overloads cover both
+     * string-literal sites and `str::format(...)` (returns std::string)
+     * sites without forcing a sed-time .c_str() ritual. */
     [[noreturn]] static void abort_ositok(const char *msg);
+    [[noreturn]] static void abort_ositok(const std::string& msg);
+    [[noreturn]] static void abort_ositok();
 #endif
 
   private:

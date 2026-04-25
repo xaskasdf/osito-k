@@ -315,7 +315,7 @@ namespace dxvk {
     VkDescriptorPool pool = VK_NULL_HANDLE;
 
     if (vk->vkCreateDescriptorPool(vk->device(), &info, nullptr, &pool) != VK_SUCCESS)
-      throw DxvkError("DxvkDescriptorPool: Failed to create descriptor pool");
+      dxvk::DxvkError::abort_ositok("DxvkDescriptorPool: Failed to create descriptor pool");
 
     if (m_contextType == DxvkContextType::Primary)
       m_device->addStatCtr(DxvkStatCounter::DescriptorPoolCount, 1);

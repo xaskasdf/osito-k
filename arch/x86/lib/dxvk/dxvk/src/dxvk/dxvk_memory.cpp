@@ -281,7 +281,7 @@ namespace dxvk {
     this->logMemoryError(req.core.memoryRequirements);
     this->logMemoryStats();
 
-    throw DxvkError("DxvkMemoryAllocator: Memory allocation failed");
+    dxvk::DxvkError::abort_ositok("DxvkMemoryAllocator: Memory allocation failed");
   }
   
   

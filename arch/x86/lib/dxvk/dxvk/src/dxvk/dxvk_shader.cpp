@@ -862,7 +862,7 @@ namespace dxvk {
       auto vk = m_device->vkd();
 
       if (vk->vkCreateShaderModule(vk->device(), &moduleInfo, nullptr, &shaderModule))
-        throw DxvkError("DxvkShaderStageInfo: Failed to create shader module");
+        dxvk::DxvkError::abort_ositok("DxvkShaderStageInfo: Failed to create shader module");
     }
 
     // Set up shader stage info with the data provided

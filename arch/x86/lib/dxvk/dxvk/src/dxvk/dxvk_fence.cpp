@@ -40,7 +40,7 @@ namespace dxvk {
       &semaphoreInfo, nullptr, &m_semaphore);
 
     if (vr != VK_SUCCESS)
-      throw DxvkError("Failed to create timeline semaphore");
+      dxvk::DxvkError::abort_ositok("Failed to create timeline semaphore");
 
     if (info.sharedHandle != INVALID_HANDLE_VALUE) {
       if (externalFeatures & VK_EXTERNAL_SEMAPHORE_FEATURE_IMPORTABLE_BIT) {
@@ -51,7 +51,7 @@ namespace dxvk {
 
         vr = m_vkd->vkImportSemaphoreWin32HandleKHR(m_vkd->device(), &importInfo);
         if (vr != VK_SUCCESS)
-          throw DxvkError("Failed to import timeline semaphore");
+          dxvk::DxvkError::abort_ositok("Failed to import timeline semaphore");
       } else {
         Logger::warn(str::format("Importing semaphores of type ", info.sharedType, " not supported by device"));
       }

@@ -190,7 +190,7 @@ namespace dxvk {
       VK_NULL_HANDLE, 1, &info, nullptr, &m_pipeline);
 
     if (vr)
-      throw DxvkError("Failed to create vertex input pipeline library");
+      dxvk::DxvkError::abort_ositok("Failed to create vertex input pipeline library");
   }
 
 
@@ -446,7 +446,7 @@ namespace dxvk {
       VK_NULL_HANDLE, 1, &info, nullptr, &m_pipeline);
 
     if (vr)
-      throw DxvkError("Failed to create vertex input pipeline library");
+      dxvk::DxvkError::abort_ositok("Failed to create vertex input pipeline library");
   }
 
 

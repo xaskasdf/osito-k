@@ -101,7 +101,7 @@ namespace dxvk {
 
     VkDescriptorSetLayout result = VK_NULL_HANDLE;
     if (m_vkd->vkCreateDescriptorSetLayout(m_vkd->device(), &dsetInfo, nullptr, &result) != VK_SUCCESS)
-      throw DxvkError("DxvkMetaPackObjects: Failed to create descriptor set layout");
+      dxvk::DxvkError::abort_ositok("DxvkMetaPackObjects: Failed to create descriptor set layout");
     return result;
   }
 
@@ -119,7 +119,7 @@ namespace dxvk {
 
     VkDescriptorSetLayout result = VK_NULL_HANDLE;
     if (m_vkd->vkCreateDescriptorSetLayout(m_vkd->device(), &dsetInfo, nullptr, &result) != VK_SUCCESS)
-      throw DxvkError("DxvkMetaPackObjects: Failed to create descriptor set layout");
+      dxvk::DxvkError::abort_ositok("DxvkMetaPackObjects: Failed to create descriptor set layout");
     return result;
   }
 
@@ -137,7 +137,7 @@ namespace dxvk {
 
     VkPipelineLayout result = VK_NULL_HANDLE;
     if (m_vkd->vkCreatePipelineLayout(m_vkd->device(), &layoutInfo, nullptr, &result) != VK_SUCCESS)
-      throw DxvkError("DxvkMetaPackObjects: Failed to create pipeline layout");
+      dxvk::DxvkError::abort_ositok("DxvkMetaPackObjects: Failed to create pipeline layout");
     return result;
   }
 
@@ -160,7 +160,7 @@ namespace dxvk {
     VkDescriptorUpdateTemplate result = VK_NULL_HANDLE;
     if (m_vkd->vkCreateDescriptorUpdateTemplate(m_vkd->device(),
           &templateInfo, nullptr, &result) != VK_SUCCESS)
-      throw DxvkError("DxvkMetaPackObjects: Failed to create descriptor update template");
+      dxvk::DxvkError::abort_ositok("DxvkMetaPackObjects: Failed to create descriptor update template");
     return result;
   }
 
@@ -184,7 +184,7 @@ namespace dxvk {
     VkDescriptorUpdateTemplate result = VK_NULL_HANDLE;
     if (m_vkd->vkCreateDescriptorUpdateTemplate(m_vkd->device(),
           &templateInfo, nullptr, &result) != VK_SUCCESS)
-      throw DxvkError("DxvkMetaPackObjects: Failed to create descriptor update template");
+      dxvk::DxvkError::abort_ositok("DxvkMetaPackObjects: Failed to create descriptor update template");
     return result;
   }
 
@@ -199,7 +199,7 @@ namespace dxvk {
     VkShaderModule module = VK_NULL_HANDLE;
 
     if (m_vkd->vkCreateShaderModule(m_vkd->device(), &shaderInfo, nullptr, &module) != VK_SUCCESS)
-      throw DxvkError("DxvkMetaPackObjects: Failed to create shader module");
+      dxvk::DxvkError::abort_ositok("DxvkMetaPackObjects: Failed to create shader module");
     
     VkPipelineShaderStageCreateInfo stageInfo = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO };
     stageInfo.stage     = VK_SHADER_STAGE_COMPUTE_BIT;
@@ -219,7 +219,7 @@ namespace dxvk {
     m_vkd->vkDestroyShaderModule(m_vkd->device(), module, nullptr);
 
     if (status != VK_SUCCESS)
-      throw DxvkError("DxvkMetaPackObjects: Failed to create pipeline");
+      dxvk::DxvkError::abort_ositok("DxvkMetaPackObjects: Failed to create pipeline");
     return result;
   }
   

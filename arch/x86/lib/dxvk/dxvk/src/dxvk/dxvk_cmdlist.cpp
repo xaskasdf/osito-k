@@ -112,7 +112,7 @@ namespace dxvk {
     poolInfo.queueFamilyIndex = queueFamily;
 
     if (vk->vkCreateCommandPool(vk->device(), &poolInfo, nullptr, &m_commandPool))
-      throw DxvkError("DxvkCommandPool: Failed to create command pool");
+      dxvk::DxvkError::abort_ositok("DxvkCommandPool: Failed to create command pool");
   }
 
 
@@ -136,7 +136,7 @@ namespace dxvk {
       VkCommandBuffer commandBuffer = VK_NULL_HANDLE;
 
       if (vk->vkAllocateCommandBuffers(vk->device(), &allocInfo, &commandBuffer))
-        throw DxvkError("DxvkCommandPool: Failed to allocate command buffer");
+        dxvk::DxvkError::abort_ositok("DxvkCommandPool: Failed to allocate command buffer");
 
       m_commandBuffers.push_back(commandBuffer);
     }
@@ -149,7 +149,7 @@ namespace dxvk {
     info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
 
     if (vk->vkBeginCommandBuffer(commandBuffer, &info))
-      throw DxvkError("DxvkCommandPool: Failed to begin command buffer");
+      dxvk::DxvkError::abort_ositok("DxvkCommandPool: Failed to begin command buffer");
 
     return commandBuffer;
   }
@@ -160,7 +160,7 @@ namespace dxvk {
 
     if (m_next) {
       if (vk->vkResetCommandPool(vk->device(), m_commandPool, 0))
-        throw DxvkError("DxvkCommandPool: Failed to reset command pool");
+        dxvk::DxvkError::abort_ositok("DxvkCommandPool: Failed to reset command pool");
 
       m_next = 0;
     }
@@ -179,12 +179,12 @@ namespace dxvk {
     if (m_vkd->vkCreateSemaphore(m_vkd->device(), &semaphoreInfo, nullptr, &m_bindSemaphore)
      || m_vkd->vkCreateSemaphore(m_vkd->device(), &semaphoreInfo, nullptr, &m_postSemaphore)
      || m_vkd->vkCreateSemaphore(m_vkd->device(), &semaphoreInfo, nullptr, &m_sdmaSemaphore))
-      throw DxvkError("DxvkCommandList: Failed to create semaphore");
+      dxvk::DxvkError::abort_ositok("DxvkCommandList: Failed to create semaphore");
 
     VkFenceCreateInfo fenceInfo = { VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
 
     if (m_vkd->vkCreateFence(m_vkd->device(), &fenceInfo, nullptr, &m_fence))
-      throw DxvkError("DxvkCommandList: Failed to create fence");
+      dxvk::DxvkError::abort_ositok("DxvkCommandList: Failed to create fence");
 
     m_graphicsPool = new DxvkCommandPool(device, graphicsQueue.queueFamily);
 
@@ -413,7 +413,7 @@ namespace dxvk {
     auto vk = m_device->vkd();
 
     if (vk->vkEndCommandBuffer(cmdBuffer))
-      throw DxvkError("DxvkCommandList: Failed to end command buffer");
+      dxvk::DxvkError::abort_ositok("DxvkCommandList: Failed to end command buffer");
   }
 
 }

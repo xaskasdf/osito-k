@@ -33,7 +33,7 @@ namespace dxvk {
     createLibraryLoader(args);
 
     if (!m_vkl->valid())
-      throw DxvkError("Failed to load vulkan-1 library.");
+      dxvk::DxvkError::abort_ositok("Failed to load vulkan-1 library.");
 
     // Initialize extension providers
     m_extProviders.push_back(&DxvkPlatformExts::s_instance);
@@ -126,7 +126,7 @@ namespace dxvk {
       auto extensionInfos = getExtensionList(m_extensions, true);
 
       if (!extensionSet.enableExtensions(extensionInfos.size(), extensionInfos.data(), nullptr))
-        throw DxvkError("DxvkInstance: Required instance extensions not enabled");
+        dxvk::DxvkError::abort_ositok("DxvkInstance: Required instance extensions not enabled");
     } else {
       // Hide VK_EXT_debug_utils behind an environment variable.
       // This extension adds additional overhead to winevulkan.
@@ -160,7 +160,7 @@ namespace dxvk {
       DxvkNameSet extensionsAvailable = DxvkNameSet::enumInstanceExtensions(m_vkl);
 
       if (!extensionsAvailable.enableExtensions(extensionInfos.size(), extensionInfos.data(), &extensionSet))
-        throw DxvkError("DxvkInstance: Required instance extensions not supported");
+        dxvk::DxvkError::abort_ositok("DxvkInstance: Required instance extensions not supported");
 
       for (const auto& provider : m_extProviders)
         extensionSet.merge(provider->getInstanceExtensions());
@@ -195,7 +195,7 @@ namespace dxvk {
       VkResult status = m_vkl->vkCreateInstance(&info, nullptr, &instance);
 
       if (status != VK_SUCCESS)
-        throw DxvkError("DxvkInstance::createInstance: Failed to create Vulkan 1.1 instance");
+        dxvk::DxvkError::abort_ositok("DxvkInstance::createInstance: Failed to create Vulkan 1.1 instance");
     }
 
     // Create the Vulkan instance loader
@@ -240,11 +240,11 @@ namespace dxvk {
   std::vector<Rc<DxvkAdapter>> DxvkInstance::queryAdapters() {
     uint32_t numAdapters = 0;
     if (m_vki->vkEnumeratePhysicalDevices(m_vki->instance(), &numAdapters, nullptr) != VK_SUCCESS)
-      throw DxvkError("DxvkInstance::enumAdapters: Failed to enumerate adapters");
+      dxvk::DxvkError::abort_ositok("DxvkInstance::enumAdapters: Failed to enumerate adapters");
     
     std::vector<VkPhysicalDevice> adapters(numAdapters);
     if (m_vki->vkEnumeratePhysicalDevices(m_vki->instance(), &numAdapters, adapters.data()) != VK_SUCCESS)
-      throw DxvkError("DxvkInstance::enumAdapters: Failed to enumerate adapters");
+      dxvk::DxvkError::abort_ositok("DxvkInstance::enumAdapters: Failed to enumerate adapters");
 
     std::vector<VkPhysicalDeviceProperties> deviceProperties(numAdapters);
     DxvkDeviceFilterFlags filterFlags = 0;
