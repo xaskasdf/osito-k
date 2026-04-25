@@ -38,10 +38,12 @@ OPENGL_ROOT := $(CURDIR)
 OSITOK_ROOT ?= $(OPENGL_ROOT)/../../../..
 MESA_ROOT   := $(OPENGL_ROOT)/mesa
 BUILD_DIR   := $(OSITOK_ROOT)/arch/x86/build/lib/opengl
-OUT         := $(BUILD_DIR)/libmesa_util.a
-OUT_GALLIUM := $(BUILD_DIR)/libmesa_gallium.a
+OUT          := $(BUILD_DIR)/libmesa_util.a
+OUT_GALLIUM  := $(BUILD_DIR)/libmesa_gallium.a
+OUT_COMPILER := $(BUILD_DIR)/libmesa_compiler.a
 
 CC          ?= gcc
+CXX         ?= g++
 AR          ?= ar
 GCC_INC     := $(shell $(CC) -print-file-name=include)
 
@@ -57,6 +59,33 @@ INCLUDES := \
   -I$(MESA_ROOT)/src/c11 \
   -I$(MESA_ROOT)/src/gallium/include \
   -I$(MESA_ROOT)/src/gallium/auxiliary
+
+# W4.2 — extended include set for compiler/{glsl,nir,spirv}/
+INCLUDES_COMPILER := \
+  $(INCLUDES) \
+  -I$(MESA_ROOT)/src/compiler \
+  -I$(MESA_ROOT)/src/compiler/glsl \
+  -I$(MESA_ROOT)/src/compiler/nir \
+  -I$(MESA_ROOT)/src/compiler/spirv \
+  -I$(OSITOK_ROOT)/arch/x86/lib/vulkan/include
+
+# W4.2 — C++ uses HOSTED gcc:12 libstdc++ (no -nostdinc, no -nostdinc++).
+# We DROP -Imesa/src/c11 because it shadows glibc's <time.h> with mesa's
+# polyfill (which expects time_t to be pre-declared). All Mesa users
+# of c11/* already use the explicit "c11/threads.h" path.
+INCLUDES_COMPILER_CXX := \
+  -I$(OPENGL_ROOT)/include \
+  -I$(OPENGL_ROOT)/osito_compat \
+  -I$(MESA_ROOT)/include \
+  -I$(MESA_ROOT)/src \
+  -I$(MESA_ROOT)/src/util \
+  -I$(MESA_ROOT)/src/gallium/include \
+  -I$(MESA_ROOT)/src/gallium/auxiliary \
+  -I$(MESA_ROOT)/src/compiler \
+  -I$(MESA_ROOT)/src/compiler/glsl \
+  -I$(MESA_ROOT)/src/compiler/nir \
+  -I$(MESA_ROOT)/src/compiler/spirv \
+  -I$(OSITOK_ROOT)/arch/x86/lib/vulkan/include
 
 CFLAGS := \
   -std=gnu11 -ffreestanding -nostdinc \
@@ -74,6 +103,55 @@ CFLAGS := \
   -DHAVE_FUNC_ATTRIBUTE_WARN_UNUSED_RESULT \
   -include $(OPENGL_ROOT)/osito_compat/mesa_compat.h \
   $(INCLUDES) \
+  -isystem $(GCC_INC)
+
+# W4.2 — CFLAGS for compiler/nir/. Same as base CFLAGS but with the
+# compiler/* includes, plus -Wno-misleading-indentation for the
+# 32 MB nir_opt_algebraic.c (Mesa upstream does the same — see
+# nir/meson.build comment).
+CFLAGS_COMPILER := \
+  -std=gnu11 -ffreestanding -nostdinc \
+  -fno-stack-protector -mno-red-zone \
+  -Wall -Wextra -Wno-unused-parameter -Wno-unused-function \
+  -Wno-missing-field-initializers -Wno-pointer-arith \
+  -Wno-sign-compare -Wno-misleading-indentation \
+  -O2 -fno-pic -fvisibility=hidden \
+  -D__OSITO_K__ \
+  -DHAVE_FUNC_ATTRIBUTE_PACKED \
+  -DHAVE_FUNC_ATTRIBUTE_FLATTEN \
+  -DHAVE_FUNC_ATTRIBUTE_FORMAT \
+  -DHAVE_FUNC_ATTRIBUTE_UNUSED \
+  -DHAVE_FUNC_ATTRIBUTE_NORETURN \
+  -DHAVE_FUNC_ATTRIBUTE_WARN_UNUSED_RESULT \
+  -include $(OPENGL_ROOT)/osito_compat/mesa_compat.h \
+  $(INCLUDES_COMPILER) \
+  -isystem $(GCC_INC)
+
+# W4.2 — CXXFLAGS for compiler/glsl/.  Hosted libstdc++ (no -nostdinc).
+# Same flag pattern as DXVK's W5.0 build:
+#   -std=gnu++17 -fno-exceptions -fno-rtti
+# We DON'T set -nostdinc because the GLSL frontend uses <vector>,
+# <string>, <unordered_map> from libstdc++. The -isystem GCC_INC line
+# pulls in /usr/local/include/c++/12/ for libstdc++ headers and
+# /usr/include/ glibc headers transparently.
+CXXFLAGS_COMPILER := \
+  -std=gnu++17 -fno-exceptions -fno-rtti \
+  -ffreestanding -fno-stack-protector -mno-red-zone \
+  -Wall -Wextra -Wno-unused-parameter -Wno-unused-function \
+  -Wno-missing-field-initializers -Wno-pointer-arith \
+  -Wno-sign-compare -Wno-unused-variable -Wno-unused-but-set-variable \
+  -Wno-non-virtual-dtor -Wno-deprecated-declarations \
+  -Wno-class-memaccess -Wno-stringop-truncation \
+  -O2 -fno-pic -fvisibility=hidden \
+  -D__OSITO_K__ \
+  -DHAVE_FUNC_ATTRIBUTE_PACKED \
+  -DHAVE_FUNC_ATTRIBUTE_FLATTEN \
+  -DHAVE_FUNC_ATTRIBUTE_FORMAT \
+  -DHAVE_FUNC_ATTRIBUTE_UNUSED \
+  -DHAVE_FUNC_ATTRIBUTE_NORETURN \
+  -DHAVE_FUNC_ATTRIBUTE_WARN_UNUSED_RESULT \
+  -include $(OPENGL_ROOT)/osito_compat/mesa_compat.h \
+  $(INCLUDES_COMPILER_CXX) \
   -isystem $(GCC_INC)
 
 # T3 — list of util/ files we currently know how to compile.
@@ -201,10 +279,92 @@ GALLIUM_SRCS := \
 
 GALLIUM_OBJS := $(patsubst %.c,$(BUILD_DIR)/%.o,$(GALLIUM_SRCS))
 
-.PHONY: all clean util gallium
-all: $(OUT) $(OUT_GALLIUM)
+# ---------------------------------------------------------------------------
+# W4.2 — libmesa_compiler.a
+# ---------------------------------------------------------------------------
+#
+# Sources:
+#   * compiler top-level (3): glsl_types.c, builtin_types.c, shader_enums.c
+#     (compiled as C — both use C99 designated initialisers in declaration
+#      order that gcc rejects under C++ rules)
+#   * compiler/nir (209): all .c files INCLUDING the four pre-generated
+#     codegen files (nir_opt_algebraic.c — 32 MB, nir_intrinsics.c,
+#     nir_constant_expressions.c, nir_opcodes.c).
+#     -Wno-misleading-indentation drops the gcc note that flags the giant
+#     generated nir_opt_algebraic.c indentation; Mesa upstream does the
+#     same in nir/meson.build.
+#   * compiler/spirv (15): spirv_to_nir.c + vtn_*.c + spirv_info.c +
+#     vtn_gather_types.c. spirv2nir.c (standalone driver) is excluded
+#     because it pulls <fcntl.h> for stdin reading.
+#   * compiler/glsl (17 of 55 .cpp files): only the AST/IR helpers
+#     that don't transitively #include "main/macros.h", "main/mtypes.h",
+#     "program/symbol_table.h", or "main/consts_exts.h". Those headers
+#     belong to mesa/src/mesa/main/ — Mesa's GL state-tracker, which is
+#     a separate ~MB-scale chunk we'll vendor in a later wave (or skip
+#     entirely if Zink ends up not needing the legacy GL→GLSL path).
+#
+# W4.2 exclusions (from compiler/glsl/), tracked here so a later wave
+# can lift them when mesa/main/ ships:
+#   ast_array_index.cpp ast_function.cpp ast_to_hir.cpp ast_type.cpp
+#   builtin_functions.cpp builtin_types.cpp builtin_variables.cpp
+#   glsl_lexer.cpp glsl_parser.cpp glsl_parser_extras.cpp
+#   glsl_symbol_table.cpp ir.cpp ir_function.cpp
+#   ir_function_detect_recursion.cpp ir_print_visitor.cpp ir_validate.cpp
+#   gl_nir_*.cpp (12 files — link/lower/etc, all need main/mtypes.h)
+#   glsl_to_nir.cpp (needs float64_glsl.h xxd-embedded resource)
+#   linker_util.cpp lower_distance.cpp lower_int64.cpp lower_precision.cpp
+#   lower_*.cpp (the ones still needing main/macros.h)
+#   opt_algebraic.cpp opt_*.cpp (the ones needing main/macros.h)
+#   serialize.cpp shader_cache.cpp standalone.cpp
+#   standalone_scaffolding.cpp main.cpp
+#
+# The 17 included GLSL .cpp files give us enough surface to do basic
+# IR walking + cloning + visitor patterns; full GLSL→NIR is a W4.3+
+# task once mesa/main/ + xxd float64_glsl.h are vendored.
+
+# C sources for libmesa_compiler.a (compiled as C: top-level + nir + spirv).
+# Wildcards are evaluated at make-time; one-shot generation.
+COMPILER_NIR_SRCS    := $(wildcard $(MESA_ROOT)/src/compiler/nir/*.c)
+COMPILER_SPIRV_SRCS  := $(filter-out $(MESA_ROOT)/src/compiler/spirv/spirv2nir.c, \
+                                     $(wildcard $(MESA_ROOT)/src/compiler/spirv/*.c))
+COMPILER_TOP_SRCS    := \
+  $(MESA_ROOT)/src/compiler/glsl_types.c \
+  $(MESA_ROOT)/src/compiler/builtin_types.c \
+  $(MESA_ROOT)/src/compiler/shader_enums.c
+
+COMPILER_C_SRCS_ABS  := $(COMPILER_TOP_SRCS) $(COMPILER_NIR_SRCS) $(COMPILER_SPIRV_SRCS)
+# strip $(OPENGL_ROOT)/ prefix to get relative paths for the build rule
+COMPILER_C_SRCS      := $(patsubst $(OPENGL_ROOT)/%,%,$(COMPILER_C_SRCS_ABS))
+
+# C++ sources for libmesa_compiler.a — minimal GLSL frontend pieces.
+COMPILER_CXX_SRCS := \
+  mesa/src/compiler/glsl/ir_basic_block.cpp \
+  mesa/src/compiler/glsl/ir_clone.cpp \
+  mesa/src/compiler/glsl/ir_constant_expression.cpp \
+  mesa/src/compiler/glsl/ir_expression_flattening.cpp \
+  mesa/src/compiler/glsl/ir_hierarchical_visitor.cpp \
+  mesa/src/compiler/glsl/ir_hv_accept.cpp \
+  mesa/src/compiler/glsl/ir_rvalue_visitor.cpp \
+  mesa/src/compiler/glsl/ir_variable_refcount.cpp \
+  mesa/src/compiler/glsl/lower_builtins.cpp \
+  mesa/src/compiler/glsl/lower_jumps.cpp \
+  mesa/src/compiler/glsl/lower_mat_op_to_vec.cpp \
+  mesa/src/compiler/glsl/lower_packing_builtins.cpp \
+  mesa/src/compiler/glsl/opt_dead_code.cpp \
+  mesa/src/compiler/glsl/opt_flatten_nested_if_blocks.cpp \
+  mesa/src/compiler/glsl/opt_function_inlining.cpp \
+  mesa/src/compiler/glsl/opt_if_simplification.cpp \
+  mesa/src/compiler/glsl/opt_tree_grafting.cpp
+
+COMPILER_C_OBJS   := $(patsubst %.c,$(BUILD_DIR)/%.o,$(COMPILER_C_SRCS))
+COMPILER_CXX_OBJS := $(patsubst %.cpp,$(BUILD_DIR)/%.o,$(COMPILER_CXX_SRCS))
+COMPILER_OBJS     := $(COMPILER_C_OBJS) $(COMPILER_CXX_OBJS)
+
+.PHONY: all clean util gallium compiler
+all: $(OUT) $(OUT_GALLIUM) $(OUT_COMPILER)
 util: $(OUT)
 gallium: $(OUT_GALLIUM)
+compiler: $(OUT_COMPILER)
 
 $(OUT): $(UTIL_OBJS) | $(BUILD_DIR)
 	@echo "  AR    $(notdir $@)"
@@ -216,11 +376,48 @@ $(OUT_GALLIUM): $(GALLIUM_OBJS) | $(BUILD_DIR)
 	@$(AR) rcs $@ $(GALLIUM_OBJS)
 	@echo "  -> $$($(AR) t $@ | wc -l) objects in $@"
 
-# Pattern rule: build/lib/opengl/foo/bar.o : foo/bar.c
-$(BUILD_DIR)/%.o: $(OPENGL_ROOT)/%.c | $(BUILD_DIR)
+$(OUT_COMPILER): $(COMPILER_OBJS) | $(BUILD_DIR)
+	@echo "  AR    $(notdir $@)"
+	@$(AR) rcs $@ $(COMPILER_OBJS)
+	@echo "  -> $$($(AR) t $@ | wc -l) objects in $@"
+
+# Default pattern rule for util/gallium (build/lib/opengl/foo/bar.o : foo/bar.c)
+$(BUILD_DIR)/osito_compat/%.o: $(OPENGL_ROOT)/osito_compat/%.c | $(BUILD_DIR)
 	@mkdir -p $(dir $@)
 	@echo "  CC    $*"
 	@$(CC) $(CFLAGS) -c -o $@ $<
+
+$(BUILD_DIR)/mesa/src/util/%.o: $(OPENGL_ROOT)/mesa/src/util/%.c | $(BUILD_DIR)
+	@mkdir -p $(dir $@)
+	@echo "  CC    $*"
+	@$(CC) $(CFLAGS) -c -o $@ $<
+
+$(BUILD_DIR)/mesa/src/gallium/%.o: $(OPENGL_ROOT)/mesa/src/gallium/%.c | $(BUILD_DIR)
+	@mkdir -p $(dir $@)
+	@echo "  CC    $*"
+	@$(CC) $(CFLAGS) -c -o $@ $<
+
+# W4.2 pattern rules for compiler/{nir,spirv,top}/ — use CFLAGS_COMPILER.
+$(BUILD_DIR)/mesa/src/compiler/nir/%.o: $(MESA_ROOT)/src/compiler/nir/%.c | $(BUILD_DIR)
+	@mkdir -p $(dir $@)
+	@echo "  CC    nir/$*"
+	@$(CC) $(CFLAGS_COMPILER) -c -o $@ $<
+
+$(BUILD_DIR)/mesa/src/compiler/spirv/%.o: $(MESA_ROOT)/src/compiler/spirv/%.c | $(BUILD_DIR)
+	@mkdir -p $(dir $@)
+	@echo "  CC    spirv/$*"
+	@$(CC) $(CFLAGS_COMPILER) -c -o $@ $<
+
+$(BUILD_DIR)/mesa/src/compiler/%.o: $(MESA_ROOT)/src/compiler/%.c | $(BUILD_DIR)
+	@mkdir -p $(dir $@)
+	@echo "  CC    compiler/$*"
+	@$(CC) $(CFLAGS_COMPILER) -c -o $@ $<
+
+# W4.2 pattern rule for compiler/glsl/*.cpp -> CXX_FLAGS_COMPILER.
+$(BUILD_DIR)/mesa/src/compiler/glsl/%.o: $(MESA_ROOT)/src/compiler/glsl/%.cpp | $(BUILD_DIR)
+	@mkdir -p $(dir $@)
+	@echo "  CXX   glsl/$*"
+	@$(CXX) $(CXXFLAGS_COMPILER) -c -o $@ $<
 
 $(BUILD_DIR):
 	@mkdir -p $(BUILD_DIR)
