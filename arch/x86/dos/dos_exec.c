@@ -627,8 +627,8 @@ void dos_transfer_to_native(dos_vm_t *vm)
             uint16_t iopb_offset;
         } kernel_tss;
         extern uint8_t ist1_stack[];
-        /* Reuse top of IST1 — it's 64 KB, plenty even with nested ints. */
-        kernel_tss.rsp0 = (uint64_t)(ist1_stack + 65536);
+        /* Reuse top of IST1 — IST1_STACK_SIZE is 256KB. */
+        kernel_tss.rsp0 = (uint64_t)(ist1_stack + 262144);
         serial_puts("[DOS-NT] TSS.RSP0 set to IST1 top = 0x");
         serial_puthex(kernel_tss.rsp0, 16); serial_puts("\n");
     }

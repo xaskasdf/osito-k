@@ -325,8 +325,14 @@ struct tss64 kernel_tss __attribute__((aligned(16)));
 uint64_t *tss_ist1_ptr;  /* = &kernel_tss.ist1, set in tss_init() */
 uint64_t *tss_ist2_ptr;  /* = &kernel_tss.ist2, for DOS INT stubs */
 
-/* IST1 stack for INT 0x2E — 64KB (needs room for re-entrant callbacks) */
-#define IST1_STACK_SIZE 65536
+/* IST1 stack for INT 0x2E — 256KB.
+ * int2e_stub.S reserves 32KB per nest (subq $32768). UT99's C++ EH
+ * unwind chain re-throws through 3-4 catches → 3-4 nested INT 0x2E
+ * entries → 96-128KB needed. 64KB was overflowing into garbage and
+ * corrupting RtlRaiseException's locals → unwind globals stayed set
+ * from a prior catch → next int2e_stub iret jumped to stale catch
+ * with stale ESP/EBP → user-stack execution → #BR. */
+#define IST1_STACK_SIZE 262144
 uint8_t ist1_stack[IST1_STACK_SIZE] __attribute__((aligned(16)));
 
 /* IST2 stack for DOS INTs + #DB — 32KB */

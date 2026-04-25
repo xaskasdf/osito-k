@@ -526,16 +526,10 @@ void RtlRaiseException(PEXCEPTION_RECORD ExceptionRecord)
             return;
     }
 
-    /* Unhandled — for C++ exceptions (0xE06D7363) we suppress and let the
-     * caller continue, instead of terminating. UT99's _initterm and many
-     * engine paths throw FCriticalError but their unwind targets are deeply
-     * embedded in the engine's catch blocks, which we can't dispatch into
-     * from this 64-bit kernel context yet. Suppression keeps the process
-     * alive and matches the previous "wide-range corrupt" behavior that
-     * got UT99 to ~29M INT 0x2E calls before the SEH walker rewrite.
-     *
-     * Real fix: dispatch handlers through compat32_callback so the catch
-     * block runs in 32-bit compat mode. */
+    /* Unhandled C++ throws (0xE06D7363) suppress and continue — UT99's
+     * engine FCriticalError throw cycle would otherwise terminate before
+     * init completes. Combined with IST1 stack at 256KB (vs prior 64KB)
+     * the nested catch chain now fits without overflowing into garbage. */
     if (ExceptionRecord->ExceptionCode == 0xE06D7363) {
         serial_puts("[SEH] suppressing unhandled C++ throw (continuing)\n");
         return;

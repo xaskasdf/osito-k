@@ -2368,7 +2368,7 @@ static void shell_exec(char *line)
                 extern uint64_t *tss_ist1_ptr;
                 extern uint8_t ist1_stack[];
                 if (tss_ist1_ptr)
-                    *tss_ist1_ptr = (uint64_t)(ist1_stack + 65536);
+                    *tss_ist1_ptr = (uint64_t)(ist1_stack + 262144);
                 /* Reset compat32 mode flag */
                 extern int g_compat32_mode;
                 g_compat32_mode = 0;
@@ -2394,7 +2394,7 @@ static void shell_exec(char *line)
                 sh_puts(rc == 2 ? "crash" : "normal");
                 sh_puts(") — returned to shell\n");
                 if (tss_ist1_ptr)
-                    *tss_ist1_ptr = (uint64_t)(ist1_stack + 65536);
+                    *tss_ist1_ptr = (uint64_t)(ist1_stack + 262144);
             }
             dos_native_exit_jmpbuf = NULL;
         }

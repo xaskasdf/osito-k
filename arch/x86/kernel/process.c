@@ -762,7 +762,7 @@ void proc_exit(int32_t code)
         extern uint64_t *tss_ist1_ptr;
         extern uint8_t ist1_stack[];
         if (tss_ist1_ptr)
-            *tss_ist1_ptr = (uint64_t)(ist1_stack + 65536);
+            *tss_ist1_ptr = (uint64_t)(ist1_stack + 262144);  /* IST1_STACK_SIZE */
     }
 
     kern_longjmp(exec_jmpbuf, 1);
