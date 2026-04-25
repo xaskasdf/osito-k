@@ -18,11 +18,14 @@
 DXVK_ROOT := $(CURDIR)
 OSITOK_ROOT ?= $(DXVK_ROOT)/../../../..
 DXVK_SRC  := $(DXVK_ROOT)/dxvk/src
+DXVK_INC  := $(DXVK_ROOT)/dxvk/include
 BUILD_DIR := $(OSITOK_ROOT)/arch/x86/build/lib/dxvk
 UTIL_OUT  := $(BUILD_DIR)/libdxvk_util.a
 SPIRV_OUT := $(BUILD_DIR)/libdxvk_spirv.a
 DXBC_OUT  := $(BUILD_DIR)/libdxvk_dxbc.a
 CORE_OUT  := $(BUILD_DIR)/libdxvk_core.a
+D3D11_OUT := $(BUILD_DIR)/libdxvk_d3d11.a
+DXGI_OUT  := $(BUILD_DIR)/libdxvk_dxgi.a
 
 # C++ compiler.  Prefer the OsitoK cross-compiler if present; else fall
 # back to the host g++ (which inside Docker is gcc:12's g++).
@@ -55,6 +58,32 @@ INCLUDES := \
   -I$(DXVK_SRC)/dxbc \
   -I$(OSITOK_ROOT)/arch/x86/lib/vulkan/include
 
+# D3D11 / DXGI use a different windows.h shim path. The DXVK native
+# windows shim (vendored under dxvk/include/native/windows/) supplies
+# the GUID/HRESULT/COM macros the WIDL-generated MinGW headers need,
+# while the MinGW d3d11/dxgi headers themselves live under
+# dxvk/include/mingw/. The com_stub/ headers used by the rest of DXVK
+# stay out of the search path so the two GUID definitions don't collide.
+D3D11_INCLUDES := \
+  -I$(DXVK_INC)/native/windows \
+  -I$(DXVK_INC)/mingw \
+  -I$(DXVK_ROOT)/include \
+  -I$(DXVK_ROOT)/include/generated \
+  -I$(DXVK_SRC) \
+  -I$(DXVK_SRC)/util \
+  -I$(DXVK_SRC)/util/com \
+  -I$(DXVK_SRC)/util/log \
+  -I$(DXVK_SRC)/util/sha1 \
+  -I$(DXVK_SRC)/util/sync \
+  -I$(DXVK_SRC)/util/config \
+  -I$(DXVK_SRC)/util/rc \
+  -I$(DXVK_SRC)/spirv \
+  -I$(DXVK_SRC)/vulkan \
+  -I$(DXVK_SRC)/dxvk \
+  -I$(DXVK_SRC)/dxbc \
+  -I$(OSITOK_ROOT)/arch/x86/lib/vulkan/include \
+  -I$(DXVK_ROOT)/com_stub_d3d11
+
 # C++17, freestanding, no exceptions, no RTTI.  Hosted libstdc++ is
 # pulled via -isystem (gcc:12 ships it under /usr/include/c++/12/).
 CXX_FLAGS := \
@@ -70,6 +99,26 @@ CXX_FLAGS := \
   -DDXVK_NO_EXCEPTIONS=1 -DUSE_X86_64 -D__OSITO_K__ \
   -include $(DXVK_ROOT)/osito_compat/dxvk_compat.h \
   $(INCLUDES) \
+  -isystem $(GCC_INC)
+
+# D3D11/DXGI flags: same toolchain, different INCLUDES (native windows
+# shim instead of com_stub/), and skip the dxvk_compat.h force-include
+# (the native windows shim provides the same Win32 typedefs and would
+# otherwise clash on GUID/IUnknown).
+D3D11_CXX_FLAGS := \
+  -std=gnu++17 \
+  -ffreestanding -fno-stack-protector -mno-red-zone \
+  -fno-exceptions -fno-rtti \
+  -fno-pic -fvisibility=hidden \
+  -O2 \
+  -Wall -Wextra \
+  -Wno-unused-parameter -Wno-unused-function -Wno-missing-field-initializers \
+  -Wno-sign-compare -Wno-unused-variable -Wno-unused-but-set-variable \
+  -Wno-non-virtual-dtor -Wno-deprecated-declarations -Wno-attributes \
+  -Wno-class-memaccess -Wno-pragmas -Wno-narrowing \
+  -DDXVK_NO_EXCEPTIONS=1 -DUSE_X86_64 -D__OSITO_K__ \
+  -include $(DXVK_ROOT)/osito_compat/dxvk_d3d11_compat.h \
+  $(D3D11_INCLUDES) \
   -isystem $(GCC_INC)
 
 # ----------------------------------------------------------------------
@@ -92,6 +141,14 @@ UTIL_SRCS := \
   dxvk/src/util/sha1/sha1_util.cpp \
   dxvk/src/util/sync/sync_recursive.cpp \
   dxvk/src/util/thread.cpp
+
+# com_guid.cpp pulls d3d11_interfaces.h + dxgi_interfaces.h transitively,
+# which reach the native windows shim — same dependency surface as
+# d3d11/dxgi proper. We compile it with D3D11_CXX_FLAGS for that reason
+# and stash it in libdxvk_util.a alongside the other com bits via a
+# dedicated rule below.
+UTIL_D3D11_SRCS := \
+  dxvk/src/util/com/com_guid.cpp
 
 # C sources (sha1.c is the SHA-1 reference impl in plain C).
 UTIL_C_SRCS := \
@@ -212,23 +269,88 @@ CORE_SRCS := \
   dxvk/src/wsi/wsi_platform_ositok.cpp \
   dxvk/src/wsi/wsi_edid_ositok.cpp
 
+# ----------------------------------------------------------------------
+# D3D11_SRCS / DXGI_SRCS — the COM-style D3D11 frontend (W5.3).
+#
+# 37 d3d11 .cpp + 10 dxgi .cpp upstream. We exclude:
+#   d3d11_main.cpp     -- replaced by d3d11_main_ositok.cpp wrapper (T5)
+#   d3d11_gdi.cpp      -- pulls Win32 GDI (HDC, BITMAPINFO, GetDC).
+#   d3d11_on_12.cpp    -- D3D11on12 interop, drags in D3D12 surface.
+#   d3d11_cuda.cpp     -- NVX CUDA interop, needs cudaGL.h.
+#   d3d11_video.cpp    -- DXVA video decode interfaces, very Windows-y.
+#   dxgi_main.cpp      -- replaced by dxgi_main_ositok.cpp wrapper (T5)
+#   dxgi_monitor.cpp   -- needs ChangeDisplaySettingsExW etc.
+# Files that build are everything else. We keep the subset that lets
+# D3D11CreateDevice + DXGIFactory creation work.
+# ----------------------------------------------------------------------
+D3D11_SRCS := \
+  dxvk/src/d3d11/d3d11_annotation.cpp \
+  dxvk/src/d3d11/d3d11_blend.cpp \
+  dxvk/src/d3d11/d3d11_buffer.cpp \
+  dxvk/src/d3d11/d3d11_class_linkage.cpp \
+  dxvk/src/d3d11/d3d11_cmdlist.cpp \
+  dxvk/src/d3d11/d3d11_context.cpp \
+  dxvk/src/d3d11/d3d11_context_def.cpp \
+  dxvk/src/d3d11/d3d11_context_ext.cpp \
+  dxvk/src/d3d11/d3d11_context_imm.cpp \
+  dxvk/src/d3d11/d3d11_depth_stencil.cpp \
+  dxvk/src/d3d11/d3d11_device.cpp \
+  dxvk/src/d3d11/d3d11_enums.cpp \
+  dxvk/src/d3d11/d3d11_features.cpp \
+  dxvk/src/d3d11/d3d11_fence.cpp \
+  dxvk/src/d3d11/d3d11_initializer.cpp \
+  dxvk/src/d3d11/d3d11_input_layout.cpp \
+  dxvk/src/d3d11/d3d11_interop.cpp \
+  dxvk/src/d3d11/d3d11_options.cpp \
+  dxvk/src/d3d11/d3d11_query.cpp \
+  dxvk/src/d3d11/d3d11_rasterizer.cpp \
+  dxvk/src/d3d11/d3d11_resource.cpp \
+  dxvk/src/d3d11/d3d11_sampler.cpp \
+  dxvk/src/d3d11/d3d11_shader.cpp \
+  dxvk/src/d3d11/d3d11_state.cpp \
+  dxvk/src/d3d11/d3d11_state_object.cpp \
+  dxvk/src/d3d11/d3d11_swapchain.cpp \
+  dxvk/src/d3d11/d3d11_texture.cpp \
+  dxvk/src/d3d11/d3d11_util.cpp \
+  dxvk/src/d3d11/d3d11_view_dsv.cpp \
+  dxvk/src/d3d11/d3d11_view_rtv.cpp \
+  dxvk/src/d3d11/d3d11_view_srv.cpp \
+  dxvk/src/d3d11/d3d11_view_uav.cpp \
+  dxvk/src/d3d11/d3d11_main_ositok.cpp
+
+DXGI_SRCS := \
+  dxvk/src/dxgi/dxgi_adapter.cpp \
+  dxvk/src/dxgi/dxgi_enums.cpp \
+  dxvk/src/dxgi/dxgi_factory.cpp \
+  dxvk/src/dxgi/dxgi_format.cpp \
+  dxvk/src/dxgi/dxgi_options.cpp \
+  dxvk/src/dxgi/dxgi_output.cpp \
+  dxvk/src/dxgi/dxgi_surface.cpp \
+  dxvk/src/dxgi/dxgi_swapchain.cpp \
+  dxvk/src/dxgi/dxgi_main_ositok.cpp
+
 UTIL_OBJS    := $(patsubst %.cpp,$(BUILD_DIR)/%.o,$(UTIL_SRCS))
+UTIL_D3D11_OBJS := $(patsubst %.cpp,$(BUILD_DIR)/%.o,$(UTIL_D3D11_SRCS))
 UTIL_C_OBJS  := $(patsubst %.c,$(BUILD_DIR)/%.o,$(UTIL_C_SRCS))
 SPIRV_OBJS   := $(patsubst %.cpp,$(BUILD_DIR)/%.o,$(SPIRV_SRCS))
 DXBC_OBJS    := $(patsubst %.cpp,$(BUILD_DIR)/%.o,$(DXBC_SRCS))
 CORE_OBJS    := $(patsubst %.cpp,$(BUILD_DIR)/%.o,$(CORE_SRCS))
+D3D11_OBJS   := $(patsubst %.cpp,$(BUILD_DIR)/%.o,$(D3D11_SRCS))
+DXGI_OBJS    := $(patsubst %.cpp,$(BUILD_DIR)/%.o,$(DXGI_SRCS))
 
-.PHONY: all clean util spirv dxbc core
-all: util spirv dxbc core
+.PHONY: all clean util spirv dxbc core d3d11 dxgi
+all: util spirv dxbc core dxgi d3d11
 
 util:  $(UTIL_OUT)
 spirv: $(SPIRV_OUT)
 dxbc:  $(DXBC_OUT)
 core:  $(CORE_OUT)
+dxgi:  $(DXGI_OUT)
+d3d11: $(D3D11_OUT)
 
-$(UTIL_OUT): $(UTIL_OBJS) $(UTIL_C_OBJS) | $(BUILD_DIR)
+$(UTIL_OUT): $(UTIL_OBJS) $(UTIL_D3D11_OBJS) $(UTIL_C_OBJS) | $(BUILD_DIR)
 	@echo "  AR    $(notdir $@)"
-	@$(AR) rcs $@ $(UTIL_OBJS) $(UTIL_C_OBJS)
+	@$(AR) rcs $@ $(UTIL_OBJS) $(UTIL_D3D11_OBJS) $(UTIL_C_OBJS)
 	@echo "  -> $$($(AR) t $@ | wc -l) objects in $@"
 
 $(SPIRV_OUT): $(SPIRV_OBJS) | $(BUILD_DIR)
@@ -245,6 +367,35 @@ $(CORE_OUT): $(CORE_OBJS) | $(BUILD_DIR)
 	@echo "  AR    $(notdir $@)"
 	@$(AR) rcs $@ $(CORE_OBJS)
 	@echo "  -> $$($(AR) t $@ | wc -l) objects in $@"
+
+$(DXGI_OUT): $(DXGI_OBJS) | $(BUILD_DIR)
+	@echo "  AR    $(notdir $@)"
+	@$(AR) rcs $@ $(DXGI_OBJS)
+	@echo "  -> $$($(AR) t $@ | wc -l) objects in $@"
+
+$(D3D11_OUT): $(D3D11_OBJS) | $(BUILD_DIR)
+	@echo "  AR    $(notdir $@)"
+	@$(AR) rcs $@ $(D3D11_OBJS)
+	@echo "  -> $$($(AR) t $@ | wc -l) objects in $@"
+
+# D3D11/DXGI pattern rule: separate flags (D3D11_CXX_FLAGS).
+# Use a stem match restricted to dxvk/src/d3d11/* and dxvk/src/dxgi/*
+# so we do not accidentally compile other TUs with the wrong shim.
+$(BUILD_DIR)/dxvk/src/d3d11/%.o: $(DXVK_ROOT)/dxvk/src/d3d11/%.cpp | $(BUILD_DIR)
+	@mkdir -p $(dir $@)
+	@echo "  CXX[d3d11]   $*"
+	@$(CXX) $(D3D11_CXX_FLAGS) -c -o $@ $<
+
+$(BUILD_DIR)/dxvk/src/dxgi/%.o: $(DXVK_ROOT)/dxvk/src/dxgi/%.cpp | $(BUILD_DIR)
+	@mkdir -p $(dir $@)
+	@echo "  CXX[dxgi]    $*"
+	@$(CXX) $(D3D11_CXX_FLAGS) -c -o $@ $<
+
+# com_guid.cpp ships with libdxvk_util.a but is compiled like d3d11/dxgi.
+$(BUILD_DIR)/dxvk/src/util/com/com_guid.o: $(DXVK_ROOT)/dxvk/src/util/com/com_guid.cpp | $(BUILD_DIR)
+	@mkdir -p $(dir $@)
+	@echo "  CXX[d3d11]   util/com/com_guid"
+	@$(CXX) $(D3D11_CXX_FLAGS) -c -o $@ $<
 
 # Pattern rule: build/lib/dxvk/foo/bar.o : foo/bar.cpp
 $(BUILD_DIR)/%.o: $(DXVK_ROOT)/%.cpp | $(BUILD_DIR)
