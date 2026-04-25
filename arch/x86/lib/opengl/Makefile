@@ -355,6 +355,7 @@ GALLIUM_SRCS := \
   mesa/src/gallium/auxiliary/util/u_sample_positions.c \
   mesa/src/gallium/auxiliary/util/u_sampler.c \
   mesa/src/gallium/auxiliary/util/u_screen.c \
+  mesa/src/gallium/auxiliary/util/u_simple_shaders.c \
   mesa/src/gallium/auxiliary/util/u_split_draw.c \
   mesa/src/gallium/auxiliary/util/u_suballoc.c \
   mesa/src/gallium/auxiliary/util/u_surface.c \
