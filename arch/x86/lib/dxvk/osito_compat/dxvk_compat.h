@@ -33,6 +33,17 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* -- DXVK throw -> abort on OsitoK ------------------------------------
+ *
+ * We build with -fno-exceptions. DXVK .cpp files contain
+ * `throw DxvkError(...)` on unreachable error paths. The throws have
+ * been hand-edited in W5.1 to expand to `DxvkError::abort_ositok(...)`
+ * when `__OSITO_K__` is defined. Helper below. Noreturn so compilers
+ * stop emitting dead code after it. */
+#if defined(__cplusplus)
+extern "C" void dxvk_throw_abort(const char *msg) __attribute__((noreturn));
+#endif
+
 #ifdef __cplusplus
 #include <atomic>
 #include <cstdlib>
