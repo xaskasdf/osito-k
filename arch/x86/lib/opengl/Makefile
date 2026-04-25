@@ -126,6 +126,7 @@ UTIL_OBJS := $(patsubst %.c,$(BUILD_DIR)/%.o,$(UTIL_SRCS))
 # u_format_table.py — pre-generated into the tree so we don't need python
 # at build time).
 GALLIUM_SRCS := \
+  mesa/src/util/format_srgb.c \
   mesa/src/util/format/u_format.c \
   mesa/src/util/format/u_format_bptc.c \
   mesa/src/util/format/u_format_etc.c \
