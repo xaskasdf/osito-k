@@ -1289,6 +1289,22 @@ uint32_t compat32_callback_args(uint32_t func_addr, int nargs, const uint32_t *a
     extern TEB32 g_teb32;
     uint32_t saved_seh = g_teb32.ExceptionList;
 
+    /* Mask APIC timer for the duration of the 32-bit callback. The
+     * callback runs on a SHARED `callback_stack[depth]` (one buffer per
+     * depth, not per process) — if the timer ISR fires here it saves
+     * the interrupted process's full GP frame on top of that stack,
+     * the scheduler stores frame_ptr in proc->kernel_rsp, then a
+     * different thread's later callback at the same depth WRITES OVER
+     * the saved frame as it pushes arguments. The saved frame becomes
+     * garbage, the next dispatch of the original process triple-faults
+     * on a CS=0x1F10-style bogus selector. Until callback_stacks are
+     * per-process the only safe thing is no-preempt during callback. */
+    {
+        extern volatile uint32_t *idt_get_apic_base(void);
+        volatile uint32_t *apic = idt_get_apic_base();
+        if (apic) apic[0x320/4] |= 0x10000;  /* LVT_TIMER |= MASKED */
+    }
+
     if (kern_setjmp(callback_jmpbufs[depth]) == 0) {
         uint32_t *sp = (uint32_t *)(callback_stack_get(depth) + CALLBACK_STACK_SIZE);
 
@@ -1325,7 +1341,14 @@ uint32_t compat32_callback_args(uint32_t func_addr, int nargs, const uint32_t *a
         /* never reached */
     }
 
-    /* longjmp returned — 32-bit function is done. */
+    /* longjmp returned — 32-bit function is done. Unmask the timer
+     * so other processes can be preempted again. */
+    {
+        extern volatile uint32_t *idt_get_apic_base(void);
+        volatile uint32_t *apic = idt_get_apic_base();
+        if (apic) apic[0x320/4] &= ~0x10000;  /* LVT_TIMER &= ~MASKED */
+    }
+
     g_teb32.ExceptionList = saved_seh;  /* Restore SEH chain */
     callback_depth--;
     return callback_retval_per_depth[depth];
