@@ -523,8 +523,14 @@ void isr_handler(interrupt_frame_t *frame)
         const char *_zone = 0;
         if (_sp >= _i1 && _sp < _i1 + 65536)      _zone = "IST1";
         else if (_sp >= _i2 && _sp < _i2 + 32768) _zone = "IST2";
+        /* DOS-active: any LDT-CS fault, OR a fault from one of the
+         * DOS4GW GDT aliases (sel 0x18 / 0x20) we install in DOS-native
+         * mode. Without the GDT-alias arm the emulator wouldn't run for
+         * code that DOS4GW transitioned into via `LJMPW $0x18:$N`. */
+        uint16_t _cs16 = (uint16_t)frame->cs;
         int _dos_active = (dos_native_exit_jmpbuf != 0)
-                       && (frame->cs & 0x04);  /* CS is an LDT selector */
+                       && ((frame->cs & 0x04) ||
+                           _cs16 == 0x18 || _cs16 == 0x20);
         if (!_zone && _dos_active) _zone = "DOS";
         if (_zone) {
             /* Rate-limit: when the same RIP keeps faulting (e.g. a
@@ -592,8 +598,10 @@ void isr_handler(interrupt_frame_t *frame)
 
             /* DOS4GW surgical recovery — try LRETW software emulation
              * first (keeps current CS, rewrites RIP to target linear),
-             * then fall back to descriptor promote+retry. */
-            if (vec == 13 && (frame->cs & 0x04) /* DOS-native code */) {
+             * then fall back to descriptor promote+retry. Accept LDT
+             * selectors AND the DOS4GW GDT aliases at sel 0x18 / 0x20. */
+            if (vec == 13 && ((frame->cs & 0x04) ||
+                              _cs16 == 0x18 || _cs16 == 0x20)) {
                 extern int dos_native_emulate_lretw(void *frame);
                 if (dos_native_emulate_lretw(frame)) {
                     return;  /* iretq will land at emulated target */
@@ -608,10 +616,11 @@ void isr_handler(interrupt_frame_t *frame)
                 }
             }
 
-            /* If a DOS native program faulted (CS is its LDT selector,
-             * low 3 bits indicate TI=1 LDT), long-jump back to the shell
-             * instead of halting. Restores kernel CR3 + kernel GDTR.  */
-            if ((frame->cs & 0x04) || (_zone && _zone[3] == '2')) {
+            /* If a DOS native program faulted (LDT-CS, DOS4GW GDT
+             * alias, or running on IST2), long-jump back to the shell
+             * instead of halting. Restores kernel CR3 + GDTR. */
+            if ((frame->cs & 0x04) || _cs16 == 0x18 || _cs16 == 0x20
+                || (_zone && _zone[3] == '2')) {
                 extern uint64_t *dos_native_exit_jmpbuf;
                 extern uint64_t paging_get_kernel_cr3(void);
                 extern void kern_longjmp(uint64_t *buf, int val);

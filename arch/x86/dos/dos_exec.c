@@ -493,17 +493,45 @@ void dos_transfer_to_native(dos_vm_t *vm)
         serial_puts(" limit=0x"); serial_puthex(ldt_limit, 4);
         serial_puts("\n");
 
-        /* NOTE: DOS4GW hard-codes selector 0x18 as a 32-bit flat code
-         * segment for raw-mode-switch returns. Tried installing a flat
-         * 32-bit descriptor at GDT[3] (commit reverted) but DOOM then
-         * jumps to linear addresses in vm->mem that contain IVT bytes
-         * rather than valid 32-bit code, hits #UD. Sticking with the
-         * surgical emulator path: the LRETW/JMP-FAR emulator redirects
-         * GDT-selector targets to current-CS-relative offsets, which
-         * keeps DOOM in 16-bit DOOM-CS mode where its actual code lives.
-         * Future fix: implement DPMI AX=0306 mode-switch routines so
-         * DOOM gets proper PM↔RM transition stubs instead of computing
-         * its own. */
+        /* DOS4GW quirk: DOOM hard-codes `LJMPW $0x18:$0x334` (and
+         * similar variants) at several places.  Selector 0x18 is GDT
+         * idx 3, which DOS4GW expected to set up itself via LGDT but
+         * our kernel keeps the host GDT.  Solution: install GDT[3] as
+         * a 16-bit code segment whose BASE matches DOOM's primary CS
+         * (LDT[0] base, e.g. 0x52B0).  Now `LJMPW $0x18:$N` lands at
+         * the SAME linear address as a `LJMPW $0x07:$N` would (where
+         * 0x07 is DOOM's LDT-CS selector) — i.e. inside DOOM's own
+         * code segment.  Only set this in DOS4GW mode so non-DOS4GW
+         * DOS binaries are untouched. */
+        if (vm->dos4gw_mode) {
+            /* Helper to build a 16-bit segment descriptor with the given
+             * base + access byte. limit fixed at 0xFFFF, flags=0. */
+            #define DOS_NT_DESC16(base32, acc) \
+                  (((uint64_t)0xFFFF)                                          \
+                 | ((uint64_t)((base32) & 0xFFFF) << 16)                       \
+                 | ((uint64_t)(((base32) >> 16) & 0xFF) << 32)                 \
+                 | ((uint64_t)((acc)) << 40)                                   \
+                 | ((uint64_t)0x00 << 52)                                      \
+                 | ((uint64_t)(((base32) >> 24) & 0xFF) << 56))
+            uint32_t doom_cs_base =
+                  (uint32_t)vm->dpmi.ldt[0].base_lo
+                | ((uint32_t)vm->dpmi.ldt[0].base_mid << 16)
+                | ((uint32_t)vm->dpmi.ldt[0].base_hi  << 24);
+            uint32_t doom_ds_base =
+                  (uint32_t)vm->dpmi.ldt[2].base_lo
+                | ((uint32_t)vm->dpmi.ldt[2].base_mid << 16)
+                | ((uint32_t)vm->dpmi.ldt[2].base_hi  << 24);
+            /* GDT[3] sel 0x18: 16-bit code at DOOM CS base. acc=0x9A:
+             *   P=1 DPL=0 S=1 type=A (code, readable, non-conforming) */
+            kernel_gdt[3] = DOS_NT_DESC16(doom_cs_base, 0x9A);
+            /* GDT[4] sel 0x20: 16-bit data at DOOM DS/SS base. acc=0x92:
+             *   P=1 DPL=0 S=1 type=2 (data, writable, expand-up) */
+            kernel_gdt[4] = DOS_NT_DESC16(doom_ds_base, 0x92);
+            #undef DOS_NT_DESC16
+            serial_puts("[DOS-NT] GDT[3]=CS@0x");  serial_puthex(doom_cs_base, 8);
+            serial_puts(" GDT[4]=DS@0x");          serial_puthex(doom_ds_base, 8);
+            serial_puts(" (DOS4GW aliases, lim=0xFFFF)\n");
+        }
 
         /* Install DOS INT handlers in the IDT with DPL=3 so ring-3 DOS
          * code can invoke them via the INT instruction. Without DPL=3

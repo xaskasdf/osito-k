@@ -337,6 +337,17 @@ typedef struct __attribute__((packed)) {
 static uint32_t dos_nt_ldt_base(dos_vm_t *vm, uint16_t sel)
 {
     uint16_t idx = (sel >> 3) & 0x1FFF;
+    /* GDT selector (TI=0): read base out of kernel_gdt directly.  Used
+     * for the DOS4GW aliases at slots 3 (sel 0x18) and 4 (sel 0x20). */
+    if ((sel & 0x04) == 0) {
+        extern uint64_t kernel_gdt[];
+        uint64_t d = kernel_gdt[idx];
+        uint32_t base = (uint32_t)((d >> 16) & 0xFFFF)
+                      | (uint32_t)(((d >> 32) & 0xFF) << 16)
+                      | (uint32_t)(((d >> 56) & 0xFF) << 24);
+        return base;
+    }
+    /* LDT selector (TI=1): read out of vm->dpmi.ldt. */
     if (idx >= DPMI_MAX_DESCRIPTORS) return 0;
     dpmi_descriptor_t *d = &vm->dpmi.ldt[idx];
     return ((uint32_t)d->base_lo)
@@ -361,8 +372,14 @@ int dos_native_emulate_lretw(void *frame_ptr)
     }
     if (!vm || !vm->dos4gw_mode) return 0;
 
-    /* Must be an LDT selector fault (DOS native). */
-    if ((f->cs & 0x04) == 0) return 0;
+    /* Accept either an LDT selector (TI=1) OR one of the DOS4GW GDT
+     * aliases we install at slots 3 / 4 (sel 0x18, 0x20). The CS lookup
+     * for these uses the kernel GDT in dos_nt_ldt_base() — we patch
+     * that helper below. */
+    if ((f->cs & 0x04) == 0) {
+        uint16_t cs = (uint16_t)f->cs;
+        if (cs != 0x18 && cs != 0x20) return 0;
+    }
 
     /* vm->mem is a PA that is identity-mapped only in the kernel CR3,
      * so switch temporarily to read/write it safely. */
