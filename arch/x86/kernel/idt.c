@@ -1481,7 +1481,7 @@ void isr_handler(interrupt_frame_t *frame)
              * NULL calls before the engine moves on). 50 was enough
              * to break out of an infinite GLog/GError tail-loop, but
              * not enough for normal init flow. */
-            if (null_call_count > 5000) {
+            if (null_call_count > 50000) {
                 serial_puts("[NULL-CALL] Too many (#");
                 serial_putdec(null_call_count);
                 serial_puts(") — forcing crash recovery\n");

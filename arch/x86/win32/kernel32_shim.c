@@ -37,8 +37,25 @@ static inline void sync_last_error(void) { g_teb32.LastErrorValue = g_last_error
 
 static inline void set_last_error_from_status(NTSTATUS status)
 {
-    g_last_error = RtlNtStatusToDosError(status);
+    DWORD err = RtlNtStatusToDosError(status);
+    g_last_error = err;
     sync_last_error();
+    /* Log when we set error 8 (ERROR_NOT_ENOUGH_MEMORY) — diagnostic
+     * for tracking the source of UT99's appError / Windows
+     * GetLastError loops. Limit to first 8 to avoid spam. */
+    if (err == 8) {
+        static int log8 = 0;
+        if (log8 < 8) {
+            extern void serial_puts(const char *s);
+            extern void serial_puthex(uint64_t val, int digits);
+            extern uint32_t compat32_get_last_caller_eip(void);
+            uint32_t ueip = compat32_get_last_caller_eip();
+            serial_puts("[ERR8] from NTSTATUS 0x"); serial_puthex(status, 8);
+            serial_puts(" userEIP=0x"); serial_puthex(ueip, 8);
+            serial_puts("\n");
+            log8++;
+        }
+    }
 }
 
 /* Convert ASCII string to UNICODE_STRING (stack-based, temporary) */
@@ -375,10 +392,24 @@ PVOID WINAPI VirtualAlloc(PVOID lpAddress, SIZE_T dwSize,
         if (cap_log < 5) {
             serial_puts("[VA] Capped: 0x");
             serial_puthex(dwSize, 8);
-            serial_puts(" -> 256MB\n");
+            serial_puts(" -> 64KB sentinel\n");
             cap_log++;
         }
-        dwSize = 0x10000000; /* 256MB */
+        /* Cap to 64KB instead of 256MB. Reasons:
+         *   - 256MB cap exhausted the 896MB VA range after 3-4 bogus
+         *     FArray::Realloc requests, all subsequent VirtualAlloc
+         *     returned NULL → STATUS_NO_MEMORY → ERROR_NOT_ENOUGH_MEMORY
+         *     → UT99 appError loop.
+         *   - The rep-movsl that follows was already patched to no-op
+         *     (commit 02f9ca6) so the engine never actually writes 2GB.
+         *   - 64KB is enough for the engine's metadata reads (it
+         *     might read first few elements after Realloc to check
+         *     existing-data preservation). Reads past 64KB will
+         *     fault, hit demand-paging — but we don't allocate
+         *     beyond, so faults page-fault back to a NULL handler
+         *     and trigger NULL-CALL recovery (controlled).
+         */
+        dwSize = 0x10000;  /* 64KB sentinel */
         /* Self-modify the engine's memcpy helper at 0x1010723E so that
          * the upcoming bogus 2GB rep-movsl terminates instantly. */
         static int patched_memcpy = 0;
