@@ -27,6 +27,59 @@ char *strndup(const char *s, size_t n) {
     return out;
 }
 
+/* ---- strtoll / strtoull (64-bit versions) ----------------------------- */
+/* Minimal conformant parsers, matching strtol but in 64-bit. Accepts
+ * optional leading whitespace + sign, optional 0x prefix when base is 0 or
+ * 16. Used by tgsi_text.c. */
+static int _dgt(int c, int base) {
+    int d = -1;
+    if (c >= '0' && c <= '9') d = c - '0';
+    else if (c >= 'a' && c <= 'z') d = c - 'a' + 10;
+    else if (c >= 'A' && c <= 'Z') d = c - 'A' + 10;
+    return (d >= 0 && d < base) ? d : -1;
+}
+unsigned long long strtoull(const char *s, char **end, int base) {
+    const char *p = s;
+    while (*p == ' ' || *p == '\t' || *p == '\n') p++;
+    int neg = 0;
+    if (*p == '+' || *p == '-') { if (*p == '-') neg = 1; p++; }
+    if ((base == 0 || base == 16) && p[0] == '0' && (p[1] == 'x' || p[1] == 'X')) {
+        p += 2; base = 16;
+    } else if (base == 0 && *p == '0') { p++; base = 8; }
+    else if (base == 0) base = 10;
+    unsigned long long v = 0;
+    int d;
+    while ((d = _dgt(*p, base)) >= 0) { v = v * base + (unsigned long long)d; p++; }
+    if (end) *end = (char *)p;
+    return neg ? (unsigned long long)-(long long)v : v;
+}
+long long strtoll(const char *s, char **end, int base) {
+    const char *p = s;
+    while (*p == ' ' || *p == '\t' || *p == '\n') p++;
+    int neg = 0;
+    if (*p == '+' || *p == '-') { if (*p == '-') neg = 1; p++; }
+    unsigned long long v = strtoull(p, end, base);
+    return neg ? -(long long)v : (long long)v;
+}
+
+/* ---- vasprintf -------------------------------------------------------- */
+/* Used by u_async_debug. We don't have real varargs formatting in a static
+ * inline, so call libc vsnprintf twice (sized probe + allocate + render).
+ * Declaration matches glibc. */
+extern int vsnprintf(char *s, size_t n, const char *fmt, __builtin_va_list ap);
+int vasprintf(char **out, const char *fmt, __builtin_va_list ap) {
+    __builtin_va_list ap2;
+    __builtin_va_copy(ap2, ap);
+    int n = vsnprintf(NULL, 0, fmt, ap2);
+    __builtin_va_end(ap2);
+    if (n < 0) { *out = NULL; return -1; }
+    char *buf = (char *)malloc((size_t)n + 1);
+    if (!buf) { *out = NULL; return -1; }
+    vsnprintf(buf, (size_t)n + 1, fmt, ap);
+    *out = buf;
+    return n;
+}
+
 /* ---- rand ------------------------------------------------------------ */
 
 static unsigned long _rng_state = 1234567u;

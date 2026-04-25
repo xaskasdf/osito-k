@@ -53,6 +53,16 @@ static inline int clock_nanosleep(int clk, int flags, const struct timespec *req
  * it. We also provide a simple inline fallback that calls lrint(double). */
 extern long lrint(double);
 static inline long lrintf(float f) { return lrint((double)f); }
+/* llrint / llrintf — not in libc math.h. u_pack_color.h uses them for
+ * packing depth into 32-bit integer representation. */
+static inline long long llrint(double x)  { return (long long)lrint(x); }
+static inline long long llrintf(float x)  { return (long long)lrint((double)x); }
+/* rintf — libc math.h has rint (double); provide the float form. */
+extern double rint(double);
+static inline float rintf(float x) { return (float)rint((double)x); }
+/* strtoll / strtoull — OsitoK libc has strtol/strtoul; extend to 64-bit. */
+extern long long strtoll(const char *s, char **end, int base);
+extern unsigned long long strtoull(const char *s, char **end, int base);
 
 /* posix_memalign: wrap libc malloc with manual over-allocation + align.
  * Mesa's ralloc/blob/SIMD codepaths pass alignments of 16/32/64 bytes;
@@ -109,6 +119,7 @@ static inline int pthread_join(pthread_t t, void **r) { (void)t; (void)r; return
 /* clock_gettime CLOCK_MONOTONIC: reuse our gettimeofday syscall (96) */
 #define CLOCK_MONOTONIC 1
 #define CLOCK_REALTIME  0
+typedef int clockid_t;
 extern long syscall(long, ...);
 static inline int clock_gettime(int clk, struct timespec *ts) {
     (void)clk;
