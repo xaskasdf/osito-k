@@ -112,7 +112,12 @@ namespace dxvk::wsi {
   }
 
   /* ------- Window queries -------- */
+  /* W5.4-fix: hold s_hwnds_mutex across find+read/write. DXVK's CS thread
+   * + present thread + game thread can all reach these paths in W5.5
+   * (GTA V); without the lock there's a data race against internHwnd /
+   * destroy_window writes. */
   void getWindowSize(HWND h, uint32_t *pWidth, uint32_t *pHeight) {
+    std::lock_guard<std::mutex> lock(s_hwnds_mutex);
     int idx = findHwndEntry(h);
     if (idx >= 0) {
       if (pWidth)  *pWidth  = s_hwnds[idx].width;
@@ -125,6 +130,7 @@ namespace dxvk::wsi {
   }
 
   void resizeWindow(HWND h, DxvkWindowState *, uint32_t w, uint32_t hgt) {
+    std::lock_guard<std::mutex> lock(s_hwnds_mutex);
     int idx = findHwndEntry(h);
     if (idx >= 0) {
       s_hwnds[idx].width  = w;
