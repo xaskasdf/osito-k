@@ -298,14 +298,17 @@ D3D11_SRCS := \
   dxvk/src/d3d11/d3d11_context_def.cpp \
   dxvk/src/d3d11/d3d11_context_ext.cpp \
   dxvk/src/d3d11/d3d11_context_imm.cpp \
+  dxvk/src/d3d11/d3d11_cuda.cpp \
   dxvk/src/d3d11/d3d11_depth_stencil.cpp \
   dxvk/src/d3d11/d3d11_device.cpp \
   dxvk/src/d3d11/d3d11_enums.cpp \
   dxvk/src/d3d11/d3d11_features.cpp \
   dxvk/src/d3d11/d3d11_fence.cpp \
+  dxvk/src/d3d11/d3d11_gdi.cpp \
   dxvk/src/d3d11/d3d11_initializer.cpp \
   dxvk/src/d3d11/d3d11_input_layout.cpp \
   dxvk/src/d3d11/d3d11_interop.cpp \
+  dxvk/src/d3d11/d3d11_on_12.cpp \
   dxvk/src/d3d11/d3d11_options.cpp \
   dxvk/src/d3d11/d3d11_query.cpp \
   dxvk/src/d3d11/d3d11_rasterizer.cpp \
@@ -317,6 +320,7 @@ D3D11_SRCS := \
   dxvk/src/d3d11/d3d11_swapchain.cpp \
   dxvk/src/d3d11/d3d11_texture.cpp \
   dxvk/src/d3d11/d3d11_util.cpp \
+  dxvk/src/d3d11/d3d11_video.cpp \
   dxvk/src/d3d11/d3d11_view_dsv.cpp \
   dxvk/src/d3d11/d3d11_view_rtv.cpp \
   dxvk/src/d3d11/d3d11_view_srv.cpp \
@@ -328,6 +332,7 @@ DXGI_SRCS := \
   dxvk/src/dxgi/dxgi_enums.cpp \
   dxvk/src/dxgi/dxgi_factory.cpp \
   dxvk/src/dxgi/dxgi_format.cpp \
+  dxvk/src/dxgi/dxgi_monitor.cpp \
   dxvk/src/dxgi/dxgi_options.cpp \
   dxvk/src/dxgi/dxgi_output.cpp \
   dxvk/src/dxgi/dxgi_surface.cpp \
