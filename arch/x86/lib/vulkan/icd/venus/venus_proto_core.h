@@ -83,4 +83,9 @@
 #define VN_CMD_vkAcquireNextImageKHR                    0x80000029u
 #define VN_CMD_vkQueuePresentKHR                        0x8000002Au
 
+/* W3b.6 additions — vertex input + dynamic state. Same Mesa-25.0.0 caveat. */
+#define VN_CMD_vkCmdBindVertexBuffers                   0x8000002Bu
+#define VN_CMD_vkCmdSetViewport                         0x8000002Cu
+#define VN_CMD_vkCmdSetScissor                          0x8000002Du
+
 #endif

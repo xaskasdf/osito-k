@@ -385,6 +385,7 @@ venus_CreateFramebuffer(VkDevice device,
     f->host_id = 0;
     f->width   = pCreateInfo->width;
     f->height  = pCreateInfo->height;
+    f->first_color_image_slot = -1;     /* W3b.6 — set below if any attachment */
 
     /* Resolve rp + view host ids. */
     int rpslot = HANDLE_TO_SLOT(pCreateInfo->renderPass);
@@ -398,9 +399,15 @@ venus_CreateFramebuffer(VkDevice device,
     if (n > VENUS_MAX_IMAGE_VIEW_OBJECTS) n = VENUS_MAX_IMAGE_VIEW_OBJECTS;
     for (uint32_t i = 0; i < n; i++) {
         int vs = HANDLE_TO_SLOT(pCreateInfo->pAttachments[i]);
-        view_ids[i] = (vs >= 0 && vs < (int)VENUS_MAX_IMAGE_VIEW_OBJECTS &&
-                       dev->image_views[vs].in_use)
-                      ? dev->image_views[vs].host_id : 0ull;
+        if (vs >= 0 && vs < (int)VENUS_MAX_IMAGE_VIEW_OBJECTS &&
+            dev->image_views[vs].in_use) {
+            view_ids[i] = dev->image_views[vs].host_id;
+            /* W3b.6 — first color attachment: record image slot. */
+            if (i == 0)
+                f->first_color_image_slot = dev->image_views[vs].image_slot;
+        } else {
+            view_ids[i] = 0ull;
+        }
     }
 
     if (dev->parent && dev->parent->wire && dev->host_handle != 0) {
@@ -738,6 +745,16 @@ venus_CmdBeginRenderPass(VkCommandBuffer cb,
     uint64_t fb_host = (fbslot >= 0 && fbslot < (int)VENUS_MAX_FB_OBJECTS &&
                         dev->framebuffers[fbslot].in_use)
                        ? dev->framebuffers[fbslot].host_id : 0ull;
+
+    /* W3b.6 — record the framebuffer's first color attachment image for
+     * the CPU-fallback rasterizer. drew_flag is reset; CmdDraw sets it. */
+    vcb->last_drawn_image_slot = -1;
+    vcb->drew_flag = 0;
+    if (fbslot >= 0 && fbslot < (int)VENUS_MAX_FB_OBJECTS &&
+        dev->framebuffers[fbslot].in_use) {
+        vcb->last_drawn_image_slot = dev->framebuffers[fbslot].first_color_image_slot;
+    }
+
     if (dev->parent && dev->parent->wire && vcb->host_id != 0) {
         (void)venus_cmd_encode_CmdBeginRenderPass(
                 dev->parent->wire, dev->host_handle, vcb->host_id,
@@ -782,6 +799,12 @@ venus_CmdDraw(VkCommandBuffer cb, uint32_t vertexCount,
     struct venus_device *dev; int slot;
     if (!cb_unwrap(cb, &dev, &slot)) return;
     struct venus_cmd_buffer *vcb = &dev->cmd_buffers[slot];
+
+    /* W3b.6 — record draw bookkeeping for the CPU-fallback rasterizer. */
+    vcb->recorded_vertex_count = vertexCount;
+    vcb->recorded_first_vertex = firstVertex;
+    vcb->drew_flag             = 1u;
+
     if (dev->parent && dev->parent->wire && vcb->host_id != 0)
         (void)venus_cmd_encode_CmdDraw(dev->parent->wire, dev->host_handle,
                                        vcb->host_id, vertexCount, instanceCount,

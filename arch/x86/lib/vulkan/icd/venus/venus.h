@@ -153,7 +153,9 @@ struct venus_framebuffer {
     uint32_t in_use;
     uint32_t width;
     uint32_t height;
-    uint32_t _pad;
+    /* W3b.6 — first color attachment image slot, used by the CPU-fallback
+     * rasterizer to find which framebuffer was last drawn to. -1 if none. */
+    int32_t  first_color_image_slot;
 };
 
 struct venus_pipeline_layout {
@@ -181,7 +183,15 @@ struct venus_cmd_buffer {
     int32_t  pool_slot;
     uint32_t in_use;
     uint32_t recording;                /* 1 after Begin, 0 after End */
-    uint32_t _pad;
+    /* W3b.6 — guest-local recording state for the CPU-fallback rasterizer. */
+    uint32_t recorded_vb_slot;         /* venus_buffer slot bound at binding 0 */
+    uint64_t recorded_vb_offset;       /* offset within the bound buffer */
+    uint32_t recorded_vb_stride;       /* bytes per vertex (from pipeline VI binding) */
+    uint32_t recorded_vertex_count;    /* last CmdDraw vertexCount */
+    uint32_t recorded_first_vertex;    /* last CmdDraw firstVertex */
+    int32_t  last_drawn_image_slot;    /* venus_image slot last bound via render pass */
+    uint32_t drew_flag;                /* 1 once CmdDraw recorded inside the active RP */
+    uint32_t _pad6;
 };
 
 /* W3b.5 — WSI + sync primitives (queue/fence/sema/swapchain; the
@@ -380,6 +390,17 @@ VKAPI_ATTR void VKAPI_CALL
 venus_CmdBindPipeline(VkCommandBuffer, VkPipelineBindPoint, VkPipeline);
 VKAPI_ATTR void VKAPI_CALL
 venus_CmdDraw(VkCommandBuffer, uint32_t, uint32_t, uint32_t, uint32_t);
+
+/* W3b.6 — vertex input + dynamic state. */
+VKAPI_ATTR void VKAPI_CALL
+venus_CmdBindVertexBuffers(VkCommandBuffer, uint32_t, uint32_t,
+                           const VkBuffer *, const VkDeviceSize *);
+VKAPI_ATTR void VKAPI_CALL
+venus_CmdSetViewport(VkCommandBuffer, uint32_t, uint32_t,
+                     const VkViewport *);
+VKAPI_ATTR void VKAPI_CALL
+venus_CmdSetScissor(VkCommandBuffer, uint32_t, uint32_t,
+                    const VkRect2D *);
 
 /* W3b.5 — WSI + surface + swapchain + queue + sync + present. */
 
