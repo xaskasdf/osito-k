@@ -15,6 +15,28 @@
 #  include <stdint.h>
 #  include <stddef.h>
 #  include <time.h>   /* OsitoK libc — provides time_t and struct tm */
+/* W4.5 — inttypes-style PRI* macros required by mesa/main/{draw,context}.c.
+ * Standard C99 <inttypes.h> exists on hosted libc but we're -nostdinc, so
+ * paste the canonical glibc-style definitions for x86-64.
+ */
+#  ifndef PRIxPTR
+#    define PRIxPTR  "lx"
+#    define PRIdPTR  "ld"
+#    define PRIuPTR  "lu"
+#  endif
+#  ifndef PRId64
+#    define PRId64   "ld"
+#    define PRIu64   "lu"
+#    define PRIx64   "lx"
+#    define PRIX64   "lX"
+#    define PRIo64   "lo"
+#  endif
+#  ifndef PRId32
+#    define PRId32   "d"
+#    define PRIu32   "u"
+#    define PRIx32   "x"
+#    define PRIX32   "X"
+#  endif
 #else
    /* C++ side: pull <ctime> via libstdc++ (NOT mesa's src/c11/time.h
     * which is a polyfill that itself recursively #includes <time.h>).
@@ -56,6 +78,30 @@ extern int errno;
 #endif
 #ifndef EAGAIN
 #define EAGAIN 11
+#endif
+#ifndef EEXIST
+#define EEXIST 17
+#endif
+#ifndef ENOENT
+#define ENOENT 2
+#endif
+#ifndef ENOMEM
+#define ENOMEM 12
+#endif
+#ifndef EINVAL
+#define EINVAL 22
+#endif
+
+#ifndef __cplusplus
+/* W4.5 — POSIX-only or libc helpers used by mesa/main/.  These code paths
+ * are usually gated on env vars or features we don't enable, but the
+ * compiler still needs decls. Bodies (if ever called) live in
+ * osito_compat/mesa_libc_stubs.c.
+ *
+ * NB: mkdir/stat/unlink are declared via osito_compat/sys/stat.h (which
+ * is pulled by util/disk_cache.h transitively).  Don't redeclare here.
+ */
+extern char *strtok_r(char *str, const char *delim, char **saveptr);
 #endif
 
 /* OsitoK has no concept of users — return 0 ("root") so any "are we

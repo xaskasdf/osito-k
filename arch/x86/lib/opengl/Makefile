@@ -46,6 +46,7 @@ OUT          := $(BUILD_DIR)/libmesa_util.a
 OUT_GALLIUM  := $(BUILD_DIR)/libmesa_gallium.a
 OUT_COMPILER := $(BUILD_DIR)/libmesa_compiler.a
 OUT_ZINK     := $(BUILD_DIR)/libmesa_zink.a
+OUT_MAIN     := $(BUILD_DIR)/libmesa_main.a
 
 CC          ?= gcc
 CXX         ?= g++
@@ -170,6 +171,48 @@ CFLAGS_ZINK := \
   -DHAVE_FUNC_ATTRIBUTE_WARN_UNUSED_RESULT \
   -include $(OPENGL_ROOT)/osito_compat/mesa_compat.h \
   $(INCLUDES_ZINK) \
+  -isystem $(GCC_INC)
+
+# W4.5 — INCLUDES + CFLAGS for mesa/src/mesa/main + state_tracker + program +
+# vbo + mapi.  This is the GL state tracker.  Pulls every header that anyone
+# else in mesa/ uses (mtypes.h, macros.h, glapi.h, dispatch.h, ...).
+#
+# IMPORTANT — the mesa/main C code uses #include "main/foo.h" and
+# #include "compiler/glsl/foo.h", so the search root must be mesa/src AND
+# mesa/src/mesa.  The mapi headers live as "glapi/glapi.h" and
+# "mapi/u_current.h", so mesa/src/mapi is also added.
+INCLUDES_MAIN := \
+  $(INCLUDES_COMPILER) \
+  -I$(MESA_ROOT)/src/mesa \
+  -I$(MESA_ROOT)/src/mesa/main \
+  -I$(MESA_ROOT)/src/mapi \
+  -I$(MESA_ROOT)/src/mapi/shared-glapi \
+  -I$(MESA_ROOT)/src/gallium/drivers/zink \
+  -I$(MESA_ROOT)/src/gallium/auxiliary/nir \
+  -I$(MESA_ROOT)/src/vulkan/util
+
+CFLAGS_MAIN := \
+  -std=gnu11 -ffreestanding -nostdinc \
+  -fno-stack-protector -mno-red-zone \
+  -Wall -Wextra -Wno-unused-parameter -Wno-unused-function \
+  -Wno-missing-field-initializers -Wno-pointer-arith \
+  -Wno-sign-compare -Wno-misleading-indentation \
+  -Wno-unused-variable -Wno-unused-but-set-variable \
+  -Wno-implicit-fallthrough -Wno-switch -Wno-empty-body \
+  -O2 -fno-pic -fvisibility=hidden \
+  -D__OSITO_K__ -DHAVE_PTHREAD=1 \
+  -DHAVE_OPENGL=1 -DHAVE_OPENGL_ES_1=0 -DHAVE_OPENGL_ES_2=0 \
+  -DMAPI_MODE_GLAPI -DMAPI_ABI_HEADER='"shared-glapi/glapi_mapi_tmp.h"' \
+  '-DPACKAGE_VERSION="25.0.0-osito"' \
+  '-DPACKAGE_BUGREPORT="https://github.com/xaskasdf/osito-k"' \
+  -DHAVE_FUNC_ATTRIBUTE_PACKED \
+  -DHAVE_FUNC_ATTRIBUTE_FLATTEN \
+  -DHAVE_FUNC_ATTRIBUTE_FORMAT \
+  -DHAVE_FUNC_ATTRIBUTE_UNUSED \
+  -DHAVE_FUNC_ATTRIBUTE_NORETURN \
+  -DHAVE_FUNC_ATTRIBUTE_WARN_UNUSED_RESULT \
+  -include $(OPENGL_ROOT)/osito_compat/mesa_compat.h \
+  $(INCLUDES_MAIN) \
   -isystem $(GCC_INC)
 
 # W4.4 — CXXFLAGS_ZINK for gallium/drivers/zink/{zink_draw,zink_synchronization}.cpp.
@@ -428,13 +471,9 @@ COMPILER_C_SRCS      := $(patsubst $(OPENGL_ROOT)/%,%,$(COMPILER_C_SRCS_ABS))
 
 # C++ sources for libmesa_compiler.a — full GLSL frontend (W4.5 lifts the
 # 38 deferred files from W4.2: ast_*, builtin_*, glsl_lexer/parser, ir/* plus
-# the rest of lower_/opt_ family and serialize/shader_cache/standalone_scaffolding).
+# the rest of lower_/opt_ family and serialize/shader_cache/standalone).
 # All require mesa/main/macros.h, mtypes.h, program/symbol_table.h —
 # now available since W4.5-T0 vendored mesa/src/mesa/main/.
-#
-# Excluded: main.cpp + standalone.cpp (they declare main() — would conflict
-# with consumer ELFs at link time).  glsl_to_nir.cpp is INCLUDED — it
-# uses float64_glsl.h which we generated at T0-gen.
 COMPILER_CXX_SRCS := \
   mesa/src/compiler/glsl/ast_array_index.cpp \
   mesa/src/compiler/glsl/ast_expr.cpp \
@@ -557,12 +596,95 @@ ZINK_CXX_OBJS    := $(patsubst %.cpp,$(BUILD_DIR)/%.o,$(ZINK_CXX_SRCS))
 ZINK_LOADER_OBJS := $(patsubst %.c,$(BUILD_DIR)/%.o,$(ZINK_LOADER_SRCS))
 ZINK_OBJS        := $(ZINK_C_OBJS) $(ZINK_CXX_OBJS) $(ZINK_LOADER_OBJS)
 
-.PHONY: all clean util gallium compiler zink
-all: $(OUT) $(OUT_GALLIUM) $(OUT_COMPILER) $(OUT_ZINK)
+# ---------------------------------------------------------------------------
+# W4.5 — libmesa_main.a
+# ---------------------------------------------------------------------------
+#
+# GL state-tracker subset.  Source layout:
+#
+#   mesa/src/mesa/main/         (120 .c)  — _mesa_initialize_context, GL
+#                                            state machine, buffer/texture/
+#                                            shader objects, dispatch glue.
+#   mesa/src/mesa/state_tracker/(56 .c) — Gallium frontend, st_context,
+#                                            translate Mesa state → pipe.
+#   mesa/src/mesa/program/      (12 .c)  — ARB_*_program legacy IR.
+#   mesa/src/mesa/vbo/          (11 .c)  — vertex buffer object frontend,
+#                                            split + replay, dlist replay.
+#   mesa/src/mapi/              (10 .c)  — GL dispatch table runtime
+#                                            (glapi.c, u_current.c,
+#                                             entry.c, glapi_*.c).
+#
+# Pre-generated codegen vendored at W4.5-T0 / T3:
+#   mesa/main/dispatch.h          (gl_table.py)
+#   mesa/main/marshal_generated.h (gl_marshal_h.py)
+#   mesa/main/marshal_generated[0-7].c (gl_marshal.py)
+#   mesa/main/unmarshal_table.c  (gl_unmarshal_table.py)
+#   mesa/main/api_exec_init.c    (api_exec_init.py)
+#   mesa/main/api_exec_decl.h    (api_exec_decl_h.py)
+#   mesa/main/api_save.h         (api_save_h.py)
+#   mesa/main/api_save_init.h    (api_save_init_h.py)
+#   mesa/main/api_beginend_init.h (api_beginend_init_h.py)
+#   mesa/main/api_hw_select_init.h (api_hw_select_init_h.py)
+#   compiler/glsl/ir_expression_operation{,_constant,_strings}.h
+#   compiler/glsl/{float64,bc1,bc4,etc2_rgba_stitch,astc}_glsl.h
+#   compiler/glsl/cross_platform_settings_piece_all.h
+#
+# Initial source list — bottom-up.  Files we know the GLSL frontend needs
+# transitively get pulled in.  Anything that #includes <fcntl.h>, drm-uapi/,
+# or frontend/vdpau* gets EXCLUDED for now (DRM/VAAPI assumptions).
+
+# All .c in mesa/main/, exclude known-DRI / EGL / GLX / debug-helper / GL_INTEL_x
+# files that won't compile against our subset.  We accept everything else;
+# CFLAGS_MAIN has -Wno- relaxations to handle the noisy bits.
+MAIN_C_SRCS_ALL    := $(wildcard $(MESA_ROOT)/src/mesa/main/*.c)
+# Exclusions — files with #include <fcntl.h>, #include "drm/", or platform-
+# specific bits we don't carry on OsitoK.
+MAIN_C_EXCLUDE     := \
+  $(MESA_ROOT)/src/mesa/main/sse_minmax.c \
+  $(MESA_ROOT)/src/mesa/main/get_hash_params.py
+MAIN_C_SRCS_ABS    := $(filter-out $(MAIN_C_EXCLUDE), $(MAIN_C_SRCS_ALL))
+MAIN_C_SRCS        := $(patsubst $(OPENGL_ROOT)/%,%,$(MAIN_C_SRCS_ABS))
+
+# .c in mapi/ — we use the SHARED-GLAPI configuration (matches Linux desktop
+# Mesa).  shared-glapi/glapi_mapi_tmp.h is the generated dispatch header
+# (40k lines) — pre-generated at T0-gen.  shared-glapi/{glapi,stub,table}.c
+# replace mapi/glapi/glapi_dispatch.c on this path.
+MAPI_C_SRCS_ABS    := \
+  $(MESA_ROOT)/src/mapi/u_current.c \
+  $(MESA_ROOT)/src/mapi/entry.c \
+  $(MESA_ROOT)/src/mapi/shared-glapi/glapi.c \
+  $(MESA_ROOT)/src/mapi/shared-glapi/stub.c \
+  $(MESA_ROOT)/src/mapi/shared-glapi/table.c \
+  $(MESA_ROOT)/src/mapi/glapi/glapi_dispatch.c \
+  $(MESA_ROOT)/src/mapi/glapi/glapi_entrypoint.c \
+  $(MESA_ROOT)/src/mapi/glapi/glapi_getproc.c \
+  $(MESA_ROOT)/src/mapi/glapi/glapi_nop.c
+MAPI_C_SRCS        := $(patsubst $(OPENGL_ROOT)/%,%,$(MAPI_C_SRCS_ABS))
+
+# program/ — ARB_*_program legacy.
+PROGRAM_C_SRCS_ABS := $(wildcard $(MESA_ROOT)/src/mesa/program/*.c)
+PROGRAM_C_SRCS     := $(patsubst $(OPENGL_ROOT)/%,%,$(PROGRAM_C_SRCS_ABS))
+
+# vbo/ — vertex buffer object frontend.
+VBO_C_SRCS_ABS     := $(wildcard $(MESA_ROOT)/src/mesa/vbo/*.c)
+VBO_C_SRCS         := $(patsubst $(OPENGL_ROOT)/%,%,$(VBO_C_SRCS_ABS))
+
+# state_tracker/ — Gallium frontend.  Pulls draw/* (excluded by W4.1) plus
+# many DRI/EGL frontends.  We START with all and document exclusions in T4.
+ST_C_SRCS_ALL      := $(wildcard $(MESA_ROOT)/src/mesa/state_tracker/*.c)
+ST_C_SRCS_ABS      := $(ST_C_SRCS_ALL)
+ST_C_SRCS          := $(patsubst $(OPENGL_ROOT)/%,%,$(ST_C_SRCS_ABS))
+
+MAIN_C_SRCS_ALL_LIST := $(MAIN_C_SRCS) $(MAPI_C_SRCS) $(PROGRAM_C_SRCS) $(VBO_C_SRCS) $(ST_C_SRCS)
+MAIN_C_OBJS        := $(patsubst %.c,$(BUILD_DIR)/%.o,$(MAIN_C_SRCS_ALL_LIST))
+
+.PHONY: all clean util gallium compiler zink main
+all: $(OUT) $(OUT_GALLIUM) $(OUT_COMPILER) $(OUT_ZINK) $(OUT_MAIN)
 util: $(OUT)
 gallium: $(OUT_GALLIUM)
 compiler: $(OUT_COMPILER)
 zink: $(OUT_ZINK)
+main: $(OUT_MAIN)
 
 $(OUT): $(UTIL_OBJS) | $(BUILD_DIR)
 	@echo "  AR    $(notdir $@)"
@@ -582,6 +704,11 @@ $(OUT_COMPILER): $(COMPILER_OBJS) | $(BUILD_DIR)
 $(OUT_ZINK): $(ZINK_OBJS) | $(BUILD_DIR)
 	@echo "  AR    $(notdir $@)"
 	@$(AR) rcs $@ $(ZINK_OBJS)
+	@echo "  -> $$($(AR) t $@ | wc -l) objects in $@"
+
+$(OUT_MAIN): $(MAIN_C_OBJS) | $(BUILD_DIR)
+	@echo "  AR    $(notdir $@)"
+	@$(AR) rcs $@ $(MAIN_C_OBJS)
 	@echo "  -> $$($(AR) t $@ | wc -l) objects in $@"
 
 # W4.4 — bridge code for libmesa_zink.a uses CFLAGS_ZINK so the v305
@@ -652,6 +779,45 @@ $(BUILD_DIR)/mesa/src/gallium/drivers/zink/%.o: $(MESA_ROOT)/src/gallium/drivers
 	@mkdir -p $(dir $@)
 	@echo "  CXX   zink/$*"
 	@$(CXX) $(CXXFLAGS_ZINK) -c -o $@ $<
+
+# W4.5 pattern rules — mesa/main/, state_tracker/, program/, vbo/, mapi/.
+# Use CFLAGS_MAIN.  Pattern matches must come BEFORE the generic
+# mesa/src/gallium/% / mesa/src/util/% rules already defined above (they
+# are; ours are last, but the prefix check makes them strict subdir-first).
+$(BUILD_DIR)/mesa/src/mesa/main/%.o: $(MESA_ROOT)/src/mesa/main/%.c | $(BUILD_DIR)
+	@mkdir -p $(dir $@)
+	@echo "  CC    main/$*"
+	@$(CC) $(CFLAGS_MAIN) -c -o $@ $<
+
+$(BUILD_DIR)/mesa/src/mesa/state_tracker/%.o: $(MESA_ROOT)/src/mesa/state_tracker/%.c | $(BUILD_DIR)
+	@mkdir -p $(dir $@)
+	@echo "  CC    state_tracker/$*"
+	@$(CC) $(CFLAGS_MAIN) -c -o $@ $<
+
+$(BUILD_DIR)/mesa/src/mesa/program/%.o: $(MESA_ROOT)/src/mesa/program/%.c | $(BUILD_DIR)
+	@mkdir -p $(dir $@)
+	@echo "  CC    program/$*"
+	@$(CC) $(CFLAGS_MAIN) -c -o $@ $<
+
+$(BUILD_DIR)/mesa/src/mesa/vbo/%.o: $(MESA_ROOT)/src/mesa/vbo/%.c | $(BUILD_DIR)
+	@mkdir -p $(dir $@)
+	@echo "  CC    vbo/$*"
+	@$(CC) $(CFLAGS_MAIN) -c -o $@ $<
+
+$(BUILD_DIR)/mesa/src/mapi/glapi/%.o: $(MESA_ROOT)/src/mapi/glapi/%.c | $(BUILD_DIR)
+	@mkdir -p $(dir $@)
+	@echo "  CC    mapi/glapi/$*"
+	@$(CC) $(CFLAGS_MAIN) -c -o $@ $<
+
+$(BUILD_DIR)/mesa/src/mapi/shared-glapi/%.o: $(MESA_ROOT)/src/mapi/shared-glapi/%.c | $(BUILD_DIR)
+	@mkdir -p $(dir $@)
+	@echo "  CC    mapi/shared-glapi/$*"
+	@$(CC) $(CFLAGS_MAIN) -c -o $@ $<
+
+$(BUILD_DIR)/mesa/src/mapi/%.o: $(MESA_ROOT)/src/mapi/%.c | $(BUILD_DIR)
+	@mkdir -p $(dir $@)
+	@echo "  CC    mapi/$*"
+	@$(CC) $(CFLAGS_MAIN) -c -o $@ $<
 
 $(BUILD_DIR):
 	@mkdir -p $(BUILD_DIR)
