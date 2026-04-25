@@ -1474,9 +1474,14 @@ void isr_handler(interrupt_frame_t *frame)
                 serial_puts("\n");
             }
             /* After too many NULL calls, force crash recovery instead of
-             * looping forever. The engine's error cleanup calls NULL
-             * function pointers (GLog, GError) in a tight loop. */
-            if (null_call_count > 50) {
+             * looping forever. Was 50 — raised to 5000 so UT99 can
+             * survive the bursts of TArray-corruption-driven NULL
+             * iterations during engine init (each FName::Add or
+             * FString::Append on a corrupt array triggers tens of
+             * NULL calls before the engine moves on). 50 was enough
+             * to break out of an infinite GLog/GError tail-loop, but
+             * not enough for normal init flow. */
+            if (null_call_count > 5000) {
                 serial_puts("[NULL-CALL] Too many (#");
                 serial_putdec(null_call_count);
                 serial_puts(") — forcing crash recovery\n");
