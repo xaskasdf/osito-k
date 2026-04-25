@@ -1,8 +1,9 @@
-# arch/x86/lib/dxvk/Makefile -- W5.0 build infrastructure for DXVK on OsitoK.
+# arch/x86/lib/dxvk/Makefile -- W5.0/W5.1 build infrastructure for DXVK on OsitoK.
 #
-# Produces two static archives:
+# Produces three static archives:
 #   $(BUILD_DIR)/libdxvk_util.a   -- DXVK src/util/  (hash maps, log, etc.)
 #   $(BUILD_DIR)/libdxvk_spirv.a  -- DXVK src/spirv/ (SPIR-V module builder)
+#   $(BUILD_DIR)/libdxvk_dxbc.a   -- DXVK src/dxbc/  (D3D11 bytecode -> SPIR-V)
 #
 # Both compiled C++17 with -fno-exceptions -fno-rtti, force-including the
 # osito_compat/dxvk_compat.h shim so the upstream sources compile unchanged.
@@ -19,6 +20,7 @@ DXVK_SRC  := $(DXVK_ROOT)/dxvk/src
 BUILD_DIR := $(OSITOK_ROOT)/arch/x86/build/lib/dxvk
 UTIL_OUT  := $(BUILD_DIR)/libdxvk_util.a
 SPIRV_OUT := $(BUILD_DIR)/libdxvk_spirv.a
+DXBC_OUT  := $(BUILD_DIR)/libdxvk_dxbc.a
 
 # C++ compiler.  Prefer the OsitoK cross-compiler if present; else fall
 # back to the host g++ (which inside Docker is gcc:12's g++).
@@ -46,6 +48,8 @@ INCLUDES := \
   -I$(DXVK_SRC)/util/rc \
   -I$(DXVK_SRC)/spirv \
   -I$(DXVK_SRC)/vulkan \
+  -I$(DXVK_SRC)/dxvk \
+  -I$(DXVK_SRC)/dxbc \
   -I$(OSITOK_ROOT)/arch/x86/lib/vulkan/include
 
 # C++17, freestanding, no exceptions, no RTTI.  Hosted libstdc++ is
@@ -123,15 +127,41 @@ SPIRV_SRCS := \
   dxvk/src/spirv/spirv_compression.cpp \
   dxvk/src/spirv/spirv_module.cpp
 
+# ----------------------------------------------------------------------
+# DXBC_SRCS — DXVK src/dxbc/. The D3D11 bytecode -> SPIR-V translator.
+# 13 upstream .cpp files per meson.build. All self-contained shader
+# translation logic (no OS interaction).
+#
+# dxbc_options.cpp is deferred: it #includes "../d3d11/d3d11_options.h"
+# which would drag the entire D3D11 frontend into W5.1 scope. It is a
+# ~20-line class that DXVK instantiates from the D3D11 layer; DXBC
+# compilation itself doesn't call it.
+# ----------------------------------------------------------------------
+DXBC_SRCS := \
+  dxvk/src/dxbc/dxbc_analysis.cpp \
+  dxvk/src/dxbc/dxbc_chunk_isgn.cpp \
+  dxvk/src/dxbc/dxbc_chunk_shex.cpp \
+  dxvk/src/dxbc/dxbc_common.cpp \
+  dxvk/src/dxbc/dxbc_compiler.cpp \
+  dxvk/src/dxbc/dxbc_decoder.cpp \
+  dxvk/src/dxbc/dxbc_defs.cpp \
+  dxvk/src/dxbc/dxbc_header.cpp \
+  dxvk/src/dxbc/dxbc_module.cpp \
+  dxvk/src/dxbc/dxbc_names.cpp \
+  dxvk/src/dxbc/dxbc_reader.cpp \
+  dxvk/src/dxbc/dxbc_util.cpp
+
 UTIL_OBJS    := $(patsubst %.cpp,$(BUILD_DIR)/%.o,$(UTIL_SRCS))
 UTIL_C_OBJS  := $(patsubst %.c,$(BUILD_DIR)/%.o,$(UTIL_C_SRCS))
 SPIRV_OBJS   := $(patsubst %.cpp,$(BUILD_DIR)/%.o,$(SPIRV_SRCS))
+DXBC_OBJS    := $(patsubst %.cpp,$(BUILD_DIR)/%.o,$(DXBC_SRCS))
 
-.PHONY: all clean util spirv
-all: util spirv
+.PHONY: all clean util spirv dxbc
+all: util spirv dxbc
 
 util:  $(UTIL_OUT)
 spirv: $(SPIRV_OUT)
+dxbc:  $(DXBC_OUT)
 
 $(UTIL_OUT): $(UTIL_OBJS) $(UTIL_C_OBJS) | $(BUILD_DIR)
 	@echo "  AR    $(notdir $@)"
@@ -141,6 +171,11 @@ $(UTIL_OUT): $(UTIL_OBJS) $(UTIL_C_OBJS) | $(BUILD_DIR)
 $(SPIRV_OUT): $(SPIRV_OBJS) | $(BUILD_DIR)
 	@echo "  AR    $(notdir $@)"
 	@$(AR) rcs $@ $(SPIRV_OBJS)
+	@echo "  -> $$($(AR) t $@ | wc -l) objects in $@"
+
+$(DXBC_OUT): $(DXBC_OBJS) | $(BUILD_DIR)
+	@echo "  AR    $(notdir $@)"
+	@$(AR) rcs $@ $(DXBC_OBJS)
 	@echo "  -> $$($(AR) t $@ | wc -l) objects in $@"
 
 # Pattern rule: build/lib/dxvk/foo/bar.o : foo/bar.cpp
