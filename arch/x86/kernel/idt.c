@@ -1884,6 +1884,45 @@ compat32_null_recovery:
                 kernel_tss.ist1 = (uint64_t)(ist1_stack + IST1_STACK_SIZE);
                 uint64_t *jmp = compat32_crash_jmpbuf;
                 compat32_crash_jmpbuf = NULL;
+
+                /* Sanity-check the jmpbuf — UT99 in compat32 shares the
+                 * kernel CR3 and could have wild-written into shell.c's
+                 * static `winexec_jmpbuf[]`. If the saved cr3/rsp/rip
+                 * look bogus, halt cleanly instead of jumping to RIP=0
+                 * with random RSP and triple-faulting in kernel mode. */
+                uint64_t s_rsp = jmp[6], s_rip = jmp[7], s_cr3 = jmp[8];
+                serial_puts("  [WIN32] jmpbuf rip=0x"); serial_puthex(s_rip, 16);
+                serial_puts(" rsp=0x"); serial_puthex(s_rsp, 16);
+                serial_puts(" cr3=0x"); serial_puthex(s_cr3, 16);
+                serial_puts("\n");
+                int valid = 1;
+                /* RIP should be in kernel high half (>= 0xFFFF800000000000) */
+                if (s_rip < 0xFFFF800000000000ULL) {
+                    serial_puts("  [WIN32] jmpbuf RIP corrupt 0x");
+                    serial_puthex(s_rip, 16); serial_puts("\n");
+                    valid = 0;
+                }
+                /* RSP should be a kernel stack — either high half OR
+                 * within an ist_stack range. Allow low-half if it's a
+                 * boot-time kernel RSP (around 0x7FExxxxx UEFI region). */
+                if (s_rsp < 0x100000ULL) {
+                    serial_puts("  [WIN32] jmpbuf RSP corrupt 0x");
+                    serial_puthex(s_rsp, 16); serial_puts("\n");
+                    valid = 0;
+                }
+                /* CR3 must be page-aligned and < 4 GB */
+                if ((s_cr3 & 0xFFFULL) || s_cr3 >= 0x100000000ULL ||
+                    s_cr3 == 0) {
+                    serial_puts("  [WIN32] jmpbuf CR3 corrupt 0x");
+                    serial_puthex(s_cr3, 16); serial_puts("\n");
+                    valid = 0;
+                }
+                if (!valid) {
+                    serial_puts("  [WIN32] REFUSING longjmp — jmpbuf "
+                                "corrupted by user code, halting\n");
+                    __asm__ volatile ("cli");
+                    for (;;) __asm__ volatile ("hlt");
+                }
                 kern_longjmp(jmp, 1);
             }
         }

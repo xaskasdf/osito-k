@@ -66,7 +66,18 @@ extern int paging_set_flags(uint64_t virt, uint64_t flags);
  * VA range: 0x40000000–0x7FFF0000 (Win32 user heap region, below 2GB).
  */
 #define WIN32_VA_BASE  0x40000000ULL
-#define WIN32_VA_LIMIT 0x7FFF0000ULL
+/* WAS 0x7FFF0000 — but the kernel's pre-MMU UEFI stack lives around
+ * 0x7FE60000, INSIDE the old VA range. UT99 making >900 MB of
+ * VirtualAlloc would push win32_va_next past 0x7FE60000 and start
+ * overwriting the shell's saved registers / setjmp buffer that lives
+ * on that stack. After UT99 crash + longjmp returns to shell, the
+ * corrupted return addresses caused #PF at RIP=0.
+ *
+ * Cap at 0x78000000 (= 1920 MB user range, 0x40000000..0x78000000) to
+ * leave a 128 MB gap below the kernel's UEFI stack. Plenty for UT99
+ * engine init (1737 VirtualAllocs observed; even with the 256MB cap
+ * burst, total ~600 MB sustained). */
+#define WIN32_VA_LIMIT 0x78000000ULL
 
 static uint64_t win32_va_next = WIN32_VA_BASE;
 
