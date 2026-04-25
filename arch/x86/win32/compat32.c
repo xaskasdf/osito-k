@@ -97,7 +97,14 @@ static uint32_t catch_continue_stub_addr = 0;
  * In BSS, the displacement contained 0xCC at a critical code address,
  * which QEMU TCG misinterpreted as INT3. */
 static int      callback_depth __attribute__((section(".data"))) = 0;
-static uint64_t callback_jmpbufs[MAX_CALLBACK_DEPTH][8];
+/* kern_setjmp / kern_longjmp use a 9-quad jmp_buf:
+ *   [0..5] callee-saved GPRs (rbx, rbp, r12-r15)
+ *   [6]    rsp     [7] rip     [8] cr3
+ * Sizing this array as [...][8] truncated each slot to 64 bytes and the
+ * setjmp at depth N+1 wrote its rbx (slot[0]) on top of slot N's cr3 —
+ * causing the depth=0 longjmp after _initterm to triple-fault on a
+ * bogus 0x40 CR3. Must be at least 9. */
+static uint64_t callback_jmpbufs[MAX_CALLBACK_DEPTH][9];
 static uint64_t callback_saved_ist1[MAX_CALLBACK_DEPTH];
 /* Callback stacks allocated lazily (saves 2MB BSS).
  * Each depth level gets its own 64KB stack on first use. */
@@ -2145,6 +2152,18 @@ uint64_t compat32_dispatch(uint32_t thunk_idx, uint32_t *stack_args)
                 g_int2e_rsp_depth--;
         }
 
+        /* Diagnostic: dump the saved jmpbuf BEFORE longjmp so we can
+         * see whether the setjmp actually captured a valid kernel
+         * state, or whether the slot was clobbered between setjmp and
+         * the longjmp dispatch. */
+        {
+            uint64_t *jb = callback_jmpbufs[depth];
+            serial_puts("[CB32] longjmp depth="); serial_putdec(depth);
+            serial_puts(" rip=0x"); serial_puthex(jb[7], 16);
+            serial_puts(" rsp=0x"); serial_puthex(jb[6], 16);
+            serial_puts(" cr3=0x"); serial_puthex(jb[8], 16);
+            serial_puts("\n");
+        }
         kern_longjmp(callback_jmpbufs[depth], 1);
         /* never reached */
         return 0;
