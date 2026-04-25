@@ -111,6 +111,15 @@ VKAPI_ATTR void VKAPI_CALL vkCmdBindPipeline(
 VKAPI_ATTR void VKAPI_CALL vkCmdDraw(
     VkCommandBuffer, uint32_t, uint32_t, uint32_t, uint32_t);
 
+/* W3b.6 — vertex input + dynamic state. */
+VKAPI_ATTR void VKAPI_CALL vkCmdBindVertexBuffers(
+    VkCommandBuffer, uint32_t, uint32_t,
+    const VkBuffer *, const VkDeviceSize *);
+VKAPI_ATTR void VKAPI_CALL vkCmdSetViewport(
+    VkCommandBuffer, uint32_t, uint32_t, const VkViewport *);
+VKAPI_ATTR void VKAPI_CALL vkCmdSetScissor(
+    VkCommandBuffer, uint32_t, uint32_t, const VkRect2D *);
+
 /* W3b.5 — WSI + surface + swapchain + queue + sync + present. */
 VKAPI_ATTR VkResult VKAPI_CALL vkCreateOsitokCompositorSurfaceKHR(
     VkInstance, const VkOsitoCompositorSurfaceCreateInfoOSITOK *,
@@ -261,6 +270,14 @@ osito_loader_get_instance_proc_addr(VkInstance instance, const char *pName) {
         return (PFN_vkVoidFunction)vkCmdBindPipeline;
     if (strcmp(pName, "vkCmdDraw") == 0)
         return (PFN_vkVoidFunction)vkCmdDraw;
+
+    /* W3b.6 — vertex input + dynamic state. */
+    if (strcmp(pName, "vkCmdBindVertexBuffers") == 0)
+        return (PFN_vkVoidFunction)vkCmdBindVertexBuffers;
+    if (strcmp(pName, "vkCmdSetViewport") == 0)
+        return (PFN_vkVoidFunction)vkCmdSetViewport;
+    if (strcmp(pName, "vkCmdSetScissor") == 0)
+        return (PFN_vkVoidFunction)vkCmdSetScissor;
 
     /* W3b.5 additions — WSI + surface + swapchain + queue + sync. */
     if (strcmp(pName, "vkCreateOsitokCompositorSurfaceKHR") == 0)
@@ -1144,6 +1161,58 @@ vkCmdDraw(VkCommandBuffer cb, uint32_t vertexCount,
         ci->icd->get_proc_addr(ci->handle, "vkCmdDraw");
     if (!fn) return;
     fn(w->real, vertexCount, instanceCount, firstVertex, firstInstance);
+}
+
+/* ---------------- W3b.6 trampolines ---------------------------------------
+ *
+ * Vertex input + dynamic state. No new wrapper types — VkBuffer wrappers
+ * already exist (osito_buffer), and VkViewport / VkRect2D are POD.
+ */
+VKAPI_ATTR void VKAPI_CALL
+vkCmdBindVertexBuffers(VkCommandBuffer cb, uint32_t firstBinding,
+                       uint32_t bindingCount, const VkBuffer *pBuffers,
+                       const VkDeviceSize *pOffsets) {
+    if (!cb || !pBuffers) return;
+    struct osito_cmd_buffer *w = (struct osito_cmd_buffer *)cb;
+    struct osito_icd_inst *ci = w->owner ? w->owner->owner : 0;
+    if (!ci) return;
+    PFN_vkCmdBindVertexBuffers fn = (PFN_vkCmdBindVertexBuffers)
+        ci->icd->get_proc_addr(ci->handle, "vkCmdBindVertexBuffers");
+    if (!fn) return;
+    /* Translate wrapper VkBuffers -> ICD-side real handles. Use a small
+     * stack array; we cap at 8 (the ICD encoder also caps there). */
+    VkBuffer real_bufs[8];
+    uint32_t n = bindingCount;
+    if (n > 8u) n = 8u;
+    for (uint32_t i = 0; i < n; i++)
+        real_bufs[i] = pBuffers[i] ? buf_from(pBuffers[i])->real : 0;
+    fn(w->real, firstBinding, n, real_bufs, pOffsets);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+vkCmdSetViewport(VkCommandBuffer cb, uint32_t firstViewport,
+                 uint32_t viewportCount, const VkViewport *pViewports) {
+    if (!cb) return;
+    struct osito_cmd_buffer *w = (struct osito_cmd_buffer *)cb;
+    struct osito_icd_inst *ci = w->owner ? w->owner->owner : 0;
+    if (!ci) return;
+    PFN_vkCmdSetViewport fn = (PFN_vkCmdSetViewport)
+        ci->icd->get_proc_addr(ci->handle, "vkCmdSetViewport");
+    if (!fn) return;
+    fn(w->real, firstViewport, viewportCount, pViewports);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+vkCmdSetScissor(VkCommandBuffer cb, uint32_t firstScissor,
+                uint32_t scissorCount, const VkRect2D *pScissors) {
+    if (!cb) return;
+    struct osito_cmd_buffer *w = (struct osito_cmd_buffer *)cb;
+    struct osito_icd_inst *ci = w->owner ? w->owner->owner : 0;
+    if (!ci) return;
+    PFN_vkCmdSetScissor fn = (PFN_vkCmdSetScissor)
+        ci->icd->get_proc_addr(ci->handle, "vkCmdSetScissor");
+    if (!fn) return;
+    fn(w->real, firstScissor, scissorCount, pScissors);
 }
 
 /* ---------------- W3b.5 trampolines ---------------------------------------
