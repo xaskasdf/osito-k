@@ -134,6 +134,14 @@ uint32_t compat32_get_last_caller_eip(void) { return g_last_caller_eip; }
 uint32_t g_last_stack_args = 0;
 uint32_t compat32_get_last_stack_args(void) { return g_last_stack_args; }
 
+/* The user-mode RBP at the moment of the INT 0x2E. Set by
+ * int2e_stub.S right before it calls compat32_dispatch. The low 32
+ * bits are the 32-bit EBP that the engine's frame-pointer chain uses;
+ * the VirtualAlloc shim walks [EBP], [EBP+4] up the chain to find
+ * the callers of FMallocWindows::Realloc. */
+uint64_t g_int2e_user_rbp = 0;
+uint32_t compat32_get_last_user_ebp(void) { return (uint32_t)g_int2e_user_rbp; }
+
 /*
  * Single global retval written by the 32-bit return stub (MOV [addr], EAX).
  * The stub uses a fixed address so we can't index by depth there.

@@ -63,6 +63,14 @@ int2e_stub:
     movq 144(%rsp), %rsi
     addq $4, %rsi
 
+    /* Stash the user-mode 32-bit EBP (low 32 bits of saved RBP at
+     * offset 72 in the GPR-save area) into a global so the C
+     * dispatcher and shims can walk the user-mode frame chain.
+     * Diagnostic only — used by the VirtualAlloc shim to identify
+     * the caller of FMallocWindows::Realloc. */
+    movq 72(%rsp), %r10
+    movq %r10, g_int2e_user_rbp(%rip)
+
     /* Save RSP to per-depth stack before aligning and calling C dispatcher.
      * Cannot use RBP (kern_longjmp overwrites it) or a single global
      * (nested INT 0x2E from callback returns overwrites it). */

@@ -326,32 +326,33 @@ PVOID WINAPI VirtualAlloc(PVOID lpAddress, SIZE_T dwSize,
             serial_puthex(user_eip, 8);
         }
         serial_puts("\n");
-        /* Dump the user-mode stack so we can identify the chain of
-         * callers that led to this bogus alloc. The compat32 INT 0x2E
-         * dispatcher receives stack_args via RSI = ESP+4 (the
-         * arguments to VirtualAlloc itself), so user ESP = stack_args
-         * - 4. Print 24 dwords starting there: that captures the four
-         * VirtualAlloc args, the wrapper's return address, the
-         * wrapper's saved-EBP region, and the immediate caller of
-         * the wrapper (= the function whose corrupt TArray is feeding
-         * the bogus size). */
-        extern uint32_t compat32_get_last_stack_args(void);
-        uint32_t sa = compat32_get_last_stack_args();
-        if (sa) {
-            uint32_t uesp = sa - 4;
-            serial_puts("[VA]   user_esp=0x"); serial_puthex(uesp, 8);
-            serial_puts(" stack:\n");
-            uint32_t *p = (uint32_t *)(uintptr_t)uesp;
-            for (int row = 0; row < 6; row++) {
-                serial_puts("[VA]   +0x");
-                serial_puthex(row * 16, 4);
-                serial_puts(":");
-                for (int c = 0; c < 4; c++) {
-                    serial_puts(" 0x");
-                    serial_puthex(p[row * 4 + c], 8);
-                }
+        /* Walk the user-mode EBP frame-pointer chain to find every
+         * caller of the FMallocWindows::Realloc wrapper. The first
+         * frame above us is the wrapper itself; subsequent frames
+         * lead back through the engine to the function whose
+         * corrupt TArray is feeding the bogus size. */
+        extern uint32_t compat32_get_last_user_ebp(void);
+        uint32_t ebp = compat32_get_last_user_ebp();
+        serial_puts("[VA]   user_ebp=0x"); serial_puthex(ebp, 8);
+        serial_puts(" frames:\n");
+        uint32_t cur = ebp;
+        for (int f = 0; f < 8; f++) {
+            if (cur < 0x100000 || cur >= 0xFFFE0000 || (cur & 3)) {
+                serial_puts("[VA]   frame "); serial_putdec(f);
+                serial_puts(": stop at ebp=0x"); serial_puthex(cur, 8);
                 serial_puts("\n");
+                break;
             }
+            uint32_t *fp = (uint32_t *)(uintptr_t)cur;
+            uint32_t saved_ebp = fp[0];
+            uint32_t ret_addr  = fp[1];
+            serial_puts("[VA]   frame "); serial_putdec(f);
+            serial_puts(": ebp=0x"); serial_puthex(cur, 8);
+            serial_puts(" ret=0x"); serial_puthex(ret_addr, 8);
+            serial_puts(" sebp=0x"); serial_puthex(saved_ebp, 8);
+            serial_puts("\n");
+            if (saved_ebp <= cur) break;  /* not strictly increasing → stop */
+            cur = saved_ebp;
         }
     }
 
