@@ -21,12 +21,14 @@ GCC_INC     := $(shell $(CC) -print-file-name=include)
 
 INCLUDES := \
   -I$(OPENGL_ROOT)/include \
+  -I$(OPENGL_ROOT)/osito_compat \
+  -I$(OSITOK_ROOT)/arch/x86/libc/qjs_headers \
+  -I$(OSITOK_ROOT)/arch/x86/libc \
+  -I$(OSITOK_ROOT)/arch/x86/include \
   -I$(MESA_ROOT)/include \
   -I$(MESA_ROOT)/src \
   -I$(MESA_ROOT)/src/util \
-  -I$(MESA_ROOT)/src/c11 \
-  -I$(OSITOK_ROOT)/arch/x86/libc \
-  -I$(OSITOK_ROOT)/arch/x86/include
+  -I$(MESA_ROOT)/src/c11
 
 CFLAGS := \
   -std=gnu11 -ffreestanding -nostdinc \
@@ -35,7 +37,7 @@ CFLAGS := \
   -Wno-missing-field-initializers -Wno-pointer-arith \
   -Wno-sign-compare \
   -O2 -fno-pic -fvisibility=hidden \
-  -DHAVE_PTHREAD=0 -D__OSITO_K__ \
+  -D__OSITO_K__ \
   -include $(OPENGL_ROOT)/osito_compat/mesa_compat.h \
   $(INCLUDES) \
   -isystem $(GCC_INC)
@@ -43,6 +45,7 @@ CFLAGS := \
 # T3 — list of util/ files we currently know how to compile.
 # Update this list as more files are validated.
 UTIL_SRCS := \
+  osito_compat/mesa_libc_stubs.c \
   mesa/src/util/bitscan.c \
   mesa/src/util/blob.c \
   mesa/src/util/crc32.c \
@@ -76,7 +79,6 @@ UTIL_SRCS := \
   mesa/src/util/u_idalloc.c \
   mesa/src/util/u_math.c \
   mesa/src/util/u_printf.c \
-  mesa/src/util/u_qsort.c \
   mesa/src/util/u_vector.c \
   mesa/src/util/u_worklist.c \
   mesa/src/util/vma.c

@@ -7,9 +7,52 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include <time.h>   /* OsitoK libc — provides time_t and struct tm */
+
+/* Tell Mesa's src/c11/time.h not to redefine struct timespec — we'll
+ * define it once below from libc primitives. */
+#define HAVE_STRUCT_TIMESPEC 1
+
+#ifndef _STRUCT_TIMESPEC_DEFINED
+#define _STRUCT_TIMESPEC_DEFINED
+struct timespec { time_t tv_sec; long tv_nsec; };
+#endif
 
 /* errno comes from libc */
 extern int errno;
+
+/* errno values that OsitoK libc errno.h doesn't define yet — Mesa references
+ * a few here and there. Add as needed. */
+#ifndef EINTR
+#define EINTR  4
+#endif
+#ifndef EAGAIN
+#define EAGAIN 11
+#endif
+
+/* OsitoK has no concept of users — return 0 ("root") so any "are we
+ * privileged?" check reads as true. */
+static inline int geteuid(void) { return 0; }
+static inline int getuid(void)  { return 0; }
+static inline int getegid(void) { return 0; }
+static inline int getgid(void)  { return 0; }
+static inline int getpid(void)  { return 1; }
+
+/* clock_nanosleep — Mesa os_time.c uses it for sleep/yield loops. We just
+ * return (no kernel sleep API exposed in this layer yet). */
+static inline int clock_nanosleep(int clk, int flags, const struct timespec *req, struct timespec *rem) {
+    (void)clk; (void)flags; (void)req; (void)rem;
+    return 0;
+}
+
+/* Endian — we are unconditionally little-endian on x86-64. */
+#define UTIL_ARCH_LITTLE_ENDIAN 1
+#define UTIL_ARCH_BIG_ENDIAN    0
+
+/* lrintf is missing from OsitoK libc math.h — declare here so Mesa can use
+ * it. We also provide a simple inline fallback that calls lrint(double). */
+extern long lrint(double);
+static inline long lrintf(float f) { return lrint((double)f); }
 
 /* posix_memalign: wrap our libc malloc */
 extern void *malloc(size_t);
@@ -28,6 +71,10 @@ typedef int pthread_cond_t;
 typedef int pthread_t;
 typedef int pthread_once_t;
 typedef int pthread_key_t;
+typedef int pthread_barrier_t;
+typedef int pthread_mutexattr_t;
+typedef int pthread_condattr_t;
+typedef int pthread_attr_t;
 #define PTHREAD_MUTEX_INITIALIZER 0
 #define PTHREAD_COND_INITIALIZER  0
 #define PTHREAD_ONCE_INIT         0
@@ -47,7 +94,6 @@ static inline int pthread_create(pthread_t *t, const void *a, void *(*f)(void *)
 static inline int pthread_join(pthread_t t, void **r) { (void)t; (void)r; return 0; }
 
 /* clock_gettime CLOCK_MONOTONIC: reuse our gettimeofday syscall (96) */
-struct timespec { long tv_sec; long tv_nsec; };
 #define CLOCK_MONOTONIC 1
 #define CLOCK_REALTIME  0
 extern long syscall(long, ...);
@@ -60,18 +106,41 @@ static inline int clock_gettime(int clk, struct timespec *ts) {
     return 0;
 }
 
-/* sysconf */
+/* sysconf — names per glibc bits/confname.h, just enough for Mesa util/ */
+#define _SC_PAGE_SIZE        30
+#define _SC_PAGESIZE         _SC_PAGE_SIZE
+#define _SC_PHYS_PAGES       85
+#define _SC_AVPHYS_PAGES     86
 #define _SC_NPROCESSORS_ONLN 84
 static inline long sysconf(int name) {
-    if (name == _SC_NPROCESSORS_ONLN) return 4;
-    return -1;
+    switch (name) {
+    case _SC_NPROCESSORS_ONLN: return 4;
+    case _SC_PAGE_SIZE:        return 4096;
+    case _SC_PHYS_PAGES:       return (1L << 30) / 4096;  /* claim 4 GiB */
+    case _SC_AVPHYS_PAGES:     return (1L << 29) / 4096;  /* claim 2 GiB free */
+    default:                   return -1;
+    }
 }
+
+/* C11 _Static_assert keyword — qjs_headers/assert.h doesn't define static_assert
+ * (it is a C11 keyword via assert.h). Provide it here. */
+#ifndef static_assert
+#define static_assert(cond, msg) _Static_assert((cond), msg)
+#endif
 
 /* getenv: always NULL on OsitoK */
 static inline char *getenv(const char *name) { (void)name; return (char *)0; }
 
-/* Tell Mesa code which features are off */
-#define HAVE_PTHREAD 0
+/* strndup / strnlen — provided by mesa_libc_stubs.c, declared here. */
+extern size_t strnlen(const char *s, size_t maxlen);
+extern char  *strndup(const char *s, size_t n);
+extern int    rand(void);
+
+/* Tell Mesa code which features are on. HAVE_PTHREAD=1 forces Mesa's
+ * c11/threads.h to take the pthread branch — which #include's <pthread.h>;
+ * we provide a stub osito_compat/pthread.h that resolves cleanly because
+ * the actual pthread surface is provided above by this very header. */
+#define HAVE_PTHREAD 1
 #define USE_X86_64   1
 
 #endif
