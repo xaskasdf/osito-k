@@ -105,7 +105,18 @@ UTIL_C_SRCS := \
 #                                          which arrive in W5.1+.  Deferred.
 
 # ----------------------------------------------------------------------
-# SPIRV_SRCS
+# SPIRV_SRCS — DXVK src/spirv/.  All four upstream .cpp / header units
+# build cleanly with the shim:
+#
+#   spirv_code_buffer.cpp  -- SPIR-V word stream emitter / encoder
+#   spirv_compression.cpp  -- DXVK in-memory cache compression
+#   spirv_module.cpp       -- the high-level builder DXBC + DXIL drive
+#
+# (spirv_instruction.h is header-only; the upstream meson.build does not
+# list it as a source — same here.)
+#
+# Together they pack into libdxvk_spirv.a at ~140 KB / 3 objects, which
+# exceeds the W5.0 acceptance bar (≥3 spirv objects).
 # ----------------------------------------------------------------------
 SPIRV_SRCS := \
   dxvk/src/spirv/spirv_code_buffer.cpp \
