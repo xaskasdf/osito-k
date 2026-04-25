@@ -108,6 +108,13 @@ typedef union _ULARGE_INTEGER {
   uint64_t QuadPart;
 } ULARGE_INTEGER;
 
+/* LUID — Locally Unique IDentifier.  Used by DXGI/D3D for adapter
+ * identification.  Same layout as Win32. */
+typedef struct _LUID {
+  uint32_t LowPart;
+  int32_t  HighPart;
+} LUID, *PLUID;
+
 #ifndef TRUE
 #define TRUE  1
 #endif
@@ -170,16 +177,22 @@ static inline void OutputDebugStringA(const char *s) {
 /* -- Misc Windows-isms DXVK uses ------------------------------------- */
 #define MAX_PATH 260
 
-/* DXVK refers to UUID/IID/GUID types via util_misc.h and com_include.h.
- * We define the minimal aliases here so transitively-included headers
- * stop yelling before com_stub/IUnknown.h is included.
- *
- * Forward decl of GUID — full definition lives in com_stub/IUnknown.h
- * which DXVK pulls in via com/com_include.h (we redirect via -I). */
-#ifdef __cplusplus
-struct GUID;
-#else
-struct GUID;
+/* WCHAR — DXVK uses this for utf-16 strings.  On Linux/Wine builds it is
+ * 16-bit; we match. */
+#ifndef WCHAR
+typedef unsigned short WCHAR;
 #endif
+typedef WCHAR *PWSTR;
+typedef const WCHAR *PCWSTR;
+typedef WCHAR *PWCHAR;
+typedef const WCHAR *PCWCHAR;
+typedef long NTSTATUS;
+typedef void *PSECURITY_ATTRIBUTES;
+typedef void *PSECURITY_DESCRIPTOR;
+typedef int SECURITY_DESCRIPTOR_REVISION;
+
+/* GUID — full definition lives in com_stub/IUnknown.h.  We do NOT
+ * forward-declare it here to avoid a struct/typedef-name clash with the
+ * `typedef struct _GUID { ... } GUID;` form in IUnknown.h. */
 
 #endif /* DXVK_OSITOK_COMPAT_H */

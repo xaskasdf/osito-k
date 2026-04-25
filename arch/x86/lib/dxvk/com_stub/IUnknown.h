@@ -35,6 +35,26 @@ typedef GUID UUID;
 }  /* extern "C" */
 #endif
 
+/* GUID equality.  Wine and the Windows SDK provide IsEqualGUID + the
+ * `operator==` overload; we provide both.  Defined inline in the header
+ * because each TU is its own namespace as far as the linker cares (this
+ * is a static inline). */
+#ifdef __cplusplus
+static inline bool operator==(const GUID& a, const GUID& b) {
+  return a.Data1 == b.Data1 && a.Data2 == b.Data2 && a.Data3 == b.Data3
+      && a.Data4[0] == b.Data4[0] && a.Data4[1] == b.Data4[1]
+      && a.Data4[2] == b.Data4[2] && a.Data4[3] == b.Data4[3]
+      && a.Data4[4] == b.Data4[4] && a.Data4[5] == b.Data4[5]
+      && a.Data4[6] == b.Data4[6] && a.Data4[7] == b.Data4[7];
+}
+static inline bool operator!=(const GUID& a, const GUID& b) {
+  return !(a == b);
+}
+static inline bool IsEqualGUID(const GUID& a, const GUID& b) {
+  return a == b;
+}
+#endif
+
 /* In Windows headers, REFIID/REFGUID are `const IID&` in C++ and a
  * pointer in C. DXVK is C++ throughout. */
 #ifdef __cplusplus
@@ -64,6 +84,7 @@ typedef int HRESULT;
 #define E_NOTIMPL       ((HRESULT)0x80004001)
 #define E_POINTER       ((HRESULT)0x80004003)
 #define DXGI_ERROR_NOT_FOUND ((HRESULT)0x887A0002)
+#define DXGI_ERROR_MORE_DATA ((HRESULT)0x887A0003)
 
 #define SUCCEEDED(hr)   (((HRESULT)(hr)) >= 0)
 #define FAILED(hr)      (((HRESULT)(hr)) < 0)
