@@ -936,7 +936,13 @@ static void __attribute__((noreturn)) sched_thread_exit(void)
 {
     if (sched_current_idx >= 0)
         proctab[sched_current_idx].state = PROC_ZOMBIE;
-    for (;;) __asm__ volatile ("hlt");
+    /* Yield repeatedly via software int $0x20 instead of `hlt`. With
+     * the APIC timer masked (compat32 sessions do this), a hlt would
+     * never wake; the scheduler would never run again and any
+     * waiter (e.g. UT99 main on WaitForSingleObject) would deadlock.
+     * Software-INT into the timer ISR runs sched_tick synchronously
+     * which switches us off this ZOMBIE process to whoever is READY. */
+    for (;;) __asm__ volatile ("int $0x20" ::: "memory");
 }
 
 /* ── sched_tick: called from ISR on every APIC timer tick ────── */
@@ -1284,7 +1290,15 @@ void sched_yield(void)
 {
     if (!sched_enabled || sched_current_idx < 0) return;
     proctab[sched_current_idx].quantum = 0;
-    __asm__ volatile ("hlt");  /* wait for next timer tick → switch */
+    /* Invoke the timer ISR via software INT instead of waiting for
+     * the next hardware tick. The APIC LVT_TIMER is masked while UT99
+     * (and any other compat32 process) is running so a `hlt` here
+     * would never wake. `int $0x20` runs isr_stub_32 → isr_handler →
+     * sched_tick synchronously, which performs the context switch
+     * exactly as a real timer tick would. After iretq we resume on
+     * whichever process the scheduler picks next (or back to us if
+     * we're still the highest-priority READY process). */
+    __asm__ volatile ("int $0x20" ::: "memory");
 }
 
 /* ── sched_stats: return context switch count ────────────────── */
