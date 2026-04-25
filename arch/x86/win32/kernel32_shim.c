@@ -380,14 +380,7 @@ PVOID WINAPI VirtualAlloc(PVOID lpAddress, SIZE_T dwSize,
         }
         dwSize = 0x10000000; /* 256MB */
         /* Self-modify the engine's memcpy helper at 0x1010723E so that
-         * the upcoming bogus 2GB rep-movsl terminates instantly. The
-         * helper's prologue computes ECX = dword count (= corrupt elem
-         * count * 2 / 4 = ~537M); we replace `rep movsl` (F3 A5) with
-         * `xor ecx, ecx` (31 C9). The CPU then proceeds to the post-
-         * rep code that does `mov ecx, ebx; rep movsb` — ebx holds the
-         * tiny (0..3) leftover-bytes count, so rep movsb is a tiny
-         * copy. Function returns after a few microseconds instead of
-         * many minutes. Idempotent: only patch once. */
+         * the upcoming bogus 2GB rep-movsl terminates instantly. */
         static int patched_memcpy = 0;
         if (!patched_memcpy) {
             volatile uint8_t *p = (uint8_t *)(uintptr_t)0x1010723E;
@@ -398,6 +391,11 @@ PVOID WINAPI VirtualAlloc(PVOID lpAddress, SIZE_T dwSize,
                 serial_puts("[VA] PATCHED rep-movsl @0x1010723E -> xor ecx,ecx\n");
             }
         }
+        /* (Tried also patching the count read at 0x1033E7F5 to
+         * `xor eax,eax; nop` — didn't help because the same NULL-call
+         * cascade hits via a parallel path that doesn't go through
+         * 0x1033E7D0. Reverting that patch; it may break legitimate
+         * uses of 0x1033E7D0 elsewhere.) */
     }
 
     PVOID base = lpAddress;
