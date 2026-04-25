@@ -415,7 +415,11 @@ COMPILER_OBJS     := $(COMPILER_C_OBJS) $(COMPILER_CXX_OBJS)
 #   zink_screen.c     — driver entrypoint, depends on full Vulkan ICD
 #   zink_draw.cpp     — c++17 driver hot path
 #   zink_synchronization.cpp — c++17 sync primitives
-#   zink_program.c    — gfx pipeline cache, requires u_blitter wiring
+#   (zink_program.c IS built but has a RUNTIME dep on util_blitter_*
+#    which lives in u_blitter.c — that file is excluded from libmesa_gallium.a
+#    at W4.1 deferral. zink_create_context will fail to link or hit an
+#    undefined symbol at runtime in W4.4 unless u_blitter.c is added.
+#    Tracked in W4.3 quality review.)
 #
 # Anything we couldn't get past header parse stays out and we document it.
 

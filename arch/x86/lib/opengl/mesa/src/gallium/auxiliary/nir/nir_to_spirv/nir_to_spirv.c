@@ -24,6 +24,14 @@
 #include "nir_to_spirv.h"
 #include "spirv_builder.h"
 
+/* OsitoK W4.3-fix: nir_to_spirv compiles against Mesa-overlay vulkan_core.h
+ * (v305+). venus ICD ships an older header. Mesa-overlay must precede the
+ * libvulkan include path or struct layouts diverge. Assert loudly. */
+#include <vulkan/vulkan_core.h>
+_Static_assert(VK_HEADER_VERSION >= 305,
+               "nir_to_spirv requires VK_HEADER_VERSION >= 305 — "
+               "verify Mesa overlay vulkan_core.h precedes the libvulkan header");
+
 #include "nir.h"
 #include "pipe/p_state.h"
 #include "util/u_math.h"
