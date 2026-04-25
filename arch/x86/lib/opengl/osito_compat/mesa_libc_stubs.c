@@ -109,7 +109,10 @@ int mtx_destroy(mtx_t *m)                  { (void)m; return 0; }
 int mtx_timedlock(mtx_t *m, const void *t) { (void)m; (void)t; return 0; }
 
 void call_once(once_flag *flag, void (*fn)(void)) {
-    if (*flag == 0) { *flag = 1; fn(); }
+    /* Set flag AFTER fn() so re-entrant calls into call_once with the
+     * same flag (Mesa's glsl_type_singleton_init_or_ref does this) don't
+     * skip init. Safe because environment is single-threaded. */
+    if (*flag == 0) { fn(); *flag = 1; }
 }
 
 /* cnd_* family used by util/u_call_once.c via threads.h */
@@ -147,8 +150,18 @@ extern double fmax(double, double);
 extern double copysign(double, double);
 extern double ldexp(double, int);
 
-float fminf(float a, float b)            { return (float)fmin((double)a, (double)b); }
-float fmaxf(float a, float b)            { return (float)fmax((double)a, (double)b); }
+/* C99/IEEE 754-2008 NaN semantics: fmin(NaN,x)=x, fmin(x,NaN)=x, fmin(NaN,NaN)=NaN.
+ * OsitoK's underlying fmin behavior may not honor this; explicit guards. */
+float fminf(float a, float b) {
+    if (a != a) return b;     /* a is NaN */
+    if (b != b) return a;     /* b is NaN */
+    return (float)fmin((double)a, (double)b);
+}
+float fmaxf(float a, float b) {
+    if (a != a) return b;
+    if (b != b) return a;
+    return (float)fmax((double)a, (double)b);
+}
 float copysignf(float a, float b)        { return (float)copysign((double)a, (double)b); }
 float ldexpf(float a, int e)             { return (float)ldexp((double)a, e); }
 
