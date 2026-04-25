@@ -9,23 +9,47 @@
  *   2. Look up the image slot at image_index.
  *   3. Look up the memory bound to the image (venus_memory slot from
  *      img->bound_mem_slot set in vkBindImageMemory).
- *   4. If that memory slot is SHM-backed (is_shm_backed=1 and
+ *   4. (W3b.6) Find a cmd buffer that drew into this image's framebuffer,
+ *      and if it recorded a CmdDraw + a vertex buffer with vertexCount>=3,
+ *      run the CPU-fallback rasterizer on the SHM-mapped framebuffer.
+ *   5. If that memory slot is SHM-backed (is_shm_backed=1 and
  *      shm_handle != 0), issue syscall(SYS_GUI_FLIP=507, shm_handle).
- *   5. If NOT SHM-backed (defensive path — happens when the app
- *      allocated non-swapchain memory, or the bind path didn't run
- *      its upgrade logic), silently return VK_SUCCESS. No crash.
+ *   6. If NOT SHM-backed (defensive path), silently return VK_SUCCESS.
  *
  * The app picks one flip per vkQueuePresentKHR call. Semaphores are
  * waited on guest-local (no-op, since no real GPU work is pending).
  *
- * See master plan §W3b.5 T5 + the SHM integration note in §G5.
+ * See master plan §W3b.5 T5 + W3b.6 §G3 (CPU rasterizer integration).
  */
 #include "venus.h"
 
 extern long __syscall1(long, long);
+extern void vsr_paint_triangle(uint32_t *fb, uint32_t fb_w, uint32_t fb_h,
+                               const float *verts, uint32_t stride_floats,
+                               uint32_t bgra_color);
 
 #define VENUS_H_SLOT_MASK_W3B5    0x0FFFull
 #define SYS_GUI_FLIP              507L
+
+/* Magenta in BGRA byte order: B=FF, G=00, R=FF, A=FF.
+ * Little-endian u32: bytes [B,G,R,A] = [FF,00,FF,FF] -> 0xFFFF00FF. */
+#define VENUS_W3B6_MAGENTA   0xFFFF00FFu
+
+/* Find a command buffer in this device whose last render pass drew into
+ * the given image slot. Returns NULL if none. */
+static struct venus_cmd_buffer *find_cb_drew_image(struct venus_device *dev,
+                                                   int img_slot) {
+    if (!dev || img_slot < 0) return 0;
+    for (uint32_t i = 0; i < VENUS_MAX_CMD_BUFFER_OBJECTS; i++) {
+        struct venus_cmd_buffer *vcb = &dev->cmd_buffers[i];
+        if (!vcb->in_use) continue;
+        if (!vcb->drew_flag) continue;
+        if (vcb->last_drawn_image_slot != img_slot) continue;
+        if (vcb->recorded_vertex_count < 3u) continue;
+        return vcb;
+    }
+    return 0;
+}
 
 int venus_cmd_encode_QueuePresentKHR(
         struct venus_device *dev,
@@ -59,6 +83,35 @@ int venus_cmd_encode_QueuePresentKHR(
         if (mslot < 0 || mslot >= (int)VENUS_MAX_MEM_OBJECTS) continue;
         struct venus_memory *m = &dev->memories[mslot];
         if (!m->in_use) continue;
+
+        /* W3b.6 — CPU-fallback rasterizer. Requires SHM-backed dest +
+         * a recorded draw + a bound vertex buffer with mapped pointer. */
+        if (m->is_shm_backed && m->local_ptr) {
+            struct venus_cmd_buffer *vcb = find_cb_drew_image(dev, img_slot);
+            if (vcb && vcb->recorded_vb_slot < VENUS_MAX_BUF_OBJECTS) {
+                struct venus_buffer *vb = &dev->buffers[vcb->recorded_vb_slot];
+                if (vb->in_use && vb->bound_mem_slot >= 0 &&
+                    vb->bound_mem_slot < (int)VENUS_MAX_MEM_OBJECTS) {
+                    struct venus_memory *vbm = &dev->memories[vb->bound_mem_slot];
+                    if (vbm->in_use && vbm->local_ptr) {
+                        const uint8_t *base = (const uint8_t *)vbm->local_ptr
+                                            + vb->bound_offset
+                                            + vcb->recorded_vb_offset;
+                        uint32_t stride = vcb->recorded_vb_stride;
+                        if (stride < 12u) stride = 12u;
+                        uint32_t stride_floats = stride / 4u;
+                        const float *verts = (const float *)base;
+                        verts += vcb->recorded_first_vertex * stride_floats;
+                        vsr_paint_triangle(
+                                (uint32_t *)m->local_ptr,
+                                m->shm_width  ? m->shm_width  : img->width,
+                                m->shm_height ? m->shm_height : img->height,
+                                verts, stride_floats,
+                                VENUS_W3B6_MAGENTA);
+                    }
+                }
+            }
+        }
 
         if (m->is_shm_backed && m->shm_handle != 0) {
             (void)__syscall1(SYS_GUI_FLIP, (long)(uint32_t)m->shm_handle);
