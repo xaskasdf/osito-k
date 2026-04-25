@@ -322,12 +322,17 @@ PVOID WINAPI VirtualAlloc(PVOID lpAddress, SIZE_T dwSize,
         serial_puts("\n");
     }
 
-    /* Cap absurd sizes (> 256MB) to 256MB. Returning NULL caused UT99
-     * to NULL-call-loop because its FArray::Realloc doesn't check the
-     * return value (or has a separate code path for failure that we
-     * don't implement). 256MB is the sweet spot — large enough to
-     * survive the bogus 2GB-class memcpy that follows for a few
-     * seconds before UT99 moves on. */
+    /* Cap absurd sizes (> 256MB) to 256MB. Empirical sweet spot:
+     *   - Returning NULL → UT99 NULL-call-loops (FArray::Realloc
+     *     doesn't check the return value).
+     *   - Cap to 16MB → 2GB rep-movsl that follows overruns hard,
+     *     UT99 busy-loops in user code for hours.
+     *   - Cap to 256MB → bogus rep-movsl runs but ECX measurably
+     *     decrements (page-fault-paged-in writes succeed); UT99
+     *     stays "running" for 4+ minutes without crash. Best so far.
+     *   - Cap to 1GB → also triggers NULL-call cascade (different
+     *     code path takes over after the realloc).
+     */
     if (dwSize > 0x10000000ULL) { /* > 256MB */
         static int cap_log = 0;
         if (cap_log < 5) {
