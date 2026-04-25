@@ -501,7 +501,8 @@ ZINK_CXX_SRCS := \
 # These live under osito_compat/ and become part of libmesa_zink.a so
 # any zink-using ELF gets them transparently from one archive.
 ZINK_LOADER_SRCS := \
-  osito_compat/zink_vk_loader.c
+  osito_compat/zink_vk_loader.c \
+  osito_compat/zink_screen_ositok.c
 
 ZINK_C_OBJS      := $(patsubst %.c,$(BUILD_DIR)/%.o,$(ZINK_C_SRCS))
 ZINK_CXX_OBJS    := $(patsubst %.cpp,$(BUILD_DIR)/%.o,$(ZINK_CXX_SRCS))
