@@ -34,7 +34,7 @@ namespace dxvk {
     auto programInfo = module.programInfo();
 
     if (!programInfo)
-      throw DxvkError("Invalid shader binary.");
+      dxvk::DxvkError::abort_ositok("Invalid shader binary.");
 
     // Decide whether we need to create a pass-through
     // geometry shader for vertex shader stream output
@@ -43,7 +43,7 @@ namespace dxvk {
        || programInfo->type() == DxbcProgramType::DomainShader);
 
     if (programInfo->shaderStage() != pShaderKey->type() && !passthroughShader)
-      throw DxvkError("Mismatching shader type.");
+      dxvk::DxvkError::abort_ositok("Mismatching shader type.");
 
     m_shader = passthroughShader
       ? module.compilePassthroughShader(*pDxbcModuleInfo, name)

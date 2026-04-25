@@ -38,7 +38,7 @@ namespace dxvk {
         bufInfo.NumElements  = pDesc->Buffer.NumElements;
         bufInfo.Flags        = 0;
       } else {
-        throw DxvkError("D3D11: Invalid view dimension for buffer SRV");
+        dxvk::DxvkError::abort_ositok("D3D11: Invalid view dimension for buffer SRV");
       }
 
       // Fill in buffer view info
@@ -162,7 +162,7 @@ namespace dxvk {
           break;
           
         default:
-          throw DxvkError("D3D11: Invalid view dimension for image SRV");
+          dxvk::DxvkError::abort_ositok("D3D11: Invalid view dimension for image SRV");
       }
       
       if (texture->GetPlaneCount() > 1)

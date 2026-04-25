@@ -20,7 +20,7 @@ namespace dxvk {
     m_presenter (pPresenter),
     m_monitor   (wsi::getWindowMonitor(m_window)) {
     if (FAILED(m_presenter->GetAdapter(__uuidof(IDXGIAdapter), reinterpret_cast<void**>(&m_adapter))))
-      throw DxvkError("DXGI: Failed to get adapter for present device");
+      dxvk::DxvkError::abort_ositok("DXGI: Failed to get adapter for present device");
 
     // Query updated interface versions from presenter, this
     // may fail e.g. with older vkd3d-proton builds.
@@ -34,7 +34,7 @@ namespace dxvk {
     
     // Apply initial window mode and fullscreen state
     if (!m_descFs.Windowed && FAILED(EnterFullscreenMode(nullptr)))
-      throw DxvkError("DXGI: Failed to set initial fullscreen state");
+      dxvk::DxvkError::abort_ositok("DXGI: Failed to set initial fullscreen state");
 
     // Ensure that RGBA16 swap chains are scRGB if supported
     UpdateColorSpace(m_desc.Format, m_colorSpace);

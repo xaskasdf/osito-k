@@ -478,13 +478,13 @@ namespace dxvk {
       });
 
       if (vr)
-        throw DxvkError(str::format("D3D11SwapChain: Failed to recreate surface: ", vr));
+        dxvk::DxvkError::abort_ositok(str::format("D3D11SwapChain: Failed to recreate surface: ", vr));
 
       vr = m_presenter->recreateSwapChain(presenterDesc);
     }
 
     if (vr)
-      throw DxvkError(str::format("D3D11SwapChain: Failed to recreate swap chain: ", vr));
+      dxvk::DxvkError::abort_ositok(str::format("D3D11SwapChain: Failed to recreate swap chain: ", vr));
     
     CreateRenderTargetViews();
   }

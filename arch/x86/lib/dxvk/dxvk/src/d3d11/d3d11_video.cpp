@@ -205,7 +205,7 @@ namespace dxvk {
         break;
 
       case D3D11_VPIV_DIMENSION_UNKNOWN:
-        throw DxvkError("Invalid view dimension");
+        dxvk::DxvkError::abort_ositok("Invalid view dimension");
     }
 
     m_subresources.aspectMask = aspectMask;
@@ -311,7 +311,7 @@ namespace dxvk {
         break;
 
       case D3D11_VPOV_DIMENSION_UNKNOWN:
-        throw DxvkError("Invalid view dimension");
+        dxvk::DxvkError::abort_ositok("Invalid view dimension");
     }
 
     m_view = pDevice->GetDXVKDevice()->createImageView(

@@ -72,7 +72,7 @@ namespace dxvk {
         break;
       
       default:
-        throw DxvkError("D3D11: Invalid view dimension for DSV");
+        dxvk::DxvkError::abort_ositok("D3D11: Invalid view dimension for DSV");
     }
     
     // Normalize view type so that we won't accidentally

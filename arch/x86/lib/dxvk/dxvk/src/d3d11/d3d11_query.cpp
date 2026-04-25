@@ -75,7 +75,7 @@ namespace dxvk {
         break;
       
       default:
-        throw DxvkError(str::format("D3D11: Unhandled query type: ", desc.Query));
+        dxvk::DxvkError::abort_ositok(str::format("D3D11: Unhandled query type: ", desc.Query));
     }
   }
   

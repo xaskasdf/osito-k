@@ -54,7 +54,7 @@ namespace dxvk {
       if (pDevice->GetFeatureLevel() < D3D_FEATURE_LEVEL_10_0 ||
           (m_desc.MiscFlags & (D3D11_RESOURCE_MISC_SHARED|D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX)) == (D3D11_RESOURCE_MISC_SHARED|D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX) ||
           (m_desc.MiscFlags & sharingFlags) == D3D11_RESOURCE_MISC_SHARED_NTHANDLE)
-        throw DxvkError(str::format("D3D11: Cannot create shared texture:",
+        dxvk::DxvkError::abort_ositok(str::format("D3D11: Cannot create shared texture:",
           "\n  MiscFlags:  ", m_desc.MiscFlags,
           "\n  FeatureLevel:  ", pDevice->GetFeatureLevel()));
 
@@ -219,7 +219,7 @@ namespace dxvk {
 
     // Check if we can actually create the image
     if (!CheckImageSupport(&imageInfo, imageInfo.tiling)) {
-      throw DxvkError(str::format(
+      dxvk::DxvkError::abort_ositok(str::format(
         "D3D11: Cannot create texture:",
         "\n  Format:  ", m_desc.Format,
         "\n  Extent:  ", m_desc.Width,
@@ -792,7 +792,7 @@ namespace dxvk {
       case D3D11_RESOURCE_DIMENSION_TEXTURE1D: return VK_IMAGE_TYPE_1D;
       case D3D11_RESOURCE_DIMENSION_TEXTURE2D: return VK_IMAGE_TYPE_2D;
       case D3D11_RESOURCE_DIMENSION_TEXTURE3D: return VK_IMAGE_TYPE_3D;
-      default: throw DxvkError("D3D11CommonTexture: Unhandled resource dimension");
+      default: dxvk::DxvkError::abort_ositok("D3D11CommonTexture: Unhandled resource dimension");
     }
   }
   

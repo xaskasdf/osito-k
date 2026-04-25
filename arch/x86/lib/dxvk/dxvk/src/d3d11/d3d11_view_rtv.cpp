@@ -86,7 +86,7 @@ namespace dxvk {
         break;
       
       default:
-        throw DxvkError("D3D11: Invalid view dimension for RTV");
+        dxvk::DxvkError::abort_ositok("D3D11: Invalid view dimension for RTV");
     }
     
     if (texture->GetPlaneCount() > 1)
