@@ -148,5 +148,13 @@ venus_icdGetInstanceProcAddr(VkInstance instance, const char *name) {
     if (strcmp(name, "vkGetPhysicalDeviceSurfaceSupportKHR") == 0)
         return (PFN_vkVoidFunction)venus_GetPhysicalDeviceSurfaceSupportKHR;
 
+    /* W3b.6 — vertex input + dynamic state. */
+    if (strcmp(name, "vkCmdBindVertexBuffers") == 0)
+        return (PFN_vkVoidFunction)venus_CmdBindVertexBuffers;
+    if (strcmp(name, "vkCmdSetViewport") == 0)
+        return (PFN_vkVoidFunction)venus_CmdSetViewport;
+    if (strcmp(name, "vkCmdSetScissor") == 0)
+        return (PFN_vkVoidFunction)venus_CmdSetScissor;
+
     return NULL;
 }
