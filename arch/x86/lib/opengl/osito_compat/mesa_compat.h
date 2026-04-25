@@ -325,12 +325,12 @@ static inline char *dlerror(void) { return (char *)0; }
  * behind ZINK_RENDERDOC and the debug marker callback respectively).
  * Stubs return -1 to mimic "no-match" / "format error". */
 typedef __builtin_va_list __mesa_va_list;
-static inline int sscanf(const char *str, const char *fmt, ...) {
-    (void)str; (void)fmt; return -1;
-}
-static inline int vasprintf(char **strp, const char *fmt, __mesa_va_list ap) {
-    (void)fmt; (void)ap; if (strp) *strp = (char *)0; return -1;
-}
+/* W4.4-fix: removed static-inline sscanf/vasprintf stubs that lived here.
+ * The real implementations now live exclusively in mesa_libc_stubs.c
+ * (file-scope extern), so C++ TUs using hosted glibc <stdio.h> see only
+ * the libstdc++ declarations and link against our impls — no
+ * redefinition collision. C TUs that include this header pick up only
+ * the typedef, which is what they actually need. */
 
 /* mmap stubs — Mesa shader cache uses mmap on Linux for file-backed
  * pages. On OsitoK we have no shader cache (no fs persistence beyond
