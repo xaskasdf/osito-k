@@ -27,9 +27,13 @@
 #   - driver_ddebug/ / driver_noop/ / driver_trace/ wrapper drivers
 #   - renderonly/    DRM-KMS split-gpu helper (needs fcntl.h / ioctl / drmXxx)
 #   - tessellator/   .cpp; C++ surface handled in W4.2
-#   - util/u_blitter.c, u_gen_mipmap.c, u_simple_shaders.c, u_tests.c,
-#     u_threaded_context.c, u_vbuf.c — pull pipe_context / tgsi_ureg
-#     machinery that requires larger subset
+#   - util/u_simple_shaders.c, u_tests.c, u_threaded_context.c,
+#     u_vbuf.c — pull pipe_context / tgsi_ureg machinery that requires
+#     larger subset
+#   (W4.4 lifted u_blitter.c + u_gen_mipmap.c into the GALLIUM list —
+#    they compile clean against the existing pipe-helper headers; the
+#    runtime calls into u_simple_shaders.c are linker-undefined symbols
+#    that the consumer (zink) will reach only on actual GL paths.)
 #   - tgsi/tgsi_exec.c  -- soft fp16/double runtime, heavy dependencies
 #   - indices/u_primconvert.c -- calls pipe_context hooks deferred to driver wave
 #   - pipebuffer/pb_*_debug.c / pb_bufmgr_slab.c  -- assorted debug helpers
@@ -285,6 +289,7 @@ GALLIUM_SRCS := \
   mesa/src/gallium/auxiliary/translate/translate_generic.c \
   mesa/src/gallium/auxiliary/util/u_async_debug.c \
   mesa/src/gallium/auxiliary/util/u_bitmask.c \
+  mesa/src/gallium/auxiliary/util/u_blitter.c \
   mesa/src/gallium/auxiliary/util/u_cache.c \
   mesa/src/gallium/auxiliary/util/u_debug_describe.c \
   mesa/src/gallium/auxiliary/util/u_debug_flush.c \
@@ -296,6 +301,7 @@ GALLIUM_SRCS := \
   mesa/src/gallium/auxiliary/util/u_dump_defines.c \
   mesa/src/gallium/auxiliary/util/u_dump_state.c \
   mesa/src/gallium/auxiliary/util/u_framebuffer.c \
+  mesa/src/gallium/auxiliary/util/u_gen_mipmap.c \
   mesa/src/gallium/auxiliary/util/u_handle_table.c \
   mesa/src/gallium/auxiliary/util/u_helpers.c \
   mesa/src/gallium/auxiliary/util/u_index_modify.c \
