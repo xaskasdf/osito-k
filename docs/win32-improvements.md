@@ -1,6 +1,35 @@
 # OsitoK Win32 Compat Layer — Improvement Plan
 
-## Context
+## Status (2026-04-24, commit 1d0b507)
+
+UT99 boot was unblocked from "stuck in kern_longjmp triple fault after 338
+_initterm callbacks" to "31,308+ INT 0x2E calls deep into engine init in 30s"
+by a single off-by-one fix in `compat32.c`.
+
+**Root cause**: `static uint64_t callback_jmpbufs[MAX_CALLBACK_DEPTH][8]`
+reserved 64 bytes per slot, but `kern_setjmp` writes a **9-quad / 72-byte**
+jmp_buf (`rbx, rbp, r12-r15, rsp, rip, cr3`). The setjmp at depth N+1 wrote
+its rbx (slot[0]) on top of slot N's cr3 (slot[8]). Depth=0 longjmp after
+_initterm reloaded `cr3 = 0x40` → triple fault inside kern_longjmp.
+
+**Fix**: `[...][8]` → `[...][9]`. UT99 now reaches NtCreateFile / NtReadFile
+of config files, NtAllocateVirtualMemory at the 0x40xxxxxx heap range,
+CreateFileW with UTF-16 args, K32-THREAD spawn (TID=2), and USER32
+CreateDialogParamW before hitting the next blocker (`[SCHED] CORRUPT PID 1`
+— the scheduler frame-validity check fires when picking PID 1 with
+`CS=0x1F10 RIP=0x14271EF0`, indicating PID 1's saved kernel_rsp interrupt-
+frame area was overwritten between clean save and next dispatch).
+
+Companion fix in `arch/x86/kernel/setjmp.S`: kern_longjmp now (a) pre-loads
+all jmp_buf words into registers BEFORE the cr3 mov so a stale rdi mapping
+no longer triple-faults the second mov, and (b) skips the cr3 mov when the
+saved CR3 already matches the current CR3.
+
+The IST1 stack-drift compensation in compat32.c (saving/restoring
+`tss_ist1_ptr` per callback depth) was already in place from earlier work
+and was NOT the bug — the buffer overflow was its own problem.
+
+## Context (historical)
 
 UT99 reaches Client+Lighting+Rendering initialized. Remaining crashes are from
 IAT corruption by the Unreal package loader and missing API coverage. This doc
