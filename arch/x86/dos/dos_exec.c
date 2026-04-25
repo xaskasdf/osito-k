@@ -493,6 +493,18 @@ void dos_transfer_to_native(dos_vm_t *vm)
         serial_puts(" limit=0x"); serial_puthex(ldt_limit, 4);
         serial_puts("\n");
 
+        /* NOTE: DOS4GW hard-codes selector 0x18 as a 32-bit flat code
+         * segment for raw-mode-switch returns. Tried installing a flat
+         * 32-bit descriptor at GDT[3] (commit reverted) but DOOM then
+         * jumps to linear addresses in vm->mem that contain IVT bytes
+         * rather than valid 32-bit code, hits #UD. Sticking with the
+         * surgical emulator path: the LRETW/JMP-FAR emulator redirects
+         * GDT-selector targets to current-CS-relative offsets, which
+         * keeps DOOM in 16-bit DOOM-CS mode where its actual code lives.
+         * Future fix: implement DPMI AX=0306 mode-switch routines so
+         * DOOM gets proper PM↔RM transition stubs instead of computing
+         * its own. */
+
         /* Install DOS INT handlers in the IDT with DPL=3 so ring-3 DOS
          * code can invoke them via the INT instruction. Without DPL=3
          * the CPU raises #GP on INT 21h etc. */
