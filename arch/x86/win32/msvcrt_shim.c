@@ -522,6 +522,9 @@ char* WINAPI crt_strrchr(const char *s, int c)
 
 PVOID WINAPI crt_memcpy(PVOID dst, PCVOID src, SIZE_T n)
 {
+    /* Defensive: NULL dst/src after FCriticalError suppression */
+    if (n == 0 || !dst || !src) return dst;
+
     /* Log copies involving VirtualAlloc range (0x40000000+) for TArray debug */
     {
         uint64_t d64 = (uint64_t)(ULONG_PTR)dst;
@@ -561,6 +564,12 @@ extern uint32_t g_fname_names_addr;
 
 PVOID WINAPI crt_memmove(PVOID dst, PCVOID src, SIZE_T n)
 {
+    /* Defensive: post-suppression code paths can call memmove with
+     * NULL dst or src (e.g., FArray::Realloc returned 0, but caller
+     * proceeds anyway after FCriticalError was suppressed). Avoid the
+     * NULL-deref kernel #PF — return early. */
+    if (n == 0 || !dst || !src) return dst;
+
     /* Log memmove calls with src/dst/size for debugging FName issue */
     static int mm_log = 0;
     if (mm_log < 20) {
@@ -2328,13 +2337,20 @@ void WINAPI crt_CxxThrowException(PVOID pExceptionObject, PVOID pThrowInfo)
         cxx_exception_active = 1;
     }
 
-    /* Pre-check: if SEH chain head is corrupt (in PE image range),
-     * try to repair by skipping corrupt entries. If no valid entry
-     * is found, suppress the throw (last resort). */
+    /* Pre-check: if SEH chain head is in PE-image .text range
+     * (DLL CODE, not stack), try to repair. UT99's PE32 stack is
+     * around 0x13E0xxxx-0x13F0xxxx — NOT corrupt, just user stack.
+     * Engine.dll/Core.dll text is 0x10000000-0x10A00000 typically;
+     * the data/import area extends past that. Tighten the range to
+     * only DLL code regions where SEH frames CAN'T live. */
     {
         extern TEB32 g_teb32;
         uint32_t head = g_teb32.ExceptionList;
-        if (head >= 0x10000000 && head < 0x14000000) {
+        /* PE image .text range: 0x10000000-0x12000000 (Engine + Core
+         * + Render + a few smaller DLLs). UT99 stack is 0x13xxxxxx,
+         * so 0x12000000 is a safe upper bound — anything above is
+         * either stack (valid SEH frame) or NULL/end-sentinel. */
+        if (head >= 0x10000000 && head < 0x12000000) {
             /* Try to repair: follow Next pointers past corrupt entries */
             uint32_t *corrupt = (uint32_t *)(uintptr_t)head;
             uint32_t next = corrupt[0];
@@ -2345,7 +2361,7 @@ void WINAPI crt_CxxThrowException(PVOID pExceptionObject, PVOID pThrowInfo)
             serial_puts("\n");
 
             if (next != 0 && next != 0xFFFFFFFF &&
-                (next < 0x10000000 || next >= 0x14000000)) {
+                (next < 0x10000000 || next >= 0x12000000)) {
                 /* Next is a valid non-PE address — repair chain.
                  * Also insert our base SEH handler so there's at least
                  * one handler to dispatch to (the original chain may only

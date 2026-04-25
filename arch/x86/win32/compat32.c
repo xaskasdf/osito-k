@@ -1557,9 +1557,12 @@ int compat32_seh_dispatch(PEXCEPTION_RECORD ExceptionRecord)
         return 0;
     }
 
-    /* Validate ExceptionList — skip corrupt entries in PE image range.
-     * Walk forward through Next pointers to find a valid stack frame. */
-    while (frame_addr >= 0x10000000 && frame_addr < 0x14000000) {
+    /* Validate ExceptionList — skip entries whose ADDRESS is in PE image
+     * .text range (where SEH frames CAN'T legitimately live — they're
+     * stack-allocated). PE images load at 0x10000000 and engine .text
+     * tops out around 0x12000000. UT99's stack at 0x13Bxxxxx-0x13Fxxxxx
+     * holds VALID stack-allocated SEH frames — DO NOT skip those. */
+    while (frame_addr >= 0x10000000 && frame_addr < 0x12000000) {
         serial_puts("[SEH32] skipping corrupt frame at 0x");
         serial_puthex(frame_addr, 8);
         uint32_t *f = (uint32_t *)(uintptr_t)frame_addr;
@@ -1597,12 +1600,45 @@ int compat32_seh_dispatch(PEXCEPTION_RECORD ExceptionRecord)
 
     int frame_num = 0;
     while (frame_addr != 0xFFFFFFFF && frame_addr != 0 && frame_num < 64) {
+        /* Per-iteration validation: skip frames whose ADDRESS is in PE
+         * image .text range (where SEH frames CAN'T legitimately live).
+         * This catches chains where a Next pointer points back into PE
+         * code (e.g., engine's Engine.dll at 0x10173F72 with garbage
+         * handler 0xC5CAE910 — calling that hangs UT99). */
+        if (frame_addr >= 0x10000000 && frame_addr < 0x12000000) {
+            serial_puts("[SEH32] skipping in-image frame at 0x");
+            serial_puthex(frame_addr, 8);
+            serial_puts("\n");
+            uint32_t *fbad = (uint32_t *)(uintptr_t)frame_addr;
+            uint32_t nbad = fbad[0];
+            if (nbad == 0 || nbad == 0xFFFFFFFF) break;
+            frame_addr = nbad;
+            frame_num++;
+            continue;
+        }
+
         /* Read 32-bit EXCEPTION_REGISTRATION_RECORD:
          *   offset 0: uint32_t Next
          *   offset 4: uint32_t Handler */
         uint32_t *frame32 = (uint32_t *)(ULONG_PTR)frame_addr;
         uint32_t next32    = frame32[0];
         uint32_t handler32 = frame32[1];
+
+        /* Validate handler address: must be in executable code range.
+         * Garbage values like 0xC5CAE910 are common in corrupt chains
+         * where the catch handler's locals overwrote [EBP-4] (Handler). */
+        if (handler32 < 0x01000000 || handler32 >= 0x80000000) {
+            serial_puts("[SEH32] frame ");
+            serial_putdec(frame_num);
+            serial_puts(" @0x");
+            serial_puthex(frame_addr, 8);
+            serial_puts(" bogus handler=0x");
+            serial_puthex(handler32, 8);
+            serial_puts(" — skipping\n");
+            frame_addr = next32;
+            frame_num++;
+            continue;
+        }
 
         serial_puts("[SEH32] frame ");
         serial_putdec(frame_num);
