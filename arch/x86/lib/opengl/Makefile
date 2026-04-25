@@ -497,9 +497,16 @@ ZINK_CXX_SRCS := \
   mesa/src/gallium/drivers/zink/zink_draw.cpp \
   mesa/src/gallium/drivers/zink/zink_synchronization.cpp
 
-ZINK_C_OBJS   := $(patsubst %.c,$(BUILD_DIR)/%.o,$(ZINK_C_SRCS))
-ZINK_CXX_OBJS := $(patsubst %.cpp,$(BUILD_DIR)/%.o,$(ZINK_CXX_SRCS))
-ZINK_OBJS     := $(ZINK_C_OBJS) $(ZINK_CXX_OBJS)
+# W4.4 — OsitoK-specific zink loader bridge + screen entrypoint.
+# These live under osito_compat/ and become part of libmesa_zink.a so
+# any zink-using ELF gets them transparently from one archive.
+ZINK_LOADER_SRCS := \
+  osito_compat/zink_vk_loader.c
+
+ZINK_C_OBJS      := $(patsubst %.c,$(BUILD_DIR)/%.o,$(ZINK_C_SRCS))
+ZINK_CXX_OBJS    := $(patsubst %.cpp,$(BUILD_DIR)/%.o,$(ZINK_CXX_SRCS))
+ZINK_LOADER_OBJS := $(patsubst %.c,$(BUILD_DIR)/%.o,$(ZINK_LOADER_SRCS))
+ZINK_OBJS        := $(ZINK_C_OBJS) $(ZINK_CXX_OBJS) $(ZINK_LOADER_OBJS)
 
 .PHONY: all clean util gallium compiler zink
 all: $(OUT) $(OUT_GALLIUM) $(OUT_COMPILER) $(OUT_ZINK)
@@ -527,6 +534,14 @@ $(OUT_ZINK): $(ZINK_OBJS) | $(BUILD_DIR)
 	@echo "  AR    $(notdir $@)"
 	@$(AR) rcs $@ $(ZINK_OBJS)
 	@echo "  -> $$($(AR) t $@ | wc -l) objects in $@"
+
+# W4.4 — bridge code for libmesa_zink.a uses CFLAGS_ZINK so the v305
+# vulkan_core.h is in scope (matches the rest of the zink build).  Must
+# come BEFORE the generic osito_compat/% rule.
+$(BUILD_DIR)/osito_compat/zink_%.o: $(OPENGL_ROOT)/osito_compat/zink_%.c | $(BUILD_DIR)
+	@mkdir -p $(dir $@)
+	@echo "  CC    osito_compat/zink_$*"
+	@$(CC) $(CFLAGS_ZINK) -c -o $@ $<
 
 # Default pattern rule for util/gallium (build/lib/opengl/foo/bar.o : foo/bar.c)
 $(BUILD_DIR)/osito_compat/%.o: $(OPENGL_ROOT)/osito_compat/%.c | $(BUILD_DIR)
