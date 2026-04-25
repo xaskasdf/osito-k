@@ -98,6 +98,8 @@ INCLUDES_COMPILER_CXX := \
   -I$(OPENGL_ROOT)/osito_compat \
   -I$(MESA_ROOT)/include \
   -I$(MESA_ROOT)/src \
+  -I$(MESA_ROOT)/src/mesa \
+  -I$(MESA_ROOT)/src/mapi \
   -I$(MESA_ROOT)/src/util \
   -I$(MESA_ROOT)/src/gallium/include \
   -I$(MESA_ROOT)/src/gallium/auxiliary \
@@ -423,25 +425,69 @@ COMPILER_C_SRCS_ABS  := $(COMPILER_TOP_SRCS) $(COMPILER_NIR_SRCS) $(COMPILER_SPI
 # strip $(OPENGL_ROOT)/ prefix to get relative paths for the build rule
 COMPILER_C_SRCS      := $(patsubst $(OPENGL_ROOT)/%,%,$(COMPILER_C_SRCS_ABS))
 
-# C++ sources for libmesa_compiler.a — minimal GLSL frontend pieces.
+# C++ sources for libmesa_compiler.a — full GLSL frontend (W4.5 lifts the
+# 38 deferred files from W4.2: ast_*, builtin_*, glsl_lexer/parser, ir/* plus
+# the rest of lower_/opt_ family and serialize/shader_cache/standalone_scaffolding).
+# All require mesa/main/macros.h, mtypes.h, program/symbol_table.h —
+# now available since W4.5-T0 vendored mesa/src/mesa/main/.
+#
+# Excluded: main.cpp + standalone.cpp (they declare main() — would conflict
+# with consumer ELFs at link time).  glsl_to_nir.cpp is INCLUDED — it
+# uses float64_glsl.h which we generated at T0-gen.
 COMPILER_CXX_SRCS := \
+  mesa/src/compiler/glsl/ast_array_index.cpp \
+  mesa/src/compiler/glsl/ast_expr.cpp \
+  mesa/src/compiler/glsl/ast_function.cpp \
+  mesa/src/compiler/glsl/ast_to_hir.cpp \
+  mesa/src/compiler/glsl/ast_type.cpp \
+  mesa/src/compiler/glsl/builtin_functions.cpp \
+  mesa/src/compiler/glsl/builtin_types.cpp \
+  mesa/src/compiler/glsl/builtin_variables.cpp \
+  mesa/src/compiler/glsl/glsl_lexer.cpp \
+  mesa/src/compiler/glsl/glsl_parser.cpp \
+  mesa/src/compiler/glsl/glsl_parser_extras.cpp \
+  mesa/src/compiler/glsl/glsl_symbol_table.cpp \
+  mesa/src/compiler/glsl/glsl_to_nir.cpp \
+  mesa/src/compiler/glsl/hir_field_selection.cpp \
+  mesa/src/compiler/glsl/ir.cpp \
   mesa/src/compiler/glsl/ir_basic_block.cpp \
+  mesa/src/compiler/glsl/ir_builder.cpp \
   mesa/src/compiler/glsl/ir_clone.cpp \
   mesa/src/compiler/glsl/ir_constant_expression.cpp \
   mesa/src/compiler/glsl/ir_expression_flattening.cpp \
+  mesa/src/compiler/glsl/ir_function.cpp \
+  mesa/src/compiler/glsl/ir_function_detect_recursion.cpp \
   mesa/src/compiler/glsl/ir_hierarchical_visitor.cpp \
   mesa/src/compiler/glsl/ir_hv_accept.cpp \
+  mesa/src/compiler/glsl/ir_print_visitor.cpp \
   mesa/src/compiler/glsl/ir_rvalue_visitor.cpp \
+  mesa/src/compiler/glsl/ir_validate.cpp \
   mesa/src/compiler/glsl/ir_variable_refcount.cpp \
+  mesa/src/compiler/glsl/linker_util.cpp \
   mesa/src/compiler/glsl/lower_builtins.cpp \
+  mesa/src/compiler/glsl/lower_instructions.cpp \
   mesa/src/compiler/glsl/lower_jumps.cpp \
   mesa/src/compiler/glsl/lower_mat_op_to_vec.cpp \
   mesa/src/compiler/glsl/lower_packing_builtins.cpp \
+  mesa/src/compiler/glsl/lower_precision.cpp \
+  mesa/src/compiler/glsl/lower_subroutine.cpp \
+  mesa/src/compiler/glsl/lower_vec_index_to_cond_assign.cpp \
+  mesa/src/compiler/glsl/lower_vector_derefs.cpp \
+  mesa/src/compiler/glsl/opt_algebraic.cpp \
+  mesa/src/compiler/glsl/opt_dead_builtin_variables.cpp \
   mesa/src/compiler/glsl/opt_dead_code.cpp \
   mesa/src/compiler/glsl/opt_flatten_nested_if_blocks.cpp \
+  mesa/src/compiler/glsl/opt_flip_matrices.cpp \
   mesa/src/compiler/glsl/opt_function_inlining.cpp \
   mesa/src/compiler/glsl/opt_if_simplification.cpp \
-  mesa/src/compiler/glsl/opt_tree_grafting.cpp
+  mesa/src/compiler/glsl/opt_minmax.cpp \
+  mesa/src/compiler/glsl/opt_rebalance_tree.cpp \
+  mesa/src/compiler/glsl/opt_tree_grafting.cpp \
+  mesa/src/compiler/glsl/propagate_invariance.cpp \
+  mesa/src/compiler/glsl/serialize.cpp \
+  mesa/src/compiler/glsl/shader_cache.cpp \
+  mesa/src/compiler/glsl/standalone_scaffolding.cpp \
+  mesa/src/compiler/glsl/string_to_uint_map.cpp
 
 COMPILER_C_OBJS   := $(patsubst %.c,$(BUILD_DIR)/%.o,$(COMPILER_C_SRCS))
 COMPILER_CXX_OBJS := $(patsubst %.cpp,$(BUILD_DIR)/%.o,$(COMPILER_CXX_SRCS))
