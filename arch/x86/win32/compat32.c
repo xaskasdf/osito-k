@@ -128,6 +128,12 @@ static uint8_t *callback_stack_get(int depth) {
 uint32_t g_last_caller_eip = 0;
 uint32_t compat32_get_last_caller_eip(void) { return g_last_caller_eip; }
 
+/* Pointer (as uint32_t) to the user-mode stack at the args, equal to
+ * user ESP+4 at the moment of the INT 0x2E. Updated on each dispatch
+ * entry. Used by VirtualAlloc shim to walk the user stack chain. */
+uint32_t g_last_stack_args = 0;
+uint32_t compat32_get_last_stack_args(void) { return g_last_stack_args; }
+
 /*
  * Single global retval written by the 32-bit return stub (MOV [addr], EAX).
  * The stub uses a fixed address so we can't index by depth there.
@@ -2103,7 +2109,9 @@ uint64_t compat32_dispatch(uint32_t thunk_idx, uint32_t *stack_args)
         g_call_trace[g_call_trace_idx % CALL_TRACE_SIZE] = ret_addr;
         g_call_trace_idx++;
         extern uint32_t g_last_caller_eip;
+        extern uint32_t g_last_stack_args;
         g_last_caller_eip = ret_addr;
+        g_last_stack_args = (uint32_t)(uintptr_t)stack_args;
     }
 
     /* Clean up null-page stale data from compat32 writes.

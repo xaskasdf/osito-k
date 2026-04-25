@@ -319,20 +319,6 @@ PVOID WINAPI VirtualAlloc(PVOID lpAddress, SIZE_T dwSize,
         serial_puthex(dwSize, 8);
         serial_puts(" addr=0x");
         serial_puthex((uint64_t)(ULONG_PTR)lpAddress, 8);
-        /* Dump the 32-bit user-mode caller's return address so we can
-         * locate which engine function is making the bogus request.
-         * The compat32 INT 0x2E dispatcher pushed the iret frame on
-         * the kernel-side IST1 stack; the user EIP is in iret RIP at
-         * a fixed offset from the dispatcher's stack frame. Walk via
-         * __builtin_return_address as a coarse approximation — this
-         * gives us the kernel-side caller of HeapAlloc, but the chain
-         * eventually leads to the dispatcher which has the user EIP. */
-        void *kret = __builtin_return_address(0);
-        serial_puts(" kret=0x");
-        serial_puthex((uint64_t)kret, 16);
-        /* Get the user EIP that issued the INT 0x2E (param 1 to the
-         * compat32_dispatch was the user EIP+offset). The dispatcher
-         * stores it for us; expose it via a getter. */
         extern uint32_t compat32_get_last_caller_eip(void);
         uint32_t user_eip = compat32_get_last_caller_eip();
         if (user_eip) {
@@ -340,6 +326,33 @@ PVOID WINAPI VirtualAlloc(PVOID lpAddress, SIZE_T dwSize,
             serial_puthex(user_eip, 8);
         }
         serial_puts("\n");
+        /* Dump the user-mode stack so we can identify the chain of
+         * callers that led to this bogus alloc. The compat32 INT 0x2E
+         * dispatcher receives stack_args via RSI = ESP+4 (the
+         * arguments to VirtualAlloc itself), so user ESP = stack_args
+         * - 4. Print 24 dwords starting there: that captures the four
+         * VirtualAlloc args, the wrapper's return address, the
+         * wrapper's saved-EBP region, and the immediate caller of
+         * the wrapper (= the function whose corrupt TArray is feeding
+         * the bogus size). */
+        extern uint32_t compat32_get_last_stack_args(void);
+        uint32_t sa = compat32_get_last_stack_args();
+        if (sa) {
+            uint32_t uesp = sa - 4;
+            serial_puts("[VA]   user_esp=0x"); serial_puthex(uesp, 8);
+            serial_puts(" stack:\n");
+            uint32_t *p = (uint32_t *)(uintptr_t)uesp;
+            for (int row = 0; row < 6; row++) {
+                serial_puts("[VA]   +0x");
+                serial_puthex(row * 16, 4);
+                serial_puts(":");
+                for (int c = 0; c < 4; c++) {
+                    serial_puts(" 0x");
+                    serial_puthex(p[row * 4 + c], 8);
+                }
+                serial_puts("\n");
+            }
+        }
     }
 
     /* Cap absurd sizes (> 256MB) to 256MB. Empirical sweet spot:
