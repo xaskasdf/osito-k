@@ -343,6 +343,17 @@ void dos_int21_dispatch(dos_vm_t *vm)
         if (h >= DOS_MAX_HANDLES || !vm->handles[h].open) {
             cpu->flags |= FLAG_CF;
             cpu->ax = 6;
+            static uint32_t bad_h_count = 0;
+            bad_h_count++;
+            if (bad_h_count < 8 || (bad_h_count & 0xFFFF) == 0) {
+                serial_puts("[DOS] R BAD-HANDLE bx=0x");
+                serial_puthex(h, 4);
+                serial_puts(" cx=");      serial_putdec(count);
+                serial_puts(" ds=0x");    serial_puthex(cpu->ds, 4);
+                serial_puts(" dx=0x");    serial_puthex(cpu->dx, 4);
+                serial_puts(" #");        serial_putdec(bad_h_count);
+                serial_puts("\n");
+            }
             break;
         }
 
@@ -353,6 +364,7 @@ void dos_int21_dispatch(dos_vm_t *vm)
 
         /* Read into a temp buffer, then copy to DOS memory */
         uint32_t buf = dos_linear(cpu->ds, cpu->dx);
+        uint32_t pos_before = fh->position;
         uint8_t tmp[512];
         uint32_t total = 0;
         while (total < to_read) {
@@ -364,6 +376,26 @@ void dos_int21_dispatch(dos_vm_t *vm)
                 dos_mem_write8(vm, buf + total + i, tmp[i]);
             total += rd;
             fh->position += rd;
+        }
+
+        /* Sampled trace: first 16 reads verbose, then every 64k. Shows
+         * handle, source position, count requested, count actually
+         * returned, and first 8 bytes of the data for diagnostic use. */
+        static uint32_t read_count = 0;
+        read_count++;
+        if (read_count < 16 || (read_count & 0xFFFF) == 0) {
+            serial_puts("[DOS] R h=");      serial_putdec(h);
+            serial_puts(" pos=0x");         serial_puthex(pos_before, 8);
+            serial_puts(" req=");           serial_putdec(count);
+            serial_puts(" got=");           serial_putdec(total);
+            serial_puts(" buf=0x");         serial_puthex(buf, 8);
+            serial_puts(" data=");
+            for (int i = 0; i < 8 && i < (int)total; i++) {
+                serial_puts(" ");
+                serial_puthex(dos_mem_read8(vm, buf + i), 2);
+            }
+            serial_puts(" #"); serial_putdec(read_count);
+            serial_puts("\n");
         }
 
         cpu->ax = total;
@@ -399,13 +431,31 @@ void dos_int21_dispatch(dos_vm_t *vm)
         if (h >= DOS_MAX_HANDLES || !vm->handles[h].open) {
             cpu->flags |= FLAG_CF;
             cpu->ax = 6;
+            static uint32_t bad_s_count = 0;
+            bad_s_count++;
+            if (bad_s_count < 8 || (bad_s_count & 0xFFFF) == 0) {
+                serial_puts("[DOS] S BAD-HANDLE bx=0x");
+                serial_puthex(h, 4);
+                serial_puts(" al=");      serial_putdec(cpu->al);
+                serial_puts(" cx:dx=0x"); serial_puthex(cpu->cx, 4);
+                serial_puts(":0x");       serial_puthex(cpu->dx, 4);
+                serial_puts(" #");        serial_putdec(bad_s_count);
+                serial_puts("\n");
+            }
             break;
         }
 
         dos_handle_t *fh = &vm->handles[h];
-        int32_t offset = (int32_t)((uint32_t)cpu->cx << 16 | cpu->dx);
 
-        switch (cpu->al) {
+        /* Sample BAD-HANDLE before the existing valid-handle path so we
+         * see which calls hit invalid handles. (Above we already returned
+         * with CF/AX=6 — this is unreachable for invalid h.) */
+
+        int32_t offset = (int32_t)((uint32_t)cpu->cx << 16 | cpu->dx);
+        uint32_t pos_before = fh->position;
+        uint8_t whence = cpu->al;
+
+        switch (whence) {
         case 0: fh->position = offset; break;                    /* SEEK_SET */
         case 1: fh->position = (int32_t)fh->position + offset; break; /* SEEK_CUR */
         case 2: fh->position = (int32_t)fh->file_size + offset; break; /* SEEK_END */
@@ -414,6 +464,18 @@ void dos_int21_dispatch(dos_vm_t *vm)
         cpu->dx = (uint16_t)(fh->position >> 16);
         cpu->ax = (uint16_t)(fh->position & 0xFFFF);
         cpu->flags &= ~FLAG_CF;
+
+        static uint32_t seek_count = 0;
+        seek_count++;
+        if (seek_count < 16 || (seek_count & 0xFFFF) == 0) {
+            serial_puts("[DOS] S h="); serial_putdec(h);
+            serial_puts(" wh=");       serial_putdec(whence);
+            serial_puts(" off=0x");    serial_puthex((uint32_t)offset, 8);
+            serial_puts(" pos 0x");    serial_puthex(pos_before, 8);
+            serial_puts(" -> 0x");     serial_puthex(fh->position, 8);
+            serial_puts(" #");         serial_putdec(seek_count);
+            serial_puts("\n");
+        }
         break;
     }
 
