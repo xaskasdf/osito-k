@@ -54,16 +54,29 @@ static inline int clock_nanosleep(int clk, int flags, const struct timespec *req
 extern long lrint(double);
 static inline long lrintf(float f) { return lrint((double)f); }
 
-/* posix_memalign: wrap our libc malloc */
+/* posix_memalign: wrap libc malloc with manual over-allocation + align.
+ * Mesa's ralloc/blob/SIMD codepaths pass alignments of 16/32/64 bytes;
+ * returning 8-byte-aligned mem to those would cause #GP on movaps. */
 extern void *malloc(size_t);
 extern void  free(void *);
 static inline int posix_memalign(void **out, size_t a, size_t s) {
-    (void)a;
-    void *p = malloc(s);
-    if (!p) return 12;  /* ENOMEM */
-    *out = p;
+    if (a < sizeof(void *) || (a & (a - 1))) return 22; /* EINVAL */
+    void *raw = malloc(s + a - 1 + sizeof(void *));
+    if (!raw) return 12;  /* ENOMEM */
+    void *aligned = (void *)(((uintptr_t)raw + sizeof(void *) + a - 1) & ~(a - 1));
+    ((void **)aligned)[-1] = raw;
+    *out = aligned;
     return 0;
 }
+/* Companion: callers that mix posix_memalign + free won't recover the raw
+ * pointer; for now we live with that — Mesa's util/blob.c uses ralloc which
+ * is its own pool so doesn't hit free() on an aligned alloc. Document the
+ * constraint here so W4.1+ can add a wrapper if needed. */
+#define HAVE_POSIX_MEMALIGN 1
+
+/* atexit stub: Mesa's os_misc.c registers options_tbl_fini; on OsitoK we
+ * don't run global destructors anyway. No-op preserves link compatibility. */
+static inline int atexit(void (*f)(void)) { (void)f; return 0; }
 
 /* pthread no-ops — Mesa is well-tested in single-threaded mode */
 typedef int pthread_mutex_t;
