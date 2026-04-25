@@ -140,7 +140,8 @@ UTIL_SRCS := \
   dxvk/src/util/log/log_debug.cpp \
   dxvk/src/util/sha1/sha1_util.cpp \
   dxvk/src/util/sync/sync_recursive.cpp \
-  dxvk/src/util/thread.cpp
+  dxvk/src/util/thread.cpp \
+  osito_compat/dxvk_compositor_bridge.cpp
 
 # com_guid.cpp pulls d3d11_interfaces.h + dxgi_interfaces.h transitively,
 # which reach the native windows shim — same dependency surface as
