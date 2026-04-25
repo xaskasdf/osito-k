@@ -88,7 +88,8 @@ int venus_cmd_encode_QueuePresentKHR(
          * a recorded draw + a bound vertex buffer with mapped pointer. */
         if (m->is_shm_backed && m->local_ptr) {
             struct venus_cmd_buffer *vcb = find_cb_drew_image(dev, img_slot);
-            if (vcb && vcb->recorded_vb_slot < VENUS_MAX_BUF_OBJECTS) {
+            if (vcb && vcb->recorded_vb_slot >= 0 &&
+                vcb->recorded_vb_slot < (int32_t)VENUS_MAX_BUF_OBJECTS) {
                 struct venus_buffer *vb = &dev->buffers[vcb->recorded_vb_slot];
                 if (vb->in_use && vb->bound_mem_slot >= 0 &&
                     vb->bound_mem_slot < (int)VENUS_MAX_MEM_OBJECTS) {

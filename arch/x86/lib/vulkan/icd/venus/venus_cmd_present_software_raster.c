@@ -6,12 +6,12 @@
  * vertexCount >= 3. Paints one triangle in solid color via barycentric
  * scan-conversion over the AABB. No texturing, no depth, no blending.
  *
- * NDC mapping:
+ * NDC mapping (Vulkan convention: +Y points DOWN in clip-space):
  *   x in [-1,+1] -> screen x in [0, fb_w-1]
- *   y in [-1,+1] -> screen y in [fb_h-1, 0]   (flip — Vulkan NDC has +Y down,
- *                                              but this matches the natural
- *                                              "smaller y = higher row" feel
- *                                              the test app expects.)
+ *   y in [-1,+1] -> screen y in [fb_h-1, 0]   (we flip so that NDC y=-1
+ *                                              maps to row 0 (top of fb).
+ *                                              The test's vertex layout
+ *                                              treats y<0 as the top.)
  *
  * Pure C, no libc. The fb is 32bpp BGRA (the format we asked for in
  * SYS_SHM_MKSURFACE).

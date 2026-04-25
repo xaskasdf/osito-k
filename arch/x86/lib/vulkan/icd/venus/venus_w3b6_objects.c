@@ -61,14 +61,15 @@ venus_CmdBindVertexBuffers(VkCommandBuffer cb,
         buf_ids[i] = host_id;
         offs[i]    = pOffsets ? (uint64_t)pOffsets[i] : 0ull;
         if (firstBinding + i == 0) {
-            vcb->recorded_vb_slot   = (uint32_t)bslot;
-            vcb->recorded_vb_offset = offs[i];
-            /* Default stride if pipeline didn't override: assume vec3 (12 B).
-             * The pipeline VI binding stride goes into recorded_vb_stride
-             * via venus_CreateGraphicsPipelines (later wave); for W3b.6 we
-             * just default to 12 here so the rasterizer Just Works. */
-            if (vcb->recorded_vb_stride == 0)
+            /* Only record valid slots; -1 sentinel means "rasterizer skip". */
+            if (bslot >= 0 && bslot < (int)VENUS_MAX_BUF_OBJECTS &&
+                dev->buffers[bslot].in_use) {
+                vcb->recorded_vb_slot   = bslot;
+                vcb->recorded_vb_offset = offs[i];
+                /* Default stride to vec3 (12 B). A future wave will plumb
+                 * pipeline VI binding stride here. */
                 vcb->recorded_vb_stride = 12u;
+            }
         }
     }
 

@@ -183,13 +183,14 @@ struct venus_cmd_buffer {
     int32_t  pool_slot;
     uint32_t in_use;
     uint32_t recording;                /* 1 after Begin, 0 after End */
-    /* W3b.6 — guest-local recording state for the CPU-fallback rasterizer. */
-    uint32_t recorded_vb_slot;         /* venus_buffer slot bound at binding 0 */
+    /* W3b.6 — guest-local recording state for the CPU-fallback rasterizer.
+     * Reset by venus_BeginCommandBuffer; -1 sentinels mean "unbound". */
+    int32_t  recorded_vb_slot;         /* venus_buffer slot at binding 0; -1 = none */
     uint64_t recorded_vb_offset;       /* offset within the bound buffer */
-    uint32_t recorded_vb_stride;       /* bytes per vertex (from pipeline VI binding) */
+    uint32_t recorded_vb_stride;       /* bytes per vertex (defaults to 12 for vec3) */
     uint32_t recorded_vertex_count;    /* last CmdDraw vertexCount */
     uint32_t recorded_first_vertex;    /* last CmdDraw firstVertex */
-    int32_t  last_drawn_image_slot;    /* venus_image slot last bound via render pass */
+    int32_t  last_drawn_image_slot;    /* venus_image slot last bound via render pass; -1 */
     uint32_t drew_flag;                /* 1 once CmdDraw recorded inside the active RP */
     uint32_t _pad6;
 };

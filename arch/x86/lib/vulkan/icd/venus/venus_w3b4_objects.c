@@ -632,6 +632,14 @@ venus_AllocateCommandBuffers(VkDevice device,
         vcb->recording = 0;
         vcb->host_id   = 0;
         vcb->in_use    = 1;
+        /* W3b.6: -1 sentinels mean "unbound" so the rasterizer skips. */
+        vcb->recorded_vb_slot       = -1;
+        vcb->recorded_vb_offset     = 0;
+        vcb->recorded_vb_stride     = 0;
+        vcb->recorded_vertex_count  = 0;
+        vcb->recorded_first_vertex  = 0;
+        vcb->last_drawn_image_slot  = -1;
+        vcb->drew_flag              = 0;
     }
     if (allocated != count) {
         for (uint32_t i = 0; i < allocated; i++) {
@@ -709,6 +717,15 @@ venus_BeginCommandBuffer(VkCommandBuffer cb,
     if (!cb_unwrap(cb, &dev, &slot)) return VK_ERROR_INITIALIZATION_FAILED;
     struct venus_cmd_buffer *vcb = &dev->cmd_buffers[slot];
     vcb->recording = 1;
+    /* W3b.6: clear recording state from any prior Begin/End cycle so the
+     * rasterizer doesn't paint stale geometry. */
+    vcb->recorded_vb_slot       = -1;
+    vcb->recorded_vb_offset     = 0;
+    vcb->recorded_vb_stride     = 0;
+    vcb->recorded_vertex_count  = 0;
+    vcb->recorded_first_vertex  = 0;
+    vcb->last_drawn_image_slot  = -1;
+    vcb->drew_flag              = 0;
     if (dev->parent && dev->parent->wire && vcb->host_id != 0)
         (void)venus_cmd_encode_BeginCommandBuffer(dev->parent->wire,
                                                   dev->host_handle,
