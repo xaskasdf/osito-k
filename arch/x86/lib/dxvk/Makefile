@@ -1,9 +1,10 @@
-# arch/x86/lib/dxvk/Makefile -- W5.0/W5.1 build infrastructure for DXVK on OsitoK.
+# arch/x86/lib/dxvk/Makefile -- W5.0/W5.1/W5.2 build infrastructure for DXVK on OsitoK.
 #
-# Produces three static archives:
+# Produces four static archives:
 #   $(BUILD_DIR)/libdxvk_util.a   -- DXVK src/util/  (hash maps, log, etc.)
 #   $(BUILD_DIR)/libdxvk_spirv.a  -- DXVK src/spirv/ (SPIR-V module builder)
 #   $(BUILD_DIR)/libdxvk_dxbc.a   -- DXVK src/dxbc/  (D3D11 bytecode -> SPIR-V)
+#   $(BUILD_DIR)/libdxvk_core.a   -- DXVK src/dxvk/  (Vulkan abstraction layer) [W5.2]
 #
 # Both compiled C++17 with -fno-exceptions -fno-rtti, force-including the
 # osito_compat/dxvk_compat.h shim so the upstream sources compile unchanged.
@@ -21,6 +22,7 @@ BUILD_DIR := $(OSITOK_ROOT)/arch/x86/build/lib/dxvk
 UTIL_OUT  := $(BUILD_DIR)/libdxvk_util.a
 SPIRV_OUT := $(BUILD_DIR)/libdxvk_spirv.a
 DXBC_OUT  := $(BUILD_DIR)/libdxvk_dxbc.a
+CORE_OUT  := $(BUILD_DIR)/libdxvk_core.a
 
 # C++ compiler.  Prefer the OsitoK cross-compiler if present; else fall
 # back to the host g++ (which inside Docker is gcc:12's g++).
@@ -149,20 +151,77 @@ DXBC_SRCS := \
   dxvk/src/dxbc/dxbc_header.cpp \
   dxvk/src/dxbc/dxbc_module.cpp \
   dxvk/src/dxbc/dxbc_names.cpp \
+  dxvk/src/dxbc/dxbc_options.cpp \
   dxvk/src/dxbc/dxbc_reader.cpp \
   dxvk/src/dxbc/dxbc_util.cpp
+
+# ----------------------------------------------------------------------
+# CORE_SRCS — DXVK src/dxvk/. The Vulkan abstraction layer.
+# 48 upstream .cpp files. Excluded:
+#   dxvk_openvr.cpp -- needs OpenVR headers (VR support, not used)
+#   dxvk_openxr.cpp -- needs OpenXR headers (AR/VR, not used)
+#   dxvk_platform_exts.cpp -- pulls openvr.h + openxr.h transitively
+# ----------------------------------------------------------------------
+CORE_SRCS := \
+  dxvk/src/dxvk/dxvk_adapter.cpp \
+  dxvk/src/dxvk/dxvk_barrier.cpp \
+  dxvk/src/dxvk/dxvk_buffer.cpp \
+  dxvk/src/dxvk/dxvk_cmdlist.cpp \
+  dxvk/src/dxvk/dxvk_compute.cpp \
+  dxvk/src/dxvk/dxvk_context.cpp \
+  dxvk/src/dxvk/dxvk_cs.cpp \
+  dxvk/src/dxvk/dxvk_data.cpp \
+  dxvk/src/dxvk/dxvk_descriptor.cpp \
+  dxvk/src/dxvk/dxvk_device.cpp \
+  dxvk/src/dxvk/dxvk_device_filter.cpp \
+  dxvk/src/dxvk/dxvk_extensions.cpp \
+  dxvk/src/dxvk/dxvk_fence.cpp \
+  dxvk/src/dxvk/dxvk_format.cpp \
+  dxvk/src/dxvk/dxvk_framebuffer.cpp \
+  dxvk/src/dxvk/dxvk_gpu_event.cpp \
+  dxvk/src/dxvk/dxvk_gpu_query.cpp \
+  dxvk/src/dxvk/dxvk_graphics.cpp \
+  dxvk/src/dxvk/dxvk_image.cpp \
+  dxvk/src/dxvk/dxvk_instance.cpp \
+  dxvk/src/dxvk/dxvk_lifetime.cpp \
+  dxvk/src/dxvk/dxvk_memory.cpp \
+  dxvk/src/dxvk/dxvk_meta_blit.cpp \
+  dxvk/src/dxvk/dxvk_meta_clear.cpp \
+  dxvk/src/dxvk/dxvk_meta_copy.cpp \
+  dxvk/src/dxvk/dxvk_meta_mipgen.cpp \
+  dxvk/src/dxvk/dxvk_meta_pack.cpp \
+  dxvk/src/dxvk/dxvk_meta_resolve.cpp \
+  dxvk/src/dxvk/dxvk_options.cpp \
+  dxvk/src/dxvk/dxvk_pipelayout.cpp \
+  dxvk/src/dxvk/dxvk_pipemanager.cpp \
+  dxvk/src/dxvk/dxvk_presenter.cpp \
+  dxvk/src/dxvk/dxvk_queue.cpp \
+  dxvk/src/dxvk/dxvk_resource.cpp \
+  dxvk/src/dxvk/dxvk_sampler.cpp \
+  dxvk/src/dxvk/dxvk_shader.cpp \
+  dxvk/src/dxvk/dxvk_shader_key.cpp \
+  dxvk/src/dxvk/dxvk_signal.cpp \
+  dxvk/src/dxvk/dxvk_sparse.cpp \
+  dxvk/src/dxvk/dxvk_staging.cpp \
+  dxvk/src/dxvk/dxvk_state_cache.cpp \
+  dxvk/src/dxvk/dxvk_stats.cpp \
+  dxvk/src/dxvk/dxvk_swapchain_blitter.cpp \
+  dxvk/src/dxvk/dxvk_unbound.cpp \
+  dxvk/src/dxvk/dxvk_util.cpp
 
 UTIL_OBJS    := $(patsubst %.cpp,$(BUILD_DIR)/%.o,$(UTIL_SRCS))
 UTIL_C_OBJS  := $(patsubst %.c,$(BUILD_DIR)/%.o,$(UTIL_C_SRCS))
 SPIRV_OBJS   := $(patsubst %.cpp,$(BUILD_DIR)/%.o,$(SPIRV_SRCS))
 DXBC_OBJS    := $(patsubst %.cpp,$(BUILD_DIR)/%.o,$(DXBC_SRCS))
+CORE_OBJS    := $(patsubst %.cpp,$(BUILD_DIR)/%.o,$(CORE_SRCS))
 
-.PHONY: all clean util spirv dxbc
-all: util spirv dxbc
+.PHONY: all clean util spirv dxbc core
+all: util spirv dxbc core
 
 util:  $(UTIL_OUT)
 spirv: $(SPIRV_OUT)
 dxbc:  $(DXBC_OUT)
+core:  $(CORE_OUT)
 
 $(UTIL_OUT): $(UTIL_OBJS) $(UTIL_C_OBJS) | $(BUILD_DIR)
 	@echo "  AR    $(notdir $@)"
@@ -177,6 +236,11 @@ $(SPIRV_OUT): $(SPIRV_OBJS) | $(BUILD_DIR)
 $(DXBC_OUT): $(DXBC_OBJS) | $(BUILD_DIR)
 	@echo "  AR    $(notdir $@)"
 	@$(AR) rcs $@ $(DXBC_OBJS)
+	@echo "  -> $$($(AR) t $@ | wc -l) objects in $@"
+
+$(CORE_OUT): $(CORE_OBJS) | $(BUILD_DIR)
+	@echo "  AR    $(notdir $@)"
+	@$(AR) rcs $@ $(CORE_OBJS)
 	@echo "  -> $$($(AR) t $@ | wc -l) objects in $@"
 
 # Pattern rule: build/lib/dxvk/foo/bar.o : foo/bar.cpp
