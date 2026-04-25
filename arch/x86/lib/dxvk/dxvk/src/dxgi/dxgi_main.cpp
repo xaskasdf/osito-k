@@ -6,7 +6,7 @@ namespace dxvk {
   Logger Logger::s_instance("dxgi.log");
   
   HRESULT createDxgiFactory(UINT Flags, REFIID riid, void **ppFactory) {
-    try {
+    /* try */ {
       Com<DxgiFactory> factory = new DxgiFactory(Flags);
       HRESULT hr = factory->QueryInterface(riid, ppFactory);
 
@@ -14,10 +14,7 @@ namespace dxvk {
         return hr;
       
       return S_OK;
-    } catch (const DxvkError& e) {
-      Logger::err(e.message());
-      return E_FAIL;
-    }
+    }  /* ositok-W5.3: catch elided (-fno-exceptions) */
   }
 }
 

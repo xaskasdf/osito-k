@@ -99,7 +99,7 @@ namespace dxvk {
     if (!ppBuffer)
       return S_FALSE;
     
-    try {
+    /* try */ {
       const Com<D3D11Buffer> buffer = new D3D11Buffer(this, &desc, nullptr);
 
       if (!(desc.MiscFlags & D3D11_RESOURCE_MISC_TILE_POOL))
@@ -107,10 +107,7 @@ namespace dxvk {
 
       *ppBuffer = buffer.ref();
       return S_OK;
-    } catch (const DxvkError& e) {
-      Logger::err(e.message());
-      return E_INVALIDARG;
-    }
+    }  /* ositok-W5.3: catch elided (-fno-exceptions) */
   }
   
   
@@ -148,15 +145,12 @@ namespace dxvk {
     if (!ppTexture1D)
       return S_FALSE;
     
-    try {
+    /* try */ {
       const Com<D3D11Texture1D> texture = new D3D11Texture1D(this, &desc, nullptr);
       m_initializer->InitTexture(texture->GetCommonTexture(), pInitialData);
       *ppTexture1D = texture.ref();
       return S_OK;
-    } catch (const DxvkError& e) {
-      Logger::err(e.message());
-      return E_INVALIDARG;
-    }
+    }  /* ositok-W5.3: catch elided (-fno-exceptions) */
   }
   
   
@@ -228,15 +222,12 @@ namespace dxvk {
     if (!ppTexture2D)
       return S_FALSE;
     
-    try {
+    /* try */ {
       Com<D3D11Texture2D> texture = new D3D11Texture2D(this, &desc, nullptr, nullptr);
       m_initializer->InitTexture(texture->GetCommonTexture(), pInitialData);
       *ppTexture2D = texture.ref();
       return S_OK;
-    } catch (const DxvkError& e) {
-      Logger::err(e.message());
-      return E_INVALIDARG;
-    }
+    }  /* ositok-W5.3: catch elided (-fno-exceptions) */
   }
 
   
@@ -307,15 +298,12 @@ namespace dxvk {
     if (!ppTexture3D)
       return S_FALSE;
       
-    try {
+    /* try */ {
       Com<D3D11Texture3D> texture = new D3D11Texture3D(this, &desc, nullptr);
       m_initializer->InitTexture(texture->GetCommonTexture(), pInitialData);
       *ppTexture3D = texture.ref();
       return S_OK;
-    } catch (const DxvkError& e) {
-      Logger::err(e.message());
-      return E_INVALIDARG;
-    }
+    }  /* ositok-W5.3: catch elided (-fno-exceptions) */
   }
   
   
@@ -386,13 +374,10 @@ namespace dxvk {
     if (!ppSRView)
       return S_FALSE;
     
-    try {
+    /* try */ {
       *ppSRView = ref(new D3D11ShaderResourceView(this, pResource, &desc));
       return S_OK;
-    } catch (const DxvkError& e) {
-      Logger::err(e.message());
-      return E_INVALIDARG;
-    }
+    }  /* ositok-W5.3: catch elided (-fno-exceptions) */
   }
   
   
@@ -463,15 +448,12 @@ namespace dxvk {
     if (!ppUAView)
       return S_FALSE;
     
-    try {
+    /* try */ {
       auto uav = new D3D11UnorderedAccessView(this, pResource, &desc);
       m_initializer->InitUavCounter(uav);
       *ppUAView = ref(uav);
       return S_OK;
-    } catch (const DxvkError& e) {
-      Logger::err(e.message());
-      return E_INVALIDARG;
-    }
+    }  /* ositok-W5.3: catch elided (-fno-exceptions) */
   }
   
   
@@ -548,13 +530,10 @@ namespace dxvk {
     if (!ppRTView)
       return S_FALSE;
     
-    try {
+    /* try */ {
       *ppRTView = ref(new D3D11RenderTargetView(this, pResource, &desc));
       return S_OK;
-    } catch (const DxvkError& e) {
-      Logger::err(e.message());
-      return E_INVALIDARG;
-    }
+    }  /* ositok-W5.3: catch elided (-fno-exceptions) */
   }
   
   
@@ -596,13 +575,10 @@ namespace dxvk {
     if (ppDepthStencilView == nullptr)
       return S_FALSE;
     
-    try {
+    /* try */ {
       *ppDepthStencilView = ref(new D3D11DepthStencilView(this, pResource, &desc));
       return S_OK;
-    } catch (const DxvkError& e) {
-      Logger::err(e.message());
-      return E_INVALIDARG;
-    }
+    }  /* ositok-W5.3: catch elided (-fno-exceptions) */
   }
   
   
@@ -620,7 +596,7 @@ namespace dxvk {
     if (!pInputElementDescs)
       return E_INVALIDARG;
     
-    try {
+    /* try */ {
       DxbcReader dxbcReader(reinterpret_cast<const char*>(
         pShaderBytecodeWithInputSignature), BytecodeLength);
       DxbcModule dxbcModule(dxbcReader);
@@ -722,10 +698,7 @@ namespace dxvk {
           attrCount, attrList.data(),
           bindCount, bindList.data()));
       return S_OK;
-    } catch (const DxvkError& e) {
-      Logger::err(e.message());
-      return E_INVALIDARG;
-    }
+    }  /* ositok-W5.3: catch elided (-fno-exceptions) */
   }
   
   
@@ -1178,13 +1151,10 @@ namespace dxvk {
     if (!ppSamplerState)
       return S_FALSE;
     
-    try {
+    /* try */ {
       *ppSamplerState = m_samplerObjects.Create(this, desc);
       return S_OK;
-    } catch (const DxvkError& e) {
-      Logger::err(e.message());
-      return E_INVALIDARG;
-    }
+    }  /* ositok-W5.3: catch elided (-fno-exceptions) */
   }
   
   
@@ -1228,13 +1198,10 @@ namespace dxvk {
     if (!ppQuery)
       return S_FALSE;
     
-    try {
+    /* try */ {
       *ppQuery = ref(new D3D11Query(this, *pQueryDesc));
       return S_OK;
-    } catch (const DxvkError& e) {
-      Logger::err(e.message());
-      return E_INVALIDARG;
-    }
+    }  /* ositok-W5.3: catch elided (-fno-exceptions) */
   }
 
   
@@ -1259,14 +1226,11 @@ namespace dxvk {
     if (!ppPredicate)
       return S_FALSE;
     
-    try {
+    /* try */ {
       *ppPredicate = D3D11Query::AsPredicate(
         ref(new D3D11Query(this, desc)));
       return S_OK;
-    } catch (const DxvkError& e) {
-      Logger::err(e.message());
-      return E_INVALIDARG;
-    }
+    }  /* ositok-W5.3: catch elided (-fno-exceptions) */
   }
   
   
@@ -1369,13 +1333,10 @@ namespace dxvk {
           void**                      ppFence) {
     InitReturnPtr(ppFence);
 
-    try {
+    /* try */ {
       Com<D3D11Fence> fence = new D3D11Fence(this, InitialValue, Flags, INVALID_HANDLE_VALUE);
       return fence->QueryInterface(riid, ppFence);
-    } catch (const DxvkError& e) {
-      Logger::err(e.message());
-      return E_FAIL;
-    }
+    }  /* ositok-W5.3: catch elided (-fno-exceptions) */
   }
 
 
@@ -1477,13 +1438,10 @@ namespace dxvk {
     if (ppFence == nullptr)
       return S_FALSE;
 
-    try {
+    /* try */ {
       Com<D3D11Fence> fence = new D3D11Fence(this, 0, D3D11_FENCE_FLAG_SHARED, hFence);
       return fence->QueryInterface(ReturnedInterface, ppFence);
-    } catch (const DxvkError& e) {
-      Logger::err(e.message());
-      return E_FAIL;
-    }
+    }  /* ositok-W5.3: catch elided (-fno-exceptions) */
   }
 
 
@@ -2315,15 +2273,11 @@ namespace dxvk {
     }
 
     // Only 2D textures may be shared
-    try {
+    /* try */ {
       const Com<D3D11Texture2D> texture = new D3D11Texture2D(this, &d3d11Desc, nullptr, hResource);
       texture->QueryInterface(ReturnedInterface, ppResource);
       return S_OK;
-    }
-    catch (const DxvkError& e) {
-      Logger::err(e.message());
-      return E_INVALIDARG;
-    }
+    }  /* ositok-W5.3: catch elided (-fno-exceptions) */
 #else
     Logger::warn("D3D11Device::OpenSharedResourceGeneric: Not supported on this platform.");
     return E_INVALIDARG;
@@ -2828,14 +2782,11 @@ namespace dxvk {
           ID3D11VideoProcessorEnumerator*               pEnum,
           UINT                                          RateConversionIndex,
           ID3D11VideoProcessor**                        ppVideoProcessor) {
-    try {
+    /* try */ {
       auto enumerator = static_cast<D3D11VideoProcessorEnumerator*>(pEnum);
       *ppVideoProcessor = ref(new D3D11VideoProcessor(m_device, enumerator, RateConversionIndex));
       return S_OK;
-    } catch (const DxvkError& e) {
-      Logger::err(e.message());
-      return E_FAIL;
-    }
+    }  /* ositok-W5.3: catch elided (-fno-exceptions) */
   }
 
 
@@ -2871,13 +2822,10 @@ namespace dxvk {
           ID3D11VideoProcessorEnumerator*               pEnum,
     const D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC*        pDesc,
           ID3D11VideoProcessorInputView**               ppVPIView) {
-    try {
+    /* try */ {
       *ppVPIView = ref(new D3D11VideoProcessorInputView(m_device, pResource, *pDesc));
       return S_OK;
-    } catch (const DxvkError& e) {
-      Logger::err(e.message());
-      return E_FAIL;
-    }
+    }  /* ositok-W5.3: catch elided (-fno-exceptions) */
   }
 
 
@@ -2886,26 +2834,20 @@ namespace dxvk {
           ID3D11VideoProcessorEnumerator*               pEnum,
     const D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC*       pDesc,
           ID3D11VideoProcessorOutputView**              ppVPOView) {
-    try {
+    /* try */ {
       *ppVPOView = ref(new D3D11VideoProcessorOutputView(m_device, pResource, *pDesc));
       return S_OK;
-    } catch (const DxvkError& e) {
-      Logger::err(e.message());
-      return E_FAIL;
-    }
+    }  /* ositok-W5.3: catch elided (-fno-exceptions) */
   }
 
 
   HRESULT STDMETHODCALLTYPE D3D11VideoDevice::CreateVideoProcessorEnumerator(
     const D3D11_VIDEO_PROCESSOR_CONTENT_DESC*           pDesc,
           ID3D11VideoProcessorEnumerator**              ppEnum)  {
-    try {
+    /* try */ {
       *ppEnum = ref(new D3D11VideoProcessorEnumerator(m_device, *pDesc));
       return S_OK;
-    } catch (const DxvkError& e) {
-      Logger::err(e.message());
-      return E_FAIL;
-    }
+    }  /* ositok-W5.3: catch elided (-fno-exceptions) */
   }
 
 
@@ -3016,7 +2958,7 @@ namespace dxvk {
           IDXGIVkSwapChain**        ppSwapChain) {
     InitReturnPtr(ppSwapChain);
 
-    try {
+    /* try */ {
       auto vki = m_device->GetDXVKDevice()->adapter()->vki();
 
       Com<D3D11SwapChain> presenter = new D3D11SwapChain(
@@ -3024,10 +2966,7 @@ namespace dxvk {
       
       *ppSwapChain = presenter.ref();
       return S_OK;
-    } catch (const DxvkError& e) {
-      Logger::err(e.message());
-      return E_FAIL;
-    }
+    }  /* ositok-W5.3: catch elided (-fno-exceptions) */
   }
 
 

@@ -86,7 +86,7 @@ extern "C" {
       return E_INVALIDARG;
     }
 
-    try {
+    /* try */ {
       Logger::info(str::format("D3D11InternalCreateDevice: Using feature level ", devFeatureLevel));
 
       DxvkDeviceFeatures deviceFeatures = D3D11Device::GetDeviceFeatures(dxvkAdapter);
@@ -100,10 +100,7 @@ extern "C" {
       return device->QueryInterface(
         __uuidof(ID3D11Device),
         reinterpret_cast<void**>(ppDevice));
-    } catch (const DxvkError& e) {
-      Logger::err("D3D11InternalCreateDevice: Failed to create D3D11 device");
-      return E_FAIL;
-    }
+    }  /* ositok-W5.3: catch elided (-fno-exceptions) */
   }
   
   
@@ -359,7 +356,7 @@ extern "C" {
       return E_INVALIDARG;
     }
 
-    try {
+    /* try */ {
       // Initialize DXVK instance
       DxvkInstanceImportInfo instanceInfo = { };
       DxvkDeviceImportInfo deviceInfo = { };
@@ -441,10 +438,7 @@ extern "C" {
         return S_FALSE;
 
       return S_OK;
-    } catch (const DxvkError& e) {
-      Logger::err("D3D11On12CreateDevice: Failed to create D3D11 device");
-      return E_FAIL;
-    }
+    }  /* ositok-W5.3: catch elided (-fno-exceptions) */
   }
 
 }

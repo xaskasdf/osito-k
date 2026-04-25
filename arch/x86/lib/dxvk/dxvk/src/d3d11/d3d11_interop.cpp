@@ -148,13 +148,10 @@ namespace dxvk {
     if (!ppTexture2D)
       return S_FALSE;
     
-    try {
+    /* try */ {
       Com<D3D11Texture2D> texture = new D3D11Texture2D(m_device, &desc, 0, vkImage);
       *ppTexture2D = texture.ref();
       return S_OK;
-    } catch (const DxvkError& e) {
-      Logger::err(e.message());
-      return E_INVALIDARG;
-    }
+    }  /* ositok-W5.3: catch elided (-fno-exceptions) */
   }
 }

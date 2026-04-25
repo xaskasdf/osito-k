@@ -282,12 +282,9 @@ namespace dxvk {
     if (std::exchange(m_dirty, false))
       RecreateSwapChain();
 
-    try {
+    /* try */ {
       hr = PresentImage(SyncInterval);
-    } catch (const DxvkError& e) {
-      Logger::err(e.message());
-      hr = E_FAIL;
-    }
+    }  /* ositok-W5.3: catch elided (-fno-exceptions) */
 
     // Ensure to synchronize and release the frame latency semaphore
     // even if presentation failed with STATUS_OCCLUDED, or otherwise

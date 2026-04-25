@@ -106,13 +106,10 @@ namespace dxvk {
     // new module. This takes a while, so we won't lock the structure.
     D3D11CommonShader module;
     
-    try {
+    /* try */ {
       module = D3D11CommonShader(pDevice, pShaderKey,
         pDxbcModuleInfo, pShaderBytecode, BytecodeLength);
-    } catch (const DxvkError& e) {
-      Logger::err(e.message());
-      return E_INVALIDARG;
-    }
+    }  /* ositok-W5.3: catch elided (-fno-exceptions) */
     
     // Insert the new module into the lookup table. If another thread
     // has compiled the same shader in the meantime, we should return

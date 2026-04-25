@@ -108,7 +108,7 @@ CXX_FLAGS := \
 D3D11_CXX_FLAGS := \
   -std=gnu++17 \
   -ffreestanding -fno-stack-protector -mno-red-zone \
-  -fno-exceptions -fno-rtti \
+  -fno-exceptions \
   -fno-pic -fvisibility=hidden \
   -O2 \
   -Wall -Wextra \
@@ -209,9 +209,13 @@ DXBC_SRCS := \
   dxvk/src/dxbc/dxbc_header.cpp \
   dxvk/src/dxbc/dxbc_module.cpp \
   dxvk/src/dxbc/dxbc_names.cpp \
-  dxvk/src/dxbc/dxbc_options.cpp \
   dxvk/src/dxbc/dxbc_reader.cpp \
   dxvk/src/dxbc/dxbc_util.cpp
+
+# dxbc_options.cpp pulls in the real d3d11_options.h (W5.3) which now
+# transitively reaches dxgi1_6.h, so it needs the D3D11_CXX_FLAGS path.
+DXBC_D3D11_SRCS := \
+  dxvk/src/dxbc/dxbc_options.cpp
 
 # ----------------------------------------------------------------------
 # CORE_SRCS — DXVK src/dxvk/. The Vulkan abstraction layer.
@@ -334,6 +338,7 @@ UTIL_D3D11_OBJS := $(patsubst %.cpp,$(BUILD_DIR)/%.o,$(UTIL_D3D11_SRCS))
 UTIL_C_OBJS  := $(patsubst %.c,$(BUILD_DIR)/%.o,$(UTIL_C_SRCS))
 SPIRV_OBJS   := $(patsubst %.cpp,$(BUILD_DIR)/%.o,$(SPIRV_SRCS))
 DXBC_OBJS    := $(patsubst %.cpp,$(BUILD_DIR)/%.o,$(DXBC_SRCS))
+DXBC_D3D11_OBJS := $(patsubst %.cpp,$(BUILD_DIR)/%.o,$(DXBC_D3D11_SRCS))
 CORE_OBJS    := $(patsubst %.cpp,$(BUILD_DIR)/%.o,$(CORE_SRCS))
 D3D11_OBJS   := $(patsubst %.cpp,$(BUILD_DIR)/%.o,$(D3D11_SRCS))
 DXGI_OBJS    := $(patsubst %.cpp,$(BUILD_DIR)/%.o,$(DXGI_SRCS))
@@ -358,9 +363,9 @@ $(SPIRV_OUT): $(SPIRV_OBJS) | $(BUILD_DIR)
 	@$(AR) rcs $@ $(SPIRV_OBJS)
 	@echo "  -> $$($(AR) t $@ | wc -l) objects in $@"
 
-$(DXBC_OUT): $(DXBC_OBJS) | $(BUILD_DIR)
+$(DXBC_OUT): $(DXBC_OBJS) $(DXBC_D3D11_OBJS) | $(BUILD_DIR)
 	@echo "  AR    $(notdir $@)"
-	@$(AR) rcs $@ $(DXBC_OBJS)
+	@$(AR) rcs $@ $(DXBC_OBJS) $(DXBC_D3D11_OBJS)
 	@echo "  -> $$($(AR) t $@ | wc -l) objects in $@"
 
 $(CORE_OUT): $(CORE_OBJS) | $(BUILD_DIR)
@@ -395,6 +400,12 @@ $(BUILD_DIR)/dxvk/src/dxgi/%.o: $(DXVK_ROOT)/dxvk/src/dxgi/%.cpp | $(BUILD_DIR)
 $(BUILD_DIR)/dxvk/src/util/com/com_guid.o: $(DXVK_ROOT)/dxvk/src/util/com/com_guid.cpp | $(BUILD_DIR)
 	@mkdir -p $(dir $@)
 	@echo "  CXX[d3d11]   util/com/com_guid"
+	@$(CXX) $(D3D11_CXX_FLAGS) -c -o $@ $<
+
+# dxbc_options.cpp likewise needs the d3d11 include path.
+$(BUILD_DIR)/dxvk/src/dxbc/dxbc_options.o: $(DXVK_ROOT)/dxvk/src/dxbc/dxbc_options.cpp | $(BUILD_DIR)
+	@mkdir -p $(dir $@)
+	@echo "  CXX[d3d11]   dxbc/dxbc_options"
 	@$(CXX) $(D3D11_CXX_FLAGS) -c -o $@ $<
 
 # Pattern rule: build/lib/dxvk/foo/bar.o : foo/bar.cpp

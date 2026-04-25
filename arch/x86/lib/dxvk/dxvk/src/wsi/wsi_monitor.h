@@ -10,9 +10,14 @@
 
 #include "wsi_edid.h"
 
+/* RECT comes from the native windows shim when this header is reached
+ * via d3d11/dxgi (W5.3); for the W5.2 standalone wsi/core builds the
+ * com_stub path doesn't define it, so provide one here as fallback. */
 #ifndef _RECT_DEFINED
 #define _RECT_DEFINED
+#ifndef DXVK_OSITOK_D3D11_COMPAT_H
 typedef struct _RECT { LONG left, top, right, bottom; } RECT;
+#endif
 #endif
 
 namespace dxvk::wsi {

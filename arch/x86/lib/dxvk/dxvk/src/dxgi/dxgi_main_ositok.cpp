@@ -6,18 +6,18 @@ namespace dxvk {
   Logger Logger::s_instance("dxgi.log");
   
   HRESULT createDxgiFactory(UINT Flags, REFIID riid, void **ppFactory) {
-    try {
-      Com<DxgiFactory> factory = new DxgiFactory(Flags);
-      HRESULT hr = factory->QueryInterface(riid, ppFactory);
+    /* OsitoK W5.3: -fno-exceptions, so the upstream try/catch around
+     * `new DxgiFactory(Flags)` collapses to direct construction. The
+     * DxvkError throw sites in dxvk core/d3d11/dxgi were rewritten to
+     * abort_ositok in W5.2 + W5.3-t1, so a thrown error is now a
+     * kernel-side abort with a logged message. */
+    Com<DxgiFactory> factory = new DxgiFactory(Flags);
+    HRESULT hr = factory->QueryInterface(riid, ppFactory);
 
-      if (FAILED(hr))
-        return hr;
-      
-      return S_OK;
-    } catch (const DxvkError& e) {
-      Logger::err(e.message());
-      return E_FAIL;
-    }
+    if (FAILED(hr))
+      return hr;
+
+    return S_OK;
   }
 }
 
