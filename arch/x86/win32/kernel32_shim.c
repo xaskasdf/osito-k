@@ -319,6 +319,26 @@ PVOID WINAPI VirtualAlloc(PVOID lpAddress, SIZE_T dwSize,
         serial_puthex(dwSize, 8);
         serial_puts(" addr=0x");
         serial_puthex((uint64_t)(ULONG_PTR)lpAddress, 8);
+        /* Dump the 32-bit user-mode caller's return address so we can
+         * locate which engine function is making the bogus request.
+         * The compat32 INT 0x2E dispatcher pushed the iret frame on
+         * the kernel-side IST1 stack; the user EIP is in iret RIP at
+         * a fixed offset from the dispatcher's stack frame. Walk via
+         * __builtin_return_address as a coarse approximation — this
+         * gives us the kernel-side caller of HeapAlloc, but the chain
+         * eventually leads to the dispatcher which has the user EIP. */
+        void *kret = __builtin_return_address(0);
+        serial_puts(" kret=0x");
+        serial_puthex((uint64_t)kret, 16);
+        /* Get the user EIP that issued the INT 0x2E (param 1 to the
+         * compat32_dispatch was the user EIP+offset). The dispatcher
+         * stores it for us; expose it via a getter. */
+        extern uint32_t compat32_get_last_caller_eip(void);
+        uint32_t user_eip = compat32_get_last_caller_eip();
+        if (user_eip) {
+            serial_puts(" userEIP=0x");
+            serial_puthex(user_eip, 8);
+        }
         serial_puts("\n");
     }
 

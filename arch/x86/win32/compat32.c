@@ -121,6 +121,13 @@ static uint8_t *callback_stack_get(int depth) {
 /* Compat macro: callback_stack_get(depth) → callback_stack_get(depth) */
 #define callback_stacks(d) callback_stack_get(d)
 
+/* The last 32-bit caller EIP (stack_args[-1] = the address right
+ * after the CALL into a kernel32_shim API). Updated on every
+ * compat32_dispatch entry. Diagnostic only — read by VirtualAlloc
+ * to identify which engine function makes bogus 4GB requests. */
+uint32_t g_last_caller_eip = 0;
+uint32_t compat32_get_last_caller_eip(void) { return g_last_caller_eip; }
+
 /*
  * Single global retval written by the 32-bit return stub (MOV [addr], EAX).
  * The stub uses a fixed address so we can't index by depth there.
@@ -2095,6 +2102,8 @@ uint64_t compat32_dispatch(uint32_t thunk_idx, uint32_t *stack_args)
         uint32_t ret_addr = stack_args[-1]; /* return address pushed by CALL */
         g_call_trace[g_call_trace_idx % CALL_TRACE_SIZE] = ret_addr;
         g_call_trace_idx++;
+        extern uint32_t g_last_caller_eip;
+        g_last_caller_eip = ret_addr;
     }
 
     /* Clean up null-page stale data from compat32 writes.
