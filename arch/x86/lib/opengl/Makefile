@@ -41,6 +41,7 @@ BUILD_DIR   := $(OSITOK_ROOT)/arch/x86/build/lib/opengl
 OUT          := $(BUILD_DIR)/libmesa_util.a
 OUT_GALLIUM  := $(BUILD_DIR)/libmesa_gallium.a
 OUT_COMPILER := $(BUILD_DIR)/libmesa_compiler.a
+OUT_ZINK     := $(BUILD_DIR)/libmesa_zink.a
 
 CC          ?= gcc
 CXX         ?= g++
@@ -68,6 +69,21 @@ INCLUDES_COMPILER := \
   -I$(MESA_ROOT)/src/compiler/nir \
   -I$(MESA_ROOT)/src/compiler/spirv \
   -I$(OSITOK_ROOT)/arch/x86/lib/vulkan/include
+
+# W4.3 — extended include set for gallium/drivers/zink/.
+# Zink's includes pull from compiler/, vulkan/util/, and gallium/drivers/zink/
+# itself (its own .h files). Plus our renderdoc_app.h vendor and the
+# osito_compat shims for vk_struct_type_cast.h (generated upstream).
+# Important: $(MESA_ROOT)/include comes FIRST so its vulkan_core.h
+# (Mesa 25.0.0, VK_HEADER_VERSION 305) wins over the venus ICD's older
+# 303 header in $(OSITOK_ROOT)/arch/x86/lib/vulkan/include — Mesa's
+# generated dispatch table references VK_HEADER_VERSION 305 symbols.
+INCLUDES_ZINK := \
+  -I$(MESA_ROOT)/include \
+  $(INCLUDES_COMPILER) \
+  -I$(MESA_ROOT)/src/gallium/drivers/zink \
+  -I$(MESA_ROOT)/src/gallium/auxiliary/nir \
+  -I$(MESA_ROOT)/src/vulkan/util
 
 # W4.2 — C++ uses HOSTED gcc:12 libstdc++ (no -nostdinc, no -nostdinc++).
 # We DROP -Imesa/src/c11 because it shadows glibc's <time.h> with mesa's
@@ -125,6 +141,29 @@ CFLAGS_COMPILER := \
   -DHAVE_FUNC_ATTRIBUTE_WARN_UNUSED_RESULT \
   -include $(OPENGL_ROOT)/osito_compat/mesa_compat.h \
   $(INCLUDES_COMPILER) \
+  -isystem $(GCC_INC)
+
+# W4.3 — CFLAGS for gallium/drivers/zink/. Same as CFLAGS_COMPILER but
+# with the zink include path and -DZINK_USE_DXIL=0 / -DZINK_DEBUG=0 to
+# silence any feature-flag-bound code paths we don't need.
+CFLAGS_ZINK := \
+  -std=gnu11 -ffreestanding -nostdinc \
+  -fno-stack-protector -mno-red-zone \
+  -Wall -Wextra -Wno-unused-parameter -Wno-unused-function \
+  -Wno-missing-field-initializers -Wno-pointer-arith \
+  -Wno-sign-compare -Wno-misleading-indentation \
+  -Wno-unused-variable -Wno-unused-but-set-variable \
+  -Wno-implicit-fallthrough -Wno-switch -Wno-empty-body \
+  -O2 -fno-pic -fvisibility=hidden \
+  -D__OSITO_K__ -DZINK -DGALLIUM_HAVE_VK=1 \
+  -DHAVE_FUNC_ATTRIBUTE_PACKED \
+  -DHAVE_FUNC_ATTRIBUTE_FLATTEN \
+  -DHAVE_FUNC_ATTRIBUTE_FORMAT \
+  -DHAVE_FUNC_ATTRIBUTE_UNUSED \
+  -DHAVE_FUNC_ATTRIBUTE_NORETURN \
+  -DHAVE_FUNC_ATTRIBUTE_WARN_UNUSED_RESULT \
+  -include $(OPENGL_ROOT)/osito_compat/mesa_compat.h \
+  $(INCLUDES_ZINK) \
   -isystem $(GCC_INC)
 
 # W4.2 — CXXFLAGS for compiler/glsl/.  Hosted libstdc++ (no -nostdinc).
@@ -275,7 +314,9 @@ GALLIUM_SRCS := \
   mesa/src/gallium/auxiliary/util/u_tile.c \
   mesa/src/gallium/auxiliary/util/u_transfer.c \
   mesa/src/gallium/auxiliary/util/u_transfer_helper.c \
-  mesa/src/gallium/auxiliary/util/u_upload_mgr.c
+  mesa/src/gallium/auxiliary/util/u_upload_mgr.c \
+  mesa/src/gallium/auxiliary/nir/nir_to_spirv/nir_to_spirv.c \
+  mesa/src/gallium/auxiliary/nir/nir_to_spirv/spirv_builder.c
 
 GALLIUM_OBJS := $(patsubst %.c,$(BUILD_DIR)/%.o,$(GALLIUM_SRCS))
 
@@ -360,11 +401,55 @@ COMPILER_C_OBJS   := $(patsubst %.c,$(BUILD_DIR)/%.o,$(COMPILER_C_SRCS))
 COMPILER_CXX_OBJS := $(patsubst %.cpp,$(BUILD_DIR)/%.o,$(COMPILER_CXX_SRCS))
 COMPILER_OBJS     := $(COMPILER_C_OBJS) $(COMPILER_CXX_OBJS)
 
-.PHONY: all clean util gallium compiler
-all: $(OUT) $(OUT_GALLIUM) $(OUT_COMPILER)
+# ---------------------------------------------------------------------------
+# W4.3 — libmesa_zink.a
+# ---------------------------------------------------------------------------
+#
+# Source list explicitly lists each .c we accept.  We start with the
+# simplest leaves (zink_format, zink_lower_cubemap_to_array,
+# zink_format_test) and grow the list as more headers / shims land.
+#
+# Excluded from the initial build (W4.3 - to be revisited in W4.4):
+#   zink_compiler.c   — pulls in the GLSL→NIR pipeline + nir_to_spirv
+#   zink_context.c    — large pipe_context implementation, ~37 includes
+#   zink_screen.c     — driver entrypoint, depends on full Vulkan ICD
+#   zink_draw.cpp     — c++17 driver hot path
+#   zink_synchronization.cpp — c++17 sync primitives
+#   zink_program.c    — gfx pipeline cache, requires u_blitter wiring
+#
+# Anything we couldn't get past header parse stays out and we document it.
+
+ZINK_C_SRCS := \
+  mesa/src/gallium/drivers/zink/zink_format.c \
+  mesa/src/gallium/drivers/zink/zink_format_test.c \
+  mesa/src/gallium/drivers/zink/zink_lower_cubemap_to_array.c \
+  mesa/src/gallium/drivers/zink/zink_device_info.c \
+  mesa/src/gallium/drivers/zink/zink_instance.c \
+  mesa/src/gallium/drivers/zink/zink_nir_algebraic.c \
+  mesa/src/gallium/drivers/zink/zink_bo.c \
+  mesa/src/gallium/drivers/zink/zink_kopper.c \
+  mesa/src/gallium/drivers/zink/zink_descriptors.c \
+  mesa/src/gallium/drivers/zink/zink_framebuffer.c \
+  mesa/src/gallium/drivers/zink/zink_query.c \
+  mesa/src/gallium/drivers/zink/zink_fence.c \
+  mesa/src/gallium/drivers/zink/zink_surface.c \
+  mesa/src/gallium/drivers/zink/zink_batch.c \
+  mesa/src/gallium/drivers/zink/zink_pipeline.c \
+  mesa/src/gallium/drivers/zink/zink_state.c \
+  mesa/src/gallium/drivers/zink/zink_render_pass.c \
+  mesa/src/gallium/drivers/zink/zink_blit.c \
+  mesa/src/gallium/drivers/zink/zink_clear.c \
+  mesa/src/gallium/drivers/zink/zink_resource.c \
+  mesa/src/gallium/drivers/zink/zink_program.c
+
+ZINK_OBJS := $(patsubst %.c,$(BUILD_DIR)/%.o,$(ZINK_C_SRCS))
+
+.PHONY: all clean util gallium compiler zink
+all: $(OUT) $(OUT_GALLIUM) $(OUT_COMPILER) $(OUT_ZINK)
 util: $(OUT)
 gallium: $(OUT_GALLIUM)
 compiler: $(OUT_COMPILER)
+zink: $(OUT_ZINK)
 
 $(OUT): $(UTIL_OBJS) | $(BUILD_DIR)
 	@echo "  AR    $(notdir $@)"
@@ -381,6 +466,11 @@ $(OUT_COMPILER): $(COMPILER_OBJS) | $(BUILD_DIR)
 	@$(AR) rcs $@ $(COMPILER_OBJS)
 	@echo "  -> $$($(AR) t $@ | wc -l) objects in $@"
 
+$(OUT_ZINK): $(ZINK_OBJS) | $(BUILD_DIR)
+	@echo "  AR    $(notdir $@)"
+	@$(AR) rcs $@ $(ZINK_OBJS)
+	@echo "  -> $$($(AR) t $@ | wc -l) objects in $@"
+
 # Default pattern rule for util/gallium (build/lib/opengl/foo/bar.o : foo/bar.c)
 $(BUILD_DIR)/osito_compat/%.o: $(OPENGL_ROOT)/osito_compat/%.c | $(BUILD_DIR)
 	@mkdir -p $(dir $@)
@@ -391,6 +481,16 @@ $(BUILD_DIR)/mesa/src/util/%.o: $(OPENGL_ROOT)/mesa/src/util/%.c | $(BUILD_DIR)
 	@mkdir -p $(dir $@)
 	@echo "  CC    $*"
 	@$(CC) $(CFLAGS) -c -o $@ $<
+
+# nir_to_spirv requires the FULL zink include set (it includes
+# zink_compiler.h transitively, which pulls vk_util.h, vk_dispatch_table.h,
+# kopper_interface.h, etc.). Reuse CFLAGS_ZINK so we get matching headers
+# AND vulkan_core.h v305 (avoids 303-vs-305 drift).
+$(BUILD_DIR)/mesa/src/gallium/auxiliary/nir/nir_to_spirv/%.o: \
+        $(OPENGL_ROOT)/mesa/src/gallium/auxiliary/nir/nir_to_spirv/%.c | $(BUILD_DIR)
+	@mkdir -p $(dir $@)
+	@echo "  CC    nir_to_spirv/$*"
+	@$(CC) $(CFLAGS_ZINK) -c -o $@ $<
 
 $(BUILD_DIR)/mesa/src/gallium/%.o: $(OPENGL_ROOT)/mesa/src/gallium/%.c | $(BUILD_DIR)
 	@mkdir -p $(dir $@)
@@ -418,6 +518,13 @@ $(BUILD_DIR)/mesa/src/compiler/glsl/%.o: $(MESA_ROOT)/src/compiler/glsl/%.cpp | 
 	@mkdir -p $(dir $@)
 	@echo "  CXX   glsl/$*"
 	@$(CXX) $(CXXFLAGS_COMPILER) -c -o $@ $<
+
+# W4.3 pattern rule for gallium/drivers/zink/*.c -> CFLAGS_ZINK.
+# Must come BEFORE the generic gallium rule to win precedence.
+$(BUILD_DIR)/mesa/src/gallium/drivers/zink/%.o: $(MESA_ROOT)/src/gallium/drivers/zink/%.c | $(BUILD_DIR)
+	@mkdir -p $(dir $@)
+	@echo "  CC    zink/$*"
+	@$(CC) $(CFLAGS_ZINK) -c -o $@ $<
 
 $(BUILD_DIR):
 	@mkdir -p $(BUILD_DIR)

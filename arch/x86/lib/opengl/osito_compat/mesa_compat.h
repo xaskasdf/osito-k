@@ -168,6 +168,15 @@ static inline int pthread_create(pthread_t *t, const void *a, void *(*f)(void *)
     (void)t; (void)a; (void)f; (void)arg; return 11; /* EAGAIN — refuse to spawn */
 }
 static inline int pthread_join(pthread_t t, void **r) { (void)t; (void)r; return 0; }
+/* W4.3 — zink uses util/rwlock.h which wraps pthread_rwlock_*. Stub
+ * the type + ops so single-threaded compile works. */
+typedef int pthread_rwlock_t;
+#define PTHREAD_RWLOCK_INITIALIZER 0
+static inline int pthread_rwlock_init(pthread_rwlock_t *l, const void *a) { (void)l; (void)a; return 0; }
+static inline int pthread_rwlock_destroy(pthread_rwlock_t *l) { (void)l; return 0; }
+static inline int pthread_rwlock_rdlock(pthread_rwlock_t *l) { (void)l; return 0; }
+static inline int pthread_rwlock_wrlock(pthread_rwlock_t *l) { (void)l; return 0; }
+static inline int pthread_rwlock_unlock(pthread_rwlock_t *l) { (void)l; return 0; }
 #endif
 
 /* clock_gettime CLOCK_MONOTONIC: reuse our gettimeofday syscall (96) */
