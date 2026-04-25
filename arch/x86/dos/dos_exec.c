@@ -480,8 +480,10 @@ void dos_transfer_to_native(dos_vm_t *vm)
         kernel_gdt[DOS_LDT_GDT_SLOT]     = desc_lo;
         kernel_gdt[DOS_LDT_GDT_SLOT + 1] = desc_hi;
 
-        /* Extend GDTR limit to cover slot 13 and reload. */
-        uint16_t needed = ((DOS_LDT_GDT_SLOT + 2) * 8) - 1;
+        /* Extend GDTR limit to cover slots 13 (LDT desc upper half),
+         * and 14-16 (DOS4GW scratch slot for synthesized real-mode
+         * segment aliases — see dos_int.c MOV Sreg handler). */
+        uint16_t needed = (17 * 8) - 1;  /* slots 0..16 inclusive */
         if (kernel_gdtr.limit < needed) {
             kernel_gdtr.limit = needed;
             __asm__ volatile ("lgdt %0" : : "m"(kernel_gdtr));

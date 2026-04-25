@@ -482,20 +482,49 @@ int dos_native_emulate_lretw(void *frame_ptr)
         } else if (mod == 2) {
             len += 2;
         }
-        /* Skipping isn't enough — DOOM actually uses the segreg right
-         * after. Load a known-valid selector (current DS, which was set
-         * up during the native transfer) into the target segreg so the
-         * subsequent memory access doesn't re-fault. This loses DOOM's
-         * intended selector, but keeps forward progress for DOS4GW's
-         * quirky patterns. */
         /* Select target segreg:
          *   MOV Sreg: ModR/M reg field (0=ES,3=DS,4=FS,5=GS).
          *   LES: ES.  LDS: DS. */
         uint8_t sreg = opc_is_mov_seg ? ((opc_modrm >> 3) & 7)
                      : opc_is_les     ? 0
                      :                  3; /* lds */
-        uint16_t safe_sel = (uint16_t)vm->cpu->ds;
-        if ((safe_sel & 0x04) == 0) safe_sel = (uint16_t)f->cs;  /* fallback */
+        /* Strategy: treat the failing selector value as a real-mode
+         * segment number and synthesize a 64KB data descriptor whose
+         * base is (sel * 16). DOS4GW often passes raw RM-style segment
+         * values to PM-mode segreg loads when bridging through DPMI
+         * functions (especially during relocation walks). Aliasing all
+         * loads to a single fixed sel kept DOOM stuck in a tight loop
+         * because every cmp es:[bx] dereferenced the same place; with
+         * a per-selector base the dereferences hit different memory
+         * and the loop can actually terminate.
+         *
+         * The base is clamped into [0, total_mem - 0x10000] so we never
+         * generate a descriptor pointing past vm->mem. We use kernel
+         * GDT slot 14 as a single rolling scratch — only one segreg can
+         * be in flight per fault, so reuse is safe across faults. */
+        uint16_t bad_sel = (uint16_t)f->error_code;
+        uint32_t synth_base = (uint32_t)bad_sel * 16u;
+        if (synth_base + 0x10000u > vm->total_mem_size)
+            synth_base = vm->total_mem_size > 0x10000u
+                       ? vm->total_mem_size - 0x10000u : 0;
+        extern uint64_t kernel_gdt[];
+        const int SCRATCH_SLOT = 14;
+        uint64_t scratch_desc =
+              ((uint64_t)0xFFFF)                              /* limit[15:0]   */
+            | ((uint64_t)(synth_base & 0xFFFF) << 16)         /* base[15:0]    */
+            | ((uint64_t)((synth_base >> 16) & 0xFF) << 32)   /* base[23:16]   */
+            | ((uint64_t)0x92 << 40)                          /* P|DPL|S|type=2*/
+            | ((uint64_t)0x00 << 52)                          /* flags+limit hi*/
+            | ((uint64_t)((synth_base >> 24) & 0xFF) << 56);  /* base[31:24]   */
+        kernel_gdt[SCRATCH_SLOT] = scratch_desc;
+        uint16_t safe_sel = (uint16_t)(SCRATCH_SLOT << 3);
+        /* If the synth base was clamped to 0 and the original sel was
+         * also nonsensical, fall back to current DS so we at least have
+         * a writable segment. */
+        if (synth_base == 0 && bad_sel != 0) {
+            uint16_t cpu_ds = (uint16_t)vm->cpu->ds;
+            if (cpu_ds & 0x04) safe_sel = cpu_ds;
+        }
         /* Load the target segment register NOW. iretq won't restore
          * ES/DS/FS/GS in same-CPL transitions, so this sticks. */
         switch (sreg) {
@@ -839,14 +868,15 @@ void dos_int_native_dispatch(uint64_t int_num, dos_native_regs_t *regs)
     cpu->protected_mode = true;
     cpu->vm = vm;
 
-    /* Log non-trivial INTs */
+    /* Log INTs — first 50 verbose, then every 256th to keep noise down */
     static uint32_t native_int_count = 0;
-    if (native_int_count < 50) {
-        native_int_count++;
+    native_int_count++;
+    if (native_int_count < 50 || (native_int_count & 0xFF) == 0) {
         serial_puts("[DOS32] INT ");
         serial_puthex(int_num, 2);
         serial_puts("h AH=");
         serial_puthex(cpu->ah, 2);
+        serial_puts(" #"); serial_putdec(native_int_count);
         serial_puts("\n");
     }
 
