@@ -749,17 +749,15 @@ MAIN_C_OBJS        := $(patsubst %.c,$(BUILD_DIR)/%.o,$(MAIN_C_SRCS_ALL_LIST))
 
 # W4.8 — C++ TUs in mesa/main + mesa/state_tracker. These define
 # _mesa_uniform, _mesa_program_resource_*, st_link_shader, st_finalize_nir,
-# astc decoder LUTs, etc.  Built with CXXFLAGS_MAIN (hosted libstdc++).
+# astc decoder LUTs, etc. Built with CXXFLAGS_MAIN_CROSS (ositok cross g++
+# + libstdc++ from sysroot — same recipe verified on uniform_query.cpp).
 #
-# NOTE: requires a *hosted* g++ that targets x86_64-linux (i.e. libstdc++
-# headers + Linux glibc headers visible). On Linux Mesa builds this
-# matches `g++-12` (or whatever host gcc is). On macOS the bare
-# x86_64-elf-g++ lacks libstdc++ headers (cstdint), and host clang/g++
-# targets darwin not Linux. Set CXX_HOST=g++-12 (Linux) before invoking
-# `make` to pick these up.  Empty by default so the Mac dev workflow
-# keeps building libGL.a without the C++ TUs.
-CXX_HOST ?=
-ifneq ($(CXX_HOST),)
+# Uses CXX_CROSS (the x86_64-pc-ositok-musl-g++ cross compiler) and SYSROOT
+# (toolchain sysroot containing usr/include/c++/13.2.0 + libstdc++.a).
+# Both have sensible defaults so `make` Just Works on the dev box.
+CXX_CROSS ?= /Users/pc/ok-ported/toolchain/cross-bin/x86_64-pc-ositok-musl-g++
+SYSROOT   ?= /Users/pc/ok-ported/toolchain/sysroot
+
 MAIN_CXX_SRCS := \
   mesa/src/mesa/main/uniform_query.cpp \
   mesa/src/mesa/main/shader_query.cpp \
@@ -769,7 +767,6 @@ MAIN_CXX_SRCS := \
 
 MAIN_CXX_OBJS := $(patsubst %.cpp,$(BUILD_DIR)/%.o,$(MAIN_CXX_SRCS))
 MAIN_C_OBJS   := $(MAIN_C_OBJS) $(MAIN_CXX_OBJS)
-endif
 
 .PHONY: all clean util gallium compiler zink main libgl
 all: $(OUT) $(OUT_GALLIUM) $(OUT_COMPILER) $(OUT_ZINK) $(OUT_MAIN) $(OUT_GL)
@@ -991,48 +988,48 @@ $(BUILD_DIR)/mesa/src/vulkan/util/%.o: $(MESA_ROOT)/src/vulkan/util/%.c | $(BUIL
 	@$(CC) $(CFLAGS_ZINK) -c -o $@ $<
 
 # CXXFLAGS_MAIN — for mesa/main/*.cpp and mesa/state_tracker/*.cpp.
-# Mirrors CXXFLAGS_COMPILER (hosted libstdc++): NO -nostdinc, so libstdc++
-# headers are visible (cstdint, vector, string, etc.).
+# VERIFIED RECIPE: uses ositok cross g++ + libstdc++ via --sysroot.
+# CRITICAL: must NOT include -I mesa/src/c11 — Mesa's c11/time.h shadows
+# the libstdc++ search for system <time.h>, breaking time_t. (The C build
+# is fine because mesa_compat.h wraps things differently in C mode.)
 CXXFLAGS_MAIN := \
-  -std=gnu++17 -fno-exceptions -fno-rtti \
-  -ffreestanding -fno-stack-protector -mno-red-zone \
-  -Wall -Wextra -Wno-unused-parameter -Wno-unused-function \
-  -Wno-missing-field-initializers -Wno-pointer-arith \
-  -Wno-sign-compare -Wno-unused-variable -Wno-unused-but-set-variable \
-  -Wno-non-virtual-dtor -Wno-deprecated-declarations \
-  -Wno-class-memaccess -Wno-stringop-truncation \
-  -Wno-implicit-fallthrough -Wno-switch -Wno-empty-body \
-  -O2 -fno-pic -fvisibility=hidden \
-  -D__OSITO_K__ -DHAVE_PTHREAD=1 \
-  -DHAVE_OPENGL=1 -DHAVE_OPENGL_ES_1=0 -DHAVE_OPENGL_ES_2=0 \
-  -DMAPI_MODE_GLAPI -DMAPI_ABI_HEADER='"shared-glapi/glapi_mapi_tmp.h"' \
-  '-DPACKAGE_VERSION="25.0.0-osito"' \
-  '-DPACKAGE_BUGREPORT="https://github.com/xaskasdf/osito-k"' \
-  -DHAVE_FUNC_ATTRIBUTE_PACKED \
-  -DHAVE_FUNC_ATTRIBUTE_FLATTEN \
-  -DHAVE_FUNC_ATTRIBUTE_FORMAT \
-  -DHAVE_FUNC_ATTRIBUTE_UNUSED \
-  -DHAVE_FUNC_ATTRIBUTE_NORETURN \
-  -DHAVE_FUNC_ATTRIBUTE_WARN_UNUSED_RESULT \
-  -include $(OPENGL_ROOT)/osito_compat/mesa_compat.h \
-  $(INCLUDES_COMPILER_CXX) \
+  --sysroot=$(SYSROOT) \
+  -isystem $(SYSROOT)/usr/include/c++/13.2.0 \
+  -isystem $(SYSROOT)/usr/include/c++/13.2.0/x86_64-pc-ositok-musl \
+  -isystem $(SYSROOT)/usr/include/c++/13.2.0/backward \
+  -isystem $(SYSROOT)/usr/include \
+  -I$(OPENGL_ROOT)/mesa/include \
+  -I$(OPENGL_ROOT)/include \
+  -I$(OPENGL_ROOT)/include/GL \
+  -I$(OPENGL_ROOT)/osito_compat \
+  -I$(MESA_ROOT)/src \
+  -I$(MESA_ROOT)/src/util \
+  -I$(MESA_ROOT)/src/gallium/include \
+  -I$(MESA_ROOT)/src/gallium/auxiliary \
+  -I$(MESA_ROOT)/src/compiler \
+  -I$(MESA_ROOT)/src/compiler/glsl \
+  -I$(MESA_ROOT)/src/compiler/nir \
+  -I$(MESA_ROOT)/src/mesa \
+  -I$(MESA_ROOT)/src/mesa/main \
+  -I$(MESA_ROOT)/src/mapi \
   -I$(MESA_ROOT)/src/mapi/shared-glapi \
-  -I$(MESA_ROOT)/src/gallium/drivers/zink \
-  -I$(MESA_ROOT)/src/gallium/auxiliary/nir \
-  -I$(MESA_ROOT)/src/vulkan/util \
-  -isystem $(GCC_INC)
+  -I$(OSITOK_ROOT)/arch/x86/lib/vulkan/include \
+  -include $(OPENGL_ROOT)/osito_compat/mesa_compat.h \
+  -DHAVE_PTHREAD=1 -DHAVE_OPENGL=1 \
+  '-DPACKAGE_VERSION="25-osito"' '-DPACKAGE_BUGREPORT=""' \
+  -DMAPI_MODE_GLAPI -DMAPI_ABI_HEADER='"shared-glapi/glapi_mapi_tmp.h"' \
+  -O2 -Wno-narrowing -Wno-unused-parameter -Wno-error
 
-# W4.8 — C++ TUs.  Use CXX_HOST (a hosted Linux g++) when set; otherwise
-# the rule simply isn't invoked because MAIN_CXX_SRCS is empty.
+# W4.8 — C++ TUs.  Built with CXX_CROSS (ositok cross g++ + libstdc++).
 $(BUILD_DIR)/mesa/src/mesa/main/%.o: $(MESA_ROOT)/src/mesa/main/%.cpp | $(BUILD_DIR)
 	@mkdir -p $(dir $@)
 	@echo "  CXX   main/$*"
-	@$(CXX_HOST) $(CXXFLAGS_MAIN) -c -o $@ $<
+	@$(CXX_CROSS) $(CXXFLAGS_MAIN) -c -o $@ $<
 
 $(BUILD_DIR)/mesa/src/mesa/state_tracker/%.o: $(MESA_ROOT)/src/mesa/state_tracker/%.cpp | $(BUILD_DIR)
 	@mkdir -p $(dir $@)
 	@echo "  CXX   state_tracker/$*"
-	@$(CXX_HOST) $(CXXFLAGS_MAIN) -c -o $@ $<
+	@$(CXX_CROSS) $(CXXFLAGS_MAIN) -c -o $@ $<
 
 $(BUILD_DIR):
 	@mkdir -p $(BUILD_DIR)

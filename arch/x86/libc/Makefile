@@ -84,13 +84,19 @@ hello_c.elf: $(TEST)/hello_c.elf
 # Links against build/lib/opengl/libGL.a + build/lib/vulkan/libvulkan.a
 # (and the supporting Mesa static libs needed by libGL).
 GL_INC := -I../lib/opengl/include -I../lib/opengl/mesa/include
+# libstdc++ + libsupc++ from cross sysroot — Mesa's GLSL frontend (compiler/glsl/*.cpp)
+# and the new mesa/main/*.cpp / state_tracker/*.cpp TUs use std::vector,
+# std::unordered_map, etc. plus the C++ ABI runtime (vtables, typeinfo).
+SYSROOT_LIB := /Users/pc/ok-ported/toolchain/sysroot/usr/lib
 GL_LIBS := $(BUILD)/lib/opengl/libGL.a \
            $(BUILD)/lib/opengl/libmesa_main.a \
            $(BUILD)/lib/opengl/libmesa_zink.a \
            $(BUILD)/lib/opengl/libmesa_gallium.a \
            $(BUILD)/lib/opengl/libmesa_compiler.a \
            $(BUILD)/lib/opengl/libmesa_util.a \
-           $(BUILD)/lib/vulkan/libvulkan.a
+           $(BUILD)/lib/vulkan/libvulkan.a \
+           $(SYSROOT_LIB)/libstdc++.a \
+           $(SYSROOT_LIB)/libsupc++.a
 
 # Use the cross-toolchain explicitly (matches how the prebuilt libGL.a was
 # produced — system 'ld' on macOS doesn't speak the ELF flag set).
