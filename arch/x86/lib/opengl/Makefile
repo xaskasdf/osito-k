@@ -743,6 +743,14 @@ $(BUILD_DIR)/osito_compat/zink_%.o: $(OPENGL_ROOT)/osito_compat/zink_%.c | $(BUI
 	@echo "  CC    osito_compat/zink_$*"
 	@$(CC) $(CFLAGS_ZINK) -c -o $@ $<
 
+# W4.7a — okgl_context.c now includes pipe/p_screen.h directly, which
+# transitively pulls util/u_endian.h -> <machine/endian.h>. Use the same
+# header set as the rest of the zink/gallium build.
+$(BUILD_DIR)/osito_compat/okgl_context.o: $(OPENGL_ROOT)/osito_compat/okgl_context.c | $(BUILD_DIR)
+	@mkdir -p $(dir $@)
+	@echo "  CC    osito_compat/okgl_context"
+	@$(CC) $(CFLAGS_ZINK) -c -o $@ $<
+
 # Default pattern rule for util/gallium (build/lib/opengl/foo/bar.o : foo/bar.c)
 $(BUILD_DIR)/osito_compat/%.o: $(OPENGL_ROOT)/osito_compat/%.c | $(BUILD_DIR)
 	@mkdir -p $(dir $@)

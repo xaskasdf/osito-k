@@ -69,10 +69,10 @@ extern VkResult vkCreateInstance(const VkInstanceCreateInfo *, const void *, VkI
 extern void     vkDestroyInstance(VkInstance, const void *);
 extern VkResult vkEnumeratePhysicalDevices(VkInstance, uint32_t *, VkPhysicalDevice *);
 
-/* From libmesa_zink.a (osito_compat/zink_screen_ositok.c) — forward
- * declared so we don't have to include p_screen.h here. */
-struct pipe_screen;
-struct pipe_context;
+/* From libmesa_zink.a (osito_compat/zink_screen_ositok.c). We pull in
+ * the full p_screen.h so we can call screen->context_create() directly
+ * (W4.7a). */
+#include "pipe/p_screen.h"
 extern struct pipe_screen *
 okGLZinkCreateScreen(VkInstance instance, VkPhysicalDevice phys);
 
@@ -173,25 +173,16 @@ okGLCreateContext(uint32_t window_id, int width, int height)
         return NULL;
     }
 
-    /* Step 4 — pipe_context.  The vtable is a `struct pipe_screen *`
-     * pointing into Mesa internals; calling screen->context_create(...)
-     * requires the full p_screen.h definition.  We forward-declare the
-     * function pointer offset and call through it.
-     *
-     * pipe_screen's first public field is destroy(), then the property
-     * getters, then context_create at offset (depends on Mesa version).
-     * Rather than hard-code the offset, we let the link line resolve a
-     * thin shim that *does* have the full header included.  That shim
-     * is okGLZinkCreateContext below — it lives in this same file and
-     * can pull p_screen.h because we'll add the include path on the
-     * link of this TU only. For W4.6 build-acceptance we leave the
-     * pipe_context as NULL — the hello-gl-* tests use okGLMakeCurrent
-     * which will fail gracefully if pipe is NULL.
-     *
-     * TODO(W4.7): include "pipe/p_screen.h" here and call
-     * ctx->pipe = ctx->screen->context_create(ctx->screen, NULL, 0);
-     */
-    ctx->pipe = NULL;
+    /* Step 4 — pipe_context (W4.7a). With p_screen.h included above
+     * we can call context_create through the vtable directly. */
+    ctx->pipe = ctx->screen->context_create(ctx->screen, NULL, 0);
+    if (!ctx->pipe) {
+        printf("okGL: pipe_screen->context_create failed\n");
+        ctx->screen->destroy(ctx->screen);
+        vkDestroyInstance(ctx->instance, NULL);
+        free(ctx);
+        return NULL;
+    }
 
     /* Step 5 — st_create_context wires Mesa's dispatch table to ctx->pipe.
      * Build-only for W4.6: skip when pipe is NULL to avoid a crash, but

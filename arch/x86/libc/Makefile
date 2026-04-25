@@ -68,6 +68,37 @@ $(TEST)/hello_c.elf: $(LIBC)/crt.o $(LIBC)/syscall.o $(TEST)/hello_c.c
 
 hello_c.elf: $(TEST)/hello_c.elf
 
+# ── Build minimal OpenGL smoke test (W4.7c) ──
+# Links against build/lib/opengl/libGL.a + build/lib/vulkan/libvulkan.a
+# (and the supporting Mesa static libs needed by libGL).
+GL_INC := -I../lib/opengl/include -I../lib/opengl/mesa/include
+GL_LIBS := $(BUILD)/lib/opengl/libGL.a \
+           $(BUILD)/lib/opengl/libmesa_main.a \
+           $(BUILD)/lib/opengl/libmesa_zink.a \
+           $(BUILD)/lib/opengl/libmesa_gallium.a \
+           $(BUILD)/lib/opengl/libmesa_compiler.a \
+           $(BUILD)/lib/opengl/libmesa_util.a \
+           $(BUILD)/lib/vulkan/libvulkan.a
+
+# Use the cross-toolchain explicitly (matches how the prebuilt libGL.a was
+# produced — system 'ld' on macOS doesn't speak the ELF flag set).
+XCC ?= x86_64-elf-gcc
+XLD ?= x86_64-elf-ld
+
+$(TEST)/hello_gl.elf: $(LIBC)/crt.o $(LIBC)/syscall.o $(LIBC)/math.o $(LIBC)/malloc.o $(TEST)/hello_gl.c
+	$(XCC) -c -O2 -fno-pie -ffreestanding -nostdinc \
+	    $(GL_INC) -isystem qjs_headers \
+	    $(TEST)/hello_gl.c -o $(BUILD)/hello_gl.o
+	$(XLD) -nostdlib -static -no-pie -e _start -Ttext=0x401000 \
+	    --defsym=__dso_handle=0 \
+	    $(LIBC)/crt.o $(LIBC)/syscall.o $(LIBC)/math.o $(LIBC)/malloc.o \
+	    $(BUILD)/hello_gl.o \
+	    --start-group $(GL_LIBS) --end-group \
+	    -o $@
+	@ls -lh $@
+
+hello_gl.elf: $(TEST)/hello_gl.elf
+
 # ── Build TCC for OsitoK ──
 TCC_OBJ := $(BUILD)/tcc.o
 
