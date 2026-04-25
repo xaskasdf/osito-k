@@ -27,7 +27,14 @@ namespace dxvk {
     this->forceSampleRateShading = config.getOption<bool>("d3d11.forceSampleRateShading", false);
     this->disableMsaa           = config.getOption<bool>("d3d11.disableMsaa", false);
     this->enableContextLock     = config.getOption<bool>("d3d11.enableContextLock", false);
+#ifdef __OSITO_K__
+    /* OsitoK W5.4: D3D11SwapChain ctor calls RecreateSwapChain eagerly
+     * when this is false. On OsitoK the WSI surface is set up lazily,
+     * so eager creation hits a NULL-surface abort loop. Force defer.   */
+    this->deferSurfaceCreation  = true;
+#else
     this->deferSurfaceCreation  = config.getOption<bool>("dxgi.deferSurfaceCreation", false);
+#endif
     this->numBackBuffers        = config.getOption<int32_t>("dxgi.numBackBuffers", 0);
     this->maxFrameLatency       = config.getOption<int32_t>("dxgi.maxFrameLatency", 0);
     this->exposeDriverCommandLists = config.getOption<bool>("d3d11.exposeDriverCommandLists", true);
