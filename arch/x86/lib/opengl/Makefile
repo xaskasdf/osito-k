@@ -323,7 +323,29 @@ UTIL_SRCS := \
   mesa/src/util/u_printf.c \
   mesa/src/util/u_vector.c \
   mesa/src/util/u_worklist.c \
-  mesa/src/util/vma.c
+  mesa/src/util/vma.c \
+  mesa/src/util/u_cpu_detect.c \
+  mesa/src/util/u_debug.c \
+  mesa/src/util/u_queue.c \
+  mesa/src/util/u_process.c \
+  mesa/src/util/u_dl.c \
+  mesa/src/util/os_misc.c \
+  mesa/src/util/rwlock.c \
+  mesa/src/util/futex.c \
+  mesa/src/util/streaming-load-memcpy.c \
+  mesa/src/util/helpers.c \
+  mesa/src/util/thread_sched.c \
+  mesa/src/util/build_id.c \
+  mesa/src/util/perf/u_trace.c \
+  mesa/src/util/blake3/blake3.c \
+  mesa/src/util/blake3/blake3_dispatch.c \
+  mesa/src/util/blake3/blake3_portable.c
+
+# u_cpu_detect.c, os_file.c, etc. were excluded earlier because
+# os_misc.c is already in the list — duplicate elimination relies on
+# Make's ordered-only behavior.  We strip duplicates explicitly to keep
+# the OBJS list unique.
+UTIL_SRCS := $(sort $(UTIL_SRCS))
 
 UTIL_OBJS := $(patsubst %.c,$(BUILD_DIR)/%.o,$(UTIL_SRCS))
 
@@ -410,7 +432,27 @@ GALLIUM_SRCS := \
   mesa/src/gallium/auxiliary/util/u_transfer_helper.c \
   mesa/src/gallium/auxiliary/util/u_upload_mgr.c \
   mesa/src/gallium/auxiliary/nir/nir_to_spirv/nir_to_spirv.c \
-  mesa/src/gallium/auxiliary/nir/nir_to_spirv/spirv_builder.c
+  mesa/src/gallium/auxiliary/nir/nir_to_spirv/spirv_builder.c \
+  mesa/src/gallium/auxiliary/cso_cache/cso_context.c \
+  mesa/src/gallium/auxiliary/util/u_threaded_context.c \
+  mesa/src/gallium/auxiliary/util/u_live_shader_cache.c \
+  mesa/src/gallium/auxiliary/util/u_vertex_state_cache.c \
+  mesa/src/gallium/auxiliary/util/u_threaded_context.c \
+  mesa/src/gallium/auxiliary/nir/nir_to_tgsi.c \
+  mesa/src/gallium/auxiliary/nir/tgsi_to_nir.c \
+
+# W4.8 — gallium/auxiliary/draw/  (draw_context + non-LLVM passes)
+# draw_llvm.c, draw_pt_fetch_shade_pipeline_llvm.c, draw_vs_llvm.c are
+# excluded (require gallivm/LLVM jit not vendored).
+DRAW_C_SRCS_ALL  := $(wildcard $(MESA_ROOT)/src/gallium/auxiliary/draw/*.c)
+DRAW_C_EXCLUDE   := \
+  $(MESA_ROOT)/src/gallium/auxiliary/draw/draw_llvm.c \
+  $(MESA_ROOT)/src/gallium/auxiliary/draw/draw_vs_llvm.c \
+  $(MESA_ROOT)/src/gallium/auxiliary/draw/draw_pt_fetch_shade_pipeline_llvm.c
+DRAW_C_SRCS_ABS  := $(filter-out $(DRAW_C_EXCLUDE), $(DRAW_C_SRCS_ALL))
+DRAW_C_SRCS      := $(patsubst $(OPENGL_ROOT)/%,%,$(DRAW_C_SRCS_ABS))
+
+GALLIUM_SRCS := $(sort $(GALLIUM_SRCS) $(DRAW_C_SRCS))
 
 GALLIUM_OBJS := $(patsubst %.c,$(BUILD_DIR)/%.o,$(GALLIUM_SRCS))
 
@@ -467,7 +509,22 @@ COMPILER_TOP_SRCS    := \
   $(MESA_ROOT)/src/compiler/builtin_types.c \
   $(MESA_ROOT)/src/compiler/shader_enums.c
 
-COMPILER_C_SRCS_ABS  := $(COMPILER_TOP_SRCS) $(COMPILER_NIR_SRCS) $(COMPILER_SPIRV_SRCS)
+# W4.8 — gl_nir_*.c (compiler/glsl/) and glcpp pre-processor.  All .c
+# files in compiler/glsl/ except the .y/.l outputs already handled.
+COMPILER_GLSL_C_SRCS := $(wildcard $(MESA_ROOT)/src/compiler/glsl/*.c)
+COMPILER_GLCPP_SRCS  := \
+  $(MESA_ROOT)/src/compiler/glsl/glcpp/pp.c \
+  $(MESA_ROOT)/src/compiler/glsl/glcpp/pp_standalone_scaffolding.c
+
+# W4.8 — vulkan/util/  (vk_dispatch_table, vk_enum_to_str, vk_extensions)
+VK_UTIL_SRCS         := \
+  $(MESA_ROOT)/src/vulkan/util/vk_dispatch_table.c \
+  $(MESA_ROOT)/src/vulkan/util/vk_enum_to_str.c \
+  $(MESA_ROOT)/src/vulkan/util/vk_extensions.c
+
+COMPILER_C_SRCS_ABS  := $(COMPILER_TOP_SRCS) $(COMPILER_NIR_SRCS) \
+                        $(COMPILER_SPIRV_SRCS) $(COMPILER_GLSL_C_SRCS) \
+                        $(COMPILER_GLCPP_SRCS) $(VK_UTIL_SRCS)
 # strip $(OPENGL_ROOT)/ prefix to get relative paths for the build rule
 COMPILER_C_SRCS      := $(patsubst $(OPENGL_ROOT)/%,%,$(COMPILER_C_SRCS_ABS))
 
@@ -681,8 +738,38 @@ ST_C_SRCS_ALL      := $(wildcard $(MESA_ROOT)/src/mesa/state_tracker/*.c)
 ST_C_SRCS_ABS      := $(ST_C_SRCS_ALL)
 ST_C_SRCS          := $(patsubst $(OPENGL_ROOT)/%,%,$(ST_C_SRCS_ABS))
 
-MAIN_C_SRCS_ALL_LIST := $(MAIN_C_SRCS) $(MAPI_C_SRCS) $(PROGRAM_C_SRCS) $(VBO_C_SRCS) $(ST_C_SRCS)
+# W4.8 — mesa/math/ (matrix + bezier eval helpers)
+MATH_C_SRCS_ABS    := \
+  $(MESA_ROOT)/src/mesa/math/m_eval.c \
+  $(MESA_ROOT)/src/mesa/math/m_matrix.c
+MATH_C_SRCS        := $(patsubst $(OPENGL_ROOT)/%,%,$(MATH_C_SRCS_ABS))
+
+MAIN_C_SRCS_ALL_LIST := $(MAIN_C_SRCS) $(MAPI_C_SRCS) $(PROGRAM_C_SRCS) $(VBO_C_SRCS) $(ST_C_SRCS) $(MATH_C_SRCS)
 MAIN_C_OBJS        := $(patsubst %.c,$(BUILD_DIR)/%.o,$(MAIN_C_SRCS_ALL_LIST))
+
+# W4.8 — C++ TUs in mesa/main + mesa/state_tracker. These define
+# _mesa_uniform, _mesa_program_resource_*, st_link_shader, st_finalize_nir,
+# astc decoder LUTs, etc.  Built with CXXFLAGS_MAIN (hosted libstdc++).
+#
+# NOTE: requires a *hosted* g++ that targets x86_64-linux (i.e. libstdc++
+# headers + Linux glibc headers visible). On Linux Mesa builds this
+# matches `g++-12` (or whatever host gcc is). On macOS the bare
+# x86_64-elf-g++ lacks libstdc++ headers (cstdint), and host clang/g++
+# targets darwin not Linux. Set CXX_HOST=g++-12 (Linux) before invoking
+# `make` to pick these up.  Empty by default so the Mac dev workflow
+# keeps building libGL.a without the C++ TUs.
+CXX_HOST ?=
+ifneq ($(CXX_HOST),)
+MAIN_CXX_SRCS := \
+  mesa/src/mesa/main/uniform_query.cpp \
+  mesa/src/mesa/main/shader_query.cpp \
+  mesa/src/mesa/main/texcompress_astc.cpp \
+  mesa/src/mesa/state_tracker/st_atom_array.cpp \
+  mesa/src/mesa/state_tracker/st_glsl_to_nir.cpp
+
+MAIN_CXX_OBJS := $(patsubst %.cpp,$(BUILD_DIR)/%.o,$(MAIN_CXX_SRCS))
+MAIN_C_OBJS   := $(MAIN_C_OBJS) $(MAIN_CXX_OBJS)
+endif
 
 .PHONY: all clean util gallium compiler zink main libgl
 all: $(OUT) $(OUT_GALLIUM) $(OUT_COMPILER) $(OUT_ZINK) $(OUT_MAIN) $(OUT_GL)
@@ -762,6 +849,20 @@ $(BUILD_DIR)/mesa/src/util/%.o: $(OPENGL_ROOT)/mesa/src/util/%.c | $(BUILD_DIR)
 	@echo "  CC    $*"
 	@$(CC) $(CFLAGS) -c -o $@ $<
 
+# W4.8 — gallium/auxiliary/draw/ needs nir.h from compiler/nir
+$(BUILD_DIR)/mesa/src/gallium/auxiliary/draw/%.o: \
+        $(OPENGL_ROOT)/mesa/src/gallium/auxiliary/draw/%.c | $(BUILD_DIR)
+	@mkdir -p $(dir $@)
+	@echo "  CC    draw/$*"
+	@$(CC) $(CFLAGS_MAIN) -c -o $@ $<
+
+# nir_to_tgsi.c, nir_to_tgsi_info.c, tgsi_to_nir.c need MAIN includes
+$(BUILD_DIR)/mesa/src/gallium/auxiliary/nir/%.o: \
+        $(OPENGL_ROOT)/mesa/src/gallium/auxiliary/nir/%.c | $(BUILD_DIR)
+	@mkdir -p $(dir $@)
+	@echo "  CC    aux/nir/$*"
+	@$(CC) $(CFLAGS_MAIN) -c -o $@ $<
+
 # nir_to_spirv requires the FULL zink include set (it includes
 # zink_compiler.h transitively, which pulls vk_util.h, vk_dispatch_table.h,
 # kopper_interface.h, etc.). Reuse CFLAGS_ZINK so we get matching headers
@@ -787,6 +888,19 @@ $(BUILD_DIR)/mesa/src/compiler/spirv/%.o: $(MESA_ROOT)/src/compiler/spirv/%.c | 
 	@mkdir -p $(dir $@)
 	@echo "  CC    spirv/$*"
 	@$(CC) $(CFLAGS_COMPILER) -c -o $@ $<
+
+# W4.8 — compiler/glsl/glcpp/ preprocessor (must precede compiler/glsl/%.c)
+$(BUILD_DIR)/mesa/src/compiler/glsl/glcpp/%.o: $(MESA_ROOT)/src/compiler/glsl/glcpp/%.c | $(BUILD_DIR)
+	@mkdir -p $(dir $@)
+	@echo "  CC    glcpp/$*"
+	@$(CC) $(CFLAGS_MAIN) -c -o $@ $<
+
+# W4.8 — compiler/glsl/ C files (gl_nir_*.c). Must precede generic
+# compiler/%.c rule below so this wins via "first match".
+$(BUILD_DIR)/mesa/src/compiler/glsl/%.o: $(MESA_ROOT)/src/compiler/glsl/%.c | $(BUILD_DIR)
+	@mkdir -p $(dir $@)
+	@echo "  CC    glsl/$*"
+	@$(CC) $(CFLAGS_MAIN) -c -o $@ $<
 
 $(BUILD_DIR)/mesa/src/compiler/%.o: $(MESA_ROOT)/src/compiler/%.c | $(BUILD_DIR)
 	@mkdir -p $(dir $@)
@@ -850,6 +964,75 @@ $(BUILD_DIR)/mesa/src/mapi/%.o: $(MESA_ROOT)/src/mapi/%.c | $(BUILD_DIR)
 	@mkdir -p $(dir $@)
 	@echo "  CC    mapi/$*"
 	@$(CC) $(CFLAGS_MAIN) -c -o $@ $<
+
+# W4.8 — additional pattern rules.
+
+# mesa/math/ — uses CFLAGS (matrix + bezier eval; no main/ deps needed).
+$(BUILD_DIR)/mesa/src/mesa/math/%.o: $(MESA_ROOT)/src/mesa/math/%.c | $(BUILD_DIR)
+	@mkdir -p $(dir $@)
+	@echo "  CC    mesa/math/$*"
+	@$(CC) $(CFLAGS_MAIN) -c -o $@ $<
+
+# util/perf/, util/blake3/ — same CFLAGS as util/.
+$(BUILD_DIR)/mesa/src/util/perf/%.o: $(MESA_ROOT)/src/util/perf/%.c | $(BUILD_DIR)
+	@mkdir -p $(dir $@)
+	@echo "  CC    util/perf/$*"
+	@$(CC) $(CFLAGS) -c -o $@ $<
+
+$(BUILD_DIR)/mesa/src/util/blake3/%.o: $(MESA_ROOT)/src/util/blake3/%.c | $(BUILD_DIR)
+	@mkdir -p $(dir $@)
+	@echo "  CC    util/blake3/$*"
+	@$(CC) $(CFLAGS) -c -o $@ $<
+
+# vulkan/util/ — same as compiler (uses vk headers from include/).
+$(BUILD_DIR)/mesa/src/vulkan/util/%.o: $(MESA_ROOT)/src/vulkan/util/%.c | $(BUILD_DIR)
+	@mkdir -p $(dir $@)
+	@echo "  CC    vulkan/util/$*"
+	@$(CC) $(CFLAGS_ZINK) -c -o $@ $<
+
+# CXXFLAGS_MAIN — for mesa/main/*.cpp and mesa/state_tracker/*.cpp.
+# Mirrors CXXFLAGS_COMPILER (hosted libstdc++): NO -nostdinc, so libstdc++
+# headers are visible (cstdint, vector, string, etc.).
+CXXFLAGS_MAIN := \
+  -std=gnu++17 -fno-exceptions -fno-rtti \
+  -ffreestanding -fno-stack-protector -mno-red-zone \
+  -Wall -Wextra -Wno-unused-parameter -Wno-unused-function \
+  -Wno-missing-field-initializers -Wno-pointer-arith \
+  -Wno-sign-compare -Wno-unused-variable -Wno-unused-but-set-variable \
+  -Wno-non-virtual-dtor -Wno-deprecated-declarations \
+  -Wno-class-memaccess -Wno-stringop-truncation \
+  -Wno-implicit-fallthrough -Wno-switch -Wno-empty-body \
+  -O2 -fno-pic -fvisibility=hidden \
+  -D__OSITO_K__ -DHAVE_PTHREAD=1 \
+  -DHAVE_OPENGL=1 -DHAVE_OPENGL_ES_1=0 -DHAVE_OPENGL_ES_2=0 \
+  -DMAPI_MODE_GLAPI -DMAPI_ABI_HEADER='"shared-glapi/glapi_mapi_tmp.h"' \
+  '-DPACKAGE_VERSION="25.0.0-osito"' \
+  '-DPACKAGE_BUGREPORT="https://github.com/xaskasdf/osito-k"' \
+  -DHAVE_FUNC_ATTRIBUTE_PACKED \
+  -DHAVE_FUNC_ATTRIBUTE_FLATTEN \
+  -DHAVE_FUNC_ATTRIBUTE_FORMAT \
+  -DHAVE_FUNC_ATTRIBUTE_UNUSED \
+  -DHAVE_FUNC_ATTRIBUTE_NORETURN \
+  -DHAVE_FUNC_ATTRIBUTE_WARN_UNUSED_RESULT \
+  -include $(OPENGL_ROOT)/osito_compat/mesa_compat.h \
+  $(INCLUDES_COMPILER_CXX) \
+  -I$(MESA_ROOT)/src/mapi/shared-glapi \
+  -I$(MESA_ROOT)/src/gallium/drivers/zink \
+  -I$(MESA_ROOT)/src/gallium/auxiliary/nir \
+  -I$(MESA_ROOT)/src/vulkan/util \
+  -isystem $(GCC_INC)
+
+# W4.8 — C++ TUs.  Use CXX_HOST (a hosted Linux g++) when set; otherwise
+# the rule simply isn't invoked because MAIN_CXX_SRCS is empty.
+$(BUILD_DIR)/mesa/src/mesa/main/%.o: $(MESA_ROOT)/src/mesa/main/%.cpp | $(BUILD_DIR)
+	@mkdir -p $(dir $@)
+	@echo "  CXX   main/$*"
+	@$(CXX_HOST) $(CXXFLAGS_MAIN) -c -o $@ $<
+
+$(BUILD_DIR)/mesa/src/mesa/state_tracker/%.o: $(MESA_ROOT)/src/mesa/state_tracker/%.cpp | $(BUILD_DIR)
+	@mkdir -p $(dir $@)
+	@echo "  CXX   state_tracker/$*"
+	@$(CXX_HOST) $(CXXFLAGS_MAIN) -c -o $@ $<
 
 $(BUILD_DIR):
 	@mkdir -p $(BUILD_DIR)

@@ -377,6 +377,10 @@ typedef __builtin_va_list __mesa_va_list;
  * the libstdc++ declarations and link against our impls — no
  * redefinition collision. C TUs that include this header pick up only
  * the typedef, which is what they actually need. */
+#ifndef __cplusplus
+extern int sscanf(const char *str, const char *fmt, ...);
+extern int vasprintf(char **out, const char *fmt, __mesa_va_list ap);
+#endif
 
 /* mmap stubs — Mesa shader cache uses mmap on Linux for file-backed
  * pages. On OsitoK we have no shader cache (no fs persistence beyond

@@ -17,6 +17,12 @@ TCC ?= tcc
 CC  ?= gcc
 LD  ?= ld
 
+# Cross-toolchain: produces x86_64 ELF objects (host cc on macOS would
+# emit Mach-O, which the cross-ld can't link).  Used by hello_gl.elf
+# and crtgl.o (W4.8).
+XCC ?= x86_64-elf-gcc
+XLD ?= x86_64-elf-ld
+
 BUILD  := ../build
 LIBC   := $(BUILD)/libc
 TEST   := ../test
@@ -37,7 +43,7 @@ QJS_CFLAGS = $(CFLAGS) $(QJS_HEADERS) -I$(QJS_SRC) \
 
 .PHONY: all clean
 
-all: $(LIBC)/crt.o $(LIBC)/syscall.o $(LIBC)/tcclib.o $(LIBC)/malloc.o $(LIBC)/math.o
+all: $(LIBC)/crt.o $(LIBC)/syscall.o $(LIBC)/tcclib.o $(LIBC)/malloc.o $(LIBC)/math.o $(LIBC)/crtgl.o
 
 $(LIBC):
 	mkdir -p $(LIBC)
@@ -55,6 +61,12 @@ $(LIBC)/tcclib.o: tcclib.c | $(LIBC)
 
 $(LIBC)/math.o: math.c | $(LIBC)
 	$(CC) $(CFLAGS) $< -o $@
+
+# W4.8 — libc extras for linking against libGL.a (Mesa).  Use the
+# cross-compiler so the .o is x86_64 ELF (host clang on macOS would
+# emit Mach-O).
+$(LIBC)/crtgl.o: crtgl.c | $(LIBC)
+	$(XCC) $(CFLAGS) $(QJS_HEADERS) $< -o $@
 
 clean:
 	rm -rf $(LIBC)
@@ -82,16 +94,16 @@ GL_LIBS := $(BUILD)/lib/opengl/libGL.a \
 
 # Use the cross-toolchain explicitly (matches how the prebuilt libGL.a was
 # produced — system 'ld' on macOS doesn't speak the ELF flag set).
-XCC ?= x86_64-elf-gcc
-XLD ?= x86_64-elf-ld
+# (XCC/XLD already defined above.)
 
-$(TEST)/hello_gl.elf: $(LIBC)/crt.o $(LIBC)/syscall.o $(LIBC)/math.o $(LIBC)/malloc.o $(TEST)/hello_gl.c
+$(TEST)/hello_gl.elf: $(LIBC)/crt.o $(LIBC)/syscall.o $(LIBC)/math.o $(LIBC)/malloc.o $(LIBC)/tcclib.o $(LIBC)/crtgl.o $(TEST)/hello_gl.c
 	$(XCC) -c -O2 -fno-pie -ffreestanding -nostdinc \
 	    $(GL_INC) -isystem qjs_headers \
 	    $(TEST)/hello_gl.c -o $(BUILD)/hello_gl.o
 	$(XLD) -nostdlib -static -no-pie -e _start -Ttext=0x401000 \
-	    --defsym=__dso_handle=0 \
+	    --allow-multiple-definition \
 	    $(LIBC)/crt.o $(LIBC)/syscall.o $(LIBC)/math.o $(LIBC)/malloc.o \
+	    $(LIBC)/tcclib.o $(LIBC)/crtgl.o \
 	    $(BUILD)/hello_gl.o \
 	    --start-group $(GL_LIBS) --end-group \
 	    -o $@
