@@ -24,6 +24,7 @@ SRC := \
   icd/nvk_stub/nvk_stub.c \
   icd/venus/venus_instance.c \
   icd/venus/venus_device.c \
+  icd/venus/venus_w3b6_objects.c \
   icd/venus/venus_w3b5_objects.c \
   icd/venus/venus_w3b4_objects.c \
   icd/venus/venus_entry.c \
@@ -90,7 +91,11 @@ SRC := \
   icd/venus/venus_cmd_GetPhysicalDeviceSurfaceCapabilitiesKHR.c \
   icd/venus/venus_cmd_GetPhysicalDeviceSurfaceFormatsKHR.c \
   icd/venus/venus_cmd_GetPhysicalDeviceSurfacePresentModesKHR.c \
-  icd/venus/venus_cmd_GetPhysicalDeviceSurfaceSupportKHR.c
+  icd/venus/venus_cmd_GetPhysicalDeviceSurfaceSupportKHR.c \
+  icd/venus/venus_cmd_CmdBindVertexBuffers.c \
+  icd/venus/venus_cmd_CmdSetViewport.c \
+  icd/venus/venus_cmd_CmdSetScissor.c \
+  icd/venus/venus_cmd_present_software_raster.c
 
 OBJ := $(patsubst %.c,$(BUILD_ROOT)/%.o,$(SRC))
 
