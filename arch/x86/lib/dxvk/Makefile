@@ -76,6 +76,7 @@ CXX_FLAGS := \
 # ----------------------------------------------------------------------
 UTIL_SRCS := \
   dxvk/src/util/util_env.cpp \
+  dxvk/src/util/util_error_ositok.cpp \
   dxvk/src/util/util_flush.cpp \
   dxvk/src/util/util_luid.cpp \
   dxvk/src/util/util_matrix.cpp \
