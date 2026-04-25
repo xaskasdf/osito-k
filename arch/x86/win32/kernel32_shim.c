@@ -356,17 +356,20 @@ PVOID WINAPI VirtualAlloc(PVOID lpAddress, SIZE_T dwSize,
         }
     }
 
-    /* Cap absurd sizes (> 256MB) to 256MB. Empirical sweet spot:
-     *   - Returning NULL → UT99 NULL-call-loops (FArray::Realloc
-     *     doesn't check the return value).
-     *   - Cap to 16MB → 2GB rep-movsl that follows overruns hard,
-     *     UT99 busy-loops in user code for hours.
-     *   - Cap to 256MB → bogus rep-movsl runs but ECX measurably
-     *     decrements (page-fault-paged-in writes succeed); UT99
-     *     stays "running" for 4+ minutes without crash. Best so far.
-     *   - Cap to 1GB → also triggers NULL-call cascade (different
-     *     code path takes over after the realloc).
-     */
+    /* Cap absurd sizes (> 256MB) to 256MB. Empirical sweet spot vs
+     * NULL/16MB/1GB. Documented in commit log. The follow-on rep-
+     * movsl that uses this buffer with a corrupt 2GB-class ECX gets
+     * short-circuited by the #PF handler in idt.c (see VA-SHORT) when
+     * the writes overrun the 256MB into unmapped pages — but only IF
+     * those pages aren't already covered by the kernel direct-map.
+     * In practice they ARE covered (winexec keeps PE32 under kernel
+     * CR3, which has the low-memory identity map), so the rep-movsl
+     * runs to completion through valid-but-irrelevant memory.
+     *
+     * Workaround: also pre-poison the buffer with a single byte at
+     * the END of the cap so the engine's checksum/comparison loop
+     * sees a sentinel — or simpler, just keep the cap and accept the
+     * slow run. UT99 eventually completes the rep-movsl and moves on. */
     if (dwSize > 0x10000000ULL) { /* > 256MB */
         static int cap_log = 0;
         if (cap_log < 5) {
@@ -376,6 +379,25 @@ PVOID WINAPI VirtualAlloc(PVOID lpAddress, SIZE_T dwSize,
             cap_log++;
         }
         dwSize = 0x10000000; /* 256MB */
+        /* Self-modify the engine's memcpy helper at 0x1010723E so that
+         * the upcoming bogus 2GB rep-movsl terminates instantly. The
+         * helper's prologue computes ECX = dword count (= corrupt elem
+         * count * 2 / 4 = ~537M); we replace `rep movsl` (F3 A5) with
+         * `xor ecx, ecx` (31 C9). The CPU then proceeds to the post-
+         * rep code that does `mov ecx, ebx; rep movsb` — ebx holds the
+         * tiny (0..3) leftover-bytes count, so rep movsb is a tiny
+         * copy. Function returns after a few microseconds instead of
+         * many minutes. Idempotent: only patch once. */
+        static int patched_memcpy = 0;
+        if (!patched_memcpy) {
+            volatile uint8_t *p = (uint8_t *)(uintptr_t)0x1010723E;
+            if (p[0] == 0xF3 && p[1] == 0xA5) {
+                p[0] = 0x31;  /* xor ecx, ecx */
+                p[1] = 0xC9;
+                patched_memcpy = 1;
+                serial_puts("[VA] PATCHED rep-movsl @0x1010723E -> xor ecx,ecx\n");
+            }
+        }
     }
 
     PVOID base = lpAddress;

@@ -901,6 +901,40 @@ void isr_handler(interrupt_frame_t *frame)
         }
     }
 
+    /* UT99 quirk: short-circuit the bogus 2GB rep-movsl in the
+     * Engine.dll memcpy helper at 0x1010723E. The helper is given a
+     * corrupt TArray Max (~537M elements = ~2GB bytes) by a buggy
+     * caller chain. Force ECX=0 to terminate REP MOVSL immediately. */
+    if (vec == 14 &&
+        (frame->rip & 0xFFFFFFFFULL) == 0x1010723EULL &&
+        (frame->rcx & 0xFFFFFFFFULL) > 0x40000ULL) {
+        static uint32_t shortcut_log = 0;
+        if (shortcut_log < 4) {
+            serial_puts("[VA-SHORT] cap rep-movsl @0x1010723E cs=0x");
+            serial_puthex(frame->cs & 0xFFFF, 4);
+            serial_puts(" ecx=0x");
+            serial_puthex(frame->rcx & 0xFFFFFFFFULL, 8);
+            serial_puts(" -> 0\n");
+            shortcut_log++;
+        }
+        frame->rcx = 0;
+        return;
+    }
+    /* Diagnostic: log #PF in compat32 CS for any RIP, sampled */
+    if (vec == 14 && (frame->cs & 0xFFFF) == 0x40) {
+        static uint32_t pf32_log = 0;
+        pf32_log++;
+        if (pf32_log < 4 || (pf32_log & 0x3FFFF) == 0) {
+            serial_puts("[PF32] rip=0x");
+            serial_puthex(frame->rip & 0xFFFFFFFFULL, 8);
+            serial_puts(" ecx=0x");
+            serial_puthex(frame->rcx & 0xFFFFFFFFULL, 8);
+            serial_puts(" cnt=");
+            serial_putdec(pf32_log);
+            serial_puts("\n");
+        }
+    }
+
     /* Demand paging — handle #PF FIRST, before any diagnostic output.
      * Validates against VMA table. Covers ELF segments (0x400000+),
      * mmap regions, and anonymous reservations (0x500000000+).
