@@ -68,7 +68,7 @@ typedef const GUID* REFCLSID;
 #endif
 
 #ifndef ULONG
-typedef unsigned long ULONG;
+typedef unsigned int ULONG;  /* Windows ABI: 32-bit even on LP64 */
 #endif
 #ifndef HRESULT
 typedef int HRESULT;

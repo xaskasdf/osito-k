@@ -83,6 +83,10 @@ namespace dxvk::env {
     exePath.resize(len);
 
     return str::fromws(exePath.data());
+#elif defined(__OSITO_K__)
+    /* OsitoK has no /proc; the exe path isn't introspectable. Return empty
+     * so callers (Logger, config) fall back to a default name. */
+    return std::string();
 #elif defined(__linux__)
     std::array<char, PATH_MAX> exePath = {};
 
@@ -138,6 +142,10 @@ namespace dxvk::env {
 
     widePath[length] = L'\0';
     return !!CreateDirectoryW(widePath.data(), nullptr);
+#elif defined(__OSITO_K__)
+    /* No filesystem in W5.0; cache/log dirs are stubbed. */
+    (void)path;
+    return false;
 #else
     return std::filesystem::create_directories(path);
 #endif

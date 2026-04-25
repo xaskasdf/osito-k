@@ -73,8 +73,8 @@ typedef int             BOOL;
 typedef unsigned char   BYTE;
 typedef unsigned short  WORD;
 typedef unsigned int    DWORD;
-typedef unsigned long   ULONG;
-typedef long            LONG;
+typedef unsigned int    ULONG;  /* Windows ABI: 32-bit even on LP64 */
+typedef int             LONG;   /* Windows ABI: 32-bit even on LP64 */
 typedef long long       LONGLONG;
 typedef unsigned long long  ULONGLONG;
 typedef int             INT;
