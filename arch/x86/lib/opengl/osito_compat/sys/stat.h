@@ -33,9 +33,14 @@ struct stat {
     long      st_ctime;
 };
 
-static inline int stat (const char *p, struct stat *s) { (void)p; (void)s; return -1; }
-static inline int fstat(int fd,         struct stat *s) { (void)fd; (void)s; return -1; }
-static inline int lstat(const char *p, struct stat *s) { (void)p; (void)s; return -1; }
+/* Zero the buffer so callers that ignore the -1 return don't read
+ * uninitialised fields (Mesa's u_screen.c equal_file_description does
+ * this; with garbage st_dev/st_ino it would compare two stale fds equal
+ * and return the wrong cached pipe_screen). */
+extern void *memset(void *, int, unsigned long);
+static inline int stat (const char *p, struct stat *s) { (void)p; if (s) memset(s, 0, sizeof(*s)); return -1; }
+static inline int fstat(int fd,         struct stat *s) { (void)fd; if (s) memset(s, 0, sizeof(*s)); return -1; }
+static inline int lstat(const char *p, struct stat *s) { (void)p; if (s) memset(s, 0, sizeof(*s)); return -1; }
 static inline int mkdir(const char *p, mode_t m) { (void)p; (void)m; return -1; }
 
 #define S_IRUSR 0400

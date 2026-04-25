@@ -75,7 +75,12 @@ int vasprintf(char **out, const char *fmt, __builtin_va_list ap) {
     if (n < 0) { *out = NULL; return -1; }
     char *buf = (char *)malloc((size_t)n + 1);
     if (!buf) { *out = NULL; return -1; }
-    vsnprintf(buf, (size_t)n + 1, fmt, ap);
+    /* Second va_copy: ap may be in indeterminate state after the probe
+     * (some libc paths consume the original even though we passed ap2). */
+    __builtin_va_list ap3;
+    __builtin_va_copy(ap3, ap);
+    vsnprintf(buf, (size_t)n + 1, fmt, ap3);
+    __builtin_va_end(ap3);
     *out = buf;
     return n;
 }
