@@ -535,12 +535,10 @@ COMPILER_GLCPP_SRCS  := \
   $(MESA_ROOT)/src/compiler/glsl/glcpp/pp_standalone_scaffolding.c
 
 # W4.8 — vulkan/util/  (vk_dispatch_table, vk_enum_to_str, vk_extensions)
-# W4.10++ — added vk_format.c (vendored from Mesa upstream main, 43KB)
 VK_UTIL_SRCS         := \
   $(MESA_ROOT)/src/vulkan/util/vk_dispatch_table.c \
   $(MESA_ROOT)/src/vulkan/util/vk_enum_to_str.c \
-  $(MESA_ROOT)/src/vulkan/util/vk_extensions.c \
-  $(MESA_ROOT)/src/vulkan/util/vk_format.c
+  $(MESA_ROOT)/src/vulkan/util/vk_extensions.c
 
 COMPILER_C_SRCS_ABS  := $(COMPILER_TOP_SRCS) $(COMPILER_NIR_SRCS) \
                         $(COMPILER_SPIRV_SRCS) $(COMPILER_GLSL_C_SRCS) \
