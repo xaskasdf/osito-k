@@ -77,50 +77,16 @@ int os_dupfd_cloexec(int fd) { (void)fd; return -1; }
 int os_file_create_unique(const char *prefix, int filemode) { (void)prefix;(void)filemode; return -1; }
 int os_same_file_description(int fd1, int fd2) { (void)fd1;(void)fd2; return -1; }
 
-/* ZINK driver core (deferred since W4.3) */
-void *zink_context_create(void *pscreen, void *priv, unsigned flags) { (void)pscreen;(void)priv;(void)flags; return (void *)0; }
-void zink_screen_init_compiler(void *screen) { (void)screen; }
-const void *zink_get_compiler_options(void *pscreen, unsigned ir, unsigned shader) { (void)pscreen;(void)ir;(void)shader; return (void *)0; }
-void zink_compiler_assign_io(void *screen, void *producer, void *consumer) { (void)screen;(void)producer;(void)consumer; }
-void *zink_shader_create(void *screen, void *nir) { (void)screen;(void)nir; return (void *)0; }
-void  zink_shader_init(void *screen, void *zs) { (void)screen;(void)zs; }
-void  zink_shader_free(void *screen, void *shader) { (void)screen;(void)shader; }
-void  zink_gfx_shader_free(void *screen, void *shader) { (void)screen;(void)shader; }
-void *zink_shader_compile(void *screen, int sep, void *base_nir, void *zs, unsigned int *non_fs_keybox, void *key) { (void)screen;(void)sep;(void)base_nir;(void)zs;(void)non_fs_keybox;(void)key; return (void *)0; }
-void *zink_shader_compile_separate(void *screen, void *zs) { (void)screen;(void)zs; return (void *)0; }
-void  zink_shader_finalize(void *pscreen, void *nirptr) { (void)pscreen;(void)nirptr; }
-int   zink_shader_has_cubes(void *nir) { (void)nir; return 0; }
-void *zink_shader_tcs_create(void *screen, void *vs, unsigned vertices_per_patch, void *key) { (void)screen;(void)vs;(void)vertices_per_patch;(void)key; return (void *)0; }
-void  zink_shader_tcs_init(void *screen, void *zs, void *nir, unsigned vertices_per_patch) { (void)screen;(void)zs;(void)nir;(void)vertices_per_patch; }
-void *zink_shader_tcs_compile(void *screen, void *zs, unsigned patch_vertices, int can_shobj) { (void)screen;(void)zs;(void)patch_vertices;(void)can_shobj; return (void *)0; }
-void  zink_shader_serialize_blob(void *nir, void *blob) { (void)nir;(void)blob; }
-void *zink_shader_deserialize(void *screen, void *zs) { (void)screen;(void)zs; return (void *)0; }
-void *zink_shader_blob_deserialize(void *screen, void *blob) { (void)screen;(void)blob; return (void *)0; }
-void *zink_tgsi_to_nir(void *screen, const void *tokens) { (void)screen;(void)tokens; return (void *)0; }
-void  zink_lower_system_values_to_inlined_uniforms(void *nir) { (void)nir; }
-void *zink_create_quads_emulation_gs(const void *options, const void *vs_nir, int flatshade_first, int alpha_test) { (void)options;(void)vs_nir;(void)flatshade_first;(void)alpha_test; return (void *)0; }
-void zink_batch_no_rp(void *ctx) { (void)ctx; }
-void zink_batch_rp(void *ctx) { (void)ctx; }
-int  zink_check_batch_completion(void *ctx, uint64_t id) { (void)ctx;(void)id; return 1; }
-void zink_cmd_debug_marker_begin(void *ctx, void *cmdbuf, const char *fmt) { (void)ctx;(void)cmdbuf;(void)fmt; }
-void zink_cmd_debug_marker_end(void *ctx, void *cmdbuf) { (void)ctx;(void)cmdbuf; }
-void zink_copy_buffer(void *ctx, void *dst, void *src, unsigned dst_offset, unsigned src_offset, unsigned size) { (void)ctx;(void)dst;(void)src;(void)dst_offset;(void)src_offset;(void)size; }
-void zink_copy_image_buffer(void *ctx, void *dst, void *src, unsigned dst_level, unsigned dstx, unsigned dsty, unsigned dstz, unsigned src_level, const void *src_box, unsigned map_flags) { (void)ctx;(void)dst;(void)src;(void)dst_level;(void)dstx;(void)dsty;(void)dstz;(void)src_level;(void)src_box;(void)map_flags; }
-int  zink_fence_wait(void *pctx) { (void)pctx; return 1; }
-void zink_wait_on_batch(void *ctx, uint64_t batch_id) { (void)ctx;(void)batch_id; }
-void zink_flush_memory_barrier(void *ctx, int is_compute) { (void)ctx;(void)is_compute; }
-void zink_init_vk_sample_locations(void *ctx, void *vk_loc) { (void)ctx;(void)vk_loc; }
-void zink_rebind_all_buffers(void *ctx) { (void)ctx; }
-void zink_rebind_all_images(void *ctx) { (void)ctx; }
-int  zink_resource_rebind(void *ctx, void *res) { (void)ctx;(void)res; return 0; }
+/* ZINK driver core — W4.10: 42 stubs lifted, real impls now in
+ * libmesa_zink.a from zink_compiler.c + zink_context.c.
+ * Remaining: zink_reset_ds3_states (lives in zink_state.c ds3 path,
+ * not exported by current build) + 2 transitive deps from real zink TUs.
+ */
 void zink_reset_ds3_states(void *ctx) { (void)ctx; }
-void zink_set_null_fs(void *ctx) { (void)ctx; }
-void *zink_tc_context_unwrap(void *ctx) { return ctx; }
-void zink_update_barriers(void *ctx, int compute, void *index, void *indirect, void *indirect_draw_count) { (void)ctx;(void)compute;(void)index;(void)indirect;(void)indirect_draw_count; }
-void zink_update_descriptor_refs(void *ctx, int compute) { (void)ctx;(void)compute; }
-void zink_update_fbfetch(void *ctx) { (void)ctx; }
-void zink_update_rendering_info(void *ctx) { (void)ctx; }
-void zink_update_shadow_samplerviews(void *ctx, unsigned mask) { (void)ctx;(void)mask; }
+
+/* W4.10 — transitive deps pulled in by real zink_context.c + zink_compiler.c */
+void *trace_get_possibly_threaded_context(void *pipe) { return pipe; }
+void *vk_spec_info_to_nir_spirv(const void *vk_spec_info, void *count_out) { (void)vk_spec_info;(void)count_out; return (void *)0; }
 
 /* W4.9 — sections below removed: now provided by REAL C++ TUs compiled via
  * CXX_CROSS (ositok cross g++ + libstdc++ from sysroot).
