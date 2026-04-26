@@ -7,17 +7,10 @@ typedef uint64_t u64;
 typedef uint32_t u32;
 typedef uint8_t  u8;
 
-/* BLAKE3 SIMD: dispatcher falls back to portable when these are not chosen. */
-void blake3_compress_in_place_sse2(u32 cv[8], const u8 block[64], u8 block_len, u64 counter, u8 flags) { (void)cv;(void)block;(void)block_len;(void)counter;(void)flags; }
-void blake3_compress_xof_sse2(const u32 cv[8], const u8 block[64], u8 block_len, u64 counter, u8 flags, u8 out[64]) { (void)cv;(void)block;(void)block_len;(void)counter;(void)flags;(void)out; }
-void blake3_hash_many_sse2(const u8 *const *inputs, size_t num_inputs, size_t blocks, const u32 key[8], u64 counter, int incr, u8 flags, u8 fs, u8 fe, u8 *out) { (void)inputs;(void)num_inputs;(void)blocks;(void)key;(void)counter;(void)incr;(void)flags;(void)fs;(void)fe;(void)out; }
-void blake3_compress_in_place_sse41(u32 cv[8], const u8 block[64], u8 block_len, u64 counter, u8 flags) { (void)cv;(void)block;(void)block_len;(void)counter;(void)flags; }
-void blake3_compress_xof_sse41(const u32 cv[8], const u8 block[64], u8 block_len, u64 counter, u8 flags, u8 out[64]) { (void)cv;(void)block;(void)block_len;(void)counter;(void)flags;(void)out; }
-void blake3_hash_many_sse41(const u8 *const *inputs, size_t num_inputs, size_t blocks, const u32 key[8], u64 counter, int incr, u8 flags, u8 fs, u8 fe, u8 *out) { (void)inputs;(void)num_inputs;(void)blocks;(void)key;(void)counter;(void)incr;(void)flags;(void)fs;(void)fe;(void)out; }
-void blake3_hash_many_avx2(const u8 *const *inputs, size_t num_inputs, size_t blocks, const u32 key[8], u64 counter, int incr, u8 flags, u8 fs, u8 fe, u8 *out) { (void)inputs;(void)num_inputs;(void)blocks;(void)key;(void)counter;(void)incr;(void)flags;(void)fs;(void)fe;(void)out; }
-void blake3_compress_in_place_avx512(u32 cv[8], const u8 block[64], u8 block_len, u64 counter, u8 flags) { (void)cv;(void)block;(void)block_len;(void)counter;(void)flags; }
-void blake3_compress_xof_avx512(const u32 cv[8], const u8 block[64], u8 block_len, u64 counter, u8 flags, u8 out[64]) { (void)cv;(void)block;(void)block_len;(void)counter;(void)flags;(void)out; }
-void blake3_hash_many_avx512(const u8 *const *inputs, size_t num_inputs, size_t blocks, const u32 key[8], u64 counter, int incr, u8 flags, u8 fs, u8 fe, u8 *out) { (void)inputs;(void)num_inputs;(void)blocks;(void)key;(void)counter;(void)incr;(void)flags;(void)fs;(void)fe;(void)out; }
+/* W4.8++ BLAKE3 SIMD stubs removed — real impls now provided by
+ * mesa/src/util/blake3/blake3_{sse2,sse41,avx2,avx512}_x86-64_unix.S
+ * (compiled via BLAKE3_ASM_OBJS into libmesa_util.a).
+ */
 
 /* glcpp preprocessor stubs */
 void *glcpp_parser_create(void *api, void *extensions, void *state) { (void)api;(void)extensions;(void)state; return (void *)0; }
@@ -26,27 +19,11 @@ int  glcpp_parser_parse(void *parser) { (void)parser; return 0; }
 void glcpp_parser_resolve_implicit_version(void *parser) { (void)parser; }
 void glcpp_parser_destroy(void *parser) { (void)parser; }
 
-/* TGSI software interpreter */
-void *tgsi_exec_machine_create(int processor) { (void)processor; return (void *)0; }
-void  tgsi_exec_machine_destroy(void *m) { (void)m; }
-void  tgsi_exec_machine_bind_shader(void *mach, const void *tokens, void *sampler, void *image, void *buffer) { (void)mach;(void)tokens;(void)sampler;(void)image;(void)buffer; }
-unsigned tgsi_exec_machine_run(void *mach, int start_pc) { (void)mach;(void)start_pc; return 0; }
-void tgsi_exec_set_constant_buffers(void *mach, unsigned num_buffers, const void *bufs) { (void)mach;(void)num_buffers;(void)bufs; }
+/* W4.8++ — TGSI exec stubs removed (real impl from tgsi_exec.c in libmesa_gallium.a). */
+/* W4.8++ — u_vbuf stubs removed (real impl from u_vbuf.c in libmesa_gallium.a). */
 
-/* translate_sse2 (x86 rtasm JIT) */
+/* translate_sse2 (x86 rtasm JIT) — keep stubbed; rtasm JIT not vendored. */
 void *translate_sse2_create(const void *key) { (void)key; return (void *)0; }
-
-/* u_vbuf */
-void *u_vbuf_create(void *pipe, const void *caps) { (void)pipe;(void)caps; return (void *)0; }
-void  u_vbuf_destroy(void *mgr) { (void)mgr; }
-void  u_vbuf_get_caps(void *screen, void *caps, unsigned flags) { (void)screen;(void)caps;(void)flags; }
-void  u_vbuf_set_vertex_elements(void *mgr, const void *state) { (void)mgr;(void)state; }
-void  u_vbuf_unset_vertex_elements(void *mgr) { (void)mgr; }
-void  u_vbuf_set_vertex_buffers(void *mgr, unsigned count, const void *buffers) { (void)mgr;(void)count;(void)buffers; }
-void  u_vbuf_save_vertex_elements(void *mgr) { (void)mgr; }
-void  u_vbuf_restore_vertex_elements(void *mgr) { (void)mgr; }
-void  u_vbuf_set_flatshade_first(void *mgr, int first) { (void)mgr;(void)first; }
-void  u_vbuf_draw_vbo(void *mgr, const void *info, unsigned drawid_offset, const void *indirect, const void *draws, unsigned num_draws) { (void)mgr;(void)info;(void)drawid_offset;(void)indirect;(void)draws;(void)num_draws; }
 
 /* util_barrier */
 int  util_barrier_init(void *barrier, unsigned count) { (void)barrier;(void)count; return 0; }
@@ -69,11 +46,11 @@ long util_thread_get_time_nano(int thread_id) { (void)thread_id; return 0; }
 int util_get_current_cpu(void) { return 0; }
 int util_set_thread_affinity(unsigned long thread, const void *mask, void *old_mask, unsigned mask_size) { (void)thread;(void)mask;(void)old_mask;(void)mask_size; return 0; }
 
-/* trace driver wrapper */
+/* trace driver wrapper. trace_dumping_*_locked() now real (tr_dump.c).
+ * trace_context_create_threaded stays stubbed: tr_context.c needs tr_util.h
+ * which is not vendored.
+ */
 void *trace_context_create_threaded(void *screen, void *pipe, void **replace_pipe, void *replace_data, unsigned flags) { (void)screen;(void)replace_pipe;(void)replace_data;(void)flags; return pipe; }
-int  trace_dumping_enabled_locked(void) { return 0; }
-void trace_dumping_start_locked(void) {}
-void trace_dumping_stop_locked(void) {}
 
 /* aaline / aapoint NIR fallbacks */
 int nir_lower_aaline_fs(void *shader, int *vars, void *stipple_tex, void *stipple_sampler) { (void)shader;(void)vars;(void)stipple_tex;(void)stipple_sampler; return 0; }

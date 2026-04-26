@@ -344,6 +344,15 @@ UTIL_SRCS := \
   mesa/src/util/mesa-blake3.c \
   osito_compat/w48_link_stubs.c
 
+# W4.8++ — BLAKE3 SIMD assembly (sse2, sse41, avx2, avx512). Real impls
+# replace the stubs in w48_link_stubs.c. Cross assembler accepts them as-is.
+BLAKE3_ASM_SRCS := \
+  mesa/src/util/blake3/blake3_sse2_x86-64_unix.S \
+  mesa/src/util/blake3/blake3_sse41_x86-64_unix.S \
+  mesa/src/util/blake3/blake3_avx2_x86-64_unix.S \
+  mesa/src/util/blake3/blake3_avx512_x86-64_unix.S
+BLAKE3_ASM_OBJS := $(patsubst %.S,$(BUILD_DIR)/%.o,$(BLAKE3_ASM_SRCS))
+
 # u_cpu_detect.c, os_file.c, etc. were excluded earlier because
 # os_misc.c is already in the list — duplicate elimination relies on
 # Make's ordered-only behavior.  We strip duplicates explicitly to keep
@@ -351,6 +360,7 @@ UTIL_SRCS := \
 UTIL_SRCS := $(sort $(UTIL_SRCS))
 
 UTIL_OBJS := $(patsubst %.c,$(BUILD_DIR)/%.o,$(UTIL_SRCS))
+UTIL_OBJS += $(BLAKE3_ASM_OBJS)
 
 # ---------------------------------------------------------------------------
 # W4.1 — libmesa_gallium.a
@@ -374,6 +384,7 @@ GALLIUM_SRCS := \
   mesa/src/gallium/auxiliary/cso_cache/cso_cache.c \
   mesa/src/gallium/auxiliary/cso_cache/cso_hash.c \
   mesa/src/gallium/auxiliary/indices/u_indices_gen.c \
+  mesa/src/gallium/auxiliary/indices/u_primconvert.c \
   mesa/src/gallium/auxiliary/indices/u_unfilled_gen.c \
   mesa/src/gallium/auxiliary/pipebuffer/pb_buffer_fenced.c \
   mesa/src/gallium/auxiliary/pipebuffer/pb_cache.c \
@@ -383,6 +394,7 @@ GALLIUM_SRCS := \
   mesa/src/gallium/auxiliary/tgsi/tgsi_build.c \
   mesa/src/gallium/auxiliary/tgsi/tgsi_dump.c \
   mesa/src/gallium/auxiliary/tgsi/tgsi_dynamic_indexing.c \
+  mesa/src/gallium/auxiliary/tgsi/tgsi_exec.c \
   mesa/src/gallium/auxiliary/tgsi/tgsi_from_mesa.c \
   mesa/src/gallium/auxiliary/tgsi/tgsi_info.c \
   mesa/src/gallium/auxiliary/tgsi/tgsi_iterate.c \
@@ -434,6 +446,8 @@ GALLIUM_SRCS := \
   mesa/src/gallium/auxiliary/util/u_transfer.c \
   mesa/src/gallium/auxiliary/util/u_transfer_helper.c \
   mesa/src/gallium/auxiliary/util/u_upload_mgr.c \
+  mesa/src/gallium/auxiliary/util/u_vbuf.c \
+  mesa/src/gallium/auxiliary/driver_trace/tr_dump.c \
   mesa/src/gallium/auxiliary/nir/nir_to_spirv/nir_to_spirv.c \
   mesa/src/gallium/auxiliary/nir/nir_to_spirv/spirv_builder.c \
   mesa/src/gallium/auxiliary/cso_cache/cso_context.c \
@@ -860,6 +874,22 @@ $(BUILD_DIR)/mesa/src/gallium/auxiliary/draw/%.o: \
 	@echo "  CC    draw/$*"
 	@$(CC) $(CFLAGS_MAIN) -c -o $@ $<
 
+# W4.8++ — generic fallback for gallium/auxiliary/* (tgsi/, util/, translate/,
+# cso_cache/, indices/, pipebuffer/, etc.). Uses CFLAGS (not CFLAGS_MAIN) since
+# these don't need mesa/main headers.
+$(BUILD_DIR)/mesa/src/gallium/auxiliary/%.o: \
+        $(OPENGL_ROOT)/mesa/src/gallium/auxiliary/%.c | $(BUILD_DIR)
+	@mkdir -p $(dir $@)
+	@echo "  CC    aux/$*"
+	@$(CC) $(CFLAGS) -c -o $@ $<
+
+# W4.8++ — generic fallback for util/format/ (u_format_*, etc.).
+$(BUILD_DIR)/mesa/src/util/format/%.o: \
+        $(OPENGL_ROOT)/mesa/src/util/format/%.c | $(BUILD_DIR)
+	@mkdir -p $(dir $@)
+	@echo "  CC    util/format/$*"
+	@$(CC) $(CFLAGS) -c -o $@ $<
+
 # nir_to_tgsi.c, nir_to_tgsi_info.c, tgsi_to_nir.c need MAIN includes
 $(BUILD_DIR)/mesa/src/gallium/auxiliary/nir/%.o: \
         $(OPENGL_ROOT)/mesa/src/gallium/auxiliary/nir/%.c | $(BUILD_DIR)
@@ -987,6 +1017,12 @@ $(BUILD_DIR)/mesa/src/util/blake3/%.o: $(MESA_ROOT)/src/util/blake3/%.c | $(BUIL
 	@mkdir -p $(dir $@)
 	@echo "  CC    util/blake3/$*"
 	@$(CC) $(CFLAGS) -c -o $@ $<
+
+# W4.8++ — BLAKE3 SIMD .S (sse2, sse41, avx2, avx512). Cross assembler.
+$(BUILD_DIR)/mesa/src/util/blake3/%.o: $(MESA_ROOT)/src/util/blake3/%.S | $(BUILD_DIR)
+	@mkdir -p $(dir $@)
+	@echo "  AS    util/blake3/$*"
+	@$(CC) -c -o $@ $<
 
 # vulkan/util/ — same as compiler (uses vk headers from include/).
 $(BUILD_DIR)/mesa/src/vulkan/util/%.o: $(MESA_ROOT)/src/vulkan/util/%.c | $(BUILD_DIR)
