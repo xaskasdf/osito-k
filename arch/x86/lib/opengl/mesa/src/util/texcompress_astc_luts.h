@@ -26,6 +26,16 @@
 #include <unordered_map>
 #include <vector>
 
+/* OsitoK: cross sysroot libstdc++ 13.2.0 was built without
+ * _GLIBCXX_HAS_GTHREADS — std::mutex not available (lock_guard is fine,
+ * it's in std_mutex.h unconditionally). We're single-threaded for ASTC
+ * LUT init; provide a noop std::mutex shim. */
+#ifndef _GLIBCXX_HAS_GTHREADS
+namespace std {
+    struct mutex { void lock() {} void unlock() {} };
+}
+#endif
+
 namespace Granite
 {
 

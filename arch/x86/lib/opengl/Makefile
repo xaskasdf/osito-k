@@ -788,6 +788,21 @@ MAIN_CXX_SRCS := \
   mesa/src/mesa/state_tracker/st_atom_array.cpp \
   mesa/src/mesa/state_tracker/st_glsl_to_nir.cpp
 
+# W4.10++ — ASTC LUT decoder + wrapper (Granite library, MIT). Vendored
+# header patched to provide noop std::mutex (sysroot libstdc++ built
+# without _GLIBCXX_HAS_GTHREADS, single-threaded use is safe here).
+UTIL_CXX_SRCS := \
+  mesa/src/util/texcompress_astc_luts.cpp \
+  mesa/src/util/texcompress_astc_luts_wrap.cpp
+UTIL_CXX_OBJS := $(patsubst %.cpp,$(BUILD_DIR)/%.o,$(UTIL_CXX_SRCS))
+UTIL_OBJS     := $(UTIL_OBJS) $(UTIL_CXX_OBJS)
+
+# Pattern rule for util/*.cpp via CXX_CROSS
+$(BUILD_DIR)/mesa/src/util/%.o: $(OPENGL_ROOT)/mesa/src/util/%.cpp | $(BUILD_DIR)
+	@mkdir -p $(dir $@)
+	@echo "  CXX   util/$*"
+	@$(CXX_CROSS) -c $(CXXFLAGS_MAIN) -o $@ $<
+
 MAIN_CXX_OBJS := $(patsubst %.cpp,$(BUILD_DIR)/%.o,$(MAIN_CXX_SRCS))
 # W4.9 — REAL: MAIN_CXX_OBJS now built via CXX_CROSS (already wired below).
 MAIN_C_OBJS   := $(MAIN_C_OBJS) $(MAIN_CXX_OBJS)

@@ -86,9 +86,10 @@ unsigned vk_format_aspects(unsigned format)
 unsigned vk_format_to_pipe_format(unsigned vk_format) { (void)vk_format; return 0; }
 unsigned vk_format_from_pipe_format(unsigned pipe_format) { (void)pipe_format; return 0; }
 
-/* ASTC decoder LUT */
-void _mesa_init_astc_decoder_luts(void *luts) { (void)luts; }
-const void *_mesa_get_astc_decoder_partition_table(unsigned block_w, unsigned block_h, unsigned partition_count) { (void)block_w;(void)block_h;(void)partition_count; return (void *)0; }
+/* W4.10++ — ASTC LUT stubs REMOVED: real impls now provided by
+ * texcompress_astc_luts.o + texcompress_astc_luts_wrap.o (Granite
+ * library, lifted with noop std::mutex shim in vendored header
+ * since cross sysroot libstdc++ was built without _GLIBCXX_HAS_GTHREADS). */
 
 /* W4.10++ — os_file POSIX helpers stubs removed. Real impls now in
  * arch/x86/libc/crtgl.c (real syscall wrappers around fcntl, open, getpid,
