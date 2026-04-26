@@ -2676,8 +2676,13 @@ void __cold shell_run(void)
     sh_puts_color(" [wasm32 | 256MB heap]\n\n", 0x00666666);
 #endif
 
+    /* Auto-launch hello_gl.elf if present (W4.10 runtime test) */
+    if (osfs2_is_mounted() && osfs2_find("hello_gl.elf")) {
+        sh_puts(" Auto-launching hello_gl.elf...\n");
+        shell_exec("exec hello_gl.elf");
+    }
     /* Auto-launch UT99 if osfs2 is mounted and UnrealTournament.exe exists */
-    if (osfs2_is_mounted() && osfs2_find("UnrealTournament.exe")) {
+    else if (osfs2_is_mounted() && osfs2_find("UnrealTournament.exe")) {
         sh_puts(" Auto-launching UnrealTournament.exe...\n");
         shell_exec("winexec UnrealTournament.exe");
     }
