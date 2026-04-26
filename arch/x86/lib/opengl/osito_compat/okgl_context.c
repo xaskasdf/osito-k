@@ -1,14 +1,18 @@
-/* okgl_context.c — W4.6 implementation of the okGL* context API.
+/* okgl_context.c — W4.7 implementation of the okGL* context API.
  *
  * Layered above:
  *   - libvulkan.a              vkCreateInstance / vkEnumeratePhysicalDevices
  *   - libmesa_zink.a           okGLZinkCreateScreen (W4.4) → pipe_screen
- *   - libmesa_main.a           st_create_context / st_make_current (W4.5)
+ *   - libmesa_main.a           st_create_context / _mesa_make_current (W4.5)
  *
- * Build-only acceptance for W4.6: the call chain is wired but a full
- * runtime exercise is deferred — the W4.6 hello-gl tests link against
- * this file but the actual end-to-end paint via zink+venus depends on
- * the compositor surface extension landing in a future wave.
+ * W4.6 wired pipe_screen + (already in this file) pipe_context + st_context
+ * creation, but okGLMakeCurrent was a no-op when ctx->st was NULL because
+ * the caller path silently fell through. W4.7 (T2/T3) makes pipe_context +
+ * st_context creation REQUIRED — if either fails the whole context-create
+ * fails — and converts okGLMakeCurrent to actually drive _mesa_make_current
+ * with the embedded gl_context (st_context's first member is `gl_context *
+ * ctx`). Return semantics also flipped: 0 = success, non-zero = failure
+ * (matches okGL.h convention + hello-gl-clear's check).
  *
  * Design notes:
  *   * The pipe_screen + pipe_context tuple is created per-call. A future
@@ -71,8 +75,9 @@ extern VkResult vkEnumeratePhysicalDevices(VkInstance, uint32_t *, VkPhysicalDev
 
 /* From libmesa_zink.a (osito_compat/zink_screen_ositok.c). We pull in
  * the full p_screen.h so we can call screen->context_create() directly
- * (W4.7a). */
+ * (W4.7a). p_context.h gives us pipe_context::destroy (W4.7-T2). */
 #include "pipe/p_screen.h"
+#include "pipe/p_context.h"
 extern struct pipe_screen *
 okGLZinkCreateScreen(VkInstance instance, VkPhysicalDevice phys);
 
@@ -87,6 +92,8 @@ typedef int gl_api;
 #define OK_API_OPENGL_COMPAT 1
 
 struct gl_config;
+struct gl_context;
+struct gl_framebuffer;
 struct st_context;
 struct st_config_options;
 
@@ -100,12 +107,25 @@ st_create_context(gl_api api, struct pipe_context *pipe,
 
 extern void st_destroy_context(struct st_context *st);
 
-/* We'd normally call _mesa_make_current here to bind the dispatch
- * table; that requires pulling in mesa/main/context.h. For W4.6 build
- * acceptance we declare it locally. The actual runtime wiring is
- * deferred. */
+/* _mesa_make_current real signature (mesa/main/context.h):
+ *   GLboolean _mesa_make_current(struct gl_context *ctx,
+ *                                struct gl_framebuffer *draw,
+ *                                struct gl_framebuffer *read);
+ * Returns 1 on success, 0 on failure. We pass NULL framebuffers — Mesa
+ * accepts that (off-screen path uses the dummy framebuffer).
+ *
+ * st_context's layout begins with `struct gl_context *ctx;` (verified
+ * in mesa/src/mesa/state_tracker/st_context.h:128). We mirror just that
+ * head locally so we can pluck out the embedded gl_context without
+ * pulling the heavy state_tracker headers into this TU. */
+struct ok_st_context_head {
+    struct gl_context *ctx;
+};
+
 extern int /*GLboolean*/
-_mesa_make_current(void *ctx, void *drawBuffer, void *readBuffer);
+_mesa_make_current(struct gl_context *ctx,
+                   struct gl_framebuffer *drawBuffer,
+                   struct gl_framebuffer *readBuffer);
 
 /* OsitoK compositor flip — same syscall used by the SHM/SDL paths. */
 #define SYS_GUI_FLIP 507
@@ -185,18 +205,21 @@ okGLCreateContext(uint32_t window_id, int width, int height)
     }
 
     /* Step 5 — st_create_context wires Mesa's dispatch table to ctx->pipe.
-     * Build-only for W4.6: skip when pipe is NULL to avoid a crash, but
-     * keep the symbol reference so the linker pulls in libmesa_main.a. */
-    if (ctx->pipe) {
-        ctx->st = st_create_context(OK_API_OPENGL_COMPAT, ctx->pipe,
-                                    NULL, NULL, NULL, 0, 0);
-        if (!ctx->st) {
-            printf("okGL: st_create_context failed\n");
-            /* destroy via screen->destroy() — same offset story; deferred */
-            vkDestroyInstance(ctx->instance, NULL);
-            free(ctx);
-            return NULL;
-        }
+     * W4.7: REQUIRED — fail the whole context-create if it doesn't return.
+     * (Previously gated on `if (ctx->pipe)` which was always-true given the
+     * preceding NULL-check on ctx->pipe; the gate was dead code for W4.6
+     * build-acceptance and is now removed for clarity.) */
+    ctx->st = st_create_context(OK_API_OPENGL_COMPAT, ctx->pipe,
+                                NULL, NULL, NULL, 0, 0);
+    if (!ctx->st) {
+        printf("okGL: st_create_context failed\n");
+        /* pipe_context + pipe_screen destroy via vtable — both libGL.a
+         * symbols. Errors here are best-effort cleanup. */
+        if (ctx->pipe->destroy) ctx->pipe->destroy(ctx->pipe);
+        if (ctx->screen->destroy) ctx->screen->destroy(ctx->screen);
+        vkDestroyInstance(ctx->instance, NULL);
+        free(ctx);
+        return NULL;
     }
 
     return ctx;
@@ -205,16 +228,16 @@ okGLCreateContext(uint32_t window_id, int width, int height)
 int
 okGLMakeCurrent(OK_GLContext *ctx)
 {
-    if (!ctx) {
-        /* Unbind. */
-        return _mesa_make_current(NULL, NULL, NULL);
+    /* okGL convention: 0 = success, non-zero = failure (matches the
+     * hello-gl-clear check `if (okGLMakeCurrent(ctx) != 0) SKIP`).
+     * _mesa_make_current returns GLboolean: 1 = success, 0 = failure. */
+    struct gl_context *gctx = NULL;
+    if (ctx) {
+        if (!ctx->st) return -1;  /* unconfigured context */
+        gctx = ((struct ok_st_context_head *)ctx->st)->ctx;
     }
-    if (!ctx->st) {
-        /* W4.6 build-acceptance path — st_context wasn't created.
-         * Not an error, but glClear / glDrawArrays will be no-ops. */
-        return 0;
-    }
-    return _mesa_make_current(ctx->st, NULL, NULL);
+    int ok = _mesa_make_current(gctx, NULL, NULL);
+    return ok ? 0 : -1;
 }
 
 int
@@ -234,9 +257,15 @@ void
 okGLDestroyContext(OK_GLContext *ctx)
 {
     if (!ctx) return;
+    /* Unbind first so Mesa doesn't dereference a stale gl_context after
+     * st_destroy_context tears it down. */
+    _mesa_make_current(NULL, NULL, NULL);
     if (ctx->st) st_destroy_context(ctx->st);
-    /* pipe_screen->destroy() and pipe_context->destroy() are vtable
-     * dispatches; deferred to W4.7 when we include p_screen.h here. */
+    /* W4.7: pipe_context and pipe_screen are vtable dispatches now that
+     * p_screen.h is in scope. Some Gallium drivers tear pipe_context down
+     * inside st_destroy_context — if our pipe survived, kill it explicitly. */
+    if (ctx->pipe && ctx->pipe->destroy) ctx->pipe->destroy(ctx->pipe);
+    if (ctx->screen && ctx->screen->destroy) ctx->screen->destroy(ctx->screen);
     if (ctx->instance) vkDestroyInstance(ctx->instance, NULL);
     free(ctx);
 }
