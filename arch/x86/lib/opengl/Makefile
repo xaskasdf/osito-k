@@ -535,10 +535,12 @@ COMPILER_GLCPP_SRCS  := \
   $(MESA_ROOT)/src/compiler/glsl/glcpp/pp_standalone_scaffolding.c
 
 # W4.8 — vulkan/util/  (vk_dispatch_table, vk_enum_to_str, vk_extensions)
+# W4.10++ — added vk_format.c (vendored from Mesa upstream main, 43KB)
 VK_UTIL_SRCS         := \
   $(MESA_ROOT)/src/vulkan/util/vk_dispatch_table.c \
   $(MESA_ROOT)/src/vulkan/util/vk_enum_to_str.c \
-  $(MESA_ROOT)/src/vulkan/util/vk_extensions.c
+  $(MESA_ROOT)/src/vulkan/util/vk_extensions.c \
+  $(MESA_ROOT)/src/vulkan/util/vk_format.c
 
 COMPILER_C_SRCS_ABS  := $(COMPILER_TOP_SRCS) $(COMPILER_NIR_SRCS) \
                         $(COMPILER_SPIRV_SRCS) $(COMPILER_GLSL_C_SRCS) \
@@ -735,13 +737,19 @@ MAIN_C_SRCS        := $(patsubst $(OPENGL_ROOT)/%,%,$(MAIN_C_SRCS_ABS))
 # Mesa).  shared-glapi/glapi_mapi_tmp.h is the generated dispatch header
 # (40k lines) — pre-generated at T0-gen.  shared-glapi/{glapi,stub,table}.c
 # replace mapi/glapi/glapi_dispatch.c on this path.
+#
+# W4.7 T1 — DROP glapi_dispatch.c. It generates the same gl* entrypoints
+# as mapi/entry.c (#include "mapi_tmp.h" with MAPI_TMP_PUBLIC_ENTRIES) and
+# the link blows up with "multiple definition of glClear" etc. entry.c is
+# the canonical SHARED-GLAPI entrypoint generator; glapi_dispatch.c is a
+# leftover from the legacy non-shared-glapi build path. No external code
+# references glapi_dispatch_table_t (verified via grep).
 MAPI_C_SRCS_ABS    := \
   $(MESA_ROOT)/src/mapi/u_current.c \
   $(MESA_ROOT)/src/mapi/entry.c \
   $(MESA_ROOT)/src/mapi/shared-glapi/glapi.c \
   $(MESA_ROOT)/src/mapi/shared-glapi/stub.c \
   $(MESA_ROOT)/src/mapi/shared-glapi/table.c \
-  $(MESA_ROOT)/src/mapi/glapi/glapi_dispatch.c \
   $(MESA_ROOT)/src/mapi/glapi/glapi_entrypoint.c \
   $(MESA_ROOT)/src/mapi/glapi/glapi_getproc.c \
   $(MESA_ROOT)/src/mapi/glapi/glapi_nop.c
