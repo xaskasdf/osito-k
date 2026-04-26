@@ -192,6 +192,13 @@ struct venus_cmd_buffer {
     uint32_t recorded_first_vertex;    /* last CmdDraw firstVertex */
     int32_t  last_drawn_image_slot;    /* venus_image slot last bound via render pass; -1 */
     uint32_t drew_flag;                /* 1 once CmdDraw recorded inside the active RP */
+    /* W4.8 — clear-only fast path. CmdBeginRenderPass with LOAD_OP_CLEAR
+     * records the clear value here; CmdClearColorImage also writes here.
+     * QueueSubmit fills SHM-backed memory bound to last_drawn_image_slot
+     * (or recorded_clear_image_slot if set). */
+    uint32_t recorded_clear_color;     /* BGRA8 packed (B=lo,G,R,A=hi); 0 = none */
+    uint32_t recorded_has_clear;       /* 1 if recorded_clear_color is valid */
+    int32_t  recorded_clear_image_slot;/* venus_image slot for vkCmdClearColorImage; -1 */
     uint32_t _pad6;
 };
 
@@ -402,6 +409,12 @@ venus_CmdSetViewport(VkCommandBuffer, uint32_t, uint32_t,
 VKAPI_ATTR void VKAPI_CALL
 venus_CmdSetScissor(VkCommandBuffer, uint32_t, uint32_t,
                     const VkRect2D *);
+
+/* W4.8 — clear-only fast path. */
+VKAPI_ATTR void VKAPI_CALL
+venus_CmdClearColorImage(VkCommandBuffer, VkImage, VkImageLayout,
+                         const VkClearColorValue *, uint32_t,
+                         const VkImageSubresourceRange *);
 
 /* W3b.5 — WSI + surface + swapchain + queue + sync + present. */
 

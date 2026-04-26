@@ -640,6 +640,10 @@ venus_AllocateCommandBuffers(VkDevice device,
         vcb->recorded_first_vertex  = 0;
         vcb->last_drawn_image_slot  = -1;
         vcb->drew_flag              = 0;
+        /* W4.8 — clear-only fast path. */
+        vcb->recorded_clear_color       = 0u;
+        vcb->recorded_has_clear         = 0u;
+        vcb->recorded_clear_image_slot  = -1;
     }
     if (allocated != count) {
         for (uint32_t i = 0; i < allocated; i++) {
@@ -726,6 +730,10 @@ venus_BeginCommandBuffer(VkCommandBuffer cb,
     vcb->recorded_first_vertex  = 0;
     vcb->last_drawn_image_slot  = -1;
     vcb->drew_flag              = 0;
+    /* W4.8 — clear-only fast path. */
+    vcb->recorded_clear_color       = 0u;
+    vcb->recorded_has_clear         = 0u;
+    vcb->recorded_clear_image_slot  = -1;
     if (dev->parent && dev->parent->wire && vcb->host_id != 0)
         (void)venus_cmd_encode_BeginCommandBuffer(dev->parent->wire,
                                                   dev->host_handle,
@@ -770,6 +778,30 @@ venus_CmdBeginRenderPass(VkCommandBuffer cb,
     if (fbslot >= 0 && fbslot < (int)VENUS_MAX_FB_OBJECTS &&
         dev->framebuffers[fbslot].in_use) {
         vcb->last_drawn_image_slot = dev->framebuffers[fbslot].first_color_image_slot;
+    }
+
+    /* W4.8 — capture LOAD_OP_CLEAR's color from the first clear value.
+     * VkClearValue.color.float32 is RGBA 0..1; pack into BGRA8 (compositor
+     * expects little-endian u32 bytes [B,G,R,A]). The render pass usually
+     * has multiple attachments but for the clear-only path we only honor
+     * the first color attachment. */
+    if (pBegin->clearValueCount > 0 && pBegin->pClearValues) {
+        const float *c = pBegin->pClearValues[0].color.float32;
+        float r = c[0], g = c[1], b = c[2], a = c[3];
+        if (r < 0.0f) r = 0.0f; else if (r > 1.0f) r = 1.0f;
+        if (g < 0.0f) g = 0.0f; else if (g > 1.0f) g = 1.0f;
+        if (b < 0.0f) b = 0.0f; else if (b > 1.0f) b = 1.0f;
+        if (a < 0.0f) a = 0.0f; else if (a > 1.0f) a = 1.0f;
+        uint32_t br = (uint32_t)(b * 255.0f + 0.5f);
+        uint32_t bg = (uint32_t)(g * 255.0f + 0.5f);
+        uint32_t bb = (uint32_t)(r * 255.0f + 0.5f);  /* red byte at byte[2] */
+        uint32_t ba = (uint32_t)(a * 255.0f + 0.5f);
+        vcb->recorded_clear_color = br | (bg << 8) | (bb << 16) | (ba << 24);
+        vcb->recorded_has_clear   = 1u;
+        /* Also tag the framebuffer's color image as the clear target — so
+         * QueueSubmit can find the SHM even if no CmdDraw fires. */
+        if (vcb->last_drawn_image_slot >= 0)
+            vcb->recorded_clear_image_slot = vcb->last_drawn_image_slot;
     }
 
     if (dev->parent && dev->parent->wire && vcb->host_id != 0) {

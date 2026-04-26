@@ -156,5 +156,9 @@ venus_icdGetInstanceProcAddr(VkInstance instance, const char *name) {
     if (strcmp(name, "vkCmdSetScissor") == 0)
         return (PFN_vkVoidFunction)venus_CmdSetScissor;
 
+    /* W4.8 — clear-only fast path. */
+    if (strcmp(name, "vkCmdClearColorImage") == 0)
+        return (PFN_vkVoidFunction)venus_CmdClearColorImage;
+
     return NULL;
 }

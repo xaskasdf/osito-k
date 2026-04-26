@@ -104,3 +104,45 @@ venus_CmdSetScissor(VkCommandBuffer cb, uint32_t firstScissor,
                 dev->parent->wire, dev->host_handle, vcb->host_id,
                 firstScissor, scissorCount, pScissors);
 }
+
+/* W4.8 — vkCmdClearColorImage entry point.
+ *
+ * Records the clear color + target image slot on the cmd buffer. Actual
+ * SHM fill happens in QueueSubmit (so we don't burn time on cmd buffers
+ * that are recorded but never submitted, and so we honor cmd buffer
+ * ordering: the SHM is filled when the GPU "executes" the cmd, not when
+ * the app records it).
+ *
+ * VkClearColorValue.float32 is RGBA 0..1; pack into BGRA8 byte order
+ * (compositor expects little-endian u32 with bytes [B,G,R,A]). */
+VKAPI_ATTR void VKAPI_CALL
+venus_CmdClearColorImage(VkCommandBuffer cb, VkImage image,
+                         VkImageLayout imageLayout,
+                         const VkClearColorValue *pColor,
+                         uint32_t rangeCount,
+                         const VkImageSubresourceRange *pRanges) {
+    (void)imageLayout; (void)rangeCount; (void)pRanges;
+    if (!cb || !image || !pColor) return;
+    struct venus_cmd_buffer *vcb = (struct venus_cmd_buffer *)cb;
+    struct venus_device *dev = vcb->owner;
+    if (!dev) return;
+    int islot = (int)(((uint64_t)image >> 48) & VENUS_H_SLOT_MASK_W3B6);
+    if (islot < 0 || islot >= (int)VENUS_MAX_IMAGE_OBJECTS) return;
+    if (!dev->images[islot].in_use) return;
+
+    float r = pColor->float32[0];
+    float g = pColor->float32[1];
+    float b = pColor->float32[2];
+    float a = pColor->float32[3];
+    if (r < 0.0f) r = 0.0f; else if (r > 1.0f) r = 1.0f;
+    if (g < 0.0f) g = 0.0f; else if (g > 1.0f) g = 1.0f;
+    if (b < 0.0f) b = 0.0f; else if (b > 1.0f) b = 1.0f;
+    if (a < 0.0f) a = 0.0f; else if (a > 1.0f) a = 1.0f;
+    uint32_t br = (uint32_t)(b * 255.0f + 0.5f);
+    uint32_t bg = (uint32_t)(g * 255.0f + 0.5f);
+    uint32_t bb = (uint32_t)(r * 255.0f + 0.5f);  /* red byte at byte[2] */
+    uint32_t ba = (uint32_t)(a * 255.0f + 0.5f);
+    vcb->recorded_clear_color      = br | (bg << 8) | (bb << 16) | (ba << 24);
+    vcb->recorded_has_clear        = 1u;
+    vcb->recorded_clear_image_slot = islot;
+}
