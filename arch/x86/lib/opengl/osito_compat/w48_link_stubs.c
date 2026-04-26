@@ -52,9 +52,9 @@ int util_set_thread_affinity(unsigned long thread, const void *mask, void *old_m
  */
 void *trace_context_create_threaded(void *screen, void *pipe, void **replace_pipe, void *replace_data, unsigned flags) { (void)screen;(void)replace_pipe;(void)replace_data;(void)flags; return pipe; }
 
-/* aaline / aapoint NIR fallbacks */
-int nir_lower_aaline_fs(void *shader, int *vars, void *stipple_tex, void *stipple_sampler) { (void)shader;(void)vars;(void)stipple_tex;(void)stipple_sampler; return 0; }
-int nir_lower_aapoint_fs(void *shader, int *vars, int coord_replace) { (void)shader;(void)vars;(void)coord_replace; return 0; }
+/* W4.10++ — nir_lower_aaline_fs / nir_lower_aapoint_fs stubs removed.
+ * Real impls now provided by mesa/src/gallium/auxiliary/nir/nir_draw_helpers.c
+ * (compiled into libmesa_gallium.a). */
 
 /* ARB program parser */
 int _mesa_parse_arb_program(void *ctx, unsigned target, const unsigned char *str, unsigned len, void *prog) { (void)ctx;(void)target;(void)str;(void)len;(void)prog; return 0; }
@@ -63,8 +63,26 @@ int _mesa_parse_arb_program(void *ctx, unsigned target, const unsigned char *str
 void driParseConfigFiles(void *cache, const void *info, int screen_no, const char *driver_name, const char *kernel_driver_name, const char *app_name, const char *app_version, const char *engine_name, const char *engine_version) { (void)cache;(void)info;(void)screen_no;(void)driver_name;(void)kernel_driver_name;(void)app_name;(void)app_version;(void)engine_name;(void)engine_version; }
 unsigned char driQueryOptionb(const void *cache, const char *name) { (void)cache;(void)name; return 0; }
 
-/* vk_format helpers (vk_format.c excluded) */
-unsigned vk_format_aspects(unsigned format) { (void)format; return 0; }
+/* vk_format helpers — vk_format.c is NOT vendored under mesa/src/vulkan/util/.
+ * Improved fallbacks: aspects returns COLOR_BIT (safe default) instead of 0
+ * which could trigger assert(aspects != 0) on the depth/stencil branch.
+ * Format conversions still return UNDEFINED (0) — real impls require the
+ * generated 600-line vk_format_map[] table. */
+#define VK_IMAGE_ASPECT_COLOR_BIT_OK 0x00000001
+unsigned vk_format_aspects(unsigned format)
+{
+    /* Known depth/stencil VkFormat enum values (Vulkan spec) */
+    switch (format) {
+    case 124: return 0x00000002;                           /* D16_UNORM    -> DEPTH */
+    case 125: return 0x00000002;                           /* X8_D24_UNORM */
+    case 126: return 0x00000002;                           /* D32_SFLOAT   */
+    case 127: return 0x00000004;                           /* S8_UINT      -> STENCIL */
+    case 128: return 0x00000002 | 0x00000004;              /* D16_S8_UINT  */
+    case 129: return 0x00000002 | 0x00000004;              /* D24_S8_UINT  */
+    case 130: return 0x00000002 | 0x00000004;              /* D32_S8_UINT  */
+    default:  return VK_IMAGE_ASPECT_COLOR_BIT_OK;
+    }
+}
 unsigned vk_format_to_pipe_format(unsigned vk_format) { (void)vk_format; return 0; }
 unsigned vk_format_from_pipe_format(unsigned pipe_format) { (void)pipe_format; return 0; }
 
@@ -72,10 +90,9 @@ unsigned vk_format_from_pipe_format(unsigned pipe_format) { (void)pipe_format; r
 void _mesa_init_astc_decoder_luts(void *luts) { (void)luts; }
 const void *_mesa_get_astc_decoder_partition_table(unsigned block_w, unsigned block_h, unsigned partition_count) { (void)block_w;(void)block_h;(void)partition_count; return (void *)0; }
 
-/* os_file Linux helpers */
-int os_dupfd_cloexec(int fd) { (void)fd; return -1; }
-int os_file_create_unique(const char *prefix, int filemode) { (void)prefix;(void)filemode; return -1; }
-int os_same_file_description(int fd1, int fd2) { (void)fd1;(void)fd2; return -1; }
+/* W4.10++ — os_file POSIX helpers stubs removed. Real impls now in
+ * arch/x86/libc/crtgl.c (real syscall wrappers around fcntl, open, getpid,
+ * getrandom). */
 
 /* ZINK driver core — W4.10: 42 stubs lifted, real impls now in
  * libmesa_zink.a from zink_compiler.c + zink_context.c.

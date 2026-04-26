@@ -457,6 +457,7 @@ GALLIUM_SRCS := \
   mesa/src/gallium/auxiliary/util/u_threaded_context.c \
   mesa/src/gallium/auxiliary/nir/nir_to_tgsi.c \
   mesa/src/gallium/auxiliary/nir/tgsi_to_nir.c \
+  mesa/src/gallium/auxiliary/nir/nir_draw_helpers.c \
 
 # W4.8 — gallium/auxiliary/draw/  (draw_context + non-LLVM passes)
 # draw_llvm.c, draw_pt_fetch_shade_pipeline_llvm.c, draw_vs_llvm.c are
@@ -876,6 +877,22 @@ $(BUILD_DIR)/mesa/src/gallium/auxiliary/draw/%.o: \
 	@echo "  CC    draw/$*"
 	@$(CC) $(CFLAGS_MAIN) -c -o $@ $<
 
+# W4.10++ — gallium/auxiliary/nir/*.c needs CFLAGS_MAIN (compiler/nir
+# include path for nir.h). MUST come BEFORE the generic gallium/auxiliary/%.o
+# rule below — GNU Make 3.81 picks first-defined for pattern rules.
+$(BUILD_DIR)/mesa/src/gallium/auxiliary/nir/%.o: \
+        $(OPENGL_ROOT)/mesa/src/gallium/auxiliary/nir/%.c | $(BUILD_DIR)
+	@mkdir -p $(dir $@)
+	@echo "  CC    aux/nir/$*"
+	@$(CC) $(CFLAGS_MAIN) -c -o $@ $<
+
+# W4.10++ — nir_to_spirv variant: needs FULL zink include set + v305 vulkan_core.h.
+$(BUILD_DIR)/mesa/src/gallium/auxiliary/nir/nir_to_spirv/%.o: \
+        $(OPENGL_ROOT)/mesa/src/gallium/auxiliary/nir/nir_to_spirv/%.c | $(BUILD_DIR)
+	@mkdir -p $(dir $@)
+	@echo "  CC    nir_to_spirv/$*"
+	@$(CC) $(CFLAGS_ZINK) -c -o $@ $<
+
 # W4.8++ — generic fallback for gallium/auxiliary/* (tgsi/, util/, translate/,
 # cso_cache/, indices/, pipebuffer/, etc.). Uses CFLAGS (not CFLAGS_MAIN) since
 # these don't need mesa/main headers.
@@ -892,22 +909,8 @@ $(BUILD_DIR)/mesa/src/util/format/%.o: \
 	@echo "  CC    util/format/$*"
 	@$(CC) $(CFLAGS) -c -o $@ $<
 
-# nir_to_tgsi.c, nir_to_tgsi_info.c, tgsi_to_nir.c need MAIN includes
-$(BUILD_DIR)/mesa/src/gallium/auxiliary/nir/%.o: \
-        $(OPENGL_ROOT)/mesa/src/gallium/auxiliary/nir/%.c | $(BUILD_DIR)
-	@mkdir -p $(dir $@)
-	@echo "  CC    aux/nir/$*"
-	@$(CC) $(CFLAGS_MAIN) -c -o $@ $<
-
-# nir_to_spirv requires the FULL zink include set (it includes
-# zink_compiler.h transitively, which pulls vk_util.h, vk_dispatch_table.h,
-# kopper_interface.h, etc.). Reuse CFLAGS_ZINK so we get matching headers
-# AND vulkan_core.h v305 (avoids 303-vs-305 drift).
-$(BUILD_DIR)/mesa/src/gallium/auxiliary/nir/nir_to_spirv/%.o: \
-        $(OPENGL_ROOT)/mesa/src/gallium/auxiliary/nir/nir_to_spirv/%.c | $(BUILD_DIR)
-	@mkdir -p $(dir $@)
-	@echo "  CC    nir_to_spirv/$*"
-	@$(CC) $(CFLAGS_ZINK) -c -o $@ $<
+# W4.10++ — nir/* and nir_to_spirv/* rules moved BEFORE the generic
+# gallium/auxiliary/%.o rule above (GNU Make 3.81 first-match order).
 
 # W4.8-cont — generic gallium rule (CFLAGS).  Specific zink/draw/nir
 # rules are defined ABOVE so GNU make 3.81 picks them via stem-length.

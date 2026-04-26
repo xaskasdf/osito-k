@@ -269,3 +269,58 @@ int __popcountsi2(unsigned int x)
     while (x) { c += (int)(x & 1); x >>= 1; }
     return c;
 }
+
+/* W4.10++ POSIX file helpers used by mesa/src/util/os_file.c.
+ * Previously stubbed; now implemented as real syscall wrappers.
+ * Linux x86-64 syscalls: fcntl=72, open=2, getpid=39, getrandom=318. */
+
+#define F_DUPFD_CLOEXEC 1030
+#define F_GETFL         3
+
+int os_dupfd_cloexec(int fd)
+{
+    long r = __syscall6(72, fd, F_DUPFD_CLOEXEC, 0, 0, 0, 0);
+    return (int)r;
+}
+
+int os_same_file_description(int fd1, int fd2)
+{
+    if (fd1 == fd2) return 1;
+    long f1 = __syscall6(72, fd1, F_GETFL, 0, 0, 0, 0);
+    long f2 = __syscall6(72, fd2, F_GETFL, 0, 0, 0, 0);
+    if (f1 < 0 || f2 < 0) return -1;
+    return (f1 == f2) ? 1 : 0;
+}
+
+int os_file_create_unique(const char *prefix, int filemode)
+{
+    if (!prefix) return -1;
+    /* O_CREAT=0x40, O_EXCL=0x80, O_RDWR=0x2, O_CLOEXEC=0x80000 */
+    const int flags = 0x40 | 0x80 | 0x2 | 0x80000;
+    size_t plen = 0;
+    while (prefix[plen]) plen++;
+    if (plen > 200) return -1;
+    long pid = __syscall6(39, 0, 0, 0, 0, 0, 0);
+    char path[256];
+    for (int attempt = 0; attempt < 8; attempt++) {
+        unsigned long rnd = 0;
+        __syscall6(318, (long)&rnd, sizeof(rnd), 0, 0, 0, 0);
+        size_t i = 0;
+        for (size_t j = 0; j < plen && i < sizeof(path) - 32; j++) path[i++] = prefix[j];
+        path[i++] = '.';
+        char tmp[24]; int t = 0;
+        unsigned long v = (unsigned long)pid;
+        if (v == 0) tmp[t++] = '0';
+        else { while (v) { tmp[t++] = '0' + (v % 10); v /= 10; } }
+        while (t--) path[i++] = tmp[t];
+        path[i++] = '.';
+        for (int s = 60; s >= 0; s -= 4) {
+            int nib = (int)((rnd >> s) & 0xf);
+            path[i++] = nib < 10 ? '0' + nib : 'a' + nib - 10;
+        }
+        path[i] = 0;
+        long fd = __syscall6(2, (long)path, flags, filemode, 0, 0, 0);
+        if (fd >= 0) return (int)fd;
+    }
+    return -1;
+}
