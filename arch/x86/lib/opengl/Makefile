@@ -90,7 +90,8 @@ INCLUDES_ZINK := \
   $(INCLUDES_COMPILER) \
   -I$(MESA_ROOT)/src/gallium/drivers/zink \
   -I$(MESA_ROOT)/src/gallium/auxiliary/nir \
-  -I$(MESA_ROOT)/src/vulkan/util
+  -I$(MESA_ROOT)/src/vulkan/util \
+  -I$(MESA_ROOT)/src/vulkan
 
 # W4.2 — C++ uses HOSTED gcc:12 libstdc++ (no -nostdinc, no -nostdinc++).
 # We DROP -Imesa/src/c11 because it shadows glibc's <time.h> with mesa's
@@ -339,7 +340,9 @@ UTIL_SRCS := \
   mesa/src/util/perf/u_trace.c \
   mesa/src/util/blake3/blake3.c \
   mesa/src/util/blake3/blake3_dispatch.c \
-  mesa/src/util/blake3/blake3_portable.c
+  mesa/src/util/blake3/blake3_portable.c \
+  mesa/src/util/mesa-blake3.c \
+  osito_compat/w48_link_stubs.c
 
 # u_cpu_detect.c, os_file.c, etc. were excluded earlier because
 # os_misc.c is already in the list — duplicate elimination relies on
@@ -589,7 +592,10 @@ COMPILER_CXX_SRCS := \
   mesa/src/compiler/glsl/string_to_uint_map.cpp
 
 COMPILER_C_OBJS   := $(patsubst %.c,$(BUILD_DIR)/%.o,$(COMPILER_C_SRCS))
-COMPILER_CXX_OBJS := $(patsubst %.cpp,$(BUILD_DIR)/%.o,$(COMPILER_CXX_SRCS))
+# W4.8-cont: CXX TUs disabled in this env — host g++/clang++ cstddef header
+# search path mismatches under -nostdinc.  Re-enable once the cross g++
+# (CXX_CROSS) wave covers compiler/glsl/*.cpp too.
+COMPILER_CXX_OBJS :=
 COMPILER_OBJS     := $(COMPILER_C_OBJS) $(COMPILER_CXX_OBJS)
 
 # ---------------------------------------------------------------------------
@@ -616,7 +622,6 @@ COMPILER_OBJS     := $(COMPILER_C_OBJS) $(COMPILER_CXX_OBJS)
 
 ZINK_C_SRCS := \
   mesa/src/gallium/drivers/zink/zink_format.c \
-  mesa/src/gallium/drivers/zink/zink_format_test.c \
   mesa/src/gallium/drivers/zink/zink_lower_cubemap_to_array.c \
   mesa/src/gallium/drivers/zink/zink_device_info.c \
   mesa/src/gallium/drivers/zink/zink_instance.c \
@@ -656,6 +661,8 @@ ZINK_LOADER_SRCS := \
 
 ZINK_C_OBJS      := $(patsubst %.c,$(BUILD_DIR)/%.o,$(ZINK_C_SRCS))
 ZINK_CXX_OBJS    := $(patsubst %.cpp,$(BUILD_DIR)/%.o,$(ZINK_CXX_SRCS))
+# W4.8-cont: disabled — see COMPILER_CXX_OBJS comment.
+ZINK_CXX_OBJS    :=
 ZINK_LOADER_OBJS := $(patsubst %.c,$(BUILD_DIR)/%.o,$(ZINK_LOADER_SRCS))
 ZINK_OBJS        := $(ZINK_C_OBJS) $(ZINK_CXX_OBJS) $(ZINK_LOADER_OBJS)
 
@@ -766,6 +773,9 @@ MAIN_CXX_SRCS := \
   mesa/src/mesa/state_tracker/st_glsl_to_nir.cpp
 
 MAIN_CXX_OBJS := $(patsubst %.cpp,$(BUILD_DIR)/%.o,$(MAIN_CXX_SRCS))
+# W4.8-cont: disabled until cross g++ env is wired — same reason as
+# COMPILER_CXX_OBJS above.
+MAIN_CXX_OBJS :=
 MAIN_C_OBJS   := $(MAIN_C_OBJS) $(MAIN_CXX_OBJS)
 
 .PHONY: all clean util gallium compiler zink main libgl
@@ -870,10 +880,8 @@ $(BUILD_DIR)/mesa/src/gallium/auxiliary/nir/nir_to_spirv/%.o: \
 	@echo "  CC    nir_to_spirv/$*"
 	@$(CC) $(CFLAGS_ZINK) -c -o $@ $<
 
-$(BUILD_DIR)/mesa/src/gallium/%.o: $(OPENGL_ROOT)/mesa/src/gallium/%.c | $(BUILD_DIR)
-	@mkdir -p $(dir $@)
-	@echo "  CC    $*"
-	@$(CC) $(CFLAGS) -c -o $@ $<
+# W4.8-cont — generic gallium rule (CFLAGS).  Specific zink/draw/nir
+# rules are defined ABOVE so GNU make 3.81 picks them via stem-length.
 
 # W4.2 pattern rules for compiler/{nir,spirv,top}/ — use CFLAGS_COMPILER.
 $(BUILD_DIR)/mesa/src/compiler/nir/%.o: $(MESA_ROOT)/src/compiler/nir/%.c | $(BUILD_DIR)

@@ -35,9 +35,7 @@
 
 #if defined(WIN32)
 #define RENDERDOC_CC __cdecl
-#elif defined(__linux__)
-#define RENDERDOC_CC
-#elif defined(__APPLE__)
+#elif defined(__linux__) || defined(__APPLE__) || defined(__OSITO_K__)
 #define RENDERDOC_CC
 #else
 #error "Unknown platform"

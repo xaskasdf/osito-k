@@ -229,3 +229,43 @@ void _Unwind_Resume(void *exc) { (void)exc; abort(); }
 void *__gxx_personality_v0;
 
 /* ── memcmp may be referenced from cso_cache; tcclib provides one ── */
+
+/* ── More math: frexpf for nir_lower_flrp ── */
+
+float frexpf(float x, int *exp_out)
+{
+    if (x == 0.0f) { *exp_out = 0; return 0.0f; }
+    /* extract exponent from float bit pattern: bias 127, mantissa 23 bits */
+    union { float f; unsigned u; } u; u.f = x;
+    int exp = (int)((u.u >> 23) & 0xff) - 126;  /* normalised mantissa is in [0.5,1) → bias-126 */
+    u.u = (u.u & 0x807fffffu) | (126u << 23);
+    *exp_out = exp;
+    return u.f;
+}
+
+double frexp(double x, int *exp_out)
+{
+    if (x == 0.0) { *exp_out = 0; return 0.0; }
+    union { double f; unsigned long long u; } u; u.f = x;
+    int exp = (int)((u.u >> 52) & 0x7ff) - 1022;
+    u.u = (u.u & 0x800fffffffffffffull) | ((unsigned long long)1022 << 52);
+    *exp_out = exp;
+    return u.f;
+}
+
+/* ── llabs ── */
+long long llabs(long long x) { return x < 0 ? -x : x; }
+
+/* ── libgcc builtins not provided by minimal libgcc ── */
+int __popcountdi2(unsigned long long x)
+{
+    int c = 0;
+    while (x) { c += (int)(x & 1); x >>= 1; }
+    return c;
+}
+int __popcountsi2(unsigned int x)
+{
+    int c = 0;
+    while (x) { c += (int)(x & 1); x >>= 1; }
+    return c;
+}

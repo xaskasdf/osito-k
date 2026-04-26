@@ -214,9 +214,10 @@ const char *util_get_process_name(void) {
 /* open_memstream: glibc creates a FILE* that grows a malloc'd buffer.
  * OsitoK has no FILE* per se; return NULL so memstream-using Mesa code
  * (mostly debug message capture) falls through to its error path. */
-void *open_memstream(char **bufp, size_t *sizep) {
+struct _FILE;
+struct _FILE *open_memstream(char **bufp, size_t *sizep) {
     (void)bufp; (void)sizep;
-    return (void *)0;
+    return (struct _FILE *)0;
 }
 
 /* os_read_file: Mesa scans /proc/meminfo etc. We have no fs at this

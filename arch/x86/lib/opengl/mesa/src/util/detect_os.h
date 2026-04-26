@@ -15,7 +15,7 @@
 #ifndef DETECT_OS_H
 #define DETECT_OS_H
 
-#if defined(__linux__)
+#if defined(__linux__) || defined(__OSITO_K__)
 #define DETECT_OS_LINUX 1
 #define DETECT_OS_POSIX 1
 #endif

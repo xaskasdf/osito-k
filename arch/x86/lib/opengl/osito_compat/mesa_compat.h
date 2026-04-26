@@ -277,6 +277,8 @@ static inline char *getenv(const char *name) { (void)name; return (char *)0; }
 #ifndef __cplusplus
 extern size_t strnlen(const char *s, size_t maxlen);
 extern char  *strndup(const char *s, size_t n);
+extern char  *strtok(char *str, const char *delim);
+extern int    asprintf(char **strp, const char *fmt, ...);
 extern int    rand(void);
 #endif
 
@@ -380,6 +382,71 @@ typedef __builtin_va_list __mesa_va_list;
 #ifndef __cplusplus
 extern int sscanf(const char *str, const char *fmt, ...);
 extern int vasprintf(char **out, const char *fmt, __mesa_va_list ap);
+struct _FILE;
+typedef struct _FILE FILE;
+extern FILE *open_memstream(char **bufp, size_t *sizep);
+extern FILE *fopencookie(void *cookie, const char *mode, void *iofuncs);
+extern FILE *fmemopen(void *buf, size_t size, const char *mode);
+extern int   vsprintf(char *str, const char *fmt, __mesa_va_list ap);
+extern int   vfprintf(FILE *f, const char *fmt, __mesa_va_list ap);
+extern void  rewind(FILE *f);
+extern long  ftell(FILE *f);
+extern int   fseek(FILE *f, long offset, int whence);
+extern long  readlink(const char *path, char *buf, size_t bufsize);
+extern int   getpid(void);
+extern char *getcwd(char *buf, size_t size);
+extern int   isatty(int fd);
+extern int   ftruncate(int fd, long length);
+extern long  lseek(int fd, long offset, int whence);
+extern int   unlink(const char *path);
+extern int   access(const char *path, int mode);
+/* stat/fstat/mkdir provided by sys/stat.h shim */
+extern int   rmdir(const char *path);
+extern int   pipe(int fds[2]);
+extern int   dup(int fd);
+extern int   dup2(int oldfd, int newfd);
+/* Math intrinsics referenced by NIR codegen */
+extern float ldexpf(float x, int exp);
+extern double ldexp(double x, int exp);
+extern float copysignf(float x, float y);
+extern double copysign(double x, double y);
+extern float frexpf(float x, int *exp);
+extern double frexp(double x, int *exp);
+extern float modff(float x, float *iptr);
+extern double modf(double x, double *iptr);
+extern float exp2f(float x);
+/* log2f / fmodf provided by qjs_headers/math.h */
+extern float log10f(float x);
+extern float hypotf(float x, float y);
+extern long long llabs(long long x);
+extern long labs(long x);
+extern long lroundf(float x);
+extern long lround(double x);
+extern long long llroundf(float x);
+extern long long llround(double x);
+/* roundf/truncf provided by qjs_headers/math.h */
+extern double round(double x);
+extern double trunc(double x);
+extern float nearbyintf(float x);
+extern double nearbyint(double x);
+extern float fminf(float x, float y);
+extern float fmaxf(float x, float y);
+extern double fmin(double x, double y);
+extern double fmax(double x, double y);
+extern float fmaf(float x, float y, float z);
+extern double fma(double x, double y, double z);
+#define isnormal(x) ((x) != 0.0 && __builtin_isnormal(x))
+#define isfinite(x) __builtin_isfinite(x)
+#define isnan(x)    __builtin_isnan(x)
+#define isinf(x)    __builtin_isinf(x)
+#define signbit(x)  __builtin_signbit(x)
+#define fpclassify(x) __builtin_fpclassify(FP_NAN, FP_INFINITE, FP_NORMAL, FP_SUBNORMAL, FP_ZERO, x)
+#define FP_NAN       0
+#define FP_INFINITE  1
+#define FP_ZERO      2
+#define FP_SUBNORMAL 3
+#define FP_NORMAL    4
+/* sysconf already declared above with _SC_* macros */
 #endif
 
 /* mmap stubs — Mesa shader cache uses mmap on Linux for file-backed
