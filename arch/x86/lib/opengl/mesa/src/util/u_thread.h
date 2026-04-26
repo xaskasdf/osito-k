@@ -45,6 +45,10 @@
  * still want to use normal TLS (which involves a function call, but not the
  * expensive pthread_getspecific() or its equivalent).
  */
+/* OsitoK: __THREAD_INITIAL_EXEC is force-defined to empty in
+ * osito_compat/mesa_compat.h (W4.7 T0) — single-threaded, no %fs setup.
+ * Skip the upstream macro selection so plain process globals are used. */
+#ifndef __THREAD_INITIAL_EXEC
 #if DETECT_OS_APPLE
 /* Apple Clang emits wrappers when using thread_local that break module linkage,
  * but not with __thread
@@ -55,6 +59,7 @@
 #define REALLY_INITIAL_EXEC
 #else
 #define __THREAD_INITIAL_EXEC thread_local
+#endif
 #endif
 
 #ifdef __cplusplus

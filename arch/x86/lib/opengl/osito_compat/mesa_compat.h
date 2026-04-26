@@ -478,6 +478,27 @@ static inline int mprotect(void *addr, size_t len, int prot) { (void)addr; (void
  * the actual pthread surface is provided above by this very header. */
 #define HAVE_PTHREAD 1
 #define USE_X86_64   1
+
+/* W4.7 T0 — Force non-TLS dispatch path (fix W4.5 C1).
+ *
+ * mesa/src/util/u_thread.h sets:
+ *   #if DETECT_OS_APPLE → __thread
+ *   #elif defined(__GLIBC__) → thread_local + initial-exec attribute
+ *   #else → thread_local
+ *
+ * On OsitoK we are -ffreestanding -nostdinc, no __GLIBC__ defined, so the
+ * "else" branch picks plain thread_local. Problem: the OsitoK ELF loader
+ * for tests doesn't initialize %fs (the TLS register), so any access to
+ * a thread_local variable would trap. Even if we wired %fs, single-threaded
+ * OsitoK doesn't need TLS for the GL dispatch table at all.
+ *
+ * Force __THREAD_INITIAL_EXEC to expand to nothing → _mesa_glapi_tls_Dispatch
+ * and _mesa_glapi_tls_Context become plain process globals. This is safe on
+ * single-threaded OsitoK and avoids the missing %fs setup entirely.
+ *
+ * We #include detect_os.h first so DETECT_OS_APPLE is defined (= 0 on us),
+ * preventing u_thread.h's first arm from triggering. */
+#define __THREAD_INITIAL_EXEC /* empty: non-TLS globals */
 /* W4.2 — In C++ mode hosted glibc supplies real secure_getenv.
  * Tell Mesa not to redefine it as static inline. */
 #ifdef __cplusplus
