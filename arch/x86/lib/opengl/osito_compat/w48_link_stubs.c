@@ -145,93 +145,21 @@ void zink_update_fbfetch(void *ctx) { (void)ctx; }
 void zink_update_rendering_info(void *ctx) { (void)ctx; }
 void zink_update_shadow_samplerviews(void *ctx, unsigned mask) { (void)ctx;(void)mask; }
 
-/* Additional zink internals exposed by zink_synchronization.cpp / draw.cpp (deferred C++ TUs) */
-void *zink_get_cmdbuf(void *ctx, void *src, void *dst) { (void)ctx;(void)src;(void)dst; return (void *)0; }
-void *zink_get_gfx_pipeline_eq_func(void *screen, void *prog) { (void)screen;(void)prog; return (void *)0; }
-void  zink_init_screen_pipeline_libs(void *screen) { (void)screen; }
-void  zink_resource_buffer_transfer_dst_barrier(void *ctx, void *res, unsigned offset, unsigned size) { (void)ctx;(void)res;(void)offset;(void)size; }
-void  zink_resource_image_barrier_init(void *ctx, void *res, unsigned new_layout, unsigned new_access, unsigned new_pipeline) { (void)ctx;(void)res;(void)new_layout;(void)new_access;(void)new_pipeline; }
-void  zink_resource_image_barrier2_init(void *ctx, void *res, unsigned new_layout, unsigned new_access, unsigned new_pipeline) { (void)ctx;(void)res;(void)new_layout;(void)new_access;(void)new_pipeline; }
-void  zink_synchronization_init(void *screen) { (void)screen; }
-
-/* GLSL C++ frontend deferral (uniform_query.cpp, shader_query.cpp, ir_function.cpp etc.) */
-void _mesa_BindAttribLocation(unsigned program, unsigned index, const char *name) { (void)program;(void)index;(void)name; }
-void _mesa_BindAttribLocation_no_error(unsigned program, unsigned index, const char *name) { (void)program;(void)index;(void)name; }
-void _mesa_BindFragDataLocation(unsigned program, unsigned colorNumber, const char *name) { (void)program;(void)colorNumber;(void)name; }
-void _mesa_BindFragDataLocationIndexed(unsigned program, unsigned colorNumber, unsigned index, const char *name) { (void)program;(void)colorNumber;(void)index;(void)name; }
-void _mesa_BindFragDataLocationIndexed_no_error(unsigned program, unsigned colorNumber, unsigned index, const char *name) { (void)program;(void)colorNumber;(void)index;(void)name; }
-void _mesa_BindFragDataLocation_no_error(unsigned program, unsigned colorNumber, const char *name) { (void)program;(void)colorNumber;(void)name; }
-void _mesa_GetActiveAttrib(unsigned p, unsigned i, int sz, int *l, int *s, unsigned *t, char *n) { (void)p;(void)i;(void)sz;(void)l;(void)s;(void)t;(void)n; }
-void _mesa_GetActiveUniform(unsigned p, unsigned i, int sz, int *l, int *s, unsigned *t, char *n) { (void)p;(void)i;(void)sz;(void)l;(void)s;(void)t;(void)n; }
-void _mesa_GetActiveUniform_impl(void *ctx, unsigned p, unsigned i, int sz, int *l, int *s, unsigned *t, char *n, int x) { (void)ctx;(void)p;(void)i;(void)sz;(void)l;(void)s;(void)t;(void)n;(void)x; }
-void _mesa_GetActiveUniformsiv(unsigned p, int c, const unsigned *i, unsigned pname, int *params) { (void)p;(void)c;(void)i;(void)pname;(void)params; }
-int  _mesa_GetAttribLocation(unsigned program, const char *name) { (void)program;(void)name; return -1; }
-int  _mesa_GetFragDataIndex(unsigned program, const char *name) { (void)program;(void)name; return -1; }
-int  _mesa_GetFragDataLocation(unsigned program, const char *name) { (void)program;(void)name; return -1; }
-unsigned _mesa_count_active_attribs(void *prog) { (void)prog; return 0; }
-void *_mesa_create_program_resource_hash(void) { return (void *)0; }
-int  _mesa_ensure_and_associate_uniform_storage(void *ctx, void *sh, void *prog, unsigned num) { (void)ctx;(void)sh;(void)prog;(void)num; return 0; }
-void _mesa_flush_vertices_for_uniforms(void *ctx, const void *uni) { (void)ctx;(void)uni; }
-void _mesa_get_program_interfaceiv(void *ctx, void *shProg, unsigned program_interface, unsigned pname, int *params) { (void)ctx;(void)shProg;(void)program_interface;(void)pname;(void)params; }
-void _mesa_get_program_resource_name(void *ctx, void *shProg, unsigned pi, unsigned idx, int bufSize, int *length, char *name, int caller) { (void)ctx;(void)shProg;(void)pi;(void)idx;(void)bufSize;(void)length;(void)name;(void)caller; }
-void _mesa_get_program_resourceiv(void *ctx, void *shProg, unsigned pi, unsigned idx, int propCount, const unsigned *props, int bufSize, int *length, int *params) { (void)ctx;(void)shProg;(void)pi;(void)idx;(void)propCount;(void)props;(void)bufSize;(void)length;(void)params; }
-void _mesa_get_uniform(void *ctx, unsigned program, int location, int bufSize, unsigned returnType, void *paramsOut) { (void)ctx;(void)program;(void)location;(void)bufSize;(void)returnType;(void)paramsOut; }
-void _mesa_glsl_builtin_functions_decref(void) {}
-void _mesa_glsl_builtin_functions_init_or_ref(void) {}
-int  _mesa_glsl_can_implicitly_convert(const void *from, const void *to, void *state) { (void)from;(void)to;(void)state; return 0; }
-void _mesa_glsl_compile_shader(void *ctx, void *shader, int dump_ast, int dump_hir, int force_recompile) { (void)ctx;(void)shader;(void)dump_ast;(void)dump_hir;(void)force_recompile; }
-const void *_mesa_glsl_get_builtin_uniform_desc(const char *name) { (void)name; return (void *)0; }
-unsigned _mesa_longest_attribute_name_length(void *prog) { (void)prog; return 0; }
-unsigned _mesa_program_resource_array_size(void *res) { (void)res; return 0; }
-int  _mesa_program_resource_find_index(void *shProg, unsigned pi, unsigned idx) { (void)shProg;(void)pi;(void)idx; return -1; }
-void *_mesa_program_resource_find_name(void *shProg, unsigned pi, const char *name, unsigned *idx) { (void)shProg;(void)pi;(void)name;(void)idx; return (void *)0; }
-void _mesa_program_resource_hash_destroy(void *prog) { (void)prog; }
-unsigned _mesa_program_resource_index(void *shProg, void *res) { (void)shProg;(void)res; return 0; }
-int  _mesa_program_resource_location(void *shProg, unsigned pi, const char *name) { (void)shProg;(void)pi;(void)name; return -1; }
-int  _mesa_program_resource_location_index(void *shProg, unsigned pi, const char *name) { (void)shProg;(void)pi;(void)name; return -1; }
-const char *_mesa_program_resource_name(void *res) { (void)res; return ""; }
-unsigned _mesa_program_resource_name_length(void *res) { (void)res; return 0; }
-unsigned _mesa_program_resource_prop(void *shProg, void *res, unsigned idx, unsigned prop, int *val, int caller) { (void)shProg;(void)res;(void)idx;(void)prop;(void)val;(void)caller; return 0; }
-void _mesa_propagate_uniforms_to_driver_storage(void *uni_storage, unsigned array_idx, unsigned count) { (void)uni_storage;(void)array_idx;(void)count; }
-int  _mesa_sampler_uniforms_are_valid(const void *prog, char *err, unsigned errlen) { (void)prog;(void)err;(void)errlen; return 1; }
-int  _mesa_sampler_uniforms_pipeline_are_valid(void *pip) { (void)pip; return 1; }
-void _mesa_uniform(int location, int count, const void *values, void *ctx, void *prog, unsigned glsl_type) { (void)location;(void)count;(void)values;(void)ctx;(void)prog;(void)glsl_type; }
-void _mesa_uniform_handle(int location, int count, const void *values, void *ctx, void *prog, unsigned glsl_type) { (void)location;(void)count;(void)values;(void)ctx;(void)prog;(void)glsl_type; }
-void _mesa_uniform_matrix(int cols, int rows, int location, int count, unsigned char transpose, const void *values, void *ctx, void *prog, unsigned matrix_type) { (void)cols;(void)rows;(void)location;(void)count;(void)transpose;(void)values;(void)ctx;(void)prog;(void)matrix_type; }
-void _mesa_unpack_astc_2d_ldr(uint8_t *dst_row, unsigned dst_stride, const uint8_t *src_row, unsigned src_stride, unsigned width, unsigned height, unsigned format) { (void)dst_row;(void)dst_stride;(void)src_row;(void)src_stride;(void)width;(void)height;(void)format; }
-int  _mesa_validate_pipeline_io(void *pip) { (void)pip; return 1; }
-
-/* GLSL deserialize / link helpers (serialize.cpp + linker_util.cpp deferral) */
-void deserialize_glsl_program(void *blob, void *ctx, void *prog) { (void)blob;(void)ctx;(void)prog; }
-void serialize_glsl_program(void *blob, void *ctx, void *prog) { (void)blob;(void)ctx;(void)prog; }
-const char *interpolation_string(unsigned interp) { (void)interp; return ""; }
-void link_util_add_program_resource(void *prog, void *resource_set, unsigned type, const void *data, unsigned char stages) { (void)prog;(void)resource_set;(void)type;(void)data;(void)stages; }
-int  link_util_calculate_subroutine_compat(void *prog) { (void)prog; return 1; }
-int  link_util_check_subroutine_resources(void *prog) { (void)prog; return 1; }
-int  link_util_check_uniform_resources(void *ctx, void *prog) { (void)ctx;(void)prog; return 1; }
-int  link_util_find_empty_block(void *prog, void *var) { (void)prog;(void)var; return -1; }
-void link_util_mark_array_elements_referenced(const void *list, unsigned list_size, unsigned dim, unsigned mask) { (void)list;(void)list_size;(void)dim;(void)mask; }
-int  link_util_parse_program_resource_name(const char *name, int n_len, int *array_index) { (void)name;(void)n_len;(void)array_index; return 0; }
-int  link_util_should_add_buffer_variable(void *prog, void *block, int top_level_array_size, int top_level_array_stride, int row_major, int matrix_stride, unsigned packing) { (void)prog;(void)block;(void)top_level_array_size;(void)top_level_array_stride;(void)row_major;(void)matrix_stride;(void)packing; return 0; }
-void link_util_update_empty_uniform_locations(void *prog) { (void)prog; }
-void linker_error(void *prog, const char *fmt, ...) { (void)prog;(void)fmt; }
-void linker_warning(void *prog, const char *fmt, ...) { (void)prog;(void)fmt; }
-char *resource_name_updated(char *name) { return name; }
-
-/* state_tracker (st_*) — st_glsl_to_nir.cpp + st_atom_array.cpp deferral */
-void *st_create_gallium_vertex_state(void *st, const void *info, unsigned num_attrs) { (void)st;(void)info;(void)num_attrs; return (void *)0; }
-void  st_finalize_nir(void *st, void *prog, void *shader_program, void *nir, int finalize_by_driver, int is_before_variants, int is_draw_shader) { (void)st;(void)prog;(void)shader_program;(void)nir;(void)finalize_by_driver;(void)is_before_variants;(void)is_draw_shader; }
-void  st_init_update_array(void *st) { (void)st; }
-int   st_link_shader(void *ctx, void *shader_program) { (void)ctx;(void)shader_program; return 1; }
-int   st_nir_lower_samplers(void *screen, void *nir, void *shp, void *prog) { (void)screen;(void)nir;(void)shp;(void)prog; return 0; }
-int   st_nir_lower_uniforms(void *st, void *nir) { (void)st;(void)nir; return 0; }
-int   st_nir_lower_wpos_ytransform(void *nir, void *prog, void *screen) { (void)nir;(void)prog;(void)screen; return 0; }
-void  st_setup_arrays(void *st, const void *vp, const void *ve_inputs, void *ve_state, void *vbuffers, unsigned *num_vbuffers, int *has_user_vertex_buffers) { (void)st;(void)vp;(void)ve_inputs;(void)ve_state;(void)vbuffers;(void)num_vbuffers;(void)has_user_vertex_buffers; }
-void  st_setup_current_user(void *st, const void *vp, const void *vs, const void *ve_inputs, void *ve_state, void *vbuffers, unsigned *num_vbuffers) { (void)st;(void)vp;(void)vs;(void)ve_inputs;(void)ve_state;(void)vbuffers;(void)num_vbuffers; }
-void  st_update_array(void *st) { (void)st; }
-
-/* string_to_uint_map_*  — C++ container shimmed as a no-op map. */
-void *string_to_uint_map_ctor(void) { return (void *)0; }
-void  string_to_uint_map_dtor(void *m) { (void)m; }
-int   string_to_uint_map_get(void *m, unsigned *value, const char *key) { (void)m;(void)key; if (value) *value = 0; return 0; }
-void  string_to_uint_map_put(void *m, unsigned value, const char *key) { (void)m;(void)value;(void)key; }
+/* W4.9 — sections below removed: now provided by REAL C++ TUs compiled via
+ * CXX_CROSS (ositok cross g++ + libstdc++ from sysroot).
+ *
+ * Removed (81 stubs total):
+ *   - GLSL C++ frontend (uniform_query.cpp, shader_query.cpp etc.)
+ *     _mesa_BindAttribLocation, _mesa_GetActiveUniform*, _mesa_uniform*,
+ *     _mesa_program_resource_*, _mesa_glsl_*, _mesa_unpack_astc_2d_ldr, ...
+ *   - GLSL deserialize/link (serialize.cpp + linker_util.cpp)
+ *     serialize_glsl_program, deserialize_glsl_program, link_util_*,
+ *     linker_error, linker_warning, interpolation_string, resource_name_updated
+ *   - state_tracker (st_glsl_to_nir.cpp + st_atom_array.cpp)
+ *     st_finalize_nir, st_link_shader, st_nir_lower_*, st_setup_*, st_update_array
+ *   - string_to_uint_map_* (string_to_uint_map.cpp now in libmesa_compiler.a)
+ *   - zink C++ TUs (zink_synchronization.cpp + zink_draw.cpp)
+ *     zink_synchronization_init, zink_resource_image_barrier*_init,
+ *     zink_get_cmdbuf, zink_get_gfx_pipeline_eq_func, zink_init_screen_pipeline_libs,
+ *     zink_resource_buffer_transfer_dst_barrier
+ */

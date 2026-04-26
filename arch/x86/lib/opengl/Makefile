@@ -592,10 +592,10 @@ COMPILER_CXX_SRCS := \
   mesa/src/compiler/glsl/string_to_uint_map.cpp
 
 COMPILER_C_OBJS   := $(patsubst %.c,$(BUILD_DIR)/%.o,$(COMPILER_C_SRCS))
-# W4.8-cont: CXX TUs disabled in this env — host g++/clang++ cstddef header
-# search path mismatches under -nostdinc.  Re-enable once the cross g++
-# (CXX_CROSS) wave covers compiler/glsl/*.cpp too.
-COMPILER_CXX_OBJS :=
+# W4.9 — REAL: COMPILER_CXX_OBJS now built via CXX_CROSS (ositok cross g++ +
+# libstdc++ from sysroot). The W4.8 disable was a host g++ workaround; the
+# cross toolchain supplies its own libstdc++ with no -nostdinc conflict.
+COMPILER_CXX_OBJS := $(patsubst %.cpp,$(BUILD_DIR)/%.o,$(COMPILER_CXX_SRCS))
 COMPILER_OBJS     := $(COMPILER_C_OBJS) $(COMPILER_CXX_OBJS)
 
 # ---------------------------------------------------------------------------
@@ -660,9 +660,8 @@ ZINK_LOADER_SRCS := \
   osito_compat/okgl_context.c
 
 ZINK_C_OBJS      := $(patsubst %.c,$(BUILD_DIR)/%.o,$(ZINK_C_SRCS))
+# W4.9 — REAL: ZINK_CXX_OBJS now built via CXX_CROSS.
 ZINK_CXX_OBJS    := $(patsubst %.cpp,$(BUILD_DIR)/%.o,$(ZINK_CXX_SRCS))
-# W4.8-cont: disabled — see COMPILER_CXX_OBJS comment.
-ZINK_CXX_OBJS    :=
 ZINK_LOADER_OBJS := $(patsubst %.c,$(BUILD_DIR)/%.o,$(ZINK_LOADER_SRCS))
 ZINK_OBJS        := $(ZINK_C_OBJS) $(ZINK_CXX_OBJS) $(ZINK_LOADER_OBJS)
 
@@ -773,9 +772,7 @@ MAIN_CXX_SRCS := \
   mesa/src/mesa/state_tracker/st_glsl_to_nir.cpp
 
 MAIN_CXX_OBJS := $(patsubst %.cpp,$(BUILD_DIR)/%.o,$(MAIN_CXX_SRCS))
-# W4.8-cont: disabled until cross g++ env is wired — same reason as
-# COMPILER_CXX_OBJS above.
-MAIN_CXX_OBJS :=
+# W4.9 — REAL: MAIN_CXX_OBJS now built via CXX_CROSS (already wired below).
 MAIN_C_OBJS   := $(MAIN_C_OBJS) $(MAIN_CXX_OBJS)
 
 .PHONY: all clean util gallium compiler zink main libgl
@@ -912,11 +909,12 @@ $(BUILD_DIR)/mesa/src/compiler/%.o: $(MESA_ROOT)/src/compiler/%.c | $(BUILD_DIR)
 	@echo "  CC    compiler/$*"
 	@$(CC) $(CFLAGS_COMPILER) -c -o $@ $<
 
-# W4.2 pattern rule for compiler/glsl/*.cpp -> CXX_FLAGS_COMPILER.
+# W4.9 — pattern rule for compiler/glsl/*.cpp -> CXX_CROSS + CXXFLAGS_MAIN
+# (real ositok cross g++ + libstdc++ from sysroot; was previously stubbed).
 $(BUILD_DIR)/mesa/src/compiler/glsl/%.o: $(MESA_ROOT)/src/compiler/glsl/%.cpp | $(BUILD_DIR)
 	@mkdir -p $(dir $@)
 	@echo "  CXX   glsl/$*"
-	@$(CXX) $(CXXFLAGS_COMPILER) -c -o $@ $<
+	@$(CXX_CROSS) $(CXXFLAGS_MAIN) -c -o $@ $<
 
 # W4.3 pattern rule for gallium/drivers/zink/*.c -> CFLAGS_ZINK.
 # Must come BEFORE the generic gallium rule to win precedence.
@@ -925,11 +923,12 @@ $(BUILD_DIR)/mesa/src/gallium/drivers/zink/%.o: $(MESA_ROOT)/src/gallium/drivers
 	@echo "  CC    zink/$*"
 	@$(CC) $(CFLAGS_ZINK) -c -o $@ $<
 
-# W4.4 pattern rule for gallium/drivers/zink/*.cpp -> CXXFLAGS_ZINK.
+# W4.9 — pattern rule for gallium/drivers/zink/*.cpp -> CXX_CROSS + CXXFLAGS_ZINK_CROSS
+# (real cross g++ + libstdc++; CXXFLAGS_ZINK_CROSS is defined further below).
 $(BUILD_DIR)/mesa/src/gallium/drivers/zink/%.o: $(MESA_ROOT)/src/gallium/drivers/zink/%.cpp | $(BUILD_DIR)
 	@mkdir -p $(dir $@)
 	@echo "  CXX   zink/$*"
-	@$(CXX) $(CXXFLAGS_ZINK) -c -o $@ $<
+	@$(CXX_CROSS) $(CXXFLAGS_ZINK_CROSS) -c -o $@ $<
 
 # W4.5 pattern rules — mesa/main/, state_tracker/, program/, vbo/, mapi/.
 # Use CFLAGS_MAIN.  Pattern matches must come BEFORE the generic
@@ -1038,6 +1037,14 @@ $(BUILD_DIR)/mesa/src/mesa/state_tracker/%.o: $(MESA_ROOT)/src/mesa/state_tracke
 	@mkdir -p $(dir $@)
 	@echo "  CXX   state_tracker/$*"
 	@$(CXX_CROSS) $(CXXFLAGS_MAIN) -c -o $@ $<
+
+# W4.9 — CXXFLAGS_ZINK_CROSS: CXXFLAGS_MAIN + zink/vulkan-specific include paths.
+# For zink_draw.cpp + zink_synchronization.cpp (need vulkan_core.h v305 + zink/*.h).
+CXXFLAGS_ZINK_CROSS := $(CXXFLAGS_MAIN) \
+  -I$(MESA_ROOT)/src/gallium/drivers/zink \
+  -I$(MESA_ROOT)/src/gallium/auxiliary/nir \
+  -I$(MESA_ROOT)/src/vulkan/util \
+  -D__OSITO_K__ -DZINK -DGALLIUM_HAVE_VK=1
 
 $(BUILD_DIR):
 	@mkdir -p $(BUILD_DIR)
