@@ -66,7 +66,11 @@ util_dl_proc
 util_dl_get_proc_address(struct util_dl_library *library,
                          const char *procname)
 {
-    if (library != DUMMY_VK_LOADER_HANDLE || procname == NULL)
+    /* W4.7-fix: don't gate on library==DUMMY. Zink may store loader_lib
+     * with adjusted bits in some build configs; accept any non-NULL
+     * library and just resolve by procname. */
+    (void)library;
+    if (procname == NULL)
         return (util_dl_proc)0;
 
     /* Two entry points zink_screen.c queries directly. */
@@ -75,11 +79,7 @@ util_dl_get_proc_address(struct util_dl_library *library,
     if (strcmp(procname, "vkGetDeviceProcAddr") == 0)
         return (util_dl_proc)(uintptr_t)&vkGetDeviceProcAddr;
 
-    /* Anything else: fall back to the instance-level loader (NULL
-     * VkInstance is legal for global commands per the spec). This
-     * lets zink resolve any extra symbols it might decide to look up
-     * directly via util_dl_get_proc_address rather than the dispatch
-     * table machinery. */
+    /* Anything else: fall back to the instance-level loader. */
     return (util_dl_proc)(uintptr_t)
            vkGetInstanceProcAddr(VK_NULL_HANDLE, procname);
 }

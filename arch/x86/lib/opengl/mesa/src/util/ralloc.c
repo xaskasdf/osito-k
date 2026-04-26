@@ -114,9 +114,20 @@ ralloc_size(const void *ctx, size_t size)
     *    must have at least 16 byte alignment.
     *  - Allocations of a size that rounds up to a multiple of 8 bytes and
     *    not 16 bytes, are only required to have at least 8 byte alignment.
+    *
+    * OsitoK W4.7-fix: malloc returns 8-aligned only. Mesa code emits
+    * movaps to zero linear_ctx structs which faults #GP on 8-aligned
+    * memory. Use posix_memalign for guaranteed 16-byte alignment.
     */
-   void *block = malloc(align64(size + sizeof(ralloc_header),
-                                alignof(ralloc_header)));
+   size_t alloc_size = align64(size + sizeof(ralloc_header),
+                               alignof(ralloc_header));
+   void *block = NULL;
+#ifdef __OSITO_K__
+   if (posix_memalign(&block, 16, alloc_size) != 0)
+      block = NULL;
+#else
+   block = malloc(alloc_size);
+#endif
    ralloc_header *info;
    ralloc_header *parent;
 

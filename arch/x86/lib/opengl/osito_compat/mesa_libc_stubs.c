@@ -186,8 +186,9 @@ int __isnormalf(float x) {
     return exp != 0 && exp != 0xff;
 }
 /* isnormal is a glibc macro that dispatches by type; nir_constant_expressions.c
- * is auto-generated and calls plain isnormal(x). Provide as variadic so it
- * accepts both float and double. */
+ * is auto-generated and calls plain isnormal(x). Undefine the macro here so
+ * we can provide a real symbol — the macro is only needed at the call sites. */
+#undef isnormal
 int isnormal(double x) { return __isnormal(x); }
 
 /* ---- W4.2 — gallium util fillers --------------------------------------

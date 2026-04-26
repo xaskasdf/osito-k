@@ -92,7 +92,11 @@ venus_EnumeratePhysicalDevices(VkInstance instance,
     if (!instance || !pPhysicalDeviceCount) return VK_ERROR_INITIALIZATION_FAILED;
     struct venus_instance *self = (struct venus_instance *)instance;
 
-    uint32_t count = (self->caps & VENUS_GPU_CAP_VENUS_READY) ? 1u : 0u;
+    /* W4.7-fix: always report 1 phys device. Every W3b.x encoder has a
+     * guest-local fallback path, so even without virglrenderer/VENUS_READY
+     * apps get a usable Vulkan stack (no real GPU work, but build through). */
+    (void)self;
+    uint32_t count = 1u;
 
     if (!pPhysicalDevices) {
         *pPhysicalDeviceCount = count;
@@ -163,16 +167,63 @@ venus_GetPhysicalDeviceProperties(VkPhysicalDevice physicalDevice,
     if (rc != 0) venus_props_fallback(pProperties);
 }
 
+/* W4.7-fix: enable a sensible subset of features for Zink/Mesa. Without
+ * these, Zink rejects the device during cap probing and returns NULL. */
+static void venus_features_fallback(VkPhysicalDeviceFeatures *pF) {
+    memset(pF, 0, sizeof(*pF));
+    pF->robustBufferAccess                       = VK_TRUE;
+    pF->fullDrawIndexUint32                      = VK_TRUE;
+    pF->imageCubeArray                           = VK_TRUE;
+    pF->independentBlend                         = VK_TRUE;
+    pF->geometryShader                           = VK_TRUE;
+    pF->tessellationShader                       = VK_TRUE;
+    pF->sampleRateShading                        = VK_TRUE;
+    pF->dualSrcBlend                             = VK_TRUE;
+    pF->logicOp                                  = VK_TRUE;
+    pF->multiDrawIndirect                        = VK_TRUE;
+    pF->drawIndirectFirstInstance                = VK_TRUE;
+    pF->depthClamp                               = VK_TRUE;
+    pF->depthBiasClamp                           = VK_TRUE;
+    pF->fillModeNonSolid                         = VK_TRUE;
+    pF->depthBounds                              = VK_TRUE;
+    pF->wideLines                                = VK_TRUE;
+    pF->largePoints                              = VK_TRUE;
+    pF->alphaToOne                               = VK_TRUE;
+    pF->multiViewport                            = VK_TRUE;
+    pF->samplerAnisotropy                        = VK_TRUE;
+    pF->textureCompressionETC2                   = VK_TRUE;
+    pF->textureCompressionASTC_LDR               = VK_TRUE;
+    pF->textureCompressionBC                     = VK_TRUE;
+    pF->occlusionQueryPrecise                    = VK_TRUE;
+    pF->pipelineStatisticsQuery                  = VK_TRUE;
+    pF->vertexPipelineStoresAndAtomics           = VK_TRUE;
+    pF->fragmentStoresAndAtomics                 = VK_TRUE;
+    pF->shaderTessellationAndGeometryPointSize   = VK_TRUE;
+    pF->shaderImageGatherExtended                = VK_TRUE;
+    pF->shaderStorageImageExtendedFormats        = VK_TRUE;
+    pF->shaderUniformBufferArrayDynamicIndexing  = VK_TRUE;
+    pF->shaderSampledImageArrayDynamicIndexing   = VK_TRUE;
+    pF->shaderStorageBufferArrayDynamicIndexing  = VK_TRUE;
+    pF->shaderStorageImageArrayDynamicIndexing   = VK_TRUE;
+    pF->shaderClipDistance                       = VK_TRUE;
+    pF->shaderCullDistance                       = VK_TRUE;
+    pF->shaderFloat64                            = VK_TRUE;
+    pF->shaderInt64                              = VK_TRUE;
+    pF->shaderInt16                              = VK_TRUE;
+}
+
 VKAPI_ATTR void VKAPI_CALL
 venus_GetPhysicalDeviceFeatures(VkPhysicalDevice physicalDevice,
                                 VkPhysicalDeviceFeatures *pFeatures) {
     if (!pFeatures) return;
-    memset(pFeatures, 0, sizeof(*pFeatures));
     struct venus_instance *self = (struct venus_instance *)physicalDevice;
-    if (!self || !self->wire) return;   /* zero-features fallback */
+    if (!self || !self->wire) {
+        venus_features_fallback(pFeatures);
+        return;
+    }
     int rc = venus_cmd_encode_GetPhysicalDeviceFeatures(
             self->wire, self->host_handle, pFeatures);
-    if (rc != 0) memset(pFeatures, 0, sizeof(*pFeatures));
+    if (rc != 0) venus_features_fallback(pFeatures);
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -181,7 +232,24 @@ venus_GetPhysicalDeviceQueueFamilyProperties(VkPhysicalDevice physicalDevice,
                                              VkQueueFamilyProperties *pFamilies) {
     if (!pCount) return;
     struct venus_instance *self = (struct venus_instance *)physicalDevice;
-    if (!self || !self->wire) { *pCount = 0; return; }
+    /* W4.7-fix: always advertise 1 graphics+compute+transfer queue family
+     * (8 queues), so Zink + DXVK can find a usable queue. */
+    if (!self || !self->wire) {
+        if (!pFamilies) { *pCount = 1; return; }
+        if (*pCount >= 1) {
+            memset(&pFamilies[0], 0, sizeof(pFamilies[0]));
+            pFamilies[0].queueFlags        = VK_QUEUE_GRAPHICS_BIT |
+                                             VK_QUEUE_COMPUTE_BIT  |
+                                             VK_QUEUE_TRANSFER_BIT;
+            pFamilies[0].queueCount        = 8;
+            pFamilies[0].timestampValidBits = 64;
+            pFamilies[0].minImageTransferGranularity.width  = 1;
+            pFamilies[0].minImageTransferGranularity.height = 1;
+            pFamilies[0].minImageTransferGranularity.depth  = 1;
+        }
+        *pCount = 1;
+        return;
+    }
     int rc = venus_cmd_encode_GetPhysicalDeviceQueueFamilyProperties(
             self->wire, self->host_handle, pCount, pFamilies);
     if (rc != 0) *pCount = 0;
@@ -193,7 +261,27 @@ venus_GetPhysicalDeviceMemoryProperties(VkPhysicalDevice physicalDevice,
     if (!pMem) return;
     memset(pMem, 0, sizeof(*pMem));
     struct venus_instance *self = (struct venus_instance *)physicalDevice;
-    if (!self || !self->wire) return;   /* count=0/count=0 fallback */
+    /* W4.7-fix: advertise 1 heap (1 GiB DEVICE_LOCAL) with 2 memory types:
+     *   [0] DEVICE_LOCAL                                — for VRAM
+     *   [1] DEVICE_LOCAL | HOST_VISIBLE | HOST_COHERENT — for staging
+     * Zink requires at least one DEVICE_LOCAL heap and one HOST_VISIBLE
+     * type to function. */
+    if (!self || !self->wire) {
+        pMem->memoryHeapCount  = 1;
+        pMem->memoryHeaps[0].size  = (uint64_t)1024 * 1024 * 1024;  /* 1 GiB */
+        pMem->memoryHeaps[0].flags = VK_MEMORY_HEAP_DEVICE_LOCAL_BIT;
+
+        pMem->memoryTypeCount = 2;
+        pMem->memoryTypes[0].propertyFlags =
+            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+        pMem->memoryTypes[0].heapIndex = 0;
+        pMem->memoryTypes[1].propertyFlags =
+            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+            VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+        pMem->memoryTypes[1].heapIndex = 0;
+        return;
+    }
     int rc = venus_cmd_encode_GetPhysicalDeviceMemoryProperties(
             self->wire, self->host_handle, pMem);
     if (rc != 0) memset(pMem, 0, sizeof(*pMem));

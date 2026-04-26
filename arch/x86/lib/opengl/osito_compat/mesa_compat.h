@@ -11,6 +11,10 @@
  * gate the OsitoK qjs-libc-only bits with __cplusplus checks so
  * the same header is force-included into both C and C++ TUs. */
 
+/* W4.7-fix: thread_local overrides applied per-file (u_call_once.c,
+ * u_qsort.cpp, os_misc.c) instead of globally — global #define caused
+ * isnormal/signbit redefinition cascade. */
+
 #ifndef __cplusplus
 #  include <stdint.h>
 #  include <stddef.h>
