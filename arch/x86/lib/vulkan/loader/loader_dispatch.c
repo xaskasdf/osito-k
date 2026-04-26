@@ -165,6 +165,41 @@ VKAPI_ATTR VkResult VKAPI_CALL vkGetPhysicalDeviceSurfacePresentModesKHR(
 VKAPI_ATTR VkResult VKAPI_CALL vkGetPhysicalDeviceSurfaceSupportKHR(
     VkPhysicalDevice, uint32_t, VkSurfaceKHR, VkBool32 *);
 
+/* W4.8 — additional instance-level entry points required by Mesa+Zink
+ * for screen creation. Most can chain into the W4.7 fallback or just
+ * fill plausible defaults. */
+VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceProperties2(
+    VkPhysicalDevice, VkPhysicalDeviceProperties2 *);
+VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceFeatures2(
+    VkPhysicalDevice, VkPhysicalDeviceFeatures2 *);
+VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceMemoryProperties2(
+    VkPhysicalDevice, VkPhysicalDeviceMemoryProperties2 *);
+VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceQueueFamilyProperties2(
+    VkPhysicalDevice, uint32_t *, VkQueueFamilyProperties2 *);
+VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceFormatProperties(
+    VkPhysicalDevice, VkFormat, VkFormatProperties *);
+VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceFormatProperties2(
+    VkPhysicalDevice, VkFormat, VkFormatProperties2 *);
+VKAPI_ATTR VkResult VKAPI_CALL vkGetPhysicalDeviceImageFormatProperties(
+    VkPhysicalDevice, VkFormat, VkImageType, VkImageTiling,
+    VkImageUsageFlags, VkImageCreateFlags, VkImageFormatProperties *);
+VKAPI_ATTR VkResult VKAPI_CALL vkGetPhysicalDeviceImageFormatProperties2(
+    VkPhysicalDevice, const VkPhysicalDeviceImageFormatInfo2 *,
+    VkImageFormatProperties2 *);
+VKAPI_ATTR VkResult VKAPI_CALL vkCreateDebugUtilsMessengerEXT(
+    VkInstance, const VkDebugUtilsMessengerCreateInfoEXT *,
+    const VkAllocationCallbacks *, VkDebugUtilsMessengerEXT *);
+VKAPI_ATTR void VKAPI_CALL vkDestroyDebugUtilsMessengerEXT(
+    VkInstance, VkDebugUtilsMessengerEXT, const VkAllocationCallbacks *);
+VKAPI_ATTR void VKAPI_CALL vkCmdClearColorImage(
+    VkCommandBuffer, VkImage, VkImageLayout, const VkClearColorValue *,
+    uint32_t, const VkImageSubresourceRange *);
+
+/* W4.7-fix: stub returning VK_ERROR_FEATURE_NOT_PRESENT for any
+ * Vulkan symbol we don't implement. Mesa/Zink/DXVK check returns
+ * and bail gracefully instead of dereferencing a NULL function ptr. */
+VKAPI_ATTR VkResult VKAPI_CALL osito_vk_unimplemented_stub(void);
+
 PFN_vkVoidFunction
 osito_loader_get_instance_proc_addr(VkInstance instance, const char *pName) {
     if (!pName) return NULL;
@@ -174,6 +209,20 @@ osito_loader_get_instance_proc_addr(VkInstance instance, const char *pName) {
         return (PFN_vkVoidFunction)vkCreateInstance;
     if (strcmp(pName, "vkGetInstanceProcAddr") == 0)
         return (PFN_vkVoidFunction)vkGetInstanceProcAddr;
+    if (strcmp(pName, "vkGetDeviceProcAddr") == 0)
+        return (PFN_vkVoidFunction)vkGetDeviceProcAddr;
+    /* W4.7-fix: Zink calls these to discover layers/extensions. Stub
+     * to "no extensions, no layers" — apps see a vanilla Vulkan stack. */
+    if (strcmp(pName, "vkEnumerateInstanceExtensionProperties") == 0)
+        return (PFN_vkVoidFunction)vkEnumerateInstanceExtensionProperties;
+    if (strcmp(pName, "vkEnumerateInstanceLayerProperties") == 0)
+        return (PFN_vkVoidFunction)vkEnumerateInstanceLayerProperties;
+    if (strcmp(pName, "vkEnumerateInstanceVersion") == 0)
+        return (PFN_vkVoidFunction)vkEnumerateInstanceVersion;
+    if (strcmp(pName, "vkEnumerateDeviceExtensionProperties") == 0)
+        return (PFN_vkVoidFunction)vkEnumerateDeviceExtensionProperties;
+    if (strcmp(pName, "vkEnumerateDeviceLayerProperties") == 0)
+        return (PFN_vkVoidFunction)vkEnumerateDeviceLayerProperties;
 
     /* Instance-scoped entry points. */
     if (strcmp(pName, "vkDestroyInstance") == 0)
@@ -323,6 +372,37 @@ osito_loader_get_instance_proc_addr(VkInstance instance, const char *pName) {
     if (strcmp(pName, "vkGetPhysicalDeviceSurfaceSupportKHR") == 0)
         return (PFN_vkVoidFunction)vkGetPhysicalDeviceSurfaceSupportKHR;
 
+    /* W4.8 — instance-level entry points required by Mesa+Zink for
+     * screen creation. */
+    if (strcmp(pName, "vkGetPhysicalDeviceProperties2") == 0 ||
+        strcmp(pName, "vkGetPhysicalDeviceProperties2KHR") == 0)
+        return (PFN_vkVoidFunction)vkGetPhysicalDeviceProperties2;
+    if (strcmp(pName, "vkGetPhysicalDeviceFeatures2") == 0 ||
+        strcmp(pName, "vkGetPhysicalDeviceFeatures2KHR") == 0)
+        return (PFN_vkVoidFunction)vkGetPhysicalDeviceFeatures2;
+    if (strcmp(pName, "vkGetPhysicalDeviceMemoryProperties2") == 0 ||
+        strcmp(pName, "vkGetPhysicalDeviceMemoryProperties2KHR") == 0)
+        return (PFN_vkVoidFunction)vkGetPhysicalDeviceMemoryProperties2;
+    if (strcmp(pName, "vkGetPhysicalDeviceQueueFamilyProperties2") == 0 ||
+        strcmp(pName, "vkGetPhysicalDeviceQueueFamilyProperties2KHR") == 0)
+        return (PFN_vkVoidFunction)vkGetPhysicalDeviceQueueFamilyProperties2;
+    if (strcmp(pName, "vkGetPhysicalDeviceFormatProperties") == 0)
+        return (PFN_vkVoidFunction)vkGetPhysicalDeviceFormatProperties;
+    if (strcmp(pName, "vkGetPhysicalDeviceFormatProperties2") == 0 ||
+        strcmp(pName, "vkGetPhysicalDeviceFormatProperties2KHR") == 0)
+        return (PFN_vkVoidFunction)vkGetPhysicalDeviceFormatProperties2;
+    if (strcmp(pName, "vkGetPhysicalDeviceImageFormatProperties") == 0)
+        return (PFN_vkVoidFunction)vkGetPhysicalDeviceImageFormatProperties;
+    if (strcmp(pName, "vkGetPhysicalDeviceImageFormatProperties2") == 0 ||
+        strcmp(pName, "vkGetPhysicalDeviceImageFormatProperties2KHR") == 0)
+        return (PFN_vkVoidFunction)vkGetPhysicalDeviceImageFormatProperties2;
+    if (strcmp(pName, "vkCreateDebugUtilsMessengerEXT") == 0)
+        return (PFN_vkVoidFunction)vkCreateDebugUtilsMessengerEXT;
+    if (strcmp(pName, "vkDestroyDebugUtilsMessengerEXT") == 0)
+        return (PFN_vkVoidFunction)vkDestroyDebugUtilsMessengerEXT;
+    if (strcmp(pName, "vkCmdClearColorImage") == 0)
+        return (PFN_vkVoidFunction)vkCmdClearColorImage;
+
     /* Unknown — fall through to the first ICD that resolves it. Matches
      * the spec's language that unknown queries may return NULL when no
      * extension is enabled, but a forward is a friendlier default for
@@ -335,12 +415,86 @@ osito_loader_get_instance_proc_addr(VkInstance instance, const char *pName) {
             if (fn) return fn;
         }
     }
-    return NULL;
+    /* W4.7-fix: rather than NULL (which crashes Mesa when it later
+     * calls a NULL function pointer), return a stub that just yields
+     * VK_ERROR_FEATURE_NOT_PRESENT. Mesa+Zink check returns and bail
+     * gracefully on unsupported entries. */
+    return (PFN_vkVoidFunction)osito_vk_unimplemented_stub;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+osito_vk_unimplemented_stub(void) {
+    return VK_ERROR_FEATURE_NOT_PRESENT;
 }
 
 VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL
 vkGetInstanceProcAddr(VkInstance instance, const char *pName) {
     return osito_loader_get_instance_proc_addr(instance, pName);
+}
+
+/* W4.7-fix: Mesa Zink calls vkGetDeviceProcAddr to populate its
+ * device-level dispatch table. Forward to the same loader path —
+ * device-level resolution falls back to instance-level for everything
+ * we currently support. */
+VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL
+vkGetDeviceProcAddr(VkDevice device, const char *pName) {
+    (void)device;
+    return osito_loader_get_instance_proc_addr((VkInstance)0, pName);
+}
+
+/* W4.7-fix: instance-level discovery functions Zink + Mesa rely on. */
+VKAPI_ATTR VkResult VKAPI_CALL
+vkEnumerateInstanceExtensionProperties(const char *pLayerName,
+                                       uint32_t *pPropertyCount,
+                                       VkExtensionProperties *pProperties) {
+    (void)pLayerName;
+    if (!pPropertyCount) return VK_ERROR_INITIALIZATION_FAILED;
+    /* No instance extensions advertised — apps see a vanilla Vulkan 1.4
+     * core stack. Add VK_KHR_surface etc. when WSI integration lands. */
+    *pPropertyCount = 0;
+    (void)pProperties;
+    return VK_SUCCESS;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+vkEnumerateInstanceLayerProperties(uint32_t *pPropertyCount,
+                                   VkLayerProperties *pProperties) {
+    if (!pPropertyCount) return VK_ERROR_INITIALIZATION_FAILED;
+    *pPropertyCount = 0;
+    (void)pProperties;
+    return VK_SUCCESS;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+vkEnumerateInstanceVersion(uint32_t *pApiVersion) {
+    if (!pApiVersion) return VK_ERROR_INITIALIZATION_FAILED;
+    *pApiVersion = VK_API_VERSION_1_4;
+    return VK_SUCCESS;
+}
+
+/* W4.7-fix: Zink probes device-level extensions; we report none, so
+ * Zink falls back to core Vulkan paths. */
+VKAPI_ATTR VkResult VKAPI_CALL
+vkEnumerateDeviceExtensionProperties(VkPhysicalDevice physicalDevice,
+                                     const char *pLayerName,
+                                     uint32_t *pPropertyCount,
+                                     VkExtensionProperties *pProperties) {
+    (void)physicalDevice; (void)pLayerName;
+    if (!pPropertyCount) return VK_ERROR_INITIALIZATION_FAILED;
+    *pPropertyCount = 0;
+    (void)pProperties;
+    return VK_SUCCESS;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+vkEnumerateDeviceLayerProperties(VkPhysicalDevice physicalDevice,
+                                 uint32_t *pPropertyCount,
+                                 VkLayerProperties *pProperties) {
+    (void)physicalDevice;
+    if (!pPropertyCount) return VK_ERROR_INITIALIZATION_FAILED;
+    *pPropertyCount = 0;
+    (void)pProperties;
+    return VK_SUCCESS;
 }
 
 /* ---------------- W3b.2 trampolines ---------------------------------------
@@ -1752,3 +1906,198 @@ vkGetPhysicalDeviceSurfaceSupportKHR(
     return fn(real, queueFamilyIndex, real_s, pSupported);
 }
 
+/* ---------------- W4.8 — phys-dev "2" trampolines + format queries ---
+ *
+ * The "2" variants accept a chained pNext list. We forward the base
+ * struct to the W3b.2 trampoline and leave the pNext chain alone — the
+ * spec allows callees to ignore unknown sType blocks. Where Mesa expects
+ * specific sType blocks (e.g. VkPhysicalDeviceVulkan11Properties), we
+ * could fill them in a follow-up; for the clear-only path the W3b.2
+ * fallback values are sufficient. */
+
+VKAPI_ATTR void VKAPI_CALL
+vkGetPhysicalDeviceProperties2(VkPhysicalDevice physicalDevice,
+                               VkPhysicalDeviceProperties2 *pProperties) {
+    if (!pProperties) return;
+    /* The spec mandates sType be VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2.
+     * We do not enforce — Mesa always fills it correctly. */
+    vkGetPhysicalDeviceProperties(physicalDevice, &pProperties->properties);
+    /* pNext chain: leave unmodified. Callers that requested specific
+     * sType blocks see zero-initialized memory (typical Vulkan pattern
+     * — caller is expected to memset before calling). */
+}
+
+VKAPI_ATTR void VKAPI_CALL
+vkGetPhysicalDeviceFeatures2(VkPhysicalDevice physicalDevice,
+                             VkPhysicalDeviceFeatures2 *pFeatures) {
+    if (!pFeatures) return;
+    vkGetPhysicalDeviceFeatures(physicalDevice, &pFeatures->features);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+vkGetPhysicalDeviceMemoryProperties2(VkPhysicalDevice physicalDevice,
+                                     VkPhysicalDeviceMemoryProperties2 *pMem) {
+    if (!pMem) return;
+    vkGetPhysicalDeviceMemoryProperties(physicalDevice, &pMem->memoryProperties);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+vkGetPhysicalDeviceQueueFamilyProperties2(VkPhysicalDevice physicalDevice,
+                                          uint32_t *pCount,
+                                          VkQueueFamilyProperties2 *pFamilies) {
+    if (!pCount) return;
+    /* Two-call pattern: first NULL, then real. */
+    if (!pFamilies) {
+        vkGetPhysicalDeviceQueueFamilyProperties(physicalDevice, pCount, NULL);
+        return;
+    }
+    /* Forward into W3b.2 fallback then copy each into the .queueFamilyProperties
+     * sub-struct of VkQueueFamilyProperties2. Cap at 4 to avoid any stack
+     * bloat — the venus_instance fallback only ever returns 1. */
+    #define OSITO_QFP2_MAX 4u
+    VkQueueFamilyProperties tmp[OSITO_QFP2_MAX];
+    uint32_t n = (*pCount < OSITO_QFP2_MAX) ? *pCount : OSITO_QFP2_MAX;
+    vkGetPhysicalDeviceQueueFamilyProperties(physicalDevice, &n, tmp);
+    for (uint32_t i = 0; i < n; i++)
+        pFamilies[i].queueFamilyProperties = tmp[i];
+    *pCount = n;
+}
+
+/* W4.8: report COLOR_ATTACHMENT|TRANSFER_DST|SAMPLED_IMAGE for the four
+ * BGRA8/RGBA8 variants Mesa+Zink uses for swapchain back-buffers and
+ * texture sampling. Everything else is rejected so Zink doesn't try to
+ * use a format the underlying SHM compositor cannot present. */
+VKAPI_ATTR void VKAPI_CALL
+vkGetPhysicalDeviceFormatProperties(VkPhysicalDevice physicalDevice,
+                                    VkFormat format,
+                                    VkFormatProperties *pFormatProperties) {
+    (void)physicalDevice;
+    if (!pFormatProperties) return;
+    memset(pFormatProperties, 0, sizeof(*pFormatProperties));
+    switch (format) {
+    case VK_FORMAT_B8G8R8A8_UNORM:
+    case VK_FORMAT_R8G8B8A8_UNORM:
+    case VK_FORMAT_B8G8R8A8_SRGB:
+    case VK_FORMAT_R8G8B8A8_SRGB: {
+        VkFormatFeatureFlags f =
+            VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT |
+            VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT |
+            VK_FORMAT_FEATURE_TRANSFER_DST_BIT |
+            VK_FORMAT_FEATURE_TRANSFER_SRC_BIT |
+            VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT |
+            VK_FORMAT_FEATURE_BLIT_DST_BIT |
+            VK_FORMAT_FEATURE_BLIT_SRC_BIT;
+        pFormatProperties->linearTilingFeatures  = f;
+        pFormatProperties->optimalTilingFeatures = f;
+        pFormatProperties->bufferFeatures        = 0;
+        break;
+    }
+    default:
+        /* All zeros — Mesa interprets as "format not supported". */
+        break;
+    }
+}
+
+VKAPI_ATTR void VKAPI_CALL
+vkGetPhysicalDeviceFormatProperties2(VkPhysicalDevice physicalDevice,
+                                     VkFormat format,
+                                     VkFormatProperties2 *pFormatProperties) {
+    if (!pFormatProperties) return;
+    vkGetPhysicalDeviceFormatProperties(physicalDevice, format,
+                                        &pFormatProperties->formatProperties);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+vkGetPhysicalDeviceImageFormatProperties(
+        VkPhysicalDevice physicalDevice, VkFormat format,
+        VkImageType type, VkImageTiling tiling,
+        VkImageUsageFlags usage, VkImageCreateFlags flags,
+        VkImageFormatProperties *pImageFormatProperties) {
+    (void)physicalDevice; (void)tiling; (void)usage; (void)flags;
+    if (!pImageFormatProperties) return VK_ERROR_INITIALIZATION_FAILED;
+    /* Only support 2D BGRA8/RGBA8. Mesa probes lots of formats; we say
+     * "no" to everything else so it falls back to supported choices. */
+    int format_ok = (format == VK_FORMAT_B8G8R8A8_UNORM ||
+                     format == VK_FORMAT_R8G8B8A8_UNORM ||
+                     format == VK_FORMAT_B8G8R8A8_SRGB  ||
+                     format == VK_FORMAT_R8G8B8A8_SRGB);
+    int type_ok   = (type == VK_IMAGE_TYPE_2D);
+    if (!format_ok || !type_ok)
+        return VK_ERROR_FORMAT_NOT_SUPPORTED;
+    memset(pImageFormatProperties, 0, sizeof(*pImageFormatProperties));
+    pImageFormatProperties->maxExtent.width  = 8192;
+    pImageFormatProperties->maxExtent.height = 8192;
+    pImageFormatProperties->maxExtent.depth  = 1;
+    pImageFormatProperties->maxMipLevels     = 14;   /* log2(8192)+1 */
+    pImageFormatProperties->maxArrayLayers   = 256;
+    pImageFormatProperties->sampleCounts     = VK_SAMPLE_COUNT_1_BIT;
+    pImageFormatProperties->maxResourceSize  = (VkDeviceSize)1 << 31;
+    return VK_SUCCESS;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+vkGetPhysicalDeviceImageFormatProperties2(
+        VkPhysicalDevice physicalDevice,
+        const VkPhysicalDeviceImageFormatInfo2 *pImageFormatInfo,
+        VkImageFormatProperties2 *pImageFormatProperties) {
+    if (!pImageFormatInfo || !pImageFormatProperties)
+        return VK_ERROR_INITIALIZATION_FAILED;
+    return vkGetPhysicalDeviceImageFormatProperties(
+            physicalDevice,
+            pImageFormatInfo->format, pImageFormatInfo->type,
+            pImageFormatInfo->tiling, pImageFormatInfo->usage,
+            pImageFormatInfo->flags,
+            &pImageFormatProperties->imageFormatProperties);
+}
+
+/* W4.8: VK_EXT_debug_utils messenger — we don't actually deliver any
+ * debug messages, but Mesa often creates one to silence its own
+ * "no messenger" complaints. Allocate a sentinel pointer and return
+ * success; the destroy is a no-op (we leak the sentinel — only one
+ * per process is ever expected). */
+VKAPI_ATTR VkResult VKAPI_CALL
+vkCreateDebugUtilsMessengerEXT(
+        VkInstance instance,
+        const VkDebugUtilsMessengerCreateInfoEXT *pCreateInfo,
+        const VkAllocationCallbacks *pAllocator,
+        VkDebugUtilsMessengerEXT *pMessenger) {
+    (void)instance; (void)pCreateInfo; (void)pAllocator;
+    if (!pMessenger) return VK_ERROR_INITIALIZATION_FAILED;
+    /* Use a non-zero sentinel so apps that test "if (messenger != VK_NULL_HANDLE)"
+     * see a valid handle. */
+    static char osito_dum_sentinel;
+    *pMessenger = (VkDebugUtilsMessengerEXT)(uintptr_t)&osito_dum_sentinel;
+    return VK_SUCCESS;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+vkDestroyDebugUtilsMessengerEXT(VkInstance instance,
+                                VkDebugUtilsMessengerEXT messenger,
+                                const VkAllocationCallbacks *pAllocator) {
+    (void)instance; (void)messenger; (void)pAllocator;
+    /* No-op — sentinel is static. */
+}
+
+/* W4.8 — vkCmdClearColorImage trampoline. The venus ICD (W4.8 follow-up
+ * in venus_w3b6_objects.c) records the clear color + image slot on the
+ * cmd buffer; QueueSubmit later fills the SHM buffer. This loader
+ * trampoline just forwards into the ICD with unwrapped image. */
+typedef void (VKAPI_PTR *PFN_vkCmdClearColorImage)(
+    VkCommandBuffer, VkImage, VkImageLayout, const VkClearColorValue *,
+    uint32_t, const VkImageSubresourceRange *);
+
+VKAPI_ATTR void VKAPI_CALL
+vkCmdClearColorImage(VkCommandBuffer cb, VkImage image,
+                     VkImageLayout imageLayout,
+                     const VkClearColorValue *pColor, uint32_t rangeCount,
+                     const VkImageSubresourceRange *pRanges) {
+    if (!cb || !image || !pColor) return;
+    struct osito_cmd_buffer *w = (struct osito_cmd_buffer *)cb;
+    struct osito_icd_inst *ci = w->owner ? w->owner->owner : 0;
+    if (!ci) return;
+    PFN_vkCmdClearColorImage fn = (PFN_vkCmdClearColorImage)
+        ci->icd->get_proc_addr(ci->handle, "vkCmdClearColorImage");
+    if (!fn) return;
+    VkImage real = img_from(image)->real;
+    fn(w->real, real, imageLayout, pColor, rangeCount, pRanges);
+}
