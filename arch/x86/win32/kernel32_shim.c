@@ -497,6 +497,67 @@ PVOID WINAPI VirtualAlloc(PVOID lpAddress, SIZE_T dwSize,
             serial_puts(" -> 64KB sentinel\n");
             cap_log++;
         }
+
+        /* W4-FArray-FIX: walk the EBP chain to find the FArray *this and
+         * patch its corrupted {+8} field (Max/ElementSize). Disasm of
+         * Core.dll FArray::Realloc proved:
+         *   - Frame 2 of the EBP chain is FArray::Realloc itself
+         *   - Its [ebp-0x18] holds the FArray *this (saved esi)
+         *   - The bad NewSize is `this->{+8} * NewMax` via imul
+         *   - `this->{+8}` contains a code pointer (uninitialized stack)
+         *
+         * Patch this->{+8} = 2 (assume wchar_t TArray, the most common
+         * UE1 use case) so subsequent reallocs of the same TArray compute
+         * a sane size instead of code_ptr * NewMax. */
+        {
+            extern uint32_t compat32_get_last_user_ebp(void);
+            uint32_t walk = compat32_get_last_user_ebp();
+            int depth = 0;
+            while (depth < 2 && walk >= 0x100000 && walk < 0xFFFE0000 &&
+                   (walk & 3) == 0) {
+                uint32_t *fp = (uint32_t *)(uintptr_t)walk;
+                walk = fp[0];
+                depth++;
+            }
+            /* now walk == frame 2's EBP (FArray::Realloc's frame) */
+            if (walk >= 0x100000 && walk < 0xFFFE0000 && (walk & 3) == 0) {
+                int32_t *neg = (int32_t *)(uintptr_t)walk;
+                uint32_t this_ptr = (uint32_t)*(neg - 6); /* [-0x18] */
+                if (this_ptr >= 0x100000 && this_ptr < 0xFFFE0000 &&
+                    (this_ptr & 3) == 0) {
+                    uint32_t *t = (uint32_t *)(uintptr_t)this_ptr;
+                    uint32_t plus8 = t[2];
+                    /* Code pointer pattern: in PE-image .text range */
+                    if (plus8 >= 0x10000000 && plus8 < 0x20000000) {
+                        static int patch_log = 0;
+                        if (patch_log < 10) {
+                            serial_puts("[VA-FARRAY] FArray@0x");
+                            serial_puthex(this_ptr, 8);
+                            serial_puts(" {+8} was code-ptr 0x");
+                            serial_puthex(plus8, 8);
+                            serial_puts(", patching to 2\n");
+                            patch_log++;
+                        }
+                        t[2] = 2;
+                        /* Also re-derive a sane dwSize: NewMax was at
+                         * frame 2 [ebp+8], take from fp[2]. */
+                        uint32_t newmax = ((uint32_t *)(uintptr_t)walk)[2];
+                        if (newmax > 0 && newmax < 0x100000) {
+                            dwSize = (SIZE_T)(newmax * 2 + 0xFFF) & ~(SIZE_T)0xFFF;
+                            if (dwSize < 0x1000) dwSize = 0x1000;
+                            serial_puts("[VA-FARRAY] re-derived dwSize=0x");
+                            serial_puthex(dwSize, 8);
+                            serial_puts(" (NewMax=");
+                            serial_putdec((uint64_t)newmax);
+                            serial_puts(" * 2)\n");
+                            /* Skip the 64KB sentinel cap below — use the
+                             * derived size as the actual allocation. */
+                            goto va_proceed;
+                        }
+                    }
+                }
+            }
+        }
         /* Cap to 64KB instead of 256MB. Reasons:
          *   - 256MB cap exhausted the 896MB VA range after 3-4 bogus
          *     FArray::Realloc requests, all subsequent VirtualAlloc
@@ -530,6 +591,7 @@ PVOID WINAPI VirtualAlloc(PVOID lpAddress, SIZE_T dwSize,
          * 0x1033E7D0. Reverting that patch; it may break legitimate
          * uses of 0x1033E7D0 elsewhere.) */
     }
+va_proceed:
 
     PVOID base = lpAddress;
     SIZE_T size = dwSize;

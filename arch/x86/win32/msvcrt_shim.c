@@ -190,11 +190,27 @@ void WINAPI _initterm(_PVFV *pfbegin, _PVFV *pfend)
     serial_puts("\n");
 
     int cb_count = 0;
-    for (uint32_t *p = begin32; p < end32; p++) {
+    int idx = 0;
+    /* Audit mode: trace each callback when the array is small or when the
+     * skip ratio is suspicious. Prints "INIT[N] @0x... → ok" per callback. */
+    int audit_mode = (end32 - begin32 < 200);
+    for (uint32_t *p = begin32; p < end32; p++, idx++) {
         if (*p) {
             ensure_gmalloc_stub();  /* re-check before EACH callback */
+            if (audit_mode) {
+                serial_puts("[INIT] [");
+                serial_putdec((uint64_t)idx);
+                serial_puts("] @0x");
+                serial_puthex(*p, 8);
+                serial_puts("\n");
+            }
             compat32_callback(*p);
             cb_count++;
+            if (audit_mode) {
+                serial_puts("[INIT] [");
+                serial_putdec((uint64_t)idx);
+                serial_puts("] returned\n");
+            }
         }
     }
     serial_puts("[MSVCRT] _initterm done: ");
