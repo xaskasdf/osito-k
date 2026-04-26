@@ -226,6 +226,8 @@ arch/arm/          SM8350 (ROG Phone 5) bare-metal port — see docs/aarch64-det
 
 ## Roadmap
 
+> **Documentation refresh — last audit 2026-04-25** (see Hardware Boot section: H1-H6 marked Done after commit `3c02b49`; X-WIN32 scope expanded with 12 DLL shims; new entries X-VGPU, X-MESA, X-DXVK, X-VK, X-DOS, X-MEMCOMP, X-VDSO, X-SPEC, X-KALL, X-AUDSCHED, X-DMASCHED, X-INOTIFY, X-CPUTOP, X-PERF, X-KSTATE, X-GUI, A-ARM64).
+
 ### ESP8266 (Xtensa LX106)
 
 | Feature | Description | Status |
@@ -290,7 +292,7 @@ arch/arm/          SM8350 (ROG Phone 5) bare-metal port — see docs/aarch64-det
 | X-AHCI  | SATA AHCI driver | Done |
 | X-XHCI  | xHCI USB 3.x driver + HID keyboard/mouse | Done |
 | X-RETINA| Display pipeline (GPU page flip, compositor, animations, AA text) | Done |
-| X-WIN32 | Windows PE32 compat layer (15 DLL shims) | WIP |
+| X-WIN32 | Windows PE32 compat layer (12+ DLL shims: kernel32, msvcrt, user32, gdi32, advapi32, comctl32, comdlg32, ddraw, dsound, ntdll, ole32, shell32, winmm, wsock32). Active: UT99/GTAV/Engine.dll debugging, SEH dispatch, IAT patching, INT 0x2E thunks | WIP |
 | X-PGTBL | Per-process page tables (CR3 switch on context switch) | Done |
 | X-W32THR| Win32 real threading (CreateThread → sched_spawn) | Done |
 | X-OSFS3 | OsitoFS v2 overhaul (9 tools, block_size, timestamps, hash, CRC, fsck) | Done |
@@ -375,6 +377,23 @@ arch/arm/          SM8350 (ROG Phone 5) bare-metal port — see docs/aarch64-det
 | X-SGTX  | Zero-copy scatter-gather TX on I211 (`i211_send_sg`, legacy descriptor chaining) | Done |
 | X-HWBP  | Hardware breakpoints (DR0-DR3), `watch`/`unwatch`/`hwbp` shell commands | Done |
 | X-SELF  | Self-optimizing kernel (dry-run v1: static branch site registration + `self_opt apply`) | Done |
+| X-MEMCOMP| Memory compression (LZ-style page packing for cold pages) | Done |
+| X-VDSO  | VDSO thunks (gettimeofday/clock_gettime fast path, no syscall) | Done |
+| X-SPEC  | Speculative decoding (spec_analyze/spec_prefetch/spec_tls — branch-pattern + TLS prewarm) | Done |
+| X-KALL  | kallsyms — runtime symbol table for stack traces and `usym` user-symbol resolver | Done |
+| X-AUDSCHED| Audio-aware scheduler (low-latency PCM playback, HDA frame deadlines) | Done |
+| X-DMASCHED| DMA scheduler (NVMe/AHCI request batching + priority queues) | Done |
+| X-INOTIFY| inotify (file watch events: create/delete/modify) | Done |
+| X-CPUTOP| CPU topology detection (sockets/cores/threads, NUMA hints) | Done |
+| X-PERF  | perf events subsystem (counter sampling + ring buffer) | Done |
+| X-KSTATE| Kernel state snapshotting (boot-time fast restore, crash_report integration) | Done |
+| X-VGPU  | virtio-gpu 2D + 3D driver (resource create, transfer, virgl-style) | Done |
+| X-MESA  | Mesa 25.0.0 in-OS port: util/c11/include + gallium aux + compiler/{glsl,nir,spirv} + zink + mesa/main + state_tracker (libGL.a super-archive) | WIP |
+| X-DXVK  | DXVK 2.4 in-OS port: util/spirv/vulkan + dxbc/dxvk core + d3d11/dxgi/d3d10 (com_stub IUnknown) | WIP |
+| X-VK    | Vulkan stack: NVK userland ICD + Venus protocol (encoder/decoder, phys-dev queries, cmd buffers) + software rasterizer for guest-local present | WIP |
+| X-DOS   | DOS-native execution: VCPI server, EMS stubs, INT 31h DPMI, GDT[3]/[4] DOS4GW aliases, synth descriptors, INT 67h, LMSW PE switch detect, native FAR JMP/RETF transfer | WIP |
+| X-GUI   | Shared cross-arch GUI (gui/): elementaryOS-inspired desktop, AA text, Wingpanel, Plank dock, window decorations, NTP clock | Done |
+| A-ARM64 | AArch64/SM8350 (ROG Phone 5) bare-metal port: PL011 UART, GICv3, MMU paging, PCI ECAM, HDA, virtio-blk + OsitoFS v2, virtio-net + TCP/IP, syscall+ELF+process, crypto/TLS/HTTPS, multi-core SMP via PSCI, NEON SIMD tensor ops, GUI desktop task | Done |
 
 > Full GPU roadmap (X27-X40 + contingency): see [docs/x86-gpu-roadmap.md](docs/x86-gpu-roadmap.md)
 > Full OS roadmap (Tiers 0-9): see [docs/os-selfhost-roadmap.md](docs/os-selfhost-roadmap.md)
@@ -386,21 +405,22 @@ arch/arm/          SM8350 (ROG Phone 5) bare-metal port — see docs/aarch64-det
 > Filesystem roadmap (12 current + 15 planned): see [docs/filesystem-roadmap.md](docs/filesystem-roadmap.md)
 > VFS + demand paging + ETXTBSY architecture (2026-04-12 sweep): see [docs/x86-vfs-demand-paging.md](docs/x86-vfs-demand-paging.md)
 
-**Tier 8: Hardware Boot** — Boot OsitoK on real hardware (AMD Ryzen 7 5800X + RTX 3090).
+**Tier 8: Hardware Boot** — Boot OsitoK on real hardware (AMD Ryzen 7 5800X + RTX 3090). **RESOLVED** (commit `3c02b49`: H1-H6 hardware boot working with USB keyboard).
 
 ### Hardware Boot Plan (target: WD SN740 512GB NVMe)
 
-| Step | Task | Description | Deps |
-|------|------|-------------|------|
-| **H1** | **xHCI USB driver** | AMD 400/Matisse xHCI (`1022:43d5`, `1022:149c`). Enumerate ports, configure endpoints, USB HID for keyboard+mouse | None |
-| **H2** | **USB HID input** | Parse HID reports, scancode→ASCII, integrate with terminal line editor | H1 |
-| **H3** | **NVMe SN740 bring-up** | Test OsitoK NVMe driver with SN740 (`15b7:5016`, DRAM-less). May need CMB/SQ-in-CMB support | None |
-| **H4** | **Flash to NVMe** | Create GPT on nvme1n1: ESP partition (boot.efi + kernel.elf) + OsitoFS partition | H3 |
-| **H5** | **UEFI GOP display** | Verify framebuffer works on RTX 3090 GOP output (already obtained by boot.efi) | None |
-| **H6** | **Real hardware boot** | Boot from nvme1n1 via BIOS boot menu. Serial header for debug if needed | H1-H5 |
-| **H7** | **Nouveau modesetting** | Native display init for RTX 3090 (GA102). Resolution control, cursor | H6 |
+| Step | Task | Description | Deps | Status |
+|------|------|-------------|------|--------|
+| **H1** | **xHCI USB driver** | AMD 400/Matisse xHCI (`1022:43d5`, `1022:149c`). Enumerate ports, configure endpoints, USB HID for keyboard+mouse | None | Done |
+| **H2** | **USB HID input** | Parse HID reports, scancode→ASCII, integrate with terminal line editor | H1 | Done |
+| **H3** | **NVMe SN740 bring-up** | Test OsitoK NVMe driver with SN740 (`15b7:5016`, DRAM-less). May need CMB/SQ-in-CMB support | None | Done |
+| **H4** | **Flash to NVMe** | Create GPT on nvme1n1: ESP partition (boot.efi + kernel.elf) + OsitoFS partition | H3 | Done |
+| **H5** | **UEFI GOP display** | Verify framebuffer works on RTX 3090 GOP output (already obtained by boot.efi) | None | Done |
+| **H6** | **Real hardware boot** | Boot from nvme1n1 via BIOS boot menu. Serial header for debug if needed | H1-H5 | Done |
+| **H7** | **Nouveau modesetting** | Native display init for RTX 3090 (GA102). Resolution control, cursor | H6 | Pending |
+| **H8** | **Documentation refresh** | Audit features marked WIP/pending vs actual implementation, update CLAUDE.md tables and roadmap docs | None | In progress (last audit 2026-04-25) |
 
-**Critical path**: H1 → H2 → H6 (xHCI is the blocker — no keyboard = no interaction)
+**Critical path resolved**: H1 → H2 → H6 worked (USB keyboard unlocked interaction). Remaining: H7 native modesetting + ongoing H8 doc maintenance.
 
 ## Detailed Feature Documentation
 
