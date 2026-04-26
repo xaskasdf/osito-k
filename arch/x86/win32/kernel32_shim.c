@@ -512,50 +512,68 @@ PVOID WINAPI VirtualAlloc(PVOID lpAddress, SIZE_T dwSize,
         {
             extern uint32_t compat32_get_last_user_ebp(void);
             uint32_t walk = compat32_get_last_user_ebp();
-            int depth = 0;
-            while (depth < 2 && walk >= 0x100000 && walk < 0xFFFE0000 &&
-                   (walk & 3) == 0) {
-                uint32_t *fp = (uint32_t *)(uintptr_t)walk;
-                walk = fp[0];
-                depth++;
-            }
-            /* now walk == frame 2's EBP (FArray::Realloc's frame) */
-            if (walk >= 0x100000 && walk < 0xFFFE0000 && (walk & 3) == 0) {
+            int patched = 0;
+            /* Walk multiple depths AND multiple [ebp-N] offsets — any
+             * frame on the chain might be FArray::Realloc, and inside it
+             * `this` is saved at some negative-offset local. Try common
+             * MSVC compiler offsets [-0x10..-0x28] (esi-spill in
+             * SEH-decorated functions). For each candidate, check if
+             * *(this+8) is a code ptr → patch to 2. */
+            for (int depth = 0; depth < 5 && walk >= 0x100000 &&
+                 walk < 0xFFFE0000 && (walk & 3) == 0; depth++) {
                 int32_t *neg = (int32_t *)(uintptr_t)walk;
-                uint32_t this_ptr = (uint32_t)*(neg - 6); /* [-0x18] */
-                if (this_ptr >= 0x100000 && this_ptr < 0xFFFE0000 &&
-                    (this_ptr & 3) == 0) {
-                    uint32_t *t = (uint32_t *)(uintptr_t)this_ptr;
+                /* Try locals at [-0x14], [-0x18], [-0x1C], [-0x20], [-0x24] */
+                for (int local_off = 5; local_off <= 9 && !patched; local_off++) {
+                    uint32_t cand = (uint32_t)*(neg - local_off);
+                    if (cand < 0x100000 || cand >= 0xFFFE0000 || (cand & 3))
+                        continue;
+                    uint32_t *t = (uint32_t *)(uintptr_t)cand;
                     uint32_t plus8 = t[2];
-                    /* Code pointer pattern: in PE-image .text range */
+                    /* Code pointer pattern in PE-image .text range */
                     if (plus8 >= 0x10000000 && plus8 < 0x20000000) {
                         static int patch_log = 0;
-                        if (patch_log < 10) {
-                            serial_puts("[VA-FARRAY] FArray@0x");
-                            serial_puthex(this_ptr, 8);
-                            serial_puts(" {+8} was code-ptr 0x");
+                        if (patch_log < 20) {
+                            serial_puts("[VA-FARRAY] frame ");
+                            serial_putdec(depth);
+                            serial_puts(" local[-0x");
+                            serial_puthex(local_off * 4, 2);
+                            serial_puts("] = FArray@0x");
+                            serial_puthex(cand, 8);
+                            serial_puts(" {+8}=0x");
                             serial_puthex(plus8, 8);
-                            serial_puts(", patching to 2\n");
+                            serial_puts(" → 2");
                             patch_log++;
                         }
                         t[2] = 2;
-                        /* Also re-derive a sane dwSize: NewMax was at
-                         * frame 2 [ebp+8], take from fp[2]. */
+                        /* Also zero Num/Data so subsequent Realloc on
+                         * this same TArray gets clean slate */
+                        if (t[0] >= 0x10000000 && t[0] < 0x20000000) {
+                            t[0] = 0; /* Data */
+                        }
+                        if (t[1] >= 0x10000000 && t[1] < 0x20000000) {
+                            t[1] = 0; /* Num */
+                        }
+                        /* Use NewMax from frame's [ebp+8] = first arg */
                         uint32_t newmax = ((uint32_t *)(uintptr_t)walk)[2];
                         if (newmax > 0 && newmax < 0x100000) {
                             dwSize = (SIZE_T)(newmax * 2 + 0xFFF) & ~(SIZE_T)0xFFF;
-                            if (dwSize < 0x1000) dwSize = 0x1000;
-                            serial_puts("[VA-FARRAY] re-derived dwSize=0x");
-                            serial_puthex(dwSize, 8);
-                            serial_puts(" (NewMax=");
-                            serial_putdec((uint64_t)newmax);
-                            serial_puts(" * 2)\n");
-                            /* Skip the 64KB sentinel cap below — use the
-                             * derived size as the actual allocation. */
-                            goto va_proceed;
+                        } else {
+                            dwSize = 0x1000; /* fallback 4KB */
                         }
+                        if (patch_log <= 20) {
+                            serial_puts(" → dwSize=0x");
+                            serial_puthex(dwSize, 8);
+                            serial_puts("\n");
+                        }
+                        patched = 1;
                     }
                 }
+                if (patched) goto va_proceed;
+                /* advance to next frame */
+                uint32_t *fp = (uint32_t *)(uintptr_t)walk;
+                uint32_t next = fp[0];
+                if (next <= walk) break;  /* not strictly increasing */
+                walk = next;
             }
         }
         /* Cap to 64KB instead of 256MB. Reasons:
