@@ -23,8 +23,14 @@
 #include "venus_proto_core.h"
 
 extern void *memset(void *, int, unsigned long);
+extern long  __syscall1(long, long);
+extern long  __syscall3(long, long, long, long);
 
 #define VENUS_H_SLOT_MASK_W3B5    0x0FFFull
+#define SYS_SHM_MAP               501L
+#define SYS_SHM_DESTROY           503L
+#define SYS_SHM_MKSURFACE         506L
+#define SHM_FMT_BGRA              0x41524742L
 
 int venus_cmd_encode_CreateSwapchainKHR(
         struct venus_device *dev,
@@ -89,6 +95,40 @@ int venus_cmd_encode_CreateSwapchainKHR(
         img->usage              = pCreateInfo->imageUsage;
         img->is_swapchain_owned = 1;
         sc->image_slots[i] = img_slot;
+
+        /* W4.8: pre-bind a SHM-backed memory slot per swapchain image so
+         * Mesa+Zink callers don't have to vkBindImageMemory swapchain
+         * images explicitly (the WSI standard says swapchain images come
+         * pre-bound). vkCmdClearColorImage + vkQueueSubmit can then fill
+         * the SHM directly and vkQueuePresentKHR flips it. */
+        int mem_slot = -1;
+        for (uint32_t j = 0; j < VENUS_MAX_MEM_OBJECTS; j++) {
+            if (!dev->memories[j].in_use) { mem_slot = (int)j; break; }
+        }
+        if (mem_slot >= 0) {
+            long shm = __syscall3(SYS_SHM_MKSURFACE,
+                                  (long)sc->width, (long)sc->height,
+                                  SHM_FMT_BGRA);
+            if (shm > 0) {
+                long mapped = __syscall1(SYS_SHM_MAP, shm);
+                if (mapped != 0) {
+                    struct venus_memory *m = &dev->memories[mem_slot];
+                    memset(m, 0, sizeof(*m));
+                    m->in_use        = 1;
+                    m->size          = (uint64_t)sc->width * sc->height * 4u;
+                    m->local_ptr     = (void *)(uintptr_t)mapped;
+                    m->is_shm_backed = 1;
+                    m->shm_handle    = (uint32_t)shm;
+                    m->shm_width     = sc->width;
+                    m->shm_height    = sc->height;
+                    img->bound_mem_slot = mem_slot;
+                    img->bound_offset   = 0;
+                    sc->memory_slots[i] = mem_slot;
+                } else {
+                    (void)__syscall1(SYS_SHM_DESTROY, shm);
+                }
+            }
+        }
     }
 
     *out_slot = sc_slot;

@@ -103,8 +103,11 @@ venus_CreateDevice(VkPhysicalDevice physicalDevice,
     if (!physicalDevice || !pDevice) return VK_ERROR_INITIALIZATION_FAILED;
 
     struct venus_instance *parent = (struct venus_instance *)physicalDevice;
-    if (!(parent->caps & VENUS_GPU_CAP_VENUS_READY) || parent->ctx_id <= 0)
-        return VK_ERROR_INITIALIZATION_FAILED;
+    /* W4.8: previously bailed when VENUS_READY was off, leaving Mesa+Zink
+     * with no VkDevice and zink_create_screen returning NULL. Now we always
+     * allocate a guest-local device — every encoder already has a fallback
+     * path, and the W3b.5 SHM upgrade in vkBindImageMemory + the W4.8 SHM
+     * clear in vkQueueSubmit don't need a host wire to work. */
 
     struct venus_device *dev = malloc(sizeof(*dev));
     if (!dev) return VK_ERROR_OUT_OF_HOST_MEMORY;
@@ -114,7 +117,8 @@ venus_CreateDevice(VkPhysicalDevice physicalDevice,
     set_loader_magic_value(&dev->queue_loader_data);
     dev->host_handle = 0;
 
-    if (parent->wire && pCreateInfo) {
+    if (parent->wire && pCreateInfo &&
+        (parent->caps & VENUS_GPU_CAP_VENUS_READY) && parent->ctx_id > 0) {
         uint64_t dev_id = 0;
         int rc = venus_cmd_encode_CreateDevice(parent->wire, parent->host_handle,
                                                pCreateInfo, &dev_id);
