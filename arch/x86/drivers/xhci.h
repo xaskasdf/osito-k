@@ -162,7 +162,12 @@ typedef struct __attribute__((packed)) {
 } xhci_ep_ctx_t;
 
 /* EP types (bits 5:3 of field2) */
+#define EP_TYPE_ISOCH_OUT       1
+#define EP_TYPE_BULK_OUT        2
+#define EP_TYPE_INTERRUPT_OUT   3
 #define EP_TYPE_CONTROL         4
+#define EP_TYPE_ISOCH_IN        5
+#define EP_TYPE_BULK_IN         6
 #define EP_TYPE_INTERRUPT_IN    7
 
 /* ── Input Control Context (32 bytes) ────────────────────────── */
@@ -251,6 +256,25 @@ typedef struct {
      * caps to extract values; otherwise the report is dropped. */
     hid_caps_t  hid_caps;
     uint16_t    report_desc_len; /* Bytes in the fetched Report Descriptor (0 if absent). */
+
+    /* ── USB Mass Storage (Bulk-Only Transport) ──────────────────
+     * For class=0x08 (Mass Storage) devices we configure two extra
+     * endpoints — Bulk OUT for sending CBWs and write data, Bulk IN
+     * for receiving read data and CSWs. The dev_idx the higher-level
+     * usb_storage driver passes to xhci_bulk_in/out is the slot_id-1. */
+    bool        msc_active;
+    xhci_trb_t *bulk_in_ring;
+    uint64_t    bulk_in_ring_phys;
+    uint32_t    bulk_in_enq;
+    uint8_t     bulk_in_cycle;
+    uint8_t     bulk_in_dci;
+    uint16_t    bulk_in_max_pkt;
+    xhci_trb_t *bulk_out_ring;
+    uint64_t    bulk_out_ring_phys;
+    uint32_t    bulk_out_enq;
+    uint8_t     bulk_out_cycle;
+    uint8_t     bulk_out_dci;
+    uint16_t    bulk_out_max_pkt;
 
     /* Keyboard state (previous report for debounce). Sized for boot
      * protocol; descriptor-driven keyboards with larger keycode arrays

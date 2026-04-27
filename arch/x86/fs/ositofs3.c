@@ -15,7 +15,7 @@ extern void serial_puthex(uint64_t val, int digits);
 extern void serial_putdec(uint64_t val);
 extern void fb_puts(const char *s);
 
-extern int nvme_read_bytes(uint64_t byte_offset, void *buf, uint64_t len);
+extern int disk_read_bytes(uint64_t byte_offset, void *buf, uint64_t len);
 extern int nvme_write_bytes(uint64_t byte_offset, const void *buf, uint64_t len);
 extern int nvme_flush(void);
 extern void *mem_alloc_aligned(uint64_t size, uint64_t alignment);
@@ -35,7 +35,7 @@ static osfs3_inode_t *inode_table = NULL; /* Cached first block of inodes */
 
 static int osfs3_part_read(uint64_t offset, void *buf, uint64_t len)
 {
-    return nvme_read_bytes(partition_offset + offset, buf, len);
+    return disk_read_bytes(partition_offset + offset, buf, len);
 }
 
 static int osfs3_read_block(uint32_t block, void *buf)
@@ -189,7 +189,7 @@ int osfs3_read(uint32_t ino, uint64_t offset, void *buf, uint64_t len)
         if (chunk > 65536) chunk = 65536;
 
         uint64_t abs_offset = ((uint64_t)inode->extents[0].start_block << OSFS3_BLOCK_SHIFT) + offset + bytes_read;
-        if (nvme_read_bytes(partition_offset + abs_offset, ptr + bytes_read, chunk) < 0) {
+        if (disk_read_bytes(partition_offset + abs_offset, ptr + bytes_read, chunk) < 0) {
             return bytes_read > 0 ? (int)bytes_read : -1;
         }
         bytes_read += chunk;

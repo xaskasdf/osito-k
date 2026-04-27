@@ -472,6 +472,22 @@ int __initk nvme_init(uint64_t bar0_phys)
     nvme.initialized = true;
 
     serial_puts("[NVMe] I/O queues created, driver ready\n");
+
+    /* Register as a block device. NVMe driver currently uses one global
+     * `nvme` so multi-controller setups overwrite each other; the most
+     * recent successful nvme_init wins both nvme_read AND the blkdev
+     * read function. main.c iterates controllers sequentially during
+     * boot to find OsitoFS, which is consistent with this single-active
+     * model. */
+    extern int  blkdev_register(const char *name, uint8_t type,
+                                uint32_t sector_size, uint64_t sector_count,
+                                int (*read)(uint64_t, uint32_t, void *),
+                                int (*write)(uint64_t, uint32_t, const void *));
+    extern int  nvme_read(uint64_t lba, uint32_t count, void *buf);
+    blkdev_register("nvme0", 0 /* BLKDEV_NVME */,
+                    nvme.lba_size, nvme.total_lbas,
+                    nvme_read, NULL);
+
     return 0;
 }
 

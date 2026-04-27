@@ -25,7 +25,7 @@ extern void fb_putdec(uint64_t val);
 extern void fb_puthex(uint64_t val, int digits);
 extern void fb_putc(char c, uint32_t color);
 
-extern int nvme_read_bytes(uint64_t byte_offset, void *buf, uint64_t len);
+extern int disk_read_bytes(uint64_t byte_offset, void *buf, uint64_t len);
 extern int nvme_write_bytes(uint64_t byte_offset, const void *buf, uint64_t len);
 extern int nvme_flush(void);
 extern void *mem_alloc_aligned(uint64_t size, uint64_t alignment);
@@ -163,7 +163,7 @@ static void osfs2_hash_build(void)
 
 static int osfs2_part_read(uint64_t offset, void *buf, uint64_t len)
 {
-    return nvme_read_bytes(partition_offset + offset, buf, len);
+    return disk_read_bytes(partition_offset + offset, buf, len);
 }
 
 static int osfs2_read_block_data(uint32_t block, void *buf)
@@ -509,7 +509,7 @@ int osfs2_read(osfs2_file_t *file, uint64_t offset, void *buf, uint64_t len)
     uint64_t abs_offset = ((uint64_t)file->start_block << blk_shift) + offset;
     int rc = osfs2_part_read(abs_offset, buf, len);
     if (rc < 0) return -1;
-    return (int)len;  /* nvme_read_bytes returns 0 on success, not byte count */
+    return (int)len;  /* disk_read_bytes returns 0 on success, not byte count */
 }
 
 /* ── Read a full block from a file ───────────────────────────── */

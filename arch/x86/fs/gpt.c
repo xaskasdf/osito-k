@@ -22,8 +22,10 @@ extern void serial_putdec(uint64_t val);
 extern void fb_puts(const char *s);
 extern void fb_putdec(uint64_t val);
 
-extern int      nvme_read_bytes(uint64_t byte_offset, void *buf, uint64_t len);
-extern uint32_t nvme_lba_size(void);
+/* Read via the active blkdev (NVMe / USB / etc.). main.c selects which
+ * device is active before each mount probe via disk_set_active(). */
+extern int      disk_read_bytes(uint64_t byte_offset, void *buf, uint64_t len);
+extern uint32_t disk_lba_size(void);
 
 /* ── Helpers ─────────────────────────────────────────────────── */
 
@@ -91,13 +93,13 @@ static bool gpt_guid_is_zero(gpt_guid_t g)
 
 int gpt_find_ositofs(uint64_t *part_offset, uint64_t *part_size)
 {
-    uint32_t lba_size = nvme_lba_size();
+    uint32_t lba_size = disk_lba_size();
 
     /* ── Read GPT header (LBA 1) ── */
     serial_puts("[GPT] Reading GPT header...\n");
 
     gpt_header_t hdr;
-    if (nvme_read_bytes((uint64_t)lba_size, &hdr, sizeof(hdr)) < 0) {
+    if (disk_read_bytes((uint64_t)lba_size, &hdr, sizeof(hdr)) < 0) {
         serial_puts("[GPT] Failed to read LBA 1\n");
         return -1;
     }
@@ -141,7 +143,7 @@ int gpt_find_ositofs(uint64_t *part_offset, uint64_t *part_size)
         gpt_entry_t entry;
         uint64_t entry_off = entries_start + (uint64_t)i * entry_size;
 
-        if (nvme_read_bytes(entry_off, &entry, sizeof(entry)) < 0)
+        if (disk_read_bytes(entry_off, &entry, sizeof(entry)) < 0)
             continue;
 
         if (gpt_guid_is_zero(entry.type_guid))
@@ -177,7 +179,7 @@ int gpt_find_ositofs(uint64_t *part_offset, uint64_t *part_size)
         gpt_entry_t entry;
         uint64_t entry_off = entries_start + (uint64_t)i * entry_size;
 
-        if (nvme_read_bytes(entry_off, &entry, sizeof(entry)) < 0)
+        if (disk_read_bytes(entry_off, &entry, sizeof(entry)) < 0)
             continue;
 
         if (gpt_guid_is_zero(entry.type_guid))
@@ -187,7 +189,7 @@ int gpt_find_ositofs(uint64_t *part_offset, uint64_t *part_size)
         uint64_t part_start = entry.first_lba * lba_size;
         uint8_t probe[512];
 
-        if (nvme_read_bytes(part_start, probe, sizeof(probe)) < 0)
+        if (disk_read_bytes(part_start, probe, sizeof(probe)) < 0)
             continue;
 
         /* Check for OSFS2 magic at offset 0 */

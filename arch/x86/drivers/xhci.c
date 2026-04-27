@@ -1033,20 +1033,30 @@ static void enumerate_port(xhci_hc_t *hc, int port)
      * we'd configure EP2/EP3 (consumer/vendor) instead of EP1 (keyboard)
      * and get zero transfer events when normal keys are pressed.
      */
-    /* Walk the configuration descriptor and select the FIRST HID interface
-     * that has an Interrupt IN endpoint. Per-interface meaning (keyboard
-     * vs mouse vs consumer vs vendor) is determined later by parsing the
-     * Report Descriptor — bInterfaceProtocol is just a hint, not a gate.
-     *
-     * NOTE: composite devices (one slot, multiple HID interfaces) only get
-     * one endpoint configured here. Full multi-interface support is a
-     * follow-up; for now most setups have one device per HID function. */
+    /* Walk the configuration descriptor. We can land on either:
+     *   - HID class (3): collect Interrupt IN endpoint + HID Report
+     *     Descriptor length (from the 0x21 class descriptor).
+     *   - Mass Storage class (8): collect Bulk IN + Bulk OUT endpoints
+     *     for SCSI BBB (subclass 6, protocol 0x50).
+     * The first matching interface wins (one functional unit per device
+     * slot — composite devices that mix functions still get only one
+     * for now). */
+    enum { IFACE_NONE, IFACE_HID, IFACE_MSC };
+    int      iface_kind         = IFACE_NONE;
+
     uint8_t  hid_iface          = 0xFF;
     uint8_t  hid_proto          = 0;
     uint8_t  int_ep_addr        = 0;
     uint16_t int_max_pkt_found  = 0;
     uint8_t  int_interval       = 0;
-    uint16_t report_desc_len    = 0;   /* From the HID descriptor (0x21). */
+    uint16_t report_desc_len    = 0;
+
+    uint8_t  msc_iface          = 0xFF;
+    uint8_t  bulk_in_addr       = 0;
+    uint16_t bulk_in_max_pkt    = 0;
+    uint8_t  bulk_out_addr      = 0;
+    uint16_t bulk_out_max_pkt   = 0;
+
     bool     collecting_eps     = false;
 
     uint32_t pos = 0;
@@ -1060,11 +1070,11 @@ static void enumerate_port(xhci_hc_t *hc, int port)
             uint8_t isub   = desc_buf[pos + 6];
             uint8_t iproto = desc_buf[pos + 7];
 
-            /* New interface starts — stop collecting endpoints from a prior
-             * interface that wasn't HID or wasn't selected. */
+            /* New interface — stop collecting endpoints from a prior
+             * interface that wasn't selected. */
             collecting_eps = false;
 
-            if (iclass == 3) {  /* HID */
+            if (iclass == 3 && iface_kind == IFACE_NONE) {  /* HID */
                 uint8_t this_iface = desc_buf[pos + 2];
                 serial_puts("[xHCI] HID interface ");
                 serial_putdec(this_iface);
@@ -1073,24 +1083,28 @@ static void enumerate_port(xhci_hc_t *hc, int port)
                 serial_puts(" proto=");
                 serial_putdec(iproto);
                 serial_puts(")\n");
-
-                /* Take the first HID interface; ignore later ones for this
-                 * device (composite-device support is a separate change). */
-                if (hid_iface == 0xFF) {
-                    hid_iface = this_iface;
-                    hid_proto = iproto;
-                    collecting_eps = true;
-                }
+                iface_kind     = IFACE_HID;
+                hid_iface      = this_iface;
+                hid_proto      = iproto;
+                collecting_eps = true;
+            } else if (iclass == 0x08 && isub == 0x06 && iproto == 0x50 &&
+                       iface_kind == IFACE_NONE) {
+                /* USB MSC SCSI Bulk-Only Transport. */
+                uint8_t this_iface = desc_buf[pos + 2];
+                serial_puts("[xHCI] MSC interface ");
+                serial_putdec(this_iface);
+                serial_puts(" (SCSI-BBB)\n");
+                iface_kind     = IFACE_MSC;
+                msc_iface      = this_iface;
+                collecting_eps = true;
             }
         }
 
-        /* HID Class Descriptor (0x21) — sits between Interface and Endpoint
-         * descriptors and tells us how big the Report Descriptor is. We
-         * need that length for GET_DESCRIPTOR(0x22) below. */
-        if (dtype == 0x21 && collecting_eps && pos + 9 <= total_len) {
-            /* Layout: bLength, bDescType=0x21, bcdHID(2), bCountry, bNum,
-             *         bDescType_0=0x22, wDescLen_0(2), [more descriptors] */
-            uint8_t  num   = desc_buf[pos + 5];
+        /* HID Class Descriptor (0x21): tells us the Report Descriptor
+         * size we'll fetch via GET_DESCRIPTOR(0x22). */
+        if (dtype == 0x21 && iface_kind == IFACE_HID && collecting_eps &&
+            pos + 9 <= total_len) {
+            uint8_t  num = desc_buf[pos + 5];
             for (uint8_t k = 0; k < num && pos + 6 + 3 * k + 3 <= total_len; k++) {
                 uint8_t  type = desc_buf[pos + 6 + 3 * k];
                 uint16_t blen = (uint16_t)(desc_buf[pos + 6 + 3 * k + 1] |
@@ -1110,26 +1124,45 @@ static void enumerate_port(xhci_hc_t *hc, int port)
             uint8_t  ep_attr = desc_buf[pos + 3];
             uint16_t ep_mps  = (uint16_t)(desc_buf[pos + 4] | (desc_buf[pos + 5] << 8));
             uint8_t  ep_int  = desc_buf[pos + 6];
+            uint8_t  ep_type = ep_attr & 0x03;
+            bool     is_in   = (ep_addr & 0x80) != 0;
 
-            /* Interrupt IN endpoint? */
-            if ((ep_attr & 0x03) == 0x03 && (ep_addr & 0x80)) {
-                int_ep_addr        = ep_addr;
-                int_max_pkt_found  = ep_mps & 0x7FF;
-                int_interval       = ep_int;
-                serial_puts("[xHCI]  -> EP: ");
+            if (iface_kind == IFACE_HID && ep_type == 0x03 && is_in) {
+                /* Interrupt IN endpoint */
+                int_ep_addr       = ep_addr;
+                int_max_pkt_found = ep_mps & 0x7FF;
+                int_interval      = ep_int;
+                serial_puts("[xHCI]  -> Int-IN EP ");
                 serial_puthex(ep_addr, 2);
                 serial_puts(" maxpkt=");
                 serial_putdec(int_max_pkt_found);
-                serial_puts(" interval=");
-                serial_putdec(int_interval);
-                serial_puts(" (selected)\n");
+                serial_puts("\n");
+            } else if (iface_kind == IFACE_MSC && ep_type == 0x02) {
+                /* Bulk endpoint — direction tells IN vs OUT. */
+                if (is_in) {
+                    bulk_in_addr    = ep_addr;
+                    bulk_in_max_pkt = ep_mps & 0x7FF;
+                    serial_puts("[xHCI]  -> Bulk-IN EP ");
+                } else {
+                    bulk_out_addr    = ep_addr;
+                    bulk_out_max_pkt = ep_mps & 0x7FF;
+                    serial_puts("[xHCI]  -> Bulk-OUT EP ");
+                }
+                serial_puthex(ep_addr, 2);
+                serial_puts(" maxpkt=");
+                serial_putdec(ep_mps & 0x7FF);
+                serial_puts("\n");
             }
         }
 
         pos += dlen;
     }
 
-    if (int_ep_addr == 0) {
+    if (iface_kind == IFACE_NONE) {
+        serial_puts("[xHCI] No supported interface (HID/MSC) found\n");
+        return;
+    }
+    if (iface_kind == IFACE_HID && int_ep_addr == 0) {
         serial_puts("[xHCI] No HID interrupt endpoint found\n");
         return;
     }
@@ -1146,6 +1179,7 @@ static void enumerate_port(xhci_hc_t *hc, int port)
         return;
     }
 
+  if (iface_kind == IFACE_HID) {
     /* ── SET_PROTOCOL (boot protocol = 0) ── */
     setup.bmRequestType = 0x21; /* Class, Interface, Host-to-Device */
     setup.bRequest = USB_REQ_SET_PROTOCOL;
@@ -1331,6 +1365,126 @@ static void enumerate_port(xhci_hc_t *hc, int port)
         fb_putdec(slot_id);
         fb_puts("\n");
     }
+  } else if (iface_kind == IFACE_MSC) {
+    /* ── USB Mass Storage path ──
+     * SET_CONFIGURATION already issued above. We now allocate two Bulk
+     * transfer rings, configure both endpoints, and hand the slot off
+     * to drivers/usb_storage.c (BBB protocol, SCSI commands). */
+    if (bulk_in_addr == 0 || bulk_out_addr == 0) {
+        serial_puts("[xHCI] MSC needs both Bulk-IN and Bulk-OUT EPs\n");
+        return;
+    }
+
+    uint8_t in_dci  = (bulk_in_addr  & 0x0F) * 2 + 1; /* IN  → odd */
+    uint8_t out_dci = (bulk_out_addr & 0x0F) * 2;     /* OUT → even */
+    uint8_t max_dci = (in_dci > out_dci) ? in_dci : out_dci;
+
+    /* Allocate the two transfer rings. */
+    uint32_t ring_bytes = XHCI_XFER_RING_SIZE * sizeof(xhci_trb_t);
+    void *bin_phys  = mem_alloc_aligned(ring_bytes, 4096);
+    void *bout_phys = mem_alloc_aligned(ring_bytes, 4096);
+    if (!bin_phys || !bout_phys) {
+        serial_puts("[xHCI] MSC ring alloc failed\n");
+        return;
+    }
+    dev->bulk_in_ring       = (xhci_trb_t *)PHYS_TO_VIRT(bin_phys);
+    dev->bulk_in_ring_phys  = (uint64_t)bin_phys;
+    dev->bulk_out_ring      = (xhci_trb_t *)PHYS_TO_VIRT(bout_phys);
+    dev->bulk_out_ring_phys = (uint64_t)bout_phys;
+    memset(dev->bulk_in_ring,  0, ring_bytes);
+    memset(dev->bulk_out_ring, 0, ring_bytes);
+    dev->bulk_in_enq    = 0;  dev->bulk_in_cycle  = 1;
+    dev->bulk_out_enq   = 0;  dev->bulk_out_cycle = 1;
+    dev->bulk_in_dci    = in_dci;
+    dev->bulk_out_dci   = out_dci;
+    dev->bulk_in_max_pkt  = bulk_in_max_pkt;
+    dev->bulk_out_max_pkt = bulk_out_max_pkt;
+
+    /* Configure Endpoint with both Bulk EPs added. */
+    memset(in_ctx, 0, in_ctx_total);
+    icc = (xhci_input_ctrl_ctx_t *)ctx_entry(hc, in_ctx, 0);
+    icc->add_flags = (1u << 0) | (1u << in_dci) | (1u << out_dci);
+
+    slot_ctx = (xhci_slot_ctx_t *)ctx_entry(hc, in_ctx, 1);
+    xhci_slot_ctx_t *out_slot = (xhci_slot_ctx_t *)ctx_entry(hc, dev->output_ctx, 0);
+    *slot_ctx = *out_slot;
+    slot_ctx->field1 &= ~(0x1F << 27);
+    slot_ctx->field1 |= ((uint32_t)max_dci << 27);
+
+    /* Bulk IN endpoint context. */
+    xhci_ep_ctx_t *bin_ep = (xhci_ep_ctx_t *)ctx_entry(hc, in_ctx, in_dci + 1);
+    bin_ep->field1    = 0;
+    bin_ep->field2    = (3 << 1) | (EP_TYPE_BULK_IN << 3) |
+                        ((uint32_t)bulk_in_max_pkt << 16);
+    bin_ep->tr_dequeue = dev->bulk_in_ring_phys | 1; /* DCS=1 */
+    bin_ep->field4    = bulk_in_max_pkt;
+
+    /* Bulk OUT endpoint context. */
+    xhci_ep_ctx_t *bout_ep = (xhci_ep_ctx_t *)ctx_entry(hc, in_ctx, out_dci + 1);
+    bout_ep->field1   = 0;
+    bout_ep->field2   = (3 << 1) | (EP_TYPE_BULK_OUT << 3) |
+                        ((uint32_t)bulk_out_max_pkt << 16);
+    bout_ep->tr_dequeue = dev->bulk_out_ring_phys | 1;
+    bout_ep->field4   = bulk_out_max_pkt;
+
+    memset(&cmd, 0, sizeof(cmd));
+    cmd.param   = (uint64_t)in_ctx_phys;
+    cmd.control = XHCI_TRB_TYPE(TRB_CONFIGURE_ENDPOINT) | ((uint32_t)slot_id << 24);
+    cmd_submit(hc, &cmd);
+    code = cmd_wait(hc, &dummy);
+    if (code != 1) {
+        serial_puts("[xHCI] MSC Configure Endpoint failed code=");
+        serial_putdec(code < 0 ? 0 : (uint64_t)code);
+        serial_puts("\n");
+        return;
+    }
+
+    dev->msc_active = true;
+    hc->num_devices++;
+
+    serial_puts("[xHCI] MSC active on slot ");
+    serial_putdec(slot_id);
+    serial_puts(" (in=");
+    serial_puthex(bulk_in_addr, 2);
+    serial_puts(" out=");
+    serial_puthex(bulk_out_addr, 2);
+    serial_puts(")\n");
+    {
+        extern void fb_puts(const char *s);
+        extern void fb_putdec(uint64_t v);
+        fb_puts(" [xHCI] mass-storage on slot ");
+        fb_putdec(slot_id);
+        fb_puts("\n");
+    }
+
+    /* Hand off to the SCSI BBB driver. dev_idx = slot_id - 1 because
+     * slots are 1-based but the device array is 0-based. */
+    extern int usb_storage_init(int xhci_dev_idx);
+    if (usb_storage_init(slot_id - 1) == 0) {
+        /* Register as block device. The SCSI READ(10) callback uses
+         * the same usb_storage_read entry; usb_storage tracks the active
+         * device internally so we don't need to thread dev_idx through. */
+        extern uint32_t usb_storage_block_size(void);
+        extern uint32_t usb_storage_block_count(void);
+        extern int usb_storage_read(uint64_t lba, uint32_t count, void *buf);
+        extern int blkdev_register(const char *name, uint8_t type,
+                                   uint32_t sector_size, uint64_t sector_count,
+                                   int (*read)(uint64_t, uint32_t, void *),
+                                   int (*write)(uint64_t, uint32_t, const void *));
+        int idx = blkdev_register("usb0", 3 /* BLKDEV_USB */,
+                                   usb_storage_block_size(),
+                                   usb_storage_block_count(),
+                                   usb_storage_read, NULL);
+        if (idx >= 0) {
+            extern void fb_puts(const char *s);
+            extern void fb_putdec(uint64_t v);
+            fb_puts(" [BLKDEV] usb0 registered (");
+            fb_putdec((uint64_t)usb_storage_block_count() *
+                      usb_storage_block_size() / (1024 * 1024));
+            fb_puts(" MB)\n");
+        }
+    }
+  }
 }
 
 /* ── Init one xHCI controller ────────────────────────────────── */
@@ -1685,6 +1839,141 @@ int xhci_init(uint64_t bar0_phys, uint8_t bus, uint8_t dev, uint8_t func)
     /* xHCI summary goes to serial; main.c shows compact HW info */
 
     return 0;
+}
+
+/* ── Bulk transfers (USB Mass Storage BBB) ─────────────────────
+ *
+ * xhci_bulk_in / xhci_bulk_out are the API surface used by the upper
+ * MSC driver (drivers/usb_storage.c) to talk to a SCSI-over-USB device.
+ * dev_idx is the host-controller-relative slot index (slot_id - 1).
+ *
+ * Implementation: a single Normal TRB is queued on the appropriate Bulk
+ * transfer ring with TRB_IOC, the endpoint doorbell is rung, and we
+ * synchronously poll the event ring for a TRANSFER_EVENT addressed to
+ * this slot+DCI. On completion we return 0 (success) or -1 (HC error,
+ * timeout, or short-packet on a write). Short-packet on a read is
+ * counted as success but `*actual_in` is updated so the caller can
+ * tell.
+ *
+ * The synchronous-wait pattern here mirrors ctrl_transfer; long term we
+ * may want async + completion callbacks but synchronous is correct and
+ * matches the BBB protocol's CBW→Data→CSW lockstep semantics anyway.
+ */
+
+static int bulk_xfer(xhci_hc_t *hc, xhci_device_t *dev,
+                     xhci_trb_t *ring, uint64_t ring_phys,
+                     uint32_t *enq_io, uint8_t *cycle_io,
+                     uint8_t ep_dci,
+                     void *buf, uint32_t len, bool dir_in,
+                     uint32_t *actual_out)
+{
+    if (!hc || !dev || !ring || ep_dci == 0) return -1;
+    if (len == 0) { if (actual_out) *actual_out = 0; return 0; }
+
+    uint32_t ei = *enq_io;
+    uint8_t  cyc = *cycle_io;
+    (void)dir_in; /* DCI encodes direction; param/IOC are the same. */
+
+    /* Build a single Normal TRB.  buf is a kernel virt pointer in the
+     * upper-half direct-map alias; the controller needs the phys. */
+    ring[ei].param   = (uint64_t)VIRT_TO_PHYS(buf);
+    ring[ei].status  = len;
+    wmb();
+    ring[ei].control = XHCI_TRB_TYPE(TRB_NORMAL) | TRB_IOC |
+                       (cyc ? TRB_CYCLE : 0);
+    wmb();
+
+    ei++;
+    if (ei >= XHCI_XFER_RING_SIZE - 1) {
+        /* Link TRB back to head — flip cycle when we cross. */
+        ring[ei].param   = ring_phys;
+        ring[ei].status  = 0;
+        ring[ei].control = XHCI_TRB_TYPE(TRB_LINK) | TRB_TC |
+                           (cyc ? TRB_CYCLE : 0);
+        wmb();
+        ei = 0;
+        cyc ^= 1;
+    }
+    *enq_io   = ei;
+    *cycle_io = cyc;
+
+    /* Ring the endpoint doorbell. */
+    db_write(hc, dev->slot_id, ep_dci);
+
+    /* Wait for the matching Transfer Event. The same iteration limit as
+     * ctrl_transfer (~340ms at 3.8 GHz) — bulk reads of 64 sectors are
+     * safely under that. */
+    for (int t = 0; t < 20000000; t++) {
+        uint32_t eidx = hc->evt_deq;
+        xhci_trb_t *ev = &hc->evt_ring[eidx];
+        rmb();
+        if ((ev->control & TRB_CYCLE) != hc->evt_cycle) {
+            __asm__ volatile ("pause");
+            continue;
+        }
+
+        uint8_t  etype = XHCI_TRB_GET_TYPE(ev->control);
+        uint8_t  ecode = (ev->status >> 24) & 0xFF;
+        uint8_t  eslot = (ev->control >> 24) & 0xFF;
+        uint8_t  edci  = (ev->control >> 16) & 0x1F;
+        uint32_t eres  = ev->status & 0xFFFFFF;  /* TRB Transfer Length residual. */
+
+        /* Always advance and acknowledge — we mustn't get stuck on
+         * an unrelated event. */
+        hc->evt_deq++;
+        if (hc->evt_deq >= XHCI_EVT_RING_SIZE) {
+            hc->evt_deq = 0;
+            hc->evt_cycle ^= 1;
+        }
+        uint64_t erdp = (hc->evt_ring_phys + hc->evt_deq * sizeof(xhci_trb_t)) | (1 << 3);
+        rt_write64(hc, XHCI_RT_IR0 + XHCI_IR_ERDP, erdp);
+
+        if (etype != TRB_TRANSFER_EVENT) continue;
+        if (eslot != dev->slot_id) continue;
+        if (edci  != ep_dci) continue;
+
+        if (actual_out) *actual_out = (eres > len) ? 0 : (len - eres);
+        /* 1 = Success, 13 = Short Packet (still useful for IN). */
+        return (ecode == 1 || ecode == 13) ? 0 : -1;
+    }
+
+    serial_puts("[xHCI] Bulk transfer timeout\n");
+    return -1;
+}
+
+int xhci_bulk_out(int dev_idx, const void *data, uint32_t len)
+{
+    /* Locate the device — dev_idx is global across controllers; we
+     * walk hc_list and use the first non-zero slot match. Real systems
+     * typically have one xHCI; if you need multi-HC, add an HC index. */
+    for (int h = 0; h < hc_count; h++) {
+        xhci_hc_t *hc = &hc_list[h];
+        if (dev_idx < 0 || dev_idx >= XHCI_MAX_SLOTS) continue;
+        xhci_device_t *dev = &hc->devices[dev_idx];
+        if (!dev->msc_active) continue;
+        return bulk_xfer(hc, dev,
+                         dev->bulk_out_ring, dev->bulk_out_ring_phys,
+                         &dev->bulk_out_enq, &dev->bulk_out_cycle,
+                         dev->bulk_out_dci,
+                         (void *)(uintptr_t)data, len, false, NULL);
+    }
+    return -1;
+}
+
+int xhci_bulk_in(int dev_idx, void *data, uint32_t len, uint32_t *actual)
+{
+    for (int h = 0; h < hc_count; h++) {
+        xhci_hc_t *hc = &hc_list[h];
+        if (dev_idx < 0 || dev_idx >= XHCI_MAX_SLOTS) continue;
+        xhci_device_t *dev = &hc->devices[dev_idx];
+        if (!dev->msc_active) continue;
+        return bulk_xfer(hc, dev,
+                         dev->bulk_in_ring, dev->bulk_in_ring_phys,
+                         &dev->bulk_in_enq, &dev->bulk_in_cycle,
+                         dev->bulk_in_dci,
+                         data, len, true, actual);
+    }
+    return -1;
 }
 
 /* ── Poll all controllers ────────────────────────────────────── */

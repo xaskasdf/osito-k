@@ -158,6 +158,82 @@ const char *blkdev_detect_fs(int dev_idx)
     return NULL;  /* Unknown */
 }
 
+/* ── Active-disk view (used by fs/ during mount probe) ─────────
+ *
+ * The filesystem layer (gpt.c, ositofs2.c, ositofs3.c) does not know
+ * about NVMe vs USB vs anything else — it just calls disk_read_bytes()
+ * to read raw bytes. Before each mount attempt, main.c selects which
+ * blkdev is "active" via disk_set_active(); subsequent disk_* calls
+ * route through that device's read function.
+ *
+ * This is simpler than threading a blkdev handle through every fs
+ * function and keeps the fs code identical regardless of underlying
+ * transport. Active-disk state is single-threaded by construction
+ * (only one mount happens at a time during boot). */
+
+static int active_dev = -1;
+
+void disk_set_active(int dev_idx)
+{
+    if (dev_idx < 0 || dev_idx >= device_count) {
+        active_dev = -1;
+        return;
+    }
+    active_dev = dev_idx;
+}
+
+int disk_active(void) { return active_dev; }
+
+uint32_t disk_lba_size(void)
+{
+    if (active_dev < 0) return 0;
+    return devices[active_dev].sector_size;
+}
+
+uint64_t disk_lba_count(void)
+{
+    if (active_dev < 0) return 0;
+    return devices[active_dev].sector_count;
+}
+
+/*
+ * Read `len` bytes starting at byte_offset on the active device.
+ * Translates byte coordinates to LBA + intra-sector offset, reads via
+ * the device's blk_read_fn into a temporary aligned buffer, and copies
+ * the requested bytes into the caller's buffer. Returns 0 on success,
+ * -1 on any sub-read failure or when no device is active.
+ */
+int disk_read_bytes(uint64_t byte_offset, void *buf, uint64_t len)
+{
+    if (active_dev < 0) return -1;
+    blkdev_t *d = &devices[active_dev];
+    if (!d->active || !d->read || d->sector_size == 0) return -1;
+
+    uint8_t *dst   = (uint8_t *)buf;
+    uint64_t off   = byte_offset;
+    uint64_t left  = len;
+    uint8_t  tmp[8192];                /* up to 16 sectors per round */
+    uint32_t ssz   = d->sector_size;
+    if (ssz > sizeof(tmp))             /* defensive — 4 KB sectors fit */
+        return -1;
+
+    while (left > 0) {
+        uint64_t lba    = off / ssz;
+        uint32_t intra  = (uint32_t)(off % ssz);
+        uint32_t want   = (uint32_t)((left < (sizeof(tmp) - intra))
+                                     ? left : (sizeof(tmp) - intra));
+        uint32_t sectors = (intra + want + ssz - 1) / ssz;
+
+        if (d->read(lba, sectors, tmp) < 0) return -1;
+
+        for (uint32_t i = 0; i < want; i++) dst[i] = tmp[intra + i];
+        dst  += want;
+        off  += want;
+        left -= want;
+    }
+    return 0;
+}
+
 /* ── List all devices ────────────────────────────────────────── */
 
 void blkdev_list(void)
