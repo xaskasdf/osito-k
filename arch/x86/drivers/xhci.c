@@ -158,110 +158,200 @@ const char hid_shifted[0x54] = {
 
 /* ── USB Keyboard Report Handler ─────────────────────────────── */
 
-static void usb_kbd_handle_report(xhci_device_t *dev, uint8_t *r, uint32_t len)
+/*
+ * Convert a HID keycode (page 7) to ASCII via boot-protocol-style tables
+ * and push it to the terminal kb_buf, honoring shift and ctrl modifiers.
+ * Also generates VT100 escape sequences for arrow / Home / End / etc.
+ */
+static void kbd_route_to_term(uint8_t code, bool shift, bool ctrl)
 {
-    if (len < 8) return;
-    // serial_puts("[USB-KB] Report received\n");
-    if (!kb_push) return; /* keyboard.c not linked */
+    if (!kb_push) return;
 
-    uint8_t mods = r[0];
-    /* r[1] is reserved */
+    /* Compositor owns input routing when running — drop here, it pulls
+     * raw HID from the input ring and pushes to kb_buf if the terminal
+     * window is focused. */
+    extern bool compositor_is_running(void) __attribute__((weak));
+    if (compositor_is_running && compositor_is_running()) return;
+
+    if (kb_push_esc) {
+        if (code == 0x4F) { kb_push_esc("C");  return; }
+        if (code == 0x50) { kb_push_esc("D");  return; }
+        if (code == 0x51) { kb_push_esc("B");  return; }
+        if (code == 0x52) { kb_push_esc("A");  return; }
+        if (code == 0x4A) { kb_push_esc("H");  return; }
+        if (code == 0x4D) { kb_push_esc("F");  return; }
+        if (code == 0x49) { kb_push_esc("2~"); return; }
+        if (code == 0x4C) { kb_push_esc("3~"); return; }
+        if (code == 0x4B) { kb_push_esc("5~"); return; }
+        if (code == 0x4E) { kb_push_esc("6~"); return; }
+    }
+
+    if (code >= 0x54) return;
+    char c = shift ? hid_shifted[code] : hid_normal[code];
+    if (ctrl && c >= 'a' && c <= 'z') { kb_push(c - 'a' + 1); return; }
+    if (ctrl && c >= 'A' && c <= 'Z') { kb_push(c - 'A' + 1); return; }
+    if (c) kb_push(c);
+}
+
+/*
+ * Process a keyboard input report using descriptor-driven offsets.
+ *
+ * Pulls the modifier byte from caps->kbd_mods_field (variable, 8x1-bit,
+ * usages 0xE0..0xE7) and the keycode array from caps->kbd_keys_field
+ * (count×8-bit, each element a usage index on page 7). Generates
+ * input_post_key events on press/release transitions vs dev->prev_*
+ * and routes ASCII to the terminal via kbd_route_to_term.
+ */
+static void hid_process_keyboard(xhci_device_t *dev, const uint8_t *r)
+{
+    const hid_caps_t *caps = &dev->hid_caps;
+
+    uint8_t mods = 0;
+    if (caps->kbd_mods_field >= 0) {
+        const hid_field_t *f = &caps->fields[caps->kbd_mods_field];
+        /* Each modifier is 1 bit; pack 8 bits into a byte. */
+        uint32_t total = (uint32_t)f->bit_size * (uint32_t)f->count;
+        if (total > 8) total = 8;
+        mods = (uint8_t)hid_extract(r, f->bit_offset, (uint8_t)total);
+    }
+
+    /* Keycode slots from current report. We scan up to 6 slots — the
+     * boot-protocol minimum and the most common count. Devices that
+     * report more usually still have the 6 most-recent in the first
+     * 6 slots. */
+    uint8_t keys[6] = {0};
+    int n_keys = 0;
+    if (caps->kbd_keys_field >= 0) {
+        const hid_field_t *f = &caps->fields[caps->kbd_keys_field];
+        uint16_t cnt = f->count;
+        if (cnt > 6) cnt = 6;
+        for (uint16_t i = 0; i < cnt; i++) {
+            uint8_t code = (uint8_t)hid_extract(
+                r, f->bit_offset + i * f->bit_size, f->bit_size);
+            if (code > 1)  /* 0=none, 1=ErrorRollOver */
+                keys[n_keys++] = code;
+        }
+    }
+
     bool shift = (mods & (HID_MOD_LSHIFT | HID_MOD_RSHIFT)) != 0;
     bool ctrl  = (mods & (HID_MOD_LCTRL  | HID_MOD_RCTRL))  != 0;
 
-    /* Check for modifier changes (Ctrl, Shift, Alt, GUI) */
-    uint8_t changed_mods = mods ^ dev->prev_mods;
-    if (changed_mods) {
+    extern void input_post_key(uint8_t scancode, bool pressed, bool extended);
+
+    /* Modifier transition events. */
+    uint8_t changed = mods ^ dev->prev_mods;
+    if (changed) {
         for (int i = 0; i < 8; i++) {
-            if (changed_mods & (1 << i)) {
+            if (changed & (1 << i)) {
                 bool pressed = (mods & (1 << i)) != 0;
-                /* Map HID modifier index to a virtual scancode (0xE0 + index) */
-                extern void input_post_key(uint8_t scancode, bool pressed, bool extended);
                 input_post_key(0xE0 + i, pressed, false);
             }
         }
     }
 
-    /* Check for key releases (present in prev, missing in current) */
+    /* Releases: prev keys not in current report. */
     for (int i = 0; i < 6; i++) {
         uint8_t prev_code = dev->prev_keys[i];
-        if (prev_code == 0 || prev_code == 1) continue;
-
-        bool still_pressed = false;
-        for (int j = 2; j < 8; j++) {
-            if (r[j] == prev_code) {
-                still_pressed = true;
-                break;
-            }
-        }
-        if (!still_pressed) {
-            /* Key released! */
-            extern void input_post_key(uint8_t scancode, bool pressed, bool extended);
+        if (prev_code <= 1) continue;
+        bool still = false;
+        for (int j = 0; j < n_keys; j++)
+            if (keys[j] == prev_code) { still = true; break; }
+        if (!still)
             input_post_key(prev_code, false, false);
-        }
     }
 
-    /* Process each keycode in slots 2-7 (KeyPresses) */
-    for (int i = 2; i < 8; i++) {
-        uint8_t code = r[i];
-        if (code == 0 || code == 1) continue; /* No event / ErrorRollOver */
-
-        /* Check if this key was already pressed in previous report */
+    /* Presses: current keys not in prev report. */
+    for (int j = 0; j < n_keys; j++) {
+        uint8_t code = keys[j];
         bool was_pressed = false;
-        for (int j = 2; j < 8; j++) {
-            if (dev->prev_keys[j - 2] == code) {
-                was_pressed = true;
-                break;
-            }
-        }
-        if (was_pressed) continue; /* Key held — don't repeat */
+        for (int i = 0; i < 6; i++)
+            if (dev->prev_keys[i] == code) { was_pressed = true; break; }
+        if (was_pressed) continue;
 
-        /* Post raw HID event to input system (for games: DOOM, Q2, etc.) */
-        extern void input_post_key(uint8_t scancode, bool pressed, bool extended);
         input_post_key(code, true, false);
-
-        /* When compositor is running it owns all input routing.
-         * Skip kb_push — compositor will convert and push to kb_buf
-         * for the terminal when that window has focus. */
-        extern bool compositor_is_running(void) __attribute__((weak));
-        if (compositor_is_running && compositor_is_running()) continue;
-
-        /* Arrow keys → VT100 escape sequences */
-        if (kb_push_esc) {
-            if (code == 0x4F) { kb_push_esc("C"); continue; } /* Right */
-            if (code == 0x50) { kb_push_esc("D"); continue; } /* Left */
-            if (code == 0x51) { kb_push_esc("B"); continue; } /* Down */
-            if (code == 0x52) { kb_push_esc("A"); continue; } /* Up */
-            if (code == 0x4A) { kb_push_esc("H"); continue; } /* Home */
-            if (code == 0x4D) { kb_push_esc("F"); continue; } /* End */
-            if (code == 0x49) { kb_push_esc("2~"); continue; } /* Insert */
-            if (code == 0x4C) { kb_push_esc("3~"); continue; } /* Delete */
-            if (code == 0x4B) { kb_push_esc("5~"); continue; } /* Page Up */
-            if (code == 0x4E) { kb_push_esc("6~"); continue; } /* Page Down */
-        }
-
-        /* Map to ASCII */
-        if (code >= 0x54) continue; /* Outside our table */
-
-        char c = shift ? hid_shifted[code] : hid_normal[code];
-
-        /* Ctrl+letter → ASCII 1-26 */
-        if (ctrl && c >= 'a' && c <= 'z') {
-            kb_push(c - 'a' + 1);
-            continue;
-        }
-        if (ctrl && c >= 'A' && c <= 'Z') {
-            kb_push(c - 'A' + 1);
-            continue;
-        }
-
-        if (c) kb_push(c);
+        kbd_route_to_term(code, shift, ctrl);
     }
 
-    /* Save current report for next comparison */
+    /* Snapshot for next report. */
     for (int i = 0; i < 6; i++)
-        dev->prev_keys[i] = r[i + 2];
+        dev->prev_keys[i] = (i < n_keys) ? keys[i] : 0;
     dev->prev_mods = mods;
+}
+
+/*
+ * Process a mouse input report using descriptor-driven offsets.
+ * Buttons go through input_post_mouse_button; X/Y get posted as either
+ * relative deltas (HID_INPUT_REL flag) or absolute coordinates.
+ */
+static void hid_process_mouse(xhci_device_t *dev, const uint8_t *r)
+{
+    const hid_caps_t *caps = &dev->hid_caps;
+    extern void input_post_mouse_move(int16_t dx, int16_t dy);
+    extern void input_post_mouse_button(uint8_t buttons);
+    extern void input_set_mouse_abs(int32_t x, int32_t y);
+
+    if (caps->mouse_btn_field >= 0) {
+        const hid_field_t *f = &caps->fields[caps->mouse_btn_field];
+        uint32_t total = (uint32_t)f->bit_size * (uint32_t)f->count;
+        if (total > 8) total = 8;
+        uint8_t btns = (uint8_t)hid_extract(r, f->bit_offset, (uint8_t)total) & 0x07;
+        input_post_mouse_button(btns);
+    }
+
+    if (caps->mouse_x_field >= 0 && caps->mouse_y_field >= 0) {
+        const hid_field_t *fx = &caps->fields[caps->mouse_x_field];
+        const hid_field_t *fy = &caps->fields[caps->mouse_y_field];
+        if (fx->flags & HID_INPUT_REL) {
+            int32_t dx = hid_extract_signed(r, fx->bit_offset, fx->bit_size);
+            int32_t dy = hid_extract_signed(r, fy->bit_offset, fy->bit_size);
+            if (dx != 0 || dy != 0)
+                input_post_mouse_move((int16_t)dx, (int16_t)dy);
+        } else {
+            int32_t ax = hid_extract(r, fx->bit_offset, fx->bit_size);
+            int32_t ay = hid_extract(r, fy->bit_offset, fy->bit_size);
+            input_set_mouse_abs(ax, ay);
+        }
+    }
+    (void)dev;
+}
+
+/*
+ * Top-level HID report dispatcher. Strips Report ID if present and
+ * routes the body through hid_process_{keyboard,mouse} based on the
+ * device's parsed caps. Devices whose Report Descriptor failed to
+ * parse, or that expose neither keyboard nor mouse, drop the report.
+ */
+static void usb_kbd_handle_report(xhci_device_t *dev, uint8_t *r, uint32_t len)
+{
+    if (len < 1) return;
+
+    /* Bare-metal diagnostic: emit a visible '*' to framebuffer on every
+     * report so we can confirm the controller is firing transfer events
+     * even if downstream routing is broken. Removed once stable. */
+    {
+        extern void fb_puts(const char *s);
+        fb_puts("*");
+    }
+
+    const hid_caps_t *caps = &dev->hid_caps;
+    if (caps->n_fields == 0) return;  /* No descriptor parsed → drop. */
+
+    /* When Report ID is in use, the first byte selects which report
+     * layout this is. Our quick-lookup stores the ID associated with
+     * the kbd/mouse fields; skip the byte before extracting. */
+    uint8_t id = 0;
+    if (caps->has_report_id) {
+        id = r[0];
+        r++;
+        len--;
+        if (len < 1) return;
+    }
+
+    if (caps->has_keyboard && (!caps->has_report_id || id == caps->kbd_report_id))
+        hid_process_keyboard(dev, r);
+
+    if (caps->has_mouse && (!caps->has_report_id || id == caps->mouse_report_id))
+        hid_process_mouse(dev, r);
 }
 
 /* ── Disable PCI MSI/MSI-X (prevent unhandled interrupts) ──── */
@@ -467,33 +557,14 @@ static void evt_poll(xhci_hc_t *hc)
                     uint32_t actual = dev->int_max_pkt - len;
                     uint8_t *r = dev->report_buf;
 
-                    if (actual >= 8) {
-                        /* ── Keyboard report (usually 8 bytes) ── */
+                    /* Single dispatcher — usb_kbd_handle_report uses the
+                     * device's parsed Report Descriptor caps to demux the
+                     * report into keyboard / mouse / both. The old size-
+                     * based heuristic (>=8 bytes = keyboard, 3-6 = mouse)
+                     * is gone — descriptor-driven layout is correct for
+                     * all HID devices including non-boot keyboards. */
+                    if (actual >= 1)
                         usb_kbd_handle_report(dev, r, actual);
-                    } else if (actual >= 3) {
-                        /* ── Mouse/tablet report (3-6 bytes) ── */
-                        uint8_t buttons = r[0] & 0x07;
-
-                        if (actual >= 6 && dev->hid_protocol != 2) {
-                            /* USB tablet: 16-bit absolute coordinates (0-32767) */
-                            int32_t ax = (int32_t)(uint16_t)(r[1] | (r[2] << 8));
-                            int32_t ay = (int32_t)(uint16_t)(r[3] | (r[4] << 8));
-                            input_set_mouse_abs(ax, ay);
-                        } else if (actual >= 6) {
-                            /* 6-byte relative mouse */
-                            int16_t dx = (int16_t)(r[1] | (r[2] << 8));
-                            int16_t dy = (int16_t)(r[3] | (r[4] << 8));
-                            if (dx != 0 || dy != 0)
-                                input_post_mouse_move(dx, dy);
-                        } else {
-                            /* 3-byte relative mouse */
-                            int16_t dx = (int8_t)r[1];
-                            int16_t dy = (int8_t)r[2];
-                            if (dx != 0 || dy != 0)
-                                input_post_mouse_move(dx, dy);
-                        }
-                        input_post_mouse_button(buttons);
-                    }
 
                     /* Re-submit Normal TRB for next poll */
                     uint32_t ei = dev->int_enq;
@@ -962,12 +1033,21 @@ static void enumerate_port(xhci_hc_t *hc, int port)
      * we'd configure EP2/EP3 (consumer/vendor) instead of EP1 (keyboard)
      * and get zero transfer events when normal keys are pressed.
      */
-    uint8_t hid_iface = 0xFF;
-    uint8_t hid_proto = 0;   /* 1 = keyboard, 2 = mouse */
-    uint8_t int_ep_addr = 0;
-    uint16_t int_max_pkt_found = 0;
-    uint8_t int_interval = 0;
-    bool collecting_eps = false; /* true = current interface is selected */
+    /* Walk the configuration descriptor and select the FIRST HID interface
+     * that has an Interrupt IN endpoint. Per-interface meaning (keyboard
+     * vs mouse vs consumer vs vendor) is determined later by parsing the
+     * Report Descriptor — bInterfaceProtocol is just a hint, not a gate.
+     *
+     * NOTE: composite devices (one slot, multiple HID interfaces) only get
+     * one endpoint configured here. Full multi-interface support is a
+     * follow-up; for now most setups have one device per HID function. */
+    uint8_t  hid_iface          = 0xFF;
+    uint8_t  hid_proto          = 0;
+    uint8_t  int_ep_addr        = 0;
+    uint16_t int_max_pkt_found  = 0;
+    uint8_t  int_interval       = 0;
+    uint16_t report_desc_len    = 0;   /* From the HID descriptor (0x21). */
+    bool     collecting_eps     = false;
 
     uint32_t pos = 0;
     while (pos + 2 <= total_len) {
@@ -977,13 +1057,14 @@ static void enumerate_port(xhci_hc_t *hc, int port)
 
         if (dtype == USB_DESC_INTERFACE && pos + 9 <= total_len) {
             uint8_t iclass = desc_buf[pos + 5];
-            uint8_t isub = desc_buf[pos + 6];
+            uint8_t isub   = desc_buf[pos + 6];
             uint8_t iproto = desc_buf[pos + 7];
 
-            /* New interface → stop collecting endpoints from previous */
+            /* New interface starts — stop collecting endpoints from a prior
+             * interface that wasn't HID or wasn't selected. */
             collecting_eps = false;
 
-            if (iclass == 3) { /* HID */
+            if (iclass == 3) {  /* HID */
                 uint8_t this_iface = desc_buf[pos + 2];
                 serial_puts("[xHCI] HID interface ");
                 serial_putdec(this_iface);
@@ -993,27 +1074,48 @@ static void enumerate_port(xhci_hc_t *hc, int port)
                 serial_putdec(iproto);
                 serial_puts(")\n");
 
-                /* Accept keyboard (proto=1), mouse (proto=2), or tablet (proto=0 with HID class). */
-                if (iproto == 1 || iproto == 2 || iproto == 0 || hid_iface == 0xFF) {
+                /* Take the first HID interface; ignore later ones for this
+                 * device (composite-device support is a separate change). */
+                if (hid_iface == 0xFF) {
                     hid_iface = this_iface;
                     hid_proto = iproto;
-                    int_ep_addr = 0; /* reset EP — pick from THIS interface */
-                    collecting_eps = true; /* Collect endpoints for this interface */
+                    collecting_eps = true;
+                }
+            }
+        }
+
+        /* HID Class Descriptor (0x21) — sits between Interface and Endpoint
+         * descriptors and tells us how big the Report Descriptor is. We
+         * need that length for GET_DESCRIPTOR(0x22) below. */
+        if (dtype == 0x21 && collecting_eps && pos + 9 <= total_len) {
+            /* Layout: bLength, bDescType=0x21, bcdHID(2), bCountry, bNum,
+             *         bDescType_0=0x22, wDescLen_0(2), [more descriptors] */
+            uint8_t  num   = desc_buf[pos + 5];
+            for (uint8_t k = 0; k < num && pos + 6 + 3 * k + 3 <= total_len; k++) {
+                uint8_t  type = desc_buf[pos + 6 + 3 * k];
+                uint16_t blen = (uint16_t)(desc_buf[pos + 6 + 3 * k + 1] |
+                                           (desc_buf[pos + 6 + 3 * k + 2] << 8));
+                if (type == 0x22) {
+                    report_desc_len = blen;
+                    serial_puts("[xHCI]  -> Report Descriptor: ");
+                    serial_putdec(blen);
+                    serial_puts(" bytes\n");
+                    break;
                 }
             }
         }
 
         if (dtype == USB_DESC_ENDPOINT && pos + 7 <= total_len && collecting_eps) {
-            uint8_t ep_addr = desc_buf[pos + 2];
-            uint8_t ep_attr = desc_buf[pos + 3];
-            uint16_t ep_mps = (uint16_t)(desc_buf[pos + 4] | (desc_buf[pos + 5] << 8));
-            uint8_t ep_int = desc_buf[pos + 6];
+            uint8_t  ep_addr = desc_buf[pos + 2];
+            uint8_t  ep_attr = desc_buf[pos + 3];
+            uint16_t ep_mps  = (uint16_t)(desc_buf[pos + 4] | (desc_buf[pos + 5] << 8));
+            uint8_t  ep_int  = desc_buf[pos + 6];
 
-            /* Interrupt IN? */
+            /* Interrupt IN endpoint? */
             if ((ep_attr & 0x03) == 0x03 && (ep_addr & 0x80)) {
-                int_ep_addr = ep_addr;
-                int_max_pkt_found = ep_mps & 0x7FF;
-                int_interval = ep_int;
+                int_ep_addr        = ep_addr;
+                int_max_pkt_found  = ep_mps & 0x7FF;
+                int_interval       = ep_int;
                 serial_puts("[xHCI]  -> EP: ");
                 serial_puthex(ep_addr, 2);
                 serial_puts(" maxpkt=");
@@ -1057,6 +1159,40 @@ static void enumerate_port(xhci_hc_t *hc, int port)
     setup.wValue = 0;
     setup.wIndex = hid_iface;
     ctrl_transfer(hc, dev, &setup, NULL, 0, false); /* OK if fails */
+
+    /* ── GET_DESCRIPTOR(Report) — fetch the HID Report Descriptor and
+     * parse it into dev->hid_caps. The parsed capability map drives the
+     * runtime report demux: which bits hold the modifier byte, where
+     * the keycode array begins, mouse buttons, X/Y, etc.
+     *
+     * If report_desc_len is 0 (descriptor missing) or the device NAKs
+     * the request, we leave hid_caps zero — the report handler will
+     * silently drop reports for that device. */
+    dev->report_desc_len = 0;
+    if (report_desc_len > 0 && report_desc_len <= 256) {
+        memset(desc_buf, 0, 256);
+        setup.bmRequestType = 0x81;  /* Std, Interface, Device-to-Host */
+        setup.bRequest      = USB_REQ_GET_DESCRIPTOR;
+        setup.wValue        = (0x22 << 8);  /* Report Descriptor type, index 0 */
+        setup.wIndex        = hid_iface;
+        setup.wLength       = report_desc_len;
+        if (ctrl_transfer(hc, dev, &setup, desc_buf, report_desc_len, true) >= 0) {
+            if (hid_parse(desc_buf, report_desc_len, &dev->hid_caps) == 0) {
+                dev->report_desc_len = report_desc_len;
+                serial_puts("[xHCI] Report Desc parsed: ");
+                serial_putdec(dev->hid_caps.n_fields);
+                serial_puts(" field(s)");
+                if (dev->hid_caps.has_keyboard) serial_puts(" KBD");
+                if (dev->hid_caps.has_mouse)    serial_puts(" MOUSE");
+                if (dev->hid_caps.has_report_id) serial_puts(" +ID");
+                serial_puts("\n");
+            } else {
+                serial_puts("[xHCI] Report Desc parse FAILED\n");
+            }
+        } else {
+            serial_puts("[xHCI] GET_DESCRIPTOR(Report) failed\n");
+        }
+    }
 
     /* ── Configure Interrupt IN Endpoint ── */
     uint8_t ep_num = int_ep_addr & 0x0F;
@@ -1167,10 +1303,17 @@ static void enumerate_port(xhci_hc_t *hc, int port)
     dev->hid_protocol = hid_proto;
     hc->num_devices++;
 
-    const char *kind = (hid_proto == 1) ? "keyboard" :
-                       (hid_proto == 2) ? "mouse" :
-                       (hid_proto == 0) ? "tablet" : "HID";
-    serial_puts("[xHCI] HID ");
+    /* Label based on what the parsed Report Descriptor actually says,
+     * not the bInterfaceProtocol hint. A device with proto=0 can still
+     * be a keyboard (Report Protocol only); only the descriptor knows. */
+    const char *kind;
+    if (dev->hid_caps.has_keyboard && dev->hid_caps.has_mouse) kind = "keyboard+mouse";
+    else if (dev->hid_caps.has_keyboard) kind = "keyboard";
+    else if (dev->hid_caps.has_mouse)    kind = "mouse";
+    else if (dev->report_desc_len > 0)   kind = "HID-other";
+    else                                 kind = "HID-unparsed";
+
+    serial_puts("[xHCI] ");
     serial_puts(kind);
     serial_puts(" active on slot ");
     serial_putdec(slot_id);
@@ -1178,6 +1321,16 @@ static void enumerate_port(xhci_hc_t *hc, int port)
     serial_puthex(int_ep_addr, 2);
     serial_puts("\n");
 
+    /* Mirror enumeration result to framebuffer for bare-metal diagnosis. */
+    {
+        extern void fb_puts(const char *s);
+        extern void fb_putdec(uint64_t v);
+        fb_puts(" [xHCI] ");
+        fb_puts(kind);
+        fb_puts(" on slot ");
+        fb_putdec(slot_id);
+        fb_puts("\n");
+    }
 }
 
 /* ── Init one xHCI controller ────────────────────────────────── */
@@ -1501,6 +1654,17 @@ int xhci_init(uint64_t bar0_phys, uint8_t bus, uint8_t dev, uint8_t func)
     serial_putdec(hc->max_ports);
     serial_puts(" ports connected\n");
 
+    /* Mirror to framebuffer for bare-metal diagnosis (no serial cable). */
+    {
+        extern void fb_puts(const char *s);
+        extern void fb_putdec(uint64_t v);
+        fb_puts("\n [xHCI] ");
+        fb_putdec(ccs_count);
+        fb_puts("/");
+        fb_putdec(hc->max_ports);
+        fb_puts(" ports connected\n");
+    }
+
     /* ── Enumerate connected ports ── */
     for (uint32_t p = 0; p < hc->max_ports; p++)
         enumerate_port(hc, (int)p);
@@ -1508,6 +1672,15 @@ int xhci_init(uint64_t bar0_phys, uint8_t bus, uint8_t dev, uint8_t func)
     serial_puts("[xHCI] Init complete: ");
     serial_putdec(hc->num_devices);
     serial_puts(" device(s)\n");
+
+    /* Mirror to framebuffer. */
+    {
+        extern void fb_puts(const char *s);
+        extern void fb_putdec(uint64_t v);
+        fb_puts(" [xHCI] init done: ");
+        fb_putdec(hc->num_devices);
+        fb_puts(" HID device(s)\n");
+    }
 
     /* xHCI summary goes to serial; main.c shows compact HW info */
 

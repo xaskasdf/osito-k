@@ -203,6 +203,8 @@ _Static_assert(sizeof(usb_setup_t) == 8, "USB setup must be 8 bytes");
 #define XHCI_XFER_RING_SIZE  32
 #define XHCI_MAX_CONTROLLERS 2
 
+#include "hid_parser.h"
+
 /* ── Device State ────────────────────────────────────────────── */
 
 typedef struct {
@@ -240,10 +242,19 @@ typedef struct {
     uint8_t    *report_buf;
     uint64_t    report_buf_phys;
 
-    /* HID type: 1 = keyboard, 2 = mouse */
+    /* HID type: 1 = keyboard, 2 = mouse, 0 = unknown (descriptor-driven) */
     uint8_t     hid_protocol;
 
-    /* Keyboard state (previous report for debounce) */
+    /* Parsed Report Descriptor — drives runtime report demux. Populated
+     * by hid_parse() during enumeration. If hid_caps.has_keyboard or
+     * has_mouse is true, the report handler uses the field offsets in
+     * caps to extract values; otherwise the report is dropped. */
+    hid_caps_t  hid_caps;
+    uint16_t    report_desc_len; /* Bytes in the fetched Report Descriptor (0 if absent). */
+
+    /* Keyboard state (previous report for debounce). Sized for boot
+     * protocol; descriptor-driven keyboards with larger keycode arrays
+     * use prev_keys as a sliding window of the most recent slots. */
     uint8_t     prev_keys[6];
     uint8_t     prev_mods;
 } xhci_device_t;
