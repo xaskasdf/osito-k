@@ -2667,10 +2667,9 @@ void __cold shell_run(void)
     sh_puts_color("[", 0x00666666);
     fb_putdec(pci_get_device_count());
     sh_puts_color(" PCI", 0x00666666);
-    if (nvme_is_ready()) sh_puts_color(" | NVMe", 0x00666666);
-    if (osfs2_is_mounted()) sh_puts_color(" | FS", 0x00666666);
-    if (i211_link_up()) sh_puts_color(" | NIC", 0x00666666);
-    if (xhci_is_ready()) sh_puts_color(" | USB", 0x00666666);
+    /* TODO(bare-metal): status checks below hung the bare-metal i5/R7 boots
+     * (one of nvme_is_ready/i211_link_up/xhci_is_ready polls a register that
+     * stalls on real HW). Skip until we identify which. */
     sh_puts_color("]\n\n", 0x00666666);
 #else
     sh_puts_color(" [wasm32 | 256MB heap]\n\n", 0x00666666);

@@ -239,12 +239,19 @@ char kb_getchar(void)
          * Concurrent xhci_poll() between compositor and shell threads
          * corrupts USB endpoint state → kb_push() never fires.
          * When compositor runs, it calls xhci_poll() every frame and
-         * pushes chars via kb_push(); shell just waits for HLT to wake. */
+         * pushes chars via kb_push(); shell just waits to be woken. */
         if (!(compositor_is_running && compositor_is_running())) {
             if (xhci_poll) xhci_poll();
         }
         if (kb_head != kb_tail) break;
-        __asm__ volatile ("hlt");  /* Wait for IRQ or next timer tick */
+        /* Bare-metal safe: PAUSE instead of HLT.
+         * HLT depends on the APIC timer or xHCI MSI/INTx waking us up.
+         * Same pattern as commit 2832f23 (sched yield via INT $0x20):
+         * on real HW with masked/misrouted IRQs, HLT never wakes and
+         * xhci_poll() never gets re-entered → kernel "hangs" at prompt.
+         * PAUSE is just a CPU hint — the loop keeps polling xhci_poll()
+         * and PS/2 IRQs (still on a vector) can also fill kb_buf. */
+        __asm__ volatile ("pause");
     }
 
     char c = kb_buf[kb_tail];
