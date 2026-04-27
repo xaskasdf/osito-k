@@ -29,12 +29,33 @@ ESP_IMG="$BUILD_DIR/esp.img"
 # plain 2D virtio-vga for hosts that lack virglrenderer. --
 USE_GL="true"
 NO_BUILD="false"
+PID_FILE_DEFAULT="/tmp/qemu-test-osito.pid"
+PID_FILE="$PID_FILE_DEFAULT"
+DO_KILL="false"
 for arg in "$@"; do
     case "$arg" in
         --no-gl)    USE_GL="false" ;;
         --no-build) NO_BUILD="true" ;;
+        --kill)     DO_KILL="true" ;;
     esac
 done
+
+# --kill: terminate a previously-launched instance by reading the PID file.
+# Only kills that exact PID — safe for concurrent qemu-system-x86_64 users.
+if [ "$DO_KILL" = "true" ]; then
+    if [ -f "$PID_FILE" ]; then
+        PID="$(cat "$PID_FILE")"
+        if kill -0 "$PID" 2>/dev/null; then
+            kill "$PID" && echo "[+] killed qemu PID $PID"
+        else
+            echo "[+] no running qemu for PID $PID (stale file)"
+        fi
+        rm -f "$PID_FILE"
+    else
+        echo "[+] no pid file at $PID_FILE — nothing to kill"
+    fi
+    exit 0
+fi
 if [ "$USE_GL" = "true" ]; then
     GPU_DEVICE="-device virtio-gpu-gl-pci,hostmem=256M,blob=on"
 else
@@ -165,8 +186,15 @@ fi
 
 # Display: cocoa native window on macOS, VNC fallback on Linux
 if [ "$(uname)" = "Darwin" ]; then
-    DISPLAY_ARGS="-display cocoa"
-    info "Display: native macOS window (cocoa)"
+    if [ "$USE_GL" = "true" ]; then
+        # cocoa lacks OpenGL on macOS QEMU builds — use SDL with gl=core
+        # (gl=on tries GLES 3.0 which macOS system GL doesn't support)
+        DISPLAY_ARGS="-display sdl,gl=core"
+        info "Display: SDL window (gl=core for virgl)"
+    else
+        DISPLAY_ARGS="-display cocoa"
+        info "Display: native macOS window (cocoa)"
+    fi
 else
     DISPLAY_ARGS="-vnc :0,password=on"
 fi
@@ -191,6 +219,22 @@ qemu-system-x86_64 \
     $DISPLAY_ARGS \
     -serial file:"$SERIAL_LOG" \
     -monitor unix:/tmp/qemu-monitor.sock,server,nowait \
-    -no-reboot -no-shutdown
+    -name osito-test \
+    -no-reboot -no-shutdown &
 
-wait
+QEMU_PID=$!
+echo "$QEMU_PID" > "$PID_FILE"
+info "QEMU PID: $QEMU_PID (pidfile: $PID_FILE)"
+info "  Stop with: bash $0 --kill"
+
+# On INT/TERM (Ctrl-C or explicit kill of the script), forward to qemu so
+# it doesn't outlive the intended session. On natural EXIT (qemu finished
+# on its own), just clean up the pidfile — do NOT re-kill qemu, or a
+# background-launched script that gets SIGHUP on terminal detach will
+# also reap qemu (which is what we DON'T want for `--no-build &` flows).
+trap 'rm -f "$PID_FILE"' EXIT
+trap 'kill "$QEMU_PID" 2>/dev/null; rm -f "$PID_FILE"; exit 130' INT TERM
+
+wait "$QEMU_PID"
+QEMU_RC=$?
+exit $QEMU_RC
