@@ -59,6 +59,25 @@ loop on macOS will never paint via the real Mesa path.
 
 ## Mode 3 — Bare-metal (i5 / R7+3090)
 
+**Status (2026-04-27):** Boot + USB keyboard + USB-MSC OsitoFS mount + ELF
+launch all working on real HW. The next bring-up milestone is the Mesa/
+Vulkan path — `okGLZinkCreateScreen` currently returns NULL because the
+Vulkan ICD has nothing to talk to on bare metal yet (no NVK, no virgl).
+
+Validated stack on bare-metal:
+- xHCI USB 3.x with HID Report Descriptor parser (any keyboard/mouse, not
+  only Boot-Protocol devices)
+- USB-MSC bulk endpoints + SCSI READ(10), registered via blkdev abstraction
+- OsitoFS mounts from USB stick (after mkfs.ositofs, GPT not required)
+- ELF exec from USB-mounted OsitoFS
+
+Known bare-metal pitfalls (see also memory/session_baremetal_usb_msc_kbd.md):
+- Kernel stacks live in lower-half identity-mapped memory on bare-metal;
+  any DMA-bound buffer needs `kvirt_to_phys` instead of plain VIRT_TO_PHYS,
+  or the controller will write to a phys the IOMMU doesn't translate.
+- `kb_getchar` busy-polls (PAUSE) instead of HLT — APIC IRQ delivery on
+  real HW can be less reliable than QEMU's emulation.
+
 Workflow:
 
 ```bash
