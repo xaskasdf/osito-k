@@ -16,8 +16,8 @@ extern void serial_putdec(uint64_t val);
 extern void fb_puts(const char *s);
 
 extern int disk_read_bytes(uint64_t byte_offset, void *buf, uint64_t len);
-extern int nvme_write_bytes(uint64_t byte_offset, const void *buf, uint64_t len);
-extern int nvme_flush(void);
+extern int disk_write_bytes(uint64_t byte_offset, const void *buf, uint64_t len);
+extern int disk_flush(void);
 extern void *mem_alloc_aligned(uint64_t size, uint64_t alignment);
 extern void  mem_free_pages(void *addr, uint64_t count);
 

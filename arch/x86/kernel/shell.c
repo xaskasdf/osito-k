@@ -2145,15 +2145,17 @@ static void shell_exec(char *line)
 
     if (argc == 0) return;
 
-    /* Setup output redirection */
+    /* Setup output redirection — 1 MB buffer covers a full dmesg dump
+     * (the prior 64 KB cap silently truncated everything past the first
+     * boot block, hiding the diagnostic we needed). */
     bool redirected = false;
     char *out_buf = NULL;
     if (redir.out_file) {
-        out_buf = (char *)kmalloc(65536);
+        out_buf = (char *)kmalloc(1024 * 1024);
         if (out_buf) {
             redir_buf = out_buf;
             redir_pos = 0;
-            redir_max = 65536;
+            redir_max = 1024 * 1024;
             sh_redir_fn = redir_capture;
             redirected = true;
         }
@@ -2271,6 +2273,144 @@ static void shell_exec(char *line)
         cmd_echo(argc, argv);
     } else if (strcmp(cmd, "ls") == 0) {
         cmd_ls();
+    } else if (strcmp(cmd, "cp") == 0) {
+        /* cp <src> <dst> — duplicate a file inside OsitoFS. */
+        if (argc < 3 || !osfs2_is_mounted()) {
+            sh_puts(argc < 3 ? "Usage: cp <src> <dst>\n"
+                              : "No filesystem mounted\n");
+        } else {
+            extern void *osfs2_find(const char *);
+            extern uint64_t osfs2_file_size(void *);
+            extern int osfs2_read(void *file, uint64_t off, void *buf, uint64_t len);
+            extern void *osfs2_create(const char *name, uint64_t size);
+            extern int osfs2_write(void *file, uint64_t off, const void *buf, uint64_t len);
+            void *src = osfs2_find(argv[1]);
+            if (!src) sh_puts("cp: source not found\n");
+            else {
+                uint64_t sz = osfs2_file_size(src);
+                char *buf = (char *)kmalloc(sz);
+                if (!buf) sh_puts("cp: out of memory\n");
+                else {
+                    if (osfs2_read(src, 0, buf, sz) < 0)
+                        sh_puts("cp: read failed\n");
+                    else {
+                        void *dst = osfs2_create(argv[2], sz);
+                        if (!dst) sh_puts("cp: create failed\n");
+                        else if (osfs2_write(dst, 0, buf, sz) < 0)
+                            sh_puts("cp: write failed\n");
+                        else
+                            sh_puts("cp: ok\n");
+                    }
+                    kfree(buf);
+                }
+            }
+        }
+    } else if (strcmp(cmd, "mv") == 0) {
+        if (argc < 3 || !osfs2_is_mounted()) {
+            sh_puts(argc < 3 ? "Usage: mv <src> <dst>\n"
+                              : "No filesystem mounted\n");
+        } else {
+            extern void *osfs2_find(const char *);
+            extern uint64_t osfs2_file_size(void *);
+            extern int osfs2_read(void *file, uint64_t off, void *buf, uint64_t len);
+            extern void *osfs2_create(const char *name, uint64_t size);
+            extern int osfs2_write(void *file, uint64_t off, const void *buf, uint64_t len);
+            extern int osfs2_delete(const char *name);
+            void *src = osfs2_find(argv[1]);
+            if (!src) sh_puts("mv: source not found\n");
+            else {
+                uint64_t sz = osfs2_file_size(src);
+                char *buf = (char *)kmalloc(sz);
+                if (!buf) sh_puts("mv: out of memory\n");
+                else {
+                    bool ok = false;
+                    if (osfs2_read(src, 0, buf, sz) < 0)
+                        sh_puts("mv: read failed\n");
+                    else {
+                        void *dst = osfs2_create(argv[2], sz);
+                        if (!dst) sh_puts("mv: create failed\n");
+                        else if (osfs2_write(dst, 0, buf, sz) < 0)
+                            sh_puts("mv: write failed\n");
+                        else ok = true;
+                    }
+                    kfree(buf);
+                    if (ok) {
+                        if (osfs2_delete(argv[1]) < 0)
+                            sh_puts("mv: dest ok but src delete failed\n");
+                        else
+                            sh_puts("mv: ok\n");
+                    }
+                }
+            }
+        }
+    } else if (strcmp(cmd, "rm") == 0) {
+        if (argc < 2 || !osfs2_is_mounted()) {
+            sh_puts(argc < 2 ? "Usage: rm <name>\n"
+                              : "No filesystem mounted\n");
+        } else {
+            extern int osfs2_delete(const char *name);
+            sh_puts(osfs2_delete(argv[1]) < 0 ? "rm: failed\n" : "rm: ok\n");
+        }
+    } else if (strcmp(cmd, "head") == 0 || strcmp(cmd, "tail") == 0) {
+        /* head/tail <file> [-n N] — print first/last N lines (default 10). */
+        if (argc < 2 || !osfs2_is_mounted()) {
+            sh_puts(argc < 2 ? "Usage: head|tail <file> [N]\n"
+                              : "No filesystem mounted\n");
+        } else {
+            int n_lines = 10;
+            if (argc >= 3) {
+                /* parse decimal */
+                n_lines = 0;
+                for (const char *p = argv[2]; *p >= '0' && *p <= '9'; p++)
+                    n_lines = n_lines * 10 + (*p - '0');
+                if (n_lines <= 0) n_lines = 10;
+            }
+            extern void *osfs2_find(const char *);
+            extern uint64_t osfs2_file_size(void *);
+            extern int osfs2_read(void *file, uint64_t off, void *buf, uint64_t len);
+            void *f = osfs2_find(argv[1]);
+            if (!f) sh_puts("file not found\n");
+            else {
+                uint64_t sz = osfs2_file_size(f);
+                if (sz > 1024 * 1024) sz = 1024 * 1024;
+                char *buf = (char *)kmalloc(sz + 1);
+                if (!buf) sh_puts("out of memory\n");
+                else {
+                    if (osfs2_read(f, 0, buf, sz) < 0)
+                        sh_puts("read failed\n");
+                    else {
+                        buf[sz] = '\0';
+                        bool is_head = (cmd[0] == 'h');
+                        if (is_head) {
+                            int seen = 0;
+                            for (uint64_t i = 0; i < sz && seen < n_lines; i++) {
+                                char s[2] = { buf[i], 0 }; sh_puts(s);
+                                if (buf[i] == '\n') seen++;
+                            }
+                        } else {
+                            /* tail: walk from end backwards counting newlines. */
+                            uint64_t start = sz;
+                            int seen = 0;
+                            while (start > 0 && seen <= n_lines) {
+                                start--;
+                                if (buf[start] == '\n') {
+                                    seen++;
+                                    if (seen > n_lines) { start++; break; }
+                                }
+                            }
+                            for (uint64_t i = start; i < sz; i++) {
+                                char s[2] = { buf[i], 0 }; sh_puts(s);
+                            }
+                        }
+                    }
+                    kfree(buf);
+                }
+            }
+        }
+    } else if (strcmp(cmd, "sync") == 0) {
+        /* Flush the active disk's controller cache before unplugging. */
+        extern int disk_flush(void);
+        sh_puts(disk_flush() == 0 ? "sync: ok\n" : "sync: failed\n");
     } else if (strcmp(cmd, "dmesg") == 0) {
         /* Dump the kernel ring buffer (klog). serial_puts has been
          * teeing into klog since boot, so this is everything the

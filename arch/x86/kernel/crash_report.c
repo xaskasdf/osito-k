@@ -206,9 +206,30 @@ void crash_report_save(uint64_t *frame, uint32_t vector, uint64_t fault_addr,
 
     void *file = osfs2_create(fname, sizeof(crash_report_t));
     if (file) {
-        osfs2_write(file, 0, r, sizeof(crash_report_t));
-        serial_puts("[CRASH] Report saved: ");
-        serial_puts(fname);
+        extern uint64_t osfs2_file_byte_offset(void *file);
+        uint64_t off = osfs2_file_byte_offset(file);
+        serial_puts("[CRASH] osfs2_create OK, file_byte_offset=0x");
+        serial_puthex(off, 16);
         serial_puts("\n");
+
+        /* Verify we have non-zero bytes BEFORE write. */
+        serial_puts("[CRASH] crash_buf magic=0x");
+        serial_puthex(r->magic, 8);
+        serial_puts(" rip=0x");
+        serial_puthex(r->rip, 16);
+        serial_puts("\n");
+
+        int wrc = osfs2_write(file, 0, r, sizeof(crash_report_t));
+        serial_puts("[CRASH] osfs2_write returned ");
+        serial_putdec(wrc < 0 ? (uint64_t)-wrc : (uint64_t)wrc);
+        serial_puts(wrc == 0 ? " (ok)\n" : " (FAIL)\n");
+
+        if (wrc == 0) {
+            serial_puts("[CRASH] Report saved: ");
+            serial_puts(fname);
+            serial_puts("\n");
+        }
+    } else {
+        serial_puts("[CRASH] osfs2_create FAILED\n");
     }
 }

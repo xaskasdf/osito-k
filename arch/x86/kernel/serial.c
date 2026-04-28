@@ -41,6 +41,14 @@ void serial_init(void)
 
 void serial_putc(char c)
 {
+    /* Tee EVERY byte to klog. Doing this here (rather than only in
+     * serial_puts) means serial_puthex/putdec are captured too — they
+     * use serial_putc for each digit and bypass serial_puts entirely.
+     * Cost: one extra function call per byte; klog_putc is a ring-buf
+     * append, cheap. */
+    extern void klog_putc(char c) __attribute__((weak));
+    if (klog_putc) klog_putc(c);
+
     while (!(inb(COM1_PORT + REG_LSR) & LSR_TX_EMPTY))
         ;
     outb(COM1_PORT + REG_DATA, (uint8_t)c);
@@ -54,12 +62,8 @@ void serial_putchar(char c)
 
 void serial_puts(const char *s)
 {
-    /* Tee to klog for `dmesg` retrieval. The klog ring is the only way
-     * to recover boot-time messages on bare-metal where there's no
-     * scrollback and no serial cable. */
-    extern void klog_puts(const char *s) __attribute__((weak));
-    if (klog_puts) klog_puts(s);
-
+    /* klog tee happens at the serial_putc level — see comment there.
+     * No need to klog_puts(s) explicitly here. */
     serial_acquire();
     while (*s) {
         if (*s == '\n') serial_putc('\r');

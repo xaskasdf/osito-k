@@ -26,8 +26,8 @@ extern void fb_puthex(uint64_t val, int digits);
 extern void fb_putc(char c, uint32_t color);
 
 extern int disk_read_bytes(uint64_t byte_offset, void *buf, uint64_t len);
-extern int nvme_write_bytes(uint64_t byte_offset, const void *buf, uint64_t len);
-extern int nvme_flush(void);
+extern int disk_write_bytes(uint64_t byte_offset, const void *buf, uint64_t len);
+extern int disk_flush(void);
 extern void *mem_alloc_aligned(uint64_t size, uint64_t alignment);
 extern void  mem_free_pages(void *addr, uint64_t count);
 
@@ -623,7 +623,7 @@ int osfs2_read_layer_index(uint16_t slot, osfs2_layer_idx_t *li)
 
 static int osfs2_part_write(uint64_t offset, const void *buf, uint64_t len)
 {
-    return nvme_write_bytes(partition_offset + offset, buf, len);
+    return disk_write_bytes(partition_offset + offset, buf, len);
 }
 
 /* ── Persist superblock to disk ─────────────────────────────── */
@@ -733,12 +733,23 @@ osfs2_file_t *osfs2_create(const char *name, uint64_t size)
     superblock.used_blocks += blocks;
     superblock.file_count++;
 
-    /* Persist */
+    /* Persist. If either write fails, we MUST roll back the in-memory
+     * state — otherwise `ls` shows a phantom file that doesn't exist on
+     * disk and never will (next mount reads the unwritten file table). */
     if (osfs2_write_file_table() < 0 || osfs2_write_superblock() < 0) {
-        serial_puts("[OsitoFS] Failed to persist metadata\n");
+        serial_puts("[OsitoFS] Failed to persist metadata — rolling back\n");
+        /* Free the slot. */
+        memset(f, 0, sizeof(*f));
+        /* Free the bitmap blocks we marked. */
+        for (uint32_t b = 0; b < blocks; b++)
+            blk_bitmap_clear(start + b);
+        superblock.used_blocks -= blocks;
+        superblock.file_count--;
+        /* Note: not rolling back next_data_block — leaves a small gap,
+         * but blk_bitmap_find_free will reuse it on the next allocation. */
         return NULL;
     }
-    nvme_flush();
+    disk_flush();
 
     serial_puts("[OsitoFS] Created '");
     serial_puts(name);
@@ -826,7 +837,7 @@ int osfs2_delete(const char *name)
     if (osfs2_write_file_table() < 0 || osfs2_write_superblock() < 0)
         return -1;
 
-    nvme_flush();
+    disk_flush();
 
     serial_puts("[OsitoFS] Deleted '");
     serial_puts(name);

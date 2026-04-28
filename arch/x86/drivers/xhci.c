@@ -1535,6 +1535,7 @@ static void enumerate_port(xhci_hc_t *hc, int port)
         extern uint32_t usb_storage_block_size(void);
         extern uint32_t usb_storage_block_count(void);
         extern int usb_storage_read(uint64_t lba, uint32_t count, void *buf);
+        extern int usb_storage_write(uint64_t lba, uint32_t count, const void *buf);
         extern int blkdev_register(const char *name, uint8_t type,
                                    uint32_t sector_size, uint64_t sector_count,
                                    int (*read)(uint64_t, uint32_t, void *),
@@ -1542,7 +1543,7 @@ static void enumerate_port(xhci_hc_t *hc, int port)
         int idx = blkdev_register("usb0", 3 /* BLKDEV_USB */,
                                    usb_storage_block_size(),
                                    usb_storage_block_count(),
-                                   usb_storage_read, NULL);
+                                   usb_storage_read, usb_storage_write);
         extern void fb_puts(const char *s);
         extern void fb_putdec(uint64_t v);
         if (idx >= 0) {

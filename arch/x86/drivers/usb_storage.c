@@ -43,9 +43,11 @@ typedef struct __attribute__((packed)) {
 } csw_t;
 
 /* SCSI Commands */
-#define SCSI_INQUIRY        0x12
-#define SCSI_READ_CAPACITY  0x25
-#define SCSI_READ_10        0x28
+#define SCSI_INQUIRY              0x12
+#define SCSI_READ_CAPACITY        0x25
+#define SCSI_READ_10              0x28
+#define SCSI_WRITE_10             0x2A
+#define SCSI_SYNCHRONIZE_CACHE_10 0x35
 
 /* ── Driver State ────────────────────────────────────────────── */
 
@@ -95,13 +97,64 @@ static int usb_scsi_cmd(const uint8_t *cdb, uint8_t cdb_len,
     /* Receive CSW */
     csw_t csw;
     uint32_t csw_actual;
-    if (xhci_bulk_in(usb_disk.dev_idx, &csw, sizeof(csw), &csw_actual) < 0)
+    if (xhci_bulk_in(usb_disk.dev_idx, &csw, sizeof(csw), &csw_actual) < 0) {
+        serial_puts("[USB-STOR] CSW xhci_bulk_in failed\n");
         return -1;
+    }
 
-    if (csw.dCSWSignature != CSW_SIGNATURE || csw.dCSWTag != cbw.dCBWTag)
+    if (csw.dCSWSignature != CSW_SIGNATURE || csw.dCSWTag != cbw.dCBWTag) {
+        serial_puts("[USB-STOR] CSW sig/tag mismatch sig=");
+        serial_puthex(csw.dCSWSignature, 8);
+        serial_puts(" tag=");
+        serial_puthex(csw.dCSWTag, 8);
+        serial_puts(" expected_tag=");
+        serial_puthex(cbw.dCBWTag, 8);
+        serial_puts("\n");
         return -1;
+    }
 
-    return (csw.bCSWStatus == 0) ? 0 : -1;
+    if (csw.bCSWStatus != 0) {
+        serial_puts("[USB-STOR] CSW status=");
+        serial_putdec(csw.bCSWStatus);
+        serial_puts(" residue=");
+        serial_putdec(csw.dCSWDataResidue);
+        serial_puts(" cdb[0]=0x");
+        serial_puthex(cdb[0], 2);
+        serial_puts("\n");
+
+        /* Status 1 = Command Failed; auto-fetch sense data via REQUEST
+         * SENSE so we know WHY the device rejected. */
+        if (csw.bCSWStatus == 1) {
+            uint8_t sense_cdb[6] = { 0x03, 0, 0, 0, 18, 0 };
+            uint8_t sense[18];
+            memset(sense, 0, sizeof(sense));
+            cbw_t s_cbw;
+            memset(&s_cbw, 0, sizeof(s_cbw));
+            s_cbw.dCBWSignature = CBW_SIGNATURE;
+            s_cbw.dCBWTag = ++usb_disk.cbw_tag;
+            s_cbw.dCBWDataTransferLength = 18;
+            s_cbw.bmCBWFlags = 0x80;
+            s_cbw.bCBWCBLength = 6;
+            memcpy(s_cbw.CBWCB, sense_cdb, 6);
+            if (xhci_bulk_out(usb_disk.dev_idx, &s_cbw, sizeof(s_cbw)) >= 0) {
+                uint32_t a;
+                if (xhci_bulk_in(usb_disk.dev_idx, sense, 18, &a) >= 0) {
+                    csw_t s_csw;
+                    uint32_t sa;
+                    xhci_bulk_in(usb_disk.dev_idx, &s_csw, sizeof(s_csw), &sa);
+                    serial_puts("[USB-STOR] sense key=0x");
+                    serial_puthex(sense[2] & 0xF, 1);
+                    serial_puts(" asc=0x");
+                    serial_puthex(sense[12], 2);
+                    serial_puts(" ascq=0x");
+                    serial_puthex(sense[13], 2);
+                    serial_puts("\n");
+                }
+            }
+        }
+        return -1;
+    }
+    return 0;
 }
 
 /* ── Public API ──────────────────────────────────────────────── */
@@ -186,4 +239,61 @@ int usb_storage_read(uint64_t lba, uint32_t count, void *buf)
         count -= chunk;
     }
     return 0;
+}
+
+/* Write sectors to USB disk via SCSI WRITE(10). Same shape as READ(10)
+ * but data goes Bulk-OUT (host→device). Without this the kernel can't
+ * persist OsitoFS updates (crash reports, file creates, etc.) when the
+ * mounted disk is the boot USB. */
+int usb_storage_write(uint64_t lba, uint32_t count, const void *buf)
+{
+    serial_puts("[USB-STOR] write lba=");
+    serial_putdec(lba);
+    serial_puts(" count=");
+    serial_putdec(count);
+    serial_puts("\n");
+
+    if (!usb_disk.ready) {
+        serial_puts("[USB-STOR] write: not ready\n");
+        return -1;
+    }
+
+    const uint8_t *src = (const uint8_t *)buf;
+    while (count > 0) {
+        uint32_t chunk = (count > 128) ? 128 : count;
+        uint32_t xfer  = chunk * usb_disk.block_size;
+
+        uint8_t cdb[10];
+        memset(cdb, 0, 10);
+        cdb[0] = SCSI_WRITE_10;
+        cdb[2] = (uint8_t)(lba >> 24);
+        cdb[3] = (uint8_t)(lba >> 16);
+        cdb[4] = (uint8_t)(lba >> 8);
+        cdb[5] = (uint8_t)(lba);
+        cdb[7] = (uint8_t)(chunk >> 8);
+        cdb[8] = (uint8_t)(chunk);
+
+        if (usb_scsi_cmd(cdb, 10, (void *)(uintptr_t)src, xfer, false) < 0) {
+            serial_puts("[USB-STOR] WRITE_10 SCSI failed lba=");
+            serial_putdec(lba);
+            serial_puts("\n");
+            return -1;
+        }
+
+        src   += xfer;
+        lba   += chunk;
+        count -= chunk;
+    }
+    serial_puts("[USB-STOR] write OK\n");
+    return 0;
+}
+
+/* SYNCHRONIZE CACHE — flush controller-side write cache to flash.
+ * Run this before unplugging or after a series of writes to make
+ * sure data is durable. */
+int usb_storage_flush(void)
+{
+    if (!usb_disk.ready) return -1;
+    uint8_t cdb[10] = { SCSI_SYNCHRONIZE_CACHE_10, 0, 0,0,0,0, 0,0,0, 0 };
+    return usb_scsi_cmd(cdb, 10, NULL, 0, false);
 }

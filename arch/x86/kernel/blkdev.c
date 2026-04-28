@@ -197,6 +197,100 @@ uint64_t disk_lba_count(void)
 }
 
 /*
+ * Write `len` bytes starting at byte_offset on the active device.
+ * Read-modify-write at the boundary sectors so partial writes are
+ * preserved. Returns 0 on success, -1 on no-active-device, no-write-fn,
+ * or any sub-write failure.
+ */
+int disk_write_bytes(uint64_t byte_offset, const void *buf, uint64_t len)
+{
+    if (active_dev < 0) {
+        serial_puts("[BLK] disk_write_bytes: no active dev\n");
+        return -1;
+    }
+    blkdev_t *d = &devices[active_dev];
+    if (!d->active || !d->read || !d->write || d->sector_size == 0) {
+        serial_puts("[BLK] disk_write_bytes: invalid dev (active=");
+        serial_putdec(d->active ? 1 : 0);
+        serial_puts(" read=");
+        serial_putdec(d->read ? 1 : 0);
+        serial_puts(" write=");
+        serial_putdec(d->write ? 1 : 0);
+        serial_puts(" ssz=");
+        serial_putdec(d->sector_size);
+        serial_puts(")\n");
+        return -1;
+    }
+
+    const uint8_t *src = (const uint8_t *)buf;
+    uint64_t off  = byte_offset;
+    uint64_t left = len;
+    uint8_t  tmp[8192];
+    uint32_t ssz = d->sector_size;
+    if (ssz > sizeof(tmp)) return -1;
+
+    while (left > 0) {
+        uint64_t lba   = off / ssz;
+        uint32_t intra = (uint32_t)(off % ssz);
+        uint32_t want  = (uint32_t)((left < (sizeof(tmp) - intra))
+                                    ? left : (sizeof(tmp) - intra));
+        uint32_t sectors = (intra + want + ssz - 1) / ssz;
+
+        /* Read-modify-write only when the write doesn't span full sectors.
+         * Some USB MSC controllers return CHECK CONDITION when reading
+         * sectors that have never been written (post-mkfs blank flash);
+         * in that case we treat the unread bytes as zeros — equivalent
+         * to what a fresh sector should contain anyway. The user data
+         * portion (intra..intra+want) is overwritten from src below, so
+         * the only bytes that matter from the read are the head/tail
+         * outside the user range. Zero-fill is safe for fresh blocks
+         * and the only realistic content for unwritten flash. */
+        bool partial = (intra != 0) || ((intra + want) % ssz != 0);
+        if (partial) {
+            if (d->read(lba, sectors, tmp) < 0) {
+                /* Unread → assume zero-fill. Only the bytes outside
+                 * [intra..intra+want] matter; we'll overwrite the rest. */
+                for (uint32_t i = 0; i < sectors * ssz; i++) tmp[i] = 0;
+            }
+        }
+
+        for (uint32_t i = 0; i < want; i++) tmp[intra + i] = src[i];
+        if (d->write(lba, sectors, tmp) < 0) {
+            serial_puts("[BLK] disk_write_bytes: write failed lba=");
+            serial_putdec(lba);
+            serial_puts("\n");
+            return -1;
+        }
+
+        src  += want;
+        off  += want;
+        left -= want;
+    }
+    return 0;
+}
+
+/*
+ * Flush controller-side write cache to durable storage. Required after
+ * a series of writes if the caller intends to physically remove the
+ * device — without this, USB sticks may report "complete" while the
+ * controller still holds the data in its DRAM cache.
+ *
+ * Only USB MSC currently implements this. NVMe driver does flush
+ * implicitly on every write, so its blkdev entry's flush is a no-op.
+ */
+int disk_flush(void)
+{
+    if (active_dev < 0) return -1;
+    blkdev_t *d = &devices[active_dev];
+    if (!d->active) return -1;
+    /* Currently only usb0 has a flush hook; nvme is write-through. */
+    extern int usb_storage_flush(void) __attribute__((weak));
+    if (d->type == 3 /* BLKDEV_USB */ && usb_storage_flush)
+        return usb_storage_flush();
+    return 0;
+}
+
+/*
  * Read `len` bytes starting at byte_offset on the active device.
  * Translates byte coordinates to LBA + intra-sector offset, reads via
  * the device's blk_read_fn into a temporary aligned buffer, and copies
