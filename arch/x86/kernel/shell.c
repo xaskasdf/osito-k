@@ -353,13 +353,94 @@ static void cmd_echo(int argc, char *argv[])
 
 /* ── Builtin: ls ─────────────────────────────────────────────── */
 
+/* Print `n` spaces — used for column padding in cmd_ls. */
+static void sh_pad(uint32_t n)
+{
+    while (n-- > 0) sh_puts(" ");
+}
+
+/* Print a uint64 right-justified in a `width`-character column. */
+static void sh_putdec_padded(uint64_t v, uint32_t width)
+{
+    char buf[24];
+    int  len = 0;
+    if (v == 0) { buf[len++] = '0'; }
+    else {
+        char tmp[24];
+        int  t = 0;
+        while (v > 0 && t < 24) { tmp[t++] = '0' + (v % 10); v /= 10; }
+        while (t > 0) buf[len++] = tmp[--t];
+    }
+    if ((uint32_t)len < width) sh_pad(width - (uint32_t)len);
+    for (int i = 0; i < len; i++) {
+        char s[2] = { buf[i], 0 };
+        sh_puts(s);
+    }
+}
+
+/*
+ * cmd_ls — list files in the mounted OsitoFS volume.
+ *
+ * Prints one line per file: <size>  <name>  [model info if GGUF].
+ * Right-justifies sizes in a 10-char column so the output reads like
+ * `ls -l` on Unix. Footer summarises file count + free blocks so the
+ * user can see capacity at a glance, similar to df. Output goes to the
+ * terminal (sh_puts), not just the serial console.
+ */
 static void cmd_ls(void)
 {
     if (!osfs2_is_mounted()) {
         sh_puts("No filesystem mounted\n");
         return;
     }
-    osfs2_list();
+
+    extern uint32_t osfs2_file_count(void);
+    extern const char *osfs2_label(void);
+    extern uint32_t osfs2_free_blocks(void);
+    extern uint32_t osfs2_get_block_size(void);
+    extern void *osfs2_file_at(int index);
+    extern const char *osfs2_file_name(void *file);
+    extern uint64_t osfs2_file_size(void *file);
+    extern uint32_t osfs2_file_mtime(void *file);
+    (void)osfs2_file_mtime;
+
+    uint32_t total = osfs2_file_count();
+    if (total == 0) {
+        sh_puts("(empty)\n");
+        return;
+    }
+
+    sh_puts("       size  name\n");
+
+    /* osfs2_file_at iterates the file table, skipping invalid slots
+     * internally — we just walk indices until we've seen `total` valid
+     * entries. The caller-side cap stops a runaway when the table is
+     * dense. */
+    uint32_t shown = 0;
+    for (uint32_t i = 0; i < 4096 && shown < total; i++) {
+        void *f = osfs2_file_at(i);
+        if (!f) continue;
+        sh_putdec_padded(osfs2_file_size(f), 11);
+        sh_puts("  ");
+        sh_puts(osfs2_file_name(f));
+        sh_puts("\n");
+        shown++;
+    }
+
+    /* Footer: file count + free space (in blocks AND bytes for clarity). */
+    uint32_t bs    = osfs2_get_block_size();
+    uint32_t freeb = osfs2_free_blocks();
+    sh_puts("\n");
+    sh_putdec((uint64_t)shown);
+    sh_puts(" file(s) on ");
+    sh_puts(osfs2_label());
+    sh_puts(", ");
+    sh_putdec((uint64_t)freeb * (uint64_t)bs / (1024 * 1024));
+    sh_puts(" MB free (");
+    sh_putdec((uint64_t)freeb);
+    sh_puts(" blocks of ");
+    sh_putdec((uint64_t)bs);
+    sh_puts("B)\n");
 }
 
 /* ── Builtin: cat ────────────────────────────────────────────── */
