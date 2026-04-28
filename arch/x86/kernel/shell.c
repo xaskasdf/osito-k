@@ -9,6 +9,7 @@
 
 #include "../include/types.h"
 #include "../include/boot_info.h"
+#include "../fs/vfs.h"
 
 /* ── External functions ──────────────────────────────────────── */
 
@@ -252,6 +253,9 @@ static void cmd_help(void)
     sh_puts("  echo      Print arguments\n");
     sh_puts("  ls        List files on disk\n");
     sh_puts("  cat       Display file contents\n");
+    sh_puts("  head      First N lines (head <file> [-n N | N])\n");
+    sh_puts("  tail      Last N lines (tail <file> [-n N | N])\n");
+    sh_puts("  grep      Match literal substring (grep <pat> <file>)\n");
     sh_puts("  exec      Run an ELF binary\n");
     sh_puts("  ping      Ping an IP address\n");
     sh_puts("  tcptest   TCP connection test (tcptest [ip] [port])\n");
@@ -2096,62 +2100,134 @@ static void shell_exec(char *line)
             extern int osfs2_delete(const char *name);
             sh_puts(osfs2_delete(argv[1]) < 0 ? "rm: failed\n" : "rm: ok\n");
         }
-    } else if (strcmp(cmd, "head") == 0 || strcmp(cmd, "tail") == 0) {
-        /* head/tail <file> [-n N] — print first/last N lines (default 10). */
-        if (argc < 2 || !osfs2_is_mounted()) {
-            sh_puts(argc < 2 ? "Usage: head|tail <file> [N]\n"
-                              : "No filesystem mounted\n");
+    } else if (strcmp(cmd, "head") == 0 || strcmp(cmd, "tail") == 0
+               || strcmp(cmd, "grep") == 0) {
+        /*
+         * head <file> [-n N] | [N]   first N lines (default 10)
+         * tail <file> [-n N] | [N]   last  N lines (default 10)
+         * grep <pattern> <file>      lines containing literal substring
+         *
+         * All three resolve files via the unified VFS so they work on
+         * osfs2, osfs3, tmpfs, fat32, ext2, etc. Output line-by-line
+         * via sh_puts (honours redirect to file via `>`).
+         *
+         * Cap file size at 1 MB to keep heap usage bounded — bigger
+         * inputs need a streaming variant which is follow-up work.
+         */
+        bool is_head = (cmd[0] == 'h');
+        bool is_grep = (cmd[0] == 'g');
+
+        const char *pattern = NULL;
+        const char *fname   = NULL;
+        int n_lines = 10;
+
+        if (is_grep) {
+            if (argc < 3) { sh_puts("Usage: grep <pattern> <file>\n"); goto cmd_filter_done; }
+            pattern = argv[1];
+            fname   = argv[2];
         } else {
-            int n_lines = 10;
-            if (argc >= 3) {
-                /* parse decimal */
-                n_lines = 0;
-                for (const char *p = argv[2]; *p >= '0' && *p <= '9'; p++)
-                    n_lines = n_lines * 10 + (*p - '0');
-                if (n_lines <= 0) n_lines = 10;
+            if (argc < 2) {
+                sh_puts(is_head ? "Usage: head <file> [-n N | N]\n"
+                                : "Usage: tail <file> [-n N | N]\n");
+                goto cmd_filter_done;
             }
-            extern void *osfs2_find(const char *);
-            extern uint64_t osfs2_file_size(void *);
-            extern int osfs2_read(void *file, uint64_t off, void *buf, uint64_t len);
-            void *f = osfs2_find(argv[1]);
-            if (!f) sh_puts("file not found\n");
-            else {
-                uint64_t sz = osfs2_file_size(f);
-                if (sz > 1024 * 1024) sz = 1024 * 1024;
-                char *buf = (char *)kmalloc(sz + 1);
-                if (!buf) sh_puts("out of memory\n");
-                else {
-                    if (osfs2_read(f, 0, buf, sz) < 0)
-                        sh_puts("read failed\n");
-                    else {
-                        buf[sz] = '\0';
-                        bool is_head = (cmd[0] == 'h');
-                        if (is_head) {
-                            int seen = 0;
-                            for (uint64_t i = 0; i < sz && seen < n_lines; i++) {
-                                char s[2] = { buf[i], 0 }; sh_puts(s);
-                                if (buf[i] == '\n') seen++;
+            fname = argv[1];
+            /* Accept "-n N", "-N", or bare "N". */
+            for (int ai = 2; ai < argc; ai++) {
+                const char *a = argv[ai];
+                if (a[0] == '-' && a[1] == 'n' && a[2] == 0 && ai + 1 < argc) {
+                    a = argv[++ai];
+                } else if (a[0] == '-' && a[1] >= '0' && a[1] <= '9') {
+                    a++;  /* "-N" form */
+                }
+                int v = 0;
+                for (const char *p = a; *p >= '0' && *p <= '9'; p++)
+                    v = v * 10 + (*p - '0');
+                if (v > 0) n_lines = v;
+            }
+        }
+
+        vfs_node_t node;
+        if (!vfs_find(fname, VFS_MODE_NATIVE, &node)) {
+            sh_puts(fname);
+            sh_puts(": file not found\n");
+            goto cmd_filter_done;
+        }
+
+        uint64_t sz = node.size;
+        if (sz == 0) goto cmd_filter_done;
+        if (sz > 1024 * 1024) sz = 1024 * 1024;
+        char *buf = (char *)kmalloc(sz + 1);
+        if (!buf) { sh_puts("out of memory\n"); goto cmd_filter_done; }
+        if (vfs_read(&node, 0, buf, sz) < 0) {
+            sh_puts("read failed\n"); kfree(buf); goto cmd_filter_done;
+        }
+        buf[sz] = '\0';
+
+        if (is_head) {
+            uint64_t i = 0; int seen = 0;
+            uint64_t line_start = 0;
+            for (; i < sz && seen < n_lines; i++) {
+                if (buf[i] == '\n') {
+                    char saved = buf[i + 1 < sz ? i + 1 : sz];
+                    buf[i + 1 < sz ? i + 1 : sz] = 0;
+                    sh_puts(buf + line_start);
+                    buf[i + 1 < sz ? i + 1 : sz] = saved;
+                    line_start = i + 1;
+                    seen++;
+                }
+            }
+            /* Print final partial line if no trailing newline yet. */
+            if (seen < n_lines && line_start < sz) {
+                buf[sz] = 0;
+                sh_puts(buf + line_start);
+                if (buf[sz - 1] != '\n') sh_puts("\n");
+            }
+        } else if (!is_grep) {
+            /* tail: scan backwards counting newlines. */
+            int64_t start = (int64_t)sz - 1;
+            /* Skip a single trailing newline so the last line counts. */
+            if (start >= 0 && buf[start] == '\n') start--;
+            int seen = 0;
+            while (start >= 0) {
+                if (buf[start] == '\n') {
+                    if (++seen >= n_lines) { start++; break; }
+                }
+                start--;
+            }
+            if (start < 0) start = 0;
+            sh_puts(buf + start);
+            if (sz > 0 && buf[sz - 1] != '\n') sh_puts("\n");
+        } else {
+            /* grep: linear scan, literal substring match. */
+            int plen = 0; while (pattern[plen]) plen++;
+            uint64_t line_start = 0;
+            for (uint64_t i = 0; i <= sz; i++) {
+                if (i == sz || buf[i] == '\n') {
+                    /* Search [line_start, i) for pattern. */
+                    if (plen > 0 && (int64_t)(i - line_start) >= plen) {
+                        for (uint64_t k = line_start; k + plen <= i; k++) {
+                            int match = 1;
+                            for (int p = 0; p < plen; p++) {
+                                if (buf[k + p] != pattern[p]) { match = 0; break; }
                             }
-                        } else {
-                            /* tail: walk from end backwards counting newlines. */
-                            uint64_t start = sz;
-                            int seen = 0;
-                            while (start > 0 && seen <= n_lines) {
-                                start--;
-                                if (buf[start] == '\n') {
-                                    seen++;
-                                    if (seen > n_lines) { start++; break; }
-                                }
-                            }
-                            for (uint64_t i = start; i < sz; i++) {
-                                char s[2] = { buf[i], 0 }; sh_puts(s);
+                            if (match) {
+                                char saved_end = buf[i];
+                                buf[i] = 0;
+                                sh_puts(buf + line_start);
+                                sh_puts("\n");
+                                buf[i] = saved_end;
+                                break;
                             }
                         }
                     }
-                    kfree(buf);
+                    line_start = i + 1;
                 }
             }
         }
+
+        kfree(buf);
+    cmd_filter_done: ;
     } else if (strcmp(cmd, "sync") == 0) {
         /* Flush the active disk's controller cache before unplugging. */
         extern int disk_flush(void);
