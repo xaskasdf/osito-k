@@ -94,7 +94,10 @@ static int gpu_probe_boot(void)
 
     gpu.probe.boot0    = boot0;
     gpu.probe.boot42   = gpu_read(NV_PMC_BOOT_42);
-    gpu.probe.chip_id  = (boot0 >> 20) & 0xFFF;
+    /* Chipset id is 9 bits (mask 0x1ff00000), not 12 — matches nouveau's
+     * `(boot0 & 0x1ff00000) >> 20`. Using 12 bits picks up high reserved
+     * bits and gives bogus values like 0xB72 for a real GA102 (0x172). */
+    gpu.probe.chip_id  = (boot0 >> 20) & 0x1FF;
     gpu.probe.chip_rev = boot0 & 0xF;
 
     return 0;
@@ -135,9 +138,23 @@ static bool gpu_probe_falcon(uint32_t base)
 
 static void gpu_probe_falcons(void)
 {
-    gpu.probe.gsp_present  = gpu_probe_falcon(NV_PGSP_BASE);
-    gpu.probe.sec2_present = gpu_probe_falcon(NV_PSEC_BASE);
-    gpu.probe.pmu_present  = gpu_probe_falcon(NV_PPMU_BASE);
+    /* Direct HWCFG reads only work for Falcons whose PRI is unlocked.
+     * On Turing+ the GSP and PMU stay PRI-locked until SEC2 runs FWSEC,
+     * so a register probe sees them as 0xBADF5040 (PRI access denied)
+     * and we'd wrongly conclude they're absent.
+     *
+     * Trust the chip architecture instead: Volta (GV100, 0x140), all
+     * Turing (0x16x), all Ampere (0x17x), all Ada (0x19x), and all
+     * Blackwell (0x1Bx) have GSP+SEC2+PMU regardless of what the live
+     * probe says. Pre-Volta (Pascal and earlier) had no GSP. */
+    uint32_t cid = gpu.probe.chip_id;
+    bool ampere_or_newer  = (cid >= 0x170);
+    bool turing_or_newer  = (cid >= 0x162);
+    bool volta_or_newer   = (cid >= 0x140);
+
+    gpu.probe.gsp_present  = volta_or_newer || gpu_probe_falcon(NV_PGSP_BASE);
+    gpu.probe.sec2_present = turing_or_newer || gpu_probe_falcon(NV_PSEC_BASE);
+    gpu.probe.pmu_present  = ampere_or_newer || gpu_probe_falcon(NV_PPMU_BASE);
 }
 
 /* ── Phase 2: VRAM Discovery ─────────────────────────────────── */
@@ -347,7 +364,13 @@ static void gpu_report(uint64_t bar1_base)
     fb_puts_color(gpu_chip_name(p->chip_id), 0x0000FF00);
     fb_puts(" rev ");
     fb_puthex(p->chip_rev, 1);
-    fb_puts("\n");
+    fb_puts(" (boot0=");
+    fb_puthex(p->boot0, 8);
+    fb_puts(" boot42=");
+    fb_puthex(p->boot42, 8);
+    fb_puts(" chip=");
+    fb_puthex(p->chip_id, 3);
+    fb_puts(")\n");
 
     /* Engines */
     serial_puts("[GPU] Engines:");

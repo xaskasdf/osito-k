@@ -2271,6 +2271,22 @@ static void shell_exec(char *line)
         cmd_echo(argc, argv);
     } else if (strcmp(cmd, "ls") == 0) {
         cmd_ls();
+    } else if (strcmp(cmd, "dmesg") == 0) {
+        /* Dump the kernel ring buffer (klog). serial_puts has been
+         * teeing into klog since boot, so this is everything the
+         * kernel printed — useful when boot output scrolls off-screen
+         * on bare-metal. */
+        extern uint32_t klog_read(char *buf, uint32_t max_len);
+        char *buf = (char *)kmalloc(64 * 1024);
+        if (!buf) { sh_puts("dmesg: out of memory\n"); }
+        else {
+            uint32_t n = klog_read(buf, 64 * 1024);
+            for (uint32_t i = 0; i < n; i++) {
+                char s[2] = { buf[i], 0 };
+                sh_puts(s);
+            }
+            kfree(buf);
+        }
     } else if (strcmp(cmd, "cat") == 0) {
         cmd_cat(argc, argv);
     } else if (strcmp(cmd, "exec") == 0) {

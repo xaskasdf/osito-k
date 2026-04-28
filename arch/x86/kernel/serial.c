@@ -54,6 +54,12 @@ void serial_putchar(char c)
 
 void serial_puts(const char *s)
 {
+    /* Tee to klog for `dmesg` retrieval. The klog ring is the only way
+     * to recover boot-time messages on bare-metal where there's no
+     * scrollback and no serial cable. */
+    extern void klog_puts(const char *s) __attribute__((weak));
+    if (klog_puts) klog_puts(s);
+
     serial_acquire();
     while (*s) {
         if (*s == '\n') serial_putc('\r');

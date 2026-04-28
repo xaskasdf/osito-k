@@ -425,6 +425,15 @@ void __initk kernel_entry(boot_info_t *info)
     /* ── Step 1.7: Kernel heap ── */
     heap_init();
 
+    /* ── Step 1.72: klog ring buffer (so dmesg works after boot) ──
+     * Must come right after heap_init since klog allocates via kmalloc.
+     * Anything serial_puts'd before this point is lost — we mostly care
+     * about GPU/NVMe/USB diagnostics which happen later. */
+    {
+        extern void klog_init(void);
+        klog_init();
+    }
+
     /* ── Step 1.74: Per-CPU FPU state (must be before SMP) ── */
     {
         extern void fpu_percpu_init(void);
@@ -573,14 +582,16 @@ void __initk kernel_entry(boot_info_t *info)
             /* Vulkan Phase 1 -- Wave 1: 3D extension + selftest */
             extern void virtio_gpu_3d_init(void);
             extern void virtio_gpu_3d_selftest(void);
-            extern void nvk_backend_init_hook(void);
             virtio_gpu_3d_init();
-            nvk_backend_init_hook();
             virtio_gpu_3d_selftest();
         } else {
             serial_puts("[KERN] No virtio-GPU found\n");
         }
     }
+
+    /* (NVK backend status is checked in Step 4.9 after GSP/RM boot,
+     * since on bare-metal GSP only comes online after the FS is mounted
+     * and the firmware blob has been loaded.) */
 
     /* ── Step 3: bring up every NVMe controller (no FS scan yet) ──
      *
@@ -775,6 +786,16 @@ void __initk kernel_entry(boot_info_t *info)
         if (gp && gp->gsp_present) gsp_boot();
 
         if (model_ready) prompt_llama = &llama;
+    }
+
+    /* ── Step 4.9: NVK backend status (after GSP boot chain) ──
+     * On bare-metal Ampere, GSP only comes online after Step 4.8 has
+     * loaded gsp.bin from OsitoFS, run the RM init RPCs, and bound a
+     * compute channel. Now that all that's done we can ask the NVK
+     * backend whether it's actually ready to talk to userspace. */
+    {
+        extern void nvk_backend_init_hook(void);
+        nvk_backend_init_hook();
     }
 
     /* ── Step 5: Keyboard + Terminal + Shell ── */
