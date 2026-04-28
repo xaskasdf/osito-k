@@ -1079,6 +1079,15 @@ int  sass_smoke_test(void);    /* Dispatch NOP kernel, check semaphore */
 /* X38: GMMU page tables + kernel loader */
 int      gmmu_init(void);              /* Build identity-map page tables, configure instance block */
 uint64_t gmmu_get_pdb_phys(void);      /* Get PDB physical address */
+
+/* NVK Vulkan VRAM allocator (4 KB-page bitmap over the trailing region
+ * of the GMMU identity map). Returns GPU virtual address (== phys for
+ * identity-mapped pages); 0 on failure. */
+uint64_t gmmu_alloc_vram(uint64_t size);
+void     gmmu_free_vram(uint64_t addr, uint64_t size);
+uint32_t gmmu_vram_pages_used(void);
+uint64_t gmmu_vram_region_base(void);
+uint64_t gmmu_vram_region_size(void);
 bool     gmmu_is_initialized(void);    /* Check if GMMU is ready */
 
 /* X39: GPU tensor operations (see gpu_tensor.h for full API) */

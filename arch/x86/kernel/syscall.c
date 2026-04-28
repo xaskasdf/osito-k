@@ -3452,28 +3452,42 @@ int64_t __hot syscall_dispatch(uint64_t nr, uint64_t a1, uint64_t a2,
         if (pid < 0) return -1;
         const struct gpu_res_create_args *a =
             (const struct gpu_res_create_args *)a2;
+        extern bool nvk_backend_ready(void);
+        extern int32_t nvk_backend_res_create(uint32_t, uint32_t, const struct gpu_res_create_args *);
+        if (nvk_backend_ready())
+            return nvk_backend_res_create((uint32_t)pid, (uint32_t)a1, a);
         return vg3d_res_create((uint32_t)pid, (uint32_t)a1, a);
     }
     case SYS_GPU_RES_MAP: {      /* 604: (res_id) -> user VA */
         int32_t pid = proc_current_pid();
         if (pid < 0) return -1;
+        extern bool nvk_backend_ready(void);
+        extern int64_t nvk_backend_res_map(uint32_t, uint32_t);
+        if (nvk_backend_ready())
+            return nvk_backend_res_map((uint32_t)pid, (uint32_t)a1);
         return (int64_t)vg3d_res_map((uint32_t)pid, (uint32_t)a1);
     }
     case SYS_GPU_SUBMIT: {       /* 605: (args *) */
         const struct gpu_submit_args *a =
             (const struct gpu_submit_args *)a1;
         if (!a) return -22; /* EINVAL */
-        /* Defence-in-depth: also reject null pointers inside the struct
-         * here. vg3d_submit rejects them too, but validating at the
-         * syscall boundary means we never dereference through the NULL
-         * pointer value in a deeper callee. */
         if (!a->cmd_bytes || !a->out_fence) return -22;
         int32_t pid = proc_current_pid();
         if (pid < 0) return -1;
+        extern bool nvk_backend_ready(void);
+        extern int32_t nvk_backend_submit(uint32_t, uint32_t, const uint8_t *, uint32_t, uint64_t *);
+        if (nvk_backend_ready())
+            return nvk_backend_submit((uint32_t)pid, a->ctx_id,
+                                       (const uint8_t *)a->cmd_bytes,
+                                       (uint32_t)a->cmd_len, a->out_fence);
         return vg3d_submit((uint32_t)pid, a->ctx_id,
                            a->cmd_bytes, a->cmd_len, a->out_fence);
     }
     case SYS_GPU_FENCE_WAIT: {   /* 606: (fence, timeout_ns) */
+        extern bool nvk_backend_ready(void);
+        extern int32_t nvk_backend_fence_wait(uint64_t, uint64_t);
+        if (nvk_backend_ready())
+            return nvk_backend_fence_wait((uint64_t)a1, (uint64_t)a2);
         return vg3d_fence_wait((uint64_t)a1, (uint64_t)a2);
     }
     case SYS_GPU_PRESENT: {      /* 607: (args *) */
@@ -3482,6 +3496,11 @@ int64_t __hot syscall_dispatch(uint64_t nr, uint64_t a1, uint64_t a2,
         if (!a) return -22;
         int32_t pid = proc_current_pid();
         if (pid < 0) return -1;
+        extern bool nvk_backend_ready(void);
+        extern int32_t nvk_backend_present(uint32_t, uint32_t, uint32_t, uint32_t);
+        if (nvk_backend_ready())
+            return nvk_backend_present((uint32_t)pid,
+                                        a->ctx_id, a->res_id, a->shm_handle);
         return vg3d_present((uint32_t)pid,
                             a->ctx_id, a->res_id, a->shm_handle);
     }

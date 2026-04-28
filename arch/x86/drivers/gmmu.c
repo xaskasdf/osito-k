@@ -357,6 +357,108 @@ uint64_t gmmu_get_pdb_phys(void)
     return gmmu.pdb_phys;
 }
 
+/* ══════════════════════════════════════════════════════════════
+ *  VRAM allocator for NVK Vulkan resources
+ *
+ *  The identity-map covers [vram_base, vram_base+vram_size). SASS
+ *  kernels and the tensor arena consume the low/middle portion; the
+ *  trailing 64 MB are free for runtime Vulkan allocations (images,
+ *  buffers, command-buffer staging, fence semaphore page).
+ *
+ *  4 KB granularity bitmap. Caller frees with gmmu_free_vram(addr,size).
+ *
+ *  Returns the GPU virtual address of the allocation (== phys, since
+ *  we identity-map). 0 on failure. The address is also a valid CPU
+ *  virtual address through PHYS_TO_VIRT for kernel-side fills.
+ *  ══════════════════════════════════════════════════════════════ */
+
+#define NVK_VRAM_TAIL_MB   64           /* trailing region of identity map */
+#define NVK_VRAM_PAGE      4096
+#define NVK_VRAM_MAX_PAGES (NVK_VRAM_TAIL_MB * 1024 * 1024 / NVK_VRAM_PAGE)
+#define NVK_VRAM_BITMAP_SZ ((NVK_VRAM_MAX_PAGES + 63) / 64)
+
+static struct {
+    uint64_t base;                          /* Region start (phys = GPU VA) */
+    uint64_t size;                          /* Region length, bytes */
+    uint64_t bitmap[NVK_VRAM_BITMAP_SZ];    /* 1 bit per 4KB page, 1 = used */
+    uint32_t pages_used;
+    bool     initialized;
+} nvk_vram;
+
+static void nvk_vram_lazy_init(void)
+{
+    if (nvk_vram.initialized) return;
+    if (!gmmu.initialized || gmmu.map_vram_size < (uint64_t)NVK_VRAM_TAIL_MB * 1024 * 1024) {
+        serial_puts("[GMMU] VRAM allocator: identity map too small or not init'd\n");
+        return;
+    }
+
+    nvk_vram.size = (uint64_t)NVK_VRAM_TAIL_MB * 1024 * 1024;
+    nvk_vram.base = gmmu.map_vram_base + gmmu.map_vram_size - nvk_vram.size;
+
+    for (uint32_t i = 0; i < NVK_VRAM_BITMAP_SZ; i++) nvk_vram.bitmap[i] = 0;
+    nvk_vram.pages_used  = 0;
+    nvk_vram.initialized = true;
+
+    serial_puts("[GMMU] NVK VRAM allocator: ");
+    serial_putdec(NVK_VRAM_TAIL_MB);
+    serial_puts(" MB at 0x");
+    serial_puthex(nvk_vram.base, 16);
+    serial_puts("\n");
+}
+
+/*
+ * Allocate `size` bytes of GPU-mapped VRAM aligned to 4 KB. Returns the
+ * VRAM address on success, 0 on failure.
+ */
+uint64_t gmmu_alloc_vram(uint64_t size)
+{
+    nvk_vram_lazy_init();
+    if (!nvk_vram.initialized || size == 0) return 0;
+
+    uint32_t need = (uint32_t)((size + NVK_VRAM_PAGE - 1) / NVK_VRAM_PAGE);
+    if (need > NVK_VRAM_MAX_PAGES) return 0;
+
+    /* First-fit search over the bitmap. */
+    for (uint32_t start = 0; start + need <= NVK_VRAM_MAX_PAGES; start++) {
+        bool ok = true;
+        for (uint32_t k = 0; k < need; k++) {
+            uint32_t b = start + k;
+            if (nvk_vram.bitmap[b / 64] & (1ULL << (b % 64))) { ok = false; break; }
+        }
+        if (!ok) continue;
+
+        for (uint32_t k = 0; k < need; k++) {
+            uint32_t b = start + k;
+            nvk_vram.bitmap[b / 64] |= (1ULL << (b % 64));
+        }
+        nvk_vram.pages_used += need;
+        return nvk_vram.base + (uint64_t)start * NVK_VRAM_PAGE;
+    }
+    return 0;
+}
+
+void gmmu_free_vram(uint64_t addr, uint64_t size)
+{
+    if (!nvk_vram.initialized || size == 0) return;
+    if (addr < nvk_vram.base || addr >= nvk_vram.base + nvk_vram.size) return;
+
+    uint32_t start = (uint32_t)((addr - nvk_vram.base) / NVK_VRAM_PAGE);
+    uint32_t need  = (uint32_t)((size + NVK_VRAM_PAGE - 1) / NVK_VRAM_PAGE);
+    for (uint32_t k = 0; k < need; k++) {
+        uint32_t b = start + k;
+        if (b >= NVK_VRAM_MAX_PAGES) break;
+        if (nvk_vram.bitmap[b / 64] & (1ULL << (b % 64))) {
+            nvk_vram.bitmap[b / 64] &= ~(1ULL << (b % 64));
+            nvk_vram.pages_used--;
+        }
+    }
+}
+
+uint32_t gmmu_vram_pages_used(void)  { return nvk_vram.pages_used; }
+uint64_t gmmu_vram_region_base(void) { return nvk_vram.base; }
+uint64_t gmmu_vram_region_size(void) { return nvk_vram.size; }
+
 bool gmmu_is_initialized(void)
 {
     return gmmu.initialized;
