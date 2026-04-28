@@ -77,7 +77,6 @@ static int usb_scsi_cmd(const uint8_t *cdb, uint8_t cdb_len,
     cbw.bCBWCBLength = cdb_len;
     memcpy(cbw.CBWCB, cdb, cdb_len);
 
-    /* Send CBW */
     if (xhci_bulk_out(usb_disk.dev_idx, &cbw, sizeof(cbw)) < 0)
         return -1;
 

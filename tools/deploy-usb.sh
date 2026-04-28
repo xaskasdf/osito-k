@@ -135,7 +135,12 @@ DATA_TMP="$(mktemp -d)/data.img"
 DATA_MB=512
 info "Building OsitoFS data partition ($DATA_MB MB) with ${#ELFS[@]} ELFs"
 dd if=/dev/zero of="$DATA_TMP" bs=1M count=$DATA_MB status=none
-"$OSITOK_ROOT/tools/ositofs/ositofs-fsck" "$DATA_TMP" --init > /dev/null 2>&1 || true
+# mkfs.ositofs writes the OSF2 superblock at offset 0; the previous
+# `ositofs-fsck --init` call was a no-op (fsck doesn't accept --init,
+# the error was masked by `|| true`) — leaving the partition all-zero.
+if ! "$OSITOK_ROOT/tools/ositofs/mkfs.ositofs" "$DATA_TMP" --label OsitoK; then
+    fatal "mkfs.ositofs failed — partition will be all-zero, kernel won't mount"
+fi
 for elf in "${ELFS[@]}"; do
     [ -f "$elf" ] || { warn "skip missing: $elf"; continue; }
     "$OSITOK_ROOT/tools/ositofs/ositofs-write" "$DATA_TMP" "$elf" \

@@ -38,4 +38,22 @@
 #define PHYS_TO_VIRT(p) ((void *)((uintptr_t)(p) + KERNEL_VBASE))
 #define VIRT_TO_PHYS(v) ((uint64_t)((uintptr_t)(v) - KERNEL_VBASE))
 
+/* Safe virtual→physical for kernel addresses.
+ *
+ * In OsitoK both lower-half identity-mapped memory (UEFI-allocated boot
+ * stacks, ELF .text/.data sections that boot.efi loaded at their LMA)
+ * AND upper-half PHYS_TO_VIRT direct-map memory (Phase C migrations) are
+ * in use. A naive `v - KERNEL_VBASE` underflows when `v` is already a
+ * lower-half identity address, producing a garbage phys that the IOMMU
+ * doesn't translate to anything real.
+ *
+ * Use this helper for any pointer that might come from either world —
+ * e.g. on-stack DMA buffers in driver code paths, where the stack might
+ * still be in UEFI-loaded territory. */
+static inline uint64_t kvirt_to_phys(const void *v)
+{
+    uint64_t a = (uint64_t)(uintptr_t)v;
+    return (a >= KERNEL_VBASE) ? (a - KERNEL_VBASE) : a;
+}
+
 #endif /* _OSITOK_PAGING_H */

@@ -677,13 +677,52 @@ void __initk kernel_entry(boot_info_t *info)
             uint64_t part_off = 0, part_size = 0;
             (void)part_size;
 
+            /* (1) Try GPT — if the disk has a GPT header at LBA 1 we
+             * can find OsitoFS by partition name or magic probe. */
             if (gpt_find_ositofs(&part_off, &part_size) == 0) {
                 if (osfs3_mount(part_off) == 0) fs_mounted = true;
                 else fs_mounted = (osfs2_mount(part_off) == 0);
             }
+
+            /* (2) Raw OsitoFS at offset 0. */
             if (!fs_mounted) {
                 if (osfs3_mount(0) == 0) fs_mounted = true;
                 else fs_mounted = (osfs2_mount(0) == 0);
+            }
+
+            /* (3) Magic scan at MB-aligned offsets — handles macOS-flashed
+             * USB sticks where deploy-usb.sh skipped sgdisk. We probe
+             * positions where deploy-usb.sh might have placed the data
+             * partition (and a few extras for older layouts). */
+            if (!fs_mounted) {
+                extern int disk_read_bytes(uint64_t, void *, uint64_t);
+                static const uint64_t probe_mb[] = {
+                    1,    /* +1 MB  (boot.efi sometimes lands here) */
+                    65,   /* +65 MB (current deploy-usb.sh data start) */
+                    128,  /* +128 MB */
+                    256,  /* +256 MB */
+                    512,  /* +512 MB */
+                };
+                for (unsigned k = 0;
+                     k < sizeof(probe_mb)/sizeof(probe_mb[0]) && !fs_mounted;
+                     k++) {
+                    uint64_t off = probe_mb[k] * 1024ULL * 1024ULL;
+                    uint8_t  probe[4];
+                    if (disk_read_bytes(off, probe, 4) < 0) continue;
+                    uint32_t magic = (uint32_t)probe[0] |
+                                     ((uint32_t)probe[1] << 8) |
+                                     ((uint32_t)probe[2] << 16) |
+                                     ((uint32_t)probe[3] << 24);
+                    if (magic != 0x4F534632 /* "OSF2" */) continue;
+
+                    serial_puts("[KERN] OSFS magic at +");
+                    serial_putdec(probe_mb[k]);
+                    serial_puts(" MB on ");
+                    serial_puts(blkdev_name(i));
+                    serial_puts("\n");
+                    if (osfs3_mount(off) == 0) fs_mounted = true;
+                    else fs_mounted = (osfs2_mount(off) == 0);
+                }
             }
 
             if (fs_mounted) {

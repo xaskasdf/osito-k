@@ -325,14 +325,6 @@ static void usb_kbd_handle_report(xhci_device_t *dev, uint8_t *r, uint32_t len)
 {
     if (len < 1) return;
 
-    /* Bare-metal diagnostic: emit a visible '*' to framebuffer on every
-     * report so we can confirm the controller is firing transfer events
-     * even if downstream routing is broken. Removed once stable. */
-    {
-        extern void fb_puts(const char *s);
-        fb_puts("*");
-    }
-
     const hid_caps_t *caps = &dev->hid_caps;
     if (caps->n_fields == 0) return;  /* No descriptor parsed → drop. */
 
@@ -631,10 +623,11 @@ static int ctrl_transfer(xhci_hc_t *hc, xhci_device_t *dev,
     ei++;
     if (ei >= XHCI_XFER_RING_SIZE - 1) { ei = 0; dev->ep0_cycle ^= 1; }
 
-    /* Data TRB (if any). data is a kernel virt pointer (upper-half
-     * direct map); the controller needs the physical address. */
+    /* Data TRB (if any). data is a kernel virt pointer — could be
+     * either upper-half direct-map (Phase C migrations) or lower-half
+     * identity (UEFI-loaded stacks). kvirt_to_phys handles both. */
     if (len > 0 && data) {
-        dev->ep0_ring[ei].param = VIRT_TO_PHYS(data);
+        dev->ep0_ring[ei].param = kvirt_to_phys(data);
         dev->ep0_ring[ei].status = len;
         dev->ep0_ring[ei].control =
             XHCI_TRB_TYPE(TRB_DATA) |
@@ -737,6 +730,7 @@ static void enumerate_port(xhci_hc_t *hc, int port)
     serial_puts(" PLS=");
     serial_putdec(pls);
     serial_puts("\n");
+
 
     /* USB 3.0 port with no SuperSpeed link (PLS != U0/U1/U2/U3):
      * The device is likely USB 2.0 — it will enumerate on the companion
@@ -997,7 +991,6 @@ static void enumerate_port(xhci_hc_t *hc, int port)
     serial_puthex(dev->class_code, 2);
     serial_puts("\n");
 
-    /* VID:PID details go to serial only */
 
     /* ── GET_CONFIGURATION_DESCRIPTOR ── */
     memset(desc_buf, 0, 256);
@@ -1056,6 +1049,15 @@ static void enumerate_port(xhci_hc_t *hc, int port)
     uint16_t bulk_in_max_pkt    = 0;
     uint8_t  bulk_out_addr      = 0;
     uint16_t bulk_out_max_pkt   = 0;
+    /* SuperSpeed Endpoint Companion (desc type 0x30) carries the burst
+     * size which the EP context's field2 needs in bits 8..15. Without
+     * this, SS bulk EPs STALL on the first transfer. */
+    uint8_t  bulk_in_max_burst  = 0;
+    uint8_t  bulk_out_max_burst = 0;
+
+    /* The SS-EP-Companion follows the EP descriptor it belongs to; we
+     * track which EP we last saw so we can attribute the next companion. */
+    enum { LAST_NONE, LAST_BULK_IN, LAST_BULK_OUT } last_ep = LAST_NONE;
 
     bool     collecting_eps     = false;
 
@@ -1087,16 +1089,32 @@ static void enumerate_port(xhci_hc_t *hc, int port)
                 hid_iface      = this_iface;
                 hid_proto      = iproto;
                 collecting_eps = true;
-            } else if (iclass == 0x08 && isub == 0x06 && iproto == 0x50 &&
-                       iface_kind == IFACE_NONE) {
-                /* USB MSC SCSI Bulk-Only Transport. */
+            } else if (iclass == 0x08 && iface_kind == IFACE_NONE) {
+                /* USB Mass Storage. Accept any subclass/protocol so we
+                 * can at least log what kind it is. Common combos:
+                 *   subclass=0x06 (SCSI), proto=0x50 (BBB)  ← supported
+                 *   subclass=0x06 (SCSI), proto=0x62 (UAS)  ← not yet
+                 *   subclass=0x05 (SFF-8070i), proto=0x50   ← supported
+                 *   subclass=0x04 (UFI),       proto=0x50   ← supported
+                 * Only iproto=0x50 (Bulk-Only Transport) really works
+                 * with our bulk_xfer code; UAS needs Bulk Streams support
+                 * which we don't have yet. */
                 uint8_t this_iface = desc_buf[pos + 2];
                 serial_puts("[xHCI] MSC interface ");
                 serial_putdec(this_iface);
-                serial_puts(" (SCSI-BBB)\n");
-                iface_kind     = IFACE_MSC;
-                msc_iface      = this_iface;
-                collecting_eps = true;
+                serial_puts(" sub=");
+                serial_putdec(isub);
+                serial_puts(" proto=");
+                serial_putdec(iproto);
+                serial_puts("\n");
+                if (iproto == 0x50) {
+                    iface_kind     = IFACE_MSC;
+                    msc_iface      = this_iface;
+                    collecting_eps = true;
+                } else {
+                    extern void fb_puts(const char *s);
+                    fb_puts(" [xHCI] MSC proto unsupported (need BBB=0x50)\n");
+                }
             }
         }
 
@@ -1142,17 +1160,35 @@ static void enumerate_port(xhci_hc_t *hc, int port)
                 if (is_in) {
                     bulk_in_addr    = ep_addr;
                     bulk_in_max_pkt = ep_mps & 0x7FF;
+                    last_ep         = LAST_BULK_IN;
                     serial_puts("[xHCI]  -> Bulk-IN EP ");
                 } else {
                     bulk_out_addr    = ep_addr;
                     bulk_out_max_pkt = ep_mps & 0x7FF;
+                    last_ep          = LAST_BULK_OUT;
                     serial_puts("[xHCI]  -> Bulk-OUT EP ");
                 }
                 serial_puthex(ep_addr, 2);
                 serial_puts(" maxpkt=");
                 serial_putdec(ep_mps & 0x7FF);
                 serial_puts("\n");
+            } else {
+                last_ep = LAST_NONE;
             }
+        }
+
+        /* SuperSpeed Endpoint Companion descriptor (type 0x30) — sits
+         * immediately after the EP descriptor in SS configurations.
+         * Layout: bLength=6, bDescType=0x30, bMaxBurst, bmAttributes,
+         *         wBytesPerInterval (2 bytes). */
+        if (dtype == 0x30 && collecting_eps && pos + 6 <= total_len &&
+            iface_kind == IFACE_MSC) {
+            uint8_t mb = desc_buf[pos + 2];  /* bMaxBurst (0..15) */
+            if (last_ep == LAST_BULK_IN)  bulk_in_max_burst  = mb;
+            if (last_ep == LAST_BULK_OUT) bulk_out_max_burst = mb;
+            serial_puts("[xHCI]  -> SS-EP-Companion bMaxBurst=");
+            serial_putdec(mb);
+            serial_puts("\n");
         }
 
         pos += dlen;
@@ -1411,21 +1447,27 @@ static void enumerate_port(xhci_hc_t *hc, int port)
     slot_ctx->field1 &= ~(0x1F << 27);
     slot_ctx->field1 |= ((uint32_t)max_dci << 27);
 
-    /* Bulk IN endpoint context. */
+    /* Bulk IN endpoint context. For SuperSpeed bulk EPs we MUST set
+     * Max Burst Size (field2 bits 8..15) from the SS-EP-Companion
+     * descriptor's bMaxBurst — without it the EP STALLs on the first
+     * transfer. HighSpeed and below use 0 for max_burst, which is also
+     * the safe default if no companion was seen. */
     xhci_ep_ctx_t *bin_ep = (xhci_ep_ctx_t *)ctx_entry(hc, in_ctx, in_dci + 1);
-    bin_ep->field1    = 0;
-    bin_ep->field2    = (3 << 1) | (EP_TYPE_BULK_IN << 3) |
-                        ((uint32_t)bulk_in_max_pkt << 16);
+    bin_ep->field1     = 0;
+    bin_ep->field2     = (3 << 1) | (EP_TYPE_BULK_IN << 3) |
+                         ((uint32_t)bulk_in_max_burst << 8) |
+                         ((uint32_t)bulk_in_max_pkt   << 16);
     bin_ep->tr_dequeue = dev->bulk_in_ring_phys | 1; /* DCS=1 */
-    bin_ep->field4    = bulk_in_max_pkt;
+    bin_ep->field4     = bulk_in_max_pkt * (bulk_in_max_burst + 1);
 
     /* Bulk OUT endpoint context. */
     xhci_ep_ctx_t *bout_ep = (xhci_ep_ctx_t *)ctx_entry(hc, in_ctx, out_dci + 1);
-    bout_ep->field1   = 0;
-    bout_ep->field2   = (3 << 1) | (EP_TYPE_BULK_OUT << 3) |
-                        ((uint32_t)bulk_out_max_pkt << 16);
+    bout_ep->field1    = 0;
+    bout_ep->field2    = (3 << 1) | (EP_TYPE_BULK_OUT << 3) |
+                         ((uint32_t)bulk_out_max_burst << 8) |
+                         ((uint32_t)bulk_out_max_pkt   << 16);
     bout_ep->tr_dequeue = dev->bulk_out_ring_phys | 1;
-    bout_ep->field4   = bulk_out_max_pkt;
+    bout_ep->field4    = bulk_out_max_pkt * (bulk_out_max_burst + 1);
 
     memset(&cmd, 0, sizeof(cmd));
     cmd.param   = (uint64_t)in_ctx_phys;
@@ -1449,6 +1491,7 @@ static void enumerate_port(xhci_hc_t *hc, int port)
     serial_puts(" out=");
     serial_puthex(bulk_out_addr, 2);
     serial_puts(")\n");
+
     {
         extern void fb_puts(const char *s);
         extern void fb_putdec(uint64_t v);
@@ -1457,13 +1500,38 @@ static void enumerate_port(xhci_hc_t *hc, int port)
         fb_puts("\n");
     }
 
-    /* Hand off to the SCSI BBB driver. dev_idx = slot_id - 1 because
-     * slots are 1-based but the device array is 0-based. */
+    /* Settling delay — devices need time after Configure Endpoint
+     * before bulk transfers work. ~50ms at 3.8 GHz. */
+    spin(2000000);
+
+    /* Get Max LUN — required by some sticks before they accept CBW.
+     * Result is ignored (single-LUN if NAK). */
+    {
+        uint8_t max_lun = 0;
+        setup.bmRequestType = 0xA1;
+        setup.bRequest      = 0xFE;
+        setup.wValue        = 0;
+        setup.wIndex        = msc_iface;
+        setup.wLength       = 1;
+        ctrl_transfer(hc, dev, &setup, &max_lun, 1, true);
+    }
+
+    /* Bulk-Only Mass Storage Reset — failure tolerated. */
+    setup.bmRequestType = 0x21;
+    setup.bRequest      = 0xFF;
+    setup.wValue        = 0;
+    setup.wIndex        = msc_iface;
+    setup.wLength       = 0;
+    ctrl_transfer(hc, dev, &setup, NULL, 0, false);
+
+    /* Hand off to the SCSI BBB driver. dev_idx = slot_id - 1. */
     extern int usb_storage_init(int xhci_dev_idx);
-    if (usb_storage_init(slot_id - 1) == 0) {
-        /* Register as block device. The SCSI READ(10) callback uses
-         * the same usb_storage_read entry; usb_storage tracks the active
-         * device internally so we don't need to thread dev_idx through. */
+    int us_ret = usb_storage_init(slot_id - 1);
+    if (us_ret < 0) {
+        extern void fb_puts(const char *s);
+        fb_puts(" [USB-STOR] init failed\n");
+    }
+    if (us_ret == 0) {
         extern uint32_t usb_storage_block_size(void);
         extern uint32_t usb_storage_block_count(void);
         extern int usb_storage_read(uint64_t lba, uint32_t count, void *buf);
@@ -1475,13 +1543,17 @@ static void enumerate_port(xhci_hc_t *hc, int port)
                                    usb_storage_block_size(),
                                    usb_storage_block_count(),
                                    usb_storage_read, NULL);
+        extern void fb_puts(const char *s);
+        extern void fb_putdec(uint64_t v);
         if (idx >= 0) {
-            extern void fb_puts(const char *s);
-            extern void fb_putdec(uint64_t v);
-            fb_puts(" [BLKDEV] usb0 registered (");
+            fb_puts(" [BLKDEV] usb0 registered: ");
             fb_putdec((uint64_t)usb_storage_block_count() *
                       usb_storage_block_size() / (1024 * 1024));
-            fb_puts(" MB)\n");
+            fb_puts(" MB, ssz=");
+            fb_putdec(usb_storage_block_size());
+            fb_puts("\n");
+        } else {
+            fb_puts(" [BLKDEV] usb0 register FAILED\n");
         }
     }
   }
@@ -1876,7 +1948,12 @@ static int bulk_xfer(xhci_hc_t *hc, xhci_device_t *dev,
 
     /* Build a single Normal TRB.  buf is a kernel virt pointer in the
      * upper-half direct-map alias; the controller needs the phys. */
-    ring[ei].param   = (uint64_t)VIRT_TO_PHYS(buf);
+    /* buf may be either upper-half (Phase C migrated) or lower-half
+     * identity (UEFI-loaded stack). Use kvirt_to_phys for safety —
+     * a plain VIRT_TO_PHYS underflow on a lower-half pointer hands
+     * the controller a garbage phys, the device receives junk in the
+     * CBW, and STALLs the next IN. */
+    ring[ei].param   = (uint64_t)kvirt_to_phys(buf);
     ring[ei].status  = len;
     wmb();
     ring[ei].control = XHCI_TRB_TYPE(TRB_NORMAL) | TRB_IOC |
