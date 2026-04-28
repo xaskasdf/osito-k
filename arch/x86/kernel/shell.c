@@ -543,49 +543,6 @@ static void cmd_exec(int argc, char *argv[])
     }
 }
 
-/* ── Builtin: cc (compile C with TCC) ────────────────────────── */
-
-/* ── Builtin: build (kernel self-build with TCC) ────────────── */
-
-/* TCC-compilable .c source files (basenames — flat FS) */
-static const char *build_tcc_sources[] = {
-    /* kernel/ */
-    "main.c", "serial.c", "framebuffer.c", "pci.c", "memory.c",
-    "net.c", "inference.c", "idt.c", "paging.c", "heap.c",
-    "syscall.c", "elf.c", "process.c", "keyboard.c", "terminal.c",
-    "shell.c", "crypto.c", "tls.c", "http.c", "claude.c",
-    "tokenizer.c", "smp.c", "dynlink.c", "zlib.c", "git.c",
-    "shm.c", "compositor.c", "display.c", "input_events.c", "memcompress.c",
-    /* drivers/ */
-    "nvme.c", "i211.c", "gpu.c", "gsp.c", "sass.c", "gmmu.c",
-    "gpu_tensor.c", "gpu_inference.c", "xhci.c",
-    /* fs/ */
-    "ositofs2.c", "gpt.c", "gguf.c",
-    /* win32/ (GCC-only: compat32.c, msvcrt_shim.c) */
-    "win32_init.c", "pe.c", "winexec.c", "handle.c", "ntsyscall.c",
-    "ntprocess.c", "ntsync.c", "dllloader.c", "kernel32_shim.c",
-    "ntdll_shim.c", "user32_shim.c", "gdi32_shim.c", "advapi32_shim.c",
-    "ddraw_shim.c", "dsound_shim.c", "ole32_shim.c", "shell32_shim.c",
-    "comctl32_shim.c", "comdlg32_shim.c", "winmm_shim.c", "wsock32_shim.c",
-    NULL
-};
-
-/* GCC pre-compiled .o files (AVX2, assembly, compat32) */
-static const char *build_gcc_objects[] = {
-    "tensor.o", "tensor_avx2.o",
-    "isr_stubs.o", "syscall_entry.o", "setjmp.o", "kexec_tramp.o",
-    "compat32.o", "msvcrt_shim.o", "int2e_stub.o",
-    "entry_alias.o",
-    NULL
-};
-
-static void c_to_o(const char *src, char *dst)
-{
-    int i = 0;
-    while (src[i] && src[i] != '.' && i < 58) { dst[i] = src[i]; i++; }
-    dst[i++] = '.'; dst[i++] = 'o'; dst[i] = '\0';
-}
-
 /* ── Builtin: ping ──────────────────────────────────────────── */
 
 static int parse_ip(const char *s, uint8_t ip[4])
@@ -2103,16 +2060,18 @@ static void shell_exec(char *line)
     } else if (strcmp(cmd, "head") == 0 || strcmp(cmd, "tail") == 0
                || strcmp(cmd, "grep") == 0) {
         /*
-         * head <file> [-n N] | [N]   first N lines (default 10)
-         * tail <file> [-n N] | [N]   last  N lines (default 10)
-         * grep <pattern> <file>      lines containing literal substring
+         * head <file> [-n N | -N | N]   first N lines (default 10)
+         * tail <file> [-n N | -N | N]   last  N lines (default 10)
+         * grep <pattern> <file>         lines containing literal substring
          *
-         * All three resolve files via the unified VFS so they work on
-         * osfs2, osfs3, tmpfs, fat32, ext2, etc. Output line-by-line
-         * via sh_puts (honours redirect to file via `>`).
+         * Streaming implementation: read the file in 8 KB chunks and
+         * carry a partial-line accumulator across chunk boundaries. No
+         * cap on input size for head/grep (memory is O(longest_line)).
+         * tail keeps a rolling ring of the last N line offsets and emits
+         * them at EOF, so memory is O(N + longest_line).
          *
-         * Cap file size at 1 MB to keep heap usage bounded — bigger
-         * inputs need a streaming variant which is follow-up work.
+         * Resolves via VFS so it works on every mounted filesystem.
+         * sh_puts honours `>`/`>>` redirect.
          */
         bool is_head = (cmd[0] == 'h');
         bool is_grep = (cmd[0] == 'g');
@@ -2132,13 +2091,12 @@ static void shell_exec(char *line)
                 goto cmd_filter_done;
             }
             fname = argv[1];
-            /* Accept "-n N", "-N", or bare "N". */
             for (int ai = 2; ai < argc; ai++) {
                 const char *a = argv[ai];
                 if (a[0] == '-' && a[1] == 'n' && a[2] == 0 && ai + 1 < argc) {
                     a = argv[++ai];
                 } else if (a[0] == '-' && a[1] >= '0' && a[1] <= '9') {
-                    a++;  /* "-N" form */
+                    a++;
                 }
                 int v = 0;
                 for (const char *p = a; *p >= '0' && *p <= '9'; p++)
@@ -2153,81 +2111,129 @@ static void shell_exec(char *line)
             sh_puts(": file not found\n");
             goto cmd_filter_done;
         }
-
         uint64_t sz = node.size;
         if (sz == 0) goto cmd_filter_done;
-        if (sz > 1024 * 1024) sz = 1024 * 1024;
-        char *buf = (char *)kmalloc(sz + 1);
-        if (!buf) { sh_puts("out of memory\n"); goto cmd_filter_done; }
-        if (vfs_read(&node, 0, buf, sz) < 0) {
-            sh_puts("read failed\n"); kfree(buf); goto cmd_filter_done;
-        }
-        buf[sz] = '\0';
 
-        if (is_head) {
-            uint64_t i = 0; int seen = 0;
-            uint64_t line_start = 0;
-            for (; i < sz && seen < n_lines; i++) {
-                if (buf[i] == '\n') {
-                    char saved = buf[i + 1 < sz ? i + 1 : sz];
-                    buf[i + 1 < sz ? i + 1 : sz] = 0;
-                    sh_puts(buf + line_start);
-                    buf[i + 1 < sz ? i + 1 : sz] = saved;
-                    line_start = i + 1;
-                    seen++;
-                }
+        /* Streaming buffers:
+         *   chunk[CHUNK_SZ]      one disk read at a time
+         *   line[LINE_MAX+1]     accumulator for current line across reads
+         */
+#define CMD_FILTER_CHUNK_SZ  8192
+#define CMD_FILTER_LINE_MAX  65536
+        char *chunk = (char *)kmalloc(CMD_FILTER_CHUNK_SZ);
+        char *line  = (char *)kmalloc(CMD_FILTER_LINE_MAX + 1);
+        if (!chunk || !line) {
+            sh_puts("out of memory\n");
+            if (chunk) kfree(chunk);
+            if (line)  kfree(line);
+            goto cmd_filter_done;
+        }
+        uint32_t line_len = 0;
+
+        /* tail-only: ring of last N line strings. Each slot is a
+         * heap-malloc'd C-string of the line's content. We rotate
+         * head index as lines come in. */
+        char    **tail_ring   = NULL;
+        uint32_t  tail_head   = 0;
+        uint32_t  tail_count  = 0;
+        if (!is_head && !is_grep) {
+            tail_ring = (char **)kmalloc((uint64_t)n_lines * sizeof(char *));
+            if (!tail_ring) {
+                sh_puts("out of memory\n");
+                kfree(chunk); kfree(line);
+                goto cmd_filter_done;
             }
-            /* Print final partial line if no trailing newline yet. */
-            if (seen < n_lines && line_start < sz) {
-                buf[sz] = 0;
-                sh_puts(buf + line_start);
-                if (buf[sz - 1] != '\n') sh_puts("\n");
-            }
-        } else if (!is_grep) {
-            /* tail: scan backwards counting newlines. */
-            int64_t start = (int64_t)sz - 1;
-            /* Skip a single trailing newline so the last line counts. */
-            if (start >= 0 && buf[start] == '\n') start--;
-            int seen = 0;
-            while (start >= 0) {
-                if (buf[start] == '\n') {
-                    if (++seen >= n_lines) { start++; break; }
-                }
-                start--;
-            }
-            if (start < 0) start = 0;
-            sh_puts(buf + start);
-            if (sz > 0 && buf[sz - 1] != '\n') sh_puts("\n");
-        } else {
-            /* grep: linear scan, literal substring match. */
-            int plen = 0; while (pattern[plen]) plen++;
-            uint64_t line_start = 0;
-            for (uint64_t i = 0; i <= sz; i++) {
-                if (i == sz || buf[i] == '\n') {
-                    /* Search [line_start, i) for pattern. */
-                    if (plen > 0 && (int64_t)(i - line_start) >= plen) {
-                        for (uint64_t k = line_start; k + plen <= i; k++) {
-                            int match = 1;
-                            for (int p = 0; p < plen; p++) {
-                                if (buf[k + p] != pattern[p]) { match = 0; break; }
-                            }
-                            if (match) {
-                                char saved_end = buf[i];
-                                buf[i] = 0;
-                                sh_puts(buf + line_start);
-                                sh_puts("\n");
-                                buf[i] = saved_end;
-                                break;
-                            }
-                        }
-                    }
-                    line_start = i + 1;
-                }
-            }
+            for (int t = 0; t < n_lines; t++) tail_ring[t] = NULL;
         }
 
-        kfree(buf);
+        int    plen          = 0;
+        if (is_grep) { while (pattern[plen]) plen++; }
+
+        int    head_emitted  = 0;
+        int    head_done     = 0;
+        uint64_t off         = 0;
+
+        /* Emit/process one completed logical line (line[0..line_len)). */
+        #define FLUSH_LINE() do {                                            \
+            if (line_len < CMD_FILTER_LINE_MAX) line[line_len] = 0;          \
+            else line[CMD_FILTER_LINE_MAX] = 0;                              \
+            if (is_head) {                                                   \
+                if (head_emitted < n_lines) {                                \
+                    sh_puts(line); sh_puts("\n");                            \
+                    if (++head_emitted >= n_lines) head_done = 1;            \
+                }                                                            \
+            } else if (is_grep) {                                            \
+                if (plen > 0 && (int)line_len >= plen) {                     \
+                    for (uint32_t k = 0; k + plen <= line_len; k++) {        \
+                        int match = 1;                                       \
+                        for (int p = 0; p < plen; p++)                       \
+                            if (line[k + p] != pattern[p]) { match = 0; break; } \
+                        if (match) {                                         \
+                            sh_puts(line); sh_puts("\n");                    \
+                            break;                                           \
+                        }                                                    \
+                    }                                                        \
+                }                                                            \
+            } else {                                                          \
+                /* tail: store into ring, replacing oldest. */                \
+                char *slot = tail_ring[tail_head];                            \
+                if (slot) kfree(slot);                                        \
+                slot = (char *)kmalloc((uint64_t)line_len + 1);               \
+                if (slot) {                                                   \
+                    for (uint32_t i = 0; i < line_len; i++) slot[i] = line[i];\
+                    slot[line_len] = 0;                                       \
+                }                                                              \
+                tail_ring[tail_head] = slot;                                   \
+                tail_head = (tail_head + 1) % (uint32_t)n_lines;               \
+                if (tail_count < (uint32_t)n_lines) tail_count++;              \
+            }                                                                 \
+            line_len = 0;                                                     \
+        } while (0)
+
+        while (off < sz && !head_done) {
+            uint64_t want = sz - off;
+            if (want > CMD_FILTER_CHUNK_SZ) want = CMD_FILTER_CHUNK_SZ;
+            int got = vfs_read(&node, off, chunk, want);
+            if (got < 0) { sh_puts("read failed\n"); break; }
+            if (got == 0) break;
+            for (int i = 0; i < got && !head_done; i++) {
+                char c = chunk[i];
+                if (c == '\n') {
+                    FLUSH_LINE();
+                } else if (line_len < CMD_FILTER_LINE_MAX) {
+                    line[line_len++] = c;
+                }
+                /* Lines longer than LINE_MAX get truncated silently —
+                 * acceptable for log/source files; binary blobs aren't
+                 * the target of head/tail/grep anyway. */
+            }
+            off += (uint64_t)got;
+        }
+        /* Flush trailing partial line (no final newline). */
+        if (!head_done && line_len > 0) {
+            FLUSH_LINE();
+        }
+
+        /* tail: emit ring in chronological order. */
+        if (!is_head && !is_grep && tail_ring) {
+            uint32_t start = (tail_head + (uint32_t)n_lines - tail_count)
+                             % (uint32_t)n_lines;
+            for (uint32_t i = 0; i < tail_count; i++) {
+                char *l = tail_ring[(start + i) % (uint32_t)n_lines];
+                if (l) { sh_puts(l); sh_puts("\n"); }
+            }
+            for (int t = 0; t < n_lines; t++) {
+                if (tail_ring[t]) kfree(tail_ring[t]);
+            }
+            kfree(tail_ring);
+        }
+
+        kfree(chunk);
+        kfree(line);
+        #undef FLUSH_LINE
     cmd_filter_done: ;
+#undef CMD_FILTER_CHUNK_SZ
+#undef CMD_FILTER_LINE_MAX
     } else if (strcmp(cmd, "sync") == 0) {
         /* Flush the active disk's controller cache before unplugging. */
         extern int disk_flush(void);
