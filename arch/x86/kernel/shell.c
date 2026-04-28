@@ -253,8 +253,6 @@ static void cmd_help(void)
     sh_puts("  ls        List files on disk\n");
     sh_puts("  cat       Display file contents\n");
     sh_puts("  exec      Run an ELF binary\n");
-    sh_puts("  cc        Compile C with TCC (cc file.c [-run])\n");
-    sh_puts("  build     Self-build kernel (TCC compile + link)\n");
     sh_puts("  ping      Ping an IP address\n");
     sh_puts("  tcptest   TCP connection test (tcptest [ip] [port])\n");
     sh_puts("  resolve   DNS lookup (resolve hostname)\n");
@@ -265,7 +263,6 @@ static void cmd_help(void)
     sh_puts("  claude    Claude REPL (multi-turn conversation)\n");
     sh_puts("  chat      Local inference (chat <prompt>)\n");
     sh_puts("  temp      Set sampling (temp <temperature> [top_p])\n");
-    sh_puts("  js        QuickJS REPL (js [script.js])\n");
     sh_puts("  dl        Dynamic linker (dl load/sym/call/close/list)\n");
     sh_puts("  git       Version control (init/add/commit/log/status/diff/branch/checkout)\n");
     sh_puts("  sched     Scheduler test (sched [stats])\n");
@@ -544,113 +541,6 @@ static void cmd_exec(int argc, char *argv[])
 
 /* ── Builtin: cc (compile C with TCC) ────────────────────────── */
 
-static void cmd_cc(int argc, char *argv[])
-{
-    if (!osfs2_is_mounted() || !osfs2_find("tcc.elf")) {
-        sh_puts("tcc.elf not found on disk\n");
-        return;
-    }
-
-    if (argc < 2) {
-        sh_puts("Usage: cc <file.c> [-run]    Compile and optionally run\n");
-        sh_puts("       cc -run <file.c>      Compile + run immediately\n");
-        sh_puts("Auto-links with CRT+libc if crt.o/syscall.o/tcclib.o on disk\n");
-        return;
-    }
-
-    /* Check for -run flag */
-    int run_mode = 0;
-    const char *source = NULL;
-
-    for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "-run") == 0)
-            run_mode = 1;
-        else if (!source)
-            source = argv[i];
-    }
-
-    if (!source) {
-        sh_puts("No source file specified\n");
-        return;
-    }
-
-    if (!osfs2_find(source)) {
-        sh_puts("File not found: ");
-        sh_puts(source);
-        sh_puts("\n");
-        return;
-    }
-
-    /* Build output filename: foo.c → foo.elf */
-    char outname[64];
-    int j = 0;
-    const char *s = source;
-    while (*s && *s != '.' && j < 58) outname[j++] = *s++;
-    outname[j++] = '.'; outname[j++] = 'e'; outname[j++] = 'l'; outname[j++] = 'f'; outname[j] = '\0';
-
-    /* Step 1: Compile + link */
-    sh_puts_color("Compiling: ", 0x0000FF00);
-    sh_puts(source);
-    sh_puts(" → ");
-    sh_puts(outname);
-    sh_puts("\n");
-
-    /* Check if CRT objects are available for libc-linked compilation */
-    int has_crt = osfs2_find("crt.o") && osfs2_find("syscall.o")
-               && osfs2_find("tcclib.o");
-
-    const char *tcc_argv_bare[] = {
-        "tcc", "-nostdlib", "-nostdinc", "-static",
-        source, "-o", outname
-    };
-    const char *tcc_argv_crt[] = {
-        "tcc", "-nostdlib", "-nostdinc", "-static",
-        "-Wl,-Ttext,0x401000",
-        "-Wl,-section-alignment,0x1000",
-        "crt.o", "syscall.o", "tcclib.o",
-        source, "-o", outname
-    };
-
-    int tcc_argc;
-    const char **tcc_argv;
-    if (has_crt) {
-        sh_puts("  [CRT+libc linked]\n");
-        tcc_argv = tcc_argv_crt;
-        tcc_argc = 12;
-    } else {
-        tcc_argv = tcc_argv_bare;
-        tcc_argc = 7;
-    }
-
-    int ret = proc_exec("tcc.elf", tcc_argc, tcc_argv);
-
-    if (ret != 0) {
-        sh_puts_color("Compilation failed", 0x00FF0000);
-        sh_puts(" (exit ");
-        sh_putdec(ret < 0 ? (uint64_t)(-(int64_t)ret) : (uint64_t)ret);
-        sh_puts(")\n");
-        return;
-    }
-
-    sh_puts_color("OK", 0x0000FF00);
-    sh_puts(" — compiled successfully\n");
-
-    /* Step 2: Run if -run flag */
-    if (run_mode) {
-        if (!osfs2_find(outname)) {
-            sh_puts("Output file not found on disk\n");
-            return;
-        }
-        sh_puts_color("Running: ", 0x0000FF00);
-        sh_puts(outname);
-        sh_puts("\n");
-        ret = proc_exec(outname, 0, NULL);
-        sh_puts("Exit code: ");
-        sh_putdec(ret < 0 ? (uint64_t)(-(int64_t)ret) : (uint64_t)ret);
-        sh_puts("\n");
-    }
-}
-
 /* ── Builtin: build (kernel self-build with TCC) ────────────── */
 
 /* TCC-compilable .c source files (basenames — flat FS) */
@@ -690,151 +580,6 @@ static void c_to_o(const char *src, char *dst)
     int i = 0;
     while (src[i] && src[i] != '.' && i < 58) { dst[i] = src[i]; i++; }
     dst[i++] = '.'; dst[i++] = 'o'; dst[i] = '\0';
-}
-
-static void cmd_build(void)
-{
-    if (!osfs2_is_mounted() || !osfs2_find("tcc.elf")) {
-        sh_puts("tcc.elf not found on disk\n");
-        return;
-    }
-
-    /* Count source files */
-    int n_src = 0;
-    while (build_tcc_sources[n_src]) n_src++;
-
-    sh_puts_color("OsitoK kernel self-build\n", 0x00FF8800);
-    sh_puts("  Sources: ");
-    sh_putdec((uint64_t)n_src);
-    sh_puts(" TCC + ");
-    int n_gcc = 0;
-    while (build_gcc_objects[n_gcc]) n_gcc++;
-    sh_putdec((uint64_t)n_gcc);
-    sh_puts(" GCC precompiled\n");
-
-    /* Verify all GCC .o files exist */
-    for (int i = 0; build_gcc_objects[i]; i++) {
-        if (!osfs2_find(build_gcc_objects[i])) {
-            sh_puts_color("MISSING: ", 0x00FF0000);
-            sh_puts(build_gcc_objects[i]);
-            sh_puts("\n");
-            return;
-        }
-    }
-
-    /* ── Phase 1: Compile each .c → .o ────────────────────── */
-
-    int errors = 0;
-    char oname[64];
-
-    for (int i = 0; i < n_src; i++) {
-        const char *src = build_tcc_sources[i];
-        c_to_o(src, oname);
-
-        /* Delete old .o if it exists */
-        if (osfs2_find(oname))
-            osfs2_delete(oname);
-
-        /* Progress */
-        sh_puts("  [");
-        sh_putdec((uint64_t)(i + 1));
-        sh_puts("/");
-        sh_putdec((uint64_t)n_src);
-        sh_puts("] ");
-        sh_puts(src);
-
-        const char *tcc_argv[] = {
-            "tcc", "-c", "-nostdlib", "-nostdinc",
-            "-D__KERNEL_X86__=1",
-            src, "-o", oname
-        };
-        int ret = proc_exec("tcc.elf", 8, tcc_argv);
-
-        if (ret != 0) {
-            sh_puts_color(" FAIL", 0x00FF0000);
-            sh_puts(" (exit ");
-            sh_putdec(ret < 0 ? (uint64_t)(-(int64_t)ret) : (uint64_t)ret);
-            sh_puts(")\n");
-            errors++;
-        } else {
-            sh_puts_color(" OK\n", 0x0000FF00);
-        }
-    }
-
-    if (errors > 0) {
-        sh_puts_color("\nBuild failed: ", 0x00FF0000);
-        sh_putdec((uint64_t)errors);
-        sh_puts(" error(s)\n");
-        return;
-    }
-
-    /* ── Phase 2: Link all .o → kernel.elf ────────────────── */
-
-    sh_puts_color("\nLinking kernel.elf...\n", 0x00FF8800);
-
-    /* Delete old kernel.elf */
-    if (osfs2_find("kernel.elf"))
-        osfs2_delete("kernel.elf");
-
-    /* Build link argv: tcc -nostdlib -static -Wl,flags... all.o -o kernel.elf */
-    /* Max: 5 flags + n_src .o + n_gcc .o + 2 (-o kernel.elf) + 1 (NULL safety) */
-    #define BUILD_MAX_LINK_ARGS 128
-    const char *link_argv[BUILD_MAX_LINK_ARGS];
-    int la = 0;
-
-    link_argv[la++] = "tcc";
-    link_argv[la++] = "-nostdlib";
-    link_argv[la++] = "-static";
-    link_argv[la++] = "-Wl,-Ttext,0x2000000";
-    link_argv[la++] = "-Wl,-section-alignment,0x1000";
-
-    /* Add all TCC-compiled .o files */
-    /* We need persistent oname strings — use a static buffer */
-    static char onames[80][64];  /* 80 slots × 64 chars */
-    for (int i = 0; i < n_src && la < BUILD_MAX_LINK_ARGS - 3; i++) {
-        c_to_o(build_tcc_sources[i], onames[i]);
-        link_argv[la++] = onames[i];
-    }
-
-    /* Add GCC pre-compiled .o files */
-    for (int i = 0; build_gcc_objects[i] && la < BUILD_MAX_LINK_ARGS - 3; i++) {
-        link_argv[la++] = build_gcc_objects[i];
-    }
-
-    link_argv[la++] = "-o";
-    link_argv[la++] = "kernel.elf";
-
-    sh_puts("  ");
-    sh_putdec((uint64_t)la);
-    sh_puts(" args, ");
-    sh_putdec((uint64_t)(n_src + n_gcc));
-    sh_puts(" object files\n");
-
-    int ret = proc_exec("tcc.elf", la, link_argv);
-
-    if (ret != 0) {
-        sh_puts_color("Link failed", 0x00FF0000);
-        sh_puts(" (exit ");
-        sh_putdec(ret < 0 ? (uint64_t)(-(int64_t)ret) : (uint64_t)ret);
-        sh_puts(")\n");
-        return;
-    }
-
-    /* Verify output */
-    void *kelf = osfs2_find("kernel.elf");
-    if (!kelf) {
-        sh_puts_color("kernel.elf not found after link!\n", 0x00FF0000);
-        return;
-    }
-
-    sh_puts_color("\nBuild successful!\n", 0x0000FF00);
-    sh_puts("  kernel.elf: ");
-    sh_putdec(osfs2_file_size(kelf));
-    sh_puts(" bytes\n");
-    uint64_t free_bytes = (uint64_t)osfs2_free_blocks() * osfs2_get_block_size();
-    sh_puts("  Free: ");
-    sh_putdec(free_bytes / (1024 * 1024));
-    sh_puts(" MB\n");
 }
 
 /* ── Builtin: ping ──────────────────────────────────────────── */
@@ -2431,10 +2176,6 @@ static void shell_exec(char *line)
         cmd_cat(argc, argv);
     } else if (strcmp(cmd, "exec") == 0) {
         cmd_exec(argc, argv);
-    } else if (strcmp(cmd, "cc") == 0 || strcmp(cmd, "tcc") == 0) {
-        cmd_cc(argc, argv);
-    } else if (strcmp(cmd, "build") == 0) {
-        cmd_build();
     } else if (strcmp(cmd, "ifconfig") == 0) {
         extern uint8_t *net_get_ip_ptr(void);
         extern void net_get_mac(uint8_t mac[6]);
@@ -2480,15 +2221,6 @@ static void shell_exec(char *line)
         cmd_chat(argc, argv);
     } else if (strcmp(cmd, "temp") == 0) {
         cmd_temp(argc, argv);
-    } else if (strcmp(cmd, "js") == 0) {
-        /* QuickJS REPL — run qjs.elf with optional script argument */
-        if (argc > 1) {
-            const char *js_argv[] = { "qjs.elf", argv[1] };
-            proc_exec("qjs.elf", 2, js_argv);
-        } else {
-            const char *js_argv[] = { "qjs.elf" };
-            proc_exec("qjs.elf", 1, js_argv);
-        }
     } else if (strcmp(cmd, "dl") == 0) {
         cmd_dl(argc, argv);
     } else if (strcmp(cmd, "git") == 0) {
