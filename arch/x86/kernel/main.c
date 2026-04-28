@@ -785,6 +785,20 @@ void __initk kernel_entry(boot_info_t *info)
         if (gp && gp->gsp_present) gsp_queue_init();
         if (gp && gp->gsp_present) gsp_boot();
 
+        /* Replace boot-time VRAM probe (PRI-locked, returned 97 MB on
+         * Ampere) with the real value from RM. This is what the SASS
+         * uploader and any DMA-buffer allocator should see. */
+        if (gp && gp->gsp_present) {
+            extern uint32_t gsp_query_vram_mb(void);
+            uint32_t real_mb = gsp_query_vram_mb();
+            if (real_mb > 0) {
+                gp->vram_size_mb = real_mb;
+                fb_puts(" GPU: VRAM=");
+                fb_putdec(real_mb);
+                fb_puts(" MB (RM)\n");
+            }
+        }
+
         if (model_ready) prompt_llama = &llama;
     }
 

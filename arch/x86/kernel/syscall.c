@@ -3429,11 +3429,21 @@ int64_t __hot syscall_dispatch(uint64_t nr, uint64_t a1, uint64_t a2,
     case SYS_GPU_CTX_CREATE: {   /* 601: gpu_ctx_create(flags) */
         int32_t pid = proc_current_pid();
         if (pid < 0) return -1;  /* EPERM */
+        /* Caller can hint NVK via flag bit 0; otherwise prefer NVK
+         * when ready (bare-metal NVIDIA), else virtio-gpu (QEMU). */
+        extern bool nvk_backend_ready(void);
+        extern int32_t nvk_backend_ctx_create(uint32_t pid, uint32_t flags);
+        if (nvk_backend_ready())
+            return nvk_backend_ctx_create((uint32_t)pid, (uint32_t)a1);
         return vg3d_ctx_create((uint32_t)pid, (uint32_t)a1);
     }
     case SYS_GPU_CTX_DESTROY: {  /* 602: gpu_ctx_destroy(ctx_id) */
         int32_t pid = proc_current_pid();
         if (pid < 0) return -1;
+        extern bool nvk_backend_ready(void);
+        extern int32_t nvk_backend_ctx_destroy(uint32_t pid, uint32_t ctx_id);
+        if (nvk_backend_ready())
+            return nvk_backend_ctx_destroy((uint32_t)pid, (uint32_t)a1);
         return vg3d_ctx_destroy((uint32_t)pid, (uint32_t)a1);
     }
     case SYS_GPU_RES_CREATE: {   /* 603: (ctx_id, args *) */

@@ -1001,6 +1001,58 @@ int gsp_rm_init(void)
 }
 
 /* ══════════════════════════════════════════════════════════
+ *  Query real VRAM size from RM via FB_GET_INFO_V2 RPC.
+ *
+ *  Boot-time gpu_probe_vram reads PFB_PRI_MMU_LOCAL_MEMORY_RANGE
+ *  directly, but on Ampere+ this register is PRI-locked at probe
+ *  time and returns garbage (97 MB instead of 24 GB). After GSP
+ *  boots and RM is initialized, the canonical way to ask "how
+ *  much VRAM?" is the NV2080_CTRL_CMD_FB_GET_INFO_V2 RPC. The
+ *  reply gives heap+RAM size in KB.
+ *
+ *  Returns the RAM size in MB on success, 0 on failure.
+ *  ══════════════════════════════════════════════════════════ */
+
+#define NV2080_CTRL_CMD_FB_GET_INFO_V2          0x20801301
+#define NV2080_CTRL_FB_INFO_INDEX_RAM_SIZE      0x4
+
+typedef struct {
+    uint32_t index;
+    uint32_t data;
+} nv2080_fb_info_t;
+
+typedef struct {
+    uint32_t fbInfoListSize;
+    nv2080_fb_info_t fbInfoList[8];
+} nv2080_fb_get_info_v2_params_t;
+
+uint32_t gsp_query_vram_mb(void)
+{
+    if (!gsp.rm_init_done) return 0;
+
+    nv2080_fb_get_info_v2_params_t params = {0};
+    params.fbInfoListSize = 1;
+    params.fbInfoList[0].index = NV2080_CTRL_FB_INFO_INDEX_RAM_SIZE;
+    params.fbInfoList[0].data  = 0;
+
+    int ret = gsp_rm_control(GSP_RM_SUBDEVICE_HANDLE,
+                             NV2080_CTRL_CMD_FB_GET_INFO_V2,
+                             &params, sizeof(params));
+    if (ret != 0) {
+        serial_puts("[GSP] FB_GET_INFO_V2 RPC failed\n");
+        return 0;
+    }
+
+    /* params.fbInfoList[0].data is RAM size in KB. */
+    uint32_t kb = params.fbInfoList[0].data;
+    uint32_t mb = kb / 1024;
+    serial_puts("[GSP] FB_GET_INFO_V2: RAM=");
+    serial_putdec(mb);
+    serial_puts(" MB\n");
+    return mb;
+}
+
+/* ══════════════════════════════════════════════════════════
  *  X33: Channel + GPFIFO
  *
  *  Allocate a GPU compute channel via RM:

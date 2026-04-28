@@ -1044,6 +1044,11 @@ int  gsp_rm_init(void);        /* 7-step RM init sequence */
 /* X32: Generic RM alloc/control */
 int  gsp_rm_alloc(uint32_t hParent, uint32_t hObject, uint32_t hClass,
                   const void *params, uint32_t params_size);
+/* Query real VRAM size via FB_GET_INFO_V2 RPC. Returns MB, 0 on failure.
+ * Only valid after gsp.rm_init_done. Use this instead of gpu.probe.vram_size_mb
+ * (which reads a PRI-locked register at boot and returns garbage on Ampere+). */
+uint32_t gsp_query_vram_mb(void);
+
 int  gsp_rm_control(uint32_t hObject, uint32_t cmd,
                     const void *params, uint32_t params_size);
 
