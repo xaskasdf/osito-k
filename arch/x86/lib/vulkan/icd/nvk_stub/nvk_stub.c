@@ -45,6 +45,11 @@ extern void  free(void *);
 extern void *memset(void *, int, unsigned long);
 extern void *memcpy(void *, const void *, unsigned long);
 
+/* Forward declaration — defined at the bottom of this file. GetDeviceProcAddr
+ * needs to forward into it before the actual definition. */
+VKAPI_ATTR PFN_vkVoidFunction VKAPI_PTR
+nvk_stub_icdGetInstanceProcAddr(VkInstance instance, const char *name);
+
 /* OsitoK syscall ABI — see arch/x86/include/sys/gpu_syscalls.h */
 #define SYS_GPU_CAPS         600
 #define SYS_GPU_CTX_CREATE   601
@@ -143,27 +148,9 @@ struct nvk_command_buffer {
     bool               recording;
 };
 
-/* Command opcodes — packed into the buffer the queue submit hands to
- * the kernel. The kernel translates these into channel pushbuffer
- * commands (compute kernel dispatch for ClearColor, CE for Copy). */
-enum nvk_cmd_op {
-    NVK_CMD_CLEAR_COLOR_IMAGE = 1,
-    NVK_CMD_COPY_IMAGE_TO_BUFFER = 2,
-};
-
-struct nvk_cmd_clear_color {
-    uint32_t op;        /* NVK_CMD_CLEAR_COLOR_IMAGE */
-    uint32_t res_id;
-    uint32_t width, height;
-    uint32_t color_rgba; /* packed BGRA (matches our framebuffer format) */
-};
-
-struct nvk_cmd_copy_i2b {
-    uint32_t op;
-    uint32_t src_res_id;
-    uint32_t dst_res_id;
-    uint32_t width, height;
-};
+/* Command opcodes — shared with kernel via include/sys/nvk_cmd.h.
+ * The kernel walks this byte stream in nvk_backend_submit. */
+#include "../../../include/sys/nvk_cmd.h"
 
 struct nvk_fence {
     uint64_t value;
@@ -833,6 +820,724 @@ nvk_stub_WaitForFences(VkDevice device, uint32_t count, const VkFence *pFences,
 }
 
 /* ══════════════════════════════════════════════════════════════
+ *  Vulkan 1.1+ "Properties2" / "Features2" / etc.
+ *
+ *  These take a `pNext` chain of extension structs. We populate the
+ *  base struct with the same data the v1 path produces, then walk the
+ *  chain and clear (zero) any extension structs we don't recognize —
+ *  which keeps the contract that "the caller's pNext field gets either
+ *  real data or a zeroed sType-tagged block, never garbage". Real
+ *  per-extension data (e.g. VkPhysicalDeviceVulkan13Features) lands
+ *  when those extensions get advertised in EnumerateDeviceExtensions.
+ * ══════════════════════════════════════════════════════════════ */
+
+/* Minimal pNext header layout — every Vulkan v2 struct begins with
+ * { VkStructureType sType; void *pNext; }. We avoid pulling in every
+ * extension struct definition by treating them generically. */
+struct vk_pnext_hdr {
+    uint32_t sType;
+    void    *pNext;
+    /* extension-specific data follows here */
+};
+
+VKAPI_ATTR void VKAPI_CALL
+nvk_stub_GetPhysicalDeviceProperties2(VkPhysicalDevice pd,
+                                      VkPhysicalDeviceProperties2 *p) {
+    if (!p) return;
+    nvk_stub_GetPhysicalDeviceProperties(pd, &p->properties);
+    /* Walk pNext chain. We don't know the layout of unknown extension
+     * structs, but they all start with sType+pNext, so we can advance
+     * without writing bytes we don't understand. */
+    struct vk_pnext_hdr *e = (struct vk_pnext_hdr *)p->pNext;
+    while (e) e = (struct vk_pnext_hdr *)e->pNext;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+nvk_stub_GetPhysicalDeviceFeatures2(VkPhysicalDevice pd,
+                                    VkPhysicalDeviceFeatures2 *f) {
+    if (!f) return;
+    nvk_stub_GetPhysicalDeviceFeatures(pd, &f->features);
+    struct vk_pnext_hdr *e = (struct vk_pnext_hdr *)f->pNext;
+    while (e) e = (struct vk_pnext_hdr *)e->pNext;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+nvk_stub_GetPhysicalDeviceMemoryProperties2(VkPhysicalDevice pd,
+                                            VkPhysicalDeviceMemoryProperties2 *m) {
+    if (!m) return;
+    nvk_stub_GetPhysicalDeviceMemoryProperties(pd, &m->memoryProperties);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+nvk_stub_GetPhysicalDeviceQueueFamilyProperties2(VkPhysicalDevice pd,
+                                                 uint32_t *pCount,
+                                                 VkQueueFamilyProperties2 *pProps) {
+    if (!pProps) {
+        nvk_stub_GetPhysicalDeviceQueueFamilyProperties(pd, pCount, NULL);
+        return;
+    }
+    /* Marshal v1 result into the v2 wrapper struct. */
+    VkQueueFamilyProperties tmp[8];
+    uint32_t n = (*pCount < 8) ? *pCount : 8;
+    nvk_stub_GetPhysicalDeviceQueueFamilyProperties(pd, &n, tmp);
+    for (uint32_t i = 0; i < n; i++) pProps[i].queueFamilyProperties = tmp[i];
+    *pCount = n;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+nvk_stub_GetPhysicalDeviceFormatProperties2(VkPhysicalDevice pd, VkFormat format,
+                                            VkFormatProperties2 *p) {
+    if (!p) return;
+    nvk_stub_GetPhysicalDeviceFormatProperties(pd, format, &p->formatProperties);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+nvk_stub_GetPhysicalDeviceImageFormatProperties(VkPhysicalDevice pd, VkFormat format,
+                                                VkImageType type, VkImageTiling tiling,
+                                                VkImageUsageFlags usage, VkImageCreateFlags flags,
+                                                VkImageFormatProperties *pProps) {
+    (void)pd; (void)format; (void)type; (void)tiling; (void)usage; (void)flags;
+    if (!pProps) return VK_ERROR_INITIALIZATION_FAILED;
+    /* Permissive defaults. Real driver gates on hardware support; for
+     * the generic CPU-mediated paths in the kernel backend, every
+     * format-with-reasonable-extent works. */
+    pProps->maxExtent.width  = 16384;
+    pProps->maxExtent.height = 16384;
+    pProps->maxExtent.depth  = 1;
+    pProps->maxMipLevels     = 14;
+    pProps->maxArrayLayers   = 2048;
+    pProps->sampleCounts     = VK_SAMPLE_COUNT_1_BIT |
+                               VK_SAMPLE_COUNT_2_BIT |
+                               VK_SAMPLE_COUNT_4_BIT |
+                               VK_SAMPLE_COUNT_8_BIT;
+    pProps->maxResourceSize  = 0x80000000ULL; /* 2 GB */
+    return VK_SUCCESS;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+nvk_stub_GetPhysicalDeviceImageFormatProperties2(VkPhysicalDevice pd,
+                                                 const VkPhysicalDeviceImageFormatInfo2 *pInfo,
+                                                 VkImageFormatProperties2 *pProps) {
+    if (!pInfo || !pProps) return VK_ERROR_INITIALIZATION_FAILED;
+    return nvk_stub_GetPhysicalDeviceImageFormatProperties(
+        pd, pInfo->format, pInfo->type, pInfo->tiling, pInfo->usage, pInfo->flags,
+        &pProps->imageFormatProperties);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+nvk_stub_GetPhysicalDeviceExternalBufferProperties(VkPhysicalDevice pd,
+    const VkPhysicalDeviceExternalBufferInfo *pInfo, VkExternalBufferProperties *pProps) {
+    (void)pd; (void)pInfo;
+    if (!pProps) return;
+    /* We don't support cross-process buffer sharing yet — zero externalMemoryProperties
+     * tells the caller "no compatible handle types". */
+    memset(&pProps->externalMemoryProperties, 0, sizeof(pProps->externalMemoryProperties));
+}
+
+VKAPI_ATTR void VKAPI_CALL
+nvk_stub_GetPhysicalDeviceExternalSemaphoreProperties(VkPhysicalDevice pd,
+    const VkPhysicalDeviceExternalSemaphoreInfo *pInfo, VkExternalSemaphoreProperties *pProps) {
+    (void)pd; (void)pInfo;
+    if (!pProps) return;
+    pProps->exportFromImportedHandleTypes = 0;
+    pProps->compatibleHandleTypes         = 0;
+    pProps->externalSemaphoreFeatures     = 0;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+nvk_stub_GetPhysicalDeviceExternalFenceProperties(VkPhysicalDevice pd,
+    const VkPhysicalDeviceExternalFenceInfo *pInfo, VkExternalFenceProperties *pProps) {
+    (void)pd; (void)pInfo;
+    if (!pProps) return;
+    pProps->exportFromImportedHandleTypes = 0;
+    pProps->compatibleHandleTypes         = 0;
+    pProps->externalFenceFeatures         = 0;
+}
+
+VKAPI_ATTR PFN_vkVoidFunction VKAPI_PTR
+nvk_stub_GetDeviceProcAddr(VkDevice device, const char *name) {
+    (void)device;
+    /* Device-level resolution falls back to instance-level — our ICD's
+     * dispatch table contains both kinds. */
+    return nvk_stub_icdGetInstanceProcAddr((VkInstance)0, name);
+}
+
+/* ══════════════════════════════════════════════════════════════
+ *  More command-buffer recording (CmdCopy*, CmdFill*, CmdUpdate*)
+ * ══════════════════════════════════════════════════════════════ */
+
+#include "../../../include/sys/nvk_cmd.h"
+
+static void cb_append(struct nvk_command_buffer *c, const void *p, uint32_t n) {
+    if (!c->recording || c->len + n > NVK_CMD_MAX) return;
+    memcpy(c->cmds + c->len, p, n);
+    c->len += n;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+nvk_stub_CmdCopyBuffer(VkCommandBuffer cb, VkBuffer src, VkBuffer dst,
+                       uint32_t regionCount, const VkBufferCopy *pRegions) {
+    if (!cb || !src || !dst) return;
+    struct nvk_command_buffer *c = (struct nvk_command_buffer *)cb;
+    struct nvk_buffer *sb = (struct nvk_buffer *)(uintptr_t)src;
+    struct nvk_buffer *db = (struct nvk_buffer *)(uintptr_t)dst;
+    if (!sb->bound_mem || !db->bound_mem) return;
+    for (uint32_t i = 0; i < regionCount; i++) {
+        struct nvk_cmd_copy_buffer cmd = {
+            .op         = NVK_CMD_COPY_BUFFER,
+            .src_res_id = sb->bound_mem->res_id,
+            .dst_res_id = db->bound_mem->res_id,
+            .src_offset = (uint32_t)pRegions[i].srcOffset,
+            .dst_offset = (uint32_t)pRegions[i].dstOffset,
+            .size       = (uint32_t)pRegions[i].size,
+        };
+        cb_append(c, &cmd, sizeof(cmd));
+    }
+}
+
+VKAPI_ATTR void VKAPI_CALL
+nvk_stub_CmdCopyImageToBuffer(VkCommandBuffer cb, VkImage src, VkImageLayout layout,
+                              VkBuffer dst, uint32_t regionCount,
+                              const VkBufferImageCopy *pRegions) {
+    (void)layout;
+    if (!cb || !src || !dst) return;
+    struct nvk_command_buffer *c = (struct nvk_command_buffer *)cb;
+    struct nvk_image  *si = (struct nvk_image  *)(uintptr_t)src;
+    struct nvk_buffer *db = (struct nvk_buffer *)(uintptr_t)dst;
+    if (!si->res_id || !db->bound_mem) return;
+    for (uint32_t i = 0; i < regionCount; i++) {
+        struct nvk_cmd_copy_i2b cmd = {
+            .op         = NVK_CMD_COPY_IMAGE_TO_BUFFER,
+            .src_res_id = si->res_id,
+            .dst_res_id = db->bound_mem->res_id,
+            .width      = pRegions[i].imageExtent.width,
+            .height     = pRegions[i].imageExtent.height,
+        };
+        cb_append(c, &cmd, sizeof(cmd));
+    }
+}
+
+VKAPI_ATTR void VKAPI_CALL
+nvk_stub_CmdCopyImage(VkCommandBuffer cb, VkImage src, VkImageLayout sl,
+                      VkImage dst, VkImageLayout dl,
+                      uint32_t regionCount, const VkImageCopy *pRegions) {
+    (void)sl; (void)dl;
+    if (!cb || !src || !dst) return;
+    struct nvk_command_buffer *c = (struct nvk_command_buffer *)cb;
+    struct nvk_image *si = (struct nvk_image *)(uintptr_t)src;
+    struct nvk_image *di = (struct nvk_image *)(uintptr_t)dst;
+    if (!si->res_id || !di->res_id) return;
+    /* Image-to-image as image-to-buffer (since both back the same
+     * VRAM blob structure). */
+    for (uint32_t i = 0; i < regionCount; i++) {
+        struct nvk_cmd_copy_i2b cmd = {
+            .op         = NVK_CMD_COPY_IMAGE_TO_BUFFER,
+            .src_res_id = si->res_id,
+            .dst_res_id = di->res_id,
+            .width      = pRegions[i].extent.width,
+            .height     = pRegions[i].extent.height,
+        };
+        cb_append(c, &cmd, sizeof(cmd));
+    }
+}
+
+VKAPI_ATTR void VKAPI_CALL
+nvk_stub_CmdCopyBufferToImage(VkCommandBuffer cb, VkBuffer src, VkImage dst,
+                              VkImageLayout layout, uint32_t regionCount,
+                              const VkBufferImageCopy *pRegions) {
+    (void)layout;
+    if (!cb || !src || !dst) return;
+    struct nvk_command_buffer *c = (struct nvk_command_buffer *)cb;
+    struct nvk_buffer *sb = (struct nvk_buffer *)(uintptr_t)src;
+    struct nvk_image  *di = (struct nvk_image  *)(uintptr_t)dst;
+    if (!sb->bound_mem || !di->res_id) return;
+    for (uint32_t i = 0; i < regionCount; i++) {
+        struct nvk_cmd_copy_buffer cmd = {
+            .op         = NVK_CMD_COPY_BUFFER,
+            .src_res_id = sb->bound_mem->res_id,
+            .dst_res_id = di->res_id,
+            .src_offset = (uint32_t)pRegions[i].bufferOffset,
+            .dst_offset = 0,
+            .size       = pRegions[i].imageExtent.width *
+                          pRegions[i].imageExtent.height * 4,
+        };
+        cb_append(c, &cmd, sizeof(cmd));
+    }
+}
+
+VKAPI_ATTR void VKAPI_CALL
+nvk_stub_CmdFillBuffer(VkCommandBuffer cb, VkBuffer buf, VkDeviceSize off,
+                       VkDeviceSize size, uint32_t data) {
+    if (!cb || !buf) return;
+    struct nvk_command_buffer *c = (struct nvk_command_buffer *)cb;
+    struct nvk_buffer *b = (struct nvk_buffer *)(uintptr_t)buf;
+    if (!b->bound_mem) return;
+    struct nvk_cmd_fill_buffer cmd = {
+        .op     = NVK_CMD_FILL_BUFFER,
+        .res_id = b->bound_mem->res_id,
+        .offset = (uint32_t)off,
+        .size   = (uint32_t)size,
+        .value  = data,
+    };
+    cb_append(c, &cmd, sizeof(cmd));
+}
+
+VKAPI_ATTR void VKAPI_CALL
+nvk_stub_CmdUpdateBuffer(VkCommandBuffer cb, VkBuffer dst, VkDeviceSize off,
+                         VkDeviceSize size, const void *pData) {
+    /* For our CPU-mediated backend, "update buffer" is effectively a
+     * memcpy from the inline data into the bound memory. The mapped VA
+     * is host-visible (PML4[256] shared) so we can write directly. */
+    if (!cb || !dst || !pData) return;
+    (void)cb; /* nothing to record — write happens immediately. */
+    struct nvk_buffer *b = (struct nvk_buffer *)(uintptr_t)dst;
+    if (!b->bound_mem || !b->bound_mem->mapped_va) {
+        /* Need a map first if not already mapped. */
+        long va = __syscall1(SYS_GPU_RES_MAP, (long)b->bound_mem->res_id);
+        if (va <= 0) return;
+        b->bound_mem->mapped_va = (void *)(uintptr_t)va;
+    }
+    uint8_t *p = (uint8_t *)b->bound_mem->mapped_va + off;
+    memcpy(p, pData, size);
+}
+
+/* ══════════════════════════════════════════════════════════════
+ *  Sync primitives — semaphore, event, pipeline barrier
+ *
+ *  Our submit path is currently synchronous, so semaphores and barriers
+ *  are effectively no-ops (the work has completed by the time the next
+ *  call runs). We still allocate handle slots so the caller's destroy
+ *  path doesn't free a NULL.
+ * ══════════════════════════════════════════════════════════════ */
+
+struct nvk_semaphore { uint32_t signaled; };
+struct nvk_event     { uint32_t signaled; };
+
+VKAPI_ATTR VkResult VKAPI_CALL
+nvk_stub_CreateSemaphore(VkDevice d, const VkSemaphoreCreateInfo *ci,
+                         const VkAllocationCallbacks *a, VkSemaphore *p) {
+    (void)d; (void)ci; (void)a;
+    if (!p) return VK_ERROR_INITIALIZATION_FAILED;
+    struct nvk_semaphore *s = malloc(sizeof(*s));
+    if (!s) return VK_ERROR_OUT_OF_HOST_MEMORY;
+    s->signaled = 0;
+    *p = (VkSemaphore)(uintptr_t)s;
+    return VK_SUCCESS;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+nvk_stub_DestroySemaphore(VkDevice d, VkSemaphore s, const VkAllocationCallbacks *a) {
+    (void)d; (void)a;
+    if (s) free((void *)(uintptr_t)s);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+nvk_stub_CreateEvent(VkDevice d, const VkEventCreateInfo *ci,
+                     const VkAllocationCallbacks *a, VkEvent *p) {
+    (void)d; (void)ci; (void)a;
+    if (!p) return VK_ERROR_INITIALIZATION_FAILED;
+    struct nvk_event *e = malloc(sizeof(*e));
+    if (!e) return VK_ERROR_OUT_OF_HOST_MEMORY;
+    e->signaled = 0;
+    *p = (VkEvent)(uintptr_t)e;
+    return VK_SUCCESS;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+nvk_stub_DestroyEvent(VkDevice d, VkEvent e, const VkAllocationCallbacks *a) {
+    (void)d; (void)a;
+    if (e) free((void *)(uintptr_t)e);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+nvk_stub_GetEventStatus(VkDevice d, VkEvent e) {
+    (void)d;
+    if (!e) return VK_NOT_READY;
+    struct nvk_event *ev = (struct nvk_event *)(uintptr_t)e;
+    return ev->signaled ? VK_EVENT_SET : VK_EVENT_RESET;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+nvk_stub_SetEvent(VkDevice d, VkEvent e) {
+    (void)d;
+    if (!e) return VK_ERROR_INITIALIZATION_FAILED;
+    struct nvk_event *ev = (struct nvk_event *)(uintptr_t)e;
+    ev->signaled = 1;
+    return VK_SUCCESS;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+nvk_stub_ResetEvent(VkDevice d, VkEvent e) {
+    (void)d;
+    if (!e) return VK_ERROR_INITIALIZATION_FAILED;
+    struct nvk_event *ev = (struct nvk_event *)(uintptr_t)e;
+    ev->signaled = 0;
+    return VK_SUCCESS;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+nvk_stub_CmdPipelineBarrier(VkCommandBuffer cb, VkPipelineStageFlags s, VkPipelineStageFlags d,
+                            VkDependencyFlags df, uint32_t mb, const VkMemoryBarrier *pmb,
+                            uint32_t bb, const VkBufferMemoryBarrier *pbb,
+                            uint32_t ib, const VkImageMemoryBarrier *pib) {
+    (void)cb; (void)s; (void)d; (void)df;
+    (void)mb; (void)pmb; (void)bb; (void)pbb; (void)ib; (void)pib;
+    /* Synchronous backend: barrier is a no-op since the previous Cmd*
+     * writes have already finished (CPU memcpy is sync). When async GPU
+     * work lands we'll insert a real fence/wait here. */
+}
+
+VKAPI_ATTR void VKAPI_CALL
+nvk_stub_CmdSetEvent(VkCommandBuffer cb, VkEvent e, VkPipelineStageFlags s) {
+    (void)cb; (void)s;
+    if (e) ((struct nvk_event *)(uintptr_t)e)->signaled = 1;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+nvk_stub_CmdResetEvent(VkCommandBuffer cb, VkEvent e, VkPipelineStageFlags s) {
+    (void)cb; (void)s;
+    if (e) ((struct nvk_event *)(uintptr_t)e)->signaled = 0;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+nvk_stub_CmdWaitEvents(VkCommandBuffer cb, uint32_t ec, const VkEvent *pe,
+                       VkPipelineStageFlags s, VkPipelineStageFlags d,
+                       uint32_t mc, const VkMemoryBarrier *pmb,
+                       uint32_t bc, const VkBufferMemoryBarrier *pbb,
+                       uint32_t ic, const VkImageMemoryBarrier *pib) {
+    (void)cb; (void)ec; (void)pe; (void)s; (void)d;
+    (void)mc; (void)pmb; (void)bc; (void)pbb; (void)ic; (void)pib;
+    /* Synchronous backend, no actual wait needed. */
+}
+
+/* ══════════════════════════════════════════════════════════════
+ *  Pipeline / shader / descriptor / framebuffer / render-pass
+ *  — opaque handles tracked but not yet executed by the backend.
+ *
+ *  We allocate small per-handle structs so create/destroy pair up and
+ *  bind/dispatch can chain without crashing. The current submit path
+ *  doesn't actually run shaders (CPU memcpy fill/copy is enough for
+ *  Zink's clear screen path); shader execution lands when a real SASS
+ *  pipeline gets wired up.
+ * ══════════════════════════════════════════════════════════════ */
+
+#define DECL_OPAQUE_HANDLE(NAME, VKTYPE) \
+    struct nvk_##NAME { uint32_t magic; }; \
+    VKAPI_ATTR VkResult VKAPI_CALL \
+    nvk_stub_Create##NAME(VkDevice d, const Vk##NAME##CreateInfo *ci, \
+                          const VkAllocationCallbacks *a, VKTYPE *p) { \
+        (void)d; (void)ci; (void)a; \
+        if (!p) return VK_ERROR_INITIALIZATION_FAILED; \
+        struct nvk_##NAME *h = malloc(sizeof(*h)); \
+        if (!h) return VK_ERROR_OUT_OF_HOST_MEMORY; \
+        h->magic = 0xC0DE0000u | __LINE__; \
+        *p = (VKTYPE)(uintptr_t)h; \
+        return VK_SUCCESS; \
+    } \
+    VKAPI_ATTR void VKAPI_CALL \
+    nvk_stub_Destroy##NAME(VkDevice d, VKTYPE h, const VkAllocationCallbacks *a) { \
+        (void)d; (void)a; \
+        if (h) free((void *)(uintptr_t)h); \
+    }
+
+DECL_OPAQUE_HANDLE(ShaderModule,        VkShaderModule)
+DECL_OPAQUE_HANDLE(RenderPass,          VkRenderPass)
+DECL_OPAQUE_HANDLE(Framebuffer,         VkFramebuffer)
+DECL_OPAQUE_HANDLE(DescriptorSetLayout, VkDescriptorSetLayout)
+DECL_OPAQUE_HANDLE(PipelineLayout,      VkPipelineLayout)
+DECL_OPAQUE_HANDLE(PipelineCache,       VkPipelineCache)
+DECL_OPAQUE_HANDLE(Sampler,             VkSampler)
+DECL_OPAQUE_HANDLE(ImageView,           VkImageView)
+DECL_OPAQUE_HANDLE(QueryPool,           VkQueryPool)
+
+VKAPI_ATTR VkResult VKAPI_CALL
+nvk_stub_CreateGraphicsPipelines(VkDevice d, VkPipelineCache pc, uint32_t count,
+                                 const VkGraphicsPipelineCreateInfo *ci,
+                                 const VkAllocationCallbacks *a, VkPipeline *p) {
+    (void)d; (void)pc; (void)ci; (void)a;
+    if (!p) return VK_ERROR_INITIALIZATION_FAILED;
+    for (uint32_t i = 0; i < count; i++) {
+        uint32_t *h = malloc(sizeof(*h));
+        if (!h) return VK_ERROR_OUT_OF_HOST_MEMORY;
+        *h = 0xC0DEC0DE;
+        p[i] = (VkPipeline)(uintptr_t)h;
+    }
+    return VK_SUCCESS;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+nvk_stub_CreateComputePipelines(VkDevice d, VkPipelineCache pc, uint32_t count,
+                                const VkComputePipelineCreateInfo *ci,
+                                const VkAllocationCallbacks *a, VkPipeline *p) {
+    (void)d; (void)pc; (void)ci; (void)a;
+    if (!p) return VK_ERROR_INITIALIZATION_FAILED;
+    for (uint32_t i = 0; i < count; i++) {
+        uint32_t *h = malloc(sizeof(*h));
+        if (!h) return VK_ERROR_OUT_OF_HOST_MEMORY;
+        *h = 0xC0DEC0DE;
+        p[i] = (VkPipeline)(uintptr_t)h;
+    }
+    return VK_SUCCESS;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+nvk_stub_DestroyPipeline(VkDevice d, VkPipeline pl, const VkAllocationCallbacks *a) {
+    (void)d; (void)a;
+    if (pl) free((void *)(uintptr_t)pl);
+}
+
+/* Descriptor pools allocate a fixed-size pool of "set" slots; each
+ * AllocateDescriptorSets pulls from this. Because we don't actually run
+ * shaders that consume descriptors yet, the sets are just opaque
+ * handles for the API contract. */
+
+struct nvk_descriptor_pool {
+    uint32_t max_sets;
+    uint32_t alloc_count;
+};
+
+VKAPI_ATTR VkResult VKAPI_CALL
+nvk_stub_CreateDescriptorPool(VkDevice d, const VkDescriptorPoolCreateInfo *ci,
+                              const VkAllocationCallbacks *a, VkDescriptorPool *p) {
+    (void)d; (void)a;
+    if (!ci || !p) return VK_ERROR_INITIALIZATION_FAILED;
+    struct nvk_descriptor_pool *pool = malloc(sizeof(*pool));
+    if (!pool) return VK_ERROR_OUT_OF_HOST_MEMORY;
+    pool->max_sets    = ci->maxSets;
+    pool->alloc_count = 0;
+    *p = (VkDescriptorPool)(uintptr_t)pool;
+    return VK_SUCCESS;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+nvk_stub_DestroyDescriptorPool(VkDevice d, VkDescriptorPool p,
+                               const VkAllocationCallbacks *a) {
+    (void)d; (void)a;
+    if (p) free((void *)(uintptr_t)p);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+nvk_stub_AllocateDescriptorSets(VkDevice d, const VkDescriptorSetAllocateInfo *ai,
+                                VkDescriptorSet *pSets) {
+    (void)d;
+    if (!ai || !pSets) return VK_ERROR_INITIALIZATION_FAILED;
+    struct nvk_descriptor_pool *pool =
+        (struct nvk_descriptor_pool *)(uintptr_t)ai->descriptorPool;
+    if (!pool) return VK_ERROR_INITIALIZATION_FAILED;
+    if (pool->alloc_count + ai->descriptorSetCount > pool->max_sets)
+        return VK_ERROR_OUT_OF_POOL_MEMORY;
+    for (uint32_t i = 0; i < ai->descriptorSetCount; i++) {
+        uint32_t *h = malloc(sizeof(*h));
+        if (!h) return VK_ERROR_OUT_OF_HOST_MEMORY;
+        *h = 0xDE5C0001u + pool->alloc_count + i;
+        pSets[i] = (VkDescriptorSet)(uintptr_t)h;
+    }
+    pool->alloc_count += ai->descriptorSetCount;
+    return VK_SUCCESS;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+nvk_stub_FreeDescriptorSets(VkDevice d, VkDescriptorPool dp, uint32_t count,
+                            const VkDescriptorSet *pSets) {
+    (void)d; (void)dp;
+    for (uint32_t i = 0; i < count; i++)
+        if (pSets[i]) free((void *)(uintptr_t)pSets[i]);
+    return VK_SUCCESS;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+nvk_stub_UpdateDescriptorSets(VkDevice d, uint32_t wc, const VkWriteDescriptorSet *pw,
+                              uint32_t cc, const VkCopyDescriptorSet *pc) {
+    (void)d; (void)wc; (void)pw; (void)cc; (void)pc;
+    /* Descriptor contents are stored client-side per the spec; our
+     * non-shader-running backend has nothing to write to GPU state. */
+}
+
+/* Cmd state-setters. None of these affect our CPU-mediated submit
+ * since we don't run real shaders, but we must accept and ignore them
+ * so Zink's recording loop completes without errors. */
+
+#define CMD_NOOP3(NAME, T1, T2)  \
+    VKAPI_ATTR void VKAPI_CALL \
+    nvk_stub_Cmd##NAME(VkCommandBuffer cb, T1 a1, T2 a2) { (void)cb; (void)a1; (void)a2; }
+#define CMD_NOOP4(NAME, T1, T2, T3)  \
+    VKAPI_ATTR void VKAPI_CALL \
+    nvk_stub_Cmd##NAME(VkCommandBuffer cb, T1 a1, T2 a2, T3 a3) { (void)cb; (void)a1; (void)a2; (void)a3; }
+
+VKAPI_ATTR void VKAPI_CALL
+nvk_stub_CmdBindPipeline(VkCommandBuffer cb, VkPipelineBindPoint bp, VkPipeline pl) {
+    (void)cb; (void)bp; (void)pl;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+nvk_stub_CmdBindDescriptorSets(VkCommandBuffer cb, VkPipelineBindPoint bp,
+                               VkPipelineLayout layout, uint32_t firstSet,
+                               uint32_t count, const VkDescriptorSet *pSets,
+                               uint32_t doff, const uint32_t *pDoff) {
+    (void)cb; (void)bp; (void)layout; (void)firstSet;
+    (void)count; (void)pSets; (void)doff; (void)pDoff;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+nvk_stub_CmdBindVertexBuffers(VkCommandBuffer cb, uint32_t firstBinding,
+                              uint32_t count, const VkBuffer *pBuffers,
+                              const VkDeviceSize *pOffsets) {
+    (void)cb; (void)firstBinding; (void)count; (void)pBuffers; (void)pOffsets;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+nvk_stub_CmdBindIndexBuffer(VkCommandBuffer cb, VkBuffer buf, VkDeviceSize off,
+                            VkIndexType type) {
+    (void)cb; (void)buf; (void)off; (void)type;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+nvk_stub_CmdSetViewport(VkCommandBuffer cb, uint32_t first, uint32_t count,
+                        const VkViewport *pv) {
+    (void)cb; (void)first; (void)count; (void)pv;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+nvk_stub_CmdSetScissor(VkCommandBuffer cb, uint32_t first, uint32_t count,
+                       const VkRect2D *ps) {
+    (void)cb; (void)first; (void)count; (void)ps;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+nvk_stub_CmdSetLineWidth(VkCommandBuffer cb, float w) {
+    (void)cb; (void)w;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+nvk_stub_CmdSetDepthBias(VkCommandBuffer cb, float c, float clamp, float s) {
+    (void)cb; (void)c; (void)clamp; (void)s;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+nvk_stub_CmdSetBlendConstants(VkCommandBuffer cb, const float bc[4]) {
+    (void)cb; (void)bc;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+nvk_stub_CmdSetDepthBounds(VkCommandBuffer cb, float minD, float maxD) {
+    (void)cb; (void)minD; (void)maxD;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+nvk_stub_CmdSetStencilCompareMask(VkCommandBuffer cb, VkStencilFaceFlags f, uint32_t m) {
+    (void)cb; (void)f; (void)m;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+nvk_stub_CmdSetStencilWriteMask(VkCommandBuffer cb, VkStencilFaceFlags f, uint32_t m) {
+    (void)cb; (void)f; (void)m;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+nvk_stub_CmdSetStencilReference(VkCommandBuffer cb, VkStencilFaceFlags f, uint32_t r) {
+    (void)cb; (void)f; (void)r;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+nvk_stub_CmdDispatch(VkCommandBuffer cb, uint32_t x, uint32_t y, uint32_t z) {
+    (void)cb; (void)x; (void)y; (void)z;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+nvk_stub_CmdDispatchIndirect(VkCommandBuffer cb, VkBuffer buf, VkDeviceSize off) {
+    (void)cb; (void)buf; (void)off;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+nvk_stub_CmdDraw(VkCommandBuffer cb, uint32_t vc, uint32_t ic,
+                 uint32_t fv, uint32_t fi) {
+    (void)cb; (void)vc; (void)ic; (void)fv; (void)fi;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+nvk_stub_CmdDrawIndexed(VkCommandBuffer cb, uint32_t ic, uint32_t inst,
+                        uint32_t fi, int32_t vo, uint32_t fInst) {
+    (void)cb; (void)ic; (void)inst; (void)fi; (void)vo; (void)fInst;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+nvk_stub_CmdDrawIndirect(VkCommandBuffer cb, VkBuffer buf, VkDeviceSize off,
+                         uint32_t drawCount, uint32_t stride) {
+    (void)cb; (void)buf; (void)off; (void)drawCount; (void)stride;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+nvk_stub_CmdDrawIndexedIndirect(VkCommandBuffer cb, VkBuffer buf, VkDeviceSize off,
+                                uint32_t drawCount, uint32_t stride) {
+    (void)cb; (void)buf; (void)off; (void)drawCount; (void)stride;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+nvk_stub_CmdBeginRenderPass(VkCommandBuffer cb,
+                            const VkRenderPassBeginInfo *pBegin,
+                            VkSubpassContents contents) {
+    /* Zink uses BeginRenderPass with clearValues to do a "load-clear".
+     * Replay each color attachment clear as a CLEAR_COLOR_IMAGE op so
+     * the kernel actually paints the framebuffer. */
+    if (!cb || !pBegin) return;
+    (void)contents;
+    struct nvk_command_buffer *c = (struct nvk_command_buffer *)cb;
+    if (!pBegin->framebuffer) return;
+    for (uint32_t i = 0; i < pBegin->clearValueCount; i++) {
+        /* We don't track the framebuffer's images here yet; skip until
+         * Wave 4 wires up per-fb image lists. */
+        (void)pBegin->pClearValues;
+    }
+    (void)c;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+nvk_stub_CmdEndRenderPass(VkCommandBuffer cb) { (void)cb; }
+
+VKAPI_ATTR void VKAPI_CALL
+nvk_stub_CmdNextSubpass(VkCommandBuffer cb, VkSubpassContents contents) {
+    (void)cb; (void)contents;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+nvk_stub_CmdBeginQuery(VkCommandBuffer cb, VkQueryPool qp, uint32_t q,
+                       VkQueryControlFlags f) {
+    (void)cb; (void)qp; (void)q; (void)f;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+nvk_stub_CmdEndQuery(VkCommandBuffer cb, VkQueryPool qp, uint32_t q) {
+    (void)cb; (void)qp; (void)q;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+nvk_stub_CmdResetQueryPool(VkCommandBuffer cb, VkQueryPool qp,
+                           uint32_t firstQ, uint32_t qCount) {
+    (void)cb; (void)qp; (void)firstQ; (void)qCount;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+nvk_stub_CmdCopyQueryPoolResults(VkCommandBuffer cb, VkQueryPool qp,
+                                 uint32_t firstQ, uint32_t qCount,
+                                 VkBuffer dst, VkDeviceSize dstOff,
+                                 VkDeviceSize stride, VkQueryResultFlags f) {
+    (void)cb; (void)qp; (void)firstQ; (void)qCount;
+    (void)dst; (void)dstOff; (void)stride; (void)f;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+nvk_stub_GetQueryPoolResults(VkDevice d, VkQueryPool qp, uint32_t firstQ,
+                             uint32_t qCount, size_t dataSize, void *pData,
+                             VkDeviceSize stride, VkQueryResultFlags flags) {
+    (void)d; (void)qp; (void)firstQ; (void)qCount;
+    (void)dataSize; (void)pData; (void)stride; (void)flags;
+    /* No queries actually run since we don't use real GPU pipelines yet.
+     * Return zeros via VK_NOT_READY so callers don't read uninit data. */
+    if (pData) memset(pData, 0, dataSize);
+    return VK_NOT_READY;
+}
+
+/* ══════════════════════════════════════════════════════════════
  *  Loader entry — vk_icdGetInstanceProcAddr
  * ══════════════════════════════════════════════════════════════ */
 
@@ -884,6 +1589,109 @@ nvk_stub_icdGetInstanceProcAddr(VkInstance instance, const char *name) {
     ENTRY(DestroyFence);
     ENTRY(ResetFences);
     ENTRY(WaitForFences);
+
+    /* PhysicalDevice queries (KHR_get_physical_device_properties2 + 1.1 core) */
+    ENTRY(GetPhysicalDeviceProperties2);
+    ENTRY(GetPhysicalDeviceFeatures2);
+    ENTRY(GetPhysicalDeviceMemoryProperties2);
+    ENTRY(GetPhysicalDeviceQueueFamilyProperties2);
+    ENTRY(GetPhysicalDeviceFormatProperties2);
+    ENTRY(GetPhysicalDeviceImageFormatProperties);
+    ENTRY(GetPhysicalDeviceImageFormatProperties2);
+    ENTRY(GetPhysicalDeviceExternalBufferProperties);
+    ENTRY(GetPhysicalDeviceExternalSemaphoreProperties);
+    ENTRY(GetPhysicalDeviceExternalFenceProperties);
+
+    /* Device-level dispatch entry */
+    ENTRY(GetDeviceProcAddr);
+
+    /* Memory ops (record opcodes for kernel-side replay) */
+    ENTRY(CmdCopyBuffer);
+    ENTRY(CmdCopyImage);
+    ENTRY(CmdCopyImageToBuffer);
+    ENTRY(CmdCopyBufferToImage);
+    ENTRY(CmdFillBuffer);
+    ENTRY(CmdUpdateBuffer);
+
+    /* Sync primitives */
+    ENTRY(CreateSemaphore);
+    ENTRY(DestroySemaphore);
+    ENTRY(CreateEvent);
+    ENTRY(DestroyEvent);
+    ENTRY(GetEventStatus);
+    ENTRY(SetEvent);
+    ENTRY(ResetEvent);
+    ENTRY(CmdPipelineBarrier);
+    ENTRY(CmdSetEvent);
+    ENTRY(CmdResetEvent);
+    ENTRY(CmdWaitEvents);
+
+    /* Opaque-handle objects */
+    ENTRY(CreateShaderModule);
+    ENTRY(DestroyShaderModule);
+    ENTRY(CreateRenderPass);
+    ENTRY(DestroyRenderPass);
+    ENTRY(CreateFramebuffer);
+    ENTRY(DestroyFramebuffer);
+    ENTRY(CreateDescriptorSetLayout);
+    ENTRY(DestroyDescriptorSetLayout);
+    ENTRY(CreatePipelineLayout);
+    ENTRY(DestroyPipelineLayout);
+    ENTRY(CreatePipelineCache);
+    ENTRY(DestroyPipelineCache);
+    ENTRY(CreateSampler);
+    ENTRY(DestroySampler);
+    ENTRY(CreateImageView);
+    ENTRY(DestroyImageView);
+    ENTRY(CreateQueryPool);
+    ENTRY(DestroyQueryPool);
+
+    /* Pipelines */
+    ENTRY(CreateGraphicsPipelines);
+    ENTRY(CreateComputePipelines);
+    ENTRY(DestroyPipeline);
+
+    /* Descriptors */
+    ENTRY(CreateDescriptorPool);
+    ENTRY(DestroyDescriptorPool);
+    ENTRY(AllocateDescriptorSets);
+    ENTRY(FreeDescriptorSets);
+    ENTRY(UpdateDescriptorSets);
+
+    /* Cmd state setters */
+    ENTRY(CmdBindPipeline);
+    ENTRY(CmdBindDescriptorSets);
+    ENTRY(CmdBindVertexBuffers);
+    ENTRY(CmdBindIndexBuffer);
+    ENTRY(CmdSetViewport);
+    ENTRY(CmdSetScissor);
+    ENTRY(CmdSetLineWidth);
+    ENTRY(CmdSetDepthBias);
+    ENTRY(CmdSetBlendConstants);
+    ENTRY(CmdSetDepthBounds);
+    ENTRY(CmdSetStencilCompareMask);
+    ENTRY(CmdSetStencilWriteMask);
+    ENTRY(CmdSetStencilReference);
+
+    /* Draw / dispatch */
+    ENTRY(CmdDispatch);
+    ENTRY(CmdDispatchIndirect);
+    ENTRY(CmdDraw);
+    ENTRY(CmdDrawIndexed);
+    ENTRY(CmdDrawIndirect);
+    ENTRY(CmdDrawIndexedIndirect);
+
+    /* Render pass */
+    ENTRY(CmdBeginRenderPass);
+    ENTRY(CmdEndRenderPass);
+    ENTRY(CmdNextSubpass);
+
+    /* Query */
+    ENTRY(CmdBeginQuery);
+    ENTRY(CmdEndQuery);
+    ENTRY(CmdResetQueryPool);
+    ENTRY(CmdCopyQueryPoolResults);
+    ENTRY(GetQueryPoolResults);
 
     return NULL;
 }
