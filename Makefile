@@ -1,197 +1,43 @@
 #
-# OsitoK v0.1 - Makefile
-# Bare-metal preemptive kernel for ESP8266 (Wemos D1)
+# OsitoK — root Makefile (delegator)
 #
+# Each architecture lives under arch/<arch>/ with its own Makefile.
+# This top-level Makefile just dispatches to the right one.
+#
+#   make            → builds the default arch (Xtensa / ESP8266)
+#   make xtensa     → ESP8266 (Wemos D1, Xtensa LX106 @ 80MHz)
+#   make x86        → x86_64 bare-metal AI OS (UEFI, requires gnu-efi)
+#   make arm        → AArch64 (SM8350, ROG Phone 5)
+#   make wasm       → wasm32 hosted build
+#   make clean-all  → wipe build artifacts in every arch
+#
+# The legacy `make flash` target stays at this level for muscle memory:
+# it forwards to arch/xtensa/.
 
-# Toolchain
-TOOLCHAIN ?= xtensa-lx106-elf
-CC      = $(TOOLCHAIN)-gcc
-CXX     = $(TOOLCHAIN)-g++
-AS      = $(TOOLCHAIN)-gcc
-LD      = $(TOOLCHAIN)-gcc
-OBJCOPY = $(TOOLCHAIN)-objcopy
-OBJDUMP = $(TOOLCHAIN)-objdump
-SIZE    = $(TOOLCHAIN)-size
+.DEFAULT_GOAL := xtensa
 
-# Feature flags (1=enabled, 0=disabled)
-ENABLE_ELITE ?= 1
-ENABLE_FORTH ?= 1
-ENABLE_DOOM  ?= 0
+.PHONY: xtensa x86 arm wasm flash clean clean-all
 
-# Python + esptool (auto-detect: python3 on Linux, py on Windows)
-PYTHON  ?= python3
-ESPTOOL  = $(PYTHON) -m esptool
-PORT    ?= /dev/ttyUSB0
-BAUD    ?= 460800
+xtensa:
+	$(MAKE) -C arch/xtensa $(MAKECMDGOALS)
 
-# Directories
-SRCDIR   = src
-INCDIR   = include
-BUILDDIR = build
-LDDIR    = ld
+x86:
+	$(MAKE) -C arch/x86
 
-# Flash parameters (Wemos D1: 4MB, DOUT mode, image v1)
-FLASH_MODE  = dout
-FLASH_SIZE  = 4MB
-FLASH_FREQ  = 40m
-IMAGE_VER   = 1
+arm:
+	$(MAKE) -C arch/arm
 
-# Compiler flags
-COMMON_FLAGS = \
-	-mlongcalls \
-	-mtext-section-literals \
-	-nostdlib \
-	-ffreestanding \
-	-Os \
-	-Wall -Wextra -Wno-unused-parameter \
-	-I$(INCDIR) \
-	-I$(SRCDIR) \
-	-DICACHE_FLASH_ATTR='__attribute__((section(".irom0.text")))' \
-	-DIRAM_ATTR='__attribute__((section(".iram0.text")))' \
-	-DENABLE_ELITE=$(ENABLE_ELITE) \
-	-DENABLE_FORTH=$(ENABLE_FORTH) \
-	-DENABLE_DOOM=$(ENABLE_DOOM)
+wasm:
+	$(MAKE) -C arch/wasm
 
-CFLAGS = $(COMMON_FLAGS) -std=c11
-CXXFLAGS = $(COMMON_FLAGS) -std=c++17 -fno-exceptions -fno-rtti
-ASFLAGS = -mlongcalls -mtext-section-literals -I$(INCDIR) -I$(SRCDIR) \
-	-DENABLE_ELITE=$(ENABLE_ELITE) -DENABLE_FORTH=$(ENABLE_FORTH) -DENABLE_DOOM=$(ENABLE_DOOM)
+flash:
+	$(MAKE) -C arch/xtensa flash
 
-# GCC 10.3 libgcc lacks Xtensa div/mul builtins; find 8.4 libgcc if present
-LIBGCC_COMPAT := $(shell find $(dir $(shell which $(CC) 2>/dev/null)).. \
-	-path '*/8.4.0/libgcc.a' 2>/dev/null | head -1)
-
-LDFLAGS = \
-	-mlongcalls \
-	-nostdlib \
-	-T$(LDDIR)/osito.ld \
-	-L$(LDDIR) \
-	-Wl,--no-check-sections \
-	-Wl,--gc-sections \
-	-Wl,-Map=$(BUILDDIR)/osito.map
-
-# Source files — core (always compiled)
-ASM_SRCS = \
-	$(SRCDIR)/boot/vectors.S \
-	$(SRCDIR)/boot/crt0.S \
-	$(SRCDIR)/kernel/context_switch.S
-
-C_SRCS = \
-	$(SRCDIR)/boot/nosdk_init.c \
-	$(SRCDIR)/kernel/timer_tick.c
-
-CXX_SRCS = \
-	$(SRCDIR)/kernel/sched.cpp \
-	$(SRCDIR)/kernel/sem.cpp \
-	$(SRCDIR)/kernel/mq.cpp \
-	$(SRCDIR)/kernel/timer_sw.cpp \
-	$(SRCDIR)/mem/pool_alloc.cpp \
-	$(SRCDIR)/mem/heap.cpp \
-	$(SRCDIR)/fs/ositofs.cpp \
-	$(SRCDIR)/math/fixedpoint.cpp \
-	$(SRCDIR)/math/matrix3.cpp \
-	$(SRCDIR)/drivers/uart.cpp \
-	$(SRCDIR)/drivers/gpio.cpp \
-	$(SRCDIR)/drivers/adc.cpp \
-	$(SRCDIR)/drivers/input.cpp \
-	$(SRCDIR)/drivers/font.cpp \
-	$(SRCDIR)/drivers/video.cpp \
-	$(SRCDIR)/shell/shell.cpp \
-	$(SRCDIR)/main.cpp
-
-# Feature: Elite wireframe flight demo (~2.1KB IRAM)
-ifeq ($(ENABLE_ELITE),1)
-CXX_SRCS += \
-	$(SRCDIR)/gfx/wire3d.cpp \
-	$(SRCDIR)/gfx/ships.cpp \
-	$(SRCDIR)/game/game.cpp
-endif
-
-# Feature: zForth scripting engine (~4.2KB IRAM)
-ifeq ($(ENABLE_FORTH),1)
-ASM_SRCS += $(SRCDIR)/forth/setjmp.S
-C_SRCS   += $(SRCDIR)/forth/zforth.c
-CXX_SRCS += $(SRCDIR)/forth/zf_host.cpp
-endif
-
-# Feature: DOOM wireframe 2.5D engine (~3.5KB IRAM)
-ifeq ($(ENABLE_DOOM),1)
-CXX_SRCS += \
-	$(SRCDIR)/doom/doom_gen.cpp \
-	$(SRCDIR)/doom/doom_render.cpp \
-	$(SRCDIR)/doom/doom_game.cpp
-endif
-
-# Object files
-ASM_OBJS = $(patsubst $(SRCDIR)/%.S,$(BUILDDIR)/%.o,$(ASM_SRCS))
-C_OBJS   = $(patsubst $(SRCDIR)/%.c,$(BUILDDIR)/%.o,$(C_SRCS))
-CXX_OBJS = $(patsubst $(SRCDIR)/%.cpp,$(BUILDDIR)/%.o,$(CXX_SRCS))
-OBJS     = $(ASM_OBJS) $(C_OBJS) $(CXX_OBJS)
-
-# Output files
-# esptool elf2image with -o build/osito produces build/osito0x00000.bin
-ELF     = $(BUILDDIR)/osito.elf
-BIN_PFX = $(BUILDDIR)/osito
-BIN     = $(BIN_PFX)0x00000.bin
-
-# =============================================================================
-
-.PHONY: all clean flash monitor dump size
-
-all: $(BIN)
-	@echo ""
-	@echo "=== OsitoK build complete ==="
-	@$(SIZE) $(ELF)
-
-# Link
-$(ELF): $(OBJS)
-	@echo "  LD    $@"
-	@$(LD) $(LDFLAGS) -o $@ $^ -lgcc $(wildcard $(LIBGCC_COMPAT))
-
-# Generate flash binary using esptool
-$(BIN): $(ELF)
-	@echo "  BIN   $@"
-	@$(ESPTOOL) --chip esp8266 elf2image \
-		--flash-mode $(FLASH_MODE) --flash-size $(FLASH_SIZE) \
-		--flash-freq $(FLASH_FREQ) --version $(IMAGE_VER) \
-		-o $(BIN_PFX) $<
-
-# Compile assembly
-$(BUILDDIR)/%.o: $(SRCDIR)/%.S
-	@mkdir -p $(dir $@)
-	@echo "  AS    $<"
-	@$(AS) $(ASFLAGS) -c -o $@ $<
-
-# Compile C
-$(BUILDDIR)/%.o: $(SRCDIR)/%.c
-	@mkdir -p $(dir $@)
-	@echo "  CC    $<"
-	@$(CC) $(CFLAGS) -c -o $@ $<
-
-# Compile C++
-$(BUILDDIR)/%.o: $(SRCDIR)/%.cpp
-	@mkdir -p $(dir $@)
-	@echo "  CXX   $<"
-	@$(CXX) $(CXXFLAGS) -c -o $@ $<
-
-# Flash to board
-flash: $(BIN)
-	$(ESPTOOL) --chip esp8266 --port $(PORT) --baud $(BAUD) write-flash \
-		--flash-mode $(FLASH_MODE) --flash-size $(FLASH_SIZE) --flash-freq $(FLASH_FREQ) \
-		0x00000 $(BIN)
-
-# Serial console
-monitor:
-	$(PYTHON) tools/console.py $(PORT)
-
-# Disassembly dump
-dump: $(ELF)
-	$(OBJDUMP) -d -S $< > $(BUILDDIR)/osito.dis
-
-# Size info
-size: $(ELF)
-	$(SIZE) -A $<
-
-# Clean
 clean:
-	rm -rf $(BUILDDIR)
+	$(MAKE) -C arch/xtensa clean
+
+clean-all:
+	-$(MAKE) -C arch/xtensa clean
+	-$(MAKE) -C arch/x86 clean
+	-$(MAKE) -C arch/arm clean
+	-$(MAKE) -C arch/wasm clean
