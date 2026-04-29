@@ -44,6 +44,10 @@ kernel.elf
 UnrealTournament.ini
 "DOOM v1.9"*.zip
 
+# QEMU serial logs from local runs
+serial.*.log
+serial_*.log
+
 # UnrealEngine .int localization files
 *.int
 
