@@ -12,6 +12,32 @@
 extern size_t strlen(const char *s);
 extern void  *malloc(size_t);
 
+/* ---- C11 time -------------------------------------------------------- */
+
+/* gettimeofday is OsitoK syscall 96 — see CLAUDE.md note about libc stub
+ * returning 0; we go direct to the kernel. timespec_get(C11) wraps that
+ * into the canonical timespec form Mesa expects from os_time_get_nano. */
+extern long __syscall2(long n, long a, long b);
+
+struct __osito_timeval { long tv_sec; long tv_usec; };
+struct __osito_timespec { long tv_sec; long tv_nsec; };
+
+#define TIME_UTC       1
+#define TIME_MONOTONIC 1   /* same source on OsitoK (no separate mono clock yet) */
+
+int timespec_get(struct __osito_timespec *ts, int base) {
+    if (!ts) return 0;
+    struct __osito_timeval tv = {0, 0};
+    long rc = __syscall2(96, (long)(unsigned long)&tv, 0);
+    if (rc < 0) { ts->tv_sec = 0; ts->tv_nsec = 0; return 0; }
+    ts->tv_sec  = tv.tv_sec;
+    ts->tv_nsec = tv.tv_usec * 1000;
+    (void)base;
+    return TIME_UTC;
+}
+
+/* (clock_gettime already provided by mesa_compat.h as a static inline.) */
+
 size_t strnlen(const char *s, size_t maxlen) {
     size_t n = 0;
     while (n < maxlen && s[n]) n++;

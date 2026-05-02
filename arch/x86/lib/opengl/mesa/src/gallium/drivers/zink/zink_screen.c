@@ -3273,6 +3273,7 @@ zink_cl_cts_version(struct pipe_screen *pscreen)
 static struct zink_screen *
 zink_internal_create_screen(const struct pipe_screen_config *config, int64_t dev_major, int64_t dev_minor, uint64_t adapter_luid)
 {
+   printf("[ZINK] zink_internal_create_screen: ENTRY\n");
    if (getenv("ZINK_USE_LAVAPIPE")) {
       mesa_loge("ZINK_USE_LAVAPIPE is obsolete. Use LIBGL_ALWAYS_SOFTWARE\n");
       return NULL;
@@ -3280,10 +3281,12 @@ zink_internal_create_screen(const struct pipe_screen_config *config, int64_t dev
 
    struct zink_screen *screen = rzalloc(NULL, struct zink_screen);
    if (!screen) {
+      printf("[ZINK] FAIL step0: rzalloc(zink_screen) returned NULL\n");
       if (!config || !config->driver_name_is_inferred)
          mesa_loge("ZINK: failed to allocate screen");
       return NULL;
    }
+   printf("[ZINK] step0: screen rzalloc OK\n");
 
    screen->driver_name_is_inferred = config && config->driver_name_is_inferred;
    screen->drm_fd = -1;
@@ -3293,11 +3296,14 @@ zink_internal_create_screen(const struct pipe_screen_config *config, int64_t dev
    if (zink_descriptor_mode == ZINK_DESCRIPTOR_MODE_AUTO)
       zink_descriptor_mode = debug_get_option_zink_descriptor_mode();
 
-   screen->threaded = util_get_cpu_caps()->nr_cpus > 1 && debug_get_bool_option("GALLIUM_THREAD", util_get_cpu_caps()->nr_cpus > 1);
-   if (zink_debug & ZINK_DEBUG_FLUSHSYNC)
-      screen->threaded_submit = false;
-   else
-      screen->threaded_submit = screen->threaded;
+   /* OsitoK runs single-threaded in user mode for now (no pthread in libc).
+    * Force-disable the threaded submit + cache queues — util_queue_init
+    * would call thrd_create which our shim returns 1 (error) for, killing
+    * screen creation. Re-enable once the user libc grows real threads. */
+   screen->threaded = false;
+   screen->threaded_submit = false;
+   (void)zink_debug;
+   (void)util_get_cpu_caps;
    screen->abort_on_hang = debug_get_bool_option("ZINK_HANG_ABORT", false);
 
 
@@ -3331,9 +3337,13 @@ zink_internal_create_screen(const struct pipe_screen_config *config, int64_t dev
    simple_mtx_lock(&instance_lock);
    if (++instance_refcount == 1) {
       instance_info.loader_version = zink_get_loader_version(screen);
+      printf("[ZINK] step1: creating instance (loader_version=%u)\n", instance_info.loader_version);
       instance = zink_create_instance(screen, &instance_info);
-      if (!instance)
+      if (!instance) {
+         printf("[ZINK] FAIL step1: zink_create_instance returned NULL\n");
          goto fail;
+      }
+      printf("[ZINK] step1: instance OK (handle=%p)\n", (void*)instance);
    } else {
       assert(instance);
    }
@@ -3365,12 +3375,15 @@ zink_internal_create_screen(const struct pipe_screen_config *config, int64_t dev
          debug_printf("ZINK: failed to setup debug utils\n");
    }
 
+   printf("[ZINK] step2: choose_pdev\n");
    choose_pdev(screen, dev_major, dev_minor, adapter_luid);
    if (screen->pdev == VK_NULL_HANDLE) {
+      printf("[ZINK] FAIL step2: pdev is VK_NULL_HANDLE (no physical device picked)\n");
       if (!screen->driver_name_is_inferred)
          mesa_loge("ZINK: failed to choose pdev");
       goto fail;
    }
+   printf("[ZINK] step2: pdev OK\n");
    screen->is_cpu = screen->info.props.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU;
 
    update_queue_props(screen);
@@ -3383,16 +3396,22 @@ zink_internal_create_screen(const struct pipe_screen_config *config, int64_t dev
                                               VK_FORMAT_D32_SFLOAT_S8_UINT);
    screen->have_dynamic_state_vertex_input_binding_stride = true;
 
+   printf("[ZINK] step3: zink_get_physical_device_info\n");
    if (!zink_get_physical_device_info(screen)) {
+      printf("[ZINK] FAIL step3: zink_get_physical_device_info returned false\n");
       if (!screen->driver_name_is_inferred)
          debug_printf("ZINK: failed to detect features\n");
       goto fail;
    }
+   printf("[ZINK] step3: pdev info OK\n");
 
+   printf("[ZINK] step4: zink_set_driver_strings\n");
    if (zink_set_driver_strings(screen)) {
+      printf("[ZINK] FAIL step4: zink_set_driver_strings returned non-zero\n");
       mesa_loge("ZINK: failed to set driver strings\n");
       goto fail;
    }
+   printf("[ZINK] step4: driver strings OK\n");
 
    memset(&screen->heap_map, UINT8_MAX, sizeof(screen->heap_map));
    for (enum zink_heap i = 0; i < ZINK_HEAP_MAX; i++) {
@@ -3443,7 +3462,10 @@ zink_internal_create_screen(const struct pipe_screen_config *config, int64_t dev
    }
 
    zink_internal_setup_moltenvk(screen);
+   printf("[ZINK] step5: timeline_semaphore check (have_KHR=%d feats12=%d)\n",
+          screen->info.have_KHR_timeline_semaphore, screen->info.feats12.timelineSemaphore);
    if (!screen->info.have_KHR_timeline_semaphore && !screen->info.feats12.timelineSemaphore) {
+      printf("[ZINK] FAIL step5: KHR_timeline_semaphore not advertised AND feats12.timelineSemaphore=false\n");
       if (!screen->driver_name_is_inferred)
          mesa_loge("zink: KHR_timeline_semaphore is required");
       goto fail;
@@ -3464,9 +3486,13 @@ zink_internal_create_screen(const struct pipe_screen_config *config, int64_t dev
 
    init_driver_workarounds(screen);
 
+   printf("[ZINK] step6: zink_create_logical_device\n");
    screen->dev = zink_create_logical_device(screen);
-   if (!screen->dev)
+   if (!screen->dev) {
+      printf("[ZINK] FAIL step6: zink_create_logical_device returned NULL\n");
       goto fail;
+   }
+   printf("[ZINK] step6: logical device OK\n");
 
    vk_device_uncompacted_dispatch_table_load(&screen->vk.device,
                                              screen->vk_GetDeviceProcAddr,
@@ -3729,9 +3755,11 @@ zink_internal_create_screen(const struct pipe_screen_config *config, int64_t dev
 
    screen->frame_marker_emitted = zink_screen_debug_marker_begin(screen, "frame");
 
+   printf("[ZINK] zink_internal_create_screen: SUCCESS — returning screen\n");
    return screen;
 
 fail:
+   printf("[ZINK] zink_internal_create_screen: hit fail label, destroying and returning NULL\n");
    zink_destroy_screen(&screen->base);
    return NULL;
 }

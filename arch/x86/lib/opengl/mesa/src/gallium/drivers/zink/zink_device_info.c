@@ -3,8 +3,9 @@
 #include "zink_screen.h"
 
 bool
-zink_get_physical_device_info(struct zink_screen *screen) 
+zink_get_physical_device_info(struct zink_screen *screen)
 {
+   printf("[ZINK] device_info: ENTRY\n");
    struct zink_device_info *info = &screen->info;
    bool support_KHR_maintenance1 = false;
    bool support_KHR_maintenance2 = false;
@@ -125,7 +126,7 @@ zink_get_physical_device_info(struct zink_screen *screen)
    } else {
       if (num_extensions > 0) {
          VkExtensionProperties *extensions = MALLOC(sizeof(VkExtensionProperties) * num_extensions);
-         if (!extensions) goto fail;
+         if (!extensions) { printf("[ZINK] device_info FAIL @128: MALLOC(extensions) returned NULL\n"); goto fail; }
          result = screen->vk.EnumerateDeviceExtensionProperties(screen->pdev, NULL, &num_extensions, extensions);
          if (result != VK_SUCCESS) {
             if (!screen->driver_name_is_inferred)
@@ -1396,6 +1397,7 @@ zink_get_physical_device_info(struct zink_screen *screen)
        info->extensions[num_extensions++] = "VK_KHR_maintenance1";
    } else {
        debug_printf("ZINK: VK_KHR_maintenance1 required!\n");
+       printf("[ZINK] device_info FAIL @1399: VK_KHR_maintenance1 not advertised by ICD\n");
        goto fail;
    }
    if (info->have_KHR_maintenance2) {
@@ -1441,6 +1443,7 @@ zink_get_physical_device_info(struct zink_screen *screen)
        info->extensions[num_extensions++] = "VK_KHR_create_renderpass2";
    } else {
        debug_printf("ZINK: VK_KHR_create_renderpass2 required!\n");
+       printf("[ZINK] device_info FAIL @1444: VK_KHR_create_renderpass2 not advertised by ICD\n");
        goto fail;
    }
    if (info->have_KHR_synchronization2) {
@@ -1573,6 +1576,7 @@ zink_get_physical_device_info(struct zink_screen *screen)
        info->extensions[num_extensions++] = "VK_KHR_imageless_framebuffer";
    } else {
        debug_printf("ZINK: VK_KHR_imageless_framebuffer required!\n");
+       printf("[ZINK] device_info FAIL @1576: VK_KHR_imageless_framebuffer not advertised by ICD\n");
        goto fail;
    }
    if (info->have_EXT_robustness2) {
@@ -1689,6 +1693,7 @@ zink_get_physical_device_info(struct zink_screen *screen)
        info->extensions[num_extensions++] = "VK_KHR_descriptor_update_template";
    } else {
        debug_printf("ZINK: VK_KHR_descriptor_update_template required!\n");
+       printf("[ZINK] device_info FAIL @1692: VK_KHR_descriptor_update_template not advertised by ICD\n");
        goto fail;
    }
    if (info->have_EXT_line_rasterization) {

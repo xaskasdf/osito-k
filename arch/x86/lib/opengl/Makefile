@@ -329,7 +329,6 @@ UTIL_SRCS := \
   mesa/src/util/u_debug.c \
   mesa/src/util/u_queue.c \
   mesa/src/util/u_process.c \
-  mesa/src/util/u_dl.c \
   mesa/src/util/os_misc.c \
   mesa/src/util/rwlock.c \
   mesa/src/util/futex.c \
