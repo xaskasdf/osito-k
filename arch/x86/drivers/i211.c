@@ -46,6 +46,10 @@ typedef struct {
 
 static i211_state_t nic;
 
+/* Forward decls for IRQ counters used by TX kick diag.                     */
+extern volatile uint32_t i211_isr_count;
+extern volatile uint32_t i211_isr_rx_count;
+
 /* ── Register Access ─────────────────────────────────────────── */
 
 static uint32_t i211_read(uint32_t reg)
@@ -521,6 +525,8 @@ int i211_send(const void *data, uint32_t len)
         serial_puts(" STATUS=");                  serial_puthex(status, 8);
         serial_puts(" desc.cmd_type_len=");       serial_puthex(desc->cmd_type_len, 8);
         serial_puts(" addr=");                    serial_puthex(desc->addr, 16);
+        serial_puts(" ISR=");                     serial_puthex(i211_isr_count, 4);
+        serial_puts(" RX_ISR=");                  serial_puthex(i211_isr_rx_count, 4);
         serial_puts("\n");
     }
 
@@ -619,6 +625,13 @@ bool i211_link_up(void)
 
 volatile bool i211_irq_pending;
 
+/* Counters for diagnostic — leemos en TX kick log para confirmar que
+ * el MSI llega y el ISR fire.  Si i211_isr_count siempre es 0 al hacer
+ * TX kick mientras Mac envía frames, MSI no está siendo entregado y el
+ * problema es en pci_enable_msi / IDT vector wiring.                    */
+volatile uint32_t i211_isr_count;
+volatile uint32_t i211_isr_rx_count;
+
 void i211_enable_interrupts(uint8_t pci_bus, uint8_t pci_dev, uint8_t pci_func)
 {
     if (!nic.initialized) return;
@@ -641,10 +654,13 @@ void i211_isr(void)
 {
     if (!nic.initialized) return;
 
+    i211_isr_count++;
+
     /* Read ICR — auto-clears on read */
     uint32_t cause = i211_read(I211_ICR);
 
     if (cause & I211_ICR_RXT0) {
+        i211_isr_rx_count++;
         /* RX packet: disable RX interrupt, set pending flag.
          * net_poll() will drain the ring and re-enable. */
         i211_write(I211_IMC, I211_ICR_RXT0);
