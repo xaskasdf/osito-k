@@ -52,6 +52,7 @@ DOOM*.zip
 # QEMU serial logs from local runs
 serial.*.log
 serial_*.log
+log/
 
 # UnrealEngine .int localization files
 *.int
