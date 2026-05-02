@@ -210,8 +210,19 @@ static int i211_setup_tx(void)
     i211_write(I211_TDT0, 0);
     nic.tx_tail = 0;
 
-    /* Enable TX queue */
-    i211_write(I211_TXDCTL0, i211_read(I211_TXDCTL0) | I211_XDCTL_ENABLE);
+    /* Enable TX queue.  CRITICAL para advanced descriptors:
+     * datasheet I211 §7.2.7.4 dice "When the device is configured to use
+     * Advanced Transmit Descriptors, the WTHRESH field of TXDCTL must be
+     * set to a value greater than 0".  Sin eso la NIC nunca write-back-ea
+     * el bit DD y, en algunos paths, ni siquiera fetchea los descriptores.
+     *
+     * Linux igb driver usa PTHRESH=31, HTHRESH=1, WTHRESH=1 — copio esos
+     * valores que están en producción hace una década.                    */
+    uint32_t txdctl = (31u <<  0) |     /* PTHRESH                          */
+                      ( 1u <<  8) |     /* HTHRESH                          */
+                      ( 1u << 16) |     /* WTHRESH                          */
+                      I211_XDCTL_ENABLE;
+    i211_write(I211_TXDCTL0, txdctl);
 
     for (int i = 0; i < 1000000; i++) {
         if (i211_read(I211_TXDCTL0) & I211_XDCTL_ENABLE)
@@ -384,9 +395,12 @@ int i211_send_sg(const uint64_t frag_phys[], const uint32_t lens[], int n_frags)
     /* Poll completion on the last descriptor */
     uint32_t last_idx = (nic.tx_tail + I211_TX_RING_SIZE - 1) % I211_TX_RING_SIZE;
     i211_tx_desc_t *last = &nic.tx_ring[last_idx];
-    for (int i = 0; i < 1000000; i++) {
-        if (last->olinfo_status & I211_TXD_STAT_DD) return 0;
-        __asm__ volatile ("pause");
+    {
+        volatile uint32_t *dd = &last->olinfo_status;
+        for (int i = 0; i < 1000000; i++) {
+            if (*dd & I211_TXD_STAT_DD) return 0;
+            __asm__ volatile ("pause");
+        }
     }
     serial_puts("[I211] SG TX timeout\n");
     return -1;
@@ -427,9 +441,13 @@ int i211_send(const void *data, uint32_t len)
     wmb();
     i211_write(I211_TDT0, nic.tx_tail);
 
-    /* Poll for completion */
+    /* Poll for completion.  El read de olinfo_status DEBE ser volatile —
+     * el compilador puede hoist-ear el load fuera del loop si no, y
+     * spin-eamos infinito sobre un valor cacheado en registro mientras
+     * la NIC sí escribió el DD.                                          */
+    volatile uint32_t *dd = &desc->olinfo_status;
     for (int i = 0; i < 1000000; i++) {
-        if (desc->olinfo_status & I211_TXD_STAT_DD)
+        if (*dd & I211_TXD_STAT_DD)
             return 0;
         __asm__ volatile ("pause");
     }
