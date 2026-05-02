@@ -103,12 +103,14 @@ static int i211_setup_rx(void)
     memset(nic.rx_ring, 0, ring_bytes);
     memset(nic.rx_bufs, 0, bufs_bytes);
 
-    /* Fill each descriptor with buffer phys address (hardware DMAs
-     * incoming packets into these). */
+    /* Fill each descriptor con buffer phys address (advanced one-buffer
+     * format).  pkt_addr = donde el HW DMA incoming packet; hdr_addr=0
+     * (no usamos header splitting).                                       */
     uint64_t rx_bufs_phys_addr = (uint64_t)rx_bufs_phys;
     for (int i = 0; i < I211_RX_RING_SIZE; i++) {
-        nic.rx_ring[i].addr = rx_bufs_phys_addr + (uint64_t)i * I211_PKT_BUF_SIZE;
-        nic.rx_ring[i].status = 0;
+        nic.rx_ring[i].read.pkt_addr =
+            rx_bufs_phys_addr + (uint64_t)i * I211_PKT_BUF_SIZE;
+        nic.rx_ring[i].read.hdr_addr = 0;
     }
 
     /* Program ring base address */
@@ -119,10 +121,18 @@ static int i211_setup_rx(void)
     /* Ring length in bytes (must be 128-byte aligned) */
     i211_write(I211_RDLEN0, (uint32_t)ring_bytes);
 
-    /* SRRCTL: legacy descriptor format (bits 25:27 = 0) */
+    /* SRRCTL: advanced one-buffer descriptor format (DESCTYPE = 001).
+     * El I211 NO soporta legacy descriptors — el datasheet Intel
+     * §7.1.5 lo prohíbe explícitamente.  Programar 0 acá deja el HW
+     * sin escribir el bit DD nunca → DHCP RX timeout permanente.        *
+     * BSIZEPACKET[6:0] = 2 → buffers de 2 KB (encaja con I211_PKT_BUF_  *
+     * SIZE y RCTL.BSIZE).                                               */
     uint32_t srrctl = i211_read(I211_SRRCTL0);
-    srrctl &= ~(7 << 25);              /* Clear descriptor type bits */
-    srrctl |= I211_SRRCTL_DROP_EN;     /* Drop if no descriptors */
+    srrctl &= ~(7u << 25);              /* Clear DESCTYPE bits          */
+    srrctl |= I211_SRRCTL_DESCTYPE_ADV; /* DESCTYPE = 001 (advanced 1-buf)*/
+    srrctl &= ~0x7Fu;                   /* Clear BSIZEPACKET[6:0]       */
+    srrctl |= 2;                         /* BSIZEPACKET = 2 → 2 KB        */
+    srrctl |= I211_SRRCTL_DROP_EN;
     i211_write(I211_SRRCTL0, srrctl);
 
     /* Set head to 0 */
@@ -419,12 +429,11 @@ int i211_recv(void *buf, uint32_t *len)
     uint32_t tail = nic.rx_tail;
     i211_rx_desc_t *desc = &nic.rx_ring[tail];
 
-    /* Check if descriptor has been filled by hardware */
-    if (!(desc->status & I211_RXD_STAT_DD))
-        return -1;  /* No packet */
+    /* Advanced descriptor write-back: status_error[0] = DD.              */
+    if (!(desc->wb.status_error & I211_RXD_STAT_DD))
+        return -1;  /* No packet                                          */
 
-    /* Copy packet data */
-    uint32_t pkt_len = desc->length;
+    uint32_t pkt_len = desc->wb.length;
     if (pkt_len > I211_PKT_BUF_SIZE)
         pkt_len = I211_PKT_BUF_SIZE;
 
@@ -432,12 +441,13 @@ int i211_recv(void *buf, uint32_t *len)
     memcpy(buf, src, pkt_len);
     *len = pkt_len;
 
-    /* Reset descriptor for reuse */
-    desc->status = 0;
-    desc->length = 0;
-    desc->errors = 0;
+    /* Re-armar descriptor: pkt_addr = mismo buffer físico.               */
+    uint64_t buf_phys = kvirt_to_phys(src);
+    desc->read.pkt_addr = buf_phys;
+    desc->read.hdr_addr = 0;
 
-    /* Advance tail and update RDT */
+    /* Avanzar tail.  RDT se escribe DESPUÉS de invalidar el descriptor
+     * para evitar carrera con el HW DMA.                                  */
     uint32_t old_tail = tail;
     nic.rx_tail = (tail + 1) % I211_RX_RING_SIZE;
     wmb();

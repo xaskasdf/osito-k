@@ -88,18 +88,33 @@
 #define I211_XDCTL_ENABLE   (1 << 25)   /* Queue Enable */
 
 /* SRRCTL */
-#define I211_SRRCTL_DROP_EN (1 << 31)   /* Drop Enable */
+#define I211_SRRCTL_DROP_EN     (1 << 31)         /* Drop Enable        */
+#define I211_SRRCTL_DESCTYPE_ADV (1 << 25)        /* Advanced one-buffer */
 
-/* ── Descriptor Formats (legacy, 16 bytes) ───────────────────── */
-
-/* RX descriptor — hardware writes length/status on receive */
+/* ── RX Descriptor (advanced, 16 bytes) ──────────────────────────────
+ *
+ * El I211 *no soporta legacy descriptors* — solo advanced.  Tiene dos
+ * formatos físicos del mismo layout de 16 bytes:
+ *
+ *   Read (SW → HW):    pkt_addr (8B) + hdr_addr (8B)
+ *   Write-back (HW→SW): status_error (4B) + length (2B) + vlan (2B) +
+ *                       mrq (4B) + rss_hash (4B)
+ *
+ * Usamos union para acceder al mismo descriptor con ambas vistas.        */
 typedef struct __attribute__((packed)) {
-    uint64_t addr;         /* Buffer physical address */
-    uint16_t length;       /* Packet length (HW writes) */
-    uint16_t checksum;     /* Packet checksum */
-    uint8_t  status;       /* DD(0), EOP(1) */
-    uint8_t  errors;
-    uint16_t special;
+    union {
+        struct {                       /* Read view (programado por SW)  */
+            uint64_t pkt_addr;
+            uint64_t hdr_addr;
+        } read;
+        struct {                       /* Write-back view (escrito por HW)*/
+            uint32_t status_error;     /* DD = bit 0, EOP = bit 1, ...    */
+            uint16_t length;
+            uint16_t vlan;
+            uint32_t mrq;              /* MRQ + RSS type                  */
+            uint32_t rss_hash;
+        } wb;
+    };
 } i211_rx_desc_t;
 
 /* TX descriptor — software fills, hardware sets DD on completion */

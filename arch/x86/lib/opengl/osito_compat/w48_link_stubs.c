@@ -37,8 +37,12 @@ int  u_cnd_monotonic_broadcast(void *cnd) { (void)cnd; return 0; }
 int  u_cnd_monotonic_wait(void *cnd, void *mtx) { (void)cnd;(void)mtx; return 0; }
 int  u_cnd_monotonic_timedwait(void *cnd, void *mtx, const void *ts) { (void)cnd;(void)mtx;(void)ts; return 0; }
 
-/* u_thread */
-int u_thread_create(void *thread, void *(*routine)(void *), void *arg) { (void)thread;(void)routine;(void)arg; return -1; }
+/* u_thread — DROP `u_thread_create` here. The real Mesa impl in
+ * mesa/src/util/u_thread.c wraps thrd_create (which we now provide for
+ * real via SYS_CLONE in mesa_libc_stubs.c). With --allow-multiple-definition
+ * the linker takes the FIRST archive object; this stub had been silently
+ * shadowing the real one, making every util_queue_init fail at thread
+ * spawn (-1 return from the stub). */
 void u_thread_setname(const char *name) { (void)name; }
 long util_thread_get_time_nano(int thread_id) { (void)thread_id; return 0; }
 
