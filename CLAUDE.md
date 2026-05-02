@@ -393,6 +393,7 @@ arch/arm/          SM8350 (ROG Phone 5) bare-metal port — see docs/aarch64-det
 | X-VK    | Vulkan stack: NVK userland ICD + Venus protocol (encoder/decoder, phys-dev queries, cmd buffers) + software rasterizer for guest-local present | WIP |
 | X-DOS   | DOS-native execution: VCPI server, EMS stubs, INT 31h DPMI, GDT[3]/[4] DOS4GW aliases, synth descriptors, INT 67h, LMSW PE switch detect, native FAR JMP/RETF transfer | WIP |
 | X-GUI   | Shared cross-arch GUI (gui/): elementaryOS-inspired desktop, AA text, Wingpanel, Plank dock, window decorations, NTP clock | Done |
+| X-UTF   | Unicode subsystem (Plan 9-style 4 capas): libutf codec + PSF2 font loader + LRU cache + width-aware renderer + Latin-1 boot fallback. Cobertura: ASCII/Latin-1 link-time + Cyrillic/Greek/CJK/Hangul desde /fonts/*.psf en OsitoFS. Implementado en fork osito-x; ver [docs/unicode-architecture.md](docs/unicode-architecture.md) para port a mainline | WIP |
 | A-ARM64 | AArch64/SM8350 (ROG Phone 5) bare-metal port: PL011 UART, GICv3, MMU paging, PCI ECAM, HDA, virtio-blk + OsitoFS v2, virtio-net + TCP/IP, syscall+ELF+process, crypto/TLS/HTTPS, multi-core SMP via PSCI, NEON SIMD tensor ops, GUI desktop task | Done |
 
 > Full GPU roadmap (X27-X40 + contingency): see [docs/x86-gpu-roadmap.md](docs/x86-gpu-roadmap.md)
@@ -428,6 +429,7 @@ For implementation details, API specifics, register-level documentation, and deb
 
 - **[docs/x86-features-detail.md](docs/x86-features-detail.md)** — All x86-64 feature descriptions (X9-X42, X-OS*, X-NET*, X-CL*, X-WIN32, etc.)
 - **[docs/kernel-demencial.md](docs/kernel-demencial.md)** — 10 features avanzadas: cpu_features, PMU counters, superpage tensor arena, multipath dispatch, sys_inference syscall, ASLR lite, predictive scheduling, speculative I/O, zero-copy SG TX, hardware breakpoints, self-optimizing kernel
+- **[docs/unicode-architecture.md](docs/unicode-architecture.md)** — Subsistema Unicode 4 capas estilo Plan 9: libutf codec, PSF2 font loader desde OsitoFS, LRU cache, renderer width-aware (CJK 16×16), boot font Latin-1 link-time. Implementado y validado en fork osito-x; documento describe diseño completo + plan de port a mainline
 - **[docs/kernel-diagram.md](docs/kernel-diagram.md)** — 5 diagramas Mermaid: arquitectura completa (111 archivos en 12 subsistemas), secuencia de boot (22 pasos), dispatch de syscalls, forward pass de inference, y mapa de integración de las 10 features
 - **[docs/esp8266-detail.md](docs/esp8266-detail.md)** — Math library API, zForth integration, resource budget, DOOM/Elite details
 - **[docs/aarch64-detail.md](docs/aarch64-detail.md)** — AArch64/SM8350 (ROG Phone 5) port details

@@ -6,6 +6,9 @@ build/
 arch/xtensa/tools/xtensa-lx106-elf/
 arch/xtensa/tools/*.tar.gz
 tools/*.tar.gz
+# Pre-migration toolchain location (kept ignored for users who haven't
+# moved their existing extracted copy to the new arch/xtensa/tools/).
+tools/xtensa-lx106-elf/
 
 # Python venv
 .venv/
