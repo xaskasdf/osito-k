@@ -148,6 +148,7 @@ extern void isr_stub_31(void);
 extern void isr_stub_32(void);   /* APIC timer */
 extern void isr_stub_33(void);   /* Keyboard IRQ */
 extern void isr_stub_40(void);   /* I211 NIC MSI */
+extern void isr_stub_41(void);   /* RTL8111 NIC MSI */
 extern void isr_stub_default(void);  /* vectors 34-255 */
 
 /* Keyboard handler */
@@ -1069,6 +1070,14 @@ void isr_handler(interrupt_frame_t *frame)
     if (vec == 40) {
         extern void i211_isr(void);
         i211_isr();
+        apic_write(APIC_EOI, 0);
+        return;
+    }
+
+    /* RTL8111 NIC MSI interrupt */
+    if (vec == 41) {
+        extern void rtl8111_isr(void) __attribute__((weak));
+        if (rtl8111_isr) rtl8111_isr();
         apic_write(APIC_EOI, 0);
         return;
     }
@@ -2248,6 +2257,10 @@ void __initk idt_init(void)
     /* Vector 40: I211 NIC MSI interrupt */
     idt_set_entry(40, isr_stub_40, 0);
     idt[40].selector = cs;
+
+    /* Vector 41: RTL8111 NIC MSI interrupt */
+    idt_set_entry(41, isr_stub_41, 0);
+    idt[41].selector = cs;
 
     /* SMP work IPI: lightweight stub, no fxsave (safe for APs) */
     extern void isr_stub_smp_ipi(void);

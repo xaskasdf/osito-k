@@ -112,9 +112,9 @@ KERN_SRC = kernel/main.c kernel/serial.c kernel/framebuffer.c \
            kernel/cpu_features.c kernel/perf.c kernel/dispatch.c \
            kernel/tensor_arena.c kernel/sys_inference.c \
            kernel/pred_sched.c kernel/io_predict.c \
-           kernel/hwbp.c kernel/self_optimize.c
+           kernel/hwbp.c kernel/self_optimize.c kernel/nic.c
 ASM_SRC  = kernel/isr_stubs.S kernel/syscall_entry.S kernel/setjmp.S kernel/kexec_tramp.S
-DRV_SRC  = drivers/nvme.c drivers/i211.c drivers/gpu.c drivers/gsp.c \
+DRV_SRC  = drivers/nvme.c drivers/i211.c drivers/rtl8111.c drivers/gpu.c drivers/gsp.c \
            drivers/sass.c drivers/gmmu.c drivers/gpu_tensor.c drivers/gpu_inference.c \
            drivers/xhci.c drivers/hid_parser.c drivers/hda.c \
            drivers/virtio.c drivers/virtio_blk.c drivers/virtio_net.c drivers/virtio_gpu.c \
@@ -173,7 +173,7 @@ KERN_MINIMAL = kernel/main.c kernel/serial.c kernel/framebuffer.c \
                kernel/zlib.c kernel/git.c \
                kernel/shm.c kernel/compositor.c kernel/display.c \
                kernel/input_events.c kernel/memcompress.c
-DRV_MINIMAL  = drivers/nvme.c drivers/i211.c drivers/gpu.c drivers/gsp.c \
+DRV_MINIMAL  = drivers/nvme.c drivers/i211.c drivers/rtl8111.c drivers/gpu.c drivers/gsp.c \
                drivers/sass.c drivers/gmmu.c drivers/gpu_tensor.c \
                drivers/gpu_inference.c drivers/xhci.c drivers/hda.c
 FS_MINIMAL   = fs/ositofs2.c fs/ositofs3.c fs/gpt.c fs/gguf.c fs/vfs.c
@@ -191,7 +191,7 @@ all: check-deps $(BUILD)/boot.efi $(BUILD)/kernel.elf libvulkan
 
 # ── Wave 2: Vulkan SDK library ────────────────────────────────
 libvulkan:
-	$(MAKE) -C lib/vulkan
+	$(MAKE) -C lib/vulkan CC=$(CC) AR=$(shell echo $(CC) | sed 's/-gcc/-ar/')
 
 minimal: check-deps $(BUILD)/boot.efi $(BUILD)/kernel-minimal.elf
 	@echo ""

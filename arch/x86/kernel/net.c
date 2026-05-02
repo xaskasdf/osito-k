@@ -9,6 +9,7 @@
 #include "../include/paging.h"
 #include "net.h"
 #include "../drivers/i211.h"
+#include "nic.h"
 
 /* ── External Functions ──────────────────────────────────────── */
 
@@ -274,7 +275,7 @@ static int eth_send(const uint8_t dst[ETH_ALEN], uint16_t ethertype,
         frame_len = 60;
     }
 
-    return i211_send(tx_pkt, frame_len);
+    return nic_send(tx_pkt, frame_len);
 }
 
 /* ── ARP: Send Reply ─────────────────────────────────────────── */
@@ -419,7 +420,7 @@ static void icmp_send(const uint8_t dst_ip[4], uint8_t type, uint8_t code,
         frame_len = 60;
     }
 
-    i211_send(tx_pkt, frame_len);
+    nic_send(tx_pkt, frame_len);
 }
 
 static void handle_icmp(const uint8_t *src_ip, const uint8_t *pkt, uint32_t len)
@@ -538,7 +539,7 @@ static void handle_ipv4(const uint8_t *pkt, uint32_t len)
 void net_init(const uint8_t ip[4])
 {
     memcpy(our_ip, ip, 4);
-    i211_get_mac(our_mac);
+    nic_get_mac(our_mac);
 
     memset(arp_table, 0, sizeof(arp_table));
     memset(udp_listeners, 0, sizeof(udp_listeners));
@@ -630,7 +631,7 @@ int net_udp_send_broadcast(uint16_t dst_port, uint16_t src_port,
 
     uint32_t frame_len = ETH_HDR_LEN + ip_total;
     if (frame_len < 60) { memset(tx_pkt + frame_len, 0, 60 - frame_len); frame_len = 60; }
-    return i211_send(tx_pkt, frame_len);
+    return nic_send(tx_pkt, frame_len);
 }
 
 /* Forward declaration for retransmit in net_poll */
@@ -650,10 +651,9 @@ void __hot net_poll(void)
     uint32_t len = 0;
 
     /* NAPI: check if interrupt flagged pending packets */
-    extern volatile bool i211_irq_pending;
-    bool was_irq = i211_irq_pending;
+    bool was_irq = nic_ops.irq_pending && *nic_ops.irq_pending;
 
-    while (i211_recv(rx_pkt, &len) == 0) {
+    while (nic_recv(rx_pkt, &len) == 0) {
         if (len < ETH_HDR_LEN)
             continue;
 
@@ -678,11 +678,14 @@ void __hot net_poll(void)
         }
     }
 
-    /* NAPI: ring drained — re-enable RX interrupt if it was the trigger */
+    /* NAPI: ring drained — re-enable RX interrupt if it was the trigger.
+     * Sólo el path de I211 expone i211_rx_irq_reenable; en RTL8111 el
+     * IMR queda armado y no necesita re-arm explícito tras el ack del
+     * ISR (escritura write-1-to-clear en el handler ya re-activa).         */
     if (was_irq) {
-        i211_irq_pending = false;
-        extern void i211_rx_irq_reenable(void);
-        i211_rx_irq_reenable();
+        if (nic_ops.irq_pending) *nic_ops.irq_pending = false;
+        extern void i211_rx_irq_reenable(void) __attribute__((weak));
+        if (i211_rx_irq_reenable) i211_rx_irq_reenable();
     }
 
     /* TCP retransmit check — process all connections with unACKed data */
@@ -788,7 +791,7 @@ int net_udp_send(const uint8_t dst_ip[4], uint16_t dst_port,
      * enough that skipping the memcpy matters (≥256 B) and total frame
      * doesn't need padding. Otherwise keep the legacy single-buffer
      * path for correctness simplicity. */
-    extern int i211_send_sg(const uint64_t frag_phys[],
+    extern int nic_send_sg(const uint64_t frag_phys[],
                             const uint32_t lens[], int n_frags);
     if (len >= 256 && frame_len >= 60) {
         uint64_t frags[2] = {
@@ -796,7 +799,7 @@ int net_udp_send(const uint8_t dst_ip[4], uint16_t dst_port,
             (uint64_t)VIRT_TO_PHYS((void *)data)
         };
         uint32_t lens_arr[2] = { hdr_total, len };
-        int sg = i211_send_sg(frags, lens_arr, 2);
+        int sg = nic_send_sg(frags, lens_arr, 2);
         if (sg == 0) return 0;
         /* On SG failure (e.g. NIC busy), fall through to copy path. */
     }
@@ -810,7 +813,7 @@ int net_udp_send(const uint8_t dst_ip[4], uint16_t dst_port,
         frame_len = 60;
     }
 
-    return i211_send(tx_pkt, frame_len);
+    return nic_send(tx_pkt, frame_len);
 }
 
 /* ── TCP Checksum (pseudo-header) ─────────────────────────────── */
@@ -923,7 +926,7 @@ static int tcp_send_segment(tcp_conn_t *conn, uint8_t flags,
         frame_len = 60;
     }
 
-    return i211_send(tx_pkt, frame_len);
+    return nic_send(tx_pkt, frame_len);
 }
 
 /* ── TCP: Handle Incoming Segment ─────────────────────────────── */

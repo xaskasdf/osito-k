@@ -622,7 +622,30 @@ void __initk kernel_entry(boot_info_t *info)
         serial_puts("[KERN] Initializing I211 NIC...\n");
         fb_puts("\n Initializing NIC...\n");
 
-        if (i211_init(nic_pci->bar[0]) == 0) {
+        /* Detectar familia del NIC y elegir driver.                       */
+        extern int  rtl8111_init(uint64_t bar0_phys, uint64_t bar2_phys);
+        extern void nic_bind_i211(void);
+        extern void nic_bind_rtl8111(void);
+        extern void rtl8111_enable_interrupts(uint8_t b, uint8_t d, uint8_t f);
+
+        int nic_ok = -1;
+        if (nic_pci->vendor_id == 0x10EC &&
+            (nic_pci->device_id == 0x8168 || nic_pci->device_id == 0x8136 ||
+             nic_pci->device_id == 0x8161)) {
+            /* Realtek RTL8111/8168/8169 family.  BAR0 = PIO, BAR2 = MMIO. */
+            uint64_t bar2 = nic_pci->bar[2];
+            if (bar2) {
+                serial_puts("[KERN] Initializing Realtek RTL8111 NIC...\n");
+                fb_puts("\n Initializing NIC (RTL8111)...\n");
+                nic_ok = rtl8111_init(nic_pci->bar[0], bar2);
+                if (nic_ok == 0) nic_bind_rtl8111();
+            }
+        } else if (i211_init(nic_pci->bar[0]) == 0) {
+            nic_bind_i211();
+            nic_ok = 0;
+        }
+
+        if (nic_ok == 0) {
             extern void net_set_ip(const uint8_t ip[4]);
             extern void net_set_gateway(const uint8_t gw[4]);
             extern void net_dns_set_server(const uint8_t ip[4]);
@@ -636,9 +659,15 @@ void __initk kernel_entry(boot_info_t *info)
             net_init(zero_ip);
 
             /* Habilitar IRQ del NIC primero — DHCP necesita poll-with-yield
-             * para no bloquear todo el boot mientras espera OFFER/ACK.    */
-            extern void i211_enable_interrupts(uint8_t bus, uint8_t dev, uint8_t func);
-            i211_enable_interrupts(nic_pci->bus, nic_pci->dev, nic_pci->func);
+             * para no bloquear todo el boot mientras espera OFFER/ACK.
+             * Cada driver expone su _enable_interrupts; dispatch manual
+             * basado en el chip detectado.                                  */
+            extern void i211_enable_interrupts(uint8_t b, uint8_t d, uint8_t f);
+            if (nic_pci->vendor_id == 0x10EC) {
+                rtl8111_enable_interrupts(nic_pci->bus, nic_pci->dev, nic_pci->func);
+            } else {
+                i211_enable_interrupts(nic_pci->bus, nic_pci->dev, nic_pci->func);
+            }
 
             /* Intentar DHCP primero; si falla (red sin servidor o link
              * down), caer a configuración estática según el tipo de NIC. */
