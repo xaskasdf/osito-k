@@ -1122,13 +1122,18 @@ void __hot sched_tick(void *frame_ptr)
         }
     }
 
-    /* Drive network stack if any process is blocked on net I/O.
-     * net_poll() has a reentrancy guard (in_net_poll) so this is safe
-     * even if the interrupted process was inside net_poll(). */
+    /* Drive network stack en cada timer tick:
+     *   - Si hay process bloqueado en net I/O (DHCP retry, TCP connect, etc.).
+     *   - O si la NIC señaló IRQ pending (paquete entrante por drenar).
+     * El segundo caso es crítico: después de boot, sin waiters, los
+     * frames entrantes (ICMP, ARP requests del peer) llenarían el ring
+     * RX hasta que HW empezara a dropear.  net_poll tiene un guard de
+     * reentrancia (in_net_poll), así que es seguro llamar siempre.    */
     {
         extern bool net_has_active_waiters(void);
         extern void net_poll(void);
-        if (net_has_active_waiters())
+        extern bool net_nic_irq_pending(void);
+        if (net_nic_irq_pending() || net_has_active_waiters())
             net_poll();
     }
 

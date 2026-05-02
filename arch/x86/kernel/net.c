@@ -298,6 +298,16 @@ static void arp_send_reply(const uint8_t *dst_mac, const uint8_t *dst_ip)
 
 /* ── ARP: Send Request ───────────────────────────────────────── */
 
+/* sched_tick (process.c) llama esto en cada IRQ del APIC timer para
+ * decidir si drenar el RX ring.  Sin esto, frames entrantes (ICMP,
+ * ARP del peer) se acumulan en el ring hasta que el HW empieza a
+ * dropear — desde fuera el OsitoK aparece "muerto en red" aunque el
+ * kernel está vivo.                                                    */
+bool net_nic_irq_pending(void)
+{
+    return nic_ops.irq_pending && *nic_ops.irq_pending;
+}
+
 /* APIPA: lookup non-blocking — 0 si entry válida, -1 si no.              */
 int net_arp_lookup_nowait(const uint8_t ip[4], uint8_t mac_out[6])
 {

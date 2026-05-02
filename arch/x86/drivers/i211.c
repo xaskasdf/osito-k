@@ -79,6 +79,21 @@ static void i211_read_mac(void)
     nic.mac[3] = (uint8_t)(ral >> 24);
     nic.mac[4] = (uint8_t)(rah);
     nic.mac[5] = (uint8_t)(rah >> 8);
+
+    /* Garantizar Address-Valid (RAH[0] bit 31).  El EEPROM normalmente lo
+     * deja seteado, pero algunos resets / quirks pueden limpiarlo —
+     * sin AV el chip filtra TODOS los unicast hacia nuestra MAC, lo
+     * cual deja ARP/broadcast pasando pero rompe ICMP/UDP/TCP entrantes.
+     * Re-escribir es idempotente y barato.                                */
+    uint32_t ral_w = ((uint32_t)nic.mac[0]) |
+                     ((uint32_t)nic.mac[1] <<  8) |
+                     ((uint32_t)nic.mac[2] << 16) |
+                     ((uint32_t)nic.mac[3] << 24);
+    uint32_t rah_w = ((uint32_t)nic.mac[4]) |
+                     ((uint32_t)nic.mac[5] <<  8) |
+                     (1u << 31);                  /* Address Valid           */
+    i211_write(I211_RAL0, ral_w);
+    i211_write(I211_RAH0, rah_w);
 }
 
 /* ── Setup RX Ring ───────────────────────────────────────────── */
