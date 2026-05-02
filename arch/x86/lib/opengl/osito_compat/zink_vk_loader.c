@@ -83,3 +83,21 @@ util_dl_get_proc_address(struct util_dl_library *library,
     return (util_dl_proc)(uintptr_t)
            vkGetInstanceProcAddr(VK_NULL_HANDLE, procname);
 }
+
+/* W4.10 — provide util_dl_close + util_dl_error too. We dropped the
+ * upstream u_dl.c from libmesa_util.a (its util_dl_open was a NULL
+ * stub on freestanding builds and was overriding ours via link order),
+ * which means these companions now also need to live here. Both are
+ * trivial: nothing to close (we never really dlopen'd anything), and
+ * never an error string to report. */
+void
+util_dl_close(struct util_dl_library *library)
+{
+    (void)library;  /* Always our DUMMY_VK_LOADER_HANDLE — nothing to free. */
+}
+
+const char *
+util_dl_error(void)
+{
+    return "OsitoK util_dl: no dynamic loader; static-linked libvulkan";
+}
