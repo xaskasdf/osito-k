@@ -382,11 +382,82 @@ nvk_stub_EnumerateDeviceExtensionProperties(VkPhysicalDevice physicalDevice,
                                             const char *pLayerName,
                                             uint32_t *pCount,
                                             VkExtensionProperties *pProps) {
-    (void)physicalDevice; (void)pLayerName; (void)pProps;
-    /* No extensions advertised yet — Zink works fine without VK_KHR_*
-     * for headless screen creation. */
-    *pCount = 0;
-    return VK_SUCCESS;
+    (void)physicalDevice; (void)pLayerName;
+    /* Extensions Mesa Zink probes during screen create. We advertise the
+     * core set required to avoid `goto fail` paths in zink_screen.c — most
+     * importantly KHR_timeline_semaphore (zink_screen.c:3446). The other
+     * EXT/KHR entries match what Zink calls vkGet*Properties on; missing
+     * any of them only loses optional fast paths. */
+    static const struct {
+        const char *name;
+        uint32_t    spec_version;
+    } exts[] = {
+        { "VK_KHR_timeline_semaphore",                  2 },
+        { "VK_KHR_swapchain",                          70 },
+        { "VK_KHR_maintenance1",                        2 },
+        { "VK_KHR_maintenance2",                        1 },
+        { "VK_KHR_maintenance3",                        1 },
+        { "VK_KHR_maintenance4",                        2 },
+        { "VK_KHR_image_format_list",                   1 },
+        { "VK_KHR_imageless_framebuffer",               1 },
+        { "VK_KHR_create_renderpass2",                  1 },
+        { "VK_KHR_synchronization2",                    1 },
+        { "VK_KHR_dynamic_rendering",                   1 },
+        { "VK_KHR_buffer_device_address",               1 },
+        { "VK_KHR_8bit_storage",                        1 },
+        { "VK_KHR_16bit_storage",                       1 },
+        { "VK_KHR_shader_float16_int8",                 1 },
+        { "VK_KHR_uniform_buffer_standard_layout",      1 },
+        { "VK_KHR_push_descriptor",                     2 },
+        { "VK_KHR_dedicated_allocation",                3 },
+        { "VK_KHR_get_memory_requirements2",            1 },
+        { "VK_KHR_bind_memory2",                        1 },
+        { "VK_KHR_storage_buffer_storage_class",        1 },
+        { "VK_KHR_external_memory",                     1 },
+        { "VK_KHR_external_semaphore",                  1 },
+        { "VK_KHR_external_fence",                      1 },
+        { "VK_KHR_descriptor_update_template",          1 },
+        { "VK_KHR_shader_draw_parameters",              1 },
+        { "VK_EXT_extended_dynamic_state",              1 },
+        { "VK_EXT_extended_dynamic_state2",             1 },
+        { "VK_EXT_extended_dynamic_state3",             2 },
+        { "VK_EXT_custom_border_color",                12 },
+        { "VK_EXT_border_color_swizzle",                1 },
+        { "VK_EXT_provoking_vertex",                    1 },
+        { "VK_EXT_vertex_attribute_divisor",            3 },
+        { "VK_EXT_scalar_block_layout",                 1 },
+        { "VK_EXT_descriptor_indexing",                 2 },
+        { "VK_EXT_host_query_reset",                    1 },
+        { "VK_EXT_separate_stencil_usage",              1 },
+        { "VK_EXT_robustness2",                         1 },
+        { "VK_EXT_line_rasterization",                  1 },
+        { "VK_EXT_color_write_enable",                  1 },
+        { "VK_EXT_4444_formats",                        1 },
+        { "VK_EXT_shader_subgroup_ballot",              1 },
+        { "VK_EXT_shader_subgroup_vote",                1 },
+        { "VK_EXT_shader_viewport_index_layer",         1 },
+        { "VK_OSITOK_compositor_surface",               1 },
+    };
+    const uint32_t total = (uint32_t)(sizeof(exts) / sizeof(exts[0]));
+
+    if (!pProps) {
+        *pCount = total;
+        return VK_SUCCESS;
+    }
+    uint32_t want = *pCount;
+    uint32_t copy = (want < total) ? want : total;
+    for (uint32_t i = 0; i < copy; i++) {
+        const char *s = exts[i].name;
+        int j = 0;
+        while (s[j] && j < (int)sizeof(pProps[i].extensionName) - 1) {
+            pProps[i].extensionName[j] = s[j];
+            j++;
+        }
+        pProps[i].extensionName[j] = '\0';
+        pProps[i].specVersion = exts[i].spec_version;
+    }
+    *pCount = copy;
+    return (copy < total) ? VK_INCOMPLETE : VK_SUCCESS;
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -857,8 +928,118 @@ nvk_stub_GetPhysicalDeviceFeatures2(VkPhysicalDevice pd,
                                     VkPhysicalDeviceFeatures2 *f) {
     if (!f) return;
     nvk_stub_GetPhysicalDeviceFeatures(pd, &f->features);
+    /* Walk pNext chain and populate the known Vulkan-version feature
+     * structs Mesa Zink queries during screen create. Most importantly
+     * VkPhysicalDeviceVulkan12Features.timelineSemaphore — without it,
+     * zink_screen.c:3446 bails. We claim broad support for the boolean
+     * features GA102 actually has via the GSP/RM path. */
     struct vk_pnext_hdr *e = (struct vk_pnext_hdr *)f->pNext;
-    while (e) e = (struct vk_pnext_hdr *)e->pNext;
+    while (e) {
+        switch (e->sType) {
+        case 49: { /* VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES */
+            VkPhysicalDeviceVulkan11Features *v = (VkPhysicalDeviceVulkan11Features *)e;
+            v->storageBuffer16BitAccess           = VK_TRUE;
+            v->uniformAndStorageBuffer16BitAccess = VK_TRUE;
+            v->storagePushConstant16              = VK_FALSE;
+            v->storageInputOutput16               = VK_FALSE;
+            v->multiview                          = VK_TRUE;
+            v->multiviewGeometryShader            = VK_TRUE;
+            v->multiviewTessellationShader        = VK_TRUE;
+            v->variablePointersStorageBuffer      = VK_TRUE;
+            v->variablePointers                   = VK_TRUE;
+            v->protectedMemory                    = VK_FALSE;
+            v->samplerYcbcrConversion             = VK_FALSE;
+            v->shaderDrawParameters               = VK_TRUE;
+            break;
+        }
+        case 51: { /* VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES */
+            VkPhysicalDeviceVulkan12Features *v = (VkPhysicalDeviceVulkan12Features *)e;
+            v->samplerMirrorClampToEdge                          = VK_TRUE;
+            v->drawIndirectCount                                 = VK_TRUE;
+            v->storageBuffer8BitAccess                           = VK_TRUE;
+            v->uniformAndStorageBuffer8BitAccess                 = VK_TRUE;
+            v->storagePushConstant8                              = VK_FALSE;
+            v->shaderBufferInt64Atomics                          = VK_TRUE;
+            v->shaderSharedInt64Atomics                          = VK_TRUE;
+            v->shaderFloat16                                     = VK_TRUE;
+            v->shaderInt8                                        = VK_TRUE;
+            v->descriptorIndexing                                = VK_TRUE;
+            v->shaderInputAttachmentArrayDynamicIndexing         = VK_TRUE;
+            v->shaderUniformTexelBufferArrayDynamicIndexing      = VK_TRUE;
+            v->shaderStorageTexelBufferArrayDynamicIndexing      = VK_TRUE;
+            v->shaderUniformBufferArrayNonUniformIndexing        = VK_TRUE;
+            v->shaderSampledImageArrayNonUniformIndexing         = VK_TRUE;
+            v->shaderStorageBufferArrayNonUniformIndexing        = VK_TRUE;
+            v->shaderStorageImageArrayNonUniformIndexing         = VK_TRUE;
+            v->shaderInputAttachmentArrayNonUniformIndexing      = VK_TRUE;
+            v->shaderUniformTexelBufferArrayNonUniformIndexing   = VK_TRUE;
+            v->shaderStorageTexelBufferArrayNonUniformIndexing   = VK_TRUE;
+            v->descriptorBindingUniformBufferUpdateAfterBind     = VK_TRUE;
+            v->descriptorBindingSampledImageUpdateAfterBind      = VK_TRUE;
+            v->descriptorBindingStorageImageUpdateAfterBind      = VK_TRUE;
+            v->descriptorBindingStorageBufferUpdateAfterBind     = VK_TRUE;
+            v->descriptorBindingUniformTexelBufferUpdateAfterBind = VK_TRUE;
+            v->descriptorBindingStorageTexelBufferUpdateAfterBind = VK_TRUE;
+            v->descriptorBindingUpdateUnusedWhilePending         = VK_TRUE;
+            v->descriptorBindingPartiallyBound                   = VK_TRUE;
+            v->descriptorBindingVariableDescriptorCount          = VK_TRUE;
+            v->runtimeDescriptorArray                            = VK_TRUE;
+            v->samplerFilterMinmax                               = VK_TRUE;
+            v->scalarBlockLayout                                 = VK_TRUE;
+            v->imagelessFramebuffer                              = VK_TRUE;
+            v->uniformBufferStandardLayout                       = VK_TRUE;
+            v->shaderSubgroupExtendedTypes                       = VK_TRUE;
+            v->separateDepthStencilLayouts                       = VK_TRUE;
+            v->hostQueryReset                                    = VK_TRUE;
+            v->timelineSemaphore                                 = VK_TRUE;
+            v->bufferDeviceAddress                               = VK_TRUE;
+            v->bufferDeviceAddressCaptureReplay                  = VK_FALSE;
+            v->bufferDeviceAddressMultiDevice                    = VK_FALSE;
+            v->vulkanMemoryModel                                 = VK_TRUE;
+            v->vulkanMemoryModelDeviceScope                      = VK_TRUE;
+            v->vulkanMemoryModelAvailabilityVisibilityChains     = VK_TRUE;
+            v->shaderOutputViewportIndex                         = VK_TRUE;
+            v->shaderOutputLayer                                 = VK_TRUE;
+            v->subgroupBroadcastDynamicId                        = VK_TRUE;
+            break;
+        }
+        case 53: { /* VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES */
+            VkPhysicalDeviceVulkan13Features *v = (VkPhysicalDeviceVulkan13Features *)e;
+            v->robustImageAccess                  = VK_TRUE;
+            v->inlineUniformBlock                 = VK_TRUE;
+            v->descriptorBindingInlineUniformBlockUpdateAfterBind = VK_TRUE;
+            v->pipelineCreationCacheControl       = VK_TRUE;
+            v->privateData                        = VK_TRUE;
+            v->shaderDemoteToHelperInvocation     = VK_TRUE;
+            v->shaderTerminateInvocation          = VK_TRUE;
+            v->subgroupSizeControl                = VK_TRUE;
+            v->computeFullSubgroups               = VK_TRUE;
+            v->synchronization2                   = VK_TRUE;
+            v->textureCompressionASTC_HDR         = VK_FALSE;
+            v->shaderZeroInitializeWorkgroupMemory = VK_TRUE;
+            v->dynamicRendering                   = VK_TRUE;
+            v->shaderIntegerDotProduct            = VK_TRUE;
+            v->maintenance4                       = VK_TRUE;
+            break;
+        }
+        case 1000207000: { /* VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES */
+            VkPhysicalDeviceTimelineSemaphoreFeatures *v =
+                (VkPhysicalDeviceTimelineSemaphoreFeatures *)e;
+            v->timelineSemaphore = VK_TRUE;
+            break;
+        }
+        case 1000267000: { /* VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_FEATURES_EXT */
+            VkPhysicalDeviceExtendedDynamicStateFeaturesEXT *v =
+                (VkPhysicalDeviceExtendedDynamicStateFeaturesEXT *)e;
+            v->extendedDynamicState = VK_TRUE;
+            break;
+        }
+        default:
+            /* Unknown feature struct — leave as caller initialized it. */
+            break;
+        }
+        e = (struct vk_pnext_hdr *)e->pNext;
+    }
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -1547,6 +1728,12 @@ VKAPI_ATTR PFN_vkVoidFunction VKAPI_PTR
 nvk_stub_icdGetInstanceProcAddr(VkInstance instance, const char *name) {
     (void)instance;
     if (!name) return NULL;
+
+    /* Standard Vulkan ICD callers (Mesa Zink, Khronos loader) pass the
+     * full "vkXxxx" name. Our ENTRY() table is unprefixed, so strip the
+     * leading "vk" once. Without this, every getProcAddr query returns
+     * NULL → screen->vk.* dispatch table is fully NULL → crash. */
+    if (name[0] == 'v' && name[1] == 'k') name += 2;
 
     /* Instance-level */
     ENTRY(CreateInstance);

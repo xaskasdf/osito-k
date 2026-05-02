@@ -10,6 +10,16 @@ OUT         := $(BUILD_ROOT)/libvulkan.a
 CC       ?= gcc
 AR       ?= ar
 GCC_INC  := $(shell $(CC) -print-file-name=include)
+
+# Refuse to build with a host compiler — produces wrong object format
+# (Mach-O on macOS) which the cross-ld silently drops, leaving NULL
+# function pointers in the ICD table. CC must be the x86_64-elf-* cross.
+ifeq ($(findstring elf,$(shell $(CC) -dumpmachine 2>/dev/null)),)
+$(error CC=$(CC) is not a freestanding ELF cross-compiler. \
+        Set CC=x86_64-elf-gcc (or equivalent). Building with a host \
+        compiler silently produces unusable object files — see the \
+        nvk_stub Mach-O bug fixed Apr 28.)
+endif
 CFLAGS   := -std=gnu99 -ffreestanding -nostdinc -fno-stack-protector \
             -mno-red-zone -Wall -Wextra -O2 -fno-pic \
             -I$(VULKAN_ROOT)/include -I$(VULKAN_ROOT)/loader \

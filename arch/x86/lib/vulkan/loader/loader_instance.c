@@ -1,5 +1,77 @@
 #include "loader.h"
 
+extern int strcmp(const char *, const char *);
+
+/* Hardware detection — ask the kernel which GPU backend(s) it has up.
+ *
+ * SYS_GPU_CAPS (601) returns a bitmask:
+ *   bit 0  GPU_CAP_VENUS_READY  — virtio-gpu 3D online (QEMU/cloud)
+ *   bit 1  GPU_CAP_NVK_READY    — bare-metal NVIDIA NVK backend online
+ *
+ * We use this to order the ICD scan so the right backend is tried FIRST
+ * and its physical devices land at index 0 in vkEnumeratePhysicalDevices
+ * (Mesa Zink picks pdev[0]).  If both are up (unusual — host-virtio +
+ * passthrough) we still prefer NVK because it backs a real GPU.  If the
+ * syscall fails (very early boot, kernel without GPU caps) we fall back
+ * to the static table order.
+ */
+#define SYS_GPU_CAPS         600
+#define GPU_CAP_VENUS_READY  (1u << 0)
+#define GPU_CAP_NVK_READY    (1u << 1)
+
+extern long __syscall1(long n, long a);
+
+static unsigned osito_query_gpu_caps(void)
+{
+    unsigned caps = 0;
+    long rc = __syscall1(SYS_GPU_CAPS, (long)(unsigned long)&caps);
+    if (rc < 0) return 0;
+    return caps;
+}
+
+/* Return the ICD entry whose name matches, or NULL. */
+static const struct osito_icd_entry *osito_icd_find(const char *name)
+{
+    for (unsigned i = 0; i < osito_icd_count; i++) {
+        if (strcmp(osito_icd_table[i].name, name) == 0)
+            return &osito_icd_table[i];
+    }
+    return NULL;
+}
+
+/* Build a probe order based on detected hardware. Writes pointers into
+ * `order[]` (length must be >= osito_icd_count) and returns the number
+ * of entries written. ICDs whose backend isn't detected are still added
+ * at the end as a fallback — they may produce CPU-only handles useful
+ * for headless test paths. */
+static unsigned osito_icd_probe_order(const struct osito_icd_entry **order)
+{
+    unsigned caps = osito_query_gpu_caps();
+    unsigned n = 0;
+
+    /* Track which ICDs we've placed so we don't double-add. */
+    char picked[8] = {0};
+
+    /* 1. Bare-metal NVK takes priority when its backend is ready. */
+    if (caps & GPU_CAP_NVK_READY) {
+        const struct osito_icd_entry *e = osito_icd_find("nvk-stub");
+        if (e) { order[n++] = e; picked[e - osito_icd_table] = 1; }
+    }
+    /* 2. Venus when virtio-gpu is up (and NVK isn't, or as a secondary). */
+    if (caps & GPU_CAP_VENUS_READY) {
+        const struct osito_icd_entry *e = osito_icd_find("venus");
+        if (e && !picked[e - osito_icd_table]) {
+            order[n++] = e; picked[e - osito_icd_table] = 1;
+        }
+    }
+    /* 3. Append any unpicked ICDs in static order (covers no-caps boot
+     *    + future ICDs not in the priority lists above). */
+    for (unsigned i = 0; i < osito_icd_count && i < sizeof(picked); i++) {
+        if (!picked[i]) order[n++] = &osito_icd_table[i];
+    }
+    return n;
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL
 vkCreateInstance(const VkInstanceCreateInfo *pCreateInfo,
                  const VkAllocationCallbacks *pAllocator,
@@ -12,11 +84,15 @@ vkCreateInstance(const VkInstanceCreateInfo *pCreateInfo,
     memset(self, 0, sizeof(*self));
     set_loader_magic_value(self);
 
+    /* HW-detect once and build the probe order. */
+    const struct osito_icd_entry *order[8];
+    unsigned order_n = osito_icd_probe_order(order);
+
     /* Create an instance on each registered ICD. Any ICD that fails is
      * skipped (rationale: a partially-available backend shouldn't kill
      * the loader). */
-    for (unsigned i = 0; i < osito_icd_count; i++) {
-        const struct osito_icd_entry *e = &osito_icd_table[i];
+    for (unsigned i = 0; i < order_n; i++) {
+        const struct osito_icd_entry *e = order[i];
 
         PFN_vkCreateInstance create =
             (PFN_vkCreateInstance)e->get_proc_addr(VK_NULL_HANDLE,

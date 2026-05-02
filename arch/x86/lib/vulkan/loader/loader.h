@@ -165,6 +165,39 @@ struct osito_swapchain {
     VkSwapchainKHR        real;
 };
 
+/* Wave 3 (W4.10) — wrappers for descriptor / sampler / event /
+ * pipeline-cache / query-pool / compute-pipeline objects. All non-
+ * dispatchable, all share the {owner, real} shape. Used by the new
+ * loader trampolines in loader_dispatch.c. */
+struct osito_descriptor_set_layout {
+    struct osito_device  *owner;
+    VkDescriptorSetLayout real;
+};
+struct osito_descriptor_pool {
+    struct osito_device  *owner;
+    VkDescriptorPool      real;
+};
+struct osito_descriptor_set {
+    struct osito_device  *owner;
+    VkDescriptorSet       real;
+};
+struct osito_event {
+    struct osito_device  *owner;
+    VkEvent               real;
+};
+struct osito_pipeline_cache {
+    struct osito_device  *owner;
+    VkPipelineCache       real;
+};
+struct osito_query_pool {
+    struct osito_device  *owner;
+    VkQueryPool           real;
+};
+struct osito_sampler {
+    struct osito_device  *owner;
+    VkSampler             real;
+};
+
 static inline struct osito_phys_device *osito_phys_from(VkPhysicalDevice h) {
     return (struct osito_phys_device *)h;
 }
