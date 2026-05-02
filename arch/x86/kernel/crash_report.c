@@ -62,6 +62,13 @@ typedef struct {
     uint8_t  code_after[32];
     uint64_t code_base;       /* RIP - 32 */
     bool     code_valid;
+
+    /* Stack memory dump — 256 quadwords starting at RSP. Lets us recover
+     * the failed-CALL return address (always at *RSP) and shallow callers
+     * even when RBP is invalid or the frame walker can't find them. */
+    uint64_t stack_base;      /* RSP at crash time */
+    uint64_t stack_words[256];
+    bool     stack_valid;
 } crash_report_t;
 
 /* ── Static report buffer (avoid allocation in crash context) ── */
@@ -115,6 +122,15 @@ void crash_report_save(uint64_t *frame, uint32_t vector, uint64_t fault_addr,
         for (int i = 0; i < 32; i++) r->code_before[i] = p[i];
         p = (uint8_t *)r->rip;
         for (int i = 0; i < 32; i++) r->code_after[i] = p[i];
+    }
+
+    /* Capture stack memory at RSP. *RSP is the return address from a failed
+     * CALL — invaluable when the bug is a NULL function pointer. */
+    if (r->rsp != 0 && (r->rsp & 7) == 0) {
+        r->stack_base = r->rsp;
+        r->stack_valid = true;
+        uint64_t *sp = (uint64_t *)r->rsp;
+        for (int i = 0; i < 256; i++) r->stack_words[i] = sp[i];
     }
 
     /* Walk backtrace (same algorithm as idt.c but captures into struct) */
@@ -193,6 +209,17 @@ void crash_report_save(uint64_t *frame, uint32_t vector, uint64_t fault_addr,
             serial_puts(" ");
         }
         serial_puts("\n");
+    }
+
+    if (r->stack_valid) {
+        serial_puts("  |\n  | Stack @ RSP (top 8 qwords, [0]=return-addr from failed CALL):\n");
+        for (int i = 0; i < 8; i++) {
+            serial_puts("  |   [");
+            serial_putdec(i);
+            serial_puts("] 0x");
+            serial_puthex(r->stack_words[i], 16);
+            serial_puts("\n");
+        }
     }
 
     serial_puts("  +--------------------------------------------------+\n\n");
