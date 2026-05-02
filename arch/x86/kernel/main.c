@@ -623,27 +623,46 @@ void __initk kernel_entry(boot_info_t *info)
         fb_puts("\n Initializing NIC...\n");
 
         if (i211_init(nic_pci->bar[0]) == 0) {
+            extern void net_set_ip(const uint8_t ip[4]);
             extern void net_set_gateway(const uint8_t gw[4]);
             extern void net_dns_set_server(const uint8_t ip[4]);
+            extern int  dhcp_discover(void);
 
-            /* Auto-detect: I211 (0x1539) = real hardware, else QEMU */
-            if (nic_pci->device_id == 0x1539) {
-                uint8_t ip[] = {192, 168, 0, 50};
-                net_init(ip);
-                uint8_t gw[] = {192, 168, 0, 1};
-                net_set_gateway(gw);
-                uint8_t dns[] = {8, 8, 8, 8};
-                net_dns_set_server(dns);
-            } else {
-                uint8_t ip[] = {10, 0, 2, 15};
-                net_init(ip);
-                /* gateway/DNS defaults in net.c match QEMU SLIRP */
-            }
-            net_udp_listen(7777, prompt_handler);
+            /* Arrancar net con IP placeholder 0.0.0.0 — necesario para
+             * que ARP table / TX path estén inicializados antes del
+             * primer broadcast.  net_set_ip() abajo escribe la IP real
+             * (DHCP o estática) sin re-armar el resto.                  */
+            uint8_t zero_ip[4] = {0, 0, 0, 0};
+            net_init(zero_ip);
 
-            /* Enable interrupt-driven NIC receive (NAPI hybrid) */
+            /* Habilitar IRQ del NIC primero — DHCP necesita poll-with-yield
+             * para no bloquear todo el boot mientras espera OFFER/ACK.    */
             extern void i211_enable_interrupts(uint8_t bus, uint8_t dev, uint8_t func);
             i211_enable_interrupts(nic_pci->bus, nic_pci->dev, nic_pci->func);
+
+            /* Intentar DHCP primero; si falla (red sin servidor o link
+             * down), caer a configuración estática según el tipo de NIC. */
+            int dhcp_ok = dhcp_discover();
+            if (dhcp_ok != 0) {
+                serial_puts("[KERN] DHCP failed, using static fallback\n");
+                fb_puts(" Net: static fallback\n");
+                if (nic_pci->device_id == 0x1539) {
+                    /* Real hardware (I211 8086:1539) — LAN típica */
+                    uint8_t ip[] = {192, 168, 0, 50};
+                    net_set_ip(ip);
+                    uint8_t gw[] = {192, 168, 0, 1};
+                    net_set_gateway(gw);
+                    uint8_t dns[] = {8, 8, 8, 8};
+                    net_dns_set_server(dns);
+                } else {
+                    /* QEMU SLIRP user-mode networking — gateway 10.0.2.2 */
+                    uint8_t ip[] = {10, 0, 2, 15};
+                    net_set_ip(ip);
+                    /* gateway/DNS defaults in net.c match QEMU SLIRP */
+                }
+            }
+
+            net_udp_listen(7777, prompt_handler);
         } else {
             serial_puts("[KERN] I211 init failed\n");
             fb_puts(" NIC: init failed\n");
