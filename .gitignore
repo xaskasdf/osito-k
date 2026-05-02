@@ -1,8 +1,10 @@
 # Build output
 build/
 
-# Toolchain (large, download separately)
-tools/xtensa-lx106-elf/
+# Toolchain (large, download separately) — Xtensa toolchain lives
+# under the xtensa arch directory after the 2026 migration.
+arch/xtensa/tools/xtensa-lx106-elf/
+arch/xtensa/tools/*.tar.gz
 tools/*.tar.gz
 
 # Python venv

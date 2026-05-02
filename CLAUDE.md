@@ -9,13 +9,13 @@ A [naranjositos.tech](https://naranjositos.tech/) project.
 
 ```bash
 # Linux:
-export PATH="$PWD/tools/xtensa-lx106-elf/bin:$PATH"
+export PATH="$PWD/arch/xtensa/tools/xtensa-lx106-elf/bin:$PATH"
 make                    # default: all features enabled
 make ENABLE_ELITE=0 ENABLE_FORTH=0 ENABLE_DOOM=1   # DOOM config
 make flash              # flash via /dev/ttyUSB0
 
 # Windows:
-export PATH="/c/Users/xasko/osito-k/tools/xtensa-lx106-elf/bin:$PATH"
+export PATH="/c/Users/xasko/osito-k/arch/xtensa/tools/xtensa-lx106-elf/bin:$PATH"
 make PYTHON=py          # or run esptool manually
 ```
 
@@ -35,9 +35,9 @@ ENABLE_DOOM=0    DOOM wireframe 2.5D engine (~3.5KB IRAM)
 
 **Serial monitor**: 74880 baud (ROM bootloader uses ~52MHz APB, not 80MHz).
 ```bash
-python3 tools/tviewer.py                    # terminal video bridge (SSH-safe)
-python3 tools/tviewer.py /dev/ttyUSB0 74880 # explicit port/baud
-python3 tools/console.py /dev/ttyUSB0       # text-only console
+python3 arch/xtensa/scripts/tviewer.py                    # terminal video bridge (SSH-safe)
+python3 arch/xtensa/scripts/tviewer.py /dev/ttyUSB0 74880 # explicit port/baud
+python3 arch/xtensa/scripts/console.py /dev/ttyUSB0       # text-only console
 ```
 
 **Restore original firmware**: `python3 -m esptool --port /dev/ttyUSB0 write_flash 0x0 backup/wemos_d1_full_backup.bin`
@@ -76,18 +76,18 @@ python3 tools/console.py /dev/ttyUSB0       # text-only console
 
 ## Code Map
 
-### ESP8266 (src/)
+### ESP8266 (arch/xtensa/)
 ```
-src/boot/          vectors.S, crt0.S, nosdk_init.c — startup + vector table
-src/kernel/        context_switch.S, sched.cpp, timer_tick.c, task.h, sem.cpp, mq.cpp
-src/mem/           pool_alloc.cpp (32B×256), heap.cpp (8KB first-fit)
-src/fs/            ositofs.cpp — SPI flash filesystem
-src/math/          fixedpoint.h/cpp (16.16), matrix3.h/cpp (3D vectors/matrices)
-src/drivers/       uart.cpp, gpio.cpp, adc.cpp, input.cpp, font.cpp, video.cpp
-src/forth/         zforth.c, zf_host.cpp, setjmp.S — Forth interpreter
-src/doom/          doom_gen.cpp, doom_render.cpp, doom_game.cpp — 2.5D engine
-src/shell/         shell.cpp — interactive shell
-src/main.cpp       kernel_main entry point
+arch/xtensa/boot/          vectors.S, crt0.S, nosdk_init.c — startup + vector table
+arch/xtensa/kernel/        context_switch.S, sched.cpp, timer_tick.c, task.h, sem.cpp, mq.cpp
+arch/xtensa/mem/           pool_alloc.cpp (32B×256), heap.cpp (8KB first-fit)
+arch/xtensa/fs/            ositofs.cpp — SPI flash filesystem
+arch/xtensa/math/          fixedpoint.h/cpp (16.16), matrix3.h/cpp (3D vectors/matrices)
+arch/xtensa/drivers/       uart.cpp, gpio.cpp, adc.cpp, input.cpp, font.cpp, video.cpp
+arch/xtensa/forth/         zforth.c, zf_host.cpp, setjmp.S — Forth interpreter
+arch/xtensa/doom/          doom_gen.cpp, doom_render.cpp, doom_game.cpp — 2.5D engine
+arch/xtensa/shell/         shell.cpp — interactive shell
+arch/xtensa/main.cpp       kernel_main entry point
 ```
 
 ### x86-64 Bare-Metal AI OS (arch/x86/)

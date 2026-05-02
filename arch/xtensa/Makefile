@@ -24,11 +24,17 @@ ESPTOOL  = $(PYTHON) -m esptool
 PORT    ?= /dev/ttyUSB0
 BAUD    ?= 460800
 
-# Directories
-SRCDIR   = src
+# Directories — sources live flat under arch/xtensa/ since the migration
+# from the old root layout (`make` was at repo root, src/ + include/).
+# SRCDIR=. means "this directory" so $(SRCDIR)/kernel/foo.c → kernel/foo.c.
+SRCDIR   = .
 INCDIR   = include
 BUILDDIR = build
 LDDIR    = ld
+
+# Shared headers (osfs2/3 on-disk format) live at the repo root so x86
+# host tools and arch/x86/ can also use them without copies.
+COMMON_INCDIR = ../../include/common
 
 # Flash parameters (Wemos D1: 4MB, DOUT mode, image v1)
 FLASH_MODE  = dout
@@ -46,6 +52,7 @@ COMMON_FLAGS = \
 	-Wall -Wextra -Wno-unused-parameter \
 	-I$(INCDIR) \
 	-I$(SRCDIR) \
+	-I$(COMMON_INCDIR) \
 	-DICACHE_FLASH_ATTR='__attribute__((section(".irom0.text")))' \
 	-DIRAM_ATTR='__attribute__((section(".iram0.text")))' \
 	-DENABLE_ELITE=$(ENABLE_ELITE) \
@@ -54,7 +61,7 @@ COMMON_FLAGS = \
 
 CFLAGS = $(COMMON_FLAGS) -std=c11
 CXXFLAGS = $(COMMON_FLAGS) -std=c++17 -fno-exceptions -fno-rtti
-ASFLAGS = -mlongcalls -mtext-section-literals -I$(INCDIR) -I$(SRCDIR) \
+ASFLAGS = -mlongcalls -mtext-section-literals -I$(INCDIR) -I$(SRCDIR) -I$(COMMON_INCDIR) \
 	-DENABLE_ELITE=$(ENABLE_ELITE) -DENABLE_FORTH=$(ENABLE_FORTH) -DENABLE_DOOM=$(ENABLE_DOOM)
 
 # GCC 10.3 libgcc lacks Xtensa div/mul builtins; find 8.4 libgcc if present
