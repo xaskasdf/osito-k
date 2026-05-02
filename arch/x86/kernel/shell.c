@@ -2717,11 +2717,16 @@ static void shell_exec(char *line)
             if (f) {
                 uint64_t off = redir.append ? osfs2_file_size(f) : 0;
                 osfs2_write(f, off, out_buf, redir_pos);
+                /* Flush write-back cache del controller — sin esto, USB
+                 * MSC pierde la data al desenchufar.  El usuario espera
+                 * que después de `>` el archivo esté en disco.            */
+                extern int disk_flush(void);
+                disk_flush();
                 sh_puts("[");
                 sh_putdec(redir_pos);
                 sh_puts(" bytes -> ");
                 sh_puts(redir.out_file);
-                sh_puts("]\n");
+                sh_puts(" (synced)]\n");
             } else {
                 sh_puts("Error: cannot create ");
                 sh_puts(redir.out_file);

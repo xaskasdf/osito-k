@@ -406,10 +406,19 @@ static inline long _osito_clone(unsigned long flags,
     return ret;
 }
 
+extern int printf(const char *, ...);
+
 int thrd_create(thrd_t *thr, thrd_start_t func, void *arg) {
-    if (!thr || !func) return thrd_error;
+    if (!thr || !func) {
+        printf("[THRD] create: bad args thr=%p func=%p\n", (void*)thr, (void*)func);
+        return thrd_error;
+    }
     void *stack = calloc(1, THREAD_STACK_SIZE);
-    if (!stack) return thrd_nomem;
+    if (!stack) {
+        printf("[THRD] create: calloc(%u) returned NULL (heap exhausted?)\n",
+               (unsigned)THREAD_STACK_SIZE);
+        return thrd_nomem;
+    }
 
     void *stack_top = (void *)((uintptr_t)stack + THREAD_STACK_SIZE);
 
@@ -421,10 +430,13 @@ int thrd_create(thrd_t *thr, thrd_start_t func, void *arg) {
                         | CLONE_PARENT_SETTID | CLONE_CHILD_CLEARTID;
 
     long tid = _osito_clone(flags, stack_top, thr, thr, func, arg);
+    printf("[THRD] create: _osito_clone returned %ld (errno=-%ld)\n",
+           tid, tid < 0 ? -tid : 0);
     if (tid <= 0) {
         free(stack);
         return thrd_error;
     }
+    printf("[THRD] create: spawned tid=%ld stack=%p func=%p\n", tid, stack, (void*)(uintptr_t)func);
     /* NOTE: stack is leaked on thread exit. We have no per-thread cleanup
      * hook today; allocator reclaims when proc_free runs. Acceptable for
      * Mesa's queue threads which live for process lifetime. */
