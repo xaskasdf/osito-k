@@ -1707,7 +1707,16 @@ static void cmd_httpd(int argc, char *argv[])
     sched_spawn("httpd", httpd_thread);
     sh_puts("HTTP server started on port ");
     sh_putdec(httpd_port);
-    sh_puts("\n  Access: http://10.0.2.15:");
+    /* Show the actual NIC IP (APIPA / DHCP / static) instead of the QEMU
+     * SLIRP placeholder. Falls back to 0.0.0.0 if the stack hasn't bound
+     * a v4 address yet, which itself is useful debugging info. */
+    extern uint8_t *net_get_ip_ptr(void);
+    uint8_t *ip = net_get_ip_ptr();
+    sh_puts("\n  Access: http://");
+    sh_putdec(ip[0]); sh_puts(".");
+    sh_putdec(ip[1]); sh_puts(".");
+    sh_putdec(ip[2]); sh_puts(".");
+    sh_putdec(ip[3]); sh_puts(":");
     sh_putdec(httpd_port);
     sh_puts("/\n");
 }

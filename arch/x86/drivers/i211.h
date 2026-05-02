@@ -117,26 +117,47 @@ typedef struct __attribute__((packed)) {
     };
 } i211_rx_desc_t;
 
-/* TX descriptor — software fills, hardware sets DD on completion */
+/* TX descriptor — Advanced Transmit Data Descriptor (Type 0x3).
+ *
+ * The I210/I211 datasheet (section 7.2.2.2.4) requires advanced descriptor
+ * format on this NIC family — legacy TX descriptors are NOT supported and
+ * silently drop packets when used. This is the same constraint that forced
+ * the RX side to advanced format in commit 4ce1549; the TX side was the
+ * still-broken half (APIPA "assigned" without ever transmitting probes,
+ * Mac saw zero packets).
+ *
+ * Layout (16 bytes):
+ *   [0..7]   buffer physical address
+ *   [8..11]  cmd_type_len:
+ *              bits  0..15: data length
+ *              bits 16..19: high bits of length (TSO; 0 here)
+ *              bits 20..23: DTYP = 0x3 (data desc)
+ *              bits 24..31: CMD — EOP(24), IFCS(25), RS(27), DEXT(29 must be 1)
+ *   [12..15] olinfo_status:
+ *              bits  0..3:  status (HW writes DD=bit0)
+ *              bits  4..7:  IDX (stats counter, 0)
+ *              bits  8..13: POPTS (offload options, 0)
+ *              bits 14..31: PAYLEN (= data length for non-TSO)
+ */
 typedef struct __attribute__((packed)) {
-    uint64_t addr;         /* Buffer physical address */
-    uint16_t length;       /* Data length */
-    uint8_t  cso;          /* Checksum offset */
-    uint8_t  cmd;          /* EOP(0), IFCS(1), RS(3) */
-    uint8_t  status;       /* DD(0) */
-    uint8_t  css;          /* Checksum start */
-    uint16_t special;
+    uint64_t addr;
+    uint32_t cmd_type_len;
+    uint32_t olinfo_status;
 } i211_tx_desc_t;
 
 /* Descriptor status/command bits */
 #define I211_RXD_STAT_DD    (1 << 0)    /* Descriptor Done */
 #define I211_RXD_STAT_EOP   (1 << 1)    /* End of Packet */
 
-#define I211_TXD_CMD_EOP    (1 << 0)    /* End of Packet */
-#define I211_TXD_CMD_IFCS   (1 << 1)    /* Insert FCS/CRC */
-#define I211_TXD_CMD_RS     (1 << 3)    /* Report Status */
+/* Advanced TX cmd_type_len — bits 24..31 are CMD, bit-relative inside CMD: */
+#define I211_TXD_DTYP_DATA  (0x3u << 20)  /* DTYP = data descriptor */
+#define I211_TXD_CMD_EOP    (1u << 24)    /* End of Packet */
+#define I211_TXD_CMD_IFCS   (1u << 25)    /* Insert FCS/CRC */
+#define I211_TXD_CMD_RS     (1u << 27)    /* Report Status */
+#define I211_TXD_CMD_DEXT   (1u << 29)    /* Descriptor extension (must be 1) */
 
-#define I211_TXD_STAT_DD    (1 << 0)    /* Descriptor Done */
+/* olinfo_status bit 0 — DD set by HW on completion */
+#define I211_TXD_STAT_DD    (1u << 0)
 
 /* ── Ring Configuration ──────────────────────────────────────── */
 

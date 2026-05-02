@@ -349,13 +349,15 @@ int i211_send_sg(const uint64_t frag_phys[], const uint32_t lens[], int n_frags)
     for (int i = 0; i < n_frags; i++) total += lens[i];
     if (total == 0 || total > I211_PKT_BUF_SIZE) return -1;
 
-    /* Wait for enough free descriptors in the ring */
+    /* Wait for enough free descriptors in the ring. olinfo_status bit0
+     * is DD on advanced descriptors; cmd_type_len==0 means descriptor
+     * has never been used (fresh ring). */
     uint32_t tail = nic.tx_tail;
     for (int spin = 0; spin < 1000000; spin++) {
         uint32_t count_free = 0;
         for (int i = 0; i < n_frags; i++) {
             i211_tx_desc_t *d = &nic.tx_ring[(tail + i) % I211_TX_RING_SIZE];
-            if ((d->status & I211_TXD_STAT_DD) || d->cmd == 0) count_free++;
+            if ((d->olinfo_status & I211_TXD_STAT_DD) || d->cmd_type_len == 0) count_free++;
             else break;
         }
         if ((int)count_free >= n_frags) break;
@@ -365,15 +367,14 @@ int i211_send_sg(const uint64_t frag_phys[], const uint32_t lens[], int n_frags)
     for (int i = 0; i < n_frags; i++) {
         uint32_t idx = (tail + i) % I211_TX_RING_SIZE;
         i211_tx_desc_t *d = &nic.tx_ring[idx];
+        uint32_t cmd = I211_TXD_DTYP_DATA | I211_TXD_CMD_IFCS | I211_TXD_CMD_DEXT;
+        if (i == n_frags - 1)
+            cmd |= I211_TXD_CMD_EOP | I211_TXD_CMD_RS;
         d->addr = frag_phys[i];
-        d->length = (uint16_t)lens[i];
-        d->cso = 0;
-        uint8_t cmd = I211_TXD_CMD_IFCS;
-        if (i == n_frags - 1) cmd |= I211_TXD_CMD_EOP | I211_TXD_CMD_RS;
-        d->cmd = cmd;
-        d->status = 0;
-        d->css = 0;
-        d->special = 0;
+        d->cmd_type_len = cmd | (lens[i] & 0xFFFFu);
+        /* PAYLEN goes in olinfo_status[31:14]. For simple non-TSO packets
+         * the payload length equals the data length of this fragment. */
+        d->olinfo_status = ((uint32_t)lens[i] & 0x3FFFFu) << 14;
     }
 
     nic.tx_tail = (tail + n_frags) % I211_TX_RING_SIZE;
@@ -384,7 +385,7 @@ int i211_send_sg(const uint64_t frag_phys[], const uint32_t lens[], int n_frags)
     uint32_t last_idx = (nic.tx_tail + I211_TX_RING_SIZE - 1) % I211_TX_RING_SIZE;
     i211_tx_desc_t *last = &nic.tx_ring[last_idx];
     for (int i = 0; i < 1000000; i++) {
-        if (last->status & I211_TXD_STAT_DD) return 0;
+        if (last->olinfo_status & I211_TXD_STAT_DD) return 0;
         __asm__ volatile ("pause");
     }
     serial_puts("[I211] SG TX timeout\n");
@@ -401,7 +402,7 @@ int i211_send(const void *data, uint32_t len)
 
     /* Wait for previous descriptor to complete (if reused) */
     for (int i = 0; i < 1000000; i++) {
-        if (desc->status & I211_TXD_STAT_DD || desc->cmd == 0)
+        if ((desc->olinfo_status & I211_TXD_STAT_DD) || desc->cmd_type_len == 0)
             break;
         __asm__ volatile ("pause");
     }
@@ -410,14 +411,16 @@ int i211_send(const void *data, uint32_t len)
     uint8_t *buf = nic.tx_bufs + (uint64_t)tail * I211_PKT_BUF_SIZE;
     memcpy(buf, data, len);
 
-    /* Fill descriptor — controller needs the physical address. */
-    desc->addr = nic.tx_bufs_phys + (uint64_t)tail * I211_PKT_BUF_SIZE;
-    desc->length = (uint16_t)len;
-    desc->cso = 0;
-    desc->cmd = I211_TXD_CMD_EOP | I211_TXD_CMD_IFCS | I211_TXD_CMD_RS;
-    desc->status = 0;
-    desc->css = 0;
-    desc->special = 0;
+    /* Fill advanced TX descriptor.
+     *  - cmd_type_len: data length | DTYP=data | CMD(EOP|IFCS|RS|DEXT)
+     *  - olinfo_status: PAYLEN[31:14] = full payload length, DD cleared
+     */
+    uint32_t cmd = I211_TXD_DTYP_DATA |
+                   I211_TXD_CMD_EOP | I211_TXD_CMD_IFCS |
+                   I211_TXD_CMD_RS  | I211_TXD_CMD_DEXT;
+    desc->addr           = nic.tx_bufs_phys + (uint64_t)tail * I211_PKT_BUF_SIZE;
+    desc->cmd_type_len   = cmd | (len & 0xFFFFu);
+    desc->olinfo_status  = ((uint32_t)len & 0x3FFFFu) << 14;
 
     /* Advance tail and notify hardware */
     nic.tx_tail = (tail + 1) % I211_TX_RING_SIZE;
@@ -426,7 +429,7 @@ int i211_send(const void *data, uint32_t len)
 
     /* Poll for completion */
     for (int i = 0; i < 1000000; i++) {
-        if (desc->status & I211_TXD_STAT_DD)
+        if (desc->olinfo_status & I211_TXD_STAT_DD)
             return 0;
         __asm__ volatile ("pause");
     }
