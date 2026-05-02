@@ -158,7 +158,7 @@ check() {
         echo "  [MISS] '$2'"; FAIL=$((FAIL+1))
     fi
 }
-check "$COM1_LOG" "Initializing NIC"
+check "$COM1_LOG" "NIC detected"
 check "$COM1_LOG" "(\\[DHCP\\] Configured|\\[NET\\] IP)"
 check "$COM1_LOG" "(osito>|Type 'help')"
 

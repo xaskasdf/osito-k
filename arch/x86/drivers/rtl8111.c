@@ -258,11 +258,10 @@ int rtl8111_init(uint64_t bar0_phys, uint64_t bar2_phys)
         serial_puts(" Mbps");
         if (phystatus & RTL_PHYSTATUS_FULLDUP) serial_puts(" Full-Duplex");
         serial_puts("\n");
-        fb_puts("\n NIC: Realtek RTL8111 link up\n");
     } else {
         serial_puts("[RTL8111] Link down (cable?)\n");
-        fb_puts("\n NIC: Realtek RTL8111 (link down)\n");
     }
+    /* fb_puts cosmético lo hace main.c con el vendor:device real.       */
 
     nic.initialized = true;
     return 0;

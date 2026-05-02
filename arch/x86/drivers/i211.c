@@ -286,19 +286,12 @@ int __initk i211_init(uint64_t bar0_phys)
         if (status & I211_STATUS_FD)
             serial_puts(" Full-Duplex");
         serial_puts("\n");
-
-        fb_puts("\n NIC: Intel I211 ");
-        for (int i = 0; i < 6; i++) {
-            fb_puthex(nic.mac[i], 2);
-            if (i < 5) fb_puts(":");
-        }
-        fb_puts("\n  Link: ");
-        fb_puts(speeds[speed]);
-        fb_puts(" Mbps\n");
     } else {
         serial_puts("[I211] Link down (cable?)\n");
-        fb_puts("\n NIC: Intel I211 (link down)\n");
     }
+    /* La línea cosmética del NIC con MAC + link la imprime main.c
+     * después con el vendor:device real — los drivers solo registran
+     * status interno por serial.                                       */
 
     nic.initialized = true;
     return 0;

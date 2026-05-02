@@ -619,24 +619,39 @@ void __initk kernel_entry(boot_info_t *info)
     /* ── Step 4: Network (I211 Ethernet + UDP) ── */
     pci_dev_t *nic_pci = (pci_dev_t *)pci_get_nic();
     if (nic_pci && nic_pci->bar[0]) {
-        serial_puts("[KERN] Initializing I211 NIC...\n");
-        fb_puts("\n Initializing NIC...\n");
+        /* La línea de identificación del NIC se imprime abajo, después
+         * de mirar vendor_id/device_id reales del PCI scan.              */
 
-        /* Detectar familia del NIC y elegir driver.                       */
+        /* Detectar familia del NIC y elegir driver.  Imprimir el
+         * vendor:device detectado + nombre del chip (no hardcodear).     */
         extern int  rtl8111_init(uint64_t bar0_phys, uint64_t bar2_phys);
         extern void nic_bind_i211(void);
         extern void nic_bind_rtl8111(void);
         extern void rtl8111_enable_interrupts(uint8_t b, uint8_t d, uint8_t f);
 
+        const char *chip = "unknown";
+        switch ((nic_pci->vendor_id << 16) | nic_pci->device_id) {
+        case 0x80861539: chip = "Intel I211";          break;
+        case 0x80861533: chip = "Intel I210";          break;
+        case 0x808610C9: chip = "Intel 82576 (igb)";   break;
+        case 0x808610D3: chip = "Intel 82574 (e1000e)"; break;
+        case 0x8086100E: chip = "Intel 82540 (e1000)"; break;
+        case 0x10EC8168: chip = "Realtek RTL8111";     break;
+        case 0x10EC8161: chip = "Realtek RTL8111H";    break;
+        case 0x10EC8136: chip = "Realtek RTL8101E";    break;
+        }
+        serial_puts("[KERN] NIC detected: ");
+        serial_puthex(nic_pci->vendor_id, 4); serial_puts(":");
+        serial_puthex(nic_pci->device_id, 4);
+        serial_puts(" ("); serial_puts(chip); serial_puts(")\n");
+        fb_puts("\n NIC: "); fb_puts(chip); fb_puts("\n");
+
         int nic_ok = -1;
         if (nic_pci->vendor_id == 0x10EC &&
             (nic_pci->device_id == 0x8168 || nic_pci->device_id == 0x8136 ||
              nic_pci->device_id == 0x8161)) {
-            /* Realtek RTL8111/8168/8169 family.  BAR0 = PIO, BAR2 = MMIO. */
             uint64_t bar2 = nic_pci->bar[2];
             if (bar2) {
-                serial_puts("[KERN] Initializing Realtek RTL8111 NIC...\n");
-                fb_puts("\n Initializing NIC (RTL8111)...\n");
                 nic_ok = rtl8111_init(nic_pci->bar[0], bar2);
                 if (nic_ok == 0) nic_bind_rtl8111();
             }
