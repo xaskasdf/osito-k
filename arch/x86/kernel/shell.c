@@ -272,6 +272,7 @@ static void cmd_help(void)
     sh_puts("  sched     Scheduler test (sched [stats])\n");
     sh_puts("  httpd     HTTP server (httpd [port] / httpd stop)\n");
     sh_puts("  dhcp      Retry DHCP discovery (manual)\n");
+    sh_puts("  apipa     Auto-assign link-local 169.254.X.Y (RFC 3927)\n");
     sh_puts("  ipconf    Set static IP (ipconf <ip> [gw] [mask] [dns])\n");
     sh_puts("  winexec   Run a Win32 PE executable (winexec file.exe)\n");
     sh_puts("  dosrun    Run a DOS 16-bit binary (dosrun file.com)\n");
@@ -2283,7 +2284,13 @@ static void shell_exec(char *line)
         sh_puts("Retrying DHCP discovery...\n");
         int rc = dhcp_discover();
         sh_puts(rc == 0 ? "DHCP: success — `ifconfig` to see IP\n"
-                        : "DHCP: failed — use `ipconf` to set static IP\n");
+                        : "DHCP: failed — try `apipa` or `ipconf`\n");
+    } else if (strcmp(cmd, "apipa") == 0) {
+        extern int apipa_assign(void);
+        sh_puts("Running APIPA link-local autoconfig (RFC 3927)...\n");
+        int rc = apipa_assign();
+        sh_puts(rc == 0 ? "APIPA: assigned — `ifconfig` to see IP\n"
+                        : "APIPA: failed — use `ipconf`\n");
     } else if (strcmp(cmd, "ipconf") == 0) {
         /* Uso: ipconf <ip> <gw> <mask> [<dns>]
          * Cada arg es A.B.C.D.  Sólo <ip> es obligatorio.                */

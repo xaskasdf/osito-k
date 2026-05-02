@@ -298,6 +298,23 @@ static void arp_send_reply(const uint8_t *dst_mac, const uint8_t *dst_ip)
 
 /* ── ARP: Send Request ───────────────────────────────────────── */
 
+/* APIPA: lookup non-blocking — 0 si entry válida, -1 si no.              */
+int net_arp_lookup_nowait(const uint8_t ip[4], uint8_t mac_out[6])
+{
+    arp_entry_t *e = arp_lookup(ip);
+    if (!e) return -1;
+    memcpy(mac_out, e->mac, ETH_ALEN);
+    return 0;
+}
+
+/* APIPA: ARP request público (probe / announce).  Forward-declared
+ * porque el static arp_send_request está más abajo.                      */
+static void arp_send_request(const uint8_t *target_ip);
+void net_arp_probe(const uint8_t target_ip[4])
+{
+    arp_send_request(target_ip);
+}
+
 static void arp_send_request(const uint8_t *target_ip)
 {
     arp_pkt_t arp;

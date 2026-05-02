@@ -705,11 +705,18 @@ void __initk kernel_entry(boot_info_t *info)
                     net_set_ip(ip);
                     /* gateway/DNS defaults en net.c matchean SLIRP        */
                 } else {
-                    serial_puts("[KERN] DHCP failed on real HW — IP=0.0.0.0\n");
-                    serial_puts("[KERN] Use shell: 'dhcp' to retry, or\n");
-                    serial_puts("[KERN]              'ipconf <ip> <gw> <mask>'\n");
-                    fb_puts(" Net: DHCP failed — use shell 'dhcp' or 'ipconf'\n");
-                    /* Dejar IP=0.0.0.0; los listeners pueden bindear igual.*/
+                    /* HW real sin DHCP: probar APIPA (RFC 3927 link-local).
+                     * Cubre el caso "cable directo Mac↔OsitoK" + cualquier
+                     * red sin DHCP server.  Mac/Linux/Windows también caen
+                     * a 169.254/16 cuando DHCP falla, así que terminan en
+                     * el mismo segmento sin coordinar.                    */
+                    extern int apipa_assign(void);
+                    if (apipa_assign() != 0) {
+                        serial_puts("[KERN] APIPA also failed — IP=0.0.0.0\n");
+                        serial_puts("[KERN] Use shell: 'dhcp' to retry, or\n");
+                        serial_puts("[KERN]              'ipconf <ip> <gw> <mask>'\n");
+                        fb_puts(" Net: no IP — use shell 'ipconf'\n");
+                    }
                 }
             }
 
