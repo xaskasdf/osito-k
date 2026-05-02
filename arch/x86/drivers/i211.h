@@ -107,12 +107,20 @@ typedef struct __attribute__((packed)) {
             uint64_t pkt_addr;
             uint64_t hdr_addr;
         } read;
-        struct {                       /* Write-back view (escrito por HW)*/
-            uint32_t status_error;     /* DD = bit 0, EOP = bit 1, ...    */
-            uint16_t length;
-            uint16_t vlan;
-            uint32_t mrq;              /* MRQ + RSS type                  */
-            uint32_t rss_hash;
+        struct {                       /* Write-back view (escrito por HW).
+                                        * Layout exacto de Linux igb driver
+                                        * struct e1000_adv_rx_desc.upper:
+                                        *   bytes 0..7  = lower dword (RSS
+                                        *                 type/info + hash
+                                        *                 o ip_id+csum)
+                                        *   bytes 8..11 = status_error
+                                        *   bytes 12..13= length
+                                        *   bytes 14..15= vlan tag         */
+            uint32_t lo_dword;         /* 0..3:  pkt_info (RSS type/info)  */
+            uint32_t hi_dword;         /* 4..7:  RSS hash o ip_id+csum     */
+            uint32_t status_error;     /* 8..11: DD=bit0 EOP=bit1 errors   */
+            uint16_t length;           /* 12..13: packet length             */
+            uint16_t vlan;             /* 14..15: VLAN tag                  */
         } wb;
     };
 } i211_rx_desc_t;
