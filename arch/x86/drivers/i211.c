@@ -441,10 +441,8 @@ int i211_send(const void *data, uint32_t len)
     wmb();
     i211_write(I211_TDT0, nic.tx_tail);
 
-    /* Poll for completion.  El read de olinfo_status DEBE ser volatile —
-     * el compilador puede hoist-ear el load fuera del loop si no, y
-     * spin-eamos infinito sobre un valor cacheado en registro mientras
-     * la NIC sí escribió el DD.                                          */
+    /* Poll for completion.  Read volatile para evitar que el compilador
+     * cache-ee el valor en registro durante el loop.                     */
     volatile uint32_t *dd = &desc->olinfo_status;
     for (int i = 0; i < 1000000; i++) {
         if (*dd & I211_TXD_STAT_DD)
@@ -452,7 +450,24 @@ int i211_send(const void *data, uint32_t len)
         __asm__ volatile ("pause");
     }
 
-    serial_puts("[I211] TX timeout\n");
+    /* Timeout — dump suficiente estado para diagnosticar.  Lee TDH/TDT/
+     * TXDCTL/STATUS/TCTL así sabemos si el chip leyó el descriptor o
+     * está ignorándolo, y si la cola sigue habilitada.                   */
+    uint32_t tdh    = i211_read(I211_TDH0);
+    uint32_t tdt    = i211_read(I211_TDT0);
+    uint32_t txdctl = i211_read(I211_TXDCTL0);
+    uint32_t tctl   = i211_read(I211_TCTL);
+    uint32_t status = i211_read(I211_STATUS);
+    serial_puts("[I211] TX timeout. TDH="); serial_puthex(tdh, 8);
+    serial_puts(" TDT=");      serial_puthex(tdt, 8);
+    serial_puts(" TXDCTL=");   serial_puthex(txdctl, 8);
+    serial_puts(" TCTL=");     serial_puthex(tctl, 8);
+    serial_puts(" STATUS=");   serial_puthex(status, 8);
+    serial_puts("\n           desc.cmd_type_len=");
+    serial_puthex(desc->cmd_type_len, 8);
+    serial_puts(" olinfo=");   serial_puthex(*dd, 8);
+    serial_puts(" addr=");     serial_puthex(desc->addr, 16);
+    serial_puts("\n");
     return -1;
 }
 
