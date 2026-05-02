@@ -167,9 +167,56 @@ static int i211_setup_rx(void)
     nic.rx_tail = 0;
     i211_write(I211_RDT0, I211_RX_RING_SIZE - 1);
 
-    /* Enable receiver */
+    /* Enable receiver in promiscuous mode (UPE+MPE+BAM) so we accept any
+     * frame whose dst MAC isn't ours either — eliminates RAR[0] / MTA
+     * filter mistakes from the suspect list while we debug why nothing's
+     * arriving. SBP also stores bad-CRC frames so we see them.
+     * Lockdown to RAR-only filtering after the link comes up clean. */
     i211_write(I211_RCTL, I211_RCTL_EN | I211_RCTL_BAM | I211_RCTL_SECRC |
-                           I211_RCTL_BSIZE_2K);
+                           I211_RCTL_BSIZE_2K | I211_RCTL_UPE |
+                           I211_RCTL_MPE | I211_RCTL_SBP);
+
+    /* Read RX + TX counters.  Read-to-clear, así que muestran "since
+     * boot".  Comparados con el TX kick log nos dicen si el chip
+     * realmente tocó el wire o solo "consumió" el descriptor.            */
+    uint32_t gprc_init  = i211_read(0x4074);  /* Good Pkts RX            */
+    uint32_t bprc_init  = i211_read(0x4078);  /* Broadcast Pkts RX       */
+    uint32_t mprc_init  = i211_read(0x407C);  /* Multicast Pkts RX       */
+    uint32_t gptc_init  = i211_read(0x4080);  /* Good Pkts TX            */
+    uint32_t gotcl_init = i211_read(0x4090);  /* Good Octets TX low      */
+    uint32_t bptc_init  = i211_read(0x40F4);  /* Broadcast Pkts TX       */
+    uint32_t mptc_init  = i211_read(0x40F0);  /* Multicast Pkts TX       */
+    uint32_t txerr_init = i211_read(0x4008);  /* TX Errors (TXERRC)      */
+    uint32_t colc_init  = i211_read(0x4028);  /* Collision Count         */
+    serial_puts("[I211] HW counters @init: GPRC=");
+    serial_puthex(gprc_init, 8);
+    serial_puts(" BPRC="); serial_puthex(bprc_init, 8);
+    serial_puts(" MPRC="); serial_puthex(mprc_init, 8);
+    serial_puts(" GPTC="); serial_puthex(gptc_init, 8);
+    serial_puts(" GOTCL="); serial_puthex(gotcl_init, 8);
+    serial_puts(" BPTC="); serial_puthex(bptc_init, 8);
+    serial_puts(" MPTC="); serial_puthex(mptc_init, 8);
+    serial_puts(" TXERR="); serial_puthex(txerr_init, 8);
+    serial_puts(" COLC="); serial_puthex(colc_init, 8);
+    serial_puts("\n");
+
+    /* Print final RX programming so we can confirm registers stuck. */
+    serial_puts("[I211] RX armed: RCTL=");
+    serial_puthex(i211_read(I211_RCTL),    8);
+    serial_puts(" RDBA=");
+    serial_puthex(((uint64_t)i211_read(I211_RDBAH0) << 32) |
+                  i211_read(I211_RDBAL0), 16);
+    serial_puts(" RDLEN=");
+    serial_puthex(i211_read(I211_RDLEN0), 8);
+    serial_puts(" RDH=");
+    serial_puthex(i211_read(I211_RDH0),   4);
+    serial_puts(" RDT=");
+    serial_puthex(i211_read(I211_RDT0),   4);
+    serial_puts(" RXDCTL=");
+    serial_puthex(i211_read(I211_RXDCTL0), 8);
+    serial_puts(" SRRCTL=");
+    serial_puthex(i211_read(I211_SRRCTL0), 8);
+    serial_puts("\n");
 
     return 0;
 }
@@ -441,6 +488,42 @@ int i211_send(const void *data, uint32_t len)
     wmb();
     i211_write(I211_TDT0, nic.tx_tail);
 
+    /* DEBUG: snapshot HW state right after kicking TDT. If TDH advances
+     * past `tail` the chip fetched our descriptor; if it stays at `tail`
+     * the chip is ignoring us.  Limit to first 8 sends so we don't flood
+     * dmesg once we know what's happening. */
+    static int dbg_count = 0;
+    if (dbg_count < 8) {
+        dbg_count++;
+        uint32_t tdh_after = i211_read(I211_TDH0);
+        uint32_t tdt_after = i211_read(I211_TDT0);
+        uint32_t status    = i211_read(I211_STATUS);
+        uint32_t gprc      = i211_read(0x4074);  /* clears on read */
+        uint32_t rdh       = i211_read(0x02810); /* RDH0 */
+        /* TX-side counters:  GPTC = good pkts TX'eados (≠ frames-en-cola).
+         * Si GPTC sigue 0 después del kick, el chip "consumió" el
+         * descriptor pero la PHY no driveó el wire — broken PHY o no-snoop
+         * leyendo memoria stale.  TXERRC + COLC nos dicen si hubo error.   */
+        uint32_t gptc      = i211_read(0x4080);
+        uint32_t gotcl     = i211_read(0x4090);
+        uint32_t txerr     = i211_read(0x4008);
+        uint32_t colc      = i211_read(0x4028);
+        serial_puts("[I211] TX kick: len=");      serial_putdec(len);
+        serial_puts(" tail=");                    serial_putdec(tail);
+        serial_puts(" -> TDH=");                  serial_puthex(tdh_after, 4);
+        serial_puts(" TDT=");                     serial_puthex(tdt_after, 4);
+        serial_puts(" RDH=");                     serial_puthex(rdh, 4);
+        serial_puts(" GPRC=");                    serial_puthex(gprc, 4);
+        serial_puts(" GPTC=");                    serial_puthex(gptc, 4);
+        serial_puts(" GOTCL=");                   serial_puthex(gotcl, 4);
+        serial_puts(" TXERR=");                   serial_puthex(txerr, 4);
+        serial_puts(" COLC=");                    serial_puthex(colc, 4);
+        serial_puts(" STATUS=");                  serial_puthex(status, 8);
+        serial_puts(" desc.cmd_type_len=");       serial_puthex(desc->cmd_type_len, 8);
+        serial_puts(" addr=");                    serial_puthex(desc->addr, 16);
+        serial_puts("\n");
+    }
+
     /* Poll for completion.  Read volatile para evitar que el compilador
      * cache-ee el valor en registro durante el loop.                     */
     volatile uint32_t *dd = &desc->olinfo_status;
@@ -483,6 +566,18 @@ int i211_recv(void *buf, uint32_t *len)
     /* Advanced descriptor write-back: status_error[0] = DD.              */
     if (!(desc->wb.status_error & I211_RXD_STAT_DD))
         return -1;  /* No packet                                          */
+
+    /* DEBUG — first 8 RX events: log so we can confirm bidirectional link
+     * with the peer. If TX seems silent on the wire but RX sees the peer's
+     * frames, the bug is purely on the TX path. */
+    static int rx_dbg = 0;
+    if (rx_dbg < 8) {
+        rx_dbg++;
+        serial_puts("[I211] RX: tail=");      serial_putdec(tail);
+        serial_puts(" len=");                  serial_putdec(desc->wb.length);
+        serial_puts(" status_error=");         serial_puthex(desc->wb.status_error, 8);
+        serial_puts("\n");
+    }
 
     uint32_t pkt_len = desc->wb.length;
     if (pkt_len > I211_PKT_BUF_SIZE)

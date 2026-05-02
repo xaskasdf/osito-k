@@ -648,9 +648,18 @@ uint8_t  pci_get_ecam_end_bus(void) { return ecam_end_bus; }
 /* Enable bus mastering + memory space for a PCI device */
 void pci_enable_bus_master(uint8_t bus, uint8_t dev, uint8_t func)
 {
-    uint32_t cmd = pci_read32(bus, dev, func, 0x04);
-    cmd |= (1 << 1) | (1 << 2);  /* Memory Space + Bus Master */
-    pci_write32(bus, dev, func, 0x04, cmd);
+    uint32_t cmd_before = pci_read32(bus, dev, func, 0x04);
+    uint32_t cmd_after  = cmd_before | (1u << 1) | (1u << 2);  /* Memory + BusMaster */
+    pci_write32(bus, dev, func, 0x04, cmd_after);
+    uint32_t cmd_read = pci_read32(bus, dev, func, 0x04);
+    serial_puts("[PCI] BM enable B/D/F=");
+    serial_puthex(bus, 2);  serial_puts(":");
+    serial_puthex(dev, 2);  serial_puts(".");
+    serial_puthex(func, 1);
+    serial_puts(" CMD before=0x"); serial_puthex(cmd_before & 0xFFFF, 4);
+    serial_puts(" wrote=0x");      serial_puthex(cmd_after  & 0xFFFF, 4);
+    serial_puts(" readback=0x");   serial_puthex(cmd_read   & 0xFFFF, 4);
+    serial_puts("\n");
 }
 
 /* Enable MSI for a PCI device — program MSI message address/data and set enable.

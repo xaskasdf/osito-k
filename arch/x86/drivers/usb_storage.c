@@ -266,6 +266,14 @@ int usb_storage_write(uint64_t lba, uint32_t count, const void *buf)
         uint8_t cdb[10];
         memset(cdb, 0, 10);
         cdb[0] = SCSI_WRITE_10;
+        /* FUA (Force Unit Access) — byte 1 bit 3. Bypass the device's
+         * write-back cache: data goes directly to the media before the
+         * command completes. Required because most cheap USB controllers
+         * silently reject SCSI SYNCHRONIZE_CACHE_10 (sense 0x5/0x24,
+         * "Invalid Operation Code"), so an explicit flush has no effect
+         * and pulled-USB-while-cache-is-dirty loses recent writes —
+         * exactly the "I did dmesg > foo, file's not on disk" symptom. */
+        cdb[1] = (1u << 3);
         cdb[2] = (uint8_t)(lba >> 24);
         cdb[3] = (uint8_t)(lba >> 16);
         cdb[4] = (uint8_t)(lba >> 8);

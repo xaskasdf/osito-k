@@ -647,6 +647,14 @@ void __initk kernel_entry(boot_info_t *info)
         fb_puts("\n NIC: "); fb_puts(chip); fb_puts("\n");
 
         int nic_ok = -1;
+        /* Enable PCI Bus Master + Memory Space *before* the driver touches
+         * the chip — without DMA the i211 cannot fetch TX descriptors or
+         * write RX packets to RAM, so the link comes up at the PHY layer
+         * but no frames ever cross the wire. UEFI usually leaves this
+         * disabled when the device wasn't claimed by an OPROM. */
+        extern void pci_enable_bus_master(uint8_t bus, uint8_t dev, uint8_t func);
+        pci_enable_bus_master(nic_pci->bus, nic_pci->dev, nic_pci->func);
+
         if (nic_pci->vendor_id == 0x10EC &&
             (nic_pci->device_id == 0x8168 || nic_pci->device_id == 0x8136 ||
              nic_pci->device_id == 0x8161)) {
