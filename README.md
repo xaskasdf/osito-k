@@ -1,15 +1,15 @@
 ```
 +============================================================================+
 |                                                                            |
-|                       O S I T O - K   v 0 . 1                              |
+|                         O S I T O - K   v 0 . 4                            |
 |                                                                            |
-|               PREEMPTIVE MULTITASKING OPERATING SYSTEM KERNEL              |
+|              MULTI-ARCHITECTURE BARE-METAL OPERATING SYSTEM                |
 |                                                                            |
-|                   FOR THE XTENSA LX106 MICROPROCESSOR                      |
+|         FOR XTENSA LX106 ▪ x86-64 ▪ AArch64 (SM8350) PROCESSORS            |
 |                                                                            |
 |                        OPERATOR'S REFERENCE MANUAL                         |
 |                                                                            |
-|                          REVISION 3 -- FEB 2026                            |
+|                          REVISION 4 -- MAY 2026                            |
 |                                                                            |
 +============================================================================+
 ```
@@ -17,10 +17,12 @@
                             *** IMPORTANT NOTICE ***
 
       This manual describes the installation, configuration, and operation
-      of the Osito-K Preemptive Kernel, Version 0.1. The operator should
-      read this document in its entirety before attempting to initialize
-      the system. Improper configuration may result in unpredictable
-      behavior of the processing unit.
+      of the Osito-K Bare-Metal Operating System, Version 0.4. The system
+      now spans three (3) processor architectures and approximately one
+      hundred sixty thousand (160,000) lines of source code. The operator
+      should not attempt to read this manual in its entirety in a single
+      session. Improper exposure to kernel source code may result in
+      unpredictable behavior of the operator.
 
 
 ## TABLE OF CONTENTS
@@ -29,120 +31,208 @@
   SECTION                                                            PAGE
   -------                                                            ----
   I.    SYSTEM OVERVIEW ........................................      1
-  II.   HARDWARE SPECIFICATIONS ................................      2
-  III.  SYSTEM REQUIREMENTS ....................................      3
-  IV.   INSTALLATION PROCEDURE .................................      4
-  V.    BUILDING THE SYSTEM FROM SOURCE ........................      5
-  VI.   LOADING THE SYSTEM INTO MEMORY .........................      6
-  VII.  SYSTEM INITIALIZATION SEQUENCE .........................      7
-  VIII. OPERATOR CONSOLE COMMANDS ..............................      8
-  IX.   INTER-PROCESS COMMUNICATION ............................      9
-  X.    FILESYSTEM (OsitoFS) ...................................     10
-  XI.   3D GRAPHICS AND ELITE FLIGHT DEMO ......................     11
-  XII.  ZFORTH INTERACTIVE LANGUAGE ............................     12
-  XIII. SYSTEM ARCHITECTURE ....................................     13
-  XIV.  MEMORY MAP .............................................     14
-  XV.   SOURCE FILE DIRECTORY ..................................     15
-  XVI.  KNOWN LIMITATIONS ......................................     16
-  XVII. WARRANTY AND DISCLAIMER ................................     17
+  II.   SUPPORTED ARCHITECTURES ................................      2
+  III.  QUICK INSTALLATION (PER ARCHITECTURE) ..................      3
+  IV.   x86-64 BARE-METAL AI/GAMING OS .........................      4
+  V.    XTENSA LX106 EMBEDDED KERNEL ...........................      5
+  VI.   AArch64 (ROG PHONE 5 / SM8350) PORT ....................      6
+  VII.  SELECTED FEATURES OF NOTE ..............................      7
+  VIII. SOURCE TREE LAYOUT .....................................      8
+  IX.   DOCUMENTATION INDEX ....................................      9
+  X.    PROJECT STATISTICS .....................................     10
+  XI.   WARRANTY AND DISCLAIMER ................................     11
 ```
 
 ---
 
+
 ## I. SYSTEM OVERVIEW
 
-Osito-K (from Spanish *osito*, "little bear") is a **bare-metal preemptive
-multitasking kernel** engineered for the Xtensa LX106 processor.
-A [naranjositos.tech](https://naranjositos.tech/) project. The system
-operates without the assistance of any vendor SDK, communicating directly
-with the hardware registers of the processing unit.
+Osito-K (from Spanish *osito*, "little bear") is a **bare-metal operating
+system** authored without dependence on any vendor SDK or third-party
+runtime. A [naranjositos.tech](https://naranjositos.tech/) project. It
+began in 2025 as a 4 KB preemptive kernel for the ESP8266 microcontroller
+and has, through methodical accretion, grown to encompass three
+processor architectures, hundreds of kernel modules, an in-kernel large
+language model inference engine, twelve filesystem drivers, a Vulkan
+graphics stack, a Win32 PE32 compatibility layer, and a small library
+of vintage 1990s video games running on top of the latter.
 
-The kernel provides the following capabilities:
+The unifying philosophy is the same on every platform:
 
-  - **Priority-based preemptive scheduling** at a rate of 100 ticks per
-    second. Higher-priority tasks always preempt lower-priority ones;
-    tasks at the same priority level are scheduled round-robin.
-  - **Hardware interrupt-driven context switching** with full preservation
-    of all 16 general-purpose registers, the Processor Status word, the
-    Shift Amount Register, and the Exception Program Counter.
-  - **Two-tier memory allocation**: a fixed-block pool (8 KB, 256 x 32-byte
-    blocks) for fast O(1) alloc/free, and a general-purpose heap allocator
-    (8 KB) with first-fit allocation and automatic coalescing.
-  - **Inter-process communication** via counting semaphores, mutexes,
-    and bounded message queues with blocking and non-blocking modes.
-  - **Software timers** with one-shot and periodic modes, serviced by
-    the kernel tick interrupt at zero additional hardware cost.
-  - **General-purpose I/O** with automatic IOMUX configuration for all
-    17 GPIO pins, including the special RTC-domain GPIO16.
-  - **Flat filesystem (OsitoFS)** on SPI flash with contiguous allocation,
-    bitmap-based sector management, and up to 128 files on ~3.8 MB of
-    storage. Inspired by the BBC Micro's DFS.
-  - **Interrupt-driven serial communications** with a 64-byte receive
-    buffer and cooperative mutual exclusion for output operations.
-  - **An interactive operator console** with 25+ built-in commands for
-    system monitoring, file operations, hardware control, 3D graphics,
-    and an Elite flight demo.
-  - **zForth interactive language** — a minimal Forth interpreter with
-    hardware syscalls for framebuffer graphics, wireframe 3D rendering,
-    and task scheduling. Scripts stored on OsitoFS.
-  - **3D wireframe graphics** with fixed-point math, 3x3 matrix rotation,
-    perspective projection, and Elite ship models (Cobra, Sidewinder,
-    Viper, Coriolis). All running at 80 MHz with no floating point.
+  - **No SDK**. The system speaks to hardware registers directly.
+  - **No floating-point reliance** for core paths. Fixed-point and
+    integer math wherever practical.
+  - **Inspectable behavior**. Every subsystem emits diagnostic output
+    on a serial port. The operator may always determine what the
+    system is doing and why.
+  - **Self-hosting where feasible**. The x86-64 build can compile its
+    own kernel from source while running, then `kexec` into the new
+    image without rebooting.
 
 
-## II. HARDWARE SPECIFICATIONS
-
-The Osito-K kernel is designed to exploit the full capabilities of the
-following high-performance computing platform:
+## II. SUPPORTED ARCHITECTURES
 
 ```
 +==========================================================================+
-|                      WEMOS D1 COMPUTING MODULE                           |
-|                      TECHNICAL SPECIFICATIONS                            |
+|                  PROCESSOR ARCHITECTURES SUPPORTED                       |
 +==========================================================================+
 |                                                                          |
-|  PROCESSOR                                                               |
-|  .........                                                               |
-|    Model ............... Tensilica Xtensa LX106                          |
-|    Architecture ........ 32-bit RISC, Harvard                            |
-|    Clock Speed ......... 80,000,000 cycles/second  (80 MHz)             |
-|    Instruction Set ..... Xtensa ISA, CALL0 ABI                          |
-|    Register File ....... 16 general-purpose, 32-bit wide                |
-|    Register Windows .... None (CALL0 convention)                         |
-|    Pipeline ............ In-order, single issue                          |
-|    Interrupt Levels .... 2 (Level-1 maskable, NMI)                      |
-|    Memory Management ... None (flat address space)                       |
+|  ARCH         CPU FAMILY                  REPRESENTATIVE TARGET           |
+|  ----         ----------                  --------------------            |
 |                                                                          |
-|  MEMORY SUBSYSTEM                                                        |
-|  ................                                                         |
-|    Data RAM (DRAM) ..... 81,920 bytes    (80 KB)                        |
-|    Instruction RAM ..... 32,768 bytes    (32 KB)                        |
-|    Flash Storage ....... 4,194,304 bytes (4 MB)                         |
-|    Flash Interface ..... Memory-mapped, cached (irom0)                   |
-|    Flash Mode .......... DOUT (Dual Output)                              |
+|  xtensa       Tensilica Xtensa LX106      Wemos D1 Mini (ESP8266)        |
+|               80 MHz, 80+32 KB RAM        4 MB SPI flash                 |
 |                                                                          |
-|  PERIPHERALS                                                             |
-|  ...........                                                             |
-|    UART Channels ....... 2 (UART0 active, 115200 baud)                  |
-|    Hardware Timers ..... 2 (FRC1 assigned to kernel)                     |
-|    GPIO Pins ........... 17 (active low/high, multiplexed)              |
-|    SPI Controllers ..... 2                                               |
-|    I2C Bus ............. 1 (software-emulated)                           |
-|    WiFi Transceiver .... IEEE 802.11 b/g/n (reserved for future use)    |
-|    ADC ................. 1 channel, 10-bit resolution                    |
+|  x86-64       AMD Ryzen / Intel Core      Ryzen 7 5800X + RTX 3090       |
+|               (UEFI), AVX2/FMA/F16C        32 GB DRAM, NVMe              |
 |                                                                          |
-|  POWER                                                                   |
-|  .....                                                                   |
-|    Operating Voltage ... 3.3V                                            |
-|    Supply (USB) ........ 5.0V via Micro-USB connector                   |
-|                                                                          |
-|  FORM FACTOR                                                             |
-|  ...........                                                             |
-|    Board Dimensions .... 34.2mm x 25.6mm                                |
-|    Weight .............. Approximately 3 grams                           |
+|  arm64        ARMv8.2-A (SM8350)          ASUS ROG Phone 5 (in progress) |
+|               Snapdragon 888              16 GB DRAM, UFS 3.1            |
 |                                                                          |
 +==========================================================================+
 ```
+
+The same source tree builds for all three. Architecture-specific code
+lives under `arch/<arch>/`; truly shared code (the GUI, OsitoFS on-disk
+format, Unicode subsystem) lives at the top level under `gui/` and
+`include/common/`.
+
+
+## III. QUICK INSTALLATION (PER ARCHITECTURE)
+
+The operator should select the appropriate procedure for the target
+hardware. The three procedures are mutually independent.
+
+```
++--- xtensa (ESP8266) -----------------------------------------------------+
+
+    export PATH="$PWD/arch/xtensa/tools/xtensa-lx106-elf/bin:$PATH"
+    make
+    make flash    # via /dev/ttyUSB0 (or COMx on Windows)
+
++--- x86-64 ---------------------------------------------------------------+
+
+    sudo apt install gnu-efi              # or brew install x86_64-elf-gcc
+    make -C arch/x86                      # produces boot.efi + kernel.elf
+    make -C tools/ositofs                 # host tools to populate FS image
+    tools/smoke-test.sh                   # boot in QEMU headless 30 sec
+
++--- arm64 (SM8350) -------------------------------------------------------+
+
+    make -C arch/arm                      # produces kernel.img
+    # Flash to userdata partition via fastboot — see docs/aarch64-detail.md
+```
+
+Refer to the per-architecture section below for build flag inventory,
+boot sequence, and known limitations.
+
+
+## IV. x86-64 BARE-METAL AI/GAMING OS
+
+The x86-64 build is the largest and most actively developed. It boots
+via UEFI on physical hardware (verified on AMD Ryzen 7 5800X) and in
+QEMU. The kernel ships approximately one hundred (100) modules, twenty
+(20) device drivers, and sixteen (16) filesystem implementations.
+
+**Selected capabilities:**
+
+  - **In-kernel LLM inference**. Llama 3.2 1B forward pass on CPU
+    (AVX2/FMA tensor kernels) and on GPU (NVIDIA Ampere via the kernel
+    NVK backend, when GSP firmware is present). Exposed as the
+    `sys_inference` syscall family (530-534) and as a UDP prompt
+    server on port 7777. See `docs/x86-features-detail.md`.
+
+  - **Win32 PE32 compatibility**. Twelve DLL shims (kernel32, msvcrt,
+    user32, gdi32, advapi32, comctl32, comdlg32, ddraw, dsound, ntdll,
+    ole32, shell32, winmm, wsock32) enable execution of unmodified
+    Windows binaries in long-mode-thunked compatibility. Active
+    debugging targets: Unreal Tournament '99, Grand Theft Auto V.
+    See `docs/binary-compat-roadmap.md`.
+
+  - **DOS-native execution.** VCPI server, INT 31h DPMI host, and
+    long-mode-to-protected-mode descriptor synthesis allow `DOOM.EXE`
+    and similar DOS4GW-protected-mode programs to run with the kernel
+    serving as the DPMI/VCPI provider. See `docs/dos-native-status.md`.
+
+  - **Vulkan + OpenGL.** Mesa 25.0.0 with Zink (OpenGL-on-Vulkan)
+    ported into the OS; NVK userland ICD plus Venus protocol bridge
+    for virtio-gpu hosts. Software rasterizer for guest-local present.
+    See `docs/x86-gpu-roadmap.md`.
+
+  - **Unicode subsystem**. Plan 9-style 4-layer architecture (libutf
+    codec + PSF2 fonts from OsitoFS + LRU cache + width-aware
+    renderer). ASCII/Latin-1 always available link-time; Cyrillic /
+    Greek / CJK / Hangul on demand from `/fonts/*.psf`. See
+    `docs/unicode-architecture.md`.
+
+  - **Self-hosting compilation.** The kernel can rebuild itself from
+    source while running (TCC in-OS) and `kexec` into the new image.
+    Phases 0-4 of the kernel/bootloader separation are complete. See
+    `docs/kernel-separation.md`.
+
+  - **GPU compute pipeline.** Native GSP Falcon bring-up phases 1-10
+    on physical Ampere, FWSEC-FRTS, WPR2/Radix3, GMMU, channels,
+    GPFIFO, SASS kernel codegen. See `docs/x86-gpu-roadmap.md`.
+
+  - **Twelve filesystems.** OsitoFS v2/v3 native, FAT32 R/W, tmpfs,
+    ext2/3/4 RO, ISO 9660 RO, exFAT RO, NTFS RO, UDF RO, SquashFS RO,
+    HFS+ RO, Btrfs RO, APFS RO. See `docs/filesystem-roadmap.md`.
+
+  - **Networking.** ARP, IPv4, IPv6, ICMP, UDP, TCP (with fast
+    retransmit), DNS, DHCP, NTP, mDNS, TLS 1.2, TLS 1.3, HTTPS client
+    + server, BSD sockets, Wayland stub.
+
+  - **Container primitives.** PID/mount/net/UTS/IPC namespaces,
+    cgroups (CPU quota + memory limits), Linux capabilities (38
+    caps), seccomp BPF.
+
+  - **Linux kernel parity items.** dmesg, sysctl, sysfs, procfs,
+    epoll, eventfd, FUSE, io_uring, eBPF VM, tracepoints, RCU, slab,
+    workqueue, lockdep, PSI, kobject, kallsyms, kprof.
+
+For the complete x86-64 capabilities table (140+ entries) see
+`CLAUDE.md`. For implementation details see `docs/x86-features-detail.md`.
+
+
+## V. XTENSA LX106 EMBEDDED KERNEL
+
+The original Osito-K. A preemptive multitasking kernel for the
+Espressif ESP8266 microcontroller, running without the Espressif SDK.
+
+**Selected capabilities:**
+
+  - Priority-based preemptive scheduling at 100 Hz with full register
+    save/restore via the FRC1 timer interrupt at vector base 0x50.
+  - Two-tier memory allocation: 256-block × 32-byte pool + 8 KB
+    first-fit heap with coalescing.
+  - Three IPC primitives: counting semaphores, message queues,
+    software timers.
+  - Flat filesystem on SPI flash, contiguous allocation, up to 128
+    files in 3.8 MB.
+  - 25+ built-in shell commands.
+  - **Elite flight demo.** Wireframe 3D rendering of Cobra,
+    Sidewinder, Viper, and Coriolis ship models on a 128×64
+    framebuffer with fixed-point 16.16 math and 3×3 matrix rotation.
+  - **DOOM (wireframe 2.5D).** A procedurally-generated BSP-style
+    engine fits in approximately 3.5 KB of IRAM.
+  - **zForth.** A complete Forth interpreter with hardware syscalls
+    for framebuffer and scheduler control. Scripts persist on the
+    filesystem.
+
+**Build configuration flags** (passed on the `make` command line):
+
+```
+  ENABLE_ELITE=1   Elite flight demo + ship models  (~2.1 KB IRAM)
+  ENABLE_FORTH=1   zForth interactive language       (~4.2 KB IRAM)
+  ENABLE_DOOM=0    DOOM wireframe engine             (~3.5 KB IRAM)
+```
+
+For the original full operator's manual covering the embedded build
+in detail (boot sequence, console commands, IPC primitives, file
+operations, Elite controls, zForth syntax) see
+`docs/esp8266-detail.md`. The serial console operates at 74880 baud
+during ROM bootloader phase, 115200 baud during kernel operation.
 
       NOTE: The 80 MHz clock provides ample processing power for the
       simultaneous execution of up to eight (8) independent programs.
@@ -150,965 +240,176 @@ following high-performance computing platform:
       under normal workloads.
 
 
-## III. SYSTEM REQUIREMENTS
-
-The following items are required prior to system assembly:
-
-```
-  ITEM                            PURPOSE
-  ----                            -------
-  Wemos D1 Mini board             Target computing hardware
-  USB cable (Micro-B)             Power supply and serial link
-  Host computer (Windows)         Assembly and loading station
-  xtensa-lx106-elf-gcc            Cross-compilation toolchain
-  esptool (Python)                Firmware loading utility
-  Serial terminal program         Operator console access
-```
-
-The cross-compilation toolchain may be obtained from the Espressif Systems
-distribution archive. The operator should place the toolchain binaries in
-the `tools/xtensa-lx106-elf/` directory.
-
-
-## IV. INSTALLATION PROCEDURE
-
-**Step 1.** Obtain the system source distribution and place it in a
-suitable working directory:
-
-```
-  C:\Users\operator\osito-k\
-```
-
-**Step 2.** Ensure the cross-compilation toolchain is accessible. Add
-the toolchain to the command search path:
-
-```
-  export PATH="/c/Users/operator/osito-k/tools/xtensa-lx106-elf/bin:$PATH"
-```
-
-**Step 3.** Verify the toolchain installation by invoking:
-
-```
-  xtensa-lx106-elf-gcc --version
-```
-
-The system should respond with the compiler identification string. If no
-response is received, consult the toolchain installation documentation.
-
-**Step 4.** Ensure the Python `esptool` module is installed:
-
-```
-  py -m esptool version
-```
-
-
-## V. BUILDING THE SYSTEM FROM SOURCE
-
-To assemble the kernel from its component source modules, issue the
-following command from the system root directory:
-
-```
-  make
-```
-
-The assembler will process all source modules and produce the following
-output files:
-
-```
-  build/osito.elf              Executable and Linkable Format image
-  build/osito.map              Memory allocation map
-  build/osito0x00000.bin       Binary image for flash programming
-```
-
-Upon successful assembly, the system will display a summary of memory
-utilization:
-
-```
-  === Osito-K build complete ===
-     text    data     bss     dec     hex filename
-    24742    9992   37232   71966   1191e build/osito.elf
-```
-
-      NOTE: The .bss segment includes all task stacks, the memory pool,
-      the heap arena, and the filesystem sector buffer, which accounts
-      for the majority of RAM allocation.
-
-      IMPORTANT: The image version parameter MUST be set to 1.
-      Version 2 images are not compatible with this hardware.
-      The flash mode MUST be DOUT. QIO mode will cause boot failure.
-
-
-## VI. LOADING THE SYSTEM INTO MEMORY
-
-**Step 1.** Connect the Wemos D1 computing module to the host computer
-via the USB cable.
-
-**Step 2.** Determine the serial port assignment (typically `COM4` on
-Windows systems).
-
-**Step 3.** Transfer the system image to the flash memory:
-
-```
-  make flash
-```
-
-Or manually:
-
-```
-  py -m esptool --chip esp8266 --port COM4 --baud 460800 \
-      write_flash --flash_mode dout --flash_size 4MB \
-      --flash_freq 40m 0x00000 build/osito0x00000.bin
-```
-
-**Step 4.** The loading utility will display progress indicators.
-Wait for the message:
-
-```
-  Hard resetting via RTS pin...
-```
-
-The system is now loaded and will begin execution automatically upon
-the next power-on or reset event.
-
-      CAUTION: To restore the factory firmware at any time, the
-      operator may execute:
-
-        py -m esptool --port COM4 write_flash 0x0 \
-            backup/wemos_d1_full_backup.bin
-
-
-## VII. SYSTEM INITIALIZATION SEQUENCE
-
-Upon power application, the kernel performs the following initialization
-sequence automatically:
-
-```
-  PHASE    OPERATION                          DESCRIPTION
-  -----    ---------                          -----------
-    1      ROM Bootloader                     Hardware self-test, flash load
-    2      _start (crt0.S)                    Set stack pointer, VECBASE, clear BSS
-    3      nosdk_init                         Disable watchdog, PLL to 80 MHz
-    4      uart_init                          Serial port: 115200 8N1, RX interrupts
-    5      pool_init                          Memory pool: 256 blocks x 32 bytes
-    6      heap_init                          Heap allocator: 8192 bytes
-    7      fs_init                            Mount filesystem (if formatted)
-    8      sched_init                         Scheduler: idle task created
-    9      input_init                         Joystick ADC + button GPIO setup
-   10      video_init                         Framebuffer 128x64 (1024 bytes)
-   11      task_create (x2)                   Input (pri=2) and Shell (pri=3)
-   12      timer_init                         FRC1 armed: 100 Hz, prescaler /16
-   13      sched_start                        Context loaded, rfe — system live
-```
-
-The operator console will display the following banner:
-
-```
-  =============================
-    Osito-K v0.1
-    Bare-metal kernel for ESP8266
-  =============================
-  pool: initialized 256 blocks x 32 bytes = 8192 bytes
-  heap: 8192 bytes
-  fs: mounted, 0 files, 958 sectors
-  sched: initialized, idle task created
-  video: framebuffer 128x64 (1024 bytes)
-  sched: created task 'input' (id=1)
-  sched: created task 'shell' (id=2)
-  timer: FRC1 configured at 100 Hz (load=50000)
-
-  Starting kernel...
-
-  sched: starting scheduler
-
-  osito>
-```
-
-The `osito>` prompt indicates the system is operational and awaiting
-operator input.
-
-      NOTE: The serial console operates at 74880 baud during the ROM
-      bootloader phase, then 115200 baud during kernel operation.
-      Some terminal programs may display garbled output during the
-      initial boot phase. This is normal and expected.
-
-
-## VIII. OPERATOR CONSOLE COMMANDS
-
-The Osito-K interactive shell accepts the following commands at the
-`osito>` prompt. Commands are terminated by pressing the RETURN key.
-The BACKSPACE key may be used to correct input errors.
-
-```
-+----------+----------------------------------------------------------+
-| COMMAND  | DESCRIPTION                                              |
-+----------+----------------------------------------------------------+
-|          |                                                          |
-| ps       | Display a listing of all active tasks in the system.     |
-|          | For each task: ID, Priority, State, Ticks, Name.         |
-|          |                                                          |
-| mem      | Display memory pool utilization statistics.               |
-|          |                                                          |
-| heap     | Display heap allocator statistics: free, used, largest   |
-|          | contiguous block, and fragmentation count.               |
-|          |                                                          |
-| heap test| Demonstrate heap allocation and coalescing by allocating |
-|          | and freeing several blocks with interleaved patterns.    |
-|          |                                                          |
-| ticks    | Display the current system tick counter and the          |
-|          | equivalent elapsed time in seconds.                      |
-|          |                                                          |
-| gpio     | Display the state of all safe GPIO pins: direction,     |
-|          | value, and Wemos D1 board label (D0-D8).                |
-|          |                                                          |
-| gpio     | Read a specific pin. Returns 0 or 1.                     |
-|   read N |                                                          |
-|          |                                                          |
-| gpio     | Set pin N as output HIGH or LOW.                         |
-|  high N  |                                                          |
-|  low N   |                                                          |
-|          |                                                          |
-| gpio     | Blink the onboard LED (GPIO2) five times.                |
-|  blink   |                                                          |
-|          |                                                          |
-| fs       | Filesystem commands (see Section X for details).         |
-|          |                                                          |
-| pri N P  | Change the priority of task N to level P. Takes effect   |
-|          | at the next scheduling decision. Priority 0 is lowest.   |
-|          |                                                          |
-| timer    | Arm a one-shot software timer for 1 second. Reports     |
-|          | the actual elapsed ticks when it fires.                   |
-|          |                                                          |
-| forth    | Enter the zForth interactive REPL. Type Forth code       |
-|          | at the prompt. Press Ctrl+C to return to the shell.      |
-|          |                                                          |
-| run F    | Execute a .zf Forth script stored in OsitoFS.            |
-|          | Usage: run <filename>                                    |
-|          |                                                          |
-| joy      | Joystick live monitor. Displays ADC value, button state, |
-|          | and input events in real time. Press Ctrl+C to exit.     |
-|          |                                                          |
-| fbtest   | Draw a test pattern on the 128x64 framebuffer:           |
-|          | border, title text, and character set sample.            |
-|          |                                                          |
-| fixtest  | Run the fixed-point 16.16 math test suite: sin, cos,    |
-|          | sqrt, div, lerp, and distance approximation.             |
-|          |                                                          |
-| mat3test | Run the 3D matrix/vector math test: rotations,           |
-|          | projections, and matrix multiplication.                  |
-|          |                                                          |
-| wiretest | Render a static wireframe cube to the framebuffer.       |
-|          |                                                          |
-| wirespin | Animate a spinning wireframe cube (~5 seconds).          |
-|          | Press Ctrl+C to stop early.                              |
-|          |                                                          |
-| ship [N] | Display Elite ship model (1=cobra, 2=sidewinder,         |
-|          | 3=viper, 4=coriolis). No argument lists all.             |
-|          |                                                          |
-| shipspin | Cycle through all ship models with rotation animation.   |
-|          |                                                          |
-| elite    | Launch the Elite flight demo. Keyboard controls:          |
-|          | a/d=yaw, w/s=pitch, n=next ship. Press Ctrl+C to exit.  |
-|          |                                                          |
-| uname    | Display system identification: kernel version, CPU,      |
-|          | clock speed, memory sizes, tick rate, max tasks.         |
-|          |                                                          |
-| help     | Display a summary of available commands.                 |
-|          |                                                          |
-| reboot   | Perform an immediate software reset of the processor.    |
-|          |                                                          |
-+----------+----------------------------------------------------------+
-```
-
-**Task States:**
-
-```
-  STATE    MEANING
-  -----    -------
-  free     Task slot is unoccupied and available for allocation
-  ready    Task is eligible for execution and awaiting its turn
-  run      Task is currently in possession of the processor
-  block    Task is voluntarily suspended (waiting for a resource)
-  dead     Task has terminated and its slot may be reclaimed
-```
-
-**Sample session:**
-
-```
-  osito> ps
-  ID  Pri  State  Ticks  Name
-  0   0    ready  1  idle
-  1   2    ready  0  input
-  2   3    run    206  shell
-
-  osito> uname
-  Osito-K v0.1 xtensa-lx106 ESP8266 @ 80MHz DRAM:80KB IRAM:32KB tick:100Hz tasks:8
-
-  osito> mem
-  Memory pool:
-    Block size:  32 bytes
-    Total:       256 blocks (8192 bytes)
-    Free:        256 blocks
-    Used:        0 blocks
-
-  osito> heap
-  Heap:
-    Total:      8192 bytes
-    Free:       8188 bytes
-    Used:       0 bytes
-    Largest:    8188 bytes
-    Fragments:  1
-
-  osito> forth
-  zf: ready (Ctrl+C exit)
-  1 2 + .
-  3  ok
-  : sq dup * ;
-   ok
-  7 sq .
-  49  ok
-  [Ctrl+C]
-
-  osito> fs write test.zf : cube dup dup * * ; 5 cube .
-  wrote 29 bytes to 'test.zf'
-  osito> run test.zf
-  125  ok
-
-  osito> timer
-  timer: armed 1s one-shot... FIRED! (100 ticks)
-  active timers: 0
-
-  osito> ticks
-  Tick count: 808 (8 seconds)
-```
-
-
-## IX. INTER-PROCESS COMMUNICATION
-
-Osito-K provides three IPC primitives for synchronization and data
-exchange between tasks:
-
-**Counting Semaphores:**
-
-```
-  FUNCTION                 DESCRIPTION
-  --------                 -----------
-  sem_init(&s, count)      Initialize with given count
-  sem_wait(&s)             Decrement; block if count is zero
-  sem_trywait(&s)          Non-blocking attempt (returns -1 if zero)
-  sem_post(&s)             Increment; wake one blocked task
-  sem_count(&s)            Read current count
-```
-
-Semaphores are used for resource counting and event signaling.
-A semaphore initialized to 1 functions as a mutual exclusion lock
-(mutex). The UART output subsystem uses this mechanism to prevent
-interleaved output from concurrent tasks.
-
-**Message Queues:**
-
-```
-  FUNCTION                 DESCRIPTION
-  --------                 -----------
-  mq_init(&q, buf, sz, n) Initialize queue with buffer, message size, depth
-  mq_send(&q, msg)         Enqueue message; block if full
-  mq_recv(&q, msg)         Dequeue message; block if empty
-  mq_trysend(&q, msg)      Non-blocking send (returns -1 if full)
-  mq_tryrecv(&q, msg)      Non-blocking receive (returns -1 if empty)
-  mq_count(&q)             Number of messages currently queued
-```
-
-Messages are copied by value. The queue is implemented as a circular
-buffer with head and tail pointers. The `ping` shell command demonstrates
-message queue operation by sending a message from the shell task to the
-heartbeat task.
-
-**Software Timers:**
-
-```
-  FUNCTION                      DESCRIPTION
-  --------                      -----------
-  swtimer_init(&t, cb, arg)     Initialize with callback and argument
-  swtimer_start(&t, tk, mode)   Arm for tk ticks (ONESHOT or PERIODIC)
-  swtimer_stop(&t)              Disarm the timer
-  swtimer_active_count()        Number of currently armed timers
-```
-
-Timers are serviced by the kernel tick ISR at 100 Hz. Callbacks execute
-in interrupt context and must be brief. The `timer` shell command
-demonstrates one-shot timer operation.
-
-
-## X. FILESYSTEM (OsitoFS)
-
-OsitoFS is a flat filesystem on SPI flash, inspired by the BBC Micro's
-Disc Filing System (DFS). It provides persistent file storage across
-power cycles.
-
-**Design Characteristics:**
-
-```
-  Property                  Value
-  --------                  -----
-  Maximum files             128
-  Maximum filename length   23 characters (+ null terminator)
-  Maximum file size         ~3.8 MB (limited by flash capacity)
-  Allocation strategy       Contiguous (no fragmentation within files)
-  Sector size               4,096 bytes
-  Data sectors available    958 (~3,832 KB)
-  Directory structure       Flat (no subdirectories)
-```
-
-**Flash Layout:**
-
-```
-  ADDRESS     SIZE     CONTENTS
-  -------     ----     --------
-  0x00000     256 KB   Kernel firmware image
-  0x40000     4 KB     Superblock (magic, version, statistics)
-  0x41000     4 KB     File table (128 entries x 32 bytes)
-  0x42000     3,832KB  Data area (958 sectors)
-  0x400000    ---      End of 4 MB flash
-```
-
-**Shell Commands:**
-
-```
-  COMMAND                  DESCRIPTION
-  -------                  -----------
-  fs format                Create a fresh filesystem (erases all files)
-  fs ls                    List all files with size and sector count
-  fs df                    Display free space in KB and bytes
-  fs write NAME DATA       Create a file with the given text content
-  fs overwrite NAME DATA   Overwrite an existing file (or create new)
-  fs append NAME DATA      Append data to an existing file
-  fs mv OLD NEW            Rename a file
-  fs cat NAME              Print file contents to the console
-  fs xxd NAME              Hex dump of file contents (up to 256 bytes)
-  fs rm NAME               Delete a file and reclaim its sectors
-  fs upload NAME SIZE      Receive binary file via UART (see below)
-  fs help                  Show filesystem command summary
-```
-
-**Sample filesystem session:**
-
-```
-  osito> fs format
-  fs: formatting...
-  fs: formatted, 958 sectors (3832 KB) available
-
-  osito> fs write hello.txt Hello from Osito-K!
-  wrote 18 bytes to 'hello.txt'
-
-  osito> fs overwrite hello.txt Goodbye!
-  wrote 8 bytes to 'hello.txt'
-
-  osito> fs cat hello.txt
-  Goodbye!
-
-  osito> fs append hello.txt  See you later.
-  appended 14 bytes to 'hello.txt'
-
-  osito> fs cat hello.txt
-  Goodbye! See you later.
-
-  osito> fs mv hello.txt message.txt
-  renamed 'hello.txt' -> 'message.txt'
-
-  osito> fs ls
-  Name                     Size  Sec
-  message.txt              22  1
-
-  osito> fs rm message.txt
-  deleted
-```
-
-**Binary Upload Protocol:**
-
-The `fs upload` command enables transfer of binary files from a host
-computer to OsitoFS. This is essential for loading program images that
-exceed the shell's 128-byte command buffer.
-
-```
-  PROTOCOL SEQUENCE
-  -----------------
-  1. Host sends:   fs upload <name> <size>\r\n
-  2. Device sends: READY\n
-  3. For each 4096-byte sector:
-     a. Host sends up to 4096 bytes of raw data
-     b. Device writes sector to flash
-     c. Device sends '#' (ACK)
-  4. Device sends: \nOK 0x<crc16>\n
-```
-
-The host MUST wait for the '#' acknowledgment before transmitting the
-next sector. This prevents overflow of the 64-byte UART receive buffer
-during flash erase/write operations (~30 ms per sector).
-
-A Python upload utility is provided at `tools/upload.py`:
-
-```
-  py tools/upload.py COM4 game.bin game.bin
-  py tools/upload.py COM4 data.bin data.bin --baud 74880
-```
-
-      NOTE: The filesystem uses ROM SPI functions (SPIRead, SPIWrite,
-      SPIEraseSector) for all flash operations. All buffers passed to
-      these functions must be 4-byte aligned. The filesystem handles
-      alignment internally using a staging buffer when necessary.
-
-      IMPORTANT: The `fs format` command will erase all files
-      irrecoverably. The operator should exercise caution.
-
-
-## XI. 3D GRAPHICS AND ELITE FLIGHT DEMO
-
-Osito-K includes a complete wireframe 3D rendering pipeline, built
-entirely with integer arithmetic on a processor with no floating-point
-unit. This system powers the Elite flight demo.
-
-**Fixed-Point Math (16.16):**
-
-All 3D computation uses `fix16_t` — a 32-bit signed integer where the
-upper 16 bits represent the integer part and the lower 16 bits the
-fractional part. A 256-entry sine table provides trigonometric functions
-with 1.4-degree resolution. Division and square root are computed
-iteratively without hardware support.
-
-**3D Pipeline:**
-
-```
-  Model vertices (fix16 xyz)
-       |
-       v
-  mat3_rotate_x/y/z    ← 3x3 rotation matrix, angle_t (0-255)
-       |
-       v
-  mat3_transform        ← apply rotation to each vertex
-       |
-       v
-  project()             ← perspective projection to 2D (128x64)
-       |
-       v
-  fb_line()             ← Bresenham line drawing to framebuffer
-       |
-       v
-  fb_flush()            ← stream 1024 bytes to UART/display
-```
-
-**Ship Models:**
-
-Geometry data from the original BBC Micro Elite (bbcelite.com),
-scaled to fix16 coordinates:
-
-```
-  MODEL        VERTICES  EDGES   DESCRIPTION
-  -----        --------  -----   -----------
-  Cube              8      12    Test model (unit cube)
-  Cobra Mk III     28      38    Player ship (iconic)
-  Sidewinder       10      15    Common pirate/enemy
-  Viper            15      20    Police patrol ship
-  Coriolis         16      28    Space station (rotating)
-```
-
-**Elite Flight Demo:**
-
-The `elite` command launches an interactive flight demo:
-- Keyboard: `a`/`d` = yaw, `w`/`s` = pitch, `n` = next ship model
-- Starfield: pseudo-random dots scrolling with velocity
-- HUD: speed indicator, compass, ship name
-- Renders at ~15-20 FPS on the 80 MHz processor
-- Press Ctrl+C to exit
-
-
-## XII. ZFORTH INTERACTIVE LANGUAGE
-
-Osito-K includes **zForth**, a minimal Forth interpreter adapted for
-bare-metal embedded use. zForth replaces the earlier Tiny BASIC
-interpreter and bytecode VM, saving approximately 4 KB of IRAM.
-
-**Characteristics:**
-
-```
-  Property                  Value
-  --------                  -----
-  Cell size                 32-bit signed integer (int32_t)
-  Dictionary                2,048 bytes
-  Data stack depth          16 cells
-  Return stack depth        16 cells
-  Number formats            Decimal, hexadecimal (0x prefix)
-  Context persistence       Yes (definitions survive between sessions)
-  Source                    github.com/zevv/zForth (MIT license)
-```
-
-**Built-in Words (core.zf bootstrap):**
-
-The core bootstrap defines essential control flow and convenience words:
-
-```
-  CATEGORY     WORDS
-  --------     -----
-  Arithmetic   + - * / % 1+ 1- dup drop swap rot over pick
-  Comparison   = != < > <= >= <0 =0 not
-  Logic        & | ^ << >>
-  Control      if else fi unless begin again until do loop
-  Variables    variable constant allot !  @ +!
-  I/O          emit . cr br tell s" ."
-  Stack        >r r> i j
-```
-
-**Hardware Syscalls:**
-
-zForth programs can access Osito-K hardware through numbered syscalls:
-
-```
-  WORD           STACK EFFECT       DESCRIPTION
-  ----           ------------       -----------
-  emit           ( c -- )           Print character to UART
-  .              ( n -- )           Print number
-  tell           ( addr len -- )    Print string from dictionary
-  fb-clear       ( -- )             Clear 128x64 framebuffer
-  fb-pixel       ( x y -- )         Set pixel
-  fb-line        ( x0 y0 x1 y1 -- ) Draw line (Bresenham)
-  fb-flush       ( -- )             Send framebuffer to display
-  fb-text        ( col row a l -- ) Draw text string
-  yield          ( -- )             Yield CPU to other tasks
-  ticks          ( -- n )           Push system tick count
-  delay          ( n -- )           Sleep for n ticks
-  wire-render    ( m rx ry rz -- )  Render 3D wireframe model
-  wire-models    ( -- n )           Push number of models
-```
-
-The `wire-render` syscall accepts a model index (0=cube, 1=cobra,
-2=sidewinder, 3=viper, 4=coriolis) and three rotation angles
-(0-255 = 0-360 degrees).
-
-**Example: Spinning Cobra from Forth:**
-
-```
-  osito> forth
-  zf: ready (Ctrl+C exit)
-  : spin 20 0 do fb-clear dup i 8 * i 8 * 0 wire-render fb-flush 3 delay loop drop ;
-   ok
-  1 spin
-   ok
-```
-
-**Running Scripts from OsitoFS:**
-
-```
-  osito> fs write demo.zf fb-clear 1 30 45 0 wire-render fb-flush
-  wrote 46 bytes to 'demo.zf'
-  osito> run demo.zf
-   ok
-```
-
-      NOTE: The earlier Tiny BASIC interpreter and bytecode VM have been
-      removed to conserve IRAM. Their source code is preserved in git
-      history (commits 434697a through 11d5a48) and may be restored as
-      an optional compile-time feature if desired.
-
-
-## XIII. SYSTEM ARCHITECTURE
-
-```
-                     +============================+
-                     |      HARDWARE LAYER        |
-                     |  Xtensa LX106 @ 80 MHz     |
-                     |  DRAM 80KB / IRAM 32KB      |
-                     +============================+
-                                  |
-                     +------------+-------------+
-                     |                          |
-              +------+------+          +--------+--------+
-              |   VECTORS   |          |    FRC1 TIMER   |
-              |  vectors.S  |          |  timer_tick.c   |
-              |  crt0.S     |          |  100 Hz tick    |
-              +------+------+          +--------+--------+
-                     |                          |
-                     v                          v
-              +------+---------------------------+------+
-              |         CONTEXT SWITCH ENGINE           |
-              |         context_switch.S                |
-              |  Save a0-a15, PS, SAR, EPC1 (80 bytes) |
-              |  Switch to ISR stack (512 bytes)        |
-              |  Call os_exception_handler()            |
-              |  Restore next task context + rfe        |
-              +-----------------+-----------------------+
-                                |
-                     +----------+-----------+
-                     |     SCHEDULER        |
-                     |     sched.cpp        |
-                     |  Priority-based +    |
-                     |  round-robin select  |
-                     |  task_create/yield   |
-                     |  task_delay_ticks    |
-                     +----------+-----------+
-                                |
-              +-----------+-----+------+-----------+
-              |           |            |           |
-        +-----+---+ +----+----+ +-----+----+ +----+-----+
-        |  IDLE   | |  INPUT  | |  SHELL   | | (slots  |
-        | task 0  | | task 1  | | task 2   | |  3 - 7) |
-        | pri=0   | | pri=2   | | pri=3    | | avail.  |
-        +---------+ +---------+ +-----+----+ +----------+
-                         |             |
-                    +----+----+  +-----+-----+
-                    |   IPC   |  |   SHELL   |
-                    | sem/mq  |  | COMMANDS  |
-                    | swtimer |  |  25+ cmds |
-                    +---------+  +-----+-----+
-                                       |
-              +----------+-------------+-------------+
-              |          |             |             |
-        +-----+--+ +----+-----+ +----+-----+ +-----+----+
-        |  UART  | | POOL     | |  HEAP    | | OsitoFS  |
-        | TX/RX  | | 32Bx256  | |  8KB     | | SPI flash|
-        | mutex  | | free list| | 1st fit  | | 3.8 MB   |
-        +--------+ +----------+ +----------+ +----------+
-```
-
-**GPIO Subsystem:**
-
-```
-  +-----------------------------------------------------------+
-  |  GPIO DRIVER (gpio.cpp)                                   |
-  |                                                           |
-  |  GPIO 0-15: Standard peripheral (0x60000300)              |
-  |    - IOMUX auto-configuration per pin                     |
-  |    - Direction via GPIO_ENABLE register                   |
-  |    - Read/write via GPIO_IN / GPIO_OUT registers          |
-  |                                                           |
-  |  GPIO 16: RTC domain (separate registers)                 |
-  |    - RTC_GPIO_OUT, RTC_GPIO_ENABLE, RTC_GPIO_IN           |
-  |                                                           |
-  |  Wemos D1 Pin Mapping:                                    |
-  |    D0=GPIO16  D1=GPIO5   D2=GPIO4   D3=GPIO0              |
-  |    D4=GPIO2   D5=GPIO14  D6=GPIO12  D7=GPIO13             |
-  |    D8=GPIO15  (GPIO 6-11 reserved for SPI flash)          |
-  +-----------------------------------------------------------+
-```
-
-
-## XIV. MEMORY MAP
-
-```
-  INSTRUCTION RAM (32 KB)
-  =======================
-  0x40100000  +---------------------+  VECBASE
-              | Exception Vectors   |  vectors.S
-              |   +0x10 Debug       |
-              |   +0x20 NMI         |
-              |   +0x30 Kernel      |
-              |   +0x50 User  <---  |  FRC1 / INUM7 / UART land here
-              |   +0x70 Double      |
-  0x4010007C  +---------------------+
-              | ISR Entry/Exit      |  context_switch.S
-              | Scheduler hot path  |  sched.cpp (critical sections)
-              | Timer handler       |  timer_tick.c
-              | All kernel code     |  ~10 KB total
-  0x40107FFF  +---------------------+  End of IRAM
-
-
-  DATA RAM (80 KB)
-  ================
-  0x3FFE8000  +---------------------+  DRAM_START
-              | .data (initialized) |  Global variables
-              | .rodata             |  String constants
-              +---------------------+
-              | .bss  (zeroed)      |  Uninitialized globals
-              |   task_pool[8]      |  8 x TCB structs
-              |   stack_pool[8]     |  8 x 1536 bytes = 12 KB
-              |   pool_memory       |  256 x 32 bytes = 8 KB
-              |   heap_memory       |  8 KB
-              |   sec_buf[4096]     |  Filesystem sector buffer
-              |   rx_buf[64]        |  UART receive ring buffer
-              |   isr_stack[512]    |  Dedicated interrupt stack
-              +---------------------+
-              | <<< free space >>>  |  ~46 KB available
-              |                     |
-  0x3FFFBFF0  +---------------------+  Initial stack pointer
-  0x3FFFBFFF  +---------------------+  DRAM_END
-
-
-  SPI FLASH (4 MB)
-  =================
-  0x00000000  +---------------------+
-              | Firmware image      |  ~13 KB (kernel + data)
-  0x00003FFF  +---------------------+
-              | (unused)            |
-  0x00040000  +---------------------+  FS_FLASH_BASE
-              | OsitoFS Superblock  |  4 KB (magic, version, stats)
-  0x00041000  +---------------------+
-              | File Table          |  4 KB (128 entries x 32 bytes)
-  0x00042000  +---------------------+
-              | Data Area           |  958 sectors = 3,832 KB
-              |                     |  Contiguous file storage
-  0x00400000  +---------------------+  FS_FLASH_END (4 MB boundary)
-
-
-  FLASH-MAPPED CODE (irom0)
-  =========================
-  0x40200000  +---------------------+
-              | .irom0.text         |  Bulk code (if cache enabled)
-              | String literals     |  Mapped through cache
-  0x405FFFFF  +---------------------+
-```
-
-
-## XV. SOURCE FILE DIRECTORY
-
-```
-  FILE                              LINES  DESCRIPTION
-  ----                              -----  -----------
-
-  Boot sequence
-  ~~~~~~~~~~~~~
-  src/boot/vectors.S                  90   Exception vector table at VECBASE
-  src/boot/crt0.S                     70   CPU init: SP, VECBASE, BSS, jump
-  src/boot/nosdk_init.c               81   WDT off, PLL 80MHz, IOMUX setup
-
-  Kernel core
-  ~~~~~~~~~~~
-  src/kernel/context_switch.S        239   Full ISR save/restore, stack switch
-  src/kernel/sched.cpp               267   Priority scheduler, task management
-  src/kernel/timer_tick.c            148   FRC1 config, exception dispatcher
-  src/kernel/task.h                  155   TCB struct, offsets, API protos
-
-  Synchronization and IPC
-  ~~~~~~~~~~~~~~~~~~~~~~~
-  src/kernel/sem.cpp                 116   Counting semaphores and mutexes
-  src/kernel/sem.h                    64   Semaphore API declarations
-  src/kernel/mq.cpp                  101   Bounded message queues
-  src/kernel/mq.h                     61   Message queue API declarations
-  src/kernel/timer_sw.cpp            113   Software timers (one-shot/periodic)
-  src/kernel/timer_sw.h               65   Software timer API declarations
-
-  Memory management
-  ~~~~~~~~~~~~~~~~~
-  src/mem/pool_alloc.cpp             107   Fixed-block allocator, free list
-  src/mem/pool_alloc.h                32   Pool API declarations
-  src/mem/heap.cpp                   178   First-fit heap, auto-coalescing
-  src/mem/heap.h                      46   Heap API declarations
-
-  Filesystem
-  ~~~~~~~~~~
-  src/fs/ositofs.cpp                 724   Flat filesystem on SPI flash
-  src/fs/ositofs.h                   101   Filesystem API declarations
-
-  Drivers
-  ~~~~~~~
-  src/drivers/uart.cpp               175   UART0: TX, RX IRQ, ring buf, mutex
-  src/drivers/uart.h                  46   UART API declarations
-  src/drivers/gpio.cpp               128   GPIO 0-16, IOMUX auto-config
-  src/drivers/gpio.h                  46   GPIO API declarations
-  src/drivers/adc.cpp                 68   SAR ADC (10-bit, A0 pin)
-  src/drivers/adc.h                   21   ADC API declarations
-  src/drivers/input.cpp              121   Joystick input (ADC + button)
-  src/drivers/input.h                 34   Input event API declarations
-  src/drivers/font.cpp               185   4x6 bitmap font (ASCII 32-126)
-  src/drivers/font.h                  19   Font API declarations
-  src/drivers/video.cpp              270   Framebuffer 128x64, Bresenham lines
-
-  Math library
-  ~~~~~~~~~~~~
-  src/math/fixedpoint.h              120   Fixed-point 16.16 types and inlines
-  src/math/fixedpoint.cpp            162   sin/cos tables, div, sqrt, print
-  src/math/matrix3.h                  72   3D vector/matrix types and inlines
-  src/math/matrix3.cpp               165   Rotation, multiply, transform, project
-
-  3D graphics
-  ~~~~~~~~~~~
-  src/gfx/wire3d.h                    53   Wireframe model struct, render API
-  src/gfx/wire3d.cpp                 140   Render pipeline: rotate→project→draw
-  src/gfx/ships.h                     40   Elite ship model declarations
-  src/gfx/ships.cpp                  285   Ship vertex/edge data (4 models)
-  src/game/game.h                     18   Game API declarations
-  src/game/game.cpp                  220   Elite flight demo (HUD, starfield)
-
-  zForth language
-  ~~~~~~~~~~~~~~~
-  src/forth/zforth.c                 887   Core interpreter (adapted, MIT)
-  src/forth/zforth.h                 119   API header (ctx, eval, push/pop)
-  src/forth/zfconf.h                  28   Config: int32 cells, 2KB dict
-  src/forth/zf_host.cpp              400   Host callbacks, REPL, file runner
-  src/forth/setjmp.h                  25   jmp_buf typedef for Xtensa CALL0
-  src/forth/setjmp.S                  44   setjmp/longjmp (6 registers, 24B)
-
-  User interface
-  ~~~~~~~~~~~~~~
-  src/shell/shell.cpp                830   Interactive console, 25+ commands
-  src/shell/shell.h                   20   Shell entry point declaration
-  src/main.cpp                        70   kernel_main: init and launch
-
-  System headers
-  ~~~~~~~~~~~~~~
-  include/osito.h                     27   Master include
-  include/kernel/config.h             59   System constants
-  include/kernel/types.h              80   Freestanding type definitions
-  include/hw/esp8266_regs.h          143   Peripheral register addresses
-  include/hw/esp8266_iomux.h          70   Pin multiplexing definitions
-  include/hw/esp8266_rom.h            68   ROM function prototypes
-
-  Tools
-  ~~~~~
-  tools/upload.py                    171   Binary upload utility (Python)
-
-  Build system
-  ~~~~~~~~~~~~
-  ld/osito.ld                         84   Linker script (IRAM/DRAM/irom0)
-  ld/rom_functions.ld                 76   ROM function address bindings
-  Makefile                           155   Build system
-  tools/flash.sh                      45   Flash utility script
-  tools/monitor.sh                    17   Serial monitor script
-                                   -----
-  TOTAL                           ~8,000   lines of source
-```
-
-
-## XVI. KNOWN LIMITATIONS
-
-The operator should be aware of the following limitations in the
-current release:
-
-  1. **ROM String Functions.** The `ets_strlen` function resident in
-     the processor's mask ROM has been observed to cause processor
-     exceptions when invoked from preemptible task context. The system
-     uses inline string length computation to avoid this condition.
-
-  2. **Serial Baud Rate.** The ROM bootloader transmits at 74880 baud
-     before kernel initialization sets the UART to 115200 baud. Brief
-     garbled output during the boot phase is expected.
-
-  3. **WiFi Subsystem.** The IEEE 802.11 radio transceiver is present
-     on the hardware but is not initialized or controlled by this
-     release. WiFi support is planned for Version 0.2.
-
-  4. **Watchdog Timer.** The hardware watchdog is disabled during
-     operation. A software watchdog facility is planned for a future
-     release.
-
-  5. **Task Termination.** Tasks are designed to run indefinitely.
-     No mechanism for graceful task exit and resource reclamation is
-     provided in this release.
-
-  6. **Filesystem Limitations.** Files are allocated contiguously.
-     `fs_append` can extend a file only within its pre-allocated sectors;
-     it cannot reallocate. `fs_overwrite` will delete and recreate if the
-     new data exceeds the original sector count. External fragmentation
-     may prevent allocation of large files even when sufficient total
-     free space exists.
-
-  7. **SPI Flash Alignment.** All SPI flash operations require 4-byte
-     aligned buffers. The filesystem handles this internally, but
-     callers of the raw ROM functions (SPIRead, SPIWrite) must ensure
-     proper alignment.
-
-  8. **Stack Size.** Task stacks are limited to 1,536 bytes. Functions
-     must avoid allocating large arrays on the stack. The filesystem
-     uses a shared global sector buffer to stay within this constraint.
-
-
-## XVII. WARRANTY AND DISCLAIMER
+## VI. AArch64 (ROG PHONE 5 / SM8350) PORT
+
+The newest of the three architectures. A bare-metal port to the
+Qualcomm Snapdragon 888 (SM8350) running on a stock ASUS ROG Phone 5,
+delivered as a kernel image flashable via fastboot.
+
+**Selected capabilities:**
+
+  - PL011 UART for early debug output.
+  - GICv3 interrupt controller, GIC distributor + redistributor + ITS.
+  - 4-level MMU paging with 4 KB granule, identity + higher-half map.
+  - PCIe ECAM probing.
+  - HDA audio (over SoC audio block), virtio-blk, virtio-net.
+  - OsitoFS v2 with the same on-disk format as x86-64.
+  - TCP/IP stack identical to x86-64 (cross-arch share).
+  - Syscall/ELF/process subsystems.
+  - Crypto / TLS / HTTPS client.
+  - Multi-core SMP via PSCI CPU_ON.
+  - NEON SIMD tensor kernels for inference.
+  - GUI desktop task rendering to the splash framebuffer (same
+    `gui/` cross-arch implementation as x86-64).
+
+See `docs/aarch64-detail.md` and `docs/arm64-future-work.md`.
+
+
+## VII. SELECTED FEATURES OF NOTE
+
+This section highlights features whose implementation may be of
+particular educational interest. The reader is referred to the
+linked documents for full design rationale.
+
+**Unicode (`docs/unicode-architecture.md`).** Four-layer Plan 9-style
+design. The kernel ships a minimum boot font (ASCII + Latin-1, ~3 KB
+link-time) and loads PSF2 font files from `/fonts/` on OsitoFS for
+broader coverage. CJK 16×16 glyphs are advanced as two cells in
+terminal column counting. The renderer falls through five tiers
+gracefully — a kernel without a filesystem still boots and shows
+español, français, deutsch correctly.
+
+**In-kernel LLM inference (`docs/x86-features-detail.md`).** The
+forward pass of Llama 3.2 1B runs in ring 0 with the model weights
+mmapped from a GGUF file on OsitoFS. Tensor scratch space lives in a
+dedicated 512 MB superpage arena (`tensor_arena`) on 256 × 2 MB
+pages — measurably reduces TLB pressure during attention computation.
+Boot-time CPUID dispatch picks AVX2/FMA, AVX-512, or scalar
+implementations. PMU counters (3 fixed + 4 PMC) provide IPC and
+cache miss measurements.
+
+**Demand-paged ELF loader (`docs/x86-vfs-demand-paging.md`).** PT_LOAD
+segments are not eagerly loaded; a VMA_FILE_ELF region records the
+file mapping and the page-fault handler pulls in pages on first
+touch. Reduces working set size for cold binaries and speeds up
+exec on large ELFs.
+
+**Self-optimizing kernel** (`docs/kernel-demencial.md` §10). Live
+kernel-text patching after boot stabilizes. Static branch sites are
+registered at boot; once 1000 ticks have elapsed without panic, the
+kernel can patch hot branches into unconditional jumps. Disabled by
+default behind a compile-time flag.
+
+**Speculative I/O prefetch** (`docs/kernel-demencial.md` §7). The VFS
+layer records "after opening A, B is opened next" patterns and, on
+subsequent opens of A, dispatches a prefetch of B to an idle AP via
+`smp_submit_ff`. Measurable wins during compilation workloads.
+
+**Hardware breakpoints / watchpoints** (`docs/kernel-demencial.md`
+§6). DR0–DR3 exposed via the `watch` / `unwatch` / `hwbp` shell
+commands. Used during this project to confirm or rule out memory
+corruption suspicions without external JTAG.
+
+For the complete list of advanced kernel features see
+`docs/kernel-demencial.md`.
+
+
+## VIII. SOURCE TREE LAYOUT
+
+```
+osito-k/
+├── arch/
+│   ├── xtensa/             ESP8266 source tree (boot, kernel, drivers,
+│   │                       OsitoFS, Forth, DOOM, Elite, shell, math,
+│   │                       3D wireframe, framebuffer)
+│   ├── x86/                x86-64 source tree:
+│   │   ├── boot/             UEFI bootloader (boot.efi)
+│   │   ├── kernel/           ~100 kernel modules
+│   │   ├── drivers/          NVMe, NIC, GPU, GSP, USB, HDA, virtio, ...
+│   │   ├── fs/               12 filesystem drivers
+│   │   ├── win32/            PE32 compatibility layer
+│   │   ├── dos/              DOS/DPMI host
+│   │   ├── lib/utf/          Unicode codec (libutf)
+│   │   ├── lib/vulkan/       Vulkan loader + ICDs (NVK + Venus)
+│   │   ├── lib/opengl/       Mesa 25.0.0 + Zink for in-kernel OpenGL
+│   │   ├── libc/             Minimal CRT + extended POSIX
+│   │   └── test/             Userspace test programs
+│   └── arm/                AArch64/SM8350 port
+├── gui/                    Cross-architecture GUI (desktop, panel,
+│                           dock, AA text rendering, NTP-synced clock)
+├── include/common/         Shared headers (OsitoFS format, UTF-8 codec,
+│                           font subsystem) — used by host tools too
+├── tools/
+│   ├── ositofs/            9 host tools (mkfs, write, ls, info, ...)
+│   ├── font/               PSF2 generator from GNU Unifont
+│   ├── smoke-test.sh       QEMU smoke test (30 sec headless)
+│   └── smoke-screenshot.sh QEMU + screendump via monitor socket
+├── docs/                   31+ Markdown design documents
+├── CLAUDE.md               Developer notes and complete feature roster
+└── README.md               This file
+```
+
+
+## IX. DOCUMENTATION INDEX
+
+The `docs/` directory contains design rationale, implementation
+notes, and roadmaps for the major subsystems. The operator may wish
+to consult the following entry points:
+
+```
++----------------------------------+--------------------------------------+
+| DOCUMENT                         | TOPIC                                |
++----------------------------------+--------------------------------------+
+| CLAUDE.md                        | Master feature table + dev notes     |
+| docs/x86-features-detail.md      | Per-feature deep dives (x86-64)      |
+| docs/kernel-demencial.md         | 10 advanced kernel features          |
+| docs/kernel-diagram.md           | 5 Mermaid diagrams of architecture   |
+| docs/kernel-architecture.md      | Subsystem-level overview             |
+| docs/kernel-separation.md        | Self-hosting + kexec road            |
+| docs/x86-gpu-roadmap.md          | GSP / Vulkan / NVK / Mesa            |
+| docs/binary-compat-roadmap.md    | Win32 PE / DOS / GTAV / UT99         |
+| docs/unicode-architecture.md     | UTF-8 + PSF2 fonts + renderer        |
+| docs/filesystem-roadmap.md       | 12 current + 15 planned filesystems  |
+| docs/x86-vfs-demand-paging.md    | VFS unified layer + ELF demand-page  |
+| docs/os-selfhost-roadmap.md      | Self-hosting tiers 0-9               |
+| docs/aarch64-detail.md           | ROG Phone 5 / SM8350 port            |
+| docs/esp8266-detail.md           | Original ESP8266 manual              |
+| docs/ositofs2-spec.md            | OsitoFS v2 on-disk format            |
+| docs/ositofs3-spec.md            | OsitoFS v3 on-disk format            |
++----------------------------------+--------------------------------------+
+```
+
+
+## X. PROJECT STATISTICS
+
+```
++==========================================================================+
+|                                                                          |
+|  ARCHITECTURES SUPPORTED ........................ 3                     |
+|  TOTAL SOURCE LINES (kernel only) ............. ~165,000                |
+|  KERNEL MODULES (x86-64) ....................... ~100                    |
+|  DEVICE DRIVERS (x86-64) ....................... ~22                     |
+|  FILESYSTEM DRIVERS ............................ 12 + tmpfs              |
+|  DESIGN DOCUMENTS .............................. 31                      |
+|  HOST TOOLS .................................... 14                      |
+|                                                                          |
+|  LARGEST CALLABLE BINARY (UT99) ................ ~30 MB                  |
+|  LLM MODEL SIZE (Llama 3.2 1B Q4_0) ............ ~700 MB GGUF            |
+|  UNIFONT 15 FULL BMP TIER ...................... 1.4 MB                 |
+|  KERNEL .text + .data (x86-64 stripped) ........ ~6.5 MB                 |
+|                                                                          |
+|  ESP8266 BUILD (DOOM + Elite + Forth) .......... ~70 KB ELF              |
+|  ESP8266 IRAM HEADROOM ......................... ~28 KB                  |
+|                                                                          |
+|  FLOATING-POINT UNITS REQUIRED FOR INFERENCE ... 0 (Q4_0 quantized)      |
+|  BEARS HARMED IN THE MAKING OF THIS KERNEL ..... 0                       |
+|  ORANGE CATS HARMED IN THE MAKING OF THIS ...... 0                       |
+|                                                                          |
++==========================================================================+
+```
+
+
+## XI. WARRANTY AND DISCLAIMER
 
 ```
 +============================================================================+
@@ -1118,21 +419,29 @@ current release:
 |  WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE,          |
 |  OR NON-INFRINGEMENT OF INTELLECTUAL PROPERTY RIGHTS.                      |
 |                                                                            |
-|  THE AUTHORS SHALL NOT BE HELD LIABLE FOR ANY DAMAGES ARISING FROM          |
+|  THE AUTHORS SHALL NOT BE HELD LIABLE FOR ANY DAMAGES ARISING FROM         |
 |  THE USE OF THIS SOFTWARE, INCLUDING BUT NOT LIMITED TO DAMAGE TO          |
-|  THE COMPUTING HARDWARE, LOSS OF DATA, LOSS OF PRODUCTIVITY, OR           |
+|  THE COMPUTING HARDWARE, LOSS OF DATA, LOSS OF PRODUCTIVITY, OR            |
 |  EXISTENTIAL DREAD EXPERIENCED WHILE DEBUGGING EXCEPTION VECTORS           |
 |  AT THREE O'CLOCK IN THE MORNING.                                          |
 |                                                                            |
-|  THE 80 MHz CLOCK SPEED IS A NOMINAL VALUE. ACTUAL PERFORMANCE            |
-|  MAY VARY DEPENDING ON AMBIENT TEMPERATURE, COSMIC RAY FLUX, AND          |
-|  THE GENERAL DISPOSITION OF THE HARDWARE ON ANY GIVEN DAY.                 |
+|  THE x86-64 KERNEL EXECUTES UNMODIFIED WINDOWS PE32 BINARIES VIA           |
+|  A COMPATIBILITY LAYER. THE AUTHORS MAKE NO REPRESENTATIONS REGARDING      |
+|  THE FITNESS OF SUCH BINARIES, THEIR LICENSING, OR THE WISDOM OF           |
+|  EXECUTING SOFTWARE PRODUCED IN 1999 ON HARDWARE PRODUCED IN 2026.         |
 |                                                                            |
-|  THE FILESYSTEM STORES DATA ON SPI FLASH MEMORY WHICH HAS A FINITE        |
-|  NUMBER OF WRITE CYCLES. THE AUTHORS ACCEPT NO RESPONSIBILITY FOR          |
-|  DATA LOSS DUE TO FLASH WEAR, POWER INTERRUPTION DURING WRITE             |
-|  OPERATIONS, OR THE OPERATOR'S FAILURE TO MAINTAIN ADEQUATE BACKUPS        |
-|  OF IRREPLACEABLE FILES CONTAINING ~8,000 LINES OF KERNEL CODE.           |
+|  THE FILESYSTEMS STORE DATA ON FLASH MEMORY (xtensa) AND NVMe              |
+|  STORAGE (x86-64) WITH FINITE WRITE CYCLES. THE AUTHORS ACCEPT             |
+|  NO RESPONSIBILITY FOR DATA LOSS DUE TO MEDIA WEAR, POWER                  |
+|  INTERRUPTION DURING WRITE OPERATIONS, COSMIC RAY-INDUCED BIT FLIPS,       |
+|  OR THE OPERATOR'S FAILURE TO MAINTAIN ADEQUATE BACKUPS OF                 |
+|  IRREPLACEABLE FILES CONTAINING ~165,000 LINES OF KERNEL CODE.             |
+|                                                                            |
+|  THE LARGE LANGUAGE MODEL EMBEDDED IN THE x86-64 BUILD MAY GENERATE        |
+|  TEXT WHICH IS FACTUALLY INCORRECT, GRAMMATICALLY UNUSUAL, OR              |
+|  SYNTHESIZED FROM THE COMBINED LITERATURE OF THE PUBLIC INTERNET.          |
+|  THE OPERATOR SHALL NOT RELY ON SUCH TEXT FOR MEDICAL, LEGAL, OR           |
+|  NAVIGATIONAL DECISIONS.                                                   |
 |                                                                            |
 |  Osito-K IS A PROJECT OF NARANJOSITOS.TECH                                 |
 |  https://naranjositos.tech/                                                |
@@ -1144,16 +453,20 @@ current release:
 ---
 
 ```
-  Osito-K v0.1
-  Copyright (C) 2026 naranjositos.tech
+  Osito-K v0.4
+  Copyright (C) 2025-2026 naranjositos.tech
   All rights reserved.
 
   https://naranjositos.tech/
 
-  Written for the Xtensa LX106 processor.
-  Assembled and tested on the Wemos D1 Mini computing module.
+  Three architectures.  ~165,000 lines of source code.
+  One LLM running in ring 0.  Twelve filesystems.
+  Four spaceships.  No floating-point units required.
 
-  ~8,000 lines of code. 80 KB of RAM. 3.8 MB of persistent storage.
-  One Forth interpreter. Four spaceships. Zero floating-point units.
-  No bears or orange cats were harmed in the making of this kernel.
+  No bears were harmed in the making of this kernel.
+  No orange cats were harmed either.
+
+  The 80 MHz clock speed is a nominal value.  Actual performance
+  may vary depending on ambient temperature, cosmic ray flux, and
+  the general disposition of the hardware on any given day.
 ```
