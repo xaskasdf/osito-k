@@ -328,7 +328,6 @@ UTIL_SRCS := \
   mesa/src/util/u_cpu_detect.c \
   mesa/src/util/u_debug.c \
   mesa/src/util/u_queue.c \
-  mesa/src/util/u_thread.c \
   mesa/src/util/u_process.c \
   mesa/src/util/os_misc.c \
   mesa/src/util/rwlock.c \

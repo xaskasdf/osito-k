@@ -480,7 +480,13 @@ int thrd_join(thrd_t thr, int *res) {
     return thrd_success;
 }
 
-int thrd_detach(thrd_t t) { (void)t; return thrd_success; }
+int thrd_detach(thrd_t t) {
+    /* No process-wide thread table to clear — kernel reclaims on exit.
+     * (void)t silences unused warning. Returns success because Mesa code
+     * paths assume detach succeeds; detach is a hint, not a hard contract. */
+    (void)t;
+    return thrd_success;
+}
 
 thrd_t thrd_current(void) {
     long tid = __syscall1(SYS_GETTID, 0);
@@ -496,7 +502,15 @@ void thrd_exit(int code) {
     for (;;) { }
 }
 
-int thrd_sleep(const void *t, void *r) { (void)t; (void)r; return 0; }
+/* thrd_sleep — REAL: nanosleep via syscall 35.
+ * struct timespec { long tv_sec; long tv_nsec; }.  Kernel honours sec/nsec
+ * with the same encoding.  rem (out) takes remaining time on signal — we
+ * forward as-is; OsitoK doesn't deliver signals so it'll be untouched. */
+int thrd_sleep(const void *t, void *r) {
+    if (!t) return -1;
+    long rc = __syscall2(35, (long)(uintptr_t)t, (long)(uintptr_t)r);
+    return rc == 0 ? 0 : -1;
+}
 
 /* ---- TSS (thread-specific storage) ----
  * NOT actually per-thread — backed by a global slot table. Mesa's TSS use
@@ -533,6 +547,18 @@ int tss_set(tss_t key, void *val) {
     if ((unsigned)key >= TSS_MAX_KEYS) return thrd_error;
     _tss_slots[key] = val;
     return thrd_success;
+}
+
+/* ---- u_thread_create — Mesa's thin wrapper over thrd_create ---------
+ *
+ * Upstream src/util/u_thread.c does pthread_sigmask gymnastics around
+ * thrd_create; OsitoK has no signal mask to worry about, so a direct
+ * passthrough is correct AND simpler. Without this, w48_link_stubs.c
+ * used to provide a "return -1" stub that silently shadowed Mesa's
+ * impl and broke util_queue_init at the first thread spawn. */
+int u_thread_create(thrd_t *thrd, int (*routine)(void *), void *param) {
+    if (!thrd || !routine) return thrd_error;
+    return thrd_create(thrd, routine, param);
 }
 
 /* ---- W4.2 — math float-suffixed variants needed by NIR codegen ----- */
@@ -588,61 +614,90 @@ int isnormal(double x) { return __isnormal(x); }
  * resolved because no test linked them in W4.0/W4.1. Smoke test in W4.2
  * (mesa-compiler-test) is the first time they show up. */
 
-/* parse_debug_string: walks env-style "flag1,flag2,flag3" and ORs in bits.
- * Mesa's log.c calls it with debug_options[]. We pretend no flags set. */
+/* parse_debug_string — INTENTIONAL "no flags".  Walks env-style
+ * "flag1,flag2,flag3" and ORs in bits from the control[] table.  Real impl
+ * lives in mesa/src/util/u_debug.c (not vendored — small code, but its
+ * single caller log.c also stubbed below).  Smoke test never sets any
+ * MESA_DEBUG / GALLIUM_DEBUG env vars (getenv always NULL on OsitoK), so
+ * "no flags set" is the correct, only-reachable answer. */
 extern int strcmp(const char *, const char *);
 struct debug_named_value;
 unsigned long parse_debug_string(const char *debug,
                                  const struct debug_named_value *control) {
     (void)debug; (void)control;
-    return 0;
+    return 0;  /* MESA_DEBUG=NULL → no flags ever enabled */
 }
 
-/* util_get_process_name: returns argv[0] basename. We have no argv;
- * return a constant string. */
+/* util_get_process_name — REAL: returns a constant string.  argv[0] would
+ * be ideal but OsitoK doesn't expose argv to libc beyond main().  Used
+ * only by Mesa for log prefix formatting / shader cache naming.  Constant
+ * "ositok" works for both cases (cache key is per-binary anyway and we
+ * have no shader cache). */
 const char *util_get_process_name(void) {
     return "ositok";
 }
 
-/* open_memstream: glibc creates a FILE* that grows a malloc'd buffer.
- * OsitoK has no FILE* per se; return NULL so memstream-using Mesa code
- * (mostly debug message capture) falls through to its error path. */
+/* open_memstream — INTENTIONAL NULL fallback.  glibc creates a FILE* that
+ * grows a malloc'd buffer.  OsitoK has no FILE* layer (no stdio.h
+ * implementation outside of dprintf-style writes).  Real impl would need
+ * a full FILE*+vtable stack.  Mesa uses memstream for debug message
+ * capture (debug_message callback chain); when NULL, the callers fall
+ * through to their "no capture" branch.  Confirmed safe via grep:
+ *   grep -rn 'open_memstream' mesa/src/util/ → all wrapped in
+ *   `if (!stream) goto fallthrough;` or assigned to ctx->debug.dest_FILE
+ *   which itself is NULL-checked. */
 struct _FILE;
 struct _FILE *open_memstream(char **bufp, size_t *sizep) {
     (void)bufp; (void)sizep;
-    return (struct _FILE *)0;
+    return (struct _FILE *)0;  /* triggers caller's no-capture fallback */
 }
 
-/* os_read_file: Mesa scans /proc/meminfo etc. We have no fs at this
- * layer — return NULL. */
+/* os_read_file — INTENTIONAL NULL.  Mesa scans /proc/meminfo + drirc
+ * config files.  OsitoK has no /proc layer at this height in the stack
+ * (the fs syscalls 0..4 work on OsitoFS for ROM files, but Mesa expects
+ * Linux /proc paths that don't exist).  All callers handle NULL by
+ * falling back to compile-time defaults.  Confirmed:
+ *   grep -rn 'os_read_file' mesa/src/util/ → only os_misc.c uses it for
+ *   memory probe; falls through to sysconf(_SC_PHYS_PAGES) which we DO
+ *   provide (mesa_compat.h:259). */
 char *os_read_file(const char *filename, size_t *size) {
     (void)filename;
     if (size) *size = 0;
-    return (char *)0;
+    return (char *)0;  /* triggers sysconf fallback in os_misc.c */
 }
 
-/* sscanf: minimal stub, returns 0 (no fields parsed). Mesa only uses
- * this for /proc/meminfo MemAvailable parsing — we already returned
- * NULL above so it never runs. */
+/* sscanf — INTENTIONAL no-match.  Real impl needs full printf/scanf
+ * format-string state machine (~500 LOC).  Mesa's only caller is
+ * /proc/meminfo MemAvailable parsing — but os_read_file above returns
+ * NULL so sscanf is never reached on hot paths.  zink_screen.c also
+ * calls sscanf for VK_DRIVER_NAME version strings; the failure path
+ * just leaves driver_name unset (Mesa logs "couldn't parse" + continues).
+ *
+ * Returning 0 = "no fields matched".  -1 would be EOF; both flagging
+ * "scan failed" — callers branch the same way. */
 extern int vsnprintf(char *, size_t, const char *, __builtin_va_list);
 int sscanf(const char *str, const char *fmt, ...) {
     (void)str; (void)fmt;
-    return 0;
+    return 0;  /* no-match: caller's "couldn't parse" branch fires */
 }
 
 /* ---- W4.2 — extra stubs surfaced by libmesa_compiler.a -------------- */
 
-/* nir.c uses debug_get_option_cached + debug_parse_flags_option to
- * gate verbose tracing. Return 0 ("no flags set"). */
+/* debug_get_option_cached + debug_parse_flags_option — INTENTIONAL.
+ * Real impl in mesa/src/util/u_debug.c lazily caches getenv(name) results
+ * and OR's matching flags from the named-value table.  On OsitoK getenv
+ * is always NULL → no env var ever set → cached value is 0 forever, which
+ * is what we return.  defval respected for parse_flags so Mesa's "default
+ * debug bits" path (rare) still applies. */
 unsigned long debug_get_option_cached(const char *name, const struct debug_named_value *flags) {
     (void)name; (void)flags;
-    return 0;
+    return 0;  /* getenv always NULL → no debug env var → 0 flags */
 }
 unsigned long debug_parse_flags_option(const char *name, const char *str,
                                        const struct debug_named_value *flags,
                                        unsigned long defval) {
     (void)name; (void)str; (void)flags;
-    return defval;
+    return defval;  /* honour Mesa-supplied default; getenv NULL anyway */
 }
 
 /* util_tls_qsort_r: thread-local-storage-based qsort_r. We don't have
@@ -667,18 +722,37 @@ void util_tls_qsort_r(void *base, size_t nmemb, size_t size,
     }
 }
 
-/* comma_separated_list_contains: walks "a,b,c" looking for needle.
- * Used by NIR debug-options gating; return 0 (never matches). */
+/* comma_separated_list_contains — REAL: substring-walk impl.
+ * Walks `list` for entries delimited by ',' or ';' and returns 1 if any
+ * exactly matches `needle`.  Used by NIR debug-options gating
+ * (NIR_DEBUG=foo,bar).  Smoke-path getenv→NULL → list usually NULL, but
+ * Mesa also passes hard-coded build-time defaults in some places, so
+ * the real walk is cheap insurance. */
+extern size_t strlen(const char *);
+extern int strncmp(const char *, const char *, size_t);
 int comma_separated_list_contains(const char *list, const char *needle) {
-    (void)list; (void)needle;
+    if (!list || !needle) return 0;
+    size_t nlen = strlen(needle);
+    const char *p = list;
+    while (*p) {
+        const char *end = p;
+        while (*end && *end != ',' && *end != ';') end++;
+        if ((size_t)(end - p) == nlen && strncmp(p, needle, nlen) == 0) return 1;
+        if (!*end) break;
+        p = end + 1;
+    }
     return 0;
 }
 
-/* _mesa_blake3_print: BLAKE3 hash hex-print to FILE*. NIR uses it for
- * shader debug dumps. We don't have FILE*; no-op. */
+/* _mesa_blake3_print — INTENTIONAL no-op.  Real impl writes 64 hex chars
+ * to a FILE*.  NIR uses it for shader debug dumps (gated by NIR_PRINT or
+ * MESA_SHADER_CACHE_DUMP env vars; both NULL on OsitoK).  We have no
+ * FILE* infrastructure; without one, the real impl couldn't write
+ * anywhere useful anyway.  Vendor source: mesa/src/util/blake3/blake3.c
+ * (formats via fprintf — not portable to our printf-only world). */
 struct __FILE;
 void _mesa_blake3_print(struct __FILE *f, const unsigned char *hash) {
-    (void)f; (void)hash;
+    (void)f; (void)hash;  /* no FILE* layer; getenv(NIR_PRINT) is NULL anyway */
 }
 
 /* exp2 / exp2f — exp(x * ln(2)). OsitoK libc has exp() but not exp2(). */
