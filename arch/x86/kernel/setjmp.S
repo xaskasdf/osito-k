@@ -84,3 +84,5 @@ kern_longjmp:
     /* Land on the saved kernel stack and continue at the saved RIP. */
     mov  %r10, %rsp
     jmp  *%r11
+
+.section .note.GNU-stack,"",%progbits

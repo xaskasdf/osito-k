@@ -111,3 +111,5 @@ lm64:
     /* Halt loop */
 2:  hlt
     jmp     2b
+
+.section .note.GNU-stack,"",%progbits

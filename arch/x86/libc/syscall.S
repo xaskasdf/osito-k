@@ -136,3 +136,5 @@ longjmp:
     mov 40(%rdi), %r15
     mov 48(%rdi), %rsp
     jmp *56(%rdi)           /* jump to saved RIP */
+
+.section .note.GNU-stack,"",%progbits

@@ -120,3 +120,5 @@ syscall_entry:
 .align 8
 syscall_user_rsp:
     .quad 0
+
+.section .note.GNU-stack,"",%progbits

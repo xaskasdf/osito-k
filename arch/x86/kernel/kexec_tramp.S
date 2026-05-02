@@ -50,3 +50,5 @@ kexec_trampoline:
 
 kexec_trampoline_end:
     nop
+
+.section .note.GNU-stack,"",%progbits

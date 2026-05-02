@@ -182,3 +182,5 @@ dos_int31_stub:             /* DPMI */
 dos_int33_stub:             /* Mouse */
     mov $0x33, %edi
     jmp dos_int_common
+
+.section .note.GNU-stack,"",%progbits

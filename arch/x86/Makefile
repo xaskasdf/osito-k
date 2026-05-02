@@ -71,7 +71,7 @@ BLDFLAGS = -nostdlib -shared -Bsymbolic \
 BLIBS    = -lefi -lgnuefi
 
 # Kernel link flags
-KLDFLAGS = -nostdlib -static -T kernel.ld
+KLDFLAGS = -nostdlib -static -T kernel.ld -z noexecstack
 
 BUILD    = build
 

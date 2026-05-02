@@ -10,3 +10,5 @@
     .globl _start
 _start:
     jmp kernel_entry
+
+.section .note.GNU-stack,"",%progbits

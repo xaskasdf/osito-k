@@ -158,3 +158,5 @@ int2e_stub:
 g_int2e_rsp_stack:
     .fill 32, 8, 0              /* 32 depth levels × 8 bytes */
 /* g_int2e_rsp_depth defined in compat32.c */
+
+.section .note.GNU-stack,"",%progbits

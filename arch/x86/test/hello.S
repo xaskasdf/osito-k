@@ -29,3 +29,5 @@ _start:
 .section .rodata
 msg:
     .ascii "Hello from OsitoK!\n"
+
+.section .note.GNU-stack,"",%progbits

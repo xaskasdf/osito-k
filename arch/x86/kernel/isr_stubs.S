@@ -260,3 +260,5 @@ isr_stub_default:
 .globl sched_switch_rsp
 sched_switch_rsp:
     .quad 0
+
+.section .note.GNU-stack,"",%progbits
