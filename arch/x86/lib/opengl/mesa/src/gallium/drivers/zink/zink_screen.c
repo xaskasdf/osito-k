@@ -3593,9 +3593,14 @@ zink_internal_create_screen(const struct pipe_screen_config *config, int64_t dev
       }
    }
 
-   if (!zink_screen_resource_init(&screen->base))
+   printf("[ZINK] step7: zink_screen_resource_init\n");
+   if (!zink_screen_resource_init(&screen->base)) {
+      printf("[ZINK] FAIL step7: zink_screen_resource_init returned false\n");
       goto fail;
+   }
+   printf("[ZINK] step8: zink_bo_init\n");
    if (!zink_bo_init(screen)) {
+      printf("[ZINK] FAIL step8: zink_bo_init returned false (suballocator)\n");
       if (!screen->driver_name_is_inferred)
          mesa_loge("ZINK: failed to initialize suballocator");
       goto fail;
@@ -3604,15 +3609,22 @@ zink_internal_create_screen(const struct pipe_screen_config *config, int64_t dev
 
    if (zink_debug & ZINK_DEBUG_IOOPT)
       screen->driver_compiler_workarounds.io_opt = true;
+   printf("[ZINK] step9: zink_screen_init_compiler\n");
    zink_screen_init_compiler(screen);
+   printf("[ZINK] step10: disk_cache_init\n");
    if (!disk_cache_init(screen)) {
+      printf("[ZINK] FAIL step10: disk_cache_init returned false\n");
       if (!screen->driver_name_is_inferred)
          mesa_loge("ZINK: failed to initialize disk cache");
       goto fail;
    }
+   printf("[ZINK] step11: util_queue_init(cache_get_thread)\n");
    if (!util_queue_init(&screen->cache_get_thread, "zcfq", 8, 4,
-                        UTIL_QUEUE_INIT_RESIZE_IF_FULL, screen))
+                        UTIL_QUEUE_INIT_RESIZE_IF_FULL, screen)) {
+      printf("[ZINK] FAIL step11: util_queue_init(cache_get_thread) returned false\n");
       goto fail;
+   }
+   printf("[ZINK] step12: populate_format_props\n");
    populate_format_props(screen);
 
    slab_create_parent(&screen->transfer_pool, sizeof(struct zink_transfer), 16);
@@ -3621,17 +3633,22 @@ zink_internal_create_screen(const struct pipe_screen_config *config, int64_t dev
 
    screen->total_video_mem = get_video_mem(screen);
    screen->clamp_video_mem = screen->total_video_mem * 0.8;
+   printf("[ZINK] step13: os_get_total_physical_memory\n");
    if (!os_get_total_physical_memory(&screen->total_mem)) {
+      printf("[ZINK] FAIL step13: os_get_total_physical_memory returned false\n");
       if (!screen->driver_name_is_inferred)
          mesa_loge("ZINK: failed to get total physical memory");
       goto fail;
    }
 
+   printf("[ZINK] step14: zink_screen_init_semaphore\n");
    if (!zink_screen_init_semaphore(screen)) {
+      printf("[ZINK] FAIL step14: zink_screen_init_semaphore returned false (timeline)\n");
       if (!screen->driver_name_is_inferred)
          mesa_loge("zink: failed to create timeline semaphore");
       goto fail;
    }
+   printf("[ZINK] step14: timeline semaphore OK\n");
 
    bool can_db = true;
    {

@@ -684,25 +684,32 @@ void __initk kernel_entry(boot_info_t *info)
                 i211_enable_interrupts(nic_pci->bus, nic_pci->dev, nic_pci->func);
             }
 
-            /* Intentar DHCP primero; si falla (red sin servidor o link
-             * down), caer a configuración estática según el tipo de NIC. */
+            /* Intentar DHCP.  Si falla, NO inventar una IP — sólo lo
+             * justo para QEMU (donde sabemos que SLIRP = 10.0.2.0/24).
+             * En real-HW dejar IP=0.0.0.0 y dejar que el usuario corra
+             * `dhcp` manual o `ipconf` desde el shell — mentir sobre el
+             * subnet rompe ARP/routing en redes reales.                   */
             int dhcp_ok = dhcp_discover();
             if (dhcp_ok != 0) {
-                serial_puts("[KERN] DHCP failed, using static fallback\n");
-                fb_puts(" Net: static fallback\n");
-                if (nic_pci->device_id == 0x1539) {
-                    /* Real hardware (I211 8086:1539) — LAN típica */
-                    uint8_t ip[] = {192, 168, 0, 50};
-                    net_set_ip(ip);
-                    uint8_t gw[] = {192, 168, 0, 1};
-                    net_set_gateway(gw);
-                    uint8_t dns[] = {8, 8, 8, 8};
-                    net_dns_set_server(dns);
-                } else {
-                    /* QEMU SLIRP user-mode networking — gateway 10.0.2.2 */
+                /* Identificar NICs emuladas por QEMU (Intel igb 82576,
+                 * e1000 82540EM, e1000e 82574, virtio-net). Sólo en ese
+                 * caso usar fallback estático SLIRP.                        */
+                uint16_t v = nic_pci->vendor_id, d = nic_pci->device_id;
+                bool is_qemu = (v == 0x8086 &&
+                                (d == 0x10C9 || d == 0x100E || d == 0x10D3)) ||
+                               v == 0x1AF4;
+                if (is_qemu) {
+                    serial_puts("[KERN] DHCP failed — QEMU SLIRP fallback 10.0.2.15\n");
+                    fb_puts(" Net: QEMU SLIRP fallback\n");
                     uint8_t ip[] = {10, 0, 2, 15};
                     net_set_ip(ip);
-                    /* gateway/DNS defaults in net.c match QEMU SLIRP */
+                    /* gateway/DNS defaults en net.c matchean SLIRP        */
+                } else {
+                    serial_puts("[KERN] DHCP failed on real HW — IP=0.0.0.0\n");
+                    serial_puts("[KERN] Use shell: 'dhcp' to retry, or\n");
+                    serial_puts("[KERN]              'ipconf <ip> <gw> <mask>'\n");
+                    fb_puts(" Net: DHCP failed — use shell 'dhcp' or 'ipconf'\n");
+                    /* Dejar IP=0.0.0.0; los listeners pueden bindear igual.*/
                 }
             }
 

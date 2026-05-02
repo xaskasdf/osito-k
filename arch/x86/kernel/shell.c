@@ -271,6 +271,8 @@ static void cmd_help(void)
     sh_puts("  git       Version control (init/add/commit/log/status/diff/branch/checkout)\n");
     sh_puts("  sched     Scheduler test (sched [stats])\n");
     sh_puts("  httpd     HTTP server (httpd [port] / httpd stop)\n");
+    sh_puts("  dhcp      Retry DHCP discovery (manual)\n");
+    sh_puts("  ipconf    Set static IP (ipconf <ip> [gw] [mask] [dns])\n");
     sh_puts("  winexec   Run a Win32 PE executable (winexec file.exe)\n");
     sh_puts("  dosrun    Run a DOS 16-bit binary (dosrun file.com)\n");
     sh_puts("  clear     Clear screen\n");
@@ -2276,6 +2278,42 @@ static void shell_exec(char *line)
             sh_puts(h);
         }
         sh_puts("\n");
+    } else if (strcmp(cmd, "dhcp") == 0) {
+        extern int dhcp_discover(void);
+        sh_puts("Retrying DHCP discovery...\n");
+        int rc = dhcp_discover();
+        sh_puts(rc == 0 ? "DHCP: success — `ifconfig` to see IP\n"
+                        : "DHCP: failed — use `ipconf` to set static IP\n");
+    } else if (strcmp(cmd, "ipconf") == 0) {
+        /* Uso: ipconf <ip> <gw> <mask> [<dns>]
+         * Cada arg es A.B.C.D.  Sólo <ip> es obligatorio.                */
+        if (argc < 2) {
+            sh_puts("Usage: ipconf <ip> [gw] [mask] [dns]\n");
+            sh_puts("       ipconf 192.168.1.50 192.168.1.1 255.255.255.0 8.8.8.8\n");
+        } else {
+            extern void net_set_ip(const uint8_t ip[4]);
+            extern void net_set_gateway(const uint8_t gw[4]);
+            extern void net_set_netmask(const uint8_t mask[4]);
+            extern void net_dns_set_server(const uint8_t ip[4]);
+            uint8_t buf[4][4] = {{0}};
+            int n = (argc - 1 < 4) ? argc - 1 : 4;
+            for (int i = 0; i < n; i++) {
+                /* Parser inline A.B.C.D → buf[i][0..3].                  */
+                const char *s = argv[i + 1];
+                int field = 0, val = 0;
+                while (*s && field < 4) {
+                    if (*s >= '0' && *s <= '9') val = val*10 + (*s - '0');
+                    else if (*s == '.') { buf[i][field++] = (uint8_t)val; val = 0; }
+                    s++;
+                }
+                if (field < 4) buf[i][field] = (uint8_t)val;
+            }
+            net_set_ip(buf[0]);
+            if (n > 1) net_set_gateway(buf[1]);
+            if (n > 2) net_set_netmask(buf[2]);
+            if (n > 3) net_dns_set_server(buf[3]);
+            sh_puts("ipconf: applied\n");
+        }
     } else if (strcmp(cmd, "route") == 0) {
         sh_puts("Destination     Gateway         Flags  Iface\n");
         sh_puts("0.0.0.0         (gateway)       UG     eth0\n");
