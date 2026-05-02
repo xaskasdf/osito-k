@@ -366,9 +366,11 @@ static void handle_arp(const uint8_t *pkt, uint32_t len)
         serial_putdec(arp->spa[0]); serial_puts(".");
         serial_putdec(arp->spa[1]); serial_puts(".");
         serial_putdec(arp->spa[2]); serial_puts(".");
-        serial_putdec(arp->spa[3]); serial_puts("\n");
+        serial_putdec(arp->spa[3]); serial_puts(" -> sending reply\n");
 
         arp_send_reply(arp->sha, arp->spa);
+
+        serial_puts("[NET] ARP reply sent (eth_send returned)\n");
     }
 
 }

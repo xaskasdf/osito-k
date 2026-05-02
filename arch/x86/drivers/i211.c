@@ -493,7 +493,7 @@ int i211_send(const void *data, uint32_t len)
      * the chip is ignoring us.  Limit to first 8 sends so we don't flood
      * dmesg once we know what's happening. */
     static int dbg_count = 0;
-    if (dbg_count < 8) {
+    if (dbg_count < 64) {
         dbg_count++;
         uint32_t tdh_after = i211_read(I211_TDH0);
         uint32_t tdt_after = i211_read(I211_TDT0);
