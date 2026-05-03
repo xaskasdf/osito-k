@@ -264,6 +264,9 @@ static void cmd_help(void)
     sh_puts("  tail      Last N lines (tail <file> [-n N | N])\n");
     sh_puts("  grep      Match literal substring (grep <pat> [file])\n");
     sh_puts("  |         Pipe stdout of one cmd into next (e.g. dmesg | grep PCI)\n");
+    sh_puts("  kexec     Boot a new kernel ELF (kexec [filename])\n");
+    sh_puts("  kdownload Fetch a file via OFTP (kdownload <ip> <port> <name> [save|--kexec])\n");
+    sh_puts("  kupdate   (TODO) Pull a kernel update from naranjositos.tech via HTTPS\n");
     sh_puts("  exec      Run an ELF binary\n");
     sh_puts("  ping      Ping an IP address\n");
     sh_puts("  tcptest   TCP connection test (tcptest [ip] [port])\n");
@@ -552,6 +555,250 @@ static void cmd_exec(int argc, char *argv[])
         sh_putdec((uint64_t)(ret < 0 ? (uint64_t)(-(int64_t)ret) : (uint64_t)ret));
         sh_puts("\n");
     }
+}
+
+/* ── OFTP client (kdownload) ──────────────────────────────────────
+ *
+ * UDP-based file fetch from a server (for now: a Python script on a
+ * directly-attached Mac, eventually naranjositos.tech via HTTPS).
+ *
+ * Workaround for the I211 Mac→OsitoK→Mac reply-path bug: OsitoK
+ * initiates a single UDP REQ outbound (TX from shell context — known
+ * to work), then receives all chunks Mac→OsitoK (RX path — known to
+ * work).  No reply ever flows along the broken net_poll-context TX.
+ *
+ * Wire format documented in tools/oftp-server.py.
+ */
+
+#define OFTP_BUF_MAX  (16u * 1024u * 1024u)   /* up to 16 MB kernels       */
+#define OFTP_LOCAL_PORT  7780
+#define OFTP_TIMEOUT_TICKS  5000               /* 5 s no-progress timeout  */
+
+static struct {
+    bool       active;
+    bool       error;
+    bool       done;
+    uint8_t   *buf;
+    uint32_t   buf_size;
+    uint32_t   total_size;       /* set by first valid chunk           */
+    uint32_t   high_watermark;   /* highest offset+chunk_len observed  */
+    uint64_t   last_chunk_tick;
+} oftp_state;
+
+static void oftp_handler(const uint8_t *src_ip, uint16_t src_port,
+                          const void *data, uint32_t len)
+{
+    (void)src_ip; (void)src_port;
+    if (!oftp_state.active || len < 4) return;
+
+    const uint8_t *p = (const uint8_t *)data;
+    if (p[0] == 'O' && p[1] == 'F' && p[2] == 'T' && p[3] == 'E') {
+        oftp_state.error = true;
+        oftp_state.done  = true;
+        return;
+    }
+    if (!(p[0] == 'O' && p[1] == 'F' && p[2] == 'T' && p[3] == 'D')) return;
+    if (len < 16) return;
+
+    uint32_t total  = ((uint32_t)p[4]  << 24) | ((uint32_t)p[5]  << 16) |
+                      ((uint32_t)p[6]  <<  8) |  (uint32_t)p[7];
+    uint32_t offset = ((uint32_t)p[8]  << 24) | ((uint32_t)p[9]  << 16) |
+                      ((uint32_t)p[10] <<  8) |  (uint32_t)p[11];
+    uint32_t cklen  = ((uint32_t)p[12] << 24) | ((uint32_t)p[13] << 16) |
+                      ((uint32_t)p[14] <<  8) |  (uint32_t)p[15];
+
+    if (total == 0 || total > oftp_state.buf_size) {
+        oftp_state.error = true;
+        oftp_state.done  = true;
+        return;
+    }
+    oftp_state.total_size = total;
+    oftp_state.last_chunk_tick = idt_get_ticks();
+
+    /* EOF marker */
+    if (cklen == 0 && offset == total) {
+        oftp_state.done = true;
+        return;
+    }
+    if (offset > total || offset + cklen > total) return;
+    if (16u + cklen > len) return;  /* truncated packet */
+
+    /* Lazily grow high_watermark for done-detection */
+    uint32_t end = offset + cklen;
+    if (end > oftp_state.high_watermark) oftp_state.high_watermark = end;
+
+    uint8_t *dst = oftp_state.buf + offset;
+    const uint8_t *s = p + 16;
+    for (uint32_t i = 0; i < cklen; i++) dst[i] = s[i];
+
+    if (oftp_state.high_watermark >= total) oftp_state.done = true;
+}
+
+static int parse_ip(const char *s, uint8_t ip[4]);  /* forward */
+static void cmd_kexec(const char *arg);              /* forward */
+extern void net_udp_listen(uint16_t port,
+    void (*handler)(const uint8_t *, uint16_t, const void *, uint32_t));
+
+static void cmd_kdownload(int argc, char *argv[])
+{
+    if (argc < 4) {
+        sh_puts("Usage: kdownload <server-ip> <port> <filename> [save_as | --kexec]\n");
+        sh_puts("  Fetches <filename> from oftp-server (tools/oftp-server.py).\n");
+        sh_puts("  With save_as, writes to OsitoFS.  With --kexec, saves to\n");
+        sh_puts("  /tmp.kexec.elf and reboots into it.\n");
+        return;
+    }
+
+    uint8_t server_ip[4];
+    if (parse_ip(argv[1], server_ip) < 0) {
+        sh_puts("kdownload: bad IP\n");
+        return;
+    }
+    /* Parse port */
+    uint16_t server_port = 0;
+    for (const char *p = argv[2]; *p >= '0' && *p <= '9'; p++)
+        server_port = server_port * 10 + (uint16_t)(*p - '0');
+    if (server_port == 0) {
+        sh_puts("kdownload: bad port\n");
+        return;
+    }
+
+    const char *filename = argv[3];
+    const char *save_as  = (argc >= 5) ? argv[4] : NULL;
+    bool do_kexec = save_as && save_as[0] == '-' && save_as[1] == '-' &&
+                    save_as[2] == 'k';   /* "--kexec" */
+    if (do_kexec) save_as = "tmp.kexec.elf";
+
+    uint8_t *buf = (uint8_t *)kmalloc(OFTP_BUF_MAX);
+    if (!buf) { sh_puts("kdownload: out of memory\n"); return; }
+
+    /* Reset state */
+    for (uint32_t i = 0; i < sizeof(oftp_state); i++)
+        ((uint8_t *)&oftp_state)[i] = 0;
+    oftp_state.buf       = buf;
+    oftp_state.buf_size  = OFTP_BUF_MAX;
+    oftp_state.active    = true;
+    oftp_state.last_chunk_tick = idt_get_ticks();
+
+    /* Listener registered once per kernel boot */
+    static bool listener_registered = false;
+    if (!listener_registered) {
+        net_udp_listen(OFTP_LOCAL_PORT, oftp_handler);
+        listener_registered = true;
+    }
+
+    /* Build & send REQ */
+    uint8_t req[64];
+    for (int i = 0; i < 64; i++) req[i] = 0;
+    req[0] = 'O'; req[1] = 'F'; req[2] = 'T'; req[3] = 'Q';
+    int fnlen = 0;
+    while (filename[fnlen] && fnlen < 60) {
+        req[4 + fnlen] = (uint8_t)filename[fnlen];
+        fnlen++;
+    }
+
+    extern int net_udp_send(const uint8_t dst_ip[4], uint16_t dst_port,
+                             uint16_t src_port, const void *data, uint32_t len);
+    if (net_udp_send(server_ip, server_port, OFTP_LOCAL_PORT, req, 64) < 0) {
+        sh_puts("kdownload: REQ send failed\n");
+        oftp_state.active = false;
+        kfree(buf);
+        return;
+    }
+
+    sh_puts("kdownload: REQ sent to ");
+    sh_puts(argv[1]); sh_puts(":"); sh_putdec(server_port);
+    sh_puts(" for "); sh_puts(filename); sh_puts("\n");
+
+    /* Drain loop */
+    extern void net_poll(void);
+    uint64_t last_print = idt_get_ticks();
+    while (!oftp_state.done) {
+        net_poll();
+        uint64_t now = idt_get_ticks();
+        if (now - oftp_state.last_chunk_tick > OFTP_TIMEOUT_TICKS) {
+            sh_puts("kdownload: timeout (no chunk in 5s)\n");
+            oftp_state.error = true;
+            break;
+        }
+        if (now - last_print > 500) {
+            last_print = now;
+            sh_puts("  rx ");
+            sh_putdec(oftp_state.high_watermark);
+            sh_puts(" / ");
+            sh_putdec(oftp_state.total_size);
+            sh_puts(" B\n");
+        }
+    }
+
+    bool ok = !oftp_state.error &&
+              oftp_state.high_watermark >= oftp_state.total_size &&
+              oftp_state.total_size > 0;
+    uint32_t got   = oftp_state.high_watermark;
+    uint32_t total = oftp_state.total_size;
+    oftp_state.active = false;
+
+    if (!ok) {
+        sh_puts("kdownload: FAILED (");
+        sh_putdec(got); sh_puts("/"); sh_putdec(total); sh_puts(")\n");
+        kfree(buf);
+        return;
+    }
+    sh_puts("kdownload: OK ");
+    sh_putdec(got); sh_puts(" B\n");
+
+    /* Save to OsitoFS */
+    if (save_as) {
+        if (!osfs2_is_mounted()) {
+            sh_puts("kdownload: no FS mounted, cannot save\n");
+            kfree(buf);
+            return;
+        }
+        extern void *osfs2_create(const char *name, uint64_t size);
+        extern int   osfs2_write(void *file, uint64_t offset, const void *buf, uint64_t len);
+        extern int   osfs2_delete(const char *name);
+        /* If exists and size differs, recreate */
+        void *f = osfs2_find(save_as);
+        if (f) {
+            uint64_t cur = osfs2_file_size(f);
+            if (cur != got) {
+                osfs2_delete(save_as);
+                f = NULL;
+            }
+        }
+        if (!f) f = osfs2_create(save_as, got);
+        if (!f) {
+            sh_puts("kdownload: cannot create file\n");
+            kfree(buf);
+            return;
+        }
+        osfs2_write(f, 0, buf, got);
+        extern int disk_flush(void);
+        disk_flush();
+        sh_puts("kdownload: saved -> ");
+        sh_puts(save_as);
+        sh_puts(" (synced)\n");
+    }
+
+    kfree(buf);
+
+    if (do_kexec) {
+        sh_puts("kdownload: chaining to kexec...\n");
+        cmd_kexec(save_as);
+    }
+}
+
+/* Web-based update path — placeholder for the eventual WAN flow that
+ * uses naranjositos.tech.  Requires DNS + TLS + HTTP client (already
+ * available in net.c/tls.c/http.c) but isn't wired up yet because the
+ * kernel currently only has a direct cable to a Mac, no Internet.    */
+static void cmd_kupdate(int argc, char *argv[])
+{
+    (void)argc; (void)argv;
+    sh_puts("kupdate: TODO — fetch from https://naranjositos.tech/k/<arch>/<channel>/kernel.elf\n");
+    sh_puts("  Will use: dns_resolve + tls13_connect + http_get + osfs2_write + cmd_kexec.\n");
+    sh_puts("  Stubbed until the kernel has Internet (current setup is direct LAN cable).\n");
+    sh_puts("  Use `kdownload <local-ip> <port> kernel.elf --kexec` for now.\n");
 }
 
 /* ── Builtin: ping ──────────────────────────────────────────── */
@@ -2826,6 +3073,10 @@ static void shell_exec(char *line)
         cmd_clear();
     } else if (strcmp(cmd, "kexec") == 0) {
         cmd_kexec(argc > 1 ? argv[1] : NULL);
+    } else if (strcmp(cmd, "kdownload") == 0) {
+        cmd_kdownload(argc, argv);
+    } else if (strcmp(cmd, "kupdate") == 0) {
+        cmd_kupdate(argc, argv);
     } else if (strcmp(cmd, "reboot") == 0) {
         cmd_reboot();
     } else if (strcmp(cmd, "halt") == 0 || strcmp(cmd, "shutdown") == 0) {
