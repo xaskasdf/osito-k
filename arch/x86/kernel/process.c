@@ -1130,11 +1130,18 @@ void __hot sched_tick(void *frame_ptr)
      * RX hasta que HW empezara a dropear.  net_poll tiene un guard de
      * reentrancia (in_net_poll), así que es seguro llamar siempre.    */
     {
-        extern bool net_has_active_waiters(void);
         extern void net_poll(void);
-        extern bool net_nic_irq_pending(void);
-        if (net_nic_irq_pending() || net_has_active_waiters())
-            net_poll();
+        /* MSI on I211 has a "pending acknowledge" gate: after the first
+         * MSI is delivered, the chip won't fire a new one until SW
+         * explicitly reads ICR (or writes 1 to clear).  Our ISR DOES
+         * read ICR — but somehow under bursty Mac→OsitoK traffic the
+         * chain stalls (observed: irq_pending=1 stuck, RDH advancing,
+         * RDT lagging, and ISR count not incrementing for 35 pings).
+         *
+         * Bypass: drive net_poll unconditionally each tick.  The
+         * function has a reentrancy guard and is cheap when the ring
+         * is empty (one MMIO descriptor read returning DD=0).         */
+        net_poll();
     }
 
     /* Load next process */

@@ -666,11 +666,23 @@ void pci_enable_bus_master(uint8_t bus, uint8_t dev, uint8_t func)
  * MSI writes directly to LAPIC (bypasses IOAPIC). vector = IDT vector number. */
 int pci_enable_msi(uint8_t bus, uint8_t dev, uint8_t func, uint8_t vector)
 {
-    /* Walk capability list to find MSI capability (Cap ID = 0x05) */
-    uint32_t status = pci_read32(bus, dev, func, 0x06);
-    if (!(status & (1 << 20))) {
-        serial_puts("[PCI] No capability list\n");
-        return -1;  /* No capabilities list */
+    /* Walk capability list to find MSI capability (Cap ID = 0x05).
+     *
+     * The PCI Status register is at config offset 0x06 (16 bits). MMIO
+     * reads of ECAM space MUST be naturally aligned (UC memory; Intel
+     * SDM 11.3) — reading from byte 0x06 with a 32-bit access is
+     * undefined behaviour and was returning 0 here, killing MSI for
+     * every device including the i211 NIC.
+     *
+     * Read the aligned dword at 0x04 (Cmd[15:0] + Status[31:16] in the
+     * dword view) and test bit 20 = bit 4 of Status = "Capabilities
+     * List present". */
+    uint32_t cmd_status = pci_read32(bus, dev, func, 0x04);
+    if (!(cmd_status & (1u << 20))) {
+        serial_puts("[PCI] No capability list (cmd_status=0x");
+        serial_puthex(cmd_status, 8);
+        serial_puts(")\n");
+        return -1;
     }
 
     uint8_t cap_ptr = (uint8_t)(pci_read32(bus, dev, func, 0x34) & 0xFF);

@@ -599,11 +599,18 @@ int i211_recv(void *buf, uint32_t *len)
     desc->read.hdr_addr = 0;
 
     /* Avanzar tail.  RDT se escribe DESPUÉS de invalidar el descriptor
-     * para evitar carrera con el HW DMA.                                  */
-    uint32_t old_tail = tail;
+     * para evitar carrera con el HW DMA.
+     *
+     * Per Intel I210/I211 datasheet §7.1.6: RDT points one descriptor
+     * BEYOND the last one HW may use.  Linux igb writes RDT=next_to_use
+     * (= last-re-armed + 1).  Writing RDT=old_tail (off-by-one) means
+     * HW does NOT see the slot we just re-armed until the NEXT consume,
+     * starving the ring under bursty load — observed as "37 packets
+     * received but only 5 drained per IRQ batch" in the post-pings
+     * nic_stats snapshot. */
     nic.rx_tail = (tail + 1) % I211_RX_RING_SIZE;
     wmb();
-    i211_write(I211_RDT0, old_tail);
+    i211_write(I211_RDT0, nic.rx_tail);
 
     return 0;
 }
@@ -683,3 +690,26 @@ void i211_rx_irq_reenable(void)
 /* i211_napi_poll is not used — NAPI drain happens inside net_poll()
  * which already has the full packet processing switch. The ISR sets
  * irq_pending, net_poll drains, then calls i211_rx_irq_reenable(). */
+
+/* Live diagnostic dump.  Walks state observable post-boot: ISR/RX_ISR
+ * counters, current IMS/ICR/RDH/RDT/GPRC, and irq_pending flag.
+ * Useful when the TX-kick log has rolled over its cap. */
+extern volatile bool i211_irq_pending;
+void i211_print_stats(void)
+{
+    if (!nic.initialized) { serial_puts("[I211] not initialized\n"); return; }
+    uint32_t ims  = i211_read(I211_IMS);
+    uint32_t icr  = i211_read(I211_ICR);   /* note: read clears */
+    uint32_t rdh  = i211_read(I211_RDH0);
+    uint32_t rdt  = i211_read(I211_RDT0);
+    uint32_t gprc = i211_read(0x4074);     /* I211_GPRC */
+    serial_puts("[I211 stats] ISR=0x");      serial_puthex(i211_isr_count, 8);
+    serial_puts(" RX_ISR=0x");               serial_puthex(i211_isr_rx_count, 8);
+    serial_puts(" IMS=0x");                  serial_puthex(ims, 8);
+    serial_puts(" ICR=0x");                  serial_puthex(icr, 8);
+    serial_puts(" RDH=0x");                  serial_puthex(rdh, 4);
+    serial_puts(" RDT=0x");                  serial_puthex(rdt, 4);
+    serial_puts(" GPRC=0x");                 serial_puthex(gprc, 8);
+    serial_puts(" irq_pending=");            serial_puts(i211_irq_pending ? "1" : "0");
+    serial_puts("\n");
+}

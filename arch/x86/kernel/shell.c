@@ -169,6 +169,13 @@ static inline void sh_halt(void)   { __asm__ volatile ("cli"); for (;;) __asm__ 
 /* Output redirect hook (set by shell_exec for > and >> operators) */
 static void (*sh_redir_fn)(const char *s, size_t len);
 
+/* Pipe input — set by the pipeline driver to feed previous stage's
+ * captured output as virtual stdin for the next stage.  Only consumed
+ * by stdin-aware commands (grep/head/tail) when no file argument is
+ * given.  Caller is responsible for buffer lifetime across the call. */
+static const char *sh_stdin_buf;
+static uint32_t    sh_stdin_len;
+
 static void sh_puts(const char *s)
 {
     if (sh_redir_fn) {
@@ -255,7 +262,8 @@ static void cmd_help(void)
     sh_puts("  cat       Display file contents\n");
     sh_puts("  head      First N lines (head <file> [-n N | N])\n");
     sh_puts("  tail      Last N lines (tail <file> [-n N | N])\n");
-    sh_puts("  grep      Match literal substring (grep <pat> <file>)\n");
+    sh_puts("  grep      Match literal substring (grep <pat> [file])\n");
+    sh_puts("  |         Pipe stdout of one cmd into next (e.g. dmesg | grep PCI)\n");
     sh_puts("  exec      Run an ELF binary\n");
     sh_puts("  ping      Ping an IP address\n");
     sh_puts("  tcptest   TCP connection test (tcptest [ip] [port])\n");
@@ -1850,6 +1858,79 @@ static void redir_capture(const char *s, size_t len)
 
 /* ── Dispatch command ────────────────────────────────────────── */
 
+/* Forward decl — pipeline driver calls into this for each stage. */
+static void shell_exec(char *line);
+
+static void shell_exec_pipeline(char *line)
+{
+    char *segments[8];
+    int   nseg = 0;
+    {
+        char *p = line;
+        char *seg_start = line;
+        bool in_sq = false, in_dq = false;
+        segments[0] = line;
+        while (*p) {
+            if (*p == '\'' && !in_dq) in_sq = !in_sq;
+            else if (*p == '"' && !in_sq) in_dq = !in_dq;
+            else if (*p == '|' && !in_sq && !in_dq) {
+                *p = 0;
+                if (nseg + 1 >= 8) {
+                    sh_puts("pipe: too many stages (max 8)\n");
+                    return;
+                }
+                segments[nseg++] = seg_start;
+                seg_start = p + 1;
+            }
+            p++;
+        }
+        segments[nseg++] = seg_start;
+    }
+
+    if (nseg == 1) { shell_exec(line); return; }
+
+    char    *prev_buf = NULL;
+    uint32_t prev_len = 0;
+
+    for (int i = 0; i < nseg; i++) {
+        while (*segments[i] == ' ' || *segments[i] == '\t') segments[i]++;
+        sh_stdin_buf = prev_buf;
+        sh_stdin_len = prev_len;
+
+        if (i < nseg - 1) {
+            char *cap = (char *)kmalloc(1024 * 1024);
+            if (!cap) { sh_puts("pipe: out of memory\n"); break; }
+            char    *saved_buf = redir_buf;
+            uint32_t saved_pos = redir_pos;
+            uint32_t saved_max = redir_max;
+            void   (*saved_fn)(const char *, size_t) = sh_redir_fn;
+
+            redir_buf  = cap;
+            redir_pos  = 0;
+            redir_max  = 1024 * 1024;
+            sh_redir_fn = redir_capture;
+
+            shell_exec(segments[i]);
+
+            uint32_t this_len = redir_pos;
+            sh_redir_fn = saved_fn;
+            redir_buf   = saved_buf;
+            redir_pos   = saved_pos;
+            redir_max   = saved_max;
+
+            if (prev_buf) kfree(prev_buf);
+            prev_buf = cap;
+            prev_len = this_len;
+        } else {
+            shell_exec(segments[i]);
+        }
+    }
+
+    sh_stdin_buf = NULL;
+    sh_stdin_len = 0;
+    if (prev_buf) kfree(prev_buf);
+}
+
 static void shell_exec(char *line)
 {
     char *argv[MAX_ARGS];
@@ -2088,22 +2169,53 @@ static void shell_exec(char *line)
         bool is_head = (cmd[0] == 'h');
         bool is_grep = (cmd[0] == 'g');
 
-        const char *pattern = NULL;
-        const char *fname   = NULL;
-        int n_lines = 10;
+        const char *pattern  = NULL;
+        const char *fname    = NULL;
+        int  n_lines = 10;
+        bool use_stdin = false;
+
+        /* Treat "-" or absent file as "use pipe stdin" when sh_stdin_buf
+         * is set by the pipeline driver. */
+        #define STDIN_TOKEN(s)  ((s)[0] == '-' && (s)[1] == 0)
 
         if (is_grep) {
-            if (argc < 3) { sh_puts("Usage: grep <pattern> <file>\n"); goto cmd_filter_done; }
-            pattern = argv[1];
-            fname   = argv[2];
-        } else {
             if (argc < 2) {
+                sh_puts("Usage: grep <pattern> [file]\n");
+                goto cmd_filter_done;
+            }
+            pattern = argv[1];
+            if (argc >= 3 && !STDIN_TOKEN(argv[2])) {
+                fname = argv[2];
+            } else if (sh_stdin_buf) {
+                use_stdin = true;
+            } else {
+                sh_puts("grep: no file and no pipe input\n");
+                goto cmd_filter_done;
+            }
+        } else {
+            /* head/tail: file may be omitted when piping. argv[1] starting
+             * with '-' or a digit is the count, not a filename. */
+            int first_arg = 1;
+            bool have_file_arg =
+                (argc >= 2)
+                && argv[1][0] != '-'
+                && !(argv[1][0] >= '0' && argv[1][0] <= '9')
+                && !STDIN_TOKEN(argv[1]);
+
+            if (have_file_arg) {
+                fname = argv[1];
+                first_arg = 2;
+            } else if (argc >= 2 && STDIN_TOKEN(argv[1])) {
+                first_arg = 2;
+                if (sh_stdin_buf) use_stdin = true;
+            } else if (sh_stdin_buf) {
+                use_stdin = true;
+            } else {
                 sh_puts(is_head ? "Usage: head <file> [-n N | N]\n"
                                 : "Usage: tail <file> [-n N | N]\n");
                 goto cmd_filter_done;
             }
-            fname = argv[1];
-            for (int ai = 2; ai < argc; ai++) {
+            for (int ai = first_arg; ai < argc; ai++) {
                 const char *a = argv[ai];
                 if (a[0] == '-' && a[1] == 'n' && a[2] == 0 && ai + 1 < argc) {
                     a = argv[++ai];
@@ -2116,14 +2228,20 @@ static void shell_exec(char *line)
                 if (v > 0) n_lines = v;
             }
         }
+        #undef STDIN_TOKEN
 
         vfs_node_t node;
-        if (!vfs_find(fname, VFS_MODE_NATIVE, &node)) {
-            sh_puts(fname);
-            sh_puts(": file not found\n");
-            goto cmd_filter_done;
+        uint64_t sz;
+        if (use_stdin) {
+            sz = sh_stdin_len;
+        } else {
+            if (!vfs_find(fname, VFS_MODE_NATIVE, &node)) {
+                sh_puts(fname);
+                sh_puts(": file not found\n");
+                goto cmd_filter_done;
+            }
+            sz = node.size;
         }
-        uint64_t sz = node.size;
         if (sz == 0) goto cmd_filter_done;
 
         /* Streaming buffers:
@@ -2205,7 +2323,14 @@ static void shell_exec(char *line)
         while (off < sz && !head_done) {
             uint64_t want = sz - off;
             if (want > CMD_FILTER_CHUNK_SZ) want = CMD_FILTER_CHUNK_SZ;
-            int got = vfs_read(&node, off, chunk, want);
+            int got;
+            if (use_stdin) {
+                for (uint64_t k = 0; k < want; k++)
+                    chunk[k] = sh_stdin_buf[off + k];
+                got = (int)want;
+            } else {
+                got = vfs_read(&node, off, chunk, want);
+            }
             if (got < 0) { sh_puts("read failed\n"); break; }
             if (got == 0) break;
             for (int i = 0; i < got && !head_done; i++) {
@@ -2250,6 +2375,10 @@ static void shell_exec(char *line)
         /* Flush the active disk's controller cache before unplugging. */
         extern int disk_flush(void);
         sh_puts(disk_flush() == 0 ? "sync: ok\n" : "sync: failed\n");
+    } else if (strcmp(cmd, "nic_stats") == 0) {
+        extern void i211_print_stats(void) __attribute__((weak));
+        if (i211_print_stats) i211_print_stats();
+        else sh_puts("nic_stats: i211 not built\n");
     } else if (strcmp(cmd, "dmesg") == 0) {
         /* Dump the kernel ring buffer (klog). serial_puts has been
          * teeing into klog since boot, so this is everything the
@@ -2812,7 +2941,7 @@ void __cold shell_run(void)
 
         if (len == 0) continue;  /* Empty line or Ctrl+C */
 
-        shell_exec(line);
+        shell_exec_pipeline(line);
 
         /* Poll network between commands */
         net_poll();
