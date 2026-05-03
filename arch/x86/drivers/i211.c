@@ -674,6 +674,21 @@ void i211_enable_interrupts(uint8_t pci_bus, uint8_t pci_dev, uint8_t pci_func)
     extern int pci_enable_msi(uint8_t bus, uint8_t dev, uint8_t func, uint8_t vector);
     pci_enable_msi(pci_bus, pci_dev, pci_func, 40);
 
+    /* Configure GPIE for MSI mode.  Critical for the MSI delivery
+     * chain to stay alive past the first ~22 interrupts.  Without
+     * EIAME, the chip stops honoring the IMS re-arm done by net_poll
+     * after drain, and subsequent RXT0 transitions never fire MSIs.
+     * Linux igb does this even in legacy MSI mode (igb_configure_msix:
+     * "Turn on MSI-X capability first, or our settings won't stick.
+     *  And it will take days to debug.").
+     *
+     * Bits:
+     *   PBA   — PBA support (harmless in MSI mode)
+     *   EIAME — Extended Interrupt Auto-Mask Enable (CRITICAL)
+     *   NSICR — No-Snoop ICR Clear (read-clear behavior, explicit)
+     * MSIX_MODE intentionally NOT set — we use MSI legacy. */
+    i211_write(I211_GPIE, I211_GPIE_PBA | I211_GPIE_EIAME | I211_GPIE_NSICR);
+
     /* Interrupt throttle: ~100us between interrupts (~10K/sec) */
     i211_write(I211_EITR0, 390 << 2);
 
@@ -681,7 +696,9 @@ void i211_enable_interrupts(uint8_t pci_bus, uint8_t pci_dev, uint8_t pci_func)
     i211_write(I211_IMS, I211_ICR_RXT0 | I211_ICR_LSC);
 
     i211_irq_pending = false;
-    serial_puts("[I211] Interrupts enabled (MSI vector 40, NAPI)\n");
+    serial_puts("[I211] Interrupts enabled (MSI vec 40, GPIE=0x");
+    serial_puthex(i211_read(I211_GPIE), 8);
+    serial_puts(", NAPI)\n");
 }
 
 void i211_isr(void)

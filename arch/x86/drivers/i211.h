@@ -27,6 +27,22 @@
 #define I211_IMC        0x000D8   /* Interrupt Mask Clear */
 #define I211_EITR0      0x01680   /* Interrupt Throttling (queue 0) */
 
+/* Extended interrupt registers — required by Linux igb's MSI/MSI-X
+ * setup, even in legacy MSI mode.  Without GPIE.EIAME programmed,
+ * the chip stops honoring IMS re-arm after ~22 IRQs and MSI delivery
+ * goes silent.  See I210/I211 datasheet §8.13.31 (GPIE).             */
+#define I211_GPIE       0x00028   /* General Purpose Interrupt Enable */
+#define I211_EIAC       0x000DC   /* Extended Interrupt Auto-Clear    */
+#define I211_EIAM       0x000E0   /* Extended Interrupt Auto-Mask     */
+#define I211_IAM        0x000E8   /* Interrupt Auto-Mask (legacy)     */
+
+/* GPIE bits */
+#define I211_GPIE_NSICR     (1u << 0)   /* No-Snoop ICR clear            */
+#define I211_GPIE_MSIX_MODE (1u << 4)   /* MSI-X enable (off in MSI mode) */
+#define I211_GPIE_LL_INT    (1u << 5)
+#define I211_GPIE_EIAME     (1u << 30)  /* Extended Int Auto-Mask Enable */
+#define I211_GPIE_PBA       (1u << 31)  /* PBA support                   */
+
 /* Interrupt cause bits */
 #define I211_ICR_TXDW   (1 << 0)    /* TX Descriptor Written Back */
 #define I211_ICR_LSC    (1 << 2)    /* Link Status Change */

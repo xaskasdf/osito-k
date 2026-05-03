@@ -710,17 +710,69 @@ static void cmd_kdownload(int argc, char *argv[])
     sh_puts(argv[1]); sh_puts(":"); sh_putdec(server_port);
     sh_puts(" for "); sh_puts(filename); sh_puts("\n");
 
-    /* Drain loop */
+    /* Drain loop with NAK-retransmit on stall.
+     *
+     * UDP loses tail packets when the server bursts faster than our drain.
+     * Instead of failing outright, send a NAK("OFTN" + offset) asking the
+     * server to resume from the current high_watermark. Try up to NAK_MAX
+     * times before giving up. */
     extern void net_poll(void);
-    uint64_t last_print = idt_get_ticks();
+    uint64_t last_print  = idt_get_ticks();
+    uint32_t last_high   = 0;
+    uint64_t stall_since = idt_get_ticks();
+    int nak_attempts = 0;
+    const int NAK_MAX = 5;
+    const uint64_t STALL_TICKS = 500;   /* NAK after 500 ms no progress */
+
     while (!oftp_state.done) {
         net_poll();
         uint64_t now = idt_get_ticks();
+
+        /* Reset stall window whenever data flows */
+        if (oftp_state.high_watermark != last_high) {
+            last_high   = oftp_state.high_watermark;
+            stall_since = now;
+        }
+
+        /* NAK retransmit on short stall — far faster than waiting the
+         * full 5 s hard timeout, which leaves the user staring at a
+         * frozen progress line for the tail-loss case (3 chunks lost
+         * out of 887). */
+        if (oftp_state.total_size > 0 &&
+            oftp_state.high_watermark < oftp_state.total_size &&
+            now - stall_since > STALL_TICKS) {
+            if (nak_attempts >= NAK_MAX) {
+                sh_puts("kdownload: NAK budget exhausted (");
+                sh_putdec(oftp_state.high_watermark); sh_puts("/");
+                sh_putdec(oftp_state.total_size); sh_puts(")\n");
+                oftp_state.error = true;
+                break;
+            }
+            nak_attempts++;
+            sh_puts("  NAK resume@");
+            sh_putdec(oftp_state.high_watermark);
+            sh_puts(" (");
+            sh_putdec(nak_attempts); sh_puts("/"); sh_putdec(NAK_MAX);
+            sh_puts(")\n");
+            uint8_t nak[8];
+            nak[0]='O'; nak[1]='F'; nak[2]='T'; nak[3]='N';
+            uint32_t off = oftp_state.high_watermark;
+            nak[4] = (uint8_t)(off >> 24);
+            nak[5] = (uint8_t)(off >> 16);
+            nak[6] = (uint8_t)(off >>  8);
+            nak[7] = (uint8_t)(off);
+            net_udp_send(server_ip, server_port, OFTP_LOCAL_PORT, nak, 8);
+            stall_since = now;
+            oftp_state.last_chunk_tick = now;
+        }
+
+        /* Absolute timeout — no chunk in 5 s even after NAKs */
         if (now - oftp_state.last_chunk_tick > OFTP_TIMEOUT_TICKS) {
-            sh_puts("kdownload: timeout (no chunk in 5s)\n");
+            sh_puts("kdownload: hard timeout\n");
             oftp_state.error = true;
             break;
         }
+
         if (now - last_print > 500) {
             last_print = now;
             sh_puts("  rx ");

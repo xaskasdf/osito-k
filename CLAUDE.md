@@ -387,6 +387,14 @@ arch/arm/          SM8350 (ROG Phone 5) bare-metal port — see docs/aarch64-det
 | X-CPUTOP| CPU topology detection (sockets/cores/threads, NUMA hints) | Done |
 | X-PERF  | perf events subsystem (counter sampling + ring buffer) | Done |
 | X-KSTATE| Kernel state snapshotting (boot-time fast restore, crash_report integration) | Done |
+| X-PIPES | Shell pipes (`cmd1 \| cmd2 \| ...`, hasta 8 etapas, stdin via memory buffer; `grep`/`head`/`tail` aceptan stdin) | Done |
+| X-NICSTAT| `nic_stats` shell command — snapshot live I211 (ISR, IMS, ICR, RDH, RDT, GPRC, irq_pending) | Done |
+| X-PCIMSI| PCI MSI capability ECAM-aligned read (offset 0x04 dword en lugar de 0x06 unaligned) — fix MSI bring-up | Done |
+| X-RDTFIX| I211 RX RDT off-by-one (Linux igb-style: `RDT = next_to_use`, slot recién re-armado visible para HW) | Done |
+| X-MSIFIX| I211 MSI delivery: programar GPIE con PBA \| EIAME \| NSICR — sin EIAME el chip ignora re-arm del IMS post-22 IRQs | Done |
+| X-OFTP  | OsitoK File Transfer Protocol over UDP (`kdownload <ip> <port> <file>` + `tools/oftp-server.py` con NAK retransmit) | Done |
+| X-KUPDATE| `kupdate` shell stub para fetch desde naranjositos.tech (DNS + TLS + http_get + osfs2 + kexec; bloqueado pendiente de Internet directo) | Stub |
+| X-NET-TXR| Mac↔OsitoK reply-path TX bug — `osito> ping` funciona pero `net_poll → handle_*` no llega al wire (instrumentado, hipótesis abiertas) | WIP |
 | X-VGPU  | virtio-gpu 2D + 3D driver (resource create, transfer, virgl-style) | Done |
 | X-MESA  | Mesa 25.0.0 in-OS port: util/c11/include + gallium aux + compiler/{glsl,nir,spirv} + zink + mesa/main + state_tracker (libGL.a super-archive) | WIP |
 | X-DXVK  | DXVK 2.4 in-OS port: util/spirv/vulkan + dxbc/dxvk core + d3d11/dxgi/d3d10 (com_stub IUnknown) | WIP |
@@ -428,6 +436,7 @@ arch/arm/          SM8350 (ROG Phone 5) bare-metal port — see docs/aarch64-det
 For implementation details, API specifics, register-level documentation, and debugging notes:
 
 - **[docs/x86-features-detail.md](docs/x86-features-detail.md)** — All x86-64 feature descriptions (X9-X42, X-OS*, X-NET*, X-CL*, X-WIN32, etc.)
+- **[docs/x86-network-stack.md](docs/x86-network-stack.md)** — Sesión bring-up red bare-metal (B450-F + I211): pipes, kdownload/OFTP, nic_stats, MSI fixes (PCI cap aligned + GPIE.EIAME), RDT off-by-one, reply-path TX bug + workaround
 - **[docs/kernel-demencial.md](docs/kernel-demencial.md)** — 10 features avanzadas: cpu_features, PMU counters, superpage tensor arena, multipath dispatch, sys_inference syscall, ASLR lite, predictive scheduling, speculative I/O, zero-copy SG TX, hardware breakpoints, self-optimizing kernel
 - **[docs/unicode-architecture.md](docs/unicode-architecture.md)** — Subsistema Unicode 4 capas estilo Plan 9: libutf codec, PSF2 font loader desde OsitoFS, LRU cache, renderer width-aware (CJK 16×16), boot font Latin-1 link-time. Implementado y validado en fork osito-x; documento describe diseño completo + plan de port a mainline
 - **[docs/kernel-diagram.md](docs/kernel-diagram.md)** — 5 diagramas Mermaid: arquitectura completa (111 archivos en 12 subsistemas), secuencia de boot (22 pasos), dispatch de syscalls, forward pass de inference, y mapa de integración de las 10 features
