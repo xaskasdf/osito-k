@@ -498,28 +498,57 @@ uint32_t net_icmp_get_rx_count(void) { return icmp_rx_count; }
 
 static void handle_ipv4(const uint8_t *pkt, uint32_t len)
 {
-    if (len < sizeof(ipv4_hdr_t))
-        return;
+    if (len < sizeof(ipv4_hdr_t)) return;
 
     const ipv4_hdr_t *ip = (const ipv4_hdr_t *)pkt;
 
+    /* Only log packets that are ICMP, or are addressed specifically to
+     * us — skip the mDNS/multicast flood that exhausts the limit before
+     * the shell is even up. */
+    static int ipv4_dbg = 0;
+    bool is_icmp     = (ip->proto == 1);
+    bool is_for_us   = ip_eq(ip->dst, our_ip);
+    bool log_this    = (is_icmp || is_for_us) && (ipv4_dbg++ < 64);
+
     /* Only IPv4, no options (IHL=5) */
-    if ((ip->ver_ihl & 0xF0) != 0x40)
+    if ((ip->ver_ihl & 0xF0) != 0x40) {
+        if (log_this) { serial_puts("[IPv4] drop ver_ihl="); serial_puthex(ip->ver_ihl, 2); serial_puts("\n"); }
         return;
+    }
 
     uint32_t ihl = (ip->ver_ihl & 0x0F) * 4;
     uint32_t total = ntohs(ip->total_len);
 
-    if (total > len || ihl > total)
+    if (total > len || ihl > total) {
+        if (log_this) { serial_puts("[IPv4] drop bad-len total="); serial_putdec(total); serial_puts(" ihl="); serial_putdec(ihl); serial_puts(" len="); serial_putdec(len); serial_puts("\n"); }
         return;
+    }
+
+    if (log_this) {
+        serial_puts("[IPv4] rx src=");
+        serial_putdec(ip->src[0]); serial_puts("."); serial_putdec(ip->src[1]); serial_puts(".");
+        serial_putdec(ip->src[2]); serial_puts("."); serial_putdec(ip->src[3]);
+        serial_puts(" dst=");
+        serial_putdec(ip->dst[0]); serial_puts("."); serial_putdec(ip->dst[1]); serial_puts(".");
+        serial_putdec(ip->dst[2]); serial_puts("."); serial_putdec(ip->dst[3]);
+        serial_puts(" our=");
+        serial_putdec(our_ip[0]); serial_puts("."); serial_putdec(our_ip[1]); serial_puts(".");
+        serial_putdec(our_ip[2]); serial_puts("."); serial_putdec(our_ip[3]);
+        serial_puts(" proto="); serial_putdec(ip->proto);
+        serial_puts(" total="); serial_putdec(total); serial_puts("\n");
+    }
 
     /* Check destination is us */
-    if (!ip_eq(ip->dst, our_ip))
+    if (!ip_eq(ip->dst, our_ip)) {
+        if (log_this) serial_puts("[IPv4] drop: dst != our_ip\n");
         return;
+    }
 
     /* Verify header checksum */
-    if (ip_checksum(ip, ihl) != 0)
+    if (ip_checksum(ip, ihl) != 0) {
+        if (log_this) serial_puts("[IPv4] drop: bad header checksum\n");
         return;
+    }
 
     /* Learn sender's MAC from Ethernet frame (already in ARP table via ARP,
      * but for cases where we get IP without prior ARP) */
@@ -690,6 +719,19 @@ void __hot net_poll(void)
         uint16_t ethertype = ntohs(eth->ethertype);
         const uint8_t *payload = rx_pkt + ETH_HDR_LEN;
         uint32_t payload_len = len - ETH_HDR_LEN;
+
+        /* Log every received frame's headline (rate-limited).  Confirms
+         * net_poll is being driven and packets reach the dispatch.       */
+        static int rx_dbg_n = 0;
+        if (rx_dbg_n++ < 64) {
+            serial_puts("[NET] rx eth dst=");
+            for (int i=0;i<6;i++){serial_puthex(eth->dst[i],2); if(i<5)serial_puts(":");}
+            serial_puts(" src=");
+            for (int i=0;i<6;i++){serial_puthex(eth->src[i],2); if(i<5)serial_puts(":");}
+            serial_puts(" type=0x"); serial_puthex(ethertype, 4);
+            serial_puts(" len="); serial_putdec(len);
+            serial_puts("\n");
+        }
 
         switch (ethertype) {
         case ETH_TYPE_ARP:

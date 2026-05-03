@@ -498,6 +498,21 @@ int i211_send(const void *data, uint32_t len)
      * dmesg once we know what's happening. */
     static int dbg_count = 0;
     if (dbg_count < 64) {
+        /* Hex dump first 16 bytes of the packet — eth header.  Lets us
+         * verify dst MAC, src MAC, ethertype on every TX so we can spot
+         * a corrupted/byte-swapped header.  Show olinfo_status so we
+         * can tell descriptor format from poll completion. */
+        serial_puts("[I211] TX-buf[0..15]=");
+        for (int j = 0; j < 16; j++) {
+            serial_puthex(buf[j], 2);
+            if (j == 5 || j == 11 || j == 13) serial_puts("|");
+            else if (j < 15) serial_puts(" ");
+        }
+        serial_puts(" olinfo_pre=");
+        serial_puthex(desc->olinfo_status, 8);
+        serial_puts("\n");
+    }
+    if (dbg_count < 64) {
         dbg_count++;
         uint32_t tdh_after = i211_read(I211_TDH0);
         uint32_t tdt_after = i211_read(I211_TDT0);
@@ -533,9 +548,21 @@ int i211_send(const void *data, uint32_t len)
     /* Poll for completion.  Read volatile para evitar que el compilador
      * cache-ee el valor en registro durante el loop.                     */
     volatile uint32_t *dd = &desc->olinfo_status;
+    int spins = 0;
     for (int i = 0; i < 1000000; i++) {
-        if (*dd & I211_TXD_STAT_DD)
+        if (*dd & I211_TXD_STAT_DD) {
+            if (dbg_count < 64) {
+                serial_puts("[I211] TX-done tail=");
+                serial_putdec(tail);
+                serial_puts(" spins=");
+                serial_putdec(spins);
+                serial_puts(" olinfo_post=");
+                serial_puthex(*dd, 8);
+                serial_puts("\n");
+            }
             return 0;
+        }
+        spins++;
         __asm__ volatile ("pause");
     }
 
