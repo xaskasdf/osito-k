@@ -695,8 +695,19 @@ int pci_enable_msi(uint8_t bus, uint8_t dev, uint8_t func, uint8_t vector)
             /* Found MSI capability */
             uint16_t msg_ctrl = (uint16_t)(cap_hdr >> 16);
 
-            /* Message Address (cap+4): target BSP LAPIC (ID 0) */
-            uint32_t msg_addr = 0xFEE00000;  /* LAPIC base, BSP ID 0 */
+            /* Message Address (cap+4): target BSP LAPIC (ID 0).
+             *
+             * x86 MSI message-address layout (Intel SDM Vol 3 §11.11.1):
+             *   bits  0..1 : reserved (00)
+             *   bit   2    : DM   (destination mode: 0=physical, 1=logical)
+             *   bit   3    : RH   (redirection hint: 0=direct, 1=lowest-pri)
+             *   bits  4..11: 0xFEE (LAPIC base low nibble fixed)
+             *   bits 12..19: destination ID (target APIC ID)
+             *   bits 20..31: 0xFEE (LAPIC base high)
+             *
+             * 0xFEE00000 = 0xFEE.00.0.0.0 = APIC ID 0 (BSP), physical mode,
+             * direct delivery — what we want for a single-CPU MSI target. */
+            uint32_t msg_addr = 0xFEE00000;
             pci_write32(bus, dev, func, cap_ptr + 4, msg_addr);
 
             /* 64-bit address? Check bit 7 of Message Control */
@@ -704,8 +715,24 @@ int pci_enable_msi(uint8_t bus, uint8_t dev, uint8_t func, uint8_t vector)
             if (msg_ctrl & (1 << 7))
                 pci_write32(bus, dev, func, cap_ptr + 8, 0);  /* upper 32 bits = 0 */
 
-            /* Message Data (cap+8 or cap+12): vector number, edge trigger, fixed delivery */
-            pci_write32(bus, dev, func, cap_ptr + data_offset, (uint32_t)vector);
+            /* Message Data (cap+8 or cap+12).
+             *
+             * x86 MSI message-data layout (Intel SDM Vol 3 §11.11.2):
+             *   bits  0..7 : vector
+             *   bits  8..10: delivery mode (000=Fixed, 010=SMI, 100=NMI,
+             *                               101=INIT, 111=ExtINT)
+             *   bits 11..13: reserved
+             *   bit   14   : trigger level (only for level-triggered)
+             *   bit   15   : trigger mode  (0=edge, 1=level)
+             *   bits 16..31: reserved
+             *
+             * For x86 MSI we want vector + Fixed delivery + Edge trigger,
+             * which is just the bare vector with all upper bits = 0.  We
+             * write that explicitly so it's obvious what's intended; if a
+             * future bug asks "is this edge-triggered?" the answer is in
+             * the source. */
+            uint32_t msg_data = (uint32_t)vector;   /* DM=000 Fixed, TM=0 Edge */
+            pci_write32(bus, dev, func, cap_ptr + data_offset, msg_data);
 
             /* Enable MSI: set bit 0 of Message Control (at cap+2) */
             uint32_t ctrl_dword = pci_read32(bus, dev, func, cap_ptr);

@@ -487,9 +487,16 @@ int i211_send(const void *data, uint32_t len)
     desc->cmd_type_len   = cmd | (len & 0xFFFFu);
     desc->olinfo_status  = ((uint32_t)len & 0x3FFFFu) << 14;
 
-    /* Advance tail and notify hardware */
+    /* Advance tail and notify hardware.
+     *
+     * Use mfence (full barrier) instead of wmb (sfence): the reply-path
+     * bug observation suggests something orders-related when called
+     * from interrupt-disabled context (sched_tick → net_poll →
+     * i211_send).  sfence orders stores only; mfence also drains the
+     * load buffer and ensures full coherency point sync before MMIO.
+     * Cost is ~5 cycles vs sfence's ~3 — negligible per-frame. */
     nic.tx_tail = (tail + 1) % I211_TX_RING_SIZE;
-    wmb();
+    __asm__ volatile ("mfence" ::: "memory");
     i211_write(I211_TDT0, nic.tx_tail);
 
     /* DEBUG: snapshot HW state right after kicking TDT. If TDH advances
@@ -498,15 +505,23 @@ int i211_send(const void *data, uint32_t len)
      * dmesg once we know what's happening. */
     static int dbg_count = 0;
     if (dbg_count < 64) {
-        /* Hex dump first 16 bytes of the packet — eth header.  Lets us
-         * verify dst MAC, src MAC, ethertype on every TX so we can spot
-         * a corrupted/byte-swapped header.  Show olinfo_status so we
-         * can tell descriptor format from poll completion. */
-        serial_puts("[I211] TX-buf[0..15]=");
-        for (int j = 0; j < 16; j++) {
+        /* Full-frame hex dump (up to 80 B).  Covers eth(14) + ip(20) +
+         * icmp(8) + 38 B of icmp data, which is everything we need to
+         * verify a reply is correctly constructed.  Compare working
+         * shell-ping requests vs broken reply-path replies side-by-side.
+         *
+         * Format:
+         *   eth_dst(6) | eth_src(6) | type(2) | ip[0..]
+         */
+        uint32_t dump_n = (len < 80) ? len : 80;
+        serial_puts("[I211] TX[");
+        serial_putdec(len);
+        serial_puts("] ");
+        for (uint32_t j = 0; j < dump_n; j++) {
             serial_puthex(buf[j], 2);
-            if (j == 5 || j == 11 || j == 13) serial_puts("|");
-            else if (j < 15) serial_puts(" ");
+            if (j == 5 || j == 11 || j == 13 || j == 33) serial_puts("|");
+            else if (j == 49 || j == 65) serial_puts("\n           ");
+            else if (j < dump_n - 1) serial_puts(" ");
         }
         serial_puts(" olinfo_pre=");
         serial_puthex(desc->olinfo_status, 8);
