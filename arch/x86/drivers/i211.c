@@ -267,11 +267,18 @@ static int i211_setup_tx(void)
      * set to a value greater than 0".  Sin eso la NIC nunca write-back-ea
      * el bit DD y, en algunos paths, ni siquiera fetchea los descriptores.
      *
-     * Linux igb driver usa PTHRESH=31, HTHRESH=1, WTHRESH=1 — copio esos
-     * valores que están en producción hace una década.                    */
-    uint32_t txdctl = (31u <<  0) |     /* PTHRESH                          */
+     * Match Linux igb's exact values for e1000_i210/i211 path:
+     *   PTHRESH = 8   (igb_main.c IGB_TX_PTHRESH)
+     *   HTHRESH = 1   (igb_main.c IGB_TX_HTHRESH)
+     *   WTHRESH = 4   (igb_main.c — i210/i211 special, vs 16 for others)
+     *
+     * The previous values (31/1/1) came from a different igb path.
+     * WTHRESH=1 may cause write-back-pipeline stalls when descriptors
+     * are submitted from interrupt-disabled context (the reply-path
+     * bug). */
+    uint32_t txdctl = ( 8u <<  0) |     /* PTHRESH                          */
                       ( 1u <<  8) |     /* HTHRESH                          */
-                      ( 1u << 16) |     /* WTHRESH                          */
+                      ( 4u << 16) |     /* WTHRESH                          */
                       I211_XDCTL_ENABLE;
     i211_write(I211_TXDCTL0, txdctl);
 
@@ -750,8 +757,13 @@ void i211_isr(void)
 
 void i211_rx_irq_reenable(void)
 {
+    /* Re-arm BOTH RXT0 and LSC (link status change).  The original
+     * version wrote only RXT0, which left LSC masked after the first
+     * RX IRQ — meaning we'd never get a link-down notification once
+     * a packet arrived.  Observed via nic_stats: IMS=0x04 (LSC only,
+     * RXT0 masked) which is the inverse of what we'd want. */
     if (nic.initialized)
-        i211_write(I211_IMS, I211_ICR_RXT0);
+        i211_write(I211_IMS, I211_ICR_RXT0 | I211_ICR_LSC);
 }
 
 /* i211_napi_poll is not used — NAPI drain happens inside net_poll()
