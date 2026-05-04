@@ -489,15 +489,23 @@ int i211_send(const void *data, uint32_t len)
 
     /* Advance tail and notify hardware.
      *
-     * Use mfence (full barrier) instead of wmb (sfence): the reply-path
-     * bug observation suggests something orders-related when called
-     * from interrupt-disabled context (sched_tick → net_poll →
-     * i211_send).  sfence orders stores only; mfence also drains the
-     * load buffer and ensures full coherency point sync before MMIO.
-     * Cost is ~5 cycles vs sfence's ~3 — negligible per-frame. */
+     * Three barriers/forces, addressing the reply-path TX-from-IRQ-context
+     * bug.  Shell `osito> ping` works (4/4); replies from net_poll don't
+     * reach the wire even though chip reports DD=1 + GPTC=1.  Hypothesis
+     * trail:
+     *   1. mfence (vs sfence): drain load buffer too, full coherency.
+     *   2. TDT write is PCIe posted — can sit in the chipset's write
+     *      buffer indefinitely.  A subsequent read of the same register
+     *      forces all pending writes to retire on the bus before the
+     *      read returns.  This is the canonical PCIe "ring the doorbell
+     *      and confirm it rang" idiom.
+     *   3. Final mfence so the readback completion is observed before
+     *      we go on to poll DD. */
     nic.tx_tail = (tail + 1) % I211_TX_RING_SIZE;
     __asm__ volatile ("mfence" ::: "memory");
     i211_write(I211_TDT0, nic.tx_tail);
+    (void)i211_read(I211_TDT0);   /* force posted write to retire */
+    __asm__ volatile ("mfence" ::: "memory");
 
     /* DEBUG: snapshot HW state right after kicking TDT. If TDH advances
      * past `tail` the chip fetched our descriptor; if it stays at `tail`
