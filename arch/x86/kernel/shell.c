@@ -266,6 +266,7 @@ static void cmd_help(void)
     sh_puts("  |         Pipe stdout of one cmd into next (e.g. dmesg | grep PCI)\n");
     sh_puts("  kexec     Boot a new kernel ELF (kexec [filename])\n");
     sh_puts("  kdownload Fetch a file via OFTP (kdownload <ip> <port> <name> [save|--kexec])\n");
+    sh_puts("  kupload   Push a file via OFTP (kupload <ip> <port> <local|--dmesg> [remote])\n");
     sh_puts("  kupdate   (TODO) Pull a kernel update from naranjositos.tech via HTTPS\n");
     sh_puts("  exec      Run an ELF binary\n");
     sh_puts("  ping      Ping an IP address\n");
@@ -838,6 +839,179 @@ static void cmd_kdownload(int argc, char *argv[])
         sh_puts("kdownload: chaining to kexec...\n");
         cmd_kexec(save_as);
     }
+}
+
+/* ── OFTP push (kupload) ──────────────────────────────────────────
+ *
+ * Inverse of kdownload: stream an OsitoFS file (or the live klog ring
+ * buffer) to an oftp-server.  Same wire format as kdownload, but
+ * directions reversed:
+ *   OFTU req      OsitoK → server (filename + total_size)
+ *   OFTA ack      server → OsitoK (ready to receive)
+ *   OFTD chunks   OsitoK → server  (data stream)
+ *   OFTD EOF      OsitoK → server  (cklen=0, offset==total)
+ *
+ * This bypasses the reply-path TX bug because every TX from the
+ * kupload command runs in shell (process) context — the proven-good
+ * direction.  The server's ACK and any other RX comes back via
+ * Mac→OsitoK RX which works.                                          */
+
+#define KUPLOAD_CHUNK_SZ    1400
+#define KUPLOAD_PACE_TICKS  1     /* ~1 ms between chunks (pacing)     */
+
+static void cmd_kupload(int argc, char *argv[])
+{
+    if (argc < 4) {
+        sh_puts("Usage: kupload <server-ip> <port> <local-name> [remote-name]\n");
+        sh_puts("       kupload <server-ip> <port> --dmesg [remote-name]\n");
+        sh_puts("  Pushes a file from OsitoFS to oftp-server's uploads/ dir.\n");
+        sh_puts("  --dmesg streams the live kernel log buffer (works even when\n");
+        sh_puts("  the FS write path is broken — bypasses blkdev entirely).\n");
+        return;
+    }
+
+    uint8_t server_ip[4];
+    if (parse_ip(argv[1], server_ip) < 0) {
+        sh_puts("kupload: bad IP\n");
+        return;
+    }
+    uint16_t server_port = 0;
+    for (const char *p = argv[2]; *p >= '0' && *p <= '9'; p++)
+        server_port = server_port * 10 + (uint16_t)(*p - '0');
+    if (server_port == 0) {
+        sh_puts("kupload: bad port\n");
+        return;
+    }
+
+    const char *local_name = argv[3];
+    bool from_klog = (local_name[0] == '-' && local_name[1] == '-' &&
+                      local_name[2] == 'd');   /* "--dmesg" */
+    const char *remote_name = (argc >= 5) ? argv[4]
+                              : (from_klog ? "dmesg.log" : local_name);
+
+    uint8_t  *src_buf  = NULL;
+    uint32_t  src_size = 0;
+    bool      free_buf = false;
+
+    if (from_klog) {
+        extern uint32_t klog_read(char *buf, uint32_t max_len);
+        const uint32_t klog_max = 256 * 1024;
+        src_buf = (uint8_t *)kmalloc(klog_max);
+        if (!src_buf) { sh_puts("kupload: out of memory\n"); return; }
+        src_size = klog_read((char *)src_buf, klog_max);
+        free_buf = true;
+        sh_puts("kupload: read ");
+        sh_putdec(src_size);
+        sh_puts(" B from klog\n");
+    } else {
+        if (!osfs2_is_mounted()) {
+            sh_puts("kupload: no FS mounted\n");
+            return;
+        }
+        void *f = osfs2_find(local_name);
+        if (!f) {
+            sh_puts("kupload: file not found: ");
+            sh_puts(local_name); sh_puts("\n");
+            return;
+        }
+        uint64_t fsize = osfs2_file_size(f);
+        if (fsize == 0 || fsize > 64u * 1024u * 1024u) {
+            sh_puts("kupload: bad file size\n");
+            return;
+        }
+        src_size = (uint32_t)fsize;
+        src_buf  = (uint8_t *)kmalloc(src_size);
+        if (!src_buf) { sh_puts("kupload: out of memory\n"); return; }
+        extern int osfs2_read(void *file, uint64_t offset, void *buf, uint64_t len);
+        if (osfs2_read(f, 0, src_buf, src_size) < 0) {
+            sh_puts("kupload: read failed\n");
+            kfree(src_buf);
+            return;
+        }
+        free_buf = true;
+    }
+
+    /* Note: we don't strictly need to wait for the OFTA ack — the
+     * server starts accepting OFTD chunks the moment it sees the OFTU
+     * request.  We just need a brief delay so the request lands first.
+     * The OFTA handler is left unwired for simplicity.                  */
+
+    /* Build PUT request: OFTU + total_size(BE32) + filename(60 B) */
+    uint8_t req[68];
+    for (int i = 0; i < 68; i++) req[i] = 0;
+    req[0]='O'; req[1]='F'; req[2]='T'; req[3]='U';
+    req[4] = (uint8_t)(src_size >> 24);
+    req[5] = (uint8_t)(src_size >> 16);
+    req[6] = (uint8_t)(src_size >>  8);
+    req[7] = (uint8_t)(src_size);
+    int n = 0;
+    while (remote_name[n] && n < 60) { req[8 + n] = remote_name[n]; n++; }
+
+    extern int net_udp_send(const uint8_t dst_ip[4], uint16_t dst_port,
+                             uint16_t src_port, const void *data, uint32_t len);
+    if (net_udp_send(server_ip, server_port, OFTP_LOCAL_PORT, req, 68) < 0) {
+        sh_puts("kupload: PUT send failed\n");
+        if (free_buf) kfree(src_buf);
+        return;
+    }
+
+    sh_puts("kupload: PUT '"); sh_puts(remote_name);
+    sh_puts("' "); sh_putdec(src_size); sh_puts(" B → ");
+    sh_puts(argv[1]); sh_puts(":"); sh_putdec(server_port); sh_puts("\n");
+
+    /* Wait briefly for ACK then start streaming.  Server is fast so
+     * 100 ms wall is plenty; if no ACK we just send anyway and the
+     * server will bin our data.  In practice the ACK arrives in <1ms. */
+    extern void net_poll(void);
+    extern uint64_t idt_get_ticks(void);
+    uint64_t t0 = idt_get_ticks();
+    while (idt_get_ticks() - t0 < 100) net_poll();
+
+    /* Stream data */
+    uint32_t offset = 0;
+    while (offset < src_size) {
+        uint32_t cklen = (src_size - offset > KUPLOAD_CHUNK_SZ)
+                        ? KUPLOAD_CHUNK_SZ : (src_size - offset);
+        uint8_t pkt[16 + KUPLOAD_CHUNK_SZ];
+        pkt[0]='O'; pkt[1]='F'; pkt[2]='T'; pkt[3]='D';
+        pkt[4]=(uint8_t)(src_size >> 24); pkt[5]=(uint8_t)(src_size >> 16);
+        pkt[6]=(uint8_t)(src_size >>  8); pkt[7]=(uint8_t)(src_size);
+        pkt[8]=(uint8_t)(offset >> 24);   pkt[9]=(uint8_t)(offset >> 16);
+        pkt[10]=(uint8_t)(offset >> 8);   pkt[11]=(uint8_t)(offset);
+        pkt[12]=(uint8_t)(cklen >> 24);   pkt[13]=(uint8_t)(cklen >> 16);
+        pkt[14]=(uint8_t)(cklen >> 8);    pkt[15]=(uint8_t)(cklen);
+        for (uint32_t i = 0; i < cklen; i++) pkt[16 + i] = src_buf[offset + i];
+        if (net_udp_send(server_ip, server_port, OFTP_LOCAL_PORT,
+                          pkt, 16 + cklen) < 0) {
+            sh_puts("kupload: chunk send failed @ off=");
+            sh_putdec(offset); sh_puts("\n");
+            break;
+        }
+        offset += cklen;
+        /* pacing: ~1 ms per chunk */
+        uint64_t s = idt_get_ticks();
+        while (idt_get_ticks() - s < KUPLOAD_PACE_TICKS) { /* spin */ }
+        if ((offset & 0x1FFFF) == 0) {  /* every 128 KB */
+            sh_puts("  tx "); sh_putdec(offset); sh_puts("/");
+            sh_putdec(src_size); sh_puts(" B\n");
+        }
+    }
+
+    /* EOF marker */
+    uint8_t eof[16];
+    eof[0]='O'; eof[1]='F'; eof[2]='T'; eof[3]='D';
+    eof[4]=(uint8_t)(src_size >> 24);  eof[5]=(uint8_t)(src_size >> 16);
+    eof[6]=(uint8_t)(src_size >>  8);  eof[7]=(uint8_t)(src_size);
+    eof[8]=(uint8_t)(src_size >> 24);  eof[9]=(uint8_t)(src_size >> 16);
+    eof[10]=(uint8_t)(src_size >> 8);  eof[11]=(uint8_t)(src_size);
+    eof[12]=0; eof[13]=0; eof[14]=0;   eof[15]=0;
+    net_udp_send(server_ip, server_port, OFTP_LOCAL_PORT, eof, 16);
+
+    sh_puts("kupload: done ");
+    sh_putdec(offset);
+    sh_puts(" B sent\n");
+
+    if (free_buf) kfree(src_buf);
 }
 
 /* Web-based update path — placeholder for the eventual WAN flow that
@@ -3127,6 +3301,8 @@ static void shell_exec(char *line)
         cmd_kexec(argc > 1 ? argv[1] : NULL);
     } else if (strcmp(cmd, "kdownload") == 0) {
         cmd_kdownload(argc, argv);
+    } else if (strcmp(cmd, "kupload") == 0) {
+        cmd_kupload(argc, argv);
     } else if (strcmp(cmd, "kupdate") == 0) {
         cmd_kupdate(argc, argv);
     } else if (strcmp(cmd, "reboot") == 0) {

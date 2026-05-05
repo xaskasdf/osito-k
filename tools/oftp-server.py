@@ -33,10 +33,13 @@ import sys
 import time
 
 CHUNK_SIZE   = 1400
-MAGIC_REQ    = b"OFTQ"
-MAGIC_DAT    = b"OFTD"
-MAGIC_ERR    = b"OFTE"
-MAGIC_NAK    = b"OFTN"   # client → server "resend from offset X" (8 bytes total)
+MAGIC_REQ    = b"OFTQ"   # download request   (client → server)
+MAGIC_DAT    = b"OFTD"   # data chunk         (both directions)
+MAGIC_ERR    = b"OFTE"   # error              (server → client)
+MAGIC_NAK    = b"OFTN"   # download NAK       (client → server, "resend from offset X")
+MAGIC_PUT    = b"OFTU"   # upload request     (client → server)
+MAGIC_ACK    = b"OFTA"   # upload acknowledge (server → client, "ready, send chunks")
+UPLOAD_DIR   = "uploads"  # subdir under serve-root for incoming files
 # 3 ms ≈ 333 chunks/s ≈ 460 KB/s. Slow on purpose: previous 0.5 ms left
 # OsitoK losing the tail packets of a 1.2 MB transfer (kdownload stalled
 # at 1237600/1240728). Drain through net_poll on the i211 polling loop is
@@ -52,6 +55,13 @@ def serve(bind_host: str, port: int, root: str) -> None:
     # peer (addr, path, size) of the file currently being served — kept
     # so a NAK from the same peer can re-stream from a given offset.
     last_serve = {}
+
+    # peer → upload session: {path, total_size, buffer (bytearray), high_watermark}
+    uploads = {}
+
+    # Ensure upload dir exists under root
+    upload_root = os.path.join(root, UPLOAD_DIR)
+    os.makedirs(upload_root, exist_ok=True)
 
     def send_from(path: str, size: int, addr: tuple, start_offset: int) -> int:
         """Stream from start_offset to EOF. Returns bytes sent (excl. EOF marker)."""
@@ -81,6 +91,53 @@ def serve(bind_host: str, port: int, root: str) -> None:
             continue
 
         magic = data[:4]
+
+        # ── Upload request: client wants to push a file to us ───────
+        if magic == MAGIC_PUT and len(data) >= 8:
+            (total_size,) = struct.unpack(">I", data[4:8])
+            filename = data[8:].rstrip(b"\x00").decode("utf-8", errors="ignore")
+            # Sanitize filename: strip path components, refuse traversal
+            base = os.path.basename(filename) or "unnamed.bin"
+            if ".." in base or total_size > 256 * 1024 * 1024:
+                print(f"  {addr[0]}:{addr[1]}  PUT {filename!r} -> rejected")
+                sock.sendto(MAGIC_ERR + b"rejected", addr)
+                continue
+            dst_path = os.path.join(upload_root, base)
+            uploads[addr] = {
+                "path": dst_path,
+                "total": total_size,
+                "buf": bytearray(total_size),
+                "high": 0,
+                "started": time.monotonic(),
+            }
+            print(f"  {addr[0]}:{addr[1]}  PUT {base!r} -> {total_size} bytes (recv)")
+            sock.sendto(MAGIC_ACK + struct.pack(">I", total_size), addr)
+            continue
+
+        # ── Upload data chunk: belongs to an active upload session ──
+        if magic == MAGIC_DAT and len(data) >= 16 and addr in uploads:
+            sess = uploads[addr]
+            (total, offset, cklen) = struct.unpack(">III", data[4:16])
+            if total != sess["total"]:
+                continue  # stale or mismatched
+            # EOF marker
+            if cklen == 0 and offset == total:
+                bytes_written = sum(1 for b in sess["buf"] if b is not None) if False else len(sess["buf"])
+                with open(sess["path"], "wb") as fh:
+                    fh.write(bytes(sess["buf"]))
+                elapsed = time.monotonic() - sess["started"]
+                rate = sess["high"] / elapsed / 1024 if elapsed else 0
+                print(f"  {addr[0]}:{addr[1]}  PUT done {sess['high']}/{total} B "
+                      f"in {elapsed*1000:.0f} ms ({rate:.0f} KB/s) -> {sess['path']}")
+                del uploads[addr]
+                continue
+            if offset + cklen > total or 16 + cklen > len(data):
+                continue
+            sess["buf"][offset:offset+cklen] = data[16:16+cklen]
+            end = offset + cklen
+            if end > sess["high"]:
+                sess["high"] = end
+            continue
 
         # NAK retransmit: client lost a stretch starting at <offset>.
         if magic == MAGIC_NAK and len(data) >= 8:
