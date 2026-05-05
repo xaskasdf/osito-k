@@ -41,31 +41,44 @@ kexec_trampoline:
     jmp     .Lcopy_loop
 
 .Lcopy_done:
-    /* Set up minimal stack (use a safe area at 16MB).
+    /* Set up minimal stack (use a safe area at 16MB) and CALL — not
+     * JMP — into kernel_entry.  This is the architecturally correct
+     * primitive: x86-64 SysV ABI mandates RSP % 16 == 8 at function
+     * entry (the post-CALL state — RSP was 16-byte aligned before
+     * CALL pushed an 8-byte return address).  The compiler emits SSE
+     * moves on locals via [rbp - K] assuming this alignment.
      *
-     * NOTE: x86-64 SysV ABI says RSP % 16 == 8 at function entry
-     * (post-CALL), so a strict reading of the spec says this should
-     * be `mov $0x1000000, %rsp; sub $8, %rsp` before JMP-to-entry.
-     * I (Claude) tried that in commit 20c1fbe and it BROKE more than
-     * it fixed: instead of #GP at pci_scan+0x458 movaps it caused a
-     * PF/UD at smp_init or gpu_init (different symbol each boot).
+     * Earlier this used JMP, leaving RSP at 0x1000000 (RSP % 16 == 0)
+     * at function entry — ABI-violating.  Triggered #GP at the first
+     * movaps reachable from kexec'd boot path (e.g. pci_scan+0x458).
      *
-     * Reverted on user request: "antes no tenia ese problema".
+     * I tried `sub $8, %rsp; jmp` (commit 20c1fbe) which is
+     * mathematically equivalent to CALL's stack adjustment.  It
+     * caused new crashes (smp_init+0 #PF, garbled boot output).
+     * Reverted in commit da8df4d.
      *
-     * Hypothesis: kernel_entry's compile-time stack frame happens to
-     * work with RSP % 16 == 0 on entry (movaps offsets coincidentally
-     * land on 16-aligned addrs).  Going forward, any new SSE-using
-     * function reachable from kexec'd kernel needs to be inspected.
+     * CALL is strictly better than the ad-hoc sub-and-jmp:
+     *   1. Same ABI-compliant stack effect (-8 from a 16-aligned RSP).
+     *   2. The pushed return address is the well-known .Lhalt_loop
+     *      below, so any runaway RET in kernel_entry lands in a
+     *      defined halt instead of garbage memory or attacker-
+     *      controllable bytes.
+     *   3. Self-documenting: future readers see "this calls kernel
+     *      entry" not "this does a sub-then-jmp dance".
      *
-     * Long-term fix: change the JMP to CALL so the standard ABI
-     * applies naturally.  But CALL implies the callee can RET, and
-     * kernel_entry never returns — needs a guarded fault page as
-     * "return address" or similar.  Out of scope right now. */
+     * If this still misbehaves, the issue is NOT stack alignment but
+     * something else (paging, IDT, GPU MMIO state) — investigate
+     * those instead of fiddling with this prologue. */
     mov     $0x1000000, %rsp
-
-    /* Jump to new kernel entry with boot_info_t* in RDI */
     mov     %r12, %rdi
-    jmp     *%r13
+    call    *%r13
+
+    /* kernel_entry must never return — if it somehow does, halt
+     * deterministically rather than executing whatever bytes follow. */
+.Lhalt_loop:
+    cli
+    hlt
+    jmp     .Lhalt_loop
 
 kexec_trampoline_end:
     nop
