@@ -864,32 +864,28 @@ int net_udp_send(const uint8_t dst_ip[4], uint16_t dst_port,
      * path for correctness simplicity. */
     extern int nic_send_sg(const uint64_t frag_phys[],
                             const uint32_t lens[], int n_frags);
-    /* Zero-copy scatter-gather: skip the memcpy when payload >= 256 B.
+    /* SG path DISABLED — pending issue.
      *
-     * Two bug classes observed historically that you should NOT
-     * reintroduce if touching this:
-     *   1. VIRT_TO_PHYS macro silently underflows for lower-half
-     *      identity addresses.  Use kvirt_to_phys() — see paging.h:46.
-     *   2. i211_send_sg used to set IFCS+PAYLEN per-fragment instead
-     *      of only on the last descriptor.  Per Intel I210/I211
-     *      datasheet §7.2.2.2.4, IFCS is one CRC per packet and
-     *      PAYLEN is the total post-L2 length on the last data
-     *      descriptor.  Fixed in commit 99cda9b.
+     * Symptom: kupload --dmesg via SG sends all-NUL bytes to the server
+     * even with the i211_send_sg fixes (commit 99cda9b: IFCS-on-last,
+     * PAYLEN-on-last per Intel datasheet §7.2.2.2.4).  Fix didn't help.
      *
-     * If both kdownload's transmit AND a future SG-using path break,
-     * the safe fallback is to comment out this whole block — the
-     * memcpy path below is correct and fast enough for kernel-class
-     * traffic. */
-    if (len >= 256 && frame_len >= 60) {
-        uint64_t frags[2] = {
-            kvirt_to_phys(tx_pkt),
-            kvirt_to_phys(data)
-        };
-        uint32_t lens_arr[2] = { hdr_total, len };
-        int sg = nic_send_sg(frags, lens_arr, 2);
-        if (sg == 0) return 0;
-        /* On SG failure (e.g. NIC busy), fall through to copy path. */
-    }
+     * Bugs found and fixed in i211_send_sg but NOT root cause:
+     *   - per-fragment IFCS bit (was on every desc; should be on last)
+     *   - per-fragment PAYLEN (was per-frag length; should be total
+     *     post-L2 length on the last data descriptor only)
+     *   - VIRT_TO_PHYS macro that underflows for lower-half identity
+     *     addrs — fixed by switching to kvirt_to_phys() (paging.h:46)
+     *
+     * Suspected residual cause: some chip-side state we're not
+     * configuring (header-split? segments-context-only?) or a desc
+     * field combination outside what i210/i211 accepts in MSI mode.
+     * Linux igb's chained-data-desc path doesn't 1:1 with what we do.
+     *
+     * For now, all UDP goes through the slower memcpy → tx_pkt →
+     * i211_send single-buffer path below.  Fast enough for kernel-class
+     * traffic.  See docs/x86-network-stack.md §SG-pending.            */
+    (void)hdr_total;
 
     /* Copy payload into tx_pkt */
     memcpy(tx_pkt + hdr_total, data, len);

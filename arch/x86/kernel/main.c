@@ -321,6 +321,21 @@ extern char __bss_end[]   __attribute__((weak));
 static void enable_sse(void) { uint64_t cr0, cr4; __asm__ volatile ("mov %%cr0, %0" : "=r"(cr0)); cr0 &= ~(1ULL << 2); cr0 |= (1ULL << 1); __asm__ volatile ("mov %0, %%cr0" : : "r"(cr0)); __asm__ volatile ("mov %%cr4, %0" : "=r"(cr4)); cr4 |= (1ULL << 9); cr4 |= (1ULL << 10); __asm__ volatile ("mov %0, %%cr4" : : "r"(cr4)); }
 void __initk kernel_entry(boot_info_t *info)
 {
+    /* Early-boot probe (kexec diagnostic).  serial_init hasn't been
+     * called yet but COM1 is already configured by UEFI / prev kernel.
+     * Direct OUTB to 0x3F8 with simple ready-bit polling. */
+    #define KEXEC_PROBE(s) do { \
+        const char *_p = (s); \
+        while (*_p) { \
+            uint8_t _st; \
+            do { __asm__ volatile ("inb $0x3FD, %0" : "=a"(_st)); } \
+            while (!(_st & 0x20)); \
+            __asm__ volatile ("outb %b0, $0x3F8" : : "a"(*_p)); \
+            _p++; \
+        } \
+    } while (0)
+    KEXEC_PROBE("[KEXEC-PATH] kernel_entry\n");
+
     /* ── Step -1: Zero BSS (UEFI AllocatePages returns zeroed memory, but
      * the kernel's BSS extends beyond the file-backed data segment) ── */
     {
@@ -562,11 +577,13 @@ void __initk kernel_entry(boot_info_t *info)
     }
 
     /* GPU MMIO probe (Phase 1) */
+    KEXEC_PROBE("[KEXEC-PATH] pre-gpu_init\n");
     if (gpu && gpu->bar0_base) {
         gpu_init(gpu->bar0_base);
     } else {
         serial_puts("[KERN] No NVIDIA GPU found\n");
     }
+    KEXEC_PROBE("[KEXEC-PATH] post-gpu_init\n");
 
     /* Virtio GPU probe */
     {

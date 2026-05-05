@@ -201,6 +201,41 @@ directo a Mac, sin gateway). Siguiente milestone H7+ (red con router/AP).
 
 ---
 
+## 9.5 SG path en `net_udp_send` (open, disabled)
+
+Commits relevantes: `99cda9b` (i211_send_sg fixes), `0ec8516` (re-enable
+attempt), reverted via SG-disable.
+
+**Symptom**: `kupload --dmesg` con SG path activo envía 100% NUL bytes
+al server, aunque `kupload: src[0..31]` confirma que `klog_read` puso
+ASCII real en el buffer source.
+
+**Bugs encontrados y fixeados (no resuelven el síntoma)**:
+1. `VIRT_TO_PHYS` macro underflows para lower-half identity addresses.
+   Switched a `kvirt_to_phys()` (paging.h:46). No cambio.
+2. `i211_send_sg` setea `IFCS` y `PAYLEN` per-fragment. Per Intel
+   I210/I211 datasheet §7.2.2.2.4, IFCS es 1 CRC por paquete y PAYLEN
+   es total post-L2 length, ambos solo en el último data descriptor.
+   Fixed en `99cda9b`. No cambio el síntoma.
+
+**Causa residual sospechada**: hay configuración chip-side adicional
+que falta (header-split mode? context-only desc?), o una combinación
+de campos del descriptor que el chip no acepta en modo MSI con
+chained data descs. Linux igb tiene un path más elaborado que
+necesitaríamos replicar 1:1.
+
+**Estado actual**: SG path disabled en `net_udp_send` (línea ~860).
+Todos los UDP pasan por `memcpy → tx_pkt → i211_send` single-buffer.
+Performance suficiente para tráfico kernel-class.
+
+**Próximo experimento**:
+- Capturar TX en cable con un NIC sniffer externo mientras enviamos
+  via SG, ver si los frames realmente salen del chip o se quedan
+  internos
+- Comparar bit-a-bit con un capture de Linux igb en el mismo HW
+
+---
+
 ## 9. Reply-path TX bug (open, workaround documentado)
 
 Commits diagnósticos: `437353c`, `b7c2225`, `2d96b04`.
