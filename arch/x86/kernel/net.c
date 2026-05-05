@@ -864,22 +864,13 @@ int net_udp_send(const uint8_t dst_ip[4], uint16_t dst_port,
      * path for correctness simplicity. */
     extern int nic_send_sg(const uint64_t frag_phys[],
                             const uint32_t lens[], int n_frags);
-    if (len >= 256 && frame_len >= 60) {
-        /* Use kvirt_to_phys (NOT VIRT_TO_PHYS) — see paging.h:46-52.
-         * VIRT_TO_PHYS underflows for lower-half identity addresses and
-         * gives the chip a garbage DMA source.  Symptom: server-side
-         * receives N bytes of pure NUL even though src buffer has real
-         * content.  kvirt_to_phys handles both lower-half identity and
-         * upper-half mirror addresses safely. */
-        uint64_t frags[2] = {
-            kvirt_to_phys(tx_pkt),
-            kvirt_to_phys(data)
-        };
-        uint32_t lens_arr[2] = { hdr_total, len };
-        int sg = nic_send_sg(frags, lens_arr, 2);
-        if (sg == 0) return 0;
-        /* On SG failure (e.g. NIC busy), fall through to copy path. */
-    }
+    /* SG path DISABLED — kupload --dmesg observed sending pure NUL
+     * via this path even with kvirt_to_phys.  Suspect: I211 chained
+     * advanced descriptors need a different PAYLEN/cmd setup, OR
+     * memory ordering between two distinct DMA sources is racing.
+     * The memcpy fallback (below) is correct & fast enough.  Re-enable
+     * after we validate the SG behavior with a smaller test rig.    */
+    (void)hdr_total;
 
     /* Copy payload into tx_pkt */
     memcpy(tx_pkt + hdr_total, data, len);
