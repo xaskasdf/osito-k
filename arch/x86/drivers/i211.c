@@ -436,14 +436,31 @@ int i211_send_sg(const uint64_t frag_phys[], const uint32_t lens[], int n_frags)
     for (int i = 0; i < n_frags; i++) {
         uint32_t idx = (tail + i) % I211_TX_RING_SIZE;
         i211_tx_desc_t *d = &nic.tx_ring[idx];
-        uint32_t cmd = I211_TXD_DTYP_DATA | I211_TXD_CMD_IFCS | I211_TXD_CMD_DEXT;
+
+        /* CMD bits: DEXT required on every advanced descriptor.  IFCS,
+         * EOP, RS go ONLY on the last descriptor of the packet —
+         * IFCS = "Insert FCS/CRC" appends once per packet (not per
+         * fragment), EOP marks End-of-Packet, RS triggers DD writeback.
+         * Setting IFCS on every fragment was confusing the chip and
+         * leading to silent data corruption (all-NUL DMA). */
+        uint32_t cmd = I211_TXD_DTYP_DATA | I211_TXD_CMD_DEXT;
         if (i == n_frags - 1)
-            cmd |= I211_TXD_CMD_EOP | I211_TXD_CMD_RS;
+            cmd |= I211_TXD_CMD_EOP | I211_TXD_CMD_IFCS | I211_TXD_CMD_RS;
         d->addr = frag_phys[i];
         d->cmd_type_len = cmd | (lens[i] & 0xFFFFu);
-        /* PAYLEN goes in olinfo_status[31:14]. For simple non-TSO packets
-         * the payload length equals the data length of this fragment. */
-        d->olinfo_status = ((uint32_t)lens[i] & 0x3FFFFu) << 14;
+
+        /* PAYLEN: per Intel I210/I211 datasheet §7.2.2.2.4, PAYLEN is
+         * the TOTAL packet payload length (after L2 header) — set ONLY
+         * on the last data descriptor of the packet.  Earlier
+         * descriptors must have olinfo_status zeroed (specifically the
+         * PAYLEN field).  Setting per-fragment PAYLEN was the all-NUL
+         * upload bug. */
+        if (i == n_frags - 1) {
+            uint32_t paylen = (total > 14) ? (total - 14) : total;
+            d->olinfo_status = (paylen & 0x3FFFFu) << 14;
+        } else {
+            d->olinfo_status = 0;
+        }
     }
 
     nic.tx_tail = (tail + n_frags) % I211_TX_RING_SIZE;
