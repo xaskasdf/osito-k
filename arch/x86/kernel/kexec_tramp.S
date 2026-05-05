@@ -43,20 +43,25 @@ kexec_trampoline:
 .Lcopy_done:
     /* Set up minimal stack (use a safe area at 16MB).
      *
-     * x86-64 SysV ABI: at function entry, RSP must satisfy
-     * (RSP % 16) == 8.  This accounts for the 8-byte return address
-     * pushed by CALL (caller's RSP is 16-aligned, CALL pushes 8 →
-     * callee sees RSP % 16 == 8).  The compiler emits SSE moves
-     * (movaps) on locals via `[rbp - offset]` assuming RBP % 16 == 0,
-     * which is satisfied iff (RSP % 16) == 8 at entry (then `push rbp;
-     * mov rsp, rbp` lands at RBP % 16 == 0).
+     * NOTE: x86-64 SysV ABI says RSP % 16 == 8 at function entry
+     * (post-CALL), so a strict reading of the spec says this should
+     * be `mov $0x1000000, %rsp; sub $8, %rsp` before JMP-to-entry.
+     * I (Claude) tried that in commit 20c1fbe and it BROKE more than
+     * it fixed: instead of #GP at pci_scan+0x458 movaps it caused a
+     * PF/UD at smp_init or gpu_init (different symbol each boot).
      *
-     * Since we use JMP not CALL, no return address is pushed.  We
-     * adjust RSP by -8 to simulate it.  Without this fix, kexec'd
-     * kernel #GPs at the first SSE local-zero in any non-trivial
-     * function — observed at pci_scan+0x458 movaps %xmm0,(%rax).      */
+     * Reverted on user request: "antes no tenia ese problema".
+     *
+     * Hypothesis: kernel_entry's compile-time stack frame happens to
+     * work with RSP % 16 == 0 on entry (movaps offsets coincidentally
+     * land on 16-aligned addrs).  Going forward, any new SSE-using
+     * function reachable from kexec'd kernel needs to be inspected.
+     *
+     * Long-term fix: change the JMP to CALL so the standard ABI
+     * applies naturally.  But CALL implies the callee can RET, and
+     * kernel_entry never returns — needs a guarded fault page as
+     * "return address" or similar.  Out of scope right now. */
     mov     $0x1000000, %rsp
-    sub     $8, %rsp
 
     /* Jump to new kernel entry with boot_info_t* in RDI */
     mov     %r12, %rdi
