@@ -949,6 +949,32 @@ static void cmd_kupload(int argc, char *argv[])
 
     extern int net_udp_send(const uint8_t dst_ip[4], uint16_t dst_port,
                              uint16_t src_port, const void *data, uint32_t len);
+    extern void net_arp_probe(const uint8_t target_ip[4]);
+    extern int  net_arp_lookup_nowait(const uint8_t ip[4], uint8_t mac_out[6]);
+    extern void net_poll(void);
+    extern uint64_t idt_get_ticks(void);
+
+    /* Resolve Mac's ARP first.  Cold-cache case: net_udp_send fails
+     * fast because ARP isn't there yet; we'd lose the PUT.  Probe +
+     * wait up to 1 s for the reply. */
+    {
+        uint8_t mac_dummy[6];
+        if (net_arp_lookup_nowait(server_ip, mac_dummy) != 0) {
+            net_arp_probe(server_ip);
+            uint64_t deadline = idt_get_ticks() + 1000;
+            while (idt_get_ticks() < deadline) {
+                net_poll();
+                if (net_arp_lookup_nowait(server_ip, mac_dummy) == 0) break;
+            }
+            if (net_arp_lookup_nowait(server_ip, mac_dummy) != 0) {
+                sh_puts("kupload: ARP resolution failed for ");
+                sh_puts(argv[1]); sh_puts("\n");
+                if (free_buf) kfree(src_buf);
+                return;
+            }
+        }
+    }
+
     if (net_udp_send(server_ip, server_port, OFTP_LOCAL_PORT, req, 68) < 0) {
         sh_puts("kupload: PUT send failed\n");
         if (free_buf) kfree(src_buf);
