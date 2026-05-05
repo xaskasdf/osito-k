@@ -864,13 +864,32 @@ int net_udp_send(const uint8_t dst_ip[4], uint16_t dst_port,
      * path for correctness simplicity. */
     extern int nic_send_sg(const uint64_t frag_phys[],
                             const uint32_t lens[], int n_frags);
-    /* SG path DISABLED — kupload --dmesg observed sending pure NUL
-     * via this path even with kvirt_to_phys.  Suspect: I211 chained
-     * advanced descriptors need a different PAYLEN/cmd setup, OR
-     * memory ordering between two distinct DMA sources is racing.
-     * The memcpy fallback (below) is correct & fast enough.  Re-enable
-     * after we validate the SG behavior with a smaller test rig.    */
-    (void)hdr_total;
+    /* Zero-copy scatter-gather: skip the memcpy when payload >= 256 B.
+     *
+     * Two bug classes observed historically that you should NOT
+     * reintroduce if touching this:
+     *   1. VIRT_TO_PHYS macro silently underflows for lower-half
+     *      identity addresses.  Use kvirt_to_phys() — see paging.h:46.
+     *   2. i211_send_sg used to set IFCS+PAYLEN per-fragment instead
+     *      of only on the last descriptor.  Per Intel I210/I211
+     *      datasheet §7.2.2.2.4, IFCS is one CRC per packet and
+     *      PAYLEN is the total post-L2 length on the last data
+     *      descriptor.  Fixed in commit 99cda9b.
+     *
+     * If both kdownload's transmit AND a future SG-using path break,
+     * the safe fallback is to comment out this whole block — the
+     * memcpy path below is correct and fast enough for kernel-class
+     * traffic. */
+    if (len >= 256 && frame_len >= 60) {
+        uint64_t frags[2] = {
+            kvirt_to_phys(tx_pkt),
+            kvirt_to_phys(data)
+        };
+        uint32_t lens_arr[2] = { hdr_total, len };
+        int sg = nic_send_sg(frags, lens_arr, 2);
+        if (sg == 0) return 0;
+        /* On SG failure (e.g. NIC busy), fall through to copy path. */
+    }
 
     /* Copy payload into tx_pkt */
     memcpy(tx_pkt + hdr_total, data, len);
