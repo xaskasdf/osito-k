@@ -903,6 +903,19 @@ static void cmd_kupload(int argc, char *argv[])
         sh_puts("kupload: read ");
         sh_putdec(src_size);
         sh_puts(" B from klog\n");
+        /* Sanity check: kupload --dmesg post-kexec uploaded 100% NUL.
+         * Print first 32 bytes from what klog_read gave us.  If they
+         * are zero too → klog_read bug (or src_buf is page-zero COW).
+         * If they are real ASCII → bug is in our send loop. */
+        sh_puts("kupload: src[0..31]=\"");
+        for (uint32_t i = 0; i < 32 && i < src_size; i++) {
+            char c = (char)src_buf[i];
+            if (c == 0)        sh_puts("\\0");
+            else if (c == '\n') sh_puts("\\n");
+            else if (c < 32 || c > 126) sh_puts(".");
+            else { char s[2] = {c, 0}; sh_puts(s); }
+        }
+        sh_puts("\"\n");
     } else {
         if (!osfs2_is_mounted()) {
             sh_puts("kupload: no FS mounted\n");

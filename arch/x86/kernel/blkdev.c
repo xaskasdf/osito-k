@@ -88,6 +88,18 @@ int blkdev_write(int dev_idx, uint64_t lba, uint32_t count, const void *buf)
 
 int blkdev_count(void) { return device_count; }
 
+/* True if device idx is registered, active, and has a non-NULL write
+ * callback.  Used by the OsitoFS scan to prefer a writeable backing
+ * (USB MSC) over a read-only one (current NVMe driver) when both have
+ * OsitoFS.  Without this preference, post-kexec we'd mount NVMe (write
+ * NULL) and the FS goes read-only — observed symptom. */
+bool blkdev_can_write(int dev_idx)
+{
+    if (dev_idx < 0 || dev_idx >= device_count) return false;
+    blkdev_t *d = &devices[dev_idx];
+    return d->active && d->write != NULL;
+}
+
 const char *blkdev_name(int idx)
 {
     if (idx < 0 || idx >= device_count) return NULL;

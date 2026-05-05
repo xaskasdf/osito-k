@@ -768,8 +768,27 @@ void __initk kernel_entry(boot_info_t *info)
         serial_puts(" block device(s)...\n");
         fb_puts("\n Scanning for OsitoFS...\n");
 
-        for (int i = 0; i < n_bd && !fs_mounted; i++) {
-            disk_set_active(i);
+        /* Two-pass scan: PREFER write-capable backings.
+         *
+         * The current NVMe driver registers with write=NULL (no NVMe
+         * Write opcode wired up yet), so if we ever find OsitoFS on
+         * NVMe before USB-MSC the FS goes read-only — `[BLK] write=0
+         * ssz=512 ... rolling back metadata`.  Try writeable devices
+         * first, fall through to read-only only if nothing else mounts.
+         *
+         * Pass 0: write-capable (USB MSC, virtio-blk, AHCI when wired)
+         * Pass 1: read-only (NVMe, ISO etc.) — last resort               */
+        extern bool blkdev_can_write(int dev_idx);
+        for (int pass = 0; pass < 2 && !fs_mounted; pass++) {
+            for (int i = 0; i < n_bd && !fs_mounted; i++) {
+                bool wr = blkdev_can_write(i);
+                if (pass == 0 && !wr) continue;   /* RO devs skipped pass 0 */
+                if (pass == 1 &&  wr) continue;   /* RW devs already tried */
+                serial_puts("[KERN] scan ");
+                serial_puts(wr ? "rw " : "ro ");
+                serial_putdec((uint64_t)i);
+                serial_puts("\n");
+                disk_set_active(i);
             uint64_t part_off = 0, part_size = 0;
             (void)part_size;
 
@@ -829,7 +848,8 @@ void __initk kernel_entry(boot_info_t *info)
                 fb_puts(blkdev_name(i));
                 fb_puts("\n");
             }
-        }
+            }   /* end for-i (per blkdev) */
+        }       /* end for-pass (rw → ro) */
         if (!fs_mounted) {
             serial_puts("[KERN] OsitoFS not found on any block device\n");
             fb_puts(" OsitoFS: not found\n");
