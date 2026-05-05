@@ -1722,20 +1722,81 @@ static void cmd_kexec(const char *arg)
         return;
     }
 
-    /* Step 2: Validate ELF header */
+    /* Step 2: Validate ELF header — kexec is ring-0 with no return.
+     * A bad jump can reboot the box (we've already burned a couple of
+     * test cycles to that), so we're paranoid: every byte that the
+     * ELF spec lets us check, we check.  Tradeoff: refuse to run a
+     * potentially-good kernel rather than gamble on a partial download.
+     */
     kexec_elf64_hdr_t *ehdr = (kexec_elf64_hdr_t *)elf_data;
     if (ehdr->e_ident[0] != 0x7F || ehdr->e_ident[1] != 'E' ||
         ehdr->e_ident[2] != 'L'  || ehdr->e_ident[3] != 'F') {
-        sh_puts_color("  Not an ELF file\n", 0x00FF0000);
-        kfree(elf_data);
-        return;
+        sh_puts_color("  validate: bad ELF magic\n", 0x00FF0000);
+        kfree(elf_data); return;
+    }
+    if (ehdr->e_ident[4] != 2) {  /* EI_CLASS: ELFCLASS64 */
+        sh_puts_color("  validate: not ELF64\n", 0x00FF0000);
+        kfree(elf_data); return;
+    }
+    if (ehdr->e_ident[5] != 1) {  /* EI_DATA: little-endian */
+        sh_puts_color("  validate: not little-endian\n", 0x00FF0000);
+        kfree(elf_data); return;
+    }
+    if (ehdr->e_type != 2) {      /* ET_EXEC */
+        sh_puts_color("  validate: e_type != ET_EXEC (got 0x", 0x00FF0000);
+        serial_puthex(ehdr->e_type, 4); sh_puts_color(")\n", 0x00FF0000);
+        kfree(elf_data); return;
+    }
+    if (ehdr->e_machine != 0x3E) { /* EM_X86_64 */
+        sh_puts_color("  validate: e_machine != X86_64 (got 0x", 0x00FF0000);
+        serial_puthex(ehdr->e_machine, 4); sh_puts_color(")\n", 0x00FF0000);
+        kfree(elf_data); return;
+    }
+    /* Entry point must be in the high-half kernel range (we only
+     * support upper-half kernels — UEFI loads us at 0xFFFF8000_xxxxxxxx). */
+    if ((ehdr->e_entry >> 32) != 0xFFFF8000ULL) {
+        sh_puts_color("  validate: entry not in upper-half (0xFFFF8000_*); got 0x",
+                       0x00FF0000);
+        serial_puthex(ehdr->e_entry, 16); sh_puts_color("\n", 0x00FF0000);
+        kfree(elf_data); return;
+    }
+    /* Sanity: phnum/phentsize/phoff inside file */
+    if (ehdr->e_phnum == 0 || ehdr->e_phnum > 16 ||
+        ehdr->e_phentsize != 56 ||
+        ehdr->e_phoff + (uint64_t)ehdr->e_phnum * 56 > file_size) {
+        sh_puts_color("  validate: phdr table out of bounds\n", 0x00FF0000);
+        kfree(elf_data); return;
+    }
+    /* Walk PT_LOAD segments; require at least one and check filesz/offset. */
+    int n_load = 0;
+    for (int i = 0; i < ehdr->e_phnum; i++) {
+        kexec_elf64_phdr_t *ph = (kexec_elf64_phdr_t *)
+            (elf_data + ehdr->e_phoff + i * 56);
+        if (ph->p_type != 1) continue;
+        n_load++;
+        if (ph->p_offset + ph->p_filesz > file_size ||
+            ph->p_filesz > ph->p_memsz) {
+            sh_puts_color("  validate: PT_LOAD segment overflows file\n",
+                           0x00FF0000);
+            kfree(elf_data); return;
+        }
+        /* Each load vaddr must also be in upper-half */
+        if ((ph->p_vaddr >> 32) != 0xFFFF8000ULL) {
+            sh_puts_color("  validate: PT_LOAD vaddr not upper-half\n",
+                           0x00FF0000);
+            kfree(elf_data); return;
+        }
+    }
+    if (n_load == 0) {
+        sh_puts_color("  validate: no PT_LOAD segments\n", 0x00FF0000);
+        kfree(elf_data); return;
     }
 
-    sh_puts("  Entry: 0x");
-    serial_puthex(ehdr->e_entry, 8);
+    sh_puts("  validate: OK (ELF64 x86_64 ET_EXEC, entry=0x");
+    serial_puthex(ehdr->e_entry, 16);
     sh_puts(", ");
-    sh_putdec(ehdr->e_phnum);
-    sh_puts(" program headers\n");
+    sh_putdec(n_load);
+    sh_puts(" PT_LOADs)\n");
 
     /* Step 3: Parse PT_LOAD segments, copy to temp area at 0x8000000 (128MB) */
     #define KEXEC_TEMP_BASE  0x8000000ULL
