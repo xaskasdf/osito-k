@@ -1006,12 +1006,25 @@ static void cmd_kupload(int argc, char *argv[])
     uint64_t t0 = idt_get_ticks();
     while (idt_get_ticks() - t0 < 100) net_poll();
 
-    /* Stream data */
+    /* Stream data.
+     *
+     * pkt buffer comes from kmalloc, NOT the stack — net_udp_send takes
+     * a scatter-gather TX path when len >= 256, and that path computes
+     * VIRT_TO_PHYS(data).  Stack pointers don't have a clean phys
+     * mapping (the kernel stack is in a separate VA region), so the
+     * chip DMAs garbage zeros from an unmapped phys.  Observed: 35473
+     * bytes of pure NUL at the server even though src_buf has real
+     * content (`src[0..31]=".\n[SMP] ..."` confirmed).               */
+    uint8_t *pkt = (uint8_t *)kmalloc(16 + KUPLOAD_CHUNK_SZ);
+    if (!pkt) {
+        sh_puts("kupload: oom for pkt buffer\n");
+        if (free_buf) kfree(src_buf);
+        return;
+    }
     uint32_t offset = 0;
     while (offset < src_size) {
         uint32_t cklen = (src_size - offset > KUPLOAD_CHUNK_SZ)
                         ? KUPLOAD_CHUNK_SZ : (src_size - offset);
-        uint8_t pkt[16 + KUPLOAD_CHUNK_SZ];
         pkt[0]='O'; pkt[1]='F'; pkt[2]='T'; pkt[3]='D';
         pkt[4]=(uint8_t)(src_size >> 24); pkt[5]=(uint8_t)(src_size >> 16);
         pkt[6]=(uint8_t)(src_size >>  8); pkt[7]=(uint8_t)(src_size);
@@ -1050,6 +1063,7 @@ static void cmd_kupload(int argc, char *argv[])
     sh_putdec(offset);
     sh_puts(" B sent\n");
 
+    kfree(pkt);
     if (free_buf) kfree(src_buf);
 }
 
