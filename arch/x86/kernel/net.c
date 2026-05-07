@@ -1091,13 +1091,19 @@ static void handle_tcp(const uint8_t *src_ip, const uint8_t *pkt, uint32_t len)
         conn->state       = TCP_SYN_RCVD;
         conn->last_activity = idt_get_ticks();
 
-        /* Send SYN+ACK */
-        tcp_send_segment(conn, TCP_SYN | TCP_ACK, NULL, 0);
+        /* Send SYN+ACK. If ARP isn't resolved this returns -1 and
+         * tcp_send_segment fires an ARP request as a side effect.
+         * The connection still sits in SYN_RCVD; the host's RTO
+         * SYN retransmit will hit the SYN_RCVD case and retry the
+         * SYN+ACK with ARP now warm. */
+        int snd_rc = tcp_send_segment(conn, TCP_SYN | TCP_ACK, NULL, 0);
 
         /* Notify listener */
         listener->pending_conn = new_idx;
 
-        serial_puts("[TCP] SYN received, sent SYN+ACK (conn ");
+        serial_puts(snd_rc == 0
+                    ? "[TCP] SYN received, sent SYN+ACK (conn "
+                    : "[TCP] SYN received, SYN+ACK deferred (ARP) (conn ");
         serial_putdec(new_idx);
         serial_puts(" port ");
         serial_putdec(dst_port);
@@ -1130,6 +1136,24 @@ static void handle_tcp(const uint8_t *src_ip, const uint8_t *pkt, uint32_t len)
             serial_puts("[TCP] Accepted (conn ");
             serial_putdec(conn_idx);
             serial_puts(")\n");
+        } else if ((flags & TCP_SYN) && !(flags & TCP_ACK)) {
+            /* Duplicate SYN — host's RTO retransmit. Our original
+             * SYN+ACK was likely dropped (e.g. ARP miss on first
+             * try). Reset snd_nxt back to the ISN (snd_una still
+             * holds it) and re-send. tcp_send_segment will bump
+             * snd_nxt by 1 again for the SYN flag.
+             *
+             * Without this, the listener stays stuck in SYN_RCVD
+             * forever — silent SYN+ACK drops on the cold path
+             * (ARP cache miss, transient TX failure) become
+             * permanent connection failures. */
+            conn->snd_nxt = conn->snd_una;
+            int rc = tcp_send_segment(conn, TCP_SYN | TCP_ACK, NULL, 0);
+            if (rc == 0) {
+                serial_puts("[TCP] SYN+ACK re-sent (conn ");
+                serial_putdec(conn_idx);
+                serial_puts(")\n");
+            }
         }
         break;
 
