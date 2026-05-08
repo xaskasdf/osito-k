@@ -959,12 +959,13 @@ void usb_hid_poll(void) {}
  * in a Web Worker. Output streams back via __ccPending → serial_puts.
  * Like `tcc -run`: compile + link + execute inline. */
 
-EM_JS(void, js_cc_kick, (const char *src), {
+EM_JS(void, js_cc_kick, (const char *src, const char *lang), {
     var s = UTF8ToString(src);
+    var l = UTF8ToString(lang);
     window.__ccPending = '';
     window.__ccDone = false;
     window.__cc.onWrite = function(chunk) { window.__ccPending += chunk; };
-    window.__cc.compileLinkRun(s).then(function() { window.__ccDone = true; });
+    window.__cc.compileLinkRun(s, l).then(function() { window.__ccDone = true; });
 });
 
 EM_JS(int, js_cc_done, (), { return window.__ccDone ? 1 : 0; });
@@ -1005,7 +1006,10 @@ void cmd_cc(int argc, char **argv)
     osfs2_read(file, 0, src, size);
     src[size] = 0;
 
-    js_cc_kick(src);
+    /* Detect language from extension: .c → C, default → C++ */
+    const char *ext = strrchr(argv[1], '.');
+    const char *lang = (ext && (!strcmp(ext, ".c") || !strcmp(ext, ".h"))) ? "c" : "c++";
+    js_cc_kick(src, lang);
     free(src);
 
     char buf[1024];

@@ -291,7 +291,7 @@
                     api = new API(opts);
                     port.postMessage({ id: 'ready' });
                 } else if (e.data.id === 'compileLinkRun') {
-                    try { await api.compileLinkRun(e.data.data); }
+                    try { await api.compileLinkRun(e.data.data, { lang: e.data.lang || 'c++' }); }
                     catch (err) { port.postMessage({ id: 'write', data: '\\n[cc] ' + err.message + '\\n' }); }
                     port.postMessage({ id: 'done' });
                 }
@@ -324,13 +324,13 @@
 
         return {
             onWrite: null,
-            // src: string, returns Promise<string of full output log>
-            compileLinkRun: async function(src) {
+            // src: string, lang: 'c' | 'c++' (default 'c++')
+            compileLinkRun: async function(src, lang) {
                 await ensureWorker();
                 pendingWrite = '';
                 return new Promise((resolve) => {
                     resolveCompile = resolve;
-                    port.postMessage({ id: 'compileLinkRun', data: src });
+                    port.postMessage({ id: 'compileLinkRun', data: src, lang: lang || 'c++' });
                 });
             }
         };
