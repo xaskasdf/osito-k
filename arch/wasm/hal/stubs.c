@@ -138,10 +138,56 @@ int proc_exec(const char *filename, int argc, const char **argv)
     serial_puts(filename);
     serial_puts("...\n");
 
-    /* Extract .so from OsitoFS to Emscripten MEMFS */
+    if (size < 16) {
+        serial_puts("[EXEC] File too small to be an executable\n");
+        return -1;
+    }
+
+    /* Extract .so from OsitoFS to a heap buffer for arch validation */
     void *buf = malloc((size_t)size);
     if (!buf) { serial_puts("[EXEC] malloc failed\n"); return -1; }
     osfs2_read(file, 0, buf, size);
+
+    /* ── Architecture validation ────────────────────────────────────
+     * Emscripten's dlopen accepts WebAssembly side modules only
+     * (magic `\x00asm`, version 0x01). Native x86-64 / aarch64 ELF
+     * binaries cannot be loaded — and emcc's loader throws inside an
+     * unhandled promise that suspends Asyncify forever, hanging the
+     * shell. Reject upfront with a clear message. */
+    const uint8_t *hdr = (const uint8_t *)buf;
+    bool is_wasm  = (hdr[0]==0x00 && hdr[1]=='a' && hdr[2]=='s' && hdr[3]=='m');
+    bool is_elf   = (hdr[0]==0x7F && hdr[1]=='E' && hdr[2]=='L' && hdr[3]=='F');
+
+    if (!is_wasm) {
+        serial_puts("[EXEC] Not a wasm side module: ");
+        if (is_elf) {
+            uint16_t e_machine = (uint16_t)hdr[18] | ((uint16_t)hdr[19] << 8);
+            const char *arch = "unknown";
+            switch (e_machine) {
+                case 0x003E: arch = "x86-64"; break;
+                case 0x0003: arch = "i386";   break;
+                case 0x00B7: arch = "aarch64";break;
+                case 0x0028: arch = "ARM";    break;
+                case 0x00F3: arch = "RISC-V"; break;
+            }
+            serial_puts("ELF (");
+            serial_puts(arch);
+            serial_puts(") — wasm runtime cannot dlopen native binaries.\n");
+            serial_puts("[EXEC] Tip: rebuild with 'emcc -sSIDE_MODULE=2'.\n");
+        } else {
+            serial_puts("unknown magic ");
+            const char hex[] = "0123456789ABCDEF";
+            char m[12] = "0x00 0x00 0x00 0x00";
+            for (int i = 0; i < 4; i++) {
+                m[2 + i*5]     = hex[(hdr[i] >> 4) & 0xF];
+                m[2 + i*5 + 1] = hex[hdr[i] & 0xF];
+            }
+            serial_puts(m);
+            serial_puts("\n");
+        }
+        free(buf);
+        return -1;
+    }
 
     EM_ASM({
         try { FS.mkdir('/tmp'); } catch(e) {}
@@ -351,6 +397,14 @@ int nvme_write_bytes(uint64_t offset, const void *buf, uint64_t len) {
 
 int nvme_flush(void) { return 0; }
 
+/* disk_read_bytes / disk_write_bytes — bypass blkdev layer in WASM:
+ * blkdev.c's version dispatches to a registered block device, but we
+ * never register one. Override with direct access to the wasm_nvme_buf. */
+int disk_read_bytes(uint64_t byte_offset, void *buf, uint64_t len)
+{ return nvme_read_bytes(byte_offset, buf, len); }
+int disk_write_bytes(uint64_t byte_offset, const void *buf, uint64_t len)
+{ return nvme_write_bytes(byte_offset, buf, len); }
+
 /* ── Network ─────────────────────────────────────────────────── */
 
 int  i211_init(uint64_t bar0) { (void)bar0; return -1; }
@@ -358,10 +412,11 @@ bool i211_link_up(void)       { return false; }
 
 void net_init(const uint8_t ip[4]) { (void)ip; }
 void net_poll(void) {}
-void net_udp_send(const uint8_t *dst_ip, uint16_t dst_port, uint16_t src_port,
-                  const void *data, uint32_t len)
+int net_udp_send(const uint8_t dst_ip[4], uint16_t dst_port, uint16_t src_port,
+                 const void *data, uint32_t len)
 {
     (void)dst_ip; (void)dst_port; (void)src_port; (void)data; (void)len;
+    return -1;
 }
 void net_udp_listen(uint16_t port, void *handler) { (void)port; (void)handler; }
 void net_icmp_send_echo(const uint8_t dst_ip[4], uint16_t seq) { (void)dst_ip; (void)seq; }
@@ -427,7 +482,7 @@ int  sched_spawn(const char *name, void (*entry)(void))
     }
     return 0;
 }
-void sched_yield(void) { emscripten_sleep(0); }
+int  sched_yield(void) { emscripten_sleep(0); return 0; }
 uint64_t sched_get_switches(void) { return 0; }
 bool sched_is_enabled(void)       { return false; }
 
@@ -717,7 +772,7 @@ uint32_t proc_count_active(void) { return 1; }
 
 /* Keyboard push (compositor routes key events to shell ring buffer) */
 void kb_push(uint8_t scancode) { (void)scancode; }
-void kb_push_esc(const char *seq, int len) { (void)seq; (void)len; }
+void kb_push_esc(const char *seq) { (void)seq; }
 
 /* HID scancode-to-ASCII tables (referenced by compositor key handler) */
 const char hid_normal[256] = {0};
@@ -750,3 +805,310 @@ void kexec_trampoline_end(void) {}
 /* ── prompt_llama (set by main on x86; NULL until inference loads) */
 
 void *prompt_llama = NULL;
+
+/* ──────────────────────────────────────────────────────────────────
+ * Stubs for x86 subsystems added since 2026-04-01.
+ * Symbols referenced from shell.c / compositor.c / inference.c (which
+ * we compile) but whose real impl is HW-bound or x86-asm-bound.
+ * ────────────────────────────────────────────────────────────────── */
+
+void sshd_init(void) {}
+void sshd_poll(void) {}
+int  tls13_connect(void *t, int c, const char *h) { (void)t; (void)c; (void)h; return -1; }
+void tls13_close(void *t) { (void)t; }
+void dhcp_init(void) {}
+void dhcp_request(void) {}
+int  dhcp_get_ip(uint8_t ip[4]) { (void)ip; return -1; }
+int  dhcp_lease_remaining(void) { return 0; }
+void ntp_init(void) {}
+int  ntp_sync(void) { return -1; }
+uint64_t ntp_get_unix_time(void) { return 0; }
+void ipv6_init(void) {}
+void mdns_init(const char *hostname) { (void)hostname; }
+void mdns_poll(void) {}
+void apipa_init(void) {}
+void nf_init(void) {}
+int  nf_add_rule(int chain, int proto, uint32_t src, uint32_t dst, uint16_t port, int verdict)
+{ (void)chain; (void)proto; (void)src; (void)dst; (void)port; (void)verdict; return -1; }
+void nf_list(void) {}
+void nf_clear(void) {}
+void nic_init(void) {}
+void nic_stats(void) { extern void serial_puts(const char *); serial_puts("  (no NIC in WASM)\n"); }
+
+void cpu_features_init(void) {}
+bool cpu_has_avx2(void)   { return false; }
+bool cpu_has_avx512(void) { return false; }
+bool cpu_has_fma(void)    { return false; }
+bool cpu_has_rdrand(void) { return false; }
+bool cpu_has_rdseed(void) { return false; }
+const char *cpu_vendor_string(void) { return "Emscripten/WASM"; }
+const char *cpu_brand_string(void)  { return "WebAssembly virtual CPU"; }
+void cpu_topology_init(void) {}
+uint32_t cpu_topology_socket_count(void)        { return 1; }
+uint32_t cpu_topology_core_count(uint32_t sock) { (void)sock; return 1; }
+uint32_t cpu_topology_thread_count(uint32_t s, uint32_t c) { (void)s; (void)c; return 1; }
+void dispatch_init(void) {}
+
+#include "hwbp.h"
+hwbp_t hwbps[4] = {{0}};
+void hwbp_init(void) {}
+int  hwbp_set(int slot, uint64_t addr, hwbp_cond_t cond, hwbp_len_t len, const char *name)
+{ (void)slot; (void)addr; (void)cond; (void)len; (void)name; return -1; }
+int  hwbp_clear(int slot) { (void)slot; return -1; }
+void hwbp_clear_all(void) {}
+void hwbp_list(void) {}
+void self_opt_init(void) {}
+int  self_opt_register_branch(void *site, const char *name) { (void)site; (void)name; return 0; }
+void self_opt_apply(void) {}
+void self_opt_status(void) {}
+void spec_init(void) {}
+void spec_analyze_init(void) {}
+void spec_prefetch_init(void) {}
+void spec_tls_init(void) {}
+int  spec_record(uint64_t pc, uint64_t target) { (void)pc; (void)target; return 0; }
+int  spec_prefetch(uint64_t pc) { (void)pc; return 0; }
+void pred_sched_init(void) {}
+void pred_record(uint32_t pid, uint64_t ts) { (void)pid; (void)ts; }
+void pred_prewarm(uint32_t pid) { (void)pid; }
+void io_predict_init(void) {}
+int  io_predict_record(const char *path) { (void)path; return 0; }
+int  io_predict_lookup(const char *path) { (void)path; return -1; }
+
+int tensor_arena_init(void *a, uint64_t size_mb) { (void)a; (void)size_mb; return 0; }
+void *tensor_arena_alloc(void *a, uint64_t bytes, uint64_t align)
+{ (void)a; (void)align; return malloc((size_t)bytes); }
+void  tensor_arena_reset(void *a) { (void)a; }
+uint64_t tensor_arena_used(void *a) { (void)a; return 0; }
+void sys_inference_init(void) {}
+int64_t sys_inference_dispatch(uint64_t op, uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint64_t e)
+{ (void)op; (void)a; (void)b; (void)c; (void)d; (void)e; return -1; }
+
+void coredump_init(void) {}
+int  coredump_write(const char *path, void *regs) { (void)path; (void)regs; return -1; }
+void crash_report_init(void) {}
+void crash_report_save(const char *reason) { (void)reason; }
+void crash_report_show(void) {}
+void audio_sched_init(void) {}
+void audio_sched_submit(void *frame, uint32_t bytes, uint64_t deadline)
+{ (void)frame; (void)bytes; (void)deadline; }
+void dma_sched_init(void) {}
+void dma_sched_enqueue(int dev, int prio, void *req) { (void)dev; (void)prio; (void)req; }
+void pci_hotplug_init(void) {}
+void pci_hotplug_rescan(void) {}
+void smp_work_init(void) {}
+int  smp_submit_ff(void (*fn)(void *), void *arg) { if (fn) fn(arg); return 0; }
+void vdso_init(void) {}
+uint64_t vdso_clock_gettime(int id) { (void)id; return idt_get_ticks() * 10000000ULL; }
+void kmod_init(void) {}
+int  kmod_load(const char *name, const uint8_t *data, uint64_t data_len)
+{ (void)name; (void)data; (void)data_len; return -1; }
+int  kmod_unload(const char *name) { (void)name; return -1; }
+void kmod_list(void) {}
+void wayland_init(void) {}
+void wayland_poll(void) {}
+void evdev_init(void) {}
+int  evdev_open(const char *path) { (void)path; return -1; }
+void evdev_poll(void) {}
+void pty_init(void) {}
+int  pty_open(int *master, int *slave) { (void)master; (void)slave; return -1; }
+void fuse_init(void) {}
+int  fuse_register(const char *name, void *ops) { (void)name; (void)ops; return -1; }
+
+void elf_init(void) {}
+int  elf_load(const char *path, void **out_entry) { (void)path; (void)out_entry; return -1; }
+int  proc_is_executing(const char *path) { (void)path; return 0; }
+
+int  kexec_load(const char *path) { (void)path; return -1; }
+void kexec_jump(void) {}
+
+void power_shutdown(void) { EM_ASM({ if (typeof window !== 'undefined') window.close(); }); }
+void power_reboot(void)   { EM_ASM({ if (typeof window !== 'undefined') location.reload(); }); }
+uint32_t power_cpu_freq_mhz(void) { return 0; }
+
+void http_init(void) {}
+void claude_init(void) {}
+
+/* AVX2 matvec — stub never executes (cpu_has_avx2() = false → scalar path) */
+void matvec_q4_0_avx2(float *out, const void *weight, const float *input,
+                      uint32_t rows, uint32_t cols)
+{
+    (void)out; (void)weight; (void)input; (void)rows; (void)cols;
+}
+
+void initramfs_init(void) {}
+int  initramfs_extract(const void *cpio, uint64_t size) { (void)cpio; (void)size; return -1; }
+
+int  dos_run(const char *filename, int argc, const char **argv)
+{ (void)filename; (void)argc; (void)argv; return -1; }
+int  pe_load(const char *path) { (void)path; return -1; }
+
+int  virtio_init(void) { return -1; }
+int  virtio_blk_init(void) { return -1; }
+int  virtio_net_init(void) { return -1; }
+int  virtio_gpu_init(void) { return -1; }
+int  virtio_gpu_3d_init(void) { return -1; }
+
+int  usb_storage_init(void) { return -1; }
+void usb_hid_poll(void) {}
+
+/* ── perf events / kprof / panic / rcu (x86 asm — excluded) ───── */
+void perf_init(void) {}
+void perf_enable_all(void) {}
+void perf_disable_all(void) {}
+uint64_t perf_read_counter(int c) { (void)c; return 0; }
+void perf_phase_begin(int p) { (void)p; }
+void perf_phase_end(int p) { (void)p; }
+void perf_phase_dump(void) {}
+bool perf_enabled = false;
+
+void rcu_init(void) {}
+void rcu_read_lock(void) {}
+void rcu_read_unlock(void) {}
+void synchronize_rcu(void) {}
+void call_rcu(void *head, void (*func)(void *)) { (void)head; if (func) func(NULL); }
+
+void panic(const char *msg) {
+    extern void serial_puts(const char *);
+    serial_puts("\n[PANIC] ");
+    serial_puts(msg ? msg : "(no message)");
+    serial_puts("\n");
+    EM_ASM({ throw new Error('kernel panic'); });
+    while (1) {}
+}
+void panic_init(void) {}
+void watchdog_kick(void) {}
+void crash_dump(void *regs) { (void)regs; }
+
+/* ── Network helpers referenced by shell/dhcp/sshd/etc. ────────── */
+void net_get_mac(uint8_t mac_out[6])     { memset(mac_out, 0, 6); }
+void net_set_ip(const uint8_t ip[4])     { (void)ip; }
+void net_set_gateway(const uint8_t gw[4]){ (void)gw; }
+void net_set_netmask(const uint8_t m[4]) { (void)m; }
+void net_dns_set_server(const uint8_t ip[4]) { (void)ip; }
+const uint8_t *net_get_ip_ptr(void)      { static const uint8_t z[4] = {0,0,0,0}; return z; }
+int  net_arp_lookup_nowait(const uint8_t ip[4], uint8_t mac_out[6])
+{ (void)ip; memset(mac_out, 0, 6); return -1; }
+void net_arp_probe(const uint8_t ip[4])  { (void)ip; }
+int  apipa_assign(void)   { return -1; }
+int  dhcp_discover(void)  { return -1; }
+
+/* ── ACPI shutdown/reboot direct symbols ──────────────────────── */
+void acpi_shutdown(void) { power_shutdown(); }
+void acpi_reboot(void)   { power_reboot(); }
+
+/* ── SMP work queue helpers ───────────────────────────────────── */
+typedef void (*smp_fn_t)(void *, void *);
+int  smp_submit(int ap_idx, smp_fn_t fn, void *arg, void *result)
+{ (void)ap_idx; if (fn) fn(arg, result); return 0; }
+int  smp_submit_any(smp_fn_t fn, void *arg, void *result)
+{ if (fn) fn(arg, result); return 0; }
+void smp_wait(int task_id) { (void)task_id; }
+bool smp_task_done(int task_id) { (void)task_id; return true; }
+uint32_t ap_worker_count = 0;
+
+/* ── Process helpers ──────────────────────────────────────────── */
+int32_t  proc_current_pid(void) { return 1; }
+void     proc_signal_pid(uint32_t pid, int sig) { (void)pid; (void)sig; }
+
+/* ── usym / kallsyms user-side getters ────────────────────────── */
+uint64_t user_load_bias_get(void *p)     { (void)p; return 0; }
+void    *user_strtab_get(void *p)        { (void)p; return NULL; }
+uint64_t user_strtab_size_get(void *p)   { (void)p; return 0; }
+void    *user_symtab_get(void *p)        { (void)p; return NULL; }
+uint64_t user_symtab_size_get(void *p)   { (void)p; return 0; }
+
+/* ── perf phases / cmd_perf ───────────────────────────────────── */
+void perf_phase_enter(int slot, const char *name) { (void)slot; (void)name; }
+void perf_phase_exit(int slot) { (void)slot; }
+void cmd_perf(int argc, char **argv) {
+    (void)argc; (void)argv;
+    extern void serial_puts(const char *);
+    serial_puts("  (perf counters disabled in WASM)\n");
+}
+void cpu_features_dump(void) {
+    extern void serial_puts(const char *);
+    serial_puts("  CPU: WebAssembly virtual (no SIMD/AVX2)\n");
+}
+
+/* ── self_opt extras ──────────────────────────────────────────── */
+void self_opt_undo_all(void) {}
+void self_opt_stats(void) {}
+bool self_opt_enabled = false;
+
+/* ── pred_sched extras ────────────────────────────────────────── */
+void pred_reset(void) {}
+void pred_stats(void) {}
+
+/* ── io_predict extras ────────────────────────────────────────── */
+void io_predict_observe(const char *path) { (void)path; }
+void io_predict_reset(void) {}
+void io_predict_stats(void) {}
+
+/* ── NVMe extra helpers ───────────────────────────────────────── */
+int  nvme_read(uint64_t lba, uint32_t count, void *buf)
+{ return nvme_read_bytes(lba * 512, buf, (uint64_t)count * 512); }
+int  nvme_read_async(uint64_t lba, uint32_t count, uint64_t phys_addr)
+{ (void)lba; (void)count; (void)phys_addr; return -1; }
+int  nvme_wait_cq(uint16_t cid)        { (void)cid; return 0; }
+uint32_t nvme_get_lba_size(void)        { return 512; }
+
+/* ── FAT32 (browser MEMFS handles real files) ─────────────────── */
+bool fat32_is_mounted(void) { return false; }
+int  fat32_find(const char *name, uint32_t *cluster_out, uint32_t *size_out)
+{ (void)name; (void)cluster_out; (void)size_out; return -1; }
+int  fat32_ls(const char *path) { (void)path; return -1; }
+int  fat32_read_file(const char *name, uint64_t offset, void *buf, uint64_t len)
+{ (void)name; (void)offset; (void)buf; (void)len; return -1; }
+
+/* ── OsitoFS v3 (only v2 is mounted in wasm MVP) ──────────────── */
+bool osfs3_is_mounted(void)             { return false; }
+uint32_t osfs3_resolve_path(const char *p) { (void)p; return 0; }
+int  osfs3_read(uint32_t inode, uint64_t off, void *buf, uint64_t len)
+{ (void)inode; (void)off; (void)buf; (void)len; return -1; }
+void osfs3_list_dir(uint32_t inode) { (void)inode; }
+bool osfs3_is_dir(uint32_t inode)   { (void)inode; return false; }
+uint64_t osfs3_get_size(uint32_t inode) { (void)inode; return 0; }
+
+/* ── Display extras ───────────────────────────────────────────── */
+int  display_resize(uint32_t w, uint32_t h, uint32_t pitch)
+{ (void)w; (void)h; (void)pitch; return -1; }
+void display_enable_gpu_scanout(void) {}
+
+/* compositor_start_wasm is now defined in compositor.c (under __EMSCRIPTEN__) */
+
+/* ── Globals expected by various subsystems ──────────────────── */
+/* hwbps[] defined above with proper hwbp_t type from hwbp.h */
+int g_compat32_mode = 0;
+uint8_t g_tensor_arena[1] = {0};   /* placeholder symbol */
+uint8_t ist1_stack[4096] = {0};
+void *tss_ist1_ptr = NULL;
+uint64_t dos_native_exit_jmpbuf[16] = {0};
+
+/* ── Tensor dispatch table (struct disp) ──────────────────────── */
+/* tensor.c references `disp` as the runtime dispatch table. With AVX2
+ * disabled, it should just point at scalar fns. Make a minimal symbol
+ * that holds zeros — tensor.c reads it but cpu_has_avx2()=false means
+ * scalar paths are taken, so the contents don't matter for correctness. */
+struct { void *matmul; void *softmax; void *rmsnorm; void *swiglu; } disp = {0};
+
+/* ── Syscall dispatch (no userspace in WASM) ─────────────────── */
+int64_t syscall_dispatch(uint64_t nr, uint64_t a1, uint64_t a2,
+                         uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
+{ (void)nr; (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; (void)a6; return -1; }
+
+/* syscall fd table accessor (referenced as a function by io_uring.c) */
+void *syscall_fds(void) {
+    static char dummy_fd_table[256 * 64];   /* opaque buffer; never used */
+    return dummy_fd_table;
+}
+
+int  ccp_init(void) { return -1; }
+int  ccp_get_random(uint8_t *buf, uint32_t len)
+{
+    EM_ASM({
+        var dst = $0; var n = $1;
+        for (var i = 0; i < n; i++)
+            HEAPU8[dst + i] = (Math.random() * 256) | 0;
+    }, buf, len);
+    return 0;
+}

@@ -176,10 +176,15 @@ static int osfs2_read_block_data(uint32_t block, void *buf)
 
 static inline uint8_t cmos_rd(uint8_t reg)
 {
+#ifdef __EMSCRIPTEN__
+    (void)reg;
+    return 0;
+#else
     __asm__ volatile ("outb %0, %1" : : "a"(reg), "Nd"((uint16_t)0x70));
     uint8_t val;
     __asm__ volatile ("inb %1, %0" : "=a"(val) : "Nd"((uint16_t)0x71));
     return val;
+#endif
 }
 
 static inline uint8_t bcd2b(uint8_t v) { return (v >> 4) * 10 + (v & 0x0F); }

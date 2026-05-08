@@ -28,9 +28,17 @@ static bool     rng_initialized;
 /* TSC-based entropy: read timestamp counter */
 static inline uint64_t rdtsc_rng(void)
 {
+#ifdef __EMSCRIPTEN__
+    /* On WASM use a monotonic counter mixed with performance.now()-derived bits */
+    static uint64_t fake_tsc;
+    extern uint64_t idt_get_ticks(void);
+    fake_tsc = (fake_tsc * 6364136223846793005ULL) + idt_get_ticks() + 1442695040888963407ULL;
+    return fake_tsc;
+#else
     uint32_t lo, hi;
     __asm__ volatile ("rdtsc" : "=a"(lo), "=d"(hi));
     return ((uint64_t)hi << 32) | lo;
+#endif
 }
 
 /* RDRAND instruction (Intel Ivy Bridge+, AMD Zen+) */
@@ -38,18 +46,26 @@ static bool has_rdrand;
 
 static bool check_rdrand(void)
 {
+#ifdef __EMSCRIPTEN__
+    return false;
+#else
     uint32_t eax, ebx, ecx, edx;
     __asm__ volatile ("cpuid" : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx)
                      : "a"(1));
     return (ecx & (1 << 30)) != 0;  /* ECX bit 30 = RDRAND */
+#endif
 }
 
 static uint64_t rdrand64(void)
 {
+#ifdef __EMSCRIPTEN__
+    return rdtsc_rng();
+#else
     uint64_t val;
     uint8_t ok;
     __asm__ volatile ("rdrand %0; setc %1" : "=r"(val), "=qm"(ok));
     return ok ? val : rdtsc_rng();  /* Fallback to TSC if RDRAND fails */
+#endif
 }
 
 /* Mix entropy into the pool */

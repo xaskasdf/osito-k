@@ -59,10 +59,15 @@ extern void xhci_poll(void) __attribute__((weak));
 
 static inline uint8_t cmos_read(uint8_t reg)
 {
+#ifdef __EMSCRIPTEN__
+    (void)reg;
+    return 0;
+#else
     __asm__ volatile ("outb %0, %1" : : "a"(reg), "Nd"((uint16_t)0x70));
     uint8_t val;
     __asm__ volatile ("inb %1, %0" : "=a"(val) : "Nd"((uint16_t)0x71));
     return val;
+#endif
 }
 
 static inline uint8_t bcd2bin(uint8_t v) { return (v >> 4) * 10 + (v & 0x0F); }
@@ -983,7 +988,21 @@ static void __hot compositor_render_frame(void)
 /* This runs as a QOS_INTERACTIVE kernel thread.
  * Called from sched_spawn("compositor", compositor_thread). */
 
-static volatile bool compositor_running;
+volatile bool compositor_running;
+
+#ifdef __EMSCRIPTEN__
+/* WASM helper: kernel uses rAF instead of compositor_thread; just mark running. */
+void compositor_start_wasm(void) { compositor_running = true; }
+
+/* One frame of the compositor, callable from JS via Module.ccall.
+ * Replaces the body of the compositor_thread while loop on WASM. */
+static void __hot compositor_render_frame(void);
+void wasm_compositor_frame(void)
+{
+    if (!compositor_running) return;
+    compositor_render_frame();
+}
+#endif
 
 void compositor_thread(void)
 {

@@ -19,10 +19,14 @@ typedef signed short        int16_t;
 typedef signed int          int32_t;
 typedef signed long long    int64_t;
 
+#ifndef __EMSCRIPTEN__
 typedef uint64_t            uintptr_t;
 typedef int64_t             intptr_t;
+#endif
 typedef __SIZE_TYPE__        size_t;  /* matches GCC's stddef.h, avoids conflict with immintrin.h */
+#ifndef __EMSCRIPTEN__
 typedef int64_t             ssize_t;
+#endif
 
 #if !defined(__bool_true_false_are_defined) && !defined(__cplusplus) && (__STDC_VERSION__ < 202311L)
 typedef _Bool               bool;
@@ -131,6 +135,8 @@ static inline int strcmp(const char *a, const char *b) {
 
 #else /* __EMSCRIPTEN__ — use hosted libc, stub out port I/O */
 
+#include <stdint.h>     /* uintptr_t/intptr_t (wasm32: 32-bit) */
+#include <sys/types.h>  /* ssize_t (wasm32: long, i.e. 32-bit) */
 #include <string.h>
 
 static inline void     outb(uint16_t p, uint8_t v)  { (void)p; (void)v; }
@@ -141,6 +147,12 @@ static inline uint32_t inl(uint16_t p)              { (void)p; return 0; }
 #define mb()  __asm__ volatile ("" ::: "memory")
 #define wmb() __asm__ volatile ("" ::: "memory")
 #define rmb() __asm__ volatile ("" ::: "memory")
+
+/* Section attributes — on Emscripten we don't have .text.hot/.text.cold
+ * linker support, so make them no-ops. */
+#define __hot
+#define __cold
+#define __initk
 
 #endif /* __EMSCRIPTEN__ */
 

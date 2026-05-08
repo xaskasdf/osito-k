@@ -403,6 +403,7 @@ arch/arm/          SM8350 (ROG Phone 5) bare-metal port — see docs/aarch64-det
 | X-GUI   | Shared cross-arch GUI (gui/): elementaryOS-inspired desktop, AA text, Wingpanel, Plank dock, window decorations, NTP clock | Done |
 | X-UTF   | Unicode subsystem (Plan 9-style 4 capas): libutf codec + PSF2 font loader + LRU cache + width-aware renderer + Latin-1 boot fallback. Cobertura: ASCII/Latin-1 link-time + Cyrillic/Greek/CJK/Hangul desde /fonts/*.psf en OsitoFS. Implementado en fork osito-x; ver [docs/unicode-architecture.md](docs/unicode-architecture.md) para port a mainline | WIP |
 | A-ARM64 | AArch64/SM8350 (ROG Phone 5) bare-metal port: PL011 UART, GICv3, MMU paging, PCI ECAM, HDA, virtio-blk + OsitoFS v2, virtio-net + TCP/IP, syscall+ELF+process, crypto/TLS/HTTPS, multi-core SMP via PSCI, NEON SIMD tensor ops, GUI desktop task | Done |
+| W-WASM  | WebAssembly/Emscripten port (`arch/wasm/`): kernel + shell + LLM inference + OsitoFS + GUI compositor + Quake 2 side-module via dlopen. ~35 portable kernel modules compiled, ~150 stubs para subsystems HW-bound. Assets en R2 (`wasm.naranjositos.tech`) con CORS. `dlopen` valida arquitectura para no colgar Asyncify con ELF nativo. Ver [docs/wasm-port.md](docs/wasm-port.md) | Done |
 
 > Full GPU roadmap (X27-X40 + contingency): see [docs/x86-gpu-roadmap.md](docs/x86-gpu-roadmap.md)
 > Full OS roadmap (Tiers 0-9): see [docs/os-selfhost-roadmap.md](docs/os-selfhost-roadmap.md)
@@ -442,6 +443,7 @@ For implementation details, API specifics, register-level documentation, and deb
 - **[docs/kernel-diagram.md](docs/kernel-diagram.md)** — 5 diagramas Mermaid: arquitectura completa (111 archivos en 12 subsistemas), secuencia de boot (22 pasos), dispatch de syscalls, forward pass de inference, y mapa de integración de las 10 features
 - **[docs/esp8266-detail.md](docs/esp8266-detail.md)** — Math library API, zForth integration, resource budget, DOOM/Elite details
 - **[docs/aarch64-detail.md](docs/aarch64-detail.md)** — AArch64/SM8350 (ROG Phone 5) port details
+- **[docs/wasm-port.md](docs/wasm-port.md)** — WebAssembly/Emscripten port: build, R2 asset hosting + CORS, subsystem map, dlopen arch-validation
 - **[docs/x86-gpu-roadmap.md](docs/x86-gpu-roadmap.md)** — GPU compute roadmap (X27-X40)
 - **[docs/os-selfhost-roadmap.md](docs/os-selfhost-roadmap.md)** — OS self-hosting tiers 0-9
 

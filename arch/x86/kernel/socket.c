@@ -28,7 +28,7 @@ extern void net_poll(void);
 
 /* TCP passive open (net.c) */
 extern int  net_tcp_listen(uint16_t port) __attribute__((weak));
-extern int  net_tcp_accept(int listen_idx) __attribute__((weak));
+extern int  net_tcp_accept(int listen_idx, uint32_t timeout_ticks) __attribute__((weak));
 
 /* ── Socket Constants ────────────────────────────────────────── */
 
@@ -156,7 +156,7 @@ int sock_accept(int sock_idx, sockaddr_in_t *addr, uint32_t *addrlen)
 
     /* Poll for incoming connection */
     if (net_tcp_accept) {
-        int conn = net_tcp_accept(s->tcp_conn >= 0 ? s->tcp_conn : 0);
+        int conn = net_tcp_accept(s->tcp_conn >= 0 ? s->tcp_conn : 0, 0);
         if (conn >= 0) {
             /* Create new socket for the accepted connection */
             int new_idx = sock_socket(AF_INET, SOCK_STREAM, 0);

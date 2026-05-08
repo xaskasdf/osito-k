@@ -55,7 +55,13 @@ EMFLAGS := \
 #           idt.c, paging.c, smp.c, syscall.c (no-ops in hal/stubs.c),
 #           process.c, elf.c (stubbed — paging_map_page not available),
 #           tensor_avx2.c (AVX2 intrinsics not supported in WASM),
-#           net.c, http.c, tls.c, claude.c (network stubbed for MVP),
+#           net.c, http.c, tls.c, claude.c, sshd.c, tls13.c, dhcp.c, ntp.c,
+#           ipv6.c, mdns.c, apipa.c, netfilter.c, nic.c (network → stubs.c),
+#           hwbp.c, self_optimize.c, spec_*.c, vdso_thunks.c, kmod.c,
+#           coredump.c, crash_report.c, audio_sched.c, dma_sched.c,
+#           pci_hotplug.c, smp_work.c, pred_sched.c, io_predict.c,
+#           tensor_arena.c, sys_inference.c (x86-only / hw-bound → stubs.c),
+#           wayland.c, evdev.c, pty.c, fuse.c, sshd.c (host-OS-bound → stubs)
 #           all *.S assembly files (replaced by libc setjmp or no-ops),
 #           all drivers/*.c (GPU/NVMe/xHCI/HDA/i211 → no-ops in stubs.c)
 X86_SRCS := \
@@ -64,12 +70,49 @@ X86_SRCS := \
     ../x86/kernel/tensor.c \
     ../x86/kernel/inference.c \
     ../x86/kernel/tokenizer.c \
+    ../x86/kernel/tokenizer_trie.c \
     ../x86/kernel/compositor.c \
     ../x86/kernel/input_events.c \
     ../x86/kernel/shm.c \
     ../x86/kernel/framebuffer.c \
+    ../x86/kernel/klog.c \
+    ../x86/kernel/kallsyms.c \
+    ../x86/kernel/usym.c \
+    ../x86/kernel/sysctl.c \
+    ../x86/kernel/sysv_ipc.c \
+    ../x86/kernel/vt.c \
+    ../x86/kernel/blkdev.c \
+    ../x86/kernel/dm.c \
+    ../x86/kernel/sysfs.c \
+    ../x86/kernel/kobject.c \
+    ../x86/kernel/inotify.c \
+    ../x86/kernel/random.c \
+    ../x86/kernel/oom.c \
+    ../x86/kernel/psi.c \
+    ../x86/kernel/ns.c \
+    ../x86/kernel/caps.c \
+    ../x86/kernel/strace.c \
+    ../x86/kernel/lockdep.c \
+    ../x86/kernel/seccomp.c \
+    ../x86/kernel/kprof.c \
+    ../x86/kernel/kstate.c \
+    ../x86/kernel/trace.c \
+    ../x86/kernel/io_uring.c \
+    ../x86/kernel/bpf.c \
+    ../x86/kernel/msync.c \
+    ../x86/kernel/memcompress.c \
+    ../x86/kernel/timers.c \
+    ../x86/kernel/crypto.c \
+    ../x86/kernel/crypto2.c \
+    ../x86/kernel/sched_rt.c \
+    ../x86/kernel/workqueue.c \
+    ../x86/kernel/kthread.c \
+    ../x86/kernel/slab.c \
+    ../x86/kernel/socket.c \
     ../x86/fs/gguf.c \
-    ../x86/fs/ositofs2.c
+    ../x86/fs/ositofs2.c \
+    ../x86/fs/vfs.c \
+    ../x86/fs/tmpfs.c
 
 # GUI library (architecture-independent rendering)
 GUI_SRCS := \

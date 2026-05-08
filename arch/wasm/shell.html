@@ -211,8 +211,14 @@
     window.__modelBuf      = null;   // Uint8Array once downloaded
     window.__modelFetchDone = false; // true when fetch completes (success or fail)
 
+    // Optional override via ?model=URL or ?fs=URL query params (for testing).
+    var qs = new URLSearchParams(window.location.search);
+    var modelOverride = qs.get('model');
+    var fsOverride    = qs.get('fs');
+
     (function() {
-        const MODEL_URL = 'https://factory.naranjositos.tech/models/smollm2-135m-instruct-q4_0.gguf';
+        var MODEL_URL = modelOverride
+            || 'https://wasm.naranjositos.tech/models/smollm2-135m-instruct-q4_0.gguf';
         fetch(MODEL_URL)
             .then(function(r) {
                 if (!r.ok) throw new Error('HTTP ' + r.status);
@@ -236,7 +242,8 @@
     window.__fsImageDone = false;
 
     (function() {
-        var FS_URL = 'https://factory.naranjositos.tech/images/q2_wasm.img';
+        var FS_URL = fsOverride
+            || 'https://wasm.naranjositos.tech/images/q2_wasm.img';
         fetch(FS_URL)
             .then(function(r) {
                 if (!r.ok) throw new Error('HTTP ' + r.status);
@@ -248,7 +255,7 @@
                 window.__fsImageDone = true;
             })
             .catch(function(e) {
-                console.warn('[WASM] FS image fetch failed (standalone mode):', e);
+                console.warn('[WASM] FS image fetch failed (standalone mode):', e.message);
                 window.__fsImageDone = true;
             });
     })();
