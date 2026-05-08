@@ -2565,6 +2565,11 @@ static void shell_exec(char *line)
     } else if (strcmp(cmd, "perf") == 0) {
         extern void cmd_perf(int, char **);
         cmd_perf(argc, argv);
+#ifdef __EMSCRIPTEN__
+    } else if (strcmp(cmd, "cc") == 0) {
+        extern void cmd_cc(int, char **);
+        cmd_cc(argc, argv);
+#endif
     } else if (strcmp(cmd, "pred") == 0) {
         extern void pred_stats(void);
         extern void pred_reset(void);

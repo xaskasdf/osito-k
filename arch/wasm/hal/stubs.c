@@ -951,6 +951,77 @@ int  virtio_gpu_3d_init(void) { return -1; }
 int  usb_storage_init(void) { return -1; }
 void usb_hid_poll(void) {}
 
+/* ── cc / clang.wasm bridge ──────────────────────────────────────
+ *
+ * `cc` shell command: reads a C source file from OsitoFS and submits
+ * it to window.__cc.compileLinkRun() (defined in shell.html), which
+ * lazy-loads clang.wasm + lld.wasm + sysroot.tar from R2 and runs them
+ * in a Web Worker. Output streams back via __ccPending → serial_puts.
+ * Like `tcc -run`: compile + link + execute inline. */
+
+EM_JS(void, js_cc_kick, (const char *src), {
+    var s = UTF8ToString(src);
+    window.__ccPending = '';
+    window.__ccDone = false;
+    window.__cc.onWrite = function(chunk) { window.__ccPending += chunk; };
+    window.__cc.compileLinkRun(s).then(function() { window.__ccDone = true; });
+});
+
+EM_JS(int, js_cc_done, (), { return window.__ccDone ? 1 : 0; });
+
+EM_JS(int, js_cc_drain, (char *dst, int max), {
+    var p = window.__ccPending || '';
+    if (!p.length) return 0;
+    var n = Math.min(p.length, max);
+    var slice = p.substring(0, n);
+    window.__ccPending = p.substring(n);
+    var bytes = new TextEncoder().encode(slice);
+    var copy = Math.min(bytes.length, max);
+    HEAPU8.set(bytes.subarray(0, copy), dst);
+    return copy;
+});
+
+void cmd_cc(int argc, char **argv)
+{
+    extern void serial_puts(const char *);
+    extern void *osfs2_find(const char *);
+    extern uint64_t osfs2_file_size(void *);
+    extern int osfs2_read(void *, uint64_t, void *, uint64_t);
+    if (argc < 2) {
+        serial_puts("usage: cc <src.c>\n");
+        return;
+    }
+
+    void *file = osfs2_find(argv[1]);
+    if (!file) {
+        serial_puts("cc: file not found: ");
+        serial_puts(argv[1]);
+        serial_puts("\n");
+        return;
+    }
+    uint64_t size = osfs2_file_size(file);
+    char *src = malloc((size_t)size + 1);
+    if (!src) { serial_puts("cc: malloc failed\n"); return; }
+    osfs2_read(file, 0, src, size);
+    src[size] = 0;
+
+    js_cc_kick(src);
+    free(src);
+
+    char buf[1024];
+    while (!js_cc_done()) {
+        int n = js_cc_drain(buf, (int)sizeof(buf) - 1);
+        if (n > 0) { buf[n] = 0; serial_puts(buf); }
+        else       { emscripten_sleep(50); }
+    }
+    int n;
+    while ((n = js_cc_drain(buf, (int)sizeof(buf) - 1)) > 0) {
+        buf[n] = 0;
+        serial_puts(buf);
+    }
+    serial_puts("\n");
+}
+
 /* ── perf events / kprof / panic / rcu (x86 asm — excluded) ───── */
 void perf_init(void) {}
 void perf_enable_all(void) {}

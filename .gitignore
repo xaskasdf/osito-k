@@ -1,6 +1,10 @@
 # Build output
 build/
 
+# Local copy of binji/wasm-clang toolchain (60MB), hosted on
+# wasm.naranjositos.tech/toolchain/ — see docs/wasm-cc.md
+arch/wasm/cc-toolchain/
+
 # Toolchain (large, download separately) — Xtensa toolchain lives
 # under the xtensa arch directory after the 2026 migration.
 arch/xtensa/tools/xtensa-lx106-elf/

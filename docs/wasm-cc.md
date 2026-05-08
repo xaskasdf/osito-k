@@ -1,0 +1,171 @@
+# In-browser C/C++ compilation in OsitoK-wasm
+
+`cc` shell command compila código C/C++ directamente dentro de OsitoK
+corriendo en navegador, sin servidor, sin tooling host. Pipeline:
+
+```
+osito> echo 'int main(){printf("hi"); return 0;}' > hello.c
+osito> cc hello.c
+> Untarring sysroot.tar... done.
+> Fetching and compiling clang... done.
+> clang -cc1 -emit-obj ... -o hello.o ...
+> Fetching and compiling lld... done.
+> wasm-ld ... -o hello.wasm
+> hello.wasm
+hi
+```
+
+## Componentes
+
+```
+shell.html  ──▶ window.__cc.compileLinkRun(src)
+                    │
+                    ▼
+              [Web Worker — Blob-inlined]
+                    │
+       importScripts('shared.js')   ◀── R2: wasm.naranjositos.tech/toolchain/
+                    │
+            ┌───────┴────────┐
+            ▼                ▼
+       clang.wasm       lld.wasm        ◀── R2 (cached after first fetch)
+        (30 MB)          (19 MB)
+                    │
+                    ▼
+            sysroot.tar (9 MB) ── extracted into in-memory FS
+            (libc, libc++, libc++abi, headers)
+                    │
+                    ▼
+                  test.wasm (output) ── runs immediately via WASI shim;
+                                       stdout streams back to terminal
+```
+
+Toolchain bundle (basado en [binji/wasm-clang](https://github.com/binji/wasm-clang),
+Apache-2.0) hosteado en `wasm.naranjositos.tech/toolchain/`:
+
+| File | Tamaño | Rol |
+|---|---|---|
+| `clang.wasm` | 30 MB | Frontend C/C++ (clang 8.0.1 con `-cc1 -emit-obj`) |
+| `lld.wasm` | 19 MB | `wasm-ld` linker |
+| `sysroot.tar` | 9 MB | Headers + libs (`libc`, `libc++`, `libc++abi`, `libm`, `libpthread`, `librt`) |
+| `memfs.wasm` | 337 KB | In-memory FS expuesto vía WASI shim |
+| `shared.js` | 23 KB | API class: `compile/link/run/compileLinkRun/untar` |
+| `worker.js` | 3 KB | (no usado — el worker está inlineado en `shell.html` como Blob) |
+
+## Cómo funciona
+
+### Lazy loading
+
+`window.__cc` no carga nada hasta la primera llamada a `compileLinkRun`.
+Al primer compilado:
+1. Crea un `Worker` desde un Blob inlineado en `shell.html`.
+2. El worker hace `importScripts(R2/shared.js)`.
+3. Construye `new API({...})` apuntando a las URLs absolutas R2.
+4. La instancia carga `memfs.wasm` y `untar(sysroot.tar)`.
+5. Cachea `clang.wasm` y `lld.wasm` (compilados en `WebAssembly.Module`)
+   para reusarlos en compilaciones siguientes.
+
+Compilaciones siguientes son rápidas (~50-200ms para hello world).
+
+### Bridge kernel ↔ JS
+
+`hal/stubs.c::cmd_cc` corre en el kernel wasm:
+- `osfs2_find` + `osfs2_read` levantan el archivo `.c` del FS.
+- `EM_JS(js_cc_kick)` llama `window.__cc.compileLinkRun(src)`.
+- Loop `while (!js_cc_done()) { drain stdout; emscripten_sleep(50); }`.
+- Output se acumula en `window.__ccPending` (string), drenado en chunks
+  vía `js_cc_drain()` y emitido por `serial_puts()` al terminal.
+
+Asyncify permite que el kernel "bloquee" sin congelar la UI — el sleep
+yielda al event loop mientras el worker sigue compilando en otro thread.
+
+### Output del compilador
+
+El binario que produce `wasm-ld` es **WASI standalone**, no Emscripten
+side module. Diferencias clave:
+
+| Aspecto | Emscripten side module (Quake 2) | WASI standalone (output de cc) |
+|---|---|---|
+| Magic adicional | sección custom `dylink.0` | sección `linking` (clang stdcall) |
+| Entry point | `q2_main` / `app_main` (función explícita) | `_start` (WASI ABI) |
+| Cómo se ejecuta | `dlopen` en main thread | Worker JS aparte con shim WASI |
+
+Por eso `compileLinkRun` corre el output dentro del mismo worker que
+ya tiene todo el shim listo (la API class de binji ya implementa
+WASI). No requiere extender `proc_exec` para el caso `cc -run`.
+
+## Casos de uso
+
+| Comando | Qué hace |
+|---|---|
+| `cc hello.c` | Compila + linkea + corre inline (estilo `tcc -run`) |
+| (futuro) `cc hello.c -o hello.wasm` | Compila + linkea + guarda en OsitoFS, no ejecuta |
+| (futuro) `exec hello.wasm` | Branch WASI en `proc_exec`: corre el binario en otro worker |
+
+## Flujo de prueba E2E
+
+```
+osito> echo '#include <stdio.h>
+int main() { printf("hello from clang.wasm!\n"); return 0; }' > hello.c
+
+osito> cc hello.c
+> Untarring sysroot.tar... done.
+> Fetching and compiling clang... done.
+> clang -cc1 -emit-obj -disable-free -isysroot / ...
+> Fetching and compiling lld... done.
+> wasm-ld --no-threads --export-dynamic ... -o hello.wasm
+> Compiling hello.wasm... done.
+> hello.wasm
+hello from clang.wasm!
+```
+
+Página standalone para sanity (sin kernel): `arch/wasm/build/cc-test.html`
+(gitignored). Útil para debugging de WASI shim sin pasar por shell.
+
+## Sysroot
+
+Headers C/C++ disponibles bajo `/include/` y `/include/c++/v1/`:
+- `<stdio.h>`, `<stdlib.h>`, `<string.h>`, `<math.h>`, `<errno.h>`, `<time.h>`
+- `<vector>`, `<string>`, `<iostream>`, `<algorithm>`, `<map>`, `<unordered_map>`
+- `<chrono>`, `<thread>` (limitado, no hay threads reales en wasm32)
+- `<canvas.h>` — binji's custom Canvas binding (linkear con `-lcanvas`)
+
+Libs en `/lib/wasm32-wasi/`:
+- `libc.a`, `libc++.a`, `libc++abi.a`, `libm.a`, `libpthread.a`
+- `librt.a`, `libdl.a`, `libcrypt.a`, `libresolv.a`, `libutil.a`
+- `libcanvas.a` (Canvas binding)
+- `libwasi-emulated-mman.a` (mmap emulation)
+- `libclang_rt.builtins-wasm32.a` (compiler-rt)
+
+## Limitaciones conocidas
+
+- Clang 8.0.1 — soporta C17 y C++17 mostly, pero algunas features
+  modernas (concepts, modules, std::format) no están.
+- Sin threading real (no `pthread_create` funcional, `<thread>` linkea
+  pero hace operaciones inválidas).
+- No hay TCP/UDP/file I/O fuera de la MemFS — `fopen("hello.txt")` 
+  abre desde MemFS, no desde OsitoFS.
+- Output WASI necesita worker aparte para correr — `compileLinkRun`
+  ya lo hace; `cc -o file.wasm + exec file.wasm` requiere extender
+  `proc_exec` (TODO).
+- Primera compilación: ~5-10 seg (download de ~50MB). Browser cache
+  acelera todas las siguientes; no usamos IndexedDB todavía (TODO).
+
+## Roadmap
+
+- [ ] **`cc -o file.wasm`** + `exec file.wasm` con branch WASI en
+      `proc_exec` (similar a la validación que hicimos para Emscripten
+      side modules).
+- [ ] **IndexedDB cache** para clang/lld/sysroot (evita re-download
+      en visitas posteriores).
+- [ ] **`#include <ositok.h>`** — exponer la API del kernel
+      (`oi_inference`, `oi_dlopen`, etc.) al toolchain.
+- [ ] **`make`** mínimo para building incremental.
+- [ ] **`cc -E`** preprocessing only.
+
+## Configuración / referencias
+
+- Toolchain bundle: <https://wasm.naranjositos.tech/toolchain/>
+- Origen: <https://github.com/binji/wasm-clang>
+- License: Apache 2.0 (clang/lld), MIT (wasi-libc), Apache 2.0 (libc++)
+- CORS R2 rule (factory bucket): origins `https://*.naranjositos.tech`,
+  `http://localhost:8000`, etc.

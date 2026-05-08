@@ -260,6 +260,82 @@
             });
     })();
 
+    // ── In-browser C/C++ compiler (clang.wasm + lld.wasm) ────────
+    //
+    // Lazy-loads a worker that runs binji/wasm-clang against the toolchain
+    // hosted at wasm.naranjositos.tech/toolchain/. First call to compile()
+    // pays ~50MB download (cached by browser); subsequent calls are fast.
+
+    window.__cc = (function() {
+        let worker = null;
+        let port = null;
+        let ready = null;
+        let pendingWrite = '';
+        let resolveCompile = null;
+
+        const WORKER_SRC = `
+            self.importScripts('https://wasm.naranjositos.tech/toolchain/shared.js');
+            const T = 'https://wasm.naranjositos.tech/toolchain';
+            let api, port;
+            const opts = {
+                clang: T + '/clang.wasm', lld: T + '/lld.wasm',
+                sysroot: T + '/sysroot.tar', memfs: T + '/memfs.wasm',
+                async readBuffer(f) { const r = await fetch(f); if (!r.ok) throw new Error('HTTP ' + r.status); return r.arrayBuffer(); },
+                async compileStreaming(f) { const r = await fetch(f); return WebAssembly.compile(await r.arrayBuffer()); },
+                hostWrite(s) { port && port.postMessage({ id: 'write', data: s }); }
+            };
+            self.onmessage = async (e) => {
+                if (e.data.id === 'constructor') {
+                    port = e.data.data;
+                    port.onmessage = self.onmessage;
+                    api = new API(opts);
+                    port.postMessage({ id: 'ready' });
+                } else if (e.data.id === 'compileLinkRun') {
+                    try { await api.compileLinkRun(e.data.data); }
+                    catch (err) { port.postMessage({ id: 'write', data: '\\n[cc] ' + err.message + '\\n' }); }
+                    port.postMessage({ id: 'done' });
+                }
+            };`;
+
+        function ensureWorker() {
+            if (worker) return ready;
+            const blob = new Blob([WORKER_SRC], { type: 'application/javascript' });
+            worker = new Worker(URL.createObjectURL(blob));
+            const ch = new MessageChannel();
+            port = ch.port1;
+            ready = new Promise((resolve) => {
+                port.onmessage = (e) => {
+                    if (e.data.id === 'ready') resolve();
+                    else if (e.data.id === 'write') {
+                        pendingWrite += e.data.data;
+                        if (window.__cc.onWrite) window.__cc.onWrite(e.data.data);
+                    }
+                    else if (e.data.id === 'done' && resolveCompile) {
+                        const cb = resolveCompile;
+                        resolveCompile = null;
+                        cb(pendingWrite);
+                        pendingWrite = '';
+                    }
+                };
+            });
+            worker.postMessage({ id: 'constructor', data: ch.port2 }, [ch.port2]);
+            return ready;
+        }
+
+        return {
+            onWrite: null,
+            // src: string, returns Promise<string of full output log>
+            compileLinkRun: async function(src) {
+                await ensureWorker();
+                pendingWrite = '';
+                return new Promise((resolve) => {
+                    resolveCompile = resolve;
+                    port.postMessage({ id: 'compileLinkRun', data: src });
+                });
+            }
+        };
+    })();
+
     // ── Emscripten module config ─────────────────────────────────
 
     var Module = {
