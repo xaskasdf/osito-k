@@ -742,23 +742,285 @@ int  tls_recv(void *tls, void *buf, uint32_t buf_size, uint32_t timeout_ticks)
      { (void)tls; (void)buf; (void)buf_size; (void)timeout_ticks; return -1; }
 void tls_close(void *tls) { (void)tls; }
 
-/* ── Claude API ──────────────────────────────────────────────── */
+/* ── Claude API (WASM = JS fetch bridge) ─────────────────────────
+ *
+ * The native build has a full TLS 1.2/1.3 client + HTTP framing in
+ * tls.c/tls13.c/http.c/claude.c. WASM lifts those out and delegates
+ * the network leg to fetch(). Conversation history is kept in a
+ * session struct as a single accumulating JSON `messages` array.
+ *
+ * No streaming yet — we POST and call the user callback once with
+ * the full assistant text. Multi-turn works because we re-send the
+ * whole history each turn (cheap at typical chat lengths).
+ * ──────────────────────────────────────────────────────────────── */
 
-void claude_set_api_key(const char *key) { (void)key; }
-const char *claude_get_api_key(void) { return NULL; }
-int  claude_chat(const void *messages, int msg_count, const char *model,
-                 int max_tokens, int (*callback)(const char *, uint32_t, void *), void *ctx)
-     { (void)messages; (void)msg_count; (void)model; (void)max_tokens;
-       (void)callback; (void)ctx; return -1; }
-void *claude_session_new(void)  { return NULL; }
-void  claude_session_free(void *s) { (void)s; }
-void  claude_session_clear(void *s) { (void)s; }
-int   claude_session_send(void *s, const char *user_msg,
-                           int (*callback)(const char *, uint32_t, void *), void *ctx)
-      { (void)s; (void)user_msg; (void)callback; (void)ctx; return -1; }
-int   claude_session_send_with_tools(void *s, const char *user_msg,
-                                      int (*callback)(const char *, uint32_t, void *), void *ctx)
-      { (void)s; (void)user_msg; (void)callback; (void)ctx; return -1; }
+static char g_claude_key[256] = {0};
+
+void claude_set_api_key(const char *key)
+{
+    int i = 0;
+    while (key && key[i] && i < (int)sizeof(g_claude_key) - 1) {
+        g_claude_key[i] = key[i]; i++;
+    }
+    g_claude_key[i] = '\0';
+}
+
+const char *claude_get_api_key(void)
+{
+    return g_claude_key[0] ? g_claude_key : NULL;
+}
+
+#define CLAUDE_HISTORY_MAX (32 * 1024)
+
+typedef struct {
+    /* Accumulating JSON: "{\"role\":\"user\",\"content\":\"…\"},…"
+     * We assemble the final messages array body at send time. */
+    char buf[CLAUDE_HISTORY_MAX];
+    int  len;
+    int  n_msgs;
+} claude_session_t;
+
+void *claude_session_new(void)
+{
+    extern void *malloc(size_t);
+    claude_session_t *s = (claude_session_t *)malloc(sizeof(*s));
+    if (!s) return NULL;
+    s->buf[0] = '\0';
+    s->len = 0;
+    s->n_msgs = 0;
+    return s;
+}
+
+void claude_session_free(void *s)
+{
+    extern void free(void *);
+    if (s) free(s);
+}
+
+void claude_session_clear(void *s)
+{
+    claude_session_t *cs = (claude_session_t *)s;
+    if (cs) { cs->buf[0] = '\0'; cs->len = 0; cs->n_msgs = 0; }
+}
+
+/* Append a JSON-escaped string into dst[*pos], advance *pos.
+ * Escapes: " \ \n \r \t and control chars as \uXXXX. */
+static void json_escape_into(char *dst, int max, int *pos, const char *src)
+{
+    int p = *pos;
+    while (*src && p < max - 8) {
+        unsigned char c = (unsigned char)*src++;
+        switch (c) {
+        case '"':  dst[p++]='\\'; dst[p++]='"';  break;
+        case '\\': dst[p++]='\\'; dst[p++]='\\'; break;
+        case '\n': dst[p++]='\\'; dst[p++]='n';  break;
+        case '\r': dst[p++]='\\'; dst[p++]='r';  break;
+        case '\t': dst[p++]='\\'; dst[p++]='t';  break;
+        default:
+            if (c < 0x20) {
+                static const char hex[] = "0123456789abcdef";
+                dst[p++]='\\'; dst[p++]='u'; dst[p++]='0'; dst[p++]='0';
+                dst[p++]=hex[(c>>4)&0xF]; dst[p++]=hex[c&0xF];
+            } else {
+                dst[p++] = (char)c;
+            }
+        }
+    }
+    *pos = p;
+}
+
+extern int wasm_http_request(const char *url, const char *method,
+                              const char *headers_json, const char *body,
+                              uint8_t **out_buf, int *out_len);
+
+/* Pull the assistant text out of Anthropic's JSON response. Looks for
+ * "text":"…" inside the first content[] object with type=text. */
+static int extract_assistant_text(const char *json, char *out, int max)
+{
+    const char *p = json;
+    const char *needle = "\"text\":\"";
+    int nlen = 8;
+    while (*p) {
+        int match = 1;
+        for (int i = 0; i < nlen; i++) if (p[i] != needle[i]) { match = 0; break; }
+        if (match) { p += nlen; break; }
+        p++;
+    }
+    if (!*p) return -1;
+    int n = 0;
+    while (*p && n < max - 1) {
+        if (*p == '\\') {
+            char e = p[1];
+            if (e == 'n') { out[n++] = '\n'; p += 2; }
+            else if (e == 't') { out[n++] = '\t'; p += 2; }
+            else if (e == 'r') { out[n++] = '\r'; p += 2; }
+            else if (e == '"') { out[n++] = '"';  p += 2; }
+            else if (e == '\\') { out[n++] = '\\'; p += 2; }
+            else if (e == 'u') {
+                /* \uXXXX — naive: emit as ASCII if codepoint < 128 */
+                if (p[2] && p[3] && p[4] && p[5]) {
+                    unsigned cp = 0;
+                    for (int k = 2; k < 6; k++) {
+                        char c = p[k]; cp <<= 4;
+                        if (c >= '0' && c <= '9') cp |= c - '0';
+                        else if (c >= 'a' && c <= 'f') cp |= c - 'a' + 10;
+                        else if (c >= 'A' && c <= 'F') cp |= c - 'A' + 10;
+                    }
+                    if (cp < 0x80) out[n++] = (char)cp;
+                    p += 6;
+                } else { p++; }
+            } else { out[n++] = e; p += 2; }
+        } else if (*p == '"') {
+            break;
+        } else {
+            out[n++] = *p++;
+        }
+    }
+    out[n] = '\0';
+    return n;
+}
+
+int claude_session_send_with_tools(void *s, const char *user_msg,
+                                    int (*callback)(const char *, uint32_t, void *),
+                                    void *ctx)
+{
+    if (!s || !user_msg || !callback) return -1;
+    if (!claude_get_api_key()) {
+        const char *m = "[claude] no API key set — run: apikey sk-ant-...\n";
+        callback(m, 50, ctx);
+        return -1;
+    }
+
+    claude_session_t *cs = (claude_session_t *)s;
+
+    /* 1. Append the user turn to history (JSON message form). */
+    if (cs->n_msgs > 0 && cs->len < CLAUDE_HISTORY_MAX - 1)
+        cs->buf[cs->len++] = ',';
+    {
+        const char *prefix = "{\"role\":\"user\",\"content\":\"";
+        for (const char *p = prefix; *p; p++)
+            if (cs->len < CLAUDE_HISTORY_MAX - 1) cs->buf[cs->len++] = *p;
+        json_escape_into(cs->buf, CLAUDE_HISTORY_MAX, &cs->len, user_msg);
+        const char *suffix = "\"}";
+        for (const char *p = suffix; *p; p++)
+            if (cs->len < CLAUDE_HISTORY_MAX - 1) cs->buf[cs->len++] = *p;
+        cs->buf[cs->len] = '\0';
+    }
+    cs->n_msgs++;
+
+    /* 2. Build the request body: messages array wrapped in JSON. */
+    static char body[CLAUDE_HISTORY_MAX + 1024];
+    int bp = 0;
+    const char *header =
+        "{\"model\":\"claude-haiku-4-5-20251001\","
+        "\"max_tokens\":1024,"
+        "\"messages\":[";
+    for (const char *p = header; *p; p++) body[bp++] = *p;
+    for (int i = 0; i < cs->len; i++) body[bp++] = cs->buf[i];
+    body[bp++] = ']';
+    body[bp++] = '}';
+    body[bp]   = '\0';
+
+    /* 3. Build headers JSON. */
+    static char headers[1024];
+    {
+        int p = 0;
+        const char *prefix =
+            "{\"content-type\":\"application/json\","
+            "\"anthropic-version\":\"2023-06-01\","
+            "\"x-api-key\":\"";
+        for (const char *q = prefix; *q; q++) headers[p++] = *q;
+        for (const char *q = g_claude_key; *q && p < (int)sizeof(headers) - 4; q++)
+            headers[p++] = *q;
+        headers[p++] = '"';
+        headers[p++] = '}';
+        headers[p]   = '\0';
+    }
+
+    /* 4. POST. */
+    uint8_t *resp = NULL;
+    int len = 0;
+    int status = wasm_http_request("https://api.anthropic.com/v1/messages",
+                                    "POST", headers, body, &resp, &len);
+    if (status < 0) {
+        const char *m = "[claude] transport error\n";
+        callback(m, 24, ctx);
+        return -1;
+    }
+    if (status / 100 != 2) {
+        callback("[claude] HTTP ", 14, ctx);
+        char codebuf[8];
+        int n = 0; int v = status;
+        if (v == 0) codebuf[n++] = '0';
+        else { char tmp[8]; int t = 0; while (v) { tmp[t++] = '0' + v % 10; v /= 10; }
+               while (t) codebuf[n++] = tmp[--t]; }
+        codebuf[n++] = ':';
+        codebuf[n++] = ' ';
+        codebuf[n] = '\0';
+        callback(codebuf, n, ctx);
+        if (resp) callback((const char *)resp, len, ctx);
+        callback("\n", 1, ctx);
+        extern void free(void *); if (resp) free(resp);
+        return -1;
+    }
+
+    /* 5. Parse JSON, extract assistant text. */
+    static char text[16 * 1024];
+    int tlen = extract_assistant_text((const char *)resp, text, sizeof(text));
+    extern void free(void *); free(resp);
+
+    if (tlen <= 0) {
+        const char *m = "[claude] could not parse response\n";
+        callback(m, 33, ctx);
+        return -1;
+    }
+
+    /* 6. Stream to caller. */
+    callback(text, (uint32_t)tlen, ctx);
+
+    /* 7. Append assistant turn to history for next call. */
+    if (cs->len < CLAUDE_HISTORY_MAX - 1) cs->buf[cs->len++] = ',';
+    {
+        const char *prefix = "{\"role\":\"assistant\",\"content\":\"";
+        for (const char *p = prefix; *p; p++)
+            if (cs->len < CLAUDE_HISTORY_MAX - 1) cs->buf[cs->len++] = *p;
+        json_escape_into(cs->buf, CLAUDE_HISTORY_MAX, &cs->len, text);
+        const char *suffix = "\"}";
+        for (const char *p = suffix; *p; p++)
+            if (cs->len < CLAUDE_HISTORY_MAX - 1) cs->buf[cs->len++] = *p;
+        cs->buf[cs->len] = '\0';
+    }
+    cs->n_msgs++;
+    return 0;
+}
+
+int claude_session_send(void *s, const char *user_msg,
+                         int (*callback)(const char *, uint32_t, void *), void *ctx)
+{
+    return claude_session_send_with_tools(s, user_msg, callback, ctx);
+}
+
+int claude_chat(const void *messages, int msg_count, const char *model,
+                int max_tokens, int (*callback)(const char *, uint32_t, void *),
+                void *ctx)
+{
+    /* Single-shot: stand up a temp session, send, free. messages is an
+     * array of {role, content} pairs; we use only the last user msg. */
+    (void)model; (void)max_tokens;
+    if (msg_count <= 0 || !messages) return -1;
+    struct cmsg { const char *role; const char *content; };
+    const struct cmsg *m = (const struct cmsg *)messages;
+    const char *last_user = NULL;
+    for (int i = msg_count - 1; i >= 0; i--) {
+        if (m[i].role && m[i].role[0] == 'u') { last_user = m[i].content; break; }
+    }
+    if (!last_user) return -1;
+    void *sess = claude_session_new();
+    if (!sess) return -1;
+    int rc = claude_session_send(sess, last_user, callback, ctx);
+    claude_session_free(sess);
+    return rc;
+}
 
 /* ── SMP CPU info ────────────────────────────────────────────── */
 
@@ -1928,3 +2190,95 @@ int aux_disk_read_512(uint64_t lba, uint32_t count, void *buf) {
 
 uint64_t aux_disk_size(void) { return g_aux_disk_size; }
 uint8_t *aux_disk_ptr(void)  { return g_aux_disk_buf; }
+
+/* ══════════════════════════════════════════════════════════════
+ *  Generic HTTP fetch bridge — used by `curl` and `claude` REPL.
+ *
+ *  WASM has no real TCP/TLS stack, so HTTP commands route through
+ *  the browser's fetch() API. The kernel suspends via Asyncify
+ *  while the JS Promise resolves.
+ * ══════════════════════════════════════════════════════════════ */
+
+EM_JS(void, js_http_kick, (const char *url, const char *method,
+                            const char *headers_json, const char *body), {
+    var u = UTF8ToString(url);
+    var m = UTF8ToString(method);
+    var hj = headers_json ? UTF8ToString(headers_json) : '';
+    var b = body ? UTF8ToString(body) : null;
+    var hdrs = {};
+    if (hj) {
+        try { hdrs = JSON.parse(hj); } catch (e) { hdrs = {}; }
+    }
+    window.__httpDone = false;
+    window.__httpStatus = 0;
+    window.__httpBody = null;
+    window.__httpError = null;
+    var opts = { method: m, headers: hdrs };
+    if (b !== null) opts.body = b;
+    fetch(u, opts)
+        .then(function(r) {
+            window.__httpStatus = r.status;
+            return r.text();
+        })
+        .then(function(t) {
+            var enc = new TextEncoder();
+            window.__httpBody = enc.encode(t);
+            window.__httpDone = true;
+        })
+        .catch(function(e) {
+            window.__httpError = String(e);
+            window.__httpDone = true;
+        });
+});
+
+EM_JS(int, js_http_done,   (), { return window.__httpDone ? 1 : 0; });
+EM_JS(int, js_http_status, (), { return window.__httpStatus | 0; });
+EM_JS(int, js_http_size,   (), {
+    return window.__httpBody ? window.__httpBody.byteLength : 0;
+});
+EM_JS(void, js_http_copy, (uint8_t *dst, int max), {
+    var src = window.__httpBody;
+    if (!src) return;
+    var n = src.byteLength < max ? src.byteLength : max;
+    HEAPU8.set(src.subarray(0, n), dst);
+});
+EM_JS(int, js_http_error, (char *dst, int max), {
+    var s = window.__httpError || '';
+    var bytes = lengthBytesUTF8(s) + 1;
+    if (bytes > max) bytes = max;
+    stringToUTF8(s, dst, bytes);
+    return s ? bytes - 1 : 0;
+});
+
+/* Synchronous HTTP — suspends via Asyncify until the Promise resolves.
+ * Allocates the body buffer; caller must free.
+ * Returns HTTP status code (>0) or -1 on transport error.
+ * On success: *out_buf points to malloc'd response body, *out_len its size. */
+int wasm_http_request(const char *url, const char *method,
+                       const char *headers_json, const char *body,
+                       uint8_t **out_buf, int *out_len)
+{
+    js_http_kick(url, method, headers_json, body);
+    while (!js_http_done()) emscripten_sleep(20);
+
+    if (js_http_status() == 0) {
+        char err[256];
+        if (js_http_error(err, sizeof(err)) > 0) {
+            serial_puts("[http] error: ");
+            serial_puts(err);
+            serial_puts("\n");
+        }
+        return -1;
+    }
+
+    int sz = js_http_size();
+    extern void *malloc(size_t);
+    uint8_t *buf = (uint8_t *)malloc(sz + 1);
+    if (!buf) return -1;
+    js_http_copy(buf, sz);
+    buf[sz] = '\0';
+
+    if (out_buf) *out_buf = buf;
+    if (out_len) *out_len = sz;
+    return js_http_status();
+}

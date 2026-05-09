@@ -1495,11 +1495,72 @@ static void cmd_tlstest(int argc, char *argv[])
 
 /* ── Builtin: curl ───────────────────────────────────────────── */
 
+#ifdef __EMSCRIPTEN__
+extern int wasm_http_request(const char *url, const char *method,
+                              const char *headers_json, const char *body,
+                              uint8_t **out_buf, int *out_len);
+extern void free(void *);
+#endif
+
 static void cmd_curl(int argc, char *argv[])
 {
-#ifdef WASM_BUILD
-    (void)argc; (void)argv;
-    sh_puts("curl: network not available in WASM\n");
+#ifdef __EMSCRIPTEN__
+    if (argc < 2) {
+        sh_puts("Usage: curl <url> [host /path]\n");
+        sh_puts("  In WASM: any URL the browser can reach (CORS permitting).\n");
+        sh_puts("  Example: curl https://example.com\n");
+        return;
+    }
+    /* Two-arg form: hostname + path → assume https://host/path */
+    char url[1024];
+    if (argc >= 3 && argv[1][0] != 'h') {
+        int p = 0;
+        const char *prefix = "https://";
+        while (*prefix && p < (int)sizeof(url) - 1) url[p++] = *prefix++;
+        const char *h = argv[1];
+        while (*h && p < (int)sizeof(url) - 1) url[p++] = *h++;
+        const char *path = argv[2];
+        while (*path && p < (int)sizeof(url) - 1) url[p++] = *path++;
+        url[p] = '\0';
+    } else {
+        int p = 0;
+        const char *u = argv[1];
+        while (*u && p < (int)sizeof(url) - 1) url[p++] = *u++;
+        url[p] = '\0';
+    }
+
+    uint8_t *buf = NULL;
+    int len = 0;
+    int status = wasm_http_request(url, "GET", "{}", NULL, &buf, &len);
+    if (status < 0) {
+        sh_puts_color("[curl] transport error\n", 0x00FF0000);
+        return;
+    }
+    sh_puts_color("HTTP ", 0x00FFD93D);
+    sh_putdec((uint64_t)status);
+    sh_puts(" — ");
+    sh_putdec((uint64_t)len);
+    sh_puts(" bytes\n");
+
+    /* Stream body in 256-byte chunks; cap visible output at 16 KB. */
+    int cap = len > 16384 ? 16384 : len;
+    char chunk[256];
+    int i = 0;
+    while (i < cap) {
+        int n = cap - i; if (n > 255) n = 255;
+        for (int j = 0; j < n; j++) chunk[j] = (char)buf[i + j];
+        chunk[n] = '\0';
+        sh_puts(chunk);
+        i += n;
+    }
+    if (len > cap) {
+        sh_puts("\n... [");
+        sh_putdec((uint64_t)(len - cap));
+        sh_puts(" more bytes truncated]\n");
+    } else {
+        sh_puts("\n");
+    }
+    free(buf);
     return;
 #endif
     if (argc < 2) {
