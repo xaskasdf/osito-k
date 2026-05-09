@@ -3580,7 +3580,63 @@ void __cold shell_run(void)
 
         if (len == 0) continue;  /* Empty line or Ctrl+C */
 
+        /* Heredoc support: detect `<<TERM` (or `<< TERM`) in the line.
+         * Read further lines until a line is exactly TERM, then feed
+         * the accumulated text as stdin to the command (and strip the
+         * heredoc marker from the line itself). */
+        char *here_marker = NULL;
+        for (char *p = line; *p; p++) {
+            if (p[0] == '<' && p[1] == '<') { here_marker = p; break; }
+        }
+        char *here_buf = NULL;
+        const char *saved_h_buf = sh_stdin_buf;
+        uint32_t    saved_h_len = sh_stdin_len;
+        if (here_marker) {
+            char *t = here_marker + 2;
+            while (*t == ' ' || *t == '\t') t++;
+            char term[64] = {0};
+            int tl = 0;
+            while (t[tl] && t[tl] != ' ' && t[tl] != '\t' && tl < (int)sizeof(term) - 1) {
+                term[tl] = t[tl]; tl++;
+            }
+            term[tl] = 0;
+
+            /* Truncate the line at `<<` so the command doesn't see the marker. */
+            *here_marker = 0;
+            /* Rstrip trailing whitespace */
+            int ll = (int)strlen(line);
+            while (ll > 0 && (line[ll-1] == ' ' || line[ll-1] == '\t')) line[--ll] = 0;
+
+            /* Read body until terminator. 64 KB cap. */
+            enum { HERE_CAP = 64 * 1024 };
+            here_buf = (char *)kmalloc(HERE_CAP);
+            uint32_t hpos = 0;
+            char hl[1024];
+            for (;;) {
+                int hn = term_readline("> ", hl, sizeof(hl));
+                if (hn < 0) break;
+                if (strcmp(hl, term) == 0) break;
+                size_t hlen = strlen(hl);
+                if (hpos + hlen + 1 >= HERE_CAP) break;
+                if (here_buf) {
+                    memcpy(here_buf + hpos, hl, hlen);
+                    hpos += hlen;
+                    here_buf[hpos++] = '\n';
+                }
+            }
+            if (here_buf) {
+                sh_stdin_buf = here_buf;
+                sh_stdin_len = hpos;
+            }
+        }
+
         shell_exec_pipeline(line);
+
+        if (here_buf) {
+            kfree(here_buf);
+            sh_stdin_buf = saved_h_buf;
+            sh_stdin_len = saved_h_len;
+        }
 
         /* Poll network between commands */
         net_poll();

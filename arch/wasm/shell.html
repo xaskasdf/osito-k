@@ -379,10 +379,17 @@
                         const input = 't.' + ext, obj = 't.o', wasm = 't.wasm';
                         await api.ready;
                         await api.compile({ input, contents: e.data.data, obj, lang });
-                        await api.link(obj, wasm);
-                        const view = api.memfs.getFileContents(wasm);
-                        const ab = view.slice().buffer;
-                        port.postMessage({ id: 'compiled', wasm: ab }, [ab]);
+                        if (e.data.objectOnly) {
+                            /* cc -c: stop after producing the .o */
+                            const view = api.memfs.getFileContents(obj);
+                            const ab = view.slice().buffer;
+                            port.postMessage({ id: 'compiled', wasm: ab }, [ab]);
+                        } else {
+                            await api.link(obj, wasm);
+                            const view = api.memfs.getFileContents(wasm);
+                            const ab = view.slice().buffer;
+                            port.postMessage({ id: 'compiled', wasm: ab }, [ab]);
+                        }
                     } catch (err) {
                         port.postMessage({ id: 'compiled', error: err.message });
                     }
@@ -448,12 +455,13 @@
                     port.postMessage({ id: 'compileLinkRun', data: src, lang: lang || 'c++' });
                 });
             },
-            // Compile + link only — returns Promise<{wasm: ArrayBuffer} | {error: string}>
-            compile: async function(src, lang) {
+            // Compile + link → Promise<{wasm: ArrayBuffer} | {error: string}>
+            // If objectOnly=true, returns the .o bytes (no link step).
+            compile: async function(src, lang, objectOnly) {
                 await ensureWorker();
                 return new Promise((resolve) => {
                     resolveCompiled = resolve;
-                    port.postMessage({ id: 'compile', data: src, lang: lang || 'c++' });
+                    port.postMessage({ id: 'compile', data: src, lang: lang || 'c++', objectOnly: !!objectOnly });
                 });
             },
             // Preprocess only (clang -cc1 -E). Output streams via onWrite.

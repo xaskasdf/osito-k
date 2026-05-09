@@ -100,7 +100,9 @@ WASI). No requiere extender `proc_exec` para el caso `cc -run`.
 | `cc hello.c` | Compila + linkea + corre inline (estilo `tcc -run`) |
 | `cc hello.c -o hello.wasm` | Compila + linkea + guarda en OsitoFS, no ejecuta |
 | `cc -E hello.c` | Solo preprocessor (`clang -cc1 -E`). |
+| `cc -c hello.c` | Compile-only — produce `<base>.o` (sin `-o` toma basename del source). |
 | `cc < hello.c` | Lee source desde redirect (o pipe `echo ... \| cc`). |
+| `cc -o foo.wasm << END` ... `END` | Heredoc inline; multi-línea sin file en disco. |
 | `exec hello.wasm` | `proc_exec` detecta WASI (no `dylink.0` section) y corre con shim. Output streamea al terminal. |
 | `exec quake2.so` | `proc_exec` detecta `dylink.0` → carga via `dlopen` (Emscripten side module). |
 | `edit <file>` | Editor multi-línea, terminator `.` en línea propia. Escribe a OsitoFS. |
@@ -173,9 +175,11 @@ Libs en `/lib/wasm32-wasi/`:
 - [x] ~~**`cc -E`** preprocessing only~~ ✅ done — patched shared.js's `preprocess()` que invoca `clang -cc1 -E`.
 - [x] ~~**`<` redirect input**~~ ✅ done — wired en `parse_redirects` para cargar archivo en `sh_stdin_buf`. `cc < hello.c` o `cmd | cc` funciona.
 - [x] ~~**`edit <file>`** multi-línea~~ ✅ done — terminator `.` en línea propia.
-- [ ] **Kernel-bridge imports** — exponer `oi_chat`, `oi_dlopen` etc. via custom `osito_env` WASI imports (App.constructor extended).
-- [ ] **`<` con heredoc** (`cmd << EOF`).
-- [ ] **`cc -c`** compile-only (currently only `-o` outputs full linked wasm).
+- [x] ~~**Kernel-bridge imports**~~ ✅ done — `osito_env` import module with `oi_random_u32`, `oi_now_us`, `oi_log_kernel`. App constructor adds it to the WebAssembly imports table; ositok.h declares them with `__attribute__((import_module/import_name))`. Compiled programs link via `wasm-ld --allow-undefined`; runtime resolves them in the worker's App instance.
+- [x] ~~**Heredoc `<< EOF`**~~ ✅ done — shell main loop detects `<<TERM` in the command line, accumulates lines until terminator, feeds via `sh_stdin_buf`. Body cap 64KB.
+- [x] ~~**`cc -c`** compile-only~~ ✅ done — produces `.o` (auto-named `<basename>.o` if no `-o`).
+- [ ] **Real `oi_chat`** that calls back to the kernel main thread (LLM inference). Needs SharedArrayBuffer + Atomics.wait or a synchronous bridge.
+- [ ] **`cat` / `head` / `tail` reading from stdin** when no filename arg.
 
 ## Configuración / referencias
 
