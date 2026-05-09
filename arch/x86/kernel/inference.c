@@ -1557,14 +1557,105 @@ uint32_t sample_topp(float *logits, uint32_t n,
 static float g_temperature = 0.6f;
 static float g_top_p = 0.9f;
 
+/* ── Repetition-penalty parameters (Goldilocks defaults: off) ──
+ *
+ * Brandon-tiny-10m and other small models collapse into degenerate
+ * attractors (the "United States" loop documented in osito-a/agent.c:112)
+ * when sampled greedily. The classic mitigation is a sliding-window
+ * penalty over the last N generated tokens.
+ *
+ *   - rep_penalty       (multiplicative, llama.cpp classic):
+ *       logits[t] /= rep_penalty   if logits[t] > 0
+ *       logits[t] *= rep_penalty   if logits[t] < 0
+ *   - presence_penalty  (additive once per unique recent token, OpenAI)
+ *   - frequency_penalty (additive scaled by occurrence count, OpenAI)
+ *
+ * Standard "balanced de-repetition" recipe: rep=1.10 + freq=0.05.
+ * Values default to identity so existing chat behavior is unchanged
+ * until `penalty` is run from the shell.                             */
+static float g_rep_penalty       = 1.0f;   /* >1 = penalize */
+static float g_presence_penalty  = 0.0f;
+static float g_frequency_penalty = 0.0f;
+
+#define LLAMA_RECENT_TOKENS 64
+static uint32_t g_recent_buf[LLAMA_RECENT_TOKENS];
+static uint32_t g_recent_count = 0;
+static uint32_t g_recent_head  = 0;
+
 void llama_set_sampling(float temperature, float top_p)
 {
     g_temperature = temperature;
     g_top_p = top_p;
 }
 
+void llama_set_penalty(float rep, float presence, float frequency)
+{
+    g_rep_penalty       = rep > 0.0f ? rep : 1.0f;
+    g_presence_penalty  = presence > 0.0f ? presence : 0.0f;
+    g_frequency_penalty = frequency > 0.0f ? frequency : 0.0f;
+}
+
+void llama_get_penalty(float *rep, float *presence, float *frequency)
+{
+    if (rep)       *rep       = g_rep_penalty;
+    if (presence)  *presence  = g_presence_penalty;
+    if (frequency) *frequency = g_frequency_penalty;
+}
+
+static void recent_reset(void)
+{
+    g_recent_count = 0;
+    g_recent_head  = 0;
+}
+
+static void recent_push(uint32_t tok)
+{
+    g_recent_buf[g_recent_head] = tok;
+    g_recent_head = (g_recent_head + 1) % LLAMA_RECENT_TOKENS;
+    if (g_recent_count < LLAMA_RECENT_TOKENS) g_recent_count++;
+}
+
+/* Apply rep + presence + frequency penalties to logits in place over
+ * the recent-token window. Skips entirely when no penalty is active. */
+static void apply_penalties(float *logits, uint32_t n)
+{
+    if (g_recent_count == 0) return;
+    if (g_rep_penalty <= 1.0f &&
+        g_presence_penalty <= 0.0f &&
+        g_frequency_penalty <= 0.0f) return;
+
+    /* rep + presence: once per unique token in the window. */
+    if (g_rep_penalty > 1.0f || g_presence_penalty > 0.0f) {
+        for (uint32_t i = 0; i < g_recent_count; i++) {
+            uint32_t t = g_recent_buf[i];
+            if (t >= n) continue;
+            bool seen = false;
+            for (uint32_t j = 0; j < i; j++) {
+                if (g_recent_buf[j] == t) { seen = true; break; }
+            }
+            if (seen) continue;
+            float v = logits[t];
+            if (g_rep_penalty > 1.0f) {
+                if (v > 0.0f) v /= g_rep_penalty;
+                else if (v < 0.0f) v *= g_rep_penalty;
+            }
+            if (g_presence_penalty > 0.0f) v -= g_presence_penalty;
+            logits[t] = v;
+        }
+    }
+
+    /* frequency: each occurrence subtracts. */
+    if (g_frequency_penalty > 0.0f) {
+        for (uint32_t i = 0; i < g_recent_count; i++) {
+            uint32_t t = g_recent_buf[i];
+            if (t < n) logits[t] -= g_frequency_penalty;
+        }
+    }
+}
+
 static uint32_t sample_next(float *logits, uint32_t vocab_size)
 {
+    apply_penalties(logits, vocab_size);
     return sample_topp(logits, vocab_size, g_temperature, g_top_p);
 }
 
@@ -1945,6 +2036,9 @@ int llama_chat(llama_state_t *state, const char *text,
      * from the previous chat. */
     state->registers_prefilled = false;
     state->v_first_captured    = false;
+    /* Empty the repetition-penalty window so we don't carry over the
+     * previous chat's tokens into this one. */
+    recent_reset();
 
     /* Prefill */
     uint64_t t0 = rdtsc();
@@ -1968,6 +2062,8 @@ int llama_chat(llama_state_t *state, const char *text,
     for (uint32_t step = 0; step < max_tokens; step++) {
         if (next == eos_id || next == LLAMA_EOS_1 || next == LLAMA_EOS_2) break;
         if (state->pos >= state->max_seq) break;
+
+        recent_push(next);
 
         /* Decode and deliver */
         const char *tok_text = tok_global_decode(next);
@@ -2079,6 +2175,7 @@ int llama_chat_with_system(llama_state_t *state,
     state->pos = 0;
     state->registers_prefilled = false;
     state->v_first_captured    = false;
+    recent_reset();
 
     /* Cap prefill at max_seq - max_tokens so generation has headroom */
     uint32_t avail = state->max_seq > max_tokens ? state->max_seq - max_tokens : 1;
@@ -2109,6 +2206,8 @@ int llama_chat_with_system(llama_state_t *state,
     for (uint32_t step = 0; step < max_tokens; step++) {
         if (next == im_end) break;
         if (state->pos >= state->max_seq) break;
+
+        recent_push(next);
 
         const char *tok_text = tok_global_decode(next);
         if (tok_text && on_token) on_token(tok_text, ctx);

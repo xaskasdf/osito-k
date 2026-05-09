@@ -144,6 +144,8 @@ extern void *prompt_llama;  /* llama_state_t* from main.c */
 extern int  llama_chat(void *state, const char *text, uint32_t max_tokens,
                        void (*on_token)(const char *text, void *ctx), void *ctx);
 extern void llama_set_sampling(float temperature, float top_p);
+extern void llama_set_penalty(float rep, float presence, float frequency);
+extern void llama_get_penalty(float *rep, float *presence, float *frequency);
 
 /* ── WASM-compatibility shims ────────────────────────────────── */
 #ifdef __EMSCRIPTEN__
@@ -1633,6 +1635,34 @@ static void cmd_temp(int argc, char *argv[])
     sh_puts(".");
     sh_putdec((uint64_t)(p * 10.0f) % 10);
     sh_puts("\n");
+}
+
+static void cmd_penalty(int argc, char *argv[])
+{
+    if (argc < 2) {
+        float r, pr, fq;
+        llama_get_penalty(&r, &pr, &fq);
+        sh_puts("Usage: penalty <rep> [presence] [frequency]\n");
+        sh_puts("  rep:       1.0=off, 1.10=balanced, 1.30=strong (multiplicative)\n");
+        sh_puts("  presence:  0.0=off, 0.5=mild, 1.0=strong (additive once-per-token)\n");
+        sh_puts("  frequency: 0.0=off, 0.05=balanced, 0.20=strong (additive per-occurrence)\n");
+        sh_puts("Current: rep=");
+        sh_putdec((uint64_t)(r * 100.0f) / 100); sh_puts(".");
+        sh_putdec((uint64_t)(r * 100.0f) % 100);
+        sh_puts(" presence=");
+        sh_putdec((uint64_t)(pr * 100.0f) / 100); sh_puts(".");
+        sh_putdec((uint64_t)(pr * 100.0f) % 100);
+        sh_puts(" frequency=");
+        sh_putdec((uint64_t)(fq * 100.0f) / 100); sh_puts(".");
+        sh_putdec((uint64_t)(fq * 100.0f) % 100);
+        sh_puts("\n");
+        return;
+    }
+    float rep = parse_float(argv[1]);
+    float pre = argc >= 3 ? parse_float(argv[2]) : 0.0f;
+    float frq = argc >= 4 ? parse_float(argv[3]) : 0.0f;
+    llama_set_penalty(rep, pre, frq);
+    sh_puts("Penalty set\n");
 }
 
 /* ── Builtin: chat (local inference) ─────────────────────────── */
@@ -3190,6 +3220,8 @@ void shell_exec(char *line)
         cmd_chat(argc, argv);
     } else if (strcmp(cmd, "rag") == 0) {
         cmd_rag(argc, argv);
+    } else if (strcmp(cmd, "penalty") == 0) {
+        cmd_penalty(argc, argv);
     } else if (strcmp(cmd, "temp") == 0) {
         cmd_temp(argc, argv);
     } else if (strcmp(cmd, "dl") == 0) {
