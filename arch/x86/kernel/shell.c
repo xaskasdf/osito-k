@@ -1676,6 +1676,72 @@ static void cmd_chat(int argc, char *argv[])
     }
 }
 
+extern int llama_chat_with_system(void *state,
+                                   const char *system_text,
+                                   const char *user_text,
+                                   uint32_t max_tokens,
+                                   void (*on_token)(const char *, void *),
+                                   void *ctx);
+
+static void cmd_rag(int argc, char *argv[])
+{
+    if (argc < 2) {
+        sh_puts("Usage: rag <context> ::: <question>\n");
+        sh_puts("  Context and question separated by triple-colon (::: avoids the | pipe).\n");
+        sh_puts("  Example: rag Einstein was born in Ulm in 1879. ::: Where was Einstein born?\n");
+        return;
+    }
+    if (!prompt_llama) {
+        sh_puts("No model loaded.\n");
+        return;
+    }
+
+    /* Reassemble argv into a single string, then split on '|'. */
+    static char buf[4096];
+    int bp = 0;
+    for (int i = 1; i < argc && bp < (int)sizeof(buf) - 1; i++) {
+        if (i > 1 && bp < (int)sizeof(buf) - 1) buf[bp++] = ' ';
+        const char *w = argv[i];
+        while (*w && bp < (int)sizeof(buf) - 1) buf[bp++] = *w++;
+    }
+    buf[bp] = '\0';
+
+    char *bar = buf;
+    while (*bar) {
+        if (bar[0] == ':' && bar[1] == ':' && bar[2] == ':') break;
+        bar++;
+    }
+    if (!*bar) {
+        sh_puts("No ':::' separator found. See: rag (no args)\n");
+        return;
+    }
+    *bar = '\0';
+    /* Strip trailing space on context */
+    char *ctx_end = bar - 1;
+    while (ctx_end > buf && *ctx_end == ' ') *ctx_end-- = '\0';
+    char *question = bar + 3;
+    while (*question == ' ') question++;
+
+    /* Build the system message (matches rag-brandon.py PROMPT_RAG). */
+    static char system_msg[4096];
+    const char *prefix = "Answer the user's question using the context below. "
+                         "If the context does not contain the answer, say you don't know.\n\n"
+                         "Context:\n";
+    int sp = 0;
+    const char *p = prefix;
+    while (*p && sp < (int)sizeof(system_msg) - 1) system_msg[sp++] = *p++;
+    p = buf;
+    while (*p && sp < (int)sizeof(system_msg) - 1) system_msg[sp++] = *p++;
+    system_msg[sp] = '\0';
+
+    sh_puts_color("\nLlama (RAG): ", 0x00FF8800);
+
+    int r = llama_chat_with_system(prompt_llama, system_msg, question, 128,
+                                    chat_token_cb, NULL);
+    if (r < 0) sh_puts_color("[error]\n", 0x00FF0000);
+    else       sh_puts("\n");
+}
+
 /* ── Builtin: kexec ──────────────────────────────────────────── */
 
 /* Trampoline symbol + size (from kexec_tramp.S) */
@@ -3122,6 +3188,8 @@ void shell_exec(char *line)
         cmd_claude(argc, argv);
     } else if (strcmp(cmd, "chat") == 0) {
         cmd_chat(argc, argv);
+    } else if (strcmp(cmd, "rag") == 0) {
+        cmd_rag(argc, argv);
     } else if (strcmp(cmd, "temp") == 0) {
         cmd_temp(argc, argv);
     } else if (strcmp(cmd, "dl") == 0) {

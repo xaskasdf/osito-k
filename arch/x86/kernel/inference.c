@@ -1888,16 +1888,7 @@ int llama_chat(llama_state_t *state, const char *text,
     uint32_t n = 0;
     int r;
 
-    /* Brandon-tiny is a base completion model trained on Wikipedia +
-     * SmolLM + synthetic. The "instruct" suffix in its filename is
-     * misleading — its reference chat.py just encodes the raw prompt
-     * (no ChatML, no BOS). Mirror that here so the prefill matches the
-     * training distribution; otherwise the model sees template tokens
-     * it has never been conditioned on. */
-    if (state->arch[0] == 'b') {
-        r = tok_encode(g_tokenizer, text, text_len, tokens + n, 1024 - n);
-        if (r > 0) n += (uint32_t)r;
-    } else if (im_start != UINT32_MAX && im_end != UINT32_MAX) {
+    if (im_start != UINT32_MAX && im_end != UINT32_MAX) {
         /* ── ChatML template ── */
         tokens[n++] = im_start;
         r = tok_encode(g_tokenizer, "user\n", 5, tokens + n, 1024 - n);
@@ -2011,6 +2002,137 @@ int llama_chat(llama_state_t *state, const char *text,
     serial_putdec(ms_per_tok);
     serial_puts(" ms/tok)\n");
 
+    return (int)gen;
+}
+
+/* ══════════════════════════════════════════════════════════════
+ *  llama_chat_with_system — RAG-style ChatML chat
+ *
+ *  Prepends a system turn before the user turn:
+ *    <|im_start|>system\n{system}<|im_end|>\n
+ *    <|im_start|>user\n{user}<|im_end|>\n
+ *    <|im_start|>assistant\n
+ *
+ *  Falls back to llama_chat (no system turn) when system_text is empty
+ *  or when the tokenizer doesn't expose ChatML special tokens.
+ * ══════════════════════════════════════════════════════════════ */
+
+int llama_chat_with_system(llama_state_t *state,
+                            const char *system_text,
+                            const char *user_text,
+                            uint32_t max_tokens,
+                            void (*on_token)(const char *text, void *ctx),
+                            void *ctx)
+{
+    if (!state || !user_text) return -1;
+    if (!system_text || !*system_text)
+        return llama_chat(state, user_text, max_tokens, on_token, ctx);
+
+    if (!tok_is_ready(g_tokenizer))
+        return llama_chat(state, user_text, max_tokens, on_token, ctx);
+
+    uint32_t im_start = tok_find_special(g_tokenizer, "<|im_start|>");
+    uint32_t im_end   = tok_find_special(g_tokenizer, "<|im_end|>");
+    if (im_start == UINT32_MAX || im_end == UINT32_MAX)
+        return llama_chat(state, user_text, max_tokens, on_token, ctx);
+
+    uint32_t sys_len = 0;  while (system_text[sys_len]) sys_len++;
+    uint32_t usr_len = 0;  while (user_text  [usr_len]) usr_len++;
+
+    /* Larger token buffer for RAG: 4096 tokens fits brandon's 256 max_seq
+     * after register prefill (registers + prompt < max_seq is checked at
+     * forward time; oversize prompts get truncated by the cache cap). */
+    static uint32_t tokens[4096];
+    uint32_t n = 0;
+    int r;
+
+    /* system turn */
+    tokens[n++] = im_start;
+    r = tok_encode(g_tokenizer, "system\n", 7, tokens + n, 4096 - n);
+    if (r > 0) n += (uint32_t)r;
+    r = tok_encode(g_tokenizer, system_text, sys_len, tokens + n, 4096 - n);
+    if (r > 0) n += (uint32_t)r;
+    tokens[n++] = im_end;
+    r = tok_encode(g_tokenizer, "\n", 1, tokens + n, 4096 - n);
+    if (r > 0) n += (uint32_t)r;
+
+    /* user turn */
+    tokens[n++] = im_start;
+    r = tok_encode(g_tokenizer, "user\n", 5, tokens + n, 4096 - n);
+    if (r > 0) n += (uint32_t)r;
+    r = tok_encode(g_tokenizer, user_text, usr_len, tokens + n, 4096 - n);
+    if (r > 0) n += (uint32_t)r;
+    tokens[n++] = im_end;
+    r = tok_encode(g_tokenizer, "\n", 1, tokens + n, 4096 - n);
+    if (r > 0) n += (uint32_t)r;
+
+    /* assistant turn opener */
+    tokens[n++] = im_start;
+    r = tok_encode(g_tokenizer, "assistant\n", 10, tokens + n, 4096 - n);
+    if (r > 0) n += (uint32_t)r;
+
+    serial_puts("[RAG] Prompt: ");
+    serial_putdec(n);
+    serial_puts(" tokens\n");
+
+    /* Reset state (brandon also re-prefills registers) */
+    state->pos = 0;
+    state->registers_prefilled = false;
+    state->v_first_captured    = false;
+
+    /* Cap prefill at max_seq - max_tokens so generation has headroom */
+    uint32_t avail = state->max_seq > max_tokens ? state->max_seq - max_tokens : 1;
+    if (n > avail) {
+        serial_puts("[RAG] truncating ");
+        serial_putdec(n - avail);
+        serial_puts(" tail tokens\n");
+        n = avail;
+    }
+
+    /* Prefill */
+    uint64_t t0 = rdtsc();
+    for (uint32_t i = 0; i < n; i++)
+        llama_forward(state, tokens[i]);
+    uint64_t t1 = rdtsc();
+    serial_puts("[RAG] Prefill: ");
+#ifdef __EMSCRIPTEN__
+    serial_putdec(t1 - t0);
+#else
+    serial_putdec((t1 - t0) / 3000000);
+#endif
+    serial_puts(" ms\n");
+
+    /* Generate (stops on im_end) */
+    rng_seed();
+    uint32_t next = sample_next(state->logits, state->vocab_size);
+    uint32_t gen = 0;
+    for (uint32_t step = 0; step < max_tokens; step++) {
+        if (next == im_end) break;
+        if (state->pos >= state->max_seq) break;
+
+        const char *tok_text = tok_global_decode(next);
+        if (tok_text && on_token) on_token(tok_text, ctx);
+
+#ifdef __EMSCRIPTEN__
+        extern void emscripten_sleep(unsigned int ms);
+        emscripten_sleep(0);
+#endif
+        llama_forward(state, next);
+        gen++;
+        next = sample_next(state->logits, state->vocab_size);
+    }
+
+    uint64_t t2 = rdtsc();
+#ifdef __EMSCRIPTEN__
+    uint64_t gen_ms = gen > 0 ? (t2 - t1) : 0;
+#else
+    uint64_t gen_ms = gen > 0 ? (t2 - t1) / 3000000 : 0;
+#endif
+    serial_puts("[RAG] Generated: ");
+    serial_putdec(gen);
+    serial_puts(" tokens (");
+    serial_putdec(gen > 0 ? gen_ms / gen : 0);
+    serial_puts(" ms/tok)\n");
     return (int)gen;
 }
 

@@ -115,6 +115,16 @@ void llama_generate(llama_state_t *state, const uint32_t *prompt,
                     uint32_t prompt_len, uint32_t max_tokens);
 void llama_free(llama_state_t *state);
 
+/* RAG-style chat: wraps system_text + user_text in a ChatML prompt
+ * (system + user + assistant turns) and runs prefill + generation.
+ * Falls back to llama_chat behavior when system_text is NULL/empty. */
+int  llama_chat_with_system(llama_state_t *state,
+                             const char *system_text,
+                             const char *user_text,
+                             uint32_t max_tokens,
+                             void (*on_token)(const char *text, void *ctx),
+                             void *ctx);
+
 /* NVMe-direct layer streaming */
 int  llama_init_streaming(llama_state_t *state);
 int  llama_forward_streaming(llama_state_t *state, uint32_t token);

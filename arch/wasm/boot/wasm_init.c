@@ -142,7 +142,7 @@ static void load_model(void)
     }
 
     /* Initialize Llama inference state (max 256 tokens context) */
-    if (llama_init(&g_llama, &g_model, 256) < 0) {
+    if (llama_init(&g_llama, &g_model, 512) < 0) {
         serial_puts("[WASM] Llama init failed\n\n");
         return;
     }
