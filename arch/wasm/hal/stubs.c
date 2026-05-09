@@ -1025,6 +1025,14 @@ extern int wasm_http_request(const char *url, const char *method,
                               const char *headers_json, const char *body,
                               uint8_t **out_buf, int *out_len);
 
+/* Forward decls for the streaming bridge defined later in this file. */
+extern int js_stream_kick(const char *url, const char *headers_json,
+                           const char *body);
+extern int js_stream_done(void);
+extern int js_stream_status(void);
+extern int js_stream_q_size(void);
+extern int js_stream_q_pop(char *dst, int max);
+
 /* Pull the assistant text out of Anthropic's JSON response. Looks for
  * "text":"…" inside the first content[] object with type=text. */
 static int extract_assistant_text(const char *json, char *out, int max)
@@ -1100,12 +1108,14 @@ int claude_session_send_with_tools(void *s, const char *user_msg,
     }
     cs->n_msgs++;
 
-    /* 2. Build the request body: messages array wrapped in JSON. */
+    /* 2. Build the request body: messages array wrapped in JSON.
+     *    stream=true so we get SSE chunks instead of one blob. */
     static char body[CLAUDE_HISTORY_MAX + 1024];
     int bp = 0;
     const char *header =
         "{\"model\":\"claude-haiku-4-5-20251001\","
         "\"max_tokens\":1024,"
+        "\"stream\":true,"
         "\"messages\":[";
     for (const char *p = header; *p; p++) body[bp++] = *p;
     for (int i = 0; i < cs->len; i++) body[bp++] = cs->buf[i];
@@ -1129,46 +1139,59 @@ int claude_session_send_with_tools(void *s, const char *user_msg,
         headers[p]   = '\0';
     }
 
-    /* 4. POST. */
-    uint8_t *resp = NULL;
-    int len = 0;
-    int status = wasm_http_request("https://api.anthropic.com/v1/messages",
-                                    "POST", headers, body, &resp, &len);
-    if (status < 0) {
-        const char *m = "[claude] transport error\n";
+    /* 4. POST + drain SSE chunks as they arrive. */
+    js_stream_kick("https://api.anthropic.com/v1/messages", headers, body);
+
+    /* Accumulate the assistant text for history while streaming. */
+    static char text[16 * 1024];
+    int tlen = 0;
+
+    while (!js_stream_done() || js_stream_q_size() > 0) {
+        if (js_stream_q_size() == 0) {
+            emscripten_sleep(20);
+            continue;
+        }
+        char ev[4096];
+        int n = js_stream_q_pop(ev, sizeof(ev));
+        if (n <= 0) continue;
+
+        /* Each event payload is a JSON object like:
+         *   {"type":"content_block_delta","delta":{"text":"..."}}
+         * Extract the inner text via the same naive parser used for
+         * the non-streaming response. */
+        if (js_stream_status() && js_stream_status() / 100 != 2) continue;
+
+        char chunk[2048];
+        int clen = extract_assistant_text(ev, chunk, sizeof(chunk));
+        if (clen > 0) {
+            callback(chunk, (uint32_t)clen, ctx);
+            for (int i = 0; i < clen && tlen < (int)sizeof(text) - 1; i++)
+                text[tlen++] = chunk[i];
+            text[tlen] = '\0';
+        }
+    }
+
+    int status = js_stream_status();
+    if (status / 100 != 2) {
+        char codebuf[64];
+        int n = 0;
+        const char *p = "[claude] HTTP ";
+        while (*p && n < 60) codebuf[n++] = *p++;
+        int v = status, t = 0; char tmp[8];
+        if (v == 0) tmp[t++] = '0';
+        else while (v && t < 8) { tmp[t++] = '0' + v % 10; v /= 10; }
+        while (t) codebuf[n++] = tmp[--t];
+        codebuf[n++] = '\n';
+        codebuf[n] = '\0';
+        callback(codebuf, n, ctx);
+        return -1;
+    }
+
+    if (tlen == 0) {
+        const char *m = "[claude] empty response\n";
         callback(m, 24, ctx);
         return -1;
     }
-    if (status / 100 != 2) {
-        callback("[claude] HTTP ", 14, ctx);
-        char codebuf[8];
-        int n = 0; int v = status;
-        if (v == 0) codebuf[n++] = '0';
-        else { char tmp[8]; int t = 0; while (v) { tmp[t++] = '0' + v % 10; v /= 10; }
-               while (t) codebuf[n++] = tmp[--t]; }
-        codebuf[n++] = ':';
-        codebuf[n++] = ' ';
-        codebuf[n] = '\0';
-        callback(codebuf, n, ctx);
-        if (resp) callback((const char *)resp, len, ctx);
-        callback("\n", 1, ctx);
-        extern void free(void *); if (resp) free(resp);
-        return -1;
-    }
-
-    /* 5. Parse JSON, extract assistant text. */
-    static char text[16 * 1024];
-    int tlen = extract_assistant_text((const char *)resp, text, sizeof(text));
-    extern void free(void *); free(resp);
-
-    if (tlen <= 0) {
-        const char *m = "[claude] could not parse response\n";
-        callback(m, 33, ctx);
-        return -1;
-    }
-
-    /* 6. Stream to caller. */
-    callback(text, (uint32_t)tlen, ctx);
 
     /* 7. Append assistant turn to history for next call. */
     if (cs->len < CLAUDE_HISTORY_MAX - 1) cs->buf[cs->len++] = ',';
@@ -2724,6 +2747,97 @@ int wasm_ws_recv_wait(int handle, void *dst, int max, int timeout_ms)
 }
 
 void wasm_ws_close(int handle) { js_ws_close(handle); }
+
+/* ══════════════════════════════════════════════════════════════
+ *  Streaming HTTP/SSE — for the claude REPL.
+ *
+ *  fetch() with stream parsing happens in JS; chunks land in a
+ *  JS-side queue (similar shape to ws_recv_drain). C polls for chunks
+ *  via js_stream_drain and emits them through the callback as they
+ *  arrive, instead of waiting for the full response.
+ *
+ *  Anthropic SSE format:
+ *    event: content_block_delta
+ *    data: {"type":"content_block_delta","delta":{"type":"text_delta",
+ *           "text":"..."}}
+ *  We extract delta.text from each event.
+ * ══════════════════════════════════════════════════════════════ */
+
+EM_JS(int, js_stream_kick, (const char *url, const char *headers_json,
+                             const char *body), {
+    var u = UTF8ToString(url);
+    var hj = headers_json ? UTF8ToString(headers_json) : '';
+    var b = body ? UTF8ToString(body) : null;
+    var hdrs = {};
+    if (hj) { try { hdrs = JSON.parse(hj); } catch (e) { hdrs = {}; } }
+    window.__streamDone = false;
+    window.__streamQ = [];           /* array of strings (SSE data fields) */
+    window.__streamStatus = 0;
+    window.__streamError = null;
+
+    var opts = { method: 'POST', headers: hdrs };
+    if (b !== null) opts.body = b;
+    fetch(u, opts).then(function(r) {
+        window.__streamStatus = r.status;
+        if (!r.body) {
+            window.__streamDone = true;
+            return;
+        }
+        var reader = r.body.getReader();
+        var dec = new TextDecoder();
+        var partial = '';
+        function pump() {
+            return reader.read().then(function(res) {
+                if (res.done) { window.__streamDone = true; return; }
+                partial += dec.decode(res.value, { stream: true });
+                /* Split on double-newline (SSE event boundary) */
+                var parts = partial.split('\n\n');
+                partial = parts.pop();
+                for (var i = 0; i < parts.length; i++) {
+                    var ev = parts[i];
+                    /* Only keep lines starting with 'data: ' */
+                    var lines = ev.split('\n');
+                    for (var j = 0; j < lines.length; j++) {
+                        var ln = lines[j];
+                        if (ln.indexOf('data: ') === 0) {
+                            window.__streamQ.push(ln.substring(6));
+                        }
+                    }
+                }
+                return pump();
+            });
+        }
+        pump();
+    }).catch(function(e) {
+        window.__streamError = String(e);
+        window.__streamDone = true;
+    });
+    return 0;
+});
+
+EM_JS(int, js_stream_done,    (), { return window.__streamDone ? 1 : 0; });
+EM_JS(int, js_stream_status,  (), { return window.__streamStatus | 0; });
+EM_JS(int, js_stream_q_size,  (), {
+    return window.__streamQ ? window.__streamQ.length : 0;
+});
+/* Pop the head of the queue into dst (NUL-terminated). Returns bytes
+ * written including NUL, or 0 if queue empty. */
+EM_JS(int, js_stream_q_pop, (char *dst, int max), {
+    var q = window.__streamQ;
+    if (!q || q.length === 0) return 0;
+    var s = q.shift();
+    var bytes = lengthBytesUTF8(s) + 1;
+    if (bytes > max) bytes = max;
+    stringToUTF8(s, dst, bytes);
+    return bytes;
+});
+EM_JS(int, js_stream_error, (char *dst, int max), {
+    var s = window.__streamError || '';
+    var bytes = lengthBytesUTF8(s) + 1;
+    if (bytes > max) bytes = max;
+    stringToUTF8(s, dst, bytes);
+    return s ? bytes - 1 : 0;
+});
 
 /* Synchronous HTTP — suspends via Asyncify until the Promise resolves.
  * Allocates the body buffer; caller must free.
