@@ -40,10 +40,11 @@ EMFLAGS := \
     -s INITIAL_MEMORY=536870912 \
     -s STACK_SIZE=1048576 \
     -s MAIN_MODULE=1 \
+    -s EMULATE_FUNCTION_POINTER_CASTS=1 \
     -Wl,--allow-multiple-definition \
     -s ASYNCIFY=1 \
     -s 'ASYNCIFY_IMPORTS=["emscripten_sleep"]' \
-    -s 'EXPORTED_FUNCTIONS=["_main","_wasm_kb_push","_wasm_get_mem_used_kb","_wasm_compositor_frame","_input_set_mouse_abs","_input_post_mouse_button"]' \
+    -s 'EXPORTED_FUNCTIONS=["_main","_wasm_kb_push","_wasm_get_mem_used_kb","_wasm_compositor_frame","_input_set_mouse_abs","_input_post_mouse_button","_osito_chat_sync"]' \
     -s 'EXPORTED_RUNTIME_METHODS=["ccall","cwrap"]' \
     --shell-file shell.html
 

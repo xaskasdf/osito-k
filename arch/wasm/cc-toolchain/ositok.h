@@ -58,6 +58,23 @@ static inline void oi_log_kernel(const char *s) {
     oi_log_kernel_raw(s, (uint32_t)n);
 }
 
+/* Synchronous chat with the OsitoK in-kernel LLM (SmolLM2-135M etc.).
+ * Worker blocks via Atomics.wait while the kernel main thread runs
+ * inference (1-5s typical). Returns bytes written to `out` or -1.
+ * Requires cross-origin isolation (SharedArrayBuffer) — serve the
+ * page with COOP=same-origin + COEP=credentialless (see arch/wasm/serve.py). */
+__attribute__((import_module("osito_env"), import_name("oi_chat")))
+extern int32_t oi_chat_raw(const char *prompt, uint32_t prompt_len,
+                           char *out, uint32_t max_out);
+
+static inline int32_t oi_chat(const char *prompt, char *out, uint32_t max_out) {
+    size_t n = 0;
+    while (n < 4096 && prompt[n]) n++;
+    int32_t r = oi_chat_raw(prompt, (uint32_t)n, out, max_out);
+    if (r >= 0 && (uint32_t)r < max_out) out[r] = 0;
+    return r;
+}
+
 #ifdef __cplusplus
 }
 #endif

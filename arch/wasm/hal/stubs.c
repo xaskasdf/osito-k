@@ -841,6 +841,70 @@ void kexec_trampoline_end(void) {}
 
 void *prompt_llama = NULL;
 
+/* ── osito_chat_sync: kernel-side chat for the worker bridge ─────
+ *
+ * Invoked from JS via Module.ccall when the user wasm program calls
+ * oi_chat(...) and the worker postMessages 'osito-chat'. Synchronous
+ * (blocks main thread for 1-5s). Output stored in a static buffer
+ * whose pointer we return — JS reads it back as a string. */
+
+/* Avoid the function-pointer indirect-call to llama_chat (MAIN_MODULE
+ * function-table issues): route through shell_exec("chat ...") and
+ * capture the output via the existing shell redirect mechanism. */
+
+#define OSITO_CHAT_OUT 8192
+static char osito_chat_buf[OSITO_CHAT_OUT];
+
+/* shell.c statics we hijack temporarily */
+extern char    *redir_buf;
+extern uint32_t redir_pos;
+extern uint32_t redir_max;
+typedef void (*sh_redir_fn_t)(const char *, size_t);
+extern sh_redir_fn_t sh_redir_fn;
+extern void redir_capture(const char *s, size_t len);
+
+EMSCRIPTEN_KEEPALIVE
+const char *osito_chat_sync(const char *prompt)
+{
+    osito_chat_buf[0] = 0;
+    if (!prompt_llama) {
+        const char *m = "[oi_chat] no model loaded";
+        memcpy(osito_chat_buf, m, strlen(m) + 1);
+        return osito_chat_buf;
+    }
+
+    /* Save shell redirect state */
+    char    *sb_buf = redir_buf;
+    uint32_t sb_pos = redir_pos;
+    uint32_t sb_max = redir_max;
+    sh_redir_fn_t sb_fn = sh_redir_fn;
+
+    /* Hijack: capture into osito_chat_buf */
+    redir_buf  = osito_chat_buf;
+    redir_pos  = 0;
+    redir_max  = OSITO_CHAT_OUT - 1;
+    sh_redir_fn = redir_capture;
+
+    /* Build "chat <prompt>" command (mutable copy — shell_exec writes). */
+    char cmdline[2048];
+    cmdline[0] = 0;
+    strncat(cmdline, "chat ", sizeof(cmdline) - 1);
+    if (prompt) strncat(cmdline, prompt, sizeof(cmdline) - 1 - strlen(cmdline));
+
+    extern void shell_exec(char *line);
+    shell_exec(cmdline);
+
+    osito_chat_buf[redir_pos] = 0;
+
+    /* Restore */
+    redir_buf  = sb_buf;
+    redir_pos  = sb_pos;
+    redir_max  = sb_max;
+    sh_redir_fn = sb_fn;
+
+    return osito_chat_buf;
+}
+
 /* ──────────────────────────────────────────────────────────────────
  * Stubs for x86 subsystems added since 2026-04-01.
  * Symbols referenced from shell.c / compositor.c / inference.c (which

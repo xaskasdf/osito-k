@@ -167,7 +167,8 @@ static inline void sh_halt(void)   { __asm__ volatile ("cli"); for (;;) __asm__ 
 /* ── Shell output helpers ────────────────────────────────────── */
 
 /* Output redirect hook (set by shell_exec for > and >> operators) */
-static void (*sh_redir_fn)(const char *s, size_t len);
+/* Non-static so wasm cmd_osito_chat_sync can hijack temporarily. */
+void (*sh_redir_fn)(const char *s, size_t len);
 
 /* Pipe input — set by the pipeline driver to feed previous stage's
  * captured output as virtual stdin for the next stage.  Only consumed
@@ -464,8 +465,18 @@ static void cmd_ls(void)
 
 static void cmd_cat(int argc, char *argv[])
 {
+    /* No filename: route piped/redirected stdin to stdout (so
+     * `echo hi | cat`, `cat < file`, and `cat << EOF` work). */
     if (argc < 2) {
-        sh_puts("Usage: cat <filename>\n");
+        if (sh_stdin_buf && sh_stdin_len > 0) {
+            char one[2] = {0, 0};
+            for (uint32_t i = 0; i < sh_stdin_len; i++) {
+                one[0] = sh_stdin_buf[i];
+                sh_puts(one);
+            }
+            return;
+        }
+        sh_puts("Usage: cat <filename>  (or pipe/redirect/heredoc into cat)\n");
         return;
     }
 
@@ -2431,12 +2442,13 @@ static void parse_redirects(int *argc, char *argv[], redir_t *r)
     *argc = new_argc;
 }
 
-/* Captured output buffer for redirection */
-static char    *redir_buf;
-static uint32_t redir_pos;
-static uint32_t redir_max;
+/* Captured output buffer for redirection. Non-static so wasm
+ * osito_chat_sync can hijack temporarily to capture chat output. */
+char    *redir_buf;
+uint32_t redir_pos;
+uint32_t redir_max;
 
-static void redir_capture(const char *s, size_t len)
+void redir_capture(const char *s, size_t len)
 {
     for (size_t i = 0; i < len; i++) {
         if (redir_pos < redir_max - 1)

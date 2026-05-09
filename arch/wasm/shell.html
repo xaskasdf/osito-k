@@ -260,6 +260,61 @@
             });
     })();
 
+    // ── OsitoK worker→kernel sync bridge (oi_chat) ──────────────
+    //
+    // SharedArrayBuffer + Atomics.wait lets the cc-worker block on
+    // a kernel-side LLM inference (window.__osito.chat) without
+    // freezing the page. Layout (Int32 indices):
+    //   [0] = state (0 idle, 1 request, 2 response, 3 error)
+    //   [1] = prompt length (bytes)
+    //   [2] = response length (bytes)
+    //   [16..16+4096) = prompt bytes (max 4 KB)
+    //   [16+4096..end) = response bytes
+    // Total SAB size = 16 + 4096 + 8192 = 12304 bytes.
+    window.__osito = window.__osito || {};
+    const __OSITO_SAB_SIZE = 16 + 4096 + 8192;
+    const __OSITO_PROMPT_OFF = 16;
+    const __OSITO_PROMPT_MAX = 4096;
+    const __OSITO_RESP_OFF = 16 + 4096;
+    const __OSITO_RESP_MAX = 8192;
+    let   __ositoSab = null;
+
+    window.__osito.chat = async function(prompt) {
+        if (!Module || !Module.ccall) return '[oi_chat] runtime not ready';
+        try {
+            return Module.ccall('osito_chat_sync', 'string', ['string'], [prompt]);
+        } catch (e) {
+            return '[oi_chat] ' + e.message;
+        }
+    };
+
+    function __ositoBindWorkerPort(port) {
+        if (typeof SharedArrayBuffer === 'undefined') {
+            console.warn('[osito] SharedArrayBuffer not available — oi_chat will fail.',
+                'Serve with COOP=same-origin + COEP=credentialless (see arch/wasm/serve.py).');
+            return null;
+        }
+        if (!__ositoSab) __ositoSab = new SharedArrayBuffer(__OSITO_SAB_SIZE);
+        const i32 = new Int32Array(__ositoSab);
+        port.postMessage({ id: 'osito-bind', sab: __ositoSab });
+        port.addEventListener('message', async (e) => {
+            if (!e.data || e.data.id !== 'osito-chat-request') return;
+            const promptLen = i32[1];
+            const promptBytes = new Uint8Array(__ositoSab, __OSITO_PROMPT_OFF, promptLen);
+            const prompt = new TextDecoder().decode(promptBytes);
+            let resultStr;
+            try { resultStr = await window.__osito.chat(prompt); }
+            catch (err) { resultStr = '[oi_chat error] ' + (err.message || err); }
+            const resBytes = new TextEncoder().encode(resultStr);
+            const n = Math.min(resBytes.length, __OSITO_RESP_MAX - 1);
+            new Uint8Array(__ositoSab, __OSITO_RESP_OFF, n).set(resBytes.subarray(0, n));
+            i32[2] = n;
+            Atomics.store(i32, 0, 2);
+            Atomics.notify(i32, 0);
+        });
+        port.start && port.start();
+    }
+
     // ── In-browser C/C++ compiler (clang.wasm + lld.wasm) ────────
     //
     // Lazy-loads a worker that runs binji/wasm-clang against the toolchain
@@ -327,6 +382,15 @@
             let api, port;
             let ositokH = null;  /* lazy-loaded ositok.h text */
 
+            /* OsitoK kernel-bridge plumbing (oi_chat). On constructor the
+             * main thread sends an MessagePort tied to a SAB. The App's
+             * oi_chat import (defined in shared.js, runs in this worker
+             * context) reads self.ositoSab + self.ositoPort + self.ositoI32,
+             * so we assign onto self/globalThis directly. */
+            self.ositoPort = null;
+            self.ositoSab  = null;
+            self.ositoI32  = null;
+
             const opts = {
                 clang: T + '/clang.wasm', lld: T + '/lld.wasm',
                 sysroot: T + '/sysroot.tar', memfs: T + '/memfs.wasm',
@@ -335,6 +399,17 @@
                 hostWrite(s) { port && port.postMessage({ id: 'write', data: s }); }
             };
             self.onmessage = async (e) => {
+                if (e.data && e.data.id === 'osito-port') {
+                    self.ositoPort = e.data.port;
+                    self.ositoPort.onmessage = (ev) => {
+                        if (ev.data && ev.data.id === 'osito-bind') {
+                            self.ositoSab = ev.data.sab;
+                            self.ositoI32 = new Int32Array(self.ositoSab);
+                        }
+                    };
+                    self.ositoPort.start && self.ositoPort.start();
+                    return;
+                }
                 if (e.data.id === 'constructor') {
                     port = e.data.data;
                     port.onmessage = self.onmessage;
@@ -441,6 +516,12 @@
                 };
             });
             worker.postMessage({ id: 'constructor', data: ch.port2 }, [ch.port2]);
+            /* Bind a separate channel for the oi_chat sync bridge (SAB
+             * + Atomics.wait). The cc-worker uses port2 of THIS channel
+             * to request kernel inference. */
+            const oc = new MessageChannel();
+            __ositoBindWorkerPort(oc.port1);
+            worker.postMessage({ id: 'osito-port', port: oc.port2 }, [oc.port2]);
             return ready;
         }
 

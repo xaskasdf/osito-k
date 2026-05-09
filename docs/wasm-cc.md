@@ -178,8 +178,49 @@ Libs en `/lib/wasm32-wasi/`:
 - [x] ~~**Kernel-bridge imports**~~ ✅ done — `osito_env` import module with `oi_random_u32`, `oi_now_us`, `oi_log_kernel`. App constructor adds it to the WebAssembly imports table; ositok.h declares them with `__attribute__((import_module/import_name))`. Compiled programs link via `wasm-ld --allow-undefined`; runtime resolves them in the worker's App instance.
 - [x] ~~**Heredoc `<< EOF`**~~ ✅ done — shell main loop detects `<<TERM` in the command line, accumulates lines until terminator, feeds via `sh_stdin_buf`. Body cap 64KB.
 - [x] ~~**`cc -c`** compile-only~~ ✅ done — produces `.o` (auto-named `<basename>.o` if no `-o`).
-- [ ] **Real `oi_chat`** that calls back to the kernel main thread (LLM inference). Needs SharedArrayBuffer + Atomics.wait or a synchronous bridge.
-- [ ] **`cat` / `head` / `tail` reading from stdin** when no filename arg.
+- [~] **Real `oi_chat`** — bridge plumbing complete (SharedArrayBuffer +
+      Atomics.wait + worker→main MessagePort + COOP/COEP server +
+      `osito_env.oi_chat` import + `osito_chat_sync` C export). Final
+      step blocked: `Module.ccall('osito_chat_sync')` enters `llama_chat`
+      from JS context, which hits a "null function" indirect-call error
+      under `MAIN_MODULE=1` even with `EMULATE_FUNCTION_POINTER_CASTS=1`.
+      Asyncify scope mismatch suspected. From the shell prompt
+      `chat <prompt>` works fine — only the JS→C ccall entry breaks.
+      Workarounds to try: (a) flag-poll bridge where the kernel C side
+      checks the SAB inside its `term_readline → emscripten_sleep` loop,
+      avoiding ccall entirely; (b) `addFunction` to register the chat
+      callback at runtime; (c) audit `ASYNCIFY_REMOVE` for misclassified
+      sync functions.
+- [x] ~~**`cat`/`head`/`tail` reading from stdin**~~ ✅ done — `cat` reads
+      from `sh_stdin_buf` when no filename arg; `head`/`tail`/`grep`
+      already supported it.
+- [ ] **Sandboxed `chat` REPL inside user wasm** — once oi_chat works,
+      compose into a multi-turn loop.
+
+## Servidor con cross-origin isolation
+
+`oi_chat` requiere `SharedArrayBuffer` para el sync bridge entre worker
+(donde corre el user wasm) y main thread (donde corre la inferencia
+LLM). Eso requiere COOP+COEP headers que `python -m http.server` no
+manda.
+
+Use el wrapper en `arch/wasm/serve.py` (default puerto 8000):
+
+```bash
+cd arch/wasm/build
+python3 ../serve.py [port]
+```
+
+Manda:
+- `Cross-Origin-Opener-Policy: same-origin`
+- `Cross-Origin-Embedder-Policy: credentialless`
+
+`credentialless` permite fetches cross-origin sin cookies sin requerir
+`Cross-Origin-Resource-Policy` en cada respuesta — útil para los assets
+de R2.
+
+Verificar en consola: `crossOriginIsolated === true` y
+`typeof SharedArrayBuffer !== 'undefined'`.
 
 ## Configuración / referencias
 
