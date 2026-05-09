@@ -4805,5 +4805,12 @@ void __cold shell_run(void)
 
         /* Poll network between commands */
         net_poll();
+
+#ifdef __EMSCRIPTEN__
+        /* Flush dirty FS image to IndexedDB after each command so
+         * git commits, file edits, and cc outputs survive reload. */
+        extern void wasm_persist_flush(void);
+        wasm_persist_flush();
+#endif
     }
 }

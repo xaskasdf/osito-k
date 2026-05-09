@@ -424,9 +424,89 @@ int nvme_read_bytes(uint64_t offset, void *buf, uint64_t len) {
     return 0;
 }
 
+/* Persistence — every write marks the image dirty; a coalesced flush
+ * pushes the whole buffer to IndexedDB. We rely on the kernel's
+ * cooperative scheduler + Asyncify yields to call wasm_persist_flush
+ * periodically (kicked from the shell main loop after each command). */
+static bool g_nvme_dirty = false;
+
+EM_JS(void, js_persist_save, (const uint8_t *buf, int len), {
+    var u8 = HEAPU8.slice(buf, buf + len).slice();
+    var req = indexedDB.open('osito-fs', 1);
+    req.onupgradeneeded = function() {
+        req.result.createObjectStore('img');
+    };
+    req.onsuccess = function() {
+        var db = req.result;
+        var tx = db.transaction('img', 'readwrite');
+        tx.objectStore('img').put(u8, 'main');
+        tx.oncomplete = function() { db.close(); };
+        tx.onerror = function() { db.close(); };
+    };
+});
+
+EM_JS(int, js_persist_load_kick, (), {
+    window.__persistDone = false;
+    window.__persistBuf = null;
+    var req = indexedDB.open('osito-fs', 1);
+    req.onupgradeneeded = function() {
+        req.result.createObjectStore('img');
+    };
+    req.onsuccess = function() {
+        var db = req.result;
+        var tx = db.transaction('img');
+        var g = tx.objectStore('img').get('main');
+        g.onsuccess = function() {
+            window.__persistBuf = g.result || null;
+            window.__persistDone = true;
+            db.close();
+        };
+        g.onerror = function() { window.__persistDone = true; db.close(); };
+    };
+    req.onerror = function() { window.__persistDone = true; };
+    return 0;
+});
+
+EM_JS(int, js_persist_done, (), { return window.__persistDone ? 1 : 0; });
+EM_JS(int, js_persist_size, (), {
+    return window.__persistBuf ? window.__persistBuf.byteLength : 0;
+});
+EM_JS(void, js_persist_copy, (uint8_t *dst, int max), {
+    var src = window.__persistBuf;
+    if (!src) return;
+    var n = src.byteLength < max ? src.byteLength : max;
+    HEAPU8.set(src.subarray(0, n), dst);
+});
+
+/* Public API: try to load the persisted image into wasm_nvme_buf.
+ * Returns the size loaded, or 0 if no snapshot or buffer too small. */
+int wasm_persist_load(void)
+{
+    js_persist_load_kick();
+    while (!js_persist_done()) emscripten_sleep(20);
+    int sz = js_persist_size();
+    if (sz <= 0 || !wasm_nvme_buf) return 0;
+    if ((uint64_t)sz > wasm_nvme_size) return 0;
+    js_persist_copy(wasm_nvme_buf, sz);
+    serial_puts("[persist] restored ");
+    serial_putdec((uint64_t)sz);
+    serial_puts(" bytes from IndexedDB\n");
+    return sz;
+}
+
+/* Push the dirty image back to IndexedDB. Async (no Asyncify wait —
+ * we don't need to block on writes). */
+void wasm_persist_flush(void)
+{
+    if (!g_nvme_dirty || !wasm_nvme_buf) return;
+    js_persist_save(wasm_nvme_buf, (int)wasm_nvme_size);
+    g_nvme_dirty = false;
+}
+
 int nvme_write_bytes(uint64_t offset, const void *buf, uint64_t len) {
     if (!wasm_nvme_buf || offset + len > wasm_nvme_size) return -1;
     memcpy(wasm_nvme_buf + offset, buf, (size_t)len);
+    g_nvme_dirty = true;
     return 0;
 }
 

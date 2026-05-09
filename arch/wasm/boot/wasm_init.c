@@ -199,6 +199,13 @@ static void load_filesystem(void)
     /* Set as NVMe backend for OsitoFS */
     wasm_nvme_set_buffer(buf, (uint64_t)sz);
 
+    /* Restore from IndexedDB if a snapshot exists. This overwrites
+     * the freshly-fetched image with the user's prior state, so any
+     * git commits, edited files, or `cc -o` outputs from the last
+     * session survive a page reload. */
+    extern int wasm_persist_load(void);
+    wasm_persist_load();
+
     /* Mount OsitoFS (partition offset 0 = raw image, no GPT) */
     if (osfs2_mount(0) < 0) {
         serial_puts("[WASM] OsitoFS mount failed\n\n");
