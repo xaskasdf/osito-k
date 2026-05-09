@@ -148,6 +148,8 @@ extern void llama_set_penalty(float rep, float presence, float frequency);
 extern void llama_get_penalty(float *rep, float *presence, float *frequency);
 extern void brandon_set_features(int dwa, int v_residual, int registers);
 extern void brandon_set_debug_logits(int on);
+extern void     llama_set_ngram_size(uint32_t n);
+extern uint32_t llama_get_ngram_size(void);
 
 /* ── WASM-compatibility shims ────────────────────────────────── */
 #ifdef __EMSCRIPTEN__
@@ -3224,6 +3226,21 @@ void shell_exec(char *line)
         cmd_rag(argc, argv);
     } else if (strcmp(cmd, "penalty") == 0) {
         cmd_penalty(argc, argv);
+    } else if (strcmp(cmd, "ngram") == 0) {
+        if (argc < 2) {
+            sh_puts("Usage: ngram <size>   (0=off, 3=balanced, 4=strict)\n");
+            sh_puts("Current: ");
+            sh_putdec(llama_get_ngram_size());
+            sh_puts("\n");
+        } else {
+            int v = 0;
+            const char *s = argv[1];
+            while (*s >= '0' && *s <= '9') { v = v * 10 + (*s - '0'); s++; }
+            llama_set_ngram_size((uint32_t)v);
+            sh_puts("ngram size set to ");
+            sh_putdec((uint64_t)v);
+            sh_puts("\n");
+        }
     } else if (strcmp(cmd, "bdebug") == 0) {
         if (argc < 2) {
             sh_puts("Usage: bdebug <dwa|vr|reg|logits|all|none> [0|1]\n");

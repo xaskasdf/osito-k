@@ -1627,14 +1627,24 @@ static float g_top_p = 0.9f;
  * Standard "balanced de-repetition" recipe: rep=1.10 + freq=0.05.
  * Values default to identity so existing chat behavior is unchanged
  * until `penalty` is run from the shell.                             */
-static float g_rep_penalty       = 1.0f;   /* >1 = penalize */
-static float g_presence_penalty  = 0.0f;
-static float g_frequency_penalty = 0.0f;
+static float    g_rep_penalty       = 1.0f;   /* >1 = penalize */
+static float    g_presence_penalty  = 0.0f;
+static float    g_frequency_penalty = 0.0f;
 
-#define LLAMA_RECENT_TOKENS 64
+/* no_repeat_ngram_size: HuggingFace-style structural blocker. When >=2,
+ * any token T that would produce an N-gram (last_N-1 + T) already seen
+ * in the window has its logit forced to -inf so it can never be picked.
+ * 0 = disabled, 3 = balanced (matches brandon-tiny test_generation.py). */
+static uint32_t g_no_repeat_ngram = 0;
+
+#define LLAMA_RECENT_TOKENS 256       /* window for both penalty + ngram */
 static uint32_t g_recent_buf[LLAMA_RECENT_TOKENS];
 static uint32_t g_recent_count = 0;
 static uint32_t g_recent_head  = 0;
+/* Linear-order copy of the generation history for ngram lookup.
+ * recent_buf is a ring; ngram_buf is rebuilt linearly. */
+static uint32_t g_ngram_buf[LLAMA_RECENT_TOKENS];
+static uint32_t g_ngram_count = 0;
 
 void llama_set_sampling(float temperature, float top_p)
 {
@@ -1664,10 +1674,14 @@ void llama_get_penalty(float *rep, float *presence, float *frequency)
     if (frequency) *frequency = g_frequency_penalty;
 }
 
+void     llama_set_ngram_size(uint32_t n) { g_no_repeat_ngram = n; }
+uint32_t llama_get_ngram_size(void)       { return g_no_repeat_ngram; }
+
 static void recent_reset(void)
 {
     g_recent_count = 0;
     g_recent_head  = 0;
+    g_ngram_count  = 0;
 }
 
 static void recent_push(uint32_t tok)
@@ -1675,6 +1689,42 @@ static void recent_push(uint32_t tok)
     g_recent_buf[g_recent_head] = tok;
     g_recent_head = (g_recent_head + 1) % LLAMA_RECENT_TOKENS;
     if (g_recent_count < LLAMA_RECENT_TOKENS) g_recent_count++;
+
+    /* Linear ngram buffer — drop the oldest token if full so the
+     * window slides over the most recent N tokens. */
+    if (g_ngram_count == LLAMA_RECENT_TOKENS) {
+        for (uint32_t i = 0; i < LLAMA_RECENT_TOKENS - 1; i++)
+            g_ngram_buf[i] = g_ngram_buf[i + 1];
+        g_ngram_buf[LLAMA_RECENT_TOKENS - 1] = tok;
+    } else {
+        g_ngram_buf[g_ngram_count++] = tok;
+    }
+}
+
+/* no_repeat_ngram: scan the linear history for any (n-1)-gram that
+ * matches the trailing (n-1) tokens of g_ngram_buf. For each match,
+ * the token at position [match + n-1] is forbidden — set its logit
+ * to -INF so sampling never chooses it. */
+static void apply_no_repeat_ngram(float *logits, uint32_t vocab)
+{
+    uint32_t n = g_no_repeat_ngram;
+    if (n < 2 || g_ngram_count < n) return;
+
+    uint32_t prefix = n - 1;
+    const uint32_t *tail = &g_ngram_buf[g_ngram_count - prefix];
+    /* Slide a window of length n over the history; when the first
+     * (n-1) tokens of the window match the tail, the n-th token is
+     * banned. */
+    for (uint32_t i = 0; i + n <= g_ngram_count; i++) {
+        bool match = true;
+        for (uint32_t j = 0; j < prefix; j++) {
+            if (g_ngram_buf[i + j] != tail[j]) { match = false; break; }
+        }
+        if (match) {
+            uint32_t banned = g_ngram_buf[i + prefix];
+            if (banned < vocab) logits[banned] = -1e30f;
+        }
+    }
 }
 
 /* Apply rep + presence + frequency penalties to logits in place over
@@ -1718,6 +1768,7 @@ static void apply_penalties(float *logits, uint32_t n)
 static uint32_t sample_next(float *logits, uint32_t vocab_size)
 {
     apply_penalties(logits, vocab_size);
+    apply_no_repeat_ngram(logits, vocab_size);
     return sample_topp(logits, vocab_size, g_temperature, g_top_p);
 }
 
