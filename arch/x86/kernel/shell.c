@@ -1500,6 +1500,34 @@ extern int wasm_http_request(const char *url, const char *method,
                               const char *headers_json, const char *body,
                               uint8_t **out_buf, int *out_len);
 extern void free(void *);
+
+extern int  wasm_ws_open(const char *url);
+extern int  wasm_ws_state(int handle);
+extern int  wasm_ws_wait_open(int handle, int timeout_ms);
+extern int  wasm_ws_send(int handle, const void *data, int len);
+extern int  wasm_ws_recv_wait(int handle, void *dst, int max, int timeout_ms);
+extern void wasm_ws_close(int handle);
+
+/* Per-shell WS handle table — small fixed slots indexed by integer.
+ * Users can name a connection ('ws open <url> myws') for nicer UX. */
+#define WS_SLOT_MAX 8
+typedef struct { int handle; char name[16]; } ws_slot_t;
+static ws_slot_t ws_slots[WS_SLOT_MAX];
+
+static ws_slot_t *ws_slot_find(const char *name)
+{
+    for (int i = 0; i < WS_SLOT_MAX; i++)
+        if (ws_slots[i].handle && strcmp(ws_slots[i].name, name) == 0)
+            return &ws_slots[i];
+    return NULL;
+}
+
+static ws_slot_t *ws_slot_alloc(void)
+{
+    for (int i = 0; i < WS_SLOT_MAX; i++)
+        if (!ws_slots[i].handle) return &ws_slots[i];
+    return NULL;
+}
 #endif
 
 static void cmd_curl(int argc, char *argv[])
@@ -3412,6 +3440,125 @@ void shell_exec(char *line)
     } else if (strcmp(cmd, "penalty") == 0) {
         cmd_penalty(argc, argv);
 #ifdef __EMSCRIPTEN__
+    } else if (strcmp(cmd, "ws") == 0) {
+        if (argc < 2) {
+            sh_puts("Usage: ws <open|send|recv|close|list> [args...]\n");
+            sh_puts("  ws open <url> [name]    open WebSocket (default name 'ws')\n");
+            sh_puts("  ws send <name> <data>   send a text frame\n");
+            sh_puts("  ws recv <name> [ms]     wait up to ms for a message (default 2000)\n");
+            sh_puts("  ws close <name>         close the connection\n");
+            sh_puts("  ws list                 show open connections\n");
+        } else if (strcmp(argv[1], "open") == 0) {
+            if (argc < 3) { sh_puts("Usage: ws open <url> [name]\n"); }
+            else {
+                const char *name = argc >= 4 ? argv[3] : "ws";
+                if (ws_slot_find(name)) {
+                    sh_puts("Slot already in use. Use a different name or 'ws close'.\n");
+                } else {
+                    ws_slot_t *slot = ws_slot_alloc();
+                    if (!slot) { sh_puts("No free WS slots.\n"); }
+                    else {
+                        int h = wasm_ws_open(argv[2]);
+                        if (h <= 0) { sh_puts_color("[ws] open failed\n", 0x00FF0000); }
+                        else if (wasm_ws_wait_open(h, 5000) < 0) {
+                            sh_puts_color("[ws] handshake failed/timeout\n", 0x00FF0000);
+                            wasm_ws_close(h);
+                        } else {
+                            slot->handle = h;
+                            int n = 0;
+                            while (n < 15 && name[n]) { slot->name[n] = name[n]; n++; }
+                            slot->name[n] = '\0';
+                            sh_puts_color("[ws] connected as '", 0x0000FF00);
+                            sh_puts(slot->name); sh_puts("'\n");
+                        }
+                    }
+                }
+            }
+        } else if (strcmp(argv[1], "send") == 0) {
+            if (argc < 4) { sh_puts("Usage: ws send <name> <data...>\n"); }
+            else {
+                ws_slot_t *slot = ws_slot_find(argv[2]);
+                if (!slot) { sh_puts("Unknown WS name.\n"); }
+                else {
+                    /* Reassemble argv[3..] with single spaces */
+                    char buf[2048]; int p = 0;
+                    for (int i = 3; i < argc && p < (int)sizeof(buf) - 1; i++) {
+                        if (i > 3 && p < (int)sizeof(buf) - 1) buf[p++] = ' ';
+                        const char *w = argv[i];
+                        while (*w && p < (int)sizeof(buf) - 1) buf[p++] = *w++;
+                    }
+                    buf[p] = '\0';
+                    int rc = wasm_ws_send(slot->handle, buf, p);
+                    if (rc < 0) sh_puts_color("[ws] send failed\n", 0x00FF0000);
+                    else { sh_puts("[ws] sent "); sh_putdec((uint64_t)rc); sh_puts(" bytes\n"); }
+                }
+            }
+        } else if (strcmp(argv[1], "recv") == 0) {
+            if (argc < 3) { sh_puts("Usage: ws recv <name> [timeout_ms]\n"); }
+            else {
+                ws_slot_t *slot = ws_slot_find(argv[2]);
+                if (!slot) { sh_puts("Unknown WS name.\n"); }
+                else {
+                    int timeout = 2000;
+                    if (argc >= 4) {
+                        timeout = 0;
+                        const char *s = argv[3];
+                        while (*s >= '0' && *s <= '9') { timeout = timeout*10 + (*s - '0'); s++; }
+                    }
+                    static char rxbuf[8192];
+                    int n = wasm_ws_recv_wait(slot->handle, rxbuf, sizeof(rxbuf) - 1, timeout);
+                    if (n < 0) sh_puts_color("[ws] connection closed\n", 0x00FF0000);
+                    else if (n == 0) sh_puts("[ws] timeout, no data\n");
+                    else {
+                        rxbuf[n] = '\0';
+                        sh_puts("[ws] "); sh_putdec((uint64_t)n); sh_puts(" bytes:\n");
+                        /* chunk-stream */
+                        char chunk[256];
+                        int i = 0;
+                        while (i < n) {
+                            int k = n - i; if (k > 255) k = 255;
+                            for (int j = 0; j < k; j++) chunk[j] = rxbuf[i+j];
+                            chunk[k] = '\0';
+                            sh_puts(chunk);
+                            i += k;
+                        }
+                        sh_puts("\n");
+                    }
+                }
+            }
+        } else if (strcmp(argv[1], "close") == 0) {
+            if (argc < 3) { sh_puts("Usage: ws close <name>\n"); }
+            else {
+                ws_slot_t *slot = ws_slot_find(argv[2]);
+                if (!slot) { sh_puts("Unknown WS name.\n"); }
+                else {
+                    wasm_ws_close(slot->handle);
+                    slot->handle = 0; slot->name[0] = '\0';
+                    sh_puts("[ws] closed\n");
+                }
+            }
+        } else if (strcmp(argv[1], "list") == 0) {
+            int any = 0;
+            for (int i = 0; i < WS_SLOT_MAX; i++) {
+                if (ws_slots[i].handle) {
+                    int s = wasm_ws_state(ws_slots[i].handle);
+                    const char *name_state =
+                        s == 0 ? "connecting" :
+                        s == 1 ? "open" :
+                        s == 2 ? "closing" :
+                        s == 3 ? "closed" : "error";
+                    sh_puts("  ");
+                    sh_puts(ws_slots[i].name);
+                    sh_puts(" — ");
+                    sh_puts(name_state);
+                    sh_puts("\n");
+                    any = 1;
+                }
+            }
+            if (!any) sh_puts("(no open WS connections)\n");
+        } else {
+            sh_puts("Unknown ws subcommand.\n");
+        }
     } else if (strcmp(cmd, "mount-fs") == 0) {
         if (argc < 3) {
             sh_puts("Usage: mount-fs <type> <url>\n");

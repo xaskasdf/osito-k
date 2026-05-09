@@ -2250,6 +2250,170 @@ EM_JS(int, js_http_error, (char *dst, int max), {
     return s ? bytes - 1 : 0;
 });
 
+/* ══════════════════════════════════════════════════════════════
+ *  WebSocket bridge — gives the kernel a packet-oriented socket
+ *  to anywhere wss:// reachable from the browser. Connection
+ *  state, RX queue, and TX path live in JS; the kernel calls
+ *  wasm_ws_* and gets back handles + bytes.
+ * ══════════════════════════════════════════════════════════════ */
+
+EM_JS(int, js_ws_open, (const char *url), {
+    var u = UTF8ToString(url);
+    if (!window.__wsHandles) {
+        window.__wsHandles = {};
+        window.__wsNextId  = 1;
+    }
+    var id = window.__wsNextId++;
+    var entry = {
+        url: u,
+        ws: null,
+        state: 0,        /* 0=connecting 1=open 2=closing 3=closed 4=error */
+        rxq: [],         /* array of Uint8Array */
+        rxbytes: 0,
+        err: ''
+    };
+    try {
+        entry.ws = new WebSocket(u);
+        entry.ws.binaryType = 'arraybuffer';
+        entry.ws.onopen    = function() { entry.state = 1; };
+        entry.ws.onclose   = function() { entry.state = 3; };
+        entry.ws.onerror   = function(e) {
+            entry.state = 4;
+            entry.err = 'ws error';
+        };
+        entry.ws.onmessage = function(ev) {
+            var data = ev.data;
+            var u8;
+            if (typeof data === 'string') {
+                u8 = new TextEncoder().encode(data);
+            } else if (data instanceof ArrayBuffer) {
+                u8 = new Uint8Array(data);
+            } else if (data instanceof Blob) {
+                /* Async — drop blobs we can't read sync. Most servers
+                 * use string or ArrayBuffer with binaryType set. */
+                return;
+            } else {
+                return;
+            }
+            entry.rxq.push(u8);
+            entry.rxbytes += u8.byteLength;
+        };
+    } catch (e) {
+        entry.state = 4;
+        entry.err = String(e);
+    }
+    window.__wsHandles[id] = entry;
+    return id;
+});
+
+EM_JS(int, js_ws_state, (int handle), {
+    var e = window.__wsHandles && window.__wsHandles[handle];
+    return e ? e.state : 4;
+});
+
+EM_JS(int, js_ws_send, (int handle, const uint8_t *data, int len), {
+    var e = window.__wsHandles && window.__wsHandles[handle];
+    if (!e || e.state !== 1) return -1;
+    try {
+        var u8 = HEAPU8.slice(data, data + len);
+        e.ws.send(u8);
+        return len;
+    } catch (err) {
+        e.err = String(err);
+        return -1;
+    }
+});
+
+EM_JS(int, js_ws_recv_size, (int handle), {
+    var e = window.__wsHandles && window.__wsHandles[handle];
+    return e ? e.rxbytes : 0;
+});
+
+/* Drain up to `max` bytes from the head of the rx queue into dst.
+ * Returns bytes drained. Partial drains leave the rest in place for
+ * the next call. */
+EM_JS(int, js_ws_recv_drain, (int handle, uint8_t *dst, int max), {
+    var e = window.__wsHandles && window.__wsHandles[handle];
+    if (!e) return 0;
+    var written = 0;
+    while (e.rxq.length > 0 && written < max) {
+        var head = e.rxq[0];
+        var room = max - written;
+        if (head.byteLength <= room) {
+            HEAPU8.set(head, dst + written);
+            written += head.byteLength;
+            e.rxbytes -= head.byteLength;
+            e.rxq.shift();
+        } else {
+            HEAPU8.set(head.subarray(0, room), dst + written);
+            e.rxq[0] = head.subarray(room);
+            e.rxbytes -= room;
+            written  += room;
+        }
+    }
+    return written;
+});
+
+EM_JS(void, js_ws_close, (int handle), {
+    var e = window.__wsHandles && window.__wsHandles[handle];
+    if (!e) return;
+    try { if (e.ws && e.state < 3) e.ws.close(); } catch (err) {}
+    e.state = 3;
+});
+
+EM_JS(int, js_ws_error, (int handle, char *dst, int max), {
+    var e = window.__wsHandles && window.__wsHandles[handle];
+    var s = e ? (e.err || '') : '';
+    var bytes = lengthBytesUTF8(s) + 1;
+    if (bytes > max) bytes = max;
+    stringToUTF8(s, dst, bytes);
+    return s ? bytes - 1 : 0;
+});
+
+/* Public C-side wrappers */
+
+int wasm_ws_open(const char *url) { return js_ws_open(url); }
+
+int wasm_ws_state(int handle) { return js_ws_state(handle); }
+
+int wasm_ws_wait_open(int handle, int timeout_ms)
+{
+    int waited = 0;
+    while (waited < timeout_ms) {
+        int s = js_ws_state(handle);
+        if (s == 1) return 0;
+        if (s >= 3) return -1;
+        emscripten_sleep(10);
+        waited += 10;
+    }
+    return -1;
+}
+
+int wasm_ws_send(int handle, const void *data, int len)
+{
+    return js_ws_send(handle, (const uint8_t *)data, len);
+}
+
+int wasm_ws_recv(int handle, void *dst, int max)
+{
+    return js_ws_recv_drain(handle, (uint8_t *)dst, max);
+}
+
+int wasm_ws_recv_wait(int handle, void *dst, int max, int timeout_ms)
+{
+    int waited = 0;
+    while (waited < timeout_ms) {
+        if (js_ws_recv_size(handle) > 0)
+            return js_ws_recv_drain(handle, (uint8_t *)dst, max);
+        if (js_ws_state(handle) >= 3) return -1;
+        emscripten_sleep(20);
+        waited += 20;
+    }
+    return 0;
+}
+
+void wasm_ws_close(int handle) { js_ws_close(handle); }
+
 /* Synchronous HTTP — suspends via Asyncify until the Promise resolves.
  * Allocates the body buffer; caller must free.
  * Returns HTTP status code (>0) or -1 on transport error.
