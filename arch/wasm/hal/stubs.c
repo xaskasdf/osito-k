@@ -503,6 +503,37 @@ void wasm_persist_flush(void)
     g_nvme_dirty = false;
 }
 
+/* ── localStorage-backed config persistence ──────────────────────
+ * Sampling tunables (temp, penalty, ngram, proxy URL) are tiny so
+ * we keep them in localStorage as a single JSON blob. Read at boot,
+ * written whenever a `temp/penalty/ngram/tcp proxy` command runs.
+ * ──────────────────────────────────────────────────────────────── */
+
+EM_JS(void, js_config_save, (const char *key, const char *value), {
+    try {
+        var k = UTF8ToString(key);
+        var v = UTF8ToString(value);
+        localStorage.setItem('osito-cfg-' + k, v);
+    } catch (e) {}
+});
+
+EM_JS(int, js_config_load, (const char *key, char *dst, int max), {
+    try {
+        var k = UTF8ToString(key);
+        var v = localStorage.getItem('osito-cfg-' + k) || '';
+        var bytes = lengthBytesUTF8(v) + 1;
+        if (bytes > max) bytes = max;
+        stringToUTF8(v, dst, bytes);
+        return v.length;
+    } catch (e) { return -1; }
+});
+
+void wasm_config_save(const char *key, const char *value)
+{ js_config_save(key, value); }
+
+int wasm_config_load(const char *key, char *dst, int max)
+{ return js_config_load(key, dst, max); }
+
 int nvme_write_bytes(uint64_t offset, const void *buf, uint64_t len) {
     if (!wasm_nvme_buf || offset + len > wasm_nvme_size) return -1;
     memcpy(wasm_nvme_buf + offset, buf, (size_t)len);

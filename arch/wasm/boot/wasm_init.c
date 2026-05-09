@@ -218,6 +218,11 @@ static void load_filesystem(void)
         serial_putdec((uint64_t)osfs2_file_count());
         serial_puts(" files\n\n");
     }
+
+    /* Restore user-tuned sampling config from localStorage. Runs after
+     * llama_init's brandon defaults so user overrides win. */
+    extern void shell_persist_load_config(void);
+    shell_persist_load_config();
 }
 
 /* ── Entry point ─────────────────────────────────────────────── */

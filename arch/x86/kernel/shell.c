@@ -152,6 +152,79 @@ extern void     llama_set_ngram_size(uint32_t n);
 extern uint32_t llama_get_ngram_size(void);
 
 #ifdef __EMSCRIPTEN__
+extern void wasm_config_save(const char *key, const char *value);
+extern int  wasm_config_load(const char *key, char *dst, int max);
+
+/* Tiny float→string helper: 2-decimal fixed-point as "1.20". */
+static void fmt_float(float v, char *dst, int max)
+{
+    int n = 0;
+    int neg = v < 0; if (neg) v = -v;
+    int hundred = (int)(v * 100.0f + 0.5f);
+    int whole = hundred / 100, frac = hundred % 100;
+    if (neg && n < max - 1) dst[n++] = '-';
+    char tmp[16]; int t = 0;
+    if (whole == 0) tmp[t++] = '0';
+    else while (whole) { tmp[t++] = '0' + whole % 10; whole /= 10; }
+    while (t && n < max - 1) dst[n++] = tmp[--t];
+    if (n < max - 1) dst[n++] = '.';
+    if (n < max - 1) dst[n++] = '0' + frac / 10;
+    if (n < max - 1) dst[n++] = '0' + frac % 10;
+    dst[n] = '\0';
+}
+
+static float parse_cfg_float(const char *s)
+{
+    float r = 0.0f, frac = 0.0f, div = 1.0f;
+    bool dot = false;
+    int neg = 0;
+    if (*s == '-') { neg = 1; s++; }
+    while (*s) {
+        if (*s == '.') { dot = true; s++; continue; }
+        if (*s < '0' || *s > '9') break;
+        if (dot) { div *= 10.0f; frac = frac * 10.0f + (*s - '0'); }
+        else r = r * 10.0f + (*s - '0');
+        s++;
+    }
+    float result = r + frac / div;
+    return neg ? -result : result;
+}
+
+void shell_persist_load_config(void)
+{
+    char buf[64];
+    if (wasm_config_load("temp", buf, sizeof(buf)) > 0) {
+        float t = parse_cfg_float(buf);
+        if (t > 0.0f && t < 5.0f) llama_set_sampling(t, 0.9f);
+    }
+    if (wasm_config_load("topp", buf, sizeof(buf)) > 0) {
+        float p = parse_cfg_float(buf);
+        if (p > 0.0f && p <= 1.0f) {
+            char tbuf[16];
+            float curr_t = 0.7f;
+            if (wasm_config_load("temp", tbuf, sizeof(tbuf)) > 0)
+                curr_t = parse_cfg_float(tbuf);
+            llama_set_sampling(curr_t, p);
+        }
+    }
+    if (wasm_config_load("rep", buf, sizeof(buf)) > 0) {
+        float r = parse_cfg_float(buf);
+        float pre = 0.0f, frq = 0.0f;
+        char b2[64];
+        if (wasm_config_load("pres", b2, sizeof(b2)) > 0) pre = parse_cfg_float(b2);
+        if (wasm_config_load("freq", b2, sizeof(b2)) > 0) frq = parse_cfg_float(b2);
+        if (r >= 1.0f && r <= 3.0f) llama_set_penalty(r, pre, frq);
+    }
+    if (wasm_config_load("ngram", buf, sizeof(buf)) > 0) {
+        int n = 0;
+        for (const char *s = buf; *s >= '0' && *s <= '9'; s++)
+            n = n * 10 + (*s - '0');
+        if (n >= 0 && n <= 10) llama_set_ngram_size((uint32_t)n);
+    }
+}
+#endif
+
+#ifdef __EMSCRIPTEN__
 /* Auxiliary disk fetch — used by mount-iso/mount-ext2 to load a disk
  * image from the network into a HEAP buffer that fs drivers read
  * through a custom callback (no contention with primary OsitoFS). */
@@ -2021,6 +2094,14 @@ static void cmd_temp(int argc, char *argv[])
 
     llama_set_sampling(t, p);
 
+#ifdef __EMSCRIPTEN__
+    {
+        char buf[16];
+        fmt_float(t, buf, sizeof(buf)); wasm_config_save("temp", buf);
+        fmt_float(p, buf, sizeof(buf)); wasm_config_save("topp", buf);
+    }
+#endif
+
     sh_puts("Sampling: temp=");
     sh_putdec((uint64_t)(t * 10.0f) / 10);
     sh_puts(".");
@@ -2057,6 +2138,14 @@ static void cmd_penalty(int argc, char *argv[])
     float pre = argc >= 3 ? parse_float(argv[2]) : 0.0f;
     float frq = argc >= 4 ? parse_float(argv[3]) : 0.0f;
     llama_set_penalty(rep, pre, frq);
+#ifdef __EMSCRIPTEN__
+    {
+        char buf[16];
+        fmt_float(rep, buf, sizeof(buf)); wasm_config_save("rep",  buf);
+        fmt_float(pre, buf, sizeof(buf)); wasm_config_save("pres", buf);
+        fmt_float(frq, buf, sizeof(buf)); wasm_config_save("freq", buf);
+    }
+#endif
     sh_puts("Penalty set\n");
 }
 
@@ -4245,6 +4334,32 @@ void shell_exec(char *line)
             }
         }
 #endif
+    } else if (strcmp(cmd, "time") == 0) {
+        if (argc < 2) { sh_puts("Usage: time <command...>\n"); return; }
+        /* Reassemble argv[1..] into a single line and run via the
+         * pipeline executor. Times the call wall-clock. */
+        static char buf[1024];
+        int p = 0;
+        for (int i = 1; i < argc && p < (int)sizeof(buf) - 1; i++) {
+            if (i > 1 && p < (int)sizeof(buf) - 1) buf[p++] = ' ';
+            const char *w = argv[i];
+            while (*w && p < (int)sizeof(buf) - 1) buf[p++] = *w++;
+        }
+        buf[p] = '\0';
+        extern uint64_t idt_get_ticks(void);
+        extern void shell_exec_pipeline(char *line);
+        uint64_t t0 = idt_get_ticks();
+        shell_exec_pipeline(buf);
+        uint64_t t1 = idt_get_ticks();
+#ifdef __EMSCRIPTEN__
+        /* idt_get_ticks in WASM is emscripten_get_now (ms-resolution). */
+        sh_puts_color("\n[time] ", 0x00FF8800);
+        sh_putdec(t1 - t0); sh_puts(" ms\n");
+#else
+        sh_puts_color("\n[time] ", 0x00FF8800);
+        sh_putdec((t1 - t0) * 10);  /* native ticks ~10ms */
+        sh_puts(" ms (approx)\n");
+#endif
     } else if (strcmp(cmd, "bench") == 0) {
         /* Inference micro-bench: prefill a known prompt, time generation. */
         if (!prompt_llama) { sh_puts("No model loaded.\n"); return; }
@@ -4274,6 +4389,17 @@ void shell_exec(char *line)
             const char *s = argv[1];
             while (*s >= '0' && *s <= '9') { v = v * 10 + (*s - '0'); s++; }
             llama_set_ngram_size((uint32_t)v);
+#ifdef __EMSCRIPTEN__
+            {
+                char buf[16];
+                int n = 0; int x = v;
+                if (x == 0) buf[n++] = '0';
+                else { char t[8]; int tt = 0; while (x) { t[tt++]='0'+x%10; x/=10; }
+                       while (tt) buf[n++]=t[--tt]; }
+                buf[n] = '\0';
+                wasm_config_save("ngram", buf);
+            }
+#endif
             sh_puts("ngram size set to ");
             sh_putdec((uint64_t)v);
             sh_puts("\n");
