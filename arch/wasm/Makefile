@@ -116,6 +116,12 @@ X86_SRCS := \
     ../x86/kernel/git.c \
     ../x86/kernel/tls.c \
     ../x86/kernel/tls13.c \
+    ../x86/kernel/wayland.c \
+    ../x86/kernel/fuse.c \
+    ../x86/kernel/evdev.c \
+    ../x86/kernel/pty.c \
+    ../x86/kernel/sshd.c \
+    ../x86/kernel/initramfs.c \
     ../x86/fs/gguf.c \
     ../x86/fs/gpt.c \
     ../x86/fs/iso9660.c \
