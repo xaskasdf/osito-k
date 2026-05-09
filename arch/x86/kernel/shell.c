@@ -1608,6 +1608,18 @@ extern int  wasm_ws_send(int handle, const void *data, int len);
 extern int  wasm_ws_recv_wait(int handle, void *dst, int max, int timeout_ms);
 extern void wasm_ws_close(int handle);
 
+extern int  wasm_tcp_connect_host(const char *host, uint16_t port);
+extern int  net_tcp_send(int conn, const void *data, uint32_t len);
+extern int  net_tcp_recv_timeout(int conn, void *buf, uint32_t buf_size, uint32_t timeout_ticks);
+extern void net_tcp_close(int conn);
+
+/* tls.h provides tls_conn_t but conflicts with the void* externs at
+ * line 99-102. We don't need the full struct shape — just allocate
+ * a generous fixed buffer that's larger than any plausible
+ * tls_conn_t (~17 KB observed). */
+#define WASM_TLS_CTX_BYTES (32 * 1024)
+extern void *malloc(unsigned long);
+
 /* Per-shell WS handle table — small fixed slots indexed by integer.
  * Users can name a connection ('ws open <url> myws') for nicer UX. */
 #define WS_SLOT_MAX 8
@@ -3617,6 +3629,73 @@ void shell_exec(char *line)
         } else {
             sh_puts("Unknown crypto subcommand.\n");
         }
+    } else if (strcmp(cmd, "https") == 0) {
+        if (argc < 2) {
+            sh_puts("Usage: https <host> [path]\n");
+            sh_puts("  Real TLS 1.2 client over the WS-tunneled TCP proxy.\n");
+            sh_puts("  Requires the CF Worker proxy to be deployed (tcp proxy).\n");
+            sh_puts("  Cert validation is OFF — for trusted/demo targets only.\n");
+            return;
+        }
+        const char *host = argv[1];
+        const char *path = argc >= 3 ? argv[2] : "/";
+
+        sh_puts("[https] connecting to "); sh_puts(host); sh_puts(":443...\n");
+        int tcp = wasm_tcp_connect_host(host, 443);
+        if (tcp < 0) {
+            sh_puts_color("[https] tcp connect failed (proxy down?)\n", 0x00FF0000);
+            return;
+        }
+
+        void *tls = malloc(WASM_TLS_CTX_BYTES);
+        if (!tls) {
+            sh_puts("[https] OOM\n"); net_tcp_close(tcp); return;
+        }
+        memset(tls, 0, WASM_TLS_CTX_BYTES);
+
+        sh_puts("[https] TLS handshake...\n");
+        if (tls_connect(tls, tcp, host) < 0) {
+            sh_puts_color("[https] handshake failed\n", 0x00FF0000);
+            net_tcp_close(tcp); free(tls); return;
+        }
+        sh_puts_color("[https] connected\n", 0x0000FF00);
+
+        /* Build minimal HTTP/1.0 GET. Connection: close so the server
+         * EOFs after the body. */
+        char req[1024];
+        int p = 0;
+        const char *prefix = "GET ";
+        while (*prefix) req[p++] = *prefix++;
+        while (*path)   req[p++] = *path++;
+        const char *mid = " HTTP/1.0\r\nHost: ";
+        while (*mid)    req[p++] = *mid++;
+        const char *h = host;
+        while (*h)      req[p++] = *h++;
+        const char *suffix = "\r\nConnection: close\r\nUser-Agent: OsitoK/1.0\r\n\r\n";
+        while (*suffix) req[p++] = *suffix++;
+
+        if (tls_send(tls, req, p) < 0) {
+            sh_puts_color("[https] tls_send failed\n", 0x00FF0000);
+            tls_close(tls); free(tls); return;
+        }
+
+        /* Stream response */
+        char rxbuf[2048];
+        int total = 0;
+        for (;;) {
+            int n = tls_recv(tls, rxbuf, sizeof(rxbuf) - 1, 100 /* ticks */);
+            if (n <= 0) break;
+            rxbuf[n] = '\0';
+            sh_puts(rxbuf);
+            total += n;
+            if (total > 64 * 1024) {
+                sh_puts("\n... [truncated at 64 KB]\n");
+                break;
+            }
+        }
+        sh_puts("\n");
+        tls_close(tls);
+        free(tls);
     } else if (strcmp(cmd, "tcp") == 0) {
         /* TCP-over-WS bridge: substitutes {host} and {port} into a
          * configured WSS proxy URL, then opens via wasm_ws_open. The
