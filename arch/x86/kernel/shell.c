@@ -228,7 +228,7 @@ static int aux_disk_read_bytes_wrap(uint64_t offset, void *buf, uint64_t len)
 }
 
 /* Generic mount table */
-typedef struct {
+struct aux_fs_t {
     const char *name;                      /* short tag for `mount-fs` */
     int   route_aux;                       /* 1 if mount uses nvme_read */
     int  (*mount_partlba)(uint64_t);       /* either this … */
@@ -237,7 +237,8 @@ typedef struct {
     bool (*is_mounted)(void);
     int  (*ls)(const char *path);          /* called with NULL or "/" */
     int  (*read_file)(const char *name, uint64_t off, void *buf, uint64_t len);
-} aux_fs_t;
+};
+typedef struct aux_fs_t aux_fs_t;
 
 static int wrap_iso_ls(const char *p)   { return iso9660_ls(p ? p : "/"); }
 static int wrap_ext_ls(const char *p)   { (void)p; return ext2_ls(); }
@@ -272,6 +273,33 @@ static const aux_fs_t *find_aux_fs(const char *name)
         if (strcmp(aux_fs_table[i].name, name) == 0)
             return &aux_fs_table[i];
     return NULL;
+}
+
+/* Public accessors used by cmd_cat / cmd_ls auto-mount path */
+const aux_fs_t *cmd_active_aux_fs(void) { return g_active_aux_fs; }
+
+int cmd_aux_fs_read(const char *name, void *buf, int max)
+{
+    if (!g_active_aux_fs || !g_active_aux_fs->read_file) return -1;
+    /* Strip leading slash if present */
+    if (name[0] == '/') name++;
+    wasm_nvme_route_aux(g_active_aux_fs->route_aux);
+    int rc = g_active_aux_fs->read_file(name, 0, buf, max);
+    wasm_nvme_route_aux(0);
+    return rc;
+}
+
+int cmd_aux_fs_ls(const char *path)
+{
+    if (!g_active_aux_fs) return -1;
+    /* Empty path → root */
+    const char *p = (!path || !*path) ? NULL : path;
+    /* Strip the leading /aux portion if any survives */
+    if (p && p[0] == '/' && p[1] == '\0') p = NULL;
+    wasm_nvme_route_aux(g_active_aux_fs->route_aux);
+    int rc = g_active_aux_fs->ls(p);
+    wasm_nvme_route_aux(0);
+    return rc;
 }
 #endif
 
@@ -593,6 +621,15 @@ static void cmd_ls(void)
 
 /* ── Builtin: cat ────────────────────────────────────────────── */
 
+#ifdef __EMSCRIPTEN__
+/* Forward-decl — defined later in this file alongside mount-fs. */
+struct aux_fs_t;
+typedef struct aux_fs_t aux_fs_t;
+extern const aux_fs_t *cmd_active_aux_fs(void);
+extern int  cmd_aux_fs_read(const char *name, void *buf, int max);
+extern int  cmd_aux_fs_ls(const char *path);
+#endif
+
 static void cmd_cat(int argc, char *argv[])
 {
     /* No filename: route piped/redirected stdin to stdout (so
@@ -609,6 +646,36 @@ static void cmd_cat(int argc, char *argv[])
         sh_puts("Usage: cat <filename>  (or pipe/redirect/heredoc into cat)\n");
         return;
     }
+
+#ifdef __EMSCRIPTEN__
+    /* Auto-mount path: paths under /aux/ route to the currently
+     * mounted auxiliary FS (set by `mount-fs <type> <url>`). The
+     * leading "/aux/" is stripped before calling the FS read_file. */
+    if (argv[1][0] == '/' && argv[1][1] == 'a' && argv[1][2] == 'u' &&
+        argv[1][3] == 'x' && argv[1][4] == '/') {
+        if (!cmd_active_aux_fs()) {
+            sh_puts("No aux FS mounted. Run: mount-fs <type> <url>\n");
+            return;
+        }
+        static char aux_buf[65536];
+        int n = cmd_aux_fs_read(argv[1] + 5, aux_buf, sizeof(aux_buf));
+        if (n <= 0) {
+            sh_puts("File not found in aux FS.\n");
+            return;
+        }
+        char chunk[256];
+        int i = 0;
+        while (i < n) {
+            int k = n - i; if (k > 255) k = 255;
+            for (int j = 0; j < k; j++) chunk[j] = aux_buf[i + j];
+            chunk[k] = '\0';
+            sh_puts(chunk);
+            i += k;
+        }
+        sh_puts("\n");
+        return;
+    }
+#endif
 
     if (!osfs2_is_mounted()) {
         sh_puts("No filesystem mounted\n");
@@ -3022,6 +3089,17 @@ void shell_exec(char *line)
     } else if (strcmp(cmd, "echo") == 0) {
         cmd_echo(argc, argv);
     } else if (strcmp(cmd, "ls") == 0) {
+#ifdef __EMSCRIPTEN__
+        /* `ls /aux` or `ls /aux/...` lists the active aux FS. */
+        if (argc >= 2 && argv[1][0] == '/' &&
+            argv[1][1] == 'a' && argv[1][2] == 'u' && argv[1][3] == 'x') {
+            if (!cmd_active_aux_fs()) {
+                sh_puts("No aux FS mounted. Run: mount-fs <type> <url>\n");
+            } else {
+                cmd_aux_fs_ls(argv[1] + 4);
+            }
+        } else
+#endif
         cmd_ls();
     } else if (strcmp(cmd, "cp") == 0) {
         /* cp <src> <dst> — duplicate a file inside OsitoFS. */
