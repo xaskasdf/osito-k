@@ -1927,3 +1927,4 @@ int aux_disk_read_512(uint64_t lba, uint32_t count, void *buf) {
 }
 
 uint64_t aux_disk_size(void) { return g_aux_disk_size; }
+uint8_t *aux_disk_ptr(void)  { return g_aux_disk_buf; }

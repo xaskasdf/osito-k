@@ -182,6 +182,97 @@ extern bool     fat32_is_mounted(void);
 extern int      fat32_ls(const char *path);
 extern int      fat32_find(const char *name, uint32_t *cluster_out, uint32_t *size_out);
 extern int      fat32_read_file(const char *name, uint64_t offset, void *buf, uint64_t len);
+
+/* part_lba-based mounts — all use nvme_read internally, need route flag. */
+extern int      exfat_mount(uint64_t part_lba);
+extern bool     exfat_is_mounted(void);
+extern int      exfat_ls(void);
+extern int      exfat_read_file(const char *name, uint64_t offset, void *buf, uint64_t len);
+
+extern int      ntfs_mount(uint64_t part_lba);
+extern bool     ntfs_is_mounted(void);
+extern int      ntfs_ls(void);
+extern int      ntfs_read_file(const char *name, uint64_t offset, void *buf, uint64_t len);
+
+extern int      hfsplus_mount(uint64_t part_lba);
+extern bool     hfsplus_is_mounted(void);
+extern int      hfsplus_ls(void);
+
+extern int      btrfs_mount(uint64_t part_lba);
+extern bool     btrfs_is_mounted(void);
+extern int      btrfs_ls(void);
+
+extern int      apfs_mount(uint64_t part_lba);
+extern bool     apfs_is_mounted(void);
+extern int      apfs_ls(void);
+
+/* Callback-based mounts (ls-only). */
+extern int      udf_mount(int (*read_fn)(uint64_t lba, uint32_t count, void *buf));
+extern bool     udf_is_mounted(void);
+extern int      udf_ls(void);
+
+extern int      squashfs_mount(int (*read_fn)(uint64_t offset, void *buf, uint64_t len),
+                                uint64_t total_size);
+extern bool     squashfs_is_mounted(void);
+extern int      squashfs_ls(void);
+
+/* squashfs read takes byte-offset, not LBA. Wrap via aux_disk_ptr(). */
+extern uint8_t *aux_disk_ptr(void);
+static int aux_disk_read_bytes_wrap(uint64_t offset, void *buf, uint64_t len)
+{
+    extern uint64_t aux_disk_size(void);
+    uint8_t *p = aux_disk_ptr();
+    if (!p || offset + len > aux_disk_size()) return -1;
+    for (uint64_t i = 0; i < len; i++) ((uint8_t *)buf)[i] = p[offset + i];
+    return 0;
+}
+
+/* Generic mount table */
+typedef struct {
+    const char *name;                      /* short tag for `mount-fs` */
+    int   route_aux;                       /* 1 if mount uses nvme_read */
+    int  (*mount_partlba)(uint64_t);       /* either this … */
+    int  (*mount_iso)(int (*)(uint64_t, uint32_t, void *));   /* … or this … */
+    int  (*mount_sqfs)(int (*)(uint64_t, void *, uint64_t), uint64_t);
+    bool (*is_mounted)(void);
+    int  (*ls)(const char *path);          /* called with NULL or "/" */
+    int  (*read_file)(const char *name, uint64_t off, void *buf, uint64_t len);
+} aux_fs_t;
+
+static int wrap_iso_ls(const char *p)   { return iso9660_ls(p ? p : "/"); }
+static int wrap_ext_ls(const char *p)   { (void)p; return ext2_ls(); }
+static int wrap_fat_ls(const char *p)   { return fat32_ls(p ? p : "/"); }
+static int wrap_exfat_ls(const char *p) { (void)p; return exfat_ls(); }
+static int wrap_ntfs_ls(const char *p)  { (void)p; return ntfs_ls(); }
+static int wrap_hfs_ls(const char *p)   { (void)p; return hfsplus_ls(); }
+static int wrap_btrfs_ls(const char *p) { (void)p; return btrfs_ls(); }
+static int wrap_apfs_ls(const char *p)  { (void)p; return apfs_ls(); }
+static int wrap_udf_ls(const char *p)   { (void)p; return udf_ls(); }
+static int wrap_sqfs_ls(const char *p)  { (void)p; return squashfs_ls(); }
+
+static const aux_fs_t aux_fs_table[] = {
+    { "iso",   0, NULL,           iso9660_mount, NULL,           iso9660_is_mounted, wrap_iso_ls,   iso9660_read_file },
+    { "ext",   0, NULL,           NULL,          NULL,           ext2_is_mounted,    wrap_ext_ls,   ext2_read_file    },
+    { "fat",   1, fat32_mount,    NULL,          NULL,           fat32_is_mounted,   wrap_fat_ls,   fat32_read_file   },
+    { "exfat", 1, exfat_mount,    NULL,          NULL,           exfat_is_mounted,   wrap_exfat_ls, exfat_read_file   },
+    { "ntfs",  1, ntfs_mount,     NULL,          NULL,           ntfs_is_mounted,    wrap_ntfs_ls,  ntfs_read_file    },
+    { "hfs",   1, hfsplus_mount,  NULL,          NULL,           hfsplus_is_mounted, wrap_hfs_ls,   NULL              },
+    { "btrfs", 1, btrfs_mount,    NULL,          NULL,           btrfs_is_mounted,   wrap_btrfs_ls, NULL              },
+    { "apfs",  1, apfs_mount,     NULL,          NULL,           apfs_is_mounted,    wrap_apfs_ls,  NULL              },
+    { "udf",   0, NULL,           udf_mount,     NULL,           udf_is_mounted,     wrap_udf_ls,   NULL              },
+    { "sqfs",  0, NULL,           NULL,          squashfs_mount, squashfs_is_mounted,wrap_sqfs_ls,  NULL              },
+};
+#define AUX_FS_COUNT (int)(sizeof(aux_fs_table)/sizeof(aux_fs_table[0]))
+
+static const aux_fs_t *g_active_aux_fs = NULL;
+
+static const aux_fs_t *find_aux_fs(const char *name)
+{
+    for (int i = 0; i < AUX_FS_COUNT; i++)
+        if (strcmp(aux_fs_table[i].name, name) == 0)
+            return &aux_fs_table[i];
+    return NULL;
+}
 #endif
 
 /* ── WASM-compatibility shims ────────────────────────────────── */
@@ -3260,6 +3351,78 @@ void shell_exec(char *line)
     } else if (strcmp(cmd, "penalty") == 0) {
         cmd_penalty(argc, argv);
 #ifdef __EMSCRIPTEN__
+    } else if (strcmp(cmd, "mount-fs") == 0) {
+        if (argc < 3) {
+            sh_puts("Usage: mount-fs <type> <url>\n");
+            sh_puts("  Types: iso ext fat exfat ntfs hfs btrfs apfs udf sqfs\n");
+            sh_puts("  After: fs-ls [path] / fs-cat <name>\n");
+            return;
+        }
+        const aux_fs_t *fs = find_aux_fs(argv[1]);
+        if (!fs) {
+            sh_puts("Unknown FS type. Run: mount-fs (no args) for list.\n");
+        } else if (aux_disk_fetch(argv[2]) < 0) {
+            sh_puts_color("[mount-fs] fetch failed\n", 0x00FF0000);
+        } else {
+            int rc = -1;
+            if (fs->mount_iso)
+                rc = fs->mount_iso(fs->name[0] == 'i' ? aux_disk_read_iso
+                                                       : aux_disk_read_512);
+            else if (fs->mount_sqfs)
+                rc = fs->mount_sqfs(aux_disk_read_bytes_wrap, aux_disk_size());
+            else if (fs->mount_partlba) {
+                wasm_nvme_route_aux(fs->route_aux);
+                rc = fs->mount_partlba(0);
+                wasm_nvme_route_aux(0);
+            } else if (strcmp(fs->name, "ext") == 0) {
+                rc = ext2_mount(0, aux_disk_read_512);
+            }
+            if (rc < 0) {
+                sh_puts_color("[mount-fs] not a valid ", 0x00FF0000);
+                sh_puts(fs->name); sh_puts(" image\n");
+            } else {
+                g_active_aux_fs = fs;
+                sh_puts_color("[mount-fs] ", 0x0000FF00);
+                sh_puts(fs->name);
+                sh_puts(" mounted (");
+                sh_putdec(aux_disk_size() / (1024 * 1024));
+                sh_puts(" MB)\n");
+            }
+        }
+    } else if (strcmp(cmd, "fs-ls") == 0) {
+        if (!g_active_aux_fs) sh_puts("No FS mounted (mount-fs <type> <url>).\n");
+        else {
+            wasm_nvme_route_aux(g_active_aux_fs->route_aux);
+            g_active_aux_fs->ls(argc >= 2 ? argv[1] : NULL);
+            wasm_nvme_route_aux(0);
+        }
+    } else if (strcmp(cmd, "fs-cat") == 0) {
+        if (argc < 2) sh_puts("Usage: fs-cat <name>\n");
+        else if (!g_active_aux_fs) sh_puts("No FS mounted.\n");
+        else if (!g_active_aux_fs->read_file)
+            sh_puts("This FS supports listing only (no read_file).\n");
+        else {
+            static char fbuf[65536];
+            wasm_nvme_route_aux(g_active_aux_fs->route_aux);
+            int rc = g_active_aux_fs->read_file(argv[1], 0, fbuf, sizeof(fbuf));
+            wasm_nvme_route_aux(0);
+            if (rc <= 0) sh_puts("File not found or read failed.\n");
+            else {
+                char chunk[256];
+                int i = 0;
+                while (i < rc) {
+                    int n = rc - i; if (n > 255) n = 255;
+                    for (int j = 0; j < n; j++) chunk[j] = fbuf[i + j];
+                    chunk[n] = '\0';
+                    sh_puts(chunk);
+                    i += n;
+                }
+                if (rc == (int)sizeof(fbuf))
+                    sh_puts("\n... [truncated at 64 KB]\n");
+                else
+                    sh_puts("\n");
+            }
+        }
     } else if (strcmp(cmd, "mount-iso") == 0) {
         if (argc < 2) {
             sh_puts("Usage: mount-iso <url>\n");
