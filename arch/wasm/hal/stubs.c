@@ -956,8 +956,9 @@ void osito_kernel_poll(void)
     if (prompt_llama) {
         /* Direct call to llama_chat — same Asyncify context as the
          * shell's own `chat` command, so the indirect call to the
-         * token callback works. 32 tokens cap for browser latency. */
-        llama_chat(prompt_llama, prompt, 32, osito_chat_token_cb, NULL);
+         * token callback works. 8 tokens cap (browser is slow without
+         * SIMD; user can chain multiple calls if more output needed). */
+        llama_chat(prompt_llama, prompt, 8, osito_chat_token_cb, NULL);
     } else {
         const char *m = "[oi_chat] no model";
         memcpy(osito_chat_buf, m, strlen(m));

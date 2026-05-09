@@ -178,18 +178,28 @@ Libs en `/lib/wasm32-wasi/`:
 - [x] ~~**Kernel-bridge imports**~~ ✅ done — `osito_env` import module with `oi_random_u32`, `oi_now_us`, `oi_log_kernel`. App constructor adds it to the WebAssembly imports table; ositok.h declares them with `__attribute__((import_module/import_name))`. Compiled programs link via `wasm-ld --allow-undefined`; runtime resolves them in the worker's App instance.
 - [x] ~~**Heredoc `<< EOF`**~~ ✅ done — shell main loop detects `<<TERM` in the command line, accumulates lines until terminator, feeds via `sh_stdin_buf`. Body cap 64KB.
 - [x] ~~**`cc -c`** compile-only~~ ✅ done — produces `.o` (auto-named `<basename>.o` if no `-o`).
-- [x] ~~**Real `oi_chat`**~~ done — poll-based bridge. Worker writes
-      prompt to `SharedArrayBuffer`, sets state=1, `Atomics.wait`s. The
-      kernel's `osito_kernel_poll()` runs from inside `kb_getchar` and
-      `cc_drain_until_done` Asyncify-aware loops, reads the prompt via
-      EM_JS, runs the shell `chat` command capturing output via the
-      shell redirect, writes back to SAB, sets state=2, `Atomics.notify`.
-      Worker wakes, copies result into user wasm memory, returns bytes
-      written. The earlier `Module.ccall` path is left as a stub since
-      it hits an Asyncify edge case under `MAIN_MODULE=1` (function-table
-      indirect call to the llama callback fails when wasm is entered
-      from a non-Asyncify JS frame). Routing through the kernel's
-      ongoing execution avoids that entirely.
+- [x] ~~**Real `oi_chat`**~~ bridge mechanism complete and dispatching.
+      Worker writes prompt to `SharedArrayBuffer`, sets state=1,
+      `Atomics.wait`s. The kernel's `osito_kernel_poll()` runs from
+      inside `kb_getchar` and `cc_drain_until_done` Asyncify-aware
+      loops, reads the prompt via EM_JS, calls `llama_chat` directly
+      (with a local token callback writing into `osito_chat_buf`),
+      writes the response back to SAB, sets state=2, `Atomics.notify`.
+      Worker wakes, copies the result into user wasm memory, returns
+      bytes written. The earlier `Module.ccall` path is stubbed —
+      direct ccall hits an Asyncify edge case under `MAIN_MODULE=1`
+      (function-table indirect call breaks when wasm is entered from
+      a non-Asyncify JS frame), so we route through the kernel's
+      ongoing call stack instead.
+
+      Latency caveat: SmolLM2-135M inference in browser without SIMD
+      is genuinely slow (~minutes for 8-32 tokens) — even the direct
+      shell `chat` command takes the same time. This is a runtime
+      perf issue, not a bridge issue. Mitigations for future work:
+      `emscripten_sleep(0)` inside the token-generation loop in
+      `inference.c` so the UI updates between tokens; SIMD-128
+      intrinsics (`-msimd128`) for the matmul hot path; or a much
+      smaller model (e.g., 10-20M params) for browser demos.
 - [x] ~~**`cat`/`head`/`tail` reading from stdin**~~ ✅ done — `cat` reads
       from `sh_stdin_buf` when no filename arg; `head`/`tail`/`grep`
       already supported it.

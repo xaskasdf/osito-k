@@ -1704,6 +1704,14 @@ int llama_chat(llama_state_t *state, const char *text,
             on_token(tok_text, ctx);
         }
 
+#ifdef __EMSCRIPTEN__
+        /* Yield to the JS event loop after each token so the browser
+         * UI updates and pumps postMessages (oi_chat bridge etc.).
+         * Costs ~1ms; negligible vs the seconds spent in matmul. */
+        extern void emscripten_sleep(unsigned int ms);
+        emscripten_sleep(0);
+#endif
+
         llama_forward(state, next);
         gen++;
         next = sample_next(state->logits, state->vocab_size);
