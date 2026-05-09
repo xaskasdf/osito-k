@@ -137,3 +137,128 @@ curl -X PUT https://api.cloudflare.com/client/v4/accounts/$ACCOUNT/r2/buckets/$B
 ```
 
 Token requiere scope **`Workers R2 Storage:Edit`**. Para purgar cache CDN: añadir **`Cache Purge`** en el token.
+
+---
+
+## Capabilities snapshot — May 2026
+
+55/103 kernel modules compilados (53% del x86 kernel). Los 48 restantes
+son arquitectónicamente excluidos (HW-bound, real-IP-net, host-OS). Todos
+los items abajo están live en `https://factory.naranjositos.tech/wasm/osito.html`.
+
+### LLM stack
+
+- **Default model**: `brandon-tiny-10m-instruct.f16.gguf` (21 MB descarga
+  inicial, cacheado por Service Worker). Custom block_sharing arch:
+  12 unique blocks aliasados a 24 logical layers vía `layer_map`,
+  DenseFormer DWA + Value Residual Learning + 4 register tokens. SPM
+  tokenizer (no BPE byte-level). Speed: **64 ms/tok** (~15 tok/s).
+- **Sampling auto-tuned** al detectar arch=brandon: temp 0.7, penalty
+  1.2 0 0, ngram 3. User overrides (`temp`, `penalty`, `ngram`)
+  persisten en localStorage.
+- **Comandos**: `chat`, `rag <ctx> ::: <q>`, `bench [n]`, `claude` REPL
+  (Anthropic API + SSE streaming), `bdebug`.
+
+Ver [docs/brandon-tiny-integration.md](brandon-tiny-integration.md)
+para guía completa de port a otros runtimes.
+
+### Filesystem (12 formatos)
+
+`mount-fs <type> <url>` + `ls /<type>/` + `cat /<type>/<file>`:
+
+| Type | Driver | read_file | Notes |
+|---|---|---|---|
+| (primary) | ositofs2 | ✓ | persistido a IndexedDB; `git`/`cc -o`/edits sobreviven reload |
+| iso | iso9660 | ✓ | callback-based; LBA 2048 |
+| ext | ext2/3/4 | ✓ | callback-based; LBA 512 |
+| fat | fat32 | ✓ | nvme_route swap; LFN |
+| exfat | exfat | ✓ | nvme_route swap |
+| ntfs | ntfs | ✓ | MFT, run-list parser |
+| hfs | hfsplus | ls-only | catalog B-tree |
+| btrfs | btrfs | ls-only | chunk tree |
+| apfs | apfs | ls-only | container + volume superblock |
+| udf | udf | ls-only | DVD/Blu-ray |
+| sqfs | squashfs | ls-only | zlib decompress |
+
+**Multi-aux real**: uno de cada tipo simultáneamente (10 slots, cada uno
+con su propio backing buffer). `umount [type]` libera. VFS auto-mount
+hace `cat /iso/foo` y `cat /fat/bar` en paralelo sin re-mount.
+
+### Network bridges (browser-side)
+
+| Comando | Bridge | Server-side |
+|---|---|---|
+| `curl <url>` | JS `fetch()` | (nada — CORS browser) |
+| `claude` REPL | JS fetch + SSE | api.anthropic.com `/v1/messages` |
+| `ws open <url>` | `new WebSocket` | cualquier wss:// |
+| `tcp connect <host> <port>` | WebSocket → CF Worker proxy | [`tools/tcp-proxy-worker.js`](../tools/tcp-proxy-worker.js) |
+| `https <host> [path]` | tls.c/tls13.c sobre net_tcp_send/recv → wasm_ws_* | TCP proxy + cert-validation OFF |
+| `crypto sha256/sha512` | crypto.c/crypto2.c (linked, no transport) | (local) |
+
+Linkeados también: `tls.c`, `tls13.c`, `wayland.c`, `fuse.c`, `evdev.c`,
+`pty.c`, `sshd.c`, `initramfs.c`, `git.c`, `zlib.c`, `rcu.c` — pure C,
+sin deps host.
+
+### Persistencia
+
+- **IndexedDB** (`osito-fs` database, `img/main` key): full FS image,
+  ~56 MB. Se guarda al final de cada comando shell si está dirty.
+  Restore al boot antes de mount.
+- **localStorage** (`osito-cfg-*`): sampling tunables (temp/topp/rep/
+  pres/freq/ngram) y proxy URL. Cargado al boot tras llama_init.
+
+### PWA + offline
+
+- `manifest.json` + Service Worker (`sw.js`): cache-first para
+  osito.{html,js,wasm}, network-first con cache fallback para R2 GGUF
+  e img. Browsers muestran prompt "install" en address bar tras primera
+  carga. Offline tras primera carga.
+
+### Comandos shell completos
+
+```
+chat <prompt>                            rag <ctx> ::: <q>
+temp <t> [topp]                          penalty <rep> [pres] [freq]
+ngram <n>                                bdebug <dwa|vr|reg|logits>
+bench [n_tokens]                         time <command...>
+claude (REPL)                            apikey sk-ant-...
+
+cc <src.c> [-o out.wasm] [-c]            make
+exec <out.wasm>                          edit <file>
+
+git <init|add|commit|log|status|diff|branch|checkout>
+
+ls [path]                                cat <file>
+ls /iso/, /fat/, /ext/, /aux/, …         cat /iso/foo, /fat/bar, …
+mount-fs <type> <url>                    fs-ls / fs-cat
+umount [type]
+
+curl <url>                               ws <open|send|recv|close|list>
+tcp <proxy|connect|send|recv|close>      https <host> [path]
+crypto sha256/sha512 <text>
+
+info                                     help
+```
+
+### Diff vs x86 — qué falta y por qué
+
+48 módulos kernel correctamente excluidos:
+
+- **HW**: idt, paging, smp, smp_work, memory, heap, pci, pci_hotplug,
+  nic, hwbp, perf, audio_sched, dma_sched, cpu_features, cpu_topology,
+  dispatch, tensor_avx2, vdso_thunks, spec_*, self_optimize,
+  pred_sched, io_predict, tensor_arena
+- **Boot/diag**: main, serial, keyboard, panic, coredump, crash_report
+- **Process model**: dynlink, elf, process, syscall, kmod, sys_inference
+- **Power/display**: power, display
+- **Real-IP net stack**: net.c, dhcp, ntp, mdns, ipv6, apipa,
+  netfilter, http (browser no expone raw IP — bridge WS reemplaza)
+- **claude.c** ya bridgeado vía wasm_http_request → JS fetch directo
+
+Para cerrar gaps adicionales se necesita refactor profundo:
+- Multi-aux DEL MISMO tipo (e.g. dos ISOs concurrentes) requiere
+  context refactor en cada FS driver — todos usan globals.
+- Server-side TCP/`accept()` necesita un protocolo over-WebSocket
+  custom (httpd/sshd quedarían).
+- WebGPU compute matvec no tiene ROI para modelos pequeños (256-dim
+  matvec dispatch overhead ≈ scalar tiempo).
