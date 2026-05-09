@@ -109,6 +109,41 @@ void __hot matvec_q4_0_avx2(float *out, const void *weight,
 }
 
 /* ══════════════════════════════════════════════════════════
+ *  AVX2 + F16C matvec_f16 — for brandon-tiny and any model with
+ *  raw fp16 weight tensors. _mm256_cvtph_ps converts 8 fp16 → 8
+ *  fp32 in a single hardware instruction (vcvtph2ps), avoiding
+ *  the ~5-op scalar dequant in inner loops.
+ * ══════════════════════════════════════════════════════════ */
+
+void __hot matvec_f16_avx2(float *out, const void *weight,
+                           const float *input, uint32_t rows, uint32_t cols)
+{
+    const uint16_t *w = (const uint16_t *)weight;
+    uint32_t c8 = cols & ~7u;        /* multiple of 8 */
+
+    for (uint32_t r = 0; r < rows; r++) {
+        const uint16_t *row = w + (uint64_t)r * cols;
+        __m256 acc = _mm256_setzero_ps();
+
+        for (uint32_t c = 0; c < c8; c += 8) {
+            __m128i hv = _mm_loadu_si128((const __m128i *)(row + c));
+            __m256 wv = _mm256_cvtph_ps(hv);
+            __m256 iv = _mm256_loadu_ps(input + c);
+            acc = _mm256_fmadd_ps(wv, iv, acc);
+        }
+
+        float sum = hsum256(acc);
+        /* Tail: scalar dequant for any leftover < 8 */
+        for (uint32_t c = c8; c < cols; c++) {
+            __m128i sh = _mm_cvtsi32_si128(row[c]);
+            float wf = _mm_cvtss_f32(_mm_cvtph_ps(sh));
+            sum += wf * input[c];
+        }
+        out[r] = sum;
+    }
+}
+
+/* ══════════════════════════════════════════════════════════
  *  AVX2 rmsnorm — sum-of-squares + element-wise multiply
  * ══════════════════════════════════════════════════════════ */
 

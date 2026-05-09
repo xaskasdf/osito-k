@@ -118,6 +118,12 @@ static void load_model(void)
         return;
     }
 
+    /* Pre-dequantize F16 → F32 once at load. Costs ~2x memory on the
+     * affected tensors but eliminates per-matvec scalar dequant in the
+     * inner loop, which was ~13x slower than F32 in WASM (151 ms/tok
+     * → ~25-40 ms/tok target after this conversion). */
+    gguf_dequant_f16_to_f32(&g_model);
+
     /* Extract tokenizer from GGUF metadata + initialize global tokenizer.
      * Dispatch by tokenizer.ggml.model: "llama" (SPM, with scores) →
      * tok_init_spm; "gpt2" or unset (BPE w/ merges) → tok_init. */

@@ -693,6 +693,53 @@ void gguf_free_tokenizer(gguf_tokenizer_t *tok)
      * with current allocator. Leak is acceptable (boot-time allocation). */
 }
 
+extern float f16_to_f32(uint16_t h);
+
+int gguf_dequant_f16_to_f32(gguf_model_t *model)
+{
+    if (!model || !model->tensors) return -1;
+
+    uint64_t n_converted = 0;
+    uint64_t bytes_added = 0;
+
+    for (uint32_t i = 0; i < model->num_tensors; i++) {
+        gguf_tensor_t *t = &model->tensors[i];
+        if (t->type != GGML_TYPE_F16) continue;
+
+        /* Element count from shape; ne[k]==0 means dimension unused */
+        uint64_t n_elems = 1;
+        for (uint32_t d = 0; d < t->n_dims && d < 4; d++)
+            if (t->ne[d] > 0) n_elems *= t->ne[d];
+
+        if (n_elems == 0) continue;
+
+        uint64_t new_bytes = n_elems * sizeof(float);
+        float *out = (float *)mem_alloc_aligned(new_bytes, 64);
+        if (!out) {
+            serial_puts("[GGUF] dequant alloc failed at tensor ");
+            serial_putdec(i); serial_puts("\n");
+            return -1;
+        }
+
+        const uint16_t *src = (const uint16_t *)t->data;
+        for (uint64_t k = 0; k < n_elems; k++)
+            out[k] = f16_to_f32(src[k]);
+
+        t->data = out;
+        t->type = GGML_TYPE_F32;
+        t->size = new_bytes;
+        n_converted++;
+        bytes_added += new_bytes;
+    }
+
+    serial_puts("[GGUF] Pre-dequant F16->F32: ");
+    serial_putdec(n_converted);
+    serial_puts(" tensors, +");
+    serial_putdec(bytes_added / (1024 * 1024));
+    serial_puts(" MB\n");
+    return 0;
+}
+
 /* ── WASM: load from in-memory buffer ───────────────────────────
  *
  * Replaces gguf_load for the WASM build where OsitoFS is unavailable.

@@ -192,6 +192,24 @@ typedef struct {
 int gguf_load_tokenizer(gguf_model_t *model, gguf_tokenizer_t *tok);
 
 /*
+ * gguf_dequant_f16_to_f32 — Convert all F16 tensors to F32 in place.
+ *
+ * For each tensor with type==GGML_TYPE_F16 in model->tensors[]:
+ *   - Allocate a new f32 buffer of 2x the size
+ *   - Decode every element via the kernel's f16_to_f32 helper
+ *   - Repoint tensor->data, update type=F32 and size accordingly
+ *
+ * Memory cost: 2x the F16 tensor footprint. CPU cost: one-time at
+ * model load, scalar; for brandon-tiny-10m (~20MB f16) this is
+ * ~50-100 ms. After this runs, matvec hits the (auto-vectorizable)
+ * F32 path on every layer instead of the scalar f16-dequant-on-the-
+ * fly slow path.
+ *
+ * Returns 0 on success, -1 if any allocation fails.
+ */
+int gguf_dequant_f16_to_f32(gguf_model_t *model);
+
+/*
  * gguf_free_tokenizer — Free tokenizer data.
  */
 void gguf_free_tokenizer(gguf_tokenizer_t *tok);

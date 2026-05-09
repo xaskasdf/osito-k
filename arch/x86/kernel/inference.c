@@ -136,10 +136,18 @@ static void matvec(float *out, gguf_tensor_t *tensor,
         break;
     }
     case GGML_TYPE_F16: {
-        /* F16 weights (brandon-tiny ships every layer as f16). Dequant
-         * each element on the fly — for dim=256/720 this is fast enough
-         * without a dedicated AVX2 path; could be replaced with vcvtph2ps
-         * later if it ever shows up in profiles. */
+        /* F16 weights (brandon-tiny ships every layer as f16). Native
+         * x86 dispatches to matvec_f16_avx2 (vcvtph2ps hardware
+         * conversion 8 lanes at a time). WASM falls through to scalar
+         * dequant — but the WASM build pre-dequants F16 → F32 at load
+         * time (gguf_dequant_f16_to_f32 in wasm_init.c) so this path
+         * never fires there. */
+#ifndef __EMSCRIPTEN__
+        extern void matvec_f16_avx2(float *out, const void *weight,
+                                     const float *input,
+                                     uint32_t rows, uint32_t cols);
+        matvec_f16_avx2(out, tensor->data, input, rows, cols);
+#else
         const uint16_t *w = (const uint16_t *)tensor->data;
         for (uint32_t r = 0; r < rows; r++) {
             float sum = 0.0f;
@@ -148,6 +156,7 @@ static void matvec(float *out, gguf_tensor_t *tensor,
                 sum += f16_to_f32(row[c]) * input[c];
             out[r] = sum;
         }
+#endif
         break;
     }
     default:
