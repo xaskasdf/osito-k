@@ -277,7 +277,9 @@
     const __OSITO_PROMPT_MAX = 4096;
     const __OSITO_RESP_OFF = 16 + 4096;
     const __OSITO_RESP_MAX = 8192;
-    let   __ositoSab = null;
+    /* Expose on window so kernel C side (EM_JS in osito_kernel_poll)
+     * can reach the SAB via window.__ositoSab. */
+    window.__ositoSab = null;
 
     window.__osito.chat = async function(prompt) {
         if (!Module || !Module.ccall) return '[oi_chat] runtime not ready';
@@ -294,24 +296,12 @@
                 'Serve with COOP=same-origin + COEP=credentialless (see arch/wasm/serve.py).');
             return null;
         }
-        if (!__ositoSab) __ositoSab = new SharedArrayBuffer(__OSITO_SAB_SIZE);
-        const i32 = new Int32Array(__ositoSab);
-        port.postMessage({ id: 'osito-bind', sab: __ositoSab });
-        port.addEventListener('message', async (e) => {
-            if (!e.data || e.data.id !== 'osito-chat-request') return;
-            const promptLen = i32[1];
-            const promptBytes = new Uint8Array(__ositoSab, __OSITO_PROMPT_OFF, promptLen);
-            const prompt = new TextDecoder().decode(promptBytes);
-            let resultStr;
-            try { resultStr = await window.__osito.chat(prompt); }
-            catch (err) { resultStr = '[oi_chat error] ' + (err.message || err); }
-            const resBytes = new TextEncoder().encode(resultStr);
-            const n = Math.min(resBytes.length, __OSITO_RESP_MAX - 1);
-            new Uint8Array(__ositoSab, __OSITO_RESP_OFF, n).set(resBytes.subarray(0, n));
-            i32[2] = n;
-            Atomics.store(i32, 0, 2);
-            Atomics.notify(i32, 0);
-        });
+        if (!window.__ositoSab) window.__ositoSab = new SharedArrayBuffer(__OSITO_SAB_SIZE);
+        const i32 = new Int32Array(window.__ositoSab);
+        port.postMessage({ id: 'osito-bind', sab: window.__ositoSab });
+        /* The actual oi_chat fulfilment runs in the kernel's
+         * osito_kernel_poll() (called from kb_getchar). The port
+         * is kept here for forward compat / debugging. */
         port.start && port.start();
     }
 

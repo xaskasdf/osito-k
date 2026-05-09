@@ -49,10 +49,17 @@ char kb_trygetchar(void)
     return c;
 }
 
+extern void osito_kernel_poll(void);  /* hal/stubs.c */
+
 char kb_getchar(void)
 {
-    while (!kb_has_input())
+    while (!kb_has_input()) {
+        /* Poll the worker→kernel oi_chat bridge while we're idle. The
+         * poll runs inside the kernel's natural Asyncify-aware
+         * execution context, so llama_chat works normally. */
+        osito_kernel_poll();
         emscripten_sleep(10);   /* yield to JS event loop — requires ASYNCIFY */
+    }
     return kb_trygetchar();
 }
 

@@ -178,19 +178,18 @@ Libs en `/lib/wasm32-wasi/`:
 - [x] ~~**Kernel-bridge imports**~~ ✅ done — `osito_env` import module with `oi_random_u32`, `oi_now_us`, `oi_log_kernel`. App constructor adds it to the WebAssembly imports table; ositok.h declares them with `__attribute__((import_module/import_name))`. Compiled programs link via `wasm-ld --allow-undefined`; runtime resolves them in the worker's App instance.
 - [x] ~~**Heredoc `<< EOF`**~~ ✅ done — shell main loop detects `<<TERM` in the command line, accumulates lines until terminator, feeds via `sh_stdin_buf`. Body cap 64KB.
 - [x] ~~**`cc -c`** compile-only~~ ✅ done — produces `.o` (auto-named `<basename>.o` if no `-o`).
-- [~] **Real `oi_chat`** — bridge plumbing complete (SharedArrayBuffer +
-      Atomics.wait + worker→main MessagePort + COOP/COEP server +
-      `osito_env.oi_chat` import + `osito_chat_sync` C export). Final
-      step blocked: `Module.ccall('osito_chat_sync')` enters `llama_chat`
-      from JS context, which hits a "null function" indirect-call error
-      under `MAIN_MODULE=1` even with `EMULATE_FUNCTION_POINTER_CASTS=1`.
-      Asyncify scope mismatch suspected. From the shell prompt
-      `chat <prompt>` works fine — only the JS→C ccall entry breaks.
-      Workarounds to try: (a) flag-poll bridge where the kernel C side
-      checks the SAB inside its `term_readline → emscripten_sleep` loop,
-      avoiding ccall entirely; (b) `addFunction` to register the chat
-      callback at runtime; (c) audit `ASYNCIFY_REMOVE` for misclassified
-      sync functions.
+- [x] ~~**Real `oi_chat`**~~ done — poll-based bridge. Worker writes
+      prompt to `SharedArrayBuffer`, sets state=1, `Atomics.wait`s. The
+      kernel's `osito_kernel_poll()` runs from inside `kb_getchar` and
+      `cc_drain_until_done` Asyncify-aware loops, reads the prompt via
+      EM_JS, runs the shell `chat` command capturing output via the
+      shell redirect, writes back to SAB, sets state=2, `Atomics.notify`.
+      Worker wakes, copies result into user wasm memory, returns bytes
+      written. The earlier `Module.ccall` path is left as a stub since
+      it hits an Asyncify edge case under `MAIN_MODULE=1` (function-table
+      indirect call to the llama callback fails when wasm is entered
+      from a non-Asyncify JS frame). Routing through the kernel's
+      ongoing execution avoids that entirely.
 - [x] ~~**`cat`/`head`/`tail` reading from stdin**~~ ✅ done — `cat` reads
       from `sh_stdin_buf` when no filename arg; `head`/`tail`/`grep`
       already supported it.

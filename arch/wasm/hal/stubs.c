@@ -866,43 +866,101 @@ extern void redir_capture(const char *s, size_t len);
 EMSCRIPTEN_KEEPALIVE
 const char *osito_chat_sync(const char *prompt)
 {
+    /* Kept as a stub for direct JS testing (Module.ccall path), but
+     * doesn't actually run inference: that path hits a wasm function
+     * table indirect-call error under MAIN_MODULE+Asyncify. The real
+     * entry is osito_kernel_poll() below, called from kb_getchar so
+     * inference runs inside the kernel's natural Asyncify-aware
+     * execution context. */
+    (void)prompt;
     osito_chat_buf[0] = 0;
-    if (!prompt_llama) {
-        const char *m = "[oi_chat] no model loaded";
-        memcpy(osito_chat_buf, m, strlen(m) + 1);
-        return osito_chat_buf;
-    }
+    const char *m = "[oi_chat] use poll path (osito_kernel_poll)";
+    memcpy(osito_chat_buf, m, strlen(m) + 1);
+    return osito_chat_buf;
+}
 
-    /* Save shell redirect state */
+/* ── Poll-based oi_chat bridge ───────────────────────────────────
+ *
+ * SAB layout (Int32 indices):
+ *   [0] = state (0 idle, 1 request, 2 response)
+ *   [1] = prompt length
+ *   [2] = response length
+ *   bytes [16..16+4096) = prompt
+ *   bytes [16+4096..16+4096+8192) = response
+ *
+ * The cc-worker writes a prompt and Atomics.wait's on state==1.
+ * Here in the kernel, kb_getchar's emscripten_sleep loop polls
+ * osito_kernel_poll() which checks the flag, runs the inference
+ * via shell_exec("chat ..."), writes the response back, sets state=2,
+ * Atomics.notify's the worker. Because the inference happens inside
+ * the kernel's running execution (not entered via Module.ccall), the
+ * Asyncify state is intact and llama_chat works normally.
+ */
+
+EM_JS(int, osito_poll_request_len, (), {
+    if (!window.__ositoSab) return 0;
+    var i32 = new Int32Array(window.__ositoSab);
+    return Atomics.load(i32, 0) === 1 ? i32[1] : 0;
+});
+
+EM_JS(void, osito_poll_get_prompt, (char *dst, int max), {
+    if (!window.__ositoSab) return;
+    var i32 = new Int32Array(window.__ositoSab);
+    var n = Math.min(i32[1], max);
+    var src = new Uint8Array(window.__ositoSab, 16, n);
+    HEAPU8.set(src, dst);
+});
+
+EM_JS(void, osito_poll_finish, (const char *src, int len), {
+    if (!window.__ositoSab) return;
+    var i32 = new Int32Array(window.__ositoSab);
+    var dst = new Uint8Array(window.__ositoSab, 16 + 4096, 8192);
+    var n = Math.min(len, 8192);
+    dst.set(HEAPU8.subarray(src, src + n));
+    i32[2] = n;
+    Atomics.store(i32, 0, 2);
+    Atomics.notify(i32, 0);
+});
+
+EMSCRIPTEN_KEEPALIVE
+void osito_kernel_poll(void)
+{
+    int plen = osito_poll_request_len();
+    if (plen <= 0) return;
+
+    char prompt[4096];
+    if (plen >= (int)sizeof(prompt)) plen = sizeof(prompt) - 1;
+    osito_poll_get_prompt(prompt, plen);
+    prompt[plen] = 0;
+
+    /* Save + hijack shell redirect to capture chat output */
     char    *sb_buf = redir_buf;
     uint32_t sb_pos = redir_pos;
     uint32_t sb_max = redir_max;
     sh_redir_fn_t sb_fn = sh_redir_fn;
 
-    /* Hijack: capture into osito_chat_buf */
-    redir_buf  = osito_chat_buf;
-    redir_pos  = 0;
-    redir_max  = OSITO_CHAT_OUT - 1;
+    redir_buf   = osito_chat_buf;
+    redir_pos   = 0;
+    redir_max   = OSITO_CHAT_OUT - 1;
     sh_redir_fn = redir_capture;
 
-    /* Build "chat <prompt>" command (mutable copy — shell_exec writes). */
-    char cmdline[2048];
+    char cmdline[4200];
     cmdline[0] = 0;
     strncat(cmdline, "chat ", sizeof(cmdline) - 1);
-    if (prompt) strncat(cmdline, prompt, sizeof(cmdline) - 1 - strlen(cmdline));
+    strncat(cmdline, prompt, sizeof(cmdline) - 1 - strlen(cmdline));
 
     extern void shell_exec(char *line);
     shell_exec(cmdline);
 
-    osito_chat_buf[redir_pos] = 0;
+    int resp_len = redir_pos;
+    osito_chat_buf[resp_len] = 0;
 
-    /* Restore */
-    redir_buf  = sb_buf;
-    redir_pos  = sb_pos;
-    redir_max  = sb_max;
+    redir_buf   = sb_buf;
+    redir_pos   = sb_pos;
+    redir_max   = sb_max;
     sh_redir_fn = sb_fn;
 
-    return osito_chat_buf;
+    osito_poll_finish(osito_chat_buf, resp_len);
 }
 
 /* ──────────────────────────────────────────────────────────────────
@@ -1133,12 +1191,17 @@ EM_JS(void, js_cc_run_wasi, (const uint8_t *src, int size, const char *name), {
     window.__cc.runWasi(bytes, nm).then(function() { window.__ccDone = true; });
 });
 
-/* Drain any pending output text into a kernel buffer + sleep until done. */
+/* Drain any pending output text into a kernel buffer + sleep until done.
+ * Also pumps osito_kernel_poll so user wasm programs running in the
+ * cc-worker can call oi_chat → kernel runs llama_chat → response. */
+extern void osito_kernel_poll(void);
+
 static void cc_drain_until_done(void)
 {
     extern void serial_puts(const char *);
     char buf[1024];
     while (!js_cc_done()) {
+        osito_kernel_poll();
         int n = js_cc_drain(buf, (int)sizeof(buf) - 1);
         if (n > 0) { buf[n] = 0; serial_puts(buf); }
         else       { emscripten_sleep(50); }
