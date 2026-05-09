@@ -3518,6 +3518,135 @@ void shell_exec(char *line)
     } else if (strcmp(cmd, "penalty") == 0) {
         cmd_penalty(argc, argv);
 #ifdef __EMSCRIPTEN__
+    } else if (strcmp(cmd, "crypto") == 0) {
+        if (argc < 3) {
+            sh_puts("Usage: crypto <hash|hmac> <text>\n");
+            sh_puts("  crypto sha256 <text>   SHA-256 hex\n");
+            sh_puts("  crypto sha512 <text>   SHA-512 hex\n");
+            sh_puts("  crypto chacha <key32> <text>   ChaCha20 hex output\n");
+        } else if (strcmp(argv[1], "sha256") == 0) {
+            extern void sha256(const void *data, uint32_t len, uint8_t digest[32]);
+            uint8_t d[32];
+            char buf[1024]; int p = 0;
+            for (int i = 2; i < argc && p < (int)sizeof(buf) - 1; i++) {
+                if (i > 2 && p < (int)sizeof(buf) - 1) buf[p++] = ' ';
+                const char *w = argv[i];
+                while (*w && p < (int)sizeof(buf) - 1) buf[p++] = *w++;
+            }
+            sha256(buf, p, d);
+            static const char hex[] = "0123456789abcdef";
+            char out[65];
+            for (int i = 0; i < 32; i++) {
+                out[i*2]   = hex[(d[i] >> 4) & 0xF];
+                out[i*2+1] = hex[d[i] & 0xF];
+            }
+            out[64] = '\0';
+            sh_puts(out); sh_puts("\n");
+        } else if (strcmp(argv[1], "sha512") == 0) {
+            extern void sha512(const uint8_t *data, uint64_t len, uint8_t hash[64]);
+            uint8_t d[64];
+            char buf[1024]; int p = 0;
+            for (int i = 2; i < argc && p < (int)sizeof(buf) - 1; i++) {
+                if (i > 2 && p < (int)sizeof(buf) - 1) buf[p++] = ' ';
+                const char *w = argv[i];
+                while (*w && p < (int)sizeof(buf) - 1) buf[p++] = *w++;
+            }
+            sha512((const uint8_t *)buf, (uint64_t)p, d);
+            static const char hex[] = "0123456789abcdef";
+            char out[129];
+            for (int i = 0; i < 64; i++) {
+                out[i*2]   = hex[(d[i] >> 4) & 0xF];
+                out[i*2+1] = hex[d[i] & 0xF];
+            }
+            out[128] = '\0';
+            sh_puts(out); sh_puts("\n");
+        } else {
+            sh_puts("Unknown crypto subcommand.\n");
+        }
+    } else if (strcmp(cmd, "tcp") == 0) {
+        /* TCP-over-WS bridge: substitutes {host} and {port} into a
+         * configured WSS proxy URL, then opens via wasm_ws_open. The
+         * proxy must be a server that bridges WS frames ↔ TCP bytes. */
+        static char tcp_proxy_url[256] =
+            "wss://tcp-proxy.naranjositos.tech/?host={host}&port={port}";
+
+        if (argc < 2) {
+            sh_puts("Usage: tcp <proxy|connect|send|recv|close|list> [args]\n");
+            sh_puts("  tcp proxy <url-template>      set the WS proxy URL\n");
+            sh_puts("                                placeholders: {host}, {port}\n");
+            sh_puts("  tcp connect <host> <port> [name]\n");
+            sh_puts("  tcp send <name> <data...>     same shape as `ws send`\n");
+            sh_puts("  tcp recv <name> [ms]\n");
+            sh_puts("  tcp close <name>\n");
+            sh_puts("  tcp list                       (alias of ws list)\n");
+            sh_puts("Current proxy: ");
+            sh_puts(tcp_proxy_url); sh_puts("\n");
+        } else if (strcmp(argv[1], "proxy") == 0) {
+            if (argc < 3) { sh_puts("Usage: tcp proxy <url-template>\n"); }
+            else {
+                int n = 0;
+                while (argv[2][n] && n < (int)sizeof(tcp_proxy_url) - 1) {
+                    tcp_proxy_url[n] = argv[2][n]; n++;
+                }
+                tcp_proxy_url[n] = '\0';
+                sh_puts("[tcp] proxy set\n");
+            }
+        } else if (strcmp(argv[1], "connect") == 0) {
+            if (argc < 4) { sh_puts("Usage: tcp connect <host> <port> [name]\n"); }
+            else {
+                const char *name = argc >= 5 ? argv[4] : "tcp";
+                if (ws_slot_find(name)) { sh_puts("Slot in use.\n"); }
+                else {
+                    /* Substitute {host}/{port} into the template */
+                    char url[512];
+                    int up = 0;
+                    const char *t = tcp_proxy_url;
+                    while (*t && up < (int)sizeof(url) - 1) {
+                        if (t[0] == '{' && t[1] == 'h' && t[2] == 'o' &&
+                            t[3] == 's' && t[4] == 't' && t[5] == '}') {
+                            const char *h = argv[2];
+                            while (*h && up < (int)sizeof(url) - 1) url[up++] = *h++;
+                            t += 6;
+                        } else if (t[0] == '{' && t[1] == 'p' && t[2] == 'o' &&
+                                   t[3] == 'r' && t[4] == 't' && t[5] == '}') {
+                            const char *p = argv[3];
+                            while (*p && up < (int)sizeof(url) - 1) url[up++] = *p++;
+                            t += 6;
+                        } else {
+                            url[up++] = *t++;
+                        }
+                    }
+                    url[up] = '\0';
+
+                    ws_slot_t *slot = ws_slot_alloc();
+                    if (!slot) { sh_puts("No free slots.\n"); }
+                    else {
+                        int h = wasm_ws_open(url);
+                        if (h <= 0) { sh_puts_color("[tcp] open failed\n", 0x00FF0000); }
+                        else if (wasm_ws_wait_open(h, 5000) < 0) {
+                            sh_puts_color("[tcp] handshake/timeout\n", 0x00FF0000);
+                            wasm_ws_close(h);
+                        } else {
+                            slot->handle = h;
+                            int n = 0;
+                            while (n < 15 && name[n]) { slot->name[n] = name[n]; n++; }
+                            slot->name[n] = '\0';
+                            sh_puts_color("[tcp] connected as '", 0x0000FF00);
+                            sh_puts(slot->name); sh_puts("' via proxy\n");
+                        }
+                    }
+                }
+            }
+        } else if (strcmp(argv[1], "send") == 0 ||
+                   strcmp(argv[1], "recv") == 0 ||
+                   strcmp(argv[1], "close") == 0 ||
+                   strcmp(argv[1], "list") == 0) {
+            sh_puts("Use 'ws ");
+            sh_puts(argv[1]);
+            sh_puts(" ...' — tcp slots share the same name table.\n");
+        } else {
+            sh_puts("Unknown tcp subcommand.\n");
+        }
     } else if (strcmp(cmd, "ws") == 0) {
         if (argc < 2) {
             sh_puts("Usage: ws <open|send|recv|close|list> [args...]\n");
