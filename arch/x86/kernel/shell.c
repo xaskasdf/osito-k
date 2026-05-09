@@ -301,6 +301,8 @@ int cmd_aux_fs_ls(const char *path)
     wasm_nvme_route_aux(0);
     return rc;
 }
+
+void cmd_clear_aux_fs(void) { g_active_aux_fs = NULL; }
 #endif
 
 /* ── WASM-compatibility shims ────────────────────────────────── */
@@ -648,32 +650,63 @@ static void cmd_cat(int argc, char *argv[])
     }
 
 #ifdef __EMSCRIPTEN__
-    /* Auto-mount path: paths under /aux/ route to the currently
-     * mounted auxiliary FS (set by `mount-fs <type> <url>`). The
-     * leading "/aux/" is stripped before calling the FS read_file. */
-    if (argv[1][0] == '/' && argv[1][1] == 'a' && argv[1][2] == 'u' &&
-        argv[1][3] == 'x' && argv[1][4] == '/') {
-        if (!cmd_active_aux_fs()) {
-            sh_puts("No aux FS mounted. Run: mount-fs <type> <url>\n");
+    /* Auto-mount path: any of /aux/, /iso/, /ext/, /fat/, /exfat/,
+     * /ntfs/, /hfs/, /btrfs/, /apfs/, /udf/, /sqfs/ routes to the
+     * currently mounted aux FS, but only when the prefix matches the
+     * mounted type (so /iso/foo errors clearly if a FAT image is
+     * mounted instead of ISO). The catch-all /aux/ accepts whatever
+     * is mounted. */
+    {
+        static const struct { const char *prefix; int plen; const char *fs_name; } pre[] = {
+            { "/aux/",   5, NULL },
+            { "/iso/",   5, "iso"   },
+            { "/ext/",   5, "ext"   },
+            { "/fat/",   5, "fat"   },
+            { "/exfat/", 7, "exfat" },
+            { "/ntfs/",  6, "ntfs"  },
+            { "/hfs/",   5, "hfs"   },
+            { "/btrfs/", 7, "btrfs" },
+            { "/apfs/",  6, "apfs"  },
+            { "/udf/",   5, "udf"   },
+            { "/sqfs/",  6, "sqfs"  },
+        };
+        for (int k = 0; k < (int)(sizeof(pre)/sizeof(pre[0])); k++) {
+            int plen = pre[k].plen;
+            int matched = 1;
+            for (int j = 0; j < plen; j++) {
+                if (argv[1][j] != pre[k].prefix[j]) { matched = 0; break; }
+            }
+            if (!matched) continue;
+
+            const aux_fs_t *fs = cmd_active_aux_fs();
+            if (!fs) {
+                sh_puts("No aux FS mounted. Run: mount-fs <type> <url>\n");
+                return;
+            }
+            if (pre[k].fs_name && strcmp(pre[k].fs_name, fs->name) != 0) {
+                sh_puts("Aux FS type mismatch (mounted=");
+                sh_puts(fs->name); sh_puts(", path expects=");
+                sh_puts(pre[k].fs_name); sh_puts(").\n");
+                return;
+            }
+            static char aux_buf[65536];
+            int n = cmd_aux_fs_read(argv[1] + plen, aux_buf, sizeof(aux_buf));
+            if (n <= 0) {
+                sh_puts("File not found in aux FS.\n");
+                return;
+            }
+            char chunk[256];
+            int i = 0;
+            while (i < n) {
+                int kk = n - i; if (kk > 255) kk = 255;
+                for (int j = 0; j < kk; j++) chunk[j] = aux_buf[i + j];
+                chunk[kk] = '\0';
+                sh_puts(chunk);
+                i += kk;
+            }
+            sh_puts("\n");
             return;
         }
-        static char aux_buf[65536];
-        int n = cmd_aux_fs_read(argv[1] + 5, aux_buf, sizeof(aux_buf));
-        if (n <= 0) {
-            sh_puts("File not found in aux FS.\n");
-            return;
-        }
-        char chunk[256];
-        int i = 0;
-        while (i < n) {
-            int k = n - i; if (k > 255) k = 255;
-            for (int j = 0; j < k; j++) chunk[j] = aux_buf[i + j];
-            chunk[k] = '\0';
-            sh_puts(chunk);
-            i += k;
-        }
-        sh_puts("\n");
-        return;
     }
 #endif
 
@@ -3090,13 +3123,34 @@ void shell_exec(char *line)
         cmd_echo(argc, argv);
     } else if (strcmp(cmd, "ls") == 0) {
 #ifdef __EMSCRIPTEN__
-        /* `ls /aux` or `ls /aux/...` lists the active aux FS. */
-        if (argc >= 2 && argv[1][0] == '/' &&
-            argv[1][1] == 'a' && argv[1][2] == 'u' && argv[1][3] == 'x') {
-            if (!cmd_active_aux_fs()) {
-                sh_puts("No aux FS mounted. Run: mount-fs <type> <url>\n");
+        /* `ls /aux` or any per-fs prefix lists the active aux FS. */
+        if (argc >= 2 && argv[1][0] == '/') {
+            static const char *prefixes[] = {
+                "aux", "iso", "ext", "fat", "exfat", "ntfs", "hfs",
+                "btrfs", "apfs", "udf", "sqfs", NULL
+            };
+            int matched = 0;
+            const char *rest = NULL;
+            for (int k = 0; prefixes[k]; k++) {
+                int plen = 0; while (prefixes[k][plen]) plen++;
+                int ok = 1;
+                for (int j = 0; j < plen; j++) {
+                    if (argv[1][1 + j] != prefixes[k][j]) { ok = 0; break; }
+                }
+                if (ok && (argv[1][1 + plen] == '\0' || argv[1][1 + plen] == '/')) {
+                    matched = 1;
+                    rest = argv[1] + 1 + plen;
+                    break;
+                }
+            }
+            if (matched) {
+                if (!cmd_active_aux_fs()) {
+                    sh_puts("No aux FS mounted. Run: mount-fs <type> <url>\n");
+                } else {
+                    cmd_aux_fs_ls(rest);
+                }
             } else {
-                cmd_aux_fs_ls(argv[1] + 4);
+                cmd_ls();
             }
         } else
 #endif
@@ -3803,6 +3857,14 @@ void shell_exec(char *line)
                 sh_putdec(aux_disk_size() / (1024 * 1024));
                 sh_puts(" MB)\n");
             }
+        }
+    } else if (strcmp(cmd, "umount") == 0 || strcmp(cmd, "umount-fs") == 0) {
+        if (!cmd_active_aux_fs()) {
+            sh_puts("No aux FS mounted.\n");
+        } else {
+            extern void cmd_clear_aux_fs(void);
+            cmd_clear_aux_fs();
+            sh_puts("[umount] aux FS detached\n");
         }
     } else if (strcmp(cmd, "fs-ls") == 0) {
         if (!g_active_aux_fs) sh_puts("No FS mounted (mount-fs <type> <url>).\n");
