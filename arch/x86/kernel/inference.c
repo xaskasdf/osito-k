@@ -135,6 +135,21 @@ static void matvec(float *out, gguf_tensor_t *tensor,
         }
         break;
     }
+    case GGML_TYPE_F16: {
+        /* F16 weights (brandon-tiny ships every layer as f16). Dequant
+         * each element on the fly — for dim=256/720 this is fast enough
+         * without a dedicated AVX2 path; could be replaced with vcvtph2ps
+         * later if it ever shows up in profiles. */
+        const uint16_t *w = (const uint16_t *)tensor->data;
+        for (uint32_t r = 0; r < rows; r++) {
+            float sum = 0.0f;
+            const uint16_t *row = w + (uint64_t)r * cols;
+            for (uint32_t c = 0; c < cols; c++)
+                sum += f16_to_f32(row[c]) * input[c];
+            out[r] = sum;
+        }
+        break;
+    }
     default:
         memset(out, 0, rows * sizeof(float));
         break;
@@ -819,6 +834,14 @@ int llama_forward(llama_state_t *s, uint32_t token)
  *  Spec: ~/osito-a-models/docs/brandon-arch-spec.md
  * ══════════════════════════════════════════════════════════════ */
 
+/* Runtime debug toggles to bisect brandon's forward pass. Default ON
+ * matches the spec; setting any to 0 lets us check whether the
+ * gibberish output traces to that one feature. */
+static bool g_brandon_use_dwa            = true;
+static bool g_brandon_use_value_residual = true;
+static bool g_brandon_use_registers      = true;
+static bool g_brandon_debug_logits       = false;
+
 /* One pass through the n_layers logical stack. produce_logits=false
  * is used during register prefill (the output isn't consumed). */
 static int brandon_forward_one(llama_state_t *s, uint32_t pos, bool produce_logits)
@@ -827,8 +850,11 @@ static int brandon_forward_one(llama_state_t *s, uint32_t pos, bool produce_logi
     uint32_t kv_dim = s->kv_dim;
     uint32_t hd     = s->head_dim;
 
+    bool eff_use_dwa            = s->use_dwa            && g_brandon_use_dwa;
+    bool eff_use_value_residual = s->use_value_residual && g_brandon_use_value_residual;
+
     /* dwa_buf[0] := embedding (input to layer 0). */
-    if (s->use_dwa)
+    if (eff_use_dwa)
         memcpy(s->dwa_buf, s->x, dim * sizeof(float));
 
     /* Value Residual Learning is per-forward (per-token), not per-slot.
@@ -851,7 +877,7 @@ static int brandon_forward_one(llama_state_t *s, uint32_t pos, bool produce_logi
          *     itself uses raw V; do NOT add v_first to it.
          *   - Layers 1..n: add v_first element-wise to V before cache + attn.
          * V never gets RoPE. */
-        if (s->use_value_residual) {
+        if (eff_use_value_residual) {
             if (l == 0) {
                 if (!s->v_first_captured) {
                     memcpy(s->v_first, s->v, kv_dim * sizeof(float));
@@ -912,7 +938,7 @@ static int brandon_forward_one(llama_state_t *s, uint32_t pos, bool produce_logi
         vec_add(s->x, s->x, s->xb, dim);
 
         /* DenseFormer DWA: append layer-L output, replace x with weighted sum */
-        if (s->use_dwa) {
+        if (eff_use_dwa) {
             float *h_slot = s->dwa_buf + (uint64_t)(l + 1) * dim;
             memcpy(h_slot, s->x, dim * sizeof(float));
 
@@ -951,7 +977,7 @@ int brandon_forward(llama_state_t *s, uint32_t token)
     /* Lazy register prefill on the first call. The n_registers learnable
      * embeddings occupy positions 0..n_registers-1 of the KV cache; user
      * tokens then start at position n_registers. */
-    if (s->n_registers > 0 && !s->registers_prefilled) {
+    if (g_brandon_use_registers && s->n_registers > 0 && !s->registers_prefilled) {
         const uint8_t *reg_data = (const uint8_t *)s->register_weights->data;
         uint32_t reg_dtype = s->register_weights->type;
         uint64_t reg_row_bytes = (uint64_t)s->dim *
@@ -979,6 +1005,25 @@ int brandon_forward(llama_state_t *s, uint32_t token)
     if (brandon_forward_one(s, s->pos, /*produce_logits=*/true) != 0)
         return -1;
     s->pos++;
+
+    /* Debug: dump top-3 candidate tokens to serial after forward */
+    if (g_brandon_debug_logits) {
+        float *L = s->logits;
+        uint32_t n = s->vocab_size;
+        uint32_t a0 = 0, a1 = 0, a2 = 0;
+        float v0 = -1e30f, v1 = -1e30f, v2 = -1e30f;
+        for (uint32_t i = 0; i < n; i++) {
+            float v = L[i];
+            if (v > v0) { v2 = v1; a2 = a1; v1 = v0; a1 = a0; v0 = v; a0 = i; }
+            else if (v > v1) { v2 = v1; a2 = a1; v1 = v; a1 = i; }
+            else if (v > v2) { v2 = v; a2 = i; }
+        }
+        serial_puts("[DBG] top3 tok="); serial_putdec(a0);
+        serial_puts(","); serial_putdec(a1);
+        serial_puts(","); serial_putdec(a2);
+        serial_puts(" pos="); serial_putdec(s->pos);
+        serial_puts("\n");
+    }
     return 0;
 }
 
@@ -1587,6 +1632,14 @@ void llama_set_sampling(float temperature, float top_p)
     g_temperature = temperature;
     g_top_p = top_p;
 }
+
+void brandon_set_features(int dwa, int v_residual, int registers)
+{
+    g_brandon_use_dwa            = dwa != 0;
+    g_brandon_use_value_residual = v_residual != 0;
+    g_brandon_use_registers      = registers != 0;
+}
+void brandon_set_debug_logits(int on) { g_brandon_debug_logits = on != 0; }
 
 void llama_set_penalty(float rep, float presence, float frequency)
 {

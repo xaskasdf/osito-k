@@ -146,6 +146,8 @@ extern int  llama_chat(void *state, const char *text, uint32_t max_tokens,
 extern void llama_set_sampling(float temperature, float top_p);
 extern void llama_set_penalty(float rep, float presence, float frequency);
 extern void llama_get_penalty(float *rep, float *presence, float *frequency);
+extern void brandon_set_features(int dwa, int v_residual, int registers);
+extern void brandon_set_debug_logits(int on);
 
 /* ── WASM-compatibility shims ────────────────────────────────── */
 #ifdef __EMSCRIPTEN__
@@ -3222,6 +3224,21 @@ void shell_exec(char *line)
         cmd_rag(argc, argv);
     } else if (strcmp(cmd, "penalty") == 0) {
         cmd_penalty(argc, argv);
+    } else if (strcmp(cmd, "bdebug") == 0) {
+        if (argc < 2) {
+            sh_puts("Usage: bdebug <dwa|vr|reg|logits|all|none> [0|1]\n");
+            sh_puts("  dwa: DenseFormer DWA mixing  vr: value residual\n");
+            sh_puts("  reg: register prefill        logits: serial dump top-3 each token\n");
+        } else {
+            int v = (argc >= 3) ? (argv[2][0] != '0') : 1;
+            if (strcmp(argv[1], "dwa") == 0)        brandon_set_features(v, 1, 1);
+            else if (strcmp(argv[1], "vr") == 0)    brandon_set_features(1, v, 1);
+            else if (strcmp(argv[1], "reg") == 0)   brandon_set_features(1, 1, v);
+            else if (strcmp(argv[1], "logits") == 0) brandon_set_debug_logits(v);
+            else if (strcmp(argv[1], "all") == 0)   { brandon_set_features(1,1,1); brandon_set_debug_logits(0); }
+            else if (strcmp(argv[1], "none") == 0)  { brandon_set_features(0,0,0); brandon_set_debug_logits(0); }
+            sh_puts("bdebug applied\n");
+        }
     } else if (strcmp(cmd, "temp") == 0) {
         cmd_temp(argc, argv);
     } else if (strcmp(cmd, "dl") == 0) {
