@@ -854,6 +854,7 @@ void *prompt_llama = NULL;
 
 #define OSITO_CHAT_OUT 8192
 static char osito_chat_buf[OSITO_CHAT_OUT];
+static int  osito_chat_pos;
 
 /* shell.c statics we hijack temporarily */
 extern char    *redir_buf;
@@ -922,6 +923,22 @@ EM_JS(void, osito_poll_finish, (const char *src, int len), {
     Atomics.notify(i32, 0);
 });
 
+extern int llama_chat(void *state, const char *text, uint32_t max_tokens,
+                      void (*on_token)(const char *text, void *ctx),
+                      void *ctx);
+
+EMSCRIPTEN_KEEPALIVE
+void osito_chat_token_cb(const char *piece, void *ctx)
+{
+    (void)ctx;
+    if (!piece) return;
+    int len = (int)strlen(piece);
+    if (osito_chat_pos + len + 1 >= OSITO_CHAT_OUT) return;
+    memcpy(osito_chat_buf + osito_chat_pos, piece, (size_t)len);
+    osito_chat_pos += len;
+    osito_chat_buf[osito_chat_pos] = 0;
+}
+
 EMSCRIPTEN_KEEPALIVE
 void osito_kernel_poll(void)
 {
@@ -933,34 +950,21 @@ void osito_kernel_poll(void)
     osito_poll_get_prompt(prompt, plen);
     prompt[plen] = 0;
 
-    /* Save + hijack shell redirect to capture chat output */
-    char    *sb_buf = redir_buf;
-    uint32_t sb_pos = redir_pos;
-    uint32_t sb_max = redir_max;
-    sh_redir_fn_t sb_fn = sh_redir_fn;
+    osito_chat_pos = 0;
+    osito_chat_buf[0] = 0;
 
-    redir_buf   = osito_chat_buf;
-    redir_pos   = 0;
-    redir_max   = OSITO_CHAT_OUT - 1;
-    sh_redir_fn = redir_capture;
+    if (prompt_llama) {
+        /* Direct call to llama_chat — same Asyncify context as the
+         * shell's own `chat` command, so the indirect call to the
+         * token callback works. 32 tokens cap for browser latency. */
+        llama_chat(prompt_llama, prompt, 32, osito_chat_token_cb, NULL);
+    } else {
+        const char *m = "[oi_chat] no model";
+        memcpy(osito_chat_buf, m, strlen(m));
+        osito_chat_pos = strlen(m);
+    }
 
-    char cmdline[4200];
-    cmdline[0] = 0;
-    strncat(cmdline, "chat ", sizeof(cmdline) - 1);
-    strncat(cmdline, prompt, sizeof(cmdline) - 1 - strlen(cmdline));
-
-    extern void shell_exec(char *line);
-    shell_exec(cmdline);
-
-    int resp_len = redir_pos;
-    osito_chat_buf[resp_len] = 0;
-
-    redir_buf   = sb_buf;
-    redir_pos   = sb_pos;
-    redir_max   = sb_max;
-    sh_redir_fn = sb_fn;
-
-    osito_poll_finish(osito_chat_buf, resp_len);
+    osito_poll_finish(osito_chat_buf, osito_chat_pos);
 }
 
 /* ──────────────────────────────────────────────────────────────────
