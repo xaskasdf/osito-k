@@ -4378,6 +4378,75 @@ void shell_exec(char *line)
         sh_puts_color("\nEverything you do persists across page reloads (IndexedDB).\n", 0x00888888);
         sh_puts_color("Press up-arrow to recall previous commands.\n", 0x00888888);
         sh_puts_color("`help` lists all 121+ builtins.\n\n", 0x00888888);
+    } else if (strcmp(cmd, "stress") == 0) {
+        /* Quick smoke test of the major bridges. Does NOT touch network
+         * unless you pass `stress net` explicitly. */
+        sh_puts_color("\n=== stress test ===\n", 0x00FF8800);
+        bool with_net = (argc >= 2 && strcmp(argv[1], "net") == 0);
+
+        /* 1. FS round-trip */
+        sh_puts("[1/5] osfs2 create+read+verify... ");
+        const char *p = "stress-test-payload";
+        int plen = 0; while (p[plen]) plen++;
+        extern void *osfs2_find(const char *);
+        extern void *osfs2_create(const char *, uint64_t);
+        extern int   osfs2_write(void *, uint64_t, const void *, uint64_t);
+        extern int   osfs2_read (void *, uint64_t, void *, uint64_t);
+        void *f = osfs2_find(".stress");
+        if (!f) f = osfs2_create(".stress", 64);
+        if (f && osfs2_write(f, 0, p, plen) >= 0) {
+            char rb[64];
+            if (osfs2_read(f, 0, rb, plen) >= 0 && rb[0] == 's')
+                sh_puts_color("ok\n", 0x0000FF00);
+            else sh_puts_color("FAIL (read)\n", 0x00FF0000);
+        } else sh_puts_color("FAIL (create/write)\n", 0x00FF0000);
+
+        /* 2. Crypto */
+        sh_puts("[2/5] sha256... ");
+        extern void sha256(const void *, uint32_t, uint8_t[32]);
+        uint8_t d[32];
+        sha256("hello", 5, d);
+        /* 'hello' SHA-256 starts with 0x2cf24dba */
+        if (d[0] == 0x2c && d[1] == 0xf2 && d[2] == 0x4d && d[3] == 0xba)
+            sh_puts_color("ok\n", 0x0000FF00);
+        else sh_puts_color("FAIL\n", 0x00FF0000);
+
+        /* 3. Inference */
+        sh_puts("[3/5] llama_chat... ");
+        if (prompt_llama) {
+            int g = llama_chat(prompt_llama, "hi", 8, NULL, NULL);
+            if (g > 0) {
+                sh_puts_color("ok (", 0x0000FF00);
+                sh_putdec((uint64_t)g); sh_puts(" tok)\n");
+            } else sh_puts_color("FAIL (gen=0)\n", 0x00FF0000);
+        } else sh_puts_color("SKIP (no model)\n", 0x00888888);
+
+        /* 4. Git */
+        sh_puts("[4/5] git status... ");
+        git_status();
+        sh_puts_color("[git] section above\n", 0x0000FF00);
+
+        /* 5. Network bridge (only if requested) */
+        sh_puts("[5/5] network... ");
+#ifdef __EMSCRIPTEN__
+        if (with_net) {
+            uint8_t *body = NULL; int len = 0;
+            int status = wasm_http_request("https://1.1.1.1/cdn-cgi/trace",
+                                            "GET", "{}", NULL, &body, &len);
+            if (status > 0 && status / 100 == 2) {
+                sh_puts_color("ok (HTTP ", 0x0000FF00);
+                sh_putdec((uint64_t)status); sh_puts(", ");
+                sh_putdec((uint64_t)len); sh_puts(" bytes)\n");
+            } else sh_puts_color("FAIL\n", 0x00FF0000);
+            if (body) free(body);
+        } else {
+            sh_puts_color("SKIP (run `stress net` to include)\n", 0x00888888);
+        }
+#else
+        (void)with_net;
+        sh_puts_color("SKIP (native build)\n", 0x00888888);
+#endif
+        sh_puts_color("=== done ===\n\n", 0x00FF8800);
     } else if (strcmp(cmd, "save") == 0) {
 #ifdef __EMSCRIPTEN__
         extern void wasm_persist_flush(void);
