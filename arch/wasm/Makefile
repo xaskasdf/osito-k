@@ -171,7 +171,11 @@ $(BUILDDIR):
 
 $(BUILDDIR)/osito.html: $(ALL_SRCS) shell.html manifest.json sw.js | $(BUILDDIR)
 	$(CC) $(CFLAGS) $(EMFLAGS) $(ALL_SRCS) -o $(BUILDDIR)/osito.html
-	cp manifest.json sw.js $(BUILDDIR)/
+	cp manifest.json $(BUILDDIR)/
+	# Stamp the Service Worker cache name with the wasm md5 so each
+	# new build invalidates the previous SW cache automatically.
+	@WASM_HASH=$$(md5 -q $(BUILDDIR)/osito.wasm 2>/dev/null || md5sum $(BUILDDIR)/osito.wasm | cut -d' ' -f1); \
+	sed "s/osito-k-v1/osito-k-$$WASM_HASH/" sw.js > $(BUILDDIR)/sw.js
 
 run: all
 	emrun $(BUILDDIR)/osito.html
