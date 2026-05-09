@@ -1733,10 +1733,26 @@ void io_predict_reset(void) {}
 void io_predict_stats(void) {}
 
 /* ── NVMe extra helpers ───────────────────────────────────────── */
+/* Dispatch flag — when 1, nvme_read serves the auxiliary disk buffer
+ * (used by fat32_mount which calls nvme_read internally). The wrapping
+ * shell command sets this around fat32 ops, then clears it.        */
+static int g_nvme_route_aux = 0;
+void wasm_nvme_route_aux(int on) { g_nvme_route_aux = on != 0; }
+
+extern int aux_disk_read_512(uint64_t lba, uint32_t count, void *buf);
+
 int  nvme_read(uint64_t lba, uint32_t count, void *buf)
-{ return nvme_read_bytes(lba * 512, buf, (uint64_t)count * 512); }
+{
+    if (g_nvme_route_aux) {
+        return aux_disk_read_512(lba, count, buf);
+    }
+    return nvme_read_bytes(lba * 512, buf, (uint64_t)count * 512);
+}
 int  nvme_write(uint64_t lba, uint32_t count, const void *buf)
-{ return nvme_write_bytes(lba * 512, buf, (uint64_t)count * 512); }
+{
+    if (g_nvme_route_aux) return -1;  /* aux is read-only */
+    return nvme_write_bytes(lba * 512, buf, (uint64_t)count * 512);
+}
 int  nvme_read_async(uint64_t lba, uint32_t count, uint64_t phys_addr)
 { (void)lba; (void)count; (void)phys_addr; return -1; }
 int  nvme_wait_cq(uint16_t cid)        { (void)cid; return 0; }

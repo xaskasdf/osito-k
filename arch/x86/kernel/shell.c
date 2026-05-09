@@ -152,17 +152,36 @@ extern void     llama_set_ngram_size(uint32_t n);
 extern uint32_t llama_get_ngram_size(void);
 
 #ifdef __EMSCRIPTEN__
-/* Auxiliary disk fetch — used by `mount-iso <url>` to load a CD image
- * from the network into a HEAP buffer that iso9660_mount reads through
- * a custom callback (no contention with the primary OsitoFS image). */
+/* Auxiliary disk fetch — used by mount-iso/mount-ext2 to load a disk
+ * image from the network into a HEAP buffer that fs drivers read
+ * through a custom callback (no contention with primary OsitoFS). */
 extern int      aux_disk_fetch(const char *url);
 extern int      aux_disk_read_iso(uint64_t lba, uint32_t count, void *buf);
+extern int      aux_disk_read_512(uint64_t lba, uint32_t count, void *buf);
 extern uint64_t aux_disk_size(void);
+
+/* iso9660 */
 extern int      iso9660_mount(int (*read_fn)(uint64_t lba, uint32_t count, void *buf));
 extern bool     iso9660_is_mounted(void);
 extern int      iso9660_ls(const char *path);
 extern int      iso9660_read_file(const char *name, uint64_t offset, void *buf, uint64_t len);
 extern int      iso9660_find(const char *name, uint32_t *lba_out, uint32_t *size_out);
+
+/* ext2/3/4 */
+extern int      ext2_mount(uint64_t part_lba,
+                            int (*read_fn)(uint64_t lba, uint32_t count, void *buf));
+extern bool     ext2_is_mounted(void);
+extern int      ext2_ls(void);
+extern int      ext2_find(const char *name, uint32_t *ino_out);
+extern int      ext2_read_file(const char *name, uint64_t offset, void *buf, uint64_t len);
+
+/* fat32 — uses nvme_read internally; we toggle the route flag around it */
+extern void     wasm_nvme_route_aux(int on);
+extern int      fat32_mount(uint64_t part_lba);
+extern bool     fat32_is_mounted(void);
+extern int      fat32_ls(const char *path);
+extern int      fat32_find(const char *name, uint32_t *cluster_out, uint32_t *size_out);
+extern int      fat32_read_file(const char *name, uint64_t offset, void *buf, uint64_t len);
 #endif
 
 /* ── WASM-compatibility shims ────────────────────────────────── */
@@ -3271,14 +3290,11 @@ void shell_exec(char *line)
             if (iso9660_find(argv[1], &lba, &size) < 0) {
                 sh_puts("File not found.\n");
             } else {
-                /* Cap at 64 KB to keep terminal responsive */
                 uint32_t cap = size > 65536 ? 65536 : size;
                 static char fbuf[65536];
                 if (iso9660_read_file(argv[1], 0, fbuf, cap) < 0) {
                     sh_puts("Read failed.\n");
                 } else {
-                    /* Stream in chunks via sh_puts (it accepts NUL-terminated;
-                     * we NUL-terminate at chunk boundary). */
                     char chunk[256];
                     uint32_t i = 0;
                     while (i < cap) {
@@ -3295,6 +3311,106 @@ void shell_exec(char *line)
                     } else {
                         sh_puts("\n");
                     }
+                }
+            }
+        }
+    } else if (strcmp(cmd, "mount-ext2") == 0) {
+        if (argc < 2) {
+            sh_puts("Usage: mount-ext2 <url>\n");
+            sh_puts("  Fetches an ext2/3/4 image and mounts read-only.\n");
+            sh_puts("  After mount: ext-ls / ext-cat <file>\n");
+        } else if (aux_disk_fetch(argv[1]) < 0) {
+            sh_puts_color("[mount-ext2] fetch failed\n", 0x00FF0000);
+        } else if (ext2_mount(0, aux_disk_read_512) < 0) {
+            sh_puts_color("[mount-ext2] not a valid ext2/3/4 image\n", 0x00FF0000);
+        } else {
+            sh_puts_color("[mount-ext2] mounted (", 0x0000FF00);
+            sh_putdec(aux_disk_size() / (1024 * 1024));
+            sh_puts(" MB)\n");
+        }
+    } else if (strcmp(cmd, "ext-ls") == 0) {
+        if (!ext2_is_mounted()) sh_puts("No ext2 mounted.\n");
+        else                    ext2_ls();
+    } else if (strcmp(cmd, "mount-fat") == 0) {
+        if (argc < 2) {
+            sh_puts("Usage: mount-fat <url>\n");
+            sh_puts("  Fetches a FAT32 image and mounts read-only.\n");
+            sh_puts("  After mount: fat-ls / fat-cat <file>\n");
+        } else if (aux_disk_fetch(argv[1]) < 0) {
+            sh_puts_color("[mount-fat] fetch failed\n", 0x00FF0000);
+        } else {
+            wasm_nvme_route_aux(1);
+            int rc = fat32_mount(0);
+            wasm_nvme_route_aux(0);
+            if (rc < 0) sh_puts_color("[mount-fat] not a valid FAT32 image\n", 0x00FF0000);
+            else {
+                sh_puts_color("[mount-fat] mounted (", 0x0000FF00);
+                sh_putdec(aux_disk_size() / (1024 * 1024));
+                sh_puts(" MB)\n");
+            }
+        }
+    } else if (strcmp(cmd, "fat-ls") == 0) {
+        if (!fat32_is_mounted()) sh_puts("No FAT32 mounted.\n");
+        else {
+            wasm_nvme_route_aux(1);
+            fat32_ls(argc >= 2 ? argv[1] : "/");
+            wasm_nvme_route_aux(0);
+        }
+    } else if (strcmp(cmd, "fat-cat") == 0) {
+        if (argc < 2) sh_puts("Usage: fat-cat <name>\n");
+        else if (!fat32_is_mounted()) sh_puts("No FAT32 mounted.\n");
+        else {
+            uint32_t clu = 0, sz = 0;
+            wasm_nvme_route_aux(1);
+            int found = fat32_find(argv[1], &clu, &sz);
+            wasm_nvme_route_aux(0);
+            if (found < 0) sh_puts("File not found.\n");
+            else {
+                static char fbuf[65536];
+                uint32_t cap = sz > 65536 ? 65536 : sz;
+                wasm_nvme_route_aux(1);
+                int rc = fat32_read_file(argv[1], 0, fbuf, cap);
+                wasm_nvme_route_aux(0);
+                if (rc < 0) sh_puts("Read failed.\n");
+                else {
+                    char chunk[256];
+                    uint32_t i = 0;
+                    while (i < cap) {
+                        uint32_t n = cap - i; if (n > 255) n = 255;
+                        for (uint32_t j = 0; j < n; j++) chunk[j] = fbuf[i + j];
+                        chunk[n] = '\0';
+                        sh_puts(chunk);
+                        i += n;
+                    }
+                    if (sz > cap) {
+                        sh_puts("\n... [truncated, ");
+                        sh_putdec((sz - cap) / 1024);
+                        sh_puts(" KB more]\n");
+                    } else sh_puts("\n");
+                }
+            }
+        }
+    } else if (strcmp(cmd, "ext-cat") == 0) {
+        if (argc < 2) sh_puts("Usage: ext-cat <name>\n");
+        else if (!ext2_is_mounted()) sh_puts("No ext2 mounted.\n");
+        else {
+            uint32_t ino = 0;
+            if (ext2_find(argv[1], &ino) < 0) sh_puts("File not found.\n");
+            else {
+                static char ebuf[65536];
+                int r = ext2_read_file(argv[1], 0, ebuf, sizeof(ebuf));
+                if (r <= 0) sh_puts("Read failed.\n");
+                else {
+                    char chunk[256];
+                    int i = 0;
+                    while (i < r) {
+                        int n = r - i; if (n > 255) n = 255;
+                        for (int j = 0; j < n; j++) chunk[j] = ebuf[i + j];
+                        chunk[n] = '\0';
+                        sh_puts(chunk);
+                        i += n;
+                    }
+                    sh_puts("\n");
                 }
             }
         }
