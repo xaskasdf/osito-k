@@ -2182,6 +2182,14 @@ void *syscall_fds(void) {
     return dummy_fd_table;
 }
 
+/* tls13.c calls x25519_scalarmult; crypto.c provides x25519 with the
+ * same signature. Alias here so tls13 links cleanly. */
+extern void x25519(uint8_t result[32], const uint8_t scalar[32],
+                    const uint8_t point[32]);
+void x25519_scalarmult(uint8_t out[32], const uint8_t scalar[32],
+                        const uint8_t point[32])
+{ x25519(out, scalar, point); }
+
 int  ccp_init(void) { return -1; }
 int  ccp_get_random(uint8_t *buf, uint32_t len)
 {
