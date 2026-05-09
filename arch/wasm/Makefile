@@ -29,6 +29,7 @@ CFLAGS := \
     -Os \
     -std=gnu11 \
     -DWASM_BUILD=1 \
+    -msimd128 \
     $(INCLUDES) \
     -Wno-unused-function \
     -Wno-unused-variable

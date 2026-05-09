@@ -118,13 +118,27 @@ static void load_model(void)
         return;
     }
 
-    /* Extract tokenizer from GGUF metadata + initialize global tokenizer */
+    /* Extract tokenizer from GGUF metadata + initialize global tokenizer.
+     * Dispatch by tokenizer.ggml.model: "llama" (SPM, with scores) →
+     * tok_init_spm; "gpt2" or unset (BPE w/ merges) → tok_init. */
     if (gguf_load_tokenizer(&g_model, &g_gguf_tok) == 0) {
-        tok_init(&g_tokenizer,
-                 (const char **)g_gguf_tok.tokens, g_gguf_tok.token_lens, g_gguf_tok.n_tokens,
-                 (const char **)g_gguf_tok.merges,  g_gguf_tok.merge_lens, g_gguf_tok.n_merges,
-                 g_gguf_tok.bos_id, g_gguf_tok.eos_id);
-        serial_puts("[WASM] Tokenizer ready\n");
+        bool is_spm = (g_gguf_tok.tok_model[0] == 'l') &&
+                      g_gguf_tok.scores != NULL;
+        if (is_spm) {
+            tok_init_spm(&g_tokenizer,
+                         (const char **)g_gguf_tok.tokens, g_gguf_tok.token_lens,
+                         g_gguf_tok.scores, g_gguf_tok.token_types,
+                         g_gguf_tok.n_tokens,
+                         g_gguf_tok.bos_id, g_gguf_tok.eos_id,
+                         g_gguf_tok.unk_id, g_gguf_tok.pad_id);
+            serial_puts("[WASM] Tokenizer ready (SPM)\n");
+        } else {
+            tok_init(&g_tokenizer,
+                     (const char **)g_gguf_tok.tokens, g_gguf_tok.token_lens, g_gguf_tok.n_tokens,
+                     (const char **)g_gguf_tok.merges,  g_gguf_tok.merge_lens, g_gguf_tok.n_merges,
+                     g_gguf_tok.bos_id, g_gguf_tok.eos_id);
+            serial_puts("[WASM] Tokenizer ready (BPE)\n");
+        }
     }
 
     /* Initialize Llama inference state (max 256 tokens context) */

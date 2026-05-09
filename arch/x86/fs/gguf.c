@@ -520,10 +520,14 @@ int gguf_load_tokenizer(gguf_model_t *model, gguf_tokenizer_t *tok)
 
     tok->bos_id = 1;   /* Safe defaults (overwritten from GGUF metadata) */
     tok->eos_id = 2;
+    tok->unk_id = (uint32_t)-1;
+    tok->pad_id = (uint32_t)-1;
 
-    /* First pass: scan for tokenizer keys to get sizes */
+    /* First pass: scan for tokenizer keys to get sizes / offsets. */
     uint64_t tokens_offset = 0, merges_offset = 0;
+    uint64_t scores_offset = 0, types_offset  = 0;
     uint32_t n_tokens = 0, n_merges = 0;
+    uint32_t n_scores = 0, n_types = 0;
 
     for (uint64_t i = 0; i < kv_count; i++) {
         char key[128];
@@ -532,20 +536,20 @@ int gguf_load_tokenizer(gguf_model_t *model, gguf_tokenizer_t *tok)
         uint32_t val_type;
         if (cur_u32(&c, &val_type) < 0) return -1;
 
-        if (key_eq(key, "tokenizer.ggml.tokens") && val_type == GGUF_TYPE_ARRAY) {
+        if (key_eq(key, "tokenizer.ggml.model") && val_type == GGUF_TYPE_STRING) {
+            cur_string(&c, tok->tok_model, sizeof(tok->tok_model));
+        } else if (key_eq(key, "tokenizer.ggml.tokens") && val_type == GGUF_TYPE_ARRAY) {
             uint32_t arr_type;
             uint64_t arr_len;
             if (cur_u32(&c, &arr_type) < 0) return -1;
             if (cur_u64(&c, &arr_len) < 0) return -1;
             if (arr_type != GGUF_TYPE_STRING) {
-                /* Skip non-string array */
                 for (uint64_t j = 0; j < arr_len; j++)
                     if (cur_skip_value(&c, arr_type) < 0) return -1;
                 continue;
             }
             tokens_offset = c.pos;
             n_tokens = (uint32_t)arr_len;
-            /* Skip the strings */
             for (uint64_t j = 0; j < arr_len; j++)
                 if (cur_string(&c, NULL, 0) < 0) return -1;
         } else if (key_eq(key, "tokenizer.ggml.merges") && val_type == GGUF_TYPE_ARRAY) {
@@ -562,18 +566,48 @@ int gguf_load_tokenizer(gguf_model_t *model, gguf_tokenizer_t *tok)
             n_merges = (uint32_t)arr_len;
             for (uint64_t j = 0; j < arr_len; j++)
                 if (cur_string(&c, NULL, 0) < 0) return -1;
+        } else if (key_eq(key, "tokenizer.ggml.scores") && val_type == GGUF_TYPE_ARRAY) {
+            uint32_t arr_type;
+            uint64_t arr_len;
+            if (cur_u32(&c, &arr_type) < 0) return -1;
+            if (cur_u64(&c, &arr_len) < 0) return -1;
+            if (arr_type != GGUF_TYPE_FLOAT32) {
+                for (uint64_t j = 0; j < arr_len; j++)
+                    if (cur_skip_value(&c, arr_type) < 0) return -1;
+                continue;
+            }
+            scores_offset = c.pos;
+            n_scores = (uint32_t)arr_len;
+            if (cur_skip(&c, arr_len * 4) < 0) return -1;
+        } else if (key_eq(key, "tokenizer.ggml.token_type") && val_type == GGUF_TYPE_ARRAY) {
+            uint32_t arr_type;
+            uint64_t arr_len;
+            if (cur_u32(&c, &arr_type) < 0) return -1;
+            if (cur_u64(&c, &arr_len) < 0) return -1;
+            if (arr_type != GGUF_TYPE_INT32 && arr_type != GGUF_TYPE_UINT32) {
+                for (uint64_t j = 0; j < arr_len; j++)
+                    if (cur_skip_value(&c, arr_type) < 0) return -1;
+                continue;
+            }
+            types_offset = c.pos;
+            n_types = (uint32_t)arr_len;
+            if (cur_skip(&c, arr_len * 4) < 0) return -1;
         } else if (key_eq(key, "tokenizer.ggml.bos_token_id")) {
-            if (val_type == GGUF_TYPE_UINT32 || val_type == GGUF_TYPE_INT32) {
+            if (val_type == GGUF_TYPE_UINT32 || val_type == GGUF_TYPE_INT32)
                 cur_u32(&c, &tok->bos_id);
-            } else {
-                cur_skip_value(&c, val_type);
-            }
+            else cur_skip_value(&c, val_type);
         } else if (key_eq(key, "tokenizer.ggml.eos_token_id")) {
-            if (val_type == GGUF_TYPE_UINT32 || val_type == GGUF_TYPE_INT32) {
+            if (val_type == GGUF_TYPE_UINT32 || val_type == GGUF_TYPE_INT32)
                 cur_u32(&c, &tok->eos_id);
-            } else {
-                cur_skip_value(&c, val_type);
-            }
+            else cur_skip_value(&c, val_type);
+        } else if (key_eq(key, "tokenizer.ggml.unknown_token_id")) {
+            if (val_type == GGUF_TYPE_UINT32 || val_type == GGUF_TYPE_INT32)
+                cur_u32(&c, &tok->unk_id);
+            else cur_skip_value(&c, val_type);
+        } else if (key_eq(key, "tokenizer.ggml.padding_token_id")) {
+            if (val_type == GGUF_TYPE_UINT32 || val_type == GGUF_TYPE_INT32)
+                cur_u32(&c, &tok->pad_id);
+            else cur_skip_value(&c, val_type);
         } else {
             if (cur_skip_value(&c, val_type) < 0) return -1;
         }
@@ -584,14 +618,17 @@ int gguf_load_tokenizer(gguf_model_t *model, gguf_tokenizer_t *tok)
         return -1;
     }
 
-    serial_puts("[GGUF] Tokenizer: ");
+    serial_puts("[GGUF] Tokenizer model=\"");
+    serial_puts(tok->tok_model[0] ? tok->tok_model : "(unset)");
+    serial_puts("\" tokens=");
     serial_putdec(n_tokens);
-    serial_puts(" tokens, ");
+    serial_puts(" merges=");
     serial_putdec(n_merges);
-    serial_puts(" merges\n");
+    serial_puts(" scores=");
+    serial_putdec(n_scores);
+    serial_puts("\n");
 
-    /* Second pass: extract token strings */
-    /* Allocate arrays for pointers + lengths */
+    /* Second pass: extract token strings (zero-copy pointers into file). */
     tok->tokens = (const char **)mem_alloc_aligned(
         (uint64_t)n_tokens * sizeof(char *), 8);
     tok->token_lens = (uint32_t *)mem_alloc_aligned(
@@ -602,7 +639,6 @@ int gguf_load_tokenizer(gguf_model_t *model, gguf_tokenizer_t *tok)
     }
     tok->n_tokens = n_tokens;
 
-    /* Point directly into the file buffer (zero-copy) */
     c.pos = tokens_offset;
     for (uint32_t i = 0; i < n_tokens; i++) {
         uint64_t slen;
@@ -611,18 +647,15 @@ int gguf_load_tokenizer(gguf_model_t *model, gguf_tokenizer_t *tok)
         tok->token_lens[i] = (uint32_t)slen;
         if (cur_skip(&c, slen) < 0) return -1;
     }
-    tok->token_data = NULL;  /* Zero-copy, no separate buffer */
+    tok->token_data = NULL;
 
-    /* Extract merge strings */
+    /* Optional: BPE merges */
     if (n_merges > 0 && merges_offset > 0) {
         tok->merges = (const char **)mem_alloc_aligned(
             (uint64_t)n_merges * sizeof(char *), 8);
         tok->merge_lens = (uint32_t *)mem_alloc_aligned(
             (uint64_t)n_merges * sizeof(uint32_t), 4);
-        if (!tok->merges || !tok->merge_lens) {
-            serial_puts("[GGUF] Failed to alloc merge arrays\n");
-            tok->n_merges = 0;
-        } else {
+        if (tok->merges && tok->merge_lens) {
             tok->n_merges = n_merges;
             c.pos = merges_offset;
             for (uint32_t i = 0; i < n_merges; i++) {
@@ -635,6 +668,17 @@ int gguf_load_tokenizer(gguf_model_t *model, gguf_tokenizer_t *tok)
             tok->merge_data = NULL;
         }
     }
+
+    /* Optional: SPM scores + token types (zero-copy into file buffer). */
+    if (n_scores == n_tokens && scores_offset > 0)
+        tok->scores = (float *)((const uint8_t *)c.buf + scores_offset);
+    if (n_types == n_tokens && types_offset > 0)
+        tok->token_types = (uint32_t *)((const uint8_t *)c.buf + types_offset);
+
+    /* Brandon doesn't ship a vocab_size key; canonical source is
+     * len(tokenizer.ggml.tokens). Fill it for llama_init validation. */
+    if (model->vocab_size == 0)
+        model->vocab_size = n_tokens;
 
     tok->valid = true;
     return 0;
@@ -674,6 +718,11 @@ static int gguf_extract_hyperparams(gguf_model_t *model)
     if (cur_u64(&c, &tensor_count) < 0) return -1;
     if (cur_u64(&c, &kv_count) < 0) return -1;
 
+    /* Track where brandon.layer_map lives so we can copy it after sizing */
+    uint64_t layer_map_offset = 0;
+    uint32_t layer_map_count  = 0;
+    bool     have_compute_lc  = false;
+
     for (uint64_t i = 0; i < kv_count; i++) {
         char key[128];
         if (cur_string(&c, key, sizeof(key)) < 0) return -1;
@@ -683,20 +732,75 @@ static int gguf_extract_hyperparams(gguf_model_t *model)
 
         if (key_eq(key, "general.name") && val_type == GGUF_TYPE_STRING) {
             cur_string(&c, model->model_name, GGUF_MODEL_NAME_LEN);
-        } else if (key_eq(key, "llama.embedding_length") && val_type == GGUF_TYPE_UINT32) {
+        } else if (key_eq(key, "general.architecture") && val_type == GGUF_TYPE_STRING) {
+            cur_string(&c, model->architecture, sizeof(model->architecture));
+        } else if ((key_eq(key, "llama.embedding_length") ||
+                    key_eq(key, "brandon.embedding_length")) &&
+                   val_type == GGUF_TYPE_UINT32) {
             cur_u32(&c, &model->hidden_size);
-        } else if (key_eq(key, "llama.block_count") && val_type == GGUF_TYPE_UINT32) {
+        } else if ((key_eq(key, "llama.block_count") ||
+                    key_eq(key, "brandon.block_count")) &&
+                   val_type == GGUF_TYPE_UINT32) {
             cur_u32(&c, &model->num_layers);
-        } else if (key_eq(key, "llama.attention.head_count") && val_type == GGUF_TYPE_UINT32) {
+        } else if ((key_eq(key, "llama.attention.head_count") ||
+                    key_eq(key, "brandon.attention.head_count")) &&
+                   val_type == GGUF_TYPE_UINT32) {
             cur_u32(&c, &model->head_count);
-        } else if (key_eq(key, "llama.attention.head_count_kv") && val_type == GGUF_TYPE_UINT32) {
+        } else if ((key_eq(key, "llama.attention.head_count_kv") ||
+                    key_eq(key, "brandon.attention.head_count_kv")) &&
+                   val_type == GGUF_TYPE_UINT32) {
             cur_u32(&c, &model->kv_head_count);
-        } else if (key_eq(key, "llama.context_length") && val_type == GGUF_TYPE_UINT32) {
+        } else if ((key_eq(key, "llama.context_length") ||
+                    key_eq(key, "brandon.context_length")) &&
+                   val_type == GGUF_TYPE_UINT32) {
             cur_u32(&c, &model->context_length);
+        } else if ((key_eq(key, "llama.feed_forward_length") ||
+                    key_eq(key, "brandon.feed_forward_length")) &&
+                   val_type == GGUF_TYPE_UINT32) {
+            cur_u32(&c, &model->feed_forward_length);
         } else if (key_eq(key, "general.quantization_version") && val_type == GGUF_TYPE_UINT32) {
             cur_u32(&c, &model->quant_type);
-        } else if (key_eq(key, "llama.rope.freq_base") && val_type == GGUF_TYPE_FLOAT32) {
+        } else if ((key_eq(key, "llama.rope.freq_base") ||
+                    key_eq(key, "brandon.rope.freq_base")) &&
+                   val_type == GGUF_TYPE_FLOAT32) {
             cur_f32(&c, &model->rope_freq_base);
+        } else if ((key_eq(key, "llama.rope.dimension_count") ||
+                    key_eq(key, "brandon.rope.dimension_count")) &&
+                   val_type == GGUF_TYPE_UINT32) {
+            cur_u32(&c, &model->rope_dim_count);
+        } else if ((key_eq(key, "llama.attention.layer_norm_rms_epsilon") ||
+                    key_eq(key, "brandon.attention.layer_norm_rms_epsilon")) &&
+                   val_type == GGUF_TYPE_FLOAT32) {
+            cur_f32(&c, &model->attn_layer_norm_rms_eps);
+        } else if (key_eq(key, "brandon.compute_layer_count") &&
+                   val_type == GGUF_TYPE_UINT32) {
+            cur_u32(&c, &model->brandon_compute_layer_count);
+            have_compute_lc = true;
+        } else if (key_eq(key, "brandon.use_dwa") && val_type == GGUF_TYPE_BOOL) {
+            uint8_t b = 0; cur_read(&c, &b, 1);
+            model->brandon_use_dwa = b != 0;
+        } else if (key_eq(key, "brandon.use_value_residual") && val_type == GGUF_TYPE_BOOL) {
+            uint8_t b = 0; cur_read(&c, &b, 1);
+            model->brandon_use_value_residual = b != 0;
+        } else if (key_eq(key, "brandon.weight_tying") && val_type == GGUF_TYPE_BOOL) {
+            uint8_t b = 0; cur_read(&c, &b, 1);
+            model->brandon_weight_tying = b != 0;
+        } else if (key_eq(key, "brandon.n_registers") && val_type == GGUF_TYPE_UINT32) {
+            cur_u32(&c, &model->brandon_n_registers);
+        } else if (key_eq(key, "brandon.n_loops") && val_type == GGUF_TYPE_UINT32) {
+            cur_u32(&c, &model->brandon_n_loops);
+        } else if (key_eq(key, "brandon.layer_map") && val_type == GGUF_TYPE_ARRAY) {
+            uint32_t arr_type; uint64_t arr_len;
+            if (cur_u32(&c, &arr_type) < 0) return -1;
+            if (cur_u64(&c, &arr_len) < 0) return -1;
+            if (arr_type != GGUF_TYPE_INT32 && arr_type != GGUF_TYPE_UINT32) {
+                for (uint64_t j = 0; j < arr_len; j++)
+                    if (cur_skip_value(&c, arr_type) < 0) return -1;
+                continue;
+            }
+            layer_map_offset = c.pos;
+            layer_map_count  = (uint32_t)arr_len;
+            if (cur_skip(&c, arr_len * 4) < 0) return -1;
         } else if (key_eq(key, "tokenizer.ggml.tokens") && val_type == GGUF_TYPE_ARRAY) {
             uint32_t arr_type; uint64_t arr_len;
             if (cur_u32(&c, &arr_type) < 0) return -1;
@@ -707,6 +811,20 @@ static int gguf_extract_hyperparams(gguf_model_t *model)
         } else {
             if (cur_skip_value(&c, val_type) < 0) return -1;
         }
+    }
+
+    /* Resolve layer_map: copy out of file buffer into an aligned uint32_t
+     * array so the consumer can index without worrying about endianness or
+     * unaligned access. Allocated once per model load (boot-time leak ok). */
+    if (layer_map_count > 0 && layer_map_offset > 0) {
+        if (!have_compute_lc)
+            model->brandon_compute_layer_count = layer_map_count;
+        model->brandon_layer_map = (uint32_t *)mem_alloc_aligned(
+            (uint64_t)layer_map_count * sizeof(uint32_t), 4);
+        if (!model->brandon_layer_map) return -1;
+        memcpy(model->brandon_layer_map,
+               (const uint8_t *)model->file_data + layer_map_offset,
+               (size_t)layer_map_count * sizeof(uint32_t));
     }
 
     if (model->kv_head_count == 0) model->kv_head_count = model->head_count;

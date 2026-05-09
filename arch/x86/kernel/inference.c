@@ -157,19 +157,43 @@ int llama_init(llama_state_t *state, gguf_model_t *model, uint32_t max_seq)
     memset(state, 0, sizeof(*state));
     state->model = model;
 
+    /* Architecture dispatch: "brandon" uses block-shared layer_map. */
+    {
+        const char *a = model->architecture[0] ? model->architecture : "llama";
+        for (uint32_t i = 0; i < GGUF_ARCH_LEN - 1 && a[i]; i++)
+            state->arch[i] = a[i];
+    }
+    bool is_brandon = (state->arch[0] == 'b');
+
     /* Copy architecture from model metadata */
     state->dim        = model->hidden_size;
-    state->n_layers   = model->num_layers;
     state->n_heads    = model->head_count;
     state->n_kv_heads = model->kv_head_count;
     state->vocab_size = model->vocab_size;
     state->max_seq    = max_seq;
+
+    /* For brandon, num_layers in the GGUF is the *unique block count*.
+     * The forward pass walks compute_layer_count logical layers, each
+     * indexed via brandon_layer_map[] into one of the unique blocks. */
+    if (is_brandon && model->brandon_compute_layer_count) {
+        state->n_layers        = model->brandon_compute_layer_count;
+        state->n_unique_blocks = model->num_layers;
+    } else {
+        state->n_layers        = model->num_layers;
+        state->n_unique_blocks = model->num_layers;
+    }
+    state->layer_map           = is_brandon ? model->brandon_layer_map : NULL;
+    state->use_dwa             = is_brandon && model->brandon_use_dwa;
+    state->use_value_residual  = is_brandon && model->brandon_use_value_residual;
+    state->n_registers         = is_brandon ? model->brandon_n_registers : 0;
 
     /* Derived dimensions */
     state->head_dim   = state->dim / state->n_heads;
     state->kv_dim     = state->n_kv_heads * state->head_dim;
     state->gqa_ratio     = state->n_heads / state->n_kv_heads;
     state->rope_freq_base = model->rope_freq_base > 0.0f ? model->rope_freq_base : 10000.0f;
+    state->rms_eps        = model->attn_layer_norm_rms_eps > 0.0f ?
+                              model->attn_layer_norm_rms_eps : 1e-5f;
 
     /* Discover ffn_dim from first layer gate tensor */
     char nbuf[64];
@@ -240,51 +264,88 @@ int llama_init(llama_state_t *state, gguf_model_t *model, uint32_t max_seq)
     state->weights.layers = (llama_layer_t *)PHYS_TO_VIRT(layer_phys);
     memset(state->weights.layers, 0, (size_t)layer_table_size);
 
-    /* ── Resolve per-layer tensors ── */
-    uint32_t resolved = 0;
-    for (uint32_t l = 0; l < state->n_layers; l++) {
-        llama_layer_t *ly = &state->weights.layers[l];
+    /* ── Resolve per-block tensors, fan out via layer_map for brandon ──
+     *
+     * For arch=brandon, weights.layers has n_layers (=24) entries but
+     * the GGUF only stores n_unique_blocks (=12) sets of weights named
+     * blk.{0..11}.*. We resolve once per unique block, then alias each
+     * logical layer's pointers via layer_map[L].
+     *
+     * For arch=llama, n_unique_blocks == n_layers and the loop is a
+     * straight 1:1 mapping. */
+    {
+        uint64_t blocks_size = (uint64_t)state->n_unique_blocks * sizeof(llama_layer_t);
+        llama_layer_t *blocks = (llama_layer_t *)mem_alloc_aligned(blocks_size, 64);
+        if (!blocks) {
+            serial_puts("[LLAMA] ERROR: failed to alloc unique-block table\n");
+            return -1;
+        }
+        memset(blocks, 0, (size_t)blocks_size);
 
-        ly->attn_norm    = gguf_find_tensor(model, build_layer_name(nbuf, l, "attn_norm.weight"));
-        ly->attn_q       = gguf_find_tensor(model, build_layer_name(nbuf, l, "attn_q.weight"));
-        ly->attn_k       = gguf_find_tensor(model, build_layer_name(nbuf, l, "attn_k.weight"));
-        ly->attn_v       = gguf_find_tensor(model, build_layer_name(nbuf, l, "attn_v.weight"));
-        ly->attn_output  = gguf_find_tensor(model, build_layer_name(nbuf, l, "attn_output.weight"));
-        ly->ffn_norm     = gguf_find_tensor(model, build_layer_name(nbuf, l, "ffn_norm.weight"));
-        ly->ffn_gate     = gguf_find_tensor(model, build_layer_name(nbuf, l, "ffn_gate.weight"));
-        ly->ffn_up       = gguf_find_tensor(model, build_layer_name(nbuf, l, "ffn_up.weight"));
-        ly->ffn_down     = gguf_find_tensor(model, build_layer_name(nbuf, l, "ffn_down.weight"));
+        uint32_t resolved = 0;
+        for (uint32_t b = 0; b < state->n_unique_blocks; b++) {
+            llama_layer_t *ly = &blocks[b];
 
-        if (ly->attn_norm && ly->attn_q && ly->attn_k && ly->attn_v &&
-            ly->attn_output && ly->ffn_norm && ly->ffn_gate &&
-            ly->ffn_up && ly->ffn_down) {
-            resolved++;
-        } else {
-            serial_puts("[LLAMA] WARNING: layer ");
-            serial_putdec(l);
-            serial_puts(" incomplete (");
-            if (!ly->attn_norm)   serial_puts("attn_norm ");
-            if (!ly->attn_q)      serial_puts("attn_q ");
-            if (!ly->attn_k)      serial_puts("attn_k ");
-            if (!ly->attn_v)      serial_puts("attn_v ");
-            if (!ly->attn_output) serial_puts("attn_out ");
-            if (!ly->ffn_norm)    serial_puts("ffn_norm ");
-            if (!ly->ffn_gate)    serial_puts("ffn_gate ");
-            if (!ly->ffn_up)      serial_puts("ffn_up ");
-            if (!ly->ffn_down)    serial_puts("ffn_down ");
-            serial_puts(")\n");
+            ly->attn_norm    = gguf_find_tensor(model, build_layer_name(nbuf, b, "attn_norm.weight"));
+            ly->attn_q       = gguf_find_tensor(model, build_layer_name(nbuf, b, "attn_q.weight"));
+            ly->attn_k       = gguf_find_tensor(model, build_layer_name(nbuf, b, "attn_k.weight"));
+            ly->attn_v       = gguf_find_tensor(model, build_layer_name(nbuf, b, "attn_v.weight"));
+            ly->attn_output  = gguf_find_tensor(model, build_layer_name(nbuf, b, "attn_output.weight"));
+            ly->ffn_norm     = gguf_find_tensor(model, build_layer_name(nbuf, b, "ffn_norm.weight"));
+            ly->ffn_gate     = gguf_find_tensor(model, build_layer_name(nbuf, b, "ffn_gate.weight"));
+            ly->ffn_up       = gguf_find_tensor(model, build_layer_name(nbuf, b, "ffn_up.weight"));
+            ly->ffn_down     = gguf_find_tensor(model, build_layer_name(nbuf, b, "ffn_down.weight"));
+
+            if (ly->attn_norm && ly->attn_q && ly->attn_k && ly->attn_v &&
+                ly->attn_output && ly->ffn_norm && ly->ffn_gate &&
+                ly->ffn_up && ly->ffn_down) {
+                resolved++;
+            } else {
+                serial_puts("[LLAMA] WARNING: block ");
+                serial_putdec(b);
+                serial_puts(" incomplete\n");
+            }
+        }
+
+        if (resolved < state->n_unique_blocks) {
+            serial_puts("[LLAMA] ERROR: only ");
+            serial_putdec(resolved);
+            serial_puts("/");
+            serial_putdec(state->n_unique_blocks);
+            serial_puts(" unique blocks resolved\n");
+            return -1;
+        }
+
+        for (uint32_t l = 0; l < state->n_layers; l++) {
+            uint32_t b = state->layer_map ? state->layer_map[l] : l;
+            if (b >= state->n_unique_blocks) {
+                serial_puts("[LLAMA] ERROR: layer_map[");
+                serial_putdec(l); serial_puts("]=");
+                serial_putdec(b); serial_puts(" out of range\n");
+                return -1;
+            }
+            state->weights.layers[l] = blocks[b];
         }
     }
 
-    if (resolved < state->n_layers) {
-        serial_puts("[LLAMA] ERROR: only ");
-        serial_putdec(resolved);
-        serial_puts("/");
-        serial_putdec(state->n_layers);
-        serial_puts(" layers resolved\n");
-        mem_free_pages(state->weights.layers, layer_table_pages);
-        state->weights.layers = NULL;
-        return -1;
+    /* Resolve brandon-specific tensors */
+    if (is_brandon) {
+        state->ffn_dim = model->feed_forward_length ? model->feed_forward_length : state->ffn_dim;
+
+        if (state->use_dwa) {
+            state->dwa_weights = gguf_find_tensor(model, "dwa.weight");
+            if (!state->dwa_weights) {
+                serial_puts("[LLAMA] ERROR: brandon use_dwa but dwa.weight missing\n");
+                return -1;
+            }
+        }
+        if (state->n_registers > 0) {
+            state->register_weights = gguf_find_tensor(model, "register.weight");
+            if (!state->register_weights) {
+                serial_puts("[LLAMA] ERROR: brandon n_registers>0 but register.weight missing\n");
+                return -1;
+            }
+        }
     }
 
     serial_puts("[LLAMA] All ");
@@ -436,6 +497,37 @@ int llama_init(llama_state_t *state, gguf_model_t *model, uint32_t max_seq)
         }
     }
 
+    /* ── Brandon-arch extras (v_first + DWA scratch) ── */
+    if (is_brandon) {
+        if (state->use_value_residual) {
+            state->v_first = (float *)mem_alloc_aligned(
+                (uint64_t)state->kv_dim * sizeof(float), 64);
+            if (!state->v_first) {
+                serial_puts("[LLAMA] ERROR: failed to alloc v_first\n");
+                return -1;
+            }
+            memset(state->v_first, 0, (size_t)state->kv_dim * sizeof(float));
+        }
+        if (state->use_dwa) {
+            uint64_t bytes = (uint64_t)(state->n_layers + 1) * state->dim * sizeof(float);
+            state->dwa_buf = (float *)mem_alloc_aligned(bytes, 64);
+            if (!state->dwa_buf) {
+                serial_puts("[LLAMA] ERROR: failed to alloc dwa_buf\n");
+                return -1;
+            }
+            memset(state->dwa_buf, 0, (size_t)bytes);
+        }
+        serial_puts("[BRANDON] arch=brandon n_unique=");
+        serial_putdec(state->n_unique_blocks);
+        serial_puts(" n_layers=");
+        serial_putdec(state->n_layers);
+        serial_puts(" registers=");
+        serial_putdec(state->n_registers);
+        if (state->use_dwa)            serial_puts(" dwa");
+        if (state->use_value_residual) serial_puts(" v_residual");
+        serial_puts("\n");
+    }
+
     serial_puts("[LLAMA] Init complete. Ready for inference.\n");
 
     return 0;
@@ -521,6 +613,10 @@ static void attention_heads_worker(void *arg, void *result)
 
 int llama_forward(llama_state_t *s, uint32_t token)
 {
+    /* Brandon-arch (block-shared TinyLlama) takes a separate path. */
+    if (s->arch[0] == 'b')
+        return brandon_forward(s, token);
+
     uint32_t dim     = s->dim;
     uint32_t kv_dim  = s->kv_dim;
     uint32_t hd      = s->head_dim;
@@ -714,6 +810,175 @@ int llama_forward(llama_state_t *s, uint32_t token)
 
     extern void perf_phase_exit(int slot);
     perf_phase_exit(0 /* PERF_PHASE_FORWARD */);
+    return 0;
+}
+
+/* ══════════════════════════════════════════════════════════════
+ *  brandon-arch forward — block_sharing + DenseFormer DWA +
+ *  Value Residual Learning + register tokens.
+ *  Spec: ~/osito-a-models/docs/brandon-arch-spec.md
+ * ══════════════════════════════════════════════════════════════ */
+
+/* One pass through the n_layers logical stack. produce_logits=false
+ * is used during register prefill (the output isn't consumed). */
+static int brandon_forward_one(llama_state_t *s, uint32_t pos, bool produce_logits)
+{
+    uint32_t dim    = s->dim;
+    uint32_t kv_dim = s->kv_dim;
+    uint32_t hd     = s->head_dim;
+
+    /* dwa_buf[0] := embedding (input to layer 0). */
+    if (s->use_dwa)
+        memcpy(s->dwa_buf, s->x, dim * sizeof(float));
+
+    /* Value Residual Learning is per-forward (per-token), not per-slot.
+     * Reset the capture flag so layer 0 of THIS forward refreshes v_first. */
+    s->v_first_captured = false;
+
+    for (uint32_t l = 0; l < s->n_layers; l++) {
+        llama_layer_t *ly = &s->weights.layers[l];
+
+        /* Attention norm */
+        rmsnorm(s->xb, s->x, norm_data(ly->attn_norm), dim);
+
+        /* Q, K, V projections */
+        matvec(s->q, ly->attn_q, s->xb, dim, dim);
+        matvec(s->k, ly->attn_k, s->xb, kv_dim, dim);
+        matvec(s->v, ly->attn_v, s->xb, kv_dim, dim);
+
+        /* Value Residual Learning (model.py:243-244):
+         *   - Layer 0: capture raw V (pre-RoPE, pre-residual). Layer 0
+         *     itself uses raw V; do NOT add v_first to it.
+         *   - Layers 1..n: add v_first element-wise to V before cache + attn.
+         * V never gets RoPE. */
+        if (s->use_value_residual) {
+            if (l == 0) {
+                if (!s->v_first_captured) {
+                    memcpy(s->v_first, s->v, kv_dim * sizeof(float));
+                    s->v_first_captured = true;
+                }
+            } else {
+                for (uint32_t i = 0; i < kv_dim; i++)
+                    s->v[i] += s->v_first[i];
+            }
+        }
+
+        /* RoPE — Q and K only; V stays unrotated */
+        rope(s->q, s->n_heads,    hd, pos, s->rope_freq_base);
+        rope(s->k, s->n_kv_heads, hd, pos, s->rope_freq_base);
+
+        /* Store K, V in cache at this position */
+        float *kc = s->kv_cache[l].k + (uint64_t)pos * kv_dim;
+        float *vc = s->kv_cache[l].v + (uint64_t)pos * kv_dim;
+        memcpy(kc, s->k, kv_dim * sizeof(float));
+        memcpy(vc, s->v, kv_dim * sizeof(float));
+
+        /* GQA serial path — small model, AP orchestration not worth it */
+        float scale = 1.0f / sqrtf_bare((float)hd);
+        for (uint32_t h = 0; h < s->n_heads; h++) {
+            uint32_t kv_h = h / s->gqa_ratio;
+            const float *q_head = s->q + h * hd;
+
+            for (uint32_t p = 0; p <= pos; p++) {
+                const float *k_pos = s->kv_cache[l].k + (uint64_t)p * kv_dim + kv_h * hd;
+                float dot = 0.0f;
+                for (uint32_t i = 0; i < hd; i++)
+                    dot += q_head[i] * k_pos[i];
+                s->att[p] = dot * scale;
+            }
+            softmax(s->att, pos + 1);
+
+            float *out_head = s->xb2 + h * hd;
+            memset(out_head, 0, hd * sizeof(float));
+            for (uint32_t p = 0; p <= pos; p++) {
+                const float *v_pos = s->kv_cache[l].v + (uint64_t)p * kv_dim + kv_h * hd;
+                float a = s->att[p];
+                for (uint32_t i = 0; i < hd; i++)
+                    out_head[i] += a * v_pos[i];
+            }
+        }
+
+        /* Output projection + residual */
+        matvec(s->xb, ly->attn_output, s->xb2, dim, dim);
+        vec_add(s->x, s->x, s->xb, dim);
+
+        /* FFN: rmsnorm → SwiGLU → residual */
+        rmsnorm(s->xb, s->x, norm_data(ly->ffn_norm), dim);
+        matvec(s->hb,  ly->ffn_gate, s->xb, s->ffn_dim, dim);
+        matvec(s->hb2, ly->ffn_up,   s->xb, s->ffn_dim, dim);
+        silu_inplace(s->hb, s->ffn_dim);
+        vec_mul(s->hb, s->hb, s->hb2, s->ffn_dim);
+        matvec(s->xb, ly->ffn_down, s->hb, dim, s->ffn_dim);
+        vec_add(s->x, s->x, s->xb, dim);
+
+        /* DenseFormer DWA: append layer-L output, replace x with weighted sum */
+        if (s->use_dwa) {
+            float *h_slot = s->dwa_buf + (uint64_t)(l + 1) * dim;
+            memcpy(h_slot, s->x, dim * sizeof(float));
+
+            const float *dwa = (const float *)s->dwa_weights->data;
+            uint32_t row_stride = s->n_layers + 1;
+            const float *w_row = dwa + (uint64_t)l * row_stride;
+
+            for (uint32_t i = 0; i < dim; i++) s->x[i] = 0.0f;
+            for (uint32_t j = 0; j <= l + 1; j++) {
+                float w = w_row[j];
+                if (w == 0.0f) continue;
+                const float *src = s->dwa_buf + (uint64_t)j * dim;
+                for (uint32_t i = 0; i < dim; i++)
+                    s->x[i] += w * src[i];
+            }
+        }
+    }
+
+    /* Final norm + LM head (skipped during register prefill) */
+    if (produce_logits) {
+        rmsnorm(s->x, s->x, norm_data(s->weights.output_norm), dim);
+        matvec(s->logits, s->weights.output, s->x, s->vocab_size, dim);
+
+        /* NaN/inf scrub */
+        for (uint32_t i = 0; i < s->vocab_size; i++) {
+            float v = s->logits[i];
+            if (v != v || v > 1e30f || v < -1e30f)
+                s->logits[i] = -1e30f;
+        }
+    }
+    return 0;
+}
+
+int brandon_forward(llama_state_t *s, uint32_t token)
+{
+    /* Lazy register prefill on the first call. The n_registers learnable
+     * embeddings occupy positions 0..n_registers-1 of the KV cache; user
+     * tokens then start at position n_registers. */
+    if (s->n_registers > 0 && !s->registers_prefilled) {
+        const uint8_t *reg_data = (const uint8_t *)s->register_weights->data;
+        uint32_t reg_dtype = s->register_weights->type;
+        uint64_t reg_row_bytes = (uint64_t)s->dim *
+                                 (reg_dtype == GGML_TYPE_F32 ? 4 : 2);
+
+        for (uint32_t r = 0; r < s->n_registers; r++) {
+            const uint8_t *src = reg_data + r * reg_row_bytes;
+            if (reg_dtype == GGML_TYPE_F32) {
+                memcpy(s->x, src, s->dim * sizeof(float));
+            } else {
+                /* F16 → F32 (matches embed_token's f16 branch) */
+                const uint16_t *h = (const uint16_t *)src;
+                for (uint32_t i = 0; i < s->dim; i++)
+                    s->x[i] = f16_to_f32(h[i]);
+            }
+            if (brandon_forward_one(s, s->pos, /*produce_logits=*/false) != 0)
+                return -1;
+            s->pos++;
+        }
+        s->registers_prefilled = true;
+    }
+
+    /* User token forward */
+    embed_token(s->x, s->weights.token_embd, token, s->dim);
+    if (brandon_forward_one(s, s->pos, /*produce_logits=*/true) != 0)
+        return -1;
+    s->pos++;
     return 0;
 }
 
@@ -1623,7 +1888,16 @@ int llama_chat(llama_state_t *state, const char *text,
     uint32_t n = 0;
     int r;
 
-    if (im_start != UINT32_MAX && im_end != UINT32_MAX) {
+    /* Brandon-tiny is a base completion model trained on Wikipedia +
+     * SmolLM + synthetic. The "instruct" suffix in its filename is
+     * misleading — its reference chat.py just encodes the raw prompt
+     * (no ChatML, no BOS). Mirror that here so the prefill matches the
+     * training distribution; otherwise the model sees template tokens
+     * it has never been conditioned on. */
+    if (state->arch[0] == 'b') {
+        r = tok_encode(g_tokenizer, text, text_len, tokens + n, 1024 - n);
+        if (r > 0) n += (uint32_t)r;
+    } else if (im_start != UINT32_MAX && im_end != UINT32_MAX) {
         /* ── ChatML template ── */
         tokens[n++] = im_start;
         r = tok_encode(g_tokenizer, "user\n", 5, tokens + n, 1024 - n);
@@ -1674,6 +1948,12 @@ int llama_chat(llama_state_t *state, const char *text,
 
     /* Reset state */
     state->pos = 0;
+    /* Brandon: re-run register prefill at the start of each chat call
+     * so positions 0..n_registers-1 are freshly written before the user
+     * tokens. Without this, cache slots 0..3 hold whatever was there
+     * from the previous chat. */
+    state->registers_prefilled = false;
+    state->v_first_captured    = false;
 
     /* Prefill */
     uint64_t t0 = rdtsc();

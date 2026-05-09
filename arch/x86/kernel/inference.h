@@ -53,6 +53,26 @@ typedef struct {
     uint32_t head_dim, kv_dim, ffn_dim, vocab_size, max_seq;
     uint32_t gqa_ratio;     /* n_heads / n_kv_heads */
     float    rope_freq_base; /* RoPE theta (10000 = default, 500000 = Llama 3) */
+    float    rms_eps;        /* RMSNorm epsilon (1e-5 default, 1e-6 Llama 3) */
+
+    /* Architecture dispatch — "llama" (default) or "brandon" (block-shared
+     * TinyLlama variant w/ DenseFormer DWA + Value Residual + register
+     * tokens — see ~/osito-a-models/docs/brandon-arch-spec.md). For
+     * "brandon", n_layers holds the *logical* layer count (compute_layer_count)
+     * and weights.layers[L] is aliased via layer_map into one of the
+     * n_unique_blocks unique stored blocks. */
+    char     arch[GGUF_ARCH_LEN];
+    uint32_t  n_unique_blocks;       /* brandon: distinct stored blocks */
+    uint32_t *layer_map;             /* [n_layers] → block index; NULL for llama */
+    bool      use_dwa;
+    bool      use_value_residual;
+    uint32_t  n_registers;
+    bool      registers_prefilled;
+    bool      v_first_captured;
+    float    *v_first;               /* [kv_dim] when use_value_residual */
+    float    *dwa_buf;               /* [(n_layers+1) * dim] when use_dwa */
+    gguf_tensor_t *dwa_weights;      /* [n_layers, n_layers+1] F32 */
+    gguf_tensor_t *register_weights; /* [n_registers, dim] */
 
     /* Resolved weights */
     llama_weights_t weights;
@@ -90,6 +110,7 @@ typedef struct {
 
 int  llama_init(llama_state_t *state, gguf_model_t *model, uint32_t max_seq);
 int  llama_forward(llama_state_t *state, uint32_t token);
+int  brandon_forward(llama_state_t *state, uint32_t token);
 void llama_generate(llama_state_t *state, const uint32_t *prompt,
                     uint32_t prompt_len, uint32_t max_tokens);
 void llama_free(llama_state_t *state);

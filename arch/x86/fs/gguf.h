@@ -60,6 +60,7 @@ typedef struct {
 /* ── Loaded model ───────────────────────────────────────────── */
 
 #define GGUF_MODEL_NAME_LEN  128
+#define GGUF_ARCH_LEN        32
 
 typedef struct gguf_model {
     /* Metadata (from OsitoFS file entry) */
@@ -72,6 +73,7 @@ typedef struct gguf_model {
     uint32_t kv_head_count;
     uint32_t context_length;
     float    rope_freq_base;     /* RoPE theta (default 10000) */
+    uint32_t feed_forward_length; /* FFN hidden size (brandon.feed_forward_length) */
 
     /* Raw file data in RAM */
     void    *file_data;         /* complete file buffer */
@@ -89,6 +91,23 @@ typedef struct gguf_model {
     /* Layer offsets (from OsitoFS layer index) */
     uint32_t layer_count;
     uint64_t layer_offsets[255];
+
+    /* ── Architecture tag + brandon-arch metadata ────────────────
+     * `architecture` is the canonical tag from `general.architecture`
+     * ("llama" or "brandon"). When "brandon", the brandon_* fields
+     * are populated from `brandon.*` GGUF keys; the layer_map is
+     * allocated by gguf_load_from_mem and indexes into 0..num_layers-1.
+     * See ~/osito-a-models/docs/brandon-arch-spec.md.                */
+    char     architecture[GGUF_ARCH_LEN];
+    uint32_t  brandon_compute_layer_count;   /* logical layers, ≥ num_layers */
+    uint32_t *brandon_layer_map;             /* [compute_layer_count] → block id */
+    bool      brandon_use_dwa;
+    bool      brandon_use_value_residual;
+    uint32_t  brandon_n_registers;
+    uint32_t  brandon_n_loops;
+    bool      brandon_weight_tying;
+    uint32_t  rope_dim_count;                /* head_dim by default */
+    float     attn_layer_norm_rms_eps;       /* RMSNorm epsilon */
 } gguf_model_t;
 
 /* ── Tensor DMA map for NVMe-direct streaming ──────────────── */
@@ -125,7 +144,15 @@ gguf_tensor_t *gguf_find_tensor(gguf_model_t *model, const char *name);
 
 /* ── Tokenizer data extracted from GGUF metadata ──────────── */
 
+#define GGUF_TOK_MODEL_LEN  16
+#define GGUF_TOK_MODEL_GPT2  "gpt2"
+#define GGUF_TOK_MODEL_LLAMA "llama"  /* SPM (SentencePiece) */
+
 typedef struct {
+    /* Tokenizer model identifier (tokenizer.ggml.model). "llama" = SPM,
+     * "gpt2" = byte-level BPE. Empty if unset. */
+    char tok_model[GGUF_TOK_MODEL_LEN];
+
     /* Array of token strings (pointers into token_data buffer) */
     const char **tokens;
     uint32_t    *token_lens;
@@ -136,9 +163,17 @@ typedef struct {
     uint32_t    *merge_lens;
     uint32_t     n_merges;
 
-    /* Special token IDs */
+    /* SPM aux: per-token scores + type codes. NULL for BPE models.
+     * Both arrays are length n_tokens when present. Zero-copy pointers
+     * into the GGUF file buffer. */
+    float    *scores;
+    uint32_t *token_types;
+
+    /* Special token IDs (UINT32_MAX = unset) */
     uint32_t bos_id;
     uint32_t eos_id;
+    uint32_t unk_id;
+    uint32_t pad_id;
 
     /* Backing buffers (caller must free) */
     void *token_data;       /* raw strings for tokens */
