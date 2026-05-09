@@ -325,6 +325,8 @@
             self.importScripts('https://wasm.naranjositos.tech/toolchain/shared.js');
             const T = 'https://wasm.naranjositos.tech/toolchain';
             let api, port;
+            let ositokH = null;  /* lazy-loaded ositok.h text */
+
             const opts = {
                 clang: T + '/clang.wasm', lld: T + '/lld.wasm',
                 sysroot: T + '/sysroot.tar', memfs: T + '/memfs.wasm',
@@ -337,10 +339,37 @@
                     port = e.data.data;
                     port.onmessage = self.onmessage;
                     api = new API(opts);
+                    /* Wrap api.ready so it ALSO awaits ositok.h injection
+                     * into MemFS at /include/ositok.h. Compile handlers
+                     * await api.ready, so this guarantees the header is
+                     * in place before clang runs. */
+                    const baseReady = api.ready;
+                    api.ready = (async function() {
+                        await baseReady;
+                        try {
+                            if (!ositokH) ositokH = await (await fetch(T + '/ositok.h')).text();
+                            /* Tar paths in sysroot have no leading slash —
+                             * match that convention so AddFileNode resolves
+                             * the parent dir correctly. */
+                            api.memfs.addFile('include/ositok.h', ositokH);
+                        } catch (e) {
+                            port.postMessage({ id: 'write', data: '\\n[cc] ositok.h fetch failed: ' + e.message + '\\n' });
+                        }
+                    })();
                     port.postMessage({ id: 'ready' });
                 } else if (e.data.id === 'compileLinkRun') {
                     try { await api.compileLinkRun(e.data.data, { lang: e.data.lang || 'c++' }); }
                     catch (err) { port.postMessage({ id: 'write', data: '\\n[cc] ' + err.message + '\\n' }); }
+                    port.postMessage({ id: 'done' });
+                } else if (e.data.id === 'preprocess') {
+                    try {
+                        const lang = e.data.lang || 'c++';
+                        const input = lang === 'c' ? 't.c' : 't.cc';
+                        await api.ready;
+                        await api.preprocess({ input, contents: e.data.data, lang });
+                    } catch (err) {
+                        port.postMessage({ id: 'write', data: '\\n[cc -E] ' + err.message + '\\n' });
+                    }
                     port.postMessage({ id: 'done' });
                 } else if (e.data.id === 'compile') {
                     /* compile + link, return bytes (no run) */
@@ -425,6 +454,15 @@
                 return new Promise((resolve) => {
                     resolveCompiled = resolve;
                     port.postMessage({ id: 'compile', data: src, lang: lang || 'c++' });
+                });
+            },
+            // Preprocess only (clang -cc1 -E). Output streams via onWrite.
+            preprocess: async function(src, lang) {
+                await ensureWorker();
+                pendingWrite = '';
+                return new Promise((resolve) => {
+                    resolveCompile = resolve;
+                    port.postMessage({ id: 'preprocess', data: src, lang: lang || 'c++' });
                 });
             },
             // Run a pre-compiled wasm module via WASI shim. bytes: ArrayBuffer

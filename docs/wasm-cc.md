@@ -99,8 +99,12 @@ WASI). No requiere extender `proc_exec` para el caso `cc -run`.
 |---|---|
 | `cc hello.c` | Compila + linkea + corre inline (estilo `tcc -run`) |
 | `cc hello.c -o hello.wasm` | Compila + linkea + guarda en OsitoFS, no ejecuta |
+| `cc -E hello.c` | Solo preprocessor (`clang -cc1 -E`). |
+| `cc < hello.c` | Lee source desde redirect (o pipe `echo ... \| cc`). |
 | `exec hello.wasm` | `proc_exec` detecta WASI (no `dylink.0` section) y corre con shim. Output streamea al terminal. |
 | `exec quake2.so` | `proc_exec` detecta `dylink.0` → carga via `dlopen` (Emscripten side module). |
+| `edit <file>` | Editor multi-línea, terminator `.` en línea propia. Escribe a OsitoFS. |
+| `make [target]` | Parsea Makefile (variables, reglas, deps, `$(VAR)`); ejecuta comandos via `shell_exec`. |
 
 ## IndexedDB cache
 
@@ -164,11 +168,14 @@ Libs en `/lib/wasm32-wasi/`:
 
 - [x] ~~**`cc -o file.wasm`** + `exec file.wasm` con branch WASI en `proc_exec`~~ ✅ done
 - [x] ~~**IndexedDB cache** para clang/lld/sysroot~~ ✅ done
-- [ ] **`#include <ositok.h>`** — exponer la API del kernel
-      (`oi_inference`, `oi_dlopen`, etc.) al toolchain.
-- [ ] **`make`** mínimo para building incremental.
-- [ ] **`cc -E`** preprocessing only.
-- [ ] **`<` redirect input** en shell para `cc < hello.c` y multi-línea.
+- [x] ~~**`#include <ositok.h>`**~~ ✅ done — convenience header (oi_puts/oi_print/oi_log/OSITOK_VERSION) inyectado en MemFS al levantar el worker. Kernel-bridge imports (oi_chat, oi_dlopen) pendientes.
+- [x] ~~**`make`** mínimo~~ ✅ done — `cmd_make` parsea variables `VAR = val`, reglas `target: deps`, comandos (cualquier indentación), `$(VAR)` expansion, ejecuta vía `shell_exec`.
+- [x] ~~**`cc -E`** preprocessing only~~ ✅ done — patched shared.js's `preprocess()` que invoca `clang -cc1 -E`.
+- [x] ~~**`<` redirect input**~~ ✅ done — wired en `parse_redirects` para cargar archivo en `sh_stdin_buf`. `cc < hello.c` o `cmd | cc` funciona.
+- [x] ~~**`edit <file>`** multi-línea~~ ✅ done — terminator `.` en línea propia.
+- [ ] **Kernel-bridge imports** — exponer `oi_chat`, `oi_dlopen` etc. via custom `osito_env` WASI imports (App.constructor extended).
+- [ ] **`<` con heredoc** (`cmd << EOF`).
+- [ ] **`cc -c`** compile-only (currently only `-o` outputs full linked wasm).
 
 ## Configuración / referencias
 

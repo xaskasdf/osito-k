@@ -1003,6 +1003,15 @@ EM_JS(void, js_cc_kick, (const char *src, const char *lang), {
     window.__cc.compileLinkRun(s, l).then(function() { window.__ccDone = true; });
 });
 
+EM_JS(void, js_cc_preprocess, (const char *src, const char *lang), {
+    var s = UTF8ToString(src);
+    var l = UTF8ToString(lang);
+    window.__ccPending = '';
+    window.__ccDone = false;
+    window.__cc.onWrite = function(chunk) { window.__ccPending += chunk; };
+    window.__cc.preprocess(s, l).then(function() { window.__ccDone = true; });
+});
+
 EM_JS(int, js_cc_done, (), { return window.__ccDone ? 1 : 0; });
 
 EM_JS(int, js_cc_drain, (char *dst, int max), {
@@ -1088,42 +1097,64 @@ void cmd_cc(int argc, char **argv)
     extern int osfs2_write(void *, uint64_t, const void *, uint64_t);
     extern int osfs2_delete(const char *);
 
-    if (argc < 2) {
-        serial_puts("usage: cc <src.c> [-o <out.wasm>]\n");
-        return;
-    }
-
-    /* Parse args: pick first non-flag as source, look for -o */
+    /* Parse args: pick first non-flag as source, look for -o, -E */
     const char *src_name = NULL;
     const char *out_name = NULL;
+    bool        preprocess = false;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-o") && i + 1 < argc) {
             out_name = argv[++i];
+        } else if (!strcmp(argv[i], "-E")) {
+            preprocess = true;
         } else if (argv[i][0] != '-' && !src_name) {
             src_name = argv[i];
         }
     }
-    if (!src_name) {
-        serial_puts("cc: no input file\n");
-        return;
-    }
 
-    /* Read source file from OsitoFS */
-    void *file = osfs2_find(src_name);
-    if (!file) {
-        serial_puts("cc: file not found: ");
-        serial_puts(src_name);
-        serial_puts("\n");
+    /* Source comes from a file (named arg) or piped stdin (`<file` or pipe). */
+    extern const char *sh_stdin_buf;
+    extern uint32_t    sh_stdin_len;
+
+    char *src = NULL;
+    uint64_t size = 0;
+    if (src_name) {
+        void *file = osfs2_find(src_name);
+        if (!file) {
+            serial_puts("cc: file not found: ");
+            serial_puts(src_name);
+            serial_puts("\n");
+            return;
+        }
+        size = osfs2_file_size(file);
+        src = malloc((size_t)size + 1);
+        if (!src) { serial_puts("cc: malloc failed\n"); return; }
+        osfs2_read(file, 0, src, size);
+        src[size] = 0;
+    } else if (sh_stdin_buf && sh_stdin_len > 0) {
+        size = sh_stdin_len;
+        src = malloc((size_t)size + 1);
+        if (!src) { serial_puts("cc: malloc failed\n"); return; }
+        memcpy(src, sh_stdin_buf, (size_t)size);
+        src[size] = 0;
+        src_name = "stdin";
+    } else {
+        serial_puts("usage: cc <src.c> [-o <out.wasm>] [-E]\n");
+        serial_puts("       cmd | cc       (read source from pipe)\n");
+        serial_puts("       cc < file.c    (read source from file)\n");
         return;
     }
-    uint64_t size = osfs2_file_size(file);
-    char *src = malloc((size_t)size + 1);
-    if (!src) { serial_puts("cc: malloc failed\n"); return; }
-    osfs2_read(file, 0, src, size);
-    src[size] = 0;
 
     const char *ext = strrchr(src_name, '.');
     const char *lang = (ext && (!strcmp(ext, ".c") || !strcmp(ext, ".h"))) ? "c" : "c++";
+
+    if (preprocess) {
+        /* `cc -E`: run clang's preprocessor and stream to terminal. */
+        js_cc_preprocess(src, lang);
+        free(src);
+        cc_drain_until_done();
+        serial_puts("\n");
+        return;
+    }
 
     if (out_name) {
         /* Compile-only mode: produce wasm bytes, write to OsitoFS */
@@ -1176,6 +1207,268 @@ void cmd_cc(int argc, char **argv)
     js_cc_kick(src, lang);
     free(src);
     cc_drain_until_done();
+    serial_puts("\n");
+}
+
+/* ── make: tiny Makefile runner ─────────────────────────────────
+ *
+ * Supports the bare bones of GNU make:
+ *  - `target: deps\n\tcmd1\n\tcmd2\n` rules (tab-indented commands).
+ *  - `# comment` lines and blank lines.
+ *  - `var = value` simple variables (no `:=`/`?=`/`+=`); $(VAR) expansion.
+ *  - Commands invoked through the kernel shell (`shell_exec`), so any
+ *    builtin (cc, exec, echo) works inside Makefiles.
+ *  - First target = default. `make name` selects.
+ *
+ * Out of scope (PoC): pattern rules, conditionals, includes, parallelism,
+ * timestamp checks (rebuilds every time). Useful for short Makefiles like
+ *
+ *     hello.wasm: hello.c
+ *         cc hello.c -o hello.wasm
+ *
+ *     run: hello.wasm
+ *         exec hello.wasm
+ */
+extern void shell_exec(char *line);
+
+typedef struct mk_var { char *name; char *val; struct mk_var *next; } mk_var_t;
+typedef struct mk_rule {
+    char *target;
+    char *deps;     /* raw, expanded later */
+    char **cmds;
+    int   ncmds;
+    struct mk_rule *next;
+} mk_rule_t;
+
+static char *mk_dup_strip(const char *s)
+{
+    while (*s == ' ' || *s == '\t') s++;
+    int len = (int)strlen(s);
+    while (len > 0 && (s[len-1] == ' ' || s[len-1] == '\t' || s[len-1] == '\r')) len--;
+    char *r = malloc(len + 1);
+    if (r) { memcpy(r, s, len); r[len] = 0; }
+    return r;
+}
+
+static char *mk_lookup(mk_var_t *vars, const char *name)
+{
+    for (mk_var_t *v = vars; v; v = v->next)
+        if (!strcmp(v->name, name)) return v->val;
+    return NULL;
+}
+
+/* Expand $(VAR) refs in `s` against `vars`. Caller frees. */
+static char *mk_expand(const char *s, mk_var_t *vars)
+{
+    size_t cap = 256, len = 0;
+    char *out = malloc(cap);
+    if (!out) return NULL;
+    while (*s) {
+        if (s[0] == '$' && s[1] == '(') {
+            const char *e = strchr(s + 2, ')');
+            if (e) {
+                char name[64]; int nl = (int)(e - (s + 2));
+                if (nl >= (int)sizeof(name)) nl = (int)sizeof(name) - 1;
+                memcpy(name, s + 2, nl); name[nl] = 0;
+                const char *v = mk_lookup(vars, name);
+                if (v) {
+                    size_t vl = strlen(v);
+                    if (len + vl + 1 >= cap) { cap = (len + vl + 1) * 2; out = realloc(out, cap); }
+                    memcpy(out + len, v, vl); len += vl;
+                }
+                s = e + 1; continue;
+            }
+        }
+        if (len + 2 >= cap) { cap *= 2; out = realloc(out, cap); }
+        out[len++] = *s++;
+    }
+    out[len] = 0;
+    return out;
+}
+
+void cmd_make(int argc, char **argv)
+{
+    extern void serial_puts(const char *);
+    extern void *osfs2_find(const char *);
+    extern uint64_t osfs2_file_size(void *);
+    extern int  osfs2_read(void *, uint64_t, void *, uint64_t);
+
+    /* Locate Makefile (`-f path` overrides). */
+    const char *mkfile = "Makefile";
+    const char *want_target = NULL;
+    for (int i = 1; i < argc; i++) {
+        if (!strcmp(argv[i], "-f") && i + 1 < argc) mkfile = argv[++i];
+        else if (argv[i][0] != '-' && !want_target) want_target = argv[i];
+    }
+    void *file = osfs2_find(mkfile);
+    if (!file) {
+        serial_puts("make: cannot find ");
+        serial_puts(mkfile);
+        serial_puts("\n");
+        return;
+    }
+    uint64_t size = osfs2_file_size(file);
+    char *body = malloc((size_t)size + 1);
+    if (!body) return;
+    osfs2_read(file, 0, body, size);
+    body[size] = 0;
+
+    /* Parse: walk line by line. Tab-indented lines are commands of the
+     * preceding rule; lines with ':' (and not tab-indented) are targets;
+     * lines with '=' (no leading tab, no ':' before '=') are variables. */
+    mk_var_t  *vars = NULL;
+    mk_rule_t *rules = NULL, *cur = NULL;
+
+    char *p = body;
+    while (*p) {
+        char *line = p;
+        char *eol = strchr(p, '\n');
+        if (eol) { *eol = 0; p = eol + 1; }
+        else p += strlen(p);
+
+        /* Skip leading whitespace (tab or space — OsitoK's edit can't
+         * easily insert tabs, so we accept either or none). */
+        char *s = line;
+        while (*s == ' ' || *s == '\t') s++;
+        if (*s == 0 || *s == '#') continue;
+
+        /* Classify the line. A `:` before any `=` makes it a rule
+         * header; an `=` before any `:` makes it a variable; otherwise
+         * it's a command attached to the most recent rule. */
+        char *colon = strchr(s, ':');
+        char *eq    = strchr(s, '=');
+        bool is_rule = colon && (!eq || colon < eq);
+        bool is_var  = eq && (!colon || eq < colon);
+
+        if (!is_rule && !is_var && cur) {
+            char *cmd = mk_dup_strip(s);
+            cur->cmds = realloc(cur->cmds, (cur->ncmds + 1) * sizeof(char *));
+            cur->cmds[cur->ncmds++] = cmd;
+            continue;
+        }
+
+        if (is_var) {
+            *eq = 0;
+            mk_var_t *v = malloc(sizeof(mk_var_t));
+            v->name = mk_dup_strip(s);
+            v->val  = mk_dup_strip(eq + 1);
+            v->next = vars;
+            vars = v;
+            continue;
+        }
+        if (is_rule) {
+            *colon = 0;
+            mk_rule_t *r = calloc(1, sizeof(mk_rule_t));
+            r->target = mk_dup_strip(s);
+            r->deps   = mk_dup_strip(colon + 1);
+            if (!rules) rules = r;
+            else { mk_rule_t *t = rules; while (t->next) t = t->next; t->next = r; }
+            cur = r;
+            continue;
+        }
+        /* Orphan command (no current rule) — ignore */
+    }
+
+    /* Pick target: arg or first defined */
+    mk_rule_t *target_rule = NULL;
+    if (want_target) {
+        for (mk_rule_t *r = rules; r; r = r->next)
+            if (!strcmp(r->target, want_target)) { target_rule = r; break; }
+        if (!target_rule) {
+            serial_puts("make: no rule for ");
+            serial_puts(want_target);
+            serial_puts("\n");
+            goto done;
+        }
+    } else if (rules) {
+        target_rule = rules;
+    } else {
+        serial_puts("make: no rules\n");
+        goto done;
+    }
+
+    /* Resolve deps recursively before running this target's commands.
+     * Cycles aren't detected (PoC); rebuild always (no timestamps). */
+    {
+        char *deps = mk_expand(target_rule->deps, vars);
+        char *tok = strtok(deps, " \t");
+        while (tok) {
+            for (mk_rule_t *dr = rules; dr; dr = dr->next) {
+                if (!strcmp(dr->target, tok)) {
+                    /* Recurse via cmd_make-like inline: just run dr's cmds */
+                    for (int i = 0; i < dr->ncmds; i++) {
+                        char *cmd = mk_expand(dr->cmds[i], vars);
+                        serial_puts(cmd); serial_puts("\n");
+                        shell_exec(cmd);
+                        free(cmd);
+                    }
+                    break;
+                }
+            }
+            tok = strtok(NULL, " \t");
+        }
+        free(deps);
+    }
+
+    /* Run the target's own commands */
+    for (int i = 0; i < target_rule->ncmds; i++) {
+        char *cmd = mk_expand(target_rule->cmds[i], vars);
+        serial_puts(cmd); serial_puts("\n");
+        shell_exec(cmd);
+        free(cmd);
+    }
+
+done:
+    /* Cleanup (omit per-node frees for brevity — heap reclaimed on exit). */
+    free(body);
+}
+
+/* ── edit: multi-line text editor saved to OsitoFS ──────────────
+ * Reads lines via term_readline until a line containing only "."
+ * (or empty + Ctrl-D); writes accumulated text to OsitoFS. Limit 64KB. */
+void cmd_edit(int argc, char **argv)
+{
+    extern void serial_puts(const char *);
+    extern void serial_putdec(uint64_t);
+    extern int  term_readline(const char *prompt, char *buf, uint32_t buf_size);
+    extern void *osfs2_find(const char *);
+    extern int  osfs2_delete(const char *);
+    extern void *osfs2_create(const char *, uint64_t);
+    extern int  osfs2_write(void *, uint64_t, const void *, uint64_t);
+
+    if (argc < 2) { serial_puts("usage: edit <file>\n"); return; }
+
+    serial_puts("[edit] type lines; '.' on its own line ends.\n");
+
+    enum { CAP = 64 * 1024 };
+    char *buffer = (char *)malloc(CAP);
+    if (!buffer) { serial_puts("edit: malloc failed\n"); return; }
+    size_t pos = 0;
+
+    char line[1024];
+    while (pos < CAP - 2) {
+        int n = term_readline("> ", line, sizeof(line));
+        if (n < 0) break;
+        /* terminator: line == "." */
+        if (line[0] == '.' && (line[1] == 0)) break;
+
+        size_t len = strlen(line);
+        if (pos + len + 1 >= CAP) break;
+        memcpy(buffer + pos, line, len);
+        pos += len;
+        buffer[pos++] = '\n';
+    }
+
+    osfs2_delete(argv[1]);
+    void *f = osfs2_create(argv[1], (uint64_t)pos);
+    if (!f) { free(buffer); serial_puts("edit: cannot create file\n"); return; }
+    osfs2_write(f, 0, buffer, (uint64_t)pos);
+    free(buffer);
+
+    serial_puts("[edit] ");
+    serial_putdec((uint64_t)pos);
+    serial_puts(" bytes -> ");
+    serial_puts(argv[1]);
     serial_puts("\n");
 }
 

@@ -173,8 +173,9 @@ static void (*sh_redir_fn)(const char *s, size_t len);
  * captured output as virtual stdin for the next stage.  Only consumed
  * by stdin-aware commands (grep/head/tail) when no file argument is
  * given.  Caller is responsible for buffer lifetime across the call. */
-static const char *sh_stdin_buf;
-static uint32_t    sh_stdin_len;
+/* Pipe / `<` stdin handoff. Non-static so wasm cmd_cc can read it. */
+const char *sh_stdin_buf;
+uint32_t    sh_stdin_len;
 
 static void sh_puts(const char *s)
 {
@@ -2446,7 +2447,8 @@ static void redir_capture(const char *s, size_t len)
 /* ── Dispatch command ────────────────────────────────────────── */
 
 /* Forward decl — pipeline driver calls into this for each stage. */
-static void shell_exec(char *line);
+/* Non-static so wasm cmd_make can invoke commands via shell pipeline. */
+void shell_exec(char *line);
 
 static void shell_exec_pipeline(char *line)
 {
@@ -2518,7 +2520,7 @@ static void shell_exec_pipeline(char *line)
     if (prev_buf) kfree(prev_buf);
 }
 
-static void shell_exec(char *line)
+void shell_exec(char *line)
 {
     char *argv[MAX_ARGS];
     int argc = parse_args(line, argv);
@@ -2530,6 +2532,32 @@ static void shell_exec(char *line)
     parse_redirects(&argc, argv, &redir);
 
     if (argc == 0) return;
+
+    /* Input redirection: `<file` loads file contents into sh_stdin_buf so
+     * the command sees it as piped stdin. Restored after exec. */
+    char       *in_buf = NULL;
+    const char *saved_stdin_buf = sh_stdin_buf;
+    uint32_t    saved_stdin_len = sh_stdin_len;
+    if (redir.in_file) {
+        extern void *osfs2_find(const char *);
+        extern uint64_t osfs2_file_size(void *);
+        extern int osfs2_read(void *, uint64_t, void *, uint64_t);
+        void *f = osfs2_find(redir.in_file);
+        if (!f) {
+            sh_puts("redirect: file not found: ");
+            sh_puts(redir.in_file);
+            sh_puts("\n");
+            return;
+        }
+        uint64_t fsz = osfs2_file_size(f);
+        in_buf = (char *)kmalloc((size_t)fsz + 1);
+        if (in_buf) {
+            osfs2_read(f, 0, in_buf, fsz);
+            in_buf[fsz] = 0;
+            sh_stdin_buf = in_buf;
+            sh_stdin_len = (uint32_t)fsz;
+        }
+    }
 
     /* Setup output redirection — 1 MB buffer covers a full dmesg dump
      * (the prior 64 KB cap silently truncated everything past the first
@@ -2569,6 +2597,12 @@ static void shell_exec(char *line)
     } else if (strcmp(cmd, "cc") == 0) {
         extern void cmd_cc(int, char **);
         cmd_cc(argc, argv);
+    } else if (strcmp(cmd, "edit") == 0) {
+        extern void cmd_edit(int, char **);
+        cmd_edit(argc, argv);
+    } else if (strcmp(cmd, "make") == 0) {
+        extern void cmd_make(int, char **);
+        cmd_make(argc, argv);
 #endif
     } else if (strcmp(cmd, "pred") == 0) {
         extern void pred_stats(void);
@@ -3480,6 +3514,13 @@ static void shell_exec(char *line)
         redir_pos = 0;
     }
     if (out_buf) kfree(out_buf);
+
+    /* Restore stdin and free input-redirect buffer if used */
+    if (in_buf) {
+        kfree(in_buf);
+        sh_stdin_buf = saved_stdin_buf;
+        sh_stdin_len = saved_stdin_len;
+    }
 }
 
 /* ── Shell main loop ─────────────────────────────────────────── */

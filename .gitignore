@@ -3,7 +3,17 @@ build/
 
 # Local copy of binji/wasm-clang toolchain (60MB), hosted on
 # wasm.naranjositos.tech/toolchain/ — see docs/wasm-cc.md
-arch/wasm/cc-toolchain/
+# Ignore the heavy binaries / vendored sources individually so our own
+# ositok.h next to them stays tracked.
+arch/wasm/cc-toolchain/clang.wasm
+arch/wasm/cc-toolchain/lld.wasm
+arch/wasm/cc-toolchain/memfs.wasm
+arch/wasm/cc-toolchain/sysroot.tar
+arch/wasm/cc-toolchain/shared.js
+arch/wasm/cc-toolchain/shared_web.js
+arch/wasm/cc-toolchain/worker.js
+arch/wasm/cc-toolchain/web.js
+arch/wasm/cc-toolchain/index.html
 
 # Toolchain (large, download separately) — Xtensa toolchain lives
 # under the xtensa arch directory after the 2026 migration.
