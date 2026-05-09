@@ -4245,6 +4245,24 @@ void shell_exec(char *line)
             }
         }
 #endif
+    } else if (strcmp(cmd, "bench") == 0) {
+        /* Inference micro-bench: prefill a known prompt, time generation. */
+        if (!prompt_llama) { sh_puts("No model loaded.\n"); return; }
+        int n_tok = 32;
+        if (argc >= 2) {
+            n_tok = 0;
+            const char *s = argv[1];
+            while (*s >= '0' && *s <= '9') { n_tok = n_tok * 10 + (*s - '0'); s++; }
+            if (n_tok < 4)   n_tok = 4;
+            if (n_tok > 256) n_tok = 256;
+        }
+        sh_puts_color("\n[bench] ", 0x00FF8800);
+        sh_putdec((uint64_t)n_tok); sh_puts(" tokens — ");
+        const char *prompt = "Once upon a time";
+        int gen = llama_chat(prompt_llama, prompt, (uint32_t)n_tok,
+                              chat_token_cb, NULL);
+        sh_puts("\n");
+        if (gen <= 0) sh_puts_color("[bench] no output\n", 0x00FF0000);
     } else if (strcmp(cmd, "ngram") == 0) {
         if (argc < 2) {
             sh_puts("Usage: ngram <size>   (0=off, 3=balanced, 4=strict)\n");

@@ -169,8 +169,9 @@ all: $(BUILDDIR)/osito.html
 $(BUILDDIR):
 	mkdir -p $(BUILDDIR)
 
-$(BUILDDIR)/osito.html: $(ALL_SRCS) shell.html | $(BUILDDIR)
+$(BUILDDIR)/osito.html: $(ALL_SRCS) shell.html manifest.json sw.js | $(BUILDDIR)
 	$(CC) $(CFLAGS) $(EMFLAGS) $(ALL_SRCS) -o $(BUILDDIR)/osito.html
+	cp manifest.json sw.js $(BUILDDIR)/
 
 run: all
 	emrun $(BUILDDIR)/osito.html

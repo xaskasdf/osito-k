@@ -210,7 +210,13 @@ static void load_filesystem(void)
     if (osfs2_mount(0) < 0) {
         serial_puts("[WASM] OsitoFS mount failed\n\n");
     } else {
-        serial_puts("[WASM] OsitoFS mounted\n\n");
+        extern uint32_t osfs2_file_count(void);
+        extern const char *osfs2_label(void);
+        serial_puts("[WASM] OsitoFS mounted: \"");
+        serial_puts(osfs2_label());
+        serial_puts("\", ");
+        serial_putdec((uint64_t)osfs2_file_count());
+        serial_puts(" files\n\n");
     }
 }
 

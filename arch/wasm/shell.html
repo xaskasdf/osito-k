@@ -4,6 +4,18 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>OsitoK — WebAssembly Shell</title>
+    <link rel="manifest" href="manifest.json">
+    <meta name="theme-color" content="#FF6B2C">
+    <script>
+        /* Register Service Worker for offline support + PWA install. */
+        if ('serviceWorker' in navigator) {
+            window.addEventListener('load', function() {
+                navigator.serviceWorker.register('sw.js').catch(function(e) {
+                    console.warn('[osito] SW registration failed:', e);
+                });
+            });
+        }
+    </script>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
 
