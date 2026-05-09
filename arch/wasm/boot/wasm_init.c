@@ -223,6 +223,75 @@ static void load_filesystem(void)
      * llama_init's brandon defaults so user overrides win. */
     extern void shell_persist_load_config(void);
     shell_persist_load_config();
+
+    /* First-boot starter files. If these names don't exist yet, create
+     * them so a fresh visitor sees something at `ls`. After IndexedDB
+     * persistence has run (commit e18b188) on a return visit, the
+     * existing files are kept and we skip creation. */
+    {
+        extern void *osfs2_find(const char *name);
+        extern void *osfs2_create(const char *name, uint64_t size);
+        extern int   osfs2_write(void *file, uint64_t offset,
+                                  const void *buf, uint64_t len);
+
+        struct { const char *name; const char *body; } seeds[] = {
+            { "README.md",
+              "# OsitoK / WebAssembly\n"
+              "\n"
+              "Bare-metal kernel running in your browser. Try:\n"
+              "\n"
+              "    info                                # kernel state dashboard\n"
+              "    chat Tell me a short story\n"
+              "    git init && git add README.md && git commit \"hi\"\n"
+              "    cc /samples/hello.c -o hello.wasm && exec hello.wasm\n"
+              "    mount-fs iso https://.../disc.iso && ls /iso\n"
+              "    claude                              # Anthropic REPL\n"
+              "                                          (run apikey first)\n"
+              "    ws open wss://echo.websocket.events main && ws send main hi\n"
+              "    bench 32                            # time inference\n"
+              "    help                                # full command list\n"
+              "\n"
+              "All your changes persist via IndexedDB across reloads.\n"
+            },
+            { "/samples/hello.c",
+              "/* Compile + run with: cc /samples/hello.c -o hello.wasm; exec hello.wasm */\n"
+              "#include <stdio.h>\n"
+              "int main(int argc, char **argv) {\n"
+              "    printf(\"hello from WASM userland — argc=%d\\n\", argc);\n"
+              "    for (int i = 0; i < argc; i++)\n"
+              "        printf(\"  argv[%d] = %s\\n\", i, argv[i]);\n"
+              "    return 0;\n"
+              "}\n"
+            },
+            { "/samples/oi_chat.c",
+              "/* Call into the kernel's LLM from a user-space program.\n"
+              " * Compile: cc /samples/oi_chat.c -o oichat.wasm */\n"
+              "#include <stdio.h>\n"
+              "#include <ositok.h>\n"
+              "int main(void) {\n"
+              "    char out[2048];\n"
+              "    int n = oi_chat(\"Once upon a time\", 24, out, sizeof(out));\n"
+              "    if (n > 0) printf(\"%.*s\\n\", n, out);\n"
+              "    return 0;\n"
+              "}\n"
+            },
+        };
+
+        int created = 0;
+        for (int i = 0; i < (int)(sizeof(seeds)/sizeof(seeds[0])); i++) {
+            if (osfs2_find(seeds[i].name)) continue;
+            uint64_t sz = 0;
+            for (const char *p = seeds[i].body; *p; p++) sz++;
+            void *f = osfs2_create(seeds[i].name, sz);
+            if (!f) continue;
+            if (osfs2_write(f, 0, seeds[i].body, sz) >= 0) created++;
+        }
+        if (created > 0) {
+            serial_puts("[seed] wrote ");
+            serial_putdec((uint64_t)created);
+            serial_puts(" starter files (try `cat README.md`)\n\n");
+        }
+    }
 }
 
 /* ── Entry point ─────────────────────────────────────────────── */
