@@ -4334,6 +4334,58 @@ void shell_exec(char *line)
             }
         }
 #endif
+    } else if (strcmp(cmd, "uname") == 0) {
+        sh_puts("OsitoK (");
+#ifdef __EMSCRIPTEN__
+        sh_puts("wasm32");
+#else
+        sh_puts("x86_64");
+#endif
+        sh_puts(") — bare-metal kernel");
+        if (argc >= 2 && strcmp(argv[1], "-a") == 0) {
+            sh_puts("\n  source: github.com/.../osito-k");
+            sh_puts("\n  arch:   ");
+#ifdef __EMSCRIPTEN__
+            sh_puts("wasm32 (Emscripten)");
+#else
+            sh_puts("x86_64");
+#endif
+            sh_puts("\n  shell:  121+ builtins (chat/git/cc/mount-fs/ws/...)");
+        }
+        sh_puts("\n");
+    } else if (strcmp(cmd, "tutorial") == 0) {
+        sh_puts_color("\n=== OsitoK quick tour ===\n", 0x00FF8800);
+        sh_puts("\n1. Run an LLM right here:\n");
+        sh_puts_color("       chat Tell me a short story\n", 0x0000FF88);
+        sh_puts("\n2. RAG with your own context:\n");
+        sh_puts_color("       rag Albert was born in Ulm in 1879. ::: Where was Albert born?\n", 0x0000FF88);
+        sh_puts("\n3. Real version control on a real filesystem:\n");
+        sh_puts_color("       git init && git add README.md && git commit \"hello\"\n", 0x0000FF88);
+        sh_puts_color("       git log\n", 0x0000FF88);
+        sh_puts("\n4. Compile + execute C from inside the kernel:\n");
+        sh_puts_color("       cc /samples/hello.c -o hello.wasm && exec hello.wasm\n", 0x0000FF88);
+        sh_puts("\n5. Mount any disk image from a URL — 12 filesystems supported:\n");
+        sh_puts_color("       mount-fs iso https://example.com/disc.iso\n", 0x0000FF88);
+        sh_puts_color("       ls /iso/   cat /iso/README\n", 0x0000FF88);
+        sh_puts("\n6. Talk to Anthropic's Claude API directly:\n");
+        sh_puts_color("       apikey sk-ant-...   # one time\n", 0x0000FF88);
+        sh_puts_color("       claude              # multi-turn REPL\n", 0x0000FF88);
+        sh_puts("\n7. Open WebSocket to anywhere CORS-permitting:\n");
+        sh_puts_color("       ws open wss://echo.websocket.events main\n", 0x0000FF88);
+        sh_puts_color("       ws send main hello   ws recv main\n", 0x0000FF88);
+        sh_puts("\n8. Time anything you run:\n");
+        sh_puts_color("       time bench 32        info\n", 0x0000FF88);
+        sh_puts_color("\nEverything you do persists across page reloads (IndexedDB).\n", 0x00888888);
+        sh_puts_color("Press up-arrow to recall previous commands.\n", 0x00888888);
+        sh_puts_color("`help` lists all 121+ builtins.\n\n", 0x00888888);
+    } else if (strcmp(cmd, "save") == 0) {
+#ifdef __EMSCRIPTEN__
+        extern void wasm_persist_flush(void);
+        wasm_persist_flush();
+        sh_puts("[save] FS image flushed to IndexedDB\n");
+#else
+        sh_puts("save: no-op outside WASM\n");
+#endif
     } else if (strcmp(cmd, "info") == 0) {
         sh_puts_color("\n── OsitoK kernel state ─────────────────────\n", 0x00FF8800);
 
