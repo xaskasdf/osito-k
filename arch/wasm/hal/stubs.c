@@ -113,6 +113,10 @@ static void extract_to_memfs(const char *osfs_name, const char *memfs_path)
     free(buf);
 }
 
+/* Forward decls for helpers used by proc_exec; bodies are further down. */
+static void cc_drain_until_done(void);
+extern void js_cc_run_wasi(const uint8_t *src, int size, const char *name);
+
 /* ── proc_exec: load and run WASM side modules via dlopen ────── */
 
 int proc_exec(const char *filename, int argc, const char **argv)
@@ -189,6 +193,37 @@ int proc_exec(const char *filename, int argc, const char **argv)
         return -1;
     }
 
+    /* Detect Emscripten side module (has `dylink.0` custom section) vs
+     * WASI standalone module. We just scan the first ~256 bytes for the
+     * literal "dylink" — fast and unique enough since custom section
+     * names appear early in the wasm file layout. */
+    bool is_dylink = false;
+    {
+        size_t scan = size < 256 ? (size_t)size : 256;
+        for (size_t i = 8; i + 6 < scan; i++) {
+            if (hdr[i]=='d' && hdr[i+1]=='y' && hdr[i+2]=='l' &&
+                hdr[i+3]=='i' && hdr[i+4]=='n' && hdr[i+5]=='k') {
+                is_dylink = true;
+                break;
+            }
+        }
+    }
+
+    if (!is_dylink) {
+        /* WASI standalone — route to clang.wasm worker's WASI runtime
+         * (App class with the same wasi_unstable shim that runs `cc`'s
+         * compileLinkRun outputs). Streams stdout via __ccPending. */
+        serial_puts("[EXEC] WASI module ");
+        serial_puts(filename);
+        serial_puts(" via clang.wasm runtime\n");
+        js_cc_run_wasi((const uint8_t *)buf, (int)size, filename);
+        free(buf);
+        cc_drain_until_done();
+        serial_puts("\n");
+        return 0;
+    }
+
+    /* Emscripten side module — dlopen path */
     EM_ASM({
         try { FS.mkdir('/tmp'); } catch(e) {}
         FS.writeFile('/tmp/app.so', HEAPU8.subarray($0, $0 + $1));
@@ -982,36 +1017,53 @@ EM_JS(int, js_cc_drain, (char *dst, int max), {
     return copy;
 });
 
-void cmd_cc(int argc, char **argv)
+/* Compile + link only (no run). Result polled via js_cc_done; bytes
+ * fetched via js_cc_compiled_size + js_cc_compiled_get. */
+EM_JS(void, js_cc_compile, (const char *src, const char *lang), {
+    var s = UTF8ToString(src);
+    var l = UTF8ToString(lang);
+    window.__ccDone = false;
+    window.__ccCompiledBytes = null;
+    window.__ccCompileError = null;
+    window.__cc.compile(s, l).then(function(res) {
+        if (res.error) window.__ccCompileError = res.error;
+        else window.__ccCompiledBytes = new Uint8Array(res.wasm);
+        window.__ccDone = true;
+    });
+});
+
+EM_JS(int, js_cc_compiled_size, (), {
+    return window.__ccCompiledBytes ? window.__ccCompiledBytes.length : 0;
+});
+
+EM_JS(int, js_cc_compile_error, (char *dst, int max), {
+    var e = window.__ccCompileError || '';
+    if (!e.length) return 0;
+    var bytes = new TextEncoder().encode(e);
+    var n = Math.min(bytes.length, max);
+    HEAPU8.set(bytes.subarray(0, n), dst);
+    return n;
+});
+
+EM_JS(void, js_cc_compiled_get, (uint8_t *dst), {
+    if (window.__ccCompiledBytes) HEAPU8.set(window.__ccCompiledBytes, dst);
+});
+
+/* Run a pre-compiled wasm via WASI shim. Output streams via the same
+ * __ccPending mechanism as compileLinkRun. */
+EM_JS(void, js_cc_run_wasi, (const uint8_t *src, int size, const char *name), {
+    var bytes = HEAPU8.slice(src, src + size).buffer;  /* copy to standalone ArrayBuffer */
+    var nm = UTF8ToString(name);
+    window.__ccPending = '';
+    window.__ccDone = false;
+    window.__cc.onWrite = function(chunk) { window.__ccPending += chunk; };
+    window.__cc.runWasi(bytes, nm).then(function() { window.__ccDone = true; });
+});
+
+/* Drain any pending output text into a kernel buffer + sleep until done. */
+static void cc_drain_until_done(void)
 {
     extern void serial_puts(const char *);
-    extern void *osfs2_find(const char *);
-    extern uint64_t osfs2_file_size(void *);
-    extern int osfs2_read(void *, uint64_t, void *, uint64_t);
-    if (argc < 2) {
-        serial_puts("usage: cc <src.c>\n");
-        return;
-    }
-
-    void *file = osfs2_find(argv[1]);
-    if (!file) {
-        serial_puts("cc: file not found: ");
-        serial_puts(argv[1]);
-        serial_puts("\n");
-        return;
-    }
-    uint64_t size = osfs2_file_size(file);
-    char *src = malloc((size_t)size + 1);
-    if (!src) { serial_puts("cc: malloc failed\n"); return; }
-    osfs2_read(file, 0, src, size);
-    src[size] = 0;
-
-    /* Detect language from extension: .c → C, default → C++ */
-    const char *ext = strrchr(argv[1], '.');
-    const char *lang = (ext && (!strcmp(ext, ".c") || !strcmp(ext, ".h"))) ? "c" : "c++";
-    js_cc_kick(src, lang);
-    free(src);
-
     char buf[1024];
     while (!js_cc_done()) {
         int n = js_cc_drain(buf, (int)sizeof(buf) - 1);
@@ -1023,6 +1075,107 @@ void cmd_cc(int argc, char **argv)
         buf[n] = 0;
         serial_puts(buf);
     }
+}
+
+void cmd_cc(int argc, char **argv)
+{
+    extern void serial_puts(const char *);
+    extern void serial_putdec(uint64_t);
+    extern void *osfs2_find(const char *);
+    extern uint64_t osfs2_file_size(void *);
+    extern int osfs2_read(void *, uint64_t, void *, uint64_t);
+    extern void *osfs2_create(const char *, uint64_t);
+    extern int osfs2_write(void *, uint64_t, const void *, uint64_t);
+    extern int osfs2_delete(const char *);
+
+    if (argc < 2) {
+        serial_puts("usage: cc <src.c> [-o <out.wasm>]\n");
+        return;
+    }
+
+    /* Parse args: pick first non-flag as source, look for -o */
+    const char *src_name = NULL;
+    const char *out_name = NULL;
+    for (int i = 1; i < argc; i++) {
+        if (!strcmp(argv[i], "-o") && i + 1 < argc) {
+            out_name = argv[++i];
+        } else if (argv[i][0] != '-' && !src_name) {
+            src_name = argv[i];
+        }
+    }
+    if (!src_name) {
+        serial_puts("cc: no input file\n");
+        return;
+    }
+
+    /* Read source file from OsitoFS */
+    void *file = osfs2_find(src_name);
+    if (!file) {
+        serial_puts("cc: file not found: ");
+        serial_puts(src_name);
+        serial_puts("\n");
+        return;
+    }
+    uint64_t size = osfs2_file_size(file);
+    char *src = malloc((size_t)size + 1);
+    if (!src) { serial_puts("cc: malloc failed\n"); return; }
+    osfs2_read(file, 0, src, size);
+    src[size] = 0;
+
+    const char *ext = strrchr(src_name, '.');
+    const char *lang = (ext && (!strcmp(ext, ".c") || !strcmp(ext, ".h"))) ? "c" : "c++";
+
+    if (out_name) {
+        /* Compile-only mode: produce wasm bytes, write to OsitoFS */
+        js_cc_compile(src, lang);
+        free(src);
+        /* No streaming output for pure compile, just block on done. */
+        while (!js_cc_done()) emscripten_sleep(50);
+
+        char errbuf[512];
+        int en = js_cc_compile_error(errbuf, (int)sizeof(errbuf) - 1);
+        if (en > 0) {
+            errbuf[en] = 0;
+            serial_puts("cc: compile failed: ");
+            serial_puts(errbuf);
+            serial_puts("\n");
+            return;
+        }
+
+        int wsz = js_cc_compiled_size();
+        if (wsz <= 0) {
+            serial_puts("cc: empty output\n");
+            return;
+        }
+        uint8_t *wbuf = malloc(wsz);
+        if (!wbuf) { serial_puts("cc: malloc failed\n"); return; }
+        js_cc_compiled_get(wbuf);
+
+        /* Replace existing file if present */
+        osfs2_delete(out_name);
+        void *of = osfs2_create(out_name, (uint64_t)wsz);
+        if (!of) {
+            free(wbuf);
+            serial_puts("cc: cannot create ");
+            serial_puts(out_name);
+            serial_puts("\n");
+            return;
+        }
+        osfs2_write(of, 0, wbuf, (uint64_t)wsz);
+        free(wbuf);
+
+        serial_puts("[cc] ");
+        serial_putdec((uint64_t)wsz);
+        serial_puts(" bytes -> ");
+        serial_puts(out_name);
+        serial_puts("\n");
+        return;
+    }
+
+    /* Inline compile + link + run (tcc -run style). */
+    js_cc_kick(src, lang);
+    free(src);
+    cc_drain_until_done();
     serial_puts("\n");
 }
 

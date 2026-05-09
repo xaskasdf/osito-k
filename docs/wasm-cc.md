@@ -98,8 +98,18 @@ WASI). No requiere extender `proc_exec` para el caso `cc -run`.
 | Comando | Qué hace |
 |---|---|
 | `cc hello.c` | Compila + linkea + corre inline (estilo `tcc -run`) |
-| (futuro) `cc hello.c -o hello.wasm` | Compila + linkea + guarda en OsitoFS, no ejecuta |
-| (futuro) `exec hello.wasm` | Branch WASI en `proc_exec`: corre el binario en otro worker |
+| `cc hello.c -o hello.wasm` | Compila + linkea + guarda en OsitoFS, no ejecuta |
+| `exec hello.wasm` | `proc_exec` detecta WASI (no `dylink.0` section) y corre con shim. Output streamea al terminal. |
+| `exec quake2.so` | `proc_exec` detecta `dylink.0` → carga via `dlopen` (Emscripten side module). |
+
+## IndexedDB cache
+
+El worker cachea las descargas pesadas en IndexedDB (`osito-cc-v1` / store `toolchain`):
+
+- **Primera visita**: ~50 MB descargados desde R2 + persistidos.
+- **Visitas siguientes**: instantáneo. Cada uno emite `[cache] <file> (X MB)` para visibilidad.
+
+Para limpiar el cache (forzar redownload), abrir DevTools → Application → IndexedDB → `osito-cc-v1` → Delete database.
 
 ## Flujo de prueba E2E
 
@@ -152,15 +162,13 @@ Libs en `/lib/wasm32-wasi/`:
 
 ## Roadmap
 
-- [ ] **`cc -o file.wasm`** + `exec file.wasm` con branch WASI en
-      `proc_exec` (similar a la validación que hicimos para Emscripten
-      side modules).
-- [ ] **IndexedDB cache** para clang/lld/sysroot (evita re-download
-      en visitas posteriores).
+- [x] ~~**`cc -o file.wasm`** + `exec file.wasm` con branch WASI en `proc_exec`~~ ✅ done
+- [x] ~~**IndexedDB cache** para clang/lld/sysroot~~ ✅ done
 - [ ] **`#include <ositok.h>`** — exponer la API del kernel
       (`oi_inference`, `oi_dlopen`, etc.) al toolchain.
 - [ ] **`make`** mínimo para building incremental.
 - [ ] **`cc -E`** preprocessing only.
+- [ ] **`<` redirect input** en shell para `cc < hello.c` y multi-línea.
 
 ## Configuración / referencias
 

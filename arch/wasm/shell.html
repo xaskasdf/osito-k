@@ -274,14 +274,62 @@
         let resolveCompile = null;
 
         const WORKER_SRC = `
+            /* IndexedDB cache for clang/lld/sysroot/memfs.
+             * First visit: fetch from R2 + persist (~50 MB).
+             * Later visits: instant load from IDB. */
+            const DB_NAME = 'osito-cc-v1', STORE = 'toolchain';
+            function idbOpen() {
+              return new Promise((resolve, reject) => {
+                const req = indexedDB.open(DB_NAME, 1);
+                req.onupgradeneeded = () => { req.result.createObjectStore(STORE); };
+                req.onsuccess = () => resolve(req.result);
+                req.onerror = () => reject(req.error);
+              });
+            }
+            async function idbGet(key) {
+              try {
+                const db = await idbOpen();
+                return await new Promise((resolve) => {
+                  const tx = db.transaction(STORE);
+                  const r = tx.objectStore(STORE).get(key);
+                  r.onsuccess = () => resolve(r.result || null);
+                  r.onerror = () => resolve(null);
+                });
+              } catch { return null; }
+            }
+            async function idbPut(key, ab) {
+              try {
+                const db = await idbOpen();
+                await new Promise((resolve) => {
+                  const tx = db.transaction(STORE, 'readwrite');
+                  tx.objectStore(STORE).put(ab, key);
+                  tx.oncomplete = resolve;
+                  tx.onerror = resolve;
+                  tx.onabort = resolve;
+                });
+              } catch {}
+            }
+            async function fetchCached(url, label) {
+              let ab = await idbGet(url);
+              if (ab) {
+                port && port.postMessage({ id: 'write', data: '\\x1b[2m[cache] ' + (label||url) + ' (' + (ab.byteLength/1024/1024).toFixed(1) + ' MB)\\x1b[0m\\n' });
+                return ab;
+              }
+              const r = await fetch(url);
+              if (!r.ok) throw new Error('HTTP ' + r.status + ' fetching ' + url);
+              ab = await r.arrayBuffer();
+              await idbPut(url, ab);
+              return ab;
+            }
+
             self.importScripts('https://wasm.naranjositos.tech/toolchain/shared.js');
             const T = 'https://wasm.naranjositos.tech/toolchain';
             let api, port;
             const opts = {
                 clang: T + '/clang.wasm', lld: T + '/lld.wasm',
                 sysroot: T + '/sysroot.tar', memfs: T + '/memfs.wasm',
-                async readBuffer(f) { const r = await fetch(f); if (!r.ok) throw new Error('HTTP ' + r.status); return r.arrayBuffer(); },
-                async compileStreaming(f) { const r = await fetch(f); return WebAssembly.compile(await r.arrayBuffer()); },
+                async readBuffer(f) { return await fetchCached(f, f.split('/').pop()); },
+                async compileStreaming(f) { return WebAssembly.compile(await fetchCached(f, f.split('/').pop())); },
                 hostWrite(s) { port && port.postMessage({ id: 'write', data: s }); }
             };
             self.onmessage = async (e) => {
@@ -294,8 +342,40 @@
                     try { await api.compileLinkRun(e.data.data, { lang: e.data.lang || 'c++' }); }
                     catch (err) { port.postMessage({ id: 'write', data: '\\n[cc] ' + err.message + '\\n' }); }
                     port.postMessage({ id: 'done' });
+                } else if (e.data.id === 'compile') {
+                    /* compile + link, return bytes (no run) */
+                    try {
+                        const lang = e.data.lang || 'c++';
+                        const ext = lang === 'c' ? 'c' : 'cc';
+                        const input = 't.' + ext, obj = 't.o', wasm = 't.wasm';
+                        await api.ready;
+                        await api.compile({ input, contents: e.data.data, obj, lang });
+                        await api.link(obj, wasm);
+                        const view = api.memfs.getFileContents(wasm);
+                        const ab = view.slice().buffer;
+                        port.postMessage({ id: 'compiled', wasm: ab }, [ab]);
+                    } catch (err) {
+                        port.postMessage({ id: 'compiled', error: err.message });
+                    }
+                } else if (e.data.id === 'runWasi') {
+                    /* Instantiate raw wasm bytes and run via API.run (uses
+                     * the App class internally — App is closure-private). */
+                    try {
+                        await api.ready;
+                        const mod = await WebAssembly.compile(e.data.bytes);
+                        await api.run(mod, e.data.name || 'app');
+                    } catch (err) {
+                        if (err && err.code !== undefined) {
+                            port.postMessage({ id: 'write', data: '\\n[exit ' + err.code + ']\\n' });
+                        } else {
+                            port.postMessage({ id: 'write', data: '\\n[wasi] ' + (err.message || err) + '\\n' });
+                        }
+                    }
+                    port.postMessage({ id: 'done' });
                 }
             };`;
+
+        let resolveCompiled = null;
 
         function ensureWorker() {
             if (worker) return ready;
@@ -316,6 +396,12 @@
                         cb(pendingWrite);
                         pendingWrite = '';
                     }
+                    else if (e.data.id === 'compiled' && resolveCompiled) {
+                        const cb = resolveCompiled;
+                        resolveCompiled = null;
+                        if (e.data.error) cb({ error: e.data.error });
+                        else              cb({ wasm: e.data.wasm });
+                    }
                 };
             });
             worker.postMessage({ id: 'constructor', data: ch.port2 }, [ch.port2]);
@@ -324,13 +410,32 @@
 
         return {
             onWrite: null,
-            // src: string, lang: 'c' | 'c++' (default 'c++')
+            // Compile + link + run inline. src: string, lang: 'c' | 'c++'
             compileLinkRun: async function(src, lang) {
                 await ensureWorker();
                 pendingWrite = '';
                 return new Promise((resolve) => {
                     resolveCompile = resolve;
                     port.postMessage({ id: 'compileLinkRun', data: src, lang: lang || 'c++' });
+                });
+            },
+            // Compile + link only — returns Promise<{wasm: ArrayBuffer} | {error: string}>
+            compile: async function(src, lang) {
+                await ensureWorker();
+                return new Promise((resolve) => {
+                    resolveCompiled = resolve;
+                    port.postMessage({ id: 'compile', data: src, lang: lang || 'c++' });
+                });
+            },
+            // Run a pre-compiled wasm module via WASI shim. bytes: ArrayBuffer
+            runWasi: async function(bytes, name) {
+                await ensureWorker();
+                pendingWrite = '';
+                return new Promise((resolve) => {
+                    resolveCompile = resolve;
+                    /* Note: bytes will be transferred (consumed) */
+                    const transfer = bytes instanceof ArrayBuffer ? [bytes] : [];
+                    port.postMessage({ id: 'runWasi', bytes, name: name || 'app' }, transfer);
                 });
             }
         };
