@@ -265,7 +265,19 @@ static const aux_fs_t aux_fs_table[] = {
 };
 #define AUX_FS_COUNT (int)(sizeof(aux_fs_table)/sizeof(aux_fs_table[0]))
 
-static const aux_fs_t *g_active_aux_fs = NULL;
+/* Per-type mount table — each fs name owns its own slot. NULL means
+ * not mounted. The "active" concept from the single-aux era survives
+ * as g_last_active_aux_fs (tracks whatever was most recently mounted)
+ * for /aux/ wildcard prefix support. */
+static const aux_fs_t *g_aux_mounts[10];        /* indexed by aux_fs_table position */
+static const aux_fs_t *g_last_active_aux_fs = NULL;
+#define g_active_aux_fs g_last_active_aux_fs    /* legacy alias */
+
+extern int  wasm_aux_alloc_slot(const char *name);
+extern int  wasm_aux_find_slot(const char *name);
+extern void wasm_aux_release_slot(int slot);
+extern int  aux_disk_fetch_slot(int slot, const char *url);
+extern void wasm_aux_route_slot(int slot);
 
 static const aux_fs_t *find_aux_fs(const char *name)
 {
@@ -275,34 +287,89 @@ static const aux_fs_t *find_aux_fs(const char *name)
     return NULL;
 }
 
-/* Public accessors used by cmd_cat / cmd_ls auto-mount path */
-const aux_fs_t *cmd_active_aux_fs(void) { return g_active_aux_fs; }
+/* Public accessors used by cmd_cat / cmd_ls auto-mount path.
+ * The "active" fs is whichever was most recently mounted, used as the
+ * fallback for the /aux/ wildcard prefix. /<type>/ prefixes look up
+ * specifically in g_aux_mounts[] by name. */
+const aux_fs_t *cmd_active_aux_fs(void) { return g_last_active_aux_fs; }
+
+const aux_fs_t *cmd_aux_fs_by_name(const char *name)
+{
+    for (int i = 0; i < AUX_FS_COUNT; i++)
+        if (g_aux_mounts[i] && strcmp(g_aux_mounts[i]->name, name) == 0)
+            return g_aux_mounts[i];
+    return NULL;
+}
+
+/* Internal: set the disk slot for fs's name before invoking its driver. */
+static int aux_route_for(const aux_fs_t *fs, int on)
+{
+    if (!fs) return -1;
+    int slot = wasm_aux_find_slot(fs->name);
+    if (slot < 0) return -1;
+    wasm_aux_route_slot(on ? slot : -1);
+    wasm_nvme_route_aux(on ? fs->route_aux : 0);
+    return slot;
+}
+
+int cmd_aux_fs_read_for(const aux_fs_t *fs, const char *name, void *buf, int max)
+{
+    if (!fs || !fs->read_file) return -1;
+    if (name[0] == '/') name++;
+    if (aux_route_for(fs, 1) < 0) return -1;
+    int rc = fs->read_file(name, 0, buf, max);
+    aux_route_for(fs, 0);
+    return rc;
+}
 
 int cmd_aux_fs_read(const char *name, void *buf, int max)
 {
-    if (!g_active_aux_fs || !g_active_aux_fs->read_file) return -1;
-    /* Strip leading slash if present */
-    if (name[0] == '/') name++;
-    wasm_nvme_route_aux(g_active_aux_fs->route_aux);
-    int rc = g_active_aux_fs->read_file(name, 0, buf, max);
-    wasm_nvme_route_aux(0);
+    return cmd_aux_fs_read_for(g_last_active_aux_fs, name, buf, max);
+}
+
+int cmd_aux_fs_ls_for(const aux_fs_t *fs, const char *path)
+{
+    if (!fs) return -1;
+    const char *p = (!path || !*path) ? NULL : path;
+    if (p && p[0] == '/' && p[1] == '\0') p = NULL;
+    if (aux_route_for(fs, 1) < 0) return -1;
+    int rc = fs->ls(p);
+    aux_route_for(fs, 0);
     return rc;
 }
 
 int cmd_aux_fs_ls(const char *path)
 {
-    if (!g_active_aux_fs) return -1;
-    /* Empty path → root */
-    const char *p = (!path || !*path) ? NULL : path;
-    /* Strip the leading /aux portion if any survives */
-    if (p && p[0] == '/' && p[1] == '\0') p = NULL;
-    wasm_nvme_route_aux(g_active_aux_fs->route_aux);
-    int rc = g_active_aux_fs->ls(p);
-    wasm_nvme_route_aux(0);
-    return rc;
+    return cmd_aux_fs_ls_for(g_last_active_aux_fs, path);
 }
 
-void cmd_clear_aux_fs(void) { g_active_aux_fs = NULL; }
+void cmd_clear_aux_fs(void)
+{
+    /* Release all mounts. */
+    for (int i = 0; i < AUX_FS_COUNT; i++) {
+        if (g_aux_mounts[i]) {
+            int slot = wasm_aux_find_slot(g_aux_mounts[i]->name);
+            if (slot >= 0) wasm_aux_release_slot(slot);
+            g_aux_mounts[i] = NULL;
+        }
+    }
+    g_last_active_aux_fs = NULL;
+}
+
+void cmd_clear_aux_fs_by_name(const char *name)
+{
+    for (int i = 0; i < AUX_FS_COUNT; i++) {
+        if (g_aux_mounts[i] && strcmp(g_aux_mounts[i]->name, name) == 0) {
+            int slot = wasm_aux_find_slot(name);
+            if (slot >= 0) wasm_aux_release_slot(slot);
+            g_aux_mounts[i] = NULL;
+            if (g_last_active_aux_fs &&
+                strcmp(g_last_active_aux_fs->name, name) == 0)
+                g_last_active_aux_fs = NULL;
+            return;
+        }
+    }
+}
 #endif
 
 /* ── WASM-compatibility shims ────────────────────────────────── */
@@ -678,21 +745,20 @@ static void cmd_cat(int argc, char *argv[])
             }
             if (!matched) continue;
 
-            const aux_fs_t *fs = cmd_active_aux_fs();
+            /* /<type>/ → look up by name; /aux/ → last active. */
+            const aux_fs_t *fs = pre[k].fs_name
+                ? cmd_aux_fs_by_name(pre[k].fs_name)
+                : cmd_active_aux_fs();
             if (!fs) {
-                sh_puts("No aux FS mounted. Run: mount-fs <type> <url>\n");
-                return;
-            }
-            if (pre[k].fs_name && strcmp(pre[k].fs_name, fs->name) != 0) {
-                sh_puts("Aux FS type mismatch (mounted=");
-                sh_puts(fs->name); sh_puts(", path expects=");
-                sh_puts(pre[k].fs_name); sh_puts(").\n");
+                sh_puts("Not mounted: ");
+                sh_puts(pre[k].fs_name ? pre[k].fs_name : "any aux FS");
+                sh_puts("\n");
                 return;
             }
             static char aux_buf[65536];
-            int n = cmd_aux_fs_read(argv[1] + plen, aux_buf, sizeof(aux_buf));
+            int n = cmd_aux_fs_read_for(fs, argv[1] + plen, aux_buf, sizeof(aux_buf));
             if (n <= 0) {
-                sh_puts("File not found in aux FS.\n");
+                sh_puts("File not found.\n");
                 return;
             }
             char chunk[256];
@@ -3156,10 +3222,30 @@ void shell_exec(char *line)
                 }
             }
             if (matched) {
-                if (!cmd_active_aux_fs()) {
-                    sh_puts("No aux FS mounted. Run: mount-fs <type> <url>\n");
+                /* Determine which fs to list by examining the prefix
+                 * (rest[-1] etc). If the matched prefix is "aux",
+                 * use the last-active fs; otherwise look up by name. */
+                int prefix_idx = -1;
+                for (int k = 0; prefixes[k]; k++) {
+                    int plen = 0; while (prefixes[k][plen]) plen++;
+                    int ok = 1;
+                    for (int j = 0; j < plen; j++)
+                        if (argv[1][1 + j] != prefixes[k][j]) { ok = 0; break; }
+                    if (ok && (argv[1][1 + plen] == '\0' ||
+                               argv[1][1 + plen] == '/')) {
+                        prefix_idx = k; break;
+                    }
+                }
+                const aux_fs_t *fs = (prefix_idx == 0)
+                    ? cmd_active_aux_fs()
+                    : cmd_aux_fs_by_name(prefixes[prefix_idx]);
+                if (!fs) {
+                    sh_puts("Not mounted: ");
+                    sh_puts(prefix_idx == 0 ? "any aux FS"
+                                            : prefixes[prefix_idx]);
+                    sh_puts("\n");
                 } else {
-                    cmd_aux_fs_ls(rest);
+                    cmd_aux_fs_ls_for(fs, rest);
                 }
             } else {
                 cmd_ls();
@@ -3903,47 +3989,72 @@ void shell_exec(char *line)
         if (argc < 3) {
             sh_puts("Usage: mount-fs <type> <url>\n");
             sh_puts("  Types: iso ext fat exfat ntfs hfs btrfs apfs udf sqfs\n");
-            sh_puts("  After: fs-ls [path] / fs-cat <name>\n");
+            sh_puts("  Multi-mount: one of each type can be mounted at once\n");
+            sh_puts("  After: ls /<type>/  cat /<type>/<name>\n");
             return;
         }
         const aux_fs_t *fs = find_aux_fs(argv[1]);
         if (!fs) {
             sh_puts("Unknown FS type. Run: mount-fs (no args) for list.\n");
-        } else if (aux_disk_fetch(argv[2]) < 0) {
-            sh_puts_color("[mount-fs] fetch failed\n", 0x00FF0000);
         } else {
-            int rc = -1;
-            if (fs->mount_iso)
-                rc = fs->mount_iso(fs->name[0] == 'i' ? aux_disk_read_iso
-                                                       : aux_disk_read_512);
-            else if (fs->mount_sqfs)
-                rc = fs->mount_sqfs(aux_disk_read_bytes_wrap, aux_disk_size());
-            else if (fs->mount_partlba) {
-                wasm_nvme_route_aux(fs->route_aux);
-                rc = fs->mount_partlba(0);
-                wasm_nvme_route_aux(0);
-            } else if (strcmp(fs->name, "ext") == 0) {
-                rc = ext2_mount(0, aux_disk_read_512);
-            }
-            if (rc < 0) {
-                sh_puts_color("[mount-fs] not a valid ", 0x00FF0000);
-                sh_puts(fs->name); sh_puts(" image\n");
+            /* Find the table index for this fs (used as slot id). */
+            int idx = -1;
+            for (int i = 0; i < AUX_FS_COUNT; i++)
+                if (&aux_fs_table[i] == fs) { idx = i; break; }
+            if (idx < 0) idx = 0;
+
+            int slot = wasm_aux_alloc_slot(fs->name);
+            if (slot < 0) { sh_puts("[mount-fs] no free slots\n"); return; }
+
+            wasm_aux_route_slot(slot);
+            int fetch_rc = aux_disk_fetch_slot(slot, argv[2]);
+            if (fetch_rc < 0) {
+                wasm_aux_route_slot(-1);
+                wasm_aux_release_slot(slot);
+                sh_puts_color("[mount-fs] fetch failed\n", 0x00FF0000);
             } else {
-                g_active_aux_fs = fs;
-                sh_puts_color("[mount-fs] ", 0x0000FF00);
-                sh_puts(fs->name);
-                sh_puts(" mounted (");
-                sh_putdec(aux_disk_size() / (1024 * 1024));
-                sh_puts(" MB)\n");
+                int rc = -1;
+                if (fs->mount_iso)
+                    rc = fs->mount_iso(fs->name[0] == 'i' ? aux_disk_read_iso
+                                                           : aux_disk_read_512);
+                else if (fs->mount_sqfs)
+                    rc = fs->mount_sqfs(aux_disk_read_bytes_wrap, aux_disk_size());
+                else if (fs->mount_partlba) {
+                    wasm_nvme_route_aux(fs->route_aux);
+                    rc = fs->mount_partlba(0);
+                    wasm_nvme_route_aux(0);
+                } else if (strcmp(fs->name, "ext") == 0) {
+                    rc = ext2_mount(0, aux_disk_read_512);
+                }
+                wasm_aux_route_slot(-1);
+
+                if (rc < 0) {
+                    wasm_aux_release_slot(slot);
+                    sh_puts_color("[mount-fs] not a valid ", 0x00FF0000);
+                    sh_puts(fs->name); sh_puts(" image\n");
+                } else {
+                    g_aux_mounts[idx] = fs;
+                    g_last_active_aux_fs = fs;
+                    sh_puts_color("[mount-fs] ", 0x0000FF00);
+                    sh_puts(fs->name);
+                    sh_puts(" mounted (");
+                    sh_putdec(aux_disk_size() / (1024 * 1024));
+                    sh_puts(" MB) at /");
+                    sh_puts(fs->name); sh_puts("/\n");
+                }
             }
         }
     } else if (strcmp(cmd, "umount") == 0 || strcmp(cmd, "umount-fs") == 0) {
-        if (!cmd_active_aux_fs()) {
-            sh_puts("No aux FS mounted.\n");
+        extern void cmd_clear_aux_fs(void);
+        extern void cmd_clear_aux_fs_by_name(const char *name);
+        if (argc >= 2) {
+            cmd_clear_aux_fs_by_name(argv[1]);
+            sh_puts("[umount] "); sh_puts(argv[1]); sh_puts(" detached\n");
+        } else if (!cmd_active_aux_fs()) {
+            sh_puts("No aux FS mounted. Use: umount <type> to be specific.\n");
         } else {
-            extern void cmd_clear_aux_fs(void);
             cmd_clear_aux_fs();
-            sh_puts("[umount] aux FS detached\n");
+            sh_puts("[umount] all aux FS detached\n");
         }
     } else if (strcmp(cmd, "fs-ls") == 0) {
         if (!g_active_aux_fs) sh_puts("No FS mounted (mount-fs <type> <url>).\n");

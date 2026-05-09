@@ -2107,9 +2107,10 @@ void io_predict_reset(void) {}
 void io_predict_stats(void) {}
 
 /* ── NVMe extra helpers ───────────────────────────────────────── */
-/* Dispatch flag — when 1, nvme_read serves the auxiliary disk buffer
- * (used by fat32_mount which calls nvme_read internally). The wrapping
- * shell command sets this around fat32 ops, then clears it.        */
+/* Dispatch flag — when 1, nvme_read serves the active aux slot
+ * (used by fat32_mount which calls nvme_read internally). Multi-slot
+ * support: the wrapping shell command sets g_active_aux_slot to the
+ * right slot before calling fat32 ops; this flag enables routing. */
 static int g_nvme_route_aux = 0;
 void wasm_nvme_route_aux(int on) { g_nvme_route_aux = on != 0; }
 
@@ -2202,18 +2203,94 @@ int  ccp_get_random(uint8_t *buf, uint32_t len)
 }
 
 /* ══════════════════════════════════════════════════════════════
- *  Auxiliary disk mount — for `mount-iso`, `mount-fat`, etc.
+ *  Auxiliary disk mount — N slots, one per FS type.
  *
  *  The primary OsitoFS image is loaded into wasm_nvme_buf at boot.
- *  A second disk slot is held here for read-only filesystem drivers
- *  that take a `read_fn(lba, count, buf)` callback (iso9660, ext2…).
- *  These drivers never call disk_read_bytes for IO — they receive
- *  bytes through the callback that we register at mount time, so
- *  there's no contention with the primary disk.
+ *  Up to AUX_DISK_SLOTS auxiliary FS images can be mounted at once
+ *  (e.g. one ISO + one FAT + one ext2). Each slot owns its own
+ *  HEAP-allocated buffer.
+ *
+ *  Dispatch flow:
+ *    - g_active_aux_slot = -1   → reads served by wasm_nvme_buf
+ *    - g_active_aux_slot >= 0   → reads served by aux_disks[slot]
+ *  The shell dispatcher sets g_active_aux_slot around each fs call
+ *  (cmd_aux_fs_read / cmd_aux_fs_ls) so individual fs drivers don't
+ *  need to know about slots.
+ *
+ *  Backwards compat: aux_disk_fetch / aux_disk_size / aux_disk_ptr
+ *  operate on slot 0 (the "default" aux). New code should use the
+ *  _slot variants.
  * ══════════════════════════════════════════════════════════════ */
 
-static uint8_t *g_aux_disk_buf = NULL;
-static uint64_t g_aux_disk_size = 0;
+#define AUX_DISK_SLOTS 10
+
+typedef struct {
+    uint8_t *buf;
+    uint64_t size;
+    char     name[16];   /* fs-type tag, e.g. "iso", "fat", "ext" */
+    bool     in_use;
+} aux_disk_t;
+
+static aux_disk_t g_aux_disks[AUX_DISK_SLOTS];
+static int        g_active_aux_slot = -1;
+
+void wasm_aux_route_slot(int slot)
+{
+    if (slot < -1 || slot >= AUX_DISK_SLOTS) slot = -1;
+    g_active_aux_slot = slot;
+}
+
+int wasm_aux_active_slot(void) { return g_active_aux_slot; }
+
+/* Find a slot by FS-type name. Returns idx ≥ 0 if found, -1 if not. */
+int wasm_aux_find_slot(const char *name)
+{
+    for (int i = 0; i < AUX_DISK_SLOTS; i++)
+        if (g_aux_disks[i].in_use && strcmp(g_aux_disks[i].name, name) == 0)
+            return i;
+    return -1;
+}
+
+/* Allocate a slot for the given FS type (replacing any prior mount of
+ * that same type). Returns slot index. */
+int wasm_aux_alloc_slot(const char *name)
+{
+    int existing = wasm_aux_find_slot(name);
+    if (existing >= 0) {
+        extern void free(void *);
+        if (g_aux_disks[existing].buf) free(g_aux_disks[existing].buf);
+        g_aux_disks[existing].buf = NULL;
+        g_aux_disks[existing].size = 0;
+        return existing;
+    }
+    for (int i = 0; i < AUX_DISK_SLOTS; i++) {
+        if (!g_aux_disks[i].in_use) {
+            g_aux_disks[i].in_use = true;
+            int n = 0;
+            while (n < 15 && name[n]) { g_aux_disks[i].name[n] = name[n]; n++; }
+            g_aux_disks[i].name[n] = '\0';
+            g_aux_disks[i].buf = NULL;
+            g_aux_disks[i].size = 0;
+            return i;
+        }
+    }
+    return -1;
+}
+
+void wasm_aux_release_slot(int slot)
+{
+    if (slot < 0 || slot >= AUX_DISK_SLOTS) return;
+    extern void free(void *);
+    if (g_aux_disks[slot].buf) free(g_aux_disks[slot].buf);
+    g_aux_disks[slot].buf = NULL;
+    g_aux_disks[slot].size = 0;
+    g_aux_disks[slot].in_use = false;
+    g_aux_disks[slot].name[0] = '\0';
+}
+
+/* Backwards-compat aliases that operate on slot 0 — the "default" aux. */
+#define g_aux_disk_buf  (g_aux_disks[0].buf)
+#define g_aux_disk_size (g_aux_disks[0].size)
 
 EM_JS(void, js_aux_fetch_kick, (const char *url), {
     var u = UTF8ToString(url);
@@ -2260,7 +2337,11 @@ EM_JS(int, js_aux_fetch_error, (char *dst, int max), {
  * until the JS Promise resolves. Returns 0 on success, -1 on error. */
 extern void emscripten_sleep(unsigned int ms);
 
-int aux_disk_fetch(const char *url) {
+/* Fetch into a specific aux slot (multi-mount). Returns 0 on success. */
+int aux_disk_fetch_slot(int slot, const char *url)
+{
+    if (slot < 0 || slot >= AUX_DISK_SLOTS) return -1;
+
     js_aux_fetch_kick(url);
     while (!js_aux_fetch_done()) emscripten_sleep(20);
 
@@ -2275,41 +2356,71 @@ int aux_disk_fetch(const char *url) {
         return -1;
     }
 
-    /* Free previous if any */
     extern void *malloc(size_t); extern void free(void *);
-    if (g_aux_disk_buf) free(g_aux_disk_buf);
+    if (g_aux_disks[slot].buf) free(g_aux_disks[slot].buf);
+    g_aux_disks[slot].buf = (uint8_t *)malloc(sz);
+    g_aux_disks[slot].size = sz;
+    if (!g_aux_disks[slot].buf) return -1;
+    js_aux_fetch_copy(g_aux_disks[slot].buf, sz);
 
-    g_aux_disk_buf = (uint8_t *)malloc(sz);
-    g_aux_disk_size = sz;
-    if (!g_aux_disk_buf) return -1;
-
-    js_aux_fetch_copy(g_aux_disk_buf, sz);
-    serial_puts("[AUX] fetched ");
+    serial_puts("[AUX] slot ");
+    serial_putdec((uint64_t)slot);
+    serial_puts(" (");
+    serial_puts(g_aux_disks[slot].name);
+    serial_puts(") fetched ");
     serial_putdec((uint64_t)sz);
     serial_puts(" bytes\n");
     return 0;
 }
 
+/* Backwards-compat: fetch into slot 0. */
+int aux_disk_fetch(const char *url) {
+    /* Ensure slot 0 is allocated/named for legacy callers. */
+    if (!g_aux_disks[0].in_use) {
+        g_aux_disks[0].in_use = true;
+        g_aux_disks[0].name[0] = 'a'; g_aux_disks[0].name[1] = 'u';
+        g_aux_disks[0].name[2] = 'x'; g_aux_disks[0].name[3] = '\0';
+    }
+    return aux_disk_fetch_slot(0, url);
+}
+
+/* Pick the buffer to read from: the active slot if set, else slot 0
+ * (backwards-compat default). */
+static const aux_disk_t *active_aux(void)
+{
+    int s = (g_active_aux_slot >= 0) ? g_active_aux_slot : 0;
+    if (!g_aux_disks[s].in_use) return NULL;
+    return &g_aux_disks[s];
+}
+
 /* iso9660_mount calls this with (lba, count, buf). Each LBA is 2048 B. */
 int aux_disk_read_iso(uint64_t lba, uint32_t count, void *buf) {
+    const aux_disk_t *a = active_aux();
     uint64_t off = lba * 2048;
     uint64_t len = (uint64_t)count * 2048;
-    if (!g_aux_disk_buf || off + len > g_aux_disk_size) return -1;
-    memcpy(buf, g_aux_disk_buf + off, (size_t)len);
+    if (!a || !a->buf || off + len > a->size) return -1;
+    memcpy(buf, a->buf + off, (size_t)len);
     return 0;
 }
 
 /* ext2 / others using 512-byte LBA */
 int aux_disk_read_512(uint64_t lba, uint32_t count, void *buf) {
+    const aux_disk_t *a = active_aux();
     uint64_t off = lba * 512;
     uint64_t len = (uint64_t)count * 512;
-    if (!g_aux_disk_buf || off + len > g_aux_disk_size) return -1;
-    memcpy(buf, g_aux_disk_buf + off, (size_t)len);
+    if (!a || !a->buf || off + len > a->size) return -1;
+    memcpy(buf, a->buf + off, (size_t)len);
     return 0;
 }
 
-uint64_t aux_disk_size(void) { return g_aux_disk_size; }
-uint8_t *aux_disk_ptr(void)  { return g_aux_disk_buf; }
+uint64_t aux_disk_size(void) {
+    const aux_disk_t *a = active_aux();
+    return a ? a->size : 0;
+}
+uint8_t *aux_disk_ptr(void)  {
+    const aux_disk_t *a = active_aux();
+    return a ? a->buf : NULL;
+}
 
 /* ══════════════════════════════════════════════════════════════
  *  Generic HTTP fetch bridge — used by `curl` and `claude` REPL.
