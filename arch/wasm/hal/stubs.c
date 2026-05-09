@@ -1735,6 +1735,8 @@ void io_predict_stats(void) {}
 /* ── NVMe extra helpers ───────────────────────────────────────── */
 int  nvme_read(uint64_t lba, uint32_t count, void *buf)
 { return nvme_read_bytes(lba * 512, buf, (uint64_t)count * 512); }
+int  nvme_write(uint64_t lba, uint32_t count, const void *buf)
+{ return nvme_write_bytes(lba * 512, buf, (uint64_t)count * 512); }
 int  nvme_read_async(uint64_t lba, uint32_t count, uint64_t phys_addr)
 { (void)lba; (void)count; (void)phys_addr; return -1; }
 int  nvme_wait_cq(uint16_t cid)        { (void)cid; return 0; }
@@ -1800,3 +1802,112 @@ int  ccp_get_random(uint8_t *buf, uint32_t len)
     }, buf, len);
     return 0;
 }
+
+/* ══════════════════════════════════════════════════════════════
+ *  Auxiliary disk mount — for `mount-iso`, `mount-fat`, etc.
+ *
+ *  The primary OsitoFS image is loaded into wasm_nvme_buf at boot.
+ *  A second disk slot is held here for read-only filesystem drivers
+ *  that take a `read_fn(lba, count, buf)` callback (iso9660, ext2…).
+ *  These drivers never call disk_read_bytes for IO — they receive
+ *  bytes through the callback that we register at mount time, so
+ *  there's no contention with the primary disk.
+ * ══════════════════════════════════════════════════════════════ */
+
+static uint8_t *g_aux_disk_buf = NULL;
+static uint64_t g_aux_disk_size = 0;
+
+EM_JS(void, js_aux_fetch_kick, (const char *url), {
+    var u = UTF8ToString(url);
+    window.__auxFetchDone = false;
+    window.__auxFetchData = null;
+    window.__auxFetchError = null;
+    fetch(u)
+        .then(function(r) {
+            if (!r.ok) throw new Error('HTTP ' + r.status);
+            return r.arrayBuffer();
+        })
+        .then(function(ab) {
+            window.__auxFetchData = new Uint8Array(ab);
+            window.__auxFetchDone = true;
+        })
+        .catch(function(e) {
+            window.__auxFetchError = String(e);
+            window.__auxFetchDone = true;
+        });
+});
+
+EM_JS(int, js_aux_fetch_done, (), { return window.__auxFetchDone ? 1 : 0; });
+
+EM_JS(int, js_aux_fetch_size, (), {
+    return window.__auxFetchData ? window.__auxFetchData.byteLength : 0;
+});
+
+EM_JS(void, js_aux_fetch_copy, (uint8_t *dst, int max), {
+    var src = window.__auxFetchData;
+    if (!src) return;
+    var n = src.byteLength < max ? src.byteLength : max;
+    HEAPU8.set(src.subarray(0, n), dst);
+});
+
+EM_JS(int, js_aux_fetch_error, (char *dst, int max), {
+    var s = window.__auxFetchError || '';
+    var bytes = lengthBytesUTF8(s) + 1;
+    if (bytes > max) bytes = max;
+    stringToUTF8(s, dst, bytes);
+    return s ? bytes - 1 : 0;
+});
+
+/* Synchronous fetch helper — relies on Asyncify to suspend the kernel
+ * until the JS Promise resolves. Returns 0 on success, -1 on error. */
+extern void emscripten_sleep(unsigned int ms);
+
+int aux_disk_fetch(const char *url) {
+    js_aux_fetch_kick(url);
+    while (!js_aux_fetch_done()) emscripten_sleep(20);
+
+    int sz = js_aux_fetch_size();
+    if (sz <= 0) {
+        char errbuf[256];
+        if (js_aux_fetch_error(errbuf, sizeof(errbuf)) > 0) {
+            serial_puts("[AUX] fetch error: ");
+            serial_puts(errbuf);
+            serial_puts("\n");
+        }
+        return -1;
+    }
+
+    /* Free previous if any */
+    extern void *malloc(size_t); extern void free(void *);
+    if (g_aux_disk_buf) free(g_aux_disk_buf);
+
+    g_aux_disk_buf = (uint8_t *)malloc(sz);
+    g_aux_disk_size = sz;
+    if (!g_aux_disk_buf) return -1;
+
+    js_aux_fetch_copy(g_aux_disk_buf, sz);
+    serial_puts("[AUX] fetched ");
+    serial_putdec((uint64_t)sz);
+    serial_puts(" bytes\n");
+    return 0;
+}
+
+/* iso9660_mount calls this with (lba, count, buf). Each LBA is 2048 B. */
+int aux_disk_read_iso(uint64_t lba, uint32_t count, void *buf) {
+    uint64_t off = lba * 2048;
+    uint64_t len = (uint64_t)count * 2048;
+    if (!g_aux_disk_buf || off + len > g_aux_disk_size) return -1;
+    memcpy(buf, g_aux_disk_buf + off, (size_t)len);
+    return 0;
+}
+
+/* ext2 / others using 512-byte LBA */
+int aux_disk_read_512(uint64_t lba, uint32_t count, void *buf) {
+    uint64_t off = lba * 512;
+    uint64_t len = (uint64_t)count * 512;
+    if (!g_aux_disk_buf || off + len > g_aux_disk_size) return -1;
+    memcpy(buf, g_aux_disk_buf + off, (size_t)len);
+    return 0;
+}
+
+uint64_t aux_disk_size(void) { return g_aux_disk_size; }

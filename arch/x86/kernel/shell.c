@@ -151,6 +151,20 @@ extern void brandon_set_debug_logits(int on);
 extern void     llama_set_ngram_size(uint32_t n);
 extern uint32_t llama_get_ngram_size(void);
 
+#ifdef __EMSCRIPTEN__
+/* Auxiliary disk fetch — used by `mount-iso <url>` to load a CD image
+ * from the network into a HEAP buffer that iso9660_mount reads through
+ * a custom callback (no contention with the primary OsitoFS image). */
+extern int      aux_disk_fetch(const char *url);
+extern int      aux_disk_read_iso(uint64_t lba, uint32_t count, void *buf);
+extern uint64_t aux_disk_size(void);
+extern int      iso9660_mount(int (*read_fn)(uint64_t lba, uint32_t count, void *buf));
+extern bool     iso9660_is_mounted(void);
+extern int      iso9660_ls(const char *path);
+extern int      iso9660_read_file(const char *name, uint64_t offset, void *buf, uint64_t len);
+extern int      iso9660_find(const char *name, uint32_t *lba_out, uint32_t *size_out);
+#endif
+
 /* ── WASM-compatibility shims ────────────────────────────────── */
 #ifdef __EMSCRIPTEN__
 #include <emscripten.h>
@@ -3226,6 +3240,65 @@ void shell_exec(char *line)
         cmd_rag(argc, argv);
     } else if (strcmp(cmd, "penalty") == 0) {
         cmd_penalty(argc, argv);
+#ifdef __EMSCRIPTEN__
+    } else if (strcmp(cmd, "mount-iso") == 0) {
+        if (argc < 2) {
+            sh_puts("Usage: mount-iso <url>\n");
+            sh_puts("  Fetches an ISO 9660 image and mounts it for browsing.\n");
+            sh_puts("  After mount: iso-ls [path] / iso-cat <file>\n");
+        } else if (aux_disk_fetch(argv[1]) < 0) {
+            sh_puts_color("[mount-iso] fetch failed\n", 0x00FF0000);
+        } else if (iso9660_mount(aux_disk_read_iso) < 0) {
+            sh_puts_color("[mount-iso] not a valid ISO 9660 image\n", 0x00FF0000);
+        } else {
+            sh_puts_color("[mount-iso] mounted (", 0x0000FF00);
+            sh_putdec(aux_disk_size() / (1024 * 1024));
+            sh_puts(" MB) — try: iso-ls\n");
+        }
+    } else if (strcmp(cmd, "iso-ls") == 0) {
+        if (!iso9660_is_mounted()) {
+            sh_puts("No ISO mounted. Use: mount-iso <url>\n");
+        } else {
+            iso9660_ls(argc >= 2 ? argv[1] : "/");
+        }
+    } else if (strcmp(cmd, "iso-cat") == 0) {
+        if (argc < 2) {
+            sh_puts("Usage: iso-cat <filename>\n");
+        } else if (!iso9660_is_mounted()) {
+            sh_puts("No ISO mounted.\n");
+        } else {
+            uint32_t lba = 0, size = 0;
+            if (iso9660_find(argv[1], &lba, &size) < 0) {
+                sh_puts("File not found.\n");
+            } else {
+                /* Cap at 64 KB to keep terminal responsive */
+                uint32_t cap = size > 65536 ? 65536 : size;
+                static char fbuf[65536];
+                if (iso9660_read_file(argv[1], 0, fbuf, cap) < 0) {
+                    sh_puts("Read failed.\n");
+                } else {
+                    /* Stream in chunks via sh_puts (it accepts NUL-terminated;
+                     * we NUL-terminate at chunk boundary). */
+                    char chunk[256];
+                    uint32_t i = 0;
+                    while (i < cap) {
+                        uint32_t n = cap - i; if (n > 255) n = 255;
+                        for (uint32_t j = 0; j < n; j++) chunk[j] = fbuf[i + j];
+                        chunk[n] = '\0';
+                        sh_puts(chunk);
+                        i += n;
+                    }
+                    if (size > cap) {
+                        sh_puts("\n... [truncated, ");
+                        sh_putdec((size - cap) / 1024);
+                        sh_puts(" KB more]\n");
+                    } else {
+                        sh_puts("\n");
+                    }
+                }
+            }
+        }
+#endif
     } else if (strcmp(cmd, "ngram") == 0) {
         if (argc < 2) {
             sh_puts("Usage: ngram <size>   (0=off, 3=balanced, 4=strict)\n");
