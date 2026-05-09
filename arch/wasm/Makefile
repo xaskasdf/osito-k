@@ -111,7 +111,21 @@ X86_SRCS := \
     ../x86/kernel/kthread.c \
     ../x86/kernel/slab.c \
     ../x86/kernel/socket.c \
+    ../x86/kernel/rcu.c \
+    ../x86/kernel/zlib.c \
+    ../x86/kernel/git.c \
     ../x86/fs/gguf.c \
+    ../x86/fs/gpt.c \
+    ../x86/fs/iso9660.c \
+    ../x86/fs/fat32.c \
+    ../x86/fs/ext2.c \
+    ../x86/fs/exfat.c \
+    ../x86/fs/ntfs.c \
+    ../x86/fs/squashfs.c \
+    ../x86/fs/hfsplus.c \
+    ../x86/fs/btrfs.c \
+    ../x86/fs/apfs.c \
+    ../x86/fs/udf.c \
     ../x86/fs/ositofs2.c \
     ../x86/fs/vfs.c \
     ../x86/fs/tmpfs.c

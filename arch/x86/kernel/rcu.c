@@ -104,7 +104,9 @@ void synchronize_rcu(void)
             }
         }
         if (all_passed) break;
+#ifndef __EMSCRIPTEN__
         __asm__ volatile ("pause");
+#endif
     }
 
     rcu_gp_completed = target_gp;
