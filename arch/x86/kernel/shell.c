@@ -4334,6 +4334,79 @@ void shell_exec(char *line)
             }
         }
 #endif
+    } else if (strcmp(cmd, "info") == 0) {
+        sh_puts_color("\n── OsitoK kernel state ─────────────────────\n", 0x00FF8800);
+
+        /* Model */
+        if (prompt_llama) {
+            extern int llama_state_dim(void *s);
+            extern int llama_state_layers(void *s);
+            extern int llama_state_vocab(void *s);
+            extern const char *llama_state_arch(void *s);
+            sh_puts("model:    arch=");
+            sh_puts(llama_state_arch(prompt_llama));
+            sh_puts(" dim=");  sh_putdec((uint64_t)llama_state_dim(prompt_llama));
+            sh_puts(" layers=");sh_putdec((uint64_t)llama_state_layers(prompt_llama));
+            sh_puts(" vocab="); sh_putdec((uint64_t)llama_state_vocab(prompt_llama));
+            sh_puts("\n");
+        } else {
+            sh_puts("model:    (none loaded)\n");
+        }
+
+        /* Sampling */
+        {
+            float r, pr, fq;
+            llama_get_penalty(&r, &pr, &fq);
+            sh_puts("sampling: penalty rep=");
+            sh_putdec((uint64_t)(r * 100.0f) / 100); sh_puts(".");
+            sh_putdec((uint64_t)(r * 100.0f) % 100);
+            sh_puts(" pres="); sh_putdec((uint64_t)(pr * 100.0f) / 100);
+            sh_puts("."); sh_putdec((uint64_t)(pr * 100.0f) % 100);
+            sh_puts(" freq="); sh_putdec((uint64_t)(fq * 100.0f) / 100);
+            sh_puts("."); sh_putdec((uint64_t)(fq * 100.0f) % 100);
+            sh_puts(" ngram="); sh_putdec(llama_get_ngram_size());
+            sh_puts("\n");
+        }
+
+        /* OsitoFS */
+        if (osfs2_is_mounted()) {
+            extern uint32_t osfs2_file_count(void);
+            extern const char *osfs2_label(void);
+            extern uint32_t osfs2_free_blocks(void);
+            extern uint32_t osfs2_get_block_size(void);
+            sh_puts("fs:       /  \"");
+            sh_puts(osfs2_label()); sh_puts("\" — ");
+            sh_putdec((uint64_t)osfs2_file_count()); sh_puts(" files, ");
+            sh_putdec((uint64_t)osfs2_free_blocks() *
+                      (uint64_t)osfs2_get_block_size() / (1024 * 1024));
+            sh_puts(" MB free\n");
+        }
+#ifdef __EMSCRIPTEN__
+        /* Aux mounts */
+        for (int i = 0; i < AUX_FS_COUNT; i++) {
+            if (g_aux_mounts[i]) {
+                sh_puts("aux:      /");
+                sh_puts(g_aux_mounts[i]->name);
+                sh_puts("/   (multi-mount)\n");
+            }
+        }
+
+        /* WS connections */
+        for (int i = 0; i < WS_SLOT_MAX; i++) {
+            if (ws_slots[i].handle) {
+                int s = wasm_ws_state(ws_slots[i].handle);
+                sh_puts("ws:       ");
+                sh_puts(ws_slots[i].name);
+                sh_puts(" — ");
+                sh_puts(s == 0 ? "connecting" :
+                        s == 1 ? "open" :
+                        s == 2 ? "closing" :
+                        s == 3 ? "closed" : "error");
+                sh_puts("\n");
+            }
+        }
+#endif
+        sh_puts("\n");
     } else if (strcmp(cmd, "time") == 0) {
         if (argc < 2) { sh_puts("Usage: time <command...>\n"); return; }
         /* Reassemble argv[1..] into a single line and run via the

@@ -1672,6 +1672,16 @@ void brandon_set_features(int dwa, int v_residual, int registers)
 }
 void brandon_set_debug_logits(int on) { g_brandon_debug_logits = on != 0; }
 
+/* Read-only state accessors for shell `info` command. */
+int llama_state_dim(void *s)
+{ return s ? (int)((llama_state_t *)s)->dim : 0; }
+int llama_state_layers(void *s)
+{ return s ? (int)((llama_state_t *)s)->n_layers : 0; }
+int llama_state_vocab(void *s)
+{ return s ? (int)((llama_state_t *)s)->vocab_size : 0; }
+const char *llama_state_arch(void *s)
+{ return s ? ((llama_state_t *)s)->arch : ""; }
+
 void llama_set_penalty(float rep, float presence, float frequency)
 {
     g_rep_penalty       = rep > 0.0f ? rep : 1.0f;
