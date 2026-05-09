@@ -182,6 +182,21 @@
 
     // ── Keyboard input → C ring buffer ──────────────────────────
 
+    // ── Command history (persisted to localStorage) ─────────────
+    var __hist = [];
+    var __histIdx = 0;
+    var __histDraft = '';
+    try {
+        var stored = localStorage.getItem('osito-history');
+        if (stored) __hist = JSON.parse(stored).slice(-200);
+    } catch (e) {}
+    function __saveHist() {
+        try { localStorage.setItem('osito-history',
+                                   JSON.stringify(__hist.slice(-200))); }
+        catch (e) {}
+    }
+    __histIdx = __hist.length;
+
     inputField.addEventListener('keydown', function(e) {
         if (e.key === 'Enter') {
             const line = inputField.value;
@@ -191,6 +206,33 @@
                 Module.ccall('wasm_kb_push', null, ['number'], [line.charCodeAt(i)]);
             }
             Module.ccall('wasm_kb_push', null, ['number'], [13]); // '\r' → enter
+            // History: append non-empty, non-duplicate-of-prev lines
+            if (line.length > 0 && (__hist.length === 0 ||
+                                    __hist[__hist.length - 1] !== line)) {
+                __hist.push(line);
+                if (__hist.length > 500) __hist = __hist.slice(-500);
+                __saveHist();
+            }
+            __histIdx = __hist.length;
+            __histDraft = '';
+            e.preventDefault();
+        } else if (e.key === 'ArrowUp') {
+            if (__hist.length === 0) { e.preventDefault(); return; }
+            if (__histIdx === __hist.length) __histDraft = inputField.value;
+            if (__histIdx > 0) __histIdx--;
+            inputField.value = __hist[__histIdx];
+            // Move cursor to end
+            inputField.setSelectionRange(inputField.value.length,
+                                         inputField.value.length);
+            e.preventDefault();
+        } else if (e.key === 'ArrowDown') {
+            if (__histIdx >= __hist.length) { e.preventDefault(); return; }
+            __histIdx++;
+            inputField.value = (__histIdx === __hist.length)
+                ? __histDraft
+                : __hist[__histIdx];
+            inputField.setSelectionRange(inputField.value.length,
+                                         inputField.value.length);
             e.preventDefault();
         } else if (e.key === 'Backspace') {
             Module.ccall('wasm_kb_push', null, ['number'], [8]); // '\b'
