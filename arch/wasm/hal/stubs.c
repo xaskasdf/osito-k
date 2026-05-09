@@ -695,18 +695,130 @@ int sys_caps_check_alloc(uint64_t bytes, const char *what)
 /* mem_get_used / mem_free_pages / kmalloc / kfree / kcalloc / krealloc
    are provided by hal/mem.c */
 
-/* ── Network TCP/DNS (no real networking in WASM MVP) ────────── */
+/* TCP state constants from net.h — duplicated here since net.h pulls
+ * in the full kernel network typedefs we don't want. */
+#define TCP_CLOSED      0
+#define TCP_ESTABLISHED 2
 
+/* ── Network TCP — WS-tunneled bridge ────────────────────────────
+ *
+ * The native net.c speaks raw TCP through nic.c (I211 hardware).
+ * In WASM there's no raw IP access, so we tunnel through a Cloudflare
+ * Worker proxy (tools/tcp-proxy-worker.js) that bridges WebSocket
+ * frames ↔ TCP bytes. Conventions:
+ *   - conn_id IS the WebSocket handle (int) returned by wasm_ws_open
+ *   - net_tcp_connect takes IPv4 which is useless here — use
+ *     wasm_tcp_connect_host(host, port) instead
+ *   - state translates ws state → TCP_* constants from net.h
+ * ──────────────────────────────────────────────────────────────── */
+
+extern int wasm_ws_open(const char *url);
+extern int wasm_ws_state(int handle);
+extern int wasm_ws_wait_open(int handle, int timeout_ms);
+extern int wasm_ws_send(int handle, const void *data, int len);
+extern int wasm_ws_recv_wait(int handle, void *dst, int max, int timeout_ms);
+extern void wasm_ws_close(int handle);
+
+/* Mutable proxy URL template — set by `tcp proxy <url>` shell.
+ * Default empty so a kernel without a deployed proxy fails clean. */
+static char g_tcp_proxy_url[256] =
+    "wss://tcp-proxy.naranjositos.tech/?host={host}&port={port}";
+
+void wasm_tcp_set_proxy(const char *url) {
+    int n = 0;
+    while (url && url[n] && n < (int)sizeof(g_tcp_proxy_url) - 1) {
+        g_tcp_proxy_url[n] = url[n]; n++;
+    }
+    g_tcp_proxy_url[n] = '\0';
+}
+
+const char *wasm_tcp_get_proxy(void) { return g_tcp_proxy_url; }
+
+/* Substitute {host}/{port} into the proxy template, then open WS. */
+int wasm_tcp_connect_host(const char *host, uint16_t port)
+{
+    if (!host || !*host) return -1;
+
+    char url[512];
+    int up = 0;
+    char portbuf[8];
+    int pn = 0;
+    {
+        uint16_t v = port;
+        if (v == 0) portbuf[pn++] = '0';
+        else {
+            char tmp[8]; int t = 0;
+            while (v) { tmp[t++] = '0' + v % 10; v /= 10; }
+            while (t) portbuf[pn++] = tmp[--t];
+        }
+        portbuf[pn] = '\0';
+    }
+
+    const char *t = g_tcp_proxy_url;
+    while (*t && up < (int)sizeof(url) - 1) {
+        if (t[0] == '{' && t[1] == 'h' && t[2] == 'o' &&
+            t[3] == 's' && t[4] == 't' && t[5] == '}') {
+            const char *h = host;
+            while (*h && up < (int)sizeof(url) - 1) url[up++] = *h++;
+            t += 6;
+        } else if (t[0] == '{' && t[1] == 'p' && t[2] == 'o' &&
+                   t[3] == 'r' && t[4] == 't' && t[5] == '}') {
+            for (int i = 0; i < pn && up < (int)sizeof(url) - 1; i++)
+                url[up++] = portbuf[i];
+            t += 6;
+        } else {
+            url[up++] = *t++;
+        }
+    }
+    url[up] = '\0';
+
+    int h = wasm_ws_open(url);
+    if (h <= 0) return -1;
+    if (wasm_ws_wait_open(h, 5000) < 0) {
+        wasm_ws_close(h);
+        return -1;
+    }
+    return h;
+}
+
+/* IPv4 connect — not supported in WASM (no raw IP). Returns -1 so
+ * native code that wraps DNS+connect either falls back to JS fetch
+ * or fails cleanly. */
 int  net_tcp_connect(const uint8_t dst_ip[4], uint16_t dst_port, uint16_t src_port)
      { (void)dst_ip; (void)dst_port; (void)src_port; return -1; }
+
+/* The conn handle IS the WS handle. */
 int  net_tcp_send(int conn, const void *data, uint32_t len)
-     { (void)conn; (void)data; (void)len; return -1; }
+     { return conn > 0 ? wasm_ws_send(conn, data, (int)len) : -1; }
+
 int  net_tcp_recv(int conn, void *buf, uint32_t buf_size)
-     { (void)conn; (void)buf; (void)buf_size; return -1; }
+     {
+        if (conn <= 0) return -1;
+        /* Non-blocking poll — match the native semantics: 0 if nothing,
+         * else bytes copied, -1 if connection died. */
+        int s = wasm_ws_state(conn);
+        if (s >= 3) return -1;
+        return wasm_ws_recv_wait(conn, buf, (int)buf_size, 0);
+     }
+
 int  net_tcp_recv_timeout(int conn, void *buf, uint32_t buf_size, uint32_t timeout_ticks)
-     { (void)conn; (void)buf; (void)buf_size; (void)timeout_ticks; return -1; }
-void net_tcp_close(int conn)   { (void)conn; }
-int  net_tcp_state(int conn)   { (void)conn; return -1; }
+     {
+        if (conn <= 0) return -1;
+        /* Native uses ticks (~10 ms each); we treat as ms directly. */
+        int rc = wasm_ws_recv_wait(conn, buf, (int)buf_size, (int)timeout_ticks * 10);
+        if (rc < 0) return -1;
+        return rc;
+     }
+
+void net_tcp_close(int conn) { if (conn > 0) wasm_ws_close(conn); }
+
+int  net_tcp_state(int conn) {
+    if (conn <= 0) return TCP_CLOSED;
+    int s = wasm_ws_state(conn);
+    if (s == 1) return TCP_ESTABLISHED;
+    return TCP_CLOSED;
+}
+
 int  net_dns_resolve(const char *hostname, uint8_t ip_out[4])
      { (void)hostname; (void)ip_out; return -1; }
 int  net_tcp_listen(uint16_t port) { (void)port; return -1; }

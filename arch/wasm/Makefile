@@ -114,6 +114,7 @@ X86_SRCS := \
     ../x86/kernel/rcu.c \
     ../x86/kernel/zlib.c \
     ../x86/kernel/git.c \
+    ../x86/kernel/tls.c \
     ../x86/fs/gguf.c \
     ../x86/fs/gpt.c \
     ../x86/fs/iso9660.c \

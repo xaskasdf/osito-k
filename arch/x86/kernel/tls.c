@@ -99,9 +99,16 @@ static void prng_seed(void)
         prng_state = ccp_random();
         return;
     }
+#ifdef __EMSCRIPTEN__
+    /* WASM has no rdtsc; fall back to JS Date.now() via a builtin
+     * that emcc compiles to wasm SIMD-free code. */
+    extern double emscripten_get_now(void);
+    prng_state = (uint64_t)emscripten_get_now();
+#else
     uint32_t lo, hi;
     __asm__ volatile ("rdtsc" : "=a"(lo), "=d"(hi));
     prng_state = ((uint64_t)hi << 32) | lo;
+#endif
 }
 
 static uint8_t prng_byte(void)
