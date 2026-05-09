@@ -218,11 +218,14 @@
 
     (function() {
         var MODEL_URL = modelOverride
-            /* SmolLM2-135M is too slow for browser inference without SIMD
-             * (~minutes per token). The 10M-param brandon-tiny gives a
-             * usable interactive feel; SmolLM2 still loadable via
-             * ?model=https://wasm.naranjositos.tech/models/smollm2-...gguf */
-            || 'https://wasm.naranjositos.tech/models/tinystories-llama2-20m.Q4_K_M.gguf';
+            /* Brandon-tiny-10m is the default: instruct-tuned (ChatML)
+             * with custom block-shared arch + DenseFormer DWA + value
+             * residual + register tokens. Runs at ~64 ms/tok in WASM
+             * with the full sampling stack (rep_penalty + ngram=3).
+             * Override:
+             *   ?model=https://wasm.naranjositos.tech/models/smollm2-135m-instruct-q4_0.gguf
+             *   ?model=https://wasm.naranjositos.tech/models/tinystories-llama2-20m.Q4_K_M.gguf */
+            || 'https://wasm.naranjositos.tech/models/brandon-tiny-10m-instruct.f16.gguf';
         fetch(MODEL_URL)
             .then(function(r) {
                 if (!r.ok) throw new Error('HTTP ' + r.status);

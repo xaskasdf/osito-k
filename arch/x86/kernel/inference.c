@@ -40,6 +40,11 @@ extern void  mem_free_pages(void *addr, uint64_t count);
 /* Tokenizer decode (tokenizer.c) — returns NULL if tokenizer not initialized */
 extern const char *tok_global_decode(uint32_t id);
 
+/* Forward declarations for sampling tuners (defined later in this file). */
+void llama_set_sampling(float temperature, float top_p);
+void llama_set_penalty(float rep, float presence, float frequency);
+void llama_set_ngram_size(uint32_t n);
+
 /* ── Utility helpers ─────────────────────────────────────────── */
 
 #define PAGE_SZ 4096
@@ -523,6 +528,13 @@ int llama_init(llama_state_t *state, gguf_model_t *model, uint32_t max_seq)
 
     /* ── Brandon-arch extras (v_first + DWA scratch) ── */
     if (is_brandon) {
+        /* Pre-load brandon-tiny's tested sampling recipe so the chat
+         * works out of the box (matches test_generation.py). User can
+         * still override via 'temp', 'penalty', 'ngram' at the shell. */
+        llama_set_sampling(0.7f, 0.9f);
+        llama_set_penalty(1.2f, 0.0f, 0.0f);
+        llama_set_ngram_size(3);
+
         if (state->use_value_residual) {
             state->v_first = (float *)mem_alloc_aligned(
                 (uint64_t)state->kv_dim * sizeof(float), 64);
