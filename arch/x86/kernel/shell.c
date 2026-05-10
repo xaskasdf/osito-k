@@ -5144,6 +5144,44 @@ void shell_exec(char *line)
                     proc_exec(fname, xc, xargv);
                 }
             }
+        } else if (strcmp(sub, "dev") == 0) {
+            /* Install a local .wasm file as a pkg without going through R2.
+             * Useful for dogfooding 'cc src.c -o foo.wasm' results.
+             *   pkg dev foo /path/to/foo.wasm
+             * If the source is /pkg/foo.wasm already, this is a no-op. */
+            const char *name = (argc >= 3) ? argv[2] : NULL;
+            const char *src  = (argc >= 4) ? argv[3] : NULL;
+            if (!name || !src) { sh_puts("usage: pkg dev <name> <src>\n"); }
+            else {
+                extern void *osfs2_find(const char *);
+                void *sf = osfs2_find(src[0] == '/' ? src + 1 : src);
+                if (!sf) { sh_puts("pkg dev: source not found\n"); }
+                else {
+                    extern uint64_t osfs2_file_size(void *);
+                    extern int osfs2_read(void *, uint64_t, void *, uint64_t);
+                    uint64_t sz = osfs2_file_size(sf);
+                    if (sz == 0 || sz > 4 * 1024 * 1024) {
+                        sh_puts("pkg dev: bad size\n");
+                    } else {
+                        extern void *malloc(unsigned long); extern void free(void *);
+                        uint8_t *blob = (uint8_t *)malloc(sz);
+                        if (blob && osfs2_read(sf, 0, blob, sz) == 0) {
+                            char fname[80]; int n = strlen(name); if (n>60) n=60;
+                            memcpy(fname, "pkg/", 4); memcpy(fname+4, name, n);
+                            memcpy(fname+4+n, ".wasm", 6);
+                            extern int osfs2_delete(const char *);
+                            osfs2_delete(fname);
+                            void *f = osfs2_create(fname, sz);
+                            if (f && osfs2_write(f, 0, blob, sz) == 0) {
+                                sh_puts("[pkg dev] installed "); sh_puts(name);
+                                sh_puts(" ("); sh_putdec(sz); sh_puts(" B) at /");
+                                sh_puts(fname); sh_puts("\n");
+                            } else sh_puts("pkg dev: write failed\n");
+                        } else sh_puts("pkg dev: read failed\n");
+                        if (blob) free(blob);
+                    }
+                }
+            }
         } else if (strcmp(sub, "uninstall") == 0 || strcmp(sub, "rm") == 0) {
             const char *name = (argc >= 3) ? argv[2] : NULL;
             if (!name) { sh_puts("usage: pkg uninstall <name>\n"); }
@@ -5168,6 +5206,7 @@ void shell_exec(char *line)
             sh_puts("  pkg installed             list packages already on local OsitoFS\n");
             sh_puts("  pkg run <name> [args]     install if needed, then exec\n");
             sh_puts("  pkg uninstall <name>      remove local /pkg/<name>.wasm\n");
+            sh_puts("  pkg dev <name> <file>     install a local .wasm as a pkg\n");
             sh_puts("\nPackages are tiny WASI binaries (<1 KB) and can be piped:\n");
             sh_puts("  echo hola | pkg run rev   ->  aloh\n");
         } else {
