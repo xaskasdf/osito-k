@@ -110,6 +110,84 @@ static void embed_token(float *dst, gguf_tensor_t *embd, uint32_t token, uint32_
         memcpy(dst, src, dim * sizeof(float));
         break;
     }
+    case GGML_TYPE_Q4_K:
+    case GGML_TYPE_Q6_K: {
+        /* For Llama 3 — token_embd often Q4_K or Q6_K. Reuse the matvec
+         * dequant by setting input = one-hot(token), but cheaper:
+         * dequant one row directly via a unit-input matvec of size 1.
+         * Use the row-extract approach: do a "matvec" with rows=1 where
+         * we point at the right row offset. */
+        size_t row_bytes = (embd->type == GGML_TYPE_Q4_K)
+            ? ((size_t)dim / 256) * 144
+            : ((size_t)dim / 256) * 210;
+        const void *row_ptr = (const uint8_t *)embd->data + (uint64_t)token * row_bytes;
+        /* Build a unit vector tmp[dim] = column-identity, then matvec with
+         * weight = row gives back the dequantized row. Simpler: dequant
+         * directly by calling matvec with one-hot input of size dim.
+         * Actually easiest is to dot against unit-vector inputs[i]=1 to
+         * extract sum of dequant values; that gives the SUM not the row.
+         *
+         * Cleanest: build a tiny scratch and run matvec_qX_k_scalar with
+         * rows=dim, treating the row as a 1×dim "matrix" multiplied by a
+         * one-hot of size dim. Cheaper: write a direct dequant.
+         *
+         * Direct dequant: walk the block layout and write to dst[]. */
+        if (embd->type == GGML_TYPE_Q4_K) {
+            const uint8_t *block_base = (const uint8_t *)row_ptr;
+            uint32_t nb = dim / 256;
+            for (uint32_t b = 0; b < nb; b++) {
+                const uint8_t *block = block_base + b * 144;
+                float d    = f16_to_f32(*(const uint16_t *)(block + 0));
+                float dmin = f16_to_f32(*(const uint16_t *)(block + 2));
+                const uint8_t *sc = block + 4;
+                const uint8_t *qs = block + 16;
+                float *yp = dst + b * 256;
+                int is = 0;
+                for (int chunk = 0; chunk < 256; chunk += 64) {
+                    uint8_t s1, m1b, s2, m2b;
+                    if (is + 0 < 4) { s1 = sc[is+0]&63; m1b = sc[is+0+4]&63; }
+                    else { int sj=is+0; s1=(sc[sj+4]&0xF)|((sc[sj-4]>>6)<<4);
+                           m1b=(sc[sj+4]>>4)|((sc[sj]>>6)<<4); }
+                    float d1 = d * (float)s1, mm1 = dmin * (float)m1b;
+                    if (is + 1 < 4) { s2 = sc[is+1]&63; m2b = sc[is+1+4]&63; }
+                    else { int sj=is+1; s2=(sc[sj+4]&0xF)|((sc[sj-4]>>6)<<4);
+                           m2b=(sc[sj+4]>>4)|((sc[sj]>>6)<<4); }
+                    float d2 = d * (float)s2, mm2 = dmin * (float)m2b;
+                    for (int l = 0; l < 32; l++)
+                        yp[chunk + l]      = d1 * (float)(qs[l] & 0xF) - mm1;
+                    for (int l = 0; l < 32; l++)
+                        yp[chunk + 32 + l] = d2 * (float)(qs[l] >> 4) - mm2;
+                    qs += 32; is += 2;
+                }
+            }
+        } else {  /* Q6_K */
+            const uint8_t *block_base = (const uint8_t *)row_ptr;
+            uint32_t nb = dim / 256;
+            for (uint32_t b = 0; b < nb; b++) {
+                const uint8_t *block = block_base + b * 210;
+                const uint8_t *ql = block + 0;
+                const uint8_t *qh = block + 128;
+                const int8_t  *sc = (const int8_t *)(block + 192);
+                float d = f16_to_f32(*(const uint16_t *)(block + 208));
+                float *yp = dst + b * 256;
+                for (int n = 0; n < 256; n += 128) {
+                    for (int l = 0; l < 32; l++) {
+                        int is = l / 16;
+                        int8_t q1 = (int8_t)((ql[l +  0] & 0xF) | (((qh[l] >> 0) & 3) << 4)) - 32;
+                        int8_t q2 = (int8_t)((ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4)) - 32;
+                        int8_t q3 = (int8_t)((ql[l +  0]  >> 4) | (((qh[l] >> 4) & 3) << 4)) - 32;
+                        int8_t q4 = (int8_t)((ql[l + 32]  >> 4) | (((qh[l] >> 6) & 3) << 4)) - 32;
+                        yp[n + l +  0] = d * (float)sc[is + 0] * (float)q1;
+                        yp[n + l + 32] = d * (float)sc[is + 2] * (float)q2;
+                        yp[n + l + 64] = d * (float)sc[is + 4] * (float)q3;
+                        yp[n + l + 96] = d * (float)sc[is + 6] * (float)q4;
+                    }
+                    ql += 64; qh += 32; sc += 8;
+                }
+            }
+        }
+        break;
+    }
     default:
         memset(dst, 0, dim * sizeof(float));
         break;
@@ -156,6 +234,18 @@ static void matvec(float *out, gguf_tensor_t *tensor,
     case GGML_TYPE_Q8_0:
         disp.matvec_q8_0(out, tensor->data, input, rows, cols);
         break;
+    case GGML_TYPE_Q4_K: {
+        extern void matvec_q4_k_scalar(float *, const void *, const float *,
+                                        uint32_t, uint32_t);
+        matvec_q4_k_scalar(out, tensor->data, input, rows, cols);
+        break;
+    }
+    case GGML_TYPE_Q6_K: {
+        extern void matvec_q6_k_scalar(float *, const void *, const float *,
+                                        uint32_t, uint32_t);
+        matvec_q6_k_scalar(out, tensor->data, input, rows, cols);
+        break;
+    }
     case GGML_TYPE_F32: {
         const float *w = (const float *)tensor->data;
         for (uint32_t r = 0; r < rows; r++) {

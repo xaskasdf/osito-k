@@ -300,6 +300,113 @@ static void matvec_q4_0_scalar(float *out, const void *weight,
     }
 }
 
+/* matvec_q4_k_scalar — Llama Q4_K_M (quantization with super-blocks).
+ * 256 elems per block, 144 bytes:
+ *   2  bytes : f16 d        (super-scale for amounts)
+ *   2  bytes : f16 dmin     (super-scale for mins)
+ *   12 bytes : packed 6-bit scales+mins for 8 sub-blocks
+ *   128 bytes: 256 4-bit quants (low/high nibble interleaved per 64) */
+static void q4k_get_scale_min(int j, const uint8_t *q, uint8_t *d, uint8_t *m)
+{
+    if (j < 4) {
+        *d = q[j]     & 63;
+        *m = q[j + 4] & 63;
+    } else {
+        *d = (q[j + 4] & 0x0F) | ((q[j - 4] >> 6) << 4);
+        *m = (q[j + 4] >>   4) | ((q[j - 0] >> 6) << 4);
+    }
+}
+
+void matvec_q4_k_scalar(float *out, const void *weight,
+                         const float *input, uint32_t rows, uint32_t cols)
+{
+    const uint8_t *w = (const uint8_t *)weight;
+    uint32_t blocks_per_row = cols / 256;
+    size_t bytes_per_row = (size_t)blocks_per_row * 144;
+
+    for (uint32_t r = 0; r < rows; r++) {
+        const uint8_t *row = w + r * bytes_per_row;
+        float sum = 0.0f;
+        const float *inp_row = input;
+        for (uint32_t b = 0; b < blocks_per_row; b++) {
+            const uint8_t *block = row + b * 144;
+            float d    = f16_to_f32(*(const uint16_t *)(block + 0));
+            float dmin = f16_to_f32(*(const uint16_t *)(block + 2));
+            const uint8_t *scales = block + 4;
+            const uint8_t *qs     = block + 16;
+            const float *inp_p = inp_row;
+
+            int is = 0;
+            for (int chunk = 0; chunk < 256; chunk += 64) {
+                uint8_t sc, m;
+                q4k_get_scale_min(is + 0, scales, &sc, &m);
+                float d1 = d * (float)sc, m1 = dmin * (float)m;
+                q4k_get_scale_min(is + 1, scales, &sc, &m);
+                float d2 = d * (float)sc, m2 = dmin * (float)m;
+                /* low nibbles -> sub-block is, high nibbles -> sub-block is+1 */
+                for (int l = 0; l < 32; l++) {
+                    float v = d1 * (float)(qs[l] & 0xF) - m1;
+                    sum += v * inp_p[l];
+                }
+                for (int l = 0; l < 32; l++) {
+                    float v = d2 * (float)(qs[l] >> 4) - m2;
+                    sum += v * inp_p[32 + l];
+                }
+                qs    += 32;
+                inp_p += 64;
+                is    += 2;
+            }
+            inp_row += 256;
+        }
+        out[r] = sum;
+    }
+}
+
+/* matvec_q6_k_scalar — Llama Q6_K (used for output projection / token_embd
+ * in some quants). 256 elems per block, 210 bytes:
+ *   128 bytes : ql        (low 4 bits of each 6-bit quant)
+ *   64  bytes : qh        (high 2 bits packed 4-per-byte)
+ *   16  bytes : scales    (int8_t per 16-element sub-block)
+ *   2   bytes : f16 d     (super-scale) */
+void matvec_q6_k_scalar(float *out, const void *weight,
+                         const float *input, uint32_t rows, uint32_t cols)
+{
+    const uint8_t *w = (const uint8_t *)weight;
+    uint32_t blocks_per_row = cols / 256;
+    size_t bytes_per_row = (size_t)blocks_per_row * 210;
+
+    for (uint32_t r = 0; r < rows; r++) {
+        const uint8_t *row = w + r * bytes_per_row;
+        float sum = 0.0f;
+        const float *inp_row = input;
+        for (uint32_t b = 0; b < blocks_per_row; b++) {
+            const uint8_t *block = row + b * 210;
+            const uint8_t *ql = block + 0;
+            const uint8_t *qh = block + 128;
+            const int8_t  *sc = (const int8_t *)(block + 192);
+            float d = f16_to_f32(*(const uint16_t *)(block + 208));
+            const float *inp_p = inp_row;
+
+            for (int n = 0; n < 256; n += 128) {
+                for (int l = 0; l < 32; l++) {
+                    int is = l / 16;
+                    int8_t q1 = (int8_t)((ql[l +  0] & 0xF) | (((qh[l] >> 0) & 3) << 4)) - 32;
+                    int8_t q2 = (int8_t)((ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4)) - 32;
+                    int8_t q3 = (int8_t)((ql[l +  0]  >> 4) | (((qh[l] >> 4) & 3) << 4)) - 32;
+                    int8_t q4 = (int8_t)((ql[l + 32]  >> 4) | (((qh[l] >> 6) & 3) << 4)) - 32;
+                    sum += d * (float)sc[is + 0] * (float)q1 * inp_p[l +  0];
+                    sum += d * (float)sc[is + 2] * (float)q2 * inp_p[l + 32];
+                    sum += d * (float)sc[is + 4] * (float)q3 * inp_p[l + 64];
+                    sum += d * (float)sc[is + 6] * (float)q4 * inp_p[l + 96];
+                }
+                ql += 64; qh += 32; sc += 8; inp_p += 128;
+            }
+            inp_row += 256;
+        }
+        out[r] = sum;
+    }
+}
+
 /* SMP parallel matvec — split rows across AP workers */
 typedef struct {
     float       *out;
