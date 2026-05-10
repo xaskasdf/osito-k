@@ -5007,6 +5007,108 @@ void shell_exec(char *line)
             sh_putdec((uint64_t)(md * 1e6f)); sh_puts("\n");
             wgpu_free(hw); wgpu_free(hi); wgpu_free(ho);
             free(w); free(in); free(cpu); free(gpu);
+        } else if (strcmp(argv[1], "fattn") == 0) {
+            /* Fused attention block end-to-end smoke test: pos=0,
+             * brandon-tiny shapes. Compare GPU output against a
+             * CPU reference implementing the same QKV+RoPE+attn+O
+             * pipeline. */
+            if (!wasm_wgpu_init()) { sh_puts("WebGPU not initialized.\n"); return; }
+            extern int wasm_wgpu_kvcache_alloc(int layer, int max_seq, int kv_dim);
+            extern int wasm_wgpu_fused_attn(int layer,
+                const float *x, const float *wq, const float *wk,
+                const float *wv, const float *wo, float *out,
+                int dim, int kv_dim, int head_dim, int n_heads, int n_kv_heads,
+                int gqa_ratio, int pos, int max_seq, float scale, float rope_base);
+            extern void *malloc(unsigned long); extern void free(void *);
+            extern double sqrt(double); extern double cos(double); extern double sin(double);
+            extern double pow(double, double); extern double exp(double);
+            int dim = 128, kv_dim = 64, head_dim = 4;
+            int n_heads = 32, n_kv_heads = 16, gqa_ratio = 2;
+            int max_seq = 16, pos = 0;
+            float scale = 1.0f / (float)sqrt((double)head_dim);
+            float rope_base = 10000.0f;
+            wasm_wgpu_kvcache_alloc(0, max_seq, kv_dim);
+            float *x  = (float*)malloc(dim*4);
+            float *wq = (float*)malloc(dim*dim*4);
+            float *wk = (float*)malloc(kv_dim*dim*4);
+            float *wv = (float*)malloc(kv_dim*dim*4);
+            float *wo = (float*)malloc(dim*dim*4);
+            float *gpu = (float*)malloc(dim*4);
+            float *cpu = (float*)malloc(dim*4);
+            float *q  = (float*)malloc(dim*4);
+            float *k  = (float*)malloc(kv_dim*4);
+            float *v  = (float*)malloc(kv_dim*4);
+            float *attn_out = (float*)malloc(dim*4);
+            for (int i = 0; i < dim; i++) x[i] = (float)((i*5%11)-5)*0.07f;
+            for (int i = 0; i < dim*dim; i++) wq[i] = (float)((i*7%13)-6)*0.03f;
+            for (int i = 0; i < dim*dim; i++) wo[i] = (float)((i*11%17)-8)*0.03f;
+            for (int i = 0; i < kv_dim*dim; i++) wk[i] = (float)((i*3%9)-4)*0.03f;
+            for (int i = 0; i < kv_dim*dim; i++) wv[i] = (float)((i*13%19)-9)*0.03f;
+            /* CPU reference */
+            for (int r = 0; r < dim; r++) {
+                float s = 0; for (int c = 0; c < dim; c++) s += wq[r*dim+c]*x[c];
+                q[r] = s;
+            }
+            for (int r = 0; r < kv_dim; r++) {
+                float s = 0; for (int c = 0; c < dim; c++) s += wk[r*dim+c]*x[c];
+                k[r] = s;
+            }
+            for (int r = 0; r < kv_dim; r++) {
+                float s = 0; for (int c = 0; c < dim; c++) s += wv[r*dim+c]*x[c];
+                v[r] = s;
+            }
+            /* RoPE on Q and K */
+            for (int h = 0; h < n_heads; h++) {
+                for (int p = 0; p < head_dim/2; p++) {
+                    float exponent = (float)(2*p) / (float)head_dim;
+                    float freq = (float)pow((double)rope_base, -(double)exponent);
+                    float theta = (float)pos * freq;
+                    float c = (float)cos((double)theta), s = (float)sin((double)theta);
+                    int idx = h*head_dim + 2*p;
+                    float x0 = q[idx], x1 = q[idx+1];
+                    q[idx]   = x0*c - x1*s;
+                    q[idx+1] = x0*s + x1*c;
+                }
+            }
+            for (int h = 0; h < n_kv_heads; h++) {
+                for (int p = 0; p < head_dim/2; p++) {
+                    float exponent = (float)(2*p) / (float)head_dim;
+                    float freq = (float)pow((double)rope_base, -(double)exponent);
+                    float theta = (float)pos * freq;
+                    float c = (float)cos((double)theta), s = (float)sin((double)theta);
+                    int idx = h*head_dim + 2*p;
+                    float x0 = k[idx], x1 = k[idx+1];
+                    k[idx]   = x0*c - x1*s;
+                    k[idx+1] = x0*s + x1*c;
+                }
+            }
+            /* Attention at pos=0: only one position, softmax = 1.0, out = v_h */
+            for (int h = 0; h < n_heads; h++) {
+                int kv_h = h / gqa_ratio;
+                for (int d = 0; d < head_dim; d++)
+                    attn_out[h*head_dim + d] = v[kv_h*head_dim + d];
+            }
+            /* Output projection */
+            for (int r = 0; r < dim; r++) {
+                float s = 0;
+                for (int c = 0; c < dim; c++) s += wo[r*dim+c]*attn_out[c];
+                cpu[r] = s;
+            }
+            int rc = wasm_wgpu_fused_attn(0, x, wq, wk, wv, wo, gpu,
+                dim, kv_dim, head_dim, n_heads, n_kv_heads, gqa_ratio,
+                pos, max_seq, scale, rope_base);
+            float md = 0;
+            for (int i = 0; i < dim; i++) {
+                float d = cpu[i] - gpu[i]; if (d < 0) d = -d;
+                if (d > md) md = d;
+            }
+            sh_puts("[wgpu fattn] dim="); sh_putdec(dim);
+            sh_puts(" pos="); sh_putdec(pos);
+            sh_puts(" rc="); sh_putdec(rc + 1000);
+            sh_puts(" maxdiff*1e6="); sh_putdec((uint64_t)(md*1e6f));
+            sh_puts("\n");
+            free(x); free(wq); free(wk); free(wv); free(wo);
+            free(gpu); free(cpu); free(q); free(k); free(v); free(attn_out);
         } else if (strcmp(argv[1], "qkv") == 0) {
             if (!wasm_wgpu_init()) { sh_puts("WebGPU not initialized.\n"); return; }
             extern int wasm_wgpu_qkv(const float *x, const float *wq,
@@ -5153,7 +5255,7 @@ void shell_exec(char *line)
             sh_putdec(t2 - t1); sh_puts(" ms total)\n");
             free(w); free(in); free(out);
         } else {
-            sh_puts("Usage: wgpu [init|test|test-h|bench|rmsnorm|softmax|qkv]\n");
+            sh_puts("Usage: wgpu [init|test|test-h|bench|rmsnorm|softmax|qkv|fattn]\n");
         }
 #else
         sh_puts("wgpu: WASM-only\n");

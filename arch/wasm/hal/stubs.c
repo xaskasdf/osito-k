@@ -791,6 +791,221 @@ EM_JS(int, js_wgpu_init_kick, (), {
                 layout: 'auto',
                 compute: { module: qkvMod, entryPoint: 'qkv' },
             });
+            /* Fused attention block: QKV proj + RoPE + KV-cache write +
+             * scaled-dot-product attention + output projection, all in
+             * one dispatch. Shared workgroup memory holds Q scratch,
+             * attention scores, and attn_out. Sized for brandon-tiny
+             * (dim<=256, max_seq<=512). One mapAsync per layer per
+             * token instead of 5+. */
+            const attnCode = `
+                const MAX_DIM: u32 = 256u;
+                const MAX_SEQ: u32 = 512u;
+                struct AttnDims {
+                    dim: u32, kv_dim: u32,
+                    head_dim: u32, n_heads: u32,
+                    n_kv_heads: u32, gqa_ratio: u32,
+                    pos: u32, max_seq: u32,
+                    scale_bits: u32, rope_base_bits: u32,
+                    _pad0: u32, _pad1: u32,
+                };
+                @group(0) @binding(0) var<storage, read> wq: array<f32>;
+                @group(0) @binding(1) var<storage, read> wk: array<f32>;
+                @group(0) @binding(2) var<storage, read> wv: array<f32>;
+                @group(0) @binding(3) var<storage, read> wo: array<f32>;
+                @group(0) @binding(4) var<storage, read> inp: array<f32>;
+                @group(0) @binding(5) var<storage, read_write> kv_k: array<f32>;
+                @group(0) @binding(6) var<storage, read_write> kv_v: array<f32>;
+                @group(0) @binding(7) var<storage, read_write> outp: array<f32>;
+                @group(0) @binding(8) var<uniform> ad: AttnDims;
+
+                var<workgroup> q_scratch: array<f32, MAX_DIM>;
+                var<workgroup> att: array<f32, MAX_SEQ>;
+                var<workgroup> attn_out: array<f32, MAX_DIM>;
+                var<workgroup> partial: array<f32, 64>;
+
+                @compute @workgroup_size(64)
+                fn fused_attn(@builtin(local_invocation_id) lid: vec3<u32>) {
+                    let tid = lid.x;
+                    let dim = ad.dim;
+                    let kv_dim = ad.kv_dim;
+                    let head_dim = ad.head_dim;
+                    let n_heads = ad.n_heads;
+                    let n_kv_heads = ad.n_kv_heads;
+                    let gqa_ratio = ad.gqa_ratio;
+                    let pos = ad.pos;
+                    let scale = bitcast<f32>(ad.scale_bits);
+                    let rope_base = bitcast<f32>(ad.rope_base_bits);
+
+                    /* Stage 1: QKV projections. Each thread handles
+                     * rows striped by 64 across the combined Q|K|V
+                     * row space. K and V rows go straight into the
+                     * persistent KV cache at row[pos]. */
+                    var i: u32 = tid;
+                    let total = dim + 2u * kv_dim;
+                    loop {
+                        if (i >= total) { break; }
+                        var sum: f32 = 0.0;
+                        if (i < dim) {
+                            let row = i;
+                            let base = row * dim;
+                            for (var c: u32 = 0u; c < dim; c = c + 1u) {
+                                sum = sum + wq[base + c] * inp[c];
+                            }
+                            q_scratch[row] = sum;
+                        } else if (i < dim + kv_dim) {
+                            let row = i - dim;
+                            let base = row * dim;
+                            for (var c: u32 = 0u; c < dim; c = c + 1u) {
+                                sum = sum + wk[base + c] * inp[c];
+                            }
+                            kv_k[pos * kv_dim + row] = sum;
+                        } else {
+                            let row = i - dim - kv_dim;
+                            let base = row * dim;
+                            for (var c: u32 = 0u; c < dim; c = c + 1u) {
+                                sum = sum + wv[base + c] * inp[c];
+                            }
+                            kv_v[pos * kv_dim + row] = sum;
+                        }
+                        i = i + 64u;
+                    }
+                    workgroupBarrier();
+
+                    /* Stage 2: RoPE on Q (in q_scratch) and current K
+                     * (just-written kv_k[pos*kv_dim..]). Standard llama
+                     * pair rotation. */
+                    let pairs_per_head = head_dim / 2u;
+                    let total_q_pairs  = n_heads    * pairs_per_head;
+                    let total_k_pairs  = n_kv_heads * pairs_per_head;
+
+                    i = tid;
+                    loop {
+                        if (i >= total_q_pairs) { break; }
+                        let h = i / pairs_per_head;
+                        let p = i % pairs_per_head;
+                        let exponent = f32(2u * p) / f32(head_dim);
+                        let freq = pow(rope_base, -exponent);
+                        let theta = f32(pos) * freq;
+                        let c = cos(theta);
+                        let s = sin(theta);
+                        let idx = h * head_dim + 2u * p;
+                        let x0 = q_scratch[idx];
+                        let x1 = q_scratch[idx + 1u];
+                        q_scratch[idx]      = x0 * c - x1 * s;
+                        q_scratch[idx + 1u] = x0 * s + x1 * c;
+                        i = i + 64u;
+                    }
+                    i = tid;
+                    loop {
+                        if (i >= total_k_pairs) { break; }
+                        let h = i / pairs_per_head;
+                        let p = i % pairs_per_head;
+                        let exponent = f32(2u * p) / f32(head_dim);
+                        let freq = pow(rope_base, -exponent);
+                        let theta = f32(pos) * freq;
+                        let c = cos(theta);
+                        let s = sin(theta);
+                        let idx = pos * kv_dim + h * head_dim + 2u * p;
+                        let x0 = kv_k[idx];
+                        let x1 = kv_k[idx + 1u];
+                        kv_k[idx]      = x0 * c - x1 * s;
+                        kv_k[idx + 1u] = x0 * s + x1 * c;
+                        i = i + 64u;
+                    }
+                    workgroupBarrier();
+
+                    /* Stage 3: For each query head h, compute attention
+                     * scores against K[0..pos+1], softmax, weighted V
+                     * sum -> attn_out[h*head_dim..(h+1)*head_dim]. */
+                    for (var h: u32 = 0u; h < n_heads; h = h + 1u) {
+                        let kv_h = h / gqa_ratio;
+                        /* 3a: dot products att[p] = q_h . k[p][kv_h] * scale */
+                        i = tid;
+                        loop {
+                            if (i > pos) { break; }
+                            var dot: f32 = 0.0;
+                            for (var d: u32 = 0u; d < head_dim; d = d + 1u) {
+                                dot = dot + q_scratch[h * head_dim + d]
+                                          * kv_k[i * kv_dim + kv_h * head_dim + d];
+                            }
+                            att[i] = dot * scale;
+                            i = i + 64u;
+                        }
+                        workgroupBarrier();
+                        /* 3b: softmax — max, exp, sum, normalize */
+                        var lmax: f32 = -3.402823e38;
+                        i = tid;
+                        loop {
+                            if (i > pos) { break; }
+                            lmax = max(lmax, att[i]);
+                            i = i + 64u;
+                        }
+                        partial[tid] = lmax;
+                        workgroupBarrier();
+                        if (tid == 0u) {
+                            var m: f32 = -3.402823e38;
+                            for (var k: u32 = 0u; k < 64u; k = k + 1u) {
+                                m = max(m, partial[k]);
+                            }
+                            partial[0] = m;
+                        }
+                        workgroupBarrier();
+                        let gmax = partial[0];
+                        var lsum: f32 = 0.0;
+                        i = tid;
+                        loop {
+                            if (i > pos) { break; }
+                            let e = exp(att[i] - gmax);
+                            att[i] = e;
+                            lsum = lsum + e;
+                            i = i + 64u;
+                        }
+                        partial[tid] = lsum;
+                        workgroupBarrier();
+                        if (tid == 0u) {
+                            var s: f32 = 0.0;
+                            for (var k: u32 = 0u; k < 64u; k = k + 1u) {
+                                s = s + partial[k];
+                            }
+                            partial[0] = s;
+                        }
+                        workgroupBarrier();
+                        let inv_sum = 1.0 / partial[0];
+                        /* 3c: attn_out[h*head_dim+d] = sum(att[p]*inv_sum * v[p][kv_h][d]) */
+                        var d: u32 = tid;
+                        loop {
+                            if (d >= head_dim) { break; }
+                            var v_acc: f32 = 0.0;
+                            for (var p: u32 = 0u; p <= pos; p = p + 1u) {
+                                v_acc = v_acc + att[p] * inv_sum
+                                              * kv_v[p * kv_dim + kv_h * head_dim + d];
+                            }
+                            attn_out[h * head_dim + d] = v_acc;
+                            d = d + 64u;
+                        }
+                        workgroupBarrier();
+                    }
+
+                    /* Stage 4: Output projection W_o . attn_out -> outp.
+                     * One thread per output row, striped by 64. */
+                    i = tid;
+                    loop {
+                        if (i >= dim) { break; }
+                        var sum: f32 = 0.0;
+                        let base = i * dim;
+                        for (var c: u32 = 0u; c < dim; c = c + 1u) {
+                            sum = sum + wo[base + c] * attn_out[c];
+                        }
+                        outp[i] = sum;
+                        i = i + 64u;
+                    }
+                }
+            `;
+            const attnMod = device.createShaderModule({ code: attnCode });
+            window.__gpuAttnPipeline = device.createComputePipeline({
+                layout: 'auto',
+                compute: { module: attnMod, entryPoint: 'fused_attn' },
+            });
             window.__gpuReady = true;
         } catch (e) {
             window.__gpuError = String(e);
@@ -1599,6 +1814,140 @@ int wasm_wgpu_kvcache_alloc(int layer, int max_seq, int kv_dim)
 {
     if (!js_wgpu_ready()) return -1;
     return js_wgpu_kvcache_alloc(layer, max_seq, kv_dim);
+}
+
+/* ── Fused attention block dispatch ──────────────────────────────
+ * Runs QKV projection, RoPE, attention scoring, softmax, value
+ * mixing, and output projection in ONE compute dispatch. KV cache
+ * lives in the per-layer pool (js_wgpu_kvcache_alloc); only x and
+ * the layer's weights cross the bus per-token after warm-up. */
+EM_JS(int, js_wgpu_fused_attn_kick, (
+    int layer,
+    const float *x, const float *wq, const float *wk, const float *wv, const float *wo,
+    float *outp,
+    int dim, int kv_dim, int head_dim, int n_heads, int n_kv_heads,
+    int gqa_ratio, int pos, int max_seq,
+    int scale_bits, int rope_base_bits,
+    int wq_id, int wk_id, int wv_id, int wo_id), {
+    window.__gpuOpDone = false; window.__gpuOpOK = false;
+    if (!window.__gpuReady) { window.__gpuOpDone = true; return 0; }
+    (async function() {
+        try {
+            const dev = window.__gpuDevice;
+            const pipe = window.__gpuAttnPipeline;
+            const kv = window.__gpuKVPool && window.__gpuKVPool[layer];
+            if (!kv) {
+                window.__gpuError = 'KV cache not allocated for layer ' + layer;
+                window.__gpuOpDone = true; return;
+            }
+            if (!window.__gpuAttnCache) window.__gpuAttnCache = new Map();
+            const key = layer + ':' + dim + ':' + kv_dim + ':' + head_dim;
+            let s = window.__gpuAttnCache.get(key);
+            if (!s) {
+                if (window.__gpuAttnCache.size >= 32) {
+                    const k0 = window.__gpuAttnCache.keys().next().value;
+                    const old = window.__gpuAttnCache.get(k0);
+                    old.wqBuf.destroy(); old.wkBuf.destroy(); old.wvBuf.destroy();
+                    old.woBuf.destroy(); old.xBuf.destroy(); old.outBuf.destroy();
+                    old.dBuf.destroy(); old.rBuf.destroy();
+                    window.__gpuAttnCache.delete(k0);
+                }
+                const dimBytes = dim * 4;
+                s = {
+                    wqBuf: dev.createBuffer({ size: dim * dim * 4,
+                        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST }),
+                    wkBuf: dev.createBuffer({ size: kv_dim * dim * 4,
+                        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST }),
+                    wvBuf: dev.createBuffer({ size: kv_dim * dim * 4,
+                        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST }),
+                    woBuf: dev.createBuffer({ size: dim * dim * 4,
+                        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST }),
+                    xBuf: dev.createBuffer({ size: dimBytes,
+                        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST }),
+                    outBuf: dev.createBuffer({ size: dimBytes,
+                        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC }),
+                    dBuf: dev.createBuffer({ size: 48,
+                        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST }),
+                    rBuf: dev.createBuffer({ size: dimBytes,
+                        usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST }),
+                    bg: null,
+                    last_wq: 0, last_wk: 0, last_wv: 0, last_wo: 0
+                };
+                s.bg = dev.createBindGroup({
+                    layout: pipe.getBindGroupLayout(0),
+                    entries: [
+                        { binding: 0, resource: { buffer: s.wqBuf } },
+                        { binding: 1, resource: { buffer: s.wkBuf } },
+                        { binding: 2, resource: { buffer: s.wvBuf } },
+                        { binding: 3, resource: { buffer: s.woBuf } },
+                        { binding: 4, resource: { buffer: s.xBuf } },
+                        { binding: 5, resource: { buffer: kv.kBuf } },
+                        { binding: 6, resource: { buffer: kv.vBuf } },
+                        { binding: 7, resource: { buffer: s.outBuf } },
+                        { binding: 8, resource: { buffer: s.dBuf } },
+                    ],
+                });
+                window.__gpuAttnCache.set(key, s);
+            }
+            if (s.last_wq !== wq_id) {
+                dev.queue.writeBuffer(s.wqBuf, 0, HEAPU8.slice(wq, wq + dim*dim*4));
+                s.last_wq = wq_id;
+            }
+            if (s.last_wk !== wk_id) {
+                dev.queue.writeBuffer(s.wkBuf, 0, HEAPU8.slice(wk, wk + kv_dim*dim*4));
+                s.last_wk = wk_id;
+            }
+            if (s.last_wv !== wv_id) {
+                dev.queue.writeBuffer(s.wvBuf, 0, HEAPU8.slice(wv, wv + kv_dim*dim*4));
+                s.last_wv = wv_id;
+            }
+            if (s.last_wo !== wo_id) {
+                dev.queue.writeBuffer(s.woBuf, 0, HEAPU8.slice(wo, wo + dim*dim*4));
+                s.last_wo = wo_id;
+            }
+            dev.queue.writeBuffer(s.xBuf, 0, HEAPU8.slice(x, x + dim*4));
+            /* Pack uniform: 12 u32s = 48 bytes. */
+            dev.queue.writeBuffer(s.dBuf, 0, new Uint32Array([
+                dim, kv_dim, head_dim, n_heads, n_kv_heads, gqa_ratio,
+                pos, max_seq, scale_bits, rope_base_bits, 0, 0
+            ]));
+            const enc = dev.createCommandEncoder();
+            const pass = enc.beginComputePass();
+            pass.setPipeline(pipe);
+            pass.setBindGroup(0, s.bg);
+            pass.dispatchWorkgroups(1);   /* single workgroup of 64 threads */
+            pass.end();
+            enc.copyBufferToBuffer(s.outBuf, 0, s.rBuf, 0, dim * 4);
+            dev.queue.submit([enc.finish()]);
+            await s.rBuf.mapAsync(GPUMapMode.READ);
+            HEAPU8.set(new Uint8Array(s.rBuf.getMappedRange()), outp);
+            s.rBuf.unmap();
+            window.__gpuOpOK = true;
+        } catch (e) { window.__gpuError = String(e); }
+        window.__gpuOpDone = true;
+    })();
+    return 1;
+});
+
+int wasm_wgpu_fused_attn(int layer,
+    const float *x, const float *wq, const float *wk, const float *wv, const float *wo,
+    float *out,
+    int dim, int kv_dim, int head_dim, int n_heads, int n_kv_heads,
+    int gqa_ratio, int pos, int max_seq, float scale, float rope_base)
+{
+    if (!js_wgpu_ready()) return -1;
+    union { float f; uint32_t u; } sb, rb;
+    sb.f = scale; rb.f = rope_base;
+    int wq_id = (int)((uint64_t)wq & 0x7FFFFFFF);
+    int wk_id = (int)((uint64_t)wk & 0x7FFFFFFF);
+    int wv_id = (int)((uint64_t)wv & 0x7FFFFFFF);
+    int wo_id = (int)((uint64_t)wo & 0x7FFFFFFF);
+    js_wgpu_fused_attn_kick(layer, x, wq, wk, wv, wo, out,
+        dim, kv_dim, head_dim, n_heads, n_kv_heads, gqa_ratio,
+        pos, max_seq, (int)sb.u, (int)rb.u,
+        wq_id, wk_id, wv_id, wo_id);
+    while (!js_wgpu_op_done()) emscripten_sleep(1);
+    return js_wgpu_op_ok() ? 0 : -1;
 }
 
 int wasm_wgpu_brandon_lm_head(const float *x, const float *w_norm,
