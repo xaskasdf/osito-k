@@ -598,6 +598,44 @@ static void cmd_help(void)
     sh_puts_color("I/O Redirection:\n", 0x00FF8800);
     sh_puts("  cmd > file    Write output to file\n");
     sh_puts("  cmd >> file   Append output to file\n");
+
+#ifdef __EMSCRIPTEN__
+    sh_puts_color("\nLLM (brandon-tiny default, sampling auto-tuned):\n", 0x00FF8800);
+    sh_puts("  chat <prompt>           Local inference (active model)\n");
+    sh_puts("  rag <ctx> ::: <q>       RAG-style ChatML prompt\n");
+    sh_puts("  bench [n]               Time inference, n tokens (default 32)\n");
+    sh_puts("  temp <t> [topp]         Set sampling temp + top-p\n");
+    sh_puts("  penalty <r> [pres][freq]  rep + presence + frequency\n");
+    sh_puts("  ngram <n>               no_repeat_ngram_size (3 = balanced)\n");
+    sh_puts("  bdebug <dwa|vr|reg|...> Toggle brandon-arch features\n");
+    sh_puts("  model <name|url>        brandon | tinystories | smollm | URL\n");
+
+    sh_puts_color("\nFilesystem (12 mountable read-only formats):\n", 0x00FF8800);
+    sh_puts("  mount-fs <type> <url>   iso ext fat exfat ntfs hfs btrfs apfs udf sqfs\n");
+    sh_puts("  ls /<type>/  cat /<type>/<file>   /aux/ for the last-active mount\n");
+    sh_puts("  fs-ls / fs-cat          Legacy aliases\n");
+    sh_puts("  umount [type]           Detach (no arg = all)\n");
+    sh_puts("  du / df                 File sizes / free space\n");
+
+    sh_puts_color("\nNetwork (browser-bridged):\n", 0x00FF8800);
+    sh_puts("  curl <url>              JS fetch — any URL CORS allows\n");
+    sh_puts("  https <host> [path]     Real TLS 1.2 over WS-tunneled TCP\n");
+    sh_puts("  ws open|send|recv|...   WebSocket primitive\n");
+    sh_puts("  tcp connect|proxy|...   TCP via configurable WS proxy\n");
+    sh_puts("  crypto sha256/sha512    SHA hash on stdin/argv\n");
+
+    sh_puts_color("\nIntrospection / persistence:\n", 0x00FF8800);
+    sh_puts("  info                    Kernel state dashboard\n");
+    sh_puts("  version                 Build hash + timestamp\n");
+    sh_puts("  uname [-a]              Kernel identity\n");
+    sh_puts("  stress [net]            Smoke test the bridges\n");
+    sh_puts("  time <cmd...>           Wall-clock the command\n");
+    sh_puts("  save                    Force-flush FS to IndexedDB\n");
+    sh_puts("  tutorial                Interactive 8-step tour\n");
+    sh_puts("  history (Up/Down keys)  Recall previous commands\n");
+    sh_puts("  Persistence:            FS image → IndexedDB; sampling → localStorage\n");
+    sh_puts("                           .osito_init in OsitoFS auto-runs at boot\n");
+#endif
 }
 
 /* ── Builtin: uname ──────────────────────────────────────────── */
