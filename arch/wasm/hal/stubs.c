@@ -674,45 +674,67 @@ EM_JS(int, js_wgpu_matvec_kick, (const float *w, const float *vinp, float *out,
             const wBytes = rows * cols * 4;
             const iBytes = cols * 4;
             const oBytes = rows * 4;
-            const wBuf = dev.createBuffer({ size: wBytes,
-                usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
-            const iBuf = dev.createBuffer({ size: iBytes,
-                usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
-            const oBuf = dev.createBuffer({ size: oBytes,
-                usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
-            const dBuf = dev.createBuffer({ size: 8,
-                usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-            const rBuf = dev.createBuffer({ size: oBytes,
-                usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
 
-            dev.queue.writeBuffer(wBuf, 0, HEAPU8.slice(w, w + wBytes));
-            dev.queue.writeBuffer(iBuf, 0, HEAPU8.slice(vinp, vinp + iBytes));
-            dev.queue.writeBuffer(dBuf, 0, new Uint32Array([rows, cols]));
+            /* Buffer cache keyed by shape "rowsxcols". The brandon
+             * forward pass calls with a small set of recurring shapes
+             * (Q/K/V/FFN per layer); creating fresh buffers each call
+             * dominated runtime. Cap the cache so unique shapes don't
+             * leak GPU memory unbounded. */
+            if (!window.__gpuBufCache) window.__gpuBufCache = new Map();
+            const key = rows + 'x' + cols;
+            let slot = window.__gpuBufCache.get(key);
+            if (!slot) {
+                if (window.__gpuBufCache.size >= 16) {
+                    /* Evict oldest entry. */
+                    const evictKey = window.__gpuBufCache.keys().next().value;
+                    const evict = window.__gpuBufCache.get(evictKey);
+                    evict.wBuf.destroy(); evict.iBuf.destroy();
+                    evict.oBuf.destroy(); evict.dBuf.destroy();
+                    evict.rBuf.destroy();
+                    window.__gpuBufCache.delete(evictKey);
+                }
+                slot = {
+                    wBuf: dev.createBuffer({ size: wBytes,
+                        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST }),
+                    iBuf: dev.createBuffer({ size: iBytes,
+                        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST }),
+                    oBuf: dev.createBuffer({ size: oBytes,
+                        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC }),
+                    dBuf: dev.createBuffer({ size: 8,
+                        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST }),
+                    rBuf: dev.createBuffer({ size: oBytes,
+                        usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST }),
+                    bg: null,
+                };
+                slot.bg = dev.createBindGroup({
+                    layout: pipe.getBindGroupLayout(0),
+                    entries: [
+                        { binding: 0, resource: { buffer: slot.wBuf } },
+                        { binding: 1, resource: { buffer: slot.iBuf } },
+                        { binding: 2, resource: { buffer: slot.oBuf } },
+                        { binding: 3, resource: { buffer: slot.dBuf } },
+                    ],
+                });
+                /* Dims are constant per shape — write once. */
+                dev.queue.writeBuffer(slot.dBuf, 0, new Uint32Array([rows, cols]));
+                window.__gpuBufCache.set(key, slot);
+            }
 
-            const bg = dev.createBindGroup({
-                layout: pipe.getBindGroupLayout(0),
-                entries: [
-                    { binding: 0, resource: { buffer: wBuf } },
-                    { binding: 1, resource: { buffer: iBuf } },
-                    { binding: 2, resource: { buffer: oBuf } },
-                    { binding: 3, resource: { buffer: dBuf } },
-                ],
-            });
+            dev.queue.writeBuffer(slot.wBuf, 0, HEAPU8.slice(w, w + wBytes));
+            dev.queue.writeBuffer(slot.iBuf, 0, HEAPU8.slice(vinp, vinp + iBytes));
+
             const enc = dev.createCommandEncoder();
             const pass = enc.beginComputePass();
             pass.setPipeline(pipe);
-            pass.setBindGroup(0, bg);
+            pass.setBindGroup(0, slot.bg);
             pass.dispatchWorkgroups(Math.ceil(rows / 64));
             pass.end();
-            enc.copyBufferToBuffer(oBuf, 0, rBuf, 0, oBytes);
+            enc.copyBufferToBuffer(slot.oBuf, 0, slot.rBuf, 0, oBytes);
             dev.queue.submit([enc.finish()]);
 
-            await rBuf.mapAsync(GPUMapMode.READ);
-            HEAPU8.set(new Uint8Array(rBuf.getMappedRange()), out);
-            rBuf.unmap();
-
-            wBuf.destroy(); iBuf.destroy(); oBuf.destroy();
-            dBuf.destroy(); rBuf.destroy();
+            await slot.rBuf.mapAsync(GPUMapMode.READ);
+            HEAPU8.set(new Uint8Array(slot.rBuf.getMappedRange()), out);
+            slot.rBuf.unmap();
             window.__gpuMatvecOK = true;
         } catch (e) {
             window.__gpuError = String(e);
