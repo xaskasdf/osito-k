@@ -5007,6 +5007,59 @@ void shell_exec(char *line)
             sh_putdec((uint64_t)(md * 1e6f)); sh_puts("\n");
             wgpu_free(hw); wgpu_free(hi); wgpu_free(ho);
             free(w); free(in); free(cpu); free(gpu);
+        } else if (strcmp(argv[1], "qkv") == 0) {
+            if (!wasm_wgpu_init()) { sh_puts("WebGPU not initialized.\n"); return; }
+            extern int wasm_wgpu_qkv(const float *x, const float *wq,
+                const float *wk, const float *wv,
+                float *outq, float *outk, float *outv,
+                int dim, int q_rows, int kv_rows);
+            extern void *malloc(unsigned long); extern void free(void *);
+            int dim = 128, q_rows = 128, kv_rows = 64;
+            float *x = (float*)malloc(dim*4);
+            float *wq = (float*)malloc(q_rows*dim*4);
+            float *wk = (float*)malloc(kv_rows*dim*4);
+            float *wv = (float*)malloc(kv_rows*dim*4);
+            float *gq = (float*)malloc(q_rows*4);
+            float *gk = (float*)malloc(kv_rows*4);
+            float *gv = (float*)malloc(kv_rows*4);
+            float *cq = (float*)malloc(q_rows*4);
+            float *ck = (float*)malloc(kv_rows*4);
+            float *cv = (float*)malloc(kv_rows*4);
+            for (int i = 0; i < dim; i++) x[i] = (float)((i*5%11)-5)*0.1f;
+            for (int i = 0; i < q_rows*dim; i++)  wq[i] = (float)((i*7%13)-6)*0.05f;
+            for (int i = 0; i < kv_rows*dim; i++) wk[i] = (float)((i*3%9)-4)*0.05f;
+            for (int i = 0; i < kv_rows*dim; i++) wv[i] = (float)((i*11%17)-8)*0.05f;
+            /* CPU reference */
+            for (int r = 0; r < q_rows; r++) {
+                float s = 0; for (int c = 0; c < dim; c++) s += wq[r*dim+c]*x[c];
+                cq[r] = s;
+            }
+            for (int r = 0; r < kv_rows; r++) {
+                float s = 0; for (int c = 0; c < dim; c++) s += wk[r*dim+c]*x[c];
+                ck[r] = s;
+            }
+            for (int r = 0; r < kv_rows; r++) {
+                float s = 0; for (int c = 0; c < dim; c++) s += wv[r*dim+c]*x[c];
+                cv[r] = s;
+            }
+            int rc = wasm_wgpu_qkv(x, wq, wk, wv, gq, gk, gv, dim, q_rows, kv_rows);
+            float md = 0;
+            for (int i = 0; i < q_rows; i++) {
+                float d = cq[i] - gq[i]; if (d < 0) d = -d; if (d > md) md = d;
+            }
+            for (int i = 0; i < kv_rows; i++) {
+                float d = ck[i] - gk[i]; if (d < 0) d = -d; if (d > md) md = d;
+                d = cv[i] - gv[i]; if (d < 0) d = -d; if (d > md) md = d;
+            }
+            sh_puts("[wgpu qkv] dim="); sh_putdec(dim);
+            sh_puts(" q="); sh_putdec(q_rows);
+            sh_puts(" kv="); sh_putdec(kv_rows);
+            sh_puts(" rc="); sh_putdec(rc + 1000);
+            sh_puts(" maxdiff*1e6="); sh_putdec((uint64_t)(md*1e6f));
+            sh_puts("\n");
+            free(x); free(wq); free(wk); free(wv);
+            free(gq); free(gk); free(gv);
+            free(cq); free(ck); free(cv);
         } else if (strcmp(argv[1], "rmsnorm") == 0) {
             if (!wasm_wgpu_init()) { sh_puts("WebGPU not initialized.\n"); return; }
             extern int wasm_wgpu_rmsnorm(const float *w, const float *in,
@@ -5100,7 +5153,7 @@ void shell_exec(char *line)
             sh_putdec(t2 - t1); sh_puts(" ms total)\n");
             free(w); free(in); free(out);
         } else {
-            sh_puts("Usage: wgpu [init|test|test-h|bench|rmsnorm|softmax]\n");
+            sh_puts("Usage: wgpu [init|test|test-h|bench|rmsnorm|softmax|qkv]\n");
         }
 #else
         sh_puts("wgpu: WASM-only\n");

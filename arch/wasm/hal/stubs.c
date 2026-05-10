@@ -743,6 +743,54 @@ EM_JS(int, js_wgpu_init_kick, (), {
                 layout: 'auto',
                 compute: { module: softMod, entryPoint: 'softmax' },
             });
+            /* Fused QKV: compute Q (dim rows) + K (kv_dim rows) + V
+             * (kv_dim rows) from the same input vector in one dispatch.
+             * One global thread per output row, dispatched as ceil(total/64). */
+            const qkvCode = `
+                struct QKVDims { dim: u32, q_rows: u32, kv_rows: u32, _pad: u32 };
+                @group(0) @binding(0) var<storage, read> wq: array<f32>;
+                @group(0) @binding(1) var<storage, read> wk: array<f32>;
+                @group(0) @binding(2) var<storage, read> wv: array<f32>;
+                @group(0) @binding(3) var<storage, read> inp: array<f32>;
+                @group(0) @binding(4) var<storage, read_write> outq: array<f32>;
+                @group(0) @binding(5) var<storage, read_write> outk: array<f32>;
+                @group(0) @binding(6) var<storage, read_write> outv: array<f32>;
+                @group(0) @binding(7) var<uniform> qd: QKVDims;
+                @compute @workgroup_size(64)
+                fn qkv(@builtin(global_invocation_id) gid: vec3<u32>) {
+                    let idx = gid.x;
+                    let total = qd.q_rows + 2u * qd.kv_rows;
+                    if (idx >= total) { return; }
+                    var sum: f32 = 0.0;
+                    if (idx < qd.q_rows) {
+                        let row = idx;
+                        let base = row * qd.dim;
+                        for (var c: u32 = 0u; c < qd.dim; c = c + 1u) {
+                            sum = sum + wq[base + c] * inp[c];
+                        }
+                        outq[row] = sum;
+                    } else if (idx < qd.q_rows + qd.kv_rows) {
+                        let row = idx - qd.q_rows;
+                        let base = row * qd.dim;
+                        for (var c: u32 = 0u; c < qd.dim; c = c + 1u) {
+                            sum = sum + wk[base + c] * inp[c];
+                        }
+                        outk[row] = sum;
+                    } else {
+                        let row = idx - qd.q_rows - qd.kv_rows;
+                        let base = row * qd.dim;
+                        for (var c: u32 = 0u; c < qd.dim; c = c + 1u) {
+                            sum = sum + wv[base + c] * inp[c];
+                        }
+                        outv[row] = sum;
+                    }
+                }
+            `;
+            const qkvMod = device.createShaderModule({ code: qkvCode });
+            window.__gpuQkvPipeline = device.createComputePipeline({
+                layout: 'auto',
+                compute: { module: qkvMod, entryPoint: 'qkv' },
+            });
             window.__gpuReady = true;
         } catch (e) {
             window.__gpuError = String(e);
@@ -1391,6 +1439,138 @@ EM_JS(int, js_wgpu_lm_head_kick, (const float *xin, const float *w_norm,
     })();
     return 1;
 });
+
+/* ── Fused QKV: 3 matvecs sharing the same input in one dispatch.
+ * Caches weight buffers by (W_q, W_k, W_v) pointer triple so a
+ * brandon layer's per-token call only re-uploads x. */
+EM_JS(int, js_wgpu_qkv_kick, (const float *x, const float *wq, const float *wk,
+                               const float *wv, float *outq, float *outk,
+                               float *outv, int dim, int q_rows, int kv_rows,
+                               int wq_id, int wk_id, int wv_id), {
+    window.__gpuOpDone = false; window.__gpuOpOK = false;
+    if (!window.__gpuReady) { window.__gpuOpDone = true; return 0; }
+    (async function() {
+        try {
+            const dev = window.__gpuDevice;
+            const pipe = window.__gpuQkvPipeline;
+            if (!window.__gpuQkvCache) window.__gpuQkvCache = new Map();
+            const key = dim + ':' + q_rows + ':' + kv_rows + ':' +
+                        wq_id + ',' + wk_id + ',' + wv_id;
+            let s = window.__gpuQkvCache.get(key);
+            if (!s) {
+                /* Cap at 32 entries × per layer (12) = ~384 layer-shape
+                 * combos; brandon reuses 1 shape across 12 layers so
+                 * the limit is loose. */
+                if (window.__gpuQkvCache.size >= 32) {
+                    const k0 = window.__gpuQkvCache.keys().next().value;
+                    const old = window.__gpuQkvCache.get(k0);
+                    old.wqBuf.destroy(); old.wkBuf.destroy(); old.wvBuf.destroy();
+                    old.xBuf.destroy(); old.qBuf.destroy(); old.kBuf.destroy();
+                    old.vBuf.destroy(); old.dBuf.destroy(); old.rqBuf.destroy();
+                    old.rkBuf.destroy(); old.rvBuf.destroy();
+                    window.__gpuQkvCache.delete(k0);
+                }
+                const dimBytes = dim * 4;
+                const qBytes = q_rows * 4;
+                const kvBytes = kv_rows * 4;
+                s = {
+                    wqBuf: dev.createBuffer({ size: q_rows * dim * 4,
+                        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST }),
+                    wkBuf: dev.createBuffer({ size: kv_rows * dim * 4,
+                        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST }),
+                    wvBuf: dev.createBuffer({ size: kv_rows * dim * 4,
+                        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST }),
+                    xBuf: dev.createBuffer({ size: dimBytes,
+                        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST }),
+                    qBuf: dev.createBuffer({ size: qBytes,
+                        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC }),
+                    kBuf: dev.createBuffer({ size: kvBytes,
+                        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC }),
+                    vBuf: dev.createBuffer({ size: kvBytes,
+                        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC }),
+                    dBuf: dev.createBuffer({ size: 16,
+                        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST }),
+                    rqBuf: dev.createBuffer({ size: qBytes,
+                        usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST }),
+                    rkBuf: dev.createBuffer({ size: kvBytes,
+                        usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST }),
+                    rvBuf: dev.createBuffer({ size: kvBytes,
+                        usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST }),
+                    bg: null, last_wq: 0, last_wk: 0, last_wv: 0
+                };
+                s.bg = dev.createBindGroup({
+                    layout: pipe.getBindGroupLayout(0),
+                    entries: [
+                        { binding: 0, resource: { buffer: s.wqBuf } },
+                        { binding: 1, resource: { buffer: s.wkBuf } },
+                        { binding: 2, resource: { buffer: s.wvBuf } },
+                        { binding: 3, resource: { buffer: s.xBuf } },
+                        { binding: 4, resource: { buffer: s.qBuf } },
+                        { binding: 5, resource: { buffer: s.kBuf } },
+                        { binding: 6, resource: { buffer: s.vBuf } },
+                        { binding: 7, resource: { buffer: s.dBuf } },
+                    ],
+                });
+                dev.queue.writeBuffer(s.dBuf, 0,
+                    new Uint32Array([dim, q_rows, kv_rows, 0]));
+                window.__gpuQkvCache.set(key, s);
+            }
+            /* Re-upload weights only when the C pointer changes. */
+            if (s.last_wq !== wq_id) {
+                dev.queue.writeBuffer(s.wqBuf, 0, HEAPU8.slice(wq, wq + q_rows*dim*4));
+                s.last_wq = wq_id;
+            }
+            if (s.last_wk !== wk_id) {
+                dev.queue.writeBuffer(s.wkBuf, 0, HEAPU8.slice(wk, wk + kv_rows*dim*4));
+                s.last_wk = wk_id;
+            }
+            if (s.last_wv !== wv_id) {
+                dev.queue.writeBuffer(s.wvBuf, 0, HEAPU8.slice(wv, wv + kv_rows*dim*4));
+                s.last_wv = wv_id;
+            }
+            dev.queue.writeBuffer(s.xBuf, 0, HEAPU8.slice(x, x + dim*4));
+            const enc = dev.createCommandEncoder();
+            const pass = enc.beginComputePass();
+            pass.setPipeline(pipe);
+            pass.setBindGroup(0, s.bg);
+            const total = q_rows + 2 * kv_rows;
+            pass.dispatchWorkgroups(Math.ceil(total / 64));
+            pass.end();
+            enc.copyBufferToBuffer(s.qBuf, 0, s.rqBuf, 0, q_rows * 4);
+            enc.copyBufferToBuffer(s.kBuf, 0, s.rkBuf, 0, kv_rows * 4);
+            enc.copyBufferToBuffer(s.vBuf, 0, s.rvBuf, 0, kv_rows * 4);
+            dev.queue.submit([enc.finish()]);
+            /* Map all three readbacks; await the last one — the others
+             * resolve concurrently so this is a single round-trip. */
+            await Promise.all([
+                s.rqBuf.mapAsync(GPUMapMode.READ),
+                s.rkBuf.mapAsync(GPUMapMode.READ),
+                s.rvBuf.mapAsync(GPUMapMode.READ),
+            ]);
+            HEAPU8.set(new Uint8Array(s.rqBuf.getMappedRange()), outq);
+            HEAPU8.set(new Uint8Array(s.rkBuf.getMappedRange()), outk);
+            HEAPU8.set(new Uint8Array(s.rvBuf.getMappedRange()), outv);
+            s.rqBuf.unmap(); s.rkBuf.unmap(); s.rvBuf.unmap();
+            window.__gpuOpOK = true;
+        } catch (e) { window.__gpuError = String(e); }
+        window.__gpuOpDone = true;
+    })();
+    return 1;
+});
+
+int wasm_wgpu_qkv(const float *x, const float *wq, const float *wk, const float *wv,
+                   float *outq, float *outk, float *outv,
+                   int dim, int q_rows, int kv_rows)
+{
+    if (!js_wgpu_ready()) return -1;
+    int wq_id = (int)((uint64_t)wq & 0x7FFFFFFF);
+    int wk_id = (int)((uint64_t)wk & 0x7FFFFFFF);
+    int wv_id = (int)((uint64_t)wv & 0x7FFFFFFF);
+    js_wgpu_qkv_kick(x, wq, wk, wv, outq, outk, outv, dim, q_rows, kv_rows,
+                      wq_id, wk_id, wv_id);
+    while (!js_wgpu_op_done()) emscripten_sleep(1);
+    return js_wgpu_op_ok() ? 0 : -1;
+}
 
 int wasm_wgpu_brandon_lm_head(const float *x, const float *w_norm,
                                const float *w_lm, float *logits,
