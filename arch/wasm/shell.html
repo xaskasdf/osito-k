@@ -281,11 +281,22 @@
         document.getElementById('prompt-label').textContent = '$';
 
         // Live status bar — polls kernel state every 2s.
+        var __osito_boot_t = Date.now();
+        function fmtUptime(ms) {
+            var s = Math.floor(ms / 1000);
+            var h = Math.floor(s / 3600);
+            var m = Math.floor((s % 3600) / 60);
+            var sec = s % 60;
+            if (h > 0) return h + 'h' + (m < 10 ? '0' : '') + m + 'm';
+            if (m > 0) return m + 'm' + (sec < 10 ? '0' : '') + sec + 's';
+            return sec + 's';
+        }
         function refreshStatus() {
             try {
                 const usedKb = Module.ccall('wasm_get_mem_used_kb', 'number', [], []);
                 document.getElementById('status-mem').textContent =
-                    'mem: ' + (usedKb > 1024 ? (usedKb / 1024).toFixed(1) + ' MB' : usedKb + ' KB');
+                    'mem: ' + (usedKb > 1024 ? (usedKb / 1024).toFixed(1) + ' MB' : usedKb + ' KB') +
+                    ' · up ' + fmtUptime(Date.now() - __osito_boot_t);
             } catch(e) {}
             try {
                 const lbl = Module.ccall('wasm_status_fs_label', 'string', [], []);
