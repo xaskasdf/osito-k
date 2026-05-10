@@ -61,6 +61,18 @@
       "url": "head.wasm",
       "desc": "print first N lines (head 5 or head -n 5; default 10)",
       "size": 574
+    },
+    {
+      "name": "seq",
+      "url": "seq.wasm",
+      "desc": "print 1..N one per line (seq 5)",
+      "size": 567
+    },
+    {
+      "name": "nl",
+      "url": "nl.wasm",
+      "desc": "number stdin lines, '<n>\\t<line>'",
+      "size": 519
     }
   ]
 }
