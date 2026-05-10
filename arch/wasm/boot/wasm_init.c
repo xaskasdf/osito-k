@@ -298,9 +298,16 @@ static void load_filesystem(void)
             },
         };
 
+        extern uint32_t osfs2_free_blocks(void);
         int created = 0;
         for (int i = 0; i < (int)(sizeof(seeds)/sizeof(seeds[0])); i++) {
             if (osfs2_find(seeds[i].name)) continue;
+            /* Bail if disk full — better than letting osfs2 log a
+             * misleading "@ block N" twice for two collided creates. */
+            if (osfs2_free_blocks() < 1) {
+                serial_puts("[seed] FS full — remaining samples skipped\n");
+                break;
+            }
             uint64_t sz = 0;
             for (const char *p = seeds[i].body; *p; p++) sz++;
             void *f = osfs2_create(seeds[i].name, sz);

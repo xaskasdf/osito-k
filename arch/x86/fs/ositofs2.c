@@ -875,7 +875,10 @@ uint32_t osfs2_free_blocks(void) {
     if (!mounted) return 0;
     uint32_t total_data = superblock.total_blocks - data_start;
     uint32_t used_data = superblock.used_blocks - data_start;
-    return total_data - used_data;
+    /* Clamp at zero — used_data > total_data shows up after osfs2_create
+     * over-allocates a tight FS. The display gets clean output and the
+     * underflow doesn't propagate to MB-conversion math. */
+    return used_data >= total_data ? 0 : total_data - used_data;
 }
 uint32_t osfs2_get_block_size(void) { return mounted ? blk_size : 0; }
 
