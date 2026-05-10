@@ -4477,6 +4477,65 @@ void shell_exec(char *line)
         if ((uint64_t)want < fsz) {
             sh_puts("... ["); sh_putdec(fsz - want); sh_puts(" more bytes]\n");
         }
+    } else if (strcmp(cmd, "base64") == 0) {
+        if (argc < 2) {
+            sh_puts("Usage: base64 [-d] <text>   encode/decode\n");
+            return;
+        }
+        bool decode = false;
+        int start = 1;
+        if (argv[1][0] == '-' && argv[1][1] == 'd') { decode = true; start = 2; }
+        if (start >= argc) { sh_puts("Need data after -d\n"); return; }
+
+        /* Reassemble argv into one buffer */
+        static uint8_t in[4096];
+        int n = 0;
+        for (int i = start; i < argc && n < (int)sizeof(in) - 1; i++) {
+            if (i > start && n < (int)sizeof(in) - 1) in[n++] = ' ';
+            const char *w = argv[i];
+            while (*w && n < (int)sizeof(in) - 1) in[n++] = (uint8_t)*w++;
+        }
+
+        static const char enc_tab[] =
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+        if (!decode) {
+            static char out[6000];
+            int o = 0;
+            for (int i = 0; i < n; i += 3) {
+                uint32_t v = ((uint32_t)in[i]) << 16;
+                if (i + 1 < n) v |= ((uint32_t)in[i+1]) << 8;
+                if (i + 2 < n) v |= ((uint32_t)in[i+2]);
+                out[o++] = enc_tab[(v >> 18) & 0x3F];
+                out[o++] = enc_tab[(v >> 12) & 0x3F];
+                out[o++] = (i + 1 < n) ? enc_tab[(v >> 6) & 0x3F] : '=';
+                out[o++] = (i + 2 < n) ? enc_tab[v & 0x3F] : '=';
+            }
+            out[o] = '\0';
+            sh_puts(out); sh_puts("\n");
+        } else {
+            /* Build inverse table */
+            int8_t dec_tab[128]; for (int i = 0; i < 128; i++) dec_tab[i] = -1;
+            for (int i = 0; i < 64; i++) dec_tab[(int)enc_tab[i]] = (int8_t)i;
+            static uint8_t out[3000];
+            int o = 0;
+            for (int i = 0; i < n; i += 4) {
+                int8_t a = (i   < n && in[i]   < 128) ? dec_tab[in[i]]   : -1;
+                int8_t b = (i+1 < n && in[i+1] < 128) ? dec_tab[in[i+1]] : -1;
+                int8_t c = (i+2 < n && in[i+2] < 128) ? dec_tab[in[i+2]] : -1;
+                int8_t d = (i+3 < n && in[i+3] < 128) ? dec_tab[in[i+3]] : -1;
+                if (a < 0 || b < 0) break;
+                out[o++] = (uint8_t)((a << 2) | (b >> 4));
+                if (c >= 0 && in[i+2] != '=') out[o++] = (uint8_t)((b << 4) | (c >> 2));
+                if (d >= 0 && in[i+3] != '=') out[o++] = (uint8_t)((c << 6) | d);
+            }
+            out[o] = '\0';
+            for (int i = 0; i < o; i++) {
+                char c[2] = { (char)out[i], 0 };
+                sh_puts(c);
+            }
+            sh_puts("\n");
+        }
     } else if (strcmp(cmd, "touch") == 0) {
         if (argc < 2) { sh_puts("Usage: touch <file>\n"); return; }
         if (!osfs2_is_mounted()) { sh_puts("No filesystem mounted\n"); return; }
