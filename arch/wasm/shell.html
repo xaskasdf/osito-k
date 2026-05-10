@@ -280,13 +280,24 @@
         inputField.focus();
         document.getElementById('prompt-label').textContent = '$';
 
-        // Update status bar
-        try {
-            const usedKb = Module.ccall('wasm_get_mem_used_kb', 'number', [], []);
-            document.getElementById('status-mem').textContent =
-                'mem: ' + (usedKb > 1024 ? (usedKb / 1024).toFixed(1) + ' MB' : usedKb + ' KB') + ' used';
-        } catch(e) {}
-        document.getElementById('status-fs').textContent = 'fs: stub';
+        // Live status bar — polls kernel state every 2s.
+        function refreshStatus() {
+            try {
+                const usedKb = Module.ccall('wasm_get_mem_used_kb', 'number', [], []);
+                document.getElementById('status-mem').textContent =
+                    'mem: ' + (usedKb > 1024 ? (usedKb / 1024).toFixed(1) + ' MB' : usedKb + ' KB');
+            } catch(e) {}
+            try {
+                const lbl = Module.ccall('wasm_status_fs_label', 'string', [], []);
+                const n   = Module.ccall('wasm_status_fs_files', 'number', [], []);
+                const mb  = Module.ccall('wasm_status_fs_free_mb', 'number', [], []);
+                document.getElementById('status-fs').textContent =
+                    lbl ? ('fs: ' + lbl + ' (' + n + ' files, ' + mb + ' MB free)')
+                        : 'fs: --';
+            } catch(e) {}
+        }
+        refreshStatus();
+        setInterval(refreshStatus, 2000);
     }
 
     // ── Model pre-fetch ─────────────────────────────────────────

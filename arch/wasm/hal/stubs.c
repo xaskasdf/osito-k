@@ -548,6 +548,27 @@ EM_JS(void, js_localstorage_set_raw, (const char *key, const char *value), {
 void wasm_localstorage_set(const char *key, const char *value)
 { js_localstorage_set_raw(key, value); }
 
+/* Status accessors for the bottom-bar live update. Returns pointers
+ * into kernel memory — JS reads them with UTF8ToString. */
+extern bool osfs2_is_mounted(void);
+extern const char *osfs2_label(void);
+extern uint32_t osfs2_file_count(void);
+extern uint32_t osfs2_free_blocks(void);
+extern uint32_t osfs2_get_block_size(void);
+
+const char *wasm_status_fs_label(void)
+{ return osfs2_is_mounted() ? osfs2_label() : ""; }
+
+int wasm_status_fs_files(void)
+{ return osfs2_is_mounted() ? (int)osfs2_file_count() : 0; }
+
+int wasm_status_fs_free_mb(void)
+{
+    if (!osfs2_is_mounted()) return 0;
+    uint64_t b = (uint64_t)osfs2_free_blocks() * (uint64_t)osfs2_get_block_size();
+    return (int)(b / (1024 * 1024));
+}
+
 int nvme_write_bytes(uint64_t offset, const void *buf, uint64_t len) {
     if (!wasm_nvme_buf || offset + len > wasm_nvme_size) return -1;
     memcpy(wasm_nvme_buf + offset, buf, (size_t)len);

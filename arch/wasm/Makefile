@@ -45,7 +45,7 @@ EMFLAGS := \
     -Wl,--allow-multiple-definition \
     -s ASYNCIFY=1 \
     -s 'ASYNCIFY_IMPORTS=["emscripten_sleep"]' \
-    -s 'EXPORTED_FUNCTIONS=["_main","_wasm_kb_push","_wasm_get_mem_used_kb","_wasm_compositor_frame","_input_set_mouse_abs","_input_post_mouse_button","_osito_chat_sync"]' \
+    -s 'EXPORTED_FUNCTIONS=["_main","_wasm_kb_push","_wasm_get_mem_used_kb","_wasm_compositor_frame","_input_set_mouse_abs","_input_post_mouse_button","_osito_chat_sync","_wasm_status_fs_label","_wasm_status_fs_files","_wasm_status_fs_free_mb"]' \
     -s 'EXPORTED_RUNTIME_METHODS=["ccall","cwrap"]' \
     --shell-file shell.html
 
