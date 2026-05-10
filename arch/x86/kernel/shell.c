@@ -4477,6 +4477,20 @@ void shell_exec(char *line)
         if ((uint64_t)want < fsz) {
             sh_puts("... ["); sh_putdec(fsz - want); sh_puts(" more bytes]\n");
         }
+    } else if (strcmp(cmd, "touch") == 0) {
+        if (argc < 2) { sh_puts("Usage: touch <file>\n"); return; }
+        if (!osfs2_is_mounted()) { sh_puts("No filesystem mounted\n"); return; }
+        extern void *osfs2_create(const char *name, uint64_t size);
+        extern void *osfs2_find(const char *name);
+        if (osfs2_find(argv[1])) {
+            sh_puts("(file exists)\n");
+            return;
+        }
+        if (osfs2_create(argv[1], 0)) {
+            sh_puts(argv[1]); sh_puts(" created\n");
+        } else {
+            sh_puts("touch failed\n");
+        }
     } else if (strcmp(cmd, "find") == 0) {
         if (argc < 2) { sh_puts("Usage: find <substring>\n"); return; }
         if (!osfs2_is_mounted()) { sh_puts("No filesystem mounted\n"); return; }
