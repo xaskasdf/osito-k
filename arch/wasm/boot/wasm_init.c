@@ -275,6 +275,27 @@ static void load_filesystem(void)
               "    return 0;\n"
               "}\n"
             },
+            { "/samples/fib.c",
+              "/* Fibonacci — cc /samples/fib.c -o fib.wasm; exec fib.wasm 30 */\n"
+              "#include <stdio.h>\n"
+              "#include <stdlib.h>\n"
+              "long fib(int n) { return n < 2 ? n : fib(n-1) + fib(n-2); }\n"
+              "int main(int argc, char **argv) {\n"
+              "    int n = argc > 1 ? atoi(argv[1]) : 25;\n"
+              "    if (n < 0 || n > 45) { puts(\"n out of range (0..45)\"); return 1; }\n"
+              "    printf(\"fib(%d) = %ld\\n\", n, fib(n));\n"
+              "    return 0;\n"
+              "}\n"
+            },
+            { "/samples/cat.c",
+              "/* Cat — print stdin to stdout. cc /samples/cat.c -o cat.wasm */\n"
+              "#include <stdio.h>\n"
+              "int main(void) {\n"
+              "    char buf[4096];\n"
+              "    while (fgets(buf, sizeof(buf), stdin)) fputs(buf, stdout);\n"
+              "    return 0;\n"
+              "}\n"
+            },
         };
 
         int created = 0;
