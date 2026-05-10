@@ -629,15 +629,23 @@ static void cmd_help(void)
     sh_puts("  tcp connect|proxy|...   TCP via configurable WS proxy\n");
     sh_puts("  crypto sha256/sha512    SHA hash on stdin/argv\n");
 
-    sh_puts_color("\nIntrospection / persistence:\n", 0x00FF8800);
+    sh_puts_color("\nIntrospection / persistence / UX:\n", 0x00FF8800);
     sh_puts("  info                    Kernel state dashboard\n");
     sh_puts("  version                 Build hash + timestamp\n");
     sh_puts("  uname [-a]              Kernel identity\n");
+    sh_puts("  date                    UTC ISO time (JS)\n");
+    sh_puts("  whoami                  Always 'osito'\n");
     sh_puts("  stress [net]            Smoke test the bridges\n");
+    sh_puts("  benchmark               sha256 + osfs2 + tok/s\n");
     sh_puts("  time <cmd...>           Wall-clock the command\n");
+    sh_puts("  bench [n]               Time inference, n tokens\n");
     sh_puts("  save                    Force-flush FS to IndexedDB\n");
+    sh_puts("  reload                  Save + reload page\n");
+    sh_puts("  alias [name=val] ...    Bash-style aliases (persisted)\n");
+    sh_puts("  unalias <name>          Remove an alias\n");
+    sh_puts("  history [clear]         localStorage cmd history (Up/Dn)\n");
+    sh_puts("  demo                    Run 6 representative commands\n");
     sh_puts("  tutorial                Interactive 8-step tour\n");
-    sh_puts("  history (Up/Down keys)  Recall previous commands\n");
     sh_puts("  Persistence:            FS image → IndexedDB; sampling → localStorage\n");
     sh_puts("                           .osito_init in OsitoFS auto-runs at boot\n");
 #endif
