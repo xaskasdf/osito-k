@@ -5013,10 +5013,10 @@ void shell_exec(char *line)
         extern uint8_t *wasm_url_fetch(const char *url, int *out_size);
         extern void *osfs2_create(const char *name, uint64_t size);
         extern int   osfs2_write(void *file, uint64_t offset, const void *buf, uint64_t len);
-        const char *PKG_BASE = "https://wasm.naranjositos.tech/pkg";
-        char *sub = strtok(NULL, " ");
+        const char *PKG_BASE = "https://factory.naranjositos.tech/wasm/pkg";
+        const char *sub = (argc >= 2) ? argv[1] : NULL;
         if (!sub || strcmp(sub, "list") == 0 || strcmp(sub, "search") == 0) {
-            const char *q = (sub && strcmp(sub, "search") == 0) ? strtok(NULL, " ") : NULL;
+            const char *q = (sub && strcmp(sub, "search") == 0 && argc >= 3) ? argv[2] : NULL;
             char url[256]; strcpy(url, PKG_BASE); strcat(url, "/index.json");
             int sz = 0;
             uint8_t *idx = wasm_url_fetch(url, &sz);
@@ -5054,23 +5054,24 @@ void shell_exec(char *line)
             }
         } else if (strcmp(sub, "installed") == 0) {
             /* Walk the file table for /pkg/* entries. */
-            extern int osfs2_find_first(const char *pattern, int start_idx);
             extern void *osfs2_get_file(int index);
             extern const char *osfs2_file_name(void *file);
             extern uint64_t osfs2_file_size(void *file);
-            int idx = 0, count = 0;
-            while ((idx = osfs2_find_first("pkg/*.wasm", idx)) >= 0) {
-                void *f = osfs2_get_file(idx);
-                if (f) {
-                    sh_puts("  "); sh_puts(osfs2_file_name(f));
-                    sh_puts(" ("); sh_putdec(osfs2_file_size(f)); sh_puts(" B)\n");
-                    count++;
-                }
-                idx++;
+            int count = 0;
+            for (int i = 0; i < 4096; i++) {  /* OSFS2_MAX_FILES upper bound */
+                void *f = osfs2_get_file(i);
+                if (!f) continue;
+                const char *nm = osfs2_file_name(f);
+                if (!nm) continue;
+                if (nm[0] != 'p' || nm[1] != 'k' || nm[2] != 'g' || nm[3] != '/')
+                    continue;
+                sh_puts("  "); sh_puts(nm);
+                sh_puts(" ("); sh_putdec(osfs2_file_size(f)); sh_puts(" B)\n");
+                count++;
             }
             if (!count) sh_puts("pkg: nothing installed\n");
         } else if (strcmp(sub, "install") == 0) {
-            char *name = strtok(NULL, " ");
+            const char *name = (argc >= 3) ? argv[2] : NULL;
             if (!name) { sh_puts("usage: pkg install <name>\n"); }
             else {
                 char url[256]; strcpy(url, PKG_BASE); strcat(url, "/"); strcat(url, name); strcat(url, ".wasm");
@@ -5100,7 +5101,7 @@ void shell_exec(char *line)
             }
         } else if (strcmp(sub, "run") == 0) {
             /* Convenience: install if not already there, then exec. */
-            char *name = strtok(NULL, " ");
+            const char *name = (argc >= 3) ? argv[2] : NULL;
             if (!name) { sh_puts("usage: pkg run <name> [args...]\n"); }
             else {
                 char fname[80];
@@ -5123,19 +5124,13 @@ void shell_exec(char *line)
                     }
                 }
                 if (osfs2_find(fname)) {
-                    /* Forge an argv for proc_exec by re-invoking via the
-                     * normal exec path. The shell's proc_exec resolves
-                     * file paths against osfs2 directly. */
-                    extern int proc_exec(const char *filename, int argc,
-                                          const char **argv);
-                    char *args = strtok(NULL, "");  /* rest of line */
-                    const char *xargv[8] = { fname, NULL };
+                    extern int proc_exec(const char *filename, int xargc,
+                                          const char **xargv);
+                    /* argv[0]="pkg" argv[1]="run" argv[2]=name argv[3..] = pkg args */
+                    const char *xargv[8] = { fname };
                     int xc = 1;
-                    if (args) {
-                        char *t = strtok(args, " ");
-                        while (t && xc < 7) { xargv[xc++] = t; t = strtok(NULL, " "); }
-                        xargv[xc] = NULL;
-                    }
+                    for (int i = 3; i < argc && xc < 7; i++) xargv[xc++] = argv[i];
+                    xargv[xc] = NULL;
                     proc_exec(fname, xc, xargv);
                 }
             }
