@@ -5052,6 +5052,23 @@ void shell_exec(char *line)
                 if (matches == 0) sh_puts("pkg: no matches\n");
                 extern void free(void *); free(idx);
             }
+        } else if (strcmp(sub, "installed") == 0) {
+            /* Walk the file table for /pkg/* entries. */
+            extern int osfs2_find_first(const char *pattern, int start_idx);
+            extern void *osfs2_get_file(int index);
+            extern const char *osfs2_file_name(void *file);
+            extern uint64_t osfs2_file_size(void *file);
+            int idx = 0, count = 0;
+            while ((idx = osfs2_find_first("pkg/*.wasm", idx)) >= 0) {
+                void *f = osfs2_get_file(idx);
+                if (f) {
+                    sh_puts("  "); sh_puts(osfs2_file_name(f));
+                    sh_puts(" ("); sh_putdec(osfs2_file_size(f)); sh_puts(" B)\n");
+                    count++;
+                }
+                idx++;
+            }
+            if (!count) sh_puts("pkg: nothing installed\n");
         } else if (strcmp(sub, "install") == 0) {
             char *name = strtok(NULL, " ");
             if (!name) { sh_puts("usage: pkg install <name>\n"); }
@@ -5081,8 +5098,49 @@ void shell_exec(char *line)
                     extern void free(void *); free(blob);
                 }
             }
+        } else if (strcmp(sub, "run") == 0) {
+            /* Convenience: install if not already there, then exec. */
+            char *name = strtok(NULL, " ");
+            if (!name) { sh_puts("usage: pkg run <name> [args...]\n"); }
+            else {
+                char fname[80];
+                int n = strlen(name); if (n > 60) n = 60;
+                memcpy(fname, "pkg/", 4); memcpy(fname + 4, name, n);
+                memcpy(fname + 4 + n, ".wasm", 6);
+                extern void *osfs2_find(const char *);
+                if (!osfs2_find(fname)) {
+                    sh_puts("[pkg run] not installed, fetching...\n");
+                    char url[256]; strcpy(url, PKG_BASE); strcat(url, "/");
+                    strcat(url, name); strcat(url, ".wasm");
+                    int sz = 0;
+                    uint8_t *blob = wasm_url_fetch(url, &sz);
+                    if (!blob) { sh_puts("pkg: fetch failed\n"); }
+                    else {
+                        void *f = osfs2_create(fname, sz);
+                        if (!f || osfs2_write(f, 0, blob, sz) < 0)
+                            sh_puts("pkg: install failed\n");
+                        extern void free(void *); free(blob);
+                    }
+                }
+                if (osfs2_find(fname)) {
+                    /* Forge an argv for proc_exec by re-invoking via the
+                     * normal exec path. The shell's proc_exec resolves
+                     * file paths against osfs2 directly. */
+                    extern int proc_exec(const char *filename, int argc,
+                                          const char **argv);
+                    char *args = strtok(NULL, "");  /* rest of line */
+                    const char *xargv[8] = { fname, NULL };
+                    int xc = 1;
+                    if (args) {
+                        char *t = strtok(args, " ");
+                        while (t && xc < 7) { xargv[xc++] = t; t = strtok(NULL, " "); }
+                        xargv[xc] = NULL;
+                    }
+                    proc_exec(fname, xc, xargv);
+                }
+            }
         } else {
-            sh_puts("usage: pkg list | pkg search <q> | pkg install <name>\n");
+            sh_puts("usage: pkg list | search <q> | install <name> | installed | run <name>\n");
         }
 #else
         sh_puts("pkg: WASM-only\n");
