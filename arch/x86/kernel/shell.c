@@ -5238,7 +5238,11 @@ void __cold shell_run(void)
     sh_puts_color(" \\____/ |___/_|\\__\\___/|_|\\_\\\n", 0x00FF8800);
     sh_puts("\n");
     sh_puts_color(" Welcome to OsitoK Shell\n", 0x0000FF88);
+#ifdef __EMSCRIPTEN__
+    sh_puts(" Type 'tutorial' for a quick tour, 'help' for commands.\n");
+#else
     sh_puts(" Type 'help' for commands.\n");
+#endif
 
     /* Compact HW summary */
 #ifndef WASM_BUILD
