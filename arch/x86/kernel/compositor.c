@@ -975,10 +975,14 @@ static void __hot compositor_render_frame(void)
         blit_window(back, p, w, h, &windows[render_order[i]]);
     }
 
-    /* Draw cursor on top */
+    /* Draw cursor on top — but in WASM the canvas already shows the
+     * native browser cursor on top, so a second one drawn into the
+     * framebuffer just looks weird. Skip on WASM. */
+#ifndef __EMSCRIPTEN__
     int32_t cx, cy;
     input_get_cursor(&cx, &cy);
     draw_cursor(back, p, w, h, cx, cy);
+#endif
 
     display_mark_dirty();
 }
@@ -1001,6 +1005,18 @@ void wasm_compositor_frame(void)
 {
     if (!compositor_running) return;
     gui_anim_tick(idt_get_ticks() * 10);
+    /* Drain mouse/wheel state into comp_button_state so process_mouse_input
+     * sees button transitions. JS-side mousedown/mouseup pushed events
+     * into the input ring via input_post_mouse_button. */
+    if (input_has_events()) {
+        int16_t mdx, mdy, wheel;
+        uint8_t buttons;
+        uint8_t key_buf[32 * 24];
+        input_drain_coalesced(&mdx, &mdy, &buttons, &wheel, key_buf, 32);
+        comp_button_state = buttons;
+        comp_wheel_accum += wheel;
+    }
+    process_mouse_input();
     compositor_render_frame();
     /* The native compositor_thread's blit step never runs in WASM; the
      * rAF wrapper has to invoke display_flip itself or pixels stay in
