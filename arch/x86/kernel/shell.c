@@ -4798,6 +4798,20 @@ void shell_exec(char *line)
         sh_puts_color("SKIP (native build)\n", 0x00888888);
 #endif
         sh_puts_color("=== done ===\n\n", 0x00FF8800);
+    } else if (strcmp(cmd, "history") == 0) {
+#ifdef __EMSCRIPTEN__
+        if (argc >= 2 && strcmp(argv[1], "clear") == 0) {
+            extern void wasm_localstorage_set(const char *key, const char *value);
+            wasm_localstorage_set("osito-history", "");
+            sh_puts("[history] cleared (reload to apply)\n");
+        } else {
+            sh_puts("History lives in JS / localStorage.\n");
+            sh_puts("Use Up/Down arrow keys to recall previous commands.\n");
+            sh_puts("`history clear` wipes localStorage entry.\n");
+        }
+#else
+        sh_puts("history: WASM-only\n");
+#endif
     } else if (strcmp(cmd, "save") == 0) {
 #ifdef __EMSCRIPTEN__
         extern void wasm_persist_flush(void);
