@@ -636,13 +636,113 @@ EM_JS(int, js_wgpu_init_kick, (), {
                     outp[row] = sum;
                 }
             `;
-            const module = device.createShaderModule({ code });
-            const pipeline = device.createComputePipeline({
-                layout: 'auto',
-                compute: { module, entryPoint: 'matvec' },
-            });
+            /* RMS norm: y[i] = (x[i] / rms(x)) * weight[i] where
+             * rms(x) = sqrt(mean(x^2) + eps). One workgroup of 64
+             * threads cooperates to compute the mean via shared memory
+             * reduction, then writes the output in parallel. */
+            const rmsCode = `
+                struct NormDims { dim: u32, eps_bits: u32 };
+                @group(0) @binding(0) var<storage, read> weight: array<f32>;
+                @group(0) @binding(1) var<storage, read> inp: array<f32>;
+                @group(0) @binding(2) var<storage, read_write> outp: array<f32>;
+                @group(0) @binding(3) var<uniform> nd: NormDims;
+                var<workgroup> sh: array<f32, 64>;
+                @compute @workgroup_size(64)
+                fn rms_norm(@builtin(local_invocation_id) lid: vec3<u32>) {
+                    let tid = lid.x;
+                    let dim = nd.dim;
+                    var partial: f32 = 0.0;
+                    var i: u32 = tid;
+                    loop {
+                        if (i >= dim) { break; }
+                        partial = partial + inp[i] * inp[i];
+                        i = i + 64u;
+                    }
+                    sh[tid] = partial;
+                    workgroupBarrier();
+                    if (tid == 0u) {
+                        var s: f32 = 0.0;
+                        for (var k: u32 = 0u; k < 64u; k = k + 1u) {
+                            s = s + sh[k];
+                        }
+                        let eps = bitcast<f32>(nd.eps_bits);
+                        sh[0] = inverseSqrt(s / f32(dim) + eps);
+                    }
+                    workgroupBarrier();
+                    let scale = sh[0];
+                    i = tid;
+                    loop {
+                        if (i >= dim) { break; }
+                        outp[i] = inp[i] * scale * weight[i];
+                        i = i + 64u;
+                    }
+                }
+            `;
+            /* Numerically-stable softmax: subtract max, exp, normalize.
+             * Same single-workgroup pattern. */
+            const softCode = `
+                struct SDims { len: u32 };
+                @group(0) @binding(0) var<storage, read> inp: array<f32>;
+                @group(0) @binding(1) var<storage, read_write> outp: array<f32>;
+                @group(0) @binding(2) var<uniform> sd: SDims;
+                var<workgroup> sh: array<f32, 64>;
+                @compute @workgroup_size(64)
+                fn softmax(@builtin(local_invocation_id) lid: vec3<u32>) {
+                    let tid = lid.x;
+                    let len = sd.len;
+                    var lmax: f32 = -3.402823e38;
+                    var i: u32 = tid;
+                    loop { if (i >= len) { break; }
+                        lmax = max(lmax, inp[i]); i = i + 64u; }
+                    sh[tid] = lmax;
+                    workgroupBarrier();
+                    if (tid == 0u) {
+                        var m: f32 = -3.402823e38;
+                        for (var k: u32 = 0u; k < 64u; k = k + 1u) {
+                            m = max(m, sh[k]);
+                        }
+                        sh[0] = m;
+                    }
+                    workgroupBarrier();
+                    let gmax = sh[0];
+                    var lsum: f32 = 0.0;
+                    i = tid;
+                    loop { if (i >= len) { break; }
+                        let e = exp(inp[i] - gmax);
+                        outp[i] = e; lsum = lsum + e;
+                        i = i + 64u; }
+                    sh[tid] = lsum;
+                    workgroupBarrier();
+                    if (tid == 0u) {
+                        var s: f32 = 0.0;
+                        for (var k: u32 = 0u; k < 64u; k = k + 1u) {
+                            s = s + sh[k];
+                        }
+                        sh[0] = s;
+                    }
+                    workgroupBarrier();
+                    let inv = 1.0 / sh[0];
+                    i = tid;
+                    loop { if (i >= len) { break; }
+                        outp[i] = outp[i] * inv; i = i + 64u; }
+                }
+            `;
+            const matvecMod = device.createShaderModule({ code });
+            const rmsMod = device.createShaderModule({ code: rmsCode });
+            const softMod = device.createShaderModule({ code: softCode });
             window.__gpuDevice = device;
-            window.__gpuPipeline = pipeline;
+            window.__gpuPipeline = device.createComputePipeline({
+                layout: 'auto',
+                compute: { module: matvecMod, entryPoint: 'matvec' },
+            });
+            window.__gpuRmsPipeline = device.createComputePipeline({
+                layout: 'auto',
+                compute: { module: rmsMod, entryPoint: 'rms_norm' },
+            });
+            window.__gpuSoftPipeline = device.createComputePipeline({
+                layout: 'auto',
+                compute: { module: softMod, entryPoint: 'softmax' },
+            });
             window.__gpuReady = true;
         } catch (e) {
             window.__gpuError = String(e);
@@ -772,6 +872,161 @@ int wasm_wgpu_matvec(const float *w, const float *vin, float *out,
     js_wgpu_matvec_kick(w, vin, out, rows, cols);
     while (!js_wgpu_matvec_done()) emscripten_sleep(1);
     return js_wgpu_matvec_ok() ? 0 : -1;
+}
+
+/* ── RMS norm: y[i] = (x[i] / sqrt(mean(x^2) + eps)) * weight[i] ── */
+EM_JS(int, js_wgpu_rmsnorm_kick, (const float *weight, const float *inp,
+                                   float *out, int dim, int eps_bits), {
+    window.__gpuOpDone = false;
+    window.__gpuOpOK = false;
+    if (!window.__gpuReady) { window.__gpuOpDone = true; return 0; }
+    (async function() {
+        try {
+            const dev = window.__gpuDevice;
+            const pipe = window.__gpuRmsPipeline;
+            const dimBytes = dim * 4;
+            if (!window.__gpuRmsCache) window.__gpuRmsCache = new Map();
+            const key = 'r' + dim;
+            let slot = window.__gpuRmsCache.get(key);
+            if (!slot) {
+                if (window.__gpuRmsCache.size >= 8) {
+                    const k0 = window.__gpuRmsCache.keys().next().value;
+                    const old = window.__gpuRmsCache.get(k0);
+                    old.wBuf.destroy(); old.iBuf.destroy();
+                    old.oBuf.destroy(); old.dBuf.destroy(); old.rBuf.destroy();
+                    window.__gpuRmsCache.delete(k0);
+                }
+                slot = {
+                    wBuf: dev.createBuffer({ size: dimBytes,
+                        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST }),
+                    iBuf: dev.createBuffer({ size: dimBytes,
+                        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST }),
+                    oBuf: dev.createBuffer({ size: dimBytes,
+                        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC }),
+                    dBuf: dev.createBuffer({ size: 8,
+                        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST }),
+                    rBuf: dev.createBuffer({ size: dimBytes,
+                        usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST }),
+                    bg: null
+                };
+                slot.bg = dev.createBindGroup({
+                    layout: pipe.getBindGroupLayout(0),
+                    entries: [
+                        { binding: 0, resource: { buffer: slot.wBuf } },
+                        { binding: 1, resource: { buffer: slot.iBuf } },
+                        { binding: 2, resource: { buffer: slot.oBuf } },
+                        { binding: 3, resource: { buffer: slot.dBuf } },
+                    ],
+                });
+                window.__gpuRmsCache.set(key, slot);
+            }
+            dev.queue.writeBuffer(slot.wBuf, 0, HEAPU8.slice(weight, weight + dimBytes));
+            dev.queue.writeBuffer(slot.iBuf, 0, HEAPU8.slice(inp, inp + dimBytes));
+            dev.queue.writeBuffer(slot.dBuf, 0, new Uint32Array([dim, eps_bits]));
+            const enc = dev.createCommandEncoder();
+            const pass = enc.beginComputePass();
+            pass.setPipeline(pipe);
+            pass.setBindGroup(0, slot.bg);
+            pass.dispatchWorkgroups(1);  /* one workgroup of 64 threads */
+            pass.end();
+            enc.copyBufferToBuffer(slot.oBuf, 0, slot.rBuf, 0, dimBytes);
+            dev.queue.submit([enc.finish()]);
+            await slot.rBuf.mapAsync(GPUMapMode.READ);
+            HEAPU8.set(new Uint8Array(slot.rBuf.getMappedRange()), out);
+            slot.rBuf.unmap();
+            window.__gpuOpOK = true;
+        } catch (e) {
+            window.__gpuError = String(e);
+        }
+        window.__gpuOpDone = true;
+    })();
+    return 1;
+});
+EM_JS(int, js_wgpu_op_done, (), { return window.__gpuOpDone ? 1 : 0; });
+EM_JS(int, js_wgpu_op_ok,   (), { return window.__gpuOpOK ? 1 : 0; });
+
+int wasm_wgpu_rmsnorm(const float *weight, const float *in, float *out,
+                       int dim, float eps)
+{
+    if (!js_wgpu_ready()) return -1;
+    /* Pass eps as raw IEEE 754 bits — WGSL bitcasts back. Avoids
+     * stuffing a float into a uniform via Uint32Array trickery. */
+    union { float f; uint32_t u; } u; u.f = eps;
+    js_wgpu_rmsnorm_kick(weight, in, out, dim, (int)u.u);
+    while (!js_wgpu_op_done()) emscripten_sleep(1);
+    return js_wgpu_op_ok() ? 0 : -1;
+}
+
+/* ── Softmax: numerically-stable, in-place semantics ─────────── */
+EM_JS(int, js_wgpu_softmax_kick, (const float *inp, float *out, int len), {
+    window.__gpuOpDone = false;
+    window.__gpuOpOK = false;
+    if (!window.__gpuReady) { window.__gpuOpDone = true; return 0; }
+    (async function() {
+        try {
+            const dev = window.__gpuDevice;
+            const pipe = window.__gpuSoftPipeline;
+            const lenBytes = len * 4;
+            if (!window.__gpuSoftCache) window.__gpuSoftCache = new Map();
+            const key = 's' + len;
+            let slot = window.__gpuSoftCache.get(key);
+            if (!slot) {
+                if (window.__gpuSoftCache.size >= 8) {
+                    const k0 = window.__gpuSoftCache.keys().next().value;
+                    const old = window.__gpuSoftCache.get(k0);
+                    old.iBuf.destroy(); old.oBuf.destroy();
+                    old.dBuf.destroy(); old.rBuf.destroy();
+                    window.__gpuSoftCache.delete(k0);
+                }
+                slot = {
+                    iBuf: dev.createBuffer({ size: lenBytes,
+                        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST }),
+                    oBuf: dev.createBuffer({ size: lenBytes,
+                        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC }),
+                    dBuf: dev.createBuffer({ size: 4,
+                        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST }),
+                    rBuf: dev.createBuffer({ size: lenBytes,
+                        usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST }),
+                    bg: null
+                };
+                slot.bg = dev.createBindGroup({
+                    layout: pipe.getBindGroupLayout(0),
+                    entries: [
+                        { binding: 0, resource: { buffer: slot.iBuf } },
+                        { binding: 1, resource: { buffer: slot.oBuf } },
+                        { binding: 2, resource: { buffer: slot.dBuf } },
+                    ],
+                });
+                dev.queue.writeBuffer(slot.dBuf, 0, new Uint32Array([len]));
+                window.__gpuSoftCache.set(key, slot);
+            }
+            dev.queue.writeBuffer(slot.iBuf, 0, HEAPU8.slice(inp, inp + lenBytes));
+            const enc = dev.createCommandEncoder();
+            const pass = enc.beginComputePass();
+            pass.setPipeline(pipe);
+            pass.setBindGroup(0, slot.bg);
+            pass.dispatchWorkgroups(1);
+            pass.end();
+            enc.copyBufferToBuffer(slot.oBuf, 0, slot.rBuf, 0, lenBytes);
+            dev.queue.submit([enc.finish()]);
+            await slot.rBuf.mapAsync(GPUMapMode.READ);
+            HEAPU8.set(new Uint8Array(slot.rBuf.getMappedRange()), out);
+            slot.rBuf.unmap();
+            window.__gpuOpOK = true;
+        } catch (e) {
+            window.__gpuError = String(e);
+        }
+        window.__gpuOpDone = true;
+    })();
+    return 1;
+});
+
+int wasm_wgpu_softmax(const float *in, float *out, int len)
+{
+    if (!js_wgpu_ready()) return -1;
+    js_wgpu_softmax_kick(in, out, len);
+    while (!js_wgpu_op_done()) emscripten_sleep(1);
+    return js_wgpu_op_ok() ? 0 : -1;
 }
 
 /* Status accessors for the bottom-bar live update. Returns pointers

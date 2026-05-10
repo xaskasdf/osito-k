@@ -4961,6 +4961,65 @@ void shell_exec(char *line)
             sh_putdec((uint64_t)(maxdiff * 1000.0f)); sh_puts(")\n");
 
             free(w); free(in); free(out_cpu); free(out_gpu);
+        } else if (strcmp(argv[1], "rmsnorm") == 0) {
+            if (!wasm_wgpu_init()) { sh_puts("WebGPU not initialized.\n"); return; }
+            extern int wasm_wgpu_rmsnorm(const float *w, const float *in,
+                                          float *out, int dim, float eps);
+            extern void *malloc(unsigned long); extern void free(void *);
+            int N = 256;
+            float *w = (float *)malloc(N * 4);
+            float *in = (float *)malloc(N * 4);
+            float *gpu = (float *)malloc(N * 4);
+            float *cpu = (float *)malloc(N * 4);
+            for (int i = 0; i < N; i++) {
+                w[i]  = 1.0f + ((i * 3 % 7) - 3) * 0.05f;
+                in[i] = ((i * 11 % 17) - 8) * 0.13f;
+            }
+            extern double sqrt(double);
+            float ssq = 0.0f;
+            for (int i = 0; i < N; i++) ssq += in[i] * in[i];
+            float rms = 1.0f / (float)sqrt(ssq / N + 1e-5f);
+            for (int i = 0; i < N; i++) cpu[i] = in[i] * rms * w[i];
+            int rc = wasm_wgpu_rmsnorm(w, in, gpu, N, 1e-5f);
+            float md = 0.0f;
+            for (int i = 0; i < N; i++) {
+                float d = cpu[i] - gpu[i]; if (d < 0) d = -d;
+                if (d > md) md = d;
+            }
+            sh_puts("[wgpu rmsnorm] N="); sh_putdec(N);
+            sh_puts(" rc="); sh_putdec(rc + 1000);
+            sh_puts(" maxdiff*1e6="); sh_putdec((uint64_t)(md * 1e6f));
+            sh_puts("\n");
+            free(w); free(in); free(gpu); free(cpu);
+        } else if (strcmp(argv[1], "softmax") == 0) {
+            if (!wasm_wgpu_init()) { sh_puts("WebGPU not initialized.\n"); return; }
+            extern int wasm_wgpu_softmax(const float *in, float *out, int len);
+            extern void *malloc(unsigned long); extern void free(void *);
+            extern double exp(double);
+            int N = 256;
+            float *in = (float *)malloc(N * 4);
+            float *gpu = (float *)malloc(N * 4);
+            float *cpu = (float *)malloc(N * 4);
+            for (int i = 0; i < N; i++)
+                in[i] = ((i * 7 % 19) - 9) * 0.21f;
+            float mx = in[0];
+            for (int i = 1; i < N; i++) if (in[i] > mx) mx = in[i];
+            float s = 0.0f;
+            for (int i = 0; i < N; i++) { cpu[i] = (float)exp(in[i] - mx); s += cpu[i]; }
+            for (int i = 0; i < N; i++) cpu[i] /= s;
+            int rc = wasm_wgpu_softmax(in, gpu, N);
+            float md = 0.0f, gsum = 0.0f;
+            for (int i = 0; i < N; i++) {
+                float d = cpu[i] - gpu[i]; if (d < 0) d = -d;
+                if (d > md) md = d;
+                gsum += gpu[i];
+            }
+            sh_puts("[wgpu softmax] N="); sh_putdec(N);
+            sh_puts(" rc="); sh_putdec(rc + 1000);
+            sh_puts(" maxdiff*1e6="); sh_putdec((uint64_t)(md * 1e6f));
+            sh_puts(" gpu_sum*1000="); sh_putdec((uint64_t)(gsum * 1000.0f));
+            sh_puts(" (should be ~1000)\n");
+            free(in); free(gpu); free(cpu);
         } else if (strcmp(argv[1], "bench") == 0) {
             /* Repeat the same shape N times to exercise the buffer
              * cache: first call pays createBuffer, the rest only
@@ -4995,7 +5054,7 @@ void shell_exec(char *line)
             sh_putdec(t2 - t1); sh_puts(" ms total)\n");
             free(w); free(in); free(out);
         } else {
-            sh_puts("Usage: wgpu [init|test|bench]\n");
+            sh_puts("Usage: wgpu [init|test|bench|rmsnorm|softmax]\n");
         }
 #else
         sh_puts("wgpu: WASM-only\n");
