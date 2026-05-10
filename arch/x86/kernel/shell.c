@@ -4954,8 +4954,41 @@ void shell_exec(char *line)
             sh_putdec((uint64_t)(maxdiff * 1000.0f)); sh_puts(")\n");
 
             free(w); free(in); free(out_cpu); free(out_gpu);
+        } else if (strcmp(argv[1], "bench") == 0) {
+            /* Repeat the same shape N times to exercise the buffer
+             * cache: first call pays createBuffer, the rest only
+             * writeBuffer + dispatch. Reports total + per-call avg. */
+            if (!wasm_wgpu_init()) { sh_puts("WebGPU not initialized.\n"); return; }
+            int N = 512, ITERS = 50;
+            extern void *malloc(unsigned long);
+            extern void free(void *);
+            float *w = (float *)malloc((size_t)N * N * 4);
+            float *in = (float *)malloc((size_t)N * 4);
+            float *out = (float *)malloc((size_t)N * 4);
+            if (!w || !in || !out) {
+                sh_puts("OOM\n");
+                if (w) free(w); if (in) free(in); if (out) free(out);
+                return;
+            }
+            for (int i = 0; i < N * N; i++) w[i]  = (float)((i * 7 % 13) - 6) * 0.1f;
+            for (int i = 0; i < N;     i++) in[i] = (float)((i * 5 % 11) - 5) * 0.1f;
+            extern uint64_t idt_get_ticks(void);
+            /* Warm-up call (fills cache) — timed separately. */
+            uint64_t t0 = idt_get_ticks();
+            wasm_wgpu_matvec(w, in, out, N, N);
+            uint64_t t1 = idt_get_ticks();
+            for (int k = 0; k < ITERS; k++) wasm_wgpu_matvec(w, in, out, N, N);
+            uint64_t t2 = idt_get_ticks();
+            sh_puts("[wgpu bench] shape "); sh_putdec(N); sh_puts("x"); sh_putdec(N);
+            sh_puts(", iters="); sh_putdec(ITERS); sh_puts("\n");
+            sh_puts("  warm-up (createBuffer): "); sh_putdec(t1 - t0); sh_puts(" ms\n");
+            sh_puts("  cached avg: ");
+            uint64_t avg = (t2 - t1) / ITERS;
+            sh_putdec(avg); sh_puts(" ms/call (");
+            sh_putdec(t2 - t1); sh_puts(" ms total)\n");
+            free(w); free(in); free(out);
         } else {
-            sh_puts("Usage: wgpu [init|test]\n");
+            sh_puts("Usage: wgpu [init|test|bench]\n");
         }
 #else
         sh_puts("wgpu: WASM-only\n");
