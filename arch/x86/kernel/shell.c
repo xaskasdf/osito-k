@@ -4833,6 +4833,74 @@ void shell_exec(char *line)
         sh_puts_color("SKIP (native build)\n", 0x00888888);
 #endif
         sh_puts_color("=== done ===\n\n", 0x00FF8800);
+    } else if (strcmp(cmd, "wgpu") == 0) {
+#ifdef __EMSCRIPTEN__
+        extern int wasm_wgpu_init(void);
+        extern int wasm_wgpu_error(char *dst, int max);
+        extern int wasm_wgpu_matvec(const float *w, const float *in, float *out,
+                                     int rows, int cols);
+        if (argc < 2 || strcmp(argv[1], "init") == 0) {
+            sh_puts("[wgpu] requesting adapter + compiling shader...\n");
+            int ok = wasm_wgpu_init();
+            if (ok) {
+                sh_puts_color("[wgpu] ready ✓\n", 0x0000FF00);
+            } else {
+                char err[256];
+                wasm_wgpu_error(err, sizeof(err));
+                sh_puts_color("[wgpu] not available: ", 0x00FF0000);
+                sh_puts(err); sh_puts("\n");
+            }
+        } else if (strcmp(argv[1], "test") == 0) {
+            if (!wasm_wgpu_init()) { sh_puts("WebGPU not initialized.\n"); return; }
+            /* 256x256 random matvec, compare CPU vs GPU */
+            int N = 256;
+            extern void *malloc(unsigned long);
+            extern void free(void *);
+            float *w = (float *)malloc((size_t)N * N * 4);
+            float *in = (float *)malloc((size_t)N * 4);
+            float *out_cpu = (float *)malloc((size_t)N * 4);
+            float *out_gpu = (float *)malloc((size_t)N * 4);
+            if (!w || !in || !out_cpu || !out_gpu) {
+                sh_puts("OOM\n");
+                if (w) free(w); if (in) free(in);
+                if (out_cpu) free(out_cpu); if (out_gpu) free(out_gpu);
+                return;
+            }
+            for (int i = 0; i < N * N; i++) w[i]  = (float)((i * 7 % 13) - 6) * 0.1f;
+            for (int i = 0; i < N;     i++) in[i] = (float)((i * 5 % 11) - 5) * 0.1f;
+
+            extern uint64_t idt_get_ticks(void);
+            uint64_t t0 = idt_get_ticks();
+            for (int r = 0; r < N; r++) {
+                float s = 0.0f;
+                for (int c = 0; c < N; c++) s += w[r * N + c] * in[c];
+                out_cpu[r] = s;
+            }
+            uint64_t t1 = idt_get_ticks();
+
+            uint64_t t2 = idt_get_ticks();
+            int rc = wasm_wgpu_matvec(w, in, out_gpu, N, N);
+            uint64_t t3 = idt_get_ticks();
+
+            float maxdiff = 0.0f;
+            for (int i = 0; i < N; i++) {
+                float d = out_cpu[i] - out_gpu[i];
+                if (d < 0) d = -d;
+                if (d > maxdiff) maxdiff = d;
+            }
+
+            sh_puts("CPU:  "); sh_putdec(t1 - t0); sh_puts(" ms\n");
+            sh_puts("GPU:  "); sh_putdec(t3 - t2); sh_puts(" ms (rc=");
+            sh_putdec(rc + 1000); sh_puts(", maxdiff*1000=");
+            sh_putdec((uint64_t)(maxdiff * 1000.0f)); sh_puts(")\n");
+
+            free(w); free(in); free(out_cpu); free(out_gpu);
+        } else {
+            sh_puts("Usage: wgpu [init|test]\n");
+        }
+#else
+        sh_puts("wgpu: WASM-only\n");
+#endif
     } else if (strcmp(cmd, "precache") == 0) {
 #ifdef __EMSCRIPTEN__
         sh_puts("[precache] kicking background fetch of clang/lld/sysroot/memfs (~50 MB)...\n");

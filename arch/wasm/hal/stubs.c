@@ -581,6 +581,159 @@ EM_JS(void, js_precache_toolchain, (), {
 
 void wasm_precache_toolchain(void) { js_precache_toolchain(); }
 
+/* ══════════════════════════════════════════════════════════════
+ *  WebGPU compute matvec — F32 weights, dispatch via EM_JS.
+ *  Falls back to scalar when navigator.gpu is missing or init fails.
+ * ══════════════════════════════════════════════════════════════ */
+
+EM_JS(int, js_wgpu_init_kick, (), {
+    window.__gpuReady = false;
+    window.__gpuPending = true;
+    window.__gpuError = '';
+    if (!navigator.gpu) {
+        window.__gpuError = 'navigator.gpu missing (WebGPU unsupported)';
+        window.__gpuPending = false;
+        return 0;
+    }
+    (async function() {
+        try {
+            const adapter = await navigator.gpu.requestAdapter();
+            if (!adapter) throw new Error('no adapter');
+            const device = await adapter.requestDevice();
+            const code = `
+                struct Dims { rows: u32, cols: u32 };
+                @group(0) @binding(0) var<storage, read> weights: array<f32>;
+                @group(0) @binding(1) var<storage, read> inp: array<f32>;
+                @group(0) @binding(2) var<storage, read_write> outp: array<f32>;
+                @group(0) @binding(3) var<uniform> dims: Dims;
+                @compute @workgroup_size(64)
+                fn matvec(@builtin(global_invocation_id) gid: vec3<u32>) {
+                    let row = gid.x;
+                    if (row >= dims.rows) { return; }
+                    var sum: f32 = 0.0;
+                    let base = row * dims.cols;
+                    for (var c: u32 = 0u; c < dims.cols; c = c + 1u) {
+                        sum = sum + weights[base + c] * inp[c];
+                    }
+                    outp[row] = sum;
+                }
+            `;
+            const module = device.createShaderModule({ code });
+            const pipeline = device.createComputePipeline({
+                layout: 'auto',
+                compute: { module, entryPoint: 'matvec' },
+            });
+            window.__gpuDevice = device;
+            window.__gpuPipeline = pipeline;
+            window.__gpuReady = true;
+        } catch (e) {
+            window.__gpuError = String(e);
+        }
+        window.__gpuPending = false;
+    })();
+    return 1;
+});
+
+EM_JS(int, js_wgpu_pending, (), { return window.__gpuPending ? 1 : 0; });
+EM_JS(int, js_wgpu_ready,   (), { return window.__gpuReady ? 1 : 0; });
+EM_JS(int, js_wgpu_error,   (char *dst, int max), {
+    var s = window.__gpuError || '';
+    var bytes = lengthBytesUTF8(s) + 1;
+    if (bytes > max) bytes = max;
+    stringToUTF8(s, dst, bytes);
+    return s ? bytes - 1 : 0;
+});
+
+/* Synchronous init wrapper. Returns 1 if WebGPU is ready, 0 if
+ * unsupported / init failed. Idempotent — repeat calls return cached
+ * state. */
+static int g_wgpu_init_done = 0;
+int wasm_wgpu_init(void)
+{
+    if (g_wgpu_init_done) return js_wgpu_ready();
+    js_wgpu_init_kick();
+    while (js_wgpu_pending()) emscripten_sleep(20);
+    g_wgpu_init_done = 1;
+    return js_wgpu_ready();
+}
+
+int wasm_wgpu_error(char *dst, int max) { return js_wgpu_error(dst, max); }
+
+/* Dispatch one matvec on the GPU. Allocates+destroys buffers per call
+ * (no cache yet). Async via Asyncify suspend. Returns 0 on success,
+ * -1 on failure (caller falls back to scalar). */
+EM_JS(int, js_wgpu_matvec_kick, (const float *w, const float *vinp, float *out,
+                                  int rows, int cols), {
+    window.__gpuMatvecDone = false;
+    window.__gpuMatvecOK = false;
+    if (!window.__gpuReady) { window.__gpuMatvecDone = true; return 0; }
+    (async function() {
+        try {
+            const dev = window.__gpuDevice;
+            const pipe = window.__gpuPipeline;
+            const wBytes = rows * cols * 4;
+            const iBytes = cols * 4;
+            const oBytes = rows * 4;
+            const wBuf = dev.createBuffer({ size: wBytes,
+                usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+            const iBuf = dev.createBuffer({ size: iBytes,
+                usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+            const oBuf = dev.createBuffer({ size: oBytes,
+                usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+            const dBuf = dev.createBuffer({ size: 8,
+                usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+            const rBuf = dev.createBuffer({ size: oBytes,
+                usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+
+            dev.queue.writeBuffer(wBuf, 0, HEAPU8.slice(w, w + wBytes));
+            dev.queue.writeBuffer(iBuf, 0, HEAPU8.slice(vinp, vinp + iBytes));
+            dev.queue.writeBuffer(dBuf, 0, new Uint32Array([rows, cols]));
+
+            const bg = dev.createBindGroup({
+                layout: pipe.getBindGroupLayout(0),
+                entries: [
+                    { binding: 0, resource: { buffer: wBuf } },
+                    { binding: 1, resource: { buffer: iBuf } },
+                    { binding: 2, resource: { buffer: oBuf } },
+                    { binding: 3, resource: { buffer: dBuf } },
+                ],
+            });
+            const enc = dev.createCommandEncoder();
+            const pass = enc.beginComputePass();
+            pass.setPipeline(pipe);
+            pass.setBindGroup(0, bg);
+            pass.dispatchWorkgroups(Math.ceil(rows / 64));
+            pass.end();
+            enc.copyBufferToBuffer(oBuf, 0, rBuf, 0, oBytes);
+            dev.queue.submit([enc.finish()]);
+
+            await rBuf.mapAsync(GPUMapMode.READ);
+            HEAPU8.set(new Uint8Array(rBuf.getMappedRange()), out);
+            rBuf.unmap();
+
+            wBuf.destroy(); iBuf.destroy(); oBuf.destroy();
+            dBuf.destroy(); rBuf.destroy();
+            window.__gpuMatvecOK = true;
+        } catch (e) {
+            window.__gpuError = String(e);
+        }
+        window.__gpuMatvecDone = true;
+    })();
+    return 1;
+});
+
+EM_JS(int, js_wgpu_matvec_done, (), { return window.__gpuMatvecDone ? 1 : 0; });
+EM_JS(int, js_wgpu_matvec_ok,   (), { return window.__gpuMatvecOK ? 1 : 0; });
+
+int wasm_wgpu_matvec(const float *w, const float *vin, float *out,
+                     int rows, int cols)
+{
+    if (!js_wgpu_ready()) return -1;
+    js_wgpu_matvec_kick(w, vin, out, rows, cols);
+    while (!js_wgpu_matvec_done()) emscripten_sleep(1);
+    return js_wgpu_matvec_ok() ? 0 : -1;
+}
+
 /* Status accessors for the bottom-bar live update. Returns pointers
  * into kernel memory — JS reads them with UTF8ToString. */
 extern bool osfs2_is_mounted(void);
