@@ -1006,8 +1006,31 @@ static int brandon_forward_one(llama_state_t *s, uint32_t pos, bool produce_logi
 
     /* Final norm + LM head (skipped during register prefill) */
     if (produce_logits) {
+#ifdef __EMSCRIPTEN__
+        /* Fused GPU path: rmsnorm + matvec dispatched as one command
+         * buffer with a single mapAsync. Skips the CPU pass entirely
+         * for this op; falls back if WebGPU init failed. */
+        extern int wasm_wgpu_brandon_lm_head(const float *x,
+            const float *w_norm, const float *w_lm, float *logits,
+            int dim, int vocab, float eps);
+        bool gpu_ok = false;
+        if (g_brandon_use_gpu_matvec &&
+            s->weights.output->type == GGML_TYPE_F32 &&
+            s->weights.output_norm->type == GGML_TYPE_F32) {
+            if (wasm_wgpu_brandon_lm_head(s->x,
+                    norm_data(s->weights.output_norm),
+                    (const float *)s->weights.output->data,
+                    s->logits, (int)dim, (int)s->vocab_size, 1e-5f) == 0)
+                gpu_ok = true;
+        }
+        if (!gpu_ok) {
+            rmsnorm(s->x, s->x, norm_data(s->weights.output_norm), dim);
+            matvec(s->logits, s->weights.output, s->x, s->vocab_size, dim);
+        }
+#else
         rmsnorm(s->x, s->x, norm_data(s->weights.output_norm), dim);
         matvec(s->logits, s->weights.output, s->x, s->vocab_size, dim);
+#endif
 
         /* NaN/inf scrub */
         for (uint32_t i = 0; i < s->vocab_size; i++) {

@@ -1293,6 +1293,120 @@ int wasm_wgpu_softmax_h(int hin, int hout, int len)
     return js_wgpu_op_ok() ? 0 : -1;
 }
 
+/* ── Fused brandon LM head: rmsnorm(x, w_norm) -> matvec(W_lm, .) -> logits.
+ * Two GPU dispatches in one command buffer, single mapAsync at the end.
+ * Weight buffers are cached by C pointer so repeat calls only re-upload x. */
+EM_JS(int, js_wgpu_lm_head_kick, (const float *xin, const float *w_norm,
+                                   const float *w_lm, float *logits,
+                                   int dim, int vocab, int eps_bits,
+                                   int wn_id, int wlm_id), {
+    window.__gpuOpDone = false; window.__gpuOpOK = false;
+    if (!window.__gpuReady) { window.__gpuOpDone = true; return 0; }
+    (async function() {
+        try {
+            const dev = window.__gpuDevice;
+            const rmsP = window.__gpuRmsPipeline;
+            const mvP = window.__gpuPipeline;
+            if (!window.__gpuLMHCache) window.__gpuLMHCache = new Map();
+            const key = dim + 'x' + vocab + ':' + wn_id + ',' + wlm_id;
+            let s = window.__gpuLMHCache.get(key);
+            if (!s) {
+                if (window.__gpuLMHCache.size >= 4) {
+                    const k0 = window.__gpuLMHCache.keys().next().value;
+                    const old = window.__gpuLMHCache.get(k0);
+                    old.wnBuf.destroy(); old.wlmBuf.destroy();
+                    old.xBuf.destroy(); old.midBuf.destroy(); old.outBuf.destroy();
+                    old.dimsRms.destroy(); old.dimsMv.destroy(); old.rBuf.destroy();
+                    window.__gpuLMHCache.delete(k0);
+                }
+                s = {
+                    wnBuf: dev.createBuffer({ size: dim * 4,
+                        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST }),
+                    wlmBuf: dev.createBuffer({ size: vocab * dim * 4,
+                        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST }),
+                    xBuf: dev.createBuffer({ size: dim * 4,
+                        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST }),
+                    midBuf: dev.createBuffer({ size: dim * 4,
+                        usage: GPUBufferUsage.STORAGE }),
+                    outBuf: dev.createBuffer({ size: vocab * 4,
+                        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC }),
+                    dimsRms: dev.createBuffer({ size: 8,
+                        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST }),
+                    dimsMv: dev.createBuffer({ size: 8,
+                        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST }),
+                    rBuf: dev.createBuffer({ size: vocab * 4,
+                        usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST }),
+                    bgRms: null, bgMv: null,
+                    last_wn: 0, last_wlm: 0,
+                };
+                s.bgRms = dev.createBindGroup({
+                    layout: rmsP.getBindGroupLayout(0),
+                    entries: [
+                        { binding: 0, resource: { buffer: s.wnBuf } },
+                        { binding: 1, resource: { buffer: s.xBuf } },
+                        { binding: 2, resource: { buffer: s.midBuf } },
+                        { binding: 3, resource: { buffer: s.dimsRms } },
+                    ],
+                });
+                s.bgMv = dev.createBindGroup({
+                    layout: mvP.getBindGroupLayout(0),
+                    entries: [
+                        { binding: 0, resource: { buffer: s.wlmBuf } },
+                        { binding: 1, resource: { buffer: s.midBuf } },
+                        { binding: 2, resource: { buffer: s.outBuf } },
+                        { binding: 3, resource: { buffer: s.dimsMv } },
+                    ],
+                });
+                dev.queue.writeBuffer(s.dimsRms, 0, new Uint32Array([dim, eps_bits]));
+                dev.queue.writeBuffer(s.dimsMv, 0, new Uint32Array([vocab, dim]));
+                window.__gpuLMHCache.set(key, s);
+            }
+            /* Re-upload weights only when the C pointer changes (model reload). */
+            if (s.last_wn !== wn_id) {
+                dev.queue.writeBuffer(s.wnBuf, 0, HEAPU8.slice(w_norm, w_norm + dim*4));
+                s.last_wn = wn_id;
+            }
+            if (s.last_wlm !== wlm_id) {
+                dev.queue.writeBuffer(s.wlmBuf, 0,
+                    HEAPU8.slice(w_lm, w_lm + vocab*dim*4));
+                s.last_wlm = wlm_id;
+            }
+            /* x changes every token. */
+            dev.queue.writeBuffer(s.xBuf, 0, HEAPU8.slice(xin, xin + dim*4));
+            const enc = dev.createCommandEncoder();
+            const pass = enc.beginComputePass();
+            pass.setPipeline(rmsP); pass.setBindGroup(0, s.bgRms);
+            pass.dispatchWorkgroups(1);
+            pass.setPipeline(mvP);  pass.setBindGroup(0, s.bgMv);
+            pass.dispatchWorkgroups(Math.ceil(vocab / 64));
+            pass.end();
+            enc.copyBufferToBuffer(s.outBuf, 0, s.rBuf, 0, vocab * 4);
+            dev.queue.submit([enc.finish()]);
+            await s.rBuf.mapAsync(GPUMapMode.READ);
+            HEAPU8.set(new Uint8Array(s.rBuf.getMappedRange()), logits);
+            s.rBuf.unmap();
+            window.__gpuOpOK = true;
+        } catch (e) { window.__gpuError = String(e); }
+        window.__gpuOpDone = true;
+    })();
+    return 1;
+});
+
+int wasm_wgpu_brandon_lm_head(const float *x, const float *w_norm,
+                               const float *w_lm, float *logits,
+                               int dim, int vocab, float eps)
+{
+    if (!js_wgpu_ready()) return -1;
+    union { float f; uint32_t u; } u; u.f = eps;
+    /* Use the low 31 bits of the data pointer as a stable cache key. */
+    int wn_id  = (int)((uint64_t)w_norm & 0x7FFFFFFF);
+    int wlm_id = (int)((uint64_t)w_lm   & 0x7FFFFFFF);
+    js_wgpu_lm_head_kick(x, w_norm, w_lm, logits, dim, vocab, (int)u.u,
+                          wn_id, wlm_id);
+    while (!js_wgpu_op_done()) emscripten_sleep(1);
+    return js_wgpu_op_ok() ? 0 : -1;
+}
+
 /* Status accessors for the bottom-bar live update. Returns pointers
  * into kernel memory — JS reads them with UTF8ToString. */
 extern bool osfs2_is_mounted(void);
