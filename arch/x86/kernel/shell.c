@@ -4704,6 +4704,32 @@ void shell_exec(char *line)
         } else {
             sh_puts("Unknown subcommand. Run: samples (no args) for help.\n");
         }
+    } else if (strcmp(cmd, "demo") == 0) {
+        sh_puts_color("\n=== OsitoK 30-second demo ===\n", 0x00FF8800);
+        extern void shell_exec_pipeline(char *line);
+
+        struct { const char *title; char line[64]; } steps[] = {
+            { "1. Kernel state",      "info" },
+            { "2. Sample sources",    "ls /samples" },
+            { "3. Hello world",       "cat /samples/hello.c" },
+            { "4. Chat (LLM)",        "chat tell me a 1-line tip" },
+            { "5. Crypto",            "crypto sha256 osito-k" },
+            { "6. Filesystem dashboard", "df" },
+        };
+        for (int i = 0; i < (int)(sizeof(steps)/sizeof(steps[0])); i++) {
+            sh_puts_color("\n──── ", 0x00FFD93D);
+            sh_puts(steps[i].title);
+            sh_puts_color(" ────\n$ ", 0x00FFD93D);
+            sh_puts(steps[i].line);
+            sh_puts("\n");
+            char copy[64];
+            int n = 0;
+            while (n < 63 && steps[i].line[n]) { copy[n] = steps[i].line[n]; n++; }
+            copy[n] = '\0';
+            shell_exec_pipeline(copy);
+        }
+        sh_puts_color("\n=== demo done — try `tutorial` for the guided tour ===\n\n",
+                       0x00FF8800);
     } else if (strcmp(cmd, "tutorial") == 0) {
         sh_puts_color("\n=== OsitoK quick tour ===\n", 0x00FF8800);
         sh_puts("\n1. Run an LLM right here:\n");
