@@ -4952,6 +4952,68 @@ void shell_exec(char *line)
         sh_putdec((t1 - t0) * 10);  /* native ticks ~10ms */
         sh_puts(" ms (approx)\n");
 #endif
+    } else if (strcmp(cmd, "benchmark") == 0) {
+        sh_puts_color("\n=== OsitoK benchmark ===\n", 0x00FF8800);
+        extern uint64_t idt_get_ticks(void);
+
+        /* SHA-256 throughput: 1 MB hashing */
+        sh_puts("[1/3] sha256 throughput: ");
+        extern void sha256(const void *, uint32_t, uint8_t[32]);
+        static uint8_t blob[1024 * 1024];
+        for (int i = 0; i < (int)sizeof(blob); i++) blob[i] = (uint8_t)(i & 0xFF);
+        uint8_t digest[32];
+        uint64_t t0 = idt_get_ticks();
+        sha256(blob, sizeof(blob), digest);
+        uint64_t t1 = idt_get_ticks();
+        uint64_t ms = (t1 - t0);
+#ifndef __EMSCRIPTEN__
+        ms *= 10;  /* native ticks to ms approx */
+#endif
+        if (ms == 0) ms = 1;
+        sh_putdec(1024 / ms);  /* 1 MB / ms ≈ MB/s */
+        sh_puts(" MB/s ("); sh_putdec(ms); sh_puts(" ms / 1 MB)\n");
+
+        /* FS write throughput: 256 KB → /tmp */
+        sh_puts("[2/3] osfs2 write: ");
+        extern void *osfs2_create(const char *, uint64_t);
+        extern void *osfs2_find(const char *);
+        extern int   osfs2_write(void *, uint64_t, const void *, uint64_t);
+        void *bench_file = osfs2_find(".bench");
+        if (!bench_file) bench_file = osfs2_create(".bench", 256 * 1024);
+        if (bench_file) {
+            uint64_t t2 = idt_get_ticks();
+            osfs2_write(bench_file, 0, blob, 256 * 1024);
+            uint64_t t3 = idt_get_ticks();
+            uint64_t ms2 = (t3 - t2);
+#ifndef __EMSCRIPTEN__
+            ms2 *= 10;
+#endif
+            if (ms2 == 0) ms2 = 1;
+            sh_putdec(256 / ms2); sh_puts(" MB/s (");
+            sh_putdec(ms2); sh_puts(" ms / 256 KB)\n");
+        } else {
+            sh_puts_color("FAIL\n", 0x00FF0000);
+        }
+
+        /* Llama tokens/sec */
+        sh_puts("[3/3] llama_chat: ");
+        if (prompt_llama) {
+            uint64_t t4 = idt_get_ticks();
+            int g = llama_chat(prompt_llama, "Once upon a time", 32, NULL, NULL);
+            uint64_t t5 = idt_get_ticks();
+            uint64_t ms3 = (t5 - t4);
+#ifndef __EMSCRIPTEN__
+            ms3 *= 10;
+#endif
+            if (g > 0 && ms3 > 0) {
+                sh_putdec((uint64_t)g * 1000 / ms3);
+                sh_puts(" tok/s (");
+                sh_putdec(ms3 / g); sh_puts(" ms/tok, ");
+                sh_putdec((uint64_t)g); sh_puts(" tokens)\n");
+            } else sh_puts_color("FAIL\n", 0x00FF0000);
+        } else sh_puts_color("SKIP (no model)\n", 0x00888888);
+
+        sh_puts_color("=== done ===\n\n", 0x00FF8800);
     } else if (strcmp(cmd, "bench") == 0) {
         /* Inference micro-bench: prefill a known prompt, time generation. */
         if (!prompt_llama) { sh_puts("No model loaded.\n"); return; }
