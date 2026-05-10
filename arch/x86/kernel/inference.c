@@ -118,9 +118,35 @@ static void embed_token(float *dst, gguf_tensor_t *embd, uint32_t token, uint32_
 
 /* ── Matvec dispatch by tensor type ──────────────────────────── */
 
+/* GPU matvec routing: kept as a non-default toggle for benchmarking
+ * only. Per-call wasm_wgpu_matvec costs ~1 ms round-trip on mapAsync,
+ * so for brandon-tiny's small shapes (~16K elems / matvec) every
+ * dispatch is a net loss. The handle-based path (wasm_wgpu_matvec_h)
+ * is the holistic answer — see brandon_forward_one_gpu (todo). */
+int g_brandon_use_gpu_matvec = 0;
+
+#ifdef __EMSCRIPTEN__
+extern int wasm_wgpu_init(void);
+extern int wasm_wgpu_matvec(const float *w, const float *vin, float *out,
+                             int rows, int cols);
+#endif
+
 static void matvec(float *out, gguf_tensor_t *tensor,
                    const float *input, uint32_t rows, uint32_t cols)
 {
+#ifdef __EMSCRIPTEN__
+    /* Only fires under bdebug gpu 1 + a giant shape. The break-even
+     * threshold is so high (~100k elements) that brandon-tiny only
+     * triggers it on the LM head, and even there round-trip dominates.
+     * Useful as a knob to time the real GPU compute against CPU. */
+    if (g_brandon_use_gpu_matvec && tensor->type == GGML_TYPE_F32 &&
+        (uint64_t)rows * cols >= 100000 && wasm_wgpu_init()) {
+        if (wasm_wgpu_matvec((const float *)tensor->data, input, out,
+                              (int)rows, (int)cols) == 0) {
+            return;
+        }
+    }
+#endif
     switch (tensor->type) {
     case GGML_TYPE_Q4_0:
         /* Go through the boot-selected dispatch table so any future

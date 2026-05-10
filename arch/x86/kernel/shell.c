@@ -5593,7 +5593,13 @@ void shell_exec(char *line)
             else if (strcmp(argv[1], "logits") == 0) brandon_set_debug_logits(v);
             else if (strcmp(argv[1], "all") == 0)   { brandon_set_features(1,1,1); brandon_set_debug_logits(0); }
             else if (strcmp(argv[1], "none") == 0)  { brandon_set_features(0,0,0); brandon_set_debug_logits(0); }
-            sh_puts("bdebug applied\n");
+            else if (strcmp(argv[1], "gpu") == 0) {
+                extern int g_brandon_use_gpu_matvec;
+                g_brandon_use_gpu_matvec = v;
+                sh_puts(v ? "[brandon] GPU matvec ENABLED\n"
+                          : "[brandon] GPU matvec disabled\n");
+            }
+            else sh_puts("bdebug applied\n");
         }
     } else if (strcmp(cmd, "temp") == 0) {
         cmd_temp(argc, argv);
