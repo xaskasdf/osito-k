@@ -1572,6 +1572,35 @@ int wasm_wgpu_qkv(const float *x, const float *wq, const float *wk, const float 
     return js_wgpu_op_ok() ? 0 : -1;
 }
 
+/* ── Persistent KV cache buffer pool ─────────────────────────────
+ * For Phase-4 fused attention: each layer reserves a GPU storage
+ * buffer for its K and V cache, sized once for max_seq × kv_dim.
+ * Pool lookup by layer index — caller supplies a stable layer id.
+ * Returns 0 on success, sets per-layer handle ids out_hk/out_hv. */
+EM_JS(int, js_wgpu_kvcache_alloc, (int layer, int max_seq, int kv_dim), {
+    if (!window.__gpuReady) return -1;
+    if (!window.__gpuKVPool) window.__gpuKVPool = {};
+    var slot = window.__gpuKVPool[layer];
+    if (slot && slot.max_seq === max_seq && slot.kv_dim === kv_dim) return 0;
+    if (slot) { slot.kBuf.destroy(); slot.vBuf.destroy(); }
+    var dev = window.__gpuDevice;
+    var bytes = max_seq * kv_dim * 4;
+    window.__gpuKVPool[layer] = {
+        max_seq: max_seq, kv_dim: kv_dim,
+        kBuf: dev.createBuffer({ size: bytes,
+            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC }),
+        vBuf: dev.createBuffer({ size: bytes,
+            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC }),
+    };
+    return 0;
+});
+
+int wasm_wgpu_kvcache_alloc(int layer, int max_seq, int kv_dim)
+{
+    if (!js_wgpu_ready()) return -1;
+    return js_wgpu_kvcache_alloc(layer, max_seq, kv_dim);
+}
+
 int wasm_wgpu_brandon_lm_head(const float *x, const float *w_norm,
                                const float *w_lm, float *logits,
                                int dim, int vocab, float eps)
