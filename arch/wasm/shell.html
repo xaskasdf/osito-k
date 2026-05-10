@@ -662,18 +662,98 @@
                         port.postMessage({ id: 'compiled', error: err.message });
                     }
                 } else if (e.data.id === 'runWasi') {
-                    /* Instantiate raw wasm bytes and run via API.run (uses
-                     * the App class internally — App is closure-private). */
+                    /* Instantiate with a minimal wasi_snapshot_preview1 shim.
+                     * api.run only knows wasi_unstable so it fails for
+                     * preview1-imported modules. We provide the syscalls the
+                     * pkg catalog programs actually use. */
                     try {
-                        await api.ready;
+                        const writeOut = (s) => port.postMessage({ id: 'write', data: s });
+                        const argv = [(e.data.name || 'app')].concat(e.data.argv || []);
+                        const wasiPreview1 = (function() {
+                            let mem = null;
+                            const td = new TextDecoder('utf-8');
+                            const heap = () => new DataView(mem.buffer);
+                            const heapU8 = () => new Uint8Array(mem.buffer);
+                            const writeStr = (s) => writeOut(s);
+                            return {
+                                set memory(m) { mem = m; },
+                                fd_write(fd, iovs, iovs_len, nwritten) {
+                                    let total = 0; let s = '';
+                                    for (let i = 0; i < iovs_len; i++) {
+                                        const ptr = heap().getUint32(iovs + i*8, true);
+                                        const len = heap().getUint32(iovs + i*8 + 4, true);
+                                        s += td.decode(heapU8().subarray(ptr, ptr + len));
+                                        total += len;
+                                    }
+                                    if (fd === 1 || fd === 2) writeStr(s);
+                                    heap().setUint32(nwritten, total, true);
+                                    return 0;
+                                },
+                                fd_read(fd, iovs, iovs_len, nread) {
+                                    /* No stdin in this runtime — return EOF. */
+                                    heap().setUint32(nread, 0, true);
+                                    return 0;
+                                },
+                                fd_close() { return 0; },
+                                fd_seek() { return 0; },
+                                fd_fdstat_get() { return 0; },
+                                args_sizes_get(argc_ptr, argv_buf_size_ptr) {
+                                    let total = 0;
+                                    for (const a of argv) total += a.length + 1;
+                                    heap().setUint32(argc_ptr, argv.length, true);
+                                    heap().setUint32(argv_buf_size_ptr, total, true);
+                                    return 0;
+                                },
+                                args_get(argv_ptrs, argv_buf) {
+                                    const enc = new TextEncoder();
+                                    let off = argv_buf;
+                                    for (let i = 0; i < argv.length; i++) {
+                                        heap().setUint32(argv_ptrs + i*4, off, true);
+                                        const bytes = enc.encode(argv[i]);
+                                        heapU8().set(bytes, off);
+                                        heap().setUint8(off + bytes.length, 0);
+                                        off += bytes.length + 1;
+                                    }
+                                    return 0;
+                                },
+                                environ_sizes_get(c, b) {
+                                    heap().setUint32(c, 0, true);
+                                    heap().setUint32(b, 0, true);
+                                    return 0;
+                                },
+                                environ_get() { return 0; },
+                                proc_exit(code) {
+                                    /* Throw to break out of the start function. */
+                                    const err = new Error('wasi proc_exit');
+                                    err.code = code;
+                                    throw err;
+                                },
+                                clock_time_get(id, prec, ptr) {
+                                    const now = BigInt(Date.now()) * 1000000n;
+                                    new BigUint64Array(mem.buffer, ptr, 1)[0] = now;
+                                    return 0;
+                                },
+                                random_get(buf, n) {
+                                    crypto.getRandomValues(heapU8().subarray(buf, buf + n));
+                                    return 0;
+                                }
+                            };
+                        })();
                         const mod = await WebAssembly.compile(e.data.bytes);
-                        await api.run(mod, e.data.name || 'app');
-                    } catch (err) {
-                        if (err && err.code !== undefined) {
-                            port.postMessage({ id: 'write', data: '\\n[exit ' + err.code + ']\\n' });
-                        } else {
-                            port.postMessage({ id: 'write', data: '\\n[wasi] ' + (err.message || err) + '\\n' });
+                        const inst = await WebAssembly.instantiate(mod, {
+                            wasi_snapshot_preview1: wasiPreview1
+                        });
+                        wasiPreview1.memory = inst.exports.memory;
+                        try {
+                            if (inst.exports._start) inst.exports._start();
+                        } catch (err) {
+                            if (err && err.code !== undefined) {
+                                if (err.code !== 0)
+                                    writeOut('\\n[exit ' + err.code + ']\\n');
+                            } else throw err;
                         }
+                    } catch (err) {
+                        port.postMessage({ id: 'write', data: '\\n[wasi] ' + (err.message || err) + '\\n' });
                     }
                     port.postMessage({ id: 'done' });
                 }
@@ -748,14 +828,15 @@
                 });
             },
             // Run a pre-compiled wasm module via WASI shim. bytes: ArrayBuffer
-            runWasi: async function(bytes, name) {
+            runWasi: async function(bytes, name, argv) {
                 await ensureWorker();
                 pendingWrite = '';
                 return new Promise((resolve) => {
                     resolveCompile = resolve;
                     /* Note: bytes will be transferred (consumed) */
                     const transfer = bytes instanceof ArrayBuffer ? [bytes] : [];
-                    port.postMessage({ id: 'runWasi', bytes, name: name || 'app' }, transfer);
+                    port.postMessage({ id: 'runWasi', bytes, name: name || 'app',
+                                       argv: argv || [] }, transfer);
                 });
             }
         };

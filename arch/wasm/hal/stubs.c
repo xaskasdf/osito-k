@@ -115,7 +115,8 @@ static void extract_to_memfs(const char *osfs_name, const char *memfs_path)
 
 /* Forward decls for helpers used by proc_exec; bodies are further down. */
 static void cc_drain_until_done(void);
-extern void js_cc_run_wasi(const uint8_t *src, int size, const char *name);
+extern void js_cc_run_wasi(const uint8_t *src, int size, const char *name,
+                            const char *argv_joined);
 
 /* ── proc_exec: load and run WASM side modules via dlopen ────── */
 
@@ -216,7 +217,17 @@ int proc_exec(const char *filename, int argc, const char **argv)
         serial_puts("[EXEC] WASI module ");
         serial_puts(filename);
         serial_puts(" via clang.wasm runtime\n");
-        js_cc_run_wasi((const uint8_t *)buf, (int)size, filename);
+        /* Pack argv[1..argc-1] into a NUL-separated string for the worker. */
+        char joined[512]; joined[0] = 0; int jp = 0;
+        for (int i = 1; i < argc && jp < (int)sizeof(joined) - 32; i++) {
+            int al = strlen(argv[i]);
+            if (al > 100) al = 100;
+            memcpy(joined + jp, argv[i], al);
+            joined[jp + al] = '\x1f';   /* unit separator */
+            jp += al + 1;
+        }
+        if (jp > 0) joined[jp - 1] = 0; else joined[0] = 0;
+        js_cc_run_wasi((const uint8_t *)buf, (int)size, filename, joined);
         free(buf);
         cc_drain_until_done();
         serial_puts("\n");
@@ -1938,13 +1949,17 @@ EM_JS(void, js_cc_compiled_get, (uint8_t *dst), {
 
 /* Run a pre-compiled wasm via WASI shim. Output streams via the same
  * __ccPending mechanism as compileLinkRun. */
-EM_JS(void, js_cc_run_wasi, (const uint8_t *src, int size, const char *name), {
+EM_JS(void, js_cc_run_wasi, (const uint8_t *src, int size, const char *name,
+                              const char *argv_joined), {
     var bytes = HEAPU8.slice(src, src + size).buffer;  /* copy to standalone ArrayBuffer */
     var nm = UTF8ToString(name);
+    var joined = UTF8ToString(argv_joined);
+    /* Split on \x1f (unit separator); empty string -> []. */
+    var argv = (joined && joined.length) ? joined.split('\x1f') : [];
     window.__ccPending = '';
     window.__ccDone = false;
     window.__cc.onWrite = function(chunk) { window.__ccPending += chunk; };
-    window.__cc.runWasi(bytes, nm).then(function() { window.__ccDone = true; });
+    window.__cc.runWasi(bytes, nm, argv).then(function() { window.__ccDone = true; });
 });
 
 /* Drain any pending output text into a kernel buffer + sleep until done.
