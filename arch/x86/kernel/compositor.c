@@ -1017,6 +1017,13 @@ void wasm_compositor_frame(void)
         comp_wheel_accum += wheel;
     }
     process_mouse_input();
+    /* Resync to the real current button state so prev_buttons can
+     * detect the next press. The drain's btn_pressed_accum or-back
+     * leaves comp_button_state pinned at "pressed" even when the
+     * physical button has already been released within the same
+     * frame, breaking subsequent click detection. */
+    extern uint8_t input_get_buttons(void);
+    comp_button_state = input_get_buttons();
     compositor_render_frame();
     /* The native compositor_thread's blit step never runs in WASM; the
      * rAF wrapper has to invoke display_flip itself or pixels stay in
