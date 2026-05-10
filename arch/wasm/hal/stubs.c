@@ -1171,6 +1171,128 @@ int wasm_wgpu_matvec_h(int hw, int hin, int hout, int rows, int cols)
     return js_wgpu_op_ok() ? 0 : -1;
 }
 
+EM_JS(int, js_wgpu_rmsnorm_h_kick, (int hw, int hin, int hout,
+                                     int dim, int eps_bits), {
+    window.__gpuOpDone = false; window.__gpuOpOK = false;
+    if (!window.__gpuReady) { window.__gpuOpDone = true; return 0; }
+    (async function() {
+        try {
+            const dev = window.__gpuDevice;
+            const pipe = window.__gpuRmsPipeline;
+            if (!window.__gpuRmsHCache) window.__gpuRmsHCache = new Map();
+            const key = dim + ':' + hw + ',' + hin + ',' + hout;
+            let slot = window.__gpuRmsHCache.get(key);
+            if (!slot) {
+                if (window.__gpuRmsHCache.size >= 64) {
+                    const k0 = window.__gpuRmsHCache.keys().next().value;
+                    const old = window.__gpuRmsHCache.get(k0);
+                    if (old.dBuf) old.dBuf.destroy();
+                    window.__gpuRmsHCache.delete(k0);
+                }
+                const w = window.__gpuHandles[hw];
+                const i = window.__gpuHandles[hin];
+                const o = window.__gpuHandles[hout];
+                if (!w || !i || !o) {
+                    window.__gpuOpOK = false; window.__gpuOpDone = true; return;
+                }
+                const dBuf = dev.createBuffer({ size: 8,
+                    usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+                const bg = dev.createBindGroup({
+                    layout: pipe.getBindGroupLayout(0),
+                    entries: [
+                        { binding: 0, resource: { buffer: w.buf } },
+                        { binding: 1, resource: { buffer: i.buf } },
+                        { binding: 2, resource: { buffer: o.buf } },
+                        { binding: 3, resource: { buffer: dBuf } },
+                    ],
+                });
+                slot = { bg, dBuf, last_eps: 0 };
+                window.__gpuRmsHCache.set(key, slot);
+            }
+            /* Re-write dims uniform if eps changed (rare). */
+            if (slot.last_eps !== eps_bits) {
+                dev.queue.writeBuffer(slot.dBuf, 0, new Uint32Array([dim, eps_bits]));
+                slot.last_eps = eps_bits;
+            }
+            const enc = dev.createCommandEncoder();
+            const pass = enc.beginComputePass();
+            pass.setPipeline(pipe); pass.setBindGroup(0, slot.bg);
+            pass.dispatchWorkgroups(1);
+            pass.end();
+            dev.queue.submit([enc.finish()]);
+            window.__gpuOpOK = true;
+        } catch (e) { window.__gpuError = String(e); }
+        window.__gpuOpDone = true;
+    })();
+    return 1;
+});
+
+int wasm_wgpu_rmsnorm_h(int hw, int hin, int hout, int dim, float eps)
+{
+    if (!js_wgpu_ready()) return -1;
+    union { float f; uint32_t u; } u; u.f = eps;
+    js_wgpu_rmsnorm_h_kick(hw, hin, hout, dim, (int)u.u);
+    while (!js_wgpu_op_done()) emscripten_sleep(1);
+    return js_wgpu_op_ok() ? 0 : -1;
+}
+
+EM_JS(int, js_wgpu_softmax_h_kick, (int hin, int hout, int len), {
+    window.__gpuOpDone = false; window.__gpuOpOK = false;
+    if (!window.__gpuReady) { window.__gpuOpDone = true; return 0; }
+    (async function() {
+        try {
+            const dev = window.__gpuDevice;
+            const pipe = window.__gpuSoftPipeline;
+            if (!window.__gpuSoftHCache) window.__gpuSoftHCache = new Map();
+            const key = len + ':' + hin + ',' + hout;
+            let slot = window.__gpuSoftHCache.get(key);
+            if (!slot) {
+                if (window.__gpuSoftHCache.size >= 64) {
+                    const k0 = window.__gpuSoftHCache.keys().next().value;
+                    const old = window.__gpuSoftHCache.get(k0);
+                    if (old.dBuf) old.dBuf.destroy();
+                    window.__gpuSoftHCache.delete(k0);
+                }
+                const i = window.__gpuHandles[hin];
+                const o = window.__gpuHandles[hout];
+                if (!i || !o) {
+                    window.__gpuOpOK = false; window.__gpuOpDone = true; return;
+                }
+                const dBuf = dev.createBuffer({ size: 4,
+                    usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+                dev.queue.writeBuffer(dBuf, 0, new Uint32Array([len]));
+                const bg = dev.createBindGroup({
+                    layout: pipe.getBindGroupLayout(0),
+                    entries: [
+                        { binding: 0, resource: { buffer: i.buf } },
+                        { binding: 1, resource: { buffer: o.buf } },
+                        { binding: 2, resource: { buffer: dBuf } },
+                    ],
+                });
+                slot = { bg, dBuf };
+                window.__gpuSoftHCache.set(key, slot);
+            }
+            const enc = dev.createCommandEncoder();
+            const pass = enc.beginComputePass();
+            pass.setPipeline(pipe); pass.setBindGroup(0, slot.bg);
+            pass.dispatchWorkgroups(1);
+            pass.end();
+            dev.queue.submit([enc.finish()]);
+            window.__gpuOpOK = true;
+        } catch (e) { window.__gpuError = String(e); }
+        window.__gpuOpDone = true;
+    })();
+    return 1;
+});
+
+int wasm_wgpu_softmax_h(int hin, int hout, int len)
+{
+    if (!js_wgpu_ready()) return -1;
+    js_wgpu_softmax_h_kick(hin, hout, len);
+    while (!js_wgpu_op_done()) emscripten_sleep(1);
+    return js_wgpu_op_ok() ? 0 : -1;
+}
+
 /* Status accessors for the bottom-bar live update. Returns pointers
  * into kernel memory — JS reads them with UTF8ToString. */
 extern bool osfs2_is_mounted(void);
