@@ -1980,18 +1980,23 @@ extern void osito_kernel_poll(void);
 
 static void cc_drain_until_done(void)
 {
-    extern void serial_puts(const char *);
+    /* Route through sh_puts so pipe capture (sh_redir_fn) sees the
+     * output. Falls back to serial_puts inside sh_puts when no
+     * redirect is active. Without this, `pkg run X | pkg run Y`
+     * loses stage 1's stdout because cc_drain wrote straight to the
+     * terminal. */
+    extern void sh_puts(const char *);
     char buf[1024];
     while (!js_cc_done()) {
         osito_kernel_poll();
         int n = js_cc_drain(buf, (int)sizeof(buf) - 1);
-        if (n > 0) { buf[n] = 0; serial_puts(buf); }
+        if (n > 0) { buf[n] = 0; sh_puts(buf); }
         else       { emscripten_sleep(50); }
     }
     int n;
     while ((n = js_cc_drain(buf, (int)sizeof(buf) - 1)) > 0) {
         buf[n] = 0;
-        serial_puts(buf);
+        sh_puts(buf);
     }
 }
 

@@ -478,7 +478,7 @@ void (*sh_redir_fn)(const char *s, size_t len);
 const char *sh_stdin_buf;
 uint32_t    sh_stdin_len;
 
-static void sh_puts(const char *s)
+void sh_puts(const char *s)
 {
     if (sh_redir_fn) {
         size_t len = 0;

@@ -49,6 +49,12 @@
       "url": "yes.wasm",
       "desc": "print 'y\\n' forever until SIGPIPE (POSIX yes)",
       "size": 188
+    },
+    {
+      "name": "grep",
+      "url": "grep.wasm",
+      "desc": "filter stdin lines containing argv[1] substring (no regex)",
+      "size": 625
     }
   ]
 }
