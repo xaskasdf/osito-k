@@ -4383,6 +4383,55 @@ void shell_exec(char *line)
             sh_puts("\n  shell:  121+ builtins (chat/git/cc/mount-fs/ws/...)");
         }
         sh_puts("\n");
+    } else if (strcmp(cmd, "du") == 0) {
+        if (!osfs2_is_mounted()) { sh_puts("No filesystem mounted\n"); return; }
+        extern uint32_t osfs2_file_count(void);
+        extern void *osfs2_file_at(int index);
+        extern const char *osfs2_file_name(void *file);
+        extern uint64_t osfs2_file_size(void *file);
+        uint32_t total = osfs2_file_count();
+        uint64_t bytes_total = 0;
+        uint32_t shown = 0;
+        for (uint32_t i = 0; i < 4096 && shown < total; i++) {
+            void *f = osfs2_file_at(i);
+            if (!f) continue;
+            uint64_t sz = osfs2_file_size(f);
+            sh_putdec_padded(sz, 11); sh_puts("  ");
+            sh_puts(osfs2_file_name(f)); sh_puts("\n");
+            bytes_total += sz;
+            shown++;
+        }
+        sh_puts("       ───\n");
+        sh_putdec_padded(bytes_total, 11); sh_puts("  total ");
+        if (bytes_total > 1024 * 1024) {
+            sh_puts("("); sh_putdec(bytes_total / (1024 * 1024)); sh_puts(" MB)");
+        } else if (bytes_total > 1024) {
+            sh_puts("("); sh_putdec(bytes_total / 1024); sh_puts(" KB)");
+        }
+        sh_puts("\n");
+    } else if (strcmp(cmd, "df") == 0) {
+        if (!osfs2_is_mounted()) { sh_puts("No filesystem mounted\n"); return; }
+        extern uint32_t osfs2_file_count(void);
+        extern uint32_t osfs2_free_blocks(void);
+        extern uint32_t osfs2_get_block_size(void);
+        extern const char *osfs2_label(void);
+        uint32_t bs    = osfs2_get_block_size();
+        uint32_t freeb = osfs2_free_blocks();
+        sh_puts("Filesystem        Files  Free blocks  Free MB\n");
+        sh_puts("/  \""); sh_puts(osfs2_label()); sh_puts("\"   ");
+        sh_putdec_padded((uint64_t)osfs2_file_count(), 5); sh_puts("  ");
+        sh_putdec_padded((uint64_t)freeb, 11); sh_puts("  ");
+        sh_putdec((uint64_t)freeb * (uint64_t)bs / (1024 * 1024));
+        sh_puts(" MB (block size ");
+        sh_putdec((uint64_t)bs / 1024); sh_puts(" KB)\n");
+#ifdef __EMSCRIPTEN__
+        for (int i = 0; i < AUX_FS_COUNT; i++) {
+            if (g_aux_mounts[i]) {
+                sh_puts("/"); sh_puts(g_aux_mounts[i]->name);
+                sh_puts("/  (read-only auxiliary mount)\n");
+            }
+        }
+#endif
     } else if (strcmp(cmd, "tutorial") == 0) {
         sh_puts_color("\n=== OsitoK quick tour ===\n", 0x00FF8800);
         sh_puts("\n1. Run an LLM right here:\n");
