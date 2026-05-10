@@ -2241,7 +2241,27 @@ static void cmd_chat(int argc, char *argv[])
 
     sh_puts_color("\nLlama: ", 0x00FF8800);
 
-    int r = llama_chat(prompt_llama, prompt, 128, chat_token_cb, NULL);
+    /* Detect Llama 3 by vocab size + arch and wrap with its chat template.
+     * Llama 3 vocab is 128256; brandon-tiny and TinyStories are smaller. */
+    extern int llama_state_vocab(void *s);
+    char wrapped[2048];
+    const char *send;
+    if (llama_state_vocab(prompt_llama) >= 128000) {
+        /* Llama 3 chat template — instruct models behave best with it. */
+        int n = 0;
+        const char *prefix =
+            "<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\n";
+        const char *suffix =
+            "<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n";
+        for (const char *p = prefix; *p && n < (int)sizeof(wrapped)-1; p++) wrapped[n++] = *p;
+        for (const char *p = prompt;  *p && n < (int)sizeof(wrapped)-1; p++) wrapped[n++] = *p;
+        for (const char *p = suffix;  *p && n < (int)sizeof(wrapped)-1; p++) wrapped[n++] = *p;
+        wrapped[n] = 0;
+        send = wrapped;
+    } else {
+        send = prompt;
+    }
+    int r = llama_chat(prompt_llama, send, 128, chat_token_cb, NULL);
     if (r < 0) {
         sh_puts_color("[error]\n", 0x00FF0000);
     } else {
