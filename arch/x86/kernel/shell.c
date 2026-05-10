@@ -4969,6 +4969,91 @@ void shell_exec(char *line)
 #else
         sh_puts("precache: WASM-only\n");
 #endif
+    } else if (strcmp(cmd, "pkg") == 0) {
+#ifdef __EMSCRIPTEN__
+        /* Lightweight package manager for the WASM kernel. The catalog
+         * is a JSON file at PKG_BASE/index.json listing { name, url,
+         * desc }. Subcommands:
+         *   pkg list           — fetch + print catalog
+         *   pkg install <name> — fetch package and write to /pkg/<name>
+         *   pkg search <q>     — substring filter on names + descs */
+        extern uint8_t *wasm_url_fetch(const char *url, int *out_size);
+        extern void *osfs2_create(const char *name, uint64_t size);
+        extern int   osfs2_write(void *file, uint64_t offset, const void *buf, uint64_t len);
+        const char *PKG_BASE = "https://wasm.naranjositos.tech/pkg";
+        char *sub = strtok(NULL, " ");
+        if (!sub || strcmp(sub, "list") == 0 || strcmp(sub, "search") == 0) {
+            const char *q = (sub && strcmp(sub, "search") == 0) ? strtok(NULL, " ") : NULL;
+            char url[256]; strcpy(url, PKG_BASE); strcat(url, "/index.json");
+            int sz = 0;
+            uint8_t *idx = wasm_url_fetch(url, &sz);
+            if (!idx) { sh_puts("pkg: catalog fetch failed (CORS or 404)\n"); }
+            else {
+                /* Tiny JSON walker: find each {"name":"X","url":"Y","desc":"Z"}.
+                 * Not a real parser — just scans for keys. Catalog is trusted. */
+                char *p = (char *)idx;
+                int matches = 0;
+                while ((p = strstr(p, "\"name\""))) {
+                    char *nb = strchr(p + 6, '"'); if (!nb) break;
+                    char *ne = strchr(nb + 1, '"'); if (!ne) break;
+                    char name[64]; int nl = ne-nb-1; if (nl > 63) nl = 63;
+                    memcpy(name, nb+1, nl); name[nl] = 0;
+                    char *db = strstr(ne, "\"desc\""); char desc[128] = "";
+                    if (db) {
+                        char *dq = strchr(db + 6, '"');
+                        if (dq) {
+                            char *de = strchr(dq + 1, '"');
+                            if (de) { int dl = de-dq-1; if (dl>127) dl=127; memcpy(desc, dq+1, dl); desc[dl]=0; }
+                        }
+                    }
+                    int show = 1;
+                    if (q && q[0]) show = (strstr(name, q) || strstr(desc, q)) ? 1 : 0;
+                    if (show) {
+                        sh_puts("  "); sh_puts(name);
+                        if (desc[0]) { sh_puts(" — "); sh_puts(desc); }
+                        sh_puts("\n");
+                        matches++;
+                    }
+                    p = ne + 1;
+                }
+                if (matches == 0) sh_puts("pkg: no matches\n");
+                extern void free(void *); free(idx);
+            }
+        } else if (strcmp(sub, "install") == 0) {
+            char *name = strtok(NULL, " ");
+            if (!name) { sh_puts("usage: pkg install <name>\n"); }
+            else {
+                char url[256]; strcpy(url, PKG_BASE); strcat(url, "/"); strcat(url, name); strcat(url, ".wasm");
+                sh_puts("[pkg] fetching "); sh_puts(url); sh_puts("\n");
+                int sz = 0;
+                uint8_t *blob = wasm_url_fetch(url, &sz);
+                if (!blob) { sh_puts("pkg: fetch failed\n"); }
+                else {
+                    char fname[80]; { int n = strlen(name); if (n>60) n=60;
+                        memcpy(fname, "/pkg/", 5); memcpy(fname+5, name, n);
+                        memcpy(fname+5+n, ".wasm", 6); }
+                    /* Strip leading / since osfs2 is flat. */
+                    void *f = osfs2_create(fname + 1, sz);
+                    if (!f) { sh_puts("pkg: osfs2_create failed\n"); }
+                    else {
+                        if (osfs2_write(f, 0, blob, sz) < 0)
+                            sh_puts("pkg: osfs2_write failed\n");
+                        else {
+                            sh_puts("[pkg] installed "); sh_puts(name);
+                            sh_puts(" ("); sh_putdec(sz); sh_puts(" bytes) at ");
+                            sh_puts(fname); sh_puts("\n");
+                            sh_puts("      run with: exec "); sh_puts(fname+1); sh_puts("\n");
+                        }
+                    }
+                    extern void free(void *); free(blob);
+                }
+            }
+        } else {
+            sh_puts("usage: pkg list | pkg search <q> | pkg install <name>\n");
+        }
+#else
+        sh_puts("pkg: WASM-only\n");
+#endif
     } else if (strcmp(cmd, "reload") == 0) {
 #ifdef __EMSCRIPTEN__
         sh_puts("[reload] reloading page...\n");

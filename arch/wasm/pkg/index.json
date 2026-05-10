@@ -1,0 +1,24 @@
+{
+  "version": 1,
+  "updated": "2026-05-10",
+  "packages": [
+    {
+      "name": "hello",
+      "url": "hello.wasm",
+      "desc": "minimal WASI hello-world (writes \"hello, osito\\n\" to stdout)",
+      "size": 198
+    },
+    {
+      "name": "fib",
+      "url": "fib.wasm",
+      "desc": "iterative fibonacci(30) demo, prints result",
+      "size": 312
+    },
+    {
+      "name": "echo",
+      "url": "echo.wasm",
+      "desc": "reads argv and prints each arg on its own line",
+      "size": 256
+    }
+  ]
+}

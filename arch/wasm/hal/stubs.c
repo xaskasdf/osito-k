@@ -2728,6 +2728,23 @@ int aux_disk_fetch_slot(int slot, const char *url)
     return 0;
 }
 
+/* Generic URL → malloc'd buffer. Caller frees. Reuses the aux fetch
+ * Promise plumbing so we don't double-define JS bridges. Returns NULL
+ * on error; sets *out_size on success. */
+uint8_t *wasm_url_fetch(const char *url, int *out_size)
+{
+    js_aux_fetch_kick(url);
+    while (!js_aux_fetch_done()) emscripten_sleep(20);
+    int sz = js_aux_fetch_size();
+    if (sz <= 0) return NULL;
+    extern void *malloc(size_t);
+    uint8_t *buf = (uint8_t *)malloc(sz);
+    if (!buf) return NULL;
+    js_aux_fetch_copy(buf, sz);
+    if (out_size) *out_size = sz;
+    return buf;
+}
+
 /* Backwards-compat: fetch into slot 0. */
 int aux_disk_fetch(const char *url) {
     /* Ensure slot 0 is allocated/named for legacy callers. */
