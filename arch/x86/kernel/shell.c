@@ -4582,6 +4582,11 @@ void shell_exec(char *line)
     } else if (strcmp(cmd, "info") == 0) {
         sh_puts_color("\n── OsitoK kernel state ─────────────────────\n", 0x00FF8800);
 
+#ifdef OSITO_GIT_REV
+        sh_puts("build:    "); sh_puts(OSITO_GIT_REV);
+        sh_puts("  ("); sh_puts(OSITO_BUILD_TS); sh_puts(")\n");
+#endif
+
         /* Model */
         if (prompt_llama) {
             extern int llama_state_dim(void *s);
