@@ -73,6 +73,18 @@
       "url": "nl.wasm",
       "desc": "number stdin lines, '<n>\\t<line>'",
       "size": 519
+    },
+    {
+      "name": "tail",
+      "url": "tail.wasm",
+      "desc": "print last N lines (tail 5 or tail -n 5; default 10; 64 KiB max input)",
+      "size": 597
+    },
+    {
+      "name": "base64",
+      "url": "base64.wasm",
+      "desc": "encode stdin to base64 (RFC 2045, 76-column lines)",
+      "size": 628
     }
   ]
 }
