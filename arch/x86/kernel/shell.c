@@ -5083,7 +5083,10 @@ void shell_exec(char *line)
                     char fname[80]; { int n = strlen(name); if (n>60) n=60;
                         memcpy(fname, "/pkg/", 5); memcpy(fname+5, name, n);
                         memcpy(fname+5+n, ".wasm", 6); }
-                    /* Strip leading / since osfs2 is flat. */
+                    /* Strip leading / since osfs2 is flat. Delete prior
+                     * version so install is idempotent (acts as upgrade). */
+                    extern int osfs2_delete(const char *);
+                    osfs2_delete(fname + 1);
                     void *f = osfs2_create(fname + 1, sz);
                     if (!f) { sh_puts("pkg: osfs2_create failed\n"); }
                     else {
@@ -5134,8 +5137,34 @@ void shell_exec(char *line)
                     proc_exec(fname, xc, xargv);
                 }
             }
+        } else if (strcmp(sub, "uninstall") == 0 || strcmp(sub, "rm") == 0) {
+            const char *name = (argc >= 3) ? argv[2] : NULL;
+            if (!name) { sh_puts("usage: pkg uninstall <name>\n"); }
+            else {
+                char fname[80];
+                int nl = strlen(name); if (nl > 60) nl = 60;
+                memcpy(fname, "pkg/", 4); memcpy(fname + 4, name, nl);
+                memcpy(fname + 4 + nl, ".wasm", 6);
+                extern int osfs2_delete(const char *);
+                if (osfs2_delete(fname) == 0) {
+                    sh_puts("[pkg] uninstalled "); sh_puts(name); sh_puts("\n");
+                } else {
+                    sh_puts("pkg: not installed: "); sh_puts(name); sh_puts("\n");
+                }
+            }
+        } else if (strcmp(sub, "help") == 0) {
+            sh_puts("pkg — fetch and run WASI programs from the OsitoK catalog.\n\n");
+            sh_puts("Subcommands:\n");
+            sh_puts("  pkg list                  show all packages in the catalog\n");
+            sh_puts("  pkg search <query>        substring filter on names + descriptions\n");
+            sh_puts("  pkg install <name>        download <name>.wasm to /pkg/<name>.wasm\n");
+            sh_puts("  pkg installed             list packages already on local OsitoFS\n");
+            sh_puts("  pkg run <name> [args]     install if needed, then exec\n");
+            sh_puts("  pkg uninstall <name>      remove local /pkg/<name>.wasm\n");
+            sh_puts("\nPackages are tiny WASI binaries (<1 KB) and can be piped:\n");
+            sh_puts("  echo hola | pkg run rev   ->  aloh\n");
         } else {
-            sh_puts("usage: pkg list | search <q> | install <name> | installed | run <name>\n");
+            sh_puts("usage: pkg help | list | search <q> | install <name> | installed | run <name> | uninstall <name>\n");
         }
 #else
         sh_puts("pkg: WASM-only\n");
