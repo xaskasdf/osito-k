@@ -4391,7 +4391,7 @@ void shell_exec(char *line)
         else if (strcmp(argv[1], "tinystories") == 0) url =
             "https://wasm.naranjositos.tech/models/tinystories-llama2-20m.Q4_K_M.gguf";
         else if (strcmp(argv[1], "smollm")      == 0) url =
-            "https://wasm.naranjositos.tech/models/smollm2-135m-instruct-q4_0.gguf";
+            "https://wasm.naranjositos.tech/models/smollm2-135m-q4_0.gguf";
         else if (strcmp(argv[1], "default")     == 0) url = "";
         else url = argv[1];
 
