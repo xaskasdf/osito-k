@@ -25,10 +25,15 @@ INCLUDES := \
     -idirafter ../x86/include
 
 # ── Compiler flags ───────────────────────────────────────────────
+GIT_REV   := $(shell cd $(CURDIR)/../.. && git rev-parse --short HEAD 2>/dev/null || echo unknown)
+BUILD_TS  := $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
+
 CFLAGS := \
     -Os \
     -std=gnu11 \
     -DWASM_BUILD=1 \
+    -DOSITO_GIT_REV=\"$(GIT_REV)\" \
+    -DOSITO_BUILD_TS=\"$(BUILD_TS)\" \
     -msimd128 \
     $(INCLUDES) \
     -Wno-unused-function \

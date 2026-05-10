@@ -4364,6 +4364,13 @@ void shell_exec(char *line)
 #else
         sh_puts("model: WASM-only command\n");
 #endif
+    } else if (strcmp(cmd, "version") == 0) {
+#ifdef OSITO_GIT_REV
+        sh_puts("OsitoK build "); sh_puts(OSITO_GIT_REV);
+        sh_puts("  ("); sh_puts(OSITO_BUILD_TS); sh_puts(")\n");
+#else
+        sh_puts("OsitoK build (no git rev embedded)\n");
+#endif
     } else if (strcmp(cmd, "uname") == 0) {
         sh_puts("OsitoK (");
 #ifdef __EMSCRIPTEN__
