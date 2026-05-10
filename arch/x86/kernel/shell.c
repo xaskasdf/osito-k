@@ -4334,6 +4334,36 @@ void shell_exec(char *line)
             }
         }
 #endif
+    } else if (strcmp(cmd, "model") == 0) {
+#ifdef __EMSCRIPTEN__
+        if (argc < 2) {
+            sh_puts("Usage: model <name|url>\n");
+            sh_puts("  Aliases: brandon | tinystories | smollm\n");
+            sh_puts("  Or full URL. Reload page to apply.\n");
+            return;
+        }
+        const char *url = NULL;
+        if      (strcmp(argv[1], "brandon")     == 0) url =
+            "https://wasm.naranjositos.tech/models/brandon-tiny-10m-instruct.f16.gguf";
+        else if (strcmp(argv[1], "tinystories") == 0) url =
+            "https://wasm.naranjositos.tech/models/tinystories-llama2-20m.Q4_K_M.gguf";
+        else if (strcmp(argv[1], "smollm")      == 0) url =
+            "https://wasm.naranjositos.tech/models/smollm2-135m-instruct-q4_0.gguf";
+        else if (strcmp(argv[1], "default")     == 0) url = "";
+        else url = argv[1];
+
+        /* Keyed under 'osito-model' (raw, no 'osito-cfg-' prefix) so
+         * shell.html's localStorage.getItem('osito-model') reads it
+         * directly. wasm_config_save adds its own prefix, so write via
+         * a separate js_localstorage_set helper. */
+        extern void wasm_localstorage_set(const char *key, const char *value);
+        wasm_localstorage_set("osito-model", url);
+        sh_puts("[model] set to: ");
+        sh_puts(url[0] ? url : "(default — cleared)");
+        sh_puts("\nReload the page to load the new model.\n");
+#else
+        sh_puts("model: WASM-only command\n");
+#endif
     } else if (strcmp(cmd, "uname") == 0) {
         sh_puts("OsitoK (");
 #ifdef __EMSCRIPTEN__

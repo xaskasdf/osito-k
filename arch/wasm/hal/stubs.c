@@ -534,6 +534,20 @@ void wasm_config_save(const char *key, const char *value)
 int wasm_config_load(const char *key, char *dst, int max)
 { return js_config_load(key, dst, max); }
 
+/* Raw localStorage set — for keys that other JS code reads directly
+ * (e.g. 'osito-model' is read by shell.html before WASM loads). */
+EM_JS(void, js_localstorage_set_raw, (const char *key, const char *value), {
+    try {
+        var k = UTF8ToString(key);
+        var v = UTF8ToString(value);
+        if (v) localStorage.setItem(k, v);
+        else   localStorage.removeItem(k);
+    } catch (e) {}
+});
+
+void wasm_localstorage_set(const char *key, const char *value)
+{ js_localstorage_set_raw(key, value); }
+
 int nvme_write_bytes(uint64_t offset, const void *buf, uint64_t len) {
     if (!wasm_nvme_buf || offset + len > wasm_nvme_size) return -1;
     memcpy(wasm_nvme_buf + offset, buf, (size_t)len);

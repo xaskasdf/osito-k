@@ -266,19 +266,24 @@
     window.__modelFetchDone = false; // true when fetch completes (success or fail)
 
     // Optional override via ?model=URL or ?fs=URL query params (for testing).
+    // Also: localStorage 'osito-model' lets users persist a non-default
+    // choice across reloads, set via the in-shell `model <name|url>` cmd.
     var qs = new URLSearchParams(window.location.search);
     var modelOverride = qs.get('model');
     var fsOverride    = qs.get('fs');
+    var savedModel = null;
+    try { savedModel = localStorage.getItem('osito-model'); } catch (e) {}
 
     (function() {
-        var MODEL_URL = modelOverride
+        var MODEL_URL = modelOverride || savedModel
             /* Brandon-tiny-10m is the default: instruct-tuned (ChatML)
              * with custom block-shared arch + DenseFormer DWA + value
              * residual + register tokens. Runs at ~64 ms/tok in WASM
              * with the full sampling stack (rep_penalty + ngram=3).
              * Override:
              *   ?model=https://wasm.naranjositos.tech/models/smollm2-135m-instruct-q4_0.gguf
-             *   ?model=https://wasm.naranjositos.tech/models/tinystories-llama2-20m.Q4_K_M.gguf */
+             *   ?model=https://wasm.naranjositos.tech/models/tinystories-llama2-20m.Q4_K_M.gguf
+             * Or in-shell: `model brandon|tinystories|smollm` (reloads page) */
             || 'https://wasm.naranjositos.tech/models/brandon-tiny-10m-instruct.f16.gguf';
         fetch(MODEL_URL)
             .then(function(r) {
