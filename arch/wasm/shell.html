@@ -7,13 +7,44 @@
     <link rel="manifest" href="manifest.json">
     <meta name="theme-color" content="#FF6B2C">
     <script>
-        /* Register Service Worker for offline support + PWA install. */
+        /* Register Service Worker for offline support + PWA install.
+         * On a fresh build the cache name auto-bumps (Makefile sed-
+         * stamps wasm-md5), which surfaces here as 'updatefound' →
+         * 'installed' with a controller. Show a small banner so the
+         * user knows to reload. */
         if ('serviceWorker' in navigator) {
             window.addEventListener('load', function() {
-                navigator.serviceWorker.register('sw.js').catch(function(e) {
+                navigator.serviceWorker.register('sw.js').then(function(reg) {
+                    function listenForUpdates(installing) {
+                        installing.addEventListener('statechange', function() {
+                            if (installing.state === 'installed' &&
+                                navigator.serviceWorker.controller) {
+                                showUpdateBanner();
+                            }
+                        });
+                    }
+                    if (reg.installing) listenForUpdates(reg.installing);
+                    reg.addEventListener('updatefound', function() {
+                        if (reg.installing) listenForUpdates(reg.installing);
+                    });
+                }).catch(function(e) {
                     console.warn('[osito] SW registration failed:', e);
                 });
             });
+        }
+        function showUpdateBanner() {
+            if (document.getElementById('osito-update-banner')) return;
+            var b = document.createElement('div');
+            b.id = 'osito-update-banner';
+            b.style.cssText =
+                'position:fixed; top:8px; right:8px; z-index:9999;' +
+                'background:#FF6B2C; color:#000; padding:8px 14px;' +
+                'font-family: "Courier New", monospace; font-size:12px;' +
+                'border-radius:3px; cursor:pointer; user-select:none;' +
+                'box-shadow:0 2px 6px rgba(0,0,0,0.5);';
+            b.textContent = '⟳ new build available — click to reload';
+            b.onclick = function() { location.reload(); };
+            document.body.appendChild(b);
         }
     </script>
     <style>
