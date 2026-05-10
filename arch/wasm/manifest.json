@@ -10,14 +10,16 @@
   "background_color": "#0d0d0d",
   "icons": [
     {
-      "src": "https://wasm.naranjositos.tech/icons/osito-192.png",
+      "src": "data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 192 192'><rect width='192' height='192' fill='%230d0d0d'/><text x='96' y='110' font-family='Courier New,monospace' font-size='80' font-weight='bold' fill='%23FF6B2C' text-anchor='middle'>%5B&gt;_%5D</text><text x='96' y='160' font-family='Courier New,monospace' font-size='22' fill='%2300FF88' text-anchor='middle'>OsitoK</text></svg>",
       "sizes": "192x192",
-      "type": "image/png"
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
     },
     {
-      "src": "https://wasm.naranjositos.tech/icons/osito-512.png",
+      "src": "data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 512 512'><rect width='512' height='512' fill='%230d0d0d'/><text x='256' y='290' font-family='Courier New,monospace' font-size='200' font-weight='bold' fill='%23FF6B2C' text-anchor='middle'>%5B&gt;_%5D</text><text x='256' y='420' font-family='Courier New,monospace' font-size='60' fill='%2300FF88' text-anchor='middle'>OsitoK</text></svg>",
       "sizes": "512x512",
-      "type": "image/png"
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
     }
   ]
 }
