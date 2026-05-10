@@ -548,6 +548,12 @@ EM_JS(void, js_localstorage_set_raw, (const char *key, const char *value), {
 void wasm_localstorage_set(const char *key, const char *value)
 { js_localstorage_set_raw(key, value); }
 
+EM_JS(void, js_reload_page, (), {
+    try { location.reload(); } catch (e) {}
+});
+
+void wasm_reload_page(void) { js_reload_page(); }
+
 /* Status accessors for the bottom-bar live update. Returns pointers
  * into kernel memory — JS reads them with UTF8ToString. */
 extern bool osfs2_is_mounted(void);

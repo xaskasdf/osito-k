@@ -4798,6 +4798,20 @@ void shell_exec(char *line)
         sh_puts_color("SKIP (native build)\n", 0x00888888);
 #endif
         sh_puts_color("=== done ===\n\n", 0x00FF8800);
+    } else if (strcmp(cmd, "reload") == 0) {
+#ifdef __EMSCRIPTEN__
+        sh_puts("[reload] reloading page...\n");
+        extern void wasm_reload_page(void);
+        extern void wasm_persist_flush_decl(void);
+        /* declare locally to avoid conflicting types */
+        {
+            extern void wasm_persist_flush(void);
+            wasm_persist_flush();   /* save FS first */
+        }
+        wasm_reload_page();
+#else
+        sh_puts("reload: WASM-only\n");
+#endif
     } else if (strcmp(cmd, "history") == 0) {
 #ifdef __EMSCRIPTEN__
         if (argc >= 2 && strcmp(argv[1], "clear") == 0) {
