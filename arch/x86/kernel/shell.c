@@ -3042,7 +3042,7 @@ void redir_capture(const char *s, size_t len)
 /* Non-static so wasm cmd_make can invoke commands via shell pipeline. */
 void shell_exec(char *line);
 
-static void shell_exec_pipeline(char *line)
+void shell_exec_pipeline(char *line)
 {
     char *segments[8];
     int   nseg = 0;

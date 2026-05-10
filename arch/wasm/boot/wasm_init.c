@@ -292,6 +292,47 @@ static void load_filesystem(void)
             serial_puts(" starter files (try `cat README.md`)\n\n");
         }
     }
+
+    /* Run .osito_init from OsitoFS if it exists. Each non-empty,
+     * non-comment line is fed to shell_exec_pipeline. Persists
+     * naturally because the file lives in IndexedDB-backed FS. */
+    {
+        extern void *osfs2_find(const char *name);
+        extern int   osfs2_read(void *file, uint64_t offset, void *buf, uint64_t len);
+        extern uint64_t osfs2_file_size(void *file);
+        extern void shell_exec_pipeline(char *line);
+
+        void *f = osfs2_find(".osito_init");
+        if (f) {
+            uint64_t sz = osfs2_file_size(f);
+            if (sz > 0 && sz < 8 * 1024) {
+                static char rcbuf[8 * 1024];
+                if (osfs2_read(f, 0, rcbuf, sz) >= 0) {
+                    rcbuf[sz] = '\0';
+                    serial_puts("[init] running .osito_init\n");
+                    char *p = rcbuf, *line_start = rcbuf;
+                    for (; *p; p++) {
+                        if (*p == '\n') {
+                            *p = '\0';
+                            /* Skip blanks and comments */
+                            char *s = line_start;
+                            while (*s == ' ' || *s == '\t') s++;
+                            if (*s && *s != '#') {
+                                shell_exec_pipeline(s);
+                            }
+                            line_start = p + 1;
+                        }
+                    }
+                    if (line_start < p) {
+                        char *s = line_start;
+                        while (*s == ' ' || *s == '\t') s++;
+                        if (*s && *s != '#') shell_exec_pipeline(s);
+                    }
+                    serial_puts("[init] done\n\n");
+                }
+            }
+        }
+    }
 }
 
 /* ── Entry point ─────────────────────────────────────────────── */
