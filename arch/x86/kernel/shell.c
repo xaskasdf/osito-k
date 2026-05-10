@@ -4428,6 +4428,37 @@ void shell_exec(char *line)
             sh_puts("\n  shell:  121+ builtins (chat/git/cc/mount-fs/ws/...)");
         }
         sh_puts("\n");
+    } else if (strcmp(cmd, "find") == 0) {
+        if (argc < 2) { sh_puts("Usage: find <substring>\n"); return; }
+        if (!osfs2_is_mounted()) { sh_puts("No filesystem mounted\n"); return; }
+        extern uint32_t osfs2_file_count(void);
+        extern void *osfs2_file_at(int index);
+        extern const char *osfs2_file_name(void *file);
+        extern uint64_t osfs2_file_size(void *file);
+        const char *needle = argv[1];
+        uint32_t total = osfs2_file_count();
+        int matches = 0, shown = 0;
+        for (uint32_t i = 0; i < 4096 && shown < (int)total; i++) {
+            void *f = osfs2_file_at(i);
+            if (!f) continue;
+            shown++;
+            const char *name = osfs2_file_name(f);
+            const char *p = name; bool found = false;
+            while (*p) {
+                const char *a = p; const char *b = needle;
+                while (*a && *b && *a == *b) { a++; b++; }
+                if (!*b) { found = true; break; }
+                p++;
+            }
+            if (found) {
+                sh_putdec_padded(osfs2_file_size(f), 11);
+                sh_puts("  ");
+                sh_puts(name);
+                sh_puts("\n");
+                matches++;
+            }
+        }
+        if (matches == 0) sh_puts("(no matches)\n");
     } else if (strcmp(cmd, "du") == 0) {
         if (!osfs2_is_mounted()) { sh_puts("No filesystem mounted\n"); return; }
         extern uint32_t osfs2_file_count(void);
