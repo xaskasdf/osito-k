@@ -3923,6 +3923,65 @@ void shell_exec(char *line)
         sh_puts("\n");
         tls_close(tls);
         free(tls);
+    } else if (strcmp(cmd, "rendezvous") == 0) {
+#ifdef __EMSCRIPTEN__
+        /* Open a 'listen' WS to the proxy's room endpoint. The
+         * counterparty connects via /connect?room=ID; the worker's
+         * Durable Object pairs the two and pumps messages. Pure-JS
+         * relay; no real TCP listener.
+         *
+         *   osito (A)> rendezvous listen demo123     # waits for B
+         *   osito (B)> rendezvous connect demo123   # joins
+         *   then either side: ws send <ws_name> hi  ws recv <ws_name>
+         */
+        if (argc < 3) {
+            sh_puts("Usage: rendezvous <listen|connect> <room-id> [name]\n");
+            sh_puts("  Pairs two browser kernels via a CF Worker room.\n");
+            return;
+        }
+        const char *role = argv[1];
+        const char *room = argv[2];
+        const char *name = argc >= 4 ? argv[3] : "rdv";
+        if (ws_slot_find(name)) { sh_puts("Slot in use.\n"); return; }
+
+        char url[512];
+        int p = 0;
+        const char *base = "wss://tcp-proxy.naranjositos.tech/";
+        while (*base) url[p++] = *base++;
+        if (strcmp(role, "listen") == 0) {
+            const char *e = "listen?room=";
+            while (*e) url[p++] = *e++;
+        } else if (strcmp(role, "connect") == 0) {
+            const char *e = "connect?room=";
+            while (*e) url[p++] = *e++;
+        } else {
+            sh_puts("role must be 'listen' or 'connect'\n");
+            return;
+        }
+        while (*room && p < (int)sizeof(url) - 1) url[p++] = *room++;
+        url[p] = '\0';
+
+        ws_slot_t *slot = ws_slot_alloc();
+        if (!slot) { sh_puts("No free slots.\n"); return; }
+        int h = wasm_ws_open(url);
+        if (h <= 0) { sh_puts_color("[rdv] open failed\n", 0x00FF0000); return; }
+        if (wasm_ws_wait_open(h, 5000) < 0) {
+            sh_puts_color("[rdv] handshake/timeout\n", 0x00FF0000);
+            wasm_ws_close(h);
+            return;
+        }
+        slot->handle = h;
+        int n = 0;
+        while (n < 15 && name[n]) { slot->name[n] = name[n]; n++; }
+        slot->name[n] = '\0';
+        sh_puts_color("[rdv] joined as '", 0x0000FF00);
+        sh_puts(slot->name);
+        sh_puts("' — use `ws send/recv ");
+        sh_puts(slot->name);
+        sh_puts("`\n");
+#else
+        sh_puts("rendezvous: WASM-only\n");
+#endif
     } else if (strcmp(cmd, "tcp") == 0) {
         /* TCP-over-WS bridge: substitutes {host} and {port} into a
          * configured WSS proxy URL, then opens via wasm_ws_open. The

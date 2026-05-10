@@ -1,7 +1,22 @@
 /*
  * tcp-proxy-worker.js — Cloudflare Worker that bridges WebSocket
- * frames to a TCP connection. Pair with the WASM kernel's `tcp`
- * shell command:
+ * frames ↔ raw TCP. Two modes:
+ *
+ * 1. Outbound TCP (existing): wss://this/?host=…&port=…
+ *    Each WS connection opens one TCP socket to (host, port).
+ *
+ * 2. Inbound TCP (new): wss://this/listen?room=ID
+ *    Receivers listen on a "room" id; senders connect to the same
+ *    room with /connect?room=ID. Bytes flow bidirectionally between
+ *    the two WebSockets — emulates accept() for kernel-side servers
+ *    that want to host a service in the browser.
+ *
+ *    We cannot literally accept() inbound IPv4 in a Worker — instead,
+ *    multiple browser-side senders rendezvous via room IDs, which
+ *    suffices for OsitoK→OsitoK demos and any client that knows the
+ *    URL.
+ *
+ * Pair with the WASM kernel's `tcp` and `httpd-ws` shell commands:
  *
  *   osito> tcp connect example.com 80 mytcp
  *   osito> ws send mytcp "GET / HTTP/1.0\r\nHost: example.com\r\n\r\n"
@@ -11,29 +26,97 @@
  *   wrangler deploy tools/tcp-proxy-worker.js \
  *     --name tcp-proxy --route tcp-proxy.naranjositos.tech/*
  *
- * Cloudflare exposes raw TCP via the `connect()` API in Workers
- * (cloudflare:sockets). Documentation:
- *   https://developers.cloudflare.com/workers/runtime-apis/tcp-sockets/
+ * For room mode the worker needs Durable Objects (sticky room state)
+ * — see RoomDO below.
  *
- * Security: this is an unauthenticated TCP proxy. In production you
- * MUST add an allowlist (e.g. only api.anthropic.com:443) or
- * authentication (signed token in the URL) so it can't be turned
- * into an open relay.
+ * Security: unauthenticated TCP proxy. In production add an allowlist
+ * (only api.anthropic.com:443 etc.) or signed-token auth before
+ * deploying publicly.
  */
 
 import { connect } from 'cloudflare:sockets';
 
+/* ── Durable Object: rendezvous room ────────────────────────────
+ * Holds 0..2 WebSockets keyed by URL path /listen?room=X or
+ * /connect?room=X. When both sides are connected, message events on
+ * either side are forwarded to the other. The first to leave closes
+ * the pair.
+ * ─────────────────────────────────────────────────────────────── */
+export class RoomDO {
+    constructor(state, env) {
+        this.state = state;
+        this.env = env;
+        this.listener = null;   // first WS to arrive (server)
+        this.connector = null;  // second WS (client)
+    }
+
+    relay(from, to) {
+        from.addEventListener('message', (ev) => {
+            try { to.send(ev.data); } catch (e) {}
+        });
+        from.addEventListener('close', () => {
+            try { to.close(1000, 'peer closed'); } catch (e) {}
+            if (this.listener === from) this.listener = null;
+            if (this.connector === from) this.connector = null;
+        });
+    }
+
+    async fetch(request) {
+        if (request.headers.get('Upgrade') !== 'websocket') {
+            return new Response('room: WebSocket required', { status: 426 });
+        }
+        const url = new URL(request.url);
+        const role = url.pathname.endsWith('/connect') ? 'connect' : 'listen';
+        const pair = new WebSocketPair();
+        const client = pair[0], server = pair[1];
+        server.accept();
+
+        if (role === 'listen') {
+            if (this.listener) {
+                server.close(1008, 'room already has a listener');
+                return new Response(null, { status: 101, webSocket: client });
+            }
+            this.listener = server;
+            if (this.connector) {
+                /* Connector arrived first — relay both directions now */
+                this.relay(this.listener, this.connector);
+                this.relay(this.connector, this.listener);
+            }
+        } else {
+            this.connector = server;
+            if (this.listener) {
+                this.relay(this.listener, this.connector);
+                this.relay(this.connector, this.listener);
+            }
+        }
+        return new Response(null, { status: 101, webSocket: client });
+    }
+}
+
 export default {
     async fetch(request, env) {
+        const url = new URL(request.url);
+
+        /* Room rendezvous mode: /listen, /connect — Durable Object
+         * pairs two WSs by room id so browser kernels can host
+         * server-side services for other browser kernels. */
+        if (url.pathname === '/listen' || url.pathname === '/connect') {
+            const room = url.searchParams.get('room') || 'default';
+            const id = env.ROOMS.idFromName(room);
+            const stub = env.ROOMS.get(id);
+            return stub.fetch(request);
+        }
+
         if (request.headers.get('Upgrade') !== 'websocket') {
             return new Response(
                 'tcp-proxy: WebSocket required.\n' +
-                'Usage: wss://this-worker/?host=<host>&port=<port>\n',
+                'Outbound: wss://this/?host=<host>&port=<port>\n' +
+                'Inbound:  wss://this/listen?room=<id>  (server side)\n' +
+                '          wss://this/connect?room=<id> (client side)\n',
                 { status: 426 }
             );
         }
 
-        const url = new URL(request.url);
         const host = url.searchParams.get('host');
         const port = parseInt(url.searchParams.get('port'), 10);
         if (!host || !port || port < 1 || port > 65535) {
