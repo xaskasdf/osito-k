@@ -623,6 +623,13 @@ static void cmd_help(void)
     sh_puts("  samples list/cat/build/run   Walk the seeded /samples/*.c\n");
     sh_puts("  precache               Background-fetch cc toolchain (~50 MB)\n");
 
+    sh_puts_color("\nPackage manager (WASI binaries from R2 catalog):\n", 0x00FF8800);
+    sh_puts("  pkg list/search <q>     Browse the catalog (10 utilities)\n");
+    sh_puts("  pkg install <name>      Fetch <name>.wasm to /pkg/\n");
+    sh_puts("  pkg run <name> [args]   Auto-install + exec; piped stdin works\n");
+    sh_puts("  pkg installed/uninstall Local list / remove\n");
+    sh_puts("  e.g. echo hola | pkg run rev   ->  aloh\n");
+
     sh_puts_color("\nNetwork (browser-bridged):\n", 0x00FF8800);
     sh_puts("  curl <url>              JS fetch — any URL CORS allows\n");
     sh_puts("  https <host> [path]     Real TLS 1.2 over WS-tunneled TCP\n");
