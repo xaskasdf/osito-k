@@ -6,19 +6,19 @@
       "name": "hello",
       "url": "hello.wasm",
       "desc": "minimal WASI hello-world (writes \"hello, osito\\n\" to stdout)",
-      "size": 198
+      "size": 184
     },
     {
       "name": "fib",
       "url": "fib.wasm",
       "desc": "iterative fibonacci(30) demo, prints result",
-      "size": 312
+      "size": 477
     },
     {
       "name": "echo",
       "url": "echo.wasm",
       "desc": "reads argv and prints each arg on its own line",
-      "size": 256
+      "size": 404
     }
   ]
 }
