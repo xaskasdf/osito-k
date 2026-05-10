@@ -4477,6 +4477,75 @@ void shell_exec(char *line)
             }
         }
 #endif
+    } else if (strcmp(cmd, "samples") == 0) {
+        if (argc < 2 || strcmp(argv[1], "list") == 0) {
+            sh_puts_color("Available samples (in /samples/):\n", 0x00FF8800);
+            sh_puts("  hello    classic stdio hello world\n");
+            sh_puts("  fib      recursive Fibonacci, takes argv n\n");
+            sh_puts("  oi_chat  user-space program calling kernel LLM\n");
+            sh_puts("  cat      stdin → stdout (use with pipes)\n");
+            sh_puts("Usage:\n");
+            sh_puts("  samples cat <name>      Show source\n");
+            sh_puts("  samples build <name>    cc + save to <name>.wasm\n");
+            sh_puts("  samples run <name>      build + exec\n");
+        } else if (strcmp(argv[1], "cat") == 0 && argc >= 3) {
+            char path[64]; int p = 0;
+            const char *prefix = "/samples/";
+            while (*prefix && p < 60) path[p++] = *prefix++;
+            const char *n = argv[2];
+            while (*n && p < 58) path[p++] = *n++;
+            const char *suffix = ".c";
+            while (*suffix && p < 62) path[p++] = *suffix++;
+            path[p] = '\0';
+            char *fakeargv[2] = { (char *)"cat", path };
+            cmd_cat(2, fakeargv);
+        } else if (strcmp(argv[1], "build") == 0 && argc >= 3) {
+            char line[160]; int p = 0;
+            const char *prefix = "cc /samples/";
+            while (*prefix && p < (int)sizeof(line) - 1) line[p++] = *prefix++;
+            const char *n = argv[2];
+            while (*n && p < (int)sizeof(line) - 4) line[p++] = *n++;
+            const char *mid = ".c -o ";
+            while (*mid && p < (int)sizeof(line) - 1) line[p++] = *mid++;
+            n = argv[2];
+            while (*n && p < (int)sizeof(line) - 6) line[p++] = *n++;
+            const char *ext = ".wasm";
+            while (*ext && p < (int)sizeof(line) - 1) line[p++] = *ext++;
+            line[p] = '\0';
+            sh_puts_color("> ", 0x00FF8800); sh_puts(line); sh_puts("\n");
+            extern void shell_exec_pipeline(char *line);
+            shell_exec_pipeline(line);
+        } else if (strcmp(argv[1], "run") == 0 && argc >= 3) {
+            /* Build then exec — two pipeline calls */
+            char line[160]; int p = 0;
+            const char *prefix = "cc /samples/";
+            while (*prefix) line[p++] = *prefix++;
+            const char *n = argv[2];
+            while (*n) line[p++] = *n++;
+            const char *mid = ".c -o ";
+            while (*mid) line[p++] = *mid++;
+            n = argv[2];
+            while (*n) line[p++] = *n++;
+            const char *ext = ".wasm";
+            while (*ext) line[p++] = *ext++;
+            line[p] = '\0';
+            sh_puts_color("> ", 0x00FF8800); sh_puts(line); sh_puts("\n");
+            extern void shell_exec_pipeline(char *line);
+            shell_exec_pipeline(line);
+
+            char line2[64]; int p2 = 0;
+            const char *e = "exec ";
+            while (*e) line2[p2++] = *e++;
+            n = argv[2];
+            while (*n) line2[p2++] = *n++;
+            ext = ".wasm";
+            while (*ext) line2[p2++] = *ext++;
+            line2[p2] = '\0';
+            sh_puts_color("> ", 0x00FF8800); sh_puts(line2); sh_puts("\n");
+            shell_exec_pipeline(line2);
+        } else {
+            sh_puts("Unknown subcommand. Run: samples (no args) for help.\n");
+        }
     } else if (strcmp(cmd, "tutorial") == 0) {
         sh_puts_color("\n=== OsitoK quick tour ===\n", 0x00FF8800);
         sh_puts("\n1. Run an LLM right here:\n");
