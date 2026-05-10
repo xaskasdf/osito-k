@@ -1000,7 +1000,12 @@ static void __hot compositor_render_frame(void);
 void wasm_compositor_frame(void)
 {
     if (!compositor_running) return;
+    gui_anim_tick(idt_get_ticks() * 10);
     compositor_render_frame();
+    /* The native compositor_thread's blit step never runs in WASM; the
+     * rAF wrapper has to invoke display_flip itself or pixels stay in
+     * the back buffer and the canvas shows black. */
+    display_flip();
 }
 #endif
 
