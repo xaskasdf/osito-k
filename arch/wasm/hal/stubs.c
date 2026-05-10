@@ -116,7 +116,8 @@ static void extract_to_memfs(const char *osfs_name, const char *memfs_path)
 /* Forward decls for helpers used by proc_exec; bodies are further down. */
 static void cc_drain_until_done(void);
 extern void js_cc_run_wasi(const uint8_t *src, int size, const char *name,
-                            const char *argv_joined);
+                            const char *argv_joined,
+                            const uint8_t *stdin_buf, int stdin_len);
 
 /* ── proc_exec: load and run WASM side modules via dlopen ────── */
 
@@ -227,7 +228,13 @@ int proc_exec(const char *filename, int argc, const char **argv)
             jp += al + 1;
         }
         if (jp > 0) joined[jp - 1] = 0; else joined[0] = 0;
-        js_cc_run_wasi((const uint8_t *)buf, (int)size, filename, joined);
+        /* Forward shell pipe / `<file` stdin to the WASI shim. */
+        extern const char *sh_stdin_buf;
+        extern uint32_t sh_stdin_len;
+        const uint8_t *sin = (const uint8_t *)sh_stdin_buf;
+        int sin_len = sh_stdin_buf ? (int)sh_stdin_len : 0;
+        js_cc_run_wasi((const uint8_t *)buf, (int)size, filename, joined,
+                       sin, sin_len);
         free(buf);
         cc_drain_until_done();
         serial_puts("\n");
@@ -1950,16 +1957,20 @@ EM_JS(void, js_cc_compiled_get, (uint8_t *dst), {
 /* Run a pre-compiled wasm via WASI shim. Output streams via the same
  * __ccPending mechanism as compileLinkRun. */
 EM_JS(void, js_cc_run_wasi, (const uint8_t *src, int size, const char *name,
-                              const char *argv_joined), {
+                              const char *argv_joined,
+                              const uint8_t *stdin_buf, int stdin_len), {
     var bytes = HEAPU8.slice(src, src + size).buffer;  /* copy to standalone ArrayBuffer */
     var nm = UTF8ToString(name);
     var joined = UTF8ToString(argv_joined);
-    /* Split on \x1f (unit separator); empty string -> []. */
     var argv = (joined && joined.length) ? joined.split('\x1f') : [];
+    /* Snapshot stdin contents for the worker; transferred along with bytes. */
+    var stdin_ab = (stdin_buf && stdin_len > 0)
+        ? HEAPU8.slice(stdin_buf, stdin_buf + stdin_len).buffer
+        : new ArrayBuffer(0);
     window.__ccPending = '';
     window.__ccDone = false;
     window.__cc.onWrite = function(chunk) { window.__ccPending += chunk; };
-    window.__cc.runWasi(bytes, nm, argv).then(function() { window.__ccDone = true; });
+    window.__cc.runWasi(bytes, nm, argv, stdin_ab).then(function() { window.__ccDone = true; });
 });
 
 /* Drain any pending output text into a kernel buffer + sleep until done.

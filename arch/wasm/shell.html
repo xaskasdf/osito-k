@@ -669,6 +669,9 @@
                     try {
                         const writeOut = (s) => port.postMessage({ id: 'write', data: s });
                         const argv = [(e.data.name || 'app')].concat(e.data.argv || []);
+                        const stdinBuf = e.data.stdin
+                            ? new Uint8Array(e.data.stdin) : new Uint8Array(0);
+                        let stdinPos = 0;
                         const wasiPreview1 = (function() {
                             let mem = null;
                             const td = new TextDecoder('utf-8');
@@ -690,8 +693,21 @@
                                     return 0;
                                 },
                                 fd_read(fd, iovs, iovs_len, nread) {
-                                    /* No stdin in this runtime — return EOF. */
-                                    heap().setUint32(nread, 0, true);
+                                    if (fd !== 0) {
+                                        heap().setUint32(nread, 0, true);
+                                        return 0;
+                                    }
+                                    /* Stream stdinBuf across iovec entries until exhausted. */
+                                    let total = 0;
+                                    for (let i = 0; i < iovs_len && stdinPos < stdinBuf.length; i++) {
+                                        const ptr = heap().getUint32(iovs + i*8, true);
+                                        const len = heap().getUint32(iovs + i*8 + 4, true);
+                                        const n = Math.min(len, stdinBuf.length - stdinPos);
+                                        heapU8().set(stdinBuf.subarray(stdinPos, stdinPos + n), ptr);
+                                        stdinPos += n;
+                                        total += n;
+                                    }
+                                    heap().setUint32(nread, total, true);
                                     return 0;
                                 },
                                 fd_close() { return 0; },
@@ -828,15 +844,18 @@
                 });
             },
             // Run a pre-compiled wasm module via WASI shim. bytes: ArrayBuffer
-            runWasi: async function(bytes, name, argv) {
+            runWasi: async function(bytes, name, argv, stdin) {
                 await ensureWorker();
                 pendingWrite = '';
                 return new Promise((resolve) => {
                     resolveCompile = resolve;
-                    /* Note: bytes will be transferred (consumed) */
-                    const transfer = bytes instanceof ArrayBuffer ? [bytes] : [];
+                    /* Transfer the wasm bytes + stdin buffer to avoid copies. */
+                    const transfer = [];
+                    if (bytes instanceof ArrayBuffer) transfer.push(bytes);
+                    if (stdin instanceof ArrayBuffer && stdin.byteLength > 0)
+                        transfer.push(stdin);
                     port.postMessage({ id: 'runWasi', bytes, name: name || 'app',
-                                       argv: argv || [] }, transfer);
+                                       argv: argv || [], stdin: stdin || null }, transfer);
                 });
             }
         };
