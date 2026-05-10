@@ -756,15 +756,18 @@ osfs2_file_t *osfs2_create(const char *name, uint64_t size)
     }
     disk_flush();
 
-    serial_puts("[OsitoFS] Created '");
-    serial_puts(name);
-    serial_puts("' size=");
-    serial_putdec(size);
-    serial_puts(" blocks=");
-    serial_putdec(blocks);
-    serial_puts(" @ block ");
-    serial_putdec(f->start_block);
-    serial_puts("\n");
+    extern int osfs2_verbose;
+    if (osfs2_verbose) {
+        serial_puts("[OsitoFS] Created '");
+        serial_puts(name);
+        serial_puts("' size=");
+        serial_putdec(size);
+        serial_puts(" blocks=");
+        serial_putdec(blocks);
+        serial_puts(" @ block ");
+        serial_putdec(f->start_block);
+        serial_puts("\n");
+    }
 
     return f;
 }
@@ -871,6 +874,16 @@ osfs2_file_t *osfs2_file_by_index(uint32_t idx)
     }
     return NULL;
 }
+/* Verbose flag — defaults to 0 (quiet). Native builds set it to 1
+ * via shell `mount -v` style; WASM keeps it 0 to avoid noisy boot. */
+int osfs2_verbose =
+#ifdef __EMSCRIPTEN__
+    0
+#else
+    1
+#endif
+;
+
 uint32_t osfs2_free_blocks(void) {
     if (!mounted) return 0;
     uint32_t total_data = superblock.total_blocks - data_start;
