@@ -616,6 +616,11 @@ static void cmd_help(void)
     sh_puts("  fs-ls / fs-cat          Legacy aliases\n");
     sh_puts("  umount [type]           Detach (no arg = all)\n");
     sh_puts("  du / df                 File sizes / free space\n");
+    sh_puts("  find <substring>        Match file names\n");
+    sh_puts("  touch <file>            Create empty file\n");
+    sh_puts("  hexdump <file> [N]      Hex+ASCII dump (default 256 bytes)\n");
+    sh_puts("  base64 [-d] <text>      Encode / decode\n");
+    sh_puts("  samples list/cat/build/run   Walk the seeded /samples/*.c\n");
 
     sh_puts_color("\nNetwork (browser-bridged):\n", 0x00FF8800);
     sh_puts("  curl <url>              JS fetch — any URL CORS allows\n");
