@@ -599,6 +599,37 @@ int tok_encode(const tokenizer_t *tok, const char *text, uint32_t text_len,
     uint32_t pos = 0;
 
     while (pos < text_len && total < max_out) {
+        /* Special-token recognition: '<|...|>' patterns are emitted as
+         * a single token id if they match a vocab entry. Linear-scan the
+         * special-token range (top of vocab) since BPE-merging can't
+         * reconstruct them anyway. */
+        if (buf[pos] == '<' && pos + 1 < text_len && buf[pos+1] == '|') {
+            uint32_t end = pos + 2;
+            while (end + 1 < text_len && !(buf[end] == '|' && buf[end+1] == '>'))
+                end++;
+            if (end + 1 < text_len) {
+                uint32_t tok_len = end + 2 - pos;
+                /* Scan vocab for exact byte match. Llama 3 special tokens
+                 * live at the top (128000+), so we walk backward to hit them
+                 * first. Stop at 32K — below that it's all regular BPE. */
+                uint32_t vstart = tok->vocab_size > 32000
+                    ? tok->vocab_size - 256 : 0;
+                int found = -1;
+                for (uint32_t v = vstart; v < tok->vocab_size; v++) {
+                    if (tok->vocab[v].len == tok_len &&
+                        memcmp(tok->vocab[v].bytes, buf + pos, tok_len) == 0) {
+                        found = (int)v;
+                        break;
+                    }
+                }
+                if (found >= 0) {
+                    out[total++] = (uint32_t)found;
+                    pos = end + 2;
+                    continue;
+                }
+            }
+        }
+
         /* Find word boundary: consume characters of same class,
          * with special handling for leading space + alpha. */
         uint32_t start = pos;
