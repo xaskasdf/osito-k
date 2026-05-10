@@ -19,6 +19,18 @@
       "url": "echo.wasm",
       "desc": "reads argv and prints each arg on its own line",
       "size": 404
+    },
+    {
+      "name": "cat",
+      "url": "cat.wasm",
+      "desc": "stream stdin to stdout in 4 KiB chunks",
+      "size": 246
+    },
+    {
+      "name": "wc",
+      "url": "wc.wasm",
+      "desc": "count lines and bytes from stdin (POSIX wc -lc)",
+      "size": 529
     }
   ]
 }
