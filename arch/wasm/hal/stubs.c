@@ -1029,6 +1029,148 @@ int wasm_wgpu_softmax(const float *in, float *out, int len)
     return js_wgpu_op_ok() ? 0 : -1;
 }
 
+/* ── GPU-resident buffer handles ────────────────────────────────
+ * Activations don't have to bounce CPU<->GPU each op. The handle API
+ * lets callers allocate a persistent VRAM buffer once, run a chain of
+ * ops that read/write it, then download the final result.
+ *
+ *   wgpu_alloc(n_floats)           -> int handle id
+ *   wgpu_upload(h, src_ptr, n)
+ *   wgpu_download(h, dst_ptr, n)
+ *   wgpu_free(h)
+ *
+ *   wasm_wgpu_matvec_h(hw, hin, hout, rows, cols)
+ *   wasm_wgpu_rmsnorm_h(hw, hin, hout, dim, eps)
+ *   wasm_wgpu_softmax_h(hin, hout, len)
+ *
+ * Pure dispatch — no buffer copy on the hot path. */
+
+EM_JS(int, js_wgpu_alloc, (int n_floats), {
+    if (!window.__gpuReady) return -1;
+    if (!window.__gpuHandles) {
+        window.__gpuHandles = [];
+        window.__gpuHandleNext = 1;
+    }
+    const dev = window.__gpuDevice;
+    const buf = dev.createBuffer({
+        size: n_floats * 4,
+        usage: GPUBufferUsage.STORAGE
+             | GPUBufferUsage.COPY_DST
+             | GPUBufferUsage.COPY_SRC,
+    });
+    const id = window.__gpuHandleNext++;
+    window.__gpuHandles[id] = { buf, n: n_floats };
+    return id;
+});
+EM_JS(void, js_wgpu_free, (int id), {
+    if (!window.__gpuHandles) return;
+    const h = window.__gpuHandles[id];
+    if (!h) return;
+    h.buf.destroy();
+    window.__gpuHandles[id] = null;
+});
+EM_JS(void, js_wgpu_upload, (int id, const float *src, int n), {
+    const h = window.__gpuHandles && window.__gpuHandles[id];
+    if (!h) return;
+    window.__gpuDevice.queue.writeBuffer(h.buf, 0, HEAPU8.slice(src, src + n*4));
+});
+EM_JS(int, js_wgpu_download_kick, (int id, float *dst, int n), {
+    window.__gpuDlDone = false;
+    const h = window.__gpuHandles && window.__gpuHandles[id];
+    if (!h) { window.__gpuDlDone = true; return -1; }
+    (async function() {
+        const dev = window.__gpuDevice;
+        const r = dev.createBuffer({
+            size: n * 4,
+            usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+        });
+        const enc = dev.createCommandEncoder();
+        enc.copyBufferToBuffer(h.buf, 0, r, 0, n * 4);
+        dev.queue.submit([enc.finish()]);
+        await r.mapAsync(GPUMapMode.READ);
+        HEAPU8.set(new Uint8Array(r.getMappedRange()), dst);
+        r.unmap();
+        r.destroy();
+        window.__gpuDlDone = true;
+    })();
+    return 0;
+});
+EM_JS(int, js_wgpu_dl_done, (), { return window.__gpuDlDone ? 1 : 0; });
+
+int wgpu_alloc(int n_floats)         { return js_wgpu_ready() ? js_wgpu_alloc(n_floats) : -1; }
+void wgpu_free(int id)               { js_wgpu_free(id); }
+void wgpu_upload(int id, const float *src, int n) { js_wgpu_upload(id, src, n); }
+void wgpu_download(int id, float *dst, int n)
+{
+    if (js_wgpu_download_kick(id, dst, n) != 0) return;
+    while (!js_wgpu_dl_done()) emscripten_sleep(1);
+}
+
+/* Handle-based matvec: zero copy on the hot path. The pipeline + bind
+ * group are still cached per-shape so dispatching is fast. */
+EM_JS(int, js_wgpu_matvec_h_kick, (int hw, int hin, int hout, int rows, int cols), {
+    window.__gpuOpDone = false;
+    window.__gpuOpOK = false;
+    if (!window.__gpuReady) { window.__gpuOpDone = true; return 0; }
+    (async function() {
+        try {
+            const dev = window.__gpuDevice;
+            const pipe = window.__gpuPipeline;
+            if (!window.__gpuMatvecHCache) window.__gpuMatvecHCache = new Map();
+            const key = rows + 'x' + cols + ':' + hw + ',' + hin + ',' + hout;
+            let slot = window.__gpuMatvecHCache.get(key);
+            if (!slot) {
+                if (window.__gpuMatvecHCache.size >= 64) {
+                    const k0 = window.__gpuMatvecHCache.keys().next().value;
+                    const old = window.__gpuMatvecHCache.get(k0);
+                    if (old.dBuf) old.dBuf.destroy();
+                    window.__gpuMatvecHCache.delete(k0);
+                }
+                const w = window.__gpuHandles[hw];
+                const i = window.__gpuHandles[hin];
+                const o = window.__gpuHandles[hout];
+                if (!w || !i || !o) {
+                    window.__gpuOpOK = false; window.__gpuOpDone = true; return;
+                }
+                const dBuf = dev.createBuffer({
+                    size: 8,
+                    usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+                });
+                dev.queue.writeBuffer(dBuf, 0, new Uint32Array([rows, cols]));
+                const bg = dev.createBindGroup({
+                    layout: pipe.getBindGroupLayout(0),
+                    entries: [
+                        { binding: 0, resource: { buffer: w.buf } },
+                        { binding: 1, resource: { buffer: i.buf } },
+                        { binding: 2, resource: { buffer: o.buf } },
+                        { binding: 3, resource: { buffer: dBuf } },
+                    ],
+                });
+                slot = { bg, dBuf };
+                window.__gpuMatvecHCache.set(key, slot);
+            }
+            const enc = dev.createCommandEncoder();
+            const pass = enc.beginComputePass();
+            pass.setPipeline(pipe);
+            pass.setBindGroup(0, slot.bg);
+            pass.dispatchWorkgroups(Math.ceil(rows / 64));
+            pass.end();
+            dev.queue.submit([enc.finish()]);
+            window.__gpuOpOK = true;
+        } catch (e) { window.__gpuError = String(e); }
+        window.__gpuOpDone = true;
+    })();
+    return 1;
+});
+
+int wasm_wgpu_matvec_h(int hw, int hin, int hout, int rows, int cols)
+{
+    if (!js_wgpu_ready()) return -1;
+    js_wgpu_matvec_h_kick(hw, hin, hout, rows, cols);
+    while (!js_wgpu_op_done()) emscripten_sleep(1);
+    return js_wgpu_op_ok() ? 0 : -1;
+}
+
 /* Status accessors for the bottom-bar live update. Returns pointers
  * into kernel memory — JS reads them with UTF8ToString. */
 extern bool osfs2_is_mounted(void);

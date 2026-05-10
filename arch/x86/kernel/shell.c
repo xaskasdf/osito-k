@@ -4961,6 +4961,52 @@ void shell_exec(char *line)
             sh_putdec((uint64_t)(maxdiff * 1000.0f)); sh_puts(")\n");
 
             free(w); free(in); free(out_cpu); free(out_gpu);
+        } else if (strcmp(argv[1], "test-h") == 0) {
+            /* Handle-based matvec: upload weights+input once, dispatch
+             * many matvecs without copy-out, download final once. The
+             * holistic ideal: activations live in VRAM. */
+            if (!wasm_wgpu_init()) { sh_puts("WebGPU not initialized.\n"); return; }
+            extern int wgpu_alloc(int);
+            extern void wgpu_free(int);
+            extern void wgpu_upload(int, const float *, int);
+            extern void wgpu_download(int, float *, int);
+            extern int wasm_wgpu_matvec_h(int hw, int hi, int ho, int r, int c);
+            extern void *malloc(unsigned long); extern void free(void *);
+            int N = 256;
+            float *w = (float *)malloc(N*N*4);
+            float *in = (float *)malloc(N*4);
+            float *cpu = (float *)malloc(N*4);
+            float *gpu = (float *)malloc(N*4);
+            for (int i = 0; i < N*N; i++) w[i] = (float)((i*7 % 13) - 6) * 0.1f;
+            for (int i = 0; i < N; i++)   in[i] = (float)((i*5 % 11) - 5) * 0.1f;
+            for (int r = 0; r < N; r++) {
+                float s = 0;
+                for (int c = 0; c < N; c++) s += w[r*N+c] * in[c];
+                cpu[r] = s;
+            }
+            int hw = wgpu_alloc(N*N);
+            int hi = wgpu_alloc(N);
+            int ho = wgpu_alloc(N);
+            wgpu_upload(hw, w, N*N);
+            wgpu_upload(hi, in, N);
+            extern uint64_t idt_get_ticks(void);
+            uint64_t t0 = idt_get_ticks();
+            for (int k = 0; k < 50; k++)
+                wasm_wgpu_matvec_h(hw, hi, ho, N, N);
+            uint64_t t1 = idt_get_ticks();
+            wgpu_download(ho, gpu, N);
+            float md = 0.0f;
+            for (int i = 0; i < N; i++) {
+                float d = cpu[i] - gpu[i]; if (d < 0) d = -d;
+                if (d > md) md = d;
+            }
+            sh_puts("[wgpu test-h] 50x ");
+            sh_putdec(N); sh_puts("x"); sh_putdec(N);
+            sh_puts(" matvec via handles: ");
+            sh_putdec(t1 - t0); sh_puts(" ms total, maxdiff*1e6=");
+            sh_putdec((uint64_t)(md * 1e6f)); sh_puts("\n");
+            wgpu_free(hw); wgpu_free(hi); wgpu_free(ho);
+            free(w); free(in); free(cpu); free(gpu);
         } else if (strcmp(argv[1], "rmsnorm") == 0) {
             if (!wasm_wgpu_init()) { sh_puts("WebGPU not initialized.\n"); return; }
             extern int wasm_wgpu_rmsnorm(const float *w, const float *in,
@@ -5054,7 +5100,7 @@ void shell_exec(char *line)
             sh_putdec(t2 - t1); sh_puts(" ms total)\n");
             free(w); free(in); free(out);
         } else {
-            sh_puts("Usage: wgpu [init|test|bench|rmsnorm|softmax]\n");
+            sh_puts("Usage: wgpu [init|test|test-h|bench|rmsnorm|softmax]\n");
         }
 #else
         sh_puts("wgpu: WASM-only\n");
