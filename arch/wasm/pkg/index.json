@@ -31,6 +31,24 @@
       "url": "wc.wasm",
       "desc": "count lines and bytes from stdin (POSIX wc -lc)",
       "size": 529
+    },
+    {
+      "name": "rev",
+      "url": "rev.wasm",
+      "desc": "reverse each line from stdin (POSIX rev)",
+      "size": 376
+    },
+    {
+      "name": "upper",
+      "url": "upper.wasm",
+      "desc": "ascii a-z -> A-Z, like tr a-z A-Z",
+      "size": 315
+    },
+    {
+      "name": "yes",
+      "url": "yes.wasm",
+      "desc": "print 'y\\n' forever until SIGPIPE (POSIX yes)",
+      "size": 188
     }
   ]
 }
