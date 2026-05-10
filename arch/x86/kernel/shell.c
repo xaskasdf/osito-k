@@ -4456,17 +4456,20 @@ void shell_exec(char *line)
 #ifdef __EMSCRIPTEN__
         if (argc < 2) {
             sh_puts("Usage: model <name|url>\n");
-            sh_puts("  Aliases: brandon | tinystories | smollm\n");
+            sh_puts("  Aliases: brandon | tinystories | smollm | llama-1b\n");
             sh_puts("  Or full URL. Reload page to apply.\n");
             return;
         }
         const char *url = NULL;
         if      (strcmp(argv[1], "brandon")     == 0) url =
-            "https://wasm.naranjositos.tech/models/brandon-tiny-10m-instruct.f16.gguf";
+            "https://factory.naranjositos.tech/models/brandon-tiny-10m-instruct.f16.gguf";
         else if (strcmp(argv[1], "tinystories") == 0) url =
-            "https://wasm.naranjositos.tech/models/tinystories-llama2-20m.Q4_K_M.gguf";
+            "https://factory.naranjositos.tech/models/tinystories-llama2-20m.Q4_K_M.gguf";
         else if (strcmp(argv[1], "smollm")      == 0) url =
-            "https://wasm.naranjositos.tech/models/smollm2-135m-q4_0.gguf";
+            "https://factory.naranjositos.tech/models/smollm2-135m-q4_0.gguf";
+        else if (strcmp(argv[1], "llama-1b") == 0 ||
+                 strcmp(argv[1], "llama1b")  == 0) url =
+            "https://factory.naranjositos.tech/models/llama-3.2-1b-instruct-q4_k_m.gguf";
         else if (strcmp(argv[1], "default")     == 0) url = "";
         else url = argv[1];
 
