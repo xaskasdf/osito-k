@@ -566,6 +566,21 @@ EM_JS(int, js_iso_now, (char *dst, int max), {
 
 int wasm_iso_now(char *dst, int max) { return js_iso_now(dst, max); }
 
+/* Background-fetch the cc toolchain into the browser HTTP cache so
+ * the first `cc` invocation doesn't wait 30s for clang+lld+sysroot. */
+EM_JS(void, js_precache_toolchain, (), {
+    var T = 'https://wasm.naranjositos.tech/toolchain';
+    var assets = [T + '/clang.wasm', T + '/lld.wasm', T + '/sysroot.tar', T + '/memfs.wasm'];
+    var done = 0;
+    assets.forEach(function(u) {
+        fetch(u).then(function(r) {
+            if (r.ok) { done++; }
+        }).catch(function() {});
+    });
+});
+
+void wasm_precache_toolchain(void) { js_precache_toolchain(); }
+
 /* Status accessors for the bottom-bar live update. Returns pointers
  * into kernel memory — JS reads them with UTF8ToString. */
 extern bool osfs2_is_mounted(void);

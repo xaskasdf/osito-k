@@ -4832,6 +4832,15 @@ void shell_exec(char *line)
         sh_puts_color("SKIP (native build)\n", 0x00888888);
 #endif
         sh_puts_color("=== done ===\n\n", 0x00FF8800);
+    } else if (strcmp(cmd, "precache") == 0) {
+#ifdef __EMSCRIPTEN__
+        sh_puts("[precache] kicking background fetch of clang/lld/sysroot/memfs (~50 MB)...\n");
+        sh_puts("           subsequent 'cc' calls will be instant.\n");
+        extern void wasm_precache_toolchain(void);
+        wasm_precache_toolchain();
+#else
+        sh_puts("precache: WASM-only\n");
+#endif
     } else if (strcmp(cmd, "reload") == 0) {
 #ifdef __EMSCRIPTEN__
         sh_puts("[reload] reloading page...\n");
