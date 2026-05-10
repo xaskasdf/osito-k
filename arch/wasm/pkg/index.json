@@ -55,6 +55,12 @@
       "url": "grep.wasm",
       "desc": "filter stdin lines containing argv[1] substring (no regex)",
       "size": 625
+    },
+    {
+      "name": "head",
+      "url": "head.wasm",
+      "desc": "print first N lines (head 5 or head -n 5; default 10)",
+      "size": 574
     }
   ]
 }
