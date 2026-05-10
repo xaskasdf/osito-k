@@ -4812,6 +4812,20 @@ void shell_exec(char *line)
 #else
         sh_puts("reload: WASM-only\n");
 #endif
+    } else if (strcmp(cmd, "date") == 0) {
+#ifdef __EMSCRIPTEN__
+        extern int wasm_iso_now(char *dst, int max);
+        char buf[64];
+        if (wasm_iso_now(buf, sizeof(buf)) > 0) {
+            sh_puts(buf); sh_puts("\n");
+        } else {
+            sh_puts("(date unavailable)\n");
+        }
+#else
+        sh_puts("(date: native build doesn't have an RTC bridge)\n");
+#endif
+    } else if (strcmp(cmd, "whoami") == 0) {
+        sh_puts("osito\n");
     } else if (strcmp(cmd, "history") == 0) {
 #ifdef __EMSCRIPTEN__
         if (argc >= 2 && strcmp(argv[1], "clear") == 0) {

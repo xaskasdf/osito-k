@@ -554,6 +554,18 @@ EM_JS(void, js_reload_page, (), {
 
 void wasm_reload_page(void) { js_reload_page(); }
 
+/* Format current wall-clock as ISO 8601 UTC. JS owns the formatting
+ * so DST/locale bugs aren't ours. Returns bytes written. */
+EM_JS(int, js_iso_now, (char *dst, int max), {
+    var s = new Date().toISOString();
+    var bytes = lengthBytesUTF8(s) + 1;
+    if (bytes > max) bytes = max;
+    stringToUTF8(s, dst, bytes);
+    return bytes - 1;
+});
+
+int wasm_iso_now(char *dst, int max) { return js_iso_now(dst, max); }
+
 /* Status accessors for the bottom-bar live update. Returns pointers
  * into kernel memory — JS reads them with UTF8ToString. */
 extern bool osfs2_is_mounted(void);
