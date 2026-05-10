@@ -5132,6 +5132,145 @@ void shell_exec(char *line)
             sh_puts("\n");
             free(x); free(wq); free(wk); free(wv); free(wo);
             free(gpu); free(cpu); free(q); free(k); free(v); free(attn_out);
+        } else if (strcmp(argv[1], "q4k") == 0) {
+            /* Unit test: construct a Q4_K block with known scale/min/quants
+             * and dequant via matvec on a one-hot input. Compare expected
+             * vs computed values. */
+            extern void matvec_q4_k_scalar(float *, const void *, const float *,
+                                            uint32_t, uint32_t);
+            extern void *malloc(unsigned long); extern void free(void *);
+            /* Construct one 144-byte Q4_K block:
+             *   d=1.0 (fp16 0x3C00), dmin=0.0 (0x0000)
+             *   scales[0]=3 (scale for sub-block 0), scales[4]=0 (min)
+             *   scales[1..3]=0, scales[5..11]=0
+             *   qs[0..15]=0x21 (low nibble=1, high nibble=2 → sub-blk 0/1)
+             *   qs[16..127]=0
+             * Expected dequant of sub-block 0 (first 32 elems): 1.0 * 3 * 1 = 3.0
+             *   for positions 0..15, then 0*3*0 = 0 for 16..31 (since qs[16..]=0)
+             * Sub-block 1 (positions 32..63): 1.0 * 0 * 2 = 0 (scale 0) ... */
+            uint8_t block[144] = {0};
+            block[0] = 0x00; block[1] = 0x3C;  /* d=1.0 fp16 LE */
+            block[2] = 0x00; block[3] = 0x00;  /* dmin=0.0 */
+            block[4] = 3;                       /* scales[0]: scale_0=3 */
+            block[8] = 0;                       /* scales[4]: min_0=0 */
+            for (int i = 0; i < 16; i++) block[16 + i] = 0x21;  /* nib lo=1 hi=2 */
+            /* One-hot input: vector of 256 floats, all zero except pos[0]=1 */
+            float *inp = (float *)malloc(256 * 4);
+            for (int i = 0; i < 256; i++) inp[i] = 0.0f;
+            inp[0] = 1.0f;
+            float out;
+            /* rows=1, cols=256 → out is one float */
+            matvec_q4_k_scalar(&out, block, inp, 1, 256);
+            /* Expected: only inp[0] contributes. Block: low nibble qs[0]=1.
+             * sub-block 0 scale=3, min=0, d=1.0, dmin=0.0
+             * value = d * scale_0 * 1 - dmin * 0 = 1.0 * 3 * 1 - 0 = 3.0 */
+            sh_puts("[q4k test] expected=3.0  got*1k=");
+            sh_putdec((uint64_t)(uint32_t)(int32_t)(out * 1000.0f));
+            sh_puts("\n");
+            /* Test 2: inp[16]=1.0 → sub-block 1 (high nibble), but scales[1]=0
+             *   so scale_1=0 → value = 1.0 * 0 * 2 = 0. */
+            for (int i = 0; i < 256; i++) inp[i] = 0.0f;
+            inp[16] = 1.0f;
+            matvec_q4_k_scalar(&out, block, inp, 1, 256);
+            sh_puts("[q4k test2] expected=0.0  got*1k=");
+            sh_putdec((uint64_t)(uint32_t)(int32_t)(out * 1000.0f));
+            sh_puts("\n");
+            /* Test 3: same as test 1 but with scales[1]=5 to verify high nibble */
+            block[5] = 5;
+            for (int i = 0; i < 256; i++) inp[i] = 0.0f;
+            inp[32] = 1.0f;  /* Position 32 reads qs[0] high nibble (2) with scale_1=5 */
+            matvec_q4_k_scalar(&out, block, inp, 1, 256);
+            sh_puts("[q4k test3] expected=10.0  got*1k=");
+            sh_putdec((uint64_t)(uint32_t)(int32_t)(out * 1000.0f));
+            sh_puts("\n");
+            free(inp);
+            /* Test 4: 2 blocks (cols=512), input one-hot at pos 256
+             * (= sub-block 0 of block 2). Block 2 has d=2.0, scale[0]=7,
+             * qs[0] low nib=3 → value=2*7*3=42. */
+            uint8_t big[288] = {0};
+            /* Block 0: all zero (no quants → 0 output) */
+            big[0] = 0x00; big[1] = 0x3C;  /* d=1.0 */
+            /* Block 1: at offset 144 */
+            big[144] = 0x00; big[145] = 0x40;  /* d=2.0 (fp16 0x4000) */
+            big[148] = 7;                      /* scales[0]=7 */
+            big[160] = 0x03;                   /* qs[0] low=3 hi=0 */
+            float *inp2 = (float *)malloc(512 * 4);
+            for (int i = 0; i < 512; i++) inp2[i] = 0.0f;
+            inp2[256] = 1.0f;
+            matvec_q4_k_scalar(&out, big, inp2, 1, 512);
+            sh_puts("[q4k test4 multi-block] expected=42.0  got*1k=");
+            sh_putdec((uint64_t)(uint32_t)(int32_t)(out * 1000.0f));
+            sh_puts("\n");
+            /* Test 5: 2 rows (rows=2, cols=256). Row 0 same as test 1
+             * (out[0]=3.0), row 1 has scales[0]=4 → out[1]=4.0. */
+            uint8_t two_row[288] = {0};
+            /* Row 0 */
+            two_row[0] = 0x00; two_row[1] = 0x3C;
+            two_row[4] = 3;
+            for (int i = 0; i < 16; i++) two_row[16 + i] = 0x21;
+            /* Row 1 at offset 144 */
+            two_row[144] = 0x00; two_row[145] = 0x3C;
+            two_row[148] = 4;  /* scales[0]=4 */
+            for (int i = 0; i < 16; i++) two_row[160 + i] = 0x21;
+            float out2r[2];
+            for (int i = 0; i < 256; i++) inp2[i] = 0.0f;
+            inp2[0] = 1.0f;
+            matvec_q4_k_scalar(out2r, two_row, inp2, 2, 256);
+            sh_puts("[q4k test5 multi-row] expected=3.0/4.0  got*1k=");
+            sh_putdec((uint64_t)(uint32_t)(int32_t)(out2r[0] * 1000.0f));
+            sh_puts("/");
+            sh_putdec((uint64_t)(uint32_t)(int32_t)(out2r[1] * 1000.0f));
+            sh_puts("\n");
+            free(inp2);
+            /* Test 6: dmin != 0 — the previous tests used dmin=0 which
+             * masks any bug in the dmin*min subtraction. Set d=1, dmin=1,
+             * scales[0]=3 (scale), scales[4]=2 (min), qs[0] low=5.
+             * Expected: d*scale*q - dmin*min = 1*3*5 - 1*2 = 13. */
+            uint8_t blk[144] = {0};
+            blk[0] = 0x00; blk[1] = 0x3C;   /* d=1.0 */
+            blk[2] = 0x00; blk[3] = 0x3C;   /* dmin=1.0 */
+            blk[4] = 3;                      /* scales[0]=3 */
+            blk[8] = 2;                      /* scales[4]=2 (min) */
+            blk[16] = 0x05;                  /* qs[0] low=5 */
+            for (int i = 0; i < 256; i++) inp[i] = 0.0f;
+            inp[0] = 1.0f;
+            matvec_q4_k_scalar(&out, blk, inp, 1, 256);
+            sh_puts("[q4k test6 dmin] expected=13.0  got*1k=");
+            sh_putdec((uint64_t)(uint32_t)(int32_t)(out * 1000.0f));
+            sh_puts("\n");
+            free(inp);
+        } else if (strcmp(argv[1], "q6k") == 0) {
+            extern void matvec_q6_k_scalar(float *, const void *, const float *,
+                                            uint32_t, uint32_t);
+            extern void *malloc(unsigned long); extern void free(void *);
+            /* Q6_K block (210 bytes):
+             *   ql[128]: low 4 bits of each 6-bit quant
+             *   qh[64]:  high 2 bits packed 4-per-byte
+             *   sc[16]:  int8 scales per 16-element sub-block
+             *   d:       fp16 (offset 208)
+             *
+             * For sub-block 0 (elements 0..15) the layout maps:
+             *   q[0..31] uses ql[0..31].low + qh[0..31].bits[0..1], scale sc[0]
+             *
+             * Per llama.cpp: q1 = (ql[l] & 0xF) | (((qh[l] >> 0) & 3) << 4) - 32
+             * For l=0: ql[0] low=5, qh[0] bits[0..1]=2 → q1 = (5 | (2<<4)) - 32 = 37-32 = 5
+             * value = d * sc[0] * 5 */
+            uint8_t blk[210] = {0};
+            blk[208] = 0x00; blk[209] = 0x3C;  /* d=1.0 fp16 */
+            blk[192 + 0] = 4;                  /* sc[0] = 4 */
+            blk[0]   = 0x05;                   /* ql[0] = 0x05 → low=5 */
+            blk[128] = 0x02;                   /* qh[0] = 0x02 → low 2 bits = 2 */
+            /* So q1 = (5 | (2 << 4)) - 32 = 37-32 = 5 */
+            /* Expected: 1.0 * 4 * 5 = 20.0 */
+            float *inp = (float *)malloc(256 * 4);
+            for (int i = 0; i < 256; i++) inp[i] = 0.0f;
+            inp[0] = 1.0f;
+            float out;
+            matvec_q6_k_scalar(&out, blk, inp, 1, 256);
+            sh_puts("[q6k test1] expected=20.0  got*1k=");
+            sh_putdec((uint64_t)(uint32_t)(int32_t)(out * 1000.0f));
+            sh_puts("\n");
+            free(inp);
         } else if (strcmp(argv[1], "qkv") == 0) {
             if (!wasm_wgpu_init()) { sh_puts("WebGPU not initialized.\n"); return; }
             extern int wasm_wgpu_qkv(const float *x, const float *wq,
