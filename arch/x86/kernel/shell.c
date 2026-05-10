@@ -4428,6 +4428,55 @@ void shell_exec(char *line)
             sh_puts("\n  shell:  121+ builtins (chat/git/cc/mount-fs/ws/...)");
         }
         sh_puts("\n");
+    } else if (strcmp(cmd, "hexdump") == 0 || strcmp(cmd, "xxd") == 0) {
+        if (argc < 2) {
+            sh_puts("Usage: hexdump <file> [bytes]   (default 256)\n");
+            return;
+        }
+        if (!osfs2_is_mounted()) { sh_puts("No filesystem mounted\n"); return; }
+        void *f = osfs2_find(argv[1]);
+        if (!f) { sh_puts("File not found.\n"); return; }
+        extern uint64_t osfs2_file_size(void *file);
+        uint64_t fsz = osfs2_file_size(f);
+        int want = 256;
+        if (argc >= 3) {
+            want = 0;
+            for (const char *s = argv[2]; *s >= '0' && *s <= '9'; s++)
+                want = want * 10 + (*s - '0');
+        }
+        if ((uint64_t)want > fsz) want = (int)fsz;
+        if (want > 8192) want = 8192;
+
+        static uint8_t buf[8192];
+        if (osfs2_read(f, 0, buf, want) < 0) { sh_puts("Read failed.\n"); return; }
+        static const char hex[] = "0123456789abcdef";
+        for (int i = 0; i < want; i += 16) {
+            char line[80]; int p = 0;
+            /* address */
+            for (int s = 24; s >= 0; s -= 8) line[p++] = hex[(i >> s) & 0xF];
+            line[p++] = ' '; line[p++] = ' ';
+            /* hex bytes */
+            for (int j = 0; j < 16; j++) {
+                if (i + j < want) {
+                    line[p++] = hex[(buf[i+j] >> 4) & 0xF];
+                    line[p++] = hex[buf[i+j] & 0xF];
+                } else {
+                    line[p++] = ' '; line[p++] = ' ';
+                }
+                line[p++] = (j == 7) ? '-' : ' ';
+            }
+            line[p++] = ' ';
+            /* ascii */
+            for (int j = 0; j < 16 && i + j < want; j++) {
+                uint8_t c = buf[i+j];
+                line[p++] = (c >= 32 && c < 127) ? (char)c : '.';
+            }
+            line[p++] = '\n'; line[p] = '\0';
+            sh_puts(line);
+        }
+        if ((uint64_t)want < fsz) {
+            sh_puts("... ["); sh_putdec(fsz - want); sh_puts(" more bytes]\n");
+        }
     } else if (strcmp(cmd, "find") == 0) {
         if (argc < 2) { sh_puts("Usage: find <substring>\n"); return; }
         if (!osfs2_is_mounted()) { sh_puts("No filesystem mounted\n"); return; }
