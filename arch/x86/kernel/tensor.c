@@ -112,14 +112,20 @@ float f16_to_f32(uint16_t h)
         if (man == 0) {
             bits = sign; /* +/- zero */
         } else {
-            /* Denormalized: shift mantissa until hidden bit appears */
+            /* Denormalized: shift mantissa until hidden bit appears.
+             * After N shifts (N = final-exp - 1 in this loop), the value
+             * encodes as fp32 with biased_exp = 113 - N = 114 - final_exp.
+             * The previous formula (113 - exp) was off by one and made
+             * subnormal fp16 reads return exactly HALF the correct value,
+             * which corrupted Q4_K_M / Q6_K dequant for Llama 3.2-1B where
+             * super-block scales are subnormal (~2e-5). */
             exp = 1;
             while (!(man & 0x400)) {
                 man <<= 1;
                 exp++;
             }
             man &= 0x3FF;
-            bits = sign | (((uint32_t)(127 - 15 + 1 - exp)) << 23) | (man << 13);
+            bits = sign | (((uint32_t)(127 - 15 + 2 - exp)) << 23) | (man << 13);
         }
     } else if (exp == 31) {
         bits = sign | 0x7F800000 | (man << 13); /* inf/nan */
@@ -587,11 +593,35 @@ void vec_mul(float *out, const float *a, const float *b, uint32_t n)
 void rope(float *vec, uint32_t n_heads, uint32_t head_dim,
           uint32_t pos, float theta)
 {
+    /* Llama 3.x rope_scaling: factor=32, low_freq_factor=1,
+     * high_freq_factor=4, original_max_position_embeddings=8192.
+     * Auto-detect by theta>=500000 (Llama 3 hallmark vs Llama 2's
+     * theta=10000). Without this scaling the high-i (low-freq) dims
+     * get rotated by ~32x the correct angle, corrupting attention. */
+    int llama3 = (theta >= 100000.0f);
+    const float FACTOR = 32.0f;
+    const float LO_FF  = 1.0f;
+    const float HI_FF  = 4.0f;
+    const float ORIG_CTX = 8192.0f;
+    const float LO_WAVE  = ORIG_CTX / LO_FF;     /* 8192 */
+    const float HI_WAVE  = ORIG_CTX / HI_FF;     /* 2048 */
+    const float TWO_PI   = 6.28318530717958647692f;
     for (uint32_t h = 0; h < n_heads; h++) {
         float *head = vec + h * head_dim;
         for (uint32_t i = 0; i < head_dim; i += 2) {
-            float freq = 1.0f / powf_bare(theta, (float)i / (float)head_dim);
-            float angle = (float)pos * freq;
+            float inv_freq = 1.0f / powf_bare(theta, (float)i / (float)head_dim);
+            if (llama3) {
+                float wavelen = TWO_PI / inv_freq;
+                if (wavelen > LO_WAVE) {
+                    inv_freq /= FACTOR;
+                } else if (wavelen >= HI_WAVE) {
+                    /* Smooth interpolation in the medium-freq band. */
+                    float smooth = (ORIG_CTX / wavelen - LO_FF) / (HI_FF - LO_FF);
+                    inv_freq = (1.0f - smooth) * (inv_freq / FACTOR) + smooth * inv_freq;
+                }
+                /* wavelen < HI_WAVE → unchanged (high freq) */
+            }
+            float angle = (float)pos * inv_freq;
             float cos_a = cosf_bare(angle);
             float sin_a = sinf_bare(angle);
             float x0 = head[i], x1 = head[i + 1];
