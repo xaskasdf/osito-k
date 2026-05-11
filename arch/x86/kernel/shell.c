@@ -3885,11 +3885,15 @@ void shell_exec(char *line)
         }
     } else if (strcmp(cmd, "wiki") == 0) {
 #ifdef __EMSCRIPTEN__
-        /* Browser-RAG: retrieve from simple_en, stitch top hits into a
-         * chat prompt, then call llama_chat. */
+        /* Browser-RAG over simple_en. Builds a ChatML system+user turn
+         * that puts Wikipedia hits in the system prompt and the user's
+         * question in the user turn. Brandon-tiny gets nudged toward
+         * citing rather than hallucinating; Llama 1B naturally treats
+         * the system context as ground truth. */
         if (argc < 2) {
-            sh_puts("Usage: rag <query>\n");
-            sh_puts("  Retrieves from simple_en, then asks the loaded LM.\n");
+            sh_puts("Usage: wiki <query>\n");
+            sh_puts("  Retrieves from simple_en (osito-a-models), then asks the loaded LM.\n");
+            sh_puts("  Recommended sampling: temp 0.4 + penalty 1.15 0.1 0.1 + ngram 3\n");
             return;
         }
         if (!prompt_llama) {
@@ -3906,29 +3910,35 @@ void shell_exec(char *line)
         extern int rag_retrieve(const char *corpus, const char *query,
                                  char *result, int result_max);
         char *hits = (char *)malloc(2048);
-        if (!hits) { sh_puts("rag: OOM\n"); return; }
+        if (!hits) { sh_puts("wiki: OOM\n"); return; }
         if (rag_retrieve("simple_en", qbuf, hits, 2048) != 0) {
-            sh_puts_color("rag: retrieval failed (network?)\n", 0x00FF0000);
+            sh_puts_color("wiki: retrieval failed (network?)\n", 0x00FF0000);
             free(hits); return;
         }
         sh_puts_color("\n--- Retrieved context ---\n", 0x00FF8800);
         sh_puts(hits);
-        sh_puts("\n--- LM response ---\n");
-        char *prompt = (char *)malloc(4096);
-        int pp = 0;
-        for (const char *p = hits + (hits[0]=='\n'?1:0); *p && pp < 4095; p++)
-            prompt[pp++] = *p;
-        const char *suffix = "\n\nBased on the Wikipedia excerpts above, ";
-        for (const char *p = suffix; *p && pp < 4095; p++) prompt[pp++] = *p;
-        for (const char *p = qbuf; *p && pp < 4095; p++) prompt[pp++] = *p;
-        prompt[pp] = 0;
+        sh_puts("\n--- LM response ---");
+
+        /* Build a compact system prompt with the hits. Brandon's ctx
+         * cap is 512 — keep system terse so question + generation fit. */
+        char *system_msg = (char *)malloc(2048);
+        int sp = 0;
+        const char *pre = "Use the Wikipedia excerpts below to answer the user. "
+                          "Cite only what the excerpts state; if they don't say, say you don't know.\n";
+        for (const char *p = pre; *p && sp < 2046; p++) system_msg[sp++] = *p;
+        const char *hp = hits;
+        if (*hp == '\n') hp++;
+        for (; *hp && sp < 2046; hp++) system_msg[sp++] = *hp;
+        system_msg[sp] = 0;
+
         sh_puts_color("\nLlama: ", 0x00FF8800);
-        int r = llama_chat(prompt_llama, prompt, 128, chat_token_cb, NULL);
+        int r = llama_chat_with_system(prompt_llama, system_msg, qbuf, 128,
+                                        chat_token_cb, NULL);
         if (r < 0) sh_puts_color("[error]\n", 0x00FF0000);
         else       sh_puts("\n");
-        free(hits); free(prompt);
+        free(hits); free(system_msg);
 #else
-        sh_puts("rag: WASM-only\n");
+        sh_puts("wiki: WASM-only\n");
 #endif
     } else if (strcmp(cmd, "https") == 0) {
         if (argc < 2) {
