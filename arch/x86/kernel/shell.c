@@ -5239,6 +5239,22 @@ void shell_exec(char *line)
             sh_putdec((uint64_t)(uint32_t)(int32_t)(out * 1000.0f));
             sh_puts("\n");
             free(inp);
+            /* Test 7: 3 blocks (cols=768) — ffn_down stride. Block 2
+             * (last) has d=1, scale=2, qs[0] low=4. Input one-hot at
+             * pos 512 → expected: 1*2*4 = 8. */
+            uint8_t big3[432] = {0};
+            big3[288+0] = 0x00; big3[288+1] = 0x3C;  /* d=1.0 */
+            big3[288+4] = 2;                          /* scales[0]=2 */
+            big3[288+16] = 0x04;                      /* qs[0] low=4 */
+            float *inp3 = (float *)malloc(768 * 4);
+            for (int i = 0; i < 768; i++) inp3[i] = 0.0f;
+            inp3[512] = 1.0f;
+            float out3;
+            matvec_q4_k_scalar(&out3, big3, inp3, 1, 768);
+            sh_puts("[q4k test7 3-block] expected=8.0  got*1k=");
+            sh_putdec((uint64_t)(uint32_t)(int32_t)(out3 * 1000.0f));
+            sh_puts("\n");
+            free(inp3);
         } else if (strcmp(argv[1], "shapes") == 0) {
             if (!prompt_llama) { sh_puts("No model loaded.\n"); return; }
             extern void llama_debug_dump_shapes(void *);

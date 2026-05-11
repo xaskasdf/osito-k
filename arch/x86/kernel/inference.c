@@ -188,9 +188,17 @@ static void embed_token(float *dst, gguf_tensor_t *embd, uint32_t token, uint32_
         }
         break;
     }
-    default:
+    default: {
         memset(dst, 0, dim * sizeof(float));
+        static int embed_warned = 0;
+        if (!embed_warned) {
+            embed_warned = 1;
+            serial_puts("[embed WARN] unsupported tensor type=");
+            serial_putdec((uint64_t)embd->type);
+            serial_puts(" -- embed zeroed!\n");
+        }
         break;
+    }
     }
 }
 
@@ -280,9 +288,19 @@ static void matvec(float *out, gguf_tensor_t *tensor,
 #endif
         break;
     }
-    default:
+    default: {
         memset(out, 0, rows * sizeof(float));
+        /* Loud one-shot warning so we know if any unsupported quant
+         * type silently zeros a matvec. */
+        static uint32_t warned_types = 0;
+        if (!(warned_types & (1u << (tensor->type & 31)))) {
+            warned_types |= (1u << (tensor->type & 31));
+            serial_puts("[matvec WARN] unsupported tensor type=");
+            serial_putdec((uint64_t)tensor->type);
+            serial_puts(" -- output zeroed!\n");
+        }
         break;
+    }
     }
 }
 
