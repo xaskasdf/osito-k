@@ -29,7 +29,7 @@ GIT_REV   := $(shell cd $(CURDIR)/../.. && git rev-parse --short HEAD 2>/dev/nul
 BUILD_TS  := $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
 
 CFLAGS := \
-    -Os \
+    -O3 \
     -std=gnu11 \
     -DWASM_BUILD=1 \
     -DOSITO_GIT_REV=\"$(GIT_REV)\" \
