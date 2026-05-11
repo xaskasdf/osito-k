@@ -3989,6 +3989,60 @@ uint8_t *wasm_url_fetch(const char *url, int *out_size)
     return buf;
 }
 
+/* ── Simple HTTP POST with JSON body ──────────────────────────
+ * Returns a malloc'd response buffer + size, NULL on error. Caller
+ * frees. Used by 'rag' for /embed and any future POST endpoint
+ * that returns a non-streaming JSON response. */
+EM_JS(void, js_http_post_kick, (const char *url, const char *body), {
+    var u = UTF8ToString(url);
+    var b = UTF8ToString(body);
+    window.__postDone = false;
+    window.__postData = null;
+    window.__postError = null;
+    fetch(u, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: b
+    })
+        .then(function(r) {
+            if (!r.ok) throw new Error('HTTP ' + r.status);
+            return r.arrayBuffer();
+        })
+        .then(function(ab) {
+            window.__postData = new Uint8Array(ab);
+            window.__postDone = true;
+        })
+        .catch(function(e) {
+            window.__postError = String(e);
+            window.__postDone = true;
+        });
+});
+EM_JS(int, js_http_post_done, (), { return window.__postDone ? 1 : 0; });
+EM_JS(int, js_http_post_size, (), {
+    return window.__postData ? window.__postData.byteLength : 0;
+});
+EM_JS(void, js_http_post_copy, (uint8_t *dst, int max), {
+    var src = window.__postData;
+    if (!src) return;
+    var n = src.byteLength < max ? src.byteLength : max;
+    HEAPU8.set(src.subarray(0, n), dst);
+});
+
+uint8_t *wasm_http_post_json(const char *url, const char *body, int *out_size)
+{
+    js_http_post_kick(url, body);
+    while (!js_http_post_done()) emscripten_sleep(20);
+    int sz = js_http_post_size();
+    if (sz <= 0) return NULL;
+    extern void *malloc(size_t);
+    uint8_t *buf = (uint8_t *)malloc(sz + 1);
+    if (!buf) return NULL;
+    js_http_post_copy(buf, sz);
+    buf[sz] = 0;
+    if (out_size) *out_size = sz;
+    return buf;
+}
+
 /* Backwards-compat: fetch into slot 0. */
 int aux_disk_fetch(const char *url) {
     /* Ensure slot 0 is allocated/named for legacy callers. */

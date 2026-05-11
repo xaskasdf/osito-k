@@ -76,6 +76,7 @@ X86_SRCS := \
     ../x86/kernel/terminal.c \
     ../x86/kernel/tensor.c \
     ../x86/kernel/inference.c \
+    ../x86/kernel/rag.c \
     ../x86/kernel/tokenizer.c \
     ../x86/kernel/tokenizer_trie.c \
     ../x86/kernel/compositor.c \

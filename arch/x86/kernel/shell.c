@@ -3883,6 +3883,53 @@ void shell_exec(char *line)
         } else {
             sh_puts("Unknown crypto subcommand.\n");
         }
+    } else if (strcmp(cmd, "wiki") == 0) {
+#ifdef __EMSCRIPTEN__
+        /* Browser-RAG: retrieve from simple_en, stitch top hits into a
+         * chat prompt, then call llama_chat. */
+        if (argc < 2) {
+            sh_puts("Usage: rag <query>\n");
+            sh_puts("  Retrieves from simple_en, then asks the loaded LM.\n");
+            return;
+        }
+        if (!prompt_llama) {
+            sh_puts("No model loaded — use 'model brandon' or 'model llama-1b' first.\n");
+            return;
+        }
+        char qbuf[512]; int qn = 0;
+        for (int i = 1; i < argc; i++) {
+            if (i > 1 && qn < (int)sizeof(qbuf) - 1) qbuf[qn++] = ' ';
+            for (const char *p = argv[i]; *p && qn < (int)sizeof(qbuf) - 1; p++)
+                qbuf[qn++] = *p;
+        }
+        qbuf[qn] = 0;
+        extern int rag_retrieve(const char *corpus, const char *query,
+                                 char *result, int result_max);
+        char *hits = (char *)malloc(2048);
+        if (!hits) { sh_puts("rag: OOM\n"); return; }
+        if (rag_retrieve("simple_en", qbuf, hits, 2048) != 0) {
+            sh_puts_color("rag: retrieval failed (network?)\n", 0x00FF0000);
+            free(hits); return;
+        }
+        sh_puts_color("\n--- Retrieved context ---\n", 0x00FF8800);
+        sh_puts(hits);
+        sh_puts("\n--- LM response ---\n");
+        char *prompt = (char *)malloc(4096);
+        int pp = 0;
+        for (const char *p = hits + (hits[0]=='\n'?1:0); *p && pp < 4095; p++)
+            prompt[pp++] = *p;
+        const char *suffix = "\n\nBased on the Wikipedia excerpts above, ";
+        for (const char *p = suffix; *p && pp < 4095; p++) prompt[pp++] = *p;
+        for (const char *p = qbuf; *p && pp < 4095; p++) prompt[pp++] = *p;
+        prompt[pp] = 0;
+        sh_puts_color("\nLlama: ", 0x00FF8800);
+        int r = llama_chat(prompt_llama, prompt, 128, chat_token_cb, NULL);
+        if (r < 0) sh_puts_color("[error]\n", 0x00FF0000);
+        else       sh_puts("\n");
+        free(hits); free(prompt);
+#else
+        sh_puts("rag: WASM-only\n");
+#endif
     } else if (strcmp(cmd, "https") == 0) {
         if (argc < 2) {
             sh_puts("Usage: https <host> [path]\n");
@@ -5329,6 +5376,26 @@ void shell_exec(char *line)
             sh_putdec((uint64_t)(uint32_t)(int32_t)(out * 1000.0f));
             sh_puts("\n");
             free(inp);
+            /* Test 2: 8 Q6_K blocks (cols=2048) — attn_v stride for Llama 1B.
+             * Last block (block 7) at offset 7*210=1470. d=1, sc[0]=3, ql[0] low=2, qh[0]=0
+             * → q1 = (2 | (0 << 4)) - 32 = -30. value = 1 * 3 * (-30) = -90.
+             * Input one-hot at pos 7*256 = 1792 → expected -90.0 */
+            uint8_t big8[8*210] = {0};
+            big8[7*210 + 208] = 0x00; big8[7*210 + 209] = 0x3C;  /* d=1.0 */
+            big8[7*210 + 192 + 0] = 3;                            /* sc[0]=3 */
+            big8[7*210 + 0]   = 0x02;                             /* ql[0] low=2 */
+            big8[7*210 + 128] = 0x00;                             /* qh[0]=0 */
+            float *inp2 = (float *)malloc(2048 * 4);
+            for (int i = 0; i < 2048; i++) inp2[i] = 0.0f;
+            inp2[1792] = 1.0f;
+            float out2;
+            extern void matvec_q6_k_scalar(float *, const void *, const float *,
+                                            uint32_t, uint32_t);
+            matvec_q6_k_scalar(&out2, big8, inp2, 1, 2048);
+            sh_puts("[q6k test2 8-block] expected=-90.0  got*1k=");
+            sh_putdec((uint64_t)(uint32_t)(int32_t)(out2 * 1000.0f));
+            sh_puts("\n");
+            free(inp2);
         } else if (strcmp(argv[1], "qkv") == 0) {
             if (!wasm_wgpu_init()) { sh_puts("WebGPU not initialized.\n"); return; }
             extern int wasm_wgpu_qkv(const float *x, const float *wq,
