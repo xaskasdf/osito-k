@@ -5239,6 +5239,48 @@ void shell_exec(char *line)
             sh_putdec((uint64_t)(uint32_t)(int32_t)(out * 1000.0f));
             sh_puts("\n");
             free(inp);
+        } else if (strcmp(argv[1], "shapes") == 0) {
+            if (!prompt_llama) { sh_puts("No model loaded.\n"); return; }
+            extern void llama_debug_dump_shapes(void *);
+            extern void llama_debug_dump_row(void *);
+            llama_debug_dump_shapes(prompt_llama);
+            llama_debug_dump_row(prompt_llama);
+        } else if (strcmp(argv[1], "embed-diff") == 0) {
+            if (!prompt_llama) { sh_puts("No model loaded.\n"); return; }
+            extern void llama_debug_embed(void *, uint32_t, float *);
+            extern void llama_debug_matvec_row(void *, uint32_t, float *);
+            uint32_t token = 5;
+            if (argc >= 3) {
+                uint32_t n = 0;
+                for (const char *p = argv[2]; *p >= '0' && *p <= '9'; p++)
+                    n = n * 10 + (*p - '0');
+                token = n;
+            }
+            float a[8], b[8];
+            llama_debug_embed(prompt_llama, token, a);
+            llama_debug_matvec_row(prompt_llama, token, b);
+            sh_puts("[embed-diff] token="); sh_putdec((uint64_t)token);
+            sh_puts("\n  embed_token first8 (*1k):");
+            for (int i = 0; i < 8; i++) {
+                sh_puts(" ");
+                sh_putdec((uint64_t)(uint32_t)(int32_t)(a[i] * 1000.0f));
+            }
+            sh_puts("\n  matvec_row first8 (*1k):");
+            for (int i = 0; i < 8; i++) {
+                sh_puts(" ");
+                sh_putdec((uint64_t)(uint32_t)(int32_t)(b[i] * 1000.0f));
+            }
+            sh_puts("\n  diff*1k:");
+            float md = 0;
+            for (int i = 0; i < 8; i++) {
+                float d = a[i] - b[i]; if (d < 0) d = -d;
+                if (d > md) md = d;
+                sh_puts(" ");
+                sh_putdec((uint64_t)(uint32_t)(int32_t)((a[i]-b[i]) * 1000.0f));
+            }
+            sh_puts("\n  maxdiff*1k=");
+            sh_putdec((uint64_t)(uint32_t)(int32_t)(md * 1000.0f));
+            sh_puts("\n");
         } else if (strcmp(argv[1], "q6k") == 0) {
             extern void matvec_q6_k_scalar(float *, const void *, const float *,
                                             uint32_t, uint32_t);

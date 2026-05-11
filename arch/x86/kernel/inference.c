@@ -1166,7 +1166,7 @@ int brandon_forward(llama_state_t *s, uint32_t token)
         return -1;
     s->pos++;
 
-    /* Debug: dump top-3 candidate tokens to serial after forward */
+    /* Debug: dump top-3 candidate tokens + their logit values to serial. */
     if (g_brandon_debug_logits) {
         float *L = s->logits;
         uint32_t n = s->vocab_size;
@@ -1178,10 +1178,19 @@ int brandon_forward(llama_state_t *s, uint32_t token)
             else if (v > v1) { v2 = v1; a2 = a1; v1 = v; a1 = i; }
             else if (v > v2) { v2 = v; a2 = i; }
         }
+        /* Mean + std of logits (rough sanity). */
+        float sum = 0.0f, sumsq = 0.0f;
+        for (uint32_t i = 0; i < n; i++) { sum += L[i]; sumsq += L[i]*L[i]; }
+        float mean = sum / (float)n;
+        float var = sumsq / (float)n - mean * mean;
         serial_puts("[DBG] top3 tok="); serial_putdec(a0);
         serial_puts(","); serial_putdec(a1);
         serial_puts(","); serial_putdec(a2);
-        serial_puts(" pos="); serial_putdec(s->pos);
+        serial_puts(" vals*1k="); serial_putdec((uint64_t)(uint32_t)(int32_t)(v0*1000.0f));
+        serial_puts(","); serial_putdec((uint64_t)(uint32_t)(int32_t)(v1*1000.0f));
+        serial_puts(","); serial_putdec((uint64_t)(uint32_t)(int32_t)(v2*1000.0f));
+        serial_puts(" mean*1k="); serial_putdec((uint64_t)(uint32_t)(int32_t)(mean*1000.0f));
+        serial_puts(" var*1k="); serial_putdec((uint64_t)(uint32_t)(int32_t)(var*1000.0f));
         serial_puts("\n");
     }
     return 0;
@@ -1816,6 +1825,143 @@ int llama_state_dim(void *s)
 { return s ? (int)((llama_state_t *)s)->dim : 0; }
 int llama_state_layers(void *s)
 { return s ? (int)((llama_state_t *)s)->n_layers : 0; }
+/* Debug accessor: dump the first 8 floats of embed_token(token) result. */
+/* Dump first 4 tensors' ne[] dims and type to verify GGUF layout. */
+/* Dump the dequantized first row of attn_q[0]. Uses embed_token's
+ * dequant path because that's verified consistent with matvec. */
+void llama_debug_dump_row(void *s_in)
+{
+    llama_state_t *s = (llama_state_t *)s_in;
+    extern void serial_puts(const char *);
+    extern void serial_putdec(uint64_t);
+    gguf_tensor_t *t = s->weights.layers[0].attn_q;
+    uint32_t dim = s->dim;
+    extern void *malloc(unsigned long); extern void free(void *);
+    /* Dump raw bytes of first block (d, dmin, 12 scales). */
+    const uint8_t *b = (const uint8_t *)t->data;
+    serial_puts("[row0 raw] d=");
+    serial_putdec((uint64_t)b[0]); serial_puts(",");
+    serial_putdec((uint64_t)b[1]); serial_puts(" dmin=");
+    serial_putdec((uint64_t)b[2]); serial_puts(",");
+    serial_putdec((uint64_t)b[3]); serial_puts(" scales=");
+    for (int i = 0; i < 12; i++) {
+        serial_putdec((uint64_t)b[4 + i]);
+        serial_puts(",");
+    }
+    serial_puts(" qs[0..7]=");
+    for (int i = 0; i < 8; i++) {
+        serial_putdec((uint64_t)b[16 + i]);
+        serial_puts(",");
+    }
+    serial_puts("\n");
+    float *tmp = (float *)malloc((size_t)dim * sizeof(float));
+    /* Treat row 0 of attn_q like an embed: dequant the first row's bytes. */
+    /* attn_q is [out_dim=dim, in_dim=dim]. Row 0 = first output's weights. */
+    embed_token(tmp, t, 0, dim);
+    /* Print first 12 values *1k, and compute sum-of-squares for magnitude. */
+    serial_puts("[row0 attn_q] first12*1k=");
+    float ssq = 0.0f;
+    float maxabs = 0.0f;
+    for (uint32_t i = 0; i < dim; i++) {
+        ssq += tmp[i] * tmp[i];
+        float a = tmp[i] < 0 ? -tmp[i] : tmp[i];
+        if (a > maxabs) maxabs = a;
+    }
+    for (int i = 0; i < 12; i++) {
+        serial_putdec((uint64_t)(uint32_t)(int32_t)(tmp[i] * 1000.0f));
+        serial_puts(",");
+    }
+    serial_puts(" rms*1k=");
+    extern double sqrt(double);
+    float rms = (float)sqrt(ssq / dim);
+    serial_putdec((uint64_t)(uint32_t)(int32_t)(rms * 1000.0f));
+    serial_puts(" maxabs*1k=");
+    serial_putdec((uint64_t)(uint32_t)(int32_t)(maxabs * 1000.0f));
+    serial_puts("\n");
+    free(tmp);
+}
+
+void llama_debug_dump_shapes(void *s_in)
+{
+    llama_state_t *s = (llama_state_t *)s_in;
+    extern void serial_puts(const char *);
+    extern void serial_putdec(uint64_t);
+    struct { const char *name; gguf_tensor_t *t; } picks[6] = {
+        {"token_embd", s->weights.token_embd},
+        {"attn_q[0]",  s->weights.layers[0].attn_q},
+        {"attn_k[0]",  s->weights.layers[0].attn_k},
+        {"attn_v[0]",  s->weights.layers[0].attn_v},
+        {"attn_o[0]",  s->weights.layers[0].attn_output},
+        {"ffn_gate[0]", s->weights.layers[0].ffn_gate},
+    };
+    for (int i = 0; i < 6; i++) {
+        if (!picks[i].t) continue;
+        gguf_tensor_t *t = picks[i].t;
+        serial_puts("[shape] "); serial_puts(picks[i].name);
+        serial_puts(" type="); serial_putdec((uint64_t)t->type);
+        serial_puts(" ne=");
+        for (uint32_t d = 0; d < t->n_dims; d++) {
+            serial_putdec(t->ne[d]);
+            if (d + 1 < t->n_dims) serial_puts("x");
+        }
+        serial_puts("\n");
+    }
+}
+
+void llama_debug_embed(void *s_in, uint32_t token, float *out8)
+{
+    llama_state_t *s = (llama_state_t *)s_in;
+    uint32_t dim = s->dim;
+    extern void *malloc(unsigned long); extern void free(void *);
+    float *tmp = (float *)malloc((size_t)dim * sizeof(float));
+    if (!tmp) return;
+    embed_token(tmp, s->weights.token_embd, token, dim);
+    for (int i = 0; i < 8; i++) out8[i] = tmp[i];
+    free(tmp);
+}
+
+/* Debug accessor: do matvec(rows=1) on token_embd row[token] with one-hot
+ * input — extracts the SAME row via the dispatcher, bypassing embed_token.
+ * If embed_token's inline dequant has a bug but matvec is correct, the
+ * two paths will disagree. */
+void llama_debug_matvec_row(void *s_in, uint32_t token, float *out8)
+{
+    llama_state_t *s = (llama_state_t *)s_in;
+    uint32_t dim = s->dim;
+    extern void *malloc(unsigned long); extern void free(void *);
+    /* Build one-hot input of size dim (one 1.0, rest zero — extracts col c
+     * via dot product). But matvec computes out[r] = sum_c w[r][c]*in[c],
+     * not extract a row. To extract a row, we need to pretend the embedding
+     * row IS a single-row weight matrix and use one-hot input.
+     *
+     * embed_token reads row[token] which is dim consecutive elements.
+     * matvec_q4_k_scalar with rows=1, cols=dim, weight=&token_embd_data[token*row_bytes]
+     * + one-hot input at position k produces: out[0] = dequantized w[0][k]
+     * which is the k-th element of the embedding row. So we'd need dim
+     * matvec calls to recover the full row. Instead, just do dim calls and
+     * grab the first 8. */
+    extern void matvec_q4_k_scalar(float *, const void *, const float *,
+                                    uint32_t, uint32_t);
+    extern void matvec_q6_k_scalar(float *, const void *, const float *,
+                                    uint32_t, uint32_t);
+    gguf_tensor_t *t = s->weights.token_embd;
+    size_t row_bytes;
+    if (t->type == GGML_TYPE_Q4_K) row_bytes = (size_t)(dim/256) * 144;
+    else if (t->type == GGML_TYPE_Q6_K) row_bytes = (size_t)(dim/256) * 210;
+    else { for (int i = 0; i < 8; i++) out8[i] = 0; return; }
+    const void *row = (const uint8_t *)t->data + (uint64_t)token * row_bytes;
+    float *inp = (float *)malloc((size_t)dim * sizeof(float));
+    for (int k = 0; k < 8; k++) {
+        for (uint32_t i = 0; i < dim; i++) inp[i] = 0.0f;
+        inp[k] = 1.0f;
+        float v;
+        if (t->type == GGML_TYPE_Q4_K) matvec_q4_k_scalar(&v, row, inp, 1, dim);
+        else matvec_q6_k_scalar(&v, row, inp, 1, dim);
+        out8[k] = v;
+    }
+    free(inp);
+}
+
 int llama_state_vocab(void *s)
 { return s ? (int)((llama_state_t *)s)->vocab_size : 0; }
 const char *llama_state_arch(void *s)

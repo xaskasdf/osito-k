@@ -317,46 +317,48 @@ static void q4k_get_scale_min(int j, const uint8_t *q, uint8_t *d, uint8_t *m)
     }
 }
 
+/* Dequant one Q4_K block (256 elements) to f32. */
+static void dequant_q4_k_block(const uint8_t *block, float *y)
+{
+    float d    = f16_to_f32(*(const uint16_t *)(block + 0));
+    float dmin = f16_to_f32(*(const uint16_t *)(block + 2));
+    const uint8_t *scales = block + 4;
+    const uint8_t *qs     = block + 16;
+    int is = 0;
+    for (int chunk = 0; chunk < 256; chunk += 64) {
+        uint8_t sc, m;
+        q4k_get_scale_min(is + 0, scales, &sc, &m);
+        float d1 = d * (float)sc, m1 = dmin * (float)m;
+        q4k_get_scale_min(is + 1, scales, &sc, &m);
+        float d2 = d * (float)sc, m2 = dmin * (float)m;
+        for (int l = 0; l < 32; l++)
+            y[chunk +     l] = d1 * (float)(qs[l] & 0xF) - m1;
+        for (int l = 0; l < 32; l++)
+            y[chunk + 32 + l] = d2 * (float)(qs[l] >> 4) - m2;
+        qs += 32; is += 2;
+    }
+}
+
 void matvec_q4_k_scalar(float *out, const void *weight,
                          const float *input, uint32_t rows, uint32_t cols)
 {
     const uint8_t *w = (const uint8_t *)weight;
     uint32_t blocks_per_row = cols / 256;
     size_t bytes_per_row = (size_t)blocks_per_row * 144;
+    /* Use a per-row dequant scratch on the stack (fixed 256 floats = 1KB
+     * per block — small). For each block, dequant to a tiny array then
+     * do a clean F32 dot product. Slightly slower than the fused path
+     * but eliminates any accumulator-order ambiguity. */
+    float scratch[256];
 
     for (uint32_t r = 0; r < rows; r++) {
         const uint8_t *row = w + r * bytes_per_row;
         float sum = 0.0f;
-        const float *inp_row = input;
         for (uint32_t b = 0; b < blocks_per_row; b++) {
-            const uint8_t *block = row + b * 144;
-            float d    = f16_to_f32(*(const uint16_t *)(block + 0));
-            float dmin = f16_to_f32(*(const uint16_t *)(block + 2));
-            const uint8_t *scales = block + 4;
-            const uint8_t *qs     = block + 16;
-            const float *inp_p = inp_row;
-
-            int is = 0;
-            for (int chunk = 0; chunk < 256; chunk += 64) {
-                uint8_t sc, m;
-                q4k_get_scale_min(is + 0, scales, &sc, &m);
-                float d1 = d * (float)sc, m1 = dmin * (float)m;
-                q4k_get_scale_min(is + 1, scales, &sc, &m);
-                float d2 = d * (float)sc, m2 = dmin * (float)m;
-                /* low nibbles -> sub-block is, high nibbles -> sub-block is+1 */
-                for (int l = 0; l < 32; l++) {
-                    float v = d1 * (float)(qs[l] & 0xF) - m1;
-                    sum += v * inp_p[l];
-                }
-                for (int l = 0; l < 32; l++) {
-                    float v = d2 * (float)(qs[l] >> 4) - m2;
-                    sum += v * inp_p[32 + l];
-                }
-                qs    += 32;
-                inp_p += 64;
-                is    += 2;
-            }
-            inp_row += 256;
+            dequant_q4_k_block(row + b * 144, scratch);
+            const float *inp = input + b * 256;
+            for (int i = 0; i < 256; i++)
+                sum += scratch[i] * inp[i];
         }
         out[r] = sum;
     }
