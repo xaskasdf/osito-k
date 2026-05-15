@@ -640,11 +640,13 @@ PVOID WINAPI VirtualAlloc(PVOID lpAddress, SIZE_T dwSize,
              * MSVC compiler offsets [-0x10..-0x28] (esi-spill in
              * SEH-decorated functions). For each candidate, check if
              * *(this+8) is a code ptr → patch to 2. */
-            for (int depth = 0; depth < 5 && walk >= 0x100000 &&
+            for (int depth = 0; depth < 10 && walk >= 0x100000 &&
                  walk < 0xFFFE0000 && (walk & 3) == 0; depth++) {
                 int32_t *neg = (int32_t *)(uintptr_t)walk;
-                /* Try locals at [-0x14], [-0x18], [-0x1C], [-0x20], [-0x24] */
-                for (int local_off = 5; local_off <= 9 && !patched; local_off++) {
+                /* Try locals at [-0x10]..[-0x40] — wide enough to cover
+                 * SEH-decorated MSVC functions (with __try frames
+                 * inflating local area) and inlined helpers. */
+                for (int local_off = 4; local_off <= 16 && !patched; local_off++) {
                     uint32_t cand = (uint32_t)*(neg - local_off);
                     if (cand < 0x100000 || cand >= 0xFFFE0000 || (cand & 3))
                         continue;
