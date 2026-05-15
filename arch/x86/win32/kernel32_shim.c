@@ -440,15 +440,26 @@ PVOID WINAPI VirtualAlloc(PVOID lpAddress, SIZE_T dwSize,
         /* VA-CACHE lookup: short-circuit repeat bogus requests from
          * the same caller-EIP.  This bypasses both the diagnostic dump
          * and the FArray-scan + cap fallback below.  Hit-count logged
-         * only at powers of 10 to avoid log spam. */
-        if (user_eip && lpAddress == NULL) {
+         * only at powers of 10 to avoid log spam.
+         *
+         * Special case eip==0: after a NULL-CALL recovery, every
+         * subsequent INT 0x2E has stack_args[-1] == 0 (synthesized
+         * retaddr), so g_last_caller_eip stays 0 forever.  Without a
+         * dedicated cache slot the engine spams thousands of LARGE
+         * allocs that each consume 256KB → VA range exhaust in ~3500
+         * calls → STATUS_NO_MEMORY → terminal appError.  Reserve a
+         * dedicated "post-recovery sentinel" slot keyed at eip=0
+         * + size>16MB (caller's intent obviously bogus). */
+        if (lpAddress == NULL) {
+            uint32_t key = user_eip ? user_eip : 0xDEAD0000;
             for (int i = 0; i < VA_CACHE_N; i++) {
-                if (va_cache[i].eip == user_eip && va_cache[i].base) {
+                if (va_cache[i].eip == key && va_cache[i].base) {
                     va_cache[i].hits++;
                     if (va_cache[i].hits == 2 || va_cache[i].hits == 10 ||
-                        va_cache[i].hits == 100 || va_cache[i].hits == 1000) {
+                        va_cache[i].hits == 100 || va_cache[i].hits == 1000 ||
+                        va_cache[i].hits == 10000) {
                         serial_puts("[VA] cache reuse eip=0x");
-                        serial_puthex(user_eip, 8);
+                        serial_puthex(key, 8);
                         serial_puts(" hits=");
                         serial_putdec(va_cache[i].hits);
                         serial_puts(" -> base=0x");
@@ -460,7 +471,7 @@ PVOID WINAPI VirtualAlloc(PVOID lpAddress, SIZE_T dwSize,
                 }
             }
         }
-        cache_eip_save = user_eip;  /* for STORE after cap path */
+        cache_eip_save = user_eip ? user_eip : 0xDEAD0000;  /* for STORE after cap path */
 
         /* Walk the user-mode EBP frame-pointer chain to find every
          * caller of the FMallocWindows::Realloc wrapper. The first
