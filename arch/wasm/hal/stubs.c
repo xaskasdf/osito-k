@@ -897,9 +897,9 @@ EM_JS(int, js_wgpu_init_kick, (), {
                             if (wavelen > LO_WAVE) {
                                 inv_freq = inv_freq / FACTOR;
                             } else if (wavelen >= HI_WAVE) {
-                                let smooth = (8192.0 / wavelen - 1.0) / 3.0;
-                                inv_freq = (1.0 - smooth) * (inv_freq / FACTOR)
-                                         + smooth * inv_freq;
+                                let sm = (8192.0 / wavelen - 1.0) / 3.0;
+                                inv_freq = (1.0 - sm) * (inv_freq / FACTOR)
+                                         + sm * inv_freq;
                             }
                         }
                         let theta = f32(pos) * inv_freq;
@@ -931,9 +931,9 @@ EM_JS(int, js_wgpu_init_kick, (), {
                             if (wavelen > LO_WAVE) {
                                 inv_freq = inv_freq / FACTOR;
                             } else if (wavelen >= HI_WAVE) {
-                                let smooth = (8192.0 / wavelen - 1.0) / 3.0;
-                                inv_freq = (1.0 - smooth) * (inv_freq / FACTOR)
-                                         + smooth * inv_freq;
+                                let sm = (8192.0 / wavelen - 1.0) / 3.0;
+                                inv_freq = (1.0 - sm) * (inv_freq / FACTOR)
+                                         + sm * inv_freq;
                             }
                         }
                         let theta = f32(pos) * inv_freq;
@@ -1317,8 +1317,8 @@ EM_JS(int, js_wgpu_init_kick, (), {
                             if (wavelen > 8192.0) {
                                 inv_freq = inv_freq / 32.0;
                             } else if (wavelen >= 2048.0) {
-                                let smooth = (8192.0 / wavelen - 1.0) / 3.0;
-                                inv_freq = (1.0 - smooth) * (inv_freq / 32.0) + smooth * inv_freq;
+                                let sm = (8192.0 / wavelen - 1.0) / 3.0;
+                                inv_freq = (1.0 - sm) * (inv_freq / 32.0) + sm * inv_freq;
                             }
                         }
                         let theta = f32(pos) * inv_freq;
@@ -1342,8 +1342,8 @@ EM_JS(int, js_wgpu_init_kick, (), {
                             if (wavelen > 8192.0) {
                                 inv_freq = inv_freq / 32.0;
                             } else if (wavelen >= 2048.0) {
-                                let smooth = (8192.0 / wavelen - 1.0) / 3.0;
-                                inv_freq = (1.0 - smooth) * (inv_freq / 32.0) + smooth * inv_freq;
+                                let sm = (8192.0 / wavelen - 1.0) / 3.0;
+                                inv_freq = (1.0 - sm) * (inv_freq / 32.0) + sm * inv_freq;
                             }
                         }
                         let theta = f32(pos) * inv_freq;
