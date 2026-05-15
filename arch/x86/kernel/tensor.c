@@ -452,40 +452,48 @@ void matvec_q4_k_scalar(float *out, const void *weight,
  *   64  bytes : qh        (high 2 bits packed 4-per-byte)
  *   16  bytes : scales    (int8_t per 16-element sub-block)
  *   2   bytes : f16 d     (super-scale) */
+static void dequant_q6_k_block(const uint8_t *block, float *y)
+{
+    const uint8_t *ql = block + 0;
+    const uint8_t *qh = block + 128;
+    const int8_t  *sc = (const int8_t *)(block + 192);
+    float d = f16_to_f32(*(const uint16_t *)(block + 208));
+    for (int n = 0; n < 256; n += 128) {
+        for (int l = 0; l < 32; l++) {
+            int is = l / 16;
+            int8_t q1 = (int8_t)((ql[l +  0] & 0xF) | (((qh[l] >> 0) & 3) << 4)) - 32;
+            int8_t q2 = (int8_t)((ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4)) - 32;
+            int8_t q3 = (int8_t)((ql[l +  0]  >> 4) | (((qh[l] >> 4) & 3) << 4)) - 32;
+            int8_t q4 = (int8_t)((ql[l + 32]  >> 4) | (((qh[l] >> 6) & 3) << 4)) - 32;
+            y[n + l +  0] = d * (float)sc[is + 0] * (float)q1;
+            y[n + l + 32] = d * (float)sc[is + 2] * (float)q2;
+            y[n + l + 64] = d * (float)sc[is + 4] * (float)q3;
+            y[n + l + 96] = d * (float)sc[is + 6] * (float)q4;
+        }
+        ql += 64; qh += 32; sc += 8;
+    }
+}
+
 void matvec_q6_k_scalar(float *out, const void *weight,
                          const float *input, uint32_t rows, uint32_t cols)
 {
     const uint8_t *w = (const uint8_t *)weight;
     uint32_t blocks_per_row = cols / 256;
     size_t bytes_per_row = (size_t)blocks_per_row * 210;
-
+    /* dequant-then-dot — same pattern as Q4_K. The dequant is scalar
+     * but the dot product loop auto-vectorizes cleanly with -O3 +
+     * msimd128, gaining most of the SIMD benefit without the much
+     * more involved Q6_K dequant-side intrinsics (Q6_K extracts 4
+     * sub-quadrants per element across two byte arrays). */
+    float scratch[256];
     for (uint32_t r = 0; r < rows; r++) {
         const uint8_t *row = w + r * bytes_per_row;
         float sum = 0.0f;
-        const float *inp_row = input;
         for (uint32_t b = 0; b < blocks_per_row; b++) {
-            const uint8_t *block = row + b * 210;
-            const uint8_t *ql = block + 0;
-            const uint8_t *qh = block + 128;
-            const int8_t  *sc = (const int8_t *)(block + 192);
-            float d = f16_to_f32(*(const uint16_t *)(block + 208));
-            const float *inp_p = inp_row;
-
-            for (int n = 0; n < 256; n += 128) {
-                for (int l = 0; l < 32; l++) {
-                    int is = l / 16;
-                    int8_t q1 = (int8_t)((ql[l +  0] & 0xF) | (((qh[l] >> 0) & 3) << 4)) - 32;
-                    int8_t q2 = (int8_t)((ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4)) - 32;
-                    int8_t q3 = (int8_t)((ql[l +  0]  >> 4) | (((qh[l] >> 4) & 3) << 4)) - 32;
-                    int8_t q4 = (int8_t)((ql[l + 32]  >> 4) | (((qh[l] >> 6) & 3) << 4)) - 32;
-                    sum += d * (float)sc[is + 0] * (float)q1 * inp_p[l +  0];
-                    sum += d * (float)sc[is + 2] * (float)q2 * inp_p[l + 32];
-                    sum += d * (float)sc[is + 4] * (float)q3 * inp_p[l + 64];
-                    sum += d * (float)sc[is + 6] * (float)q4 * inp_p[l + 96];
-                }
-                ql += 64; qh += 32; sc += 8; inp_p += 128;
-            }
-            inp_row += 256;
+            dequant_q6_k_block(row + b * 210, scratch);
+            const float *inp = input + b * 256;
+            for (int i = 0; i < 256; i++)
+                sum += scratch[i] * inp[i];
         }
         out[r] = sum;
     }
