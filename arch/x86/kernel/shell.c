@@ -3893,9 +3893,10 @@ void shell_exec(char *line)
          * citing rather than hallucinating; Llama 1B naturally treats
          * the system context as ground truth. */
         if (argc < 2) {
-            sh_puts("Usage: wiki <query>           Retrieve + answer\n");
-            sh_puts("       wiki status            Show cached RAG shards\n");
-            sh_puts("       wiki clear             Drop all cached RAG shards\n");
+            sh_puts("Usage: wiki <query>              Retrieve + answer (simple_en)\n");
+            sh_puts("       wiki -c <corpus> <query>  Use a different corpus (e.g. wiki_en)\n");
+            sh_puts("       wiki status               Show cached RAG shards\n");
+            sh_puts("       wiki clear                Drop all cached RAG shards\n");
             sh_puts("Recommended sampling: temp 0.4 + penalty 1.15 0.1 0.1 + ngram 3\n");
             return;
         }
@@ -3952,9 +3953,17 @@ void shell_exec(char *line)
             sh_puts("No model loaded — use 'model brandon' or 'model llama-1b' first.\n");
             return;
         }
+        /* Optional '-c <corpus>' override; default simple_en. wiki_en
+         * support lands once that index finishes embedding. */
+        const char *corpus = "simple_en";
+        int start = 1;
+        if (argc >= 4 && strcmp(argv[1], "-c") == 0) {
+            corpus = argv[2];
+            start = 3;
+        }
         char qbuf[512]; int qn = 0;
-        for (int i = 1; i < argc; i++) {
-            if (i > 1 && qn < (int)sizeof(qbuf) - 1) qbuf[qn++] = ' ';
+        for (int i = start; i < argc; i++) {
+            if (i > start && qn < (int)sizeof(qbuf) - 1) qbuf[qn++] = ' ';
             for (const char *p = argv[i]; *p && qn < (int)sizeof(qbuf) - 1; p++)
                 qbuf[qn++] = *p;
         }
@@ -3963,7 +3972,7 @@ void shell_exec(char *line)
                                  char *result, int result_max);
         char *hits = (char *)malloc(2048);
         if (!hits) { sh_puts("wiki: OOM\n"); return; }
-        if (rag_retrieve("simple_en", qbuf, hits, 2048) != 0) {
+        if (rag_retrieve(corpus, qbuf, hits, 2048) != 0) {
             sh_puts_color("wiki: retrieval failed (network?)\n", 0x00FF0000);
             free(hits); return;
         }
