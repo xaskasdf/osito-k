@@ -40,6 +40,51 @@ extern uint8_t *wasm_http_post_json(const char *url, const char *body, int *out_
 extern float f16_to_f32(uint16_t h);
 extern double sqrt(double);
 
+/* OsitoFS for shard caching — accessed by string name. */
+extern void    *osfs2_find(const char *name);
+extern void    *osfs2_create(const char *name, uint64_t size);
+extern int      osfs2_read(void *file, uint64_t offset, void *buf, uint64_t len);
+extern int      osfs2_write(void *file, uint64_t offset, const void *buf, uint64_t len);
+extern uint64_t osfs2_file_size(void *file);
+extern int      osfs2_delete(const char *name);
+extern int      osfs2_is_mounted(void);
+
+/* Fetch a URL, but cache the body to OsitoFS at `fs_name` so subsequent
+ * calls (across page reloads, via IndexedDB persistence) skip the
+ * network. Caller frees the returned buffer. */
+static uint8_t *rag_fetch_cached(const char *url, const char *fs_name, int *out_size)
+{
+    /* Cache hit path. */
+    if (osfs2_is_mounted()) {
+        void *f = osfs2_find(fs_name);
+        if (f) {
+            uint64_t sz = osfs2_file_size(f);
+            if (sz > 0 && sz < (uint64_t)64 * 1024 * 1024) {
+                uint8_t *buf = (uint8_t *)malloc((size_t)sz);
+                if (buf && osfs2_read(f, 0, buf, sz) == 0) {
+                    if (out_size) *out_size = (int)sz;
+                    return buf;
+                }
+                if (buf) free(buf);
+            }
+        }
+    }
+    /* Cache miss: hit the network. */
+    int sz = 0;
+    uint8_t *blob = wasm_url_fetch(url, &sz);
+    if (!blob) return NULL;
+    /* Store to OsitoFS (best effort — if write fails we still return
+     * the network buffer). */
+    if (osfs2_is_mounted() && sz > 0) {
+        /* Replace any stale copy. */
+        osfs2_delete(fs_name);
+        void *f = osfs2_create(fs_name, (uint64_t)sz);
+        if (f) osfs2_write(f, 0, blob, (uint64_t)sz);
+    }
+    if (out_size) *out_size = sz;
+    return blob;
+}
+
 #define RAG_DIM       1024
 #define RAG_DIM_BYTES (RAG_DIM / 8)   /* 128 bytes packed binary */
 #define RAG_TOP_N      4              /* clusters fetched per query */
@@ -323,13 +368,21 @@ int rag_retrieve(const char *corpus, const char *query,
     }
     l2_normalize(qvec, RAG_DIM);
 
-    /* ── Step 2: fetch centroids (do this every query for now —
-     * tiny at 512 KB and browser HTTP cache hits this for free). ── */
+    /* ── Step 2: fetch centroids (cached on OsitoFS after first call —
+     * survives reload via IndexedDB persistence so repeat queries
+     * skip this 524 KB download). ── */
     serial_puts("[rag] fetch centroids...\n");
-    char url[256];
+    char url[256], fs_path[128];
     build_rag_url(url, sizeof(url), corpus, "centroids.fp16.bin");
+    int fn = 0;
+    const char *fp = "rag/";
+    for (const char *q = fp; *q && fn < (int)sizeof(fs_path) - 1; q++) fs_path[fn++] = *q;
+    for (const char *q = corpus; *q && fn < (int)sizeof(fs_path) - 1; q++) fs_path[fn++] = *q;
+    const char *cs = "/centroids.fp16.bin";
+    for (const char *q = cs; *q && fn < (int)sizeof(fs_path) - 1; q++) fs_path[fn++] = *q;
+    fs_path[fn] = 0;
     int csz = 0;
-    uint8_t *c_buf = wasm_url_fetch(url, &csz);
+    uint8_t *c_buf = rag_fetch_cached(url, fs_path, &csz);
     if (!c_buf) { serial_puts("[rag] centroids fetch failed\n"); free(qvec); return -1; }
     int n_clusters = csz / (RAG_DIM * 2);
 
@@ -361,8 +414,16 @@ int rag_retrieve(const char *corpus, const char *query,
         char path[64];
         cluster_path(path, sizeof(path), "clusters", cluster_id, ".bin");
         build_rag_url(url, sizeof(url), corpus, path);
+        /* Cache cluster shard by full fs path. */
+        char shard_fs[128]; int sf = 0;
+        const char *pre = "rag/";
+        for (const char *q = pre; *q && sf < (int)sizeof(shard_fs) - 1; q++) shard_fs[sf++] = *q;
+        for (const char *q = corpus; *q && sf < (int)sizeof(shard_fs) - 1; q++) shard_fs[sf++] = *q;
+        if (sf < (int)sizeof(shard_fs) - 1) shard_fs[sf++] = '/';
+        for (const char *q = path; *q && sf < (int)sizeof(shard_fs) - 1; q++) shard_fs[sf++] = *q;
+        shard_fs[sf] = 0;
         int bsz = 0;
-        uint8_t *blob = wasm_url_fetch(url, &bsz);
+        uint8_t *blob = rag_fetch_cached(url, shard_fs, &bsz);
         if (!blob) {
             serial_puts("[rag] cluster fetch failed: cluster ");
             serial_putdec((uint64_t)cluster_id); serial_puts("\n");
@@ -401,8 +462,16 @@ int rag_retrieve(const char *corpus, const char *query,
             char path[64];
             cluster_path(path, sizeof(path), "texts", top_clusters[ci], ".jsonl");
             build_rag_url(url, sizeof(url), corpus, path);
+            /* Cache texts file too. */
+            char tfs[128]; int tf = 0;
+            const char *pre = "rag/";
+            for (const char *q = pre; *q && tf < (int)sizeof(tfs) - 1; q++) tfs[tf++] = *q;
+            for (const char *q = corpus; *q && tf < (int)sizeof(tfs) - 1; q++) tfs[tf++] = *q;
+            if (tf < (int)sizeof(tfs) - 1) tfs[tf++] = '/';
+            for (const char *q = path; *q && tf < (int)sizeof(tfs) - 1; q++) tfs[tf++] = *q;
+            tfs[tf] = 0;
             int tsz = 0;
-            uint8_t *t = wasm_url_fetch(url, &tsz);
+            uint8_t *t = rag_fetch_cached(url, tfs, &tsz);
             if (!t) {
                 serial_puts("[rag] texts fetch failed: ");
                 serial_putdec((uint64_t)top_clusters[ci]); serial_puts("\n");
