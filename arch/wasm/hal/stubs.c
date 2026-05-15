@@ -2108,6 +2108,116 @@ int git_diff(void)           { return -1; }
 int git_branch(const char *n){ (void)n; return -1; }
 int git_checkout(const char *b){ (void)b; return -1; }
 
+/* ══════════════════════════════════════════════════════════════
+ *  Tier 2 #8 — Web Workers scaffolding
+ *
+ *  Spawns N dedicated Workers (one per logical core) with a tiny JS
+ *  bundle that handles 'job' messages: dot product of a weight slice
+ *  and an input vector. Used by future SIMD matvec parallelization
+ *  for Llama-1B-class models where single-threaded dequant+dot is
+ *  the bottleneck. For brandon-tiny (dim=128) the overhead dominates;
+ *  this scaffolding only earns its keep on larger shapes.
+ *
+ *  C surface:
+ *    int  wasm_workers_init(int n)      → spawn n workers (caps at 8)
+ *    int  wasm_workers_count(void)      → number alive
+ *    int  wasm_workers_dot_f32(const float *W, const float *x,
+ *                              int rows, int cols, float *out)
+ *                                       → row-parallel dot product
+ *  ════════════════════════════════════════════════════════════ */
+EM_JS(int, js_workers_init, (int n), {
+    if (window.__pool) {
+        for (var i = 0; i < window.__pool.length; i++)
+            window.__pool[i].w.terminate();
+    }
+    var src = `
+        onmessage = function(e) {
+            var d = e.data;
+            if (d.kind === 'dot_f32') {
+                var W = new Float32Array(d.wbuf);
+                var x = new Float32Array(d.xbuf);
+                var r0 = d.r0, r1 = d.r1, cols = d.cols;
+                var out = new Float32Array(r1 - r0);
+                for (var r = r0; r < r1; r++) {
+                    var s = 0;
+                    var base = (r - r0) * cols;
+                    for (var c = 0; c < cols; c++) s += W[base + c] * x[c];
+                    out[r - r0] = s;
+                }
+                postMessage({ kind: 'done', r0: r0, r1: r1, out: out.buffer },
+                            [out.buffer]);
+            }
+        };`;
+    var blob = new Blob([src], { type: 'application/javascript' });
+    var url = URL.createObjectURL(blob);
+    window.__pool = [];
+    for (var i = 0; i < n && i < 8; i++) {
+        var w = new Worker(url);
+        window.__pool.push({ w: w, busy: false, lastOut: null });
+    }
+    return window.__pool.length;
+});
+EM_JS(int, js_workers_count, (), {
+    return window.__pool ? window.__pool.length : 0;
+});
+
+/* Synchronous parallel dot — caller blocks via Asyncify until all
+ * workers report back. The weight matrix is row-major [rows, cols]
+ * f32; we slice contiguous row blocks and ship one slice per worker. */
+EM_JS(int, js_workers_dot_f32_kick, (const float *W, const float *x,
+                                      int rows, int cols, float *out), {
+    var pool = window.__pool;
+    if (!pool || pool.length === 0) return -1;
+    window.__poolPending = pool.length;
+    window.__poolErr = 0;
+    var xbuf = HEAPU8.slice(x, x + cols * 4).buffer;
+    var n = pool.length;
+    var per = Math.ceil(rows / n);
+    for (var i = 0; i < n; i++) {
+        var r0 = i * per;
+        var r1 = Math.min(r0 + per, rows);
+        if (r0 >= rows) {
+            window.__poolPending--;
+            continue;
+        }
+        var wptr = W + r0 * cols * 4;
+        var wbuf = HEAPU8.slice(wptr, wptr + (r1 - r0) * cols * 4).buffer;
+        /* Local xbuf clone so each worker has its own copy. */
+        var xb = HEAPU8.slice(x, x + cols * 4).buffer;
+        pool[i].busy = true;
+        (function(idx, r0_, r1_) {
+            pool[idx].w.onmessage = function(e) {
+                if (e.data.kind === 'done') {
+                    var part = new Float32Array(e.data.out);
+                    HEAPU8.set(new Uint8Array(part.buffer),
+                               out + r0_ * 4);
+                    pool[idx].busy = false;
+                    window.__poolPending--;
+                }
+            };
+        })(i, r0, r1);
+        pool[i].w.postMessage({ kind: 'dot_f32', wbuf: wbuf, xbuf: xb,
+                                 r0: r0, r1: r1, cols: cols },
+                                [wbuf, xb]);
+    }
+    return 0;
+});
+EM_JS(int, js_workers_pending, (), {
+    return window.__poolPending ? window.__poolPending : 0;
+});
+
+int wasm_workers_init(int n)   { return js_workers_init(n); }
+int wasm_workers_count(void)   { return js_workers_count(); }
+
+int wasm_workers_dot_f32(const float *W, const float *x,
+                          int rows, int cols, float *out)
+{
+    if (wasm_workers_count() <= 0) return -1;
+    if (js_workers_dot_f32_kick(W, x, rows, cols, out) != 0) return -1;
+    while (js_workers_pending() > 0) emscripten_sleep(1);
+    return 0;
+}
+
 /* ── HDA audio ───────────────────────────────────────────────── */
 
 void hda_init(void) {}

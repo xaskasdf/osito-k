@@ -3885,6 +3885,79 @@ void shell_exec(char *line)
         } else {
             sh_puts("Unknown crypto subcommand.\n");
         }
+    } else if (strcmp(cmd, "parallel") == 0) {
+#ifdef __EMSCRIPTEN__
+        /* Tier 2 #8 demo: spawn N Web Workers and time a parallel
+         * F32 matvec vs single-threaded. Real model integration is
+         * a separate step; this cmd verifies the bridge + measures
+         * the speedup ceiling on the user's machine.
+         *
+         * usage:
+         *   parallel init [N]        Spawn N workers (default 4)
+         *   parallel dot              Benchmark 512x512 F32 matvec
+         *   parallel count            Show active worker count */
+        extern int  wasm_workers_init(int n);
+        extern int  wasm_workers_count(void);
+        extern int  wasm_workers_dot_f32(const float *W, const float *x,
+                                          int rows, int cols, float *out);
+        if (argc < 2 || strcmp(argv[1], "count") == 0) {
+            sh_puts("[parallel] active workers: ");
+            sh_putdec((uint64_t)wasm_workers_count()); sh_puts("\n");
+        } else if (strcmp(argv[1], "init") == 0) {
+            int n = 4;
+            if (argc >= 3) {
+                int v = 0;
+                for (const char *p = argv[2]; *p >= '0' && *p <= '9'; p++)
+                    v = v * 10 + (*p - '0');
+                if (v > 0 && v <= 8) n = v;
+            }
+            int got = wasm_workers_init(n);
+            sh_puts("[parallel] spawned "); sh_putdec((uint64_t)got);
+            sh_puts(" workers\n");
+        } else if (strcmp(argv[1], "dot") == 0) {
+            if (wasm_workers_count() <= 0) {
+                sh_puts("[parallel] no workers — run 'parallel init' first\n");
+                return;
+            }
+            int rows = 512, cols = 512;
+            extern void *malloc(unsigned long); extern void free(void *);
+            float *W = (float *)malloc((size_t)rows * cols * 4);
+            float *x = (float *)malloc((size_t)cols * 4);
+            float *out_p = (float *)malloc((size_t)rows * 4);
+            float *out_s = (float *)malloc((size_t)rows * 4);
+            if (!W || !x || !out_p || !out_s) { sh_puts("OOM\n"); goto pdone; }
+            for (int i = 0; i < rows*cols; i++) W[i] = (float)((i*7%13)-6)*0.1f;
+            for (int i = 0; i < cols; i++)      x[i] = (float)((i*3%11)-5)*0.1f;
+            extern uint64_t idt_get_ticks(void);
+            uint64_t t0 = idt_get_ticks();
+            for (int r = 0; r < rows; r++) {
+                float s = 0;
+                for (int c = 0; c < cols; c++) s += W[r*cols+c] * x[c];
+                out_s[r] = s;
+            }
+            uint64_t t1 = idt_get_ticks();
+            wasm_workers_dot_f32(W, x, rows, cols, out_p);
+            uint64_t t2 = idt_get_ticks();
+            float md = 0;
+            for (int i = 0; i < rows; i++) {
+                float d = out_p[i] - out_s[i];
+                if (d < 0) d = -d;
+                if (d > md) md = d;
+            }
+            sh_puts("[parallel dot 512x512] single: ");
+            sh_putdec(t1 - t0); sh_puts(" ms  parallel(");
+            sh_putdec((uint64_t)wasm_workers_count()); sh_puts("): ");
+            sh_putdec(t2 - t1); sh_puts(" ms  maxdiff*1e6=");
+            sh_putdec((uint64_t)(md * 1e6f)); sh_puts("\n");
+pdone:
+            if (W) free(W); if (x) free(x);
+            if (out_p) free(out_p); if (out_s) free(out_s);
+        } else {
+            sh_puts("Usage: parallel init [N] | parallel dot | parallel count\n");
+        }
+#else
+        sh_puts("parallel: WASM-only\n");
+#endif
     } else if (strcmp(cmd, "wiki") == 0) {
 #ifdef __EMSCRIPTEN__
         /* Browser-RAG over simple_en. Builds a ChatML system+user turn
