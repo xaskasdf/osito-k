@@ -388,6 +388,11 @@ int rag_retrieve(const char *corpus, const char *query,
 
     /* ── Step 3: score centroids, pick top-N. ── */
     float *scores = (float *)malloc((size_t)n_clusters * sizeof(float));
+    if (!scores) {
+        serial_puts("[rag] OOM allocating scores\n");
+        free(c_buf); free(qvec);
+        return -1;
+    }
     score_centroids(qvec, (const uint16_t *)c_buf, n_clusters, RAG_DIM, scores);
     int top_clusters[RAG_TOP_N];
     top_n_indices(scores, n_clusters, RAG_TOP_N, top_clusters);
@@ -409,6 +414,7 @@ int rag_retrieve(const char *corpus, const char *query,
     rag_hit_t topk[RAG_TOP_K];
     for (int i = 0; i < RAG_TOP_K; i++) { topk[i].dist = 99999; topk[i].row_id = 0; topk[i].cluster_idx = -1; }
 
+    int hits_found = 0;
     for (int c = 0; c < RAG_TOP_N; c++) {
         int cluster_id = top_clusters[c];
         char path[64];
@@ -425,8 +431,9 @@ int rag_retrieve(const char *corpus, const char *query,
         int bsz = 0;
         uint8_t *blob = rag_fetch_cached(url, shard_fs, &bsz);
         if (!blob) {
-            serial_puts("[rag] cluster fetch failed: cluster ");
-            serial_putdec((uint64_t)cluster_id); serial_puts("\n");
+            serial_puts("[rag] cluster fetch failed (cluster ");
+            serial_putdec((uint64_t)cluster_id);
+            serial_puts(", bytes=0 — heap OOM or network fail?)\n");
             continue;
         }
         uint32_t count = *(uint32_t *)blob;
@@ -437,9 +444,13 @@ int rag_retrieve(const char *corpus, const char *query,
             const uint8_t *ubin = p + 4;
             int dist = hamming_distance(qubin, ubin, RAG_DIM_BYTES);
             topk_insert(topk, RAG_TOP_K, dist, row_id, c);
+            hits_found++;
             p += stride;
         }
         free(blob);
+    }
+    if (hits_found == 0) {
+        serial_puts("[rag] WARNING: no cluster rows processed — retrieval empty\n");
     }
     /* Sort topk ascending. Insertion sort, only 4 elems. */
     for (int i = 1; i < RAG_TOP_K; i++) {
@@ -473,11 +484,18 @@ int rag_retrieve(const char *corpus, const char *query,
             int tsz = 0;
             uint8_t *t = rag_fetch_cached(url, tfs, &tsz);
             if (!t) {
-                serial_puts("[rag] texts fetch failed: ");
-                serial_putdec((uint64_t)top_clusters[ci]); serial_puts("\n");
+                serial_puts("[rag] texts fetch failed (cluster ");
+                serial_putdec((uint64_t)top_clusters[ci]);
+                serial_puts(" — OOM or network)\n");
                 continue;
             }
             char *zt = (char *)malloc((size_t)tsz + 1);
+            if (!zt) {
+                serial_puts("[rag] OOM allocating texts buffer (size=");
+                serial_putdec((uint64_t)tsz); serial_puts(")\n");
+                free(t);
+                continue;
+            }
             memcpy(zt, t, (size_t)tsz);
             zt[tsz] = 0;
             free(t);
