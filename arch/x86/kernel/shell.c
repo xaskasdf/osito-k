@@ -602,7 +602,9 @@ static void cmd_help(void)
 #ifdef __EMSCRIPTEN__
     sh_puts_color("\nLLM (brandon-tiny default, sampling auto-tuned):\n", 0x00FF8800);
     sh_puts("  chat <prompt>           Local inference (active model)\n");
-    sh_puts("  rag <ctx> ::: <q>       RAG-style ChatML prompt\n");
+    sh_puts("  wiki <query>            Browser-RAG: simple_en retrieval + chat\n");
+    sh_puts("  wiki status             Show cached RAG shards on OsitoFS\n");
+    sh_puts("  rag <ctx> ::: <q>       Inline-context RAG (no retrieval)\n");
     sh_puts("  bench [n]               Time inference, n tokens (default 32)\n");
     sh_puts("  temp <t> [topp]         Set sampling temp + top-p\n");
     sh_puts("  penalty <r> [pres][freq]  rep + presence + frequency\n");
@@ -3891,9 +3893,59 @@ void shell_exec(char *line)
          * citing rather than hallucinating; Llama 1B naturally treats
          * the system context as ground truth. */
         if (argc < 2) {
-            sh_puts("Usage: wiki <query>\n");
-            sh_puts("  Retrieves from simple_en (osito-a-models), then asks the loaded LM.\n");
-            sh_puts("  Recommended sampling: temp 0.4 + penalty 1.15 0.1 0.1 + ngram 3\n");
+            sh_puts("Usage: wiki <query>           Retrieve + answer\n");
+            sh_puts("       wiki status            Show cached RAG shards\n");
+            sh_puts("       wiki clear             Drop all cached RAG shards\n");
+            sh_puts("Recommended sampling: temp 0.4 + penalty 1.15 0.1 0.1 + ngram 3\n");
+            return;
+        }
+        if (strcmp(argv[1], "status") == 0) {
+            /* Walk OsitoFS for any file under rag/. */
+            extern void *osfs2_get_file(int idx);
+            extern const char *osfs2_file_name(void *f);
+            extern uint64_t osfs2_file_size(void *f);
+            uint64_t total = 0;
+            int count = 0;
+            for (int i = 0; i < 4096; i++) {
+                void *f = osfs2_get_file(i);
+                if (!f) continue;
+                const char *nm = osfs2_file_name(f);
+                if (!nm || nm[0] != 'r' || nm[1] != 'a' || nm[2] != 'g' || nm[3] != '/')
+                    continue;
+                uint64_t sz = osfs2_file_size(f);
+                sh_puts("  "); sh_puts(nm);
+                sh_puts(" ("); sh_putdec(sz); sh_puts(" B)\n");
+                total += sz; count++;
+            }
+            if (count == 0) sh_puts("  (no shards cached yet — run 'wiki <query>' first)\n");
+            else {
+                sh_puts("  total: "); sh_putdec((uint64_t)count);
+                sh_puts(" files, "); sh_putdec(total / 1024); sh_puts(" KB\n");
+            }
+            return;
+        }
+        if (strcmp(argv[1], "clear") == 0) {
+            extern void *osfs2_get_file(int idx);
+            extern const char *osfs2_file_name(void *f);
+            extern int   osfs2_delete(const char *name);
+            int removed = 0;
+            /* Two-pass: collect names then delete (avoids index shift). */
+            char names[64][128];
+            int nn = 0;
+            for (int i = 0; i < 4096 && nn < 64; i++) {
+                void *f = osfs2_get_file(i);
+                if (!f) continue;
+                const char *nm = osfs2_file_name(f);
+                if (!nm || nm[0]!='r'||nm[1]!='a'||nm[2]!='g'||nm[3]!='/') continue;
+                int l = 0;
+                while (nm[l] && l < 127) { names[nn][l] = nm[l]; l++; }
+                names[nn][l] = 0;
+                nn++;
+            }
+            for (int i = 0; i < nn; i++) {
+                if (osfs2_delete(names[i]) == 0) removed++;
+            }
+            sh_puts("[wiki] cleared "); sh_putdec((uint64_t)removed); sh_puts(" shards\n");
             return;
         }
         if (!prompt_llama) {
