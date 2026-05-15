@@ -799,12 +799,75 @@ int llama_forward(llama_state_t *s, uint32_t token)
     /* ── Embed token ── */
     embed_token(s->x, s->weights.token_embd, token, dim);
 
+#ifdef __EMSCRIPTEN__
+    /* Lazy GPU KV-cache + attn pipeline init for llama-arch models.
+     * Mirrors the brandon init pattern. Gated on: F32 weights for
+     * layer 0, rope_freq_base < 100000 (no Llama 3 NTK scaling — the
+     * shader's pow(rope_base, -e) doesn't match scaled freqs), and
+     * the user toggle (off by default; flip with `bdebug llama_attn`). */
+    extern bool g_llama_use_gpu_attn;
+    extern bool g_llama_attn_init;
+    if (g_llama_use_gpu_attn && !g_llama_attn_init &&
+        s->n_layers > 0 &&
+        s->weights.layers[0].attn_q->type == GGML_TYPE_F32 &&
+        s->rope_freq_base < 100000.0f) {
+        extern int wasm_wgpu_kvcache_alloc(int layer, int max_seq, int kv_dim);
+        bool all_ok = true;
+        for (uint32_t l = 0; l < s->n_layers; l++) {
+            if (wasm_wgpu_kvcache_alloc((int)l,
+                                         (int)s->max_seq,
+                                         (int)kv_dim) != 0) {
+                all_ok = false; break;
+            }
+        }
+        g_llama_attn_init = all_ok;
+        if (all_ok) serial_puts("[llama] GPU attn KV-cache pool ready\n");
+    }
+#endif
+
     /* ── Transformer layers ── */
     for (uint32_t l = 0; l < s->n_layers; l++) {
         llama_layer_t *ly = &s->weights.layers[l];
 
         /* Attention norm */
         rmsnorm(s->xb, s->x, norm_data(ly->attn_norm), dim);
+
+#ifdef __EMSCRIPTEN__
+        /* GPU fused-attn fast path. Replaces QKV+RoPE+KV-cache+
+         * attention+output-projection with a single GPU dispatch.
+         * Requires all four attn weights to be F32 (the shader has no
+         * Q4_K dequant inline yet) and a non-scaled RoPE base. KV
+         * cache stays GPU-side across the whole generation. */
+        bool gpu_attn_ok = false;
+        if (g_llama_use_gpu_attn && g_llama_attn_init &&
+            ly->attn_q->type      == GGML_TYPE_F32 &&
+            ly->attn_k->type      == GGML_TYPE_F32 &&
+            ly->attn_v->type      == GGML_TYPE_F32 &&
+            ly->attn_output->type == GGML_TYPE_F32) {
+            extern int wasm_wgpu_fused_attn(int layer,
+                const float *x, const float *wq, const float *wk,
+                const float *wv, const float *wo, float *out,
+                int dim, int kv_dim, int head_dim, int n_heads,
+                int n_kv_heads, int gqa_ratio, int pos, int max_seq,
+                float scale, float rope_base);
+            float scale = 1.0f / sqrtf_bare((float)hd);
+            int rc = wasm_wgpu_fused_attn((int)l,
+                s->xb,
+                (const float *)ly->attn_q->data,
+                (const float *)ly->attn_k->data,
+                (const float *)ly->attn_v->data,
+                (const float *)ly->attn_output->data,
+                s->xb,
+                (int)dim, (int)kv_dim, (int)hd, (int)s->n_heads,
+                (int)s->n_kv_heads, (int)s->gqa_ratio,
+                (int)pos, (int)s->max_seq, scale, s->rope_freq_base);
+            if (rc == 0) {
+                vec_add(s->x, s->x, s->xb, dim);
+                gpu_attn_ok = true;
+            }
+        }
+        if (gpu_attn_ok) goto llama_ffn_block;
+#endif
 
         /* Q, K, V projections — K and V on APs, Q on BSP */
         if (ap_worker_count > 0) {
@@ -933,6 +996,9 @@ int llama_forward(llama_state_t *s, uint32_t token)
         /* Residual connection */
         vec_add(s->x, s->x, s->xb, dim);
 
+#ifdef __EMSCRIPTEN__
+    llama_ffn_block:
+#endif
         /* ── FFN ── */
         rmsnorm(s->xb, s->x, norm_data(ly->ffn_norm), dim);
 
@@ -994,6 +1060,13 @@ int llama_forward(llama_state_t *s, uint32_t token)
  * gibberish output traces to that one feature. */
 static bool g_brandon_use_dwa            = true;
 static bool g_brandon_use_value_residual = true;
+
+/* Llama-arch GPU attention toggle (off by default; the F32-only gate
+ * means Llama 1B Q4_K_M skips this path automatically — useful today
+ * for F32 TinyLlama variants and any future F32 dequant cache). */
+bool g_llama_use_gpu_attn = false;
+bool g_llama_attn_init    = false;
+
 static bool g_brandon_use_registers      = true;
 static bool g_brandon_debug_logits       = false;
 

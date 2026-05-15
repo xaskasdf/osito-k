@@ -6235,6 +6235,12 @@ pdone:
                 sh_puts(v ? "[brandon] GPU fused-attn ENABLED (F32 + no VR/DWA)\n"
                           : "[brandon] GPU fused-attn disabled\n");
             }
+            else if (strcmp(argv[1], "llama_attn") == 0) {
+                extern bool g_llama_use_gpu_attn;
+                g_llama_use_gpu_attn = (v != 0);
+                sh_puts(v ? "[llama] GPU fused-attn ENABLED (F32 + rope_base<100k)\n"
+                          : "[llama] GPU fused-attn disabled\n");
+            }
             else sh_puts("bdebug applied\n");
         }
     } else if (strcmp(cmd, "temp") == 0) {
