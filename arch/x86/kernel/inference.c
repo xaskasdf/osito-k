@@ -851,7 +851,10 @@ int llama_forward(llama_state_t *s, uint32_t token)
                        ly->attn_k->type      == GGML_TYPE_Q4_K &&
                        ly->attn_v->type      == GGML_TYPE_Q4_K &&
                        ly->attn_output->type == GGML_TYPE_Q4_K;
-        int weight_dtype = all_f32 ? 0 : (all_q4k ? 2 : -1);
+        extern bool g_llama_use_gpu_predequant;
+        int weight_dtype = all_f32 ? 0
+                         : (all_q4k ? (g_llama_use_gpu_predequant ? 3 : 2)
+                                    : -1);
         if (g_llama_use_gpu_attn && g_llama_attn_init && weight_dtype >= 0) {
             extern int wasm_wgpu_fused_attn(int layer,
                 const float *x, const void *wq, const void *wk,
@@ -1074,8 +1077,9 @@ static bool g_brandon_use_value_residual = true;
 /* Llama-arch GPU attention toggle (off by default; the F32-only gate
  * means Llama 1B Q4_K_M skips this path automatically — useful today
  * for F32 TinyLlama variants and any future F32 dequant cache). */
-bool g_llama_use_gpu_attn = false;
-bool g_llama_attn_init    = false;
+bool g_llama_use_gpu_attn       = false;
+bool g_llama_use_gpu_predequant = false;  /* dtype-3: Q4_K → on-GPU F32 mirror */
+bool g_llama_attn_init          = false;
 
 static bool g_brandon_use_registers      = true;
 static bool g_brandon_debug_logits       = false;

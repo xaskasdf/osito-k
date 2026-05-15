@@ -1101,6 +1101,78 @@ EM_JS(int, js_wgpu_init_kick, (), {
                 compute: { module: q4kMod, entryPoint: 'dequant_q4k' },
             });
 
+            /* Q4_K → F32 matrix dequant pipeline. Dispatches one
+             * workgroup per row; 64 threads cooperate on the row's
+             * elements. Used to fill a GPU-resident F32 mirror of an
+             * attn weight (one-shot at first forward) so the existing
+             * large-dim F32 fused-attn path can run on a Q4_K_M model
+             * without the +608 MB CPU heap predequant. The F32 mirror
+             * lives in VRAM (~640 MB on Llama 1B). */
+            const q4kRowCode = `
+                @group(0) @binding(0) var<storage, read>  src: array<u32>;
+                @group(0) @binding(1) var<storage, read_write> dst: array<f32>;
+                @group(0) @binding(2) var<uniform> dims: vec4<u32>;
+
+                fn sb_at(base: u32, idx: u32) -> u32 {
+                    let w = src[base + 1u + (idx / 4u)];
+                    return (w >> (8u * (idx % 4u))) & 0xFFu;
+                }
+                fn qb_at(base: u32, idx: u32) -> u32 {
+                    let w = src[base + 4u + (idx / 4u)];
+                    return (w >> (8u * (idx % 4u))) & 0xFFu;
+                }
+                fn q4k_d(base: u32, j: u32) -> u32 {
+                    if (j < 4u) { return sb_at(base, j) & 63u; }
+                    let lo = sb_at(base, j + 4u) & 0xFu;
+                    let hi = (sb_at(base, j - 4u) >> 6u) & 3u;
+                    return lo | (hi << 4u);
+                }
+                fn q4k_m(base: u32, j: u32) -> u32 {
+                    if (j < 4u) { return sb_at(base, j + 4u) & 63u; }
+                    let lo = sb_at(base, j + 4u) >> 4u;
+                    let hi = (sb_at(base, j) >> 6u) & 3u;
+                    return lo | (hi << 4u);
+                }
+
+                @compute @workgroup_size(64)
+                fn dequant_row(@builtin(workgroup_id) wid: vec3<u32>,
+                               @builtin(local_invocation_id) lid: vec3<u32>) {
+                    let row = wid.x;
+                    let cols = dims.x;
+                    let tid = lid.x;
+                    let blocks_per_row = cols / 256u;
+                    let words_per_row  = blocks_per_row * 36u;
+                    let row_word_base  = row * words_per_row;
+                    let row_f32_base   = row * cols;
+
+                    var e: u32 = tid;
+                    loop {
+                        if (e >= cols) { break; }
+                        let blk_idx = e / 256u;
+                        let elem    = e % 256u;
+                        let base    = row_word_base + blk_idx * 36u;
+                        let h0 = src[base];
+                        let dd   = unpack2x16float(h0).x;
+                        let dmin = unpack2x16float(h0).y;
+                        let pair = elem / 64u;
+                        let off  = elem % 64u;
+                        let is_high = off >= 32u;
+                        let sub_idx = pair * 2u + select(0u, 1u, is_high);
+                        let sc = f32(q4k_d(base, sub_idx));
+                        let mn = f32(q4k_m(base, sub_idx));
+                        let qbyte = qb_at(base, pair * 32u + (off % 32u));
+                        let nibble = select(qbyte & 0xFu, qbyte >> 4u, is_high);
+                        dst[row_f32_base + e] = dd * sc * f32(nibble) - dmin * mn;
+                        e = e + 64u;
+                    }
+                }
+            `;
+            const q4kRowMod = device.createShaderModule({ code: q4kRowCode });
+            window.__gpuQ4KRowPipeline = device.createComputePipeline({
+                layout: 'auto',
+                compute: { module: q4kRowMod, entryPoint: 'dequant_row' },
+            });
+
             /* Q4_K-native fused-attn variant for Llama 1B Q4_K_M without
              * predequant. wq/wk/wv/wo are array<u32> (raw Q4_K bytes,
              * 36 u32 per 256-elem block). Matvecs inline the dequant
@@ -2288,8 +2360,13 @@ EM_JS(int, js_wgpu_fused_attn_kick, (
              * Q4_K path falls back if the pipeline compile failed (older
              * WebGPU implementations may not support pointer-to-storage
              * function params used by the inline dequant). */
-            const isQ4K = (weight_dtype === 2) && !!window.__gpuAttnPipelineQ4K;
-            const isLarge = !isQ4K && dim > 256;
+            /* dtype = 3 means "Q4_K source, dequant once to GPU F32 and
+             * run the F32 fused-attn pipeline thereafter". Trades 640 MB
+             * VRAM for full F32 speed without the CPU heap bump. */
+            const isPreGPU = (weight_dtype === 3) && !!window.__gpuQ4KRowPipeline;
+            const isQ4K = (weight_dtype === 2) && !isPreGPU
+                          && !!window.__gpuAttnPipelineQ4K;
+            const isLarge = !isQ4K && (isPreGPU || dim > 256);
             const pipe = isQ4K  ? window.__gpuAttnPipelineQ4K
                        : isLarge ? window.__gpuAttnPipelineLarge
                                  : window.__gpuAttnPipeline;
@@ -2319,6 +2396,8 @@ EM_JS(int, js_wgpu_fused_attn_kick, (
                 /* Q4_K byte size per weight row = (dim/256) * 144. */
                 const blocksPerRow = (dim / 256) | 0;
                 const q4kRowBytes = blocksPerRow * 144;
+                /* dtype=2 → buffers hold raw Q4_K bytes; dtype=0 or 3 →
+                 * buffers hold F32 (dtype=3 fills via on-GPU dequant). */
                 const wqBytes = isQ4K ? dim    * q4kRowBytes : dim    * dim * 4;
                 const wkBytes = isQ4K ? kv_dim * q4kRowBytes : kv_dim * dim * 4;
                 const wvBytes = isQ4K ? kv_dim * q4kRowBytes : kv_dim * dim * 4;
@@ -2374,20 +2453,74 @@ EM_JS(int, js_wgpu_fused_attn_kick, (
                 });
                 window.__gpuAttnCache.set(key, s);
             }
+            /* dtype=3 upload helper: Q4_K source bytes → on-GPU dequant
+             * compute → fills the existing F32 mirror buffer. Allocates
+             * a transient staging buffer per call; the result lives in
+             * the per-layer attn cache buffer for the rest of the run. */
+            const q4kRowBytes_kick = ((dim / 256) | 0) * 144;
+            async function preGpuFill(dstBuf, srcPtr, rows, srcBytes) {
+                const stg = dev.createBuffer({ size: srcBytes,
+                    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+                dev.queue.writeBuffer(stg, 0, HEAPU8.slice(srcPtr, srcPtr + srcBytes));
+                const ub = dev.createBuffer({ size: 16,
+                    usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+                dev.queue.writeBuffer(ub, 0, new Uint32Array([dim, 0, 0, 0]));
+                const dqBg = dev.createBindGroup({
+                    layout: window.__gpuQ4KRowPipeline.getBindGroupLayout(0),
+                    entries: [
+                        { binding: 0, resource: { buffer: stg    } },
+                        { binding: 1, resource: { buffer: dstBuf } },
+                        { binding: 2, resource: { buffer: ub     } },
+                    ],
+                });
+                const enc = dev.createCommandEncoder();
+                const pass = enc.beginComputePass();
+                pass.setPipeline(window.__gpuQ4KRowPipeline);
+                pass.setBindGroup(0, dqBg);
+                pass.dispatchWorkgroups(rows);
+                pass.end();
+                dev.queue.submit([enc.finish()]);
+                /* Make sure the dequant finishes before we destroy the
+                 * staging buffer. We don't await — the F32 buffer is
+                 * a STORAGE resource used by the fused-attn dispatch
+                 * later in this same kick, and WebGPU enforces ordering
+                 * within a queue. We can safely destroy() the staging
+                 * buffer (and uniform) — WebGPU keeps the underlying
+                 * resource alive until all in-flight commands referencing
+                 * it complete. */
+                stg.destroy(); ub.destroy();
+            }
+
             if (s.last_wq !== wq_id) {
-                dev.queue.writeBuffer(s.wqBuf, 0, HEAPU8.slice(wq, wq + s._wqBytes));
+                if (isPreGPU) {
+                    await preGpuFill(s.wqBuf, wq, dim,    dim * q4kRowBytes_kick);
+                } else {
+                    dev.queue.writeBuffer(s.wqBuf, 0, HEAPU8.slice(wq, wq + s._wqBytes));
+                }
                 s.last_wq = wq_id;
             }
             if (s.last_wk !== wk_id) {
-                dev.queue.writeBuffer(s.wkBuf, 0, HEAPU8.slice(wk, wk + s._wkBytes));
+                if (isPreGPU) {
+                    await preGpuFill(s.wkBuf, wk, kv_dim, kv_dim * q4kRowBytes_kick);
+                } else {
+                    dev.queue.writeBuffer(s.wkBuf, 0, HEAPU8.slice(wk, wk + s._wkBytes));
+                }
                 s.last_wk = wk_id;
             }
             if (s.last_wv !== wv_id) {
-                dev.queue.writeBuffer(s.wvBuf, 0, HEAPU8.slice(wv, wv + s._wvBytes));
+                if (isPreGPU) {
+                    await preGpuFill(s.wvBuf, wv, kv_dim, kv_dim * q4kRowBytes_kick);
+                } else {
+                    dev.queue.writeBuffer(s.wvBuf, 0, HEAPU8.slice(wv, wv + s._wvBytes));
+                }
                 s.last_wv = wv_id;
             }
             if (s.last_wo !== wo_id) {
-                dev.queue.writeBuffer(s.woBuf, 0, HEAPU8.slice(wo, wo + s._woBytes));
+                if (isPreGPU) {
+                    await preGpuFill(s.woBuf, wo, dim,    dim * q4kRowBytes_kick);
+                } else {
+                    dev.queue.writeBuffer(s.woBuf, 0, HEAPU8.slice(wo, wo + s._woBytes));
+                }
                 s.last_wo = wo_id;
             }
             dev.queue.writeBuffer(s.xBuf, 0, HEAPU8.slice(x, x + dim*4));

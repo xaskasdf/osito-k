@@ -6306,6 +6306,16 @@ q4kgdone:
                 sh_puts(v ? "[llama] GPU fused-attn ENABLED (F32 attn, Llama 2/3 RoPE)\n"
                           : "[llama] GPU fused-attn disabled\n");
             }
+            else if (strcmp(argv[1], "llama_gpu_predequant") == 0) {
+                /* Path 3 trade-off: Q4_K → on-GPU F32 mirror once at
+                 * first forward. Costs ~640 MB VRAM but keeps CPU heap
+                 * at +0 MB AND matches F32 predequant speed. Combine
+                 * with `bdebug llama_attn 1`. */
+                extern bool g_llama_use_gpu_predequant;
+                g_llama_use_gpu_predequant = (v != 0);
+                sh_puts(v ? "[llama] GPU pre-dequant ENABLED (640 MB VRAM, F32 speed)\n"
+                          : "[llama] GPU pre-dequant disabled\n");
+            }
             else if (strcmp(argv[1], "predequant_attn") == 0) {
                 /* Pre-dequant Q4_K attn weights → F32 to satisfy the
                  * GPU fused-attn F32 gate. Memory cost: ~640 MB for
