@@ -398,8 +398,9 @@ static void dequant_q4_k_block(const uint8_t *block, float *y)
     }
 }
 #else
-/* Scalar fallback for non-WASM-SIMD targets. */
-static void dequant_q4_k_block(const uint8_t *block, float *y)
+/* Scalar fallback for non-WASM-SIMD targets.  Non-static because
+ * fs/gguf.c calls it for full-tensor dequant. */
+void dequant_q4_k_block(const uint8_t *block, float *y)
 {
     float d    = f16_to_f32(*(const uint16_t *)(block + 0));
     float dmin = f16_to_f32(*(const uint16_t *)(block + 2));

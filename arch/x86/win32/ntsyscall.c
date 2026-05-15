@@ -93,6 +93,57 @@ typedef struct {
 static vm_track_entry_t vm_track[VM_TRACK_MAX];
 static int vm_track_count = 0;
 
+/* VA free-list: ranges released by MEM_RELEASE that get recycled.
+ * Pages keep their tombstone pattern (0xDEADC0DE) UNTIL the engine
+ * either writes (overwriting it) or reads it as a pointer (triggering
+ * STALE-PTR detector in idt.c).  This is a *detector* mode — designed
+ * to flush out use-after-free patterns, not to be safe long-term. */
+#define VM_FREELIST_MAX 128
+
+typedef struct {
+    uint64_t va;
+    SIZE_T   size;
+} vm_freelist_entry_t;
+
+static vm_freelist_entry_t vm_freelist[VM_FREELIST_MAX];
+static int vm_freelist_count = 0;
+
+static uint64_t vm_freelist_take(SIZE_T size)
+{
+    for (int i = 0; i < vm_freelist_count; i++) {
+        if (vm_freelist[i].size >= size) {
+            uint64_t va = vm_freelist[i].va;
+            SIZE_T leftover = vm_freelist[i].size - size;
+            if (leftover > 0) {
+                vm_freelist[i].va   += size;
+                vm_freelist[i].size  = leftover;
+            } else {
+                vm_freelist[i] = vm_freelist[--vm_freelist_count];
+            }
+            return va;
+        }
+    }
+    return 0;
+}
+
+static void vm_freelist_add(uint64_t va, SIZE_T size)
+{
+    if (size == 0) return;
+    for (int i = 0; i < vm_freelist_count; i++) {
+        if (vm_freelist[i].va + vm_freelist[i].size == va) {
+            vm_freelist[i].size += size; return;
+        }
+        if (va + size == vm_freelist[i].va) {
+            vm_freelist[i].va = va; vm_freelist[i].size += size; return;
+        }
+    }
+    if (vm_freelist_count < VM_FREELIST_MAX) {
+        vm_freelist[vm_freelist_count].va   = va;
+        vm_freelist[vm_freelist_count].size = size;
+        vm_freelist_count++;
+    }
+}
+
 static void vm_track_add(uint64_t va, uint64_t phys, SIZE_T size)
 {
     for (int i = 0; i < vm_track_count; i++) {
@@ -139,9 +190,24 @@ static PVOID win32_va_alloc(SIZE_T size, uint64_t *out_phys, ULONG protect)
     /* Align VA to 64KB boundary — Windows VirtualAlloc guarantees
      * dwAllocationGranularity (64KB) alignment. FMallocWindows's
      * binned pool allocator uses (ptr >> 16) & 0xFF for pool index;
-     * without 64KB alignment, pool lookups corrupt free-lists. */
+     * without 64KB alignment, pool lookups corrupt free-lists.
+     *
+     * Free-list recycling DISABLED for now.  Two experiments showed:
+     *   1. Recycling without tombstone → engine crashes at vec=14
+     *      RIP=0x401BC870 (jumps to data in recycled VA).
+     *   2. Recycling WITH tombstone fill + STALE-PTR detector →
+     *      same early crash, STALE detector reports zero hits
+     *      (engine doesn't read tombstoned memory, so the crash
+     *      cause is NOT stale-pointer-deref).
+     * Conclusion: UE1/UT99 does NOT rely on freed-VA-still-readable,
+     * but free-list recycling somehow breaks compat32 _initterm
+     * dispatch (DLL static init at index 69 fires PF before
+     * appMalloc is initialized).  The interaction is unclear —
+     * needs deeper investigation.  Until then, pure bump allocator. */
     uint64_t va = (win32_va_next + 0xFFFF) & ~0xFFFFULL;
     uint64_t va_end = va + size;
+    int recycled = 0;
+    (void)vm_freelist_take;  /* keep the function alive for future use */
     if (va_end > WIN32_VA_LIMIT) {
         mem_free_pages(phys, pages);
         return NULL;
@@ -162,9 +228,8 @@ static PVOID win32_va_alloc(SIZE_T size, uint64_t *out_phys, ULONG protect)
         paging_win32_map_page(va + i * 4096, pa + i * 4096, pte_flags);
     }
 
-    /* Zero via the newly mapped VA (not PA — under Win32 CR3,
-     * PA addresses in the 0x40000000+ range are aliased by
-     * VirtualAlloc mappings in PDPT[1], so identity-map access fails) */
+    /* Zero via the newly mapped VA (recycling disabled — always zero). */
+    (void)recycled;
     nt_memset((void *)va, 0, size);
 
     if (out_phys) *out_phys = pa;
@@ -695,14 +760,28 @@ NTSTATUS sys_NtFreeVirtualMemory(ULONG_PTR *args)
 
     if (FreeType & MEM_RELEASE) {
         uint64_t phys = 0;
-        SIZE_T tracked = vm_track_remove((uint64_t)*BaseAddress, &phys);
+        uint64_t va    = (uint64_t)*BaseAddress;
+        SIZE_T tracked = vm_track_remove(va, &phys);
 
-        /* Keep pages mapped — Win32 apps may access freed VA briefly
-         * (FMallocWindows, UE1 TArray realloc patterns). Windows doesn't
-         * tear down PTEs immediately on MEM_RELEASE, and game code relies
-         * on this. We leak the physical pages; PE32 compat doesn't need
-         * to be memory-efficient. */
-        nt_log_hex("  release (lazy) size = ", tracked);
+        /* TOMBSTONE: keep VA mapped (engine may read briefly), but
+         * overwrite the freed pages with a recognizable sentinel
+         * pattern.  Any subsequent stale-pointer dereference that
+         * was holding a `Data*` from inside this range will read
+         * 0xDEADC0DE / 0xDEADC0DE / ... — if the engine then calls
+         * through it, RIP becomes 0xDEADC0DE which our PF handler
+         * recognizes and logs (see idt.c [STALE-PTR] tag).  This
+         * gives us precise visibility into UE1 use-after-free
+         * patterns without crashing the engine. */
+        if (tracked > 0) {
+            uint32_t *p = (uint32_t *)(uintptr_t)va;
+            SIZE_T words = tracked / 4;
+            for (SIZE_T i = 0; i < words; i++) p[i] = 0xDEADC0DE;
+            /* Free-list recycle disabled (see win32_va_alloc); we
+             * still tombstone-fill so the STALE-PTR detector in idt.c
+             * can spot any engine reads of freed memory. */
+            (void)vm_freelist_add;
+        }
+        nt_log_hex("  release (tombstone) size = ", tracked);
 
         *BaseAddress = NULL;
         if (RegionSize) *RegionSize = 0;

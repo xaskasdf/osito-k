@@ -673,6 +673,44 @@ void isr_handler(interrupt_frame_t *frame)
             serial_putdec(exc_count);
             serial_puts("\n");
         }
+        /* STALE-PTR detector: if user-mode code jumped to 0xDEADC0DE
+         * (our VirtualFree MEM_RELEASE tombstone pattern) it means a
+         * pointer that lived inside a freed VA range was read AFTER
+         * the free and used as a code/data pointer.  Logs the calling
+         * context so we know who held the stale ref. */
+        uint32_t rip32 = (uint32_t)frame->rip;
+        if (rip32 == 0xDEADC0DE) {
+            static int stale_count = 0;
+            stale_count++;
+            if (stale_count <= 10) {
+                uint32_t *sp = (uint32_t *)(uintptr_t)(frame->rsp & 0xFFFFFFFF);
+                serial_puts("[STALE-PTR] call/jmp -> 0xDEADC0DE (freed mem) #");
+                serial_putdec(stale_count);
+                serial_puts(" retaddr=0x");
+                serial_puthex((uint64_t)sp[0], 8);
+                serial_puts(" EBP=0x");
+                serial_puthex((uint32_t)frame->rbp, 8);
+                serial_puts(" ESI=0x");
+                serial_puthex((uint32_t)frame->rsi, 8);
+                serial_puts("\n");
+            }
+        } else if (vec == 14) {
+            /* Data deref of a tombstoned value: CR2 == 0xDEADC0DE
+             * (the engine treated a freed-range word as a pointer). */
+            uint64_t cr2;
+            __asm__ volatile ("mov %%cr2, %0" : "=r"(cr2));
+            if ((uint32_t)cr2 == 0xDEADC0DE) {
+                static int stale_deref = 0;
+                stale_deref++;
+                if (stale_deref <= 10) {
+                    serial_puts("[STALE-PTR] deref of 0xDEADC0DE at RIP=0x");
+                    serial_puthex(rip32, 8);
+                    serial_puts(" #");
+                    serial_putdec(stale_deref);
+                    serial_puts("\n");
+                }
+            }
+        }
     }
 
     /* EARLY check: code execution outside DLL range in compat32 mode.
