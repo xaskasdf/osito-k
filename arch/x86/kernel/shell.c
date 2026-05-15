@@ -6238,7 +6238,7 @@ pdone:
             else if (strcmp(argv[1], "llama_attn") == 0) {
                 extern bool g_llama_use_gpu_attn;
                 g_llama_use_gpu_attn = (v != 0);
-                sh_puts(v ? "[llama] GPU fused-attn ENABLED (F32 + rope_base<100k)\n"
+                sh_puts(v ? "[llama] GPU fused-attn ENABLED (F32 attn, Llama 2/3 RoPE)\n"
                           : "[llama] GPU fused-attn disabled\n");
             }
             else if (strcmp(argv[1], "predequant_attn") == 0) {

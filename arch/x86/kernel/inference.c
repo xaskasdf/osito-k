@@ -804,13 +804,16 @@ int llama_forward(llama_state_t *s, uint32_t token)
      * Mirrors the brandon init pattern. Gated on: F32 weights for
      * layer 0, rope_freq_base < 100000 (no Llama 3 NTK scaling — the
      * shader's pow(rope_base, -e) doesn't match scaled freqs), and
-     * the user toggle (off by default; flip with `bdebug llama_attn`). */
+     * the user toggle (off by default; flip with `bdebug llama_attn`).
+     * Shader now implements Llama 3 NTK rope_scaling (factor=32,
+     * lo=1, hi=4, orig_ctx=8192) auto-gated on rope_base>=100000, so
+     * both Llama 2 (theta=10000) and Llama 3.x families are
+     * supported here. */
     extern bool g_llama_use_gpu_attn;
     extern bool g_llama_attn_init;
     if (g_llama_use_gpu_attn && !g_llama_attn_init &&
         s->n_layers > 0 &&
-        s->weights.layers[0].attn_q->type == GGML_TYPE_F32 &&
-        s->rope_freq_base < 100000.0f) {
+        s->weights.layers[0].attn_q->type == GGML_TYPE_F32) {
         extern int wasm_wgpu_kvcache_alloc(int layer, int max_seq, int kv_dim);
         bool all_ok = true;
         for (uint32_t l = 0; l < s->n_layers; l++) {

@@ -884,8 +884,25 @@ EM_JS(int, js_wgpu_init_kick, (), {
                         let h = i / pairs_per_head;
                         let p = i % pairs_per_head;
                         let exponent = f32(2u * p) / f32(head_dim);
-                        let freq = pow(rope_base, -exponent);
-                        let theta = f32(pos) * freq;
+                        var inv_freq = pow(rope_base, -exponent);
+                        /* Llama 3 NTK-aware scaling — auto-detect via
+                         * rope_base. Constants match the CPU rope()
+                         * (factor=32, lo=1, hi=4, orig_ctx=8192). */
+                        if (rope_base >= 100000.0) {
+                            let TWO_PI  = 6.28318530717958647692;
+                            let wavelen = TWO_PI / inv_freq;
+                            let LO_WAVE = 8192.0;
+                            let HI_WAVE = 2048.0;
+                            let FACTOR  = 32.0;
+                            if (wavelen > LO_WAVE) {
+                                inv_freq = inv_freq / FACTOR;
+                            } else if (wavelen >= HI_WAVE) {
+                                let smooth = (8192.0 / wavelen - 1.0) / 3.0;
+                                inv_freq = (1.0 - smooth) * (inv_freq / FACTOR)
+                                         + smooth * inv_freq;
+                            }
+                        }
+                        let theta = f32(pos) * inv_freq;
                         let c = cos(theta);
                         let s = sin(theta);
                         let idx = h * head_dim + 2u * p;
@@ -901,8 +918,25 @@ EM_JS(int, js_wgpu_init_kick, (), {
                         let h = i / pairs_per_head;
                         let p = i % pairs_per_head;
                         let exponent = f32(2u * p) / f32(head_dim);
-                        let freq = pow(rope_base, -exponent);
-                        let theta = f32(pos) * freq;
+                        var inv_freq = pow(rope_base, -exponent);
+                        /* Llama 3 NTK-aware scaling — auto-detect via
+                         * rope_base. Constants match the CPU rope()
+                         * (factor=32, lo=1, hi=4, orig_ctx=8192). */
+                        if (rope_base >= 100000.0) {
+                            let TWO_PI  = 6.28318530717958647692;
+                            let wavelen = TWO_PI / inv_freq;
+                            let LO_WAVE = 8192.0;
+                            let HI_WAVE = 2048.0;
+                            let FACTOR  = 32.0;
+                            if (wavelen > LO_WAVE) {
+                                inv_freq = inv_freq / FACTOR;
+                            } else if (wavelen >= HI_WAVE) {
+                                let smooth = (8192.0 / wavelen - 1.0) / 3.0;
+                                inv_freq = (1.0 - smooth) * (inv_freq / FACTOR)
+                                         + smooth * inv_freq;
+                            }
+                        }
+                        let theta = f32(pos) * inv_freq;
                         let c = cos(theta);
                         let s = sin(theta);
                         let idx = pos * kv_dim + h * head_dim + 2u * p;
