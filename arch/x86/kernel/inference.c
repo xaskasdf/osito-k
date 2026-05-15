@@ -2608,6 +2608,68 @@ int llama_chat(llama_state_t *state, const char *text,
 }
 
 /* ══════════════════════════════════════════════════════════════
+ *  llama_embed_text — last-token hidden-state embedder
+ *
+ *  Tokenizes `text` (no chat template — raw + BOS), runs forward
+ *  over each token, then copies the post-final-norm hidden state
+ *  at the last position to `out`. Output is L2-normalized and
+ *  truncated to min(model_dim, max_dim). Returns the effective
+ *  embedding dimension written, or -1 on failure.
+ *
+ *  Use case: query similarity for RAG cache, semantic dedup of
+ *  shell history, ad-hoc cosine-sim debugging. Note the resulting
+ *  vector lives in the loaded model's hidden space (e.g. llama
+ *  1B = 2048d), which is NOT the same space as the bge-large
+ *  corpus (1024d) — use this for self-similarity, not for
+ *  cross-system retrieval against externally-embedded data.
+ * ══════════════════════════════════════════════════════════════ */
+int llama_embed_text(llama_state_t *state, const char *text,
+                     float *out, int max_dim)
+{
+    if (!state || !text || !out || max_dim < 1) return -1;
+    if (!tok_is_ready(g_tokenizer)) return -1;
+
+    uint32_t text_len = 0;
+    for (const char *p = text; *p; p++) text_len++;
+    if (text_len == 0) return -1;
+
+    uint32_t bos_id = tok_get_bos_id(g_tokenizer);
+    uint32_t tokens[1024];
+    uint32_t n = 0;
+    tokens[n++] = bos_id;
+    int r = tok_encode(g_tokenizer, text, text_len,
+                       tokens + n, 1024 - n);
+    if (r > 0) n += (uint32_t)r;
+    if (n < 2) return -1;
+
+    state->pos = 0;
+    state->registers_prefilled = false;
+    state->v_first_captured    = false;
+    recent_reset();
+
+    for (uint32_t i = 0; i < n; i++)
+        llama_forward(state, tokens[i]);
+
+    /* After the last forward, s->x holds the post-final-norm
+     * hidden state for the last token (final rmsnorm is applied
+     * in-place before the LM head). Snapshot + L2-normalize. */
+    uint32_t dim = state->dim;
+    int eff = (int)dim < max_dim ? (int)dim : max_dim;
+    double sumsq = 0.0;
+    for (int i = 0; i < eff; i++) {
+        float v = state->x[i];
+        if (v != v) v = 0.0f;
+        out[i] = v;
+        sumsq += (double)v * (double)v;
+    }
+    if (sumsq > 1e-12) {
+        float inv = 1.0f / sqrtf_bare((float)sumsq);
+        for (int i = 0; i < eff; i++) out[i] *= inv;
+    }
+    return eff;
+}
+
+/* ══════════════════════════════════════════════════════════════
  *  llama_chat_with_system — RAG-style ChatML chat
  *
  *  Prepends a system turn before the user turn:

@@ -3885,6 +3885,50 @@ void shell_exec(char *line)
         } else {
             sh_puts("Unknown crypto subcommand.\n");
         }
+    } else if (strcmp(cmd, "embed") == 0) {
+        /* Tier 2 #9: local embedder. Runs the loaded llama/brandon
+         * model forward over the input text and returns the
+         * post-final-norm hidden state at the last token,
+         * L2-normalized. Useful for self-similarity (query cache,
+         * shell-history dedup); NOT compatible with bge-large
+         * corpus vectors (different embedding space + dimension). */
+        if (!prompt_llama) {
+            sh_puts("embed: no model loaded\n");
+            return;
+        }
+        if (argc < 2) {
+            sh_puts("Usage: embed <text>\n");
+            return;
+        }
+        char buf[512]; int blen = 0;
+        for (int i = 1; i < argc && blen < (int)sizeof(buf) - 2; i++) {
+            if (i > 1 && blen < (int)sizeof(buf) - 1) buf[blen++] = ' ';
+            for (const char *p = argv[i];
+                 *p && blen < (int)sizeof(buf) - 1; p++)
+                buf[blen++] = *p;
+        }
+        buf[blen] = 0;
+        extern int llama_embed_text(void *state, const char *text,
+                                     float *out, int max_dim);
+        extern void *malloc(unsigned long); extern void free(void *);
+        const int MAX_D = 4096;
+        float *vec = (float *)malloc(MAX_D * sizeof(float));
+        if (!vec) { sh_puts("OOM\n"); return; }
+        int dim = llama_embed_text(prompt_llama, buf, vec, MAX_D);
+        if (dim < 0) { sh_puts("embed: failed\n"); free(vec); return; }
+        double norm = 0.0;
+        for (int i = 0; i < dim; i++) norm += (double)vec[i]*(double)vec[i];
+        sh_puts("[embed] dim="); sh_putdec((uint64_t)dim);
+        sh_puts(" norm*1e6="); sh_putdec((uint64_t)(norm * 1e6));
+        sh_puts(" first8=");
+        for (int i = 0; i < 8 && i < dim; i++) {
+            int v = (int)(vec[i] * 10000.0f);
+            if (i > 0) sh_puts(",");
+            if (v < 0) { sh_puts("-"); v = -v; }
+            sh_putdec((uint64_t)v);
+        }
+        sh_puts("\n");
+        free(vec);
     } else if (strcmp(cmd, "parallel") == 0) {
 #ifdef __EMSCRIPTEN__
         /* Tier 2 #8 demo: spawn N Web Workers and time a parallel
