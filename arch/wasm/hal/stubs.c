@@ -1101,6 +1101,284 @@ EM_JS(int, js_wgpu_init_kick, (), {
                 compute: { module: q4kMod, entryPoint: 'dequant_q4k' },
             });
 
+            /* Q4_K-native fused-attn variant for Llama 1B Q4_K_M without
+             * predequant. wq/wk/wv/wo are array<u32> (raw Q4_K bytes,
+             * 36 u32 per 256-elem block). Matvecs inline the dequant
+             * via q4k_dequant_one helper. Eliminates the +608 MB heap
+             * cost of predequant_attn.
+             *
+             * Workgroup memory still uses storage q_scratch + attn_out
+             * (bindings 9, 10) — same layout as attnCodeLarge so the
+             * KV cache + scratch allocs are reusable. */
+            const attnCodeQ4K = `
+                const MAX_SEQ: u32 = 2048u;
+                struct AttnDims {
+                    dim: u32, kv_dim: u32,
+                    head_dim: u32, n_heads: u32,
+                    n_kv_heads: u32, gqa_ratio: u32,
+                    pos: u32, max_seq: u32,
+                    scale_bits: u32, rope_base_bits: u32,
+                    _pad0: u32, _pad1: u32,
+                };
+                @group(0) @binding(0) var<storage, read> wq: array<u32>;
+                @group(0) @binding(1) var<storage, read> wk: array<u32>;
+                @group(0) @binding(2) var<storage, read> wv: array<u32>;
+                @group(0) @binding(3) var<storage, read> wo: array<u32>;
+                @group(0) @binding(4) var<storage, read> inp: array<f32>;
+                @group(0) @binding(5) var<storage, read_write> kv_k: array<f32>;
+                @group(0) @binding(6) var<storage, read_write> kv_v: array<f32>;
+                @group(0) @binding(7) var<storage, read_write> outp: array<f32>;
+                @group(0) @binding(8) var<uniform> ad: AttnDims;
+                @group(0) @binding(9)  var<storage, read_write> q_scratch: array<f32>;
+                @group(0) @binding(10) var<storage, read_write> attn_out: array<f32>;
+
+                var<workgroup> att: array<f32, MAX_SEQ>;
+                var<workgroup> partial: array<f32, 64>;
+
+                /* Read byte at offset (4..15) into the block's scales region. */
+                fn sb_at(buf: ptr<storage, array<u32>, read>, base: u32, idx: u32) -> u32 {
+                    let w = (*buf)[base + 1u + (idx / 4u)];
+                    return (w >> (8u * (idx % 4u))) & 0xFFu;
+                }
+                fn qb_at(buf: ptr<storage, array<u32>, read>, base: u32, idx: u32) -> u32 {
+                    let w = (*buf)[base + 4u + (idx / 4u)];
+                    return (w >> (8u * (idx % 4u))) & 0xFFu;
+                }
+                fn q4k_d_at(buf: ptr<storage, array<u32>, read>, base: u32, j: u32) -> u32 {
+                    if (j < 4u) { return sb_at(buf, base, j) & 63u; }
+                    let lo = sb_at(buf, base, j + 4u) & 0xFu;
+                    let hi = (sb_at(buf, base, j - 4u) >> 6u) & 3u;
+                    return lo | (hi << 4u);
+                }
+                fn q4k_m_at(buf: ptr<storage, array<u32>, read>, base: u32, j: u32) -> u32 {
+                    if (j < 4u) { return sb_at(buf, base, j + 4u) & 63u; }
+                    let lo = sb_at(buf, base, j + 4u) >> 4u;
+                    let hi = (sb_at(buf, base, j) >> 6u) & 3u;
+                    return lo | (hi << 4u);
+                }
+                fn q4k_one(buf: ptr<storage, array<u32>, read>, base: u32, e: u32) -> f32 {
+                    let h0 = (*buf)[base];
+                    let dd   = unpack2x16float(h0).x;
+                    let dmin = unpack2x16float(h0).y;
+                    let pair = e / 64u;
+                    let off = e % 64u;
+                    let is_high = off >= 32u;
+                    let sub_idx = pair * 2u + select(0u, 1u, is_high);
+                    let sc = f32(q4k_d_at(buf, base, sub_idx));
+                    let mn = f32(q4k_m_at(buf, base, sub_idx));
+                    let qbyte = qb_at(buf, base, pair * 32u + (off % 32u));
+                    let nibble = select(qbyte & 0xFu, qbyte >> 4u, is_high);
+                    return dd * sc * f32(nibble) - dmin * mn;
+                }
+
+                @compute @workgroup_size(64)
+                fn fused_attn(@builtin(local_invocation_id) lid: vec3<u32>) {
+                    let tid = lid.x;
+                    let dim = ad.dim;
+                    let kv_dim = ad.kv_dim;
+                    let head_dim = ad.head_dim;
+                    let n_heads = ad.n_heads;
+                    let n_kv_heads = ad.n_kv_heads;
+                    let gqa_ratio = ad.gqa_ratio;
+                    let pos = ad.pos;
+                    let scale = bitcast<f32>(ad.scale_bits);
+                    let rope_base = bitcast<f32>(ad.rope_base_bits);
+                    let blocks_per_row = dim / 256u;
+                    let words_per_row  = blocks_per_row * 36u;
+
+                    /* Stage 1: Q,K,V via inline Q4_K dot product. */
+                    var i: u32 = tid;
+                    let total = dim + 2u * kv_dim;
+                    loop {
+                        if (i >= total) { break; }
+                        var sum: f32 = 0.0;
+                        if (i < dim) {
+                            let row_base = i * words_per_row;
+                            for (var b: u32 = 0u; b < blocks_per_row; b = b + 1u) {
+                                let blk = row_base + b * 36u;
+                                for (var e: u32 = 0u; e < 256u; e = e + 1u) {
+                                    sum = sum + q4k_one(&wq, blk, e) * inp[b * 256u + e];
+                                }
+                            }
+                            q_scratch[i] = sum;
+                        } else if (i < dim + kv_dim) {
+                            let row = i - dim;
+                            let row_base = row * words_per_row;
+                            for (var b: u32 = 0u; b < blocks_per_row; b = b + 1u) {
+                                let blk = row_base + b * 36u;
+                                for (var e: u32 = 0u; e < 256u; e = e + 1u) {
+                                    sum = sum + q4k_one(&wk, blk, e) * inp[b * 256u + e];
+                                }
+                            }
+                            kv_k[pos * kv_dim + row] = sum;
+                        } else {
+                            let row = i - dim - kv_dim;
+                            let row_base = row * words_per_row;
+                            for (var b: u32 = 0u; b < blocks_per_row; b = b + 1u) {
+                                let blk = row_base + b * 36u;
+                                for (var e: u32 = 0u; e < 256u; e = e + 1u) {
+                                    sum = sum + q4k_one(&wv, blk, e) * inp[b * 256u + e];
+                                }
+                            }
+                            kv_v[pos * kv_dim + row] = sum;
+                        }
+                        i = i + 64u;
+                    }
+                    workgroupBarrier();
+
+                    /* Stage 2: RoPE on Q (q_scratch) and current K
+                     * (just-written kv_k[pos*kv_dim..]). Same NTK
+                     * scaling math as attnCodeLarge. */
+                    let pairs_per_head = head_dim / 2u;
+                    let total_q_pairs  = n_heads    * pairs_per_head;
+                    let total_k_pairs  = n_kv_heads * pairs_per_head;
+                    i = tid;
+                    loop {
+                        if (i >= total_q_pairs) { break; }
+                        let h = i / pairs_per_head;
+                        let p = i % pairs_per_head;
+                        let exponent = f32(2u * p) / f32(head_dim);
+                        var inv_freq = pow(rope_base, -exponent);
+                        if (rope_base >= 100000.0) {
+                            let TWO_PI = 6.28318530717958647692;
+                            let wavelen = TWO_PI / inv_freq;
+                            if (wavelen > 8192.0) {
+                                inv_freq = inv_freq / 32.0;
+                            } else if (wavelen >= 2048.0) {
+                                let smooth = (8192.0 / wavelen - 1.0) / 3.0;
+                                inv_freq = (1.0 - smooth) * (inv_freq / 32.0) + smooth * inv_freq;
+                            }
+                        }
+                        let theta = f32(pos) * inv_freq;
+                        let c = cos(theta); let s = sin(theta);
+                        let idx = h * head_dim + 2u * p;
+                        let x0 = q_scratch[idx]; let x1 = q_scratch[idx + 1u];
+                        q_scratch[idx]      = x0 * c - x1 * s;
+                        q_scratch[idx + 1u] = x0 * s + x1 * c;
+                        i = i + 64u;
+                    }
+                    i = tid;
+                    loop {
+                        if (i >= total_k_pairs) { break; }
+                        let h = i / pairs_per_head;
+                        let p = i % pairs_per_head;
+                        let exponent = f32(2u * p) / f32(head_dim);
+                        var inv_freq = pow(rope_base, -exponent);
+                        if (rope_base >= 100000.0) {
+                            let TWO_PI = 6.28318530717958647692;
+                            let wavelen = TWO_PI / inv_freq;
+                            if (wavelen > 8192.0) {
+                                inv_freq = inv_freq / 32.0;
+                            } else if (wavelen >= 2048.0) {
+                                let smooth = (8192.0 / wavelen - 1.0) / 3.0;
+                                inv_freq = (1.0 - smooth) * (inv_freq / 32.0) + smooth * inv_freq;
+                            }
+                        }
+                        let theta = f32(pos) * inv_freq;
+                        let c = cos(theta); let s = sin(theta);
+                        let idx = pos * kv_dim + h * head_dim + 2u * p;
+                        let x0 = kv_k[idx]; let x1 = kv_k[idx + 1u];
+                        kv_k[idx]      = x0 * c - x1 * s;
+                        kv_k[idx + 1u] = x0 * s + x1 * c;
+                        i = i + 64u;
+                    }
+                    workgroupBarrier();
+
+                    /* Stage 3: per-head attention. Identical to large F32. */
+                    for (var h: u32 = 0u; h < n_heads; h = h + 1u) {
+                        let kv_h = h / gqa_ratio;
+                        i = tid;
+                        loop {
+                            if (i > pos) { break; }
+                            var dot: f32 = 0.0;
+                            for (var d: u32 = 0u; d < head_dim; d = d + 1u) {
+                                dot = dot + q_scratch[h * head_dim + d]
+                                          * kv_k[i * kv_dim + kv_h * head_dim + d];
+                            }
+                            att[i] = dot * scale;
+                            i = i + 64u;
+                        }
+                        workgroupBarrier();
+                        var lmax: f32 = -3.402823e38;
+                        i = tid;
+                        loop {
+                            if (i > pos) { break; }
+                            lmax = max(lmax, att[i]);
+                            i = i + 64u;
+                        }
+                        partial[tid] = lmax;
+                        workgroupBarrier();
+                        if (tid == 0u) {
+                            var m: f32 = -3.402823e38;
+                            for (var k: u32 = 0u; k < 64u; k = k + 1u) {
+                                m = max(m, partial[k]);
+                            }
+                            partial[0] = m;
+                        }
+                        workgroupBarrier();
+                        let gmax = partial[0];
+                        var lsum: f32 = 0.0;
+                        i = tid;
+                        loop {
+                            if (i > pos) { break; }
+                            let e = exp(att[i] - gmax);
+                            att[i] = e;
+                            lsum = lsum + e;
+                            i = i + 64u;
+                        }
+                        partial[tid] = lsum;
+                        workgroupBarrier();
+                        if (tid == 0u) {
+                            var s: f32 = 0.0;
+                            for (var k: u32 = 0u; k < 64u; k = k + 1u) {
+                                s = s + partial[k];
+                            }
+                            partial[0] = s;
+                        }
+                        workgroupBarrier();
+                        let inv_sum = 1.0 / partial[0];
+                        var d: u32 = tid;
+                        loop {
+                            if (d >= head_dim) { break; }
+                            var v_acc: f32 = 0.0;
+                            for (var p: u32 = 0u; p <= pos; p = p + 1u) {
+                                v_acc = v_acc + att[p] * inv_sum
+                                              * kv_v[p * kv_dim + kv_h * head_dim + d];
+                            }
+                            attn_out[h * head_dim + d] = v_acc;
+                            d = d + 64u;
+                        }
+                        workgroupBarrier();
+                    }
+
+                    /* Stage 4: W_o · attn_out via inline Q4_K dot. */
+                    i = tid;
+                    loop {
+                        if (i >= dim) { break; }
+                        let row_base = i * words_per_row;
+                        var sum: f32 = 0.0;
+                        for (var b: u32 = 0u; b < blocks_per_row; b = b + 1u) {
+                            let blk = row_base + b * 36u;
+                            for (var e: u32 = 0u; e < 256u; e = e + 1u) {
+                                sum = sum + q4k_one(&wo, blk, e) * attn_out[b * 256u + e];
+                            }
+                        }
+                        outp[i] = sum;
+                        i = i + 64u;
+                    }
+                }
+            `;
+            try {
+                const attnModQ4K = device.createShaderModule({ code: attnCodeQ4K });
+                window.__gpuAttnPipelineQ4K = device.createComputePipeline({
+                    layout: 'auto',
+                    compute: { module: attnModQ4K, entryPoint: 'fused_attn' },
+                });
+            } catch (e) {
+                console.warn('[wgpu] Q4_K attn pipeline failed:', String(e));
+                window.__gpuAttnPipelineQ4K = null;
+            }
+
             /* Large-dim variant for Llama 1B (dim=2048, kv_dim=512).
              * Promotes q_scratch and attn_out from workgroup arrays to
              * storage buffers (bindings 9, 10) so the per-workgroup
@@ -1995,18 +2273,25 @@ EM_JS(int, js_wgpu_fused_attn_kick, (
     int dim, int kv_dim, int head_dim, int n_heads, int n_kv_heads,
     int gqa_ratio, int pos, int max_seq,
     int scale_bits, int rope_base_bits,
-    int wq_id, int wk_id, int wv_id, int wo_id), {
+    int wq_id, int wk_id, int wv_id, int wo_id,
+    int weight_dtype), {
     window.__gpuOpDone = false; window.__gpuOpOK = false;
     if (!window.__gpuReady) { window.__gpuOpDone = true; return 0; }
     (async function() {
         try {
             const dev = window.__gpuDevice;
-            /* Pipeline select: small dim keeps q/o in workgroup arrays
-             * (faster — no cross-shader-stage roundtrip via storage);
-             * large dim uses the storage-buffer variant. 256 matches
-             * MAX_DIM in the small shader. */
-            const isLarge = dim > 256;
-            const pipe = isLarge ? window.__gpuAttnPipelineLarge
+            /* Pipeline select:
+             *   weight_dtype=2 (Q4_K) → Q4K pipeline (zero predequant cost)
+             *   dim > 256             → Large F32 pipeline (storage q/o)
+             *   else                   → small F32 pipeline (workgroup q/o)
+             *
+             * Q4_K path falls back if the pipeline compile failed (older
+             * WebGPU implementations may not support pointer-to-storage
+             * function params used by the inline dequant). */
+            const isQ4K = (weight_dtype === 2) && !!window.__gpuAttnPipelineQ4K;
+            const isLarge = !isQ4K && dim > 256;
+            const pipe = isQ4K  ? window.__gpuAttnPipelineQ4K
+                       : isLarge ? window.__gpuAttnPipelineLarge
                                  : window.__gpuAttnPipeline;
             const kv = window.__gpuKVPool && window.__gpuKVPool[layer];
             if (!kv) {
@@ -2014,7 +2299,10 @@ EM_JS(int, js_wgpu_fused_attn_kick, (
                 window.__gpuOpDone = true; return;
             }
             if (!window.__gpuAttnCache) window.__gpuAttnCache = new Map();
-            const key = layer + ':' + dim + ':' + kv_dim + ':' + head_dim;
+            /* Per-layer attn cache key now also discriminates on dtype so
+             * we don't reuse F32-sized weight buffers when the model is
+             * Q4_K (or vice versa). */
+            const key = layer + ':' + dim + ':' + kv_dim + ':' + head_dim + ':' + weight_dtype;
             let s = window.__gpuAttnCache.get(key);
             if (!s) {
                 if (window.__gpuAttnCache.size >= 32) {
@@ -2028,15 +2316,24 @@ EM_JS(int, js_wgpu_fused_attn_kick, (
                     window.__gpuAttnCache.delete(k0);
                 }
                 const dimBytes = dim * 4;
+                /* Q4_K byte size per weight row = (dim/256) * 144. */
+                const blocksPerRow = (dim / 256) | 0;
+                const q4kRowBytes = blocksPerRow * 144;
+                const wqBytes = isQ4K ? dim    * q4kRowBytes : dim    * dim * 4;
+                const wkBytes = isQ4K ? kv_dim * q4kRowBytes : kv_dim * dim * 4;
+                const wvBytes = isQ4K ? kv_dim * q4kRowBytes : kv_dim * dim * 4;
+                const woBytes = isQ4K ? dim    * q4kRowBytes : dim    * dim * 4;
                 s = {
-                    wqBuf: dev.createBuffer({ size: dim * dim * 4,
+                    wqBuf: dev.createBuffer({ size: wqBytes,
                         usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST }),
-                    wkBuf: dev.createBuffer({ size: kv_dim * dim * 4,
+                    wkBuf: dev.createBuffer({ size: wkBytes,
                         usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST }),
-                    wvBuf: dev.createBuffer({ size: kv_dim * dim * 4,
+                    wvBuf: dev.createBuffer({ size: wvBytes,
                         usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST }),
-                    woBuf: dev.createBuffer({ size: dim * dim * 4,
+                    woBuf: dev.createBuffer({ size: woBytes,
                         usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST }),
+                    _wqBytes: wqBytes, _wkBytes: wkBytes,
+                    _wvBytes: wvBytes, _woBytes: woBytes,
                     xBuf: dev.createBuffer({ size: dimBytes,
                         usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST }),
                     outBuf: dev.createBuffer({ size: dimBytes,
@@ -2063,7 +2360,7 @@ EM_JS(int, js_wgpu_fused_attn_kick, (
                     { binding: 7, resource: { buffer: s.outBuf } },
                     { binding: 8, resource: { buffer: s.dBuf } },
                 ];
-                if (isLarge) {
+                if (isLarge || isQ4K) {
                     s.qBuf = dev.createBuffer({ size: dimBytes,
                         usage: GPUBufferUsage.STORAGE });
                     s.oBuf = dev.createBuffer({ size: dimBytes,
@@ -2078,19 +2375,19 @@ EM_JS(int, js_wgpu_fused_attn_kick, (
                 window.__gpuAttnCache.set(key, s);
             }
             if (s.last_wq !== wq_id) {
-                dev.queue.writeBuffer(s.wqBuf, 0, HEAPU8.slice(wq, wq + dim*dim*4));
+                dev.queue.writeBuffer(s.wqBuf, 0, HEAPU8.slice(wq, wq + s._wqBytes));
                 s.last_wq = wq_id;
             }
             if (s.last_wk !== wk_id) {
-                dev.queue.writeBuffer(s.wkBuf, 0, HEAPU8.slice(wk, wk + kv_dim*dim*4));
+                dev.queue.writeBuffer(s.wkBuf, 0, HEAPU8.slice(wk, wk + s._wkBytes));
                 s.last_wk = wk_id;
             }
             if (s.last_wv !== wv_id) {
-                dev.queue.writeBuffer(s.wvBuf, 0, HEAPU8.slice(wv, wv + kv_dim*dim*4));
+                dev.queue.writeBuffer(s.wvBuf, 0, HEAPU8.slice(wv, wv + s._wvBytes));
                 s.last_wv = wv_id;
             }
             if (s.last_wo !== wo_id) {
-                dev.queue.writeBuffer(s.woBuf, 0, HEAPU8.slice(wo, wo + dim*dim*4));
+                dev.queue.writeBuffer(s.woBuf, 0, HEAPU8.slice(wo, wo + s._woBytes));
                 s.last_wo = wo_id;
             }
             dev.queue.writeBuffer(s.xBuf, 0, HEAPU8.slice(x, x + dim*4));
@@ -2118,10 +2415,11 @@ EM_JS(int, js_wgpu_fused_attn_kick, (
 });
 
 int wasm_wgpu_fused_attn(int layer,
-    const float *x, const float *wq, const float *wk, const float *wv, const float *wo,
+    const float *x, const void *wq, const void *wk, const void *wv, const void *wo,
     float *out,
     int dim, int kv_dim, int head_dim, int n_heads, int n_kv_heads,
-    int gqa_ratio, int pos, int max_seq, float scale, float rope_base)
+    int gqa_ratio, int pos, int max_seq, float scale, float rope_base,
+    int weight_dtype)
 {
     if (!js_wgpu_ready()) return -1;
     union { float f; uint32_t u; } sb, rb;
@@ -2133,7 +2431,7 @@ int wasm_wgpu_fused_attn(int layer,
     js_wgpu_fused_attn_kick(layer, x, wq, wk, wv, wo, out,
         dim, kv_dim, head_dim, n_heads, n_kv_heads, gqa_ratio,
         pos, max_seq, (int)sb.u, (int)rb.u,
-        wq_id, wk_id, wv_id, wo_id);
+        wq_id, wk_id, wv_id, wo_id, weight_dtype);
     while (!js_wgpu_op_done()) emscripten_sleep(1);
     return js_wgpu_op_ok() ? 0 : -1;
 }

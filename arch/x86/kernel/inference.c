@@ -813,7 +813,8 @@ int llama_forward(llama_state_t *s, uint32_t token)
     extern bool g_llama_attn_init;
     if (g_llama_use_gpu_attn && !g_llama_attn_init &&
         s->n_layers > 0 &&
-        s->weights.layers[0].attn_q->type == GGML_TYPE_F32) {
+        (s->weights.layers[0].attn_q->type == GGML_TYPE_F32 ||
+         s->weights.layers[0].attn_q->type == GGML_TYPE_Q4_K)) {
         extern int wasm_wgpu_kvcache_alloc(int layer, int max_seq, int kv_dim);
         bool all_ok = true;
         for (uint32_t l = 0; l < s->n_layers; l++) {
@@ -842,28 +843,34 @@ int llama_forward(llama_state_t *s, uint32_t token)
          * Q4_K dequant inline yet) and a non-scaled RoPE base. KV
          * cache stays GPU-side across the whole generation. */
         bool gpu_attn_ok = false;
-        if (g_llama_use_gpu_attn && g_llama_attn_init &&
-            ly->attn_q->type      == GGML_TYPE_F32 &&
-            ly->attn_k->type      == GGML_TYPE_F32 &&
-            ly->attn_v->type      == GGML_TYPE_F32 &&
-            ly->attn_output->type == GGML_TYPE_F32) {
+        bool all_f32 = ly->attn_q->type      == GGML_TYPE_F32 &&
+                       ly->attn_k->type      == GGML_TYPE_F32 &&
+                       ly->attn_v->type      == GGML_TYPE_F32 &&
+                       ly->attn_output->type == GGML_TYPE_F32;
+        bool all_q4k = ly->attn_q->type      == GGML_TYPE_Q4_K &&
+                       ly->attn_k->type      == GGML_TYPE_Q4_K &&
+                       ly->attn_v->type      == GGML_TYPE_Q4_K &&
+                       ly->attn_output->type == GGML_TYPE_Q4_K;
+        int weight_dtype = all_f32 ? 0 : (all_q4k ? 2 : -1);
+        if (g_llama_use_gpu_attn && g_llama_attn_init && weight_dtype >= 0) {
             extern int wasm_wgpu_fused_attn(int layer,
-                const float *x, const float *wq, const float *wk,
-                const float *wv, const float *wo, float *out,
+                const float *x, const void *wq, const void *wk,
+                const void *wv, const void *wo, float *out,
                 int dim, int kv_dim, int head_dim, int n_heads,
                 int n_kv_heads, int gqa_ratio, int pos, int max_seq,
-                float scale, float rope_base);
+                float scale, float rope_base, int weight_dtype);
             float scale = 1.0f / sqrtf_bare((float)hd);
             int rc = wasm_wgpu_fused_attn((int)l,
                 s->xb,
-                (const float *)ly->attn_q->data,
-                (const float *)ly->attn_k->data,
-                (const float *)ly->attn_v->data,
-                (const float *)ly->attn_output->data,
+                ly->attn_q->data,
+                ly->attn_k->data,
+                ly->attn_v->data,
+                ly->attn_output->data,
                 s->xb,
                 (int)dim, (int)kv_dim, (int)hd, (int)s->n_heads,
                 (int)s->n_kv_heads, (int)s->gqa_ratio,
-                (int)pos, (int)s->max_seq, scale, s->rope_freq_base);
+                (int)pos, (int)s->max_seq, scale, s->rope_freq_base,
+                weight_dtype);
             if (rc == 0) {
                 vec_add(s->x, s->x, s->xb, dim);
                 gpu_attn_ok = true;
@@ -1135,22 +1142,22 @@ static int brandon_forward_one(llama_state_t *s, uint32_t pos, bool produce_logi
             ly->attn_v->type == GGML_TYPE_F32 &&
             ly->attn_output->type == GGML_TYPE_F32) {
             extern int wasm_wgpu_fused_attn(int layer,
-                const float *x, const float *wq, const float *wk,
-                const float *wv, const float *wo, float *out,
+                const float *x, const void *wq, const void *wk,
+                const void *wv, const void *wo, float *out,
                 int dim, int kv_dim, int head_dim, int n_heads,
                 int n_kv_heads, int gqa_ratio, int pos, int max_seq,
-                float scale, float rope_base);
+                float scale, float rope_base, int weight_dtype);
             float scale = 1.0f / sqrtf_bare((float)hd);
             int rc = wasm_wgpu_fused_attn((int)l,
                 s->xb,
-                (const float *)ly->attn_q->data,
-                (const float *)ly->attn_k->data,
-                (const float *)ly->attn_v->data,
-                (const float *)ly->attn_output->data,
+                ly->attn_q->data,
+                ly->attn_k->data,
+                ly->attn_v->data,
+                ly->attn_output->data,
                 s->xb,                 /* output: post-O projection */
                 (int)dim, (int)kv_dim, (int)hd, (int)s->n_heads,
                 (int)s->n_kv_heads, (int)s->gqa_ratio,
-                (int)pos, (int)s->max_seq, scale, s->rope_freq_base);
+                (int)pos, (int)s->max_seq, scale, s->rope_freq_base, 0);
             if (rc == 0) {
                 vec_add(s->x, s->x, s->xb, dim);
                 gpu_attn_ok = true;
