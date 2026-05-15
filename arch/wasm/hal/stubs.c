@@ -1715,6 +1715,294 @@ EM_JS(int, js_wgpu_init_kick, (), {
                 window.__gpuFFNPipelineQ4K = null;
             }
 
+            /* Multi-workgroup Q4_K FFN pipelines. The single-workgroup
+             * fused FFN above runs 64 threads on the whole FFN block,
+             * leaving 99% of the GPU idle. Split into 3 pipelines:
+             *
+             *   rmsnorm (1 workgroup × 64 threads): reduce + scale
+             *   gate_up (ffn_dim workgroups × 64 threads): each WG
+             *           computes one output row of gate AND up via
+             *           thread-cooperative dot, then SwiGLU
+             *   down_residual (dim workgroups × 64 threads): each WG
+             *           computes one output row of down via coop dot,
+             *           then x[row] += result
+             *
+             * For Llama 1B (dim=2048, ffn_dim=8192): 8192 + 2048 + 1 =
+             * 10241 workgroups per FFN call instead of 1. Unlocks
+             * ~160x more concurrent threads on the GPU.
+             *
+             * Same bindgroup as the single-WG pipeline — all 3 shaders
+             * declare all 9 bindings even though each uses a subset.
+             * WGSL allows this; lets us reuse the existing FFN cache. */
+            const ffnCodeRms = `
+                struct FFNDims { dim: u32, ffn_dim: u32, eps_bits: u32, _pad0: u32 };
+                @group(0) @binding(0) var<storage, read>       w_gate: array<u32>;
+                @group(0) @binding(1) var<storage, read>       w_up:   array<u32>;
+                @group(0) @binding(2) var<storage, read>       w_down: array<u32>;
+                @group(0) @binding(3) var<storage, read>       ffn_norm_w: array<f32>;
+                @group(0) @binding(4) var<storage, read_write> x_inout: array<f32>;
+                @group(0) @binding(5) var<uniform>             fd: FFNDims;
+                @group(0) @binding(6) var<storage, read_write> gate_scratch: array<f32>;
+                @group(0) @binding(7) var<storage, read_write> up_scratch:   array<f32>;
+                @group(0) @binding(8) var<storage, read_write> xb_scratch:   array<f32>;
+
+                var<workgroup> partial: array<f32, 64>;
+
+                @compute @workgroup_size(64)
+                fn ffn_rmsnorm(@builtin(local_invocation_id) lid: vec3<u32>) {
+                    let tid = lid.x;
+                    let dim = fd.dim;
+                    let eps = bitcast<f32>(fd.eps_bits);
+                    var ss: f32 = 0.0;
+                    var i: u32 = tid;
+                    loop {
+                        if (i >= dim) { break; }
+                        let v = x_inout[i];
+                        ss = ss + v * v;
+                        i = i + 64u;
+                    }
+                    partial[tid] = ss;
+                    workgroupBarrier();
+                    if (tid == 0u) {
+                        var s: f32 = 0.0;
+                        for (var k: u32 = 0u; k < 64u; k = k + 1u) {
+                            s = s + partial[k];
+                        }
+                        partial[0] = s;
+                    }
+                    workgroupBarrier();
+                    let rms = 1.0 / sqrt(partial[0] / f32(dim) + eps);
+                    i = tid;
+                    loop {
+                        if (i >= dim) { break; }
+                        xb_scratch[i] = ffn_norm_w[i] * x_inout[i] * rms;
+                        i = i + 64u;
+                    }
+                }
+            `;
+
+            /* gate_up: one workgroup per row of ffn_dim. 64 threads
+             * cooperatively walk the row's Q4_K blocks for BOTH gate
+             * and up, accumulating partial dots. Reduce across threads,
+             * apply SwiGLU, write gate_scratch[row]. up_scratch unused
+             * after this stage but kept in layout for binding compat. */
+            const ffnCodeGateUp = `
+                struct FFNDims { dim: u32, ffn_dim: u32, eps_bits: u32, _pad0: u32 };
+                @group(0) @binding(0) var<storage, read>       w_gate: array<u32>;
+                @group(0) @binding(1) var<storage, read>       w_up:   array<u32>;
+                @group(0) @binding(2) var<storage, read>       w_down: array<u32>;
+                @group(0) @binding(3) var<storage, read>       ffn_norm_w: array<f32>;
+                @group(0) @binding(4) var<storage, read_write> x_inout: array<f32>;
+                @group(0) @binding(5) var<uniform>             fd: FFNDims;
+                @group(0) @binding(6) var<storage, read_write> gate_scratch: array<f32>;
+                @group(0) @binding(7) var<storage, read_write> up_scratch:   array<f32>;
+                @group(0) @binding(8) var<storage, read_write> xb_scratch:   array<f32>;
+
+                var<workgroup> pg: array<f32, 64>;
+                var<workgroup> pu: array<f32, 64>;
+
+                fn sb_g(base: u32, idx: u32) -> u32 {
+                    let w = w_gate[base + 1u + (idx / 4u)];
+                    return (w >> (8u * (idx % 4u))) & 0xFFu;
+                }
+                fn qb_g(base: u32, idx: u32) -> u32 {
+                    let w = w_gate[base + 4u + (idx / 4u)];
+                    return (w >> (8u * (idx % 4u))) & 0xFFu;
+                }
+                fn dq_g(base: u32, e: u32) -> f32 {
+                    let h0 = w_gate[base];
+                    let dd = unpack2x16float(h0).x; let dmin = unpack2x16float(h0).y;
+                    let pair = e / 64u; let off = e % 64u;
+                    let is_high = off >= 32u;
+                    let sub_idx = pair * 2u + select(0u, 1u, is_high);
+                    var sc: u32; var mn: u32;
+                    if (sub_idx < 4u) {
+                        sc = sb_g(base, sub_idx) & 63u;
+                        mn = sb_g(base, sub_idx + 4u) & 63u;
+                    } else {
+                        let lo_s = sb_g(base, sub_idx + 4u) & 0xFu;
+                        let hi_s = (sb_g(base, sub_idx - 4u) >> 6u) & 3u;
+                        sc = lo_s | (hi_s << 4u);
+                        let lo_m = sb_g(base, sub_idx + 4u) >> 4u;
+                        let hi_m = (sb_g(base, sub_idx) >> 6u) & 3u;
+                        mn = lo_m | (hi_m << 4u);
+                    }
+                    let qbyte = qb_g(base, pair * 32u + (off % 32u));
+                    let nibble = select(qbyte & 0xFu, qbyte >> 4u, is_high);
+                    return dd * f32(sc) * f32(nibble) - dmin * f32(mn);
+                }
+                fn sb_u(base: u32, idx: u32) -> u32 {
+                    let w = w_up[base + 1u + (idx / 4u)];
+                    return (w >> (8u * (idx % 4u))) & 0xFFu;
+                }
+                fn qb_u(base: u32, idx: u32) -> u32 {
+                    let w = w_up[base + 4u + (idx / 4u)];
+                    return (w >> (8u * (idx % 4u))) & 0xFFu;
+                }
+                fn dq_u(base: u32, e: u32) -> f32 {
+                    let h0 = w_up[base];
+                    let dd = unpack2x16float(h0).x; let dmin = unpack2x16float(h0).y;
+                    let pair = e / 64u; let off = e % 64u;
+                    let is_high = off >= 32u;
+                    let sub_idx = pair * 2u + select(0u, 1u, is_high);
+                    var sc: u32; var mn: u32;
+                    if (sub_idx < 4u) {
+                        sc = sb_u(base, sub_idx) & 63u;
+                        mn = sb_u(base, sub_idx + 4u) & 63u;
+                    } else {
+                        let lo_s = sb_u(base, sub_idx + 4u) & 0xFu;
+                        let hi_s = (sb_u(base, sub_idx - 4u) >> 6u) & 3u;
+                        sc = lo_s | (hi_s << 4u);
+                        let lo_m = sb_u(base, sub_idx + 4u) >> 4u;
+                        let hi_m = (sb_u(base, sub_idx) >> 6u) & 3u;
+                        mn = lo_m | (hi_m << 4u);
+                    }
+                    let qbyte = qb_u(base, pair * 32u + (off % 32u));
+                    let nibble = select(qbyte & 0xFu, qbyte >> 4u, is_high);
+                    return dd * f32(sc) * f32(nibble) - dmin * f32(mn);
+                }
+
+                @compute @workgroup_size(64)
+                fn ffn_gate_up(@builtin(workgroup_id) wid: vec3<u32>,
+                               @builtin(local_invocation_id) lid: vec3<u32>) {
+                    let row = wid.x;
+                    let tid = lid.x;
+                    let cols = fd.dim;
+                    if (row >= fd.ffn_dim) { return; }
+                    let blocks_per_row = cols / 256u;
+                    let words_per_row  = blocks_per_row * 36u;
+                    let row_base = row * words_per_row;
+                    var gp: f32 = 0.0;
+                    var up: f32 = 0.0;
+                    var e: u32 = tid;
+                    loop {
+                        if (e >= cols) { break; }
+                        let blk_idx = e / 256u;
+                        let elem = e % 256u;
+                        let blk = row_base + blk_idx * 36u;
+                        let xv = xb_scratch[e];
+                        gp = gp + dq_g(blk, elem) * xv;
+                        up = up + dq_u(blk, elem) * xv;
+                        e = e + 64u;
+                    }
+                    pg[tid] = gp;
+                    pu[tid] = up;
+                    workgroupBarrier();
+                    if (tid == 0u) {
+                        var gs: f32 = 0.0;
+                        var us: f32 = 0.0;
+                        for (var k: u32 = 0u; k < 64u; k = k + 1u) {
+                            gs = gs + pg[k];
+                            us = us + pu[k];
+                        }
+                        let sig = 1.0 / (1.0 + exp(-gs));
+                        gate_scratch[row] = gs * sig * us;
+                    }
+                }
+            `;
+
+            /* down_residual: one workgroup per dim row. Reads
+             * gate_scratch (full ffn_dim entries), writes x_inout[row]
+             * += dot. Same coop pattern as gate_up. */
+            const ffnCodeDown = `
+                struct FFNDims { dim: u32, ffn_dim: u32, eps_bits: u32, _pad0: u32 };
+                @group(0) @binding(0) var<storage, read>       w_gate: array<u32>;
+                @group(0) @binding(1) var<storage, read>       w_up:   array<u32>;
+                @group(0) @binding(2) var<storage, read>       w_down: array<u32>;
+                @group(0) @binding(3) var<storage, read>       ffn_norm_w: array<f32>;
+                @group(0) @binding(4) var<storage, read_write> x_inout: array<f32>;
+                @group(0) @binding(5) var<uniform>             fd: FFNDims;
+                @group(0) @binding(6) var<storage, read_write> gate_scratch: array<f32>;
+                @group(0) @binding(7) var<storage, read_write> up_scratch:   array<f32>;
+                @group(0) @binding(8) var<storage, read_write> xb_scratch:   array<f32>;
+
+                var<workgroup> pd: array<f32, 64>;
+
+                fn sb_d(base: u32, idx: u32) -> u32 {
+                    let w = w_down[base + 1u + (idx / 4u)];
+                    return (w >> (8u * (idx % 4u))) & 0xFFu;
+                }
+                fn qb_d(base: u32, idx: u32) -> u32 {
+                    let w = w_down[base + 4u + (idx / 4u)];
+                    return (w >> (8u * (idx % 4u))) & 0xFFu;
+                }
+                fn dq_d(base: u32, e: u32) -> f32 {
+                    let h0 = w_down[base];
+                    let dd = unpack2x16float(h0).x; let dmin = unpack2x16float(h0).y;
+                    let pair = e / 64u; let off = e % 64u;
+                    let is_high = off >= 32u;
+                    let sub_idx = pair * 2u + select(0u, 1u, is_high);
+                    var sc: u32; var mn: u32;
+                    if (sub_idx < 4u) {
+                        sc = sb_d(base, sub_idx) & 63u;
+                        mn = sb_d(base, sub_idx + 4u) & 63u;
+                    } else {
+                        let lo_s = sb_d(base, sub_idx + 4u) & 0xFu;
+                        let hi_s = (sb_d(base, sub_idx - 4u) >> 6u) & 3u;
+                        sc = lo_s | (hi_s << 4u);
+                        let lo_m = sb_d(base, sub_idx + 4u) >> 4u;
+                        let hi_m = (sb_d(base, sub_idx) >> 6u) & 3u;
+                        mn = lo_m | (hi_m << 4u);
+                    }
+                    let qbyte = qb_d(base, pair * 32u + (off % 32u));
+                    let nibble = select(qbyte & 0xFu, qbyte >> 4u, is_high);
+                    return dd * f32(sc) * f32(nibble) - dmin * f32(mn);
+                }
+
+                @compute @workgroup_size(64)
+                fn ffn_down(@builtin(workgroup_id) wid: vec3<u32>,
+                            @builtin(local_invocation_id) lid: vec3<u32>) {
+                    let row = wid.x;
+                    let tid = lid.x;
+                    let cols = fd.ffn_dim;
+                    if (row >= fd.dim) { return; }
+                    let blocks_per_row = cols / 256u;
+                    let words_per_row  = blocks_per_row * 36u;
+                    let row_base = row * words_per_row;
+                    var sum: f32 = 0.0;
+                    var e: u32 = tid;
+                    loop {
+                        if (e >= cols) { break; }
+                        let blk_idx = e / 256u;
+                        let elem = e % 256u;
+                        let blk = row_base + blk_idx * 36u;
+                        sum = sum + dq_d(blk, elem) * gate_scratch[e];
+                        e = e + 64u;
+                    }
+                    pd[tid] = sum;
+                    workgroupBarrier();
+                    if (tid == 0u) {
+                        var s: f32 = 0.0;
+                        for (var k: u32 = 0u; k < 64u; k = k + 1u) {
+                            s = s + pd[k];
+                        }
+                        x_inout[row] = x_inout[row] + s;
+                    }
+                }
+            `;
+            try {
+                const m1 = device.createShaderModule({ code: ffnCodeRms });
+                const m2 = device.createShaderModule({ code: ffnCodeGateUp });
+                const m3 = device.createShaderModule({ code: ffnCodeDown });
+                window.__gpuFFNRmsPipeline = device.createComputePipeline({
+                    layout: 'auto',
+                    compute: { module: m1, entryPoint: 'ffn_rmsnorm' },
+                });
+                window.__gpuFFNGateUpPipeline = device.createComputePipeline({
+                    layout: 'auto',
+                    compute: { module: m2, entryPoint: 'ffn_gate_up' },
+                });
+                window.__gpuFFNDownPipeline = device.createComputePipeline({
+                    layout: 'auto',
+                    compute: { module: m3, entryPoint: 'ffn_down' },
+                });
+            } catch (e) {
+                console.warn('[wgpu] Q4_K FFN multi-WG pipelines failed:', String(e));
+                window.__gpuFFNRmsPipeline = null;
+                window.__gpuFFNGateUpPipeline = null;
+                window.__gpuFFNDownPipeline = null;
+            }
+
             /* Large-dim variant for Llama 1B (dim=2048, kv_dim=512).
              * Promotes q_scratch and attn_out from workgroup arrays to
              * storage buffers (bindings 9, 10) so the per-workgroup
@@ -2596,6 +2884,12 @@ EM_JS(int, js_wgpu_ffn_q4k_kick, (
     (async function() {
         try {
             const dev = window.__gpuDevice;
+            /* Prefer the multi-workgroup split when all 3 pipelines
+             * compiled; falls back to the single-WG fused shader
+             * (older devices may lack required limits). */
+            const useMulti = window.__gpuFFNRmsPipeline &&
+                             window.__gpuFFNGateUpPipeline &&
+                             window.__gpuFFNDownPipeline;
             const pipe = window.__gpuFFNPipelineQ4K;
             if (!window.__gpuFFNCache) window.__gpuFFNCache = new Map();
             const key = layer + ':' + dim + ':' + ffn_dim;
@@ -2643,20 +2937,40 @@ EM_JS(int, js_wgpu_ffn_q4k_kick, (
                     bg: null,
                     last_wg: 0, last_wu: 0, last_wd: 0, last_wn: 0,
                 };
+                /* Multi-WG path needs separate bind groups (one per
+                 * pipeline) since 'layout: auto' gives each pipeline a
+                 * unique BindGroupLayout. Even though all 3 shaders
+                 * declare identical bindings, the layouts are distinct
+                 * objects so we can't share one bind group. */
+                const entries = [
+                    { binding: 0, resource: { buffer: s.wgBuf } },
+                    { binding: 1, resource: { buffer: s.wuBuf } },
+                    { binding: 2, resource: { buffer: s.wdBuf } },
+                    { binding: 3, resource: { buffer: s.wnBuf } },
+                    { binding: 4, resource: { buffer: s.xBuf  } },
+                    { binding: 5, resource: { buffer: s.dBuf  } },
+                    { binding: 6, resource: { buffer: s.gateBuf } },
+                    { binding: 7, resource: { buffer: s.upBuf   } },
+                    { binding: 8, resource: { buffer: s.xbBuf   } },
+                ];
                 s.bg = dev.createBindGroup({
                     layout: pipe.getBindGroupLayout(0),
-                    entries: [
-                        { binding: 0, resource: { buffer: s.wgBuf } },
-                        { binding: 1, resource: { buffer: s.wuBuf } },
-                        { binding: 2, resource: { buffer: s.wdBuf } },
-                        { binding: 3, resource: { buffer: s.wnBuf } },
-                        { binding: 4, resource: { buffer: s.xBuf  } },
-                        { binding: 5, resource: { buffer: s.dBuf  } },
-                        { binding: 6, resource: { buffer: s.gateBuf } },
-                        { binding: 7, resource: { buffer: s.upBuf   } },
-                        { binding: 8, resource: { buffer: s.xbBuf   } },
-                    ],
+                    entries: entries,
                 });
+                if (useMulti) {
+                    s.bgRms = dev.createBindGroup({
+                        layout: window.__gpuFFNRmsPipeline.getBindGroupLayout(0),
+                        entries: entries,
+                    });
+                    s.bgGateUp = dev.createBindGroup({
+                        layout: window.__gpuFFNGateUpPipeline.getBindGroupLayout(0),
+                        entries: entries,
+                    });
+                    s.bgDown = dev.createBindGroup({
+                        layout: window.__gpuFFNDownPipeline.getBindGroupLayout(0),
+                        entries: entries,
+                    });
+                }
                 dev.queue.writeBuffer(s.dBuf, 0,
                     new Uint32Array([dim, ffn_dim, eps_bits, 0]));
                 window.__gpuFFNCache.set(key, s);
@@ -2683,11 +2997,33 @@ EM_JS(int, js_wgpu_ffn_q4k_kick, (
             /* Upload current residual x. */
             dev.queue.writeBuffer(s.xBuf, 0, HEAPU8.slice(x, x + dim * 4));
             const enc = dev.createCommandEncoder();
-            const pass = enc.beginComputePass();
-            pass.setPipeline(pipe);
-            pass.setBindGroup(0, s.bg);
-            pass.dispatchWorkgroups(1);
-            pass.end();
+            if (useMulti && s.bgRms) {
+                /* Pass 1: rmsnorm (1 workgroup). */
+                const p1 = enc.beginComputePass();
+                p1.setPipeline(window.__gpuFFNRmsPipeline);
+                p1.setBindGroup(0, s.bgRms);
+                p1.dispatchWorkgroups(1);
+                p1.end();
+                /* Pass 2: gate+up matvec + SwiGLU (ffn_dim workgroups). */
+                const p2 = enc.beginComputePass();
+                p2.setPipeline(window.__gpuFFNGateUpPipeline);
+                p2.setBindGroup(0, s.bgGateUp);
+                p2.dispatchWorkgroups(ffn_dim);
+                p2.end();
+                /* Pass 3: down matvec + residual (dim workgroups). */
+                const p3 = enc.beginComputePass();
+                p3.setPipeline(window.__gpuFFNDownPipeline);
+                p3.setBindGroup(0, s.bgDown);
+                p3.dispatchWorkgroups(dim);
+                p3.end();
+            } else {
+                /* Single-WG fallback (16K threads sequential). */
+                const pass = enc.beginComputePass();
+                pass.setPipeline(pipe);
+                pass.setBindGroup(0, s.bg);
+                pass.dispatchWorkgroups(1);
+                pass.end();
+            }
             enc.copyBufferToBuffer(s.xBuf, 0, s.rBuf, 0, dim * 4);
             dev.queue.submit([enc.finish()]);
             await s.rBuf.mapAsync(GPUMapMode.READ);
