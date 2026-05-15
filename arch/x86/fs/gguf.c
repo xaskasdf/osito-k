@@ -740,6 +740,95 @@ int gguf_dequant_f16_to_f32(gguf_model_t *model)
     return 0;
 }
 
+/* Selective Q4_K → F32 dequant. Walks every tensor whose name contains
+ * `name_filter` (e.g. ".attn_" matches attn_q/k/v/output across all
+ * layers) and converts the data in-place. Used to satisfy the GPU
+ * fused-attn F32-only gate for Q4_K_M models. FFN tensors stay
+ * Q4_K — they'd dwarf the memory budget.
+ *
+ * Memory cost reference (Llama 1B Q4_K_M, dim=2048, 16 layers):
+ *   attn_q + attn_o = 16 MB each per layer
+ *   attn_k + attn_v =  4 MB each per layer
+ *   Total ≈ 640 MB extra
+ * Caller decides if this fits. The function logs the totals and
+ * returns the number of tensors converted (or -1 on error). */
+/* Inline Q4_K block dequant — scalar fallback. Equivalent to the
+ * one in tensor.c but kept local to avoid exposing the static. */
+static void gguf_q4k_scale_min(int j, const uint8_t *q,
+                                uint8_t *d, uint8_t *m)
+{
+    if (j < 4) { *d = q[j] & 63; *m = q[j+4] & 63; }
+    else {
+        *d = (q[j+4] & 0x0F) | ((q[j-4] >> 6) << 4);
+        *m = (q[j+4] >> 4)   | ((q[j]   >> 6) << 4);
+    }
+}
+static void gguf_dequant_q4k_block(const uint8_t *block, float *y)
+{
+    float d    = f16_to_f32(*(const uint16_t *)(block + 0));
+    float dmin = f16_to_f32(*(const uint16_t *)(block + 2));
+    const uint8_t *scales = block + 4;
+    const uint8_t *qs     = block + 16;
+    int is = 0;
+    for (int chunk = 0; chunk < 256; chunk += 64) {
+        uint8_t sc, m;
+        gguf_q4k_scale_min(is + 0, scales, &sc, &m);
+        float d1 = d * (float)sc, m1 = dmin * (float)m;
+        gguf_q4k_scale_min(is + 1, scales, &sc, &m);
+        float d2 = d * (float)sc, m2 = dmin * (float)m;
+        for (int l = 0; l < 32; l++)
+            y[chunk +     l] = d1 * (float)(qs[l] & 0xF) - m1;
+        for (int l = 0; l < 32; l++)
+            y[chunk + 32 + l] = d2 * (float)(qs[l] >> 4) - m2;
+        qs += 32; is += 2;
+    }
+}
+
+int gguf_dequant_q4k_to_f32(gguf_model_t *model, const char *name_filter)
+{
+    if (!model || !model->tensors) return -1;
+    uint64_t n_converted = 0, bytes_added = 0;
+    for (uint32_t i = 0; i < model->num_tensors; i++) {
+        gguf_tensor_t *t = &model->tensors[i];
+        if (t->type != GGML_TYPE_Q4_K) continue;
+        if (name_filter && *name_filter) {
+            const char *hay = t->name, *needle = name_filter;
+            bool match = false;
+            for (; *hay && !match; hay++) {
+                const char *h = hay, *n = needle;
+                while (*h && *n && *h == *n) { h++; n++; }
+                if (!*n) match = true;
+            }
+            if (!match) continue;
+        }
+        uint64_t n_elems = 1;
+        for (uint32_t d = 0; d < t->n_dims && d < 4; d++)
+            if (t->ne[d] > 0) n_elems *= t->ne[d];
+        if (n_elems == 0 || (n_elems % 256) != 0) continue;
+        uint64_t n_blocks = n_elems / 256;
+        uint64_t new_bytes = n_elems * sizeof(float);
+        float *out = (float *)mem_alloc_aligned(new_bytes, 64);
+        if (!out) {
+            serial_puts("[GGUF] Q4_K dequant alloc failed at ");
+            serial_puts(t->name); serial_puts("\n");
+            return -1;
+        }
+        const uint8_t *src = (const uint8_t *)t->data;
+        for (uint64_t b = 0; b < n_blocks; b++)
+            gguf_dequant_q4k_block(src + b * 144, out + b * 256);
+        t->data = out;
+        t->type = GGML_TYPE_F32;
+        t->size = new_bytes;
+        n_converted++;
+        bytes_added += new_bytes;
+    }
+    serial_puts("[GGUF] Pre-dequant Q4_K->F32 (filter='");
+    serial_puts(name_filter ? name_filter : ""); serial_puts("'): ");
+    serial_putdec(n_converted); serial_puts(" tensors, +");
+    serial_putdec(bytes_added / (1024 * 1024)); serial_puts(" MB\n");
+    return (int)n_converted;
+}
+
 /* ── WASM: load from in-memory buffer ───────────────────────────
  *
  * Replaces gguf_load for the WASM build where OsitoFS is unavailable.

@@ -6241,6 +6241,25 @@ pdone:
                 sh_puts(v ? "[llama] GPU fused-attn ENABLED (F32 + rope_base<100k)\n"
                           : "[llama] GPU fused-attn disabled\n");
             }
+            else if (strcmp(argv[1], "predequant_attn") == 0) {
+                /* Pre-dequant Q4_K attn weights → F32 to satisfy the
+                 * GPU fused-attn F32 gate. Memory cost: ~640 MB for
+                 * Llama 1B. Run AFTER model load, BEFORE first chat. */
+#ifdef __EMSCRIPTEN__
+                extern void *wasm_get_model(void);
+                void *m = wasm_get_model();
+                if (!m) { sh_puts("predequant_attn: no model loaded\n"); }
+                else {
+                    extern int gguf_dequant_q4k_to_f32(void *model, const char *filter);
+                    int n = gguf_dequant_q4k_to_f32(m, ".attn_");
+                    if (n < 0) sh_puts("[predequant_attn] FAILED (likely OOM)\n");
+                    else { sh_puts("[predequant_attn] "); sh_putdec((uint64_t)n);
+                           sh_puts(" tensors converted\n"); }
+                }
+#else
+                sh_puts("predequant_attn: WASM-only\n");
+#endif
+            }
             else sh_puts("bdebug applied\n");
         }
     } else if (strcmp(cmd, "temp") == 0) {

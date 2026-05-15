@@ -210,6 +210,20 @@ int gguf_load_tokenizer(gguf_model_t *model, gguf_tokenizer_t *tok);
 int gguf_dequant_f16_to_f32(gguf_model_t *model);
 
 /*
+ * gguf_dequant_q4k_to_f32 — Selective Q4_K → F32 in-place conversion.
+ *
+ * Walks every Q4_K tensor whose name contains `name_filter`. Pass
+ * ".attn_" to dequant only attention weights (Q/K/V/O) — typical
+ * memory cost is ~640 MB for a Llama 1B Q4_K_M. The caller decides
+ * if this fits the runtime budget.
+ *
+ * Returns the count of converted tensors, or -1 on allocation
+ * failure (model state may be partially mutated; caller should
+ * unload).
+ */
+int gguf_dequant_q4k_to_f32(gguf_model_t *model, const char *name_filter);
+
+/*
  * gguf_free_tokenizer — Free tokenizer data.
  */
 void gguf_free_tokenizer(gguf_tokenizer_t *tok);

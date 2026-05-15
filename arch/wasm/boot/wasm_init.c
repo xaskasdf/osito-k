@@ -39,6 +39,10 @@ static gguf_model_t     g_model;
 static llama_state_t    g_llama;
 static gguf_tokenizer_t g_gguf_tok;
 
+/* Public accessor for the loaded model — used by the shell to drive
+ * post-load mutations like gguf_dequant_q4k_to_f32 (predequant_attn). */
+void *wasm_get_model(void) { return &g_model; }
+
 /* ── Model pre-fetch bridge (no EM_ASYNC_JS needed) ─────────── */
 
 /*
