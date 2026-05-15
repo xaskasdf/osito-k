@@ -82,6 +82,10 @@ int2e_stub:
     movq %r10, g_int2e_user_rsi(%rip)
     movq  80(%rsp), %r10            /* RDI */
     movq %r10, g_int2e_user_rdi(%rip)
+    movq 112(%rsp), %r10            /* RBX — used by VA-FARRAY scan to
+                                        catch Engine.dll 0x1033E7D0's
+                                        `EBX + 0xC` FArray pattern */
+    movq %r10, g_int2e_user_rbx(%rip)
 
     /* Save RSP to per-depth stack before aligning and calling C dispatcher.
      * Cannot use RBP (kern_longjmp overwrites it) or a single global

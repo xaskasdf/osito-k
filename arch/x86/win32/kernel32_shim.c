@@ -609,26 +609,26 @@ PVOID WINAPI VirtualAlloc(PVOID lpAddress, SIZE_T dwSize,
             extern uint32_t compat32_get_last_user_ecx(void);
             extern uint32_t compat32_get_last_user_esi(void);
             extern uint32_t compat32_get_last_user_edi(void);
+            extern uint32_t compat32_get_last_user_ebx(void);
             uint32_t walk = compat32_get_last_user_ebp();
             int patched = 0;
 
             /* Direct user-reg check before walking the EBP chain.  In
              * Core.dll FArray::Realloc, ECX/ESI both held the FArray
-             * *this on entry; ESI/EDI are callee-saved across the
+             * *this on entry; ESI/EDI/EBX are callee-saved across the
              * intermediate calls to FMallocWindows::Realloc → Malloc →
              * VirtualAlloc, so they typically still point at the
-             * corrupt FArray on shim entry.  Catching these here avoids
-             * the 5×5 EBP-walk miss for parallel call sites where the
-             * FArray isn't a saved-reg spill on any reachable frame.
-             *
-             * (EBX isn't currently captured by int2e_stub.S — Engine.dll
-             * 0x1033E7D0's `EBX + 0xC` FArray location would need that.
-             * Add g_int2e_user_rbx capture + getter when needed.) */
-            uint32_t cand_regs[3];
+             * corrupt FArray on shim entry.  Engine.dll 0x1033E7D0
+             * additionally has the FArray at `EBX + 0xC`. */
+            uint32_t ebx = compat32_get_last_user_ebx();
+            uint32_t cand_regs[5];
             cand_regs[0] = compat32_get_last_user_esi();
             cand_regs[1] = compat32_get_last_user_edi();
             cand_regs[2] = compat32_get_last_user_ecx();
-            for (int r = 0; r < 3 && !patched; r++) {
+            cand_regs[3] = ebx;
+            cand_regs[4] = (ebx >= 0x100000 && ebx < 0xFFFE0000)
+                           ? ebx + 0xC : 0;
+            for (int r = 0; r < 5 && !patched; r++) {
                 if (try_patch_farray(cand_regs[r], 0, &dwSize, "user-reg")) {
                     patched = 1;
                 }

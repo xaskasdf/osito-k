@@ -144,11 +144,13 @@ uint64_t g_int2e_user_rcx = 0;
 uint64_t g_int2e_user_rdx = 0;
 uint64_t g_int2e_user_rsi = 0;
 uint64_t g_int2e_user_rdi = 0;
+uint64_t g_int2e_user_rbx = 0;
 uint32_t compat32_get_last_user_ecx(void) { return (uint32_t)g_int2e_user_rcx; }
 uint32_t compat32_get_last_user_edx(void) { return (uint32_t)g_int2e_user_rdx; }
 uint32_t compat32_get_last_user_esi(void) { return (uint32_t)g_int2e_user_rsi; }
 uint32_t compat32_get_last_user_edi(void) { return (uint32_t)g_int2e_user_rdi; }
 uint32_t compat32_get_last_user_ebp(void) { return (uint32_t)g_int2e_user_rbp; }
+uint32_t compat32_get_last_user_ebx(void) { return (uint32_t)g_int2e_user_rbx; }
 
 /*
  * Single global retval written by the 32-bit return stub (MOV [addr], EAX).
