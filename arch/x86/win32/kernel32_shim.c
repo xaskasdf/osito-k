@@ -346,13 +346,19 @@ static int try_patch_farray(uint32_t cand_addr, uint32_t newmax_hint,
     uint32_t plus0 = t[0];  /* Data */
     uint32_t plus4 = t[1];  /* Num  */
     uint32_t plus8 = t[2];  /* Max or ElementSize per disasm */
-    /* Tighter than [0x10000000, 0x20000000): only patch when {+8} is a
-     * real PE-image .text code pointer.  UT99 maps Core.dll @
-     * 0x10100000, Engine.dll @ 0x10300000, UT.exe @ 0x10900000,
-     * Window.dll @ 0x11000000.  Heap (0x14xxxxxx, 0x40xxxxxx) and
-     * stack (0x13Bxxxxx-0x13Fxxxxx) are NOT code, even though they
-     * look pointer-ish. */
+    /* {+8} must look like a leaked PE-image .text code pointer.  Range
+     * covers Core.dll/Engine.dll/UT.exe/Window.dll. */
     if (plus8 < 0x10000000 || plus8 >= 0x12000000) return 0;
+    /* CRITICAL: a real FArray's Data is either NULL (fresh array, never
+     * allocated yet) OR a heap pointer (UT99 heap starts at 0x40000000).
+     * If Data is in stack range (0x14xxxxxx) the "FArray" is actually a
+     * stack frame whose saved-EBP points to the parent frame.  Patching
+     * `{+8}` then writes 4 over the parent frame's first stack arg AND
+     * we'd also zero `{+4}` (the saved return address!) — engine RET's
+     * to address 0 → tight loop in null-call recovery.  Observed live
+     * on UT99 with FArray@0x14001140 (= frame 3 EBP) where Data=
+     * 0x14001174 (= frame 4 EBP). */
+    if (plus0 != 0 && plus0 < 0x40000000) return 0;
 
     static int patch_log = 0;
     if (patch_log < 20) {
