@@ -327,6 +327,49 @@ DWORD WINAPI GetCurrentProcessId(void)
 
 /* ── Memory API ─────────────────────────────────────────────── */
 
+/* try_patch_farray — given a user-space address that MIGHT be an FArray
+ * (UE1 TArray header: { void* Data; INT Num; INT Max; }), check the
+ * corrupt-pattern signature `*(cand+8)` ∈ PE-image .text range
+ * [0x10000000, 0x20000000).  If matched, patch {+8}=2, zero Data/Num if
+ * they also look like code/stack ptrs, and derive a safe dwSize.
+ * Returns 1 if patched, 0 otherwise.
+ *
+ * Used by VirtualAlloc cap path to repair multiple class of corrupt
+ * FArray sites: (a) saved on EBP-chain stack frames, (b) directly
+ * pointed to by user-side callee-saved regs (ESI/EDI/EBX). */
+static int try_patch_farray(uint32_t cand_addr, uint32_t newmax_hint,
+                             SIZE_T *dwSize_out, const char *origin)
+{
+    if (cand_addr < 0x100000 || cand_addr >= 0xFFFE0000 || (cand_addr & 3))
+        return 0;
+    uint32_t *t = (uint32_t *)(uintptr_t)cand_addr;
+    uint32_t plus8 = t[2];
+    if (plus8 < 0x10000000 || plus8 >= 0x20000000) return 0;
+
+    static int patch_log = 0;
+    if (patch_log < 20) {
+        serial_puts("[VA-FARRAY] ");
+        serial_puts(origin);
+        serial_puts(" FArray@0x"); serial_puthex(cand_addr, 8);
+        serial_puts(" {+8}=0x"); serial_puthex(plus8, 8);
+        serial_puts(" -> 2");
+        patch_log++;
+    }
+    t[2] = 2;
+    if (t[0] >= 0x10000000 && t[0] < 0x20000000) t[0] = 0;
+    if (t[1] >= 0x10000000 && t[1] < 0x20000000) t[1] = 0;
+    if (newmax_hint > 0 && newmax_hint < 0x100000) {
+        *dwSize_out = (SIZE_T)(newmax_hint * 2 + 0xFFF) & ~(SIZE_T)0xFFF;
+    } else {
+        *dwSize_out = 0x1000;  /* 4KB fallback when NewMax unknown */
+    }
+    if (patch_log <= 20) {
+        serial_puts(" -> dwSize=0x"); serial_puthex(*dwSize_out, 8);
+        serial_puts("\n");
+    }
+    return 1;
+}
+
 /* VA-CACHE: dedupe the bogus VirtualAlloc spam from UT99's corrupt
  * TArray::Realloc paths.  Background: an FArray with `{+8}` set to a
  * code-pointer (uninitialized stack local) computes `NewSize = NewMax *
@@ -563,8 +606,34 @@ PVOID WINAPI VirtualAlloc(PVOID lpAddress, SIZE_T dwSize,
          * a sane size instead of code_ptr * NewMax. */
         {
             extern uint32_t compat32_get_last_user_ebp(void);
+            extern uint32_t compat32_get_last_user_ecx(void);
+            extern uint32_t compat32_get_last_user_esi(void);
+            extern uint32_t compat32_get_last_user_edi(void);
             uint32_t walk = compat32_get_last_user_ebp();
             int patched = 0;
+
+            /* Direct user-reg check before walking the EBP chain.  In
+             * Core.dll FArray::Realloc, ECX/ESI both held the FArray
+             * *this on entry; ESI/EDI are callee-saved across the
+             * intermediate calls to FMallocWindows::Realloc → Malloc →
+             * VirtualAlloc, so they typically still point at the
+             * corrupt FArray on shim entry.  Catching these here avoids
+             * the 5×5 EBP-walk miss for parallel call sites where the
+             * FArray isn't a saved-reg spill on any reachable frame.
+             *
+             * (EBX isn't currently captured by int2e_stub.S — Engine.dll
+             * 0x1033E7D0's `EBX + 0xC` FArray location would need that.
+             * Add g_int2e_user_rbx capture + getter when needed.) */
+            uint32_t cand_regs[3];
+            cand_regs[0] = compat32_get_last_user_esi();
+            cand_regs[1] = compat32_get_last_user_edi();
+            cand_regs[2] = compat32_get_last_user_ecx();
+            for (int r = 0; r < 3 && !patched; r++) {
+                if (try_patch_farray(cand_regs[r], 0, &dwSize, "user-reg")) {
+                    patched = 1;
+                }
+            }
+            if (patched) goto va_proceed;
             /* Walk multiple depths AND multiple [ebp-N] offsets — any
              * frame on the chain might be FArray::Realloc, and inside it
              * `this` is saved at some negative-offset local. Try common
