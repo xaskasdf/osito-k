@@ -344,7 +344,16 @@ static int try_patch_farray(uint32_t cand_addr, uint32_t newmax_hint,
         return 0;
     uint32_t *t = (uint32_t *)(uintptr_t)cand_addr;
     uint32_t plus8 = t[2];
-    if (plus8 < 0x10000000 || plus8 >= 0x20000000) return 0;
+    /* Tighter than [0x10000000, 0x20000000): the corruption pattern is a
+     * leaked .text code pointer from a parent frame's saved-reg spill.
+     * UT99 maps Core.dll @ 0x10100000, Engine.dll @ 0x10300000, UT.exe @
+     * 0x10900000, Window.dll @ 0x11000000.  Real heap (0x14xxxxxx,
+     * 0x40xxxxxx) and stack (0x13Bxxxxx-0x13Fxxxxx) addresses look
+     * pointer-ish but aren't code, so DON'T patch them — they may be
+     * legitimate FArray::Max values larger than expected for non-TArray
+     * structs.  An over-eager patch broke a legitimately huge Max field
+     * once and put the engine in an infinite tight loop. */
+    if (plus8 < 0x10000000 || plus8 >= 0x12000000) return 0;
 
     static int patch_log = 0;
     if (patch_log < 20) {
@@ -656,7 +665,15 @@ PVOID WINAPI VirtualAlloc(PVOID lpAddress, SIZE_T dwSize,
                     uint32_t *t = (uint32_t *)(uintptr_t)cand;
                     uint32_t plus8 = t[2];
                     /* Code pointer pattern in PE-image .text range */
-                    if (plus8 >= 0x10000000 && plus8 < 0x20000000) {
+                    /* Same tight range as try_patch_farray (see helper
+                     * comment): only patch when {+8} is a real PE-image
+                     * .text code pointer.  Heap-range pointers (e.g.
+                     * 0x14xxxxxx) were producing false positives that
+                     * patched legitimately-large Max fields and broke
+                     * the engine into a tight loop.  Range covers
+                     * Core.dll (0x10100000), Engine.dll (0x10300000),
+                     * UT.exe (0x10900000), Window.dll (0x11000000). */
+                    if (plus8 >= 0x10000000 && plus8 < 0x12000000) {
                         static int patch_log = 0;
                         if (patch_log < 20) {
                             serial_puts("[VA-FARRAY] frame ");

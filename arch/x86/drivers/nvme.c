@@ -513,9 +513,17 @@ int nvme_read(uint64_t lba, uint32_t count, void *buf)
         memset(&cmd, 0, sizeof(cmd));
         cmd.cdw0 = NVME_IO_READ;
         cmd.nsid = 1;
-        cmd.prp1 = (uint64_t)dst;
+        /* NVMe PRP fields are PHYSICAL addresses.  Callers may pass
+         * either lower-half identity virts (UEFI-era boot stacks) or
+         * upper-half kernel mirror virts (kmalloc'd buffers, per-process
+         * kernel stacks). kvirt_to_phys handles both correctly.  Without
+         * this translation, kmalloc'd `sys_buf` in NtReadFile would be
+         * DMA-written-to using an upper-half VIRT treated as PHYS — the
+         * data lands at the wrong physical address and the buffer stays
+         * zero (caught when UT99 localization reads returned all-NUL). */
+        cmd.prp1 = kvirt_to_phys(dst);
         if (bytes > 4096)
-            cmd.prp2 = (uint64_t)(dst + 4096);
+            cmd.prp2 = kvirt_to_phys(dst + 4096);
         cmd.cdw10 = (uint32_t)(lba & 0xFFFFFFFF);
         cmd.cdw11 = (uint32_t)(lba >> 32);
         cmd.cdw12 = this_count - 1; /* 0-based */
