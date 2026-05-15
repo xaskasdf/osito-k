@@ -531,11 +531,14 @@ PVOID WINAPI VirtualAlloc(PVOID lpAddress, SIZE_T dwSize,
         extern uint32_t compat32_get_last_user_edx(void);
         extern uint32_t compat32_get_last_user_esi(void);
         extern uint32_t compat32_get_last_user_edi(void);
+        extern uint32_t compat32_get_last_user_ebx(void);
         uint32_t ecx = compat32_get_last_user_ecx();
         uint32_t edx = compat32_get_last_user_edx();
         uint32_t esi = compat32_get_last_user_esi();
         uint32_t edi = compat32_get_last_user_edi();
-        serial_puts("[VA]   user regs: ECX=0x"); serial_puthex(ecx, 8);
+        uint32_t ebx = compat32_get_last_user_ebx();
+        serial_puts("[VA]   user regs: EBX=0x"); serial_puthex(ebx, 8);
+        serial_puts(" ECX=0x"); serial_puthex(ecx, 8);
         serial_puts(" EDX=0x"); serial_puthex(edx, 8);
         serial_puts(" ESI=0x"); serial_puthex(esi, 8);
         serial_puts(" EDI=0x"); serial_puthex(edi, 8);
