@@ -323,7 +323,82 @@ static void q4k_get_scale_min(int j, const uint8_t *q, uint8_t *d, uint8_t *m)
     }
 }
 
-/* Dequant one Q4_K block (256 elements) to f32. */
+#if defined(__EMSCRIPTEN__) && defined(__wasm_simd128__)
+#include <wasm_simd128.h>
+
+/* SIMD msimd128 dequant: process 16 quants per iteration. Each
+ * iteration loads 16 packed bytes (32 nibbles = 16 low + 16 high)
+ * and converts them to 32 f32s via u8→u16→u32→f32 widening. Saves
+ * ~3x vs the scalar loop on Llama 1B because Q4_K dequant dominates
+ * the per-token compute budget at WASM scalar speeds. */
+static void dequant_q4_k_block(const uint8_t *block, float *y)
+{
+    float d    = f16_to_f32(*(const uint16_t *)(block + 0));
+    float dmin = f16_to_f32(*(const uint16_t *)(block + 2));
+    const uint8_t *scales = block + 4;
+    const uint8_t *qs     = block + 16;
+    const v128_t mask_lo  = wasm_u8x16_splat(0x0F);
+
+    int is = 0;
+    for (int chunk = 0; chunk < 256; chunk += 64) {
+        uint8_t sc, m;
+        q4k_get_scale_min(is + 0, scales, &sc, &m);
+        float d1 = d * (float)sc, m1 = dmin * (float)m;
+        q4k_get_scale_min(is + 1, scales, &sc, &m);
+        float d2 = d * (float)sc, m2 = dmin * (float)m;
+        const v128_t d1_v = wasm_f32x4_splat(d1);
+        const v128_t m1_v = wasm_f32x4_splat(m1);
+        const v128_t d2_v = wasm_f32x4_splat(d2);
+        const v128_t m2_v = wasm_f32x4_splat(m2);
+
+        /* qs holds 32 bytes for this chunk:
+         *   low nibbles → 32 elements (sub-block is)
+         *   high nibbles → 32 elements (sub-block is+1)
+         * Process in two 16-byte groups via SIMD. */
+        for (int half = 0; half < 32; half += 16) {
+            v128_t b  = wasm_v128_load(qs + half);
+            v128_t lo = wasm_v128_and(b, mask_lo);
+            v128_t hi = wasm_u8x16_shr(b, 4);
+
+            /* u8 → u16 (low/high halves) → u32 (low/high halves)
+             * → i32 → f32. Six widenings per 16-byte input. */
+            v128_t lo_u16_a = wasm_u16x8_extend_low_u8x16(lo);
+            v128_t lo_u16_b = wasm_u16x8_extend_high_u8x16(lo);
+            v128_t hi_u16_a = wasm_u16x8_extend_low_u8x16(hi);
+            v128_t hi_u16_b = wasm_u16x8_extend_high_u8x16(hi);
+
+            v128_t lo_0 = wasm_u32x4_extend_low_u16x8(lo_u16_a);
+            v128_t lo_1 = wasm_u32x4_extend_high_u16x8(lo_u16_a);
+            v128_t lo_2 = wasm_u32x4_extend_low_u16x8(lo_u16_b);
+            v128_t lo_3 = wasm_u32x4_extend_high_u16x8(lo_u16_b);
+            v128_t hi_0 = wasm_u32x4_extend_low_u16x8(hi_u16_a);
+            v128_t hi_1 = wasm_u32x4_extend_high_u16x8(hi_u16_a);
+            v128_t hi_2 = wasm_u32x4_extend_low_u16x8(hi_u16_b);
+            v128_t hi_3 = wasm_u32x4_extend_high_u16x8(hi_u16_b);
+
+            v128_t f0 = wasm_f32x4_sub(wasm_f32x4_mul(wasm_f32x4_convert_i32x4(lo_0), d1_v), m1_v);
+            v128_t f1 = wasm_f32x4_sub(wasm_f32x4_mul(wasm_f32x4_convert_i32x4(lo_1), d1_v), m1_v);
+            v128_t f2 = wasm_f32x4_sub(wasm_f32x4_mul(wasm_f32x4_convert_i32x4(lo_2), d1_v), m1_v);
+            v128_t f3 = wasm_f32x4_sub(wasm_f32x4_mul(wasm_f32x4_convert_i32x4(lo_3), d1_v), m1_v);
+            v128_t g0 = wasm_f32x4_sub(wasm_f32x4_mul(wasm_f32x4_convert_i32x4(hi_0), d2_v), m2_v);
+            v128_t g1 = wasm_f32x4_sub(wasm_f32x4_mul(wasm_f32x4_convert_i32x4(hi_1), d2_v), m2_v);
+            v128_t g2 = wasm_f32x4_sub(wasm_f32x4_mul(wasm_f32x4_convert_i32x4(hi_2), d2_v), m2_v);
+            v128_t g3 = wasm_f32x4_sub(wasm_f32x4_mul(wasm_f32x4_convert_i32x4(hi_3), d2_v), m2_v);
+
+            wasm_v128_store(y + chunk + half +  0, f0);
+            wasm_v128_store(y + chunk + half +  4, f1);
+            wasm_v128_store(y + chunk + half +  8, f2);
+            wasm_v128_store(y + chunk + half + 12, f3);
+            wasm_v128_store(y + chunk + 32 + half +  0, g0);
+            wasm_v128_store(y + chunk + 32 + half +  4, g1);
+            wasm_v128_store(y + chunk + 32 + half +  8, g2);
+            wasm_v128_store(y + chunk + 32 + half + 12, g3);
+        }
+        qs += 32; is += 2;
+    }
+}
+#else
+/* Scalar fallback for non-WASM-SIMD targets. */
 static void dequant_q4_k_block(const uint8_t *block, float *y)
 {
     float d    = f16_to_f32(*(const uint16_t *)(block + 0));
@@ -344,6 +419,7 @@ static void dequant_q4_k_block(const uint8_t *block, float *y)
         qs += 32; is += 2;
     }
 }
+#endif /* __EMSCRIPTEN__ && __wasm_simd128__ — close #if at line 326 */
 
 void matvec_q4_k_scalar(float *out, const void *weight,
                          const float *input, uint32_t rows, uint32_t cols)

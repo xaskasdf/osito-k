@@ -318,7 +318,14 @@ int disk_read_bytes(uint64_t byte_offset, void *buf, uint64_t len)
     uint8_t *dst   = (uint8_t *)buf;
     uint64_t off   = byte_offset;
     uint64_t left  = len;
-    uint8_t  tmp[8192];                /* up to 16 sectors per round */
+    /* MUST be page-aligned AND in lower-half identity (so its virt addr
+     * equals its phys, since nvme_read passes the buffer pointer
+     * directly as PRP1/PRP2).  Stack-allocated with aligned(4096) lives
+     * in the kernel stack, which is in lower-half identity-mapped
+     * memory during early boot — so the address GCC gives us IS the
+     * phys NVMe DMA needs.  Cannot use a `static` .bss buffer because
+     * .bss is in the upper-half kernel mirror, where virt != phys. */
+    uint8_t tmp[8192] __attribute__((aligned(4096)));
     uint32_t ssz   = d->sector_size;
     if (ssz > sizeof(tmp))             /* defensive — 4 KB sectors fit */
         return -1;
