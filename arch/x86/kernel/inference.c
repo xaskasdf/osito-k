@@ -1011,8 +1011,28 @@ int llama_forward(llama_state_t *s, uint32_t token)
 
 #ifdef __EMSCRIPTEN__
     llama_ffn_block:
+        /* GPU FFN fast path: single compute dispatch fuses rmsnorm +
+         * gate/up Q4_K matvecs + SwiGLU + down Q4_K matvec + residual.
+         * Updates s->x in place. Conditions: all three FFN weights are
+         * Q4_K and the toggle is on (`bdebug llama_ffn 1`). */
+        {
+            extern bool g_llama_use_gpu_ffn;
+            bool ffn_all_q4k = ly->ffn_gate->type == GGML_TYPE_Q4_K &&
+                               ly->ffn_up->type   == GGML_TYPE_Q4_K &&
+                               ly->ffn_down->type == GGML_TYPE_Q4_K;
+            if (g_llama_use_gpu_ffn && ffn_all_q4k) {
+                extern int wasm_wgpu_ffn_q4k(int layer, float *x,
+                    const void *w_gate, const void *w_up, const void *w_down,
+                    const float *ffn_norm, int dim, int ffn_dim, float eps);
+                int rc = wasm_wgpu_ffn_q4k((int)l, s->x,
+                    ly->ffn_gate->data, ly->ffn_up->data, ly->ffn_down->data,
+                    norm_data(ly->ffn_norm),
+                    (int)dim, (int)s->ffn_dim, 1e-5f);
+                if (rc == 0) goto llama_ffn_done;
+            }
+        }
 #endif
-        /* ── FFN ── */
+        /* ── FFN (CPU) ── */
         rmsnorm(s->xb, s->x, norm_data(ly->ffn_norm), dim);
 
         /* Gate + Up projections — Up on AP, Gate on BSP */
@@ -1040,6 +1060,9 @@ int llama_forward(llama_state_t *s, uint32_t token)
         /* Residual connection */
         vec_add(s->x, s->x, s->xb, dim);
 
+#ifdef __EMSCRIPTEN__
+    llama_ffn_done:
+#endif
         /* Prefetch next layer's weights into cache while we loop back.
          * The attn_q weight matrix is the first thing accessed in the
          * next iteration — prefetch its start and the norm weights. */
@@ -1079,6 +1102,7 @@ static bool g_brandon_use_value_residual = true;
  * for F32 TinyLlama variants and any future F32 dequant cache). */
 bool g_llama_use_gpu_attn       = false;
 bool g_llama_use_gpu_predequant = false;  /* dtype-3: Q4_K → on-GPU F32 mirror */
+bool g_llama_use_gpu_ffn        = false;  /* fused Q4_K FFN compute */
 bool g_llama_attn_init          = false;
 
 static bool g_brandon_use_registers      = true;

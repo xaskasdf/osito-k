@@ -6306,6 +6306,16 @@ q4kgdone:
                 sh_puts(v ? "[llama] GPU fused-attn ENABLED (F32 attn, Llama 2/3 RoPE)\n"
                           : "[llama] GPU fused-attn disabled\n");
             }
+            else if (strcmp(argv[1], "llama_ffn") == 0) {
+                /* Fused Q4_K FFN compute: rmsnorm + gate/up matvec +
+                 * SwiGLU + down matvec + residual, all in one GPU
+                 * dispatch. Combine with `bdebug llama_attn 1` for the
+                 * full transformer-block GPU forward (attn + FFN). */
+                extern bool g_llama_use_gpu_ffn;
+                g_llama_use_gpu_ffn = (v != 0);
+                sh_puts(v ? "[llama] GPU fused-FFN ENABLED (Q4_K gate/up/down)\n"
+                          : "[llama] GPU fused-FFN disabled\n");
+            }
             else if (strcmp(argv[1], "llama_gpu_predequant") == 0) {
                 /* Path 3 trade-off: Q4_K → on-GPU F32 mirror once at
                  * first forward. Costs ~640 MB VRAM but keeps CPU heap

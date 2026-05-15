@@ -1451,6 +1451,254 @@ EM_JS(int, js_wgpu_init_kick, (), {
                 window.__gpuAttnPipelineQ4K = null;
             }
 
+            /* Fused FFN block for Llama Q4_K_M models. Stages:
+             *   A) rmsnorm(x, ffn_norm) → xb_scratch
+             *   B) gate = Q4_K matvec(W_gate, xb_scratch) → gate_scratch
+             *      up   = Q4_K matvec(W_up,   xb_scratch) → up_scratch
+             *   C) SwiGLU: gate_scratch = silu(gate_scratch) * up_scratch
+             *   D) xb_scratch = Q4_K matvec(W_down, gate_scratch)
+             *   E) x[i] = x[i] + xb_scratch[i]
+             *
+             * Single workgroup of 64 threads loops cooperatively at
+             * each stage. Q4_K matvec inlined per stage (no pointer
+             * params — read_write scratch buffers can't be passed as
+             * ptr<storage, _, read>). */
+            const ffnCodeQ4K = `
+                struct FFNDims {
+                    dim: u32, ffn_dim: u32,
+                    eps_bits: u32, _pad0: u32,
+                };
+                @group(0) @binding(0) var<storage, read>       w_gate: array<u32>;
+                @group(0) @binding(1) var<storage, read>       w_up:   array<u32>;
+                @group(0) @binding(2) var<storage, read>       w_down: array<u32>;
+                @group(0) @binding(3) var<storage, read>       ffn_norm_w: array<f32>;
+                @group(0) @binding(4) var<storage, read_write> x_inout: array<f32>;
+                @group(0) @binding(5) var<uniform>             fd: FFNDims;
+                @group(0) @binding(6) var<storage, read_write> gate_scratch: array<f32>;
+                @group(0) @binding(7) var<storage, read_write> up_scratch:   array<f32>;
+                @group(0) @binding(8) var<storage, read_write> xb_scratch:   array<f32>;
+
+                var<workgroup> partial: array<f32, 64>;
+
+                fn sb_at_g(base: u32, idx: u32) -> u32 {
+                    let w = w_gate[base + 1u + (idx / 4u)];
+                    return (w >> (8u * (idx % 4u))) & 0xFFu;
+                }
+                fn qb_at_g(base: u32, idx: u32) -> u32 {
+                    let w = w_gate[base + 4u + (idx / 4u)];
+                    return (w >> (8u * (idx % 4u))) & 0xFFu;
+                }
+                fn dq_g(base: u32, e: u32) -> f32 {
+                    let h0 = w_gate[base];
+                    let dd   = unpack2x16float(h0).x;
+                    let dmin = unpack2x16float(h0).y;
+                    let pair = e / 64u;
+                    let off  = e % 64u;
+                    let is_high = off >= 32u;
+                    let sub_idx = pair * 2u + select(0u, 1u, is_high);
+                    var sc: u32; var mn: u32;
+                    if (sub_idx < 4u) {
+                        sc = sb_at_g(base, sub_idx) & 63u;
+                        mn = sb_at_g(base, sub_idx + 4u) & 63u;
+                    } else {
+                        let lo_s = sb_at_g(base, sub_idx + 4u) & 0xFu;
+                        let hi_s = (sb_at_g(base, sub_idx - 4u) >> 6u) & 3u;
+                        sc = lo_s | (hi_s << 4u);
+                        let lo_m = sb_at_g(base, sub_idx + 4u) >> 4u;
+                        let hi_m = (sb_at_g(base, sub_idx) >> 6u) & 3u;
+                        mn = lo_m | (hi_m << 4u);
+                    }
+                    let qbyte = qb_at_g(base, pair * 32u + (off % 32u));
+                    let nibble = select(qbyte & 0xFu, qbyte >> 4u, is_high);
+                    return dd * f32(sc) * f32(nibble) - dmin * f32(mn);
+                }
+
+                fn sb_at_u(base: u32, idx: u32) -> u32 {
+                    let w = w_up[base + 1u + (idx / 4u)];
+                    return (w >> (8u * (idx % 4u))) & 0xFFu;
+                }
+                fn qb_at_u(base: u32, idx: u32) -> u32 {
+                    let w = w_up[base + 4u + (idx / 4u)];
+                    return (w >> (8u * (idx % 4u))) & 0xFFu;
+                }
+                fn dq_u(base: u32, e: u32) -> f32 {
+                    let h0 = w_up[base];
+                    let dd   = unpack2x16float(h0).x;
+                    let dmin = unpack2x16float(h0).y;
+                    let pair = e / 64u;
+                    let off  = e % 64u;
+                    let is_high = off >= 32u;
+                    let sub_idx = pair * 2u + select(0u, 1u, is_high);
+                    var sc: u32; var mn: u32;
+                    if (sub_idx < 4u) {
+                        sc = sb_at_u(base, sub_idx) & 63u;
+                        mn = sb_at_u(base, sub_idx + 4u) & 63u;
+                    } else {
+                        let lo_s = sb_at_u(base, sub_idx + 4u) & 0xFu;
+                        let hi_s = (sb_at_u(base, sub_idx - 4u) >> 6u) & 3u;
+                        sc = lo_s | (hi_s << 4u);
+                        let lo_m = sb_at_u(base, sub_idx + 4u) >> 4u;
+                        let hi_m = (sb_at_u(base, sub_idx) >> 6u) & 3u;
+                        mn = lo_m | (hi_m << 4u);
+                    }
+                    let qbyte = qb_at_u(base, pair * 32u + (off % 32u));
+                    let nibble = select(qbyte & 0xFu, qbyte >> 4u, is_high);
+                    return dd * f32(sc) * f32(nibble) - dmin * f32(mn);
+                }
+
+                fn sb_at_d(base: u32, idx: u32) -> u32 {
+                    let w = w_down[base + 1u + (idx / 4u)];
+                    return (w >> (8u * (idx % 4u))) & 0xFFu;
+                }
+                fn qb_at_d(base: u32, idx: u32) -> u32 {
+                    let w = w_down[base + 4u + (idx / 4u)];
+                    return (w >> (8u * (idx % 4u))) & 0xFFu;
+                }
+                fn dq_d(base: u32, e: u32) -> f32 {
+                    let h0 = w_down[base];
+                    let dd   = unpack2x16float(h0).x;
+                    let dmin = unpack2x16float(h0).y;
+                    let pair = e / 64u;
+                    let off  = e % 64u;
+                    let is_high = off >= 32u;
+                    let sub_idx = pair * 2u + select(0u, 1u, is_high);
+                    var sc: u32; var mn: u32;
+                    if (sub_idx < 4u) {
+                        sc = sb_at_d(base, sub_idx) & 63u;
+                        mn = sb_at_d(base, sub_idx + 4u) & 63u;
+                    } else {
+                        let lo_s = sb_at_d(base, sub_idx + 4u) & 0xFu;
+                        let hi_s = (sb_at_d(base, sub_idx - 4u) >> 6u) & 3u;
+                        sc = lo_s | (hi_s << 4u);
+                        let lo_m = sb_at_d(base, sub_idx + 4u) >> 4u;
+                        let hi_m = (sb_at_d(base, sub_idx) >> 6u) & 3u;
+                        mn = lo_m | (hi_m << 4u);
+                    }
+                    let qbyte = qb_at_d(base, pair * 32u + (off % 32u));
+                    let nibble = select(qbyte & 0xFu, qbyte >> 4u, is_high);
+                    return dd * f32(sc) * f32(nibble) - dmin * f32(mn);
+                }
+
+                @compute @workgroup_size(64)
+                fn fused_ffn(@builtin(local_invocation_id) lid: vec3<u32>) {
+                    let tid = lid.x;
+                    let dim     = fd.dim;
+                    let ffn_dim = fd.ffn_dim;
+                    let eps = bitcast<f32>(fd.eps_bits);
+
+                    /* Stage A: rmsnorm(x_inout, ffn_norm_w) → xb_scratch.
+                     * partial[tid] holds the thread-local sum of squares;
+                     * thread 0 reduces, then everyone scales. */
+                    var ss: f32 = 0.0;
+                    var i: u32 = tid;
+                    loop {
+                        if (i >= dim) { break; }
+                        let v = x_inout[i];
+                        ss = ss + v * v;
+                        i = i + 64u;
+                    }
+                    partial[tid] = ss;
+                    workgroupBarrier();
+                    if (tid == 0u) {
+                        var s: f32 = 0.0;
+                        for (var k: u32 = 0u; k < 64u; k = k + 1u) {
+                            s = s + partial[k];
+                        }
+                        partial[0] = s;
+                    }
+                    workgroupBarrier();
+                    let rms = 1.0 / sqrt(partial[0] / f32(dim) + eps);
+                    i = tid;
+                    loop {
+                        if (i >= dim) { break; }
+                        xb_scratch[i] = ffn_norm_w[i] * x_inout[i] * rms;
+                        i = i + 64u;
+                    }
+                    workgroupBarrier();
+
+                    /* Stage B: gate + up matvecs (Q4_K, rows = ffn_dim,
+                     * cols = dim). Each thread strides across rows. */
+                    let blocks_per_row_b = dim / 256u;
+                    let words_per_row_b  = blocks_per_row_b * 36u;
+                    i = tid;
+                    let total_rows_b = 2u * ffn_dim;
+                    loop {
+                        if (i >= total_rows_b) { break; }
+                        var sum: f32 = 0.0;
+                        if (i < ffn_dim) {
+                            let row_base = i * words_per_row_b;
+                            for (var b: u32 = 0u; b < blocks_per_row_b; b = b + 1u) {
+                                let blk = row_base + b * 36u;
+                                for (var e: u32 = 0u; e < 256u; e = e + 1u) {
+                                    sum = sum + dq_g(blk, e) * xb_scratch[b * 256u + e];
+                                }
+                            }
+                            gate_scratch[i] = sum;
+                        } else {
+                            let row = i - ffn_dim;
+                            let row_base = row * words_per_row_b;
+                            for (var b: u32 = 0u; b < blocks_per_row_b; b = b + 1u) {
+                                let blk = row_base + b * 36u;
+                                for (var e: u32 = 0u; e < 256u; e = e + 1u) {
+                                    sum = sum + dq_u(blk, e) * xb_scratch[b * 256u + e];
+                                }
+                            }
+                            up_scratch[row] = sum;
+                        }
+                        i = i + 64u;
+                    }
+                    workgroupBarrier();
+
+                    /* Stage C: SwiGLU — gate = silu(gate) * up. */
+                    i = tid;
+                    loop {
+                        if (i >= ffn_dim) { break; }
+                        let g = gate_scratch[i];
+                        let sig = 1.0 / (1.0 + exp(-g));
+                        gate_scratch[i] = g * sig * up_scratch[i];
+                        i = i + 64u;
+                    }
+                    workgroupBarrier();
+
+                    /* Stage D: down matvec (Q4_K, rows = dim, cols = ffn_dim). */
+                    let blocks_per_row_d = ffn_dim / 256u;
+                    let words_per_row_d  = blocks_per_row_d * 36u;
+                    i = tid;
+                    loop {
+                        if (i >= dim) { break; }
+                        let row_base = i * words_per_row_d;
+                        var sum: f32 = 0.0;
+                        for (var b: u32 = 0u; b < blocks_per_row_d; b = b + 1u) {
+                            let blk = row_base + b * 36u;
+                            for (var e: u32 = 0u; e < 256u; e = e + 1u) {
+                                sum = sum + dq_d(blk, e) * gate_scratch[b * 256u + e];
+                            }
+                        }
+                        xb_scratch[i] = sum;
+                        i = i + 64u;
+                    }
+                    workgroupBarrier();
+
+                    /* Stage E: residual — x_inout[i] += xb_scratch[i]. */
+                    i = tid;
+                    loop {
+                        if (i >= dim) { break; }
+                        x_inout[i] = x_inout[i] + xb_scratch[i];
+                        i = i + 64u;
+                    }
+                }
+            `;
+            try {
+                const ffnModQ4K = device.createShaderModule({ code: ffnCodeQ4K });
+                window.__gpuFFNPipelineQ4K = device.createComputePipeline({
+                    layout: 'auto',
+                    compute: { module: ffnModQ4K, entryPoint: 'fused_ffn' },
+                });
+            } catch (e) {
+                console.warn('[wgpu] Q4_K FFN pipeline failed:', String(e));
+                window.__gpuFFNPipelineQ4K = null;
+            }
+
             /* Large-dim variant for Llama 1B (dim=2048, kv_dim=512).
              * Promotes q_scratch and attn_out from workgroup arrays to
              * storage buffers (bindings 9, 10) so the per-workgroup
@@ -2305,6 +2553,151 @@ int wasm_wgpu_q4k_dequant(const void *blk, float *out)
 {
     if (!js_wgpu_ready()) return -1;
     js_wgpu_q4k_dequant_kick(blk, out);
+    while (!js_wgpu_op_done()) emscripten_sleep(1);
+    return js_wgpu_op_ok() ? 0 : -1;
+}
+
+/* ── FFN Q4_K dispatcher ─────────────────────────────────────────
+ *
+ * One-workgroup compute that fuses rmsnorm + gate/up matvec + SwiGLU
+ * + down matvec + residual add. Reads Q4_K weights directly from
+ * VRAM-resident buffers (uploaded once per layer on first call).
+ *
+ * Per-layer cache: per-config scratch buffers (gate/up/xb) shared
+ * across layers since dispatches are serialized. */
+EM_JS(int, js_wgpu_ffn_q4k_kick, (
+    int layer,
+    float *x,
+    const void *w_gate, const void *w_up, const void *w_down,
+    const float *ffn_norm,
+    int dim, int ffn_dim,
+    int eps_bits,
+    int wg_id, int wu_id, int wd_id, int wn_id), {
+    window.__gpuOpDone = false; window.__gpuOpOK = false;
+    if (!window.__gpuReady || !window.__gpuFFNPipelineQ4K) {
+        window.__gpuOpDone = true; return 0;
+    }
+    (async function() {
+        try {
+            const dev = window.__gpuDevice;
+            const pipe = window.__gpuFFNPipelineQ4K;
+            if (!window.__gpuFFNCache) window.__gpuFFNCache = new Map();
+            const key = layer + ':' + dim + ':' + ffn_dim;
+            let s = window.__gpuFFNCache.get(key);
+            const blocksPerRowDim = (dim / 256) | 0;
+            const blocksPerRowFFN = (ffn_dim / 256) | 0;
+            const q4kRowBytesDim = blocksPerRowDim * 144;
+            const q4kRowBytesFFN = blocksPerRowFFN * 144;
+            /* gate/up: ffn_dim rows × dim cols → ffn_dim * q4kRowBytesDim
+             * down:    dim rows × ffn_dim cols → dim     * q4kRowBytesFFN */
+            const gateBytes = ffn_dim * q4kRowBytesDim;
+            const upBytes   = ffn_dim * q4kRowBytesDim;
+            const downBytes = dim     * q4kRowBytesFFN;
+            if (!s) {
+                if (window.__gpuFFNCache.size >= 32) {
+                    const k0 = window.__gpuFFNCache.keys().next().value;
+                    const old = window.__gpuFFNCache.get(k0);
+                    old.wgBuf.destroy(); old.wuBuf.destroy(); old.wdBuf.destroy();
+                    old.wnBuf.destroy(); old.xBuf.destroy(); old.dBuf.destroy();
+                    old.gateBuf.destroy(); old.upBuf.destroy(); old.xbBuf.destroy();
+                    old.rBuf.destroy();
+                    window.__gpuFFNCache.delete(k0);
+                }
+                s = {
+                    wgBuf: dev.createBuffer({ size: gateBytes,
+                        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST }),
+                    wuBuf: dev.createBuffer({ size: upBytes,
+                        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST }),
+                    wdBuf: dev.createBuffer({ size: downBytes,
+                        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST }),
+                    wnBuf: dev.createBuffer({ size: dim * 4,
+                        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST }),
+                    xBuf:  dev.createBuffer({ size: dim * 4,
+                        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC }),
+                    dBuf:  dev.createBuffer({ size: 16,
+                        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST }),
+                    gateBuf: dev.createBuffer({ size: ffn_dim * 4,
+                        usage: GPUBufferUsage.STORAGE }),
+                    upBuf:   dev.createBuffer({ size: ffn_dim * 4,
+                        usage: GPUBufferUsage.STORAGE }),
+                    xbBuf:   dev.createBuffer({ size: dim * 4,
+                        usage: GPUBufferUsage.STORAGE }),
+                    rBuf:  dev.createBuffer({ size: dim * 4,
+                        usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST }),
+                    bg: null,
+                    last_wg: 0, last_wu: 0, last_wd: 0, last_wn: 0,
+                };
+                s.bg = dev.createBindGroup({
+                    layout: pipe.getBindGroupLayout(0),
+                    entries: [
+                        { binding: 0, resource: { buffer: s.wgBuf } },
+                        { binding: 1, resource: { buffer: s.wuBuf } },
+                        { binding: 2, resource: { buffer: s.wdBuf } },
+                        { binding: 3, resource: { buffer: s.wnBuf } },
+                        { binding: 4, resource: { buffer: s.xBuf  } },
+                        { binding: 5, resource: { buffer: s.dBuf  } },
+                        { binding: 6, resource: { buffer: s.gateBuf } },
+                        { binding: 7, resource: { buffer: s.upBuf   } },
+                        { binding: 8, resource: { buffer: s.xbBuf   } },
+                    ],
+                });
+                dev.queue.writeBuffer(s.dBuf, 0,
+                    new Uint32Array([dim, ffn_dim, eps_bits, 0]));
+                window.__gpuFFNCache.set(key, s);
+            }
+            /* Upload weights and norm only on first call (or pointer
+             * change). The C kernel reuses the same ly->ffn_* tensors
+             * across forwards. */
+            if (s.last_wg !== wg_id) {
+                dev.queue.writeBuffer(s.wgBuf, 0, HEAPU8.slice(w_gate, w_gate + gateBytes));
+                s.last_wg = wg_id;
+            }
+            if (s.last_wu !== wu_id) {
+                dev.queue.writeBuffer(s.wuBuf, 0, HEAPU8.slice(w_up, w_up + upBytes));
+                s.last_wu = wu_id;
+            }
+            if (s.last_wd !== wd_id) {
+                dev.queue.writeBuffer(s.wdBuf, 0, HEAPU8.slice(w_down, w_down + downBytes));
+                s.last_wd = wd_id;
+            }
+            if (s.last_wn !== wn_id) {
+                dev.queue.writeBuffer(s.wnBuf, 0, HEAPU8.slice(ffn_norm, ffn_norm + dim * 4));
+                s.last_wn = wn_id;
+            }
+            /* Upload current residual x. */
+            dev.queue.writeBuffer(s.xBuf, 0, HEAPU8.slice(x, x + dim * 4));
+            const enc = dev.createCommandEncoder();
+            const pass = enc.beginComputePass();
+            pass.setPipeline(pipe);
+            pass.setBindGroup(0, s.bg);
+            pass.dispatchWorkgroups(1);
+            pass.end();
+            enc.copyBufferToBuffer(s.xBuf, 0, s.rBuf, 0, dim * 4);
+            dev.queue.submit([enc.finish()]);
+            await s.rBuf.mapAsync(GPUMapMode.READ);
+            HEAPU8.set(new Uint8Array(s.rBuf.getMappedRange()), x);
+            s.rBuf.unmap();
+            window.__gpuOpOK = true;
+        } catch (e) { window.__gpuError = String(e); }
+        window.__gpuOpDone = true;
+    })();
+    return 1;
+});
+
+int wasm_wgpu_ffn_q4k(int layer, float *x,
+                       const void *w_gate, const void *w_up, const void *w_down,
+                       const float *ffn_norm,
+                       int dim, int ffn_dim, float eps)
+{
+    if (!js_wgpu_ready()) return -1;
+    union { float f; uint32_t u; } eb;
+    eb.f = eps;
+    int wg_id = (int)((uint64_t)w_gate  & 0x7FFFFFFF);
+    int wu_id = (int)((uint64_t)w_up    & 0x7FFFFFFF);
+    int wd_id = (int)((uint64_t)w_down  & 0x7FFFFFFF);
+    int wn_id = (int)((uint64_t)ffn_norm & 0x7FFFFFFF);
+    js_wgpu_ffn_q4k_kick(layer, x, w_gate, w_up, w_down, ffn_norm,
+                         dim, ffn_dim, (int)eb.u, wg_id, wu_id, wd_id, wn_id);
     while (!js_wgpu_op_done()) emscripten_sleep(1);
     return js_wgpu_op_ok() ? 0 : -1;
 }
