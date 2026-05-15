@@ -1846,7 +1846,12 @@ int llama_state_layers(void *s)
 /* Debug accessor: dump the first 8 floats of embed_token(token) result. */
 /* Dump first 4 tensors' ne[] dims and type to verify GGUF layout. */
 /* Dump the dequantized first row of attn_q[0]. Uses embed_token's
- * dequant path because that's verified consistent with matvec. */
+ * dequant path because that's verified consistent with matvec.
+ *
+ * These four llama_debug_* helpers rely on libc malloc/free/sqrt, which
+ * only exist in the WASM (emscripten) build.  Gating with __EMSCRIPTEN__
+ * so the x86 kernel still links. */
+#ifdef __EMSCRIPTEN__
 void llama_debug_dump_row(void *s_in)
 {
     llama_state_t *s = (llama_state_t *)s_in;
@@ -1979,6 +1984,7 @@ void llama_debug_matvec_row(void *s_in, uint32_t token, float *out8)
     }
     free(inp);
 }
+#endif /* __EMSCRIPTEN__ — close llama_debug_* block */
 
 int llama_state_vocab(void *s)
 { return s ? (int)((llama_state_t *)s)->vocab_size : 0; }
