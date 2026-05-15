@@ -327,9 +327,35 @@ DWORD WINAPI GetCurrentProcessId(void)
 
 /* ── Memory API ─────────────────────────────────────────────── */
 
+/* VA-CACHE: dedupe the bogus VirtualAlloc spam from UT99's corrupt
+ * TArray::Realloc paths.  Background: an FArray with `{+8}` set to a
+ * code-pointer (uninitialized stack local) computes `NewSize = NewMax *
+ * code_ptr` ≈ 3-4 GB.  The FArray scan in this shim patches what it can
+ * find via EBP walking, but a parallel call site that the scan misses
+ * still produces 100+ bogus requests in a tight loop.  Allocating a
+ * fresh 64KB block for each one exhausts the 896MB user VA range and
+ * leads to STATUS_NO_MEMORY → appError → forced shell return.
+ *
+ * Strategy: keyed by caller-EIP, after the FIRST bogus request from a
+ * given site is served with a capped buffer, every subsequent call
+ * from the same EIP returns the SAME buffer.  UT99 doesn't free
+ * between iterations, and the no-op'd rep-movsl @0x1010723E means
+ * the buffer is effectively write-only metadata that nobody reads
+ * back to a meaningful value.  Reuse is harmless and saves the VA. */
+#define VA_CACHE_N 16
+static struct {
+    uint32_t eip;
+    PVOID    base;
+    SIZE_T   size;
+    uint32_t hits;
+} va_cache[VA_CACHE_N];
+
 PVOID WINAPI VirtualAlloc(PVOID lpAddress, SIZE_T dwSize,
                    DWORD flAllocationType, DWORD flProtect)
 {
+    int      was_capped     = 0;
+    uint32_t cache_eip_save = 0;
+
     /* Suppress normal VA logs — only log large/abnormal requests */
     if (dwSize > 0x1000000) { /* > 16MB */
         serial_puts("[VA] VirtualAlloc LARGE: size=0x");
@@ -343,6 +369,32 @@ PVOID WINAPI VirtualAlloc(PVOID lpAddress, SIZE_T dwSize,
             serial_puthex(user_eip, 8);
         }
         serial_puts("\n");
+
+        /* VA-CACHE lookup: short-circuit repeat bogus requests from
+         * the same caller-EIP.  This bypasses both the diagnostic dump
+         * and the FArray-scan + cap fallback below.  Hit-count logged
+         * only at powers of 10 to avoid log spam. */
+        if (user_eip && lpAddress == NULL) {
+            for (int i = 0; i < VA_CACHE_N; i++) {
+                if (va_cache[i].eip == user_eip && va_cache[i].base) {
+                    va_cache[i].hits++;
+                    if (va_cache[i].hits == 2 || va_cache[i].hits == 10 ||
+                        va_cache[i].hits == 100 || va_cache[i].hits == 1000) {
+                        serial_puts("[VA] cache reuse eip=0x");
+                        serial_puthex(user_eip, 8);
+                        serial_puts(" hits=");
+                        serial_putdec(va_cache[i].hits);
+                        serial_puts(" -> base=0x");
+                        serial_puthex(
+                            (uint64_t)(ULONG_PTR)va_cache[i].base, 8);
+                        serial_puts("\n");
+                    }
+                    return va_cache[i].base;
+                }
+            }
+        }
+        cache_eip_save = user_eip;  /* for STORE after cap path */
+
         /* Walk the user-mode EBP frame-pointer chain to find every
          * caller of the FMallocWindows::Realloc wrapper. The first
          * frame above us is the wrapper itself; subsequent frames
@@ -591,6 +643,7 @@ PVOID WINAPI VirtualAlloc(PVOID lpAddress, SIZE_T dwSize,
          *     and trigger NULL-CALL recovery (controlled).
          */
         dwSize = 0x10000;  /* 64KB sentinel */
+        was_capped = 1;    /* triggers VA-CACHE STORE post-alloc */
         /* Self-modify the engine's memcpy helper at 0x1010723E so that
          * the upcoming bogus 2GB rep-movsl terminates instantly. */
         static int patched_memcpy = 0;
@@ -626,6 +679,28 @@ va_proceed:
         serial_puts("\n");
         set_last_error_from_status(status);
         return NULL;
+    }
+
+    /* VA-CACHE store: only when the original request was bogus and we
+     * served it from the cap fallback.  Subsequent requests from this
+     * EIP will short-circuit to the cached `base` (see lookup above). */
+    if (was_capped && cache_eip_save && base) {
+        for (int i = 0; i < VA_CACHE_N; i++) {
+            if (!va_cache[i].eip) {
+                va_cache[i].eip  = cache_eip_save;
+                va_cache[i].base = base;
+                va_cache[i].size = size;
+                va_cache[i].hits = 1;
+                serial_puts("[VA] cache STORE eip=0x");
+                serial_puthex(cache_eip_save, 8);
+                serial_puts(" base=0x");
+                serial_puthex((uint64_t)(ULONG_PTR)base, 8);
+                serial_puts(" (slot=");
+                serial_putdec((uint64_t)i);
+                serial_puts(")\n");
+                break;
+            }
+        }
     }
 
     return base;
