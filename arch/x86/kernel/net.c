@@ -172,7 +172,13 @@ static uint16_t ip_id_counter;
 /* Packet buffer for receive */
 static uint8_t rx_pkt[2048];
 /* Packet buffer for transmit (building frames) */
-static uint8_t tx_pkt[2048];
+/* 64-byte alignment: hypothesis for the all-NUL SG bug is that I210/I211
+ * silently zero-DMAs when desc->addr is not cache-line aligned, even
+ * though the datasheet doesn't document an alignment requirement.  The
+ * single-desc path's buffer comes from mem_alloc_aligned(., 4096) so it
+ * never hits this.  Force tx_pkt to a clean 64-byte boundary and re-test
+ * SG before adding further chip-side context-descriptor experiments. */
+static uint8_t tx_pkt[2048] __attribute__((aligned(64)));
 
 /* Broadcast MAC */
 static const uint8_t bcast_mac[ETH_ALEN] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
@@ -864,28 +870,27 @@ int net_udp_send(const uint8_t dst_ip[4], uint16_t dst_port,
      * path for correctness simplicity. */
     extern int nic_send_sg(const uint64_t frag_phys[],
                             const uint32_t lens[], int n_frags);
-    /* SG path DISABLED — pending issue.
-     *
-     * Symptom: kupload --dmesg via SG sends all-NUL bytes to the server
-     * even with the i211_send_sg fixes (commit 99cda9b: IFCS-on-last,
-     * PAYLEN-on-last per Intel datasheet §7.2.2.2.4).  Fix didn't help.
-     *
-     * Bugs found and fixed in i211_send_sg but NOT root cause:
-     *   - per-fragment IFCS bit (was on every desc; should be on last)
-     *   - per-fragment PAYLEN (was per-frag length; should be total
-     *     post-L2 length on the last data descriptor only)
-     *   - VIRT_TO_PHYS macro that underflows for lower-half identity
-     *     addrs — fixed by switching to kvirt_to_phys() (paging.h:46)
-     *
-     * Suspected residual cause: some chip-side state we're not
-     * configuring (header-split? segments-context-only?) or a desc
-     * field combination outside what i210/i211 accepts in MSI mode.
-     * Linux igb's chained-data-desc path doesn't 1:1 with what we do.
-     *
-     * For now, all UDP goes through the slower memcpy → tx_pkt →
-     * i211_send single-buffer path below.  Fast enough for kernel-class
-     * traffic.  See docs/x86-network-stack.md §SG-pending.            */
-    (void)hdr_total;
+    /* Zero-copy SG path — re-enabled with tx_pkt 64-byte aligned (see
+     * net.c:175).  Previous attempts at fixing the all-NUL bug:
+     *   - kvirt_to_phys (commit 9f7255f)         — phys translation
+     *   - IFCS/PAYLEN only-on-last (commit 99cda9b) — Intel §7.2.2.2.4
+     *   - heap-allocated kupload pkt (2398adf)   — stack→heap source
+     * None of those resolved the NUL upload.  Latest hypothesis: the
+     * chip silently zero-DMAs when desc->addr is misaligned.  tx_pkt
+     * was a plain `static uint8_t[]` (1-byte aligned); now forced to
+     * 64-byte boundary.  If kupload --dmesg still arrives as NUL with
+     * this in place, fall back to commenting out this whole block —
+     * the memcpy path below is correct and fast enough.              */
+    if (len >= 256 && frame_len >= 60) {
+        uint64_t frags[2] = {
+            kvirt_to_phys(tx_pkt),
+            kvirt_to_phys(data)
+        };
+        uint32_t lens_arr[2] = { hdr_total, len };
+        int sg = nic_send_sg(frags, lens_arr, 2);
+        if (sg == 0) return 0;
+        /* SG failure (NIC busy, etc.) — fall through to memcpy path. */
+    }
 
     /* Copy payload into tx_pkt */
     memcpy(tx_pkt + hdr_total, data, len);
