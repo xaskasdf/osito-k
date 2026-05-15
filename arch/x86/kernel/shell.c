@@ -5273,10 +5273,11 @@ pdone:
             if (!wasm_wgpu_init()) { sh_puts("WebGPU not initialized.\n"); return; }
             extern int wasm_wgpu_kvcache_alloc(int layer, int max_seq, int kv_dim);
             extern int wasm_wgpu_fused_attn(int layer,
-                const float *x, const float *wq, const float *wk,
-                const float *wv, const float *wo, float *out,
+                const float *x, const void *wq, const void *wk,
+                const void *wv, const void *wo, float *out,
                 int dim, int kv_dim, int head_dim, int n_heads, int n_kv_heads,
-                int gqa_ratio, int pos, int max_seq, float scale, float rope_base);
+                int gqa_ratio, int pos, int max_seq, float scale, float rope_base,
+                int weight_dtype);
             extern void *malloc(unsigned long); extern void free(void *);
             extern double sqrt(double); extern double cos(double); extern double sin(double);
             extern double pow(double, double); extern double exp(double);
@@ -5354,7 +5355,7 @@ pdone:
             }
             int rc = wasm_wgpu_fused_attn(0, x, wq, wk, wv, wo, gpu,
                 dim, kv_dim, head_dim, n_heads, n_kv_heads, gqa_ratio,
-                pos, max_seq, scale, rope_base);
+                pos, max_seq, scale, rope_base, 0 /* F32 dtype */);
             float md = 0;
             for (int i = 0; i < dim; i++) {
                 float d = cpu[i] - gpu[i]; if (d < 0) d = -d;
