@@ -253,23 +253,45 @@ Commits diagnósticos: `437353c`, `b7c2225`, `2d96b04`.
   "buen packet transmitido"
 - Pero `tcpdump -i en5 -p` (promiscuous) en Mac NO ve los frames
 
-**Hipótesis residuales** (no confirmadas):
-- A: timing burst — el USB-Ethernet bridge del Mac descarta frames
-  demasiado cercanos en el tiempo
-- B: stale buffer DMA — el chip lee tx_buf antes de que el wmb() haya
-  flusheado completamente (pero osito ping funciona y usa el mismo path)
-- C: errata específica del I211 con el reply-context que estamos pasando
-  por alto
+**Kernel-side exonerado** (audit 2026-05-15, revisando los 3 commits
+diagnósticos): cada paso del path está verificado byte-a-byte:
 
-**Workaround**: usar OFTP (kdownload) que solo necesita:
-- Mac→OsitoK RX (funciona)
-- OsitoK→Mac TX iniciado desde shell context (funciona)
+| Paso | Evidencia | Estado |
+|---|---|---|
+| RX del paquete | RDH avanza | ✅ |
+| `nic_recv → net_poll` con eth header correcto | log eth dump | ✅ |
+| `handle_ipv4` procesa (proto/dst/checksum OK) | rate-limit log | ✅ |
+| `handle_icmp → icmp_send` con data correcta | log | ✅ |
+| `i211_send` arma frame con dst=Mac MAC correcto | hex dump `tx_buf[0..15]` | ✅ |
+| HW write-back `DD=1` | `olinfo_post` log | ✅ |
+| Chip's `GPTC` counter incrementa | TX kick log | ✅ |
+| Mac `tcpdump -i en5 -p` ve el frame | — | ❌ |
 
-Cero packets en el reply-context broken.
+Las hipótesis kernel-side (doorbell readback en IRQ ctx, cache barrier,
+phys-translation, IRQ ctx race) están **muertas**: cualquiera de ellas
+sería visible como `GPTC` no incrementando o `DD=0`.
 
-**Próxima sesión**: instrumentar `desc->olinfo_status` post-write-back vs
-pre-write-back para detectar si HW realmente leyó el descriptor, y
-capturar TX en un sniffer L1 externo si es viable.
+**Hipótesis vivas restantes (todas medio físico)**:
+- A: USB-Ethernet bridge del Mac drop frames timing-related (TX
+  inmediato post-RX dispara dentro de un burst window del adapter)
+- B: Frame anomaly invisible al hex dump (padding/runt/FCS) que L1 del
+  bridge rechaza
+- C: I211 errata silently dropping reply-context frames — chip miente
+  con `GPTC++` pero nunca emite al PHY
+
+**Workaround actual (suficiente para el use case)**: OFTP (kdownload /
+kupload) solo necesita Mac→OsitoK RX y OsitoK→Mac TX iniciado desde
+shell context, ambos funcionan. El reply-context "broken" no impacta
+la iteración kexec-over-network.
+
+**Próximos experimentos requieren hardware extra**, no más instrumentación
+kernel:
+- Switch barato + sniffer L1 entre Mac y OsitoK con port mirroring → si
+  el switch ve los frames y el Mac no, el bridge USB-Ethernet del Mac es
+  el culpable; si el switch tampoco los ve, errata I211 confirmada
+- Repro mínimo en Linux booteando OsitoK con USB live → mismo I211, RX→TX
+  IRQ-ctx idéntico; si Linux entrega y OsitoK no, ahí sí hay algo en
+  nuestro driver que falta ver
 
 ---
 
