@@ -90,6 +90,60 @@ static uint8_t *rag_fetch_cached(const char *url, const char *fs_name, int *out_
 #define RAG_TOP_N      4              /* clusters fetched per query */
 #define RAG_TOP_K      4              /* hits returned to LM */
 
+/* ── Query cache (saves ~88 ms /embed round-trip for repeat queries).
+ *
+ * Stored persistently on OsitoFS as rag/qc/<hash>.bin (4100 bytes per
+ * entry: 4-byte query length + up to 4096 bytes of query bytes is in
+ * the FS name; the bin holds qvec). Survives reload via IndexedDB.
+ * Exact-match only — semantic-near-match would use llama_embed_text
+ * but the embed space differs from bge-large, so reuse would be
+ * lossy. Exact match is 100% safe.
+ *
+ * Hash: djb2 over query bytes, truncated to 32 bits, hex-encoded.
+ */
+static uint32_t qc_hash(const char *s)
+{
+    uint32_t h = 5381;
+    for (const char *p = s; *p; p++)
+        h = ((h << 5) + h) ^ (uint8_t)*p;
+    return h;
+}
+
+static void qc_path(uint32_t h, char *out, int max)
+{
+    const char *hex = "0123456789abcdef";
+    int n = 0;
+    const char *prefix = "rag/qc/";
+    for (const char *p = prefix; *p && n < max - 1; p++) out[n++] = *p;
+    for (int i = 7; i >= 0 && n < max - 1; i--)
+        out[n++] = hex[(h >> (i * 4)) & 0xF];
+    if (n < max - 4) { out[n++] = '.'; out[n++] = 'b'; out[n++] = 'i'; out[n++] = 'n'; }
+    out[n] = 0;
+}
+
+/* Return 1 + writes qvec on cache hit; 0 on miss. */
+static int qc_lookup(const char *query, float *qvec)
+{
+    if (!osfs2_is_mounted()) return 0;
+    char path[64];
+    qc_path(qc_hash(query), path, sizeof(path));
+    void *f = osfs2_find(path);
+    if (!f) return 0;
+    uint64_t sz = osfs2_file_size(f);
+    if (sz != RAG_DIM * sizeof(float)) return 0;
+    return osfs2_read(f, 0, qvec, sz) == 0 ? 1 : 0;
+}
+
+static void qc_store(const char *query, const float *qvec)
+{
+    if (!osfs2_is_mounted()) return;
+    char path[64];
+    qc_path(qc_hash(query), path, sizeof(path));
+    osfs2_delete(path);  /* replace any prior */
+    void *f = osfs2_create(path, RAG_DIM * sizeof(float));
+    if (f) osfs2_write(f, 0, qvec, RAG_DIM * sizeof(float));
+}
+
 /* Very small JSON-like extractor: find "key" then return the float
  * after the colon. Returns 0.0 if not found. */
 static float json_num_after(const char *s, const char *key)
@@ -333,6 +387,14 @@ int rag_retrieve(const char *corpus, const char *query,
     result[0] = 0;
 
     /* ── Step 1: fetch query embedding via Worker /embed. ── */
+    /* First check the persistent query cache (saves ~88 ms /embed
+     * round-trip on repeat queries; survives reload). */
+    float *qvec = (float *)malloc(RAG_DIM * sizeof(float));
+    if (!qvec) return -1;
+    if (qc_lookup(query, qvec)) {
+        serial_puts("[rag] qc hit, skipping /embed\n");
+        goto have_qvec;
+    }
     serial_puts("[rag] embedding query...\n");
     char body[1024];
     int n = 0;
@@ -354,9 +416,9 @@ int rag_retrieve(const char *corpus, const char *query,
         "https://rag.naranjositos.tech/embed", body, &emsz);
     if (!embed_resp) {
         serial_puts("[rag] /embed POST failed\n");
+        free(qvec);
         return -1;
     }
-    float *qvec = (float *)malloc(RAG_DIM * sizeof(float));
     int got = parse_embed_response((const char *)embed_resp, qvec, RAG_DIM);
     free(embed_resp);
     if (got != RAG_DIM) {
@@ -367,6 +429,8 @@ int rag_retrieve(const char *corpus, const char *query,
         return -1;
     }
     l2_normalize(qvec, RAG_DIM);
+    qc_store(query, qvec);
+have_qvec: ;
 
     /* ── Step 2: fetch centroids (cached on OsitoFS after first call —
      * survives reload via IndexedDB persistence so repeat queries
