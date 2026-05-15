@@ -617,7 +617,23 @@ EM_JS(int, js_wgpu_init_kick, (), {
         try {
             const adapter = await navigator.gpu.requestAdapter();
             if (!adapter) throw new Error('no adapter');
-            const device = await adapter.requestDevice();
+            /* Bump per-stage storage buffer limit to 10. The fused FFN
+             * shader needs 8 storage buffers (3 weights + ffn_norm +
+             * x + 3 scratch); the default WebGPU minimum is 8 which
+             * doesn't include the uniform AttnDims, so we ask for the
+             * adapter's reported maximum to give the FFN headroom. */
+            const adapterLimits = adapter.limits;
+            const maxStorageBuffers = Math.min(
+                10, adapterLimits.maxStorageBuffersPerShaderStage || 8);
+            const maxStorageSize = Math.min(
+                512 * 1024 * 1024,
+                adapterLimits.maxStorageBufferBindingSize || (128 * 1024 * 1024));
+            const device = await adapter.requestDevice({
+                requiredLimits: {
+                    maxStorageBuffersPerShaderStage: maxStorageBuffers,
+                    maxStorageBufferBindingSize:     maxStorageSize,
+                },
+            });
             const code = `
                 struct Dims { rows: u32, cols: u32 };
                 @group(0) @binding(0) var<storage, read> weights: array<f32>;
