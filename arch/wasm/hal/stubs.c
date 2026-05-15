@@ -1981,19 +1981,50 @@ EM_JS(int, js_wgpu_init_kick, (), {
                 }
             `;
             try {
+                /* Shared BindGroupLayout for all three FFN passes. With
+                 * 'layout: auto' WebGPU omits bindings the shader doesn't
+                 * actually reference, so each pipeline produced a
+                 * different layout — making a shared bind group
+                 * impossible. Explicit layout fixes that. */
+                const ffnBindLayout = device.createBindGroupLayout({
+                    entries: [
+                        { binding: 0, visibility: GPUShaderStage.COMPUTE,
+                          buffer: { type: 'read-only-storage' } },
+                        { binding: 1, visibility: GPUShaderStage.COMPUTE,
+                          buffer: { type: 'read-only-storage' } },
+                        { binding: 2, visibility: GPUShaderStage.COMPUTE,
+                          buffer: { type: 'read-only-storage' } },
+                        { binding: 3, visibility: GPUShaderStage.COMPUTE,
+                          buffer: { type: 'read-only-storage' } },
+                        { binding: 4, visibility: GPUShaderStage.COMPUTE,
+                          buffer: { type: 'storage' } },
+                        { binding: 5, visibility: GPUShaderStage.COMPUTE,
+                          buffer: { type: 'uniform' } },
+                        { binding: 6, visibility: GPUShaderStage.COMPUTE,
+                          buffer: { type: 'storage' } },
+                        { binding: 7, visibility: GPUShaderStage.COMPUTE,
+                          buffer: { type: 'storage' } },
+                        { binding: 8, visibility: GPUShaderStage.COMPUTE,
+                          buffer: { type: 'storage' } },
+                    ],
+                });
+                const ffnPipeLayout = device.createPipelineLayout({
+                    bindGroupLayouts: [ffnBindLayout],
+                });
+                window.__gpuFFNBindLayout = ffnBindLayout;
                 const m1 = device.createShaderModule({ code: ffnCodeRms });
                 const m2 = device.createShaderModule({ code: ffnCodeGateUp });
                 const m3 = device.createShaderModule({ code: ffnCodeDown });
                 window.__gpuFFNRmsPipeline = device.createComputePipeline({
-                    layout: 'auto',
+                    layout: ffnPipeLayout,
                     compute: { module: m1, entryPoint: 'ffn_rmsnorm' },
                 });
                 window.__gpuFFNGateUpPipeline = device.createComputePipeline({
-                    layout: 'auto',
+                    layout: ffnPipeLayout,
                     compute: { module: m2, entryPoint: 'ffn_gate_up' },
                 });
                 window.__gpuFFNDownPipeline = device.createComputePipeline({
-                    layout: 'auto',
+                    layout: ffnPipeLayout,
                     compute: { module: m3, entryPoint: 'ffn_down' },
                 });
             } catch (e) {
@@ -2001,6 +2032,7 @@ EM_JS(int, js_wgpu_init_kick, (), {
                 window.__gpuFFNRmsPipeline = null;
                 window.__gpuFFNGateUpPipeline = null;
                 window.__gpuFFNDownPipeline = null;
+                window.__gpuFFNBindLayout = null;
             }
 
             /* Large-dim variant for Llama 1B (dim=2048, kv_dim=512).
@@ -2957,17 +2989,9 @@ EM_JS(int, js_wgpu_ffn_q4k_kick, (
                     layout: pipe.getBindGroupLayout(0),
                     entries: entries,
                 });
-                if (useMulti) {
-                    s.bgRms = dev.createBindGroup({
-                        layout: window.__gpuFFNRmsPipeline.getBindGroupLayout(0),
-                        entries: entries,
-                    });
-                    s.bgGateUp = dev.createBindGroup({
-                        layout: window.__gpuFFNGateUpPipeline.getBindGroupLayout(0),
-                        entries: entries,
-                    });
-                    s.bgDown = dev.createBindGroup({
-                        layout: window.__gpuFFNDownPipeline.getBindGroupLayout(0),
+                if (useMulti && window.__gpuFFNBindLayout) {
+                    s.bgMulti = dev.createBindGroup({
+                        layout: window.__gpuFFNBindLayout,
                         entries: entries,
                     });
                 }
@@ -2997,23 +3021,23 @@ EM_JS(int, js_wgpu_ffn_q4k_kick, (
             /* Upload current residual x. */
             dev.queue.writeBuffer(s.xBuf, 0, HEAPU8.slice(x, x + dim * 4));
             const enc = dev.createCommandEncoder();
-            if (useMulti && s.bgRms) {
+            if (useMulti && s.bgMulti) {
                 /* Pass 1: rmsnorm (1 workgroup). */
                 const p1 = enc.beginComputePass();
                 p1.setPipeline(window.__gpuFFNRmsPipeline);
-                p1.setBindGroup(0, s.bgRms);
+                p1.setBindGroup(0, s.bgMulti);
                 p1.dispatchWorkgroups(1);
                 p1.end();
                 /* Pass 2: gate+up matvec + SwiGLU (ffn_dim workgroups). */
                 const p2 = enc.beginComputePass();
                 p2.setPipeline(window.__gpuFFNGateUpPipeline);
-                p2.setBindGroup(0, s.bgGateUp);
+                p2.setBindGroup(0, s.bgMulti);
                 p2.dispatchWorkgroups(ffn_dim);
                 p2.end();
                 /* Pass 3: down matvec + residual (dim workgroups). */
                 const p3 = enc.beginComputePass();
                 p3.setPipeline(window.__gpuFFNDownPipeline);
-                p3.setBindGroup(0, s.bgDown);
+                p3.setBindGroup(0, s.bgMulti);
                 p3.dispatchWorkgroups(dim);
                 p3.end();
             } else {
