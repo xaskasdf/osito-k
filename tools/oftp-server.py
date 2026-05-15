@@ -23,7 +23,7 @@ Protocol:
 
 Usage:
     ./oftp-server.py [bind-host] [port] [serve-root]
-    Defaults: 0.0.0.0  7779  current dir
+    Defaults: 0.0.0.0  7781  current dir
 """
 
 import os
@@ -179,7 +179,7 @@ def serve(bind_host: str, port: int, root: str) -> None:
 
 def main() -> None:
     bind_host = sys.argv[1] if len(sys.argv) > 1 else "0.0.0.0"
-    port      = int(sys.argv[2]) if len(sys.argv) > 2 else 7779
+    port      = int(sys.argv[2]) if len(sys.argv) > 2 else 7781
     root      = sys.argv[3] if len(sys.argv) > 3 else "."
     if not os.path.isdir(root):
         print(f"error: serve root {root!r} not a directory")
