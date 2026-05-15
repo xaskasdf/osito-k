@@ -1006,6 +1006,26 @@ EM_JS(int, js_wgpu_init_kick, (), {
                 layout: 'auto',
                 compute: { module: attnMod, entryPoint: 'fused_attn' },
             });
+
+            /* Large-dim variant for Llama 1B (dim=2048, kv_dim=512).
+             * Promotes q_scratch and attn_out from workgroup arrays to
+             * storage buffers (bindings 9, 10) so the per-workgroup
+             * memory budget no longer caps dim. MAX_SEQ bumped to 2048
+             * (8 KB workgroup mem for att[], still well under 16 KB
+             * limit; partial[] adds 256 B). */
+            const attnCodeLarge = attnCode
+                .replace('const MAX_DIM: u32 = 256u;', 'const MAX_DIM: u32 = 256u;\n                const _UNUSED_LG: u32 = 1u;')
+                .replace('const MAX_SEQ: u32 = 512u;', 'const MAX_SEQ: u32 = 2048u;')
+                .replace('var<workgroup> q_scratch: array<f32, MAX_DIM>;',
+                         '@group(0) @binding(9) var<storage, read_write> q_scratch: array<f32>;')
+                .replace('var<workgroup> attn_out: array<f32, MAX_DIM>;',
+                         '@group(0) @binding(10) var<storage, read_write> attn_out: array<f32>;');
+            const attnModL = device.createShaderModule({ code: attnCodeLarge });
+            window.__gpuAttnPipelineLarge = device.createComputePipeline({
+                layout: 'auto',
+                compute: { module: attnModL, entryPoint: 'fused_attn' },
+            });
+
             window.__gpuReady = true;
         } catch (e) {
             window.__gpuError = String(e);
@@ -1834,7 +1854,13 @@ EM_JS(int, js_wgpu_fused_attn_kick, (
     (async function() {
         try {
             const dev = window.__gpuDevice;
-            const pipe = window.__gpuAttnPipeline;
+            /* Pipeline select: small dim keeps q/o in workgroup arrays
+             * (faster — no cross-shader-stage roundtrip via storage);
+             * large dim uses the storage-buffer variant. 256 matches
+             * MAX_DIM in the small shader. */
+            const isLarge = dim > 256;
+            const pipe = isLarge ? window.__gpuAttnPipelineLarge
+                                 : window.__gpuAttnPipeline;
             const kv = window.__gpuKVPool && window.__gpuKVPool[layer];
             if (!kv) {
                 window.__gpuError = 'KV cache not allocated for layer ' + layer;
@@ -1850,6 +1876,8 @@ EM_JS(int, js_wgpu_fused_attn_kick, (
                     old.wqBuf.destroy(); old.wkBuf.destroy(); old.wvBuf.destroy();
                     old.woBuf.destroy(); old.xBuf.destroy(); old.outBuf.destroy();
                     old.dBuf.destroy(); old.rBuf.destroy();
+                    if (old.qBuf) old.qBuf.destroy();
+                    if (old.oBuf) old.oBuf.destroy();
                     window.__gpuAttnCache.delete(k0);
                 }
                 const dimBytes = dim * 4;
@@ -1870,22 +1898,35 @@ EM_JS(int, js_wgpu_fused_attn_kick, (
                         usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST }),
                     rBuf: dev.createBuffer({ size: dimBytes,
                         usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST }),
+                    qBuf: null, oBuf: null,
                     bg: null,
                     last_wq: 0, last_wk: 0, last_wv: 0, last_wo: 0
                 };
+                /* Large-dim path: persistent q + o scratch (per layer
+                 * config). Small path uses workgroup arrays inside the
+                 * shader and skips these buffers entirely. */
+                const entries = [
+                    { binding: 0, resource: { buffer: s.wqBuf } },
+                    { binding: 1, resource: { buffer: s.wkBuf } },
+                    { binding: 2, resource: { buffer: s.wvBuf } },
+                    { binding: 3, resource: { buffer: s.woBuf } },
+                    { binding: 4, resource: { buffer: s.xBuf } },
+                    { binding: 5, resource: { buffer: kv.kBuf } },
+                    { binding: 6, resource: { buffer: kv.vBuf } },
+                    { binding: 7, resource: { buffer: s.outBuf } },
+                    { binding: 8, resource: { buffer: s.dBuf } },
+                ];
+                if (isLarge) {
+                    s.qBuf = dev.createBuffer({ size: dimBytes,
+                        usage: GPUBufferUsage.STORAGE });
+                    s.oBuf = dev.createBuffer({ size: dimBytes,
+                        usage: GPUBufferUsage.STORAGE });
+                    entries.push({ binding: 9,  resource: { buffer: s.qBuf } });
+                    entries.push({ binding: 10, resource: { buffer: s.oBuf } });
+                }
                 s.bg = dev.createBindGroup({
                     layout: pipe.getBindGroupLayout(0),
-                    entries: [
-                        { binding: 0, resource: { buffer: s.wqBuf } },
-                        { binding: 1, resource: { buffer: s.wkBuf } },
-                        { binding: 2, resource: { buffer: s.wvBuf } },
-                        { binding: 3, resource: { buffer: s.woBuf } },
-                        { binding: 4, resource: { buffer: s.xBuf } },
-                        { binding: 5, resource: { buffer: kv.kBuf } },
-                        { binding: 6, resource: { buffer: kv.vBuf } },
-                        { binding: 7, resource: { buffer: s.outBuf } },
-                        { binding: 8, resource: { buffer: s.dBuf } },
-                    ],
+                    entries: entries,
                 });
                 window.__gpuAttnCache.set(key, s);
             }
