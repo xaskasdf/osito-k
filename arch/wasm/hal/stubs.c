@@ -1041,6 +1041,66 @@ EM_JS(int, js_wgpu_init_kick, (), {
                 compute: { module: attnMod, entryPoint: 'fused_attn' },
             });
 
+            /* Q4_K dequant test pipeline. Single-workgroup compute that
+             * reads a 144-byte Q4_K block from binding 0 (as array<u32>)
+             * and writes 256 f32s to binding 1. Validates that the WGSL
+             * port of dequant_q4_k_block matches the CPU implementation
+             * bit-exact; precondition for porting fused-attn matvecs
+             * to native Q4_K (eliminates the +608 MB predequant_attn
+             * cost for Llama 1B Q4_K_M). */
+            const q4kCode = `
+                @group(0) @binding(0) var<storage, read> blk: array<u32>;
+                @group(0) @binding(1) var<storage, read_write> outp: array<f32>;
+
+                fn sb(idx: u32) -> u32 {
+                    let w = blk[1u + (idx / 4u)];
+                    return (w >> (8u * (idx % 4u))) & 0xFFu;
+                }
+                fn q4k_d(j: u32) -> u32 {
+                    if (j < 4u) { return sb(j) & 63u; }
+                    let lo = sb(j + 4u) & 0xFu;
+                    let hi = (sb(j - 4u) >> 6u) & 3u;
+                    return lo | (hi << 4u);
+                }
+                fn q4k_m(j: u32) -> u32 {
+                    if (j < 4u) { return sb(j + 4u) & 63u; }
+                    let lo = sb(j + 4u) >> 4u;
+                    let hi = (sb(j) >> 6u) & 3u;
+                    return lo | (hi << 4u);
+                }
+                fn qb(idx: u32) -> u32 {
+                    let w = blk[4u + (idx / 4u)];
+                    return (w >> (8u * (idx % 4u))) & 0xFFu;
+                }
+
+                @compute @workgroup_size(64)
+                fn dequant_q4k(@builtin(local_invocation_id) lid: vec3<u32>) {
+                    let tid = lid.x;
+                    let h0 = blk[0u];
+                    let dd   = unpack2x16float(h0).x;
+                    let dmin = unpack2x16float(h0).y;
+                    var e: u32 = tid;
+                    loop {
+                        if (e >= 256u) { break; }
+                        let pair = e / 64u;
+                        let off  = e % 64u;
+                        let is_high = off >= 32u;
+                        let sub_idx = pair * 2u + select(0u, 1u, is_high);
+                        let sc = f32(q4k_d(sub_idx));
+                        let mn = f32(q4k_m(sub_idx));
+                        let qbyte = qb(pair * 32u + (off % 32u));
+                        let nibble = select(qbyte & 0xFu, qbyte >> 4u, is_high);
+                        outp[e] = dd * sc * f32(nibble) - dmin * mn;
+                        e = e + 64u;
+                    }
+                }
+            `;
+            const q4kMod = device.createShaderModule({ code: q4kCode });
+            window.__gpuQ4KPipeline = device.createComputePipeline({
+                layout: 'auto',
+                compute: { module: q4kMod, entryPoint: 'dequant_q4k' },
+            });
+
             /* Large-dim variant for Llama 1B (dim=2048, kv_dim=512).
              * Promotes q_scratch and attn_out from workgroup arrays to
              * storage buffers (bindings 9, 10) so the per-workgroup
@@ -1846,6 +1906,59 @@ int wasm_wgpu_qkv(const float *x, const float *wq, const float *wk, const float 
  * buffer for its K and V cache, sized once for max_seq × kv_dim.
  * Pool lookup by layer index — caller supplies a stable layer id.
  * Returns 0 on success, sets per-layer handle ids out_hk/out_hv. */
+/* ── Q4_K dequant test dispatcher ────────────────────────────────
+ *
+ * Reads a 144-byte block from `blk_ptr`, dispatches the GPU dequant
+ * shader, writes 256 f32s to `out_ptr`. Blocking on Asyncify. Used by
+ * the `wgpu q4k_gpu` shell command to compare against CPU dequant. */
+EM_JS(int, js_wgpu_q4k_dequant_kick, (const void *blk_ptr, float *out_ptr), {
+    window.__gpuOpDone = false; window.__gpuOpOK = false;
+    if (!window.__gpuReady) { window.__gpuOpDone = true; return 0; }
+    (async function() {
+        try {
+            const dev  = window.__gpuDevice;
+            const pipe = window.__gpuQ4KPipeline;
+            const bIn  = dev.createBuffer({ size: 144,
+                usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+            const bOut = dev.createBuffer({ size: 256 * 4,
+                usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+            const bRd  = dev.createBuffer({ size: 256 * 4,
+                usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+            dev.queue.writeBuffer(bIn, 0, HEAPU8.slice(blk_ptr, blk_ptr + 144));
+            const bg = dev.createBindGroup({
+                layout: pipe.getBindGroupLayout(0),
+                entries: [
+                    { binding: 0, resource: { buffer: bIn  } },
+                    { binding: 1, resource: { buffer: bOut } },
+                ],
+            });
+            const enc = dev.createCommandEncoder();
+            const pass = enc.beginComputePass();
+            pass.setPipeline(pipe);
+            pass.setBindGroup(0, bg);
+            pass.dispatchWorkgroups(1);
+            pass.end();
+            enc.copyBufferToBuffer(bOut, 0, bRd, 0, 256 * 4);
+            dev.queue.submit([enc.finish()]);
+            await bRd.mapAsync(GPUMapMode.READ);
+            HEAPU8.set(new Uint8Array(bRd.getMappedRange()), out_ptr);
+            bRd.unmap();
+            bIn.destroy(); bOut.destroy(); bRd.destroy();
+            window.__gpuOpOK = true;
+        } catch (e) { window.__gpuError = String(e); }
+        window.__gpuOpDone = true;
+    })();
+    return 1;
+});
+
+int wasm_wgpu_q4k_dequant(const void *blk, float *out)
+{
+    if (!js_wgpu_ready()) return -1;
+    js_wgpu_q4k_dequant_kick(blk, out);
+    while (!js_wgpu_op_done()) emscripten_sleep(1);
+    return js_wgpu_op_ok() ? 0 : -1;
+}
+
 EM_JS(int, js_wgpu_kvcache_alloc, (int layer, int max_seq, int kv_dim), {
     if (!window.__gpuReady) return -1;
     if (!window.__gpuKVPool) window.__gpuKVPool = {};

@@ -5367,6 +5367,71 @@ pdone:
             sh_puts("\n");
             free(x); free(wq); free(wk); free(wv); free(wo);
             free(gpu); free(cpu); free(q); free(k); free(v); free(attn_out);
+        } else if (strcmp(argv[1], "q4k_gpu") == 0) {
+            /* GPU Q4_K dequant validator. Builds a deterministic Q4_K
+             * block, dequants on GPU + CPU, prints maxdiff. Passes if
+             * maxdiff*1e6 < ~10 (sub-microvolt — same precision as
+             * f16 round-trip). Precondition for porting fused-attn
+             * matvecs to native Q4_K. */
+#ifdef __EMSCRIPTEN__
+            extern void *malloc(unsigned long); extern void free(void *);
+            extern int wasm_wgpu_q4k_dequant(const void *blk, float *out);
+            extern float f16_to_f32(uint16_t h);
+            extern void matvec_q4_k_scalar(float *, const void *, const float *,
+                                            uint32_t, uint32_t);
+            uint8_t *blk = (uint8_t *)malloc(144);
+            float *gpu = (float *)malloc(256 * 4);
+            float *cpu = (float *)malloc(256 * 4);
+            float *inp = (float *)malloc(256 * 4);
+            if (!blk || !gpu || !cpu || !inp) { sh_puts("OOM\n"); goto q4kgdone; }
+            /* fp16 d=0.125, dmin=0.0625 — small but representable */
+            *(uint16_t *)(blk + 0) = 0x3000;  /* 0.125 */
+            *(uint16_t *)(blk + 2) = 0x2C00;  /* 0.0625 */
+            for (int i = 0; i < 12; i++) blk[4 + i] = (uint8_t)((i*7+1) & 0x3F);
+            for (int i = 0; i < 128; i++) blk[16 + i] = (uint8_t)(i*13 + 5);
+            /* GPU dequant */
+            int rc = wasm_wgpu_q4k_dequant(blk, gpu);
+            if (rc != 0) { sh_puts("GPU rc!=0\n"); goto q4kgdone; }
+            /* CPU dequant via one-hot matvec (extracts column k as scalar). */
+            for (int k = 0; k < 256; k++) {
+                for (int i = 0; i < 256; i++) inp[i] = 0.0f;
+                inp[k] = 1.0f;
+                float v;
+                matvec_q4_k_scalar(&v, blk, inp, 1, 256);
+                cpu[k] = v;
+            }
+            float md = 0.0f;
+            int worst = -1;
+            for (int i = 0; i < 256; i++) {
+                float d = gpu[i] - cpu[i];
+                if (d < 0) d = -d;
+                if (d > md) { md = d; worst = i; }
+            }
+            sh_puts("[wgpu q4k_gpu] maxdiff*1e6=");
+            sh_putdec((uint64_t)(md * 1e6f));
+            sh_puts(" worst_idx=");
+            sh_putdec((uint64_t)worst);
+            sh_puts(" gpu0..3=");
+            for (int i = 0; i < 4; i++) {
+                int v = (int)(gpu[i] * 10000);
+                if (i > 0) sh_puts(",");
+                if (v < 0) { sh_puts("-"); v = -v; }
+                sh_putdec((uint64_t)v);
+            }
+            sh_puts(" cpu0..3=");
+            for (int i = 0; i < 4; i++) {
+                int v = (int)(cpu[i] * 10000);
+                if (i > 0) sh_puts(",");
+                if (v < 0) { sh_puts("-"); v = -v; }
+                sh_putdec((uint64_t)v);
+            }
+            sh_puts("\n");
+q4kgdone:
+            if (blk) free(blk); if (gpu) free(gpu);
+            if (cpu) free(cpu); if (inp) free(inp);
+#else
+            sh_puts("wgpu q4k_gpu: WASM-only\n");
+#endif
         } else if (strcmp(argv[1], "q4k") == 0) {
             /* Unit test: construct a Q4_K block with known scale/min/quants
              * and dequant via matvec on a one-hot input. Compare expected
