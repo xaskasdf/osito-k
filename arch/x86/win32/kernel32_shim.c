@@ -781,13 +781,18 @@ va_proceed:
 
 BOOL WINAPI VirtualFree(PVOID lpAddress, SIZE_T dwSize, DWORD dwFreeType)
 {
-    /* MEM_RELEASE (0x8000): no-op to prevent use-after-free.
-     * UT99's error cleanup frees FName::Names data via VirtualFree,
-     * then later code still accesses it → NULL deref → crash.
-     * Single-process app — no need to actually reclaim pages. */
-    if (dwFreeType == 0x8000) /* MEM_RELEASE */
-        return TRUE;
-
+    /* MEM_RELEASE (0x8000) DOES reclaim the VA range now.  The old no-op
+     * comment said this avoided FName::Names use-after-free during
+     * error cleanup.  But with VA-CACHE deduping LARGE bogus allocs,
+     * the dominant VA consumer is now REAL engine asset loads (textures,
+     * sounds, meshes — 4-14 MB each).  Without releasing those, UT99
+     * hits VA-exhaust (STATUS_NO_MEMORY) on a 1.6 MB request well
+     * before reaching gameplay.
+     *
+     * Tradeoff: if engine error-path accesses freed FName data, we'll
+     * see a NULL-deref later.  Mitigated by the high NULL-CALL recovery
+     * cap (5000); compared to guaranteed VA exhaust, this is the better
+     * failure mode. */
     PVOID base = lpAddress;
     SIZE_T size = dwSize;
 
