@@ -343,16 +343,15 @@ static int try_patch_farray(uint32_t cand_addr, uint32_t newmax_hint,
     if (cand_addr < 0x100000 || cand_addr >= 0xFFFE0000 || (cand_addr & 3))
         return 0;
     uint32_t *t = (uint32_t *)(uintptr_t)cand_addr;
-    uint32_t plus8 = t[2];
-    /* Tighter than [0x10000000, 0x20000000): the corruption pattern is a
-     * leaked .text code pointer from a parent frame's saved-reg spill.
-     * UT99 maps Core.dll @ 0x10100000, Engine.dll @ 0x10300000, UT.exe @
-     * 0x10900000, Window.dll @ 0x11000000.  Real heap (0x14xxxxxx,
-     * 0x40xxxxxx) and stack (0x13Bxxxxx-0x13Fxxxxx) addresses look
-     * pointer-ish but aren't code, so DON'T patch them — they may be
-     * legitimate FArray::Max values larger than expected for non-TArray
-     * structs.  An over-eager patch broke a legitimately huge Max field
-     * once and put the engine in an infinite tight loop. */
+    uint32_t plus0 = t[0];  /* Data */
+    uint32_t plus4 = t[1];  /* Num  */
+    uint32_t plus8 = t[2];  /* Max or ElementSize per disasm */
+    /* Tighter than [0x10000000, 0x20000000): only patch when {+8} is a
+     * real PE-image .text code pointer.  UT99 maps Core.dll @
+     * 0x10100000, Engine.dll @ 0x10300000, UT.exe @ 0x10900000,
+     * Window.dll @ 0x11000000.  Heap (0x14xxxxxx, 0x40xxxxxx) and
+     * stack (0x13Bxxxxx-0x13Fxxxxx) are NOT code, even though they
+     * look pointer-ish. */
     if (plus8 < 0x10000000 || plus8 >= 0x12000000) return 0;
 
     static int patch_log = 0;
@@ -360,20 +359,30 @@ static int try_patch_farray(uint32_t cand_addr, uint32_t newmax_hint,
         serial_puts("[VA-FARRAY] ");
         serial_puts(origin);
         serial_puts(" FArray@0x"); serial_puthex(cand_addr, 8);
+        serial_puts(" Data=0x"); serial_puthex(plus0, 8);
+        serial_puts(" Num=0x"); serial_puthex(plus4, 8);
         serial_puts(" {+8}=0x"); serial_puthex(plus8, 8);
-        serial_puts(" -> 2");
         patch_log++;
     }
-    t[2] = 2;
-    if (t[0] >= 0x10000000 && t[0] < 0x20000000) t[0] = 0;
-    if (t[1] >= 0x10000000 && t[1] < 0x20000000) t[1] = 0;
-    if (newmax_hint > 0 && newmax_hint < 0x100000) {
-        *dwSize_out = (SIZE_T)(newmax_hint * 2 + 0xFFF) & ~(SIZE_T)0xFFF;
+    /* Patch {+8} to 4 (pointer-sized element).  Most UE1 TArrays hold
+     * UObject* / FName / similar 4-byte values.  WCHAR=2 was empirically
+     * too small for non-string arrays and put the engine in a tight
+     * loop reading half-words as full structs. */
+    t[2] = 4;
+    if (t[0] >= 0x10000000 && t[0] < 0x12000000) t[0] = 0;  /* Data */
+    if (t[1] >= 0x10000000 && t[1] < 0x12000000) t[1] = 0;  /* Num */
+    /* dwSize: bigger is safer (with VA-CACHE deduping, the VA range
+     * stays healthy).  Aim for ~256 KB worst case, derived from
+     * NewMax * 4 if we know it. */
+    if (newmax_hint > 0 && newmax_hint < 0x10000) {
+        SIZE_T s = (SIZE_T)(newmax_hint * 4 + 0xFFF) & ~(SIZE_T)0xFFF;
+        if (s < 0x40000) s = 0x40000;  /* min 256 KB */
+        *dwSize_out = s;
     } else {
-        *dwSize_out = 0x1000;  /* 4KB fallback when NewMax unknown */
+        *dwSize_out = 0x40000;  /* 256 KB fallback */
     }
     if (patch_log <= 20) {
-        serial_puts(" -> dwSize=0x"); serial_puthex(*dwSize_out, 8);
+        serial_puts(" -> {+8}=4 dwSize=0x"); serial_puthex(*dwSize_out, 8);
         serial_puts("\n");
     }
     return 1;
@@ -652,62 +661,18 @@ PVOID WINAPI VirtualAlloc(PVOID lpAddress, SIZE_T dwSize,
              * MSVC compiler offsets [-0x10..-0x28] (esi-spill in
              * SEH-decorated functions). For each candidate, check if
              * *(this+8) is a code ptr → patch to 2. */
+            /* EBP walk: try locals [-0x10..-0x40] across up to 10 frames.
+             * Each candidate goes through try_patch_farray for the same
+             * tight {+8}∈[0x10000000,0x12000000) check and unified
+             * {+8}=4 + 256KB buffer policy. */
             for (int depth = 0; depth < 10 && walk >= 0x100000 &&
                  walk < 0xFFFE0000 && (walk & 3) == 0; depth++) {
                 int32_t *neg = (int32_t *)(uintptr_t)walk;
-                /* Try locals at [-0x10]..[-0x40] — wide enough to cover
-                 * SEH-decorated MSVC functions (with __try frames
-                 * inflating local area) and inlined helpers. */
+                /* NewMax hint = [ebp+8] = first stack arg of this frame */
+                uint32_t newmax = ((uint32_t *)(uintptr_t)walk)[2];
                 for (int local_off = 4; local_off <= 16 && !patched; local_off++) {
                     uint32_t cand = (uint32_t)*(neg - local_off);
-                    if (cand < 0x100000 || cand >= 0xFFFE0000 || (cand & 3))
-                        continue;
-                    uint32_t *t = (uint32_t *)(uintptr_t)cand;
-                    uint32_t plus8 = t[2];
-                    /* Code pointer pattern in PE-image .text range */
-                    /* Same tight range as try_patch_farray (see helper
-                     * comment): only patch when {+8} is a real PE-image
-                     * .text code pointer.  Heap-range pointers (e.g.
-                     * 0x14xxxxxx) were producing false positives that
-                     * patched legitimately-large Max fields and broke
-                     * the engine into a tight loop.  Range covers
-                     * Core.dll (0x10100000), Engine.dll (0x10300000),
-                     * UT.exe (0x10900000), Window.dll (0x11000000). */
-                    if (plus8 >= 0x10000000 && plus8 < 0x12000000) {
-                        static int patch_log = 0;
-                        if (patch_log < 20) {
-                            serial_puts("[VA-FARRAY] frame ");
-                            serial_putdec(depth);
-                            serial_puts(" local[-0x");
-                            serial_puthex(local_off * 4, 2);
-                            serial_puts("] = FArray@0x");
-                            serial_puthex(cand, 8);
-                            serial_puts(" {+8}=0x");
-                            serial_puthex(plus8, 8);
-                            serial_puts(" → 2");
-                            patch_log++;
-                        }
-                        t[2] = 2;
-                        /* Also zero Num/Data so subsequent Realloc on
-                         * this same TArray gets clean slate */
-                        if (t[0] >= 0x10000000 && t[0] < 0x20000000) {
-                            t[0] = 0; /* Data */
-                        }
-                        if (t[1] >= 0x10000000 && t[1] < 0x20000000) {
-                            t[1] = 0; /* Num */
-                        }
-                        /* Use NewMax from frame's [ebp+8] = first arg */
-                        uint32_t newmax = ((uint32_t *)(uintptr_t)walk)[2];
-                        if (newmax > 0 && newmax < 0x100000) {
-                            dwSize = (SIZE_T)(newmax * 2 + 0xFFF) & ~(SIZE_T)0xFFF;
-                        } else {
-                            dwSize = 0x1000; /* fallback 4KB */
-                        }
-                        if (patch_log <= 20) {
-                            serial_puts(" → dwSize=0x");
-                            serial_puthex(dwSize, 8);
-                            serial_puts("\n");
-                        }
+                    if (try_patch_farray(cand, newmax, &dwSize, "ebp-walk")) {
                         patched = 1;
                     }
                 }
