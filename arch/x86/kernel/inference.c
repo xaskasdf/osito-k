@@ -997,6 +997,14 @@ static bool g_brandon_use_value_residual = true;
 static bool g_brandon_use_registers      = true;
 static bool g_brandon_debug_logits       = false;
 
+/* Off by default. When ON and the model uses neither value-residual
+ * nor DWA (the fused_attn WGSL shader has no slot for either), the
+ * attention block (rmsnorm-output through output projection) is
+ * dispatched to WebGPU as a single fused kernel instead of running
+ * the CPU loop. Toggle via 'bdebug attn 1'. */
+int  g_brandon_use_gpu_attn       = 0;
+static int  g_brandon_attn_init   = 0;
+
 /* One pass through the n_layers logical stack. produce_logits=false
  * is used during register prefill (the output isn't consumed). */
 static int brandon_forward_one(llama_state_t *s, uint32_t pos, bool produce_logits)
@@ -1016,11 +1024,64 @@ static int brandon_forward_one(llama_state_t *s, uint32_t pos, bool produce_logi
      * Reset the capture flag so layer 0 of THIS forward refreshes v_first. */
     s->v_first_captured = false;
 
+#ifdef __EMSCRIPTEN__
+    /* One-shot: allocate per-layer GPU KV cache the first time we
+     * enter forward with the GPU attn flag on. */
+    if (g_brandon_use_gpu_attn && !g_brandon_attn_init &&
+        !eff_use_dwa && !eff_use_value_residual) {
+        extern int wasm_wgpu_init(void);
+        extern int wasm_wgpu_kvcache_alloc(int layer, int max_seq, int kv_dim);
+        if (wasm_wgpu_init()) {
+            for (uint32_t l = 0; l < s->n_layers; l++)
+                wasm_wgpu_kvcache_alloc((int)l, (int)s->max_seq, (int)kv_dim);
+            g_brandon_attn_init = 1;
+            serial_puts("[brandon] GPU attn: KV cache pool allocated\n");
+        }
+    }
+#endif
+
     for (uint32_t l = 0; l < s->n_layers; l++) {
         llama_layer_t *ly = &s->weights.layers[l];
 
         /* Attention norm */
         rmsnorm(s->xb, s->x, norm_data(ly->attn_norm), dim);
+
+#ifdef __EMSCRIPTEN__
+        /* GPU fused-attn fast path. Replaces QKV+VR+RoPE+KV-cache+
+         * attention+O-projection with a single GPU dispatch. Only
+         * fires when the model is non-DWA non-VR F32. KV cache stays
+         * GPU-side for the whole generation. */
+        bool gpu_attn_ok = false;
+        if (g_brandon_use_gpu_attn && g_brandon_attn_init &&
+            !eff_use_dwa && !eff_use_value_residual &&
+            ly->attn_q->type == GGML_TYPE_F32 &&
+            ly->attn_k->type == GGML_TYPE_F32 &&
+            ly->attn_v->type == GGML_TYPE_F32 &&
+            ly->attn_output->type == GGML_TYPE_F32) {
+            extern int wasm_wgpu_fused_attn(int layer,
+                const float *x, const float *wq, const float *wk,
+                const float *wv, const float *wo, float *out,
+                int dim, int kv_dim, int head_dim, int n_heads,
+                int n_kv_heads, int gqa_ratio, int pos, int max_seq,
+                float scale, float rope_base);
+            float scale = 1.0f / sqrtf_bare((float)hd);
+            int rc = wasm_wgpu_fused_attn((int)l,
+                s->xb,
+                (const float *)ly->attn_q->data,
+                (const float *)ly->attn_k->data,
+                (const float *)ly->attn_v->data,
+                (const float *)ly->attn_output->data,
+                s->xb,                 /* output: post-O projection */
+                (int)dim, (int)kv_dim, (int)hd, (int)s->n_heads,
+                (int)s->n_kv_heads, (int)s->gqa_ratio,
+                (int)pos, (int)s->max_seq, scale, s->rope_freq_base);
+            if (rc == 0) {
+                vec_add(s->x, s->x, s->xb, dim);
+                gpu_attn_ok = true;
+            }
+        }
+        if (gpu_attn_ok) goto ffn_block;
+#endif
 
         /* Q, K, V projections */
         matvec(s->q, ly->attn_q, s->xb, dim, dim);
@@ -1083,6 +1144,7 @@ static int brandon_forward_one(llama_state_t *s, uint32_t pos, bool produce_logi
         matvec(s->xb, ly->attn_output, s->xb2, dim, dim);
         vec_add(s->x, s->x, s->xb, dim);
 
+ffn_block: ;
         /* FFN: rmsnorm → SwiGLU → residual */
         rmsnorm(s->xb, s->x, norm_data(ly->ffn_norm), dim);
         matvec(s->hb,  ly->ffn_gate, s->xb, s->ffn_dim, dim);

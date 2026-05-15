@@ -6112,6 +6112,12 @@ void shell_exec(char *line)
                 sh_puts(v ? "[brandon] GPU matvec ENABLED\n"
                           : "[brandon] GPU matvec disabled\n");
             }
+            else if (strcmp(argv[1], "attn") == 0) {
+                extern int g_brandon_use_gpu_attn;
+                g_brandon_use_gpu_attn = v;
+                sh_puts(v ? "[brandon] GPU fused-attn ENABLED (F32 + no VR/DWA)\n"
+                          : "[brandon] GPU fused-attn disabled\n");
+            }
             else sh_puts("bdebug applied\n");
         }
     } else if (strcmp(cmd, "temp") == 0) {
