@@ -1076,7 +1076,27 @@ int llama_forward(llama_state_t *s, uint32_t token)
 
     /* ── Final norm + logits ── */
     rmsnorm(s->x, s->x, norm_data(s->weights.output_norm), dim);
+#ifdef __EMSCRIPTEN__
+    /* GPU LM head fast path: Q6_K matvec over the full vocab. The
+     * rmsnorm above runs on CPU (cheap, ~2K elements). The matvec
+     * is the dominant CPU cost — 128K × 2048 with Q6_K dequant inline
+     * → ~150 ms/tok. GPU multi-WG handles it in <30 ms.
+     * Gated on the toggle + Q6_K output weight. */
+    extern bool g_llama_use_gpu_lm_head;
+    bool lm_gpu_ok = false;
+    if (g_llama_use_gpu_lm_head &&
+        s->weights.output->type == GGML_TYPE_Q6_K) {
+        extern int wasm_wgpu_lm_head_q6k(const float *x_norm, const void *w,
+                                          float *logits, int dim, int vocab);
+        int rc = wasm_wgpu_lm_head_q6k(s->x, s->weights.output->data,
+                                        s->logits, (int)dim, (int)s->vocab_size);
+        if (rc == 0) lm_gpu_ok = true;
+    }
+    if (!lm_gpu_ok)
+        matvec(s->logits, s->weights.output, s->x, s->vocab_size, dim);
+#else
     matvec(s->logits, s->weights.output, s->x, s->vocab_size, dim);
+#endif
 
     s->pos++;
 
@@ -1103,6 +1123,7 @@ static bool g_brandon_use_value_residual = true;
 bool g_llama_use_gpu_attn       = false;
 bool g_llama_use_gpu_predequant = false;  /* dtype-3: Q4_K → on-GPU F32 mirror */
 bool g_llama_use_gpu_ffn        = false;  /* fused Q4_K FFN compute */
+bool g_llama_use_gpu_lm_head    = false;  /* Q6_K LM head matvec */
 bool g_llama_attn_init          = false;
 
 static bool g_brandon_use_registers      = true;

@@ -1961,6 +1961,107 @@ EM_JS(int, js_wgpu_init_kick, (), {
                 window.__gpuAttnBindLayout = null;
             }
 
+            /* Q6_K LM head matvec. Used for Llama Q4_K_M models where
+             * token_embd (tied with output) is Q6_K. One workgroup per
+             * vocab row, 64 threads coop dot. 2D dispatch since vocab
+             * often exceeds the 65535 per-dim limit (Llama 1B has
+             * 128256).
+             *
+             * Weights are stored at 256-byte stride per block (padded
+             * from the native 210-byte Q6_K block) so all u32 reads
+             * are aligned. JS does the repack once at upload. */
+            const lmHeadQ6KCode = `
+                struct LMDims { dim: u32, vocab: u32, vocab_x: u32, _pad: u32 };
+                @group(0) @binding(0) var<storage, read>       w: array<u32>;
+                @group(0) @binding(1) var<storage, read>       xin: array<f32>;
+                @group(0) @binding(2) var<storage, read_write> logits: array<f32>;
+                @group(0) @binding(3) var<uniform>             d: LMDims;
+
+                var<workgroup> partial: array<f32, 64>;
+
+                fn ql_byte(base: u32, idx: u32) -> u32 {
+                    let w_word = w[base + idx / 4u];
+                    return (w_word >> (8u * (idx % 4u))) & 0xFFu;
+                }
+                fn qh_byte(base: u32, idx: u32) -> u32 {
+                    let off = 128u + idx;
+                    let w_word = w[base + off / 4u];
+                    return (w_word >> (8u * (off % 4u))) & 0xFFu;
+                }
+                fn sc_byte(base: u32, idx: u32) -> i32 {
+                    let off = 192u + idx;
+                    let w_word = w[base + off / 4u];
+                    let u = (w_word >> (8u * (off % 4u))) & 0xFFu;
+                    return select(i32(u), i32(u) - 256, u >= 128u);
+                }
+                fn d_val(base: u32) -> f32 {
+                    /* d (fp16) at byte 208..209 = word 52 low 16 bits. */
+                    return unpack2x16float(w[base + 52u]).x;
+                }
+
+                fn dq_q6k(base: u32, e: u32) -> f32 {
+                    let super_chunk = e / 128u;
+                    let offset = e % 128u;
+                    let group = offset / 32u;
+                    let l = offset % 32u;
+                    let is_v = l / 16u;
+                    let scales_idx = super_chunk * 8u + group * 2u + is_v;
+                    let ql_idx = super_chunk * 64u + l + (group % 2u) * 32u;
+                    let qh_idx = super_chunk * 32u + l;
+                    let qh_shift = group * 2u;
+                    let use_high_ql = group >= 2u;
+
+                    let ql = ql_byte(base, ql_idx);
+                    let nibble = (ql >> select(0u, 4u, use_high_ql)) & 0xFu;
+                    let qh = qh_byte(base, qh_idx);
+                    let qh_bits = (qh >> qh_shift) & 0x3u;
+                    let q_val = i32(nibble | (qh_bits << 4u)) - 32;
+                    let sc = sc_byte(base, scales_idx);
+                    let dd = d_val(base);
+                    return dd * f32(sc) * f32(q_val);
+                }
+
+                @compute @workgroup_size(64)
+                fn matvec_q6k(@builtin(workgroup_id) wid: vec3<u32>,
+                              @builtin(local_invocation_id) lid: vec3<u32>) {
+                    let row = wid.x + wid.y * d.vocab_x;
+                    let tid = lid.x;
+                    let dim = d.dim;
+                    if (row >= d.vocab) { return; }
+                    let blocks_per_row = dim / 256u;
+                    /* 256-byte stride = 64 u32 words per block. */
+                    let words_per_row = blocks_per_row * 64u;
+                    let row_base = row * words_per_row;
+                    var sum: f32 = 0.0;
+                    var e: u32 = tid;
+                    loop {
+                        if (e >= dim) { break; }
+                        let blk = row_base + (e / 256u) * 64u;
+                        sum = sum + dq_q6k(blk, e % 256u) * xin[e];
+                        e = e + 64u;
+                    }
+                    partial[tid] = sum;
+                    workgroupBarrier();
+                    if (tid == 0u) {
+                        var s: f32 = 0.0;
+                        for (var k: u32 = 0u; k < 64u; k = k + 1u) {
+                            s = s + partial[k];
+                        }
+                        logits[row] = s;
+                    }
+                }
+            `;
+            try {
+                const lmModQ6K = device.createShaderModule({ code: lmHeadQ6KCode });
+                window.__gpuLMHeadQ6KPipeline = device.createComputePipeline({
+                    layout: 'auto',
+                    compute: { module: lmModQ6K, entryPoint: 'matvec_q6k' },
+                });
+            } catch (e) {
+                console.warn('[wgpu] Q6_K LM head pipeline failed:', String(e));
+                window.__gpuLMHeadQ6KPipeline = null;
+            }
+
             /* Fused FFN block for Llama Q4_K_M models. Stages:
              *   A) rmsnorm(x, ffn_norm) → xb_scratch
              *   B) gate = Q4_K matvec(W_gate, xb_scratch) → gate_scratch
@@ -3196,6 +3297,116 @@ EM_JS(int, js_wgpu_lm_head_kick, (const float *xin, const float *w_norm,
     })();
     return 1;
 });
+
+/* ── Q6_K LM head dispatch ────────────────────────────────────────
+ *
+ * Llama 1B's token_embd (tied with output) is Q6_K. The CPU matvec
+ * over 128K rows × 2048 dim is ~150ms/tok at WASM AVX2 — the last
+ * dominant CPU bottleneck after the multi-WG attn+FFN moves to GPU.
+ *
+ * The shader expects the Q6_K weights padded to 256-byte stride per
+ * block (vs the native 210-byte block) so all reads are u32-aligned.
+ * JS does the repack once at upload time; the padded buffer lives in
+ * VRAM for the lifetime of the model.
+ *
+ * One workgroup per vocab row, 64 threads coop dot. Dispatched in 2D
+ * since vocab=128256 exceeds the 65535 single-dim limit.
+ *
+ * Input: caller-provided x_norm (already rmsnormed on CPU — cheap
+ * for dim=2048). Output: logits[vocab]. */
+EM_JS(int, js_wgpu_lm_head_q6k_kick, (
+    const float *x_norm, const void *w, float *logits,
+    int dim, int vocab, int w_id), {
+    window.__gpuOpDone = false; window.__gpuOpOK = false;
+    if (!window.__gpuReady || !window.__gpuLMHeadQ6KPipeline) {
+        window.__gpuOpDone = true; return 0;
+    }
+    (async function() {
+        try {
+            const dev = window.__gpuDevice;
+            const pipe = window.__gpuLMHeadQ6KPipeline;
+            if (!window.__gpuLMHQ6KCache) window.__gpuLMHQ6KCache = new Map();
+            const key = dim + 'x' + vocab;
+            let s = window.__gpuLMHQ6KCache.get(key);
+            const blocks_per_row = (dim / 256) | 0;
+            const padded_row_bytes = blocks_per_row * 256;
+            const total_w_bytes = vocab * padded_row_bytes;
+            if (!s) {
+                s = {
+                    wBuf: dev.createBuffer({ size: total_w_bytes,
+                        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST }),
+                    xBuf: dev.createBuffer({ size: dim * 4,
+                        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST }),
+                    outBuf: dev.createBuffer({ size: vocab * 4,
+                        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC }),
+                    dBuf: dev.createBuffer({ size: 16,
+                        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST }),
+                    rBuf: dev.createBuffer({ size: vocab * 4,
+                        usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST }),
+                    bg: null, last_w: 0,
+                };
+                s.bg = dev.createBindGroup({
+                    layout: pipe.getBindGroupLayout(0),
+                    entries: [
+                        { binding: 0, resource: { buffer: s.wBuf } },
+                        { binding: 1, resource: { buffer: s.xBuf } },
+                        { binding: 2, resource: { buffer: s.outBuf } },
+                        { binding: 3, resource: { buffer: s.dBuf } },
+                    ],
+                });
+                /* vocab_x ≤ 65535 (per-dim dispatch limit); vocab_y =
+                 * ceil(vocab / vocab_x). For Llama 1B (vocab=128256):
+                 * vocab_x=64128, vocab_y=2 → exact tiling. */
+                const vocab_x = Math.min(65535, vocab);
+                const vocab_y = Math.ceil(vocab / vocab_x);
+                dev.queue.writeBuffer(s.dBuf, 0,
+                    new Uint32Array([dim, vocab, vocab_x, 0]));
+                s.vocab_x = vocab_x;
+                s.vocab_y = vocab_y;
+                window.__gpuLMHQ6KCache.set(key, s);
+            }
+            /* Upload Q6_K weights ONCE per model — repack 210B/block
+             * → 256B/block to satisfy u32-aligned shader access. */
+            if (s.last_w !== w_id) {
+                const num_blocks = vocab * blocks_per_row;
+                const padded = new Uint8Array(total_w_bytes);
+                const src = HEAPU8.subarray(w, w + num_blocks * 210);
+                for (let i = 0; i < num_blocks; i++) {
+                    padded.set(src.subarray(i * 210, i * 210 + 210), i * 256);
+                }
+                dev.queue.writeBuffer(s.wBuf, 0, padded);
+                s.last_w = w_id;
+            }
+            /* Upload x_norm. */
+            dev.queue.writeBuffer(s.xBuf, 0,
+                HEAPU8.slice(x_norm, x_norm + dim * 4));
+            const enc = dev.createCommandEncoder();
+            const pass = enc.beginComputePass();
+            pass.setPipeline(pipe);
+            pass.setBindGroup(0, s.bg);
+            pass.dispatchWorkgroups(s.vocab_x, s.vocab_y);
+            pass.end();
+            enc.copyBufferToBuffer(s.outBuf, 0, s.rBuf, 0, vocab * 4);
+            dev.queue.submit([enc.finish()]);
+            await s.rBuf.mapAsync(GPUMapMode.READ);
+            HEAPU8.set(new Uint8Array(s.rBuf.getMappedRange()), logits);
+            s.rBuf.unmap();
+            window.__gpuOpOK = true;
+        } catch (e) { window.__gpuError = String(e); }
+        window.__gpuOpDone = true;
+    })();
+    return 1;
+});
+
+int wasm_wgpu_lm_head_q6k(const float *x_norm, const void *w,
+                           float *logits, int dim, int vocab)
+{
+    if (!js_wgpu_ready()) return -1;
+    int w_id = (int)((uint64_t)w & 0x7FFFFFFF);
+    js_wgpu_lm_head_q6k_kick(x_norm, w, logits, dim, vocab, w_id);
+    while (!js_wgpu_op_done()) emscripten_sleep(1);
+    return js_wgpu_op_ok() ? 0 : -1;
+}
 
 /* ── Fused QKV: 3 matvecs sharing the same input in one dispatch.
  * Caches weight buffers by (W_q, W_k, W_v) pointer triple so a

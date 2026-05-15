@@ -6307,6 +6307,15 @@ q4kgdone:
                 sh_puts(v ? "[llama] GPU fused-attn ENABLED (F32 attn, Llama 2/3 RoPE)\n"
                           : "[llama] GPU fused-attn disabled\n");
             }
+            else if (strcmp(argv[1], "llama_lm_head") == 0) {
+                /* Move the final Q6_K vocab matvec to the GPU. Saves
+                 * ~150 ms/tok on Llama 1B by offloading the last
+                 * dominant CPU bottleneck. */
+                extern bool g_llama_use_gpu_lm_head;
+                g_llama_use_gpu_lm_head = (v != 0);
+                sh_puts(v ? "[llama] GPU LM head ENABLED (Q6_K matvec)\n"
+                          : "[llama] GPU LM head disabled\n");
+            }
             else if (strcmp(argv[1], "llama_ffn") == 0) {
                 /* Fused Q4_K FFN compute: rmsnorm + gate/up matvec +
                  * SwiGLU + down matvec + residual, all in one GPU
