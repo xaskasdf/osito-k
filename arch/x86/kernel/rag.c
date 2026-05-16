@@ -1,621 +1,839 @@
 /*
- * rag.c — Browser-RAG client for osito-k.
+ * rag.c — Path 1 (network-attached) RAG retrieval for osito-a.
  *
- * Talks to factory.naranjositos.tech/rag/<corpus>/ for the index shards
- * and rag.naranjositos.tech/embed for the Cloudflare Workers AI
- * bge-large embedder.
+ * Reads docs/rag-integration-guide.md for the wire layout and
+ * algorithm; this file is the in-kernel implementation. Single
+ * coarse pipeline per query:
  *
- * Path 1: network-attached. Pure fetch loop — no caching yet. After we
- * verify it works we can persist centroids + hot shards to OsitoFS for
- * a hybrid offline mode.
+ *   1. POST /embed → 1024 fp32 (L2-normalized; the edge already
+ *      normalizes, but we re-normalize defensively).
+ *   2. Score against K fp32 centroids via dot product → top-N
+ *      clusters.
+ *   3. Binarize the query (sign-bit-pack 1024 dims → 128 bytes).
+ *   4. Fetch each top-N cluster blob, popcount the XOR of every
+ *      row's binary embedding vs the query, maintain a top-K
+ *      ranked array.
+ *   5. Fetch the cluster's texts/NNNN.jsonl, linear-scan for
+ *      each top-K row_id, copy title + text into the result.
  *
- * Algorithm (per query):
- *   1. POST query to /embed → 1024 f32 vector (already L2-normalized
- *      by the Worker; we re-normalize defensively).
- *   2. Score against K centroids (dot product).
- *   3. Pick top-N clusters.
- *   4. Sign-binarize the query into 128 bytes.
- *   5. Fetch top-N cluster blobs in series (Asyncify makes parallel
- *      tricky to write; series is plenty fast for N=4).
- *   6. Hamming top-K across all fetched rows.
- *   7. Fetch each contributing cluster's texts/NNNN.jsonl and resolve
- *      row_id → {title, text}.
+ * Embedder match: the corpus on R2 was embedded with BAAI/bge-large-
+ * en-v1.5 and the query MUST be embedded in the same space, so we
+ * always go through the edge /embed endpoint (NOT through the
+ * kernel's local mxbai embedder — different vector space, cosine is
+ * meaningless across them).
  *
- * Output rows are returned as a single buffer of newline-separated
- * "title :: text" pairs, ready to splice into a chat prompt.
+ * Trust: both endpoints are CF-fronted with chains that share the
+ * GTS WE1 intermediate cert we already pin (kernel/cert_pin.c).
+ * No new pinning needed — chain walking matches on intermediate.
  */
 
-#include <stdint.h>
-#include <stddef.h>
-#include <string.h>
+#include "../include/types.h"
+#include "rag.h"
+#include "http.h"
 
-extern void serial_puts(const char *);
-extern void serial_putdec(uint64_t);
-extern void *malloc(unsigned long);
-extern void  free(void *);
+extern void   serial_puts(const char *s);
+extern void   serial_putdec(uint64_t v);
+extern void  *kmalloc(uint64_t);
+extern void   kfree(void *);
+extern float  f16_to_f32(uint16_t h);
+extern float  sqrtf_bare(float);
 
-extern uint8_t *wasm_url_fetch(const char *url, int *out_size);
-extern uint8_t *wasm_http_post_json(const char *url, const char *body, int *out_size);
+/* VFS — we try osfs2 first for every shard fetch.  The bake script
+ * at tools/rag-bake.sh pre-installs `rag/<corpus>/...` into the
+ * image; reading locally skips the multi-HTTPS path that the kernel
+ * TCP stack currently can't handle (see docs/rag-native.md). */
+typedef struct { uint32_t fs_version; uint32_t ino; void *data; uint64_t size; } vfs_stub_t;
+extern bool  vfs_find(const char *path, int mode, void *out);
+extern int   vfs_read(void *node, uint64_t offset, void *buf, uint64_t len);
 
-extern float f16_to_f32(uint16_t h);
-extern double sqrt(double);
+/* osfs2 write path — for the `rag_refresh` agent tool. */
+extern bool  osfs2_is_mounted(void);
+extern int   osfs2_delete(const char *name);
+extern void *osfs2_create(const char *name, uint64_t size);
+extern int   osfs2_write(void *file, uint64_t offset, const void *buf, uint64_t len);
 
-/* OsitoFS for shard caching — accessed by string name. */
-extern void    *osfs2_find(const char *name);
-extern void    *osfs2_create(const char *name, uint64_t size);
-extern int      osfs2_read(void *file, uint64_t offset, void *buf, uint64_t len);
-extern int      osfs2_write(void *file, uint64_t offset, const void *buf, uint64_t len);
-extern uint64_t osfs2_file_size(void *file);
-extern int      osfs2_delete(const char *name);
-extern int      osfs2_is_mounted(void);
+#define RAG_FACTORY_HOST    "factory.naranjositos.tech"
+#define RAG_EMBED_HOST      "rag.naranjositos.tech"
+#define RAG_DEFAULT_TOPN    4
+#define RAG_DIM             1024
+#define RAG_DIM_BYTES       128         /* 1024 / 8, sign-packed binary */
+#define RAG_STRIDE_BYTES    132         /* 4 byte row_id + 128 byte binary */
 
-/* Fetch a URL, but cache the body to OsitoFS at `fs_name` so subsequent
- * calls (across page reloads, via IndexedDB persistence) skip the
- * network. Caller frees the returned buffer. */
-static uint8_t *rag_fetch_cached(const char *url, const char *fs_name, int *out_size)
-{
-    /* Cache hit path. */
-    if (osfs2_is_mounted()) {
-        void *f = osfs2_find(fs_name);
-        if (f) {
-            uint64_t sz = osfs2_file_size(f);
-            if (sz > 0 && sz < (uint64_t)64 * 1024 * 1024) {
-                uint8_t *buf = (uint8_t *)malloc((size_t)sz);
-                if (buf && osfs2_read(f, 0, buf, sz) == 0) {
-                    if (out_size) *out_size = (int)sz;
-                    return buf;
-                }
-                if (buf) free(buf);
-            }
-        }
+/* ── module state ───────────────────────────────────────────── */
+
+static char       g_corpus[32];
+static uint32_t   g_n_clusters;
+static uint32_t   g_dim;
+static uint32_t   g_stride_bytes;
+static float     *g_centroids;      /* g_n_clusters * g_dim fp32 */
+static bool       g_ready;
+
+/* ── tiny utilities (per-module to keep coupling minimal) ───── */
+
+static uint32_t kstrlen(const char *s) {
+    uint32_t n = 0; while (s && s[n]) n++; return n;
+}
+static int kstrncmp(const char *a, const char *b, uint32_t n) {
+    for (uint32_t i = 0; i < n; i++) {
+        if (a[i] != b[i]) return (uint8_t)a[i] - (uint8_t)b[i];
+        if (a[i] == 0) return 0;
     }
-    /* Cache miss: hit the network. */
-    int sz = 0;
-    uint8_t *blob = wasm_url_fetch(url, &sz);
-    if (!blob) return NULL;
-    /* Store to OsitoFS (best effort — if write fails we still return
-     * the network buffer). */
-    if (osfs2_is_mounted() && sz > 0) {
-        /* Replace any stale copy. */
-        osfs2_delete(fs_name);
-        void *f = osfs2_create(fs_name, (uint64_t)sz);
-        if (f) osfs2_write(f, 0, blob, (uint64_t)sz);
+    return 0;
+}
+static const char *kstrnstr(const char *hay, uint32_t hlen, const char *needle) {
+    uint32_t nl = kstrlen(needle);
+    if (nl == 0 || nl > hlen) return 0;
+    for (uint32_t i = 0; i + nl <= hlen; i++) {
+        if (kstrncmp(hay + i, needle, nl) == 0) return hay + i;
     }
-    if (out_size) *out_size = sz;
-    return blob;
+    return 0;
 }
 
-#define RAG_DIM       1024
-#define RAG_DIM_BYTES (RAG_DIM / 8)   /* 128 bytes packed binary */
-#define RAG_TOP_N      4              /* clusters fetched per query */
-#define RAG_TOP_K      4              /* hits returned to LM */
-
-/* ── Query cache (saves ~88 ms /embed round-trip for repeat queries).
- *
- * Stored persistently on OsitoFS as rag/qc/<hash>.bin (4100 bytes per
- * entry: 4-byte query length + up to 4096 bytes of query bytes is in
- * the FS name; the bin holds qvec). Survives reload via IndexedDB.
- * Exact-match only — semantic-near-match would use llama_embed_text
- * but the embed space differs from bge-large, so reuse would be
- * lossy. Exact match is 100% safe.
- *
- * Hash: djb2 over query bytes, truncated to 32 bits, hex-encoded.
- */
-static uint32_t qc_hash(const char *s)
-{
-    uint32_t h = 5381;
-    for (const char *p = s; *p; p++)
-        h = ((h << 5) + h) ^ (uint8_t)*p;
-    return h;
-}
-
-static void qc_path(uint32_t h, char *out, int max)
-{
-    const char *hex = "0123456789abcdef";
-    int n = 0;
-    const char *prefix = "rag/qc/";
-    for (const char *p = prefix; *p && n < max - 1; p++) out[n++] = *p;
-    for (int i = 7; i >= 0 && n < max - 1; i--)
-        out[n++] = hex[(h >> (i * 4)) & 0xF];
-    if (n < max - 4) { out[n++] = '.'; out[n++] = 'b'; out[n++] = 'i'; out[n++] = 'n'; }
-    out[n] = 0;
-}
-
-/* Return 1 + writes qvec on cache hit; 0 on miss. */
-static int qc_lookup(const char *query, float *qvec)
-{
-    if (!osfs2_is_mounted()) return 0;
-    char path[64];
-    qc_path(qc_hash(query), path, sizeof(path));
-    void *f = osfs2_find(path);
-    if (!f) return 0;
-    uint64_t sz = osfs2_file_size(f);
-    if (sz != RAG_DIM * sizeof(float)) return 0;
-    return osfs2_read(f, 0, qvec, sz) == 0 ? 1 : 0;
-}
-
-static void qc_store(const char *query, const float *qvec)
-{
-    if (!osfs2_is_mounted()) return;
-    char path[64];
-    qc_path(qc_hash(query), path, sizeof(path));
-    osfs2_delete(path);  /* replace any prior */
-    void *f = osfs2_create(path, RAG_DIM * sizeof(float));
-    if (f) osfs2_write(f, 0, qvec, RAG_DIM * sizeof(float));
-}
-
-/* Very small JSON-like extractor: find "key" then return the float
- * after the colon. Returns 0.0 if not found. */
-static float json_num_after(const char *s, const char *key)
-{
-    const char *p = strstr(s, key);
-    if (!p) return 0.0f;
-    p += strlen(key);
-    while (*p && *p != ':') p++;
-    if (!*p) return 0.0f;
-    p++;
-    while (*p == ' ' || *p == '\t') p++;
-    /* Naive parseFloat. */
-    float sign = 1.0f;
-    if (*p == '-') { sign = -1.0f; p++; }
-    float n = 0.0f, frac = 0.0f, fdiv = 1.0f;
-    int saw_dot = 0;
-    while (*p) {
-        if (*p >= '0' && *p <= '9') {
-            if (!saw_dot) n = n * 10.0f + (float)(*p - '0');
-            else { frac = frac * 10.0f + (float)(*p - '0'); fdiv *= 10.0f; }
-            p++;
-        } else if (*p == '.') { saw_dot = 1; p++; }
-        else break;
+/* Build a path string into `buf` from segments. Returns bytes
+ * written (excluding NUL). Stops cleanly at cap-1. */
+static uint32_t kpath_join(char *buf, uint32_t cap, const char *const *segs) {
+    uint32_t off = 0;
+    for (int i = 0; segs[i]; i++) {
+        for (uint32_t k = 0; segs[i][k] && off + 1 < cap; k++)
+            buf[off++] = segs[i][k];
     }
-    /* Handle exponent for the embed response (scientific notation). */
-    float val = sign * (n + frac / fdiv);
-    if (*p == 'e' || *p == 'E') {
+    if (off < cap) buf[off] = 0;
+    return off;
+}
+static uint32_t kappend_u32_pad4(char *buf, uint32_t off, uint32_t cap, uint32_t v) {
+    /* 4-digit zero-padded, e.g. 17 -> "0017" — matches the shard
+     * file-name convention. */
+    char tmp[5]; tmp[0] = (char)('0' + (v / 1000) % 10);
+                 tmp[1] = (char)('0' + (v /  100) % 10);
+                 tmp[2] = (char)('0' + (v /   10) % 10);
+                 tmp[3] = (char)('0' + (v        ) % 10);
+                 tmp[4] = 0;
+    for (int i = 0; i < 4 && off + 1 < cap; i++) buf[off++] = tmp[i];
+    return off;
+}
+
+/* JSON helpers — same scan-based approach used by the OAI server. */
+
+static int json_find_int_in(const char *body, uint32_t len, const char *key) {
+    char needle[64];
+    uint32_t nl = 0;
+    needle[nl++] = '"';
+    for (uint32_t i = 0; key[i] && nl + 4 < sizeof needle; i++) needle[nl++] = key[i];
+    needle[nl++] = '"'; needle[nl] = 0;
+    const char *m = kstrnstr(body, len, needle);
+    if (!m) return -1;
+    uint32_t p = (uint32_t)(m - body) + nl;
+    while (p < len && (body[p] == ' ' || body[p] == ':' ||
+                         body[p] == '\t' || body[p] == '\n')) p++;
+    int v = 0, got = 0;
+    while (p < len && body[p] >= '0' && body[p] <= '9') {
+        v = v * 10 + (body[p] - '0'); p++; got = 1;
+    }
+    return got ? v : -1;
+}
+
+/* Parse a float starting at *p (advance *p). Sets *ok. Subset of
+ * the JSON-number grammar — enough for "-1.234e-5" style. */
+static float kparse_float(const char **p_io, const char *end, int *ok) {
+    const char *p = *p_io;
+    int sign = 1;
+    if (p < end && *p == '-') { sign = -1; p++; }
+    else if (p < end && *p == '+') p++;
+    float v = 0.0f; int digits = 0;
+    while (p < end && *p >= '0' && *p <= '9') {
+        v = v * 10.0f + (float)(*p - '0'); p++; digits++;
+    }
+    if (p < end && *p == '.') {
         p++;
-        int esign = 1;
-        if (*p == '-') { esign = -1; p++; }
-        else if (*p == '+') p++;
-        int e = 0;
-        while (*p >= '0' && *p <= '9') { e = e * 10 + (*p - '0'); p++; }
-        float mult = 1.0f;
-        for (int i = 0; i < e; i++) mult *= 10.0f;
-        if (esign < 0) val /= mult;
-        else            val *= mult;
+        float scale = 0.1f;
+        while (p < end && *p >= '0' && *p <= '9') {
+            v += (float)(*p - '0') * scale;
+            scale *= 0.1f; p++; digits++;
+        }
     }
-    return val;
+    if (p < end && (*p == 'e' || *p == 'E')) {
+        p++;
+        int es = 1;
+        if (p < end && *p == '-') { es = -1; p++; }
+        else if (p < end && *p == '+') p++;
+        int e = 0;
+        while (p < end && *p >= '0' && *p <= '9') { e = e*10 + (*p - '0'); p++; }
+        float mul = 1.0f;
+        for (int i = 0; i < e; i++) mul *= 10.0f;
+        v = (es < 0) ? (v / mul) : (v * mul);
+    }
+    *p_io = p;
+    if (ok) *ok = digits > 0 ? 1 : 0;
+    return sign * v;
 }
 
-static int parse_embed_response(const char *json, float *out, int max)
+/* Decode a JSON-escaped string body into `out` (NUL-terminated).
+ * `p_io` points at the opening quote on entry; advances past the
+ * closing quote. Returns bytes copied. */
+static uint32_t kjson_decode_str(const char *body, uint32_t len,
+                                   uint32_t *p_io, char *out, uint32_t cap)
 {
-    /* {"model":"...","dim":1024,"data":[[f, f, ...]],"edge_ms":...}
-     * Walk to the first '[' inside "data", then to the inner '[',
-     * then parse floats until the inner ']'. */
-    const char *p = strstr(json, "\"data\"");
-    if (!p) return -1;
-    p = strchr(p, '[');
-    if (!p) return -1;
-    p = strchr(p + 1, '[');   /* inner */
-    if (!p) return -1;
+    uint32_t p = *p_io;
+    if (p >= len || body[p] != '"') return 0;
     p++;
-    int n = 0;
-    while (*p && *p != ']' && n < max) {
-        while (*p == ' ' || *p == ',' || *p == '\n' || *p == '\t') p++;
-        if (*p == ']') break;
-        float sign = 1.0f;
-        if (*p == '-') { sign = -1.0f; p++; }
-        float a = 0.0f, frac = 0.0f, fdiv = 1.0f;
-        int saw_dot = 0;
-        while (*p && *p != ',' && *p != ']') {
-            if (*p >= '0' && *p <= '9') {
-                if (!saw_dot) a = a * 10.0f + (float)(*p - '0');
-                else { frac = frac * 10.0f + (float)(*p - '0'); fdiv *= 10.0f; }
-            } else if (*p == '.') saw_dot = 1;
-            else if (*p == 'e' || *p == 'E') {
-                p++;
-                int esign = 1;
-                if (*p == '-') { esign = -1; p++; }
-                else if (*p == '+') p++;
-                int e = 0;
-                while (*p >= '0' && *p <= '9') { e = e * 10 + (*p - '0'); p++; }
-                float mult = 1.0f;
-                for (int i = 0; i < e; i++) mult *= 10.0f;
-                if (esign < 0) a /= mult; else a *= mult;
-                p--; /* compensate for outer p++ */
+    uint32_t n = 0;
+    while (p < len && body[p] != '"' && n + 1 < cap) {
+        char c = body[p];
+        if (c == '\\' && p + 1 < len) {
+            char esc = body[p + 1];
+            switch (esc) {
+                case 'n': out[n++] = '\n'; break;
+                case 'r': out[n++] = '\r'; break;
+                case 't': out[n++] = '\t'; break;
+                case '"': out[n++] = '"';  break;
+                case '\\':out[n++] = '\\'; break;
+                case '/': out[n++] = '/';  break;
+                case 'u': p += 4; break;       /* skip \uXXXX */
+                default:  out[n++] = esc;  break;
             }
-            p++;
+            p += 2;
+        } else {
+            out[n++] = c; p++;
         }
-        out[n++] = sign * (a + frac / fdiv);
     }
+    if (p < len && body[p] == '"') p++;
+    out[n] = 0;
+    *p_io = p;
     return n;
 }
 
-static void l2_normalize(float *v, int n)
-{
-    float ssq = 0.0f;
-    for (int i = 0; i < n; i++) ssq += v[i] * v[i];
-    if (ssq <= 0.0f) return;
-    float inv = 1.0f / (float)sqrt((double)ssq);
-    for (int i = 0; i < n; i++) v[i] *= inv;
+/* ── math kernels ──────────────────────────────────────────── */
+
+static void l2_normalize(float *v, uint32_t dim) {
+    float s = 0.0f;
+    for (uint32_t i = 0; i < dim; i++) s += v[i] * v[i];
+    if (s <= 0.0f) return;
+    float inv = 1.0f / sqrtf_bare(s);
+    for (uint32_t i = 0; i < dim; i++) v[i] *= inv;
 }
 
-static void score_centroids(const float *q, const uint16_t *c_fp16,
-                             int n_clusters, int dim, float *scores)
-{
-    for (int k = 0; k < n_clusters; k++) {
-        float s = 0.0f;
-        const uint16_t *row = c_fp16 + (uint64_t)k * dim;
-        for (int d = 0; d < dim; d++)
-            s += q[d] * f16_to_f32(row[d]);
-        scores[k] = s;
-    }
+static float dot_f32(const float *a, const float *b, uint32_t dim) {
+    float s = 0.0f;
+    for (uint32_t i = 0; i < dim; i++) s += a[i] * b[i];
+    return s;
 }
 
-static void top_n_indices(const float *scores, int n_total, int n_top,
-                           int *out_idx)
-{
-    /* Naive: scan for max n_top times. n_total = 256 or 1024,
-     * n_top ≤ 16. Plenty fast. */
-    for (int t = 0; t < n_top; t++) out_idx[t] = -1;
-    for (int t = 0; t < n_top; t++) {
-        int best = -1;
-        float bv = -1e30f;
-        for (int k = 0; k < n_total; k++) {
-            /* Skip already-picked. */
-            int taken = 0;
-            for (int j = 0; j < t; j++) if (out_idx[j] == k) { taken = 1; break; }
-            if (taken) continue;
-            if (scores[k] > bv) { bv = scores[k]; best = k; }
-        }
-        out_idx[t] = best;
-    }
-}
-
-static void binarize_query(const float *q, int dim, uint8_t *out)
-{
-    /* MSB-first within each byte, to match the index. */
-    memset(out, 0, (size_t)dim / 8);
-    for (int i = 0; i < dim; i++) {
-        if (q[i] > 0.0f) {
-            out[i >> 3] |= (uint8_t)(0x80 >> (i & 7));
+/* Pick top-N indices in `scores` by descending value. */
+static void topn_indices(const float *scores, uint32_t k_total,
+                          uint32_t n, uint32_t *out, float *out_score) {
+    for (uint32_t i = 0; i < n; i++) { out[i] = (uint32_t)-1; out_score[i] = -1e30f; }
+    for (uint32_t i = 0; i < k_total; i++) {
+        float s = scores[i];
+        for (uint32_t k = 0; k < n; k++) {
+            if (s > out_score[k]) {
+                for (int j = (int)n - 1; j > (int)k; j--) {
+                    out[j] = out[j-1]; out_score[j] = out_score[j-1];
+                }
+                out[k] = i; out_score[k] = s;
+                break;
+            }
         }
     }
 }
 
-static int hamming_distance(const uint8_t *a, const uint8_t *b, int bytes)
-{
-    int d = 0;
-    for (int i = 0; i < bytes; i++) {
-        uint8_t x = a[i] ^ b[i];
-        /* __builtin_popcount expects unsigned int. */
-        d += __builtin_popcount((unsigned)x);
+/* Sign-bit-pack 1024 floats into 128 bytes, MSB-first within byte
+ * (matches the corpus's binary encoding per the integration guide). */
+static void binarize_query(const float *v, uint32_t dim, uint8_t *out) {
+    for (uint32_t i = 0; i < dim / 8; i++) {
+        uint8_t b = 0;
+        for (int k = 0; k < 8; k++) {
+            float f = v[i * 8 + k];
+            if (f >= 0.0f) b |= (uint8_t)(0x80 >> k);
+        }
+        out[i] = b;
+    }
+}
+
+/* Hamming distance via POPCNT.  Returns the number of bit positions
+ * where the two 128-byte (1024-bit) embeddings differ. Smaller is
+ * more similar; we'll convert to a similarity score downstream.
+ *
+ * __builtin_popcountll would compile to a libgcc helper
+ * (__popcountdi2) we don't link; the inline `popcntq` instruction
+ * is present on every CPU we run on (Sandy Bridge+/Bulldozer+). */
+static inline uint64_t popcnt64(uint64_t x) {
+    uint64_t r;
+    __asm__("popcntq %1, %0" : "=r"(r) : "rm"(x));
+    return r;
+}
+static uint32_t hamming_128(const uint8_t *a, const uint8_t *b) {
+    const uint64_t *A = (const uint64_t *)a;
+    const uint64_t *B = (const uint64_t *)b;
+    uint32_t d = 0;
+    for (int i = 0; i < 16; i++) {
+        d += (uint32_t)popcnt64(A[i] ^ B[i]);
     }
     return d;
 }
 
-typedef struct {
-    int      dist;       /* hamming distance (smaller = better) */
-    uint32_t row_id;
-    int      cluster_idx; /* index into top_clusters[] */
-} rag_hit_t;
+/* ── shard fetch — VFS first, HTTPS fallback ──────────────── */
 
-static void topk_insert(rag_hit_t *topk, int k, int dist, uint32_t row_id,
-                         int cluster_idx)
-{
-    /* Find worst (largest dist) slot. */
-    int worst = 0;
-    for (int i = 1; i < k; i++)
-        if (topk[i].dist > topk[worst].dist) worst = i;
-    if (dist < topk[worst].dist) {
-        topk[worst].dist = dist;
-        topk[worst].row_id = row_id;
-        topk[worst].cluster_idx = cluster_idx;
-    }
-}
-
-static int topk_sort_cmp(const rag_hit_t *a, const rag_hit_t *b)
-{
-    return a->dist - b->dist;
-}
-
-/* Build the URL "https://factory.naranjositos.tech/rag/<corpus>/<path>". */
-static void build_rag_url(char *dst, int dst_max,
-                          const char *corpus, const char *suffix)
-{
-    int n = 0;
-    const char *prefix = "https://factory.naranjositos.tech/rag/";
-    for (const char *p = prefix; *p && n < dst_max - 1; p++) dst[n++] = *p;
-    for (const char *p = corpus; *p && n < dst_max - 1; p++) dst[n++] = *p;
-    if (n < dst_max - 1) dst[n++] = '/';
-    for (const char *p = suffix; *p && n < dst_max - 1; p++) dst[n++] = *p;
-    dst[n] = 0;
-}
-
-/* For "clusters/NNNN.bin" / "texts/NNNN.jsonl" — 4-digit zero-padded. */
-static void cluster_path(char *dst, int max, const char *kind, int n, const char *ext)
-{
-    /* kind is "clusters" or "texts"; ext is ".bin" or ".jsonl". */
-    int p = 0;
-    for (const char *q = kind; *q && p < max - 1; q++) dst[p++] = *q;
-    if (p < max - 1) dst[p++] = '/';
-    if (p < max - 1) dst[p++] = (char)('0' + (n / 1000) % 10);
-    if (p < max - 1) dst[p++] = (char)('0' + (n / 100)  % 10);
-    if (p < max - 1) dst[p++] = (char)('0' + (n / 10)   % 10);
-    if (p < max - 1) dst[p++] = (char)('0' + n % 10);
-    for (const char *q = ext; *q && p < max - 1; q++) dst[p++] = *q;
-    dst[p] = 0;
-}
-
-/* Locate "title": "..." or "text": "..." in a JSONL line. Writes a
- * unescaped copy to out (max bytes). Returns length, 0 if not found. */
-static int json_string_value(const char *line, const char *key,
-                              char *out, int max)
-{
-    const char *p = strstr(line, key);
-    if (!p) return 0;
-    p += strlen(key);
-    while (*p && *p != ':') p++;
-    if (!*p) return 0;
-    while (*p && *p != '"') p++;
-    if (*p != '"') return 0;
-    p++;
-    int n = 0;
-    while (*p && *p != '"' && n < max - 1) {
-        if (*p == '\\' && *(p+1)) {
-            char c = *(p+1);
-            if      (c == 'n')  out[n++] = '\n';
-            else if (c == 't')  out[n++] = '\t';
-            else if (c == '"')  out[n++] = '"';
-            else if (c == '\\') out[n++] = '\\';
-            else { out[n++] = c; }
-            p += 2;
-        } else {
-            out[n++] = *p++;
-        }
-    }
-    out[n] = 0;
+/* Try to read `osfs_name` from osfs2 into `out` (up to `cap`).
+ * Returns bytes read on success, -1 on miss. */
+static int rag_vfs_get(const char *osfs_name, void *out, uint32_t cap) {
+    vfs_stub_t node;
+    if (!vfs_find(osfs_name, 0, &node)) return -1;
+    uint64_t want = node.size < cap ? node.size : (uint64_t)cap;
+    int n = vfs_read(&node, 0, out, want);
+    if (n < 0) return -1;
     return n;
 }
 
-/* Public entry point — populates `result` with formatted retrieval
- * output (one "Title :: Text" per line, up to RAG_TOP_K hits).
- * Returns 0 on success, -1 on any fetch failure. */
-int rag_retrieve(const char *corpus, const char *query,
-                 char *result, int result_max)
+/* ── HTTP wrappers ─────────────────────────────────────────── */
+
+/* GET a binary blob into `out`, expecting at most `cap` bytes. The
+ * connection is opened, fetched, drained, closed in one call —
+ * a stateless one-shot. Returns bytes received, or -1 on failure. */
+/* Sleep `ticks` ticks of the 100 Hz IDT timer. Used to space TCP
+ * connections in rag_http_get_blob — CF closes connections after
+ * each response, and the kernel's TCP slot cycles through TIME_WAIT
+ * faster than its slirp peer expects, causing the next handshake
+ * to lose its ServerHello on the wire. A short sleep between calls
+ * keeps each connection isolated. */
+extern uint64_t idt_get_ticks(void);
+static void rag_sleep_ticks(uint32_t n) {
+    uint64_t deadline = idt_get_ticks() + n;
+    while (idt_get_ticks() < deadline) {
+        __asm__ volatile ("sti; hlt" ::: "memory");
+    }
+}
+
+static int rag_http_get_blob(const char *hostname, const char *path,
+                              void *out, uint32_t cap)
 {
-    /* Sanity check: ensure result buffer is reasonable. */
-    if (!result || result_max < 64) return -1;
-    result[0] = 0;
+    /* Try up to 3 times with a 200 ms gap between attempts. CF
+     * closes the TCP after every response; back-to-back fresh
+     * handshakes occasionally lose the ServerHello on our slirp
+     * NAT path (documented in docs/session-2026-05-10.md as the
+     * rapid-fire TCP regression). Two retries cover the
+     * typical observed failure window without changing the TCP
+     * stack. */
+    for (int attempt = 0; attempt < 3; attempt++) {
+        if (attempt > 0) rag_sleep_ticks(200);    /* ~2 s — gives CF / slirp time to settle */
 
-    /* ── Step 1: fetch query embedding via Worker /embed. ── */
-    /* First check the persistent query cache (saves ~88 ms /embed
-     * round-trip on repeat queries; survives reload). */
-    float *qvec = (float *)malloc(RAG_DIM * sizeof(float));
-    if (!qvec) return -1;
-    if (qc_lookup(query, qvec)) {
-        serial_puts("[rag] qc hit, skipping /embed\n");
-        goto have_qvec;
-    }
-    serial_puts("[rag] embedding query...\n");
-    char body[1024];
-    int n = 0;
-    {
-        const char *p = "{\"query\":\"";
-        for (; *p && n < (int)sizeof(body) - 1; p++) body[n++] = *p;
-        for (const char *q = query; *q && n < (int)sizeof(body) - 4; q++) {
-            if (*q == '"' || *q == '\\') {
-                if (n < (int)sizeof(body) - 2) body[n++] = '\\';
-            }
-            if (n < (int)sizeof(body) - 2) body[n++] = *q;
-        }
-        body[n++] = '"';
-        body[n++] = '}';
-        body[n] = 0;
-    }
-    int emsz = 0;
-    uint8_t *embed_resp = wasm_http_post_json(
-        "https://rag.naranjositos.tech/embed", body, &emsz);
-    if (!embed_resp) {
-        serial_puts("[rag] /embed POST failed\n");
-        free(qvec);
-        return -1;
-    }
-    int got = parse_embed_response((const char *)embed_resp, qvec, RAG_DIM);
-    free(embed_resp);
-    if (got != RAG_DIM) {
-        serial_puts("[rag] embed parse failed, got=");
-        serial_putdec((uint64_t)got);
-        serial_puts("\n");
-        free(qvec);
-        return -1;
-    }
-    l2_normalize(qvec, RAG_DIM);
-    qc_store(query, qvec);
-have_qvec: ;
-
-    /* ── Step 2: fetch centroids (cached on OsitoFS after first call —
-     * survives reload via IndexedDB persistence so repeat queries
-     * skip this 524 KB download). ── */
-    serial_puts("[rag] fetch centroids...\n");
-    char url[256], fs_path[128];
-    build_rag_url(url, sizeof(url), corpus, "centroids.fp16.bin");
-    int fn = 0;
-    const char *fp = "rag/";
-    for (const char *q = fp; *q && fn < (int)sizeof(fs_path) - 1; q++) fs_path[fn++] = *q;
-    for (const char *q = corpus; *q && fn < (int)sizeof(fs_path) - 1; q++) fs_path[fn++] = *q;
-    const char *cs = "/centroids.fp16.bin";
-    for (const char *q = cs; *q && fn < (int)sizeof(fs_path) - 1; q++) fs_path[fn++] = *q;
-    fs_path[fn] = 0;
-    int csz = 0;
-    uint8_t *c_buf = rag_fetch_cached(url, fs_path, &csz);
-    if (!c_buf) { serial_puts("[rag] centroids fetch failed\n"); free(qvec); return -1; }
-    int n_clusters = csz / (RAG_DIM * 2);
-
-    /* ── Step 3: score centroids, pick top-N. ── */
-    float *scores = (float *)malloc((size_t)n_clusters * sizeof(float));
-    if (!scores) {
-        serial_puts("[rag] OOM allocating scores\n");
-        free(c_buf); free(qvec);
-        return -1;
-    }
-    score_centroids(qvec, (const uint16_t *)c_buf, n_clusters, RAG_DIM, scores);
-    int top_clusters[RAG_TOP_N];
-    top_n_indices(scores, n_clusters, RAG_TOP_N, top_clusters);
-    serial_puts("[rag] top clusters: ");
-    for (int i = 0; i < RAG_TOP_N; i++) {
-        serial_putdec((uint64_t)top_clusters[i]);
-        serial_puts(" ");
-    }
-    serial_puts("\n");
-    free(scores);
-    free(c_buf);
-
-    /* ── Step 4: binarize query. ── */
-    uint8_t qubin[RAG_DIM_BYTES];
-    binarize_query(qvec, RAG_DIM, qubin);
-    free(qvec);
-
-    /* ── Step 5-6: fetch top-N cluster blobs + accumulate hamming top-K. ── */
-    rag_hit_t topk[RAG_TOP_K];
-    for (int i = 0; i < RAG_TOP_K; i++) { topk[i].dist = 99999; topk[i].row_id = 0; topk[i].cluster_idx = -1; }
-
-    int hits_found = 0;
-    for (int c = 0; c < RAG_TOP_N; c++) {
-        int cluster_id = top_clusters[c];
-        char path[64];
-        cluster_path(path, sizeof(path), "clusters", cluster_id, ".bin");
-        build_rag_url(url, sizeof(url), corpus, path);
-        /* Cache cluster shard by full fs path. */
-        char shard_fs[128]; int sf = 0;
-        const char *pre = "rag/";
-        for (const char *q = pre; *q && sf < (int)sizeof(shard_fs) - 1; q++) shard_fs[sf++] = *q;
-        for (const char *q = corpus; *q && sf < (int)sizeof(shard_fs) - 1; q++) shard_fs[sf++] = *q;
-        if (sf < (int)sizeof(shard_fs) - 1) shard_fs[sf++] = '/';
-        for (const char *q = path; *q && sf < (int)sizeof(shard_fs) - 1; q++) shard_fs[sf++] = *q;
-        shard_fs[sf] = 0;
-        int bsz = 0;
-        uint8_t *blob = rag_fetch_cached(url, shard_fs, &bsz);
-        if (!blob) {
-            serial_puts("[rag] cluster fetch failed (cluster ");
-            serial_putdec((uint64_t)cluster_id);
-            serial_puts(", bytes=0 — heap OOM or network fail?)\n");
+        http_session_t s;
+        if (http_open(&s, hostname) < 0) {
+            serial_puts("[RAG] http_open failed (attempt ");
+            serial_putdec((uint64_t)attempt);
+            serial_puts(")\n");
             continue;
         }
-        uint32_t count = *(uint32_t *)blob;
-        const uint8_t *p = blob + 4;
-        int stride = 4 + RAG_DIM_BYTES;  /* 132 */
-        for (uint32_t r = 0; r < count; r++) {
-            uint32_t row_id = *(const uint32_t *)p;
-            const uint8_t *ubin = p + 4;
-            int dist = hamming_distance(qubin, ubin, RAG_DIM_BYTES);
-            topk_insert(topk, RAG_TOP_K, dist, row_id, c);
-            hits_found++;
-            p += stride;
+        http_response_t resp;
+        if (http_request(&s, "GET", path, hostname, 0, 0, 0, &resp) < 0 ||
+            resp.status_code != 200) {
+            http_close(&s);
+            continue;
         }
-        free(blob);
+        int n = http_read_body_full(&s, &resp, out, cap);
+        http_close(&s);
+        if (n > 0) return n;
     }
-    if (hits_found == 0) {
-        serial_puts("[rag] WARNING: no cluster rows processed — retrieval empty\n");
-    }
-    /* Sort topk ascending. Insertion sort, only 4 elems. */
-    for (int i = 1; i < RAG_TOP_K; i++) {
-        for (int j = i; j > 0 && topk_sort_cmp(&topk[j-1], &topk[j]) > 0; j--) {
-            rag_hit_t tmp = topk[j]; topk[j] = topk[j-1]; topk[j-1] = tmp;
-        }
-    }
+    serial_puts("[RAG] http_get_blob exhausted retries for ");
+    serial_puts(path);
+    serial_puts("\n");
+    return -1;
+}
 
-    /* ── Step 7: resolve texts. Fetch each contributing cluster's
-     * jsonl and find matching row_id. To minimize fetches, cache
-     * each cluster's jsonl by index. ── */
-    char *texts_cache[RAG_TOP_N] = {0};
-    int   texts_cache_size[RAG_TOP_N] = {0};
+/* Try osfs2 first; if missing, fall back to HTTPS. `local_name` is
+ * the osfs2 stored name (e.g. "rag/simple_en/meta.json"); `path` is
+ * the URL path (e.g. "/rag/simple_en/meta.json"). Returns bytes
+ * fetched, or -1 on both miss. */
+static int rag_get_with_fallback(const char *local_name, const char *path,
+                                   void *out, uint32_t cap)
+{
+    int n = rag_vfs_get(local_name, out, cap);
+    if (n > 0) {
+        serial_puts("[RAG] vfs hit ");
+        serial_puts(local_name);
+        serial_puts(" (");
+        serial_putdec((uint64_t)n);
+        serial_puts("B)\n");
+        return n;
+    }
+    serial_puts("[RAG] vfs miss ");
+    serial_puts(local_name);
+    serial_puts(" — fetching HTTPS\n");
+    return rag_http_get_blob(RAG_FACTORY_HOST, path, out, cap);
+}
 
-    int rp = 0;
-    for (int h = 0; h < RAG_TOP_K; h++) {
-        int ci = topk[h].cluster_idx;
-        if (ci < 0) continue;
-        if (!texts_cache[ci]) {
-            char path[64];
-            cluster_path(path, sizeof(path), "texts", top_clusters[ci], ".jsonl");
-            build_rag_url(url, sizeof(url), corpus, path);
-            /* Cache texts file too. */
-            char tfs[128]; int tf = 0;
-            const char *pre = "rag/";
-            for (const char *q = pre; *q && tf < (int)sizeof(tfs) - 1; q++) tfs[tf++] = *q;
-            for (const char *q = corpus; *q && tf < (int)sizeof(tfs) - 1; q++) tfs[tf++] = *q;
-            if (tf < (int)sizeof(tfs) - 1) tfs[tf++] = '/';
-            for (const char *q = path; *q && tf < (int)sizeof(tfs) - 1; q++) tfs[tf++] = *q;
-            tfs[tf] = 0;
-            int tsz = 0;
-            uint8_t *t = rag_fetch_cached(url, tfs, &tsz);
-            if (!t) {
-                serial_puts("[rag] texts fetch failed (cluster ");
-                serial_putdec((uint64_t)top_clusters[ci]);
-                serial_puts(" — OOM or network)\n");
-                continue;
-            }
-            char *zt = (char *)malloc((size_t)tsz + 1);
-            if (!zt) {
-                serial_puts("[rag] OOM allocating texts buffer (size=");
-                serial_putdec((uint64_t)tsz); serial_puts(")\n");
-                free(t);
-                continue;
-            }
-            memcpy(zt, t, (size_t)tsz);
-            zt[tsz] = 0;
-            free(t);
-            texts_cache[ci] = zt;
-            texts_cache_size[ci] = tsz;
+/* POST a small JSON body, drain the response into `out`. Retries
+ * up to 3 times — the same partial-recv issue that bites the
+ * multi-conn GET path can also clip a single response if the
+ * server's reply spans multiple TLS records and tls_recv times
+ * out between them. Each attempt is a fresh TCP+TLS handshake. */
+static int rag_http_post_json(const char *hostname, const char *path,
+                               const char *body, uint32_t body_len,
+                               void *out, uint32_t cap)
+{
+    for (int attempt = 0; attempt < 3; attempt++) {
+        if (attempt > 0) rag_sleep_ticks(50);     /* 500 ms */
+
+        http_session_t s;
+        if (http_open(&s, hostname) < 0) continue;
+        const char *hdrs[] = {
+            "Content-Type: application/json",
+            "Accept: application/json",
+            0
+        };
+        http_response_t resp;
+        if (http_request(&s, "POST", path, hostname, hdrs, body, body_len, &resp) < 0 ||
+            resp.status_code != 200) {
+            http_close(&s);
+            continue;
         }
-        /* Scan JSONL for line containing "id": row_id. JSONL format
-         * stores `{"id": NNN, "title": ...}` with a SPACE after the
-         * colon, so we match `"id":` then skip whitespace and check
-         * digits. */
-        const char *txt = texts_cache[ci];
-        uint32_t rid = topk[h].row_id;
-        char ridstr[16]; int rln = 0;
-        if (rid == 0) ridstr[rln++] = '0';
-        else {
-            uint32_t tmp = rid;
-            char rev[16]; int rl = 0;
-            while (tmp) { rev[rl++] = (char)('0' + tmp % 10); tmp /= 10; }
-            while (rl > 0) ridstr[rln++] = rev[--rl];
+        int n = http_read_body_full(&s, &resp, out, cap);
+        http_close(&s);
+        /* Require at minimum half of the advertised Content-Length —
+         * a clipped response is worse than no response (parser would
+         * succeed on partial data and produce garbage). */
+        if (resp.content_length == 0) {
+            if (n > 0) return n;
+        } else if ((uint32_t)n >= resp.content_length) {
+            return n;
         }
-        ridstr[rln] = 0;
-        const char *line = txt;
-        const char *found = NULL;
-        while (line && *line) {
-            const char *nl = strchr(line, '\n');
-            /* Each line starts with `{"id":` (maybe with space). */
-            const char *idkey = strstr(line, "\"id\":");
-            if (idkey && (!nl || idkey < nl)) {
-                const char *p = idkey + 5;  /* past "id": */
-                while (*p == ' ' || *p == '\t') p++;
-                /* Compare ridstr against p. */
-                int j;
-                for (j = 0; j < rln; j++) if (p[j] != ridstr[j]) break;
-                if (j == rln && (p[rln] == ',' || p[rln] == ' ' || p[rln] == '}')) {
-                    found = line;
+        serial_puts("[RAG] POST short (attempt ");
+        serial_putdec((uint64_t)attempt);
+        serial_puts("): got ");
+        serial_putdec((uint64_t)n);
+        serial_puts(" of ");
+        serial_putdec((uint64_t)resp.content_length);
+        serial_puts("\n");
+    }
+    return -1;
+}
+
+/* ── init ──────────────────────────────────────────────────── */
+
+bool rag_is_ready(void) { return g_ready; }
+
+int rag_init(const char *corpus)
+{
+    if (g_ready) return 0;
+    if (!corpus || !corpus[0]) return -1;
+    uint32_t cl = 0;
+    while (corpus[cl] && cl + 1 < sizeof g_corpus) { g_corpus[cl] = corpus[cl]; cl++; }
+    g_corpus[cl] = 0;
+
+    serial_puts("[RAG] init corpus=");
+    serial_puts(g_corpus);
+    serial_puts("\n");
+
+    /* meta.json — osfs2 first, HTTPS fallback. The flat osfs2 name
+     * uses no leading slash so `vfs_find` does an exact match;
+     * the URL path keeps the leading slash for the HTTP request. */
+    char path[128], local[128];
+    const char *seg_url[]   = { "/rag/", g_corpus, "/meta.json", 0 };
+    const char *seg_local[] = {  "rag/", g_corpus, "/meta.json", 0 };
+    kpath_join(path,  sizeof path,  seg_url);
+    kpath_join(local, sizeof local, seg_local);
+    static char meta[2048];
+    int n = rag_get_with_fallback(local, path, meta, sizeof meta - 1);
+    if (n <= 0) return -1;
+    meta[n] = 0;
+    int nc = json_find_int_in(meta, (uint32_t)n, "n_clusters");
+    int dim = json_find_int_in(meta, (uint32_t)n, "dim");
+    int stride = json_find_int_in(meta, (uint32_t)n, "stride_bytes");
+    if (nc <= 0 || dim != RAG_DIM || stride != RAG_STRIDE_BYTES) {
+        serial_puts("[RAG] meta unexpected\n");
+        return -1;
+    }
+    g_n_clusters = (uint32_t)nc;
+    g_dim = (uint32_t)dim;
+    g_stride_bytes = (uint32_t)stride;
+    serial_puts("[RAG] meta ok n_clusters=");
+    serial_putdec((uint64_t)g_n_clusters);
+    serial_puts(" dim=");
+    serial_putdec((uint64_t)g_dim);
+    serial_puts("\n");
+
+    /* centroids.fp16.bin — same VFS-first pattern. */
+    const char *seg_cent_u[] = { "/rag/", g_corpus, "/centroids.fp16.bin", 0 };
+    const char *seg_cent_l[] = {  "rag/", g_corpus, "/centroids.fp16.bin", 0 };
+    kpath_join(path,  sizeof path,  seg_cent_u);
+    kpath_join(local, sizeof local, seg_cent_l);
+    uint32_t cent_bytes = g_n_clusters * g_dim * 2u;
+    uint8_t *raw = (uint8_t *)kmalloc(cent_bytes);
+    if (!raw) return -1;
+    int got = rag_get_with_fallback(local, path, raw, cent_bytes);
+    if (got <= 0 || (uint32_t)got != cent_bytes) {
+        serial_puts("[RAG] centroid download short got=");
+        serial_putdec((uint64_t)(int64_t)got);   /* signed-aware print */
+        serial_puts("\n");
+        kfree(raw);
+        return -1;
+    }
+    g_centroids = (float *)kmalloc(g_n_clusters * g_dim * sizeof(float));
+    if (!g_centroids) { kfree(raw); return -1; }
+    const uint16_t *h16 = (const uint16_t *)raw;
+    for (uint32_t i = 0; i < g_n_clusters * g_dim; i++) {
+        g_centroids[i] = f16_to_f32(h16[i]);
+    }
+    kfree(raw);
+    serial_puts("[RAG] centroids loaded\n");
+    g_ready = true;
+    return 0;
+}
+
+/* ── per-query pipeline ────────────────────────────────────── */
+
+/* JSON-escape the question into a body of the form {"query":"..."}. */
+static uint32_t build_embed_body(const char *q, char *out, uint32_t cap) {
+    uint32_t off = 0;
+    const char *p = "{\"query\":\"";
+    while (*p && off + 1 < cap) out[off++] = *p++;
+    for (uint32_t i = 0; q[i] && off + 4 < cap; i++) {
+        char c = q[i];
+        if      (c == '"')  { out[off++] = '\\'; out[off++] = '"';  }
+        else if (c == '\\') { out[off++] = '\\'; out[off++] = '\\'; }
+        else if (c == '\n') { out[off++] = '\\'; out[off++] = 'n';  }
+        else if (c == '\r') { /* drop */ }
+        else if (c < 0x20)  { /* drop */ }
+        else                { out[off++] = c; }
+    }
+    p = "\"}";
+    while (*p && off + 1 < cap) out[off++] = *p++;
+    if (off < cap) out[off] = 0;
+    return off;
+}
+
+/* Parse the /embed JSON response and fill `out` with `dim` floats.
+ * Response shape:  {"model":"...","dim":1024,"data":[[ ... ]],"edge_ms":N}
+ * Returns 0 on success, -1 on parse failure. */
+static int parse_embed_response(const char *body, uint32_t len,
+                                  float *out, uint32_t dim)
+{
+    const char *m = kstrnstr(body, len, "\"data\"");
+    if (!m) return -1;
+    uint32_t p = (uint32_t)(m - body) + 6;
+    /* skip whitespace, colon, '[', '[' */
+    while (p < len && (body[p] == ' ' || body[p] == ':' || body[p] == '\t' ||
+                         body[p] == '[' || body[p] == '\n')) p++;
+
+    const char *cur = body + p, *end = body + len;
+    for (uint32_t i = 0; i < dim; i++) {
+        while (cur < end && (*cur == ',' || *cur == ' ' || *cur == '\n')) cur++;
+        int ok = 0;
+        float v = kparse_float(&cur, end, &ok);
+        if (!ok) return -1;
+        out[i] = v;
+    }
+    return 0;
+}
+
+/* Scan a JSONL line of {"id":N,"title":"...","text":"..."}.  Returns
+ * 1 if the id matches `want_id`, else 0.  On match, copies title +
+ * text into the destination buffers. */
+static int parse_jsonl_line(const char *line, uint32_t line_len,
+                              uint32_t want_id,
+                              char *title_out, uint32_t title_cap,
+                              char *text_out,  uint32_t text_cap)
+{
+    int id = json_find_int_in(line, line_len, "id");
+    if (id != (int)want_id) return 0;
+
+    const char *m_title = kstrnstr(line, line_len, "\"title\"");
+    const char *m_text  = kstrnstr(line, line_len, "\"text\"");
+    if (m_title) {
+        uint32_t p = (uint32_t)(m_title - line) + 7;
+        while (p < line_len && (line[p] == ' ' || line[p] == ':')) p++;
+        kjson_decode_str(line, line_len, &p, title_out, title_cap);
+    } else if (title_cap) title_out[0] = 0;
+    if (m_text) {
+        uint32_t p = (uint32_t)(m_text - line) + 6;
+        while (p < line_len && (line[p] == ' ' || line[p] == ':')) p++;
+        kjson_decode_str(line, line_len, &p, text_out, text_cap);
+    } else if (text_cap) text_out[0] = 0;
+    return 1;
+}
+
+/* Walk a JSONL blob line by line, looking for any `want_ids[k]` and
+ * filling the corresponding `hits[hit_idx[k]]`. Returns count of
+ * row_ids resolved. */
+static uint32_t resolve_texts_in_blob(const char *blob, uint32_t blob_len,
+                                        const uint32_t *want_ids,
+                                        const int *hit_idx,
+                                        uint32_t n_want,
+                                        rag_hit_t *hits)
+{
+    uint32_t resolved = 0;
+    uint32_t off = 0;
+    while (off < blob_len) {
+        uint32_t end = off;
+        while (end < blob_len && blob[end] != '\n') end++;
+        if (end > off) {
+            for (uint32_t k = 0; k < n_want; k++) {
+                if (hit_idx[k] < 0) continue;
+                if (hits[hit_idx[k]].title[0] != 0) continue;  /* already filled */
+                if (parse_jsonl_line(blob + off, end - off, want_ids[k],
+                                       hits[hit_idx[k]].title, RAG_TITLE_CAP,
+                                       hits[hit_idx[k]].text,  RAG_TEXT_CAP)) {
+                    resolved++;
+                    if (resolved >= n_want) return resolved;
                     break;
                 }
             }
-            if (!nl) break;
-            line = nl + 1;
         }
-        if (found) {
-            char title[256], text[1024];
-            int tn = json_string_value(found, "\"title\"", title, sizeof(title));
-            int tx = json_string_value(found, "\"text\"",  text,  sizeof(text));
-            if (rp < result_max - 1) result[rp++] = '\n';
-            /* "Wikipedia says: <title> — <text>" */
-            const char *pre = "Wikipedia says: ";
-            for (const char *q = pre; *q && rp < result_max - 1; q++) result[rp++] = *q;
-            for (int i = 0; i < tn && rp < result_max - 1; i++) result[rp++] = title[i];
-            if (rp < result_max - 3) { result[rp++] = ' '; result[rp++] = '-'; result[rp++] = ' '; }
-            for (int i = 0; i < tx && rp < result_max - 1; i++) result[rp++] = text[i];
+        off = end + 1;
+    }
+    return resolved;
+}
+
+/* ── one-shot refresh of a single corpus file from URL → osfs2 ─ */
+
+int rag_refresh(const char *corpus, const char *sub)
+{
+    if (!corpus || !sub) return -1;
+    if (!osfs2_is_mounted()) {
+        serial_puts("[RAG] refresh: osfs2 not mounted\n");
+        return -1;
+    }
+
+    char url[160], local[160];
+    /* /rag/<corpus>/<sub> */
+    uint32_t up = 0; const char *p;
+    p = "/rag/"; while (*p && up + 1 < sizeof url) url[up++] = *p++;
+    for (uint32_t i = 0; corpus[i] && up + 1 < sizeof url; i++) url[up++] = corpus[i];
+    if (up + 1 < sizeof url) url[up++] = '/';
+    for (uint32_t i = 0; sub[i] && up + 1 < sizeof url; i++) url[up++] = sub[i];
+    url[up] = 0;
+    /* rag/<corpus>/<sub> (no leading slash) */
+    uint32_t lp = 0;
+    p = "rag/"; while (*p && lp + 1 < sizeof local) local[lp++] = *p++;
+    for (uint32_t i = 0; corpus[i] && lp + 1 < sizeof local; i++) local[lp++] = corpus[i];
+    if (lp + 1 < sizeof local) local[lp++] = '/';
+    for (uint32_t i = 0; sub[i] && lp + 1 < sizeof local; i++) local[lp++] = sub[i];
+    local[lp] = 0;
+
+    serial_puts("[RAG] refresh GET ");
+    serial_puts(url);
+    serial_puts(" → osfs2:");
+    serial_puts(local);
+    serial_puts("\n");
+
+    /* Probe with a small buffer first to get the size... actually
+     * we'd need HEAD or a content-length read.  Simpler: try 4 MB
+     * scratch which covers every individual shard in simple_en. */
+    uint32_t cap = 4u * 1024u * 1024u;
+    uint8_t *buf = (uint8_t *)kmalloc(cap);
+    if (!buf) {
+        serial_puts("[RAG] refresh: alloc failed\n");
+        return -1;
+    }
+    int n = rag_http_get_blob(RAG_FACTORY_HOST, url, buf, cap);
+    if (n <= 0) {
+        kfree(buf);
+        return -1;
+    }
+
+    /* Replace any prior osfs2 entry; ignore delete failure (may be new). */
+    osfs2_delete(local);
+    void *f = osfs2_create(local, (uint64_t)n);
+    if (!f) {
+        serial_puts("[RAG] refresh: osfs2_create failed\n");
+        kfree(buf);
+        return -1;
+    }
+    int wr = osfs2_write(f, 0, buf, (uint64_t)n);
+    kfree(buf);
+    if (wr < 0) {
+        serial_puts("[RAG] refresh: osfs2_write failed\n");
+        return -1;
+    }
+    serial_puts("[RAG] refresh ok ");
+    serial_putdec((uint64_t)n);
+    serial_puts(" bytes\n");
+    return n;
+}
+
+int rag_query(const char *question, rag_hit_t *hits, uint32_t max_hits)
+{
+    if (!g_ready) {
+        serial_puts("[RAG] not initialized\n");
+        return -1;
+    }
+    if (!question || !hits || max_hits == 0) return -1;
+    if (max_hits > RAG_MAX_HITS) max_hits = RAG_MAX_HITS;
+
+    /* Zero hits up front so resolve loop can short-circuit on already-filled entries. */
+    for (uint32_t i = 0; i < max_hits; i++) {
+        hits[i].title[0] = 0; hits[i].text[0] = 0;
+        hits[i].similarity = 0.0f; hits[i].row_id = 0; hits[i].cluster_idx = -1;
+    }
+
+    /* 1. POST /embed */
+    static char embed_body[1024];
+    uint32_t body_len = build_embed_body(question, embed_body, sizeof embed_body);
+    static char embed_resp[32768];
+    int n_resp = rag_http_post_json(RAG_EMBED_HOST, "/embed",
+                                      embed_body, body_len,
+                                      embed_resp, sizeof embed_resp - 1);
+    if (n_resp <= 0) return -1;
+    embed_resp[n_resp] = 0;
+    serial_puts("[RAG] embed resp ");
+    serial_putdec((uint64_t)n_resp);
+    serial_puts("B head=\"");
+    for (int i = 0; i < n_resp && i < 80; i++) {
+        char c = embed_resp[i];
+        char tmp[2] = { c == '\n' || c == '\r' ? ' ' : c, 0 };
+        serial_puts(tmp);
+    }
+    serial_puts("\"\n");
+
+    static float qvec[RAG_DIM];
+    if (parse_embed_response(embed_resp, (uint32_t)n_resp, qvec, g_dim) < 0) {
+        serial_puts("[RAG] embed parse failed\n");
+        return -1;
+    }
+    l2_normalize(qvec, g_dim);
+
+    /* 2. Centroid scores → top-N clusters */
+    static float scores[1024];
+    for (uint32_t i = 0; i < g_n_clusters; i++) {
+        scores[i] = dot_f32(qvec, g_centroids + i * g_dim, g_dim);
+    }
+    uint32_t topn[RAG_DEFAULT_TOPN];
+    float    topn_score[RAG_DEFAULT_TOPN];
+    topn_indices(scores, g_n_clusters, RAG_DEFAULT_TOPN, topn, topn_score);
+
+    serial_puts("[RAG] top-");
+    serial_putdec((uint64_t)RAG_DEFAULT_TOPN);
+    serial_puts(" clusters:");
+    for (uint32_t i = 0; i < RAG_DEFAULT_TOPN; i++) {
+        serial_puts(" ");
+        serial_putdec((uint64_t)topn[i]);
+    }
+    serial_puts("\n");
+
+    /* 3. Binarize query for hamming pass */
+    static uint8_t qubin[RAG_DIM_BYTES];
+    binarize_query(qvec, g_dim, qubin);
+
+    /* 4. Fetch each top-N cluster, score every row, keep global top-K hits */
+    /* Per-hit fields tracked here: smallest hamming distance + which
+     * cluster it came from + the row_id. */
+    uint32_t hit_dist[RAG_MAX_HITS];
+    uint32_t hit_row [RAG_MAX_HITS];
+    int      hit_clu [RAG_MAX_HITS];
+    for (uint32_t i = 0; i < max_hits; i++) {
+        hit_dist[i] = (uint32_t)-1;
+        hit_row [i] = 0;
+        hit_clu [i] = -1;
+    }
+
+    static uint8_t cluster_blob[200 * 1024];
+    char cpath[128], clocal[128];
+    for (uint32_t i = 0; i < RAG_DEFAULT_TOPN; i++) {
+        uint32_t cidx = topn[i];
+        const char *seg_u[] = { "/rag/", g_corpus, "/clusters/", 0 };
+        const char *seg_l[] = {  "rag/", g_corpus, "/clusters/", 0 };
+        uint32_t pl = kpath_join(cpath,  sizeof cpath,  seg_u);
+        uint32_t ll = kpath_join(clocal, sizeof clocal, seg_l);
+        pl = kappend_u32_pad4(cpath,  pl, sizeof cpath,  cidx);
+        ll = kappend_u32_pad4(clocal, ll, sizeof clocal, cidx);
+        const char *suf = ".bin";
+        for (int k = 0; suf[k] && pl + 1 < sizeof cpath;  k++) cpath[pl++]  = suf[k];
+        for (int k = 0; suf[k] && ll + 1 < sizeof clocal; k++) clocal[ll++] = suf[k];
+        cpath[pl] = 0; clocal[ll] = 0;
+
+        int n = rag_get_with_fallback(clocal, cpath,
+                                        cluster_blob, sizeof cluster_blob);
+        if (n <= 4) continue;
+        uint32_t count = ((uint32_t)cluster_blob[0])
+                       | ((uint32_t)cluster_blob[1] << 8)
+                       | ((uint32_t)cluster_blob[2] << 16)
+                       | ((uint32_t)cluster_blob[3] << 24);
+        uint32_t need = 4 + count * RAG_STRIDE_BYTES;
+        if (need > (uint32_t)n) {
+            serial_puts("[RAG] cluster blob short\n");
+            continue;
+        }
+
+        const uint8_t *row = cluster_blob + 4;
+        for (uint32_t r = 0; r < count; r++, row += RAG_STRIDE_BYTES) {
+            uint32_t row_id = ((uint32_t)row[0])
+                            | ((uint32_t)row[1] << 8)
+                            | ((uint32_t)row[2] << 16)
+                            | ((uint32_t)row[3] << 24);
+            uint32_t d = hamming_128(qubin, row + 4);
+
+            /* Insertion sort: smaller distance is better. */
+            for (uint32_t k = 0; k < max_hits; k++) {
+                if (d < hit_dist[k]) {
+                    for (int j = (int)max_hits - 1; j > (int)k; j--) {
+                        hit_dist[j] = hit_dist[j-1];
+                        hit_row [j] = hit_row [j-1];
+                        hit_clu [j] = hit_clu [j-1];
+                    }
+                    hit_dist[k] = d;
+                    hit_row [k] = row_id;
+                    hit_clu [k] = (int)cidx;
+                    break;
+                }
+            }
         }
     }
-    result[rp < result_max ? rp : result_max - 1] = 0;
 
-    for (int i = 0; i < RAG_TOP_N; i++) if (texts_cache[i]) free(texts_cache[i]);
-    return 0;
+    /* Convert hamming distance to a similarity score in [0, 1]. */
+    for (uint32_t i = 0; i < max_hits; i++) {
+        if (hit_clu[i] < 0) continue;
+        hits[i].row_id      = hit_row[i];
+        hits[i].cluster_idx = hit_clu[i];
+        hits[i].similarity  = 1.0f - (float)hit_dist[i] / (float)g_dim;
+    }
+
+    /* 5. Resolve texts.  Group top-K by cluster so we only fetch each
+     * texts/NNNN.jsonl once. */
+    static uint8_t fetched[256];   /* indexed by which-hit-already-fetched-its-cluster */
+    for (uint32_t i = 0; i < sizeof fetched; i++) fetched[i] = 0;
+
+    static char text_blob[256 * 1024];
+    for (uint32_t i = 0; i < max_hits; i++) {
+        if (hit_clu[i] < 0 || fetched[i]) continue;
+
+        /* Gather all hits in the same cluster. */
+        uint32_t batch_ids[RAG_MAX_HITS];
+        int      batch_idx[RAG_MAX_HITS];
+        uint32_t n_batch = 0;
+        for (uint32_t k = i; k < max_hits; k++) {
+            if (hit_clu[k] != hit_clu[i] || fetched[k]) continue;
+            batch_ids[n_batch] = hit_row[k];
+            batch_idx[n_batch] = (int)k;
+            n_batch++;
+            fetched[k] = 1;
+        }
+        if (n_batch == 0) continue;
+
+        const char *seg_u[] = { "/rag/", g_corpus, "/texts/", 0 };
+        const char *seg_l[] = {  "rag/", g_corpus, "/texts/", 0 };
+        uint32_t pl = kpath_join(cpath,  sizeof cpath,  seg_u);
+        uint32_t ll = kpath_join(clocal, sizeof clocal, seg_l);
+        pl = kappend_u32_pad4(cpath,  pl, sizeof cpath,  (uint32_t)hit_clu[i]);
+        ll = kappend_u32_pad4(clocal, ll, sizeof clocal, (uint32_t)hit_clu[i]);
+        const char *suf = ".jsonl";
+        for (int k = 0; suf[k] && pl + 1 < sizeof cpath;  k++) cpath[pl++]  = suf[k];
+        for (int k = 0; suf[k] && ll + 1 < sizeof clocal; k++) clocal[ll++] = suf[k];
+        cpath[pl] = 0; clocal[ll] = 0;
+
+        int tn = rag_get_with_fallback(clocal, cpath,
+                                         text_blob, sizeof text_blob - 1);
+        if (tn <= 0) continue;
+        text_blob[tn] = 0;
+        resolve_texts_in_blob(text_blob, (uint32_t)tn, batch_ids, batch_idx,
+                              n_batch, hits);
+    }
+
+    /* Count filled hits for the return value. */
+    uint32_t out_n = 0;
+    for (uint32_t i = 0; i < max_hits; i++) {
+        if (hits[i].title[0]) out_n++;
+    }
+    serial_puts("[RAG] resolved ");
+    serial_putdec((uint64_t)out_n);
+    serial_puts(" hits\n");
+    return (int)out_n;
 }

@@ -10,6 +10,7 @@
 #include "../include/types.h"
 #include "../include/boot_info.h"
 #include "../fs/vfs.h"
+#include "rag.h"
 
 /* ── External functions ──────────────────────────────────────── */
 
@@ -4116,7 +4117,74 @@ pdone:
         else       sh_puts("\n");
         free(hits); free(system_msg);
 #else
-        sh_puts("wiki: WASM-only\n");
+        /* Native x86: kernel-side RAG client (factory.naranjositos.tech).
+         * Same shape as the WASM browser-RAG path, but the retrieval
+         * runs in-kernel via rag.c (Path 1 from osito-a-models). */
+        {
+            extern int  rag_init(const char *corpus);
+            extern int  rag_query(const char *q, rag_hit_t *hits, uint32_t max_hits);
+            extern bool rag_is_ready(void);
+
+            if (argc < 2) {
+                sh_puts("Usage: wiki <query>     Retrieve + answer (simple_en)\n");
+                sh_puts("       wiki status      Show RAG client status\n");
+                sh_puts("Brandon-tiny: temp 0.4 + penalty 1.15 0.1 0.1 + ngram 3\n");
+                return;
+            }
+            if (strcmp(argv[1], "status") == 0) {
+                sh_puts(rag_is_ready() ? "wiki: ready (simple_en loaded)\n"
+                                        : "wiki: not initialized — first query will init\n");
+                return;
+            }
+            if (!prompt_llama) {
+                sh_puts("No model loaded.\n");
+                return;
+            }
+
+            static char wq[1024]; int qp = 0;
+            for (int i = 1; i < argc && qp < (int)sizeof(wq) - 1; i++) {
+                if (i > 1 && qp < (int)sizeof(wq) - 1) wq[qp++] = ' ';
+                const char *w = argv[i];
+                while (*w && qp < (int)sizeof(wq) - 1) wq[qp++] = *w++;
+            }
+            wq[qp] = '\0';
+
+            if (!rag_is_ready()) {
+                sh_puts("wiki: initializing RAG (factory.naranjositos.tech)...\n");
+                if (rag_init("simple_en") < 0) {
+                    sh_puts_color("wiki: RAG offline — init failed (endpoint unreachable?)\n",
+                                  0x00FF0000);
+                    return;
+                }
+            }
+
+            rag_hit_t hits[3];
+            int n = rag_query(wq, hits, 3);
+            if (n <= 0) {
+                sh_puts_color("wiki: rag_query returned no hits\n", 0x00FF0000);
+                return;
+            }
+
+            static char wsys[4096];
+            int sp = 0;
+            const char *pre = "Answer the question using the Wikipedia context below. "
+                              "Cite the title that supports your answer.\n\n";
+            for (const char *p = pre; *p && sp < (int)sizeof(wsys) - 1; p++) wsys[sp++] = *p;
+            for (int i = 0; i < n && sp < (int)sizeof(wsys) - 256; i++) {
+                const char *pre2 = "Wikipedia says: ";
+                for (const char *p = pre2; *p && sp < (int)sizeof(wsys) - 1; p++) wsys[sp++] = *p;
+                for (const char *p = hits[i].title; *p && sp < (int)sizeof(wsys) - 1; p++) wsys[sp++] = *p;
+                if (sp < (int)sizeof(wsys) - 5) { wsys[sp++] = ' '; wsys[sp++] = '-'; wsys[sp++] = ' '; }
+                for (const char *p = hits[i].text; *p && sp < (int)sizeof(wsys) - 1; p++) wsys[sp++] = *p;
+                if (sp < (int)sizeof(wsys) - 1) wsys[sp++] = '\n';
+            }
+            wsys[sp] = '\0';
+
+            sh_puts_color("\nLlama (wiki): ", 0x00FF8800);
+            int r = llama_chat_with_system(prompt_llama, wsys, wq, 128, chat_token_cb, NULL);
+            if (r < 0) sh_puts_color("[error]\n", 0x00FF0000);
+            else       sh_puts("\n");
+        }
 #endif
     } else if (strcmp(cmd, "https") == 0) {
         if (argc < 2) {
