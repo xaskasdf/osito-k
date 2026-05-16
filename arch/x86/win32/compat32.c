@@ -2167,14 +2167,20 @@ uint64_t compat32_dispatch(uint32_t thunk_idx, uint32_t *stack_args)
      * the assert is ALWAYS taken.  Engine continues to read Actor[0]
      * which may NULL-deref, but our existing recovery handles that
      * cleanly via proc_exit. */
-    /* Try patch each INT 0x2E until the expected byte appears (Engine.dll
-     * page might not be loaded on first dispatch — defer until pages
-     * are populated).  Once patched, the flag prevents re-checks. */
-    static int actors_patched_mask = 0;  /* bit 0=site 0, bit 1=site 1 */
+    /* Actors-assert jne→jmp patches DISABLED.  Skipping the assertions
+     * makes the engine read Actors[0] which is NULL, leading to a
+     * different/earlier downstream crash chain (NULL-CALL → #BR @0x10243B18).
+     * The original assert path (call appFailAssert → our shim's
+     * proc_exit) reaches the same terminal state with cleaner exit and
+     * after more engine progress (13,849 INT 0x2E baseline vs ~1,420
+     * with the patches).  Keep the code in tree commented for future
+     * comparisons. */
+    #if 0
+    static int actors_patched_mask = 0;
     if (actors_patched_mask != 0x3) {
         struct { uint32_t va; uint8_t want; uint8_t patch; } sites[] = {
-            { 0x1038C324, 0x75, 0xEB },  /* line 246 check */
-            { 0x1038C35A, 0x75, 0xEB },  /* line 247 check */
+            { 0x1038C324, 0x75, 0xEB },
+            { 0x1038C35A, 0x75, 0xEB },
         };
         for (int i = 0; i < 2; i++) {
             if (actors_patched_mask & (1 << i)) continue;
@@ -2182,13 +2188,10 @@ uint64_t compat32_dispatch(uint32_t thunk_idx, uint32_t *stack_args)
             if (p[0] == sites[i].want) {
                 p[0] = sites[i].patch;
                 actors_patched_mask |= (1 << i);
-                serial_puts("[ENGINE-PATCH] Actors-assert site ");
-                serial_putdec((uint64_t)i);
-                serial_puts(" @0x"); serial_puthex(sites[i].va, 8);
-                serial_puts(" jne→jmp OK\n");
             }
         }
     }
+    #endif
 
     /* UT-EXE-PATCH: UT.exe @0x10902A40 doubly-linked-list pool manager
      * has 3 unguarded NULL-pointer writes (prev/next/container fields):
