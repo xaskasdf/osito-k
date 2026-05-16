@@ -2167,6 +2167,24 @@ uint64_t compat32_dispatch(uint32_t thunk_idx, uint32_t *stack_args)
      * the assert is ALWAYS taken.  Engine continues to read Actor[0]
      * which may NULL-deref, but our existing recovery handles that
      * cleanly via proc_exit. */
+    /* Core.dll throw-helper @0x1014BD10 — leave as-is.  Tried suppressing
+     * the CxxThrowException call (5 bytes replaced with add esp,0xC; ret;
+     * nop).  Result: engine assumed package loaded successfully, then
+     * NULL-CALL'd 50,000+ times trying to access fields of the nonexistent
+     * package.  The throw's catch handler is the lesser evil — at least
+     * engine exits cleanly. */
+    #if 0
+    static int patched_core_throw = 0;
+    if (!patched_core_throw) {
+        volatile uint8_t *p = (uint8_t *)(uintptr_t)0x1014BD3A;
+        if (p[0] == 0xE8) {
+            p[0] = 0x83; p[1] = 0xC4; p[2] = 0x0C;
+            p[3] = 0xC3; p[4] = 0x90;
+            patched_core_throw = 1;
+        }
+    }
+    #endif
+
     /* FMallocWindows pool-integrity asserts in UT.exe — skip them.
      * Our stub FMalloc doesn't maintain the Pool/Free/FirstMem
      * doubly-linked-list invariants the engine sanity-checks.  Each
