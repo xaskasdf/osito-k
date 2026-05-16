@@ -2263,101 +2263,32 @@ uint64_t compat32_dispatch(uint32_t thunk_idx, uint32_t *stack_args)
     {
         volatile uint32_t *fname_tarray = (volatile uint32_t *)(uintptr_t)0x10295D30;
         static uint64_t fname_buf_phys = 0;
-        static uint64_t fname_entries_phys = 0;
         uint32_t fd = fname_tarray[0], fn = fname_tarray[1], fm = fname_tarray[2];
         if (fd == 0 && fm == 0) {
             if (fname_buf_phys == 0) {
                 extern void *mem_alloc_pages(uint64_t count);
-                /* Buffer A: TArray data (FNameEntry* slots, 4 bytes each). */
-                void *buf = mem_alloc_pages(4);   /* 16 KB */
-                /* Buffer B: pool of FNameEntry structs for canonical names. */
-                void *pool = mem_alloc_pages(1);  /* 4 KB — 32 entries × 80 bytes */
-                if (buf && pool) {
-                    uint8_t *p = (uint8_t *)(uintptr_t)buf;
+                void *buf = mem_alloc_pages(4);  /* 16 KB = room for 4096 8-byte entries */
+                if (buf) {
+                    uint64_t pa = (uint64_t)buf;
+                    uint8_t *p = (uint8_t *)pa;
                     for (int i = 0; i < 16384; i++) p[i] = 0;
-                    uint8_t *q = (uint8_t *)(uintptr_t)pool;
-                    for (int i = 0; i < 4096; i++) q[i] = 0;
-
-                    /* UE1 canonical names — the engine pre-registers a
-                     * fixed list at engine-static-init time. Without
-                     * these populated, any code that prints FName(idx)
-                     * via the index→string fallback (e.g. when an
-                     * entry pointer is NULL) gets back the decimal
-                     * representation of the index — e.g. FName(0)
-                     * formats as "0" instead of "None", which is then
-                     * used as a package filename and fails to open,
-                     * which throws "Can't find file for package '0'".
-                     *
-                     * Pre-populate slots [0..N) with stub FNameEntry
-                     * structs containing the canonical names. Layout:
-                     *   +0  INT Index
-                     *   +4  FNameEntry* HashNext
-                     *   +8  ANSICHAR Name[NAME_SIZE]   (NAME_SIZE=64)
-                     * Total stride: 80 bytes (8 + 64 + padding to align).
-                     * We use 80 to be safe.
-                     */
-                    static const char *canon[] = {
-                        "None",            /* 0 = NAME_None */
-                        "ByteProperty",    /* 1 */
-                        "IntProperty",     /* 2 */
-                        "BoolProperty",    /* 3 */
-                        "FloatProperty",   /* 4 */
-                        "ObjectProperty",  /* 5 */
-                        "NameProperty",    /* 6 */
-                        "StringProperty",  /* 7 */
-                        "ClassProperty",   /* 8 */
-                        "ArrayProperty",   /* 9 */
-                        "StructProperty",  /* 10 */
-                        "VectorProperty",  /* 11 */
-                        "RotatorProperty", /* 12 */
-                        "StrProperty",     /* 13 */
-                        "MapProperty",     /* 14 */
-                        "FixedArrayProperty", /* 15 */
-                    };
-                    int ncanon = sizeof(canon) / sizeof(canon[0]);
-                    uint32_t entry_stride = 80;
-                    volatile uint32_t *slots = (volatile uint32_t *)(uintptr_t)buf;
-                    for (int i = 0; i < ncanon; i++) {
-                        uint8_t *entry = q + i * entry_stride;
-                        /* +0: Index = i */
-                        *(volatile uint32_t *)(entry + 0) = (uint32_t)i;
-                        /* +4: HashNext = NULL */
-                        *(volatile uint32_t *)(entry + 4) = 0;
-                        /* +8: Name (copy the literal) */
-                        const char *src = canon[i];
-                        int j = 0;
-                        while (src[j] && j < 63) {
-                            *(volatile char *)(entry + 8 + j) = src[j];
-                            j++;
-                        }
-                        *(volatile char *)(entry + 8 + j) = 0;
-                        /* Slot i in TArray.Data → entry pointer */
-                        slots[i] = (uint32_t)(uintptr_t)entry;
-                    }
-
-                    fname_buf_phys = (uint64_t)(uintptr_t)buf;
-                    fname_entries_phys = (uint64_t)(uintptr_t)pool;
-
-                    serial_puts("[FNAME-RESCUE] populated ");
-                    serial_putdec((uint64_t)ncanon);
-                    serial_puts(" canonical names (Names[0]=\"None\")\n");
+                    fname_buf_phys = pa;
                 }
             }
             if (fname_buf_phys) {
                 fname_tarray[0] = (uint32_t)fname_buf_phys;
-                fname_tarray[1] = 16;     /* Num = 16 canonical entries pre-populated */
-                fname_tarray[2] = 2048;   /* Max = 2K entries */
+                fname_tarray[2] = 2048;  /* Max = 2K entries */
+                /* Don't touch Num — preserve whatever the engine wrote */
                 static int fname_setup_logged = 0;
                 if (!fname_setup_logged) {
                     fname_setup_logged = 1;
                     serial_puts("[FNAME-RESCUE] pre-alloc FName::Names Data=0x");
                     serial_puthex(fname_buf_phys, 8);
-                    serial_puts(" Num=16 Max=2048\n");
+                    serial_puts(" Max=2048\n");
                 }
             }
         }
         (void)fn;
-        (void)fname_entries_phys;
     }
 
     /* GObjRegistrants snapshot + restore.
