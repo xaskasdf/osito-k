@@ -694,6 +694,22 @@ void isr_handler(interrupt_frame_t *frame)
                 serial_puthex((uint32_t)frame->rsi, 8);
                 serial_puts("\n");
             }
+        } else if (vec == 5) {
+            /* #BR Bound Range in compat32: engine jumped into data (the
+             * byte at RIP is 0x62 = BOUND opcode, but it's actually a
+             * UTF-16 ASCII char or similar data).  This always means
+             * deep state corruption — the engine's vtable/fn-ptr was
+             * pointing to a data buffer.  Skip the chaotic crash dump
+             * and exit the PE process cleanly. */
+            extern void proc_exit(int32_t code);
+            static int br_count = 0;
+            if (++br_count <= 3) {
+                serial_puts("[BR] compat32 #BR at RIP=0x");
+                serial_puthex(rip32, 8);
+                serial_puts(" — proc_exit\n");
+            }
+            proc_exit(0xC0000026 /* STATUS_INVALID_PARAMETER_5 */);
+            /* unreachable */
         } else if (vec == 14) {
             /* Data deref of a tombstoned value: CR2 == 0xDEADC0DE
              * (the engine treated a freed-range word as a pointer). */
