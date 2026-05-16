@@ -344,6 +344,7 @@ void __initk kernel_entry(boot_info_t *info)
         while (p < end)
             *p++ = 0;
     }
+    KEXEC_PROBE("[KEXEC-PATH] bss-zeroed\n");
 
     /* ── Save boot_info + UEFI mmap for kexec ── */
     saved_boot_info = *info;

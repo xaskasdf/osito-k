@@ -1694,6 +1694,31 @@ void isr_handler(interrupt_frame_t *frame)
         serial_puthex(frame->rflags, 16);
         serial_puts("\n");
 
+        /* Kernel-mode exception extras (CS==0x08): dump CR3, SS and
+         * the dword at [RSP] so post-kexec #UD/#GP can be triaged.
+         * The kexec'd kernel landing on a mid-instruction RIP is most
+         * often a corrupt indirect call/ret — knowing the return slot
+         * + the active page tables narrows that down fast.           */
+        if ((frame->cs & 0xFFFF) == 0x08) {
+            uint64_t cr3;
+            __asm__ volatile ("mov %%cr3, %0" : "=r"(cr3));
+            serial_puts("  CR3 = 0x");
+            serial_puthex(cr3, 16);
+            serial_puts("  SS  = 0x");
+            serial_puthex(frame->ss, 4);
+            serial_puts("\n");
+            /* Dump 4 quadwords at top of stack — kernel stacks live in
+             * the upper-half mirror so this is safe even pre-paging. */
+            uint64_t *kp = (uint64_t *)frame->rsp;
+            for (int i = 0; i < 4; i++) {
+                serial_puts("    [RSP+");
+                serial_puthex((uint64_t)(i * 8), 2);
+                serial_puts("] = 0x");
+                serial_puthex(kp[i], 16);
+                serial_puts("\n");
+            }
+        }
+
         /* Dump bytes at RIP (useful for crashes on stack/corrupted code).
          * Skip the NULL page (Phase C: user PML4s have no mapping there),
          * and skip when not running compat32 user code — the dump is

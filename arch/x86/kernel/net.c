@@ -863,34 +863,16 @@ int net_udp_send(const uint8_t dst_ip[4], uint16_t dst_port,
     uint32_t hdr_total = ETH_HDR_LEN + sizeof(ipv4_hdr_t) + sizeof(udp_hdr_t);
     uint32_t frame_len = ETH_HDR_LEN + ip_total;
 
-    /* Zero-copy scatter-gather path: header on stack, payload streamed
-     * directly from caller's buffer. Only used when payload is big
-     * enough that skipping the memcpy matters (≥256 B) and total frame
-     * doesn't need padding. Otherwise keep the legacy single-buffer
-     * path for correctness simplicity. */
-    extern int nic_send_sg(const uint64_t frag_phys[],
-                            const uint32_t lens[], int n_frags);
-    /* Zero-copy SG path — re-enabled with tx_pkt 64-byte aligned (see
-     * net.c:175).  Previous attempts at fixing the all-NUL bug:
-     *   - kvirt_to_phys (commit 9f7255f)         — phys translation
-     *   - IFCS/PAYLEN only-on-last (commit 99cda9b) — Intel §7.2.2.2.4
-     *   - heap-allocated kupload pkt (2398adf)   — stack→heap source
-     * None of those resolved the NUL upload.  Latest hypothesis: the
-     * chip silently zero-DMAs when desc->addr is misaligned.  tx_pkt
-     * was a plain `static uint8_t[]` (1-byte aligned); now forced to
-     * 64-byte boundary.  If kupload --dmesg still arrives as NUL with
-     * this in place, fall back to commenting out this whole block —
-     * the memcpy path below is correct and fast enough.              */
-    if (len >= 256 && frame_len >= 60) {
-        uint64_t frags[2] = {
-            kvirt_to_phys(tx_pkt),
-            kvirt_to_phys(data)
-        };
-        uint32_t lens_arr[2] = { hdr_total, len };
-        int sg = nic_send_sg(frags, lens_arr, 2);
-        if (sg == 0) return 0;
-        /* SG failure (NIC busy, etc.) — fall through to memcpy path. */
-    }
+    /* SG path DISABLED — kupload --dmesg via SG sends pure NUL even with
+     * tx_pkt 64B-aligned (6bdcbc7) + IFCS-on-last + PAYLEN-on-last
+     * (99cda9b) + kvirt_to_phys translation (9f7255f) + heap-alloc pkt
+     * (2398adf).  Root cause still unclear — suspect chip-side state
+     * we're not configuring, or a descriptor field combo i210/i211
+     * rejects in MSI mode.  Fall back to memcpy path; it's correct &
+     * adequate for kernel traffic.  Follow-up: capture TX on external
+     * sniffer to confirm whether frames leave the wire at all when SG
+     * is enabled.  See docs/x86-network-stack.md §SG-pending.        */
+    (void)hdr_total;
 
     /* Copy payload into tx_pkt */
     memcpy(tx_pkt + hdr_total, data, len);

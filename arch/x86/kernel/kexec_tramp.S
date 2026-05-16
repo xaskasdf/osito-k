@@ -41,6 +41,18 @@ kexec_trampoline:
     jmp     .Lcopy_loop
 
 .Lcopy_done:
+    /* Diag probe: emit 'T' over COM1 so we can distinguish "copy
+     * succeeded, jump-to-kernel failed" from "trampoline never
+     * reached copy-done".  Polls 0x3FD THR-empty bit (0x20). */
+    movw    $0x3FD, %dx
+.Lprobe_t_wait:
+    inb     %dx, %al
+    testb   $0x20, %al
+    jz      .Lprobe_t_wait
+    movw    $0x3F8, %dx
+    movb    $'T', %al
+    outb    %al, %dx
+
     /* Set up minimal stack (use a safe area at 16MB) and CALL — not
      * JMP — into kernel_entry.  This is the architecturally correct
      * primitive: x86-64 SysV ABI mandates RSP % 16 == 8 at function
