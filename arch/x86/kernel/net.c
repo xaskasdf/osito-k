@@ -778,8 +778,10 @@ void __hot net_poll(void)
         tcp_send_segment(tc, TCP_ACK | TCP_PSH, tc->tx_buf, chunk);
         tc->rto_count++;
 
-        /* Exponential backoff: 3s, 6s, 12s, 24s, max 60s */
-        uint32_t backoff = 300;
+        /* Exponential backoff (RFC 6298 §5.5). Start from the
+         * Jacobson-smoothed RTO if we have one, fall back to 300
+         * ticks when no RTT sample has landed yet. Cap at 60 s. */
+        uint32_t backoff = tc->rto ? tc->rto : 300;
         for (uint32_t b = 0; b < tc->rto_count && backoff < 6000; b++)
             backoff *= 2;
         tc->rto_tick = now + backoff;
@@ -1159,6 +1161,10 @@ static void handle_tcp(const uint8_t *src_ip, const uint8_t *pkt, uint32_t len)
     bool    peer_sack_ok = false;
     bool    peer_has_ts = false;
     uint32_t peer_tsval = 0;
+    uint32_t peer_tsecr = 0;
+    bool    peer_has_sack_blk = false;
+    uint32_t peer_sack_start = 0;
+    uint32_t peer_sack_end = 0;
     if (hdr_len > 20) {
         const uint8_t *opt = pkt + 20;
         uint32_t opt_len = hdr_len - 20;
@@ -1178,8 +1184,21 @@ static void handle_tcp(const uint8_t *src_ip, const uint8_t *pkt, uint32_t len)
                 peer_sack_ok = true;
             } else if (kind == 8 && l == 10) {
                 memcpy(&peer_tsval, opt + i + 2, 4);
+                memcpy(&peer_tsecr, opt + i + 6, 4);
                 peer_tsval = ntohl(peer_tsval);
+                peer_tsecr = ntohl(peer_tsecr);
                 peer_has_ts = true;
+            } else if (kind == 5 && l >= 10 && ((l - 2) % 8 == 0) &&
+                       !(flags & TCP_SYN)) {
+                /* SACK block list (RFC 2018). We only need the first
+                 * block — it's enough to decide whether our single
+                 * unACKed tx_buf segment is already in the receiver's
+                 * out-of-order queue. */
+                memcpy(&peer_sack_start, opt + i + 2, 4);
+                memcpy(&peer_sack_end,   opt + i + 6, 4);
+                peer_sack_start = ntohl(peer_sack_start);
+                peer_sack_end   = ntohl(peer_sack_end);
+                peer_has_sack_blk = true;
             }
             i += l;
         }
@@ -1364,6 +1383,36 @@ static void handle_tcp(const uint8_t *src_ip, const uint8_t *pkt, uint32_t len)
     case TCP_ESTABLISHED:
         /* ACK processing with retransmit tracking */
         if (flags & TCP_ACK) {
+            /* RTT measurement (RFC 6298 Jacobson). The peer's TSecr
+             * field echoes the TSval we stamped on an earlier outbound
+             * segment — `idt_get_ticks() - TSecr` is a precise sample,
+             * free of the Karn ambiguity. We update on every ACK that
+             * advances snd_una OR that carries a non-zero TSecr. */
+            if (conn->tsopt_ok && peer_has_ts && peer_tsecr != 0) {
+                uint64_t now = idt_get_ticks();
+                int64_t  sample = (int64_t)((uint32_t)now - peer_tsecr);
+                if (sample > 0 && sample < 60000) {
+                    if (conn->srtt == 0) {
+                        conn->srtt   = (uint32_t)sample;
+                        conn->rttvar = (uint32_t)(sample / 2);
+                    } else {
+                        int32_t diff = (int32_t)sample - (int32_t)conn->srtt;
+                        int32_t abs_diff = diff < 0 ? -diff : diff;
+                        /* RTTVAR = 3/4 * RTTVAR + 1/4 * |diff| */
+                        conn->rttvar = (uint32_t)(
+                            ((int64_t)conn->rttvar * 3 + abs_diff) / 4);
+                        /* SRTT = 7/8 * SRTT + 1/8 * sample
+                         * ≡ SRTT + diff/8 (signed) */
+                        conn->srtt = (uint32_t)(
+                            (int64_t)conn->srtt + diff / 8);
+                    }
+                    uint32_t rto = conn->srtt + (conn->rttvar << 2);
+                    if (rto < 100)   rto = 100;
+                    if (rto > 60000) rto = 60000;
+                    conn->rto = rto;
+                }
+            }
+
             if (ack > conn->snd_una) {
                 /* New data ACKed — advance tx_buf, reset dup count */
                 uint32_t acked = ack - conn->snd_una;
@@ -1380,19 +1429,42 @@ static void handle_tcp(const uint8_t *src_ip, const uint8_t *pkt, uint32_t len)
                         conn->tx_len = remain;
                         conn->tx_seq += acked;
                     }
-                    conn->rto_tick = idt_get_ticks() + 300;
+                    conn->rto_tick = idt_get_ticks() +
+                                     (conn->rto ? conn->rto : 300);
                     conn->rto_count = 0;
                 }
             } else if (ack == conn->snd_una && conn->tx_len > 0) {
-                /* Duplicate ACK — fast retransmit at 3 dups (RFC 5681) */
+                /* Duplicate ACK — fast retransmit at 3 dups (RFC 5681).
+                 * RFC 6675 SACK-aware refinement: if the peer's SACK
+                 * block covers our entire unACKed tx_buf, the segment
+                 * arrived (just out-of-order). The missing piece is
+                 * BEFORE tx_seq, not at tx_buf — so retransmitting
+                 * tx_buf would burn bandwidth without making progress.
+                 * Postpone rto and wait for the cumulative ACK. */
+                bool tx_sacked = false;
+                if (peer_has_sack_blk && conn->sack_ok) {
+                    uint32_t tx_end = conn->tx_seq + conn->tx_len;
+                    if (seq_le(peer_sack_start, conn->tx_seq) &&
+                        seq_ge(peer_sack_end,   tx_end)) {
+                        tx_sacked = true;
+                    }
+                }
                 conn->dup_ack_count++;
-                if (conn->dup_ack_count >= 3) {
+                if (conn->dup_ack_count >= 3 && !tx_sacked) {
                     uint32_t chunk = conn->tx_len;
                     if (chunk > TCP_MSS) chunk = TCP_MSS;
                     tcp_send_segment(conn, TCP_ACK | TCP_PSH,
                                      conn->tx_buf, chunk);
                     conn->dup_ack_count = 0;
-                    conn->rto_tick = idt_get_ticks() + 300;
+                    conn->rto_tick = idt_get_ticks() +
+                                     (conn->rto ? conn->rto : 300);
+                } else if (tx_sacked) {
+                    /* SACK proves the receiver has our data. Slide the
+                     * timer forward so we don't fire a spurious RTO
+                     * while waiting for the cumulative ACK that's
+                     * blocked behind whatever the receiver is missing. */
+                    conn->rto_tick = idt_get_ticks() +
+                                     (conn->rto ? conn->rto : 300);
                 }
             }
         }

@@ -159,6 +159,14 @@ typedef struct {
     uint8_t   tsopt_ok;       /* peer sent TS option in SYN */
     uint32_t  ts_recent;      /* most-recent in-order peer TS Value */
 
+    /* RTT smoothing (RFC 6298 Jacobson). srtt=0 means no measurement
+     * yet — first sample seeds srtt and rttvar directly. rto is the
+     * current dynamic retransmit timeout in ticks; clamped to
+     * [100, 60000]. */
+    uint32_t  srtt;
+    uint32_t  rttvar;
+    uint32_t  rto;
+
     uint64_t  last_activity;  /* tick of last packet */
 } tcp_conn_t;
 
