@@ -17,7 +17,10 @@ extern int  net_dns_resolve(const char *hostname, uint8_t ip_out[4]);
 extern int  net_tcp_connect(const uint8_t dst_ip[4], uint16_t dst_port,
                             uint16_t src_port);
 extern void net_tcp_close(int conn);
+extern int  net_tcp_state(int conn);
 extern uint64_t idt_get_ticks(void);
+
+#define TCP_STATE_ESTABLISHED 2
 
 /* ── Helpers ─────────────────────────────────────────────────── */
 
@@ -313,6 +316,24 @@ int http_read_body(http_session_t *s, const http_response_t *resp,
 
     int total = 0;
 
+    /* tls_recv conflates two return cases under -1: hard fail
+     * (connection closed, decrypt error, alert) and pure timeout
+     * (no record within the 500-tick budget — peer is mid-response,
+     * the next TLS record is just slow to arrive).  Treating both as
+     * end-of-stream truncates large bodies whenever CF inserts a >5 s
+     * pause between records (their bge-large `/embed` reply does this
+     * routinely under load: ~7 KB land fast, the rest dribbles in).
+     *
+     * tls_recv's internal call chain (tls_recv_record → tls_read_exact
+     * → net_tcp_recv_timeout) reports the same -1 for "deadline
+     * elapsed" as for "TCP closed."  Rather than threading a new
+     * return code through three layers, distinguish at this layer:
+     * after a -1, peek at the TCP connection state.  If the kernel
+     * still has it ESTABLISHED, the peer hasn't closed — retry up to
+     * MAX_IDLE_RETRIES times.  If it's any post-ESTABLISHED state,
+     * the peer really closed and we should stop. */
+    const int MAX_IDLE_RETRIES = 12;   /* ~60 s at 500 ticks each */
+    int idle = 0;
     if (resp->chunked) {
         /* ── Chunked transfer-encoding ── */
         /* Format: <hex-size>\r\n<data>\r\n ... 0\r\n\r\n */
@@ -335,7 +356,16 @@ int http_read_body(http_session_t *s, const http_response_t *resp,
             while (!got_line) {
                 if (bp >= bl) {
                     int n = tls_recv(&s->tls, buf, sizeof(buf), 500);
-                    if (n <= 0) goto done;
+                    if (n < 0) {
+                        if (net_tcp_state(s->tcp_conn) == TCP_STATE_ESTABLISHED
+                            && ++idle < MAX_IDLE_RETRIES) continue;
+                        goto done;
+                    }
+                    if (n == 0) {
+                        if (++idle >= MAX_IDLE_RETRIES) goto done;
+                        continue;
+                    }
+                    idle = 0;
                     bp = 0;
                     bl = n;
                 }
@@ -363,7 +393,16 @@ int http_read_body(http_session_t *s, const http_response_t *resp,
             while (remaining > 0) {
                 if (bp >= bl) {
                     int n = tls_recv(&s->tls, buf, sizeof(buf), 500);
-                    if (n <= 0) goto done;
+                    if (n < 0) {
+                        if (net_tcp_state(s->tcp_conn) == TCP_STATE_ESTABLISHED
+                            && ++idle < MAX_IDLE_RETRIES) continue;
+                        goto done;
+                    }
+                    if (n == 0) {
+                        if (++idle >= MAX_IDLE_RETRIES) goto done;
+                        continue;
+                    }
+                    idle = 0;
                     bp = 0;
                     bl = n;
                 }
@@ -383,7 +422,16 @@ int http_read_body(http_session_t *s, const http_response_t *resp,
             for (int skip = 0; skip < 2; ) {
                 if (bp >= bl) {
                     int n = tls_recv(&s->tls, buf, sizeof(buf), 500);
-                    if (n <= 0) goto done;
+                    if (n < 0) {
+                        if (net_tcp_state(s->tcp_conn) == TCP_STATE_ESTABLISHED
+                            && ++idle < MAX_IDLE_RETRIES) continue;
+                        goto done;
+                    }
+                    if (n == 0) {
+                        if (++idle >= MAX_IDLE_RETRIES) goto done;
+                        continue;
+                    }
+                    idle = 0;
                     bp = 0;
                     bl = n;
                 }
@@ -415,7 +463,25 @@ int http_read_body(http_session_t *s, const http_response_t *resp,
             if (has_cl && remaining < want) want = remaining;
 
             int n = tls_recv(&s->tls, buf, want, 500);
-            if (n <= 0) break;
+            if (n < 0) {
+                /* tls_recv -1: could be a real close or just a tls_recv
+                 * deadline (the underlying tls_read_exact treats both
+                 * the same).  If the TCP connection is still alive and
+                 * we still have content-length remaining, keep trying. */
+                if (net_tcp_state(s->tcp_conn) == TCP_STATE_ESTABLISHED
+                    && ++idle < MAX_IDLE_RETRIES) continue;
+                break;
+            }
+            if (n == 0) {
+                /* Timeout with connection still alive.  If we have a
+                 * known content-length and haven't reached it, keep
+                 * trying — the server may be mid-response.  For read-
+                 * until-close (no CL), a long idle stretch is the
+                 * normal terminator, so still cap retries. */
+                if (++idle >= MAX_IDLE_RETRIES) break;
+                continue;
+            }
+            idle = 0;
 
             if (callback) {
                 if (callback(buf, (uint32_t)n, ctx) < 0)
