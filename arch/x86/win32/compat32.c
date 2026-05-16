@@ -2166,6 +2166,37 @@ uint64_t compat32_dispatch(uint32_t thunk_idx, uint32_t *stack_args)
         extern uint32_t g_last_stack_args;
         g_last_caller_eip = ret_addr;
         g_last_stack_args = (uint32_t)(uintptr_t)stack_args;
+
+        /* BAD-THIS detector: only flag ECX in PE-image .text range.
+         * EDX in code range is often a legit function-pointer arg
+         * (e.g. __dllonexit, callback registrations).  But ECX is
+         * `this` for any C++ thiscall — a real `this` is a heap or
+         * stack object, never a .text address.  When ECX lands in
+         * code range, the engine is about to deref a code byte as
+         * a vtable pointer, the start of the corrupt-three-level-
+         * indirect chain that ends in NX-fault on data.            */
+        uint32_t ecx = (uint32_t)g_int2e_user_rcx;
+        uint32_t edx = (uint32_t)g_int2e_user_rdx;
+        static int bad_this_count = 0;
+        int bad_ecx = (ecx >= 0x10000000 && ecx < 0x12000000);
+        if (bad_ecx && bad_this_count < 40) {
+            bad_this_count++;
+            serial_puts("[BAD-THIS#");
+            serial_putdec((uint64_t)bad_this_count);
+            serial_puts("] thunk=");
+            serial_putdec((uint64_t)thunk_idx);
+            serial_puts(" caller=0x");
+            serial_puthex(ret_addr, 8);
+            serial_puts(" ECX=0x");
+            serial_puthex(ecx, 8);
+            serial_puts(" EDX=0x");
+            serial_puthex(edx, 8);
+            serial_puts(" ESI=0x");
+            serial_puthex((uint32_t)g_int2e_user_rsi, 8);
+            serial_puts(" EDI=0x");
+            serial_puthex((uint32_t)g_int2e_user_rdi, 8);
+            serial_puts("\n");
+        }
     }
 
     /* Clean up null-page stale data from compat32 writes.
