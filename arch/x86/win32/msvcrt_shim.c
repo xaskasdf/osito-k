@@ -2251,10 +2251,14 @@ uint32_t crt_get_base_seh_thunk(void); /* forward decl */
 
 void WINAPI crt_CxxThrowException(PVOID pExceptionObject, PVOID pThrowInfo)
 {
+    extern uint32_t compat32_get_last_caller_eip(void);
+    uint32_t throw_eip = compat32_get_last_caller_eip();
     serial_puts("[MSVCRT] _CxxThrowException: obj=0x");
     serial_puthex((uint64_t)(ULONG_PTR)pExceptionObject, 8);
     serial_puts(" throwInfo=0x");
     serial_puthex((uint64_t)(ULONG_PTR)pThrowInfo, 8);
+    serial_puts(" thrown_from=0x");
+    serial_puthex(throw_eip, 8);
     serial_puts("\n");
 
     /* Dump thrown object to identify the error message.
