@@ -109,15 +109,37 @@ static int stub_gmalloc_installed = 0;
 
 static void ensure_gmalloc_stub(void)
 {
-
     /* GMalloc is at Core.dll + RVA 0xA7B90 (VA 0x101A7B90 when base=0x10100000).
      * It's a FMalloc* pointer. On disk, it points to a BSS object (0x101E3450)
      * whose vtable starts as 0 (zero-initialized). The pointer is NON-NULL but
      * the vtable is NULL — so we check the vtable, not the pointer. */
     volatile uint32_t *gmalloc = (volatile uint32_t *)(uintptr_t)0x101A7B90;
 
+    /* Diagnostic: trace the GMalloc/vtbl state across calls.  Log only
+     * every Nth call to avoid spam, plus always-log when state changes. */
+    static uint32_t last_obj  = 0xFFFFFFFF;
+    static uint32_t last_vtbl = 0xFFFFFFFF;
+    static int call_n = 0;
+    call_n++;
+    uint32_t cur_obj  = *gmalloc;
+    uint32_t cur_vtbl = (cur_obj && cur_obj < 0x80000000)
+                       ? *(volatile uint32_t *)(uintptr_t)cur_obj : 0;
+    int changed = (cur_obj != last_obj) || (cur_vtbl != last_vtbl);
+    if (changed || call_n < 10 || (call_n % 25) == 0) {
+        serial_puts("[GMSTATE#");
+        serial_putdec((uint64_t)call_n);
+        serial_puts("] *0x101A7B90=0x");
+        serial_puthex(cur_obj, 8);
+        serial_puts(" *obj=0x");
+        serial_puthex(cur_vtbl, 8);
+        if (changed && call_n > 1) serial_puts(" CHANGED");
+        serial_puts("\n");
+        last_obj  = cur_obj;
+        last_vtbl = cur_vtbl;
+    }
+
     /* Check if Core.dll is loaded */
-    uint32_t obj_addr = *gmalloc;
+    uint32_t obj_addr = cur_obj;
     if (obj_addr < 0x10000000 || obj_addr >= 0x20000000) {
         serial_puts("[CRT] GMalloc not in DLL range: 0x");
         serial_puthex(obj_addr, 8);
@@ -128,9 +150,11 @@ static void ensure_gmalloc_stub(void)
     /* Check if the FMalloc object's vtable is already valid */
     volatile uint32_t *obj_vtbl = (volatile uint32_t *)(uintptr_t)obj_addr;
     if (*obj_vtbl != 0) {
-        serial_puts("[CRT] GMalloc vtable already set: 0x");
-        serial_puthex(*obj_vtbl, 8);
-        serial_puts("\n");
+        if (changed) {
+            serial_puts("[CRT] GMalloc vtable already set: 0x");
+            serial_puthex(*obj_vtbl, 8);
+            serial_puts("\n");
+        }
         return;  /* Already constructed by appInit */
     }
 

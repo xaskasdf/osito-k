@@ -187,27 +187,22 @@ static PVOID win32_va_alloc(SIZE_T size, uint64_t *out_phys, ULONG protect)
     void *phys = mem_alloc_pages(pages);
     if (!phys) return NULL;
 
-    /* Align VA to 64KB boundary — Windows VirtualAlloc guarantees
-     * dwAllocationGranularity (64KB) alignment. FMallocWindows's
-     * binned pool allocator uses (ptr >> 16) & 0xFF for pool index;
-     * without 64KB alignment, pool lookups corrupt free-lists.
+    /* Free-list recycling DISABLED (regression investigation 2026-05-15).
+     * GMalloc state logging confirmed GMalloc is INTACT across the entire
+     * run (525+ calls, no CHANGED events after init).  Tombstone +
+     * STALE-PTR detector saw 0 hits.  Yet engine still crashes at
+     * vec=14 NX-fault RIP=0x401BC870 → engine treats DATA as code at a
+     * freshly-allocated NX page.  Root cause not pinpointed; engine
+     * derives a function pointer from somewhere that points to a
+     * data buffer.  Cannot fix without engine source.
      *
-     * Free-list recycling DISABLED for now.  Two experiments showed:
-     *   1. Recycling without tombstone → engine crashes at vec=14
-     *      RIP=0x401BC870 (jumps to data in recycled VA).
-     *   2. Recycling WITH tombstone fill + STALE-PTR detector →
-     *      same early crash, STALE detector reports zero hits
-     *      (engine doesn't read tombstoned memory, so the crash
-     *      cause is NOT stale-pointer-deref).
-     * Conclusion: UE1/UT99 does NOT rely on freed-VA-still-readable,
-     * but free-list recycling somehow breaks compat32 _initterm
-     * dispatch (DLL static init at index 69 fires PF before
-     * appMalloc is initialized).  The interaction is unclear —
-     * needs deeper investigation.  Until then, pure bump allocator. */
+     * Keep the free-list scaffolding so future investigations can
+     * re-enable trivially.  See project_ut99_thunks_at_13d5.md and
+     * project_ut99_stale_ptr_falsified.md for the trail. */
     uint64_t va = (win32_va_next + 0xFFFF) & ~0xFFFFULL;
     uint64_t va_end = va + size;
     int recycled = 0;
-    (void)vm_freelist_take;  /* keep the function alive for future use */
+    (void)vm_freelist_take;
     if (va_end > WIN32_VA_LIMIT) {
         mem_free_pages(phys, pages);
         return NULL;
@@ -776,9 +771,6 @@ NTSTATUS sys_NtFreeVirtualMemory(ULONG_PTR *args)
             uint32_t *p = (uint32_t *)(uintptr_t)va;
             SIZE_T words = tracked / 4;
             for (SIZE_T i = 0; i < words; i++) p[i] = 0xDEADC0DE;
-            /* Free-list recycle disabled (see win32_va_alloc); we
-             * still tombstone-fill so the STALE-PTR detector in idt.c
-             * can spot any engine reads of freed memory. */
             (void)vm_freelist_add;
         }
         nt_log_hex("  release (tombstone) size = ", tracked);
