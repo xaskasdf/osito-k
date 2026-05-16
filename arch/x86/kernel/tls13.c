@@ -652,6 +652,24 @@ int tls13_connect(int tcp_conn, const char *hostname)
                                 serial_puts("[TLS1.3] validity skipped (NTP not synced)\n");
                             }
 
+                            /* A12.8: SAN / hostname match on the leaf.
+                             * Looks at the cert's Subject Alternative
+                             * Name extension (or falls back to Subject
+                             * CN) and verifies one of the dNSName
+                             * entries matches the SNI hostname we
+                             * connected to. */
+                            extern int x509_match_hostname(
+                                const uint8_t *cert, uint32_t cert_len,
+                                const char *hostname);
+                            if (nc >= 1 && hostname) {
+                                int m = x509_match_hostname(
+                                    certs[0], cert_lens[0], hostname);
+                                serial_puts("[TLS1.3] hostname match (");
+                                serial_puts(hostname);
+                                serial_puts("): ");
+                                serial_puts(m == 0 ? "OK\n" : "MISMATCH\n");
+                            }
+
                             /* Chain link verification: each cert is
                              * signed by the next.  Logs PASS/FAIL
                              * per link; informative mode (no abort). */

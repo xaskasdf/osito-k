@@ -429,3 +429,84 @@ int cert_pin_check_leaf(const uint8_t *cert_msg, uint32_t cert_msg_len)
     serial_puts("[PIN] WARN: no chain cert in pin table — accepting (mode=warn)\n");
     return 0;
 }
+
+/* ── Operator CA bundle (A12.9) ─────────────────────────────────
+ *
+ * Reads `osfs2:tls/roots.txt`, one SHA-256 hex digest per line.
+ * Each parsed digest is added to the dynamic pin table.  Lets an
+ * operator extend trust without rebuilding the kernel.
+ *
+ * Lines starting with '#' or whitespace-only are skipped.  Trailing
+ * comments after a digest (e.g. "<hex> # Some CA") are tolerated.
+ */
+
+#define OPERATOR_ROOTS_PATH  "tls/roots.txt"
+#define OPERATOR_ROOTS_MAX   16384   /* upper bound on file size */
+
+static int hex_nibble(char c)
+{
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return 10 + (c - 'a');
+    if (c >= 'A' && c <= 'F') return 10 + (c - 'A');
+    return -1;
+}
+
+int cert_pin_load_operator_roots(void)
+{
+    if (!osfs2_is_mounted()) return -1;
+    vfs_stub_t node;
+    if (!vfs_find(OPERATOR_ROOTS_PATH, 0, &node)) return -1;
+
+    static uint8_t buf[OPERATOR_ROOTS_MAX + 1];
+    uint32_t cap = node.size < OPERATOR_ROOTS_MAX ? (uint32_t)node.size
+                                                  : OPERATOR_ROOTS_MAX;
+    int n = vfs_read(&node, 0, buf, cap);
+    if (n < 0) return -1;
+    buf[n] = 0;
+
+    int added = 0;
+    uint32_t i = 0;
+    while ((int)i < n) {
+        /* Skip leading whitespace */
+        while ((int)i < n && (buf[i] == ' ' || buf[i] == '\t')) i++;
+        /* Comment or blank line? */
+        if ((int)i >= n || buf[i] == '#' || buf[i] == '\n' || buf[i] == '\r') {
+            while ((int)i < n && buf[i] != '\n') i++;
+            if ((int)i < n) i++;
+            continue;
+        }
+        /* Parse 64 hex chars → 32-byte digest. */
+        uint8_t digest[32];
+        int ok = 1;
+        for (int b = 0; b < 32; b++) {
+            if ((int)(i + 1) >= n) { ok = 0; break; }
+            int hi = hex_nibble((char)buf[i]);
+            int lo = hex_nibble((char)buf[i + 1]);
+            if (hi < 0 || lo < 0) { ok = 0; break; }
+            digest[b] = (uint8_t)((hi << 4) | lo);
+            i += 2;
+        }
+        if (!ok) {
+            /* Drain bad line. */
+            while ((int)i < n && buf[i] != '\n') i++;
+            if ((int)i < n) i++;
+            continue;
+        }
+        /* Trailing space or comment is OK; skip to newline. */
+        while ((int)i < n && buf[i] != '\n') i++;
+        if ((int)i < n) i++;
+
+        /* Add to dynamic table if not already present. */
+        if (!dyn_table_has(digest)) {
+            dyn_table_add(digest);
+            added++;
+        }
+    }
+    if (added > 0) {
+        dyn_table_save();
+        serial_puts("[PIN] operator roots loaded: +");
+        serial_putdec((uint64_t)added);
+        serial_puts(" digests from tls/roots.txt\n");
+    }
+    return added;
+}

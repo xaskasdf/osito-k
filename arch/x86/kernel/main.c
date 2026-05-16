@@ -776,6 +776,13 @@ void __initk kernel_entry(boot_info_t *info)
             extern int cert_pin_load_dynamic(void);
             cert_pin_load_dynamic();
 
+            /* A12.9: operator CA bundle — parse tls/roots.txt (one
+             * SHA-256 hex digest per line, `#` comments tolerated)
+             * and append each to the dynamic pin table. Lets the
+             * operator extend trust without rebuilding the kernel. */
+            extern int cert_pin_load_operator_roots(void);
+            cert_pin_load_operator_roots();
+
             /* TLS 1.3 key-schedule self-test (RFC 8448 §3 vectors).
              * Verifies hkdf_extract + hkdf_expand_label produce the
              * canonical early_secret + derived values. Cheap (~2 HMAC
@@ -796,6 +803,15 @@ void __initk kernel_entry(boot_info_t *info)
                 serial_puts("[KERN] RSA-2048 verify self-test: PASS\n");
             else
                 serial_puts("[KERN] RSA-2048 verify self-test: FAIL\n");
+
+            /* ECDSA P-384 verify self-test (A12.7). Closes the
+             * intermediate → root cryptographic chain link (GTS
+             * Root R4 uses a P-384 public key). */
+            extern int ecdsa_p384_self_test(void);
+            if (ecdsa_p384_self_test() == 0)
+                serial_puts("[KERN] ECDSA P-384 verify self-test: PASS\n");
+            else
+                serial_puts("[KERN] ECDSA P-384 verify self-test: FAIL\n");
 
             /* SHA-384 hash self-test against FIPS 180-4 vector
              * SHA-384("abc"). Needed for chain validation links

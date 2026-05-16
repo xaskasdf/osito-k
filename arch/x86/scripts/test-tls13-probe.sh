@@ -23,6 +23,22 @@ for fn in ws-test.txt ws-send.txt ws-serve.txt ws-gen.txt no-demo.bin \
 done
 "$OFS_TOOLS/ositofs-write" "$NVME" "$SENT_DIR/no-demo.bin"    | tail -1
 "$OFS_TOOLS/ositofs-write" "$NVME" "$SENT_DIR/tls13-probe.txt"  | tail -1
+
+# A12.9: drop an operator CA bundle test file so the loader sees
+# it during boot.  Mix of duplicates (already-pinned) and one
+# new dummy hash to exercise both the dedup and add paths.
+mkdir -p "$SENT_DIR/tls"
+cat > "$SENT_DIR/tls/roots.txt" <<'_ROOTS'
+# Operator-added roots (A12.9 test)
+# Duplicates of static pins (should be skipped as already-present)
+1dfc1605fbad358d8bc844f76d15203fac9ca5c1a79fd4857ffaf2864fbebf96
+76b27b80a58027dc3cf1da68dac17010ed93997d0b603e2fadbe85012493b5a7
+# A made-up hash to test parsing of new entries
+0000111122223333444455556666777788889999aaaabbbbccccddddeeeeffff
+_ROOTS
+"$OFS_TOOLS/ositofs-delete" "$NVME" "tls/roots.txt" >/dev/null 2>&1 || true
+"$OFS_TOOLS/ositofs-write" "$NVME" "$SENT_DIR/tls/roots.txt" \
+    --name "tls/roots.txt" --overwrite | tail -1
 rm -rf "$SENT_DIR"
 
 ESP="$BUILD/esp-tls13.img"

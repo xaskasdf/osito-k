@@ -73,4 +73,21 @@ int cert_pin_check_leaf(const uint8_t *cert_msg, uint32_t cert_msg_len);
  * Returns 0 on success, -1 on parse error / fs unavailable. */
 int cert_pin_load_dynamic(void);
 
+/* ── Operator CA bundle (A12.9) ────────────────────────────────
+ *
+ * Reads a text file at `osfs2:tls/roots.txt`, one SHA-256 hex
+ * digest per line (with optional `#`-prefixed comments and
+ * trailing space/tab tolerated).  Each parsed digest is added to
+ * the dynamic pin table — so an operator can extend the kernel's
+ * trust set without rebuilding by writing the file to osfs2.
+ *
+ * Format example:
+ *     # Issued by some new CA we want to trust
+ *     76b27b80a58027dc3cf1da68dac17010ed93997d0b603e2fadbe85012493b5a7
+ *     # Another root
+ *     1dfc1605fbad358d8bc844f76d15203fac9ca5c1a79fd4857ffaf2864fbebf96
+ *
+ * Returns the number of digests added, or -1 on FS unavailable. */
+int cert_pin_load_operator_roots(void);
+
 #endif

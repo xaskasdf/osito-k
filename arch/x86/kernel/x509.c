@@ -212,6 +212,9 @@ extern int  rsa_pkcs1_v15_sha384_verify(const uint8_t *sig, uint32_t sig_len,
 extern int  ecdsa_p256_verify(const uint8_t pub_x[32], const uint8_t pub_y[32],
                               const uint8_t hash[32],
                               const uint8_t *sig, uint32_t sig_len);
+extern int  ecdsa_p384_verify(const uint8_t pub_x[48], const uint8_t pub_y[48],
+                              const uint8_t hash[48],
+                              const uint8_t *sig, uint32_t sig_len);
 
 /* OIDs we recognize for signature algorithms. */
 static const uint8_t OID_SHA256_WITH_RSA[] = {
@@ -435,24 +438,49 @@ int x509_verify_chain_link(const uint8_t *child_cert, uint32_t child_len,
     }
 
     if (sa == SIG_ECDSA_P256_SHA256 || sa == SIG_ECDSA_P256_SHA384) {
-        uint8_t pub_x[32], pub_y[32];
-        if (x509_extract_ec_pubkey(issuer_cert, issuer_len, pub_x, pub_y) < 0) {
-            serial_puts("[X509] chain: issuer EC pubkey extract failed\n");
-            return -1;
-        }
-        /* For SHA-384 → P-256, FIPS 186-4 §6.4 truncates the digest
-         * to the leftmost 32 bytes (= P-256 curve order width). */
-        const uint8_t *hash_to_verify = (sa == SIG_ECDSA_P256_SHA256) ? hash32 : hash48;
-        if (ecdsa_p256_verify(pub_x, pub_y, hash_to_verify, cp.sig, cp.sig_len) != 0) {
+        /* ECDSA verification — the *curve* is determined by the
+         * issuer's pubkey, NOT by the sigalg OID.  Probe both
+         * extractors and dispatch to the matching primitive.  P-256
+         * first since it's the common case. */
+        uint8_t p256x[32], p256y[32];
+        if (x509_extract_ec_pubkey(issuer_cert, issuer_len, p256x, p256y) == 0) {
+            /* For SHA-384 → P-256, FIPS 186-4 §6.4 leftmost-truncates
+             * the 48-byte digest to 32 bytes. */
+            const uint8_t *hh = (sa == SIG_ECDSA_P256_SHA256) ? hash32 : hash48;
+            if (ecdsa_p256_verify(p256x, p256y, hh, cp.sig, cp.sig_len) != 0) {
+                serial_puts(sa == SIG_ECDSA_P256_SHA256
+                    ? "[X509] chain: ECDSA-P256-SHA256 verify FAILED\n"
+                    : "[X509] chain: ECDSA-P256-SHA384 verify FAILED\n");
+                return -1;
+            }
             serial_puts(sa == SIG_ECDSA_P256_SHA256
-                ? "[X509] chain: ECDSA-P256-SHA256 verify FAILED\n"
-                : "[X509] chain: ECDSA-P256-SHA384 verify FAILED\n");
-            return -1;
+                ? "[X509] chain: ECDSA-P256-SHA256 link verified\n"
+                : "[X509] chain: ECDSA-P256-SHA384 link verified\n");
+            return 0;
         }
-        serial_puts(sa == SIG_ECDSA_P256_SHA256
-            ? "[X509] chain: ECDSA-P256-SHA256 link verified\n"
-            : "[X509] chain: ECDSA-P256-SHA384 link verified\n");
-        return 0;
+        uint8_t p384x[48], p384y[48];
+        if (x509_extract_ec_pubkey_p384(issuer_cert, issuer_len,
+                                         p384x, p384y) == 0) {
+            /* SHA-256 against P-384 is not used in practice, but
+             * support it for completeness: zero-pad the 32-byte
+             * hash to 48 (right-align — leftmost bits zero).  The
+             * canonical case is SHA-384 → P-384, no truncation. */
+            uint8_t hh48[48];
+            if (sa == SIG_ECDSA_P256_SHA384) {
+                for (int i = 0; i < 48; i++) hh48[i] = hash48[i];
+            } else {
+                for (int i = 0; i < 16; i++) hh48[i] = 0;
+                for (int i = 0; i < 32; i++) hh48[16 + i] = hash32[i];
+            }
+            if (ecdsa_p384_verify(p384x, p384y, hh48, cp.sig, cp.sig_len) != 0) {
+                serial_puts("[X509] chain: ECDSA-P384 verify FAILED\n");
+                return -1;
+            }
+            serial_puts("[X509] chain: ECDSA-P384 link verified\n");
+            return 0;
+        }
+        serial_puts("[X509] chain: issuer EC pubkey extract failed (neither P-256 nor P-384)\n");
+        return -1;
     }
 
     return -1;
@@ -614,4 +642,268 @@ int x509_check_validity(const uint8_t *cert, uint32_t cert_len, uint32_t now_utc
         return -1;
     }
     return 0;
+}
+
+/* ── P-384 EC pubkey extraction (A12.7) ──────────────────────── */
+
+int x509_extract_ec_pubkey_p384(const uint8_t *cert, uint32_t cert_len,
+                                uint8_t pub_x[48], uint8_t pub_y[48])
+{
+    const uint8_t *p = cert;
+    const uint8_t *end = cert + cert_len;
+    const uint8_t *outer_end;
+    if (der_enter(&p, end, 0x30, &outer_end) < 0) return -1;
+    const uint8_t *tbs_end;
+    if (der_enter(&p, outer_end, 0x30, &tbs_end) < 0) return -1;
+    if (p < tbs_end && p[0] == 0xA0)
+        if (der_skip_tlv(&p, tbs_end) < 0) return -1;
+    for (int i = 0; i < 5; i++)
+        if (der_skip_tlv(&p, tbs_end) < 0) return -1;
+
+    const uint8_t *spki_end;
+    if (der_enter(&p, tbs_end, 0x30, &spki_end) < 0) return -1;
+
+    /* AlgorithmIdentifier — id-ecPublicKey ‖ secp384r1 */
+    static const uint8_t OID_ID_EC_PK[] = {
+        0x06, 0x07, 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x02, 0x01
+    };
+    static const uint8_t OID_SECP384R1[] = {
+        0x06, 0x05, 0x2B, 0x81, 0x04, 0x00, 0x22
+    };
+    const uint8_t *alg_end;
+    if (der_enter(&p, spki_end, 0x30, &alg_end) < 0) return -1;
+    if ((uint32_t)(alg_end - p) < sizeof OID_ID_EC_PK ||
+        bytes_eq(p, OID_ID_EC_PK, sizeof OID_ID_EC_PK) != 0) return -1;
+    p += sizeof OID_ID_EC_PK;
+    if ((uint32_t)(alg_end - p) < sizeof OID_SECP384R1 ||
+        bytes_eq(p, OID_SECP384R1, sizeof OID_SECP384R1) != 0) return -1;
+    p = alg_end;
+
+    /* subjectPublicKey BIT STRING: unused-bits ‖ 0x04 ‖ X(48) ‖ Y(48) */
+    if (p >= spki_end || *p != 0x03) return -1;
+    p++;
+    uint32_t bs_len;
+    if (der_read_len(&p, spki_end, &bs_len) < 0) return -1;
+    if (p + bs_len > spki_end || bs_len < 98) return -1;
+    if (p[0] != 0x00 || p[1] != 0x04) return -1;
+    for (int i = 0; i < 48; i++) pub_x[i] = p[2 + i];
+    for (int i = 0; i < 48; i++) pub_y[i] = p[50 + i];
+    return 0;
+}
+
+/* ── SAN / hostname matching (A12.8) ──────────────────────────── */
+
+/* Case-insensitive single-byte tolower for ASCII. */
+static inline char to_lower_ascii(char c)
+{
+    return (c >= 'A' && c <= 'Z') ? (char)(c - 'A' + 'a') : c;
+}
+
+/* RFC 6125 §6.4.3 dNSName match.  `pat` is a label string from a
+ * SAN dNSName; `host` is the user-supplied hostname.  Both are
+ * matched case-insensitively.  Wildcards (`*`) may appear in the
+ * leftmost label of `pat` only, and consume exactly one label of
+ * `host` — no empty match, no multi-label match. */
+static int san_dns_match(const char *pat, uint32_t pat_len,
+                         const char *host, uint32_t host_len)
+{
+    if (pat_len == 0 || host_len == 0) return 0;
+
+    /* Find first '.' in pat to identify the leftmost label. */
+    uint32_t first_dot = 0;
+    while (first_dot < pat_len && pat[first_dot] != '.') first_dot++;
+
+    bool has_wild = (first_dot >= 1 && pat[0] == '*' && first_dot == 1);
+    if (!has_wild) {
+        /* Plain equality, case-insensitive. */
+        if (pat_len != host_len) return 0;
+        for (uint32_t i = 0; i < pat_len; i++)
+            if (to_lower_ascii(pat[i]) != to_lower_ascii(host[i])) return 0;
+        return 1;
+    }
+
+    /* Wildcard: pat = "*" || rest_of_pat (starting at first_dot).
+     * Match host's leftmost label, then require rest_of_host ==
+     * rest_of_pat (case-insensitive).  Empty leftmost label is not
+     * allowed (RFC 6125: "presented name MUST NOT contain a
+     * wildcard character (e.g., '*') that matches a public suffix"
+     * — we don't enforce public-suffix list, just the empty-label
+     * guard). */
+    uint32_t host_dot = 0;
+    while (host_dot < host_len && host[host_dot] != '.') host_dot++;
+    if (host_dot == 0) return 0;                 /* empty label */
+    if (host_dot == host_len) return 0;          /* host has no dot */
+    uint32_t pat_rest_len = pat_len - first_dot;
+    uint32_t host_rest_len = host_len - host_dot;
+    if (pat_rest_len != host_rest_len) return 0;
+    for (uint32_t i = 0; i < pat_rest_len; i++)
+        if (to_lower_ascii(pat[first_dot + i]) !=
+            to_lower_ascii(host[host_dot + i])) return 0;
+    return 1;
+}
+
+/* Find the extensions block ([3] EXPLICIT tag inside TBSCertificate)
+ * and return pointers to its content (the inner Extensions SEQUENCE).
+ * Returns 0 on success, -1 if the cert has no extensions block. */
+static int find_extensions(const uint8_t *cert, uint32_t cert_len,
+                           const uint8_t **ext_seq_start,
+                           const uint8_t **ext_seq_end)
+{
+    const uint8_t *p = cert;
+    const uint8_t *end = cert + cert_len;
+    const uint8_t *outer_end, *tbs_end;
+    if (der_enter(&p, end, 0x30, &outer_end) < 0) return -1;
+    if (der_enter(&p, outer_end, 0x30, &tbs_end) < 0) return -1;
+    if (p < tbs_end && p[0] == 0xA0)
+        if (der_skip_tlv(&p, tbs_end) < 0) return -1;
+    /* serial, sigAlg, issuer, validity, subject, SPKI = 6 TLVs */
+    for (int i = 0; i < 6; i++)
+        if (der_skip_tlv(&p, tbs_end) < 0) return -1;
+    /* Optional issuerUniqueID [1] and subjectUniqueID [2] before
+     * the extensions [3] block. */
+    while (p < tbs_end) {
+        uint8_t tag = *p;
+        if (tag == 0xA3) {
+            /* Found extensions: enter the [3] explicit wrapper. */
+            const uint8_t *exp_end;
+            if (der_enter(&p, tbs_end, 0xA3, &exp_end) < 0) return -1;
+            /* Inside [3]: a single SEQUENCE OF Extension. */
+            if (der_enter(&p, exp_end, 0x30, ext_seq_end) < 0) return -1;
+            *ext_seq_start = p;
+            return 0;
+        }
+        if (tag == 0x81 || tag == 0x82) {
+            if (der_skip_tlv(&p, tbs_end) < 0) return -1;
+            continue;
+        }
+        /* Unknown tag in this position — bail. */
+        break;
+    }
+    return -1;
+}
+
+/* Find the Subject CN value (case insensitive match in matcher).
+ * The CN OID is 2.5.4.3 = 06 03 55 04 03. */
+static int find_subject_cn(const uint8_t *cert, uint32_t cert_len,
+                           const uint8_t **cn_str, uint32_t *cn_len)
+{
+    const uint8_t *p = cert;
+    const uint8_t *end = cert + cert_len;
+    const uint8_t *outer_end, *tbs_end;
+    if (der_enter(&p, end, 0x30, &outer_end) < 0) return -1;
+    if (der_enter(&p, outer_end, 0x30, &tbs_end) < 0) return -1;
+    if (p < tbs_end && p[0] == 0xA0)
+        if (der_skip_tlv(&p, tbs_end) < 0) return -1;
+    /* serial, sigAlg, issuer, validity (4 TLVs) → subject SEQUENCE */
+    for (int i = 0; i < 4; i++)
+        if (der_skip_tlv(&p, tbs_end) < 0) return -1;
+    const uint8_t *subj_end;
+    if (der_enter(&p, tbs_end, 0x30, &subj_end) < 0) return -1;
+
+    /* Subject is a SEQUENCE of RDN (SET OF AttributeTypeAndValue). */
+    static const uint8_t OID_CN[] = { 0x06, 0x03, 0x55, 0x04, 0x03 };
+    while (p < subj_end) {
+        const uint8_t *rdn_end;
+        if (der_enter(&p, subj_end, 0x31, &rdn_end) < 0) return -1;
+        while (p < rdn_end) {
+            const uint8_t *atv_end;
+            if (der_enter(&p, rdn_end, 0x30, &atv_end) < 0) return -1;
+            /* OID */
+            if ((uint32_t)(atv_end - p) >= sizeof OID_CN &&
+                bytes_eq(p, OID_CN, sizeof OID_CN) == 0) {
+                p += sizeof OID_CN;
+                /* Value is a tag-prefixed string — PrintableString
+                 * (0x13), UTF8String (0x0c), or others.  Just read
+                 * the body bytes. */
+                if (p >= atv_end) return -1;
+                p++;                                    /* skip tag */
+                uint32_t v_len;
+                if (der_read_len(&p, atv_end, &v_len) < 0) return -1;
+                if (p + v_len > atv_end) return -1;
+                *cn_str = p;
+                *cn_len = v_len;
+                return 0;
+            }
+            p = atv_end;
+        }
+    }
+    return -1;
+}
+
+int x509_match_hostname(const uint8_t *cert, uint32_t cert_len,
+                        const char *hostname)
+{
+    if (!hostname || hostname[0] == 0) return -1;
+    uint32_t host_len = 0;
+    while (hostname[host_len]) host_len++;
+
+    const uint8_t *ext_p, *ext_end;
+    int have_san = 0;
+    int got_match = 0;
+    if (find_extensions(cert, cert_len, &ext_p, &ext_end) == 0) {
+        static const uint8_t OID_SAN[] = { 0x06, 0x03, 0x55, 0x1d, 0x11 };
+        while (ext_p < ext_end) {
+            const uint8_t *ex_end;
+            if (der_enter(&ext_p, ext_end, 0x30, &ex_end) < 0) break;
+            const uint8_t *probe = ext_p;
+            const uint8_t *probe_end = ex_end;
+            /* AlgorithmIdentifier-like: OID, optional BOOLEAN
+             * (critical), OCTET STRING (value). */
+            if ((uint32_t)(probe_end - probe) < sizeof OID_SAN ||
+                bytes_eq(probe, OID_SAN, sizeof OID_SAN) != 0) {
+                ext_p = ex_end;
+                continue;
+            }
+            probe += sizeof OID_SAN;
+            if (probe < probe_end && *probe == 0x01) {
+                /* critical BOOLEAN — skip */
+                if (der_skip_tlv(&probe, probe_end) < 0) break;
+            }
+            /* OCTET STRING wrapping the GeneralNames SEQUENCE. */
+            if (probe >= probe_end || *probe != 0x04) { ext_p = ex_end; continue; }
+            probe++;
+            uint32_t os_len;
+            if (der_read_len(&probe, probe_end, &os_len) < 0) { ext_p = ex_end; continue; }
+            if (probe + os_len > probe_end) { ext_p = ex_end; continue; }
+            const uint8_t *gn_start = probe;
+            const uint8_t *gn_end_outer = probe + os_len;
+
+            /* GeneralNames SEQUENCE. */
+            const uint8_t *gn_seq_end;
+            const uint8_t *gp = gn_start;
+            if (der_enter(&gp, gn_end_outer, 0x30, &gn_seq_end) < 0) {
+                ext_p = ex_end; continue;
+            }
+            have_san = 1;
+            while (gp < gn_seq_end) {
+                uint8_t tag = *gp;
+                gp++;
+                uint32_t glen;
+                if (der_read_len(&gp, gn_seq_end, &glen) < 0) break;
+                if (gp + glen > gn_seq_end) break;
+                if (tag == 0x82) {
+                    /* [2] dNSName IA5String */
+                    if (san_dns_match((const char *)gp, glen,
+                                       hostname, host_len)) {
+                        got_match = 1;
+                        break;
+                    }
+                }
+                gp += glen;
+            }
+            if (got_match) break;
+            ext_p = ex_end;
+        }
+    }
+
+    if (got_match) return 0;
+    if (have_san)  return -1;       /* SAN present → don't fall to CN */
+
+    /* No SAN — fall back to CN matching. */
+    const uint8_t *cn; uint32_t cn_len;
+    if (find_subject_cn(cert, cert_len, &cn, &cn_len) == 0) {
+        if (san_dns_match((const char *)cn, cn_len, hostname, host_len))
+            return 0;
+    }
+    return -1;
 }

@@ -22,6 +22,12 @@
 int x509_extract_ec_pubkey(const uint8_t *cert, uint32_t cert_len,
                            uint8_t pub_x[32], uint8_t pub_y[32]);
 
+/* Extract the EC P-384 (secp384r1) public key from a single DER-
+ * encoded cert.  pub_x and pub_y receive 48 big-endian bytes.  Used
+ * to verify the WE1 → GTS Root R4 chain link (root cert is P-384). */
+int x509_extract_ec_pubkey_p384(const uint8_t *cert, uint32_t cert_len,
+                                uint8_t pub_x[48], uint8_t pub_y[48]);
+
 /* Convenience: parse a TLS Certificate handshake message body
  * (uint24 list_len + per-cert {uint24 len + DER}) and extract from
  * the LEAF (first) cert. */
@@ -69,5 +75,23 @@ int x509_verify_chain_link(const uint8_t *child_cert,  uint32_t child_len,
  * accept a cert in a pre-NTP boot than fail closed on an unbacked
  * clock reading. */
 int x509_check_validity(const uint8_t *cert, uint32_t cert_len, uint32_t now_utc);
+
+/* ── SAN / hostname matching (A12.8) ───────────────────────────
+ *
+ * Walk the Subject Alternative Name extension (OID 2.5.29.17) and
+ * test each dNSName against `hostname`.  Wildcards (`*.example.com`)
+ * match exactly one label per RFC 6125 §6.4.3 — `foo.example.com`
+ * matches but `a.b.example.com` and `example.com` do not.
+ * Case-insensitive ASCII matching.
+ *
+ * Returns:
+ *    0   at least one dNSName matched
+ *   -1   no match, SAN missing/malformed, or hostname empty
+ *
+ * Falls back to comparing against the Subject CN ONLY if no SAN
+ * extension is present (RFC 6125 §6.4.4 — CN-matching is deprecated
+ * but still encountered in self-signed certs and old internal CAs). */
+int x509_match_hostname(const uint8_t *cert, uint32_t cert_len,
+                        const char    *hostname);
 
 #endif
