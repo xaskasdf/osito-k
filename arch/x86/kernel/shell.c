@@ -4003,6 +4003,7 @@ pdone:
 #else
         sh_puts("parallel: WASM-only\n");
 #endif
+#endif /* close outer __EMSCRIPTEN__ block so `wiki` has both branches */
     } else if (strcmp(cmd, "wiki") == 0) {
 #ifdef __EMSCRIPTEN__
         /* Browser-RAG over simple_en. Builds a ChatML system+user turn
@@ -4186,6 +4187,7 @@ pdone:
             else       sh_puts("\n");
         }
 #endif
+#ifdef __EMSCRIPTEN__ /* reopen outer block — rest of WASM-only commands */
     } else if (strcmp(cmd, "https") == 0) {
         if (argc < 2) {
             sh_puts("Usage: https <host> [path]\n");
