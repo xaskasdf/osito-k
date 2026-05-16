@@ -649,13 +649,17 @@ static LOADED_MODULE *dll_try_load_from_fs(const char *dll_name)
 }
 
 /* appUnwindf shim: suppresses the throw from appError.  Logs the
- * caller EIP + first 2 wide-string args so we can identify the
- * specific check() that failed (file + expression). */
+ * caller EIP + first 4 args. appUnwindf is `void appUnwindf(const TCHAR* fmt, ...)`
+ * — arg0 is the wide format string, rest are %-conversion targets.
+ * Print each arg both as hex and as a wide string (when the pointer is
+ * in PE/heap range), so we can see exactly what error the engine is
+ * reporting. */
 static uint64_t WINAPI shim_appUnwindf(uint64_t fmt)
 {
     (void)fmt;
     extern void serial_puts(const char *);
     extern void serial_puthex(uint64_t val, int digits);
+    extern void wdbg_print_wide(uint32_t va);
     extern uint32_t compat32_get_last_caller_eip(void);
     extern uint32_t compat32_get_last_stack_args(void);
     static int count = 0;
@@ -673,8 +677,21 @@ static uint64_t WINAPI shim_appUnwindf(uint64_t fmt)
                 serial_puts("=0x");
                 serial_puthex(v, 8);
             }
+            serial_puts("\n");
+            /* Decode wide-string args inline. */
+            for (int i = 0; i < 4; i++) {
+                uint32_t v = args[i];
+                if (v >= 0x10000 && v < 0x80000000u) {
+                    serial_puts("  arg");
+                    serial_puthex((uint64_t)i, 1);
+                    serial_puts("=");
+                    wdbg_print_wide(v);
+                    serial_puts("\n");
+                }
+            }
+        } else {
+            serial_puts("\n");
         }
-        serial_puts("\n");
     }
     return 0;
 }
