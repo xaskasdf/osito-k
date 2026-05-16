@@ -987,34 +987,28 @@ static int tcp_send_segment(tcp_conn_t *conn, uint8_t flags,
         return -1;
     }
 
-    /* SYN segments carry MSS + Window-Scale + SACK_PERMITTED options.
-     * Cloudflare and other commercial load-balancers / DDoS scrubbers
-     * silently drop SYNs with zero TCP options — they look like crude
-     * port scans.
-     *
-     * Layout (12 bytes, aligned to 4):
+    /* SYN options layout (20 bytes, header = 40 bytes total — the RFC
+     * 1122 ceiling common stacks accept):
      *   MSS (4):       kind=2, len=4, mss=1460
-     *   NOP (1):       kind=1                     — align next opt to 4
+     *   NOP (1):       kind=1                  — align WS to 4
      *   WS  (3):       kind=3, len=3, shift=TCP_RX_WSCALE
-     *   SACK_OK (2):   kind=4, len=2              — RFC 2018
-     *   NOP NOP (2):                              — pad to 4-byte align
+     *   SACK_OK (2):   kind=4, len=2           — RFC 2018
+     *   TS (10):       kind=8, len=10, val, echo  — RFC 7323
      *
-     * Non-SYN ACK segments append a SACK block option (kind=5) when
-     * the receiver is tracking out-of-order data. Layout (12 bytes):
-     *   NOP NOP (2):                              — align option to 4
-     *   SACK (10):     kind=5, len=10, [start, end) — single block
+     * Non-SYN options layout (variable, all 4-byte aligned):
+     *   TS (10) + 2 NOPs                  — if tsopt_ok          → 12B
+     *   SACK (10) + 2 NOPs                — if emit_sack         → 12B
+     *   TS (10) + SACK (10) + 2 NOPs      — both present         → 24B
      *
-     * Multi-block SACK (up to 4) is rare in practice for our flows —
-     * one OOO range is the dominant case at our typical packet loss
-     * rate — so we keep the option fixed-size to avoid pushing the
-     * header past the common 40-byte options ceiling other stacks
-     * sometimes enforce. */
-    uint32_t tcp_hdr_len;
+     * Plain ACKs without TS or SACK stay at the bare 20-byte header. */
     bool emit_sack = (!(flags & TCP_SYN)) && conn->sack_ok &&
                      conn->n_sack_blocks > 0;
-    if (flags & TCP_SYN)        tcp_hdr_len = 32;
-    else if (emit_sack)         tcp_hdr_len = 32;
-    else                        tcp_hdr_len = 20;
+    bool emit_ts   = (!(flags & TCP_SYN)) && conn->tsopt_ok;
+    uint32_t tcp_hdr_len;
+    if (flags & TCP_SYN)            tcp_hdr_len = 40;
+    else if (emit_ts && emit_sack)  tcp_hdr_len = 44;
+    else if (emit_ts || emit_sack)  tcp_hdr_len = 32;
+    else                            tcp_hdr_len = 20;
     uint32_t tcp_total = tcp_hdr_len + data_len;
     uint32_t ip_total  = sizeof(ipv4_hdr_t) + tcp_total;
 
@@ -1069,40 +1063,48 @@ static int tcp_send_segment(tcp_conn_t *conn, uint8_t flags,
     tcp->checksum = 0;
     tcp->urgent   = 0;
 
-    /* MSS + Window-Scale + SACK_PERMITTED options for SYN segments. */
+    uint8_t *opt = tx_pkt + ETH_HDR_LEN + sizeof(ipv4_hdr_t) + 20;
+    uint32_t ts_now = (uint32_t)idt_get_ticks();
+
     if (flags & TCP_SYN) {
-        uint8_t *opt = tx_pkt + ETH_HDR_LEN + sizeof(ipv4_hdr_t) + 20;
         /* MSS (kind=2, len=4, value=1460) */
-        opt[0] = 0x02;
-        opt[1] = 0x04;
-        opt[2] = (uint8_t)(TCP_MSS >> 8);
-        opt[3] = (uint8_t)(TCP_MSS & 0xFF);
+        opt[0] = 0x02; opt[1] = 0x04;
+        opt[2] = (uint8_t)(TCP_MSS >> 8); opt[3] = (uint8_t)(TCP_MSS & 0xFF);
         /* NOP (kind=1) for 4-byte alignment of the next option */
         opt[4] = 0x01;
         /* Window scale (kind=3, len=3, shift=TCP_RX_WSCALE) */
-        opt[5] = 0x03;
-        opt[6] = 0x03;
-        opt[7] = (uint8_t)TCP_RX_WSCALE;
+        opt[5] = 0x03; opt[6] = 0x03; opt[7] = (uint8_t)TCP_RX_WSCALE;
         /* SACK_PERMITTED (kind=4, len=2) — RFC 2018 */
-        opt[8] = 0x04;
-        opt[9] = 0x02;
-        /* Two NOPs to pad to 12 bytes (4-byte aligned) */
-        opt[10] = 0x01;
-        opt[11] = 0x01;
-    } else if (emit_sack) {
-        /* Single-block SACK option on a data-less ACK. The block holds
-         * the most recently received out-of-order [start, end) range. */
-        uint8_t *opt = tx_pkt + ETH_HDR_LEN + sizeof(ipv4_hdr_t) + 20;
-        /* Two leading NOPs to align the SACK option to 4 bytes (so a
-         * downstream offload that reads it as 32-bit words is happy). */
-        opt[0] = 0x01;
-        opt[1] = 0x01;
-        opt[2] = 0x05;   /* kind = SACK */
-        opt[3] = 0x0A;   /* length = 2 + 8 (one block) */
-        uint32_t blk_start = htonl(conn->sack_blocks[0][0]);
-        uint32_t blk_end   = htonl(conn->sack_blocks[0][1]);
-        memcpy(opt + 4, &blk_start, 4);
-        memcpy(opt + 8, &blk_end,   4);
+        opt[8] = 0x04; opt[9] = 0x02;
+        /* Timestamps (kind=8, len=10, TSval, TSecr) — RFC 7323. On the
+         * initial SYN TS Echo Reply is 0; in SYN-ACK it echoes the SYN's
+         * TS Value. Non-SYN segments below use the same code path. */
+        opt[10] = 0x08; opt[11] = 0x0A;
+        uint32_t tsval = htonl(ts_now);
+        uint32_t tsecr = htonl((flags & TCP_ACK) ? conn->ts_recent : 0);
+        memcpy(opt + 12, &tsval, 4);
+        memcpy(opt + 16, &tsecr, 4);
+    } else if (emit_ts || emit_sack) {
+        uint32_t off = 0;
+        if (emit_ts) {
+            /* Two leading NOPs to 4-byte-align the TS option */
+            opt[off++] = 0x01; opt[off++] = 0x01;
+            opt[off++] = 0x08; opt[off++] = 0x0A;
+            uint32_t tsval = htonl(ts_now);
+            uint32_t tsecr = htonl(conn->ts_recent);
+            memcpy(opt + off, &tsval, 4); off += 4;
+            memcpy(opt + off, &tsecr, 4); off += 4;
+        }
+        if (emit_sack) {
+            /* Two NOPs + single-block SACK (10 bytes payload) */
+            opt[off++] = 0x01; opt[off++] = 0x01;
+            opt[off++] = 0x05;   /* kind = SACK */
+            opt[off++] = 0x0A;   /* length = 2 + 8 (one block) */
+            uint32_t blk_start = htonl(conn->sack_blocks[0][0]);
+            uint32_t blk_end   = htonl(conn->sack_blocks[0][1]);
+            memcpy(opt + off, &blk_start, 4); off += 4;
+            memcpy(opt + off, &blk_end,   4); off += 4;
+        }
     }
 
     /* Copy payload */
@@ -1146,15 +1148,18 @@ static void handle_tcp(const uint8_t *src_ip, const uint8_t *pkt, uint32_t len)
     if (hdr_len < 20 || hdr_len > len)
         return;
 
-    /* Walk TCP options in the [20, hdr_len) range. On SYN we extract
-     * the peer's window scale (RFC 7323) and SACK_PERMITTED flag
-     * (RFC 2018). Both are fixed at handshake time. SACK blocks on
-     * non-SYN ACKs (kind=5) are ignored on the sender side for now —
-     * fast retransmit (3 dup ACKs) covers the common loss case. */
+    /* Walk TCP options. SYN-only options (window scale RFC 7323,
+     * SACK_PERMITTED RFC 2018) are captured for handshake state.
+     * Timestamps (kind=8) appear on SYN AND on every post-handshake
+     * segment — we parse them on every packet so ts_recent stays
+     * current for PAWS + RTT echo. SACK blocks on non-SYN ACKs
+     * (kind=5) are ignored on the sender side for now. */
     uint8_t peer_wscale = 0;
     bool    peer_has_ws = false;
     bool    peer_sack_ok = false;
-    if (hdr_len > 20 && (flags & TCP_SYN)) {
+    bool    peer_has_ts = false;
+    uint32_t peer_tsval = 0;
+    if (hdr_len > 20) {
         const uint8_t *opt = pkt + 20;
         uint32_t opt_len = hdr_len - 20;
         uint32_t i = 0;
@@ -1165,12 +1170,16 @@ static void handle_tcp(const uint8_t *src_ip, const uint8_t *pkt, uint32_t len)
             if (i + 1 >= opt_len) break;
             uint8_t l = opt[i + 1];
             if (l < 2 || i + l > opt_len) break;
-            if (kind == 3 && l == 3) {
+            if (kind == 3 && l == 3 && (flags & TCP_SYN)) {
                 peer_wscale = opt[i + 2];
                 if (peer_wscale > 14) peer_wscale = 14; /* RFC 7323 cap */
                 peer_has_ws = true;
-            } else if (kind == 4 && l == 2) {
+            } else if (kind == 4 && l == 2 && (flags & TCP_SYN)) {
                 peer_sack_ok = true;
+            } else if (kind == 8 && l == 10) {
+                memcpy(&peer_tsval, opt + i + 2, 4);
+                peer_tsval = ntohl(peer_tsval);
+                peer_has_ts = true;
             }
             i += l;
         }
@@ -1236,6 +1245,8 @@ static void handle_tcp(const uint8_t *src_ip, const uint8_t *pkt, uint32_t len)
         conn->snd_una     = conn->snd_nxt;
         conn->state       = TCP_SYN_RCVD;
         conn->sack_ok     = peer_sack_ok ? 1 : 0;
+        conn->tsopt_ok    = peer_has_ts ? 1 : 0;
+        if (peer_has_ts) conn->ts_recent = peer_tsval;
         conn->last_activity = idt_get_ticks();
 
         /* Send SYN+ACK. If ARP isn't resolved this returns -1 and
@@ -1328,6 +1339,11 @@ static void handle_tcp(const uint8_t *src_ip, const uint8_t *pkt, uint32_t len)
                  * advertise SACK_PERMITTED in their SYN. We always send
                  * it; trust the peer's bit. */
                 conn->sack_ok = peer_sack_ok ? 1 : 0;
+                /* RFC 7323 §1.3: same rule for timestamps. ts_recent is
+                 * primed with the SYN-ACK's TS Value so the first ACK
+                 * we send can echo it. */
+                conn->tsopt_ok = peer_has_ts ? 1 : 0;
+                if (peer_has_ts) conn->ts_recent = peer_tsval;
                 conn->state = TCP_ESTABLISHED;
                 net_waiter_wake(NETWAIT_TCP_ESTABLISHED, conn_idx);
                 /* Send ACK */
@@ -1381,8 +1397,18 @@ static void handle_tcp(const uint8_t *src_ip, const uint8_t *pkt, uint32_t len)
             }
         }
 
-        /* Receive data */
-        if (data_len > 0 && seq == conn->rcv_nxt) {
+        /* PAWS (RFC 7323 §5.3): drop segments that arrived with a TS
+         * Value older than ts_recent. On a 1 Gb/s link the 32-bit seq
+         * space wraps in ~34 s — without PAWS a delayed packet from a
+         * previous wrap could be wrongly accepted as new in-window data.
+         * We don't enforce the 24-day idle reset (§5.5) — connections
+         * that idle that long fall out of our retransmit budget anyway. */
+        if (conn->tsopt_ok && peer_has_ts &&
+            (int32_t)(peer_tsval - conn->ts_recent) < 0) {
+            /* Stale segment — send a current ACK to refresh the peer
+             * (per §5.3 "an old duplicate" handling) and drop the data. */
+            tcp_send_segment(conn, TCP_ACK, NULL, 0);
+        } else if (data_len > 0 && seq == conn->rcv_nxt) {
             uint32_t space = TCP_RX_BUF_SIZE - conn->rx_len;
             uint32_t copy = data_len < space ? data_len : space;
             if (copy > 0) {
@@ -1391,6 +1417,11 @@ static void handle_tcp(const uint8_t *src_ip, const uint8_t *pkt, uint32_t len)
             }
             conn->rcv_nxt += data_len;
             tcp_sack_drain(conn);
+            /* RFC 7323 §3.4: only update ts_recent on in-order data
+             * (the segment's TS Value is the freshest the peer has
+             * sent so far). */
+            if (conn->tsopt_ok && peer_has_ts)
+                conn->ts_recent = peer_tsval;
             /* ACK the data */
             tcp_send_segment(conn, TCP_ACK, NULL, 0);
             /* Wake any process blocked on recv */

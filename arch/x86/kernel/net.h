@@ -150,6 +150,15 @@ typedef struct {
     uint8_t   n_sack_blocks;      /* 0..4 valid entries in sack_blocks */
     uint32_t  sack_blocks[4][2];  /* [start, end) seq pairs */
 
+    /* TCP timestamps + PAWS (RFC 7323 §3-5). Both sides exchange a
+     * 32-bit timestamp on every segment post-handshake. The receiver
+     * echoes the most-recent in-order TS Value, which lets the sender
+     * measure RTT precisely and lets the receiver discard segments
+     * that arrive with a TS older than ts_recent (Protection Against
+     * Wrapped Sequences, useful on >32-bit/s links). */
+    uint8_t   tsopt_ok;       /* peer sent TS option in SYN */
+    uint32_t  ts_recent;      /* most-recent in-order peer TS Value */
+
     uint64_t  last_activity;  /* tick of last packet */
 } tcp_conn_t;
 
