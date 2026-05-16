@@ -15,6 +15,7 @@
 #include "nttypes.h"
 #include "pe.h"
 #include "compat32.h"
+#include "wdbg.h"
 
 /* ── Kernel interfaces (weak-safe externs) ────────────────────── */
 
@@ -166,6 +167,9 @@ void win32_init(void)
 
     /* Step 2: Install INT 0x2E handler for compat32 dispatch */
     idt_install_int2e();
+
+    /* Step 3: Initialize Win32 debug toolkit (modules, default hooks) */
+    wdbg_init();
 
     win32_initialized = 1;
 

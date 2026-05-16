@@ -126,7 +126,7 @@ FS_SRC   = fs/ositofs2.c fs/ositofs3.c fs/gpt.c fs/gguf.c fs/vfs.c fs/fat32.c \
            fs/udf.c fs/squashfs.c fs/hfsplus.c fs/btrfs.c fs/apfs.c
 WIN32_SRC = win32/win32_init.c win32/compat32.c win32/pe.c win32/winexec.c \
             win32/handle.c win32/ntsyscall.c win32/ntprocess.c win32/ntsync.c \
-            win32/dllloader.c \
+            win32/dllloader.c win32/wdbg.c \
             win32/kernel32_shim.c win32/ntdll_shim.c win32/msvcrt_shim.c \
             win32/user32_shim.c win32/gdi32_shim.c win32/advapi32_shim.c \
             win32/ddraw_shim.c win32/dsound_shim.c \

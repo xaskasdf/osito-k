@@ -19,6 +19,7 @@
 
 #include "compat32.h"
 #include "dllloader.h"
+#include "wdbg.h"
 
 extern void serial_puts(const char *s);
 extern void serial_puthex(uint64_t val, int digits);
@@ -2436,6 +2437,11 @@ uint64_t compat32_dispatch(uint32_t thunk_idx, uint32_t *stack_args)
         extern uint32_t g_last_stack_args;
         g_last_caller_eip = ret_addr;
         g_last_stack_args = (uint32_t)(uintptr_t)stack_args;
+
+        /* wdbg: dispatch any address-site hooks registered by callers
+         * who want to inspect engine state when the PE is executing
+         * inside a given VA range. No-op when no hooks registered. */
+        wdbg_check_caller(ret_addr, stack_args);
 
         /* BAD-THIS detector: only flag ECX in PE-image .text range.
          * EDX in code range is often a legit function-pointer arg
