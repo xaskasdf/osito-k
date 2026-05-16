@@ -80,8 +80,25 @@ void wdbg_uobject_set_offsets(int outer, int name, int klass);
  *
  * Walk EBP frame chain `depth` levels deep, print each return
  * address symbolized via wdbg_symbolize. Output prefix [WDBG/stk].
+ *
+ * Caveat: requires the PE32 binary to compile with frame pointers.
+ * Epic/UE1 typically omits frame pointers in Release builds — use
+ * wdbg_stack_scan instead in that case.
  */
 void wdbg_stack_walk(uint32_t ebp, int depth, const char *label);
+
+/* ── Stack scanner (no frame pointer required) ──────────────────
+ *
+ * Walks `depth` dwords up from `esp`. For each dword that looks
+ * like a return address (i.e., falls inside a registered module
+ * range AND the 5 bytes before it look like `E8 ?? ?? ?? ??` —
+ * a CALL rel32), print it symbolized.
+ *
+ * Heuristic isn't perfect — false positives from data dwords that
+ * happen to point into code. But for finding upstream callers in
+ * a binary built without frame pointers, this is the only option.
+ */
+void wdbg_stack_scan(uint32_t esp, int depth, const char *label);
 
 /* ── Module + symbolization ─────────────────────────────────────
  *
