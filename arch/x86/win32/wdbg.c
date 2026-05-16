@@ -575,6 +575,64 @@ static void upstream_caller_dump(uint32_t va, uint32_t esp, uint32_t ebp,
     wdbg_stack_walk(ebp, 4, "up-callers");
 }
 
+/*
+ * UT.exe-exit hook — 0x10922000..0x10922400.
+ *
+ * The K32 log shows ExitProcess is called from UT.exe+0x221BA with
+ * an exit code that's a stack address (EBP-0xC8 local var). This
+ * means the engine reaches some "quit" path with an uninitialized
+ * local. Hook the surrounding function body to see what's happening
+ * just before the exit call.
+ */
+static int g_exit_hook_fired = 0;
+
+static void exit_caller_dump(uint32_t va, uint32_t esp, uint32_t ebp,
+                              const uint32_t *stack_args)
+{
+    g_exit_hook_fired++;
+    if (g_exit_hook_fired > 30) {
+        if ((g_exit_hook_fired % 5000) == 0) {
+            serial_puts("[WDBG/exit] still firing: hits=");
+            serial_putdec((uint64_t)g_exit_hook_fired);
+            serial_puts("\n");
+        }
+        return;
+    }
+    char sym[64];
+    serial_puts("[WDBG/exit#");
+    serial_putdec((uint64_t)g_exit_hook_fired);
+    serial_puts("] inside=");
+    serial_puts(wdbg_symbolize(va, sym, sizeof sym));
+    serial_puts(" esp="); serial_puthex(esp, 8);
+    serial_puts(" ebp="); serial_puthex(ebp, 8);
+    serial_puts("\n");
+
+    extern uint64_t g_int2e_user_rcx, g_int2e_user_rdx;
+    extern uint64_t g_int2e_user_rsi, g_int2e_user_rdi, g_int2e_user_rbx;
+    serial_puts("[WDBG/exit#");
+    serial_putdec((uint64_t)g_exit_hook_fired);
+    serial_puts("] regs: ECX="); serial_puthex((uint32_t)g_int2e_user_rcx, 8);
+    serial_puts(" EDX="); serial_puthex((uint32_t)g_int2e_user_rdx, 8);
+    serial_puts(" EBX="); serial_puthex((uint32_t)g_int2e_user_rbx, 8);
+    serial_puts(" ESI="); serial_puthex((uint32_t)g_int2e_user_rsi, 8);
+    serial_puts(" EDI="); serial_puthex((uint32_t)g_int2e_user_rdi, 8);
+    serial_puts("\n");
+
+    /* Show the args being passed to whatever thunk is being called. */
+    serial_puts("[WDBG/exit#");
+    serial_putdec((uint64_t)g_exit_hook_fired);
+    serial_puts("] args: ");
+    for (int i = 0; i < 6; i++) {
+        if (!va_readable(esp + i * 4, 4)) break;
+        serial_puts("[+"); serial_putdec((uint64_t)(i * 4));
+        serial_puts("]="); serial_puthex(stack_args[i], 8);
+        serial_puts(" ");
+    }
+    serial_puts("\n");
+
+    wdbg_stack_scan(esp, 80, "exit-stack");
+}
+
 void wdbg_init(void)
 {
     /* Pre-register UT99 module ranges (empirically observed). These
@@ -590,14 +648,21 @@ void wdbg_init(void)
                    throw_caller_dump,
                    "throw-helper-region");
 
-    /* Upstream-caller hook — Core.dll +0x59000..+0x5A000. This is the
-     * function body around 0x599AB which was the dominant throw
-     * caller in the first run. By hooking here, we see engine state
-     * *before* the throw fires: register values, args being passed
-     * to thunks, candidate UObject/FName/string interpretations. */
+    /* Upstream-caller hook — Core.dll +0x59000..+0x5A000. Quiet now
+     * that throws are fixed (0 hits with FNAME canonical fix). Kept
+     * registered in case throws ever return — would surface
+     * immediately. */
     wdbg_addr_hook(0x10159000, 0x1015A000,
                    upstream_caller_dump,
                    "upstream-0x599AB-region");
 
-    serial_puts("[WDBG] init: 3 modules, 2 hooks registered\n");
+    /* UT.exe exit hook — function around 0x10922000..0x10922400
+     * which calls ExitProcess. The exit code observed is a stack
+     * address (EBP-0xC8 of caller), indicating an uninitialized
+     * local. Hook the body to see what condition triggers the exit. */
+    wdbg_addr_hook(0x10922000, 0x10922400,
+                   exit_caller_dump,
+                   "UT-exit-0x221BA-region");
+
+    serial_puts("[WDBG] init: 3 modules, 3 hooks registered\n");
 }

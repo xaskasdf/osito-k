@@ -308,27 +308,22 @@ void WINAPI ExitProcess(DWORD uExitCode)
 {
     extern uint32_t compat32_get_last_caller_eip(void);
     extern uint32_t compat32_get_last_user_ebp(void);
+    extern uint32_t compat32_get_last_stack_args(void);
+    extern void wdbg_stack_scan(uint32_t esp, int depth, const char *label);
     uint32_t eip = compat32_get_last_caller_eip();
     uint32_t ebp = compat32_get_last_user_ebp();
+    uint32_t esp = compat32_get_last_stack_args();
     serial_puts("[K32] ExitProcess called, code=");
     serial_putdec(uExitCode);
     serial_puts(" caller=0x");
     serial_puthex(eip, 8);
     serial_puts(" EBP=0x");
     serial_puthex(ebp, 8);
-    /* Walk 4 frames of the user-mode EBP chain */
-    uint32_t cur = ebp;
-    for (int f = 0; f < 4; f++) {
-        if (cur < 0x100000 || cur >= 0xFFFE0000 || (cur & 3)) break;
-        uint32_t *fp = (uint32_t *)(uintptr_t)cur;
-        uint32_t ret = fp[1];
-        serial_puts(" f");
-        serial_putdec((uint64_t)f);
-        serial_puts("=0x");
-        serial_puthex(ret, 8);
-        cur = fp[0];
-    }
     serial_puts("\n");
+    /* Use wdbg_stack_scan — works without frame pointers (which UE1
+     * binaries are compiled without). Heuristic finds CALL retaddrs
+     * by scanning for values in known modules preceded by CALL bytes. */
+    wdbg_stack_scan(esp, 96, "ExitProcess-stack");
     NtTerminateProcess(NT_CURRENT_PROCESS, (NTSTATUS)uExitCode);
     /* Never returns */
     for (;;) __asm__ volatile("hlt");
