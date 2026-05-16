@@ -2157,6 +2157,43 @@ uint64_t compat32_dispatch(uint32_t thunk_idx, uint32_t *stack_args)
     }
 #endif
 
+    /* UT-EXE-PATCH: UT.exe @0x10902A40 doubly-linked-list pool manager
+     * has 3 unguarded NULL-pointer writes (prev/next/container fields):
+     *   0x10902AF2  89 01   mov [ecx], eax     ; *prev = next
+     *   0x10902B1B  89 41 18 mov [ecx+0x18], eax
+     *   0x10902B2D  89 08   mov [eax], ecx
+     * Patch each to NOPs.  The pool's link state stays stale (orphan
+     * node) but downstream code re-reads from container fields rather
+     * than walking the broken chain, so engine continues.
+     *
+     * Forcing the function's early-exit (NOP'ing `jne +5` in prologue)
+     * was tried — caused regression: skipped useful work and broke a
+     * later Level/Actors invariant check.  Targeted writes only. */
+    static int patched_ut_listdel = 0;
+    if (!patched_ut_listdel) {
+        struct { uint32_t va; uint8_t want[3]; uint8_t patch[3]; int len; }
+        sites[] = {
+            { 0x10902AF2, {0x89, 0x01, 0x00}, {0x90, 0x90, 0x00}, 2 },
+            { 0x10902B1B, {0x89, 0x41, 0x18}, {0x90, 0x90, 0x90}, 3 },
+            { 0x10902B2D, {0x89, 0x08, 0x00}, {0x90, 0x90, 0x00}, 2 },
+        };
+        int ok = 0;
+        for (int i = 0; i < 3; i++) {
+            volatile uint8_t *p = (uint8_t *)(uintptr_t)sites[i].va;
+            int match = 1;
+            for (int b = 0; b < sites[i].len; b++)
+                if (p[b] != sites[i].want[b]) { match = 0; break; }
+            if (match) {
+                for (int b = 0; b < sites[i].len; b++) p[b] = sites[i].patch[b];
+                ok++;
+            }
+        }
+        patched_ut_listdel = 1;
+        serial_puts("[UT-PATCH] linked-list NULL-write sites patched: ");
+        serial_putdec((uint64_t)ok);
+        serial_puts("/3\n");
+    }
+
     /* ENGINE-PATCH: Engine.dll @0x103887C0 does `mov ebx, [IAT-slot]`
      * then makes multiple `call ebx` to StaticLoadClass.  Between the
      * 1st and 2nd call, a virtual call `call [edx+0x54]` (at 0x1038887A)
