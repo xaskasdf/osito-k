@@ -785,6 +785,16 @@ LRESULT WINAPI DispatchMessageA(const MSG *lpMsg)
 
 void WINAPI PostQuitMessage(int nExitCode)
 {
+    extern void serial_puts(const char *);
+    extern void serial_puthex(uint64_t v, int n);
+    extern void serial_putdec(uint64_t v);
+    extern uint32_t compat32_get_last_caller_eip(void);
+    uint32_t eip = compat32_get_last_caller_eip();
+    serial_puts("[USER32] PostQuitMessage code=");
+    serial_putdec((uint64_t)(uint32_t)nExitCode);
+    serial_puts(" caller=0x");
+    serial_puthex(eip, 8);
+    serial_puts("\n");
     quit_posted = 1;
     quit_code = nExitCode;
 }
