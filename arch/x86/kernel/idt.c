@@ -710,6 +710,33 @@ void isr_handler(interrupt_frame_t *frame)
                     serial_puts("\n");
                 }
             }
+            /* NX-execute fault in Win32 VA range: engine called through
+             * a function pointer that landed in a non-executable heap
+             * page.  Dump the IAT slot at Engine.dll +0x2A5E08 = the
+             * `UObject::StaticLoadClass` import, which is the value the
+             * 0x103887C0 function loads into EBX and calls.  If the IAT
+             * slot still points to a valid Core.dll .text addr, EBX got
+             * clobbered USER-SIDE between the first and second call —
+             * a virtual call through a corrupt vtable picked a non-ABI-
+             * compliant callee that didn't preserve EBX. */
+            uint32_t err_iexec = (frame->error_code & 0x10);
+            if (err_iexec && rip32 >= 0x40000000 && rip32 < 0x80000000) {
+                static int iat_dump_count = 0;
+                iat_dump_count++;
+                if (iat_dump_count <= 3) {
+                    volatile uint32_t *iat = (volatile uint32_t *)
+                        (uintptr_t)0x105A5E08;
+                    serial_puts("[IAT-PROBE] *0x105A5E08=0x");
+                    serial_puthex((uint32_t)*iat, 8);
+                    serial_puts(" (StaticLoadClass — expected Core.dll .text)");
+                    if ((uint32_t)*iat >= 0x10100000 && (uint32_t)*iat < 0x10300000) {
+                        serial_puts(" -> IAT OK, EBX clobbered USER-SIDE");
+                    } else {
+                        serial_puts(" -> IAT IS CORRUPT");
+                    }
+                    serial_puts("\n");
+                }
+            }
         }
     }
 
