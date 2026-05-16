@@ -2206,6 +2206,20 @@ uint64_t compat32_dispatch(uint32_t thunk_idx, uint32_t *stack_args)
         /* Snapshot when Num grows (likely registrant Add) */
         if (d != 0 && n > snap_n && m > 0) {
             snap_d = d; snap_n = n; snap_m = m;
+            /* When Num peaks at a substantial value (≥100 registrants),
+             * manually invoke UObject::ProcessRegistrants @0x1010190B
+             * to bind the UClass hierarchy before the engine clears the
+             * array.  Done once per peak. */
+            static int peak_processed = 0;
+            if (n >= 100 && !peak_processed) {
+                peak_processed = 1;
+                serial_puts("[GOBJREG-PROCESS] manual call to ProcessRegistrants @0x1010190B Num=");
+                serial_putdec((uint64_t)n);
+                serial_puts("\n");
+                uint32_t args[1] = { 0 };
+                compat32_callback_args(0x1010190B, 0, args);
+                serial_puts("[GOBJREG-PROCESS] returned\n");
+            }
         }
         /* Restore if zeroed AFTER snapshot taken */
         if (d == 0 && n == 0 && m == 0 && snap_n > 0) {
