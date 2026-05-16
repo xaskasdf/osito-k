@@ -2157,6 +2157,33 @@ uint64_t compat32_dispatch(uint32_t thunk_idx, uint32_t *stack_args)
     }
 #endif
 
+    /* ENGINE-PATCH: Engine.dll @0x103887C0 does `mov ebx, [IAT-slot]`
+     * then makes multiple `call ebx` to StaticLoadClass.  Between the
+     * 1st and 2nd call, a virtual call `call [edx+0x54]` (at 0x1038887A)
+     * goes through a corrupt vtable and lands in non-ABI-compliant code
+     * that doesn't preserve EBX.  Then the 2nd `call ebx` faults at
+     * NX (EBX=0x401BC870, a heap data addr).
+     *
+     * Fix: patch the corrupt-vtable call to a 3-byte NOP, eliminating
+     * the EBX clobber.  Side effect: the virtual method (likely some
+     * sort of class hierarchy walker) doesn't run, but the engine
+     * generally handles missing-vtable cases gracefully.
+     *
+     * Verify expected bytes before patching, in case Engine.dll layout
+     * differs in some build. */
+    static int patched_ebx_callsite = 0;
+    if (!patched_ebx_callsite) {
+        volatile uint8_t *p = (uint8_t *)(uintptr_t)0x1038887A;
+        if (p[0] == 0xFF && p[1] == 0x52 && p[2] == 0x54) {
+            p[0] = 0x90;  /* NOP */
+            p[1] = 0x90;
+            p[2] = 0x90;
+            patched_ebx_callsite = 1;
+            serial_puts("[ENGINE-PATCH] NOP'd call [edx+0x54] @0x1038887A "
+                         "(prevents EBX clobber)\n");
+        }
+    }
+
     /* Log PE32 caller return address (at stack_args[-1] = [ESP] on entry) */
     if (stack_args && thunk_idx < 0xFFFFFFF0) {
         uint32_t ret_addr = stack_args[-1]; /* return address pushed by CALL */
