@@ -239,6 +239,136 @@ void sha512(const uint8_t *data, uint64_t len, uint8_t hash[64])
             hash[i*8+j] = (uint8_t)(h[i] >> (56 - j*8));
 }
 
+/* ── SHA-384 (FIPS 180-4) ────────────────────────────────────
+ *
+ * Same compression function as SHA-512 but with a different IV
+ * (FIPS 180-4 §5.3.4) and a 384-bit truncated output.  Padding
+ * needs up to two final blocks when the original length leaves
+ * <17 bytes for length+0x80 in the last block.  This implementation
+ * handles both single- and double-block tails correctly (the
+ * existing sha512 has a "skip for now" TODO for the two-block
+ * case — fixed here so future TBSCertificate hashes near the
+ * 128-byte boundary don't silently misbehave).
+ *
+ * Used by chain-link verification for sha384WithRSAEncryption
+ * (OID 1.2.840.113549.1.1.12) and ecdsa-with-SHA-384
+ * (OID 1.2.840.10045.4.3.3) — the latter is what GTS Root R4
+ * signs its intermediates with. */
+void sha384(const uint8_t *data, uint64_t len, uint8_t hash[48])
+{
+    uint64_t h[8] = {
+        0xcbbb9d5dc1059ed8ULL, 0x629a292a367cd507ULL,
+        0x9159015a3070dd17ULL, 0x152fecd8f70e5939ULL,
+        0x67332667ffc00b31ULL, 0x8eb44a8768581511ULL,
+        0xdb0c2e0d64f98fa7ULL, 0x47b5481dbefa4fa4ULL,
+    };
+
+    uint64_t total_bits = len * 8;
+    uint64_t pos = 0;
+
+    /* Block processing — identical to SHA-512. */
+    while (pos + 128 <= len) {
+        uint64_t w[80];
+        for (int i = 0; i < 16; i++) {
+            const uint8_t *p = data + pos + i * 8;
+            w[i] = ((uint64_t)p[0]<<56)|((uint64_t)p[1]<<48)|
+                   ((uint64_t)p[2]<<40)|((uint64_t)p[3]<<32)|
+                   ((uint64_t)p[4]<<24)|((uint64_t)p[5]<<16)|
+                   ((uint64_t)p[6]<<8)|p[7];
+        }
+        for (int i = 16; i < 80; i++) {
+            uint64_t s0 = rotr64(w[i-15],1)^rotr64(w[i-15],8)^(w[i-15]>>7);
+            uint64_t s1 = rotr64(w[i-2],19)^rotr64(w[i-2],61)^(w[i-2]>>6);
+            w[i] = w[i-16]+s0+w[i-7]+s1;
+        }
+        uint64_t a=h[0],b=h[1],c=h[2],d=h[3],e=h[4],f=h[5],g=h[6],hh=h[7];
+        for (int i = 0; i < 80; i++) {
+            uint64_t S1 = rotr64(e,14)^rotr64(e,18)^rotr64(e,41);
+            uint64_t ch = (e&f)^((~e)&g);
+            uint64_t t1 = hh+S1+ch+sha512_k[i]+w[i];
+            uint64_t S0 = rotr64(a,28)^rotr64(a,34)^rotr64(a,39);
+            uint64_t maj = (a&b)^(a&c)^(b&c);
+            uint64_t t2 = S0+maj;
+            hh=g; g=f; f=e; e=d+t1; d=c; c=b; b=a; a=t1+t2;
+        }
+        h[0]+=a;h[1]+=b;h[2]+=c;h[3]+=d;h[4]+=e;h[5]+=f;h[6]+=g;h[7]+=hh;
+        pos += 128;
+    }
+
+    /* Final padding — may need one OR two extra blocks.  If the
+     * tail (rem bytes) is so close to 128 that the 0x80 + zero-pad
+     * + 16-byte length doesn't fit, emit two blocks: first the
+     * tail+0x80+zeroes-to-128, then a full 128 of zeroes ending
+     * with the length. */
+    uint64_t rem = len - pos;
+    uint8_t  tail[256];
+    for (int i = 0; i < 256; i++) tail[i] = 0;
+    for (uint64_t i = 0; i < rem; i++) tail[i] = data[pos + i];
+    tail[rem] = 0x80;
+    /* SHA-512/-384 length field is 128 bits big-endian.  We only
+     * write the low 64 bits (msg length < 2^64) and zero the upper
+     * 64.  Position: last 16 bytes of whichever block ends up final. */
+    uint32_t tail_blocks = (rem + 1 + 16 + 127) / 128;  /* at least 1 */
+    if (tail_blocks < 1) tail_blocks = 1;
+    if (tail_blocks > 2) tail_blocks = 2;
+    uint32_t length_off = tail_blocks * 128 - 8;
+    for (int i = 0; i < 8; i++)
+        tail[length_off + i] = (uint8_t)(total_bits >> (56 - i*8));
+
+    for (uint32_t blk = 0; blk < tail_blocks; blk++) {
+        const uint8_t *bp = tail + blk * 128;
+        uint64_t w[80];
+        for (int i = 0; i < 16; i++) {
+            w[i] = ((uint64_t)bp[i*8]<<56)|((uint64_t)bp[i*8+1]<<48)|
+                   ((uint64_t)bp[i*8+2]<<40)|((uint64_t)bp[i*8+3]<<32)|
+                   ((uint64_t)bp[i*8+4]<<24)|((uint64_t)bp[i*8+5]<<16)|
+                   ((uint64_t)bp[i*8+6]<<8)|bp[i*8+7];
+        }
+        for (int i = 16; i < 80; i++) {
+            uint64_t s0 = rotr64(w[i-15],1)^rotr64(w[i-15],8)^(w[i-15]>>7);
+            uint64_t s1 = rotr64(w[i-2],19)^rotr64(w[i-2],61)^(w[i-2]>>6);
+            w[i] = w[i-16]+s0+w[i-7]+s1;
+        }
+        uint64_t a=h[0],b=h[1],c=h[2],d=h[3],e=h[4],f=h[5],g=h[6],hh=h[7];
+        for (int i = 0; i < 80; i++) {
+            uint64_t S1 = rotr64(e,14)^rotr64(e,18)^rotr64(e,41);
+            uint64_t ch = (e&f)^((~e)&g);
+            uint64_t t1 = hh+S1+ch+sha512_k[i]+w[i];
+            uint64_t S0 = rotr64(a,28)^rotr64(a,34)^rotr64(a,39);
+            uint64_t maj = (a&b)^(a&c)^(b&c);
+            uint64_t t2 = S0+maj;
+            hh=g; g=f; f=e; e=d+t1; d=c; c=b; b=a; a=t1+t2;
+        }
+        h[0]+=a;h[1]+=b;h[2]+=c;h[3]+=d;h[4]+=e;h[5]+=f;h[6]+=g;h[7]+=hh;
+    }
+
+    /* Output: first 384 bits (= 48 bytes) of the 8-word state. */
+    for (int i = 0; i < 6; i++)
+        for (int j = 0; j < 8; j++)
+            hash[i*8+j] = (uint8_t)(h[i] >> (56 - j*8));
+}
+
+/* Self-test against FIPS 180-4 vector: SHA-384("abc") =
+ *   cb00753f 45a35e8b b5a03d69 9ac65007 272c32ab 0eded163
+ *   1a8b605a 43ff5bed 8086072b a1e7cc23 58baeca1 34c825a7
+ */
+int sha384_self_test(void)
+{
+    uint8_t out[48];
+    sha384((const uint8_t *)"abc", 3, out);
+    static const uint8_t expected[48] = {
+        0xcb,0x00,0x75,0x3f,0x45,0xa3,0x5e,0x8b,
+        0xb5,0xa0,0x3d,0x69,0x9a,0xc6,0x50,0x07,
+        0x27,0x2c,0x32,0xab,0x0e,0xde,0xd1,0x63,
+        0x1a,0x8b,0x60,0x5a,0x43,0xff,0x5b,0xed,
+        0x80,0x86,0x07,0x2b,0xa1,0xe7,0xcc,0x23,
+        0x58,0xba,0xec,0xa1,0x34,0xc8,0x25,0xa7,
+    };
+    for (int i = 0; i < 48; i++)
+        if (out[i] != expected[i]) return -1;
+    return 0;
+}
+
 /* ── HKDF-SHA256 (Key Derivation for TLS 1.3) ───────────────── */
 
 extern void hmac_sha256(const uint8_t *key, uint32_t key_len,

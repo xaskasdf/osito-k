@@ -87,12 +87,19 @@ static void ntp_handler(const uint8_t *src_ip, uint16_t src_port,
 
 int ntp_sync(void)
 {
-    serial_puts("[NTP] Resolving pool.ntp.org...\n");
-
+    /* Try time.google.com first (anycast, very reliable), fall back
+     * to pool.ntp.org if the lookup fails.  pool.ntp.org rotates
+     * through many servers; some are slow or unresponsive, and the
+     * 3-attempt retry loop below isn't enough to ride that out. */
+    serial_puts("[NTP] Resolving time.google.com...\n");
     uint8_t ntp_ip[4];
-    if (net_dns_resolve("pool.ntp.org", ntp_ip) < 0) {
-        serial_puts("[NTP] DNS resolution failed\n");
-        return -1;
+    int dns_ok = (net_dns_resolve("time.google.com", ntp_ip) == 0);
+    if (!dns_ok) {
+        serial_puts("[NTP] time.google.com DNS failed, trying pool.ntp.org\n");
+        if (net_dns_resolve("pool.ntp.org", ntp_ip) < 0) {
+            serial_puts("[NTP] DNS resolution failed\n");
+            return -1;
+        }
     }
 
     serial_puts("[NTP] Server: ");

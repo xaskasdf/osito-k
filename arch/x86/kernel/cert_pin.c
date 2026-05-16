@@ -92,6 +92,25 @@ static const cert_pin_t pin_table[] = {
           0xac,0x9c,0xa5,0xc1,0xa7,0x9f,0xd4,0x85,
           0x7f,0xfa,0xf2,0x86,0x4f,0xbe,0xbf,0x96
       } },
+    /* GTS Root R4 — root CA (P-384 key, cross-signed by GlobalSign
+     * Root CA).  Pinning the root anchors the chain past any future
+     * intermediate rotation; even if Google retires WE1 entirely,
+     * the new intermediate will still chain through GTS Root R4 and
+     * the pin will hold.  Verified 2026-05-16:
+     *   openssl x509 -in root.pem -outform der | shasum -a 256
+     *   → 76b27b80a58027dc3cf1da68dac17010ed93997d0b603e2fadbe85012493b5a7
+     *
+     * We can't *cryptographically* verify the WE1 → GTS Root R4
+     * link yet (it's ECDSA-P256-SHA384 signed against a P-384 key
+     * and we don't have a P-384 verify primitive), but pinning the
+     * root by SHA-256 doesn't need it. */
+    { .label = "GTS Root R4 (P-384)",
+      .digest = {
+          0x76,0xb2,0x7b,0x80,0xa5,0x80,0x27,0xdc,
+          0x3c,0xf1,0xda,0x68,0xda,0xc1,0x70,0x10,
+          0xed,0x93,0x99,0x7d,0x0b,0x60,0x3e,0x2f,
+          0xad,0xbe,0x85,0x01,0x24,0x93,0xb5,0xa7
+      } },
     { 0, {0} }   /* sentinel — keep last */
 };
 
@@ -335,6 +354,27 @@ int cert_pin_check_leaf(const uint8_t *cert_msg, uint32_t cert_msg_len)
         }
         off += cert_len;
         cert_idx++;
+    }
+
+    /* A12.6: validity-window check.  Reject any cert in the chain
+     * whose notBefore/notAfter doesn't bracket the current clock.
+     * If NTP hasn't synced (ntp_get_utc returns 0), skip cleanly —
+     * the pin is still authoritative.  Informative mode: log but
+     * don't abort. */
+    extern uint32_t ntp_get_utc(void);
+    extern int x509_check_validity(const uint8_t *cert, uint32_t len,
+                                   uint32_t now_utc);
+    uint32_t now_utc = ntp_get_utc();
+    if (now_utc != 0) {
+        for (int i = 0; i < chain_count; i++) {
+            int v = x509_check_validity(chain_ptr[i], chain_len_arr[i], now_utc);
+            serial_puts("[PIN] cert#");
+            serial_putdec((uint64_t)i);
+            serial_puts(" validity: ");
+            serial_puts(v == 0 ? "OK\n" : "OUT OF WINDOW\n");
+        }
+    } else {
+        serial_puts("[PIN] validity skipped (NTP not synced)\n");
     }
 
     /* A12.5: cryptographic chain link verification.  For each pair

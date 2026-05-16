@@ -630,6 +630,28 @@ int tls13_connect(int tcp_conn, const char *hostname)
                                 }
                             }
 
+                            /* A12.6: validity-window check on every
+                             * cert in the chain.  Skips cleanly if
+                             * NTP hasn't synced (now_utc == 0). */
+                            extern uint32_t ntp_get_utc(void);
+                            extern int x509_check_validity(
+                                const uint8_t *cert, uint32_t len,
+                                uint32_t now_utc);
+                            uint32_t now_utc = ntp_get_utc();
+                            if (now_utc != 0) {
+                                for (int i = 0; i < nc; i++) {
+                                    int v = x509_check_validity(
+                                        certs[i], cert_lens[i], now_utc);
+                                    serial_puts("[TLS1.3] cert#");
+                                    serial_putdec((uint64_t)i);
+                                    serial_puts(" validity: ");
+                                    serial_puts(v == 0 ? "OK\n"
+                                                       : "OUT OF WINDOW\n");
+                                }
+                            } else {
+                                serial_puts("[TLS1.3] validity skipped (NTP not synced)\n");
+                            }
+
                             /* Chain link verification: each cert is
                              * signed by the next.  Logs PASS/FAIL
                              * per link; informative mode (no abort). */

@@ -796,6 +796,25 @@ void __initk kernel_entry(boot_info_t *info)
                 serial_puts("[KERN] RSA-2048 verify self-test: PASS\n");
             else
                 serial_puts("[KERN] RSA-2048 verify self-test: FAIL\n");
+
+            /* SHA-384 hash self-test against FIPS 180-4 vector
+             * SHA-384("abc"). Needed for chain validation links
+             * signed with SHA-384 (GTS Root R4 → intermediates). */
+            extern int sha384_self_test(void);
+            if (sha384_self_test() == 0)
+                serial_puts("[KERN] SHA-384 self-test: PASS\n");
+            else
+                serial_puts("[KERN] SHA-384 self-test: FAIL\n");
+
+            /* X.509 validity-window self-test (A12.6). Checks the
+             * Gregorian→Unix conversion + UTCTime/GeneralizedTime
+             * parser at known clock values (in-window, not-yet-valid,
+             * expired, no-clock). */
+            extern int rsa_validity_self_test(void);
+            if (rsa_validity_self_test() == 0)
+                serial_puts("[KERN] X.509 validity self-test: PASS\n");
+            else
+                serial_puts("[KERN] X.509 validity self-test: FAIL\n");
         } else {
             serial_puts("[KERN] I211 init failed\n");
             fb_puts(" NIC: init failed\n");

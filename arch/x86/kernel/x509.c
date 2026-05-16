@@ -200,10 +200,15 @@ int x509_extract_ec_pubkey_from_msg(const uint8_t *cert_msg, uint32_t msg_len,
 /* ── Chain link validation primitives ─────────────────────────── */
 
 extern void sha256(const uint8_t *data, uint32_t len, uint8_t out[32]);
+extern void sha384(const uint8_t *data, uint64_t len, uint8_t out[48]);
 extern int  rsa_pkcs1_v15_sha256_verify(const uint8_t *sig, uint32_t sig_len,
                                          const uint8_t *n,   uint32_t n_len,
                                          const uint8_t *e,   uint32_t e_len,
                                          const uint8_t hash[32]);
+extern int  rsa_pkcs1_v15_sha384_verify(const uint8_t *sig, uint32_t sig_len,
+                                         const uint8_t *n,   uint32_t n_len,
+                                         const uint8_t *e,   uint32_t e_len,
+                                         const uint8_t hash[48]);
 extern int  ecdsa_p256_verify(const uint8_t pub_x[32], const uint8_t pub_y[32],
                               const uint8_t hash[32],
                               const uint8_t *sig, uint32_t sig_len);
@@ -212,8 +217,14 @@ extern int  ecdsa_p256_verify(const uint8_t pub_x[32], const uint8_t pub_y[32],
 static const uint8_t OID_SHA256_WITH_RSA[] = {
     0x06, 0x09, 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x0B
 };
+static const uint8_t OID_SHA384_WITH_RSA[] = {
+    0x06, 0x09, 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x0C
+};
 static const uint8_t OID_ECDSA_WITH_SHA256[] = {
     0x06, 0x08, 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x03, 0x02
+};
+static const uint8_t OID_ECDSA_WITH_SHA384[] = {
+    0x06, 0x08, 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x03, 0x03
 };
 static const uint8_t OID_RSA_ENCRYPTION[] = {
     0x06, 0x09, 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x01
@@ -282,7 +293,9 @@ static int cert_split(const uint8_t *cert, uint32_t cert_len, cert_parts_t *out)
 typedef enum {
     SIG_UNKNOWN = 0,
     SIG_RSA_SHA256,
+    SIG_RSA_SHA384,
     SIG_ECDSA_P256_SHA256,
+    SIG_ECDSA_P256_SHA384,   /* P-256 key + SHA-384 hash (truncated) */
 } sig_alg_t;
 
 static sig_alg_t sigalg_recognize(const cert_parts_t *cp)
@@ -297,9 +310,15 @@ static sig_alg_t sigalg_recognize(const cert_parts_t *cp)
     if (avail >= sizeof OID_SHA256_WITH_RSA &&
         !bytes_eq(p, OID_SHA256_WITH_RSA, sizeof OID_SHA256_WITH_RSA))
         return SIG_RSA_SHA256;
+    if (avail >= sizeof OID_SHA384_WITH_RSA &&
+        !bytes_eq(p, OID_SHA384_WITH_RSA, sizeof OID_SHA384_WITH_RSA))
+        return SIG_RSA_SHA384;
     if (avail >= sizeof OID_ECDSA_WITH_SHA256 &&
         !bytes_eq(p, OID_ECDSA_WITH_SHA256, sizeof OID_ECDSA_WITH_SHA256))
         return SIG_ECDSA_P256_SHA256;
+    if (avail >= sizeof OID_ECDSA_WITH_SHA384 &&
+        !bytes_eq(p, OID_ECDSA_WITH_SHA384, sizeof OID_ECDSA_WITH_SHA384))
+        return SIG_ECDSA_P256_SHA384;
     return SIG_UNKNOWN;
 }
 
@@ -381,10 +400,18 @@ int x509_verify_chain_link(const uint8_t *child_cert, uint32_t child_len,
         return -1;
     }
 
-    uint8_t hash[32];
-    sha256(cp.tbs, cp.tbs_len, hash);
+    /* Compute the hash matching the sig algorithm.  For ECDSA-P256
+     * with SHA-384, the 48-byte digest is truncated to the leftmost
+     * 32 bytes (curve order width) per FIPS 186-4 §6.4. */
+    uint8_t hash32[32];
+    uint8_t hash48[48];
+    bool use_sha384 = (sa == SIG_RSA_SHA384 || sa == SIG_ECDSA_P256_SHA384);
+    if (use_sha384)
+        sha384(cp.tbs, cp.tbs_len, hash48);
+    else
+        sha256(cp.tbs, cp.tbs_len, hash32);
 
-    if (sa == SIG_RSA_SHA256) {
+    if (sa == SIG_RSA_SHA256 || sa == SIG_RSA_SHA384) {
         const uint8_t *n, *e;
         uint32_t n_len, e_len;
         if (extract_rsa_pubkey(issuer_cert, issuer_len,
@@ -392,28 +419,199 @@ int x509_verify_chain_link(const uint8_t *child_cert, uint32_t child_len,
             serial_puts("[X509] chain: issuer RSA pubkey extract failed\n");
             return -1;
         }
-        if (rsa_pkcs1_v15_sha256_verify(cp.sig, cp.sig_len,
-                                        n, n_len, e, e_len, hash) < 0) {
-            serial_puts("[X509] chain: RSA-SHA256 verify FAILED\n");
+        int rc = (sa == SIG_RSA_SHA256)
+            ? rsa_pkcs1_v15_sha256_verify(cp.sig, cp.sig_len, n, n_len, e, e_len, hash32)
+            : rsa_pkcs1_v15_sha384_verify(cp.sig, cp.sig_len, n, n_len, e, e_len, hash48);
+        if (rc < 0) {
+            serial_puts(sa == SIG_RSA_SHA256
+                ? "[X509] chain: RSA-SHA256 verify FAILED\n"
+                : "[X509] chain: RSA-SHA384 verify FAILED\n");
             return -1;
         }
-        serial_puts("[X509] chain: RSA-SHA256 link verified\n");
+        serial_puts(sa == SIG_RSA_SHA256
+            ? "[X509] chain: RSA-SHA256 link verified\n"
+            : "[X509] chain: RSA-SHA384 link verified\n");
         return 0;
     }
 
-    if (sa == SIG_ECDSA_P256_SHA256) {
+    if (sa == SIG_ECDSA_P256_SHA256 || sa == SIG_ECDSA_P256_SHA384) {
         uint8_t pub_x[32], pub_y[32];
         if (x509_extract_ec_pubkey(issuer_cert, issuer_len, pub_x, pub_y) < 0) {
             serial_puts("[X509] chain: issuer EC pubkey extract failed\n");
             return -1;
         }
-        if (ecdsa_p256_verify(pub_x, pub_y, hash, cp.sig, cp.sig_len) != 0) {
-            serial_puts("[X509] chain: ECDSA-P256 verify FAILED\n");
+        /* For SHA-384 → P-256, FIPS 186-4 §6.4 truncates the digest
+         * to the leftmost 32 bytes (= P-256 curve order width). */
+        const uint8_t *hash_to_verify = (sa == SIG_ECDSA_P256_SHA256) ? hash32 : hash48;
+        if (ecdsa_p256_verify(pub_x, pub_y, hash_to_verify, cp.sig, cp.sig_len) != 0) {
+            serial_puts(sa == SIG_ECDSA_P256_SHA256
+                ? "[X509] chain: ECDSA-P256-SHA256 verify FAILED\n"
+                : "[X509] chain: ECDSA-P256-SHA384 verify FAILED\n");
             return -1;
         }
-        serial_puts("[X509] chain: ECDSA-P256 link verified\n");
+        serial_puts(sa == SIG_ECDSA_P256_SHA256
+            ? "[X509] chain: ECDSA-P256-SHA256 link verified\n"
+            : "[X509] chain: ECDSA-P256-SHA384 link verified\n");
         return 0;
     }
 
     return -1;
+}
+
+/* ── Validity-window check (A12.6) ──────────────────────────── */
+
+/* Convert a calendar date (UTC, Gregorian) to Unix seconds. */
+static uint32_t civil_to_unix(int year, int month, int day,
+                              int hour, int minute, int second)
+{
+    /* Howard Hinnant's date algorithm — works for years > 1583. */
+    int y = year - (month <= 2);
+    int era = (y >= 0 ? y : y - 399) / 400;
+    unsigned yoe = (unsigned)(y - era * 400);
+    unsigned doy = (153 * (month + (month > 2 ? -3 : 9)) + 2) / 5
+                   + (unsigned)day - 1;
+    unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    int days_since_epoch = era * 146097 + (int)doe - 719468;
+    int64_t s = (int64_t)days_since_epoch * 86400
+              + (int64_t)hour * 3600 + (int64_t)minute * 60 + second;
+    if (s < 0) return 0;
+    if (s > (int64_t)0xFFFFFFFF) return 0xFFFFFFFF;
+    return (uint32_t)s;
+}
+
+/* Parse ASCII digit at p, return value or -1. */
+static int digit(uint8_t c) {
+    return (c >= '0' && c <= '9') ? (int)(c - '0') : -1;
+}
+/* Read N decimal digits at *p, advance *p, return value or -1. */
+static int read_ndigits(const uint8_t **p, const uint8_t *end, int n) {
+    if (*p + n > end) return -1;
+    int v = 0;
+    for (int i = 0; i < n; i++) {
+        int d = digit((*p)[i]);
+        if (d < 0) return -1;
+        v = v * 10 + d;
+    }
+    *p += n;
+    return v;
+}
+
+/* Parse a UTCTime ("YYMMDDHHMMSSZ", 13 bytes) or GeneralizedTime
+ * ("YYYYMMDDHHMMSSZ", 15 bytes) at the current TLV.  Advances *p
+ * past the TLV.  Returns 0 + fills *out_unix; -1 on failure. */
+static int parse_time_tlv(const uint8_t **p, const uint8_t *end,
+                          uint32_t *out_unix)
+{
+    if (*p >= end) return -1;
+    uint8_t tag = *(*p)++;
+    uint32_t len;
+    if (der_read_len(p, end, &len) < 0) return -1;
+    if (*p + len > end) return -1;
+    const uint8_t *q = *p;
+    const uint8_t *q_end = *p + len;
+    *p = q_end;          /* always advance past TLV */
+
+    int year, month, day, hour, minute, second;
+    if (tag == 0x17 && len >= 13) {
+        /* UTCTime: YYMMDDHHMMSSZ.  RFC 5280 §4.1.2.5.1: YY ∈ 00..49
+         * → 2000..2049; YY ∈ 50..99 → 1950..1999. */
+        int yy = read_ndigits(&q, q_end, 2);
+        if (yy < 0) return -1;
+        year = (yy < 50) ? (2000 + yy) : (1900 + yy);
+    } else if (tag == 0x18 && len >= 15) {
+        /* GeneralizedTime: YYYYMMDDHHMMSSZ. */
+        year = read_ndigits(&q, q_end, 4);
+        if (year < 0) return -1;
+    } else {
+        return -1;
+    }
+    month  = read_ndigits(&q, q_end, 2);
+    day    = read_ndigits(&q, q_end, 2);
+    hour   = read_ndigits(&q, q_end, 2);
+    minute = read_ndigits(&q, q_end, 2);
+    second = read_ndigits(&q, q_end, 2);
+    if (month < 1 || month > 12 || day < 1 || day > 31) return -1;
+    if (hour < 0 || hour > 23) return -1;
+    if (minute < 0 || minute > 59 || second < 0 || second > 60) return -1;
+    if (q >= q_end || (*q != 'Z' && *q != '+' && *q != '-')) return -1;
+    /* We don't handle timezone offsets — RFC 5280 mandates 'Z'. */
+
+    *out_unix = civil_to_unix(year, month, day, hour, minute, second);
+    return 0;
+}
+
+int x509_check_validity(const uint8_t *cert, uint32_t cert_len, uint32_t now_utc)
+{
+    if (now_utc == 0) {
+        /* No real clock — can't make a judgement.  Caller (pin)
+         * still applies; we don't fail closed without a clock. */
+        return 0;
+    }
+    const uint8_t *p = cert;
+    const uint8_t *end = cert + cert_len;
+    const uint8_t *outer_end;
+    if (der_enter(&p, end, 0x30, &outer_end) < 0) {
+        serial_puts("[X509] validity: outer SEQ failed\n");
+        return -1;
+    }
+    const uint8_t *tbs_end;
+    if (der_enter(&p, outer_end, 0x30, &tbs_end) < 0) {
+        serial_puts("[X509] validity: TBS SEQ failed\n");
+        return -1;
+    }
+
+    /* Optional [0] EXPLICIT Version */
+    if (p < tbs_end && p[0] == 0xA0) {
+        if (der_skip_tlv(&p, tbs_end) < 0) {
+            serial_puts("[X509] validity: skip version failed\n");
+            return -1;
+        }
+    }
+    /* serial, sigAlg, issuer (3 TLVs) — then Validity SEQUENCE. */
+    for (int i = 0; i < 3; i++) {
+        if (der_skip_tlv(&p, tbs_end) < 0) {
+            serial_puts("[X509] validity: skip pre-Validity TLV ");
+            serial_putdec((uint64_t)i);
+            serial_puts(" failed\n");
+            return -1;
+        }
+    }
+
+    /* Validity ::= SEQUENCE { notBefore Time, notAfter Time }. */
+    const uint8_t *val_end;
+    if (der_enter(&p, tbs_end, 0x30, &val_end) < 0) {
+        serial_puts("[X509] validity: enter Validity SEQ failed (cur=0x");
+        if (p < tbs_end) {
+            serial_putdec((uint64_t)p[0]);
+        }
+        serial_puts(")\n");
+        return -1;
+    }
+
+    uint32_t not_before, not_after;
+    if (parse_time_tlv(&p, val_end, &not_before) < 0) {
+        serial_puts("[X509] validity: bad notBefore\n");
+        return -1;
+    }
+    if (parse_time_tlv(&p, val_end, &not_after) < 0) {
+        serial_puts("[X509] validity: bad notAfter\n");
+        return -1;
+    }
+    if (now_utc < not_before) {
+        serial_puts("[X509] validity: not yet valid (now=");
+        serial_putdec((uint64_t)now_utc);
+        serial_puts(" notBefore=");
+        serial_putdec((uint64_t)not_before);
+        serial_puts(")\n");
+        return -1;
+    }
+    if (now_utc > not_after) {
+        serial_puts("[X509] validity: expired (now=");
+        serial_putdec((uint64_t)now_utc);
+        serial_puts(" notAfter=");
+        serial_putdec((uint64_t)not_after);
+        serial_puts(")\n");
+        return -1;
+    }
+    return 0;
 }
