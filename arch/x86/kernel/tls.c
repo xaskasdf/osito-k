@@ -623,13 +623,24 @@ static int tls_process_server_handshake(tls_conn_t *tls)
                 got_hello = 1;
                 break;
 
-            case TLS_HS_CERTIFICATE:
-                /* We accept any certificate — no CA verification */
+            case TLS_HS_CERTIFICATE: {
+                /* Hash the leaf cert and check against the pin table.
+                 * Until A12's full ECDSA + chain validator lands, this
+                 * is our MITM defense: an attacker re-routing the
+                 * connection without the matching cert+key is rejected
+                 * by digest mismatch. SKE signature is still
+                 * unverified — separate sub-item. */
                 serial_puts("[TLS] Certificate received (");
                 serial_putdec(hs_len);
-                serial_puts(" bytes, not verified)\n");
+                serial_puts(" bytes)\n");
+                extern int cert_pin_check_leaf(const uint8_t *msg, uint32_t len);
+                if (cert_pin_check_leaf(buf + offset + 4, hs_len) < 0) {
+                    serial_puts("[TLS] cert pin check failed — abort\n");
+                    return -1;
+                }
                 got_cert = 1;
                 break;
+            }
 
             case TLS_HS_SERVER_KEY_EXCH:
                 if (parse_server_key_exchange(tls, buf + offset + 4, hs_len) < 0)

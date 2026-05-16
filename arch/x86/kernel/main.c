@@ -636,16 +636,26 @@ void __initk kernel_entry(boot_info_t *info)
 
     /* ── Step 4: Network (I211 Ethernet + UDP) ── */
     pci_dev_t *nic_pci = (pci_dev_t *)pci_get_nic();
-    if (nic_pci && nic_pci->bar[0]) {
+    /* Modern virtio-net (disable-legacy=on) leaves BAR0 zero — config
+     * lives in BAR4 via PCI capability list. Gate on "any BAR set". */
+    if (nic_pci && (nic_pci->bar[0] || nic_pci->bar[1] || nic_pci->bar[2] ||
+                    nic_pci->bar[3] || nic_pci->bar[4] || nic_pci->bar[5])) {
         /* La línea de identificación del NIC se imprime abajo, después
          * de mirar vendor_id/device_id reales del PCI scan.              */
 
         /* Detectar familia del NIC y elegir driver.  Imprimir el
          * vendor:device detectado + nombre del chip (no hardcodear).     */
         extern int  rtl8111_init(uint64_t bar0_phys, uint64_t bar2_phys);
+        extern int  virtio_net_init(uint8_t bus, uint8_t dev, uint8_t func,
+                                     const uint64_t bars[6]);
         extern void nic_bind_i211(void);
         extern void nic_bind_rtl8111(void);
+        extern void nic_bind_virtio_net(void);
         extern void rtl8111_enable_interrupts(uint8_t b, uint8_t d, uint8_t f);
+
+        bool is_virtio_net = (nic_pci->vendor_id == 0x1AF4 &&
+                              (nic_pci->device_id == 0x1041 ||
+                               nic_pci->device_id == 0x1000));
 
         const char *chip = "unknown";
         switch ((nic_pci->vendor_id << 16) | nic_pci->device_id) {
@@ -657,6 +667,8 @@ void __initk kernel_entry(boot_info_t *info)
         case 0x10EC8168: chip = "Realtek RTL8111";     break;
         case 0x10EC8161: chip = "Realtek RTL8111H";    break;
         case 0x10EC8136: chip = "Realtek RTL8101E";    break;
+        case 0x1AF41041: chip = "virtio-net (modern)"; break;
+        case 0x1AF41000: chip = "virtio-net (legacy)"; break;
         }
         serial_puts("[KERN] NIC detected: ");
         serial_puthex(nic_pci->vendor_id, 4); serial_puts(":");
@@ -673,7 +685,13 @@ void __initk kernel_entry(boot_info_t *info)
         extern void pci_enable_bus_master(uint8_t bus, uint8_t dev, uint8_t func);
         pci_enable_bus_master(nic_pci->bus, nic_pci->dev, nic_pci->func);
 
-        if (nic_pci->vendor_id == 0x10EC &&
+        if (is_virtio_net) {
+            if (virtio_net_init(nic_pci->bus, nic_pci->dev, nic_pci->func,
+                                 nic_pci->bar) == 0) {
+                nic_bind_virtio_net();
+                nic_ok = 0;
+            }
+        } else if (nic_pci->vendor_id == 0x10EC &&
             (nic_pci->device_id == 0x8168 || nic_pci->device_id == 0x8136 ||
              nic_pci->device_id == 0x8161)) {
             uint64_t bar2 = nic_pci->bar[2];
@@ -704,7 +722,9 @@ void __initk kernel_entry(boot_info_t *info)
              * Cada driver expone su _enable_interrupts; dispatch manual
              * basado en el chip detectado.                                  */
             extern void i211_enable_interrupts(uint8_t b, uint8_t d, uint8_t f);
-            if (nic_pci->vendor_id == 0x10EC) {
+            if (is_virtio_net) {
+                /* virtio-net is polled via sched_tick → net_poll; no IRQ. */
+            } else if (nic_pci->vendor_id == 0x10EC) {
                 rtl8111_enable_interrupts(nic_pci->bus, nic_pci->dev, nic_pci->func);
             } else {
                 i211_enable_interrupts(nic_pci->bus, nic_pci->dev, nic_pci->func);
@@ -747,6 +767,25 @@ void __initk kernel_entry(boot_info_t *info)
             }
 
             net_udp_listen(7777, prompt_handler);
+
+            /* A12.4: load any previously-captured dynamic leaf-cert pins
+             * from osfs2 (`tls/pins.bin`). After the static intermediate
+             * pin validates a CF chain, we remember the leaf so the next
+             * handshake matches it directly — survives CF's ~90 d rotation
+             * without an operator rebuild. */
+            extern int cert_pin_load_dynamic(void);
+            cert_pin_load_dynamic();
+
+            /* TLS 1.3 key-schedule self-test (RFC 8448 §3 vectors).
+             * Verifies hkdf_extract + hkdf_expand_label produce the
+             * canonical early_secret + derived values. Cheap (~2 HMAC
+             * chains); logs PASS/FAIL but does not abort boot — TLS 1.3
+             * is not yet wired into the production path. */
+            extern int hkdf_tls13_self_test(void);
+            if (hkdf_tls13_self_test() == 0)
+                serial_puts("[KERN] HKDF TLS 1.3 self-test: PASS\n");
+            else
+                serial_puts("[KERN] HKDF TLS 1.3 self-test: FAIL\n");
         } else {
             serial_puts("[KERN] I211 init failed\n");
             fb_puts(" NIC: init failed\n");

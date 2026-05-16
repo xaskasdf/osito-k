@@ -285,3 +285,115 @@ void hkdf_expand(const uint8_t prk[32],
         pos += copy;
     }
 }
+
+/* ── HKDF-Expand-Label (RFC 8446 §7.1) ─────────────────────────
+ *
+ * TLS 1.3 derives every secret/key/iv via HKDF-Expand-Label, which
+ * is just HKDF-Expand with a structured `info` parameter:
+ *
+ *   info = uint16(out_len) || length-prefixed("tls13 " || label)
+ *                          || length-prefixed(context)
+ *
+ * label_len is one byte; context_len is one byte.  Maximum label
+ * length is 255 - len("tls13 ") = 249, but in practice TLS 1.3
+ * labels are short ("derived", "c hs traffic", "key", "iv", "finished").
+ *
+ * `context` is usually the running transcript hash (32 bytes for
+ * SHA-256) or empty.
+ */
+void hkdf_expand_label(const uint8_t prk[32],
+                       const char    *label,
+                       const uint8_t *context, uint32_t context_len,
+                       uint8_t       *okm, uint32_t okm_len)
+{
+    /* Build the structured info */
+    uint8_t info[2 + 1 + 256 + 1 + 256];
+    uint32_t io = 0;
+
+    /* HkdfLabel.length (uint16, network byte order) */
+    info[io++] = (uint8_t)(okm_len >> 8);
+    info[io++] = (uint8_t)(okm_len & 0xFF);
+
+    /* HkdfLabel.label = "tls13 " ‖ label, length-prefixed (uint8) */
+    static const char prefix[] = "tls13 ";
+    const uint32_t prefix_len = 6;
+    uint32_t label_len = 0;
+    while (label[label_len]) label_len++;
+    if (label_len > 249) label_len = 249;
+    info[io++] = (uint8_t)(prefix_len + label_len);
+    memcpy(info + io, prefix, prefix_len); io += prefix_len;
+    memcpy(info + io, label, label_len);   io += label_len;
+
+    /* HkdfLabel.context, length-prefixed (uint8) */
+    if (context_len > 255) context_len = 255;
+    info[io++] = (uint8_t)context_len;
+    if (context_len > 0) { memcpy(info + io, context, context_len); io += context_len; }
+
+    hkdf_expand(prk, info, io, okm, okm_len);
+}
+
+/* RFC 8446 §7.1 "Derive-Secret(Secret, Label, Messages)":
+ *   HKDF-Expand-Label(Secret, Label, Hash(Messages), Hash.length)
+ *
+ * Convenience wrapper used pervasively in the TLS 1.3 key schedule
+ * (early_secret → derived → handshake_secret → traffic secrets).
+ * Hash.length here is always 32 (SHA-256). */
+void hkdf_derive_secret(const uint8_t prk[32],
+                        const char    *label,
+                        const uint8_t  transcript_hash[32],
+                        uint8_t        out[32])
+{
+    hkdf_expand_label(prk, label, transcript_hash, 32, out, 32);
+}
+
+/* Self-test against RFC 8448 §3 vectors.  Verifies hkdf_extract +
+ * hkdf_expand_label against the canonical TLS 1.3 handshake.  Run
+ * once at boot to catch crypto regressions before they bite an
+ * actual handshake. */
+int hkdf_tls13_self_test(void)
+{
+    /* RFC 8448 §3: psk = zero32, dhe = known shared.  The first
+     * derivation in the schedule is:
+     *   early_secret = HKDF-Extract(salt=zero32, IKM=zero32)
+     *   → 33 ad 0a 1c 60 7e c0 3b 09 e6 cd 98 93 68 0c e2
+     *     10 ad f3 00 aa 1f 26 60 e1 b2 2e 10 f1 70 f9 2a
+     * (per the worked example in §3.) */
+    static const uint8_t zero32[32] = {0};
+    uint8_t early_secret[32];
+    hkdf_extract(zero32, 32, zero32, 32, early_secret);
+
+    static const uint8_t expected_early[32] = {
+        0x33,0xad,0x0a,0x1c,0x60,0x7e,0xc0,0x3b,
+        0x09,0xe6,0xcd,0x98,0x93,0x68,0x0c,0xe2,
+        0x10,0xad,0xf3,0x00,0xaa,0x1f,0x26,0x60,
+        0xe1,0xb2,0x2e,0x10,0xf1,0x70,0xf9,0x2a,
+    };
+    for (uint32_t i = 0; i < 32; i++)
+        if (early_secret[i] != expected_early[i]) return -1;
+
+    /* "derived" label, empty-hash context (Hash("") for SHA-256):
+     *   e3 b0 c4 42 98 fc 1c 14 9a fb f4 c8 99 6f b9 24
+     *   27 ae 41 e4 64 9b 93 4c a4 95 99 1b 78 52 b8 55
+     * Result per RFC 8448:
+     *   6f 26 15 a1 08 c7 02 c5 67 8f 54 fc 9d ba b6 97
+     *   16 c0 76 18 9c 48 25 0c eb ea c3 57 6c 36 11 ba */
+    static const uint8_t empty_hash_sha256[32] = {
+        0xe3,0xb0,0xc4,0x42,0x98,0xfc,0x1c,0x14,
+        0x9a,0xfb,0xf4,0xc8,0x99,0x6f,0xb9,0x24,
+        0x27,0xae,0x41,0xe4,0x64,0x9b,0x93,0x4c,
+        0xa4,0x95,0x99,0x1b,0x78,0x52,0xb8,0x55,
+    };
+    uint8_t derived[32];
+    hkdf_expand_label(early_secret, "derived",
+                      empty_hash_sha256, 32, derived, 32);
+    static const uint8_t expected_derived[32] = {
+        0x6f,0x26,0x15,0xa1,0x08,0xc7,0x02,0xc5,
+        0x67,0x8f,0x54,0xfc,0x9d,0xba,0xb6,0x97,
+        0x16,0xc0,0x76,0x18,0x9c,0x48,0x25,0x0c,
+        0xeb,0xea,0xc3,0x57,0x6c,0x36,0x11,0xba,
+    };
+    for (uint32_t i = 0; i < 32; i++)
+        if (derived[i] != expected_derived[i]) return -1;
+
+    return 0;  /* both checks passed */
+}

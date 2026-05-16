@@ -937,16 +937,20 @@ static int tcp_send_segment(tcp_conn_t *conn, uint8_t flags,
         return -1;
     }
 
-    /* SYN segments carry a 4-byte MSS option so the peer knows we can
-     * accept full-sized payloads.  Cloudflare (and various commercial
-     * load-balancers / DDoS scrubbers) silently drop SYNs that arrive
-     * with zero TCP options — they look like crude port scans.  Our
-     * old "naked" SYN got no SYN+ACK back from CF and the kernel
-     * timed out connecting; with the option present, the handshake
-     * completes immediately.  Non-SYN segments stay at 20 bytes (no
-     * options); we don't negotiate window scale, SACK, or timestamps,
-     * because the rest of the stack doesn't honor them yet. */
-    uint32_t tcp_hdr_len = (flags & TCP_SYN) ? 24 : 20;
+    /* SYN segments carry MSS + Window-Scale options so the peer (a)
+     * knows we can accept full-sized payloads and (b) honors our
+     * 128 KiB rx_buf via RFC 7323 scaling.  Cloudflare and other
+     * commercial load-balancers / DDoS scrubbers also silently drop
+     * SYNs with zero TCP options — they look like crude port scans.
+     *
+     * Layout (8 bytes, aligned to 4):
+     *   MSS (4):  kind=2, len=4, mss=1460
+     *   NOP (1):  kind=1                       — alignment
+     *   WS  (3):  kind=3, len=3, shift=TCP_RX_WSCALE
+     *
+     * Non-SYN segments stay at 20 bytes — we don't negotiate SACK
+     * or timestamps because the rest of the stack doesn't honor them. */
+    uint32_t tcp_hdr_len = (flags & TCP_SYN) ? 28 : 20;
     uint32_t tcp_total = tcp_hdr_len + data_len;
     uint32_t ip_total  = sizeof(ipv4_hdr_t) + tcp_total;
 
@@ -982,27 +986,39 @@ static int tcp_send_segment(tcp_conn_t *conn, uint8_t flags,
     tcp->data_off = (uint8_t)((tcp_hdr_len / 4) << 4);
     tcp->flags    = flags;
     /* Advertise the ACTUAL available window so the peer stops sending
-     * when our rx_buf fills.  Previously we hard-coded the buffer size,
-     * which lied to the peer: it kept sending at full clip past our
-     * real capacity, handle_tcp() dropped the overflow at line 1267
-     * (copy clamped to `space`), and the connection stalled at ~4–5 KiB
-     * of any large response (the bge-large /embed 19 KiB body was the
-     * canonical reproducer).  TCP_RX_BUF_SIZE is 65535 (max 16-bit
-     * window without RFC 7323 scaling), so the subtraction never
-     * underflows. */
+     * when our rx_buf fills.  RFC 7323 §2.2: the SYN itself MUST carry
+     * the *unscaled* window value; only post-handshake segments scale.
+     * For non-SYN segments we right-shift by rcv_wscale so the 16-bit
+     * field can represent up to (65535 << rcv_wscale) bytes of credit. */
     uint32_t free_window = (TCP_RX_BUF_SIZE > conn->rx_len)
                          ? (TCP_RX_BUF_SIZE - conn->rx_len) : 0;
-    tcp->window   = htons((uint16_t)free_window);
+    uint16_t wnd_field;
+    if (flags & TCP_SYN) {
+        /* Unscaled — peer doesn't yet know our wscale, must take the
+         * literal value.  Clamp to 16-bit. */
+        wnd_field = (free_window > 65535) ? 65535 : (uint16_t)free_window;
+    } else {
+        uint32_t scaled = free_window >> conn->rcv_wscale;
+        wnd_field = (scaled > 65535) ? 65535 : (uint16_t)scaled;
+    }
+    tcp->window   = htons(wnd_field);
     tcp->checksum = 0;
     tcp->urgent   = 0;
 
-    /* MSS option for SYN segments (kind=2, len=4, value=1460) */
+    /* MSS + Window-Scale options for SYN segments. */
     if (flags & TCP_SYN) {
         uint8_t *opt = tx_pkt + ETH_HDR_LEN + sizeof(ipv4_hdr_t) + 20;
-        opt[0] = 0x02;                       /* kind: MSS */
-        opt[1] = 0x04;                       /* length */
-        opt[2] = (uint8_t)(TCP_MSS >> 8);    /* MSS hi */
-        opt[3] = (uint8_t)(TCP_MSS & 0xFF);  /* MSS lo */
+        /* MSS (kind=2, len=4, value=1460) */
+        opt[0] = 0x02;
+        opt[1] = 0x04;
+        opt[2] = (uint8_t)(TCP_MSS >> 8);
+        opt[3] = (uint8_t)(TCP_MSS & 0xFF);
+        /* NOP (kind=1) for 4-byte alignment of the next option */
+        opt[4] = 0x01;
+        /* Window scale (kind=3, len=3, shift=TCP_RX_WSCALE) */
+        opt[5] = 0x03;
+        opt[6] = 0x03;
+        opt[7] = (uint8_t)TCP_RX_WSCALE;
     }
 
     /* Copy payload */
@@ -1045,6 +1061,33 @@ static void handle_tcp(const uint8_t *src_ip, const uint8_t *pkt, uint32_t len)
 
     if (hdr_len < 20 || hdr_len > len)
         return;
+
+    /* Walk TCP options in the [20, hdr_len) range and extract the
+     * peer's window scale (RFC 7323).  Only honored when this segment
+     * carries SYN — wscale is fixed at handshake time.  Other options
+     * (MSS, SACK_PERMITTED, timestamps) are ignored: we don't honor
+     * them in this stack. */
+    uint8_t peer_wscale = 0;
+    bool    peer_has_ws = false;
+    if (hdr_len > 20 && (flags & TCP_SYN)) {
+        const uint8_t *opt = pkt + 20;
+        uint32_t opt_len = hdr_len - 20;
+        uint32_t i = 0;
+        while (i < opt_len) {
+            uint8_t kind = opt[i];
+            if (kind == 0) break;            /* EOL */
+            if (kind == 1) { i++; continue; } /* NOP */
+            if (i + 1 >= opt_len) break;
+            uint8_t l = opt[i + 1];
+            if (l < 2 || i + l > opt_len) break;
+            if (kind == 3 && l == 3) {
+                peer_wscale = opt[i + 2];
+                if (peer_wscale > 14) peer_wscale = 14; /* RFC 7323 cap */
+                peer_has_ws = true;
+            }
+            i += l;
+        }
+    }
 
     const uint8_t *data = pkt + hdr_len;
     uint32_t data_len = len - hdr_len;
@@ -1179,12 +1222,32 @@ static void handle_tcp(const uint8_t *src_ip, const uint8_t *pkt, uint32_t len)
             if (ack == conn->snd_nxt) {
                 conn->rcv_nxt = seq + 1;
                 conn->snd_una = ack;
+                /* RFC 7323 §2.2: both sides must advertise WS on SYN
+                 * for scaling to apply.  If the peer omitted it (some
+                 * legacy boxes), neither side scales — leave
+                 * snd_wscale + rcv_wscale at 0, falling back to a
+                 * straight 16-bit window. */
+                if (peer_has_ws) {
+                    conn->snd_wscale = peer_wscale;
+                    /* keep our advertised rcv_wscale from connect-time
+                     * setup (TCP_RX_WSCALE) — we asked for it in our
+                     * SYN, peer ack'd by sending its own WS option. */
+                } else {
+                    conn->snd_wscale = 0;
+                    conn->rcv_wscale = 0;  /* downgrade — peer can't scale */
+                }
                 conn->state = TCP_ESTABLISHED;
                 net_waiter_wake(NETWAIT_TCP_ESTABLISHED, conn_idx);
                 /* Send ACK */
                 tcp_send_segment(conn, TCP_ACK, NULL, 0);
                 serial_puts("[TCP] Connected (conn ");
                 serial_putdec(conn_idx);
+                if (peer_has_ws) {
+                    serial_puts(", wscale snd=");
+                    serial_putdec((uint64_t)conn->snd_wscale);
+                    serial_puts(" rcv=");
+                    serial_putdec((uint64_t)conn->rcv_wscale);
+                }
                 serial_puts(")\n");
             }
         }

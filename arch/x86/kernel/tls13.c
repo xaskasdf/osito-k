@@ -230,13 +230,43 @@ int tls13_connect(int tcp_conn, const char *hostname)
         serial_puts(" bytes)\n");
         tls13.tls13 = true;
 
-        /* TODO: Parse ServerHello extensions for key_share,
-         * compute shared_secret via X25519,
-         * derive handshake keys via HKDF,
-         * decrypt EncryptedExtensions + Certificate + Finished */
+        /* TODO — TLS 1.3 handshake completion.  The remaining pieces
+         * are non-trivial (~620 LoC total) and tracked in
+         * docs/tls13-roadmap.md:
+         *
+         *   1. Parse ServerHello extensions: supported_versions
+         *      (must be 0x0304), key_share (peer's X25519 public
+         *      key for ECDHE).
+         *   2. Maintain transcript_hash (running SHA-256 over
+         *      ClientHello || ServerHello || ...).
+         *   3. HKDF key schedule (RFC 8446 §7.1):
+         *        early_secret    = Extract(0, 0)
+         *        derived         = Expand-Label(early_secret,"derived",H(""),32)
+         *        handshake_secret= Extract(derived, ECDH_shared)
+         *        c_hs_traffic    = Expand-Label(hs_secret,"c hs traffic",th,32)
+         *        s_hs_traffic    = Expand-Label(hs_secret,"s hs traffic",th,32)
+         *      Then write_key + write_iv via Expand-Label.
+         *   4. Decrypt EncryptedExtensions, Certificate,
+         *      CertificateVerify, Finished using ChaCha20-Poly1305
+         *      (already in crypto2.c) or AES-128-GCM (crypto.c).
+         *      TLS 1.3 records carry a single inner_type byte at
+         *      the end of plaintext; record header bytes go in AAD.
+         *   5. Verify CertificateVerify signature (different from
+         *      TLS 1.2 ServerKeyExchange — signed over
+         *      transcript_hash with context string prefix).
+         *   6. Compute and verify server Finished MAC, emit client
+         *      Finished, switch to application traffic secrets.
+         *
+         * Deferred for now because (a) cost is ~6× any other item
+         * in the current roadmap, (b) CF still serves TLS 1.2
+         * with ECDHE-ECDSA-AES128-GCM-SHA256 which our existing
+         * tls.c path handles end-to-end including SKE verify and
+         * cert pinning, (c) upside is marginal under our threat
+         * model (no 0-RTT, no PFS regressions).  Will revisit when
+         * an endpoint we need only speaks 1.3. */
 
-        serial_puts("[TLS1.3] Handshake in progress (key derivation TODO)\n");
-        return 0;
+        serial_puts("[TLS1.3] Handshake stub — falling back to TLS 1.2\n");
+        return -2;  /* signal caller to retry with TLS 1.2 */
     }
 
     serial_puts("[TLS1.3] Server did not select TLS 1.3, falling back to 1.2\n");

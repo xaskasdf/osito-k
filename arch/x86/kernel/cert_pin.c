@@ -1,0 +1,356 @@
+/*
+ * cert_pin.c — leaf-cert SHA-256 pinning for TLS handshakes.
+ *
+ * MVP pin table; entries are added as we verify them. To onboard a
+ * new endpoint:
+ *
+ *   1. Run the kernel against the host with mode=WARN. The handshake
+ *      will print:
+ *        [PIN] leaf SHA-256 = <64 hex chars>
+ *   2. Verify the fingerprint out-of-band:
+ *        echo | openssl s_client -connect HOST:443 -servername HOST \
+ *          | openssl x509 -outform der | sha256sum
+ *      Both should match.
+ *   3. Append the digest to the `pin_table[]` below, rebuild.
+ *   4. Flip cert_pin_set_mode(CERT_PIN_STRICT) once all live endpoints
+ *      are pinned.
+ *
+ * Cert rotation: leaf certs typically rotate every 60–90 days for
+ * Let's Encrypt / Cloudflare. When a cert rotates, the kernel will
+ * reject (STRICT) or warn (WARN); operator re-pins.
+ */
+
+#include "cert_pin.h"
+
+extern void  serial_puts(const char *s);
+extern void  serial_putdec(uint64_t v);
+
+/* sha256 single-shot helper from kernel/crypto.c. */
+extern void  sha256(const uint8_t *data, uint32_t len, uint8_t out[32]);
+
+/* osfs2 — used to persist the dynamic pin table across boots.
+ * Stub matches vfs_node_t layout (32 bytes) from fs/vfs.h; replicated
+ * here so cert_pin.c stays a leaf module with no fs/vfs dependencies. */
+typedef struct {
+    uint32_t fs_version;
+    uint32_t ino;
+    void    *data;
+    uint64_t size;
+} vfs_stub_t;
+extern bool  vfs_find(const char *path, int mode, void *out);
+extern int   vfs_read(void *node, uint64_t offset, void *buf, uint64_t len);
+extern bool  osfs2_is_mounted(void);
+extern int   osfs2_delete(const char *name);
+extern void *osfs2_create(const char *name, uint64_t size);
+extern int   osfs2_write(void *file, uint64_t offset, const void *buf, uint64_t len);
+
+/* osfs2 path for the persisted dynamic-pin table.  Lives at the
+ * root because cert_pin.c has no concept of multi-host namespacing
+ * yet (the pin table is global, not per-hostname). */
+#define DYN_PIN_PATH       "tls/pins.bin"
+#define DYN_PIN_MAGIC      0x504e504bU  /* "KPNP" — Kernel PiN Persistence */
+
+/* ── Pin table ─────────────────────────────────────────────── */
+
+typedef struct {
+    const char *label;          /* free-form: hostname, comment */
+    uint8_t     digest[32];     /* SHA-256 of DER-encoded leaf cert */
+} cert_pin_t;
+
+static const cert_pin_t pin_table[] = {
+    /* inferconnect.naranjositos.tech — Cloudflare-fronted leaf cert.
+     * Verified 2026-05-10 on macOS host:
+     *   echo | openssl s_client -connect inferconnect.naranjositos.tech:443 \
+     *     -servername inferconnect.naranjositos.tech \
+     *     | openssl x509 -outform der | shasum -a 256
+     *   → b0db909ebee1ecc1717bee9a8a302bd78383ce2c1a5ef2c914e7ad49e5163621
+     * Cross-checked against the kernel's own [PIN] log on the same date,
+     * matched byte-for-byte.
+     *
+     * Cert rotates every ~90 days; on rotation the kernel will reject
+     * (STRICT) or warn (WARN). Re-pin via the workflow at the top of
+     * this file. */
+    { .label = "inferconnect.naranjositos.tech (leaf)",
+      .digest = {
+          0xb0,0xdb,0x90,0x9e,0xbe,0xe1,0xec,0xc1,
+          0x71,0x7b,0xee,0x9a,0x8a,0x30,0x2b,0xd7,
+          0x83,0x83,0xce,0x2c,0x1a,0x5e,0xf2,0xc9,
+          0x14,0xe7,0xad,0x49,0xe5,0x16,0x36,0x21
+      } },
+    /* Google Trust Services WE1 — issuing intermediate.  Pinning the
+     * intermediate gives leaf-rotation tolerance: GTS rotates leaf
+     * certs every ~90 days but the WE1 intermediate rotates every
+     * few years.  As long as either the leaf OR the intermediate
+     * matches, the chain is accepted (cert_pin_check walks each
+     * entry and accepts on first match).  Verified 2026-05-10:
+     *   openssl s_client ... -showcerts \
+     *     | <extract Cert 2> | openssl x509 -outform der | shasum -a 256 */
+    { .label = "GTS WE1 intermediate",
+      .digest = {
+          0x1d,0xfc,0x16,0x05,0xfb,0xad,0x35,0x8d,
+          0x8b,0xc8,0x44,0xf7,0x6d,0x15,0x20,0x3f,
+          0xac,0x9c,0xa5,0xc1,0xa7,0x9f,0xd4,0x85,
+          0x7f,0xfa,0xf2,0x86,0x4f,0xbe,0xbf,0x96
+      } },
+    { 0, {0} }   /* sentinel — keep last */
+};
+
+#define PIN_TABLE_LEN  ((sizeof pin_table / sizeof pin_table[0]) - 1)
+
+/* ── Dynamic pin table (runtime + persisted) ───────────────────
+ *
+ * Captured automatically on a successful chain match when the
+ * leaf isn't already known (static or dynamic).  Persisted to
+ * osfs2 so that subsequent boots remember rotated leaves even if
+ * the static intermediate eventually rotates too.  FIFO eviction
+ * when full. */
+#define CERT_PIN_DYN_MAX  32
+static uint8_t  dyn_digests[CERT_PIN_DYN_MAX][32];
+static uint8_t  dyn_count = 0;     /* 0..CERT_PIN_DYN_MAX */
+static uint8_t  dyn_head  = 0;     /* FIFO insertion index when full */
+static bool     dyn_dirty = false; /* unflushed changes pending */
+
+static int dyn_table_has(const uint8_t *digest)
+{
+    for (uint8_t i = 0; i < dyn_count; i++) {
+        const uint8_t *a = dyn_digests[i];
+        uint8_t diff = 0;
+        for (uint32_t j = 0; j < 32; j++) diff |= (uint8_t)(a[j] ^ digest[j]);
+        if (diff == 0) return 1;
+    }
+    return 0;
+}
+
+static void dyn_table_add(const uint8_t *digest)
+{
+    uint8_t slot;
+    if (dyn_count < CERT_PIN_DYN_MAX) {
+        slot = dyn_count++;
+    } else {
+        /* Full — evict the oldest (FIFO via dyn_head). */
+        slot = dyn_head;
+        dyn_head = (uint8_t)((dyn_head + 1) % CERT_PIN_DYN_MAX);
+    }
+    for (uint32_t j = 0; j < 32; j++) dyn_digests[slot][j] = digest[j];
+    dyn_dirty = true;
+}
+
+/* Persist dyn_digests[0..dyn_count) to osfs2.  Format:
+ *   uint32 LE magic
+ *   uint32 LE count
+ *   N * 32 bytes digest
+ * Called from cert_pin_check_leaf after a new pin is captured. */
+static void dyn_table_save(void)
+{
+    if (!dyn_dirty) return;
+    if (!osfs2_is_mounted()) {
+        /* No FS to persist into yet — keep the in-memory copy and
+         * try again next time something changes. */
+        return;
+    }
+
+    uint8_t buf[8 + CERT_PIN_DYN_MAX * 32];
+    buf[0] = (uint8_t)(DYN_PIN_MAGIC      ); buf[1] = (uint8_t)(DYN_PIN_MAGIC >> 8);
+    buf[2] = (uint8_t)(DYN_PIN_MAGIC >> 16); buf[3] = (uint8_t)(DYN_PIN_MAGIC >> 24);
+    buf[4] = dyn_count;
+    buf[5] = buf[6] = buf[7] = 0;
+
+    /* Write entries in insertion order, oldest first.  When the
+     * ring has wrapped (dyn_count == CERT_PIN_DYN_MAX), the
+     * "oldest" entry is at dyn_head; otherwise indices 0..count-1
+     * are already in order. */
+    uint32_t off = 8;
+    if (dyn_count == CERT_PIN_DYN_MAX) {
+        for (uint8_t i = 0; i < CERT_PIN_DYN_MAX; i++) {
+            uint8_t idx = (uint8_t)((dyn_head + i) % CERT_PIN_DYN_MAX);
+            for (uint32_t j = 0; j < 32; j++) buf[off++] = dyn_digests[idx][j];
+        }
+    } else {
+        for (uint8_t i = 0; i < dyn_count; i++)
+            for (uint32_t j = 0; j < 32; j++) buf[off++] = dyn_digests[i][j];
+    }
+    uint32_t total = off;
+
+    osfs2_delete(DYN_PIN_PATH);   /* ignore missing-file errors */
+    void *f = osfs2_create(DYN_PIN_PATH, (uint64_t)total);
+    if (!f) {
+        serial_puts("[PIN] dyn save: osfs2_create failed\n");
+        return;
+    }
+    int wr = osfs2_write(f, 0, buf, (uint64_t)total);
+    if (wr < 0) {
+        serial_puts("[PIN] dyn save: osfs2_write failed\n");
+        return;
+    }
+    dyn_dirty = false;
+    serial_puts("[PIN] dyn table saved (");
+    serial_putdec((uint64_t)dyn_count);
+    serial_puts(" entries)\n");
+}
+
+int cert_pin_load_dynamic(void)
+{
+    if (!osfs2_is_mounted()) return -1;
+
+    vfs_stub_t node;
+    if (!vfs_find(DYN_PIN_PATH, 0, &node)) return -1;
+
+    uint8_t buf[8 + CERT_PIN_DYN_MAX * 32];
+    int n = vfs_read(&node, 0, buf, sizeof buf);
+    if (n < 8) return -1;
+
+    uint32_t magic = (uint32_t)buf[0]
+                   | ((uint32_t)buf[1] << 8)
+                   | ((uint32_t)buf[2] << 16)
+                   | ((uint32_t)buf[3] << 24);
+    if (magic != DYN_PIN_MAGIC) {
+        serial_puts("[PIN] dyn load: bad magic, ignoring\n");
+        return -1;
+    }
+    uint8_t count = buf[4];
+    if (count > CERT_PIN_DYN_MAX) count = CERT_PIN_DYN_MAX;
+    if (n < (int)(8 + (uint32_t)count * 32)) return -1;
+
+    dyn_count = count;
+    dyn_head  = 0;
+    for (uint8_t i = 0; i < count; i++)
+        for (uint32_t j = 0; j < 32; j++)
+            dyn_digests[i][j] = buf[8 + i * 32 + j];
+    dyn_dirty = false;
+
+    serial_puts("[PIN] dyn table loaded (");
+    serial_putdec((uint64_t)dyn_count);
+    serial_puts(" entries)\n");
+    return 0;
+}
+
+/* ── Mode (default WARN until table is populated) ──────────── */
+
+static cert_pin_mode_t g_mode = CERT_PIN_WARN;
+
+void cert_pin_set_mode(cert_pin_mode_t m) { g_mode = m; }
+cert_pin_mode_t cert_pin_get_mode(void)   { return g_mode; }
+
+/* ── Helpers ───────────────────────────────────────────────── */
+
+static void puthex(uint8_t b)
+{
+    static const char hx[] = "0123456789abcdef";
+    char out[3] = { hx[(b >> 4) & 0xF], hx[b & 0xF], 0 };
+    serial_puts(out);
+}
+
+static int digests_equal(const uint8_t *a, const uint8_t *b)
+{
+    /* Constant-time over 32 bytes; not security-critical here but
+     * good hygiene since this is a comparison of cryptographic
+     * digests. */
+    uint8_t diff = 0;
+    for (uint32_t i = 0; i < 32; i++) diff |= (uint8_t)(a[i] ^ b[i]);
+    return diff == 0 ? 1 : 0;
+}
+
+/* ── Main entry ────────────────────────────────────────────── */
+
+/* Walk every cert in the TLS Certificate handshake message, hash it,
+ * log the SHA-256 so the operator can copy it into pin_table[], and
+ * succeed as soon as ANY cert in the chain matches a pin. This means
+ * the operator can pin either the leaf (rotates ~90d) or the
+ * intermediate (rotates ~years) — pinning the intermediate is more
+ * stable since leaf certs rotate frequently but their issuer doesn't. */
+int cert_pin_check_leaf(const uint8_t *cert_msg, uint32_t cert_msg_len)
+{
+    if (g_mode == CERT_PIN_OFF) return 0;
+
+    if (cert_msg_len < 6) {
+        serial_puts("[PIN] cert msg too short — rejecting\n");
+        return (g_mode == CERT_PIN_STRICT) ? -1 : 0;
+    }
+    uint32_t total = ((uint32_t)cert_msg[0] << 16)
+                   | ((uint32_t)cert_msg[1] <<  8)
+                   |  (uint32_t)cert_msg[2];
+    if (total + 3 > cert_msg_len || total < 3) {
+        serial_puts("[PIN] malformed cert list — rejecting\n");
+        return (g_mode == CERT_PIN_STRICT) ? -1 : 0;
+    }
+
+    /* Walk the chain. Each entry is uint24 cert_len + cert bytes. */
+    uint32_t off = 3;
+    uint32_t end = 3 + total;
+    int      cert_idx = 0;
+    int      any_match = 0;
+    int      dyn_match = 0;
+    const cert_pin_t *match_entry = 0;
+    uint8_t  leaf_digest[32];
+    bool     have_leaf = false;
+    while (off + 3 <= end) {
+        uint32_t cert_len = ((uint32_t)cert_msg[off]     << 16)
+                          | ((uint32_t)cert_msg[off + 1] <<  8)
+                          |  (uint32_t)cert_msg[off + 2];
+        off += 3;
+        if (off + cert_len > end) {
+            serial_puts("[PIN] malformed chain — rejecting\n");
+            return (g_mode == CERT_PIN_STRICT) ? -1 : 0;
+        }
+        uint8_t digest[32];
+        sha256(cert_msg + off, cert_len, digest);
+
+        if (cert_idx == 0) {
+            for (uint32_t j = 0; j < 32; j++) leaf_digest[j] = digest[j];
+            have_leaf = true;
+        }
+
+        /* Always log every chain cert so the operator can pick which
+         * one to pin (leaf is most specific; intermediate is most
+         * stable; root is most coarse). */
+        serial_puts("[PIN] cert#");
+        serial_putdec((uint64_t)cert_idx);
+        serial_puts(" SHA-256 = ");
+        for (uint32_t i = 0; i < 32; i++) puthex(digest[i]);
+        serial_puts(" (");
+        serial_putdec(cert_len);
+        serial_puts(" B)\n");
+
+        for (uint32_t i = 0; i < PIN_TABLE_LEN && !any_match; i++) {
+            if (digests_equal(pin_table[i].digest, digest)) {
+                any_match = 1;
+                match_entry = &pin_table[i];
+            }
+        }
+        if (!any_match && dyn_table_has(digest)) {
+            any_match = 1;
+            dyn_match = 1;
+        }
+        off += cert_len;
+        cert_idx++;
+    }
+
+    if (any_match) {
+        if (dyn_match) {
+            serial_puts("[PIN] match: dynamic pin\n");
+        } else {
+            serial_puts("[PIN] match: ");
+            serial_puts(match_entry->label);
+            serial_puts("\n");
+        }
+        /* Dynamic capture: chain validated through a *static*
+         * pin (not just the dynamic table itself, which would be a
+         * tautology), but the leaf isn't yet recorded.  Add it so
+         * that we have a leaf-level fingerprint when the static
+         * intermediate eventually rotates.  Guarded against the
+         * dyn_match case to avoid re-adding entries we just matched
+         * against. */
+        if (!dyn_match && have_leaf && !dyn_table_has(leaf_digest)) {
+            dyn_table_add(leaf_digest);
+            serial_puts("[PIN] dyn capture: new leaf added\n");
+            dyn_table_save();
+        }
+        return 0;
+    }
+    if (g_mode == CERT_PIN_STRICT) {
+        serial_puts("[PIN] STRICT: no chain cert matches the pin table — abort\n");
+        return -1;
+    }
+    serial_puts("[PIN] WARN: no chain cert in pin table — accepting (mode=warn)\n");
+    return 0;
+}
