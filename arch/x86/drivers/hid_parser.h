@@ -102,6 +102,15 @@ typedef struct {
     int         mouse_x_field;     /* Page 1 usage 0x30. */
     int         mouse_y_field;     /* Page 1 usage 0x31. */
     int         mouse_wheel_field; /* Page 1 usage 0x38, -1 if absent. */
+    /* Index of the X/Y/wheel element WITHIN its declaring field.
+     * A descriptor that uses Usage_Minimum(X)..Usage_Maximum(Y) with
+     * REPORT_COUNT(2) (QEMU usb-mouse, most boot mice) declares X and
+     * Y as two consecutive elements of one field. Without recording
+     * the element index here the extractor reads `bit_offset` for
+     * both axes → identical dx/dy → cursor moves only on the diagonal. */
+    uint8_t     mouse_x_elem;
+    uint8_t     mouse_y_elem;
+    uint8_t     mouse_wheel_elem;
     uint8_t     mouse_report_id;   /* 0 if no ID. */
 } hid_caps_t;
 

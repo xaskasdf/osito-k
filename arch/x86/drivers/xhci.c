@@ -301,14 +301,21 @@ static void hid_process_mouse(xhci_device_t *dev, const uint8_t *r)
     if (caps->mouse_x_field >= 0 && caps->mouse_y_field >= 0) {
         const hid_field_t *fx = &caps->fields[caps->mouse_x_field];
         const hid_field_t *fy = &caps->fields[caps->mouse_y_field];
+        /* When X and Y live in the same hid_field_t (count >= 2,
+         * QEMU usb-mouse style), fx == fy and both reads would
+         * otherwise hit the same bits → only-diagonal cursor. Apply
+         * the element-index offset stored at parse time so each axis
+         * reads its own slice of the field. */
+        uint16_t x_off = fx->bit_offset + (uint16_t)caps->mouse_x_elem * fx->bit_size;
+        uint16_t y_off = fy->bit_offset + (uint16_t)caps->mouse_y_elem * fy->bit_size;
         if (fx->flags & HID_INPUT_REL) {
-            int32_t dx = hid_extract_signed(r, fx->bit_offset, fx->bit_size);
-            int32_t dy = hid_extract_signed(r, fy->bit_offset, fy->bit_size);
+            int32_t dx = hid_extract_signed(r, x_off, fx->bit_size);
+            int32_t dy = hid_extract_signed(r, y_off, fy->bit_size);
             if (dx != 0 || dy != 0)
                 input_post_mouse_move((int16_t)dx, (int16_t)dy);
         } else {
-            int32_t ax = hid_extract(r, fx->bit_offset, fx->bit_size);
-            int32_t ay = hid_extract(r, fy->bit_offset, fy->bit_size);
+            int32_t ax = hid_extract(r, x_off, fx->bit_size);
+            int32_t ay = hid_extract(r, y_off, fy->bit_size);
             input_set_mouse_abs(ax, ay);
         }
     }
@@ -1039,6 +1046,7 @@ static void enumerate_port(xhci_hc_t *hc, int port)
 
     uint8_t  hid_iface          = 0xFF;
     uint8_t  hid_proto          = 0;
+    uint8_t  hid_subclass       = 0;
     uint8_t  int_ep_addr        = 0;
     uint16_t int_max_pkt_found  = 0;
     uint8_t  int_interval       = 0;
@@ -1088,6 +1096,7 @@ static void enumerate_port(xhci_hc_t *hc, int port)
                 iface_kind     = IFACE_HID;
                 hid_iface      = this_iface;
                 hid_proto      = iproto;
+                hid_subclass   = isub;
                 collecting_eps = true;
             } else if (iclass == 0x08 && iface_kind == IFACE_NONE) {
                 /* USB Mass Storage. Accept any subclass/protocol so we
@@ -1216,19 +1225,35 @@ static void enumerate_port(xhci_hc_t *hc, int port)
     }
 
   if (iface_kind == IFACE_HID) {
-    /* ── SET_PROTOCOL (boot protocol = 0) ── */
-    setup.bmRequestType = 0x21; /* Class, Interface, Host-to-Device */
-    setup.bRequest = USB_REQ_SET_PROTOCOL;
-    setup.wValue = 0; /* Boot protocol */
-    setup.wIndex = hid_iface;
-    setup.wLength = 0;
-    ctrl_transfer(hc, dev, &setup, NULL, 0, false); /* OK if fails */
+    /* SET_PROTOCOL and SET_IDLE are mandatory only for HID Boot
+     * Interface Subclass (bInterfaceSubClass == 1) — i.e. boot
+     * keyboards and boot mice. Generic HID devices (subclass 0,
+     * which QEMU's usb-mouse and most non-boot pointers use) STALL
+     * these class-specific requests. A stalled EP0 then refuses
+     * every subsequent control transfer until CLEAR_FEATURE(EP_HALT),
+     * so issuing them unconditionally killed our GET_DESCRIPTOR(Report)
+     * for the mouse and left it HID-unparsed → reports dropped.
+     *
+     * Skip the boot-only requests for non-boot subclasses; the
+     * device's default protocol (Report) is what we already expect
+     * to parse anyway. */
+    if (hid_subclass == 1) {
+        /* ── SET_PROTOCOL (boot protocol = 0) ── */
+        setup.bmRequestType = 0x21; /* Class, Interface, Host-to-Device */
+        setup.bRequest = USB_REQ_SET_PROTOCOL;
+        setup.wValue = 0; /* Boot protocol */
+        setup.wIndex = hid_iface;
+        setup.wLength = 0;
+        ctrl_transfer(hc, dev, &setup, NULL, 0, false); /* OK if fails */
 
-    /* ── SET_IDLE (rate = 0, infinite) ── */
-    setup.bRequest = USB_REQ_SET_IDLE;
-    setup.wValue = 0;
-    setup.wIndex = hid_iface;
-    ctrl_transfer(hc, dev, &setup, NULL, 0, false); /* OK if fails */
+        /* ── SET_IDLE (rate = 0, infinite) ── */
+        setup.bRequest = USB_REQ_SET_IDLE;
+        setup.wValue = 0;
+        setup.wIndex = hid_iface;
+        ctrl_transfer(hc, dev, &setup, NULL, 0, false); /* OK if fails */
+    } else {
+        serial_puts("[xHCI] non-boot HID subclass — skip SET_PROTOCOL/SET_IDLE\n");
+    }
 
     /* ── GET_DESCRIPTOR(Report) — fetch the HID Report Descriptor and
      * parse it into dev->hid_caps. The parsed capability map drives the

@@ -367,19 +367,31 @@ int hid_parse(const uint8_t *desc, uint16_t len, hid_caps_t *out)
             out->mouse_report_id = f->report_id;
         }
 
-        /* Mouse X/Y/wheel: page 1, variable, single usage. */
+        /* Mouse X/Y/wheel: page 1, variable, possibly multi-element.
+         * The descriptor pattern QEMU's usb-mouse (and most boot mice)
+         * emit is:
+         *   USAGE_MINIMUM(X), USAGE_MAXIMUM(Y), REPORT_COUNT(2)
+         * which collapses X and Y into a single hid_field_t with
+         * count=2. Record the element INDEX (X is min..min+0, Y is at
+         * usage−min) so the extractor can compute the right per-axis
+         * bit offset:
+         *     axis_bit_off = f->bit_offset + elem * f->bit_size;
+         */
         if (f->usage_page == HID_PAGE_DESKTOP && (f->flags & HID_INPUT_VAR)) {
             if (f->usage_min <= HID_USAGE_X && f->usage_max >= HID_USAGE_X) {
                 out->has_mouse = true;
                 out->mouse_x_field = i;
+                out->mouse_x_elem  = (uint8_t)(HID_USAGE_X - f->usage_min);
                 out->mouse_report_id = f->report_id;
             }
             if (f->usage_min <= HID_USAGE_Y && f->usage_max >= HID_USAGE_Y) {
                 out->has_mouse = true;
                 out->mouse_y_field = i;
+                out->mouse_y_elem  = (uint8_t)(HID_USAGE_Y - f->usage_min);
             }
             if (f->usage_min <= HID_USAGE_WHEEL && f->usage_max >= HID_USAGE_WHEEL) {
                 out->mouse_wheel_field = i;
+                out->mouse_wheel_elem  = (uint8_t)(HID_USAGE_WHEEL - f->usage_min);
             }
         }
     }
