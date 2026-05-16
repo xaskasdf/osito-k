@@ -955,7 +955,16 @@ static int tcp_send_segment(tcp_conn_t *conn, uint8_t flags,
         return -1;
     }
 
-    uint32_t tcp_hdr_len = 20;  /* No options */
+    /* SYN segments carry a 4-byte MSS option so the peer knows we can
+     * accept full-sized payloads.  Cloudflare (and various commercial
+     * load-balancers / DDoS scrubbers) silently drop SYNs that arrive
+     * with zero TCP options — they look like crude port scans.  Our
+     * old "naked" SYN got no SYN+ACK back from CF and the kernel
+     * timed out connecting; with the option present, the handshake
+     * completes immediately.  Non-SYN segments stay at 20 bytes (no
+     * options); we don't negotiate window scale, SACK, or timestamps,
+     * because the rest of the stack doesn't honor them yet. */
+    uint32_t tcp_hdr_len = (flags & TCP_SYN) ? 24 : 20;
     uint32_t tcp_total = tcp_hdr_len + data_len;
     uint32_t ip_total  = sizeof(ipv4_hdr_t) + tcp_total;
 
@@ -1004,6 +1013,15 @@ static int tcp_send_segment(tcp_conn_t *conn, uint8_t flags,
     tcp->window   = htons((uint16_t)free_window);
     tcp->checksum = 0;
     tcp->urgent   = 0;
+
+    /* MSS option for SYN segments (kind=2, len=4, value=1460) */
+    if (flags & TCP_SYN) {
+        uint8_t *opt = tx_pkt + ETH_HDR_LEN + sizeof(ipv4_hdr_t) + 20;
+        opt[0] = 0x02;                       /* kind: MSS */
+        opt[1] = 0x04;                       /* length */
+        opt[2] = (uint8_t)(TCP_MSS >> 8);    /* MSS hi */
+        opt[3] = (uint8_t)(TCP_MSS & 0xFF);  /* MSS lo */
+    }
 
     /* Copy payload */
     if (data && data_len > 0)
