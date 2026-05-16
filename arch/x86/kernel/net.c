@@ -926,6 +926,56 @@ static uint16_t tcp_checksum(const uint8_t src_ip[4], const uint8_t dst_ip[4],
 
 #define TCP_MSS 1460  /* Ethernet MTU 1500 - 20 IP - 20 TCP */
 
+/* Sequence-number comparators (32-bit modular arithmetic, RFC 1323). */
+static inline int seq_ge(uint32_t a, uint32_t b) { return (int32_t)(a - b) >= 0; }
+static inline int seq_le(uint32_t a, uint32_t b) { return (int32_t)(a - b) <= 0; }
+
+/* Record an out-of-order [start, end) range so the next outgoing ACK
+ * advertises it via SACK (RFC 2018). Coalesces with adjacent blocks
+ * and moves the touched block to the front (most-recent first, per
+ * RFC 2018 §4 ordering). Up to 4 blocks; older entries fall off. */
+static void tcp_sack_add_block(tcp_conn_t *conn, uint32_t start, uint32_t end)
+{
+    if (!conn->sack_ok || seq_le(end, start)) return;
+    for (uint8_t i = 0; i < conn->n_sack_blocks; i++) {
+        uint32_t *b = conn->sack_blocks[i];
+        if (seq_le(start, b[1]) && seq_ge(end, b[0])) {
+            uint32_t s = seq_le(start, b[0]) ? start : b[0];
+            uint32_t e = seq_ge(end,   b[1]) ? end   : b[1];
+            for (uint8_t j = i; j > 0; j--) {
+                conn->sack_blocks[j][0] = conn->sack_blocks[j - 1][0];
+                conn->sack_blocks[j][1] = conn->sack_blocks[j - 1][1];
+            }
+            conn->sack_blocks[0][0] = s;
+            conn->sack_blocks[0][1] = e;
+            return;
+        }
+    }
+    uint8_t n = conn->n_sack_blocks < 4 ? conn->n_sack_blocks : 3;
+    for (uint8_t i = n; i > 0; i--) {
+        conn->sack_blocks[i][0] = conn->sack_blocks[i - 1][0];
+        conn->sack_blocks[i][1] = conn->sack_blocks[i - 1][1];
+    }
+    conn->sack_blocks[0][0] = start;
+    conn->sack_blocks[0][1] = end;
+    if (conn->n_sack_blocks < 4) conn->n_sack_blocks++;
+}
+
+/* Discard SACK blocks fully covered by the advanced rcv_nxt. */
+static void tcp_sack_drain(tcp_conn_t *conn)
+{
+    uint8_t w = 0;
+    for (uint8_t r = 0; r < conn->n_sack_blocks; r++) {
+        if (seq_ge(conn->rcv_nxt, conn->sack_blocks[r][1])) continue;
+        if (w != r) {
+            conn->sack_blocks[w][0] = conn->sack_blocks[r][0];
+            conn->sack_blocks[w][1] = conn->sack_blocks[r][1];
+        }
+        w++;
+    }
+    conn->n_sack_blocks = w;
+}
+
 static int tcp_send_segment(tcp_conn_t *conn, uint8_t flags,
                              const void *data, uint32_t data_len)
 {
@@ -937,20 +987,34 @@ static int tcp_send_segment(tcp_conn_t *conn, uint8_t flags,
         return -1;
     }
 
-    /* SYN segments carry MSS + Window-Scale options so the peer (a)
-     * knows we can accept full-sized payloads and (b) honors our
-     * 128 KiB rx_buf via RFC 7323 scaling.  Cloudflare and other
-     * commercial load-balancers / DDoS scrubbers also silently drop
-     * SYNs with zero TCP options — they look like crude port scans.
+    /* SYN segments carry MSS + Window-Scale + SACK_PERMITTED options.
+     * Cloudflare and other commercial load-balancers / DDoS scrubbers
+     * silently drop SYNs with zero TCP options — they look like crude
+     * port scans.
      *
-     * Layout (8 bytes, aligned to 4):
-     *   MSS (4):  kind=2, len=4, mss=1460
-     *   NOP (1):  kind=1                       — alignment
-     *   WS  (3):  kind=3, len=3, shift=TCP_RX_WSCALE
+     * Layout (12 bytes, aligned to 4):
+     *   MSS (4):       kind=2, len=4, mss=1460
+     *   NOP (1):       kind=1                     — align next opt to 4
+     *   WS  (3):       kind=3, len=3, shift=TCP_RX_WSCALE
+     *   SACK_OK (2):   kind=4, len=2              — RFC 2018
+     *   NOP NOP (2):                              — pad to 4-byte align
      *
-     * Non-SYN segments stay at 20 bytes — we don't negotiate SACK
-     * or timestamps because the rest of the stack doesn't honor them. */
-    uint32_t tcp_hdr_len = (flags & TCP_SYN) ? 28 : 20;
+     * Non-SYN ACK segments append a SACK block option (kind=5) when
+     * the receiver is tracking out-of-order data. Layout (12 bytes):
+     *   NOP NOP (2):                              — align option to 4
+     *   SACK (10):     kind=5, len=10, [start, end) — single block
+     *
+     * Multi-block SACK (up to 4) is rare in practice for our flows —
+     * one OOO range is the dominant case at our typical packet loss
+     * rate — so we keep the option fixed-size to avoid pushing the
+     * header past the common 40-byte options ceiling other stacks
+     * sometimes enforce. */
+    uint32_t tcp_hdr_len;
+    bool emit_sack = (!(flags & TCP_SYN)) && conn->sack_ok &&
+                     conn->n_sack_blocks > 0;
+    if (flags & TCP_SYN)        tcp_hdr_len = 32;
+    else if (emit_sack)         tcp_hdr_len = 32;
+    else                        tcp_hdr_len = 20;
     uint32_t tcp_total = tcp_hdr_len + data_len;
     uint32_t ip_total  = sizeof(ipv4_hdr_t) + tcp_total;
 
@@ -1005,7 +1069,7 @@ static int tcp_send_segment(tcp_conn_t *conn, uint8_t flags,
     tcp->checksum = 0;
     tcp->urgent   = 0;
 
-    /* MSS + Window-Scale options for SYN segments. */
+    /* MSS + Window-Scale + SACK_PERMITTED options for SYN segments. */
     if (flags & TCP_SYN) {
         uint8_t *opt = tx_pkt + ETH_HDR_LEN + sizeof(ipv4_hdr_t) + 20;
         /* MSS (kind=2, len=4, value=1460) */
@@ -1019,6 +1083,26 @@ static int tcp_send_segment(tcp_conn_t *conn, uint8_t flags,
         opt[5] = 0x03;
         opt[6] = 0x03;
         opt[7] = (uint8_t)TCP_RX_WSCALE;
+        /* SACK_PERMITTED (kind=4, len=2) — RFC 2018 */
+        opt[8] = 0x04;
+        opt[9] = 0x02;
+        /* Two NOPs to pad to 12 bytes (4-byte aligned) */
+        opt[10] = 0x01;
+        opt[11] = 0x01;
+    } else if (emit_sack) {
+        /* Single-block SACK option on a data-less ACK. The block holds
+         * the most recently received out-of-order [start, end) range. */
+        uint8_t *opt = tx_pkt + ETH_HDR_LEN + sizeof(ipv4_hdr_t) + 20;
+        /* Two leading NOPs to align the SACK option to 4 bytes (so a
+         * downstream offload that reads it as 32-bit words is happy). */
+        opt[0] = 0x01;
+        opt[1] = 0x01;
+        opt[2] = 0x05;   /* kind = SACK */
+        opt[3] = 0x0A;   /* length = 2 + 8 (one block) */
+        uint32_t blk_start = htonl(conn->sack_blocks[0][0]);
+        uint32_t blk_end   = htonl(conn->sack_blocks[0][1]);
+        memcpy(opt + 4, &blk_start, 4);
+        memcpy(opt + 8, &blk_end,   4);
     }
 
     /* Copy payload */
@@ -1062,13 +1146,14 @@ static void handle_tcp(const uint8_t *src_ip, const uint8_t *pkt, uint32_t len)
     if (hdr_len < 20 || hdr_len > len)
         return;
 
-    /* Walk TCP options in the [20, hdr_len) range and extract the
-     * peer's window scale (RFC 7323).  Only honored when this segment
-     * carries SYN — wscale is fixed at handshake time.  Other options
-     * (MSS, SACK_PERMITTED, timestamps) are ignored: we don't honor
-     * them in this stack. */
+    /* Walk TCP options in the [20, hdr_len) range. On SYN we extract
+     * the peer's window scale (RFC 7323) and SACK_PERMITTED flag
+     * (RFC 2018). Both are fixed at handshake time. SACK blocks on
+     * non-SYN ACKs (kind=5) are ignored on the sender side for now —
+     * fast retransmit (3 dup ACKs) covers the common loss case. */
     uint8_t peer_wscale = 0;
     bool    peer_has_ws = false;
+    bool    peer_sack_ok = false;
     if (hdr_len > 20 && (flags & TCP_SYN)) {
         const uint8_t *opt = pkt + 20;
         uint32_t opt_len = hdr_len - 20;
@@ -1084,6 +1169,8 @@ static void handle_tcp(const uint8_t *src_ip, const uint8_t *pkt, uint32_t len)
                 peer_wscale = opt[i + 2];
                 if (peer_wscale > 14) peer_wscale = 14; /* RFC 7323 cap */
                 peer_has_ws = true;
+            } else if (kind == 4 && l == 2) {
+                peer_sack_ok = true;
             }
             i += l;
         }
@@ -1148,6 +1235,7 @@ static void handle_tcp(const uint8_t *src_ip, const uint8_t *pkt, uint32_t len)
         tcp_isn_counter  += 64000;
         conn->snd_una     = conn->snd_nxt;
         conn->state       = TCP_SYN_RCVD;
+        conn->sack_ok     = peer_sack_ok ? 1 : 0;
         conn->last_activity = idt_get_ticks();
 
         /* Send SYN+ACK. If ARP isn't resolved this returns -1 and
@@ -1236,6 +1324,10 @@ static void handle_tcp(const uint8_t *src_ip, const uint8_t *pkt, uint32_t len)
                     conn->snd_wscale = 0;
                     conn->rcv_wscale = 0;  /* downgrade — peer can't scale */
                 }
+                /* RFC 2018 §2.2: SACK only activates when *both* sides
+                 * advertise SACK_PERMITTED in their SYN. We always send
+                 * it; trust the peer's bit. */
+                conn->sack_ok = peer_sack_ok ? 1 : 0;
                 conn->state = TCP_ESTABLISHED;
                 net_waiter_wake(NETWAIT_TCP_ESTABLISHED, conn_idx);
                 /* Send ACK */
@@ -1298,10 +1390,17 @@ static void handle_tcp(const uint8_t *src_ip, const uint8_t *pkt, uint32_t len)
                 conn->rx_len += copy;
             }
             conn->rcv_nxt += data_len;
+            tcp_sack_drain(conn);
             /* ACK the data */
             tcp_send_segment(conn, TCP_ACK, NULL, 0);
             /* Wake any process blocked on recv */
             net_waiter_wake(NETWAIT_TCP_RX, conn_idx);
+        } else if (data_len > 0 && (int32_t)(seq - conn->rcv_nxt) > 0) {
+            /* Out-of-order — record [seq, seq+data_len) as a SACK block
+             * and send a duplicate ACK (rcv_nxt unchanged). The peer's
+             * fast-retransmit logic picks up the missing range. */
+            tcp_sack_add_block(conn, seq, seq + data_len);
+            tcp_send_segment(conn, TCP_ACK, NULL, 0);
         }
 
         /* FIN from remote */

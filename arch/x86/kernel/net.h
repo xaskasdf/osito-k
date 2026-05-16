@@ -140,6 +140,16 @@ typedef struct {
     uint8_t   rcv_wscale;      /* our window scale (log2 of RX buf) */
     uint32_t  snd_wnd;         /* remote advertised window (scaled) */
 
+    /* Selective ACK (RFC 2018). Receiver-side state: when an out-of-order
+     * segment arrives we record its [start, end) sequence range so the
+     * next outgoing ACK can advertise it via the SACK option (kind=5).
+     * Up to 4 blocks per RFC; the most-recent block is shipped first
+     * (matches Linux + the RFC 2883 D-SACK recommendation). Blocks are
+     * coalesced when adjacent and discarded as rcv_nxt catches up. */
+    uint8_t   sack_ok;            /* peer sent SACK_PERMITTED in SYN */
+    uint8_t   n_sack_blocks;      /* 0..4 valid entries in sack_blocks */
+    uint32_t  sack_blocks[4][2];  /* [start, end) seq pairs */
+
     uint64_t  last_activity;  /* tick of last packet */
 } tcp_conn_t;
 
