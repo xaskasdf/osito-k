@@ -1516,8 +1516,13 @@ int WINAPI lstrlenW(PCWSTR lpString)
 
 /* ── Command line (stub) ────────────────────────────────────── */
 
-static char  g_cmdline_a[] = "UnrealTournament.exe CityIntro.unr";
-static WCHAR g_cmdline_w[] = {'U','n','r','e','a','l','T','o','u','r','n','a','m','e','n','t','.','e','x','e',' ','C','i','t','y','I','n','t','r','o','.','u','n','r',0};
+/* Command line: omitting the map arg makes the engine fall through
+ * to its DEFAULT URL (Entry.unr → main menu).  With "CityIntro.unr"
+ * the engine attempts to load it but ends up trying to load package
+ * "0" (some FName index resolves to empty/zero) and throws "Can't
+ * find file for package '0'".  Bare exe → menu may work better. */
+static char  g_cmdline_a[] = "UnrealTournament.exe";
+static WCHAR g_cmdline_w[] = {'U','n','r','e','a','l','T','o','u','r','n','a','m','e','n','t','.','e','x','e',0};
 
 PCSTR WINAPI GetCommandLineA(void)
 {
