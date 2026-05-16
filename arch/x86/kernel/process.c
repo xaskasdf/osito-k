@@ -515,6 +515,45 @@ static void proc_free(process_t *p)
     proc_transition(p, PROC_FREE);
 }
 
+/* External kill-and-reap — mark a process as ZOMBIE, free all its
+ * resources (page tables, fd table, symbol tables, GPU contexts,
+ * SHM regions, ...), then put the proctab slot back to PROC_FREE so
+ * it can be reused. Used by winexec to clean up orphan win32 threads
+ * before re-enabling the APIC LVT: leaving them as ZOMBIE merely
+ * stops the scheduler from dispatching them, but keeps their slot
+ * occupied and their context structures allocated. proc_free() does
+ * the real work; we just need to make sure we aren't reaping the
+ * currently-running process (would self-corrupt).
+ *
+ * Returns 0 on successful reap, -1 if the pid is invalid, the slot
+ * is already free, or the process is the caller itself. */
+int proc_kill_pid(int pid)
+{
+    if (pid <= 0 || pid >= MAX_PID) return -1;
+    int idx = pid_to_idx[pid];
+    if (idx < 0 || idx >= MAX_PROCESSES) return -1;
+    process_t *p = &proctab[idx];
+    if (p->state == PROC_FREE) return -1;
+    /* Refuse to reap ourselves — proc_free dismantles state that the
+     * current execution context still depends on. proc_exit() is the
+     * right API for self-termination. */
+    if (p == current_proc) return -1;
+
+    /* If the process is ready but never dispatched (compositor's
+     * orphan win32 threads after PE exit fall into this bucket), we
+     * can free it immediately. proc_free handles dequeueing from the
+     * run queue, releasing per-process resources, and transitioning
+     * to PROC_FREE. */
+    p->exit_code = -1;
+    proc_transition(p, PROC_ZOMBIE);
+    proc_free(p);
+    return 0;
+}
+
+/* Back-compat alias — kept so existing callers (winexec, debug
+ * tooling) continue to compile. Prefer proc_kill_pid going forward. */
+int proc_zombify_pid(int pid) { return proc_kill_pid(pid); }
+
 /* ── Register memory region with current process (for cleanup) ── */
 
 void proc_add_region(void *base, uint64_t pages)

@@ -141,22 +141,13 @@ static inline uint64_t disp_rdtsc(void)
 
 static uint64_t calibrate_tsc(void)
 {
-    /* Align to tick boundary */
-    uint64_t t0 = idt_get_ticks();
-    while (idt_get_ticks() == t0) __asm__ volatile ("hlt");
-
-    uint64_t tick_start = idt_get_ticks();
-    uint64_t tsc_start  = disp_rdtsc();
-
-    /* Wait for N_CAL more ticks */
-    while (idt_get_ticks() - tick_start < TSC_CAL_TICKS)
-        __asm__ volatile ("hlt");
-
-    uint64_t tsc_end  = disp_rdtsc();
-    uint64_t elapsed_tsc = tsc_end - tsc_start;
-
-    /* APIC fires at ~100Hz; TSC cycles per second = elapsed_tsc * (100 / N_CAL) */
-    return elapsed_tsc * 100 / TSC_CAL_TICKS;
+    /* TSC was already calibrated at boot against the PIT in idt_init
+     * (idt.c:2240-2257). Reuse that value rather than spinning on
+     * APIC ticks here — the APIC LVT may be masked by compat32 for
+     * the lifetime of a Win32 PE process (compat32.c:1163), in which
+     * case `hlt` would never wake up and this function would hang. */
+    extern uint64_t idt_get_tsc_freq(void);
+    return idt_get_tsc_freq();
 }
 
 /* ── VBlank synchronization ──────────────────────────────────── */
@@ -361,7 +352,15 @@ static void virtio_blit(const uint32_t *src)
 
 void display_flip(void)
 {
-    if (!disp.initialized || !disp.dirty) return;
+    /* The dirty-flag early-return optimisation skipped 59 of 60 flips
+     * on a static desktop, which means the host display backend
+     * (Cocoa, HVF) only saw a single refresh after the compositor
+     * started — every subsequent frame produced the same gop_fb
+     * memcpy that the host had already seen, but with dirty=true only
+     * being set when the compositor explicitly invalidates, most
+     * frames were skipped. Cheap memcpy ≪ losing user-visible refresh
+     * cadence in QEMU/HVF. */
+    if (!disp.initialized) return;
 
     /* Wait for VBlank */
     display_wait_vblank();
@@ -374,11 +373,16 @@ void display_flip(void)
         disp.draw_idx ^= 1;
         disp.back = disp.buffers[disp.draw_idx];
     } else {
-        /* Fallback: NT-store back buffer → GOP framebuffer (QEMU / no GPU).
-         * movntdq bypasses L1/L2/L3 cache pollution (~3MB freed for compute).
-         * sfence is inside memcpy_nt. display_force_refresh() uses regular
-         * memcpy as fallback for QEMU/HVF dirty-page tracking. */
-        memcpy_nt(disp.gop_fb, disp.back, disp.fb_size);
+        /* Back buffer → GOP framebuffer (QEMU / no GPU scanout).
+         *
+         * Use regular memcpy, NOT memcpy_nt: non-temporal stores
+         * bypass cache and *also* bypass QEMU/HVF dirty-page tracking
+         * — the host display backend only refreshes pages it observes
+         * being written via normal cacheable stores. The mfence then
+         * drains the write buffers before the host's next dirty-page
+         * scan, so the new pixels actually become visible. */
+        memcpy(disp.gop_fb, disp.back, disp.fb_size);
+        __asm__ volatile ("mfence" ::: "memory");
     }
 
     /* Virtio-GPU: also blit to virtio framebuffer and flush to host */

@@ -1938,6 +1938,52 @@ DWORD WINAPI GetCurrentThreadId(void)
     return 1; /* main thread */
 }
 
+/* Snapshot of an orphaned win32 thread's identifying info, returned
+ * to winexec_run for logging + reaping when the PE has exited but
+ * the thread context table still references kernel processes that
+ * would otherwise re-enter compat32 and re-mask the APIC LVT. */
+typedef struct {
+    int      kernel_pid;   /* sched_spawn'd kernel process to kill */
+    uint32_t tid;          /* Win32 thread ID (for the log line) */
+    uint32_t func_addr;    /* PE entry point this thread was running */
+} win32_orphan_info_t;
+
+/* Collect (and immediately mark inactive) all non-terminated win32
+ * threads. Caller is responsible for reaping the kernel PIDs via
+ * proc_kill_pid. Marking them inactive frees the slot for the next
+ * PE invocation. */
+int win32_collect_orphan_threads(win32_orphan_info_t *out, int max)
+{
+    int n = 0;
+    for (int i = 0; i < MAX_WIN32_THREADS && n < max; i++) {
+        win32_thread_ctx_t *t = &g_win32_threads[i];
+        if (t->active && !t->terminated) {
+            out[n].kernel_pid = t->kernel_pid;
+            out[n].tid        = t->tid;
+            out[n].func_addr  = t->func_addr;
+            t->terminated = 1;
+            t->active     = 0;
+            n++;
+        }
+    }
+    return n;
+}
+
+/* Back-compat thin shim. Prefer win32_collect_orphan_threads which
+ * also returns the TID + entry point for an informative reap log. */
+int win32_get_thread_pids(int *out, int max)
+{
+    int n = 0;
+    for (int i = 0; i < MAX_WIN32_THREADS && n < max; i++) {
+        if (g_win32_threads[i].active && !g_win32_threads[i].terminated) {
+            out[n++] = g_win32_threads[i].kernel_pid;
+            g_win32_threads[i].terminated = 1;
+            g_win32_threads[i].active = 0;
+        }
+    }
+    return n;
+}
+
 HANDLE WINAPI GetCurrentThread(void) { return NT_CURRENT_THREAD; }
 
 DWORD WINAPI SuspendThread(HANDLE hThread)

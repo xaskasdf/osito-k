@@ -831,11 +831,81 @@ int winexec_run(const uint8_t *file_data, uint64_t file_size)
             extern uint64_t exec_jmpbuf[];
             extern int32_t  last_exit_code;
             if (kern_setjmp(exec_jmpbuf) != 0) {
-                /* proc_exit returned here — PE process has exited */
+                /* proc_exit returned here — PE process has exited.
+                 *
+                 * Two cleanup steps before we let the scheduler see
+                 * this kernel context again:
+                 *
+                 * (1) Restore 64-bit kernel data segments. compat32_enter
+                 *     set DS/ES/SS to GDT_SEL_DATA32 (0x48) for the PE
+                 *     lifetime. proc_exit longjmped back, restoring
+                 *     RIP/RSP but NOT segment selectors. If we don't
+                 *     fix them, the next scheduler tick observes PID 1
+                 *     with SS=0x48 and bails with "[SCHED] CORRUPT PID 1",
+                 *     leaving the shell unschedulable.
+                 *
+                 * (2) Re-enable the APIC LVT timer. compat32_enter
+                 *     masked it for the entire PE lifetime; without
+                 *     re-enabling, the preemptive scheduler can't tick
+                 *     and `desktop` (which sched_spawns a compositor
+                 *     thread) never runs because PID 1 never yields. */
+                __asm__ volatile (
+                    "mov $0x30, %%ax\n"
+                    "mov %%ax, %%ds\n"
+                    "mov %%ax, %%es\n"
+                    "mov %%ax, %%ss\n"
+                    ::: "ax"
+                );
+
+                /* Reap any orphan win32 threads spawned by the PE via
+                 * CreateThread. Why this is necessary: if we leave
+                 * them schedulable, the scheduler will dispatch them
+                 * and they'll re-enter compat32_callback_args, which
+                 * re-masks the APIC LVT timer (the entire-PE-lifetime
+                 * mask from compat32_enter). The callback path
+                 * deliberately doesn't unmask on the way out
+                 * (compat32.c:1294), so any subsequent kernel
+                 * `hlt`-wait — including compositor's
+                 * display_wait_vblank — would deadlock forever.
+                 *
+                 * proc_kill_pid runs the full proc_free cleanup so
+                 * the slot is reusable for the next PE invocation,
+                 * not left as a permanent ZOMBIE. */
+                {
+                    typedef struct {
+                        int      kernel_pid;
+                        uint32_t tid;
+                        uint32_t func_addr;
+                    } win32_orphan_info_t;
+                    extern int proc_kill_pid(int pid);
+                    extern int win32_collect_orphan_threads(
+                        win32_orphan_info_t *out, int max);
+
+                    win32_orphan_info_t orphans[16];
+                    int n = win32_collect_orphan_threads(orphans, 16);
+                    for (int i = 0; i < n; i++) {
+                        int rc = proc_kill_pid(orphans[i].kernel_pid);
+                        serial_puts(rc == 0
+                            ? "[winexec] reaped orphan PE thread tid="
+                            : "[winexec] FAILED to reap orphan PE thread tid=");
+                        serial_putdec((uint64_t)orphans[i].tid);
+                        serial_puts(" pid=");
+                        serial_putdec((uint64_t)orphans[i].kernel_pid);
+                        serial_puts(" entry=0x");
+                        serial_puthex(orphans[i].func_addr, 8);
+                        serial_puts("\n");
+                    }
+                }
+
+                {
+                    extern volatile uint32_t *idt_get_apic_base(void);
+                    volatile uint32_t *apic = idt_get_apic_base();
+                    if (apic) apic[0x320/4] &= ~0x10000u;  /* LVT_TIMER &= ~MASKED */
+                }
                 __asm__ volatile ("sti");
                 serial_puts("[WINEXEC] PE process exited, code=");
                 serial_putdec((uint32_t)last_exit_code);
-                serial_puts("\n");
+                serial_puts(" (SS restored, APIC re-enabled)\n");
                 return last_exit_code;
             }
         }

@@ -6696,6 +6696,13 @@ q4kgdone:
 
             sched_spawn("compositor", compositor_thread);
             sh_puts("Desktop launched. Compositor running.\n");
+            /* Yield immediately so the compositor's first frame renders
+             * before we return to the shell's input poll. Without this
+             * the compositor remains READY but never gets dispatched
+             * (shell quantum doesn't expire fast enough for the user
+             * to perceive that the desktop has come up). */
+            extern void sched_yield(void);
+            sched_yield();
         }
     } else if (strcmp(cmd, "fatls") == 0) {
         extern int fat32_ls(const char *path);
