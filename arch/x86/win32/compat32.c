@@ -2205,6 +2205,47 @@ uint64_t compat32_dispatch(uint32_t thunk_idx, uint32_t *stack_args)
      * Forcing the function's early-exit (NOP'ing `jne +5` in prologue)
      * was tried — caused regression: skipped useful work and broke a
      * later Level/Actors invariant check.  Targeted writes only. */
+    /* FName::Names @0x10295D30 — pre-allocate same way as GObjRegistrants.
+     * UClass static ctors call FName::FName("Engine") etc. which needs
+     * to either look up or add to FName::Names.  If TArray is empty
+     * (Num=0 Max=0), the first Add() triggers a bogus FArray::Realloc
+     * (with bogus Max field from default ctor).  Pre-fill with a
+     * stable 16KB buffer to allow ~2K name entries (8 bytes each).
+     *
+     * If FName::Names contains valid entries, UClass::Name fields
+     * resolve correctly → class hierarchy lookups work → UGameEngine
+     * is constructable → Browse() works → Level loads. */
+    {
+        volatile uint32_t *fname_tarray = (volatile uint32_t *)(uintptr_t)0x10295D30;
+        static uint64_t fname_buf_phys = 0;
+        uint32_t fd = fname_tarray[0], fn = fname_tarray[1], fm = fname_tarray[2];
+        if (fd == 0 && fm == 0) {
+            if (fname_buf_phys == 0) {
+                extern void *mem_alloc_pages(uint64_t count);
+                void *buf = mem_alloc_pages(4);  /* 16 KB = room for 4096 8-byte entries */
+                if (buf) {
+                    uint64_t pa = (uint64_t)buf;
+                    uint8_t *p = (uint8_t *)pa;
+                    for (int i = 0; i < 16384; i++) p[i] = 0;
+                    fname_buf_phys = pa;
+                }
+            }
+            if (fname_buf_phys) {
+                fname_tarray[0] = (uint32_t)fname_buf_phys;
+                fname_tarray[2] = 2048;  /* Max = 2K entries */
+                /* Don't touch Num — preserve whatever the engine wrote */
+                static int fname_setup_logged = 0;
+                if (!fname_setup_logged) {
+                    fname_setup_logged = 1;
+                    serial_puts("[FNAME-RESCUE] pre-alloc FName::Names Data=0x");
+                    serial_puthex(fname_buf_phys, 8);
+                    serial_puts(" Max=2048\n");
+                }
+            }
+        }
+        (void)fn;
+    }
+
     /* GObjRegistrants snapshot + restore.
      *
      * Observed: 200 UClass registrants get added (Num→200), then
