@@ -100,7 +100,12 @@ typedef struct __attribute__((packed)) {
 #define TCP_LISTEN      8
 #define TCP_SYN_RCVD    9
 
-#define TCP_RX_BUF_SIZE 8192
+/* 64 KiB minus 1 — the advertised TCP window field is 16 bits and
+ * we don't implement window scaling, so 65535 is the max we can
+ * announce. The old 8 KiB throttled bulk responses (the bge-large
+ * embedding endpoint returns ~19 KiB and CF retransmits when our
+ * window saturates faster than tls_recv can drain). */
+#define TCP_RX_BUF_SIZE 65535
 #define TCP_TX_BUF_SIZE 4096
 #define TCP_MAX_CONNS   32
 #define TCP_MSS         1460
