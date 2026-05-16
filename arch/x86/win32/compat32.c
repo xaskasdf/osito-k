@@ -2169,6 +2169,55 @@ uint64_t compat32_dispatch(uint32_t thunk_idx, uint32_t *stack_args)
      * Forcing the function's early-exit (NOP'ing `jne +5` in prologue)
      * was tried — caused regression: skipped useful work and broke a
      * later Level/Actors invariant check.  Targeted writes only. */
+    /* GObjRegistrants RESCUE: TArray @0x102A0360 keeps getting zeroed
+     * even though dllloader.c::EARLY and winexec.c both pre-allocate.
+     * Some engine init function (likely appInit / UObject::StaticInit)
+     * resets the TArray to {Data=0, Num=0, Max=0} after our pre-alloc.
+     * Without GObjRegistrants populated, UClass registration never
+     * completes → UGameEngine has no class hierarchy → Browse() is
+     * called on stack `this` → corrupt URL → LoadMap fails → Actors(0)
+     * assertion in UnLevel.h:246.
+     *
+     * Hook: on every INT 0x2E, if the TArray is in zero-state, pre-fill
+     * it with a fresh 1024-slot buffer.  This catches the engine's
+     * reset and immediately restores valid pointers BEFORE any code
+     * that calls FArray::Realloc on it.
+     *
+     * Caveat: this also fires on the LEGIT initial zero state (before
+     * static ctors), so we may overwrite a brief valid TArray.  The
+     * net effect should still be a valid pre-alloced buffer when the
+     * registrant Add() calls run. */
+    {
+        volatile uint32_t *tarray = (volatile uint32_t *)(uintptr_t)0x102A0360;
+        if (tarray[0] == 0 && tarray[1] == 0 && tarray[2] == 0) {
+            static uint64_t rescue_phys = 0;
+            static int rescue_count = 0;
+            if (rescue_phys == 0) {
+                extern void *mem_alloc_pages(uint64_t count);
+                void *buf = mem_alloc_pages(1);
+                if (buf) {
+                    uint64_t pa = (uint64_t)buf;
+                    uint8_t *p = (uint8_t *)pa;
+                    for (int i = 0; i < 4096; i++) p[i] = 0;
+                    rescue_phys = pa;
+                }
+            }
+            if (rescue_phys) {
+                tarray[0] = (uint32_t)rescue_phys;
+                tarray[1] = 0;
+                tarray[2] = 1024;
+                rescue_count++;
+                if (rescue_count <= 5 || rescue_count == 100 || rescue_count == 1000) {
+                    serial_puts("[GOBJREG-RESCUE] #");
+                    serial_putdec((uint64_t)rescue_count);
+                    serial_puts(" restored Data=0x");
+                    serial_puthex(rescue_phys, 8);
+                    serial_puts("\n");
+                }
+            }
+        }
+    }
+
     static int patched_ut_listdel = 0;
     if (!patched_ut_listdel) {
         struct { uint32_t va; uint8_t want[3]; uint8_t patch[3]; int len; }

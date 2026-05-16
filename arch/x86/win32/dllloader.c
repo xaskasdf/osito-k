@@ -436,6 +436,44 @@ PVOID dll_load(const char *dll_name, const BYTE *file_data, SIZE_T file_size)
         }
     }
 
+    /* Core.dll-specific: pre-allocate GObjRegistrants TArray BEFORE
+     * Core.dll's DllMain runs.  Core.dll's _initterm constructs every
+     * UClass's static class object, each of which calls
+     * GObjRegistrants.Add(this).  If the TArray is in its default zero
+     * state at that moment, the first Add() triggers FArray::Realloc
+     * with bogus Max → corrupted alloc → registrants get dropped or
+     * land in garbage memory.  Pre-allocating a 1024-slot buffer with
+     * sane {Data, Num=0, Max=1024} lets each Add() succeed without
+     * triggering realloc.
+     *
+     * The late pre-alloc in winexec.c (after all preloads) was too
+     * late — Core.dll's _initterm had already run with empty TArray.
+     */
+    if (mod->image.IsDLL && !find_shim(mod->name) &&
+        ((mod->name[0]=='C' && mod->name[1]=='o' && mod->name[2]=='r' && mod->name[3]=='e') ||
+         (mod->name[0]=='c' && mod->name[1]=='o' && mod->name[2]=='r' && mod->name[3]=='e'))) {
+        PVOID gobjreg_ptr = dll_resolve_export(mod,
+            "?GObjRegistrants@UObject@@0V?$TArray@PAVUObject@@@@A", 0, FALSE);
+        if (gobjreg_ptr) {
+            uint32_t *tarray = (uint32_t *)gobjreg_ptr;
+            extern void *mem_alloc_pages(uint64_t count);
+            void *buf = mem_alloc_pages(1);
+            if (buf) {
+                uint64_t pa = (uint64_t)buf;
+                uint8_t *p = (uint8_t *)pa;
+                for (int i = 0; i < 4096; i++) p[i] = 0;
+                tarray[0] = (uint32_t)pa;
+                tarray[1] = 0;
+                tarray[2] = 1024;
+                serial_puts("[DLL-EARLY] Pre-allocated GObjRegistrants BEFORE DllMain: Data=0x");
+                serial_puthex(pa, 8);
+                serial_puts(" Max=1024 @TArray=0x");
+                serial_puthex((uint64_t)(ULONG_PTR)gobjreg_ptr, 8);
+                serial_puts("\n");
+            }
+        }
+    }
+
     /* Call DllMain(DLL_PROCESS_ATTACH) if it has one.
      * Skip DllMain for DLLs that have a registered shim — the shim already
      * provides all CRT/API functions and the real DllMain may crash trying
@@ -610,14 +648,34 @@ static LOADED_MODULE *dll_try_load_from_fs(const char *dll_name)
     return NULL;
 }
 
-/* appUnwindf shim: suppresses the throw from appError. */
+/* appUnwindf shim: suppresses the throw from appError.  Logs the
+ * caller EIP + first 2 wide-string args so we can identify the
+ * specific check() that failed (file + expression). */
 static uint64_t WINAPI shim_appUnwindf(uint64_t fmt)
 {
     (void)fmt;
     extern void serial_puts(const char *);
+    extern void serial_puthex(uint64_t val, int digits);
+    extern uint32_t compat32_get_last_caller_eip(void);
+    extern uint32_t compat32_get_last_stack_args(void);
     static int count = 0;
-    if (++count <= 5)
-        serial_puts("[APP] appUnwindf suppressed\n");
+    if (++count <= 20) {
+        uint32_t eip  = compat32_get_last_caller_eip();
+        uint32_t sa   = compat32_get_last_stack_args();
+        serial_puts("[APP] appUnwindf suppressed caller=0x");
+        serial_puthex(eip, 8);
+        if (sa >= 0x100000) {
+            const uint32_t *args = (const uint32_t *)(uintptr_t)sa;
+            for (int i = 0; i < 4; i++) {
+                uint32_t v = args[i];
+                serial_puts(" arg");
+                serial_puthex((uint64_t)i, 1);
+                serial_puts("=0x");
+                serial_puthex(v, 8);
+            }
+        }
+        serial_puts("\n");
+    }
     return 0;
 }
 
