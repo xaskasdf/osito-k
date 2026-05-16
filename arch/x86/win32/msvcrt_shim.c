@@ -2313,9 +2313,20 @@ void WINAPI crt_CxxThrowException(PVOID pExceptionObject, PVOID pThrowInfo)
     if (!pExceptionObject && !pThrowInfo) {
         serial_puts("[CXX] rethrow → re-dispatching current exception\n");
         if (cxx_exception_active) {
-            /* Dispatch the saved exception to the next handler */
-            compat32_seh_dispatch(&cxx_current_exception);
-            /* If dispatch handled it, the INT2E unwind will redirect execution */
+            /* Dispatch the saved exception to the next handler.
+             * Return 1 = handled (compat32 longjmped, this RET path
+             * is the post-handler unwind).  Return 0 = UNHANDLED, in
+             * which case _CxxThrowException MUST NOT RETURN — the
+             * engine compiler emitted padding bytes after the throw
+             * call assuming it never comes back.  Returning normally
+             * lands the engine in 0xCC INT3 padding.  Force exit. */
+            int handled = compat32_seh_dispatch(&cxx_current_exception);
+            if (!handled) {
+                extern void proc_exit(int32_t code);
+                serial_puts("[CXX] rethrow UNHANDLED — proc_exit\n");
+                proc_exit(0xE06D7363);
+                /* unreachable */
+            }
             return;
         }
         /* No active exception — just suppress */
