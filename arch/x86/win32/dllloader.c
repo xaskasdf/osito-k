@@ -688,28 +688,30 @@ static uint64_t WINAPI shim_appFailAssert(uint64_t expr, uint64_t file, uint64_t
     extern void serial_putdec(uint64_t val);
     extern void serial_putchar(char c);
     extern uint32_t compat32_get_last_caller_eip(void);
-    static int count = 0;
-    if (++count <= 30) {
-        uint32_t eip = compat32_get_last_caller_eip();
-        serial_puts("[ASSERT] caller=0x");
-        serial_puthex(eip, 8);
-        serial_puts(" line=");
-        serial_putdec((uint64_t)(uint32_t)line);
-        if (expr >= 0x100000) {
-            const char *e = (const char *)(uintptr_t)expr;
-            serial_puts(" expr=\"");
-            for (int k = 0; k < 64 && e[k]; k++) serial_putchar(e[k]);
-            serial_puts("\"");
-        }
-        if (file >= 0x100000) {
-            const char *f = (const char *)(uintptr_t)file;
-            serial_puts(" file=\"");
-            for (int k = 0; k < 64 && f[k]; k++) serial_putchar(f[k]);
-            serial_puts("\"");
-        }
-        serial_puts("\n");
+    extern void proc_exit(int32_t code);
+    uint32_t eip = compat32_get_last_caller_eip();
+    serial_puts("[ASSERT-FATAL] caller=0x");
+    serial_puthex(eip, 8);
+    serial_puts(" line=");
+    serial_putdec((uint64_t)(uint32_t)line);
+    if (expr >= 0x100000) {
+        const char *e = (const char *)(uintptr_t)expr;
+        serial_puts(" expr=\"");
+        for (int k = 0; k < 80 && e[k]; k++) serial_putchar(e[k]);
+        serial_puts("\"");
     }
-    return 0;
+    if (file >= 0x100000) {
+        const char *f = (const char *)(uintptr_t)file;
+        serial_puts(" file=\"");
+        for (int k = 0; k < 80 && f[k]; k++) serial_putchar(f[k]);
+        serial_puts("\"");
+    }
+    serial_puts(" -> proc_exit\n");
+    /* Skip the entire engine error/shutdown cascade — it walks corrupt
+     * UClass state and ends up #BR'ing in BSS data.  Clean exit is
+     * better than chaotic crash. */
+    proc_exit(0xC0000420 | (uint32_t)line);
+    return 0;  /* unreachable */
 }
 
 /* appRequestExit shim: suppresses exit requests from error handlers.
