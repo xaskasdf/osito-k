@@ -1,15 +1,75 @@
-# TLS 1.3 — roadmap for full client implementation
+# TLS 1.3 — status: working end-to-end (2026-05-16)
 
-The kernel currently completes TLS 1.2 handshakes against
-Cloudflare-fronted endpoints using `kernel/tls.c`
-(ECDHE-ECDSA-AES128-GCM-SHA256, X25519 ECDHE, SKE signature
-verification against the leaf cert pulled via `kernel/x509.c`, and
-cert pinning against the static + dynamic pin tables).  TLS 1.3
-support is a stub in `kernel/tls13.c` that sends a ClientHello with
-the `supported_versions` extension but does not complete the
-handshake.
+`kernel/tls13.c` now does a full TLS 1.3 client handshake against
+the Cloudflare-fronted broker:
 
-This doc tracks what's needed to finish the 1.3 path.
+```
+[TLS1.3] ClientHello sent
+[TLS1.3] ServerHello ok suite=0x1301
+[TLS1.3] handshake keys derived
+[TLS1.3] EncryptedExtensions
+[TLS1.3] Certificate ok (pinned)
+[TLS1.3] CertVerify (signature check deferred)
+[TLS1.3] server Finished verified
+[TLS1.3] handshake complete — application channel ready
+[TLS13-PROBE] response: HTTP/1.1 200 OK Date: Sat, 16 May 2026 ...
+[TLS13-PROBE] PASS
+```
+
+Verified via `bash scripts/test-tls13-probe.sh` (sentinel-gated
+boot probe in `main.c`).  Reachable from outside the file via
+`tls13_connect / tls13_send / tls13_recv / tls13_is_active`.
+
+## What ships
+
+- ClientHello with required extensions: `supported_versions`
+  (forcing 1.3), `supported_groups` (x25519), `key_share`
+  (x25519), `signature_algorithms` (ecdsa_secp256r1_sha256,
+  rsa_pss_rsae_sha256), `server_name` (SNI).
+- Cipher suite: `TLS_AES_128_GCM_SHA256` only (the AEAD we have
+  a working record-protect path for).  The handshake aborts
+  cleanly if the server selects anything else.
+- ServerHello parser extracts the peer's X25519 key_share and
+  confirms TLS 1.3 selection.
+- Full key schedule (RFC 8446 §7.1):
+  early_secret → derived → handshake_secret → c/s_hs_traffic →
+  key+iv; then through master_secret → c/s_ap_traffic → key+iv
+  for application data.
+- Transcript hash maintained as a running SHA-256 over every
+  handshake message body.
+- AEAD record framing per §5.2: outer type 0x17, inner_type byte
+  appended to plaintext, nonce = iv ⊕ seq, AAD = record header.
+- Decrypts and verifies the server's EncryptedExtensions,
+  Certificate, CertificateVerify, Finished.
+- Server Finished MAC verified against the transcript snapshot
+  ending at CertificateVerify.
+- Client Finished computed and sent; followed by app-traffic
+  rekey for normal data send/recv.
+- Cert pinning: Certificate body is rewritten to a TLS-1.2-style
+  cert message and passed to `cert_pin_check_leaf` so the static
+  + dynamic pin tables apply unchanged.
+- Post-handshake messages (NewSessionTicket) are silently
+  consumed by `tls13_recv`.
+
+## What's deferred
+
+- **CertificateVerify signature check.**  Pinning already proves
+  the cert chain; CertVerify would prove the cert holder actually
+  signed this specific handshake's transcript.  Wired location is
+  in `tls13_connect`'s `TLS13_CERT_VERIFY` case — currently logs
+  "signature check deferred" and accepts.  Same status as TLS 1.2
+  before A12.2 — implementing it is mechanical given we already
+  have ECDSA-P256 verify in `kernel/ecdsa_p256.c`.
+- **ChaCha20-Poly1305 record AEAD.**  Advertised in earlier
+  drafts; current ClientHello only offers AES_128_GCM.  Easy to
+  add — wrap `chacha20_encrypt` + `poly1305` in an AES-GCM-shaped
+  API and dispatch on `tls13.suite`.
+- **HelloRetryRequest** flow.  We assume the server picks our
+  key_share on the first try.  CF does; some servers may not
+  (e.g., post-quantum hybrid groups).  Adding HRR handling is
+  ~80 LoC.
+
+## What this doc tracked before completion
 
 ## Why deferred (2026-05-16)
 

@@ -283,6 +283,13 @@ int cert_pin_check_leaf(const uint8_t *cert_msg, uint32_t cert_msg_len)
     const cert_pin_t *match_entry = 0;
     uint8_t  leaf_digest[32];
     bool     have_leaf = false;
+    /* Capture cert pointers as we walk so we can run RFC 5280 chain
+     * signature verification (A12.5) after the pin check.  Up to 4
+     * cap; CF chains we see today are 2-3 entries.  Pointers into
+     * cert_msg are stable for the duration of this call. */
+    const uint8_t *chain_ptr[4];
+    uint32_t       chain_len_arr[4];
+    int            chain_count = 0;
     while (off + 3 <= end) {
         uint32_t cert_len = ((uint32_t)cert_msg[off]     << 16)
                           | ((uint32_t)cert_msg[off + 1] <<  8)
@@ -321,8 +328,36 @@ int cert_pin_check_leaf(const uint8_t *cert_msg, uint32_t cert_msg_len)
             any_match = 1;
             dyn_match = 1;
         }
+        if (chain_count < 4) {
+            chain_ptr[chain_count]     = cert_msg + off;
+            chain_len_arr[chain_count] = cert_len;
+            chain_count++;
+        }
         off += cert_len;
         cert_idx++;
+    }
+
+    /* A12.5: cryptographic chain link verification.  For each pair
+     * (cert[i], cert[i+1]), check that cert[i]'s signature was made
+     * by cert[i+1]'s public key.  Pinning above already gives us
+     * trust in the leaf/intermediate; this check adds defense-in-
+     * depth — if a static pin matched a stale intermediate but the
+     * leaf was rotated through a different chain, the link verify
+     * would catch it.  Logs result; does NOT abort the handshake on
+     * failure (yet — this is informative-mode rollout). */
+    if (chain_count >= 2) {
+        extern int x509_verify_chain_link(const uint8_t *child,  uint32_t cl,
+                                          const uint8_t *issuer, uint32_t il);
+        for (int i = 0; i + 1 < chain_count; i++) {
+            int r = x509_verify_chain_link(chain_ptr[i],     chain_len_arr[i],
+                                           chain_ptr[i + 1], chain_len_arr[i + 1]);
+            serial_puts("[PIN] chain link ");
+            serial_putdec((uint64_t)i);
+            serial_puts(" → ");
+            serial_putdec((uint64_t)(i + 1));
+            serial_puts(": ");
+            serial_puts(r == 0 ? "OK\n" : "FAIL\n");
+        }
     }
 
     if (any_match) {

@@ -113,7 +113,8 @@ KERN_SRC = kernel/main.c kernel/serial.c kernel/framebuffer.c \
            kernel/tensor_arena.c kernel/sys_inference.c \
            kernel/pred_sched.c kernel/io_predict.c \
            kernel/hwbp.c kernel/self_optimize.c kernel/nic.c \
-           kernel/apipa.c kernel/rag.c kernel/cert_pin.c
+           kernel/apipa.c kernel/rag.c kernel/cert_pin.c \
+           kernel/rsa.c kernel/x509.c kernel/ecdsa_p256.c
 ASM_SRC  = kernel/isr_stubs.S kernel/syscall_entry.S kernel/setjmp.S kernel/kexec_tramp.S
 DRV_SRC  = drivers/nvme.c drivers/i211.c drivers/rtl8111.c drivers/gpu.c drivers/gsp.c \
            drivers/sass.c drivers/gmmu.c drivers/gpu_tensor.c drivers/gpu_inference.c \

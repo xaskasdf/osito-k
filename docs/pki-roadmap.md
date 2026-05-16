@@ -1,5 +1,11 @@
 # A12.3 — Full PKI chain validation roadmap
 
+> **2026-05-16 status update:** A12.5 landed.  Chain link
+> signature verification works end-to-end for RSA-SHA256 and
+> ECDSA-P256-SHA256 against the live CF chain.  The pieces below
+> still remain (validity dates, name matching, root anchoring,
+> SHA-384 OID coverage) — see "Remaining work" at the bottom.
+
 The kernel's TLS trust model currently rests on three layers:
 
 1. **Static leaf+intermediate pin** in `kernel/cert_pin.c::pin_table[]`.
@@ -33,6 +39,21 @@ What's missing to claim a full RFC 5280 chain validator:
   PKI-pin-only concern is now mostly addressed.
 - **No 3rd-party endpoint pending.**  No item on the roadmap pulls
   in a new TLS endpoint outside our pin coverage.
+
+## Remaining work after A12.5
+
+| Piece                                                       | LoC |
+|-------------------------------------------------------------|-----|
+| sha384 (HMAC-SHA-384 already absent; reuses sha512 IV swap) | 30  |
+| Add SHA-384 sig algorithm OIDs (RSA + ECDSA variants)       | 30  |
+| Full X.509 ASN.1 parser (Validity dates, SAN, KeyUsage)     | 250 |
+| Hostname → SAN matching                                     | 150 |
+| RTC clock readback for NotBefore/NotAfter                   | 50  |
+| Root anchoring (CA bundle on disk + lookup)                 | 200 |
+
+Most acute next step is **SHA-384 + sha384WithRSA + ecdsa-with-SHA-384**
+so the GTS Root R4 link verifies (~60 LoC).  The rest only matter
+if we add a non-pinned third-party endpoint.
 
 ## When to revisit
 

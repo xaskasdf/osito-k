@@ -786,6 +786,16 @@ void __initk kernel_entry(boot_info_t *info)
                 serial_puts("[KERN] HKDF TLS 1.3 self-test: PASS\n");
             else
                 serial_puts("[KERN] HKDF TLS 1.3 self-test: FAIL\n");
+
+            /* RSA-2048 PKCS#1 v1.5 SHA-256 verify self-test. Positive +
+             * negative vector. Without this an arithmetic regression in
+             * bn_mod_mul/bn_mod_pow_small_e could silently accept forged
+             * signatures during chain-link verification. */
+            extern int rsa_self_test(void);
+            if (rsa_self_test() == 0)
+                serial_puts("[KERN] RSA-2048 verify self-test: PASS\n");
+            else
+                serial_puts("[KERN] RSA-2048 verify self-test: FAIL\n");
         } else {
             serial_puts("[KERN] I211 init failed\n");
             fb_puts(" NIC: init failed\n");
