@@ -1807,7 +1807,11 @@ int net_dns_resolve(const char *hostname, uint8_t ip_out[4])
     dns_got_reply = 0;
     net_udp_listen(10053, dns_handler);
 
-    /* Send query — retry if ARP not yet resolved */
+    /* Send query — retry if ARP not yet resolved.  We use `sti; hlt`
+     * (NOT bare `hlt`) so the wait works regardless of what state the
+     * caller left interrupts in — `net_tcp_close` is one example of
+     * a path that ends with cli (via its `sti; hlt; cli` busy-wait)
+     * and would otherwise deadlock the next DNS resolve. */
     serial_puts("[DNS] Resolving ");
     serial_puts(hostname);
     serial_puts("...\n");
@@ -1815,16 +1819,15 @@ int net_dns_resolve(const char *hostname, uint8_t ip_out[4])
     for (int attempt = 0; attempt < 5; attempt++) {
         if (net_udp_send(dns_server, 53, 10053, query, qlen) == 0)
             break;
-        /* ARP not resolved yet — poll and retry */
         net_poll();
-        __asm__ volatile ("hlt");
+        __asm__ volatile ("sti; hlt" ::: "memory");
     }
 
     /* Poll for response (3s timeout = 300 ticks) */
     uint64_t start = idt_get_ticks();
     while (!dns_got_reply && (idt_get_ticks() - start) < 300) {
         net_poll();
-        __asm__ volatile ("hlt");
+        __asm__ volatile ("sti; hlt" ::: "memory");
     }
 
     if (dns_got_reply) {
@@ -2111,6 +2114,17 @@ int net_async_pending(void)
 
 void net_udp_listen(uint16_t port, udp_handler_t handler)
 {
+    /* Idempotent: re-registering the same (port, handler) — common
+     * for net_dns_resolve which is called once per HTTP session — is
+     * a no-op. Without this, MAX_UDP_LISTENERS fills after a handful
+     * of resolves and subsequent calls silently drop without
+     * registering. */
+    for (int i = 0; i < udp_listener_count; i++) {
+        if (udp_listeners[i].port == port &&
+            udp_listeners[i].handler == handler) {
+            return;
+        }
+    }
     if (udp_listener_count >= MAX_UDP_LISTENERS) {
         serial_puts("[NET] Too many UDP listeners\n");
         return;
