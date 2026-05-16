@@ -679,6 +679,39 @@ static uint64_t WINAPI shim_appUnwindf(uint64_t fmt)
     return 0;
 }
 
+/* appFailAssert shim: log expression+file+line, then suppress.  Caller
+ * EIP identifies the engine function whose check() failed. */
+static uint64_t WINAPI shim_appFailAssert(uint64_t expr, uint64_t file, uint64_t line)
+{
+    extern void serial_puts(const char *);
+    extern void serial_puthex(uint64_t val, int digits);
+    extern void serial_putdec(uint64_t val);
+    extern void serial_putchar(char c);
+    extern uint32_t compat32_get_last_caller_eip(void);
+    static int count = 0;
+    if (++count <= 30) {
+        uint32_t eip = compat32_get_last_caller_eip();
+        serial_puts("[ASSERT] caller=0x");
+        serial_puthex(eip, 8);
+        serial_puts(" line=");
+        serial_putdec((uint64_t)(uint32_t)line);
+        if (expr >= 0x100000) {
+            const char *e = (const char *)(uintptr_t)expr;
+            serial_puts(" expr=\"");
+            for (int k = 0; k < 64 && e[k]; k++) serial_putchar(e[k]);
+            serial_puts("\"");
+        }
+        if (file >= 0x100000) {
+            const char *f = (const char *)(uintptr_t)file;
+            serial_puts(" file=\"");
+            for (int k = 0; k < 64 && f[k]; k++) serial_putchar(f[k]);
+            serial_puts("\"");
+        }
+        serial_puts("\n");
+    }
+    return 0;
+}
+
 /* appRequestExit shim: suppresses exit requests from error handlers.
  * After Browse() fails and throw is suppressed, the engine calls
  * appRequestExit(1) which sets GIsRequestingExit=1. The game loop
@@ -722,6 +755,21 @@ PVOID dll_resolve_import(const char *dll_name, const char *func_name,
             serial_puts("\n");
         }
         return (PVOID)(uintptr_t)thunk_addr;
+    }
+    /* appFailAssert: log + suppress (so engine continues past check() */
+    if (func_name && dl_strcmp(func_name, "?appFailAssert@@YAXPBD0H@Z") == 0) {
+        static uint32_t thunk_addr_assert = 0;
+        if (!thunk_addr_assert) {
+            extern uint32_t compat32_make_thunk_ex(uint64_t target,
+                const char *name, uint8_t num_args, uint8_t callconv);
+            thunk_addr_assert = compat32_make_thunk_ex(
+                (uint64_t)(uintptr_t)shim_appFailAssert,
+                "appFailAssert_shim", 3, 1 /* CC_CDECL */);
+            serial_puts("[DLL] appFailAssert thunk at 0x");
+            serial_puthex((uint64_t)thunk_addr_assert, 8);
+            serial_puts("\n");
+        }
+        return (PVOID)(uintptr_t)thunk_addr_assert;
     }
     /* appRequestExit: suppress exit after Browse() error */
     if (func_name && dl_strcmp(func_name, "?appRequestExit@@YAXH@Z") == 0) {

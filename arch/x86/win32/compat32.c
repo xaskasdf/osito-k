@@ -2157,6 +2157,39 @@ uint64_t compat32_dispatch(uint32_t thunk_idx, uint32_t *stack_args)
     }
 #endif
 
+    /* ENGINE-PATCH UnLevel.h:246-247 — skip Actors(0) assertions.
+     * The function at Engine.dll ~0x1038C320 does two consecutive
+     * checks on Level->Actors:
+     *   line 246:  if (Actors.Num()==0)  fail("Actors(0)")
+     *   line 247:  if (!Actors(0)->IsA(ALevelInfo)) fail("...IsA(...)")
+     * Both `jne +N` (75 NN) over the call to appFailAssert.  If we
+     * change `jne` to `jmp` (EB NN), the path that doesn't trigger
+     * the assert is ALWAYS taken.  Engine continues to read Actor[0]
+     * which may NULL-deref, but our existing recovery handles that
+     * cleanly via proc_exit. */
+    /* Try patch each INT 0x2E until the expected byte appears (Engine.dll
+     * page might not be loaded on first dispatch — defer until pages
+     * are populated).  Once patched, the flag prevents re-checks. */
+    static int actors_patched_mask = 0;  /* bit 0=site 0, bit 1=site 1 */
+    if (actors_patched_mask != 0x3) {
+        struct { uint32_t va; uint8_t want; uint8_t patch; } sites[] = {
+            { 0x1038C324, 0x75, 0xEB },  /* line 246 check */
+            { 0x1038C35A, 0x75, 0xEB },  /* line 247 check */
+        };
+        for (int i = 0; i < 2; i++) {
+            if (actors_patched_mask & (1 << i)) continue;
+            volatile uint8_t *p = (uint8_t *)(uintptr_t)sites[i].va;
+            if (p[0] == sites[i].want) {
+                p[0] = sites[i].patch;
+                actors_patched_mask |= (1 << i);
+                serial_puts("[ENGINE-PATCH] Actors-assert site ");
+                serial_putdec((uint64_t)i);
+                serial_puts(" @0x"); serial_puthex(sites[i].va, 8);
+                serial_puts(" jne→jmp OK\n");
+            }
+        }
+    }
+
     /* UT-EXE-PATCH: UT.exe @0x10902A40 doubly-linked-list pool manager
      * has 3 unguarded NULL-pointer writes (prev/next/container fields):
      *   0x10902AF2  89 01   mov [ecx], eax     ; *prev = next
