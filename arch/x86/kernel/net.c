@@ -990,7 +990,18 @@ static int tcp_send_segment(tcp_conn_t *conn, uint8_t flags,
     tcp->ack      = htonl(conn->rcv_nxt);
     tcp->data_off = (uint8_t)((tcp_hdr_len / 4) << 4);
     tcp->flags    = flags;
-    tcp->window   = htons(TCP_RX_BUF_SIZE);
+    /* Advertise the ACTUAL available window so the peer stops sending
+     * when our rx_buf fills.  Previously we hard-coded the buffer size,
+     * which lied to the peer: it kept sending at full clip past our
+     * real capacity, handle_tcp() dropped the overflow at line 1267
+     * (copy clamped to `space`), and the connection stalled at ~4–5 KiB
+     * of any large response (the bge-large /embed 19 KiB body was the
+     * canonical reproducer).  TCP_RX_BUF_SIZE is 65535 (max 16-bit
+     * window without RFC 7323 scaling), so the subtraction never
+     * underflows. */
+    uint32_t free_window = (TCP_RX_BUF_SIZE > conn->rx_len)
+                         ? (TCP_RX_BUF_SIZE - conn->rx_len) : 0;
+    tcp->window   = htons((uint16_t)free_window);
     tcp->checksum = 0;
     tcp->urgent   = 0;
 
@@ -1466,6 +1477,7 @@ int net_tcp_recv(int conn_idx, void *buf, uint32_t buf_size)
 
     /* If data available, return it */
     if (conn->rx_len > 0) {
+        uint32_t pre_len = conn->rx_len;
         uint32_t copy = conn->rx_len < buf_size ? conn->rx_len : buf_size;
         memcpy(buf, conn->rx_buf, copy);
         /* Shift remaining data down (forward copy, dst < src, so safe) */
@@ -1475,6 +1487,21 @@ int net_tcp_recv(int conn_idx, void *buf, uint32_t buf_size)
                 conn->rx_buf[i] = conn->rx_buf[copy + i];
         }
         conn->rx_len -= copy;
+
+        /* Window-update ACK: if the buffer was near-full before the
+         * drain and is now substantially free, send a pure-ACK so the
+         * peer notices our window reopened.  The advertised window in
+         * the ACK comes from tcp_send_segment, which now reads
+         * (TCP_RX_BUF_SIZE - rx_len) dynamically — so this ACK
+         * effectively carries the new credit.  Without this update the
+         * peer keeps treating our window as the value from the last
+         * ACK we sent (often near zero), and never resumes sending
+         * even though we just freed thousands of bytes. */
+        if (conn->state == TCP_ESTABLISHED &&
+            pre_len > (TCP_RX_BUF_SIZE / 2) &&
+            conn->rx_len <= (TCP_RX_BUF_SIZE / 2)) {
+            tcp_send_segment(conn, TCP_ACK, NULL, 0);
+        }
         return (int)copy;
     }
 
