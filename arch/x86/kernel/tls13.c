@@ -670,6 +670,69 @@ int tls13_connect(int tcp_conn, const char *hostname)
                                 serial_puts(m == 0 ? "OK\n" : "MISMATCH\n");
                             }
 
+                            /* A12.10: chain constraints (BasicConstraints,
+                             * KeyUsage, pathLenConstraint).  Asserts that
+                             * every intermediate has CA=TRUE and (when
+                             * present) keyCertSign — the right to sign
+                             * other certs.  Without this, an attacker's
+                             * valid LEAF cert could be presented as an
+                             * intermediate and chain validation would
+                             * still pass. */
+                            extern int x509_check_chain_constraints(
+                                const uint8_t **chain,
+                                const uint32_t *chain_lens,
+                                uint32_t count);
+                            int cc = x509_check_chain_constraints(
+                                certs, cert_lens, (uint32_t)nc);
+                            serial_puts("[TLS1.3] chain constraints: ");
+                            serial_puts(cc == 0 ? "OK\n" : "FAIL\n");
+
+                            /* A12.11: AIA URL extraction (informational —
+                             * shows the responder + issuer URLs the cert
+                             * advertises so AIA chasing and OCSP queries
+                             * have somewhere to go). */
+                            extern int x509_get_aia_caissuers(
+                                const uint8_t *cert, uint32_t len,
+                                char *out, uint32_t cap);
+                            extern int x509_get_aia_ocsp(
+                                const uint8_t *cert, uint32_t len,
+                                char *out, uint32_t cap);
+                            if (nc >= 1) {
+                                char url[256];
+                                int n = x509_get_aia_caissuers(
+                                    certs[0], cert_lens[0], url, sizeof url);
+                                serial_puts("[TLS1.3] AIA caIssuers: ");
+                                serial_puts(n > 0 ? url : "(none)");
+                                serial_puts("\n");
+                                n = x509_get_aia_ocsp(
+                                    certs[0], cert_lens[0], url, sizeof url);
+                                serial_puts("[TLS1.3] AIA OCSP:      ");
+                                serial_puts(n > 0 ? url : "(none)");
+                                serial_puts("\n");
+                            }
+
+                            /* A12.12: OCSP revocation check.  Query the
+                             * responder named in the leaf's AIA-OCSP
+                             * URL with the leaf + issuer; informative
+                             * mode (logged but not enforced).
+                             * Signature verify on the response is a
+                             * follow-up (documented in ocsp.h). */
+                            if (nc >= 2) {
+                                extern int ocsp_check(
+                                    const uint8_t *cert, uint32_t cert_len,
+                                    const uint8_t *issuer, uint32_t issuer_len);
+                                int ocsp = ocsp_check(
+                                    certs[0], cert_lens[0],
+                                    certs[1], cert_lens[1]);
+                                serial_puts("[TLS1.3] OCSP status: ");
+                                switch (ocsp) {
+                                case 0: serial_puts("GOOD\n");     break;
+                                case 1: serial_puts("REVOKED\n");  break;
+                                case 2: serial_puts("UNKNOWN\n");  break;
+                                default: serial_puts("ERROR\n");   break;
+                                }
+                            }
+
                             /* Chain link verification: each cert is
                              * signed by the next.  Logs PASS/FAIL
                              * per link; informative mode (no abort). */

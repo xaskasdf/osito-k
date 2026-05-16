@@ -94,4 +94,91 @@ int x509_check_validity(const uint8_t *cert, uint32_t cert_len, uint32_t now_utc
 int x509_match_hostname(const uint8_t *cert, uint32_t cert_len,
                         const char    *hostname);
 
+/* ── X.509 v3 extension parsing (A12.10) ──────────────────────
+ *
+ * Two security-critical extensions enforced per RFC 5280 §4.2.1.9
+ * (BasicConstraints) and §4.2.1.3 (KeyUsage).  Used during chain
+ * walking to ensure intermediates actually have CA authority and
+ * leaves don't masquerade as CAs.
+ *
+ * Without these checks, an attacker holding ANY valid leaf cert
+ * could potentially be accepted as an intermediate by our chain
+ * walker — minted sub-certs would chain through their stolen
+ * leaf instead of failing closed.  This is the classic
+ * "X.509 confusion" vulnerability.
+ */
+
+/* Bit flags for KeyUsage (RFC 5280 §4.2.1.3 — order matches the
+ * BIT STRING bit ordering used in the extension). */
+#define X509_KU_DIGITAL_SIGNATURE  0x0001
+#define X509_KU_NON_REPUDIATION    0x0002
+#define X509_KU_KEY_ENCIPHERMENT   0x0004
+#define X509_KU_DATA_ENCIPHERMENT  0x0008
+#define X509_KU_KEY_AGREEMENT      0x0010
+#define X509_KU_KEY_CERT_SIGN      0x0020
+#define X509_KU_CRL_SIGN           0x0040
+#define X509_KU_ENCIPHER_ONLY      0x0080
+#define X509_KU_DECIPHER_ONLY      0x0100
+
+typedef struct {
+    bool     has_bc;          /* BasicConstraints present */
+    bool     is_ca;           /* BasicConstraints.cA = TRUE */
+    int      path_len;        /* BasicConstraints.pathLenConstraint, -1 = unset */
+    bool     has_ku;          /* KeyUsage present */
+    uint32_t key_usage_flags; /* X509_KU_* bitmask */
+} x509_v3_t;
+
+/* Parse the v3 extension fields we care about (BasicConstraints +
+ * KeyUsage) from a single DER cert.  Other extensions are silently
+ * skipped.  Returns 0 always — caller checks the populated fields
+ * to decide what to enforce (CA validation, signature authority,
+ * etc.).  If the cert has no v3 extensions block, all fields stay
+ * at their zero defaults. */
+int x509_parse_v3(const uint8_t *cert, uint32_t cert_len, x509_v3_t *out);
+
+/* Walk-time chain check: assert that every intermediate in the
+ * chain has BasicConstraints.cA = TRUE AND KeyUsage.keyCertSign
+ * (when KeyUsage is present).  `chain[0]` is the leaf; chain
+ * intermediates are `chain[1..count-1]`.  Returns 0 if all
+ * intermediates pass, -1 on first violation.  Logs the failing
+ * cert index and reason. */
+int x509_check_chain_constraints(const uint8_t **chain,
+                                 const uint32_t *chain_lens,
+                                 uint32_t        count);
+
+/* ── Authority Information Access (A12.11) ─────────────────────
+ *
+ * RFC 5280 §4.2.2.1.  Two URLs of interest typically appear in
+ * the AIA extension on a leaf cert:
+ *
+ *   id-ad-caIssuers (1.3.6.1.5.5.7.48.2): URL of the *parent* cert,
+ *     used to fetch the intermediate when a server doesn't send
+ *     the full chain.  AIA chasing reads this.
+ *   id-ad-ocsp      (1.3.6.1.5.5.7.48.1): URL of the OCSP
+ *     responder for this cert.  OCSP queries POST to this URL.
+ *
+ * Both functions return the URL as a NUL-terminated string in
+ * `out`, capped at `cap` bytes (truncated with no NUL if too small,
+ * which the caller detects via the returned length).  Returns the
+ * length of the URL (excluding NUL) on success, -1 if the cert has
+ * no AIA extension or the requested OID isn't present. */
+int x509_get_aia_caissuers(const uint8_t *cert, uint32_t cert_len,
+                          char *out, uint32_t cap);
+int x509_get_aia_ocsp     (const uint8_t *cert, uint32_t cert_len,
+                          char *out, uint32_t cap);
+
+/* ── OCSP request fields (A12.11) ──────────────────────────────
+ *
+ * Helpers used by the OCSP module to build a CertID.  Each
+ * returns the *raw DER bytes* of the requested field within the
+ * cert (pointers into the input buffer; no allocation).  Returns
+ * 0 with `out_ptr`/`out_len` populated on success, -1 on parse
+ * failure. */
+int x509_get_issuer_der(const uint8_t *cert, uint32_t cert_len,
+                        const uint8_t **out_ptr, uint32_t *out_len);
+int x509_get_subject_pubkey_bits(const uint8_t *cert, uint32_t cert_len,
+                                 const uint8_t **out_ptr, uint32_t *out_len);
+int x509_get_serial_number(const uint8_t *cert, uint32_t cert_len,
+                           const uint8_t **out_ptr, uint32_t *out_len);
+
 #endif

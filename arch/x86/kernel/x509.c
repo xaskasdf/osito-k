@@ -907,3 +907,354 @@ int x509_match_hostname(const uint8_t *cert, uint32_t cert_len,
     }
     return -1;
 }
+
+/* ── v3 extension parsing (A12.10) ──────────────────────────── */
+
+static const uint8_t OID_BASIC_CONSTRAINTS[] = {
+    0x06, 0x03, 0x55, 0x1d, 0x13
+};
+static const uint8_t OID_KEY_USAGE[] = {
+    0x06, 0x03, 0x55, 0x1d, 0x0f
+};
+
+/* Walk a single Extension TLV body to identify which of the v3
+ * extensions we care about it is, and populate `out` accordingly.
+ * `ext_body` points at the contents of the Extension SEQUENCE
+ * (i.e. just past the outer 0x30/length tag-and-length). */
+static void parse_one_extension(const uint8_t *ext_body, uint32_t ext_len,
+                                x509_v3_t *out)
+{
+    const uint8_t *p = ext_body;
+    const uint8_t *end = ext_body + ext_len;
+
+    /* Extension OID. */
+    if (p >= end || *p != 0x06) return;
+    const uint8_t *oid_p = p;
+    uint32_t oid_full_len;
+    /* tag(1) + length-octets(1+) + content */
+    if (p + 1 >= end) return;
+    p++;
+    if (der_read_len(&p, end, &oid_full_len) < 0) return;
+    if (p + oid_full_len > end) return;
+    /* Reconstruct {tag, length, body} comparator block for OID matching. */
+    /* Easier: just look at oid_p[0..1+sizeof len+body] vs known prefixes. */
+    /* For simplicity, advance past the OID and compare a few known
+     * 5-byte OIDs against the full TLV (`oid_p[0..5)` since our two
+     * extensions are short). */
+    p += oid_full_len;
+
+    bool is_bc = (uint32_t)(p - oid_p) >= sizeof OID_BASIC_CONSTRAINTS
+              && bytes_eq(oid_p, OID_BASIC_CONSTRAINTS,
+                           sizeof OID_BASIC_CONSTRAINTS) == 0;
+    bool is_ku = (uint32_t)(p - oid_p) >= sizeof OID_KEY_USAGE
+              && bytes_eq(oid_p, OID_KEY_USAGE, sizeof OID_KEY_USAGE) == 0;
+    if (!is_bc && !is_ku) return;
+
+    /* Optional critical BOOLEAN — skip if present. */
+    if (p < end && *p == 0x01) {
+        if (der_skip_tlv(&p, end) < 0) return;
+    }
+
+    /* OCTET STRING wrapping the actual extension value. */
+    if (p >= end || *p != 0x04) return;
+    p++;
+    uint32_t os_len;
+    if (der_read_len(&p, end, &os_len) < 0) return;
+    if (p + os_len > end) return;
+    const uint8_t *val = p;
+    const uint8_t *val_end = p + os_len;
+
+    if (is_bc) {
+        /* BasicConstraints ::= SEQUENCE {
+         *   cA  BOOLEAN DEFAULT FALSE,
+         *   pathLenConstraint INTEGER (0..MAX) OPTIONAL
+         * } */
+        out->has_bc = true;
+        const uint8_t *bc_p = val;
+        const uint8_t *bc_end;
+        if (der_enter(&bc_p, val_end, 0x30, &bc_end) < 0) return;
+        if (bc_p < bc_end && *bc_p == 0x01) {
+            /* cA BOOLEAN */
+            bc_p++;
+            uint32_t bl;
+            if (der_read_len(&bc_p, bc_end, &bl) < 0) return;
+            if (bl >= 1 && bc_p[0] != 0x00) out->is_ca = true;
+            bc_p += bl;
+        }
+        if (bc_p < bc_end && *bc_p == 0x02) {
+            /* pathLenConstraint INTEGER */
+            bc_p++;
+            uint32_t il;
+            if (der_read_len(&bc_p, bc_end, &il) < 0) return;
+            if (il > 0 && il <= 4) {
+                int v = 0;
+                for (uint32_t i = 0; i < il; i++) v = (v << 8) | bc_p[i];
+                out->path_len = v;
+            }
+        }
+    } else if (is_ku) {
+        /* KeyUsage ::= BIT STRING.  Tag 0x03, then unused-bits + bits. */
+        out->has_ku = true;
+        if (val + 2 >= val_end || *val != 0x03) return;
+        uint32_t bs_len;
+        const uint8_t *kp = val + 1;
+        if (der_read_len(&kp, val_end, &bs_len) < 0) return;
+        if (kp + bs_len > val_end || bs_len < 2) return;
+        uint8_t unused = kp[0];
+        const uint8_t *bits = kp + 1;
+        uint32_t bit_count = (bs_len - 1) * 8 - unused;
+        uint32_t flags = 0;
+        for (uint32_t i = 0; i < bit_count && i < 9; i++) {
+            uint8_t byte = bits[i / 8];
+            uint8_t mask = (uint8_t)(0x80 >> (i % 8));
+            if (byte & mask) flags |= ((uint32_t)1 << i);
+        }
+        out->key_usage_flags = flags;
+    }
+}
+
+int x509_parse_v3(const uint8_t *cert, uint32_t cert_len, x509_v3_t *out)
+{
+    out->has_bc = false;
+    out->is_ca = false;
+    out->path_len = -1;
+    out->has_ku = false;
+    out->key_usage_flags = 0;
+
+    const uint8_t *ext_seq_start, *ext_seq_end;
+    if (find_extensions(cert, cert_len, &ext_seq_start, &ext_seq_end) < 0)
+        return 0;   /* no extensions block — leave defaults */
+
+    const uint8_t *p = ext_seq_start;
+    while (p < ext_seq_end) {
+        const uint8_t *ex_end;
+        if (der_enter(&p, ext_seq_end, 0x30, &ex_end) < 0) break;
+        parse_one_extension(p, (uint32_t)(ex_end - p), out);
+        p = ex_end;
+    }
+    return 0;
+}
+
+int x509_check_chain_constraints(const uint8_t **chain,
+                                 const uint32_t *chain_lens,
+                                 uint32_t        count)
+{
+    if (count == 0) return -1;
+    /* Walk intermediates: chain[1..count-1].  The leaf chain[0]
+     * generally doesn't have CA=TRUE; the root chain[count-1]
+     * may or may not be in the chain (we still check if present). */
+    for (uint32_t i = 1; i < count; i++) {
+        x509_v3_t v3;
+        x509_parse_v3(chain[i], chain_lens[i], &v3);
+
+        if (!v3.has_bc || !v3.is_ca) {
+            serial_puts("[X509] chain constraint: cert#");
+            serial_putdec((uint64_t)i);
+            serial_puts(" lacks BasicConstraints.cA=TRUE\n");
+            return -1;
+        }
+        /* If KeyUsage is present (most intermediates), it MUST
+         * include keyCertSign — the right to sign other certs. */
+        if (v3.has_ku && !(v3.key_usage_flags & X509_KU_KEY_CERT_SIGN)) {
+            serial_puts("[X509] chain constraint: cert#");
+            serial_putdec((uint64_t)i);
+            serial_puts(" KeyUsage lacks keyCertSign\n");
+            return -1;
+        }
+        /* pathLenConstraint check: the number of NON-self-issued
+         * intermediates between this cert and the leaf must be
+         * ≤ path_len.  Count of intermediates below this one =
+         * (i - 1).  RFC 5280 §4.2.1.9. */
+        if (v3.path_len >= 0 && (int)(i - 1) > v3.path_len) {
+            serial_puts("[X509] chain constraint: cert#");
+            serial_putdec((uint64_t)i);
+            serial_puts(" pathLenConstraint violated\n");
+            return -1;
+        }
+    }
+    return 0;
+}
+
+/* ── AIA extension parsing (A12.11) ─────────────────────────── */
+
+static const uint8_t OID_AIA[] = {
+    0x06, 0x08, 0x2B, 0x06, 0x01, 0x05, 0x05, 0x07, 0x01, 0x01
+};
+static const uint8_t OID_AD_CA_ISSUERS[] = {
+    0x06, 0x08, 0x2B, 0x06, 0x01, 0x05, 0x05, 0x07, 0x30, 0x02
+};
+static const uint8_t OID_AD_OCSP[] = {
+    0x06, 0x08, 0x2B, 0x06, 0x01, 0x05, 0x05, 0x07, 0x30, 0x01
+};
+
+/* Walk the AIA extension's AccessDescription list and look for the
+ * given access-method OID.  On match, copy the URI (tag 0x86 [6]
+ * IMPLICIT IA5String for the uniformResourceIdentifier choice) into
+ * `out`.  Returns URL length on match, -1 otherwise. */
+static int aia_get_url(const uint8_t *cert, uint32_t cert_len,
+                       const uint8_t *want_oid, uint32_t want_oid_len,
+                       char *out, uint32_t cap)
+{
+    const uint8_t *ext_seq_start, *ext_seq_end;
+    if (find_extensions(cert, cert_len, &ext_seq_start, &ext_seq_end) < 0)
+        return -1;
+    const uint8_t *p = ext_seq_start;
+    while (p < ext_seq_end) {
+        const uint8_t *ex_end;
+        if (der_enter(&p, ext_seq_end, 0x30, &ex_end) < 0) break;
+        const uint8_t *probe = p;
+        /* Extension OID must match AIA. */
+        if ((uint32_t)(ex_end - probe) < sizeof OID_AIA ||
+            bytes_eq(probe, OID_AIA, sizeof OID_AIA) != 0) {
+            p = ex_end; continue;
+        }
+        probe += sizeof OID_AIA;
+        /* Optional critical BOOLEAN. */
+        if (probe < ex_end && *probe == 0x01)
+            if (der_skip_tlv(&probe, ex_end) < 0) { p = ex_end; continue; }
+        /* OCTET STRING wrapping the AIA SEQUENCE. */
+        if (probe >= ex_end || *probe != 0x04) { p = ex_end; continue; }
+        probe++;
+        uint32_t os_len;
+        if (der_read_len(&probe, ex_end, &os_len) < 0) { p = ex_end; continue; }
+        if (probe + os_len > ex_end) { p = ex_end; continue; }
+        const uint8_t *aia_p = probe;
+        const uint8_t *aia_outer_end = probe + os_len;
+
+        /* AIA ::= SEQUENCE OF AccessDescription */
+        const uint8_t *aia_seq_end;
+        if (der_enter(&aia_p, aia_outer_end, 0x30, &aia_seq_end) < 0) {
+            p = ex_end; continue;
+        }
+        while (aia_p < aia_seq_end) {
+            const uint8_t *ad_end;
+            if (der_enter(&aia_p, aia_seq_end, 0x30, &ad_end) < 0) break;
+            /* AccessDescription ::= SEQUENCE {
+             *   accessMethod   OBJECT IDENTIFIER,
+             *   accessLocation GeneralName  }
+             *
+             * accessLocation has tag 0x86 ([6] IMPLICIT IA5String)
+             * when the choice is uniformResourceIdentifier. */
+            if ((uint32_t)(ad_end - aia_p) < want_oid_len ||
+                bytes_eq(aia_p, want_oid, want_oid_len) != 0) {
+                aia_p = ad_end; continue;
+            }
+            aia_p += want_oid_len;
+            if (aia_p >= ad_end || *aia_p != 0x86) { aia_p = ad_end; continue; }
+            aia_p++;
+            uint32_t url_len;
+            if (der_read_len(&aia_p, ad_end, &url_len) < 0) return -1;
+            if (aia_p + url_len > ad_end) return -1;
+            /* Copy with NUL terminator. */
+            uint32_t take = (url_len + 1 > cap) ? (cap - 1) : url_len;
+            for (uint32_t i = 0; i < take; i++) out[i] = (char)aia_p[i];
+            if (cap > 0) out[take] = 0;
+            return (int)url_len;
+        }
+        return -1;
+    }
+    return -1;
+}
+
+int x509_get_aia_caissuers(const uint8_t *cert, uint32_t cert_len,
+                          char *out, uint32_t cap)
+{
+    return aia_get_url(cert, cert_len,
+                       OID_AD_CA_ISSUERS, sizeof OID_AD_CA_ISSUERS,
+                       out, cap);
+}
+int x509_get_aia_ocsp(const uint8_t *cert, uint32_t cert_len,
+                     char *out, uint32_t cap)
+{
+    return aia_get_url(cert, cert_len,
+                       OID_AD_OCSP, sizeof OID_AD_OCSP,
+                       out, cap);
+}
+
+/* Issuer DN extraction: return raw DER bytes of the entire Issuer
+ * SEQUENCE TLV (including the SEQUENCE tag + length).  Used by
+ * OCSP CertID building (issuer name hash = SHA-1 of these bytes). */
+int x509_get_issuer_der(const uint8_t *cert, uint32_t cert_len,
+                        const uint8_t **out_ptr, uint32_t *out_len)
+{
+    const uint8_t *p = cert;
+    const uint8_t *end = cert + cert_len;
+    const uint8_t *outer_end, *tbs_end;
+    if (der_enter(&p, end, 0x30, &outer_end) < 0) return -1;
+    if (der_enter(&p, outer_end, 0x30, &tbs_end) < 0) return -1;
+    /* Skip optional version + serial + sigAlg. */
+    if (p < tbs_end && p[0] == 0xA0)
+        if (der_skip_tlv(&p, tbs_end) < 0) return -1;
+    for (int i = 0; i < 2; i++)
+        if (der_skip_tlv(&p, tbs_end) < 0) return -1;
+    /* Issuer Name = SEQUENCE OF RDN.  Capture the whole TLV. */
+    if (p >= tbs_end || *p != 0x30) return -1;
+    const uint8_t *iss_start = p;
+    p++;
+    uint32_t il;
+    if (der_read_len(&p, tbs_end, &il) < 0) return -1;
+    if (p + il > tbs_end) return -1;
+    *out_ptr = iss_start;
+    *out_len = (uint32_t)(p + il - iss_start);
+    return 0;
+}
+
+/* Subject Public Key BIT STRING content (without the tag/length and
+ * the leading unused-bits byte).  This is what OCSP CertID hashes
+ * for the issuer-key-hash field. */
+int x509_get_subject_pubkey_bits(const uint8_t *cert, uint32_t cert_len,
+                                 const uint8_t **out_ptr, uint32_t *out_len)
+{
+    const uint8_t *p = cert;
+    const uint8_t *end = cert + cert_len;
+    const uint8_t *outer_end, *tbs_end;
+    if (der_enter(&p, end, 0x30, &outer_end) < 0) return -1;
+    if (der_enter(&p, outer_end, 0x30, &tbs_end) < 0) return -1;
+    if (p < tbs_end && p[0] == 0xA0)
+        if (der_skip_tlv(&p, tbs_end) < 0) return -1;
+    /* serial, sigAlg, issuer, validity, subject = 5 */
+    for (int i = 0; i < 5; i++)
+        if (der_skip_tlv(&p, tbs_end) < 0) return -1;
+    /* SubjectPublicKeyInfo */
+    const uint8_t *spki_end;
+    if (der_enter(&p, tbs_end, 0x30, &spki_end) < 0) return -1;
+    /* Skip AlgorithmIdentifier. */
+    if (der_skip_tlv(&p, spki_end) < 0) return -1;
+    /* subjectPublicKey BIT STRING. */
+    if (p >= spki_end || *p != 0x03) return -1;
+    p++;
+    uint32_t bs_len;
+    if (der_read_len(&p, spki_end, &bs_len) < 0) return -1;
+    if (p + bs_len > spki_end || bs_len < 1) return -1;
+    /* Skip the unused-bits byte (should be 0). */
+    *out_ptr = p + 1;
+    *out_len = bs_len - 1;
+    return 0;
+}
+
+int x509_get_serial_number(const uint8_t *cert, uint32_t cert_len,
+                           const uint8_t **out_ptr, uint32_t *out_len)
+{
+    const uint8_t *p = cert;
+    const uint8_t *end = cert + cert_len;
+    const uint8_t *outer_end, *tbs_end;
+    if (der_enter(&p, end, 0x30, &outer_end) < 0) return -1;
+    if (der_enter(&p, outer_end, 0x30, &tbs_end) < 0) return -1;
+    if (p < tbs_end && p[0] == 0xA0)
+        if (der_skip_tlv(&p, tbs_end) < 0) return -1;
+    /* serial INTEGER */
+    if (p >= tbs_end || *p != 0x02) return -1;
+    const uint8_t *s_tag = p;
+    p++;
+    uint32_t sl;
+    if (der_read_len(&p, tbs_end, &sl) < 0) return -1;
+    if (p + sl > tbs_end) return -1;
+    /* Return value bytes (without the INTEGER tag/length).  Strip
+     * leading 0x00 sign byte if present. */
+    const uint8_t *vp = p;
+    if (sl > 1 && vp[0] == 0x00) { vp++; sl--; }
+    *out_ptr = vp;
+    *out_len = sl;
+    (void)s_tag;
+    return 0;
+}
