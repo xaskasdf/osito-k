@@ -119,6 +119,7 @@ typedef struct {
     uint32_t    state;
     char        name[MAX_NAME_LEN];
     int32_t     exit_code;
+    uint64_t    zombie_tick;        /* idt_get_ticks() when state→ZOMBIE; 0 if alive */
 
     /* Memory regions (for cleanup) */
     mem_region_t regions[MAX_REGIONS];
@@ -392,6 +393,16 @@ static inline void proc_transition(process_t *p, uint32_t new_state)
         runq_dequeue(idx);
     else if (old != PROC_READY && new_state == PROC_READY)
         runq_enqueue(idx);
+
+    /* Stamp the death time when a process first enters ZOMBIE state.
+     * The auto-reaper uses this to apply a grace period before
+     * reclaiming the slot, so a parent that calls wait4() within the
+     * grace window can still observe its child's exit_code. Reset on
+     * a transition back to PROC_FREE (slot reuse). */
+    if (new_state == PROC_ZOMBIE && old != PROC_ZOMBIE)
+        p->zombie_tick = idt_get_ticks();
+    else if (new_state == PROC_FREE)
+        p->zombie_tick = 0;
 }
 
 static void runq_init(void)
@@ -2251,6 +2262,154 @@ int sched_spawn_qos(const char *name, void (*entry)(void), uint8_t qos)
 
 /* ── Process initialization ──────────────────────────────────── */
 
+/* ── Auto-reaper: zombies are a smell, not a state ────────────── */
+/*
+ * Philosophy: a process that has finished running has no business
+ * occupying a proctab slot, fd table, page-table allocations, FPU
+ * area, symbol tables, etc. POSIX zombies exist purely so the parent
+ * can later call wait4() and observe exit_code. If no one is going
+ * to wait (kthreads, orphaned win32 threads, processes whose parent
+ * has died), the zombie is pure leak.
+ *
+ * The auto-reaper kthread sweeps proctab every second and reclaims
+ * zombies that:
+ *   (a) have no parent process alive (orphan), OR
+ *   (b) have been waiting beyond REAP_GRACE_TICKS with no parent
+ *       blocked in wait4 on them.
+ *
+ * Before reclaiming, each victim is dumped to klog (mirrored to
+ * dmesg via serial) so postmortem analysis is still possible.
+ */
+#define REAP_GRACE_TICKS  1000   /* 10 s at 100 Hz APIC */
+#define REAP_SWEEP_TICKS  100    /* 1 s between sweeps */
+
+extern uint64_t paging_get_kernel_cr3(void);
+
+static int proc_has_blocked_waiter(uint32_t pid, uint32_t ppid)
+{
+    /* True if any process is PROC_BLOCKED on wait4 expecting this
+     * zombie. We don't track the wait target explicitly — wait4 just
+     * parks the parent in BLOCKED — so we approximate: parent (ppid)
+     * is alive and currently BLOCKED. That's the same predicate
+     * proc_exit() uses to wake a waiter (line 781). */
+    if (ppid == 0) return 0;
+    for (int i = 0; i < MAX_PROCESSES; i++) {
+        if (proctab[i].pid == ppid &&
+            proctab[i].state == PROC_BLOCKED) {
+            (void)pid;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int proc_parent_alive(uint32_t ppid)
+{
+    if (ppid == 0) return 0;
+    for (int i = 0; i < MAX_PROCESSES; i++) {
+        if (proctab[i].pid == ppid &&
+            proctab[i].state != PROC_FREE &&
+            proctab[i].state != PROC_ZOMBIE)
+            return 1;
+    }
+    return 0;
+}
+
+static void proc_reap_dump(const process_t *p, uint64_t age_ticks,
+                            const char *reason)
+{
+    serial_puts("[reaper] ");
+    serial_puts(reason);
+    serial_puts(" pid=");
+    serial_putdec((uint64_t)p->pid);
+    serial_puts(" name='");
+    serial_puts(p->name[0] ? p->name : "(anon)");
+    serial_puts("' ppid=");
+    serial_putdec((uint64_t)p->ppid);
+    serial_puts(" exit=");
+    serial_putdec((uint64_t)(uint32_t)p->exit_code);
+    serial_puts(" age=");
+    serial_putdec(age_ticks * 10);
+    serial_puts("ms");
+    if (p->cr3 && p->cr3 != paging_get_kernel_cr3()) {
+        serial_puts(" cr3=0x");
+        serial_puthex(p->cr3, 16);
+    }
+    if (p->fd_table) {
+        serial_puts(" fd_refs=");
+        serial_putdec((uint64_t)p->fd_table->refcount);
+    }
+    if (p->region_count > 0) {
+        serial_puts(" regions=");
+        serial_putdec((uint64_t)p->region_count);
+    }
+    if (p->kernel_stack) {
+        serial_puts(" kstack=0x");
+        serial_puthex((uint64_t)p->kernel_stack, 16);
+    }
+    if (p->saved_frame_rip) {
+        serial_puts(" last_rip=0x");
+        serial_puthex(p->saved_frame_rip, 16);
+    }
+    serial_puts("\n");
+}
+
+/* Scan the proctab once and reap eligible zombies. Safe to call from
+ * any context that can be preempted; the loop is O(MAX_PROCESSES). */
+void proc_reap_zombies(void)
+{
+    uint64_t now = idt_get_ticks();
+    int reaped = 0;
+    for (int i = 0; i < MAX_PROCESSES; i++) {
+        process_t *p = &proctab[i];
+        if (p->state != PROC_ZOMBIE) continue;
+        if (p == current_proc) continue;   /* paranoia */
+
+        /* If a parent is currently blocked in wait4 for this child,
+         * leave the zombie for it. wait4 wants to observe exit_code. */
+        if (proc_has_blocked_waiter(p->pid, p->ppid))
+            continue;
+
+        uint64_t age = now - p->zombie_tick;
+        const char *reason;
+        if (!proc_parent_alive(p->ppid)) {
+            /* Orphan: parent already gone (or kernel PID 0 / 1 isn't
+             * going to wait on its child). Reap immediately. */
+            reason = "reaped orphan";
+        } else if (age >= REAP_GRACE_TICKS) {
+            /* Parent alive but not waiting within the grace window.
+             * It had its chance — reclaim the slot. */
+            reason = "reaped (parent-no-wait)";
+        } else {
+            continue;
+        }
+
+        proc_reap_dump(p, age, reason);
+        proc_free(p);
+        reaped++;
+    }
+    (void)reaped;
+}
+
+/* Periodic kthread: sweep zombies once per second.
+ * Runs at QOS_BACKGROUND so it can never starve real work. */
+static void zombie_reaper_thread(void)
+{
+    extern void proc_set_qos(uint8_t qos);
+    proc_set_qos(QOS_BACKGROUND);
+    serial_puts("[reaper] zombie auto-reaper online (QOS_BACKGROUND, "
+                "sweep=1s, grace=10s)\n");
+    while (1) {
+        proc_reap_zombies();
+        /* Sleep ~1 s on APIC ticks. hlt + IRQ; if APIC is masked the
+         * sweep cadence stretches, but that's fine — we're not on a
+         * latency budget here. */
+        uint64_t target = idt_get_ticks() + REAP_SWEEP_TICKS;
+        while (idt_get_ticks() < target)
+            __asm__ volatile ("hlt");
+    }
+}
+
 void proc_init(void)
 {
     serial_puts("[PROC] Initializing process subsystem...\n");
@@ -2276,6 +2435,17 @@ void proc_init(void)
     }
 
     fb_puts(" Process subsystem ready\n");
+}
+
+/* Spawn the auto-reaper. Called from main.c after all boot
+ * initialization is complete — not from proc_init, because spawning
+ * a thread at proc_init time auto-enables preemption, and any APIC
+ * tick during the still-running PCI / driver init steps would try
+ * to dispatch the new thread from a low-half boot-stack context
+ * which the scheduler isn't ready to context-switch out of. */
+void proc_start_reaper(void)
+{
+    sched_spawn("reaper", zombie_reaper_thread);
 }
 
 uint32_t proc_count_active(void)

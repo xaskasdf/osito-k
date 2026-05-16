@@ -1050,6 +1050,13 @@ void __initk kernel_entry(boot_info_t *info)
     /* Reclaim init-only code pages */
     reclaim_init_memory();
 
+    /* Spawn the zombie auto-reaper now that all subsystems are
+     * initialised. Doing this earlier (e.g. inside proc_init) would
+     * auto-enable preemptive scheduling before the rest of the boot
+     * is safe to be context-switched out of. */
+    extern void proc_start_reaper(void);
+    proc_start_reaper();
+
     /* Run interactive shell (never returns) */
     shell_run();
 }
