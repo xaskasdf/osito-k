@@ -2988,6 +2988,69 @@ uint64_t compat32_dispatch(uint32_t thunk_idx, uint32_t *stack_args)
         }
     }
 
+    /* PRECREATE-PACKAGES — Phase 7f. Before Phase 2 of ProcessRegistrants
+     * iterates, ensure UPackage("Engine") and other common packages exist
+     * in GObj.
+     *
+     * Phase 7d evidence: entries 5+ have +0x18 pointing at TCHAR* L"Engine"
+     * (or "SGLDrv", etc.) in their respective DLLs' .rdata. Register()
+     * needs to find UPackage(*Name) in GObj, and if not found, tries
+     * CreatePackage which throws when the package can't be loaded.
+     *
+     * Strategy: at the moment Num just transitioned 0→200 (Phase 1 done,
+     * Phase 2 about to start), call CreatePackage(NULL, L"Engine") via
+     * compat32_callback_args(0x10101CFD, 2, [NULL, &"Engine"]) to create
+     * the UPackage("Engine") object in GObj BEFORE Phase 2 iterates.
+     * Then Engine.dll's UClass instances can find their outer UPackage
+     * during Register, completing registration. */
+    {
+        volatile uint32_t *gobjreg2 = (volatile uint32_t *)(uintptr_t)0x102A0360ULL;
+        static int precreate_done = 0;
+        uint32_t pg_grd = gobjreg2[0], pg_grn = gobjreg2[1];
+        if (!precreate_done && pg_grd != 0 && pg_grn >= 100) {
+            precreate_done = 1;
+            extern void *mem_alloc_pages(uint64_t count);
+            void *page = mem_alloc_pages(1);
+            if (page && (uint64_t)page < 0x80000000ULL) {
+                /* Write WCHAR strings into the page at known offsets. */
+                uint16_t *p = (uint16_t *)page;
+                const char *names[] = {
+                    "Engine", "Core", "Window", "Render", "Galaxy",
+                    "Editor", "UnrealI", "UnrealShare", "IpDrv", "Fire",
+                    "D3DDrv", "GlideDrv", "MeTaLDrv", "OpenGlDrv", "SGLDrv",
+                    "SoftDrv", "UWeb", "WinDrv", "Audio", NULL,
+                };
+                int off = 0;
+                int offsets[32];
+                int name_count = 0;
+                for (int i = 0; names[i]; i++) {
+                    offsets[name_count++] = off;
+                    for (int j = 0; names[i][j]; j++) {
+                        p[off++] = (uint16_t)names[i][j];
+                    }
+                    p[off++] = 0;
+                }
+                serial_puts("[PRECREATE-PACKAGES] page=0x");
+                serial_puthex((uint64_t)page, 8);
+                serial_puts(" calling CreatePackage for ");
+                serial_putdec((uint64_t)name_count);
+                serial_puts(" packages...\n");
+                for (int i = 0; i < name_count; i++) {
+                    uint32_t name_va = (uint32_t)(uint64_t)page + offsets[i] * 2;
+                    uint32_t args2[2] = { 0, name_va };
+                    serial_puts("  CreatePackage(NULL, L\"");
+                    serial_puts(names[i]);
+                    serial_puts("\") ...");
+                    uint32_t ret = compat32_callback_args(0x10101CFD, 2, args2);
+                    serial_puts(" → 0x");
+                    serial_puthex((uint64_t)ret, 8);
+                    serial_puts("\n");
+                }
+                serial_puts("[PRECREATE-PACKAGES] done\n");
+            }
+        }
+    }
+
     /* GOBJREG-FORCE — when GObjRegistrants accumulates >= 100 entries and
      * stays there, force a manual ProcessRegistrants pass.
      *
