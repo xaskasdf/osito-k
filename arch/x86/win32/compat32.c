@@ -2220,31 +2220,14 @@ uint64_t compat32_dispatch(uint32_t thunk_idx, uint32_t *stack_args)
         }
     }
 
-    /* FMallocWindows pool-integrity asserts in UT.exe — skip them.
-     * Our stub FMalloc doesn't maintain the Pool/Free/FirstMem
-     * doubly-linked-list invariants the engine sanity-checks.  Each
-     * je/ja over the assert call gets flipped to jmp. */
-    static int fmw_patched_mask = 0;
-    if (fmw_patched_mask != 0xF) {
-        struct { uint32_t va; uint8_t want; uint8_t patch; } sites[] = {
-            { 0x109032A8, 0x74, 0xEB },  /* line 367  je → jmp */
-            { 0x10903303, 0x77, 0xEB },  /* line 370  ja → jmp */
-            { 0x10903353, 0x74, 0xEB },  /* line 375  je → jmp */
-            { 0x10903374, 0x74, 0xEB },  /* line 376  je → jmp */
-        };
-        for (int i = 0; i < 4; i++) {
-            if (fmw_patched_mask & (1 << i)) continue;
-            volatile uint8_t *p = (uint8_t *)(uintptr_t)sites[i].va;
-            if (p[0] == sites[i].want) {
-                p[0] = sites[i].patch;
-                fmw_patched_mask |= (1 << i);
-                serial_puts("[UT-PATCH] FMallocWindows assert site ");
-                serial_putdec((uint64_t)i);
-                serial_puts(" @0x"); serial_puthex(sites[i].va, 8);
-                serial_puts(" → jmp\n");
-            }
-        }
-    }
+    /* FMallocWindows pool-integrity asserts: REMOVED in Phase 3 of
+     * the layer-repair plan. Previously we patched je/ja → jmp at
+     * UT.exe 0x109032A8/0x10903303/0x10903353/0x10903374 to skip
+     * the HeapCheck() asserts at FMallocWindows.cpp lines 367/370/
+     * 375/376. With Phase 2-fix's defensive FMW-REPAIR sweep
+     * keeping the pool->PrevLink invariant satisfied (commit
+     * b82559c), the engine's HeapCheck walk passes naturally and
+     * the bypasses are no longer needed. */
 
     /* Actors-assert jne→jmp patches DISABLED.  Skipping the assertions
      * makes the engine read Actors[0] which is NULL, leading to a
