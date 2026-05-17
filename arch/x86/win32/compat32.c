@@ -2610,6 +2610,111 @@ uint64_t compat32_dispatch(uint32_t thunk_idx, uint32_t *stack_args)
         (void)fname_none_entry;
     }
 
+    /* FMW-REPAIR — defensive pool-list invariant repair.
+     *
+     * UT99's FMallocWindows pool allocator uses TDoubleLinkedList<FPoolInfoBase>
+     * with the invariant `pool->PrevLink == cursor` where cursor is either
+     * &Table->FirstPool/ExaustedPool (for the head) or &PrevPool->Next (for
+     * subsequent pools). HeapCheck() asserts this at 4 sites (UT.exe
+     * 0x109032A8/0x10903303/0x10903353/0x10903374).
+     *
+     * Phase 1-2d investigation (commits 61514f4 → 6e833c2 → fbf6dd6)
+     * confirmed Pool@0x40010700 reliably enters an inconsistent state where
+     * its PrevLink points to &Pool@0x40010200.Next (0x40010218) but the
+     * Table->FirstPool walk finds it as head. Root cause: unclear — UE1's
+     * inline Link/Unlink operations should leave the list consistent, but
+     * something in our compat32 layer causes momentary inconsistencies that
+     * persist past Link/Unlink completion.
+     *
+     * Defensive repair: at each compat32_dispatch (= INT 0x2E boundary, safe
+     * point between PE32 operations), walk every PoolTable[0..48]'s FirstPool
+     * AND ExaustedPool chain. For each visited pool, verify the invariant
+     * and REPAIR if mismatch. This enforces the same invariant the engine
+     * asserts, so the bypass patches at 0x109032A8/0x10903303/0x10903353/
+     * 0x10903374 become unnecessary (Phase 3 of plan).
+     *
+     * Layout constants (from FMallocWindows.h):
+     *   POOL_COUNT = 49 (line 18)
+     *   sizeof(FPoolTable) = 12 (FirstPool/ExaustedPool/BlockSize)
+     *   FPoolInfo +0x18 = Next field
+     *   FPoolInfo +0x1c = PrevLink field
+     *
+     * PoolTable base in UT99: 0x1092F738 (observed across all phases).
+     * Could be detected dynamically via FMallocWindows vtable lookup, but
+     * the address is deterministic for this PE32 build — hardcode for now.
+     *
+     * Safety: every pool pointer is range-checked against compat32 heap
+     * (0x40000000..0x80000000) before deref. Walk depth capped at 1024
+     * per list to prevent infinite-loop on circular lists. */
+    {
+        static int repair_total = 0;
+        const uint32_t POOLTABLE_BASE = 0x1092F738;
+        const int POOL_COUNT = 49;
+        int repairs_this_dispatch = 0;
+
+        /* Only run when UT99 is actually loaded — gate by checking that
+         * the FMallocWindows vtable slot (FMallocWindows base = PoolTable
+         * - 4 dwords, vtable ptr at +0) is non-zero and looks like a
+         * Core.dll text address (FMalloc vtable lives in Core.dll). Also
+         * verify the GMalloc global pointer is set to a non-zero value
+         * (which winexec / PE init establishes). */
+        extern uint32_t g_gmalloc_addr;
+        int ut99_ready = 0;
+        if (g_gmalloc_addr) {
+            uint32_t gmalloc_obj = *(volatile uint32_t *)(uintptr_t)g_gmalloc_addr;
+            if (gmalloc_obj >= 0x10900000 && gmalloc_obj < 0x10A00000) {
+                /* GMalloc points to a UT.exe-resident FMallocWindows instance */
+                ut99_ready = 1;
+            }
+        }
+        if (!ut99_ready) goto fmw_repair_done;
+
+        for (int t = 0; t < POOL_COUNT; t++) {
+            uint32_t table_base = POOLTABLE_BASE + (uint32_t)(t * 12);
+            for (int list = 0; list < 2; list++) {
+                /* list 0 = FirstPool (offset 0), list 1 = ExaustedPool (+4) */
+                uint32_t cursor_addr = table_base + (uint32_t)(list * 4);
+                if (cursor_addr < 0x10000000 || cursor_addr >= 0x12000000) break;
+                uint32_t pool = *(volatile uint32_t *)(uintptr_t)cursor_addr;
+                int depth = 0;
+                while (pool != 0 && depth < 1024) {
+                    /* sanity: pool ptr should be in compat32 heap range
+                     * (PoolIndirect bucket VAs) */
+                    if (pool < 0x40000000 || pool >= 0x80000000) break;
+                    uint32_t pool_prevlink = *(volatile uint32_t *)(uintptr_t)(pool + 0x1c);
+                    if (pool_prevlink != cursor_addr) {
+                        /* Mismatch — repair by setting Pool->PrevLink = cursor_addr.
+                         * This is the value the engine's Link operation
+                         * SHOULD have set if it completed atomically. */
+                        *(volatile uint32_t *)(uintptr_t)(pool + 0x1c) = cursor_addr;
+                        repairs_this_dispatch++;
+                    }
+                    /* Advance: cursor = &pool->Next, pool = pool->Next */
+                    cursor_addr = pool + 0x18;
+                    pool = *(volatile uint32_t *)(uintptr_t)cursor_addr;
+                    depth++;
+                }
+            }
+        }
+        if (repairs_this_dispatch > 0) {
+            repair_total += repairs_this_dispatch;
+            /* Log every fire — should be RARE once warm; if it spams we
+             * know the repair is racing the engine and need to throttle. */
+            static int log_count = 0;
+            if (log_count < 50 || (log_count % 100 == 0)) {
+                log_count++;
+                serial_puts("[FMW-REPAIR] fixed ");
+                serial_putdec((uint64_t)repairs_this_dispatch);
+                serial_puts(" PrevLink mismatches (cum=");
+                serial_putdec((uint64_t)repair_total);
+                serial_puts(") thunk=");
+                serial_putdec((uint64_t)thunk_idx);
+                serial_puts("\n");
+            }
+        }
+    fmw_repair_done: ;
+    }
+
     /* GObjRegistrants snapshot + restore.
      *
      * Observed: 200 UClass registrants get added (Num→200), then

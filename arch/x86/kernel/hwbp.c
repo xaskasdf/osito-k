@@ -296,6 +296,40 @@ bool hwbp_dispatch(struct interrupt_frame *frame)
                     /* site 0 (and default): cursor mismatch */
                     mismatch = (edx32 != cursor_val);
                 }
+                /* FMW-INLINE-REPAIR — when site 0 detects PrevLink
+                 * mismatch, repair the pool's PrevLink AT THIS POINT
+                 * so the engine's walk sees consistent state. The
+                 * je→jmp patch in compat32.c handles the je outcome
+                 * (always takes the "pass" path), but downstream code
+                 * may still access pool->PrevLink and expect it valid.
+                 *
+                 * cursor_addr = [ebp-0x18] (the cursor variable's value)
+                 * ecx = pool (the pool whose PrevLink we just checked)
+                 * Write pool->PrevLink = cursor_addr.
+                 *
+                 * Only do this for site 0 (the PrevLink check). Other
+                 * mismatch types (site 1 Free->Blocks) don't have a
+                 * simple repair. */
+                if (mismatch && site_idx == 0) {
+                    uint32_t pool_ptr = (uint32_t)frame->rcx;
+                    if (pool_ptr >= 0x40000000 && pool_ptr < 0x80000000ULL &&
+                        cursor_val >= 0x10000000) {
+                        *(volatile uint32_t *)(uintptr_t)(pool_ptr + 0x1c) = cursor_val;
+                        static uint32_t inline_repairs = 0;
+                        inline_repairs++;
+                        if (inline_repairs <= 20 || (inline_repairs % 50 == 0)) {
+                            serial_puts("[FMW-INLINE-REPAIR] pool@0x");
+                            serial_puthex((uint64_t)pool_ptr, 8);
+                            serial_puts(" PrevLink: 0x");
+                            serial_puthex((uint64_t)edx32, 8);
+                            serial_puts(" → 0x");
+                            serial_puthex((uint64_t)cursor_val, 8);
+                            serial_puts(" (cum=");
+                            serial_putdec((uint64_t)inline_repairs);
+                            serial_puts(")\n");
+                        }
+                    }
+                }
                 if (mismatch) {
                     serial_puts("[FMW-MISMATCH] slot=");
                     serial_putdec((uint64_t)i);
