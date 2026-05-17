@@ -2186,6 +2186,40 @@ uint64_t compat32_dispatch(uint32_t thunk_idx, uint32_t *stack_args)
     }
     #endif
 
+    /* CASCADE-NOP — surgical NOP of the inner-most appThrowf call inside
+     * UPackage::LoadPackage at Core.dll+0x10159B99 ("Can't find file for
+     * package 'None0'"). The caller has a built-in recovery path at
+     * +0x10159BA1 (jmp 0x10159D30) that handles "file not found" by
+     * returning NULL up the chain. Without this NOP, LoadPackage throws,
+     * the outer StaticLoadObject also throws, the engine cascades to
+     * appError → StaticShutdownAfterError → exit.
+     *
+     * Replace `e8 5e 91 fa ff` (call 0x10102cfc, 5 bytes) with 5×NOP.
+     * The push edx; push eax that prepared the throw args remain — the
+     * subsequent `add esp, 8` cleans them up after the NOPs. Then
+     * `jmp 0x10159D30` runs the engine's NULL-return recovery.
+     *
+     * DEBUG/EXPLORATION patch — the cascade comes from UE1 internals
+     * trying to load synthetic "None0"/"None1" packages because the
+     * UObject Outer tree for Engine.u isn't being built. The real
+     * fix needs Engine.u export parser + UPackage instantiation in
+     * GObj. This NOP is a stepping stone to see how far the engine
+     * gets when the LoadPackage abort signal is silenced. */
+    {
+        static int cascade_nop_patched = 0;
+        if (!cascade_nop_patched) {
+            volatile uint8_t *p = (volatile uint8_t *)(uintptr_t)0x10159B99ULL;
+            if (p[0] == 0xE8 && p[1] == 0x5E && p[2] == 0x91 &&
+                p[3] == 0xFA && p[4] == 0xFF) {
+                p[0] = 0x90; p[1] = 0x90; p[2] = 0x90;
+                p[3] = 0x90; p[4] = 0x90;
+                cascade_nop_patched = 1;
+                serial_puts("[CASCADE-NOP] patched Core.dll+0x10159B99 "
+                            "appThrowf(can't find file) → 5×NOP\n");
+            }
+        }
+    }
+
     /* FMallocWindows pool-integrity asserts in UT.exe — skip them.
      * Our stub FMalloc doesn't maintain the Pool/Free/FirstMem
      * doubly-linked-list invariants the engine sanity-checks.  Each
