@@ -2698,90 +2698,12 @@ uint64_t compat32_dispatch(uint32_t thunk_idx, uint32_t *stack_args)
     fmw_repair_done: ;
     }
 
-    /* GObjRegistrants snapshot + restore.
-     *
-     * Observed: 200 UClass registrants get added (Num→200), then
-     * engine zeros the entire TArray (Data=0, Num=0, Max=0).  Likely
-     * `FArray::Empty()` after a partial ProcessRegistrants pass.  The
-     * engine then queries GObjRegistrants for UClass lookups and gets
-     * an empty array → UClass hierarchy never resolves → Browse() ends
-     * up with corrupt this → assertion.
-     *
-     * Strategy: snapshot the {Data,Num,Max} when Num peaks.  After the
-     * zero-event, restore the snapshot so the engine sees the original
-     * 200 registrants again.  Best-effort — engine may have already
-     * freed the underlying buffer, but our pre-alloc was a stable phys
-     * buffer that doesn't get freed by FMallocWindows. */
-    {
-        volatile uint32_t *tarray = (volatile uint32_t *)(uintptr_t)0x102A0360;
-        static uint32_t last_d = 0xFFFFFFFF, last_n = 0xFFFFFFFF, last_m = 0xFFFFFFFF;
-        static int change_count = 0;
-        static uint64_t rescue_phys = 0;
-        static uint32_t snap_d = 0, snap_n = 0, snap_m = 0;
-        static int restore_count = 0;
-        uint32_t d = tarray[0], n = tarray[1], m = tarray[2];
-        int changed = (d != last_d) || (n != last_n) || (m != last_m);
-        if (changed && change_count < 50) {
-            change_count++;
-            serial_puts("[GOBJREG-TRACE#");
-            serial_putdec((uint64_t)change_count);
-            serial_puts("] Data=0x"); serial_puthex(d, 8);
-            serial_puts(" Num="); serial_putdec((uint64_t)n);
-            serial_puts(" Max="); serial_putdec((uint64_t)m);
-            serial_puts(" thunk="); serial_putdec((uint64_t)thunk_idx);
-            serial_puts("\n");
-            last_d = d; last_n = n; last_m = m;
-        }
-        /* Snapshot when Num grows (likely registrant Add) */
-        if (d != 0 && n > snap_n && m > 0) {
-            snap_d = d; snap_n = n; snap_m = m;
-            /* When Num peaks at a substantial value (≥100 registrants),
-             * manually invoke UObject::ProcessRegistrants @0x1010190B
-             * to bind the UClass hierarchy before the engine clears the
-             * array.  Done once per peak. */
-            static int peak_processed = 0;
-            if (n >= 100 && !peak_processed) {
-                peak_processed = 1;
-                serial_puts("[GOBJREG-PROCESS] manual call to ProcessRegistrants @0x1010190B Num=");
-                serial_putdec((uint64_t)n);
-                serial_puts("\n");
-                uint32_t args[1] = { 0 };
-                compat32_callback_args(0x1010190B, 0, args);
-                serial_puts("[GOBJREG-PROCESS] returned\n");
-            }
-        }
-        /* Restore if zeroed AFTER snapshot taken */
-        if (d == 0 && n == 0 && m == 0 && snap_n > 0) {
-            tarray[0] = snap_d;
-            tarray[1] = snap_n;
-            tarray[2] = snap_m;
-            restore_count++;
-            if (restore_count <= 5) {
-                serial_puts("[GOBJREG-SNAP-RESTORE #");
-                serial_putdec((uint64_t)restore_count);
-                serial_puts("] Data=0x"); serial_puthex(snap_d, 8);
-                serial_puts(" Num="); serial_putdec((uint64_t)snap_n);
-                serial_puts("\n");
-            }
-        }
-        /* Initial-state rescue: if all-zero and never snapshotted, give a buffer */
-        if (d == 0 && m == 0 && snap_n == 0) {
-            if (rescue_phys == 0) {
-                extern void *mem_alloc_pages(uint64_t count);
-                void *buf = mem_alloc_pages(1);
-                if (buf) {
-                    uint64_t pa = (uint64_t)buf;
-                    uint8_t *p = (uint8_t *)pa;
-                    for (int i = 0; i < 4096; i++) p[i] = 0;
-                    rescue_phys = pa;
-                }
-            }
-            if (rescue_phys) {
-                tarray[0] = (uint32_t)rescue_phys;
-                tarray[2] = 1024;
-            }
-        }
-    }
+    /* GObjRegistrants snapshot/restore + manual ProcessRegistrants
+     * REMOVED in Phase 5. Was working around a perceived FArray::Empty()
+     * race where engine zeroed the registrants before our manual
+     * ProcessRegistrants could run. With Phase 2-fix's allocator
+     * stability, the engine's own ProcessRegistrants + Empty cycle
+     * should complete naturally. */
 
     static int patched_ut_listdel = 0;
     if (!patched_ut_listdel) {
