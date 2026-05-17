@@ -2380,10 +2380,12 @@ uint64_t compat32_dispatch(uint32_t thunk_idx, uint32_t *stack_args)
             }
             if (filled) {
                 static uint32_t total_filled = 0;
+                static uint32_t last_logged_total = 0;
                 total_filled += filled;
-                static int log_count = 0;
-                if (log_count < 6) {
-                    log_count++;
+                /* Log every +100 NULLs filled so we can see growth. */
+                if (total_filled - last_logged_total >= 100 ||
+                    last_logged_total == 0) {
+                    last_logged_total = total_filled;
                     serial_puts("[FNAME-NULL-FILL] filled ");
                     serial_putdec((uint64_t)filled);
                     serial_puts(" NULL slots (cumulative=");
