@@ -976,24 +976,26 @@ int winexec_run(const uint8_t *file_data, uint64_t file_size)
                           "FMW-pool@40010700-Next") == 0) {
                 serial_puts("[winexec] HWBP slot 2 armed at Pool+0x18 WRITE\n");
             }
-            /* Slot 3: WRITE on Pool@0x40010200 Next + PrevLink fields
-             * (LEN_8 covers 0x40010218..0x4001021F = both fields).
+            /* Slot 3: EXECUTE on 0x10902B2D — the step 4 instruction
+             * of T7's inline Link (`mov [eax], ecx`, where eax=&Before
+             * and ecx=this). Phase 2c proved execution reaches past
+             * this point (hit 7 at 0x10902BAC) but slot 1 (Table head
+             * WRITE) did NOT fire — so either EAX was not 0x1092F88C
+             * here, or HWBP missed it.
              *
-             * Phase 2b found T7's Link is PARTIAL — step 1 runs (writes
-             * Pool@0x40010700.PrevLink) but step 4 never writes Table
-             * head. Need to narrow where execution stops:
-             *   step 2 = Pool@0x40010200.Next write at 0x40010218
-             *   step 3 = Pool@0x40010200.PrevLink write at 0x4001021C
-             * If we see neither: fault before step 2.
-             * If we see step 2 only: fault between step 2 and step 3.
-             * If we see step 3 too: fault between step 3 and step 4.
+             * Phase 2d: HWBP_EXECUTE fires BEFORE the instruction —
+             * we capture the actual EAX (target address) and ECX
+             * (value to write). If EAX != 0x1092F88C, we know step 4
+             * wrote somewhere else and slot 1 was correctly silent.
+             * If EAX == 0x1092F88C, then slot 1 missed a real write,
+             * indicating an HWBP coverage bug.
              *
-             * Retired Pool@0x40010700.PrevLink WRITE — its 3 writes
-             * (kernel zero, Link@0x109021DC, Link@0x10902B10) are
-             * captured in commit 07ba285. */
-            if (hwbp_set(3, 0x40010218ULL, /*HWBP_WRITE*/1, /*HWBP_LEN_8*/2,
-                          "FMW-pool@40010200-Next+PrevLink") == 0) {
-                serial_puts("[winexec] HWBP slot 3 armed at Pool@0x40010200+0x18 WRITE LEN_8\n");
+             * Retired Pool@0x40010200 dual-WRITE (7 hits captured in
+             * 52b6b51). Slot name "FMW-step4-prefire" routes through
+             * the is_write_probe path (logs every hit). */
+            if (hwbp_set(3, 0x10902B2DULL, /*HWBP_EXECUTE*/0, /*HWBP_LEN_1*/0,
+                          "FMW-step4-prefire") == 0) {
+                serial_puts("[winexec] HWBP slot 3 armed at step4 prefire\n");
             }
         }
 
