@@ -2,12 +2,16 @@
  * ocsp.c — RFC 6960 OCSP client.
  *
  * Builds and POSTs an OCSPRequest, then parses the response to
- * extract the certStatus tag for the requested cert.  Signature
- * verification on the BasicOCSPResponse is NOT performed yet —
- * documented in ocsp.h.  Threat model: pin-anchored chain
- * validation already gives us confidence in the cert+key; OCSP
- * adds revocation freshness, but a forged "good" response from
- * a non-CA-signing actor would still need our pin check to fail.
+ * extract the certStatus tag for the requested cert.  RFC 6960
+ * §4.2.2.2 signature verification IS performed: hash the captured
+ * tbsResponseData TLV, dispatch by signatureAlgorithm (RSA-SHA256
+ * or ECDSA-P256-SHA256), and verify against the responder cert
+ * (delegated signer when `certs [0]` is present and its issuer DN
+ * matches the target cert's issuer DN — RFC 6960 §4.2.2.2 same-CA
+ * constraint — otherwise against the issuer cert directly).
+ * Verify failures are logged ([OCSP] sig verify: ...) and reported
+ * back to the caller, but the parsed certStatus is still returned
+ * — tls13.c decides whether to abort on verify failure.
  *
  * Request wire format:
  *
@@ -42,6 +46,14 @@ extern void serial_puts(const char *s);
 extern void serial_putdec(uint64_t v);
 
 extern void sha1(const void *data, uint32_t len, uint8_t digest[20]);
+extern void sha256(const uint8_t *data, uint32_t len, uint8_t out[32]);
+extern int  ecdsa_p256_verify(const uint8_t pub_x[32], const uint8_t pub_y[32],
+                              const uint8_t hash[32],
+                              const uint8_t *sig, uint32_t sig_len);
+extern int  rsa_pkcs1_v15_sha256_verify(const uint8_t *sig, uint32_t sig_len,
+                                         const uint8_t *n,   uint32_t n_len,
+                                         const uint8_t *e,   uint32_t e_len,
+                                         const uint8_t hash[32]);
 
 /* http_plain.c */
 extern int http_plain_post(const char *url, const char *content_type,
@@ -204,7 +216,59 @@ static int der_skip_loc(const uint8_t **p, const uint8_t *end) {
     return 0;
 }
 
-static ocsp_status_t parse_ocsp_response(const uint8_t *body, uint32_t body_len)
+/* Compare two byte ranges. Returns 0 on equality, nonzero otherwise. */
+static int ocsp_memeq(const uint8_t *a, uint32_t a_len,
+                      const uint8_t *b, uint32_t b_len)
+{
+    if (a_len != b_len) return 1;
+    for (uint32_t i = 0; i < a_len; i++) if (a[i] != b[i]) return 1;
+    return 0;
+}
+
+/* OIDs used by sigAlg dispatch — match the encodings in x509.c.  Note
+ * we match against the bare OID TLV (tag 0x06 + length + value). */
+static const uint8_t OCSP_OID_SHA256_RSA[] = {
+    0x06, 0x09, 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x0B
+};
+static const uint8_t OCSP_OID_ECDSA_SHA256[] = {
+    0x06, 0x08, 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x03, 0x02
+};
+
+typedef enum {
+    OCSP_SIG_UNKNOWN = 0,
+    OCSP_SIG_RSA_SHA256,
+    OCSP_SIG_ECDSA_P256_SHA256,
+} ocsp_sig_alg_t;
+
+/* Parsed material needed to verify the BasicOCSPResponse signature. */
+typedef struct {
+    const uint8_t *tbs;       uint32_t tbs_len;       /* tbsResponseData TLV */
+    ocsp_sig_alg_t alg;
+    const uint8_t *sig;       uint32_t sig_len;       /* raw sig bytes */
+    const uint8_t *signer;    uint32_t signer_len;    /* delegate signer cert DER, or NULL */
+} ocsp_verify_material_t;
+
+/* Recognize a signatureAlgorithm AlgorithmIdentifier.  Receives a
+ * pointer at the OUTER SEQUENCE tag and its length. */
+static ocsp_sig_alg_t ocsp_recognize_sigalg(const uint8_t *p, uint32_t len)
+{
+    const uint8_t *end = p + len;
+    const uint8_t *body_end;
+    if (der_enter_loc(&p, end, 0x30, &body_end) < 0) return OCSP_SIG_UNKNOWN;
+    uint32_t avail = (uint32_t)(body_end - p);
+    if (avail >= sizeof OCSP_OID_SHA256_RSA &&
+        ocsp_memeq(p, sizeof OCSP_OID_SHA256_RSA,
+                   OCSP_OID_SHA256_RSA, sizeof OCSP_OID_SHA256_RSA) == 0)
+        return OCSP_SIG_RSA_SHA256;
+    if (avail >= sizeof OCSP_OID_ECDSA_SHA256 &&
+        ocsp_memeq(p, sizeof OCSP_OID_ECDSA_SHA256,
+                   OCSP_OID_ECDSA_SHA256, sizeof OCSP_OID_ECDSA_SHA256) == 0)
+        return OCSP_SIG_ECDSA_P256_SHA256;
+    return OCSP_SIG_UNKNOWN;
+}
+
+static ocsp_status_t parse_ocsp_response(const uint8_t *body, uint32_t body_len,
+                                         ocsp_verify_material_t *vm)
 {
     /* Diagnostic dump of the first 16 bytes — useful for debugging
      * parser mismatches against new responders. */
@@ -254,9 +318,14 @@ static ocsp_status_t parse_ocsp_response(const uint8_t *body, uint32_t body_len)
     /* BasicOCSPResponse SEQUENCE { tbsResponseData, sigAlg, sig BIT STRING, certs? } */
     const uint8_t *basic_end;
     if (der_enter_loc(&p, p + os_len, 0x30, &basic_end) < 0) return OCSP_ERROR;
-    /* ResponseData SEQUENCE { version?, responderID, producedAt, responses, ext? } */
+    /* ResponseData SEQUENCE { version?, responderID, producedAt, responses, ext? }
+     * — capture the full tbsResponseData TLV (including its outer tag+length)
+     * because that's what the responder hashed. */
+    const uint8_t *tbs_start = p;
     const uint8_t *rd_end;
     if (der_enter_loc(&p, basic_end, 0x30, &rd_end) < 0) return OCSP_ERROR;
+    uint32_t tbs_len = (uint32_t)(rd_end - tbs_start);
+    if (vm) { vm->tbs = tbs_start; vm->tbs_len = tbs_len; }
     /* Skip optional version [0]. */
     if (p < rd_end && p[0] == 0xA0)
         if (der_skip_loc(&p, rd_end) < 0) return OCSP_ERROR;
@@ -279,15 +348,151 @@ static ocsp_status_t parse_ocsp_response(const uint8_t *body, uint32_t body_len)
      * 0x82=unknown (NULL). */
     if (p >= sr_end) return OCSP_ERROR;
     uint8_t status_tag = *p;
+    ocsp_status_t status;
     switch (status_tag) {
-    case 0x80: return OCSP_GOOD;
-    case 0xA1: return OCSP_REVOKED;
-    case 0x82: return OCSP_UNKNOWN;
+    case 0x80: status = OCSP_GOOD;    break;
+    case 0xA1: status = OCSP_REVOKED; break;
+    case 0x82: status = OCSP_UNKNOWN; break;
     default:
         serial_puts("[OCSP] unknown certStatus tag 0x");
         serial_putdec((uint64_t)status_tag); serial_puts("\n");
         return OCSP_ERROR;
     }
+
+    /* If the caller doesn't need verify material we're done. */
+    if (!vm) return status;
+
+    /* Resume at end of tbsResponseData (rd_end) to parse sigAlg/sig/certs. */
+    p = rd_end;
+
+    /* signatureAlgorithm AlgorithmIdentifier (SEQUENCE). */
+    if (p >= basic_end || *p != 0x30) return status;   /* malformed but status known */
+    const uint8_t *sa_start = p;
+    const uint8_t *sa_end;
+    if (der_enter_loc(&p, basic_end, 0x30, &sa_end) < 0) return status;
+    vm->alg = ocsp_recognize_sigalg(sa_start, (uint32_t)(sa_end - sa_start));
+    p = sa_end;
+
+    /* signature BIT STRING. */
+    if (p >= basic_end || *p != 0x03) return status;
+    p++;
+    uint32_t bs_len;
+    if (der_read_len_loc(&p, basic_end, &bs_len) < 0) return status;
+    if (p + bs_len > basic_end || bs_len < 1) return status;
+    if (*p != 0x00) return status;                    /* unused-bits must be 0 */
+    vm->sig     = p + 1;
+    vm->sig_len = bs_len - 1;
+    p += bs_len;
+
+    /* certs [0] EXPLICIT SEQUENCE OF Certificate OPTIONAL — capture
+     * the FIRST embedded cert if present. */
+    if (p < basic_end && *p == 0xA0) {
+        const uint8_t *certs_explicit_end;
+        if (der_enter_loc(&p, basic_end, 0xA0, &certs_explicit_end) == 0) {
+            const uint8_t *certs_seq_end;
+            if (der_enter_loc(&p, certs_explicit_end, 0x30, &certs_seq_end) == 0) {
+                /* First Certificate is itself a SEQUENCE.  Capture its
+                 * full TLV (tag+length+body) — that's what x509 helpers
+                 * expect. */
+                if (p < certs_seq_end && *p == 0x30) {
+                    const uint8_t *c_start = p;
+                    const uint8_t *c_end;
+                    if (der_enter_loc(&p, certs_seq_end, 0x30, &c_end) == 0) {
+                        vm->signer     = c_start;
+                        vm->signer_len = (uint32_t)(c_end - c_start);
+                    }
+                }
+            }
+        }
+    }
+
+    return status;
+}
+
+/* RFC 6960 §4.2.2.2 — verify the responder signature over
+ * tbsResponseData using the delegate signer cert (if present) or the
+ * issuer cert directly.  When a delegate cert is embedded we sanity-
+ * check that its issuer DN matches the issuer DN of the cert being
+ * status-checked — same-CA constraint, since RFC 6960 §4.2.2.2
+ * requires the OCSP signer be either the issuer itself or a cert
+ * directly issued by the same CA.
+ *
+ * Returns 0 on verified, -1 on any failure (logged but non-fatal —
+ * the caller in tls13.c decides policy). */
+static int ocsp_verify_sig(const ocsp_verify_material_t *vm,
+                           const uint8_t *cert,    uint32_t cert_len,
+                           const uint8_t *issuer,  uint32_t issuer_len)
+{
+    if (!vm || !vm->tbs || !vm->sig || vm->alg == OCSP_SIG_UNKNOWN) {
+        serial_puts("[OCSP] sig verify: FAIL (no material / unsupported alg)\n");
+        return -1;
+    }
+
+    /* Decide whether to verify under the issuer's own key or the
+     * embedded delegate signer cert's key. */
+    const uint8_t *signer_cert     = issuer;
+    uint32_t       signer_cert_len = issuer_len;
+
+    if (vm->signer && vm->signer_len > 0) {
+        /* Same-CA constraint: responder cert's issuer DN must equal
+         * the issuer DN of the cert we're checking. */
+        const uint8_t *resp_issuer_dn,  *target_issuer_dn;
+        uint32_t       resp_issuer_len,  target_issuer_len;
+        if (x509_get_issuer_der(vm->signer, vm->signer_len,
+                                &resp_issuer_dn, &resp_issuer_len) < 0 ||
+            x509_get_issuer_der(cert, cert_len,
+                                &target_issuer_dn, &target_issuer_len) < 0) {
+            serial_puts("[OCSP] sig verify: FAIL (delegate-signer DN parse)\n");
+            return -1;
+        }
+        if (ocsp_memeq(resp_issuer_dn,  resp_issuer_len,
+                       target_issuer_dn, target_issuer_len) != 0) {
+            serial_puts("[OCSP] sig verify: FAIL (delegate-signer issuer DN mismatch)\n");
+            return -1;
+        }
+        signer_cert     = vm->signer;
+        signer_cert_len = vm->signer_len;
+        serial_puts("[OCSP] using embedded delegate signer cert\n");
+    }
+
+    /* Hash the captured tbsResponseData with SHA-256 (only hash
+     * supported by our dispatch table). */
+    uint8_t digest[32];
+    sha256(vm->tbs, vm->tbs_len, digest);
+
+    int rc = -1;
+    if (vm->alg == OCSP_SIG_ECDSA_P256_SHA256) {
+        uint8_t qx[32], qy[32];
+        if (x509_extract_ec_pubkey(signer_cert, signer_cert_len, qx, qy) < 0) {
+            serial_puts("[OCSP] sig verify: FAIL (signer EC pubkey extract)\n");
+            return -1;
+        }
+        rc = ecdsa_p256_verify(qx, qy, digest, vm->sig, vm->sig_len);
+        if (rc != 0) {
+            serial_puts("[OCSP] sig verify: FAIL (ECDSA-P256-SHA256)\n");
+            return -1;
+        }
+    } else if (vm->alg == OCSP_SIG_RSA_SHA256) {
+        const uint8_t *n, *e;
+        uint32_t       n_len, e_len;
+        if (x509_extract_rsa_pubkey(signer_cert, signer_cert_len,
+                                    &n, &n_len, &e, &e_len) < 0) {
+            serial_puts("[OCSP] sig verify: FAIL (signer RSA pubkey extract)\n");
+            return -1;
+        }
+        rc = rsa_pkcs1_v15_sha256_verify(vm->sig, vm->sig_len,
+                                          n, n_len, e, e_len, digest);
+        if (rc != 0) {
+            serial_puts("[OCSP] sig verify: FAIL (RSA-PKCS1-SHA256)\n");
+            return -1;
+        }
+    } else {
+        serial_puts("[OCSP] sig verify: FAIL (unsupported sigalg)\n");
+        return -1;
+    }
+
+    serial_puts("[OCSP] sig verify: OK\n");
+    return 0;
 }
 
 ocsp_status_t ocsp_check(const uint8_t *cert, uint32_t cert_len,
@@ -322,5 +527,13 @@ ocsp_status_t ocsp_check(const uint8_t *cert, uint32_t cert_len,
     serial_puts("[OCSP] response "); serial_putdec((uint64_t)resp_len);
     serial_puts(" bytes\n");
 
-    return parse_ocsp_response(resp_buf, (uint32_t)resp_len);
+    ocsp_verify_material_t vm = { 0 };
+    ocsp_status_t st = parse_ocsp_response(resp_buf, (uint32_t)resp_len, &vm);
+    if (st == OCSP_ERROR) return st;
+
+    /* Verify the responder signature — informative-mode: log result
+     * but don't downgrade the parsed certStatus.  The caller in
+     * tls13.c decides whether to abort on verify failure. */
+    (void)ocsp_verify_sig(&vm, cert, cert_len, issuer, issuer_len);
+    return st;
 }

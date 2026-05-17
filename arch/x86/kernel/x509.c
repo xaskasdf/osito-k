@@ -1349,3 +1349,14 @@ int x509_get_serial_number(const uint8_t *cert, uint32_t cert_len,
     (void)s_tag;
     return 0;
 }
+
+/* Public wrapper around the file-static extract_rsa_pubkey, used by
+ * OCSP responder-signature verification (RFC 6960 §4.2.2) when the
+ * delegated signer cert (or its issuer) carries an RSA SPKI. */
+int x509_extract_rsa_pubkey(const uint8_t *cert, uint32_t cert_len,
+                            const uint8_t **n_out, uint32_t *n_len_out,
+                            const uint8_t **e_out, uint32_t *e_len_out)
+{
+    return extract_rsa_pubkey(cert, cert_len,
+                              n_out, n_len_out, e_out, e_len_out);
+}

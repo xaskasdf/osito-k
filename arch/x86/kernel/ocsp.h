@@ -26,12 +26,14 @@ typedef enum {
  *   OCSP_UNKNOWN  — responder doesn't know about this cert
  *   OCSP_ERROR    — network/parse failure
  *
- * Currently does NOT cryptographically verify the responder's
- * signature on the BasicOCSPResponse — that requires either the
- * issuer key (if delegated) or a OCSP signing cert in the response
- * (which itself needs chain validation).  This is informative-mode;
- * a "revoked" status is logged but not enforced.  Sig verify is
- * tracked as a follow-up. */
+ * The responder's BasicOCSPResponse signature IS verified per RFC
+ * 6960 §4.2.2.2 (RSA-SHA256 / ECDSA-P256-SHA256).  Verification
+ * uses the embedded delegated-signer cert if `certs [0]` is present
+ * and its issuer DN matches the target cert's issuer DN (same-CA
+ * constraint); otherwise it falls back to the issuer cert key.
+ * Verify failures emit "[OCSP] sig verify: FAIL (<reason>)" to
+ * serial but do not change the returned status — tls13.c decides
+ * whether to enforce. */
 ocsp_status_t ocsp_check(const uint8_t *cert,    uint32_t cert_len,
                          const uint8_t *issuer,  uint32_t issuer_len);
 

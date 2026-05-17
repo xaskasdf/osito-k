@@ -205,4 +205,13 @@ int x509_get_subject_pubkey_bits(const uint8_t *cert, uint32_t cert_len,
 int x509_get_serial_number(const uint8_t *cert, uint32_t cert_len,
                            const uint8_t **out_ptr, uint32_t *out_len);
 
+/* Extract an RSA public key (modulus + exponent) from a cert's SPKI.
+ * On success the returned pointers point INTO the cert buffer, so the
+ * cert must remain valid for the lifetime of any verify call.  Returns
+ * 0 on success, -1 if the cert is malformed or the SPKI is not RSA
+ * (or the modulus is not exactly 256 bytes / RSA-2048). */
+int x509_extract_rsa_pubkey(const uint8_t *cert, uint32_t cert_len,
+                            const uint8_t **n_out, uint32_t *n_len_out,
+                            const uint8_t **e_out, uint32_t *e_len_out);
+
 #endif
