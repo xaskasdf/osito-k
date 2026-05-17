@@ -2767,7 +2767,7 @@ uint64_t compat32_dispatch(uint32_t thunk_idx, uint32_t *stack_args)
             serial_puthex((uint64_t)grd, 8);
             if (data_changed) serial_puts(" [Data-CHANGED]");
             serial_puts("\n");
-            uint32_t to_dump = grn > 30 ? 30 : grn;
+            uint32_t to_dump = grn > 20 ? 20 : grn;
             uint32_t *slots = (uint32_t *)(uintptr_t)grd;
             for (uint32_t i = 0; i < to_dump; i++) {
                 uint32_t uobj = slots[i];
@@ -2775,27 +2775,33 @@ uint64_t compat32_dispatch(uint32_t thunk_idx, uint32_t *stack_args)
                 serial_putdec((uint64_t)i);
                 serial_puts("] UObj=0x");
                 serial_puthex((uint64_t)uobj, 8);
-                /* Read FName index at UObj+0x20. */
-                if (uobj >= 0x01000000) {
-                    uint32_t fname_idx = *(volatile uint32_t *)(uintptr_t)(uobj + 0x20);
-                    serial_puts(" FName.Idx=");
-                    serial_putdec((uint64_t)fname_idx);
-                    if (names_data && fname_idx < names_num) {
-                        uint32_t *fname_slots = (uint32_t *)(uintptr_t)names_data;
-                        uint32_t entry = fname_slots[fname_idx];
-                        if (entry >= 0x01000000) {
-                            uint16_t *name = (uint16_t *)(uintptr_t)(entry + 0xC);
-                            serial_puts(" Name=L\"");
-                            for (int c = 0; c < 24; c++) {
-                                uint16_t ch = name[c];
-                                if (ch == 0) break;
-                                if (ch >= 0x20 && ch < 0x7F) {
-                                    char b[2] = { (char)ch, 0 };
-                                    serial_puts(b);
-                                } else { serial_puts("?"); }
-                            }
-                            serial_puts("\"");
+                /* Sweep offsets 0..0x40 looking for valid FName.Index
+                 * (small value pointing to a populated Names slot). */
+                if (uobj >= 0x01000000 && names_data) {
+                    uint32_t *fname_slots = (uint32_t *)(uintptr_t)names_data;
+                    for (int off = 0x10; off <= 0x40; off += 4) {
+                        uint32_t v = *(volatile uint32_t *)(uintptr_t)(uobj + off);
+                        if (v >= names_num) continue;
+                        uint32_t entry = fname_slots[v];
+                        if (entry < 0x01000000) continue;
+                        uint16_t *name = (uint16_t *)(uintptr_t)(entry + 0xC);
+                        /* Check name is plausibly ASCII-letters first char. */
+                        uint16_t ch0 = name[0];
+                        if (ch0 < 'A' || ch0 > 'Z') continue;
+                        serial_puts(" +0x");
+                        serial_puthex((uint64_t)off, 2);
+                        serial_puts("=FName(");
+                        serial_putdec((uint64_t)v);
+                        serial_puts(")=L\"");
+                        for (int c = 0; c < 20; c++) {
+                            uint16_t ch = name[c];
+                            if (ch == 0) break;
+                            if (ch >= 0x20 && ch < 0x7F) {
+                                char b[2] = { (char)ch, 0 };
+                                serial_puts(b);
+                            } else { serial_puts("?"); break; }
                         }
+                        serial_puts("\"");
                     }
                 }
                 serial_puts("\n");
