@@ -2325,8 +2325,16 @@ uint64_t compat32_dispatch(uint32_t thunk_idx, uint32_t *stack_args)
                     *(volatile uint32_t *)(q + 0)  = 0;        /* Index */
                     *(volatile uint32_t *)(q + 4)  = 0;        /* HashNext / flags */
                     *(volatile uint32_t *)(q + 8)  = 0;        /* reserved */
-                    /* Name at +0xC, NUL-terminated. */
-                    q[12] = 'N'; q[13] = 'o'; q[14] = 'n'; q[15] = 'e'; q[16] = 0;
+                    /* Name at +0xC. UE1 Unicode builds (UT99) read TCHAR
+                     * as WCHAR (uint16_t LE). Previously wrote ASCII
+                     * "None\0" which got mis-read as UTF-16 -> mojibake
+                     * "Nn" (0x6F4E='??' + 0x656E='??'). Write as proper
+                     * UTF-16 LE. */
+                    q[12] = 'N'; q[13] = 0;
+                    q[14] = 'o'; q[15] = 0;
+                    q[16] = 'n'; q[17] = 0;
+                    q[18] = 'e'; q[19] = 0;
+                    q[20] = 0;   q[21] = 0;  /* L"\0" terminator */
 
                     /* TArray.Data[0] = &none_entry */
                     *(volatile uint32_t *)buf = (uint32_t)(uintptr_t)pool;
