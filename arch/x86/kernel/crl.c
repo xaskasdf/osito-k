@@ -28,10 +28,16 @@
  *       crlEntryExtensions Extensions OPTIONAL } OPTIONAL,
  *     crlExtensions    [0] EXPLICIT Extensions OPTIONAL }
  *
- * The signature on tbsCertList is NOT verified here (informative
- * mode — same posture ocsp.c shipped with).  TODO: thread the
- * issuer cert through and verify with x509_verify_chain_link's
- * primitives.
+ * The signature on tbsCertList IS verified (RFC 5280 §5.1.1 +
+ * §5.2.5) when an issuer cert is plumbed in via
+ * crl_check_revoked_with_issuer: we capture the tbsCertList TLV,
+ * the signatureAlgorithm OID, and the signatureValue BIT STRING
+ * during the parser walk, then dispatch to the matching primitive
+ * (RSA-PKCS1-v1.5-SHA256 or ECDSA-P256-SHA256).  The verify result
+ * is informative — logged via serial_puts but does NOT change the
+ * GOOD/REVOKED return code; the caller decides policy (same posture
+ * as ocsp.c).  The legacy 1-arg variant (crl_check_revoked) skips
+ * signature verification with a SKIPPED log.
  */
 
 #include "../include/types.h"
@@ -47,8 +53,19 @@ extern void  kfree(void *ptr);
 /* http_plain.c */
 extern int http_plain_get(const char *url, uint8_t *out, uint32_t out_cap);
 
-/* sha256 — used to derive the cache filename from the URL. */
+/* sha256 — used both to derive the cache filename from the URL and
+ * to hash tbsCertList before signature verification. */
 extern void sha256(const void *data, uint32_t len, uint8_t digest[32]);
+
+/* Verify primitives (declared in rsa.h / crypto / x509 — extern'd
+ * here to keep crl.c self-contained, matching ocsp.c style). */
+extern int ecdsa_p256_verify(const uint8_t pub_x[32], const uint8_t pub_y[32],
+                             const uint8_t hash[32],
+                             const uint8_t *sig, uint32_t sig_len);
+extern int rsa_pkcs1_v15_sha256_verify(const uint8_t *sig, uint32_t sig_len,
+                                       const uint8_t *n,   uint32_t n_len,
+                                       const uint8_t *e,   uint32_t e_len,
+                                       const uint8_t hash[32]);
 
 /* VFS / osfs2 — match the stub layout used by cert_pin.c. */
 typedef struct {
@@ -117,10 +134,65 @@ static int serial_equal(const uint8_t *a, uint32_t alen,
     return 1;
 }
 
+/* ── Signature-algorithm recognition ─────────────────────────── */
+
+typedef enum {
+    CRL_SIG_UNKNOWN = 0,
+    CRL_SIG_RSA_SHA256,
+    CRL_SIG_ECDSA_P256_SHA256,
+} crl_sig_alg_t;
+
+/* Bare OID TLVs (tag 0x06 + length + value), matching the encodings
+ * used by ocsp.c and x509.c.  RSA-with-SHA256 = 1.2.840.113549.1.1.11,
+ * ECDSA-with-SHA256 = 1.2.840.10045.4.3.2. */
+static const uint8_t CRL_OID_SHA256_RSA[] = {
+    0x06, 0x09, 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x0B
+};
+static const uint8_t CRL_OID_ECDSA_SHA256[] = {
+    0x06, 0x08, 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x03, 0x02
+};
+
+static int crl_memeq(const uint8_t *a, uint32_t a_len,
+                     const uint8_t *b, uint32_t b_len)
+{
+    if (a_len != b_len) return 1;
+    for (uint32_t i = 0; i < a_len; i++) if (a[i] != b[i]) return 1;
+    return 0;
+}
+
+/* Recognize the AlgorithmIdentifier sitting at the OUTER SEQUENCE
+ * (`p` points at tag 0x30, `len` is the full TLV length). */
+static crl_sig_alg_t crl_recognize_sigalg(const uint8_t *p, uint32_t len)
+{
+    const uint8_t *end = p + len;
+    const uint8_t *body_end;
+    if (der_enter(&p, end, 0x30, &body_end) < 0) return CRL_SIG_UNKNOWN;
+    uint32_t avail = (uint32_t)(body_end - p);
+    if (avail >= sizeof CRL_OID_SHA256_RSA &&
+        crl_memeq(p, sizeof CRL_OID_SHA256_RSA,
+                  CRL_OID_SHA256_RSA, sizeof CRL_OID_SHA256_RSA) == 0)
+        return CRL_SIG_RSA_SHA256;
+    if (avail >= sizeof CRL_OID_ECDSA_SHA256 &&
+        crl_memeq(p, sizeof CRL_OID_ECDSA_SHA256,
+                  CRL_OID_ECDSA_SHA256, sizeof CRL_OID_ECDSA_SHA256) == 0)
+        return CRL_SIG_ECDSA_P256_SHA256;
+    return CRL_SIG_UNKNOWN;
+}
+
+/* Parsed material needed to verify the CRL signature over tbsCertList. */
+typedef struct {
+    const uint8_t *tbs;     uint32_t tbs_len;   /* tbsCertList TLV */
+    crl_sig_alg_t  alg;
+    const uint8_t *sig;     uint32_t sig_len;   /* BIT STRING body sans unused-bits byte */
+} crl_verify_material_t;
+
 /* ── CRL parser ──────────────────────────────────────────────── */
 
-int crl_parse_and_check(const uint8_t *crl, uint32_t crl_len,
-                        const uint8_t *serial, uint32_t serial_len)
+/* Internal parser that ALSO captures verify material when `vm` is
+ * non-NULL.  The public crl_parse_and_check() is a thin wrapper. */
+static int crl_parse_and_check_vm(const uint8_t *crl, uint32_t crl_len,
+                                  const uint8_t *serial, uint32_t serial_len,
+                                  crl_verify_material_t *vm)
 {
     const uint8_t *p = crl;
     const uint8_t *end = crl + crl_len;
@@ -131,11 +203,46 @@ int crl_parse_and_check(const uint8_t *crl, uint32_t crl_len,
         serial_puts("[CRL] bad outer SEQUENCE\n");
         return CRL_ERROR;
     }
-    /* tbsCertList SEQUENCE */
+    /* tbsCertList SEQUENCE — capture its full TLV (tag+length+body)
+     * because that's what the issuer signed. */
+    const uint8_t *tbs_start = p;
     const uint8_t *tbs_end;
     if (der_enter(&p, list_end, 0x30, &tbs_end) < 0) {
         serial_puts("[CRL] bad TBSCertList\n");
         return CRL_ERROR;
+    }
+    if (vm) {
+        vm->tbs     = tbs_start;
+        vm->tbs_len = (uint32_t)(tbs_end - tbs_start);
+        vm->alg     = CRL_SIG_UNKNOWN;
+        vm->sig     = NULL;
+        vm->sig_len = 0;
+
+        /* Sniff signatureAlgorithm + signatureValue siblings of
+         * tbsCertList (they live between tbs_end and list_end).
+         * Walk a separate cursor so the revoked-list parser below
+         * keeps using `p` from inside tbsCertList. */
+        const uint8_t *q = tbs_end;
+        if (q < list_end && *q == 0x30) {
+            const uint8_t *sa_start = q;
+            const uint8_t *sa_end;
+            if (der_enter(&q, list_end, 0x30, &sa_end) == 0) {
+                vm->alg = crl_recognize_sigalg(
+                    sa_start, (uint32_t)(sa_end - sa_start));
+                q = sa_end;
+                /* signatureValue BIT STRING */
+                if (q < list_end && *q == 0x03) {
+                    q++;
+                    uint32_t bs_len;
+                    if (der_read_len(&q, list_end, &bs_len) == 0 &&
+                        q + bs_len <= list_end && bs_len >= 1 &&
+                        *q == 0x00) {
+                        vm->sig     = q + 1;
+                        vm->sig_len = bs_len - 1;
+                    }
+                }
+            }
+        }
     }
     /* Optional version INTEGER (v2 = 1).  If present, the first
      * tag inside TBSCertList is 0x02. */
@@ -199,6 +306,70 @@ int crl_parse_and_check(const uint8_t *crl, uint32_t crl_len,
     serial_putdec((uint64_t)scanned);
     serial_puts(" entries)\n");
     return CRL_GOOD;
+}
+
+/* Public thin wrapper — preserves the original signature. */
+int crl_parse_and_check(const uint8_t *crl, uint32_t crl_len,
+                        const uint8_t *serial, uint32_t serial_len)
+{
+    return crl_parse_and_check_vm(crl, crl_len, serial, serial_len, NULL);
+}
+
+/* ── CRL signature verification (RFC 5280 §5.1.1 + §5.2.5) ────
+ *
+ * The signer of a CRL is normally the issuer CA itself: the CRL's
+ * `issuer` field equals the cert's `issuer` DN, and the signature
+ * is produced with the issuer's private key.  We therefore extract
+ * the pubkey from `issuer_der` and dispatch by sigAlg.
+ *
+ * Returns 0 on verified, -1 on any failure.  Caller treats result
+ * as informative — the GOOD/REVOKED status from the parser stands
+ * regardless.  Logs an [CRL] sig verify: line in every case. */
+static int crl_verify_sig(const crl_verify_material_t *vm,
+                          const uint8_t *issuer_der, uint32_t issuer_len)
+{
+    if (!issuer_der || issuer_len == 0) {
+        serial_puts("[CRL] sig verify: SKIPPED (no issuer)\n");
+        return -1;
+    }
+    if (!vm || !vm->tbs || !vm->sig || vm->alg == CRL_SIG_UNKNOWN) {
+        serial_puts("[CRL] sig verify: FAIL (no material / unsupported alg)\n");
+        return -1;
+    }
+
+    uint8_t digest[32];
+    sha256(vm->tbs, vm->tbs_len, digest);
+
+    if (vm->alg == CRL_SIG_ECDSA_P256_SHA256) {
+        uint8_t qx[32], qy[32];
+        if (x509_extract_ec_pubkey(issuer_der, issuer_len, qx, qy) < 0) {
+            serial_puts("[CRL] sig verify: FAIL (issuer EC pubkey extract)\n");
+            return -1;
+        }
+        if (ecdsa_p256_verify(qx, qy, digest, vm->sig, vm->sig_len) != 0) {
+            serial_puts("[CRL] sig verify: FAIL (ECDSA-P256-SHA256)\n");
+            return -1;
+        }
+    } else if (vm->alg == CRL_SIG_RSA_SHA256) {
+        const uint8_t *n, *e;
+        uint32_t       n_len, e_len;
+        if (x509_extract_rsa_pubkey(issuer_der, issuer_len,
+                                    &n, &n_len, &e, &e_len) < 0) {
+            serial_puts("[CRL] sig verify: FAIL (issuer RSA pubkey extract)\n");
+            return -1;
+        }
+        if (rsa_pkcs1_v15_sha256_verify(vm->sig, vm->sig_len,
+                                         n, n_len, e, e_len, digest) != 0) {
+            serial_puts("[CRL] sig verify: FAIL (RSA-PKCS1-SHA256)\n");
+            return -1;
+        }
+    } else {
+        serial_puts("[CRL] sig verify: FAIL (unsupported sigalg)\n");
+        return -1;
+    }
+
+    serial_puts("[CRL] sig verify: OK\n");
+    return 0;
 }
 
 /* ── Cache filename derivation ───────────────────────────────── */
@@ -275,7 +446,8 @@ static void persist_crl(const char *path,
  * kernel heap which auto-grows. */
 #define CRL_MAX_BYTES   (4u * 1024u * 1024u)
 
-int crl_check_revoked(const uint8_t *cert_der, uint32_t cert_len)
+static int crl_check_revoked_impl(const uint8_t *cert_der,    uint32_t cert_len,
+                                  const uint8_t *issuer_der,  uint32_t issuer_len)
 {
     const uint8_t *serial_ptr;
     uint32_t serial_len;
@@ -328,14 +500,32 @@ int crl_check_revoked(const uint8_t *cert_der, uint32_t cert_len)
         persist_crl(cache_path, crl_buf, crl_len);
     }
 
-    int rc = crl_parse_and_check(crl_buf, crl_len,
-                                 serial_copy, scopy_len);
-    kfree(crl_buf);
+    crl_verify_material_t vm = { 0 };
+    int rc = crl_parse_and_check_vm(crl_buf, crl_len,
+                                    serial_copy, scopy_len, &vm);
 
-    /* Informative-mode reminder: sig over tbsCertList not verified. */
-    if (rc == CRL_REVOKED) {
-        serial_puts("[CRL] WARNING informative mode — "
-                    "tbsCertList signature unverified\n");
+    /* Signature verification (RFC 5280 §5.1.1 + §5.2.5).  Informative:
+     * log pass/fail but don't override the GOOD/REVOKED status.  The
+     * caller in tls13.c / cert chain validation decides whether to
+     * treat a verify failure as fatal.  vm.tbs/sig point into crl_buf,
+     * so verify MUST run before kfree. */
+    if (rc != CRL_ERROR) {
+        (void)crl_verify_sig(&vm, issuer_der, issuer_len);
     }
+
+    kfree(crl_buf);
     return rc;
+}
+
+/* Legacy 1-arg variant — skips signature verification (logs SKIPPED). */
+int crl_check_revoked(const uint8_t *cert_der, uint32_t cert_len)
+{
+    return crl_check_revoked_impl(cert_der, cert_len, NULL, 0);
+}
+
+/* Full verification variant — pass the issuer cert DER. */
+int crl_check_revoked_with_issuer(const uint8_t *cert_der,   uint32_t cert_len,
+                                  const uint8_t *issuer_der, uint32_t issuer_len)
+{
+    return crl_check_revoked_impl(cert_der, cert_len, issuer_der, issuer_len);
 }

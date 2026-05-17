@@ -14,12 +14,15 @@
  *  - Bigger payload than OCSP (KBs to MBs vs ~hundreds of bytes).
  *  - Coarser freshness (CRLs typically refresh every 24h-7d).
  *
- * Like ocsp.c, this is informative-mode for now: the CRL signature
- * over tbsCertList is NOT verified.  A forged CRL claiming
- * everything is revoked would cause us to reject good certs; a
- * forged CRL omitting a revocation would be invisible to us.
- * The cert-pin layer + chain validation are still our primary
- * authority; CRL is freshness on top.
+ * RFC 5280 §5.1.1 + §5.2.5 signature verification: when an issuer
+ * cert is plumbed through `crl_check_revoked_with_issuer`, the CRL
+ * parser captures the tbsCertList TLV, signatureAlgorithm OID, and
+ * the signatureValue BIT STRING, then dispatches to the matching
+ * primitive (RSA-PKCS1-v1.5-SHA256 or ECDSA-P256-SHA256) keyed by
+ * the issuer's SPKI.  Verify result is logged ([CRL] sig verify: ...)
+ * but informative-only — the CRL_GOOD/CRL_REVOKED status is still
+ * returned; the caller decides policy.  The legacy 1-arg variant
+ * (`crl_check_revoked`) skips verification with a SKIPPED log.
  */
 
 #ifndef OSITOA_CRL_H
@@ -48,6 +51,14 @@ typedef enum {
  *
  * Returns CRL_GOOD / CRL_REVOKED / CRL_ERROR. */
 int crl_check_revoked(const uint8_t *cert_der, uint32_t cert_len);
+
+/* Same as crl_check_revoked, plus an issuer cert (DER) used to
+ * verify the CRL signature over tbsCertList (RFC 5280 §5.1.1 +
+ * §5.2.5).  The signature check is informative: pass/fail is
+ * logged but does not change the return code.  If `issuer_der`
+ * is NULL or `issuer_len == 0`, behaves like crl_check_revoked. */
+int crl_check_revoked_with_issuer(const uint8_t *cert_der,   uint32_t cert_len,
+                                  const uint8_t *issuer_der, uint32_t issuer_len);
 
 /* Lower-level entrypoint: given the raw CRL DER and a target
  * serial (big-endian, as it appears in the cert's INTEGER body),
