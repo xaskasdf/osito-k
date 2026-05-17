@@ -641,16 +641,21 @@ int winexec_run(const uint8_t *file_data, uint64_t file_size)
     }
 
     /*
-     * Pre-allocate GObjRegistrants TArray buffer to prevent realloc data loss.
+     * Pre-allocate GObjRegistrants TArray buffer ONLY if dllloader.c didn't
+     * already pre-allocate via Core.dll's DllMain hook (typical case).
      *
-     * Root cause: FMallocWindows::Realloc during TArray growth fails to
-     * preserve existing entries (first 140 entries zeroed after growth from
-     * capacity 140→225). The native memcpy (MSVC intrinsic) loses data,
-     * possibly due to physical page aliasing between identity-mapped kernel
-     * VA and VirtualAlloc-mapped PE VA.
+     * Previous bug: unconditional re-allocation here was DESTRUCTIVE — by
+     * this point Engine.dll/Window.dll/etc. had run their C++ static
+     * initializers and registered UClass entries (UGameEngine etc.) into
+     * GObjRegistrants @ dllloader's buffer (0x01FF6000). Overwriting
+     * tarray[0..2] with a fresh empty buffer (0x01F74000, Num=0) orphaned
+     * those entries. The engine's later ProcessRegistrants then iterated
+     * an empty list → no UClass("GameEngine") registered in GObj →
+     * StaticLoadClass("Engine.GameEngine") fails → "Failed to load
+     * 'None None.GameEngine'" cascade.
      *
-     * Fix: pre-allocate a large buffer for GObjRegistrants before the PE
-     * entry point runs. With enough capacity, the TArray never needs to grow.
+     * Fix: only allocate if tarray[0] is NULL (i.e. dllloader didn't run
+     * yet, e.g. running a PE that doesn't load Core.dll).
      */
     {
         LOADED_MODULE *core = dll_find_module("Core.dll");
@@ -659,27 +664,32 @@ int winexec_run(const uint8_t *file_data, uint64_t file_size)
                 "?GObjRegistrants@UObject@@0V?$TArray@PAVUObject@@@@A", 0, FALSE);
             if (gobjreg_ptr) {
                 uint32_t *tarray = (uint32_t *)gobjreg_ptr;
-                /* Use a page from the PE image range (already identity-mapped
-                 * and accessible from 32-bit compat mode). Allocate 1 page =
-                 * 4096 bytes = room for 1024 UObject* entries (4 bytes each). */
-                void *buf = mem_alloc_pages(1);
-                if (buf) {
-                    uint64_t pa = (uint64_t)buf;
-                    /* Zero via identity-mapped VA (PA == VA for kernel) */
-                    uint8_t *p = (uint8_t *)pa;
-                    for (int i = 0; i < 4096; i++) p[i] = 0;
-
-                    /* The buffer is at PA which is identity-mapped as VA=PA.
-                     * 32-bit PE code can access it since PA < 4GB. */
-                    tarray[0] = (uint32_t)pa;   /* Data pointer */
-                    tarray[1] = 0;              /* Num = 0 */
-                    tarray[2] = 1024;           /* Max = 1024 entries */
-
-                    serial_puts("[WINEXEC] Pre-allocated GObjRegistrants: Data=0x");
-                    serial_puthex(pa, 8);
-                    serial_puts(" Max=1024 @TArray=0x");
-                    serial_puthex((uint64_t)(ULONG_PTR)gobjreg_ptr, 8);
-                    serial_puts("\n");
+                if (tarray[0] == 0) {
+                    /* Not pre-allocated yet — allocate a fallback buffer. */
+                    void *buf = mem_alloc_pages(1);
+                    if (buf) {
+                        uint64_t pa = (uint64_t)buf;
+                        uint8_t *p = (uint8_t *)pa;
+                        for (int i = 0; i < 4096; i++) p[i] = 0;
+                        tarray[0] = (uint32_t)pa;
+                        tarray[1] = 0;
+                        tarray[2] = 1024;
+                        serial_puts("[WINEXEC] Pre-allocated GObjRegistrants (fallback): "
+                                    "Data=0x");
+                        serial_puthex(pa, 8);
+                        serial_puts(" Max=1024 @TArray=0x");
+                        serial_puthex((uint64_t)(ULONG_PTR)gobjreg_ptr, 8);
+                        serial_puts("\n");
+                    }
+                } else {
+                    serial_puts("[WINEXEC] GObjRegistrants already populated by "
+                                "dllloader: Data=0x");
+                    serial_puthex((uint64_t)tarray[0], 8);
+                    serial_puts(" Num=");
+                    serial_putdec((uint64_t)tarray[1]);
+                    serial_puts(" Max=");
+                    serial_putdec((uint64_t)tarray[2]);
+                    serial_puts(" — preserving DLL static-init registrants\n");
                 }
             }
         }

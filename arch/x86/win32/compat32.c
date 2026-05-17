@@ -2562,6 +2562,70 @@ uint64_t compat32_dispatch(uint32_t thunk_idx, uint32_t *stack_args)
             }
         }
         #endif /* DISABLE_NULL_FILL */
+
+        /* FNAME-EDUMP — once-per-state diagnostic of canonical EName slots.
+         * Records what Names[Idx] points to for Idx in {0,20,21,151,...}.
+         * If Names[NAME_Engine=21] points at our None sentinel, that
+         * confirms Core.dll's StaticInit never registered hardcoded names
+         * (or our NULL-FILL pre-empted it). If Names[21] points elsewhere,
+         * it's a valid FNameEntry — log its Name field (offset +0xC) so
+         * we can see whether it says "Engine" or something else. */
+        if (fd != 0 && fn >= 838) {
+            static uint32_t edump_count = 0;
+            static uint32_t last_fn = 0;
+            /* Trigger: first time Num crosses 838, then every 200 dispatches. */
+            if (edump_count == 0 || (edump_count < 20 && fn != last_fn) ||
+                (edump_count % 200) == 0) {
+                static const struct { uint32_t idx; const char *name; } ENAMES[] = {
+                    {  0, "None"   }, { 10, "StructProp" }, { 20, "Core"   },
+                    { 21, "Engine" }, { 22, "Editor"     }, { 81, "Int"    },
+                    { 86, "Struct" }, {100, "Begin"      }, {151, "Object" },
+                    {152, "TxtBuf" }, {500, "<gap500>"   },
+                };
+                serial_puts("[FNAME-EDUMP] #");
+                serial_putdec((uint64_t)edump_count);
+                serial_puts(" Num=");
+                serial_putdec((uint64_t)fn);
+                serial_puts(" none_sentinel=0x");
+                serial_puthex(fname_none_entry, 8);
+                serial_puts("\n");
+                uint32_t *slots = (uint32_t *)(uintptr_t)fd;
+                for (uint32_t e = 0; e < sizeof(ENAMES)/sizeof(ENAMES[0]); e++) {
+                    uint32_t idx = ENAMES[e].idx;
+                    if (idx >= fn) continue;
+                    uint32_t entry = slots[idx];
+                    serial_puts("  Names[");
+                    serial_putdec((uint64_t)idx);
+                    serial_puts("] (");
+                    serial_puts(ENAMES[e].name);
+                    serial_puts(") = 0x");
+                    serial_puthex((uint64_t)entry, 8);
+                    if (entry == 0) {
+                        serial_puts(" NULL\n");
+                    } else if ((uint64_t)entry == fname_none_entry) {
+                        serial_puts(" =NoneSentinel\n");
+                    } else {
+                        /* Try to read +0xC = Name UTF-16 LE (8 bytes = 4 chars). */
+                        uint16_t *name = (uint16_t *)(uintptr_t)(entry + 0xC);
+                        serial_puts(" Name=L\"");
+                        for (int c = 0; c < 16; c++) {
+                            uint16_t ch = name[c];
+                            if (ch == 0) break;
+                            if (ch >= 0x20 && ch < 0x7F) {
+                                char b[2] = { (char)ch, 0 };
+                                serial_puts(b);
+                            } else {
+                                serial_puts("?");
+                            }
+                        }
+                        serial_puts("\"\n");
+                    }
+                }
+                edump_count++;
+                last_fn = fn;
+            }
+        }
+
         (void)fn;
         (void)fname_none_entry;
     }
@@ -2677,6 +2741,113 @@ uint64_t compat32_dispatch(uint32_t thunk_idx, uint32_t *stack_args)
      * ProcessRegistrants could run. With Phase 2-fix's allocator
      * stability, the engine's own ProcessRegistrants + Empty cycle
      * should complete naturally. */
+
+    /* GOBJREG-DIAG — passive observer for GObjRegistrants TArray<UObject*>.
+     * Each entry is a UObject* (4 bytes). UObject::Name (FName) is at
+     * offset +0x20. Dereference to get the FName index, then look up
+     * in FName::Names[Idx] for the FNameEntry, read Name field at +0xC. */
+    {
+        volatile uint32_t *gobjreg = (volatile uint32_t *)(uintptr_t)0x102A0360ULL;
+        uint32_t grd = gobjreg[0], grn = gobjreg[1], grm = gobjreg[2];
+        static uint32_t last_grn = 0xFFFFFFFFu;
+        static uint32_t last_grd = 0;
+        static uint32_t snapshot_count = 0;
+        int data_changed = (grd != last_grd);
+        int num_changed = (grn != last_grn);
+        if (grd != 0 && (data_changed || num_changed) && snapshot_count < 24) {
+            volatile uint32_t *fname_tarray = (volatile uint32_t *)(uintptr_t)0x10295D30;
+            uint32_t names_data = fname_tarray[0], names_num = fname_tarray[1];
+            serial_puts("[GOBJREG-DIAG] Num=");
+            serial_putdec((uint64_t)grn);
+            serial_puts(" (was ");
+            serial_putdec(last_grn == 0xFFFFFFFFu ? 0 : (uint64_t)last_grn);
+            serial_puts(") Max=");
+            serial_putdec((uint64_t)grm);
+            serial_puts(" Data=0x");
+            serial_puthex((uint64_t)grd, 8);
+            if (data_changed) serial_puts(" [Data-CHANGED]");
+            serial_puts("\n");
+            uint32_t to_dump = grn > 30 ? 30 : grn;
+            uint32_t *slots = (uint32_t *)(uintptr_t)grd;
+            for (uint32_t i = 0; i < to_dump; i++) {
+                uint32_t uobj = slots[i];
+                serial_puts("  [");
+                serial_putdec((uint64_t)i);
+                serial_puts("] UObj=0x");
+                serial_puthex((uint64_t)uobj, 8);
+                /* Read FName index at UObj+0x20. */
+                if (uobj >= 0x01000000) {
+                    uint32_t fname_idx = *(volatile uint32_t *)(uintptr_t)(uobj + 0x20);
+                    serial_puts(" FName.Idx=");
+                    serial_putdec((uint64_t)fname_idx);
+                    if (names_data && fname_idx < names_num) {
+                        uint32_t *fname_slots = (uint32_t *)(uintptr_t)names_data;
+                        uint32_t entry = fname_slots[fname_idx];
+                        if (entry >= 0x01000000) {
+                            uint16_t *name = (uint16_t *)(uintptr_t)(entry + 0xC);
+                            serial_puts(" Name=L\"");
+                            for (int c = 0; c < 24; c++) {
+                                uint16_t ch = name[c];
+                                if (ch == 0) break;
+                                if (ch >= 0x20 && ch < 0x7F) {
+                                    char b[2] = { (char)ch, 0 };
+                                    serial_puts(b);
+                                } else { serial_puts("?"); }
+                            }
+                            serial_puts("\"");
+                        }
+                    }
+                }
+                serial_puts("\n");
+            }
+            snapshot_count++;
+            last_grn = grn;
+            last_grd = grd;
+        }
+    }
+
+    /* GOBJREG-FORCE — when GObjRegistrants accumulates >= 100 entries and
+     * stays there, force a manual ProcessRegistrants pass.
+     *
+     * Observed during Phase 7 investigation: after natural ProcessRegistrants
+     * runs, GObjRegistrants stays at Num=200 with Data=0x01F74000 instead
+     * of being cleared (Phase 3 of ProcessRegistrants didn't run). This
+     * means either (a) an exception escaped during Phase 2 (ConditionalRegister
+     * threw on one entry), or (b) the natural call was interrupted between
+     * Phase 2 and Phase 3.
+     *
+     * Either way, the entries that successfully ran Register() are now
+     * properly hashed into GObj. The un-registered ones aren't. Forcing
+     * a SECOND ProcessRegistrants pass:
+     *   - Phase 1 no-ops (GAutoRegister empty)
+     *   - Phase 2 re-iterates the 200 entries; already-registered ones
+     *     skip via the RF_Registered flag check, unregistered ones try
+     *     again
+     *   - Phase 3 clears the array (if no exception)
+     *
+     * Triggered once when Num >= 100 — gives ProcessRegistrants a second
+     * chance to register UClass("GameEngine") and other classes from
+     * Engine.dll's IMPLEMENT_CLASS static initializers. */
+    {
+        volatile uint32_t *gobjreg = (volatile uint32_t *)(uintptr_t)0x102A0360ULL;
+        uint32_t grd = gobjreg[0], grn = gobjreg[1];
+        static int force_done = 0;
+        if (!force_done && grd != 0 && grn >= 100) {
+            force_done = 1;
+            serial_puts("[GOBJREG-FORCE] manual ProcessRegistrants @0x1010190B "
+                        "with Num=");
+            serial_putdec((uint64_t)grn);
+            serial_puts("\n");
+            uint32_t args[1] = { 0 };
+            compat32_callback_args(0x1010190B, 0, args);
+            uint32_t grn_after = gobjreg[1];
+            serial_puts("[GOBJREG-FORCE] returned. Num: ");
+            serial_putdec((uint64_t)grn);
+            serial_puts(" -> ");
+            serial_putdec((uint64_t)grn_after);
+            serial_puts("\n");
+        }
+    }
 
     static int patched_ut_listdel = 0;
     if (!patched_ut_listdel) {
