@@ -108,19 +108,30 @@ int ntp_sync(void)
     serial_putdec(ntp_ip[2]); serial_puts(".");
     serial_putdec(ntp_ip[3]); serial_puts("\n");
 
-    /* Register UDP listener */
-    ntp_got_reply = false;
-    net_udp_listen(12321, (void *)ntp_handler);
-
     /* Build NTP request: Version 4, Mode 3 (client) */
     ntp_packet_t req;
     memset(&req, 0, sizeof(req));
     req.li_vn_mode = 0x23;  /* LI=0, VN=4, Mode=3 */
 
-    /* Send query — retry up to 3 times */
+    /* Send query — retry up to 3 times.  Use a fresh ephemeral source
+     * port per attempt: macOS pf (vmnet-shared) only installs reverse
+     * NAT mappings for the BSD ephemeral range [49152..65535] by default
+     * (and some configs gate on [32768..60999]).  Earlier code pinned
+     * src_port=12321 and the reply silently disappeared in pf.        */
+    extern void random_get_bytes(void *buf, uint32_t len);
+    ntp_got_reply = false;
     for (int attempt = 0; attempt < 3; attempt++) {
         ntp_got_reply = false;
-        if (net_udp_send(ntp_ip, 123, 12321, &req, sizeof(req)) < 0) {
+        uint16_t r;
+        random_get_bytes(&r, sizeof(r));
+        /* Map into [49152, 65535] — IANA-registered ephemeral range,
+         * tightest overlap of Linux/Darwin/BSD defaults.              */
+        uint16_t src_port = 49152 + (uint16_t)(r % (65535 - 49152 + 1));
+        net_udp_listen(src_port, (void *)ntp_handler);
+        serial_puts("[NTP] src_port=");
+        serial_putdec(src_port);
+        serial_puts("\n");
+        if (net_udp_send(ntp_ip, 123, src_port, &req, sizeof(req)) < 0) {
             net_poll();
             continue;
         }

@@ -180,6 +180,52 @@ static uint8_t rx_pkt[2048];
  * SG before adding further chip-side context-descriptor experiments. */
 static uint8_t tx_pkt[2048] __attribute__((aligned(64)));
 
+/* ── Reply-path TX timing experiment (docs/x86-network-stack.md §9) ──
+ *
+ * Hypothesis-A: the USB-Ethernet bridge on the test Mac drops frames
+ * whose TX completion comes within N µs of an RX completion in the
+ * same direction.  Frames sent from shell-thread context (ping)
+ * succeed; frames sent from sched_tick → net_poll → handle_arp/icmp →
+ * eth_send → i211_send do not — even though the I211 reports DD=1 and
+ * GPTC++.  Both paths share the exact same i211_send code.
+ *
+ * Experiment: stamp the TSC at end of the net_poll RX loop, and have
+ * eth_send busy-wait until at least g_tx_post_rx_delay_us microseconds
+ * have elapsed since that stamp.  A shell builtin (`txdelay <us>`)
+ * tweaks the threshold live, so we can sweep [0, 5000] and see if any
+ * delay value flips the reply-path from broken to working.
+ *
+ * If a threshold exists → hypothesis-A confirmed, follow-up: build a
+ * proper deferred-TX queue that runs from the next sched_tick.  If
+ * even 5 ms doesn't help → hypothesis-A refuted; reach for an external
+ * sniffer (hypothesis-B/C).                                          */
+volatile uint32_t g_tx_post_rx_delay_us;
+static volatile uint64_t last_rx_complete_tsc;
+/* TSC ticks per µs — calibrated once at boot, defaults to 3500 for a
+ * ~3.5 GHz CPU when calibration hasn't run yet.  Better-than-nothing
+ * for the experiment; if Phase-2 finds a threshold we'll tighten the
+ * conversion using `cpu_features_tsc_freq()`.                         */
+static uint64_t tsc_per_us = 3500;
+void net_pre_tx_wait(void)
+{
+    if (g_tx_post_rx_delay_us == 0) return;
+    uint64_t deadline = last_rx_complete_tsc +
+                        (uint64_t)g_tx_post_rx_delay_us * tsc_per_us;
+    uint64_t now;
+    do {
+        __asm__ volatile ("pause" ::: "memory");
+        uint32_t lo, hi;
+        __asm__ volatile ("rdtsc" : "=a"(lo), "=d"(hi));
+        now = ((uint64_t)hi << 32) | lo;
+    } while (now < deadline);
+}
+static inline uint64_t net_rdtsc(void)
+{
+    uint32_t lo, hi;
+    __asm__ volatile ("rdtsc" : "=a"(lo), "=d"(hi));
+    return ((uint64_t)hi << 32) | lo;
+}
+
 /* Broadcast MAC */
 static const uint8_t bcast_mac[ETH_ALEN] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 
@@ -281,6 +327,8 @@ static int eth_send(const uint8_t dst[ETH_ALEN], uint16_t ethertype,
         frame_len = 60;
     }
 
+    /* Reply-path TX timing experiment — pace TX after recent RX. */
+    net_pre_tx_wait();
     return nic_send(tx_pkt, frame_len);
 }
 
@@ -754,6 +802,11 @@ void __hot net_poll(void)
         }
         }
     }
+
+    /* Reply-path TX timing experiment — stamp the moment the RX loop
+     * finished so eth_send (called from handle_arp/icmp) can pace its
+     * subsequent TX relative to this point.                            */
+    last_rx_complete_tsc = net_rdtsc();
 
     /* NAPI: ring drained — re-enable RX interrupt if it was the trigger.
      * Sólo el path de I211 expone i211_rx_irq_reenable; en RTL8111 el

@@ -570,6 +570,8 @@ static void cmd_help(void)
     sh_puts("  kexec     Boot a new kernel ELF (kexec [filename])\n");
     sh_puts("  kdownload Fetch a file via OFTP (kdownload <ip> <port> <name> [save|--kexec])\n");
     sh_puts("  kupload   Push a file via OFTP (kupload <ip> <port> <local|--dmesg> [remote])\n");
+    sh_puts("  txdelay   Pace reply-path TX by N µs after last RX (debug)\n");
+    sh_puts("            txdelay [N]  — get/set, see net.c hypothesis-A comment\n");
     sh_puts("  kupdate   Pull + kexec a kernel update via HTTPS\n");
     sh_puts("            (kupdate [host] [path] [--channel <ch>] [--no-kexec])\n");
     sh_puts("            default: https://wasm.naranjositos.tech/k/x86_64/stable/kernel.elf\n");
@@ -3870,6 +3872,25 @@ void shell_exec(char *line)
         extern void i211_print_stats(void) __attribute__((weak));
         if (i211_print_stats) i211_print_stats();
         else sh_puts("nic_stats: i211 not built\n");
+    } else if (strcmp(cmd, "txdelay") == 0) {
+        /* Reply-path TX timing experiment — see net.c hypothesis-A
+         * comment.  `txdelay <us>` paces eth_send() to wait until at
+         * least <us> µs have elapsed since the last RX completion.
+         * `txdelay` with no arg prints the current value.            */
+        extern volatile uint32_t g_tx_post_rx_delay_us;
+        if (argc < 2) {
+            sh_puts("txdelay = ");
+            sh_putdec((uint64_t)g_tx_post_rx_delay_us);
+            sh_puts(" us\n");
+        } else {
+            uint32_t v = 0;
+            for (const char *p = argv[1]; *p >= '0' && *p <= '9'; p++)
+                v = v * 10 + (uint32_t)(*p - '0');
+            g_tx_post_rx_delay_us = v;
+            sh_puts("txdelay <- ");
+            sh_putdec((uint64_t)v);
+            sh_puts(" us\n");
+        }
     } else if (strcmp(cmd, "dmesg") == 0) {
         /* Dump the kernel ring buffer (klog). serial_puts has been
          * teeing into klog since boot, so this is everything the
