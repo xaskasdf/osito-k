@@ -517,6 +517,93 @@ static int parse_ecdsa_sig(const uint8_t *der, uint32_t len,
     return 0;
 }
 
+/* ── DER encoder for {r, s} → SEQUENCE { INTEGER, INTEGER } ── */
+
+static void bn_to_be32(const uint64_t a[4], uint8_t out[32])
+{
+    for (int i = 0; i < 4; i++) {
+        uint64_t w = a[3 - i];
+        for (int j = 0; j < 8; j++)
+            out[i * 8 + j] = (uint8_t)(w >> (56 - 8 * j));
+    }
+}
+
+/* Encode a 32-byte big-endian unsigned int as DER INTEGER.
+ * Strips leading zeros, prepends 0x00 if MSB is set.  Returns
+ * bytes written starting at out (TLV: 02 LEN CONTENT). */
+static uint32_t der_emit_int(uint8_t *out, const uint8_t be[32])
+{
+    uint32_t skip = 0;
+    while (skip < 31 && be[skip] == 0) skip++;
+    int needs_pad = (be[skip] & 0x80) ? 1 : 0;
+    uint32_t content_len = (32 - skip) + (uint32_t)needs_pad;
+    out[0] = 0x02;
+    out[1] = (uint8_t)content_len;
+    uint32_t off = 2;
+    if (needs_pad) out[off++] = 0x00;
+    for (uint32_t i = skip; i < 32; i++) out[off++] = be[i];
+    return off;
+}
+
+extern void random_get_bytes(void *buf, uint32_t len);
+
+/* ECDSA P-256 sign.  d_be is the 32-byte big-endian private key;
+ * hash is the 32-byte message digest (caller hashes with SHA-256).
+ * Writes a DER-encoded signature to sig_out (cap should be ≥ 72 B
+ * for safety; typical output is 70-72).  Returns bytes written, or
+ * -1 on error.  Uses random_get_bytes for k. */
+int ecdsa_p256_sign(const uint8_t d_be[32], const uint8_t hash[32],
+                     uint8_t *sig_out, uint32_t sig_cap)
+{
+    if (sig_cap < 72) return -1;
+    uint64_t d[4], z[4];
+    be32_to_bn(d_be, d);
+    be32_to_bn(hash, z);
+    if (bn_is_zero(d) || bn_cmp(d, P256_N) >= 0) return -1;
+
+    uint64_t r[4], s[4], k[4], kinv[4];
+    ec_point_t G, kG;
+    bn_copy(G.x, P256_GX); bn_copy(G.y, P256_GY); G.infinity = 0;
+
+    for (int retry = 0; retry < 16; retry++) {
+        /* Pick k ∈ [1, n-1].  Reject if outside range — extremely
+         * rare with 256-bit n. */
+        uint8_t kb[32];
+        random_get_bytes(kb, 32);
+        be32_to_bn(kb, k);
+        if (bn_is_zero(k) || bn_cmp(k, P256_N) >= 0) continue;
+
+        /* (x, y) = k*G ; r = x mod n */
+        pt_mul(&kG, k, &G);
+        if (kG.infinity) continue;
+        bn_copy(r, kG.x);
+        if (bn_cmp(r, P256_N) >= 0) bn_sub(r, r, P256_N);
+        if (bn_is_zero(r)) continue;
+
+        /* s = k^-1 * (z + d*r) mod n */
+        bn_mod_inv(kinv, k, P256_N);
+        uint64_t dr[4], zdr[4];
+        bn_mod_mul(dr, d, r, P256_N);
+        bn_mod_add(zdr, z, dr, P256_N);
+        bn_mod_mul(s, kinv, zdr, P256_N);
+        if (bn_is_zero(s)) continue;
+
+        /* Encode DER */
+        uint8_t r_be[32], s_be[32];
+        bn_to_be32(r, r_be);
+        bn_to_be32(s, s_be);
+        uint8_t inner[80];
+        uint32_t off = 0;
+        off += der_emit_int(inner + off, r_be);
+        off += der_emit_int(inner + off, s_be);
+        sig_out[0] = 0x30;            /* SEQUENCE */
+        sig_out[1] = (uint8_t)off;    /* total inner length, always ≤ 70 */
+        for (uint32_t i = 0; i < off; i++) sig_out[2 + i] = inner[i];
+        return (int)(2 + off);
+    }
+    return -1;
+}
+
 /* ── ECDSA verify entry point ──────────────────────────────── */
 
 int ecdsa_p256_verify(const uint8_t pub_x[32], const uint8_t pub_y[32],
@@ -596,14 +683,37 @@ static const uint8_t cavs_sig[] = {
     0xF3,0xE9,0x00,0xDB,0xB9,0xAF,0xF4,0x06, 0x4D,0xC4,0xAB,0x2F,0x84,0x3A,0xCD,0xA8
 };
 
+/* RFC 6979 §A.2.5 P-256 private key matching cavs_qx / cavs_qy. */
+static const uint8_t rfc6979_d[32] = {
+    0xC9,0xAF,0xA9,0xD8,0x45,0xBA,0x75,0x16, 0x6B,0x5C,0x21,0x57,0x67,0xB1,0xD6,0x93,
+    0x4E,0x50,0xC3,0xDB,0x36,0xE8,0x9B,0x12, 0x7B,0x8A,0x62,0x2B,0x12,0x0F,0x67,0x21
+};
+
 int ecdsa_p256_self_test(void)
 {
     int rc = ecdsa_p256_verify(cavs_qx, cavs_qy, cavs_hash,
                                  cavs_sig, sizeof cavs_sig);
+    if (rc != 0) {
+        serial_puts("[ECDSA] P-256 verify self-test FAILED\n");
+        return rc;
+    }
+    serial_puts("[ECDSA] P-256 verify self-test OK\n");
+
+    /* Sign roundtrip: pick random k, sign cavs_hash with rfc6979_d,
+     * verify against (cavs_qx, cavs_qy).  Confirms the sign primitive
+     * is self-consistent with the verify primitive. */
+    uint8_t sig[72];
+    int sl = ecdsa_p256_sign(rfc6979_d, cavs_hash, sig, sizeof sig);
+    if (sl < 0) {
+        serial_puts("[ECDSA] P-256 sign self-test FAILED (sign returned -1)\n");
+        return -1;
+    }
+    rc = ecdsa_p256_verify(cavs_qx, cavs_qy, cavs_hash,
+                            sig, (uint32_t)sl);
     if (rc == 0) {
-        serial_puts("[ECDSA] P-256 self-test OK\n");
+        serial_puts("[ECDSA] P-256 sign roundtrip OK\n");
     } else {
-        serial_puts("[ECDSA] P-256 self-test FAILED — falling back to no SKE verify\n");
+        serial_puts("[ECDSA] P-256 sign roundtrip FAILED — verify rejected our signature\n");
     }
     return rc;
 }

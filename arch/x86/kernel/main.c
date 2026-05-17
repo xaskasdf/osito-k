@@ -813,6 +813,15 @@ void __initk kernel_entry(boot_info_t *info)
             else
                 serial_puts("[KERN] ECDSA P-384 verify self-test: FAIL\n");
 
+            /* ECDSA P-256 verify + sign-roundtrip self-test.  Sign
+             * path is needed for the upcoming TLS 1.3 server
+             * CertificateVerify primitive. */
+            extern int ecdsa_p256_self_test(void);
+            if (ecdsa_p256_self_test() == 0)
+                serial_puts("[KERN] ECDSA P-256 sign roundtrip: PASS\n");
+            else
+                serial_puts("[KERN] ECDSA P-256 sign roundtrip: FAIL\n");
+
             /* SHA-384 hash self-test against FIPS 180-4 vector
              * SHA-384("abc"). Needed for chain validation links
              * signed with SHA-384 (GTS Root R4 → intermediates). */

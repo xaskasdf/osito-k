@@ -50,6 +50,15 @@ int ecdsa_p256_verify(const uint8_t pub_x[32], const uint8_t pub_y[32],
                       const uint8_t hash[32],
                       const uint8_t *sig_der, uint32_t sig_der_len);
 
+/* Sign a 32-byte SHA-256 digest with a 32-byte big-endian P-256 private
+ * key.  Writes a DER-encoded SEQUENCE { INTEGER r, INTEGER s } to
+ * sig_out (cap must be ≥ 72).  k is drawn from random_get_bytes and
+ * rejected if outside [1, n-1].  Returns the number of bytes written
+ * (typically 70-72) or -1 on any failure.  Needed for the TLS 1.3
+ * server CertificateVerify path. */
+int ecdsa_p256_sign(const uint8_t d_be[32], const uint8_t hash[32],
+                    uint8_t *sig_out, uint32_t sig_cap);
+
 /* Run a self-test against a known-good NIST CAVS test vector.
  * Returns 0 on pass, -1 on any internal mismatch.  Called from
  * tls_init() so a broken bigint impl (e.g. compiler regression)
