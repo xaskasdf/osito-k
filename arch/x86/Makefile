@@ -115,7 +115,9 @@ KERN_SRC = kernel/main.c kernel/serial.c kernel/framebuffer.c \
            kernel/hwbp.c kernel/self_optimize.c kernel/nic.c \
            kernel/apipa.c kernel/rag.c kernel/cert_pin.c \
            kernel/rsa.c kernel/x509.c kernel/ecdsa_p256.c kernel/ecdsa_p384.c \
-           kernel/http_plain.c kernel/ocsp.c kernel/crl.c
+           kernel/http_plain.c kernel/ocsp.c kernel/crl.c \
+           kernel/inferconnect.c kernel/inferconnect_rpc.c kernel/inferconnect_client.c \
+           kernel/cluster.c kernel/cluster_rendezvous.c kernel/cluster_stubs.c
 ASM_SRC  = kernel/isr_stubs.S kernel/syscall_entry.S kernel/setjmp.S kernel/kexec_tramp.S
 DRV_SRC  = drivers/nvme.c drivers/i211.c drivers/rtl8111.c drivers/gpu.c drivers/gsp.c \
            drivers/sass.c drivers/gmmu.c drivers/gpu_tensor.c drivers/gpu_inference.c \

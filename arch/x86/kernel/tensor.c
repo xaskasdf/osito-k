@@ -273,6 +273,59 @@ void dequant_q8_0(const void *src, float *dst, uint64_t n)
     }
 }
 
+/* IEEE 754 single → half. Round-to-nearest-even, no NaN/Inf
+ * preservation (only quantize finite activations). */
+uint16_t f32_to_f16(float f)
+{
+    union { float f; uint32_t u; } v = { .f = f };
+    uint32_t u = v.u;
+    uint16_t sign = (u >> 16) & 0x8000;
+    int32_t  exp  = ((u >> 23) & 0xFF) - 127 + 15;
+    uint32_t mant = u & 0x7FFFFF;
+
+    if (exp <= 0) {
+        if (exp < -10) return sign;
+        mant |= 0x800000;
+        uint32_t shift = (uint32_t)(14 - exp);
+        uint32_t round = (mant >> (shift - 1)) & 1;
+        return sign | (uint16_t)((mant >> shift) + round);
+    }
+    if (exp >= 31) return sign | 0x7C00;
+    uint32_t round = (mant >> 12) & 1;
+    return sign | (uint16_t)(exp << 10) |
+           (uint16_t)((mant >> 13) + round);
+}
+
+/* Reverse of dequant_q8_0. dst layout per 32-float block: 2 B fp16 scale +
+ * 32 B int8 values (34 B total). n must be a multiple of 32. Used by
+ * inferconnect_oict / inferconnect_client to compress hidden states +
+ * top-k logits before shipping across the InferConnect mesh. */
+void quantize_q8_0(const float *src, void *dst, uint64_t n)
+{
+    uint8_t *p = (uint8_t *)dst;
+    for (uint64_t i = 0; i < n; i += Q8_0_VALUES) {
+        float absmax = 0.0f;
+        for (int j = 0; j < 32; j++) {
+            float a = src[i + j];
+            float aa = a < 0 ? -a : a;
+            if (aa > absmax) absmax = aa;
+        }
+        float scale = absmax / 127.0f;
+        float inv   = scale != 0.0f ? 1.0f / scale : 0.0f;
+        *(uint16_t *)p = f32_to_f16(scale);
+        p += 2;
+        int8_t *vals = (int8_t *)p;
+        for (int j = 0; j < 32; j++) {
+            float v = src[i + j] * inv;
+            int   q = (int)(v < 0 ? v - 0.5f : v + 0.5f);
+            if (q > 127) q = 127;
+            if (q < -127) q = -127;
+            vals[j] = (int8_t)q;
+        }
+        p += 32;
+    }
+}
+
 /* ══════════════════════════════════════════════════════════
  *  Quantized matrix-vector multiply
  * ══════════════════════════════════════════════════════════ */

@@ -15,7 +15,8 @@
 
 /* ── Freestanding math (x87/SSE) ─────────────────────── */
 
-float f16_to_f32(uint16_t h);       /* IEEE 754 half -> float */
+float    f16_to_f32(uint16_t h);    /* IEEE 754 half -> float */
+uint16_t f32_to_f16(float f);       /* IEEE 754 float -> half */
 float sqrtf_bare(float x);          /* SSE sqrtss */
 float expf_bare(float x);           /* x87: fldl2e + f2xm1 + fscale */
 float sinf_bare(float x);           /* x87 fsin */
@@ -26,6 +27,7 @@ float powf_bare(float base, float exponent); /* x87: fyl2x + 2^x */
 
 void dequant_q4_0(const void *src, float *dst, uint64_t n);
 void dequant_q8_0(const void *src, float *dst, uint64_t n);
+void quantize_q8_0(const float *src, void *dst, uint64_t n);
 
 /* ── Quantized matrix-vector multiply ────────────────── */
 /* out[rows] = weight[rows x cols, quantized] x input[cols] */

@@ -2011,6 +2011,62 @@ int net_tcp_state(int conn_idx)
     return tcp_conns[conn_idx].state;
 }
 
+/* ── Cluster helpers ─────────────────────────────────────────── */
+
+/* Send to a class-D group. Skips ARP — multicast MAC is derived
+ * from the low 23 bits of the IPv4 group (RFC 1112 §6.4):
+ *   01:00:5E:[bit23..0 of group_ip]
+ * Send-only (no IGMP membership). Used by inferconnect peer
+ * announcements + cluster_rendezvous LAN discovery. */
+int net_udp_send_multicast(const uint8_t group_ip[4], uint16_t dst_port,
+                            uint16_t src_port, const void *data, uint32_t len)
+{
+    if ((group_ip[0] & 0xF0) != 0xE0) return -1;
+
+    uint32_t udp_len = sizeof(udp_hdr_t) + len;
+    uint32_t ip_total = sizeof(ipv4_hdr_t) + udp_len;
+    if (ETH_HDR_LEN + ip_total > sizeof(tx_pkt)) return -1;
+
+    uint8_t mc_mac[6] = {
+        0x01, 0x00, 0x5E,
+        (uint8_t)(group_ip[1] & 0x7F), group_ip[2], group_ip[3],
+    };
+
+    eth_hdr_t *eth = (eth_hdr_t *)tx_pkt;
+    memcpy(eth->dst, mc_mac, 6);
+    memcpy(eth->src, our_mac, 6);
+    eth->ethertype = htons(ETH_TYPE_IP4);
+
+    ipv4_hdr_t *ip = (ipv4_hdr_t *)(tx_pkt + ETH_HDR_LEN);
+    ip->ver_ihl = 0x45; ip->tos = 0;
+    ip->total_len = htons((uint16_t)ip_total);
+    ip->id = htons(ip_id_counter++); ip->frag = 0;
+    ip->ttl = 1; ip->proto = IP_PROTO_UDP; ip->checksum = 0;
+    memcpy(ip->src, our_ip, 4); memcpy(ip->dst, group_ip, 4);
+    ip->checksum = ip_checksum(ip, sizeof(ipv4_hdr_t));
+
+    udp_hdr_t *udp = (udp_hdr_t *)(tx_pkt + ETH_HDR_LEN + sizeof(ipv4_hdr_t));
+    udp->src_port = htons(src_port);
+    udp->dst_port = htons(dst_port);
+    udp->length = htons((uint16_t)udp_len);
+    udp->checksum = 0;
+
+    memcpy(tx_pkt + ETH_HDR_LEN + sizeof(ipv4_hdr_t) + sizeof(udp_hdr_t),
+           data, len);
+
+    uint32_t frame_len = ETH_HDR_LEN + ip_total;
+    if (frame_len < 60) { memset(tx_pkt + frame_len, 0, 60 - frame_len); frame_len = 60; }
+    return nic_send(tx_pkt, frame_len);
+}
+
+int net_tcp_get_peer_ip(int conn_idx, uint8_t ip_out[4])
+{
+    if (conn_idx < 0 || conn_idx >= TCP_MAX_CONNS) return -1;
+    if (tcp_conns[conn_idx].state == TCP_CLOSED)   return -1;
+    for (int i = 0; i < 4; i++) ip_out[i] = tcp_conns[conn_idx].remote_ip[i];
+    return 0;
+}
+
 /* ── TCP Server: Listen / Accept ─────────────────────────────── */
 
 int net_tcp_listen(uint16_t port)
