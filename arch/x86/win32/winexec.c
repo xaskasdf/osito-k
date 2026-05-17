@@ -976,20 +976,24 @@ int winexec_run(const uint8_t *file_data, uint64_t file_size)
                           "FMW-pool@40010700-Next") == 0) {
                 serial_puts("[winexec] HWBP slot 2 armed at Pool+0x18 WRITE\n");
             }
-            /* Slot 3: WRITE on Pool@0x40010700 PrevLink field (offset +0x1C).
-             * Phase 1 found Pool 0x40010700 is linked in two FMallocWindows
-             * lists simultaneously (PrevLink = 0x40010218 from one chain,
-             * but walk arrives via cursor 0x1092F88C from another chain).
-             * HWBP_WRITE catches every writer to the PrevLink slot —
-             * expected: two writers, one normal Link operation each.
-             * The second writer (or non-Link writer) reveals the
-             * disruption.
+            /* Slot 3: WRITE on Pool@0x40010200 Next + PrevLink fields
+             * (LEN_8 covers 0x40010218..0x4001021F = both fields).
              *
-             * Retired StaticLoadClass slot 3 — we have its data and
-             * StaticFindObject (slot 2) shows the same info plus more. */
-            if (hwbp_set(3, 0x4001071CULL, /*HWBP_WRITE*/1, /*HWBP_LEN_4*/3,
-                          "FMW-pool-PrevLink") == 0) {
-                serial_puts("[winexec] HWBP slot 3 armed at Pool+0x1C WRITE\n");
+             * Phase 2b found T7's Link is PARTIAL — step 1 runs (writes
+             * Pool@0x40010700.PrevLink) but step 4 never writes Table
+             * head. Need to narrow where execution stops:
+             *   step 2 = Pool@0x40010200.Next write at 0x40010218
+             *   step 3 = Pool@0x40010200.PrevLink write at 0x4001021C
+             * If we see neither: fault before step 2.
+             * If we see step 2 only: fault between step 2 and step 3.
+             * If we see step 3 too: fault between step 3 and step 4.
+             *
+             * Retired Pool@0x40010700.PrevLink WRITE — its 3 writes
+             * (kernel zero, Link@0x109021DC, Link@0x10902B10) are
+             * captured in commit 07ba285. */
+            if (hwbp_set(3, 0x40010218ULL, /*HWBP_WRITE*/1, /*HWBP_LEN_8*/2,
+                          "FMW-pool@40010200-Next+PrevLink") == 0) {
+                serial_puts("[winexec] HWBP slot 3 armed at Pool@0x40010200+0x18 WRITE LEN_8\n");
             }
         }
 
