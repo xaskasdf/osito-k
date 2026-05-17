@@ -97,6 +97,34 @@ uint32_t http_response_size(void) { return (uint32_t)sizeof(http_response_t); }
 static uint8_t leftover_buf[4096];
 static int     leftover_len;
 
+/* ── TLS dispatch helpers (1.2/1.3 unified) ──────────────────── */
+
+extern int tls13_send(const void *data, uint32_t len);
+extern int tls13_recv(void *buf, uint32_t cap);
+
+static inline int http_tls_send(http_session_t *s, const void *data, uint32_t len)
+{
+    return s->use_tls13 ? tls13_send(data, len) : tls_send(&s->tls, data, len);
+}
+
+/* 1.2 tls_recv takes a deadline-ish timeout (ticks); 1.3 tls_recv has its
+ * own internal deadline. The 1.3 wrapper ignores the timeout arg for now —
+ * tls13_recv blocks against the live socket with its own watchdog. */
+static inline int http_tls_recv(http_session_t *s, void *buf, uint32_t cap,
+                                uint32_t timeout_ticks)
+{
+    if (s->use_tls13) return tls13_recv(buf, cap);
+    return tls_recv(&s->tls, buf, cap, timeout_ticks);
+}
+
+static inline void http_tls_close(http_session_t *s)
+{
+    /* TLS 1.3 has no explicit close API in this build — just drop the
+     * TCP; the peer detects close via FIN. TLS 1.2 needs tls_close to
+     * emit close_notify before TCP teardown. */
+    if (!s->use_tls13) tls_close(&s->tls);
+}
+
 /* ── HTTP Session Management ─────────────────────────────────── */
 
 int http_open(http_session_t *s, const char *hostname)
@@ -127,14 +155,34 @@ int http_open(http_session_t *s, const char *hostname)
         return -1;
     }
 
-    /* TLS handshake */
+    /* TLS handshake — prefer 1.3 (one-RTT handshake + modern ciphers).
+     * Fall back to 1.2 if the server can't do 1.3. tls13 uses a global
+     * state struct, so we hold an outer single-conn lock in http_open
+     * by virtue of it being called serially per session. */
+    extern int  tls13_connect(int tcp_conn, const char *hostname);
+    if (tls13_connect(s->tcp_conn, hostname) == 0) {
+        s->use_tls13 = true;
+        serial_puts("[HTTP] HTTPS ready (TLS 1.3)\n");
+        s->connected = true;
+        return 0;
+    }
+
+    /* 1.3 failed — close and reopen TCP, then try 1.2. The TLS 1.3 path
+     * may have left the connection mid-handshake; safest is a fresh TCP. */
+    serial_puts("[HTTP] TLS 1.3 failed, falling back to 1.2\n");
+    net_tcp_close(s->tcp_conn);
+    s->tcp_conn = net_tcp_connect(ip, 443, next_port++);
+    if (s->tcp_conn < 0) {
+        serial_puts("[HTTP] TCP reconnect failed\n");
+        return -1;
+    }
     if (tls_connect(&s->tls, s->tcp_conn, hostname) < 0) {
-        serial_puts("[HTTP] TLS handshake failed\n");
+        serial_puts("[HTTP] TLS 1.2 handshake also failed\n");
         net_tcp_close(s->tcp_conn);
         return -1;
     }
-
-    serial_puts("[HTTP] HTTPS ready\n");
+    s->use_tls13 = false;
+    serial_puts("[HTTP] HTTPS ready (TLS 1.2)\n");
     s->connected = true;
     return 0;
 }
@@ -142,7 +190,7 @@ int http_open(http_session_t *s, const char *hostname)
 void http_close(http_session_t *s)
 {
     if (!s->connected) return;
-    tls_close(&s->tls);
+    http_tls_close(s);
     net_tcp_close(s->tcp_conn);
     s->connected = false;
 }
@@ -186,11 +234,11 @@ int http_request(http_session_t *s, const char *method, const char *path,
     p = buf_puts(req, p, mx, "\r\n");
 
     /* Send headers */
-    if (tls_send(&s->tls, req, (uint32_t)p) < 0) return -1;
+    if (http_tls_send(s, req, (uint32_t)p) < 0) return -1;
 
     /* Send body */
     if (body && body_len > 0) {
-        if (tls_send(&s->tls, body, body_len) < 0) return -1;
+        if (http_tls_send(s, body, body_len) < 0) return -1;
     }
 
     serial_puts("[HTTP] Sent ");
@@ -206,8 +254,8 @@ int http_request(http_session_t *s, const char *method, const char *path,
     int hdr_end = -1;
 
     while (hdr_len < (int)sizeof(hdr) - 1) {
-        int n = tls_recv(&s->tls, hdr + hdr_len,
-                         (uint32_t)(sizeof(hdr) - 1 - (uint32_t)hdr_len), 5000);
+        int n = http_tls_recv(s, hdr + hdr_len,
+                              (uint32_t)(sizeof(hdr) - 1 - (uint32_t)hdr_len), 5000);
         if (n <= 0) {
             serial_puts("[HTTP] Timeout reading headers\n");
             return -1;
@@ -355,7 +403,7 @@ int http_read_body(http_session_t *s, const http_response_t *resp,
 
             while (!got_line) {
                 if (bp >= bl) {
-                    int n = tls_recv(&s->tls, buf, sizeof(buf), 500);
+                    int n = http_tls_recv(s, buf, sizeof(buf), 500);
                     if (n < 0) {
                         if (net_tcp_state(s->tcp_conn) == TCP_STATE_ESTABLISHED
                             && ++idle < MAX_IDLE_RETRIES) continue;
@@ -392,7 +440,7 @@ int http_read_body(http_session_t *s, const http_response_t *resp,
             uint32_t remaining = chunk_size;
             while (remaining > 0) {
                 if (bp >= bl) {
-                    int n = tls_recv(&s->tls, buf, sizeof(buf), 500);
+                    int n = http_tls_recv(s, buf, sizeof(buf), 500);
                     if (n < 0) {
                         if (net_tcp_state(s->tcp_conn) == TCP_STATE_ESTABLISHED
                             && ++idle < MAX_IDLE_RETRIES) continue;
@@ -421,7 +469,7 @@ int http_read_body(http_session_t *s, const http_response_t *resp,
             /* Consume trailing \r\n */
             for (int skip = 0; skip < 2; ) {
                 if (bp >= bl) {
-                    int n = tls_recv(&s->tls, buf, sizeof(buf), 500);
+                    int n = http_tls_recv(s, buf, sizeof(buf), 500);
                     if (n < 0) {
                         if (net_tcp_state(s->tcp_conn) == TCP_STATE_ESTABLISHED
                             && ++idle < MAX_IDLE_RETRIES) continue;
@@ -462,7 +510,7 @@ int http_read_body(http_session_t *s, const http_response_t *resp,
             uint32_t want = sizeof(buf);
             if (has_cl && remaining < want) want = remaining;
 
-            int n = tls_recv(&s->tls, buf, want, 500);
+            int n = http_tls_recv(s, buf, want, 500);
             if (n < 0) {
                 /* tls_recv -1: could be a real close or just a tls_recv
                  * deadline (the underlying tls_read_exact treats both

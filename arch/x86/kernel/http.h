@@ -41,6 +41,7 @@ typedef struct {
     tls_conn_t  tls;
     int         tcp_conn;
     bool        connected;
+    bool        use_tls13;     /* set by http_open: true if TLS 1.3 succeeded */
 } http_session_t;
 
 /* ── HTTP API ───────────────────────────────────────────────── */
