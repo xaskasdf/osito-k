@@ -146,9 +146,21 @@ static float kparse_float(const char **p_io, const char *end, int *ok) {
     if (p < end && *p == '.') {
         p++;
         float scale = 0.1f;
+        /* Cap fractional precision at 9 digits.  float32 mantissa is
+         * 23 bits ~= 7 decimal digits; beyond ~10 fractional digits
+         * `scale *= 0.1f` drops below the normal range and produces
+         * denormal operands.  Kernels that don't set MXCSR.DAZ/FTZ
+         * (ours, currently) raise #XM SIMD exception on denormal
+         * arithmetic, which previously killed agent_s0 mid-embed-
+         * parse on the bge-large response (~17-digit fractions). */
+        int frac_digits = 0;
         while (p < end && *p >= '0' && *p <= '9') {
-            v += (float)(*p - '0') * scale;
-            scale *= 0.1f; p++; digits++;
+            if (frac_digits < 9) {
+                v += (float)(*p - '0') * scale;
+                scale *= 0.1f;
+                frac_digits++;
+            }
+            p++; digits++;
         }
     }
     if (p < end && (*p == 'e' || *p == 'E')) {
