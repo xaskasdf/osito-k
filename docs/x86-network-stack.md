@@ -348,14 +348,29 @@ kupload) solo necesita Mac→OsitoK RX y OsitoK→Mac TX iniciado desde
 shell context, ambos funcionan. El reply-context "broken" no impacta
 la iteración kexec-over-network.
 
-**Próximos experimentos requieren hardware extra**, no más instrumentación
-kernel:
+**Próximos experimentos requieren hardware extra** para B/C, pero
+**hipótesis A es testeable en-tree**:
 - Switch barato + sniffer L1 entre Mac y OsitoK con port mirroring → si
   el switch ve los frames y el Mac no, el bridge USB-Ethernet del Mac es
   el culpable; si el switch tampoco los ve, errata I211 confirmada
 - Repro mínimo en Linux booteando OsitoK con USB live → mismo I211, RX→TX
   IRQ-ctx idéntico; si Linux entrega y OsitoK no, ahí sí hay algo en
   nuestro driver que falta ver
+
+**Hipótesis-A test rig landed (commit `2e3716a`, 2026-05-17)**:
+- `net.c` stamp `last_rx_complete_tsc` al final del RX loop en
+  `net_poll()`.
+- `net_pre_tx_wait()` busy-polls RDTSC en `eth_send` hasta que pasen
+  `g_tx_post_rx_delay_us` µs desde el stamp.
+- `txdelay <us>` shell builtin para tunear live.
+- Test plan:
+  1. Bootear, ping de Mac al guest continuo.
+  2. `osito> txdelay 0` → confirmar 0% reply rate.
+  3. Sweep `txdelay 100`, `500`, `1000`, `2000`, `5000`.
+  4. Si alguno flippea a 100% → hipótesis-A confirmada, próximo paso:
+     defer reply-path TX a workqueue que corra "1 tick post-RX".
+  5. Si ni 5000 µs ayuda → hipótesis-A refutada, queda solo B/C con HW
+     externo.
 
 ---
 

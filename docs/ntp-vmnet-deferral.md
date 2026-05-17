@@ -24,7 +24,16 @@ so the bug is specific to UDP/123 round-trip, not the entire UDP path.
    - The NTP request egresses with src IP matching DHCP lease (not 0.0.0.0).
    - The NTP reply arrives at the host but is filtered before it hits the guest interface.
 2. Inspect `pfctl -ss` for any UDP/123 entry while NTP is in-flight.
-3. If H5 confirmed: add a source-port range constraint (use 32768-60999 ephemeral range, not 12321) and/or implement UDP send retry with port rotation **specifically** when no reply within 2s.
+3. ~If H5 confirmed: add a source-port range constraint (use 32768-60999 ephemeral range, not 12321) and/or implement UDP send retry with port rotation **specifically** when no reply within 2s.~
+   **LANDED 2026-05-17 in commit `2e3716a`** — `ntp.c` now uses a fresh
+   `random_get_bytes`-driven src_port in [49152, 65535] per retry, and
+   re-registers `net_udp_listen(src_port, ntp_handler)` per attempt.
+   The IANA-registered ephemeral band is the tightest overlap of
+   Linux/Darwin/BSD defaults.  Verification (pending live run under
+   vmnet): watch for `[NTP] src_port=<N>` followed by `[NTP] UTC time
+   = …` in serial.log.  If that appears, H5 confirmed and this
+   deferral is closeable.  If it does NOT appear with ephemeral, H5
+   refuted → revisit with host `pfctl -ss` capture.
 
 ## Workaround in tree
 
