@@ -572,7 +572,7 @@ static void cmd_help(void)
     sh_puts("  kupload   Push a file via OFTP (kupload <ip> <port> <local|--dmesg> [remote])\n");
     sh_puts("  kupdate   Pull + kexec a kernel update via HTTPS\n");
     sh_puts("            (kupdate [host] [path] [--channel <ch>] [--no-kexec])\n");
-    sh_puts("            default: https://naranjositos.tech/k/x86_64/stable/kernel.elf\n");
+    sh_puts("            default: https://wasm.naranjositos.tech/k/x86_64/stable/kernel.elf\n");
     sh_puts("  exec      Run an ELF binary\n");
     sh_puts("  ping      Ping an IP address\n");
     sh_puts("  tcptest   TCP connection test (tcptest [ip] [port])\n");
@@ -1518,7 +1518,7 @@ static void cmd_kupload(int argc, char *argv[])
  * kernel currently only has a direct cable to a Mac, no Internet.    */
 static void cmd_kupdate(int argc, char *argv[])
 {
-    const char *host    = "naranjositos.tech";
+    const char *host    = "wasm.naranjositos.tech";
     const char *path    = "/k/x86_64/stable/kernel.elf";
     const char *save_as = "kernel.elf";
     bool do_kexec = true;
