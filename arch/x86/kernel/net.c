@@ -931,6 +931,8 @@ static uint16_t tcp_checksum(const uint8_t src_ip[4], const uint8_t dst_ip[4],
 /* Sequence-number comparators (32-bit modular arithmetic, RFC 1323). */
 static inline int seq_ge(uint32_t a, uint32_t b) { return (int32_t)(a - b) >= 0; }
 static inline int seq_le(uint32_t a, uint32_t b) { return (int32_t)(a - b) <= 0; }
+static inline int seq_gt(uint32_t a, uint32_t b) { return (int32_t)(a - b) >  0; }
+static inline int seq_lt(uint32_t a, uint32_t b) { return (int32_t)(a - b) <  0; }
 
 /* Record an out-of-order [start, end) range so the next outgoing ACK
  * advertises it via SACK (RFC 2018). Coalesces with adjacent blocks
@@ -1187,8 +1189,8 @@ static void handle_tcp(const uint8_t *src_ip, const uint8_t *pkt, uint32_t len)
     uint32_t peer_tsval = 0;
     uint32_t peer_tsecr = 0;
     bool    peer_has_sack_blk = false;
-    uint32_t peer_sack_start = 0;
-    uint32_t peer_sack_end = 0;
+    uint32_t peer_sack_ranges[4][2];  /* up to 4 SACK blocks (RFC 2018) */
+    int      peer_sack_n = 0;
     if (hdr_len > 20) {
         const uint8_t *opt = pkt + 20;
         uint32_t opt_len = hdr_len - 20;
@@ -1214,15 +1216,22 @@ static void handle_tcp(const uint8_t *src_ip, const uint8_t *pkt, uint32_t len)
                 peer_has_ts = true;
             } else if (kind == 5 && l >= 10 && ((l - 2) % 8 == 0) &&
                        !(flags & TCP_SYN)) {
-                /* SACK block list (RFC 2018). We only need the first
-                 * block — it's enough to decide whether our single
-                 * unACKed tx_buf segment is already in the receiver's
-                 * out-of-order queue. */
-                memcpy(&peer_sack_start, opt + i + 2, 4);
-                memcpy(&peer_sack_end,   opt + i + 6, 4);
-                peer_sack_start = ntohl(peer_sack_start);
-                peer_sack_end   = ntohl(peer_sack_end);
-                peer_has_sack_blk = true;
+                /* SACK block list (RFC 2018).  We parse every block
+                 * (up to 4 — the option fits at most 4 in 40 bytes of
+                 * TCP option space) so the sender can implement
+                 * RFC 6675 §4 multi-gap retransmit decisions and
+                 * partial-coverage advance of the unACKed window. */
+                int nblk = (int)((l - 2) / 8);
+                if (nblk > 4) nblk = 4;
+                for (int b = 0; b < nblk; b++) {
+                    uint32_t s, e;
+                    memcpy(&s, opt + i + 2 + b * 8,     4);
+                    memcpy(&e, opt + i + 2 + b * 8 + 4, 4);
+                    peer_sack_ranges[b][0] = ntohl(s);
+                    peer_sack_ranges[b][1] = ntohl(e);
+                }
+                peer_sack_n = nblk;
+                peer_has_sack_blk = (nblk > 0);
             }
             i += l;
         }
@@ -1468,9 +1477,48 @@ static void handle_tcp(const uint8_t *src_ip, const uint8_t *pkt, uint32_t len)
                 bool tx_sacked = false;
                 if (peer_has_sack_blk && conn->sack_ok) {
                     uint32_t tx_end = conn->tx_seq + conn->tx_len;
-                    if (seq_le(peer_sack_start, conn->tx_seq) &&
-                        seq_ge(peer_sack_end,   tx_end)) {
-                        tx_sacked = true;
+                    /* RFC 6675 §4 (a): walk every SACK block.  If ANY
+                     * one fully covers [tx_seq, tx_end), the entire
+                     * unACKed window is already at the receiver and
+                     * we must not retransmit.  Otherwise, if a block
+                     * covers a prefix [tx_seq, X) with X < tx_end,
+                     * slide the unACKed window forward by (X - tx_seq)
+                     * so the next retransmit (or RTO) only re-sends
+                     * the still-missing tail. */
+                    for (int b = 0; b < peer_sack_n; b++) {
+                        uint32_t ss = peer_sack_ranges[b][0];
+                        uint32_t se = peer_sack_ranges[b][1];
+                        if (seq_le(ss, conn->tx_seq) &&
+                            seq_ge(se, tx_end)) {
+                            tx_sacked = true;
+                            break;
+                        }
+                    }
+                    if (!tx_sacked) {
+                        /* Partial-prefix advance: find the largest X
+                         * such that some block covers [tx_seq, X).
+                         * Multiple blocks could each cover a prefix —
+                         * pick the longest one. */
+                        uint32_t best_x = conn->tx_seq;
+                        for (int b = 0; b < peer_sack_n; b++) {
+                            uint32_t ss = peer_sack_ranges[b][0];
+                            uint32_t se = peer_sack_ranges[b][1];
+                            if (seq_le(ss, conn->tx_seq) &&
+                                seq_gt(se, best_x) &&
+                                seq_lt(se, tx_end)) {
+                                best_x = se;
+                            }
+                        }
+                        if (best_x != conn->tx_seq) {
+                            uint32_t adv = best_x - conn->tx_seq;
+                            if (adv < conn->tx_len) {
+                                uint32_t remain = conn->tx_len - adv;
+                                for (uint32_t bi = 0; bi < remain; bi++)
+                                    conn->tx_buf[bi] = conn->tx_buf[bi + adv];
+                                conn->tx_len  = remain;
+                                conn->tx_seq  = best_x;
+                            }
+                        }
                     }
                 }
                 conn->dup_ack_count++;

@@ -110,7 +110,13 @@ typedef struct __attribute__((packed)) {
  * TCP_MAX_CONNS (32) × 128 KiB ≈ 4 MiB BSS — acceptable on 512 MiB. */
 #define TCP_RX_BUF_SIZE 131072
 #define TCP_RX_WSCALE   3   /* log2 of the granularity we advertise */
-#define TCP_TX_BUF_SIZE 4096
+/* 16 KiB unACKed TX window (~11 MSS).  Was 4096 — too small to fill
+ * a typical bandwidth-delay product on a LAN (RTT ~1 ms, 1 Gb/s ≈
+ * 128 KiB BDP) and made the SACK-skip-retransmit optimization
+ * negligible because at most 2-3 MSS were ever in flight.  At 16 KiB
+ * we can carry up to 4 SACK'd gaps' worth of in-flight data, which
+ * is the exact regime where multi-block SACK parsing earns its keep. */
+#define TCP_TX_BUF_SIZE 16384
 #define TCP_MAX_CONNS   32
 #define TCP_MSS         1460
 
