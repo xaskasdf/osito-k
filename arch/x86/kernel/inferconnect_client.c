@@ -201,9 +201,21 @@ int inferconnect_remote_agent_task(const uint8_t ip[4], uint16_t port,
     if (plen && net_tcp_send(conn, prompt, plen) < 0) goto fail;
 
     /* Recv: u64 out_size | u32 result_len | result_bytes. The remote
-     * subtask can take a few seconds — give it a generous timeout. */
+     * subtask runs a full agent task — short-circuit RAG, cold TLS to
+     * CF, etc — easily 20-60 s before the first byte comes back.
+     * recv_exact's per-chunk 5 s timeout is too short for the leading
+     * u64 (no data flows until task completion). Use a 90 s timeout
+     * on the FIRST byte; subsequent fields stream fast. */
     uint64_t out_size;
-    if (recv_exact(conn, &out_size, 8) < 0) goto fail;
+    {
+        uint8_t *p = (uint8_t *)&out_size;
+        uint32_t got = 0;
+        while (got < 8) {
+            int r = net_tcp_recv_timeout(conn, p + got, 8 - got, 9000);
+            if (r <= 0) goto fail;
+            got += (uint32_t)r;
+        }
+    }
     if (out_size < 4 || out_size > 4096) goto fail;
     uint32_t result_len;
     if (recv_exact(conn, &result_len, 4) < 0) goto fail;

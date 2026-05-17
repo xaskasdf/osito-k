@@ -730,6 +730,62 @@ void cluster_force_reconfigure(void)
     serial_puts("[CLUSTER] reconfigure forced\n");
 }
 
+/* ── Cross-node delegation probe (test harness hook) ─────────── */
+
+static void cluster_delegate_probe_thread(void *unused)
+{
+    (void)unused;
+    extern int inferconnect_remote_agent_task(const uint8_t ip[4],
+                                                uint16_t port,
+                                                const char *prompt,
+                                                char *out, uint32_t cap);
+
+    serial_puts("[CLUSTER-PROBE] waiting for ALIVE peer (≤120s)...\n");
+    uint64_t deadline = idt_get_ticks() + 12000;
+    int peer = -1;
+    while (idt_get_ticks() < deadline) {
+        for (int i = 0; i < CLUSTER_MAX_PEERS; i++) {
+            if (g_meta[i].in_use && g_meta[i].state == PEER_ALIVE
+                && g_meta[i].rpc_port != 0) {
+                peer = i; break;
+            }
+        }
+        if (peer >= 0) break;
+        sched_yield();
+    }
+    if (peer < 0) {
+        serial_puts("[CLUSTER-PROBE] no ALIVE peer found — aborting\n");
+        return;
+    }
+    cluster_peer_meta_t *m = &g_meta[peer];
+    serial_puts("[CLUSTER-PROBE] delegating to ");
+    put_ip(m->ip); serial_puts(":");
+    serial_putdec((uint64_t)m->rpc_port); serial_puts("\n");
+
+    char resp[1024];
+    /* Factual question triggers the brandon-mode RAG short-circuit on
+     * the remote, which completes in ~5s — well within the RPC recv
+     * timeout. A non-factual prompt would force full inference (30+ s)
+     * and hit the (now 90s) recv timeout in inferconnect_client.c. */
+    int n = inferconnect_remote_agent_task(m->ip, m->rpc_port,
+                                            "Who wrote Hamlet?",
+                                            resp, sizeof resp);
+    if (n > 0) {
+        resp[n < (int)sizeof resp ? n : (int)sizeof resp - 1] = 0;
+        serial_puts("[CLUSTER-PROBE] reply (");
+        serial_putdec((uint64_t)n); serial_puts(" B): ");
+        serial_puts(resp);
+        serial_puts("\n[CLUSTER-PROBE] delegation OK\n");
+    } else {
+        serial_puts("[CLUSTER-PROBE] delegation FAILED\n");
+    }
+}
+
+void cluster_delegate_probe_start(void)
+{
+    (void)kthread_create("cluster-probe", cluster_delegate_probe_thread, NULL);
+}
+
 int cluster_keygen(void)
 {
     uint8_t key[32];
