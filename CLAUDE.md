@@ -226,7 +226,7 @@ arch/arm/          SM8350 (ROG Phone 5) bare-metal port — see docs/aarch64-det
 
 ## Roadmap
 
-> **Documentation refresh — last audit 2026-04-25** (see Hardware Boot section: H1-H6 marked Done after commit `3c02b49`; X-WIN32 scope expanded with 12 DLL shims; new entries X-VGPU, X-MESA, X-DXVK, X-VK, X-DOS, X-MEMCOMP, X-VDSO, X-SPEC, X-KALL, X-AUDSCHED, X-DMASCHED, X-INOTIFY, X-CPUTOP, X-PERF, X-KSTATE, X-GUI, A-ARM64).
+> **Documentation refresh — last audit 2026-05-17** (TCP/TLS/PKI overhaul session: X-TLS13 row clarified (real handshake e2e, AES-128-GCM not ChaCha), new rows X-PKI / X-OCSP / X-CRL / X-AIA / X-SACK / X-RFC7323 / X-RTO / X-TLS-NEG, all marked Done; see `docs/session-2026-05-16-17-net-pki-overhaul.md` for the full chronology, RFC table, and primitive sizes. Prior 2026-04-25 audit covered Hardware Boot H1-H6 and the X-WIN32 / X-VGPU / X-MESA / X-DXVK / X-VK / X-DOS / X-MEMCOMP / X-VDSO / X-SPEC / X-KALL / X-AUDSCHED / X-DMASCHED / X-INOTIFY / X-CPUTOP / X-PERF / X-KSTATE / X-GUI / A-ARM64 entries.)
 
 ### ESP8266 (Xtensa LX106)
 
@@ -334,7 +334,15 @@ arch/arm/          SM8350 (ROG Phone 5) bare-metal port — see docs/aarch64-det
 | X-VBLK  | Virtio block driver (read/write via split virtqueue) | Done |
 | X-VNET  | Virtio network driver (RX/TX queues, MAC config) | Done |
 | X-USBMS | USB mass storage (BBB protocol, SCSI READ/INQUIRY) | Done |
-| X-TLS13 | TLS 1.3 client (X25519 key share, ChaCha20-Poly1305) | Done |
+| X-TLS13 | TLS 1.3 client real (X25519 + AES-128-GCM + HKDF, Finished MAC, full handshake e2e contra CF) | Done |
+| X-PKI   | RFC 5280 chain validation: link sig verify (P-256/P-384/RSA-SHA256/RSA-SHA384) + constraints (BasicConstraints/KeyUsage/pathLen) + validity window + SAN/CN match (RFC 6125) + cert_pin (static/dynamic/operator) | Done |
+| X-OCSP  | OCSP client (RFC 6960): live query + responder sig verify + stapling (RFC 6066 §8) | Done |
+| X-CRL   | CRL client (RFC 5280 §5): download + parse + serial check + sig verify (informative-mode fallback when OCSP errors) | Done |
+| X-AIA   | AIA chase end-to-end: caIssuers URL extract + http_plain fetch + chain extend (recursive up to depth 3) + osfs2 cache | Done |
+| X-SACK  | RFC 2018 SACK: SACK_PERMITTED negotiate + multi-block emission (up to 4) + RFC 6675 §4 prefix advance | Done |
+| X-RFC7323| TCP window scaling + timestamps + PAWS (full RFC 7323) | Done |
+| X-RTO   | RFC 6298 Jacobson RTT smoothing + dynamic RTO (SRTT/RTTVAR) via TSecr | Done |
+| X-TLS-NEG| HTTP dispatch: try TLS 1.3 first, fallback TLS 1.2 (transparent to caller) | Done |
 | X-SSHD  | SSH server (protocol exchange, KEXINIT, session mgmt) | Done |
 | X-EVDEV | Input event device (evdev, Linux struct input_event) | Done |
 | X-SYSCTL| Kernel sysctl (10+ tunable parameters, read/write) | Done |
@@ -444,6 +452,7 @@ For implementation details, API specifics, register-level documentation, and deb
 
 - **[docs/x86-features-detail.md](docs/x86-features-detail.md)** — All x86-64 feature descriptions (X9-X42, X-OS*, X-NET*, X-CL*, X-WIN32, etc.)
 - **[docs/x86-network-stack.md](docs/x86-network-stack.md)** — Sesión bring-up red bare-metal (B450-F + I211): pipes, kdownload/OFTP, nic_stats, MSI fixes (PCI cap aligned + GPIE.EIAME), RDT off-by-one, reply-path TX bug + workaround
+- **[docs/session-2026-05-16-17-net-pki-overhaul.md](docs/session-2026-05-16-17-net-pki-overhaul.md)** — 26-commit TCP + TLS + PKI overhaul: RFC 2018 SACK (multi-block), RFC 7323 timestamps + PAWS, RFC 6298 Jacobson RTT, TLS 1.3 client real (X25519 + AES-128-GCM + HKDF), RSA-2048, ECDSA P-256/P-384, X.509 chain validation (link sig + constraints + validity + SAN + pin + AIA + OCSP + CRL), OCSP stapling client, 1.3-preferred HTTP dispatch with 1.2 fallback
 - **[docs/kernel-demencial.md](docs/kernel-demencial.md)** — 10 features avanzadas: cpu_features, PMU counters, superpage tensor arena, multipath dispatch, sys_inference syscall, ASLR lite, predictive scheduling, speculative I/O, zero-copy SG TX, hardware breakpoints, self-optimizing kernel
 - **[docs/unicode-architecture.md](docs/unicode-architecture.md)** — Subsistema Unicode 4 capas estilo Plan 9: libutf codec, PSF2 font loader desde OsitoFS, LRU cache, renderer width-aware (CJK 16×16), boot font Latin-1 link-time. Implementado y validado en fork osito-x; documento describe diseño completo + plan de port a mainline
 - **[docs/kernel-diagram.md](docs/kernel-diagram.md)** — 5 diagramas Mermaid: arquitectura completa (111 archivos en 12 subsistemas), secuencia de boot (22 pasos), dispatch de syscalls, forward pass de inference, y mapa de integración de las 10 features
