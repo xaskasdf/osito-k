@@ -209,6 +209,9 @@ static const char *gguf_quant_name(uint32_t osfs2_quant)
 
 /* ── In-memory GGUF parser ───────────────────────────────────── */
 
+static bool key_eq(const char *key, const char *target);
+static int  gguf_extract_hyperparams(gguf_model_t *model);
+
 static int gguf_parse_buffer(gguf_model_t *model)
 {
     gguf_cursor_t c = {
@@ -240,9 +243,19 @@ static int gguf_parse_buffer(gguf_model_t *model)
     serial_putdec(kv_count);
     serial_puts(" metadata keys\n");
 
-    /* Skip all metadata KV pairs */
+    /* Walk metadata KV pairs. Most keys go to OsitoFS-cached file
+     * entry fields (num_layers, hidden_size, etc.) when the file was
+     * written, so we skip them here. The exception is
+     * `general.architecture`: it's not stored in osfs2_file_t, but
+     * llama_init() reads model->architecture to dispatch between the
+     * standard Llama forward and the brandon-arch path (block-shared
+     * layers, register prefill, DWA, value residual). Without setting
+     * it here, every brandon-tiny model falls through to the Llama
+     * path with mismatched layer plumbing → forward stalls and never
+     * produces a token. */
     for (uint64_t i = 0; i < kv_count; i++) {
-        if (cur_string(&c, NULL, 0) < 0) {
+        char key[64];
+        if (cur_string(&c, key, sizeof key) < 0) {
             serial_puts("[GGUF] Failed at metadata key ");
             serial_putdec(i);
             serial_puts("\n");
@@ -250,6 +263,16 @@ static int gguf_parse_buffer(gguf_model_t *model)
         }
         uint32_t val_type;
         if (cur_u32(&c, &val_type) < 0) return -1;
+        if (key_eq(key, "general.architecture") &&
+            val_type == GGUF_TYPE_STRING) {
+            if (cur_string(&c, model->architecture,
+                            sizeof model->architecture) < 0)
+                return -1;
+            serial_puts("[GGUF] architecture=");
+            serial_puts(model->architecture);
+            serial_puts("\n");
+            continue;
+        }
         if (cur_skip_value(&c, val_type) < 0) {
             serial_puts("[GGUF] Failed at metadata value ");
             serial_putdec(i);
@@ -409,7 +432,18 @@ int gguf_load(gguf_model_t *model)
         }
     }
 
-    /* Parse GGUF header in-memory */
+    /* Extract metadata first: fills model->architecture +
+     * brandon.{use_dwa,use_value_residual,n_registers,compute_layer_count,
+     * layer_map,...} plus the rest of the brandon.* / llama.* hyperparams
+     * that osfs2_file_t doesn't cache. Without this the runtime sees
+     * arch="" → falls through to the plain Llama forward → mismatched
+     * layer plumbing → wedge or token soup. */
+    if (gguf_extract_hyperparams(model) < 0) {
+        serial_puts("[GGUF] Hyperparam extract failed\n");
+        return -1;
+    }
+
+    /* Parse GGUF header in-memory (tensor table). */
     if (gguf_parse_buffer(model) < 0) {
         serial_puts("[GGUF] Parse failed\n");
         return -1;
