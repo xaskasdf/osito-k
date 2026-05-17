@@ -1647,8 +1647,14 @@ int net_tcp_connect(const uint8_t dst_ip[4], uint16_t dst_port,
         if (sched_is_enabled()) {
             int slot = net_waiter_register(NETWAIT_ARP, -1, arp_deadline);
             if (slot >= 0) {
-                while (!arp_lookup(nexthop) && idt_get_ticks() < arp_deadline)
+                while (!arp_lookup(nexthop) && idt_get_ticks() < arp_deadline) {
                     __asm__ volatile ("sti; hlt; cli" ::: "memory");
+                    /* virtio-net is polled (irq_pending=NULL) — drain
+                     * the RX queue here so the ARP reply doesn't sit
+                     * in virtqueue indefinitely. APIC tick wakes us
+                     * from hlt; net_poll() actually reads the packet. */
+                    net_poll();
+                }
                 net_waiter_clear(slot);
             }
         } else {
@@ -1698,8 +1704,11 @@ int net_tcp_connect(const uint8_t dst_ip[4], uint16_t dst_port,
         int slot = net_waiter_register(NETWAIT_TCP_ESTABLISHED, idx,
                                        syn_deadline);
         if (slot >= 0) {
-            while (conn->state == TCP_SYN_SENT && idt_get_ticks() < syn_deadline)
+            while (conn->state == TCP_SYN_SENT && idt_get_ticks() < syn_deadline) {
                 __asm__ volatile ("sti; hlt; cli" ::: "memory");
+                /* Polled-NIC drain — see ARP wait comment above. */
+                net_poll();
+            }
             net_waiter_clear(slot);
         }
     } else {
@@ -1877,8 +1886,11 @@ void net_tcp_close(int conn_idx)
                                        close_deadline);
         if (slot >= 0) {
             while (conn->state != TCP_CLOSED && conn->state != TCP_TIME_WAIT &&
-                   idt_get_ticks() < close_deadline)
+                   idt_get_ticks() < close_deadline) {
                 __asm__ volatile ("sti; hlt; cli" ::: "memory");
+                /* Polled-NIC drain — see ARP wait comment above. */
+                net_poll();
+            }
             net_waiter_clear(slot);
         }
     } else {
