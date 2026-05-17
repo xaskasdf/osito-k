@@ -997,20 +997,39 @@ static int tcp_send_segment(tcp_conn_t *conn, uint8_t flags,
      *   SACK_OK (2):   kind=4, len=2           — RFC 2018
      *   TS (10):       kind=8, len=10, val, echo  — RFC 7323
      *
-     * Non-SYN options layout (variable, all 4-byte aligned):
-     *   TS (10) + 2 NOPs                  — if tsopt_ok          → 12B
-     *   SACK (10) + 2 NOPs                — if emit_sack         → 12B
-     *   TS (10) + SACK (10) + 2 NOPs      — both present         → 24B
+     * Non-SYN options layout (variable, all 4-byte aligned). SACK block
+     * count N is in [1..4] (RFC 2018 §3 caps at 4). The SACK option
+     * itself contributes 2 NOPs + 2-byte header + 8*N = 4 + 8*N bytes.
+     *   TS only (10) + 2 NOPs              — emit_ts only        → 12B
+     *   SACK only (N blocks)               — emit_sack only      → 4 + 8*N B
+     *   TS + SACK (N blocks)               — both present        → 12 + 4 + 8*N B
+     *
+     * The TCP data-offset field is 4 bits → max header 60 bytes. With
+     * TS we can fit at most 3 SACK blocks (20+12+4+24=60); without TS
+     * all 4 blocks fit (20+4+32=56). Cap n_emit_sack accordingly so the
+     * header never overflows 60 bytes.
      *
      * Plain ACKs without TS or SACK stay at the bare 20-byte header. */
     bool emit_sack = (!(flags & TCP_SYN)) && conn->sack_ok &&
                      conn->n_sack_blocks > 0;
     bool emit_ts   = (!(flags & TCP_SYN)) && conn->tsopt_ok;
+    /* Number of SACK blocks we'll actually serialize (0 if !emit_sack).
+     * Cap at 4 (RFC 2018), and at 3 when TS coexists (data-offset 60B
+     * ceiling). conn->n_sack_blocks is already 0..4. */
+    uint8_t n_emit_sack = 0;
+    if (emit_sack) {
+        n_emit_sack = conn->n_sack_blocks;
+        if (n_emit_sack > 4) n_emit_sack = 4;
+        if (emit_ts && n_emit_sack > 3) n_emit_sack = 3;
+    }
     uint32_t tcp_hdr_len;
-    if (flags & TCP_SYN)            tcp_hdr_len = 40;
-    else if (emit_ts && emit_sack)  tcp_hdr_len = 44;
-    else if (emit_ts || emit_sack)  tcp_hdr_len = 32;
-    else                            tcp_hdr_len = 20;
+    if (flags & TCP_SYN) {
+        tcp_hdr_len = 40;
+    } else {
+        tcp_hdr_len = 20;
+        if (emit_ts)     tcp_hdr_len += 12;             /* 2 NOPs + TS(10) */
+        if (n_emit_sack) tcp_hdr_len += 4 + 8 * n_emit_sack; /* 2 NOPs + kind/len + 8*N */
+    }
     uint32_t tcp_total = tcp_hdr_len + data_len;
     uint32_t ip_total  = sizeof(ipv4_hdr_t) + tcp_total;
 
@@ -1097,15 +1116,20 @@ static int tcp_send_segment(tcp_conn_t *conn, uint8_t flags,
             memcpy(opt + off, &tsval, 4); off += 4;
             memcpy(opt + off, &tsecr, 4); off += 4;
         }
-        if (emit_sack) {
-            /* Two NOPs + single-block SACK (10 bytes payload) */
+        if (n_emit_sack) {
+            /* Two NOPs + multi-block SACK (RFC 2018). Each block is 8
+             * bytes (left edge + right edge, network order). Length
+             * field = 2 + 8 * N. tcp_sack_add_block keeps most-recent
+             * blocks at index 0; we iterate in that order. */
             opt[off++] = 0x01; opt[off++] = 0x01;
-            opt[off++] = 0x05;   /* kind = SACK */
-            opt[off++] = 0x0A;   /* length = 2 + 8 (one block) */
-            uint32_t blk_start = htonl(conn->sack_blocks[0][0]);
-            uint32_t blk_end   = htonl(conn->sack_blocks[0][1]);
-            memcpy(opt + off, &blk_start, 4); off += 4;
-            memcpy(opt + off, &blk_end,   4); off += 4;
+            opt[off++] = 0x05;                       /* kind = SACK */
+            opt[off++] = (uint8_t)(2 + 8 * n_emit_sack); /* len */
+            for (uint8_t i = 0; i < n_emit_sack; i++) {
+                uint32_t blk_start = htonl(conn->sack_blocks[i][0]);
+                uint32_t blk_end   = htonl(conn->sack_blocks[i][1]);
+                memcpy(opt + off, &blk_start, 4); off += 4;
+                memcpy(opt + off, &blk_end,   4); off += 4;
+            }
         }
     }
 
