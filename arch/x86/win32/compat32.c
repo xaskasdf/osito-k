@@ -2754,7 +2754,14 @@ uint64_t compat32_dispatch(uint32_t thunk_idx, uint32_t *stack_args)
         static uint32_t snapshot_count = 0;
         int data_changed = (grd != last_grd);
         int num_changed = (grn != last_grn);
-        if (grd != 0 && (data_changed || num_changed) && snapshot_count < 24) {
+        /* Fire ONCE at dispatch #5000 when Num is stable high, to capture
+         * post-Phase 2 state (entries should have Name set by Register). */
+        static uint32_t dispatch_count = 0;
+        static int late_fired = 0;
+        dispatch_count++;
+        int periodic_fire = (!late_fired && grn >= 100 && dispatch_count >= 5000);
+        if (periodic_fire) late_fired = 1;
+        if (grd != 0 && (data_changed || num_changed || periodic_fire) && snapshot_count < 24) {
             volatile uint32_t *fname_tarray = (volatile uint32_t *)(uintptr_t)0x10295D30;
             uint32_t names_data = fname_tarray[0], names_num = fname_tarray[1];
             serial_puts("[GOBJREG-DIAG] Num=");
@@ -2767,6 +2774,64 @@ uint64_t compat32_dispatch(uint32_t thunk_idx, uint32_t *stack_args)
             serial_puthex((uint64_t)grd, 8);
             if (data_changed) serial_puts(" [Data-CHANGED]");
             serial_puts("\n");
+            /* When Num is small, dump every entry with name sweep. When
+             * large (>=100), do a fast scan first showing address-range
+             * histogram (count of entries by DLL region) then dump only
+             * Engine.dll-resident entries (0x10300000-0x104B3000) with
+             * full name sweep. */
+            if (grn >= 100) {
+                uint32_t count_engine = 0, count_core = 0, count_window = 0,
+                         count_d3ddrv = 0, count_galaxy = 0, count_render = 0,
+                         count_other_dll = 0, count_heap = 0;
+                uint32_t *all = (uint32_t *)(uintptr_t)grd;
+                /* DLL bases from runtime log: Engine 0x10300000+0x2C7000,
+                 * Core 0x10100000, Window 0x11000000, D3DDrv 0x10000000,
+                 * Galaxy 0x10600000, Render 0x10B00000. */
+                for (uint32_t i = 0; i < grn; i++) {
+                    uint32_t v = all[i];
+                    if (v >= 0x10300000 && v < 0x105C7000) count_engine++;
+                    else if (v >= 0x10100000 && v < 0x102C0000) count_core++;
+                    else if (v >= 0x11000000 && v < 0x11200000) count_window++;
+                    else if (v >= 0x10000000 && v < 0x10100000) count_d3ddrv++;
+                    else if (v >= 0x10600000 && v < 0x10700000) count_galaxy++;
+                    else if (v >= 0x10B00000 && v < 0x10C00000) count_render++;
+                    else if (v >= 0x10000000 && v < 0x80000000) count_other_dll++;
+                    else if (v >= 0x01000000 && v < 0x10000000) count_heap++;
+                }
+                serial_puts("[GOBJREG-HISTO]");
+                serial_puts(" Engine=");
+                serial_putdec((uint64_t)count_engine);
+                serial_puts(" Core=");
+                serial_putdec((uint64_t)count_core);
+                serial_puts(" Window=");
+                serial_putdec((uint64_t)count_window);
+                serial_puts(" D3DDrv=");
+                serial_putdec((uint64_t)count_d3ddrv);
+                serial_puts(" Galaxy=");
+                serial_putdec((uint64_t)count_galaxy);
+                serial_puts(" Render=");
+                serial_putdec((uint64_t)count_render);
+                serial_puts(" other_dll=");
+                serial_putdec((uint64_t)count_other_dll);
+                serial_puts(" heap=");
+                serial_putdec((uint64_t)count_heap);
+                serial_puts("\n");
+                /* Dump first ~5 entries of each major DLL bucket so we
+                 * can see Engine.dll classes by-address. */
+                serial_puts("[GOBJREG-HISTO] Engine entries:");
+                int shown = 0;
+                for (uint32_t i = 0; i < grn && shown < 10; i++) {
+                    uint32_t v = all[i];
+                    if (v >= 0x10300000 && v < 0x105C7000) {
+                        serial_puts(" [");
+                        serial_putdec((uint64_t)i);
+                        serial_puts("]=0x");
+                        serial_puthex((uint64_t)v, 8);
+                        shown++;
+                    }
+                }
+                serial_puts("\n");
+            }
             uint32_t to_dump = grn > 20 ? 20 : grn;
             uint32_t *slots = (uint32_t *)(uintptr_t)grd;
             for (uint32_t i = 0; i < to_dump; i++) {

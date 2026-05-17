@@ -986,12 +986,17 @@ int winexec_run(const uint8_t *file_data, uint64_t file_size)
                           "FMW-pool@40010700-Next") == 0) {
                 serial_puts("[winexec] HWBP slot 2 armed at Pool+0x18 WRITE\n");
             }
-            /* Slot 3: DISABLED for Step A experiment (HVF blind-spot
-             * confirmation). Phase 2d confirmed step 4 writes EAX=
-             * 0x1092F88C with the EXEC HWBP active. Now without slot
-             * 3 armed, slot 1 (WRITE on 0x1092F88C) should fire on
-             * every write — confirming the HVF EXEC+WRITE suppression. */
-            serial_puts("[winexec] HWBP slot 3 INTENTIONALLY UNARMED for Step A\n");
+            /* Slot 3: Phase 7c — EXEC at Core.dll+0x57DBD = ProcessRegistrants
+             * Phase 2 inner loop's `call ConditionalRegister`. Each hit
+             * captures ECX (= UObject* being processed) + ESI (= loop counter).
+             * The LAST hit before the throw cascade identifies the entry
+             * whose Register() threw, narrowing the layer issue down to a
+             * specific UClass static. */
+            if (hwbp_set(3, 0x10157DBDULL, /*HWBP_EXECUTE*/0, /*HWBP_LEN_1*/0,
+                          "ProcessRegistrants-Phase2-CR-call") == 0) {
+                serial_puts("[winexec] HWBP slot 3 armed at Core.dll+0x57DBD "
+                            "(ProcessRegistrants Phase 2 ConditionalRegister call)\n");
+            }
         }
 
         compat32_enter(entry32, sp32);

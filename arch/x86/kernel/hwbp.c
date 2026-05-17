@@ -203,6 +203,51 @@ bool hwbp_dispatch(struct interrupt_frame *frame)
             serial_puts("\"\n");
         }
 
+        /* Slot 3 (ProcessRegistrants Phase 2 ConditionalRegister probe) logs
+         * compact ECX+ESI+UObject-dump for hits 197..205 — captures the
+         * entries closest to the throw point. */
+        if (i == 3 && hwbps[i].hit_count >= 197 && hwbps[i].hit_count <= 205) {
+            uint32_t ecx32 = (uint32_t)frame->rcx;
+            uint32_t esi32 = (uint32_t)frame->rsi;
+            serial_puts("  [slot3-late] ecx=0x");
+            serial_puthex(ecx32, 8);
+            serial_puts(" esi=");
+            serial_putdec((uint64_t)esi32);
+            /* Dump first 64 bytes of the UClass at ECX, then try to render
+             * each pointer-shaped value as a string from .rdata. */
+            serial_puts(" bytes=");
+            volatile uint32_t *u = (volatile uint32_t *)(uintptr_t)ecx32;
+            for (int k = 0; k < 16; k++) {
+                serial_puts("0x");
+                serial_puthex((uint64_t)u[k], 8);
+                serial_puts(" ");
+            }
+            serial_puts("\n");
+            /* For each pointer-looking field, try to render as ASCII string. */
+            for (int k = 0; k < 16; k++) {
+                uint32_t v = u[k];
+                if (v < 0x10000000 || v >= 0x12000000) continue;
+                volatile char *s = (volatile char *)(uintptr_t)v;
+                /* Check for plausible ASCII string: first chars printable. */
+                int ok = 1;
+                for (int c = 0; c < 4; c++) {
+                    char ch = s[c];
+                    if (ch < 0x20 || ch >= 0x7F) { ok = 0; break; }
+                }
+                if (!ok) continue;
+                serial_puts("    field+0x");
+                serial_puthex((uint64_t)(k * 4), 2);
+                serial_puts(" -> \"");
+                char tmp[40]; int n = 0;
+                for (int c = 0; c < 39 && s[c]; c++) {
+                    char ch = s[c];
+                    tmp[n++] = (ch < 0x20 || ch >= 0x7F) ? '?' : ch;
+                }
+                tmp[n] = 0;
+                serial_puts(tmp);
+                serial_puts("\"\n");
+            }
+        }
         if (hwbps[i].hit_count <= 4) {
             uint32_t esp32 = (uint32_t)frame->rsp;
             uint32_t ecx32 = (uint32_t)frame->rcx;
