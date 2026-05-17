@@ -976,27 +976,12 @@ int winexec_run(const uint8_t *file_data, uint64_t file_size)
                           "FMW-pool@40010700-Next") == 0) {
                 serial_puts("[winexec] HWBP slot 2 armed at Pool+0x18 WRITE\n");
             }
-            /* Slot 3: EXECUTE on 0x10902B2D — the step 4 instruction
-             * of T7's inline Link (`mov [eax], ecx`, where eax=&Before
-             * and ecx=this). Phase 2c proved execution reaches past
-             * this point (hit 7 at 0x10902BAC) but slot 1 (Table head
-             * WRITE) did NOT fire — so either EAX was not 0x1092F88C
-             * here, or HWBP missed it.
-             *
-             * Phase 2d: HWBP_EXECUTE fires BEFORE the instruction —
-             * we capture the actual EAX (target address) and ECX
-             * (value to write). If EAX != 0x1092F88C, we know step 4
-             * wrote somewhere else and slot 1 was correctly silent.
-             * If EAX == 0x1092F88C, then slot 1 missed a real write,
-             * indicating an HWBP coverage bug.
-             *
-             * Retired Pool@0x40010200 dual-WRITE (7 hits captured in
-             * 52b6b51). Slot name "FMW-step4-prefire" routes through
-             * the is_write_probe path (logs every hit). */
-            if (hwbp_set(3, 0x10902B2DULL, /*HWBP_EXECUTE*/0, /*HWBP_LEN_1*/0,
-                          "FMW-step4-prefire") == 0) {
-                serial_puts("[winexec] HWBP slot 3 armed at step4 prefire\n");
-            }
+            /* Slot 3: DISABLED for Step A experiment (HVF blind-spot
+             * confirmation). Phase 2d confirmed step 4 writes EAX=
+             * 0x1092F88C with the EXEC HWBP active. Now without slot
+             * 3 armed, slot 1 (WRITE on 0x1092F88C) should fire on
+             * every write — confirming the HVF EXEC+WRITE suppression. */
+            serial_puts("[winexec] HWBP slot 3 INTENTIONALLY UNARMED for Step A\n");
         }
 
         compat32_enter(entry32, sp32);
