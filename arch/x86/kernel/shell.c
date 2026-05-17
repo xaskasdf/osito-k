@@ -570,6 +570,8 @@ static void cmd_help(void)
     sh_puts("  kexec     Boot a new kernel ELF (kexec [filename])\n");
     sh_puts("  kdownload Fetch a file via OFTP (kdownload <ip> <port> <name> [save|--kexec])\n");
     sh_puts("  kupload   Push a file via OFTP (kupload <ip> <port> <local|--dmesg> [remote])\n");
+    sh_puts("  netconf   Set IP/gw/dns manually (escape hatch when DHCP fails)\n");
+    sh_puts("            netconf <ip> <gw> <dns>\n");
     sh_puts("  ntpsync   Run NTP time sync (time.google.com fallback pool.ntp.org)\n");
     sh_puts("  txdelay   Pace reply-path TX by N µs after last RX (debug)\n");
     sh_puts("            txdelay [N]  — get/set, see net.c hypothesis-A comment\n");
@@ -3873,6 +3875,31 @@ void shell_exec(char *line)
         extern void i211_print_stats(void) __attribute__((weak));
         if (i211_print_stats) i211_print_stats();
         else sh_puts("nic_stats: i211 not built\n");
+    } else if (strcmp(cmd, "netconf") == 0) {
+        /* Manual IP/gw/dns config — for when DHCP fails (e.g. vmnet
+         * without Internet Sharing, or hosts where the DHCP server
+         * just isn't responding).  Pure escape hatch.                */
+        if (argc < 4) {
+            sh_puts("Usage: netconf <ip> <gw> <dns>\n");
+            sh_puts("  e.g. netconf 192.168.64.99 192.168.64.1 8.8.8.8\n");
+        } else {
+            extern void net_set_ip(const uint8_t ip[4]);
+            extern void net_set_gateway(const uint8_t gw[4]);
+            extern void net_dns_set_server(const uint8_t ip[4]);
+            uint8_t ip[4], gw[4], dns[4];
+            if (parse_ip(argv[1], ip) < 0 || parse_ip(argv[2], gw) < 0 ||
+                parse_ip(argv[3], dns) < 0) {
+                sh_puts("netconf: bad IP\n");
+            } else {
+                net_set_ip(ip);
+                net_set_gateway(gw);
+                net_dns_set_server(dns);
+                sh_puts("netconf: ip="); sh_puts(argv[1]);
+                sh_puts(" gw="); sh_puts(argv[2]);
+                sh_puts(" dns="); sh_puts(argv[3]);
+                sh_puts(" — set\n");
+            }
+        }
     } else if (strcmp(cmd, "ntpsync") == 0) {
         extern int ntp_sync(void);
         int r = ntp_sync();
