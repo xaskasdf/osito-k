@@ -972,27 +972,101 @@ int tls13_connect(int tcp_conn, const char *hostname)
                                 case 2: serial_puts("UNKNOWN\n");  break;
                                 default: serial_puts("ERROR\n");   break;
                                 }
+
+                                /* CRL fallback wiring.  Policy:
+                                 *  - OCSP GOOD     → trust the live answer, skip CRL.
+                                 *  - OCSP REVOKED  → already a hard fail, no point
+                                 *                   double-checking.
+                                 *  - OCSP UNKNOWN/ERROR → consult the batch CRL.
+                                 * CRL_REVOKED is a hard abort; CRL_ERROR is logged
+                                 * and we continue (same fail-open posture OCSP has). */
+                                if (ocsp != 0 /* not GOOD */ && ocsp != 1 /* not REVOKED */) {
+                                    extern int crl_check_revoked(
+                                        const uint8_t *cert_der, uint32_t cert_len);
+                                    int crl = crl_check_revoked(
+                                        certs[0], cert_lens[0]);
+                                    serial_puts("[TLS1.3] CRL fallback (OCSP=");
+                                    serial_puts(ocsp == 2 ? "unknown" : "error");
+                                    serial_puts("): ");
+                                    switch (crl) {
+                                    case 0:
+                                        serial_puts("GOOD\n");
+                                        break;
+                                    case 1:
+                                        serial_puts("REVOKED\n");
+                                        /* Hard abort the handshake. */
+                                        return -1;
+                                    default:
+                                        serial_puts("ERROR\n");
+                                        break;
+                                    }
+                                } else if (ocsp == 1) {
+                                    /* OCSP says revoked — honour it. */
+                                    return -1;
+                                }
                             }
 
                             /* AIA chase: if the server sent an
-                             * incomplete chain (no intermediate),
-                             * fetch it from the leaf's caIssuers URL
-                             * and splice into the chain BEFORE we
-                             * run chain-link verification.  Single
-                             * level — enough for typical Let's
-                             * Encrypt + Google PKI deployments. */
-                            static uint8_t aia_der_buf[8192];
-                            if (nc == 1 && nc < 4) {
+                             * incomplete chain, fetch the missing
+                             * intermediates from each top-of-chain
+                             * cert's caIssuers URL and splice into
+                             * the chain BEFORE we run chain-link
+                             * verification.  Recurses up to AIA_MAX
+                             * levels to handle CAs that nest two
+                             * intermediates above the leaf. */
+                            #define AIA_MAX 3
+                            static uint8_t aia_der_bufs[AIA_MAX][8192];
+                            /* URL dedup table: each fetched URL is
+                             * hashed (FNV-1a 32-bit, first 8 chars
+                             * of the encoded SHA-256 would be more
+                             * collision-safe but this is for one
+                             * handshake's ≤3 URLs so FNV suffices). */
+                            uint32_t aia_tried[AIA_MAX] = {0};
+                            int aia_tried_n = 0;
+                            for (int depth = 0; depth < AIA_MAX && nc < 4; depth++) {
+                                /* Peek the URL on the current top-of-chain
+                                 * cert so we can dedup before fetching. */
+                                char url_peek[256];
+                                int  ulen = x509_get_aia_caissuers(
+                                    certs[nc - 1], cert_lens[nc - 1],
+                                    url_peek, sizeof url_peek);
+                                if (ulen <= 0) {
+                                    /* No more caIssuers — chain head is
+                                     * either already a root or self-signed. */
+                                    break;
+                                }
+                                /* FNV-1a 32. */
+                                uint32_t h = 2166136261u;
+                                for (int i = 0; i < ulen; i++) {
+                                    h ^= (uint8_t)url_peek[i];
+                                    h *= 16777619u;
+                                }
+                                bool seen = false;
+                                for (int i = 0; i < aia_tried_n; i++) {
+                                    if (aia_tried[i] == h) { seen = true; break; }
+                                }
+                                if (seen) {
+                                    serial_puts("[AIA] URL already tried this handshake — stop\n");
+                                    break;
+                                }
+                                if (aia_tried_n < AIA_MAX)
+                                    aia_tried[aia_tried_n++] = h;
+
                                 uint32_t alen = 0;
                                 if (aia_chase_intermediate(
-                                        certs[0], cert_lens[0],
-                                        aia_der_buf, &alen,
-                                        sizeof aia_der_buf) == 0) {
-                                    certs[nc]     = aia_der_buf;
-                                    cert_lens[nc] = alen;
-                                    nc++;
-                                    serial_puts("[AIA] chain extended\n");
+                                        certs[nc - 1], cert_lens[nc - 1],
+                                        aia_der_bufs[depth], &alen,
+                                        sizeof aia_der_bufs[depth]) != 0) {
+                                    /* Fetch failed — stop, don't keep
+                                     * hammering the same dead URL. */
+                                    break;
                                 }
+                                certs[nc]     = aia_der_bufs[depth];
+                                cert_lens[nc] = alen;
+                                nc++;
+                                serial_puts("[AIA] chain extended to depth ");
+                                serial_putdec((uint64_t)(depth + 1));
+                                serial_puts("\n");
                             }
 
                             /* Chain link verification: each cert is
