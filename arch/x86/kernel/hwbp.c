@@ -298,8 +298,9 @@ bool hwbp_dispatch(struct interrupt_frame *frame)
                     serial_puts(" ebp=0x"); serial_puthex(ebp32, 8);
                     serial_puts(" ecx=0x"); serial_puthex((uint64_t)frame->rcx, 8);
                     serial_puts("\n");
-                    /* Dump the pool struct that triggered the mismatch.
-                     * ECX is the Pool*, dump first 0x20 bytes. */
+                    /* Dump the pool struct that triggered the mismatch
+                     * AND walk the full Table->FirstPool list to see
+                     * the broader corruption pattern. */
                     uint32_t pool_ptr = (uint32_t)frame->rcx;
                     if (pool_ptr >= 0x10000 && (uint64_t)pool_ptr < 0x80000000ULL) {
                         serial_puts("  [FMW-MISMATCH] pool@0x");
@@ -311,6 +312,27 @@ bool hwbp_dispatch(struct interrupt_frame *frame)
                             serial_puts("=0x"); serial_puthex(v, 8);
                         }
                         serial_puts("\n");
+                    }
+                    /* Walk Table->FirstPool list. cursor is &Table->FirstPool
+                     * (we read it above as cursor_val). Walk = *cursor →
+                     * pool->Next → pool->Next->Next → ... NULL.
+                     * Dump first 8 nodes with their Next/PrevLink. */
+                    if (cursor_val >= 0x10000 && (uint64_t)cursor_val < 0x80000000ULL) {
+                        uint32_t head = *(volatile uint32_t *)(uintptr_t)cursor_val;
+                        serial_puts("  [FMW-MISMATCH] walking Table->FirstPool chain (head=*cursor):\n");
+                        for (int n = 0; n < 8; n++) {
+                            if (head == 0) { serial_puts("    [end]\n"); break; }
+                            if (head < 0x10000 || (uint64_t)head >= 0x80000000ULL) {
+                                serial_puts("    [bad ptr 0x"); serial_puthex(head, 8); serial_puts("]\n"); break;
+                            }
+                            uint32_t nxt = *(volatile uint32_t *)(uintptr_t)(head + 0x18);
+                            uint32_t prv = *(volatile uint32_t *)(uintptr_t)(head + 0x1c);
+                            serial_puts("    pool@0x"); serial_puthex(head, 8);
+                            serial_puts(" Next=0x"); serial_puthex(nxt, 8);
+                            serial_puts(" PrevLink=0x"); serial_puthex(prv, 8);
+                            serial_puts("\n");
+                            head = nxt;
+                        }
                     }
                 }
             }

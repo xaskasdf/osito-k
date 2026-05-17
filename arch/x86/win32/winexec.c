@@ -980,12 +980,20 @@ int winexec_run(const uint8_t *file_data, uint64_t file_size)
                           "StaticFindObject") == 0) {
                 serial_puts("[winexec] HWBP slot 2 armed at StaticFindObject\n");
             }
-            /* Slot 3: EXECUTE on StaticLoadClass body (Core.dll+0x1015A670).
-             * Pairs with slot 2 — together they show the engine's full
-             * class-lookup pattern. */
-            if (hwbp_set(3, 0x1015A670ULL, /*HWBP_EXECUTE*/0, /*HWBP_LEN_1*/0,
-                          "StaticLoadClass") == 0) {
-                serial_puts("[winexec] HWBP slot 3 armed at StaticLoadClass\n");
+            /* Slot 3: WRITE on Pool@0x40010700 PrevLink field (offset +0x1C).
+             * Phase 1 found Pool 0x40010700 is linked in two FMallocWindows
+             * lists simultaneously (PrevLink = 0x40010218 from one chain,
+             * but walk arrives via cursor 0x1092F88C from another chain).
+             * HWBP_WRITE catches every writer to the PrevLink slot —
+             * expected: two writers, one normal Link operation each.
+             * The second writer (or non-Link writer) reveals the
+             * disruption.
+             *
+             * Retired StaticLoadClass slot 3 — we have its data and
+             * StaticFindObject (slot 2) shows the same info plus more. */
+            if (hwbp_set(3, 0x4001071CULL, /*HWBP_WRITE*/1, /*HWBP_LEN_4*/3,
+                          "FMW-pool-PrevLink") == 0) {
+                serial_puts("[winexec] HWBP slot 3 armed at Pool+0x1C WRITE\n");
             }
         }
 
