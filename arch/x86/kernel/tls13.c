@@ -98,6 +98,7 @@ static void t13_memset(void *p, int v, uint32_t n)
 #define TLS_EXT_SUPPORTED_GROUPS    10
 #define TLS_EXT_SIG_ALGS            13
 #define TLS_EXT_SERVER_NAME          0
+#define TLS_EXT_STATUS_REQUEST       5    /* RFC 6066 §8 / RFC 8446 §4.4.2.1 */
 
 #define TLS_GROUP_X25519     0x001D
 #define TLS_SIG_ECDSA_P256_SHA256  0x0403
@@ -255,6 +256,20 @@ static int build_client_hello(uint8_t *buf, uint32_t cap, const char *hostname)
     buf[p++] = 0x00; buf[p++] = 0x1D;            /* group: x25519 */
     buf[p++] = 0x00; buf[p++] = 0x20;            /* key len: 32 */
     t13_memcpy(buf + p, s13.client_pub, 32); p += 32;
+
+    /* status_request (RFC 6066 §8 / RFC 8446 §4.4.2.1) — request that
+     * the server staple an OCSP response inside its Certificate message,
+     * sparing us a separate ~300ms HTTP roundtrip per chain cert.  Body:
+     *   CertificateStatusType = ocsp (1)
+     *   ResponderID list      uint16(0)  -- empty: any responder
+     *   request_extensions    uint16(0)  -- empty
+     * ext_data is 5 bytes; total ext is 9 bytes including the 4-byte
+     * type+len header. */
+    buf[p++] = 0x00; buf[p++] = TLS_EXT_STATUS_REQUEST;
+    buf[p++] = 0x00; buf[p++] = 0x05;            /* ext_data length: 5 */
+    buf[p++] = 0x01;                              /* status_type = ocsp(1) */
+    buf[p++] = 0x00; buf[p++] = 0x00;            /* responder_id_list: 0 */
+    buf[p++] = 0x00; buf[p++] = 0x00;            /* extensions: 0 */
 
     /* server_name (SNI) */
     if (hostname && hostname[0]) {
@@ -835,20 +850,59 @@ int tls13_connect(int tcp_conn, const char *hostname)
                             const uint8_t *certs[4];
                             uint32_t       cert_lens[4];
                             int            nc = 0;
+                            /* Stapled OCSP for the leaf (RFC 6066 §8 /
+                             * RFC 8446 §4.4.2.1).  Servers attach the
+                             * status_request extension (type=5) to the
+                             * leaf's CertificateEntry; its body is a
+                             *   CertificateStatus { uint8 type=ocsp(1),
+                             *                       opaque resp<1..2^24-1> }
+                             * Captured here, consumed by the chain
+                             * verifier below to skip the outbound OCSP
+                             * call when GOOD. */
+                            const uint8_t *stapled_ocsp = NULL;
+                            uint32_t       stapled_ocsp_len = 0;
                             while (walk + 3 <= walk_end && nc < 4) {
                                 uint32_t clen = ((uint32_t)rec[walk] << 16) |
                                                  ((uint32_t)rec[walk + 1] << 8) |
                                                   rec[walk + 2];
                                 walk += 3;
                                 if (walk + clen > walk_end) break;
+                                int this_idx = nc;
                                 certs[nc]     = rec + walk;
                                 cert_lens[nc] = clen;
                                 nc++;
                                 walk += clen;
-                                /* Skip per-entry extensions. */
+                                /* Per-entry extensions block. */
                                 if (walk + 2 > walk_end) break;
                                 uint16_t elen = ((uint16_t)rec[walk] << 8) | rec[walk + 1];
-                                walk += 2 + elen;
+                                walk += 2;
+                                if (walk + elen > walk_end) break;
+                                /* Scan extensions ONLY on the leaf for
+                                 * status_request (type=5). */
+                                if (this_idx == 0) {
+                                    uint32_t eo = walk;
+                                    uint32_t ee = walk + elen;
+                                    while (eo + 4 <= ee) {
+                                        uint16_t etype = ((uint16_t)rec[eo] << 8) | rec[eo + 1];
+                                        uint16_t elen2 = ((uint16_t)rec[eo + 2] << 8) | rec[eo + 3];
+                                        eo += 4;
+                                        if (eo + elen2 > ee) break;
+                                        if (etype == TLS_EXT_STATUS_REQUEST && elen2 >= 4) {
+                                            /* CertificateStatus: type(1) + len(3) + resp. */
+                                            if (rec[eo] == 0x01) {
+                                                uint32_t rlen = ((uint32_t)rec[eo + 1] << 16) |
+                                                                 ((uint32_t)rec[eo + 2] << 8)  |
+                                                                  rec[eo + 3];
+                                                if (rlen > 0 && 4 + rlen <= elen2) {
+                                                    stapled_ocsp     = rec + eo + 4;
+                                                    stapled_ocsp_len = rlen;
+                                                }
+                                            }
+                                        }
+                                        eo += elen2;
+                                    }
+                                }
+                                walk += elen;
                             }
 
                             /* Pin check on the leaf: synthesize a
@@ -962,9 +1016,35 @@ int tls13_connect(int tcp_conn, const char *hostname)
                                 extern int ocsp_check(
                                     const uint8_t *cert, uint32_t cert_len,
                                     const uint8_t *issuer, uint32_t issuer_len);
-                                int ocsp = ocsp_check(
-                                    certs[0], cert_lens[0],
-                                    certs[1], cert_lens[1]);
+                                extern int ocsp_parse_stapled(
+                                    const uint8_t *resp,   uint32_t resp_len,
+                                    const uint8_t *cert,   uint32_t cert_len,
+                                    const uint8_t *issuer, uint32_t issuer_len);
+                                int ocsp = -1;
+                                /* Try stapled response first (RFC 6066 §8). */
+                                if (stapled_ocsp && stapled_ocsp_len > 0) {
+                                    int sst = ocsp_parse_stapled(
+                                        stapled_ocsp, stapled_ocsp_len,
+                                        certs[0], cert_lens[0],
+                                        certs[1], cert_lens[1]);
+                                    serial_puts("[TLS1.3] OCSP stapled: ");
+                                    switch (sst) {
+                                    case 0: serial_puts("GOOD\n");     break;
+                                    case 1: serial_puts("REVOKED\n");  break;
+                                    case 2: serial_puts("UNKNOWN\n");  break;
+                                    default: serial_puts("parse failed -> fallback to outbound\n"); break;
+                                    }
+                                    /* Accept GOOD/REVOKED from stapled
+                                     * (saves ~300ms).  UNKNOWN / parse
+                                     * error fall through to the outbound
+                                     * query. */
+                                    if (sst == 0 || sst == 1) ocsp = sst;
+                                }
+                                if (ocsp < 0) {
+                                    ocsp = ocsp_check(
+                                        certs[0], cert_lens[0],
+                                        certs[1], cert_lens[1]);
+                                }
                                 serial_puts("[TLS1.3] OCSP status: ");
                                 switch (ocsp) {
                                 case 0: serial_puts("GOOD\n");     break;

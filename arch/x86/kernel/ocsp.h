@@ -37,4 +37,17 @@ typedef enum {
 ocsp_status_t ocsp_check(const uint8_t *cert,    uint32_t cert_len,
                          const uint8_t *issuer,  uint32_t issuer_len);
 
+/* Parse + verify a STAPLED OCSP response (RFC 6066 §8 / RFC 8446
+ * §4.4.2.1).  The server attaches the DER OCSPResponse inside the
+ * Certificate handshake message — no outbound HTTP needed.  Returns:
+ *   OCSP_GOOD     — responder asserts the cert is not revoked
+ *   OCSP_REVOKED  — responder asserts the cert is revoked
+ *   OCSP_UNKNOWN  — responder doesn't know about this cert
+ *   OCSP_ERROR    — parse failure
+ * Signature verification follows the same informative-mode policy as
+ * ocsp_check: result logged but does not change the returned status. */
+ocsp_status_t ocsp_parse_stapled(const uint8_t *resp,   uint32_t resp_len,
+                                 const uint8_t *cert,   uint32_t cert_len,
+                                 const uint8_t *issuer, uint32_t issuer_len);
+
 #endif

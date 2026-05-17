@@ -537,3 +537,20 @@ ocsp_status_t ocsp_check(const uint8_t *cert, uint32_t cert_len,
     (void)ocsp_verify_sig(&vm, cert, cert_len, issuer, issuer_len);
     return st;
 }
+
+/* RFC 6066 §8 / RFC 8446 §4.4.2.1 — parse a STAPLED OCSP response
+ * embedded inside the Certificate handshake message.  Same parser as
+ * ocsp_check uses; just skips the network roundtrip. */
+ocsp_status_t ocsp_parse_stapled(const uint8_t *resp,   uint32_t resp_len,
+                                 const uint8_t *cert,   uint32_t cert_len,
+                                 const uint8_t *issuer, uint32_t issuer_len)
+{
+    if (!resp || resp_len == 0) return OCSP_ERROR;
+    serial_puts("[OCSP] stapled response "); serial_putdec((uint64_t)resp_len);
+    serial_puts(" bytes\n");
+    ocsp_verify_material_t vm = { 0 };
+    ocsp_status_t st = parse_ocsp_response(resp, resp_len, &vm);
+    if (st == OCSP_ERROR) return st;
+    (void)ocsp_verify_sig(&vm, cert, cert_len, issuer, issuer_len);
+    return st;
+}
