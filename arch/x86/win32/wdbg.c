@@ -633,6 +633,85 @@ static void exit_caller_dump(uint32_t va, uint32_t esp, uint32_t ebp,
     wdbg_stack_scan(esp, 80, "exit-stack");
 }
 
+/*
+ * UT.exe+0x4756 caller hunt. The stack-scan from the throw region
+ * identified UT.exe+0x4756 as the topmost frame on the
+ * "Failed to load '0'" → "Failed to load ''" → " .GameEngine"
+ * cascade. Hook the surrounding basic block so every thunk call
+ * made from there dumps:
+ *   - the symbolized ret_va (which thunk),
+ *   - arg0..arg5 (the LoadObject path takes the package/class/name
+ *     wide-strings as args),
+ *   - arg0 + ECX + EDX rendered as wide-strings when they look like
+ *     pointers (LoadObject's first wstring arg is typically the
+ *     package, and ECX is the `this`).
+ */
+static int g_ut_hook_fired = 0;
+
+static void ut_caller_dump(uint32_t va, uint32_t esp, uint32_t ebp,
+                            const uint32_t *stack_args)
+{
+    g_ut_hook_fired++;
+    if (g_ut_hook_fired > 20) {
+        if ((g_ut_hook_fired % 5000) == 0) {
+            serial_puts("[WDBG/ut] still firing: hits=");
+            serial_putdec((uint64_t)g_ut_hook_fired);
+            serial_puts("\n");
+        }
+        return;
+    }
+    (void)ebp;
+    char sym[64];
+    serial_puts("[WDBG/ut#");
+    serial_putdec((uint64_t)g_ut_hook_fired);
+    serial_puts("] inside=");
+    serial_puts(wdbg_symbolize(va, sym, sizeof sym));
+
+    extern uint64_t g_int2e_user_rcx, g_int2e_user_rdx;
+    uint32_t ecx = (uint32_t)g_int2e_user_rcx;
+    uint32_t edx = (uint32_t)g_int2e_user_rdx;
+    serial_puts(" ECX="); serial_puthex(ecx, 8);
+    serial_puts(" EDX="); serial_puthex(edx, 8);
+    serial_puts("\n");
+
+    serial_puts("[WDBG/ut#");
+    serial_putdec((uint64_t)g_ut_hook_fired);
+    serial_puts("] args:");
+    for (int i = 0; i < 6; i++) {
+        if (!va_readable(esp + i * 4, 4)) break;
+        serial_puts(" ["); serial_putdec((uint64_t)i); serial_puts("]=");
+        serial_puthex(stack_args[i], 8);
+    }
+    serial_puts("\n");
+
+    /* Each arg / ECX / EDX rendered as wide-string when it looks
+     * like a pointer to readable memory. wdbg_print_wide handles
+     * NULL / unreadable / unterminated safely. */
+    uint32_t cands[8];
+    cands[0] = ecx;
+    cands[1] = edx;
+    for (int i = 0; i < 6; i++)
+        cands[2 + i] = va_readable(esp + i * 4, 4) ? stack_args[i] : 0;
+    static const char *labels[8] = {
+        "ECX", "EDX", "arg0", "arg1", "arg2", "arg3", "arg4", "arg5"
+    };
+    for (int i = 0; i < 8; i++) {
+        uint32_t a = cands[i];
+        if (a < 0x10000 || a >= 0x80000000u) continue;
+        if (!va_readable(a, 4)) continue;
+        uint16_t w0 = *(volatile uint16_t *)(uintptr_t)a;
+        /* Heuristic: a wide-string starts with a printable ASCII
+         * (0x20..0x7E) low byte and the high byte is 0. */
+        if ((w0 & 0xFF) >= 0x20 && (w0 & 0xFF) < 0x7F && (w0 >> 8) == 0) {
+            serial_puts("[WDBG/ut#");
+            serial_putdec((uint64_t)g_ut_hook_fired);
+            serial_puts("] "); serial_puts(labels[i]); serial_puts("=");
+            wdbg_print_wide(a);
+            serial_puts("\n");
+        }
+    }
+}
+
 void wdbg_init(void)
 {
     /* Pre-register UT99 module ranges (empirically observed). These
@@ -664,5 +743,15 @@ void wdbg_init(void)
                    exit_caller_dump,
                    "UT-exit-0x221BA-region");
 
-    serial_puts("[WDBG] init: 3 modules, 3 hooks registered\n");
+    /* UT.exe+0x4700..0x4800 — basic block around 0x4756 identified
+     * by the throw-helper stack scan as the topmost frame on the
+     * "Failed to load '0'" cascade. Hook dumps every thunk call from
+     * here so we can see exactly what string argument UT.exe is
+     * passing to Core.dll when the engine asks for the missing
+     * package. */
+    wdbg_addr_hook(0x10904700, 0x10904800,
+                   ut_caller_dump,
+                   "UT-loadcaller-0x4756-region");
+
+    serial_puts("[WDBG] init: 3 modules, 4 hooks registered\n");
 }
