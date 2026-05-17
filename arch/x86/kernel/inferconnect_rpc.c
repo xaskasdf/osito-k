@@ -344,6 +344,15 @@ static void ic_handle_connection(int conn)
 static void ic_rpc_thread(void *data)
 {
     (void)data;
+    /* Mask all SIMD floating-point exceptions in this kthread's MXCSR.
+     * Default mask (0x1F80) suppresses PE/UE/OE/ZE/DE/IE. Without this,
+     * a downstream call that runs FP code on denormal inputs (e.g.
+     * agent_submit_slot → llama_forward) raises #XM and the kthread
+     * is killed. Same fix the agent slot kthread + OpenAI server use. */
+    {
+        uint32_t mxcsr = 0x1F80;
+        __asm__ __volatile__("ldmxcsr %0" :: "m"(mxcsr));
+    }
     int listener = net_tcp_listen(ic_rpc_port);
     if (listener < 0) {
         serial_puts("[IC-RPC] failed to listen — abort\n");

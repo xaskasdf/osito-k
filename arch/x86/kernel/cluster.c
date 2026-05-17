@@ -740,10 +740,16 @@ static void cluster_delegate_probe_thread(void *unused)
                                                 const char *prompt,
                                                 char *out, uint32_t cap);
 
-    serial_puts("[CLUSTER-PROBE] waiting for ALIVE peer (≤120s)...\n");
+    /* Wait for the LOCAL agent to finish initializing before we look
+     * for peers. ALIVE peer transition already implies the peer's
+     * IC-RPC server is listening, but its agent may still be coming
+     * up — we add a settle window below. */
+    extern bool agent_is_initialized(void);
+    serial_puts("[CLUSTER-PROBE] waiting for local agent_init + ALIVE peer (≤120s)...\n");
     uint64_t deadline = idt_get_ticks() + 12000;
     int peer = -1;
     while (idt_get_ticks() < deadline) {
+        if (!agent_is_initialized()) { sched_yield(); continue; }
         for (int i = 0; i < CLUSTER_MAX_PEERS; i++) {
             if (g_meta[i].in_use && g_meta[i].state == PEER_ALIVE
                 && g_meta[i].rpc_port != 0) {
@@ -757,6 +763,10 @@ static void cluster_delegate_probe_thread(void *unused)
         serial_puts("[CLUSTER-PROBE] no ALIVE peer found — aborting\n");
         return;
     }
+    /* Brief settle: give the peer's agent_init time too if they
+     * started slightly later. 10 s is generous for paired boot. */
+    uint64_t settle_until = idt_get_ticks() + 1000;
+    while (idt_get_ticks() < settle_until) sched_yield();
     cluster_peer_meta_t *m = &g_meta[peer];
     serial_puts("[CLUSTER-PROBE] delegating to ");
     put_ip(m->ip); serial_puts(":");

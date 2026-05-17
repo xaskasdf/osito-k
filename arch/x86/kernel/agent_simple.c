@@ -37,6 +37,7 @@ typedef struct {
 static agent_slot_t g_slots[AGENT_N_SLOTS];
 static volatile uint64_t g_next_task_id = 1;
 static volatile bool g_worker_started = false;
+static volatile bool g_agent_ready = false;
 
 extern llama_state_t *prompt_llama;
 extern char g_tokenizer[];
@@ -139,11 +140,22 @@ static void agent_worker(void *_)
     }
 }
 
-static void agent_ensure_worker(void)
+/* Init-ready gate (osito-a parity). Without this, an RPC-arrived
+ * agent task that races boot can land before the worker is alive
+ * and the slot's task_id collide with a later submission. */
+bool agent_is_initialized(void)
+{
+    return g_agent_ready;
+}
+
+void agent_init(void)
 {
     if (g_worker_started) return;
     g_worker_started = true;
     kthread_create("agent-worker", agent_worker, NULL);
+    __sync_synchronize();
+    g_agent_ready = true;
+    serial_puts("[AGENT] init complete (4 slots, single worker, greedy sampler)\n");
 }
 
 /* ── Public API ──────────────────────────────────────────────── */
@@ -153,6 +165,9 @@ int64_t agent_submit_slot(uint32_t slot, const char *prompt,
 {
     (void)temp;  /* Greedy sampler in v1 — bandit/temperature ignored. */
     if (slot >= AGENT_N_SLOTS) return -1;
+    /* Refuse before init complete — osito-a's `-5` convention. The
+     * caller (ic_handle_agent_task) falls through to its echo path. */
+    if (!g_agent_ready) return -5;
 
     agent_slot_t *sl = &g_slots[slot];
     if (sl->pending) return -1;  /* slot busy */
@@ -172,8 +187,6 @@ int64_t agent_submit_slot(uint32_t slot, const char *prompt,
     sl->task_id = tid;
     __sync_synchronize();
     sl->pending = 1;
-
-    agent_ensure_worker();
     return (int64_t)tid;
 }
 

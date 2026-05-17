@@ -768,6 +768,29 @@ void __initk kernel_entry(boot_info_t *info)
 
             net_udp_listen(7777, prompt_handler);
 
+            /* Agent task queue init (single-worker, 4 slots). Must run
+             * before inferconnect_start so any incoming RPC agent_task
+             * sees agent_is_initialized() = true. */
+            extern void agent_init(void);
+            agent_init();
+
+            /* Inferconnect: UDP heartbeat + TCP RPC server (port 19999).
+             * cluster: liveness state machine on top + V1 LAN rendezvous. */
+            extern int  inferconnect_start(void);
+            extern void cluster_init(void);
+            inferconnect_start();
+            cluster_init();
+
+            /* Optional cross-node delegation probe — triggered only
+             * when `cluster-delegate.txt` sentinel exists in osfs2. */
+            {
+                vfs_node_t n;
+                extern void cluster_delegate_probe_start(void);
+                if (osfs2_is_mounted() &&
+                    vfs_find("cluster-delegate.txt", VFS_MODE_POSIX, &n))
+                    cluster_delegate_probe_start();
+            }
+
             /* A12.4: load any previously-captured dynamic leaf-cert pins
              * from osfs2 (`tls/pins.bin`). After the static intermediate
              * pin validates a CF chain, we remember the leaf so the next
