@@ -3262,6 +3262,42 @@ int WINAPI crt_vsnwprintf(WCHAR *buf, SIZE_T count, const WCHAR *fmt, ms_va_list
     /* Walk the 32-bit va_list manually — 4 bytes per arg */
     uint32_t *vp = (uint32_t *)(void *)ap;
 
+    /* Diagnostic: print caller_eip + first 4 args when fmt starts with
+     * "Failed to load" — this is the appSprintf that builds the cascade
+     * we're hunting. */
+    if (fmt[0] == L'F' && fmt[1] == L'a' && fmt[2] == L'i' && fmt[3] == L'l') {
+        extern uint32_t compat32_get_last_caller_eip(void);
+        extern void serial_puthex(uint64_t v, int d);
+        uint32_t ceip = compat32_get_last_caller_eip();
+        serial_puts("[FAIL-FMT] caller_eip=0x");
+        serial_puthex((uint64_t)ceip, 8);
+        serial_puts(" fmt=\"");
+        for (int k = 0; k < 50 && fmt[k]; k++)
+            serial_putchar((char)(fmt[k] & 0x7F));
+        serial_puts("\" args=");
+        for (int k = 0; k < 6; k++) {
+            serial_puts(" [");
+            serial_putdec((uint64_t)k);
+            serial_puts("]=0x");
+            serial_puthex((uint64_t)vp[k], 8);
+        }
+        serial_puts("\n");
+        for (int k = 0; k < 6; k++) {
+            uint32_t a = vp[k];
+            if (a < 0x10000 || a >= 0x80000000u) continue;
+            const WCHAR *p = (const WCHAR *)(uintptr_t)a;
+            uint16_t w0 = *(volatile uint16_t *)p;
+            uint8_t lo = (uint8_t)(w0 & 0xFF), hi = (uint8_t)(w0 >> 8);
+            if (lo < 0x20 || lo >= 0x7F || hi != 0) continue;
+            serial_puts("  arg[");
+            serial_putdec((uint64_t)k);
+            serial_puts("]=L\"");
+            for (int j = 0; j < 60 && p[j]; j++)
+                serial_putchar((char)(p[j] & 0x7F));
+            serial_puts("\"\n");
+        }
+    }
+
     /* Debug: trace first 30 calls to see what's going on */
     if (vsnw_trace_count < 30) {
         vsnw_trace_count++;
@@ -3744,6 +3780,33 @@ SIZE_T WINAPI crt_wcslen(const WCHAR *s)
 
 WCHAR* WINAPI crt_wcscpy(WCHAR *dst, const WCHAR *src)
 {
+    /* Diagnostic: catch the caller that copies the bad "0" package name.
+     * Renders src as ASCII when it looks like a wstring, then logs caller
+     * EIP via compat32's saved per-thunk return address. */
+    if (src && ((uintptr_t)src >= 0x10000) && ((uintptr_t)src < 0x80000000ULL)) {
+        const WCHAR *s = src;
+        if (s[0] == L'0' && s[1] == 0) {
+            extern uint32_t compat32_get_last_caller_eip(void);
+            extern uint32_t g_last_stack_args;
+            extern void serial_puts(const char *s);
+            extern void serial_puthex(uint64_t v, int d);
+            uint32_t ceip = compat32_get_last_caller_eip();
+            uint32_t outer = 0;
+            /* stack_args[2] for a jmp-thunk wcscpy is the outer caller's
+             * return address (the real user code that wanted to copy "0"). */
+            if (g_last_stack_args) {
+                uint32_t *sa = (uint32_t *)(uintptr_t)g_last_stack_args;
+                outer = sa[2];
+            }
+            serial_puts("[wcscpy] src=L\"0\" dst=0x");
+            serial_puthex((uint64_t)(uintptr_t)dst, 8);
+            serial_puts(" inner_eip=0x");
+            serial_puthex((uint64_t)ceip, 8);
+            serial_puts(" outer_eip=0x");
+            serial_puthex((uint64_t)outer, 8);
+            serial_puts("\n");
+        }
+    }
     WCHAR *d = dst;
     while ((*d++ = *src++));
     return dst;

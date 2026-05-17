@@ -910,24 +910,43 @@ int winexec_run(const uint8_t *file_data, uint64_t file_size)
             }
         }
 
-        /* Arm hardware breakpoint at the UT.exe LoadObject call-site that
-         * earlier wdbg stack-scans pinned as the topmost frame on the
-         * 'Failed to load 0' cascade. The call is an indirect-via-IAT
-         * `call DWORD PTR ds:0x10958c38` at 0x10904750 (6 bytes), with
-         * three dwords already pushed (one from the preceding push ecx).
-         * On HWBP_EXECUTE fire, hwbp_dispatch prints ECX/EDX + stack[0..7]
-         * + tries a wide-string render so we see exactly what package
-         * name UT.exe is asking Core.dll to load. The address is gated
-         * on the PE being UT.exe (ImageBase 0x10900000): nothing else
-         * is mapped there in our compat32 layout so it's safe. */
+        /* Arm hardware breakpoint at Core.dll+0x22DBB — the instruction
+         * just AFTER an inline appSprintf wrapper around _vsnwprintf
+         * (the wrapper lives at Core.dll+0x22DA0..0x22DBB and the
+         * earlier wdbg stack-scan from the 'Failed to load 0' cascade
+         * always shows 0x22DBB as the post-call retaddr).
+         *
+         * At HWBP fire time, the 4 dwords just pushed for vsnwprintf
+         * are still on the stack:
+         *   [esp+0]  = buffer (now contains the formatted wide string)
+         *   [esp+4]  = count (= 1024)
+         *   [esp+8]  = format
+         *   [esp+12] = va_list pointer
+         *
+         * Rendering the wstring at [esp+0] tells us exactly what
+         * string Core.dll just produced. When the cascade is
+         * formatting the package name "0" / "" / " .GameEngine" via
+         * this wrapper, the next 8 fires after Engine.u will show
+         * the offending string content. */
         if ((uint32_t)(ULONG_PTR)info.ImageBase == 0x10900000) {
             extern int hwbp_set(int slot, uint64_t addr, int cond, int len,
                                 const char *name);
-            if (hwbp_set(0, 0x10904750ULL, /*HWBP_EXECUTE*/0, /*HWBP_LEN_1*/0,
-                          "UT-LoadObject@4750") == 0) {
-                serial_puts("[winexec] HWBP slot 0 armed at UT.exe+0x4750\n");
+            if (hwbp_set(0, 0x10122dbbULL, /*HWBP_EXECUTE*/0, /*HWBP_LEN_1*/0,
+                          "Core-appSprintf-post@22DBB") == 0) {
+                serial_puts("[winexec] HWBP slot 0 armed at Core.dll+0x22DBB\n");
             } else {
                 serial_puts("[winexec] HWBP slot 0 arm FAILED\n");
+            }
+            /* Slot 1: WRITE-watch the heap slot where the engine has
+             * been writing the wide-string "0" right before the
+             * PackageNotFound throw cascade. Every previous run has
+             * placed the string at 0x4013F9FC (compat32 heap is
+             * deterministic in our layout), so when the writer
+             * touches that slot we'll see RIP land in the function
+             * that constructs the bad package name. */
+            if (hwbp_set(1, 0x4013F9FCULL, /*HWBP_WRITE*/1, /*HWBP_LEN_4*/3,
+                          "engine-pkgname-buf") == 0) {
+                serial_puts("[winexec] HWBP slot 1 armed at 0x4013F9FC (WRITE)\n");
             }
         }
 

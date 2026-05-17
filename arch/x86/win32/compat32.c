@@ -2260,35 +2260,142 @@ uint64_t compat32_dispatch(uint32_t thunk_idx, uint32_t *stack_args)
      * If FName::Names contains valid entries, UClass::Name fields
      * resolve correctly → class hierarchy lookups work → UGameEngine
      * is constructable → Browse() works → Level loads. */
+    /* Patch Core.dll's FName-register "Hardcoded name was duplicated"
+     * check. Instruction at 0x10150AEF is `74 15  je 0x10150B06` —
+     * skip-error if Names[Index] == NULL. Once we pre-populate
+     * Names[0] with NAME_None for the FName-converter (below), that
+     * test always fails on entry and the engine appErrorf()s + throws.
+     * The next instruction (at 0x10150B06) unconditionally overwrites
+     * Names[Index] = ebx anyway, so converting the je into an
+     * unconditional jmp (EB 15) loses nothing — and lets the engine's
+     * own hardcoded-name init proceed past the duplicate check. */
+    {
+        static int patched_hardcode_dup_check = 0;
+        if (!patched_hardcode_dup_check) {
+            volatile uint8_t *p = (volatile uint8_t *)(uintptr_t)0x10150AEFULL;
+            if (p[0] == 0x74 && p[1] == 0x15) {
+                p[0] = 0xEB;
+                patched_hardcode_dup_check = 1;
+                serial_puts("[FNAME-RESCUE] patched Core.dll+0x50AEF "
+                            "je→jmp (skip hardcode-dup-check error)\n");
+            }
+        }
+    }
     {
         volatile uint32_t *fname_tarray = (volatile uint32_t *)(uintptr_t)0x10295D30;
         static uint64_t fname_buf_phys = 0;
+        static uint64_t fname_none_entry = 0;
         uint32_t fd = fname_tarray[0], fn = fname_tarray[1], fm = fname_tarray[2];
         if (fd == 0 && fm == 0) {
             if (fname_buf_phys == 0) {
                 extern void *mem_alloc_pages(uint64_t count);
-                void *buf = mem_alloc_pages(4);  /* 16 KB = room for 4096 8-byte entries */
-                if (buf) {
-                    uint64_t pa = (uint64_t)buf;
-                    uint8_t *p = (uint8_t *)pa;
+                /* Buffer A (16 KB) — TArray slot pool (4 bytes per slot,
+                 *                                          room for 4096 ptrs) */
+                void *buf  = mem_alloc_pages(4);
+                /* Buffer B (4 KB)  — FNameEntry pool */
+                void *pool = mem_alloc_pages(1);
+                if (buf && pool) {
+                    uint8_t *p = (uint8_t *)buf;
                     for (int i = 0; i < 16384; i++) p[i] = 0;
-                    fname_buf_phys = pa;
+                    uint8_t *q = (uint8_t *)pool;
+                    for (int i = 0; i < 4096; i++) q[i] = 0;
+
+                    /* Build a single canonical FNameEntry for NAME_None.
+                     * Core.dll's FName::operator const TCHAR*()
+                     * (Core.dll+0x98E0, confirmed via disasm) does:
+                     *   eax = this->Index;
+                     *   ecx = Names.Data;
+                     *   eax = Names.Data[Index];       (FNameEntry*)
+                     *   eax += 0xC;                    (Name field)
+                     *   ret;
+                     * — no NULL check. If Names[0] is NULL the returned
+                     * pointer is 0xC and the caller reads garbage that
+                     * happens to render as L"0" or L"". The CASCADE of
+                     * "Failed to load '0' / '' / .GameEngine" is exactly
+                     * that.
+                     *
+                     * Name lives at FNameEntry+0xC. Earlier failed
+                     * attempt (commit 9f447e1) wrote the string at +8,
+                     * which is some other internal field — the engine
+                     * couldn't find "None" by string at the canonical
+                     * +0xC location, decided it was a new name, and
+                     * tripped its own "Hardcoded name 0 was duplicated"
+                     * assertion. With the correct offset the engine
+                     * lookup matches and dedup short-circuits. */
+                    *(volatile uint32_t *)(q + 0)  = 0;        /* Index */
+                    *(volatile uint32_t *)(q + 4)  = 0;        /* HashNext / flags */
+                    *(volatile uint32_t *)(q + 8)  = 0;        /* reserved */
+                    /* Name at +0xC, NUL-terminated. */
+                    q[12] = 'N'; q[13] = 'o'; q[14] = 'n'; q[15] = 'e'; q[16] = 0;
+
+                    /* TArray.Data[0] = &none_entry */
+                    *(volatile uint32_t *)buf = (uint32_t)(uintptr_t)pool;
+
+                    fname_buf_phys   = (uint64_t)(uintptr_t)buf;
+                    fname_none_entry = (uint64_t)(uintptr_t)pool;
+
+                    serial_puts("[FNAME-RESCUE] populated Names[0] = &(NAME_None) "
+                                "at FNameEntry@0x");
+                    serial_puthex(fname_none_entry, 8);
+                    serial_puts(" (Name@+0xC = \"None\")\n");
                 }
             }
             if (fname_buf_phys) {
                 fname_tarray[0] = (uint32_t)fname_buf_phys;
-                fname_tarray[2] = 2048;  /* Max = 2K entries */
-                /* Don't touch Num — preserve whatever the engine wrote */
+                fname_tarray[1] = 1;       /* Num = 1 (slot 0 populated) */
+                fname_tarray[2] = 2048;    /* Max = 2K entries */
                 static int fname_setup_logged = 0;
                 if (!fname_setup_logged) {
                     fname_setup_logged = 1;
                     serial_puts("[FNAME-RESCUE] pre-alloc FName::Names Data=0x");
                     serial_puthex(fname_buf_phys, 8);
-                    serial_puts(" Max=2048\n");
+                    serial_puts(" Num=1 Max=2048\n");
+                }
+            }
+        }
+        /* FNAME-NULL-FILL — sweep the populated range and replace NULL
+         * slots with a pointer to our canonical "None" entry. The engine
+         * uses sparse-by-design indices (EName enum slots) and leaves
+         * many entries NULL; FName::operator*() at Core.dll+0x98E0 does
+         * `Names[Idx] + 0xC` with no NULL check, so any FName(NullIdx)
+         * returns the literal pointer 0xC. That bogus pointer becomes
+         * the "%s" arg in appSprintf and produces the "Failed to load '0'"
+         * / "Failed to load ''" / " .GameEngine" cascade.
+         *
+         * Filling NULLs with the None entry makes FName(NullIdx).GetName()
+         * return "None" instead of garbage. Idempotent — only writes
+         * slots that are still NULL. Runs every dispatch (cheap: a
+         * 2-5K loop) so it catches reallocations too. */
+        if (fname_none_entry && fd != 0) {
+            uint32_t *slots = (uint32_t *)(uintptr_t)fd;
+            uint32_t limit = fn;
+            if (limit > fm) limit = fm;
+            if (limit > 65536) limit = 65536; /* sanity cap */
+            uint32_t filled = 0;
+            for (uint32_t k = 0; k < limit; k++) {
+                if (slots[k] == 0) {
+                    slots[k] = (uint32_t)fname_none_entry;
+                    filled++;
+                }
+            }
+            if (filled) {
+                static uint32_t total_filled = 0;
+                total_filled += filled;
+                static int log_count = 0;
+                if (log_count < 6) {
+                    log_count++;
+                    serial_puts("[FNAME-NULL-FILL] filled ");
+                    serial_putdec((uint64_t)filled);
+                    serial_puts(" NULL slots (cumulative=");
+                    serial_putdec((uint64_t)total_filled);
+                    serial_puts(", Num=");
+                    serial_putdec((uint64_t)fn);
+                    serial_puts(")\n");
                 }
             }
         }
         (void)fn;
+        (void)fname_none_entry;
     }
 
     /* GObjRegistrants snapshot + restore.

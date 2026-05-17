@@ -161,15 +161,69 @@ bool hwbp_dispatch(struct interrupt_frame *frame)
          * arguments. Print ECX/EDX, then 8 dwords at [RSP], then try a
          * wide-string render on each pointer-shaped value. PE32 in
          * compat mode has 32-bit ESP — interrupt_frame->rsp holds the
-         * full saved value; truncate to 32 bits to read user memory. */
-        if (hwbps[i].hit_count <= 8) {
+         * full saved value; truncate to 32 bits to read user memory.
+         *
+         * Suspicious-content filter: print the full detail block on
+         * the first 4 fires (warm-up sanity), and after that only when
+         * the buffer at [esp+0] decodes to a suspicious wide string —
+         * a 1- or 2-char numeric, an empty string, or one starting
+         * with a literal '.' (the " .GameEngine" cascade pattern).
+         * Everything else is plain banner/info chatter we don't care
+         * about for this hunt. */
+        /* Compact mode: print buffer contents on EVERY fire as a
+         * one-liner. Cheap, ordered, and lets us correlate the
+         * sprintf output history against the throw cascade lines. */
+        {
+            uint32_t esp32 = (uint32_t)frame->rsp;
+            volatile uint32_t *st = (volatile uint32_t *)(uintptr_t)esp32;
+            uint32_t buf_ptr = (uint32_t)st[0];
+            uint32_t fmt_ptr = (uint32_t)st[2];
+            serial_puts("  buf=L\"");
+            if (buf_ptr >= 0x10000 && (uint64_t)buf_ptr < 0x80000000ULL) {
+                volatile uint16_t *w = (volatile uint16_t *)(uintptr_t)buf_ptr;
+                char tmp[64]; int n = 0;
+                for (int k = 0; k < 63; k++) {
+                    uint16_t c = w[k];
+                    if (c == 0) break;
+                    tmp[n++] = (c < 0x20 || c >= 0x7F) ? '?' : (char)c;
+                }
+                tmp[n] = 0; serial_puts(tmp);
+            }
+            serial_puts("\" fmt=L\"");
+            if (fmt_ptr >= 0x10000 && (uint64_t)fmt_ptr < 0x80000000ULL) {
+                volatile uint16_t *w = (volatile uint16_t *)(uintptr_t)fmt_ptr;
+                char tmp[64]; int n = 0;
+                for (int k = 0; k < 63; k++) {
+                    uint16_t c = w[k];
+                    if (c == 0) break;
+                    tmp[n++] = (c < 0x20 || c >= 0x7F) ? '?' : (char)c;
+                }
+                tmp[n] = 0; serial_puts(tmp);
+            }
+            serial_puts("\"\n");
+        }
+
+        if (hwbps[i].hit_count <= 4) {
             uint32_t esp32 = (uint32_t)frame->rsp;
             uint32_t ecx32 = (uint32_t)frame->rcx;
             uint32_t edx32 = (uint32_t)frame->rdx;
+            uint32_t esi32 = (uint32_t)frame->rsi;
+            uint32_t edi32 = (uint32_t)frame->rdi;
+            uint32_t ebx32 = (uint32_t)frame->rbx;
+            uint32_t eax32 = (uint32_t)frame->rax;
             serial_puts("  esp=0x"); serial_puthex(esp32, 8);
+            serial_puts(" eax=0x"); serial_puthex(eax32, 8);
             serial_puts(" ecx=0x"); serial_puthex(ecx32, 8);
             serial_puts(" edx=0x"); serial_puthex(edx32, 8);
+            serial_puts(" ebx=0x"); serial_puthex(ebx32, 8);
+            serial_puts(" esi=0x"); serial_puthex(esi32, 8);
+            serial_puts(" edi=0x"); serial_puthex(edi32, 8);
             serial_puts("\n");
+            /* Try to render ESI (rep movs source) and EDI as wide
+             * strings — common rep-movsb hot path produces a wstring
+             * the caller is about to use. */
+            hwbp_try_wstr("ESI",  esi32);
+            hwbp_try_wstr("EDI",  edi32);
 
             volatile uint32_t *st = (volatile uint32_t *)(uintptr_t)esp32;
             uint32_t args[8] = {0};
