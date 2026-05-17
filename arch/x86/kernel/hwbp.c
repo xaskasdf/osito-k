@@ -275,14 +275,22 @@ bool hwbp_dispatch(struct interrupt_frame *frame)
                  *       unsigned greater than 0; fail when == 0)
                  *   other FMW-* sites default to site-0 filter. */
                 int site_idx = -1;
+                int is_write_probe = 0;
                 if (nm[4]=='s' && nm[5]=='i' && nm[6]=='t' && nm[7]=='e') {
                     if (nm[8]=='0') site_idx = 0;
                     else if (nm[8]=='1') site_idx = 1;
+                } else {
+                    /* FMW-Table*, FMW-pool* — WRITE probes, log every hit */
+                    is_write_probe = 1;
                 }
                 int mismatch;
-                if (site_idx == 1) {
-                    /* Free->Blocks > 0 — assertion fails when EDX is 0
-                     * (the ja over the assert means pass when above 0). */
+                if (is_write_probe) {
+                    /* For WRITE probes, "mismatch" means "log every hit" —
+                     * we want full timeline of mutations, not assert-fail
+                     * filtering. */
+                    mismatch = 1;
+                } else if (site_idx == 1) {
+                    /* Free->Blocks > 0 — assertion fails when EDX is 0 */
                     mismatch = (edx32 == 0);
                 } else {
                     /* site 0 (and default): cursor mismatch */

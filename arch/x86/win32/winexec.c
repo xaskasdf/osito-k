@@ -952,33 +952,29 @@ int winexec_run(const uint8_t *file_data, uint64_t file_size)
                           "FMW-site0-FirstPool-Next-Prev") == 0) {
                 serial_puts("[winexec] HWBP slot 0 armed at FMW site 0\n");
             }
-            /* Slot 1: FMW assertion site 1 — FMallocWindows.cpp:368
-             * (Pool->FirstMem != NULL, FirstPool walk). Same comment
-             * applies. Retired the previous slot 1 (pkgname-WRITE)
-             * since cascade writer data was captured.
+            /* Slot 1: WRITE on PoolTable[28].ExaustedPool field at
+             * 0x1092F88C — the list head cursor from Phase 1 mismatch.
+             * Retired FMW site 1 EXEC (Phase 1 showed 0 mismatches on
+             * Free->Blocks>0 invariant; site 0 alone catches the
+             * relevant pool-list corruption).
              *
-             * Note: site 1 in our patch list is the second je in the
-             * disasm sequence, at offset 0x109032C9 (cmp [eax+0x14],0
-             * + jne over the assert). The patch flips jne→jmp at
-             * 0x109032C9, but the HWBP_EXECUTE address must be the
-             * actual instruction byte to be hit — let's use the FMW
-             * patch list table's "site 1" address: 0x10903303. */
-            if (hwbp_set(1, 0x10903303ULL, /*HWBP_EXECUTE*/0, /*HWBP_LEN_1*/0,
-                          "FMW-site1") == 0) {
-                serial_puts("[winexec] HWBP slot 1 armed at FMW site 1\n");
+             * Captures every write to the head pointer (= writes that
+             * happen during Link / Unlink / direct head assignment).
+             * Cross-reference with slot 3 (Pool@0x40010700.PrevLink
+             * WRITE) to time-order all mutations and identify which
+             * operation left the list inconsistent. */
+            if (hwbp_set(1, 0x1092F88CULL, /*HWBP_WRITE*/1, /*HWBP_LEN_4*/3,
+                          "FMW-Table28-ExaustedPool-head") == 0) {
+                serial_puts("[winexec] HWBP slot 1 armed at Table28.ExaustedPool WRITE\n");
             }
-            /* Slot 2: EXECUTE on StaticFindObject body (Core.dll+0x101570B0).
-             * When PE32 calls UObject::StaticFindObject, we dump args:
-             *   [esp+4]  = Class*  (UClass to find — UPackage, UClass, etc.)
-             *   [esp+8]  = Outer*  (parent UObject, or NULL)
-             *   [esp+0xC] = Name   (WCHAR* of object name)
-             *   [esp+0x10] = ExactClass (BOOL)
-             * Knowing which classes are LOOKED UP and FAIL tells us
-             * which UObjects are missing from GObj at the time of the
-             * cascade — pinpointing where the package load left gaps. */
-            if (hwbp_set(2, 0x101570B0ULL, /*HWBP_EXECUTE*/0, /*HWBP_LEN_1*/0,
-                          "StaticFindObject") == 0) {
-                serial_puts("[winexec] HWBP slot 2 armed at StaticFindObject\n");
+            /* Slot 2: WRITE on Pool@0x40010700.Next field (offset +0x18).
+             * Pairs with slot 3 (PrevLink WRITE) for complete mutation
+             * coverage of the corrupt pool. Retired StaticFindObject
+             * EXEC — Phase 1 confirmed the "Engine" lookup returns
+             * NULL; further data not needed here. */
+            if (hwbp_set(2, 0x40010718ULL, /*HWBP_WRITE*/1, /*HWBP_LEN_4*/3,
+                          "FMW-pool@40010700-Next") == 0) {
+                serial_puts("[winexec] HWBP slot 2 armed at Pool+0x18 WRITE\n");
             }
             /* Slot 3: WRITE on Pool@0x40010700 PrevLink field (offset +0x1C).
              * Phase 1 found Pool 0x40010700 is linked in two FMallocWindows
