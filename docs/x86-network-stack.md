@@ -203,8 +203,13 @@ directo a Mac, sin gateway). Siguiente milestone H7+ (red con router/AP).
 
 ## 9.5 SG path en `net_udp_send` (open, disabled)
 
-Commits relevantes: `99cda9b` (i211_send_sg fixes), `0ec8516` (re-enable
-attempt), reverted via SG-disable.
+Commits relevantes:
+- `99cda9b` — IFCS/PAYLEN only-on-last (per Intel §7.2.2.2.4)
+- `0ec8516` — re-enable attempt #1
+- `9f7255f` — kvirt_to_phys translation
+- `2398adf` — heap-alloc kupload pkt (descarta stack-source UB)
+- `6bdcbc7` — re-enable attempt #2 con tx_pkt 64-byte aligned
+- `b5bd22f` — **re-disable definitivo tras 4 intentos fallidos**
 
 **Symptom**: `kupload --dmesg` con SG path activo envía 100% NUL bytes
 al server, aunque `kupload: src[0..31]` confirma que `klog_read` puso
@@ -217,6 +222,11 @@ ASCII real en el buffer source.
    I210/I211 datasheet §7.2.2.2.4, IFCS es 1 CRC por paquete y PAYLEN
    es total post-L2 length, ambos solo en el último data descriptor.
    Fixed en `99cda9b`. No cambio el síntoma.
+3. `tx_pkt` era plain `static uint8_t[]` (1-byte aligned). Force
+   64-byte alignment (`__attribute__((aligned(64)))`) por hipótesis
+   de DMA align (commit `6bdcbc7`). NO ayudó: upload sigue 100% NUL.
+4. kupload buffer movido stack→heap (`2398adf`) para descartar UB en
+   el source side. No cambio.
 
 **Causa residual sospechada**: hay configuración chip-side adicional
 que falta (header-split mode? context-only desc?), o una combinación
@@ -224,15 +234,69 @@ de campos del descriptor que el chip no acepta en modo MSI con
 chained data descs. Linux igb tiene un path más elaborado que
 necesitaríamos replicar 1:1.
 
-**Estado actual**: SG path disabled en `net_udp_send` (línea ~860).
-Todos los UDP pasan por `memcpy → tx_pkt → i211_send` single-buffer.
-Performance suficiente para tráfico kernel-class.
+**Estado actual** (commit `b5bd22f`, 2026-05-16): SG path disabled
+en `net_udp_send` (línea ~860).  Todos los UDP pasan por `memcpy →
+tx_pkt → i211_send` single-buffer.  Performance suficiente para
+tráfico kernel-class.  El path memcpy es 100% correcto y entrega
+`kupload --dmesg` con contenido real.
 
 **Próximo experimento**:
 - Capturar TX en cable con un NIC sniffer externo mientras enviamos
   via SG, ver si los frames realmente salen del chip o se quedan
   internos
 - Comparar bit-a-bit con un capture de Linux igb en el mismo HW
+- Replicar el descriptor flow exacto de `igb_xmit_frame` de Linux,
+  incluyendo el context descriptor opcional y el `tx_buffer_info`
+  unmap-tracking (probablemente no necesario funcionalmente pero
+  bueno como referencia)
+
+---
+
+## 9.6 kexec'd kernel #UD diagnostics (instrumentation landed)
+
+Commit relevante: `b5bd22f`.
+
+**Background**: el path `kdownload --kexec` (descargar un kernel.elf
+nuevo via OFTP y bootearlo sin reset HW) crashea pre-shell con `#UD
+at RIP=0xffff800002064fa2`, una dirección que cae **mid-instruction**
+de `gpu_init` (la primera instrucción de gpu_init es un `movabs` de
+10 bytes en `fa0..fa9`).  Mid-instruction RIP en `#UD` significa que
+el CPU NO ejecutó linealmente desde gpu_init+0 — alguien hizo
+CALL/JMP a `fa2` directo (return mismatch, fn-ptr corruption, o
+indirect call con valor garbage).
+
+**Instrumentación añadida** (no es un fix, es diagnóstico):
+
+1. `arch/x86/kernel/kexec_tramp.S` — emite `'T'` (0x54) directo a
+   COM1 (`outb $0x3f8`) después de `rep movsb` de todos los
+   segmentos, antes del `call *%r13` a kernel_entry.  Distingue
+   "tramp completó copy, jump-to-kernel falló" de "tramp se
+   autoextinguió mid-copy".  Polls 0x3FD bit 0x20 (THR-empty).
+2. `arch/x86/kernel/main.c::kernel_entry` — añade probe
+   `[KEXEC-PATH] bss-zeroed` después del zero-BSS, para bracketar
+   el gap entre la primera probe (`kernel_entry`) y `serial_init`.
+   Las probes anteriores existían en `pre-gpu_init` y
+   `post-gpu_init`.
+3. `arch/x86/kernel/idt.c` panic dump — para excepciones con
+   `CS==0x08` (kernel code), añade dump de **CR3, SS, y 4 quadwords
+   desde [RSP]**.  El return-slot quadword es la pista crítica para
+   identificar indirect-call corruption vs stack corruption.
+
+**Validación**: smoke-test boot directo en QEMU (`b5bd22f`) confirma
+que la instrumentación no rompió el path normal (`serial.log`:
+`Serial initialized`, virtio-net up, shell prompt, no `EXCEPTION`).
+El path kexec'd se ejercita cuando alguien dispare `kexec` desde el
+shell o `kdownload --kexec` desde la red.
+
+**Hipótesis abiertas** (a confirmar con la próxima traza):
+- (A) HW state stale: el new kernel re-inicia GPU/xHCI/NVMe asumiendo
+  un estado limpio, pero el old kernel los dejó en mid-state.
+- (B) IDT stale: vectores del old kernel siguen apuntando a código
+  ya sobreescrito por la copy del new kernel.  Cualquier IRQ
+  spurious cae a bytes random.
+- (C) CR3 stale: paging tables del old kernel siguen activas hasta
+  que el new kernel corra `paging_init`.  Las "indirect calls"
+  podrían estar resolviendo via PTEs viejos.
 
 ---
 
