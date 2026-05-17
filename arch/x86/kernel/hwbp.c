@@ -246,6 +246,74 @@ bool hwbp_dispatch(struct interrupt_frame *frame)
                 char lbl[8] = { 'a', 'r', 'g', (char)('0' + k), 0, 0, 0, 0 };
                 hwbp_try_wstr(lbl, args[k]);
             }
+
+        }
+        /* FMW-specific: dump EVERY fire (not just first 4) but
+         * filter to MISMATCH cases only — fires where the
+         * assertion would have failed if not patched. Pool->Next->Prev
+         * is at [ECX+0x1c] (per disasm: mov edx, [ecx+0x1c]; cmp edx,
+         * [ebp-0x18]). We check the same condition here. Only log
+         * when EDX != [ebp-0x18] — meaning the assertion would have
+         * failed if not patched. */
+        {
+            const char *nm = hwbps[i].name;
+            int is_fmw = (nm[0]=='F' && nm[1]=='M' && nm[2]=='W' && nm[3]=='-');
+            if (is_fmw) {
+                uint32_t ebp32 = (uint32_t)frame->rbp;
+                uint32_t edx32 = (uint32_t)frame->rdx;
+                uint32_t pool_cursor_va = ebp32 - 0x18;
+                int cursor_ok = (pool_cursor_va >= 0x10000 &&
+                                 (uint64_t)pool_cursor_va < 0x80000000ULL);
+                uint32_t cursor_val = cursor_ok ?
+                    *(volatile uint32_t *)(uintptr_t)pool_cursor_va : 0;
+                /* Site-specific assertion check. Strings decoded from
+                 * UT.exe .data:
+                 *   site 0 (0x109032A8, line 367): "Pool->PrevLink==PoolPtr"
+                 *     → fails when EDX != cursor_val
+                 *   site 1 (0x10903303, line 370): "Free->Blocks>0"
+                 *     → fails when EDX (Pool->[+0x4]) is 0 (ja = pass when
+                 *       unsigned greater than 0; fail when == 0)
+                 *   other FMW-* sites default to site-0 filter. */
+                int site_idx = -1;
+                if (nm[4]=='s' && nm[5]=='i' && nm[6]=='t' && nm[7]=='e') {
+                    if (nm[8]=='0') site_idx = 0;
+                    else if (nm[8]=='1') site_idx = 1;
+                }
+                int mismatch;
+                if (site_idx == 1) {
+                    /* Free->Blocks > 0 — assertion fails when EDX is 0
+                     * (the ja over the assert means pass when above 0). */
+                    mismatch = (edx32 == 0);
+                } else {
+                    /* site 0 (and default): cursor mismatch */
+                    mismatch = (edx32 != cursor_val);
+                }
+                if (mismatch) {
+                    serial_puts("[FMW-MISMATCH] slot=");
+                    serial_putdec((uint64_t)i);
+                    serial_puts(" hit=");
+                    serial_putdec((uint64_t)hwbps[i].hit_count);
+                    serial_puts(" EDX=0x"); serial_puthex(edx32, 8);
+                    serial_puts(" cursor=*[ebp-0x18]=0x"); serial_puthex(cursor_val, 8);
+                    serial_puts(" ebp=0x"); serial_puthex(ebp32, 8);
+                    serial_puts(" ecx=0x"); serial_puthex((uint64_t)frame->rcx, 8);
+                    serial_puts("\n");
+                    /* Dump the pool struct that triggered the mismatch.
+                     * ECX is the Pool*, dump first 0x20 bytes. */
+                    uint32_t pool_ptr = (uint32_t)frame->rcx;
+                    if (pool_ptr >= 0x10000 && (uint64_t)pool_ptr < 0x80000000ULL) {
+                        serial_puts("  [FMW-MISMATCH] pool@0x");
+                        serial_puthex(pool_ptr, 8);
+                        serial_puts(":");
+                        for (int off = 0; off <= 0x1c; off += 4) {
+                            uint32_t v = *(volatile uint32_t *)(uintptr_t)(pool_ptr + (uint32_t)off);
+                            serial_puts(" +"); serial_puthex((uint64_t)off, 2);
+                            serial_puts("=0x"); serial_puthex(v, 8);
+                        }
+                        serial_puts("\n");
+                    }
+                }
+            }
         }
 
         handled = true;

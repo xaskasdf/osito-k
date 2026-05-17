@@ -227,6 +227,26 @@ static PVOID win32_va_alloc(SIZE_T size, uint64_t *out_phys, ULONG protect)
     (void)recycled;
     nt_memset((void *)va, 0, size);
 
+    /* VA-ALLOC trace — every fresh allocation. Caller EIP comes from
+     * compat32's saved per-thunk return address (compat32_get_last_caller_eip)
+     * — that's the PE32 instruction immediately after the VirtualAlloc
+     * INT 0x2E thunk return. Cross-reference with FMW-ASSERT logs to
+     * identify which alloc became a Pool->Mem that later failed the
+     * pool-integrity check. */
+    {
+        extern uint32_t compat32_get_last_caller_eip(void);
+        uint32_t ceip = compat32_get_last_caller_eip();
+        serial_puts("[VA-ALLOC] base=0x");
+        serial_puthex((uint64_t)(uintptr_t)va, 8);
+        serial_puts(" size=0x");
+        serial_puthex((uint64_t)size, 8);
+        serial_puts(" prot=0x");
+        serial_puthex((uint64_t)protect, 8);
+        serial_puts(" caller=0x");
+        serial_puthex((uint64_t)ceip, 8);
+        serial_puts("\n");
+    }
+
     if (out_phys) *out_phys = pa;
     return (PVOID)va;
 }

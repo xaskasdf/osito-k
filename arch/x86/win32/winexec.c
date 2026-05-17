@@ -931,22 +931,41 @@ int winexec_run(const uint8_t *file_data, uint64_t file_size)
         if ((uint32_t)(ULONG_PTR)info.ImageBase == 0x10900000) {
             extern int hwbp_set(int slot, uint64_t addr, int cond, int len,
                                 const char *name);
-            if (hwbp_set(0, 0x10122dbbULL, /*HWBP_EXECUTE*/0, /*HWBP_LEN_1*/0,
-                          "Core-appSprintf-post@22DBB") == 0) {
-                serial_puts("[winexec] HWBP slot 0 armed at Core.dll+0x22DBB\n");
-            } else {
-                serial_puts("[winexec] HWBP slot 0 arm FAILED\n");
+            /* Slot 0: FMW assertion site 0 — FMallocWindows.cpp:367
+             * (pool->Next->Prev == pool, FirstPool walk).
+             * The je at this address is currently `EB 18` (patched
+             * by FMW-PATCH block in compat32.c to skip the assert).
+             * HWBP_EXECUTE fires BEFORE the jmp, gives us pool state
+             * at the moment the engine detected list corruption.
+             *
+             * Retired the previous slot 0 (Core.dll+0x22DBB appSprintf-
+             * post) since cascade format data was already captured
+             * via [FAIL-FMT] logging.
+             *
+             * hwbp_dispatch's reg+stack dump shows EBP; pool cursor
+             * is at [EBP-0x18] per disasm (mov edx,[ebp-0x18] / mov
+             * eax,[edx] is the iteration pattern). The first 4 fires
+             * also get [esp+0..0x1c] stack dump, which catches the
+             * Pool struct fields if the pool ptr happens to be near
+             * a stack-resident local. */
+            if (hwbp_set(0, 0x109032A8ULL, /*HWBP_EXECUTE*/0, /*HWBP_LEN_1*/0,
+                          "FMW-site0-FirstPool-Next-Prev") == 0) {
+                serial_puts("[winexec] HWBP slot 0 armed at FMW site 0\n");
             }
-            /* Slot 1: WRITE-watch the heap slot where the engine has
-             * been writing the wide-string "0" right before the
-             * PackageNotFound throw cascade. Every previous run has
-             * placed the string at 0x4013F9FC (compat32 heap is
-             * deterministic in our layout), so when the writer
-             * touches that slot we'll see RIP land in the function
-             * that constructs the bad package name. */
-            if (hwbp_set(1, 0x4013F9FCULL, /*HWBP_WRITE*/1, /*HWBP_LEN_4*/3,
-                          "engine-pkgname-buf") == 0) {
-                serial_puts("[winexec] HWBP slot 1 armed at 0x4013F9FC (WRITE)\n");
+            /* Slot 1: FMW assertion site 1 — FMallocWindows.cpp:368
+             * (Pool->FirstMem != NULL, FirstPool walk). Same comment
+             * applies. Retired the previous slot 1 (pkgname-WRITE)
+             * since cascade writer data was captured.
+             *
+             * Note: site 1 in our patch list is the second je in the
+             * disasm sequence, at offset 0x109032C9 (cmp [eax+0x14],0
+             * + jne over the assert). The patch flips jne→jmp at
+             * 0x109032C9, but the HWBP_EXECUTE address must be the
+             * actual instruction byte to be hit — let's use the FMW
+             * patch list table's "site 1" address: 0x10903303. */
+            if (hwbp_set(1, 0x10903303ULL, /*HWBP_EXECUTE*/0, /*HWBP_LEN_1*/0,
+                          "FMW-site1") == 0) {
+                serial_puts("[winexec] HWBP slot 1 armed at FMW site 1\n");
             }
             /* Slot 2: EXECUTE on StaticFindObject body (Core.dll+0x101570B0).
              * When PE32 calls UObject::StaticFindObject, we dump args:
