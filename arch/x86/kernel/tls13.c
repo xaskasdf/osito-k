@@ -981,10 +981,16 @@ int tls13_connect(int tcp_conn, const char *hostname)
                                  * CRL_REVOKED is a hard abort; CRL_ERROR is logged
                                  * and we continue (same fail-open posture OCSP has). */
                                 if (ocsp != 0 /* not GOOD */ && ocsp != 1 /* not REVOKED */) {
-                                    extern int crl_check_revoked(
-                                        const uint8_t *cert_der, uint32_t cert_len);
-                                    int crl = crl_check_revoked(
-                                        certs[0], cert_lens[0]);
+                                    /* 4-arg form: plumb issuer through so
+                                     * crl.c can verify the CRL signature
+                                     * (RFC 5280 §5.1.1 + §5.2.5).  The
+                                     * 2-arg legacy wrapper logs SKIPPED. */
+                                    extern int crl_check_revoked_with_issuer(
+                                        const uint8_t *cert_der,   uint32_t cert_len,
+                                        const uint8_t *issuer_der, uint32_t issuer_len);
+                                    int crl = crl_check_revoked_with_issuer(
+                                        certs[0], cert_lens[0],
+                                        certs[1], cert_lens[1]);
                                     serial_puts("[TLS1.3] CRL fallback (OCSP=");
                                     serial_puts(ocsp == 2 ? "unknown" : "error");
                                     serial_puts("): ");
@@ -1016,12 +1022,23 @@ int tls13_connect(int tcp_conn, const char *hostname)
                              * intermediates above the leaf. */
                             #define AIA_MAX 3
                             static uint8_t aia_der_bufs[AIA_MAX][8192];
-                            /* URL dedup table: each fetched URL is
-                             * hashed (FNV-1a 32-bit, first 8 chars
-                             * of the encoded SHA-256 would be more
-                             * collision-safe but this is for one
-                             * handshake's ≤3 URLs so FNV suffices). */
-                            uint32_t aia_tried[AIA_MAX] = {0};
+                            /* URL dedup table: FNV-1a 32-bit hash
+                             * plus the first 16 bytes of the URL.
+                             * The head-prefix guards against the
+                             * (rare but real) 32-bit collision case
+                             * where two distinct CAs would otherwise
+                             * appear identical and the second
+                             * intermediate would never be fetched. */
+                            struct aia_seen {
+                                uint32_t hash;
+                                char     head[16];
+                            };
+                            struct aia_seen aia_tried[AIA_MAX];
+                            for (int i = 0; i < AIA_MAX; i++) {
+                                aia_tried[i].hash = 0;
+                                for (int j = 0; j < 16; j++)
+                                    aia_tried[i].head[j] = 0;
+                            }
                             int aia_tried_n = 0;
                             for (int depth = 0; depth < AIA_MAX && nc < 4; depth++) {
                                 /* Peek the URL on the current top-of-chain
@@ -1041,16 +1058,36 @@ int tls13_connect(int tcp_conn, const char *hostname)
                                     h ^= (uint8_t)url_peek[i];
                                     h *= 16777619u;
                                 }
+                                /* Capture head-prefix for collision guard. */
+                                char head[16];
+                                for (int i = 0; i < 16; i++)
+                                    head[i] = (i < ulen) ? url_peek[i] : 0;
                                 bool seen = false;
                                 for (int i = 0; i < aia_tried_n; i++) {
-                                    if (aia_tried[i] == h) { seen = true; break; }
+                                    if (aia_tried[i].hash != h)
+                                        continue;
+                                    /* Hash matches — require head-prefix
+                                     * to match too before declaring dup. */
+                                    bool head_eq = true;
+                                    for (int j = 0; j < 16; j++) {
+                                        if (aia_tried[i].head[j] != head[j]) {
+                                            head_eq = false;
+                                            break;
+                                        }
+                                    }
+                                    if (head_eq) { seen = true; break; }
+                                    serial_puts("[AIA] FNV collision — different URL, continuing\n");
                                 }
                                 if (seen) {
                                     serial_puts("[AIA] URL already tried this handshake — stop\n");
                                     break;
                                 }
-                                if (aia_tried_n < AIA_MAX)
-                                    aia_tried[aia_tried_n++] = h;
+                                if (aia_tried_n < AIA_MAX) {
+                                    aia_tried[aia_tried_n].hash = h;
+                                    for (int j = 0; j < 16; j++)
+                                        aia_tried[aia_tried_n].head[j] = head[j];
+                                    aia_tried_n++;
+                                }
 
                                 uint32_t alen = 0;
                                 if (aia_chase_intermediate(
