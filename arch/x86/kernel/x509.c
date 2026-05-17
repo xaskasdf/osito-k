@@ -1171,6 +1171,97 @@ int x509_get_aia_ocsp(const uint8_t *cert, uint32_t cert_len,
                        out, cap);
 }
 
+/* ── CRL Distribution Points (RFC 5280 §4.2.1.13) ─────────────── */
+
+/* OID 2.5.29.31 = 06 03 55 1D 1F */
+static const uint8_t OID_CRLDP[] = {
+    0x06, 0x03, 0x55, 0x1D, 0x1F
+};
+
+/* Walk a GeneralNames SEQUENCE looking for the first [6] IMPLICIT
+ * IA5String entry (uniformResourceIdentifier).  Copies into `out`
+ * (NUL-terminated, truncated to cap) and returns URL length.  -1
+ * if no URI entry found. */
+static int gn_extract_uri(const uint8_t *p, const uint8_t *end,
+                          char *out, uint32_t cap)
+{
+    while (p < end) {
+        uint8_t tag = *p;
+        if (tag == 0x86) {
+            p++;
+            uint32_t url_len;
+            if (der_read_len(&p, end, &url_len) < 0) return -1;
+            if (p + url_len > end) return -1;
+            uint32_t take = (url_len + 1 > cap) ? (cap - 1) : url_len;
+            for (uint32_t i = 0; i < take; i++) out[i] = (char)p[i];
+            if (cap > 0) out[take] = 0;
+            return (int)url_len;
+        }
+        if (der_skip_tlv(&p, end) < 0) return -1;
+    }
+    return -1;
+}
+
+int x509_get_crldp_url(const uint8_t *cert, uint32_t cert_len,
+                       char *out, uint32_t cap)
+{
+    const uint8_t *ext_seq_start, *ext_seq_end;
+    if (find_extensions(cert, cert_len, &ext_seq_start, &ext_seq_end) < 0)
+        return -1;
+    const uint8_t *p = ext_seq_start;
+    while (p < ext_seq_end) {
+        const uint8_t *ex_end;
+        if (der_enter(&p, ext_seq_end, 0x30, &ex_end) < 0) break;
+        const uint8_t *probe = p;
+        if ((uint32_t)(ex_end - probe) < sizeof OID_CRLDP ||
+            bytes_eq(probe, OID_CRLDP, sizeof OID_CRLDP) != 0) {
+            p = ex_end; continue;
+        }
+        probe += sizeof OID_CRLDP;
+        /* Optional critical BOOLEAN. */
+        if (probe < ex_end && *probe == 0x01)
+            if (der_skip_tlv(&probe, ex_end) < 0) { p = ex_end; continue; }
+        /* OCTET STRING wrapping the CRLDP SEQUENCE. */
+        if (probe >= ex_end || *probe != 0x04) { p = ex_end; continue; }
+        probe++;
+        uint32_t os_len;
+        if (der_read_len(&probe, ex_end, &os_len) < 0) { p = ex_end; continue; }
+        if (probe + os_len > ex_end) { p = ex_end; continue; }
+        const uint8_t *cdp_p = probe;
+        const uint8_t *cdp_outer_end = probe + os_len;
+        /* SEQUENCE OF DistributionPoint */
+        const uint8_t *cdp_seq_end;
+        if (der_enter(&cdp_p, cdp_outer_end, 0x30, &cdp_seq_end) < 0) {
+            p = ex_end; continue;
+        }
+        while (cdp_p < cdp_seq_end) {
+            const uint8_t *dp_end;
+            if (der_enter(&cdp_p, cdp_seq_end, 0x30, &dp_end) < 0) break;
+            /* DistributionPoint fields are all [n] EXPLICIT.  We want
+             * [0] distributionPoint → [0] fullName → GeneralNames. */
+            if (cdp_p >= dp_end || *cdp_p != 0xA0) { cdp_p = dp_end; continue; }
+            const uint8_t *dpname_end;
+            if (der_enter(&cdp_p, dp_end, 0xA0, &dpname_end) < 0) {
+                cdp_p = dp_end; continue;
+            }
+            /* Inside [0] DistributionPointName CHOICE — fullName is
+             * [0] IMPLICIT GeneralNames. */
+            if (cdp_p >= dpname_end || *cdp_p != 0xA0) {
+                cdp_p = dp_end; continue;
+            }
+            const uint8_t *fn_end;
+            if (der_enter(&cdp_p, dpname_end, 0xA0, &fn_end) < 0) {
+                cdp_p = dp_end; continue;
+            }
+            int r = gn_extract_uri(cdp_p, fn_end, out, cap);
+            if (r > 0) return r;
+            cdp_p = dp_end;
+        }
+        return -1;
+    }
+    return -1;
+}
+
 /* Issuer DN extraction: return raw DER bytes of the entire Issuer
  * SEQUENCE TLV (including the SEQUENCE tag + length).  Used by
  * OCSP CertID building (issuer name hash = SHA-1 of these bytes). */

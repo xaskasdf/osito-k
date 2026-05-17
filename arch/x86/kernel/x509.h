@@ -167,6 +167,30 @@ int x509_get_aia_caissuers(const uint8_t *cert, uint32_t cert_len,
 int x509_get_aia_ocsp     (const uint8_t *cert, uint32_t cert_len,
                           char *out, uint32_t cap);
 
+/* ── CRL Distribution Points (RFC 5280 §4.2.1.13) ───────────────
+ *
+ * Extension OID 2.5.29.31.  Each cert may list one or more URLs
+ * where its CRL can be fetched.  We only care about the first
+ * URI distributionPoint encountered — multi-URL CDP rotation is
+ * a higher-tier concern (handled by retrying with the next URL
+ * if the first download fails).
+ *
+ * The DER shape per RFC 5280:
+ *   CRLDistributionPoints ::= SEQUENCE OF DistributionPoint
+ *   DistributionPoint ::= SEQUENCE {
+ *     distributionPoint [0] DistributionPointName OPTIONAL,
+ *     reasons           [1] ReasonFlags OPTIONAL,
+ *     cRLIssuer         [2] GeneralNames OPTIONAL }
+ *   DistributionPointName ::= CHOICE {
+ *     fullName              [0] GeneralNames,
+ *     nameRelativeToCRLIssuer [1] RelativeDistinguishedName }
+ *   GeneralName for URI ::= [6] IMPLICIT IA5String
+ *
+ * Returns URL length on success, -1 if the extension is missing
+ * or no URI fullName entry exists. */
+int x509_get_crldp_url(const uint8_t *cert, uint32_t cert_len,
+                       char *out, uint32_t cap);
+
 /* ── OCSP request fields (A12.11) ──────────────────────────────
  *
  * Helpers used by the OCSP module to build a CertID.  Each
