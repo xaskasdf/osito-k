@@ -948,6 +948,26 @@ int winexec_run(const uint8_t *file_data, uint64_t file_size)
                           "engine-pkgname-buf") == 0) {
                 serial_puts("[winexec] HWBP slot 1 armed at 0x4013F9FC (WRITE)\n");
             }
+            /* Slot 2: EXECUTE on StaticFindObject body (Core.dll+0x101570B0).
+             * When PE32 calls UObject::StaticFindObject, we dump args:
+             *   [esp+4]  = Class*  (UClass to find — UPackage, UClass, etc.)
+             *   [esp+8]  = Outer*  (parent UObject, or NULL)
+             *   [esp+0xC] = Name   (WCHAR* of object name)
+             *   [esp+0x10] = ExactClass (BOOL)
+             * Knowing which classes are LOOKED UP and FAIL tells us
+             * which UObjects are missing from GObj at the time of the
+             * cascade — pinpointing where the package load left gaps. */
+            if (hwbp_set(2, 0x101570B0ULL, /*HWBP_EXECUTE*/0, /*HWBP_LEN_1*/0,
+                          "StaticFindObject") == 0) {
+                serial_puts("[winexec] HWBP slot 2 armed at StaticFindObject\n");
+            }
+            /* Slot 3: EXECUTE on StaticLoadClass body (Core.dll+0x1015A670).
+             * Pairs with slot 2 — together they show the engine's full
+             * class-lookup pattern. */
+            if (hwbp_set(3, 0x1015A670ULL, /*HWBP_EXECUTE*/0, /*HWBP_LEN_1*/0,
+                          "StaticLoadClass") == 0) {
+                serial_puts("[winexec] HWBP slot 3 armed at StaticLoadClass\n");
+            }
         }
 
         compat32_enter(entry32, sp32);

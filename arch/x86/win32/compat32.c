@@ -2395,6 +2395,167 @@ uint64_t compat32_dispatch(uint32_t thunk_idx, uint32_t *stack_args)
                 }
             }
         }
+        /* FNDIFF-NONULLCOUNT — scan the buffer periodically. Triggers:
+         * - When Data ptr changes (realloc event)
+         * - Every +500 entries added to Num (sample during growth)
+         * Reports non_null count, highest non-NULL index, first NULL idx.
+         * Tells us if entries are being written during Num growth, or
+         * if the engine increments Num without writing slots. */
+        {
+            static uint32_t last_seen_data = 0;
+            static uint32_t last_count_num = 0;
+            int do_scan = 0;
+            if (fd != last_seen_data && fd != 0) {
+                do_scan = 1;
+            } else if (fn > last_count_num + 499 || (fn > 0 && last_count_num == 0)) {
+                do_scan = 1;
+            }
+            if (do_scan && fd != 0) {
+                last_seen_data = fd;
+                last_count_num = fn;
+                uint32_t *slots = (uint32_t *)(uintptr_t)fd;
+                uint32_t limit = fn;
+                if (limit > 8192) limit = 8192;
+                uint32_t nn_count = 0;
+                int32_t highest_nn = -1;
+                int32_t first_null = -1;
+                for (uint32_t k = 0; k < limit; k++) {
+                    if (slots[k] != 0) {
+                        nn_count++;
+                        highest_nn = (int32_t)k;
+                    } else if (first_null < 0) {
+                        first_null = (int32_t)k;
+                    }
+                }
+                serial_puts("[FNDIFF-COUNT] Data=0x");
+                serial_puthex(fd, 8);
+                serial_puts(" Num=");
+                serial_putdec((uint64_t)fn);
+                serial_puts(" non_null=");
+                serial_putdec((uint64_t)nn_count);
+                serial_puts(" highest_idx=");
+                serial_putdec((uint64_t)(uint32_t)highest_nn);
+                serial_puts(" first_null=");
+                serial_putdec((uint64_t)(uint32_t)first_null);
+                serial_puts("\n");
+            }
+        }
+
+        /* FNDIFF-TARRAY — watch the TArray header itself (Data/Num/Max).
+         * When Data pointer changes, that's a Realloc — likely the
+         * trigger for the LOST events (old buffer's slots aren't seen
+         * any more, new buffer's slots are zero-init until refilled). */
+        {
+            static uint32_t prev_data = 0, prev_num = 0, prev_max = 0;
+            static uint32_t tarray_changes = 0;
+            if (fd != prev_data || fn != prev_num || fm != prev_max) {
+                tarray_changes++;
+                serial_puts("[FNDIFF-TA] #");
+                serial_putdec((uint64_t)tarray_changes);
+                serial_puts(" Data:0x");
+                serial_puthex(prev_data, 8);
+                serial_puts("→0x");
+                serial_puthex(fd, 8);
+                serial_puts(" Num:");
+                serial_putdec((uint64_t)prev_num);
+                serial_puts("→");
+                serial_putdec((uint64_t)fn);
+                serial_puts(" Max:");
+                serial_putdec((uint64_t)prev_max);
+                serial_puts("→");
+                serial_putdec((uint64_t)fm);
+                serial_puts(" thunk=");
+                serial_putdec((uint64_t)thunk_idx);
+                serial_puts("\n");
+                prev_data = fd; prev_num = fn; prev_max = fm;
+            }
+        }
+
+        /* FNDIFF — per-dispatch diff of Names.Data. Snapshots the buffer
+         * slot-by-slot, compares to previous snapshot, reports:
+         *   - new entries (NULL → non-null + value written)
+         *   - LOST entries (non-null → NULL, the corruption signal)
+         *   - REASSIGNED entries (non-null → different non-null)
+         * Includes thunk_idx so we can correlate with the Win32 call
+         * that produced the change. Capped at SHADOW_SIZE entries to
+         * keep memory cost bounded. */
+        #ifndef DISABLE_FNDIFF
+        #define FNDIFF_SHADOW_SIZE 8192
+        static uint32_t fndiff_shadow[FNDIFF_SHADOW_SIZE];
+        static uint32_t fndiff_shadow_initialized = 0;
+        static uint32_t fndiff_dispatch_count = 0;
+        static uint32_t fndiff_total_lost = 0;
+        static uint32_t fndiff_total_new = 0;
+        static uint32_t fndiff_total_reassign = 0;
+        fndiff_dispatch_count++;
+        if (fd != 0) {
+            uint32_t *slots = (uint32_t *)(uintptr_t)fd;
+            uint32_t limit = fn;
+            if (limit > FNDIFF_SHADOW_SIZE) limit = FNDIFF_SHADOW_SIZE;
+            if (!fndiff_shadow_initialized) {
+                fndiff_shadow_initialized = 1;
+                for (uint32_t k = 0; k < FNDIFF_SHADOW_SIZE; k++)
+                    fndiff_shadow[k] = 0;
+            }
+            uint32_t lost = 0, news = 0, reass = 0;
+            uint32_t lost_first_idx = 0xFFFFFFFF;
+            uint32_t lost_first_old = 0;
+            for (uint32_t k = 0; k < limit; k++) {
+                uint32_t cur = slots[k];
+                uint32_t prev = fndiff_shadow[k];
+                if (cur != prev) {
+                    if (prev != 0 && cur == 0) {
+                        if (lost_first_idx == 0xFFFFFFFF) {
+                            lost_first_idx = k;
+                            lost_first_old = prev;
+                        }
+                        lost++;
+                    } else if (prev == 0 && cur != 0) {
+                        news++;
+                    } else {
+                        reass++;
+                    }
+                    fndiff_shadow[k] = cur;
+                }
+            }
+            /* Always log lost-events (the smoking gun). */
+            if (lost > 0) {
+                fndiff_total_lost += lost;
+                serial_puts("[FNDIFF] LOST=");
+                serial_putdec((uint64_t)lost);
+                serial_puts(" first idx=");
+                serial_putdec((uint64_t)lost_first_idx);
+                serial_puts(" old_val=0x");
+                serial_puthex(lost_first_old, 8);
+                serial_puts(" thunk=");
+                serial_putdec((uint64_t)thunk_idx);
+                serial_puts(" disp=");
+                serial_putdec((uint64_t)fndiff_dispatch_count);
+                serial_puts(" cum_lost=");
+                serial_putdec((uint64_t)fndiff_total_lost);
+                serial_puts("\n");
+            }
+            /* Throttled "growth" log every 500 new entries. */
+            if (news > 0) {
+                fndiff_total_new += news;
+                static uint32_t last_log_new = 0;
+                if (fndiff_total_new - last_log_new >= 500) {
+                    last_log_new = fndiff_total_new;
+                    serial_puts("[FNDIFF] cum_new=");
+                    serial_putdec((uint64_t)fndiff_total_new);
+                    serial_puts(" cum_reass=");
+                    serial_putdec((uint64_t)fndiff_total_reassign);
+                    serial_puts(" cum_lost=");
+                    serial_putdec((uint64_t)fndiff_total_lost);
+                    serial_puts(" Num=");
+                    serial_putdec((uint64_t)fn);
+                    serial_puts("\n");
+                }
+            }
+            if (reass > 0) fndiff_total_reassign += reass;
+        }
+        #endif /* DISABLE_FNDIFF */
+
         /* FNAME-NULL-FILL — sweep the populated range and replace NULL
          * slots with a pointer to our canonical "None" entry. The engine
          * uses sparse-by-design indices (EName enum slots) and leaves
@@ -2407,7 +2568,13 @@ uint64_t compat32_dispatch(uint32_t thunk_idx, uint32_t *stack_args)
          * Filling NULLs with the None entry makes FName(NullIdx).GetName()
          * return "None" instead of garbage. Idempotent — only writes
          * slots that are still NULL. Runs every dispatch (cheap: a
-         * 2-5K loop) so it catches reallocations too. */
+         * 2-5K loop) so it catches reallocations too.
+         *
+         * Gate: define DISABLE_NULL_FILL at compile time to skip this
+         * fix and see the engine's raw behavior — used in conjunction
+         * with FNDIFF to attribute NULL slots to the engine's own code
+         * path vs our fill. */
+        #ifndef DISABLE_NULL_FILL
         if (fname_none_entry && fd != 0) {
             uint32_t *slots = (uint32_t *)(uintptr_t)fd;
             uint32_t limit = fn;
@@ -2438,6 +2605,7 @@ uint64_t compat32_dispatch(uint32_t thunk_idx, uint32_t *stack_args)
                 }
             }
         }
+        #endif /* DISABLE_NULL_FILL */
         (void)fn;
         (void)fname_none_entry;
     }
