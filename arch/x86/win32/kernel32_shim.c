@@ -2352,6 +2352,32 @@ HANDLE WINAPI LoadLibraryA(PCSTR lpLibFileName)
     if (is_unavailable_dll(lpLibFileName))
         return NULL;
 
+    /* Reject purely-numeric basenames. UT99's native-binding loop
+     * walks an internal package array past Transient — once past the
+     * legit packages, slot N has its FName resolved as the decimal
+     * representation of an uninitialised index, so the engine asks us
+     * to LoadLibrary("C:\\System\\0"), "\\1", "\\2", … and (because we
+     * used to return a sentinel handle for every request) treats each
+     * one as a successfully loaded native, then later tries to find
+     * package "0.u" / "1.u" / … on disk and throws PackageNotFound
+     * from the localised error path. Returning NULL here tells the
+     * engine the binding does not exist and the loop short-circuits. */
+    {
+        const char *bn = lpLibFileName;
+        for (const char *p = lpLibFileName; *p; p++)
+            if (*p == '\\' || *p == '/') bn = p + 1;
+        bool all_digits = (*bn != 0);
+        for (const char *p = bn; *p; p++) {
+            if (*p < '0' || *p > '9') { all_digits = false; break; }
+        }
+        if (all_digits) {
+            serial_puts("[K32] LoadLibraryA: rejecting numeric basename '");
+            serial_puts(bn);
+            serial_puts("' (uninitialised package slot)\n");
+            return NULL;
+        }
+    }
+
     serial_puts("[K32] LoadLibraryA: ");
     serial_puts(lpLibFileName);
     serial_puts("\n");
