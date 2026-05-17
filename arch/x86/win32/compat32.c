@@ -2186,12 +2186,53 @@ uint64_t compat32_dispatch(uint32_t thunk_idx, uint32_t *stack_args)
     }
     #endif
 
-    /* CASCADE-NOP REMOVED in Phase 6. Was patching the inner appThrowf
-     * call site in UPackage::LoadPackage. With FMW-REPAIR + FNAME
-     * workarounds keeping the engine consistent, the cascade may
-     * still fire (UE1 internal Outer-tree issue, not allocator-related)
-     * but allowing the throw lets the engine's native error path run
-     * — same end state, less binary patching. */
+    /* CASCADE-NOP-V2 (Phase 7e) — RE-INSTATED with new understanding.
+     *
+     * Phase 7d confirmed: ProcessRegistrants Phase 2 runs ConditionalRegister
+     * for ALL 200 entries. Entries 0..4 succeed (FName/FString conversion
+     * complete, Index field set). Entries 5..199 throw at Core.dll+0x10159B99
+     * (appThrowf "Failed to load 'None'") because their Register() tries
+     * LoadPackage("SGLDrv"/"Engine"/...) and the package can't be
+     * found-or-loaded.
+     *
+     * Disasm at the throw site:
+     *   10159b99: e8 .. .. .. ..   call appThrowf   ; (5 bytes)
+     *   10159b9e: 83 c4 08         add esp, 0x8     ; pop args
+     *   10159ba1: e9 8a 01 00 00   jmp 10159d30     ; FALL-THROUGH
+     *
+     * The recovery path at 10159d30 calls GetTransientPackage() and
+     * uses TransientPackage as Outer for the failing object. This is
+     * the engine's native fallback for "package not findable".
+     *
+     * NOP the 5-byte call → execution falls through to add esp + jmp →
+     * lands in recovery code → object gets TransientPackage as Outer →
+     * Register() returns normally → next entry processes. Phase 2
+     * COMPLETES → Phase 3 reached → GObjRegistrants cleaned → engine
+     * continues.
+     *
+     * UClasses end up with Outer=TransientPackage instead of their
+     * intended UPackage. StaticLoadClass("Engine.GameEngine") must then
+     * find UClass("GameEngine") by name (in any package) — UE1's
+     * fallback search. If it works, game progresses.
+     *
+     * Previous Phase 6 removal hypothesis was that "the engine's natural
+     * error path runs naturally" — false. The natural path is the SEH
+     * unwind that prevents Phase 3 cleanup. We need the FALL-THROUGH
+     * (silent recovery), not the throw. */
+    {
+        static int cascade_nop_patched = 0;
+        if (!cascade_nop_patched) {
+            volatile uint8_t *p = (volatile uint8_t *)(uintptr_t)0x10159B99ULL;
+            if (p[0] == 0xE8) {
+                /* 5-byte CALL — NOP it (5 × 0x90). */
+                p[0] = 0x90; p[1] = 0x90; p[2] = 0x90; p[3] = 0x90; p[4] = 0x90;
+                cascade_nop_patched = 1;
+                serial_puts("[CASCADE-NOP-V2] patched Core.dll+0x59B99 "
+                            "(call appThrowf → 5x NOP, fall-through to "
+                            "TransientPackage recovery)\n");
+            }
+        }
+    }
 
     /* FMallocWindows pool-integrity asserts: REMOVED in Phase 3 of
      * the layer-repair plan. Previously we patched je/ja → jmp at
