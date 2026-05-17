@@ -109,6 +109,27 @@ struct interrupt_frame {
     uint64_t rip, cs, rflags, rsp, ss;
 };
 
+/* Render the four bytes at `va` as a wide-string when they look like
+ * one ((low byte printable ASCII, high byte 0). Otherwise no-op. */
+static void hwbp_try_wstr(const char *label, uint32_t va)
+{
+    if (va < 0x10000 || (uint64_t)va >= 0x80000000ULL) return;
+    volatile uint16_t *w = (volatile uint16_t *)(uintptr_t)va;
+    uint16_t w0 = *w;
+    uint8_t lo = (uint8_t)(w0 & 0xFF), hi = (uint8_t)(w0 >> 8);
+    if (lo < 0x20 || lo >= 0x7F || hi != 0) return;
+    serial_puts("    "); serial_puts(label); serial_puts("=L\"");
+    char tmp[96]; int n = 0;
+    for (int i = 0; i < 95; i++) {
+        uint16_t c = w[i];
+        if (c == 0) break;
+        tmp[n++] = (c < 0x20 || c >= 0x7F) ? '?' : (char)c;
+    }
+    tmp[n] = 0;
+    serial_puts(tmp);
+    serial_puts("\"\n");
+}
+
 bool hwbp_dispatch(struct interrupt_frame *frame)
 {
     uint64_t dr6;
@@ -134,6 +155,45 @@ bool hwbp_dispatch(struct interrupt_frame *frame)
         serial_puts(" hits=");
         serial_putdec(hwbps[i].hit_count);
         serial_puts("\n");
+
+        /* Detail dump: a HWBP_EXECUTE fires BEFORE the instruction runs,
+         * so the caller's stack still holds the soon-to-be-called
+         * arguments. Print ECX/EDX, then 8 dwords at [RSP], then try a
+         * wide-string render on each pointer-shaped value. PE32 in
+         * compat mode has 32-bit ESP — interrupt_frame->rsp holds the
+         * full saved value; truncate to 32 bits to read user memory. */
+        if (hwbps[i].hit_count <= 8) {
+            uint32_t esp32 = (uint32_t)frame->rsp;
+            uint32_t ecx32 = (uint32_t)frame->rcx;
+            uint32_t edx32 = (uint32_t)frame->rdx;
+            serial_puts("  esp=0x"); serial_puthex(esp32, 8);
+            serial_puts(" ecx=0x"); serial_puthex(ecx32, 8);
+            serial_puts(" edx=0x"); serial_puthex(edx32, 8);
+            serial_puts("\n");
+
+            volatile uint32_t *st = (volatile uint32_t *)(uintptr_t)esp32;
+            uint32_t args[8] = {0};
+            for (int k = 0; k < 8; k++) {
+                /* Coarse readability — must be in user/compat32 range. */
+                uint32_t a = esp32 + (uint32_t)(k * 4);
+                if (a < 0x10000 || (uint64_t)a >= 0x80000000ULL) break;
+                args[k] = st[k];
+            }
+            serial_puts("  stack:");
+            for (int k = 0; k < 8; k++) {
+                serial_puts(" ["); serial_putdec((uint64_t)k); serial_puts("]=");
+                serial_puthex(args[k], 8);
+            }
+            serial_puts("\n");
+
+            hwbp_try_wstr("ECX",  ecx32);
+            hwbp_try_wstr("EDX",  edx32);
+            for (int k = 0; k < 4; k++) {
+                char lbl[8] = { 'a', 'r', 'g', (char)('0' + k), 0, 0, 0, 0 };
+                hwbp_try_wstr(lbl, args[k]);
+            }
+        }
+
         handled = true;
     }
 

@@ -910,6 +910,27 @@ int winexec_run(const uint8_t *file_data, uint64_t file_size)
             }
         }
 
+        /* Arm hardware breakpoint at the UT.exe LoadObject call-site that
+         * earlier wdbg stack-scans pinned as the topmost frame on the
+         * 'Failed to load 0' cascade. The call is an indirect-via-IAT
+         * `call DWORD PTR ds:0x10958c38` at 0x10904750 (6 bytes), with
+         * three dwords already pushed (one from the preceding push ecx).
+         * On HWBP_EXECUTE fire, hwbp_dispatch prints ECX/EDX + stack[0..7]
+         * + tries a wide-string render so we see exactly what package
+         * name UT.exe is asking Core.dll to load. The address is gated
+         * on the PE being UT.exe (ImageBase 0x10900000): nothing else
+         * is mapped there in our compat32 layout so it's safe. */
+        if ((uint32_t)(ULONG_PTR)info.ImageBase == 0x10900000) {
+            extern int hwbp_set(int slot, uint64_t addr, int cond, int len,
+                                const char *name);
+            if (hwbp_set(0, 0x10904750ULL, /*HWBP_EXECUTE*/0, /*HWBP_LEN_1*/0,
+                          "UT-LoadObject@4750") == 0) {
+                serial_puts("[winexec] HWBP slot 0 armed at UT.exe+0x4750\n");
+            } else {
+                serial_puts("[winexec] HWBP slot 0 arm FAILED\n");
+            }
+        }
+
         compat32_enter(entry32, sp32);
         /* never reached — control returns via proc_exit → longjmp above */
     } else {
