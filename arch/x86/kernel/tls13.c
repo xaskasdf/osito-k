@@ -467,6 +467,247 @@ static int parse_server_hello(const uint8_t *body, uint32_t len)
     return 0;
 }
 
+/* ── AIA chasing ──────────────────────────────────────────────
+ *
+ * When a server sends an incomplete chain (e.g. only the leaf, with
+ * no intermediate), some leaf certs advertise an Authority Information
+ * Access (AIA) extension with a caIssuers URL pointing at the parent
+ * cert.  RFC 5280 §4.2.2.1 says this URL serves the issuer's cert as
+ * `application/pkix-cert` (DER) or `application/x-pem-file` (PEM,
+ * rare).  We do one level of chase — enough for Let's Encrypt and
+ * Google Trust Services deployments where the leaf is shipped alone
+ * but the intermediate is reachable via plain HTTP.
+ *
+ * Cached at osfs2:tls/aia-<hash8>.der so subsequent boots reuse it
+ * without a network roundtrip.  Hash is the first 8 bytes of the
+ * SHA-256 of the leaf's caIssuers URL (deterministic, collision-safe
+ * at our scale of a handful of distinct issuers). */
+
+extern int  http_plain_get(const char *url, uint8_t *out, uint32_t out_cap);
+extern int  x509_get_aia_caissuers(const uint8_t *cert, uint32_t cert_len,
+                                   char *out, uint32_t cap);
+
+/* osfs2 stub layout (same as cert_pin.c uses). */
+typedef struct {
+    uint32_t fs_version;
+    uint32_t ino;
+    void    *data;
+    uint64_t size;
+} aia_vfs_stub_t;
+extern bool  vfs_find(const char *path, int mode, void *out);
+extern int   vfs_read(void *node, uint64_t offset, void *buf, uint64_t len);
+extern bool  osfs2_is_mounted(void);
+extern int   osfs2_delete(const char *name);
+extern void *osfs2_create(const char *name, uint64_t size);
+extern int   osfs2_write(void *file, uint64_t offset, const void *buf, uint64_t len);
+
+static const char b64_tbl[256] = {
+    /* Initialized at first use via aia_b64_init. */
+    0
+};
+static bool b64_inited = false;
+static int8_t b64_val[256];
+
+static void aia_b64_init(void)
+{
+    if (b64_inited) return;
+    for (int i = 0; i < 256; i++) b64_val[i] = -1;
+    const char *alpha = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    for (int i = 0; i < 64; i++) b64_val[(uint8_t)alpha[i]] = (int8_t)i;
+    b64_inited = true;
+    (void)b64_tbl;
+}
+
+/* Decode base64 (RFC 4648, with whitespace skipped).  Returns output
+ * length, or -1 on parse error.  Writes to `out`, capped at `cap`. */
+static int aia_b64_decode(const uint8_t *in, uint32_t in_len,
+                          uint8_t *out, uint32_t cap)
+{
+    aia_b64_init();
+    uint32_t acc = 0; int bits = 0; uint32_t outn = 0;
+    for (uint32_t i = 0; i < in_len; i++) {
+        uint8_t c = in[i];
+        if (c == '=' || c == '\r' || c == '\n' || c == ' ' || c == '\t') {
+            if (c == '=') break;
+            continue;
+        }
+        int8_t v = b64_val[c];
+        if (v < 0) return -1;
+        acc = (acc << 6) | (uint32_t)v;
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            if (outn >= cap) return -1;
+            out[outn++] = (uint8_t)((acc >> bits) & 0xFF);
+        }
+    }
+    return (int)outn;
+}
+
+/* Convert PEM-encoded cert (with "-----BEGIN CERTIFICATE-----" header)
+ * into raw DER, in place if needed.  Returns DER length, or -1 if no
+ * PEM header was found.  `buf` is rewritten with the decoded bytes. */
+static int aia_pem_to_der(uint8_t *buf, uint32_t len)
+{
+    static const char hdr[] = "-----BEGIN CERTIFICATE-----";
+    static const char ftr[] = "-----END CERTIFICATE-----";
+    uint32_t hlen = sizeof hdr - 1;
+    uint32_t flen = sizeof ftr - 1;
+    uint32_t hpos = 0;
+    bool found = false;
+    for (; hpos + hlen <= len; hpos++) {
+        bool m = true;
+        for (uint32_t k = 0; k < hlen; k++)
+            if (buf[hpos + k] != (uint8_t)hdr[k]) { m = false; break; }
+        if (m) { found = true; break; }
+    }
+    if (!found) return -1;
+    uint32_t body_start = hpos + hlen;
+    uint32_t fpos = body_start;
+    found = false;
+    for (; fpos + flen <= len; fpos++) {
+        bool m = true;
+        for (uint32_t k = 0; k < flen; k++)
+            if (buf[fpos + k] != (uint8_t)ftr[k]) { m = false; break; }
+        if (m) { found = true; break; }
+    }
+    if (!found) return -1;
+    /* Decode in a temp buf, then copy back. */
+    static uint8_t der_tmp[8192];
+    int n = aia_b64_decode(buf + body_start, fpos - body_start,
+                           der_tmp, sizeof der_tmp);
+    if (n < 0) return -1;
+    for (int i = 0; i < n; i++) buf[i] = der_tmp[i];
+    return n;
+}
+
+/* Hex-encode 4 bytes into 8 ASCII chars (lowercase).  Used to derive
+ * the cache filename from the URL hash. */
+static void aia_hex8(const uint8_t *in, char *out)
+{
+    static const char hex[] = "0123456789abcdef";
+    for (int i = 0; i < 4; i++) {
+        out[i * 2 + 0] = hex[(in[i] >> 4) & 0xF];
+        out[i * 2 + 1] = hex[ in[i]       & 0xF];
+    }
+    out[8] = 0;
+}
+
+/* Try to load a previously-cached intermediate for `url` from osfs2.
+ * Returns DER length on hit, -1 on miss. */
+static int aia_cache_load(const char *url, uint8_t *out, uint32_t cap)
+{
+    if (!osfs2_is_mounted()) return -1;
+    uint8_t url_h[32];
+    /* hostname-strlen */
+    uint32_t ul = 0; while (url[ul]) ul++;
+    sha256((const uint8_t *)url, ul, url_h);
+    char tag[9]; aia_hex8(url_h, tag);
+    char path[32];
+    /* "tls/aia-" + 8 + ".der" + NUL = 21 chars. */
+    const char *pfx = "tls/aia-";
+    uint32_t p = 0;
+    for (; pfx[p]; p++) path[p] = pfx[p];
+    for (int i = 0; i < 8; i++) path[p++] = tag[i];
+    path[p++] = '.'; path[p++] = 'd'; path[p++] = 'e'; path[p++] = 'r';
+    path[p] = 0;
+
+    aia_vfs_stub_t node;
+    if (!vfs_find(path, 0, &node)) return -1;
+    int n = vfs_read(&node, 0, out, cap);
+    if (n <= 0) return -1;
+    serial_puts("[AIA] cache hit: "); serial_puts(path); serial_puts("\n");
+    return n;
+}
+
+/* Persist the freshly-fetched intermediate to osfs2. */
+static void aia_cache_save(const char *url, const uint8_t *der, uint32_t len)
+{
+    if (!osfs2_is_mounted()) return;
+    uint8_t url_h[32];
+    uint32_t ul = 0; while (url[ul]) ul++;
+    sha256((const uint8_t *)url, ul, url_h);
+    char tag[9]; aia_hex8(url_h, tag);
+    char path[32];
+    const char *pfx = "tls/aia-";
+    uint32_t p = 0;
+    for (; pfx[p]; p++) path[p] = pfx[p];
+    for (int i = 0; i < 8; i++) path[p++] = tag[i];
+    path[p++] = '.'; path[p++] = 'd'; path[p++] = 'e'; path[p++] = 'r';
+    path[p] = 0;
+
+    osfs2_delete(path);
+    void *f = osfs2_create(path, (uint64_t)len);
+    if (!f) { serial_puts("[AIA] cache save: create failed\n"); return; }
+    int wr = osfs2_write(f, 0, der, (uint64_t)len);
+    if (wr < 0) { serial_puts("[AIA] cache save: write failed\n"); return; }
+    serial_puts("[AIA] cached intermediate at "); serial_puts(path); serial_puts("\n");
+}
+
+/* Extract leaf's caIssuers URL, fetch the response over plain HTTP,
+ * decode PEM→DER if needed, return DER bytes in `out`.
+ *
+ * Returns 0 on success (`*out_len` set), -1 if the leaf has no AIA URL
+ * or the fetch / decode failed.  Tries the osfs2 cache first. */
+static int aia_chase_intermediate(const uint8_t *leaf_der, uint32_t leaf_len,
+                                  uint8_t *out, uint32_t *out_len,
+                                  uint32_t cap)
+{
+    char url[256];
+    int ulen = x509_get_aia_caissuers(leaf_der, leaf_len, url, sizeof url);
+    if (ulen <= 0) {
+        serial_puts("[AIA] no caIssuers URL on leaf\n");
+        return -1;
+    }
+
+    /* Cache lookup first. */
+    int cn = aia_cache_load(url, out, cap);
+    if (cn > 0) { *out_len = (uint32_t)cn; return 0; }
+
+    int n = http_plain_get(url, out, cap);
+    if (n <= 0) {
+        serial_puts("[AIA] fetch failed for "); serial_puts(url); serial_puts("\n");
+        return -1;
+    }
+
+    /* Detect PEM and decode in place. */
+    bool is_pem = false;
+    if ((uint32_t)n >= 11) {
+        static const char marker[] = "-----BEGIN";
+        is_pem = true;
+        for (int k = 0; k < 10; k++)
+            if (out[k] != (uint8_t)marker[k]) { is_pem = false; break; }
+        if (!is_pem) {
+            /* Some servers return a leading CR/LF or BOM; scan first 64 bytes. */
+            uint32_t scan = (uint32_t)n < 64 ? (uint32_t)n : 64;
+            for (uint32_t i = 0; i + 10 < scan; i++) {
+                bool m = true;
+                for (int k = 0; k < 10; k++)
+                    if (out[i + k] != (uint8_t)marker[k]) { m = false; break; }
+                if (m) { is_pem = true; break; }
+            }
+        }
+    }
+    if (is_pem) {
+        int dn = aia_pem_to_der(out, (uint32_t)n);
+        if (dn < 0) {
+            serial_puts("[AIA] PEM decode failed\n");
+            return -1;
+        }
+        n = dn;
+    }
+
+    *out_len = (uint32_t)n;
+    serial_puts("[AIA] fetched intermediate from ");
+    serial_puts(url);
+    serial_puts(" (");
+    serial_putdec((uint64_t)n);
+    serial_puts(" bytes)\n");
+
+    aia_cache_save(url, out, (uint32_t)n);
+    return 0;
+}
+
 /* ── Public API ──────────────────────────────────────────────── */
 
 int tls13_connect(int tcp_conn, const char *hostname)
@@ -730,6 +971,27 @@ int tls13_connect(int tcp_conn, const char *hostname)
                                 case 1: serial_puts("REVOKED\n");  break;
                                 case 2: serial_puts("UNKNOWN\n");  break;
                                 default: serial_puts("ERROR\n");   break;
+                                }
+                            }
+
+                            /* AIA chase: if the server sent an
+                             * incomplete chain (no intermediate),
+                             * fetch it from the leaf's caIssuers URL
+                             * and splice into the chain BEFORE we
+                             * run chain-link verification.  Single
+                             * level — enough for typical Let's
+                             * Encrypt + Google PKI deployments. */
+                            static uint8_t aia_der_buf[8192];
+                            if (nc == 1 && nc < 4) {
+                                uint32_t alen = 0;
+                                if (aia_chase_intermediate(
+                                        certs[0], cert_lens[0],
+                                        aia_der_buf, &alen,
+                                        sizeof aia_der_buf) == 0) {
+                                    certs[nc]     = aia_der_buf;
+                                    cert_lens[nc] = alen;
+                                    nc++;
+                                    serial_puts("[AIA] chain extended\n");
                                 }
                             }
 
