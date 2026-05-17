@@ -570,6 +570,7 @@ static void cmd_help(void)
     sh_puts("  kexec     Boot a new kernel ELF (kexec [filename])\n");
     sh_puts("  kdownload Fetch a file via OFTP (kdownload <ip> <port> <name> [save|--kexec])\n");
     sh_puts("  kupload   Push a file via OFTP (kupload <ip> <port> <local|--dmesg> [remote])\n");
+    sh_puts("  ntpsync   Run NTP time sync (time.google.com fallback pool.ntp.org)\n");
     sh_puts("  txdelay   Pace reply-path TX by N µs after last RX (debug)\n");
     sh_puts("            txdelay [N]  — get/set, see net.c hypothesis-A comment\n");
     sh_puts("  kupdate   Pull + kexec a kernel update via HTTPS\n");
@@ -3872,6 +3873,10 @@ void shell_exec(char *line)
         extern void i211_print_stats(void) __attribute__((weak));
         if (i211_print_stats) i211_print_stats();
         else sh_puts("nic_stats: i211 not built\n");
+    } else if (strcmp(cmd, "ntpsync") == 0) {
+        extern int ntp_sync(void);
+        int r = ntp_sync();
+        sh_puts(r == 0 ? "ntpsync: ok\n" : "ntpsync: failed\n");
     } else if (strcmp(cmd, "txdelay") == 0) {
         /* Reply-path TX timing experiment — see net.c hypothesis-A
          * comment.  `txdelay <us>` paces eth_send() to wait until at
