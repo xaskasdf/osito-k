@@ -570,7 +570,9 @@ static void cmd_help(void)
     sh_puts("  kexec     Boot a new kernel ELF (kexec [filename])\n");
     sh_puts("  kdownload Fetch a file via OFTP (kdownload <ip> <port> <name> [save|--kexec])\n");
     sh_puts("  kupload   Push a file via OFTP (kupload <ip> <port> <local|--dmesg> [remote])\n");
-    sh_puts("  kupdate   (TODO) Pull a kernel update from naranjositos.tech via HTTPS\n");
+    sh_puts("  kupdate   Pull + kexec a kernel update via HTTPS\n");
+    sh_puts("            (kupdate [host] [path] [--channel <ch>] [--no-kexec])\n");
+    sh_puts("            default: https://naranjositos.tech/k/x86_64/stable/kernel.elf\n");
     sh_puts("  exec      Run an ELF binary\n");
     sh_puts("  ping      Ping an IP address\n");
     sh_puts("  tcptest   TCP connection test (tcptest [ip] [port])\n");
@@ -1516,11 +1518,148 @@ static void cmd_kupload(int argc, char *argv[])
  * kernel currently only has a direct cable to a Mac, no Internet.    */
 static void cmd_kupdate(int argc, char *argv[])
 {
-    (void)argc; (void)argv;
-    sh_puts("kupdate: TODO — fetch from https://naranjositos.tech/k/<arch>/<channel>/kernel.elf\n");
-    sh_puts("  Will use: dns_resolve + tls13_connect + http_get + osfs2_write + cmd_kexec.\n");
-    sh_puts("  Stubbed until the kernel has Internet (current setup is direct LAN cable).\n");
-    sh_puts("  Use `kdownload <local-ip> <port> kernel.elf --kexec` for now.\n");
+    const char *host    = "naranjositos.tech";
+    const char *path    = "/k/x86_64/stable/kernel.elf";
+    const char *save_as = "kernel.elf";
+    bool do_kexec = true;
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--no-kexec") == 0) do_kexec = false;
+        else if (strcmp(argv[i], "--channel") == 0 && i + 1 < argc) {
+            i++;
+            static char path_buf[64];
+            int n = 0;
+            const char *prefix = "/k/x86_64/";
+            while (*prefix && n < 60) path_buf[n++] = *prefix++;
+            const char *ch = argv[i];
+            while (*ch && n < 56) path_buf[n++] = *ch++;
+            const char *suffix = "/kernel.elf";
+            while (*suffix && n < 63) path_buf[n++] = *suffix++;
+            path_buf[n] = 0;
+            path = path_buf;
+        } else if (argv[i][0] == '/') {
+            path = argv[i];
+        } else if (argv[i][0] != '-') {
+            host = argv[i];
+        }
+    }
+
+    if (!osfs2_is_mounted()) {
+        sh_puts("kupdate: no FS mounted, cannot save\n");
+        return;
+    }
+
+    sh_puts("kupdate: GET https://");
+    sh_puts(host);
+    sh_puts(path);
+    sh_puts("\n");
+
+    void *session = kmalloc(http_session_size());
+    if (!session) { sh_puts("kupdate: out of memory (session)\n"); return; }
+    void *resp = kmalloc(http_response_size());
+    if (!resp) { kfree(session); sh_puts("kupdate: out of memory (resp)\n"); return; }
+
+    if (http_open(session, host) < 0) {
+        sh_puts("kupdate: http_open failed (DNS/TLS)\n");
+        kfree(resp); kfree(session);
+        return;
+    }
+
+    const char *headers[] = {
+        "Connection: close",
+        "User-Agent: OsitoK/1.0 (kupdate)",
+        NULL,
+    };
+    if (http_request(session, "GET", path, host, headers,
+                     NULL, 0, resp) < 0) {
+        sh_puts("kupdate: http_request failed\n");
+        http_close(session);
+        kfree(resp); kfree(session);
+        return;
+    }
+
+    /* Reach into response for status + content_length without including
+     * http.h.  Layout matches http_response_t (http.h:26-32): int32
+     * status, then headers array, header_count, bool chunked, uint32
+     * content_length.  We only need status & content_length, accessed
+     * via the public header accessor. */
+    const char *clen_s = http_get_header(resp, "Content-Length");
+    uint32_t clen = 0;
+    if (clen_s) {
+        for (const char *p = clen_s; *p >= '0' && *p <= '9'; p++)
+            clen = clen * 10 + (uint32_t)(*p - '0');
+    }
+    if (clen == 0 || clen > 32 * 1024 * 1024) {
+        sh_puts("kupdate: bad/missing Content-Length (got ");
+        sh_putdec(clen);
+        sh_puts(")\n");
+        http_close(session);
+        kfree(resp); kfree(session);
+        return;
+    }
+
+    sh_puts("kupdate: Content-Length=");
+    sh_putdec(clen);
+    sh_puts(" bytes\n");
+
+    void *buf = kmalloc(clen);
+    if (!buf) {
+        sh_puts("kupdate: out of memory (body)\n");
+        http_close(session);
+        kfree(resp); kfree(session);
+        return;
+    }
+
+    int got = http_read_body_full(session, resp, buf, clen);
+    http_close(session);
+    kfree(resp); kfree(session);
+    if (got < 0 || (uint32_t)got != clen) {
+        sh_puts("kupdate: body read short (");
+        sh_putdec((uint64_t)got);
+        sh_puts("/");
+        sh_putdec(clen);
+        sh_puts(")\n");
+        kfree(buf);
+        return;
+    }
+
+    /* Sanity: first 4 bytes must be ELF magic 0x7F 'E' 'L' 'F'. */
+    const uint8_t *b = (const uint8_t *)buf;
+    if (!(b[0] == 0x7F && b[1] == 'E' && b[2] == 'L' && b[3] == 'F')) {
+        sh_puts("kupdate: payload not ELF, aborting\n");
+        kfree(buf);
+        return;
+    }
+
+    extern void *osfs2_create(const char *name, uint64_t size);
+    extern int   osfs2_write(void *file, uint64_t offset, const void *buf, uint64_t len);
+    extern int   osfs2_delete(const char *name);
+    extern int   disk_flush(void);
+
+    void *f = osfs2_find(save_as);
+    if (f) {
+        uint64_t cur = osfs2_file_size(f);
+        if (cur != clen) { osfs2_delete(save_as); f = NULL; }
+    }
+    if (!f) f = osfs2_create(save_as, clen);
+    if (!f) {
+        sh_puts("kupdate: osfs2_create failed\n");
+        kfree(buf);
+        return;
+    }
+    osfs2_write(f, 0, buf, clen);
+    disk_flush();
+    kfree(buf);
+
+    sh_puts("kupdate: saved -> ");
+    sh_puts(save_as);
+    sh_puts(" (synced)\n");
+
+    if (do_kexec) {
+        sh_puts("kupdate: chaining to kexec...\n");
+        cmd_kexec(save_as);
+    } else {
+        sh_puts("kupdate: --no-kexec, skipping reboot\n");
+    }
 }
 
 /* ── Builtin: ping ──────────────────────────────────────────── */

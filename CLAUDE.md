@@ -393,7 +393,7 @@ arch/arm/          SM8350 (ROG Phone 5) bare-metal port — see docs/aarch64-det
 | X-RDTFIX| I211 RX RDT off-by-one (Linux igb-style: `RDT = next_to_use`, slot recién re-armado visible para HW) | Done |
 | X-MSIFIX| I211 MSI delivery: programar GPIE con PBA \| EIAME \| NSICR — sin EIAME el chip ignora re-arm del IMS post-22 IRQs | Done |
 | X-OFTP  | OsitoK File Transfer Protocol over UDP (`kdownload <ip> <port> <file>` + `tools/oftp-server.py` con NAK retransmit) | Done |
-| X-KUPDATE| `kupdate` shell stub para fetch desde naranjositos.tech (DNS + TLS + http_get + osfs2 + kexec; bloqueado pendiente de Internet directo) | Stub |
+| X-KUPDATE| `kupdate` shell command — DNS + TLS 1.2 + HTTP GET + osfs2_write + cmd_kexec; default `https://naranjositos.tech/k/x86_64/stable/kernel.elf`, `--channel <ch>` y `--no-kexec` opcionales, valida ELF magic antes de kexec | Done (pending server-side upload) |
 | X-NET-TXR| Mac↔OsitoK reply-path TX bug — `osito> ping` funciona pero `net_poll → handle_*` no llega al wire (instrumentado, hipótesis abiertas) | WIP |
 | X-VGPU  | virtio-gpu 2D + 3D driver (resource create, transfer, virgl-style) | Done |
 | X-MESA  | Mesa 25.0.0 in-OS port: util/c11/include + gallium aux + compiler/{glsl,nir,spirv} + zink + mesa/main + state_tracker (libGL.a super-archive) | WIP |
