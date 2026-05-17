@@ -2832,6 +2832,76 @@ uint64_t compat32_dispatch(uint32_t thunk_idx, uint32_t *stack_args)
                 }
                 serial_puts("\n");
             }
+            /* Phase 7d — when this is a periodic (post-Phase 2) snapshot,
+             * dump entry 0 (registered OK) and entry 5 (failed) byte-by-byte
+             * at offsets 0..0x60. Each pointer-shaped value is also rendered
+             * as both ASCII and UTF-16LE strings (UE1 uses TCHAR=WCHAR). */
+            if (periodic_fire && grn >= 6) {
+                uint32_t *all = (uint32_t *)(uintptr_t)grd;
+                int dump_idx[] = { 0, 1, 4, 5, 6, 7, 100 };
+                for (uint32_t di = 0; di < sizeof(dump_idx)/sizeof(dump_idx[0]); di++) {
+                    int idx = dump_idx[di];
+                    if ((uint32_t)idx >= grn) continue;
+                    uint32_t uobj = all[idx];
+                    if (uobj < 0x01000000) continue;
+                    serial_puts("[ENTRY-RAW#");
+                    serial_putdec((uint64_t)idx);
+                    serial_puts("] @0x");
+                    serial_puthex((uint64_t)uobj, 8);
+                    serial_puts("\n");
+                    volatile uint32_t *u = (volatile uint32_t *)(uintptr_t)uobj;
+                    for (int off = 0; off < 0x60; off += 4) {
+                        uint32_t v = u[off / 4];
+                        serial_puts("  +0x");
+                        serial_puthex((uint64_t)off, 2);
+                        serial_puts(": 0x");
+                        serial_puthex((uint64_t)v, 8);
+                        /* Render as ASCII string if it's a plausible
+                         * pointer to .rdata text. */
+                        if (v >= 0x10000000 && v < 0x12000000) {
+                            volatile char *s = (volatile char *)(uintptr_t)v;
+                            int ascii_ok = 1;
+                            for (int c = 0; c < 4; c++) {
+                                char ch = s[c];
+                                if (ch < 0x20 || ch >= 0x7F) { ascii_ok = 0; break; }
+                            }
+                            if (ascii_ok) {
+                                serial_puts(" A=\"");
+                                char tmp[32]; int n = 0;
+                                for (int c = 0; c < 31 && s[c]; c++) {
+                                    char ch = s[c];
+                                    tmp[n++] = (ch < 0x20 || ch >= 0x7F) ? '?' : ch;
+                                }
+                                tmp[n] = 0;
+                                serial_puts(tmp);
+                                serial_puts("\"");
+                            } else {
+                                /* Try UTF-16LE */
+                                volatile uint16_t *w = (volatile uint16_t *)(uintptr_t)v;
+                                int utf16_ok = 1;
+                                for (int c = 0; c < 4; c++) {
+                                    uint16_t ch = w[c];
+                                    if (ch == 0 && c > 0) break;
+                                    if (ch < 0x20 || ch >= 0x7F) { utf16_ok = 0; break; }
+                                }
+                                if (utf16_ok) {
+                                    serial_puts(" W=L\"");
+                                    char tmp[32]; int n = 0;
+                                    for (int c = 0; c < 31; c++) {
+                                        uint16_t ch = w[c];
+                                        if (ch == 0) break;
+                                        tmp[n++] = (ch < 0x20 || ch >= 0x7F) ? '?' : (char)ch;
+                                    }
+                                    tmp[n] = 0;
+                                    serial_puts(tmp);
+                                    serial_puts("\"");
+                                }
+                            }
+                        }
+                        serial_puts("\n");
+                    }
+                }
+            }
             uint32_t to_dump = grn > 20 ? 20 : grn;
             uint32_t *slots = (uint32_t *)(uintptr_t)grd;
             for (uint32_t i = 0; i < to_dump; i++) {
