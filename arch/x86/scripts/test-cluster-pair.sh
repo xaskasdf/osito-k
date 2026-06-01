@@ -96,7 +96,7 @@ boot_vm() {
       -drive if=pflash,format=raw,readonly=on,file="$OVMF" \
       -drive if=pflash,format=raw,file="$vars" \
       -drive file="$esp",format=raw,if=ide \
-      -drive file="$nvme",format=raw,if=none,id=nvme0,cache=none \
+      -drive file="$nvme",format=raw,if=none,id=nvme0 \
       -device nvme,serial=deadbeef,drive=nvme0 \
       -m 512M -machine q35 -smp 2 \
       -device virtio-net-pci,netdev=net0,disable-legacy=on,disable-modern=off,mac="$mac" \
@@ -106,6 +106,11 @@ boot_vm() {
 }
 
 PID_A=$(boot_vm a 52:54:00:12:34:01)
+# Stagger the second launch: bringing up two vmnet-shared interfaces
+# back-to-back on HVF sometimes leaves the 2nd VM without a working NIC
+# (B then produces no serial output / never DHCPs). An 8s gap lets the
+# first interface settle.
+sleep 8
 PID_B=$(boot_vm b 52:54:00:12:34:02)
 LOG_A="$BUILD/serial-cluster-a.log"
 LOG_B="$BUILD/serial-cluster-b.log"
