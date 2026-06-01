@@ -7,24 +7,60 @@ A [naranjositos.tech](https://naranjositos.tech/) project.
 
 ## Build & Flash
 
+The root `Makefile` is a **delegator** — each arch has its own Makefile under `arch/<arch>/`:
+
+```bash
+make            # default → ESP8266/Xtensa firmware (build/osito.elf + osito0x00000.bin)
+make x86        # x86-64 bare-metal OS → arch/x86/build/{boot.efi,kernel.elf}
+make arm        # AArch64 (SM8350 / ROG Phone 5)
+make wasm       # wasm32 hosted build
+make flash      # flash ESP8266 via /dev/ttyUSB0
+make clean-all  # wipe every arch's build/
+```
+
+### ESP8266 (Xtensa) — the CI-built default
 ```bash
 # Linux:
 export PATH="$PWD/arch/xtensa/tools/xtensa-lx106-elf/bin:$PATH"
-make                    # default: all features enabled
+make                    # default: all features enabled (build/osito.elf)
 make ENABLE_ELITE=0 ENABLE_FORTH=0 ENABLE_DOOM=1   # DOOM config
 make flash              # flash via /dev/ttyUSB0
-
-# Windows:
-export PATH="/c/Users/xasko/osito-k/arch/xtensa/tools/xtensa-lx106-elf/bin:$PATH"
-make PYTHON=py          # or run esptool manually
+# Windows: export PATH=".../arch/xtensa/tools/xtensa-lx106-elf/bin:$PATH"; make PYTHON=py
 ```
+CI (`.github/workflows/build.yml`) builds **only** this Xtensa firmware on push/PR to `master`; x86/arm/wasm are not in CI.
 
-**x86-64 bare-metal build** (requires `gnu-efi`):
+### x86-64 bare-metal AI OS — the primary active target
+Needs the **`x86_64-elf-gcc` cross toolchain + gnu-efi** (the bundled `tools/` toolchain is Xtensa-only). The Makefile auto-detects gnu-efi at `/usr/local` (macOS, ncroxon source build) or `/usr` (`sudo apt install gnu-efi`).
 ```bash
-sudo apt install gnu-efi
-make -C arch/x86            # builds arch/x86/build/ositok.efi
-make -C tools/ositofs        # builds host tools (mkfs, write, ls, info)
+make -C arch/x86            # → build/boot.efi + build/kernel.elf + lib/vulkan/libvulkan.a
+make -C arch/x86 minimal    # kernel-minimal.elf — fallback when the full kernel crashes (BSS/NVMe-DMA overlap)
+make -C arch/x86 tcc        # kernel.elf via in-tree TCC (self-host verification)
+make -C arch/x86 legacy     # monolithic ositok.efi (old single-PE path)
+make -C arch/x86 COMPAT_TRACE=1   # +diagnostic probes in int2e/dos-int + #PF (byte-identical when unset/0)
+make -C tools/ositofs       # host FS tools: mkfs/write/read/ls/info/delete/rename/fsck/defrag
 ```
+
+### Run x86-64 in QEMU (the main dev loop)
+The runner scripts build an ESP FAT image (boot.efi → `BOOTX64.EFI`, plus `kernel.elf`) via `mtools`, boot it under OVMF/edk2 on `q35`/`-m 512M`/`-smp 4` with virtio-net (`hostfwd udp 7778→7777`, `tcp 50052→50052`), xHCI kbd+tablet, and attach `arch/x86/build/nvme.img` as NVMe if present (the UT99/DOOM image).
+```bash
+arch/x86/scripts/qemu-cocoa.sh                                # macOS: -accel hvf -display cocoa
+arch/x86/scripts/qemu-test.sh [--no-build] [--no-gl] [--kill] # generic; virtio-gpu-gl by default
+.\build-windows.ps1                                           # Windows: WHPX + gtk (see below)
+```
+**The serial log is the debugging lifeline**: `arch/x86/build/serial.log`. Exit QEMU with `Ctrl-A X`. Poke the in-OS UDP inference server from the host: `echo "hola osito" | nc -u localhost 7777`.
+
+### Windows (this machine)
+The repo is rsync'd from a Mac to `C:\Users\xasko\osito-k`; build via msys2/mingw64 (`C:\msys64`). Full guide: **`README-windows.md`**.
+```powershell
+.\build-windows.ps1 -Check      # report missing deps
+.\build-windows.ps1 -Install    # pacman: make, mtools, mingw-w64-x86_64-qemu
+.\build-windows.ps1 -BuildOnly  # compile only
+.\build-windows.ps1             # build + QEMU (WHPX; add -Accel tcg if no Hypervisor Platform)
+```
+`x86_64-elf-gcc` and `gnu-efi` are **not in pacman** — install manually (prebuilt cross-tools or crosstool-ng) and add their `bin/` to the mingw64 PATH.
+
+### Tests
+There is no host unit-test harness. `arch/x86/test/*.c` (hello_c, fork_test, thread_test, mmap_test, vfs_test, test_linux_abi, kilo, qjs, tcc, selfbuild…) compile to ELF and run **inside the booted OS** — load them onto the NVMe/ESP image and run from the in-OS shell, or exercise the network stack via the UDP server above.
 
 **Feature flags** (see Makefile):
 ```
