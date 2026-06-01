@@ -3178,6 +3178,59 @@ uint64_t compat32_dispatch(uint32_t thunk_idx, uint32_t *stack_args)
                             cls_cur = cls_super;
                             cls_depth++;
                         }
+
+                        /* Phase 7l — NameHash bucket walker. FName::FName
+                         * decoded from Core.dll+0x150b50: looks up via
+                         * NameHash[hash & 0xfff] (table at 0x10295d4c).
+                         * Each FNameEntry chains via +0x08; Name string
+                         * starts at +0x0c.
+                         *
+                         * Goal: search all 4096 buckets for the FNameEntry
+                         * whose Name == "Engine" / "Core". If found,
+                         * compare bucket index to the hash expected. If
+                         * NOT found in ANY bucket → NameHash is missing
+                         * the entry → FName::FName(L"Engine", FALSE)
+                         * returns 0 → StaticFindObject early-exits. */
+                        uint32_t target_fname_entry = name_slots[target_idx];
+                        volatile uint32_t *namehash = (volatile uint32_t *)(uintptr_t)0x10295D4CULL;
+                        int hash_bucket = -1;
+                        int hash_chain_pos = -1;
+                        int total_chain_nodes = 0;
+                        int populated_buckets = 0;
+                        for (int b = 0; b < 4096; b++) {
+                            uint32_t head = namehash[b];
+                            if (head < 0x01000000) continue;
+                            populated_buckets++;
+                            uint32_t cur = head;
+                            int depth = 0;
+                            while (cur >= 0x01000000 && depth < 64) {
+                                total_chain_nodes++;
+                                if (cur == target_fname_entry) {
+                                    hash_bucket = b;
+                                    hash_chain_pos = depth;
+                                }
+                                uint32_t next = *(volatile uint32_t *)(uintptr_t)(cur + 0x08);
+                                cur = next;
+                                depth++;
+                            }
+                        }
+                        serial_puts("[NAMEHASH] '");
+                        serial_puts(want);
+                        serial_puts("' FNameEntry=0x");
+                        serial_puthex((uint64_t)target_fname_entry, 8);
+                        serial_puts(" populated_buckets=");
+                        serial_putdec((uint64_t)populated_buckets);
+                        serial_puts(" total_chain_nodes=");
+                        serial_putdec((uint64_t)total_chain_nodes);
+                        if (hash_bucket >= 0) {
+                            serial_puts(" FOUND in bucket=");
+                            serial_putdec((uint64_t)hash_bucket);
+                            serial_puts(" pos=");
+                            serial_putdec((uint64_t)hash_chain_pos);
+                        } else {
+                            serial_puts(" NOT FOUND in any bucket");
+                        }
+                        serial_puts("\n");
                     }
                 }
             }
