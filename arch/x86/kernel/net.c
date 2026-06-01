@@ -1937,7 +1937,11 @@ int net_tcp_recv_timeout(int conn_idx, void *buf, uint32_t buf_size,
                     __asm__ volatile ("sti; hlt; cli" ::: "memory");
                     net_poll();
                     r = net_tcp_recv(conn_idx, buf, buf_size);
-                    if (r != 0) { net_waiter_clear(slot); return r; }
+                    if (r != 0) {
+                        net_waiter_clear(slot);
+                        __asm__ volatile ("sti" ::: "memory"); /* leave IF=1 */
+                        return r;
+                    }
                     /* If we were woken but no data yet, re-register */
                     if (net_waiters[slot].type == NETWAIT_NONE) {
                         /* Waiter was cleared (wakeup or timeout) */
@@ -1945,6 +1949,13 @@ int net_tcp_recv_timeout(int conn_idx, void *buf, uint32_t buf_size,
                     }
                 }
                 net_waiter_clear(slot);
+                /* Re-enable IF before any later code runs — the inner
+                 * loop's trailing `cli` would otherwise leak out and any
+                 * subsequent bare `hlt` (here or in a caller, e.g. a
+                 * kthread returning into sched_thread_exit) could halt the
+                 * BSP forever (no IRQ left to wake it). Ported from
+                 * osito-a@7a72b06. */
+                __asm__ volatile ("sti" ::: "memory");
                 /* Re-check after wakeup */
                 r = net_tcp_recv(conn_idx, buf, buf_size);
                 if (r != 0) return r;

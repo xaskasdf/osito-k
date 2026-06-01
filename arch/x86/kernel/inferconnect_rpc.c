@@ -382,6 +382,13 @@ int inferconnect_rpc_start(uint16_t port)
 {
     if (ic_rpc_running) return 0;
     if (port != 0) ic_rpc_port = port;
+    /* Publish rpc_port to the broadcaster SYNCHRONOUSLY before the
+     * kthread launches, so the very first multicast heartbeat already
+     * advertises the correct port. Otherwise the broadcaster's first
+     * send carries port=0 (its default); peers cache port=0 for our IP
+     * and cluster_send_heartbeat/delegation reject us until a later
+     * heartbeat refreshes the slot. Ported from osito-a@6040e00. */
+    inferconnect_set_rpc_port(ic_rpc_port);
     ic_rpc_running = 1;
     ic_rpc_kth_idx = kthread_create("inferconnect-rpc", ic_rpc_thread, NULL);
     if (ic_rpc_kth_idx < 0) { ic_rpc_running = 0; return -1; }

@@ -777,7 +777,15 @@ void __initk kernel_entry(boot_info_t *info)
             /* Inferconnect: UDP heartbeat + TCP RPC server (port 19999).
              * cluster: liveness state machine on top + V1 LAN rendezvous. */
             extern int  inferconnect_start(void);
+            extern int  inferconnect_rpc_start(uint16_t port);
             extern void cluster_init(void);
+            /* RPC server FIRST so the broadcaster's very first heartbeat
+             * already advertises a non-zero rpc_port (the server publishes
+             * it synchronously). Without the RPC server up, this node can
+             * initiate delegations but cannot answer them — required for
+             * the osito-k <-> osito-a cross-node cluster. Ported from
+             * osito-a@6040e00. */
+            inferconnect_rpc_start(0);
             inferconnect_start();
             cluster_init();
 

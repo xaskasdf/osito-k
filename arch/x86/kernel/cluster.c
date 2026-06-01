@@ -745,8 +745,11 @@ static void cluster_delegate_probe_thread(void *unused)
      * IC-RPC server is listening, but its agent may still be coming
      * up — we add a settle window below. */
     extern bool agent_is_initialized(void);
-    serial_puts("[CLUSTER-PROBE] waiting for local agent_init + ALIVE peer (≤120s)...\n");
-    uint64_t deadline = idt_get_ticks() + 12000;
+    serial_puts("[CLUSTER-PROBE] waiting for local agent_init + ALIVE peer (≤300s)...\n");
+    /* 300s: agent_init takes ~100s on a fresh boot (model + tokenizer
+     * load + osfs2 RL-record reload), so a 120s window raced the probe
+     * past readiness. Ported from osito-a@6040e00. */
+    uint64_t deadline = idt_get_ticks() + 30000;
     int peer = -1;
     while (idt_get_ticks() < deadline) {
         if (!agent_is_initialized()) { sched_yield(); continue; }
