@@ -89,6 +89,16 @@ static void ic_thread(void *data)
             int len = ic_build_msg(msg, sizeof(msg));
             int rc = net_udp_send_multicast(grp, IC_PORT, IC_PORT,
                                              msg, (uint32_t)len);
+            /* Discovery fallback: also limited-broadcast the heartbeat.
+             * macOS vmnet-shared bridges broadcast between guests but
+             * drops the 239.255.255.250 multicast group, so the multicast
+             * send alone never reaches peers there. The broadcast carries
+             * our real source IP (ic_peer_handler keys peers off it).
+             * Harmless on real LANs (peers dedupe by IP). */
+            extern int net_udp_send_broadcast_self(uint16_t, uint16_t,
+                                                    const void *, uint32_t);
+            (void)net_udp_send_broadcast_self(IC_PORT, IC_PORT,
+                                              msg, (uint32_t)len);
             if (rc == 0) ic_packets_sent++;
             /* After a few heartbeats, give peers time to land in our
              * table and then probe each one over TCP/RPC. One-shot:

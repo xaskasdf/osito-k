@@ -754,6 +754,56 @@ int net_udp_send_broadcast(uint16_t dst_port, uint16_t src_port,
     return nic_send(tx_pkt, frame_len);
 }
 
+/* Limited-broadcast (255.255.255.255) UDP sourced from OUR real IP.
+ *
+ * Unlike net_udp_send_broadcast (which hardcodes src 0.0.0.0 for DHCP),
+ * this carries our_ip as the source so receivers that key peers off the
+ * packet source address (e.g. inferconnect's ic_peer_handler) record the
+ * right address. Used as a discovery fallback on segments that don't
+ * forward IP multicast between hosts — notably macOS vmnet-shared, which
+ * bridges broadcast but drops the 239.255.255.250 cluster group. Real
+ * LANs / hardware with working multicast still get the multicast send;
+ * this just guarantees discovery everywhere. */
+int net_udp_send_broadcast_self(uint16_t dst_port, uint16_t src_port,
+                                const void *data, uint32_t len)
+{
+    uint32_t udp_len = sizeof(udp_hdr_t) + len;
+    uint32_t ip_total = sizeof(ipv4_hdr_t) + udp_len;
+    if (ETH_HDR_LEN + ip_total > sizeof(tx_pkt)) return -1;
+
+    static const uint8_t bcast_mac[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
+    eth_hdr_t *eth = (eth_hdr_t *)tx_pkt;
+    memcpy(eth->dst, bcast_mac, 6);
+    memcpy(eth->src, our_mac, 6);
+    eth->ethertype = htons(ETH_TYPE_IP4);
+
+    ipv4_hdr_t *ip = (ipv4_hdr_t *)(tx_pkt + ETH_HDR_LEN);
+    ip->ver_ihl   = 0x45;
+    ip->tos       = 0;
+    ip->total_len = htons((uint16_t)ip_total);
+    ip->id        = htons(ip_id_counter++);
+    ip->frag      = 0;
+    ip->ttl       = 1;                                  /* link-local only */
+    ip->proto     = IP_PROTO_UDP;
+    ip->checksum  = 0;
+    memcpy(ip->src, our_ip, 4);                         /* our real IP */
+    memset(ip->dst, 0xFF, 4);                           /* 255.255.255.255 */
+    ip->checksum  = ip_checksum(ip, sizeof(ipv4_hdr_t));
+
+    udp_hdr_t *udp = (udp_hdr_t *)(tx_pkt + ETH_HDR_LEN + sizeof(ipv4_hdr_t));
+    udp->src_port = htons(src_port);
+    udp->dst_port = htons(dst_port);
+    udp->length   = htons((uint16_t)udp_len);
+    udp->checksum = 0;
+
+    memcpy(tx_pkt + ETH_HDR_LEN + sizeof(ipv4_hdr_t) + sizeof(udp_hdr_t),
+           data, len);
+
+    uint32_t frame_len = ETH_HDR_LEN + ip_total;
+    if (frame_len < 60) { memset(tx_pkt + frame_len, 0, 60 - frame_len); frame_len = 60; }
+    return nic_send(tx_pkt, frame_len);
+}
+
 /* Forward declaration for retransmit in net_poll */
 static int tcp_send_segment(tcp_conn_t *conn, uint8_t flags,
                             const void *data, uint32_t len);
