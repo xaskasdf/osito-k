@@ -2186,55 +2186,19 @@ uint64_t compat32_dispatch(uint32_t thunk_idx, uint32_t *stack_args)
     }
     #endif
 
-    /* CASCADE-NOP-V2 (Phase 7e) — RE-INSTATED with new understanding.
+    /* CASCADE-NOP-V2 REMOVED in Phase 7h.
      *
-     * Phase 7d confirmed: ProcessRegistrants Phase 2 runs ConditionalRegister
-     * for ALL 200 entries. Entries 0..4 succeed (FName/FString conversion
-     * complete, Index field set). Entries 5..199 throw at Core.dll+0x10159B99
-     * (appThrowf "Failed to load 'None'") because their Register() tries
-     * LoadPackage("SGLDrv"/"Engine"/...) and the package can't be
-     * found-or-loaded.
-     *
-     * Disasm at the throw site:
-     *   10159b99: e8 .. .. .. ..   call appThrowf   ; (5 bytes)
-     *   10159b9e: 83 c4 08         add esp, 0x8     ; pop args
-     *   10159ba1: e9 8a 01 00 00   jmp 10159d30     ; FALL-THROUGH
-     *
-     * The recovery path at 10159d30 calls GetTransientPackage() and
-     * uses TransientPackage as Outer for the failing object. This is
-     * the engine's native fallback for "package not findable".
-     *
-     * NOP the 5-byte call → execution falls through to add esp + jmp →
-     * lands in recovery code → object gets TransientPackage as Outer →
-     * Register() returns normally → next entry processes. Phase 2
-     * COMPLETES → Phase 3 reached → GObjRegistrants cleaned → engine
-     * continues.
-     *
-     * UClasses end up with Outer=TransientPackage instead of their
-     * intended UPackage. StaticLoadClass("Engine.GameEngine") must then
-     * find UClass("GameEngine") by name (in any package) — UE1's
-     * fallback search. If it works, game progresses.
-     *
-     * Previous Phase 6 removal hypothesis was that "the engine's natural
-     * error path runs naturally" — false. The natural path is the SEH
-     * unwind that prevents Phase 3 cleanup. We need the FALL-THROUGH
-     * (silent recovery), not the throw. */
-    {
-        static int cascade_nop_patched = 0;
-        if (!cascade_nop_patched) {
-            volatile uint8_t *p = (volatile uint8_t *)(uintptr_t)0x10159B99ULL;
-            if (p[0] == 0xE8) {
-                /* 5-byte CALL — NOP it (5 × 0x90). */
-                p[0] = 0x90; p[1] = 0x90; p[2] = 0x90; p[3] = 0x90; p[4] = 0x90;
-                cascade_nop_patched = 1;
-                serial_puts("[CASCADE-NOP-V2] patched Core.dll+0x59B99 "
-                            "(call appThrowf → 5x NOP, fall-through to "
-                            "TransientPackage recovery)\n");
-            }
-        }
-    }
+     * Phase 7g HWBP data (commit da1fb85) falsified the premise: ALL 200
+     * GObjRegistrants entries successfully traverse the full Register
+     * chain (UClass → UStruct → UField → UObject → CreatePackage). The
+     * "Failed to load 'None'" throw at Core.dll+0x59B99 (PackageNotFound)
+     * is NOT firing because of registration failure — it fires later
+     * during StaticLoadObject downstream lookups. NOP'ing it was
+     * whack-a-mole on the wrong site; real cascade root is
+     * StaticFindObject(UPackage, NULL, "Engine") returning NULL.
+     */
 
-    /* FMallocWindows pool-integrity asserts: REMOVED in Phase 3 of
+/* FMallocWindows pool-integrity asserts: REMOVED in Phase 3 of
      * the layer-repair plan. Previously we patched je/ja → jmp at
      * UT.exe 0x109032A8/0x10903303/0x10903353/0x10903374 to skip
      * the HeapCheck() asserts at FMallocWindows.cpp lines 367/370/
@@ -2988,70 +2952,18 @@ uint64_t compat32_dispatch(uint32_t thunk_idx, uint32_t *stack_args)
         }
     }
 
-    /* PRECREATE-PACKAGES — Phase 7f. Before Phase 2 of ProcessRegistrants
-     * iterates, ensure UPackage("Engine") and other common packages exist
-     * in GObj.
+    /* PRECREATE-PACKAGES REMOVED in Phase 7h.
      *
-     * Phase 7d evidence: entries 5+ have +0x18 pointing at TCHAR* L"Engine"
-     * (or "SGLDrv", etc.) in their respective DLLs' .rdata. Register()
-     * needs to find UPackage(*Name) in GObj, and if not found, tries
-     * CreatePackage which throws when the package can't be loaded.
-     *
-     * Strategy: at the moment Num just transitioned 0→200 (Phase 1 done,
-     * Phase 2 about to start), call CreatePackage(NULL, L"Engine") via
-     * compat32_callback_args(0x10101CFD, 2, [NULL, &"Engine"]) to create
-     * the UPackage("Engine") object in GObj BEFORE Phase 2 iterates.
-     * Then Engine.dll's UClass instances can find their outer UPackage
-     * during Register, completing registration. */
-    {
-        volatile uint32_t *gobjreg2 = (volatile uint32_t *)(uintptr_t)0x102A0360ULL;
-        static int precreate_done = 0;
-        uint32_t pg_grd = gobjreg2[0], pg_grn = gobjreg2[1];
-        if (!precreate_done && pg_grd != 0 && pg_grn >= 100) {
-            precreate_done = 1;
-            extern void *mem_alloc_pages(uint64_t count);
-            void *page = mem_alloc_pages(1);
-            if (page && (uint64_t)page < 0x80000000ULL) {
-                /* Write WCHAR strings into the page at known offsets. */
-                uint16_t *p = (uint16_t *)page;
-                const char *names[] = {
-                    "Engine", "Core", "Window", "Render", "Galaxy",
-                    "Editor", "UnrealI", "UnrealShare", "IpDrv", "Fire",
-                    "D3DDrv", "GlideDrv", "MeTaLDrv", "OpenGlDrv", "SGLDrv",
-                    "SoftDrv", "UWeb", "WinDrv", "Audio", NULL,
-                };
-                int off = 0;
-                int offsets[32];
-                int name_count = 0;
-                for (int i = 0; names[i]; i++) {
-                    offsets[name_count++] = off;
-                    for (int j = 0; names[i][j]; j++) {
-                        p[off++] = (uint16_t)names[i][j];
-                    }
-                    p[off++] = 0;
-                }
-                serial_puts("[PRECREATE-PACKAGES] page=0x");
-                serial_puthex((uint64_t)page, 8);
-                serial_puts(" calling CreatePackage for ");
-                serial_putdec((uint64_t)name_count);
-                serial_puts(" packages...\n");
-                for (int i = 0; i < name_count; i++) {
-                    uint32_t name_va = (uint32_t)(uint64_t)page + offsets[i] * 2;
-                    uint32_t args2[2] = { 0, name_va };
-                    serial_puts("  CreatePackage(NULL, L\"");
-                    serial_puts(names[i]);
-                    serial_puts("\") ...");
-                    uint32_t ret = compat32_callback_args(0x10101CFD, 2, args2);
-                    serial_puts(" → 0x");
-                    serial_puthex((uint64_t)ret, 8);
-                    serial_puts("\n");
-                }
-                serial_puts("[PRECREATE-PACKAGES] done\n");
-            }
-        }
-    }
+     * Phase 7g HWBP data confirmed Register's CreatePackage call fires
+     * for every entry (200 hits at CreatePackage entry). Pre-creating
+     * packages was both redundant and irrelevant to the cascade — which
+     * actually originates downstream in StaticLoadObject when
+     * StaticFindObject(UPackage, "Engine") fails to find the package
+     * even though it WAS created. Real bug is in GObj insertion or
+     * lookup, not in pre-population.
+     */
 
-    /* GOBJREG-FORCE — when GObjRegistrants accumulates >= 100 entries and
+/* GOBJREG-FORCE — when GObjRegistrants accumulates >= 100 entries and
      * stays there, force a manual ProcessRegistrants pass.
      *
      * Observed during Phase 7 investigation: after natural ProcessRegistrants
