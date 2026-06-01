@@ -188,6 +188,21 @@ void cluster_init(void)
     serial_puts(" stale=15s dead=30s\n");
 }
 
+/* Re-load FS-dependent cluster state once OsitoFS is mounted.
+ *
+ * osito-k's boot brings networking + cluster_init() up BEFORE the
+ * OsitoFS mount, so the PSK (oict-key.txt) and cluster.json are not
+ * yet readable when cluster_init() runs — load_psk() fails closed and
+ * every HEARTBEAT HMAC verify is rejected, so peers never reach ALIVE.
+ * main.c calls this immediately after the mount completes; the
+ * broadcaster's periodic heartbeats then start verifying once both
+ * nodes have re-loaded the shared key. */
+void cluster_fs_ready(void)
+{
+    load_psk();
+    load_config();
+}
+
 const cluster_state_t *cluster_state(void) { return &g_cluster; }
 
 uint32_t cluster_count_state(peer_state_t st)

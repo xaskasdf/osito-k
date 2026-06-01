@@ -778,8 +778,15 @@ void __initk kernel_entry(boot_info_t *info)
              * cluster: liveness state machine on top + V1 LAN rendezvous. */
             extern int  inferconnect_start(void);
             extern int  inferconnect_rpc_start(uint16_t port);
+            extern int  inferconnect_peer_listener_start(void);
             extern void cluster_init(void);
-            /* RPC server FIRST so the broadcaster's very first heartbeat
+            /* Peer listener FIRST: registers the UDP :19999 callback so we
+             * actually RECEIVE peer heartbeats. Without it this node only
+             * broadcasts into the void and never discovers anyone (the
+             * multicast-accept patch in net.c::handle_ipv4 is what lets the
+             * 239.x frames reach this callback). */
+            inferconnect_peer_listener_start();
+            /* RPC server next so the broadcaster's very first heartbeat
              * already advertises a non-zero rpc_port (the server publishes
              * it synchronously). Without the RPC server up, this node can
              * initiate delegations but cannot answer them — required for
@@ -788,6 +795,13 @@ void __initk kernel_entry(boot_info_t *info)
             inferconnect_rpc_start(0);
             inferconnect_start();
             cluster_init();
+            /* Launch the cluster-tick kthread: it scans the inferconnect
+             * peer table, promotes discovered peers to ALIVE, sends RPC
+             * HEARTBEATs, and ages peers through STALE/DEAD. cluster_init()
+             * only sets up state — without cluster_start() the liveness
+             * machine never runs and no peer ever reaches ALIVE. */
+            extern int cluster_start(void);
+            cluster_start();
 
             /* Optional cross-node delegation probe — triggered only
              * when `cluster-delegate.txt` sentinel exists in osfs2. */
@@ -1021,6 +1035,14 @@ void __initk kernel_entry(boot_info_t *info)
     bool model_ready = false;
     if (fs_mounted) {
         osfs2_list();
+
+        /* Cluster PSK (oict-key.txt) + cluster.json live on OsitoFS,
+         * which only just mounted — cluster_init() ran earlier (before
+         * the mount) with the FS absent, so its load_psk() failed closed.
+         * Re-load now so HEARTBEAT HMAC verify can succeed and peers can
+         * reach ALIVE. */
+        extern void cluster_fs_ready(void);
+        cluster_fs_ready();
 
         static gguf_model_t gguf_model;
         if (gguf_load(&gguf_model) == 0 && gguf_model.num_tensors > 0) {

@@ -592,8 +592,16 @@ static void handle_ipv4(const uint8_t *pkt, uint32_t len)
         serial_puts(" total="); serial_putdec(total); serial_puts("\n");
     }
 
-    /* Check destination is us */
-    if (!ip_eq(ip->dst, our_ip)) {
+    /* Accept frames addressed to us, to limited broadcast, OR to a
+     * class-D multicast group. Multicast lets us listen for peer
+     * heartbeats (InferConnect 239.255.255.250:19999) without joining
+     * IGMP groups — virtio-net + e1000 family deliver multicast frames
+     * by default since we never negotiated VIRTIO_NET_F_CTRL_RX. Ported
+     * from osito-a (was missing in osito-k → cluster discovery dead). */
+    bool is_bcast = (ip->dst[0] == 0xFF && ip->dst[1] == 0xFF &&
+                     ip->dst[2] == 0xFF && ip->dst[3] == 0xFF);
+    bool is_mcast = ((ip->dst[0] & 0xF0) == 0xE0);   /* 224.0.0.0/4 */
+    if (!ip_eq(ip->dst, our_ip) && !is_bcast && !is_mcast) {
         if (log_this) serial_puts("[IPv4] drop: dst != our_ip\n");
         return;
     }
