@@ -3044,6 +3044,92 @@ uint64_t compat32_dispatch(uint32_t thunk_idx, uint32_t *stack_args)
                     serial_puts(" core_hits=");
                     serial_putdec((uint64_t)core_hits);
                     serial_puts("\n");
+
+                    /* Phase 7j — GObjHash chain walker. Decoded from
+                     * StaticFindObject @ Core.dll+0x570b0:
+                     *   hash = (Outer ? Outer->Index : 0) XOR FName.Index
+                     *   slot = GObjHash[hash & 0xfff]   (table @ 0x1029be68)
+                     *   while (slot) {
+                     *       if (slot->Name == FName.Index && slot->Outer == Outer)
+                     *           return slot;
+                     *       slot = slot->HashNext;   // [obj+0x08]
+                     *   }
+                     *
+                     * For each found Engine/Core UPackage, walk the chain
+                     * that StaticFindObject would walk. If our target is
+                     * NOT in the chain → AddObject doesn't link into hash
+                     * table for UPackages. */
+                    volatile uint32_t *gobjhash = (volatile uint32_t *)(uintptr_t)0x1029BE68ULL;
+                    for (int pass = 0; pass < 2; pass++) {
+                        const char *want = pass == 0 ? "Engine" : "Core";
+                        int want_len = pass == 0 ? 6 : 4;
+                        uint32_t target_obj = 0;
+                        uint32_t target_idx = 0;
+                        for (uint32_t i = 0; i < oo_num; i++) {
+                            uint32_t obj_va = obj_slots[i];
+                            if (obj_va < 0x01000000) continue;
+                            uint32_t fname_idx = *(volatile uint32_t *)(uintptr_t)(obj_va + 0x20);
+                            if (fname_idx >= names_num) continue;
+                            uint32_t name_entry = name_slots[fname_idx];
+                            if (name_entry < 0x01000000) continue;
+                            uint16_t *ws = (uint16_t *)(uintptr_t)(name_entry + 0xC);
+                            int matches = 1;
+                            for (int c = 0; c < want_len; c++) {
+                                if (ws[c] != (uint16_t)want[c]) { matches = 0; break; }
+                            }
+                            if (matches && ws[want_len] == 0) {
+                                uint32_t outer = *(volatile uint32_t *)(uintptr_t)(obj_va + 0x18);
+                                if (outer == 0) {  /* prefer top-level UPackage */
+                                    target_obj = obj_va;
+                                    target_idx = fname_idx;
+                                    break;
+                                }
+                            }
+                        }
+                        if (target_obj == 0) continue;
+                        uint32_t hash = (0 ^ target_idx) & 0xfff;
+                        uint32_t head = gobjhash[hash];
+                        serial_puts("[GOBJHASH] '");
+                        serial_puts(want);
+                        serial_puts("' FName=");
+                        serial_putdec((uint64_t)target_idx);
+                        serial_puts(" bucket=");
+                        serial_putdec((uint64_t)hash);
+                        serial_puts(" head=0x");
+                        serial_puthex((uint64_t)head, 8);
+                        serial_puts(" target=0x");
+                        serial_puthex((uint64_t)target_obj, 8);
+                        serial_puts("\n");
+                        int chain_len = 0;
+                        int found = 0;
+                        uint32_t cur = head;
+                        while (cur >= 0x01000000 && chain_len < 64) {
+                            uint32_t cur_name = *(volatile uint32_t *)(uintptr_t)(cur + 0x20);
+                            uint32_t cur_outer = *(volatile uint32_t *)(uintptr_t)(cur + 0x18);
+                            uint32_t cur_next  = *(volatile uint32_t *)(uintptr_t)(cur + 0x08);
+                            serial_puts("  [chain#");
+                            serial_putdec((uint64_t)chain_len);
+                            serial_puts("] obj=0x");
+                            serial_puthex((uint64_t)cur, 8);
+                            serial_puts(" Name=");
+                            serial_putdec((uint64_t)cur_name);
+                            serial_puts(" Outer=0x");
+                            serial_puthex((uint64_t)cur_outer, 8);
+                            serial_puts(" Next=0x");
+                            serial_puthex((uint64_t)cur_next, 8);
+                            if (cur == target_obj) { serial_puts(" <-- TARGET"); found = 1; }
+                            serial_puts("\n");
+                            cur = cur_next;
+                            chain_len++;
+                        }
+                        serial_puts("[GOBJHASH] '");
+                        serial_puts(want);
+                        serial_puts("' chain_len=");
+                        serial_putdec((uint64_t)chain_len);
+                        serial_puts(" found_in_chain=");
+                        serial_puts(found ? "YES" : "NO");
+                        serial_puts("\n");
+                    }
                 }
             }
         }
