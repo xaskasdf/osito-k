@@ -2949,6 +2949,103 @@ uint64_t compat32_dispatch(uint32_t thunk_idx, uint32_t *stack_args)
             snapshot_count++;
             last_grn = grn;
             last_grd = grd;
+
+            /* GOBJOBJ-DUMP — Phase 7i. Walk GObjObjects (TArray at 0x102a2160)
+             * after Phase 2 completion (one-shot via periodic_fire). For each
+             * UObject:
+             *   - skip NULL slots
+             *   - read +0x20 = Name FName.Index
+             *   - resolve Names[idx]+0xC = WCHAR* name string
+             *   - filter print to entries whose name starts with capital
+             *     letter (skip internal hash entries / None placeholders)
+             *
+             * Goal: confirm whether UPackage("Engine") is present. If yes,
+             * the bug is in StaticFindObject's GObjHash traversal (FName
+             * mismatch or chain corruption). If no, AddObject doesn't
+             * insert UPackages at all (CreatePackage allocation succeeds
+             * but doesn't bind). */
+            if (periodic_fire) {
+                volatile uint32_t *gobjobjs = (volatile uint32_t *)(uintptr_t)0x102A2160ULL;
+                uint32_t oo_data = gobjobjs[0];
+                uint32_t oo_num  = gobjobjs[1];
+                uint32_t oo_max  = gobjobjs[2];
+                serial_puts("[GOBJOBJ-DUMP] GObjObjects Data=0x");
+                serial_puthex((uint64_t)oo_data, 8);
+                serial_puts(" Num=");
+                serial_putdec((uint64_t)oo_num);
+                serial_puts(" Max=");
+                serial_putdec((uint64_t)oo_max);
+                serial_puts("\n");
+                if (names_data && oo_data != 0 && oo_num > 0 && oo_num < 100000) {
+                    uint32_t *obj_slots = (uint32_t *)(uintptr_t)oo_data;
+                    uint32_t *name_slots = (uint32_t *)(uintptr_t)names_data;
+                    int matched = 0;
+                    int engine_hits = 0;
+                    int core_hits = 0;
+                    for (uint32_t i = 0; i < oo_num; i++) {
+                        uint32_t obj_va = obj_slots[i];
+                        if (obj_va < 0x01000000) continue;
+                        /* Read Name FName.Index at +0x20. */
+                        uint32_t fname_idx = *(volatile uint32_t *)(uintptr_t)(obj_va + 0x20);
+                        if (fname_idx >= names_num) continue;
+                        uint32_t name_entry = name_slots[fname_idx];
+                        if (name_entry < 0x01000000) continue;
+                        uint16_t *ws = (uint16_t *)(uintptr_t)(name_entry + 0xC);
+                        uint16_t c0 = ws[0];
+                        if (c0 < 'A' || c0 > 'Z') continue;
+                        /* Collect Name as ASCII. */
+                        char name_buf[32];
+                        int n = 0;
+                        for (int c = 0; c < 31; c++) {
+                            uint16_t ch = ws[c];
+                            if (ch == 0) break;
+                            if (ch < 0x20 || ch >= 0x7F) { name_buf[n++] = '?'; continue; }
+                            name_buf[n++] = (char)ch;
+                        }
+                        name_buf[n] = 0;
+                        /* Match name=="Engine" exactly to find UPackage. */
+                        int is_engine = (n == 6 && name_buf[0]=='E' && name_buf[1]=='n'
+                                          && name_buf[2]=='g' && name_buf[3]=='i'
+                                          && name_buf[4]=='n' && name_buf[5]=='e');
+                        int is_core = (n == 4 && name_buf[0]=='C' && name_buf[1]=='o'
+                                          && name_buf[2]=='r' && name_buf[3]=='e');
+                        if (is_engine) engine_hits++;
+                        if (is_core) core_hits++;
+                        /* Print first few matches + always print Engine/Core. */
+                        if (matched < 20 || is_engine || is_core) {
+                            uint32_t vtable = *(volatile uint32_t *)(uintptr_t)obj_va;
+                            uint32_t outer  = *(volatile uint32_t *)(uintptr_t)(obj_va + 0x18);
+                            uint32_t flags  = *(volatile uint32_t *)(uintptr_t)(obj_va + 0x1C);
+                            uint32_t idx    = *(volatile uint32_t *)(uintptr_t)(obj_va + 0x04);
+                            serial_puts("[GOBJOBJ#");
+                            serial_putdec((uint64_t)i);
+                            serial_puts("] UObj=0x");
+                            serial_puthex((uint64_t)obj_va, 8);
+                            serial_puts(" Idx=");
+                            serial_putdec((uint64_t)idx);
+                            serial_puts(" vtbl=0x");
+                            serial_puthex((uint64_t)vtable, 8);
+                            serial_puts(" Outer=0x");
+                            serial_puthex((uint64_t)outer, 8);
+                            serial_puts(" Flags=0x");
+                            serial_puthex((uint64_t)flags, 8);
+                            serial_puts(" Name=FName(");
+                            serial_putdec((uint64_t)fname_idx);
+                            serial_puts(")=L\"");
+                            serial_puts(name_buf);
+                            serial_puts("\"\n");
+                            matched++;
+                        }
+                    }
+                    serial_puts("[GOBJOBJ-DUMP] matched=");
+                    serial_putdec((uint64_t)matched);
+                    serial_puts(" engine_hits=");
+                    serial_putdec((uint64_t)engine_hits);
+                    serial_puts(" core_hits=");
+                    serial_putdec((uint64_t)core_hits);
+                    serial_puts("\n");
+                }
+            }
         }
     }
 
