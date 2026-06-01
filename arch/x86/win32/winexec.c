@@ -958,47 +958,48 @@ int winexec_run(const uint8_t *file_data, uint64_t file_size)
              * also get [esp+0..0x1c] stack dump, which catches the
              * Pool struct fields if the pool ptr happens to be near
              * a stack-resident local. */
-            /* Phase 7g — retired stale FMW slots (Phase 3 acad659 removed
-             * those assert bypasses). Re-arming for UE1 Register virtual
-             * chain instrumentation. We know HWBP slot 3 fires 200 times
-             * at the ConditionalRegister call, but entries 5-199 fail
-             * Register because UObject::Register's write of [esi+0x18]
-             * never executes. Need to pinpoint where the chain breaks.
+            /* Phase 7h — lookup-side instrumentation. Phase 7g proved the
+             * Register chain is fully intact (slot 0/1/2 hits=200 each in
+             * the prior run). The cascade actually fires in StaticLoadObject
+             * when StaticFindObject(UPackage, NULL, "Engine") returns NULL,
+             * even though CreatePackage("Engine") ran twice. So the real
+             * bug is either:
+             *   (a) UObject::AddObject never inserts the new UPackage into
+             *       GObjObjects, OR
+             *   (b) it inserts but GObjHash chain or FName index disagree
+             *       so StaticFindObject can't traverse to it.
              *
-             * Chain: ConditionalRegister vtable[19] → UClass::Register
-             *  → UStruct::Register → UField::Register → UObject::Register
-             *
-             * Slot 0 = UClass::Register entry @ 0x10127190 (EXEC)
-             *   - if < 200 hits: ConditionalRegister early-exits because
-             *     Index already != -1 (some entries pre-registered)
-             *   - if = 200: vtable[19] dispatch reaches derived Register */
-            if (hwbp_set(0, 0x10127190ULL, /*HWBP_EXECUTE*/0, /*HWBP_LEN_1*/0,
-                          "UClass-Register-entry") == 0) {
-                serial_puts("[winexec] HWBP slot 0 armed at Core.dll+0x27190 "
-                            "(UClass::Register entry)\n");
+             * Re-target slots 0/1/2 to the lookup path:
+             * Slot 0 = AddObject entry @ 0x1015cbe0 (EXEC).
+             *   - Count: should be ≥ 200 (one per UObject created during
+             *     ProcessRegistrants, plus all UPackages). First 4 hits
+             *     dump ECX (= UObject* being added) so we can see UPackage
+             *     instances getting added. */
+            if (hwbp_set(0, 0x1015cbe0ULL, /*HWBP_EXECUTE*/0, /*HWBP_LEN_1*/0,
+                          "AddObject-entry") == 0) {
+                serial_puts("[winexec] HWBP slot 0 armed at Core.dll+0x5cbe0 "
+                            "(UObject::AddObject entry — GObjObjects insert)\n");
             }
-            /* Slot 1 = UObject::Register entry @ 0x10157820 (EXEC).
-             *   - if = slot 0 hits: chain runs to bottom; throw inside
-             *     UObject::Register (likely GObjInitialized assert at
-             *     0x4DD, or inside CreatePackage call)
-             *   - if < slot 0: chain throws in UClass/UStruct/UField
-             *     before reaching UObject::Register */
-            if (hwbp_set(1, 0x10157820ULL, /*HWBP_EXECUTE*/0, /*HWBP_LEN_1*/0,
-                          "UObject-Register-entry") == 0) {
-                serial_puts("[winexec] HWBP slot 1 armed at Core.dll+0x57820 "
-                            "(UObject::Register entry)\n");
+            /* Slot 1 = StaticFindObject entry @ 0x101570b0 (EXEC).
+             *   - Count: high; this is the engine's per-lookup probe.
+             *   - First 4 hits dump args: Class, Outer, Name (TCHAR*).
+             *   - The lookup that FAILS for "Engine" is what we want to
+             *     correlate with — if it's called with name="Engine" but
+             *     returns NULL, that's the smoking gun. */
+            if (hwbp_set(1, 0x101570b0ULL, /*HWBP_EXECUTE*/0, /*HWBP_LEN_1*/0,
+                          "StaticFindObject-entry") == 0) {
+                serial_puts("[winexec] HWBP slot 1 armed at Core.dll+0x570b0 "
+                            "(UObject::StaticFindObject entry)\n");
             }
-            /* Slot 2 = CreatePackage entry @ 0x10159EF0 (EXEC).
-             *   - if = slot 1: UObject::Register passes GObjInitialized
-             *     assert and reaches CreatePackage call
-             *   - if < slot 1: stuck at GObjInitialized assert (line 0x4DD,
-             *     C:\\UTDev\\Core\\Src\\UnObj.cpp)
-             * Captures ECX/EDX/stack args at first 4 hits for analysis
-             * of CreatePackage call args (TCHAR* package name). */
-            if (hwbp_set(2, 0x10159EF0ULL, /*HWBP_EXECUTE*/0, /*HWBP_LEN_1*/0,
-                          "CreatePackage-entry") == 0) {
-                serial_puts("[winexec] HWBP slot 2 armed at Core.dll+0x59EF0 "
-                            "(CreatePackage entry)\n");
+            /* Slot 2 = StaticLoadObject entry @ 0x1015a260 (EXEC).
+             *   - Count: rises near cascade time.
+             *   - Args: Class, Outer, Name = "Engine.GameEngine".
+             *   - Captures the high-level engine call that's about to
+             *     return NULL → cascade. */
+            if (hwbp_set(2, 0x1015a260ULL, /*HWBP_EXECUTE*/0, /*HWBP_LEN_1*/0,
+                          "StaticLoadObject-entry") == 0) {
+                serial_puts("[winexec] HWBP slot 2 armed at Core.dll+0x5a260 "
+                            "(UObject::StaticLoadObject entry)\n");
             }
             /* Slot 3: Phase 7c — EXEC at Core.dll+0x57DBD = ProcessRegistrants
              * Phase 2 inner loop's `call ConditionalRegister`. Each hit
