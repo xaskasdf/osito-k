@@ -958,33 +958,47 @@ int winexec_run(const uint8_t *file_data, uint64_t file_size)
              * also get [esp+0..0x1c] stack dump, which catches the
              * Pool struct fields if the pool ptr happens to be near
              * a stack-resident local. */
-            if (hwbp_set(0, 0x109032A8ULL, /*HWBP_EXECUTE*/0, /*HWBP_LEN_1*/0,
-                          "FMW-site0-FirstPool-Next-Prev") == 0) {
-                serial_puts("[winexec] HWBP slot 0 armed at FMW site 0\n");
-            }
-            /* Slot 1: WRITE on PoolTable[28].ExaustedPool field at
-             * 0x1092F88C — the list head cursor from Phase 1 mismatch.
-             * Retired FMW site 1 EXEC (Phase 1 showed 0 mismatches on
-             * Free->Blocks>0 invariant; site 0 alone catches the
-             * relevant pool-list corruption).
+            /* Phase 7g — retired stale FMW slots (Phase 3 acad659 removed
+             * those assert bypasses). Re-arming for UE1 Register virtual
+             * chain instrumentation. We know HWBP slot 3 fires 200 times
+             * at the ConditionalRegister call, but entries 5-199 fail
+             * Register because UObject::Register's write of [esi+0x18]
+             * never executes. Need to pinpoint where the chain breaks.
              *
-             * Captures every write to the head pointer (= writes that
-             * happen during Link / Unlink / direct head assignment).
-             * Cross-reference with slot 3 (Pool@0x40010700.PrevLink
-             * WRITE) to time-order all mutations and identify which
-             * operation left the list inconsistent. */
-            if (hwbp_set(1, 0x1092F88CULL, /*HWBP_WRITE*/1, /*HWBP_LEN_4*/3,
-                          "FMW-Table28-ExaustedPool-head") == 0) {
-                serial_puts("[winexec] HWBP slot 1 armed at Table28.ExaustedPool WRITE\n");
+             * Chain: ConditionalRegister vtable[19] → UClass::Register
+             *  → UStruct::Register → UField::Register → UObject::Register
+             *
+             * Slot 0 = UClass::Register entry @ 0x10127190 (EXEC)
+             *   - if < 200 hits: ConditionalRegister early-exits because
+             *     Index already != -1 (some entries pre-registered)
+             *   - if = 200: vtable[19] dispatch reaches derived Register */
+            if (hwbp_set(0, 0x10127190ULL, /*HWBP_EXECUTE*/0, /*HWBP_LEN_1*/0,
+                          "UClass-Register-entry") == 0) {
+                serial_puts("[winexec] HWBP slot 0 armed at Core.dll+0x27190 "
+                            "(UClass::Register entry)\n");
             }
-            /* Slot 2: WRITE on Pool@0x40010700.Next field (offset +0x18).
-             * Pairs with slot 3 (PrevLink WRITE) for complete mutation
-             * coverage of the corrupt pool. Retired StaticFindObject
-             * EXEC — Phase 1 confirmed the "Engine" lookup returns
-             * NULL; further data not needed here. */
-            if (hwbp_set(2, 0x40010718ULL, /*HWBP_WRITE*/1, /*HWBP_LEN_4*/3,
-                          "FMW-pool@40010700-Next") == 0) {
-                serial_puts("[winexec] HWBP slot 2 armed at Pool+0x18 WRITE\n");
+            /* Slot 1 = UObject::Register entry @ 0x10157820 (EXEC).
+             *   - if = slot 0 hits: chain runs to bottom; throw inside
+             *     UObject::Register (likely GObjInitialized assert at
+             *     0x4DD, or inside CreatePackage call)
+             *   - if < slot 0: chain throws in UClass/UStruct/UField
+             *     before reaching UObject::Register */
+            if (hwbp_set(1, 0x10157820ULL, /*HWBP_EXECUTE*/0, /*HWBP_LEN_1*/0,
+                          "UObject-Register-entry") == 0) {
+                serial_puts("[winexec] HWBP slot 1 armed at Core.dll+0x57820 "
+                            "(UObject::Register entry)\n");
+            }
+            /* Slot 2 = CreatePackage entry @ 0x10159EF0 (EXEC).
+             *   - if = slot 1: UObject::Register passes GObjInitialized
+             *     assert and reaches CreatePackage call
+             *   - if < slot 1: stuck at GObjInitialized assert (line 0x4DD,
+             *     C:\\UTDev\\Core\\Src\\UnObj.cpp)
+             * Captures ECX/EDX/stack args at first 4 hits for analysis
+             * of CreatePackage call args (TCHAR* package name). */
+            if (hwbp_set(2, 0x10159EF0ULL, /*HWBP_EXECUTE*/0, /*HWBP_LEN_1*/0,
+                          "CreatePackage-entry") == 0) {
+                serial_puts("[winexec] HWBP slot 2 armed at Core.dll+0x59EF0 "
+                            "(CreatePackage entry)\n");
             }
             /* Slot 3: Phase 7c — EXEC at Core.dll+0x57DBD = ProcessRegistrants
              * Phase 2 inner loop's `call ConditionalRegister`. Each hit
