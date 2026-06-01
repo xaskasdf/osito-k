@@ -3129,6 +3129,55 @@ uint64_t compat32_dispatch(uint32_t thunk_idx, uint32_t *stack_args)
                         serial_puts(" found_in_chain=");
                         serial_puts(found ? "YES" : "NO");
                         serial_puts("\n");
+
+                        /* Phase 7k — walk obj->Class chain (the part of
+                         * StaticFindObject that filters by Class). Bug
+                         * hypothesis: UPackage("Engine")->Class at +0x24
+                         * either NULL or doesn't reach UPackage::StaticClass
+                         * via SuperClass chain at +0x28. */
+                        uint32_t obj_class = *(volatile uint32_t *)(uintptr_t)(target_obj + 0x24);
+                        serial_puts("[CLASS-CHAIN] '");
+                        serial_puts(want);
+                        serial_puts("' obj->Class[+0x24]=0x");
+                        serial_puthex((uint64_t)obj_class, 8);
+                        serial_puts(" (UPackage::SC should be 0x102A1C60)\n");
+                        uint32_t cls_cur = obj_class;
+                        int cls_depth = 0;
+                        while (cls_cur >= 0x01000000 && cls_depth < 16) {
+                            uint32_t cls_name_idx = *(volatile uint32_t *)(uintptr_t)(cls_cur + 0x20);
+                            uint32_t cls_super   = *(volatile uint32_t *)(uintptr_t)(cls_cur + 0x28);
+                            uint32_t cls_vtable  = *(volatile uint32_t *)(uintptr_t)(cls_cur);
+                            const char *cname = "?";
+                            char cnbuf[32];
+                            if (cls_name_idx < names_num) {
+                                uint32_t ne = name_slots[cls_name_idx];
+                                if (ne >= 0x01000000) {
+                                    uint16_t *nws = (uint16_t *)(uintptr_t)(ne + 0xC);
+                                    int nn = 0;
+                                    for (int c = 0; c < 31; c++) {
+                                        uint16_t ch = nws[c];
+                                        if (ch == 0) break;
+                                        cnbuf[nn++] = (ch < 0x20 || ch >= 0x7F) ? '?' : (char)ch;
+                                    }
+                                    cnbuf[nn] = 0;
+                                    cname = cnbuf;
+                                }
+                            }
+                            serial_puts("  Class[");
+                            serial_putdec((uint64_t)cls_depth);
+                            serial_puts("] @0x");
+                            serial_puthex((uint64_t)cls_cur, 8);
+                            serial_puts(" vtbl=0x");
+                            serial_puthex((uint64_t)cls_vtable, 8);
+                            serial_puts(" Name=L\"");
+                            serial_puts(cname);
+                            serial_puts("\" Super=0x");
+                            serial_puthex((uint64_t)cls_super, 8);
+                            if (cls_cur == 0x102A1C60ULL) serial_puts(" <-- IS UPackage::SC");
+                            serial_puts("\n");
+                            cls_cur = cls_super;
+                            cls_depth++;
+                        }
                     }
                 }
             }
