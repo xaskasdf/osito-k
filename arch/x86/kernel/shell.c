@@ -6276,7 +6276,10 @@ q4kgdone:
             sh_puts("usage: pkg help | list | search <q> | install <name> | installed | run <name> | uninstall <name>\n");
         }
 #else
-        sh_puts("pkg: WASM-only\n");
+        {
+            extern int pkg_cmd(int argc, char **argv, void (*out)(const char *));
+            pkg_cmd(argc, argv, sh_puts);
+        }
 #endif
     } else if (strcmp(cmd, "reload") == 0) {
 #ifdef __EMSCRIPTEN__
@@ -6990,9 +6993,15 @@ q4kgdone:
             hda_play_tone(freq, dur);
         }
     } else {
-        sh_puts("Unknown command: ");
-        sh_puts(cmd);
-        sh_puts("\n  Type 'help' for available commands.\n");
+#ifndef __EMSCRIPTEN__
+        extern int pkg_lazy_try(const char *cmd, int argc, char **argv, void (*out)(const char *));
+        if (!pkg_lazy_try(cmd, argc, argv, sh_puts))
+#endif
+        {
+            sh_puts("Unknown command: ");
+            sh_puts(cmd);
+            sh_puts("\n  Type 'help' for available commands.\n");
+        }
     }
 
     /* Finalize output redirection — write captured output to file */
