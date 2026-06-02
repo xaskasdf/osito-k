@@ -78,10 +78,18 @@ endif
 AVXFLAGS = $(KCFLAGS_PRECOMP) -mavx2 -mfma -mf16c
 
 # EFI link flags (for boot.efi only)
+ifeq ($(CLANG),1)
+# ld.lld: force ELF mode (not MinGW/COFF), drop the driver-only -nostdlib
+BLDFLAGS = -m elf_x86_64 -shared -Bsymbolic -z norelro \
+           -T $(EFI_LDS) \
+           -L$(EFI_LIB) \
+           $(EFI_CRT)
+else
 BLDFLAGS = -nostdlib -shared -Bsymbolic \
            -T $(EFI_LDS) \
            -L$(EFI_LIB) \
            $(EFI_CRT)
+endif
 BLIBS    = -lefi -lgnuefi
 
 # Kernel link flags
