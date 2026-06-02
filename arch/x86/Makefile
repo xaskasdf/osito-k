@@ -13,9 +13,18 @@
 # Legacy monolithic build:
 #   make legacy       Build ositok.efi (single PE32+ binary)
 
+# Cross toolchain. `make CLANG=1` uses clang as a freestanding cross-compiler
+# + lld (the Windows/msys2 path — no x86_64-elf-gcc needed). Default is the
+# x86_64-elf GNU toolchain (Linux/macOS).
+ifeq ($(CLANG),1)
+CC       = clang --target=x86_64-elf
+LD       = ld.lld
+OBJCOPY  = llvm-objcopy
+else
 CC       = x86_64-elf-gcc
 LD       = x86_64-elf-ld
 OBJCOPY  = x86_64-elf-objcopy
+endif
 
 # gnu-efi paths. Auto-detect macOS (/usr/local via ncroxon/gnu-efi from
 # source) vs Debian/Ubuntu (/usr via apt-get install gnu-efi). Override
@@ -58,7 +67,12 @@ endif
 # TCC doesn't guarantee 16-byte stack alignment (SysV ABI requires it).
 # -mincoming-stack-boundary=3 tells GCC the stack may be 8-byte aligned,
 # so it inserts realignment in prologues before any movaps/movdqa.
+# clang lacks -mincoming-stack-boundary; -mstackrealign forces the same realign.
+ifeq ($(findstring clang,$(CC)),clang)
+KCFLAGS_PRECOMP = $(KCFLAGS) -mstackrealign
+else
 KCFLAGS_PRECOMP = $(KCFLAGS) -mincoming-stack-boundary=3
+endif
 
 # AVX2/FMA/F16C flags for tensor_avx2.c only
 AVXFLAGS = $(KCFLAGS_PRECOMP) -mavx2 -mfma -mf16c
@@ -71,7 +85,14 @@ BLDFLAGS = -nostdlib -shared -Bsymbolic \
 BLIBS    = -lefi -lgnuefi
 
 # Kernel link flags
+ifeq ($(CLANG),1)
+# Raw ld.lld: force ELF mode (not MinGW/COFF), drop the driver-only -nostdlib,
+# and keep every PT_LOAD on its own page so boot.efi can AllocatePages each one
+# (--no-rosegment folds read-only orphan sections into the text segment).
+KLDFLAGS = -m elf_x86_64 -static -T kernel.ld -z noexecstack --no-rosegment
+else
 KLDFLAGS = -nostdlib -static -T kernel.ld -z noexecstack
+endif
 
 BUILD    = build
 
@@ -80,7 +101,7 @@ BUILD    = build
 BOOT_SRC = boot/boot_efi.c
 
 KERN_SRC = kernel/main.c kernel/serial.c kernel/framebuffer.c \
-           kernel/pci.c kernel/memory.c kernel/net.c \
+           kernel/pci.c kernel/memory.c kernel/mem_extern.c kernel/net.c \
            kernel/dhcp.c kernel/ntp.c kernel/ipv6.c kernel/mdns.c \
            kernel/tensor.c \
            kernel/tensor_avx2.c kernel/inference.c kernel/idt.c \
@@ -169,7 +190,7 @@ ALL_KERN_OBJ = $(KERN_OBJ) $(ASM_OBJ) $(DRV_OBJ) $(FS_OBJ) $(WIN32_OBJ) $(WIN32_
 # Minimal kernel: excludes all new subsystems from Apr 2026 session.
 # Use when full kernel crashes (e.g., BSS overlap with NVMe DMA).
 KERN_MINIMAL = kernel/main.c kernel/serial.c kernel/framebuffer.c \
-               kernel/pci.c kernel/memory.c kernel/net.c \
+               kernel/pci.c kernel/memory.c kernel/mem_extern.c kernel/net.c \
                kernel/tensor.c kernel/tensor_avx2.c kernel/inference.c \
                kernel/idt.c kernel/paging.c kernel/heap.c kernel/syscall.c \
                kernel/elf.c kernel/process.c \

@@ -328,9 +328,9 @@ void __initk kernel_entry(boot_info_t *info)
         const char *_p = (s); \
         while (*_p) { \
             uint8_t _st; \
-            do { __asm__ volatile ("inb $0x3FD, %0" : "=a"(_st)); } \
+            do { __asm__ volatile ("inb %w1, %b0" : "=a"(_st) : "Nd"((uint16_t)0x3FD)); } \
             while (!(_st & 0x20)); \
-            __asm__ volatile ("outb %b0, $0x3F8" : : "a"(*_p)); \
+            __asm__ volatile ("outb %b0, %w1" : : "a"(*_p), "Nd"((uint16_t)0x3F8)); \
             _p++; \
         } \
     } while (0)
