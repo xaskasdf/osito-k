@@ -434,7 +434,9 @@ static int cpio_extract(const uint8_t *base, uint64_t size, const char *dest, pk
 /* Install a kind:sysroot package: fetch zlib-compressed CPIO, verify sha,
  * inflate, extract to dest. A marker pkg/.sysroot-<name> makes it idempotent. */
 static int install_sysroot(pkg_entry_t *e, int force, pkg_out_fn out) {
-    if (!e->dest[0]) { out("pkg: sysroot '"); out(e->name); out("' missing 'dest'\n"); return -1; }
+    /* dest MAY be empty: a sysroot whose CPIO carries full paths (e.g.
+     * "usr/bin/gcc") extracts at the FS root — cpio_extract uses each
+     * entry's own name verbatim when dest is "". Only usize is mandatory. */
     if (!e->usize)   { out("pkg: sysroot '"); out(e->name); out("' missing 'usize'\n"); return -1; }
 
     char marker[96];
