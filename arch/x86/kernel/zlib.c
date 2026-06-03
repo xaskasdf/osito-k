@@ -68,6 +68,15 @@ static void huff_build(huffman_t *h, const uint8_t *lengths, int n)
     for (int i = 0; i < n; i++)
         if (lengths[i] <= HUFF_MAX_BITS) h->counts[lengths[i]]++;
 
+    /* Length-0 symbols are UNUSED — they must not reserve slots in the
+     * symbol table. Without this, offsets[1] = counts[0] instead of 0, so
+     * every symbol is shifted by the number of unused codes and huff_decode
+     * (which reads from index 0) returns garbage / fails. Fixed-Huffman
+     * tables have no length-0 codes so they worked by luck; every real
+     * DYNAMIC-Huffman stream (all practical zlib/gzip data) was corrupted —
+     * the gcc sysroot's 283 MB cpio.z failed on its first symbol until this. */
+    h->counts[0] = 0;
+
     uint16_t offsets[HUFF_MAX_BITS + 1];
     offsets[0] = 0;
     for (int i = 1; i <= HUFF_MAX_BITS; i++)
