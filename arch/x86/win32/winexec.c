@@ -493,8 +493,15 @@ int winexec_run(const uint8_t *file_data, uint64_t file_size)
         serial_puts("\n");
     }
 
-    /* Pre-load all DLLs from filesystem (registers native classes) */
+    /* Pre-load all DLLs from filesystem (registers native classes).
+     * Force the GMalloc stub during preload: UE1 IMPLEMENT_CLASS constructors
+     * call appMalloc, but FMallocWindows::Init (appInit) hasn't run, so the
+     * real allocator's Heap is NULL and would fault. The stub routes to the
+     * same HeapAlloc pool, so the handoff to the real allocator is seamless. */
+    extern int g_gmalloc_preload_phase;
+    g_gmalloc_preload_phase = 1;
     winexec_preload_dlls();
+    g_gmalloc_preload_phase = 0;
 
     /* ── Diagnostic: inspect UE1 GAutoRegister linked list ─────── */
     {

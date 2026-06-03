@@ -107,6 +107,19 @@ static uint32_t stub_fmalloc_vtbl[8];
 static uint32_t stub_fmalloc_obj[4]; /* [0]=vtbl ptr, [1-3]=padding */
 static int stub_gmalloc_installed = 0;
 
+/* Set by winexec around winexec_preload_dlls(). During preload, the UE1
+ * native-class _initterm constructors (IMPLEMENT_CLASS) run and may call
+ * appMalloc — but the EXE's appInit (which calls FMallocWindows::Init to
+ * create the HeapAlloc heap) has NOT run yet. On Windows the file order of
+ * the OsitoFS image makes Core.dll's FMallocWindows global constructor run
+ * BEFORE OpenGlDrv's _initterm, so the real vtable is already installed but
+ * its Heap is still NULL → appMalloc hits "Called appMalloc before memory
+ * init" and faults. While this flag is set we force our stub vtable even
+ * over an already-installed real vtable; the stub routes Malloc/Realloc/Free
+ * to HeapAlloc/HeapReAlloc/HeapFree, the SAME pool the real FMallocWindows
+ * uses (HeapAlloc ignores the heap handle), so the handoff is transparent. */
+int g_gmalloc_preload_phase = 0;
+
 static void ensure_gmalloc_stub(void)
 {
     /* GMalloc is at Core.dll + RVA 0xA7B90 (VA 0x101A7B90 when base=0x10100000).
@@ -147,47 +160,62 @@ static void ensure_gmalloc_stub(void)
         return;
     }
 
-    /* Check if the FMalloc object's vtable is already valid */
-    volatile uint32_t *obj_vtbl = (volatile uint32_t *)(uintptr_t)obj_addr;
-    if (*obj_vtbl != 0) {
+    /* Build the stub vtable thunks once (lazily). */
+    if (!stub_gmalloc_installed) {
+        extern uint32_t compat32_make_thunk_ex(uint64_t target, const char *name,
+                                                 uint8_t num_args, uint8_t callconv);
+        uint32_t t_malloc  = compat32_make_thunk_ex((uint64_t)(uintptr_t)stub_fmalloc_malloc,
+                                                      "GMalloc_Malloc", 2, 0);
+        uint32_t t_realloc = compat32_make_thunk_ex((uint64_t)(uintptr_t)stub_fmalloc_realloc,
+                                                      "GMalloc_Realloc", 3, 0);
+        uint32_t t_free    = compat32_make_thunk_ex((uint64_t)(uintptr_t)stub_fmalloc_free,
+                                                      "GMalloc_Free", 1, 0);
+        uint32_t t_nop     = compat32_make_thunk_ex((uint64_t)(uintptr_t)stub_fmalloc_nop,
+                                                      "GMalloc_nop", 0, 0);
+        /* FMalloc vtable: [Malloc, Realloc, Free, DumpAllocs, HeapCheck, Init, Exit] */
+        stub_fmalloc_vtbl[0] = t_malloc;
+        stub_fmalloc_vtbl[1] = t_realloc;
+        stub_fmalloc_vtbl[2] = t_free;
+        stub_fmalloc_vtbl[3] = t_nop;
+        stub_fmalloc_vtbl[4] = t_nop;
+        stub_fmalloc_vtbl[5] = t_nop;
+        stub_fmalloc_vtbl[6] = t_nop;
+        stub_fmalloc_vtbl[7] = t_nop;  /* no NULL entries — causes crash if called */
+        stub_gmalloc_installed = 1;
+    }
+
+    volatile uint32_t *obj_vtbl  = (volatile uint32_t *)(uintptr_t)obj_addr;
+    uint32_t stub_vtbl_addr      = (uint32_t)(uintptr_t)stub_fmalloc_vtbl;
+
+    /* Already routed through our stub — nothing to do. */
+    if (*obj_vtbl == stub_vtbl_addr)
+        return;
+
+    /* A real (Core.dll-resident) FMallocWindows vtable is installed. Outside
+     * the preload window we trust it: appInit has run FMallocWindows::Init so
+     * its Heap is live. */
+    if (*obj_vtbl != 0 && !g_gmalloc_preload_phase) {
         if (changed) {
             serial_puts("[CRT] GMalloc vtable already set: 0x");
             serial_puthex(*obj_vtbl, 8);
             serial_puts("\n");
         }
-        return;  /* Already constructed by appInit */
+        return;  /* Already constructed AND initialized by appInit */
     }
 
-    /* Create thunks for each vtable method */
-    extern uint32_t compat32_make_thunk_ex(uint64_t target, const char *name,
-                                             uint8_t num_args, uint8_t callconv);
-    uint32_t t_malloc  = compat32_make_thunk_ex((uint64_t)(uintptr_t)stub_fmalloc_malloc,
-                                                  "GMalloc_Malloc", 2, 0);
-    uint32_t t_realloc = compat32_make_thunk_ex((uint64_t)(uintptr_t)stub_fmalloc_realloc,
-                                                  "GMalloc_Realloc", 3, 0);
-    uint32_t t_free    = compat32_make_thunk_ex((uint64_t)(uintptr_t)stub_fmalloc_free,
-                                                  "GMalloc_Free", 1, 0);
-    uint32_t t_nop     = compat32_make_thunk_ex((uint64_t)(uintptr_t)stub_fmalloc_nop,
-                                                  "GMalloc_nop", 0, 0);
-
-    /* FMalloc vtable: [Malloc, Realloc, Free, DumpAllocs, HeapCheck, Init, Exit] */
-    stub_fmalloc_vtbl[0] = t_malloc;
-    stub_fmalloc_vtbl[1] = t_realloc;
-    stub_fmalloc_vtbl[2] = t_free;
-    stub_fmalloc_vtbl[3] = t_nop;
-    stub_fmalloc_vtbl[4] = t_nop;
-    stub_fmalloc_vtbl[5] = t_nop;
-    stub_fmalloc_vtbl[6] = t_nop;
-    stub_fmalloc_vtbl[7] = t_nop;  /* no NULL entries — causes crash if called */
-
-    /* Install stub vtable INTO the existing FMalloc object (at obj_addr).
-     * The object exists in BSS (zero-initialized). Its vtable pointer
-     * (first DWORD) is 0. We write our stub vtable there.
-     * When FMallocWindows is properly constructed later (EXE _initterm),
-     * its constructor overwrites the vtable with the real one. */
-    *obj_vtbl = (uint32_t)(uintptr_t)stub_fmalloc_vtbl;
-
-    stub_gmalloc_installed = 1;
+    /* Install our stub vtable. Two cases reach here:
+     *   (a) *obj_vtbl == 0  — object in BSS, real ctor hasn't run yet.
+     *   (b) *obj_vtbl != 0 AND preload phase — real ctor ran but Heap is still
+     *       NULL (appInit hasn't run); the real Malloc would fault with
+     *       "Called appMalloc before memory init". We override it so preload
+     *       allocations succeed via HeapAlloc (same pool the real allocator
+     *       uses once it takes over). */
+    if (*obj_vtbl != 0) {
+        serial_puts("[CRT] preload: overriding real GMalloc vtbl 0x");
+        serial_puthex(*obj_vtbl, 8);
+        serial_puts(" with stub (Heap not yet init)\n");
+    }
+    *obj_vtbl = stub_vtbl_addr;
     serial_puts("[CRT] Stub GMalloc vtable at 0x");
     serial_puthex(obj_addr, 8);
     serial_puts(" -> vtbl 0x");
