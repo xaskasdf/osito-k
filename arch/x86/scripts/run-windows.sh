@@ -82,11 +82,16 @@ if [ "${OK_PCAP:-0}" = "1" ]; then
 fi
 
 SERIAL="$BUILD/serial.log"; rm -f "$SERIAL"
-info "TCG multi-thread, q35, smp 4, mem $MEM, display=$DISPLAY_MODE"
+# TCG emulates every guest instruction in software; `-cpu max` makes the
+# guest take AVX/AES-NI/PCLMULQDQ paths that TCG then emulates, which can be
+# slower than scalar code under TCG. OK_CPU lets us A/B different models
+# (e.g. Haswell, Nehalem, qemu64) to find the fastest under emulation.
+CPU="${OK_CPU:-max}"
+info "TCG multi-thread, q35, smp 4, cpu $CPU, mem $MEM, display=$DISPLAY_MODE"
 info "Serial log -> $SERIAL"
 
 qemu-system-x86_64 \
-    -accel tcg,thread=multi -cpu max \
+    -accel tcg,thread=multi -cpu "$CPU" \
     -machine q35 -m "$MEM" -smp 4 \
     -bios ovmf-unified.fd \
     -drive file=esp.img,format=raw,if=ide \
