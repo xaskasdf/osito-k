@@ -1750,6 +1750,17 @@ void isr_handler(interrupt_frame_t *frame)
                 serial_puts(" kernel CR3=0x");
                 serial_puthex(paging_get_kernel_cr3(), 16);
                 serial_puts("\n");
+                {
+                    extern uint64_t proc_current_cr3(void);
+                    extern int      sched_current_get(void);
+                    serial_puts("  [WILD] cur_pid=");
+                    serial_putdec((uint64_t)proc_current_pid());
+                    serial_puts(" sched_idx=");
+                    serial_putdec((uint64_t)(uint32_t)sched_current_get());
+                    serial_puts(" cur->cr3=0x");
+                    serial_puthex(proc_current_cr3(), 16);
+                    serial_puts("\n");
+                }
 
                 if (frame->rsp >= 0xFFFF800000000000ULL) {
                     uint64_t *sp = (uint64_t *)frame->rsp;
