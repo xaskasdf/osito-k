@@ -290,6 +290,38 @@ static int str_ends_with_dll(const char *s)
     return c0 == '.' && c1 == 'd' && c2 == 'l' && c3 == 'l';
 }
 
+/* Case-insensitive equality for short DLL names. */
+static int dll_name_ieq(const char *a, const char *b)
+{
+    while (*a && *b) {
+        char ca = *a, cb = *b;
+        if (ca >= 'A' && ca <= 'Z') ca += 32;
+        if (cb >= 'A' && cb <= 'Z') cb += 32;
+        if (ca != cb) return 0;
+        a++; b++;
+    }
+    return *a == 0 && *b == 0;
+}
+
+/* Render-device plugin DLLs must NOT be preloaded: their _initterm static
+ * initializers do engine-level work (object loading, large allocations) that
+ * needs FName/GObj to be live — but the EXE's appInit (which runs
+ * FName::StaticInit + ProcessRegistrants) hasn't executed during preload.
+ * Preloading OpenGlDrv crashed mid-_initterm at a "Loading objects..." site,
+ * so preload never completed and the EXE entry was never reached. In real
+ * Windows these load via LoadLibrary AFTER appInit, when the engine selects a
+ * renderer — our dll_load runs their _initterm then, with the engine up. */
+static int is_deferred_render_dll(const char *name)
+{
+    static const char *deferred[] = {
+        "OpenGlDrv.dll", "D3DDrv.dll", "GlideDrv.dll",
+        "MeTaLDrv.dll", "SoftDrv.dll", 0
+    };
+    for (int i = 0; deferred[i]; i++)
+        if (dll_name_ieq(name, deferred[i])) return 1;
+    return 0;
+}
+
 static void winexec_preload_dlls(void)
 {
     uint32_t count = osfs2_file_count();
@@ -305,6 +337,14 @@ static void winexec_preload_dlls(void)
 
         /* Skip if already loaded (import DLLs or shim DLLs) */
         if (dll_find_module(name)) continue;
+
+        /* Defer render-device plugins to runtime LoadLibrary (see above). */
+        if (is_deferred_render_dll(name)) {
+            serial_puts("[WINEXEC] preload SKIP (render device, load on demand): ");
+            serial_puts(name);
+            serial_puts("\n");
+            continue;
+        }
 
         uint64_t fsize = osfs2_file_size(f);
         if (fsize == 0) continue;

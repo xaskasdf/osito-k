@@ -2281,7 +2281,16 @@ uint64_t compat32_dispatch(uint32_t thunk_idx, uint32_t *stack_args)
         static uint64_t fname_buf_phys = 0;
         static uint64_t fname_none_entry = 0;
         uint32_t fd = fname_tarray[0], fn = fname_tarray[1], fm = fname_tarray[2];
-        if (fd == 0 && fm == 0) {
+        /* FNAME_RESCUE_PREFILL — EXPERIMENT (2026-06-03): the pre-fill sets
+         * Num=1, which makes UE1 FName::StaticInit see a non-empty table and
+         * SKIP registering all ~600 hardcoded names (FNDIFF proves only
+         * Names[0] is ever populated, Num stuck at 1, Names.Add never called).
+         * The pre-fill predates the GMalloc stub fix — it existed to dodge a
+         * "bogus FArray::Realloc" that happened when GMalloc wasn't set up.
+         * Now that appMalloc/appRealloc route through the working HeapAlloc
+         * stub, let StaticInit allocate + register naturally (Num==0 path). */
+        static const int FNAME_RESCUE_PREFILL = 1;
+        if (FNAME_RESCUE_PREFILL && fd == 0 && fm == 0) {
             if (fname_buf_phys == 0) {
                 extern void *mem_alloc_pages(uint64_t count);
                 /* Buffer A (16 KB) — TArray slot pool (4 bytes per slot,
@@ -2365,18 +2374,28 @@ uint64_t compat32_dispatch(uint32_t thunk_idx, uint32_t *stack_args)
         {
             static uint32_t last_seen_data = 0;
             static uint32_t last_count_num = 0;
+            static uint32_t nonull_dispatch_ctr = 0;
             int do_scan = 0;
+            nonull_dispatch_ctr++;
             if (fd != last_seen_data && fd != 0) {
                 do_scan = 1;
             } else if (fn > last_count_num + 499 || (fn > 0 && last_count_num == 0)) {
+                do_scan = 1;
+            } else if ((nonull_dispatch_ctr % 500) == 0) {
+                /* FNDIFF-PROBE — periodic snapshot regardless of Num, so we
+                 * can see whether the engine fills Names.Data[i] slots beyond
+                 * Num (hardcoded-name registration writes Data[Index]=entry
+                 * WITHOUT bumping Num). */
                 do_scan = 1;
             }
             if (do_scan && fd != 0) {
                 last_seen_data = fd;
                 last_count_num = fn;
                 uint32_t *slots = (uint32_t *)(uintptr_t)fd;
-                uint32_t limit = fn;
-                if (limit > 8192) limit = 8192;
+                /* Scan up to Max (capped) rather than Num, to detect slots
+                 * filled beyond the Num watermark. */
+                uint32_t limit = fm ? fm : fn;
+                if (limit > 2048) limit = 2048;
                 uint32_t nn_count = 0;
                 int32_t highest_nn = -1;
                 int32_t first_null = -1;
