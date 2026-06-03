@@ -127,6 +127,13 @@ typedef struct {
 
     /* Address space (for future per-process paging) */
     uint64_t    cr3;
+    bool        owns_cr3;         /* true = this process allocated its own
+                                   * isolated CR3 (proc_exec / execve) and
+                                   * must free it on exit. false = it SHARES
+                                   * another process's CR3 (fork child until
+                                   * execve, or a thread) → must NOT free it. */
+    uint32_t    vforked_parent;   /* PID of a vfork parent blocked until this
+                                   * process execve's or exits (0 = none). */
 
     /* Scheduler context (X-SCHED) */
     void    *kernel_stack;       /* allocated kernel stack (NULL for kernel proc) */
@@ -499,11 +506,12 @@ static void proc_free(process_t *p)
     /* X-PGTBL: release the per-process page tables if this process owns
      * one. Must run *after* syscall_reset_process because VMA cleanup
      * needs to walk the per-process PML4 to free faulted pages. */
-    if (p->cr3 && p->cr3 != paging_get_kernel_cr3()) {
+    if (p->owns_cr3 && p->cr3 && p->cr3 != paging_get_kernel_cr3()) {
         extern void paging_free_process_cr3(uint64_t cr3);
         paging_free_process_cr3(p->cr3);
         p->cr3 = 0;
     }
+    p->owns_cr3 = false;
 
     /* Release the user-symbol-table copies captured at elf_load time. */
     if (p->user_symtab) { kfree(p->user_symtab); p->user_symtab = NULL; }
@@ -897,6 +905,7 @@ int proc_exec(const char *filename, int argc, const char **argv)
     uint64_t new_cr3 = paging_create_process_cr3();
     if (new_cr3) {
         p->cr3 = new_cr3;
+        p->owns_cr3 = true;       /* proc_exec allocated it → free on exit */
         /* Don't activate the new CR3 yet — the kernel is still running
          * on the boot kernel stack at low phys, which the user PML4
          * deliberately does NOT map. elf_jump() switches CR3 right
@@ -1632,6 +1641,17 @@ int32_t proc_fork(void)
 
     child->ppid = parent->pid;
 
+    /* vfork-style address-space sharing: the child runs in the PARENT's
+     * CR3 until it execve's (which allocates a fresh isolated CR3) or
+     * _exit's. Under X-PGTBL each process has its own CR3, so without this
+     * the child would inherit proc_alloc's kernel_cr3 default and could not
+     * see the parent's code at 0x20000000. The child must NOT free this
+     * shared CR3 on exit (owns_cr3=false). The parent is suspended below
+     * until the child execs/exits, so the shared space is never used by
+     * both at once. */
+    child->cr3 = parent->cr3;
+    child->owns_cr3 = false;
+
     /* Fork: allocate a NEW fd_table (separate copy for child).
      * Each inherited pipe fd bumps the corresponding refcounts. */
     child->fd_table = kmalloc(sizeof(fd_table_t));
@@ -1853,6 +1873,12 @@ int32_t proc_clone_thread(uint64_t child_stack, uint64_t parent_tidptr,
     thread->tgid = parent->tgid;
     thread->ppid = parent->pid;
     thread->is_thread = true;
+
+    /* A CLONE_THREAD thread genuinely shares the parent's address space →
+     * share its CR3 (the old "identity-mapped OS is automatic" assumption
+     * is false under X-PGTBL). Thread must NOT free the shared CR3. */
+    thread->cr3 = parent->cr3;
+    thread->owns_cr3 = false;
 
     /* CLONE_FILES: threads SHARE the parent's fd_table (POSIX-correct).
      * No copy — bump refcount. open()/close() in either thread affects both. */
@@ -2220,6 +2246,34 @@ int proc_execve(const char *path, char *const argv[])
     }
     p->name[j] = '\0';
 
+    /* execve must SNAPSHOT path + argv into KERNEL memory NOW, while the
+     * caller's address space is still active and intact. Below we free the
+     * old regions, reset brk, and (in the CR3 block) hand the process a
+     * fresh PML4 — all of which unmap the user memory where path/argv live.
+     * elf_setup_stack later reads argv to build the new stack; without this
+     * snapshot it dereferences freed/unmapped pages → #PF (observed: cc1's
+     * argv at 0x34B0xxxx/0xA591xxxx). Kernel copies are always mapped. */
+    {
+        uint64_t plen = strlen(path);
+        char *kpath = (char *)kmalloc(plen + 1);
+        if (kpath) { memcpy(kpath, path, plen + 1); path = kpath; }
+        if (argv) {
+            int ac = 0;
+            while (argv[ac]) ac++;
+            char **ka = (char **)kmalloc((uint64_t)(ac + 1) * sizeof(char *));
+            if (ka) {
+                for (int i = 0; i < ac; i++) {
+                    uint64_t l = strlen(argv[i]);
+                    char *s = (char *)kmalloc(l + 1);
+                    if (s) memcpy(s, argv[i], l + 1);
+                    ka[i] = s;
+                }
+                ka[ac] = NULL;
+                argv = (char *const *)ka;
+            }
+        }
+    }
+
     /* Free old memory regions ONLY if this process owns them.
      * Forked children share parent's memory (identity-mapped OS),
      * so we must NOT free the parent's regions. Only free if this
@@ -2266,12 +2320,46 @@ int proc_execve(const char *path, char *const argv[])
     /* Non-stdio FDs are closed by syscall_reset_process() in syscall.c
      * (which operates on the global fd_table). */
 
+    /* execve replaces the address space: give the new image a FRESH
+     * isolated CR3 (POSIX). For a fork child this DETACHES it from the
+     * parent's shared CR3, so cc1/as/ld run isolated at 0x20000000 without
+     * clobbering the parent — and the parent keeps its own CR3 intact.
+     * exec_target_proc=p makes elf_jump's proc_launch_prepare re-anchor
+     * current_proc + sched_current_idx + switch to this CR3 (the same
+     * launch path proc_exec uses → no wrong-CR3-on-resume race). */
+    {
+        extern uint64_t paging_create_process_cr3(void);
+        extern int  vdso_map_process(uint64_t cr3);
+        extern int  vdso_thunks_map_process(uint64_t cr3);
+        extern void paging_free_process_cr3(uint64_t cr3);
+        uint64_t fresh = paging_create_process_cr3();
+        if (fresh) {
+            vdso_map_process(fresh);
+            vdso_thunks_map_process(fresh);
+            p->cr3 = fresh;
+            p->owns_cr3 = true;
+            /* NOTE: do NOT free the OLD cr3 here. The switch to `fresh`
+             * happens later in elf_jump; until then the old address space
+             * is still ACTIVE and elf_setup_stack reads the argv/envp
+             * strings from it (they live in the caller's memory). Freeing
+             * its page tables now unmaps those strings → #PF in
+             * elf_setup_stack. The old cr3 (if we owned it) leaks a few KB
+             * of page-table pages per direct-execve; TODO: free it after
+             * the CR3 switch (e.g. via a deferred free in proc_exit/sched).
+             * A fork child shares the parent's cr3 (owns_cr3 was false) and
+             * must never free it regardless. */
+            (void)paging_free_process_cr3;
+        }
+        exec_target_proc = p;
+    }
+
     /* Execute the ELF — does not return on success.
      * elf_exec loads segments, sets up stack, jumps to entry.
      * When the process exits, proc_exit() handles cleanup. */
     int ret = elf_exec(path, argc, (const char **)argv);
 
     /* If we get here, exec failed */
+    exec_target_proc = NULL;
     serial_puts("[EXECVE] Failed: ");
     serial_puts(path);
     serial_puts("\n");
