@@ -68,21 +68,35 @@ if [ -n "${OK_NVME:-}" ]; then
 fi
 
 DISPLAY_MODE="${OK_DISPLAY:-none}"
+# 2 GB by default so the gcc sysroot install fits (283 MB compressed +
+# 748 MB inflate buffer ≈ 1 GB peak in the kernel heap, which auto-grows
+# with RAM). Override with OK_MEM (e.g. OK_MEM=512M for the as/ld-only run).
+MEM="${OK_MEM:-2048M}"
+
+# Optional packet capture (OK_PCAP=1) → build/net.pcap, parse with pcap.py.
+PCAP_ARGS=()
+if [ "${OK_PCAP:-0}" = "1" ]; then
+    rm -f net.pcap
+    PCAP_ARGS=(-object filter-dump,id=dump0,netdev=net0,file=net.pcap)
+    info "Packet capture -> $BUILD/net.pcap"
+fi
+
 SERIAL="$BUILD/serial.log"; rm -f "$SERIAL"
-info "TCG multi-thread, q35, smp 4, display=$DISPLAY_MODE"
+info "TCG multi-thread, q35, smp 4, mem $MEM, display=$DISPLAY_MODE"
 info "Serial log -> $SERIAL"
 
 qemu-system-x86_64 \
     -accel tcg,thread=multi -cpu max \
-    -machine q35 -m 512M -smp 4 \
+    -machine q35 -m "$MEM" -smp 4 \
     -bios ovmf-unified.fd \
     -drive file=esp.img,format=raw,if=ide \
     "${NVME_ARGS[@]}" \
     -device virtio-net-pci,netdev=net0,disable-legacy=on,disable-modern=off \
     -netdev user,id=net0,hostfwd=udp::7778-:7777,hostfwd=tcp::50052-:50052 \
+    "${PCAP_ARGS[@]}" \
     -device qemu-xhci,id=usb \
     -device usb-kbd,bus=usb.0 \
     -device usb-tablet,bus=usb.0 \
     -display "$DISPLAY_MODE" \
-    -serial file:"$SERIAL" \
+    -serial file:serial.log \
     -no-reboot

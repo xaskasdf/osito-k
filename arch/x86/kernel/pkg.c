@@ -206,17 +206,19 @@ static int catalog_find(const char *cat, const char *want, pkg_entry_t *e) {
     return 0;
 }
 
-/* ── Streaming download → OsitoFS, with SHA-256 ─────────────── */
+/* ── Download → RAM, with SHA-256, then persist to OsitoFS ────── */
 typedef struct {
-    void    *file;
-    uint64_t off;
+    uint8_t *buf;       /* RAM staging buffer (size = Content-Length) */
+    uint64_t cap;       /* buffer capacity */
+    uint64_t off;       /* bytes received so far */
     sha256_ctx sha;
     int      err;
 } fetch_ctx_t;
 
 static int fetch_cb(const void *data, uint32_t len, void *vctx) {
     fetch_ctx_t *c = (fetch_ctx_t *)vctx;
-    if (osfs2_write(c->file, c->off, data, len) < 0) { c->err = 1; return -1; }
+    if (c->off + len > c->cap) { c->err = 1; return -1; }   /* server overran CL */
+    memcpy(c->buf + c->off, data, len);
     sha256_update(&c->sha, data, len);
     c->off += len;
     return 0;
@@ -255,16 +257,23 @@ static int fetch_to_osfs(const char *host, const char *path, const char *dest,
         http_close(s); kfree(s); kfree(resp); return -1;
     }
 
-    osfs2_delete(dest);                     /* idempotent */
-    void *f = osfs2_create(dest, clen);
-    if (!f) {
-        out("pkg: osfs2_create failed (no contiguous space for ");
-        emit_num(out, clen); out(" bytes?)\n");
+    /* Stage the whole body in RAM, then write to disk in ONE pass after the
+     * connection is closed.  The old path wrote each chunk to NVMe inline
+     * inside the read callback; under QEMU TCG those synchronous writes
+     * starved net_poll long enough that the TCP receive window filled and
+     * the server (Cloudflare) closed the connection mid-transfer (~2 MB in).
+     * Receiving at network speed into RAM and deferring the disk write
+     * decouples the two so the full transfer completes.  Buffer size =
+     * Content-Length; the heap auto-grows with RAM (sysroot-scale matches
+     * the -m the install already needs). */
+    uint8_t *body = (uint8_t *)kmalloc(clen);
+    if (!body) {
+        out("pkg: out of memory ("); emit_num(out, clen); out(" bytes)\n");
         http_close(s); kfree(s); kfree(resp); return -1;
     }
 
     fetch_ctx_t c;
-    c.file = f; c.off = 0; c.err = 0;
+    c.buf = body; c.cap = clen; c.off = 0; c.err = 0;
     sha256_init(&c.sha);
     out("pkg: downloading "); emit_num(out, clen); out(" bytes...\n");
     int got = http_read_body(s, resp, fetch_cb, &c);
@@ -273,10 +282,26 @@ static int fetch_to_osfs(const char *host, const char *path, const char *dest,
     if (got < 0 || c.err || c.off != clen) {
         out("pkg: download failed/short ("); emit_num(out, c.off);
         out("/"); emit_num(out, clen); out(")\n");
-        osfs2_delete(dest);
+        kfree(body);
         return -1;
     }
     sha256_final(&c.sha, out_sha);
+
+    /* Persist — no network in flight now, so a slow NVMe write is harmless. */
+    osfs2_delete(dest);                     /* idempotent */
+    void *f = osfs2_create(dest, clen);
+    if (!f) {
+        out("pkg: osfs2_create failed (no contiguous space for ");
+        emit_num(out, clen); out(" bytes?)\n");
+        kfree(body);
+        return -1;
+    }
+    if (osfs2_write(f, 0, body, clen) < 0) {
+        out("pkg: disk write failed\n");
+        osfs2_delete(dest); kfree(body);
+        return -1;
+    }
+    kfree(body);
     disk_flush();
     return 0;
 }

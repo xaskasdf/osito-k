@@ -237,7 +237,9 @@ int disk_write_bytes(uint64_t byte_offset, const void *buf, uint64_t len)
     const uint8_t *src = (const uint8_t *)buf;
     uint64_t off  = byte_offset;
     uint64_t left = len;
-    uint8_t  tmp[8192];
+    /* Page-aligned so the 2-page PRP1/PRP2 split nvme_write does is on a
+     * clean 4 KB boundary (mirrors the read path's tmp buffer below). */
+    uint8_t  tmp[8192] __attribute__((aligned(4096)));
     uint32_t ssz = d->sector_size;
     if (ssz > sizeof(tmp)) return -1;
 

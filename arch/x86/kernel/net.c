@@ -907,6 +907,41 @@ void __hot net_poll(void)
         }
     }
 
+    /* SYN retransmit — client connections stuck in SYN_SENT because the SYN
+     * (or the server's SYN-ACK) was dropped.  Reuses the rto_tick/rto_count
+     * fields armed by net_tcp_connect.  Under QEMU TCG + SLIRP NAT a single
+     * lost SYN otherwise becomes a permanent connect failure. */
+    for (int ci = 0; ci < TCP_MAX_CONNS; ci++) {
+        tcp_conn_t *tc = &tcp_conns[ci];
+        if (tc->state != TCP_SYN_SENT) continue;
+        if (tc->rto_tick == 0 || now < tc->rto_tick) continue;
+
+        /* Reset snd_nxt back to the ISN (snd_una still holds it) so the
+         * re-sent SYN re-consumes exactly one seq number; otherwise
+         * tcp_send_segment's SYN snd_nxt++ would double-count and the
+         * SYN-ACK's ack (ISN+1) would no longer match snd_nxt.  Same fix
+         * the listener uses for duplicate SYNs in handle_tcp. */
+        tc->snd_nxt = tc->snd_una;
+        tcp_send_segment(tc, TCP_SYN, NULL, 0);
+        tc->rto_count++;
+
+        uint32_t backoff = 100;  /* ~1 s base, doubling, cap ~60 s */
+        for (uint32_t b = 1; b < tc->rto_count && backoff < 6000; b++)
+            backoff *= 2;
+        tc->rto_tick = now + backoff;
+
+        /* The connect deadline (see net_tcp_connect) is the authority for
+         * giving up — it tolerates a slow SLIRP/TCG SYN-ACK.  This cap is
+         * only an orphan guard (a SYN_SENT conn with no waiter) and is set
+         * high enough never to fire inside a normal connect window. */
+        if (tc->rto_count >= 12) {
+            serial_puts("[TCP] SYN retransmit orphan limit, conn ");
+            serial_putdec((uint64_t)ci);
+            serial_puts("\n");
+            tc->state = TCP_CLOSED;
+        }
+    }
+
     /* Advance async operations (DNS wait, ARP wait, SYN wait) */
     net_async_check();
 
@@ -1665,27 +1700,48 @@ static void handle_tcp(const uint8_t *src_ip, const uint8_t *pkt, uint32_t len)
             tcp_send_segment(conn, TCP_ACK, NULL, 0);
         } else if (data_len > 0 && seq == conn->rcv_nxt) {
             uint32_t space = TCP_RX_BUF_SIZE - conn->rx_len;
-            uint32_t copy = data_len < space ? data_len : space;
-            if (copy > 0) {
-                memcpy(conn->rx_buf + conn->rx_len, data, copy);
-                conn->rx_len += copy;
+            if (data_len <= space) {
+                memcpy(conn->rx_buf + conn->rx_len, data, data_len);
+                conn->rx_len  += data_len;
+                conn->rcv_nxt += data_len;
+                tcp_sack_drain(conn);
+                /* RFC 7323 §3.4: only update ts_recent on in-order data
+                 * (the segment's TS Value is the freshest the peer has
+                 * sent so far). */
+                if (conn->tsopt_ok && peer_has_ts)
+                    conn->ts_recent = peer_tsval;
+                /* ACK the data */
+                tcp_send_segment(conn, TCP_ACK, NULL, 0);
+                /* Wake any process blocked on recv */
+                net_waiter_wake(NETWAIT_TCP_RX, conn_idx);
+            } else {
+                /* Receive window full — the segment (e.g. a zero-window
+                 * probe sent beyond the window) does NOT fit. Drop it WHOLE
+                 * and send a dup-ACK carrying our current window; do NOT
+                 * advance rcv_nxt. The old code advanced rcv_nxt by the full
+                 * data_len while storing only `space` bytes — ACKing data it
+                 * never kept. On a sustained slow download (TLS decrypt under
+                 * TCG < line rate → window hits 0 → Cloudflare probes) that
+                 * silently lost a byte per probe, desynced the TLS stream,
+                 * and the server closed the connection (~2 MB in). The peer
+                 * retransmits once net_tcp_recv's window-update re-opens us. */
+                tcp_send_segment(conn, TCP_ACK, NULL, 0);
             }
-            conn->rcv_nxt += data_len;
-            tcp_sack_drain(conn);
-            /* RFC 7323 §3.4: only update ts_recent on in-order data
-             * (the segment's TS Value is the freshest the peer has
-             * sent so far). */
-            if (conn->tsopt_ok && peer_has_ts)
-                conn->ts_recent = peer_tsval;
-            /* ACK the data */
-            tcp_send_segment(conn, TCP_ACK, NULL, 0);
-            /* Wake any process blocked on recv */
-            net_waiter_wake(NETWAIT_TCP_RX, conn_idx);
         } else if (data_len > 0 && (int32_t)(seq - conn->rcv_nxt) > 0) {
             /* Out-of-order — record [seq, seq+data_len) as a SACK block
              * and send a duplicate ACK (rcv_nxt unchanged). The peer's
              * fast-retransmit logic picks up the missing range. */
             tcp_sack_add_block(conn, seq, seq + data_len);
+            tcp_send_segment(conn, TCP_ACK, NULL, 0);
+        } else if (data_len > 0) {
+            /* Old/duplicate data (seq < rcv_nxt): we already have it, but
+             * the peer retransmitted because an earlier ACK of ours was
+             * lost — common over QEMU SLIRP/TCG, which negotiates no SACK
+             * or timestamps (its SYN-ACK carries only MSS). RFC 793 §3.9:
+             * ACK any acceptable segment. Without this dup-ACK the peer
+             * never learns we hold the data and retransmits the same bytes
+             * forever — the retransmit storm seen in capture (15 MB resent
+             * to deliver 2 MB) that collapses a large download. */
             tcp_send_segment(conn, TCP_ACK, NULL, 0);
         }
 
@@ -1855,12 +1911,19 @@ int net_tcp_connect(const uint8_t dst_ip[4], uint16_t dst_port,
 
     /* Send SYN */
     tcp_send_segment(conn, TCP_SYN, NULL, 0);
+    /* Arm the SYN-retransmit timer: if no SYN-ACK lands by then, net_poll
+     * resends the SYN (snd_nxt reset to the ISN first).  ~1 s base, doubling.
+     * A single dropped SYN under QEMU TCG + SLIRP NAT would otherwise become
+     * a permanent connect failure within the deadline window below. */
+    conn->rto_tick  = idt_get_ticks() + 100;
+    conn->rto_count = 0;
 
     /* Wait for SYN-ACK. Generous deadline: a real-internet SYN-ACK (via SLIRP
      * NAT) has true RTT, and under TCG the APIC timer is coarse — 500 ticks
-     * can elapse before it lands. 3000 ticks tolerates both. */
+     * can elapse before it lands. net_poll retransmits the SYN within this
+     * window; 6000 ticks tolerates a slow SLIRP/TCG SYN-ACK with margin. */
     uint64_t start = idt_get_ticks();
-    uint64_t syn_deadline = start + 3000;
+    uint64_t syn_deadline = start + 6000;
     if (sched_is_enabled()) {
         int slot = net_waiter_register(NETWAIT_TCP_ESTABLISHED, idx,
                                        syn_deadline);
@@ -1957,8 +2020,8 @@ int net_tcp_recv(int conn_idx, void *buf, uint32_t buf_size)
          * ACK we sent (often near zero), and never resumes sending
          * even though we just freed thousands of bytes. */
         if (conn->state == TCP_ESTABLISHED &&
-            pre_len > (TCP_RX_BUF_SIZE / 2) &&
-            conn->rx_len <= (TCP_RX_BUF_SIZE / 2)) {
+            pre_len > (TCP_RX_BUF_SIZE / 4) &&
+            (pre_len - conn->rx_len) >= TCP_MSS) {
             tcp_send_segment(conn, TCP_ACK, NULL, 0);
         }
         return (int)copy;

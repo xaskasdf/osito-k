@@ -603,9 +603,16 @@ int nvme_write(uint64_t lba, uint32_t count, const void *buf)
         memset(&cmd, 0, sizeof(cmd));
         cmd.cdw0 = NVME_IO_WRITE;
         cmd.nsid = 1;
-        cmd.prp1 = (uint64_t)src;
+        /* NVMe PRP fields are PHYSICAL addresses — same translation the
+         * read path uses (see nvme_read).  The write callers (disk_write_bytes'
+         * scratch buffer, osfs2 block buffers) may be upper-half kernel-mirror
+         * virts where virt != phys; a raw cast worked only by luck when the
+         * buffer happened to land in lower-half identity memory.  Sustained
+         * multi-block writes (8 MB pkg install) run from a deep stack whose
+         * buffer is high-half → wrong PRP → write fails mid-transfer. */
+        cmd.prp1 = kvirt_to_phys(src);
         if (bytes > 4096)
-            cmd.prp2 = (uint64_t)(src + 4096);
+            cmd.prp2 = kvirt_to_phys(src + 4096);
         cmd.cdw10 = (uint32_t)(lba & 0xFFFFFFFF);
         cmd.cdw11 = (uint32_t)(lba >> 32);
         cmd.cdw12 = this_count - 1; /* 0-based */
