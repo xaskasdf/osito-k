@@ -200,7 +200,38 @@ bool hwbp_dispatch(struct interrupt_frame *frame)
                 }
                 tmp[n] = 0; serial_puts(tmp);
             }
-            serial_puts("\"\n");
+            serial_puts("\"");
+            /* Render the stack args that are TCHAR* names. Different Core.dll
+             * functions put the name at different arg slots:
+             *   StaticFindObject(Class, Outer, Name, Exact) → st[3]=Name
+             *   CreatePackage(Outer, Name)                  → st[2]=Name
+             * Try st[1..3] and print each that decodes to a plausible wide
+             * string, labeled argN. Catches the package name in CreatePackage
+             * and the lookup name in StaticFindObject (the Mac None/None0
+             * frontier). */
+            for (int ai = 1; ai <= 3; ai++) {
+                uint32_t name_ptr = (uint32_t)st[ai];
+                if (name_ptr < 0x10000 || (uint64_t)name_ptr >= 0x80000000ULL)
+                    continue;
+                volatile uint16_t *w = (volatile uint16_t *)(uintptr_t)name_ptr;
+                uint16_t c0 = w[0];
+                if (c0 < 0x20 || c0 >= 0x7F) continue;   /* not a printable wstr */
+                /* Require the 2nd unit to also be ASCII-ish or NUL to avoid
+                 * mis-rendering pointers as 1-char strings. */
+                uint16_t c1 = w[1];
+                if (c1 != 0 && (c1 < 0x20 || c1 >= 0x7F)) continue;
+                serial_puts(" arg"); serial_putdec((uint64_t)ai);
+                serial_puts("=L\"");
+                char tmp[64]; int n = 0;
+                for (int k = 0; k < 63; k++) {
+                    uint16_t c = w[k];
+                    if (c == 0) break;
+                    tmp[n++] = (c < 0x20 || c >= 0x7F) ? '?' : (char)c;
+                }
+                tmp[n] = 0; serial_puts(tmp);
+                serial_puts("\"");
+            }
+            serial_puts("\n");
         }
 
         /* Slot 3 (ProcessRegistrants Phase 2 ConditionalRegister probe) logs

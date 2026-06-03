@@ -2293,14 +2293,21 @@ uint64_t compat32_dispatch(uint32_t thunk_idx, uint32_t *stack_args)
         if (FNAME_RESCUE_PREFILL && fd == 0 && fm == 0) {
             if (fname_buf_phys == 0) {
                 extern void *mem_alloc_pages(uint64_t count);
-                /* Buffer A (16 KB) — TArray slot pool (4 bytes per slot,
-                 *                                          room for 4096 ptrs) */
-                void *buf  = mem_alloc_pages(4);
+                /* Buffer A (64 KB) — TArray slot pool (4 bytes per slot,
+                 * room for 16384 ptrs). Sized large so FName::Names NEVER
+                 * needs to FArray::Realloc (final Num ~4271, prev runs grew
+                 * to Max 5464). The realloc path lost ~2048 entries — our
+                 * HeapReAlloc can't size a non-heap-pool source buffer and
+                 * the copy drops entries → NULL slots → FNAME-NULL-FILL masks
+                 * them with "None" → packages bind to "None0.dll". Avoid the
+                 * realloc entirely by pre-sizing past anything the engine
+                 * needs. */
+                void *buf  = mem_alloc_pages(16);
                 /* Buffer B (4 KB)  — FNameEntry pool */
                 void *pool = mem_alloc_pages(1);
                 if (buf && pool) {
                     uint8_t *p = (uint8_t *)buf;
-                    for (int i = 0; i < 16384; i++) p[i] = 0;
+                    for (int i = 0; i < 65536; i++) p[i] = 0;
                     uint8_t *q = (uint8_t *)pool;
                     for (int i = 0; i < 4096; i++) q[i] = 0;
 
@@ -2355,7 +2362,7 @@ uint64_t compat32_dispatch(uint32_t thunk_idx, uint32_t *stack_args)
             if (fname_buf_phys) {
                 fname_tarray[0] = (uint32_t)fname_buf_phys;
                 fname_tarray[1] = 1;       /* Num = 1 (slot 0 populated) */
-                fname_tarray[2] = 2048;    /* Max = 2K entries */
+                fname_tarray[2] = 16384;   /* Max = 16K entries (no realloc) */
                 static int fname_setup_logged = 0;
                 if (!fname_setup_logged) {
                     fname_setup_logged = 1;

@@ -1038,15 +1038,28 @@ int winexec_run(const uint8_t *file_data, uint64_t file_size)
                 serial_puts("[winexec] HWBP slot 1 armed at Core.dll+0x570b0 "
                             "(UObject::StaticFindObject entry)\n");
             }
-            /* Slot 2 = StaticLoadObject entry @ 0x1015a260 (EXEC).
-             *   - Count: rises near cascade time.
-             *   - Args: Class, Outer, Name = "Engine.GameEngine".
-             *   - Captures the high-level engine call that's about to
-             *     return NULL → cascade. */
-            if (hwbp_set(2, 0x1015a260ULL, /*HWBP_EXECUTE*/0, /*HWBP_LEN_1*/0,
-                          "StaticLoadObject-entry") == 0) {
-                serial_puts("[winexec] HWBP slot 2 armed at Core.dll+0x5a260 "
-                            "(UObject::StaticLoadObject entry)\n");
+            /* Slot 2 = CreatePackage entry (EXEC), resolved at runtime.
+             * CreatePackage(UObject* Outer, const TCHAR* Name) → st[1]=Outer,
+             * st[2]=Name. The hwbp arg-decoder prints argN=L"..." for st[2],
+             * so every package creation shows the name string it's built with.
+             * Goal: confirm whether a package is created with a real name
+             * (e.g. "Engine") but ends up with FName index 0 (None) — the
+             * "None0" native-DLL-bind frontier — or whether CreatePackage is
+             * called with None to begin with (linker name-mapping bug). */
+            {
+                LOADED_MODULE *core_m = dll_find_module("Core.dll");
+                PVOID cp = core_m ? dll_resolve_export(core_m,
+                    "?CreatePackage@UObject@@SAPAVUPackage@@PAV1@PBG@Z", 0, FALSE)
+                    : (PVOID)0;
+                if (cp && hwbp_set(2, (uint64_t)(ULONG_PTR)cp,
+                                   /*HWBP_EXECUTE*/0, /*HWBP_LEN_1*/0,
+                                   "CreatePackage-entry") == 0) {
+                    serial_puts("[winexec] HWBP slot 2 armed at CreatePackage @0x");
+                    serial_puthex((uint64_t)(ULONG_PTR)cp, 8);
+                    serial_puts("\n");
+                } else {
+                    serial_puts("[winexec] could not resolve/arm CreatePackage\n");
+                }
             }
             /* Slot 3: Phase 7c — EXEC at Core.dll+0x57DBD = ProcessRegistrants
              * Phase 2 inner loop's `call ConditionalRegister`. Each hit
