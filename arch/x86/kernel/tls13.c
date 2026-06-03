@@ -62,6 +62,7 @@ extern int  net_tcp_send(int conn, const void *data, uint32_t len);
 extern int  net_tcp_recv(int conn, void *buf, uint32_t size);
 extern int  net_tcp_recv_timeout(int conn, void *buf, uint32_t size,
                                   uint32_t timeout_ticks);
+extern uint64_t idt_get_ticks(void);
 
 static void *t13_memcpy(void *dst, const void *src, uint32_t n)
 {
@@ -312,22 +313,42 @@ static int build_client_hello(uint8_t *buf, uint32_t cap, const char *hostname)
 static int read_record(int conn, uint8_t *type_out, uint8_t *body, uint32_t cap,
                        uint32_t *body_len_out)
 {
+    /* Overall deadline for the whole record.  Each net_tcp_recv_timeout
+     * below is a SHORT poll; a poll that returns 0 is a timeout, not an
+     * error — we retry it until this deadline while the connection lives,
+     * and only bail on a close (n<0). The old code used a single 500-tick
+     * poll and treated n==0 as fatal; under TCG's uncalibrated APIC timer
+     * 500 ticks elapse in ~5 ms of wall-clock — well before Cloudflare's
+     * ~60 ms ServerHello (confirmed by capture) — so the 1.3 handshake
+     * ALWAYS gave up and fell back to 1.2.  This mirrors tls.c's
+     * tls_read_exact, which is why 1.2 worked where 1.3 didn't.
+     *
+     * The budget is generous (TCG's timer runs ~50k ticks/s, so this is
+     * ~1.2 s of wall-clock) to cover not just the handshake flight but a
+     * cache-cold GET response, where Cloudflare round-trips to R2 before
+     * the first app-data record lands.  net_tcp_recv_timeout still returns
+     * <0 immediately if the peer actually closes, so we don't block the
+     * full budget on a real teardown. */
+    uint64_t deadline = idt_get_ticks() + 60000;
+
     /* 5-byte header */
     uint32_t got = 0;
     uint8_t hdr[5];
     while (got < 5) {
-        int n = net_tcp_recv_timeout(conn, hdr + got, 5 - got, 500);
-        if (n <= 0) return -1;
-        got += (uint32_t)n;
+        if (idt_get_ticks() > deadline) return -1;
+        int n = net_tcp_recv_timeout(conn, hdr + got, 5 - got, 200);
+        if (n < 0) return -1;          /* connection closed */
+        if (n > 0) got += (uint32_t)n; /* n==0: poll timeout, retry */
     }
     uint8_t ct = hdr[0];
     uint16_t rec_len = ((uint16_t)hdr[3] << 8) | hdr[4];
     if (rec_len > cap) return -1;
     got = 0;
     while (got < rec_len) {
-        int n = net_tcp_recv_timeout(conn, body + got, rec_len - got, 500);
-        if (n <= 0) return -1;
-        got += (uint32_t)n;
+        if (idt_get_ticks() > deadline) return -1;
+        int n = net_tcp_recv_timeout(conn, body + got, rec_len - got, 200);
+        if (n < 0) return -1;
+        if (n > 0) got += (uint32_t)n;
     }
     if (type_out)     *type_out = ct;
     if (body_len_out) *body_len_out = rec_len;
@@ -675,52 +696,29 @@ static int aia_chase_intermediate(const uint8_t *leaf_der, uint32_t leaf_len,
         return -1;
     }
 
-    /* Cache lookup first. */
+    /* Cache lookup only — NO live HTTP fetch during the handshake.
+     *
+     * This used to do http_plain_get(url) here, but that synchronous
+     * connect+GET to the CA's AIA host (e.g. i.pki.goog) takes tens of
+     * seconds over QEMU SLIRP — long enough that the TLS peer hits its
+     * handshake idle timeout (~15 s) and FINs before we ever send our
+     * Finished.  Capture showed our client Finished going out at t=48 s,
+     * 33 s after the server had already given up, so TLS 1.3 could never
+     * complete a request and we always fell back to 1.2.  An external
+     * fetch on the handshake critical path is architecturally wrong
+     * regardless of transport.  Chain validation here is warn-mode (an
+     * incomplete chain or a failed link is informative, not fatal — the
+     * server's Finished still authenticates the handshake), so skipping
+     * the live fetch costs nothing functionally and unblocks 1.3.  A
+     * cached intermediate (populated out-of-band) is still spliced in.
+     * Re-enabling live AIA belongs in a background warm path off the
+     * handshake — see project notes. */
     int cn = aia_cache_load(url, out, cap);
     if (cn > 0) { *out_len = (uint32_t)cn; return 0; }
 
-    int n = http_plain_get(url, out, cap);
-    if (n <= 0) {
-        serial_puts("[AIA] fetch failed for "); serial_puts(url); serial_puts("\n");
-        return -1;
-    }
-
-    /* Detect PEM and decode in place. */
-    bool is_pem = false;
-    if ((uint32_t)n >= 11) {
-        static const char marker[] = "-----BEGIN";
-        is_pem = true;
-        for (int k = 0; k < 10; k++)
-            if (out[k] != (uint8_t)marker[k]) { is_pem = false; break; }
-        if (!is_pem) {
-            /* Some servers return a leading CR/LF or BOM; scan first 64 bytes. */
-            uint32_t scan = (uint32_t)n < 64 ? (uint32_t)n : 64;
-            for (uint32_t i = 0; i + 10 < scan; i++) {
-                bool m = true;
-                for (int k = 0; k < 10; k++)
-                    if (out[i + k] != (uint8_t)marker[k]) { m = false; break; }
-                if (m) { is_pem = true; break; }
-            }
-        }
-    }
-    if (is_pem) {
-        int dn = aia_pem_to_der(out, (uint32_t)n);
-        if (dn < 0) {
-            serial_puts("[AIA] PEM decode failed\n");
-            return -1;
-        }
-        n = dn;
-    }
-
-    *out_len = (uint32_t)n;
-    serial_puts("[AIA] fetched intermediate from ");
-    serial_puts(url);
-    serial_puts(" (");
-    serial_putdec((uint64_t)n);
-    serial_puts(" bytes)\n");
-
-    aia_cache_save(url, out, (uint32_t)n);
-    return 0;
+    serial_puts("[AIA] skip live fetch during handshake (cache-only): ");
+    serial_puts(url); serial_puts("\n");
+    return -1;
 }
 
 /* ── Public API ──────────────────────────────────────────────── */
@@ -1186,23 +1184,25 @@ int tls13_connect(int tcp_conn, const char *hostname)
                                 serial_puts("\n");
                             }
 
-                            /* Chain link verification: each cert is
-                             * signed by the next.  Logs PASS/FAIL
-                             * per link; informative mode (no abort). */
-                            extern int x509_verify_chain_link(
-                                const uint8_t *child,  uint32_t cl,
-                                const uint8_t *issuer, uint32_t il);
-                            for (int i = 0; i + 1 < nc; i++) {
-                                int r = x509_verify_chain_link(
-                                    certs[i],     cert_lens[i],
-                                    certs[i + 1], cert_lens[i + 1]);
-                                serial_puts("[TLS1.3] chain link ");
-                                serial_putdec((uint64_t)i);
-                                serial_puts(" → ");
-                                serial_putdec((uint64_t)(i + 1));
-                                serial_puts(": ");
-                                serial_puts(r == 0 ? "OK\n" : "FAIL\n");
-                            }
+                            /* Chain-link verification (each cert signed by
+                             * the next) is NOT run inline on the handshake.
+                             * It is informative here — it never aborts, and
+                             * CertVerify (the real server-key-ownership
+                             * proof) is skipped, so identity rests on the
+                             * cert pin + SAN hostname match above.  Each
+                             * x509_verify_chain_link is a full bignum
+                             * signature verify (ECDSA P-384 for Google Trust
+                             * Services), ~20 s apiece under QEMU TCG — two
+                             * links burned 43 s of wall-clock, far past
+                             * Cloudflare's ~15 s handshake idle timeout, so
+                             * the server FIN'd before our Finished ever went
+                             * out and 1.3 could never complete a request
+                             * (capture-confirmed).  On real hardware these
+                             * are sub-millisecond; re-enabling belongs on a
+                             * post-handshake warm path, off this critical
+                             * section. */
+                            serial_puts("[TLS1.3] chain-link verify: deferred "
+                                        "(off handshake critical path)\n");
                         }
                     }
                 }
