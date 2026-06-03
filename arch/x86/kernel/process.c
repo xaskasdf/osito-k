@@ -1232,7 +1232,15 @@ void __hot sched_tick(void *frame_ptr)
         uint64_t rsp_saved = frame[20];
         bool bad_cs  = (cs != 0x38 && cs != 0x28 && cs != 0x43 && cs != 0x40);
         bool bad_ss  = (ss != 0x30 && ss != 0x3B && ss != 0x00);
-        bool bad_rip = (rip < 0xFFFF800000000000ULL && cs == 0x38);
+        /* A low (user-space) RIP is corruption only for a KERNEL thread,
+         * whose entry is a kernel function at a high RIP. User-ELF processes
+         * legitimately run their own code at low addresses (e.g. 0x20000000)
+         * in ring 0 with CS=0x38, and a timer tick can interrupt them there.
+         * Gate on next->cr3==0 (kernel threads have no per-process CR3) so
+         * this never false-positive-kills a long-running user program (gcc)
+         * mid-execution. */
+        bool bad_rip = (rip < 0xFFFF800000000000ULL && cs == 0x38 &&
+                        next->cr3 == 0);
 
         if (bad_cs || bad_ss || bad_rip) {
             serial_puts("[SCHED] CORRUPT PID ");

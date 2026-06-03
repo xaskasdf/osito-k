@@ -16,6 +16,17 @@ extern void serial_putdec(uint64_t val);
 extern void *mem_alloc_aligned(uint64_t size, uint64_t alignment);
 extern void  paging_map_mmio(uint64_t phys, uint64_t size);
 
+/* mem_alloc_aligned returns a PHYSICAL address. The virtqueue rings are
+ * touched by the CPU (here) AND DMA'd by the device. Store the kernel
+ * upper-half MIRROR for CPU access so it works under ANY CR3 — a raw
+ * physical pointer is only mapped in the kernel's lower-half identity map,
+ * which per-process page tables (paging_create_process_cr3) deliberately
+ * omit. Without this, a net_poll() that fires while a user process's CR3
+ * is active (e.g. during a long-running program like gcc) faults in
+ * virtqueue_has_used reading vq->used->idx. The device still gets the
+ * physical via kv2p()/kvirt_to_phys(), which converts the mirror back. */
+#define VIO_P2V(p) ((void *)((uintptr_t)(p) + 0xFFFF800000000000ULL))
+
 /* ── Virtio PCI Capability Offsets ───────────────────────────── */
 
 /* PCI vendor/device for virtio */
@@ -75,22 +86,26 @@ int virtqueue_init(virtqueue_t *vq, uint16_t size)
     vq->free_head = 0;
     vq->last_used_idx = 0;
 
-    /* Allocate descriptor table (16 bytes each, page-aligned) */
+    /* Allocate descriptor table (16 bytes each, page-aligned). Store the
+     * kernel MIRROR (see VIO_P2V) so CPU access is CR3-independent. */
     uint64_t desc_size = (uint64_t)size * sizeof(vring_desc_t);
-    vq->desc = (vring_desc_t *)mem_alloc_aligned(desc_size, 4096);
-    if (!vq->desc) return -1;
+    void *desc_p = mem_alloc_aligned(desc_size, 4096);
+    if (!desc_p) return -1;
+    vq->desc = (vring_desc_t *)VIO_P2V(desc_p);
     memset(vq->desc, 0, desc_size);
 
     /* Allocate available ring (4 + 2*size bytes, page-aligned) */
     uint64_t avail_size = 4 + (uint64_t)size * 2;
-    vq->avail = (vring_avail_t *)mem_alloc_aligned(avail_size, 4096);
-    if (!vq->avail) return -1;
+    void *avail_p = mem_alloc_aligned(avail_size, 4096);
+    if (!avail_p) return -1;
+    vq->avail = (vring_avail_t *)VIO_P2V(avail_p);
     memset(vq->avail, 0, avail_size);
 
     /* Allocate used ring (4 + 8*size bytes, page-aligned) */
     uint64_t used_size = 4 + (uint64_t)size * sizeof(vring_used_elem_t);
-    vq->used = (vring_used_t *)mem_alloc_aligned(used_size, 4096);
-    if (!vq->used) return -1;
+    void *used_p = mem_alloc_aligned(used_size, 4096);
+    if (!used_p) return -1;
+    vq->used = (vring_used_t *)VIO_P2V(used_p);
     memset(vq->used, 0, used_size);
 
     /* Chain free descriptors */
