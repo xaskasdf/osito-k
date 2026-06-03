@@ -719,6 +719,19 @@ static void elf_jump(uint64_t entry, uint64_t sp)
     extern uint64_t proc_launch_prepare(void);
     uint64_t pcr3 = proc_launch_prepare();
 
+    /* Reset the FPU/SSE state to the x86-64 ABI default before entering a
+     * fresh image: x87 FCW=0x037F + MXCSR=0x1F80 (ALL FP exceptions MASKED).
+     * execve reuses the caller's process slot, so the new binary would
+     * otherwise inherit its live MXCSR — and gcc leaves divide-by-zero
+     * UNMASKED, so cc1's first `divsd` by zero (it relies on IEEE infinity,
+     * not a trap) raised #XM. fninit + ldmxcsr here gives every launched
+     * binary the clean state the ABI promises. No FPU use after this until
+     * the jmp into user code. */
+    {
+        uint32_t _mxcsr = 0x00001F80;
+        __asm__ volatile ("fninit; ldmxcsr %0" :: "m"(_mxcsr) : "memory");
+    }
+
     __asm__ volatile (
         "cli\n"
         "test %2, %2\n"

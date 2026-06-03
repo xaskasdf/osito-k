@@ -1254,7 +1254,9 @@ void __hot sched_tick(void *frame_ptr)
      * RX hasta que HW empezara a dropear.  net_poll tiene un guard de
      * reentrancia (in_net_poll), así que es seguro llamar siempre.    */
     {
-        extern void net_poll(void);
+        extern void     net_poll(void);
+        extern void     paging_switch(uint64_t cr3);
+        extern uint64_t paging_get_kernel_cr3(void);
         /* MSI on I211 has a "pending acknowledge" gate: after the first
          * MSI is delivered, the chip won't fire a new one until SW
          * explicitly reads ICR (or writes 1 to clear).  Our ISR DOES
@@ -1264,8 +1266,27 @@ void __hot sched_tick(void *frame_ptr)
          *
          * Bypass: drive net_poll unconditionally each tick.  The
          * function has a reentrancy guard and is cheap when the ring
-         * is empty (one MMIO descriptor read returning DD=0).         */
+         * is empty (one MMIO descriptor read returning DD=0).
+         *
+         * CR3: run net_poll under the KERNEL CR3. net_poll's call graph
+         * (virtio_net_recv, NIC RX buffers, etc.) dereferences RAW PHYSICAL
+         * / low-identity addresses that only exist in the kernel CR3's low
+         * map. A user per-process CR3 has an empty PML4[0] (no low identity,
+         * see paging_create_process_cr3), so when this fires from the timer
+         * while a user process (gcc/cc1) is current, net_poll #PFs (observed:
+         * virtio_net_recv+0xa0 touching a low RX buffer under cc1's CR3).
+         * net_poll only touches kernel memory, never the interrupted user
+         * pages, so kernel_cr3 is safe + complete. Restore before the
+         * scheduler loads next->cr3 below. Guarded so kernel-thread ticks
+         * (cr3 == kernel_cr3) pay no TLB cost. */
+        uint64_t saved_cr3;
+        __asm__ volatile ("mov %%cr3, %0" : "=r"(saved_cr3));
+        uint64_t kcr3 = paging_get_kernel_cr3();
+        if (saved_cr3 != kcr3) paging_switch(kcr3);
+
         net_poll();
+
+        if (saved_cr3 != kcr3) paging_switch(saved_cr3);
     }
 
     /* Load next process */
@@ -2351,6 +2372,22 @@ int proc_execve(const char *path, char *const argv[])
             (void)paging_free_process_cr3;
         }
         exec_target_proc = p;
+    }
+
+    /* elf_setup_stack (inside elf_exec, BEFORE elf_jump's CR3 switch) reads
+     * the kernel-snapshotted argv and writes the (mirror-backed) user stack.
+     * It runs under the CURRENTLY-active CR3 — which here is the calling
+     * process's ISOLATED CR3 (empty PML4[0], no low identity map), so the
+     * kmalloc'd argv (low/identity kernel heap) is unmapped → #PF. The
+     * proc_exec launch path doesn't hit this because it runs elf_setup_stack
+     * under the shell's kernel_cr3. Switch to kernel_cr3 now so the load +
+     * stack setup see the kernel heap + mirror; elf_jump then switches to
+     * the fresh process CR3 before jumping into the binary. The kernel stack
+     * we're running on is in the shared upper-half mirror, so this switch is
+     * safe. */
+    {
+        extern void paging_switch(uint64_t cr3);
+        paging_switch(paging_get_kernel_cr3());
     }
 
     /* Execute the ELF — does not return on success.
