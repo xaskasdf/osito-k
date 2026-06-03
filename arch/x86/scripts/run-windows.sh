@@ -60,7 +60,9 @@ mcopy -i esp.img startup.nsh ::/startup.nsh
 NVME_ARGS=()
 if [ -n "${OK_NVME:-}" ]; then
     [ -f "$OK_NVME" ] || die "OK_NVME no existe: $OK_NVME"
-    NVME_ARGS=(-drive "file=$OK_NVME,format=raw,if=none,id=nvme0,cache=none"
+    # cache=writeback + aio=threads: QEMU on Windows can't do O_DIRECT
+    # (cache=none) writes — they fail with "aio failed: Invalid argument".
+    NVME_ARGS=(-drive "file=$OK_NVME,format=raw,if=none,id=nvme0,cache=writeback,aio=threads"
                -device "nvme,serial=deadbeef,drive=nvme0")
     info "NVMe: $OK_NVME ($(du -h "$OK_NVME" | cut -f1))"
 fi

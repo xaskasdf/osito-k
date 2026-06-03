@@ -7,6 +7,7 @@
 #include "../include/types.h"
 #include "http.h"
 #include "crypto.h"
+#include "zlib.h"
 #include "pkg.h"
 
 /* ── Config ─────────────────────────────────────────────────── */
@@ -147,6 +148,7 @@ typedef struct {
     char     dest[128];     /* install path for lib/sysroot */
     char     desc[160];
     uint64_t size;
+    uint64_t usize;         /* uncompressed size (kind:sysroot) */
     uint8_t  sha256[32];
     int      has_sha;
     const char *win;        /* window start (for deps iteration) */
@@ -168,7 +170,7 @@ static void parse_sha(const char *s, const char *end, pkg_entry_t *e) {
 
 static void fill_entry(const char *s, const char *end, pkg_entry_t *e) {
     e->name[0] = e->file[0] = e->dest[0] = e->desc[0] = 0;
-    e->size = 0;
+    e->size = 0; e->usize = 0;
     e->win = s; e->win_end = end;
     jstr(s, end, "name", e->name, sizeof e->name);
     if (jstr(s, end, "file", e->file, sizeof e->file) <= 0)
@@ -178,6 +180,7 @@ static void fill_entry(const char *s, const char *end, pkg_entry_t *e) {
     jstr(s, end, "dest", e->dest, sizeof e->dest);
     jstr(s, end, "desc", e->desc, sizeof e->desc);
     jnum(s, end, "size", &e->size);
+    jnum(s, end, "usize", &e->usize);
     parse_sha(s, end, e);
 }
 
@@ -345,6 +348,131 @@ static int sha_eq(const uint8_t a[32], const uint8_t b[32]) {
     return 1;
 }
 
+/* ── CPIO newc extraction (kind:sysroot) ────────────────────── */
+typedef struct {
+    char magic[6]; char ino[8]; char mode[8]; char uid[8]; char gid[8];
+    char nlink[8]; char mtime[8]; char filesize[8]; char devmajor[8];
+    char devminor[8]; char rdevmajor[8]; char rdevminor[8];
+    char namesize[8]; char check[8];
+} cpio_hdr_t;   /* 110 bytes */
+
+static uint32_t hex8(const char *s) {
+    uint32_t v = 0;
+    for (int i = 0; i < 8; i++) { int d = hexnib(s[i]); if (d < 0) d = 0; v = (v << 4) | (uint32_t)d; }
+    return v;
+}
+
+/* Extract a CPIO newc archive [base,size) into OsitoFS, each entry written as
+ * "<dest>/<relative-name>". Returns number of regular files extracted. */
+static int cpio_extract(const uint8_t *base, uint64_t size, const char *dest, pkg_out_fn out) {
+    char dpre[160];
+    scpy(dpre, dest, sizeof dpre);
+    { unsigned l = slen(dpre); if (l && dpre[l - 1] != '/' && l + 1 < sizeof dpre) { dpre[l] = '/'; dpre[l + 1] = 0; } }
+
+    const uint8_t *p = base, *end = base + size;
+    int count = 0;
+    while (p + sizeof(cpio_hdr_t) <= end) {
+        const cpio_hdr_t *h = (const cpio_hdr_t *)p;
+        if (!(h->magic[0] == '0' && h->magic[1] == '7' && h->magic[2] == '0' &&
+              h->magic[3] == '7' && h->magic[4] == '0' && h->magic[5] == '1')) break;
+        uint32_t namesize = hex8(h->namesize);
+        uint32_t filesize = hex8(h->filesize);
+        uint32_t mode     = hex8(h->mode);
+        const char *name = (const char *)(p + sizeof(cpio_hdr_t));
+        uint32_t hpn = (uint32_t)sizeof(cpio_hdr_t) + namesize; hpn = (hpn + 3) & ~3u;
+        const uint8_t *data = p + hpn;
+        uint32_t dpad = (filesize + 3) & ~3u;
+
+        if (namesize == 11 && name[0] == 'T' && name[1] == 'R' && name[2] == 'A' &&
+            name[3] == 'I' && name[4] == 'L' && name[5] == 'E' && name[6] == 'R') break;
+        if (data + filesize > end) break;   /* corrupt/truncated */
+
+        if ((mode & 0xF000u) == 0x8000u && filesize > 0) {     /* regular file */
+            const char *fn = name;
+            if (fn[0] == '.' && fn[1] == '/') fn += 2;
+            while (fn[0] == '/') fn++;
+            if (fn[0]) {
+                char full[224];
+                scpy(full, dpre, sizeof full);
+                scat(full, fn, sizeof full);
+                osfs2_delete(full);
+                void *f = osfs2_create(full, filesize);
+                if (f) { osfs2_write(f, 0, data, filesize); count++; }
+                else { out("pkg: create failed: "); out(full); out("\n"); }
+            }
+        }
+        p += hpn + dpad;
+    }
+    return count;
+}
+
+/* Install a kind:sysroot package: fetch zlib-compressed CPIO, verify sha,
+ * inflate, extract to dest. A marker pkg/.sysroot-<name> makes it idempotent. */
+static int install_sysroot(pkg_entry_t *e, int force, pkg_out_fn out) {
+    if (!e->dest[0]) { out("pkg: sysroot '"); out(e->name); out("' missing 'dest'\n"); return -1; }
+    if (!e->usize)   { out("pkg: sysroot '"); out(e->name); out("' missing 'usize'\n"); return -1; }
+
+    char marker[96];
+    scpy(marker, "pkg/.sysroot-", sizeof marker);
+    scat(marker, e->name, sizeof marker);
+    if (!force && osfs2_find(marker)) return 0;     /* already extracted */
+
+    char path[224];
+    scpy(path, PKG_BASE, sizeof path);
+    scat(path, e->file, sizeof path);
+    out("pkg: install "); out(e->name); out(" (sysroot) <- "); out(PKG_HOST); out(path); out("\n");
+
+    const char *tmp = "pkg/.sysroot.tmp";
+    uint8_t got[32];
+    if (fetch_to_osfs(PKG_HOST, path, tmp, e->size, got, out) < 0) return -1;
+    if (e->has_sha && !sha_eq(got, e->sha256)) {
+        out("pkg: SHA-256 MISMATCH for "); out(e->name); out(" — abort\n");
+        osfs2_delete(tmp); return -1;
+    }
+
+    void *tf = osfs2_find(tmp);
+    uint64_t csz = tf ? osfs2_file_size(tf) : 0;
+    if (!csz) { out("pkg: temp read failed\n"); osfs2_delete(tmp); return -1; }
+    uint8_t *cbuf = (uint8_t *)kmalloc(csz);
+    if (!cbuf || osfs2_read(tf, 0, cbuf, csz) < 0) {
+        out("pkg: out of memory / read failed\n");
+        if (cbuf) kfree(cbuf);
+        osfs2_delete(tmp); return -1;
+    }
+
+    uint32_t usz = (uint32_t)e->usize;
+    uint8_t *ubuf = (uint8_t *)kmalloc(usz);
+    if (!ubuf) {
+        out("pkg: out of memory (usize "); emit_num(out, usz); out(")\n");
+        kfree(cbuf); osfs2_delete(tmp); return -1;
+    }
+    uint32_t outlen = usz;
+    int zr = zlib_inflate(cbuf, (uint32_t)csz, ubuf, &outlen);
+    kfree(cbuf);
+    if (zr != 0) {
+        out("pkg: decompress failed (");
+        out(zr == -2 ? "overflow — usize too small?" : zr == -3 ? "checksum" : "format");
+        out(")\n");
+        kfree(ubuf); osfs2_delete(tmp); return -1;
+    }
+
+    out("pkg: extracting "); emit_num(out, outlen); out(" bytes -> "); out(e->dest); out("\n");
+    int n = cpio_extract(ubuf, outlen, e->dest, out);
+    kfree(ubuf);
+    osfs2_delete(tmp);
+
+    if (n <= 0) { out("pkg: no files extracted (not a CPIO newc archive?)\n"); disk_flush(); return -1; }
+
+    void *mf = osfs2_create(marker, 1);
+    if (mf) { uint8_t one = 1; osfs2_write(mf, 0, &one, 1); }
+    disk_flush();
+
+    out("pkg: installed "); out(e->name);
+    if (e->has_sha) out(" (sha256 ok)");
+    out(" — "); emit_num(out, (uint64_t)n); out(" files\n");
+    return 0;
+}
+
 /* ── Install one package (resolves deps, verifies sha) ──────── */
 static int install_one(const char *cat, const char *name, int depth, int force, pkg_out_fn out) {
     if (depth > PKG_DEP_DEPTH) { out("pkg: dependency depth exceeded\n"); return -1; }
@@ -388,9 +516,10 @@ static int install_one(const char *cat, const char *name, int depth, int force, 
         if (d[0] == '/') d++;
         if (!d[0]) { out("pkg: lib package missing 'dest': "); out(name); out("\n"); return -1; }
         scpy(dest, d, sizeof dest);
+    } else if (strcmp(e.kind, "sysroot") == 0) {
+        return install_sysroot(&e, force, out);
     } else {
-        /* kind:sysroot (cpio.gz) — extraction not yet wired (initramfs/zlib). */
-        out("pkg: kind '"); out(e.kind); out("' not yet supported (sysroot extraction pending)\n");
+        out("pkg: unknown kind '"); out(e.kind); out("'\n");
         return -1;
     }
 

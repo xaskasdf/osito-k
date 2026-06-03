@@ -1856,9 +1856,11 @@ int net_tcp_connect(const uint8_t dst_ip[4], uint16_t dst_port,
     /* Send SYN */
     tcp_send_segment(conn, TCP_SYN, NULL, 0);
 
-    /* Wait for SYN-ACK (5s timeout = 500 ticks at 100Hz) */
+    /* Wait for SYN-ACK. Generous deadline: a real-internet SYN-ACK (via SLIRP
+     * NAT) has true RTT, and under TCG the APIC timer is coarse — 500 ticks
+     * can elapse before it lands. 3000 ticks tolerates both. */
     uint64_t start = idt_get_ticks();
-    uint64_t syn_deadline = start + 500;
+    uint64_t syn_deadline = start + 3000;
     if (sched_is_enabled()) {
         int slot = net_waiter_register(NETWAIT_TCP_ESTABLISHED, idx,
                                        syn_deadline);

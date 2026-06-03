@@ -484,9 +484,10 @@ int __initk nvme_init(uint64_t bar0_phys)
                                 int (*read)(uint64_t, uint32_t, void *),
                                 int (*write)(uint64_t, uint32_t, const void *));
     extern int  nvme_read(uint64_t lba, uint32_t count, void *buf);
+    extern int  nvme_write(uint64_t lba, uint32_t count, const void *buf);
     blkdev_register("nvme0", 0 /* BLKDEV_NVME */,
                     nvme.lba_size, nvme.total_lbas,
-                    nvme_read, NULL);
+                    nvme_read, nvme_write);
 
     return 0;
 }

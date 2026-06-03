@@ -244,6 +244,13 @@ char kb_getchar(void)
             if (xhci_poll) xhci_poll();
         }
         if (kb_head != kb_tail) break;
+        /* Serial console input (headless / CI / debugging): a byte on COM1 RX
+         * is treated as a typed key. term_readline already maps \r and 0x7F. */
+        {
+            extern int serial_getc(void);
+            int sc = serial_getc();
+            if (sc >= 0) return (char)sc;
+        }
         /* Bare-metal safe: PAUSE instead of HLT.
          * HLT depends on the APIC timer or xHCI MSI/INTx waking us up.
          * Same pattern as commit 2832f23 (sched yield via INT $0x20):
