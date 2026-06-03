@@ -674,7 +674,14 @@ int vma_register_file(uint64_t base, uint64_t pages, uint32_t prot,
             vma_table[i].file_node   = *node;
             vma_table[i].file_offset = file_offset;
             vma_table[i].file_size   = file_size;
-            vma_table[i].owner       = proc_current();
+            /* Anchor ownership to the exec target (not the possibly-stale
+             * proc_current during the ELF load) so the owner filter in
+             * demand_page_fault matches once the binary runs. */
+            {
+                extern void *proc_exec_target(void);
+                void *et = proc_exec_target();
+                vma_table[i].owner = et ? et : proc_current();
+            }
             return 0;
         }
     }

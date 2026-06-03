@@ -1719,6 +1719,61 @@ void isr_handler(interrupt_frame_t *frame)
             }
         }
 
+        /* ── WILD-RIP diagnostic (gcc 0x7BF5xxxx OVMF-region crash) ──
+         * When RIP lands above the user-ELF region and below the kernel
+         * upper-half mirror, control flow jumped to garbage (the gcc bug:
+         * an indirect call/jmp through a corrupted target, e.g. into the
+         * OVMF firmware band 0x7Bxxxxxx). Dump the ACTIVE CR3 (to see
+         * whether we're under the process or kernel CR3) plus a window of
+         * the stack: after a `call`, [RSP] holds the return address — the
+         * instruction right after the corrupt call IN THE CALLER. Stack
+         * values in the user-ELF range (0x20000000..0x20200000) are the
+         * call sites; objdump the binary there to read the `call *reg/mem`
+         * and identify the corrupted operand. Reads are guarded: stack
+         * only if RSP is in the mirror (always mapped), code only if the
+         * RIP page executed (it did — we faulted there). */
+        {
+            uint64_t wrip = frame->rip;
+            uint16_t wcs  = frame->cs & 0xFFFF;
+            int is_kernel = (wrip >= 0x2000000ULL  && wrip < 0x4000000ULL);
+            int is_user   = (wrip >= 0x20000000ULL && wrip < 0x20200000ULL);
+            int is_mirror = (wrip >= 0xFFFF800000000000ULL);
+            int is_vdso   = (wrip >= 0x7FFF0000ULL && wrip < 0x80000000ULL);
+            int native_cs = (wcs == 0x38 || wcs == 0x28 || wcs == 0x08);
+            if (wrip >= 0x10000ULL && native_cs &&
+                !is_kernel && !is_user && !is_mirror && !is_vdso) {
+                extern uint64_t paging_get_kernel_cr3(void);
+                uint64_t cr3;
+                __asm__ volatile ("mov %%cr3, %0" : "=r"(cr3));
+                serial_puts("  [WILD] active CR3=0x");
+                serial_puthex(cr3, 16);
+                serial_puts(" kernel CR3=0x");
+                serial_puthex(paging_get_kernel_cr3(), 16);
+                serial_puts("\n");
+
+                if (frame->rsp >= 0xFFFF800000000000ULL) {
+                    uint64_t *sp = (uint64_t *)frame->rsp;
+                    for (int i = 0; i < 24; i++) {
+                        serial_puts("    [RSP+");
+                        serial_puthex((uint64_t)(i * 8), 3);
+                        serial_puts("]=0x");
+                        serial_puthex(sp[i], 16);
+                        if (sp[i] >= 0x20000000ULL && sp[i] < 0x20200000ULL)
+                            serial_puts("  <-- user call site");
+                        serial_puts("\n");
+                    }
+                }
+
+                serial_puts("  [WILD] Code @ RIP: ");
+                uint8_t *wc = (uint8_t *)wrip;
+                for (int bi = 0; bi < 16; bi++) {
+                    serial_puthex(wc[bi], 2);
+                    serial_puts(" ");
+                }
+                serial_puts("\n");
+            }
+        }
+
         /* Dump bytes at RIP (useful for crashes on stack/corrupted code).
          * Skip the NULL page (Phase C: user PML4s have no mapping there),
          * and skip when not running compat32 user code — the dump is

@@ -711,8 +711,13 @@ static void elf_jump(uint64_t entry, uint64_t sp)
      * The instruction fetches between mov %cr3 and jmp succeed because
      * kernel text lives at the upper-half mirror (PML4[256], shared
      * across all CR3s). */
-    extern uint64_t proc_current_cr3(void);
-    uint64_t pcr3 = proc_current_cr3();
+    /* Re-anchor current_proc to the exec target and use ITS cr3: a timer
+     * context-switch during the ELF load can leave current_proc (hence
+     * proc_current_cr3) pointing at a kernel thread, which would launch
+     * the binary un-isolated under kernel_cr3 (load-VA / identity-map
+     * collision → self-corruption). See proc_launch_prepare. */
+    extern uint64_t proc_launch_prepare(void);
+    uint64_t pcr3 = proc_launch_prepare();
 
     __asm__ volatile (
         "cli\n"

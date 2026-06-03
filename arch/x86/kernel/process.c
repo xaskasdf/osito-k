@@ -622,6 +622,43 @@ uint64_t proc_current_cr3(void)
     return current_proc ? current_proc->cr3 : 0;
 }
 
+/* Called by elf_jump right before entering a freshly-exec'd binary.
+ * proc_exec sets current_proc = the new process, but the ELF load that
+ * follows runs with interrupts ON, so a timer tick can context-switch
+ * current_proc to a kernel thread (cr3 == kernel_cr3) and never restore
+ * it before elf_jump. Then proc_current_cr3() returns the stale kernel
+ * CR3, elf_jump skips the address-space switch, and the binary runs
+ * un-isolated under kernel_cr3 — where its load VA (0x20000000) COLLIDES
+ * with the kernel's low identity map, corrupting its own code pages
+ * (timing-dependent). Re-anchor current_proc to exec_target_proc (the
+ * process actually being launched, already used to anchor region
+ * registration) and return ITS cr3, so the launch + every subsequent
+ * demand fault use the correct isolated address space. */
+uint64_t proc_launch_prepare(void)
+{
+    if (exec_target_proc) {
+        extern void sched_current_set_proc(void *pp);
+        set_current_proc(exec_target_proc);
+        /* Make the scheduler track this process so a later preemption
+         * saves/restores ITS context + CR3 (not the kernel/shell slot). */
+        sched_current_set_proc(exec_target_proc);
+        return exec_target_proc->cr3;
+    }
+    return current_proc ? current_proc->cr3 : 0;
+}
+
+/* The process an in-progress exec is launching (NULL when not in exec).
+ * VMA/region registration must anchor ownership HERE, not to
+ * proc_current(): a timer context-switch during the (interrupt-enabled)
+ * ELF load can transiently move current_proc to a kernel thread, so a
+ * VMA registered then would be owned by the wrong process and fail the
+ * owner filter in demand_page_fault once the binary is correctly running
+ * as exec_target. See proc_launch_prepare. */
+void *proc_exec_target(void)
+{
+    return exec_target_proc;
+}
+
 /* User-symbol-table accessors — used by usym.c so it doesn't have to
  * know the layout of process_t. Take/return void* so usym.c stays
  * decoupled from this struct's anonymous tag. */
@@ -889,12 +926,21 @@ int proc_exec(const char *filename, int argc, const char **argv)
     fb_puts(filename);
     fb_puts("\n");
 
+    /* Remember the scheduler's current slot so we can restore it when the
+     * exec'd process exits (proc_launch_prepare points it at the new
+     * process; on exit we must hand it back, since p's slot gets freed).
+     * volatile so it survives the proc_exit longjmp below. */
+    extern int  sched_current_get(void);
+    extern void sched_current_set_idx(int idx);
+    volatile int prev_sched_idx = sched_current_get();
+
     /* Save kernel context so proc_exit() can longjmp back here */
     if (kern_setjmp(exec_jmpbuf) != 0) {
         /* Returned from proc_exit via longjmp.
          * SYSCALL disables interrupts (FMASK clears IF) and the longjmp
          * bypasses SYSRET which would re-enable them. Re-enable now. */
         __asm__ volatile ("sti");
+        sched_current_set_idx(prev_sched_idx);
         exec_target_proc = NULL;
         int code = last_exit_code;
         set_current_proc(prev);
@@ -921,6 +967,7 @@ int proc_exec(const char *filename, int argc, const char **argv)
     serial_puts(filename);
     serial_puts("'\n");
 
+    sched_current_set_idx(prev_sched_idx);
     exec_target_proc = NULL;
     set_current_proc(prev);
     proc_free(p);
@@ -977,6 +1024,24 @@ void proc_list(void)
 extern volatile uint64_t sched_switch_rsp;
 
 static int      sched_current_idx = -1;
+
+/* Scheduler current-slot accessors used by proc_launch_prepare / proc_exec
+ * to make a freshly-exec'd binary the scheduler's tracked process. Without
+ * this, proc_exec launches the binary outside the scheduler (sched_current_idx
+ * still on the kernel/shell slot), so the FIRST timer preemption saves the
+ * binary's context into the wrong slot and RESUMES it under the wrong (kernel)
+ * CR3 — colliding the binary's load VA (0x20000000) with the kernel low
+ * identity map and corrupting its own code. The fork path already does this
+ * fixup (sched_current_idx = parent_idx); this generalizes it to plain exec. */
+int  sched_current_get(void) { return sched_current_idx; }
+void sched_current_set_idx(int idx) { sched_current_idx = idx; }
+void sched_current_set_proc(void *pp)
+{
+    if (!pp) return;
+    process_t *p = (process_t *)pp;
+    sched_current_idx = (int)(p - &proctab[0]);
+    p->quantum = qos_quantum[p->qos_class];
+}
 static bool     sched_enabled = false;
 static uint64_t sched_switches = 0;
 
