@@ -178,7 +178,11 @@ bool hwbp_dispatch(struct interrupt_frame *frame)
             volatile uint32_t *st = (volatile uint32_t *)(uintptr_t)esp32;
             uint32_t buf_ptr = (uint32_t)st[0];
             uint32_t fmt_ptr = (uint32_t)st[2];
-            serial_puts("  buf=L\"");
+            /* EDI on EVERY hit (not just first-4 detail dump) — for the
+             * GameEngine-Browse EDI-clobber bisect inside StaticConstructObject. */
+            serial_puts("  edi=0x");
+            serial_puthex((uint64_t)(uint32_t)frame->rdi, 8);
+            serial_puts(" buf=L\"");
             if (buf_ptr >= 0x10000 && (uint64_t)buf_ptr < 0x80000000ULL) {
                 volatile uint16_t *w = (volatile uint16_t *)(uintptr_t)buf_ptr;
                 char tmp[64]; int n = 0;
