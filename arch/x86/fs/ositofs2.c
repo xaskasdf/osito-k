@@ -850,20 +850,73 @@ osfs2_file_t *osfs2_create(const char *name, uint64_t size)
 
 /* ── Write data to an existing file ─────────────────────────── */
 
+/* Allocate a contiguous run of `blocks` data blocks via the authoritative
+ * live-extent bitmap (same policy as osfs2_create). Returns the start block,
+ * or 0 if no non-overlapping run is available. Marks the run used + advances
+ * the next_data_block hint. */
+static uint32_t osfs2_alloc_blocks(uint32_t blocks)
+{
+    if (blocks == 0) blocks = 1;
+    uint32_t start = blk_bitmap_find_free(blocks);
+    if (start && !blk_range_free(start, blocks)) start = 0;
+    if (!start) {
+        uint32_t hint = superblock.next_data_block;
+        if (hint < data_start) hint = data_start;
+        if (blk_range_free(hint, blocks)) {
+            start = hint;
+        } else {
+            uint32_t hwm = data_start;
+            for (uint32_t b = data_start; b < superblock.total_blocks; b++)
+                if (blk_bitmap_test(b)) hwm = b + 1;
+            if (blk_range_free(hwm, blocks)) start = hwm;
+            else return 0;
+        }
+    }
+    if (!blk_range_free(start, blocks)) return 0;
+    for (uint32_t b = 0; b < blocks; b++) blk_bitmap_set(start + b);
+    if (start + blocks > superblock.next_data_block)
+        superblock.next_data_block = start + blocks;
+    return start;
+}
+
 int osfs2_write(osfs2_file_t *file, uint64_t offset, const void *buf, uint64_t len)
 {
     if (!mounted || !file || !buf) return -1;
 
     /* Inline files: write to model_name field, persist via file table */
     if (file->flags & OSFS2_FLAG_INLINE) {
-        if (offset + len > OSFS2_INLINE_MAX) return -1;
-        memcpy(file->model_name + offset, buf, len);
-        if (offset + len > file->size) {
-            file->size = offset + len;
-            file->modify_time = osfs2_get_time();
+        if (offset + len <= OSFS2_INLINE_MAX) {
+            memcpy(file->model_name + offset, buf, len);
+            if (offset + len > file->size) {
+                file->size = offset + len;
+                file->modify_time = osfs2_get_time();
+            }
+            osfs2_write_file_table();
+            return 0;
         }
-        osfs2_write_file_table();
-        return 0;
+        /* The file grew past the inline limit → CONVERT it to a block-backed
+         * file: allocate an extent, migrate the existing inline bytes into
+         * it, clear the INLINE flag, then fall through to the normal block
+         * write below for the new data. (cc1 hits this writing assembly
+         * larger than OSFS2_INLINE_MAX to a freshly O_CREAT'd .s file.) */
+        uint64_t newsize = offset + len;
+        uint32_t blocks  = (uint32_t)((newsize + blk_size - 1) >> blk_shift);
+        uint32_t start   = osfs2_alloc_blocks(blocks);
+        if (!start) {
+            serial_puts("[OsitoFS] inline→block: no space for grow\n");
+            return -1;
+        }
+        uint8_t  saved[OSFS2_INLINE_MAX];
+        uint64_t oldsize = file->size > OSFS2_INLINE_MAX ? OSFS2_INLINE_MAX
+                                                         : file->size;
+        if (oldsize) memcpy(saved, file->model_name, (uint64_t)oldsize);
+        memset(file->model_name, 0, OSFS2_INLINE_MAX);
+        file->flags       &= ~OSFS2_FLAG_INLINE;
+        file->start_block  = start;
+        file->block_count  = blocks;
+        if (oldsize)
+            osfs2_part_write((uint64_t)start << blk_shift, saved, oldsize);
+        /* fall through to the block-write path below */
     }
 
     if (offset + len > (uint64_t)file->block_count << blk_shift) return -1;
