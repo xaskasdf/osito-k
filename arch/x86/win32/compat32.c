@@ -2825,6 +2825,30 @@ uint64_t compat32_dispatch(uint32_t thunk_idx, uint32_t *stack_args)
                         *(volatile uint32_t *)(uintptr_t)(pool + 0x1c) = cursor_addr;
                         repairs_this_dispatch++;
                     }
+                    /* FMW-EMPTY detect: a pool in the FirstPool list (list 0)
+                     * with FirstMem(+0x14)=NULL is the 0x109022BE crash setup —
+                     * Malloc takes from FirstPool but the pool has no free
+                     * blocks (should have been moved to ExaustedPool). Log it
+                     * (and the table's block size) to confirm before repairing. */
+                    if (list == 0) {
+                        uint32_t firstmem = *(volatile uint32_t *)(uintptr_t)(pool + 0x14);
+                        if (firstmem == 0) {
+                            static int empty_log = 0;
+                            if (empty_log < 30) {
+                                empty_log++;
+                                uint32_t blocksize = *(volatile uint32_t *)(uintptr_t)(table_base + 8);
+                                serial_puts("[FMW-EMPTY] pool 0x");
+                                serial_puthex(pool, 8);
+                                serial_puts(" in FirstPool[t=");
+                                serial_putdec((uint64_t)t);
+                                serial_puts(" blk=");
+                                serial_putdec((uint64_t)blocksize);
+                                serial_puts("] has FirstMem=NULL (Taken+8=0x");
+                                serial_puthex(*(volatile uint32_t *)(uintptr_t)(pool + 8), 8);
+                                serial_puts(")\n");
+                            }
+                        }
+                    }
                     /* Advance: cursor = &pool->Next, pool = pool->Next */
                     cursor_addr = pool + 0x18;
                     pool = *(volatile uint32_t *)(uintptr_t)cursor_addr;
@@ -3402,8 +3426,19 @@ uint64_t compat32_dispatch(uint32_t thunk_idx, uint32_t *stack_args)
         }
     }
 
+    /* UT-EXE-PATCH DISABLED (Jun 4): these 3 NOPs blanked essential pool
+     * linked-list writes in FMallocWindows::Link/Unlink (0x10902AF2 *prev=next
+     * Unlink; 0x10902B1B PoolPtr->Next=oldhead; 0x10902B2D *head=PoolPtr) — the
+     * final head update. They were a workaround for the "EBX clobber" crash in
+     * this pool manager, which we now know was the GlobalAddAtomW arg-count bug
+     * (fixed in 0889057). With those NOPs, the Link insert never updates the
+     * list head → FirstPool/ExaustedPool lists go inconsistent → Malloc picks
+     * an exhausted pool → deref FirstMem(NULL) → crash at 0x109022BE. With the
+     * real EBX fix in place these NOPs are both unnecessary AND the cause, so
+     * leave the pool writes intact. */
+    static const int APPLY_LISTDEL_NOPS = 0;
     static int patched_ut_listdel = 0;
-    if (!patched_ut_listdel) {
+    if (APPLY_LISTDEL_NOPS && !patched_ut_listdel) {
         struct { uint32_t va; uint8_t want[3]; uint8_t patch[3]; int len; }
         sites[] = {
             { 0x10902AF2, {0x89, 0x01, 0x00}, {0x90, 0x90, 0x00}, 2 },

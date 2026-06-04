@@ -1282,6 +1282,69 @@ void isr_handler(interrupt_frame_t *frame)
                     serial_puthex((uint32_t)cr2, 4);
                     serial_puts(is_heap ? " (heap→SEH)\n" : " (DLL→wt)\n");
                 }
+                /* FMW pool crash (UT.exe 0x109022BE: `mov [edx+4],eax`,
+                 * edx=pool->[0x14]=0). Dump the pool local [ebp-0x18] + fields
+                 * to see if it's a valid pool with FirstMem(+0x14)=NULL or a
+                 * corrupted local. Logged once. */
+                if ((uint32_t)frame->rip == 0x109022BE) {
+                    static int fmw_dumped = 0;
+                    if (!fmw_dumped) {
+                        fmw_dumped = 1;
+                        uint32_t ebp = (uint32_t)frame->rbp;
+                        uint32_t pool = (ebp >= 0x10000 && ebp < 0x80000000)
+                            ? *(volatile uint32_t *)(uintptr_t)(ebp - 0x18) : 0;
+                        serial_puts("[FMW-CRASH] edx=0x");
+                        serial_puthex((uint32_t)frame->rdx, 8);
+                        serial_puts(" ecx=0x"); serial_puthex((uint32_t)frame->rcx, 8);
+                        serial_puts(" pool[ebp-18]=0x"); serial_puthex(pool, 8);
+                        if (pool >= 0x10000 && pool < 0x80000000) {
+                            serial_puts(" +08=0x"); serial_puthex(*(volatile uint32_t *)(uintptr_t)(pool+0x08), 8);
+                            serial_puts(" +14=0x"); serial_puthex(*(volatile uint32_t *)(uintptr_t)(pool+0x14), 8);
+                            serial_puts(" +18=0x"); serial_puthex(*(volatile uint32_t *)(uintptr_t)(pool+0x18), 8);
+                            serial_puts(" +1c=0x"); serial_puthex(*(volatile uint32_t *)(uintptr_t)(pool+0x1c), 8);
+                        }
+                        serial_puts("\n");
+                    }
+                }
+                /* FMW-POOL-SKIP: a NULL-target write (CR2 in the NULL page)
+                 * from UT.exe's FMallocWindows pool manager (Malloc/Free/
+                 * Link/Unlink, ~0x10902000..0x10903400). These are
+                 * `*pool->PrevLink = …`, `*head = …`, `FirstMem->… = …` etc.
+                 * on a pool that isn't linked / has no free blocks (PrevLink
+                 * or FirstMem == NULL). Skipping ONLY the faulting (NULL)
+                 * write — vs the old blanket NOP that also dropped VALID
+                 * writes and corrupted the lists — keeps the list updates
+                 * intact and just no-ops the meaningless NULL store. Decode
+                 * the mov length and advance past it. */
+                if ((uint32_t)cr2 < 0x1000 && (frame->cs & 0xFFFF) == 0x40 &&
+                    (uint32_t)frame->rip >= 0x10902000 &&
+                    (uint32_t)frame->rip <  0x10903400) {
+                    volatile uint8_t *ins = (volatile uint8_t *)(uintptr_t)(uint32_t)frame->rip;
+                    uint8_t op = ins[0];
+                    if (op == 0x89 || op == 0x8B || op == 0x88 ||
+                        op == 0x8A || op == 0xC7) {
+                        uint8_t modrm = ins[1];
+                        int mod = modrm >> 6, rm = modrm & 7;
+                        int len = 2;
+                        if (mod != 3 && rm == 4) len++;          /* SIB */
+                        if (mod == 1) len += 1;                  /* disp8 */
+                        else if (mod == 2) len += 4;             /* disp32 */
+                        else if (mod == 0 && rm == 5) len += 4;  /* disp32 no base */
+                        if (op == 0xC7) len += 4;                /* imm32 */
+                        static int fmw_skip = 0;
+                        if (fmw_skip < 20) {
+                            fmw_skip++;
+                            serial_puts("[FMW-POOL-SKIP] NULL write @0x");
+                            serial_puthex((uint32_t)frame->rip, 8);
+                            serial_puts(" len="); serial_putdec((uint64_t)len);
+                            serial_puts(" CR2=0x"); serial_puthex((uint32_t)cr2, 4);
+                            serial_puts("\n");
+                        }
+                        frame->rip += len;
+                        if (g_null_page_dirty) null_page_clean();
+                        return;
+                    }
+                }
                 if (is_heap) {
                     /* Heap code executing data as code → EBX was corrupted
                      * by a callback, causing call *%ebx to jump to heap data.
