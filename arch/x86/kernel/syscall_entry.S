@@ -79,6 +79,13 @@ syscall_entry:
      * interrupts off avoids races with the APIC timer. */
     call syscall_dispatch
 
+    /* TLS contract (FS base) is preserved INSIDE syscall_dispatch: it
+     * snapshots the caller's live MSR_FS_BASE on entry into a stack local
+     * (which survives any mid-syscall yield, since the kernel stack travels
+     * with the process) and re-asserts it on return. Doing it there — rather
+     * than here from current_proc->fs_base — is immune to a transient
+     * current_proc/sched desync across a yield. */
+
     /* Restore stack (undo alignment) */
     mov %rbp, %rsp
 

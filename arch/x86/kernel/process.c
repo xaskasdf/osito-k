@@ -30,6 +30,10 @@ extern void *kmalloc(uint64_t size);
 extern void  kfree(void *ptr);
 extern void *mem_alloc_aligned(uint64_t size, uint64_t alignment);
 extern void  mem_free_pages(void *addr, uint64_t count);
+
+/* Forward decl: sched_current_idx is defined (= -1) further down but used by
+ * the FS-base/TLS diagnostics above its definition (parallel fork/TLS work). */
+static int sched_current_idx;
 extern uint64_t paging_get_kernel_cr3(void);
 
 /* MSR access for per-thread TLS (X-THREAD) */
@@ -353,6 +357,14 @@ int32_t  last_exit_code;
  * segments to the right slot, preventing a page-free miss on exit. */
 static process_t *exec_target_proc;
 
+/* The parent of a *synchronous* exec (proc_exec — kernel shell `exec`). It is
+ * suspended inside proc_exec for the whole child run (it only resumes via the
+ * proc_exit longjmp), so it must be BLOCKED while the child runs — otherwise a
+ * timer tick re-enqueues/re-selects its slot and reverts current_proc +
+ * sched_current_idx away from the child, making the child's arch_prctl write
+ * the TLS base into the parent's process_t. NULL on the fork+exec path. */
+static process_t *exec_parent_proc;
+
 
 /* ── Run queue implementation ────────────────────────────────── */
 
@@ -650,6 +662,31 @@ uint64_t proc_launch_prepare(void)
         /* Make the scheduler track this process so a later preemption
          * saves/restores ITS context + CR3 (not the kernel/shell slot). */
         sched_current_set_proc(exec_target_proc);
+        /* The synchronous-exec parent's kernel context is abandoned at the
+         * elf_jump that immediately follows (control enters the child and
+         * only returns via the proc_exit longjmp). BLOCK the parent so the
+         * scheduler can't re-enqueue/re-select its slot and revert
+         * current_proc + sched_current_idx back to it mid-run — that desync
+         * is what made the child's arch_prctl(ARCH_SET_FS) land in the
+         * parent's process_t (child fs_base=0 → fs:[0] #PF). proc_transition
+         * to BLOCKED also dequeues it from the runq if a tick during the ELF
+         * load already enqueued it READY. Unblocked at proc_exec's setjmp
+         * return. exec_parent_proc is NULL on the fork+exec path. */
+        bool blocked_parent = false;
+        if (exec_parent_proc && exec_parent_proc != exec_target_proc &&
+            exec_parent_proc->state != PROC_ZOMBIE &&
+            exec_parent_proc->state != PROC_FREE) {
+            proc_transition(exec_parent_proc, PROC_BLOCKED);
+            blocked_parent = true;
+        }
+        serial_puts("[LP] anchor child pid=");
+        serial_putdec(exec_target_proc->pid);
+        serial_puts(":");
+        serial_putdec((uint64_t)(int)(exec_target_proc - proctab));
+        serial_puts(" parent=");
+        serial_putdec(exec_parent_proc ? exec_parent_proc->pid : 0);
+        serial_puts(blocked_parent ? " BLOCKED" : " (not blocked)");
+        serial_puts("\n");
         return exec_target_proc->cr3;
     }
     return current_proc ? current_proc->cr3 : 0;
@@ -733,8 +770,87 @@ void proc_set_clear_child_tid(uint64_t *addr)
 /* Save FS_BASE to current process (called from arch_prctl SET_FS) */
 void proc_set_fs_base(uint64_t addr)
 {
-    if (current_proc)
+    if (current_proc) {
         current_proc->fs_base = addr;
+        /* DIAG: which process_t actually receives the TLS base, and whether
+         * current_proc agrees with sched_current_idx. If current_proc's slot
+         * != sched_idx (or slot_pid != current_proc pid), the two "current"
+         * notions have diverged and FS will be written/read on different
+         * process_t entries. */
+        int cur_slot = (int)(current_proc - proctab);
+        int si = sched_current_idx;
+        serial_puts("[FSSET] current_proc pid=");
+        serial_putdec(current_proc->pid);
+        serial_puts(" slot=");
+        serial_putdec((uint64_t)cur_slot);
+        serial_puts(" | sched_idx=");
+        serial_putdec((uint64_t)(uint32_t)si);
+        serial_puts(" slot_pid=");
+        serial_putdec((si >= 0 && si < MAX_PROCESSES) ? proctab[si].pid : 0);
+        serial_puts(" fs_base=0x");
+        serial_puthex(addr, 16);
+        serial_puts("\n");
+    }
+}
+
+/* Current process's stored TLS base (process_t.fs_base). */
+uint64_t proc_get_fs_base(void)
+{
+    return current_proc ? current_proc->fs_base : 0;
+}
+
+/* TLS contract hardening (x86-64 Linux ABI):
+ * Re-assert the live MSR_FS_BASE from the calling process's stored
+ * fs_base on every syscall return. A long-running syscall (e.g. the
+ * inference path, which sched_yield()s to other tasks mid-call) can
+ * return to userland on a path where the live FS base no longer matches
+ * the process's TLS pointer; musl then dereferences fs:[0] (the TCB
+ * self-pointer used by errno / __pthread_self) and faults with CR2=0.
+ * The process_t copy is the source of truth — it is set by arch_prctl
+ * and preserved across context switches — so reloading it here makes the
+ * thread pointer survive unconditionally. Skipped for tasks that never
+ * set up TLS (fs_base==0, e.g. kernel threads) so we never clobber a
+ * legitimately-zero base. Called from syscall_entry.S after dispatch. */
+void proc_reassert_fs_base(void)
+{
+    if (!current_proc) return;
+    uint64_t want = current_proc->fs_base;
+    if (!want) return;              /* never force a 0 base (kernel threads) */
+    uint64_t live = rdmsr(MSR_FS_BASE);
+    if (live != want) {
+        /* A syscall left the live FS base diverged from the process's
+         * stored TLS base. Log it (rare → no spam) and correct it so
+         * userland resumes with the right thread pointer. This both
+         * diagnoses the clobber and cures the fs:[0] fault. */
+        serial_puts("[FSRA] pid=");
+        serial_putdec(current_proc->pid);
+        serial_puts(" live=0x");
+        serial_puthex(live, 16);
+        serial_puts(" -> stored=0x");
+        serial_puthex(want, 16);
+        serial_puts("\n");
+        wrmsr(MSR_FS_BASE, want);
+    }
+}
+
+/* Diagnostic: dump the live MSR_FS_BASE vs the process's stored fs_base.
+ * Lets the #PF handler tell apart "live MSR was clobbered" (stored base
+ * still correct) from "stored base was zeroed" (deeper bug). */
+void proc_dump_fs_state(void)
+{
+    uint64_t live = rdmsr(MSR_FS_BASE);
+    serial_puts("  [FS] live MSR_FS_BASE=0x");
+    serial_puthex(live, 16);
+    serial_puts(" stored fs_base=0x");
+    serial_puthex(current_proc ? current_proc->fs_base : 0, 16);
+    if (current_proc) {
+        serial_puts(" pid=");
+        serial_putdec(current_proc->pid);
+        serial_puts(" tgid=");
+        serial_putdec(current_proc->tgid);
+        serial_puts(current_proc->is_thread ? " thread" : " main");
+    }
+    serial_puts("\n");
 }
 
 /* Get current process name */
@@ -922,6 +1038,20 @@ int proc_exec(const char *filename, int argc, const char **argv)
     process_t *prev = current_proc;
     set_current_proc(p);
     exec_target_proc = p;
+    /* Pin the parent so proc_launch_prepare can BLOCK it for the child's
+     * lifetime (see exec_parent_proc). Cleared on the child's exit below. */
+    exec_parent_proc = prev;
+    serial_puts("[PE] proc_exec parent(prev)=");
+    serial_putdec(prev ? prev->pid : 0);
+    serial_puts(":");
+    serial_putdec(prev ? (uint64_t)(int)(prev - proctab) : 0);
+    serial_puts(" child=");
+    serial_putdec(p->pid);
+    serial_puts(":");
+    serial_putdec((uint64_t)(int)(p - proctab));
+    serial_puts(" sched_idx=");
+    serial_putdec((uint64_t)(uint32_t)sched_current_idx);
+    serial_puts("\n");
     proc_transition(p, PROC_RUNNING);
 
     /* Seed stdio — proc_alloc zeros the fd table, so the new process
@@ -945,14 +1075,22 @@ int proc_exec(const char *filename, int argc, const char **argv)
 
     /* Save kernel context so proc_exit() can longjmp back here */
     if (kern_setjmp(exec_jmpbuf) != 0) {
-        /* Returned from proc_exit via longjmp.
-         * SYSCALL disables interrupts (FMASK clears IF) and the longjmp
-         * bypasses SYSRET which would re-enable them. Re-enable now. */
-        __asm__ volatile ("sti");
+        /* Returned from proc_exit via longjmp. Re-anchor the parent as the
+         * running process and UNBLOCK it (blocked at launch) BEFORE
+         * re-enabling interrupts, so a timer tick can't catch the scheduler
+         * still pointing at the now-dead child. SYSCALL disabled interrupts
+         * (FMASK clears IF) and the longjmp bypassed SYSRET, so IF is still 0
+         * here — keep it 0 until current_proc/sched_idx/state are consistent. */
         sched_current_set_idx(prev_sched_idx);
+        set_current_proc(prev);
+        if (exec_parent_proc) {
+            if (exec_parent_proc->state == PROC_BLOCKED)
+                proc_transition(exec_parent_proc, PROC_RUNNING);
+            exec_parent_proc = NULL;
+        }
         exec_target_proc = NULL;
         int code = last_exit_code;
-        set_current_proc(prev);
+        __asm__ volatile ("sti");
         /* Switch back to the parent's CR3 (kernel CR3 if no parent). */
         if (prev && prev->cr3)
             paging_switch(prev->cr3);
@@ -979,6 +1117,13 @@ int proc_exec(const char *filename, int argc, const char **argv)
     sched_current_set_idx(prev_sched_idx);
     exec_target_proc = NULL;
     set_current_proc(prev);
+    /* exec failed before elf_jump, so the parent was never blocked; clear the
+     * pin (and unblock defensively in case a path did block it). */
+    if (exec_parent_proc) {
+        if (exec_parent_proc->state == PROC_BLOCKED)
+            proc_transition(exec_parent_proc, PROC_RUNNING);
+        exec_parent_proc = NULL;
+    }
     proc_free(p);
 
     return ret;
@@ -1093,6 +1238,23 @@ void __hot sched_tick(void *frame_ptr)
 
     process_t *cur = &proctab[sched_current_idx];
 
+    /* DIAG [INV]: the running process should be both current_proc AND
+     * proctab[sched_current_idx]. If they disagree on entry, the two
+     * "current" notions have diverged — the FS write path (arch_prctl via
+     * current_proc) and the FS save/restore path (via sched_current_idx)
+     * then operate on different process_t entries. */
+    if (current_proc && current_proc != cur) {
+        serial_puts("[INV] current_proc pid=");
+        serial_putdec(current_proc->pid);
+        serial_puts(" slot=");
+        serial_putdec((uint64_t)(int)(current_proc - proctab));
+        serial_puts(" != sched_idx=");
+        serial_putdec((uint64_t)(uint32_t)sched_current_idx);
+        serial_puts(" slot_pid=");
+        serial_putdec(cur->pid);
+        serial_puts("\n");
+    }
+
     /* Drain syscall-free command ring for current process (if registered).
      * fd_table macro resolves via current_proc which is correct here. */
     {
@@ -1180,7 +1342,21 @@ void __hot sched_tick(void *frame_ptr)
         cur->saved_frame_rip = f[17];
     }
 
-    cur->fs_base = rdmsr(MSR_FS_BASE);  /* save per-thread TLS */
+    {
+        uint64_t live_fs = rdmsr(MSR_FS_BASE);  /* save per-thread TLS */
+        /* DIAG: smoking gun for "save clobbers a good TLS base to 0".
+         * If this process had a valid TLS base but the live MSR reads 0
+         * at save time, the base was lost while it was current (another
+         * task's restore wrote 0 and we are about to persist that). */
+        if (cur->fs_base && !live_fs) {
+            serial_puts("[FSSAVE-ZERO] pid=");
+            serial_putdec(cur->pid);
+            serial_puts(" had fs_base=0x");
+            serial_puthex(cur->fs_base, 16);
+            serial_puts(" but live MSR=0 -> persisting 0\n");
+        }
+        cur->fs_base = live_fs;
+    }
     /* Only mark as READY if currently RUNNING.
      * ZOMBIE processes must stay ZOMBIE — proc_wait4 relies on this. */
     if (cur->state == PROC_RUNNING)
@@ -1302,6 +1478,20 @@ void __hot sched_tick(void *frame_ptr)
     proc_transition(next, PROC_RUNNING);
     next->quantum = qos_quantum[next->qos_class];
     next->last_active_tick = idt_get_ticks();
+    /* DIAG [SW]: every context switch — who → who (pid:slot). Reveals when the
+     * scheduler resumes the synchronous-exec parent's stale kernel context
+     * (which re-enters the child's userland under the parent's identity). */
+    serial_puts("[SW] cur=");
+    serial_putdec(cur->pid);
+    serial_puts(":");
+    serial_putdec((uint64_t)(uint32_t)sched_current_idx);
+    serial_puts(" -> next=");
+    serial_putdec(next->pid);
+    serial_puts(":");
+    serial_putdec((uint64_t)next_idx);
+    serial_puts(" fs=0x");
+    serial_puthex(next->fs_base, 16);
+    serial_puts("\n");
     set_current_proc(next);
     sched_current_idx = next_idx;
     wrmsr(MSR_FS_BASE, next->fs_base);  /* restore per-thread TLS */
@@ -1672,6 +1862,18 @@ int32_t proc_fork(void)
      * both at once. */
     child->cr3 = parent->cr3;
     child->owns_cr3 = false;
+
+    /* Inherit the parent's TLS base (thread pointer). POSIX fork duplicates
+     * the calling thread, so the child's FS base must equal the parent's —
+     * its TLS block lives at the same virtual address in the shared/copied
+     * address space. proc_alloc zeroed child->fs_base; without this the
+     * scheduler restores fs_base=0 when it first runs the child, and the
+     * child's first TLS access (errno / __pthread_self → fs:[0]) faults at
+     * CR2=0 while still running the parent's image (before execve installs a
+     * new one whose musl will arch_prctl its own base). The child enters
+     * userland via the fake IRETQ frame, NOT the syscall return path, so the
+     * syscall_dispatch FS-restore wrapper does not cover it — this does. */
+    child->fs_base = parent->fs_base;
 
     /* Fork: allocate a NEW fd_table (separate copy for child).
      * Each inherited pipe fd bumps the corresponding refcounts. */

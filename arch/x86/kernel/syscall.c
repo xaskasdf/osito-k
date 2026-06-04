@@ -3336,7 +3336,37 @@ static void memo_invalidate_nr(uint64_t nr)
 
 /* ── Syscall dispatch (called from assembly) ─────────────────── */
 
+static int64_t __hot syscall_dispatch_inner(uint64_t nr, uint64_t a1, uint64_t a2,
+                         uint64_t a3, uint64_t a4, uint64_t a5);
+
+/* FS-base (TLS) transparency wrapper.
+ *
+ * A syscall that yields mid-flight (sys_inference's sched_yield, or any
+ * blocking path that re-schedules) resumes the caller on a context-switch
+ * RESTORE that reloads the caller's *stored* per-process fs_base. If a
+ * transient current_proc/sched desync ever left that stored copy at 0 (its
+ * arch_prctl write landed on the wrong process_t — the live MSR was still set
+ * correctly by arch_prctl's own wrmsr, but the process_t copy was not), the
+ * caller comes back from the syscall with FS=0 and the next fs:[0] read
+ * (errno / __pthread_self) faults at CR2=0.
+ *
+ * Make every syscall FS-transparent instead of trusting current_proc: snapshot
+ * the caller's LIVE FS base on entry into this frame's local (which travels
+ * with the process's kernel stack across any yield) and re-assert it on
+ * return. This is immune to the desync because it reads/writes the hardware
+ * MSR for *this* call, never a process_t field. arch_prctl is the one syscall
+ * that legitimately changes FS, so skip the re-assert for it. */
 int64_t __hot syscall_dispatch(uint64_t nr, uint64_t a1, uint64_t a2,
+                               uint64_t a3, uint64_t a4, uint64_t a5)
+{
+    uint64_t entry_fs = rdmsr(MSR_FS_BASE);
+    int64_t  ret = syscall_dispatch_inner(nr, a1, a2, a3, a4, a5);
+    if (nr != SYS_ARCH_PRCTL && entry_fs && rdmsr(MSR_FS_BASE) != entry_fs)
+        wrmsr(MSR_FS_BASE, entry_fs);
+    return ret;
+}
+
+static int64_t __hot syscall_dispatch_inner(uint64_t nr, uint64_t a1, uint64_t a2,
                          uint64_t a3, uint64_t a4, uint64_t a5)
 {
     /* Memoization: check cache for known-memoizable syscalls.

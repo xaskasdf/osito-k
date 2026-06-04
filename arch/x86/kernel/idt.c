@@ -1804,6 +1804,15 @@ void isr_handler(interrupt_frame_t *frame)
             if (frame->error_code & 8) serial_puts("RESERVED-BIT ");
             if (frame->error_code & 16) serial_puts("INSTRUCTION-FETCH ");
             serial_puts("\n");
+
+            /* TLS diagnostic: a fault at a low linear address from user
+             * code is the signature of a lost FS base (fs:[0] with
+             * FS_BASE==0 → CR2==0). Dump live MSR vs the process's stored
+             * fs_base to tell apart MSR-clobber from stored-base-zeroed. */
+            {
+                extern void proc_dump_fs_state(void);
+                proc_dump_fs_state();
+            }
         }
 
         /* GP fault: decode error code */
