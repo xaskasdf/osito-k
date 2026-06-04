@@ -44,7 +44,16 @@ static io_pattern_t patterns[IO_PATTERN_MAX];
  * via proc_current_last_opened() in process.c. */
 static char kernel_last_opened[IO_NAME_MAX];
 
-bool io_predict_enabled = true;
+/* DISABLED: the prefetch worker runs vfs_read() → NVMe reads on an AP core
+ * concurrently with the BSP's synchronous demand-paging NVMe reads, and the
+ * NVMe I/O completion queue (nvme.iocq_head / iocq_phase, drivers/nvme.c) is
+ * accessed WITHOUT a lock. Under heavy file-open load (e.g. cc1 reading
+ * hundreds of headers while demand-paging its 31MB image) the two cores race
+ * on the shared CQ → a sync read's completion is consumed/lost by the AP →
+ * "[NVMe] I/O command timeout" → demand-page fails → the process #PFs on an
+ * unmapped page. Keep off until NVMe CQ access is serialized (TODO: per-queue
+ * lock or a dedicated AP completion path). io_predict is a perf opt only. */
+bool io_predict_enabled = false;
 extern uint64_t idt_get_ticks(void);
 extern char *proc_current_last_opened(void);
 
