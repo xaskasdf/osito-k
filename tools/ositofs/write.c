@@ -26,6 +26,59 @@
 
 #define MAX_BATCH_FILES 4096
 
+/*
+ * Live-extent bitmap (one bit per block). Built from the in-memory file
+ * table so the allocator never overlaps a live file — exactly the guard the
+ * kernel driver uses. Needed because superblock.next_data_block can be stale
+ * (observed on nvme_gcc.img: next_data_block=4 while 2034 blocks were live),
+ * and appending blindly there clobbered a live extent.
+ */
+static uint8_t *g_blkmap;          /* malloc'd, total_blocks bits */
+static uint32_t g_total_blocks;
+
+static inline void blkmap_set(uint32_t b)   { if (b < g_total_blocks) g_blkmap[b>>3] |=  (uint8_t)(1u << (b & 7)); }
+static inline void blkmap_clear(uint32_t b) { if (b < g_total_blocks) g_blkmap[b>>3] &= (uint8_t)~(1u << (b & 7)); }
+static inline int  blkmap_test(uint32_t b)  { return (b >= g_total_blocks) ? 1 : ((g_blkmap[b>>3] >> (b & 7)) & 1); }
+
+/* 1 iff [start,start+count) is fully in-bounds and every block is free. */
+static int blkmap_range_free(uint32_t start, uint32_t count, uint32_t data_start)
+{
+    if (count == 0) return 0;
+    if (start < data_start) return 0;
+    if ((uint64_t)start + count > (uint64_t)g_total_blocks) return 0;
+    for (uint32_t b = start; b < start + count; b++)
+        if (blkmap_test(b)) return 0;
+    return 1;
+}
+
+/* First-fit contiguous free run of `count` blocks. Returns start or 0 (none). */
+static uint32_t blkmap_find_free(uint32_t count, uint32_t data_start)
+{
+    uint32_t run_start = 0, run_len = 0;
+    for (uint32_t b = data_start; b < g_total_blocks; b++) {
+        if (!blkmap_test(b)) {
+            if (run_len == 0) run_start = b;
+            if (++run_len == count) return run_start;
+        } else run_len = 0;
+    }
+    return 0;
+}
+
+/* Rebuild g_blkmap from the file table: mark metadata + every live extent. */
+static int blkmap_build(const osfs2_file_t *ft, uint32_t total_blocks, uint32_t data_start)
+{
+    g_total_blocks = total_blocks;
+    g_blkmap = calloc((total_blocks + 7) / 8, 1);
+    if (!g_blkmap) return -1;
+    for (uint32_t b = 0; b < data_start; b++) blkmap_set(b);
+    for (uint32_t i = 0; i < OSFS2_MAX_FILES; i++) {
+        if (!(ft[i].flags & OSFS2_FLAG_VALID)) continue;
+        for (uint32_t b = 0; b < ft[i].block_count; b++)
+            blkmap_set(ft[i].start_block + b);
+    }
+    return 0;
+}
+
 typedef struct {
     const char *local_path;
     char stored_name[OSFS2_NAME_LEN];
@@ -375,6 +428,13 @@ int main(int argc, char **argv)
 
     osfs2_file_t *ft = (osfs2_file_t *)ft_blk;
 
+    /* Build the live-extent bitmap so allocation never overlaps a live file,
+     * even if superblock.next_data_block is stale. */
+    if (blkmap_build(ft, sb.total_blocks, osfs2_data_start_blk(bs)) < 0) {
+        fprintf(stderr, "ositofs-write: out of memory for block bitmap\n");
+        goto fail;
+    }
+
     void *crc_blk = osfs2_alloc_aligned(OSFS2_CRCTAB_SIZE);
     if (!crc_blk) goto fail;
     if (osfs2_read_bytes(fd, OSFS2_CRCTAB_OFF, crc_blk, OSFS2_CRCTAB_SIZE) < 0)
@@ -474,6 +534,10 @@ int main(int argc, char **argv)
                 uint32_t old_blocks = ft[fi].block_count;
                 uint32_t old_top = ft[fi].start_block + old_blocks;
 
+                /* Release the old extent in the live bitmap so it can be reused. */
+                for (uint32_t b = 0; b < old_blocks; b++)
+                    blkmap_clear(ft[fi].start_block + b);
+
                 /* Free layer index slot if GGUF */
                 if (li && ft[fi].layer_index_slot != 0xFFFF &&
                     ft[fi].layer_index_slot < OSFS2_MAX_MODELS) {
@@ -498,17 +562,39 @@ int main(int argc, char **argv)
             }
         }
 
-        /* Check available space */
-        uint32_t avail = sb.total_blocks - sb.next_data_block;
-        if (blocks_needed > avail) {
-            fprintf(stderr, "ositofs-write: not enough space for '%s' (%u blocks needed, %u available)\n",
-                    job->stored_name, blocks_needed, avail);
+        /* Allocate a contiguous run from the live-extent bitmap (first-fit).
+         * This NEVER overlaps a live file. next_data_block is only a hint and
+         * may be stale; the bitmap is authoritative. */
+        uint32_t data_start_blk = osfs2_data_start_blk(sb.block_size);
+        uint32_t start_block = blkmap_find_free(blocks_needed, data_start_blk);
+        if (start_block && !blkmap_range_free(start_block, blocks_needed, data_start_blk))
+            start_block = 0;  /* defensive */
+        if (!start_block) {
+            /* Try the next_data_block hint only if verified free, else
+             * re-derive a true high-water mark from the bitmap. */
+            uint32_t hint = sb.next_data_block;
+            if (hint < data_start_blk) hint = data_start_blk;
+            if (blkmap_range_free(hint, blocks_needed, data_start_blk)) {
+                start_block = hint;
+            } else {
+                uint32_t hwm = data_start_blk;
+                for (uint32_t b = data_start_blk; b < sb.total_blocks; b++)
+                    if (blkmap_test(b)) hwm = b + 1;
+                if (blkmap_range_free(hwm, blocks_needed, data_start_blk))
+                    start_block = hwm;
+            }
+        }
+        if (!start_block) {
+            fprintf(stderr, "ositofs-write: not enough contiguous space for '%s' (%u blocks needed)\n",
+                    job->stored_name, blocks_needed);
             exit_code = 1;
             continue;  /* skip this file, try next */
         }
 
-        /* Allocate data blocks (contiguous, next_data_block) */
-        uint32_t start_block = sb.next_data_block;
+        /* Reserve the run in the bitmap immediately. */
+        for (uint32_t b = 0; b < blocks_needed; b++)
+            blkmap_set(start_block + b);
+
         printf("  Writing %u data blocks starting at block %u...\n", blocks_needed, start_block);
 
         /* Write data blocks */
@@ -578,15 +664,27 @@ int main(int argc, char **argv)
             }
         }
 
-        /* Update superblock in-memory */
+        /* Update superblock in-memory. next_data_block is a high-water-mark
+         * hint: only RAISE it (first-fit may place a file below the current
+         * top, which must not lower the hint). */
         if (file_idx >= sb.file_count)
             sb.file_count = file_idx + 1;
-        sb.next_data_block = start_block + blocks_needed;
-        sb.used_blocks = sb.next_data_block;
+        if (start_block + blocks_needed > sb.next_data_block)
+            sb.next_data_block = start_block + blocks_needed;
 
         printf("  [OK] '%s' written: blocks %u-%u, CRC 0x%08X\n",
                job->stored_name, start_block, start_block + blocks_needed - 1, file_crc);
         success_count++;
+    }
+
+    /* Recompute used_blocks from the authoritative bitmap (metadata + every
+     * reserved data block) so the superblock stays consistent regardless of
+     * first-fit placement. */
+    {
+        uint32_t used = 0;
+        for (uint32_t b = 0; b < sb.total_blocks; b++)
+            if (blkmap_test(b)) used++;
+        sb.used_blocks = used;
     }
 
     /* ── Flush all metadata once ────────────────────────────────── */
@@ -637,6 +735,7 @@ int main(int argc, char **argv)
     if (li_blk) free(li_blk);
     free(crc_blk);
     free(ft_blk);
+    free(g_blkmap); g_blkmap = NULL;
     /* Free strdup'd paths from manifest */
     if (manifest_path) {
         for (int i = pos_count; i < job_count; i++) {
@@ -653,6 +752,7 @@ fail_crc:
     free(crc_blk);
 fail:
     free(ft_blk);
+    free(g_blkmap); g_blkmap = NULL;
     if (manifest_path) {
         for (int i = pos_count; i < job_count; i++) {
             free((void *)jobs[i].local_path);

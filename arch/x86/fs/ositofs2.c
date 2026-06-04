@@ -119,6 +119,29 @@ static uint32_t blk_bitmap_find_free(uint32_t count)
     return 0;
 }
 
+/* Returns 1 iff the whole range [start, start+count) is in-bounds AND every
+ * block in it is currently FREE in the bitmap. This is the authoritative
+ * overlap guard: a range that fails this check must NEVER be handed out,
+ * because the bitmap is rebuilt from all live file extents on mount.
+ *
+ * Why this exists: osfs2_create used to fall back to appending at
+ * superblock.next_data_block whenever blk_bitmap_find_free() returned 0.
+ * But next_data_block can be STALE/LOW relative to the actual high-water
+ * mark (observed on nvme_gcc.img: next_data_block=4 while 2034 data blocks
+ * were live). Appending blindly at a stale next_data_block handed out an
+ * already-occupied block (4), letting pkg/catalog.json's extent clobber
+ * hello.c's live extent. Now the bitmap is the single source of truth. */
+static int blk_range_free(uint32_t start, uint32_t count)
+{
+    if (count == 0) return 0;
+    if (start < data_start) return 0;
+    /* Guard against overflow and out-of-range (total_blocks bounds the FS). */
+    if ((uint64_t)start + count > (uint64_t)superblock.total_blocks) return 0;
+    for (uint32_t b = start; b < start + count; b++)
+        if (blk_bitmap_test(b)) return 0;   /* any used block => not free */
+    return 1;
+}
+
 /* ── File name hash table (in-memory, O(1) lookup) ──────────── */
 
 #define OSFS2_HASH_SLOTS  8192
@@ -325,10 +348,19 @@ superblock_ok:
     /* Build block usage bitmap from file table */
     blk_bitmap_rebuild();
 
-    /* Shrink next_data_block if trailing blocks are free (recover from old append-only) */
-    while (superblock.next_data_block > data_start &&
-           !blk_bitmap_test(superblock.next_data_block - 1))
-        superblock.next_data_block--;
+    /* Re-anchor next_data_block to the TRUE high-water mark derived from the
+     * bitmap (one past the highest live block). The old code only ever
+     * *shrank* this value, which could leave it inconsistent with the live
+     * extents — e.g. nvme_gcc.img persisted next_data_block=4 while 2034 data
+     * blocks were live. A stale-low next_data_block let osfs2_create's append
+     * fallback hand out an already-occupied block, corrupting a live file.
+     * Recomputing from the bitmap makes the hint correct in both directions. */
+    {
+        uint32_t hwm = data_start;
+        for (uint32_t b = data_start; b < superblock.total_blocks; b++)
+            if (blk_bitmap_test(b)) hwm = b + 1;
+        superblock.next_data_block = hwm;
+    }
 
     uint32_t data_blks = superblock.total_blocks - data_start;
     uint32_t used_data = superblock.used_blocks - data_start;
@@ -702,23 +734,67 @@ osfs2_file_t *osfs2_create(const char *name, uint64_t size)
     uint32_t blocks = (uint32_t)((size + blk_size - 1) >> blk_shift);
     if (blocks == 0) blocks = 1;
 
-    /* Try to reuse freed blocks first (first-fit in bitmap) */
+    /* Allocate a contiguous run. The in-memory bitmap (rebuilt from every
+     * live file's extent on mount) is the AUTHORITATIVE allocator: first-fit
+     * over the bitmap is the only path that is guaranteed not to overlap a
+     * live file.
+     *
+     * superblock.next_data_block is treated as a HINT only. It can be stale
+     * (observed: next_data_block=4 while 2034 data blocks were live), and
+     * blindly appending there used to clobber a live extent. We therefore
+     * only fall back to the next_data_block append path when that exact range
+     * is verified FREE in the bitmap; otherwise we hard-fail rather than
+     * hand out an overlapping range. */
     uint32_t start = blk_bitmap_find_free(blocks);
+    if (start && !blk_range_free(start, blocks)) {
+        /* Defensive: find_free should only return free runs. If not, treat
+         * as "no run found" so we don't corrupt data. */
+        serial_puts("[OsitoFS] BUG: find_free returned occupied run, rejecting\n");
+        start = 0;
+    }
     if (!start) {
-        /* No reusable gap — append at high-water mark */
-        if (superblock.next_data_block + blocks > superblock.total_blocks) {
-            serial_puts("[OsitoFS] Not enough space: need ");
-            serial_putdec(blocks);
-            serial_puts(" blocks\n");
-            return NULL;
+        /* No reusable gap from first-fit. Try the next_data_block hint, but
+         * ONLY if it does not overlap any live extent. */
+        uint32_t hint = superblock.next_data_block;
+        if (hint < data_start) hint = data_start;
+        if (blk_range_free(hint, blocks)) {
+            start = hint;
+        } else {
+            /* Hint is stale/occupied. Re-derive a true high-water mark from
+             * the bitmap (skip every used block) and try to append above it.
+             * This recovers cleanly from a corrupted/low next_data_block. */
+            uint32_t hwm = data_start;
+            for (uint32_t b = data_start; b < superblock.total_blocks; b++)
+                if (blk_bitmap_test(b)) hwm = b + 1;
+            if (blk_range_free(hwm, blocks)) {
+                start = hwm;
+            } else {
+                serial_puts("[OsitoFS] Not enough contiguous space: need ");
+                serial_putdec(blocks);
+                serial_puts(" blocks\n");
+                return NULL;
+            }
         }
-        start = superblock.next_data_block;
-        superblock.next_data_block += blocks;
+    }
+
+    /* Final paranoia check: never hand out a range that intersects a live
+     * extent. If this ever trips, fail the create rather than corrupt data. */
+    if (!blk_range_free(start, blocks)) {
+        serial_puts("[OsitoFS] Refusing to allocate overlapping extent @ block ");
+        serial_putdec(start);
+        serial_puts("\n");
+        return NULL;
     }
 
     /* Mark blocks as used in bitmap */
     for (uint32_t b = 0; b < blocks; b++)
         blk_bitmap_set(start + b);
+
+    /* Keep next_data_block as a forward hint: advance it past this run if we
+     * just extended the high-water mark. (Gaps reused via first-fit do not
+     * move it.) */
+    if (start + blocks > superblock.next_data_block)
+        superblock.next_data_block = start + blocks;
 
     /* Fill file entry */
     osfs2_file_t *f = &file_table[slot];
