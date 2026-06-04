@@ -1046,31 +1046,27 @@ int winexec_run(const uint8_t *file_data, uint64_t file_size)
              * (e.g. "Engine") but ends up with FName index 0 (None) — the
              * "None0" native-DLL-bind frontier — or whether CreatePackage is
              * called with None to begin with (linker name-mapping bug). */
-            {
-                LOADED_MODULE *core_m = dll_find_module("Core.dll");
-                PVOID cp = core_m ? dll_resolve_export(core_m,
-                    "?CreatePackage@UObject@@SAPAVUPackage@@PAV1@PBG@Z", 0, FALSE)
-                    : (PVOID)0;
-                if (cp && hwbp_set(2, (uint64_t)(ULONG_PTR)cp,
-                                   /*HWBP_EXECUTE*/0, /*HWBP_LEN_1*/0,
-                                   "CreatePackage-entry") == 0) {
-                    serial_puts("[winexec] HWBP slot 2 armed at CreatePackage @0x");
-                    serial_puthex((uint64_t)(ULONG_PTR)cp, 8);
-                    serial_puts("\n");
-                } else {
-                    serial_puts("[winexec] could not resolve/arm CreatePackage\n");
-                }
+            /* Slot 2 = UGameEngine StaticAllocateObject call site (EXE
+             * 0x109214FF, inside the ConstructObject wrapper that pushes
+             * $0x3D8 = sizeof(UGameEngine)). If this fires, the wrapper's
+             * CastChecked matched (UGameEngine SuperField → UEngine OK) and it
+             * IS allocating a UGameEngine. If it NEVER fires, the cast still
+             * fails / wrapper not reached → Init() runs on a stale `this`. */
+            if (hwbp_set(2, 0x109214FFULL, /*HWBP_EXECUTE*/0, /*HWBP_LEN_1*/0,
+                          "UGameEngine-AllocObject") == 0) {
+                serial_puts("[winexec] HWBP slot 2 armed at EXE+0x214FF "
+                            "(UGameEngine StaticAllocateObject 0x3D8)\n");
             }
-            /* Slot 3: Phase 7c — EXEC at Core.dll+0x57DBD = ProcessRegistrants
-             * Phase 2 inner loop's `call ConditionalRegister`. Each hit
-             * captures ECX (= UObject* being processed) + ESI (= loop counter).
-             * The LAST hit before the throw cascade identifies the entry
-             * whose Register() threw, narrowing the layer issue down to a
-             * specific UClass static. */
-            if (hwbp_set(3, 0x10157DBDULL, /*HWBP_EXECUTE*/0, /*HWBP_LEN_1*/0,
-                          "ProcessRegistrants-Phase2-CR-call") == 0) {
-                serial_puts("[winexec] HWBP slot 3 armed at Core.dll+0x57DBD "
-                            "(ProcessRegistrants Phase 2 ConditionalRegister call)\n");
+            /* Slot 3 = the instruction right after ConstructObject(UGameEngine)
+             * returns (EXE 0x1090BC72 `mov eax,[ebp-0x7a4]`). EAX holds the
+             * object pointer Init() will run on. Heap (0x40xxxxxx/0x55xxxxxx)
+             * = real construction; 0x10101820 (Core.dll .data) = stale/garbage
+             * `this` (the crash we see). The first-4-hit detail dump prints
+             * EAX. */
+            if (hwbp_set(3, 0x1090BC72ULL, /*HWBP_EXECUTE*/0, /*HWBP_LEN_1*/0,
+                          "GEngine-ctor-result") == 0) {
+                serial_puts("[winexec] HWBP slot 3 armed at EXE+0xBC72 "
+                            "(GEngine = ConstructObject result, EAX)\n");
             }
         }
 
