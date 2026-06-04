@@ -1030,18 +1030,25 @@ int winexec_run(const uint8_t *file_data, uint64_t file_size)
              * Find the hit where EDI=0x401DF500 (the render-device F call) and
              * see whether appFailAssert (slot 0→1) or StaticConstructObject
              * (slot 2→3) flips EDI to 0x10101820. */
-            if (hwbp_set(0, 0x10392858ULL, /*HWBP_EXECUTE*/0, /*HWBP_LEN_1*/0,
-                          "before-appFailAssert") == 0) {
-                serial_puts("[winexec] HWBP slot 0 armed at Engine.dll+0x92858\n");
+            /* Inside Core.dll StaticConstructObject @0x1015D3A0. It saves EDI
+             * (push edi @0x5D3C0) and restores it (pop edi @0x5D41A), but the
+             * caller's EDI ends up = saved-EBX → an 8-byte ESP imbalance from
+             * a callee. Probe esp/ebp (hwbp.c compact) before/after its two
+             * calls: StaticAllocateObject (0x5D3FD) and the ClassConstructor
+             * `call *0x4e4(edi)` (0x5D40C). The render-device construct is the
+             * LAST one before the crash. */
+            if (hwbp_set(0, 0x1015D3FDULL, /*HWBP_EXECUTE*/0, /*HWBP_LEN_1*/0,
+                          "SCO-call-AllocObject") == 0) {
+                serial_puts("[winexec] HWBP slot 0 armed at Core.dll+0x5D3FD\n");
             }
             /* Slot 1 = Engine.dll 0x103888D6 — inside F, just BEFORE the
              * `call 0x103038aa` (FURL ctor @0x888E1) that precedes the Browse.
              * Detail dump prints EDI (= F's `this`). Bisect: if EDI is still
              * 0x401DF500 here but 0x10101820 at 0x888E6 (slot 3), the FURL
              * call clobbered the callee-saved EDI (this). */
-            if (hwbp_set(1, 0x1039285EULL, /*HWBP_EXECUTE*/0, /*HWBP_LEN_1*/0,
-                          "after-appFailAssert") == 0) {
-                serial_puts("[winexec] HWBP slot 1 armed at Engine.dll+0x9285E\n");
+            if (hwbp_set(1, 0x1015D402ULL, /*HWBP_EXECUTE*/0, /*HWBP_LEN_1*/0,
+                          "SCO-after-AllocObject") == 0) {
+                serial_puts("[winexec] HWBP slot 1 armed at Core.dll+0x5D402\n");
             }
             /* Slot 2 = CreatePackage entry (EXEC), resolved at runtime.
              * CreatePackage(UObject* Outer, const TCHAR* Name) → st[1]=Outer,
@@ -1065,9 +1072,9 @@ int winexec_run(const uint8_t *file_data, uint64_t file_size)
              * this at entry) and stack[0] (=caller retaddr). Goal: is F called
              * with the real engine 0x401DF500 or the Core.dll thunk 0x10101820,
              * and WHO calls it? */
-            if (hwbp_set(2, 0x10392887ULL, /*HWBP_EXECUTE*/0, /*HWBP_LEN_1*/0,
-                          "before-StaticConstructObject") == 0) {
-                serial_puts("[winexec] HWBP slot 2 armed at Engine.dll+0x92887\n");
+            if (hwbp_set(2, 0x1015D40CULL, /*HWBP_EXECUTE*/0, /*HWBP_LEN_1*/0,
+                          "SCO-call-ClassCtor") == 0) {
+                serial_puts("[winexec] HWBP slot 2 armed at Core.dll+0x5D40C\n");
             }
             /* Slot 3 = the instruction right after ConstructObject(UGameEngine)
              * returns (EXE 0x1090BC72 `mov eax,[ebp-0x7a4]`). EAX holds the
@@ -1079,9 +1086,9 @@ int winexec_run(const uint8_t *file_data, uint64_t file_size)
              * the FURL call returns and right BEFORE the Browse call. Detail
              * dump prints EDI. If EDI=0x10101820 here (vs 0x401DF500 at slot
              * 1), the FURL call (0x103fd8d0) clobbered EDI = root cause. */
-            if (hwbp_set(3, 0x1039288DULL, /*HWBP_EXECUTE*/0, /*HWBP_LEN_1*/0,
-                          "after-StaticConstructObject") == 0) {
-                serial_puts("[winexec] HWBP slot 3 armed at Engine.dll+0x9288D\n");
+            if (hwbp_set(3, 0x1015D412ULL, /*HWBP_EXECUTE*/0, /*HWBP_LEN_1*/0,
+                          "SCO-after-ClassCtor") == 0) {
+                serial_puts("[winexec] HWBP slot 3 armed at Core.dll+0x5D412\n");
             }
         }
 

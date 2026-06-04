@@ -182,6 +182,10 @@ bool hwbp_dispatch(struct interrupt_frame *frame)
              * GameEngine-Browse EDI-clobber bisect inside StaticConstructObject. */
             serial_puts("  edi=0x");
             serial_puthex((uint64_t)(uint32_t)frame->rdi, 8);
+            serial_puts(" esp=0x");
+            serial_puthex((uint64_t)(uint32_t)frame->rsp, 8);
+            serial_puts(" ebp=0x");
+            serial_puthex((uint64_t)(uint32_t)frame->rbp, 8);
             serial_puts(" buf=L\"");
             if (buf_ptr >= 0x10000 && (uint64_t)buf_ptr < 0x80000000ULL) {
                 volatile uint16_t *w = (volatile uint16_t *)(uintptr_t)buf_ptr;
