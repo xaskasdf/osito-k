@@ -3196,32 +3196,14 @@ uint64_t compat32_dispatch(uint32_t thunk_idx, uint32_t *stack_args)
         serial_puts("/3\n");
     }
 
-    /* ENGINE-PATCH: Engine.dll @0x103887C0 does `mov ebx, [IAT-slot]`
-     * then makes multiple `call ebx` to StaticLoadClass.  Between the
-     * 1st and 2nd call, a virtual call `call [edx+0x54]` (at 0x1038887A)
-     * goes through a corrupt vtable and lands in non-ABI-compliant code
-     * that doesn't preserve EBX.  Then the 2nd `call ebx` faults at
-     * NX (EBX=0x401BC870, a heap data addr).
-     *
-     * Fix: patch the corrupt-vtable call to a 3-byte NOP, eliminating
-     * the EBX clobber.  Side effect: the virtual method (likely some
-     * sort of class hierarchy walker) doesn't run, but the engine
-     * generally handles missing-vtable cases gracefully.
-     *
-     * Verify expected bytes before patching, in case Engine.dll layout
-     * differs in some build. */
-    static int patched_ebx_callsite = 0;
-    if (!patched_ebx_callsite) {
-        volatile uint8_t *p = (uint8_t *)(uintptr_t)0x1038887A;
-        if (p[0] == 0xFF && p[1] == 0x52 && p[2] == 0x54) {
-            p[0] = 0x90;  /* NOP */
-            p[1] = 0x90;
-            p[2] = 0x90;
-            patched_ebx_callsite = 1;
-            serial_puts("[ENGINE-PATCH] NOP'd call [edx+0x54] @0x1038887A "
-                         "(prevents EBX clobber)\n");
-        }
-    }
+    /* ENGINE-PATCH (the byte-NOP of `call [edx+0x54]` @0x1038887A) REMOVED:
+     * its real root was a LAYER bug — GetProcAddress (kernel32_shim.c) hardcoded
+     * a 4-arg thunk for every resolved function. UWindowsClient::Init does
+     * GetProcAddress(ddraw,"DirectDrawCreate") (3 args); the 4-arg thunk's
+     * RET 16 over-cleaned 4 bytes, so a later `push &obj->field` landed on
+     * Init's saved-EBX stack slot → its `pop ebx` restored garbage → the engine's
+     * subsequent `call ebx` jumped into the object and #PF'd. Fix: GetProcAddress
+     * now uses win32_abi_lookup for the real argc/cc (the Phase 1 mechanism). */
 
     /* Log PE32 caller return address (at stack_args[-1] = [ESP] on entry) */
     if (stack_args && thunk_idx < 0xFFFFFFF0) {
@@ -3232,6 +3214,7 @@ uint64_t compat32_dispatch(uint32_t thunk_idx, uint32_t *stack_args)
         extern uint32_t g_last_stack_args;
         g_last_caller_eip = ret_addr;
         g_last_stack_args = (uint32_t)(uintptr_t)stack_args;
+
 
         /* wdbg: dispatch any address-site hooks registered by callers
          * who want to inspect engine state when the PE is executing

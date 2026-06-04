@@ -1226,9 +1226,20 @@ PVOID WINAPI GetProcAddress(HANDLE hModule, PCSTR lpProcName)
                  * 64-bit code get misinterpreted as INC/DEC in 32-bit. */
                 extern int g_compat32_mode;
                 if (g_compat32_mode) {
-                    extern uint32_t compat32_make_thunk(uint64_t, const char *, uint8_t);
-                    uint32_t thunk = compat32_make_thunk(
-                        (uint64_t)(ULONG_PTR)fn, lpProcName, 4);
+                    /* Use the co-located ABI descriptor for the real argc +
+                     * callconv (Phase 1), NOT a hardcoded 4. A wrong argc here
+                     * makes the thunk's RET N over/under-clean the caller stack
+                     * and corrupt its saved callee-saved registers (e.g.
+                     * DirectDrawCreate is 3 args, not 4 — argc=4 over-cleaned 4
+                     * bytes and clobbered UWindowsClient::Init's saved EBX). */
+                    extern int win32_abi_lookup(const char *, const char *,
+                                                uint8_t *, uint8_t *);
+                    extern uint32_t compat32_make_thunk_ex(uint64_t, const char *,
+                                                           uint8_t, uint8_t);
+                    uint8_t nargs = 4, cc = 0 /* CC_STDCALL */;
+                    win32_abi_lookup(shim_dll, lpProcName, &nargs, &cc);
+                    uint32_t thunk = compat32_make_thunk_ex(
+                        (uint64_t)(ULONG_PTR)fn, lpProcName, nargs, cc);
                     if (thunk)
                         return (PVOID)(ULONG_PTR)thunk;
                 }

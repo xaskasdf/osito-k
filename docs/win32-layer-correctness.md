@@ -282,8 +282,29 @@ sendto=6, select/getsockopt/setsockopt=5; **ole32** CoCreateInstance=5;
   with correct NT loader init ordering (`FMallocWindows::Init` before any
   appMalloc; FName table init as the engine expects), per UE1 + NT loader spec.
 
-## 4.5 ENGINE-PATCH root-cause (Phase 2 step 3, 2026-06-04)
+## 4.5 ENGINE-PATCH root-cause — FOUND & FIXED (Phase 2 step 3, 2026-06-04)
 
+**ROOT CAUSE (definitive, layer bug): `GetProcAddress` (kernel32_shim.c) hardcoded
+a 4-arg thunk for every function it resolved.** `UWindowsClient::Init` does
+`GetProcAddress(ddraw, "DirectDrawCreate")` (3 args); the 4-arg thunk's `RET 16`
+**over-cleaned 4 bytes**, so a later `push &obj->field(+0xF0)` in Init landed on
+its own saved-EBX stack slot `[ebp-0x2b8]`. Init's `pop ebx` then restored that
+object pointer (`obj1+0xF0` = `0x4020C870`) instead of the caller's EBX, and the
+engine's next `call ebx` jumped into the object and #PF'd — the crash ENGINE-PATCH
+masked. Pinned deterministically by tracking `[ebp-0x2b8]` live across every shim
+call from Init (jitter-immune; the per-run stack base varies via ASLR-lite, which
+had defeated hardcoded-address HWBP/watchpoints).
+
+**FIX:** `GetProcAddress` now uses `win32_abi_lookup(shim_dll, name, &argc, &cc)`
+(the Phase-1 co-located ABI mechanism) for the real argc + callconv, instead of a
+hardcoded 4. **ENGINE-PATCH deleted.** Verified: DirectDrawCreate thunk argc 4→3,
+the saved-EBX slot stays intact through Init, the `0x4020C870` crash is gone, and
+UT99 reaches the same Browse + LoadMap("Can't find Entry.unr") frontier (~121k log
+lines) **with no band-aid**. This is exactly the Phase-1 class of bug (a wrong argc
+producing stack-cleanup corruption), just on the GetProcAddress thunk path the
+initial migration didn't cover.
+
+### Earlier investigation (how we got here)
 ENGINE-PATCH byte-NOPs `call [edx+0x54]` @Engine.dll `0x1038887A`. Step 3 chased
 its real root.
 
