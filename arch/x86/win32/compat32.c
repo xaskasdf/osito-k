@@ -511,6 +511,17 @@ static uint8_t guess_num_args(const char *name)
         { "UnhandledExceptionFilter",    1 },
         { "IsBadReadPtr",         2 }, { "IsBadWritePtr",        2 },
         { "IsBadCodePtr",         1 },
+        /* Atom APIs take 1 arg (3 for GetAtomName). Without these, the default
+         * of 4 args makes the stdcall thunk RET 16 and over-clean the stack by
+         * 12 bytes per call → ESP imbalance → caller's callee-saved EDI/EBX
+         * corrupt. UT99's UWindowsClient ctor calls GlobalAddAtomW 4x for key
+         * names ("UnrealAltEsc"…), which was crashing the render-device load. */
+        { "GlobalAddAtomW",       1 }, { "GlobalAddAtomA",       1 },
+        { "GlobalFindAtomW",      1 }, { "GlobalFindAtomA",      1 },
+        { "GlobalDeleteAtom",     1 }, { "AddAtomW",             1 },
+        { "AddAtomA",             1 }, { "FindAtomW",            1 },
+        { "FindAtomA",            1 }, { "DeleteAtom",           1 },
+        { "GlobalGetAtomNameW",   3 }, { "GlobalGetAtomNameA",   3 },
         { "HeapReAlloc",          4 }, { "HeapSize",             3 },
         { "RtlUnwind",            4 },
         { "CreateThread",         6 }, { "ExitThread",           1 },
