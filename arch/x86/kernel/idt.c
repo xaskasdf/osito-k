@@ -1527,61 +1527,8 @@ void isr_handler(interrupt_frame_t *frame)
                 uint32_t *sp32 = (uint32_t *)(uintptr_t)(frame->rsp & 0xFFFFFFFF);
                 uint32_t retaddr = sp32[0];
 
-                /* Browse() redirect: Init() at Engine.dll+0x888F5 calls
-                 * Browse via call *0xB0(%edx) but the vtable is corrupt
-                 * (heap ini strings instead of C++ vtable). The REAL
-                 * Browse function is at Engine.dll+0xBC210 (0x1038C210).
-                 * Redirect the NULL-CALL to the real Browse. The args
-                 * are already pushed on the stack, ECX=this from EDI. */
-                if (retaddr >= 0x103888F0 && retaddr <= 0x10388900) {
-                    uint32_t real_browse = 0x1038C210;
-                    static int browse_fix_count = 0;
-                    browse_fix_count++;
-                    if (browse_fix_count <= 3) {
-                        serial_puts("[BROWSE-FIX] this=0x");
-                        serial_puthex((uint32_t)frame->rdi, 8);
-                        serial_puts("\n");
-                        /* Dump UClass hierarchy to diagnose ConstructObject failure */
-                        /* UGameEngine::PrivateStaticClass at 0x105928A0 */
-                        volatile uint32_t *ge_cls = (volatile uint32_t *)(uintptr_t)0x105928A0;
-                        serial_puts("  UGameEngine::SC vtbl=0x");
-                        serial_puthex(ge_cls[0], 8);
-                        serial_puts(" SuperField=0x");
-                        serial_puthex(ge_cls[0x28/4], 8);
-                        serial_puts(" Name=0x");
-                        serial_puthex(ge_cls[0x0C/4], 8);  /* FName at offset 0x0C in UObject */
-                        serial_puts("\n");
-                        /* GObjRegistrants: TArray at 0x102A0360 */
-                        volatile uint32_t *reg = (volatile uint32_t *)(uintptr_t)0x102A0360;
-                        serial_puts("  GObjRegistrants: Data=0x");
-                        serial_puthex(reg[0], 8);
-                        serial_puts(" Num=");
-                        serial_putdec(reg[1]);
-                        serial_puts(" Max=");
-                        serial_putdec(reg[2]);
-                        serial_puts("\n");
-                        /* UEngine::PrivateStaticClass — find from EXE IAT 0x10958D74 */
-                        volatile uint32_t *ue_iat = (volatile uint32_t *)(uintptr_t)0x10958D74;
-                        uint32_t ue_cls_addr = *ue_iat;
-                        serial_puts("  UEngine::SC (from IAT) = 0x");
-                        serial_puthex(ue_cls_addr, 8);
-                        if (ue_cls_addr >= 0x10000 && ue_cls_addr < 0x20000000) {
-                            volatile uint32_t *ue_cls = (volatile uint32_t *)(uintptr_t)ue_cls_addr;
-                            serial_puts(" SuperField=0x");
-                            serial_puthex(ue_cls[0x28/4], 8);
-                        }
-                        serial_puts("\n");
-                    }
-                    /* Also fix the vtable pointer so Browse can use it */
-                    uint32_t this_ptr = (uint32_t)frame->rdi;
-                    if (this_ptr >= 0x1000 && this_ptr < 0x50000000) {
-                        *(uint32_t *)(uintptr_t)this_ptr = 0x10434650; /* real UGameEngine vtable */
-                    }
-                    frame->rip = real_browse;
-                    frame->rcx = frame->rdi; /* this = GameEngine */
-                    if (g_null_page_dirty) null_page_clean();
-                    return;
-                }
+                /* BROWSE-FIX removed (Phase 2 bisect: 0 fires; the
+                 * GameEngine vtable is valid now, real Browse runs). */
 
                 /* Stub object NULL-CALL: if retaddr is in Window.dll or
                  * any DLL that calls methods on our stub UObjects, RET 0.
@@ -1595,41 +1542,8 @@ void isr_handler(interrupt_frame_t *frame)
                     return;
                 }
 
-                /* Try IAT redirect: find 'call reg' (FF Dx) at retaddr-2,
-                 * then scan backwards for 'mov reg, [imm32]' (IAT load) */
-                uint8_t *caller = (uint8_t *)(uintptr_t)(retaddr - 2);
-                uint32_t iat_addr = 0;
-                uint8_t mov_opcode = 0;
-
-                if (caller[0] == 0xFF && (caller[1] & 0xF8) == 0xD0) {
-                    uint8_t reg = caller[1] & 0x07;
-                    mov_opcode = 0x05 + reg * 8;
-                }
-
-                if (mov_opcode) {
-                    uint8_t *scan = caller - 1;
-                    for (int i = 0; i < 200 && !iat_addr; i++, scan--) {
-                        if (scan[0] == 0x8B && scan[1] == mov_opcode)
-                            iat_addr = *(uint32_t *)(scan + 2);
-                    }
-                }
-
-                if (iat_addr >= 0x10000000 && iat_addr < 0x20000000) {
-                    uint32_t correct_fn = *(uint32_t *)(uintptr_t)iat_addr;
-                    if (correct_fn >= 0x10000000 && correct_fn < 0x20000000) {
-                        if (null_call_count <= 10) {
-                            serial_puts("[NULL-REDIRECT] -> 0x");
-                            serial_puthex(correct_fn, 8);
-                            serial_puts(" (IAT 0x");
-                            serial_puthex(iat_addr, 8);
-                            serial_puts(") retaddr=0x");
-                            serial_puthex(retaddr, 8);
-                            serial_puts("\n");
-                        }
-                        frame->rip = correct_fn;
-                        return;
-                    }
-                }
+                /* NULL-REDIRECT (IAT-disasm rescue) removed (Phase 2
+                 * bisect: 0 fires with Phase 1 ABI fix + ENGINE-PATCH). */
             }
 
             if (null_call_count <= 10) {

@@ -250,15 +250,34 @@ sendto=6, select/getsockopt/setsockopt=5; **ole32** CoCreateInstance=5;
     find file 'Entry.unr'" frontier (band-aids still ON). Spec citations: §1.5.
   - ⚠️ As predicted, Phase 1 alone does **not** delete the surviving band-aids —
     their root is elsewhere (Phase 2).
-- [ ] **Phase 2 — Remove band-aids, confirming each is dead / root-causing the
-  rest.** For each of ENGINE-PATCH, BROWSE-FIX, NULL-REDIRECT, FMW-REPAIR,
-  GOBJREG-FORCE, FMW-POOL-SKIP, UT-EXE-PATCH NOPs: disable → run → if the masked
-  crash does not reappear, delete it; if it does, root-cause to the underlying
-  layer bug (wrong table entry / callconv / int2e register preservation /
-  semantic) and fix the layer. **Measured: disabling the 5 EBX-era band-aids
-  regresses LoadMap→crash at ~19k lines (heap-exec 0x4020C870) — so at least one
-  masks a real, still-unfixed layer bug. This is where the remaining corruption
-  lives.**
+- [~] **Phase 2 — Remove band-aids, confirming each is dead / root-causing the
+  rest. IN PROGRESS 2026-06-04.**
+  - **Step 1 (done):** removed the HWBP-bisect arming (winexec.c) + FNDIFF FName
+    tracer (compat32.c) — pure instrumentation that flooded runs. A full run to
+    the LoadMap frontier dropped 252k→115k lines, frontier intact. Runs are now
+    measurable for the bisect.
+  - **Step 2 (done):** non-invasive bisect — counted each band-aid's fires in a
+    clean Phase-1 run (115k lines, reaches frontier):
+
+    | band-aid | fires | verdict |
+    |---|---|---|
+    | BROWSE-FIX | **0** | dead → **removed** |
+    | NULL-REDIRECT | **0** | dead → **removed** |
+    | FMW-REPAIR | **0** | dead → **removed** |
+    | ENGINE-PATCH | 1 (preventive) | **load-bearing** — disabling it crashed at 15.8k lines, heap-exec 0x4020C870 (the `call ebx`/EBX-clobber). Phase 1 did NOT fix its root (corrupt vtable at `call [edx+0x54]` @0x1038887A). KEPT. |
+    | FMW-POOL-SKIP | 6 | active → kept (Phase 3) |
+    | GOBJREG-FORCE | 2 | active → kept (Phase 3) |
+    | FNAME-NULL-FILL / FNAME-RESCUE | 151 / 3 | active → kept (Phase 3) |
+
+    Removing the 3 zero-fire band-aids (212 lines) was byte-for-byte neutral —
+    re-ran to 115082 lines, same Browse + LoadMap + "Can't find Entry.unr"
+    frontier, crash 0.
+  - **Step 3 (TODO):** root-cause the still-live band-aids as layer bugs:
+    ENGINE-PATCH (why is the `[edx+0x54]` vtable corrupt? — likely an
+    uninitialized/wrong-object vtable, not arg-count); FMW-POOL-SKIP (NULL pool
+    writes); GOBJREG-FORCE (ProcessRegistrants not self-firing). Fix → remove.
+  - ⚠️ Earlier measurement (pre-Phase-1, all 5 off) regressed to ~19k. The
+    refined bisect shows that was ENGINE-PATCH alone; the other 3 are dead.
 - [ ] **Phase 3 — Init-ordering semantics.** Replace GMalloc stub / FNAME-RESCUE
   with correct NT loader init ordering (`FMallocWindows::Init` before any
   appMalloc; FName table init as the engine expects), per UE1 + NT loader spec.
