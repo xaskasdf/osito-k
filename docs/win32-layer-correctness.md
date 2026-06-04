@@ -282,6 +282,42 @@ sendto=6, select/getsockopt/setsockopt=5; **ole32** CoCreateInstance=5;
   with correct NT loader init ordering (`FMallocWindows::Init` before any
   appMalloc; FName table init as the engine expects), per UE1 + NT loader spec.
 
+## 4.5 ENGINE-PATCH root-cause (Phase 2 step 3, 2026-06-04)
+
+ENGINE-PATCH byte-NOPs `call [edx+0x54]` @Engine.dll `0x1038887A`. Step 3 chased
+its real root.
+
+**Confirmed mechanism (via the #PF stack dump).** The crash is `UGameEngine::Init`
+(F)'s `call ebx` @`0x1038888F`: `[RSP+0]=0x10388891` (F's return addr), `RBX=
+0x4020C870` = `obj1+0xF0` where obj1 = the `ViewportManager` (= `WinDrv.WindowsClient`)
+object F builds. The kernel's own detector (idt.c) prints `*0x105A5E08=0x10101820
+(StaticLoadClass) … IAT OK, EBX clobbered USER-SIDE`. So `UWindowsClient::Init`
+(WinDrv `0x11101720`) returns having restored F's callee-saved EBX/ESI/EDI as
+garbage → a **32-bit stack imbalance inside Init** leaves an object-field pointer on
+the stack at the saved-EBX slot. **Disproven**: corrupt vtable (vt=0x1110C928 valid
+WinDrv, [vt+0x54]=0x11101720 valid) and damaged class/object (header valid: Class,
+Outer, Name all set; mid-Init esi=appStricmp / ebx=Logf both valid). Phase-1 shim
+argc is correct, so the under-cleaner is a virtual call / callback-arg cleanup /
+`_alloca`(`__chkstk`) / an un-audited argc — pin it with a **data write-watchpoint**
+on Init's saved-EBX slot (deterministic, unlike exec-HWBPs).
+
+**NT/WOW64 reference for the 32↔64 boundary** (`nt5src/.../base/wow64/cpu/amd64/
+cpu/amd64/simulate.asm`): `CpupRunSimulatedCode` (64→32) saves 64-bit non-volatiles
++ restores the 32-bit register context from a **per-thread** x86 CPU-context struct;
+`CpupReturnFromSimulatedCode` (32→64) saves the **full** 32-bit context into that
+per-thread struct. Discipline = full register set preserved, per-thread, every
+transition.
+
+**Our audit vs NT.** `int2e_stub.S` already saves all 15 GPRs on the IST1 stack and
+restores them — preserves the 32-bit caller's EBX/ESI/EDI/EBP across a shim call;
+lighter than NT's per-thread CONTEXT and **works (keep)**. Gaps to fix (real but
+likely NOT this user-side root): `compat32_callback`/`compat32_callback_args`
+inline-asm **clobber lists incomplete** (omit rsi/rdi etc.), and callback/int2e
+state is **global** (`callback_depth`, `callback_jmpbufs[]`, `callback_stacks_ptr[]`,
+`g_int2e_rsp_depth`) where NT keeps it per-thread (latent multi-thread bug; APIC
+timer is masked for UT99's lifetime so preemption is largely off today). See memory
+`project-ut99-enginepatch-root` for exact addresses.
+
 ## 5. Open questions / notes
 - `WINAPI` is a no-op at 64-bit (shims run as native 64-bit); arg-count only
   drives the **32-bit thunk's `RET n*4`**. So GT-argc must be the count of
