@@ -239,6 +239,25 @@ bool hwbp_dispatch(struct interrupt_frame *frame)
                 tmp[n] = 0; serial_puts(tmp);
                 serial_puts("\"");
             }
+            /* At the StaticConstructObject ClassConstructor call (Core.dll
+             * 0x1015D40C), EDI=the UClass. Dump the ctor field region
+             * [EDI+0x4D8..0x4EC] + the class Name (FName idx at EDI+0x20) so
+             * we can see why [EDI+0x4E4] (ClassConstructor) is garbage (0x09)
+             * for the WindowsClient class vs valid for working classes. */
+            if (dr_get_addr(i) == 0x1015D40CULL) {
+                uint32_t cls = (uint32_t)frame->rdi;
+                if (cls >= 0x01000000 && cls < 0x60000000) {
+                    serial_puts(" CLASS@0x"); serial_puthex(cls, 8);
+                    serial_puts(" Name=");
+                    serial_putdec((uint64_t)*(volatile uint32_t *)(uintptr_t)(cls + 0x20));
+                    serial_puts(" ctorfld[+4D8..4EC]=");
+                    for (uint32_t off = 0x4D8; off <= 0x4EC; off += 4) {
+                        serial_puts("0x");
+                        serial_puthex((uint64_t)*(volatile uint32_t *)(uintptr_t)(cls + off), 8);
+                        serial_puts(" ");
+                    }
+                }
+            }
             serial_puts("\n");
         }
 
