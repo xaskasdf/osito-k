@@ -2004,7 +2004,16 @@ static int16_t futex_free_head = -1;            /* free slot list */
 
 static inline uint32_t futex_hash(uint64_t addr)
 {
-    return ((uint32_t)(addr >> 2) * 0x9e370001UL) >> (32 - FUTEX_HASH_BITS);
+    /* 32-bit Fibonacci hash → top FUTEX_HASH_BITS bits, MASKED to a valid
+     * bucket index. BUG (pre-existing): the multiplier was `0x9e370001UL`
+     * (unsigned LONG = 64-bit), so the product was 64-bit and `>> 27`
+     * yielded bits 27..58 — a value far outside [0, FUTEX_HASH_SIZE) — and
+     * `futex_buckets[bucket]` then read wildly out of bounds (#PF, observed
+     * CR2 = &futex_buckets + 0xA8763EA2*2 when cc1's malloc-lock contention
+     * exercised the futex path). Force a 32-bit multiply (`0x9e370001u`) and
+     * mask to the bucket count so the index is always valid. */
+    uint32_t h = (uint32_t)(addr >> 2) * 0x9e370001u;
+    return (h >> (32 - FUTEX_HASH_BITS)) & (FUTEX_HASH_SIZE - 1);
 }
 
 static void futex_init(void)
