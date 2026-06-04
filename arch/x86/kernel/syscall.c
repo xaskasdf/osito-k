@@ -1023,6 +1023,116 @@ static int vfs_alloc_fd(void)
     return -1;
 }
 
+/* ── Path normalization for the flat OsitoFS namespace ──────────────
+ *
+ * cc1 / gcc bake HOST absolute include paths into the binary and emit
+ * RELATIVE paths containing '.'/'..' (e.g. "usr/bin/../lib/gcc/.../include").
+ * OsitoFS is a FLAT namespace (no directories, no '.'/'..' resolution),
+ * so these paths never match real entries like "usr/include/stdc-predef.h".
+ *
+ * This helper canonicalizes a path into the flat OsitoFS name:
+ *   1. Strip a known HOST sysroot / system prefix (small table).
+ *   2. Strip the single leading '/'.
+ *   3. Resolve '.' (drop) and '..' (pop one component) lexically.
+ *
+ * Result is written into out[] (NUL-terminated). Returns true if the
+ * normalized path differs from a trivial leading-'/'-strip (i.e. some
+ * actual rewriting happened) — callers can fall back to the raw path
+ * otherwise. We always populate out[] with the canonical form.
+ */
+static const char *const k_host_prefixes[] = {
+    /* User's gcc toolchain sysroot baked into the cc1 binary. */
+    "/Users/pc/ok-ported/toolchain/sysroot/",
+    /* Generic system prefixes that map 1:1 onto flat 'usr/...' entries. */
+    "/usr/",
+    NULL,
+};
+
+static bool path_normalize_flat(const char *path, char *out, int out_sz)
+{
+    if (!path || !out || out_sz <= 1) return false;
+
+    const char *p = path;
+    bool rewritten = false;
+
+    /* 1. Strip a known HOST sysroot / system prefix. The "/usr/" entry
+     *    maps an absolute "/usr/include/..." onto flat "usr/include/..."
+     *    by leaving the trailing "usr/" in place (we strip only the
+     *    leading slash, see below). To keep both behaviors simple we
+     *    match the full prefix then re-prepend the tail. */
+    for (int i = 0; k_host_prefixes[i]; i++) {
+        const char *pre = k_host_prefixes[i];
+        /* "/usr/" is special: we want the "usr/" to survive, so only the
+         *  sysroot-style prefixes (which end the path at a real root) get
+         *  fully stripped. Detect by whether the prefix is exactly the
+         *  generic "/usr/" guard. */
+        bool keep_tail_usr = (pre[0] == '/' && pre[1] == 'u' && pre[2] == 's' &&
+                              pre[3] == 'r' && pre[4] == '/' && pre[5] == '\0');
+        if (str_startswith(p, pre)) {
+            if (keep_tail_usr) {
+                /* "/usr/x" → leave "/usr/x"; leading '/' stripped below
+                 *  yields "usr/x" which matches the flat entry. */
+                /* no-op: fall through to leading-slash strip */
+            } else {
+                p += (int)strlen(pre);   /* drop the whole sysroot prefix */
+                rewritten = true;
+            }
+            break;
+        }
+    }
+
+    /* 2. Strip the single leading '/'. */
+    if (*p == '/') { p++; rewritten = true; }
+
+    /* 3. Lexically resolve '.' and '..' components into out[].
+     *    We build a stack of component start offsets so '..' can pop. */
+    int comp_off[64];   /* start offset (in out[]) of each kept component */
+    int ncomp = 0;
+    int w = 0;          /* write cursor in out[] */
+    out[0] = '\0';
+
+    while (*p) {
+        /* Skip redundant separators. */
+        while (*p == '/') { p++; rewritten = true; }
+        if (!*p) break;
+
+        /* Find component bounds. */
+        const char *start = p;
+        while (*p && *p != '/') p++;
+        int len = (int)(p - start);
+
+        if (len == 1 && start[0] == '.') {
+            /* '.' → drop */
+            rewritten = true;
+            continue;
+        }
+        if (len == 2 && start[0] == '.' && start[1] == '.') {
+            /* '..' → pop last kept component (if any) */
+            rewritten = true;
+            if (ncomp > 0) {
+                ncomp--;
+                w = comp_off[ncomp];
+                out[w] = '\0';
+            }
+            continue;
+        }
+
+        /* Normal component: append, prefixing with '/' if not first. */
+        if (ncomp >= 64) return false;            /* too many components */
+        if (w > 0) {
+            if (w + 1 >= out_sz) return false;
+            out[w++] = '/';
+        }
+        comp_off[ncomp++] = w;
+        if (w + len >= out_sz) return false;       /* overflow guard */
+        for (int i = 0; i < len; i++) out[w++] = start[i];
+        out[w] = '\0';
+    }
+
+    out[w] = '\0';
+    return rewritten;
+}
+
 static int64_t sys_open(uint64_t path_addr, uint64_t flags, uint64_t mode)
 {
     (void)mode;
@@ -1094,16 +1204,27 @@ static int64_t sys_open(uint64_t path_addr, uint64_t flags, uint64_t mode)
     fd_entry_t *f = &fd_table[newfd];
     memset(f, 0, sizeof(*f));
 
-    if (!vfs_find(path, VFS_MODE_POSIX, &f->node)) {
+    /* Normalize host/relative paths into the flat OsitoFS namespace.
+     * cc1 opens e.g. "usr/bin/../lib/gcc/.../include" and the host-absolute
+     * "/Users/pc/ok-ported/toolchain/sysroot/usr/include/stdc-predef.h";
+     * both must collapse onto flat entries like "usr/include/stdc-predef.h".
+     * Only the regular-file branch is affected — /dev/ and /proc/ above are
+     * checked first and return before reaching here. */
+    char norm_path[256];
+    const char *lookup = path;
+    if (path_normalize_flat(path, norm_path, sizeof(norm_path)) && norm_path[0])
+        lookup = norm_path;
+
+    if (!vfs_find(lookup, VFS_MODE_POSIX, &f->node)) {
         if (flags & O_CREAT) {
-            void *f2 = osfs2_create(path, 0);
+            void *f2 = osfs2_create(lookup, 0);
             if (f2) {
                 f->node.fs_version = 2;
                 f->node.data = f2;
                 f->node.size = 0;
             } else return -ENOENT;
         } else {
-            if (!vfs_find(path, VFS_MODE_WIN32, &f->node)) return -ENOENT;
+            if (!vfs_find(lookup, VFS_MODE_WIN32, &f->node)) return -ENOENT;
         }
     }
 
@@ -1113,7 +1234,7 @@ static int64_t sys_open(uint64_t path_addr, uint64_t flags, uint64_t mode)
      * they corrupt their own .text segment on disk. */
     if ((flags & O_ACCMODE) != O_RDONLY) {
         extern bool proc_is_executing(const char *name);
-        if (proc_is_executing(path)) {
+        if (proc_is_executing(lookup)) {
             memset(f, 0, sizeof(*f));
             return -26; /* ETXTBSY */
         }
