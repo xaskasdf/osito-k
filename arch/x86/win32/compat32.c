@@ -522,6 +522,73 @@ static uint8_t guess_num_args(const char *name)
         { "AddAtomA",             1 }, { "FindAtomW",            1 },
         { "FindAtomA",            1 }, { "DeleteAtom",           1 },
         { "GlobalGetAtomNameW",   3 }, { "GlobalGetAtomNameA",   3 },
+        /* ── ARGCOUNT systematic fix (Jun 3): stdcall Win32 APIs whose real
+         * arg count != the default of 4. Wrong counts over/under-clean the
+         * stack → caller callee-saved register / pool corruption (same class
+         * as the GlobalAddAtomW bug). cdecl/CRT funcs are unaffected (caller
+         * cleans) so they're omitted. */
+        /* kernel32 */
+        { "GetVersion",           0 }, { "GetSystemTime",        1 },
+        { "SetLocalTime",         1 }, { "GlobalMemoryStatus",   1 },
+        { "InterlockedIncrement", 1 }, { "InterlockedDecrement", 1 },
+        { "SetErrorMode",         1 }, { "HeapDestroy",          1 },
+        { "HeapCompact",          2 }, { "HeapValidate",         3 },
+        { "HeapWalk",             2 }, { "GetFileInformationByHandle", 2 },
+        { "DuplicateHandle",      7 }, { "GetExitCodeProcess",   2 },
+        { "TerminateProcess",     2 }, { "SetEnvironmentVariableA", 2 },
+        { "SetEnvironmentVariableW", 2 }, { "FreeEnvironmentStringsA", 1 },
+        { "GetEnvironmentStrings", 0 }, { "GetProcessWorkingSetSize", 3 },
+        { "RemoveDirectoryA",     1 }, { "RemoveDirectoryW",     1 },
+        { "FileTimeToSystemTime", 2 }, { "FileTimeToLocalFileTime", 2 },
+        { "LocalFileTimeToFileTime", 2 }, { "SystemTimeToFileTime", 2 },
+        { "SetConsoleCtrlHandler", 2 }, { "GetNumberOfConsoleInputEvents", 2 },
+        { "PeekNamedPipe",        6 }, { "PeekConsoleInputA",    5 },
+        { "ReadConsoleA",         5 }, { "ReadConsoleInputA",    5 },
+        { "GetStringTypeA",       5 }, { "LCMapStringA",         6 },
+        { "IsValidLocale",        3 }, { "EnumSystemLocalesA",   2 },
+        { "Beep",                 2 }, { "CreateProcessA",       10 },
+        { "CreateProcessW",       10 },
+        /* user32 */
+        { "CheckMenuItem",        3 }, { "CloseClipboard",       0 },
+        { "CreateDialogParamA",   5 }, { "CreateDialogParamW",   5 },
+        { "DrawFocusRect",        2 }, { "DrawTextA",            5 },
+        { "EmptyClipboard",       0 }, { "EndDialog",            2 },
+        { "GetClipboardData",     1 }, { "GetDlgItem",           2 },
+        { "GetMenu",              1 }, { "GetMenuItemCount",     1 },
+        { "GetMenuState",         2 }, { "GetMessageTime",       0 },
+        { "GetSysColor",          1 }, { "GetWindowLongA",       2 },
+        { "GetWindowThreadProcessId", 2 }, { "IsWindowVisible",  1 },
+        { "LoadImageA",           6 }, { "LoadMenuA",            2 },
+        { "LoadMenuW",            2 }, { "OpenClipboard",        1 },
+        { "SetClipboardData",     2 }, { "SetMenu",              2 },
+        { "SetParent",            2 }, { "SetWindowLongA",       3 },
+        { "TrackPopupMenu",       7 }, { "UnregisterHotKey",     2 },
+        { "ValidateRect",         2 }, { "GetSubMenu",           2 },
+        { "ChooseColorA",         1 }, { "DrawTextExA",          5 },
+        { "DrawTextExW",          5 },
+        /* gdi32 */
+        { "CreateFontA",          14 }, { "CreateFontW",         14 },
+        { "CreatePen",            3 }, { "ExtTextOutA",          8 },
+        { "GetPixel",             3 }, { "LineTo",               2 },
+        { "PatBlt",               6 }, { "SetBkColor",           2 },
+        { "SetBkMode",            2 }, { "SetTextColor",         2 },
+        { "TextOutW",             5 },
+        /* winmm / mci / joy / aux / mixer / wave */
+        { "auxGetDevCapsA",       3 }, { "auxGetNumDevs",        0 },
+        { "auxSetVolume",         2 }, { "joyGetDevCapsA",       3 },
+        { "joyGetNumDevs",        0 }, { "joyGetPosEx",          2 },
+        { "mixerGetDevCapsA",     3 }, { "mixerGetNumDevs",      0 },
+        { "mixerGetLineInfoA",    3 }, { "mixerGetControlDetailsA", 3 },
+        { "mixerSetControlDetails", 3 }, { "waveOutClose",       1 },
+        { "waveOutGetDevCapsA",   3 }, { "waveOutGetPosition",   3 },
+        { "waveOutOpen",          7 }, { "waveOutPrepareHeader", 3 },
+        { "waveOutReset",         1 }, { "waveOutUnprepareHeader", 3 },
+        { "waveOutWrite",         3 }, { "mciSendCommandA",      4 },
+        /* ole32 / shell32 */
+        { "CoCreateGuid",         1 }, { "CoCreateInstance",     5 },
+        { "CoInitialize",         1 }, { "CoUninitialize",       0 },
+        { "ShellExecuteA",        6 }, { "ShellExecuteW",        6 },
+        { "Shell_NotifyIconA",    2 },
         { "HeapReAlloc",          4 }, { "HeapSize",             3 },
         { "RtlUnwind",            4 },
         { "CreateThread",         6 }, { "ExitThread",           1 },
@@ -764,6 +831,13 @@ static uint8_t guess_num_args(const char *name)
      * failures caused by 0-arg defaults for stdcall functions that need cleanup.
      * The critical missing entries (timeGetTime=0, IsWindow=1, etc.) are now
      * all explicitly listed above. */
+    /* ARGCOUNT-AUDIT: log functions falling back to the default of 4 so we can
+     * spot the next GlobalAddAtomW-style stack-imbalance bug (a stdcall API
+     * whose real arg count != 4 over/under-cleans the stack → caller
+     * callee-saved register / pool corruption). Logged once per import patch. */
+    serial_puts("[ARGCOUNT-DEFAULT4] ");
+    serial_puts(name);
+    serial_puts("\n");
     return 4;
 }
 
