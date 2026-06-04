@@ -509,6 +509,13 @@ osfs2_file_t *osfs2_find(const char *name)
 osfs2_file_t *osfs2_find_ci(const char *name)
 {
     if (!mounted || !name) return NULL;
+    /* OsitoFS v2 is a FLAT filesystem (keys are bare filenames). Win32 callers
+     * (e.g. UT99's GetPackageLinker at LoadMap) may pass a directory-prefixed
+     * path like "Maps\Entry.unr" or "System\Entry.unr"; reduce to the basename
+     * so the flat lookup still matches. (resolve_win32 only strips \??\ and C:\,
+     * not directory components.) No-op for already-bare names. */
+    for (const char *p = name; *p; p++)
+        if (*p == '\\' || *p == '/') name = p + 1;
     uint32_t slot = osfs2_name_hash_fn(name);
     while (name_hash[slot] != OSFS2_HASH_EMPTY) {
         uint16_t idx = name_hash[slot];
