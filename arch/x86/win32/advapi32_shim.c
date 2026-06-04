@@ -9,6 +9,7 @@
  */
 
 #include "advapi32_shim.h"
+#include "win32_abi.h"
 
 extern void serial_puts(const char *s);
 extern void serial_puthex(uint64_t val, int digits);
@@ -614,25 +615,30 @@ BOOL WINAPI GetUserNameW(PWSTR lpBuffer, DWORD *pcbBuffer)
 
 /* ── Export table ──────────────────────────────────────────── */
 
-typedef struct { const char *name; PVOID func; } SHIM_EXPORT;
+typedef struct { const char *name; PVOID func; uint8_t argc; uint8_t cc; } SHIM_EXPORT;
 
 static const SHIM_EXPORT advapi32_exports[] = {
-    { "RegOpenKeyExA",      (PVOID)RegOpenKeyExA },
-    { "RegCreateKeyExA",    (PVOID)RegCreateKeyExA },
-    { "RegQueryValueExA",   (PVOID)RegQueryValueExA },
-    { "RegSetValueExA",     (PVOID)RegSetValueExA },
-    { "RegCloseKey",        (PVOID)RegCloseKey },
-    { "RegDeleteValueA",    (PVOID)RegDeleteValueA },
-    { "RegEnumKeyExA",      (PVOID)RegEnumKeyExA },
-    { "RegEnumValueA",      (PVOID)RegEnumValueA },
-    { "RegOpenKeyExW",      (PVOID)RegOpenKeyExW },
-    { "RegQueryValueExW",   (PVOID)RegQueryValueExW },
-    { "RegCreateKeyExW",    (PVOID)RegCreateKeyExW },
-    { "RegSetValueExW",     (PVOID)RegSetValueExW },
-    { "GetUserNameA",       (PVOID)GetUserNameA },
-    { "GetUserNameW",       (PVOID)GetUserNameW },
-    { NULL, NULL }
+    { "RegOpenKeyExA",      (PVOID)RegOpenKeyExA,    5, CC_STDCALL },
+    { "RegCreateKeyExA",    (PVOID)RegCreateKeyExA,  9, CC_STDCALL },
+    { "RegQueryValueExA",   (PVOID)RegQueryValueExA, 6, CC_STDCALL },
+    { "RegSetValueExA",     (PVOID)RegSetValueExA,   6, CC_STDCALL },
+    { "RegCloseKey",        (PVOID)RegCloseKey,      1, CC_STDCALL },
+    { "RegDeleteValueA",    (PVOID)RegDeleteValueA,  2, CC_STDCALL },
+    { "RegEnumKeyExA",      (PVOID)RegEnumKeyExA,    8, CC_STDCALL },
+    { "RegEnumValueA",      (PVOID)RegEnumValueA,    8, CC_STDCALL },
+    { "RegOpenKeyExW",      (PVOID)RegOpenKeyExW,    5, CC_STDCALL },
+    { "RegQueryValueExW",   (PVOID)RegQueryValueExW, 6, CC_STDCALL },
+    { "RegCreateKeyExW",    (PVOID)RegCreateKeyExW,  9, CC_STDCALL },
+    { "RegSetValueExW",     (PVOID)RegSetValueExW,   6, CC_STDCALL },
+    { "GetUserNameA",       (PVOID)GetUserNameA,     2, CC_STDCALL },
+    { "GetUserNameW",       (PVOID)GetUserNameW,     2, CC_STDCALL },
+    { NULL, NULL, 0, CC_STDCALL }
 };
+
+const WIN32_EXPORT *advapi32_abi_table(int *count) {
+    *count = (int)(sizeof(advapi32_exports)/sizeof(advapi32_exports[0]));
+    return (const WIN32_EXPORT *)advapi32_exports;
+}
 
 static int advapi_strcmp(const char *a, const char *b)
 {

@@ -4,6 +4,7 @@
  */
 
 #include "ole32_shim.h"
+#include "win32_abi.h"
 
 extern void serial_puts(const char *s);
 
@@ -89,21 +90,26 @@ int WINAPI shim_StringFromGUID2(PVOID guid, PVOID str, int max)
 
 /* ── Export table ──────────────────────────────────────────── */
 
-typedef struct { const char *name; PVOID func; } SHIM_EXPORT;
+typedef struct { const char *name; PVOID func; uint8_t argc; uint8_t cc; } SHIM_EXPORT;
 
 static const SHIM_EXPORT ole32_exports[] = {
-    { "CoInitialize",      (PVOID)shim_CoInitialize },
-    { "CoInitializeEx",    (PVOID)shim_CoInitializeEx },
-    { "CoUninitialize",    (PVOID)shim_CoUninitialize },
-    { "CoCreateInstance",  (PVOID)shim_CoCreateInstance },
-    { "CoTaskMemAlloc",    (PVOID)shim_CoTaskMemAlloc },
-    { "CoTaskMemFree",     (PVOID)shim_CoTaskMemFree },
-    { "OleInitialize",     (PVOID)shim_OleInitialize },
-    { "OleUninitialize",   (PVOID)shim_OleUninitialize },
-    { "CoCreateGuid",      (PVOID)shim_CoCreateGuid },
-    { "StringFromGUID2",   (PVOID)shim_StringFromGUID2 },
-    { NULL, NULL }
+    { "CoInitialize",      (PVOID)shim_CoInitialize,     1, CC_STDCALL },
+    { "CoInitializeEx",    (PVOID)shim_CoInitializeEx,   2, CC_STDCALL },
+    { "CoUninitialize",    (PVOID)shim_CoUninitialize,   0, CC_STDCALL },
+    { "CoCreateInstance",  (PVOID)shim_CoCreateInstance, 5, CC_STDCALL },
+    { "CoTaskMemAlloc",    (PVOID)shim_CoTaskMemAlloc,   1, CC_STDCALL },
+    { "CoTaskMemFree",     (PVOID)shim_CoTaskMemFree,    1, CC_STDCALL },
+    { "OleInitialize",     (PVOID)shim_OleInitialize,    1, CC_STDCALL },
+    { "OleUninitialize",   (PVOID)shim_OleUninitialize,  0, CC_STDCALL },
+    { "CoCreateGuid",      (PVOID)shim_CoCreateGuid,     1, CC_STDCALL },
+    { "StringFromGUID2",   (PVOID)shim_StringFromGUID2,  3, CC_STDCALL },
+    { NULL, NULL, 0, CC_STDCALL }
 };
+
+const WIN32_EXPORT *ole32_abi_table(int *count) {
+    *count = (int)(sizeof(ole32_exports)/sizeof(ole32_exports[0]));
+    return (const WIN32_EXPORT *)ole32_exports;
+}
 
 static int ole_strcmp(const char *a, const char *b)
 {

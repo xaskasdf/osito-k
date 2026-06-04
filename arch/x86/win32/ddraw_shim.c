@@ -12,6 +12,7 @@
  */
 
 #include "ddraw_shim.h"
+#include "win32_abi.h"
 
 extern uint32_t compat32_callback_args(uint32_t func_addr, int nargs, const uint32_t *args);
 
@@ -1510,14 +1511,19 @@ HRESULT WINAPI DirectDrawEnumerateA(LPDDENUMCALLBACKA lpCallback, PVOID lpContex
 
 /* ── Export table ──────────────────────────────────────────── */
 
-typedef struct { const char *name; PVOID func; } SHIM_EXPORT;
+typedef struct { const char *name; PVOID func; uint8_t argc; uint8_t cc; } SHIM_EXPORT;
 
 static const SHIM_EXPORT ddraw_exports[] = {
-    { "DirectDrawCreate",      (PVOID)DirectDrawCreate },
-    { "DirectDrawCreateEx",    (PVOID)DirectDrawCreateEx },
-    { "DirectDrawEnumerateA",  (PVOID)DirectDrawEnumerateA },
-    { NULL, NULL }
+    { "DirectDrawCreate",      (PVOID)DirectDrawCreate,     3, CC_STDCALL },
+    { "DirectDrawCreateEx",    (PVOID)DirectDrawCreateEx,   4, CC_STDCALL },
+    { "DirectDrawEnumerateA",  (PVOID)DirectDrawEnumerateA, 2, CC_STDCALL },
+    { NULL, NULL, 0, CC_STDCALL }
 };
+
+const WIN32_EXPORT *ddraw_abi_table(int *count) {
+    *count = (int)(sizeof(ddraw_exports)/sizeof(ddraw_exports[0]));
+    return (const WIN32_EXPORT *)ddraw_exports;
+}
 
 static int dd_strcmp(const char *a, const char *b)
 {

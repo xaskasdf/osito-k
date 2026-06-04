@@ -29,6 +29,7 @@ uint32_t g_exe_image_base;
 #include "comctl32_shim.h"
 #include "comdlg32_shim.h"
 #include "compat32.h"
+#include "win32_abi.h"
 #include "handle.h"
 
 /* ── External kernel interfaces ─────────────────────────────── */
@@ -434,6 +435,42 @@ int winexec_run(const uint8_t *file_data, uint64_t file_size)
     dll_register_shim("ole32.dll",   ole32_resolve);
     dll_register_shim("comctl32.dll", comctl32_resolve);
     dll_register_shim("comdlg32.dll", comdlg32_resolve);
+
+    /* Phase 1: register each shim's co-located ABI table (argc + callconv
+     * derived from the prototype) so the IAT thunk's RET N comes from the
+     * real signature, not the name-keyed guess_num_args default-4. */
+    {
+        extern const WIN32_EXPORT *ntdll_abi_table(int *);
+        extern const WIN32_EXPORT *kernel32_abi_table(int *);
+        extern const WIN32_EXPORT *msvcrt_abi_table(int *);
+        extern const WIN32_EXPORT *advapi32_abi_table(int *);
+        extern const WIN32_EXPORT *user32_abi_table(int *);
+        extern const WIN32_EXPORT *gdi32_abi_table(int *);
+        extern const WIN32_EXPORT *ddraw_abi_table(int *);
+        extern const WIN32_EXPORT *dsound_abi_table(int *);
+        extern const WIN32_EXPORT *wsock32_abi_table(int *);
+        extern const WIN32_EXPORT *shell32_abi_table(int *);
+        extern const WIN32_EXPORT *winmm_abi_table(int *);
+        extern const WIN32_EXPORT *ole32_abi_table(int *);
+        extern const WIN32_EXPORT *comctl32_abi_table(int *);
+        extern const WIN32_EXPORT *comdlg32_abi_table(int *);
+        int n;
+        win32_abi_register("ntdll.dll",    ntdll_abi_table(&n),    n);
+        win32_abi_register("kernel32.dll", kernel32_abi_table(&n), n);
+        win32_abi_register("msvcrt.dll",   msvcrt_abi_table(&n),   n);
+        win32_abi_register("advapi32.dll", advapi32_abi_table(&n), n);
+        win32_abi_register("user32.dll",   user32_abi_table(&n),   n);
+        win32_abi_register("gdi32.dll",    gdi32_abi_table(&n),    n);
+        win32_abi_register("ddraw.dll",    ddraw_abi_table(&n),    n);
+        win32_abi_register("dsound.dll",   dsound_abi_table(&n),   n);
+        win32_abi_register("wsock32.dll",  wsock32_abi_table(&n),  n);
+        win32_abi_register("ws2_32.dll",   wsock32_abi_table(&n),  n);
+        win32_abi_register("shell32.dll",  shell32_abi_table(&n),  n);
+        win32_abi_register("winmm.dll",    winmm_abi_table(&n),    n);
+        win32_abi_register("ole32.dll",    ole32_abi_table(&n),    n);
+        win32_abi_register("comctl32.dll", comctl32_abi_table(&n), n);
+        win32_abi_register("comdlg32.dll", comdlg32_abi_table(&n), n);
+    }
 
     /*
      * Initialize compat32 thunk pool BEFORE pe_load(), because pe_load()

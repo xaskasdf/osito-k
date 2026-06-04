@@ -20,6 +20,7 @@
 #include "compat32.h"
 #include "dllloader.h"
 #include "wdbg.h"
+#include "win32_abi.h"
 
 extern void serial_puts(const char *s);
 extern void serial_puthex(uint64_t val, int digits);
@@ -548,6 +549,24 @@ static uint8_t guess_num_args(const char *name)
         { "IsValidLocale",        3 }, { "EnumSystemLocalesA",   2 },
         { "Beep",                 2 }, { "CreateProcessA",       10 },
         { "CreateProcessW",       10 },
+        /* ── ABI inventory (Jun 4): kernel32 stdcall fns verified absent from
+         * this table → were silently getting default-4. Group (A) = GT<4
+         * OVER-cleaners (RET 16 over-pops the caller stack → corrupts callee-
+         * saved EDI/ESI/EBX = the exact GlobalAddAtomW crash class). Group (B) =
+         * GT>4 under-cleaners (stale args left on stack). Ground truth from the
+         * shim prototypes; see docs/win32-layer-correctness.md §3.9. */
+        /* (A) over-cleaners */
+        { "lstrlenA",             1 }, { "lstrlenW",             1 },
+        { "GetSystemTimeAsFileTime", 1 }, { "IsDebuggerPresent", 0 },
+        { "GetTickCount64",       0 }, { "GetEnvironmentStringsA", 0 },
+        { "PulseEvent",           1 }, { "TryEnterCriticalSection", 1 },
+        { "UnmapViewOfFile",      1 },
+        /* (B) under-cleaners */
+        { "CreateFileMappingA",   6 }, { "CreateFileMappingW",   6 },
+        { "MapViewOfFile",        5 }, { "VirtualProtect",       4 },
+        { "InterlockedExchange",  2 }, { "InterlockedCompareExchange", 3 },
+        { "LoadLibraryExA",       3 }, { "LoadLibraryExW",       3 },
+        { "InitializeCriticalSectionAndSpinCount", 2 },
         /* user32 */
         { "CheckMenuItem",        3 }, { "CloseClipboard",       0 },
         { "CreateDialogParamA",   5 }, { "CreateDialogParamW",   5 },
@@ -1059,9 +1078,19 @@ NTSTATUS compat32_patch_iat(PE_IMAGE_INFO *info)
                         serial_puts("\n");
                     }
                 } else {
-                    /* Function import — create INT 0x2E thunk */
+                    /* Function import — create INT 0x2E thunk.
+                     * Phase 1: prefer the co-located ABI descriptor (argc + cc
+                     * from the shim's own export table / MSVC demangle). The
+                     * name-keyed guess_num_args (with its default-4) is only a
+                     * fallback until every shim table is migrated. */
                     uint64_t target64 = (uint64_t)(ULONG_PTR)resolved;
-                    uint8_t nargs = func_name ? guess_num_args(func_name) : 4;
+                    uint8_t nargs, abi_cc;
+                    if (func_name &&
+                        win32_abi_lookup(dll_name, func_name, &nargs, &abi_cc)) {
+                        cc = abi_cc;  /* co-located convention wins */
+                    } else {
+                        nargs = func_name ? guess_num_args(func_name) : 4;
+                    }
                     uint32_t thunk_addr = compat32_make_thunk_ex(target64, func_name, nargs, cc);
                     if (thunk_addr) {
                         iat_entry->u1.Function = thunk_addr;

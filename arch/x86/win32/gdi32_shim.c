@@ -6,6 +6,7 @@
  */
 
 #include "gdi32_shim.h"
+#include "win32_abi.h"
 
 extern void serial_puts(const char *s);
 extern void *kmalloc(uint64_t size);
@@ -667,49 +668,55 @@ static DWORD WINAPI GetPixel_stub(HDC hdc, int x, int y)
 
 /* ── Export table ──────────────────────────────────────────────── */
 
-typedef struct { const char *name; PVOID func; } SHIM_EXPORT;
+typedef struct { const char *name; PVOID func; uint8_t argc; uint8_t cc; } SHIM_EXPORT;
 
 static const SHIM_EXPORT gdi32_exports[] = {
-    { "GetDeviceCaps",       (PVOID)GetDeviceCaps },
-    { "CreateDCA",           (PVOID)CreateDCA },
-    { "DeleteDC",            (PVOID)DeleteDC },
-    { "ChoosePixelFormat",   (PVOID)ChoosePixelFormat },
-    { "SetPixelFormat",      (PVOID)SetPixelFormat },
-    { "GetPixelFormat",      (PVOID)GetPixelFormat },
-    { "DescribePixelFormat", (PVOID)DescribePixelFormat },
-    { "SwapBuffers",         (PVOID)SwapBuffers },
-    { "SelectObject",        (PVOID)SelectObject },
-    { "DeleteObject",        (PVOID)DeleteObject },
-    { "GetObjectA",          (PVOID)GetObjectA },
+    { "GetDeviceCaps",       (PVOID)GetDeviceCaps, 2, CC_STDCALL },
+    { "CreateDCA",           (PVOID)CreateDCA, 4, CC_STDCALL },
+    { "DeleteDC",            (PVOID)DeleteDC, 1, CC_STDCALL },
+    { "ChoosePixelFormat",   (PVOID)ChoosePixelFormat, 2, CC_STDCALL },
+    { "SetPixelFormat",      (PVOID)SetPixelFormat, 3, CC_STDCALL },
+    { "GetPixelFormat",      (PVOID)GetPixelFormat, 1, CC_STDCALL },
+    { "DescribePixelFormat", (PVOID)DescribePixelFormat, 4, CC_STDCALL },
+    { "SwapBuffers",         (PVOID)SwapBuffers, 1, CC_STDCALL },
+    { "SelectObject",        (PVOID)SelectObject, 2, CC_STDCALL },
+    { "DeleteObject",        (PVOID)DeleteObject, 1, CC_STDCALL },
+    { "GetObjectA",          (PVOID)GetObjectA, 3, CC_STDCALL },
     /* GDI object creation */
-    { "CreateCompatibleDC",       (PVOID)CreateCompatibleDC },
-    { "CreateCompatibleBitmap",   (PVOID)CreateCompatibleBitmap },
-    { "CreateSolidBrush",         (PVOID)CreateSolidBrush },
-    { "CreatePatternBrush",       (PVOID)CreatePatternBrush },
-    { "CreatePen",                (PVOID)CreatePen },
-    { "CreateBitmap",             (PVOID)CreateBitmap },
-    { "CreateDIBitmap",           (PVOID)CreateDIBitmap },
-    { "GetStockObject",           (PVOID)GetStockObject },
+    { "CreateCompatibleDC",       (PVOID)CreateCompatibleDC, 1, CC_STDCALL },
+    { "CreateCompatibleBitmap",   (PVOID)CreateCompatibleBitmap, 3, CC_STDCALL },
+    { "CreateSolidBrush",         (PVOID)CreateSolidBrush, 1, CC_STDCALL },
+    { "CreatePatternBrush",       (PVOID)CreatePatternBrush, 1, CC_STDCALL },
+    { "CreatePen",                (PVOID)CreatePen, 3, CC_STDCALL },
+    { "CreateBitmap",             (PVOID)CreateBitmap, 5, CC_STDCALL },
+    { "CreateDIBitmap",           (PVOID)CreateDIBitmap, 6, CC_STDCALL },
+    { "GetStockObject",           (PVOID)GetStockObject, 1, CC_STDCALL },
     /* Drawing */
-    { "BitBlt",                   (PVOID)BitBlt },
-    { "PatBlt",                   (PVOID)PatBlt },
-    { "MoveToEx",                 (PVOID)MoveToEx },
-    { "LineTo",                   (PVOID)LineTo },
+    { "BitBlt",                   (PVOID)BitBlt, 9, CC_STDCALL },
+    { "PatBlt",                   (PVOID)PatBlt, 6, CC_STDCALL },
+    { "MoveToEx",                 (PVOID)MoveToEx, 4, CC_STDCALL },
+    { "LineTo",                   (PVOID)LineTo, 3, CC_STDCALL },
     /* Text */
-    { "SetTextColor",             (PVOID)SetTextColor },
-    { "SetBkColor",               (PVOID)SetBkColor },
-    { "SetBkMode",                (PVOID)SetBkMode },
-    { "TextOutW",                 (PVOID)TextOutW },
-    { "ExtTextOutA",              (PVOID)ExtTextOutA },
-    { "GetTextExtentPoint32A",    (PVOID)GetTextExtentPoint32A },
-    { "GetTextExtentPoint32W",    (PVOID)GetTextExtentPoint32W },
+    { "SetTextColor",             (PVOID)SetTextColor, 2, CC_STDCALL },
+    { "SetBkColor",               (PVOID)SetBkColor, 2, CC_STDCALL },
+    { "SetBkMode",                (PVOID)SetBkMode, 2, CC_STDCALL },
+    { "TextOutW",                 (PVOID)TextOutW, 5, CC_STDCALL },
+    { "ExtTextOutA",              (PVOID)ExtTextOutA, 8, CC_STDCALL },
+    { "GetTextExtentPoint32A",    (PVOID)GetTextExtentPoint32A, 4, CC_STDCALL },
+    { "GetTextExtentPoint32W",    (PVOID)GetTextExtentPoint32W, 4, CC_STDCALL },
     /* Additional stubs */
-    { "CreateFontA",              (PVOID)CreateFontA_stub },
-    { "CreateFontW",              (PVOID)CreateFontW_stub },
-    { "CreateDIBSection",         (PVOID)CreateDIBSection_stub },
-    { "GetPixel",                 (PVOID)GetPixel_stub },
-    { NULL, NULL }
+    { "CreateFontA",              (PVOID)CreateFontA_stub, 14, CC_STDCALL },
+    { "CreateFontW",              (PVOID)CreateFontW_stub, 14, CC_STDCALL },
+    { "CreateDIBSection",         (PVOID)CreateDIBSection_stub, 6, CC_STDCALL },
+    { "GetPixel",                 (PVOID)GetPixel_stub, 3, CC_STDCALL },
+    { NULL, NULL, 0, CC_STDCALL }
 };
+
+const WIN32_EXPORT *gdi32_abi_table(int *count)
+{
+    *count = (int)(sizeof(gdi32_exports) / sizeof(gdi32_exports[0]));
+    return (const WIN32_EXPORT *)gdi32_exports;
+}
 
 static int gdi_strcmp(const char *a, const char *b)
 {

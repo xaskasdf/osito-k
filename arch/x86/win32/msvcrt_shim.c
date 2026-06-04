@@ -9,6 +9,7 @@
 #include "kernel32_shim.h"
 #include "ntdll_shim.h"
 #include "compat32.h"
+#include "win32_abi.h"
 
 #ifdef TEST_HARNESS
 #include <math.h>
@@ -4024,207 +4025,214 @@ uint32_t crt_get_base_seh_thunk(void) { return g_base_seh_thunk; }
 typedef struct {
     const char *name;
     PVOID       func;
+    uint8_t     argc;
+    uint8_t     cc;
 } MSVCRT_EXPORT;
 
 static const MSVCRT_EXPORT msvcrt_exports[] = {
     /* CRT init */
-    { "_initterm",           (PVOID)_initterm },
-    { "_initterm_e",         (PVOID)_initterm_e },
-    { "__getmainargs",       (PVOID)__getmainargs },
-    { "__wgetmainargs",      (PVOID)__wgetmainargs },
-    { "__set_app_type",      (PVOID)__set_app_type },
-    { "_set_new_mode",       (PVOID)_set_new_mode },
+    { "_initterm",           (PVOID)_initterm,        2, CC_CDECL },
+    { "_initterm_e",         (PVOID)_initterm_e,      2, CC_CDECL },
+    { "__getmainargs",       (PVOID)__getmainargs,    5, CC_CDECL },
+    { "__wgetmainargs",      (PVOID)__wgetmainargs,   5, CC_CDECL },
+    { "__set_app_type",      (PVOID)__set_app_type,   1, CC_CDECL },
+    { "_set_new_mode",       (PVOID)_set_new_mode,    1, CC_CDECL },
 
     /* Memory */
-    { "malloc",              (PVOID)crt_malloc },
-    { "calloc",              (PVOID)crt_calloc },
-    { "realloc",             (PVOID)crt_realloc },
-    { "free",                (PVOID)crt_free },
-    { "?malloc@@YAPEAX_K@Z", (PVOID)crt_malloc },  /* C++ mangled (64-bit) */
-    { "?free@@YAXPEAX@Z",   (PVOID)crt_free },
+    { "malloc",              (PVOID)crt_malloc,       1, CC_CDECL },
+    { "calloc",              (PVOID)crt_calloc,       2, CC_CDECL },
+    { "realloc",             (PVOID)crt_realloc,      2, CC_CDECL },
+    { "free",                (PVOID)crt_free,         1, CC_CDECL },
+    { "?malloc@@YAPEAX_K@Z", (PVOID)crt_malloc,       1, CC_CDECL },  /* C++ mangled (64-bit) */
+    { "?free@@YAXPEAX@Z",   (PVOID)crt_free,          1, CC_CDECL },
     /* MSVC 32-bit operator new/delete — used by C++ code via MSVCRT */
-    { "??2@YAPAXI@Z",       (PVOID)crt_malloc },  /* operator new(unsigned int) */
-    { "??3@YAXPAX@Z",       (PVOID)crt_free },    /* operator delete(void*) */
-    { "??_U@YAPAXI@Z",      (PVOID)crt_malloc },  /* operator new[](unsigned int) */
-    { "??_V@YAXPAX@Z",      (PVOID)crt_free },    /* operator delete[](void*) */
+    { "??2@YAPAXI@Z",       (PVOID)crt_malloc,        1, CC_CDECL },  /* operator new(unsigned int) */
+    { "??3@YAXPAX@Z",       (PVOID)crt_free,          1, CC_CDECL },  /* operator delete(void*) */
+    { "??_U@YAPAXI@Z",      (PVOID)crt_malloc,        1, CC_CDECL },  /* operator new[](unsigned int) */
+    { "??_V@YAXPAX@Z",      (PVOID)crt_free,          1, CC_CDECL },  /* operator delete[](void*) */
 
     /* String */
-    { "strlen",              (PVOID)crt_strlen },
-    { "strcmp",              (PVOID)crt_strcmp },
-    { "strncmp",             (PVOID)crt_strncmp },
-    { "_stricmp",            (PVOID)crt_stricmp },
-    { "_strnicmp",           (PVOID)crt_strnicmp },
-    { "_strcmpi",            (PVOID)crt_stricmp },
-    { "strcpy",              (PVOID)crt_strcpy },
-    { "strncpy",             (PVOID)crt_strncpy },
-    { "strcat",              (PVOID)crt_strcat },
-    { "strstr",              (PVOID)crt_strstr },
-    { "strchr",              (PVOID)crt_strchr },
-    { "strrchr",             (PVOID)crt_strrchr },
+    { "strlen",              (PVOID)crt_strlen,       1, CC_CDECL },
+    { "strcmp",              (PVOID)crt_strcmp,       2, CC_CDECL },
+    { "strncmp",             (PVOID)crt_strncmp,      3, CC_CDECL },
+    { "_stricmp",            (PVOID)crt_stricmp,      2, CC_CDECL },
+    { "_strnicmp",           (PVOID)crt_strnicmp,     3, CC_CDECL },
+    { "_strcmpi",            (PVOID)crt_stricmp,      2, CC_CDECL },
+    { "strcpy",              (PVOID)crt_strcpy,       2, CC_CDECL },
+    { "strncpy",             (PVOID)crt_strncpy,      3, CC_CDECL },
+    { "strcat",              (PVOID)crt_strcat,       2, CC_CDECL },
+    { "strstr",              (PVOID)crt_strstr,       2, CC_CDECL },
+    { "strchr",              (PVOID)crt_strchr,       2, CC_CDECL },
+    { "strrchr",             (PVOID)crt_strrchr,      2, CC_CDECL },
 
     /* Memory ops */
-    { "memcpy",              (PVOID)crt_memcpy },
-    { "memset",              (PVOID)crt_memset },
-    { "memmove",             (PVOID)crt_memmove },
-    { "memcmp",              (PVOID)crt_memcmp },
+    { "memcpy",              (PVOID)crt_memcpy,       3, CC_CDECL },
+    { "memset",              (PVOID)crt_memset,       3, CC_CDECL },
+    { "memmove",             (PVOID)crt_memmove,      3, CC_CDECL },
+    { "memcmp",              (PVOID)crt_memcmp,       3, CC_CDECL },
 
-    /* Format I/O */
-    { "printf",              (PVOID)crt_printf },
-    { "sprintf",             (PVOID)crt_sprintf },
-    { "_snprintf",           (PVOID)crt_snprintf },
-    { "_vsnprintf",          (PVOID)crt_vsnprintf },
-    { "fprintf",             (PVOID)crt_fprintf },
-    { "vprintf",             (PVOID)crt_vprintf },
-    { "vsprintf",            (PVOID)crt_vsprintf },
-    { "vfprintf",            (PVOID)crt_vfprintf },
-    { "sscanf",              (PVOID)crt_sscanf },
-    { "puts",                (PVOID)crt_puts },
-    { "putchar",             (PVOID)crt_putchar },
+    /* Format I/O (variadic → fixed-param count) */
+    { "printf",              (PVOID)crt_printf,       1, CC_CDECL },
+    { "sprintf",             (PVOID)crt_sprintf,      2, CC_CDECL },
+    { "_snprintf",           (PVOID)crt_snprintf,     3, CC_CDECL },
+    { "_vsnprintf",          (PVOID)crt_vsnprintf,    4, CC_CDECL },
+    { "fprintf",             (PVOID)crt_fprintf,      2, CC_CDECL },
+    { "vprintf",             (PVOID)crt_vprintf,      2, CC_CDECL },
+    { "vsprintf",            (PVOID)crt_vsprintf,     3, CC_CDECL },
+    { "vfprintf",            (PVOID)crt_vfprintf,     3, CC_CDECL },
+    { "sscanf",              (PVOID)crt_sscanf,       2, CC_CDECL },
+    { "puts",                (PVOID)crt_puts,         1, CC_CDECL },
+    { "putchar",             (PVOID)crt_putchar,      1, CC_CDECL },
 
     /* stdio FILE* */
-    { "fopen",               (PVOID)crt_fopen },
-    { "_wfopen",             (PVOID)crt_wfopen },
-    { "fread",               (PVOID)crt_fread },
-    { "fwrite",              (PVOID)crt_fwrite },
-    { "fclose",              (PVOID)crt_fclose },
-    { "fseek",               (PVOID)crt_fseek },
-    { "ftell",               (PVOID)crt_ftell },
-    { "fflush",              (PVOID)crt_fflush },
-    { "feof",                (PVOID)crt_feof },
-    { "ferror",              (PVOID)crt_ferror },
-    { "fgetc",               (PVOID)crt_fgetc },
-    { "fputc",               (PVOID)crt_fputc },
-    { "fgets",               (PVOID)crt_fgets },
-    { "fputs",               (PVOID)crt_fputs },
-    { "ungetc",              (PVOID)crt_ungetc },
-    { "__iob_func",          (PVOID)crt_iob_func },
-    { "__acrt_iob_func",     (PVOID)crt_iob_func },
+    { "fopen",               (PVOID)crt_fopen,        2, CC_CDECL },
+    { "_wfopen",             (PVOID)crt_wfopen,       2, CC_CDECL },
+    { "fread",               (PVOID)crt_fread,        4, CC_CDECL },
+    { "fwrite",              (PVOID)crt_fwrite,       4, CC_CDECL },
+    { "fclose",              (PVOID)crt_fclose,       1, CC_CDECL },
+    { "fseek",               (PVOID)crt_fseek,        3, CC_CDECL },
+    { "ftell",               (PVOID)crt_ftell,        1, CC_CDECL },
+    { "fflush",              (PVOID)crt_fflush,       1, CC_CDECL },
+    { "feof",                (PVOID)crt_feof,         1, CC_CDECL },
+    { "ferror",              (PVOID)crt_ferror,       1, CC_CDECL },
+    { "fgetc",               (PVOID)crt_fgetc,        1, CC_CDECL },
+    { "fputc",               (PVOID)crt_fputc,        2, CC_CDECL },
+    { "fgets",               (PVOID)crt_fgets,        3, CC_CDECL },
+    { "fputs",               (PVOID)crt_fputs,        2, CC_CDECL },
+    { "ungetc",              (PVOID)crt_ungetc,       2, CC_CDECL },
+    { "__iob_func",          (PVOID)crt_iob_func,     1, CC_CDECL },
+    { "__acrt_iob_func",     (PVOID)crt_iob_func,     1, CC_CDECL },
 
     /* Conversion */
-    { "atoi",                (PVOID)crt_atoi },
-    { "atol",                (PVOID)crt_atol },
-    { "atof",                (PVOID)crt_atof },
-    { "strtol",              (PVOID)crt_strtol },
-    { "strtoul",             (PVOID)crt_strtoul },
+    { "atoi",                (PVOID)crt_atoi,         1, CC_CDECL },
+    { "atol",                (PVOID)crt_atol,         1, CC_CDECL },
+    { "atof",                (PVOID)crt_atof,         1, CC_CDECL },
+    { "strtol",              (PVOID)crt_strtol,       3, CC_CDECL },
+    { "strtoul",             (PVOID)crt_strtoul,      3, CC_CDECL },
 
     /* Process */
-    { "exit",                (PVOID)crt_exit },
-    { "abort",               (PVOID)crt_abort },
-    { "_exit",               (PVOID)crt__exit },
-    { "_cexit",              (PVOID)crt_exit },
-    { "_c_exit",             (PVOID)crt__exit },
-    { "atexit",              (PVOID)crt_atexit },
+    { "exit",                (PVOID)crt_exit,         1, CC_CDECL },
+    { "abort",               (PVOID)crt_abort,        0, CC_CDECL },
+    { "_exit",               (PVOID)crt__exit,        1, CC_CDECL },
+    { "_cexit",              (PVOID)crt_exit,         1, CC_CDECL },
+    { "_c_exit",             (PVOID)crt__exit,        1, CC_CDECL },
+    { "atexit",              (PVOID)crt_atexit,       1, CC_CDECL },
 
     /* ctype */
-    { "isalpha",             (PVOID)crt_isalpha },
-    { "isdigit",             (PVOID)crt_isdigit },
-    { "isalnum",             (PVOID)crt_isalnum },
-    { "isspace",             (PVOID)crt_isspace },
-    { "isupper",             (PVOID)crt_isupper },
-    { "islower",             (PVOID)crt_islower },
-    { "isprint",             (PVOID)crt_isprint },
-    { "toupper",             (PVOID)crt_toupper },
-    { "tolower",             (PVOID)crt_tolower },
+    { "isalpha",             (PVOID)crt_isalpha,      1, CC_CDECL },
+    { "isdigit",             (PVOID)crt_isdigit,      1, CC_CDECL },
+    { "isalnum",             (PVOID)crt_isalnum,      1, CC_CDECL },
+    { "isspace",             (PVOID)crt_isspace,      1, CC_CDECL },
+    { "isupper",             (PVOID)crt_isupper,      1, CC_CDECL },
+    { "islower",             (PVOID)crt_islower,      1, CC_CDECL },
+    { "isprint",             (PVOID)crt_isprint,      1, CC_CDECL },
+    { "toupper",             (PVOID)crt_toupper,      1, CC_CDECL },
+    { "tolower",             (PVOID)crt_tolower,      1, CC_CDECL },
 
     /* Algorithm */
-    { "qsort",               (PVOID)crt_qsort },
-    { "bsearch",             (PVOID)crt_bsearch },
+    { "qsort",               (PVOID)crt_qsort,        4, CC_CDECL },
+    { "bsearch",             (PVOID)crt_bsearch,      5, CC_CDECL },
 
     /* Error */
-    { "_errno",              (PVOID)crt_errno },
+    { "_errno",              (PVOID)crt_errno,        0, CC_CDECL },
 
     /* Time */
-    { "time",                (PVOID)crt_time },
-    { "clock",               (PVOID)crt_clock },
+    { "time",                (PVOID)crt_time,         1, CC_CDECL },
+    { "clock",               (PVOID)crt_clock,        0, CC_CDECL },
 
     /* SEH */
-    { "_except_handler3",    (PVOID)crt_except_handler3 },
-    { "_except_handler4",    (PVOID)crt_except_handler4 },
-    { "_XcptFilter",         (PVOID)crt_XcptFilter },
+    { "_except_handler3",    (PVOID)crt_except_handler3, 4, CC_CDECL },
+    { "_except_handler4",    (PVOID)crt_except_handler4, 4, CC_CDECL },
+    { "_XcptFilter",         (PVOID)crt_XcptFilter,   2, CC_CDECL },
 
     /* Misc CRT internal */
-    { "_controlfp_s",        (PVOID)crt_controlfp_s },
-    { "_configthreadlocale", (PVOID)crt_configthreadlocale },
-    { "_lock",               (PVOID)crt_lock },
-    { "_unlock",             (PVOID)crt_unlock },
-    { "__CxxFrameHandler3",  (PVOID)crt_except_handler3 },
-    { "__CxxFrameHandler4",  (PVOID)crt_except_handler4 },
-    { "_CRT_DEBUGGER_HOOK",  (PVOID)crt_crt_debugger_hook },
-    { "_encoded_null",       (PVOID)crt_encoded_null },
-    { "_amsg_exit",          (PVOID)crt_amsg_exit },
+    { "_controlfp_s",        (PVOID)crt_controlfp_s,  3, CC_CDECL },
+    { "_configthreadlocale", (PVOID)crt_configthreadlocale, 1, CC_CDECL },
+    { "_lock",               (PVOID)crt_lock,         1, CC_CDECL },
+    { "_unlock",             (PVOID)crt_unlock,       1, CC_CDECL },
+    { "__CxxFrameHandler3",  (PVOID)crt_except_handler3, 4, CC_CDECL },
+    { "__CxxFrameHandler4",  (PVOID)crt_except_handler4, 4, CC_CDECL },
+    { "_CRT_DEBUGGER_HOOK",  (PVOID)crt_crt_debugger_hook, 1, CC_CDECL },
+    { "_encoded_null",       (PVOID)crt_encoded_null, 0, CC_CDECL },
+    { "_amsg_exit",          (PVOID)crt_amsg_exit,    1, CC_CDECL },
 
     /* C++ EH / UT99 required stubs */
-    { "??1type_info@@UAE@XZ", (PVOID)crt_type_info_dtor },
-    { "_CxxThrowException",  (PVOID)crt_CxxThrowException },
-    { "__CxxFrameHandler",   (PVOID)crt_CxxFrameHandler },
-    { "__dllonexit",         (PVOID)crt_dllonexit },
-    { "__p__commode",        (PVOID)crt_p_commode },
-    { "__p__fmode",          (PVOID)crt_p_fmode },
-    { "_commode",            (PVOID)&crt_commode_val },
-    { "_fmode",              (PVOID)&crt_fmode_val },
-    { "__C_specific_handler",(PVOID)crt_C_specific_handler },
-    { "__initenv",           (PVOID)&crt_initenv_val },
-    { "signal",              (PVOID)crt_signal },
-    { "__setusermatherr",    (PVOID)crt_setusermatherr },
-    { "_acmdln",             (PVOID)crt_acmdln },
-    { "_adjust_fdiv",        (PVOID)crt_adjust_fdiv },
-    { "_controlfp",          (PVOID)crt_controlfp },
-    { "_ftol",               (PVOID)crt_ftol },
-    { "_onexit",             (PVOID)crt_onexit },
-    { "_purecall",           (PVOID)crt_purecall },
+    { "??1type_info@@UAE@XZ", (PVOID)crt_type_info_dtor, 0, CC_THISCALL },
+    { "_CxxThrowException",  (PVOID)crt_CxxThrowException, 2, CC_CDECL },
+    { "__CxxFrameHandler",   (PVOID)crt_CxxFrameHandler, 4, CC_CDECL },
+    { "__dllonexit",         (PVOID)crt_dllonexit,    3, CC_CDECL },
+    { "__p__commode",        (PVOID)crt_p_commode,    0, CC_CDECL },
+    { "__p__fmode",          (PVOID)crt_p_fmode,      0, CC_CDECL },
+    { "_commode",            (PVOID)&crt_commode_val, 0, CC_CDECL },  /* data export */
+    { "_fmode",              (PVOID)&crt_fmode_val,   0, CC_CDECL },  /* data export */
+    { "__C_specific_handler",(PVOID)crt_C_specific_handler, 4, CC_CDECL },
+    { "__initenv",           (PVOID)&crt_initenv_val, 0, CC_CDECL },  /* data export */
+    { "signal",              (PVOID)crt_signal,       2, CC_CDECL },
+    { "__setusermatherr",    (PVOID)crt_setusermatherr, 1, CC_CDECL },
+    { "_acmdln",             (PVOID)crt_acmdln,       0, CC_CDECL },
+    { "_adjust_fdiv",        (PVOID)crt_adjust_fdiv,  0, CC_CDECL },
+    { "_controlfp",          (PVOID)crt_controlfp,    2, CC_CDECL },
+    { "_ftol",               (PVOID)crt_ftol,         2, CC_CDECL },  /* double = 2 DWORDs */
+    { "_onexit",             (PVOID)crt_onexit,       1, CC_CDECL },
+    { "_purecall",           (PVOID)crt_purecall,     0, CC_CDECL },
 
     /* UT99 Core.dll / Engine.dll required exports */
-    { "?terminate@@YAXXZ",   (PVOID)crt_terminate },
-    { "_CIacos",             (PVOID)crt_CIacos },
-    { "_CIfmod",             (PVOID)crt_CIfmod },
-    { "_CIpow",              (PVOID)crt_CIpow },
-    { "_isnan",              (PVOID)crt_isnan },
-    { "_stat",               (PVOID)crt_stat },
-    { "_wstat",              (PVOID)crt_wstat },
-    { "_strdate",            (PVOID)crt_strdate },
-    { "_strtime",            (PVOID)crt_strtime },
-    { "_wstrdate",           (PVOID)crt_wstrdate },
-    { "_wstrtime",           (PVOID)crt_wstrtime },
-    { "_vsnwprintf",         (PVOID)crt_vsnwprintf },
-    { "_wcsicmp",            (PVOID)crt_wcsicmp },
-    { "_wcsnicmp",           (PVOID)crt_wcsnicmp },
-    { "_wcsupr",             (PVOID)crt_wcsupr },
-    { "_wtoi",               (PVOID)crt_wtoi },
-    { "ceil",                (PVOID)crt_ceil },
-    { "floor",               (PVOID)crt_floor },
-    { "difftime",            (PVOID)crt_difftime },
-    { "gmtime",              (PVOID)crt_gmtime },
-    { "mktime",              (PVOID)crt_mktime },
-    { "rand",                (PVOID)crt_rand },
-    { "srand",               (PVOID)crt_srand },
-    { "strncat",             (PVOID)crt_strncat },
-    { "wcscat",              (PVOID)crt_wcscat },
-    { "wcschr",              (PVOID)crt_wcschr },
-    { "wcscmp",              (PVOID)crt_wcscmp },
-    { "wcscpy",              (PVOID)crt_wcscpy },
-    { "wcslen",              (PVOID)crt_wcslen },
-    { "wcsncmp",             (PVOID)crt_wcsncmp },
-    { "wcsncpy",             (PVOID)crt_wcsncpy },
-    { "wcsstr",              (PVOID)crt_wcsstr },
-    { "wcstoul",             (PVOID)crt_wcstoul },
+    { "?terminate@@YAXXZ",   (PVOID)crt_terminate,    0, CC_CDECL },
+    { "_CIacos",             (PVOID)crt_CIacos,       2, CC_CDECL },  /* double = 2 DWORDs */
+    { "_CIfmod",             (PVOID)crt_CIfmod,       4, CC_CDECL },  /* 2 doubles = 4 DWORDs */
+    { "_CIpow",              (PVOID)crt_CIpow,        4, CC_CDECL },  /* 2 doubles = 4 DWORDs */
+    { "_isnan",              (PVOID)crt_isnan,        2, CC_CDECL },  /* double = 2 DWORDs */
+    { "_stat",               (PVOID)crt_stat,         2, CC_CDECL },
+    { "_wstat",              (PVOID)crt_wstat,        2, CC_CDECL },
+    { "_strdate",            (PVOID)crt_strdate,      1, CC_CDECL },
+    { "_strtime",            (PVOID)crt_strtime,      1, CC_CDECL },
+    { "_wstrdate",           (PVOID)crt_wstrdate,     1, CC_CDECL },
+    { "_wstrtime",           (PVOID)crt_wstrtime,     1, CC_CDECL },
+    { "_vsnwprintf",         (PVOID)crt_vsnwprintf,   4, CC_CDECL },
+    { "_wcsicmp",            (PVOID)crt_wcsicmp,      2, CC_CDECL },
+    { "_wcsnicmp",           (PVOID)crt_wcsnicmp,     3, CC_CDECL },
+    { "_wcsupr",             (PVOID)crt_wcsupr,       1, CC_CDECL },
+    { "_wtoi",               (PVOID)crt_wtoi,         1, CC_CDECL },
+    { "ceil",                (PVOID)crt_ceil,         2, CC_CDECL },  /* double = 2 DWORDs */
+    { "floor",               (PVOID)crt_floor,        2, CC_CDECL },  /* double = 2 DWORDs */
+    { "difftime",            (PVOID)crt_difftime,     2, CC_CDECL },  /* 2× long (time_t) */
+    { "gmtime",              (PVOID)crt_gmtime,       1, CC_CDECL },
+    { "mktime",              (PVOID)crt_mktime,       1, CC_CDECL },
+    { "rand",                (PVOID)crt_rand,         0, CC_CDECL },
+    { "srand",               (PVOID)crt_srand,        1, CC_CDECL },
+    { "strncat",             (PVOID)crt_strncat,      3, CC_CDECL },
+    { "wcscat",              (PVOID)crt_wcscat,       2, CC_CDECL },
+    { "wcschr",              (PVOID)crt_wcschr,       2, CC_CDECL },
+    { "wcscmp",              (PVOID)crt_wcscmp,       2, CC_CDECL },
+    { "wcscpy",              (PVOID)crt_wcscpy,       2, CC_CDECL },
+    { "wcslen",              (PVOID)crt_wcslen,       1, CC_CDECL },
+    { "wcsncmp",             (PVOID)crt_wcsncmp,      3, CC_CDECL },
+    { "wcsncpy",             (PVOID)crt_wcsncpy,      3, CC_CDECL },
+    { "wcsstr",              (PVOID)crt_wcsstr,       2, CC_CDECL },
+    { "wcstoul",             (PVOID)crt_wcstoul,      3, CC_CDECL },
     /* File access */
-    { "_access",             (PVOID)crt_access },
-    { "_waccess",            (PVOID)crt_waccess },
+    { "_access",             (PVOID)crt_access,       2, CC_CDECL },
+    { "_waccess",            (PVOID)crt_waccess,      2, CC_CDECL },
 
     /* CRT globals (as accessor functions through INT 0x2E) */
-    { "_fltused",            (PVOID)crt_fltused },
-    { "__p__osver",          (PVOID)crt_p_osver },
-    { "__p__winver",         (PVOID)crt_p_winver },
-    { "__p__winmajor",       (PVOID)crt_p_winmajor },
-    { "__p__winminor",       (PVOID)crt_p_winminor },
+    { "_fltused",            (PVOID)crt_fltused,      0, CC_CDECL },
+    { "__p__osver",          (PVOID)crt_p_osver,      0, CC_CDECL },
+    { "__p__winver",         (PVOID)crt_p_winver,     0, CC_CDECL },
+    { "__p__winmajor",       (PVOID)crt_p_winmajor,   0, CC_CDECL },
+    { "__p__winminor",       (PVOID)crt_p_winminor,   0, CC_CDECL },
 
     /* Stubs for bundled MSVCRT.dll imports */
-    { "_getch",              (PVOID)crt_getch_stub },
-    { "_kbhit",              (PVOID)crt_kbhit_stub },
-    { "_putenv",             (PVOID)crt_putenv_stub },
+    { "_getch",              (PVOID)crt_getch_stub,   0, CC_CDECL },
+    { "_kbhit",              (PVOID)crt_kbhit_stub,   0, CC_CDECL },
+    { "_putenv",             (PVOID)crt_putenv_stub,  1, CC_CDECL },
 
-    { NULL, NULL }
+    { NULL, NULL, 0, CC_CDECL }
 };
+
+const WIN32_EXPORT *msvcrt_abi_table(int *count) {
+    *count = (int)(sizeof(msvcrt_exports)/sizeof(msvcrt_exports[0]));
+    return (const WIN32_EXPORT *)msvcrt_exports;
+}
 
 static int msvcrt_strcmp(const char *a, const char *b)
 {

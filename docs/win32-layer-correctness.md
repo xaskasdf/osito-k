@@ -1,0 +1,273 @@
+# Win32 Layer Correctness — ABI Inventory & Fix Plan
+
+> **Goal:** make the osito-k Win32 compat layer correctly *execute Win32 apps*,
+> using the NT/Win32 sources as the spec — **not** patch the layer/binary for one
+> executable (UT99). See memory `feedback-win32-fix-layer-not-binary`.
+>
+> This doc is the living inventory we iterate on. Last update: 2026-06-04.
+
+---
+
+## 1. How the layer dispatches a Win32 call (mechanism)
+
+PE32 code runs in 32-bit compat mode. Each imported function's IAT entry is
+patched (in `compat32.c` import resolver, ~line 1016) to point at a generated
+**thunk** in low memory. The thunk (`emit_thunk`, compat32.c:188) is:
+
+```
+B8 <idx>        MOV EAX, thunk_index
+B9 <nargs>      MOV ECX, num_args
+CD 2E           INT 0x2E              ; enter 64-bit kernel dispatcher
+C2 <n*4> | C3   RET n*4 (stdcall) | RET (cdecl)   ; <-- STACK CLEANUP
+```
+
+The kernel handler (`compat32_dispatch`) reads the 32-bit stack, calls the
+64-bit shim, returns. **The thunk's `RET n*4` is where correctness lives:**
+
+- **stdcall** (all Win32 API DLLs): callee cleans → `RET n*4`. If `n` ≠ the real
+  arg count, the thunk over/under-pops the caller's stack → the caller's
+  **callee-saved EDI/ESI/EBX/EBP get corrupted** → garbage vtable calls, pool
+  corruption, wild jumps. **This is the root of every band-aid.**
+- **cdecl** (msvcrt/ucrt): caller cleans → `RET` (n is irrelevant for cleanup).
+
+### The two decoupled lookups (the design flaw)
+
+| What | Decided by | Keyed on | Failure mode |
+|------|-----------|----------|--------------|
+| `num_args` (n) | `guess_num_args(name)` compat32.c:454 | **function name** | **default `return 4`** for any name not in the hand-maintained `known[]` table → wrong `RET n*4` |
+| callconv | `dll_calling_convention(dll_name)` compat32.c:849 | **DLL name** | msvcrt*/ucrt*→cdecl, else stdcall; per-fn C++ mangled overrides in dllloader.c |
+
+The arg-count is **divorced from the shim function pointer**. The shim
+`GlobalAddAtomW_stub` is declared `WINAPI ...(1 param)` — ground truth = 1 — but
+the layer re-derives "1" from a separate name table, and if the entry is missing
+it silently guesses 4. That mismatch *is* the GlobalAddAtomW bug, and the
+remaining band-aids mask more of the same.
+
+### Ground truth = the shim prototype
+
+Every shim is declared in its `.h` with the real signature:
+`RET WINAPI Name(p1, p2, …)`. So:
+- **arg-count (32-bit stack DWORDs)** = number of params, counting any
+  64-bit-by-value param (`__int64`, `double`, `LARGE_INTEGER`/`ULARGE_INTEGER`
+  by value) as **2** slots. (Win32 params are otherwise 4-byte DWORD/ptr/HANDLE.)
+- **callconv** = `WINAPI`/`APIENTRY`/`CALLBACK`/`PASCAL` → stdcall; plain `__cdecl`
+  or no marker on a CRT export → cdecl.
+
+**The correct fix (Phase 1):** carry `argc` + `callconv` *with the shim
+registration* (co-located with the function pointer), so `dll_resolve_import`
+returns them together and the thunk is emitted with values that **cannot drift**
+from the prototype, and **eliminate the `default 4`** (a miss becomes a loud
+error, never a silent wrong guess).
+
+---
+
+## 1.5 What NT actually does (verified against the leaked source)
+
+> Source: `D:\Stuff\dev\Microsoft leaked source code archive_2020-09-24` →
+> `windows_2000_source_code` (extracted to `_extracted/win2k`). Spec for
+> `feedback-win32-fix-layer-not-binary` / [[reference-leak-source]].
+
+**(a) The NT loader never computes or stores an arg count.**
+`LdrpSnapThunk` (private/ntos/dll/ldrsnap.c:2656) resolves an import to the raw
+function VA and writes it straight into the IAT:
+```c
+Addr = (PULONG)((ULONG_PTR)DllBase + ExportDirectory->AddressOfFunctions);
+Thunk->u1.Function = ((ULONG_PTR)DllBase + Addr[OrdinalNumber]);   // raw VA, no argc
+```
+The `call [IAT]` jumps directly into the real DLL function, whose compiler-emitted
+`ret N` (stdcall) does the cleanup. **The arg count lives in the callee's
+epilogue, never in a table.** Our thunk + arg table only exist because our
+"callee" (the shim) is 64-bit and cannot emit a 32-bit `ret N` — a self-inflicted
+artifact of the 32→64 boundary. Conclusion: **a per-API arg count is mandatory
+for cross-ABI thunks** (you cannot avoid it for stdcall — the caller will not
+clean), so the *category* of what we do is correct.
+
+**(b) When NT DOES thunk across an ABI, it declares each API's typed signature —
+it never guesses.** The Win32 thunk compiler is fed `.thk` spec files
+(private/shell/thunk/*.thk) that declare every thunked export with its **typed
+signature**, e.g.:
+```
+BOOL GetOpenFileName(LPOPENFILENAME lpOfn) = BOOL ThkGetOpenFileName(...) { ... }
+```
+The compiler derives stack size + marshaling from the **types**. Every thunked
+API is listed; there is **no default-guess path**. This is the gold-standard
+model and exactly what Phase 1 should imitate: argc/callconv derived from the
+real signature, complete, mechanical.
+
+**(c) For C++ (mangled) imports, the exact signature is *in the name* — derive
+it by demangling.** `undname.cxx`'s `getCallingConvention()` (private/windbg64/
+langapi/undname/undname.cxx:2032) decodes the callconv from one char
+(`callCode = *gName - 'A'`: `A`=__cdecl, `G`=__stdcall, `E`=__thiscall,
+`I`=__fastcall) and parses the typed arg list. UE1's cross-DLL imports
+(Core.dll/Engine.dll/.u, all `?Name@@YA…@Z`) currently fall to default-4; a
+small MSVC demangler gives **exact argc + callconv**, deterministically. e.g.
+`?appUnwindf@@YAXPBGZZ` → `A`=__cdecl, ret `X`=void, args `PBG`=`const WCHAR*`,
+`ZZ`=`...` → cdecl, varargs, 1 fixed arg (matches the hand-coded override).
+
+### Verdict on "are we doing num_args all wrong?"
+Half-right. The **approach** (per-API arg count) is unavoidable and matches NT's
+thunk compiler. The **implementation** is wrong in two specific ways NT never is:
+1. **We guess** (`return 4`). NT declares every thunked API; a miss is impossible.
+   → Eliminate default-4: a miss becomes a loud `[ABI-MISS]` error.
+2. **We key on the name, divorced from the signature.** NT derives the stack size
+   from the **type** (.thk) or by **demangling** (undname). → Derive argc from the
+   shim prototype (co-located), and demangle `?…@@…` imports.
+
+### Important caveat (measured)
+In a real UT99 run, of the ~68 functions hitting default-4, **almost all Win32
+stdcall ones genuinely have 4 args** (`MoveToEx`, `CreatePipe`, `RegisterHotKey`,
+`GetMenuItemInfoA`…) and the rest are cdecl CRT (`ceil`, `qsort`, `_ftol` →
+caller cleans, argc irrelevant). So the default-4 is a **latent** landmine, **not**
+what the surviving band-aids (ENGINE-PATCH/BROWSE-FIX/…) mask. Their root is a
+*wrong table entry*, a callconv error, or int2e register preservation — found by
+Phase 2 (disable→observe→root-cause), not by completing the table. Phase 1 is
+correct foundational hygiene that removes the class; it is not expected to delete
+the band-aids on its own.
+
+---
+
+## 2. Inventory legend
+
+For each shim function: **GT-argc** = ground-truth arg DWORDs from the prototype;
+**GT-cc** = ground-truth callconv; **tbl-argc** = what `known[]` returns (or
+`DEF4` if it falls through to the default); **status**:
+
+- ✅ `OK` — tbl-argc matches GT-argc (and cc correct)
+- ❌ `MISMATCH` — tbl-argc ≠ GT-argc (active stack-imbalance bug, stdcall only)
+- ⚠️ `DEF4` — not in table → gets 4; **bug iff GT-argc ≠ 4 and stdcall**
+- 🟡 `CC?` — callconv ambiguity (cdecl export in a stdcall DLL, or vice-versa)
+
+---
+
+## 3. Per-DLL function inventory
+
+> Filled from parallel extraction of the shim `.h` prototypes (ground truth)
+> cross-referenced against the `known[]` table in compat32.c:459-810.
+
+> Ground truth (GT) extracted from shim `.h`/`.c` prototypes. `tbl` = value
+> `known[]` returns today (`—` = absent → falls to **default 4**). Only rows where
+> **tbl ≠ GT** are listed as ❌; everything else in the prototypes matched or is
+> cdecl (cleanup-irrelevant). Full per-function GT lists archived below the verdict.
+
+### 3.9 ⭐ CROSS-CHECK VERDICT — confirmed wrong entries (the bug surface)
+
+**(A) OVER-CLEANERS — stdcall, GT < 4, absent from `known[]` → default-4 RET 16
+over-pops the caller stack → corrupts callee-saved EDI/ESI/EBX. THIS IS THE
+GlobalAddAtomW CRASH CLASS.** Prime Phase-2 suspects (verified absent via grep):
+
+| Function | DLL | GT | tbl | over-pop | likely imported by UT99 |
+|---|---|---|---|---|---|
+| `lstrlenA` / `lstrlenW` | kernel32 | 1 | — (4) | 12 B | **yes — extremely common** |
+| `GetSystemTimeAsFileTime` | kernel32 | 1 | — (4) | 12 B | **yes — UE1 timing/appInit** |
+| `IsDebuggerPresent` | kernel32 | 0 | — (4) | 16 B | **yes — CRT/appInit** |
+| `GetTickCount64` | kernel32 | 0 | — (4) | 16 B | maybe (returns ULONGLONG) |
+| `GetEnvironmentStringsA` | kernel32 | 0 | — (4) | 16 B | maybe |
+| `PulseEvent` | kernel32 | 1 | — (4) | 12 B | maybe (threading) |
+| `TryEnterCriticalSection` | kernel32 | 1 | — (4) | 12 B | maybe (threading) |
+| `UnmapViewOfFile` | kernel32 | 1 | — (4) | 12 B | maybe (file mapping) |
+
+**(B) UNDER-CLEANERS — stdcall, GT > 4, absent → default-4 RET 16 under-pops →
+leaves stale args on the stack (logic corruption, slower-burning than A):**
+
+| Function | DLL | GT | tbl | under-pop |
+|---|---|---|---|---|
+| `CreateFileMappingA` / `CreateFileMappingW` | kernel32 | 6 | — (4) | 8 B |
+| `MapViewOfFile` | kernel32 | 5 | — (4) | 4 B |
+| `InterlockedCompareExchange` | kernel32 | 3 | — (4) | over-pop 4 B |
+| `InterlockedExchange` | kernel32 | 2 | — (4) | over-pop 8 B |
+| `LoadLibraryExA` | kernel32 | 3 | — (4) | over-pop 4 B |
+| `InitializeCriticalSectionAndSpinCount` | kernel32 | 2 | — (4) | over-pop 8 B |
+
+> NOTE on the agents' "almost all default-4 hits were genuinely 4-arg" finding:
+> that survey only covered names that *actually appeared* in one early-crash run's
+> log. The functions above are **also** absent from `known[]` but may be imported
+> on code paths the band-aids currently keep alive — so they don't show up until
+> the band-aids are removed. **Action: add explicit entries for all of (A) and (B)
+> BEFORE the Phase-2 band-aid bisect**, so the bisect isn't masking a known
+> over-cleaner. The (A) group especially must be fixed first — it is the exact
+> mechanism (callee-saved corruption) the EBX-era band-aids were invented for.
+
+**(C) Verified-correct high-arg entries** (tbl == GT, no action): CreateFileA=7,
+ReadFile/WriteFile=5, DuplicateHandle=7, WideCharToMultiByte=8,
+MultiByteToWideChar=6, CreateThread=6, CreateWindowExA/W=12, BitBlt=9,
+CreateFontA/W=14, SetWindowPos=7, ExtTextOutA=8, RegCreateKeyExA/W=9,
+RegEnumKeyExA=8(❓ check table), ShellExecuteA/W=6, waveOutOpen=6, surf_Blt=7,
+CoCreateInstance=5, GlobalAddAtomW=1 (the original fix). The COM thunks
+(DD_*/Surf_*/Pal_*) register their argc explicitly via `dd_args[]`/`sf_args[]`,
+not through `known[]` — those are self-consistent.
+
+**(D) ntdll syscalls** (NtCreateFile=11, NtMapViewOfSection=10, NtReadFile/
+NtWriteFile=9, …) — these are resolved as shims but reach the kernel via a
+different path (NtXxx are not stdcall-thunked the same way; they marshal in
+`ntsyscall.c`). Audit separately; if any Nt* DOES go through `guess_num_args`,
+the high counts (10-11) make a default-4 catastrophic. **TODO: confirm the Nt*
+dispatch path.**
+
+**(E) cdecl / msvcrt** — caller cleans, so a wrong argc does **not** corrupt
+cleanup; it only changes how many DWORDs the INT 0x2E dispatcher copies. Real
+risks there are structural, not arg-count: (1) **`double`-taking fns** (`_CIpow`,
+`_CIfmod`, `_CIacos`, `_isnan`, `_ftol`, `ceil`, `floor`, `difftime`) — each
+`double` = 2 stack DWORDs and the `_CI*` intrinsics use the **x87 register**
+convention, not the integer stack; (2) **`double`-returning fns** (`atof`,
+`difftime`) return in **ST(0)**, not EAX:EDX; (3) **variadic** printf family —
+dispatcher must expose the live 32-bit stack, not a fixed copy; (4)
+**`??1type_info@@UAE@XZ`** is **thiscall** (`this` in ECX, 0 stack args). These
+are correctness items for the dispatcher, tracked in §1.5(c)/Phase 1b.
+
+### 3.10 Full per-function ground-truth tables (reference)
+The complete GT extraction (every exported function, cc, argc) for all DLLs is
+preserved verbatim in the agent run; the actionable deltas are §3.9 above. Key
+high-arg references kept inline: **kernel32** CreateFile*=7, Read/Write=5,
+Duplicate=7, W2MB=8, MB2W=6, CreateThread=6, RegCreateKeyEx*=9, RegEnum*=8;
+**user32** CreateWindowEx*=12, SetWindowPos/TrackPopupMenu/SendMessageTimeout=7,
+Move/DrawTextEx/LoadImage=6, CallWindowProc/Dialog*/Peek*/DrawText/ToAscii=5;
+**gdi32** CreateFont*=14, BitBlt=9, ExtTextOut=8, PatBlt/CreateDIB*=6,
+CreateBitmap/TextOutW=5; **ddraw** Surf_Blt=7, BltFast=6, SetDisplayMode=6,
+Lock/CreatePalette/EnumModes/Pal*=5; **dsound** dsb_Lock=8(direct vtbl, untunked),
+dsb_Unlock=5; **winmm** waveOutOpen=6, timeSetEvent=5; **wsock32** recvfrom/
+sendto=6, select/getsockopt/setsockopt=5; **ole32** CoCreateInstance=5;
+**shell32** ShellExecute*=6.
+
+---
+
+## 4. Fix plan (in order)
+
+- [x] **Phase 1 — ABI correctness, signature-derived (NT `.thk` model). DONE 2026-06-04.**
+  - [x] 1a. Co-located `{argc, callconv}` with each shim export (`WIN32_EXPORT`
+    in `win32_abi.h`). All 14 shim tables migrated (kernel32/user32/gdi32/msvcrt/
+    ntdll/advapi32/ddraw/dsound/winmm/wsock32/ole32/shell32/comctl32/comdlg32),
+    argc derived from each prototype, registered via `win32_abi_register` in
+    winexec.c. The IAT patcher (compat32.c) now calls `win32_abi_lookup` first.
+  - [x] 1b. MSVC demangler (`msvc_demangle_abi` in win32_abi.c) — decodes
+    callconv (`A`=cdecl/`G`=stdcall/`E`=thiscall/`I`=fastcall) + counts arg
+    DWORDs from `?…@@YA…@Z`; conservative (bails → miss on by-value user types).
+  - [~] 1c. `guess_num_args` default-4 is now **dead for every import UT99 uses**
+    (measured `[ARGCOUNT-DEFAULT4]` = 0 in a full run). Still present as a
+    last-resort fallback that logs loudly; formal removal of the dead `known[]`
+    table is a cleanup TODO.
+  - **RESULT:** zero default-4 fallbacks; **no regression** — UT99 reaches the
+    same Browse(Entry.unr?Name=Player?Class=Botpack.TMale2) + LoadMap + "Can't
+    find file 'Entry.unr'" frontier (band-aids still ON). Spec citations: §1.5.
+  - ⚠️ As predicted, Phase 1 alone does **not** delete the surviving band-aids —
+    their root is elsewhere (Phase 2).
+- [ ] **Phase 2 — Remove band-aids, confirming each is dead / root-causing the
+  rest.** For each of ENGINE-PATCH, BROWSE-FIX, NULL-REDIRECT, FMW-REPAIR,
+  GOBJREG-FORCE, FMW-POOL-SKIP, UT-EXE-PATCH NOPs: disable → run → if the masked
+  crash does not reappear, delete it; if it does, root-cause to the underlying
+  layer bug (wrong table entry / callconv / int2e register preservation /
+  semantic) and fix the layer. **Measured: disabling the 5 EBX-era band-aids
+  regresses LoadMap→crash at ~19k lines (heap-exec 0x4020C870) — so at least one
+  masks a real, still-unfixed layer bug. This is where the remaining corruption
+  lives.**
+- [ ] **Phase 3 — Init-ordering semantics.** Replace GMalloc stub / FNAME-RESCUE
+  with correct NT loader init ordering (`FMallocWindows::Init` before any
+  appMalloc; FName table init as the engine expects), per UE1 + NT loader spec.
+
+## 5. Open questions / notes
+- `WINAPI` is a no-op at 64-bit (shims run as native 64-bit); arg-count only
+  drives the **32-bit thunk's `RET n*4`**. So GT-argc must be the count of
+  **32-bit stack DWORDs the 32-bit caller pushed**, not the 64-bit ABI.
+- Variadic CRT fns (printf family) are cdecl → caller cleans, so a too-large
+  argc (12) is harmless for cleanup; it only affects how many stack DWORDs the
+  dispatcher copies. Keep but document.
+- COM vtable methods (DD_*, Surf_*) are stdcall-with-`this`; argc includes `this`.

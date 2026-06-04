@@ -4,6 +4,7 @@
  */
 
 #include "winmm_shim.h"
+#include "win32_abi.h"
 
 #ifdef TEST_HARNESS
 #include <time.h>
@@ -161,39 +162,44 @@ static UINT WINAPI shim_joyGetPosEx(UINT id, PVOID info)
 
 /* ── Export table ──────────────────────────────────────────── */
 
-typedef struct { const char *name; PVOID func; } SHIM_EXPORT;
+typedef struct { const char *name; PVOID func; uint8_t argc; uint8_t cc; } SHIM_EXPORT;
 
 static const SHIM_EXPORT winmm_exports[] = {
-    { "timeGetTime",              (PVOID)shim_timeGetTime },
-    { "timeBeginPeriod",          (PVOID)shim_timeBeginPeriod },
-    { "timeEndPeriod",            (PVOID)shim_timeEndPeriod },
-    { "timeSetEvent",             (PVOID)shim_timeSetEvent },
-    { "timeKillEvent",            (PVOID)shim_timeKillEvent },
-    { "joyGetNumDevs",            (PVOID)shim_joyGetNumDevs },
-    { "joyGetDevCapsA",           (PVOID)shim_joyGetDevCapsA },
-    { "joyGetPosEx",              (PVOID)shim_joyGetPosEx },
-    { "PlaySoundA",               (PVOID)shim_PlaySoundA },
-    { "waveOutGetNumDevs",        (PVOID)shim_waveOutGetNumDevs },
-    { "waveOutReset",             (PVOID)shim_waveOutReset },
-    { "waveOutUnprepareHeader",   (PVOID)shim_waveOutUnprepareHeader },
-    { "waveOutGetPosition",       (PVOID)shim_waveOutGetPosition },
-    { "waveOutGetDevCapsA",       (PVOID)shim_waveOutGetDevCapsA },
-    { "waveOutOpen",              (PVOID)shim_waveOutOpen },
-    { "waveOutClose",             (PVOID)shim_waveOutClose },
-    { "waveOutWrite",             (PVOID)shim_waveOutWrite },
-    { "waveOutPrepareHeader",     (PVOID)shim_waveOutPrepareHeader },
-    { "auxGetNumDevs",            (PVOID)shim_auxGetNumDevs },
-    { "auxGetDevCapsA",           (PVOID)shim_auxGetDevCapsA },
-    { "auxSetVolume",             (PVOID)shim_auxSetVolume },
-    { "mixerGetNumDevs",          (PVOID)shim_mixerGetNumDevs },
-    { "mixerGetControlDetailsA",  (PVOID)shim_mixerGetControlDetailsA },
-    { "mixerGetDevCapsA",         (PVOID)shim_mixerGetDevCapsA },
-    { "mixerGetLineInfoA",        (PVOID)shim_mixerGetLineInfoA },
-    { "mixerSetControlDetails",   (PVOID)shim_mixerSetControlDetails },
-    { "mciSendCommandA",          (PVOID)shim_mciSendCommandA },
-    { "mciSendStringA",           (PVOID)shim_mciSendStringA },
-    { NULL, NULL }
+    { "timeGetTime",              (PVOID)shim_timeGetTime,             0, CC_STDCALL },
+    { "timeBeginPeriod",          (PVOID)shim_timeBeginPeriod,         1, CC_STDCALL },
+    { "timeEndPeriod",            (PVOID)shim_timeEndPeriod,           1, CC_STDCALL },
+    { "timeSetEvent",             (PVOID)shim_timeSetEvent,            5, CC_STDCALL },
+    { "timeKillEvent",            (PVOID)shim_timeKillEvent,           1, CC_STDCALL },
+    { "joyGetNumDevs",            (PVOID)shim_joyGetNumDevs,           0, CC_STDCALL },
+    { "joyGetDevCapsA",           (PVOID)shim_joyGetDevCapsA,          3, CC_STDCALL },
+    { "joyGetPosEx",              (PVOID)shim_joyGetPosEx,             2, CC_STDCALL },
+    { "PlaySoundA",               (PVOID)shim_PlaySoundA,              3, CC_STDCALL },
+    { "waveOutGetNumDevs",        (PVOID)shim_waveOutGetNumDevs,       0, CC_STDCALL },
+    { "waveOutReset",             (PVOID)shim_waveOutReset,            1, CC_STDCALL },
+    { "waveOutUnprepareHeader",   (PVOID)shim_waveOutUnprepareHeader,  3, CC_STDCALL },
+    { "waveOutGetPosition",       (PVOID)shim_waveOutGetPosition,      3, CC_STDCALL },
+    { "waveOutGetDevCapsA",       (PVOID)shim_waveOutGetDevCapsA,      3, CC_STDCALL },
+    { "waveOutOpen",              (PVOID)shim_waveOutOpen,             6, CC_STDCALL },
+    { "waveOutClose",             (PVOID)shim_waveOutClose,            1, CC_STDCALL },
+    { "waveOutWrite",             (PVOID)shim_waveOutWrite,            3, CC_STDCALL },
+    { "waveOutPrepareHeader",     (PVOID)shim_waveOutPrepareHeader,    3, CC_STDCALL },
+    { "auxGetNumDevs",            (PVOID)shim_auxGetNumDevs,           0, CC_STDCALL },
+    { "auxGetDevCapsA",           (PVOID)shim_auxGetDevCapsA,          3, CC_STDCALL },
+    { "auxSetVolume",             (PVOID)shim_auxSetVolume,            2, CC_STDCALL },
+    { "mixerGetNumDevs",          (PVOID)shim_mixerGetNumDevs,         0, CC_STDCALL },
+    { "mixerGetControlDetailsA",  (PVOID)shim_mixerGetControlDetailsA, 3, CC_STDCALL },
+    { "mixerGetDevCapsA",         (PVOID)shim_mixerGetDevCapsA,        3, CC_STDCALL },
+    { "mixerGetLineInfoA",        (PVOID)shim_mixerGetLineInfoA,       3, CC_STDCALL },
+    { "mixerSetControlDetails",   (PVOID)shim_mixerSetControlDetails,  3, CC_STDCALL },
+    { "mciSendCommandA",          (PVOID)shim_mciSendCommandA,         4, CC_STDCALL },
+    { "mciSendStringA",           (PVOID)shim_mciSendStringA,          4, CC_STDCALL },
+    { NULL, NULL, 0, CC_STDCALL }
 };
+
+const WIN32_EXPORT *winmm_abi_table(int *count) {
+    *count = (int)(sizeof(winmm_exports)/sizeof(winmm_exports[0]));
+    return (const WIN32_EXPORT *)winmm_exports;
+}
 
 static int wm_strcmp(const char *a, const char *b)
 {

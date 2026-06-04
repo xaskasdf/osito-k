@@ -4,6 +4,7 @@
  */
 
 #include "comdlg32_shim.h"
+#include "win32_abi.h"
 
 extern void serial_puts(const char *s);
 
@@ -51,17 +52,22 @@ BOOL WINAPI shim_PrintDlgA(PVOID pd)
 
 /* ── Export table ──────────────────────────────────────────── */
 
-typedef struct { const char *name; PVOID func; } SHIM_EXPORT;
+typedef struct { const char *name; PVOID func; uint8_t argc; uint8_t cc; } SHIM_EXPORT;
 
 static const SHIM_EXPORT comdlg32_exports[] = {
-    { "GetOpenFileNameA",    (PVOID)shim_GetOpenFileNameA },
-    { "GetSaveFileNameA",    (PVOID)shim_GetSaveFileNameA },
-    { "ChooseColorA",        (PVOID)shim_ChooseColorA },
-    { "ChooseFontA",         (PVOID)shim_ChooseFontA },
-    { "CommDlgExtendedError",(PVOID)shim_CommDlgExtendedError },
-    { "PrintDlgA",           (PVOID)shim_PrintDlgA },
-    { NULL, NULL }
+    { "GetOpenFileNameA",    (PVOID)shim_GetOpenFileNameA,     1, CC_STDCALL },
+    { "GetSaveFileNameA",    (PVOID)shim_GetSaveFileNameA,     1, CC_STDCALL },
+    { "ChooseColorA",        (PVOID)shim_ChooseColorA,         1, CC_STDCALL },
+    { "ChooseFontA",         (PVOID)shim_ChooseFontA,          1, CC_STDCALL },
+    { "CommDlgExtendedError",(PVOID)shim_CommDlgExtendedError, 0, CC_STDCALL },
+    { "PrintDlgA",           (PVOID)shim_PrintDlgA,            1, CC_STDCALL },
+    { NULL, NULL, 0, CC_STDCALL }
 };
+
+const WIN32_EXPORT *comdlg32_abi_table(int *count) {
+    *count = (int)(sizeof(comdlg32_exports)/sizeof(comdlg32_exports[0]));
+    return (const WIN32_EXPORT *)comdlg32_exports;
+}
 
 static int cd_strcmp(const char *a, const char *b)
 {

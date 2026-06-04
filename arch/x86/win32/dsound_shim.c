@@ -13,6 +13,7 @@
  */
 
 #include "dsound_shim.h"
+#include "win32_abi.h"
 
 extern void serial_puts(const char *s);
 extern void serial_puthex(uint64_t val, int digits);
@@ -884,13 +885,18 @@ HRESULT WINAPI DirectSoundEnumerateA(PVOID lpDSEnumCallback, PVOID lpContext)
 
 /* ── Export table ──────────────────────────────────────────── */
 
-typedef struct { const char *name; PVOID func; } SHIM_EXPORT;
+typedef struct { const char *name; PVOID func; uint8_t argc; uint8_t cc; } SHIM_EXPORT;
 
 static const SHIM_EXPORT dsound_exports[] = {
-    { "DirectSoundCreate",     (PVOID)DirectSoundCreate },
-    { "DirectSoundEnumerateA", (PVOID)DirectSoundEnumerateA },
-    { NULL, NULL }
+    { "DirectSoundCreate",     (PVOID)DirectSoundCreate,     3, CC_STDCALL },
+    { "DirectSoundEnumerateA", (PVOID)DirectSoundEnumerateA, 2, CC_STDCALL },
+    { NULL, NULL, 0, CC_STDCALL }
 };
+
+const WIN32_EXPORT *dsound_abi_table(int *count) {
+    *count = (int)(sizeof(dsound_exports)/sizeof(dsound_exports[0]));
+    return (const WIN32_EXPORT *)dsound_exports;
+}
 
 static int ds_strcmp(const char *a, const char *b)
 {

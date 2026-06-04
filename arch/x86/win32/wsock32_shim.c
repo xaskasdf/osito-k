@@ -8,6 +8,7 @@
  */
 
 #include "wsock32_shim.h"
+#include "win32_abi.h"
 
 extern void serial_puts(const char *s);
 extern void serial_puthex(uint64_t val, int digits);
@@ -654,36 +655,36 @@ USHORT WINAPI htons(USHORT h) { return ntohs(h); }
 
 /* ── Export table ──────────────────────────────────────────── */
 
-typedef struct { const char *name; PVOID func; } SHIM_EXPORT;
+typedef struct { const char *name; PVOID func; uint8_t argc; uint8_t cc; } SHIM_EXPORT;
 
 static const SHIM_EXPORT wsock_exports[] = {
-    { "WSAStartup",     (PVOID)WSAStartup },
-    { "WSACleanup",     (PVOID)WSACleanup },
-    { "WSAGetLastError",(PVOID)WSAGetLastError },
-    { "socket",         (PVOID)wsock_socket },
-    { "accept",         (PVOID)wsock_accept },
-    { "closesocket",    (PVOID)closesocket },
-    { "connect",        (PVOID)wsock_connect },
-    { "send",           (PVOID)wsock_send },
-    { "recv",           (PVOID)wsock_recv },
-    { "recvfrom",       (PVOID)wsock_recvfrom },
-    { "sendto",         (PVOID)wsock_sendto },
-    { "bind",           (PVOID)wsock_bind },
-    { "listen",         (PVOID)wsock_listen },
-    { "select",         (PVOID)wsock_select },
-    { "getpeername",    (PVOID)wsock_getpeername },
-    { "getsockname",    (PVOID)wsock_getsockname },
-    { "getsockopt",     (PVOID)wsock_getsockopt },
-    { "setsockopt",     (PVOID)wsock_setsockopt },
-    { "shutdown",       (PVOID)wsock_shutdown },
-    { "gethostbyname",  (PVOID)wsock_gethostbyname },
-    { "inet_addr",      (PVOID)wsock_inet_addr },
-    { "inet_ntoa",      (PVOID)wsock_inet_ntoa },
-    { "ntohl",          (PVOID)ntohl },
-    { "htonl",          (PVOID)htonl },
-    { "ntohs",          (PVOID)ntohs },
-    { "htons",          (PVOID)htons },
-    { NULL, NULL }
+    { "WSAStartup",     (PVOID)WSAStartup,         2, CC_STDCALL },
+    { "WSACleanup",     (PVOID)WSACleanup,         0, CC_STDCALL },
+    { "WSAGetLastError",(PVOID)WSAGetLastError,    0, CC_STDCALL },
+    { "socket",         (PVOID)wsock_socket,       3, CC_STDCALL },
+    { "accept",         (PVOID)wsock_accept,       3, CC_STDCALL },
+    { "closesocket",    (PVOID)closesocket,        1, CC_STDCALL },
+    { "connect",        (PVOID)wsock_connect,      3, CC_STDCALL },
+    { "send",           (PVOID)wsock_send,         4, CC_STDCALL },
+    { "recv",           (PVOID)wsock_recv,         4, CC_STDCALL },
+    { "recvfrom",       (PVOID)wsock_recvfrom,     6, CC_STDCALL },
+    { "sendto",         (PVOID)wsock_sendto,       6, CC_STDCALL },
+    { "bind",           (PVOID)wsock_bind,         3, CC_STDCALL },
+    { "listen",         (PVOID)wsock_listen,       2, CC_STDCALL },
+    { "select",         (PVOID)wsock_select,       5, CC_STDCALL },
+    { "getpeername",    (PVOID)wsock_getpeername,  3, CC_STDCALL },
+    { "getsockname",    (PVOID)wsock_getsockname,  3, CC_STDCALL },
+    { "getsockopt",     (PVOID)wsock_getsockopt,   5, CC_STDCALL },
+    { "setsockopt",     (PVOID)wsock_setsockopt,   5, CC_STDCALL },
+    { "shutdown",       (PVOID)wsock_shutdown,     2, CC_STDCALL },
+    { "gethostbyname",  (PVOID)wsock_gethostbyname,1, CC_STDCALL },
+    { "inet_addr",      (PVOID)wsock_inet_addr,    1, CC_STDCALL },
+    { "inet_ntoa",      (PVOID)wsock_inet_ntoa,    1, CC_STDCALL },
+    { "ntohl",          (PVOID)ntohl,              1, CC_STDCALL },
+    { "htonl",          (PVOID)htonl,              1, CC_STDCALL },
+    { "ntohs",          (PVOID)ntohs,              1, CC_STDCALL },
+    { "htons",          (PVOID)htons,              1, CC_STDCALL },
+    { NULL, NULL, 0, CC_STDCALL }
 };
 
 /* ── Ordinal table (WSOCK32 exports by ordinal, not name) ──── */
@@ -734,3 +735,8 @@ PVOID wsock32_resolve(const char *func_name, USHORT ordinal, BOOL by_ordinal)
 }
 
 PVOID wsock32_shim_init(void) { return (PVOID)wsock_exports; }
+
+const WIN32_EXPORT *wsock32_abi_table(int *count) {
+    *count = (int)(sizeof(wsock_exports)/sizeof(wsock_exports[0]));
+    return (const WIN32_EXPORT *)wsock_exports;
+}

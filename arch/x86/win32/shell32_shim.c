@@ -6,6 +6,7 @@
  */
 
 #include "shell32_shim.h"
+#include "win32_abi.h"
 
 extern void serial_puts(const char *s);
 
@@ -39,14 +40,19 @@ BOOL WINAPI Shell_NotifyIconA(DWORD dwMessage, PVOID lpData)
 
 /* ── Export table ──────────────────────────────────────────── */
 
-typedef struct { const char *name; PVOID func; } SHIM_EXPORT;
+typedef struct { const char *name; PVOID func; uint8_t argc; uint8_t cc; } SHIM_EXPORT;
 
 static const SHIM_EXPORT shell32_exports[] = {
-    { "ShellExecuteA",      (PVOID)ShellExecuteA },
-    { "ShellExecuteW",      (PVOID)ShellExecuteW },
-    { "Shell_NotifyIconA",  (PVOID)Shell_NotifyIconA },
-    { NULL, NULL }
+    { "ShellExecuteA",      (PVOID)ShellExecuteA,     6, CC_STDCALL },
+    { "ShellExecuteW",      (PVOID)ShellExecuteW,     6, CC_STDCALL },
+    { "Shell_NotifyIconA",  (PVOID)Shell_NotifyIconA, 2, CC_STDCALL },
+    { NULL, NULL, 0, CC_STDCALL }
 };
+
+const WIN32_EXPORT *shell32_abi_table(int *count) {
+    *count = (int)(sizeof(shell32_exports)/sizeof(shell32_exports[0]));
+    return (const WIN32_EXPORT *)shell32_exports;
+}
 
 static int shell_strcmp(const char *a, const char *b)
 {

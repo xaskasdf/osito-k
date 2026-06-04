@@ -11,6 +11,7 @@
 
 #include "ntdll_shim.h"
 #include "ntsyscall.h"
+#include "win32_abi.h"
 
 /* ── Rtl* Utilities ─────────────────────────────────────────── */
 
@@ -92,6 +93,8 @@ ULONG RtlNtStatusToDosError(NTSTATUS status)
 typedef struct _SHIM_EXPORT {
     const char *name;
     PVOID       func;
+    uint8_t     argc;
+    uint8_t     cc;
 } SHIM_EXPORT;
 
 /* Forward declare NT handlers — these are the kernel-side implementations
@@ -666,63 +669,68 @@ static NTSTATUS NTAPI LdrGetProcedureAddress(PVOID BaseAddress,
 
 static const SHIM_EXPORT ntdll_exports[] = {
     /* NT API */
-    { "NtCreateFile",              (PVOID)NtCreateFile },
-    { "NtReadFile",                (PVOID)NtReadFile },
-    { "NtWriteFile",               (PVOID)NtWriteFile },
-    { "NtClose",                   (PVOID)NtClose },
-    { "NtAllocateVirtualMemory",   (PVOID)NtAllocateVirtualMemory },
-    { "NtFreeVirtualMemory",       (PVOID)NtFreeVirtualMemory },
-    { "NtTerminateProcess",        (PVOID)NtTerminateProcess },
-    { "NtDelayExecution",          (PVOID)NtDelayExecution },
-    { "NtQueryPerformanceCounter", (PVOID)NtQueryPerformanceCounter },
-    { "NtQueryInformationFile",    (PVOID)NtQueryInformationFile },
-    { "NtSetInformationFile",      (PVOID)NtSetInformationFile },
-    { "NtDuplicateObject",         (PVOID)NtDuplicateObject },
-    { "NtProtectVirtualMemory",    (PVOID)NtProtectVirtualMemory },
-    { "NtQueryVirtualMemory",      (PVOID)NtQueryVirtualMemory },
+    { "NtCreateFile",              (PVOID)NtCreateFile,              11, CC_STDCALL },
+    { "NtReadFile",                (PVOID)NtReadFile,                 9, CC_STDCALL },
+    { "NtWriteFile",               (PVOID)NtWriteFile,                9, CC_STDCALL },
+    { "NtClose",                   (PVOID)NtClose,                    1, CC_STDCALL },
+    { "NtAllocateVirtualMemory",   (PVOID)NtAllocateVirtualMemory,    6, CC_STDCALL },
+    { "NtFreeVirtualMemory",       (PVOID)NtFreeVirtualMemory,        4, CC_STDCALL },
+    { "NtTerminateProcess",        (PVOID)NtTerminateProcess,         2, CC_STDCALL },
+    { "NtDelayExecution",          (PVOID)NtDelayExecution,           2, CC_STDCALL },
+    { "NtQueryPerformanceCounter", (PVOID)NtQueryPerformanceCounter,  2, CC_STDCALL },
+    { "NtQueryInformationFile",    (PVOID)NtQueryInformationFile,     5, CC_STDCALL },
+    { "NtSetInformationFile",      (PVOID)NtSetInformationFile,       5, CC_STDCALL },
+    { "NtDuplicateObject",         (PVOID)NtDuplicateObject,          7, CC_STDCALL },
+    { "NtProtectVirtualMemory",    (PVOID)NtProtectVirtualMemory,     5, CC_STDCALL },
+    { "NtQueryVirtualMemory",      (PVOID)NtQueryVirtualMemory,       6, CC_STDCALL },
     /* Section (memory-mapped files) */
-    { "NtCreateSection",           (PVOID)NtCreateSection },
-    { "NtMapViewOfSection",        (PVOID)NtMapViewOfSection },
-    { "NtUnmapViewOfSection",      (PVOID)NtUnmapViewOfSection },
-    { "ZwCreateSection",           (PVOID)NtCreateSection },
-    { "ZwMapViewOfSection",        (PVOID)NtMapViewOfSection },
-    { "ZwUnmapViewOfSection",      (PVOID)NtUnmapViewOfSection },
+    { "NtCreateSection",           (PVOID)NtCreateSection,            7, CC_STDCALL },
+    { "NtMapViewOfSection",        (PVOID)NtMapViewOfSection,        10, CC_STDCALL },
+    { "NtUnmapViewOfSection",      (PVOID)NtUnmapViewOfSection,       2, CC_STDCALL },
+    { "ZwCreateSection",           (PVOID)NtCreateSection,            7, CC_STDCALL },
+    { "ZwMapViewOfSection",        (PVOID)NtMapViewOfSection,        10, CC_STDCALL },
+    { "ZwUnmapViewOfSection",      (PVOID)NtUnmapViewOfSection,       2, CC_STDCALL },
     /* Synchronization (Phase 21) */
-    { "NtCreateEvent",             (PVOID)NtCreateEvent },
-    { "NtSetEvent",                (PVOID)NtSetEvent },
-    { "NtResetEvent",              (PVOID)NtResetEvent },
-    { "NtPulseEvent",              (PVOID)NtPulseEvent },
-    { "NtWaitForSingleObject",     (PVOID)NtWaitForSingleObject },
+    { "NtCreateEvent",             (PVOID)NtCreateEvent,              5, CC_STDCALL },
+    { "NtSetEvent",                (PVOID)NtSetEvent,                 2, CC_STDCALL },
+    { "NtResetEvent",              (PVOID)NtResetEvent,               2, CC_STDCALL },
+    { "NtPulseEvent",              (PVOID)NtPulseEvent,               2, CC_STDCALL },
+    { "NtWaitForSingleObject",     (PVOID)NtWaitForSingleObject,      3, CC_STDCALL },
     /* Zw aliases (identical in user mode) */
-    { "ZwCreateFile",              (PVOID)NtCreateFile },
-    { "ZwReadFile",                (PVOID)NtReadFile },
-    { "ZwWriteFile",               (PVOID)NtWriteFile },
-    { "ZwClose",                   (PVOID)NtClose },
-    { "ZwQueryInformationFile",    (PVOID)NtQueryInformationFile },
-    { "ZwSetInformationFile",      (PVOID)NtSetInformationFile },
-    { "ZwDuplicateObject",         (PVOID)NtDuplicateObject },
-    { "ZwCreateEvent",             (PVOID)NtCreateEvent },
-    { "ZwSetEvent",                (PVOID)NtSetEvent },
-    { "ZwResetEvent",              (PVOID)NtResetEvent },
-    { "ZwPulseEvent",              (PVOID)NtPulseEvent },
-    { "ZwWaitForSingleObject",     (PVOID)NtWaitForSingleObject },
+    { "ZwCreateFile",              (PVOID)NtCreateFile,              11, CC_STDCALL },
+    { "ZwReadFile",                (PVOID)NtReadFile,                 9, CC_STDCALL },
+    { "ZwWriteFile",               (PVOID)NtWriteFile,                9, CC_STDCALL },
+    { "ZwClose",                   (PVOID)NtClose,                    1, CC_STDCALL },
+    { "ZwQueryInformationFile",    (PVOID)NtQueryInformationFile,     5, CC_STDCALL },
+    { "ZwSetInformationFile",      (PVOID)NtSetInformationFile,       5, CC_STDCALL },
+    { "ZwDuplicateObject",         (PVOID)NtDuplicateObject,          7, CC_STDCALL },
+    { "ZwCreateEvent",             (PVOID)NtCreateEvent,              5, CC_STDCALL },
+    { "ZwSetEvent",                (PVOID)NtSetEvent,                 2, CC_STDCALL },
+    { "ZwResetEvent",              (PVOID)NtResetEvent,               2, CC_STDCALL },
+    { "ZwPulseEvent",              (PVOID)NtPulseEvent,               2, CC_STDCALL },
+    { "ZwWaitForSingleObject",     (PVOID)NtWaitForSingleObject,      3, CC_STDCALL },
     /* Rtl utilities */
-    { "RtlInitUnicodeString",      (PVOID)RtlInitUnicodeString },
-    { "RtlCopyMemory",             (PVOID)RtlCopyMemory },
-    { "RtlZeroMemory",             (PVOID)RtlZeroMemory },
-    { "RtlFillMemory",             (PVOID)RtlFillMemory },
-    { "RtlNtStatusToDosError",     (PVOID)RtlNtStatusToDosError },
+    { "RtlInitUnicodeString",      (PVOID)RtlInitUnicodeString,       2, CC_STDCALL },
+    { "RtlCopyMemory",             (PVOID)RtlCopyMemory,              3, CC_STDCALL },
+    { "RtlZeroMemory",             (PVOID)RtlZeroMemory,              2, CC_STDCALL },
+    { "RtlFillMemory",             (PVOID)RtlFillMemory,              3, CC_STDCALL },
+    { "RtlNtStatusToDosError",     (PVOID)RtlNtStatusToDosError,      1, CC_STDCALL },
     /* SEH support */
-    { "RtlRaiseException",         (PVOID)RtlRaiseException },
-    { "RtlUnwind",                 (PVOID)RtlUnwind },
-    { "RtlCaptureContext",         (PVOID)RtlCaptureContext },
-    { "NtRaiseException",          (PVOID)NtRaiseException },
-    { "ZwRaiseException",          (PVOID)NtRaiseException },
+    { "RtlRaiseException",         (PVOID)RtlRaiseException,          1, CC_STDCALL },
+    { "RtlUnwind",                 (PVOID)RtlUnwind,                  4, CC_STDCALL },
+    { "RtlCaptureContext",         (PVOID)RtlCaptureContext,          1, CC_STDCALL },
+    { "NtRaiseException",          (PVOID)NtRaiseException,           3, CC_STDCALL },
+    { "ZwRaiseException",          (PVOID)NtRaiseException,           3, CC_STDCALL },
     /* Loader */
-    { "LdrLoadDll",                (PVOID)LdrLoadDll },
-    { "LdrGetProcedureAddress",    (PVOID)LdrGetProcedureAddress },
-    { NULL, NULL }
+    { "LdrLoadDll",                (PVOID)LdrLoadDll,                 4, CC_STDCALL },
+    { "LdrGetProcedureAddress",    (PVOID)LdrGetProcedureAddress,     4, CC_STDCALL },
+    { NULL, NULL, 0, CC_STDCALL }
 };
+
+const WIN32_EXPORT *ntdll_abi_table(int *count) {
+    *count = (int)(sizeof(ntdll_exports)/sizeof(ntdll_exports[0]));
+    return (const WIN32_EXPORT *)ntdll_exports;
+}
 
 #define NTDLL_EXPORT_COUNT \
     (sizeof(ntdll_exports) / sizeof(ntdll_exports[0]) - 1)

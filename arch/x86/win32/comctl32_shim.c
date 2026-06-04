@@ -4,6 +4,7 @@
  */
 
 #include "comctl32_shim.h"
+#include "win32_abi.h"
 
 extern void serial_puts(const char *s);
 
@@ -40,15 +41,20 @@ PVOID WINAPI shim_ImageList_Create(int cx, int cy, UINT flags,
 
 /* ── Export table ──────────────────────────────────────────── */
 
-typedef struct { const char *name; PVOID func; } SHIM_EXPORT;
+typedef struct { const char *name; PVOID func; uint8_t argc; uint8_t cc; } SHIM_EXPORT;
 
 static const SHIM_EXPORT comctl32_exports[] = {
-    { "InitCommonControls",   (PVOID)shim_InitCommonControls },
-    { "InitCommonControlsEx", (PVOID)shim_InitCommonControlsEx },
-    { "CreateStatusWindowA",  (PVOID)shim_CreateStatusWindowA },
-    { "ImageList_Create",     (PVOID)shim_ImageList_Create },
-    { NULL, NULL }
+    { "InitCommonControls",   (PVOID)shim_InitCommonControls,   0, CC_STDCALL },
+    { "InitCommonControlsEx", (PVOID)shim_InitCommonControlsEx, 1, CC_STDCALL },
+    { "CreateStatusWindowA",  (PVOID)shim_CreateStatusWindowA,  4, CC_STDCALL },
+    { "ImageList_Create",     (PVOID)shim_ImageList_Create,     5, CC_STDCALL },
+    { NULL, NULL, 0, CC_STDCALL }
 };
+
+const WIN32_EXPORT *comctl32_abi_table(int *count) {
+    *count = (int)(sizeof(comctl32_exports)/sizeof(comctl32_exports[0]));
+    return (const WIN32_EXPORT *)comctl32_exports;
+}
 
 static int cc_strcmp(const char *a, const char *b)
 {
