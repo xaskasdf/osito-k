@@ -1133,6 +1133,30 @@ static bool path_normalize_flat(const char *path, char *out, int out_sz)
     return rewritten;
 }
 
+/* Synthetic directories for the flat OsitoFS namespace. A path is a
+ * "directory" if it is the slash-prefix of any stored file key (the FS has
+ * no real directory entries — keys are full paths like "usr/include/foo").
+ * gcc validates its include dirs by stat()ing them and DROPS any that aren't
+ * S_ISDIR; on a flat FS every include dir ENOENT'd, so gcc reported
+ * "no include path in which to search for stdc-predef.h". `flat` must already
+ * be path_normalize_flat()'d. */
+static bool osfs2_path_is_dir(const char *flat)
+{
+    extern uint32_t     osfs2_file_count(void);
+    extern void        *osfs2_get_file(int index);
+    extern const char  *osfs2_file_name(void *file);
+    if (!flat) return false;
+    if (!flat[0]) return true;                 /* "" == root */
+    uint64_t len = strlen(flat);
+    uint32_t n = osfs2_file_count();
+    for (uint32_t i = 0; i < n; i++) {
+        const char *name = osfs2_file_name(osfs2_get_file((int)i));
+        if (name && str_startswith(name, flat) && name[len] == '/')
+            return true;
+    }
+    return false;
+}
+
 static int64_t sys_open(uint64_t path_addr, uint64_t flags, uint64_t mode)
 {
     (void)mode;
@@ -2349,7 +2373,24 @@ static int64_t sys_newfstatat(uint64_t dirfd, uint64_t path_addr,
 
     /* Open, stat, close */
     int64_t fd = sys_open(path_addr, O_RDONLY, 0);
-    if (fd < 0) return fd;
+    if (fd < 0) {
+        /* The flat FS has no directory entries, so a directory path fails
+         * to open. Report it as a directory if it is the prefix of any
+         * stored file — lets gcc keep its include dirs (S_ISDIR check). */
+        char norm[256];
+        const char *flat = path;
+        if (path_normalize_flat(path, norm, sizeof(norm)) && norm[0])
+            flat = norm;
+        if (osfs2_path_is_dir(flat)) {
+            linux_stat_t *st = (linux_stat_t *)statbuf_addr;
+            memset(st, 0, sizeof(*st));
+            st->st_mode   = 0040755;  /* S_IFDIR | 0755 */
+            st->st_nlink  = 2;
+            st->st_blksize = 4096;
+            return 0;
+        }
+        return fd;
+    }
     int64_t ret = sys_fstat((uint64_t)fd, statbuf_addr);
     sys_close((uint64_t)fd);
     return ret;
