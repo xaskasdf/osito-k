@@ -436,6 +436,26 @@ BOOL WINAPI UnregisterClassA(PCSTR lpClassName, HINSTANCE hInstance)
     return FALSE;
 }
 
+/* Deliver WM_SIZE to a window's 32-bit wndproc. Real Windows posts WM_SIZE
+ * synchronously when a window is created with a size, resized, or shown — UE1's
+ * UWindowsViewport learns SizeX/SizeY from this message (its WndProc WM_SIZE
+ * handler calls ResizeViewport). Without it the viewport stays 0x0 → SoftDrv
+ * SetRes(0,0) → DirectDraw SetDisplayMode(0,0) → zero-size surface → no frame.
+ * compat32_callback_args handles the 64→32 mode switch (nesting-safe). */
+static void dispatch_wm_size(WINDOW *w)
+{
+    if (!w || !w->wndproc || w->width == 0 || w->height == 0) return;
+    extern uint32_t compat32_callback_args(uint32_t func, int nargs,
+                                            const uint32_t *args);
+    uint32_t args[4] = {
+        (uint32_t)(uintptr_t)w->handle,
+        WM_SIZE,
+        0,  /* wParam = SIZE_RESTORED */
+        ((uint32_t)w->width & 0xFFFF) | (((uint32_t)w->height & 0xFFFF) << 16),
+    };
+    compat32_callback_args((uint32_t)(uintptr_t)w->wndproc, 4, args);
+}
+
 HWND WINAPI CreateWindowExA(DWORD dwExStyle, PCSTR lpClassName,
                             PCSTR lpWindowName, DWORD dwStyle,
                             int X, int Y, int nWidth, int nHeight,
@@ -560,6 +580,13 @@ HWND WINAPI CreateWindowExA(DWORD dwExStyle, PCSTR lpClassName,
         }
     }
 
+    /* Real Windows sends WM_SIZE during CreateWindow when the window has a
+     * non-zero size. UE1's viewport window is created already sized (e.g.
+     * 640x480), so this is where it must learn SizeX/SizeY — there is no later
+     * MoveWindow. Dispatched after the hWnd↔this association above so the
+     * WndProc can resolve the window. */
+    dispatch_wm_size(w);
+
     return w->handle;
 }
 
@@ -593,8 +620,12 @@ BOOL WINAPI ShowWindow(HWND hWnd, int nCmdShow)
     int was_visible = w->visible;
     w->visible = (nCmdShow != SW_HIDE) ? 1 : 0;
 
-    /* Don't call wndproc directly — it's 32-bit PE code.
-     * WM_SHOWWINDOW is informational; the engine doesn't need it dispatched. */
+    /* On first show, real Windows posts WM_SIZE to the wndproc. UE1's viewport
+     * may rely on this (rather than the WM_SIZE during CreateWindow) to pick up
+     * SizeX/SizeY before the render device is set up. compat32_callback_args
+     * handles the 64→32 switch. */
+    if (!was_visible && w->visible)
+        dispatch_wm_size(w);
 
     return was_visible;
 }
@@ -624,10 +655,18 @@ BOOL WINAPI SetWindowPos(HWND hWnd, HWND hWndInsertAfter,
                          int X, int Y, int cx, int cy, DWORD uFlags)
 {
     (void)hWndInsertAfter;
-    (void)uFlags;
     WINDOW *w = find_window(hWnd);
     if (!w) return FALSE;
-    w->x = X; w->y = Y; w->width = cx; w->height = cy;
+    /* Honor SWP_NOMOVE (0x0002) / SWP_NOSIZE (0x0001): leave pos/size untouched
+     * when the caller asks to. The old code clobbered them to X/Y/cx/cy
+     * unconditionally, so a SWP_NOSIZE call (cx=cy=0) would zero the window. */
+    if (!(uFlags & 0x0002)) { w->x = X; w->y = Y; }
+    if (!(uFlags & 0x0001)) {
+        DWORD old_w = w->width, old_h = w->height;
+        w->width = cx; w->height = cy;
+        if ((DWORD)cx != old_w || (DWORD)cy != old_h)
+            dispatch_wm_size(w);
+    }
     return TRUE;
 }
 
@@ -635,10 +674,12 @@ BOOL WINAPI MoveWindow(HWND hWnd, int X, int Y, int nWidth, int nHeight, BOOL bR
 {
     WINDOW *w = find_window(hWnd);
     if (!w) return FALSE;
+    DWORD old_w = w->width, old_h = w->height;
     w->x = X; w->y = Y; w->width = nWidth; w->height = nHeight;
-    if (bRepaint && w->wndproc && w->visible)
-        /* wndproc is 32-bit PE code — can't call from 64-bit */
-        (void)w; /* WM_PAINT not dispatched */
+    (void)bRepaint;
+    /* Resizing posts WM_SIZE in real Windows; UE1's viewport relies on it. */
+    if ((DWORD)nWidth != old_w || (DWORD)nHeight != old_h)
+        dispatch_wm_size(w);
     return TRUE;
 }
 
@@ -1328,8 +1369,23 @@ LRESULT WINAPI DispatchMessageW(const MSG *lpMsg)
 
 LRESULT WINAPI SendMessageW(HWND hWnd, DWORD Msg, WPARAM wParam, LPARAM lParam)
 {
-    (void)hWnd; (void)Msg; (void)wParam; (void)lParam;
-    return 0;
+    /* UT99 is a Unicode build and uses the W variant; this must dispatch to the
+     * 32-bit wndproc exactly like SendMessageA (previously a no-op return 0,
+     * which silently dropped engine messages such as WM_SIZE/WM_ACTIVATE). */
+    WINDOW *w = find_window(hWnd);
+    if (w && w->wndproc) {
+        extern uint32_t compat32_callback_args(uint32_t func, int nargs,
+                                                const uint32_t *args);
+        uint32_t args[4] = {
+            (uint32_t)(uintptr_t)hWnd,
+            (uint32_t)Msg,
+            (uint32_t)wParam,
+            (uint32_t)lParam
+        };
+        return (LRESULT)compat32_callback_args(
+            (uint32_t)(uintptr_t)w->wndproc, 4, args);
+    }
+    return DefWindowProcW(hWnd, Msg, wParam, lParam);
 }
 
 LRESULT WINAPI SendMessageTimeoutW(HWND hWnd, DWORD Msg, WPARAM wParam, LPARAM lParam,

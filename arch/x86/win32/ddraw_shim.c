@@ -48,8 +48,8 @@ static void dd_memcpy(void *dst, const void *src, SIZE_T n)
 
 /* ── Display state ─────────────────────────────────────────── */
 
-static DWORD display_width  = 800;
-static DWORD display_height = 600;
+static DWORD display_width  = 640;  /* UT99 default WindowedViewportX */
+static DWORD display_height = 480;  /* UT99 default WindowedViewportY */
 static DWORD display_bpp    = 16;  /* UT99 SoftDrv uses 16-bit (RGB565) */
 
 /* Framebuffer pointer — connect to real GOP LFB on OsitoK bare metal,
@@ -928,13 +928,23 @@ static HRESULT WINAPI dd_SetDisplayMode(IDirectDraw7 *self, DWORD w, DWORD h,
                                          DWORD bpp, DWORD refreshRate, DWORD flags)
 {
     (void)self; (void)refreshRate; (void)flags;
-    display_width  = w;
-    display_height = h;
-    display_bpp    = bpp;
+    /* A 0-width/height mode is invalid (real DDraw → DDERR_INVALIDMODE). UT99's
+     * SoftDrv passes (0,0,16) here — its UWindowsViewport hands SetRes a 0x0
+     * extent. Rather than brick every surface with a 0x0 size, keep the current
+     * (real) mode: SetDisplayMode(0,...) means "don't change resolution". Only
+     * adopt w/h when both are non-zero. */
+    if (w > 0 && h > 0) {
+        display_width  = w;
+        display_height = h;
+    }
+    if (bpp > 0)
+        display_bpp = bpp;
 
-    serial_puts("[DDRAW] SetDisplayMode ");
+    serial_puts("[DDRAW] SetDisplayMode req ");
     serial_puthex(w, 4); serial_puts("x"); serial_puthex(h, 4);
     serial_puts("x"); serial_puthex(bpp, 2);
+    serial_puts(" -> using ");
+    serial_puthex(display_width, 4); serial_puts("x"); serial_puthex(display_height, 4);
     serial_puts("\n");
 
     ensure_framebuffer();
