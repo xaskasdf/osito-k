@@ -1239,7 +1239,12 @@ static void ddraw_init_com32(void)
     extern uint32_t compat32_make_thunk_ex(uint64_t target, const char *name,
                                             uint8_t num_args, uint8_t callconv);
     extern void *mem_alloc_pages(uint64_t count);
-    #define CC_STDCALL 1
+    /* CC_STDCALL comes from compat32.h (== 0). Do NOT redefine it here:
+     * a local `#define CC_STDCALL 1` collides with CC_CDECL (==1), so
+     * emit_thunk() would emit `ret` (cdecl, no cleanup) instead of
+     * `ret N`. The ddraw COM methods are stdcall (callee cleans), and
+     * the leaked args drift ESP → corrupt the caller's saved ESI →
+     * NULL virtual call in WinDrv ResizeViewport (no frame presents). */
 
     /* Allocate COM proxy objects from PE32-accessible memory.
      * Layout in 1 page:

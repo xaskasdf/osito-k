@@ -1433,6 +1433,8 @@ void isr_handler(interrupt_frame_t *frame)
                     serial_puts(rn[reg]);
                     serial_puts(") vtbl=0x"); serial_puthex(vtbl, 8);
                     serial_puts(" this=0x"); serial_puthex((uint32_t)frame->rdi, 8);
+                    serial_puts(" callsite=0x"); serial_puthex(retaddr32 - 6, 8);
+                    serial_puts(" ret=0x"); serial_puthex(retaddr32, 8);
                     serial_puts("\n");
                     /* Dump registers and object for Browse call */
                     if (disp == 0xB0) {
