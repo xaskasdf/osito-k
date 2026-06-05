@@ -1048,7 +1048,8 @@ static const char *const k_host_prefixes[] = {
     NULL,
 };
 
-static bool path_normalize_flat(const char *path, char *out, int out_sz)
+/* Non-static: elf.c (exec path normalization) calls this via an extern decl. */
+bool path_normalize_flat(const char *path, char *out, int out_sz)
 {
     if (!path || !out || out_sz <= 1) return false;
 

@@ -1238,23 +1238,6 @@ void __hot sched_tick(void *frame_ptr)
 
     process_t *cur = &proctab[sched_current_idx];
 
-    /* DIAG [INV]: the running process should be both current_proc AND
-     * proctab[sched_current_idx]. If they disagree on entry, the two
-     * "current" notions have diverged — the FS write path (arch_prctl via
-     * current_proc) and the FS save/restore path (via sched_current_idx)
-     * then operate on different process_t entries. */
-    if (current_proc && current_proc != cur) {
-        serial_puts("[INV] current_proc pid=");
-        serial_putdec(current_proc->pid);
-        serial_puts(" slot=");
-        serial_putdec((uint64_t)(int)(current_proc - proctab));
-        serial_puts(" != sched_idx=");
-        serial_putdec((uint64_t)(uint32_t)sched_current_idx);
-        serial_puts(" slot_pid=");
-        serial_putdec(cur->pid);
-        serial_puts("\n");
-    }
-
     /* Drain syscall-free command ring for current process (if registered).
      * fd_table macro resolves via current_proc which is correct here. */
     {
@@ -1478,20 +1461,6 @@ void __hot sched_tick(void *frame_ptr)
     proc_transition(next, PROC_RUNNING);
     next->quantum = qos_quantum[next->qos_class];
     next->last_active_tick = idt_get_ticks();
-    /* DIAG [SW]: every context switch — who → who (pid:slot). Reveals when the
-     * scheduler resumes the synchronous-exec parent's stale kernel context
-     * (which re-enters the child's userland under the parent's identity). */
-    serial_puts("[SW] cur=");
-    serial_putdec(cur->pid);
-    serial_puts(":");
-    serial_putdec((uint64_t)(uint32_t)sched_current_idx);
-    serial_puts(" -> next=");
-    serial_putdec(next->pid);
-    serial_puts(":");
-    serial_putdec((uint64_t)next_idx);
-    serial_puts(" fs=0x");
-    serial_puthex(next->fs_base, 16);
-    serial_puts("\n");
     set_current_proc(next);
     sched_current_idx = next_idx;
     wrmsr(MSR_FS_BASE, next->fs_base);  /* restore per-thread TLS */
