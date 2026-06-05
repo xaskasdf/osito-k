@@ -420,6 +420,51 @@ uint32_t compat32_make_thunk(uint64_t target, const char *name, uint8_t num_args
     return compat32_make_thunk_ex(target, name, num_args, CC_STDCALL);
 }
 
+/* Native 32-bit _ftol stub. The MS CRT _ftol helper takes its argument in the
+ * x87 ST(0) register — the compiler emits `fld X; call _ftol`, NOT a stack push
+ * — and returns the truncated int64 in EDX:EAX. Routing it through an INT 0x2E
+ * shim is wrong twice: (a) the 64-bit shim reads two garbage DWORDs off the
+ * 32-bit stack instead of ST(0), and (b) the x87 state isn't preserved across
+ * the 32->64 transition (int2e_stub does no fxsave). So emit a real 32-bit
+ * fistp stub that runs entirely in compat mode where ST(0) is valid. This is
+ * the root of UT99's black screen: the fullscreen mode pick does
+ * `fld <matched 640.0>; call _ftol` and was getting 0 back -> ddraw
+ * SetDisplayMode(0,0) -> 0x0 surface. (bpp survived because it's integer
+ * `lea eax,[..*8]`, never _ftol'd — hence "bpp right, WxH zero".) */
+static void emit_ftol_stub(uint8_t *code)
+{
+    static const uint8_t blob[] = {
+        0x83,0xEC,0x0C,             /* sub   esp,12               */
+        0xD9,0x7C,0x24,0x08,        /* fnstcw [esp+8]  (save CW)  */
+        0x0F,0xB7,0x44,0x24,0x08,   /* movzx eax,word [esp+8]     */
+        0x0D,0x00,0x0C,0x00,0x00,   /* or    eax,0x0C00 (RC=trunc)*/
+        0x66,0x89,0x44,0x24,0x0A,   /* mov   [esp+10],ax          */
+        0xD9,0x6C,0x24,0x0A,        /* fldcw [esp+10] (truncate)  */
+        0xDF,0x3C,0x24,             /* fistp qword [esp]          */
+        0xD9,0x6C,0x24,0x08,        /* fldcw [esp+8]  (restore)   */
+        0x8B,0x04,0x24,             /* mov   eax,[esp]            */
+        0x8B,0x54,0x24,0x04,        /* mov   edx,[esp+4]          */
+        0x83,0xC4,0x0C,             /* add   esp,12               */
+        0xC3,                       /* ret   (cdecl, no stack arg)*/
+    };
+    int p = 0;
+    for (unsigned i = 0; i < sizeof(blob); i++) code[p++] = blob[i];
+    while (p < THUNK_STUB_SIZE) code[p++] = 0xCC;
+}
+
+/* True for the st0-based CRT float->int helpers that must run native. */
+static int is_ftol_helper(const char *n)
+{
+    if (!n) return 0;
+    const char *cands[] = { "_ftol", "_ftol2", "__ftol", 0 };
+    for (int i = 0; cands[i]; i++) {
+        const char *a = n, *b = cands[i];
+        while (*a && *b && *a == *b) { a++; b++; }
+        if (*a == 0 && *b == 0) return 1;
+    }
+    return 0;
+}
+
 uint32_t compat32_make_thunk_ex(uint64_t target, const char *name,
                                  uint8_t num_args, uint8_t callconv)
 {
@@ -432,8 +477,12 @@ uint32_t compat32_make_thunk_ex(uint64_t target, const char *name,
     uint32_t idx = thunk_count;
     uint8_t *stub = thunk_pool + (idx * THUNK_STUB_SIZE);
 
-    /* Generate thunk code */
-    emit_thunk(stub, target, num_args, callconv);
+    /* Generate thunk code — _ftol family runs as a native x87 stub (see above);
+     * everything else goes through the INT 0x2E gateway. */
+    if (is_ftol_helper(name))
+        emit_ftol_stub(stub);
+    else
+        emit_thunk(stub, target, num_args, callconv);
 
     /* Record in table */
     thunk_table[idx].thunk_addr  = (uint32_t)(ULONG_PTR)stub;
