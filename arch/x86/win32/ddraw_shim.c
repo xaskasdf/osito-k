@@ -1287,7 +1287,9 @@ static void ddraw_init_com32(void)
                                             "DD_EnumDisplayModes", 5, CC_STDCALL);
     dd_vtbl32[12] = compat32_make_thunk_ex((uint64_t)(ULONG_PTR)dd_GetDisplayMode,
                                             "DD_GetDisplayMode", 2, CC_STDCALL);
-    dd_vtbl32[13] = dd_vtbl32[12]; /* Same method, both IDirectDraw slots */
+    /* slot 13 = GetFourCCCodes (NOT a duplicate GetDisplayMode) — left 0 so the
+     * fill loop installs a correct 3-arg stub. The old `[13]=[12]` duplicate
+     * shifted the dd_args labels and broke RestoreDisplayMode (slot 19). */
     dd_vtbl32[20] = compat32_make_thunk_ex((uint64_t)(ULONG_PTR)dd_SetCooperativeLevel,
                                             "DD_SetCoopLevel", 3, CC_STDCALL);
     dd_vtbl32[21] = compat32_make_thunk_ex((uint64_t)(ULONG_PTR)dd_SetDisplayMode,
@@ -1301,7 +1303,7 @@ static void ddraw_init_com32(void)
     surf_vtbl32[2]  = compat32_make_thunk_ex((uint64_t)(ULONG_PTR)surf_Release,
                                               "Surf_Release", 1, CC_STDCALL);
     surf_vtbl32[5]  = compat32_make_thunk_ex((uint64_t)(ULONG_PTR)surf_Blt,
-                                              "Surf_Blt", 7, CC_STDCALL);
+                                              "Surf_Blt", 6, CC_STDCALL);  /* this+DestRect,SrcSurf,SrcRect,Flags,BltFx */
     surf_vtbl32[7]  = compat32_make_thunk_ex((uint64_t)(ULONG_PTR)surf_BltFast,
                                               "Surf_BltFast", 6, CC_STDCALL);
     surf_vtbl32[11] = compat32_make_thunk_ex((uint64_t)(ULONG_PTR)surf_Flip,
@@ -1328,7 +1330,17 @@ static void ddraw_init_com32(void)
      * otherwise RET N pops wrong number of bytes → stack corruption
      * → SEH chain destroyed → engine can't catch exceptions. */
     {
-        /* IDirectDraw7 arg counts (including 'this'): */
+        /* IDirectDraw vtable arg counts (including 'this'). MUST match the real
+         * IDirectDraw layout exactly — a wrong count makes the stub's RET N
+         * over/under-clean the caller's stack. The table was previously
+         * mis-labelled from slot 13 on (a stray "GetDisplayMode at 13"
+         * duplicate shifted everything by one), which left slot 19
+         * (RestoreDisplayMode = 1 arg) registered as 2. UWindowsViewport's
+         * fullscreen ResizeViewport calls RestoreDisplayMode (RenDev->vtable[19],
+         * 1 pushed arg); the 2-arg stub did RET 8 → over-cleaned 4 bytes →
+         * stack imbalance → the WinDrv wrapper's `pop edi/esi/ebx` (which run
+         * BEFORE `mov esp,ebp`) read shifted slots → corrupt viewport `this` →
+         * #PF on a 0x20 vtable. Correct layout below. */
         static const uint8_t dd_args[23] = {
             3,1,1,  /* 0:QI 1:AddRef 2:Release (implemented) */
             1,      /* 3:Compact */
@@ -1337,17 +1349,17 @@ static void ddraw_init_com32(void)
             4,      /* 6:CreateSurface (implemented) */
             3,      /* 7:DuplicateSurface */
             5,      /* 8:EnumDisplayModes */
-            4,      /* 9:EnumSurfaces */
+            5,      /* 9:EnumSurfaces (dwFlags,lpDDSD,lpCtx,lpCb) */
             1,      /* 10:FlipToGDISurface */
             3,      /* 11:GetCaps */
-            2,      /* 12:GetDisplayMode (implemented as slot 13) */
-            2,      /* 13:GetDisplayMode */
-            3,      /* 14:GetFourCCCodes */
-            2,      /* 15:GetGDISurface */
-            2,      /* 16:GetMonitorFrequency */
-            2,      /* 17:GetScanLine */
-            2,      /* 18:GetVerticalBlankStatus */
-            2,      /* 19:Initialize */
+            2,      /* 12:GetDisplayMode (implemented) */
+            3,      /* 13:GetFourCCCodes (lpNumCodes,lpCodes) */
+            2,      /* 14:GetGDISurface */
+            2,      /* 15:GetMonitorFrequency */
+            2,      /* 16:GetScanLine */
+            2,      /* 17:GetVerticalBlankStatus */
+            2,      /* 18:Initialize (lpGUID) */
+            1,      /* 19:RestoreDisplayMode (this only) */
             3,      /* 20:SetCooperativeLevel (implemented) */
             6,      /* 21:SetDisplayMode (implemented) */
             3,      /* 22:WaitForVerticalBlank */
@@ -1363,26 +1375,30 @@ static void ddraw_init_com32(void)
 
     /* Fill unimplemented Surface slots with correct arg counts */
     {
-        /* IDirectDrawSurface7 arg counts (including 'this'): */
+        /* IDirectDrawSurface arg counts (including 'this'). Corrected against
+         * the real IDirectDrawSurface vtable — several were short, which makes
+         * an unimplemented-slot stub RET too few bytes and imbalance the caller
+         * (the engine's SetRes Blt-clears the surfaces during fullscreen
+         * ResizeViewport). */
         static const uint8_t sf_args[33] = {
             3,1,1,  /* 0:QI 1:AddRef 2:Release */
             2,      /* 3:AddAttachedSurface */
             2,      /* 4:AddOverlayDirtyRect */
-            7,      /* 5:Blt (implemented) */
+            6,      /* 5:Blt (DestRect,SrcSurf,SrcRect,Flags,BltFx) */
             4,      /* 6:BltBatch */
-            5,      /* 7:BltFast */
-            2,      /* 8:DeleteAttachedSurface */
+            6,      /* 7:BltFast (x,y,SrcSurf,SrcRect,Trans) */
+            3,      /* 8:DeleteAttachedSurface (Flags,Surf) */
             3,      /* 9:EnumAttachedSurfaces */
-            3,      /* 10:EnumOverlayZOrders */
+            4,      /* 10:EnumOverlayZOrders (Flags,Ctx,Cb) */
             3,      /* 11:Flip (implemented) */
             3,      /* 12:GetAttachedSurface */
             2,      /* 13:GetBltStatus */
             2,      /* 14:GetCaps */
             2,      /* 15:GetClipper */
-            2,      /* 16:GetColorKey */
+            3,      /* 16:GetColorKey (Flags,ColorKey) */
             2,      /* 17:GetDC */
             2,      /* 18:GetFlipStatus */
-            2,      /* 19:GetOverlayPosition */
+            3,      /* 19:GetOverlayPosition (lX,lY) */
             2,      /* 20:GetPalette */
             2,      /* 21:GetPixelFormat */
             2,      /* 22:GetSurfaceDesc (implemented) */
@@ -1393,7 +1409,7 @@ static void ddraw_init_com32(void)
             1,      /* 27:Restore */
             2,      /* 28:SetClipper */
             3,      /* 29:SetColorKey */
-            2,      /* 30:SetOverlayPosition */
+            3,      /* 30:SetOverlayPosition (X,Y) */
             2,      /* 31:SetPalette */
             2,      /* 32:Unlock (implemented) */
         };
