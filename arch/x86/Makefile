@@ -63,6 +63,14 @@ ifeq ($(COMPAT_TRACE),1)
   KCFLAGS += -DCOMPAT_TRACE=1
 endif
 
+# Dev fast-boot: skip the boot-time GGUF/LLM model load (brandon-tiny, ~20 MB)
+# to shorten the build→boot→UT99 loop. Inference is unavailable in this build.
+#   make -C arch/x86 CLANG=1 SKIP_MODEL=1
+SKIP_MODEL ?= 0
+ifeq ($(SKIP_MODEL),1)
+  KCFLAGS += -DOK_SKIP_MODEL=1
+endif
+
 # Flags for precompiled .o files that may be called from TCC code.
 # TCC doesn't guarantee 16-byte stack alignment (SysV ABI requires it).
 # -mincoming-stack-boundary=3 tells GCC the stack may be 8-byte aligned,

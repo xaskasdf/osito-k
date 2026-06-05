@@ -456,6 +456,30 @@ static void dispatch_wm_size(WINDOW *w)
     compat32_callback_args((uint32_t)(uintptr_t)w->wndproc, 4, args);
 }
 
+/* Tell the engine its window is the active, focused foreground app. UE1's
+ * UWindowsViewport gates realtime rendering on activation: without these
+ * messages the viewport renders one init frame then idles (no per-frame
+ * Repaint → no DDraw present). Real Windows delivers this sequence when a
+ * window is shown and brought to the foreground. */
+static int g_activated = 0;
+static void dispatch_wm_activate(WINDOW *w)
+{
+    if (!w || !w->wndproc) return;
+    extern uint32_t compat32_callback_args(uint32_t func, int nargs,
+                                            const uint32_t *args);
+    uint32_t fn = (uint32_t)(uintptr_t)w->wndproc;
+    uint32_t h  = (uint32_t)(uintptr_t)w->handle;
+    uint32_t a_app[4]  = { h, WM_ACTIVATEAPP, 1, 0 };        /* TRUE, no thread */
+    uint32_t a_ncact[4]= { h, WM_NCACTIVATE, 1, 0 };
+    uint32_t a_act[4]  = { h, WM_ACTIVATE, 1 /*WA_ACTIVE*/, 0 };
+    uint32_t a_focus[4]= { h, WM_SETFOCUS, 0, 0 };
+    compat32_callback_args(fn, 4, a_app);
+    compat32_callback_args(fn, 4, a_ncact);
+    compat32_callback_args(fn, 4, a_act);
+    compat32_callback_args(fn, 4, a_focus);
+    serial_puts("[USER32] dispatched WM_ACTIVATEAPP/ACTIVATE/SETFOCUS\n");
+}
+
 HWND WINAPI CreateWindowExA(DWORD dwExStyle, PCSTR lpClassName,
                             PCSTR lpWindowName, DWORD dwStyle,
                             int X, int Y, int nWidth, int nHeight,
@@ -624,8 +648,15 @@ BOOL WINAPI ShowWindow(HWND hWnd, int nCmdShow)
      * may rely on this (rather than the WM_SIZE during CreateWindow) to pick up
      * SizeX/SizeY before the render device is set up. compat32_callback_args
      * handles the 64→32 switch. */
-    if (!was_visible && w->visible)
+    if (!was_visible && w->visible) {
         dispatch_wm_size(w);
+        /* First time a real (wndproc-backed) window is shown, activate it so
+         * the engine enters realtime rendering. Only once, for the viewport. */
+        if (!g_activated && w->wndproc) {
+            g_activated = 1;
+            dispatch_wm_activate(w);
+        }
+    }
 
     return was_visible;
 }
@@ -691,6 +722,11 @@ BOOL WINAPI PeekMessageA(LPMSG lpMsg, HWND hWnd, DWORD wMsgFilterMin,
     (void)hWnd;
     (void)wMsgFilterMin;
     (void)wMsgFilterMax;
+
+    /* Present the current software-rendered frame each pump iteration.
+     * SoftDrv keeps its render target Locked and never issues the fullscreen
+     * Flip in our setup, so this is where frames reach the GOP framebuffer. */
+    { extern void ddraw_present_hook(void); ddraw_present_hook(); }
 
     static int peek_log_count = 0;
     if (peek_log_count < 3) {

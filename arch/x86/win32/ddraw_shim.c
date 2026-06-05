@@ -23,6 +23,7 @@ typedef HANDLE  HDC;
 
 extern void serial_puts(const char *s);
 extern void serial_puthex(uint64_t val, int digits);
+extern void serial_putdec(uint64_t val);
 extern void *mem_alloc_pages(uint64_t count);
 extern void mem_free_pages(void *addr, uint64_t count);
 
@@ -64,6 +65,9 @@ extern uint32_t *fb_get_base(void)   __attribute__((weak));
 extern uint32_t  fb_get_width(void)  __attribute__((weak));
 extern uint32_t  fb_get_height(void) __attribute__((weak));
 extern uint32_t  fb_get_pitch(void)  __attribute__((weak));
+/* fb_get_base() returns the cached RAM *shadow*; writes only reach the
+ * displayed VRAM after fb_flush_all() copies shadow→vram. */
+extern void      fb_flush_all(void)  __attribute__((weak));
 
 static void ensure_framebuffer(void)
 {
@@ -420,6 +424,59 @@ static HRESULT WINAPI surf_QueryInterface(IDirectDrawSurface7 *self, REFIID iid,
 static ULONG WINAPI surf_AddRef(IDirectDrawSurface7 *self)  { (void)self; return 2; }
 static ULONG WINAPI surf_Release(IDirectDrawSurface7 *self) { (void)self; return 1; }
 
+static void ddraw_compositor_notify(void);
+
+/* The display-sized surface SoftDrv renders into (it Locks the back buffer
+ * once and writes pixels every frame without re-Locking, and never issues the
+ * fullscreen Flip in our environment). The per-frame message pump calls
+ * ddraw_present_hook() to copy it to the GOP framebuffer so frames are seen. */
+static DDSurface *g_present_surface = NULL;
+
+/* Copy a software-rendered DD surface to the GOP framebuffer (RGB565/8bpp/32
+ * → XRGB8888), honoring the GOP scanline pitch. Shared by Flip/Blt/Unlock. */
+static void present_surface_to_gop(DDSurface *s)
+{
+    ensure_framebuffer();
+    if (!framebuffer || !s || !s->pixels) return;
+    DWORD pitch = gop_pitch ? gop_pitch : s->width;
+    uint32_t *dst32 = (uint32_t *)framebuffer;
+    if (s->bpp == 8 && s->palette) {
+        BYTE *src8 = s->pixels;
+        for (DWORD y = 0; y < s->height; y++)
+            for (DWORD x = 0; x < s->width; x++)
+                dst32[y * pitch + x] = s->palette->entries[src8[y * s->width + x]];
+    } else if (s->bpp == 16) {
+        uint16_t *src16 = (uint16_t *)s->pixels;
+        for (DWORD y = 0; y < s->height; y++)
+            for (DWORD x = 0; x < s->width; x++) {
+                uint16_t c = src16[y * s->width + x];
+                uint32_t r = ((c >> 11) & 0x1F) * 255 / 31;
+                uint32_t g = ((c >> 5)  & 0x3F) * 255 / 63;
+                uint32_t b = (c & 0x1F) * 255 / 31;
+                dst32[y * pitch + x] = (r << 16) | (g << 8) | b;
+            }
+    } else if (s->bpp == 32) {
+        uint32_t *src32 = (uint32_t *)s->pixels;
+        for (DWORD y = 0; y < s->height; y++)
+            dd_memcpy(&dst32[y * pitch], &src32[y * s->width], s->width * 4);
+    }
+
+    /* Push the cached shadow framebuffer to displayed VRAM, else nothing
+     * appears on screen (the console path flushes; we must too). */
+    if (fb_flush_all) fb_flush_all();
+}
+
+/* Per-frame present hook, called by the user32 message pump (PeekMessage).
+ * SoftDrv renders into a persistently-locked surface and does not issue the
+ * fullscreen Flip in our setup, so we present the current render target each
+ * frame here. No-op until SoftDrv has Locked a display-sized surface. */
+void ddraw_present_hook(void)
+{
+    if (!g_present_surface) return;
+    present_surface_to_gop(g_present_surface);
+    ddraw_compositor_notify();
+}
+
 static HRESULT WINAPI surf_Lock(IDirectDrawSurface7 *self, LPRECT destRect,
                                  DDSURFACEDESC2 *desc, DWORD flags, HANDLE hEvent)
 {
@@ -440,6 +497,11 @@ static HRESULT WINAPI surf_Lock(IDirectDrawSurface7 *self, LPRECT destRect,
     d[3]  = s->width;               /* dwWidth at offset 12 */
     d[4]  = (uint32_t)s->pitch;     /* lPitch at offset 16 */
     d[9]  = (uint32_t)(ULONG_PTR)s->pixels; /* lpSurface at offset 36 */
+
+    /* Remember the display-sized surface being rendered into so the per-frame
+     * pump can present it (SoftDrv keeps this Locked and never Flips). */
+    if (s->pixels && s->width == display_width && s->height == display_height)
+        g_present_surface = s;
 
     /* ddpfPixelFormat at offset 72 (32-bit layout) */
     d[18] = 32;  /* ddpfPixelFormat.dwSize at offset 72 */
@@ -468,7 +530,18 @@ static HRESULT WINAPI surf_Unlock(IDirectDrawSurface7 *self, LPRECT lpRect)
 {
     (void)lpRect;
     IDirectDrawSurface7 *real = REAL_SURF(self);
-    if (real) real->surf.locked = 0;
+    if (!real) return DDERR_INVALIDPARAMS;
+    real->surf.locked = 0;
+
+    /* SoftDrv renders the frame into a locked surface (typically the back
+     * buffer) and unlocks it; the fullscreen Flip that would present it is
+     * not always issued. Present the just-rendered surface to the GOP
+     * framebuffer here so the frame becomes visible. */
+    DDSurface *s = &real->surf;
+    if (s->pixels && s->width == display_width && s->height == display_height) {
+        present_surface_to_gop(s);
+        ddraw_compositor_notify();
+    }
     return DD_OK;
 }
 

@@ -1045,7 +1045,12 @@ void __initk kernel_entry(boot_info_t *info)
         cluster_fs_ready();
 
         static gguf_model_t gguf_model;
+#ifdef OK_SKIP_MODEL
+        serial_puts("[BOOT] SKIP_MODEL=1 — bypassing GGUF/LLM load (fast boot)\n");
+        if (0) { /* model load disabled */
+#else
         if (gguf_load(&gguf_model) == 0 && gguf_model.num_tensors > 0) {
+#endif
             static gguf_tokenizer_t gtok;
             if (gguf_load_tokenizer(&gguf_model, &gtok) == 0) {
                 extern int tok_init(void *, const char **,
