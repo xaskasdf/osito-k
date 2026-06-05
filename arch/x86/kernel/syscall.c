@@ -2648,7 +2648,7 @@ static int64_t sys_close_range(uint64_t first, uint64_t last, uint64_t flags)
 /* ── clone/fork + wait4 (X-SYSCALL40 process management) ─────── */
 
 /* Process table access for clone/fork */
-extern int32_t proc_fork(void);
+extern int32_t proc_fork(uint64_t child_stack);
 extern int32_t proc_wait4(int32_t pid, int *wstatus, int options);
 
 /*
@@ -2674,6 +2674,9 @@ extern int32_t proc_clone_thread(uint64_t child_stack, uint64_t parent_tidptr,
 static int64_t sys_clone(uint64_t flags, uint64_t child_stack,
                           uint64_t ptid, uint64_t ctid, uint64_t tls)
 {
+    serial_puts("[CLONE] flags=0x"); serial_puthex(flags, 16);
+    serial_puts(child_stack ? " cstk!=0" : " cstk=0");
+    serial_puts((flags & CLONE_THREAD) ? " THREAD\n" : " FORK\n");
     /* Thread creation: CLONE_VM | CLONE_THREAD (+ usually CLONE_SIGHAND etc.) */
     if (flags & CLONE_THREAD) {
         if (!child_stack) return -22; /* EINVAL: thread requires stack */
@@ -2685,8 +2688,10 @@ static int64_t sys_clone(uint64_t flags, uint64_t child_stack,
         return (int64_t)tid;
     }
 
-    /* Fork semantics: SIGCHLD flag (or bare CLONE_CHILD_CLEARTID etc.) */
-    int32_t ret = proc_fork();
+    /* Fork / vfork semantics. Pass child_stack: vfork()/posix_spawn() supply a
+     * ready-made child stack (CLONE_VM|CLONE_VFORK) and the child must run on
+     * it, not on a copy of the parent's stack. */
+    int32_t ret = proc_fork(child_stack);
     return (int64_t)ret;
 }
 

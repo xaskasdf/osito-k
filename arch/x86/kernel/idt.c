@@ -1671,6 +1671,15 @@ void isr_handler(interrupt_frame_t *frame)
         serial_puthex(frame->rflags, 16);
         serial_puts("\n");
 
+        serial_puts("  R8  = 0x"); serial_puthex(frame->r8, 16);
+        serial_puts("  R9  = 0x"); serial_puthex(frame->r9, 16); serial_puts("\n");
+        serial_puts("  R10 = 0x"); serial_puthex(frame->r10, 16);
+        serial_puts("  R11 = 0x"); serial_puthex(frame->r11, 16); serial_puts("\n");
+        serial_puts("  R12 = 0x"); serial_puthex(frame->r12, 16);
+        serial_puts("  R13 = 0x"); serial_puthex(frame->r13, 16); serial_puts("\n");
+        serial_puts("  R14 = 0x"); serial_puthex(frame->r14, 16);
+        serial_puts("  R15 = 0x"); serial_puthex(frame->r15, 16); serial_puts("\n");
+
         /* Kernel-mode exception extras (CS==0x08): dump CR3, SS and
          * the dword at [RSP] so post-kexec #UD/#GP can be triaged.
          * The kexec'd kernel landing on a mid-instruction RIP is most

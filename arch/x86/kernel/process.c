@@ -138,6 +138,10 @@ typedef struct {
                                    * execve, or a thread) → must NOT free it. */
     uint32_t    vforked_parent;   /* PID of a vfork parent blocked until this
                                    * process execve's or exits (0 = none). */
+    uint64_t    user_stack_top;   /* highest VA of this process's user stack
+                                   * (stack_base + USER_STACK_SIZE), set by the
+                                   * ELF loader. fork() copies the WHOLE used
+                                   * stack [user_rsp, user_stack_top). 0=unset */
 
     /* Scheduler context (X-SCHED) */
     void    *kernel_stack;       /* allocated kernel stack (NULL for kernel proc) */
@@ -793,6 +797,21 @@ void proc_set_fs_base(uint64_t addr)
     }
 }
 
+/* Record the highest VA of the process's user stack so fork() can copy the
+ * whole used extent. Called by the ELF loader after the stack is allocated.
+ * Targets the exec target (mid-exec) or the current process. */
+void proc_set_user_stack_top(uint64_t top)
+{
+    extern void *proc_exec_target(void);
+    process_t *p = (process_t *)proc_exec_target();
+    if (!p) p = current_proc;
+    if (p) p->user_stack_top = top;
+    serial_puts("[USTKTOP] set pid=");
+    serial_putdec(p ? p->pid : 0);
+    serial_puts(" top=0x"); serial_puthex(top, 16);
+    serial_puts("\n");
+}
+
 /* Current process's stored TLS base (process_t.fs_base). */
 uint64_t proc_get_fs_base(void)
 {
@@ -914,6 +933,7 @@ int proc_exception_kill(int32_t code)
 {
     process_t *p = current_proc;
     if (!p) return -1;
+    { extern void vfork_release(void *); vfork_release(p); }  /* wake vfork parent if any */
 
     /* Forked/spawned process — mark ZOMBIE, scheduler will switch away */
     if (p->kernel_stack) {
@@ -937,6 +957,7 @@ int proc_exception_kill(int32_t code)
 void proc_exit(int32_t code)
 {
     process_t *p = current_proc;
+    { extern void vfork_release(void *); vfork_release(p); }  /* wake vfork parent if any */
 
     /* If this process has a kernel_stack, it was created by fork/sched_spawn.
      * Mark as ZOMBIE and let the scheduler switch away. Parent reaps via wait4. */
@@ -1746,7 +1767,7 @@ extern volatile uint64_t syscall_user_rsp;
  *   [12]=RCX [13]=RBX [14]=RAX [15]=vector [16]=error_code
  *   [17]=RIP [18]=CS  [19]=RFLAGS [20]=RSP [21]=SS
  */
-int32_t proc_fork(void)
+int32_t proc_fork(uint64_t child_stack)
 {
     if (!current_proc) return -1;
 
@@ -1907,16 +1928,26 @@ int32_t proc_fork(void)
     cf[15] = 0;             /* vector (unused) */
     cf[16] = 0;             /* error_code (unused) */
 
-    /* Allocate a separate user stack for the child.
-     * Without this, parent and child share the same user stack and
-     * the scheduler's concurrent execution corrupts both frames.
-     * Copy a portion of the parent's stack so the child has valid
-     * return addresses and local variables for the short time before
-     * it calls exec() or _exit(). */
-#define CHILD_USTACK_SIZE  (64 * 1024)  /* Same size as ELF loader */
-#define CHILD_USTACK_COPY  (32 * 1024)  /* Copy top 32KB of used stack */
+    /* Copy EXACTLY the used portion of the parent's stack [user_rsp, stack_top)
+     * — no more (reading past stack_top hits memory above the stack) and no
+     * fixed floor (the old 32KB window over-read past the top when the used
+     * stack was smaller). stack_top is the parent's recorded user_stack_top. */
+#define CHILD_USTACK_FALLBACK_COPY  (32 * 1024)
+    uint64_t stk_top = parent->user_stack_top;
+    uint64_t copy_size;
+    if (stk_top && stk_top > user_rsp)
+        copy_size = stk_top - user_rsp;                 /* exact used extent */
+    else
+        copy_size = (uint64_t)CHILD_USTACK_FALLBACK_COPY; /* top unknown */
+    if (copy_size > 8ULL * 1024 * 1024) copy_size = 8ULL * 1024 * 1024;
+    /* Round up + one guard page of headroom below the copied frames. */
+    uint64_t child_ustack_size = ((copy_size + 0xFFFULL) & ~0xFFFULL) + 0x1000ULL;
 
-    void *child_ustack_phys = mem_alloc_aligned(CHILD_USTACK_SIZE, 4096);
+    serial_puts("[FORK-COPY] stk_top=0x"); serial_puthex(stk_top, 16);
+    serial_puts(" copy="); serial_putdec(copy_size);
+    serial_puts(" ustk="); serial_putdec(child_ustack_size); serial_puts("\n");
+
+    void *child_ustack_phys = mem_alloc_aligned(child_ustack_size, 4096);
     if (!child_ustack_phys) {
         mem_free_pages(stack_phys, KERNEL_STACK_SIZE / 4096);
         proc_transition(child, PROC_FREE);
@@ -1924,13 +1955,9 @@ int32_t proc_fork(void)
         return -1;
     }
     void *child_ustack = PHYS_TO_VIRT(child_ustack_phys);
-    memset(child_ustack, 0, CHILD_USTACK_SIZE);
+    memset(child_ustack, 0, child_ustack_size);
 
-    /* The parent's stack grows downward. user_rsp is the current top of the
-     * used portion. We copy CHILD_USTACK_COPY bytes above user_rsp (the used
-     * frames: return addresses, local variables, etc.). */
-    uint64_t child_ustack_top = (uint64_t)child_ustack + CHILD_USTACK_SIZE;
-    uint64_t copy_size = CHILD_USTACK_COPY;
+    uint64_t child_ustack_top = (uint64_t)child_ustack + child_ustack_size;
     /* Copy from parent's [user_rsp .. user_rsp + copy_size) to child */
     memcpy((void *)(child_ustack_top - copy_size),
            (void *)user_rsp, copy_size);
@@ -1942,42 +1969,47 @@ int32_t proc_fork(void)
      * the phys address handed to mem_free_pages later. */
     if (child->region_count < MAX_REGIONS) {
         child->regions[child->region_count].base = child_ustack_phys;
-        child->regions[child->region_count].pages = CHILD_USTACK_SIZE / 4096;
+        child->regions[child->region_count].pages = child_ustack_size / 4096;
         child->region_count++;
     }
 
-    /* IRETQ frame */
+    /* IRETQ frame (common fields; RSP depends on the clone variant below). */
     cf[17] = user_rip;      /* RIP = return to userspace after SYSCALL */
     cf[18] = 0x38;          /* CS  = kernel code segment */
     cf[19] = user_rflags | 0x200;  /* RFLAGS with IF=1 */
-    cf[20] = child_user_rsp; /* RSP = child's own stack (copied from parent) */
     cf[21] = 0x30;          /* SS  = kernel data segment */
 
-    /* Adjust child's RBP to point into the new stack if it was in the
-     * parent's stack range. This is needed for frame pointer unwinding. */
-    if (rbp >= user_rsp && rbp < user_rsp + copy_size) {
-        cf[8] = child_user_rsp + (rbp - user_rsp);  /* RBP adjusted */
-    }
-
-    /* Relocate saved frame pointers within the copied stack.
-     *
-     * The copied stack contains saved RBP values (pushed by function
-     * prologues) that point into the PARENT's stack. When the child
-     * returns through these functions, `pop %rbp` restores a parent
-     * pointer, causing the child to read/write parent stack memory.
-     *
-     * Fix: scan the copied region for any 8-byte value that falls
-     * within the parent's copied range [user_rsp .. user_rsp+copy_size),
-     * and adjust it by the parent→child delta. This catches all saved
-     * frame pointers without needing to walk the frame chain. */
-    {
-        int64_t delta = (int64_t)child_user_rsp - (int64_t)user_rsp;
-        uint64_t *scan = (uint64_t *)child_user_rsp;
-        uint64_t scan_count = copy_size / 8;
-        for (uint64_t i = 0; i < scan_count; i++) {
-            uint64_t val = scan[i];
-            if (val >= user_rsp && val < user_rsp + copy_size) {
-                scan[i] = val + delta;
+    if (child_stack) {
+        /* clone()/vfork() with an explicit child stack (musl posix_spawn and
+         * the __clone wrapper). musl has ALREADY set up the child's function +
+         * args on that stack, so the child must run on it verbatim — NOT on a
+         * copy of the parent's stack — and the callee-saved registers must keep
+         * the parent's raw values (the child re-establishes them from
+         * child_stack itself). Ignoring child_stack and substituting a copied
+         * stack made the child read garbage (→ #GP). */
+        cf[20] = child_stack;
+    } else {
+        /* raw fork(): the child runs on its private copy of the parent's stack.
+         * Relocate RBP, the other callee-saved regs (R12-R15, RBX), and any
+         * saved frame pointers from the parent's stack range into the copy so
+         * the child doesn't dereference the parent's stack. */
+        cf[20] = child_user_rsp;
+        if (rbp >= user_rsp && rbp < user_rsp + copy_size)
+            cf[8] = child_user_rsp + (rbp - user_rsp);
+        {
+            int64_t delta = (int64_t)child_user_rsp - (int64_t)user_rsp;
+            static const int reloc_idx[] = { 0, 1, 2, 3, 13 };  /* R15 R14 R13 R12 RBX */
+            for (unsigned k = 0; k < sizeof(reloc_idx) / sizeof(reloc_idx[0]); k++) {
+                uint64_t v = cf[reloc_idx[k]];
+                if (v >= user_rsp && v < user_rsp + copy_size)
+                    cf[reloc_idx[k]] = (uint64_t)((int64_t)v + delta);
+            }
+            uint64_t *scan = (uint64_t *)child_user_rsp;
+            uint64_t scan_count = copy_size / 8;
+            for (uint64_t i = 0; i < scan_count; i++) {
+                uint64_t val = scan[i];
+                if (val >= user_rsp && val < user_rsp + copy_size)
+                    scan[i] = val + delta;
             }
         }
     }
@@ -2010,8 +2042,55 @@ int32_t proc_fork(void)
     /* Save parent's brk state before child can execve+reset it */
     syscall_save_brk();
 
+    /* DIAG [FORKED]: confirm child origin + the callee-saved regs copied into
+     * its fake frame (a non-canonical r12 here would explain its #GP). */
+    serial_puts("[FORKED] child pid=");
+    serial_putdec(child->pid);
+    serial_puts(" ppid=");
+    serial_putdec(parent->pid);
+    serial_puts(" rip=0x"); serial_puthex(user_rip, 16);
+    serial_puts(" ursp=0x"); serial_puthex(user_rsp, 16);
+    serial_puts(" r12=0x"); serial_puthex(r12, 16);
+    serial_puts(" rbp=0x"); serial_puthex(rbp, 16);
+    serial_puts(" cstk=0x"); serial_puthex(child_user_rsp, 16);
+    serial_puts("\n");
+
+    /* vfork semantics: SUSPEND the parent until the child execve()s or _exit()s.
+     * The child has its OWN copied stack, but parent and child still SHARE the
+     * address space (heap/globals via the same CR3). Letting both run
+     * concurrently races those shared writes — the child read a struct pointer
+     * the parent was mutating → garbage r12 → #GP. Blocking the parent here
+     * serializes them. The parent's kernel context (this proc_fork frame) lives
+     * on the parent's OWN stack, which the child never touches, so the suspend
+     * frame is safe. Released by vfork_release() from proc_execve / proc_exit. */
+    child->vforked_parent = parent->pid;
+    proc_transition(parent, PROC_BLOCKED);
+    {
+        extern void sched_yield(void);
+        sched_yield();   /* switch to the child; resumes here once released */
+    }
+
     /* Parent returns child PID immediately */
     return (int32_t)child->pid;
+}
+
+/* Release a vfork-suspended parent when its child execs or exits. */
+void vfork_release(void *child_vp)
+{
+    process_t *child = (process_t *)child_vp;
+    if (!child || !child->vforked_parent) return;
+    uint32_t ppid = child->vforked_parent;
+    child->vforked_parent = 0;
+    for (int i = 0; i < MAX_PROCESSES; i++) {
+        if (proctab[i].pid == ppid && proctab[i].state == PROC_BLOCKED) {
+            proc_transition(&proctab[i], PROC_READY);
+            serial_puts("[VFORK-REL] woke parent pid="); serial_putdec(ppid);
+            serial_puts("\n");
+            return;
+        }
+    }
+    serial_puts("[VFORK-REL] parent pid="); serial_putdec(ppid);
+    serial_puts(" not blocked/found\n");
 }
 
 /*
@@ -2416,6 +2495,7 @@ extern int strncmp(const char *, const char *, uint64_t);
 int proc_execve(const char *path, char *const argv[])
 {
     if (!current_proc || !path) return -1;
+    { extern void vfork_release(void *); vfork_release(current_proc); }  /* wake vfork parent */
 
     process_t *p = current_proc;
 
