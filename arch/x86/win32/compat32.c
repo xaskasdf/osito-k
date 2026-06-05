@@ -2407,21 +2407,26 @@ uint64_t compat32_dispatch(uint32_t thunk_idx, uint32_t *stack_args)
         if (FNAME_RESCUE_PREFILL && fd == 0 && fm == 0) {
             if (fname_buf_phys == 0) {
                 extern void *mem_alloc_pages(uint64_t count);
-                /* Buffer A (64 KB) — TArray slot pool (4 bytes per slot,
-                 * room for 16384 ptrs). Sized large so FName::Names NEVER
-                 * needs to FArray::Realloc (final Num ~4271, prev runs grew
-                 * to Max 5464). The realloc path lost ~2048 entries — our
+                /* Buffer A (512 KB) — TArray slot pool (4 bytes per slot,
+                 * room for 131072 ptrs). Sized large so FName::Names NEVER
+                 * needs to FArray::Realloc. The realloc path is fatal: our
                  * HeapReAlloc can't size a non-heap-pool source buffer and
-                 * the copy drops entries → NULL slots → FNAME-NULL-FILL masks
-                 * them with "None" → packages bind to "None0.dll". Avoid the
-                 * realloc entirely by pre-sizing past anything the engine
-                 * needs. */
-                void *buf  = mem_alloc_pages(16);
+                 * the copy drops ALL entries → the whole table goes NULL →
+                 * FNAME-NULL-FILL then masks every slot with "None" → every
+                 * object reference resolves to "None None.X" → appError.
+                 * Avoid the realloc entirely by pre-sizing past anything the
+                 * engine needs. Preload/Browse peaked ~4271 entries, but
+                 * LEVEL LOAD (UTMenu + the map's actors/textures/sounds)
+                 * crosses 16384 — the previous Max=16384 reallocated mid-load
+                 * (observed Num=16385, whole table NULL'd) and bricked every
+                 * FName → fatal "None None.UTConsole". 131072 covers a full
+                 * level + gameplay with wide headroom. */
+                void *buf  = mem_alloc_pages(128);
                 /* Buffer B (4 KB)  — FNameEntry pool */
                 void *pool = mem_alloc_pages(1);
                 if (buf && pool) {
                     uint8_t *p = (uint8_t *)buf;
-                    for (int i = 0; i < 65536; i++) p[i] = 0;
+                    for (int i = 0; i < 524288; i++) p[i] = 0;  /* 512 KB = 131072 ptrs */
                     uint8_t *q = (uint8_t *)pool;
                     for (int i = 0; i < 4096; i++) q[i] = 0;
 
@@ -2476,13 +2481,13 @@ uint64_t compat32_dispatch(uint32_t thunk_idx, uint32_t *stack_args)
             if (fname_buf_phys) {
                 fname_tarray[0] = (uint32_t)fname_buf_phys;
                 fname_tarray[1] = 1;       /* Num = 1 (slot 0 populated) */
-                fname_tarray[2] = 16384;   /* Max = 16K entries (no realloc) */
+                fname_tarray[2] = 131072;  /* Max = 128K entries (no realloc, covers level load) */
                 static int fname_setup_logged = 0;
                 if (!fname_setup_logged) {
                     fname_setup_logged = 1;
                     serial_puts("[FNAME-RESCUE] pre-alloc FName::Names Data=0x");
                     serial_puthex(fname_buf_phys, 8);
-                    serial_puts(" Num=1 Max=2048\n");
+                    serial_puts(" Num=1 Max=131072\n");
                 }
             }
         }
@@ -2511,7 +2516,7 @@ uint64_t compat32_dispatch(uint32_t thunk_idx, uint32_t *stack_args)
             uint32_t *slots = (uint32_t *)(uintptr_t)fd;
             uint32_t limit = fn;
             if (limit > fm) limit = fm;
-            if (limit > 65536) limit = 65536; /* sanity cap */
+            if (limit > 131072) limit = 131072; /* sanity cap = buffer capacity */
             uint32_t filled = 0;
             for (uint32_t k = 0; k < limit; k++) {
                 if (slots[k] == 0) {
