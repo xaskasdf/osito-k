@@ -421,15 +421,21 @@ NTSTATUS sys_NtCreateFile(ULONG_PTR *args)
         return STATUS_OBJECT_NAME_NOT_FOUND;
     }
 
-    /* Create file object */
-    /* NOTE: In kernel integration, use kmalloc. Here we use static pool. */
+    /* Create file object. The pool is reused: a free slot has flags==0 (an
+     * in-use object always has FILE_OBJ_DISK_FILE set); NtClose returns the slot
+     * by zeroing flags. Previously this was a monotonic bump allocator that never
+     * freed, so after 64 opens NtCreateFile failed for everything — which is why
+     * UT99 opened Entry.unr fine early but got "Can't find file" at LoadMap once
+     * the 64 slots were exhausted (64 opens / 5 closes). */
     static FILE_OBJECT file_pool[64];
-    static int file_pool_next = 0;
 
-    if (file_pool_next >= 64)
+    FILE_OBJECT *fobj = NULL;
+    for (int i = 0; i < 64; i++) {
+        if (file_pool[i].flags == 0) { fobj = &file_pool[i]; break; }
+    }
+    if (!fobj)
         return STATUS_INSUFFICIENT_RESOURCES;
 
-    FILE_OBJECT *fobj = &file_pool[file_pool_next++];
     fobj->flags     = FILE_OBJ_DISK_FILE;
     fobj->osfs_file = osfs_file;
     fobj->position  = 0;
@@ -688,6 +694,15 @@ NTSTATUS sys_NtClose(ULONG_PTR *args)
         /* backing is first pointer field after uint64_t size */
         void **backing_ptr = (void **)((char *)entry->object + sizeof(uint64_t));
         if (*backing_ptr) { kfree(*backing_ptr); *backing_ptr = NULL; }
+    }
+
+    /* Return the FILE_OBJECT pool slot so NtCreateFile can reuse it (zeroing
+     * flags marks it free). Without this the 64-slot disk-file pool leaks and
+     * later opens (e.g. Entry.unr at LoadMap) fail with INSUFFICIENT_RESOURCES. */
+    if (entry && entry->type == OBJ_TYPE_FILE && entry->object) {
+        FILE_OBJECT *fobj = (FILE_OBJECT *)entry->object;
+        if (fobj->flags & FILE_OBJ_DISK_FILE)
+            fobj->flags = 0;  /* slot reusable; console FILE_OBJECTs are left alone */
     }
 
     return handle_close(&g_handle_table, Handle);
