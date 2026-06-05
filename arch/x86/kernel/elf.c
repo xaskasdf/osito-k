@@ -1070,6 +1070,22 @@ static void elf_capture_symtab_vfs(vfs_node_t *node, uint64_t file_size,
 
 /* ── Public API: Load and execute ELF from OsitoFS ───────────── */
 
+/* elf_path_exists — true if `path` resolves to a file in the VFS. proc_execve
+ * calls this to validate the target BEFORE tearing down the caller's image: a
+ * missing target must fail with -ENOENT while the old image is still intact
+ * (otherwise a vfork/posix_spawn child is left running a half-destroyed image).
+ * Uses the same vfs_find primitive elf_exec uses for the real load. */
+int elf_path_exists(const char *path)
+{
+    vfs_node_t node;
+    char norm[256];
+    const char *lookup = path;
+    extern bool path_normalize_flat(const char *path, char *out, int out_sz);
+    if (path_normalize_flat(path, norm, sizeof(norm)) && norm[0])
+        lookup = norm;
+    return vfs_find(lookup, VFS_MODE_POSIX, &node) ? 1 : 0;
+}
+
 int elf_exec(const char *filename, int argc, const char **argv)
 {
     serial_puts("[ELF] Loading '");

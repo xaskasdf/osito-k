@@ -2495,7 +2495,6 @@ extern int strncmp(const char *, const char *, uint64_t);
 int proc_execve(const char *path, char *const argv[])
 {
     if (!current_proc || !path) return -1;
-    { extern void vfork_release(void *); vfork_release(current_proc); }  /* wake vfork parent */
 
     process_t *p = current_proc;
 
@@ -2515,6 +2514,28 @@ int proc_execve(const char *path, char *const argv[])
     serial_puts(" -> '");
     serial_puts(path);
     serial_puts("'\n");
+
+    /* Validate the target exists BEFORE tearing down the caller's image.
+     * Below we free the old regions and hand the process a fresh CR3; if the
+     * file is then not found (e.g. /bin/sh absent from OsitoFS) the process is
+     * left running a half-destroyed image → #UD. Failing here with -ENOENT
+     * keeps the image intact so a vfork/posix_spawn child reports the error
+     * (errno pipe) and _exit()s cleanly, and the parent's spawn returns it. */
+    {
+        extern int elf_path_exists(const char *path);
+        if (!elf_path_exists(path)) {
+            serial_puts("[EXECVE] -ENOENT (image intact): ");
+            serial_puts(path); serial_puts("\n");
+            return -2;  /* -ENOENT */
+        }
+    }
+
+    /* Target exists — the exec is committing. Release a vfork parent now: the
+     * child is about to replace its image on a fresh CR3 and won't touch the
+     * shared address space again. A missing target above returned -ENOENT
+     * WITHOUT releasing, so the parent stays suspended until the child _exit()s
+     * (proc_exit releases it) — correct vfork semantics. */
+    { extern void vfork_release(void *); vfork_release(current_proc); }
 
     /* Update process name */
     int j = 0;
