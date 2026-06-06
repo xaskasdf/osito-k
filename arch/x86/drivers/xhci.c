@@ -2144,10 +2144,21 @@ int xhci_bulk_in(int dev_idx, void *data, uint32_t len, uint32_t *actual)
 
 void xhci_poll(void)
 {
+    /* Re-entrancy / concurrency guard. evt_poll mutates shared ring state
+     * (evt_deq/evt_cycle and per-device int_enq/int_cycle). If two callers
+     * overlap — e.g. the compositor kthread and a win32 game's PeekMessage
+     * loop, which can interleave via sched_yield — they corrupt the event
+     * and transfer rings and the keyboard silently stops delivering. Only
+     * one drain runs at a time; the loser returns (its events are picked up
+     * by the in-flight drain or the next call). */
+    static volatile int polling = 0;
+    if (__atomic_test_and_set(&polling, __ATOMIC_ACQUIRE))
+        return;
     for (int i = 0; i < hc_count; i++) {
         if (hc_list[i].initialized)
             evt_poll(&hc_list[i]);
     }
+    __atomic_clear(&polling, __ATOMIC_RELEASE);
 }
 
 bool xhci_is_ready(void)
