@@ -193,6 +193,56 @@ static void kbd_route_to_term(uint8_t code, bool shift, bool ctrl)
     if (c) kb_push(c);
 }
 
+/* HID usage (page 7) → PS/2 scancode set 1, for the non-extended main block.
+ * 0 = unmapped/extended (handled separately in hid_route_to_win32). */
+static const uint8_t hid_to_ps2_set1[0x59] = {
+    [0x04]=0x1E,[0x05]=0x30,[0x06]=0x2E,[0x07]=0x20,[0x08]=0x12,[0x09]=0x21,
+    [0x0A]=0x22,[0x0B]=0x23,[0x0C]=0x17,[0x0D]=0x24,[0x0E]=0x25,[0x0F]=0x26,
+    [0x10]=0x32,[0x11]=0x31,[0x12]=0x18,[0x13]=0x19,[0x14]=0x10,[0x15]=0x13,
+    [0x16]=0x1F,[0x17]=0x14,[0x18]=0x16,[0x19]=0x2F,[0x1A]=0x11,[0x1B]=0x2D,
+    [0x1C]=0x15,[0x1D]=0x2C,
+    [0x1E]=0x02,[0x1F]=0x03,[0x20]=0x04,[0x21]=0x05,[0x22]=0x06,[0x23]=0x07,
+    [0x24]=0x08,[0x25]=0x09,[0x26]=0x0A,[0x27]=0x0B,
+    [0x28]=0x1C/*Enter*/,[0x29]=0x01/*Esc*/,[0x2A]=0x0E/*Bksp*/,[0x2B]=0x0F/*Tab*/,
+    [0x2C]=0x39/*Space*/,[0x2D]=0x0C,[0x2E]=0x0D,[0x2F]=0x1A,[0x30]=0x1B,
+    [0x31]=0x2B,[0x32]=0x2B,[0x33]=0x27,[0x34]=0x28,[0x35]=0x29,[0x36]=0x33,
+    [0x37]=0x34,[0x38]=0x35,[0x39]=0x3A/*Caps*/,
+    [0x3A]=0x3B,[0x3B]=0x3C,[0x3C]=0x3D,[0x3D]=0x3E,[0x3E]=0x3F,[0x3F]=0x40,
+    [0x40]=0x41,[0x41]=0x42,[0x42]=0x43,[0x43]=0x44,[0x44]=0x57,[0x45]=0x58,
+};
+
+/* Deliver a USB HID key transition to the Win32 layer (UT99 etc.). Maps the
+ * HID usage to a PS/2 set-1 scancode; extended keys (arrows / nav) are sent
+ * with the 0xE0 prefix the way a real PS/2 controller would. No-op if the
+ * win32 layer isn't present. */
+static void hid_route_to_win32(uint8_t code, bool key_up)
+{
+    extern void win32_post_keyboard_event(uint8_t scancode, int key_up) __attribute__((weak));
+    if (!win32_post_keyboard_event) return;
+
+    uint8_t ext = 0;  /* extended PS/2 scancode (after 0xE0), 0 = none */
+    switch (code) {
+    case 0x4F: ext = 0x4D; break; /* Right  */
+    case 0x50: ext = 0x4B; break; /* Left   */
+    case 0x51: ext = 0x50; break; /* Down   */
+    case 0x52: ext = 0x48; break; /* Up     */
+    case 0x4A: ext = 0x47; break; /* Home   */
+    case 0x4D: ext = 0x4F; break; /* End    */
+    case 0x4B: ext = 0x49; break; /* PageUp */
+    case 0x4E: ext = 0x51; break; /* PageDn */
+    case 0x49: ext = 0x52; break; /* Insert */
+    case 0x4C: ext = 0x53; break; /* Delete */
+    default: break;
+    }
+    if (ext) {
+        win32_post_keyboard_event(0xE0, key_up);
+        win32_post_keyboard_event(ext, key_up);
+        return;
+    }
+    if (code < 0x59 && hid_to_ps2_set1[code])
+        win32_post_keyboard_event(hid_to_ps2_set1[code], key_up);
+}
+
 /*
  * Process a keyboard input report using descriptor-driven offsets.
  *
@@ -245,6 +295,14 @@ static void hid_process_keyboard(xhci_device_t *dev, const uint8_t *r)
             if (changed & (1 << i)) {
                 bool pressed = (mods & (1 << i)) != 0;
                 input_post_key(0xE0 + i, pressed, false);
+                /* PS/2 set-1 scancodes for L/R Ctrl,Shift,Alt,Gui. */
+                extern void win32_post_keyboard_event(uint8_t, int) __attribute__((weak));
+                static const uint8_t mod_ps2[8]  = {0x1D,0x2A,0x38,0x5B,0x1D,0x36,0x38,0x5C};
+                static const uint8_t mod_ext[8]  = {0,0,0,1,1,0,1,1};
+                if (win32_post_keyboard_event) {
+                    if (mod_ext[i]) win32_post_keyboard_event(0xE0, !pressed);
+                    win32_post_keyboard_event(mod_ps2[i], !pressed);
+                }
             }
         }
     }
@@ -256,8 +314,10 @@ static void hid_process_keyboard(xhci_device_t *dev, const uint8_t *r)
         bool still = false;
         for (int j = 0; j < n_keys; j++)
             if (keys[j] == prev_code) { still = true; break; }
-        if (!still)
+        if (!still) {
             input_post_key(prev_code, false, false);
+            hid_route_to_win32(prev_code, true);
+        }
     }
 
     /* Presses: current keys not in prev report. */
@@ -269,6 +329,7 @@ static void hid_process_keyboard(xhci_device_t *dev, const uint8_t *r)
         if (was_pressed) continue;
 
         input_post_key(code, true, false);
+        hid_route_to_win32(code, false);
         kbd_route_to_term(code, shift, ctrl);
     }
 

@@ -728,6 +728,15 @@ BOOL WINAPI PeekMessageA(LPMSG lpMsg, HWND hWnd, DWORD wMsgFilterMin,
      * Flip in our setup, so this is where frames reach the GOP framebuffer. */
     { extern void ddraw_present_hook(void); ddraw_present_hook(); }
 
+    /* Poll USB HID so keyboard/mouse reach the win32 input state during a
+     * win32 game's message loop. A foreground win32 process runs with the
+     * APIC timer masked (no preemption), so the compositor kthread that
+     * normally owns USB polling never runs — we must poll here ourselves. */
+    {
+        extern void xhci_poll(void) __attribute__((weak));
+        if (xhci_poll) xhci_poll();
+    }
+
     static int peek_log_count = 0;
     if (peek_log_count < 3) {
         serial_puts("[USER32] PeekMessageA called\n");
