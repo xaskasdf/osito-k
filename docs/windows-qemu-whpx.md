@@ -95,3 +95,45 @@ recompilar desde fuente.
 
 **Esfuerzo: alto.** Solo vale la pena si la velocidad de TCG resulta
 bloqueante para el debugging de UT99.
+
+---
+
+## SOLUCIÓN (2026-06-06): QEMU en WSL2 con KVM
+
+WHPX no se pudo arreglar sin recompilar QEMU. El camino que SÍ funciona y evita
+WHPX por completo: **correr QEMU dentro de WSL2, que expone `/dev/kvm` real vía
+virtualización anidada.** KVM emula los MSR de OVMF correctamente → OVMF bootea
+sin el `#GP`, y se obtiene aceleración por hardware.
+
+### Setup (una vez)
+```powershell
+# Distro limpia en D: (no tocar la existente). --no-launch => sólo root, sin OOBE.
+wsl --install Ubuntu-24.04 --location D:\wsl\osito --name osito --no-launch
+```
+```bash
+# Como root (sin password): instalar qemu + ovmf + mtools
+wsl -d osito -u root -e bash -c "apt-get update && apt-get install -y qemu-system-x86 ovmf mtools python3"
+```
+Correr como **root** evita el grupo `kvm`/sudo (root accede a `/dev/kvm` directo).
+
+### Correr
+```bash
+# kernel.elf/boot.efi se buildean en Windows (msys2 clang); el script los lee de
+# /mnt/c y stagea todo a ext4 (rápido). Display via WSLg (DISPLAY=:0 ya seteado).
+wsl -d osito -u root -e bash -c "
+  export XDG_RUNTIME_DIR=/mnt/wslg/runtime-dir DISPLAY=:0 WAYLAND_DISPLAY=wayland-0
+  OK_DISPLAY=gtk OK_MONITOR=1 OK_NVME=/mnt/c/Users/xasko/osito-k/nvme_ut99.img \
+    bash /mnt/c/Users/xasko/osito-k/arch/x86/scripts/run-wsl-kvm.sh"
+```
+`arch/x86/scripts/run-wsl-kvm.sh` usa `-accel kvm -cpu host` + OVMF por pflash.
+Monitor en `127.0.0.1:55555` (alcanzable desde Windows por localhostForwarding).
+
+### Hallazgo importante: el cuello de botella es el I/O serial, no el cómputo
+Bajo KVM, **cada escritura al puerto serial (COM1) es un VM-exit** (guest→KVM→
+qemu), MÁS caro que en TCG (misma-proceso). El boot de UT99 genera ~127k líneas
+de log → es serial-bound, y KVM NO lo acelera (~600 líneas/seg, similar a TCG).
+KVM solo gana en **cómputo puro sin I/O**. Para aprovecharlo de verdad hay que
+**recortar el logging diagnóstico de alto volumen** (el shim `%s` de
+msvcrt_shim.c, `[NtReadFile]`, `[INT2E]`). Plan: flag de build `QUIET=1` que
+compile-out esos logs, dejando sólo markers dirigidos. Entonces las fases
+compute-pesadas (init del engine, carga de paquetes) corren rápido bajo KVM.
