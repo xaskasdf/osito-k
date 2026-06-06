@@ -326,14 +326,18 @@ struct tss64 kernel_tss __attribute__((aligned(16)));
 uint64_t *tss_ist1_ptr;  /* = &kernel_tss.ist1, set in tss_init() */
 uint64_t *tss_ist2_ptr;  /* = &kernel_tss.ist2, for DOS INT stubs */
 
-/* IST1 stack for INT 0x2E — 256KB.
- * int2e_stub.S reserves 32KB per nest (subq $32768). UT99's C++ EH
- * unwind chain re-throws through 3-4 catches → 3-4 nested INT 0x2E
- * entries → 96-128KB needed. 64KB was overflowing into garbage and
- * corrupting RtlRaiseException's locals → unwind globals stayed set
- * from a prior catch → next int2e_stub iret jumped to stale catch
- * with stale ESP/EBP → user-stack execution → #BR. */
-#define IST1_STACK_SIZE 262144
+/* IST1 stack for INT 0x2E — 1MB.
+ * int2e_stub.S reserves 16KB per nest (subq $16384). UT99's C++ EH
+ * unwind chain re-throws DEEPLY during the boot exception storm (the
+ * FName/package recovery throws ~30 C++ exceptions, several nesting via
+ * appUnwindf re-throw) → that many nested INT 0x2E entries. 256KB at
+ * 32KB/level = only 8 levels: deeper storms walked IST1 BELOW this array
+ * into kernel BSS/.text and corrupted it → flaky boot #UD / wild kernel
+ * write (CR2 in the kernel-image range, RSP pointing into .text). Adding
+ * unrelated kernel BSS shifted what got clobbered and made it
+ * deterministic. 1MB at 16KB/level = 64 nesting levels with ample
+ * per-level headroom (the kernel call chain per level is ~1-3KB). */
+#define IST1_STACK_SIZE 1048576
 uint8_t ist1_stack[IST1_STACK_SIZE] __attribute__((aligned(16)));
 
 /* IST2 stack for DOS INTs + #DB — 32KB */
