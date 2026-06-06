@@ -2444,14 +2444,20 @@ uint64_t compat32_dispatch(uint32_t thunk_idx, uint32_t *stack_args)
         static uint64_t fname_buf_phys = 0;
         static uint64_t fname_none_entry = 0;
         uint32_t fd = fname_tarray[0], fn = fname_tarray[1], fm = fname_tarray[2];
-        /* FNAME_RESCUE_PREFILL — EXPERIMENT (2026-06-03): the pre-fill sets
-         * Num=1, which makes UE1 FName::StaticInit see a non-empty table and
-         * SKIP registering all ~600 hardcoded names (FNDIFF proves only
-         * Names[0] is ever populated, Num stuck at 1, Names.Add never called).
-         * The pre-fill predates the GMalloc stub fix — it existed to dodge a
-         * "bogus FArray::Realloc" that happened when GMalloc wasn't set up.
-         * Now that appMalloc/appRealloc route through the working HeapAlloc
-         * stub, let StaticInit allocate + register naturally (Num==0 path). */
+        /* FNAME_RESCUE_PREFILL — ROOT-CAUSE FIX (2026-06-05): the OLD pre-fill
+         * set Num=1, which made UE1 FName::StaticInit see a non-empty table and
+         * SKIP registering all ~838 hardcoded EName names (FNDIFF proved only
+         * Names[0] populated, Num stuck at 1, Names.Add never called). Then
+         * FNAME-NULL-FILL masked every unregistered slot with "None", so every
+         * lookup-by-name (menu classes, packages) resolved to "None"/"0" — the
+         * recurring package-zero cascade.
+         *
+         * The fix: still pre-size the TArray (Data = our 512KB buffer,
+         * Max=131072) so the engine NEVER hits the fatal FArray::Realloc, but
+         * leave **Num=0** so StaticInit sees an empty table and registers the
+         * hardcoded names into our buffer naturally (no realloc needed, since
+         * Max is already past anything a full level+gameplay needs). NULL-FILL
+         * remains as a safety net for genuinely-sparse EName slots. */
         static const int FNAME_RESCUE_PREFILL = 1;
         if (FNAME_RESCUE_PREFILL && fd == 0 && fm == 0) {
             if (fname_buf_phys == 0) {
@@ -2529,14 +2535,15 @@ uint64_t compat32_dispatch(uint32_t thunk_idx, uint32_t *stack_args)
             }
             if (fname_buf_phys) {
                 fname_tarray[0] = (uint32_t)fname_buf_phys;
-                fname_tarray[1] = 1;       /* Num = 1 (slot 0 populated) */
+                fname_tarray[1] = 0;       /* Num = 0 → StaticInit registers the
+                                            * hardcoded names itself (root fix) */
                 fname_tarray[2] = 131072;  /* Max = 128K entries (no realloc, covers level load) */
                 static int fname_setup_logged = 0;
                 if (!fname_setup_logged) {
                     fname_setup_logged = 1;
                     serial_puts("[FNAME-RESCUE] pre-alloc FName::Names Data=0x");
                     serial_puthex(fname_buf_phys, 8);
-                    serial_puts(" Num=1 Max=131072\n");
+                    serial_puts(" Num=0 Max=131072 (StaticInit registers names)\n");
                 }
             }
         }
@@ -2600,11 +2607,12 @@ uint64_t compat32_dispatch(uint32_t thunk_idx, uint32_t *stack_args)
          * (or our NULL-FILL pre-empted it). If Names[21] points elsewhere,
          * it's a valid FNameEntry — log its Name field (offset +0xC) so
          * we can see whether it says "Engine" or something else. */
-        if (fd != 0 && fn >= 838) {
+        if (fd != 0 && fn >= 22) {
             static uint32_t edump_count = 0;
             static uint32_t last_fn = 0;
-            /* Trigger: first time Num crosses 838, then every 200 dispatches. */
-            if (edump_count == 0 || (edump_count < 20 && fn != last_fn) ||
+            /* Trigger: first few times Num grows (confirms StaticInit is
+             * registering real hardcoded names), then every 200 dispatches. */
+            if (edump_count == 0 || (edump_count < 8 && fn != last_fn) ||
                 (edump_count % 200) == 0) {
                 static const struct { uint32_t idx; const char *name; } ENAMES[] = {
                     {  0, "None"   }, { 10, "StructProp" }, { 20, "Core"   },
