@@ -3514,6 +3514,7 @@ int WINAPI crt_vsnwprintf(WCHAR *buf, SIZE_T count, const WCHAR *fmt, ms_va_list
              * %ls is also wide string. We treat both the same. */
             uint32_t raw_ptr = *vp++;
             const WCHAR *ws = (const WCHAR *)(uintptr_t)raw_ptr;
+#ifndef OK_QUIET
             if (vsnw_trace_count <= 30) {
                 serial_puts("  %s ptr=0x");
                 serial_puthex((uint64_t)raw_ptr, 8);
@@ -3525,6 +3526,7 @@ int WINAPI crt_vsnwprintf(WCHAR *buf, SIZE_T count, const WCHAR *fmt, ms_va_list
                 }
                 serial_puts("\n");
             }
+#endif
             if (!ws) ws = (const WCHAR[]){'(','n','u','l','l',')',0};
             int n = 0;
             while (ws[n]) n++;

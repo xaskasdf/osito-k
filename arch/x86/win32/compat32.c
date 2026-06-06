@@ -3484,6 +3484,7 @@ uint64_t compat32_dispatch(uint32_t thunk_idx, uint32_t *stack_args)
     }
 
     /* Debug: log INT 0x2E dispatch (throttled to reduce log noise) */
+#ifndef OK_QUIET
     {
         static uint32_t int2e_call_count = 0;
         int2e_call_count++;
@@ -3511,6 +3512,7 @@ uint64_t compat32_dispatch(uint32_t thunk_idx, uint32_t *stack_args)
             serial_puts("]\n");
         }
     }
+#endif
 
     /*
      * Call the 64-bit shim function with marshaled arguments.

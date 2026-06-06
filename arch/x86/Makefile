@@ -71,6 +71,16 @@ ifeq ($(SKIP_MODEL),1)
   KCFLAGS += -DOK_SKIP_MODEL=1
 endif
 
+# Dev quiet: compile out the high-volume diagnostic serial logging (the printf
+# %s-arg tracer, [NtReadFile] per-read spam, [INT2E] per-call spam). Under KVM
+# every serial write is a VM-exit, so these dominate UT99 boot time (~80% of
+# 172k log lines). With QUIET=1 the compute-heavy phases run fast.
+#   make -C arch/x86 CLANG=1 QUIET=1
+QUIET ?= 0
+ifeq ($(QUIET),1)
+  KCFLAGS += -DOK_QUIET=1
+endif
+
 # Flags for precompiled .o files that may be called from TCC code.
 # TCC doesn't guarantee 16-byte stack alignment (SysV ABI requires it).
 # -mincoming-stack-boundary=3 tells GCC the stack may be 8-byte aligned,
