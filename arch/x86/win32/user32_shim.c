@@ -567,40 +567,49 @@ HWND WINAPI CreateWindowExA(DWORD dwExStyle, PCSTR lpClassName,
     serial_puthex(nHeight, 4);
     serial_puts("\n");
 
-    /* Simulate WM_NCCREATE: write hWnd at WWindow::hWnd (this+4).
-     *
-     * The engine passes `this` as lpParam (arg 12 of CreateWindowExW).
-     * Due to a stack layout quirk in the compat32 thunk, lpParam arrives
-     * as 0 but the real `this` pointer is at stack_args[12] (one slot
-     * past the declared 12 args). As a workaround, if lpParam is NULL
-     * we look at the caller's stack for a plausible WWindow pointer. */
+    /* WM_NCCREATE — the NT-correct window setup. Real Windows calls the
+     * registered WndProc with WM_NCCREATE during CreateWindow, passing a
+     * CREATESTRUCT whose lpCreateParams is the caller's `this` (lpParam, arg 12).
+     * UT99's Window.dll WWindow::StaticProc reads lpCreateParams there, sets
+     * WWindow->hWnd, and adds the WWindow to its global _Windows list. For every
+     * later message StaticProc walks _Windows by hWnd to find the WWindow and
+     * call its real WndProc. If we never send WM_NCCREATE, the WWindow is never
+     * added to _Windows, so StaticProc can't map hwnd->WWindow and routes
+     * WM_KEYDOWN to DefWindowProc — the game never receives keys and the menu
+     * (Escape=ShowMenu) never opens. So send the real WM_NCCREATE rather than
+     * poking WWindow->hWnd directly (which would also trip StaticProc's
+     * check(!WWindow->hWnd) assertion). */
     {
         uint32_t wwindow_addr = (uint32_t)(ULONG_PTR)lpParam;
-
-        /* If lpParam is NULL, try the 13th stack arg (compat32 off-by-one) */
-        if (!wwindow_addr && lpClassName) {
-            /* The className pointer typically points into the same
-             * stack region as `this`. Use className as a heuristic
-             * to validate stack_args[12] if we can access it. */
-            extern int g_compat32_mode;
-            if (g_compat32_mode) {
-                /* Read the 13th arg from the compat32 stack.
-                 * This is a pragmatic workaround: the PE32 code's CALL
-                 * leaves `this` one slot beyond the declared 12 args. */
-                extern uint32_t g_compat32_last_stack_arg13;
-                if (g_compat32_last_stack_arg13 >= 0x10000)
-                    wwindow_addr = g_compat32_last_stack_arg13;
+        if (w->wndproc && wwindow_addr >= 0x10000) {
+            extern uint32_t compat32_callback_args(uint32_t func, int nargs,
+                                                    const uint32_t *args);
+            /* 32-bit CREATESTRUCTA (12 dwords) in PE32-accessible memory so the
+             * 32-bit StaticProc can dereference lParam. */
+            static volatile uint32_t *cs = 0;
+            if (!cs) {
+                extern void *mem_alloc_pages(uint64_t count);
+                cs = (volatile uint32_t *)mem_alloc_pages(1);
             }
-        }
-
-        /* Direct write: set this->hWnd = hwnd at offset +4.
-         * NOTE: currently lpParam arrives as 0 (off-by-one in compat32
-         * stack extraction needs investigation). The workaround using
-         * g_compat32_last_stack_arg13 is incorrect — it reads the class
-         * name pointer, not the WWindow this pointer. */
-        if (wwindow_addr >= 0x10000) {
-            uint32_t *ww = (uint32_t *)(uintptr_t)wwindow_addr;
-            ww[1] = (uint32_t)(ULONG_PTR)w->handle;
+            if (cs) {
+                cs[0]  = wwindow_addr;                       /* lpCreateParams */
+                cs[1]  = (uint32_t)(ULONG_PTR)hInstance;     /* hInstance */
+                cs[2]  = (uint32_t)(ULONG_PTR)hMenu;         /* hMenu */
+                cs[3]  = (uint32_t)(ULONG_PTR)hWndParent;    /* hwndParent */
+                cs[4]  = (uint32_t)nHeight;                  /* cy */
+                cs[5]  = (uint32_t)nWidth;                   /* cx */
+                cs[6]  = (uint32_t)Y;                        /* y */
+                cs[7]  = (uint32_t)X;                        /* x */
+                cs[8]  = dwStyle;                            /* style */
+                cs[9]  = (uint32_t)(ULONG_PTR)lpWindowName;  /* lpszName */
+                cs[10] = (uint32_t)(ULONG_PTR)lpClassName;   /* lpszClass */
+                cs[11] = dwExStyle;                          /* dwExStyle */
+                uint32_t args[4] = {
+                    (uint32_t)(uintptr_t)w->handle, WM_NCCREATE, 0,
+                    (uint32_t)(uintptr_t)cs
+                };
+                compat32_callback_args((uint32_t)(uintptr_t)w->wndproc, 4, args);
+            }
         }
     }
 
@@ -1562,10 +1571,14 @@ void win32_post_keyboard_event(BYTE scancode, BOOL key_up)
             key_state[VK_MENU] |= 0x80;
     }
 
-    /* Find active window for message target */
+    /* Find active window for message target. MUST use the window's real handle
+     * (windows[i].handle) — find_window() matches by handle, and Window.dll's
+     * StaticProc maps hwnd->WWindow by the same handle. Using (i+1) here made
+     * find_window() fail (handle 0xA00000xx != i+1), so DispatchMessage dropped
+     * every key to DefWindowProc and the game never saw input. */
     HWND target = NULL;
     for (int i = window_count - 1; i >= 0; i--) {
-        if (windows[i].used) { target = (HWND)(ULONG_PTR)(i + 1); break; }
+        if (windows[i].used) { target = windows[i].handle; break; }
     }
 
     /* Build lParam: scancode in bits 16-23, extended flag in bit 24,
@@ -1603,7 +1616,7 @@ void win32_post_mouse_event(int dx, int dy, DWORD buttons, short wheel_delta)
 
     HWND target = NULL;
     for (int i = window_count - 1; i >= 0; i--) {
-        if (windows[i].used) { target = (HWND)(ULONG_PTR)(i + 1); break; }
+        if (windows[i].used) { target = windows[i].handle; break; }
     }
     if (capture_hwnd) target = capture_hwnd;
 
