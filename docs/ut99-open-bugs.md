@@ -100,6 +100,47 @@ call it with EBP set to the establisher and a valid return frame, take its
 returned continuation address, then resume — so prologue/epilog balance and
 callee-saved registers survive.
 
+## B8 — Preferences menu crash (out-of-bounds write → AV)
+**Symptom:** opening the Preferences/Settings menu crashes the process.
+**Captured:** first fault is a WRITE AV at Core.dll `0x1014ADBC`
+(`mov word [eax],0; ret`) with `eax=CR2=0x101FD2F0` — past the end of Core.dll.
+The corrupt input is a huge FName index `ecx=0x4250A` (271114, well beyond the
+131072-pre-sized Names table); the config-enumeration code does
+`Names.Data[index]` where `index` came from an object's Name field (`[obj+0x20]`,
+obj=`ebx=0x401FFC00`). So a config/property object carries a corrupt FName index
+→ Names[] overrun → wild write. Same FName-corruption family as the other UT99
+bugs, surfacing in the settings-enumeration path. ROOT (why that object's Name
+index is garbage) is unresolved — deep object-corruption hunt.
+
+## B9 — SEH dispatch can't read unmapped EH-handler pages (double-fault)
+**Symptom:** the B8 AV (recoverable; UE1 guards config code) becomes FATAL because
+our SEH dispatch double-faults the KERNEL while handling it.
+**Captured:** `compat32_seh_dispatch` reads the SEH frame's handler bytes at
+`0x10173C1A` (Core.dll EH handler) → kernel `#PF`, `CR2=0x10173C1A`, not-present.
+The CPU fault is authoritative: that page is genuinely NOT mapped in the dispatch's
+active CR3 (`0x01000000`, the kernel CR3) — even though `pe_alloc` maps all of
+Core.dll's SizeOfImage (0xC0000, which covers RVA 0x73C1A) into both kernel and
+win32 CR3 at load. Hypothesis: the EH-handler pages are never *executed* by UT
+(only read by the OS dispatcher = us), so if the mapping is lazy/partial for those
+pages they stay not-present in the CR3 the dispatcher uses. Frames 0-5 all had
+handlers in the unmapped 0x10173xxx region.
+**Attempted (reverted):** a `seh_va_readable` CR3 page-walk guard that skips
+unmapped frames. It correctly detected the unmapped pages and stopped the *first*
+double-fault, but skipping the real handlers just dispatched to a wrong/outer catch
+and hit a *secondary* kernel fault (an FName::Names monitor read at `0x10295D30`),
+and it doesn't make Preferences work (the real handler is needed). Reverted as a
+band-aid that adds an unverified page-walk to the exception hot path without fixing
+the user-visible crash.
+**Real fix direction:** make the EH-handler (and any never-executed PE) pages
+readable to the dispatcher — either (a) ensure pe_alloc's mapping is actually
+present in the dispatch CR3 for the whole image (investigate why 0x10173xxx is
+not-present despite the eager map loop), or (b) on a not-present kernel read of a
+PE-image VA, mirror the page from the win32 CR3 / image backing into the kernel
+CR3 and retry (extend `demand_page_fault`). Then the dispatch reads the real
+handler, UE1 catches the B8 AV, and Preferences fails gracefully or works. Pair
+with fixing B8's root so the AV doesn't fire at all. This is a focused
+paging-layer task — do it carefully, it's in the critical exception path.
+
 ---
 
 ### Diagnostics in tree (gated; for the above)
