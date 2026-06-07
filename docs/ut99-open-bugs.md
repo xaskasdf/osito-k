@@ -142,14 +142,27 @@ and it doesn't make Preferences work (the real handler is needed). Reverted as a
 band-aid that adds an unverified page-walk to the exception hot path without fixing
 the user-visible crash.
 **Real fix direction:** make the EH-handler (and any never-executed PE) pages
-readable to the dispatcher — either (a) ensure pe_alloc's mapping is actually
-present in the dispatch CR3 for the whole image (investigate why 0x10173xxx is
-not-present despite the eager map loop), or (b) on a not-present kernel read of a
-PE-image VA, mirror the page from the win32 CR3 / image backing into the kernel
-CR3 and retry (extend `demand_page_fault`). Then the dispatch reads the real
-handler, UE1 catches the B8 AV, and Preferences fails gracefully or works. Pair
-with fixing B8's root so the AV doesn't fire at all. This is a focused
-paging-layer task — do it carefully, it's in the critical exception path.
+readable to the dispatcher. `pe_image_fixup_page` (re-install a not-present PE
+page's PTE from the load-time phys, tracked in pe_alloc) is the right repair
+primitive. **CRITICAL — HOW to invoke it:**
+- Attempt 1 (2026-06-07, REVERTED): hooked `pe_image_fixup_page` ONLY in the #PF
+  handler (idt.c) and retried. HARMFUL for the `seh_dispatch` path — caused a
+  **KVM triple-fault / `paused (internal-error)`**: a guest NULL vtable call
+  (`CR2=0x40`) → #PF (on IST3) → `compat32_seh_dispatch` reads an unmapped PE
+  handler page → **nested #PF re-enters IST3** (RSP reloaded to IST3_top,
+  clobbers the outer handler frame) → triple fault. So relying on a nested #PF to
+  repair is unsafe inside the #PF/IST3 context. (It IS safe for the non-IST3
+  INT2E path — the gameplay FName::Names read — which is why the gameplay crash
+  alone could be repaired that way.)
+- REQUIRED approach: **PRE-PROBE** — before each guest PE read in
+  `compat32_seh_dispatch` (handler bytes @compat32.c:2031, FuncInfo @2043,
+  TryBlockMap, HandlerArray, scopetable, frame chain) AND the FName reads in
+  `compat32_dispatch`, call `paging_va_present(va)` and if absent
+  `pe_image_fixup_page(va)` — so NO nested #PF ever occurs. Then the dispatch
+  reads the real handler, UE1 catches the B8 AV, Preferences fails gracefully or
+  works. A #PF-handler hook may stay ONLY as a backstop for non-IST3 contexts.
+Pair with fixing B8's root so the AV doesn't fire at all. Focused paging-layer
+task — do it carefully, it's in the critical exception path.
 
 ---
 
