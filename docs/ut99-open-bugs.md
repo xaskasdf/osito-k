@@ -45,11 +45,21 @@ mouse-grab).
 `DF E0` (`fnstsw ax`) `F6 C4 01` (`test ah,1`) `74 04` `83 C8 FF` (`or eax,-1`)
 `C3` — a tiny x87 float-compare leaf. `EDX=0xFFFFFFFF` (wild object ptr) →
 reads `[0xFFFFFFFF+0x24]=0x100000023` → fault.
-**Next:** disasm the caller of `0x1039B6CB` to find where `edx=-1` comes from
-(an actor/iterator sentinel used as a pointer?). Isolate whether it is
-grab-triggered (input-mode switch mid-frame) or an independent gameplay path —
-test by playing WITHOUT grab (observed stable so far → likely grab-related, i.e.
-tied to B1's input path).
+**ROOT CAUSE (verified by disasm, 2026-06-07):** a **qsort-callback ABI bug** in
+our layer — the grab was coincidental, NOT causal. `0x1039B6C0` is a `__cdecl`
+qsort comparator (`mov ecx,[esp+4]; mov edx,[esp+8]; fld [ecx+0x24]; fcomp
+[edx+0x24]`) — a distance/scene sort UE1 runs the first time a map is entered
+(Engine.dll 0x1039A870 builds a 64×0x2C buffer, push thunk 0x10303765 → push
+0x2C → call Core appQsort → MSVCRT!qsort → OUR `crt_qsort`). `crt_qsort`/
+`crt_bsearch` (msvcrt_shim.c) invoked the **32-bit guest comparator DIRECTLY as a
+native 64-bit pointer**, bypassing `compat32_callback_args` (the 64→32 mode switch
++ cdecl stack frame). So the comparator read its element pointers from the 64-bit
+RSP (garbage above the host call's return addr) → `edx=0xFFFFFFFF` → `fcomp
+[rdx+0x24]` = `0x100000023` → #PF (CR2 matches exactly).
+**FIX (committed pending test):** route the leaf comparator call through
+`compat32_callback_args` (new `qs_cmp` helper in msvcrt_shim.c) with the cdecl
+EAX sign-extended. Independent of B1/B2. Verify: play several minutes through
+translucent geometry with AND without toggling grab → no `RIP=0x1039B6CB`.
 
 ## B4 — Dirty layer state after a crash (can't relaunch in-OS)
 **Symptom:** after a PE32 process crash recovers to the `osito>` shell, UT99
