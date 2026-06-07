@@ -433,37 +433,63 @@ static void ddraw_compositor_notify(void);
 static DDSurface *g_present_surface = NULL;
 
 /* Copy a software-rendered DD surface to the GOP framebuffer (RGB565/8bpp/32
- * → XRGB8888), honoring the GOP scanline pitch. Shared by Flip/Blt/Unlock. */
+ * → XRGB8888). NEAREST-NEIGHBOR UPSCALES the surface to fill the whole GOP
+ * (e.g. UT99's 640x480 → 1024x768, both 4:3 so no distortion) instead of the
+ * old 1:1 top-left blit that left the game letterboxed. Mouse mapping in
+ * win32_post_mouse_abs scales the tablet to the SAME source space so the cursor
+ * lines up with the scaled image. Shared by Flip/Blt/Unlock. */
 static void present_surface_to_gop(DDSurface *s)
 {
     ensure_framebuffer();
     if (!framebuffer || !s || !s->pixels) return;
-    DWORD pitch = gop_pitch ? gop_pitch : s->width;
+    uint32_t pitch = gop_pitch ? gop_pitch : s->width;
+    uint32_t sw = s->width, sh = s->height;
+    if (!sw || !sh) return;
+    uint32_t fbw = (fb_get_width  && fb_get_width())  ? fb_get_width()  : sw;
+    uint32_t fbh = (fb_get_height && fb_get_height()) ? fb_get_height() : sh;
     uint32_t *dst32 = (uint32_t *)framebuffer;
-    if (s->bpp == 8 && s->palette) {
-        BYTE *src8 = s->pixels;
-        for (DWORD y = 0; y < s->height; y++)
-            for (DWORD x = 0; x < s->width; x++)
-                dst32[y * pitch + x] = s->palette->entries[src8[y * s->width + x]];
-    } else if (s->bpp == 16) {
-        uint16_t *src16 = (uint16_t *)s->pixels;
-        for (DWORD y = 0; y < s->height; y++)
-            for (DWORD x = 0; x < s->width; x++) {
-                uint16_t c = src16[y * s->width + x];
+
+    /* per-column source-x LUT for the horizontal scale (sw -> fbw) */
+    static uint32_t xlut[4096];
+    uint32_t outw = fbw > 4096 ? 4096 : fbw;
+    for (uint32_t dx = 0; dx < outw; dx++) xlut[dx] = (dx * sw) / fbw;
+
+    for (uint32_t dy = 0; dy < fbh; dy++) {
+        uint32_t sy = (dy * sh) / fbh;
+        uint32_t *drow = &dst32[dy * pitch];
+        if (s->bpp == 16) {
+            const uint16_t *srow = (const uint16_t *)s->pixels + (size_t)sy * sw;
+            for (uint32_t dx = 0; dx < outw; dx++) {
+                uint16_t c = srow[xlut[dx]];
                 uint32_t r = ((c >> 11) & 0x1F) * 255 / 31;
                 uint32_t g = ((c >> 5)  & 0x3F) * 255 / 63;
                 uint32_t b = (c & 0x1F) * 255 / 31;
-                dst32[y * pitch + x] = (r << 16) | (g << 8) | b;
+                drow[dx] = (r << 16) | (g << 8) | b;
             }
-    } else if (s->bpp == 32) {
-        uint32_t *src32 = (uint32_t *)s->pixels;
-        for (DWORD y = 0; y < s->height; y++)
-            dd_memcpy(&dst32[y * pitch], &src32[y * s->width], s->width * 4);
+        } else if (s->bpp == 8 && s->palette) {
+            const uint8_t *srow = (const uint8_t *)s->pixels + (size_t)sy * sw;
+            for (uint32_t dx = 0; dx < outw; dx++)
+                drow[dx] = s->palette->entries[srow[xlut[dx]]];
+        } else if (s->bpp == 32) {
+            const uint32_t *srow = (const uint32_t *)s->pixels + (size_t)sy * sw;
+            for (uint32_t dx = 0; dx < outw; dx++)
+                drow[dx] = srow[xlut[dx]];
+        }
     }
 
     /* Push the cached shadow framebuffer to displayed VRAM, else nothing
      * appears on screen (the console path flushes; we must too). */
     if (fb_flush_all) fb_flush_all();
+}
+
+/* Report the current SoftDrv render resolution (the surface space that
+ * present_surface_to_gop scales to fill the whole screen). win32_post_mouse_abs
+ * maps the absolute tablet into THIS space so the cursor lines up with the
+ * scaled image. Returns 0/0 until a display mode is set. */
+void ddraw_get_display_size(uint32_t *w, uint32_t *h)
+{
+    if (w) *w = display_width;
+    if (h) *h = display_height;
 }
 
 /* Per-frame present hook, called by the user32 message pump (PeekMessage).
@@ -607,43 +633,9 @@ static HRESULT WINAPI surf_Blt(IDirectDrawSurface7 *self, LPRECT destRect,
         dd_memcpy(dst->pixels, s->pixels, copy_size);
     }
 
-    /* If primary surface, blit to GOP framebuffer */
-    if (dst->is_primary) {
-        ensure_framebuffer();
-        if (framebuffer && dst->pixels) {
-            DWORD pitch = gop_pitch ? gop_pitch : dst->width;
-
-            if (dst->bpp == 8 && dst->palette) {
-                /* 8bpp palettized → XRGB8888 via palette lookup */
-                BYTE *src8 = dst->pixels;
-                uint32_t *dst32 = (uint32_t *)framebuffer;
-                for (DWORD y = 0; y < dst->height; y++) {
-                    for (DWORD x = 0; x < dst->width; x++) {
-                        uint8_t idx = src8[y * dst->width + x];
-                        dst32[y * pitch + x] = dst->palette->entries[idx];
-                    }
-                }
-            } else if (dst->bpp == 16) {
-                /* Convert RGB565 → XRGB8888, respecting GOP pitch */
-                uint16_t *src16 = (uint16_t *)dst->pixels;
-                uint32_t *dst32 = (uint32_t *)framebuffer;
-                for (DWORD y = 0; y < dst->height; y++) {
-                    for (DWORD x = 0; x < dst->width; x++) {
-                        uint16_t c = src16[y * dst->width + x];
-                        uint32_t r = ((c >> 11) & 0x1F) * 255 / 31;
-                        uint32_t g = ((c >> 5)  & 0x3F) * 255 / 63;
-                        uint32_t b = (c & 0x1F) * 255 / 31;
-                        dst32[y * pitch + x] = (r << 16) | (g << 8) | b;
-                    }
-                }
-            } else if (dst->bpp == 32) {
-                uint32_t *src32 = (uint32_t *)dst->pixels;
-                uint32_t *dst32 = (uint32_t *)framebuffer;
-                for (DWORD y = 0; y < dst->height; y++)
-                    dd_memcpy(&dst32[y * pitch], &src32[y * dst->width], dst->width * 4);
-            }
-        }
-    }
+    /* If primary surface, blit (nearest-neighbor scaled to full GOP) */
+    if (dst->is_primary)
+        present_surface_to_gop(dst);
 
     /* Also copy to compositor's shm surface if available */
     if (dst->is_primary)
@@ -736,40 +728,8 @@ static HRESULT WINAPI surf_Flip(IDirectDrawSurface7 *self,
     primary->pixels = back->pixels;
     back->pixels = tmp;
 
-    /* Blit primary to GOP framebuffer */
-    ensure_framebuffer();
-    if (framebuffer && primary->pixels) {
-        DWORD pitch = gop_pitch ? gop_pitch : primary->width;
-
-        if (primary->bpp == 8 && primary->palette) {
-            /* 8bpp palettized → XRGB8888 via palette lookup */
-            BYTE *src8 = primary->pixels;
-            uint32_t *dst32 = (uint32_t *)framebuffer;
-            for (DWORD y = 0; y < primary->height; y++) {
-                for (DWORD x = 0; x < primary->width; x++) {
-                    uint8_t idx = src8[y * primary->width + x];
-                    dst32[y * pitch + x] = primary->palette->entries[idx];
-                }
-            }
-        } else if (primary->bpp == 16) {
-            uint16_t *src16 = (uint16_t *)primary->pixels;
-            uint32_t *dst32 = (uint32_t *)framebuffer;
-            for (DWORD y = 0; y < primary->height; y++) {
-                for (DWORD x = 0; x < primary->width; x++) {
-                    uint16_t c = src16[y * primary->width + x];
-                    uint32_t r = ((c >> 11) & 0x1F) * 255 / 31;
-                    uint32_t g = ((c >> 5)  & 0x3F) * 255 / 63;
-                    uint32_t b = (c & 0x1F) * 255 / 31;
-                    dst32[y * pitch + x] = (r << 16) | (g << 8) | b;
-                }
-            }
-        } else if (primary->bpp == 32) {
-            uint32_t *src32 = (uint32_t *)primary->pixels;
-            uint32_t *dst32 = (uint32_t *)framebuffer;
-            for (DWORD y = 0; y < primary->height; y++)
-                dd_memcpy(&dst32[y * pitch], &src32[y * primary->width], primary->width * 4);
-        }
-    }
+    /* Blit primary to GOP framebuffer (nearest-neighbor scaled to full GOP) */
+    present_surface_to_gop(primary);
 
     ddraw_compositor_notify();
     return DD_OK;

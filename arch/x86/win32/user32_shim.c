@@ -1679,6 +1679,15 @@ void win32_post_mouse_abs(int ax, int ay, int lmin, int lmax, DWORD buttons)
     }
     if (capture_hwnd) target = capture_hwnd;
 
+    /* Prefer the DDraw render resolution (the 640x480 surface that
+     * present_surface_to_gop scales to fill the screen) as the mapping space, so
+     * the cursor lines up with the scaled image instead of a raw window rect. */
+    extern void ddraw_get_display_size(unsigned *w, unsigned *h) __attribute__((weak));
+    if (ddraw_get_display_size) {
+        unsigned dw = 0, dh = 0; ddraw_get_display_size(&dw, &dh);
+        if (dw && dh) { tw = (int)dw; th = (int)dh; }
+    }
+
     int range = lmax - lmin;
     if (range <= 0) range = 1;
     int nx = (int)(((int64_t)(ax - lmin) * (tw - 1)) / range);
