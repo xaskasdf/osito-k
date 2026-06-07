@@ -1411,6 +1411,29 @@ void isr_handler(interrupt_frame_t *frame)
             static int null_call_count = 0;
             null_call_count++;
 
+            /* [RET0-DIAG] Always dump the recent native-shim call ring on the
+             * first few near-NULL instruction-fetch faults, even when the
+             * call-site can't be decoded as `call *disp32(reg)` (e.g. a RET to a
+             * corrupted return address — the char-select-3x crash: RIP=0x13,
+             * stack zeroed). The last shim in the ring is the prime suspect for
+             * a wrong arg-count that over/under-cleaned the caller's stack. */
+            if (null_call_count <= 3) {
+                serial_puts("[RET0-DIAG] near-NULL fetch RIP=0x");
+                serial_puthex(frame->rip & 0xFFFFFFFF, 8);
+                serial_puts(" ESP=0x"); serial_puthex(frame->rsp & 0xFFFFFFFF, 8);
+                serial_puts(" EBP=0x"); serial_puthex((uint32_t)frame->rbp, 8);
+                serial_puts(" EBX=0x"); serial_puthex((uint32_t)frame->rbx, 8);
+                serial_puts(" ESI=0x"); serial_puthex((uint32_t)frame->rsi, 8);
+                serial_puts("\n  recent stack dwords:");
+                uint32_t *sp = (uint32_t *)(uintptr_t)(frame->rsp & 0xFFFFFFFF);
+                for (int si = 0; si < 12; si++) {
+                    serial_puts(" 0x"); serial_puthex(sp[si], 8);
+                }
+                serial_puts("\n");
+                extern void compat32_dump_recent_calls(void);
+                compat32_dump_recent_calls();
+            }
+
             /* Diagnostic: for indirect calls (call *offset(reg)), dump
              * the vtable pointer and the target entry so we can see why
              * the function pointer is NULL. */
@@ -1440,6 +1463,10 @@ void isr_handler(interrupt_frame_t *frame)
                     serial_puts(" callsite=0x"); serial_puthex(retaddr32 - 6, 8);
                     serial_puts(" ret=0x"); serial_puthex(retaddr32, 8);
                     serial_puts("\n");
+                    /* Dump recent native calls to find the shim that corrupted
+                     * the caller before this NULL virtual call (New-Game crash). */
+                    { extern void compat32_dump_recent_calls(void);
+                      compat32_dump_recent_calls(); }
                     /* Dump registers and object for Browse call */
                     if (disp == 0xB0) {
                         serial_puts("  ECX=0x"); serial_puthex((uint32_t)frame->rcx, 8);
@@ -1934,6 +1961,18 @@ void isr_handler(interrupt_frame_t *frame)
                 serial_puts("\n");
                 if (prev_ebp <= ebp) break;  /* prevent infinite loops */
                 ebp = prev_ebp;
+            }
+            /* [BPDIAG] On a compat-mode fatal exception (covers #BP at 0xCC
+             * thunk-pool tail and #PF), dump the recent native-shim call ring
+             * once so we can see which shim/path produced the garbage
+             * call/return target (map-select recovery-cascade crash). */
+            {
+                static int bpdiag_done = 0;
+                if (!bpdiag_done) {
+                    bpdiag_done = 1;
+                    extern void compat32_dump_recent_calls(void);
+                    compat32_dump_recent_calls();
+                }
             }
         }
 

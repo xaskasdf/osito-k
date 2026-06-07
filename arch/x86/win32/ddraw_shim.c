@@ -503,23 +503,31 @@ static HRESULT WINAPI surf_Lock(IDirectDrawSurface7 *self, LPRECT destRect,
     if (s->pixels && s->width == display_width && s->height == display_height)
         g_present_surface = s;
 
-    /* ddpfPixelFormat at offset 72 (32-bit layout) */
-    d[18] = 32;  /* ddpfPixelFormat.dwSize at offset 72 */
-    d[22] = s->bpp;  /* dwRGBBitCount at offset 88 */
+    /* ddpfPixelFormat at offset 72 (32-bit DDSURFACEDESC2 layout). Field
+     * offsets within ddpf: dwSize@72(d18), dwFlags@76(d19), dwFourCC@80(d20),
+     * dwRGBBitCount@84(d21), dwRBitMask@88(d22), dwGBitMask@92(d23),
+     * dwBBitMask@96(d24), dwRGBAlphaBitMask@100(d25).
+     * BUGFIX 2026-06-07: every field from dwRGBBitCount on was written one dword
+     * too high (bitcount at d22, R/G/B masks at d23/d24/d25), so SoftDrv read
+     * dwRGBBitCount=0, dwRBitMask=bpp, dwGBitMask=0xF800, dwBBitMask=0x07E0 and
+     * built a blitter that wrote only the middle 6 bits (green field) — the
+     * green-tint. Use the correct ABI offsets. */
+    d[18] = 32;       /* dwSize @72 */
+    d[21] = s->bpp;   /* dwRGBBitCount @84 */
 
     if (s->bpp == 8) {
-        d[19] = 0x00000020;  /* DDPF_PALETTEINDEXED8 */
+        d[19] = 0x00000020;  /* DDPF_PALETTEINDEXED8 @76 */
         /* No bit masks for palettized mode */
     } else if (s->bpp == 16) {
-        d[19] = DDPF_RGB;  /* dwFlags at offset 76 */
-        d[23] = 0xF800;  /* dwRBitMask at offset 92 */
-        d[24] = 0x07E0;  /* dwGBitMask at offset 96 */
-        d[25] = 0x001F;  /* dwBBitMask at offset 100 */
+        d[19] = DDPF_RGB;    /* dwFlags @76 */
+        d[22] = 0xF800;      /* dwRBitMask @88 */
+        d[23] = 0x07E0;      /* dwGBitMask @92 */
+        d[24] = 0x001F;      /* dwBBitMask @96 */
     } else {
-        d[19] = DDPF_RGB;
-        d[23] = 0x00FF0000;
-        d[24] = 0x0000FF00;
-        d[25] = 0x000000FF;
+        d[19] = DDPF_RGB;    /* dwFlags @76 */
+        d[22] = 0x00FF0000;  /* dwRBitMask @88 */
+        d[23] = 0x0000FF00;  /* dwGBitMask @92 */
+        d[24] = 0x000000FF;  /* dwBBitMask @96 */
     }
 
     s->locked = 1;
@@ -774,6 +782,43 @@ static HRESULT WINAPI surf_GetSurfaceDesc(IDirectDrawSurface7 *self, DDSURFACEDE
     HRESULT hr = surf_Lock(self, NULL, desc, 0, NULL);
     if (hr == DD_OK) surf_Unlock(self, NULL);
     return hr;
+}
+
+/* IDirectDrawSurface7::GetPixelFormat (vtbl slot 21). UE1
+ * USoftwareRenderDevice::SetRes calls this on the render-target surface to learn
+ * the RGB bit layout and build its 16-bit shade/color tables. It was previously
+ * UNIMPLEMENTED (the generic S_OK stub left the caller's DDPIXELFORMAT
+ * untouched), so SoftDrv read a zeroed format and built a green-biased table —
+ * the green tint. Fill a proper DDPIXELFORMAT (32-bit layout, 32 bytes):
+ *   dwSize@0 dwFlags@4 dwFourCC@8 dwRGBBitCount@12
+ *   dwRBitMask@16 dwGBitMask@20 dwBBitMask@24 dwRGBAlphaBitMask@28 */
+static HRESULT WINAPI surf_GetPixelFormat(IDirectDrawSurface7 *self, void *lpDDPF)
+{
+    IDirectDrawSurface7 *real = REAL_SURF(self);
+    if (!real || !lpDDPF) return DDERR_INVALIDPARAMS;
+    DDSurface *s = &real->surf;
+    uint32_t *pf = (uint32_t *)lpDDPF;
+    dd_memset(pf, 0, 32);
+    pf[0] = 32;          /* dwSize */
+    pf[3] = s->bpp;      /* dwRGBBitCount */
+    if (s->bpp == 8) {
+        pf[1] = 0x00000020;       /* DDPF_PALETTEINDEXED8 */
+    } else if (s->bpp == 16) {
+        pf[1] = DDPF_RGB;
+        pf[4] = 0xF800;  pf[5] = 0x07E0;  pf[6] = 0x001F;
+    } else {
+        pf[1] = DDPF_RGB;
+        pf[4] = 0x00FF0000; pf[5] = 0x0000FF00; pf[6] = 0x000000FF;
+    }
+    static int gpf_logged = 0;
+    if (!gpf_logged) {
+        gpf_logged = 1;
+        serial_puts("[DDRAW] GetPixelFormat -> bpp="); serial_putdec(s->bpp);
+        serial_puts(" R=0x"); serial_puthex(pf[4], 4);
+        serial_puts(" G=0x"); serial_puthex(pf[5], 4);
+        serial_puts(" B=0x"); serial_puthex(pf[6], 4); serial_puts("\n");
+    }
+    return DD_OK;
 }
 
 static HRESULT WINAPI surf_GetDC(IDirectDrawSurface7 *self, HDC *hdc)
@@ -1388,6 +1433,8 @@ static void ddraw_init_com32(void)
                                               "Surf_Flip", 3, CC_STDCALL);
     surf_vtbl32[12] = compat32_make_thunk_ex((uint64_t)(ULONG_PTR)surf_GetAttachedSurface,
                                               "Surf_GetAttached", 3, CC_STDCALL);
+    surf_vtbl32[21] = compat32_make_thunk_ex((uint64_t)(ULONG_PTR)surf_GetPixelFormat,
+                                              "Surf_GetPixelFormat", 2, CC_STDCALL);
     surf_vtbl32[22] = compat32_make_thunk_ex((uint64_t)(ULONG_PTR)surf_GetSurfaceDesc,
                                               "Surf_GetDesc", 2, CC_STDCALL);
     surf_vtbl32[15] = compat32_make_thunk_ex((uint64_t)(ULONG_PTR)surf_GetClipper,

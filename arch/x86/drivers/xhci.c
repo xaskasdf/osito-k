@@ -350,12 +350,17 @@ static void hid_process_mouse(xhci_device_t *dev, const uint8_t *r)
     extern void input_post_mouse_move(int16_t dx, int16_t dy);
     extern void input_post_mouse_button(uint8_t buttons);
     extern void input_set_mouse_abs(int32_t x, int32_t y);
+    /* Win32 bridge (UT99 etc.) — weak so a kernel without the win32 layer
+     * still links. The keyboard takes the same path (hid_route_to_win32). */
+    extern void win32_post_mouse_event(int dx, int dy, uint32_t buttons, short wheel) __attribute__((weak));
+    extern void win32_post_mouse_abs(int ax, int ay, int lmin, int lmax, uint32_t buttons) __attribute__((weak));
 
+    uint8_t btns = 0;
     if (caps->mouse_btn_field >= 0) {
         const hid_field_t *f = &caps->fields[caps->mouse_btn_field];
         uint32_t total = (uint32_t)f->bit_size * (uint32_t)f->count;
         if (total > 8) total = 8;
-        uint8_t btns = (uint8_t)hid_extract(r, f->bit_offset, (uint8_t)total) & 0x07;
+        btns = (uint8_t)hid_extract(r, f->bit_offset, (uint8_t)total) & 0x07;
         input_post_mouse_button(btns);
     }
 
@@ -374,11 +379,19 @@ static void hid_process_mouse(xhci_device_t *dev, const uint8_t *r)
             int32_t dy = hid_extract_signed(r, y_off, fy->bit_size);
             if (dx != 0 || dy != 0)
                 input_post_mouse_move((int16_t)dx, (int16_t)dy);
+            if (win32_post_mouse_event)
+                win32_post_mouse_event((int)dx, (int)dy, btns, 0);
         } else {
             int32_t ax = hid_extract(r, x_off, fx->bit_size);
             int32_t ay = hid_extract(r, y_off, fy->bit_size);
             input_set_mouse_abs(ax, ay);
+            if (win32_post_mouse_abs)
+                win32_post_mouse_abs((int)ax, (int)ay,
+                                     fx->logical_min, fx->logical_max, btns);
         }
+    } else if (caps->mouse_btn_field >= 0 && win32_post_mouse_event) {
+        /* Button-only report (no axes this frame): still deliver clicks. */
+        win32_post_mouse_event(0, 0, btns, 0);
     }
     (void)dev;
 }

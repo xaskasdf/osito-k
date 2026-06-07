@@ -2290,6 +2290,45 @@ void WINAPI crt_CxxThrowException(PVOID pExceptionObject, PVOID pThrowInfo)
     serial_puthex(throw_eip, 8);
     serial_puts("\n");
 
+    /* [THROWMSG] diagnostic: UT99's New-Game crash is preceded by a recoverable
+     * `throw (TCHAR*)errmsg` (throwInfo 0x1017D4B0, type wchar_t*) from a failed
+     * map load. The thrown object is the TCHAR* pointer; dump the message it
+     * points to (first few) to learn WHY the load fails (the crash trigger). */
+    {
+        static int throwmsg_n = 0;
+        if (pThrowInfo == (PVOID)(uintptr_t)0x1017D4B0ULL && throwmsg_n < 6 && pExceptionObject) {
+            throwmsg_n++;
+            uint32_t pstr = *(volatile uint32_t *)pExceptionObject;  /* TCHAR* */
+            serial_puts("[THROWMSG] \"");
+            if (pstr >= 0x10000 && pstr < 0x80000000) {
+                const uint16_t *w = (const uint16_t *)(uintptr_t)pstr;
+                for (int k = 0; k < 160 && w[k]; k++) {
+                    char c = (w[k] >= 0x20 && w[k] < 0x7F) ? (char)w[k] : '?';
+                    char s[2] = { c, 0 }; serial_puts(s);
+                }
+            }
+            serial_puts("\"\n");
+        }
+    }
+
+    /* [GERRHIST DIAGNOSTIC — uncommitted] For appError `throw 1` (funclet rethrow
+     * @0x10903EE4), the message is in GErrorHist (Core.dll buffer @0x101E3474, UTF-16),
+     * not the throw object. Dump it once-per-cascade to learn the real fatal reason
+     * (e.g. render/audio device init failure) behind the render-frontier exit. */
+    {
+        static int gerr_n = 0;
+        const volatile uint16_t *gh = (const volatile uint16_t *)(uintptr_t)0x101E3474ULL;
+        if (gerr_n < 4 && gh[0] != 0) {
+            gerr_n++;
+            serial_puts("[GERRHIST] \"");
+            for (int k = 0; k < 240 && gh[k]; k++) {
+                char c = (gh[k] >= 0x20 && gh[k] < 0x7F) ? (char)gh[k] : '?';
+                char s[2] = { c, 0 }; serial_puts(s);
+            }
+            serial_puts("\"\n");
+        }
+    }
+
     /* Dump thrown object to identify the error message.
      * Try reading the first few fields and interpret as string pointers. */
     if (pExceptionObject) {
@@ -3836,6 +3875,27 @@ WCHAR* WINAPI crt_wcscpy(WCHAR *dst, const WCHAR *src)
             serial_puts(" outer_eip=0x");
             serial_puthex((uint64_t)outer, 8);
             serial_puts("\n");
+            /* [BT-0 DIAGNOSTIC — uncommitted] First few times only, walk the
+             * guest stack and print PE-code return addresses so we can identify
+             * the iterator that keeps appending the bad "0" name. */
+            {
+                static int bt0_n = 0;
+                if (bt0_n < 4 && g_last_stack_args) {
+                    bt0_n++;
+                    uint32_t *sp = (uint32_t *)(uintptr_t)g_last_stack_args;
+                    serial_puts("[BT-0]");
+                    int printed = 0;
+                    for (int k = 0; k < 64 && printed < 12; k++) {
+                        uint32_t v = sp[k];
+                        if (v >= 0x10100000 && v < 0x11000000) {
+                            serial_puts(" 0x");
+                            serial_puthex((uint64_t)v, 8);
+                            printed++;
+                        }
+                    }
+                    serial_puts("\n");
+                }
+            }
         }
     }
     WCHAR *d = dst;

@@ -1660,6 +1660,68 @@ void win32_post_mouse_event(int dx, int dy, DWORD buttons, short wheel_delta)
     }
 }
 
+/* Absolute-pointer path (QEMU usb-tablet / any HID_INPUT_ABS mouse). ax/ay are
+ * raw logical coordinates in [lmin,lmax]; scale into the top window's client
+ * space (UT's 640x480 viewport), set cursor_pos (so GetCursorPos is accurate for
+ * UWindow's polled menu cursor), and emit WM_MOUSEMOVE + button transitions.
+ * Bridges the xHCI mouse to the Win32 layer (previously unwired → dead mouse). */
+void win32_post_mouse_abs(int ax, int ay, int lmin, int lmax, DWORD buttons)
+{
+    HWND target = NULL;
+    int tw = SCREEN_WIDTH, th = SCREEN_HEIGHT;
+    for (int i = window_count - 1; i >= 0; i--) {
+        if (windows[i].used) {
+            target = windows[i].handle;
+            if (windows[i].width  > 0) tw = windows[i].width;
+            if (windows[i].height > 0) th = windows[i].height;
+            break;
+        }
+    }
+    if (capture_hwnd) target = capture_hwnd;
+
+    int range = lmax - lmin;
+    if (range <= 0) range = 1;
+    int nx = (int)(((int64_t)(ax - lmin) * (tw - 1)) / range);
+    int ny = (int)(((int64_t)(ay - lmin) * (th - 1)) / range);
+    if (nx < 0) nx = 0; else if (nx >= tw) nx = tw - 1;
+    if (ny < 0) ny = 0; else if (ny >= th) ny = th - 1;
+
+    int moved = (nx != cursor_pos.x) || (ny != cursor_pos.y);
+    cursor_pos.x = nx;
+    cursor_pos.y = ny;
+
+    DWORD old_buttons = mouse_buttons;
+    mouse_buttons = buttons;
+    LPARAM pos_lp = ((LPARAM)(ny & 0xFFFF) << 16) | (LPARAM)(nx & 0xFFFF);
+
+    if (moved)
+        msg_enqueue(target, WM_MOUSEMOVE, 0, pos_lp);
+    if ((buttons & 1) && !(old_buttons & 1)) {
+        key_state[VK_LBUTTON] |= 0x80;
+        msg_enqueue(target, WM_LBUTTONDOWN, MK_LBUTTON, pos_lp);
+    }
+    if (!(buttons & 1) && (old_buttons & 1)) {
+        key_state[VK_LBUTTON] &= ~0x80;
+        msg_enqueue(target, WM_LBUTTONUP, 0, pos_lp);
+    }
+    if ((buttons & 2) && !(old_buttons & 2)) {
+        key_state[VK_RBUTTON] |= 0x80;
+        msg_enqueue(target, WM_RBUTTONDOWN, MK_RBUTTON, pos_lp);
+    }
+    if (!(buttons & 2) && (old_buttons & 2)) {
+        key_state[VK_RBUTTON] &= ~0x80;
+        msg_enqueue(target, WM_RBUTTONUP, 0, pos_lp);
+    }
+    if ((buttons & 4) && !(old_buttons & 4)) {
+        key_state[VK_MBUTTON] |= 0x80;
+        msg_enqueue(target, WM_MBUTTONDOWN, MK_MBUTTON, pos_lp);
+    }
+    if (!(buttons & 4) && (old_buttons & 4)) {
+        key_state[VK_MBUTTON] &= ~0x80;
+        msg_enqueue(target, WM_MBUTTONUP, 0, pos_lp);
+    }
+}
+
 /* ── Clipboard stubs (UT99 Core.dll) ─────────────────────── */
 
 BOOL WINAPI OpenClipboard(HANDLE hWndNewOwner)

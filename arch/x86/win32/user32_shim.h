@@ -328,6 +328,7 @@ int     WINAPI ToAscii(DWORD uVirtKey, DWORD uScanCode, const BYTE *lpKeyState,
  */
 void win32_post_keyboard_event(BYTE scancode, BOOL key_up);
 void win32_post_mouse_event(int dx, int dy, DWORD buttons, short wheel_delta);
+void win32_post_mouse_abs(int ax, int ay, int lmin, int lmax, DWORD buttons);
 
 /* Misc */
 int     WINAPI MessageBoxA(HWND hWnd, PCSTR lpText, PCSTR lpCaption, DWORD uType);

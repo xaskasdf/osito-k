@@ -136,6 +136,40 @@ uint32_t compat32_get_last_caller_eip(void) { return g_last_caller_eip; }
 uint32_t g_last_stack_args = 0;
 uint32_t compat32_get_last_stack_args(void) { return g_last_stack_args; }
 
+/* Recent-native-call ring buffer (diagnostic): records every INT 0x2E shim
+ * dispatch (no serial I/O) so the #PF/NULL-CALL handler can dump the last ~24
+ * native calls before a crash — to find a shim whose wrong arg-count/return
+ * corrupted the caller's registers/stack (the New-Game LocalMapURL NULL-vtable
+ * crash). Safe to add now that the IST1 stack-overflow is fixed. */
+const char *g_rcall_name[64];
+uint32_t    g_rcall_args[64][4];
+uint8_t     g_rcall_nargs[64];
+uint32_t    g_rcall_caller[64];
+uint32_t    g_rcall_idx = 0;
+
+void compat32_dump_recent_calls(void)
+{
+    serial_puts("[RCALL] last native calls before fault (oldest->newest):\n");
+    uint32_t start = (g_rcall_idx >= 24) ? g_rcall_idx - 24 : 0;
+    for (uint32_t k = start; k < g_rcall_idx; k++) {
+        uint32_t ri = k & 63;
+        serial_puts("  ");
+        serial_putdec(k);
+        serial_puts(": ");
+        serial_puts(g_rcall_name[ri] ? g_rcall_name[ri] : "?");
+        serial_puts(" (");
+        serial_putdec(g_rcall_nargs[ri]);
+        serial_puts(" args) caller=0x");
+        serial_puthex(g_rcall_caller[ri], 8);
+        serial_puts(" a=[0x");
+        serial_puthex(g_rcall_args[ri][0], 8);
+        serial_puts(" 0x"); serial_puthex(g_rcall_args[ri][1], 8);
+        serial_puts(" 0x"); serial_puthex(g_rcall_args[ri][2], 8);
+        serial_puts(" 0x"); serial_puthex(g_rcall_args[ri][3], 8);
+        serial_puts("]\n");
+    }
+}
+
 /* The user-mode RBP at the moment of the INT 0x2E. Set by
  * int2e_stub.S right before it calls compat32_dispatch. The low 32
  * bits are the 32-bit EBP that the engine's frame-pointer chain uses;
@@ -2121,6 +2155,25 @@ int compat32_seh_dispatch(PEXCEPTION_RECORD ExceptionRecord)
                         serial_puthex(catch_ebp, 8);
                         serial_puts("\n");
 
+                        /* [CATCH-EBP DIAGNOSTIC — uncommitted] For the UT99 LoadMap
+                         * TCHAR* catch funclet (Engine.dll ~0x1038Exxx), the fault is a
+                         * NULL vtable call on this=[ebp-0x14]. Dump frame_addr and the
+                         * value that will be visible at [catch_ebp-0x14] / -0x34 / -0xC so
+                         * we can verify the establisher EBP is correct. */
+                        if (catch_handler >= 0x1038E000 && catch_handler < 0x1038F000) {
+                            serial_puts("[CATCH-EBP] frame_addr=0x");
+                            serial_puthex(frame_addr, 8);
+                            serial_puts(" next=0x");
+                            serial_puthex(next32, 8);
+                            serial_puts(" [ebp-0x14]=0x");
+                            serial_puthex(*(volatile uint32_t *)(uintptr_t)(catch_ebp - 0x14), 8);
+                            serial_puts(" [ebp-0x34]=0x");
+                            serial_puthex(*(volatile uint32_t *)(uintptr_t)(catch_ebp - 0x34), 8);
+                            serial_puts(" [ebp-0xC]=0x");
+                            serial_puthex(*(volatile uint32_t *)(uintptr_t)(catch_ebp - 0x0C), 8);
+                            serial_puts("\n");
+                        }
+
                         /*
                          * Call the catch handler via compat32_callback.
                          * The MSVC catch handler expects EBP to be the
@@ -2567,8 +2620,27 @@ uint64_t compat32_dispatch(uint32_t thunk_idx, uint32_t *stack_args)
          * fix and see the engine's raw behavior — used in conjunction
          * with FNDIFF to attribute NULL slots to the engine's own code
          * path vs our fill. */
+        /* FNAME-NULL-FILL DISABLED (2026-06-06, option (b)): disasm of Core.dll
+         * proved the "Unhashed name '%s'" assert at 0x101533aa lives inside
+         * FName::DeleteEntry(INT Index) — it loads Names[Index], walks NameHash
+         * (@0x10295d4c, HashNext@+0x08) to find that exact pointer, raises
+         * "Unhashed name '<name>'" if absent, then UNLINKS it (*esi =
+         * entry->HashNext) and calls GMalloc->Free(entry) (GMalloc@0x101a7b90,
+         * vtbl[2]=Free). Masking NULL slots with a single SHARED, non-GMalloc
+         * sentinel poisons that delete path: DeleteEntry on a filled slot can't
+         * find the aliased pointer in the hash -> "Unhashed name 'None'" (the
+         * render-transition crash). Hash-linking the sentinel (opt a) would make
+         * GMalloc->Free() run on foreign/aliased memory (heap corruption + UAF
+         * of sibling slots); reusing the engine's real None (opt c) would
+         * unlink+Free the canonical NAME_None (UAF on every later FName(0)).
+         * The FNAME_RESCUE_PREFILL above (Num=0, pre-sized Max) already makes
+         * the engine register its own names densely, so the operator*()
+         * NULL-read cascade this masked is now inert. Keep the loop compiled but
+         * gated off; only re-enable with a PER-SLOT, non-aliased, GMalloc-owned,
+         * hash-linked entry if a specific NULL read ever recurs. */
+        static const int FNAME_NULL_FILL_ENABLED = 0;
         #ifndef DISABLE_NULL_FILL
-        if (fname_none_entry && fd != 0) {
+        if (FNAME_NULL_FILL_ENABLED && fname_none_entry && fd != 0) {
             uint32_t *slots = (uint32_t *)(uintptr_t)fd;
             uint32_t limit = fn;
             if (limit > fm) limit = fm;
@@ -3454,6 +3526,20 @@ uint64_t compat32_dispatch(uint32_t thunk_idx, uint32_t *stack_args)
     compat32_thunk_t *t = &thunk_table[thunk_idx];
     uint64_t target = t->target_addr;
     uint8_t nargs = t->num_args;
+
+    /* Recent-native-call ring buffer: record this shim dispatch (cheap, no I/O)
+     * so the NULL-CALL/#PF handler can dump the calls leading up to a crash. */
+    {
+        uint32_t ri = g_rcall_idx & 63;
+        g_rcall_name[ri]   = t->name;
+        g_rcall_nargs[ri]  = nargs;
+        g_rcall_caller[ri] = stack_args[-1];
+        g_rcall_args[ri][0] = nargs > 0 ? stack_args[0] : 0;
+        g_rcall_args[ri][1] = nargs > 1 ? stack_args[1] : 0;
+        g_rcall_args[ri][2] = nargs > 2 ? stack_args[2] : 0;
+        g_rcall_args[ri][3] = nargs > 3 ? stack_args[3] : 0;
+        g_rcall_idx++;
+    }
 
     /* Save the 13th stack arg for CreateWindowExW workaround. */
     g_compat32_last_stack_arg13 = (nargs >= 12) ? stack_args[12] : 0;
