@@ -331,6 +331,7 @@ arch/arm/          SM8350 (ROG Phone 5) bare-metal port — see docs/aarch64-det
 | X-WIN32 | Windows PE32 compat layer (12+ DLL shims: kernel32, msvcrt, user32, gdi32, advapi32, comctl32, comdlg32, ddraw, dsound, ntdll, ole32, shell32, winmm, wsock32). Active: UT99/GTAV/Engine.dll debugging, SEH dispatch, IAT patching, INT 0x2E thunks | WIP |
 | X-PGTBL | Per-process page tables (CR3 switch on context switch) | Done |
 | X-W32THR| Win32 real threading (CreateThread → sched_spawn) | Done |
+| X-MSI   | Native MSI/MSIX installer engine (mini-msiexec): OLE2/CFBF reader, MSI string-pool + _Columns + Directory/Component/File/Media/Registry tables, embedded CAB/MSZIP (zlib_inflate_raw cross-block window), ZIP/OPC + AppxManifest for MSIX. Extracts to OsitoFS via vfs_resolve(WIN32), applies Registry rows, writes uninstall manifest. Shell: `msi install`/`msiexec`/`msix` + `.msi`/`.msix` auto-detect in winexec. Validated end-to-end vs real test.msi+test.msix (host harness, byte-exact). Files: win32/{ole2,msi,cab,zip,msix,installer}.c | Done |
 | X-OSFS3 | OsitoFS v2 overhaul (9 tools, block_size, timestamps, hash, CRC, fsck) | Done |
 | X-DHCP  | DHCP client (auto IP, gateway, DNS, lease renewal) | Done |
 | X-NTP   | NTP time sync (pool.ntp.org, UTC offset, panel clock) | Done |

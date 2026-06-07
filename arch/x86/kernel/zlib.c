@@ -190,47 +190,42 @@ static int decode_dynamic(bitreader_t *br, huffman_t *lit, huffman_t *dist)
     return 0;
 }
 
-/* ── Main inflate ───────────────────────────────────────────── */
-
-int zlib_inflate(const uint8_t *src, uint32_t src_len,
-                 uint8_t *dst, uint32_t *dst_len)
+/* ── Block decoder (shared core) ─────────────────────────────────
+ * Decode a sequence of DEFLATE blocks from br into dst, starting at
+ * *io_out and stopping after the BFINAL block. *io_out is updated to
+ * the new output length. dst[0..*io_out) is usable LZ77 history, which
+ * is what lets MSZIP back-reference the previous CFDATA block.
+ * Returns 0, -1 (format error), or -2 (output overflow). */
+static int inflate_blocks(bitreader_t *br, uint8_t *dst,
+                          uint32_t *io_out, uint32_t max_out)
 {
-    if (src_len < 6) return -1;
-
-    /* zlib header check */
-    uint8_t cmf = src[0], flg = src[1];
-    if ((cmf & 0x0F) != 8) return -1;          /* CM = deflate */
-    if (((cmf * 256 + flg) % 31) != 0) return -1; /* FCHECK */
-
-    bitreader_t br = { src + 2, src_len - 2, 0, 0, 0 };
-    uint32_t out = 0, max_out = *dst_len;
-
+    uint32_t out = *io_out;
     int bfinal;
     do {
-        bfinal = (int)br_read(&br, 1);
-        int btype = (int)br_read(&br, 2);
+        bfinal = (int)br_read(br, 1);
+        int btype = (int)br_read(br, 2);
 
         if (btype == 0) {
             /* Stored block — align to byte boundary */
-            br.bits = 0; br.nbits = 0;
-            if (br.pos + 4 > br.size) return -1;
-            uint16_t len  = br.data[br.pos] | ((uint16_t)br.data[br.pos + 1] << 8);
-            br.pos += 4; /* skip len + nlen */
+            br->bits = 0; br->nbits = 0;
+            if (br->pos + 4 > br->size) return -1;
+            uint16_t len = br->data[br->pos] | ((uint16_t)br->data[br->pos + 1] << 8);
+            br->pos += 4; /* skip len + nlen */
             for (uint16_t i = 0; i < len; i++) {
                 if (out >= max_out) return -2;
-                if (br.pos >= br.size) return -1;
-                dst[out++] = br.data[br.pos++];
+                if (br->pos >= br->size) return -1;
+                dst[out++] = br->data[br->pos++];
             }
         } else if (btype == 1 || btype == 2) {
             huffman_t lit_h, dist_h;
             if (btype == 1) {
                 build_fixed_tables(&lit_h, &dist_h);
             } else {
-                if (decode_dynamic(&br, &lit_h, &dist_h) < 0) return -1;
+                if (decode_dynamic(br, &lit_h, &dist_h) < 0) return -1;
             }
 
             for (;;) {
-                int sym = huff_decode(&br, &lit_h);
+                int sym = huff_decode(br, &lit_h);
                 if (sym < 0) return -1;
 
                 if (sym < 256) {
@@ -242,10 +237,10 @@ int zlib_inflate(const uint8_t *src, uint32_t src_len,
                     /* Length + distance */
                     int li = sym - 257;
                     if (li < 0 || li >= 29) return -1;
-                    uint32_t length = len_base[li] + br_read(&br, len_extra[li]);
-                    int dsym = huff_decode(&br, &dist_h);
+                    uint32_t length = len_base[li] + br_read(br, len_extra[li]);
+                    int dsym = huff_decode(br, &dist_h);
                     if (dsym < 0 || dsym >= 30) return -1;
-                    uint32_t distance = dist_base[dsym] + br_read(&br, dist_extra[dsym]);
+                    uint32_t distance = dist_base[dsym] + br_read(br, dist_extra[dsym]);
 
                     if (distance > out) return -1;
                     for (uint32_t i = 0; i < length; i++) {
@@ -260,9 +255,29 @@ int zlib_inflate(const uint8_t *src, uint32_t src_len,
         }
     } while (!bfinal);
 
+    *io_out = out;
+    return 0;
+}
+
+/* ── Main inflate (zlib-framed: 2-byte header + adler32 trailer) ── */
+
+int zlib_inflate(const uint8_t *src, uint32_t src_len,
+                 uint8_t *dst, uint32_t *dst_len)
+{
+    if (src_len < 6) return -1;
+
+    /* zlib header check */
+    uint8_t cmf = src[0], flg = src[1];
+    if ((cmf & 0x0F) != 8) return -1;          /* CM = deflate */
+    if (((cmf * 256 + flg) % 31) != 0) return -1; /* FCHECK */
+
+    bitreader_t br = { src + 2, src_len - 2, 0, 0, 0 };
+    uint32_t out = 0;
+    int rc = inflate_blocks(&br, dst, &out, *dst_len);
+    if (rc < 0) return rc;
+
     *dst_len = out;
 
-    /* Verify adler32 (last 4 bytes of src, big-endian) */
     /* Verify adler32 (last 4 bytes of src, big-endian) */
     if (src_len >= 4) {
         uint32_t expected = ((uint32_t)src[src_len - 4] << 24) |
@@ -273,6 +288,22 @@ int zlib_inflate(const uint8_t *src, uint32_t src_len,
         if (actual != expected) return -3;
     }
 
+    return 0;
+}
+
+/* ── Raw inflate (bare DEFLATE, no header/trailer) ───────────────
+ * For MSZIP (CAB) and ZIP/OPC (MSIX) payloads, which are raw DEFLATE.
+ * dst may already hold start_off bytes of prior output to serve as
+ * LZ77 history (MSZIP cross-block window). On success *dst_len is set
+ * to the total length (start_off + bytes produced by this call). */
+int zlib_inflate_raw(const uint8_t *src, uint32_t src_len,
+                     uint8_t *dst, uint32_t start_off, uint32_t *dst_len)
+{
+    bitreader_t br = { src, src_len, 0, 0, 0 };
+    uint32_t out = start_off;
+    int rc = inflate_blocks(&br, dst, &out, *dst_len);
+    if (rc < 0) return rc;
+    *dst_len = out;
     return 0;
 }
 

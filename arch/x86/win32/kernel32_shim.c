@@ -1528,6 +1528,9 @@ int WINAPI lstrlenW(PCWSTR lpString)
  * the engine attempts to load it but ends up trying to load package
  * "0" (some FName index resolves to empty/zero) and throws "Can't
  * find file for package '0'".  Bare exe → menu may work better. */
+/* [REPRO-#1 DIAGNOSTIC — uncommitted] Boot directly into a gameplay map so the
+ * engine attempts a New-Game-style LoadMap at startup (deterministic, no GUI nav)
+ * to reproduce the LocalMapURL map-load-failure throw. Revert to bare exe before commit. */
 static char  g_cmdline_a[] = "UnrealTournament.exe";
 static WCHAR g_cmdline_w[] = {'U','n','r','e','a','l','T','o','u','r','n','a','m','e','n','t','.','e','x','e',0};
 

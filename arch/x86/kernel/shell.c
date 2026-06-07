@@ -597,6 +597,7 @@ static void cmd_help(void)
     sh_puts("  apipa     Auto-assign link-local 169.254.X.Y (RFC 3927)\n");
     sh_puts("  ipconf    Set static IP (ipconf <ip> [gw] [mask] [dns])\n");
     sh_puts("  winexec   Run a Win32 PE executable (winexec file.exe)\n");
+    sh_puts("  msi       Install MSI/MSIX package (msi install file.msi | msix file.msix)\n");
     sh_puts("  dosrun    Run a DOS 16-bit binary (dosrun file.com)\n");
     sh_puts("  clear     Clear screen\n");
     sh_puts("  desktop   Launch graphical desktop (elementaryOS style)\n");
@@ -6726,12 +6727,26 @@ q4kgdone:
             sh_puts("Usage: winexec <file.exe>\n");
         } else {
             extern int win32_exec(const char *filename);
+            extern int win32_install(const char *filename);
             extern int  kern_setjmp(uint64_t *buf) __attribute__((returns_twice));
             extern uint64_t *compat32_crash_jmpbuf;
+            /* Route installer packages to the installer engine. */
+            const char *fn = argv[1];
+            int fl = 0; while (fn[fl]) fl++;
+            int is_pkg = (fl > 4 && fn[fl-4] == '.' &&
+                          (fn[fl-3]=='m'||fn[fl-3]=='M') &&
+                          (fn[fl-2]=='s'||fn[fl-2]=='S') &&
+                          (fn[fl-1]=='i'||fn[fl-1]=='I')) ||
+                         (fl > 5 && fn[fl-5] == '.' &&
+                          (fn[fl-4]=='m'||fn[fl-4]=='M') &&
+                          (fn[fl-3]=='s'||fn[fl-3]=='S') &&
+                          (fn[fl-2]=='i'||fn[fl-2]=='I') &&
+                          (fn[fl-1]=='x'||fn[fl-1]=='X'));
             static uint64_t winexec_jmpbuf[9];
             compat32_crash_jmpbuf = winexec_jmpbuf;
             if (kern_setjmp(winexec_jmpbuf) == 0) {
-                win32_exec(argv[1]);
+                if (is_pkg) win32_install(fn);
+                else        win32_exec(fn);
             } else {
                 sh_puts("\n [WIN32] Process crashed — returned to shell\n");
                 /* Restore IST1 after longjmp — the compat32 exception path
@@ -6742,6 +6757,45 @@ q4kgdone:
                 if (tss_ist1_ptr)
                     *tss_ist1_ptr = (uint64_t)(ist1_stack + 262144);
                 /* Reset compat32 mode flag */
+                extern int g_compat32_mode;
+                g_compat32_mode = 0;
+            }
+            compat32_crash_jmpbuf = NULL;
+        }
+    } else if (strcmp(cmd, "msi") == 0 || strcmp(cmd, "msiexec") == 0 ||
+               strcmp(cmd, "msix") == 0) {
+        extern int win32_install(const char *filename);
+        extern int installer_uninstall(const char *pkg);
+        const char *file = NULL;
+        int do_uninstall = 0;
+        if (strcmp(cmd, "msi") == 0) {
+            if (argc >= 3 && strcmp(argv[1], "install") == 0)        file = argv[2];
+            else if (argc >= 3 && strcmp(argv[1], "uninstall") == 0) { do_uninstall = 1; file = argv[2]; }
+            else if (argc >= 2)                                      file = argv[1];
+        } else if (argc >= 2) {
+            file = argv[1];   /* msiexec / msix <file> */
+        }
+        if (!file) {
+            sh_puts("Usage: msi install <file.msi> | msi uninstall <pkg> | msiexec <file> | msix <file.msix>\n");
+        } else if (do_uninstall) {
+            int n = installer_uninstall(file);
+            if (n < 0) sh_puts(" [MSI] no install manifest for that package\n");
+            else { sh_puts(" [MSI] uninstalled package\n"); }
+        } else {
+            extern int  kern_setjmp(uint64_t *buf) __attribute__((returns_twice));
+            extern uint64_t *compat32_crash_jmpbuf;
+            static uint64_t msi_jmpbuf[9];
+            compat32_crash_jmpbuf = msi_jmpbuf;
+            if (kern_setjmp(msi_jmpbuf) == 0) {
+                int rc = win32_install(file);
+                if (rc < 0) sh_puts(" [MSI] install failed (see serial log)\n");
+                else        sh_puts(" [MSI] install complete\n");
+            } else {
+                sh_puts("\n [WIN32] Installer crashed — returned to shell\n");
+                extern uint64_t *tss_ist1_ptr;
+                extern uint8_t ist1_stack[];
+                if (tss_ist1_ptr)
+                    *tss_ist1_ptr = (uint64_t)(ist1_stack + 262144);
                 extern int g_compat32_mode;
                 g_compat32_mode = 0;
             }

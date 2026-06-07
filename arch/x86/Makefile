@@ -184,7 +184,9 @@ WIN32_SRC = win32/win32_init.c win32/compat32.c win32/pe.c win32/winexec.c \
             win32/ddraw_shim.c win32/dsound_shim.c \
             win32/ole32_shim.c win32/shell32_shim.c \
             win32/comctl32_shim.c win32/comdlg32_shim.c \
-            win32/winmm_shim.c win32/wsock32_shim.c
+            win32/winmm_shim.c win32/wsock32_shim.c \
+            win32/ole2.c win32/msi.c win32/cab.c \
+            win32/zip.c win32/msix.c win32/installer.c
 WIN32_ASM = win32/int2e_stub.S
 DOS_ASM  = dos/dos_int_stub.S
 DOS_SRC  = dos/dos_init.c dos/dos_exec.c dos/dos_loader.c \

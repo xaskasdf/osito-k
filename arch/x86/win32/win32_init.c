@@ -251,3 +251,72 @@ int win32_exec(const char *filename)
 
     return result;
 }
+
+/* ── Install an MSI/MSIX package from OsitoFS ─────────────────── */
+
+extern int installer_run_buffer(const uint8_t *data, uint32_t len,
+                                const char *pkg_name);
+
+int win32_install(const char *filename)
+{
+    if (!win32_initialized) win32_init();
+
+    if (!osfs2_is_mounted()) {
+        serial_puts("[WIN32] No filesystem mounted\n");
+        return -1;
+    }
+
+    void *file = osfs2_find(filename);
+    if (!file) {
+        serial_puts("[WIN32] File not found: ");
+        serial_puts(filename);
+        serial_puts("\n");
+        return -1;
+    }
+
+    uint64_t size = osfs2_file_size(file);
+    if (size < 8) {
+        serial_puts("[WIN32] File too small to be a package\n");
+        return -1;
+    }
+
+    serial_puts("[WIN32] Installing ");
+    serial_puts(filename);
+    serial_puts(" (");
+    serial_putdec(size);
+    serial_puts(" bytes)\n");
+
+    uint64_t pages = (size + 0xFFF) / 4096;
+    uint8_t *buf = (uint8_t *)mem_alloc_pages(pages);
+    if (!buf) {
+        serial_puts("[WIN32] Failed to allocate read buffer\n");
+        return -1;
+    }
+
+    int rd = osfs2_read(file, 0, buf, size);
+    if (rd < 0) {
+        serial_puts("[WIN32] Failed to read file\n");
+        mem_free_pages(buf, pages);
+        return -1;
+    }
+
+    /* package name = filename basename without extension */
+    char pkg[64];
+    {
+        const char *base = filename;
+        for (const char *p = filename; *p; p++)
+            if (*p == '\\' || *p == '/') base = p + 1;
+        int i = 0;
+        for (; base[i] && base[i] != '.' && i < 63; i++) pkg[i] = base[i];
+        pkg[i] = 0;
+    }
+
+    int result = installer_run_buffer(buf, (uint32_t)size, pkg);
+
+    mem_free_pages(buf, pages);
+
+    serial_puts("[WIN32] Install finished, status = ");
+    serial_putdec((uint64_t)(uint32_t)result);
+    serial_puts("\n");
+    return result;
+}
