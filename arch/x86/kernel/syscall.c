@@ -2245,10 +2245,14 @@ static int64_t sys_sigaltstack(uint64_t ss_addr, uint64_t old_ss_addr)
     return 0;
 }
 
-/* exit_group — terminate all threads (alias to exit for now) */
+/* exit_group — terminate every thread in the caller's thread group.
+ * musl's exit()/return-from-main routes here; all sibling pthreads must die,
+ * not just the caller (and the shared CR3 must outlive the call). */
+extern void proc_exit_group(int32_t code);
 static int64_t sys_exit_group(uint64_t status)
 {
-    return sys_exit(status);
+    proc_exit_group((int32_t)status);
+    return 0; /* unreachable */
 }
 
 /* clock_gettime — return monotonic/realtime clock */
@@ -2431,22 +2435,44 @@ static int64_t sys_pwrite64(uint64_t fd, uint64_t buf, uint64_t count, uint64_t 
 #define FUTEX_PRIVATE_FLAG 128
 
 /* Futex — real wait queue implementation (X-THREAD) */
-extern int futex_do_wait(uint64_t uaddr, int expected);
-extern int futex_do_wake(uint64_t uaddr, int count);
+extern int futex_do_wait(uint64_t uaddr, int expected, uint64_t space,
+                         uint64_t timeout_ticks);
+extern int futex_do_wake(uint64_t uaddr, uint64_t space, int count);
+extern uint64_t proc_current_cr3(void);
+
+/* userspace struct timespec */
+typedef struct { int64_t tv_sec; int64_t tv_nsec; } futex_timespec_t;
 
 static int64_t sys_futex(uint64_t uaddr, uint64_t op, uint64_t val,
                           uint64_t timeout, uint64_t uaddr2)
 {
-    (void)timeout; (void)uaddr2;
+    (void)uaddr2;
     int cmd = (int)(op & ~FUTEX_PRIVATE_FLAG);
 
+    /* PRIVATE futexes are scoped to the calling address space (its CR3 —
+     * threads share it). SHARED (no PRIVATE flag) futexes are cross-process,
+     * keyed globally with space 0. musl's pthread primitives are PRIVATE. */
+    uint64_t space = (op & FUTEX_PRIVATE_FLAG) ? proc_current_cr3() : 0;
+
     if (cmd == FUTEX_WAIT) {
-        return (int64_t)futex_do_wait(uaddr, (int)val);
+        /* For FUTEX_WAIT, `timeout` (a4) is a RELATIVE struct timespec* or
+         * NULL for an infinite wait. Convert to 100Hz ticks (10ms each). */
+        uint64_t ticks = 0;
+        if (timeout) {
+            const futex_timespec_t *ts = (const futex_timespec_t *)timeout;
+            int64_t sec = ts->tv_sec, nsec = ts->tv_nsec;
+            if (sec < 0) sec = 0;
+            if (nsec < 0) nsec = 0;
+            uint64_t total_ns = (uint64_t)sec * 1000000000ULL + (uint64_t)nsec;
+            ticks = total_ns / 10000000ULL;   /* 10 ms per tick */
+            if (ticks == 0) ticks = 1;        /* round any nonzero up to 1 tick */
+        }
+        return (int64_t)futex_do_wait(uaddr, (int)val, space, ticks);
     }
     if (cmd == FUTEX_WAKE) {
-        return (int64_t)futex_do_wake(uaddr, (int)val);
+        return (int64_t)futex_do_wake(uaddr, space, (int)val);
     }
-    /* FUTEX_REQUEUE, etc. — stub for now */
+    /* FUTEX_REQUEUE, FUTEX_WAKE_OP, FUTEX_WAIT_BITSET, etc. — stub for now */
     return 0;
 }
 

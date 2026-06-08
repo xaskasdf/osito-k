@@ -1000,6 +1000,38 @@ void proc_exit(int32_t code)
     kern_longjmp(exec_jmpbuf, 1);
 }
 
+/* proc_exit_group — terminate the entire thread group, then exit the caller.
+ *
+ * POSIX exit() / return-from-main emits SYS_exit_group: every pthread sharing
+ * this tgid must die, not just the calling thread. We mark each sibling ZOMBIE
+ * so the scheduler can never resume it on the (about-to-be-freed) shared
+ * address space, and run its TID/futex cleanup so any pthread_join waiter is
+ * released. We deliberately do NOT proc_free() siblings here: proc_free() runs
+ * current-process-coupled teardown (syscall_reset_process closes the live FD
+ * table, frees brk, resets the terminal), which would corrupt the still-running
+ * caller. The zombie reaper kthread reclaims the sibling slots afterward.
+ *
+ * The thread-group leader (which owns the CR3) is left ZOMBIE for the parent /
+ * shell to reap via wait4 → proc_free → paging_free_process_cr3. By then every
+ * sibling is already ZOMBIE, so no thread runs on the freed page tables. */
+void proc_exit_group(int32_t code)
+{
+    process_t *self = current_proc;
+    if (self) {
+        uint32_t tg = self->tgid;
+        for (int i = 0; i < MAX_PROCESSES; i++) {
+            process_t *p = &proctab[i];
+            if (p == self) continue;
+            if (p->tgid != tg) continue;
+            if (p->state == PROC_FREE || p->state == PROC_ZOMBIE) continue;
+            thread_exit_cleanup(p);   /* clear_child_tid + futex wake */
+            p->exit_code = code;
+            proc_transition(p, PROC_ZOMBIE);
+        }
+    }
+    proc_exit(code);   /* never returns */
+}
+
 /* Wait for process to finish (synchronous) */
 int proc_waitpid(uint32_t pid, int32_t *status)
 {
@@ -1256,6 +1288,11 @@ void __hot sched_tick(void *frame_ptr)
      * timer interrupts but must not touch single-CPU scheduler state */
     if (sched_get_lapic_id() != 0)
         return;
+
+    /* Expire any timed futex waiters (pthread_cond_timedwait, sem_timedwait).
+     * No-op unless at least one timed waiter is parked. */
+    extern void futex_timeout_sweep(void);
+    futex_timeout_sweep();
 
     process_t *cur = &proctab[sched_current_idx];
 
@@ -2243,16 +2280,28 @@ int32_t proc_clone_thread(uint64_t child_stack, uint64_t parent_tidptr,
 
 typedef struct {
     uint64_t    addr;       /* futex user address */
+    uint64_t    space;      /* address-space id (CR3) for PRIVATE futexes,
+                             * 0 for cross-process SHARED futexes. Two distinct
+                             * processes can have a libc global at the *same*
+                             * virtual address; keying on the space prevents a
+                             * private wake in one from waking a waiter in the
+                             * other. Threads share a CR3 → share the space. */
+    uint64_t    deadline;   /* idt_get_ticks() value at which a timed wait
+                             * expires, or 0 for an infinite wait */
     int         proc_idx;   /* index into proctab (process waiting) */
     bool        active;
+    bool        timed_out;  /* set by futex_timeout_sweep when deadline passes */
     int16_t     next;       /* next in same hash bucket, -1 = end */
 } futex_waiter_t;
 
 static futex_waiter_t futex_waiters[MAX_FUTEX_WAITERS];
 static int16_t futex_buckets[FUTEX_HASH_SIZE];  /* heads, -1 = empty */
 static int16_t futex_free_head = -1;            /* free slot list */
+static int      futex_timed_count = 0;          /* # of active timed waiters;
+                                                 * lets sched_tick skip the
+                                                 * deadline sweep when zero */
 
-static inline uint32_t futex_hash(uint64_t addr)
+static inline uint32_t futex_hash(uint64_t addr, uint64_t space)
 {
     /* 32-bit Fibonacci hash → top FUTEX_HASH_BITS bits, MASKED to a valid
      * bucket index. BUG (pre-existing): the multiplier was `0x9e370001UL`
@@ -2262,7 +2311,7 @@ static inline uint32_t futex_hash(uint64_t addr)
      * CR2 = &futex_buckets + 0xA8763EA2*2 when cc1's malloc-lock contention
      * exercised the futex path). Force a 32-bit multiply (`0x9e370001u`) and
      * mask to the bucket count so the index is always valid. */
-    uint32_t h = (uint32_t)(addr >> 2) * 0x9e370001u;
+    uint32_t h = (uint32_t)((addr >> 2) ^ (space >> 12)) * 0x9e370001u;
     return (h >> (32 - FUTEX_HASH_BITS)) & (FUTEX_HASH_SIZE - 1);
 }
 
@@ -2279,9 +2328,13 @@ static void futex_init(void)
     futex_free_head = 0;
 }
 
-/* futex_wait — block current process until woken.
- * Returns 0 on success, -EAGAIN if value mismatch. */
-int futex_do_wait(uint64_t uaddr, int expected)
+/* futex_wait — block current process until woken or (optionally) timed out.
+ *   space        = address-space id (CR3) for a PRIVATE futex, 0 for SHARED.
+ *   timeout_ticks = relative deadline in 100Hz ticks; 0 means wait forever.
+ * Returns 0 on wake, -EAGAIN (-11) on value mismatch, -ETIMEDOUT (-110) on
+ * timeout, -ENOMEM (-12) if the wait table is full. */
+int futex_do_wait(uint64_t uaddr, int expected, uint64_t space,
+                  uint64_t timeout_ticks)
 {
     volatile int *addr = (volatile int *)uaddr;
 
@@ -2297,21 +2350,36 @@ int futex_do_wait(uint64_t uaddr, int expected)
     int cur_idx = (int)(cur - &proctab[0]);
 
     /* Insert into hash bucket */
-    uint32_t bucket = futex_hash(uaddr);
+    uint32_t bucket = futex_hash(uaddr, space);
     futex_waiters[slot].addr = uaddr;
+    futex_waiters[slot].space = space;
     futex_waiters[slot].proc_idx = cur_idx;
     futex_waiters[slot].active = true;
+    futex_waiters[slot].timed_out = false;
+    futex_waiters[slot].deadline =
+        timeout_ticks ? (idt_get_ticks() + timeout_ticks) : 0;
     futex_waiters[slot].next = futex_buckets[bucket];
     futex_buckets[bucket] = (int16_t)slot;
+    if (futex_waiters[slot].deadline)
+        futex_timed_count++;
 
     proc_transition(cur, PROC_BLOCKED);
 
+    /* A BLOCKED task cannot poll its own deadline (the scheduler never
+     * resumes it), so timeout enforcement is done by futex_timeout_sweep()
+     * from sched_tick, which flips us back to READY + sets timed_out. */
     while (cur->state == PROC_BLOCKED) {
         __asm__ volatile ("sti; hlt; cli" ::: "memory");
     }
 
+    int rc = futex_waiters[slot].timed_out ? -110 /* ETIMEDOUT */ : 0;
+
     /* Woken — remove from bucket and return to free list */
     futex_waiters[slot].active = false;
+    if (futex_waiters[slot].deadline) {
+        futex_waiters[slot].deadline = 0;
+        if (futex_timed_count > 0) futex_timed_count--;
+    }
     /* Unlink from bucket (may already be unlinked by wake) */
     int16_t *pp = &futex_buckets[bucket];
     while (*pp >= 0) {
@@ -2321,21 +2389,21 @@ int futex_do_wait(uint64_t uaddr, int expected)
     futex_waiters[slot].next = futex_free_head;
     futex_free_head = (int16_t)slot;
 
-    return 0;
+    return rc;
 }
 
-/* futex_wake — wake up to 'count' processes waiting on uaddr.
+/* futex_wake — wake up to 'count' processes waiting on (space, uaddr).
  * Returns number of processes woken. Only scans one hash bucket. */
-int futex_do_wake(uint64_t uaddr, int count)
+int futex_do_wake(uint64_t uaddr, uint64_t space, int count)
 {
-    uint32_t bucket = futex_hash(uaddr);
+    uint32_t bucket = futex_hash(uaddr, space);
     int woken = 0;
     int16_t *pp = &futex_buckets[bucket];
 
     while (*pp >= 0 && woken < count) {
         int16_t idx = *pp;
         futex_waiter_t *w = &futex_waiters[idx];
-        if (w->active && w->addr == uaddr) {
+        if (w->active && w->addr == uaddr && w->space == space) {
             int pidx = w->proc_idx;
             if (pidx >= 0 && pidx < MAX_PROCESSES &&
                 proctab[pidx].state == PROC_BLOCKED) {
@@ -2344,6 +2412,10 @@ int futex_do_wake(uint64_t uaddr, int count)
             }
             /* Unlink from bucket and return to free list */
             w->active = false;
+            if (w->deadline) {
+                w->deadline = 0;
+                if (futex_timed_count > 0) futex_timed_count--;
+            }
             *pp = w->next;
             w->next = futex_free_head;
             futex_free_head = idx;
@@ -2354,14 +2426,38 @@ int futex_do_wake(uint64_t uaddr, int count)
     return woken;
 }
 
+/* futex_timeout_sweep — called from sched_tick on the BSP. Wakes any timed
+ * waiter whose deadline has elapsed, marking it timed_out so futex_do_wait
+ * returns -ETIMEDOUT. Cheap no-op when no timed waiters exist. The waiter
+ * stays linked in its bucket; futex_do_wait unlinks it after resuming. */
+void futex_timeout_sweep(void)
+{
+    if (futex_timed_count <= 0) return;
+    uint64_t now = idt_get_ticks();
+    for (int i = 0; i < MAX_FUTEX_WAITERS; i++) {
+        futex_waiter_t *w = &futex_waiters[i];
+        if (!w->active || !w->deadline) continue;
+        if (now >= w->deadline) {
+            int pidx = w->proc_idx;
+            if (pidx >= 0 && pidx < MAX_PROCESSES &&
+                proctab[pidx].state == PROC_BLOCKED) {
+                w->timed_out = true;
+                proc_transition(&proctab[pidx], PROC_READY);
+            }
+        }
+    }
+}
+
 /* Thread exit cleanup: clear_child_tid + futex wake (X-THREAD) */
 static void thread_exit_cleanup(process_t *p)
 {
     if (p->clear_child_tid) {
         /* Write 0 to the TID address (signals thread death to parent) */
         *(int *)p->clear_child_tid = 0;
-        /* Wake any futex waiter on that address (pthread_join uses this) */
-        futex_do_wake((uint64_t)p->clear_child_tid, 1);
+        /* Wake any futex waiter on that address (pthread_join uses this).
+         * The joiner waits with a PRIVATE futex in this thread's address
+         * space, so key the wake on the same CR3. */
+        futex_do_wake((uint64_t)p->clear_child_tid, p->cr3, 1);
         p->clear_child_tid = NULL;
     }
 }
