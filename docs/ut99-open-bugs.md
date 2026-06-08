@@ -56,10 +56,25 @@ native 64-bit pointer**, bypassing `compat32_callback_args` (the 64→32 mode sw
 + cdecl stack frame). So the comparator read its element pointers from the 64-bit
 RSP (garbage above the host call's return addr) → `edx=0xFFFFFFFF` → `fcomp
 [rdx+0x24]` = `0x100000023` → #PF (CR2 matches exactly).
-**FIX (committed pending test):** route the leaf comparator call through
-`compat32_callback_args` (new `qs_cmp` helper in msvcrt_shim.c) with the cdecl
-EAX sign-extended. Independent of B1/B2. Verify: play several minutes through
-translucent geometry with AND without toggling grab → no `RIP=0x1039B6CB`.
+**FIX ATTEMPT 1 (committed bf70e4d, then REVERTED):** routed the leaf comparator
+through `compat32_callback_args` (`qs_cmp` helper) with the cdecl EAX
+sign-extended. It DID fix `0x1039B6CB`, BUT **regressed New Game**: a
+`compat32_callback_args` call per comparison, hundreds of times in qsort's loop
+from inside the INT2E `crt_qsort` handler, stresses the callback machinery
+(shared `callback_stack[slot]`, depth/jmpbuf, IST1 save/restore, timer mask —
+designed for OCCASIONAL callbacks like wndproc/SEH, not a tight high-frequency
+loop) → state corruption → a guest NULL vtable call `CR2=0x40` → **KVM
+triple-fault (VM paused, internal-error)**. CONFIRMED by A/B (2026-06-08):
+reverting B3 made New Game stop triple-faulting (it reaches the map; the original
+`0x1039B6CB` #PF returns but recovers cleanly to shell — strictly better than a
+kernel triple-fault). So `compat32_callback_args` is the WRONG vehicle here.
+**PROPER FIX (deferred):** invoke the 32-bit comparator via a LIGHTWEIGHT
+symmetric far-call/far-return trampoline (64→32 `lretq` to CS32 with args + a
+32-bit `retf`-back stub to CS64) — NO callback_stack/depth/jmpbuf/IST1 machinery,
+since the comparator is a pure leaf. Or JIT a one-time cdecl→register shim per the
+workflow. Verify: play through translucent geometry AND New Game multiple times —
+no `0x1039B6CB` and no `CR2=0x40`. Until then B3 stays REVERTED (the recoverable
+qsort #PF is preferable to the kernel triple-fault).
 
 ## B4 — Dirty layer state after a crash (can't relaunch in-OS)
 **Symptom:** after a PE32 process crash recovers to the `osito>` shell, UT99

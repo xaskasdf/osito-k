@@ -1989,31 +1989,6 @@ static void qs_swap(BYTE *a, BYTE *b, SIZE_T size)
     }
 }
 
-/* Invoke a guest comparator with the correct ABI. crt_qsort/crt_bsearch are
- * called only from 32-bit guests (UT99 via Core appQsort -> MSVCRT!qsort), and
- * `compar` is a 32-bit GUEST __cdecl function that reads its two element pointers
- * off the 32-bit stack. Calling it directly as a native 64-bit pointer skips the
- * 64->32 mode switch + cdecl stack frame, so the comparator reads stale 64-bit
- * stack content (edx=0xFFFFFFFF) and faults — the B3 gameplay #PF at Engine.dll
- * 0x1039B6CB (CR2=0x100000023). Route a 32-bit guest VA through
- * compat32_callback_args (pushes args right-to-left, lretq to the 32-bit CS) and
- * sign-extend the cdecl EAX return so negative comparisons order correctly. The
- * <4GB test keeps the host/TEST_HARNESS (and any future native) caller direct;
- * all real callers here are 32-bit guest VAs. */
-static int qs_cmp(int (WINAPI *compar)(PCVOID, PCVOID),
-                  PCVOID a, PCVOID b)
-{
-#ifndef TEST_HARNESS
-    uint64_t f = (uint64_t)(uintptr_t)compar;
-    if (f && f < 0x100000000ULL) {
-        extern uint32_t compat32_callback_args(uint32_t, int, const uint32_t *);
-        uint32_t args[2] = { (uint32_t)(uintptr_t)a, (uint32_t)(uintptr_t)b };
-        return (int)(int32_t)compat32_callback_args((uint32_t)f, 2, args);
-    }
-#endif
-    return compar(a, b);
-}
-
 void WINAPI crt_qsort(PVOID base, SIZE_T nmemb, SIZE_T size,
                        int (WINAPI *compar)(PCVOID, PCVOID))
 {
@@ -2024,7 +1999,7 @@ void WINAPI crt_qsort(PVOID base, SIZE_T nmemb, SIZE_T size,
     SIZE_T i = 0;
 
     for (SIZE_T j = 0; j < nmemb - 1; j++) {
-        if (qs_cmp(compar, arr + j * size, pivot) <= 0) {
+        if (compar(arr + j * size, pivot) <= 0) {
             qs_swap(arr + i * size, arr + j * size, size);
             i++;
         }
@@ -2043,7 +2018,7 @@ PVOID WINAPI crt_bsearch(PCVOID key, PCVOID base, SIZE_T nmemb,
     SIZE_T lo = 0, hi = nmemb;
     while (lo < hi) {
         SIZE_T mid = lo + (hi - lo) / 2;
-        int cmp = qs_cmp(compar, key, arr + mid * size);
+        int cmp = compar(key, arr + mid * size);
         if (cmp == 0) return (PVOID)(arr + mid * size);
         if (cmp < 0) hi = mid;
         else lo = mid + 1;
