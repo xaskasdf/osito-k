@@ -32,6 +32,17 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifdef __cplusplus
+#include <atomic>
+#include <limits>
+#include <string_view>
+#include <cstring>
+#include <type_traits>
+#include <algorithm>
+#include <tuple>
+#include <iterator>
+#endif
+
 #ifndef __forceinline
 #define __forceinline inline __attribute__((always_inline))
 #endif

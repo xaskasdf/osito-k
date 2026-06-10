@@ -10,6 +10,14 @@
 namespace dxvk::vk {
 
   static std::pair<HMODULE, PFN_vkGetInstanceProcAddr> loadVulkanLibrary() {
+#ifdef __OSITO_K__
+    // OsitoK: the Vulkan ICD (libvulkan_user.a) is statically linked into the
+    // executable, so there is no shared object to dlopen. Reference its
+    // vkGetInstanceProcAddr directly — the LoadLibraryA/GetProcAddress path
+    // below is dlsym-based and returns null in a static-PIE binary.
+    return std::make_pair(reinterpret_cast<HMODULE>(1),
+      reinterpret_cast<PFN_vkGetInstanceProcAddr>(&::vkGetInstanceProcAddr));
+#else
     static const std::array<const char*, 2> dllNames = {{
 #ifdef _WIN32
       "winevulkan.dll",
@@ -39,6 +47,7 @@ namespace dxvk::vk {
 
     Logger::err("Vulkan: vkGetInstanceProcAddr not found");
     return { };
+#endif
   }
 
   LibraryLoader::LibraryLoader() {

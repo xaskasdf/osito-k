@@ -19,6 +19,10 @@ DXVK_ROOT := $(CURDIR)
 OSITOK_ROOT ?= $(DXVK_ROOT)/../../../..
 DXVK_SRC  := $(DXVK_ROOT)/dxvk/src
 DXVK_INC  := $(DXVK_ROOT)/dxvk/include
+# Port C++ stdlib: GTA V uses a hand-rolled libstdc++ subset under
+# GTAV_Source/ositok_native (there is no hosted libstdc++ for this target).
+# DXVK must use the SAME stdlib so its objects are ABI-compatible with GTA5.elf.
+OSITOK_STDCPP := /Users/pc/ok-ported/GTAV_Source/ositok_stdcpp
 BUILD_DIR := $(OSITOK_ROOT)/arch/x86/build/lib/dxvk
 UTIL_OUT  := $(BUILD_DIR)/libdxvk_util.a
 SPIRV_OUT := $(BUILD_DIR)/libdxvk_spirv.a
@@ -41,6 +45,7 @@ GCC_INC     := $(shell $(CXX) -print-file-name=include)
 GCC_CXX_INC := $(shell $(CXX) -print-file-name=include) # placeholder
 
 INCLUDES := \
+  -nostdinc++ -I$(OSITOK_STDCPP) \
   -I$(DXVK_ROOT)/com_stub \
   -I$(DXVK_ROOT)/include \
   -I$(DXVK_ROOT)/include/generated \
@@ -65,8 +70,10 @@ INCLUDES := \
 # dxvk/include/mingw/. The com_stub/ headers used by the rest of DXVK
 # stay out of the search path so the two GUID definitions don't collide.
 D3D11_INCLUDES := \
+  -nostdinc++ \
   -I$(DXVK_INC)/native/windows \
   -I$(DXVK_INC)/mingw \
+  -I$(OSITOK_STDCPP) \
   -I$(DXVK_ROOT)/include \
   -I$(DXVK_ROOT)/include/generated \
   -I$(DXVK_SRC) \
@@ -90,7 +97,7 @@ CXX_FLAGS := \
   -std=gnu++17 \
   -ffreestanding -fno-stack-protector -mno-red-zone \
   -fno-exceptions -fno-rtti \
-  -fno-pic -fvisibility=hidden \
+  -fPIC -fvisibility=hidden \
   -O2 \
   -Wall -Wextra \
   -Wno-unused-parameter -Wno-unused-function -Wno-missing-field-initializers \
@@ -109,7 +116,7 @@ D3D11_CXX_FLAGS := \
   -std=gnu++17 \
   -ffreestanding -fno-stack-protector -mno-red-zone \
   -fno-exceptions \
-  -fno-pic -fvisibility=hidden \
+  -fPIC -fvisibility=hidden \
   -O2 \
   -Wall -Wextra \
   -Wno-unused-parameter -Wno-unused-function -Wno-missing-field-initializers \
@@ -271,6 +278,9 @@ CORE_SRCS := \
   dxvk/src/dxvk/dxvk_swapchain_blitter.cpp \
   dxvk/src/dxvk/dxvk_unbound.cpp \
   dxvk/src/dxvk/dxvk_util.cpp \
+  dxvk/src/dxvk/dxvk_platform_exts.cpp \
+  dxvk/src/vulkan/vulkan_loader.cpp \
+  dxvk/src/vulkan/vulkan_names.cpp \
   dxvk/src/wsi/wsi_platform_ositok.cpp \
   dxvk/src/wsi/wsi_edid_ositok.cpp
 
@@ -327,6 +337,26 @@ D3D11_SRCS := \
   dxvk/src/d3d11/d3d11_view_uav.cpp \
   dxvk/src/d3d11/d3d11_main_ositok.cpp
 
+# D3D10 compat layer — the D3D11Device instantiates a D3D10Device wrapper, so
+# these are pulled by the D3D11 frontend. Compiled with D3D11_CXX_FLAGS and
+# stashed in libdxvk_d3d11.a.
+D3D10_SRCS := \
+  dxvk/src/d3d10/d3d10_blend.cpp \
+  dxvk/src/d3d10/d3d10_buffer.cpp \
+  dxvk/src/d3d10/d3d10_core.cpp \
+  dxvk/src/d3d10/d3d10_depth_stencil.cpp \
+  dxvk/src/d3d10/d3d10_device.cpp \
+  dxvk/src/d3d10/d3d10_input_layout.cpp \
+  dxvk/src/d3d10/d3d10_multithread.cpp \
+  dxvk/src/d3d10/d3d10_query.cpp \
+  dxvk/src/d3d10/d3d10_rasterizer.cpp \
+  dxvk/src/d3d10/d3d10_sampler.cpp \
+  dxvk/src/d3d10/d3d10_texture.cpp \
+  dxvk/src/d3d10/d3d10_util.cpp \
+  dxvk/src/d3d10/d3d10_view_dsv.cpp \
+  dxvk/src/d3d10/d3d10_view_rtv.cpp \
+  dxvk/src/d3d10/d3d10_view_srv.cpp
+
 DXGI_SRCS := \
   dxvk/src/dxgi/dxgi_adapter.cpp \
   dxvk/src/dxgi/dxgi_enums.cpp \
@@ -347,6 +377,7 @@ DXBC_OBJS    := $(patsubst %.cpp,$(BUILD_DIR)/%.o,$(DXBC_SRCS))
 DXBC_D3D11_OBJS := $(patsubst %.cpp,$(BUILD_DIR)/%.o,$(DXBC_D3D11_SRCS))
 CORE_OBJS    := $(patsubst %.cpp,$(BUILD_DIR)/%.o,$(CORE_SRCS))
 D3D11_OBJS   := $(patsubst %.cpp,$(BUILD_DIR)/%.o,$(D3D11_SRCS))
+D3D10_OBJS   := $(patsubst %.cpp,$(BUILD_DIR)/%.o,$(D3D10_SRCS))
 DXGI_OBJS    := $(patsubst %.cpp,$(BUILD_DIR)/%.o,$(DXGI_SRCS))
 
 .PHONY: all clean util spirv dxbc core d3d11 dxgi
@@ -384,10 +415,16 @@ $(DXGI_OUT): $(DXGI_OBJS) | $(BUILD_DIR)
 	@$(AR) rcs $@ $(DXGI_OBJS)
 	@echo "  -> $$($(AR) t $@ | wc -l) objects in $@"
 
-$(D3D11_OUT): $(D3D11_OBJS) | $(BUILD_DIR)
+$(D3D11_OUT): $(D3D11_OBJS) $(D3D10_OBJS) | $(BUILD_DIR)
 	@echo "  AR    $(notdir $@)"
-	@$(AR) rcs $@ $(D3D11_OBJS)
+	@$(AR) rcs $@ $(D3D11_OBJS) $(D3D10_OBJS)
 	@echo "  -> $$($(AR) t $@ | wc -l) objects in $@"
+
+# D3D10 compat layer pattern rule (same flags as d3d11).
+$(BUILD_DIR)/dxvk/src/d3d10/%.o: $(DXVK_ROOT)/dxvk/src/d3d10/%.cpp | $(BUILD_DIR)
+	@mkdir -p $(dir $@)
+	@echo "  CXX[d3d10]   $*"
+	@$(CXX) $(D3D11_CXX_FLAGS) -c -o $@ $<
 
 # D3D11/DXGI pattern rule: separate flags (D3D11_CXX_FLAGS).
 # Use a stem match restricted to dxvk/src/d3d11/* and dxvk/src/dxgi/*
@@ -414,6 +451,21 @@ $(BUILD_DIR)/dxvk/src/dxbc/dxbc_options.o: $(DXVK_ROOT)/dxvk/src/dxbc/dxbc_optio
 	@echo "  CXX[d3d11]   dxbc/dxbc_options"
 	@$(CXX) $(D3D11_CXX_FLAGS) -c -o $@ $<
 
+# util_string.cpp / com_private_data.cpp expose WCHAR- and GUID-typed symbols
+# (str::fromws, ComPrivateData::set/getData) consumed by the d3d11/dxgi
+# frontend. They MUST see the same WCHAR (wchar_t) and GUID (struct GUID)
+# definitions as that frontend, so compile them with D3D11_CXX_FLAGS — building
+# them with the plain CXX_FLAGS yielded `_GUID`/`unsigned short` mangling that
+# did not match the d3d11 callers (4 undefined references at final link).
+$(BUILD_DIR)/dxvk/src/util/util_string.o: $(DXVK_ROOT)/dxvk/src/util/util_string.cpp | $(BUILD_DIR)
+	@mkdir -p $(dir $@)
+	@echo "  CXX[d3d11]   util/util_string"
+	@$(CXX) $(D3D11_CXX_FLAGS) -c -o $@ $<
+$(BUILD_DIR)/dxvk/src/util/com/com_private_data.o: $(DXVK_ROOT)/dxvk/src/util/com/com_private_data.cpp | $(BUILD_DIR)
+	@mkdir -p $(dir $@)
+	@echo "  CXX[d3d11]   util/com/com_private_data"
+	@$(CXX) $(D3D11_CXX_FLAGS) -c -o $@ $<
+
 # Pattern rule: build/lib/dxvk/foo/bar.o : foo/bar.cpp
 $(BUILD_DIR)/%.o: $(DXVK_ROOT)/%.cpp | $(BUILD_DIR)
 	@mkdir -p $(dir $@)
@@ -426,7 +478,7 @@ $(BUILD_DIR)/%.o: $(DXVK_ROOT)/%.c | $(BUILD_DIR)
 	@mkdir -p $(dir $@)
 	@echo "  CC    $*"
 	@$(CC) -std=gnu11 -ffreestanding -fno-stack-protector -mno-red-zone \
-	       -fno-pic -O2 -Wall \
+	       -fPIC -O2 -Wall \
 	       -D__OSITO_K__ \
 	       $(INCLUDES) -isystem $(GCC_INC) \
 	       -c -o $@ $<
