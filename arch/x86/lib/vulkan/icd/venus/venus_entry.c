@@ -71,6 +71,10 @@ venus_icdGetInstanceProcAddr(VkInstance instance, const char *name) {
         return (PFN_vkVoidFunction)venus_CreateImageView;
     if (strcmp(name, "vkDestroyImageView") == 0)
         return (PFN_vkVoidFunction)venus_DestroyImageView;
+    if (strcmp(name, "vkCreateSampler") == 0)
+        return (PFN_vkVoidFunction)venus_CreateSampler;
+    if (strcmp(name, "vkDestroySampler") == 0)
+        return (PFN_vkVoidFunction)venus_DestroySampler;
     if (strcmp(name, "vkCreateFramebuffer") == 0)
         return (PFN_vkVoidFunction)venus_CreateFramebuffer;
     if (strcmp(name, "vkDestroyFramebuffer") == 0)

@@ -95,6 +95,7 @@ extern int venus_cmd_encode_CmdDraw(struct venus_wire *, uint64_t, uint64_t,
 #define VENUS_H_MARKER_RP           0x9000000000000000ull
 #define VENUS_H_MARKER_IMAGE        0xE000000000000000ull
 #define VENUS_H_MARKER_IMGVIEW      0xD000000000000000ull
+#define VENUS_H_MARKER_SAMPLER      0x5000000000000000ull
 #define VENUS_H_MARKER_FB           0xB000000000000000ull
 #define VENUS_H_MARKER_PLLAYOUT     0xF000000000000000ull
 #define VENUS_H_MARKER_PIPELINE     0x7000000000000000ull
@@ -121,6 +122,7 @@ DEFINE_SLOT_ALLOC(shader,   shaders,       VENUS_MAX_SHADER_OBJECTS)
 DEFINE_SLOT_ALLOC(rp,       render_passes, VENUS_MAX_RP_OBJECTS)
 DEFINE_SLOT_ALLOC(image,    images,        VENUS_MAX_IMAGE_OBJECTS)
 DEFINE_SLOT_ALLOC(imgview,  image_views,   VENUS_MAX_IMAGE_VIEW_OBJECTS)
+DEFINE_SLOT_ALLOC(sampler,  samplers,      VENUS_MAX_SAMPLER_OBJECTS)
 DEFINE_SLOT_ALLOC(fb,       framebuffers,  VENUS_MAX_FB_OBJECTS)
 DEFINE_SLOT_ALLOC(pllayout, pl_layouts,    VENUS_MAX_PL_LAYOUT_OBJECTS)
 DEFINE_SLOT_ALLOC(pipeline, pipelines,     VENUS_MAX_PIPELINE_OBJECTS)
@@ -368,6 +370,41 @@ venus_DestroyImageView(VkDevice device, VkImageView view,
         (void)venus_cmd_encode_DestroyImageView(dev->parent->wire,
                                                 dev->host_handle, iv->host_id);
     memset(iv, 0, sizeof(*iv));
+}
+
+/* --- Sampler ---
+ * Guest-local object, same shape as the other W3b objects. DXVK's DxvkSampler
+ * (and the meta-blit/present path) needs a valid VkSampler handle to proceed;
+ * there is no host-side venus sampler encoder yet, so this is purely a tracked
+ * slot handle. When a real host backend is wired up, add an optional
+ * venus_cmd_encode_CreateSampler round-trip here exactly like CreateImageView. */
+VKAPI_ATTR VkResult VKAPI_CALL
+venus_CreateSampler(VkDevice device,
+                    const VkSamplerCreateInfo *pCreateInfo,
+                    const VkAllocationCallbacks *pAllocator,
+                    VkSampler *pSampler) {
+    (void)pAllocator; (void)pCreateInfo;
+    if (!device || !pCreateInfo || !pSampler) return VK_ERROR_INITIALIZATION_FAILED;
+    struct venus_device *dev = (struct venus_device *)device;
+    int slot = sampler_slot_alloc(dev);
+    if (slot < 0) return VK_ERROR_OUT_OF_HOST_MEMORY;
+    struct venus_sampler *s = &dev->samplers[slot];
+    s->host_id = 0;
+    *pSampler = (VkSampler)MAKE_SLOT_HANDLE(dev, slot, VENUS_H_MARKER_SAMPLER);
+    return VK_SUCCESS;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+venus_DestroySampler(VkDevice device, VkSampler sampler,
+                     const VkAllocationCallbacks *pAllocator) {
+    (void)pAllocator;
+    if (!device || !sampler) return;
+    struct venus_device *dev = (struct venus_device *)device;
+    int slot = HANDLE_TO_SLOT(sampler);
+    if (slot < 0 || slot >= (int)VENUS_MAX_SAMPLER_OBJECTS) return;
+    struct venus_sampler *s = &dev->samplers[slot];
+    if (!s->in_use) return;
+    memset(s, 0, sizeof(*s));
 }
 
 /* --- Framebuffer --- */

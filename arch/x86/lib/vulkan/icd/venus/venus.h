@@ -88,6 +88,7 @@ struct venus_instance {
 #define VENUS_MAX_RP_OBJECTS           32u
 #define VENUS_MAX_IMAGE_OBJECTS        32u
 #define VENUS_MAX_IMAGE_VIEW_OBJECTS   32u
+#define VENUS_MAX_SAMPLER_OBJECTS      32u
 #define VENUS_MAX_FB_OBJECTS           32u
 #define VENUS_MAX_PL_LAYOUT_OBJECTS    32u
 #define VENUS_MAX_PIPELINE_OBJECTS     32u
@@ -146,6 +147,11 @@ struct venus_image_view {
     uint64_t host_id;
     uint32_t in_use;
     int32_t  image_slot;
+};
+
+struct venus_sampler {
+    uint64_t host_id;
+    uint32_t in_use;
 };
 
 struct venus_framebuffer {
@@ -249,6 +255,7 @@ struct venus_device {
     struct venus_render_pass     render_passes [VENUS_MAX_RP_OBJECTS];
     struct venus_image           images        [VENUS_MAX_IMAGE_OBJECTS];
     struct venus_image_view      image_views   [VENUS_MAX_IMAGE_VIEW_OBJECTS];
+    struct venus_sampler         samplers      [VENUS_MAX_SAMPLER_OBJECTS];
     struct venus_framebuffer     framebuffers  [VENUS_MAX_FB_OBJECTS];
     struct venus_pipeline_layout pl_layouts    [VENUS_MAX_PL_LAYOUT_OBJECTS];
     struct venus_pipeline        pipelines     [VENUS_MAX_PIPELINE_OBJECTS];
@@ -353,6 +360,12 @@ venus_CreateImageView(VkDevice, const VkImageViewCreateInfo *,
                       const VkAllocationCallbacks *, VkImageView *);
 VKAPI_ATTR void VKAPI_CALL
 venus_DestroyImageView(VkDevice, VkImageView, const VkAllocationCallbacks *);
+
+VKAPI_ATTR VkResult VKAPI_CALL
+venus_CreateSampler(VkDevice, const VkSamplerCreateInfo *,
+                    const VkAllocationCallbacks *, VkSampler *);
+VKAPI_ATTR void VKAPI_CALL
+venus_DestroySampler(VkDevice, VkSampler, const VkAllocationCallbacks *);
 
 VKAPI_ATTR VkResult VKAPI_CALL
 venus_CreateFramebuffer(VkDevice, const VkFramebufferCreateInfo *,
