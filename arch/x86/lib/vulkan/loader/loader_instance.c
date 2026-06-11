@@ -49,25 +49,26 @@ static unsigned osito_icd_probe_order(const struct osito_icd_entry **order)
     unsigned caps = osito_query_gpu_caps();
     unsigned n = 0;
 
-    /* Track which ICDs we've placed so we don't double-add. */
-    char picked[8] = {0};
-
-    /* 1. Bare-metal NVK takes priority when its backend is ready. */
-    if (caps & GPU_CAP_NVK_READY) {
-        const struct osito_icd_entry *e = osito_icd_find("nvk-stub");
-        if (e) { order[n++] = e; picked[e - osito_icd_table] = 1; }
-    }
-    /* 2. Venus when virtio-gpu is up (and NVK isn't, or as a secondary). */
+    /* Register EXACTLY ONE primary ICD. Exposing two ICDs (e.g. venus +
+     * nvk-stub) as two separate VkPhysicalDevices makes a D3D11 frontend
+     * (DXVK) enumerate a second, unusable adapter and hang during adapter
+     * enumeration — and because GPU_CAP_NVK_READY toggles per boot, the phys-
+     * device count was non-deterministically 1 or 2. Venus is the project's
+     * validated DXVK backend (it has a guest-local fallback that works without
+     * a live virgl host), so prefer it; fall back to nvk, then the first table
+     * entry. To re-enable true multi-ICD enumeration later, restore the
+     * append-unpicked loop below the single-pick. */
     if (caps & GPU_CAP_VENUS_READY) {
         const struct osito_icd_entry *e = osito_icd_find("venus");
-        if (e && !picked[e - osito_icd_table]) {
-            order[n++] = e; picked[e - osito_icd_table] = 1;
-        }
+        if (e) { order[n++] = e; return n; }
     }
-    /* 3. Append any unpicked ICDs in static order (covers no-caps boot
-     *    + future ICDs not in the priority lists above). */
-    for (unsigned i = 0; i < osito_icd_count && i < sizeof(picked); i++) {
-        if (!picked[i]) order[n++] = &osito_icd_table[i];
+    if (caps & GPU_CAP_NVK_READY) {
+        const struct osito_icd_entry *e = osito_icd_find("nvk-stub");
+        if (e) { order[n++] = e; return n; }
+    }
+    /* No caps detected (or named ICDs missing): first available ICD only. */
+    if (osito_icd_count > 0) {
+        order[n++] = &osito_icd_table[0];
     }
     return n;
 }
