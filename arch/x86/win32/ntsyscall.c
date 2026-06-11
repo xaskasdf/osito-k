@@ -1380,6 +1380,14 @@ static NTSTATUS sys_NtStub(ULONG_PTR *args)
 
 void nt_syscall_init(NT_SERVICE_TABLE *table)
 {
+    /* Re-exec reset: the VA bump allocator and its tracking must restart, or a
+     * relaunched PE's VirtualAllocs continue above the previous run's watermark
+     * and exhaust WIN32_VA_LIMIT after a few relaunches (old phys leaks, bounded
+     * by relaunch count). */
+    win32_va_next = WIN32_VA_BASE;
+    vm_track_count = 0;
+    vm_freelist_count = 0;
+
     /* Fill all slots with stub */
     for (ULONG i = 0; i < NTSYS_MAX; i++) {
         table->handlers[i]   = sys_NtStub;

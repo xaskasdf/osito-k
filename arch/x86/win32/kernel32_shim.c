@@ -3273,9 +3273,22 @@ PVOID WINAPI GlobalAlloc(UINT uFlags, SIZE_T dwBytes)
 BOOL WINAPI CreateProcessA(PCSTR lpApp, PSTR lpCmd, PVOID a, PVOID b,
                             BOOL c, DWORD d, PVOID e, PCSTR f, PVOID g, PVOID h)
 {
-    (void)lpApp; (void)lpCmd; (void)a; (void)b; (void)c;
+    (void)a; (void)b; (void)c;
     (void)d; (void)e; (void)f; (void)g; (void)h;
-    serial_puts("[K32] CreateProcessA (stub — FALSE)\n");
+    serial_puts("[K32] CreateProcessA: app=");
+    if (lpApp) serial_puts(lpApp);
+    serial_puts(" cmd=");
+    if (lpCmd) serial_puts(lpCmd);
+    serial_puts("\n");
+    /* The game relaunching itself (apply video/depth change) → request a re-exec
+     * so the current process's ExitProcess restarts the EXE. Treat any non-NULL
+     * lpApp/lpCmd as a self-relaunch (UE1 only CreateProcess's its own exe). */
+    if (lpApp || lpCmd) {
+        extern int g_win32_relaunch;
+        g_win32_relaunch = 1;
+        serial_puts("[K32] CreateProcessA → RE-EXEC requested\n");
+        return TRUE;
+    }
     g_last_error = 2;
     return FALSE;
 }
@@ -4376,5 +4389,10 @@ PVOID kernel32_resolve(const char *func_name, USHORT ordinal, BOOL by_ordinal)
 
 PVOID kernel32_shim_init(void)
 {
+    /* Re-exec reset: don't leak the previous run's last-error into the fresh
+     * process (real NT starts a process with LastError = 0). The heap_pool is
+     * intentionally KEPT — it's a kmalloc arena reused across runs. */
+    g_last_error = 0;
+    sync_last_error();
     return (PVOID)k32_exports;
 }

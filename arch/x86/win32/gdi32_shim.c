@@ -52,6 +52,8 @@ typedef struct {
     uint32_t bk_color;
     int      bk_mode;       /* TRANSPARENT=1, OPAQUE=2 */
     HGDIOBJ  prev_bitmap;   /* previously selected bitmap handle */
+    int      is_screen;     /* DC targets the GOP framebuffer (window/screen DC) */
+    int      bottomup;      /* selected bitmap is a bottom-up DIB */
 } GDI_DC;
 
 typedef struct {
@@ -60,6 +62,8 @@ typedef struct {
     int      width, height;
     int      bpp;
     int      pitch;
+    int      bottomup;      /* DIB with positive biHeight (rows stored bottom-up) */
+    uint32_t alloc_pages;   /* >0: pixels from mem_alloc_pages (DIB section) */
 } GDI_BITMAP;
 
 static GDI_DC     gdi_dcs[MAX_GDI_DCS];
@@ -186,6 +190,7 @@ HDC WINAPI CreateDCA(PCSTR lpszDriver, PCSTR lpszDevice,
     gdi_dcs[idx].height  = h;
     gdi_dcs[idx].bpp     = 32;
     gdi_dcs[idx].pitch   = p;
+    gdi_dcs[idx].is_screen = 1;  /* display DC: BitBlt here = present to GOP */
 
     return (HDC)(ULONG_PTR)(DC_TAG | (unsigned)idx);
 }
@@ -241,6 +246,7 @@ HDC gdi32_alloc_screen_dc(void)
     gdi_dcs[idx].height  = h;
     gdi_dcs[idx].bpp     = 32;
     gdi_dcs[idx].pitch   = p;
+    gdi_dcs[idx].is_screen = 1;  /* window/screen DC: BitBlt here = present to GOP */
 
     return (HDC)(ULONG_PTR)(DC_TAG | (unsigned)idx);
 }
@@ -391,6 +397,7 @@ HGDIOBJ WINAPI SelectObject(HDC hdc, HGDIOBJ h)
             dc->height      = bmp->height;
             dc->bpp         = bmp->bpp;
             dc->pitch       = bmp->pitch;
+            dc->bottomup    = bmp->bottomup;
             dc->prev_bitmap = h;
             return prev ? prev : h;
         }
@@ -402,12 +409,19 @@ HGDIOBJ WINAPI SelectObject(HDC hdc, HGDIOBJ h)
 
 BOOL WINAPI DeleteObject(HGDIOBJ ho)
 {
-    /* If it's a bitmap handle, free the pixels */
+    /* If it's a bitmap handle, free the pixels with the MATCHING allocator:
+     * DIB sections come from mem_alloc_pages (PE32-visible low pages), regular
+     * bitmaps from kmalloc — kfree on a page allocation corrupts the heap. */
     if (IS_BMP_HANDLE(ho)) {
         GDI_BITMAP *bmp = bmp_from_handle((HBITMAP)ho);
         if (bmp) {
             if (bmp->pixels) {
-                kfree(bmp->pixels);
+                if (bmp->alloc_pages) {
+                    extern void mem_free_pages(void *addr, uint64_t count);
+                    mem_free_pages(bmp->pixels, bmp->alloc_pages);
+                } else {
+                    kfree(bmp->pixels);
+                }
                 bmp->pixels = NULL;
             }
             bmp->in_use = 0;
@@ -494,6 +508,31 @@ BOOL WINAPI BitBlt(HDC hdcDest, int x, int y, int cx, int cy,
     if (rop == ROP_SRCCOPY) {
         GDI_DC *src = dc_from_handle(hdcSrc);
         if (!src || !src->surface) return FALSE;
+
+        /* Blit to the window/screen DC = PRESENT. This is UT99 SoftDrv's
+         * windowed frame present (render into a DIB section, BitBlt the memory
+         * DC to the window DC). Route it through the shared scaled present
+         * (bpp-convert + nearest-neighbor fill of the GOP + shadow flush) —
+         * the same pipeline DirectDraw Flip/Blt uses — instead of a raw
+         * unscaled, unflushed memcpy. Bottom-up DIBs present inverted via a
+         * negative pitch starting at the last memory row. */
+        if (dst->is_screen) {
+            extern void ddraw_present_pixels(const void *pixels, uint32_t sw,
+                                             uint32_t sh, uint32_t bpp,
+                                             int32_t pitch_bytes,
+                                             const uint32_t *pal256);
+            extern void ddraw_suspend_present_hook(void);
+            ddraw_suspend_present_hook();
+            const uint8_t *px = (const uint8_t *)src->surface;
+            int32_t p = src->pitch;
+            if (src->bottomup && src->height > 1) {
+                px += (size_t)(src->height - 1) * (size_t)src->pitch;
+                p = -p;
+            }
+            ddraw_present_pixels(px, (uint32_t)src->width, (uint32_t)src->height,
+                                 (uint32_t)src->bpp, p, NULL);
+            return TRUE;
+        }
 
         /* Clip source coordinates */
         int sx = x1, sy = y1;
@@ -650,12 +689,56 @@ static PVOID WINAPI CreateFontW_stub(int h, int w, int esc, int orient, int weig
     return (PVOID)(ULONG_PTR)0xF0F0F002;  /* fake HFONT */
 }
 
-static PVOID WINAPI CreateDIBSection_stub(HDC hdc, PVOID pbmi, UINT usage,
+/* Real CreateDIBSection. UT99's SoftDrv windowed path recreates its render DIB
+ * on every SetRes (incl. color-depth changes) and then check()s the returned
+ * bits pointer (UWindowsViewport::ResizeViewport, WinDrv line 2348) — a NULL
+ * here is a FATAL engine assert ("Critical Error" → exit). NT semantics: parse
+ * the 32-bit BITMAPINFOHEADER, allocate the pixel buffer, return a real HBITMAP
+ * and write the bits pointer through ppvBits (a 4-byte slot in the 32-bit
+ * caller — write it as uint32, not a 64-bit store). */
+static PVOID WINAPI CreateDIBSection_impl(HDC hdc, PVOID pbmi, UINT usage,
                                            void **ppvBits, PVOID hSection, DWORD offset)
 {
-    (void)hdc; (void)pbmi; (void)usage; (void)hSection; (void)offset;
-    if (ppvBits) *ppvBits = NULL;
-    return NULL;  /* failure */
+    extern void serial_putdec(uint64_t val);
+    extern void serial_puthex(uint64_t val, int digits);
+    (void)hdc; (void)usage; (void)hSection; (void)offset;
+    if (ppvBits) *(uint32_t *)ppvBits = 0;
+    if (!pbmi) return NULL;
+
+    const uint8_t *bi = (const uint8_t *)pbmi;     /* BITMAPINFOHEADER (32-bit) */
+    int32_t  w    = *(const int32_t  *)(bi + 4);   /* biWidth */
+    int32_t  hraw = *(const int32_t  *)(bi + 8);   /* biHeight (<0 = top-down) */
+    uint16_t bpp  = *(const uint16_t *)(bi + 14);  /* biBitCount */
+    int32_t  h    = hraw < 0 ? -hraw : hraw;
+    if (w <= 0 || h <= 0 || w > 8192 || h > 8192) return NULL;
+    if (bpp != 8 && bpp != 16 && bpp != 24 && bpp != 32) return NULL;
+
+    int idx = alloc_bmp();
+    if (idx < 0) return NULL;
+
+    uint32_t pitch = (((uint32_t)w * bpp + 31) / 32) * 4;  /* DWORD-aligned */
+    uint64_t size  = (uint64_t)pitch * (uint64_t)h;
+    extern void *mem_alloc_pages(uint64_t count);
+    void *pixels = mem_alloc_pages((size + 4095) / 4096);  /* PE32-visible low mem */
+    if (!pixels) { gdi_bmps[idx].in_use = 0; return NULL; }
+    gdi_memset(pixels, 0, size);
+
+    gdi_bmps[idx].pixels = pixels;
+    gdi_bmps[idx].width  = w;
+    gdi_bmps[idx].height = h;
+    gdi_bmps[idx].bpp    = bpp;
+    gdi_bmps[idx].pitch  = (int)pitch;
+    gdi_bmps[idx].bottomup    = (hraw > 0);  /* positive biHeight = bottom-up */
+    gdi_bmps[idx].alloc_pages = (uint32_t)((size + 4095) / 4096);
+
+    if (ppvBits) *(uint32_t *)ppvBits = (uint32_t)(uintptr_t)pixels;
+
+    serial_puts("[GDI32] CreateDIBSection ");
+    serial_putdec((uint64_t)w); serial_puts("x"); serial_putdec((uint64_t)h);
+    serial_puts("x"); serial_putdec(bpp);
+    serial_puts(" bits=0x"); serial_puthex((uint64_t)(uintptr_t)pixels, 8);
+    serial_puts("\n");
+    return (PVOID)(ULONG_PTR)(BMP_TAG | (uint32_t)idx);
 }
 
 static DWORD WINAPI GetPixel_stub(HDC hdc, int x, int y)
@@ -711,7 +794,7 @@ static const SHIM_EXPORT gdi32_exports[] = {
     /* Additional stubs */
     { "CreateFontA",              (PVOID)CreateFontA_stub, 14, CC_STDCALL },
     { "CreateFontW",              (PVOID)CreateFontW_stub, 14, CC_STDCALL },
-    { "CreateDIBSection",         (PVOID)CreateDIBSection_stub, 6, CC_STDCALL },
+    { "CreateDIBSection",         (PVOID)CreateDIBSection_impl, 6, CC_STDCALL },
     { "GetPixel",                 (PVOID)GetPixel_stub, 3, CC_STDCALL },
     { NULL, NULL, 0, CC_STDCALL }
 };

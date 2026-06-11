@@ -345,6 +345,15 @@ void compat32_init(void)
 {
     thunk_count = 0;
 
+    /* Re-exec reset: a relaunch arrives via ExitProcess (longjmp out of guest
+     * code), so any nested-callback bookkeeping from the previous run is stale —
+     * a leftover depth/jmpbuf would make the next callback unwind into the
+     * previous run's stack/CR3. callback_stacks_ptr is kept (stacks reusable). */
+    callback_depth = 0;
+    for (int i = 0; i < MAX_CALLBACK_DEPTH; i++)
+        for (int j = 0; j < 9; j++)
+            callback_jmpbufs[i][j] = 0;
+
     /* Allocate executable thunk pool in low memory */
     thunk_pool = (uint8_t *)mem_alloc_pages(THUNK_POOL_PAGES);
     if (!thunk_pool) {

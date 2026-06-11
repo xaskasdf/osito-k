@@ -1169,9 +1169,15 @@ BOOL WINAPI EnumDisplaySettingsA(const char *device, uint32_t mode, DEVMODEA *dm
     dm->dmDisplayFrequency = 60;
 
     if (mode == ENUM_CURRENT_SETTINGS) {
-        dm->dmBitsPerPel = 32;
-        dm->dmPelsWidth  = screen_cx();
-        dm->dmPelsHeight = screen_cy();
+        /* Report the live DirectDraw mode (the layer's "current mode" authority)
+         * so user32/gdi32/ddraw agree; fall back to GOP size + 16bpp pre-ddraw. */
+        extern void ddraw_get_display_mode(uint32_t *w, uint32_t *h, uint32_t *bpp)
+            __attribute__((weak));
+        uint32_t cw = 0, ch = 0, cb = 0;
+        if (ddraw_get_display_mode) ddraw_get_display_mode(&cw, &ch, &cb);
+        dm->dmBitsPerPel = cb ? cb : 16;
+        dm->dmPelsWidth  = cw ? cw : (uint32_t)screen_cx();
+        dm->dmPelsHeight = ch ? ch : (uint32_t)screen_cy();
         return TRUE;
     }
 
@@ -2542,10 +2548,20 @@ PVOID user32_shim_init(void)
 {
     wndclass_count = 0;
     window_count = 0;
+    for (int i = 0; i < MAX_WINDOWS; i++) windows[i].used = 0;
     msg_head = msg_tail = 0;
     quit_posted = 0;
     for (int i = 0; i < 256; i++) { key_state[i] = 0; async_pressed[i] = 0; }
     mouse_buttons = 0;
     prev_was_e0 = 0;
+    /* Re-exec resets: one-shot activation + input-routing state. Without these a
+     * relaunched PE never receives WM_ACTIVATE and inherits stale focus/capture. */
+    g_activated = 0;
+    focus_hwnd = NULL;
+    capture_hwnd = NULL;
+    clip_active = 0;
+    g_abs_prev_valid = 0;
+    cursor_visible = 1;
+    cursor_pos.x = 320; cursor_pos.y = 240;
     return (PVOID)user32_exports;
 }

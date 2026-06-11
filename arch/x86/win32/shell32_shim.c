@@ -12,6 +12,20 @@ extern void serial_puts(const char *s);
 
 /* ── API Implementations ───────────────────────────────────── */
 
+/* True if path ends in ".exe" (case-insensitive) — UT99 relaunches itself this
+ * way to apply a video/color-depth change. */
+static int ends_in_exe(PCSTR p)
+{
+    if (!p) return 0;
+    int n = 0; while (p[n]) n++;
+    if (n < 4) return 0;
+    const char *e = p + n - 4;
+    return (e[0] == '.' &&
+            (e[1] == 'e' || e[1] == 'E') &&
+            (e[2] == 'x' || e[2] == 'X') &&
+            (e[3] == 'e' || e[3] == 'E'));
+}
+
 HINSTANCE WINAPI ShellExecuteA(HWND hwnd, PCSTR lpOperation, PCSTR lpFile,
                                 PCSTR lpParameters, PCSTR lpDirectory, int nShowCmd)
 {
@@ -20,6 +34,13 @@ HINSTANCE WINAPI ShellExecuteA(HWND hwnd, PCSTR lpOperation, PCSTR lpFile,
     if (lpOperation) { serial_puts(lpOperation); serial_puts(" "); }
     if (lpFile) serial_puts(lpFile);
     serial_puts("\n");
+    /* Launching an .exe = the game relaunching itself → request a re-exec so the
+     * current process's ExitProcess restarts the EXE instead of exiting dead. */
+    if (ends_in_exe(lpFile)) {
+        extern int g_win32_relaunch;
+        g_win32_relaunch = 1;
+        serial_puts("[SHELL32] .exe launch → RE-EXEC requested\n");
+    }
     return (HINSTANCE)(ULONG_PTR)32; /* >32 = success */
 }
 

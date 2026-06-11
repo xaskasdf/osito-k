@@ -4397,5 +4397,13 @@ PVOID msvcrt_resolve(const char *func_name, USHORT ordinal, BOOL by_ordinal)
 PVOID msvcrt_shim_init(void)
 {
     ensure_stdio_init();
+    /* Re-exec resets. stub_gmalloc_installed is a one-shot whose stub vtable
+     * holds thunks into the PREVIOUS run's thunk pool (compat32_init re-allocates
+     * it) — must rebuild. The FMW Free router likewise re-installs on the freshly
+     * reloaded Core.dll/UT.exe vtables; drop the old router pool (page leaks,
+     * bounded by relaunch count). */
+    stub_gmalloc_installed = 0;
+    fmw_router_pool = NULL;
+    fmw_router_used = 0;
     return (PVOID)msvcrt_exports;
 }

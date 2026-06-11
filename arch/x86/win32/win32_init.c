@@ -181,6 +181,12 @@ void win32_init(void)
 
 char win32_exe_name[64] = "program.exe";
 
+/* Set by ShellExecuteA/CreateProcessA when the guest launches an .exe (UT99
+ * re-launches itself to apply a video-mode/color-depth change). win32_exec
+ * loops: when the current PE exits with this set, it reloads + re-runs the
+ * same EXE — a minimal "process re-exec" so the relaunch isn't a dead exit. */
+int  g_win32_relaunch = 0;
+
 /* ── Load and execute a PE from OsitoFS ──────────────────────── */
 
 int win32_exec(const char *filename)
@@ -194,6 +200,10 @@ int win32_exec(const char *filename)
         serial_puts("[WIN32] No filesystem mounted\n");
         return -1;
     }
+
+    int result = -1;
+  relaunch:
+    g_win32_relaunch = 0;
 
     /* Find file on OsitoFS */
     void *file = osfs2_find(filename);
@@ -240,7 +250,7 @@ int win32_exec(const char *filename)
     }
 
     /* Hand off to the PE execution engine */
-    int result = winexec_run(buf, size);
+    result = winexec_run(buf, size);
 
     /* Free the file buffer (PE image was copied by pe_load) */
     mem_free_pages(buf, pages);
@@ -248,6 +258,19 @@ int win32_exec(const char *filename)
     serial_puts("[WIN32] Execution finished, exit code = ");
     serial_putdec((uint64_t)(uint32_t)result);
     serial_puts("\n");
+
+    /* Minimal process re-exec: UT99 relaunches itself (ShellExecute/CreateProcess
+     * of its own .exe) to apply a video-mode/color-depth change, then ExitProcess.
+     * Without this the relaunch is a dead exit to the shell. Reload + re-run the
+     * same EXE. NOTE: win32 global state (PE/DLL VA mappings, FName, GMalloc,
+     * surfaces) is only partially reset by winexec_run's *_shim_init — this is a
+     * debug attempt to see how far a naive re-exec gets. */
+    if (g_win32_relaunch) {
+        serial_puts("[WIN32] === RE-EXEC requested — relaunching ");
+        serial_puts(filename);
+        serial_puts(" ===\n");
+        goto relaunch;
+    }
 
     return result;
 }
