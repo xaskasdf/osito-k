@@ -142,8 +142,41 @@ The corrupt input is a huge FName index `ecx=0x4250A` (271114, well beyond the
 `Names.Data[index]` where `index` came from an object's Name field (`[obj+0x20]`,
 obj=`ebx=0x401FFC00`). So a config/property object carries a corrupt FName index
 → Names[] overrun → wild write. Same FName-corruption family as the other UT99
-bugs, surfacing in the settings-enumeration path. ROOT (why that object's Name
-index is garbage) is unresolved — deep object-corruption hunt.
+bugs, surfacing in the settings-enumeration path.
+
+**ROOT IDENTIFIED (2026-06-11, workflow analysis, confidence medium):** the corrupt
+index is NOT from the `.int` data (NtReadFile serves `[Public]..Object` correctly)
+and is NOT an arithmetic step — it is **stale memory** at `[0x401FFC00+0x20]` left by
+**FMallocWindows pool aliasing that OUR layer creates**. Object `0x401FFC00` lives in
+a 64KB FMallocWindows pool (`VirtualAlloc` base `0x401F0000`, size 0x10000, caller
+UT.exe `0x109020F8`). FMallocWindows handed that sub-block out while it still aliased
+another live allocation, so a colliding write dropped `0x4250A` into the Name slot.
+The aliasing is **enabled by our `FMW-POOL-SKIP` band-aid** (`arch/x86/kernel/idt.c`
+~1313-1351): it watches UT.exe's pool manager (RIP `0x10902000..0x10903400`, e.g.
+`0x10902AF2`/`0x10902B2D`) do NULL-target writes (`*PrevLink`/`*FirstMem`, `CR2<0x1000`)
+and silently **skips** them — leaving the pool link/free-list un-updated, so coalesce/
+unlink never happens and blocks get re-handed-out overlapping. Those NULL targets are
+themselves a symptom: the pool→`FPoolInfo` indirection (FMallocWindows masks a pointer
+to its 64KB base and indexes `PoolIndirect[ptr>>16]`) returns the wrong/empty FPoolInfo
+for the `0x401Fxxxx` pool, because `win32_va_alloc`/`sys_NtAllocateVirtualMemory`
+(`arch/x86/win32/ntsyscall.c` ~182-251, 717-769) **ignore MEM_RESERVE vs MEM_COMMIT**
+and don't guarantee FMallocWindows-compatible 64KB pointer→FPoolInfo slotting
+(sub-64KB pool blocks 0xF000/0xE000/0xC000 from caller `0x109020F8` interleave with
+multi-64KB large allocs from caller `0x109023F4`).
+**Proposed fix (LAYER, not band-aid):** (1) delete the `FMW-POOL-SKIP` skip block in
+`idt.c` — it masks meaningful pool writes and is the proximate cause of aliasing;
+(2) implement real **MEM_RESERVE vs MEM_COMMIT** in `NtAllocateVirtualMemory` (reserve
+address space, commit on demand) so the engine's reserve-then-grow pool yields the same
+base/size it later masks against; (3) round each VirtualAlloc reservation up to a full
+64KB slot so two distinct FMallocWindows allocations never share a `>>16` PoolIndirect
+slot. Then `*PrevLink`/`*FirstMem` are never NULL and no skip is needed.
+**OPEN (needs QEMU + UT.exe disasm):** UT.exe FMallocWindows code (`0x10902xxx`) is not
+in-tree (only Core.dll + windrv.bin are), so the exact `PoolIndirect` shift/table-base
+is inferred from UE1 behavior, not confirmed by disasm. Removing `FMW-POOL-SKIP` alone
+may surface the now-unmasked NULL write unless the reserve/commit+granularity fix lands
+first. This is the SINGLE fix for B8 (and thus B9). See `project_ut99_b8_fmw_pool_aliasing`.
+Prior context: `project_ut99_fmw_pool_fix_loadmap` (FMW-POOL-SKIP was itself a workaround
+— lesson: stale workarounds cause later crashes once the real root is fixed).
 
 ## B9 — [CLOSED: duplicate of B8] not-present Core.dll pages during Preferences
 **Resolution (2026-06-11):** root-caused as a pure **symptom of B8** (FName
