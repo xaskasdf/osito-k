@@ -1341,6 +1341,18 @@ HWND WINAPI GetForegroundWindow(void)
 HWND WINAPI SetFocus(HWND hWnd)
 {
     HWND old = focus_hwnd;
+    /* [CAPDIAG — uncommitted] who flips focus (the capture-flap suspect) */
+    {
+        static int n = 0;
+        if (hWnd != old && n++ < 40) {
+            extern uint32_t compat32_get_last_caller_eip(void);
+            serial_puts("[CAP] SetFocus(0x");
+            serial_puthex((uint64_t)(ULONG_PTR)hWnd, 8);
+            serial_puts(") was=0x"); serial_puthex((uint64_t)(ULONG_PTR)old, 8);
+            serial_puts(" eip=0x"); serial_puthex(compat32_get_last_caller_eip(), 8);
+            serial_puts("\n");
+        }
+    }
     /* Only track real windows we know about; NULL clears focus. */
     if (hWnd == NULL || find_window(hWnd)) {
         focus_hwnd = hWnd;
