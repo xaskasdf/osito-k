@@ -708,6 +708,19 @@ void *proc_exec_target(void)
     return exec_target_proc;
 }
 
+/* CR3 of the process an in-progress exec is launching. The eager-ELF-load
+ * mapping (elf_load_segments) must install the binary's pages into THIS
+ * PML4, not proc_current_cr3(): the load runs with interrupts enabled, so a
+ * timer context-switch can transiently move current_proc to the launchpad
+ * parent or a kernel thread — mapping there leaves the child (the process
+ * that actually elf_jumps to the entry) with an unmapped entry page → #PF on
+ * the first instruction fetch. Returns 0 when not in an exec (caller falls
+ * back to proc_current_cr3). See proc_launch_prepare / proc_exec_target. */
+uint64_t proc_exec_target_cr3(void)
+{
+    return exec_target_proc ? exec_target_proc->cr3 : 0;
+}
+
 /* User-symbol-table accessors — used by usym.c so it doesn't have to
  * know the layout of process_t. Take/return void* so usym.c stays
  * decoupled from this struct's anonymous tag. */

@@ -441,7 +441,15 @@ static int elf_load_segments(const uint8_t *data, uint64_t data_size,
         extern int paging_map_page_in_cr3(uint64_t cr3, uint64_t virt,
                                           uint64_t phys, uint64_t flags);
         extern uint64_t proc_current_cr3(void);
-        uint64_t cr3 = proc_current_cr3();
+        extern uint64_t proc_exec_target_cr3(void);
+        /* Anchor to the exec_target's CR3, NOT proc_current_cr3(): the load
+         * runs interrupts-enabled, so a timer context-switch can move
+         * current_proc to the launchpad parent or a kernel thread. Mapping
+         * into the wrong PML4 leaves the child that actually elf_jumps to
+         * the entry with an unmapped entry page → instruction-fetch #PF.
+         * Falls back to proc_current_cr3 for non-exec loads. */
+        uint64_t cr3 = proc_exec_target_cr3();
+        if (!cr3) cr3 = proc_current_cr3();
         if (cr3) {
             uint64_t va = fixed_load ? vaddr_min : (uint64_t)base;
             uint64_t pa = (uint64_t)phys_base;
