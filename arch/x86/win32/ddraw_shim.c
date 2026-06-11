@@ -552,6 +552,22 @@ void ddraw_present_hook(void)
     ddraw_compositor_notify();
 }
 
+/* True when a surface is the size the user sees (or last saw): either the
+ * current ddraw display mode, or the source size of the most recent present.
+ * The second test matters because the GDI/DIB present path can change the
+ * visible resolution WITHOUT a ddraw SetDisplayMode — after such a mid-stream
+ * mode change SoftDrv's render surface must not be orphaned by a strict
+ * display_width/height compare. Shared by Lock/Unlock/Flip/Blt so every path
+ * agrees on which surface is eligible for the per-pump present hook. */
+static int surf_is_present_sized(const DDSurface *s)
+{
+    if (!s->pixels || !s->width || !s->height) return 0;
+    if (s->width == display_width && s->height == display_height) return 1;
+    if (g_present_src_w && g_present_src_h &&
+        s->width == g_present_src_w && s->height == g_present_src_h) return 1;
+    return 0;
+}
+
 static HRESULT WINAPI surf_Lock(IDirectDrawSurface7 *self, LPRECT destRect,
                                  DDSURFACEDESC2 *desc, DWORD flags, HANDLE hEvent)
 {
@@ -574,8 +590,11 @@ static HRESULT WINAPI surf_Lock(IDirectDrawSurface7 *self, LPRECT destRect,
     d[9]  = (uint32_t)(ULONG_PTR)s->pixels; /* lpSurface at offset 36 */
 
     /* Remember the display-sized surface being rendered into so the per-frame
-     * pump can present it (SoftDrv keeps this Locked and never Flips). */
-    if (s->pixels && s->width == display_width && s->height == display_height)
+     * pump can present it (SoftDrv keeps this Locked and never Flips). Match
+     * by current mode OR last-presented source size (see
+     * surf_is_present_sized) so a GDI-side resolution change mid-stream
+     * doesn't orphan the surface. */
+    if (surf_is_present_sized(s))
         g_present_surface = s;
 
     /* ddpfPixelFormat at offset 72 (32-bit DDSURFACEDESC2 layout). Field
@@ -621,7 +640,15 @@ static HRESULT WINAPI surf_Unlock(IDirectDrawSurface7 *self, LPRECT lpRect)
      * not always issued. Present the just-rendered surface to the GOP
      * framebuffer here so the frame becomes visible. */
     DDSurface *s = &real->surf;
-    if (s->pixels && s->width == display_width && s->height == display_height) {
+    if (surf_is_present_sized(s)) {
+        /* Re-arm the per-pump present hook: an Unlock of a display-sized
+         * surface is a positive signal the ddraw path is producing frames
+         * again. The GDI/DIB present path (the menu) suspends the hook
+         * (g_present_surface = NULL), and on resume SoftDrv may keep its
+         * surface persistently Locked without ever re-Locking — so without
+         * this re-arm the pump presents nothing after a menu round-trip
+         * (in-game black screen until something re-Locks, e.g. death-cam). */
+        g_present_surface = s;
         present_surface_to_gop(s);
         ddraw_compositor_notify();
     }
@@ -682,9 +709,15 @@ static HRESULT WINAPI surf_Blt(IDirectDrawSurface7 *self, LPRECT destRect,
         dd_memcpy(dst->pixels, s->pixels, copy_size);
     }
 
-    /* If primary surface, blit (nearest-neighbor scaled to full GOP) */
-    if (dst->is_primary)
+    /* If primary surface, blit (nearest-neighbor scaled to full GOP).
+     * Re-arm the per-pump present hook on a primary-sized Blt for the same
+     * reason as Unlock/Flip: a ddraw present means the ddraw path owns the
+     * screen again after any GDI-present suspension. */
+    if (dst->is_primary) {
+        if (surf_is_present_sized(dst))
+            g_present_surface = dst;
         present_surface_to_gop(dst);
+    }
 
     /* Also copy to compositor's shm surface if available */
     if (dst->is_primary)
@@ -777,7 +810,12 @@ static HRESULT WINAPI surf_Flip(IDirectDrawSurface7 *self,
     primary->pixels = back->pixels;
     back->pixels = tmp;
 
-    /* Blit primary to GOP framebuffer (nearest-neighbor scaled to full GOP) */
+    /* Blit primary to GOP framebuffer (nearest-neighbor scaled to full GOP).
+     * A Flip is the strongest "ddraw owns the screen" signal: re-arm the
+     * per-pump present hook so flip-chain games keep presenting after a GDI
+     * BitBlt present suspended it (mirrors the Lock/Unlock re-arm). */
+    if (surf_is_present_sized(primary))
+        g_present_surface = primary;
     present_surface_to_gop(primary);
 
     ddraw_compositor_notify();
@@ -787,9 +825,18 @@ static HRESULT WINAPI surf_Flip(IDirectDrawSurface7 *self,
 static HRESULT WINAPI surf_GetSurfaceDesc(IDirectDrawSurface7 *self, DDSURFACEDESC2 *desc)
 {
     if (!desc) return DDERR_INVALIDPARAMS;
-    /* Just lock and unlock to fill the descriptor */
+    /* Fill the descriptor via the Lock path, but a Desc QUERY must not have
+     * present side effects: don't let the synthetic Lock/Unlock arm the
+     * per-pump present hook (that would override a GDI-present suspension and
+     * push a stale ddraw frame over the DIB) or present a frame. Restore the
+     * arming state and clear the lock flag directly instead of Unlock. */
+    DDSurface *saved = g_present_surface;
     HRESULT hr = surf_Lock(self, NULL, desc, 0, NULL);
-    if (hr == DD_OK) surf_Unlock(self, NULL);
+    g_present_surface = saved;
+    if (hr == DD_OK) {
+        IDirectDrawSurface7 *real = REAL_SURF(self);
+        if (real) real->surf.locked = 0;
+    }
     return hr;
 }
 
