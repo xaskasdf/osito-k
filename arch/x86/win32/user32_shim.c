@@ -1342,6 +1342,18 @@ HWND WINAPI GetForegroundWindow(void)
 HWND WINAPI SetFocus(HWND hWnd)
 {
     HWND old = focus_hwnd;
+    /* [CAPDIAG — uncommitted] who flips focus (the capture-flap suspect) */
+    {
+        static int n = 0;
+        if (hWnd != old && n++ < 40) {
+            extern uint32_t compat32_get_last_caller_eip(void);
+            serial_puts("[CAP] SetFocus(0x");
+            serial_puthex((uint64_t)(ULONG_PTR)hWnd, 8);
+            serial_puts(") was=0x"); serial_puthex((uint64_t)(ULONG_PTR)old, 8);
+            serial_puts(" eip=0x"); serial_puthex(compat32_get_last_caller_eip(), 8);
+            serial_puts("\n");
+        }
+    }
     /* Only track real windows we know about; NULL clears focus. */
     if (hWnd == NULL || find_window(hWnd)) {
         focus_hwnd = hWnd;
@@ -1383,14 +1395,21 @@ int WINAPI ShowCursor(BOOL bShow)
 {
     if (bShow) cursor_visible++;
     else       cursor_visible--;
-    /* [CAPDIAG — uncommitted] trace capture-sequence calls (throttled) */
+    /* [CAPDIAG — uncommitted] trace capture-sequence calls + the
+     * SetMouseCapture caller's return address (guest [ebp+4]). */
     {
         static int n = 0;
-        if (n++ < 40) {
+        if (n++ < 48) {
             extern uint32_t compat32_get_last_caller_eip(void);
+            extern uint32_t compat32_get_last_user_ebp(void);
+            uint32_t ebp = compat32_get_last_user_ebp();
+            uint32_t ret = 0;
+            if (ebp >= 0x10000 && ebp < 0x7FFF0000)
+                ret = *(volatile uint32_t *)(uintptr_t)(ebp + 4);
             serial_puts("[CAP] ShowCursor("); serial_putdec((uint64_t)(uint32_t)bShow);
             serial_puts(")->"); serial_putdec((uint64_t)(uint32_t)cursor_visible);
             serial_puts(" eip=0x"); serial_puthex(compat32_get_last_caller_eip(), 8);
+            serial_puts(" smc_ret=0x"); serial_puthex(ret, 8);
             serial_puts("\n");
         }
     }
@@ -1411,13 +1430,34 @@ HWND WINAPI SetCapture(HWND hWnd)
 {
     HWND old = capture_hwnd;
     capture_hwnd = hWnd;
-    /* [CAPDIAG — uncommitted] */
+    /* [CAPDIAG — uncommitted] log + identify SetMouseCapture's CALLER (the
+     * flap driver): we are called from inside WinDrv SetMouseCapture
+     * (0x11106610, std prologue), so guest [ebp+4] = its return address into
+     * Engine/Window.dll — the per-frame capture/release decision site. */
     {
         static int n = 0;
-        if (n++ < 20) {
+        if (n++ < 24) {
+            extern uint32_t compat32_get_last_user_ebp(void);
+            uint32_t ebp = compat32_get_last_user_ebp();
+            uint32_t ret = 0, vp = 0, f38 = 0, actor = 0, show = 0;
+            if (ebp >= 0x10000 && ebp < 0x7FFF0000) {
+                ret = *(volatile uint32_t *)(uintptr_t)(ebp + 4);
+                /* SetMouseCapture prologue saves this(esi) at [ebp-0x1C] */
+                vp  = *(volatile uint32_t *)(uintptr_t)(ebp - 0x1C);
+                if (vp >= 0x10000 && vp < 0x7FFF0000) {
+                    f38   = *(volatile uint32_t *)(uintptr_t)(vp + 0x38);
+                    actor = *(volatile uint32_t *)(uintptr_t)(vp + 0x30);
+                    if (actor >= 0x10000 && actor < 0x7FFF0000)
+                        show = *(volatile uint32_t *)(uintptr_t)(actor + 0x51C);
+                }
+            }
             serial_puts("[CAP] SetCapture(0x");
             serial_puthex((uint64_t)(ULONG_PTR)hWnd, 8);
-            serial_puts(")\n");
+            serial_puts(") smc_ret=0x"); serial_puthex(ret, 8);
+            serial_puts(" vp=0x"); serial_puthex(vp, 8);
+            serial_puts(" vp38=0x"); serial_puthex(f38, 4);
+            serial_puts(" show=0x"); serial_puthex(show, 8);
+            serial_puts("\n");
         }
     }
     return old;
