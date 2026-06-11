@@ -8,6 +8,8 @@
 #include "../util/util_singleton.h"
 
 extern "C" int printf(const char*, ...);  /* DIAG */
+extern "C" long write(int, const void*, unsigned long);  /* DIAG fd2 unbuffered */
+static void dbgw2(const char* s) { unsigned long n = 0; while (s[n]) n++; write(2, s, n); }
 
 namespace dxvk {
 
@@ -371,13 +373,19 @@ namespace dxvk {
     if (ppAdapter == nullptr)
       return DXGI_ERROR_INVALID_CALL;
     
+    dbgw2("[DBGW2] EnumAdapters1: enumAdapters...\n");
     Rc<DxvkAdapter> dxvkAdapter
       = m_instance->enumAdapters(Adapter);
-    
+    dbgw2("[DBGW2] enumAdapters done; nullcheck...\n");
+
     if (dxvkAdapter == nullptr)
       return DXGI_ERROR_NOT_FOUND;
-    
-    *ppAdapter = ref(new DxgiAdapter(this, dxvkAdapter, Adapter));
+
+    dbgw2("[DBGW2] new DxgiAdapter...\n");
+    DxgiAdapter* da = new DxgiAdapter(this, dxvkAdapter, Adapter);
+    dbgw2("[DBGW2] new DxgiAdapter done; ref()...\n");
+    *ppAdapter = ref(da);
+    dbgw2("[DBGW2] ref done; return S_OK\n");
     return S_OK;
   }
   

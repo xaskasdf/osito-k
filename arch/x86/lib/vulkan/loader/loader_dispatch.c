@@ -68,6 +68,10 @@ VKAPI_ATTR void VKAPI_CALL vkDestroyImage(
     VkDevice, VkImage, const VkAllocationCallbacks *);
 VKAPI_ATTR void VKAPI_CALL vkGetImageMemoryRequirements(
     VkDevice, VkImage, VkMemoryRequirements *);
+VKAPI_ATTR void VKAPI_CALL vkGetImageMemoryRequirements2(
+    VkDevice, const VkImageMemoryRequirementsInfo2 *, VkMemoryRequirements2 *);
+VKAPI_ATTR void VKAPI_CALL vkGetBufferMemoryRequirements2(
+    VkDevice, const VkBufferMemoryRequirementsInfo2 *, VkMemoryRequirements2 *);
 VKAPI_ATTR VkResult VKAPI_CALL vkBindImageMemory(
     VkDevice, VkImage, VkDeviceMemory, VkDeviceSize);
 VKAPI_ATTR VkResult VKAPI_CALL vkCreateImageView(
@@ -413,6 +417,12 @@ osito_loader_get_instance_proc_addr(VkInstance instance, const char *pName) {
         return (PFN_vkVoidFunction)vkDestroyImage;
     if (strcmp(pName, "vkGetImageMemoryRequirements") == 0)
         return (PFN_vkVoidFunction)vkGetImageMemoryRequirements;
+    if (strcmp(pName, "vkGetImageMemoryRequirements2") == 0 ||
+        strcmp(pName, "vkGetImageMemoryRequirements2KHR") == 0)
+        return (PFN_vkVoidFunction)vkGetImageMemoryRequirements2;
+    if (strcmp(pName, "vkGetBufferMemoryRequirements2") == 0 ||
+        strcmp(pName, "vkGetBufferMemoryRequirements2KHR") == 0)
+        return (PFN_vkVoidFunction)vkGetBufferMemoryRequirements2;
     if (strcmp(pName, "vkBindImageMemory") == 0)
         return (PFN_vkVoidFunction)vkBindImageMemory;
     if (strcmp(pName, "vkCreateImageView") == 0)
@@ -754,6 +764,10 @@ vkEnumerateDeviceExtensionProperties(VkPhysicalDevice physicalDevice,
                                      const char *pLayerName,
                                      uint32_t *pPropertyCount,
                                      VkExtensionProperties *pProperties) {
+    { extern long write(int,const void*,unsigned long);
+      const char* m = pProperties ? "[okenum] DevExt FILL query\n"
+                                  : "[okenum] DevExt COUNT query\n";
+      unsigned long n=0; while(m[n])++n; write(2,m,n); }
     printf("[LOADER] EnumerateDeviceExtensionProperties: pd=%p pCount=%p props=%p\n",
            (void*)physicalDevice, (void*)pPropertyCount, (void*)pProperties);
     if (!physicalDevice || !pPropertyCount) return VK_ERROR_INITIALIZATION_FAILED;
@@ -769,15 +783,91 @@ vkEnumerateDeviceExtensionProperties(VkPhysicalDevice physicalDevice,
         (PFN_vkEnumerateDeviceExtensionProperties)
         ci->icd->get_proc_addr(ci->handle, "vkEnumerateDeviceExtensionProperties");
     printf("[LOADER]   icd-side fn=%p\n", (void*)fn);
-    if (!fn) {
-        *pPropertyCount = 0;
+    /* NOTE: venus does NOT expose vkEnumerateDeviceExtensionProperties via
+     * get_proc_addr (fn == NULL). We must NOT early-return here — DXVK still
+     * needs our injected extensions, so fall through with icd_count = 0. */
+
+    /* Device extensions the loader injects on top of whatever the ICD
+     * advertises. DXVK only chains a feature struct into its
+     * vkGetPhysicalDeviceFeatures2 query when the corresponding extension
+     * is advertised, so VK_EXT_transform_feedback must appear here or
+     * DXVK never asks about transformFeedback (a baseline-required
+     * feature) and reports D3D_FEATURE_LEVEL 0. The venus host driver
+     * supports it; vkCreateDevice enables it downstream. */
+    static const char *const s_injected_dev_ext[] = {
+        /* DxvkExtMode::Required device extensions — without these
+         * DxvkAdapter::createDevice's enableExtensions() bails before it
+         * ever calls vkCreateDevice. venus advertises ZERO device
+         * extensions (it has no vkEnumerateDeviceExtensionProperties), so
+         * the loader must inject the full required set. */
+        "VK_KHR_swapchain",
+        "VK_EXT_robustness2",
+        /* Optional extension, but its FEATURE (transformFeedback) is part
+         * of DXVK's baseline checkFeatureSupport — advertise so DXVK chains
+         * the feature struct into its vkGetPhysicalDeviceFeatures2 query. */
+        "VK_EXT_transform_feedback",
+    };
+    const uint32_t n_inject =
+        (uint32_t)(sizeof(s_injected_dev_ext) / sizeof(s_injected_dev_ext[0]));
+
+    if (!pProperties) {
+        /* Count query: ICD count + injected. Tolerate ICD failure — venus
+         * returns an error / 0 extensions, but DXVK bails out of
+         * enumDeviceExtensions entirely if the COUNT query is not
+         * VK_SUCCESS, so it never even reads our injected names. Always
+         * report success with at least the injected count. */
+        uint32_t icd_count = 0;
+        if (fn) {
+            VkResult rc = fn(pw->real, pLayerName, &icd_count, NULL);
+            if (rc != VK_SUCCESS && rc != VK_INCOMPLETE) icd_count = 0;
+        }
+        *pPropertyCount = icd_count + n_inject;
+        printf("[LOADER]   ext count query: icd=%u +inject=%u\n",
+               (unsigned)icd_count, (unsigned)n_inject);
         return VK_SUCCESS;
     }
-    VkResult rc = fn(pw->real, pLayerName, pPropertyCount, pProperties);
-    printf("[LOADER]   icd returned rc=%d count=%u\n", rc, (unsigned)*pPropertyCount);
-    if (pProperties && *pPropertyCount > 0) {
-        printf("[LOADER]   first ext: '%s'\n", pProperties[0].extensionName);
+
+    /* Fill query: *pPropertyCount is the caller's capacity. Reserve room
+     * at the tail for the injected entries. Tolerate ICD failure. */
+    uint32_t cap = *pPropertyCount;
+    uint32_t icd_cap = (cap >= n_inject) ? (cap - n_inject) : 0;
+    uint32_t icd_count = icd_cap;
+    VkResult rc = VK_SUCCESS;
+    if (fn) {
+        rc = fn(pw->real, pLayerName, &icd_count, pProperties);
+        if (rc != VK_SUCCESS && rc != VK_INCOMPLETE) { icd_count = 0; rc = VK_SUCCESS; }
+    } else {
+        icd_count = 0;
     }
+
+    uint32_t total = icd_count;
+    for (uint32_t j = 0; j < n_inject && total < cap; j++) {
+        /* Skip if the ICD already advertises it. */
+        int dup = 0;
+        for (uint32_t k = 0; k < icd_count; k++) {
+            if (strcmp(pProperties[k].extensionName, s_injected_dev_ext[j]) == 0) {
+                dup = 1; break;
+            }
+        }
+        if (dup) continue;
+        unsigned m = 0;
+        for (; s_injected_dev_ext[j][m] && m < VK_MAX_EXTENSION_NAME_SIZE - 1; m++)
+            pProperties[total].extensionName[m] = s_injected_dev_ext[j][m];
+        pProperties[total].extensionName[m] = '\0';
+        pProperties[total].specVersion = 1;
+        total++;
+    }
+    *pPropertyCount = total;
+    { extern long write(int,const void*,unsigned long);
+      char b[64]; int p=0; const char* t="[okenum] FILL total="; while(t[p-0]&&p<20){b[p]=t[p];p++;}
+      unsigned v=total; char d[10]; int q=0; if(!v)d[q++]='0'; while(v){d[q++]='0'+v%10;v/=10;}
+      while(q)b[p++]=d[--q]; b[p++]=' '; b[p++]='i'; b[p++]='c'; b[p++]='d'; b[p++]='=';
+      v=icd_count; q=0; if(!v)d[q++]='0'; while(v){d[q++]='0'+v%10;v/=10;} while(q)b[p++]=d[--q];
+      b[p++]='\n'; write(2,b,p); }
+    printf("[LOADER]   icd returned rc=%d total=%u (icd=%u +inject)\n",
+           rc, (unsigned)total, (unsigned)icd_count);
+    if (total > 0)
+        printf("[LOADER]   first ext: '%s'\n", pProperties[0].extensionName);
     return rc;
 }
 
@@ -815,8 +905,23 @@ vkCreateDevice(VkPhysicalDevice physicalDevice,
         ci->icd->get_proc_addr(ci->handle, "vkCreateDevice");
     if (!fn) return VK_ERROR_INITIALIZATION_FAILED;
 
+    { extern long write(int,const void*,unsigned long);
+      const char* h="[okdev] vkCreateDevice enabled exts:\n";
+      unsigned long n=0; while(h[n])++n; write(2,h,n);
+      if (pCreateInfo) {
+        for (unsigned e=0; e<pCreateInfo->enabledExtensionCount; e++) {
+            const char* nm = pCreateInfo->ppEnabledExtensionNames[e];
+            write(2,"  ",2); n=0; while(nm[n])++n; write(2,nm,n); write(2,"\n",1);
+        }
+      }
+    }
     VkDevice icd_dev = VK_NULL_HANDLE;
     VkResult rc = fn(pw->real, pCreateInfo, pAllocator, &icd_dev);
+    { extern long write(int,const void*,unsigned long);
+      char b[40]; int p=0; const char* t="[okdev] venus vkCreateDevice rc=";
+      while(t[p]&&p<33){b[p]=t[p];p++;} int v=(int)rc; if(v<0){b[p++]='-';v=-v;}
+      char d[12]; int q=0; if(!v)d[q++]='0'; while(v){d[q++]='0'+v%10;v/=10;}
+      while(q)b[p++]=d[--q]; b[p++]='\n'; write(2,b,p); }
     if (rc != VK_SUCCESS || !icd_dev) return rc;
 
     struct osito_device *dw = malloc(sizeof(*dw));
@@ -1237,9 +1342,51 @@ vkGetImageMemoryRequirements(VkDevice device, VkImage image,
     struct osito_icd_inst *ci = dw->owner;
     struct osito_image *w = img_from(image);
     if (!ci) return;
+    pReqs->size = 0; pReqs->alignment = 0; pReqs->memoryTypeBits = 0;
     PFN_vkGetImageMemoryRequirements fn = (PFN_vkGetImageMemoryRequirements)
         ci->icd->get_proc_addr(ci->handle, "vkGetImageMemoryRequirements");
     if (fn) fn(dw->real, w->real, pReqs);
+}
+
+/* Vulkan 1.1 core variants. DXVK (and most modern clients) call the _2
+ * forms exclusively; venus only implements the v1 encoders, so the loader
+ * must synthesize v2 from v1 or DXVK's allocator receives size 0 and aborts
+ * with "DxvkMemoryAllocator: Memory allocation failed / Size: 0". */
+VKAPI_ATTR void VKAPI_CALL
+vkGetImageMemoryRequirements2(VkDevice device,
+                              const VkImageMemoryRequirementsInfo2 *pInfo,
+                              VkMemoryRequirements2 *pReqs) {
+    if (!pInfo || !pReqs) return;
+    vkGetImageMemoryRequirements(device, pInfo->image, &pReqs->memoryRequirements);
+    /* Fill any VkMemoryDedicatedRequirements in the pNext chain. */
+    VkBaseOutStructure *s = (VkBaseOutStructure *)pReqs->pNext;
+    for (; s; s = s->pNext) {
+        if (s->sType == VK_STRUCTURE_TYPE_MEMORY_DEDICATED_REQUIREMENTS) {
+            VkMemoryDedicatedRequirements *d = (VkMemoryDedicatedRequirements *)s;
+            d->prefersDedicatedAllocation  = VK_FALSE;
+            d->requiresDedicatedAllocation = VK_FALSE;
+        }
+    }
+}
+
+VKAPI_ATTR void VKAPI_CALL
+vkGetBufferMemoryRequirements(VkDevice device, VkBuffer buffer,
+                              VkMemoryRequirements *pReqs);
+
+VKAPI_ATTR void VKAPI_CALL
+vkGetBufferMemoryRequirements2(VkDevice device,
+                               const VkBufferMemoryRequirementsInfo2 *pInfo,
+                               VkMemoryRequirements2 *pReqs) {
+    if (!pInfo || !pReqs) return;
+    vkGetBufferMemoryRequirements(device, pInfo->buffer, &pReqs->memoryRequirements);
+    VkBaseOutStructure *s = (VkBaseOutStructure *)pReqs->pNext;
+    for (; s; s = s->pNext) {
+        if (s->sType == VK_STRUCTURE_TYPE_MEMORY_DEDICATED_REQUIREMENTS) {
+            VkMemoryDedicatedRequirements *d = (VkMemoryDedicatedRequirements *)s;
+            d->prefersDedicatedAllocation  = VK_FALSE;
+            d->requiresDedicatedAllocation = VK_FALSE;
+        }
+    }
 }
 VKAPI_ATTR VkResult VKAPI_CALL
 vkBindImageMemory(VkDevice device, VkImage image, VkDeviceMemory memory,
@@ -2227,6 +2374,64 @@ vkGetPhysicalDeviceFeatures2(VkPhysicalDevice physicalDevice,
                              VkPhysicalDeviceFeatures2 *pFeatures) {
     if (!pFeatures) return;
     vkGetPhysicalDeviceFeatures(physicalDevice, &pFeatures->features);
+
+    /* Walk the pNext chain and populate the extended feature structs.
+     * The previous shim dropped pNext entirely, so vk11/vk12/vk13/ext
+     * feature bits came back all-zero — which made DXVK's baseline
+     * checkFeatureSupport() fail (shaderDrawParameters / samplerMirror-
+     * ClampToEdge / shaderDemoteToHelperInvocation / transformFeedback)
+     * and report D3D_FEATURE_LEVEL 0 -> E_INVALIDARG at device creation.
+     * The venus backend forwards to a real host Vulkan driver that
+     * supports these common features, so advertise them here. */
+    VkBaseOutStructure *s = (VkBaseOutStructure *)pFeatures->pNext;
+    for (; s; s = s->pNext) {
+        switch (s->sType) {
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES: {
+            VkPhysicalDeviceVulkan11Features *f =
+                (VkPhysicalDeviceVulkan11Features *)s;
+            f->shaderDrawParameters             = VK_TRUE;
+            f->storageBuffer16BitAccess         = VK_TRUE;
+            f->uniformAndStorageBuffer16BitAccess = VK_TRUE;
+            f->multiview                        = VK_TRUE;
+            break;
+        }
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES: {
+            VkPhysicalDeviceVulkan12Features *f =
+                (VkPhysicalDeviceVulkan12Features *)s;
+            f->samplerMirrorClampToEdge   = VK_TRUE;
+            f->drawIndirectCount          = VK_TRUE;
+            f->hostQueryReset             = VK_TRUE;
+            f->timelineSemaphore          = VK_TRUE;
+            f->bufferDeviceAddress        = VK_TRUE;
+            f->shaderOutputViewportIndex  = VK_TRUE;
+            f->shaderOutputLayer          = VK_TRUE;
+            f->descriptorIndexing         = VK_TRUE;
+            f->runtimeDescriptorArray     = VK_TRUE;
+            f->shaderSampledImageArrayNonUniformIndexing = VK_TRUE;
+            break;
+        }
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES: {
+            VkPhysicalDeviceVulkan13Features *f =
+                (VkPhysicalDeviceVulkan13Features *)s;
+            f->shaderDemoteToHelperInvocation   = VK_TRUE;
+            f->shaderZeroInitializeWorkgroupMemory = VK_TRUE;
+            f->synchronization2                 = VK_TRUE;
+            f->dynamicRendering                 = VK_TRUE;
+            f->maintenance4                     = VK_TRUE;
+            f->pipelineCreationCacheControl     = VK_TRUE;
+            break;
+        }
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TRANSFORM_FEEDBACK_FEATURES_EXT: {
+            VkPhysicalDeviceTransformFeedbackFeaturesEXT *f =
+                (VkPhysicalDeviceTransformFeedbackFeaturesEXT *)s;
+            f->transformFeedback = VK_TRUE;
+            f->geometryStreams   = VK_TRUE;
+            break;
+        }
+        default:
+            break;
+        }
+    }
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -2300,8 +2505,33 @@ vkGetPhysicalDeviceImageFormatProperties(
     PFN_vkGetPhysicalDeviceImageFormatProperties fn =
         (PFN_vkGetPhysicalDeviceImageFormatProperties)
         ci->icd->get_proc_addr(ci->handle, "vkGetPhysicalDeviceImageFormatProperties");
-    if (!fn) return VK_ERROR_FORMAT_NOT_SUPPORTED;
-    return fn(pw->real, format, type, tiling, usage, flags, pImageFormatProperties);
+
+    VkResult rc = VK_ERROR_FORMAT_NOT_SUPPORTED;
+    if (fn)
+        rc = fn(pw->real, format, type, tiling, usage, flags, pImageFormatProperties);
+
+    /* venus does NOT expose vkGetPhysicalDeviceImageFormatProperties (fn ==
+     * NULL), so without a fallback DXVK's CheckImageSupport() fails for the
+     * swapchain backbuffer (B8G8R8A8_UNORM) and aborts with "Cannot create
+     * texture". Synthesize generous limits for the common case; the real
+     * vkCreateImage on the host validates the actual constraints later. */
+    if (rc != VK_SUCCESS) {
+        (void)format; (void)usage; (void)flags;
+        uint32_t w = 16384, h = 16384, d = 1;
+        if (type == VK_IMAGE_TYPE_1D)      { h = 1; d = 1; }
+        else if (type == VK_IMAGE_TYPE_3D) { w = 2048; h = 2048; d = 2048; }
+        pImageFormatProperties->maxExtent.width  = w;
+        pImageFormatProperties->maxExtent.height = h;
+        pImageFormatProperties->maxExtent.depth  = d;
+        pImageFormatProperties->maxMipLevels     = 15;
+        pImageFormatProperties->maxArrayLayers   = 2048;
+        pImageFormatProperties->sampleCounts     =
+            VK_SAMPLE_COUNT_1_BIT | VK_SAMPLE_COUNT_2_BIT |
+            VK_SAMPLE_COUNT_4_BIT | VK_SAMPLE_COUNT_8_BIT;
+        pImageFormatProperties->maxResourceSize  = (VkDeviceSize)1 << 32;
+        return VK_SUCCESS;
+    }
+    return rc;
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL
@@ -2849,10 +3079,20 @@ vkCreateSampler(VkDevice device, const VkSamplerCreateInfo *pCI,
     if (!ci) return VK_ERROR_INITIALIZATION_FAILED;
     PFN_vkCreateSampler fn = (PFN_vkCreateSampler)
         ci->icd->get_proc_addr(ci->handle, "vkCreateSampler");
-    if (!fn) return VK_ERROR_INITIALIZATION_FAILED;
     VkSampler real = VK_NULL_HANDLE;
-    VkResult rc = fn(dw->real, pCI, pAllocator, &real);
-    if (rc != VK_SUCCESS || !real) return rc;
+    if (fn) {
+        VkResult rc = fn(dw->real, pCI, pAllocator, &real);
+        if (rc != VK_SUCCESS || !real) return rc;
+    } else {
+        /* DIAGNOSTIC STUB: venus does not implement vkCreateSampler (the
+         * host venus decoder lives in QEMU and lacks the 3D sampler path).
+         * Return a wrapper with a NULL host handle so DXVK init proceeds —
+         * this reveals downstream venus gaps. Real sampling needs a venus
+         * host-side encoder (Wave 3/5). */
+        extern long write(int,const void*,unsigned long);
+        const char* m="[okvk] STUB vkCreateSampler (venus lacks it)\n";
+        unsigned long n=0; while(m[n])++n; write(2,m,n);
+    }
     struct osito_sampler *w = malloc(sizeof(*w));
     if (!w) return VK_ERROR_OUT_OF_HOST_MEMORY;
     w->owner = dw; w->real = real;
