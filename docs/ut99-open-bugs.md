@@ -178,6 +178,32 @@ first. This is the SINGLE fix for B8 (and thus B9). See `project_ut99_b8_fmw_poo
 Prior context: `project_ut99_fmw_pool_fix_loadmap` (FMW-POOL-SKIP was itself a workaround
 — lesson: stale workarounds cause later crashes once the real root is fixed).
 
+**ROOT CORRECTED (2026-06-11, runtime probe — it is NOT reserve/commit, it is an
+ALLOCATOR MISMATCH).** A B8-PROBE at the FMW-POOL-SKIP site dumped the freed block
+ptr `[ebp+8]`, the GMalloc `this` `[ebp-0x28]`, and the FPoolInfo node `[ebp-0x14]`:
+`[FMW-POOL-SKIP] @0x10902AF2 blk=0x019AA000 slot=0x9A node=0x00001340 this=0x1092F738`.
+The freed block `0x019AA000` is in **low physical memory** (the kmalloc/CRT/Heap pool
+region, next to PE images — e.g. WinDrv maps to PA `0x019AC000`), **NOT** in the
+FMallocWindows VirtualAlloc range (`0x42xxxxxx`). The PoolIndirect first-level entry
+for it is NULL: `node = [this + (ptr>>16)*4 + 0x25c] + ((ptr>>16)&0xff)*0x20`
+= `0 + 0x9A*0x20 = 0x1340` ⇒ garbage near-NULL node ⇒ the `*node->PrevLink`/`pool->Head`
+writes hit NULL. So the real **FMallocWindows::Free is being handed a foreign pointer**
+it never pool-allocated. Origin: our **stub allocator handoff**. During DLL preload
+(before the EXE's appInit creates FMallocWindows' Heap) our stub GMalloc
+(`msvcrt_shim.c` `stub_fmalloc_*`) + `HeapAlloc`/`crt_malloc` allocate from a `kmalloc`
+pool → low `0x019xxxxx` addresses. The `msvcrt_shim.c:56-60` comment ASSUMED "FMallocWindows
+uses HeapReAlloc/HeapFree on these pointers after it takes over" — but the disasm proves
+THIS build's FMallocWindows is a **custom PoolIndirect allocator, not a Win32-heap wrapper**,
+so it pool-frees the foreign low block → miss → corruption. (Reserve/commit is a red
+herring; the 64KB slotting is already correct.)
+**Real fix:** route allocator calls by pointer ownership. Install a Free/Realloc router
+on GMalloc's vtable (slots [1]/[2]) that sends low/foreign pointers (< 0x40000000, our
+kmalloc/Heap range) to `HeapFree`/`HeapReAlloc` and forwards native (`0x42xxxxxx`)
+pointers to the real FMallocWindows method. Prefer a 32-bit branching thunk (tail-jump to
+the real method for native ptrs) to avoid a 64→32 callback on the hot free path. Then the
+`FMW-POOL-SKIP` band-aid and the wcscpy(L"0") cascade both disappear. FMalloc::Free is
+__thiscall (ecx=this, [esp+4]=ptr). See `project_ut99_b8_fmw_pool_aliasing`.
+
 ## B9 — [CLOSED: duplicate of B8] not-present Core.dll pages during Preferences
 **Resolution (2026-06-11):** root-caused as a pure **symptom of B8** (FName
 corruption wild-writing page-table memory → Core.dll pages go not-present → guest
