@@ -11,7 +11,20 @@
 namespace dxvk {
   Logger Logger::s_instance("d3d11.log");
 }
-  
+
+// OsitoK: direct fd2 trace (DXVK Logger goes to a file/cerr that may be lost)
+extern "C" long write(int, const void*, unsigned long);
+static inline void okd11(const char* s) {
+  unsigned long n = 0; while (s[n]) ++n; write(2, s, n);
+}
+static inline void okd11hex(const char* tag, unsigned long v) {
+  okd11(tag);
+  const char* hx = "0123456789abcdef"; char b[19]; int p = 0;
+  b[p++]='0'; b[p++]='x';
+  for (int i = 15; i >= 0; --i) b[p++] = hx[(v >> (i*4)) & 0xf];
+  b[p++]='\n'; write(2, b, p);
+}
+
 extern "C" {
   using namespace dxvk;
   
@@ -70,6 +83,11 @@ extern "C" {
     D3D_FEATURE_LEVEL minFeatureLevel = D3D_FEATURE_LEVEL();
     D3D_FEATURE_LEVEL devFeatureLevel = D3D_FEATURE_LEVEL();
 
+    okd11hex("[D11mok] GetMaxFeatureLevel=", (unsigned long)(unsigned int)maxFeatureLevel);
+    okd11hex("[D11mok] FeatureLevels count=", (unsigned long)FeatureLevels);
+    if (FeatureLevels && pFeatureLevels)
+      okd11hex("[D11mok] pFeatureLevels[0]=", (unsigned long)(unsigned int)pFeatureLevels[0]);
+
     Logger::info(str::format("D3D11InternalCreateDevice: Maximum supported feature level: ", maxFeatureLevel));
 
     for (uint32_t flId = 0 ; flId < FeatureLevels; flId++) {
@@ -82,9 +100,11 @@ extern "C" {
     }
 
     if (!devFeatureLevel) {
+      okd11("[D11mok] devFeatureLevel==0 -> E_INVALIDARG (no requested level <= max)\n");
       Logger::err(str::format("D3D11InternalCreateDevice: Minimum required feature level ", minFeatureLevel, " not supported"));
       return E_INVALIDARG;
     }
+    okd11hex("[D11mok] chosen devFeatureLevel=", (unsigned long)(unsigned int)devFeatureLevel);
 
     /* try */ {
       Logger::info(str::format("D3D11InternalCreateDevice: Using feature level ", devFeatureLevel));
@@ -170,24 +190,29 @@ extern "C" {
     }
     
     // Create the actual device
+    okd11("[D11mok] before D3D11InternalCreateDevice\n");
     hr = D3D11InternalCreateDevice(
       dxgiFactory.ptr(), dxgiAdapter.ptr(),
       Flags, pFeatureLevels, FeatureLevels,
       &device);
-    
+    okd11hex("[D11mok] D3D11InternalCreateDevice hr=", (unsigned long)(unsigned int)hr);
+
     if (FAILED(hr))
       return hr;
-    
+
     // Create the swap chain, if requested
     if (ppSwapChain) {
+      okd11("[D11mok] before CreateSwapChain (WSI)\n");
       DXGI_SWAP_CHAIN_DESC desc = *pSwapChainDesc;
       hr = dxgiFactory->CreateSwapChain(device.ptr(), &desc, ppSwapChain);
+      okd11hex("[D11mok] CreateSwapChain hr=", (unsigned long)(unsigned int)hr);
 
       if (FAILED(hr)) {
         Logger::err("D3D11CreateDevice: Failed to create swap chain");
         return hr;
       }
     }
+    okd11("[D11mok] device+swapchain OK, returning S_OK\n");
     
     // Write back whatever info the application requested
     if (pFeatureLevel)

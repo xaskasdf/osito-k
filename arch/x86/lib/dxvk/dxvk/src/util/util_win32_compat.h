@@ -23,7 +23,7 @@ inline void* GetProcAddress(HMODULE module, LPCSTR lpProcName) {
 }
 
 inline HANDLE CreateSemaphoreA(
-        SECURITY_ATTRIBUTES*  lpSemaphoreAttributes,
+        PSECURITY_ATTRIBUTES  lpSemaphoreAttributes,
         LONG                  lInitialCount,
         LONG                  lMaximumCount,
         LPCSTR                lpName) {

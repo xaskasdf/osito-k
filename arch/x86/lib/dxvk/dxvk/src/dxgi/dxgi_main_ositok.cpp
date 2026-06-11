@@ -1,6 +1,8 @@
 #include "dxgi_factory.h"
 #include "dxgi_include.h"
 
+extern "C" int printf(const char*, ...);  /* DIAG */
+
 namespace dxvk {
   
   Logger Logger::s_instance("dxgi.log");
@@ -11,8 +13,12 @@ namespace dxvk {
      * DxvkError throw sites in dxvk core/d3d11/dxgi were rewritten to
      * abort_ositok in W5.2 + W5.3-t1, so a thrown error is now a
      * kernel-side abort with a logged message. */
-    Com<DxgiFactory> factory = new DxgiFactory(Flags);
+    DxgiFactory* rawf = new DxgiFactory(Flags);
+    printf("[DBG cdf] new DxgiFactory done raw=%p\n", (void*)rawf);
+    Com<DxgiFactory> factory = rawf;
+    printf("[DBG cdf] Com assigned; QueryInterface...\n");
     HRESULT hr = factory->QueryInterface(riid, ppFactory);
+    printf("[DBG cdf] QueryInterface done hr=0x%x\n", (unsigned)hr);
 
     if (FAILED(hr))
       return hr;

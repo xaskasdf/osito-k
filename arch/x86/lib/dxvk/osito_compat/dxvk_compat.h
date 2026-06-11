@@ -26,6 +26,13 @@
 
 #define DXVK_NO_EXCEPTIONS 1
 
+/* util_env.cpp's POSIX setThreadName() calls pthread_setname_np, which musl
+ * gates behind _GNU_SOURCE. Define it before any system header is pulled (this
+ * shim is force-included first). */
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE 1
+#endif
+
 /* C runtime essentials. Pulled before anything else so DXVK headers see
  * the standard fixed-width types. */
 #include <stddef.h>
@@ -47,6 +54,15 @@
 #ifdef __cplusplus
 #include <atomic>
 #include <cstdlib>
+#include <limits>       // numeric_limits — util_bit.h uses it without including it
+#include <string_view>  // several DXVK headers use std::string_view unqualified
+#include <cstring>      // std::memcpy / std::strlen used unqualified
+#include <type_traits>  // is_trivially_copyable etc.
+#include <algorithm>    // std::max / std::min used unqualified (util_bit.h etc.)
+#include <utility>      // std::move / std::exchange / std::pair
+#include <tuple>        // std::make_tuple / std::tie
+#include <iterator>     // std::forward_iterator_tag (sync_list.h)
+#include <pthread.h>    // util_env.cpp setThreadName(): pthread_self / pthread_setname_np
 #endif
 
 /* -- Calling-convention macros ---------------------------------------- */

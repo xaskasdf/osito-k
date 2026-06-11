@@ -7,6 +7,10 @@
 
 #include "../util/util_singleton.h"
 
+extern "C" int printf(const char*, ...);  /* DIAG */
+extern "C" long write(int, const void*, unsigned long);  /* DIAG fd2 unbuffered */
+static void dbgw2(const char* s) { unsigned long n = 0; while (s[n]) n++; write(2, s, n); }
+
 namespace dxvk {
 
   Singleton<DxvkInstance> g_dxvkInstance;
@@ -99,13 +103,17 @@ namespace dxvk {
       monitors.push_back(hmon);
     }
 
+    printf("[DBG factory] entering adapter loop, %u monitors\n", (unsigned)monitors.size());
     for (uint32_t i = 0; m_instance->enumAdapters(i) != nullptr; i++) {
       auto adapter = m_instance->enumAdapters(i);
+      printf("[DBG factory] adapter %u: logAdapterInfo...\n", i);
       adapter->logAdapterInfo();
+      printf("[DBG factory] adapter %u: logAdapterInfo DONE; devicePropertiesExt...\n", i);
 
       // Remove all monitors that are associated
       // with the current adapter from the list.
       const auto& vk11 = adapter->devicePropertiesExt().vk11;
+      printf("[DBG factory] adapter %u: vk11 OK luidValid=%d\n", i, (int)vk11.deviceLUIDValid);
 
       if (vk11.deviceLUIDValid) {
         auto luid = reinterpret_cast<const LUID*>(&vk11.deviceLUID);
@@ -122,12 +130,15 @@ namespace dxvk {
             monitors.erase(entry);
         }
       }
+      printf("[DBG factory] loop body %u done, re-eval enumAdapters...\n", i);
     }
+    printf("[DBG factory] adapter loop EXITED\n");
 
     // If any monitors are left on the list, enable the
     // fallback to always enumerate all monitors.
     if ((m_monitorFallback = !monitors.empty()))
       Logger::warn("DXGI: Found monitors not associated with any adapter, using fallback");
+    printf("[DBG factory] ctor BODY DONE\n");
   }
   
   
@@ -362,13 +373,19 @@ namespace dxvk {
     if (ppAdapter == nullptr)
       return DXGI_ERROR_INVALID_CALL;
     
+    dbgw2("[DBGW2] EnumAdapters1: enumAdapters...\n");
     Rc<DxvkAdapter> dxvkAdapter
       = m_instance->enumAdapters(Adapter);
-    
+    dbgw2("[DBGW2] enumAdapters done; nullcheck...\n");
+
     if (dxvkAdapter == nullptr)
       return DXGI_ERROR_NOT_FOUND;
-    
-    *ppAdapter = ref(new DxgiAdapter(this, dxvkAdapter, Adapter));
+
+    dbgw2("[DBGW2] new DxgiAdapter...\n");
+    DxgiAdapter* da = new DxgiAdapter(this, dxvkAdapter, Adapter);
+    dbgw2("[DBGW2] new DxgiAdapter done; ref()...\n");
+    *ppAdapter = ref(da);
+    dbgw2("[DBGW2] ref done; return S_OK\n");
     return S_OK;
   }
   
