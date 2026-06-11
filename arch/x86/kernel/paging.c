@@ -74,12 +74,19 @@ extern void *mem_alloc_aligned_high(uint64_t size, uint64_t alignment);
  * lower-half identity map. */
 static uint64_t *pt_alloc_page(void)
 {
-    /* Allocate from low memory (< 4GB) so the PML4 physical address
-     * fits in the 32-bit CR3 loaded by the AP trampoline. High-memory
-     * allocation (> 4GB) would be truncated by the 32-bit mov cr3. */
-    void *phys = mem_alloc_aligned(PAGE_SIZE, PAGE_SIZE);
+    /* Page-table pages MUST be physically isolated from the bottom-up general
+     * pool (mem_alloc_pages/mem_alloc_aligned) that backs the Win32 heap and PE
+     * images. Otherwise a guest HeapAlloc block ends up PHYSICALLY ADJACENT to a
+     * page-table page, and a guest heap overrun overwrites the PTEs — silently
+     * unmapping a 2 MB swath of Core.dll (the UT99 "Preferences crash": PTEs at
+     * PT page 0x01C9D000 found overwritten with guest pointers, PE-PTE=0 i.e. no
+     * paging-API call). So allocate page tables TOP-DOWN (mem_alloc_aligned_high)
+     * so they cluster at the top of RAM, far from the bottom-up heap/PE pool.
+     * High memory here is still < 4 GB for our RAM sizes, so the PML4 physical
+     * address still fits the 32-bit CR3 the AP trampoline loads. */
+    void *phys = mem_alloc_aligned_high(PAGE_SIZE, PAGE_SIZE);
     if (!phys)
-        phys = mem_alloc_aligned_high(PAGE_SIZE, PAGE_SIZE);
+        phys = mem_alloc_aligned(PAGE_SIZE, PAGE_SIZE);
     if (!phys)
         return NULL;
     uint64_t *virt = (uint64_t *)PHYS_TO_VIRT(phys);
