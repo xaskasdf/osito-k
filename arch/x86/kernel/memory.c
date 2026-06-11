@@ -423,6 +423,52 @@ void *mem_alloc_aligned_high(uint64_t size, uint64_t alignment)
     return NULL;
 }
 
+/* ── Top-down allocation bounded to below 4 GB ─────────────────── */
+/*
+ * Same top-down strategy as mem_alloc_aligned_high (cluster away from the
+ * bottom-up Win32 heap/PE pool), but the search starts just below 4 GB
+ * instead of at the top of RAM. Page-table pages allocated here are loaded
+ * into CR3 by the AP trampoline with a 32-bit `mov cr3,eax` in protected
+ * mode (before long mode is enabled) — a PML4 physical address >= 4 GB
+ * would be silently truncated to 32 bits, pointing the AP at garbage page
+ * tables and faulting it during the long-mode transition (the SMP "AP hangs
+ * at Starting AP N" regression on >4 GB RAM configs). Keeping page tables
+ * < 4 GB preserves both the heap-isolation intent and a CR3-loadable base.
+ */
+#define MEM_4GB_PAGE  (0x100000000ULL >> PAGE_SHIFT)  /* 4 GB / 4 KB = 1048576 */
+
+void *mem_alloc_aligned_high_below4g(uint64_t size, uint64_t alignment)
+{
+    uint64_t pages = (size + PAGE_SIZE - 1) >> PAGE_SHIFT;
+    uint64_t align_pages = alignment >> PAGE_SHIFT;
+    if (align_pages == 0) align_pages = 1;
+
+    if (free_pages < pages) return NULL;
+
+    uint64_t limit = max_tracked_page ? max_tracked_page : MAX_PHYS_PAGES;
+    if (limit > MEM_4GB_PAGE) limit = MEM_4GB_PAGE;
+    if (limit < pages) return NULL;
+
+    uint64_t p = (limit - pages) & ~(align_pages - 1);
+
+    while (p >= 4096) {
+        uint64_t ok = 1;
+        for (uint64_t i = 0; i < pages; i++) {
+            if (!bitmap_test(p + i)) { ok = 0; break; }
+        }
+        if (ok) {
+            for (uint64_t i = 0; i < pages; i++) {
+                bitmap_clear(p + i);
+                free_pages--;
+            }
+            return (void *)(p << PAGE_SHIFT);
+        }
+        if (p < align_pages) break;
+        p -= align_pages;
+    }
+    return NULL;
+}
+
 /* ── Info ────────────────────────────────────────────────────── */
 
 uint64_t mem_get_free(void)
