@@ -292,6 +292,69 @@ static BYTE extended_scancode_to_vk(BYTE sc)
 static POINT cursor_pos = { 320, 240 };
 static int   cursor_visible = 1;
 static HWND  capture_hwnd = NULL;
+static HWND  focus_hwnd   = NULL;   /* SetFocus / WM_SETFOCUS target */
+static int   clip_active  = 0;      /* ClipCursor(rect!=NULL) in effect */
+
+/* Relative-delta tracker for the absolute (usb-tablet) pointer while in-game
+ * mouse-look. Invalidated whenever we leave mouse-look so re-entry starts
+ * fresh (no stale-position jump). */
+static int   g_abs_prev_valid = 0;
+static int   g_abs_prev_sx = 0, g_abs_prev_sy = 0;
+
+/*
+ * In-game mouse-look gate. UT99's UWindowsViewport does NOT call user32
+ * SetCapture when it grabs the mouse for mouse-look; instead (see WinDrv
+ * SetMouseCapture @0x11106610) it ShowCursor(FALSE) + ClipCursor(rect) +
+ * SetCursorPos(center) and then, per WM_MOUSEMOVE, reads the absolute cursor
+ * pos, subtracts the recenter origin to get a delta, and SetCursorPos(center)
+ * again. So the reliable "we are in mouse-look" signal in our layer is: the
+ * cursor is hidden (ShowCursor count < 0) or the cursor is clipped, or an
+ * explicit SetCapture is in force. The menu uses none of these (cursor shown,
+ * unclipped, uncaptured) → it keeps the absolute path. */
+static int mouselook_active(void)
+{
+    return (cursor_visible < 0) || clip_active || (capture_hwnd != NULL);
+}
+
+/* The in-game viewport window handle: the most-recently-created *used* window
+ * whose class is UT's viewport window class. Falls back to focus, then to the
+ * last used window. This is the window WinDrv's ViewportWndProc is bound to and
+ * the one that must receive in-game keyboard + mouse input. */
+static int is_viewport_class(const char *name)
+{
+    /* UT registers "UnrealTournamentUnrealWWindowsViewportWindow" (wide→narrow
+     * may corrupt the first char), so match the stable substring. */
+    if (!name) return 0;
+    const char *needle = "ViewportWindow";
+    for (const char *p = name; *p; p++) {
+        const char *a = p, *b = needle;
+        while (*a && *b && *a == *b) { a++; b++; }
+        if (!*b) return 1;
+    }
+    return 0;
+}
+
+static HWND viewport_hwnd(void)
+{
+    for (int i = window_count - 1; i >= 0; i--) {
+        if (windows[i].used && is_viewport_class(windows[i].class_name))
+            return windows[i].handle;
+    }
+    return NULL;
+}
+
+/* Keyboard/mouse input target. In-game (mouse-look) the viewport owns input
+ * regardless of which UWindow was created last; otherwise honor the focused
+ * window (menu/console), then fall back to the last used window. */
+static HWND input_target(void)
+{
+    HWND vp = viewport_hwnd();
+    if (mouselook_active() && vp) return vp;
+    if (focus_hwnd && find_window(focus_hwnd)) return focus_hwnd;
+    for (int i = window_count - 1; i >= 0; i--)
+        if (windows[i].used) return windows[i].handle;
+    return vp;
+}
 
 /* ── Default screen dimensions ─────────────────────────────── */
 
@@ -1138,7 +1201,14 @@ HWND WINAPI GetForegroundWindow(void)
     return NULL;
 }
 
-HWND WINAPI SetFocus(HWND hWnd) { return hWnd; }
+HWND WINAPI SetFocus(HWND hWnd)
+{
+    HWND old = focus_hwnd;
+    /* Only track real windows we know about; NULL clears focus. */
+    if (hWnd == NULL || find_window(hWnd))
+        focus_hwnd = hWnd;
+    return old;
+}
 HWND WINAPI GetDesktopWindow(void) { return (HWND)(ULONG_PTR)0xD0000001; }
 HWND WINAPI GetActiveWindow(void) { return GetForegroundWindow(); }
 
@@ -1167,7 +1237,11 @@ int WINAPI ShowCursor(BOOL bShow)
 
 BOOL WINAPI ClipCursor(const RECT *lpRect)
 {
-    (void)lpRect;
+    /* UT99's viewport calls ClipCursor(rect) when entering mouse-look and
+     * ClipCursor(NULL) when releasing it. Track this so the input path knows
+     * whether to deliver relative deltas (in-game) or absolute coords (menu).
+     * We do not actually constrain the cursor here. */
+    clip_active = (lpRect != NULL);
     return TRUE;
 }
 
@@ -1575,11 +1649,14 @@ void win32_post_keyboard_event(BYTE scancode, BOOL key_up)
      * (windows[i].handle) — find_window() matches by handle, and Window.dll's
      * StaticProc maps hwnd->WWindow by the same handle. Using (i+1) here made
      * find_window() fail (handle 0xA00000xx != i+1), so DispatchMessage dropped
-     * every key to DefWindowProc and the game never saw input. */
-    HWND target = NULL;
-    for (int i = window_count - 1; i >= 0; i--) {
-        if (windows[i].used) { target = windows[i].handle; break; }
-    }
+     * every key to DefWindowProc and the game never saw input.
+     *
+     * input_target() routes to the in-game VIEWPORT window when mouse-look is
+     * active (so WASD/arrows reach UWindowsViewport::ViewportWndProc → the same
+     * CauseInputEvent path ESC/Space already take), and to the focused UWindow
+     * (menu/console) otherwise. This fixes B2: movement keys were landing on a
+     * non-viewport window and never reaching the gameplay input. */
+    HWND target = input_target();
 
     /* Build lParam: scancode in bits 16-23, extended flag in bit 24,
      * previous state in bit 30, transition state in bit 31 */
@@ -1614,11 +1691,10 @@ void win32_post_mouse_event(int dx, int dy, DWORD buttons, short wheel_delta)
     DWORD old_buttons = mouse_buttons;
     mouse_buttons = buttons;
 
-    HWND target = NULL;
-    for (int i = window_count - 1; i >= 0; i--) {
-        if (windows[i].used) { target = windows[i].handle; break; }
-    }
-    if (capture_hwnd) target = capture_hwnd;
+    /* Route to the in-game viewport during mouse-look, else focused window.
+     * The relative-delta accumulation above is already what UE1's recenter
+     * math expects (cursor_pos = recenter_origin + delta). */
+    HWND target = input_target();
 
     LPARAM pos_lp = ((LPARAM)(cursor_pos.y & 0xFFFF) << 16) |
                      (LPARAM)(cursor_pos.x & 0xFFFF);
@@ -1667,17 +1743,15 @@ void win32_post_mouse_event(int dx, int dy, DWORD buttons, short wheel_delta)
  * Bridges the xHCI mouse to the Win32 layer (previously unwired → dead mouse). */
 void win32_post_mouse_abs(int ax, int ay, int lmin, int lmax, DWORD buttons)
 {
-    HWND target = NULL;
     int tw = SCREEN_WIDTH, th = SCREEN_HEIGHT;
     for (int i = window_count - 1; i >= 0; i--) {
         if (windows[i].used) {
-            target = windows[i].handle;
             if (windows[i].width  > 0) tw = windows[i].width;
             if (windows[i].height > 0) th = windows[i].height;
             break;
         }
     }
-    if (capture_hwnd) target = capture_hwnd;
+    HWND target = input_target();
 
     /* Prefer the DDraw render resolution (the 640x480 surface that
      * present_surface_to_gop scales to fill the screen) as the mapping space, so
@@ -1690,12 +1764,44 @@ void win32_post_mouse_abs(int ax, int ay, int lmin, int lmax, DWORD buttons)
 
     int range = lmax - lmin;
     if (range <= 0) range = 1;
-    int nx = (int)(((int64_t)(ax - lmin) * (tw - 1)) / range);
-    int ny = (int)(((int64_t)(ay - lmin) * (th - 1)) / range);
-    if (nx < 0) nx = 0; else if (nx >= tw) nx = tw - 1;
-    if (ny < 0) ny = 0; else if (ny >= th) ny = th - 1;
+    /* Scale the absolute tablet coordinate into client space. */
+    int sx = (int)(((int64_t)(ax - lmin) * (tw - 1)) / range);
+    int sy = (int)(((int64_t)(ay - lmin) * (th - 1)) / range);
+    if (sx < 0) sx = 0; else if (sx >= tw) sx = tw - 1;
+    if (sy < 0) sy = 0; else if (sy >= th) sy = th - 1;
 
-    int moved = (nx != cursor_pos.x) || (ny != cursor_pos.y);
+    int nx, ny, moved;
+
+    if (mouselook_active()) {
+        /* In-game mouse-look. UE1 recenters the cursor every frame via
+         * SetCursorPos and reads (cursor_pos - recenter_origin) as the delta.
+         * A QEMU usb-tablet is an ABSOLUTE device, so derive a relative delta
+         * from the previous tablet sample and ADD it to cursor_pos (which the
+         * engine just reset to the recenter origin via our SetCursorPos). This
+         * makes GetCursorPos return the recenter origin and each WM_MOUSEMOVE
+         * carry origin+delta — exactly what WinDrv's recenter math expects.
+         * We must NOT snap cursor_pos to the absolute sample (that destroys the
+         * delta and yields "viewport not connected" / dead mouse-look). */
+        int dx = 0, dy = 0;
+        if (g_abs_prev_valid) { dx = sx - g_abs_prev_sx; dy = sy - g_abs_prev_sy; }
+        g_abs_prev_sx = sx; g_abs_prev_sy = sy; g_abs_prev_valid = 1;
+
+        nx = cursor_pos.x + dx;
+        ny = cursor_pos.y + dy;
+        /* Keep within client bounds; the engine's SetCursorPos(center) recenter
+         * keeps us away from the edges in practice. */
+        if (nx < 0) nx = 0; else if (nx >= tw) nx = tw - 1;
+        if (ny < 0) ny = 0; else if (ny >= th) ny = th - 1;
+        moved = (dx != 0 || dy != 0);
+    } else {
+        /* Menu / UI: absolute path (unchanged — keeps the working menu mouse).
+         * Invalidate the relative tracker so re-entering mouse-look doesn't
+         * inject a spurious jump from a stale tablet position. */
+        g_abs_prev_valid = 0;
+        nx = sx; ny = sy;
+        moved = (nx != cursor_pos.x) || (ny != cursor_pos.y);
+    }
+
     cursor_pos.x = nx;
     cursor_pos.y = ny;
 
