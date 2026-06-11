@@ -145,7 +145,11 @@ obj=`ebx=0x401FFC00`). So a config/property object carries a corrupt FName index
 bugs, surfacing in the settings-enumeration path. ROOT (why that object's Name
 index is garbage) is unresolved — deep object-corruption hunt.
 
-## B9 — SEH dispatch can't read unmapped EH-handler pages (double-fault)
+## B9 — [CLOSED: duplicate of B8] not-present Core.dll pages during Preferences
+**Resolution (2026-06-11):** root-caused as a pure **symptom of B8** (FName
+corruption wild-writing page-table memory → Core.dll pages go not-present → guest
+instruction-faults). See "Analysis 3" below. No independent fix exists; fixing B8
+removes B9. History retained below for the paging-layer lessons.
 **Symptom:** the B8 AV (recoverable; UE1 guards config code) becomes FATAL because
 our SEH dispatch double-faults the KERNEL while handling it.
 **Captured:** `compat32_seh_dispatch` reads the SEH frame's handler bytes at
@@ -186,6 +190,52 @@ primitive. **CRITICAL — HOW to invoke it:**
   works. A #PF-handler hook may stay ONLY as a backstop for non-IST3 contexts.
 Pair with fixing B8's root so the AV doesn't fire at all. Focused paging-layer
 task — do it carefully, it's in the critical exception path.
+
+**Attempt 2 — PRE-PROBE, built + tested (2026-06-08, REVERTED as incomplete):**
+implemented `pe_image_fixup_page` (winexec.c, phys-tracked) + `paging_va_present`
+(paging.c, CR3 walk) + `seh_ensure_pe` pre-probes in compat32_seh_dispatch and the
+compat32_dispatch FName read. With B3 fixed (so the New-Game CR2=0x40 no longer
+masks the result), Preferences was tested cleanly. RESULT: the pre-probe MECHANISM
+WORKS — `[PEFIX] repaired PE page 0x10295000 -> PA 0x01C7B000` fired (FName::Names
+page repaired, content correct since the engine kept running). BUT it's
+**whack-a-mole**: the next fault moved to `isr_handler` (idt.c) itself reading a
+not-present Core.dll code page (`CR2=0x10102E14`) in the CRASH-DUMP path — a guest
+PE read OUTSIDE the dispatcher pre-probes. Recovered to shell (no triple-fault).
+So Preferences still crashes. TWO remaining problems: (1) MANY kernel paths read
+guest PE memory (dispatcher + isr_handler diagnostics/EBP-walk/code-dump); pre-
+probing each is fragile — the ROOT (why eagerly-mapped Core.dll pages go
+not-present) must be found instead. NOT memcompress (inactive, doesn't target PE).
+Candidates: the 2MB→4KB split TLB dance (paging.c ~139, QEMU-TCG stale entries), or
+a later remap. (2) Even with all reads repaired, the AV is B8 (corrupt FName index)
+so UE1's catch may not fully recover → Preferences may not open. Also: the pre-probe
+adds a CR3 page-walk to EVERY INT2E (thousands/frame) = real gameplay overhead.
+REVERTED to keep B3 clean + no overhead. **Next time:** find the not-present-PE ROOT
+(instrument what unmaps the page between pe_alloc and the fault), fix B8's index, and
+only then the dispatcher reads + isr_handler dump are moot.
+
+**Analysis 3 — root resolved: B9 IS a symptom of B8 (2026-06-11).** Re-read the live
+fault trail with B3 fixed. The FIRST fault of the Preferences crash is NOT a
+dispatcher read — it is the **guest itself instruction-fetching a not-present page**:
+`[EXC32] vec=14 RIP=0x10102E14 err=0x10 CR2=0x10102E14` (`err` bit4=1 ⇒ I-fetch,
+bit0=0 ⇒ not-present). `0x10102000` is the *second page of Core.dll `.text`*
+(`.text` VMA 0x10101000) — code the menu runs on constantly, so it was mapped and
+went **not-present at runtime**. It faults immediately after
+`[wcscpy] src=L"0" dst=0x42930074 inner_eip=0x10122E80 outer_eip=0x1010796D` — the
+B8 corrupt-FName write. Disasm of `0x10107900` (objdump Core.dll) shows an
+FString-build (`rep movs` + the `wcscpy` thunk at `0x10122e80→IAT`) **appending the
+decimal string "0"** = the classic index-0/None0 FName signature; `dst=0x42930074`
+is a wild heap pointer. The other not-present page `0x10295000` (PEFIX-repaired)
+sits in Core.dll's `.data`→`.idata` **section gap** (.data ends 0x101b4000, .idata
+0x102ab000) — mapped (zero-filled) by whole-image `pe_alloc` but never section-backed.
+The two dead pages are in **different 2MB regions** (0x101xxxxx vs 0x102xxxxx) ⇒
+**two separate page-table corruptions**, consistent with B8 wild writes landing on
+page-table physical pages (`pt_alloc_page` draws from the same low-mem pool as PE
+backing and the engine heap, so a corrupt FName pointer can clobber a PT page →
+clears 512 PTEs = a 2MB swath of Core.dll). **Conclusion:** NO paging-layer repair
+(pre-probe, #PF fixup) can fix B9 — they are band-aids for memory the engine itself
+is corrupting. **B9 is closed as a duplicate of B8.** The single fix is B8's corrupt
+FName index/pointer (the long-running None0/FName-table saga, here surfacing in the
+`.int`-driven Preferences-enumeration path). See `project_ut99_b9_is_b8_symptom`.
 
 ---
 
