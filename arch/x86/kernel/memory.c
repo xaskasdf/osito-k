@@ -116,6 +116,15 @@ void __initk mem_init(void *mmap, uint64_t mmap_size, uint64_t desc_size)
         }
     }
 
+    /* Clamp the top-down search bound to the bitmap. max_tracked_page is
+     * built ONLY from usable descriptors (conventional + freed boot
+     * services), so it never points at MMIO/reserved ranges — but a
+     * descriptor may extend past MAX_PHYS_PAGES, and mem_alloc_aligned_high
+     * starts its cursor AT this value, so it must stay inside what the
+     * bitmap actually tracks. */
+    if (max_tracked_page > MAX_PHYS_PAGES)
+        max_tracked_page = MAX_PHYS_PAGES;
+
     serial_puts("[MEM] Memory manager initialized\n");
     serial_puts("[MEM] Total: ");
     serial_putdec(total_memory / (1024 * 1024));
@@ -153,6 +162,70 @@ void mem_reserve_kernel(uint64_t phys_base, uint64_t size)
     serial_puts("[MEM] Reserved kernel region: 0x");
     serial_puthex(phys_base, 16);
     serial_puts(" (");
+    serial_putdec(reserved);
+    serial_puts(" pages)\n");
+}
+
+/* ── Reserve the UEFI boot stack (the kernel never switches off it) ── */
+/*
+ * boot.efi calls kernel_entry() on the firmware-provided DXE stack
+ * (EfiBootServicesData, ~0x7FE60000 on QEMU q35/2GB — see the
+ * WIN32_VA_LIMIT comment in win32/ntsyscall.c). The kernel — and the
+ * shell, whose setjmp buffer and saved callee registers live in those
+ * frames — runs on that stack for its entire life; there is no stack
+ * switch. mem_init() marks EfiBootServicesData as FREE, which is legal
+ * per the UEFI spec for memory we are NOT still standing on, but the
+ * live stack ended up unaccounted in the phys bitmap.
+ *
+ * That was harmless while every allocator searched bottom-up, but
+ * pt_alloc_page() now allocates page-table pages TOP-DOWN
+ * (mem_alloc_aligned_high walks down from max_tracked_page). After a
+ * long Win32 session (hundreds of PT pages from 2MB splits) the cursor
+ * reached the live stack: memset(pt, 0, 4096) zeroed live frames and
+ * subsequent PTE stores clobbered stack spills — observed as
+ * kfree(0x800000005E5EE063) (a raw PTE value as a pointer) #GP with
+ * PTE values in the caller's saved r12/r15. Same failure family as the
+ * UEFI GDT relocation in idt.c.
+ *
+ * Fix at the accounting layer: mark a window around the entry RSP as
+ * used so BOTH the bottom-up and top-down allocators respect it. The
+ * region is derived from the actual boot RSP (captured in
+ * kernel_entry), not a hardcoded address, so it also holds under kexec
+ * or a different firmware layout. The boot stack is identity-mapped
+ * (VA == phys) at entry and stays that way, so RSP is usable as a
+ * physical address directly.
+ */
+void __initk mem_reserve_boot_stack(uint64_t boot_rsp)
+{
+    /* OVMF's DXE stack is 128 KB. Reserve a generous guard BELOW the
+     * entry RSP (the kernel main thread's whole call depth lives
+     * there) and the frames already in use ABOVE it (efi_main locals,
+     * including the boot_info struct the loader passed by pointer). */
+    const uint64_t guard_below = 512 * 1024;
+    const uint64_t guard_above = 128 * 1024;
+
+    uint64_t lo = (boot_rsp > guard_below) ? (boot_rsp - guard_below) : 0;
+    lo &= ~(uint64_t)(PAGE_SIZE - 1);
+    uint64_t hi = (boot_rsp + guard_above + PAGE_SIZE - 1) & ~(uint64_t)(PAGE_SIZE - 1);
+
+    uint64_t reserved = 0;
+    for (uint64_t p = lo >> PAGE_SHIFT; p < (hi >> PAGE_SHIFT) && p < MAX_PHYS_PAGES; p++) {
+        if (bitmap_test(p)) {
+            bitmap_clear(p);
+            free_pages--;
+            reserved++;
+        }
+    }
+
+    /* Boot-time diagnostic so the operator can confirm in serial that
+     * the top-down PT cursor can no longer reach the live stack. */
+    serial_puts("[MEM] reserved top region 0x");
+    serial_puthex(lo, 16);
+    serial_puts("-0x");
+    serial_puthex(hi, 16);
+    serial_puts(" (boot stack, rsp=0x");
+    serial_puthex(boot_rsp, 16);
+    serial_puts(", ");
     serial_putdec(reserved);
     serial_puts(" pages)\n");
 }
