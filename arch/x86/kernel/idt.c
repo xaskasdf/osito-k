@@ -326,14 +326,18 @@ struct tss64 kernel_tss __attribute__((aligned(16)));
 uint64_t *tss_ist1_ptr;  /* = &kernel_tss.ist1, set in tss_init() */
 uint64_t *tss_ist2_ptr;  /* = &kernel_tss.ist2, for DOS INT stubs */
 
-/* IST1 stack for INT 0x2E — 256KB.
- * int2e_stub.S reserves 32KB per nest (subq $32768). UT99's C++ EH
- * unwind chain re-throws through 3-4 catches → 3-4 nested INT 0x2E
- * entries → 96-128KB needed. 64KB was overflowing into garbage and
- * corrupting RtlRaiseException's locals → unwind globals stayed set
- * from a prior catch → next int2e_stub iret jumped to stale catch
- * with stale ESP/EBP → user-stack execution → #BR. */
-#define IST1_STACK_SIZE 262144
+/* IST1 stack for INT 0x2E — 1MB.
+ * int2e_stub.S reserves 16KB per nest (subq $16384). UT99's C++ EH
+ * unwind chain re-throws DEEPLY during the boot exception storm (the
+ * FName/package recovery throws ~30 C++ exceptions, several nesting via
+ * appUnwindf re-throw) → that many nested INT 0x2E entries. 256KB at
+ * 32KB/level = only 8 levels: deeper storms walked IST1 BELOW this array
+ * into kernel BSS/.text and corrupted it → flaky boot #UD / wild kernel
+ * write (CR2 in the kernel-image range, RSP pointing into .text). Adding
+ * unrelated kernel BSS shifted what got clobbered and made it
+ * deterministic. 1MB at 16KB/level = 64 nesting levels with ample
+ * per-level headroom (the kernel call chain per level is ~1-3KB). */
+#define IST1_STACK_SIZE 1048576
 uint8_t ist1_stack[IST1_STACK_SIZE] __attribute__((aligned(16)));
 
 /* IST2 stack for DOS INTs + #DB — 32KB */
@@ -1407,6 +1411,29 @@ void isr_handler(interrupt_frame_t *frame)
             static int null_call_count = 0;
             null_call_count++;
 
+            /* [RET0-DIAG] Always dump the recent native-shim call ring on the
+             * first few near-NULL instruction-fetch faults, even when the
+             * call-site can't be decoded as `call *disp32(reg)` (e.g. a RET to a
+             * corrupted return address — the char-select-3x crash: RIP=0x13,
+             * stack zeroed). The last shim in the ring is the prime suspect for
+             * a wrong arg-count that over/under-cleaned the caller's stack. */
+            if (null_call_count <= 3) {
+                serial_puts("[RET0-DIAG] near-NULL fetch RIP=0x");
+                serial_puthex(frame->rip & 0xFFFFFFFF, 8);
+                serial_puts(" ESP=0x"); serial_puthex(frame->rsp & 0xFFFFFFFF, 8);
+                serial_puts(" EBP=0x"); serial_puthex((uint32_t)frame->rbp, 8);
+                serial_puts(" EBX=0x"); serial_puthex((uint32_t)frame->rbx, 8);
+                serial_puts(" ESI=0x"); serial_puthex((uint32_t)frame->rsi, 8);
+                serial_puts("\n  recent stack dwords:");
+                uint32_t *sp = (uint32_t *)(uintptr_t)(frame->rsp & 0xFFFFFFFF);
+                for (int si = 0; si < 12; si++) {
+                    serial_puts(" 0x"); serial_puthex(sp[si], 8);
+                }
+                serial_puts("\n");
+                extern void compat32_dump_recent_calls(void);
+                compat32_dump_recent_calls();
+            }
+
             /* Diagnostic: for indirect calls (call *offset(reg)), dump
              * the vtable pointer and the target entry so we can see why
              * the function pointer is NULL. */
@@ -1433,7 +1460,13 @@ void isr_handler(interrupt_frame_t *frame)
                     serial_puts(rn[reg]);
                     serial_puts(") vtbl=0x"); serial_puthex(vtbl, 8);
                     serial_puts(" this=0x"); serial_puthex((uint32_t)frame->rdi, 8);
+                    serial_puts(" callsite=0x"); serial_puthex(retaddr32 - 6, 8);
+                    serial_puts(" ret=0x"); serial_puthex(retaddr32, 8);
                     serial_puts("\n");
+                    /* Dump recent native calls to find the shim that corrupted
+                     * the caller before this NULL virtual call (New-Game crash). */
+                    { extern void compat32_dump_recent_calls(void);
+                      compat32_dump_recent_calls(); }
                     /* Dump registers and object for Browse call */
                     if (disp == 0xB0) {
                         serial_puts("  ECX=0x"); serial_puthex((uint32_t)frame->rcx, 8);
@@ -1928,6 +1961,18 @@ void isr_handler(interrupt_frame_t *frame)
                 serial_puts("\n");
                 if (prev_ebp <= ebp) break;  /* prevent infinite loops */
                 ebp = prev_ebp;
+            }
+            /* [BPDIAG] On a compat-mode fatal exception (covers #BP at 0xCC
+             * thunk-pool tail and #PF), dump the recent native-shim call ring
+             * once so we can see which shim/path produced the garbage
+             * call/return target (map-select recovery-cascade crash). */
+            {
+                static int bpdiag_done = 0;
+                if (!bpdiag_done) {
+                    bpdiag_done = 1;
+                    extern void compat32_dump_recent_calls(void);
+                    compat32_dump_recent_calls();
+                }
             }
         }
 

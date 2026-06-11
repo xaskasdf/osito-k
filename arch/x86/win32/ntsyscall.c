@@ -509,6 +509,7 @@ NTSTATUS sys_NtReadFile(ULONG_PTR *args)
     if (offset + to_read > (ULONGLONG)fobj->size)
         to_read = (ULONG)(fobj->size - offset);
 
+#ifndef OK_QUIET
     serial_puts("[NtReadFile] h=0x");
     serial_puthex((uint64_t)FileHandle, 4);
     serial_puts(" buf=0x");
@@ -520,6 +521,7 @@ NTSTATUS sys_NtReadFile(ULONG_PTR *args)
     serial_puts(" fsz=");
     serial_puthex(fobj->size, 8);
     serial_puts("\n");
+#endif
 
     /*
      * Buffered I/O: read into a kernel-allocated temp buffer, then copy
@@ -559,9 +561,11 @@ NTSTATUS sys_NtReadFile(ULONG_PTR *args)
         result = osfs2_read(fobj->osfs_file, (uint64_t)offset, Buffer, to_read);
     }
 
+#ifndef OK_QUIET
     serial_puts("[NtReadFile] result=");
     serial_puthex((uint64_t)(int64_t)result, 8);
     serial_puts("\n");
+#endif
 
     /* Dump first 16 bytes as hex for localization debugging */
     if (result > 0 && result <= 8192 && offset == 0) {
@@ -1376,6 +1380,14 @@ static NTSTATUS sys_NtStub(ULONG_PTR *args)
 
 void nt_syscall_init(NT_SERVICE_TABLE *table)
 {
+    /* Re-exec reset: the VA bump allocator and its tracking must restart, or a
+     * relaunched PE's VirtualAllocs continue above the previous run's watermark
+     * and exhaust WIN32_VA_LIMIT after a few relaunches (old phys leaks, bounded
+     * by relaunch count). */
+    win32_va_next = WIN32_VA_BASE;
+    vm_track_count = 0;
+    vm_freelist_count = 0;
+
     /* Fill all slots with stub */
     for (ULONG i = 0; i < NTSYS_MAX; i++) {
         table->handlers[i]   = sys_NtStub;

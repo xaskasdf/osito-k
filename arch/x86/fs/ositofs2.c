@@ -76,6 +76,8 @@ static inline int blk_bitmap_test(uint32_t blk)
     return (blk_bitmap[blk / 8] >> (blk % 8)) & 1;
 }
 
+static int blk_range_free(uint32_t start, uint32_t count);  /* fwd decl (fsck) */
+
 /* Rebuild bitmap from file table (called on mount) */
 static void blk_bitmap_rebuild(void)
 {
@@ -85,10 +87,48 @@ static void blk_bitmap_rebuild(void)
     for (uint32_t i = 0; i < data_start; i++)
         blk_bitmap_set(i);
 
-    /* Mark each valid file's blocks */
+    /* Mark each valid file's blocks — in TWO passes so stale/duplicate extents
+     * can't keep a live file's data blocks. This is a mount-time fsck (run once,
+     * mount-only). Motivating bug: an old allocator handed UnrealTournament.log
+     * (size 0) the SAME block as Entry.unr (11617 B); the engine reopened that
+     * stale log entry and its write clobbered Entry.unr's package data, so a
+     * later read of Entry.unr returned "Log:" text → "ReadFile beyond EOF" →
+     * an unrecoverable C++ throw cascade that reset the session at the menu. */
+
+    /* Pass 1: real files (size>0) are authoritative. On overlap (corruption),
+     * drop the LATER claimant so it can't keep a live file's blocks. */
     for (uint32_t i = 0; i < OSFS2_MAX_FILES; i++) {
-        if (!(file_table[i].flags & OSFS2_FLAG_VALID)) continue;
         osfs2_file_t *f = &file_table[i];
+        if (!(f->flags & OSFS2_FLAG_VALID)) continue;
+        if (f->size == 0 || f->block_count == 0) continue;
+        if (!blk_range_free(f->start_block, f->block_count)) {
+            serial_puts("[OsitoFS] fsck: '");
+            serial_puts(f->name);
+            serial_puts("' extent overlaps a live file — dropping (corrupt)\n");
+            f->flags &= ~OSFS2_FLAG_VALID;
+            continue;
+        }
+        for (uint32_t b = 0; b < f->block_count; b++)
+            blk_bitmap_set(f->start_block + b);
+    }
+
+    /* Pass 2: empty files (size==0) that still CLAIM data blocks. A size-0 file
+     * whose block overlaps a real file is stale corruption (the log-on-Entry.unr
+     * case): writing it would clobber the real file. Drop it (no data to lose) +
+     * release its block; the owner re-creates it cleanly via the fixed allocator. */
+    for (uint32_t i = 0; i < OSFS2_MAX_FILES; i++) {
+        osfs2_file_t *f = &file_table[i];
+        if (!(f->flags & OSFS2_FLAG_VALID)) continue;
+        if (f->size != 0 || f->block_count == 0) continue;
+        if (!blk_range_free(f->start_block, f->block_count)) {
+            serial_puts("[OsitoFS] fsck: empty '");
+            serial_puts(f->name);
+            serial_puts("' claims a live block — dropping (stale)\n");
+            f->flags &= ~OSFS2_FLAG_VALID;
+            f->start_block = 0;
+            f->block_count = 0;
+            continue;
+        }
         for (uint32_t b = 0; b < f->block_count; b++)
             blk_bitmap_set(f->start_block + b);
     }

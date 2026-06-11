@@ -87,6 +87,7 @@ extern void fb_puthex(uint64_t val, int digits);
 /* Memory */
 extern void mem_init(void *mmap, uint64_t mmap_size, uint64_t desc_size);
 extern void mem_reserve_kernel(uint64_t phys_base, uint64_t size);
+extern void mem_reserve_boot_stack(uint64_t boot_rsp);
 extern void *mem_alloc_pages(uint64_t count);
 
 /* ACPI RSDP — set from boot_info, read by smp.c */
@@ -336,6 +337,15 @@ void __initk kernel_entry(boot_info_t *info)
     } while (0)
     KEXEC_PROBE("[KEXEC-PATH] kernel_entry\n");
 
+    /* Capture the entry RSP NOW, before any deeper frames. We arrive on
+     * the firmware-provided UEFI stack (EfiBootServicesData) and never
+     * switch off it — mem_init() below marks BootServicesData free, so
+     * this exact window must be re-reserved in the phys bitmap or the
+     * top-down page-table allocator eventually hands out our live stack
+     * (see mem_reserve_boot_stack in memory.c). */
+    uint64_t boot_rsp;
+    __asm__ volatile ("mov %%rsp, %0" : "=r"(boot_rsp));
+
     /* ── Step -1: Zero BSS (UEFI AllocatePages returns zeroed memory, but
      * the kernel's BSS extends beyond the file-backed data segment) ── */
     {
@@ -396,6 +406,13 @@ void __initk kernel_entry(boot_info_t *info)
     /* Reserve kernel pages so allocator doesn't hand them out */
     if (info->kernel_phys_base && info->kernel_size)
         mem_reserve_kernel(info->kernel_phys_base, info->kernel_size);
+
+    /* Reserve the UEFI boot stack we are still running on. Must happen
+     * before ANY page allocation: mem_init just marked the stack's
+     * BootServicesData pages free, and both the shadow-FB bottom-up
+     * alloc and pt_alloc_page's top-down cursor could otherwise land
+     * on live frames. */
+    mem_reserve_boot_stack(boot_rsp);
 
     /* Compute system capabilities from actual hardware */
     {
@@ -1045,7 +1062,12 @@ void __initk kernel_entry(boot_info_t *info)
         cluster_fs_ready();
 
         static gguf_model_t gguf_model;
+#ifdef OK_SKIP_MODEL
+        serial_puts("[BOOT] SKIP_MODEL=1 — bypassing GGUF/LLM load (fast boot)\n");
+        if (0) { /* model load disabled */
+#else
         if (gguf_load(&gguf_model) == 0 && gguf_model.num_tensors > 0) {
+#endif
             static gguf_tokenizer_t gtok;
             if (gguf_load_tokenizer(&gguf_model, &gtok) == 0) {
                 extern int tok_init(void *, const char **,

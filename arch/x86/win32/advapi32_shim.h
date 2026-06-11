@@ -92,6 +92,11 @@ LONG WINAPI RegCreateKeyExW(HKEY hKey, PCWSTR lpSubKey, DWORD Reserved,
 LONG WINAPI RegSetValueExW(HKEY hKey, PCWSTR lpValueName, DWORD Reserved,
                            DWORD dwType, const BYTE *lpData, DWORD cbData);
 
+/* Installer hook: write a value at an already-normalized lowercase backslash
+ * registry path (e.g. "hklm\\software\\app"). Used by the MSI Registry table. */
+void advapi32_reg_install_set(const char *path_lc_backslash, const char *name,
+                             DWORD type, const void *data, DWORD len);
+
 /* ── Shim init / resolve ───────────────────────────────────── */
 
 PVOID advapi32_shim_init(void);

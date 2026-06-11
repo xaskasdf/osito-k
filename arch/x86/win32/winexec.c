@@ -392,6 +392,12 @@ int winexec_run(const uint8_t *file_data, uint64_t file_size)
 {
     serial_puts("\n=== OsitoK Windows Compatibility Layer ===\n");
 
+    /* Re-exec support: clear the PE VA-range tracker so a relaunch maps the PE
+     * (and its DLLs) at their preferred ImageBases again — pe_alloc re-maps the
+     * VAs to fresh phys (old phys leaks), instead of seeing them as occupied and
+     * relocating. Other subsystems re-init below via *_shim_init / dll_loader_init. */
+    pe_va_count = 0;
+
     /* Create Win32 per-process page table (fixes VirtualAlloc aliasing) */
     {
         extern uint64_t paging_create_win32_cr3(void);
@@ -417,6 +423,8 @@ int winexec_run(const uint8_t *file_data, uint64_t file_size)
     ntdll_shim_init();
     kernel32_shim_init();
     msvcrt_shim_init();
+    user32_shim_init();   /* re-exec: window/input/activation state reset */
+    ddraw_shim_init();    /* re-exec: surfaces/COM proxies/display-mode reset */
 
     /* Initialize DLL loader and register built-in shims */
     dll_loader_init();

@@ -134,6 +134,12 @@ void dll_loader_init(void)
 {
     module_count = 0;
     shim_count = 0;
+    /* Re-exec: scrub stale module records (base addrs / export tables of the
+     * previous run) so nothing can resolve against a dead image. */
+    for (int i = 0; i < MAX_LOADED_MODULES; i++) {
+        uint8_t *p = (uint8_t *)&modules[i];
+        for (unsigned j = 0; j < sizeof(modules[i]); j++) p[j] = 0;
+    }
 
     /* Built-in shims are registered by winexec.c after calling this */
 }

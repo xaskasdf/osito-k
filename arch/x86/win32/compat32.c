@@ -47,6 +47,60 @@ uint32_t g_compat32_unwind_ebp = 0;
 #define THUNK_POOL_PAGES 32      /* 32 pages = 2048 thunks */
 
 static uint8_t *thunk_pool = NULL;
+
+/* B3 fix: native 32-bit qsort/bsearch blob (clang -m32, position-independent,
+ * no relocations; qsort@0, bsearch@0x1a0). Installed in PE-executable low memory
+ * and used as the MSVCRT qsort/bsearch import so the guest calls them NATIVELY in
+ * 32-bit mode and the comparator runs 32->32 native — NO INT 0x2E, NO compat32
+ * callback round-trip, NO IST1 drift (which corrupted state and triple-faulted
+ * New Game when crt_qsort called compat32_callback_args per comparison). Source:
+ * arch/x86/scripts/qsort32.c. */
+#define QSORT32_BSEARCH_OFF 0x1a0
+static uint32_t qsort32_blob_addr = 0;
+static const unsigned char qsort32_blob[498] = {
+    0x55,0x89,0xe5,0x53,0x57,0x56,0x83,0xec,0x2c,0x83,0x7d,0x0c,
+    0x02,0x0f,0x82,0x77,0x01,0x00,0x00,0x8b,0x75,0x10,0x89,0xf0,
+    0x83,0xe0,0xe0,0x89,0x45,0xf0,0x89,0xf0,0x83,0xe0,0xfc,0x89,
+    0x45,0xcc,0x89,0xf3,0xf7,0xdb,0x8b,0x7d,0x08,0x8d,0x0c,0x37,
+    0x83,0xc1,0x10,0x8d,0x57,0x10,0x01,0xfe,0xb8,0x01,0x00,0x00,
+    0x00,0x89,0x5d,0xec,0xeb,0x32,0x66,0x66,0x66,0x66,0x66,0x2e,
+    0x0f,0x1f,0x84,0x00,0x00,0x00,0x00,0x00,0x8b,0x45,0xdc,0x40,
+    0x8b,0x4d,0xd0,0x01,0xd1,0x89,0xd7,0x8b,0x55,0xd4,0x01,0xfa,
+    0x8b,0x75,0xd8,0x01,0xfe,0x8b,0x7d,0xe0,0x03,0x7d,0x10,0x3b,
+    0x45,0x0c,0x0f,0x84,0x16,0x01,0x00,0x00,0x89,0x7d,0xe0,0x89,
+    0x75,0xd8,0x89,0x55,0xd4,0x89,0x55,0xe4,0x89,0x4d,0xd0,0x89,
+    0x4d,0xe8,0x89,0x45,0xdc,0x8b,0x55,0x10,0xeb,0x16,0x66,0x90,
+    0x01,0x5d,0xe8,0x01,0x5d,0xe4,0x01,0xde,0x01,0xdf,0x8b,0x45,
+    0xc8,0x85,0xc0,0x8b,0x55,0x10,0x74,0xac,0x8d,0x48,0xff,0x89,
+    0x4d,0xc8,0x8d,0x48,0xff,0x0f,0xaf,0xca,0x8b,0x55,0x08,0x01,
+    0xd1,0x0f,0xaf,0x45,0x10,0x01,0xd0,0x50,0x51,0xff,0x55,0x14,
+    0x8b,0x55,0x10,0x83,0xc4,0x08,0x85,0xc0,0x7e,0x86,0x85,0xd2,
+    0x74,0xc2,0x31,0xc0,0x83,0x7d,0x10,0x04,0x0f,0x82,0x96,0x00,
+    0x00,0x00,0x31,0xc9,0x83,0x7d,0x10,0x20,0x72,0x52,0x31,0xc0,
+    0x8b,0x4d,0xf0,0x8b,0x55,0xe4,0x8b,0x5d,0xe8,0x0f,0x1f,0x00,
+    0x0f,0x10,0x44,0x02,0xf0,0x0f,0x10,0x0c,0x02,0x0f,0x10,0x54,
+    0x03,0xf0,0x0f,0x10,0x1c,0x03,0x0f,0x11,0x54,0x02,0xf0,0x0f,
+    0x11,0x1c,0x02,0x0f,0x11,0x44,0x03,0xf0,0x0f,0x11,0x0c,0x03,
+    0x83,0xc0,0x20,0x39,0xc1,0x75,0xd5,0x39,0x4d,0x10,0x8b,0x5d,
+    0xec,0x0f,0x84,0x69,0xff,0xff,0xff,0x8b,0x45,0xf0,0x89,0xc1,
+    0x8b,0x55,0x10,0xf6,0xc2,0x1c,0x74,0x3c,0x8b,0x5d,0xcc,0x66,
+    0x0f,0x1f,0x84,0x00,0x00,0x00,0x00,0x00,0x8b,0x04,0x0f,0x8b,
+    0x14,0x0e,0x89,0x14,0x0f,0x89,0x04,0x0e,0x83,0xc1,0x04,0x39,
+    0xcb,0x75,0xed,0x89,0xd8,0x39,0x5d,0x10,0x8b,0x5d,0xec,0x0f,
+    0x84,0x2f,0xff,0xff,0xff,0x66,0x66,0x66,0x66,0x66,0x66,0x2e,
+    0x0f,0x1f,0x84,0x00,0x00,0x00,0x00,0x00,0x0f,0xb6,0x0c,0x07,
+    0x0f,0xb6,0x14,0x06,0x88,0x14,0x07,0x88,0x0c,0x06,0x40,0x89,
+    0xd9,0x01,0xc1,0x75,0xeb,0xe9,0x06,0xff,0xff,0xff,0x83,0xc4,
+    0x2c,0x5e,0x5f,0x5b,0x5d,0xc3,0x66,0x66,0x66,0x66,0x66,0x2e,
+    0x0f,0x1f,0x84,0x00,0x00,0x00,0x00,0x00,0x55,0x89,0xe5,0x53,
+    0x57,0x56,0x83,0xec,0x08,0x31,0xff,0x8b,0x4d,0x10,0x66,0x90,
+    0x89,0xcb,0x29,0xfb,0x76,0x30,0xd1,0xeb,0x8d,0x34,0x3b,0x89,
+    0x75,0xf0,0x0f,0xaf,0x75,0x14,0x03,0x75,0x0c,0x56,0xff,0x75,
+    0x08,0x89,0x4d,0xec,0xff,0x55,0x18,0x8b,0x4d,0xec,0x83,0xc4,
+    0x08,0x85,0xc0,0x8d,0x44,0x3b,0x01,0x0f,0x48,0x4d,0xf0,0x0f,
+    0x49,0xf8,0x75,0xcc,0xeb,0x02,0x31,0xf6,0x89,0xf0,0x83,0xc4,
+    0x08,0x5e,0x5f,0x5b,0x5d,0xc3,
+};
 static uint32_t thunk_count = 0;
 
 static compat32_thunk_t thunk_table[COMPAT32_MAX_THUNKS];
@@ -135,6 +189,40 @@ uint32_t compat32_get_last_caller_eip(void) { return g_last_caller_eip; }
  * entry. Used by VirtualAlloc shim to walk the user stack chain. */
 uint32_t g_last_stack_args = 0;
 uint32_t compat32_get_last_stack_args(void) { return g_last_stack_args; }
+
+/* Recent-native-call ring buffer (diagnostic): records every INT 0x2E shim
+ * dispatch (no serial I/O) so the #PF/NULL-CALL handler can dump the last ~24
+ * native calls before a crash — to find a shim whose wrong arg-count/return
+ * corrupted the caller's registers/stack (the New-Game LocalMapURL NULL-vtable
+ * crash). Safe to add now that the IST1 stack-overflow is fixed. */
+const char *g_rcall_name[64];
+uint32_t    g_rcall_args[64][4];
+uint8_t     g_rcall_nargs[64];
+uint32_t    g_rcall_caller[64];
+uint32_t    g_rcall_idx = 0;
+
+void compat32_dump_recent_calls(void)
+{
+    serial_puts("[RCALL] last native calls before fault (oldest->newest):\n");
+    uint32_t start = (g_rcall_idx >= 24) ? g_rcall_idx - 24 : 0;
+    for (uint32_t k = start; k < g_rcall_idx; k++) {
+        uint32_t ri = k & 63;
+        serial_puts("  ");
+        serial_putdec(k);
+        serial_puts(": ");
+        serial_puts(g_rcall_name[ri] ? g_rcall_name[ri] : "?");
+        serial_puts(" (");
+        serial_putdec(g_rcall_nargs[ri]);
+        serial_puts(" args) caller=0x");
+        serial_puthex(g_rcall_caller[ri], 8);
+        serial_puts(" a=[0x");
+        serial_puthex(g_rcall_args[ri][0], 8);
+        serial_puts(" 0x"); serial_puthex(g_rcall_args[ri][1], 8);
+        serial_puts(" 0x"); serial_puthex(g_rcall_args[ri][2], 8);
+        serial_puts(" 0x"); serial_puthex(g_rcall_args[ri][3], 8);
+        serial_puts("]\n");
+    }
+}
 
 /* The user-mode RBP at the moment of the INT 0x2E. Set by
  * int2e_stub.S right before it calls compat32_dispatch. The low 32
@@ -257,6 +345,15 @@ void compat32_init(void)
 {
     thunk_count = 0;
 
+    /* Re-exec reset: a relaunch arrives via ExitProcess (longjmp out of guest
+     * code), so any nested-callback bookkeeping from the previous run is stale —
+     * a leftover depth/jmpbuf would make the next callback unwind into the
+     * previous run's stack/CR3. callback_stacks_ptr is kept (stacks reusable). */
+    callback_depth = 0;
+    for (int i = 0; i < MAX_CALLBACK_DEPTH; i++)
+        for (int j = 0; j < 9; j++)
+            callback_jmpbufs[i][j] = 0;
+
     /* Allocate executable thunk pool in low memory */
     thunk_pool = (uint8_t *)mem_alloc_pages(THUNK_POOL_PAGES);
     if (!thunk_pool) {
@@ -273,6 +370,23 @@ void compat32_init(void)
     serial_puts(" (");
     serial_putdec(THUNKS_PER_PAGE * THUNK_POOL_PAGES);
     serial_puts(" slots)\n");
+
+    /* B3: install the native 32-bit qsort/bsearch blob in a low (<4GB),
+     * executable page (same identity-mapped exec memory class as the thunk pool)
+     * so the MSVCRT qsort/bsearch imports can point at it and run in-mode. */
+    {
+        uint8_t *blob = (uint8_t *)mem_alloc_pages(1);
+        if (blob) {
+            for (uint32_t i = 0; i < (uint32_t)sizeof(qsort32_blob); i++)
+                blob[i] = qsort32_blob[i];
+            qsort32_blob_addr = (uint32_t)(ULONG_PTR)blob;
+            serial_puts("[COMPAT32] qsort32 blob at 0x");
+            serial_puthex(qsort32_blob_addr, 8);
+            serial_puts(" (bsearch +0x");
+            serial_puthex(QSORT32_BSEARCH_OFF, 4);
+            serial_puts(")\n");
+        }
+    }
 
 #ifdef TEST_HARNESS
     /* On Linux test harness, make thunk pool executable */
@@ -420,10 +534,68 @@ uint32_t compat32_make_thunk(uint64_t target, const char *name, uint8_t num_args
     return compat32_make_thunk_ex(target, name, num_args, CC_STDCALL);
 }
 
+/* Native 32-bit _ftol stub. The MS CRT _ftol helper takes its argument in the
+ * x87 ST(0) register — the compiler emits `fld X; call _ftol`, NOT a stack push
+ * — and returns the truncated int64 in EDX:EAX. Routing it through an INT 0x2E
+ * shim is wrong twice: (a) the 64-bit shim reads two garbage DWORDs off the
+ * 32-bit stack instead of ST(0), and (b) the x87 state isn't preserved across
+ * the 32->64 transition (int2e_stub does no fxsave). So emit a real 32-bit
+ * fistp stub that runs entirely in compat mode where ST(0) is valid. This is
+ * the root of UT99's black screen: the fullscreen mode pick does
+ * `fld <matched 640.0>; call _ftol` and was getting 0 back -> ddraw
+ * SetDisplayMode(0,0) -> 0x0 surface. (bpp survived because it's integer
+ * `lea eax,[..*8]`, never _ftol'd — hence "bpp right, WxH zero".) */
+static void emit_ftol_stub(uint8_t *code)
+{
+    static const uint8_t blob[] = {
+        0x83,0xEC,0x0C,             /* sub   esp,12               */
+        0xD9,0x7C,0x24,0x08,        /* fnstcw [esp+8]  (save CW)  */
+        0x0F,0xB7,0x44,0x24,0x08,   /* movzx eax,word [esp+8]     */
+        0x0D,0x00,0x0C,0x00,0x00,   /* or    eax,0x0C00 (RC=trunc)*/
+        0x66,0x89,0x44,0x24,0x0A,   /* mov   [esp+10],ax          */
+        0xD9,0x6C,0x24,0x0A,        /* fldcw [esp+10] (truncate)  */
+        0xDF,0x3C,0x24,             /* fistp qword [esp]          */
+        0xD9,0x6C,0x24,0x08,        /* fldcw [esp+8]  (restore)   */
+        0x8B,0x04,0x24,             /* mov   eax,[esp]            */
+        0x8B,0x54,0x24,0x04,        /* mov   edx,[esp+4]          */
+        0x83,0xC4,0x0C,             /* add   esp,12               */
+        0xC3,                       /* ret   (cdecl, no stack arg)*/
+    };
+    int p = 0;
+    for (unsigned i = 0; i < sizeof(blob); i++) code[p++] = blob[i];
+    while (p < THUNK_STUB_SIZE) code[p++] = 0xCC;
+}
+
+/* True for the st0-based CRT float->int helpers that must run native. */
+static int is_ftol_helper(const char *n)
+{
+    if (!n) return 0;
+    const char *cands[] = { "_ftol", "_ftol2", "__ftol", 0 };
+    for (int i = 0; cands[i]; i++) {
+        const char *a = n, *b = cands[i];
+        while (*a && *b && *a == *b) { a++; b++; }
+        if (*a == 0 && *b == 0) return 1;
+    }
+    return 0;
+}
+
 uint32_t compat32_make_thunk_ex(uint64_t target, const char *name,
                                  uint8_t num_args, uint8_t callconv)
 {
     if (!thunk_pool) return 0;
+
+    /* B3: resolve qsort/bsearch to the native 32-bit blob (runs in-mode, calls
+     * the comparator 32->32 native) instead of an INT 0x2E thunk into the 64-bit
+     * crt_qsort, whose per-comparison compat32_callback_args round-trip corrupts
+     * IST1 state and triple-faults New Game. */
+    if (qsort32_blob_addr && name) {
+        const char *q = "qsort", *b = "bsearch";
+        int mq = 1, mb = 1;
+        for (int i = 0; i < 6; i++) if (name[i] != q[i]) { mq = 0; break; }
+        for (int i = 0; i < 8; i++) if (name[i] != b[i]) { mb = 0; break; }
+        if (mq) return qsort32_blob_addr;
+        if (mb) return qsort32_blob_addr + QSORT32_BSEARCH_OFF;
+    }
     if (thunk_count >= COMPAT32_MAX_THUNKS) {
         serial_puts("[COMPAT32] Thunk table full!\n");
         return 0;
@@ -432,8 +604,12 @@ uint32_t compat32_make_thunk_ex(uint64_t target, const char *name,
     uint32_t idx = thunk_count;
     uint8_t *stub = thunk_pool + (idx * THUNK_STUB_SIZE);
 
-    /* Generate thunk code */
-    emit_thunk(stub, target, num_args, callconv);
+    /* Generate thunk code — _ftol family runs as a native x87 stub (see above);
+     * everything else goes through the INT 0x2E gateway. */
+    if (is_ftol_helper(name))
+        emit_ftol_stub(stub);
+    else
+        emit_thunk(stub, target, num_args, callconv);
 
     /* Record in table */
     thunk_table[idx].thunk_addr  = (uint32_t)(ULONG_PTR)stub;
@@ -2072,6 +2248,25 @@ int compat32_seh_dispatch(PEXCEPTION_RECORD ExceptionRecord)
                         serial_puthex(catch_ebp, 8);
                         serial_puts("\n");
 
+                        /* [CATCH-EBP DIAGNOSTIC — uncommitted] For the UT99 LoadMap
+                         * TCHAR* catch funclet (Engine.dll ~0x1038Exxx), the fault is a
+                         * NULL vtable call on this=[ebp-0x14]. Dump frame_addr and the
+                         * value that will be visible at [catch_ebp-0x14] / -0x34 / -0xC so
+                         * we can verify the establisher EBP is correct. */
+                        if (catch_handler >= 0x1038E000 && catch_handler < 0x1038F000) {
+                            serial_puts("[CATCH-EBP] frame_addr=0x");
+                            serial_puthex(frame_addr, 8);
+                            serial_puts(" next=0x");
+                            serial_puthex(next32, 8);
+                            serial_puts(" [ebp-0x14]=0x");
+                            serial_puthex(*(volatile uint32_t *)(uintptr_t)(catch_ebp - 0x14), 8);
+                            serial_puts(" [ebp-0x34]=0x");
+                            serial_puthex(*(volatile uint32_t *)(uintptr_t)(catch_ebp - 0x34), 8);
+                            serial_puts(" [ebp-0xC]=0x");
+                            serial_puthex(*(volatile uint32_t *)(uintptr_t)(catch_ebp - 0x0C), 8);
+                            serial_puts("\n");
+                        }
+
                         /*
                          * Call the catch handler via compat32_callback.
                          * The MSVC catch handler expects EBP to be the
@@ -2395,33 +2590,44 @@ uint64_t compat32_dispatch(uint32_t thunk_idx, uint32_t *stack_args)
         static uint64_t fname_buf_phys = 0;
         static uint64_t fname_none_entry = 0;
         uint32_t fd = fname_tarray[0], fn = fname_tarray[1], fm = fname_tarray[2];
-        /* FNAME_RESCUE_PREFILL — EXPERIMENT (2026-06-03): the pre-fill sets
-         * Num=1, which makes UE1 FName::StaticInit see a non-empty table and
-         * SKIP registering all ~600 hardcoded names (FNDIFF proves only
-         * Names[0] is ever populated, Num stuck at 1, Names.Add never called).
-         * The pre-fill predates the GMalloc stub fix — it existed to dodge a
-         * "bogus FArray::Realloc" that happened when GMalloc wasn't set up.
-         * Now that appMalloc/appRealloc route through the working HeapAlloc
-         * stub, let StaticInit allocate + register naturally (Num==0 path). */
+        /* FNAME_RESCUE_PREFILL — ROOT-CAUSE FIX (2026-06-05): the OLD pre-fill
+         * set Num=1, which made UE1 FName::StaticInit see a non-empty table and
+         * SKIP registering all ~838 hardcoded EName names (FNDIFF proved only
+         * Names[0] populated, Num stuck at 1, Names.Add never called). Then
+         * FNAME-NULL-FILL masked every unregistered slot with "None", so every
+         * lookup-by-name (menu classes, packages) resolved to "None"/"0" — the
+         * recurring package-zero cascade.
+         *
+         * The fix: still pre-size the TArray (Data = our 512KB buffer,
+         * Max=131072) so the engine NEVER hits the fatal FArray::Realloc, but
+         * leave **Num=0** so StaticInit sees an empty table and registers the
+         * hardcoded names into our buffer naturally (no realloc needed, since
+         * Max is already past anything a full level+gameplay needs). NULL-FILL
+         * remains as a safety net for genuinely-sparse EName slots. */
         static const int FNAME_RESCUE_PREFILL = 1;
         if (FNAME_RESCUE_PREFILL && fd == 0 && fm == 0) {
             if (fname_buf_phys == 0) {
                 extern void *mem_alloc_pages(uint64_t count);
-                /* Buffer A (64 KB) — TArray slot pool (4 bytes per slot,
-                 * room for 16384 ptrs). Sized large so FName::Names NEVER
-                 * needs to FArray::Realloc (final Num ~4271, prev runs grew
-                 * to Max 5464). The realloc path lost ~2048 entries — our
+                /* Buffer A (512 KB) — TArray slot pool (4 bytes per slot,
+                 * room for 131072 ptrs). Sized large so FName::Names NEVER
+                 * needs to FArray::Realloc. The realloc path is fatal: our
                  * HeapReAlloc can't size a non-heap-pool source buffer and
-                 * the copy drops entries → NULL slots → FNAME-NULL-FILL masks
-                 * them with "None" → packages bind to "None0.dll". Avoid the
-                 * realloc entirely by pre-sizing past anything the engine
-                 * needs. */
-                void *buf  = mem_alloc_pages(16);
+                 * the copy drops ALL entries → the whole table goes NULL →
+                 * FNAME-NULL-FILL then masks every slot with "None" → every
+                 * object reference resolves to "None None.X" → appError.
+                 * Avoid the realloc entirely by pre-sizing past anything the
+                 * engine needs. Preload/Browse peaked ~4271 entries, but
+                 * LEVEL LOAD (UTMenu + the map's actors/textures/sounds)
+                 * crosses 16384 — the previous Max=16384 reallocated mid-load
+                 * (observed Num=16385, whole table NULL'd) and bricked every
+                 * FName → fatal "None None.UTConsole". 131072 covers a full
+                 * level + gameplay with wide headroom. */
+                void *buf  = mem_alloc_pages(128);
                 /* Buffer B (4 KB)  — FNameEntry pool */
                 void *pool = mem_alloc_pages(1);
                 if (buf && pool) {
                     uint8_t *p = (uint8_t *)buf;
-                    for (int i = 0; i < 65536; i++) p[i] = 0;
+                    for (int i = 0; i < 524288; i++) p[i] = 0;  /* 512 KB = 131072 ptrs */
                     uint8_t *q = (uint8_t *)pool;
                     for (int i = 0; i < 4096; i++) q[i] = 0;
 
@@ -2475,14 +2681,15 @@ uint64_t compat32_dispatch(uint32_t thunk_idx, uint32_t *stack_args)
             }
             if (fname_buf_phys) {
                 fname_tarray[0] = (uint32_t)fname_buf_phys;
-                fname_tarray[1] = 1;       /* Num = 1 (slot 0 populated) */
-                fname_tarray[2] = 16384;   /* Max = 16K entries (no realloc) */
+                fname_tarray[1] = 0;       /* Num = 0 → StaticInit registers the
+                                            * hardcoded names itself (root fix) */
+                fname_tarray[2] = 131072;  /* Max = 128K entries (no realloc, covers level load) */
                 static int fname_setup_logged = 0;
                 if (!fname_setup_logged) {
                     fname_setup_logged = 1;
                     serial_puts("[FNAME-RESCUE] pre-alloc FName::Names Data=0x");
                     serial_puthex(fname_buf_phys, 8);
-                    serial_puts(" Num=1 Max=2048\n");
+                    serial_puts(" Num=0 Max=131072 (StaticInit registers names)\n");
                 }
             }
         }
@@ -2506,12 +2713,31 @@ uint64_t compat32_dispatch(uint32_t thunk_idx, uint32_t *stack_args)
          * fix and see the engine's raw behavior — used in conjunction
          * with FNDIFF to attribute NULL slots to the engine's own code
          * path vs our fill. */
+        /* FNAME-NULL-FILL DISABLED (2026-06-06, option (b)): disasm of Core.dll
+         * proved the "Unhashed name '%s'" assert at 0x101533aa lives inside
+         * FName::DeleteEntry(INT Index) — it loads Names[Index], walks NameHash
+         * (@0x10295d4c, HashNext@+0x08) to find that exact pointer, raises
+         * "Unhashed name '<name>'" if absent, then UNLINKS it (*esi =
+         * entry->HashNext) and calls GMalloc->Free(entry) (GMalloc@0x101a7b90,
+         * vtbl[2]=Free). Masking NULL slots with a single SHARED, non-GMalloc
+         * sentinel poisons that delete path: DeleteEntry on a filled slot can't
+         * find the aliased pointer in the hash -> "Unhashed name 'None'" (the
+         * render-transition crash). Hash-linking the sentinel (opt a) would make
+         * GMalloc->Free() run on foreign/aliased memory (heap corruption + UAF
+         * of sibling slots); reusing the engine's real None (opt c) would
+         * unlink+Free the canonical NAME_None (UAF on every later FName(0)).
+         * The FNAME_RESCUE_PREFILL above (Num=0, pre-sized Max) already makes
+         * the engine register its own names densely, so the operator*()
+         * NULL-read cascade this masked is now inert. Keep the loop compiled but
+         * gated off; only re-enable with a PER-SLOT, non-aliased, GMalloc-owned,
+         * hash-linked entry if a specific NULL read ever recurs. */
+        static const int FNAME_NULL_FILL_ENABLED = 0;
         #ifndef DISABLE_NULL_FILL
-        if (fname_none_entry && fd != 0) {
+        if (FNAME_NULL_FILL_ENABLED && fname_none_entry && fd != 0) {
             uint32_t *slots = (uint32_t *)(uintptr_t)fd;
             uint32_t limit = fn;
             if (limit > fm) limit = fm;
-            if (limit > 65536) limit = 65536; /* sanity cap */
+            if (limit > 131072) limit = 131072; /* sanity cap = buffer capacity */
             uint32_t filled = 0;
             for (uint32_t k = 0; k < limit; k++) {
                 if (slots[k] == 0) {
@@ -2546,11 +2772,12 @@ uint64_t compat32_dispatch(uint32_t thunk_idx, uint32_t *stack_args)
          * (or our NULL-FILL pre-empted it). If Names[21] points elsewhere,
          * it's a valid FNameEntry — log its Name field (offset +0xC) so
          * we can see whether it says "Engine" or something else. */
-        if (fd != 0 && fn >= 838) {
+        if (fd != 0 && fn >= 22) {
             static uint32_t edump_count = 0;
             static uint32_t last_fn = 0;
-            /* Trigger: first time Num crosses 838, then every 200 dispatches. */
-            if (edump_count == 0 || (edump_count < 20 && fn != last_fn) ||
+            /* Trigger: first few times Num grows (confirms StaticInit is
+             * registering real hardcoded names), then every 200 dispatches. */
+            if (edump_count == 0 || (edump_count < 8 && fn != last_fn) ||
                 (edump_count % 200) == 0) {
                 static const struct { uint32_t idx; const char *name; } ENAMES[] = {
                     {  0, "None"   }, { 10, "StructProp" }, { 20, "Core"   },
@@ -3393,6 +3620,20 @@ uint64_t compat32_dispatch(uint32_t thunk_idx, uint32_t *stack_args)
     uint64_t target = t->target_addr;
     uint8_t nargs = t->num_args;
 
+    /* Recent-native-call ring buffer: record this shim dispatch (cheap, no I/O)
+     * so the NULL-CALL/#PF handler can dump the calls leading up to a crash. */
+    {
+        uint32_t ri = g_rcall_idx & 63;
+        g_rcall_name[ri]   = t->name;
+        g_rcall_nargs[ri]  = nargs;
+        g_rcall_caller[ri] = stack_args[-1];
+        g_rcall_args[ri][0] = nargs > 0 ? stack_args[0] : 0;
+        g_rcall_args[ri][1] = nargs > 1 ? stack_args[1] : 0;
+        g_rcall_args[ri][2] = nargs > 2 ? stack_args[2] : 0;
+        g_rcall_args[ri][3] = nargs > 3 ? stack_args[3] : 0;
+        g_rcall_idx++;
+    }
+
     /* Save the 13th stack arg for CreateWindowExW workaround. */
     g_compat32_last_stack_arg13 = (nargs >= 12) ? stack_args[12] : 0;
 
@@ -3422,6 +3663,7 @@ uint64_t compat32_dispatch(uint32_t thunk_idx, uint32_t *stack_args)
     }
 
     /* Debug: log INT 0x2E dispatch (throttled to reduce log noise) */
+#ifndef OK_QUIET
     {
         static uint32_t int2e_call_count = 0;
         int2e_call_count++;
@@ -3449,6 +3691,7 @@ uint64_t compat32_dispatch(uint32_t thunk_idx, uint32_t *stack_args)
             serial_puts("]\n");
         }
     }
+#endif
 
     /*
      * Call the 64-bit shim function with marshaled arguments.

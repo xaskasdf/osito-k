@@ -63,6 +63,24 @@ ifeq ($(COMPAT_TRACE),1)
   KCFLAGS += -DCOMPAT_TRACE=1
 endif
 
+# Dev fast-boot: skip the boot-time GGUF/LLM model load (brandon-tiny, ~20 MB)
+# to shorten the build→boot→UT99 loop. Inference is unavailable in this build.
+#   make -C arch/x86 CLANG=1 SKIP_MODEL=1
+SKIP_MODEL ?= 0
+ifeq ($(SKIP_MODEL),1)
+  KCFLAGS += -DOK_SKIP_MODEL=1
+endif
+
+# Dev quiet: compile out the high-volume diagnostic serial logging (the printf
+# %s-arg tracer, [NtReadFile] per-read spam, [INT2E] per-call spam). Under KVM
+# every serial write is a VM-exit, so these dominate UT99 boot time (~80% of
+# 172k log lines). With QUIET=1 the compute-heavy phases run fast.
+#   make -C arch/x86 CLANG=1 QUIET=1
+QUIET ?= 0
+ifeq ($(QUIET),1)
+  KCFLAGS += -DOK_QUIET=1
+endif
+
 # Flags for precompiled .o files that may be called from TCC code.
 # TCC doesn't guarantee 16-byte stack alignment (SysV ABI requires it).
 # -mincoming-stack-boundary=3 tells GCC the stack may be 8-byte aligned,
@@ -166,7 +184,9 @@ WIN32_SRC = win32/win32_init.c win32/compat32.c win32/pe.c win32/winexec.c \
             win32/ddraw_shim.c win32/dsound_shim.c \
             win32/ole32_shim.c win32/shell32_shim.c \
             win32/comctl32_shim.c win32/comdlg32_shim.c \
-            win32/winmm_shim.c win32/wsock32_shim.c
+            win32/winmm_shim.c win32/wsock32_shim.c \
+            win32/ole2.c win32/msi.c win32/cab.c \
+            win32/zip.c win32/msix.c win32/installer.c
 WIN32_ASM = win32/int2e_stub.S
 DOS_ASM  = dos/dos_int_stub.S
 DOS_SRC  = dos/dos_init.c dos/dos_exec.c dos/dos_loader.c \

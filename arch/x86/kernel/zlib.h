@@ -23,6 +23,14 @@ int zlib_deflate(const uint8_t *src, uint32_t src_len,
 int zlib_inflate(const uint8_t *src, uint32_t src_len,
                  uint8_t *dst, uint32_t *dst_len);
 
+/* Decompress raw DEFLATE (no zlib header / adler32 trailer) into dst.
+ * dst may already contain start_off bytes of prior output, usable as
+ * LZ77 history (required for MSZIP cross-block back-references).
+ * *dst_len is input: max output size; output: total size (start_off + produced).
+ * Returns 0 on success, -1 on format error, -2 on overflow. */
+int zlib_inflate_raw(const uint8_t *src, uint32_t src_len,
+                     uint8_t *dst, uint32_t start_off, uint32_t *dst_len);
+
 /* Raw adler32 checksum */
 uint32_t zlib_adler32(const uint8_t *data, uint32_t len);
 

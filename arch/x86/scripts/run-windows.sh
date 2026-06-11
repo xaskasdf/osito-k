@@ -81,6 +81,14 @@ if [ "${OK_PCAP:-0}" = "1" ]; then
     info "Packet capture -> $BUILD/net.pcap"
 fi
 
+# Optional QEMU monitor over TCP (OK_MONITOR=1) → connect to 127.0.0.1:55555
+# and issue `screendump out.ppm` to capture the framebuffer (proof of render).
+MON_ARGS=()
+if [ "${OK_MONITOR:-0}" = "1" ]; then
+    MON_ARGS=(-monitor "tcp:127.0.0.1:55555,server,nowait")
+    info "QEMU monitor -> tcp:127.0.0.1:55555 (screendump out.ppm)"
+fi
+
 SERIAL="$BUILD/serial.log"; rm -f "$SERIAL"
 # TCG emulates every guest instruction in software; `-cpu max` makes the
 # guest take AVX/AES-NI/PCLMULQDQ paths that TCG then emulates, which can be
@@ -103,5 +111,6 @@ qemu-system-x86_64 \
     -device usb-kbd,bus=usb.0 \
     -device usb-tablet,bus=usb.0 \
     -display "$DISPLAY_MODE" \
+    "${MON_ARGS[@]}" \
     -serial file:serial.log \
     -no-reboot

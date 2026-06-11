@@ -23,6 +23,7 @@ typedef HANDLE  HDC;
 
 extern void serial_puts(const char *s);
 extern void serial_puthex(uint64_t val, int digits);
+extern void serial_putdec(uint64_t val);
 extern void *mem_alloc_pages(uint64_t count);
 extern void mem_free_pages(void *addr, uint64_t count);
 
@@ -48,8 +49,8 @@ static void dd_memcpy(void *dst, const void *src, SIZE_T n)
 
 /* ── Display state ─────────────────────────────────────────── */
 
-static DWORD display_width  = 800;
-static DWORD display_height = 600;
+static DWORD display_width  = 640;  /* UT99 default WindowedViewportX */
+static DWORD display_height = 480;  /* UT99 default WindowedViewportY */
 static DWORD display_bpp    = 16;  /* UT99 SoftDrv uses 16-bit (RGB565) */
 
 /* Framebuffer pointer — connect to real GOP LFB on OsitoK bare metal,
@@ -64,6 +65,9 @@ extern uint32_t *fb_get_base(void)   __attribute__((weak));
 extern uint32_t  fb_get_width(void)  __attribute__((weak));
 extern uint32_t  fb_get_height(void) __attribute__((weak));
 extern uint32_t  fb_get_pitch(void)  __attribute__((weak));
+/* fb_get_base() returns the cached RAM *shadow*; writes only reach the
+ * displayed VRAM after fb_flush_all() copies shadow→vram. */
+extern void      fb_flush_all(void)  __attribute__((weak));
 
 static void ensure_framebuffer(void)
 {
@@ -420,6 +424,150 @@ static HRESULT WINAPI surf_QueryInterface(IDirectDrawSurface7 *self, REFIID iid,
 static ULONG WINAPI surf_AddRef(IDirectDrawSurface7 *self)  { (void)self; return 2; }
 static ULONG WINAPI surf_Release(IDirectDrawSurface7 *self) { (void)self; return 1; }
 
+static void ddraw_compositor_notify(void);
+
+/* The display-sized surface SoftDrv renders into (it Locks the back buffer
+ * once and writes pixels every frame without re-Locking, and never issues the
+ * fullscreen Flip in our environment). The per-frame message pump calls
+ * ddraw_present_hook() to copy it to the GOP framebuffer so frames are seen. */
+static DDSurface *g_present_surface = NULL;
+
+/* Copy a software-rendered DD surface to the GOP framebuffer (RGB565/8bpp/32
+ * → XRGB8888). NEAREST-NEIGHBOR UPSCALES the surface to fill the whole GOP
+ * (e.g. UT99's 640x480 → 1024x768, both 4:3 so no distortion) instead of the
+ * old 1:1 top-left blit that left the game letterboxed. Mouse mapping in
+ * win32_post_mouse_abs scales the tablet to the SAME source space so the cursor
+ * lines up with the scaled image. Shared by Flip/Blt/Unlock. */
+/* Core scaled present: convert (bpp) + nearest-neighbor scale an arbitrary
+ * pixel buffer to fill the GOP framebuffer, then flush shadow→VRAM. Exported
+ * so the GDI path (BitBlt of a DIB section to the window DC — UT99 SoftDrv's
+ * windowed present) shares the exact same pipeline as DirectDraw Flip/Blt.
+ * pitch_bytes may be NEGATIVE for bottom-up DIBs (pixels then points at the
+ * FIRST scanline in memory order = the bottom row). pal256 is the 256-entry
+ * 0x00RRGGBB palette for 8bpp sources (may be NULL → 8bpp skipped). */
+/* Size of the SOURCE buffer most recently scaled to the GOP — i.e. the pixel
+ * space the user actually sees. The mouse mapping (win32_post_mouse_abs via
+ * ddraw_get_display_size) must use THIS space, not ddraw's display mode: the
+ * GDI/DIB present path changes resolution without a ddraw SetDisplayMode, and
+ * a stale mapping makes every click land offset (e.g. UT99's "Confirm Video
+ * Settings Change" Yes button becomes unclickable after a resolution switch →
+ * 15s auto-revert). */
+static uint32_t g_present_src_w = 0, g_present_src_h = 0;
+
+void ddraw_present_pixels(const void *pixels, uint32_t sw, uint32_t sh,
+                          uint32_t bpp, int32_t pitch_bytes, const uint32_t *pal256)
+{
+    ensure_framebuffer();
+    if (!framebuffer || !pixels || !sw || !sh) return;
+    g_present_src_w = sw;
+    g_present_src_h = sh;
+    uint32_t pitch = gop_pitch ? gop_pitch : sw;
+    uint32_t fbw = (fb_get_width  && fb_get_width())  ? fb_get_width()  : sw;
+    uint32_t fbh = (fb_get_height && fb_get_height()) ? fb_get_height() : sh;
+    uint32_t *dst32 = (uint32_t *)framebuffer;
+
+    /* per-column source-x LUT for the horizontal scale (sw -> fbw) */
+    static uint32_t xlut[4096];
+    uint32_t outw = fbw > 4096 ? 4096 : fbw;
+    for (uint32_t dx = 0; dx < outw; dx++) xlut[dx] = (dx * sw) / fbw;
+
+    const uint8_t *base = (const uint8_t *)pixels;
+    for (uint32_t dy = 0; dy < fbh; dy++) {
+        uint32_t sy = (dy * sh) / fbh;
+        const uint8_t *srow8 = base + (int64_t)(int32_t)sy * pitch_bytes;
+        uint32_t *drow = &dst32[dy * pitch];
+        if (bpp == 16) {
+            const uint16_t *srow = (const uint16_t *)srow8;
+            for (uint32_t dx = 0; dx < outw; dx++) {
+                uint16_t c = srow[xlut[dx]];
+                uint32_t r = ((c >> 11) & 0x1F) * 255 / 31;
+                uint32_t g = ((c >> 5)  & 0x3F) * 255 / 63;
+                uint32_t b = (c & 0x1F) * 255 / 31;
+                drow[dx] = (r << 16) | (g << 8) | b;
+            }
+        } else if (bpp == 8 && pal256) {
+            const uint8_t *srow = srow8;
+            for (uint32_t dx = 0; dx < outw; dx++)
+                drow[dx] = pal256[srow[xlut[dx]]];
+        } else if (bpp == 32) {
+            const uint32_t *srow = (const uint32_t *)srow8;
+            for (uint32_t dx = 0; dx < outw; dx++)
+                drow[dx] = srow[xlut[dx]];
+        }
+    }
+
+    /* Push the cached shadow framebuffer to displayed VRAM, else nothing
+     * appears on screen (the console path flushes; we must too). */
+    if (fb_flush_all) fb_flush_all();
+}
+
+static void present_surface_to_gop(DDSurface *s)
+{
+    if (!s || !s->pixels || !s->width) return;
+    ddraw_present_pixels(s->pixels, s->width, s->height, s->bpp,
+                         (int32_t)(s->width * (s->bpp / 8)),
+                         s->palette ? s->palette->entries : NULL);
+}
+
+/* Report the current SoftDrv render resolution (the surface space that
+ * present_surface_to_gop scales to fill the whole screen). win32_post_mouse_abs
+ * maps the absolute tablet into THIS space so the cursor lines up with the
+ * scaled image. Returns 0/0 until a display mode is set. */
+void ddraw_get_display_size(uint32_t *w, uint32_t *h)
+{
+    /* Prefer the size of what is actually being PRESENTED (DIB or ddraw
+     * surface) so the cursor space always matches the visible image; fall back
+     * to the ddraw display mode before the first present. */
+    if (w) *w = g_present_src_w ? g_present_src_w : display_width;
+    if (h) *h = g_present_src_h ? g_present_src_h : display_height;
+}
+
+/* Called by the GDI present path (BitBlt of a DIB to the window DC): the game
+ * has switched to GDI/DIB presentation, so stop the per-pump re-present of the
+ * last DirectDraw surface — it would overwrite the DIB frames with stale
+ * content. A later ddraw Lock/Flip re-arms g_present_surface. */
+void ddraw_suspend_present_hook(void)
+{
+    g_present_surface = NULL;
+}
+
+/* Full current display mode incl. depth — used by user32's
+ * EnumDisplaySettings(ENUM_CURRENT_SETTINGS) so the whole layer tells one
+ * consistent "current mode" story (ddraw is the authority). */
+void ddraw_get_display_mode(uint32_t *w, uint32_t *h, uint32_t *bpp)
+{
+    if (w)   *w   = display_width;
+    if (h)   *h   = display_height;
+    if (bpp) *bpp = display_bpp;
+}
+
+/* Per-frame present hook, called by the user32 message pump (PeekMessage).
+ * SoftDrv renders into a persistently-locked surface and does not issue the
+ * fullscreen Flip in our setup, so we present the current render target each
+ * frame here. No-op until SoftDrv has Locked a display-sized surface. */
+void ddraw_present_hook(void)
+{
+    if (!g_present_surface) return;
+    present_surface_to_gop(g_present_surface);
+    ddraw_compositor_notify();
+}
+
+/* True when a surface is the size the user sees (or last saw): either the
+ * current ddraw display mode, or the source size of the most recent present.
+ * The second test matters because the GDI/DIB present path can change the
+ * visible resolution WITHOUT a ddraw SetDisplayMode — after such a mid-stream
+ * mode change SoftDrv's render surface must not be orphaned by a strict
+ * display_width/height compare. Shared by Lock/Unlock/Flip/Blt so every path
+ * agrees on which surface is eligible for the per-pump present hook. */
+static int surf_is_present_sized(const DDSurface *s)
+{
+    if (!s->pixels || !s->width || !s->height) return 0;
+    if (s->width == display_width && s->height == display_height) return 1;
+    if (g_present_src_w && g_present_src_h &&
+        s->width == g_present_src_w && s->height == g_present_src_h) return 1;
+    return 0;
+}
+
 static HRESULT WINAPI surf_Lock(IDirectDrawSurface7 *self, LPRECT destRect,
                                  DDSURFACEDESC2 *desc, DWORD flags, HANDLE hEvent)
 {
@@ -441,23 +589,39 @@ static HRESULT WINAPI surf_Lock(IDirectDrawSurface7 *self, LPRECT destRect,
     d[4]  = (uint32_t)s->pitch;     /* lPitch at offset 16 */
     d[9]  = (uint32_t)(ULONG_PTR)s->pixels; /* lpSurface at offset 36 */
 
-    /* ddpfPixelFormat at offset 72 (32-bit layout) */
-    d[18] = 32;  /* ddpfPixelFormat.dwSize at offset 72 */
-    d[22] = s->bpp;  /* dwRGBBitCount at offset 88 */
+    /* Remember the display-sized surface being rendered into so the per-frame
+     * pump can present it (SoftDrv keeps this Locked and never Flips). Match
+     * by current mode OR last-presented source size (see
+     * surf_is_present_sized) so a GDI-side resolution change mid-stream
+     * doesn't orphan the surface. */
+    if (surf_is_present_sized(s))
+        g_present_surface = s;
+
+    /* ddpfPixelFormat at offset 72 (32-bit DDSURFACEDESC2 layout). Field
+     * offsets within ddpf: dwSize@72(d18), dwFlags@76(d19), dwFourCC@80(d20),
+     * dwRGBBitCount@84(d21), dwRBitMask@88(d22), dwGBitMask@92(d23),
+     * dwBBitMask@96(d24), dwRGBAlphaBitMask@100(d25).
+     * BUGFIX 2026-06-07: every field from dwRGBBitCount on was written one dword
+     * too high (bitcount at d22, R/G/B masks at d23/d24/d25), so SoftDrv read
+     * dwRGBBitCount=0, dwRBitMask=bpp, dwGBitMask=0xF800, dwBBitMask=0x07E0 and
+     * built a blitter that wrote only the middle 6 bits (green field) — the
+     * green-tint. Use the correct ABI offsets. */
+    d[18] = 32;       /* dwSize @72 */
+    d[21] = s->bpp;   /* dwRGBBitCount @84 */
 
     if (s->bpp == 8) {
-        d[19] = 0x00000020;  /* DDPF_PALETTEINDEXED8 */
+        d[19] = 0x00000020;  /* DDPF_PALETTEINDEXED8 @76 */
         /* No bit masks for palettized mode */
     } else if (s->bpp == 16) {
-        d[19] = DDPF_RGB;  /* dwFlags at offset 76 */
-        d[23] = 0xF800;  /* dwRBitMask at offset 92 */
-        d[24] = 0x07E0;  /* dwGBitMask at offset 96 */
-        d[25] = 0x001F;  /* dwBBitMask at offset 100 */
+        d[19] = DDPF_RGB;    /* dwFlags @76 */
+        d[22] = 0xF800;      /* dwRBitMask @88 */
+        d[23] = 0x07E0;      /* dwGBitMask @92 */
+        d[24] = 0x001F;      /* dwBBitMask @96 */
     } else {
-        d[19] = DDPF_RGB;
-        d[23] = 0x00FF0000;
-        d[24] = 0x0000FF00;
-        d[25] = 0x000000FF;
+        d[19] = DDPF_RGB;    /* dwFlags @76 */
+        d[22] = 0x00FF0000;  /* dwRBitMask @88 */
+        d[23] = 0x0000FF00;  /* dwGBitMask @92 */
+        d[24] = 0x000000FF;  /* dwBBitMask @96 */
     }
 
     s->locked = 1;
@@ -468,7 +632,26 @@ static HRESULT WINAPI surf_Unlock(IDirectDrawSurface7 *self, LPRECT lpRect)
 {
     (void)lpRect;
     IDirectDrawSurface7 *real = REAL_SURF(self);
-    if (real) real->surf.locked = 0;
+    if (!real) return DDERR_INVALIDPARAMS;
+    real->surf.locked = 0;
+
+    /* SoftDrv renders the frame into a locked surface (typically the back
+     * buffer) and unlocks it; the fullscreen Flip that would present it is
+     * not always issued. Present the just-rendered surface to the GOP
+     * framebuffer here so the frame becomes visible. */
+    DDSurface *s = &real->surf;
+    if (surf_is_present_sized(s)) {
+        /* Re-arm the per-pump present hook: an Unlock of a display-sized
+         * surface is a positive signal the ddraw path is producing frames
+         * again. The GDI/DIB present path (the menu) suspends the hook
+         * (g_present_surface = NULL), and on resume SoftDrv may keep its
+         * surface persistently Locked without ever re-Locking — so without
+         * this re-arm the pump presents nothing after a menu round-trip
+         * (in-game black screen until something re-Locks, e.g. death-cam). */
+        g_present_surface = s;
+        present_surface_to_gop(s);
+        ddraw_compositor_notify();
+    }
     return DD_OK;
 }
 
@@ -526,42 +709,14 @@ static HRESULT WINAPI surf_Blt(IDirectDrawSurface7 *self, LPRECT destRect,
         dd_memcpy(dst->pixels, s->pixels, copy_size);
     }
 
-    /* If primary surface, blit to GOP framebuffer */
+    /* If primary surface, blit (nearest-neighbor scaled to full GOP).
+     * Re-arm the per-pump present hook on a primary-sized Blt for the same
+     * reason as Unlock/Flip: a ddraw present means the ddraw path owns the
+     * screen again after any GDI-present suspension. */
     if (dst->is_primary) {
-        ensure_framebuffer();
-        if (framebuffer && dst->pixels) {
-            DWORD pitch = gop_pitch ? gop_pitch : dst->width;
-
-            if (dst->bpp == 8 && dst->palette) {
-                /* 8bpp palettized → XRGB8888 via palette lookup */
-                BYTE *src8 = dst->pixels;
-                uint32_t *dst32 = (uint32_t *)framebuffer;
-                for (DWORD y = 0; y < dst->height; y++) {
-                    for (DWORD x = 0; x < dst->width; x++) {
-                        uint8_t idx = src8[y * dst->width + x];
-                        dst32[y * pitch + x] = dst->palette->entries[idx];
-                    }
-                }
-            } else if (dst->bpp == 16) {
-                /* Convert RGB565 → XRGB8888, respecting GOP pitch */
-                uint16_t *src16 = (uint16_t *)dst->pixels;
-                uint32_t *dst32 = (uint32_t *)framebuffer;
-                for (DWORD y = 0; y < dst->height; y++) {
-                    for (DWORD x = 0; x < dst->width; x++) {
-                        uint16_t c = src16[y * dst->width + x];
-                        uint32_t r = ((c >> 11) & 0x1F) * 255 / 31;
-                        uint32_t g = ((c >> 5)  & 0x3F) * 255 / 63;
-                        uint32_t b = (c & 0x1F) * 255 / 31;
-                        dst32[y * pitch + x] = (r << 16) | (g << 8) | b;
-                    }
-                }
-            } else if (dst->bpp == 32) {
-                uint32_t *src32 = (uint32_t *)dst->pixels;
-                uint32_t *dst32 = (uint32_t *)framebuffer;
-                for (DWORD y = 0; y < dst->height; y++)
-                    dd_memcpy(&dst32[y * pitch], &src32[y * dst->width], dst->width * 4);
-            }
-        }
+        if (surf_is_present_sized(dst))
+            g_present_surface = dst;
+        present_surface_to_gop(dst);
     }
 
     /* Also copy to compositor's shm surface if available */
@@ -655,40 +810,13 @@ static HRESULT WINAPI surf_Flip(IDirectDrawSurface7 *self,
     primary->pixels = back->pixels;
     back->pixels = tmp;
 
-    /* Blit primary to GOP framebuffer */
-    ensure_framebuffer();
-    if (framebuffer && primary->pixels) {
-        DWORD pitch = gop_pitch ? gop_pitch : primary->width;
-
-        if (primary->bpp == 8 && primary->palette) {
-            /* 8bpp palettized → XRGB8888 via palette lookup */
-            BYTE *src8 = primary->pixels;
-            uint32_t *dst32 = (uint32_t *)framebuffer;
-            for (DWORD y = 0; y < primary->height; y++) {
-                for (DWORD x = 0; x < primary->width; x++) {
-                    uint8_t idx = src8[y * primary->width + x];
-                    dst32[y * pitch + x] = primary->palette->entries[idx];
-                }
-            }
-        } else if (primary->bpp == 16) {
-            uint16_t *src16 = (uint16_t *)primary->pixels;
-            uint32_t *dst32 = (uint32_t *)framebuffer;
-            for (DWORD y = 0; y < primary->height; y++) {
-                for (DWORD x = 0; x < primary->width; x++) {
-                    uint16_t c = src16[y * primary->width + x];
-                    uint32_t r = ((c >> 11) & 0x1F) * 255 / 31;
-                    uint32_t g = ((c >> 5)  & 0x3F) * 255 / 63;
-                    uint32_t b = (c & 0x1F) * 255 / 31;
-                    dst32[y * pitch + x] = (r << 16) | (g << 8) | b;
-                }
-            }
-        } else if (primary->bpp == 32) {
-            uint32_t *src32 = (uint32_t *)primary->pixels;
-            uint32_t *dst32 = (uint32_t *)framebuffer;
-            for (DWORD y = 0; y < primary->height; y++)
-                dd_memcpy(&dst32[y * pitch], &src32[y * primary->width], primary->width * 4);
-        }
-    }
+    /* Blit primary to GOP framebuffer (nearest-neighbor scaled to full GOP).
+     * A Flip is the strongest "ddraw owns the screen" signal: re-arm the
+     * per-pump present hook so flip-chain games keep presenting after a GDI
+     * BitBlt present suspended it (mirrors the Lock/Unlock re-arm). */
+    if (surf_is_present_sized(primary))
+        g_present_surface = primary;
+    present_surface_to_gop(primary);
 
     ddraw_compositor_notify();
     return DD_OK;
@@ -697,10 +825,56 @@ static HRESULT WINAPI surf_Flip(IDirectDrawSurface7 *self,
 static HRESULT WINAPI surf_GetSurfaceDesc(IDirectDrawSurface7 *self, DDSURFACEDESC2 *desc)
 {
     if (!desc) return DDERR_INVALIDPARAMS;
-    /* Just lock and unlock to fill the descriptor */
+    /* Fill the descriptor via the Lock path, but a Desc QUERY must not have
+     * present side effects: don't let the synthetic Lock/Unlock arm the
+     * per-pump present hook (that would override a GDI-present suspension and
+     * push a stale ddraw frame over the DIB) or present a frame. Restore the
+     * arming state and clear the lock flag directly instead of Unlock. */
+    DDSurface *saved = g_present_surface;
     HRESULT hr = surf_Lock(self, NULL, desc, 0, NULL);
-    if (hr == DD_OK) surf_Unlock(self, NULL);
+    g_present_surface = saved;
+    if (hr == DD_OK) {
+        IDirectDrawSurface7 *real = REAL_SURF(self);
+        if (real) real->surf.locked = 0;
+    }
     return hr;
+}
+
+/* IDirectDrawSurface7::GetPixelFormat (vtbl slot 21). UE1
+ * USoftwareRenderDevice::SetRes calls this on the render-target surface to learn
+ * the RGB bit layout and build its 16-bit shade/color tables. It was previously
+ * UNIMPLEMENTED (the generic S_OK stub left the caller's DDPIXELFORMAT
+ * untouched), so SoftDrv read a zeroed format and built a green-biased table —
+ * the green tint. Fill a proper DDPIXELFORMAT (32-bit layout, 32 bytes):
+ *   dwSize@0 dwFlags@4 dwFourCC@8 dwRGBBitCount@12
+ *   dwRBitMask@16 dwGBitMask@20 dwBBitMask@24 dwRGBAlphaBitMask@28 */
+static HRESULT WINAPI surf_GetPixelFormat(IDirectDrawSurface7 *self, void *lpDDPF)
+{
+    IDirectDrawSurface7 *real = REAL_SURF(self);
+    if (!real || !lpDDPF) return DDERR_INVALIDPARAMS;
+    DDSurface *s = &real->surf;
+    uint32_t *pf = (uint32_t *)lpDDPF;
+    dd_memset(pf, 0, 32);
+    pf[0] = 32;          /* dwSize */
+    pf[3] = s->bpp;      /* dwRGBBitCount */
+    if (s->bpp == 8) {
+        pf[1] = 0x00000020;       /* DDPF_PALETTEINDEXED8 */
+    } else if (s->bpp == 16) {
+        pf[1] = DDPF_RGB;
+        pf[4] = 0xF800;  pf[5] = 0x07E0;  pf[6] = 0x001F;
+    } else {
+        pf[1] = DDPF_RGB;
+        pf[4] = 0x00FF0000; pf[5] = 0x0000FF00; pf[6] = 0x000000FF;
+    }
+    static int gpf_logged = 0;
+    if (!gpf_logged) {
+        gpf_logged = 1;
+        serial_puts("[DDRAW] GetPixelFormat -> bpp="); serial_putdec(s->bpp);
+        serial_puts(" R=0x"); serial_puthex(pf[4], 4);
+        serial_puts(" G=0x"); serial_puthex(pf[5], 4);
+        serial_puts(" B=0x"); serial_puthex(pf[6], 4); serial_puts("\n");
+    }
+    return DD_OK;
 }
 
 static HRESULT WINAPI surf_GetDC(IDirectDrawSurface7 *self, HDC *hdc)
@@ -928,13 +1102,23 @@ static HRESULT WINAPI dd_SetDisplayMode(IDirectDraw7 *self, DWORD w, DWORD h,
                                          DWORD bpp, DWORD refreshRate, DWORD flags)
 {
     (void)self; (void)refreshRate; (void)flags;
-    display_width  = w;
-    display_height = h;
-    display_bpp    = bpp;
+    /* A 0-width/height mode is invalid (real DDraw → DDERR_INVALIDMODE). UT99's
+     * SoftDrv passes (0,0,16) here — its UWindowsViewport hands SetRes a 0x0
+     * extent. Rather than brick every surface with a 0x0 size, keep the current
+     * (real) mode: SetDisplayMode(0,...) means "don't change resolution". Only
+     * adopt w/h when both are non-zero. */
+    if (w > 0 && h > 0) {
+        display_width  = w;
+        display_height = h;
+    }
+    if (bpp > 0)
+        display_bpp = bpp;
 
-    serial_puts("[DDRAW] SetDisplayMode ");
+    serial_puts("[DDRAW] SetDisplayMode req ");
     serial_puthex(w, 4); serial_puts("x"); serial_puthex(h, 4);
     serial_puts("x"); serial_puthex(bpp, 2);
+    serial_puts(" -> using ");
+    serial_puthex(display_width, 4); serial_puts("x"); serial_puthex(display_height, 4);
     serial_puts("\n");
 
     ensure_framebuffer();
@@ -1060,7 +1244,13 @@ static HRESULT WINAPI dd_CreateSurface(IDirectDraw7 *self, DDSURFACEDESC2 *desc,
 
     DWORD w   = (flags32 & DDSD_WIDTH)  ? d32[3] : display_width;   /* offset 12 */
     DWORD h   = (flags32 & DDSD_HEIGHT) ? d32[2] : display_height;  /* offset 8 */
+    /* Honor an explicitly requested pixel format (real DDraw semantics); the
+     * global display_bpp is only the default when the desc doesn't specify one. */
     DWORD bpp = display_bpp;
+    if (flags32 & DDSD_PIXELFORMAT) {
+        uint32_t req = d32[21];      /* ddpfPixelFormat.dwRGBBitCount @84 */
+        if (req == 8 || req == 16 || req == 32) bpp = req;
+    }
     int is_primary = (caps32 & DDSCAPS_PRIMARYSURFACE) ? 1 : 0;
 
     IDirectDrawSurface7 *s = alloc_surface(w, h, bpp, is_primary);
@@ -1085,18 +1275,79 @@ static HRESULT WINAPI dd_CreateSurface(IDirectDraw7 *self, DDSURFACEDESC2 *desc,
     return DD_OK;
 }
 
+/* Fill a 32-bit DDPIXELFORMAT (8 dwords at `pf`) for the given bpp. Shared by
+ * GetDisplayMode / EnumDisplayModes; mirrors surf_GetPixelFormat (the 565-mask
+ * fix that cured the green tint). */
+static void fill_pixfmt32(uint32_t *pf, uint32_t bpp)
+{
+    pf[0] = 32;                       /* dwSize */
+    pf[2] = 0;                        /* dwFourCC */
+    pf[3] = bpp;                      /* dwRGBBitCount */
+    pf[7] = 0;                        /* dwRGBAlphaBitMask */
+    if (bpp == 8) {
+        pf[1] = 0x00000020;           /* DDPF_PALETTEINDEXED8 */
+        pf[4] = pf[5] = pf[6] = 0;
+    } else if (bpp == 16) {
+        pf[1] = DDPF_RGB;
+        pf[4] = 0xF800; pf[5] = 0x07E0; pf[6] = 0x001F;       /* RGB565 */
+    } else {
+        pf[1] = DDPF_RGB;
+        pf[4] = 0x00FF0000; pf[5] = 0x0000FF00; pf[6] = 0x000000FF; /* XRGB8888 */
+    }
+}
+
 static HRESULT WINAPI dd_GetDisplayMode(IDirectDraw7 *self, DDSURFACEDESC2 *desc)
 {
     (void)self;
     if (!desc) return DDERR_INVALIDPARAMS;
-    dd_memset(desc, 0, sizeof(DDSURFACEDESC2));
-    desc->dwSize    = sizeof(DDSURFACEDESC2);
-    desc->dwFlags   = DDSD_WIDTH | DDSD_HEIGHT | DDSD_PIXELFORMAT;
-    desc->dwWidth   = display_width;
-    desc->dwHeight  = display_height;
-    desc->ddpfPixelFormat.dwSize        = sizeof(DDPIXELFORMAT);
-    desc->ddpfPixelFormat.dwFlags       = DDPF_RGB;
-    desc->ddpfPixelFormat.dwRGBBitCount = display_bpp;
+    /* The caller is 32-bit PE code: write the 32-bit DDSURFACEDESC2 layout
+     * (dwSize 124, ddpfPixelFormat at offset 72) with raw dword stores. The
+     * 64-bit struct has an 8-byte lpSurface, so writing through it lands the
+     * pixel format at the WRONG offset for the 32-bit reader. Also fill the
+     * RGB masks — SoftDrv builds its color tables from them. */
+    uint32_t *d = (uint32_t *)desc;
+    for (int i = 0; i < 31; i++) d[i] = 0;
+    d[0]  = 124;                                  /* dwSize */
+    d[1]  = DDSD_WIDTH | DDSD_HEIGHT | DDSD_PITCH | DDSD_PIXELFORMAT;
+    d[2]  = display_height;                       /* dwHeight  @8  */
+    d[3]  = display_width;                        /* dwWidth   @12 */
+    d[4]  = display_width * (display_bpp / 8);    /* lPitch    @16 */
+    fill_pixfmt32(d + 18, display_bpp);           /* ddpf      @72 */
+    return DD_OK;
+}
+
+/* IDirectDraw::GetCaps — real vtable slot 11 (this + lpDDDriverCaps + lpDDHELCaps).
+ * UE1's UWindowsViewport reads these caps to decide whether DirectDraw is usable
+ * (fullscreen / BLIT_DirectDraw). A zeroed/garbage DDCAPS makes it bail. Report an
+ * honest HEL-style software device: GDI-coexistent, blit + stretch + colorfill,
+ * palette, sysmem blits. DDCAPS layout (32-bit): dwSize@0, dwCaps@4, dwCaps2@8,
+ * dwPalCaps@24, dwVidMemTotal@60, dwVidMemFree@64. */
+static HRESULT WINAPI dd_GetCaps(IDirectDraw7 *self, PVOID lpDriverCaps, PVOID lpHELCaps)
+{
+    (void)self;
+    if (!lpDriverCaps && !lpHELCaps) return DDERR_INVALIDPARAMS;
+    PVOID targets[2] = { lpDriverCaps, lpHELCaps };
+    for (int t = 0; t < 2; t++) {
+        uint32_t *c = (uint32_t *)targets[t];
+        if (!c) continue;
+        uint32_t size = c[0];                   /* caller sets dwSize */
+        if (size < 8 || size > 1024) size = 380; /* DDCAPS_DX7 default */
+        for (uint32_t i = 1; i < size / 4; i++) c[i] = 0;
+        c[1] = 0x00000040u   /* DDCAPS_BLT          */
+             | 0x00000200u   /* DDCAPS_BLTSTRETCH   */
+             | 0x00008000u   /* DDCAPS_PALETTE      */
+             | 0x00010000u   /* DDCAPS_GDI          */
+             | 0x00400000u   /* DDCAPS_COLORKEY     */
+             | 0x04000000u   /* DDCAPS_BLTCOLORFILL */
+             | 0x80000000u;  /* DDCAPS_CANBLTSYSMEM */
+        if (size >= 28)
+            c[6] = 0x04 | 0x10 | 0x40;  /* dwPalCaps: 8BIT|PRIMARYSURFACE|ALLOW256 */
+        if (size >= 68) {
+            c[15] = 16u * 1024 * 1024;  /* dwVidMemTotal @60 */
+            c[16] = 12u * 1024 * 1024;  /* dwVidMemFree  @64 */
+        }
+    }
+    serial_puts("[DDRAW] GetCaps -> HEL caps reported\n");
     return DD_OK;
 }
 
@@ -1166,9 +1417,26 @@ static uint64_t WINAPI dd_EnumDisplayModes(
     uint64_t _this, uint64_t dwFlags, uint64_t lpDesc,
     uint64_t lpContext, uint64_t lpCallback)
 {
-    (void)_this; (void)dwFlags; (void)lpDesc;
+    (void)_this; (void)dwFlags;
+
+    /* Real DirectDraw semantics: a non-NULL lpDDSurfaceDesc is a FILTER — only
+     * modes matching its specified fields are enumerated. UE1's UWindowsViewport
+     * enumerates once per color depth with a pixel-format filter, storing each
+     * depth's modes in a separate per-ColorBytes array; feeding ALL bpps into
+     * every array breaks its mode bookkeeping. Honor bpp/width/height filters. */
+    uint32_t f_flags = 0, f_bpp = 0, f_w = 0, f_h = 0;
+    if (lpDesc) {
+        const uint32_t *fd = (const uint32_t *)(uintptr_t)(uint32_t)lpDesc;
+        f_flags = fd[1];
+        if (f_flags & DDSD_PIXELFORMAT) f_bpp = fd[21];  /* dwRGBBitCount @84 */
+        if (f_flags & DDSD_WIDTH)       f_w   = fd[3];
+        if (f_flags & DDSD_HEIGHT)      f_h   = fd[2];
+    }
+
     serial_puts("[DDRAW] EnumDisplayModes cb=0x");
     serial_puthex((uint32_t)lpCallback, 8);
+    serial_puts(" filter bpp=");
+    serial_putdec(f_bpp);
     serial_puts("\n");
 
     if (!lpCallback) return 0; /* DD_OK */
@@ -1180,29 +1448,23 @@ static uint64_t WINAPI dd_EnumDisplayModes(
     };
 
     for (int i = 0; i < 9; i++) {
+        if (f_bpp && modes[i].bpp != f_bpp) continue;
+        if (f_w   && modes[i].w   != f_w)   continue;
+        if (f_h   && modes[i].h   != f_h)   continue;
+
         /* DDSURFACEDESC2 = 124 bytes. Use static buffer so the 32-bit
          * callback can access it (must be in lower 4GB). */
         static uint8_t desc_buf[128];
         for (int j = 0; j < 128; j++) desc_buf[j] = 0;
         uint32_t *d = (uint32_t *)desc_buf;
         d[0]  = 124;                  /* dwSize */
-        d[1]  = 0x00001006;           /* DDSD_WIDTH|DDSD_HEIGHT|DDSD_PIXELFORMAT */
+        d[1]  = DDSD_WIDTH | DDSD_HEIGHT | DDSD_PITCH | DDSD_PIXELFORMAT
+              | 0x00040000;           /* DDSD_REFRESHRATE */
         d[2]  = modes[i].h;           /* dwHeight */
         d[3]  = modes[i].w;           /* dwWidth */
         d[4]  = modes[i].w * (modes[i].bpp / 8); /* lPitch */
-        /* ddpfPixelFormat at offset 72 */
-        uint32_t *pf = (uint32_t *)(desc_buf + 72);
-        pf[0] = 32;                   /* dwSize of DDPIXELFORMAT */
-        pf[3] = modes[i].bpp;         /* dwRGBBitCount */
-        if (modes[i].bpp == 8) {
-            pf[1] = 0x00000020;       /* DDPF_PALETTEINDEXED8 */
-        } else if (modes[i].bpp == 16) {
-            pf[1] = 0x00000040;       /* DDPF_RGB */
-            pf[4] = 0xF800;  pf[5] = 0x07E0;  pf[6] = 0x001F;
-        } else {
-            pf[1] = 0x00000040;       /* DDPF_RGB */
-            pf[4] = 0x00FF0000; pf[5] = 0x0000FF00; pf[6] = 0x000000FF;
-        }
+        d[5]  = 60;                   /* dwRefreshRate @20 (union) */
+        fill_pixfmt32((uint32_t *)(desc_buf + 72), modes[i].bpp);
 
         uint32_t args[2] = {
             (uint32_t)(uintptr_t)desc_buf,
@@ -1229,7 +1491,12 @@ static void ddraw_init_com32(void)
     extern uint32_t compat32_make_thunk_ex(uint64_t target, const char *name,
                                             uint8_t num_args, uint8_t callconv);
     extern void *mem_alloc_pages(uint64_t count);
-    #define CC_STDCALL 1
+    /* CC_STDCALL comes from compat32.h (== 0). Do NOT redefine it here:
+     * a local `#define CC_STDCALL 1` collides with CC_CDECL (==1), so
+     * emit_thunk() would emit `ret` (cdecl, no cleanup) instead of
+     * `ret N`. The ddraw COM methods are stdcall (callee cleans), and
+     * the leaked args drift ESP → corrupt the caller's saved ESI →
+     * NULL virtual call in WinDrv ResizeViewport (no frame presents). */
 
     /* Allocate COM proxy objects from PE32-accessible memory.
      * Layout in 1 page:
@@ -1275,9 +1542,13 @@ static void ddraw_init_com32(void)
                                             "DD_CreateSurface", 4, CC_STDCALL);
     dd_vtbl32[8]  = compat32_make_thunk_ex((uint64_t)(ULONG_PTR)dd_EnumDisplayModes,
                                             "DD_EnumDisplayModes", 5, CC_STDCALL);
+    dd_vtbl32[11] = compat32_make_thunk_ex((uint64_t)(ULONG_PTR)dd_GetCaps,
+                                            "DD_GetCaps", 3, CC_STDCALL);
     dd_vtbl32[12] = compat32_make_thunk_ex((uint64_t)(ULONG_PTR)dd_GetDisplayMode,
                                             "DD_GetDisplayMode", 2, CC_STDCALL);
-    dd_vtbl32[13] = dd_vtbl32[12]; /* Same method, both IDirectDraw slots */
+    /* slot 13 = GetFourCCCodes (NOT a duplicate GetDisplayMode) — left 0 so the
+     * fill loop installs a correct 3-arg stub. The old `[13]=[12]` duplicate
+     * shifted the dd_args labels and broke RestoreDisplayMode (slot 19). */
     dd_vtbl32[20] = compat32_make_thunk_ex((uint64_t)(ULONG_PTR)dd_SetCooperativeLevel,
                                             "DD_SetCoopLevel", 3, CC_STDCALL);
     dd_vtbl32[21] = compat32_make_thunk_ex((uint64_t)(ULONG_PTR)dd_SetDisplayMode,
@@ -1291,13 +1562,15 @@ static void ddraw_init_com32(void)
     surf_vtbl32[2]  = compat32_make_thunk_ex((uint64_t)(ULONG_PTR)surf_Release,
                                               "Surf_Release", 1, CC_STDCALL);
     surf_vtbl32[5]  = compat32_make_thunk_ex((uint64_t)(ULONG_PTR)surf_Blt,
-                                              "Surf_Blt", 7, CC_STDCALL);
+                                              "Surf_Blt", 6, CC_STDCALL);  /* this+DestRect,SrcSurf,SrcRect,Flags,BltFx */
     surf_vtbl32[7]  = compat32_make_thunk_ex((uint64_t)(ULONG_PTR)surf_BltFast,
                                               "Surf_BltFast", 6, CC_STDCALL);
     surf_vtbl32[11] = compat32_make_thunk_ex((uint64_t)(ULONG_PTR)surf_Flip,
                                               "Surf_Flip", 3, CC_STDCALL);
     surf_vtbl32[12] = compat32_make_thunk_ex((uint64_t)(ULONG_PTR)surf_GetAttachedSurface,
                                               "Surf_GetAttached", 3, CC_STDCALL);
+    surf_vtbl32[21] = compat32_make_thunk_ex((uint64_t)(ULONG_PTR)surf_GetPixelFormat,
+                                              "Surf_GetPixelFormat", 2, CC_STDCALL);
     surf_vtbl32[22] = compat32_make_thunk_ex((uint64_t)(ULONG_PTR)surf_GetSurfaceDesc,
                                               "Surf_GetDesc", 2, CC_STDCALL);
     surf_vtbl32[15] = compat32_make_thunk_ex((uint64_t)(ULONG_PTR)surf_GetClipper,
@@ -1318,7 +1591,17 @@ static void ddraw_init_com32(void)
      * otherwise RET N pops wrong number of bytes → stack corruption
      * → SEH chain destroyed → engine can't catch exceptions. */
     {
-        /* IDirectDraw7 arg counts (including 'this'): */
+        /* IDirectDraw vtable arg counts (including 'this'). MUST match the real
+         * IDirectDraw layout exactly — a wrong count makes the stub's RET N
+         * over/under-clean the caller's stack. The table was previously
+         * mis-labelled from slot 13 on (a stray "GetDisplayMode at 13"
+         * duplicate shifted everything by one), which left slot 19
+         * (RestoreDisplayMode = 1 arg) registered as 2. UWindowsViewport's
+         * fullscreen ResizeViewport calls RestoreDisplayMode (RenDev->vtable[19],
+         * 1 pushed arg); the 2-arg stub did RET 8 → over-cleaned 4 bytes →
+         * stack imbalance → the WinDrv wrapper's `pop edi/esi/ebx` (which run
+         * BEFORE `mov esp,ebp`) read shifted slots → corrupt viewport `this` →
+         * #PF on a 0x20 vtable. Correct layout below. */
         static const uint8_t dd_args[23] = {
             3,1,1,  /* 0:QI 1:AddRef 2:Release (implemented) */
             1,      /* 3:Compact */
@@ -1327,17 +1610,17 @@ static void ddraw_init_com32(void)
             4,      /* 6:CreateSurface (implemented) */
             3,      /* 7:DuplicateSurface */
             5,      /* 8:EnumDisplayModes */
-            4,      /* 9:EnumSurfaces */
+            5,      /* 9:EnumSurfaces (dwFlags,lpDDSD,lpCtx,lpCb) */
             1,      /* 10:FlipToGDISurface */
             3,      /* 11:GetCaps */
-            2,      /* 12:GetDisplayMode (implemented as slot 13) */
-            2,      /* 13:GetDisplayMode */
-            3,      /* 14:GetFourCCCodes */
-            2,      /* 15:GetGDISurface */
-            2,      /* 16:GetMonitorFrequency */
-            2,      /* 17:GetScanLine */
-            2,      /* 18:GetVerticalBlankStatus */
-            2,      /* 19:Initialize */
+            2,      /* 12:GetDisplayMode (implemented) */
+            3,      /* 13:GetFourCCCodes (lpNumCodes,lpCodes) */
+            2,      /* 14:GetGDISurface */
+            2,      /* 15:GetMonitorFrequency */
+            2,      /* 16:GetScanLine */
+            2,      /* 17:GetVerticalBlankStatus */
+            2,      /* 18:Initialize (lpGUID) */
+            1,      /* 19:RestoreDisplayMode (this only) */
             3,      /* 20:SetCooperativeLevel (implemented) */
             6,      /* 21:SetDisplayMode (implemented) */
             3,      /* 22:WaitForVerticalBlank */
@@ -1353,26 +1636,30 @@ static void ddraw_init_com32(void)
 
     /* Fill unimplemented Surface slots with correct arg counts */
     {
-        /* IDirectDrawSurface7 arg counts (including 'this'): */
+        /* IDirectDrawSurface arg counts (including 'this'). Corrected against
+         * the real IDirectDrawSurface vtable — several were short, which makes
+         * an unimplemented-slot stub RET too few bytes and imbalance the caller
+         * (the engine's SetRes Blt-clears the surfaces during fullscreen
+         * ResizeViewport). */
         static const uint8_t sf_args[33] = {
             3,1,1,  /* 0:QI 1:AddRef 2:Release */
             2,      /* 3:AddAttachedSurface */
             2,      /* 4:AddOverlayDirtyRect */
-            7,      /* 5:Blt (implemented) */
+            6,      /* 5:Blt (DestRect,SrcSurf,SrcRect,Flags,BltFx) */
             4,      /* 6:BltBatch */
-            5,      /* 7:BltFast */
-            2,      /* 8:DeleteAttachedSurface */
+            6,      /* 7:BltFast (x,y,SrcSurf,SrcRect,Trans) */
+            3,      /* 8:DeleteAttachedSurface (Flags,Surf) */
             3,      /* 9:EnumAttachedSurfaces */
-            3,      /* 10:EnumOverlayZOrders */
+            4,      /* 10:EnumOverlayZOrders (Flags,Ctx,Cb) */
             3,      /* 11:Flip (implemented) */
             3,      /* 12:GetAttachedSurface */
             2,      /* 13:GetBltStatus */
             2,      /* 14:GetCaps */
             2,      /* 15:GetClipper */
-            2,      /* 16:GetColorKey */
+            3,      /* 16:GetColorKey (Flags,ColorKey) */
             2,      /* 17:GetDC */
             2,      /* 18:GetFlipStatus */
-            2,      /* 19:GetOverlayPosition */
+            3,      /* 19:GetOverlayPosition (lX,lY) */
             2,      /* 20:GetPalette */
             2,      /* 21:GetPixelFormat */
             2,      /* 22:GetSurfaceDesc (implemented) */
@@ -1383,7 +1670,7 @@ static void ddraw_init_com32(void)
             1,      /* 27:Restore */
             2,      /* 28:SetClipper */
             3,      /* 29:SetColorKey */
-            2,      /* 30:SetOverlayPosition */
+            3,      /* 30:SetOverlayPosition (X,Y) */
             2,      /* 31:SetPalette */
             2,      /* 32:Unlock (implemented) */
         };
@@ -1543,9 +1830,24 @@ PVOID ddraw_resolve(const char *func_name, USHORT ordinal, BOOL by_ordinal)
 
 PVOID ddraw_shim_init(void)
 {
+    /* Full reset for process re-exec (UT99 relaunches itself to apply a video
+     * change). CRITICAL: com32_initialized must drop so ddraw_init_com32 builds
+     * FRESH COM proxy vtables — compat32_init() re-allocates the thunk pool each
+     * run, so the old vtables hold dangling thunk addresses. Old proxy/surface
+     * pages leak (bounded by relaunch count). */
+    com32_initialized = 0;
     surface_count = 0;
+    dd_memset(surfaces, 0, sizeof(surfaces));
+    g_present_surface = NULL;
+    g_present_src_w = 0;
+    g_present_src_h = 0;
+    display_width  = 640;
+    display_height = 480;
+    display_bpp    = 16;
     framebuffer = NULL;
     fb_size = 0;
+    gop_pitch = 0;
+    ddraw_hwnd = NULL;
     dd_memset(&g_ddpalette, 0, sizeof(g_ddpalette));
     dd_memset(&g_ddclipper, 0, sizeof(g_ddclipper));
     return (PVOID)ddraw_exports;

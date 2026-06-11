@@ -155,6 +155,18 @@ static void reg_set_value(const char *key_path, const char *name,
     }
 }
 
+static void reg_init(void);
+
+/* Public entry for the MSI installer: write a value at an already-normalized
+ * lowercase backslash path (e.g. "hklm\\software\\app"). Ensures the store is
+ * initialized first so installer-written rows survive alongside UT99 defaults. */
+void advapi32_reg_install_set(const char *path_lc_backslash, const char *name,
+                             DWORD type, const void *data, DWORD len)
+{
+    reg_init();
+    reg_set_value(path_lc_backslash, name, type, data, len);
+}
+
 static void reg_init(void)
 {
     if (reg_initialized) return;

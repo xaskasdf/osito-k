@@ -35,10 +35,14 @@ int2e_stub:
     pushq (%r11)                     /* [RSP] = old IST1 */
 
     /* Update IST1 to well below current RSP.
-     * Must leave room for compat32_dispatch + _initterm + compat32_callback
-     * + kern_setjmp call chain (~1KB). Nested INTs push BELOW this. */
+     * Must leave room for compat32_dispatch + compat32_seh_dispatch +
+     * compat32_callback + kern_setjmp call chain (measured ~1-3KB). Nested
+     * INTs push BELOW this. 16KB/level over a 1MB IST1 stack = 64 nesting
+     * levels — UT99's boot C++ exception storm re-throws deeply (>8), so the
+     * old 32KB/level over 256KB (= only 8 levels) overflowed IST1 down into
+     * kernel BSS/code and corrupted it (flaky boot #UD/wild-write). */
     movq %rsp, %r10
-    subq $32768, %r10
+    subq $16384, %r10
     movq %r10, (%r11)
 
     /*
@@ -160,7 +164,10 @@ int2e_stub:
 .section .bss
 .align 8
 g_int2e_rsp_stack:
-    .fill 32, 8, 0              /* 32 depth levels × 8 bytes */
+    .fill 96, 8, 0             /* 96 depth levels × 8 bytes — must exceed the
+                                 IST1 nesting capacity (1MB / 16KB = 64 levels)
+                                 so deep boot-storm nesting can't overflow this
+                                 saved-RSP array into adjacent BSS. */
 /* g_int2e_rsp_depth defined in compat32.c */
 
 .section .note.GNU-stack,"",%progbits

@@ -224,6 +224,83 @@ static void ensure_gmalloc_stub(void)
     serial_puts("\n");
 }
 
+/* ── B8 fix: FMallocWindows Free router (allocator-mismatch) ────────
+ * This build's FMallocWindows is a custom pool allocator: it frees by
+ * PoolIndirect[ptr>>24][(ptr>>16)&0xff]. Blocks our stub/Heap/CRT
+ * allocators hand out during preload live in LOW memory (< 0x40000000,
+ * the kmalloc pool) which FMallocWindows never registered -> the lookup
+ * returns an empty FPoolInfo -> wild NULL/garbage writes (what the
+ * FMW-POOL-SKIP band-aid masks). Fix: replace the FMallocWindows vtable's
+ * Free slot (vtbl[2]) with a 32-bit router that no-op-LEAKS foreign (low)
+ * pointers (they were bump-pool allocated; leaking the bounded preload set
+ * is harmless) and tail-calls the REAL Free for native (>= 0x40000000)
+ * pointers. FMalloc::Free is __thiscall (ecx=this, [esp+4]=ptr, ret 4).
+ * Native blocks are always >= 0x40000000 (win32_va_alloc base), foreign
+ * always < 0x40000000, so the threshold cleanly separates them. */
+extern void *mem_alloc_pages(uint64_t count);
+static uint8_t *fmw_router_pool = NULL;
+static uint32_t fmw_router_used = 0;
+
+static uint32_t fmw_build_free_router(uint32_t real_free)
+{
+    if (!fmw_router_pool) {
+        fmw_router_pool = (uint8_t *)mem_alloc_pages(1);
+        if (!fmw_router_pool) return 0;
+    }
+    if (fmw_router_used + 32 > 4096) return 0;
+    uint8_t *p = fmw_router_pool + fmw_router_used;
+    int o = 0;
+    p[o++]=0x8B; p[o++]=0x44; p[o++]=0x24; p[o++]=0x04;              /* mov eax,[esp+4]   ; ptr */
+    p[o++]=0x3D; p[o++]=0x00; p[o++]=0x00; p[o++]=0x00; p[o++]=0x40; /* cmp eax,0x40000000     */
+    p[o++]=0x73; p[o++]=0x05;                                        /* jae +5 (native)        */
+    p[o++]=0x31; p[o++]=0xC0;                                        /* xor eax,eax            */
+    p[o++]=0xC2; p[o++]=0x04; p[o++]=0x00;                           /* ret 4   (foreign no-op)*/
+    uint32_t site = (uint32_t)(uintptr_t)(p + o);
+    int32_t rel = (int32_t)(real_free - (site + 5));
+    p[o++]=0xE9; p[o++]=rel & 0xff; p[o++]=(rel>>8)&0xff;
+    p[o++]=(rel>>16)&0xff; p[o++]=(rel>>24)&0xff;                    /* jmp real_free          */
+    fmw_router_used += (uint32_t)((o + 15) & ~15);
+    return (uint32_t)(uintptr_t)p;
+}
+
+static void fmw_install_router(uint32_t obj_addr)
+{
+    if (obj_addr < 0x10000 || obj_addr >= 0x80000000) return;
+    volatile uint32_t *obj = (volatile uint32_t *)(uintptr_t)obj_addr;
+    uint32_t vtbl = *obj;
+    if (vtbl < 0x10000 || vtbl >= 0x80000000) return;
+    /* Never router our own stub vtable (its HeapFree path is correct). */
+    if (vtbl == (uint32_t)(uintptr_t)stub_fmalloc_vtbl) return;
+    volatile uint32_t *vt = (volatile uint32_t *)(uintptr_t)vtbl;
+    uint32_t real_free = vt[2];
+    /* Already routed? (vtbl[2] points into our router pool) */
+    if (fmw_router_pool) {
+        uint32_t lo = (uint32_t)(uintptr_t)fmw_router_pool;
+        if (real_free >= lo && real_free < lo + 4096) return;
+    }
+    /* Sanity: the real Free must be PE code (Core.dll/UT.exe range). */
+    if (real_free < 0x10100000 || real_free >= 0x11000000) return;
+    uint32_t router = fmw_build_free_router(real_free);
+    if (!router) return;
+    vt[2] = router;
+    serial_puts("[FMW-ROUTER] obj=0x"); serial_puthex(obj_addr, 8);
+    serial_puts(" vtbl=0x"); serial_puthex(vtbl, 8);
+    serial_puts(" realFree=0x"); serial_puthex(real_free, 8);
+    serial_puts(" router=0x"); serial_puthex(router, 8);
+    serial_puts("\n");
+}
+
+/* Install the Free router on every live FMallocWindows object we know of:
+ * the UT.exe instance (0x1092F738, the one the probe caught corrupting) and
+ * the Core.dll GMalloc object (*0x101A7B90). Idempotent + cheap; called from
+ * ensure_gmalloc_stub so it fires as soon as each real vtable is set. */
+static void fmw_install_routers(void)
+{
+    fmw_install_router(0x1092F738);
+    volatile uint32_t *gmalloc = (volatile uint32_t *)(uintptr_t)0x101A7B90;
+    fmw_install_router(*gmalloc);
+}
+
 void WINAPI _initterm(_PVFV *pfbegin, _PVFV *pfend)
 {
 #ifndef TEST_HARNESS
@@ -231,6 +308,7 @@ void WINAPI _initterm(_PVFV *pfbegin, _PVFV *pfend)
      * Core.dll's global constructors and DLL _initterm callbacks may
      * use appMalloc BEFORE the EXE's appInit() sets up FMallocWindows. */
     ensure_gmalloc_stub();
+    fmw_install_routers();   /* B8: route foreign frees away from FMallocWindows */
 
     /* PE32 mode: treat as array of uint32_t function pointers */
     uint32_t *begin32 = (uint32_t *)(ULONG_PTR)pfbegin;
@@ -250,6 +328,7 @@ void WINAPI _initterm(_PVFV *pfbegin, _PVFV *pfend)
     for (uint32_t *p = begin32; p < end32; p++, idx++) {
         if (*p) {
             ensure_gmalloc_stub();  /* re-check before EACH callback */
+            fmw_install_routers();  /* B8: (re)install Free router once vtable is live */
             if (audit_mode) {
                 serial_puts("[INIT] [");
                 serial_putdec((uint64_t)idx);
@@ -2290,6 +2369,45 @@ void WINAPI crt_CxxThrowException(PVOID pExceptionObject, PVOID pThrowInfo)
     serial_puthex(throw_eip, 8);
     serial_puts("\n");
 
+    /* [THROWMSG] diagnostic: UT99's New-Game crash is preceded by a recoverable
+     * `throw (TCHAR*)errmsg` (throwInfo 0x1017D4B0, type wchar_t*) from a failed
+     * map load. The thrown object is the TCHAR* pointer; dump the message it
+     * points to (first few) to learn WHY the load fails (the crash trigger). */
+    {
+        static int throwmsg_n = 0;
+        if (pThrowInfo == (PVOID)(uintptr_t)0x1017D4B0ULL && throwmsg_n < 6 && pExceptionObject) {
+            throwmsg_n++;
+            uint32_t pstr = *(volatile uint32_t *)pExceptionObject;  /* TCHAR* */
+            serial_puts("[THROWMSG] \"");
+            if (pstr >= 0x10000 && pstr < 0x80000000) {
+                const uint16_t *w = (const uint16_t *)(uintptr_t)pstr;
+                for (int k = 0; k < 160 && w[k]; k++) {
+                    char c = (w[k] >= 0x20 && w[k] < 0x7F) ? (char)w[k] : '?';
+                    char s[2] = { c, 0 }; serial_puts(s);
+                }
+            }
+            serial_puts("\"\n");
+        }
+    }
+
+    /* [GERRHIST DIAGNOSTIC — uncommitted] For appError `throw 1` (funclet rethrow
+     * @0x10903EE4), the message is in GErrorHist (Core.dll buffer @0x101E3474, UTF-16),
+     * not the throw object. Dump it once-per-cascade to learn the real fatal reason
+     * (e.g. render/audio device init failure) behind the render-frontier exit. */
+    {
+        static int gerr_n = 0;
+        const volatile uint16_t *gh = (const volatile uint16_t *)(uintptr_t)0x101E3474ULL;
+        if (gerr_n < 4 && gh[0] != 0) {
+            gerr_n++;
+            serial_puts("[GERRHIST] \"");
+            for (int k = 0; k < 240 && gh[k]; k++) {
+                char c = (gh[k] >= 0x20 && gh[k] < 0x7F) ? (char)gh[k] : '?';
+                char s[2] = { c, 0 }; serial_puts(s);
+            }
+            serial_puts("\"\n");
+        }
+    }
+
     /* Dump thrown object to identify the error message.
      * Try reading the first few fields and interpret as string pointers. */
     if (pExceptionObject) {
@@ -3514,6 +3632,7 @@ int WINAPI crt_vsnwprintf(WCHAR *buf, SIZE_T count, const WCHAR *fmt, ms_va_list
              * %ls is also wide string. We treat both the same. */
             uint32_t raw_ptr = *vp++;
             const WCHAR *ws = (const WCHAR *)(uintptr_t)raw_ptr;
+#ifndef OK_QUIET
             if (vsnw_trace_count <= 30) {
                 serial_puts("  %s ptr=0x");
                 serial_puthex((uint64_t)raw_ptr, 8);
@@ -3525,6 +3644,7 @@ int WINAPI crt_vsnwprintf(WCHAR *buf, SIZE_T count, const WCHAR *fmt, ms_va_list
                 }
                 serial_puts("\n");
             }
+#endif
             if (!ws) ws = (const WCHAR[]){'(','n','u','l','l',')',0};
             int n = 0;
             while (ws[n]) n++;
@@ -3814,7 +3934,8 @@ WCHAR* WINAPI crt_wcscpy(WCHAR *dst, const WCHAR *src)
      * EIP via compat32's saved per-thunk return address. */
     if (src && ((uintptr_t)src >= 0x10000) && ((uintptr_t)src < 0x80000000ULL)) {
         const WCHAR *s = src;
-        if (s[0] == L'0' && s[1] == 0) {
+        static uint32_t wcs0_log_n = 0;
+        if (s[0] == L'0' && s[1] == 0 && wcs0_log_n++ < 8) {
             extern uint32_t compat32_get_last_caller_eip(void);
             extern uint32_t g_last_stack_args;
             extern void serial_puts(const char *s);
@@ -3834,6 +3955,27 @@ WCHAR* WINAPI crt_wcscpy(WCHAR *dst, const WCHAR *src)
             serial_puts(" outer_eip=0x");
             serial_puthex((uint64_t)outer, 8);
             serial_puts("\n");
+            /* [BT-0 DIAGNOSTIC — uncommitted] First few times only, walk the
+             * guest stack and print PE-code return addresses so we can identify
+             * the iterator that keeps appending the bad "0" name. */
+            {
+                static int bt0_n = 0;
+                if (bt0_n < 4 && g_last_stack_args) {
+                    bt0_n++;
+                    uint32_t *sp = (uint32_t *)(uintptr_t)g_last_stack_args;
+                    serial_puts("[BT-0]");
+                    int printed = 0;
+                    for (int k = 0; k < 64 && printed < 12; k++) {
+                        uint32_t v = sp[k];
+                        if (v >= 0x10100000 && v < 0x11000000) {
+                            serial_puts(" 0x");
+                            serial_puthex((uint64_t)v, 8);
+                            printed++;
+                        }
+                    }
+                    serial_puts("\n");
+                }
+            }
         }
     }
     WCHAR *d = dst;
@@ -4255,5 +4397,13 @@ PVOID msvcrt_resolve(const char *func_name, USHORT ordinal, BOOL by_ordinal)
 PVOID msvcrt_shim_init(void)
 {
     ensure_stdio_init();
+    /* Re-exec resets. stub_gmalloc_installed is a one-shot whose stub vtable
+     * holds thunks into the PREVIOUS run's thunk pool (compat32_init re-allocates
+     * it) — must rebuild. The FMW Free router likewise re-installs on the freshly
+     * reloaded Core.dll/UT.exe vtables; drop the old router pool (page leaks,
+     * bounded by relaunch count). */
+    stub_gmalloc_installed = 0;
+    fmw_router_pool = NULL;
+    fmw_router_used = 0;
     return (PVOID)msvcrt_exports;
 }

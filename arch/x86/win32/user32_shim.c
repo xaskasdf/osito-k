@@ -292,6 +292,69 @@ static BYTE extended_scancode_to_vk(BYTE sc)
 static POINT cursor_pos = { 320, 240 };
 static int   cursor_visible = 1;
 static HWND  capture_hwnd = NULL;
+static HWND  focus_hwnd   = NULL;   /* SetFocus / WM_SETFOCUS target */
+static int   clip_active  = 0;      /* ClipCursor(rect!=NULL) in effect */
+
+/* Relative-delta tracker for the absolute (usb-tablet) pointer while in-game
+ * mouse-look. Invalidated whenever we leave mouse-look so re-entry starts
+ * fresh (no stale-position jump). */
+static int   g_abs_prev_valid = 0;
+static int   g_abs_prev_sx = 0, g_abs_prev_sy = 0;
+
+/*
+ * In-game mouse-look gate. UT99's UWindowsViewport does NOT call user32
+ * SetCapture when it grabs the mouse for mouse-look; instead (see WinDrv
+ * SetMouseCapture @0x11106610) it ShowCursor(FALSE) + ClipCursor(rect) +
+ * SetCursorPos(center) and then, per WM_MOUSEMOVE, reads the absolute cursor
+ * pos, subtracts the recenter origin to get a delta, and SetCursorPos(center)
+ * again. So the reliable "we are in mouse-look" signal in our layer is: the
+ * cursor is hidden (ShowCursor count < 0) or the cursor is clipped, or an
+ * explicit SetCapture is in force. The menu uses none of these (cursor shown,
+ * unclipped, uncaptured) → it keeps the absolute path. */
+static int mouselook_active(void)
+{
+    return (cursor_visible < 0) || clip_active || (capture_hwnd != NULL);
+}
+
+/* The in-game viewport window handle: the most-recently-created *used* window
+ * whose class is UT's viewport window class. Falls back to focus, then to the
+ * last used window. This is the window WinDrv's ViewportWndProc is bound to and
+ * the one that must receive in-game keyboard + mouse input. */
+static int is_viewport_class(const char *name)
+{
+    /* UT registers "UnrealTournamentUnrealWWindowsViewportWindow" (wide→narrow
+     * may corrupt the first char), so match the stable substring. */
+    if (!name) return 0;
+    const char *needle = "ViewportWindow";
+    for (const char *p = name; *p; p++) {
+        const char *a = p, *b = needle;
+        while (*a && *b && *a == *b) { a++; b++; }
+        if (!*b) return 1;
+    }
+    return 0;
+}
+
+static HWND viewport_hwnd(void)
+{
+    for (int i = window_count - 1; i >= 0; i--) {
+        if (windows[i].used && is_viewport_class(windows[i].class_name))
+            return windows[i].handle;
+    }
+    return NULL;
+}
+
+/* Keyboard/mouse input target. In-game (mouse-look) the viewport owns input
+ * regardless of which UWindow was created last; otherwise honor the focused
+ * window (menu/console), then fall back to the last used window. */
+static HWND input_target(void)
+{
+    HWND vp = viewport_hwnd();
+    if (mouselook_active() && vp) return vp;
+    if (focus_hwnd && find_window(focus_hwnd)) return focus_hwnd;
+    for (int i = window_count - 1; i >= 0; i--)
+        if (windows[i].used) return windows[i].handle;
+    return vp;
+}
 
 /* ── Default screen dimensions ─────────────────────────────── */
 
@@ -436,6 +499,50 @@ BOOL WINAPI UnregisterClassA(PCSTR lpClassName, HINSTANCE hInstance)
     return FALSE;
 }
 
+/* Deliver WM_SIZE to a window's 32-bit wndproc. Real Windows posts WM_SIZE
+ * synchronously when a window is created with a size, resized, or shown — UE1's
+ * UWindowsViewport learns SizeX/SizeY from this message (its WndProc WM_SIZE
+ * handler calls ResizeViewport). Without it the viewport stays 0x0 → SoftDrv
+ * SetRes(0,0) → DirectDraw SetDisplayMode(0,0) → zero-size surface → no frame.
+ * compat32_callback_args handles the 64→32 mode switch (nesting-safe). */
+static void dispatch_wm_size(WINDOW *w)
+{
+    if (!w || !w->wndproc || w->width == 0 || w->height == 0) return;
+    extern uint32_t compat32_callback_args(uint32_t func, int nargs,
+                                            const uint32_t *args);
+    uint32_t args[4] = {
+        (uint32_t)(uintptr_t)w->handle,
+        WM_SIZE,
+        0,  /* wParam = SIZE_RESTORED */
+        ((uint32_t)w->width & 0xFFFF) | (((uint32_t)w->height & 0xFFFF) << 16),
+    };
+    compat32_callback_args((uint32_t)(uintptr_t)w->wndproc, 4, args);
+}
+
+/* Tell the engine its window is the active, focused foreground app. UE1's
+ * UWindowsViewport gates realtime rendering on activation: without these
+ * messages the viewport renders one init frame then idles (no per-frame
+ * Repaint → no DDraw present). Real Windows delivers this sequence when a
+ * window is shown and brought to the foreground. */
+static int g_activated = 0;
+static void dispatch_wm_activate(WINDOW *w)
+{
+    if (!w || !w->wndproc) return;
+    extern uint32_t compat32_callback_args(uint32_t func, int nargs,
+                                            const uint32_t *args);
+    uint32_t fn = (uint32_t)(uintptr_t)w->wndproc;
+    uint32_t h  = (uint32_t)(uintptr_t)w->handle;
+    uint32_t a_app[4]  = { h, WM_ACTIVATEAPP, 1, 0 };        /* TRUE, no thread */
+    uint32_t a_ncact[4]= { h, WM_NCACTIVATE, 1, 0 };
+    uint32_t a_act[4]  = { h, WM_ACTIVATE, 1 /*WA_ACTIVE*/, 0 };
+    uint32_t a_focus[4]= { h, WM_SETFOCUS, 0, 0 };
+    compat32_callback_args(fn, 4, a_app);
+    compat32_callback_args(fn, 4, a_ncact);
+    compat32_callback_args(fn, 4, a_act);
+    compat32_callback_args(fn, 4, a_focus);
+    serial_puts("[USER32] dispatched WM_ACTIVATEAPP/ACTIVATE/SETFOCUS\n");
+}
+
 HWND WINAPI CreateWindowExA(DWORD dwExStyle, PCSTR lpClassName,
                             PCSTR lpWindowName, DWORD dwStyle,
                             int X, int Y, int nWidth, int nHeight,
@@ -523,42 +630,58 @@ HWND WINAPI CreateWindowExA(DWORD dwExStyle, PCSTR lpClassName,
     serial_puthex(nHeight, 4);
     serial_puts("\n");
 
-    /* Simulate WM_NCCREATE: write hWnd at WWindow::hWnd (this+4).
-     *
-     * The engine passes `this` as lpParam (arg 12 of CreateWindowExW).
-     * Due to a stack layout quirk in the compat32 thunk, lpParam arrives
-     * as 0 but the real `this` pointer is at stack_args[12] (one slot
-     * past the declared 12 args). As a workaround, if lpParam is NULL
-     * we look at the caller's stack for a plausible WWindow pointer. */
+    /* WM_NCCREATE — the NT-correct window setup. Real Windows calls the
+     * registered WndProc with WM_NCCREATE during CreateWindow, passing a
+     * CREATESTRUCT whose lpCreateParams is the caller's `this` (lpParam, arg 12).
+     * UT99's Window.dll WWindow::StaticProc reads lpCreateParams there, sets
+     * WWindow->hWnd, and adds the WWindow to its global _Windows list. For every
+     * later message StaticProc walks _Windows by hWnd to find the WWindow and
+     * call its real WndProc. If we never send WM_NCCREATE, the WWindow is never
+     * added to _Windows, so StaticProc can't map hwnd->WWindow and routes
+     * WM_KEYDOWN to DefWindowProc — the game never receives keys and the menu
+     * (Escape=ShowMenu) never opens. So send the real WM_NCCREATE rather than
+     * poking WWindow->hWnd directly (which would also trip StaticProc's
+     * check(!WWindow->hWnd) assertion). */
     {
         uint32_t wwindow_addr = (uint32_t)(ULONG_PTR)lpParam;
-
-        /* If lpParam is NULL, try the 13th stack arg (compat32 off-by-one) */
-        if (!wwindow_addr && lpClassName) {
-            /* The className pointer typically points into the same
-             * stack region as `this`. Use className as a heuristic
-             * to validate stack_args[12] if we can access it. */
-            extern int g_compat32_mode;
-            if (g_compat32_mode) {
-                /* Read the 13th arg from the compat32 stack.
-                 * This is a pragmatic workaround: the PE32 code's CALL
-                 * leaves `this` one slot beyond the declared 12 args. */
-                extern uint32_t g_compat32_last_stack_arg13;
-                if (g_compat32_last_stack_arg13 >= 0x10000)
-                    wwindow_addr = g_compat32_last_stack_arg13;
+        if (w->wndproc && wwindow_addr >= 0x10000) {
+            extern uint32_t compat32_callback_args(uint32_t func, int nargs,
+                                                    const uint32_t *args);
+            /* 32-bit CREATESTRUCTA (12 dwords) in PE32-accessible memory so the
+             * 32-bit StaticProc can dereference lParam. */
+            static volatile uint32_t *cs = 0;
+            if (!cs) {
+                extern void *mem_alloc_pages(uint64_t count);
+                cs = (volatile uint32_t *)mem_alloc_pages(1);
+            }
+            if (cs) {
+                cs[0]  = wwindow_addr;                       /* lpCreateParams */
+                cs[1]  = (uint32_t)(ULONG_PTR)hInstance;     /* hInstance */
+                cs[2]  = (uint32_t)(ULONG_PTR)hMenu;         /* hMenu */
+                cs[3]  = (uint32_t)(ULONG_PTR)hWndParent;    /* hwndParent */
+                cs[4]  = (uint32_t)nHeight;                  /* cy */
+                cs[5]  = (uint32_t)nWidth;                   /* cx */
+                cs[6]  = (uint32_t)Y;                        /* y */
+                cs[7]  = (uint32_t)X;                        /* x */
+                cs[8]  = dwStyle;                            /* style */
+                cs[9]  = (uint32_t)(ULONG_PTR)lpWindowName;  /* lpszName */
+                cs[10] = (uint32_t)(ULONG_PTR)lpClassName;   /* lpszClass */
+                cs[11] = dwExStyle;                          /* dwExStyle */
+                uint32_t args[4] = {
+                    (uint32_t)(uintptr_t)w->handle, WM_NCCREATE, 0,
+                    (uint32_t)(uintptr_t)cs
+                };
+                compat32_callback_args((uint32_t)(uintptr_t)w->wndproc, 4, args);
             }
         }
-
-        /* Direct write: set this->hWnd = hwnd at offset +4.
-         * NOTE: currently lpParam arrives as 0 (off-by-one in compat32
-         * stack extraction needs investigation). The workaround using
-         * g_compat32_last_stack_arg13 is incorrect — it reads the class
-         * name pointer, not the WWindow this pointer. */
-        if (wwindow_addr >= 0x10000) {
-            uint32_t *ww = (uint32_t *)(uintptr_t)wwindow_addr;
-            ww[1] = (uint32_t)(ULONG_PTR)w->handle;
-        }
     }
+
+    /* Real Windows sends WM_SIZE during CreateWindow when the window has a
+     * non-zero size. UE1's viewport window is created already sized (e.g.
+     * 640x480), so this is where it must learn SizeX/SizeY — there is no later
+     * MoveWindow. Dispatched after the hWnd↔this association above so the
+     * WndProc can resolve the window. */
+    dispatch_wm_size(w);
 
     return w->handle;
 }
@@ -593,8 +716,19 @@ BOOL WINAPI ShowWindow(HWND hWnd, int nCmdShow)
     int was_visible = w->visible;
     w->visible = (nCmdShow != SW_HIDE) ? 1 : 0;
 
-    /* Don't call wndproc directly — it's 32-bit PE code.
-     * WM_SHOWWINDOW is informational; the engine doesn't need it dispatched. */
+    /* On first show, real Windows posts WM_SIZE to the wndproc. UE1's viewport
+     * may rely on this (rather than the WM_SIZE during CreateWindow) to pick up
+     * SizeX/SizeY before the render device is set up. compat32_callback_args
+     * handles the 64→32 switch. */
+    if (!was_visible && w->visible) {
+        dispatch_wm_size(w);
+        /* First time a real (wndproc-backed) window is shown, activate it so
+         * the engine enters realtime rendering. Only once, for the viewport. */
+        if (!g_activated && w->wndproc) {
+            g_activated = 1;
+            dispatch_wm_activate(w);
+        }
+    }
 
     return was_visible;
 }
@@ -624,10 +758,18 @@ BOOL WINAPI SetWindowPos(HWND hWnd, HWND hWndInsertAfter,
                          int X, int Y, int cx, int cy, DWORD uFlags)
 {
     (void)hWndInsertAfter;
-    (void)uFlags;
     WINDOW *w = find_window(hWnd);
     if (!w) return FALSE;
-    w->x = X; w->y = Y; w->width = cx; w->height = cy;
+    /* Honor SWP_NOMOVE (0x0002) / SWP_NOSIZE (0x0001): leave pos/size untouched
+     * when the caller asks to. The old code clobbered them to X/Y/cx/cy
+     * unconditionally, so a SWP_NOSIZE call (cx=cy=0) would zero the window. */
+    if (!(uFlags & 0x0002)) { w->x = X; w->y = Y; }
+    if (!(uFlags & 0x0001)) {
+        DWORD old_w = w->width, old_h = w->height;
+        w->width = cx; w->height = cy;
+        if ((DWORD)cx != old_w || (DWORD)cy != old_h)
+            dispatch_wm_size(w);
+    }
     return TRUE;
 }
 
@@ -635,10 +777,12 @@ BOOL WINAPI MoveWindow(HWND hWnd, int X, int Y, int nWidth, int nHeight, BOOL bR
 {
     WINDOW *w = find_window(hWnd);
     if (!w) return FALSE;
+    DWORD old_w = w->width, old_h = w->height;
     w->x = X; w->y = Y; w->width = nWidth; w->height = nHeight;
-    if (bRepaint && w->wndproc && w->visible)
-        /* wndproc is 32-bit PE code — can't call from 64-bit */
-        (void)w; /* WM_PAINT not dispatched */
+    (void)bRepaint;
+    /* Resizing posts WM_SIZE in real Windows; UE1's viewport relies on it. */
+    if ((DWORD)nWidth != old_w || (DWORD)nHeight != old_h)
+        dispatch_wm_size(w);
     return TRUE;
 }
 
@@ -650,6 +794,20 @@ BOOL WINAPI PeekMessageA(LPMSG lpMsg, HWND hWnd, DWORD wMsgFilterMin,
     (void)hWnd;
     (void)wMsgFilterMin;
     (void)wMsgFilterMax;
+
+    /* Present the current software-rendered frame each pump iteration.
+     * SoftDrv keeps its render target Locked and never issues the fullscreen
+     * Flip in our setup, so this is where frames reach the GOP framebuffer. */
+    { extern void ddraw_present_hook(void); ddraw_present_hook(); }
+
+    /* Poll USB HID so keyboard/mouse reach the win32 input state during a
+     * win32 game's message loop. A foreground win32 process runs with the
+     * APIC timer masked (no preemption), so the compositor kthread that
+     * normally owns USB polling never runs — we must poll here ourselves. */
+    {
+        extern void xhci_poll(void) __attribute__((weak));
+        if (xhci_poll) xhci_poll();
+    }
 
     static int peek_log_count = 0;
     if (peek_log_count < 3) {
@@ -918,13 +1076,29 @@ BOOL WINAPI KillTimer(HWND hWnd, ULONG_PTR uIDEvent)
     return TRUE;
 }
 
+/* Report the real GOP framebuffer resolution as the "desktop" so UT99 keeps
+ * the larger DirectDraw-enumerated modes (it filters out modes bigger than the
+ * desktop). Falls back to the compiled default if the GOP isn't up yet. */
+extern uint32_t fb_get_width(void)  __attribute__((weak));
+extern uint32_t fb_get_height(void) __attribute__((weak));
+static int screen_cx(void)
+{
+    uint32_t w = (fb_get_width && fb_get_width()) ? fb_get_width() : 0;
+    return w ? (int)w : SCREEN_WIDTH;
+}
+static int screen_cy(void)
+{
+    uint32_t h = (fb_get_height && fb_get_height()) ? fb_get_height() : 0;
+    return h ? (int)h : SCREEN_HEIGHT;
+}
+
 int WINAPI GetSystemMetrics(int nIndex)
 {
     switch (nIndex) {
-    case SM_CXSCREEN:      return SCREEN_WIDTH;
-    case SM_CYSCREEN:      return SCREEN_HEIGHT;
-    case SM_CXFULLSCREEN:  return SCREEN_WIDTH;
-    case SM_CYFULLSCREEN:  return SCREEN_HEIGHT;
+    case SM_CXSCREEN:      return screen_cx();
+    case SM_CYSCREEN:      return screen_cy();
+    case SM_CXFULLSCREEN:  return screen_cx();
+    case SM_CYFULLSCREEN:  return screen_cy();
     default:               return 0;
     }
 }
@@ -981,19 +1155,41 @@ BOOL WINAPI EnumDisplaySettingsA(const char *device, uint32_t mode, DEVMODEA *dm
     (void)device;
     if (!dm) return FALSE;
 
-    /* Return our single supported mode */
+    /* Enumerable resolution × depth table (matches dd_EnumDisplayModes). Some
+     * apps walk EnumDisplaySettings(0,1,2,...) until it returns FALSE to build
+     * their resolution list, so offer the standard set, not a single mode. */
+    static const struct { uint16_t w, h; } res[] = {
+        {640, 480}, {800, 600}, {1024, 768},
+    };
+    static const uint8_t bpps[] = { 16, 32 };
+
     memset(dm, 0, sizeof(*dm));
     dm->dmSize = sizeof(*dm);
     dm->dmFields = DM_BITSPERPEL | DM_PELSWIDTH | DM_PELSHEIGHT;
-    dm->dmBitsPerPel = 32;
-    dm->dmPelsWidth = SCREEN_WIDTH;
-    dm->dmPelsHeight = SCREEN_HEIGHT;
     dm->dmDisplayFrequency = 60;
 
-    /* Only mode index 0 and ENUM_CURRENT_SETTINGS are valid */
-    if (mode == 0 || mode == ENUM_CURRENT_SETTINGS)
+    if (mode == ENUM_CURRENT_SETTINGS) {
+        /* Report the live DirectDraw mode (the layer's "current mode" authority)
+         * so user32/gdi32/ddraw agree; fall back to GOP size + 16bpp pre-ddraw. */
+        extern void ddraw_get_display_mode(uint32_t *w, uint32_t *h, uint32_t *bpp)
+            __attribute__((weak));
+        uint32_t cw = 0, ch = 0, cb = 0;
+        if (ddraw_get_display_mode) ddraw_get_display_mode(&cw, &ch, &cb);
+        dm->dmBitsPerPel = cb ? cb : 16;
+        dm->dmPelsWidth  = cw ? cw : (uint32_t)screen_cx();
+        dm->dmPelsHeight = ch ? ch : (uint32_t)screen_cy();
         return TRUE;
-    return FALSE;
+    }
+
+    /* index = res-major, bpp-minor */
+    const uint32_t nres = sizeof(res) / sizeof(res[0]);
+    const uint32_t nbpp = sizeof(bpps) / sizeof(bpps[0]);
+    if (mode >= nres * nbpp) return FALSE;
+    uint32_t ri = mode / nbpp, bi = mode % nbpp;
+    dm->dmBitsPerPel = bpps[bi];
+    dm->dmPelsWidth  = res[ri].w;
+    dm->dmPelsHeight = res[ri].h;
+    return TRUE;
 }
 
 BOOL WINAPI EnumDisplaySettingsW(const void *device, uint32_t mode, void *dm)
@@ -1043,7 +1239,14 @@ HWND WINAPI GetForegroundWindow(void)
     return NULL;
 }
 
-HWND WINAPI SetFocus(HWND hWnd) { return hWnd; }
+HWND WINAPI SetFocus(HWND hWnd)
+{
+    HWND old = focus_hwnd;
+    /* Only track real windows we know about; NULL clears focus. */
+    if (hWnd == NULL || find_window(hWnd))
+        focus_hwnd = hWnd;
+    return old;
+}
 HWND WINAPI GetDesktopWindow(void) { return (HWND)(ULONG_PTR)0xD0000001; }
 HWND WINAPI GetActiveWindow(void) { return GetForegroundWindow(); }
 
@@ -1072,7 +1275,11 @@ int WINAPI ShowCursor(BOOL bShow)
 
 BOOL WINAPI ClipCursor(const RECT *lpRect)
 {
-    (void)lpRect;
+    /* UT99's viewport calls ClipCursor(rect) when entering mouse-look and
+     * ClipCursor(NULL) when releasing it. Track this so the input path knows
+     * whether to deliver relative deltas (in-game) or absolute coords (menu).
+     * We do not actually constrain the cursor here. */
+    clip_active = (lpRect != NULL);
     return TRUE;
 }
 
@@ -1328,8 +1535,23 @@ LRESULT WINAPI DispatchMessageW(const MSG *lpMsg)
 
 LRESULT WINAPI SendMessageW(HWND hWnd, DWORD Msg, WPARAM wParam, LPARAM lParam)
 {
-    (void)hWnd; (void)Msg; (void)wParam; (void)lParam;
-    return 0;
+    /* UT99 is a Unicode build and uses the W variant; this must dispatch to the
+     * 32-bit wndproc exactly like SendMessageA (previously a no-op return 0,
+     * which silently dropped engine messages such as WM_SIZE/WM_ACTIVATE). */
+    WINDOW *w = find_window(hWnd);
+    if (w && w->wndproc) {
+        extern uint32_t compat32_callback_args(uint32_t func, int nargs,
+                                                const uint32_t *args);
+        uint32_t args[4] = {
+            (uint32_t)(uintptr_t)hWnd,
+            (uint32_t)Msg,
+            (uint32_t)wParam,
+            (uint32_t)lParam
+        };
+        return (LRESULT)compat32_callback_args(
+            (uint32_t)(uintptr_t)w->wndproc, 4, args);
+    }
+    return DefWindowProcW(hWnd, Msg, wParam, lParam);
 }
 
 LRESULT WINAPI SendMessageTimeoutW(HWND hWnd, DWORD Msg, WPARAM wParam, LPARAM lParam,
@@ -1461,11 +1683,18 @@ void win32_post_keyboard_event(BYTE scancode, BOOL key_up)
             key_state[VK_MENU] |= 0x80;
     }
 
-    /* Find active window for message target */
-    HWND target = NULL;
-    for (int i = window_count - 1; i >= 0; i--) {
-        if (windows[i].used) { target = (HWND)(ULONG_PTR)(i + 1); break; }
-    }
+    /* Find active window for message target. MUST use the window's real handle
+     * (windows[i].handle) — find_window() matches by handle, and Window.dll's
+     * StaticProc maps hwnd->WWindow by the same handle. Using (i+1) here made
+     * find_window() fail (handle 0xA00000xx != i+1), so DispatchMessage dropped
+     * every key to DefWindowProc and the game never saw input.
+     *
+     * input_target() routes to the in-game VIEWPORT window when mouse-look is
+     * active (so WASD/arrows reach UWindowsViewport::ViewportWndProc → the same
+     * CauseInputEvent path ESC/Space already take), and to the focused UWindow
+     * (menu/console) otherwise. This fixes B2: movement keys were landing on a
+     * non-viewport window and never reaching the gameplay input. */
+    HWND target = input_target();
 
     /* Build lParam: scancode in bits 16-23, extended flag in bit 24,
      * previous state in bit 30, transition state in bit 31 */
@@ -1500,11 +1729,10 @@ void win32_post_mouse_event(int dx, int dy, DWORD buttons, short wheel_delta)
     DWORD old_buttons = mouse_buttons;
     mouse_buttons = buttons;
 
-    HWND target = NULL;
-    for (int i = window_count - 1; i >= 0; i--) {
-        if (windows[i].used) { target = (HWND)(ULONG_PTR)(i + 1); break; }
-    }
-    if (capture_hwnd) target = capture_hwnd;
+    /* Route to the in-game viewport during mouse-look, else focused window.
+     * The relative-delta accumulation above is already what UE1's recenter
+     * math expects (cursor_pos = recenter_origin + delta). */
+    HWND target = input_target();
 
     LPARAM pos_lp = ((LPARAM)(cursor_pos.y & 0xFFFF) << 16) |
                      (LPARAM)(cursor_pos.x & 0xFFFF);
@@ -1543,6 +1771,107 @@ void win32_post_mouse_event(int dx, int dy, DWORD buttons, short wheel_delta)
     if (wheel_delta != 0) {
         WPARAM wp = ((WPARAM)(short)wheel_delta << 16);
         msg_enqueue(target, WM_MOUSEWHEEL, wp, pos_lp);
+    }
+}
+
+/* Absolute-pointer path (QEMU usb-tablet / any HID_INPUT_ABS mouse). ax/ay are
+ * raw logical coordinates in [lmin,lmax]; scale into the top window's client
+ * space (UT's 640x480 viewport), set cursor_pos (so GetCursorPos is accurate for
+ * UWindow's polled menu cursor), and emit WM_MOUSEMOVE + button transitions.
+ * Bridges the xHCI mouse to the Win32 layer (previously unwired → dead mouse). */
+void win32_post_mouse_abs(int ax, int ay, int lmin, int lmax, DWORD buttons)
+{
+    int tw = SCREEN_WIDTH, th = SCREEN_HEIGHT;
+    for (int i = window_count - 1; i >= 0; i--) {
+        if (windows[i].used) {
+            if (windows[i].width  > 0) tw = windows[i].width;
+            if (windows[i].height > 0) th = windows[i].height;
+            break;
+        }
+    }
+    HWND target = input_target();
+
+    /* Prefer the DDraw render resolution (the 640x480 surface that
+     * present_surface_to_gop scales to fill the screen) as the mapping space, so
+     * the cursor lines up with the scaled image instead of a raw window rect. */
+    extern void ddraw_get_display_size(unsigned *w, unsigned *h) __attribute__((weak));
+    if (ddraw_get_display_size) {
+        unsigned dw = 0, dh = 0; ddraw_get_display_size(&dw, &dh);
+        if (dw && dh) { tw = (int)dw; th = (int)dh; }
+    }
+
+    int range = lmax - lmin;
+    if (range <= 0) range = 1;
+    /* Scale the absolute tablet coordinate into client space. */
+    int sx = (int)(((int64_t)(ax - lmin) * (tw - 1)) / range);
+    int sy = (int)(((int64_t)(ay - lmin) * (th - 1)) / range);
+    if (sx < 0) sx = 0; else if (sx >= tw) sx = tw - 1;
+    if (sy < 0) sy = 0; else if (sy >= th) sy = th - 1;
+
+    int nx, ny, moved;
+
+    if (mouselook_active()) {
+        /* In-game mouse-look. UE1 recenters the cursor every frame via
+         * SetCursorPos and reads (cursor_pos - recenter_origin) as the delta.
+         * A QEMU usb-tablet is an ABSOLUTE device, so derive a relative delta
+         * from the previous tablet sample and ADD it to cursor_pos (which the
+         * engine just reset to the recenter origin via our SetCursorPos). This
+         * makes GetCursorPos return the recenter origin and each WM_MOUSEMOVE
+         * carry origin+delta — exactly what WinDrv's recenter math expects.
+         * We must NOT snap cursor_pos to the absolute sample (that destroys the
+         * delta and yields "viewport not connected" / dead mouse-look). */
+        int dx = 0, dy = 0;
+        if (g_abs_prev_valid) { dx = sx - g_abs_prev_sx; dy = sy - g_abs_prev_sy; }
+        g_abs_prev_sx = sx; g_abs_prev_sy = sy; g_abs_prev_valid = 1;
+
+        nx = cursor_pos.x + dx;
+        ny = cursor_pos.y + dy;
+        /* Keep within client bounds; the engine's SetCursorPos(center) recenter
+         * keeps us away from the edges in practice. */
+        if (nx < 0) nx = 0; else if (nx >= tw) nx = tw - 1;
+        if (ny < 0) ny = 0; else if (ny >= th) ny = th - 1;
+        moved = (dx != 0 || dy != 0);
+    } else {
+        /* Menu / UI: absolute path (unchanged — keeps the working menu mouse).
+         * Invalidate the relative tracker so re-entering mouse-look doesn't
+         * inject a spurious jump from a stale tablet position. */
+        g_abs_prev_valid = 0;
+        nx = sx; ny = sy;
+        moved = (nx != cursor_pos.x) || (ny != cursor_pos.y);
+    }
+
+    cursor_pos.x = nx;
+    cursor_pos.y = ny;
+
+    DWORD old_buttons = mouse_buttons;
+    mouse_buttons = buttons;
+    LPARAM pos_lp = ((LPARAM)(ny & 0xFFFF) << 16) | (LPARAM)(nx & 0xFFFF);
+
+    if (moved)
+        msg_enqueue(target, WM_MOUSEMOVE, 0, pos_lp);
+    if ((buttons & 1) && !(old_buttons & 1)) {
+        key_state[VK_LBUTTON] |= 0x80;
+        msg_enqueue(target, WM_LBUTTONDOWN, MK_LBUTTON, pos_lp);
+    }
+    if (!(buttons & 1) && (old_buttons & 1)) {
+        key_state[VK_LBUTTON] &= ~0x80;
+        msg_enqueue(target, WM_LBUTTONUP, 0, pos_lp);
+    }
+    if ((buttons & 2) && !(old_buttons & 2)) {
+        key_state[VK_RBUTTON] |= 0x80;
+        msg_enqueue(target, WM_RBUTTONDOWN, MK_RBUTTON, pos_lp);
+    }
+    if (!(buttons & 2) && (old_buttons & 2)) {
+        key_state[VK_RBUTTON] &= ~0x80;
+        msg_enqueue(target, WM_RBUTTONUP, 0, pos_lp);
+    }
+    if ((buttons & 4) && !(old_buttons & 4)) {
+        key_state[VK_MBUTTON] |= 0x80;
+        msg_enqueue(target, WM_MBUTTONDOWN, MK_MBUTTON, pos_lp);
+    }
+    if (!(buttons & 4) && (old_buttons & 4)) {
+        key_state[VK_MBUTTON] &= ~0x80;
+        msg_enqueue(target, WM_MBUTTONUP, 0, pos_lp);
     }
 }
 
@@ -2219,10 +2548,20 @@ PVOID user32_shim_init(void)
 {
     wndclass_count = 0;
     window_count = 0;
+    for (int i = 0; i < MAX_WINDOWS; i++) windows[i].used = 0;
     msg_head = msg_tail = 0;
     quit_posted = 0;
     for (int i = 0; i < 256; i++) { key_state[i] = 0; async_pressed[i] = 0; }
     mouse_buttons = 0;
     prev_was_e0 = 0;
+    /* Re-exec resets: one-shot activation + input-routing state. Without these a
+     * relaunched PE never receives WM_ACTIVATE and inherits stale focus/capture. */
+    g_activated = 0;
+    focus_hwnd = NULL;
+    capture_hwnd = NULL;
+    clip_active = 0;
+    g_abs_prev_valid = 0;
+    cursor_visible = 1;
+    cursor_pos.x = 320; cursor_pos.y = 240;
     return (PVOID)user32_exports;
 }
