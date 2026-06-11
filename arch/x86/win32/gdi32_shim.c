@@ -155,9 +155,22 @@ int WINAPI GetDeviceCaps(HDC hdc, int index)
 {
     (void)hdc;
     /* Report the real GOP resolution as the device extent so UT99 keeps the
-     * larger DirectDraw-enumerated modes (it filters modes bigger than this). */
+     * larger DirectDraw-enumerated modes (it filters modes bigger than this).
+     * BUT once a fullscreen-exclusive SetDisplayMode has happened, NT reports
+     * the CURRENT mode here (HORZRES/VERTRES track the desktop mode) — gate on
+     * ddraw_display_mode_active() so startup enumeration still sees the GOP
+     * size while in-game consumers see the truth after a SetRes. */
+    extern int  ddraw_display_mode_active(void) __attribute__((weak));
+    extern void ddraw_get_display_mode(uint32_t *w, uint32_t *h, uint32_t *bpp)
+                __attribute__((weak));
     int hw = (fb_get_width  && fb_get_width())  ? (int)fb_get_width()  : SCREEN_WIDTH;
     int vh = (fb_get_height && fb_get_height()) ? (int)fb_get_height() : SCREEN_HEIGHT;
+    if (ddraw_display_mode_active && ddraw_get_display_mode &&
+        ddraw_display_mode_active()) {
+        uint32_t mw = 0, mh = 0;
+        ddraw_get_display_mode(&mw, &mh, NULL);
+        if (mw && mh) { hw = (int)mw; vh = (int)mh; }
+    }
     switch (index) {
     case HORZRES:    return hw;
     case VERTRES:    return vh;

@@ -152,6 +152,16 @@ static int msg_queue_empty(void)
     return msg_head == msg_tail;
 }
 
+/* Millisecond time base for message timestamps. Shares winmm's rdtsc-based
+ * clock (the APIC tick doesn't advance while a compat32 process runs, so
+ * idt_get_ticks would freeze). NT stamps MSG.time when the message is POSTED,
+ * and GetMessageTime() returns the stamp of the last retrieved message —
+ * WinDrv stores it per mouse-button event (windrv.bin @0x11108457/0x1110847C/
+ * 0x111084A1) for click/double-click discrimination, so a constant 0 corrupts
+ * that logic. */
+extern DWORD WINAPI shim_timeGetTime(void);
+static DWORD g_last_msg_time = 0;   /* MSG.time of last dequeued message */
+
 static void msg_enqueue(HWND hwnd, DWORD message, WPARAM wp, LPARAM lp)
 {
     int next = (msg_tail + 1) % MSG_QUEUE_SIZE;
@@ -160,7 +170,7 @@ static void msg_enqueue(HWND hwnd, DWORD message, WPARAM wp, LPARAM lp)
     msg_queue[msg_tail].message = message;
     msg_queue[msg_tail].wParam  = wp;
     msg_queue[msg_tail].lParam  = lp;
-    msg_queue[msg_tail].time    = 0;
+    msg_queue[msg_tail].time    = shim_timeGetTime();
     msg_queue[msg_tail].pt.x    = 0;
     msg_queue[msg_tail].pt.y    = 0;
     msg_tail = next;
@@ -230,6 +240,7 @@ static int msg_dequeue(void *out)
     MSG *src = &msg_queue[msg_head];
     msg_write_to(out, src->hwnd, src->message, src->wParam, src->lParam,
                  src->time, src->pt.x, src->pt.y);
+    g_last_msg_time = src->time;   /* feeds GetMessageTime(), like NT */
     msg_head = (msg_head + 1) % MSG_QUEUE_SIZE;
     return 1;
 }
@@ -290,7 +301,12 @@ static BYTE extended_scancode_to_vk(BYTE sc)
 /* ── Cursor state ──────────────────────────────────────────── */
 
 static POINT cursor_pos = { 320, 240 };
-static int   cursor_visible = 1;
+/* NT cursor display count starts at 0 (cursor shown). It was 1 here, which
+ * broke the count by one: WinDrv SetMouseCapture's single ShowCursor(FALSE)
+ * (windrv.bin @0x11106765) yielded 0 instead of -1, so the cursor never
+ * counted as "hidden" and mouselook_active()'s cursor_visible<0 leg could
+ * never trip. ShowCursor(FALSE) must return -1 on the first call, like NT. */
+static int   cursor_visible = 0;
 static HWND  capture_hwnd = NULL;
 static HWND  focus_hwnd   = NULL;   /* SetFocus / WM_SETFOCUS target */
 static int   clip_active  = 0;      /* ClipCursor(rect!=NULL) in effect */
@@ -508,6 +524,18 @@ BOOL WINAPI UnregisterClassA(PCSTR lpClassName, HINSTANCE hInstance)
 static void dispatch_wm_size(WINDOW *w)
 {
     if (!w || !w->wndproc || w->width == 0 || w->height == 0) return;
+    /* Probe: every WM_SIZE we synthesize. UE1's ViewportWndProc consumes
+     * LOWORD/HIWORD verbatim into ResizeViewport (windowed branch @0x1110757F)
+     * and treats wParam==0 in fullscreen as "restore SavedWindowRect"
+     * (@0x111074A6) — so an unexpected line here after a SetRes pinpoints a
+     * stale-size feedback into the engine. */
+    serial_puts("[USER32] WM_SIZE hwnd=");
+    serial_puthex((uint64_t)(ULONG_PTR)w->handle, 8);
+    serial_puts(" ");
+    serial_puthex(w->width, 4);
+    serial_puts("x");
+    serial_puthex(w->height, 4);
+    serial_puts("\n");
     extern uint32_t compat32_callback_args(uint32_t func, int nargs,
                                             const uint32_t *args);
     uint32_t args[4] = {
@@ -536,6 +564,13 @@ static void dispatch_wm_activate(WINDOW *w)
     uint32_t a_ncact[4]= { h, WM_NCACTIVATE, 1, 0 };
     uint32_t a_act[4]  = { h, WM_ACTIVATE, 1 /*WA_ACTIVE*/, 0 };
     uint32_t a_focus[4]= { h, WM_SETFOCUS, 0, 0 };
+    /* Keep the shim focus state coherent with the messages we deliver: on NT
+     * the window that receives WM_SETFOCUS IS the GetFocus() window. We used
+     * to send WM_SETFOCUS here yet leave focus_hwnd NULL, so GetFocus()
+     * contradicted the activation forever after — WinDrv gates its whole
+     * in-game input path (UpdateInput key poll @0x11106F33, SetMouseCapture
+     * OnlyFocus bail @0x1110665C) on GetFocus()==viewport hWnd. */
+    focus_hwnd = w->handle;
     compat32_callback_args(fn, 4, a_app);
     compat32_callback_args(fn, 4, a_ncact);
     compat32_callback_args(fn, 4, a_act);
@@ -784,6 +819,29 @@ BOOL WINAPI MoveWindow(HWND hWnd, int X, int Y, int nWidth, int nHeight, BOOL bR
     if ((DWORD)nWidth != old_w || (DWORD)nHeight != old_h)
         dispatch_wm_size(w);
     return TRUE;
+}
+
+/* SILENT window geometry sync — called by ddraw's SetDisplayMode to emulate
+ * real NT DirectDraw exclusive-fullscreen, where the mode switch itself
+ * resizes the device window to cover the new desktop. WinDrv deliberately
+ * skips its own MoveWindow for non-OpenGL renderers (windrv.bin gate
+ * 0x1110A857-0x1110A87C: class-name compare vs "OpenGLRenderDevice"; the
+ * MoveWindow @0x1110A8DA is OpenGL-only) — it trusts DirectDraw to do it.
+ * Without this, GetClientRect/GetWindowRect (and our mouse mapping) stay at
+ * the PREVIOUS mode after an in-game SetRes. Deliberately NO WM_SIZE: UE1's
+ * fullscreen WM_SIZE branch treats wParam==0 (the only value our
+ * dispatch_wm_size sends) as "restore SavedWindowRect" (ViewportWndProc
+ * @0x111074A6), so an unsolicited WM_SIZE here would actively corrupt the
+ * mode change; real ddraw's resize is likewise unobserved by UE1 because
+ * HoldCount suppresses it during SetRes. */
+void user32_sync_window_size(HWND hWnd, int w, int h)
+{
+    WINDOW *win = find_window(hWnd);
+    if (!win || w <= 0 || h <= 0) return;
+    win->x = 0;
+    win->y = 0;
+    win->width  = (DWORD)w;
+    win->height = (DWORD)h;
 }
 
 /* ── Message Loop ──────────────────────────────────────────── */
@@ -1047,16 +1105,23 @@ BOOL WINAPI AdjustWindowRectEx(LPRECT lpRect, DWORD dwStyle, BOOL bMenu, DWORD d
 
 #define SPI_GETWORKAREA 48
 
+static int screen_cx(void);   /* defined below (live GOP size) */
+static int screen_cy(void);
+
 BOOL WINAPI SystemParametersInfoA(UINT uiAction, UINT uiParam, PVOID pvParam, UINT fWinIni)
 {
     (void)uiParam; (void)fWinIni;
     if (uiAction == SPI_GETWORKAREA && pvParam) {
-        /* Return screen rect as work area */
+        /* Return screen rect as work area. Use the LIVE screen size (same
+         * source as GetSystemMetrics) — the old compile-time
+         * SCREEN_WIDTH/SCREEN_HEIGHT constants were the one remaining size
+         * source that could disagree with every other metric, showing UE1 a
+         * phantom desktop-size mismatch. */
         int32_t *rect = (int32_t *)pvParam;
         rect[0] = 0;              /* left */
         rect[1] = 0;              /* top */
-        rect[2] = SCREEN_WIDTH;   /* right */
-        rect[3] = SCREEN_HEIGHT;  /* bottom */
+        rect[2] = screen_cx();    /* right */
+        rect[3] = screen_cy();    /* bottom */
         return TRUE;
     }
     return TRUE;
@@ -1092,13 +1157,42 @@ static int screen_cy(void)
     return h ? (int)h : SCREEN_HEIGHT;
 }
 
+/* NT semantics: a fullscreen-exclusive DirectDraw SetDisplayMode CHANGES the
+ * desktop metrics (SM_CXSCREEN/HORZRES report the current mode). We must keep
+ * reporting the GOP size during startup (UT99 filters out enumerated modes
+ * larger than the "desktop"), so only switch to the ddraw mode once an actual
+ * SetDisplayMode has been issued — ddraw_display_mode_active() is 0 until
+ * then. Weak: user32 also serves PE apps that never touch ddraw. */
+extern int  ddraw_display_mode_active(void) __attribute__((weak));
+extern void ddraw_get_display_mode(uint32_t *w, uint32_t *h, uint32_t *bpp)
+            __attribute__((weak));
+
+static int current_mode_cx(void)
+{
+    if (ddraw_display_mode_active && ddraw_get_display_mode &&
+        ddraw_display_mode_active()) {
+        uint32_t w = 0, h = 0; ddraw_get_display_mode(&w, &h, NULL);
+        if (w) return (int)w;
+    }
+    return screen_cx();
+}
+static int current_mode_cy(void)
+{
+    if (ddraw_display_mode_active && ddraw_get_display_mode &&
+        ddraw_display_mode_active()) {
+        uint32_t w = 0, h = 0; ddraw_get_display_mode(&w, &h, NULL);
+        if (h) return (int)h;
+    }
+    return screen_cy();
+}
+
 int WINAPI GetSystemMetrics(int nIndex)
 {
     switch (nIndex) {
-    case SM_CXSCREEN:      return screen_cx();
-    case SM_CYSCREEN:      return screen_cy();
-    case SM_CXFULLSCREEN:  return screen_cx();
-    case SM_CYFULLSCREEN:  return screen_cy();
+    case SM_CXSCREEN:      return current_mode_cx();
+    case SM_CYSCREEN:      return current_mode_cy();
+    case SM_CXFULLSCREEN:  return current_mode_cx();
+    case SM_CYFULLSCREEN:  return current_mode_cy();
     default:               return 0;
     }
 }
@@ -1231,7 +1325,12 @@ LONG WINAPI SetWindowLongA(HWND hWnd, int nIndex, LONG dwNewLong)
 
 HWND WINAPI GetForegroundWindow(void)
 {
-    /* Return the first visible window */
+    /* NT: the foreground window is the one the user is working with — for a
+     * single-app session that is the focused/active window. Returning "first
+     * visible" contradicted GetFocus() whenever focus moved to a later-created
+     * window (e.g. the viewport). Prefer the focused window. */
+    if (focus_hwnd && find_window(focus_hwnd))
+        return focus_hwnd;
     for (int i = 0; i < MAX_WINDOWS; i++) {
         if (windows[i].used && windows[i].visible)
             return windows[i].handle;
@@ -1243,8 +1342,21 @@ HWND WINAPI SetFocus(HWND hWnd)
 {
     HWND old = focus_hwnd;
     /* Only track real windows we know about; NULL clears focus. */
-    if (hWnd == NULL || find_window(hWnd))
+    if (hWnd == NULL || find_window(hWnd)) {
         focus_hwnd = hWnd;
+        /* NT delivers WM_KILLFOCUS to the loser and WM_SETFOCUS to the gainer.
+         * UE1 re-arms input/capture on WM_SETFOCUS and releases on
+         * WM_KILLFOCUS (ViewportWndProc focus cases near 0x1110715D/
+         * 0x11107223); WinDrv itself calls SetFocus at OpenWindow
+         * (0x11105AAD), in its WndProc (0x111071C5) and at ResizeViewport
+         * (0x1110A25C), so mode changes depend on these messages flowing. */
+        if (old != hWnd) {
+            if (old)  msg_enqueue(old,  WM_KILLFOCUS,
+                                  (WPARAM)(ULONG_PTR)hWnd, 0);
+            if (hWnd) msg_enqueue(hWnd, WM_SETFOCUS,
+                                  (WPARAM)(ULONG_PTR)old, 0);
+        }
+    }
     return old;
 }
 HWND WINAPI GetDesktopWindow(void) { return (HWND)(ULONG_PTR)0xD0000001; }
@@ -1270,6 +1382,17 @@ int WINAPI ShowCursor(BOOL bShow)
 {
     if (bShow) cursor_visible++;
     else       cursor_visible--;
+    /* [CAPDIAG — uncommitted] trace capture-sequence calls (throttled) */
+    {
+        static int n = 0;
+        if (n++ < 40) {
+            extern uint32_t compat32_get_last_caller_eip(void);
+            serial_puts("[CAP] ShowCursor("); serial_putdec((uint64_t)(uint32_t)bShow);
+            serial_puts(")->"); serial_putdec((uint64_t)(uint32_t)cursor_visible);
+            serial_puts(" eip=0x"); serial_puthex(compat32_get_last_caller_eip(), 8);
+            serial_puts("\n");
+        }
+    }
     return cursor_visible;
 }
 
@@ -1287,6 +1410,15 @@ HWND WINAPI SetCapture(HWND hWnd)
 {
     HWND old = capture_hwnd;
     capture_hwnd = hWnd;
+    /* [CAPDIAG — uncommitted] */
+    {
+        static int n = 0;
+        if (n++ < 20) {
+            serial_puts("[CAP] SetCapture(0x");
+            serial_puthex((uint64_t)(ULONG_PTR)hWnd, 8);
+            serial_puts(")\n");
+        }
+    }
     return old;
 }
 
@@ -1460,7 +1592,12 @@ BOOL WINAPI InvalidateRect(HWND hWnd, const RECT *lpRect, BOOL bErase)
 
 BOOL WINAPI SetForegroundWindow(HWND hWnd)
 {
-    (void)hWnd;
+    /* NT: bringing a window to the foreground also gives it keyboard focus.
+     * WinDrv's SetMouseCapture calls SetForegroundWindow(viewport) as step 1
+     * of its capture sequence — keep the focus model coherent so the
+     * subsequent GetFocus()-gated logic (and our input_target()) agree. */
+    if (hWnd && find_window(hWnd))
+        SetFocus(hWnd);
     return TRUE;
 }
 
@@ -2092,15 +2229,29 @@ BOOL WINAPI EnumChildWindows(HWND hWndParent, PVOID lpEnumFunc, LPARAM lParam)
     return TRUE;
 }
 
+/* Client→screen translation. Our windows are borderless (client rect ==
+ * window rect), so the client origin in screen space is simply (w->x, w->y).
+ * POINT is two LONGs (int32) — identical layout for 32-bit callers.
+ * WinDrv's captured-mouse recenter does ClientToScreen+SetCursorPos
+ * (windrv.bin 0x11108B0A-0x11108B18) and SetMouseCapture computes its rect via
+ * GetClientRect+MapWindowPoints (0x11106682-0x111066A4); the old no-op stubs
+ * were only correct because the game window happens to sit at 0,0 — make the
+ * coordinate spaces correct by construction. */
 BOOL WINAPI ClientToScreen(HWND hWnd, PVOID lpPoint)
 {
-    (void)hWnd; (void)lpPoint;
+    WINDOW *w = find_window(hWnd);
+    LONG *pt = (LONG *)lpPoint;
+    if (!pt) return FALSE;
+    if (w) { pt[0] += w->x; pt[1] += w->y; }
     return TRUE;
 }
 
 BOOL WINAPI ScreenToClient(HWND hWnd, PVOID lpPoint)
 {
-    (void)hWnd; (void)lpPoint;
+    WINDOW *w = find_window(hWnd);
+    LONG *pt = (LONG *)lpPoint;
+    if (!pt) return FALSE;
+    if (w) { pt[0] -= w->x; pt[1] -= w->y; }
     return TRUE;
 }
 
@@ -2296,12 +2447,34 @@ HMENU WINAPI GetMenu(HWND hWnd)
 
 DWORD WINAPI GetMessageTime(void)
 {
-    return 0;
+    /* NT: the timestamp of the last message retrieved by Get/PeekMessage.
+     * WinDrv stores this per mouse-button event for double-click detection
+     * (windrv.bin 0x11108457/0x1110847C/0x111084A1) — a constant 0 broke it. */
+    return g_last_msg_time;
 }
 
 HWND WINAPI GetFocus(void)
 {
-    return NULL;
+    /* WinDrv gates its ENTIRE in-game input path on GetFocus()==viewport hWnd:
+     * UpdateInput's GetKeyState press loop only emits IST_Press when focused
+     * (windrv.bin cmp @0x11106F33) and SetMouseCapture's OnlyFocus check bails
+     * before SetCapture/ShowCursor(0)/recenter (@0x1110665C). The old
+     * unconditional NULL therefore killed in-game movement keys AND mouse-look
+     * capture. NT semantics: while our (only) app is active, some window of it
+     * has keyboard focus — serve the tracked focus window, falling back to the
+     * foreground window; NULL only when the process has no windows at all. */
+    HWND r = (focus_hwnd && find_window(focus_hwnd)) ? focus_hwnd
+                                                      : GetForegroundWindow();
+    /* [CAPDIAG — uncommitted] sample what the engine's focus gate sees */
+    {
+        static uint32_t n = 0;
+        if ((n++ & 0x3FF) == 0) {
+            serial_puts("[CAP] GetFocus->0x");
+            serial_puthex((uint64_t)(ULONG_PTR)r, 8);
+            serial_puts("\n");
+        }
+    }
+    return r;
 }
 
 BOOL WINAPI IsWindowVisible(HWND hWnd)
@@ -2312,8 +2485,26 @@ BOOL WINAPI IsWindowVisible(HWND hWnd)
 
 int WINAPI MapWindowPoints(HWND hWndFrom, HWND hWndTo, LPPOINT lpPoints, UINT cPoints)
 {
-    (void)hWndFrom; (void)hWndTo; (void)lpPoints; (void)cPoints;
-    return 0;
+    /* NT: translate points from hWndFrom's client space to hWndTo's client
+     * space (NULL = screen). Borderless model: a window's client origin in
+     * screen space is (x, y). Return value packs the applied delta
+     * (LOWORD=dx, HIWORD=dy) like real user32. Used by WinDrv SetMouseCapture
+     * to convert its client rect to screen for the recenter math
+     * (windrv.bin 0x11106682-0x111066A4) — the old no-op was only right
+     * because the game window sits at 0,0. */
+    LONG dx = 0, dy = 0;
+    WINDOW *from = hWndFrom ? find_window(hWndFrom) : NULL;
+    WINDOW *to   = hWndTo   ? find_window(hWndTo)   : NULL;
+    if (from) { dx += from->x; dy += from->y; }
+    if (to)   { dx -= to->x;   dy -= to->y;   }
+    LONG *pt = (LONG *)lpPoints;
+    if (pt) {
+        for (UINT i = 0; i < cPoints; i++) {
+            pt[i * 2 + 0] += dx;
+            pt[i * 2 + 1] += dy;
+        }
+    }
+    return (int)((((uint32_t)dy & 0xFFFF) << 16) | ((uint32_t)dx & 0xFFFF));
 }
 
 BOOL WINAPI RegisterHotKey(HWND hWnd, int id, UINT fsModifiers, UINT vk)
@@ -2336,8 +2527,12 @@ HWND WINAPI SetParent(HWND hWndChild, HWND hWndNewParent)
 
 HWND WINAPI SetActiveWindow(HWND hWnd)
 {
-    (void)hWnd;
-    return NULL;
+    /* NT: activating a window moves keyboard focus to it (focus follows
+     * activation within a thread). Returns the previously active window. */
+    HWND prev = GetForegroundWindow();
+    if (hWnd && find_window(hWnd))
+        SetFocus(hWnd);
+    return prev;
 }
 
 BOOL WINAPI SystemParametersInfoW(UINT uiAction, UINT uiParam,
@@ -2561,7 +2756,7 @@ PVOID user32_shim_init(void)
     capture_hwnd = NULL;
     clip_active = 0;
     g_abs_prev_valid = 0;
-    cursor_visible = 1;
+    cursor_visible = 0;   /* NT display count starts at 0 (ShowCursor(FALSE) -> -1) */
     cursor_pos.x = 320; cursor_pos.y = 240;
     return (PVOID)user32_exports;
 }

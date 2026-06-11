@@ -51,6 +51,12 @@ static void dd_memcpy(void *dst, const void *src, SIZE_T n)
 
 static DWORD display_width  = 640;  /* UT99 default WindowedViewportX */
 static DWORD display_height = 480;  /* UT99 default WindowedViewportY */
+/* Set once a real (non-zero) SetDisplayMode has been issued. user32/gdi32
+ * gate their desktop metrics on this: NT reports the CURRENT exclusive mode
+ * via GetSystemMetrics/GetDeviceCaps after a fullscreen SetDisplayMode, but
+ * during startup enumeration (no mode set yet) they must keep reporting the
+ * GOP size so UT99's "mode larger than desktop" filter keeps big modes. */
+static int   g_mode_set     = 0;
 static DWORD display_bpp    = 16;  /* UT99 SoftDrv uses 16-bit (RGB565) */
 
 /* Framebuffer pointer — connect to real GOP LFB on OsitoK bare metal,
@@ -459,6 +465,17 @@ void ddraw_present_pixels(const void *pixels, uint32_t sw, uint32_t sh,
 {
     ensure_framebuffer();
     if (!framebuffer || !pixels || !sw || !sh) return;
+    /* Probe: log every change of the PRESENTED source size. After a SetRes,
+     * any present at the OLD size means stale-mode frames are being scaled
+     * against the new projection (the fisheye symptom) — this line is the
+     * cheap discriminator for the next live run. */
+    if (sw != g_present_src_w || sh != g_present_src_h) {
+        serial_puts("[DDRAW] present src ");
+        serial_puthex(g_present_src_w, 4); serial_puts("x");
+        serial_puthex(g_present_src_h, 4); serial_puts(" -> ");
+        serial_puthex(sw, 4); serial_puts("x"); serial_puthex(sh, 4);
+        serial_puts("\n");
+    }
     g_present_src_w = sw;
     g_present_src_h = sh;
     uint32_t pitch = gop_pitch ? gop_pitch : sw;
@@ -539,6 +556,14 @@ void ddraw_get_display_mode(uint32_t *w, uint32_t *h, uint32_t *bpp)
     if (w)   *w   = display_width;
     if (h)   *h   = display_height;
     if (bpp) *bpp = display_bpp;
+}
+
+/* True once a real SetDisplayMode has happened — see g_mode_set above. Used
+ * by user32 GetSystemMetrics and gdi32 GetDeviceCaps to switch from GOP size
+ * (startup) to the current exclusive mode (in-game), per NT semantics. */
+int ddraw_display_mode_active(void)
+{
+    return g_mode_set;
 }
 
 /* Per-frame present hook, called by the user32 message pump (PeekMessage).
@@ -1108,8 +1133,43 @@ static HRESULT WINAPI dd_SetDisplayMode(IDirectDraw7 *self, DWORD w, DWORD h,
      * (real) mode: SetDisplayMode(0,...) means "don't change resolution". Only
      * adopt w/h when both are non-zero. */
     if (w > 0 && h > 0) {
+        int changed = (display_width != w) || (display_height != h);
         display_width  = w;
         display_height = h;
+        g_mode_set = 1;   /* desktop metrics now report the exclusive mode */
+
+        if (changed) {
+            /* NT DirectDraw exclusive-fullscreen semantics: the mode switch
+             * itself (a) invalidates the previous mode's frames and (b)
+             * resizes the device window to the new desktop. Without this,
+             * after an in-game SetRes the layer kept THREE stale sizes —
+             * g_present_src_* (old-mode presents stayed eligible via
+             * surf_is_present_sized, so a late Lock on a leftover old-size
+             * surface re-armed old-mode frames against the new projection =
+             * the observed fisheye/FOV change), the tracked window rect
+             * (GetClientRect/GetWindowRect answered the old size), and the
+             * mouse-mapping space (ddraw_get_display_size). */
+            g_present_src_w = 0;
+            g_present_src_h = 0;
+            /* Drop a present-armed surface from the previous mode: the next
+             * Lock of the new-mode primary re-arms it. Keep it only if it
+             * already matches the new mode. */
+            if (g_present_surface &&
+                (g_present_surface->width != display_width ||
+                 g_present_surface->height != display_height))
+                g_present_surface = NULL;
+            /* Resize the cooperative window SILENTLY (no WM_SIZE — see the
+             * helper's comment: UE1's fullscreen WM_SIZE wParam==0 branch
+             * restores SavedWindowRect, which would undo the mode change). */
+            {
+                extern void user32_sync_window_size(HANDLE hwnd, int w, int h)
+                    __attribute__((weak));
+                if (ddraw_hwnd && user32_sync_window_size)
+                    user32_sync_window_size(ddraw_hwnd,
+                                            (int)display_width,
+                                            (int)display_height);
+            }
+        }
     }
     if (bpp > 0)
         display_bpp = bpp;
@@ -1844,6 +1904,7 @@ PVOID ddraw_shim_init(void)
     display_width  = 640;
     display_height = 480;
     display_bpp    = 16;
+    g_mode_set     = 0;   /* back to GOP-size metrics until next SetDisplayMode */
     framebuffer = NULL;
     fb_size = 0;
     gop_pitch = 0;
