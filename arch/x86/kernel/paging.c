@@ -66,6 +66,7 @@ static uint32_t  pt_pages_used;  /* Number of 4KB pages allocated for tables */
 /* ── Allocate a zeroed page for page tables ──────────────────── */
 
 extern void *mem_alloc_aligned_high(uint64_t size, uint64_t alignment);
+extern void *mem_alloc_aligned_high_below4g(uint64_t size, uint64_t alignment);
 
 /* Allocate a fresh page-table page and return an UPPER-HALF (virt)
  * pointer to it. The hardware always sees the physical address (stored
@@ -80,11 +81,14 @@ static uint64_t *pt_alloc_page(void)
      * page-table page, and a guest heap overrun overwrites the PTEs — silently
      * unmapping a 2 MB swath of Core.dll (the UT99 "Preferences crash": PTEs at
      * PT page 0x01C9D000 found overwritten with guest pointers, PE-PTE=0 i.e. no
-     * paging-API call). So allocate page tables TOP-DOWN (mem_alloc_aligned_high)
-     * so they cluster at the top of RAM, far from the bottom-up heap/PE pool.
-     * High memory here is still < 4 GB for our RAM sizes, so the PML4 physical
-     * address still fits the 32-bit CR3 the AP trampoline loads. */
-    void *phys = mem_alloc_aligned_high(PAGE_SIZE, PAGE_SIZE);
+     * paging-API call). So allocate page tables TOP-DOWN so they cluster near
+     * the top of RAM, far from the bottom-up heap/PE pool.
+     * MUST stay < 4 GB: the AP trampoline loads the PML4 base into CR3 with a
+     * 32-bit `mov` in protected mode (before long mode), so a >= 4 GB page-table
+     * physical address is truncated and faults the AP — the SMP "Starting AP N"
+     * hang on >4 GB RAM configs. mem_alloc_aligned_high_below4g caps the
+     * top-down search just under 4 GB. */
+    void *phys = mem_alloc_aligned_high_below4g(PAGE_SIZE, PAGE_SIZE);
     if (!phys)
         phys = mem_alloc_aligned(PAGE_SIZE, PAGE_SIZE);
     if (!phys)

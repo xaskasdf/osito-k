@@ -11,6 +11,7 @@
 
 extern void serial_puts(const char *s);
 extern void serial_puthex(uint64_t val, int digits);
+extern void serial_putdec(uint64_t val);
 
 /* ── OsitoK compositor integration (weak — NULL in test harness) ── */
 extern uint32_t shm_create_surface(uint32_t w, uint32_t h, uint32_t flags)
