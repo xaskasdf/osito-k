@@ -1437,18 +1437,19 @@ HWND WINAPI SetCapture(HWND hWnd)
         static int n = 0;
         if (n++ < 24) {
             extern uint32_t compat32_get_last_user_ebp(void);
+            extern uint32_t compat32_get_last_user_esi(void);
             uint32_t ebp = compat32_get_last_user_ebp();
-            uint32_t ret = 0, vp = 0, f38 = 0, actor = 0, show = 0;
-            if (ebp >= 0x10000 && ebp < 0x7FFF0000) {
+            uint32_t ret = 0, f38 = 0, actor = 0, show = 0;
+            /* The viewport `this` is LIVE in guest ESI inside SetMouseCapture
+             * (its body keeps this in esi; INT2E saved the guest registers). */
+            uint32_t vp = compat32_get_last_user_esi();
+            if (ebp >= 0x10000 && ebp < 0x7FFF0000)
                 ret = *(volatile uint32_t *)(uintptr_t)(ebp + 4);
-                /* SetMouseCapture prologue saves this(esi) at [ebp-0x1C] */
-                vp  = *(volatile uint32_t *)(uintptr_t)(ebp - 0x1C);
-                if (vp >= 0x10000 && vp < 0x7FFF0000) {
-                    f38   = *(volatile uint32_t *)(uintptr_t)(vp + 0x38);
-                    actor = *(volatile uint32_t *)(uintptr_t)(vp + 0x30);
-                    if (actor >= 0x10000 && actor < 0x7FFF0000)
-                        show = *(volatile uint32_t *)(uintptr_t)(actor + 0x51C);
-                }
+            if (vp >= 0x10000 && vp < 0x7FFF0000) {
+                f38   = *(volatile uint32_t *)(uintptr_t)(vp + 0x38);
+                actor = *(volatile uint32_t *)(uintptr_t)(vp + 0x30);
+                if (actor >= 0x10000 && actor < 0x7FFF0000)
+                    show = *(volatile uint32_t *)(uintptr_t)(actor + 0x51C);
             }
             serial_puts("[CAP] SetCapture(0x");
             serial_puthex((uint64_t)(ULONG_PTR)hWnd, 8);
@@ -1457,6 +1458,19 @@ HWND WINAPI SetCapture(HWND hWnd)
             serial_puts(" vp38=0x"); serial_puthex(f38, 4);
             serial_puts(" show=0x"); serial_puthex(show, 8);
             serial_puts("\n");
+            /* [CAPDIAG] one-shot: watch WRITES to viewport+0x38 — the flap is
+             * bits 1,2 toggling 0x0000<->0x0007 per frame; the #DB handler logs
+             * each writer's guest RIP (the script/native oscillator). */
+            {
+                static int armed = 0;
+                if (!armed && ret == 0x10390159 && vp >= 0x10000 && vp < 0x7FFF0000) {
+                    extern int hwbp_set(int slot, uint64_t addr, int cond, int len,
+                                        const char *name);
+                    hwbp_set(0, (uint64_t)vp + 0x38, 1 /*WRITE*/, 3 /*LEN_4*/, "vp38w");
+                    serial_puts("[CAP] HWBP armed on vp+0x38\n");
+                    armed = 1;
+                }
+            }
         }
     }
     return old;
