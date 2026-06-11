@@ -150,9 +150,13 @@ static void *get_screen_surface(int *out_w, int *out_h, int *out_pitch)
 int WINAPI GetDeviceCaps(HDC hdc, int index)
 {
     (void)hdc;
+    /* Report the real GOP resolution as the device extent so UT99 keeps the
+     * larger DirectDraw-enumerated modes (it filters modes bigger than this). */
+    int hw = (fb_get_width  && fb_get_width())  ? (int)fb_get_width()  : SCREEN_WIDTH;
+    int vh = (fb_get_height && fb_get_height()) ? (int)fb_get_height() : SCREEN_HEIGHT;
     switch (index) {
-    case HORZRES:    return SCREEN_WIDTH;
-    case VERTRES:    return SCREEN_HEIGHT;
+    case HORZRES:    return hw;
+    case VERTRES:    return vh;
     case BITSPIXEL:  return SCREEN_BPP;
     case PLANES:     return 1;
     case RASTERCAPS: return 0;

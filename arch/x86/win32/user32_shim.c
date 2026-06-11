@@ -1076,13 +1076,29 @@ BOOL WINAPI KillTimer(HWND hWnd, ULONG_PTR uIDEvent)
     return TRUE;
 }
 
+/* Report the real GOP framebuffer resolution as the "desktop" so UT99 keeps
+ * the larger DirectDraw-enumerated modes (it filters out modes bigger than the
+ * desktop). Falls back to the compiled default if the GOP isn't up yet. */
+extern uint32_t fb_get_width(void)  __attribute__((weak));
+extern uint32_t fb_get_height(void) __attribute__((weak));
+static int screen_cx(void)
+{
+    uint32_t w = (fb_get_width && fb_get_width()) ? fb_get_width() : 0;
+    return w ? (int)w : SCREEN_WIDTH;
+}
+static int screen_cy(void)
+{
+    uint32_t h = (fb_get_height && fb_get_height()) ? fb_get_height() : 0;
+    return h ? (int)h : SCREEN_HEIGHT;
+}
+
 int WINAPI GetSystemMetrics(int nIndex)
 {
     switch (nIndex) {
-    case SM_CXSCREEN:      return SCREEN_WIDTH;
-    case SM_CYSCREEN:      return SCREEN_HEIGHT;
-    case SM_CXFULLSCREEN:  return SCREEN_WIDTH;
-    case SM_CYFULLSCREEN:  return SCREEN_HEIGHT;
+    case SM_CXSCREEN:      return screen_cx();
+    case SM_CYSCREEN:      return screen_cy();
+    case SM_CXFULLSCREEN:  return screen_cx();
+    case SM_CYFULLSCREEN:  return screen_cy();
     default:               return 0;
     }
 }
@@ -1139,19 +1155,35 @@ BOOL WINAPI EnumDisplaySettingsA(const char *device, uint32_t mode, DEVMODEA *dm
     (void)device;
     if (!dm) return FALSE;
 
-    /* Return our single supported mode */
+    /* Enumerable resolution × depth table (matches dd_EnumDisplayModes). Some
+     * apps walk EnumDisplaySettings(0,1,2,...) until it returns FALSE to build
+     * their resolution list, so offer the standard set, not a single mode. */
+    static const struct { uint16_t w, h; } res[] = {
+        {640, 480}, {800, 600}, {1024, 768},
+    };
+    static const uint8_t bpps[] = { 16, 32 };
+
     memset(dm, 0, sizeof(*dm));
     dm->dmSize = sizeof(*dm);
     dm->dmFields = DM_BITSPERPEL | DM_PELSWIDTH | DM_PELSHEIGHT;
-    dm->dmBitsPerPel = 32;
-    dm->dmPelsWidth = SCREEN_WIDTH;
-    dm->dmPelsHeight = SCREEN_HEIGHT;
     dm->dmDisplayFrequency = 60;
 
-    /* Only mode index 0 and ENUM_CURRENT_SETTINGS are valid */
-    if (mode == 0 || mode == ENUM_CURRENT_SETTINGS)
+    if (mode == ENUM_CURRENT_SETTINGS) {
+        dm->dmBitsPerPel = 32;
+        dm->dmPelsWidth  = screen_cx();
+        dm->dmPelsHeight = screen_cy();
         return TRUE;
-    return FALSE;
+    }
+
+    /* index = res-major, bpp-minor */
+    const uint32_t nres = sizeof(res) / sizeof(res[0]);
+    const uint32_t nbpp = sizeof(bpps) / sizeof(bpps[0]);
+    if (mode >= nres * nbpp) return FALSE;
+    uint32_t ri = mode / nbpp, bi = mode % nbpp;
+    dm->dmBitsPerPel = bpps[bi];
+    dm->dmPelsWidth  = res[ri].w;
+    dm->dmPelsHeight = res[ri].h;
+    return TRUE;
 }
 
 BOOL WINAPI EnumDisplaySettingsW(const void *device, uint32_t mode, void *dm)
