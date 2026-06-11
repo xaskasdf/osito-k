@@ -777,6 +777,15 @@ int32_t proc_current_tgid(void)
     return current_proc ? (int32_t)current_proc->tgid : 0;
 }
 
+/* Thread group ID of an arbitrary process_t* (0 if NULL). Used by
+ * vma_owned_by_current so a CLONE_THREAD thread can fault-in VMAs its
+ * thread-group siblings (incl. the main thread) registered — they share
+ * the address space. */
+int32_t proc_tgid_of(void *p)
+{
+    return p ? (int32_t)((process_t *)p)->tgid : 0;
+}
+
 /* Set clear_child_tid address (set_tid_address syscall) */
 void proc_set_clear_child_tid(uint64_t *addr)
 {
@@ -1475,11 +1484,35 @@ void __hot sched_tick(void *frame_ptr)
         uint64_t saved_cr3;
         __asm__ volatile ("mov %%cr3, %0" : "=r"(saved_cr3));
         uint64_t kcr3 = paging_get_kernel_cr3();
-        if (saved_cr3 != kcr3) paging_switch(kcr3);
-
-        net_poll();
-
-        if (saved_cr3 != kcr3) paging_switch(saved_cr3);
+        /* BISECT: the CR3 switch corrupts the stack out from under us when
+         * sched_tick is running on a LOW (user-VA) stack — true for pthread
+         * worker/render threads (musl puts their stacks in the low mmap
+         * region, e.g. 0x5_1408_xxxx), since that VA maps to a DIFFERENT
+         * physical page in kernel_cr3's identity map than in the process CR3.
+         * The main thread is immune (upper-half stack, shared in all CR3s).
+         * Only do the kernel-CR3 net_poll dance when our own RSP is upper-half
+         * (always-mapped); otherwise skip net_poll this tick (it's opportunistic
+         * and will run next tick from an upper-half-stack process). */
+        uint64_t cur_rsp;
+        __asm__ volatile ("mov %%rsp, %0" : "=r"(cur_rsp));
+        bool rsp_upper = (cur_rsp >= 0xFFFF800000000000ULL);
+        if (saved_cr3 == kcr3) {
+            /* Already on kernel CR3 (kernel thread / idle): no switch, the
+             * low-identity stack is valid as-is. Always safe. */
+            net_poll();
+        } else if (rsp_upper) {
+            /* User process with an upper-half stack (main thread): the stack is
+             * shared in PML4[256] across all CR3s, so the kernel-CR3 switch
+             * leaves it valid. */
+            paging_switch(kcr3);
+            net_poll();
+            paging_switch(saved_cr3);
+        }
+        /* else: user process on a LOW (non-identity) stack — a pthread worker/
+         * render thread. Switching to kernel CR3 would remap RSP to a different
+         * physical page (identity) and corrupt the live stack → return-to-garbage
+         * / RIP=0. Skip net_poll this tick; it runs next tick from the main
+         * thread or a kernel thread. */
     }
 
     /* Load next process */
@@ -1527,7 +1560,12 @@ void __hot sched_tick(void *frame_ptr)
          * Gate on next->cr3==0 (kernel threads have no per-process CR3) so
          * this never false-positive-kills a long-running user program (gcc)
          * mid-execution. */
-        bool bad_rip = (rip < 0xFFFF800000000000ULL && cs == 0x38 &&
+        /* A near-NULL RIP is never a legitimate resume target for ANY
+         * process (lowest user-ELF base is 0x20000000). Catch it ungated:
+         * a CLONE_THREAD child (cr3 != 0) whose saved frame got RIP=0 must
+         * not be iret'd into address 0 (wild #PF at instruction-fetch). */
+        bool bad_rip = (rip < 0x1000ULL) ||
+                       (rip < 0xFFFF800000000000ULL && cs == 0x38 &&
                         next->cr3 == 0);
 
         if (bad_cs || bad_ss || bad_rip) {

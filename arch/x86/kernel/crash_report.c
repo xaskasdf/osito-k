@@ -130,7 +130,16 @@ void crash_report_save(uint64_t *frame, uint32_t vector, uint64_t fault_addr,
         r->stack_base = r->rsp;
         r->stack_valid = true;
         uint64_t *sp = (uint64_t *)r->rsp;
-        for (int i = 0; i < 256; i++) r->stack_words[i] = sp[i];
+        /* Do NOT read past the current page: a small pthread stack (worker /
+         * render thread) places an unmapped guard page right above the top,
+         * so an unconditional 2 KB read faults the crash handler itself and
+         * cascades to a halt — losing the report for the very crash we care
+         * about. Stop at the page boundary; zero-fill the rest. */
+        uint64_t page_end = (r->rsp + 0x1000ULL) & ~0xFFFULL;
+        int max_words = (int)((page_end - r->rsp) / 8);
+        if (max_words > 256) max_words = 256;
+        for (int i = 0; i < max_words; i++) r->stack_words[i] = sp[i];
+        for (int i = max_words; i < 256; i++) r->stack_words[i] = 0;
     }
 
     /* Walk backtrace (same algorithm as idt.c but captures into struct) */
@@ -149,10 +158,17 @@ void crash_report_save(uint64_t *frame, uint32_t vector, uint64_t fault_addr,
     }
     r->frame_count = 1;
 
+    /* Confine rbp-chain reads to rsp's own page. A small pthread stack (worker/
+     * render thread) has an unmapped guard page adjacent to the live frame; a
+     * loose [rsp-256, rsp+8MB] window let the walker deref into it and fault the
+     * crash handler again (crash_report_save+0x300). Staying within the page we
+     * already know is mapped (rsp's) yields a shallow-but-safe backtrace. */
+    (void)win;
+    uint64_t rsp_page_end = (rsp | 0xFFFULL) + 1;
     if ((r->cs & 0xFFFF) == 0x28) {
         for (int d = 0; d < CRASH_MAX_FRAMES - 1; d++) {
             if (rbp == 0 || (rbp & 7) || rbp + 16 < rbp) break;
-            if (rbp < rsp - 256 || rbp > rsp + win) break;
+            if (rbp < rsp || rbp + 16 > rsp_page_end) break;
 
             uint64_t ret = ((uint64_t *)rbp)[1];
             uint64_t prev = ((uint64_t *)rbp)[0];

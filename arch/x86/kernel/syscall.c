@@ -520,7 +520,15 @@ extern uint64_t proc_current_cr3(void);
 static inline bool vma_owned_by_current(const vma_t *v)
 {
     void *cur = proc_current();
-    return v->owner == NULL || v->owner == cur;
+    if (v->owner == NULL || v->owner == cur) return true;
+    /* CLONE_THREAD threads share one address space (and its VMAs) with their
+     * thread-group siblings, but each is a distinct process_t. A worker/render
+     * thread must be able to demand-fault VMAs the main thread (or another
+     * sibling) registered — including its own musl-mmap'd stack — so match by
+     * thread group, not the exact process_t. */
+    extern int32_t proc_tgid_of(void *p);
+    int32_t ct = proc_tgid_of(cur);
+    return ct != 0 && proc_tgid_of(v->owner) == ct;
 }
 
 /* ── Demand paging: free individually-faulted pages in a VMA ───── */
