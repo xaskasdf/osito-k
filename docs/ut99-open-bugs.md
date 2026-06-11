@@ -68,13 +68,21 @@ triple-fault (VM paused, internal-error)**. CONFIRMED by A/B (2026-06-08):
 reverting B3 made New Game stop triple-faulting (it reaches the map; the original
 `0x1039B6CB` #PF returns but recovers cleanly to shell — strictly better than a
 kernel triple-fault). So `compat32_callback_args` is the WRONG vehicle here.
-**PROPER FIX (deferred):** invoke the 32-bit comparator via a LIGHTWEIGHT
-symmetric far-call/far-return trampoline (64→32 `lretq` to CS32 with args + a
-32-bit `retf`-back stub to CS64) — NO callback_stack/depth/jmpbuf/IST1 machinery,
-since the comparator is a pure leaf. Or JIT a one-time cdecl→register shim per the
-workflow. Verify: play through translucent geometry AND New Game multiple times —
-no `0x1039B6CB` and no `CR2=0x40`. Until then B3 stays REVERTED (the recoverable
-qsort #PF is preferable to the kernel triple-fault).
+**FIX 2 — IN-MODE 32-BIT BLOB (FIXED + VALIDATED 2026-06-08):** the lightweight
+far-return idea is impossible (the 64-bit kernel lives in the high half; a 32-bit
+`lret` can't return there with a 32-bit EIP — which is exactly why
+compat32_callback_args needs the jmpbuf machinery). So the real fix runs qsort
+ITSELF in 32-bit mode, like real MSVCRT: a position-independent 32-bit qsort/
+bsearch compiled with `clang -m32` (source `arch/x86/scripts/qsort32.c`, 498 bytes,
+no relocations, qsort@0 / bsearch@0x1a0), embedded in compat32.c, installed in a
+low (<4GB) executable page at boot (`[COMPAT32] qsort32 blob at 0x...`), and
+`compat32_make_thunk_ex` resolves the MSVCRT `qsort`/`bsearch` imports to the blob
+(like the `_ftol` native-stub path) instead of an INT 0x2E thunk into the 64-bit
+crt_qsort. The guest calls the blob NATIVELY in 32-bit; it calls the comparator
+32→32 native — NO INT 0x2E, NO compat32 callback, NO IST1 round-trip. VALIDATED:
+New Game reaches a map (no `CR2=0x40` triple-fault, VM stays running) and gameplay
+runs with NO `0x1039B6CB` / `CR2=0x100000023`. crt_qsort/crt_bsearch (msvcrt_shim.c,
+64-bit) stay registered but are now bypassed for the guest.
 
 ## B4 — Dirty layer state after a crash (can't relaunch in-OS)
 **Symptom:** after a PE32 process crash recovers to the `osito>` shell, UT99
