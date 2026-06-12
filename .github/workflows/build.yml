@@ -2,34 +2,94 @@ name: Build
 
 on:
   push:
-    branches: [master]
+    branches: [master, experiment]
   pull_request:
-    branches: [master]
+    branches: [master, experiment]
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    strategy:
+      # fail-fast en false permite que si falla una arquitectura, las demás continúen su build
+      fail-fast: false
+      matrix:
+        include:
+          - arch: esp8266
+            name: ESP8266
+          - arch: x86_64
+            name: x86-64
+          - arch: arm64
+            name: ARM64
+          - arch: wasm
+            name: WebAssembly
 
+    name: Build ${{ matrix.name }}
     steps:
       - uses: actions/checkout@v4
 
-      - name: Download xtensa-lx106-elf toolchain
+      # ---------------------------------------------------------
+      # 1. PREPARACIÓN DE ENTORNOS (Dependiendo de la arquitectura)
+      # ---------------------------------------------------------
+
+      - name: Setup ESP8266 Toolchain
+        if: matrix.arch == 'esp8266'
         run: |
-          curl -sSL https://dl.espressif.com/dl/xtensa-lx106-elf-gcc8_4_0-esp-2020r3-linux-amd64.tar.gz \
-            -o toolchain.tar.gz
+          curl -sSL https://dl.espressif.com/dl/xtensa-lx106-elf-gcc8_4_0-esp-2020r3-linux-amd64.tar.gz -o toolchain.tar.gz
           mkdir -p tools
           tar xzf toolchain.tar.gz -C tools/
           rm toolchain.tar.gz
+          pip install esptool
 
-      - name: Install esptool
-        run: pip install esptool
+      - name: Setup x86-64 Tools
+        if: matrix.arch == 'x86_64'
+        run: |
+          sudo apt-get update
+          # nasm y xorriso son muy comunes para bootloaders e imágenes ISO en x86
+          sudo apt-get install -y build-essential nasm xorriso mtools
+
+      - name: Setup ARM64 Toolchain
+        if: matrix.arch == 'arm64'
+        run: |
+          sudo apt-get update
+          # Instalamos el compilador cruzado para ARM64
+          sudo apt-get install -y gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu
+
+      - name: Setup WebAssembly (WASI SDK)
+        if: matrix.arch == 'wasm'
+        run: |
+          # WASI-SDK provee clang preconfigurado para compilar C/C++ a WebAssembly "bare-metal"
+          wget https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-20/wasi-sdk-20.0-linux.tar.gz
+          tar xzf wasi-sdk-20.0-linux.tar.gz
+          sudo mv wasi-sdk-20.0 /opt/wasi-sdk
+
+      # ---------------------------------------------------------
+      # 2. COMPILACIÓN (Adaptado a cada arquitectura)
+      # ---------------------------------------------------------
 
       - name: Build
         run: |
-          export PATH="$PWD/tools/xtensa-lx106-elf/bin:$PATH"
-          make PYTHON=python3
+          if [ "${{ matrix.arch }}" = "esp8266" ]; then
+            export PATH="$PWD/tools/xtensa-lx106-elf/bin:$PATH"
+            make PYTHON=python3 ARCH=esp8266
+            
+          elif [ "${{ matrix.arch }}" = "x86_64" ]; then
+            make ARCH=x86_64
+            
+          elif [ "${{ matrix.arch }}" = "arm64" ]; then
+            # Pasamos CROSS_COMPILE para que el Makefile use aarch64-linux-gnu-gcc
+            make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu-
+            
+          elif [ "${{ matrix.arch }}" = "wasm" ]; then
+            export WASI_SDK_PATH=/opt/wasi-sdk
+            make ARCH=wasm CC=/opt/wasi-sdk/bin/clang LD=/opt/wasi-sdk/bin/wasm-ld
+          fi
 
-      - name: Show size
+      # ---------------------------------------------------------
+      # 3. MOSTRAR TAMAÑO Y SUBIR ARTEFACTOS
+      # ---------------------------------------------------------
+
+      - name: Show size (ESP8266 only)
+        if: matrix.arch == 'esp8266'
         run: |
           export PATH="$PWD/tools/xtensa-lx106-elf/bin:$PATH"
           xtensa-lx106-elf-size build/osito.elf
@@ -38,8 +98,7 @@ jobs:
       - name: Upload firmware artifact
         uses: actions/upload-artifact@v4
         with:
-          name: osito-k-firmware
-          path: |
-            build/osito0x00000.bin
-            build/osito.elf
-            build/osito.map
+          # Nombra el artefacto de forma dinámica (ej: osito-k-firmware-x86_64)
+          name: osito-k-firmware-${{ matrix.arch }}
+          # Sube toda la carpeta build para que no falle si los nombres de archivo varían por arquitectura
+          path: build/
