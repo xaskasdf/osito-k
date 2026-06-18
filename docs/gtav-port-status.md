@@ -71,7 +71,8 @@ allocators.
 one-page guard with `mprotect(PROT_NONE)`. OsitoK now splits VMAs for partial
 `mprotect` ranges, so the guard page no longer changes protection on the whole
 allocator workspace. Demand paging also refuses to fault in `PROT_NONE` VMAs
-and updates present pages through the active process CR3.
+and updates present pages through the active process CR3. `munmap` now accepts
+ranges spanning split VMAs so callers can still release the original allocation.
 
 **Port workaround**: `GTAV_Source/ositok_stubs.cpp` still overrides both
 `sysMemVirtualAllocate` overloads with a simple 64KB-aligned mmap path. Keep

@@ -1650,22 +1650,41 @@ static int64_t sys_munmap(uint64_t addr, uint64_t length)
     if (length == 0) return -EINVAL;
 
     uint64_t npages = (length + 4095) / 4096;
+    uint64_t unmap_end = addr + npages * 4096;
+    bool unmapped_any = false;
 
-    /* Find matching VMA (exact or containing) owned by current process */
-    for (int i = 0; i < MAX_VMAS; i++) {
-        if (!vma_table[i].in_use) continue;
-        if (!vma_owned_by_current(&vma_table[i])) continue;
-        uint64_t vma_end = vma_table[i].base + vma_table[i].pages * 4096;
-        bool exact = (vma_table[i].base == addr && vma_table[i].pages == npages);
-        bool contains = (addr >= vma_table[i].base && addr + npages * 4096 <= vma_end);
-        if (exact || contains) {
+    for (;;) {
+        bool progress = false;
+
+        for (int i = 0; i < MAX_VMAS; i++) {
+            if (!vma_table[i].in_use) continue;
+            if (!vma_owned_by_current(&vma_table[i])) continue;
+
+            uint64_t vma_start = vma_table[i].base;
+            uint64_t vma_end = vma_start + vma_table[i].pages * 4096;
+            uint64_t overlap_start = addr > vma_start ? addr : vma_start;
+            uint64_t overlap_end = unmap_end < vma_end ? unmap_end : vma_end;
+            if (overlap_start >= overlap_end) continue;
+
+            if (overlap_start != vma_start || overlap_end != vma_end) {
+                int ti = vma_split_for_range(i, overlap_start,
+                                             (overlap_end - overlap_start) / 4096);
+                if (ti < 0) return ti;
+                i = ti;
+            }
+
             vma_free_pages(&vma_table[i]);
             vma_table[i].in_use = false;
-            return 0;
+            unmapped_any = true;
+            progress = true;
+            break;
         }
+
+        if (!progress)
+            break;
     }
 
-    return -EINVAL;
+    return unmapped_any ? 0 : -EINVAL;
 }
 
 /* sys_mprotect — change protection flags on mapped pages.
