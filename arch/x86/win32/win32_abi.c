@@ -155,13 +155,45 @@ int msvc_demangle_abi(const char *s, uint8_t *out_argc, uint8_t *out_cc)
     if (!skip_qual_name(&p)) return 0;            /* skip up to `@@` */
 
     char kind = *p++;
-    if (kind != 'Y') return 0;                    /* only free functions; members → miss */
+    int code = kind - 'A';
+    if (code < 0 || code > 25) return 0;
+
+    /* MSVC function-type code (A-Z → 0-25):
+     *   bit 0   (0x01): near(0) / far(1)
+     *   bits 1-2(0x06): member(0) / static(2) / virtual(4)
+     *   bits 3-4(0x18): private(0) / protected(8) / public(16)
+     *   code < 24:     member-function; code >= 24: free function
+     * Ref: NT5 undname.cxx getTypeEncoding + undname.hxx TE_ constants. */
+    int is_member = (code < 24);                   /* 0-23 = member, 24-25 = free */
+    int is_static = is_member && ((code & 0x06) == 2);
 
     uint8_t cc;
-    if (!cc_from_code(*p, &cc)) return 0;
-    p++;
+    if (is_member && !is_static) {
+        /* Non-static member: skip `thistype` prefix (A/B reference + CV
+         * letter, e.g. `AE` in `?Tick@UObject@@UA E X X Z`), then read
+         * the calling-convention character.  If the CC char is not a valid
+         * code (constructor/destructor `@`), default to thiscall. */
+        if (*p == 'A' || *p == 'B') {
+            p++;                                   /* skip reference marker */
+            if (*p >= 'A' && *p <= 'Z') p++;       /* skip CV qualifier */
+        }
+        if (!cc_from_code(*p, &cc)) {
+            cc = CC_THISCALL;                      /* ctor/dtor @ → fallback */
+            if (*p != '@') return 0;               /* truly unparseable */
+        }
+        p++;
+    } else {
+        /* Free function or static member: read CC from next char */
+        if (!cc_from_code(*p, &cc)) return 0;
+        p++;
+    }
 
-    if (!skip_type(&p)) return 0;                 /* skip return type */
+    /* Skip return type (constructors/destructors use `@` as empty return) */
+    if (*p == '@') {
+        p++;
+    } else {
+        if (!skip_type(&p)) return 0;
+    }
 
     int argc = 0;
     if (*p == 'X') {                              /* (void) */
@@ -175,6 +207,9 @@ int msvc_demangle_abi(const char *s, uint8_t *out_argc, uint8_t *out_cc)
             if (argc > 64) return 0;              /* sanity */
         }
     }
+
+    /* Non-static member functions: `this` pointer counts as 1 DWORD arg */
+    if (is_member && !is_static) argc += 1;
 
     *out_cc   = cc;
     *out_argc = (uint8_t)argc;

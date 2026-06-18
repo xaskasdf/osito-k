@@ -4138,10 +4138,9 @@ static uint64_t WINAPI crt_base_seh_handler(
     serial_puts("[SEH-BASE] handler called, code=0x");
     serial_puthex(code, 8);
     serial_puts("\n");
-    /* Return ContinueExecution (0) — the base handler absorbs all
-     * exceptions. The page fault handler makes page 0 writable before
-     * resuming so the retried instruction succeeds. */
-    return 0; /* ExceptionContinueExecution */
+    /* Do not absorb access violations. Returning ContinueExecution here
+     * retries the same faulting EIP, which turns NULL calls into #PF loops. */
+    return 1; /* ExceptionContinueSearch */
 }
 
 static uint32_t g_base_seh_thunk = 0;

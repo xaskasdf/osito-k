@@ -143,6 +143,19 @@ static WINDOW *find_window(HWND hwnd)
 
 #define MSG_QUEUE_SIZE 256
 
+/* ── Input state ──────────────────────────────────────────── */
+
+/*
+ * key_state[vk]: bit 0 = toggled, bit 7 = currently down.
+ * async_pressed[vk]: set when key goes down, cleared by GetAsyncKeyState.
+ */
+static BYTE key_state[256];
+static BYTE async_pressed[256];
+static BYTE key_state_at_msg[256]; /* snapshot at last PeekMessage/GetMessage retrieval */
+static DWORD mouse_buttons = 0; /* bit 0=left, 1=right, 2=middle */
+
+/* ── Message queue ────────────────────────────────────────── */
+
 static MSG msg_queue[MSG_QUEUE_SIZE];
 static int msg_head = 0, msg_tail = 0;
 static int quit_posted = 0;
@@ -242,19 +255,12 @@ static int msg_dequeue(void *out)
     msg_write_to(out, src->hwnd, src->message, src->wParam, src->lParam,
                  src->time, src->pt.x, src->pt.y);
     g_last_msg_time = src->time;   /* feeds GetMessageTime(), like NT */
+    /* Snapshot key_state at the moment the message is retrieved — GetKeyState
+     * on NT reports the state at last-message-retrieval time, not live. */
+    for (int i = 0; i < 256; i++) key_state_at_msg[i] = key_state[i];
     msg_head = (msg_head + 1) % MSG_QUEUE_SIZE;
     return 1;
 }
-
-/* ── Input state ──────────────────────────────────────────── */
-
-/*
- * key_state[vk]: bit 0 = toggled, bit 7 = currently down.
- * async_pressed[vk]: set when key goes down, cleared by GetAsyncKeyState.
- */
-static BYTE key_state[256];
-static BYTE async_pressed[256];
-static DWORD mouse_buttons = 0; /* bit 0=left, 1=right, 2=middle */
 
 /*
  * PS/2 scancode set 1 → Windows virtual key code.
@@ -317,6 +323,26 @@ static int   clip_active  = 0;      /* ClipCursor(rect!=NULL) in effect */
  * fresh (no stale-position jump). */
 static int   g_abs_prev_valid = 0;
 static int   g_abs_prev_sx = 0, g_abs_prev_sy = 0;
+
+static HWND viewport_hwnd(void);
+
+static int is_gameplay_key(int vk)
+{
+    return vk == VK_UP || vk == VK_DOWN ||
+           vk == VK_LEFT || vk == VK_RIGHT ||
+           vk == 'W' || vk == 'A' || vk == 'S' || vk == 'D' ||
+           vk == VK_SPACE || vk == VK_CONTROL || vk == VK_LBUTTON;
+}
+
+static void log_input_prefix(const char *tag)
+{
+    serial_puts(tag);
+    serial_puts(" focus=0x"); serial_puthex((uint64_t)(ULONG_PTR)focus_hwnd, 8);
+    serial_puts(" vp=0x"); serial_puthex((uint64_t)(ULONG_PTR)viewport_hwnd(), 8);
+    serial_puts(" cap=0x"); serial_puthex((uint64_t)(ULONG_PTR)capture_hwnd, 8);
+    serial_puts(" cv="); serial_putdec((uint64_t)(int64_t)cursor_visible);
+    serial_puts(" clip="); serial_putdec((uint64_t)(int64_t)clip_active);
+}
 
 /*
  * In-game mouse-look gate. UT99's UWindowsViewport does NOT call user32
@@ -874,6 +900,16 @@ BOOL WINAPI PeekMessageA(LPMSG lpMsg, HWND hWnd, DWORD wMsgFilterMin,
         peek_log_count++;
     }
 
+    /* First-ever PeekMessage: bootstrap the queued-state snapshot so GetKeyState
+     * has a baseline (otherwise key_state_at_msg is zeroes → all keys "up"). */
+    {
+        static int boot_snap = 0;
+        if (!boot_snap) {
+            for (int ki = 0; ki < 256; ki++) key_state_at_msg[ki] = key_state[ki];
+            boot_snap = 1;
+        }
+    }
+
     /* One-shot: clear GErrorHist on first PeekMessage call.
      * The engine's init phase triggers null-pointer faults (handled by our
      * write-through) that set GErrorHist="General protection fault!".
@@ -902,6 +938,34 @@ BOOL WINAPI PeekMessageA(LPMSG lpMsg, HWND hWnd, DWORD wMsgFilterMin,
 
     if (msg_queue_empty()) return FALSE;
 
+    /* Snapshot key_state at message-retrieval time (NT GetKeyState semantics).
+     * Do this BEFORE msg_dequeue so the snapshot reflects the state at the
+     * moment this message was retrieved — matching what NT's GetKeyState
+     * would return if called right after PeekMessage/GetMessage. */
+    for (int ki = 0; ki < 256; ki++) key_state_at_msg[ki] = key_state[ki];
+
+    /* ── Phase 1 diagnostic: log messages retrieved during capture ── */
+    {
+        static int diag_n = 0;
+        if (diag_n < 180 && mouselook_active() && !msg_queue_empty()) {
+            MSG *src = &msg_queue[msg_head];
+            serial_puts("[CAP-MSG] Peek: wm=0x");
+            serial_puthex((uint64_t)src->message, 4);
+            serial_puts(" hWnd=0x"); serial_puthex((uint64_t)(ULONG_PTR)src->hwnd, 8);
+            if (src->message == WM_MOUSEMOVE || src->message == WM_KEYDOWN ||
+                src->message == WM_KEYUP || src->message == WM_CHAR)
+            {
+                serial_puts(" wp=0x"); serial_puthex((uint64_t)(uint32_t)src->wParam, 8);
+                serial_puts(" lp=0x"); serial_puthex((uint64_t)src->lParam, 8);
+            }
+            serial_puts(" focus=0x"); serial_puthex((uint64_t)(ULONG_PTR)focus_hwnd, 8);
+            serial_puts(" vp=0x"); serial_puthex((uint64_t)(ULONG_PTR)viewport_hwnd(), 8);
+            serial_puts(" cap=0x"); serial_puthex((uint64_t)(ULONG_PTR)capture_hwnd, 8);
+            serial_puts("\n");
+            diag_n++;
+        }
+    }
+
     if (wRemoveMsg & PM_REMOVE) {
         return msg_dequeue(lpMsg) ? TRUE : FALSE;
     } else {
@@ -926,6 +990,9 @@ BOOL WINAPI GetMessageA(LPMSG lpMsg, HWND hWnd, DWORD wMsgFilterMin,
         msg_write_to(lpMsg, NULL, WM_QUIT, (WPARAM)quit_code, 0, 0, 0, 0);
         return FALSE; /* WM_QUIT → return FALSE to exit loop */
     }
+
+    /* Snapshot key_state at message-retrieval time (matching NT semantics). */
+    for (int ki = 0; ki < 256; ki++) key_state_at_msg[ki] = key_state[ki];
 
     if (msg_dequeue(lpMsg))
         return TRUE;
@@ -966,9 +1033,11 @@ BOOL WINAPI TranslateMessage(const MSG *lpMsg)
     /* Generate WM_CHAR from WM_KEYDOWN — simplified */
     if (m.message == WM_KEYDOWN) {
         DWORD vk = (DWORD)m.wParam;
-        if (vk >= 0x20 && vk <= 0x7E) {
-            msg_enqueue(m.hwnd, WM_CHAR, m.wParam, m.lParam);
-        }
+        BYTE state[256];
+        WORD ch = 0;
+        GetKeyboardState(state);
+        if (ToAscii(vk, (DWORD)((m.lParam >> 16) & 0xFF), state, &ch, 0) > 0)
+            msg_enqueue(m.hwnd, WM_CHAR, (WPARAM)ch, m.lParam);
     }
     return TRUE;
 }
@@ -981,6 +1050,24 @@ LRESULT WINAPI DispatchMessageA(const MSG *lpMsg)
 
     if (m.message == WM_QUIT)
         return 0;
+
+    {
+        static int n = 0;
+        if (n < 180 && mouselook_active() &&
+            (m.message == WM_MOUSEMOVE || m.message == WM_KEYDOWN ||
+             m.message == WM_KEYUP || m.message == WM_LBUTTONDOWN ||
+             m.message == WM_LBUTTONUP || m.message == WM_RBUTTONDOWN ||
+             m.message == WM_RBUTTONUP))
+        {
+            log_input_prefix("[DISPATCH]");
+            serial_puts(" hwnd=0x"); serial_puthex((uint64_t)(ULONG_PTR)m.hwnd, 8);
+            serial_puts(" msg=0x"); serial_puthex((uint64_t)m.message, 4);
+            serial_puts(" wp=0x"); serial_puthex((uint64_t)(uint32_t)m.wParam, 8);
+            serial_puts(" lp=0x"); serial_puthex((uint64_t)(uint32_t)m.lParam, 8);
+            serial_puts("\n");
+            n++;
+        }
+    }
 
     /* Dispatch to 32-bit WndProc via compat32_callback_args.
      * Previous code fell back to DefWindowProc with "can't call 32-bit
@@ -1074,6 +1161,22 @@ BOOL WINAPI GetClientRect(HWND hWnd, LPRECT lpRect)
     lpRect->top    = 0;
     lpRect->right  = w->width;
     lpRect->bottom = w->height;
+    {
+        static int n = 0;
+        if (n < 32 && mouselook_active()) {
+            extern uint32_t compat32_get_last_caller_eip(void);
+            log_input_prefix("[MOUSE-RECT] GetClientRect");
+            serial_puts(" hwnd=0x"); serial_puthex((uint64_t)(ULONG_PTR)hWnd, 8);
+            serial_puts(" r=");
+            serial_putdec((uint64_t)(uint32_t)lpRect->left); serial_puts(",");
+            serial_putdec((uint64_t)(uint32_t)lpRect->top); serial_puts(",");
+            serial_putdec((uint64_t)(uint32_t)lpRect->right); serial_puts(",");
+            serial_putdec((uint64_t)(uint32_t)lpRect->bottom);
+            serial_puts(" eip=0x"); serial_puthex(compat32_get_last_caller_eip(), 8);
+            serial_puts("\n");
+            n++;
+        }
+    }
     return TRUE;
 }
 
@@ -1381,6 +1484,18 @@ BOOL WINAPI SetCursorPos(int X, int Y)
 {
     cursor_pos.x = X;
     cursor_pos.y = Y;
+    {
+        static int n = 0;
+        if (n < 96 && mouselook_active()) {
+            extern uint32_t compat32_get_last_caller_eip(void);
+            log_input_prefix("[MOUSE-CURSOR] SetCursorPos");
+            serial_puts(" x="); serial_putdec((uint64_t)(uint32_t)X);
+            serial_puts(" y="); serial_putdec((uint64_t)(uint32_t)Y);
+            serial_puts(" eip=0x"); serial_puthex(compat32_get_last_caller_eip(), 8);
+            serial_puts("\n");
+            n++;
+        }
+    }
     return TRUE;
 }
 
@@ -1388,6 +1503,18 @@ BOOL WINAPI GetCursorPos(LPPOINT lpPoint)
 {
     if (!lpPoint) return FALSE;
     *lpPoint = cursor_pos;
+    {
+        static int n = 0;
+        if (n < 96 && mouselook_active()) {
+            extern uint32_t compat32_get_last_caller_eip(void);
+            log_input_prefix("[MOUSE-CURSOR] GetCursorPos");
+            serial_puts(" x="); serial_putdec((uint64_t)(uint32_t)lpPoint->x);
+            serial_puts(" y="); serial_putdec((uint64_t)(uint32_t)lpPoint->y);
+            serial_puts(" eip=0x"); serial_puthex(compat32_get_last_caller_eip(), 8);
+            serial_puts("\n");
+            n++;
+        }
+    }
     return TRUE;
 }
 
@@ -1430,19 +1557,19 @@ HWND WINAPI SetCapture(HWND hWnd)
 {
     HWND old = capture_hwnd;
     capture_hwnd = hWnd;
-    /* [CAPDIAG — uncommitted] log + identify SetMouseCapture's CALLER (the
+    if (hWnd && find_window(hWnd) && focus_hwnd != hWnd)
+        SetFocus(hWnd);
+    /* [CAPDIAG] log + identify SetMouseCapture's CALLER (the
      * flap driver): we are called from inside WinDrv SetMouseCapture
      * (0x11106610, std prologue), so guest [ebp+4] = its return address into
      * Engine/Window.dll — the per-frame capture/release decision site. */
     {
         static int n = 0;
-        if (n++ < 24) {
+        if (n++ < 32) {
             extern uint32_t compat32_get_last_user_ebp(void);
             extern uint32_t compat32_get_last_user_esi(void);
             uint32_t ebp = compat32_get_last_user_ebp();
             uint32_t ret = 0, f38 = 0, actor = 0, show = 0;
-            /* The viewport `this` is LIVE in guest ESI inside SetMouseCapture
-             * (its body keeps this in esi; INT2E saved the guest registers). */
             uint32_t vp = compat32_get_last_user_esi();
             if (ebp >= 0x10000 && ebp < 0x7FFF0000)
                 ret = *(volatile uint32_t *)(uintptr_t)(ebp + 4);
@@ -1456,12 +1583,29 @@ HWND WINAPI SetCapture(HWND hWnd)
             serial_puthex((uint64_t)(ULONG_PTR)hWnd, 8);
             serial_puts(") smc_ret=0x"); serial_puthex(ret, 8);
             serial_puts(" vp=0x"); serial_puthex(vp, 8);
+            serial_puts(" actor=0x"); serial_puthex(actor, 8);
             serial_puts(" vp38=0x"); serial_puthex(f38, 4);
             serial_puts(" show=0x"); serial_puthex(show, 8);
             serial_puts("\n");
-            /* [CAPDIAG] one-shot: watch WRITES to viewport+0x38 — the flap is
-             * bits 1,2 toggling 0x0000<->0x0007 per frame; the #DB handler logs
-             * each writer's guest RIP (the script/native oscillator). */
+            /* ── Phase 1 diagnostic: key_state live vs queued delta ── */
+            {
+                int diffs = 0;
+                for (int vk = 0; vk < 256 && diffs < 8; vk++) {
+                    BYTE live = key_state[vk];
+                    BYTE queued = key_state_at_msg[vk];
+                    if ((live & 0x80) != (queued & 0x80)) {
+                        serial_puts("[CAP-KEYDIFF] VK=0x");
+                        serial_puthex((uint64_t)vk, 2);
+                        serial_puts(" live=0x"); serial_puthex((uint64_t)live, 2);
+                        serial_puts(" queued=0x"); serial_puthex((uint64_t)queued, 2);
+                        serial_puts("\n");
+                        diffs++;
+                    }
+                }
+                if (diffs == 0)
+                    serial_puts("[CAP-KEYDIFF] (none — live == queued)\n");
+            }
+            /* [CAPDIAG] one-shot: watch WRITES to viewport+0x38 */
             {
                 static int armed = 0;
                 if (!armed && ret == 0x10390159 && vp >= 0x10000 && vp < 0x7FFF0000) {
@@ -1470,6 +1614,33 @@ HWND WINAPI SetCapture(HWND hWnd)
                     hwbp_set(0, (uint64_t)vp + 0x38, 1 /*WRITE*/, 3 /*LEN_4*/, "vp38w");
                     serial_puts("[CAP] HWBP armed on vp+0x38\n");
                     armed = 1;
+                }
+            }
+            /* [CAPDIAG] one-shot: break whenever WinDrv hands an input event
+             * to Unreal. CauseInputEvent is thiscall:
+             *   ECX=this, stack={ret,key,action,delta/raw}. */
+            {
+                static int cie_armed = 0;
+                if (!cie_armed) {
+                    extern int hwbp_set(int slot, uint64_t addr, int cond, int len,
+                                        const char *name);
+                    hwbp_set(1, 0x11106560ULL, 0 /*EXEC*/, 0 /*LEN_1*/, "cie");
+                    serial_puts("[CAP] HWBP armed on WinDrv!CauseInputEvent\n");
+                    cie_armed = 1;
+                }
+            }
+            /* [CAPDIAG] downstream input probes. UInput::Exec sees bound
+             * commands and recursive alias expansion; 0x10393B05 is the Axis
+             * success path after the action==2/4 store paths. */
+            {
+                static int uinput_armed = 0;
+                if (!uinput_armed) {
+                    extern int hwbp_set(int slot, uint64_t addr, int cond, int len,
+                                        const char *name);
+                    hwbp_set(0, 0x10393B05ULL, 0 /*EXEC*/, 0 /*LEN_1*/, "uiaxpost");
+                    hwbp_set(3, 0x10393800ULL, 0 /*EXEC*/, 0 /*LEN_1*/, "uiexec");
+                    serial_puts("[CAP] HWBP armed on UInput::Exec/Axis branch\n");
+                    uinput_armed = 1;
                 }
             }
         }
@@ -1496,8 +1667,29 @@ short WINAPI GetKeyState(int nVirtKey)
 {
     if (nVirtKey < 0 || nVirtKey > 255) return 0;
     short result = 0;
+    /* UE1/WinDrv polls GetKeyState for all keys once per frame. In this
+     * single-foreground-thread shim, return the live state so movement keys
+     * are visible outside individual WM_KEYDOWN dispatch. */
     if (key_state[nVirtKey] & 0x80) result |= (short)0x8000;
-    if (key_state[nVirtKey] & 0x01) result |= 0x0001; /* toggle state */
+    if (key_state[nVirtKey] & 0x01) result |= 0x0001;
+    if (result & (short)0x8000) {
+        static int n = 0;
+        if (n < 256 && is_gameplay_key(nVirtKey))
+        {
+            extern uint32_t compat32_get_last_caller_eip(void);
+            extern uint32_t compat32_get_last_user_esi(void);
+            serial_puts("[KEYSTATE] vk=0x");
+            serial_puthex((uint64_t)(uint32_t)nVirtKey, 2);
+            serial_puts(" r=0x"); serial_puthex((uint64_t)(uint16_t)result, 4);
+            serial_puts(" eip=0x"); serial_puthex(compat32_get_last_caller_eip(), 8);
+            serial_puts(" esi=0x"); serial_puthex(compat32_get_last_user_esi(), 8);
+            serial_puts(" focus=0x"); serial_puthex((uint64_t)(ULONG_PTR)focus_hwnd, 8);
+            serial_puts(" vp=0x"); serial_puthex((uint64_t)(ULONG_PTR)viewport_hwnd(), 8);
+            serial_puts(" cap=0x"); serial_puthex((uint64_t)(ULONG_PTR)capture_hwnd, 8);
+            serial_puts("\n");
+            n++;
+        }
+    }
     return result;
 }
 
@@ -1557,8 +1749,22 @@ int WINAPI ToAscii(DWORD uVirtKey, DWORD uScanCode, const BYTE *lpKeyState,
         *lpChar = (WORD)uVirtKey;
         return 1;
     }
-    if (uVirtKey == VK_SPACE)  { *lpChar = ' '; return 1; }
-    if (uVirtKey == VK_RETURN) { *lpChar = '\r'; return 1; }
+    if (uVirtKey == VK_SPACE)      { *lpChar = ' ';  return 1; }
+    if (uVirtKey == VK_RETURN)     { *lpChar = '\r'; return 1; }
+    if (uVirtKey == VK_BACK)       { *lpChar = '\b'; return 1; }
+    if (uVirtKey == VK_TAB)        { *lpChar = '\t'; return 1; }
+    if (uVirtKey == VK_ESCAPE)     { *lpChar = 0x1B; return 1; }
+    if (uVirtKey == VK_OEM_MINUS)  { *lpChar = shift ? '_'  : '-';  return 1; }
+    if (uVirtKey == VK_OEM_PLUS)   { *lpChar = shift ? '+'  : '=';  return 1; }
+    if (uVirtKey == VK_OEM_COMMA)  { *lpChar = shift ? '<'  : ',';  return 1; }
+    if (uVirtKey == VK_OEM_PERIOD) { *lpChar = shift ? '>'  : '.';  return 1; }
+    if (uVirtKey == VK_OEM_1)      { *lpChar = shift ? ':'  : ';';  return 1; }
+    if (uVirtKey == VK_OEM_2)      { *lpChar = shift ? '?'  : '/';  return 1; }
+    if (uVirtKey == VK_OEM_3)      { *lpChar = shift ? '~'  : '`';  return 1; }
+    if (uVirtKey == VK_OEM_4)      { *lpChar = shift ? '{'  : '[';  return 1; }
+    if (uVirtKey == VK_OEM_5)      { *lpChar = shift ? '|'  : '\\'; return 1; }
+    if (uVirtKey == VK_OEM_6)      { *lpChar = shift ? '}'  : ']';  return 1; }
+    if (uVirtKey == VK_OEM_7)      { *lpChar = shift ? '"'  : '\''; return 1; }
     return 0;
 }
 
@@ -1888,6 +2094,21 @@ void win32_post_keyboard_event(BYTE scancode, BOOL key_up)
      * non-viewport window and never reaching the gameplay input. */
     HWND target = input_target();
 
+    if (is_gameplay_key(vk)) {
+        static int n = 0;
+        if (n < 160) {
+            log_input_prefix("[KEY-IN]");
+            serial_puts(" sc=0x"); serial_puthex((uint64_t)scancode, 2);
+            serial_puts(" ext="); serial_putdec((uint64_t)(uint32_t)extended);
+            serial_puts(" up="); serial_putdec((uint64_t)(uint32_t)key_up);
+            serial_puts(" vk=0x"); serial_puthex((uint64_t)vk, 2);
+            serial_puts(" state=0x"); serial_puthex((uint64_t)key_state[vk], 2);
+            serial_puts(" target=0x"); serial_puthex((uint64_t)(ULONG_PTR)target, 8);
+            serial_puts("\n");
+            n++;
+        }
+    }
+
     /* Build lParam: scancode in bits 16-23, extended flag in bit 24,
      * previous state in bit 30, transition state in bit 31 */
     LPARAM lp = ((LPARAM)scancode << 16) | 1; /* repeat count = 1 */
@@ -1925,6 +2146,25 @@ void win32_post_mouse_event(int dx, int dy, DWORD buttons, short wheel_delta)
      * The relative-delta accumulation above is already what UE1's recenter
      * math expects (cursor_pos = recenter_origin + delta). */
     HWND target = input_target();
+
+    /* ── Phase 1 diagnostic: WM_MOUSEMOVE routing during capture ── */
+    {
+        static int diag_n = 0;
+        int cap = (capture_hwnd != NULL);
+        int ml  = (cursor_visible < 0) || clip_active;
+        if (diag_n < 60 && (cap || ml)) {
+            serial_puts("[CAP-MOUSE] dx="); serial_putdec((uint64_t)(int64_t)dx);
+            serial_puts(" dy="); serial_putdec((uint64_t)(int64_t)dy);
+            serial_puts(" x="); serial_putdec((uint64_t)cursor_pos.x);
+            serial_puts(" y="); serial_putdec((uint64_t)cursor_pos.y);
+            serial_puts(" target=0x"); serial_puthex((uint64_t)(ULONG_PTR)target, 8);
+            serial_puts(" cap=0x"); serial_puthex((uint64_t)(ULONG_PTR)capture_hwnd, 8);
+            serial_puts(" cv="); serial_putdec((uint64_t)(int64_t)cursor_visible);
+            serial_puts(" ml="); serial_putdec((uint64_t)(int64_t)ml);
+            serial_puts("\n");
+            diag_n++;
+        }
+    }
 
     LPARAM pos_lp = ((LPARAM)(cursor_pos.y & 0xFFFF) << 16) |
                      (LPARAM)(cursor_pos.x & 0xFFFF);
@@ -2001,6 +2241,7 @@ void win32_post_mouse_abs(int ax, int ay, int lmin, int lmax, DWORD buttons)
     if (sy < 0) sy = 0; else if (sy >= th) sy = th - 1;
 
     int nx, ny, moved;
+    int rel_dx = 0, rel_dy = 0;
 
     if (mouselook_active()) {
         /* In-game mouse-look. UE1 recenters the cursor every frame via
@@ -2015,6 +2256,8 @@ void win32_post_mouse_abs(int ax, int ay, int lmin, int lmax, DWORD buttons)
         int dx = 0, dy = 0;
         if (g_abs_prev_valid) { dx = sx - g_abs_prev_sx; dy = sy - g_abs_prev_sy; }
         g_abs_prev_sx = sx; g_abs_prev_sy = sy; g_abs_prev_valid = 1;
+        rel_dx = dx;
+        rel_dy = dy;
 
         nx = cursor_pos.x + dx;
         ny = cursor_pos.y + dy;
@@ -2034,6 +2277,27 @@ void win32_post_mouse_abs(int ax, int ay, int lmin, int lmax, DWORD buttons)
 
     cursor_pos.x = nx;
     cursor_pos.y = ny;
+
+    /* ── Phase 1 diagnostic: abs-path WM_MOUSEMOVE during capture ── */
+    {
+        static int diag_n = 0;
+        int cap = (capture_hwnd != NULL);
+        int ml  = mouselook_active();
+        if (diag_n < 160 && (cap || ml)) {
+            serial_puts("[CAP-MOUSE-ABS] x="); serial_putdec((uint64_t)nx);
+            serial_puts(" y="); serial_putdec((uint64_t)ny);
+            serial_puts(" sx="); serial_putdec((uint64_t)sx);
+            serial_puts(" sy="); serial_putdec((uint64_t)sy);
+            serial_puts(" dx="); serial_putdec((uint64_t)(int64_t)rel_dx);
+            serial_puts(" dy="); serial_putdec((uint64_t)(int64_t)rel_dy);
+            serial_puts(" target=0x"); serial_puthex((uint64_t)(ULONG_PTR)target, 8);
+            serial_puts(" cap=0x"); serial_puthex((uint64_t)(ULONG_PTR)capture_hwnd, 8);
+            serial_puts(" moved="); serial_putdec((uint64_t)(int64_t)moved);
+            serial_puts(" cv="); serial_putdec((uint64_t)(int64_t)cursor_visible);
+            serial_puts("\n");
+            diag_n++;
+        }
+    }
 
     DWORD old_buttons = mouse_buttons;
     mouse_buttons = buttons;
@@ -2182,6 +2446,7 @@ WORD WINAPI RegisterClassExW(PVOID lpwcx)
      * Read fields at byte offsets to be safe: */
     uint8_t *raw = (uint8_t *)lpwcx;
     uint32_t cb_size = *(uint32_t *)(raw + 0);
+    (void)cb_size;
     uint32_t wndproc_addr = *(uint32_t *)(raw + 8);
     uint32_t classname_ptr = *(uint32_t *)(raw + 40);
 
@@ -2518,8 +2783,10 @@ HWND WINAPI GetFocus(void)
      * capture. NT semantics: while our (only) app is active, some window of it
      * has keyboard focus — serve the tracked focus window, falling back to the
      * foreground window; NULL only when the process has no windows at all. */
-    HWND r = (focus_hwnd && find_window(focus_hwnd)) ? focus_hwnd
-                                                      : GetForegroundWindow();
+    HWND vp = viewport_hwnd();
+    HWND r = (mouselook_active() && vp) ? vp :
+             ((focus_hwnd && find_window(focus_hwnd)) ? focus_hwnd
+                                                       : GetForegroundWindow());
     /* [CAPDIAG — uncommitted] sample what the engine's focus gate sees */
     {
         static uint32_t n = 0;
@@ -2534,8 +2801,9 @@ HWND WINAPI GetFocus(void)
 
 BOOL WINAPI IsWindowVisible(HWND hWnd)
 {
-    (void)hWnd;
-    return TRUE;
+    WINDOW *w = find_window(hWnd);
+    if (!w) return FALSE;
+    return w->visible ? TRUE : FALSE;
 }
 
 int WINAPI MapWindowPoints(HWND hWndFrom, HWND hWndTo, LPPOINT lpPoints, UINT cPoints)
@@ -2557,6 +2825,27 @@ int WINAPI MapWindowPoints(HWND hWndFrom, HWND hWndTo, LPPOINT lpPoints, UINT cP
         for (UINT i = 0; i < cPoints; i++) {
             pt[i * 2 + 0] += dx;
             pt[i * 2 + 1] += dy;
+        }
+    }
+    {
+        static int n = 0;
+        if (n < 32 && mouselook_active()) {
+            extern uint32_t compat32_get_last_caller_eip(void);
+            log_input_prefix("[MOUSE-RECT] MapWindowPoints");
+            serial_puts(" from=0x"); serial_puthex((uint64_t)(ULONG_PTR)hWndFrom, 8);
+            serial_puts(" to=0x"); serial_puthex((uint64_t)(ULONG_PTR)hWndTo, 8);
+            serial_puts(" dx="); serial_putdec((uint64_t)(uint32_t)dx);
+            serial_puts(" dy="); serial_putdec((uint64_t)(uint32_t)dy);
+            serial_puts(" n="); serial_putdec((uint64_t)cPoints);
+            if (pt && cPoints) {
+                serial_puts(" p0=");
+                serial_putdec((uint64_t)(uint32_t)pt[0]);
+                serial_puts(",");
+                serial_putdec((uint64_t)(uint32_t)pt[1]);
+            }
+            serial_puts(" eip=0x"); serial_puthex(compat32_get_last_caller_eip(), 8);
+            serial_puts("\n");
+            n++;
         }
     }
     return (int)((((uint32_t)dy & 0xFFFF) << 16) | ((uint32_t)dx & 0xFFFF));
@@ -2786,6 +3075,7 @@ const WIN32_EXPORT *user32_abi_table(int *count)
 
 PVOID user32_resolve(const char *func_name, USHORT ordinal, BOOL by_ordinal)
 {
+    (void)ordinal;
     if (by_ordinal) return NULL;
     for (int i = 0; user32_exports[i].name; i++) {
         if (u32_strcmp(func_name, user32_exports[i].name) == 0)

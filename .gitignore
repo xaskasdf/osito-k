@@ -51,6 +51,11 @@ tools/ositofs/ositofs-defrag
 tools/ositofs/ositofs-fsck
 tools/uzdecomp/uzdecomp
 
+# Local agent/tool state
+.agents/
+.omo/
+.wrangler/
+
 # Game / workload artifacts (binaries, discs, NVMe images)
 *.WAD
 *.wad
@@ -62,11 +67,38 @@ quake2.elf
 kernel.elf
 UnrealTournament.ini
 DOOM*.zip
+/Core.dll
+/Engine.dll
+/Window.dll
+/UnrealTournament.exe
+/Engine.u
+/*.dll
+/*.DLL
+/*.exe
+/*.EXE
+/*.u
+/*.U
+/*.bin
+/*.bundle
+/*UnrealTournament*
+/fix_*.py
+/EFI/
+/startup.nsh
+arch/x86/out/
+arch/x86/scripts/*.bin
+
+# In-tree test/build outputs
+arch/x86/test/*.elf
+arch/arm/test/hello
+arch/arm/test/neon_bench
+arch/arm/test/neon_test
+arch/x86/dos/test/*.COM
+arch/wasm/*.so
 
 # QEMU serial logs from local runs
 serial.*.log
 serial_*.log
-log/
+/log/
 
 # UnrealEngine .int localization files
 *.int

@@ -1528,9 +1528,8 @@ int WINAPI lstrlenW(PCWSTR lpString)
  * the engine attempts to load it but ends up trying to load package
  * "0" (some FName index resolves to empty/zero) and throws "Can't
  * find file for package '0'".  Bare exe → menu may work better. */
-/* [REPRO-#1 DIAGNOSTIC — uncommitted] Boot directly into a gameplay map so the
- * engine attempts a New-Game-style LoadMap at startup (deterministic, no GUI nav)
- * to reproduce the LocalMapURL map-load-failure throw. Revert to bare exe before commit. */
+/* Keep the default command line bare. Map-specific repros should be injected
+ * by launch scripts or image contents, not hardcoded into kernel32. */
 static char  g_cmdline_a[] = "UnrealTournament.exe";
 static WCHAR g_cmdline_w[] = {'U','n','r','e','a','l','T','o','u','r','n','a','m','e','n','t','.','e','x','e',0};
 
@@ -3111,15 +3110,16 @@ int WINAPI MultiByteToWideChar(DWORD CodePage, DWORD dwFlags,
     return copy;
 }
 
-int WINAPI WideCharToMultiByte(DWORD CodePage, DWORD dwFlags,
-                               PCWSTR lpWideCharStr, int cchWideChar,
-                               PSTR lpMultiByteStr, int cbMultiByte,
-                               PCSTR lpDefaultChar, BOOL *lpUsedDefaultChar)
+static int wide_char_to_multi_byte_impl(DWORD CodePage, DWORD dwFlags,
+                                        PCWSTR lpWideCharStr, int cchWideChar,
+                                        PSTR lpMultiByteStr, int cbMultiByte,
+                                        PCSTR lpDefaultChar, BOOL *lpUsedDefaultChar)
 {
     (void)CodePage;
     (void)dwFlags;
     (void)lpDefaultChar;
     if (lpUsedDefaultChar) *lpUsedDefaultChar = FALSE;
+    if (!lpWideCharStr) return 0;
 
     int len = 0;
     if (cchWideChar == -1) {
@@ -3137,6 +3137,18 @@ int WINAPI WideCharToMultiByte(DWORD CodePage, DWORD dwFlags,
 
     return copy;
 }
+
+int WINAPI WideCharToMultiByte(DWORD CodePage, DWORD dwFlags,
+                               PCWSTR lpWideCharStr, int cchWideChar,
+                               PSTR lpMultiByteStr, int cbMultiByte,
+                               PCSTR lpDefaultChar, BOOL *lpUsedDefaultChar)
+{
+    return wide_char_to_multi_byte_impl(CodePage, dwFlags, lpWideCharStr,
+                                        cchWideChar, lpMultiByteStr,
+                                        cbMultiByte, lpDefaultChar,
+                                        lpUsedDefaultChar);
+}
+
 
 /* ── Interlocked ───────────────────────────────────────────── */
 

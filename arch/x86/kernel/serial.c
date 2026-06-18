@@ -20,9 +20,13 @@
 #define LSR_RX_READY  0x01
 
 static volatile int serial_lock = 0;
-static inline void serial_acquire(void) {
-    while (__sync_lock_test_and_set(&serial_lock, 1))
+static inline int serial_acquire(void) {
+    for (uint32_t spins = 0; spins < 1000000; spins++) {
+        if (!__sync_lock_test_and_set(&serial_lock, 1))
+            return 1;
         __asm__ volatile ("pause" ::: "memory");
+    }
+    return 0;
 }
 static inline void serial_release(void) {
     __sync_lock_release(&serial_lock);
@@ -49,8 +53,10 @@ void serial_putc(char c)
     extern void klog_putc(char c) __attribute__((weak));
     if (klog_putc) klog_putc(c);
 
-    while (!(inb(COM1_PORT + REG_LSR) & LSR_TX_EMPTY))
-        ;
+    for (uint32_t spins = 0; spins < 1000000; spins++) {
+        if (inb(COM1_PORT + REG_LSR) & LSR_TX_EMPTY)
+            break;
+    }
     outb(COM1_PORT + REG_DATA, (uint8_t)c);
 }
 
@@ -64,12 +70,12 @@ void serial_puts(const char *s)
 {
     /* klog tee happens at the serial_putc level — see comment there.
      * No need to klog_puts(s) explicitly here. */
-    serial_acquire();
+    int locked = serial_acquire();
     while (*s) {
         if (*s == '\n') serial_putc('\r');
         serial_putc(*s++);
     }
-    serial_release();
+    if (locked) serial_release();
 }
 
 void serial_puthex(uint64_t val, int digits)

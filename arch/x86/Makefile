@@ -20,10 +20,12 @@ ifeq ($(CLANG),1)
 CC       = clang --target=x86_64-elf
 LD       = ld.lld
 OBJCOPY  = llvm-objcopy
+AR       = llvm-ar
 else
 CC       = x86_64-elf-gcc
 LD       = x86_64-elf-ld
 OBJCOPY  = x86_64-elf-objcopy
+AR       = x86_64-elf-ar
 endif
 
 # gnu-efi paths. Auto-detect macOS (/usr/local via ncroxon/gnu-efi from
@@ -246,7 +248,7 @@ all: check-deps $(BUILD)/boot.efi $(BUILD)/kernel.elf libvulkan
 
 # ── Wave 2: Vulkan SDK library ────────────────────────────────
 libvulkan:
-	$(MAKE) -C lib/vulkan CC=$(CC) AR=$(shell echo $(CC) | sed 's/-gcc/-ar/')
+	$(MAKE) -C lib/vulkan CC='$(CC)' AR='$(AR)'
 
 minimal: check-deps $(BUILD)/boot.efi $(BUILD)/kernel-minimal.elf
 	@echo ""

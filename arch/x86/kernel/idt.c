@@ -1267,14 +1267,18 @@ void isr_handler(interrupt_frame_t *frame)
          * causes #GP(0x0A) because the 64-bit exception frame can't be
          * pushed on the 32-bit stack without IST. Just leave page writable. */
         if (cr2 < 0x1000 && (frame->error_code & 2) && !(frame->error_code & 16)) {
-            /* Null-pointer writes from PE32 code.
-             * For code in DLL range (0x10-0x12M): write-through (safe,
-             * these are benign init-time writes the engine expects).
-             * For code in heap range (0x40-0x80M): dispatch to base SEH
-             * handler to trigger the engine's __except error path.
-             * Without SEH, heap code falls through to garbage after the
-             * write and hits CC padding → #BP crash. */
-            {
+            /* Null-pointer writes from PE32 code (CS=0x40).
+             * Route through the normal SEH dispatch at the end of this
+             * function — the engine's __except handlers (including the
+             * appFailAssert crash reporter) catch EXCEPTION_ACCESS_VIOLATION.
+             * Write-through was masking real null-pointer dereference bugs
+             * (e.g. SoftDrv+0x361D4 writing to NULL+0x198 during post-init
+             * rendering), turning them into cascading kernel RIP=0 crashes.
+             *
+             * Non-compat32 code (kernel init) still gets write-through —
+             * boot-time page-table setup touches low addresses legitimately. */
+            int is_compat32 = ((frame->cs & 0xFFFF) == 0x40);
+            if (!is_compat32) {
                 static int nw_count = 0;
                 nw_count++;
                 int is_heap = (frame->cs & 0xFFFF) == 0x40 &&
@@ -1336,12 +1340,35 @@ void isr_handler(interrupt_frame_t *frame)
                         else if (mod == 0 && rm == 5) len += 4;  /* disp32 no base */
                         if (op == 0xC7) len += 4;                /* imm32 */
                         static int fmw_skip = 0;
-                        if (fmw_skip < 20) {
+                        if (fmw_skip < 24) {
                             fmw_skip++;
-                            serial_puts("[FMW-POOL-SKIP] NULL write @0x");
+                            /* FMW pool alias probe: dump the
+                             * freed block ptr ([ebp+8]), the GMalloc this
+                             * ([ebp-0x28]), the FPoolInfo node ([ebp-0x14]) and
+                             * its pool(+0x10)/PrevLink(+0x1c). The block ptr's
+                             * 64KB slot vs a registered VA-ALLOC base tells us
+                             * whether the PoolIndirect lookup misses because the
+                             * block lives in an unregistered/aliased slot. */
+                            uint32_t ebp = (uint32_t)frame->rbp;
+                            uint32_t blk = 0, thiz = 0, node = 0;
+                            if (ebp >= 0x10000 && ebp < 0x80000000) {
+                                blk  = *(volatile uint32_t *)(uintptr_t)(ebp + 0x08);
+                                thiz = *(volatile uint32_t *)(uintptr_t)(ebp - 0x28);
+                                node = *(volatile uint32_t *)(uintptr_t)(ebp - 0x14);
+                            }
+                            serial_puts("[FMW-POOL-SKIP] @0x");
                             serial_puthex((uint32_t)frame->rip, 8);
-                            serial_puts(" len="); serial_putdec((uint64_t)len);
                             serial_puts(" CR2=0x"); serial_puthex((uint32_t)cr2, 4);
+                            serial_puts(" blk=0x"); serial_puthex(blk, 8);
+                            serial_puts(" slot=0x"); serial_puthex((blk >> 16) & 0xff, 2);
+                            serial_puts(" node=0x"); serial_puthex(node, 8);
+                            if (node >= 0x10000 && node < 0x80000000) {
+                                serial_puts(" pool=0x");
+                                serial_puthex(*(volatile uint32_t *)(uintptr_t)(node + 0x10), 8);
+                                serial_puts(" prevlink=0x");
+                                serial_puthex(*(volatile uint32_t *)(uintptr_t)(node + 0x1c), 8);
+                            }
+                            serial_puts(" this=0x"); serial_puthex(thiz, 8);
                             serial_puts("\n");
                         }
                         frame->rip += len;
@@ -1383,16 +1410,20 @@ void isr_handler(interrupt_frame_t *frame)
                     frame->rax = 0;
                     return;  /* resume at the correct function */
                 }
-            }
 
-            /* Normal null-page write-through */
+            /* Normal null-page write-through
+             * (non-compat32 code — kernel init / boot path) */
             paging_set_flags(0, PTE_PRESENT | PTE_WRITABLE | PTE_GLOBAL | PTE_NX);
             __asm__ volatile ("invlpg (%0)" :: "r"((uint64_t)0) : "memory");
-            if ((frame->cs & 0xFFFF) != 0x40) {
-                frame->rflags |= (1ULL << 8);  /* TF bit */
-            }
+            frame->rflags |= (1ULL << 8);  /* TF bit — re-protect in #DB */
             g_null_page_dirty = 1;
             return;
+            } /* end if (!is_compat32) */
+
+            /* compat32 path (CS=0x40): fall through to SEH dispatch at the
+             * end of this function.  The null-page is left read-only+NX;
+             * the guest receives EXCEPTION_ACCESS_VIOLATION which the
+             * engine's __except handler catches and reports properly. */
         }
 
         /* The NULL-CALL recovery path below is Win32 PE32 specific: it
@@ -2025,14 +2056,18 @@ void isr_handler(interrupt_frame_t *frame)
 
             if (vec == 14) {
                 /* #PF → STATUS_ACCESS_VIOLATION.
-                 * NULL page WRITES (cr2 < 0x1000, !instruction-fetch) are handled
-                 * by the write-through handler above — skip SEH for those.
-                 * NULL page INSTRUCTION FETCHES (null function call) MUST go to SEH
-                 * because silently returning 0 causes cascading NULL pointer usage. */
+                 * NULL page WRITES (cr2 < 0x1000, !instruction-fetch) are
+                 * dispatched to the guest SEH chain — the engine's
+                 * __except handler catches them and displays the crash
+                 * reporter (like NT's Dr. Watson). No more silent
+                 * write-through that turns into cascading RIP=0 crashes. */
                 uint64_t cr2;
                 __asm__ volatile ("mov %%cr2, %0" : "=r"(cr2));
-                if (cr2 < 0x1000 && !(frame->error_code & 16))
-                    goto compat32_null_recovery; /* NULL page write: keep old handling */
+                /* Non-compat32 null-page writes still go to old recovery
+                 * (kernel init code legitimately touches page 0). */
+                if (cr2 < 0x1000 && !(frame->error_code & 16) &&
+                    (frame->cs & 0xFFFF) != 0x40)
+                    goto compat32_null_recovery;
                 er.ExceptionCode = 0xC0000005;  /* STATUS_ACCESS_VIOLATION */
                 er.NumberParameters = 2;
                 er.ExceptionInformation[0] = (frame->error_code & 2) ? 1 : 0;

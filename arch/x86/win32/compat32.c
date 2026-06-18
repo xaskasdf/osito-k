@@ -101,6 +101,8 @@ static const unsigned char qsort32_blob[498] = {
     0x49,0xf8,0x75,0xcc,0xeb,0x02,0x31,0xf6,0x89,0xf0,0x83,0xc4,
     0x08,0x5e,0x5f,0x5b,0x5d,0xc3,
 };
+static uint32_t atof32_blob_addr = 0;
+static void emit_atof32_blob(uint8_t *code);
 static uint32_t thunk_count = 0;
 
 static compat32_thunk_t thunk_table[COMPAT32_MAX_THUNKS];
@@ -388,6 +390,21 @@ void compat32_init(void)
         }
     }
 
+    /* MSVCRT atof returns a double in x87 ST(0) on i386. The regular INT 0x2E
+     * thunk returns only EAX/EDX, which leaves PE32 callers reading stale x87
+     * state. Install a small native decimal parser so Core.dll's appAtof sees
+     * a real ST(0) return value. */
+    {
+        uint8_t *blob = (uint8_t *)mem_alloc_pages(1);
+        if (blob) {
+            emit_atof32_blob(blob);
+            atof32_blob_addr = (uint32_t)(ULONG_PTR)blob;
+            serial_puts("[COMPAT32] atof32 blob at 0x");
+            serial_puthex(atof32_blob_addr, 8);
+            serial_puts("\n");
+        }
+    }
+
 #ifdef TEST_HARNESS
     /* On Linux test harness, make thunk pool executable */
     #include <sys/mman.h>
@@ -566,6 +583,124 @@ static void emit_ftol_stub(uint8_t *code)
     while (p < THUNK_STUB_SIZE) code[p++] = 0xCC;
 }
 
+static void emit_atof32_blob(uint8_t *code)
+{
+    int p = 0;
+    int j_null, j_ep0, j_ws_done, j_not_minus, j_sign_done1, j_sign_done2;
+    int j_int_done_1, j_int_done_2, j_no_frac, j_frac_done_1, j_frac_done_2;
+    int j_no_frac_part, j_no_neg;
+    int l_parse, l_ws, l_ws_inc, l_ws_done, l_not_minus, l_sign_done;
+    int l_int, l_int_done, l_frac, l_build, l_sign, l_epilogue;
+
+#define E8(v) do { code[p++] = (uint8_t)(v); } while (0)
+#define PATCH8(pos, target) do { code[(pos)] = (uint8_t)((target) - ((pos) + 1)); } while (0)
+
+    E8(0x53);                                           /* push ebx */
+    E8(0x56);                                           /* push esi */
+    E8(0x57);                                           /* push edi */
+    E8(0x83); E8(0xEC); E8(0x10);                       /* sub esp,16 */
+    E8(0x8B); E8(0x74); E8(0x24); E8(0x20);             /* mov esi,[esp+32] */
+    E8(0x85); E8(0xF6);                                 /* test esi,esi */
+    E8(0x75); j_null = p++;                             /* jnz parse */
+    E8(0xD9); E8(0xEE);                                 /* fldz */
+    E8(0xEB); j_ep0 = p++;                              /* jmp epilogue */
+
+    l_parse = p;
+    PATCH8(j_null, l_parse);
+    l_ws = p;
+    E8(0x8A); E8(0x06);                                 /* mov al,[esi] */
+    E8(0x3C); E8(0x20); E8(0x74); j_ws_done = p++;      /* cmp al,' '; je ws_inc */
+    E8(0x3C); E8(0x09); E8(0x74); int j_ws_tab = p++;
+    E8(0x3C); E8(0x0A); E8(0x74); int j_ws_lf = p++;
+    E8(0x3C); E8(0x0D); E8(0x74); int j_ws_cr = p++;
+    E8(0xEB); int j_ws_out = p++;                       /* jmp ws_done */
+    l_ws_inc = p;
+    PATCH8(j_ws_done, l_ws_inc);
+    PATCH8(j_ws_tab, l_ws_inc);
+    PATCH8(j_ws_lf, l_ws_inc);
+    PATCH8(j_ws_cr, l_ws_inc);
+    E8(0x46);                                           /* inc esi */
+    E8(0xEB); PATCH8(p, l_ws); p++;                     /* jmp ws */
+
+    l_ws_done = p;
+    PATCH8(j_ws_out, l_ws_done);
+    E8(0x31); E8(0xDB);                                 /* xor ebx,ebx */
+    E8(0x8A); E8(0x06);                                 /* mov al,[esi] */
+    E8(0x3C); E8(0x2D); E8(0x75); j_not_minus = p++;    /* cmp '-'; jne */
+    E8(0xB3); E8(0x01);                                 /* mov bl,1 */
+    E8(0x46);                                           /* inc esi */
+    E8(0xEB); j_sign_done1 = p++;                       /* jmp sign_done */
+    l_not_minus = p;
+    PATCH8(j_not_minus, l_not_minus);
+    E8(0x3C); E8(0x2B); E8(0x75); j_sign_done2 = p++;   /* cmp '+'; jne */
+    E8(0x46);                                           /* inc esi */
+    l_sign_done = p;
+    PATCH8(j_sign_done1, l_sign_done);
+    PATCH8(j_sign_done2, l_sign_done);
+
+    E8(0x31); E8(0xC9);                                 /* xor ecx,ecx */
+    E8(0x31); E8(0xD2);                                 /* xor edx,edx */
+    E8(0xBF); E8(0x01); E8(0x00); E8(0x00); E8(0x00);   /* mov edi,1 */
+    l_int = p;
+    E8(0x0F); E8(0xB6); E8(0x06);                       /* movzx eax,byte [esi] */
+    E8(0x3C); E8(0x30); E8(0x72); j_int_done_1 = p++;   /* jb int_done */
+    E8(0x3C); E8(0x39); E8(0x77); j_int_done_2 = p++;   /* ja int_done */
+    E8(0x83); E8(0xE8); E8(0x30);                       /* sub eax,'0' */
+    E8(0x6B); E8(0xC9); E8(0x0A);                       /* imul ecx,ecx,10 */
+    E8(0x01); E8(0xC1);                                 /* add ecx,eax */
+    E8(0x46);                                           /* inc esi */
+    E8(0xEB); PATCH8(p, l_int); p++;                    /* jmp int */
+
+    l_int_done = p;
+    PATCH8(j_int_done_1, l_int_done);
+    PATCH8(j_int_done_2, l_int_done);
+    E8(0x80); E8(0x3E); E8(0x2E); E8(0x75); j_no_frac = p++; /* cmp byte [esi],'.'; jne */
+    E8(0x46);                                           /* inc esi */
+    l_frac = p;
+    E8(0x0F); E8(0xB6); E8(0x06);                       /* movzx eax,byte [esi] */
+    E8(0x3C); E8(0x30); E8(0x72); j_frac_done_1 = p++;  /* jb build */
+    E8(0x3C); E8(0x39); E8(0x77); j_frac_done_2 = p++;  /* ja build */
+    E8(0x83); E8(0xE8); E8(0x30);                       /* sub eax,'0' */
+    E8(0x6B); E8(0xD2); E8(0x0A);                       /* imul edx,edx,10 */
+    E8(0x01); E8(0xC2);                                 /* add edx,eax */
+    E8(0x6B); E8(0xFF); E8(0x0A);                       /* imul edi,edi,10 */
+    E8(0x46);                                           /* inc esi */
+    E8(0xEB); PATCH8(p, l_frac); p++;                   /* jmp frac */
+
+    l_build = p;
+    PATCH8(j_no_frac, l_build);
+    PATCH8(j_frac_done_1, l_build);
+    PATCH8(j_frac_done_2, l_build);
+    E8(0x89); E8(0x0C); E8(0x24);                       /* mov [esp],ecx */
+    E8(0x89); E8(0x54); E8(0x24); E8(0x04);             /* mov [esp+4],edx */
+    E8(0x89); E8(0x7C); E8(0x24); E8(0x08);             /* mov [esp+8],edi */
+    E8(0xDB); E8(0x04); E8(0x24);                       /* fild dword [esp] */
+    E8(0x85); E8(0xD2);                                 /* test edx,edx */
+    E8(0x74); j_no_frac_part = p++;                     /* jz sign */
+    E8(0xDB); E8(0x44); E8(0x24); E8(0x04);             /* fild dword [esp+4] */
+    E8(0xDB); E8(0x44); E8(0x24); E8(0x08);             /* fild dword [esp+8] */
+    E8(0xDE); E8(0xF9);                                 /* fdivp st(1),st */
+    E8(0xDE); E8(0xC1);                                 /* faddp st(1),st */
+    l_sign = p;
+    PATCH8(j_no_frac_part, l_sign);
+    E8(0x84); E8(0xDB);                                 /* test bl,bl */
+    E8(0x74); j_no_neg = p++;                           /* jz epilogue */
+    E8(0xD9); E8(0xE0);                                 /* fchs */
+    l_epilogue = p;
+    PATCH8(j_ep0, l_epilogue);
+    PATCH8(j_no_neg, l_epilogue);
+    E8(0x83); E8(0xC4); E8(0x10);                       /* add esp,16 */
+    E8(0x5F);                                           /* pop edi */
+    E8(0x5E);                                           /* pop esi */
+    E8(0x5B);                                           /* pop ebx */
+    E8(0xC3);                                           /* ret */
+
+    for (; p < 4096; p++) code[p] = 0xCC;
+
+#undef PATCH8
+#undef E8
+}
+
 /* True for the st0-based CRT float->int helpers that must run native. */
 static int is_ftol_helper(const char *n)
 {
@@ -577,6 +712,13 @@ static int is_ftol_helper(const char *n)
         if (*a == 0 && *b == 0) return 1;
     }
     return 0;
+}
+
+static int is_atof_helper(const char *n)
+{
+    if (!n) return 0;
+    return n[0] == 'a' && n[1] == 't' && n[2] == 'o' &&
+           n[3] == 'f' && n[4] == 0;
 }
 
 uint32_t compat32_make_thunk_ex(uint64_t target, const char *name,
@@ -596,6 +738,8 @@ uint32_t compat32_make_thunk_ex(uint64_t target, const char *name,
         if (mq) return qsort32_blob_addr;
         if (mb) return qsort32_blob_addr + QSORT32_BSEARCH_OFF;
     }
+    if (atof32_blob_addr && is_atof_helper(name))
+        return atof32_blob_addr;
     if (thunk_count >= COMPAT32_MAX_THUNKS) {
         serial_puts("[COMPAT32] Thunk table full!\n");
         return 0;
@@ -3649,10 +3793,66 @@ uint64_t compat32_dispatch(uint32_t thunk_idx, uint32_t *stack_args)
         serial_puts("\n");
     }
 
-    /* Stack alignment check: 32-bit caller's ESP must be 4-byte aligned.
-     * If misaligned, a stdcall RET N shifted the stack incorrectly. */
+    /* Stack alignment check + ESP delta tracker.
+     * Each compat32 thunk does `RET n*4` (stdcall) or `RET` (cdecl).
+     * If the RET pops the wrong number of bytes, the caller's ESP is
+     * shifted by the delta, silently corrupting callee-saved registers
+     * (EBX/ESI/EDI/EBP).  This detector compares the ESP expected from
+     * the PREVIOUS thunk's RET against the current thunk's actual ESP.
+     * Global state because it's reset by compat32_enter via reset_stack_delta(). */
     {
-        uint32_t esp32 = (uint32_t)(uintptr_t)stack_args - 4; /* stack_args = ESP+4 */
+        static uint32_t st_prev_esp = 0;
+        static uint8_t  st_prev_nargs = 0;
+        static uint8_t  st_prev_cc = 0;
+        static const char *st_prev_name = NULL;
+        static int32_t  st_acc = 0;
+        static uint32_t st_bad = 0;
+
+        uint32_t esp32 = (uint32_t)(uintptr_t)stack_args - 4;
+
+        if (st_prev_esp != 0) {
+            /* Expected ESP at this INT 0x2E entry if the PREVIOUS thunk's
+             * RET N was correct:
+             *   st_prev_esp          = ESP at previous INT 0x2E
+             *   + st_prev_nargs*4+4  = cleanup by previous RET N + return addr
+             *   - nargs*4 - 4        = push of this call's args + call's ret addr
+             *   = st_prev_esp + (st_prev_nargs - nargs)*4
+             * Only valid for stdcall (callee cleans); cdecl frames are caller-
+             * cleaned and the ESP between calls depends on caller code. */
+            uint32_t expected = st_prev_esp + ((int32_t)st_prev_nargs - (int32_t)nargs) * 4;
+            int32_t delta = (int32_t)(esp32 - expected);
+            /* Only track for stdcall prev calls where the thunk controls
+             * cleanup.  Large deltas (> 1MB) mean a stack switch (CRT stub
+             * → PE32), not corruption. */
+            if (delta != 0 && (uint32_t)(delta > 0 ? delta : -delta) < 0x100000 && st_prev_cc == CC_STDCALL) {
+                st_acc += delta;
+                st_bad++;
+                if (st_bad <= 64) {
+                    serial_puts("[STACK-DELTA] prev=");
+                    if (st_prev_name) serial_puts(st_prev_name);
+                    else serial_puts("?");
+                    serial_puts(" argc=");
+                    serial_putdec(st_prev_nargs);
+                    serial_puts(" delta=");
+                    serial_putdec((int64_t)delta);
+                    serial_puts(" acc=");
+                    serial_putdec((int64_t)st_acc);
+                    serial_puts(" next=");
+                    if (t->name) serial_puts(t->name);
+                    serial_puts(" cur_esp=0x");
+                    serial_puthex(esp32, 8);
+                    serial_puts(" prev_esp=0x");
+                    serial_puthex(st_prev_esp, 8);
+                    serial_puts("\n");
+                }
+            }
+        }
+        st_prev_esp   = esp32;
+        st_prev_nargs = nargs;
+        st_prev_cc    = t->callconv;
+        st_prev_name  = t->name;
+
+        /* Also check alignment — a misaligned ESP is always a bug */
         if (esp32 & 3) {
             serial_puts("[COMPAT32] *** ESP MISALIGNED: 0x");
             serial_puthex(esp32, 8);

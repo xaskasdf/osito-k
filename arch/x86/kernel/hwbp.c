@@ -14,6 +14,35 @@ extern void serial_puthex(uint64_t v, int d);
 
 hwbp_t hwbps[4];
 
+static struct {
+    uint64_t seq;
+    uint32_t thisp;
+    uint32_t ret;
+    uint32_t key;
+    uint32_t action;
+    uint32_t aux;
+} hwbp_last_cie;
+
+static struct {
+    uint64_t seq;
+    uint32_t thisp;
+    uint32_t ret;
+    uint32_t vp;
+    uint32_t key;
+    uint32_t action;
+    uint32_t aux;
+} hwbp_last_eie;
+
+static struct {
+    uint64_t seq;
+    uint32_t thisp;
+    uint32_t ret;
+    uint32_t key;
+    uint32_t action;
+    uint32_t aux;
+    uint32_t state;
+} hwbp_last_uiproc;
+
 /* DR register access */
 static void dr_set_addr(int slot, uint64_t v)
 {
@@ -130,6 +159,66 @@ static void hwbp_try_wstr(const char *label, uint32_t va)
     serial_puts("\"\n");
 }
 
+static void hwbp_put_ascii_preview(uint32_t va)
+{
+    if (va < 0x10000 || (uint64_t)va >= 0x80000000ULL) {
+        serial_puts("<bad>");
+        return;
+    }
+    volatile uint8_t *p = (volatile uint8_t *)(uintptr_t)va;
+    serial_puts("\"");
+    char tmp[64];
+    int n = 0;
+    for (int i = 0; i < 63; i++) {
+        uint8_t c = p[i];
+        if (c == 0) break;
+        tmp[n++] = (c < 0x20 || c >= 0x7F) ? '?' : (char)c;
+    }
+    tmp[n] = 0;
+    serial_puts(tmp);
+    serial_puts("\"");
+}
+
+static int hwbp_looks_wstr(uint32_t va)
+{
+    if (va < 0x10000 || (uint64_t)va >= 0x80000000ULL) return 0;
+    volatile uint16_t *w = (volatile uint16_t *)(uintptr_t)va;
+    uint16_t c0 = w[0];
+    uint16_t c1 = w[1];
+    if (c0 < 0x20 || c0 >= 0x7F) return 0;
+    return c1 == 0 || (c1 >= 0x20 && c1 < 0x7F);
+}
+
+static int hwbp_wstr_prefix(uint32_t va, const char *prefix)
+{
+    if (!hwbp_looks_wstr(va)) return 0;
+    volatile uint16_t *w = (volatile uint16_t *)(uintptr_t)va;
+    for (int i = 0; prefix[i]; i++) {
+        if ((uint8_t)w[i] != (uint8_t)prefix[i]) return 0;
+    }
+    return 1;
+}
+
+static void hwbp_put_tchar_preview(uint32_t va)
+{
+    if (hwbp_looks_wstr(va)) {
+        volatile uint16_t *w = (volatile uint16_t *)(uintptr_t)va;
+        serial_puts("L\"");
+        char tmp[96];
+        int n = 0;
+        for (int i = 0; i < 95; i++) {
+            uint16_t c = w[i];
+            if (c == 0) break;
+            tmp[n++] = (c < 0x20 || c >= 0x7F) ? '?' : (char)c;
+        }
+        tmp[n] = 0;
+        serial_puts(tmp);
+        serial_puts("\"");
+        return;
+    }
+    hwbp_put_ascii_preview(va);
+}
+
 bool hwbp_dispatch(struct interrupt_frame *frame)
 {
     uint64_t dr6;
@@ -141,6 +230,441 @@ bool hwbp_dispatch(struct interrupt_frame *frame)
         if (!hwbps[i].active) continue;
 
         hwbps[i].hit_count++;
+
+        {
+            const char *nm = hwbps[i].name;
+            int is_cieret = (nm[0] == 'c' && nm[1] == 'i' && nm[2] == 'e' &&
+                             nm[3] == 'r');
+            if (is_cieret) {
+                serial_puts("[CIE-RET] seq=");
+                serial_putdec(hwbp_last_cie.seq);
+                serial_puts(" this=0x");
+                serial_puthex(hwbp_last_cie.thisp, 8);
+                serial_puts(" ret=0x");
+                serial_puthex((uint32_t)frame->rip, 8);
+                serial_puts(" eax=0x");
+                serial_puthex((uint32_t)frame->rax, 8);
+                serial_puts(" key=0x");
+                serial_puthex(hwbp_last_cie.key, 4);
+                serial_puts(" action=");
+                serial_putdec(hwbp_last_cie.action);
+                serial_puts(" aux=0x");
+                serial_puthex(hwbp_last_cie.aux, 8);
+                serial_puts("\n");
+                hwbp_clear(i);
+                handled = true;
+                continue;
+            }
+            int is_eieret = (nm[0] == 'e' && nm[1] == 'i' && nm[2] == 'e' &&
+                             nm[3] == 'r');
+            if (is_eieret) {
+                serial_puts("[EIE-RET] seq=");
+                serial_putdec(hwbp_last_eie.seq);
+                serial_puts(" this=0x");
+                serial_puthex(hwbp_last_eie.thisp, 8);
+                serial_puts(" ret=0x");
+                serial_puthex((uint32_t)frame->rip, 8);
+                serial_puts(" eax=0x");
+                serial_puthex((uint32_t)frame->rax, 8);
+                serial_puts(" vp=0x");
+                serial_puthex(hwbp_last_eie.vp, 8);
+                serial_puts(" key=0x");
+                serial_puthex(hwbp_last_eie.key, 4);
+                serial_puts(" action=");
+                serial_putdec(hwbp_last_eie.action);
+                serial_puts(" aux=0x");
+                serial_puthex(hwbp_last_eie.aux, 8);
+                serial_puts("\n");
+                hwbp_clear(i);
+                handled = true;
+                continue;
+            }
+            int is_uipret = (nm[0] == 'u' && nm[1] == 'i' && nm[2] == 'p' &&
+                             nm[3] == 'r');
+            if (is_uipret) {
+                serial_puts("[UIP-RET] seq=");
+                serial_putdec(hwbp_last_uiproc.seq);
+                serial_puts(" this=0x");
+                serial_puthex(hwbp_last_uiproc.thisp, 8);
+                serial_puts(" ret=0x");
+                serial_puthex((uint32_t)frame->rip, 8);
+                serial_puts(" eax=0x");
+                serial_puthex((uint32_t)frame->rax, 8);
+                serial_puts(" key=0x");
+                serial_puthex(hwbp_last_uiproc.key, 4);
+                serial_puts(" action=");
+                serial_putdec(hwbp_last_uiproc.action);
+                serial_puts(" aux=0x");
+                serial_puthex(hwbp_last_uiproc.aux, 8);
+                serial_puts(" state=0x");
+                serial_puthex(hwbp_last_uiproc.state, 2);
+                serial_puts("\n");
+                hwbp_clear(i);
+                handled = true;
+                continue;
+            }
+        }
+
+        /* UT99/WinDrv input probe: CauseInputEvent(this, key, action, delta).
+         * This one is hot enough that the generic HWBP string-oriented dump is
+         * just noise; print the thiscall arguments as a compact input trace. */
+        {
+            const char *nm = hwbps[i].name;
+            int is_cie = (nm[0] == 'c' && nm[1] == 'i' && nm[2] == 'e') ||
+                         ((uint32_t)hwbps[i].addr == 0x11106560U);
+            if (is_cie) {
+                uint32_t esp32 = (uint32_t)frame->rsp;
+                uint32_t ret = 0, key = 0, action = 0, aux = 0;
+                if (esp32 >= 0x10000 && esp32 < 0x7FFFF000U) {
+                    volatile uint32_t *st = (volatile uint32_t *)(uintptr_t)esp32;
+                    ret    = st[0];
+                    key    = st[1];
+                    action = st[2];
+                    aux    = st[3];
+                }
+                int axis = (action == 4);
+                int log_this = !axis || hwbps[i].hit_count <= 12;
+                if (log_this) {
+                    serial_puts("[CIE] hit=");
+                    serial_putdec(hwbps[i].hit_count);
+                    serial_puts(" this=0x");
+                    serial_puthex((uint64_t)(uint32_t)frame->rcx, 8);
+                    serial_puts(" ret=0x");
+                    serial_puthex(ret, 8);
+                    serial_puts(" key=0x");
+                    serial_puthex(key, 4);
+                    serial_puts(" action=");
+                    serial_putdec(action);
+                    serial_puts(" aux=0x");
+                    serial_puthex(aux, 8);
+                    serial_puts("\n");
+                }
+                hwbp_last_cie.seq = hwbps[i].hit_count;
+                hwbp_last_cie.thisp = (uint32_t)frame->rcx;
+                hwbp_last_cie.ret = ret;
+                hwbp_last_cie.key = key;
+                hwbp_last_cie.action = action;
+                hwbp_last_cie.aux = aux;
+                if (!axis && ret >= 0x10000000U && ret < 0x80000000U)
+                    hwbp_set(2, ret, HWBP_EXECUTE, HWBP_LEN_1, "cieret");
+                handled = true;
+                continue;
+            }
+        }
+
+        /* UT99/UInput::Process(this, outdev, key, action, delta). This is
+         * where held-key state is resolved into bound commands. */
+        {
+            const char *nm = hwbps[i].name;
+            int is_uiproc = (nm[0] == 'u' && nm[1] == 'i' && nm[2] == 'p') ||
+                            ((uint32_t)hwbps[i].addr == 0x10393E50U);
+            if (is_uiproc) {
+                uint32_t esp32 = (uint32_t)frame->rsp;
+                uint32_t ret = 0, outdev = 0, key = 0, action = 0, aux = 0;
+                uint32_t entry = 0, cmd = 0, len = 0, max = 0, state = 0;
+                uint32_t thisp = (uint32_t)frame->rcx;
+                if (esp32 >= 0x10000 && esp32 < 0x7FFFF000U) {
+                    volatile uint32_t *st = (volatile uint32_t *)(uintptr_t)esp32;
+                    ret    = st[0];
+                    outdev = st[1];
+                    key    = st[2];
+                    action = st[3];
+                    aux    = st[4];
+                }
+                if (thisp >= 0x10000 && thisp < 0x7FFFF000U && key < 0x100) {
+                    entry = thisp + 0x2AC + key * 12;
+                    cmd = *(volatile uint32_t *)(uintptr_t)entry;
+                    len = *(volatile uint32_t *)(uintptr_t)(entry + 4);
+                    max = *(volatile uint32_t *)(uintptr_t)(entry + 8);
+                    state = *(volatile uint8_t *)(uintptr_t)(thisp + 0xEB0 + key);
+                }
+                int interesting = (key == 0x25 || key == 0x26 || key == 0x27 ||
+                                   key == 0x28 || key == 0xE4 || key == 0xE5);
+                int log_this = interesting || hwbps[i].hit_count <= 24;
+                if (log_this) {
+                    serial_puts("[UIP] hit=");
+                    serial_putdec(hwbps[i].hit_count);
+                    serial_puts(" this=0x");
+                    serial_puthex(thisp, 8);
+                    serial_puts(" ret=0x");
+                    serial_puthex(ret, 8);
+                    serial_puts(" out=0x");
+                    serial_puthex(outdev, 8);
+                    serial_puts(" key=0x");
+                    serial_puthex(key, 4);
+                    serial_puts(" action=");
+                    serial_putdec(action);
+                    serial_puts(" aux=0x");
+                    serial_puthex(aux, 8);
+                    serial_puts(" state=0x");
+                    serial_puthex(state, 2);
+                    serial_puts(" cmd=0x");
+                    serial_puthex(cmd, 8);
+                    serial_puts(" len=");
+                    serial_putdec(len);
+                    serial_puts(" max=");
+                    serial_putdec(max);
+                    serial_puts(" text=");
+                    hwbp_put_tchar_preview(cmd);
+                    serial_puts("\n");
+                }
+                hwbp_last_uiproc.seq = hwbps[i].hit_count;
+                hwbp_last_uiproc.thisp = thisp;
+                hwbp_last_uiproc.ret = ret;
+                hwbp_last_uiproc.key = key;
+                hwbp_last_uiproc.action = action;
+                hwbp_last_uiproc.aux = aux;
+                hwbp_last_uiproc.state = state;
+                if (log_this && ret >= 0x10000000U && ret < 0x80000000U)
+                    hwbp_set(2, ret, HWBP_EXECUTE, HWBP_LEN_1, "uipret");
+                handled = true;
+                continue;
+            }
+        }
+
+        /* UT99/UInput::Exec(this=UInput+0x28, cmd, outdev). UInput::Process
+         * calls this with bound commands such as MoveForward. Alias expansion
+         * should recursively re-enter here with Axis aBaseY... */
+        {
+            const char *nm = hwbps[i].name;
+            int is_uiexec = (nm[0] == 'u' && nm[1] == 'i' && nm[2] == 'e' &&
+                             nm[3] == 'x') ||
+                            ((uint32_t)hwbps[i].addr == 0x10393800U);
+            if (is_uiexec) {
+                uint32_t esp32 = (uint32_t)frame->rsp;
+                uint32_t ret = 0, cmd = 0, outdev = 0;
+                uint32_t sub = (uint32_t)frame->rcx;
+                uint32_t owner = (sub >= 0x28) ? sub - 0x28 : 0;
+                uint32_t vp = 0, action = 0, scale = 0;
+                if (esp32 >= 0x10000 && esp32 < 0x7FFFF000U) {
+                    volatile uint32_t *st = (volatile uint32_t *)(uintptr_t)esp32;
+                    ret    = st[0];
+                    cmd    = st[1];
+                    outdev = st[2];
+                }
+                if (sub >= 0x10000 && sub < 0x7FFFF000U) {
+                    vp     = *(volatile uint32_t *)(uintptr_t)(sub + 0xE78);
+                    action = *(volatile uint32_t *)(uintptr_t)(sub + 0xE80);
+                    scale  = *(volatile uint32_t *)(uintptr_t)(sub + 0xE84);
+                }
+                int interesting =
+                    hwbp_wstr_prefix(cmd, "Move") ||
+                    hwbp_wstr_prefix(cmd, "Axis") ||
+                    hwbp_wstr_prefix(cmd, "Strafe") ||
+                    hwbp_wstr_prefix(cmd, "Turn") ||
+                    hwbp_wstr_prefix(cmd, "Button") ||
+                    hwbp_wstr_prefix(cmd, "Fire") ||
+                    hwbp_wstr_prefix(cmd, "AltFire");
+                if (interesting || hwbps[i].hit_count <= 32) {
+                    serial_puts("[UIEXEC] hit=");
+                    serial_putdec(hwbps[i].hit_count);
+                    serial_puts(" sub=0x");
+                    serial_puthex(sub, 8);
+                    serial_puts(" owner=0x");
+                    serial_puthex(owner, 8);
+                    serial_puts(" ret=0x");
+                    serial_puthex(ret, 8);
+                    serial_puts(" out=0x");
+                    serial_puthex(outdev, 8);
+                    serial_puts(" vp=0x");
+                    serial_puthex(vp, 8);
+                    serial_puts(" action=");
+                    serial_putdec(action);
+                    serial_puts(" scale=0x");
+                    serial_puthex(scale, 8);
+                    serial_puts(" cmd=0x");
+                    serial_puthex(cmd, 8);
+                    serial_puts(" text=");
+                    hwbp_put_tchar_preview(cmd);
+                    serial_puts("\n");
+                }
+                handled = true;
+                continue;
+            }
+        }
+
+        /* UT99/UInput::Exec Axis success path. At 0x10393B05, EDI still holds
+         * the resolved destination float, after the action==2/4 store paths. */
+        {
+            const char *nm = hwbps[i].name;
+            int is_uiax = (nm[0] == 'u' && nm[1] == 'i' && nm[2] == 'a' &&
+                           nm[3] == 'x') ||
+                          ((uint32_t)hwbps[i].addr == 0x10393B05U);
+            if (is_uiax) {
+                uint32_t ebp32 = (uint32_t)frame->rbp;
+                uint32_t cmd = 0, outdev = 0;
+                uint32_t sub = (uint32_t)frame->rsi;
+                uint32_t owner = (sub >= 0x28) ? sub - 0x28 : 0;
+                uint32_t target = (uint32_t)frame->rdi;
+                uint32_t value = 0, vp = 0, actor = 0, action = 0, scale = 0;
+                if (ebp32 >= 0x10000 && ebp32 < 0x7FFFF000U) {
+                    volatile uint32_t *bp = (volatile uint32_t *)(uintptr_t)ebp32;
+                    cmd = bp[2];
+                    outdev = bp[3];
+                }
+                if (target >= 0x10000 && target < 0x7FFFF000U)
+                    value = *(volatile uint32_t *)(uintptr_t)target;
+                if (sub >= 0x10000 && sub < 0x7FFFF000U) {
+                    vp     = *(volatile uint32_t *)(uintptr_t)(sub + 0xE78);
+                    action = *(volatile uint32_t *)(uintptr_t)(sub + 0xE80);
+                    scale  = *(volatile uint32_t *)(uintptr_t)(sub + 0xE84);
+                    if (vp >= 0x10000 && vp < 0x7FFFF000U)
+                        actor = *(volatile uint32_t *)(uintptr_t)(vp + 0x30);
+                }
+                if (hwbps[i].hit_count <= 120) {
+                    serial_puts("[UIAX] hit=");
+                    serial_putdec(hwbps[i].hit_count);
+                    serial_puts(" sub=0x");
+                    serial_puthex(sub, 8);
+                    serial_puts(" owner=0x");
+                    serial_puthex(owner, 8);
+                    serial_puts(" target=0x");
+                    serial_puthex(target, 8);
+                    serial_puts(" value=0x");
+                    serial_puthex(value, 8);
+                    serial_puts(" out=0x");
+                    serial_puthex(outdev, 8);
+                    serial_puts(" vp=0x");
+                    serial_puthex(vp, 8);
+                    serial_puts(" actor=0x");
+                    serial_puthex(actor, 8);
+                    serial_puts(" action=");
+                    serial_putdec(action);
+                    serial_puts(" scale=0x");
+                    serial_puthex(scale, 8);
+                    serial_puts(" cmd=0x");
+                    serial_puthex(cmd, 8);
+                    serial_puts(" text=");
+                    hwbp_put_tchar_preview(cmd);
+                    serial_puts("\n");
+                }
+                handled = true;
+                continue;
+            }
+        }
+
+        /* UT99/UInput::DirectAxis(this, key, speed, delta). If this fires,
+         * binding execution reached the axis write path. */
+        {
+            const char *nm = hwbps[i].name;
+            int is_uaxis = (nm[0] == 'u' && nm[1] == 'a' && nm[2] == 'x') ||
+                           ((uint32_t)hwbps[i].addr == 0x10393F90U);
+            if (is_uaxis) {
+                uint32_t esp32 = (uint32_t)frame->rsp;
+                uint32_t ret = 0, key = 0, speed = 0, delta = 0;
+                uint32_t thisp = (uint32_t)frame->rcx;
+                uint32_t vp = 0, actor = 0;
+                if (esp32 >= 0x10000 && esp32 < 0x7FFFF000U) {
+                    volatile uint32_t *st = (volatile uint32_t *)(uintptr_t)esp32;
+                    ret = st[0];
+                    key = st[1];
+                    speed = st[2];
+                    delta = st[3];
+                }
+                if (thisp >= 0x10000 && thisp < 0x7FFFF000U) {
+                    vp = *(volatile uint32_t *)(uintptr_t)(thisp + 0xEA0);
+                    if (vp >= 0x10000 && vp < 0x7FFFF000U)
+                        actor = *(volatile uint32_t *)(uintptr_t)(vp + 0x30);
+                }
+                if (hwbps[i].hit_count <= 80) {
+                    serial_puts("[UAXIS] hit=");
+                    serial_putdec(hwbps[i].hit_count);
+                    serial_puts(" this=0x");
+                    serial_puthex(thisp, 8);
+                    serial_puts(" ret=0x");
+                    serial_puthex(ret, 8);
+                    serial_puts(" key=0x");
+                    serial_puthex(key, 4);
+                    serial_puts(" speed=0x");
+                    serial_puthex(speed, 8);
+                    serial_puts(" delta=0x");
+                    serial_puthex(delta, 8);
+                    serial_puts(" vp=0x");
+                    serial_puthex(vp, 8);
+                    serial_puts(" actor=0x");
+                    serial_puthex(actor, 8);
+                    serial_puts("\n");
+                }
+                handled = true;
+                continue;
+            }
+        }
+
+        /* UT99/Engine input probe: UEngine::InputEvent(this, viewport,
+         * key, action, delta).  WinDrv reaches it via the engine vtable
+         * entry used by CauseInputEvent; hook the real implementation so
+         * we catch direct virtual calls as well as export-thunk calls. */
+        {
+            const char *nm = hwbps[i].name;
+            int is_eie = (nm[0] == 'e' && nm[1] == 'i' && nm[2] == 'e') ||
+                         ((uint32_t)hwbps[i].addr == 0x103839C0U);
+            if (is_eie) {
+                uint32_t esp32 = (uint32_t)frame->rsp;
+                uint32_t ret = 0, vp = 0, key = 0, action = 0, aux = 0;
+                uint32_t actor = 0, vp34 = 0, p4a8 = 0, p228 = 0, p24 = 0;
+                if (esp32 >= 0x10000 && esp32 < 0x7FFFF000U) {
+                    volatile uint32_t *st = (volatile uint32_t *)(uintptr_t)esp32;
+                    ret    = st[0];
+                    vp     = st[1];
+                    key    = st[2];
+                    action = st[3];
+                    aux    = st[4];
+                }
+                if (vp >= 0x10000 && vp < 0x7FFFF000U) {
+                    actor = *(volatile uint32_t *)(uintptr_t)(vp + 0x30);
+                    vp34  = *(volatile uint32_t *)(uintptr_t)(vp + 0x34);
+                    if (actor >= 0x10000 && actor < 0x7FFFF000U) {
+                        p4a8 = *(volatile uint32_t *)(uintptr_t)(actor + 0x4A8);
+                        if (p4a8 >= 0x10000 && p4a8 < 0x7FFFF000U) {
+                            p228 = *(volatile uint32_t *)(uintptr_t)(p4a8 + 0x228);
+                            if (p228 >= 0x10000 && p228 < 0x7FFFF000U)
+                                p24 = *(volatile uint32_t *)(uintptr_t)(p228 + 0x24);
+                        }
+                    }
+                }
+                int axis = (action == 4);
+                int log_this = !axis || hwbps[i].hit_count <= 12;
+                if (log_this) {
+                    serial_puts("[EIE] hit=");
+                    serial_putdec(hwbps[i].hit_count);
+                    serial_puts(" this=0x");
+                    serial_puthex((uint64_t)(uint32_t)frame->rcx, 8);
+                    serial_puts(" ret=0x");
+                    serial_puthex(ret, 8);
+                    serial_puts(" vp=0x");
+                    serial_puthex(vp, 8);
+                    serial_puts(" key=0x");
+                    serial_puthex(key, 4);
+                    serial_puts(" action=");
+                    serial_putdec(action);
+                    serial_puts(" aux=0x");
+                    serial_puthex(aux, 8);
+                    serial_puts(" actor=0x");
+                    serial_puthex(actor, 8);
+                    serial_puts(" vp34=0x");
+                    serial_puthex(vp34, 8);
+                    serial_puts(" p4a8=0x");
+                    serial_puthex(p4a8, 8);
+                    serial_puts(" p228=0x");
+                    serial_puthex(p228, 8);
+                    serial_puts(" p24=0x");
+                    serial_puthex(p24, 8);
+                    serial_puts("\n");
+                }
+                hwbp_last_eie.seq = hwbps[i].hit_count;
+                hwbp_last_eie.thisp = (uint32_t)frame->rcx;
+                hwbp_last_eie.ret = ret;
+                hwbp_last_eie.vp = vp;
+                hwbp_last_eie.key = key;
+                hwbp_last_eie.action = action;
+                hwbp_last_eie.aux = aux;
+                if (log_this && ret >= 0x10000000U && ret < 0x80000000U)
+                    hwbp_set(2, ret, HWBP_EXECUTE, HWBP_LEN_1, "eieret");
+                handled = true;
+                continue;
+            }
+        }
+
         serial_puts("[HWBP] slot ");
         serial_putdec(i);
         if (hwbps[i].name[0]) {

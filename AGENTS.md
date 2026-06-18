@@ -1,78 +1,53 @@
-<!-- gitnexus:start -->
-# GitNexus — Code Intelligence
+# Repository Guidelines
 
-This project is indexed by GitNexus as **osito-k** (76066 symbols, 93233 relationships, 76 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
+## Project Structure & Module Organization
 
-> If any GitNexus tool warns the index is stale, run `npx gitnexus analyze` in terminal first.
+Osito-K is a bare-metal OS with architecture-specific code under `arch/<arch>/`.
+The active trees are `arch/xtensa/` for ESP8266 firmware, `arch/x86/` for the
+x86-64 UEFI/kernel target, `arch/arm/` for AArch64 SM8350, and `arch/wasm/` for
+Emscripten. Shared GUI code lives in `gui/`; shared headers and on-disk format
+definitions live in `include/common/`. Host filesystem tools are in
+`tools/ositofs/`, design notes are in `docs/`, and x86 in-OS tests are in
+`arch/x86/test/*.c`. Build outputs and local disk images belong in ignored
+`build/` directories or ignored `nvme_*.img` assets.
 
-## Always Do
+## Build, Test, and Development Commands
 
-- **MUST run impact analysis before editing any symbol.** Before modifying a function, class, or method, run `gitnexus_impact({target: "symbolName", direction: "upstream"})` and report the blast radius (direct callers, affected processes, risk level) to the user.
-- **MUST run `gitnexus_detect_changes()` before committing** to verify your changes only affect expected symbols and execution flows.
-- **MUST warn the user** if impact analysis returns HIGH or CRITICAL risk before proceeding with edits.
-- When exploring unfamiliar code, use `gitnexus_query({query: "concept"})` to find execution flows instead of grepping. It returns process-grouped results ranked by relevance.
-- When you need full context on a specific symbol — callers, callees, which execution flows it participates in — use `gitnexus_context({name: "symbolName"})`.
+- `make` builds the default CI target, Xtensa ESP8266.
+- `make x86`, `make arm`, and `make wasm` delegate to the architecture
+  Makefiles.
+- `make -C arch/x86` builds `arch/x86/build/{boot.efi,kernel.elf}`.
+- `make -C arch/x86 CLANG=1` uses clang/lld for the Windows/MSYS2 workflow.
+- `make -C tools/ositofs` builds host tools for creating and editing OsitoFS
+  images.
+- `arch/x86/scripts/qemu-test.sh [--no-build] [--no-gl] [--kill]` runs the x86
+  QEMU loop. Use `arch/x86/build/serial.log` as the primary debug output.
+- `make clean-all` removes all architecture build directories.
 
-## When Debugging
+## Coding Style & Naming Conventions
 
-1. `gitnexus_query({query: "<error or symptom>"})` — find execution flows related to the issue
-2. `gitnexus_context({name: "<suspect function>"})` — see all callers, callees, and process participation
-3. `READ gitnexus://repo/osito-k/process/{processName}` — trace the full execution flow step by step
-4. For regressions: `gitnexus_detect_changes({scope: "compare", base_ref: "main"})` — see what your branch changed
+Keep LF line endings; `.gitattributes` enforces this and CRLF creates noisy
+diffs. Follow the existing C style in each architecture subtree and keep
+hardware-facing code explicit: prefer register names, small helpers, and local
+patterns over broad abstractions. Put architecture-specific code under
+`arch/<arch>/`; only move reusable formats or APIs into `include/common/`.
 
-## When Refactoring
+## Testing Guidelines
 
-- **Renaming**: MUST use `gitnexus_rename({symbol_name: "old", new_name: "new", dry_run: true})` first. Review the preview — graph edits are safe, text_search edits need manual review. Then run with `dry_run: false`.
-- **Extracting/Splitting**: MUST run `gitnexus_context({name: "target"})` to see all incoming/outgoing refs, then `gitnexus_impact({target: "target", direction: "upstream"})` to find all external callers before moving code.
-- After any refactor: run `gitnexus_detect_changes({scope: "all"})` to verify only expected files changed.
+There is no host unit-test harness. x86 tests compile to ELFs from
+`arch/x86/test/*.c` and run inside the booted OS after being copied to an
+NVMe/ESP image. Network behavior can be smoke-tested through the UDP inference
+server, for example: `echo "hola osito" | nc -u localhost 7777`.
 
-## Never Do
+## Commit & Pull Request Guidelines
 
-- NEVER edit a function, class, or method without first running `gitnexus_impact` on it.
-- NEVER ignore HIGH or CRITICAL risk warnings from impact analysis.
-- NEVER rename symbols with find-and-replace — use `gitnexus_rename` which understands the call graph.
-- NEVER commit changes without running `gitnexus_detect_changes()` to check affected scope.
+Recent commits use concise, subsystem-prefixed subjects such as
+`x86/win32: ...` or `paging/smp: ...`. Keep the first line action-oriented and
+specific. Pull requests should describe the target architecture, commands run,
+serial-log findings for QEMU work, and any required images, WADs, or toolchains.
 
-## Tools Quick Reference
+## Agent-Specific Instructions
 
-| Tool | When to use | Command |
-|------|-------------|---------|
-| `query` | Find code by concept | `gitnexus_query({query: "auth validation"})` |
-| `context` | 360-degree view of one symbol | `gitnexus_context({name: "validateUser"})` |
-| `impact` | Blast radius before editing | `gitnexus_impact({target: "X", direction: "upstream"})` |
-| `detect_changes` | Pre-commit scope check | `gitnexus_detect_changes({scope: "staged"})` |
-| `rename` | Safe multi-file rename | `gitnexus_rename({symbol_name: "old", new_name: "new", dry_run: true})` |
-| `cypher` | Custom graph queries | `gitnexus_cypher({query: "MATCH ..."})` |
-
-## Impact Risk Levels
-
-| Depth | Meaning | Action |
-|-------|---------|--------|
-| d=1 | WILL BREAK — direct callers/importers | MUST update these |
-| d=2 | LIKELY AFFECTED — indirect deps | Should test |
-| d=3 | MAY NEED TESTING — transitive | Test if critical path |
-
-## Resources
-
-| Resource | Use for |
-|----------|---------|
-| `gitnexus://repo/osito-k/context` | Codebase overview, check index freshness |
-| `gitnexus://repo/osito-k/clusters` | All functional areas |
-| `gitnexus://repo/osito-k/processes` | All execution flows |
-| `gitnexus://repo/osito-k/process/{name}` | Step-by-step execution trace |
-
-## Self-Check Before Finishing
-
-Before completing any code modification task, verify:
-1. `gitnexus_impact` was run for all modified symbols
-2. No HIGH/CRITICAL risk warnings were ignored
-3. `gitnexus_detect_changes()` confirms changes match expected scope
-4. All d=1 (WILL BREAK) dependents were updated
-
-## CLI
-
-- Re-index: `npx gitnexus analyze`
-- Check freshness: `npx gitnexus status`
-- Generate docs: `npx gitnexus wiki`
-
-<!-- gitnexus:end -->
+Before editing a function, class, or method, run GitNexus impact analysis for
+the symbol and report the blast radius. Before committing, run
+`gitnexus_detect_changes()` to verify the affected scope.
