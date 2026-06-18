@@ -12,7 +12,8 @@ system.cpp, game.cpp, filemgr.cpp) compile and link.
 
 **Runtime**: FSM reaches RunGame (state 2), game loop ran 1.5M+ ticks with
 CSystem::BeginUpdate/EndUpdate active. Compositor shows GTA5 window via
-virtio-gpu.
+virtio-gpu. On macOS, the patched QEMU 11.0.1 SDL/OpenGL core build boots the
+virtio-gpu-gl/VIRGL path to shell with VG3D selftests T2-T9 passing.
 
 **Assets**: 24 RPFs (39GB) loaded from 60GB NVMe image. common.rpf + x64a-x64w
 all RPF7-valid. Real assets rendered (icon.jpg, hires_lrg2.bmp from common.rpf).
@@ -51,7 +52,7 @@ OsitoK Kernel
 | CFileMgr | DONE | Real impl compiled, 24 RPFs mounted |
 | CGame::Init | PARTIAL | Compiles, InitWidgets/DLC/LoadingScreens guarded |
 | Parser (attribute.h) | DONE | Real header from Windows source |
-| GPU backend | STUB | virtio-gpu 2D works, D3D11→DXVK→Vulkan pending |
+| GPU backend | PARTIAL | virtio-gpu 2D + VIRGL negotiate; VG3D T2-T9 pass; D3D11→DXVK→Vulkan pending |
 | Audio backend | STUB | HDA driver exists, no RAGE bridge |
 | Input | STUB | Kernel has xHCI+evdev, no RAGE bridge |
 | Streaming (pgStreamer) | STUB | Thread creation works, real streaming pending |
@@ -117,14 +118,18 @@ cd ~/osito-k
 tools/ositofs/ositofs-delete arch/x86/build/nvme.img GTA5.elf
 tools/ositofs/ositofs-write arch/x86/build/nvme.img ~/ok-ported/GTAV_Source/GTA5.elf --name GTA5.elf
 
-# Run
-bash arch/x86/scripts/qemu-test.sh --no-build
+# Run with macOS HVF + SDL GL core/VIRGL.
+# Requires the patched QEMU 11.0.1 build that creates a 4.1 core context.
+PATH=/private/tmp/qemu-core-src/qemu-11.0.1/build:$PATH \
+  bash arch/x86/scripts/qemu-test.sh --no-build --hvf
 # In OsitoK shell: exec GTA5.elf
 ```
 
 ## QEMU Configuration
 
 ```
--m 4G -smp 4 -device virtio-vga -device e1000e -device qemu-xhci
--device usb-kbd -device usb-mouse -device intel-hda -device nvme
+-m 4G -smp 4 -machine q35,accel=hvf -cpu host
+-device virtio-gpu-gl-pci,hostmem=256M,blob=on -display sdl,gl=core
+-device e1000e -device qemu-xhci -device usb-kbd -device usb-mouse
+-device intel-hda -device nvme
 ```

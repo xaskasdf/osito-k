@@ -450,11 +450,13 @@ void virtio_gpu_init(uint64_t ecam, uint8_t bus, uint8_t dev, uint8_t func,
         uint64_t next_addr = 0x81100000ULL;
         for (int i = 0; i < 6; i++) {
             uint32_t raw = ecam_read32(0x10 + i * 4);
+            bool is_mem = (raw & 1) == 0;
+            bool is_64 = is_mem && ((raw & 0x6) == 0x4) && (i < 5);
             serial_puts("[VIRTIO-GPU] BAR"); serial_putdec(i);
             serial_puts(" raw=0x"); serial_puthex(raw, 8); serial_puts("\n");
-            if ((raw & 1) == 0 && (raw & ~0xFU) == 0) {
+
+            if (is_mem && (raw & ~0xFU) == 0) {
                 /* Unassigned memory BAR — program it */
-                bool is_64 = ((raw & 0x6) == 0x4) && (i < 5);
                 *(volatile uint32_t *)(cfg_base + 0x10 + i * 4) = (uint32_t)(next_addr | (raw & 0xF));
                 if (is_64)
                     *(volatile uint32_t *)(cfg_base + 0x10 + (i+1) * 4) = (uint32_t)(next_addr >> 32);
@@ -462,7 +464,10 @@ void virtio_gpu_init(uint64_t ecam, uint8_t bus, uint8_t dev, uint8_t func,
                 serial_puts("[VIRTIO-GPU] Programmed BAR"); serial_putdec(i);
                 serial_puts("=0x"); serial_puthex(next_addr, 8); serial_puts("\n");
                 next_addr += 0x100000;  /* 1 MB per BAR */
-                if (is_64) i++;  /* skip high half */
+            }
+
+            if (is_64) {
+                i++;  /* skip the high half even when the BAR was already assigned */
             }
         }
     }
@@ -487,7 +492,7 @@ void virtio_gpu_init(uint64_t ecam, uint8_t bus, uint8_t dev, uint8_t func,
             serial_puts("[VIRTIO-GPU] BAR");
             serial_putdec(i);
             serial_puts("=0x");
-            serial_puthex(bars[i], 8);
+            serial_puthex(bars[i], 16);
             serial_puts("\n");
         }
     }
@@ -498,7 +503,7 @@ void virtio_gpu_init(uint64_t ecam, uint8_t bus, uint8_t dev, uint8_t func,
             paging_map_mmio(bars[i], 64 * 1024);
             serial_puts("[VIRTIO-GPU] Mapped BAR");
             serial_putdec(i);
-            serial_puts("=0x"); serial_puthex(bars[i], 8);
+            serial_puts("=0x"); serial_puthex(bars[i], 16);
             serial_puts("\n");
         }
     }

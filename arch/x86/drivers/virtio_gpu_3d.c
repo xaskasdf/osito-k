@@ -18,6 +18,8 @@ extern void serial_putdec(uint64_t val);
 #define EIO     5
 #define EPERM   1
 
+#define SHM_FLAG_GPU_SCANOUT 4u
+
 /* -- Context table ---------------------------------------- */
 #define VG3D_CTX_MAX 64
 
@@ -357,7 +359,7 @@ static void vg3d_t9_caps(void) {
 static void vg3d_t8_present(void) {
     if (!g_3d_ready) { serial_puts("[VG3D-T8] present SKIP\n"); return; }
     extern uint32_t shm_create_surface(uint32_t w, uint32_t h, uint32_t flags);
-    uint32_t shm = shm_create_surface(64, 64, 0);
+    uint32_t shm = shm_create_surface(64, 64, SHM_FLAG_GPU_SCANOUT);
     if (!shm) { serial_puts("[VG3D-T8] present FAIL (shm)\n"); return; }
 
     int32_t cid = vg3d_ctx_create(1, GPU_CTX_VENUS);

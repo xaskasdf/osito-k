@@ -8,6 +8,7 @@
 # Usage:
 #   ./qemu-test.sh              # Build + boot
 #   ./qemu-test.sh --no-build   # Boot only (skip build)
+#   ./qemu-test.sh --hvf        # Use macOS HVF acceleration
 #
 # Test from another terminal:
 #   echo "hola osito" | nc -u localhost 7777
@@ -28,6 +29,7 @@ ESP_IMG="$BUILD_DIR/esp.img"
 # the guest can negotiate VIRTIO_GPU_F_VIRGL. `--no-gl` falls back to the
 # plain 2D virtio-vga for hosts that lack virglrenderer. --
 USE_GL="true"
+USE_HVF="false"
 NO_BUILD="false"
 PID_FILE_DEFAULT="/tmp/qemu-test-osito.pid"
 PID_FILE="$PID_FILE_DEFAULT"
@@ -35,6 +37,7 @@ DO_KILL="false"
 for arg in "$@"; do
     case "$arg" in
         --no-gl)    USE_GL="false" ;;
+        --hvf)      USE_HVF="true" ;;
         --no-build) NO_BUILD="true" ;;
         --kill)     DO_KILL="true" ;;
     esac
@@ -155,6 +158,14 @@ info "  OVMF: $OVMF"
 info "  NIC:  e1000e (Intel 82574L, igb family)"
 info "  USB:  xHCI + keyboard + mouse"
 info "  Net:  user-mode, UDP :7777 → guest 10.0.2.15:7777"
+if [ "$USE_HVF" = "true" ]; then
+    MACHINE_ARGS="-machine q35,accel=hvf"
+    CPU_ARGS="-cpu host"
+    info "  Accel: HVF (host CPU)"
+else
+    MACHINE_ARGS="-machine q35"
+    CPU_ARGS="-cpu Nehalem"
+fi
 info ""
 echo -e "${CYAN}  Test: echo \"hola osito\" | nc -u localhost 7777${NC}"
 echo -e "${CYAN}  Exit: Ctrl-A X${NC}"
@@ -204,8 +215,8 @@ qemu-system-x86_64 \
     -drive file="$ESP_IMG",format=raw,if=ide \
     $NVME_ARGS \
     -m 4G \
-    -machine q35 \
-    -cpu Nehalem \
+    $MACHINE_ARGS \
+    $CPU_ARGS \
     -smp 4 \
     -device e1000e,netdev=net0 \
     -netdev user,id=net0,hostfwd=udp::7778-:7777 \
