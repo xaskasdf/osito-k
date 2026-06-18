@@ -7,10 +7,15 @@
 #include "d3d11_rasterizer.h"
 #include "d3d11_sampler.h"
 
+extern "C" long write(int, const void*, unsigned long);
 namespace dxvk {
-  
+
+  static inline void okstate_dbg(const char* s) {
+    unsigned long n = 0; while (s[n]) ++n; write(2, s, n);
+  }
+
   class D3D11Device;
-  
+
   struct D3D11StateDescHash {
     size_t operator () (const D3D11_BLEND_DESC1& desc) const;
     size_t operator () (const D3D11_DEPTH_STENCILOP_DESC& desc) const;
@@ -54,17 +59,21 @@ namespace dxvk {
      * \returns Pointer to the state object
      */
     T* Create(D3D11Device* device, const DescType& desc) {
+      okstate_dbg("[okstate] Create: before lock\n");
       std::lock_guard<dxvk::mutex> lock(m_mutex);
-      
+      okstate_dbg("[okstate] Create: lock held; find...\n");
+
       auto entry = m_objects.find(desc);
-      
+      okstate_dbg("[okstate] Create: find done\n");
+
       if (entry != m_objects.end())
         return ref(&entry->second);
-      
+
       auto result = m_objects.emplace(
         std::piecewise_construct,
         std::tuple(desc),
         std::tuple(device, desc));
+      okstate_dbg("[okstate] Create: emplace done\n");
       return ref(&result.first->second);
     }
     
