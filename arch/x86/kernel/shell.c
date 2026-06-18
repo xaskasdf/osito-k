@@ -59,7 +59,11 @@ extern void  kfree(void *ptr);
 
 /* Scheduler (X-SCHED) */
 extern int  sched_spawn(const char *name, void (*entry)(void));
+#ifdef WASM_BUILD
+extern int  sched_yield(void);
+#else
 extern void sched_yield(void);
+#endif
 extern uint64_t sched_get_switches(void);
 extern bool sched_is_enabled(void);
 
@@ -6950,7 +6954,6 @@ q4kgdone:
              * the compositor remains READY but never gets dispatched
              * (shell quantum doesn't expire fast enough for the user
              * to perceive that the desktop has come up). */
-            extern void sched_yield(void);
             sched_yield();
         }
     } else if (strcmp(cmd, "fatls") == 0) {

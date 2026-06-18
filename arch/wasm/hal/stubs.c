@@ -407,6 +407,8 @@ void dl_init(void) {}
 /* ── Win32 compat ────────────────────────────────────────────── */
 
 void win32_init(void) {}
+int  win32_install(const char *filename) { (void)filename; return -1; }
+int  installer_uninstall(const char *pkg) { (void)pkg; return -1; }
 
 /* ── PCI ─────────────────────────────────────────────────────── */
 
@@ -4135,6 +4137,8 @@ int disk_read_bytes(uint64_t byte_offset, void *buf, uint64_t len)
 { return nvme_read_bytes(byte_offset, buf, len); }
 int disk_write_bytes(uint64_t byte_offset, const void *buf, uint64_t len)
 { return nvme_write_bytes(byte_offset, buf, len); }
+int disk_flush(void) { wasm_persist_flush(); return 0; }
+uint32_t disk_lba_size(void) { return 512; }
 
 /* ── Network ─────────────────────────────────────────────────── */
 
@@ -4143,6 +4147,7 @@ bool i211_link_up(void)       { return false; }
 
 void net_init(const uint8_t ip[4]) { (void)ip; }
 void net_poll(void) {}
+volatile uint32_t g_tx_post_rx_delay_us = 0;
 int net_udp_send(const uint8_t dst_ip[4], uint16_t dst_port, uint16_t src_port,
                  const void *data, uint32_t len)
 {
@@ -4213,11 +4218,16 @@ int  sched_spawn(const char *name, void (*entry)(void))
     }
     return 0;
 }
-int  sched_yield(void) { emscripten_sleep(0); return 0; }
 uint64_t sched_get_switches(void) { return 0; }
 bool sched_is_enabled(void)       { return false; }
 
 /* tensor_benchmark is defined in arch/x86/kernel/tensor.c */
+int rag_retrieve(const char *corpus, const char *query, char *result, int result_max)
+{
+    (void)corpus; (void)query;
+    if (result && result_max > 0) result[0] = '\0';
+    return -1;
+}
 
 /* ── Git stubs ───────────────────────────────────────────────── */
 
