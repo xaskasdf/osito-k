@@ -56,8 +56,13 @@ jobs:
       - name: Setup WebAssembly
         if: matrix.target == 'wasm'
         run: |
-          sudo apt-get update
-          sudo apt-get install -y emscripten
+          git clone --depth 1 https://github.com/emscripten-core/emsdk.git "$HOME/emsdk"
+          "$HOME/emsdk/emsdk" install latest
+          "$HOME/emsdk/emsdk" activate latest
+          source "$HOME/emsdk/emsdk_env.sh"
+          echo "$HOME/emsdk" >> "$GITHUB_PATH"
+          echo "$HOME/emsdk/upstream/emscripten" >> "$GITHUB_PATH"
+          emcc --version
 
       # ---------------------------------------------------------
       # 2. COMPILACIÓN (Llamando a tus targets)
