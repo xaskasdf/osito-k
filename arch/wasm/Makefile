@@ -88,7 +88,6 @@ X86_SRCS := \
     ../x86/kernel/sysctl.c \
     ../x86/kernel/sysv_ipc.c \
     ../x86/kernel/vt.c \
-    ../x86/kernel/blkdev.c \
     ../x86/kernel/dm.c \
     ../x86/kernel/sysfs.c \
     ../x86/kernel/kobject.c \
@@ -118,14 +117,6 @@ X86_SRCS := \
     ../x86/kernel/socket.c \
     ../x86/kernel/rcu.c \
     ../x86/kernel/zlib.c \
-    ../x86/kernel/git.c \
-    ../x86/kernel/tls.c \
-    ../x86/kernel/tls13.c \
-    ../x86/kernel/wayland.c \
-    ../x86/kernel/fuse.c \
-    ../x86/kernel/evdev.c \
-    ../x86/kernel/pty.c \
-    ../x86/kernel/sshd.c \
     ../x86/kernel/initramfs.c \
     ../x86/fs/gguf.c \
     ../x86/fs/gpt.c \

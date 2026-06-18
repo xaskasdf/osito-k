@@ -4217,17 +4217,6 @@ int  sched_yield(void) { emscripten_sleep(0); return 0; }
 uint64_t sched_get_switches(void) { return 0; }
 bool sched_is_enabled(void)       { return false; }
 
-/* ── GPT ─────────────────────────────────────────────────────── */
-
-int gpt_find_ositofs(uint64_t *part_offset, uint64_t *part_size)
-{
-    (void)part_offset; (void)part_size; return -1;
-}
-
-/* ── Crypto ─────────────────────────────────────────────────── */
-
-int crypto_selftest(void) { return 0; }
-
 /* tensor_benchmark is defined in arch/x86/kernel/tensor.c */
 
 /* ── Git stubs ───────────────────────────────────────────────── */
@@ -5865,12 +5854,6 @@ void perf_phase_end(int p) { (void)p; }
 void perf_phase_dump(void) {}
 bool perf_enabled = false;
 
-void rcu_init(void) {}
-void rcu_read_lock(void) {}
-void rcu_read_unlock(void) {}
-void synchronize_rcu(void) {}
-void call_rcu(void *head, void (*func)(void *)) { (void)head; if (func) func(NULL); }
-
 void panic(const char *msg) {
     extern void serial_puts(const char *);
     serial_puts("\n[PANIC] ");
@@ -5974,14 +5957,6 @@ int  nvme_read_async(uint64_t lba, uint32_t count, uint64_t phys_addr)
 { (void)lba; (void)count; (void)phys_addr; return -1; }
 int  nvme_wait_cq(uint16_t cid)        { (void)cid; return 0; }
 uint32_t nvme_get_lba_size(void)        { return 512; }
-
-/* ── FAT32 (browser MEMFS handles real files) ─────────────────── */
-bool fat32_is_mounted(void) { return false; }
-int  fat32_find(const char *name, uint32_t *cluster_out, uint32_t *size_out)
-{ (void)name; (void)cluster_out; (void)size_out; return -1; }
-int  fat32_ls(const char *path) { (void)path; return -1; }
-int  fat32_read_file(const char *name, uint64_t offset, void *buf, uint64_t len)
-{ (void)name; (void)offset; (void)buf; (void)len; return -1; }
 
 /* ── OsitoFS v3 (only v2 is mounted in wasm MVP) ──────────────── */
 bool osfs3_is_mounted(void)             { return false; }
