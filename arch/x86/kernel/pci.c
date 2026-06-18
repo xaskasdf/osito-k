@@ -8,6 +8,7 @@
 
 #include "../include/types.h"
 #include "../drivers/gpu.h"
+#include "../drivers/intel_gfx.h"
 
 /* ── Declarations ────────────────────────────────────────────── */
 
@@ -93,7 +94,9 @@ static pci_dev_t nvme_dev_stores[MAX_NVME_DEVS];
 static int       nvme_dev_count;
 static pci_dev_t nic_dev_store, xhci_dev_store, hda_dev_store;
 static pci_dev_t virtio_gpu_dev_store;
+static pci_dev_t intel_gfx_dev_store;
 static int       has_virtio_gpu;
+static int       has_intel_gfx;
 static pci_dev_t *nvme_dev;   /* first NVMe (backward compat) */
 static pci_dev_t *nic_dev;
 static pci_dev_t *xhci_dev;
@@ -391,6 +394,23 @@ static void pci_add_device(uint8_t bus, uint8_t dev, uint8_t func,
         serial_puts(" MB\n");
     }
 
+    /* Check if Intel integrated display controller (Gen9 handled by intel_gfx.c) */
+    if (vendor == 0x8086 && class == PCI_CLASS_DISPLAY && !has_intel_gfx) {
+        intel_gfx_dev_store = *d;
+        has_intel_gfx = 1;
+        serial_puts("[PCI] Intel display: ");
+        serial_puthex(vendor, 4);
+        serial_puts(":");
+        serial_puthex(device, 4);
+        serial_puts(" ");
+        serial_puts(intel_gfx_device_name(device));
+        serial_puts(" BAR0=0x");
+        serial_puthex(d->bar[0], 16);
+        serial_puts(" BAR2=0x");
+        serial_puthex(d->bar[2], 16);
+        serial_puts("\n");
+    }
+
     /* Check if virtio-gpu (vendor 0x1AF4, device 0x1050) */
     if (vendor == 0x1AF4 && device == 0x1050) {
         /* Read BARs directly — the generic scan may have missed them */
@@ -490,6 +510,8 @@ void __initk pci_scan(void)
     nic_dev = NULL;
     xhci_dev = NULL;
     hda_dev = NULL;
+    has_virtio_gpu = 0;
+    has_intel_gfx = 0;
 
     /* Try ECAM first */
     find_mcfg();
@@ -593,6 +615,11 @@ gpu_device_t *pci_get_gpu(void)
 pci_dev_t *pci_get_virtio_gpu(void)
 {
     return has_virtio_gpu ? &virtio_gpu_dev_store : NULL;
+}
+
+pci_dev_t *pci_get_intel_gfx(void)
+{
+    return has_intel_gfx ? &intel_gfx_dev_store : NULL;
 }
 
 pci_dev_t *pci_get_nvme(void)

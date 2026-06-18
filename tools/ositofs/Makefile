@@ -9,7 +9,8 @@ CFLAGS  = -Wall -Wextra -O2 -std=c11 -D_GNU_SOURCE
 LDFLAGS =
 
 TOOLS_V2 = mkfs.ositofs ositofs-write ositofs-ls ositofs-info ositofs-read \
-           ositofs-delete ositofs-fsck ositofs-rename ositofs-defrag
+           ositofs-delete ositofs-fsck ositofs-rename ositofs-defrag \
+           ositofs-resize
 TOOLS_V3 = mkfs.ositofs3 ositofs-write3
 
 all: $(TOOLS_V2) $(TOOLS_V3)
@@ -41,6 +42,9 @@ ositofs-rename: rename.o common.o
 	$(CC) $(LDFLAGS) -o $@ $^
 
 ositofs-defrag: defrag.o common.o
+	$(CC) $(LDFLAGS) -o $@ $^
+
+ositofs-resize: resize.o common.o
 	$(CC) $(LDFLAGS) -o $@ $^
 
 # ── v3 Tools ──────────────────────────────────────────────────

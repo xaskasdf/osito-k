@@ -11,6 +11,7 @@
 #include "../include/tensor_arena.h"
 #include "../drivers/gpu.h"
 #include "../drivers/gpu_inference.h"
+#include "../drivers/intel_gfx.h"
 #include "../fs/gguf.h"
 #include "../fs/vfs.h"
 #include "tensor.h"
@@ -105,6 +106,7 @@ extern int   pci_get_nvme_count(void);
 extern void *pci_get_nvme_idx(int idx); /* Returns pci_dev_t* */
 extern void *pci_get_nic(void);  /* Returns pci_dev_t* */
 extern void *pci_get_xhci(void); /* Returns pci_dev_t* */
+extern void *pci_get_intel_gfx(void); /* Returns pci_dev_t* */
 
 /* NVMe */
 extern int nvme_init(uint64_t bar0_phys);
@@ -573,6 +575,10 @@ void __initk kernel_entry(boot_info_t *info)
         paging_map_mmio(hda_pci->bar[0], 32 * 1024);  /* 32KB HDA regs */
     }
 
+    /* Intel integrated display BAR0 is mapped by intel_gfx_init().
+     * Keep the pointer here so diagnostics can report it later. */
+    pci_dev_t *intel_pci = (pci_dev_t *)pci_get_intel_gfx();
+
     /* Flush TLB after all MMIO mappings */
     __asm__ volatile ("mov %%cr3, %%rax; mov %%rax, %%cr3" ::: "rax", "memory");
 
@@ -602,6 +608,20 @@ void __initk kernel_entry(boot_info_t *info)
         serial_puts("[KERN] No NVIDIA GPU found\n");
     }
     KEXEC_PROBE("[KEXEC-PATH] post-gpu_init\n");
+
+    /* Intel Gen9 display probe (HD 530 class real hardware).
+     * This is conservative: it reads the GOP-programmed pipe/plane and
+     * leaves the GOP scanout active unless the driver can prove the state
+     * is safe. NVIDIA/GSP and virtio paths remain independent. */
+    if (intel_pci && intel_pci->bar[0]) {
+        intel_gfx_init(intel_pci->device_id, intel_pci->bus,
+                       intel_pci->dev, intel_pci->func,
+                       intel_pci->bar[0], intel_pci->bar[2],
+                       info->fb_base, info->fb_width, info->fb_height,
+                       info->fb_pitch * 4);
+    } else {
+        serial_puts("[KERN] No Intel integrated display found\n");
+    }
 
     /* Virtio GPU probe */
     {
@@ -1151,6 +1171,8 @@ void __initk kernel_entry(boot_info_t *info)
         fb_puts(gpu ? "yes" : "no");
         fb_puts("  NVMe: ");
         fb_puts(nvme_pci ? "yes" : "no");
+        fb_puts("  iGPU: ");
+        fb_puts(intel_pci ? (intel_gfx_is_ready() ? "ready" : "seen") : "no");
         fb_puts("  NIC: ");
         fb_puts(nic_pci ? "yes" : "no");
         fb_puts("  xHCI: ");

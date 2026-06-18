@@ -11,6 +11,9 @@
 #include <unistd.h>
 #include <errno.h>
 #include <sys/ioctl.h>
+#ifdef __APPLE__
+#include <sys/disk.h>
+#endif
 #ifdef __linux__
 #include <linux/fs.h>
 #endif
@@ -147,6 +150,16 @@ uint64_t osfs2_device_size(int fd)
     if (ioctl(fd, BLKGETSIZE64, &size) < 0) {
 #else
     {
+#endif
+#ifdef __APPLE__
+        uint64_t blocks = 0;
+        uint32_t block_size = 0;
+
+        if (ioctl(fd, DKIOCGETBLOCKCOUNT, &blocks) == 0 &&
+            ioctl(fd, DKIOCGETBLOCKSIZE, &block_size) == 0 &&
+            block_size != 0) {
+            return blocks * (uint64_t)block_size;
+        }
 #endif
         /* Might be a regular file */
         off_t pos = lseek(fd, 0, SEEK_END);

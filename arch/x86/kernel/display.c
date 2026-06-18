@@ -37,6 +37,9 @@ extern uint32_t virtio_gpu_get_width(void)  __attribute__((weak));
 extern uint32_t virtio_gpu_get_height(void) __attribute__((weak));
 extern void     virtio_gpu_flush(void)      __attribute__((weak));
 
+/* Intel Gen9 probe (GOP scanout retained, no unsafe RAM page-flip) */
+extern int      intel_gfx_is_ready(void)    __attribute__((weak));
+
 static void virtio_blit(const uint32_t *src);
 
 /* ── Display state ───────────────────────────────────────────── */
@@ -282,7 +285,14 @@ int display_init(uint32_t *gop_base, uint32_t width, uint32_t height,
     serial_putdec(disp.fb_size / 1024);
     serial_puts(" KB each)\n");
     serial_puts("[DISP] Scanout: ");
-    serial_puts(disp.gpu_scanout ? "GPU page flip\n" : "CPU memcpy (GOP)\n");
+    if (disp.gpu_scanout)
+        serial_puts("GPU page flip\n");
+    else if (disp.virtio_scanout)
+        serial_puts("virtio blit + flush\n");
+    else if (intel_gfx_is_ready && intel_gfx_is_ready())
+        serial_puts("Intel Gen9 GOP-retained\n");
+    else
+        serial_puts("CPU memcpy (GOP)\n");
 
     return 0;
 }
