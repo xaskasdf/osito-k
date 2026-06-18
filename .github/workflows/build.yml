@@ -2,9 +2,9 @@ name: Build
 
 on:
   push:
-    branches: [master, experiment]
+    branches: [master, experiment, fix/review-build-tooling]
   pull_request:
-    branches: [master, experiment]
+    branches: [master, experiment, fix/review-build-tooling]
 
 jobs:
   build:
