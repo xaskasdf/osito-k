@@ -82,7 +82,7 @@ extern int paging_set_flags(uint64_t virt, uint64_t flags);
 static uint64_t win32_va_next = WIN32_VA_BASE;
 
 /* Track VA→phys mapping for cleanup on VirtualFree */
-#define VM_TRACK_MAX 256
+#define VM_TRACK_MAX 8192
 
 typedef struct {
     uint64_t va;
@@ -797,22 +797,17 @@ NTSTATUS sys_NtFreeVirtualMemory(ULONG_PTR *args)
         uint64_t va    = (uint64_t)*BaseAddress;
         SIZE_T tracked = vm_track_remove(va, &phys);
 
-        /* TOMBSTONE: keep VA mapped (engine may read briefly), but
-         * overwrite the freed pages with a recognizable sentinel
-         * pattern.  Any subsequent stale-pointer dereference that
-         * was holding a `Data*` from inside this range will read
-         * 0xDEADC0DE / 0xDEADC0DE / ... — if the engine then calls
-         * through it, RIP becomes 0xDEADC0DE which our PF handler
-         * recognizes and logs (see idt.c [STALE-PTR] tag).  This
-         * gives us precise visibility into UE1 use-after-free
-         * patterns without crashing the engine. */
+        /* Release backing pages. VA recycling remains disabled in
+         * win32_va_alloc while stale engine pointers are investigated. */
         if (tracked > 0) {
-            uint32_t *p = (uint32_t *)(uintptr_t)va;
-            SIZE_T words = tracked / 4;
-            for (SIZE_T i = 0; i < words; i++) p[i] = 0xDEADC0DE;
+            SIZE_T pages = (tracked + 4095) / 4096;
+            for (SIZE_T i = 0; i < pages; i++)
+                paging_unmap_page(va + i * 4096);
+            if (phys)
+                mem_free_pages((void *)(uintptr_t)phys, pages);
             (void)vm_freelist_add;
         }
-        nt_log_hex("  release (tombstone) size = ", tracked);
+        nt_log_hex("  release size = ", tracked);
 
         *BaseAddress = NULL;
         if (RegionSize) *RegionSize = 0;

@@ -1,5 +1,22 @@
 # UT99 on OsitoK — Open Bugs (post-playable)
 
+## Current validated state — 2026-06-18
+
+UT99 is currently validated playable in the x86 Win32 layer under QEMU/GTK. The
+user verified a live match with working mouse look and player movement.
+
+The latest shell-return failure was root-caused to `NtFreeVirtualMemory` leaking
+physical pages on `MEM_RELEASE`, producing an Unreal `Ran out of virtual memory`
+critical error during match startup. The fix is in `arch/x86/win32/ntsyscall.c`:
+`MEM_RELEASE` now unmaps tracked pages and returns backing pages through
+`mem_free_pages`; `VM_TRACK_MAX` is 8192. VA recycling remains disabled while
+stale-pointer investigations continue.
+
+See `docs/session-2026-06-18-ut99-win32.md` for the serial evidence, verification
+commands, and current debugging workflow.
+
+---
+
 State as of 2026-06-07: UT99 boots, renders its menus with correct color, takes
 mouse in the menus, New Game reaches Character Creation, and the game is
 **playable across the full (decompressed) map set** — it enters a map and runs
