@@ -137,6 +137,7 @@ and pflash setup on macOS automatically.
 - [`x86-gpu-roadmap.md`](x86-gpu-roadmap.md) — GPU compute (X27..X40)
 - [`os-selfhost-roadmap.md`](os-selfhost-roadmap.md) — Tier 0..9
 - [`binary-compat-roadmap.md`](binary-compat-roadmap.md) — Linux/Win32/PE/DOS
+- [`wsl-kernel-wishlist.md`](wsl-kernel-wishlist.md) — future native WSL2 kernel spike
 - [`win32-improvements.md`](win32-improvements.md) — PE compat layer
 - [`game-rendering-guide.md`](game-rendering-guide.md) — porting guide
 

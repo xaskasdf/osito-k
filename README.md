@@ -372,6 +372,7 @@ to consult the following entry points:
 | docs/filesystem-roadmap.md       | 12 current + 15 planned filesystems  |
 | docs/x86-vfs-demand-paging.md    | VFS unified layer + ELF demand-page  |
 | docs/os-selfhost-roadmap.md      | Self-hosting tiers 0-9               |
+| docs/wsl-kernel-wishlist.md      | Future native WSL2 kernel spike      |
 | docs/aarch64-detail.md           | ROG Phone 5 / SM8350 port            |
 | docs/esp8266-detail.md           | Original ESP8266 manual              |
 | docs/ositofs2-spec.md            | OsitoFS v2 on-disk format            |

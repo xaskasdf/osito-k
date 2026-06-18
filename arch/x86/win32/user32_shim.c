@@ -160,6 +160,7 @@ static MSG msg_queue[MSG_QUEUE_SIZE];
 static int msg_head = 0, msg_tail = 0;
 static int quit_posted = 0;
 static int quit_code = 0;
+static int dispatch_depth = 0;
 
 static int msg_queue_empty(void)
 {
@@ -178,6 +179,19 @@ static DWORD g_last_msg_time = 0;   /* MSG.time of last dequeued message */
 
 static void msg_enqueue(HWND hwnd, DWORD message, WPARAM wp, LPARAM lp)
 {
+    if (message == WM_MOUSEMOVE && msg_tail != msg_head) {
+        int last = (msg_tail + MSG_QUEUE_SIZE - 1) % MSG_QUEUE_SIZE;
+        if (msg_queue[last].message == WM_MOUSEMOVE &&
+            msg_queue[last].hwnd == hwnd) {
+            msg_queue[last].wParam = wp;
+            msg_queue[last].lParam = lp;
+            msg_queue[last].time = shim_timeGetTime();
+            msg_queue[last].pt.x = 0;
+            msg_queue[last].pt.y = 0;
+            return;
+        }
+    }
+
     int next = (msg_tail + 1) % MSG_QUEUE_SIZE;
     if (next == msg_head) return; /* full — drop */
     msg_queue[msg_tail].hwnd    = hwnd;
@@ -399,6 +413,9 @@ static HWND input_target(void)
     return vp;
 }
 
+static LRESULT dispatch_wndproc32(WNDPROC wndproc, HWND hWnd, DWORD Msg,
+                                  WPARAM wParam, LPARAM lParam);
+
 /* ── Default screen dimensions ─────────────────────────────── */
 
 #define SCREEN_WIDTH  800
@@ -563,15 +580,12 @@ static void dispatch_wm_size(WINDOW *w)
     serial_puts("x");
     serial_puthex(w->height, 4);
     serial_puts("\n");
-    extern uint32_t compat32_callback_args(uint32_t func, int nargs,
-                                            const uint32_t *args);
-    uint32_t args[4] = {
-        (uint32_t)(uintptr_t)w->handle,
+    dispatch_wndproc32(
+        w->wndproc,
+        w->handle,
         WM_SIZE,
         0,  /* wParam = SIZE_RESTORED */
-        ((uint32_t)w->width & 0xFFFF) | (((uint32_t)w->height & 0xFFFF) << 16),
-    };
-    compat32_callback_args((uint32_t)(uintptr_t)w->wndproc, 4, args);
+        ((uint32_t)w->width & 0xFFFF) | (((uint32_t)w->height & 0xFFFF) << 16));
 }
 
 /* Tell the engine its window is the active, focused foreground app. UE1's
@@ -583,14 +597,6 @@ static int g_activated = 0;
 static void dispatch_wm_activate(WINDOW *w)
 {
     if (!w || !w->wndproc) return;
-    extern uint32_t compat32_callback_args(uint32_t func, int nargs,
-                                            const uint32_t *args);
-    uint32_t fn = (uint32_t)(uintptr_t)w->wndproc;
-    uint32_t h  = (uint32_t)(uintptr_t)w->handle;
-    uint32_t a_app[4]  = { h, WM_ACTIVATEAPP, 1, 0 };        /* TRUE, no thread */
-    uint32_t a_ncact[4]= { h, WM_NCACTIVATE, 1, 0 };
-    uint32_t a_act[4]  = { h, WM_ACTIVATE, 1 /*WA_ACTIVE*/, 0 };
-    uint32_t a_focus[4]= { h, WM_SETFOCUS, 0, 0 };
     /* Keep the shim focus state coherent with the messages we deliver: on NT
      * the window that receives WM_SETFOCUS IS the GetFocus() window. We used
      * to send WM_SETFOCUS here yet leave focus_hwnd NULL, so GetFocus()
@@ -598,10 +604,10 @@ static void dispatch_wm_activate(WINDOW *w)
      * in-game input path (UpdateInput key poll @0x11106F33, SetMouseCapture
      * OnlyFocus bail @0x1110665C) on GetFocus()==viewport hWnd. */
     focus_hwnd = w->handle;
-    compat32_callback_args(fn, 4, a_app);
-    compat32_callback_args(fn, 4, a_ncact);
-    compat32_callback_args(fn, 4, a_act);
-    compat32_callback_args(fn, 4, a_focus);
+    dispatch_wndproc32(w->wndproc, w->handle, WM_ACTIVATEAPP, 1, 0);
+    dispatch_wndproc32(w->wndproc, w->handle, WM_NCACTIVATE, 1, 0);
+    dispatch_wndproc32(w->wndproc, w->handle, WM_ACTIVATE, 1, 0);
+    dispatch_wndproc32(w->wndproc, w->handle, WM_SETFOCUS, 0, 0);
     serial_puts("[USER32] dispatched WM_ACTIVATEAPP/ACTIVATE/SETFOCUS\n");
 }
 
@@ -707,8 +713,6 @@ HWND WINAPI CreateWindowExA(DWORD dwExStyle, PCSTR lpClassName,
     {
         uint32_t wwindow_addr = (uint32_t)(ULONG_PTR)lpParam;
         if (w->wndproc && wwindow_addr >= 0x10000) {
-            extern uint32_t compat32_callback_args(uint32_t func, int nargs,
-                                                    const uint32_t *args);
             /* 32-bit CREATESTRUCTA (12 dwords) in PE32-accessible memory so the
              * 32-bit StaticProc can dereference lParam. */
             static volatile uint32_t *cs = 0;
@@ -729,11 +733,8 @@ HWND WINAPI CreateWindowExA(DWORD dwExStyle, PCSTR lpClassName,
                 cs[9]  = (uint32_t)(ULONG_PTR)lpWindowName;  /* lpszName */
                 cs[10] = (uint32_t)(ULONG_PTR)lpClassName;   /* lpszClass */
                 cs[11] = dwExStyle;                          /* dwExStyle */
-                uint32_t args[4] = {
-                    (uint32_t)(uintptr_t)w->handle, WM_NCCREATE, 0,
-                    (uint32_t)(uintptr_t)cs
-                };
-                compat32_callback_args((uint32_t)(uintptr_t)w->wndproc, 4, args);
+                dispatch_wndproc32(w->wndproc, w->handle, WM_NCCREATE, 0,
+                                   (LPARAM)(uintptr_t)cs);
             }
         }
     }
@@ -891,7 +892,7 @@ BOOL WINAPI PeekMessageA(LPMSG lpMsg, HWND hWnd, DWORD wMsgFilterMin,
      * normally owns USB polling never runs — we must poll here ourselves. */
     {
         extern void xhci_poll(void) __attribute__((weak));
-        if (xhci_poll) xhci_poll();
+        if (xhci_poll && dispatch_depth == 0) xhci_poll();
     }
 
     static int peek_log_count = 0;
@@ -1042,6 +1043,23 @@ BOOL WINAPI TranslateMessage(const MSG *lpMsg)
     return TRUE;
 }
 
+static LRESULT dispatch_wndproc32(WNDPROC wndproc, HWND hWnd, DWORD Msg,
+                                  WPARAM wParam, LPARAM lParam)
+{
+    extern uint32_t compat32_callback_args(uint32_t func, int nargs,
+                                           const uint32_t *args);
+    uint32_t args[4] = {
+        (uint32_t)(uintptr_t)hWnd,
+        (uint32_t)Msg,
+        (uint32_t)wParam,
+        (uint32_t)lParam
+    };
+    dispatch_depth++;
+    uint32_t ret = compat32_callback_args((uint32_t)(uintptr_t)wndproc, 4, args);
+    dispatch_depth--;
+    return (LRESULT)ret;
+}
+
 LRESULT WINAPI DispatchMessageA(const MSG *lpMsg)
 {
     /* Read MSG from caller buffer (handles 32-bit vs 64-bit layout) */
@@ -1074,16 +1092,8 @@ LRESULT WINAPI DispatchMessageA(const MSG *lpMsg)
      * from 64-bit" — but compat32_callback_args handles the mode switch. */
     WINDOW *w = find_window(m.hwnd);
     if (w && w->wndproc) {
-        extern uint32_t compat32_callback_args(uint32_t func, int nargs,
-                                                const uint32_t *args);
-        uint32_t args[4] = {
-            (uint32_t)(uintptr_t)m.hwnd,
-            (uint32_t)m.message,
-            (uint32_t)m.wParam,
-            (uint32_t)m.lParam
-        };
-        return (LRESULT)compat32_callback_args(
-            (uint32_t)(uintptr_t)w->wndproc, 4, args);
+        return dispatch_wndproc32(w->wndproc, m.hwnd, m.message,
+                                  m.wParam, m.lParam);
     }
     return DefWindowProcA(m.hwnd, m.message, m.wParam, m.lParam);
 }
@@ -1114,16 +1124,7 @@ LRESULT WINAPI SendMessageA(HWND hWnd, DWORD Msg, WPARAM wParam, LPARAM lParam)
 {
     WINDOW *w = find_window(hWnd);
     if (w && w->wndproc) {
-        extern uint32_t compat32_callback_args(uint32_t func, int nargs,
-                                                const uint32_t *args);
-        uint32_t args[4] = {
-            (uint32_t)(uintptr_t)hWnd,
-            (uint32_t)Msg,
-            (uint32_t)wParam,
-            (uint32_t)lParam
-        };
-        return (LRESULT)compat32_callback_args(
-            (uint32_t)(uintptr_t)w->wndproc, 4, args);
+        return dispatch_wndproc32(w->wndproc, hWnd, Msg, wParam, lParam);
     }
     return DefWindowProcA(hWnd, Msg, wParam, lParam);
 }
@@ -1938,16 +1939,7 @@ LRESULT WINAPI SendMessageW(HWND hWnd, DWORD Msg, WPARAM wParam, LPARAM lParam)
      * which silently dropped engine messages such as WM_SIZE/WM_ACTIVATE). */
     WINDOW *w = find_window(hWnd);
     if (w && w->wndproc) {
-        extern uint32_t compat32_callback_args(uint32_t func, int nargs,
-                                                const uint32_t *args);
-        uint32_t args[4] = {
-            (uint32_t)(uintptr_t)hWnd,
-            (uint32_t)Msg,
-            (uint32_t)wParam,
-            (uint32_t)lParam
-        };
-        return (LRESULT)compat32_callback_args(
-            (uint32_t)(uintptr_t)w->wndproc, 4, args);
+        return dispatch_wndproc32(w->wndproc, hWnd, Msg, wParam, lParam);
     }
     return DefWindowProcW(hWnd, Msg, wParam, lParam);
 }

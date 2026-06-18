@@ -128,6 +128,16 @@ wsl -d osito -u root -e bash -c "
 `arch/x86/scripts/run-wsl-kvm.sh` usa `-accel kvm -cpu host` + OVMF por pflash.
 Monitor en `127.0.0.1:55555` (alcanzable desde Windows por localhostForwarding).
 
+### Wishlist relacionado: Osito-K como kernel nativo de WSL2
+
+Este documento cubre el camino practico actual: WSL2 como host Linux para QEMU
++ KVM. El experimento distinto, mucho mas especulativo, es hacer que WSL2 cargue
+Osito-K como su kernel configurado por `.wslconfig kernel=...`. Ver
+[`wsl-kernel-wishlist.md`](wsl-kernel-wishlist.md). El hallazgo clave es que
+Osito-K ya tiene bastante ABI Linux/musl/VFS resuelto; el riesgo real esta en el
+contrato de boot WSL2 y en dispositivos Hyper-V/VMBus, no en volver a empezar la
+compatibilidad Linux.
+
 ### Hallazgo importante: el cuello de botella es el I/O serial, no el cómputo
 Bajo KVM, **cada escritura al puerto serial (COM1) es un VM-exit** (guest→KVM→
 qemu), MÁS caro que en TCG (misma-proceso). El boot de UT99 genera ~127k líneas

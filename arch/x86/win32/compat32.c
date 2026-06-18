@@ -148,7 +148,7 @@ static uint32_t catch_continue_stub_addr = 0;
  * We support up to MAX_CALLBACK_DEPTH nested callbacks, each with its
  * own jmpbuf, return value, and stack.
  */
-#define MAX_CALLBACK_DEPTH    32
+#define MAX_CALLBACK_DEPTH    128
 #define CALLBACK_STACK_SIZE   65536
 
 /* Force to .data section to change RIP-relative displacement encoding.
@@ -1654,20 +1654,23 @@ void compat32_callback(uint32_t func_addr)
 #ifndef TEST_HARNESS
     if (!callback_return_stub_addr) return;
 
-    /* Clamp depth — callbacks that don't return via the stub leak depth.
-     * UT99's message loop (PeekMessage/DispatchMessage/WndProc) does this.
-     * Always use slot 0 when overflowed — safe because the old callbacks
-     * are already gone (their stack frames were unwound by the game loop). */
-    if (callback_depth >= MAX_CALLBACK_DEPTH)
-        callback_depth = 1;  /* Reserve slot 0 for overflow reuse */
+    /* Do not recycle live callback slots. A deep WndProc/message-pump nest can
+     * legitimately approach the old limit; reusing slot 0 corrupts jmpbufs and
+     * later returns through a stale callback_return_stub. */
+    if (callback_depth >= MAX_CALLBACK_DEPTH) {
+        serial_puts("[CB32] FATAL: callback depth overflow\n");
+        return;
+    }
 
     int depth = callback_depth++;
 
-    serial_puts("[CB32] depth=");
-    serial_putdec(depth);
-    serial_puts(" calling 0x");
-    serial_puthex(func_addr, 8);
-    serial_puts("\n");
+    if (depth >= 16) {
+        serial_puts("[CB32] depth=");
+        serial_putdec(depth);
+        serial_puts(" calling 0x");
+        serial_puthex(func_addr, 8);
+        serial_puts("\n");
+    }
 
     /* Save IST1 before callback — longjmp bypasses int2e_stub's restore */
     {
@@ -1735,9 +1738,11 @@ void compat32_callback(uint32_t func_addr)
 
     g_teb32.ExceptionList = saved_seh;  /* Restore SEH chain */
     callback_depth--;
-    serial_puts("[CB32] depth=");
-    serial_putdec(depth);
-    serial_puts(" returned\n");
+    if (depth >= 16) {
+        serial_puts("[CB32] depth=");
+        serial_putdec(depth);
+        serial_puts(" returned\n");
+    }
 #else
     /* Test harness: call directly */
     typedef void (*void_fn)(void);
@@ -1756,8 +1761,10 @@ uint32_t compat32_callback_args(uint32_t func_addr, int nargs, const uint32_t *a
 #ifndef TEST_HARNESS
     if (!callback_return_stub_addr) return 0;
 
-    if (callback_depth >= MAX_CALLBACK_DEPTH)
-        callback_depth = 1;
+    if (callback_depth >= MAX_CALLBACK_DEPTH) {
+        serial_puts("[CB32] FATAL: callback depth overflow\n");
+        return 0;
+    }
 
     int depth = callback_depth++;
 
@@ -3704,11 +3711,16 @@ uint64_t compat32_dispatch(uint32_t thunk_idx, uint32_t *stack_args)
         );
 
         int depth = callback_depth - 1;
-        serial_puts("[INT2E] callback return depth=");
-        serial_putdec(depth);
-        serial_puts("\n");
+        if (depth >= 16) {
+            serial_puts("[INT2E] callback return depth=");
+            serial_putdec(depth);
+            serial_puts("\n");
+        }
 
         if (depth < 0 || depth >= MAX_CALLBACK_DEPTH) {
+            serial_puts("[INT2E] callback return depth=");
+            serial_putdec(depth);
+            serial_puts("\n");
             serial_puts("[INT2E] FATAL: invalid callback depth!\n");
             return 0;
         }
@@ -3742,11 +3754,13 @@ uint64_t compat32_dispatch(uint32_t thunk_idx, uint32_t *stack_args)
          * the longjmp dispatch. */
         {
             uint64_t *jb = callback_jmpbufs[depth];
-            serial_puts("[CB32] longjmp depth="); serial_putdec(depth);
-            serial_puts(" rip=0x"); serial_puthex(jb[7], 16);
-            serial_puts(" rsp=0x"); serial_puthex(jb[6], 16);
-            serial_puts(" cr3=0x"); serial_puthex(jb[8], 16);
-            serial_puts("\n");
+            if (depth >= 16) {
+                serial_puts("[CB32] longjmp depth="); serial_putdec(depth);
+                serial_puts(" rip=0x"); serial_puthex(jb[7], 16);
+                serial_puts(" rsp=0x"); serial_puthex(jb[6], 16);
+                serial_puts(" cr3=0x"); serial_puthex(jb[8], 16);
+                serial_puts("\n");
+            }
         }
         kern_longjmp(callback_jmpbufs[depth], 1);
         /* never reached */
