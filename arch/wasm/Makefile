@@ -44,7 +44,7 @@ EMFLAGS := \
     -s WASM=1 \
     -s ALLOW_MEMORY_GROWTH=1 \
     -s INITIAL_MEMORY=536870912 \
-    -s STACK_SIZE=1048576 \
+    -s TOTAL_STACK=1048576 \
     -s MAIN_MODULE=1 \
     -s EMULATE_FUNCTION_POINTER_CASTS=1 \
     -Wl,--allow-multiple-definition \
