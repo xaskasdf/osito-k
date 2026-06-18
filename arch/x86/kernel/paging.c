@@ -402,6 +402,21 @@ int paging_set_flags(uint64_t virt, uint64_t flags)
     return 0;
 }
 
+/* Change protection flags on a 4KB page in a specific process CR3. */
+int paging_set_flags_in_cr3(uint64_t cr3, uint64_t virt, uint64_t flags)
+{
+    if (!cr3) return -1;
+
+    uint64_t *pte = paging_get_pte_in_cr3(cr3, virt);
+    if (!pte || !(*pte & PTE_PRESENT))
+        return -1;
+
+    uint64_t phys = *pte & PTE_ADDR_MASK;
+    *pte = phys | flags;
+    invlpg(virt);
+    return 0;
+}
+
 /* Map an MMIO region (uncacheable) */
 int paging_map_mmio(uint64_t phys, uint64_t size)
 {

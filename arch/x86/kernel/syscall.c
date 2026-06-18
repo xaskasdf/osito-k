@@ -531,6 +531,96 @@ static inline bool vma_owned_by_current(const vma_t *v)
     return ct != 0 && proc_tgid_of(v->owner) == ct;
 }
 
+static int vma_find_free_slot_except(int except)
+{
+    for (int i = 0; i < MAX_VMAS; i++) {
+        if (i == except) continue;
+        if (!vma_table[i].in_use) return i;
+    }
+    return -1;
+}
+
+static void vma_copy_range(vma_t *dst, const vma_t *src,
+                           uint64_t base, uint64_t pages)
+{
+    *dst = *src;
+    dst->base = base;
+    dst->pages = pages;
+    dst->in_use = true;
+
+    if (src->type == VMA_FILE_ELF || src->type == VMA_FILE_MMAP) {
+        uint64_t delta = base - src->base;
+        uint64_t bytes = pages * 4096;
+        if (delta < src->file_size) {
+            uint64_t remaining = src->file_size - delta;
+            dst->file_offset = src->file_offset + delta;
+            dst->file_size = remaining < bytes ? remaining : bytes;
+        } else {
+            dst->file_offset = src->file_offset + src->file_size;
+            dst->file_size = 0;
+        }
+    }
+}
+
+static int vma_split_for_range(int idx, uint64_t base, uint64_t pages)
+{
+    vma_t src = vma_table[idx];
+    uint64_t start = src.base;
+    uint64_t end = src.base + src.pages * 4096;
+    uint64_t range_end = base + pages * 4096;
+
+    if (base == start && range_end == end)
+        return idx;
+
+    int before_slot = -1;
+    int after_slot = -1;
+    bool has_before = base > start;
+    bool has_after = range_end < end;
+
+    if (has_before) {
+        before_slot = vma_find_free_slot_except(idx);
+        if (before_slot < 0) return -ENOMEM;
+        vma_table[before_slot].in_use = true;
+    }
+    if (has_after) {
+        after_slot = vma_find_free_slot_except(idx);
+        if (after_slot < 0) {
+            if (before_slot >= 0) vma_table[before_slot].in_use = false;
+            return -ENOMEM;
+        }
+        vma_table[after_slot].in_use = true;
+    }
+
+    vma_copy_range(&vma_table[idx], &src, base, pages);
+    if (has_before) {
+        uint64_t before_pages = (base - start) / 4096;
+        vma_copy_range(&vma_table[before_slot], &src, start, before_pages);
+    }
+    if (has_after) {
+        uint64_t after_pages = (end - range_end) / 4096;
+        vma_copy_range(&vma_table[after_slot], &src, range_end, after_pages);
+    }
+
+    return idx;
+}
+
+static int vma_set_present_page_flags(uint64_t cr3, uint64_t va,
+                                      uint64_t flags)
+{
+    extern uint64_t *paging_get_pte(uint64_t virt);
+    extern uint64_t *paging_get_pte_in_cr3(uint64_t cr3, uint64_t virt);
+    extern int paging_set_flags_in_cr3(uint64_t cr3, uint64_t virt,
+                                       uint64_t flags);
+
+    uint64_t *pte = cr3 ? paging_get_pte_in_cr3(cr3, va)
+                        : paging_get_pte(va);
+    if (!pte || !(*pte & PTE_PRESENT))
+        return 0;
+
+    return cr3 ? paging_set_flags_in_cr3(cr3, va, flags)
+               : paging_set_flags(va, flags);
+}
+
 /* ── Demand paging: free individually-faulted pages in a VMA ───── */
 extern uint64_t *paging_get_pte(uint64_t virt);
 extern uint64_t *paging_get_pte_in_cr3(uint64_t cr3, uint64_t virt);
@@ -1580,11 +1670,13 @@ static int64_t sys_munmap(uint64_t addr, uint64_t length)
 
 /* sys_mprotect — change protection flags on mapped pages.
  *
- * Demand paging interaction: vma_table[i].prot is updated unconditionally
- * (line below). Pages that are already faulted-in get their PTEs updated
- * via paging_set_flags. Pages still not-present pick up the new flags
- * automatically when demand_page_fault() consults the VMA's prot field. */
+ * Demand paging interaction: a partial mprotect first splits the VMA so only
+ * the requested range changes protection. Pages that are already faulted-in get
+ * their PTEs updated; pages still not-present pick up the new flags when
+ * demand_page_fault() consults the range's VMA. */
 extern int paging_map_page(uint64_t virt, uint64_t phys, uint64_t flags);
+extern int paging_map_page_in_cr3(uint64_t cr3, uint64_t virt,
+                                  uint64_t phys, uint64_t flags);
 
 static int64_t sys_mprotect(uint64_t addr, uint64_t length, uint64_t prot)
 {
@@ -1599,26 +1691,43 @@ static int64_t sys_mprotect(uint64_t addr, uint64_t length, uint64_t prot)
         if (!vma_owned_by_current(&vma_table[i])) continue;
         uint64_t vma_end = vma_table[i].base + vma_table[i].pages * 4096;
         if (addr >= vma_table[i].base && addr + npages * 4096 <= vma_end) {
+            int ti = vma_split_for_range(i, addr, npages);
+            if (ti < 0) return ti;
+
+            uint32_t old_prot = vma_table[ti].prot;
             uint64_t pte_flags = prot_to_pte_flags((uint32_t)prot);
+            uint64_t cr3 = proc_current_cr3();
 
             /* Committing a PROT_NONE reservation: allocate real pages */
-            if (vma_table[i].prot == 0 && prot != 0) {
+            if (old_prot == 0 && prot != 0) {
                 for (uint64_t p = 0; p < npages; p++) {
                     uint64_t va = addr + p * 4096;
+                    if (vma_set_present_page_flags(cr3, va, pte_flags) != 0)
+                        return -ENOMEM;
+                    uint64_t *pte = cr3 ? paging_get_pte_in_cr3(cr3, va)
+                                        : paging_get_pte(va);
+                    if (pte && (*pte & PTE_PRESENT_BIT))
+                        continue;
                     void *phys = mem_alloc_pages(1);
                     if (!phys) return -ENOMEM;
                     memset(PHYS_TO_VIRT(phys), 0, 4096);
-                    paging_map_page(va, (uint64_t)phys, pte_flags);
+                    int rc = cr3 ? paging_map_page_in_cr3(cr3, va, (uint64_t)phys, pte_flags)
+                                 : paging_map_page(va, (uint64_t)phys, pte_flags);
+                    if (rc != 0) {
+                        mem_free_pages(phys, 1);
+                        return -ENOMEM;
+                    }
                 }
             } else {
                 /* Update existing page table entries */
                 for (uint64_t p = 0; p < npages; p++) {
                     uint64_t va = addr + p * 4096;
-                    paging_set_flags(va, pte_flags);
+                    if (vma_set_present_page_flags(cr3, va, pte_flags) != 0)
+                        return -ENOMEM;
                 }
             }
 
-            vma_table[i].prot = (uint32_t)prot;
+            vma_table[ti].prot = (uint32_t)prot;
             return 0;
         }
     }
@@ -1703,6 +1812,8 @@ int demand_page_fault(uint64_t addr, uint64_t error_code)
         quarantine_check_uaf(addr, (uint32_t)proc_current_pid());
         return -1;  /* No VMA → SIGSEGV (quarantine_check_uaf logged if UAF) */
     }
+    if (vma->prot == PROT_NONE)
+        return -1;
 
     /* Allocate a physical page, zero-filled via the upper-half mirror.
      * CPU writes (memset + vfs_read) go through the kernel direct map;

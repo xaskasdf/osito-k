@@ -4,7 +4,7 @@ Port of GTA V SP to OsitoK (bare-metal x86-64 OS). Full source access
 to both RAGE engine and OsitoK kernel. Target: playable SP from Prologue
 to credits.
 
-## Current State (Apr 18 2026)
+## Current State (Jun 18 2026)
 
 **Build**: GTA5.elf 7MB, compiled with x86_64-ositok-gcc 14.2.0 + musl libc.
 1199 RAGE .o files in rage_core.a. Game core files (main.cpp, app.cpp,
@@ -61,12 +61,21 @@ OsitoK Kernel
 
 ## Current Blocker
 
-**#PF at CR2=0x504000648**: RAGE's sysMemSimpleAllocator places metadata
-before the usable heap pointer. The mmap at 0x504001000 doesn't account
-for this prefix — the allocator reads 0x9B8 bytes before the base.
+**Allocator bring-up**: GTA now reaches RAGE allocator initialization with a
+multi-allocator graph: game heap plus growable buddy allocators for resource
+virtual and physical memory. The previous invalid-cast crash in
+`pgRscBuilder::ComputeLeafSize()` is resolved by using real resource buddy
+allocators.
 
-**Fix needed**: Allocate an extra page at the start of the mmap region,
-or adjust the heap base pointer to leave room for metadata.
+**Kernel VM fix**: RAGE's PC `sysMemVirtualAllocate(size, bool)` creates a
+one-page guard with `mprotect(PROT_NONE)`. OsitoK now splits VMAs for partial
+`mprotect` ranges, so the guard page no longer changes protection on the whole
+allocator workspace. Demand paging also refuses to fault in `PROT_NONE` VMAs
+and updates present pages through the active process CR3.
+
+**Port workaround**: `GTAV_Source/ositok_stubs.cpp` still overrides both
+`sysMemVirtualAllocate` overloads with a simple 64KB-aligned mmap path. Keep
+that until the kernel VM change has been validated with non-GTA mmap tests.
 
 ## Key Files
 
@@ -84,9 +93,9 @@ or adjust the heap base pointer to leave room for metadata.
 
 ## Next Steps
 
-1. Fix heap metadata #PF (extra page at mmap base)
-2. Compile CGame::Init fully (game.cpp remaining errors)
-3. Implement pgStreamer real thread (uses ipc_ositok threading)
+1. Rebuild kernel and GTA5.elf, then retest `exec GTA5.elf` from QEMU.
+2. Validate partial `mprotect` with `arch/x86/test/mmap_test.c`.
+3. Remove the GTA `sysMemVirtualAllocate(size, bool)` workaround after kernel VM validation.
 4. GPU backend: virtio-gpu-gl 3D → Vulkan ICD → DXVK → RAGE D3D11
 5. Audio backend: HDA driver → RAGE audiosystem bridge
 6. Input: xHCI/evdev → RAGE ioKeyboard/ioMouse
