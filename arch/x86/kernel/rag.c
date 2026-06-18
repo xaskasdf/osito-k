@@ -269,9 +269,13 @@ static void binarize_query(const float *v, uint32_t dim, uint8_t *out) {
  * (__popcountdi2) we don't link; the inline `popcntq` instruction
  * is present on every CPU we run on (Sandy Bridge+/Bulldozer+). */
 static inline uint64_t popcnt64(uint64_t x) {
+#ifdef WASM_BUILD
+    return (uint64_t)__builtin_popcountll(x);
+#else
     uint64_t r;
     __asm__("popcntq %1, %0" : "=r"(r) : "rm"(x));
     return r;
+#endif
 }
 static uint32_t hamming_128(const uint8_t *a, const uint8_t *b) {
     const uint64_t *A = (const uint64_t *)a;
@@ -307,12 +311,20 @@ static int rag_vfs_get(const char *osfs_name, void *out, uint32_t cap) {
  * faster than its slirp peer expects, causing the next handshake
  * to lose its ServerHello on the wire. A short sleep between calls
  * keeps each connection isolated. */
+#ifdef WASM_BUILD
+extern void emscripten_sleep(unsigned int ms);
+#else
 extern uint64_t idt_get_ticks(void);
+#endif
 static void rag_sleep_ticks(uint32_t n) {
+#ifdef WASM_BUILD
+    emscripten_sleep(n * 10);
+#else
     uint64_t deadline = idt_get_ticks() + n;
     while (idt_get_ticks() < deadline) {
         __asm__ volatile ("sti; hlt" ::: "memory");
     }
+#endif
 }
 
 static int rag_http_get_blob(const char *hostname, const char *path,
