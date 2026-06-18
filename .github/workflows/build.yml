@@ -31,7 +31,7 @@ jobs:
       # ---------------------------------------------------------
 
       - name: Setup ESP8266 Toolchain
-        if: matrix.target == 'esp8266'
+        if: matrix.target == 'xtensa'
         run: |
           curl -sSL https://dl.espressif.com/dl/xtensa-lx106-elf-gcc8_4_0-esp-2020r3-linux-amd64.tar.gz -o toolchain.tar.gz
           mkdir -p tools
@@ -40,26 +40,24 @@ jobs:
           pip install esptool
 
       - name: Setup x86-64 Tools
-        if: matrix.target == 'x86_64'
+        if: matrix.target == 'x86'
         run: |
           sudo apt-get update
           # nasm y xorriso son muy comunes para bootloaders e imágenes ISO en x86
-          sudo apt-get install -y build-essential nasm xorriso mtools
+          sudo apt-get install -y build-essential clang lld llvm gnu-efi nasm xorriso mtools
 
       - name: Setup ARM64 Toolchain
-        if: matrix.target == 'arm64'
+        if: matrix.target == 'arm'
         run: |
           sudo apt-get update
           # Instalamos el compilador cruzado para ARM64
           sudo apt-get install -y gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu
 
-      - name: Setup WebAssembly (WASI SDK)
+      - name: Setup WebAssembly
         if: matrix.target == 'wasm'
         run: |
-          # WASI-SDK provee clang preconfigurado para compilar C/C++ a WebAssembly "bare-metal"
-          wget https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-20/wasi-sdk-20.0-linux.tar.gz
-          tar xzf wasi-sdk-20.0-linux.tar.gz
-          sudo mv wasi-sdk-20.0 /opt/wasi-sdk
+          sudo apt-get update
+          sudo apt-get install -y emscripten
 
       # ---------------------------------------------------------
       # 2. COMPILACIÓN (Llamando a tus targets)
@@ -72,15 +70,14 @@ jobs:
             make xtensa PYTHON=python3
             
           elif [ "${{ matrix.target }}" = "x86" ]; then
-            make x86
+            make x86 CLANG=1 SKIP_MODEL=1
             
           elif [ "${{ matrix.target }}" = "arm" ]; then
             # Puedes seguir pasando variables si los Makefiles internos las necesitan
             make arm CROSS_COMPILE=aarch64-linux-gnu-
             
           elif [ "${{ matrix.target }}" = "wasm" ]; then
-            export WASI_SDK_PATH=/opt/wasi-sdk
-            make wasm CC=/opt/wasi-sdk/bin/clang LD=/opt/wasi-sdk/bin/wasm-ld
+            make wasm
           fi
 
       # ---------------------------------------------------------
@@ -91,11 +88,11 @@ jobs:
         if: matrix.target == 'xtensa'
         run: |
           export PATH="$PWD/tools/xtensa-lx106-elf/bin:$PATH"
-          xtensa-lx106-elf-size build/osito.elf
-          xtensa-lx106-elf-size -A build/osito.elf | grep -E '\.text|\.data|\.bss|Total'
+          xtensa-lx106-elf-size arch/xtensa/build/osito.elf
+          xtensa-lx106-elf-size -A arch/xtensa/build/osito.elf | grep -E '\.text|\.data|\.bss|Total'
 
       - name: Upload firmware artifact
         uses: actions/upload-artifact@v4
         with:
           name: osito-k-firmware-${{ matrix.target }}
-          path: build/
+          path: arch/${{ matrix.target }}/build/

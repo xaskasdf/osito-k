@@ -19,7 +19,7 @@
 .PHONY: xtensa x86 arm wasm flash clean clean-all
 
 xtensa:
-	$(MAKE) -C arch/xtensa $(MAKECMDGOALS)
+	$(MAKE) -C arch/xtensa
 
 x86:
 	$(MAKE) -C arch/x86

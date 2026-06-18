@@ -562,49 +562,55 @@ int main(int argc, char **argv)
             }
         }
 
-        /* Allocate a contiguous run from the live-extent bitmap (first-fit).
-         * This NEVER overlaps a live file. next_data_block is only a hint and
-         * may be stale; the bitmap is authoritative. */
-        uint32_t data_start_blk = osfs2_data_start_blk(sb.block_size);
-        uint32_t start_block = blkmap_find_free(blocks_needed, data_start_blk);
-        if (start_block && !blkmap_range_free(start_block, blocks_needed, data_start_blk))
-            start_block = 0;  /* defensive */
-        if (!start_block) {
-            /* Try the next_data_block hint only if verified free, else
-             * re-derive a true high-water mark from the bitmap. */
-            uint32_t hint = sb.next_data_block;
-            if (hint < data_start_blk) hint = data_start_blk;
-            if (blkmap_range_free(hint, blocks_needed, data_start_blk)) {
-                start_block = hint;
-            } else {
-                uint32_t hwm = data_start_blk;
-                for (uint32_t b = data_start_blk; b < sb.total_blocks; b++)
-                    if (blkmap_test(b)) hwm = b + 1;
-                if (blkmap_range_free(hwm, blocks_needed, data_start_blk))
-                    start_block = hwm;
-            }
-        }
-        if (!start_block) {
-            fprintf(stderr, "ositofs-write: not enough contiguous space for '%s' (%u blocks needed)\n",
-                    job->stored_name, blocks_needed);
-            exit_code = 1;
-            continue;  /* skip this file, try next */
-        }
-
-        /* Reserve the run in the bitmap immediately. */
-        for (uint32_t b = 0; b < blocks_needed; b++)
-            blkmap_set(start_block + b);
-
-        printf("  Writing %u data blocks starting at block %u...\n", blocks_needed, start_block);
-
-        /* Write data blocks */
+        uint32_t start_block = 0;
         uint32_t file_crc = 0;
-        if (write_data_blocks(fd, job, start_block, blocks_needed, bs,
-                              crc_table, &file_crc, ji, job_count) < 0) {
-            fprintf(stderr, "ositofs-write: failed to write data for '%s', skipping\n",
-                    job->stored_name);
-            exit_code = 1;
-            continue;
+
+        if (blocks_needed > 0) {
+            /* Allocate a contiguous run from the live-extent bitmap (first-fit).
+             * This NEVER overlaps a live file. next_data_block is only a hint and
+             * may be stale; the bitmap is authoritative. */
+            uint32_t data_start_blk = osfs2_data_start_blk(sb.block_size);
+            start_block = blkmap_find_free(blocks_needed, data_start_blk);
+            if (start_block && !blkmap_range_free(start_block, blocks_needed, data_start_blk))
+                start_block = 0;  /* defensive */
+            if (!start_block) {
+                /* Try the next_data_block hint only if verified free, else
+                 * re-derive a true high-water mark from the bitmap. */
+                uint32_t hint = sb.next_data_block;
+                if (hint < data_start_blk) hint = data_start_blk;
+                if (blkmap_range_free(hint, blocks_needed, data_start_blk)) {
+                    start_block = hint;
+                } else {
+                    uint32_t hwm = data_start_blk;
+                    for (uint32_t b = data_start_blk; b < sb.total_blocks; b++)
+                        if (blkmap_test(b)) hwm = b + 1;
+                    if (blkmap_range_free(hwm, blocks_needed, data_start_blk))
+                        start_block = hwm;
+                }
+            }
+            if (!start_block) {
+                fprintf(stderr, "ositofs-write: not enough contiguous space for '%s' (%u blocks needed)\n",
+                        job->stored_name, blocks_needed);
+                exit_code = 1;
+                continue;  /* skip this file, try next */
+            }
+
+            /* Reserve the run in the bitmap immediately. */
+            for (uint32_t b = 0; b < blocks_needed; b++)
+                blkmap_set(start_block + b);
+
+            printf("  Writing %u data blocks starting at block %u...\n", blocks_needed, start_block);
+
+            /* Write data blocks */
+            if (write_data_blocks(fd, job, start_block, blocks_needed, bs,
+                                  crc_table, &file_crc, ji, job_count) < 0) {
+                fprintf(stderr, "ositofs-write: failed to write data for '%s', skipping\n",
+                        job->stored_name);
+                exit_code = 1;
+                continue;
+            }
+        } else {
+            printf("  Empty file: no data blocks\n");
         }
 
         /* Find a free file table slot */
@@ -669,11 +675,15 @@ int main(int argc, char **argv)
          * top, which must not lower the hint). */
         if (file_idx >= sb.file_count)
             sb.file_count = file_idx + 1;
-        if (start_block + blocks_needed > sb.next_data_block)
+        if (blocks_needed > 0 && start_block + blocks_needed > sb.next_data_block)
             sb.next_data_block = start_block + blocks_needed;
 
-        printf("  [OK] '%s' written: blocks %u-%u, CRC 0x%08X\n",
-               job->stored_name, start_block, start_block + blocks_needed - 1, file_crc);
+        if (blocks_needed > 0)
+            printf("  [OK] '%s' written: blocks %u-%u, CRC 0x%08X\n",
+                   job->stored_name, start_block, start_block + blocks_needed - 1, file_crc);
+        else
+            printf("  [OK] '%s' written: empty file, CRC 0x%08X\n",
+                   job->stored_name, file_crc);
         success_count++;
     }
 

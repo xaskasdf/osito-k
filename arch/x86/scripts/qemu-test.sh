@@ -196,6 +196,10 @@ if [ "$(uname)" = "Darwin" ]; then
         info "Display: native macOS window (cocoa)"
     fi
 else
+    if [ "$USE_GL" = "true" ]; then
+        GPU_DEVICE="-device virtio-vga"
+        info "Display: VNC (virgl disabled; VNC is not GL-capable)"
+    fi
     DISPLAY_ARGS="-vnc :0,password=on"
 fi
 
@@ -208,7 +212,7 @@ qemu-system-x86_64 \
     -cpu Nehalem \
     -smp 4 \
     -device e1000e,netdev=net0 \
-    -netdev user,id=net0,hostfwd=udp::7778-:7777 \
+    -netdev user,id=net0,hostfwd=udp::7777-:7777 \
     -device qemu-xhci,id=usb \
     -device usb-kbd,bus=usb.0 \
     -device usb-mouse,bus=usb.0 \

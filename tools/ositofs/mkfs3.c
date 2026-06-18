@@ -103,7 +103,7 @@ int main(int argc, char **argv)
     /* Root Inode (index 1) */
     inodes[1].mode = OSFS3_S_IFDIR | 0755;
     inodes[1].nlink = 2;
-    inodes[1].size = 0; /* No entries yet, or empty data block */
+    inodes[1].size = OSFS3_BLOCK_SIZE;
     inodes[1].atime = inodes[1].mtime = inodes[1].ctime = sb->create_time;
     inodes[1].extent_count = 1;
     inodes[1].extents[0].start_block = 4;
@@ -132,8 +132,6 @@ int main(int argc, char **argv)
     memcpy(de2->name, "..", 2);
     de2->rec_len = OSFS3_BLOCK_SIZE - de->rec_len; /* Fill the rest of the block */
     
-    inodes[1].size = de->rec_len + 8; /* Just an example size */
-
     if (osfs3_write_block(fd, 4, blk) < 0) goto fail;
     printf("  [OK] Root directory initialized\n");
 
