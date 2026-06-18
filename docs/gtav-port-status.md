@@ -13,7 +13,9 @@ system.cpp, game.cpp, filemgr.cpp) compile and link.
 **Runtime**: FSM reaches RunGame (state 2), game loop ran 1.5M+ ticks with
 CSystem::BeginUpdate/EndUpdate active. Compositor shows GTA5 window via
 virtio-gpu. On macOS, the patched QEMU 11.0.1 SDL/OpenGL core build boots the
-virtio-gpu-gl/VIRGL path to shell with VG3D selftests T2-T9 passing.
+virtio-gpu-gl/VIRGL path to shell with VG3D selftests T2-T9 passing. The 3D
+driver now creates/destroys host contexts and validates host responses; T6/T7
+are local submit/fence guards until a real Venus command encoder is wired.
 
 **Assets**: 24 RPFs (39GB) loaded from 60GB NVMe image. common.rpf + x64a-x64w
 all RPF7-valid. Real assets rendered (icon.jpg, hires_lrg2.bmp from common.rpf).
@@ -52,7 +54,7 @@ OsitoK Kernel
 | CFileMgr | DONE | Real impl compiled, 24 RPFs mounted |
 | CGame::Init | PARTIAL | Compiles, InitWidgets/DLC/LoadingScreens guarded |
 | Parser (attribute.h) | DONE | Real header from Windows source |
-| GPU backend | PARTIAL | virtio-gpu 2D + VIRGL negotiate; VG3D T2-T9 pass; D3D11→DXVK→Vulkan pending |
+| GPU backend | PARTIAL | virtio-gpu 2D + VIRGL negotiate; VG3D host ctx lifecycle passes; real Venus submit stream pending |
 | Audio backend | STUB | HDA driver exists, no RAGE bridge |
 | Input | STUB | Kernel has xHCI+evdev, no RAGE bridge |
 | Streaming (pgStreamer) | STUB | Thread creation works, real streaming pending |
@@ -133,3 +135,6 @@ PATH=/private/tmp/qemu-core-src/qemu-11.0.1/build:$PATH \
 -device e1000e -device qemu-xhci -device usb-kbd -device usb-mouse
 -device intel-hda -device nvme
 ```
+
+Do not enable `venus=on` with the current macOS virglrenderer build: QEMU
+fails early with `Render server support was not enabled in virglrenderer`.

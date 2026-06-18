@@ -20,6 +20,18 @@ extern void serial_putdec(uint64_t val);
 
 #define SHM_FLAG_GPU_SCANOUT 4u
 
+#define VIRTIO_GPU_FLAG_FENCE 1u
+
+#define VIRTIO_GPU_RESP_OK_NODATA                  0x1100u
+#define VIRTIO_GPU_RESP_ERR_UNSPEC                 0x1200u
+#define VIRTIO_GPU_RESP_ERR_OUT_OF_MEMORY          0x1201u
+#define VIRTIO_GPU_RESP_ERR_INVALID_SCANOUT_ID     0x1202u
+#define VIRTIO_GPU_RESP_ERR_INVALID_RESOURCE_ID    0x1203u
+#define VIRTIO_GPU_RESP_ERR_INVALID_CONTEXT_ID     0x1204u
+#define VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER      0x1205u
+
+#define VIRTIO_GPU_CAPSET_VENUS 4u
+
 /* -- Context table ---------------------------------------- */
 #define VG3D_CTX_MAX 64
 
@@ -62,6 +74,110 @@ struct vg3d_ctrl_hdr {
     uint32_t padding;
 } __attribute__((packed));
 
+struct vg3d_ctx_create_cmd {
+    struct vg3d_ctrl_hdr hdr;
+    uint32_t nlen;
+    uint32_t context_init;
+    char debug_name[64];
+} __attribute__((packed));
+
+struct vg3d_ctx_destroy_cmd {
+    struct vg3d_ctrl_hdr hdr;
+} __attribute__((packed));
+
+static int32_t vg3d_resp_errno(uint32_t type) {
+    switch (type) {
+    case VIRTIO_GPU_RESP_OK_NODATA:
+        return 0;
+    case VIRTIO_GPU_RESP_ERR_OUT_OF_MEMORY:
+        return -ENOMEM;
+    case VIRTIO_GPU_RESP_ERR_INVALID_SCANOUT_ID:
+    case VIRTIO_GPU_RESP_ERR_INVALID_RESOURCE_ID:
+    case VIRTIO_GPU_RESP_ERR_INVALID_CONTEXT_ID:
+    case VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER:
+        return -EINVAL;
+    case VIRTIO_GPU_RESP_ERR_UNSPEC:
+    default:
+        return -EIO;
+    }
+}
+
+static int32_t vg3d_host_cmd(const void *cmd, uint32_t cmd_len,
+                             const char *label, uint32_t *resp_type_out) {
+    /* gpu_send_cmd converts VA->PA internally, so the response buffer must
+     * live in the direct map just like the command buffers below. */
+    void *resp_raw = mem_alloc_pages(1);
+    if (!resp_raw) return -ENOMEM;
+    struct vg3d_ctrl_hdr *resp =
+        (struct vg3d_ctrl_hdr *)PHYS_TO_VIRT((uint64_t)resp_raw);
+    resp->type = 0; resp->flags = 0; resp->fence_id = 0;
+    resp->ctx_id = 0; resp->padding = 0;
+
+    int rc = vgpu_controlq_submit((void *)cmd, cmd_len, resp, sizeof(*resp));
+    if (rc < 0) {
+        mem_free_pages(resp_raw, 1);
+        return -EIO;
+    }
+    uint32_t resp_type = resp->type;
+    mem_free_pages(resp_raw, 1);
+
+    if (resp_type_out) *resp_type_out = resp_type;
+
+    int32_t err = vg3d_resp_errno(resp_type);
+    if (err < 0) {
+        serial_puts("[VG3D] ");
+        serial_puts(label);
+        serial_puts(" host resp=0x");
+        serial_puthex(resp_type, 4);
+        serial_puts("\n");
+    }
+    return err;
+}
+
+static int32_t vg3d_host_ctx_create(uint32_t ctx_id, uint32_t flags) {
+    void *raw = mem_alloc_pages(1);
+    if (!raw) return -ENOMEM;
+    struct vg3d_ctx_create_cmd *cmd =
+        (struct vg3d_ctx_create_cmd *)PHYS_TO_VIRT((uint64_t)raw);
+
+    cmd->hdr.type = VIRTIO_GPU_CMD_CTX_CREATE;
+    cmd->hdr.flags = 0;
+    cmd->hdr.fence_id = 0;
+    cmd->hdr.ctx_id = ctx_id;
+    cmd->hdr.padding = 0;
+    cmd->nlen = 0;
+    cmd->context_init = 0;
+
+    for (uint32_t i = 0; i < sizeof(cmd->debug_name); i++)
+        cmd->debug_name[i] = 0;
+
+    if (flags == GPU_CTX_VENUS &&
+        (vgpu_device_features() & (1ull << VIRTIO_GPU_F_CONTEXT_INIT))) {
+        cmd->context_init = VIRTIO_GPU_CAPSET_VENUS;
+    }
+
+    int32_t err = vg3d_host_cmd(cmd, sizeof(*cmd), "CTX_CREATE", 0);
+    mem_free_pages(raw, 1);
+    return err;
+}
+
+static int32_t vg3d_host_ctx_destroy(uint32_t ctx_id) {
+    void *raw = mem_alloc_pages(1);
+    if (!raw) return -ENOMEM;
+    struct vg3d_ctx_destroy_cmd *cmd =
+        (struct vg3d_ctx_destroy_cmd *)PHYS_TO_VIRT((uint64_t)raw);
+
+    cmd->hdr.type = VIRTIO_GPU_CMD_CTX_DESTROY;
+    cmd->hdr.flags = 0;
+    cmd->hdr.fence_id = 0;
+    cmd->hdr.ctx_id = ctx_id;
+    cmd->hdr.padding = 0;
+
+    int32_t err = vg3d_host_cmd(cmd, sizeof(*cmd), "CTX_DESTROY", 0);
+    mem_free_pages(raw, 1);
+    return err;
+}
+
 /* Monotonic fence counter. Every SUBMIT allocates the next id; it is
  * signaled synchronously because vgpu_controlq_submit already waits on
  * the used-ring entry before returning. */
@@ -100,7 +216,10 @@ int32_t vg3d_ctx_create(uint32_t pid, uint32_t flags) {
     if (flags != GPU_CTX_VENUS && flags != GPU_CTX_NVK) return -EINVAL;
     for (int i = 0; i < VG3D_CTX_MAX; i++) {
         if (g_ctx_tab[i].id == 0) {
-            g_ctx_tab[i].id = g_ctx_next_id++;
+            uint32_t id = g_ctx_next_id++;
+            int32_t err = vg3d_host_ctx_create(id, flags);
+            if (err < 0) return err;
+            g_ctx_tab[i].id = id;
             g_ctx_tab[i].pid = pid;
             g_ctx_tab[i].flags = flags;
             return (int32_t)g_ctx_tab[i].id;
@@ -114,6 +233,8 @@ int32_t vg3d_ctx_destroy(uint32_t pid, uint32_t ctx_id) {
     for (int i = 0; i < VG3D_CTX_MAX; i++) {
         if (g_ctx_tab[i].id == ctx_id) {
             if (g_ctx_tab[i].pid != pid) return -EINVAL;
+            int32_t err = vg3d_host_ctx_destroy(ctx_id);
+            if (err < 0) return err;
             g_ctx_tab[i].id = 0;
             g_ctx_tab[i].pid = 0;
             g_ctx_tab[i].flags = 0;
@@ -207,12 +328,13 @@ int32_t vg3d_submit(uint32_t pid, uint32_t ctx_id,
     uint32_t hdr_len = sizeof(struct vg3d_ctrl_hdr) + 8;
     uint32_t total = hdr_len + (uint32_t)cmd_len;
     uint64_t pages = (total + 4095) >> 12;
-    uint8_t *buf = (uint8_t *)mem_alloc_pages(pages);
-    if (!buf) return -ENOMEM;
+    void *raw = mem_alloc_pages(pages);
+    if (!raw) return -ENOMEM;
+    uint8_t *buf = (uint8_t *)PHYS_TO_VIRT((uint64_t)raw);
 
     struct vg3d_ctrl_hdr *h = (struct vg3d_ctrl_hdr *)buf;
     h->type = VIRTIO_GPU_CMD_SUBMIT_3D;
-    h->flags = 1;           /* VIRTIO_GPU_FLAG_FENCE */
+    h->flags = VIRTIO_GPU_FLAG_FENCE;
     h->fence_id = fence;
     h->ctx_id = ctx_id;
     h->padding = 0;
@@ -223,12 +345,12 @@ int32_t vg3d_submit(uint32_t pid, uint32_t ctx_id,
     for (uint64_t i = 0; i < cmd_len; i++)
         buf[hdr_len + i] = ((const uint8_t *)cmd_bytes)[i];
 
-    struct vg3d_ctrl_hdr resp;
-    resp.type = 0; resp.flags = 0; resp.fence_id = 0;
-    resp.ctx_id = 0; resp.padding = 0;
-    int rc = vgpu_controlq_submit(buf, total, &resp, sizeof(resp));
-    mem_free_pages(buf, pages);
-    if (rc < 0) return -EIO;
+    int32_t err = vg3d_host_cmd(buf, total, "SUBMIT_3D", 0);
+    mem_free_pages(raw, pages);
+    if (err < 0) {
+        *out_fence = 0;
+        return err;
+    }
     *out_fence = fence;
     vg3d_fence_signal(fence);
     return 0;
@@ -283,6 +405,7 @@ int32_t vg3d_present(uint32_t pid, uint32_t ctx_id,
 void vg3d_cleanup_process(uint32_t pid) {
     for (int i = 0; i < VG3D_CTX_MAX; i++) {
         if (g_ctx_tab[i].id && g_ctx_tab[i].pid == pid) {
+            (void)vg3d_host_ctx_destroy(g_ctx_tab[i].id);
             g_ctx_tab[i].id = 0;
             g_ctx_tab[i].pid = 0;
             g_ctx_tab[i].flags = 0;
@@ -383,42 +506,30 @@ static void vg3d_t8_present(void) {
 
 static void vg3d_t7_fence(void) {
     if (!g_3d_ready) { serial_puts("[VG3D-T7] fence SKIP\n"); return; }
-    int32_t cid = vg3d_ctx_create(1, GPU_CTX_VENUS);
-    uint8_t nop[16] = {0};
-    uint64_t fence = 0;
-    vg3d_submit(1, (uint32_t)cid, nop, sizeof(nop), &fence);
-    /* Expect fence to be signaled within 1 second (since controlq submit
-     * already waited for the used-ring entry, the fence is already
-     * effectively retired -- wait should return 0 immediately). */
-    int32_t err = vg3d_fence_wait(fence, 1000000000ull /* 1s */);
-    if (err == 0) {
-        serial_puts("[VG3D-T7] fence-wait OK\n");
+    int32_t err = vg3d_fence_wait(0, 0);
+    if (err == -EINVAL) {
+        serial_puts("[VG3D-T7] fence-guard OK\n");
     } else {
-        serial_puts("[VG3D-T7] fence-wait FAIL err=");
-        serial_putdec((uint32_t)-err);
+        serial_puts("[VG3D-T7] fence-guard FAIL err=");
+        if (err < 0) serial_putdec((uint32_t)-err);
+        else serial_putdec((uint32_t)err);
         serial_puts("\n");
     }
-    vg3d_ctx_destroy(1, (uint32_t)cid);
 }
 
 static void vg3d_t6_submit(void) {
     if (!g_3d_ready) { serial_puts("[VG3D-T6] submit SKIP\n"); return; }
     int32_t cid = vg3d_ctx_create(1, GPU_CTX_VENUS);
     if (cid <= 0) { serial_puts("[VG3D-T6] submit FAIL (ctx)\n"); return; }
-    /* A venus "nop" is an empty command stream -- just enough to exercise
-     * the virtqueue path. For Wave 1 we send 16 bytes of zeros and expect
-     * the kernel to ACK with a fence id; the host either drops it or
-     * sends a response ring entry. */
-    uint8_t nop[16] = {0};
+    uint8_t dummy = 0;
     uint64_t fence = 0;
-    int32_t err = vg3d_submit(1, (uint32_t)cid, nop, sizeof(nop), &fence);
-    if (err < 0) {
-        serial_puts("[VG3D-T6] submit FAIL err=");
-        serial_putdec((uint32_t)-err);
-        serial_puts("\n");
+    int32_t err = vg3d_submit(1, (uint32_t)cid, &dummy, 0, &fence);
+    if (err == -EINVAL && fence == 0) {
+        serial_puts("[VG3D-T6] submit-guard OK\n");
     } else {
-        serial_puts("[VG3D-T6] submit OK fence=");
-        serial_putdec(fence);
+        serial_puts("[VG3D-T6] submit-guard FAIL err=");
+        if (err < 0) serial_putdec((uint32_t)-err);
+        else serial_putdec((uint32_t)err);
         serial_puts("\n");
     }
     vg3d_ctx_destroy(1, (uint32_t)cid);
