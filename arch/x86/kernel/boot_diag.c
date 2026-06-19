@@ -9,7 +9,7 @@
 
 #define BOOT_DIAG_SLOTS        4
 #define BOOT_DIAG_CRASH_SLOTS  16
-#define BOOT_DIAG_MAX_LOG      (1024 * 1024)
+#define BOOT_DIAG_MAX_LOG      (4 * 1024 * 1024)
 #define BOOT_DIAG_CHUNK        4096
 
 extern void serial_puts(const char *s);
@@ -39,6 +39,8 @@ static uint32_t boot_diag_crash_next;
 static uint64_t boot_diag_cursor;
 static uint64_t boot_diag_log_bytes;
 static uint64_t boot_diag_last_hb_ticks;
+static uint64_t boot_diag_last_auto_ticks;
+static bool boot_diag_flushing;
 static void *boot_diag_log_file;
 static char boot_diag_log_name[32];
 static char boot_diag_chunk[BOOT_DIAG_CHUNK];
@@ -141,7 +143,7 @@ static void bd_delete_slot_crashes(int slot)
 
 static int bd_append_log(const char *buf, uint32_t len)
 {
-    static const char trunc_msg[] = "\n[BDIAG] log truncated at 1048576 bytes\n";
+    static const char trunc_msg[] = "\n[BDIAG] log truncated at 4194304 bytes\n";
     uint32_t trunc_len = (uint32_t)(sizeof(trunc_msg) - 1);
 
     if (!boot_diag_ready || boot_diag_failed || boot_diag_truncated || len == 0)
@@ -239,6 +241,8 @@ void boot_diag_init(void)
     boot_diag_failed = false;
     boot_diag_crash_next = 0;
     boot_diag_last_hb_ticks = 0;
+    boot_diag_last_auto_ticks = 0;
+    boot_diag_flushing = false;
     boot_diag_ready = true;
 
     serial_puts("[BDIAG] boot diagnostics active: ");
@@ -254,6 +258,9 @@ void boot_diag_flush(const char *reason)
 
     if (!boot_diag_ready || boot_diag_failed)
         return;
+    if (boot_diag_flushing)
+        return;
+    boot_diag_flushing = true;
 
     if (usb_storage_write_diag_flush)
         usb_storage_write_diag_flush(reason);
@@ -274,6 +281,36 @@ void boot_diag_flush(const char *reason)
     bd_write_latest(reason);
     osfs2_truncate(boot_diag_log_file, boot_diag_log_bytes);
     disk_flush();
+    boot_diag_flushing = false;
+}
+
+void boot_diag_maybe_flush(const char *reason, uint64_t min_bytes,
+                           uint64_t min_ticks)
+{
+    uint64_t total;
+    uint64_t pending;
+    uint64_t now;
+
+    if (!boot_diag_ready || boot_diag_failed || boot_diag_truncated ||
+        boot_diag_flushing)
+        return;
+
+    total = klog_total_bytes();
+    if (total <= boot_diag_cursor)
+        return;
+    pending = total - boot_diag_cursor;
+    now = idt_get_ticks();
+
+    if (min_bytes && pending >= min_bytes) {
+        boot_diag_last_auto_ticks = now;
+        boot_diag_flush(reason ? reason : "auto");
+        return;
+    }
+
+    if (min_ticks && pending && now - boot_diag_last_auto_ticks >= min_ticks) {
+        boot_diag_last_auto_ticks = now;
+        boot_diag_flush(reason ? reason : "auto");
+    }
 }
 
 void boot_diag_mark(const char *reason)

@@ -13,6 +13,8 @@
 extern void serial_puts(const char *s);
 extern void serial_puthex(uint64_t val, int digits);
 extern void serial_putdec(uint64_t val);
+extern void boot_diag_maybe_flush(const char *reason, uint64_t min_bytes,
+                                  uint64_t min_ticks) __attribute__((weak));
 
 /* Framebuffer */
 extern void fb_puts(const char *s);
@@ -121,7 +123,11 @@ static const char *hist_get(int index)
 /* Read a line with editing. Returns line length, -1 on EOF (Ctrl+D) */
 int term_readline(const char *prompt, char *buf, uint32_t buf_size)
 {
-    if (prompt) term_puts_color(prompt, 0x0000FF88);
+    if (prompt) {
+        term_puts_color(prompt, 0x0000FF88);
+        if (boot_diag_maybe_flush)
+            boot_diag_maybe_flush("readline-prompt", 1, 0);
+    }
 
     line_pos = 0;
     line_len = 0;

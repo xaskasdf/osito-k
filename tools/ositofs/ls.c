@@ -11,6 +11,15 @@
 
 #include "common.h"
 
+static const char *display_name(const osfs2_file_t *f)
+{
+    if (!(f->flags & OSFS2_FLAG_GGUF) &&
+        !(f->flags & OSFS2_FLAG_INLINE) &&
+        f->model_name[0])
+        return f->model_name;
+    return f->name;
+}
+
 int main(int argc, char **argv)
 {
     if (argc != 2) {
@@ -57,7 +66,7 @@ int main(int argc, char **argv)
     for (uint32_t i = 0; i < OSFS2_MAX_FILES; i++) {
         if (!(ft[i].flags & OSFS2_FLAG_VALID)) continue;
 
-        printf("%-40s ", ft[i].name);
+        printf("%-40s ", display_name(&ft[i]));
 
         /* Size */
         char sizebuf[32];

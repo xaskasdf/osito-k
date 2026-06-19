@@ -38,6 +38,8 @@ extern void serial_puts(const char *s);
 extern void serial_puthex(uint64_t val, int digits);
 extern void serial_putdec(uint64_t val);
 extern void serial_putc(char c);
+extern void boot_diag_maybe_flush(const char *reason, uint64_t min_bytes,
+                                  uint64_t min_ticks) __attribute__((weak));
 
 extern void fb_puts(const char *s);
 extern void fb_putc(char c, uint32_t color);
@@ -368,7 +370,11 @@ static ssize_t console_write(const void *buf, size_t count)
         fb_putc(s[i], 0x00CCCCCC);
         if (capture_buf && capture_pos < capture_max - 1)
             capture_buf[capture_pos++] = s[i];
+        if ((i & 0xFFFF) == 0xFFFF && boot_diag_maybe_flush)
+            boot_diag_maybe_flush("console", 64 * 1024, 50);
     }
+    if (boot_diag_maybe_flush)
+        boot_diag_maybe_flush("console", 64 * 1024, 100);
     return (ssize_t)count;
 }
 
@@ -1640,14 +1646,29 @@ static uint64_t prot_to_pte_flags(uint32_t prot)
  *   args: a1=addr, a2=length, a3=prot, a4=flags, a5(R8)=fd, a6(R9)=offset
  *   Note: R10 carries flags (a4 in our dispatch), fd is a5, offset is unused.
  */
+static int64_t sys_munmap(uint64_t addr, uint64_t length);
+
 static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
                          uint64_t flags, uint64_t fd, uint64_t offset)
 {
     if (length == 0) return -EINVAL;
+    if (length > 0x0000800000000000ULL - 4095)
+        return -EINVAL;
 
-    /* Handle musl's mallocng guard page request */
-    if ((flags & 0x10 /* MAP_FIXED */) && addr != 0) {
-        return (int64_t)addr;
+    uint64_t npages = (length + 4095) / 4096;
+    if (npages == 0 || npages > (0x0000800000000000ULL / 4096))
+        return -EINVAL;
+
+    bool fixed = (flags & MAP_FIXED) != 0;
+    if (fixed) {
+        if (addr < 0x1000 || (addr & 0xFFF))
+            return -EINVAL;
+        if (addr + npages * 4096 < addr)
+            return -EINVAL;
+        /* Linux MAP_FIXED replaces existing mappings in the target range.
+         * Keep the behavior simple: remove owned overlapping VMAs if present,
+         * then install the new demand-paged VMA below. */
+        (void)sys_munmap(addr, npages * 4096);
     }
 
     /* File-backed mmap: demand-paged (pages loaded on first access) */
@@ -1655,8 +1676,6 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
         if (fd >= MAX_FDS || !fd_table[fd].open) return -EBADF;
         fd_entry_t *f = &fd_table[fd];
         if (f->type != FD_TYPE_FILE) return -EBADF;
-
-        uint64_t npages = (length + 4095) / 4096;
 
         int vi = -1;
         for (int i = 0; i < MAX_VMAS; i++) {
@@ -1666,8 +1685,13 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
 
         /* Reserve virtual address range (no physical pages allocated) */
         static uint64_t mmap_file_base = 0x600000000ULL;
-        uint64_t result = mmap_file_base;
-        mmap_file_base += npages * 4096;
+        uint64_t result;
+        if (fixed) {
+            result = addr;
+        } else {
+            result = mmap_file_base;
+            mmap_file_base += npages * 4096;
+        }
 
         /* How much of this mapping is backed by file data? */
         uint64_t fsize = f->node.size;
@@ -1696,9 +1720,6 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
     if (fd != (uint64_t)-1 && !(flags & MAP_ANONYMOUS))
         return -EBADF;
 
-    /* Round up to page boundary */
-    uint64_t npages = (length + 4095) / 4096;
-
     /* Find free VMA slot */
     int vi = -1;
     for (int i = 0; i < MAX_VMAS; i++) {
@@ -1712,7 +1733,9 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
      * that exact VA back, just like the legacy PROT_NONE path. */
     static uint64_t mmap_anon_base = 0x500000000ULL;
     uint64_t result;
-    if (addr && (addr & 0xFFF) == 0) {
+    if (fixed) {
+        result = addr;
+    } else if (addr && (addr & 0xFFF) == 0) {
         result = addr;
     } else {
         result = mmap_anon_base;
@@ -2680,6 +2703,9 @@ extern int futex_do_wake(uint64_t uaddr, uint64_t space, int count);
 extern int futex_do_requeue(uint64_t uaddr, uint64_t space, int wake_count,
                             int requeue_count, uint64_t uaddr2,
                             uint64_t space2);
+extern int futex_do_cmp_requeue(uint64_t uaddr, uint64_t space, int wake_count,
+                                int requeue_count, uint64_t uaddr2,
+                                uint64_t space2, int expected);
 extern uint64_t proc_current_cr3(void);
 
 /* userspace struct timespec */
@@ -2698,12 +2724,33 @@ static void futex_log_unsupported(const char *what, uint64_t op)
     serial_puts("\n");
 }
 
+static uint64_t futex_relative_ticks(const futex_timespec_t *ts)
+{
+    int64_t sec = ts->tv_sec, nsec = ts->tv_nsec;
+    if (sec < 0) sec = 0;
+    if (nsec < 0) nsec = 0;
+    uint64_t total_ns = (uint64_t)sec * 1000000000ULL + (uint64_t)nsec;
+    uint64_t ticks = total_ns / 10000000ULL;   /* 10 ms per tick */
+    return ticks ? ticks : 1;                  /* round any nonzero up */
+}
+
+static uint64_t futex_absolute_ticks(const futex_timespec_t *ts)
+{
+    int64_t sec = ts->tv_sec, nsec = ts->tv_nsec;
+    if (sec < 0) sec = 0;
+    if (nsec < 0) nsec = 0;
+    uint64_t total_ticks = (uint64_t)sec * 100ULL +
+                           (uint64_t)nsec / 10000000ULL;
+    uint64_t now = idt_get_ticks();
+    return (total_ticks > now) ? (total_ticks - now) : 1;
+}
+
 static int64_t sys_futex(uint64_t uaddr, uint64_t op, uint64_t val,
-                          uint64_t timeout, uint64_t uaddr2)
+                          uint64_t timeout, uint64_t uaddr2, uint64_t val3)
 {
     int cmd = (int)(op & ~(FUTEX_PRIVATE_FLAG | FUTEX_CLOCK_REALTIME));
 
-    if (op & FUTEX_CLOCK_REALTIME) {
+    if ((op & FUTEX_CLOCK_REALTIME) && cmd != FUTEX_WAIT_BITSET) {
         futex_log_unsupported("realtime", op);
         return -ENOSYS;
     }
@@ -2713,18 +2760,14 @@ static int64_t sys_futex(uint64_t uaddr, uint64_t op, uint64_t val,
      * keyed globally with space 0. musl's pthread primitives are PRIVATE. */
     uint64_t space = (op & FUTEX_PRIVATE_FLAG) ? proc_current_cr3() : 0;
 
-    if (cmd == FUTEX_WAIT) {
-        /* For FUTEX_WAIT, `timeout` (a4) is a RELATIVE struct timespec* or
-         * NULL for an infinite wait. Convert to 100Hz ticks (10ms each). */
+    if (cmd == FUTEX_WAIT || cmd == FUTEX_WAIT_BITSET) {
+        if (cmd == FUTEX_WAIT_BITSET && val3 == 0)
+            return -EINVAL;
         uint64_t ticks = 0;
         if (timeout) {
             const futex_timespec_t *ts = (const futex_timespec_t *)timeout;
-            int64_t sec = ts->tv_sec, nsec = ts->tv_nsec;
-            if (sec < 0) sec = 0;
-            if (nsec < 0) nsec = 0;
-            uint64_t total_ns = (uint64_t)sec * 1000000000ULL + (uint64_t)nsec;
-            ticks = total_ns / 10000000ULL;   /* 10 ms per tick */
-            if (ticks == 0) ticks = 1;        /* round any nonzero up to 1 tick */
+            ticks = (cmd == FUTEX_WAIT_BITSET) ?
+                futex_absolute_ticks(ts) : futex_relative_ticks(ts);
         }
         return (int64_t)futex_do_wait(uaddr, (int)val, space, ticks);
     }
@@ -2736,11 +2779,13 @@ static int64_t sys_futex(uint64_t uaddr, uint64_t op, uint64_t val,
         return (int64_t)futex_do_requeue(uaddr, space, (int)val,
                                          (int)timeout, uaddr2, space);
     }
-    /* CMP_REQUEUE needs the sixth syscall argument (val3), which the current
-     * dispatcher does not pass through yet. Return ENOSYS so libc can fall
-     * back instead of treating an unimplemented operation as success. */
-    if (cmd == FUTEX_CMP_REQUEUE || cmd == FUTEX_WAKE_OP ||
-        cmd == FUTEX_WAIT_BITSET) {
+    if (cmd == FUTEX_CMP_REQUEUE) {
+        if (!uaddr2) return -EINVAL;
+        return (int64_t)futex_do_cmp_requeue(uaddr, space, (int)val,
+                                             (int)timeout, uaddr2, space,
+                                             (int)val3);
+    }
+    if (cmd == FUTEX_WAKE_OP) {
         futex_log_unsupported("cmd", op);
         return -ENOSYS;
     }
@@ -3332,7 +3377,8 @@ typedef struct {
 
 /* Forward decl — defined immediately below */
 int64_t syscall_dispatch(uint64_t nr, uint64_t a1, uint64_t a2,
-                         uint64_t a3, uint64_t a4, uint64_t a5);
+                         uint64_t a3, uint64_t a4, uint64_t a5,
+                         uint64_t a6);
 
 static int64_t sys_batch(uint64_t entries_addr, uint64_t count)
 {
@@ -3348,7 +3394,7 @@ static int64_t sys_batch(uint64_t entries_addr, uint64_t count)
         for (int j = 0; j < 6; j++)
             a[j] = (e->args[j] == BATCH_USE_PREV_RESULT) ? (uint64_t)prev_result : e->args[j];
 
-        e->result = syscall_dispatch(e->nr, a[0], a[1], a[2], a[3], a[4]);
+        e->result = syscall_dispatch(e->nr, a[0], a[1], a[2], a[3], a[4], a[5]);
         prev_result = e->result;
 
         if ((e->flags & BATCH_STOP_ON_ERROR) && e->result < 0)
@@ -3642,7 +3688,8 @@ static void memo_invalidate_nr(uint64_t nr)
 /* ── Syscall dispatch (called from assembly) ─────────────────── */
 
 static int64_t __hot syscall_dispatch_inner(uint64_t nr, uint64_t a1, uint64_t a2,
-                         uint64_t a3, uint64_t a4, uint64_t a5);
+                         uint64_t a3, uint64_t a4, uint64_t a5,
+                         uint64_t a6);
 
 /* FS-base (TLS) transparency wrapper.
  *
@@ -3662,17 +3709,19 @@ static int64_t __hot syscall_dispatch_inner(uint64_t nr, uint64_t a1, uint64_t a
  * MSR for *this* call, never a process_t field. arch_prctl is the one syscall
  * that legitimately changes FS, so skip the re-assert for it. */
 int64_t __hot syscall_dispatch(uint64_t nr, uint64_t a1, uint64_t a2,
-                               uint64_t a3, uint64_t a4, uint64_t a5)
+                               uint64_t a3, uint64_t a4, uint64_t a5,
+                               uint64_t a6)
 {
     uint64_t entry_fs = rdmsr(MSR_FS_BASE);
-    int64_t  ret = syscall_dispatch_inner(nr, a1, a2, a3, a4, a5);
+    int64_t  ret = syscall_dispatch_inner(nr, a1, a2, a3, a4, a5, a6);
     if (nr != SYS_ARCH_PRCTL && entry_fs && rdmsr(MSR_FS_BASE) != entry_fs)
         wrmsr(MSR_FS_BASE, entry_fs);
     return ret;
 }
 
 static int64_t __hot syscall_dispatch_inner(uint64_t nr, uint64_t a1, uint64_t a2,
-                         uint64_t a3, uint64_t a4, uint64_t a5)
+                         uint64_t a3, uint64_t a4, uint64_t a5,
+                         uint64_t a6)
 {
     /* Memoization: check cache for known-memoizable syscalls.
      * Buffer-writing syscalls replay via memcpy on cache hit. */
@@ -3703,7 +3752,7 @@ static int64_t __hot syscall_dispatch_inner(uint64_t nr, uint64_t a1, uint64_t a
     }
     case SYS_POLL:       return sys_poll(a1, a2, a3);
     case SYS_LSEEK:      return sys_lseek(a1, (int64_t)a2, a3);
-    case SYS_MMAP:       return sys_mmap(a1, a2, a3, a4, a5, 0);
+    case SYS_MMAP:       return sys_mmap(a1, a2, a3, a4, a5, a6);
     case SYS_MPROTECT:   return sys_mprotect(a1, a2, a3);
     case SYS_MUNMAP:     return sys_munmap(a1, a2);
     case SYS_MREMAP:     return sys_mremap(a1, a2, a3, a4);
@@ -3768,7 +3817,7 @@ static int64_t __hot syscall_dispatch_inner(uint64_t nr, uint64_t a1, uint64_t a
     case SYS_PRCTL:      return sys_prctl(a1, a2, a3, a4, a5);
     case SYS_ARCH_PRCTL: return sys_arch_prctl(a1, a2);
     case SYS_GETTID:     return sys_gettid();
-    case SYS_FUTEX:      return sys_futex(a1, a2, a3, a4, a5);
+    case SYS_FUTEX:      return sys_futex(a1, a2, a3, a4, a5, a6);
     case SYS_GETDENTS64: return sys_getdents64(a1, a2, a3);
     case SYS_SET_TID_ADDR: return sys_set_tid_address(a1);
     case SYS_CLOCK_GETTIME: return sys_clock_gettime(a1, a2);

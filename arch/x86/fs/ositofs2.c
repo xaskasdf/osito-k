@@ -222,6 +222,43 @@ static void osfs2_hash_build(void)
     }
 }
 
+static const char *osfs2_file_long_name(const osfs2_file_t *f)
+{
+    if (!(f->flags & OSFS2_FLAG_GGUF) &&
+        !(f->flags & OSFS2_FLAG_INLINE) &&
+        f->model_name[0])
+        return f->model_name;
+    return NULL;
+}
+
+static int osfs2_streq_ci(const char *a, const char *b)
+{
+    while (*a && *b) {
+        char ca = *a, cb = *b;
+        if (ca >= 'A' && ca <= 'Z') ca += 32;
+        if (cb >= 'A' && cb <= 'Z') cb += 32;
+        if (ca != cb) return 0;
+        a++; b++;
+    }
+    return *a == '\0' && *b == '\0';
+}
+
+static int osfs2_file_name_eq(const osfs2_file_t *f, const char *name)
+{
+    if (strcmp(f->name, name) == 0)
+        return 1;
+    const char *long_name = osfs2_file_long_name(f);
+    return long_name && strcmp(long_name, name) == 0;
+}
+
+static int osfs2_file_name_eq_ci(const osfs2_file_t *f, const char *name)
+{
+    if (osfs2_streq_ci(f->name, name))
+        return 1;
+    const char *long_name = osfs2_file_long_name(f);
+    return long_name && osfs2_streq_ci(long_name, name);
+}
+
 /* ── Read from partition ─────────────────────────────────────── */
 
 static int osfs2_part_read(uint64_t offset, void *buf, uint64_t len)
@@ -517,6 +554,9 @@ int osfs2_find_first(const char *pattern, int start_idx)
         if (!(file_table[i].flags & OSFS2_FLAG_VALID)) continue;
         if (osfs2_wildcard_match(pattern, file_table[i].name))
             return i;
+        const char *long_name = osfs2_file_long_name(&file_table[i]);
+        if (long_name && osfs2_wildcard_match(pattern, long_name))
+            return i;
     }
     return -1;
 }
@@ -538,9 +578,14 @@ osfs2_file_t *osfs2_find(const char *name)
     while (name_hash[slot] != OSFS2_HASH_EMPTY) {
         uint16_t idx = name_hash[slot];
         if ((file_table[idx].flags & OSFS2_FLAG_VALID) &&
-            strcmp(file_table[idx].name, name) == 0)
+            osfs2_file_name_eq(&file_table[idx], name))
             return &file_table[idx];
         slot = (slot + 1) & OSFS2_HASH_MASK;
+    }
+    for (uint32_t i = 0; i < OSFS2_MAX_FILES; i++) {
+        if ((file_table[i].flags & OSFS2_FLAG_VALID) &&
+            osfs2_file_name_eq(&file_table[i], name))
+            return &file_table[i];
     }
     return NULL;
 }
@@ -549,6 +594,7 @@ osfs2_file_t *osfs2_find(const char *name)
 osfs2_file_t *osfs2_find_ci(const char *name)
 {
     if (!mounted || !name) return NULL;
+    const char *orig_name = name;
     /* OsitoFS v2 is a FLAT filesystem (keys are bare filenames). Win32 callers
      * (e.g. UT99's GetPackageLinker at LoadMap) may pass a directory-prefixed
      * path like "Maps\Entry.unr" or "System\Entry.unr"; reduce to the basename
@@ -560,19 +606,17 @@ osfs2_file_t *osfs2_find_ci(const char *name)
     while (name_hash[slot] != OSFS2_HASH_EMPTY) {
         uint16_t idx = name_hash[slot];
         if (file_table[idx].flags & OSFS2_FLAG_VALID) {
-            const char *a = file_table[idx].name;
-            const char *b = name;
-            int match = 1;
-            while (*a && *b) {
-                char ca = *a, cb = *b;
-                if (ca >= 'A' && ca <= 'Z') ca += 32;
-                if (cb >= 'A' && cb <= 'Z') cb += 32;
-                if (ca != cb) { match = 0; break; }
-                a++; b++;
-            }
-            if (match && !*a && !*b) return &file_table[idx];
+            if (osfs2_file_name_eq_ci(&file_table[idx], name) ||
+                osfs2_file_name_eq_ci(&file_table[idx], orig_name))
+                return &file_table[idx];
         }
         slot = (slot + 1) & OSFS2_HASH_MASK;
+    }
+    for (uint32_t i = 0; i < OSFS2_MAX_FILES; i++) {
+        if (!(file_table[i].flags & OSFS2_FLAG_VALID)) continue;
+        if (osfs2_file_name_eq_ci(&file_table[i], name) ||
+            osfs2_file_name_eq_ci(&file_table[i], orig_name))
+            return &file_table[i];
     }
     return NULL;
 }

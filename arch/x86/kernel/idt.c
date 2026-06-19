@@ -22,6 +22,13 @@ extern void fb_puts(const char *s);
 extern void fb_puts_color(const char *s, uint32_t color);
 extern void fb_putdec(uint64_t val);
 extern void fb_puthex(uint64_t val, int digits);
+extern void boot_diag_flush(const char *reason) __attribute__((weak));
+
+static inline void idt_diag_flush(const char *reason)
+{
+    if (boot_diag_flush)
+        boot_diag_flush(reason);
+}
 
 /* X-SCHED: scheduler tick (process.c) */
 extern void sched_tick(void *frame);
@@ -638,6 +645,7 @@ void isr_handler(interrupt_frame_t *frame)
                     uint64_t kcr3 = paging_get_kernel_cr3();
                     if (kcr3) __asm__ volatile ("mov %0, %%cr3"
                                                  :: "r"(kcr3) : "memory");
+                    idt_diag_flush("dos-crash-recover");
                     kern_longjmp(dos_native_exit_jmpbuf, 2);
                 }
             }
@@ -1419,7 +1427,7 @@ void isr_handler(interrupt_frame_t *frame)
          * reads from `frame->rsp & 0xFFFFFFFF` (truncated 32-bit RSP)
          * to recover the return address, dispatches to the engine SEH
          * chain, scans the IAT for redirect candidates, etc. Native
-         * x86_64 user code (CS=0x38) with a NULL function pointer
+         * x86_64 SYSCALL-launched code (CS=0x28) with a NULL function pointer
          * should just take the regular #PF path and die. */
         if (cr2 < 0x1000 && (frame->error_code & 16) &&
             ((frame->cs & 0xFFFF) == 0x40 ||
@@ -2180,9 +2188,11 @@ compat32_null_recovery:
                 if (!valid) {
                     serial_puts("  [WIN32] REFUSING longjmp — jmpbuf "
                                 "corrupted by user code, halting\n");
+                    idt_diag_flush("win32-jmpbuf-corrupt");
                     __asm__ volatile ("cli");
                     for (;;) __asm__ volatile ("hlt");
                 }
+                idt_diag_flush("win32-crash-recover");
                 kern_longjmp(jmp, 1);
             }
         }
@@ -2199,6 +2209,7 @@ compat32_null_recovery:
                 serial_puts("  Cascading exception in PID ");
                 serial_putdec(pid);
                 serial_puts(" — halting\n");
+                idt_diag_flush("exception-cascade");
                 __asm__ volatile ("sti");
                 for (;;) __asm__ volatile ("hlt");
             }
@@ -2226,6 +2237,7 @@ compat32_null_recovery:
             serial_putdec((uint64_t)sig);
             serial_puts("\n");
             fb_puts_color(" Process killed\n", 0x00FF0000);
+            idt_diag_flush("process-kill");
             {
                 extern void proc_exit_group(int32_t code);
                 proc_exit_group(128 + sig);
@@ -2248,6 +2260,7 @@ compat32_null_recovery:
                 uint64_t kcr3 = paging_get_kernel_cr3();
                 if (kcr3) __asm__ volatile ("mov %0, %%cr3"
                                              :: "r"(kcr3) : "memory");
+                idt_diag_flush("dos-panic-recover");
                 kern_longjmp(dos_native_exit_jmpbuf, 3);
             }
         }
@@ -2255,6 +2268,7 @@ compat32_null_recovery:
         /* Kernel exception (PID 0 or 1) — halt the system */
         serial_puts("  SYSTEM HALTED\n");
         fb_puts_color(" SYSTEM HALTED\n", 0x00FF0000);
+        idt_diag_flush("kernel-exception-halt");
         __asm__ volatile ("cli");
         for (;;) __asm__ volatile ("hlt");
     }

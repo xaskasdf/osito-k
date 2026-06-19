@@ -586,8 +586,9 @@ static void upstream_caller_dump(uint32_t va, uint32_t esp, uint32_t ebp,
  */
 static int g_exit_hook_fired = 0;
 
-static void exit_caller_dump(uint32_t va, uint32_t esp, uint32_t ebp,
-                              const uint32_t *stack_args)
+static void __attribute__((unused))
+exit_caller_dump(uint32_t va, uint32_t esp, uint32_t ebp,
+                 const uint32_t *stack_args)
 {
     g_exit_hook_fired++;
     if (g_exit_hook_fired > 30) {
@@ -735,13 +736,9 @@ void wdbg_init(void)
                    upstream_caller_dump,
                    "upstream-0x599AB-region");
 
-    /* UT.exe exit hook — function around 0x10922000..0x10922400
-     * which calls ExitProcess. The exit code observed is a stack
-     * address (EBP-0xC8 of caller), indicating an uninitialized
-     * local. Hook the body to see what condition triggers the exit. */
-    wdbg_addr_hook(0x10922000, 0x10922400,
-                   exit_caller_dump,
-                   "UT-exit-0x221BA-region");
+    /* UT.exe exit hook intentionally disabled on real hardware. It is a
+     * noisy UT99-only diagnostic and can fault while reading the compat32
+     * stack during unrelated DLL/IAT work, masking the actual process state. */
 
     /* UT.exe+0x4700..0x4800 — basic block around 0x4756 identified
      * by the throw-helper stack scan as the topmost frame on the
@@ -753,5 +750,5 @@ void wdbg_init(void)
                    ut_caller_dump,
                    "UT-loadcaller-0x4756-region");
 
-    serial_puts("[WDBG] init: 3 modules, 4 hooks registered\n");
+    serial_puts("[WDBG] init: 3 modules, 3 hooks registered\n");
 }

@@ -56,23 +56,26 @@ syscall_entry:
     push %r8
     push %r9
 
-    /* Set up arguments for syscall_dispatch(nr, a1, a2, a3, a4, a5)
-     * C calling convention: RDI, RSI, RDX, RCX, R8, R9
-     * From user: RAX=nr, RDI=a1, RSI=a2, RDX=a3, R10=a4, R8=a5
+    /* Set up arguments for syscall_dispatch(nr, a1, a2, a3, a4, a5, a6)
+     * C calling convention: RDI, RSI, RDX, RCX, R8, R9, stack[0]
+     * From user: RAX=nr, RDI=a1, RSI=a2, RDX=a3, R10=a4, R8=a5, R9=a6
      *
      * We read from the SAVED values on stack to avoid ordering issues.
      * Stack layout (from RSP): r9, r8, r10, rdx, rsi, rdi, ...
      */
-    mov %r8, %r9      /* a5 = R8 → R9 (still has user value) */
+    mov %r8, %r9      /* a5 = R8 -> R9 (still has user value) */
     mov %r10, %r8     /* a4 = R10 → R8 */
     mov %rdx, %rcx    /* a3 = RDX → RCX */
     mov %rsi, %rdx    /* a2 = RSI → RDX */
     mov %rdi, %rsi    /* a1 = RDI → RSI */
     mov %rax, %rdi    /* nr = RAX → RDI */
 
-    /* Align stack to 16 bytes (ABI requirement) */
+    /* Align stack to 16 bytes (ABI requirement), then pass a6 on stack. */
     mov %rsp, %rbp
     and $~0xF, %rsp
+    sub $16, %rsp
+    mov 0(%rbp), %rax  /* saved user R9 = a6 */
+    mov %rax, 0(%rsp)
 
     /* Interrupts stay disabled during syscall (non-preemptive kernel).
      * kern_longjmp (proc_exit) bypasses the return path, so keeping

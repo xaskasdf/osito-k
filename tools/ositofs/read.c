@@ -21,6 +21,25 @@
 
 #include "common.h"
 
+static int wildcard_match(const char *pattern, const char *name);
+
+static const char *display_name(const osfs2_file_t *f)
+{
+    if (!(f->flags & OSFS2_FLAG_GGUF) &&
+        !(f->flags & OSFS2_FLAG_INLINE) &&
+        f->model_name[0])
+        return f->model_name;
+    return f->name;
+}
+
+static int entry_matches(const osfs2_file_t *f, const char *pattern)
+{
+    if (wildcard_match(pattern, f->name))
+        return 1;
+    const char *alias = display_name(f);
+    return alias != f->name && wildcard_match(pattern, alias);
+}
+
 static void fprint_size(FILE *fp, uint64_t bytes)
 {
     if (bytes >= (uint64_t)1024 * 1024 * 1024)
@@ -200,7 +219,7 @@ int main(int argc, char **argv)
 
     for (uint32_t i = 0; i < OSFS2_MAX_FILES; i++) {
         if (!(ft[i].flags & OSFS2_FLAG_VALID)) continue;
-        if (wildcard_match(pattern, ft[i].name))
+        if (entry_matches(&ft[i], pattern))
             matches[match_count++] = (int)i;
     }
 
@@ -214,7 +233,7 @@ int main(int argc, char **argv)
     /* Single file with explicit output path (legacy mode) */
     if (match_count == 1 && output_path) {
         osfs2_file_t *f = &ft[matches[0]];
-        fprintf(stderr, "Extracting '%s' (", f->name);
+        fprintf(stderr, "Extracting '%s' (", display_name(f));
         fprint_size(stderr, f->size);
         fprintf(stderr, ")...\n");
 

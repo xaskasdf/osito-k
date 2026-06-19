@@ -36,6 +36,9 @@ extern void  mem_free_pages(void *addr, uint64_t count);
  * the FS-base/TLS diagnostics above its definition (parallel fork/TLS work). */
 static int sched_current_idx;
 extern uint64_t paging_get_kernel_cr3(void);
+extern uint64_t *paging_get_pte(uint64_t virt);
+extern uint64_t *paging_get_pte_in_cr3(uint64_t cr3, uint64_t virt);
+extern int demand_page_fault(uint64_t addr, uint64_t error_code);
 
 /* MSR access for per-thread TLS (X-THREAD) */
 #define MSR_FS_BASE 0xC0000100
@@ -223,6 +226,7 @@ static void runq_enqueue(int idx);
 static void runq_dequeue(int idx);
 static inline void proc_transition(process_t *p, uint32_t new_state);
 static void runq_init(void);
+static void futex_cleanup_process(process_t *p);
 
 /* ── Exec cache: reuse read-only ELF segments across exec() ─── */
 
@@ -507,6 +511,8 @@ static process_t *proc_alloc(const char *name)
 
 static void proc_free(process_t *p)
 {
+    futex_cleanup_process(p);
+
     /* Free memory regions (ELF segments + stack) */
     for (int i = 0; i < p->region_count; i++) {
         if (p->regions[i].base && p->regions[i].pages > 0)
@@ -2412,21 +2418,83 @@ static void futex_init(void)
  *   timeout_ticks = relative deadline in 100Hz ticks; 0 means wait forever.
  * Returns 0 on wake, -EAGAIN (-11) on value mismatch, -ETIMEDOUT (-110) on
  * timeout, -ENOMEM (-12) if the wait table is full. */
+#define FUTEX_EFAULT       14
+#define FUTEX_EINVAL       22
+#define FUTEX_EAGAIN       11
+#define FUTEX_ENOMEM       12
+#define FUTEX_ETIMEDOUT    110
+#define FUTEX_PTE_PRESENT  1ULL
+#define FUTEX_USER_TOP     0x0000800000000000ULL
+
+static int futex_validate_uaddr(uint64_t uaddr)
+{
+    if (uaddr < 0x1000 || (uaddr & 3))
+        return -FUTEX_EINVAL;
+    if (uaddr > FUTEX_USER_TOP - sizeof(uint32_t))
+        return -FUTEX_EFAULT;
+    return 0;
+}
+
+static inline bool futex_slot_valid(int idx)
+{
+    return idx >= 0 && idx < MAX_FUTEX_WAITERS;
+}
+
+static void futex_log_corrupt(const char *where, int idx)
+{
+    static int log_count;
+    if (log_count++ >= 8) return;
+    serial_puts("[FUTEX] corrupt chain at ");
+    serial_puts(where);
+    serial_puts(" idx=");
+    serial_putdec((uint64_t)(uint32_t)idx);
+    serial_puts("\n");
+}
+
+static int futex_prefault_read32(uint64_t uaddr, int *value)
+{
+    int rc = futex_validate_uaddr(uaddr);
+    if (rc < 0)
+        return rc;
+
+    uint64_t cr3 = proc_current_cr3();
+    uint64_t *pte = cr3 ? paging_get_pte_in_cr3(cr3, uaddr)
+                        : paging_get_pte(uaddr);
+    if (!pte || !(*pte & FUTEX_PTE_PRESENT)) {
+        if (demand_page_fault(uaddr, 0) != 0)
+            return -FUTEX_EFAULT;
+        pte = cr3 ? paging_get_pte_in_cr3(cr3, uaddr)
+                  : paging_get_pte(uaddr);
+        if (!pte || !(*pte & FUTEX_PTE_PRESENT))
+            return -FUTEX_EFAULT;
+    }
+
+    *value = *(volatile int *)(uintptr_t)uaddr;
+    return 0;
+}
+
 int futex_do_wait(uint64_t uaddr, int expected, uint64_t space,
                   uint64_t timeout_ticks)
 {
+    int observed = 0;
+    int rc = futex_prefault_read32(uaddr, &observed);
+    if (rc < 0)
+        return rc;
+    if (observed != expected)
+        return -FUTEX_EAGAIN;
+
     volatile int *addr = (volatile int *)uaddr;
     uint64_t flags = futex_lock_irqsave();
 
     if (*addr != expected) {
         futex_unlock_irqrestore(flags);
-        return -11; /* EAGAIN */
+        return -FUTEX_EAGAIN;
     }
 
     /* Allocate from free list */
     if (futex_free_head < 0) {
         futex_unlock_irqrestore(flags);
-        return -12; /* ENOMEM */
+        return -FUTEX_ENOMEM;
     }
     int slot = futex_free_head;
     futex_free_head = futex_waiters[slot].next;
@@ -2462,7 +2530,7 @@ int futex_do_wait(uint64_t uaddr, int expected, uint64_t space,
     }
 
     flags = futex_lock_irqsave();
-    int rc = futex_waiters[slot].timed_out ? -110 /* ETIMEDOUT */ : 0;
+    rc = futex_waiters[slot].timed_out ? -FUTEX_ETIMEDOUT : 0;
 
     /* Woken — remove from the current bucket and return to free list. A
      * FUTEX_REQUEUE may have moved this waiter to another key while it slept,
@@ -2476,9 +2544,16 @@ int futex_do_wait(uint64_t uaddr, int expected, uint64_t space,
     }
     /* Unlink from bucket (may already be unlinked by wake) */
     int16_t *pp = &futex_buckets[cleanup_bucket];
-    while (*pp >= 0) {
-        if (*pp == slot) { *pp = futex_waiters[slot].next; break; }
-        pp = &futex_waiters[*pp].next;
+    int guard = 0;
+    while (*pp >= 0 && guard++ < MAX_FUTEX_WAITERS) {
+        int idx = *pp;
+        if (!futex_slot_valid(idx)) {
+            futex_log_corrupt("wait-cleanup", idx);
+            *pp = -1;
+            break;
+        }
+        if (idx == slot) { *pp = futex_waiters[slot].next; break; }
+        pp = &futex_waiters[idx].next;
     }
     futex_waiters[slot].next = futex_free_head;
     futex_free_head = (int16_t)slot;
@@ -2491,13 +2566,23 @@ int futex_do_wait(uint64_t uaddr, int expected, uint64_t space,
  * Returns number of processes woken. Only scans one hash bucket. */
 int futex_do_wake(uint64_t uaddr, uint64_t space, int count)
 {
+    int rc = futex_validate_uaddr(uaddr);
+    if (rc < 0)
+        return rc;
+
     uint64_t flags = futex_lock_irqsave();
     uint32_t bucket = futex_hash(uaddr, space);
     int woken = 0;
     int16_t *pp = &futex_buckets[bucket];
 
-    while (*pp >= 0 && woken < count) {
+    int guard = 0;
+    while (*pp >= 0 && woken < count && guard++ < MAX_FUTEX_WAITERS) {
         int16_t idx = *pp;
+        if (!futex_slot_valid(idx)) {
+            futex_log_corrupt("wake", idx);
+            *pp = -1;
+            break;
+        }
         futex_waiter_t *w = &futex_waiters[idx];
         if (w->active && w->addr == uaddr && w->space == space) {
             int pidx = w->proc_idx;
@@ -2524,21 +2609,30 @@ int futex_do_wake(uint64_t uaddr, uint64_t space, int count)
             pp = &w->next;
         }
     }
+    if (*pp >= 0 && guard >= MAX_FUTEX_WAITERS) {
+        futex_log_corrupt("wake-loop", *pp);
+        *pp = -1;
+    }
     futex_unlock_irqrestore(flags);
     return woken;
 }
 
-/* futex_requeue — wake up to wake_count waiters on (space, uaddr), then move
- * up to requeue_count remaining waiters to (space2, uaddr2). This is the core
- * primitive used by pthread condition variables to hand waiters from the cond
- * variable futex to the associated mutex futex without losing wakeups. */
-int futex_do_requeue(uint64_t uaddr, uint64_t space, int wake_count,
-                     int requeue_count, uint64_t uaddr2, uint64_t space2)
+static int futex_requeue_locked(uint64_t uaddr, uint64_t space, int wake_count,
+                                int requeue_count, uint64_t uaddr2,
+                                uint64_t space2)
 {
+    int rc = futex_validate_uaddr(uaddr);
+    if (rc < 0)
+        return rc;
+    if (uaddr2) {
+        rc = futex_validate_uaddr(uaddr2);
+        if (rc < 0)
+            return rc;
+    }
+
     if (wake_count < 0) wake_count = 0;
     if (requeue_count < 0) requeue_count = 0;
 
-    uint64_t flags = futex_lock_irqsave();
     uint32_t src_bucket = futex_hash(uaddr, space);
     bool same_key = (uaddr == uaddr2 && space == space2);
     bool can_requeue = (uaddr2 != 0 && !same_key);
@@ -2547,9 +2641,16 @@ int futex_do_requeue(uint64_t uaddr, uint64_t space, int wake_count,
     int16_t moved_head = -1;
     int16_t *pp = &futex_buckets[src_bucket];
 
+    int guard = 0;
     while (*pp >= 0 &&
+           guard++ < MAX_FUTEX_WAITERS &&
            (woken < wake_count || (can_requeue && requeued < requeue_count))) {
         int16_t idx = *pp;
+        if (!futex_slot_valid(idx)) {
+            futex_log_corrupt("requeue", idx);
+            *pp = -1;
+            break;
+        }
         futex_waiter_t *w = &futex_waiters[idx];
 
         if (w->active && w->addr == uaddr && w->space == space) {
@@ -2579,11 +2680,20 @@ int futex_do_requeue(uint64_t uaddr, uint64_t space, int wake_count,
             pp = &w->next;
         }
     }
+    if (*pp >= 0 && guard >= MAX_FUTEX_WAITERS) {
+        futex_log_corrupt("requeue-loop", *pp);
+        *pp = -1;
+    }
 
     if (moved_head >= 0) {
         uint32_t dst_bucket = futex_hash(uaddr2, space2);
-        while (moved_head >= 0) {
+        guard = 0;
+        while (moved_head >= 0 && guard++ < MAX_FUTEX_WAITERS) {
             int16_t idx = moved_head;
+            if (!futex_slot_valid(idx)) {
+                futex_log_corrupt("requeue-moved", idx);
+                break;
+            }
             futex_waiter_t *w = &futex_waiters[idx];
             moved_head = w->next;
 
@@ -2592,10 +2702,60 @@ int futex_do_requeue(uint64_t uaddr, uint64_t space, int wake_count,
             w->next = futex_buckets[dst_bucket];
             futex_buckets[dst_bucket] = idx;
         }
+        if (moved_head >= 0)
+            futex_log_corrupt("requeue-moved-loop", moved_head);
     }
 
-    futex_unlock_irqrestore(flags);
     return woken + requeued;
+}
+
+/* futex_requeue — wake up to wake_count waiters on (space, uaddr), then move
+ * up to requeue_count remaining waiters to (space2, uaddr2). This is the core
+ * primitive used by pthread condition variables to hand waiters from the cond
+ * variable futex to the associated mutex futex without losing wakeups. */
+int futex_do_requeue(uint64_t uaddr, uint64_t space, int wake_count,
+                     int requeue_count, uint64_t uaddr2, uint64_t space2)
+{
+    int rc = futex_validate_uaddr(uaddr);
+    if (rc < 0)
+        return rc;
+    rc = futex_validate_uaddr(uaddr2);
+    if (rc < 0)
+        return rc;
+
+    uint64_t flags = futex_lock_irqsave();
+    int ret = futex_requeue_locked(uaddr, space, wake_count, requeue_count,
+                                   uaddr2, space2);
+    futex_unlock_irqrestore(flags);
+    return ret;
+}
+
+/* FUTEX_CMP_REQUEUE: compare the source futex value and requeue under the
+ * same lock so a condition-variable wake cannot race past the predicate. */
+int futex_do_cmp_requeue(uint64_t uaddr, uint64_t space, int wake_count,
+                         int requeue_count, uint64_t uaddr2,
+                         uint64_t space2, int expected)
+{
+    int observed = 0;
+    int rc = futex_prefault_read32(uaddr, &observed);
+    if (rc < 0)
+        return rc;
+    if (observed != expected)
+        return -FUTEX_EAGAIN;
+    rc = futex_validate_uaddr(uaddr2);
+    if (rc < 0)
+        return rc;
+
+    volatile int *addr = (volatile int *)uaddr;
+    uint64_t flags = futex_lock_irqsave();
+    if (*addr != expected) {
+        futex_unlock_irqrestore(flags);
+        return -FUTEX_EAGAIN;
+    }
+    int ret = futex_requeue_locked(uaddr, space, wake_count, requeue_count,
+                                   uaddr2, space2);
+    futex_unlock_irqrestore(flags);
+    return ret;
 }
 
 /* futex_timeout_sweep — called from sched_tick on the BSP. Wakes any timed
@@ -2622,9 +2782,66 @@ void futex_timeout_sweep(void)
     futex_unlock_irqrestore(flags);
 }
 
+static void futex_cleanup_process(process_t *p)
+{
+    if (!p) return;
+    int pidx = (int)(p - &proctab[0]);
+    if (pidx < 0 || pidx >= MAX_PROCESSES) return;
+
+    uint64_t flags = futex_lock_irqsave();
+    int dropped = 0;
+
+    for (int b = 0; b < FUTEX_HASH_SIZE; b++) {
+        int16_t *pp = &futex_buckets[b];
+        int guard = 0;
+        while (*pp >= 0 && guard++ < MAX_FUTEX_WAITERS) {
+            int idx = *pp;
+            if (!futex_slot_valid(idx)) {
+                futex_log_corrupt("cleanup-proc", idx);
+                *pp = -1;
+                break;
+            }
+
+            futex_waiter_t *w = &futex_waiters[idx];
+            if (w->proc_idx != pidx) {
+                pp = &w->next;
+                continue;
+            }
+
+            *pp = w->next;
+            w->active = false;
+            w->timed_out = false;
+            if (w->deadline) {
+                w->deadline = 0;
+                if (futex_timed_count > 0)
+                    futex_timed_count--;
+            }
+            w->next = futex_free_head;
+            futex_free_head = (int16_t)idx;
+            dropped++;
+        }
+        if (*pp >= 0 && guard >= MAX_FUTEX_WAITERS) {
+            futex_log_corrupt("cleanup-proc-loop", *pp);
+            *pp = -1;
+        }
+    }
+
+    futex_unlock_irqrestore(flags);
+
+    if (dropped) {
+        serial_puts("[FUTEX] dropped ");
+        serial_putdec((uint64_t)dropped);
+        serial_puts(" waiter(s) for pid=");
+        serial_putdec(p->pid);
+        serial_puts("\n");
+    }
+}
+
 /* Thread exit cleanup: clear_child_tid + futex wake (X-THREAD) */
 static void thread_exit_cleanup(process_t *p)
 {
+    futex_cleanup_process(p);
+
     if (p->clear_child_tid) {
         /* Write 0 to the TID address (signals thread death to parent) */
         *(int *)p->clear_child_tid = 0;

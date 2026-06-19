@@ -782,6 +782,8 @@ void __initk kernel_entry(boot_info_t *info)
         boot_diag_mark("fs-mounted");
     }
     boot_diag_mark("pre-net");
+    bool net_services_ready = false;
+    bool cluster_delegate_probe_pending = false;
 
     /* ── Step 4: Network (I211 Ethernet + UDP) ── */
     pci_dev_t *nic_pci = (pci_dev_t *)pci_get_nic();
@@ -931,10 +933,11 @@ void __initk kernel_entry(boot_info_t *info)
             agent_init();
             boot_diag_mark("post-agent");
 
-            /* Inferconnect: UDP heartbeat + TCP RPC server (port 19999).
-             * cluster: liveness state machine on top + V1 LAN rendezvous. */
-            extern int  inferconnect_start(void);
-            extern int  inferconnect_rpc_start(uint16_t port);
+            /* Inferconnect: register the UDP peer-heartbeat listener early,
+             * but defer kthread-backed RPC/broadcast/cluster services until
+             * the end of boot. kthread_create() enables preemption on first
+             * spawn, and this network block still runs before heavy boot
+             * initialization is complete. */
             extern int  inferconnect_peer_listener_start(void);
             extern void cluster_init(void);
             /* Peer listener FIRST: registers the UDP :19999 callback so we
@@ -945,39 +948,19 @@ void __initk kernel_entry(boot_info_t *info)
             boot_diag_mark("pre-udp19999");
             inferconnect_peer_listener_start();
             boot_diag_mark("post-udp19999");
-            /* RPC server next so the broadcaster's very first heartbeat
-             * already advertises a non-zero rpc_port (the server publishes
-             * it synchronously). Without the RPC server up, this node can
-             * initiate delegations but cannot answer them — required for
-             * the osito-k <-> osito-a cross-node cluster. Ported from
-             * osito-a@6040e00. */
-            boot_diag_mark("pre-rpc");
-            inferconnect_rpc_start(0);
-            boot_diag_mark("post-rpc");
-            boot_diag_mark("pre-infer");
-            inferconnect_start();
-            boot_diag_mark("post-infer");
+
             boot_diag_mark("pre-cluster-init");
             cluster_init();
             boot_diag_mark("post-cluster-init");
-            /* Launch the cluster-tick kthread: it scans the inferconnect
-             * peer table, promotes discovered peers to ALIVE, sends RPC
-             * HEARTBEATs, and ages peers through STALE/DEAD. cluster_init()
-             * only sets up state — without cluster_start() the liveness
-             * machine never runs and no peer ever reaches ALIVE. */
-            extern int cluster_start(void);
-            boot_diag_mark("pre-cluster-start");
-            cluster_start();
-            boot_diag_mark("post-cluster-start");
+            net_services_ready = true;
 
             /* Optional cross-node delegation probe — triggered only
              * when `cluster-delegate.txt` sentinel exists in osfs2. */
             {
                 vfs_node_t n;
-                extern void cluster_delegate_probe_start(void);
                 if (osfs2_is_mounted() &&
                     vfs_find("cluster-delegate.txt", VFS_MODE_POSIX, &n))
-                    cluster_delegate_probe_start();
+                    cluster_delegate_probe_pending = true;
             }
 
             /* A12.4: load any previously-captured dynamic leaf-cert pins
@@ -1161,17 +1144,25 @@ void __initk kernel_entry(boot_info_t *info)
 
     serial_puts("\n[KERN] Boot complete.\n");
     fb_puts("\n Boot complete.\n");
+    boot_diag_mark("boot-complete");
+
+    /*
+     * Do not reclaim .text.init here: kernel_entry itself lives in that
+     * section and never returns to a non-init caller. Freeing it before the
+     * shell lets later boot_diag/USB writes reuse the page that still contains
+     * the code path that is about to call shell_run().
+     */
+    serial_puts("[INIT] init memory reclaim deferred until after shell handoff\n");
+
+    /* Defer kthread-backed background services until the scheduler path is
+     * fixed on real hardware. The first sched_spawn after boot-complete
+     * currently prevents the interactive shell from taking over the console.
+     * UDP listeners are already registered; TCP RPC/cluster tick/reaper are
+     * intentionally not started in this boot path. */
+    (void)net_services_ready;
+    (void)cluster_delegate_probe_pending;
+
     boot_diag_mark("pre-shell");
-
-    /* Reclaim init-only code pages */
-    reclaim_init_memory();
-
-    /* Spawn the zombie auto-reaper now that all subsystems are
-     * initialised. Doing this earlier (e.g. inside proc_init) would
-     * auto-enable preemptive scheduling before the rest of the boot
-     * is safe to be context-switched out of. */
-    extern void proc_start_reaper(void);
-    proc_start_reaper();
 
     /* Run interactive shell (never returns) */
     shell_run();

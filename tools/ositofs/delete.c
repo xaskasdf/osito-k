@@ -59,6 +59,23 @@ static int wildcard_match(const char *pattern, const char *name)
     return strcmp(pattern, name) == 0;
 }
 
+static const char *display_name(const osfs2_file_t *f)
+{
+    if (!(f->flags & OSFS2_FLAG_GGUF) &&
+        !(f->flags & OSFS2_FLAG_INLINE) &&
+        f->model_name[0])
+        return f->model_name;
+    return f->name;
+}
+
+static int entry_matches(const osfs2_file_t *f, const char *pattern)
+{
+    if (wildcard_match(pattern, f->name))
+        return 1;
+    const char *alias = display_name(f);
+    return alias != f->name && wildcard_match(pattern, alias);
+}
+
 static void usage(void)
 {
     fprintf(stderr,
@@ -122,7 +139,7 @@ int main(int argc, char **argv)
 
     for (int i = 0; i < OSFS2_MAX_FILES; i++) {
         if (!(ft[i].flags & OSFS2_FLAG_VALID)) continue;
-        if (wildcard_match(pattern, ft[i].name))
+        if (entry_matches(&ft[i], pattern))
             matches[match_count++] = i;
     }
 
@@ -137,7 +154,7 @@ int main(int argc, char **argv)
     printf("Matched %d file%s:\n", match_count, match_count == 1 ? "" : "s");
     for (int m = 0; m < match_count; m++) {
         osfs2_file_t *f = &ft[matches[m]];
-        printf("  %-48s ", f->name);
+        printf("  %-48s ", display_name(f));
         osfs2_print_size(f->size);
         printf("  (blocks %u-%u)\n", f->start_block,
                f->start_block + f->block_count - 1);

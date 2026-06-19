@@ -41,6 +41,8 @@ extern int  proc_exec(const char *filename, int argc, const char **argv);
 
 /* Ticks */
 extern uint64_t idt_get_ticks(void);
+extern void boot_diag_mark(const char *reason) __attribute__((weak));
+extern void boot_diag_flush(const char *reason) __attribute__((weak));
 
 /* OsitoFS */
 extern bool osfs2_is_mounted(void);
@@ -468,6 +470,18 @@ static inline void sh_reboot(void) {
 }
 static inline void sh_halt(void)   { __asm__ volatile ("cli"); for (;;) __asm__ volatile ("hlt"); }
 #endif
+
+static void sh_diag_mark(const char *reason)
+{
+    if (boot_diag_mark)
+        boot_diag_mark(reason);
+}
+
+static void sh_diag_flush(const char *reason)
+{
+    if (boot_diag_flush)
+        boot_diag_flush(reason);
+}
 
 /* ── Shell output helpers ────────────────────────────────────── */
 
@@ -6811,11 +6825,15 @@ q4kgdone:
                           (fn[fl-2]=='i'||fn[fl-2]=='I') &&
                           (fn[fl-1]=='x'||fn[fl-1]=='X'));
             static uint64_t winexec_jmpbuf[9];
+            int winexec_crashed = 0;
+            sh_diag_mark("winexec-start");
             compat32_crash_jmpbuf = winexec_jmpbuf;
             if (kern_setjmp(winexec_jmpbuf) == 0) {
                 if (is_pkg) win32_install(fn);
                 else        win32_exec(fn);
             } else {
+                winexec_crashed = 1;
+                sh_diag_mark("winexec-crash-return");
                 sh_puts("\n [WIN32] Process crashed — returned to shell\n");
                 /* Restore IST1 after longjmp — the compat32 exception path
                  * bypasses int2e_stub's IST1 restore, leaving it corrupted.
@@ -6829,6 +6847,7 @@ q4kgdone:
                 g_compat32_mode = 0;
             }
             compat32_crash_jmpbuf = NULL;
+            sh_diag_mark(winexec_crashed ? "winexec-crash-done" : "winexec-done");
         }
     } else if (strcmp(cmd, "msi") == 0 || strcmp(cmd, "msiexec") == 0 ||
                strcmp(cmd, "msix") == 0) {
@@ -7175,6 +7194,7 @@ void __cold shell_run(void)
 {
     char line[256];
 
+    sh_diag_mark("shell-start");
     sh_puts("\n");
     sh_puts_color("  ____       _ _        _  __\n", 0x00FF8800);
     sh_puts_color(" / __ \\  ___(_) |_ ___ | |/ /\n", 0x00FF8800);
@@ -7202,33 +7222,45 @@ void __cold shell_run(void)
 #else
     sh_puts_color(" [wasm32 | 256MB heap]\n\n", 0x00666666);
 #endif
+    sh_diag_flush("shell-banner");
 
+    sh_diag_mark("shell-autoexec-check");
     /* Auto-launch hello_gl.elf if present (W4.10 runtime test) */
     if (osfs2_is_mounted() && osfs2_find("hello_gl.elf")) {
         sh_puts(" Auto-launching hello_gl.elf...\n");
+        sh_diag_mark("autoexec-hello-start");
         shell_exec("exec hello_gl.elf");
+        sh_diag_mark("autoexec-hello-done");
     }
-    /* Auto-launch UT99 if osfs2 is mounted and UnrealTournament.exe exists */
-    else if (osfs2_is_mounted() && osfs2_find("UnrealTournament.exe")) {
-        sh_puts(" Auto-launching UnrealTournament.exe...\n");
-        shell_exec("winexec UnrealTournament.exe");
-    }
+    /* UT99 assets may be present on the USB, but do not auto-launch them.
+     * Real-HW bringup needs a quiet shell so GTA5 can be started explicitly. */
     /* Panorama: auto-launch DOOM.EXE (DOS4GW embedded) when no UT99 present */
     else if (osfs2_is_mounted() && osfs2_find("DOOM.EXE")) {
         sh_puts(" Auto-launching DOOM.EXE...\n");
+        sh_diag_mark("autoexec-doom-start");
         shell_exec("dosrun DOOM.EXE");
+        sh_diag_mark("autoexec-doom-done");
     }
+    sh_diag_flush("shell-ready");
 
     for (;;) {
+        sh_diag_flush("shell-prompt");
         int len = term_readline("osito> ", line, sizeof(line));
 
         if (len < 0) {
+            sh_diag_mark("shell-eof");
             /* EOF (Ctrl+D) */
             sh_puts("Use 'halt' to stop or 'reboot' to restart.\n");
+            sh_diag_flush("shell-eof-done");
             continue;
         }
 
-        if (len == 0) continue;  /* Empty line or Ctrl+C */
+        if (len == 0) {
+            sh_diag_mark("shell-empty");
+            continue;  /* Empty line or Ctrl+C */
+        }
+
+        sh_diag_mark("shell-input");
 
         /* Heredoc support: detect `<<TERM` (or `<< TERM`) in the line.
          * Read further lines until a line is exactly TERM, then feed
@@ -7278,9 +7310,12 @@ void __cold shell_run(void)
                 sh_stdin_buf = here_buf;
                 sh_stdin_len = hpos;
             }
+            sh_diag_mark("shell-heredoc");
         }
 
+        sh_diag_mark("shell-exec");
         shell_exec_pipeline(line);
+        sh_diag_mark("shell-exec-done");
 
         if (here_buf) {
             kfree(here_buf);

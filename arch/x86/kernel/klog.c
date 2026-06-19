@@ -11,7 +11,7 @@ extern uint64_t idt_get_ticks(void);
 
 /* ── Ring Buffer ─────────────────────────────────────────────── */
 
-#define KLOG_SIZE  (512 * 1024)  /* 512KB ring buffer */
+#define KLOG_SIZE  (2 * 1024 * 1024)  /* 2MB ring buffer */
 
 static char *klog_buf;  /* Lazy alloc (saves ~64KB BSS) */
 static uint32_t klog_head;       /* Write position */

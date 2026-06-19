@@ -81,11 +81,37 @@ static int blkmap_build(const osfs2_file_t *ft, uint32_t total_blocks, uint32_t 
 
 typedef struct {
     const char *local_path;
-    char stored_name[OSFS2_NAME_LEN];
+    char stored_name[OSFS2_MODEL_NAME_LEN];
     uint64_t file_size;
     int is_gguf;
     gguf_model_info_t model_info;
 } write_job_t;
+
+static int copy_stored_name(char dst[OSFS2_MODEL_NAME_LEN],
+                            const char *src, const char *context)
+{
+    size_t len = strlen(src);
+    if (len >= OSFS2_MODEL_NAME_LEN) {
+        fprintf(stderr,
+                "ositofs-write: %s name '%s' is too long (max %u bytes)\n",
+                context, src, OSFS2_MODEL_NAME_LEN - 1);
+        return -1;
+    }
+    memcpy(dst, src, len + 1);
+    return 0;
+}
+
+static int file_name_matches(const osfs2_file_t *f, const char *name)
+{
+    if (strcmp(f->name, name) == 0)
+        return 1;
+    if (!(f->flags & OSFS2_FLAG_GGUF) &&
+        !(f->flags & OSFS2_FLAG_INLINE) &&
+        f->model_name[0] &&
+        strcmp(f->model_name, name) == 0)
+        return 1;
+    return 0;
+}
 
 static void usage(void)
 {
@@ -197,12 +223,17 @@ static int parse_manifest(const char *path, write_job_t *jobs, int *count, int m
             size_t slen = strlen(stored);
             while (slen > 0 && (stored[slen - 1] == ' ' || stored[slen - 1] == '\t'))
                 stored[--slen] = '\0';
-            strncpy(j->stored_name, stored, OSFS2_NAME_LEN - 1);
-            j->stored_name[OSFS2_NAME_LEN - 1] = '\0';
+            if (copy_stored_name(j->stored_name, stored, "stored") < 0) {
+                fclose(fp);
+                return -1;
+            }
         } else {
             char *tmp = strdup(local);
-            strncpy(j->stored_name, basename(tmp), OSFS2_NAME_LEN - 1);
-            j->stored_name[OSFS2_NAME_LEN - 1] = '\0';
+            if (copy_stored_name(j->stored_name, basename(tmp), "stored") < 0) {
+                free(tmp);
+                fclose(fp);
+                return -1;
+            }
             free(tmp);
         }
 
@@ -358,12 +389,17 @@ int main(int argc, char **argv)
         j->file_size = (uint64_t)st.st_size;
 
         if (name_override) {
-            strncpy(j->stored_name, name_override, OSFS2_NAME_LEN - 1);
-            j->stored_name[OSFS2_NAME_LEN - 1] = '\0';
+            if (copy_stored_name(j->stored_name, name_override, "stored") < 0) {
+                free(jobs);
+                return 1;
+            }
         } else {
             char *tmp = strdup(pos_files[i]);
-            strncpy(j->stored_name, basename(tmp), OSFS2_NAME_LEN - 1);
-            j->stored_name[OSFS2_NAME_LEN - 1] = '\0';
+            if (copy_stored_name(j->stored_name, basename(tmp), "stored") < 0) {
+                free(tmp);
+                free(jobs);
+                return 1;
+            }
             free(tmp);
         }
 
@@ -482,7 +518,7 @@ int main(int argc, char **argv)
         int exists = 0;
         for (uint32_t fi = 0; fi < OSFS2_MAX_FILES; fi++) {
             if ((ft[fi].flags & OSFS2_FLAG_VALID) &&
-                strcmp(ft[fi].name, jobs[i].stored_name) == 0) {
+                file_name_matches(&ft[fi], jobs[i].stored_name)) {
                 if (!overwrite) {
                     fprintf(stderr, "ositofs-write: file '%s' already exists (use --overwrite to replace)\n",
                             jobs[i].stored_name);
@@ -528,7 +564,7 @@ int main(int argc, char **argv)
         /* Handle overwrite: delete existing in-memory */
         for (uint32_t fi = 0; fi < OSFS2_MAX_FILES; fi++) {
             if ((ft[fi].flags & OSFS2_FLAG_VALID) &&
-                strcmp(ft[fi].name, job->stored_name) == 0) {
+                file_name_matches(&ft[fi], job->stored_name)) {
                 printf("  Overwriting '%s' (freeing %u blocks)\n",
                        job->stored_name, ft[fi].block_count);
                 uint32_t old_blocks = ft[fi].block_count;
@@ -642,6 +678,13 @@ int main(int argc, char **argv)
         ft[file_idx].layer_index_slot = 0xFFFF;
         ft[file_idx].create_time = (uint32_t)time(NULL);
         ft[file_idx].modify_time = ft[file_idx].create_time;
+
+        /* Long raw filenames are stored as a compatibility alias in the
+         * otherwise-unused model_name field. The fixed name[64] field remains
+         * the hash key for older tools and existing images. */
+        if (!job->is_gguf && strlen(job->stored_name) >= OSFS2_NAME_LEN)
+            strncpy(ft[file_idx].model_name, job->stored_name,
+                    OSFS2_MODEL_NAME_LEN - 1);
 
         /* GGUF metadata */
         if (job->is_gguf) {

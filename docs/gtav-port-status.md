@@ -4,7 +4,7 @@ Port of GTA V SP to OsitoK (bare-metal x86-64 OS). Full source access
 to both RAGE engine and OsitoK kernel. Target: playable SP from Prologue
 to credits.
 
-## Current State (Jun 18 2026)
+## Current State (Jun 19 2026)
 
 **Build**: GTA5.elf 7MB, compiled with x86_64-ositok-gcc 14.2.0 + musl libc.
 1199 RAGE .o files in rage_core.a. Game core files (main.cpp, app.cpp,
@@ -13,9 +13,10 @@ system.cpp, game.cpp, filemgr.cpp) compile and link.
 **Runtime**: FSM reaches RunGame (state 2), game loop ran 1.5M+ ticks with
 CSystem::BeginUpdate/EndUpdate active. Compositor shows GTA5 window via
 virtio-gpu. On macOS, the patched QEMU 11.0.1 SDL/OpenGL core build boots the
-virtio-gpu-gl/VIRGL path to shell with VG3D selftests T2-T9 passing. The 3D
-driver now creates/destroys host contexts and validates host responses; T6/T7
-are local submit/fence guards until a real Venus command encoder is wired.
+virtio-gpu-gl/VIRGL path to shell with VG3D selftests T2-T9 passing. A QEMU
+8GB + `-display sdl,gl=core` run now reaches DXVK swapchain creation, repeated
+successful presents, shader/effect loading, and passes the previous
+`dialoguecharacters.meta` inflate crash point.
 
 **Assets**: 24 RPFs (39GB) loaded from 60GB NVMe image. common.rpf + x64a-x64w
 all RPF7-valid. Real assets rendered (icon.jpg, hires_lrg2.bmp from common.rpf).
@@ -64,6 +65,21 @@ OsitoK Kernel
 
 ## Current Blocker
 
+**Current runtime barrier**: After loading `dialoguecharacters.meta` and
+`hudcolor.dat`, the QEMU run remains alive in a high-rate DXVK/D3D11 present
+loop. There is no `#PF`, `#GP`, futex corruption log, or process crash in the
+serial output. The next investigation target is whether the black frame is
+expected loading-screen behavior, missing assets, or a render/presenter state
+machine issue.
+
+**Hardware futex crash fixed in test**: Real hardware logs from
+`/private/tmp/boot0.log` and `/private/tmp/cr0_00.txt` captured `GTA5.elf`
+crashing in kernel mode at `futex_requeue_locked`. The kernel now cleans stale
+futex waiters when a process/thread exits, validates futex addresses before
+wait/wake/requeue, guards futex bucket chains against corrupt indices, and
+implements six-argument futex dispatch for `FUTEX_CMP_REQUEUE` and
+`FUTEX_WAIT_BITSET`.
+
 **Allocator bring-up**: GTA now reaches RAGE allocator initialization with a
 multi-allocator graph: game heap plus growable buddy allocators for resource
 virtual and physical memory. The previous invalid-cast crash in
@@ -97,14 +113,17 @@ that until the kernel VM change has been validated with non-GTA mmap tests.
 
 ## Next Steps
 
-1. Rebuild kernel and GTA5.elf, then retest `exec GTA5.elf` from QEMU.
-2. Validate partial `mprotect` with `arch/x86/test/mmap_test.c`.
-3. Remove the GTA `sysMemVirtualAllocate(size, bool)` workaround after kernel VM validation.
-4. GPU backend: virtio-gpu-gl 3D → Vulkan ICD → DXVK → RAGE D3D11
-5. Audio backend: HDA driver → RAGE audiosystem bridge
-6. Input: xHCI/evdev → RAGE ioKeyboard/ioMouse
-7. Script VM: compile rage/script/, load .ysc from script.rpf
-8. Loading screens: Scaleform + grcDevice integration
+1. Inspect the present loop after `hudcolor.dat`: capture the QEMU window and
+   correlate it with D3D11/DXVK state.
+2. Resolve missing optional asset probes such as `platformcrc:/data/startup.meta`
+   and `update2:/x64/data/lang/american_rel.rpf` if they block progression.
+3. Validate partial `mprotect` with `arch/x86/test/mmap_test.c`.
+4. Remove the GTA `sysMemVirtualAllocate(size, bool)` workaround after kernel VM validation.
+5. GPU backend: virtio-gpu-gl 3D -> Vulkan ICD -> DXVK -> RAGE D3D11
+6. Audio backend: HDA driver -> RAGE audiosystem bridge
+7. Input: xHCI/evdev -> RAGE ioKeyboard/ioMouse
+8. Script VM: compile rage/script/, load .ysc from script.rpf
+9. Loading screens: Scaleform + grcDevice integration
 
 ## Build Commands
 
@@ -130,7 +149,7 @@ PATH=/private/tmp/qemu-core-src/qemu-11.0.1/build:$PATH \
 ## QEMU Configuration
 
 ```
--m 4G -smp 4 -machine q35,accel=hvf -cpu host
+-m 8G -smp 4 -machine q35,accel=hvf -cpu host
 -device virtio-gpu-gl-pci,hostmem=256M,blob=on -display sdl,gl=core
 -device e1000e -device qemu-xhci -device usb-kbd -device usb-mouse
 -device intel-hda -device nvme
