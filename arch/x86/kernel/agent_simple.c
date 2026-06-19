@@ -36,7 +36,7 @@ typedef struct {
 
 static agent_slot_t g_slots[AGENT_N_SLOTS];
 static volatile uint64_t g_next_task_id = 1;
-static volatile bool g_worker_started = false;
+static volatile uint32_t g_worker_started = 0;
 static volatile bool g_agent_ready = false;
 
 extern llama_state_t *prompt_llama;
@@ -140,9 +140,27 @@ static void agent_worker(void *_)
     }
 }
 
-/* Init-ready gate (osito-a parity). Without this, an RPC-arrived
- * agent task that races boot can land before the worker is alive
- * and the slot's task_id collide with a later submission. */
+static bool agent_start_worker(void)
+{
+    int kt;
+
+    if (__sync_lock_test_and_set(&g_worker_started, 1))
+        return true;
+
+    kt = kthread_create("agent-worker", agent_worker, NULL);
+    if (kt < 0) {
+        __sync_synchronize();
+        g_worker_started = 0;
+        serial_puts("[AGENT] failed to start worker\n");
+        return false;
+    }
+
+    return true;
+}
+
+/* Init-ready gate (osito-a parity). Boot only publishes readiness; the
+ * worker kthread starts lazily on the first accepted remote task so network
+ * listener setup does not enable preemption early. */
 bool agent_is_initialized(void)
 {
     return g_agent_ready;
@@ -150,12 +168,10 @@ bool agent_is_initialized(void)
 
 void agent_init(void)
 {
-    if (g_worker_started) return;
-    g_worker_started = true;
-    kthread_create("agent-worker", agent_worker, NULL);
+    if (g_agent_ready) return;
     __sync_synchronize();
     g_agent_ready = true;
-    serial_puts("[AGENT] init complete (4 slots, single worker, greedy sampler)\n");
+    serial_puts("[AGENT] init complete (4 slots, lazy worker, greedy sampler)\n");
 }
 
 /* ── Public API ──────────────────────────────────────────────── */
@@ -168,6 +184,7 @@ int64_t agent_submit_slot(uint32_t slot, const char *prompt,
     /* Refuse before init complete — osito-a's `-5` convention. The
      * caller (ic_handle_agent_task) falls through to its echo path. */
     if (!g_agent_ready) return -5;
+    if (!agent_start_worker()) return -5;
 
     agent_slot_t *sl = &g_slots[slot];
     if (sl->pending) return -1;  /* slot busy */
