@@ -44,10 +44,9 @@ EMFLAGS := \
     -s WASM=1 \
     -s ALLOW_MEMORY_GROWTH=1 \
     -s INITIAL_MEMORY=536870912 \
-    -s STACK_SIZE=1048576 \
+    -s TOTAL_STACK=1048576 \
     -s MAIN_MODULE=1 \
     -s EMULATE_FUNCTION_POINTER_CASTS=1 \
-    -Wl,--allow-multiple-definition \
     -s ASYNCIFY=1 \
     -s 'ASYNCIFY_IMPORTS=["emscripten_sleep"]' \
     -s 'EXPORTED_FUNCTIONS=["_main","_wasm_kb_push","_wasm_get_mem_used_kb","_wasm_compositor_frame","_input_set_mouse_abs","_input_post_mouse_button","_osito_chat_sync","_wasm_status_fs_label","_wasm_status_fs_files","_wasm_status_fs_free_mb"]' \
@@ -89,7 +88,6 @@ X86_SRCS := \
     ../x86/kernel/sysctl.c \
     ../x86/kernel/sysv_ipc.c \
     ../x86/kernel/vt.c \
-    ../x86/kernel/blkdev.c \
     ../x86/kernel/dm.c \
     ../x86/kernel/sysfs.c \
     ../x86/kernel/kobject.c \
@@ -119,14 +117,6 @@ X86_SRCS := \
     ../x86/kernel/socket.c \
     ../x86/kernel/rcu.c \
     ../x86/kernel/zlib.c \
-    ../x86/kernel/git.c \
-    ../x86/kernel/tls.c \
-    ../x86/kernel/tls13.c \
-    ../x86/kernel/wayland.c \
-    ../x86/kernel/fuse.c \
-    ../x86/kernel/evdev.c \
-    ../x86/kernel/pty.c \
-    ../x86/kernel/sshd.c \
     ../x86/kernel/initramfs.c \
     ../x86/fs/gguf.c \
     ../x86/fs/gpt.c \

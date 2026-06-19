@@ -62,7 +62,8 @@ C_SRCS   := kernel/main.c kernel/serial.c kernel/gic.c kernel/timer.c \
             $(wildcard $(PLAT_DIR)/*.c)
 GUI_SRCS := ../../gui/gui_draw.c ../../gui/gui_text.c \
             ../../gui/gui_panel.c ../../gui/gui_dock.c \
-            ../../gui/gui_desktop.c ../../gui/gui_window.c
+            ../../gui/gui_desktop.c ../../gui/gui_window.c \
+            ../../gui/gui_anim.c
 
 # Objects
 ASM_OBJS := $(patsubst %.S,$(BUILD)/%.o,$(ASM_SRCS))

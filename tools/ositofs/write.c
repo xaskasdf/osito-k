@@ -677,7 +677,7 @@ int main(int argc, char **argv)
          * top, which must not lower the hint). */
         if (file_idx >= sb.file_count)
             sb.file_count = file_idx + 1;
-        if (start_block + blocks_needed > sb.next_data_block)
+        if (blocks_needed > 0 && start_block + blocks_needed > sb.next_data_block)
             sb.next_data_block = start_block + blocks_needed;
 
         if (blocks_needed > 0) {

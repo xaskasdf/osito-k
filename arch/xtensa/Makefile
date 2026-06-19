@@ -189,7 +189,7 @@ flash: $(BIN)
 
 # Serial console
 monitor:
-	$(PYTHON) tools/console.py $(PORT)
+	$(PYTHON) scripts/console.py $(PORT)
 
 # Disassembly dump
 dump: $(ELF)

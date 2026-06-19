@@ -407,6 +407,8 @@ void dl_init(void) {}
 /* ── Win32 compat ────────────────────────────────────────────── */
 
 void win32_init(void) {}
+int  win32_install(const char *filename) { (void)filename; return -1; }
+int  installer_uninstall(const char *pkg) { (void)pkg; return -1; }
 
 /* ── PCI ─────────────────────────────────────────────────────── */
 
@@ -4135,6 +4137,8 @@ int disk_read_bytes(uint64_t byte_offset, void *buf, uint64_t len)
 { return nvme_read_bytes(byte_offset, buf, len); }
 int disk_write_bytes(uint64_t byte_offset, const void *buf, uint64_t len)
 { return nvme_write_bytes(byte_offset, buf, len); }
+int disk_flush(void) { wasm_persist_flush(); return 0; }
+uint32_t disk_lba_size(void) { return 512; }
 
 /* ── Network ─────────────────────────────────────────────────── */
 
@@ -4143,6 +4147,7 @@ bool i211_link_up(void)       { return false; }
 
 void net_init(const uint8_t ip[4]) { (void)ip; }
 void net_poll(void) {}
+volatile uint32_t g_tx_post_rx_delay_us = 0;
 int net_udp_send(const uint8_t dst_ip[4], uint16_t dst_port, uint16_t src_port,
                  const void *data, uint32_t len)
 {
@@ -4213,22 +4218,16 @@ int  sched_spawn(const char *name, void (*entry)(void))
     }
     return 0;
 }
-int  sched_yield(void) { emscripten_sleep(0); return 0; }
 uint64_t sched_get_switches(void) { return 0; }
 bool sched_is_enabled(void)       { return false; }
 
-/* ── GPT ─────────────────────────────────────────────────────── */
-
-int gpt_find_ositofs(uint64_t *part_offset, uint64_t *part_size)
-{
-    (void)part_offset; (void)part_size; return -1;
-}
-
-/* ── Crypto ─────────────────────────────────────────────────── */
-
-int crypto_selftest(void) { return 0; }
-
 /* tensor_benchmark is defined in arch/x86/kernel/tensor.c */
+int rag_retrieve(const char *corpus, const char *query, char *result, int result_max)
+{
+    (void)corpus; (void)query;
+    if (result && result_max > 0) result[0] = '\0';
+    return -1;
+}
 
 /* ── Git stubs ───────────────────────────────────────────────── */
 
@@ -5253,6 +5252,17 @@ int  coredump_write(const char *path, void *regs) { (void)path; (void)regs; retu
 void crash_report_init(void) {}
 void crash_report_save(const char *reason) { (void)reason; }
 void crash_report_show(void) {}
+void boot_diag_format_crash_name(char *out, int slot, uint32_t idx, const char *ext)
+{
+    strcpy(out, "diag/cr0_00.");
+    out[7] = (char)('0' + (slot & 3));
+    out[9] = (char)('0' + ((idx / 10) % 10));
+    out[10] = (char)('0' + (idx % 10));
+    out[12] = ext[0];
+    out[13] = ext[1];
+    out[14] = ext[2];
+    out[15] = '\0';
+}
 void audio_sched_init(void) {}
 void audio_sched_submit(void *frame, uint32_t bytes, uint64_t deadline)
 { (void)frame; (void)bytes; (void)deadline; }
@@ -5865,12 +5875,6 @@ void perf_phase_end(int p) { (void)p; }
 void perf_phase_dump(void) {}
 bool perf_enabled = false;
 
-void rcu_init(void) {}
-void rcu_read_lock(void) {}
-void rcu_read_unlock(void) {}
-void synchronize_rcu(void) {}
-void call_rcu(void *head, void (*func)(void *)) { (void)head; if (func) func(NULL); }
-
 void panic(const char *msg) {
     extern void serial_puts(const char *);
     serial_puts("\n[PANIC] ");
@@ -5974,14 +5978,6 @@ int  nvme_read_async(uint64_t lba, uint32_t count, uint64_t phys_addr)
 { (void)lba; (void)count; (void)phys_addr; return -1; }
 int  nvme_wait_cq(uint16_t cid)        { (void)cid; return 0; }
 uint32_t nvme_get_lba_size(void)        { return 512; }
-
-/* ── FAT32 (browser MEMFS handles real files) ─────────────────── */
-bool fat32_is_mounted(void) { return false; }
-int  fat32_find(const char *name, uint32_t *cluster_out, uint32_t *size_out)
-{ (void)name; (void)cluster_out; (void)size_out; return -1; }
-int  fat32_ls(const char *path) { (void)path; return -1; }
-int  fat32_read_file(const char *name, uint64_t offset, void *buf, uint64_t len)
-{ (void)name; (void)offset; (void)buf; (void)len; return -1; }
 
 /* ── OsitoFS v3 (only v2 is mounted in wasm MVP) ──────────────── */
 bool osfs3_is_mounted(void)             { return false; }

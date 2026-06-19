@@ -1,6 +1,7 @@
 # Repo origin is macOS (LF). Windows editors/tools were introducing CRLF into
 # some committed source files, producing 1000s-of-lines whitespace diffs.
 # Force LF for text source so working trees stay consistent across platforms.
+.gitattributes text eol=lf
 *.c        text eol=lf
 *.h        text eol=lf
 *.cpp      text eol=lf
@@ -8,6 +9,8 @@
 *.S        text eol=lf
 *.s        text eol=lf
 *.md       text eol=lf
+*.yml      text eol=lf
+*.yaml     text eol=lf
 *.sh       text eol=lf
 *.py       text eol=lf
 *.ld       text eol=lf
