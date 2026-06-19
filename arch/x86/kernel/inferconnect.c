@@ -44,6 +44,7 @@ static volatile int ic_running = 0;    /* set by start, cleared by stop */
 static uint16_t ic_rpc_port = 0;       /* 0 until ggml-rpc lands */
 static uint64_t ic_packets_sent = 0;
 static uint64_t ic_last_send_tick = 0;
+static bool     ic_first_send_reported = false;
 
 /* Append decimal to dst at *pos, capped at cap. Returns chars written. */
 static int ic_append_dec(char *dst, int *pos, int cap, uint64_t v)
@@ -97,8 +98,10 @@ static void ic_thread(void *data)
              * Harmless on real LANs (peers dedupe by IP). */
             extern int net_udp_send_broadcast_self(uint16_t, uint16_t,
                                                     const void *, uint32_t);
-            (void)net_udp_send_broadcast_self(IC_PORT, IC_PORT,
-                                              msg, (uint32_t)len);
+            if (rc == 0) {
+                (void)net_udp_send_broadcast_self(IC_PORT, IC_PORT,
+                                                  msg, (uint32_t)len);
+            }
             if (rc == 0) ic_packets_sent++;
             /* After a few heartbeats, give peers time to land in our
              * table and then probe each one over TCP/RPC. One-shot:
@@ -137,9 +140,10 @@ static void ic_thread(void *data)
              * the multicast frame; subsequent sends would flood the
              * log. After that, `agent inferconnect status` reports
              * the running counter. */
-            if (ic_packets_sent + (rc != 0 ? 1 : 0) == 1) {
+            if (!ic_first_send_reported) {
                 serial_puts(rc == 0 ? "[IC] first heartbeat sent OK\n"
                                     : "[IC] first heartbeat send failed\n");
+                ic_first_send_reported = true;
             }
             ic_last_send_tick = now;
         }

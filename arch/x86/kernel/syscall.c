@@ -2663,25 +2663,50 @@ static int64_t sys_pwrite64(uint64_t fd, uint64_t buf, uint64_t count, uint64_t 
     return ret;
 }
 
-/* futex — minimal WAIT/WAKE */
+/* futex — Linux-compatible subset used by musl pthreads */
 #define FUTEX_WAIT 0
 #define FUTEX_WAKE 1
+#define FUTEX_REQUEUE 3
+#define FUTEX_CMP_REQUEUE 4
+#define FUTEX_WAKE_OP 5
+#define FUTEX_WAIT_BITSET 9
 #define FUTEX_PRIVATE_FLAG 128
+#define FUTEX_CLOCK_REALTIME 256
 
 /* Futex — real wait queue implementation (X-THREAD) */
 extern int futex_do_wait(uint64_t uaddr, int expected, uint64_t space,
                          uint64_t timeout_ticks);
 extern int futex_do_wake(uint64_t uaddr, uint64_t space, int count);
+extern int futex_do_requeue(uint64_t uaddr, uint64_t space, int wake_count,
+                            int requeue_count, uint64_t uaddr2,
+                            uint64_t space2);
 extern uint64_t proc_current_cr3(void);
 
 /* userspace struct timespec */
 typedef struct { int64_t tv_sec; int64_t tv_nsec; } futex_timespec_t;
 
+static bool futex_unsupported_logged;
+
+static void futex_log_unsupported(const char *what, uint64_t op)
+{
+    if (futex_unsupported_logged) return;
+    futex_unsupported_logged = true;
+    serial_puts("[FUTEX] unsupported ");
+    serial_puts(what);
+    serial_puts(" op=");
+    serial_puthex(op, 4);
+    serial_puts("\n");
+}
+
 static int64_t sys_futex(uint64_t uaddr, uint64_t op, uint64_t val,
                           uint64_t timeout, uint64_t uaddr2)
 {
-    (void)uaddr2;
-    int cmd = (int)(op & ~FUTEX_PRIVATE_FLAG);
+    int cmd = (int)(op & ~(FUTEX_PRIVATE_FLAG | FUTEX_CLOCK_REALTIME));
+
+    if (op & FUTEX_CLOCK_REALTIME) {
+        futex_log_unsupported("realtime", op);
+        return -ENOSYS;
+    }
 
     /* PRIVATE futexes are scoped to the calling address space (its CR3 —
      * threads share it). SHARED (no PRIVATE flag) futexes are cross-process,
@@ -2706,8 +2731,22 @@ static int64_t sys_futex(uint64_t uaddr, uint64_t op, uint64_t val,
     if (cmd == FUTEX_WAKE) {
         return (int64_t)futex_do_wake(uaddr, space, (int)val);
     }
-    /* FUTEX_REQUEUE, FUTEX_WAKE_OP, FUTEX_WAIT_BITSET, etc. — stub for now */
-    return 0;
+    if (cmd == FUTEX_REQUEUE) {
+        if (!uaddr2) return -EINVAL;
+        return (int64_t)futex_do_requeue(uaddr, space, (int)val,
+                                         (int)timeout, uaddr2, space);
+    }
+    /* CMP_REQUEUE needs the sixth syscall argument (val3), which the current
+     * dispatcher does not pass through yet. Return ENOSYS so libc can fall
+     * back instead of treating an unimplemented operation as success. */
+    if (cmd == FUTEX_CMP_REQUEUE || cmd == FUTEX_WAKE_OP ||
+        cmd == FUTEX_WAIT_BITSET) {
+        futex_log_unsupported("cmd", op);
+        return -ENOSYS;
+    }
+
+    futex_log_unsupported("cmd", op);
+    return -ENOSYS;
 }
 
 /* set_robust_list — stub for thread-safety (musl calls at startup) */

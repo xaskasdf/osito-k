@@ -34,34 +34,23 @@ extern uint64_t *paging_get_pte(uint64_t virt);
 #define PTE_GLOBAL   (1ULL << 8)
 #define PTE_NX       (1ULL << 63)
 
-/* NULL page write-through: page 0 is read-only+NX. When compat32 code
- * writes to NULL (e.g., FString copies), we temporarily make it writable,
- * set TF (single-step), let the write execute, then in #DB re-protect
- * and re-zero the page. This prevents corruption that turns NULL reads
- * from 0 into garbage values like 1. */
+/* NULL page policy: page 0 is read-only+NX. Native ELF user code must fault
+ * normally on NULL writes so the crash reporter sees the real bug. Compat32 PE
+ * faults are routed to SEH. Only kernel/bootstrap code may temporarily enable
+ * write-through, then #DB restores the guard flags. */
 volatile int g_null_page_dirty = 0;
 uint32_t g_base_seh_frame_addr = 0;  /* winexec base SEH frame on PE32 stack */
 
-/* Win32/PE compat32 helper: re-zero and re-protect the NULL page.
+/* NULL-page cleanup after the narrow kernel/bootstrap write-through path.
  *
- * Currently a NO-OP. The original implementation did
- *   memset((void *)0, 0, 4096); paging_set_flags(0, RO|NX); invlpg(0);
- * which crashed zsh during demand-paged ELF startup with #DF (the write
- * to address 0 faulted even though the PTE was marked writable, possibly
- * due to TLB / SMP coherence or stale large-page mapping at vaddr 0).
- *
- * This helper is only meaningful for the Win32/PE compat32 layer, where
- * NULL pointer derefs are tolerated by temporarily marking page 0
- * writable in the #PF handler. For non-PE workloads (zsh, GTA5, anything
- * ELF-loaded), the post-write cleanup is unnecessary — those programs
- * shouldn't be writing to NULL in the first place, and if they do it's a
- * SIGSEGV.
- *
- * TODO: re-introduce the cleanup gated on a "compat32 active" flag set
- * by winexec_main. Until then we just clear the dirty flag so subsequent
- * timer ticks don't loop. */
+ * Do not memset VA 0 here. That crashed demand-paged ELF startup in the past
+ * by faulting recursively from the exception handler. The important invariant
+ * is to restore page 0 to read-only+NX so later NULL writes fault instead of
+ * silently corrupting the guard page. */
 static void null_page_clean(void)
 {
+    paging_set_flags(0, PTE_PRESENT | PTE_GLOBAL | PTE_NX);
+    __asm__ volatile ("invlpg (%0)" :: "r"((uint64_t)0) : "memory");
     g_null_page_dirty = 0;
 }
 
@@ -1108,12 +1097,9 @@ void isr_handler(interrupt_frame_t *frame)
         }
 #endif
 
-        /* Re-zero NULL page for compat32: compat32 can't use TF single-step
-         * (#DB from compat mode causes #GP without IST), so page 0 stays
-         * writable after a compat32 write. Re-zero + re-protect here so that
-         * future NULL pointer derefs read 0 (vtable=0) instead of stale data.
-         * Without this, a NULL object pointer reads garbage from page 0 as a
-         * vtable and jumps to BIOS IVT addresses → #UD. */
+        /* Restore NULL-page guard flags after any narrow write-through path.
+         * null_page_clean() no longer writes through VA 0; it only clears
+         * writable and NX-protects the guard page. */
         if (g_null_page_dirty) null_page_clean();
 
         /* Always-on profiling: record RIP at each timer tick (~3 cycles) */
@@ -1262,10 +1248,12 @@ void isr_handler(interrupt_frame_t *frame)
         uint64_t cr2;
         __asm__ volatile ("mov %%cr2, %0" : "=r"(cr2));
 
-        /* WRITE fault on page 0: allow it via TF single-step.
-         * For compat32 (CS=0x40): skip TF — #DB delivery from compat mode
-         * causes #GP(0x0A) because the 64-bit exception frame can't be
-         * pushed on the 32-bit stack without IST. Just leave page writable. */
+        /* WRITE fault on page 0.
+         *
+         * Native ELF user code (CS=0x28) must see a real SIGSEGV/crash
+         * report. Only kernel/bootstrap selectors keep the historical
+         * write-through path for early page-table setup. Compat32 PE code
+         * falls through to the SEH dispatch below. */
         if (cr2 < 0x1000 && (frame->error_code & 2) && !(frame->error_code & 16)) {
             /* Null-pointer writes from PE32 code (CS=0x40).
              * Route through the normal SEH dispatch at the end of this
@@ -1275,10 +1263,12 @@ void isr_handler(interrupt_frame_t *frame)
              * (e.g. SoftDrv+0x361D4 writing to NULL+0x198 during post-init
              * rendering), turning them into cascading kernel RIP=0 crashes.
              *
-             * Non-compat32 code (kernel init) still gets write-through —
-             * boot-time page-table setup touches low addresses legitimately. */
+             * Kernel/bootstrap code still gets write-through — boot-time
+             * page-table setup touches low addresses legitimately. */
             int is_compat32 = ((frame->cs & 0xFFFF) == 0x40);
-            if (!is_compat32) {
+            uint16_t cs16 = (uint16_t)(frame->cs & 0xFFFF);
+            int is_kernel_context = (cs16 == 0x38 || cs16 == 0x08);
+            if (!is_compat32 && is_kernel_context) {
                 static int nw_count = 0;
                 nw_count++;
                 int is_heap = (frame->cs & 0xFFFF) == 0x40 &&
@@ -1411,8 +1401,7 @@ void isr_handler(interrupt_frame_t *frame)
                     return;  /* resume at the correct function */
                 }
 
-            /* Normal null-page write-through
-             * (non-compat32 code — kernel init / boot path) */
+            /* Normal null-page write-through for kernel init / boot path. */
             paging_set_flags(0, PTE_PRESENT | PTE_WRITABLE | PTE_GLOBAL | PTE_NX);
             __asm__ volatile ("invlpg (%0)" :: "r"((uint64_t)0) : "memory");
             frame->rflags |= (1ULL << 8);  /* TF bit — re-protect in #DB */
@@ -2231,14 +2220,17 @@ compat32_null_recovery:
                                   proc_current_name(), (uint32_t)pid);
             }
 
-            serial_puts("  Killing process PID ");
+            serial_puts("  Killing process group for PID ");
             serial_putdec(pid);
             serial_puts(" with signal ");
             serial_putdec((uint64_t)sig);
             serial_puts("\n");
             fb_puts_color(" Process killed\n", 0x00FF0000);
-            proc_exception_kill(128 + sig);
-            /* proc_exception_kill never returns */
+            {
+                extern void proc_exit_group(int32_t code);
+                proc_exit_group(128 + sig);
+            }
+            /* proc_exit_group never returns */
         }
 
         /* DOS-native fallback: if a DOS native session is active

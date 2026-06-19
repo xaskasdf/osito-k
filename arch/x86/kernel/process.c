@@ -2464,14 +2464,18 @@ int futex_do_wait(uint64_t uaddr, int expected, uint64_t space,
     flags = futex_lock_irqsave();
     int rc = futex_waiters[slot].timed_out ? -110 /* ETIMEDOUT */ : 0;
 
-    /* Woken — remove from bucket and return to free list */
+    /* Woken — remove from the current bucket and return to free list. A
+     * FUTEX_REQUEUE may have moved this waiter to another key while it slept,
+     * so use the slot's live address/space instead of the original wait key. */
+    uint32_t cleanup_bucket =
+        futex_hash(futex_waiters[slot].addr, futex_waiters[slot].space);
     futex_waiters[slot].active = false;
     if (futex_waiters[slot].deadline) {
         futex_waiters[slot].deadline = 0;
         if (futex_timed_count > 0) futex_timed_count--;
     }
     /* Unlink from bucket (may already be unlinked by wake) */
-    int16_t *pp = &futex_buckets[bucket];
+    int16_t *pp = &futex_buckets[cleanup_bucket];
     while (*pp >= 0) {
         if (*pp == slot) { *pp = futex_waiters[slot].next; break; }
         pp = &futex_waiters[*pp].next;
@@ -2522,6 +2526,76 @@ int futex_do_wake(uint64_t uaddr, uint64_t space, int count)
     }
     futex_unlock_irqrestore(flags);
     return woken;
+}
+
+/* futex_requeue — wake up to wake_count waiters on (space, uaddr), then move
+ * up to requeue_count remaining waiters to (space2, uaddr2). This is the core
+ * primitive used by pthread condition variables to hand waiters from the cond
+ * variable futex to the associated mutex futex without losing wakeups. */
+int futex_do_requeue(uint64_t uaddr, uint64_t space, int wake_count,
+                     int requeue_count, uint64_t uaddr2, uint64_t space2)
+{
+    if (wake_count < 0) wake_count = 0;
+    if (requeue_count < 0) requeue_count = 0;
+
+    uint64_t flags = futex_lock_irqsave();
+    uint32_t src_bucket = futex_hash(uaddr, space);
+    bool same_key = (uaddr == uaddr2 && space == space2);
+    bool can_requeue = (uaddr2 != 0 && !same_key);
+    int woken = 0;
+    int requeued = 0;
+    int16_t moved_head = -1;
+    int16_t *pp = &futex_buckets[src_bucket];
+
+    while (*pp >= 0 &&
+           (woken < wake_count || (can_requeue && requeued < requeue_count))) {
+        int16_t idx = *pp;
+        futex_waiter_t *w = &futex_waiters[idx];
+
+        if (w->active && w->addr == uaddr && w->space == space) {
+            if (woken < wake_count) {
+                int pidx = w->proc_idx;
+                if (pidx >= 0 && pidx < MAX_PROCESSES &&
+                    proctab[pidx].state == PROC_BLOCKED) {
+                    proc_transition(&proctab[pidx], PROC_READY);
+                    woken++;
+                }
+                w->active = false;
+                if (w->deadline) {
+                    w->deadline = 0;
+                    if (futex_timed_count > 0) futex_timed_count--;
+                }
+                *pp = w->next;
+                w->next = -1;
+            } else if (can_requeue && requeued < requeue_count) {
+                *pp = w->next;
+                w->next = moved_head;
+                moved_head = idx;
+                requeued++;
+            } else {
+                pp = &w->next;
+            }
+        } else {
+            pp = &w->next;
+        }
+    }
+
+    if (moved_head >= 0) {
+        uint32_t dst_bucket = futex_hash(uaddr2, space2);
+        while (moved_head >= 0) {
+            int16_t idx = moved_head;
+            futex_waiter_t *w = &futex_waiters[idx];
+            moved_head = w->next;
+
+            w->addr = uaddr2;
+            w->space = space2;
+            w->next = futex_buckets[dst_bucket];
+            futex_buckets[dst_bucket] = idx;
+        }
+    }
+
+    futex_unlock_irqrestore(flags);
+    return woken + requeued;
 }
 
 /* futex_timeout_sweep — called from sched_tick on the BSP. Wakes any timed

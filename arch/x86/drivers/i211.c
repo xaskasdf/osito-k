@@ -40,11 +40,15 @@ typedef struct {
     uint8_t        *tx_bufs;       /* TX_RING_SIZE * PKT_BUF_SIZE (virt view) */
     uint64_t        tx_bufs_phys;  /* Physical base — handed to the controller */
     uint32_t        tx_tail;       /* Next descriptor to use */
+    uint32_t        tx_timeout_count;
+    bool            tx_disabled;   /* Repeated HW timeouts: fail fast */
 
     bool initialized;
 } i211_state_t;
 
 static i211_state_t nic;
+
+#define I211_TX_TIMEOUT_DISABLE_THRESHOLD 3
 
 /* Forward decls for IRQ counters used by TX kick diag.                     */
 extern volatile uint32_t i211_isr_count;
@@ -60,6 +64,25 @@ static uint32_t i211_read(uint32_t reg)
 static void i211_write(uint32_t reg, uint32_t val)
 {
     mmio_write32((volatile void *)((uint64_t)nic.bar0 + reg), val);
+}
+
+static void i211_note_tx_success(void)
+{
+    nic.tx_timeout_count = 0;
+}
+
+static void i211_note_tx_timeout(const char *path)
+{
+    if (nic.tx_timeout_count < 0xFFFFFFFFu)
+        nic.tx_timeout_count++;
+
+    if (!nic.tx_disabled &&
+        nic.tx_timeout_count >= I211_TX_TIMEOUT_DISABLE_THRESHOLD) {
+        nic.tx_disabled = true;
+        serial_puts("[I211] TX disabled after repeated timeouts (");
+        serial_puts(path);
+        serial_puts("); future sends fail fast\n");
+    }
 }
 
 /* ── Spin delay (~1ms at typical clock speeds) ───────────────── */
@@ -413,7 +436,8 @@ void i211_get_mac(uint8_t mac[6])
  */
 int i211_send_sg(const uint64_t frag_phys[], const uint32_t lens[], int n_frags)
 {
-    if (!nic.initialized || n_frags <= 0 || n_frags > 4) return -1;
+    if (!nic.initialized || nic.tx_disabled || n_frags <= 0 || n_frags > 4)
+        return -1;
     uint32_t total = 0;
     for (int i = 0; i < n_frags; i++) total += lens[i];
     if (total == 0 || total > I211_PKT_BUF_SIZE) return -1;
@@ -473,17 +497,21 @@ int i211_send_sg(const uint64_t frag_phys[], const uint32_t lens[], int n_frags)
     {
         volatile uint32_t *dd = &last->olinfo_status;
         for (int i = 0; i < 1000000; i++) {
-            if (*dd & I211_TXD_STAT_DD) return 0;
+            if (*dd & I211_TXD_STAT_DD) {
+                i211_note_tx_success();
+                return 0;
+            }
             __asm__ volatile ("pause");
         }
     }
     serial_puts("[I211] SG TX timeout\n");
+    i211_note_tx_timeout("send_sg");
     return -1;
 }
 
 int i211_send(const void *data, uint32_t len)
 {
-    if (!nic.initialized || len == 0 || len > I211_PKT_BUF_SIZE)
+    if (!nic.initialized || nic.tx_disabled || len == 0 || len > I211_PKT_BUF_SIZE)
         return -1;
 
     uint32_t tail = nic.tx_tail;
@@ -607,6 +635,7 @@ int i211_send(const void *data, uint32_t len)
                 serial_puthex(*dd, 8);
                 serial_puts("\n");
             }
+            i211_note_tx_success();
             return 0;
         }
         spins++;
@@ -631,6 +660,7 @@ int i211_send(const void *data, uint32_t len)
     serial_puts(" olinfo=");   serial_puthex(*dd, 8);
     serial_puts(" addr=");     serial_puthex(desc->addr, 16);
     serial_puts("\n");
+    i211_note_tx_timeout("send");
     return -1;
 }
 
