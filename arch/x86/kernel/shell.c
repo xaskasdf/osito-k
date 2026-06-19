@@ -575,6 +575,7 @@ static void cmd_help(void)
     sh_puts("  ntpsync   Run NTP time sync (time.google.com fallback pool.ntp.org)\n");
     sh_puts("  txdelay   Pace reply-path TX by N µs after last RX (debug)\n");
     sh_puts("            txdelay [N]  — get/set, see net.c hypothesis-A comment\n");
+    sh_puts("  diagclean Remove boot logs and crash dumps from OsitoFS\n");
     sh_puts("  kupdate   Pull + kexec a kernel update via HTTPS\n");
     sh_puts("            (kupdate [host] [path] [--channel <ch>] [--no-kexec])\n");
     sh_puts("            default: https://wasm.naranjositos.tech/k/x86_64/stable/kernel.elf\n");
@@ -1346,7 +1347,7 @@ static void cmd_kupload(int argc, char *argv[])
 
     if (from_klog) {
         extern uint32_t klog_read(char *buf, uint32_t max_len);
-        const uint32_t klog_max = 256 * 1024;
+        const uint32_t klog_max = 512 * 1024;
         src_buf = (uint8_t *)kmalloc(klog_max);
         if (!src_buf) { sh_puts("kupload: out of memory\n"); return; }
         src_size = klog_read((char *)src_buf, klog_max);
@@ -3930,15 +3931,56 @@ void shell_exec(char *line)
          * kernel printed — useful when boot output scrolls off-screen
          * on bare-metal. */
         extern uint32_t klog_read(char *buf, uint32_t max_len);
-        char *buf = (char *)kmalloc(64 * 1024);
+        const uint32_t dmesg_max = 512 * 1024;
+        char *buf = (char *)kmalloc(dmesg_max);
         if (!buf) { sh_puts("dmesg: out of memory\n"); }
         else {
-            uint32_t n = klog_read(buf, 64 * 1024);
+            uint32_t n = klog_read(buf, dmesg_max);
             for (uint32_t i = 0; i < n; i++) {
                 char s[2] = { buf[i], 0 };
                 sh_puts(s);
             }
             kfree(buf);
+        }
+    } else if (strcmp(cmd, "diagclean") == 0) {
+        if (!osfs2_is_mounted()) {
+            sh_puts("diagclean: no filesystem mounted\n");
+        } else {
+            extern int osfs2_delete(const char *name);
+            extern void boot_diag_format_crash_name(char *out, int slot,
+                                                    uint32_t idx,
+                                                    const char *ext);
+            int removed = 0;
+            char name[32];
+
+            for (int slot = 0; slot < 4; slot++) {
+                strcpy(name, "diag/boot0.log");
+                name[9] = (char)('0' + slot);
+                if (osfs2_delete(name) == 0) removed++;
+            }
+            if (osfs2_delete("diag/latest.txt") == 0) removed++;
+            if (osfs2_delete("diag/boot.idx") == 0) removed++;
+
+            for (int slot = 0; slot < 4; slot++) {
+                for (uint32_t i = 0; i < 16; i++) {
+                    boot_diag_format_crash_name(name, slot, i, "bin");
+                    if (osfs2_delete(name) == 0) removed++;
+                    boot_diag_format_crash_name(name, slot, i, "txt");
+                    if (osfs2_delete(name) == 0) removed++;
+                }
+            }
+
+            strcpy(name, "crash_000.bin");
+            for (int i = 0; i <= 999; i++) {
+                name[6] = (char)('0' + (i / 100) % 10);
+                name[7] = (char)('0' + (i / 10) % 10);
+                name[8] = (char)('0' + i % 10);
+                if (osfs2_delete(name) == 0) removed++;
+            }
+
+            sh_puts("diagclean: removed ");
+            sh_putdec((uint64_t)removed);
+            sh_puts(" diagnostic file(s)\n");
         }
     } else if (strcmp(cmd, "cat") == 0) {
         cmd_cat(argc, argv);
@@ -6706,9 +6748,31 @@ q4kgdone:
     } else if (strcmp(cmd, "crashdump") == 0) {
         /* List saved crash reports */
         extern void *osfs2_find(const char *name);
+        extern void boot_diag_format_crash_name(char *out, int slot,
+                                                uint32_t idx,
+                                                const char *ext);
         char fname[32] = "crash_000.bin";
         int found = 0;
-        for (int i = 1; i <= 100; i++) {
+        for (int slot = 0; slot < 4; slot++) {
+            for (uint32_t i = 0; i < 16; i++) {
+                boot_diag_format_crash_name(fname, slot, i, "bin");
+                if (osfs2_find(fname)) {
+                    sh_puts("  ");
+                    sh_puts(fname);
+                    sh_puts("\n");
+                    found++;
+                }
+                boot_diag_format_crash_name(fname, slot, i, "txt");
+                if (osfs2_find(fname)) {
+                    sh_puts("  ");
+                    sh_puts(fname);
+                    sh_puts("\n");
+                    found++;
+                }
+            }
+        }
+        strcpy(fname, "crash_000.bin");
+        for (int i = 0; i <= 999; i++) {
             fname[6] = '0' + (i / 100) % 10;
             fname[7] = '0' + (i / 10) % 10;
             fname[8] = '0' + i % 10;

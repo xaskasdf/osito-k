@@ -692,6 +692,10 @@ static inline void okvk_(const char* s){ unsigned long n=0; while(s[n])++n; writ
   
   
   void DxvkAdapter::logAdapterInfo() const {
+#ifdef __OSITO_K__
+    Logger::info("OsitoK Venus: adapter info logging skipped");
+    return;
+#endif
     const auto deviceInfo = this->devicePropertiesExt();
     const auto memoryInfo = this->memoryProperties();
     

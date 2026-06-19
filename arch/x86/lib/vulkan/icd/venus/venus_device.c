@@ -11,6 +11,18 @@
 extern void *malloc(unsigned long);
 extern void  free(void *);
 extern void *memset(void *, int, unsigned long);
+extern int   printf(const char *, ...);
+
+#ifdef __OSITO_K__
+extern long write(int, const void *, unsigned long);
+static void venus_dev_log(const char *msg) {
+    unsigned long len = 0;
+    while (msg[len]) len++;
+    write(2, msg, len);
+}
+#else
+static void venus_dev_log(const char *msg) { (void)msg; }
+#endif
 
 /* Forward decls for encoders (keep out of venus.h to keep that header
  * app-facing / handle-only). */
@@ -176,10 +188,35 @@ venus_DestroyDevice(VkDevice device, const VkAllocationCallbacks *pAllocator) {
 VKAPI_ATTR void VKAPI_CALL
 venus_GetDeviceQueue(VkDevice device, uint32_t queueFamilyIndex,
                      uint32_t queueIndex, VkQueue *pQueue) {
-    (void)queueFamilyIndex; (void)queueIndex;
     if (!device || !pQueue) return;
     struct venus_device *dev = (struct venus_device *)device;
-    *pQueue = (VkQueue)&dev->queue_loader_data;
+
+    for (uint32_t i = 0; i < VENUS_MAX_QUEUE_OBJECTS; i++) {
+        struct venus_queue *q = &dev->queues[i];
+        if (q->in_use && q->queue_family_index == queueFamilyIndex &&
+            q->queue_index == queueIndex) {
+            *pQueue = (VkQueue)q;
+            return;
+        }
+    }
+
+    for (uint32_t i = 0; i < VENUS_MAX_QUEUE_OBJECTS; i++) {
+        struct venus_queue *q = &dev->queues[i];
+        if (!q->in_use) {
+            memset(q, 0, sizeof(*q));
+            set_loader_magic_value(&q->loader_data);
+            q->owner = dev;
+            q->queue_family_index = queueFamilyIndex;
+            q->queue_index = queueIndex;
+            q->in_use = 1;
+            printf("[VGQ] queue=%p owner=%p family=%u index=%u\n",
+                   (void *)q, (void *)q->owner, queueFamilyIndex, queueIndex);
+            *pQueue = (VkQueue)q;
+            return;
+        }
+    }
+
+    *pQueue = VK_NULL_HANDLE;
 }
 
 /* --- Memory ------------------------------------------------------------- */
@@ -189,6 +226,7 @@ venus_AllocateMemory(VkDevice device,
                      const VkMemoryAllocateInfo *pAllocateInfo,
                      const VkAllocationCallbacks *pAllocator,
                      VkDeviceMemory *pMemory) {
+    venus_dev_log("[VENUSdev] AllocateMemory enter\n");
     (void)pAllocator;
     if (!device || !pAllocateInfo || !pMemory)
         return VK_ERROR_INITIALIZATION_FAILED;
@@ -205,23 +243,32 @@ venus_AllocateMemory(VkDevice device,
 
     /* Always allocate guest-local backing — this is what vkMapMemory
      * returns to the app in W3b.3. Real host-coherent mapping is W3b.4. */
+    printf("[VENUSdev] AllocateMemory slot=%d size=%llu type=%u\n",
+           slot, (unsigned long long)m->size, m->type_index);
+    venus_dev_log("[VENUSdev] AllocateMemory malloc begin\n");
     m->local_ptr = malloc(m->size ? m->size : 1);
+    venus_dev_log("[VENUSdev] AllocateMemory malloc done\n");
     if (!m->local_ptr) {
         m->in_use = 0;
         return VK_ERROR_OUT_OF_DEVICE_MEMORY;
     }
-    memset(m->local_ptr, 0, m->size);
+    /* Vulkan allocation contents are undefined. Zeroing large DXVK heap
+     * chunks burns a long time in the guest and can look like an allocation
+     * hang, so only preserve zero-init behavior for small test allocations. */
+    if (m->size <= 64u * 1024u)
+        memset(m->local_ptr, 0, m->size);
+    else
+        printf("[VENUSdev] AllocateMemory skip zero size=%llu\n",
+               (unsigned long long)m->size);
 
-    if (dev->parent && dev->parent->wire && dev->host_handle != 0) {
-        uint64_t host_mem_id = 0;
-        int rc = venus_cmd_encode_AllocateMemory(
-                dev->parent->wire, dev->host_handle,
-                m->size, m->type_index, &host_mem_id);
-        if (rc == 0 && host_mem_id != 0) m->host_id = host_mem_id;
-        /* else: guest-local fallback — same semantics for hello-memory. */
-    }
+    /* Keep allocations guest-local for now. Some virglrenderer/Venus builds
+     * accept vkCreateDevice and image creation but never reply to
+     * vkAllocateMemory, which stalls DXVK's allocator while constructing the
+     * first D3D11 backbuffer. BindImageMemory only forwards when both image and
+     * memory have host ids, so host_id=0 intentionally selects the local path. */
 
     *pMemory = mem_slot_to_handle(dev, slot);
+    venus_dev_log("[VENUSdev] AllocateMemory done\n");
     return VK_SUCCESS;
 }
 
@@ -365,7 +412,10 @@ venus_GetBufferMemoryRequirements(VkDevice device, VkBuffer buffer,
         int rc = venus_cmd_encode_GetBufferMemoryRequirements(
                 dev->parent->wire, dev->host_handle, b->host_id,
                 pMemoryRequirements);
-        if (rc == 0) return;
+        if (rc == 0 && pMemoryRequirements->size != 0 &&
+            pMemoryRequirements->alignment != 0 &&
+            pMemoryRequirements->memoryTypeBits != 0)
+            return;
     }
     /* Guest-local fallback: tight pack, 16-byte alignment, any type bit. */
     pMemoryRequirements->size           = b->size;

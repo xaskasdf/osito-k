@@ -3,6 +3,19 @@
 #include "dxvk_device.h"
 
 namespace dxvk {
+
+#ifdef __OSITO_K__
+  extern "C" long write(int, const void*, unsigned long);
+
+  static void okImageLog(const char* msg) {
+    unsigned long len = 0;
+    while (msg[len])
+      len++;
+    write(2, msg, len);
+  }
+#else
+  static void okImageLog(const char*) { }
+#endif
   
   DxvkImage::DxvkImage(
           DxvkDevice*           device,
@@ -42,6 +55,7 @@ namespace dxvk {
     if ((m_shared = canShareImage(info, createInfo.sharing)))
       externalInfo.pNext = std::exchange(info.pNext, &externalInfo);
 
+    okImageLog("[DXVKimg] vkCreateImage begin\n");
     if (m_vkd->vkCreateImage(m_vkd->device(), &info, nullptr, &m_image.image)) {
       dxvk::DxvkError::abort_ositok(str::format(
         "DxvkImage: Failed to create image:",
@@ -57,6 +71,7 @@ namespace dxvk {
         "\n  Usage:           ", info.usage,
         "\n  Tiling:          ", info.tiling));
     }
+    okImageLog("[DXVKimg] vkCreateImage done\n");
 
     VkImageMemoryRequirementsInfo2 memoryRequirementInfo = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_REQUIREMENTS_INFO_2 };
     memoryRequirementInfo.image = m_image.image;
@@ -69,8 +84,10 @@ namespace dxvk {
       memoryRequirements.dedicated = { VK_STRUCTURE_TYPE_MEMORY_DEDICATED_REQUIREMENTS };
       memoryRequirements.core = { VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2, &memoryRequirements.dedicated };
 
+      okImageLog("[DXVKimg] get requirements begin\n");
       m_vkd->vkGetImageMemoryRequirements2(m_vkd->device(),
         &memoryRequirementInfo, &memoryRequirements.core);
+      okImageLog("[DXVKimg] get requirements done\n");
 
       // Fill in desired memory properties
       DxvkMemoryProperties memoryProperties = { };
@@ -110,12 +127,16 @@ namespace dxvk {
       if (isGpuWritable)
         hints.set(DxvkMemoryFlag::GpuWritable);
 
+      okImageLog("[DXVKimg] alloc begin\n");
       m_image.memory = memAlloc.alloc(memoryRequirements, memoryProperties, hints);
+      okImageLog("[DXVKimg] alloc done\n");
 
       // Try to bind the allocated memory slice to the image
+      okImageLog("[DXVKimg] bind begin\n");
       if (m_vkd->vkBindImageMemory(m_vkd->device(), m_image.image,
           m_image.memory.memory(), m_image.memory.offset()) != VK_SUCCESS)
         dxvk::DxvkError::abort_ositok("DxvkImage::DxvkImage: Failed to bind device memory");
+      okImageLog("[DXVKimg] bind done\n");
     } else {
       // Initialize sparse info. We do not immediately bind the metadata
       // aspects of the image here, the caller needs to explicitly do that.

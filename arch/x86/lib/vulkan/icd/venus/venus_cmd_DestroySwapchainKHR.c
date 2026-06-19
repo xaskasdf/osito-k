@@ -18,6 +18,10 @@
 #include "venus.h"
 
 extern void *memset(void *, int, unsigned long);
+extern long  __syscall1(long, long);
+
+#define SYS_SHM_UNMAP    502L
+#define SYS_SHM_DESTROY  503L
 
 int venus_cmd_encode_DestroySwapchainKHR(struct venus_device *dev, int sc_slot) {
     if (!dev) return -22;
@@ -26,6 +30,18 @@ int venus_cmd_encode_DestroySwapchainKHR(struct venus_device *dev, int sc_slot) 
     if (!sc->in_use) return 0;
 
     for (uint32_t i = 0; i < sc->image_count; i++) {
+        int mslot = sc->memory_slots[i];
+        if (mslot >= 0 && mslot < (int)VENUS_MAX_MEM_OBJECTS) {
+            struct venus_memory *m = &dev->memories[mslot];
+            if (m->in_use && m->is_shm_backed) {
+                if (m->local_ptr)
+                    (void)__syscall1(SYS_SHM_UNMAP, (long)m->shm_handle);
+                if (m->shm_handle)
+                    (void)__syscall1(SYS_SHM_DESTROY, (long)m->shm_handle);
+                memset(m, 0, sizeof(*m));
+            }
+        }
+
         int s = sc->image_slots[i];
         if (s < 0 || s >= (int)VENUS_MAX_IMAGE_OBJECTS) continue;
         struct venus_image *img = &dev->images[s];

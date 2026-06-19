@@ -129,9 +129,22 @@ isr_common:
     jnz    .Lno_switch       /* AP → skip context switch */
 
     xor %rax, %rax
+    xor %rcx, %rcx
     xchg sched_switch_rsp(%rip), %rax
+    xchg sched_switch_cr3(%rip), %rcx
     test %rax, %rax
     jz .Lno_switch
+    /* A timer IRQ can enter on a low per-process stack. Loading the
+     * incoming CR3 while still using that stack can unmap the return
+     * address before C/asm can switch RSP. Move to an upper-half
+     * trampoline stack, load the next CR3, then switch to the incoming
+     * saved frame. Kernel text/data and this trampoline are shared in
+     * every process CR3 via the upper-half kernel mapping. */
+    lea sched_switch_trampoline_top(%rip), %rsp
+    test %rcx, %rcx
+    jz 1f
+    mov %rcx, %cr3
+1:
     mov %rax, %rsp
 .Lno_switch:
 
@@ -260,5 +273,14 @@ isr_stub_default:
 .globl sched_switch_rsp
 sched_switch_rsp:
     .quad 0
+
+.globl sched_switch_cr3
+sched_switch_cr3:
+    .quad 0
+
+.align 16
+sched_switch_trampoline:
+    .skip 4096
+sched_switch_trampoline_top:
 
 .section .note.GNU-stack,"",%progbits

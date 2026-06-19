@@ -23,6 +23,7 @@
 #include "venus_proto_core.h"
 
 extern void *memset(void *, int, unsigned long);
+extern int   printf(const char *, ...);
 extern long  __syscall1(long, long);
 extern long  __syscall3(long, long, long, long);
 
@@ -36,7 +37,10 @@ int venus_cmd_encode_CreateSwapchainKHR(
         struct venus_device *dev,
         const VkSwapchainCreateInfoKHR *pCreateInfo,
         int *out_slot) {
-    if (!dev || !pCreateInfo || !out_slot) return -22;
+    if (!dev || !pCreateInfo || !out_slot) {
+        printf("[VSCE] invalid args dev=%p ci=%p out=%p\n", dev, (void *)pCreateInfo, (void *)out_slot);
+        return -22;
+    }
 
     /* Clamp minImageCount to our capacity. */
     uint32_t image_count = pCreateInfo->minImageCount;
@@ -48,7 +52,10 @@ int venus_cmd_encode_CreateSwapchainKHR(
     for (uint32_t i = 0; i < VENUS_MAX_SWAPCHAIN_OBJECTS; i++) {
         if (!dev->swapchains[i].in_use) { sc_slot = (int)i; break; }
     }
-    if (sc_slot < 0) return -12;
+    if (sc_slot < 0) {
+        printf("[VSCE] no swapchain slots\n");
+        return -12;
+    }
 
     struct venus_swapchain *sc = &dev->swapchains[sc_slot];
     memset(sc, 0, sizeof(*sc));
@@ -77,6 +84,7 @@ int venus_cmd_encode_CreateSwapchainKHR(
             if (!dev->images[j].in_use) { img_slot = (int)j; break; }
         }
         if (img_slot < 0) {
+            printf("[VSCE] no image slot at image %u/%u\n", i, image_count);
             /* Roll back on failure. */
             for (uint32_t k = 0; k < i; k++) {
                 int s = sc->image_slots[k];
@@ -125,12 +133,17 @@ int venus_cmd_encode_CreateSwapchainKHR(
                     img->bound_offset   = 0;
                     sc->memory_slots[i] = mem_slot;
                 } else {
+                    printf("[VSCE] shm map failed image=%u handle=%ld\n", i, shm);
                     (void)__syscall1(SYS_SHM_DESTROY, shm);
                 }
             }
+        } else {
+            printf("[VSCE] no memory slot for image %u/%u\n", i, image_count);
         }
     }
 
     *out_slot = sc_slot;
+    printf("[VSCE] done slot=%d images=%u extent=%ux%u fmt=%u\n",
+           sc_slot, image_count, sc->width, sc->height, sc->format);
     return 0;
 }

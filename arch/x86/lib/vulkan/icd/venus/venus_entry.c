@@ -71,6 +71,10 @@ venus_icdGetInstanceProcAddr(VkInstance instance, const char *name) {
         return (PFN_vkVoidFunction)venus_CreateImageView;
     if (strcmp(name, "vkDestroyImageView") == 0)
         return (PFN_vkVoidFunction)venus_DestroyImageView;
+    if (strcmp(name, "vkCreateBufferView") == 0)
+        return (PFN_vkVoidFunction)venus_CreateBufferView;
+    if (strcmp(name, "vkDestroyBufferView") == 0)
+        return (PFN_vkVoidFunction)venus_DestroyBufferView;
     if (strcmp(name, "vkCreateSampler") == 0)
         return (PFN_vkVoidFunction)venus_CreateSampler;
     if (strcmp(name, "vkDestroySampler") == 0)
@@ -79,6 +83,29 @@ venus_icdGetInstanceProcAddr(VkInstance instance, const char *name) {
         return (PFN_vkVoidFunction)venus_CreateFramebuffer;
     if (strcmp(name, "vkDestroyFramebuffer") == 0)
         return (PFN_vkVoidFunction)venus_DestroyFramebuffer;
+    if (strcmp(name, "vkCreateDescriptorSetLayout") == 0)
+        return (PFN_vkVoidFunction)venus_CreateDescriptorSetLayout;
+    if (strcmp(name, "vkDestroyDescriptorSetLayout") == 0)
+        return (PFN_vkVoidFunction)venus_DestroyDescriptorSetLayout;
+    if (strcmp(name, "vkCreateDescriptorPool") == 0)
+        return (PFN_vkVoidFunction)venus_CreateDescriptorPool;
+    if (strcmp(name, "vkDestroyDescriptorPool") == 0)
+        return (PFN_vkVoidFunction)venus_DestroyDescriptorPool;
+    if (strcmp(name, "vkAllocateDescriptorSets") == 0)
+        return (PFN_vkVoidFunction)venus_AllocateDescriptorSets;
+    if (strcmp(name, "vkFreeDescriptorSets") == 0)
+        return (PFN_vkVoidFunction)venus_FreeDescriptorSets;
+    if (strcmp(name, "vkUpdateDescriptorSets") == 0)
+        return (PFN_vkVoidFunction)venus_UpdateDescriptorSets;
+    if (strcmp(name, "vkCreateDescriptorUpdateTemplate") == 0 ||
+        strcmp(name, "vkCreateDescriptorUpdateTemplateKHR") == 0)
+        return (PFN_vkVoidFunction)venus_CreateDescriptorUpdateTemplate;
+    if (strcmp(name, "vkDestroyDescriptorUpdateTemplate") == 0 ||
+        strcmp(name, "vkDestroyDescriptorUpdateTemplateKHR") == 0)
+        return (PFN_vkVoidFunction)venus_DestroyDescriptorUpdateTemplate;
+    if (strcmp(name, "vkUpdateDescriptorSetWithTemplate") == 0 ||
+        strcmp(name, "vkUpdateDescriptorSetWithTemplateKHR") == 0)
+        return (PFN_vkVoidFunction)venus_UpdateDescriptorSetWithTemplate;
     if (strcmp(name, "vkCreatePipelineLayout") == 0)
         return (PFN_vkVoidFunction)venus_CreatePipelineLayout;
     if (strcmp(name, "vkDestroyPipelineLayout") == 0)
@@ -91,6 +118,8 @@ venus_icdGetInstanceProcAddr(VkInstance instance, const char *name) {
         return (PFN_vkVoidFunction)venus_CreateCommandPool;
     if (strcmp(name, "vkDestroyCommandPool") == 0)
         return (PFN_vkVoidFunction)venus_DestroyCommandPool;
+    if (strcmp(name, "vkResetCommandPool") == 0)
+        return (PFN_vkVoidFunction)venus_ResetCommandPool;
     if (strcmp(name, "vkAllocateCommandBuffers") == 0)
         return (PFN_vkVoidFunction)venus_AllocateCommandBuffers;
     if (strcmp(name, "vkFreeCommandBuffers") == 0)
@@ -115,6 +144,9 @@ venus_icdGetInstanceProcAddr(VkInstance instance, const char *name) {
         return (PFN_vkVoidFunction)venus_DestroySurfaceKHR;
     if (strcmp(name, "vkQueueSubmit") == 0)
         return (PFN_vkVoidFunction)venus_QueueSubmit;
+    if (strcmp(name, "vkQueueSubmit2") == 0 ||
+        strcmp(name, "vkQueueSubmit2KHR") == 0)
+        return (PFN_vkVoidFunction)venus_QueueSubmit2;
     if (strcmp(name, "vkQueueWaitIdle") == 0)
         return (PFN_vkVoidFunction)venus_QueueWaitIdle;
     if (strcmp(name, "vkDeviceWaitIdle") == 0)

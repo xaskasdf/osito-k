@@ -154,8 +154,15 @@ namespace dxvk {
     if (m_swapchain)
       destroySwapchain();
 
-    if (!m_surface)
+    printf("[DXVKprs] recreate begin surface=0x%llx desc=%ux%u images=%u formats=%u\n",
+      (unsigned long long)(uintptr_t)m_surface,
+      desc.imageExtent.width, desc.imageExtent.height,
+      desc.imageCount, desc.numFormats);
+
+    if (!m_surface) {
+      printf("[DXVKprs] recreate no surface\n");
       return VK_ERROR_SURFACE_LOST_KHR;
+    }
 
     VkSurfaceFullScreenExclusiveInfoEXT fullScreenExclusiveInfo = { VK_STRUCTURE_TYPE_SURFACE_FULL_SCREEN_EXCLUSIVE_INFO_EXT };
     fullScreenExclusiveInfo.fullScreenExclusive = desc.fullScreenExclusive;
@@ -184,12 +191,21 @@ namespace dxvk {
         m_device->adapter()->handle(), m_surface, &caps.surfaceCapabilities);
     }
 
-    if (status)
+    if (status) {
+      printf("[DXVKprs] surface caps failed rc=%d\n", int32_t(status));
       return status;
+    }
 
     // Select image extent based on current surface capabilities, and return
     // immediately if we cannot create an actual swap chain.
     m_info.imageExtent = pickImageExtent(caps.surfaceCapabilities, desc.imageExtent);
+    printf("[DXVKprs] caps extent=%ux%u minImages=%u maxImages=%u picked=%ux%u\n",
+      caps.surfaceCapabilities.currentExtent.width,
+      caps.surfaceCapabilities.currentExtent.height,
+      caps.surfaceCapabilities.minImageCount,
+      caps.surfaceCapabilities.maxImageCount,
+      m_info.imageExtent.width,
+      m_info.imageExtent.height);
 
     if (!m_info.imageExtent.width || !m_info.imageExtent.height) {
       m_info.imageCount = 0;
@@ -198,16 +214,27 @@ namespace dxvk {
     }
 
     // Select format based on swap chain properties
-    if ((status = getSupportedFormats(formats, desc.fullScreenExclusive)))
+    if ((status = getSupportedFormats(formats, desc.fullScreenExclusive))) {
+      printf("[DXVKprs] formats failed rc=%d\n", int32_t(status));
       return status;
+    }
 
     m_info.format = pickFormat(formats.size(), formats.data(), desc.numFormats, desc.formats);
+    printf("[DXVKprs] formats count=%u picked=%d/%d\n",
+      uint32_t(formats.size()),
+      int32_t(m_info.format.format),
+      int32_t(m_info.format.colorSpace));
 
     // Select a present mode for the current sync interval
-    if ((status = getSupportedPresentModes(modes, desc.fullScreenExclusive)))
+    if ((status = getSupportedPresentModes(modes, desc.fullScreenExclusive))) {
+      printf("[DXVKprs] present modes failed rc=%d\n", int32_t(status));
       return status;
+    }
 
     m_info.presentMode = pickPresentMode(modes.size(), modes.data(), m_info.syncInterval);
+    printf("[DXVKprs] modes count=%u picked=%d\n",
+      uint32_t(modes.size()),
+      int32_t(m_info.presentMode));
 
     // Check whether we can change present modes dynamically. This may
     // influence the image count as well as further swap chain creation.
@@ -285,6 +312,8 @@ namespace dxvk {
 
     // Compute swap chain image count based on available info
     m_info.imageCount = pickImageCount(minImageCount, maxImageCount, desc.imageCount);
+    printf("[DXVKprs] image count picked=%u min=%u max=%u\n",
+      m_info.imageCount, minImageCount, maxImageCount);
 
     VkSurfaceFullScreenExclusiveInfoEXT fullScreenInfo = { VK_STRUCTURE_TYPE_SURFACE_FULL_SCREEN_EXCLUSIVE_INFO_EXT };
     fullScreenInfo.fullScreenExclusive = desc.fullScreenExclusive;
@@ -323,15 +352,31 @@ namespace dxvk {
       "\n  Image count:  ", m_info.imageCount,
       "\n  Exclusive FS: ", desc.fullScreenExclusive));
     
+    printf("[DXVKprs] vkCreateSwapchainKHR begin surf=0x%llx extent=%ux%u count=%u fmt=%d mode=%d old=0x%llx\n",
+      (unsigned long long)(uintptr_t)swapInfo.surface,
+      swapInfo.imageExtent.width,
+      swapInfo.imageExtent.height,
+      swapInfo.minImageCount,
+      int32_t(swapInfo.imageFormat),
+      int32_t(swapInfo.presentMode),
+      (unsigned long long)(uintptr_t)swapInfo.oldSwapchain);
+
     if ((status = m_vkd->vkCreateSwapchainKHR(m_vkd->device(),
-        &swapInfo, nullptr, &m_swapchain)))
+        &swapInfo, nullptr, &m_swapchain))) {
+      printf("[DXVKprs] vkCreateSwapchainKHR failed rc=%d\n", int32_t(status));
       return status;
+    }
+    printf("[DXVKprs] vkCreateSwapchainKHR done swap=0x%llx\n",
+      (unsigned long long)(uintptr_t)m_swapchain);
     
     // Acquire images and create views
     std::vector<VkImage> images;
 
-    if ((status = getSwapImages(images)))
+    if ((status = getSwapImages(images))) {
+      printf("[DXVKprs] getSwapImages failed rc=%d\n", int32_t(status));
       return status;
+    }
+    printf("[DXVKprs] getSwapImages done count=%u\n", uint32_t(images.size()));
     
     // Update actual image count
     m_info.imageCount = images.size();

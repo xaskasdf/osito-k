@@ -174,6 +174,7 @@ namespace dxvk {
 
     VkCommandPool                 m_commandPool = VK_NULL_HANDLE;
     std::vector<VkCommandBuffer>  m_commandBuffers;
+    uint32_t                      m_queueFamily = 0;
     size_t                        m_next        = 0;
 
   };

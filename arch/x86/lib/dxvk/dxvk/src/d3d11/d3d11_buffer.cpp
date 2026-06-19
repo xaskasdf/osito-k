@@ -202,7 +202,16 @@ namespace dxvk {
     DXGI_VK_FORMAT_INFO viewFormat = m_parent->LookupFormat(Format, DXGI_VK_FORMAT_MODE_ANY);
     VkFormatFeatureFlags2 features = GetBufferFormatFeatures(BindFlags);
 
-    return CheckFormatFeatureSupport(viewFormat.Format, features);
+    if (CheckFormatFeatureSupport(viewFormat.Format, features))
+      return true;
+
+#ifdef __OSITO_K__
+    if ((m_desc.MiscFlags & D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS)
+     && (Format == DXGI_FORMAT_R32_TYPELESS || Format == DXGI_FORMAT_R32_UINT))
+      return true;
+#endif
+
+    return false;
   }
 
 

@@ -6,6 +6,19 @@
 #include "dxvk_memory.h"
 
 namespace dxvk {
+
+#ifdef __OSITO_K__
+  extern "C" long write(int, const void*, unsigned long);
+
+  static void okMemLog(const char* msg) {
+    unsigned long len = 0;
+    while (msg[len])
+      len++;
+    write(2, msg, len);
+  }
+#else
+  static void okMemLog(const char*) { }
+#endif
   
   DxvkMemory::DxvkMemory() { }
   DxvkMemory::DxvkMemory(
@@ -211,7 +224,9 @@ namespace dxvk {
           DxvkMemoryRequirements            req,
           DxvkMemoryProperties              info,
           DxvkMemoryFlags                   hints) {
+    okMemLog("[DXVKmem] alloc enter\n");
     std::lock_guard<dxvk::mutex> lock(m_mutex);
+    okMemLog("[DXVKmem] alloc locked\n");
 
     // Keep small allocations together to avoid fragmenting
     // chunks for larger resources with lots of small gaps,
@@ -228,6 +243,7 @@ namespace dxvk {
 
     // If requested, try with a dedicated allocation first.
     if (info.dedicated.image || info.dedicated.buffer) {
+      okMemLog("[DXVKmem] try dedicated first\n");
       DxvkMemory result = this->tryAlloc(req, info, hints);
 
       if (result)
@@ -247,6 +263,7 @@ namespace dxvk {
         req.core.memoryRequirements.alignment = align(req.core.memoryRequirements.alignment,  granularity);
       }
 
+      okMemLog("[DXVKmem] try regular\n");
       DxvkMemory result = this->tryAlloc(req, info, hints);
 
       if (result)
@@ -254,6 +271,7 @@ namespace dxvk {
 
       // Retry without the hint constraints
       hints.set(DxvkMemoryFlag::IgnoreConstraints);
+      okMemLog("[DXVKmem] try ignore constraints\n");
       result = this->tryAlloc(req, info, hints);
 
       if (result)
@@ -271,6 +289,7 @@ namespace dxvk {
     if (info.flags & optionalFlags) {
       info.flags &= ~optionalFlags;
 
+      okMemLog("[DXVKmem] try optional flags stripped\n");
       DxvkMemory result = this->tryAlloc(req, info, hints);
 
       if (result)
@@ -290,6 +309,7 @@ namespace dxvk {
     const DxvkMemoryProperties&             info,
           DxvkMemoryFlags                   hints) {
     DxvkMemory result;
+    okMemLog("[DXVKmem] tryAlloc enter\n");
 
     for (uint32_t i = 0; i < m_memProps.memoryTypeCount && !result; i++) {
       const bool supported = (req.core.memoryRequirements.memoryTypeBits & (1u << i)) != 0;
@@ -313,6 +333,7 @@ namespace dxvk {
           VkDeviceSize                      align,
     const DxvkMemoryProperties&             info,
           DxvkMemoryFlags                   hints) {
+    okMemLog("[DXVKmem] tryAllocFromType enter\n");
     VkDeviceSize chunkSize = pickChunkSize(type->memTypeId, hints);
 
     DxvkMemory memory;
@@ -341,8 +362,10 @@ namespace dxvk {
         if (this->shouldFreeEmptyChunks(type->heap, chunkSize))
           this->freeEmptyChunks(type->heap);
 
-        for (uint32_t i = 0; i < 6 && (chunkSize >> i) >= size && !devMem.memHandle; i++)
+        for (uint32_t i = 0; i < 6 && (chunkSize >> i) >= size && !devMem.memHandle; i++) {
+          okMemLog("[DXVKmem] try chunk device memory\n");
           devMem = tryAllocDeviceMemory(type, chunkSize >> i, info, hints);
+        }
 
         if (devMem.memHandle) {
           Rc<DxvkMemoryChunk> chunk = new DxvkMemoryChunk(this, type, devMem, hints);
@@ -359,6 +382,7 @@ namespace dxvk {
       if (this->shouldFreeEmptyChunks(type->heap, size))
         this->freeEmptyChunks(type->heap);
 
+      okMemLog("[DXVKmem] try dedicated device memory\n");
       DxvkDeviceMemory devMem = this->tryAllocDeviceMemory(type, size, info, hints);
 
       if (devMem.memHandle != VK_NULL_HANDLE)
@@ -366,6 +390,7 @@ namespace dxvk {
     }
 
     if (memory) {
+      okMemLog("[DXVKmem] alloc success\n");
       type->heap->stats.memoryUsed += memory.m_length;
       m_device->notifyMemoryUse(type->heapId, memory.m_length);
     }
@@ -379,6 +404,7 @@ namespace dxvk {
           VkDeviceSize                      size,
           DxvkMemoryProperties              info,
           DxvkMemoryFlags                   hints) {
+    okMemLog("[DXVKmem] tryAllocDeviceMemory enter\n");
     auto vk = m_device->vkd();
 
     bool useMemoryPriority = (info.flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)
@@ -415,8 +441,12 @@ namespace dxvk {
     if (useMemoryPriority)
       priorityInfo.pNext = std::exchange(memoryInfo.pNext, &priorityInfo);
 
-    if (vk->vkAllocateMemory(vk->device(), &memoryInfo, nullptr, &result.memHandle))
+    okMemLog("[DXVKmem] vkAllocateMemory begin\n");
+    if (vk->vkAllocateMemory(vk->device(), &memoryInfo, nullptr, &result.memHandle)) {
+      okMemLog("[DXVKmem] vkAllocateMemory failed\n");
       return DxvkDeviceMemory();
+    }
+    okMemLog("[DXVKmem] vkAllocateMemory done\n");
     
     if (info.flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) {
       VkResult status = vk->vkMapMemory(vk->device(), result.memHandle, 0, VK_WHOLE_SIZE, 0, &result.memPointer);

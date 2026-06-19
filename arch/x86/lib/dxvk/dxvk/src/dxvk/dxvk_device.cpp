@@ -312,6 +312,12 @@ namespace dxvk {
   
   
   void DxvkDevice::waitForIdle() {
+#ifdef __OSITO_K__
+    printf("[DXVKdev] waitForIdle begin\n");
+    m_submissionQueue.waitForIdle();
+    printf("[DXVKdev] waitForIdle queue done; skipping vkDeviceWaitIdle on OsitoK\n");
+    return;
+#else
     m_submissionQueue.waitForIdle();
     m_submissionQueue.lockDeviceQueue();
 
@@ -319,6 +325,7 @@ namespace dxvk {
       Logger::err("DxvkDevice: waitForIdle: Operation failed");
 
     m_submissionQueue.unlockDeviceQueue();
+#endif
   }
   
   

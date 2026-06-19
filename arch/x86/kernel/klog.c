@@ -11,11 +11,11 @@ extern uint64_t idt_get_ticks(void);
 
 /* ── Ring Buffer ─────────────────────────────────────────────── */
 
-#define KLOG_SIZE  (64 * 1024)  /* 64KB ring buffer */
+#define KLOG_SIZE  (512 * 1024)  /* 512KB ring buffer */
 
 static char *klog_buf;  /* Lazy alloc (saves ~64KB BSS) */
 static uint32_t klog_head;       /* Write position */
-static uint32_t klog_total;      /* Total bytes ever written */
+static uint64_t klog_total;      /* Total bytes ever written */
 static bool     klog_initialized;
 
 void klog_init(void)
@@ -52,14 +52,14 @@ uint32_t klog_read(char *buf, uint32_t max_len)
 {
     if (!klog_initialized || max_len == 0) return 0;
 
-    uint32_t available = (klog_total < KLOG_SIZE) ? klog_total : KLOG_SIZE;
+    uint32_t available = (klog_total < KLOG_SIZE) ? (uint32_t)klog_total : KLOG_SIZE;
     uint32_t to_copy = (available < max_len) ? available : max_len;
 
     /* Calculate start position in ring */
     uint32_t start;
     if (klog_total <= KLOG_SIZE) {
         start = 0;
-        to_copy = klog_total < max_len ? klog_total : max_len;
+        to_copy = klog_total < max_len ? (uint32_t)klog_total : max_len;
     } else {
         start = klog_head;  /* Oldest data is at current head */
         /* Skip to show only the last max_len bytes */
@@ -76,7 +76,38 @@ uint32_t klog_read(char *buf, uint32_t max_len)
 }
 
 /* Get total bytes logged */
-uint32_t klog_total_bytes(void) { return klog_total; }
+uint64_t klog_total_bytes(void) { return klog_total; }
+
+/* Incremental read by absolute byte cursor.
+ * The cursor is a monotonic byte position in the logical klog stream.
+ * If it falls behind the ring's oldest byte, it is advanced to oldest. */
+uint32_t klog_read_since(uint64_t *cursor, char *buf, uint32_t max_len)
+{
+    if (!klog_initialized || !cursor || !buf || max_len == 0) return 0;
+
+    uint32_t available = (klog_total < KLOG_SIZE) ? (uint32_t)klog_total : KLOG_SIZE;
+    uint64_t oldest = klog_total - available;
+    if (*cursor < oldest)
+        *cursor = oldest;
+    if (*cursor >= klog_total)
+        return 0;
+
+    uint64_t pending64 = klog_total - *cursor;
+    uint32_t to_copy = pending64 < max_len ? (uint32_t)pending64 : max_len;
+    uint32_t oldest_pos;
+    if (klog_total <= KLOG_SIZE)
+        oldest_pos = 0;
+    else
+        oldest_pos = klog_head;
+
+    uint64_t rel = *cursor - oldest;
+    uint32_t start = (oldest_pos + (uint32_t)rel) % KLOG_SIZE;
+    for (uint32_t i = 0; i < to_copy; i++)
+        buf[i] = klog_buf[(start + i) % KLOG_SIZE];
+
+    *cursor += to_copy;
+    return to_copy;
+}
 
 /* ── syslog Syscall Interface ────────────────────────────────── */
 

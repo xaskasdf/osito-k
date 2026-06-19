@@ -6,6 +6,20 @@
 
 namespace dxvk {
 
+#ifdef __OSITO_K__
+  extern "C" long write(int, const void*, unsigned long);
+  extern "C" int printf(const char*, ...);
+
+  static void okSwapLog(const char* msg) {
+    unsigned long len = 0;
+    while (msg[len])
+      len++;
+    write(2, msg, len);
+  }
+#else
+  static void okSwapLog(const char*) { }
+#endif
+
   static uint16_t MapGammaControlPoint(float x) {
     if (x < 0.0f) x = 0.0f;
     if (x > 1.0f) x = 1.0f;
@@ -65,14 +79,29 @@ namespace dxvk {
     m_device(pDevice->GetDXVKDevice()),
     m_context(m_device->createContext(DxvkContextType::Supplementary)),
     m_frameLatencyCap(pDevice->GetOptions()->maxFrameLatency) {
+    okSwapLog("[D11sc] ctor begin\n");
+    okSwapLog("[D11sc] CreateFrameLatencyEvent begin\n");
     CreateFrameLatencyEvent();
+    okSwapLog("[D11sc] CreateFrameLatencyEvent done\n");
+    okSwapLog("[D11sc] CreatePresenter begin\n");
     CreatePresenter();
+    okSwapLog("[D11sc] CreatePresenter done\n");
+    okSwapLog("[D11sc] CreateBackBuffer begin\n");
     CreateBackBuffer();
+    okSwapLog("[D11sc] CreateBackBuffer done\n");
+    okSwapLog("[D11sc] CreateBlitter begin\n");
     CreateBlitter();
+    okSwapLog("[D11sc] CreateBlitter done\n");
+    okSwapLog("[D11sc] CreateHud begin\n");
     CreateHud();
+    okSwapLog("[D11sc] CreateHud done\n");
 
-    if (!pDevice->GetOptions()->deferSurfaceCreation)
+    if (!pDevice->GetOptions()->deferSurfaceCreation) {
+      okSwapLog("[D11sc] RecreateSwapChain begin\n");
       RecreateSwapChain();
+      okSwapLog("[D11sc] RecreateSwapChain done\n");
+    }
+    okSwapLog("[D11sc] ctor done\n");
   }
 
 
@@ -178,6 +207,7 @@ namespace dxvk {
     const DXGI_SWAP_CHAIN_DESC1*    pDesc,
     const UINT*                     pNodeMasks,
           IUnknown* const*          ppPresentQueues) {
+    okSwapLog("[D11sc] ChangeProperties begin\n");
     m_dirty |= m_desc.Format      != pDesc->Format
             || m_desc.Width       != pDesc->Width
             || m_desc.Height      != pDesc->Height
@@ -185,7 +215,9 @@ namespace dxvk {
             || m_desc.Flags       != pDesc->Flags;
 
     m_desc = *pDesc;
+    okSwapLog("[D11sc] ChangeProperties CreateBackBuffer begin\n");
     CreateBackBuffer();
+    okSwapLog("[D11sc] ChangeProperties done\n");
     return S_OK;
   }
 
@@ -255,35 +287,65 @@ namespace dxvk {
           UINT                      SyncInterval,
           UINT                      PresentFlags,
     const DXGI_PRESENT_PARAMETERS*  pPresentParameters) {
+    printf("[D11sc] Present enter sync=%u flags=0x%x dirty=%u hasSwap=%u\n",
+      SyncInterval, PresentFlags, m_dirty ? 1u : 0u,
+      m_presenter->hasSwapChain() ? 1u : 0u);
+
+#if defined(__OSITO_K__)
+    if (PresentFlags & DXGI_PRESENT_TEST) {
+      printf("[D11sc] OsitoK clearing DXGI_PRESENT_TEST flags=0x%x\n",
+        PresentFlags);
+      PresentFlags &= ~DXGI_PRESENT_TEST;
+    }
+#endif
+
     if (!(PresentFlags & DXGI_PRESENT_TEST))
       m_dirty |= m_presenter->setSyncInterval(SyncInterval) != VK_SUCCESS;
+    printf("[D11sc] Present after setSync dirty=%u hasSwap=%u\n",
+      m_dirty ? 1u : 0u, m_presenter->hasSwapChain() ? 1u : 0u);
 
     HRESULT hr = S_OK;
 
     if (!m_presenter->hasSwapChain()) {
+      okSwapLog("[D11sc] Present recreate missing-swap begin\n");
       RecreateSwapChain();
+      okSwapLog("[D11sc] Present recreate missing-swap done\n");
       m_dirty = false;
     }
 
-    if (!m_presenter->hasSwapChain())
+    if (!m_presenter->hasSwapChain()) {
+      okSwapLog("[D11sc] Present still no swapchain\n");
       hr = DXGI_STATUS_OCCLUDED;
+    }
 
-    if (m_device->getDeviceStatus() != VK_SUCCESS)
+    VkResult deviceStatus = m_device->getDeviceStatus();
+    printf("[D11sc] Present device status=%d hr=0x%x\n",
+      (int)deviceStatus, (unsigned)hr);
+    if (deviceStatus != VK_SUCCESS) {
+      printf("[D11sc] Present device status=%d -> DXGI_ERROR_DEVICE_RESET\n",
+        (int)deviceStatus);
       hr = DXGI_ERROR_DEVICE_RESET;
+    }
 
     if (PresentFlags & DXGI_PRESENT_TEST)
       return hr;
 
     if (hr != S_OK) {
+      printf("[D11sc] Present returning early hr=0x%x\n", (unsigned)hr);
       SyncFrameLatency();
       return hr;
     }
 
-    if (std::exchange(m_dirty, false))
+    if (std::exchange(m_dirty, false)) {
+      okSwapLog("[D11sc] Present recreate dirty begin\n");
       RecreateSwapChain();
+      okSwapLog("[D11sc] Present recreate dirty done\n");
+    }
 
     /* try */ {
+      printf("[D11sc] PresentImage begin\n");
       hr = PresentImage(SyncInterval);
+      printf("[D11sc] PresentImage done hr=0x%x\n", (unsigned)hr);
     }  /* ositok-W5.3: catch elided (-fno-exceptions) */
 
     // Ensure to synchronize and release the frame latency semaphore
@@ -447,6 +509,7 @@ namespace dxvk {
   void D3D11SwapChain::SynchronizePresent() {
     // Recreate swap chain if the previous present call failed
     VkResult status = m_device->waitForSubmission(&m_presentStatus);
+    printf("[D11sc] SynchronizePresent status=%d\n", (int)status);
     
     if (status != VK_SUCCESS)
       RecreateSwapChain();
@@ -454,9 +517,13 @@ namespace dxvk {
 
 
   void D3D11SwapChain::RecreateSwapChain() {
+    okSwapLog("[D11sc] Recreate waitForSubmission begin\n");
     // Ensure that we can safely destroy the swap chain
     m_device->waitForSubmission(&m_presentStatus);
+    okSwapLog("[D11sc] Recreate waitForSubmission done\n");
+    okSwapLog("[D11sc] Recreate waitForIdle begin\n");
     m_device->waitForIdle();
+    okSwapLog("[D11sc] Recreate waitForIdle done\n");
 
     m_presentStatus.result = VK_SUCCESS;
     m_dirtyHdrMetadata = true;
@@ -467,23 +534,31 @@ namespace dxvk {
     presenterDesc.numFormats      = PickFormats(m_desc.Format, presenterDesc.formats);
     presenterDesc.fullScreenExclusive = PickFullscreenMode();
 
+    okSwapLog("[D11sc] presenter recreateSwapChain begin\n");
     VkResult vr = m_presenter->recreateSwapChain(presenterDesc);
+    okSwapLog("[D11sc] presenter recreateSwapChain done\n");
 
     if (vr == VK_ERROR_SURFACE_LOST_KHR) {
+      okSwapLog("[D11sc] recreateSurface begin\n");
       vr = m_presenter->recreateSurface([this] (VkSurfaceKHR* surface) {
         return CreateSurface(surface);
       });
+      okSwapLog("[D11sc] recreateSurface done\n");
 
       if (vr)
         dxvk::DxvkError::abort_ositok(str::format("D3D11SwapChain: Failed to recreate surface: ", vr));
 
+      okSwapLog("[D11sc] presenter recreateSwapChain retry begin\n");
       vr = m_presenter->recreateSwapChain(presenterDesc);
+      okSwapLog("[D11sc] presenter recreateSwapChain retry done\n");
     }
 
     if (vr)
       dxvk::DxvkError::abort_ositok(str::format("D3D11SwapChain: Failed to recreate swap chain: ", vr));
     
+    okSwapLog("[D11sc] CreateRenderTargetViews begin\n");
     CreateRenderTargetViews();
+    okSwapLog("[D11sc] CreateRenderTargetViews done\n");
   }
 
 
@@ -496,27 +571,34 @@ namespace dxvk {
 
 
   void D3D11SwapChain::CreatePresenter() {
+    okSwapLog("[D11sc] CreatePresenter desc begin\n");
     PresenterDesc presenterDesc;
     presenterDesc.imageExtent     = { m_desc.Width, m_desc.Height };
     presenterDesc.imageCount      = PickImageCount(m_desc.BufferCount + 1);
     presenterDesc.numFormats      = PickFormats(m_desc.Format, presenterDesc.formats);
     presenterDesc.fullScreenExclusive = PickFullscreenMode();
 
+    okSwapLog("[D11sc] new Presenter begin\n");
     m_presenter = new Presenter(m_device, m_frameLatencySignal, presenterDesc);
+    okSwapLog("[D11sc] new Presenter done\n");
     m_presenter->setFrameRateLimit(m_targetFrameRate);
   }
 
 
   VkResult D3D11SwapChain::CreateSurface(VkSurfaceKHR* pSurface) {
+    okSwapLog("[D11sc] CreateSurface begin\n");
     Rc<DxvkAdapter> adapter = m_device->adapter();
 
-    return m_surfaceFactory->CreateSurface(
+    VkResult vr = m_surfaceFactory->CreateSurface(
       adapter->vki()->instance(),
       adapter->handle(), pSurface);
+    okSwapLog("[D11sc] CreateSurface done\n");
+    return vr;
   }
 
 
   void D3D11SwapChain::CreateRenderTargetViews() {
+    okSwapLog("[D11sc] CRTV begin\n");
     PresenterInfo info = m_presenter->info();
 
     m_imageViews.clear();
@@ -548,19 +630,24 @@ namespace dxvk {
     viewInfo.numLayers    = 1;
 
     for (uint32_t i = 0; i < info.imageCount; i++) {
+      okSwapLog("[D11sc] CRTV image begin\n");
       VkImage imageHandle = m_presenter->getImage(i).image;
       
       Rc<DxvkImage> image = new DxvkImage(
         m_device.ptr(), imageInfo, imageHandle,
         VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
 
+      okSwapLog("[D11sc] CRTV view begin\n");
       m_imageViews[i] = new DxvkImageView(
         m_device->vkd(), image, viewInfo);
+      okSwapLog("[D11sc] CRTV image done\n");
     }
+    okSwapLog("[D11sc] CRTV done\n");
   }
 
 
   void D3D11SwapChain::CreateBackBuffer() {
+    okSwapLog("[D11sc] CBB begin\n");
     // Explicitly destroy current swap image before
     // creating a new one to free up resources
     m_swapImage         = nullptr;
@@ -600,7 +687,9 @@ namespace dxvk {
      || m_desc.SwapEffect == DXGI_SWAP_EFFECT_FLIP_DISCARD)
       dxgiUsage |= DXGI_USAGE_DISCARD_ON_PRESENT;
 
+    okSwapLog("[D11sc] CBB new texture begin\n");
     m_backBuffer = new D3D11Texture2D(m_parent, this, &desc, dxgiUsage);
+    okSwapLog("[D11sc] CBB new texture done\n");
     m_swapImage = GetCommonTexture(m_backBuffer.ptr())->GetImage();
 
     // Create an image view that allows the
@@ -614,7 +703,9 @@ namespace dxvk {
     viewInfo.numLevels  = 1;
     viewInfo.minLayer   = 0;
     viewInfo.numLayers  = 1;
+    okSwapLog("[D11sc] CBB image view begin\n");
     m_swapImageView = m_device->createImageView(m_swapImage, viewInfo);
+    okSwapLog("[D11sc] CBB image view done\n");
     
     // Initialize the image so that we can use it. Clearing
     // to black prevents garbled output for the first frame.
@@ -643,6 +734,10 @@ namespace dxvk {
 
 
   void D3D11SwapChain::CreateHud() {
+#ifdef __OSITO_K__
+    m_hud = nullptr;
+    return;
+#endif
     m_hud = hud::Hud::createHud(m_device);
 
     if (m_hud != nullptr)

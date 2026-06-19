@@ -30,6 +30,7 @@ OSITOFS_WRITE="$OSITOK_ROOT/tools/ositofs/ositofs-write"
 OSITOFS_READ="$OSITOK_ROOT/tools/ositofs/ositofs-read"
 OSITOFS_RESIZE="$OSITOK_ROOT/tools/ositofs/ositofs-resize"
 OSITOFS_LS="$OSITOK_ROOT/tools/ositofs/ositofs-ls"
+OSITOFS_DELETE="$OSITOK_ROOT/tools/ositofs/ositofs-delete"
 
 ESP_MIB=512
 EXPECTED_BYTES_MIN=120000000000
@@ -92,6 +93,7 @@ check_inputs() {
     need_file "$OSITOFS_READ"
     need_file "$OSITOFS_RESIZE"
     need_file "$OSITOFS_LS"
+    need_file "$OSITOFS_DELETE"
     command -v sgdisk >/dev/null 2>&1 ||
         fatal "sgdisk is required on macOS for the exact two-partition GPT layout"
 }
@@ -171,6 +173,23 @@ extract_one() {
     "$OSITOFS_READ" "$image" "$stored" "$out" >/dev/null
 }
 
+clean_diag_ositofs() {
+    local image="$1"
+    local i name
+
+    info "Cleaning old diagnostic logs and crash dumps"
+    "$OSITOFS_DELETE" "$image" "diag/boot*" >/dev/null 2>&1 || true
+    "$OSITOFS_DELETE" "$image" "diag/cr*" >/dev/null 2>&1 || true
+    "$OSITOFS_DELETE" "$image" "diag/latest.txt" >/dev/null 2>&1 || true
+
+    i=0
+    while [ "$i" -le 999 ]; do
+        name="$(printf 'crash_%03d.bin' "$i")"
+        "$OSITOFS_DELETE" "$image" "$name" >/dev/null 2>&1 || true
+        i=$((i + 1))
+    done
+}
+
 copy_base_ositofs() {
     local data="${DEVICE}s2"
     local raw_data
@@ -192,6 +211,8 @@ add_payloads_ositofs() {
 
     tmp="$(mktemp -d /tmp/ositok-bundle.XXXXXX)"
     trap 'rm -rf "$tmp"' EXIT
+
+    clean_diag_ositofs "$data"
 
     gta_src="$OK_PORTED/GTAV_Source/GTA5.elf"
     [ -s "$gta_src" ] || gta_src=""

@@ -39,6 +39,8 @@ extern int  net_arp_lookup_nowait(const uint8_t ip[4], uint8_t mac_out[6]);
 /* Probe especial: ARP "who-has X.Y? tell 0.0.0.0".  net.c tiene un
  * arp_send_request estático; expone una versión pública para APIPA.    */
 extern void net_arp_probe(const uint8_t target_ip[4]);
+extern void boot_diag_mark(const char *reason);
+extern void boot_diag_heartbeat(const char *reason);
 
 /* RFC 3927 timing (en ticks de 100 Hz):
  *   PROBE_WAIT      1 segundo antes de empezar
@@ -81,6 +83,7 @@ static void apipa_sleep(uint64_t ticks)
 {
     uint64_t start = idt_get_ticks();
     while (idt_get_ticks() - start < ticks) {
+        boot_diag_heartbeat("apipa-wait");
         net_poll_wait();
     }
 }
@@ -107,6 +110,7 @@ int apipa_assign(void)
 
     serial_puts("[APIPA] starting link-local autoconfig (RFC 3927)\n");
     fb_puts(" Net: link-local autoconfig...\n");
+    boot_diag_mark("apipa-start");
 
     for (int attempt = 0; attempt < 8; attempt++) {
         uint8_t cand[4];
@@ -160,9 +164,13 @@ int apipa_assign(void)
             fb_putdec(cand[i]); if (i < 3) fb_puts(".");
         }
         fb_puts("/16 (link-local)\n");
+        boot_diag_mark("apipa-done");
+        serial_puts("[APIPA] return ok\n");
+        boot_diag_mark("apipa-return");
         return 0;
     }
 
     serial_puts("[APIPA] gave up after 8 attempts\n");
+    boot_diag_mark("apipa-failed");
     return -1;
 }

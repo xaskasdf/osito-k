@@ -8,14 +8,13 @@
  * boots while the wire is still ramping up.
  *
  * Handle tagging (per-object markers):
- *   VENUS_H_MARKER_SURFACE    0xFE00...
- *   VENUS_H_MARKER_QUEUE      0xFE01...   (dispatchable, but we tag anyway)
- *   VENUS_H_MARKER_FENCE      0xFE02...
- *   VENUS_H_MARKER_SEMA       0xFE03...
- *   VENUS_H_MARKER_SWAPCHAIN  0xFE04...
+ *   VENUS_H_MARKER_SURFACE    0x0...
+ *   VENUS_H_MARKER_FENCE      0x1...
+ *   VENUS_H_MARKER_SEMA       0x2...
+ *   VENUS_H_MARKER_SWAPCHAIN  0x3...
  *
- * Slot decode uses the usual (handle >> 48) & 0x0FFF shape to avoid
- * the W3b.3 marker-leak trap.
+ * Markers must only occupy bits 60..63. Slot decode uses the usual
+ * (handle >> 48) & 0x0FFF shape to avoid the W3b.3 marker-leak trap.
  *
  * SHM upgrade path (G5 integration):
  *   When vkBindImageMemory is called and the image is is_swapchain_owned,
@@ -33,6 +32,7 @@
 
 extern void *malloc(unsigned long);
 extern void  free(void *);
+extern int   printf(const char *, ...);
 extern void *memset(void *, int, unsigned long);
 extern long  __syscall1(long, long);
 extern long  __syscall3(long, long, long, long);
@@ -45,6 +45,8 @@ extern int venus_cmd_encode_GetDeviceQueue(
         struct venus_device *, uint32_t, uint32_t, struct venus_queue **);
 extern int venus_cmd_encode_QueueSubmit(
         struct venus_device *, uint32_t, const VkSubmitInfo *, uint64_t);
+extern int venus_cmd_encode_QueueSubmit2(
+        struct venus_device *, uint32_t, const VkSubmitInfo2 *, uint64_t);
 extern int venus_cmd_encode_QueueWaitIdle(struct venus_device *);
 extern int venus_cmd_encode_DeviceWaitIdle(struct venus_device *);
 extern int venus_cmd_encode_CreateFence(
@@ -81,10 +83,10 @@ extern int venus_cmd_encode_GetPhysicalDeviceSurfaceSupportKHR(
         struct venus_instance *, uint32_t, VkSurfaceKHR, VkBool32 *);
 
 /* ---- Handle markers + slot helpers. ---- */
-#define VENUS_H_MARKER_SURFACE    0xFE00000000000000ull
-#define VENUS_H_MARKER_FENCE      0xFE02000000000000ull
-#define VENUS_H_MARKER_SEMA       0xFE03000000000000ull
-#define VENUS_H_MARKER_SWAPCHAIN  0xFE04000000000000ull
+#define VENUS_H_MARKER_SURFACE    0x0000000000000000ull
+#define VENUS_H_MARKER_FENCE      0x1000000000000000ull
+#define VENUS_H_MARKER_SEMA       0x2000000000000000ull
+#define VENUS_H_MARKER_SWAPCHAIN  0x3000000000000000ull
 #define VENUS_H_SLOT_MASK_W3B5    0x0FFFull
 #define VENUS_H_PTR_MASK_W3B5     0x0000FFFFFFFFFFFFull
 
@@ -151,6 +153,8 @@ venus_DestroySurfaceKHR(VkInstance instance, VkSurfaceKHR surface,
 
 /* ---- Queue + device-wait. ---- */
 
+static struct venus_device *g_w3b5_queue_fallback_dev;
+
 VKAPI_ATTR void VKAPI_CALL
 venus_GetDeviceQueue(VkDevice device, uint32_t queueFamilyIndex,
                      uint32_t queueIndex, VkQueue *pQueue) {
@@ -162,13 +166,20 @@ venus_GetDeviceQueue(VkDevice device, uint32_t queueFamilyIndex,
         *pQueue = VK_NULL_HANDLE;
         return;
     }
+    g_w3b5_queue_fallback_dev = dev;
+    printf("[VGQ] queue=%p owner=%p family=%u index=%u\n",
+           (void *)q, (void *)q->owner, queueFamilyIndex, queueIndex);
     *pQueue = (VkQueue)q;
 }
 
 static inline struct venus_device *queue_to_dev(VkQueue q) {
     if (!q) return 0;
     struct venus_queue *vq = (struct venus_queue *)q;
-    return vq->owner;
+    if (vq->owner) return vq->owner;
+    if (g_w3b5_queue_fallback_dev)
+        printf("[VQ] owner fallback queue=%p dev=%p\n",
+               (void *)q, (void *)g_w3b5_queue_fallback_dev);
+    return g_w3b5_queue_fallback_dev;
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL
@@ -180,6 +191,28 @@ venus_QueueSubmit(VkQueue queue, uint32_t submitCount,
                                           (uint64_t)fence);
     if (rc < 0) return VK_ERROR_DEVICE_LOST;
     return (VkResult)rc;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+venus_QueueSubmit2(VkQueue queue, uint32_t submitCount,
+                   const VkSubmitInfo2 *pSubmits, VkFence fence) {
+    struct venus_device *dev = queue_to_dev(queue);
+    if (!dev) {
+        printf("[VQ2] missing dev queue=%p\n", (void *)queue);
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    int rc = venus_cmd_encode_QueueSubmit2(dev, submitCount, pSubmits,
+                                           (uint64_t)fence);
+    printf("[VQ2] submit2 count=%u rc=%d fence=0x%llx\n",
+           submitCount, rc, (unsigned long long)(uintptr_t)fence);
+    if (rc < 0) return VK_ERROR_DEVICE_LOST;
+    return (VkResult)rc;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+venus_QueueSubmit2KHR(VkQueue queue, uint32_t submitCount,
+                      const VkSubmitInfo2 *pSubmits, VkFence fence) {
+    return venus_QueueSubmit2(queue, submitCount, pSubmits, fence);
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL
@@ -280,12 +313,24 @@ venus_CreateSwapchainKHR(VkDevice device,
                          const VkAllocationCallbacks *pAllocator,
                          VkSwapchainKHR *pSwapchain) {
     (void)pAllocator;
-    if (!device || !pCreateInfo || !pSwapchain) return VK_ERROR_INITIALIZATION_FAILED;
+    if (!device || !pCreateInfo || !pSwapchain) {
+        printf("[VSC] invalid args dev=%p ci=%p out=%p\n", device, (void *)pCreateInfo, (void *)pSwapchain);
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
     struct venus_device *dev = (struct venus_device *)device;
     int slot = -1;
+    printf("[VSC] create begin surface=0x%llx count=%u extent=%ux%u fmt=%d usage=0x%x\n",
+           (unsigned long long)(uintptr_t)pCreateInfo->surface,
+           pCreateInfo->minImageCount,
+           pCreateInfo->imageExtent.width,
+           pCreateInfo->imageExtent.height,
+           (int)pCreateInfo->imageFormat,
+           (unsigned)pCreateInfo->imageUsage);
     int rc = venus_cmd_encode_CreateSwapchainKHR(dev, pCreateInfo, &slot);
+    printf("[VSC] encode rc=%d slot=%d\n", rc, slot);
     if (rc != 0) return VK_ERROR_OUT_OF_HOST_MEMORY;
     *pSwapchain = (VkSwapchainKHR)make_nd_handle(dev, slot, VENUS_H_MARKER_SWAPCHAIN);
+    printf("[VSC] create done handle=0x%llx\n", (unsigned long long)(uintptr_t)*pSwapchain);
     return VK_SUCCESS;
 }
 

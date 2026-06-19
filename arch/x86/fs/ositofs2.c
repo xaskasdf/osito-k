@@ -583,6 +583,23 @@ int osfs2_read(osfs2_file_t *file, uint64_t offset, void *buf, uint64_t len)
 {
     if (!mounted || !file) return -1;
     if (offset + len > file->size) return -1;
+    int dbg_fx = (strcmp(file->name, "shaders/win32_40_lq_final/im.fxc") == 0 ||
+                  strcmp(file->name, "rage/assets/tune/shaders/lib/win32_40/rage_im.fxc") == 0);
+    if (dbg_fx) {
+        serial_puts("[OsitoFS] read fx name='");
+        serial_puts(file->name);
+        serial_puts("' off=");
+        serial_putdec(offset);
+        serial_puts(" len=");
+        serial_putdec(len);
+        serial_puts(" start=");
+        serial_putdec(file->start_block);
+        serial_puts(" blocks=");
+        serial_putdec(file->block_count);
+        serial_puts(" flags=0x");
+        serial_puthex(file->flags, 8);
+        serial_puts("\n");
+    }
 
     /* Inline files: data stored in model_name[128] field */
     if (file->flags & OSFS2_FLAG_INLINE) {
@@ -591,8 +608,29 @@ int osfs2_read(osfs2_file_t *file, uint64_t offset, void *buf, uint64_t len)
     }
 
     uint64_t abs_offset = ((uint64_t)file->start_block << blk_shift) + offset;
+    if (dbg_fx) {
+        serial_puts("[OsitoFS] read fx abs=0x");
+        serial_puthex(abs_offset, 16);
+        serial_puts(" part=0x");
+        serial_puthex(partition_offset, 16);
+        serial_puts("\n");
+    }
     int rc = osfs2_part_read(abs_offset, buf, len);
     if (rc < 0) return -1;
+    if (dbg_fx) {
+        uint8_t *p = (uint8_t *)buf;
+        serial_puts("[OsitoFS] read fx bytes=");
+        if (len >= 4) {
+            serial_puthex(p[0], 2);
+            serial_puts(" ");
+            serial_puthex(p[1], 2);
+            serial_puts(" ");
+            serial_puthex(p[2], 2);
+            serial_puts(" ");
+            serial_puthex(p[3], 2);
+        }
+        serial_puts("\n");
+    }
     return (int)len;  /* disk_read_bytes returns 0 on success, not byte count */
 }
 
@@ -727,6 +765,22 @@ static int osfs2_write_superblock(void)
 static int osfs2_write_file_table(void)
 {
     return osfs2_part_write(OSFS2_FILETAB_OFF, file_table, OSFS2_FILETAB_SIZE);
+}
+
+static int osfs2_file_index(osfs2_file_t *file)
+{
+    if (!file || file < file_table || file >= file_table + OSFS2_MAX_FILES)
+        return -1;
+    return (int)(file - file_table);
+}
+
+static int osfs2_write_file_entry(osfs2_file_t *file)
+{
+    int idx = osfs2_file_index(file);
+    if (idx < 0) return -1;
+    return osfs2_part_write(OSFS2_FILETAB_OFF +
+                            (uint64_t)idx * sizeof(osfs2_file_t),
+                            file, sizeof(osfs2_file_t));
 }
 
 /* ── Create a new file ──────────────────────────────────────── */
@@ -938,7 +992,7 @@ int osfs2_write(osfs2_file_t *file, uint64_t offset, const void *buf, uint64_t l
                 file->size = offset + len;
                 file->modify_time = osfs2_get_time();
             }
-            osfs2_write_file_table();
+            osfs2_write_file_entry(file);
             return 0;
         }
         /* The file grew past the inline limit → CONVERT it to a block-backed
@@ -984,10 +1038,61 @@ int osfs2_write(osfs2_file_t *file, uint64_t offset, const void *buf, uint64_t l
     if (offset + len > file->size) {
         file->size = offset + len;
         file->modify_time = osfs2_get_time();
-        osfs2_write_file_table();
-        osfs2_write_superblock();
+        osfs2_write_file_entry(file);
     }
 
+    return 0;
+}
+
+/* Write inside the already allocated capacity without changing visible size.
+ * The caller is responsible for a later osfs2_truncate() if the written bytes
+ * should become visible. */
+int osfs2_write_data(osfs2_file_t *file, uint64_t offset, const void *buf, uint64_t len)
+{
+    if (!mounted || !file || !buf) return -1;
+
+    if (file->flags & OSFS2_FLAG_INLINE) {
+        if (offset + len > OSFS2_INLINE_MAX) return -1;
+        memcpy(file->model_name + offset, buf, len);
+        osfs2_write_file_entry(file);
+        return 0;
+    }
+
+    if (offset + len > (uint64_t)file->block_count << blk_shift) return -1;
+
+    uint64_t abs_offset = ((uint64_t)file->start_block << blk_shift) + offset;
+    int ret = osfs2_part_write(abs_offset, buf, len);
+    if (ret < 0) return -1;
+
+    if (crc_table && len) {
+        uint32_t first = file->start_block + (uint32_t)(offset >> blk_shift);
+        uint32_t last  = file->start_block + (uint32_t)((offset + len - 1) >> blk_shift);
+        for (uint32_t b = first; b <= last && b < OSFS2_MAX_BLOCKS; b++)
+            crc_table[b] = 0;
+    }
+
+    return 0;
+}
+
+/* Adjust the visible size of a file without reallocating its extent.
+ * Used by boot diagnostics to reserve log capacity once, then append while
+ * keeping the file length equal to bytes actually written. */
+int osfs2_truncate(osfs2_file_t *file, uint64_t size)
+{
+    if (!mounted || !file) return -1;
+
+    uint64_t capacity = 0;
+    if (file->flags & OSFS2_FLAG_INLINE)
+        capacity = OSFS2_INLINE_MAX;
+    else
+        capacity = (uint64_t)file->block_count << blk_shift;
+    if (size > capacity) return -1;
+
+    file->size = size;
+    file->modify_time = osfs2_get_time();
+    if (osfs2_write_file_entry(file) < 0)
+        return -1;
+    disk_flush();
     return 0;
 }
 

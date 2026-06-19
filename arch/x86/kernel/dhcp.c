@@ -24,6 +24,8 @@ extern int      net_udp_send_broadcast(uint16_t dst_port, uint16_t src_port,
                                        const void *data, uint32_t len);
 extern void     net_poll(void);
 extern uint64_t idt_get_ticks(void);
+extern void     boot_diag_mark(const char *reason);
+extern void     boot_diag_heartbeat(const char *reason);
 
 /* ── DHCP packet format ──────────────────────────────────────── */
 
@@ -209,6 +211,7 @@ int dhcp_discover(void)
 {
     serial_puts("[DHCP] Starting discovery...\n");
     fb_puts(" DHCP: discovering...\n");
+    boot_diag_mark("dhcp-start");
 
     /* Generate transaction ID from tick counter */
     dhcp_xid = (uint32_t)(idt_get_ticks() * 0x5DEECE66DULL + 0xB);
@@ -225,6 +228,7 @@ int dhcp_discover(void)
         uint64_t start = idt_get_ticks();
         while (!dhcp_got_reply && (idt_get_ticks() - start) < 300) {
             extern void net_poll_wait(void);
+            boot_diag_heartbeat("dhcp-wait-offer");
             net_poll_wait();
         }
 
@@ -239,11 +243,13 @@ int dhcp_discover(void)
         serial_puts("[DHCP] Retry ");
         serial_putdec((uint64_t)(attempt + 1));
         serial_puts("...\n");
+        boot_diag_mark("dhcp-retry");
     }
 
     if (!dhcp_got_reply || dhcp_msg_type != DHCP_OFFER) {
         serial_puts("[DHCP] No OFFER received, giving up\n");
         fb_puts(" DHCP: failed\n");
+        boot_diag_mark("dhcp-failed");
         return -1;
     }
 
@@ -255,12 +261,14 @@ int dhcp_discover(void)
     uint64_t start = idt_get_ticks();
     while (!dhcp_got_reply && (idt_get_ticks() - start) < 300) {
         extern void net_poll_wait(void);
+        boot_diag_heartbeat("dhcp-wait-ack");
         net_poll_wait();
     }
 
     if (!dhcp_got_reply || dhcp_msg_type != DHCP_ACK) {
         serial_puts("[DHCP] No ACK received\n");
         fb_puts(" DHCP: no ACK\n");
+        boot_diag_mark("dhcp-failed");
         return -1;
     }
 
@@ -302,6 +310,7 @@ int dhcp_discover(void)
     dhcp_lease_start = idt_get_ticks();
     dhcp_lease_ticks = (uint64_t)offered_lease * 100;  /* convert to 100Hz ticks */
 
+    boot_diag_mark("dhcp-done");
     return 0;
 }
 

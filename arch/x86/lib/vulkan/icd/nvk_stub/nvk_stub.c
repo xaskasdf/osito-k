@@ -22,6 +22,7 @@
  *   vkAllocateMemory / vkFreeMemory / vkMapMemory / vkUnmapMemory
  *   vkCreateImage / vkDestroyImage / vkBindImageMemory
  *   vkCreateBuffer / vkDestroyBuffer / vkBindBufferMemory
+ *   vkCreateBufferView / vkDestroyBufferView
  *   vkGetImageMemoryRequirements / vkGetBufferMemoryRequirements
  *   vkCreateCommandPool / vkDestroyCommandPool
  *   vkAllocateCommandBuffers / vkFreeCommandBuffers
@@ -125,6 +126,13 @@ struct nvk_buffer {
     uint64_t       size;
     struct nvk_memory *bound_mem;
     uint64_t       bound_offset;
+};
+
+struct nvk_buffer_view {
+    struct nvk_buffer *buffer;
+    uint32_t       format;
+    uint64_t       offset;
+    uint64_t       range;
 };
 
 struct nvk_image {
@@ -701,6 +709,32 @@ nvk_stub_BindBufferMemory(VkDevice device, VkBuffer buffer,
     buf->bound_mem    = (struct nvk_memory *)(uintptr_t)memory;
     buf->bound_offset = memoryOffset;
     return VK_SUCCESS;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+nvk_stub_CreateBufferView(VkDevice device,
+                          const VkBufferViewCreateInfo *pCreateInfo,
+                          const VkAllocationCallbacks *pAllocator,
+                          VkBufferView *pView) {
+    (void)device; (void)pAllocator;
+    if (!pCreateInfo || !pCreateInfo->buffer || !pView)
+        return VK_ERROR_INITIALIZATION_FAILED;
+    struct nvk_buffer_view *view = malloc(sizeof(*view));
+    if (!view) return VK_ERROR_OUT_OF_HOST_MEMORY;
+    memset(view, 0, sizeof(*view));
+    view->buffer = (struct nvk_buffer *)(uintptr_t)pCreateInfo->buffer;
+    view->format = (uint32_t)pCreateInfo->format;
+    view->offset = pCreateInfo->offset;
+    view->range  = pCreateInfo->range;
+    *pView = (VkBufferView)(uintptr_t)view;
+    return VK_SUCCESS;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+nvk_stub_DestroyBufferView(VkDevice device, VkBufferView view,
+                           const VkAllocationCallbacks *pAllocator) {
+    (void)device; (void)pAllocator;
+    if (view) free((void *)(uintptr_t)view);
 }
 
 /* ══════════════════════════════════════════════════════════════
@@ -1760,6 +1794,8 @@ nvk_stub_icdGetInstanceProcAddr(VkInstance instance, const char *name) {
     ENTRY(BindImageMemory);
     ENTRY(CreateBuffer);
     ENTRY(DestroyBuffer);
+    ENTRY(CreateBufferView);
+    ENTRY(DestroyBufferView);
     ENTRY(GetBufferMemoryRequirements);
     ENTRY(BindBufferMemory);
     ENTRY(CreateCommandPool);

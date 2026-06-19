@@ -1,6 +1,32 @@
 #include "loader.h"
 #include <vulkan/vulkan_ositok.h>
 
+#ifdef __OSITO_K__
+extern long write(int, const void *, unsigned long);
+static void ok_vk_log(const char *msg) {
+    unsigned long len = 0;
+    while (msg[len]) len++;
+    write(2, msg, len);
+}
+static void ok_vk_log_u64(unsigned long long value) {
+    char buf[24];
+    unsigned long pos = sizeof(buf);
+    buf[--pos] = '\n';
+    if (!value) {
+        buf[--pos] = '0';
+    } else {
+        while (value && pos) {
+            buf[--pos] = '0' + (value % 10);
+            value /= 10;
+        }
+    }
+    write(2, &buf[pos], sizeof(buf) - pos);
+}
+#else
+static void ok_vk_log(const char *msg) { (void)msg; }
+static void ok_vk_log_u64(unsigned long long value) { (void)value; }
+#endif
+
 VKAPI_ATTR VkResult VKAPI_CALL vkCreateInstance(
     const VkInstanceCreateInfo *, const VkAllocationCallbacks *, VkInstance *);
 VKAPI_ATTR void VKAPI_CALL vkDestroyInstance(
@@ -79,6 +105,11 @@ VKAPI_ATTR VkResult VKAPI_CALL vkCreateImageView(
     const VkAllocationCallbacks *, VkImageView *);
 VKAPI_ATTR void VKAPI_CALL vkDestroyImageView(
     VkDevice, VkImageView, const VkAllocationCallbacks *);
+VKAPI_ATTR VkResult VKAPI_CALL vkCreateBufferView(
+    VkDevice, const VkBufferViewCreateInfo *,
+    const VkAllocationCallbacks *, VkBufferView *);
+VKAPI_ATTR void VKAPI_CALL vkDestroyBufferView(
+    VkDevice, VkBufferView, const VkAllocationCallbacks *);
 VKAPI_ATTR VkResult VKAPI_CALL vkCreateFramebuffer(
     VkDevice, const VkFramebufferCreateInfo *,
     const VkAllocationCallbacks *, VkFramebuffer *);
@@ -100,6 +131,8 @@ VKAPI_ATTR VkResult VKAPI_CALL vkCreateCommandPool(
     const VkAllocationCallbacks *, VkCommandPool *);
 VKAPI_ATTR void VKAPI_CALL vkDestroyCommandPool(
     VkDevice, VkCommandPool, const VkAllocationCallbacks *);
+VKAPI_ATTR VkResult VKAPI_CALL vkResetCommandPool(
+    VkDevice, VkCommandPool, VkCommandPoolResetFlags);
 VKAPI_ATTR VkResult VKAPI_CALL vkAllocateCommandBuffers(
     VkDevice, const VkCommandBufferAllocateInfo *, VkCommandBuffer *);
 VKAPI_ATTR void VKAPI_CALL vkFreeCommandBuffers(
@@ -132,6 +165,10 @@ VKAPI_ATTR void VKAPI_CALL vkDestroySurfaceKHR(
     VkInstance, VkSurfaceKHR, const VkAllocationCallbacks *);
 VKAPI_ATTR VkResult VKAPI_CALL vkQueueSubmit(
     VkQueue, uint32_t, const VkSubmitInfo *, VkFence);
+VKAPI_ATTR VkResult VKAPI_CALL vkQueueSubmit2(
+    VkQueue, uint32_t, const VkSubmitInfo2 *, VkFence);
+VKAPI_ATTR VkResult VKAPI_CALL vkQueueSubmit2KHR(
+    VkQueue, uint32_t, const VkSubmitInfo2 *, VkFence);
 VKAPI_ATTR VkResult VKAPI_CALL vkQueueWaitIdle(VkQueue);
 VKAPI_ATTR VkResult VKAPI_CALL vkDeviceWaitIdle(VkDevice);
 VKAPI_ATTR VkResult VKAPI_CALL vkCreateFence(
@@ -209,6 +246,13 @@ VKAPI_ATTR VkResult VKAPI_CALL vkFreeDescriptorSets(
 VKAPI_ATTR void     VKAPI_CALL vkUpdateDescriptorSets(
     VkDevice, uint32_t, const VkWriteDescriptorSet *,
     uint32_t, const VkCopyDescriptorSet *);
+VKAPI_ATTR VkResult VKAPI_CALL vkCreateDescriptorUpdateTemplate(
+    VkDevice, const VkDescriptorUpdateTemplateCreateInfo *,
+    const VkAllocationCallbacks *, VkDescriptorUpdateTemplate *);
+VKAPI_ATTR void     VKAPI_CALL vkDestroyDescriptorUpdateTemplate(
+    VkDevice, VkDescriptorUpdateTemplate, const VkAllocationCallbacks *);
+VKAPI_ATTR void     VKAPI_CALL vkUpdateDescriptorSetWithTemplate(
+    VkDevice, VkDescriptorSet, VkDescriptorUpdateTemplate, const void *);
 VKAPI_ATTR VkResult VKAPI_CALL vkCreateDescriptorSetLayout(
     VkDevice, const VkDescriptorSetLayoutCreateInfo *,
     const VkAllocationCallbacks *, VkDescriptorSetLayout *);
@@ -429,6 +473,10 @@ osito_loader_get_instance_proc_addr(VkInstance instance, const char *pName) {
         return (PFN_vkVoidFunction)vkCreateImageView;
     if (strcmp(pName, "vkDestroyImageView") == 0)
         return (PFN_vkVoidFunction)vkDestroyImageView;
+    if (strcmp(pName, "vkCreateBufferView") == 0)
+        return (PFN_vkVoidFunction)vkCreateBufferView;
+    if (strcmp(pName, "vkDestroyBufferView") == 0)
+        return (PFN_vkVoidFunction)vkDestroyBufferView;
     if (strcmp(pName, "vkCreateFramebuffer") == 0)
         return (PFN_vkVoidFunction)vkCreateFramebuffer;
     if (strcmp(pName, "vkDestroyFramebuffer") == 0)
@@ -445,6 +493,8 @@ osito_loader_get_instance_proc_addr(VkInstance instance, const char *pName) {
         return (PFN_vkVoidFunction)vkCreateCommandPool;
     if (strcmp(pName, "vkDestroyCommandPool") == 0)
         return (PFN_vkVoidFunction)vkDestroyCommandPool;
+    if (strcmp(pName, "vkResetCommandPool") == 0)
+        return (PFN_vkVoidFunction)vkResetCommandPool;
     if (strcmp(pName, "vkAllocateCommandBuffers") == 0)
         return (PFN_vkVoidFunction)vkAllocateCommandBuffers;
     if (strcmp(pName, "vkFreeCommandBuffers") == 0)
@@ -477,6 +527,9 @@ osito_loader_get_instance_proc_addr(VkInstance instance, const char *pName) {
         return (PFN_vkVoidFunction)vkDestroySurfaceKHR;
     if (strcmp(pName, "vkQueueSubmit") == 0)
         return (PFN_vkVoidFunction)vkQueueSubmit;
+    if (strcmp(pName, "vkQueueSubmit2") == 0 ||
+        strcmp(pName, "vkQueueSubmit2KHR") == 0)
+        return (PFN_vkVoidFunction)vkQueueSubmit2;
     if (strcmp(pName, "vkQueueWaitIdle") == 0)
         return (PFN_vkVoidFunction)vkQueueWaitIdle;
     if (strcmp(pName, "vkDeviceWaitIdle") == 0)
@@ -555,6 +608,15 @@ osito_loader_get_instance_proc_addr(VkInstance instance, const char *pName) {
         return (PFN_vkVoidFunction)vkFreeDescriptorSets;
     if (strcmp(pName, "vkUpdateDescriptorSets") == 0)
         return (PFN_vkVoidFunction)vkUpdateDescriptorSets;
+    if (strcmp(pName, "vkCreateDescriptorUpdateTemplate") == 0 ||
+        strcmp(pName, "vkCreateDescriptorUpdateTemplateKHR") == 0)
+        return (PFN_vkVoidFunction)vkCreateDescriptorUpdateTemplate;
+    if (strcmp(pName, "vkDestroyDescriptorUpdateTemplate") == 0 ||
+        strcmp(pName, "vkDestroyDescriptorUpdateTemplateKHR") == 0)
+        return (PFN_vkVoidFunction)vkDestroyDescriptorUpdateTemplate;
+    if (strcmp(pName, "vkUpdateDescriptorSetWithTemplate") == 0 ||
+        strcmp(pName, "vkUpdateDescriptorSetWithTemplateKHR") == 0)
+        return (PFN_vkVoidFunction)vkUpdateDescriptorSetWithTemplate;
     if (strcmp(pName, "vkCreateDescriptorSetLayout") == 0)
         return (PFN_vkVoidFunction)vkCreateDescriptorSetLayout;
     if (strcmp(pName, "vkDestroyDescriptorSetLayout") == 0)
@@ -801,6 +863,7 @@ vkEnumerateDeviceExtensionProperties(VkPhysicalDevice physicalDevice,
          * extensions (it has no vkEnumerateDeviceExtensionProperties), so
          * the loader must inject the full required set. */
         "VK_KHR_swapchain",
+        "VK_KHR_descriptor_update_template",
         "VK_EXT_robustness2",
         /* Optional extension, but its FEATURE (transformFeedback) is part
          * of DXVK's baseline checkFeatureSupport — advertise so DXVK chains
@@ -1060,6 +1123,7 @@ VKAPI_ATTR VkResult VKAPI_CALL
 vkAllocateMemory(VkDevice device, const VkMemoryAllocateInfo *pAI,
                  const VkAllocationCallbacks *pAllocator,
                  VkDeviceMemory *pMemory) {
+    ok_vk_log("[VKldr] AllocateMemory enter\n");
     if (!device || !pAI || !pMemory) return VK_ERROR_INITIALIZATION_FAILED;
     struct osito_device    *dw = osito_device_from(device);
     struct osito_icd_inst  *ci = dw->owner;
@@ -1069,7 +1133,9 @@ vkAllocateMemory(VkDevice device, const VkMemoryAllocateInfo *pAI,
     if (!fn) return VK_ERROR_INITIALIZATION_FAILED;
 
     VkDeviceMemory real = VK_NULL_HANDLE;
+    ok_vk_log("[VKldr] AllocateMemory icd begin\n");
     VkResult rc = fn(dw->real, pAI, pAllocator, &real);
+    ok_vk_log("[VKldr] AllocateMemory icd done\n");
     if (rc != VK_SUCCESS || !real) return rc;
 
     struct osito_memory *mw = malloc(sizeof(*mw));
@@ -1083,6 +1149,7 @@ vkAllocateMemory(VkDevice device, const VkMemoryAllocateInfo *pAI,
     mw->owner = dw;
     mw->real  = real;
     *pMemory = mem_to(mw);
+    ok_vk_log("[VKldr] AllocateMemory wrapped\n");
     return VK_SUCCESS;
 }
 
@@ -1153,6 +1220,7 @@ vkCreateBuffer(VkDevice device, const VkBufferCreateInfo *pCI,
     memset(bw, 0, sizeof(*bw));
     bw->owner = dw;
     bw->real  = real;
+    bw->size  = pCI->size;
     *pBuffer = buf_to(bw);
     return VK_SUCCESS;
 }
@@ -1180,10 +1248,19 @@ vkGetBufferMemoryRequirements(VkDevice device, VkBuffer buffer,
     struct osito_icd_inst  *ci = dw->owner;
     struct osito_buffer    *bw = buf_from(buffer);
     if (!ci) return;
+    pReqs->size = 0;
+    pReqs->alignment = 0;
+    pReqs->memoryTypeBits = 0;
     PFN_vkGetBufferMemoryRequirements fn =
         (PFN_vkGetBufferMemoryRequirements)ci->icd->get_proc_addr(
             ci->handle, "vkGetBufferMemoryRequirements");
     if (fn) fn(dw->real, bw->real, pReqs);
+    if (pReqs->size == 0 || pReqs->alignment == 0 ||
+        pReqs->memoryTypeBits == 0) {
+        pReqs->size = bw->size ? bw->size : 1;
+        pReqs->alignment = 16u;
+        pReqs->memoryTypeBits = 0xFFFFFFFFu;
+    }
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL
@@ -1218,6 +1295,8 @@ static inline struct osito_image *img_from(VkImage h) { return (struct osito_ima
 static inline VkImage            img_to(struct osito_image *w) { return (VkImage)(uintptr_t)w; }
 static inline struct osito_image_view *iv_from(VkImageView h) { return (struct osito_image_view *)(uintptr_t)h; }
 static inline VkImageView             iv_to(struct osito_image_view *w) { return (VkImageView)(uintptr_t)w; }
+static inline struct osito_buffer_view *bv_from(VkBufferView h) { return (struct osito_buffer_view *)(uintptr_t)h; }
+static inline VkBufferView              bv_to(struct osito_buffer_view *w) { return (VkBufferView)(uintptr_t)w; }
 static inline struct osito_framebuffer *fb_from(VkFramebuffer h) { return (struct osito_framebuffer *)(uintptr_t)h; }
 static inline VkFramebuffer            fb_to(struct osito_framebuffer *w) { return (VkFramebuffer)(uintptr_t)w; }
 static inline struct osito_pipeline_layout *pl_from(VkPipelineLayout h) { return (struct osito_pipeline_layout *)(uintptr_t)h; }
@@ -1305,6 +1384,7 @@ VKAPI_ATTR VkResult VKAPI_CALL
 vkCreateImage(VkDevice device, const VkImageCreateInfo *pCI,
               const VkAllocationCallbacks *pAllocator, VkImage *pImage) {
     if (!device || !pCI || !pImage) return VK_ERROR_INITIALIZATION_FAILED;
+    ok_vk_log("[vkldr] CreateImage enter\n");
     struct osito_device *dw = osito_device_from(device);
     struct osito_icd_inst *ci = dw->owner;
     if (!ci) return VK_ERROR_INITIALIZATION_FAILED;
@@ -1312,12 +1392,18 @@ vkCreateImage(VkDevice device, const VkImageCreateInfo *pCI,
         ci->icd->get_proc_addr(ci->handle, "vkCreateImage");
     if (!fn) return VK_ERROR_INITIALIZATION_FAILED;
     VkImage real = VK_NULL_HANDLE;
+    ok_vk_log("[vkldr] CreateImage icd begin\n");
     VkResult rc = fn(dw->real, pCI, pAllocator, &real);
+    ok_vk_log("[vkldr] CreateImage icd done\n");
     if (rc != VK_SUCCESS || !real) return rc;
     struct osito_image *w = malloc(sizeof(*w));
     if (!w) return VK_ERROR_OUT_OF_HOST_MEMORY;
-    w->owner = dw; w->real = real;
+    w->owner = dw;
+    w->real = real;
+    w->width = pCI->extent.width;
+    w->height = pCI->extent.height;
     *pImage = img_to(w);
+    ok_vk_log("[vkldr] CreateImage leave\n");
     return VK_SUCCESS;
 }
 VKAPI_ATTR void VKAPI_CALL
@@ -1345,7 +1431,17 @@ vkGetImageMemoryRequirements(VkDevice device, VkImage image,
     pReqs->size = 0; pReqs->alignment = 0; pReqs->memoryTypeBits = 0;
     PFN_vkGetImageMemoryRequirements fn = (PFN_vkGetImageMemoryRequirements)
         ci->icd->get_proc_addr(ci->handle, "vkGetImageMemoryRequirements");
+    ok_vk_log("[vkldr] GetImageReq icd begin\n");
     if (fn) fn(dw->real, w->real, pReqs);
+    ok_vk_log("[vkldr] GetImageReq icd done\n");
+    if (pReqs->size == 0 || pReqs->alignment == 0 ||
+        pReqs->memoryTypeBits == 0) {
+        VkDeviceSize pixels = (VkDeviceSize)w->width * (VkDeviceSize)w->height;
+        pReqs->size = pixels ? pixels * 4u : 256u;
+        pReqs->alignment = 256u;
+        pReqs->memoryTypeBits = 0xFFFFFFFFu;
+    }
+    ok_vk_log("[vkldr] GetImageReq leave\n");
 }
 
 /* Vulkan 1.1 core variants. DXVK (and most modern clients) call the _2
@@ -1400,7 +1496,10 @@ vkBindImageMemory(VkDevice device, VkImage image, VkDeviceMemory memory,
     PFN_vkBindImageMemory fn = (PFN_vkBindImageMemory)
         ci->icd->get_proc_addr(ci->handle, "vkBindImageMemory");
     if (!fn) return VK_ERROR_INITIALIZATION_FAILED;
-    return fn(dw->real, w->real, mw->real, memoryOffset);
+    ok_vk_log("[vkldr] BindImageMemory icd begin\n");
+    VkResult rc = fn(dw->real, w->real, mw->real, memoryOffset);
+    ok_vk_log("[vkldr] BindImageMemory icd done\n");
+    return rc;
 }
 
 /* Image view */
@@ -1439,6 +1538,57 @@ vkDestroyImageView(VkDevice device, VkImageView view,
     if (ci) {
         PFN_vkDestroyImageView fn = (PFN_vkDestroyImageView)
             ci->icd->get_proc_addr(ci->handle, "vkDestroyImageView");
+        if (fn) fn(dw->real, w->real, pAllocator);
+    }
+    free(w);
+}
+
+/* Buffer view */
+VKAPI_ATTR VkResult VKAPI_CALL
+vkCreateBufferView(VkDevice device, const VkBufferViewCreateInfo *pCI,
+                   const VkAllocationCallbacks *pAllocator,
+                   VkBufferView *pView) {
+    if (!device || !pCI || !pView) return VK_ERROR_INITIALIZATION_FAILED;
+    struct osito_device *dw = osito_device_from(device);
+    struct osito_icd_inst *ci = dw->owner;
+    if (!ci) return VK_ERROR_INITIALIZATION_FAILED;
+    PFN_vkCreateBufferView fn = (PFN_vkCreateBufferView)
+        ci->icd->get_proc_addr(ci->handle, "vkCreateBufferView");
+    if (!fn) return VK_ERROR_FEATURE_NOT_PRESENT;
+
+    VkBufferViewCreateInfo tmp = *pCI;
+    if (pCI->buffer) {
+        struct osito_buffer *bw = buf_from(pCI->buffer);
+        tmp.buffer = bw->real;
+    }
+
+    VkBufferView real = VK_NULL_HANDLE;
+    VkResult rc = fn(dw->real, &tmp, pAllocator, &real);
+    if (rc != VK_SUCCESS || !real) return rc;
+
+    struct osito_buffer_view *w = malloc(sizeof(*w));
+    if (!w) {
+        PFN_vkDestroyBufferView drop = (PFN_vkDestroyBufferView)
+            ci->icd->get_proc_addr(ci->handle, "vkDestroyBufferView");
+        if (drop) drop(dw->real, real, NULL);
+        return VK_ERROR_OUT_OF_HOST_MEMORY;
+    }
+    w->owner = dw;
+    w->real = real;
+    *pView = bv_to(w);
+    return VK_SUCCESS;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+vkDestroyBufferView(VkDevice device, VkBufferView view,
+                    const VkAllocationCallbacks *pAllocator) {
+    if (!device || !view) return;
+    struct osito_device *dw = osito_device_from(device);
+    struct osito_icd_inst *ci = dw->owner;
+    struct osito_buffer_view *w = bv_from(view);
+    if (ci) {
+        PFN_vkDestroyBufferView fn = (PFN_vkDestroyBufferView)
+            ci->icd->get_proc_addr(ci->handle, "vkDestroyBufferView");
         if (fn) fn(dw->real, w->real, pAllocator);
     }
     free(w);
@@ -1621,6 +1771,21 @@ vkDestroyCommandPool(VkDevice device, VkCommandPool pool,
         if (fn) fn(dw->real, w->real, pAllocator);
     }
     free(w);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+vkResetCommandPool(VkDevice device, VkCommandPool pool,
+                   VkCommandPoolResetFlags flags) {
+    if (!device || !pool) return VK_ERROR_INITIALIZATION_FAILED;
+    struct osito_device *dw = osito_device_from(device);
+    struct osito_icd_inst *ci = dw->owner;
+    struct osito_cmd_pool *w = cp_from(pool);
+    if (!ci || !w) return VK_ERROR_INITIALIZATION_FAILED;
+    PFN_vkResetCommandPool fn = (PFN_vkResetCommandPool)
+        ci->icd->get_proc_addr(ci->handle, "vkResetCommandPool");
+    if (!fn)
+        return VK_SUCCESS;
+    return fn(dw->real, w->real, flags);
 }
 
 /* Command buffers (dispatchable). */
@@ -1826,6 +1991,8 @@ typedef void (VKAPI_PTR *PFN_vkDestroySurfaceKHR)(
     VkInstance, VkSurfaceKHR, const VkAllocationCallbacks *);
 typedef VkResult (VKAPI_PTR *PFN_vkQueueSubmit)(
     VkQueue, uint32_t, const VkSubmitInfo *, VkFence);
+typedef VkResult (VKAPI_PTR *PFN_vkQueueSubmit2)(
+    VkQueue, uint32_t, const VkSubmitInfo2 *, VkFence);
 typedef VkResult (VKAPI_PTR *PFN_vkQueueWaitIdle)(VkQueue);
 typedef VkResult (VKAPI_PTR *PFN_vkDeviceWaitIdle)(VkDevice);
 typedef VkResult (VKAPI_PTR *PFN_vkCreateFence)(
@@ -2010,6 +2177,84 @@ vkQueueSubmit(VkQueue queue, uint32_t submitCount,
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL
+vkQueueSubmit2(VkQueue queue, uint32_t submitCount,
+               const VkSubmitInfo2 *pSubmits, VkFence fence) {
+    if (!queue) {
+        ok_vk_log("[LQ2] null queue\n");
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    struct osito_device *dw = queue_owner(queue);
+    if (!dw || !dw->owner) {
+        ok_vk_log("[LQ2] queue owner missing\n");
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    struct osito_icd_inst *ci = dw->owner;
+    PFN_vkQueueSubmit2 fn = (PFN_vkQueueSubmit2)
+        ci->icd->get_proc_addr(ci->handle, "vkQueueSubmit2");
+    if (!fn) {
+        fn = (PFN_vkQueueSubmit2)
+            ci->icd->get_proc_addr(ci->handle, "vkQueueSubmit2KHR");
+    }
+    if (!fn) {
+        ok_vk_log("[LQ2] icd submit2 missing\n");
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    if (submitCount > OSITO_QS_MAX_SUBMITS) {
+        ok_vk_log("[LQ2] too many submits\n");
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+
+    VkSubmitInfo2 locals[OSITO_QS_MAX_SUBMITS];
+    VkSemaphoreSubmitInfo waits[OSITO_QS_MAX_SUBMITS][OSITO_QS_MAX_PER_SUBMIT];
+    VkSemaphoreSubmitInfo sigs [OSITO_QS_MAX_SUBMITS][OSITO_QS_MAX_PER_SUBMIT];
+    VkCommandBufferSubmitInfo cbs[OSITO_QS_MAX_SUBMITS][OSITO_QS_MAX_PER_SUBMIT];
+
+    for (uint32_t i = 0; i < submitCount; i++) {
+        locals[i] = pSubmits[i];
+        uint32_t nw = locals[i].waitSemaphoreInfoCount;
+        uint32_t ns = locals[i].signalSemaphoreInfoCount;
+        uint32_t nc = locals[i].commandBufferInfoCount;
+        if (nw > OSITO_QS_MAX_PER_SUBMIT) nw = OSITO_QS_MAX_PER_SUBMIT;
+        if (ns > OSITO_QS_MAX_PER_SUBMIT) ns = OSITO_QS_MAX_PER_SUBMIT;
+        if (nc > OSITO_QS_MAX_PER_SUBMIT) nc = OSITO_QS_MAX_PER_SUBMIT;
+
+        for (uint32_t j = 0; j < nw; j++) {
+            waits[i][j] = pSubmits[i].pWaitSemaphoreInfos[j];
+            waits[i][j].semaphore = waits[i][j].semaphore
+                ? sem_from(waits[i][j].semaphore)->real : 0;
+        }
+        for (uint32_t j = 0; j < ns; j++) {
+            sigs[i][j] = pSubmits[i].pSignalSemaphoreInfos[j];
+            sigs[i][j].semaphore = sigs[i][j].semaphore
+                ? sem_from(sigs[i][j].semaphore)->real : 0;
+        }
+        for (uint32_t j = 0; j < nc; j++) {
+            cbs[i][j] = pSubmits[i].pCommandBufferInfos[j];
+            struct osito_cmd_buffer *cbw =
+                (struct osito_cmd_buffer *)cbs[i][j].commandBuffer;
+            cbs[i][j].commandBuffer = cbw ? cbw->real : 0;
+        }
+
+        locals[i].waitSemaphoreInfoCount   = nw;
+        locals[i].signalSemaphoreInfoCount = ns;
+        locals[i].commandBufferInfoCount   = nc;
+        locals[i].pWaitSemaphoreInfos      = waits[i];
+        locals[i].pSignalSemaphoreInfos    = sigs [i];
+        locals[i].pCommandBufferInfos      = cbs  [i];
+    }
+
+    VkFence real_fence = fence ? fence_from(fence)->real : VK_NULL_HANDLE;
+    ok_vk_log("[LQ2] call icd submit2\n");
+    return fn(unwrap_queue(queue), submitCount, locals, real_fence);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+vkQueueSubmit2KHR(VkQueue queue, uint32_t submitCount,
+                  const VkSubmitInfo2 *pSubmits, VkFence fence) {
+    return vkQueueSubmit2(queue, submitCount, pSubmits, fence);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
 vkQueueWaitIdle(VkQueue queue) {
     if (!queue) return VK_ERROR_INITIALIZATION_FAILED;
     struct osito_device *dw = queue_owner(queue);
@@ -2163,22 +2408,42 @@ vkCreateSwapchainKHR(VkDevice device,
                      const VkSwapchainCreateInfoKHR *pCI,
                      const VkAllocationCallbacks *pAllocator,
                      VkSwapchainKHR *pSwapchain) {
-    if (!device || !pCI || !pSwapchain) return VK_ERROR_INITIALIZATION_FAILED;
+    extern int printf(const char *, ...);
+    if (!device || !pCI || !pSwapchain) {
+        printf("[LDSC] invalid args dev=%p ci=%p out=%p\n", device, (void *)pCI, (void *)pSwapchain);
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
     struct osito_device *dw = osito_device_from(device);
     struct osito_icd_inst *ci = dw->owner;
-    if (!ci) return VK_ERROR_INITIALIZATION_FAILED;
+    if (!ci) {
+        printf("[LDSC] missing owner device=%p dw=%p\n", device, (void *)dw);
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
     PFN_vkCreateSwapchainKHR fn = (PFN_vkCreateSwapchainKHR)
         ci->icd->get_proc_addr(ci->handle, "vkCreateSwapchainKHR");
-    if (!fn) return VK_ERROR_INITIALIZATION_FAILED;
+    if (!fn) {
+        printf("[LDSC] missing icd vkCreateSwapchainKHR icd=%p handle=%p\n", (void *)ci->icd, (void *)ci->handle);
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
     VkSwapchainCreateInfoKHR tmp = *pCI;
     if (tmp.surface) tmp.surface = surf_from(tmp.surface)->real;
     if (tmp.oldSwapchain) tmp.oldSwapchain = swp_from(tmp.oldSwapchain)->real;
+    printf("[LDSC] create begin surf=0x%llx real=0x%llx old=0x%llx count=%u extent=%ux%u fmt=%d\n",
+           (unsigned long long)(uintptr_t)pCI->surface,
+           (unsigned long long)(uintptr_t)tmp.surface,
+           (unsigned long long)(uintptr_t)tmp.oldSwapchain,
+           tmp.minImageCount, tmp.imageExtent.width, tmp.imageExtent.height,
+           (int)tmp.imageFormat);
     VkSwapchainKHR real = VK_NULL_HANDLE;
     VkResult rc = fn(dw->real, &tmp, pAllocator, &real);
+    printf("[LDSC] icd create rc=%d real=0x%llx\n", (int)rc, (unsigned long long)(uintptr_t)real);
     if (rc != VK_SUCCESS || !real) return rc;
     struct osito_swapchain *w = malloc(sizeof(*w));
     if (!w) return VK_ERROR_OUT_OF_HOST_MEMORY;
-    w->owner = dw; w->real = real;
+    w->owner = dw;
+    w->real = real;
+    w->width = tmp.imageExtent.width;
+    w->height = tmp.imageExtent.height;
     *pSwapchain = swp_to(w);
     return VK_SUCCESS;
 }
@@ -2229,7 +2494,10 @@ vkGetSwapchainImagesKHR(VkDevice device, VkSwapchainKHR swapchain,
             for (uint32_t j = 0; j < i; j++) free((void *)pImages[j]);
             return VK_ERROR_OUT_OF_HOST_MEMORY;
         }
-        iw->owner = dw; iw->real = reals[i];
+        iw->owner = dw;
+        iw->real = reals[i];
+        iw->width = w->width;
+        iw->height = w->height;
         pImages[i] = (VkImage)(uintptr_t)iw;
     }
     *pCount = req;
@@ -2480,6 +2748,36 @@ vkGetPhysicalDeviceFormatProperties(VkPhysicalDevice physicalDevice,
         (PFN_vkGetPhysicalDeviceFormatProperties)
         ci->icd->get_proc_addr(ci->handle, "vkGetPhysicalDeviceFormatProperties");
     if (fn) fn(pw->real, format, pFormatProperties);
+
+    if (!pFormatProperties->linearTilingFeatures &&
+        !pFormatProperties->optimalTilingFeatures &&
+        !pFormatProperties->bufferFeatures) {
+        VkFormatFeatureFlags image_features =
+            VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT |
+            VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT |
+            VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT |
+            VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT |
+            VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT |
+            VK_FORMAT_FEATURE_TRANSFER_SRC_BIT |
+            VK_FORMAT_FEATURE_TRANSFER_DST_BIT |
+            VK_FORMAT_FEATURE_BLIT_SRC_BIT |
+            VK_FORMAT_FEATURE_BLIT_DST_BIT |
+            VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT;
+
+        VkFormatFeatureFlags buffer_features =
+            VK_FORMAT_FEATURE_UNIFORM_TEXEL_BUFFER_BIT |
+            VK_FORMAT_FEATURE_STORAGE_TEXEL_BUFFER_BIT |
+            VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT;
+
+        if (format == VK_FORMAT_UNDEFINED) {
+            image_features = 0;
+            buffer_features = 0;
+        }
+
+        pFormatProperties->linearTilingFeatures  = image_features;
+        pFormatProperties->optimalTilingFeatures = image_features;
+        pFormatProperties->bufferFeatures        = buffer_features;
+    }
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -2489,6 +2787,19 @@ vkGetPhysicalDeviceFormatProperties2(VkPhysicalDevice physicalDevice,
     if (!pFormatProperties) return;
     vkGetPhysicalDeviceFormatProperties(physicalDevice, format,
                                         &pFormatProperties->formatProperties);
+
+    for (VkBaseOutStructure *next = (VkBaseOutStructure *)pFormatProperties->pNext;
+         next; next = next->pNext) {
+        if (next->sType == VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_3) {
+            VkFormatProperties3 *props3 = (VkFormatProperties3 *)next;
+            props3->linearTilingFeatures =
+                (VkFormatFeatureFlags2)pFormatProperties->formatProperties.linearTilingFeatures;
+            props3->optimalTilingFeatures =
+                (VkFormatFeatureFlags2)pFormatProperties->formatProperties.optimalTilingFeatures;
+            props3->bufferFeatures =
+                (VkFormatFeatureFlags2)pFormatProperties->formatProperties.bufferFeatures;
+        }
+    }
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL
@@ -2625,6 +2936,8 @@ static inline struct osito_descriptor_pool        *dp_from(VkDescriptorPool h) {
 static inline VkDescriptorPool                     dp_to(struct osito_descriptor_pool *w) { return (VkDescriptorPool)(uintptr_t)w; }
 static inline struct osito_descriptor_set         *ds_from(VkDescriptorSet h) { return (struct osito_descriptor_set *)(uintptr_t)h; }
 static inline VkDescriptorSet                      ds_to(struct osito_descriptor_set *w) { return (VkDescriptorSet)(uintptr_t)w; }
+static inline struct osito_descriptor_update_template *dut_from(VkDescriptorUpdateTemplate h) { return (struct osito_descriptor_update_template *)(uintptr_t)h; }
+static inline VkDescriptorUpdateTemplate dut_to(struct osito_descriptor_update_template *w) { return (VkDescriptorUpdateTemplate)(uintptr_t)w; }
 static inline struct osito_event                  *ev_from(VkEvent h) { return (struct osito_event *)(uintptr_t)h; }
 static inline VkEvent                              ev_to(struct osito_event *w) { return (VkEvent)(uintptr_t)w; }
 static inline struct osito_pipeline_cache         *pc_from(VkPipelineCache h) { return (struct osito_pipeline_cache *)(uintptr_t)h; }
@@ -2696,22 +3009,37 @@ vkCreateDescriptorSetLayout(VkDevice device,
                             const VkDescriptorSetLayoutCreateInfo *pCI,
                             const VkAllocationCallbacks *pAllocator,
                             VkDescriptorSetLayout *pLayout) {
-    if (!device || !pCI || !pLayout) return VK_ERROR_INITIALIZATION_FAILED;
+    extern int printf(const char *, ...);
+    if (!device || !pCI || !pLayout) {
+        printf("[vkldr] DSL bad args dev=%p ci=%p out=%p\n", (void *)device, (void *)pCI, (void *)pLayout);
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    printf("[vkldr] DSL enter dev=%p bindings=%u flags=0x%x\n",
+           (void *)device, pCI->bindingCount, pCI->flags);
     struct osito_device *dw = osito_device_from(device);
     struct osito_icd_inst *ci = dw->owner;
-    if (!ci) return VK_ERROR_INITIALIZATION_FAILED;
+    if (!ci) {
+        printf("[vkldr] DSL missing owner dw=%p\n", (void *)dw);
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
     PFN_vkCreateDescriptorSetLayout fn = (PFN_vkCreateDescriptorSetLayout)
         ci->icd->get_proc_addr(ci->handle, "vkCreateDescriptorSetLayout");
-    if (!fn) return VK_ERROR_INITIALIZATION_FAILED;
+    if (!fn) {
+        printf("[vkldr] DSL missing icd proc ci=%p\n", (void *)ci);
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
     /* Bindings reference VkSampler arrays via pImmutableSamplers. Unwrap if non-NULL. */
-    #define OSITO_DSL_MAX_BIND 32u
+    #define OSITO_DSL_MAX_BIND 256u
     #define OSITO_DSL_MAX_SAMP 16u
     VkDescriptorSetLayoutBinding locals[OSITO_DSL_MAX_BIND];
     VkSampler                    samp_pool[OSITO_DSL_MAX_BIND][OSITO_DSL_MAX_SAMP];
     VkDescriptorSetLayoutCreateInfo tmp = *pCI;
     if (pCI->bindingCount && pCI->pBindings) {
         uint32_t nb = pCI->bindingCount;
-        if (nb > OSITO_DSL_MAX_BIND) nb = OSITO_DSL_MAX_BIND;
+        if (nb > OSITO_DSL_MAX_BIND) {
+            printf("[vkldr] DSL too many bindings %u\n", nb);
+            return VK_ERROR_INITIALIZATION_FAILED;
+        }
         for (uint32_t i = 0; i < nb; i++) {
             locals[i] = pCI->pBindings[i];
             if (locals[i].pImmutableSamplers && locals[i].descriptorCount) {
@@ -2729,7 +3057,18 @@ vkCreateDescriptorSetLayout(VkDevice device,
     }
     VkDescriptorSetLayout real = VK_NULL_HANDLE;
     VkResult rc = fn(dw->real, &tmp, pAllocator, &real);
-    if (rc != VK_SUCCESS || !real) return rc;
+    printf("[vkldr] DSL icd rc=%d real=%p\n", (int)rc, (void *)real);
+    if (rc != VK_SUCCESS || !real) {
+        printf("[vkldr] DSL create failed rc=%d bindings=%u\n", (int)rc, pCI->bindingCount);
+        if (pCI->bindingCount && pCI->pBindings) {
+            printf("[vkldr] DSL first binding=%u type=%u stages=0x%x count=%u\n",
+                   pCI->pBindings[0].binding,
+                   pCI->pBindings[0].descriptorType,
+                   pCI->pBindings[0].stageFlags,
+                   pCI->pBindings[0].descriptorCount);
+        }
+        return rc;
+    }
     struct osito_descriptor_set_layout *w = malloc(sizeof(*w));
     if (!w) return VK_ERROR_OUT_OF_HOST_MEMORY;
     w->owner = dw; w->real = real;
@@ -2894,7 +3233,9 @@ vkUpdateDescriptorSets(VkDevice device,
         }
         if (locals_w[i].pTexelBufferView) {
             for (uint32_t j = 0; j < n; j++)
-                bv_pool[i][j] = locals_w[i].pTexelBufferView[j];
+                bv_pool[i][j] = locals_w[i].pTexelBufferView[j]
+                    ? bv_from(locals_w[i].pTexelBufferView[j])->real
+                    : VK_NULL_HANDLE;
             locals_w[i].pTexelBufferView = bv_pool[i];
         }
         locals_w[i].descriptorCount = n;
@@ -2905,6 +3246,90 @@ vkUpdateDescriptorSets(VkDevice device,
         if (locals_c[i].dstSet) locals_c[i].dstSet = ds_from(locals_c[i].dstSet)->real;
     }
     fn(dw->real, writeCount, locals_w, copyCount, locals_c);
+}
+
+/* --- Descriptor update template --- */
+VKAPI_ATTR VkResult VKAPI_CALL
+vkCreateDescriptorUpdateTemplate(
+        VkDevice device,
+        const VkDescriptorUpdateTemplateCreateInfo *pCI,
+        const VkAllocationCallbacks *pAllocator,
+        VkDescriptorUpdateTemplate *pTemplate) {
+    if (!device || !pCI || !pTemplate) return VK_ERROR_INITIALIZATION_FAILED;
+    struct osito_device *dw = osito_device_from(device);
+    struct osito_icd_inst *ci = dw->owner;
+    if (!ci) return VK_ERROR_INITIALIZATION_FAILED;
+    PFN_vkCreateDescriptorUpdateTemplate fn =
+        (PFN_vkCreateDescriptorUpdateTemplate)ci->icd->get_proc_addr(
+            ci->handle, "vkCreateDescriptorUpdateTemplate");
+    if (!fn) {
+        fn = (PFN_vkCreateDescriptorUpdateTemplate)ci->icd->get_proc_addr(
+            ci->handle, "vkCreateDescriptorUpdateTemplateKHR");
+    }
+    if (!fn) return VK_ERROR_INITIALIZATION_FAILED;
+
+    VkDescriptorUpdateTemplateCreateInfo tmp = *pCI;
+    if (tmp.descriptorSetLayout)
+        tmp.descriptorSetLayout = dsl_from(tmp.descriptorSetLayout)->real;
+    if (tmp.pipelineLayout)
+        tmp.pipelineLayout = pl_from(tmp.pipelineLayout)->real;
+
+    VkDescriptorUpdateTemplate real = VK_NULL_HANDLE;
+    VkResult rc = fn(dw->real, &tmp, pAllocator, &real);
+    if (rc != VK_SUCCESS || !real) return rc;
+    struct osito_descriptor_update_template *w = malloc(sizeof(*w));
+    if (!w) return VK_ERROR_OUT_OF_HOST_MEMORY;
+    w->owner = dw;
+    w->real = real;
+    *pTemplate = dut_to(w);
+    return VK_SUCCESS;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+vkDestroyDescriptorUpdateTemplate(
+        VkDevice device,
+        VkDescriptorUpdateTemplate descriptorUpdateTemplate,
+        const VkAllocationCallbacks *pAllocator) {
+    if (!device || !descriptorUpdateTemplate) return;
+    struct osito_device *dw = osito_device_from(device);
+    struct osito_icd_inst *ci = dw->owner;
+    struct osito_descriptor_update_template *w =
+        dut_from(descriptorUpdateTemplate);
+    if (ci) {
+        PFN_vkDestroyDescriptorUpdateTemplate fn =
+            (PFN_vkDestroyDescriptorUpdateTemplate)ci->icd->get_proc_addr(
+                ci->handle, "vkDestroyDescriptorUpdateTemplate");
+        if (!fn) {
+            fn = (PFN_vkDestroyDescriptorUpdateTemplate)ci->icd->get_proc_addr(
+                ci->handle, "vkDestroyDescriptorUpdateTemplateKHR");
+        }
+        if (fn) fn(dw->real, w->real, pAllocator);
+    }
+    free(w);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+vkUpdateDescriptorSetWithTemplate(
+        VkDevice device,
+        VkDescriptorSet descriptorSet,
+        VkDescriptorUpdateTemplate descriptorUpdateTemplate,
+        const void *pData) {
+    if (!device || !descriptorSet || !descriptorUpdateTemplate) return;
+    struct osito_device *dw = osito_device_from(device);
+    struct osito_icd_inst *ci = dw->owner;
+    if (!ci) return;
+    PFN_vkUpdateDescriptorSetWithTemplate fn =
+        (PFN_vkUpdateDescriptorSetWithTemplate)ci->icd->get_proc_addr(
+            ci->handle, "vkUpdateDescriptorSetWithTemplate");
+    if (!fn) {
+        fn = (PFN_vkUpdateDescriptorSetWithTemplate)ci->icd->get_proc_addr(
+            ci->handle, "vkUpdateDescriptorSetWithTemplateKHR");
+    }
+    if (!fn) return;
+    VkDescriptorSet real_set = ds_from(descriptorSet)->real;
+    VkDescriptorUpdateTemplate real_tpl =
+        dut_from(descriptorUpdateTemplate)->real;
+    fn(dw->real, real_set, real_tpl, pData);
 }
 
 /* --- Event --- */

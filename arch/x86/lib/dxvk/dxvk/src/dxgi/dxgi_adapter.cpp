@@ -17,6 +17,50 @@
 
 namespace dxvk {
 
+#ifdef __OSITO_K__
+  template<typename Desc>
+  static void dxgiOsitoFillAdapterBaseDesc(Desc* pDesc) {
+    const char name[] = "OsitoK Venus";
+
+    std::memset(pDesc, 0, sizeof(*pDesc));
+
+    for (uint32_t i = 0; i + 1 < sizeof(pDesc->Description) / sizeof(pDesc->Description[0]) && name[i]; i++)
+      pDesc->Description[i] = name[i];
+
+    pDesc->VendorId              = uint32_t(DxvkGpuVendor::Amd);
+    pDesc->DeviceId              = 0x73df;
+    pDesc->SubSysId              = 0;
+    pDesc->Revision              = 0;
+    pDesc->DedicatedVideoMemory  = 1024ull * 1024ull * 1024ull;
+    pDesc->DedicatedSystemMemory = 0;
+    pDesc->SharedSystemMemory    = 3ull * 1024ull * 1024ull * 1024ull;
+    pDesc->AdapterLuid           = LUID { 1, 0 };
+  }
+
+  static void dxgiOsitoFillAdapterDesc(DXGI_ADAPTER_DESC* pDesc) {
+    dxgiOsitoFillAdapterBaseDesc(pDesc);
+  }
+
+  static void dxgiOsitoFillAdapterDesc(DXGI_ADAPTER_DESC1* pDesc) {
+    dxgiOsitoFillAdapterBaseDesc(pDesc);
+    pDesc->Flags = 0;
+  }
+
+  static void dxgiOsitoFillAdapterDesc(DXGI_ADAPTER_DESC2* pDesc) {
+    dxgiOsitoFillAdapterBaseDesc(pDesc);
+    pDesc->Flags = 0;
+    pDesc->GraphicsPreemptionGranularity = DXGI_GRAPHICS_PREEMPTION_DMA_BUFFER_BOUNDARY;
+    pDesc->ComputePreemptionGranularity  = DXGI_COMPUTE_PREEMPTION_DMA_BUFFER_BOUNDARY;
+  }
+
+  static void dxgiOsitoFillAdapterDesc(DXGI_ADAPTER_DESC3* pDesc) {
+    dxgiOsitoFillAdapterBaseDesc(pDesc);
+    pDesc->Flags = DXGI_ADAPTER_FLAG3_NONE;
+    pDesc->GraphicsPreemptionGranularity = DXGI_GRAPHICS_PREEMPTION_DMA_BUFFER_BOUNDARY;
+    pDesc->ComputePreemptionGranularity  = DXGI_COMPUTE_PREEMPTION_DMA_BUFFER_BOUNDARY;
+  }
+#endif
+
   DxgiVkAdapter::DxgiVkAdapter(DxgiAdapter* pAdapter)
   : m_adapter(pAdapter) {
 
@@ -190,6 +234,11 @@ namespace dxvk {
     if (pDesc == nullptr)
       return E_INVALIDARG;
 
+#ifdef __OSITO_K__
+    dxgiOsitoFillAdapterDesc(pDesc);
+    return S_OK;
+#endif
+
     DXGI_ADAPTER_DESC3 desc;
     HRESULT hr = GetDesc3(&desc);
     
@@ -213,6 +262,11 @@ namespace dxvk {
   HRESULT STDMETHODCALLTYPE DxgiAdapter::GetDesc1(DXGI_ADAPTER_DESC1* pDesc) {
     if (pDesc == nullptr)
       return E_INVALIDARG;
+
+#ifdef __OSITO_K__
+    dxgiOsitoFillAdapterDesc(pDesc);
+    return S_OK;
+#endif
 
     DXGI_ADAPTER_DESC3 desc;
     HRESULT hr = GetDesc3(&desc);
@@ -238,6 +292,11 @@ namespace dxvk {
   HRESULT STDMETHODCALLTYPE DxgiAdapter::GetDesc2(DXGI_ADAPTER_DESC2* pDesc) {
     if (pDesc == nullptr)
       return E_INVALIDARG;
+
+#ifdef __OSITO_K__
+    dxgiOsitoFillAdapterDesc(pDesc);
+    return S_OK;
+#endif
 
     DXGI_ADAPTER_DESC3 desc;
     HRESULT hr = GetDesc3(&desc);
@@ -266,6 +325,11 @@ namespace dxvk {
           DXGI_ADAPTER_DESC3*       pDesc) {
     if (pDesc == nullptr)
       return E_INVALIDARG;
+
+#ifdef __OSITO_K__
+    dxgiOsitoFillAdapterDesc(pDesc);
+    return S_OK;
+#endif
     
     const DxgiOptions* options = m_factory->GetOptions();
     

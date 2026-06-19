@@ -136,6 +136,19 @@ namespace dxvk {
   DxvkNameSet DxvkNameSet::enumDeviceExtensions(
     const Rc<vk::InstanceFn>& vki,
           VkPhysicalDevice    device) {
+#ifdef __OSITO_K__
+    static const char* const ositoDeviceExtensions[] = {
+      "VK_KHR_swapchain",
+      "VK_EXT_robustness2",
+      "VK_EXT_transform_feedback",
+    };
+
+    (void)vki;
+    (void)device;
+    return DxvkNameSet(
+      sizeof(ositoDeviceExtensions) / sizeof(ositoDeviceExtensions[0]),
+      ositoDeviceExtensions);
+#else
     uint32_t entryCount = 0;
     if (vki->vkEnumerateDeviceExtensionProperties(
           device, nullptr, &entryCount, nullptr) != VK_SUCCESS)
@@ -150,6 +163,7 @@ namespace dxvk {
     for (uint32_t i = 0; i < entryCount; i++)
       set.m_names.insert({ entries[i].extensionName, entries[i].specVersion });
     return set;
+#endif
   }
   
 }

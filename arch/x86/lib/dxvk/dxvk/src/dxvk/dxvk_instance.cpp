@@ -9,6 +9,8 @@
 #include <algorithm>
 #include <sstream>
 
+extern "C" int printf(const char*, ...);
+
 namespace dxvk {
   
   DxvkInstance::DxvkInstance(DxvkInstanceFlags flags)
@@ -18,19 +20,27 @@ namespace dxvk {
 
 
   DxvkInstance::DxvkInstance(const DxvkInstanceImportInfo& args, DxvkInstanceFlags flags) {
+    printf("[DXVKinst] ctor begin flags=0x%x imported=%d\n",
+      flags.raw(), args.instance != VK_NULL_HANDLE);
     Logger::info(str::format("Game: ", env::getExeName()));
     Logger::info(str::format("DXVK: ", DXVK_VERSION));
 
+    printf("[DXVKinst] wsi init begin\n");
     wsi::init();
+    printf("[DXVKinst] wsi init done\n");
 
+    printf("[DXVKinst] config begin\n");
     m_config = Config::getUserConfig();
     m_config.merge(Config::getAppConfig(env::getExePath()));
     m_config.logOptions();
 
     m_options = DxvkOptions(m_config);
+    printf("[DXVKinst] config done\n");
 
     // Load Vulkan library
+    printf("[DXVKinst] createLibraryLoader begin\n");
     createLibraryLoader(args);
+    printf("[DXVKinst] createLibraryLoader done valid=%d\n", (int)m_vkl->valid());
 
     if (!m_vkl->valid())
       dxvk::DxvkError::abort_ositok("Failed to load vulkan-1 library.");
@@ -46,21 +56,32 @@ namespace dxvk {
     for (const auto& provider : m_extProviders)
       Logger::info(str::format("  ", provider->getName()));
 
+    printf("[DXVKinst] init instance ext providers begin\n");
     for (const auto& provider : m_extProviders)
       provider->initInstanceExtensions();
+    printf("[DXVKinst] init instance ext providers done\n");
 
+    printf("[DXVKinst] createInstanceLoader begin\n");
     createInstanceLoader(args, flags);
-    m_adapters = this->queryAdapters();
+    printf("[DXVKinst] createInstanceLoader done\n");
 
+    printf("[DXVKinst] queryAdapters begin\n");
+    m_adapters = this->queryAdapters();
+    printf("[DXVKinst] queryAdapters done count=%u\n", (unsigned)m_adapters.size());
+
+    printf("[DXVKinst] init device ext providers begin\n");
     for (const auto& provider : m_extProviders)
       provider->initDeviceExtensions(this);
+    printf("[DXVKinst] init device ext providers done\n");
 
+    printf("[DXVKinst] enable adapter extensions begin\n");
     for (uint32_t i = 0; i < m_adapters.size(); i++) {
       for (const auto& provider : m_extProviders) {
         m_adapters[i]->enableExtensions(
           provider->getDeviceExtensions(i));
       }
     }
+    printf("[DXVKinst] ctor done\n");
   }
   
   
@@ -112,6 +133,7 @@ namespace dxvk {
 
 
   void DxvkInstance::createInstanceLoader(const DxvkInstanceImportInfo& args, DxvkInstanceFlags flags) {
+    printf("[DXVKinst] CIL start imported=%d\n", args.instance != VK_NULL_HANDLE);
     DxvkNameList layerList;
     DxvkNameList extensionList;
     DxvkNameSet extensionSet;
@@ -156,14 +178,21 @@ namespace dxvk {
 
       // Get set of extensions to enable based on available
       // extensions and extension providers.
+      printf("[DXVKinst] CIL getExtensionList begin\n");
       auto extensionInfos = getExtensionList(m_extensions, enableDebug);
+      printf("[DXVKinst] CIL enumInstanceExtensions begin\n");
       DxvkNameSet extensionsAvailable = DxvkNameSet::enumInstanceExtensions(m_vkl);
+      printf("[DXVKinst] CIL enumInstanceExtensions done\n");
 
+      printf("[DXVKinst] CIL enableExtensions begin count=%u\n", (unsigned)extensionInfos.size());
       if (!extensionsAvailable.enableExtensions(extensionInfos.size(), extensionInfos.data(), &extensionSet))
         dxvk::DxvkError::abort_ositok("DxvkInstance: Required instance extensions not supported");
+      printf("[DXVKinst] CIL enableExtensions done\n");
 
+      printf("[DXVKinst] CIL merge provider extensions begin\n");
       for (const auto& provider : m_extProviders)
         extensionSet.merge(provider->getInstanceExtensions());
+      printf("[DXVKinst] CIL merge provider extensions done\n");
 
       // Generate list of extensions to enable
       extensionList = extensionSet.toNameList();
@@ -192,14 +221,20 @@ namespace dxvk {
       info.enabledExtensionCount    = extensionList.count();
       info.ppEnabledExtensionNames  = extensionList.names();
 
+      printf("[DXVKinst] vkCreateInstance begin layers=%u exts=%u\n",
+        layerList.count(), extensionList.count());
       VkResult status = m_vkl->vkCreateInstance(&info, nullptr, &instance);
+      printf("[DXVKinst] vkCreateInstance done status=%d instance=%p\n",
+        status, (void*)instance);
 
       if (status != VK_SUCCESS)
         dxvk::DxvkError::abort_ositok("DxvkInstance::createInstance: Failed to create Vulkan 1.1 instance");
     }
 
     // Create the Vulkan instance loader
+    printf("[DXVKinst] new InstanceFn begin\n");
     m_vki = new vk::InstanceFn(m_vkl, !args.instance, instance);
+    printf("[DXVKinst] new InstanceFn done\n");
 
     if (enableValidation) {
       VkDebugUtilsMessengerCreateInfoEXT messengerInfo = { VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT };
@@ -239,18 +274,27 @@ namespace dxvk {
 
   std::vector<Rc<DxvkAdapter>> DxvkInstance::queryAdapters() {
     uint32_t numAdapters = 0;
+    printf("[DXVKinst] vkEnumeratePhysicalDevices count begin\n");
     if (m_vki->vkEnumeratePhysicalDevices(m_vki->instance(), &numAdapters, nullptr) != VK_SUCCESS)
       dxvk::DxvkError::abort_ositok("DxvkInstance::enumAdapters: Failed to enumerate adapters");
+    printf("[DXVKinst] vkEnumeratePhysicalDevices count done n=%u\n", numAdapters);
     
     std::vector<VkPhysicalDevice> adapters(numAdapters);
+    printf("[DXVKinst] vkEnumeratePhysicalDevices list begin\n");
     if (m_vki->vkEnumeratePhysicalDevices(m_vki->instance(), &numAdapters, adapters.data()) != VK_SUCCESS)
       dxvk::DxvkError::abort_ositok("DxvkInstance::enumAdapters: Failed to enumerate adapters");
+    printf("[DXVKinst] vkEnumeratePhysicalDevices list done n=%u\n", numAdapters);
 
     std::vector<VkPhysicalDeviceProperties> deviceProperties(numAdapters);
     DxvkDeviceFilterFlags filterFlags = 0;
 
     for (uint32_t i = 0; i < numAdapters; i++) {
+      printf("[DXVKinst] vkGetPhysicalDeviceProperties begin i=%u dev=%p\n",
+        i, (void*)adapters[i]);
       m_vki->vkGetPhysicalDeviceProperties(adapters[i], &deviceProperties[i]);
+      printf("[DXVKinst] vkGetPhysicalDeviceProperties done i=%u type=%u vendor=0x%x device=0x%x\n",
+        i, deviceProperties[i].deviceType, deviceProperties[i].vendorID,
+        deviceProperties[i].deviceID);
 
       if (deviceProperties[i].deviceType != VK_PHYSICAL_DEVICE_TYPE_CPU)
         filterFlags.set(DxvkDeviceFilterFlag::SkipCpuDevices);
@@ -264,7 +308,10 @@ namespace dxvk {
 
     for (uint32_t i = 0; i < numAdapters; i++) {
       if (filter.testAdapter(deviceProperties[i])) {
+        printf("[DXVKinst] new DxvkAdapter begin i=%u\n", i);
         result.push_back(new DxvkAdapter(m_vki, adapters[i]));
+        printf("[DXVKinst] new DxvkAdapter done i=%u result=%u\n",
+          i, (unsigned)result.size());
 
         if (deviceProperties[i].deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU)
           numDGPU += 1;

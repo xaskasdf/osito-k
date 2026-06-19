@@ -9,10 +9,13 @@
  */
 
 #include "../include/types.h"
+#include "../include/paging.h"
 
 extern void serial_puts(const char *s);
 extern void serial_putdec(uint64_t val);
 extern void serial_puthex(uint64_t val, int digits);
+extern void *mem_alloc_aligned(uint64_t size, uint64_t alignment);
+extern void  mem_free_pages(void *addr, uint64_t count);
 
 /* ── Block Device Interface ──────────────────────────────────── */
 
@@ -234,20 +237,21 @@ int disk_write_bytes(uint64_t byte_offset, const void *buf, uint64_t len)
         return -1;
     }
 
+    uint32_t ssz = d->sector_size;
+    if (ssz > 8192) return -1;
+
     const uint8_t *src = (const uint8_t *)buf;
     uint64_t off  = byte_offset;
     uint64_t left = len;
-    /* Page-aligned so the 2-page PRP1/PRP2 split nvme_write does is on a
-     * clean 4 KB boundary (mirrors the read path's tmp buffer below). */
-    uint8_t  tmp[8192] __attribute__((aligned(4096)));
-    uint32_t ssz = d->sector_size;
-    if (ssz > sizeof(tmp)) return -1;
+    void *tmp_phys = mem_alloc_aligned(8192, 4096);
+    if (!tmp_phys) return -1;
+    uint8_t *tmp = (uint8_t *)PHYS_TO_VIRT(tmp_phys);
 
     while (left > 0) {
         uint64_t lba   = off / ssz;
         uint32_t intra = (uint32_t)(off % ssz);
-        uint32_t want  = (uint32_t)((left < (sizeof(tmp) - intra))
-                                    ? left : (sizeof(tmp) - intra));
+        uint32_t want  = (uint32_t)((left < (8192 - intra))
+                                    ? left : (8192 - intra));
         uint32_t sectors = (intra + want + ssz - 1) / ssz;
 
         /* Read-modify-write only when the write doesn't span full sectors.
@@ -261,7 +265,7 @@ int disk_write_bytes(uint64_t byte_offset, const void *buf, uint64_t len)
          * and the only realistic content for unwritten flash. */
         bool partial = (intra != 0) || ((intra + want) % ssz != 0);
         if (partial) {
-            if (d->read(lba, sectors, tmp) < 0) {
+            if (d->read(lba, sectors, tmp_phys) < 0) {
                 /* Unread → assume zero-fill. Only the bytes outside
                  * [intra..intra+want] matter; we'll overwrite the rest. */
                 for (uint32_t i = 0; i < sectors * ssz; i++) tmp[i] = 0;
@@ -269,10 +273,11 @@ int disk_write_bytes(uint64_t byte_offset, const void *buf, uint64_t len)
         }
 
         for (uint32_t i = 0; i < want; i++) tmp[intra + i] = src[i];
-        if (d->write(lba, sectors, tmp) < 0) {
+        if (d->write(lba, sectors, tmp_phys) < 0) {
             serial_puts("[BLK] disk_write_bytes: write failed lba=");
             serial_putdec(lba);
             serial_puts("\n");
+            mem_free_pages(tmp_phys, 2);
             return -1;
         }
 
@@ -280,6 +285,7 @@ int disk_write_bytes(uint64_t byte_offset, const void *buf, uint64_t len)
         off  += want;
         left -= want;
     }
+    mem_free_pages(tmp_phys, 2);
     return 0;
 }
 
@@ -317,35 +323,35 @@ int disk_read_bytes(uint64_t byte_offset, void *buf, uint64_t len)
     blkdev_t *d = &devices[active_dev];
     if (!d->active || !d->read || d->sector_size == 0) return -1;
 
+    uint32_t ssz   = d->sector_size;
+    if (ssz > 8192)             /* defensive — 4 KB sectors fit */
+        return -1;
+
     uint8_t *dst   = (uint8_t *)buf;
     uint64_t off   = byte_offset;
     uint64_t left  = len;
-    /* MUST be page-aligned AND in lower-half identity (so its virt addr
-     * equals its phys, since nvme_read passes the buffer pointer
-     * directly as PRP1/PRP2).  Stack-allocated with aligned(4096) lives
-     * in the kernel stack, which is in lower-half identity-mapped
-     * memory during early boot — so the address GCC gives us IS the
-     * phys NVMe DMA needs.  Cannot use a `static` .bss buffer because
-     * .bss is in the upper-half kernel mirror, where virt != phys. */
-    uint8_t tmp[8192] __attribute__((aligned(4096)));
-    uint32_t ssz   = d->sector_size;
-    if (ssz > sizeof(tmp))             /* defensive — 4 KB sectors fit */
-        return -1;
+    void *tmp_phys = mem_alloc_aligned(8192, 4096);
+    if (!tmp_phys) return -1;
+    uint8_t *tmp = (uint8_t *)PHYS_TO_VIRT(tmp_phys);
 
     while (left > 0) {
         uint64_t lba    = off / ssz;
         uint32_t intra  = (uint32_t)(off % ssz);
-        uint32_t want   = (uint32_t)((left < (sizeof(tmp) - intra))
-                                     ? left : (sizeof(tmp) - intra));
+        uint32_t want   = (uint32_t)((left < (8192 - intra))
+                                     ? left : (8192 - intra));
         uint32_t sectors = (intra + want + ssz - 1) / ssz;
 
-        if (d->read(lba, sectors, tmp) < 0) return -1;
+        if (d->read(lba, sectors, tmp_phys) < 0) {
+            mem_free_pages(tmp_phys, 2);
+            return -1;
+        }
 
         for (uint32_t i = 0; i < want; i++) dst[i] = tmp[intra + i];
         dst  += want;
         off  += want;
         left -= want;
     }
+    mem_free_pages(tmp_phys, 2);
     return 0;
 }
 

@@ -22,6 +22,7 @@
  *   0x9 (1001b—using full 4-bit marker 0x9000) render pass (W3b.4)
  *   0xE         image         (W3b.4)
  *   0xD         image view    (W3b.4)
+ *   0x4         buffer view   (W4.9 guest-local typed buffer view)
  *   0xB         framebuffer   (W3b.4)
  *   0xF         pipeline layout (W3b.4)
  *   0x7         pipeline      (W3b.4)   (re-uses bit63=0 which is fine
@@ -95,7 +96,12 @@ extern int venus_cmd_encode_CmdDraw(struct venus_wire *, uint64_t, uint64_t,
 #define VENUS_H_MARKER_RP           0x9000000000000000ull
 #define VENUS_H_MARKER_IMAGE        0xE000000000000000ull
 #define VENUS_H_MARKER_IMGVIEW      0xD000000000000000ull
+#define VENUS_H_MARKER_BUFVIEW      0x4000000000000000ull
 #define VENUS_H_MARKER_SAMPLER      0x5000000000000000ull
+#define VENUS_H_MARKER_DPOOL        0x1000000000000000ull
+#define VENUS_H_MARKER_DSL          0x2000000000000000ull
+#define VENUS_H_MARKER_DSET         0x3000000000000000ull
+#define VENUS_H_MARKER_DTEMPLATE    0x0000000000000000ull
 #define VENUS_H_MARKER_FB           0xB000000000000000ull
 #define VENUS_H_MARKER_PLLAYOUT     0xF000000000000000ull
 #define VENUS_H_MARKER_PIPELINE     0x7000000000000000ull
@@ -122,8 +128,13 @@ DEFINE_SLOT_ALLOC(shader,   shaders,       VENUS_MAX_SHADER_OBJECTS)
 DEFINE_SLOT_ALLOC(rp,       render_passes, VENUS_MAX_RP_OBJECTS)
 DEFINE_SLOT_ALLOC(image,    images,        VENUS_MAX_IMAGE_OBJECTS)
 DEFINE_SLOT_ALLOC(imgview,  image_views,   VENUS_MAX_IMAGE_VIEW_OBJECTS)
+DEFINE_SLOT_ALLOC(bufview,  buffer_views,  VENUS_MAX_BUFFER_VIEW_OBJECTS)
 DEFINE_SLOT_ALLOC(sampler,  samplers,      VENUS_MAX_SAMPLER_OBJECTS)
 DEFINE_SLOT_ALLOC(fb,       framebuffers,  VENUS_MAX_FB_OBJECTS)
+DEFINE_SLOT_ALLOC(dsl,      desc_layouts,  VENUS_MAX_DESC_LAYOUT_OBJECTS)
+DEFINE_SLOT_ALLOC(dpool,    desc_pools,    VENUS_MAX_DESC_POOL_OBJECTS)
+DEFINE_SLOT_ALLOC(dset,     desc_sets,     VENUS_MAX_DESC_SET_OBJECTS)
+DEFINE_SLOT_ALLOC(dtpl,     desc_templates, VENUS_MAX_DESC_TPL_OBJECTS)
 DEFINE_SLOT_ALLOC(pllayout, pl_layouts,    VENUS_MAX_PL_LAYOUT_OBJECTS)
 DEFINE_SLOT_ALLOC(pipeline, pipelines,     VENUS_MAX_PIPELINE_OBJECTS)
 DEFINE_SLOT_ALLOC(cmdpool,  cmd_pools,     VENUS_MAX_CMD_POOL_OBJECTS)
@@ -283,7 +294,10 @@ venus_GetImageMemoryRequirements(VkDevice device, VkImage image,
     if (dev->parent && dev->parent->wire && img->host_id != 0) {
         int rc = venus_cmd_encode_GetImageMemoryRequirements(
                 dev->parent->wire, dev->host_handle, img->host_id, pReqs);
-        if (rc == 0) return;
+        if (rc == 0 && pReqs->size != 0 &&
+            pReqs->alignment != 0 &&
+            pReqs->memoryTypeBits != 0)
+            return;
     }
     /* Guest-local fallback: assume RGBA8 4bpp, 256-byte alignment. */
     uint64_t bpp = 4u;
@@ -370,6 +384,49 @@ venus_DestroyImageView(VkDevice device, VkImageView view,
         (void)venus_cmd_encode_DestroyImageView(dev->parent->wire,
                                                 dev->host_handle, iv->host_id);
     memset(iv, 0, sizeof(*iv));
+}
+
+/* --- Buffer View ---
+ * Guest-local typed buffer views unblock DXVK's raw/structured buffer SRV/UAV
+ * setup while the venus wire encoder only covers image views. */
+VKAPI_ATTR VkResult VKAPI_CALL
+venus_CreateBufferView(VkDevice device,
+                       const VkBufferViewCreateInfo *pCreateInfo,
+                       const VkAllocationCallbacks *pAllocator,
+                       VkBufferView *pView) {
+    (void)pAllocator;
+    if (!device || !pCreateInfo || !pCreateInfo->buffer || !pView)
+        return VK_ERROR_INITIALIZATION_FAILED;
+    struct venus_device *dev = (struct venus_device *)device;
+    int bslot = HANDLE_TO_SLOT(pCreateInfo->buffer);
+    if (bslot < 0 || bslot >= (int)VENUS_MAX_BUF_OBJECTS ||
+        !dev->buffers[bslot].in_use)
+        return VK_ERROR_INITIALIZATION_FAILED;
+
+    int slot = bufview_slot_alloc(dev);
+    if (slot < 0) return VK_ERROR_OUT_OF_HOST_MEMORY;
+    struct venus_buffer_view *bv = &dev->buffer_views[slot];
+    bv->host_id     = 0;
+    bv->buffer_slot = bslot;
+    bv->format      = (uint32_t)pCreateInfo->format;
+    bv->offset      = (uint64_t)pCreateInfo->offset;
+    bv->range       = (uint64_t)pCreateInfo->range;
+
+    *pView = (VkBufferView)MAKE_SLOT_HANDLE(dev, slot, VENUS_H_MARKER_BUFVIEW);
+    return VK_SUCCESS;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+venus_DestroyBufferView(VkDevice device, VkBufferView view,
+                        const VkAllocationCallbacks *pAllocator) {
+    (void)pAllocator;
+    if (!device || !view) return;
+    struct venus_device *dev = (struct venus_device *)device;
+    int slot = HANDLE_TO_SLOT(view);
+    if (slot < 0 || slot >= (int)VENUS_MAX_BUFFER_VIEW_OBJECTS) return;
+    struct venus_buffer_view *bv = &dev->buffer_views[slot];
+    if (!bv->in_use) return;
+    memset(bv, 0, sizeof(*bv));
 }
 
 /* --- Sampler ---
@@ -475,6 +532,191 @@ venus_DestroyFramebuffer(VkDevice device, VkFramebuffer fb,
     memset(f, 0, sizeof(*f));
 }
 
+/* --- Descriptor state ---
+ *
+ * Venus does not forward descriptors over the wire yet. DXVK still expects
+ * these objects to exist before it can build pipeline layouts and binding
+ * sets, so keep guest-local opaque handles and accept descriptor updates as
+ * no-ops for the current software/WSI fallback path.
+ */
+VKAPI_ATTR VkResult VKAPI_CALL
+venus_CreateDescriptorSetLayout(VkDevice device,
+                                const VkDescriptorSetLayoutCreateInfo *pCreateInfo,
+                                const VkAllocationCallbacks *pAllocator,
+                                VkDescriptorSetLayout *pLayout) {
+    (void)pAllocator;
+    if (!device || !pCreateInfo || !pLayout) return VK_ERROR_INITIALIZATION_FAILED;
+    struct venus_device *dev = (struct venus_device *)device;
+    int slot = dsl_slot_alloc(dev);
+    if (slot < 0) return VK_ERROR_OUT_OF_HOST_MEMORY;
+    struct venus_descriptor_set_layout *dsl = &dev->desc_layouts[slot];
+    dsl->host_id = 0;
+    dsl->binding_count = pCreateInfo->bindingCount;
+    *pLayout = (VkDescriptorSetLayout)MAKE_SLOT_HANDLE(dev, slot, VENUS_H_MARKER_DSL);
+    return VK_SUCCESS;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+venus_DestroyDescriptorSetLayout(VkDevice device, VkDescriptorSetLayout layout,
+                                 const VkAllocationCallbacks *pAllocator) {
+    (void)pAllocator;
+    if (!device || !layout) return;
+    struct venus_device *dev = (struct venus_device *)device;
+    int slot = HANDLE_TO_SLOT(layout);
+    if (slot < 0 || slot >= (int)VENUS_MAX_DESC_LAYOUT_OBJECTS) return;
+    memset(&dev->desc_layouts[slot], 0, sizeof(dev->desc_layouts[slot]));
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+venus_CreateDescriptorPool(VkDevice device,
+                           const VkDescriptorPoolCreateInfo *pCreateInfo,
+                           const VkAllocationCallbacks *pAllocator,
+                           VkDescriptorPool *pPool) {
+    (void)pAllocator;
+    if (!device || !pCreateInfo || !pPool) return VK_ERROR_INITIALIZATION_FAILED;
+    struct venus_device *dev = (struct venus_device *)device;
+    int slot = dpool_slot_alloc(dev);
+    if (slot < 0) return VK_ERROR_OUT_OF_HOST_MEMORY;
+    struct venus_descriptor_pool *pool = &dev->desc_pools[slot];
+    pool->max_sets = pCreateInfo->maxSets;
+    pool->alloc_count = 0;
+    *pPool = (VkDescriptorPool)MAKE_SLOT_HANDLE(dev, slot, VENUS_H_MARKER_DPOOL);
+    return VK_SUCCESS;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+venus_DestroyDescriptorPool(VkDevice device, VkDescriptorPool pool,
+                            const VkAllocationCallbacks *pAllocator) {
+    (void)pAllocator;
+    if (!device || !pool) return;
+    struct venus_device *dev = (struct venus_device *)device;
+    int slot = HANDLE_TO_SLOT(pool);
+    if (slot < 0 || slot >= (int)VENUS_MAX_DESC_POOL_OBJECTS) return;
+    memset(&dev->desc_pools[slot], 0, sizeof(dev->desc_pools[slot]));
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+venus_AllocateDescriptorSets(VkDevice device,
+                             const VkDescriptorSetAllocateInfo *pAllocateInfo,
+                             VkDescriptorSet *pDescriptorSets) {
+    if (!device || !pAllocateInfo || !pDescriptorSets)
+        return VK_ERROR_INITIALIZATION_FAILED;
+    struct venus_device *dev = (struct venus_device *)device;
+    int pool_slot = HANDLE_TO_SLOT(pAllocateInfo->descriptorPool);
+    if (pool_slot < 0 || pool_slot >= (int)VENUS_MAX_DESC_POOL_OBJECTS)
+        return VK_ERROR_INITIALIZATION_FAILED;
+    struct venus_descriptor_pool *pool = &dev->desc_pools[pool_slot];
+    if (!pool->in_use) return VK_ERROR_INITIALIZATION_FAILED;
+    if (pool->alloc_count + pAllocateInfo->descriptorSetCount > pool->max_sets)
+        return VK_ERROR_OUT_OF_POOL_MEMORY;
+
+    int allocated[16];
+    uint32_t count = pAllocateInfo->descriptorSetCount;
+    if (count > 16u) return VK_ERROR_OUT_OF_HOST_MEMORY;
+
+    for (uint32_t i = 0; i < count; i++) {
+        int layout_slot = HANDLE_TO_SLOT(pAllocateInfo->pSetLayouts[i]);
+        if (layout_slot < 0 || layout_slot >= (int)VENUS_MAX_DESC_LAYOUT_OBJECTS ||
+            !dev->desc_layouts[layout_slot].in_use) {
+            for (uint32_t j = 0; j < i; j++)
+                memset(&dev->desc_sets[allocated[j]], 0, sizeof(dev->desc_sets[allocated[j]]));
+            return VK_ERROR_INITIALIZATION_FAILED;
+        }
+        int set_slot = dset_slot_alloc(dev);
+        if (set_slot < 0) {
+            for (uint32_t j = 0; j < i; j++)
+                memset(&dev->desc_sets[allocated[j]], 0, sizeof(dev->desc_sets[allocated[j]]));
+            return VK_ERROR_OUT_OF_HOST_MEMORY;
+        }
+        allocated[i] = set_slot;
+        struct venus_descriptor_set *set = &dev->desc_sets[set_slot];
+        set->pool_slot = pool_slot;
+        set->layout_slot = layout_slot;
+        pDescriptorSets[i] =
+            (VkDescriptorSet)MAKE_SLOT_HANDLE(dev, set_slot, VENUS_H_MARKER_DSET);
+    }
+
+    pool->alloc_count += count;
+    return VK_SUCCESS;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+venus_FreeDescriptorSets(VkDevice device, VkDescriptorPool pool,
+                         uint32_t descriptorSetCount,
+                         const VkDescriptorSet *pDescriptorSets) {
+    if (!device || !pDescriptorSets) return VK_SUCCESS;
+    struct venus_device *dev = (struct venus_device *)device;
+    int pool_slot = pool ? HANDLE_TO_SLOT(pool) : -1;
+    struct venus_descriptor_pool *dp =
+        (pool_slot >= 0 && pool_slot < (int)VENUS_MAX_DESC_POOL_OBJECTS)
+            ? &dev->desc_pools[pool_slot] : NULL;
+    for (uint32_t i = 0; i < descriptorSetCount; i++) {
+        int slot = HANDLE_TO_SLOT(pDescriptorSets[i]);
+        if (slot < 0 || slot >= (int)VENUS_MAX_DESC_SET_OBJECTS) continue;
+        if (dev->desc_sets[slot].in_use && dp && dp->alloc_count)
+            dp->alloc_count--;
+        memset(&dev->desc_sets[slot], 0, sizeof(dev->desc_sets[slot]));
+    }
+    return VK_SUCCESS;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+venus_UpdateDescriptorSets(VkDevice device,
+                           uint32_t descriptorWriteCount,
+                           const VkWriteDescriptorSet *pDescriptorWrites,
+                           uint32_t descriptorCopyCount,
+                           const VkCopyDescriptorSet *pDescriptorCopies) {
+    (void)device;
+    (void)descriptorWriteCount;
+    (void)pDescriptorWrites;
+    (void)descriptorCopyCount;
+    (void)pDescriptorCopies;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+venus_CreateDescriptorUpdateTemplate(
+        VkDevice device,
+        const VkDescriptorUpdateTemplateCreateInfo *pCreateInfo,
+        const VkAllocationCallbacks *pAllocator,
+        VkDescriptorUpdateTemplate *pDescriptorUpdateTemplate) {
+    (void)pAllocator;
+    if (!device || !pCreateInfo || !pDescriptorUpdateTemplate)
+        return VK_ERROR_INITIALIZATION_FAILED;
+    struct venus_device *dev = (struct venus_device *)device;
+    int slot = dtpl_slot_alloc(dev);
+    if (slot < 0) return VK_ERROR_OUT_OF_HOST_MEMORY;
+    struct venus_descriptor_update_template *tpl = &dev->desc_templates[slot];
+    tpl->entry_count = pCreateInfo->descriptorUpdateEntryCount;
+    tpl->template_type = (uint32_t)pCreateInfo->templateType;
+    *pDescriptorUpdateTemplate =
+        (VkDescriptorUpdateTemplate)MAKE_SLOT_HANDLE(dev, slot, VENUS_H_MARKER_DTEMPLATE);
+    return VK_SUCCESS;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+venus_DestroyDescriptorUpdateTemplate(
+        VkDevice device,
+        VkDescriptorUpdateTemplate descriptorUpdateTemplate,
+        const VkAllocationCallbacks *pAllocator) {
+    (void)pAllocator;
+    if (!device || !descriptorUpdateTemplate) return;
+    struct venus_device *dev = (struct venus_device *)device;
+    int slot = HANDLE_TO_SLOT(descriptorUpdateTemplate);
+    if (slot < 0 || slot >= (int)VENUS_MAX_DESC_TPL_OBJECTS) return;
+    memset(&dev->desc_templates[slot], 0, sizeof(dev->desc_templates[slot]));
+}
+
+VKAPI_ATTR void VKAPI_CALL
+venus_UpdateDescriptorSetWithTemplate(VkDevice device,
+                                      VkDescriptorSet descriptorSet,
+                                      VkDescriptorUpdateTemplate descriptorUpdateTemplate,
+                                      const void *pData) {
+    (void)device;
+    (void)descriptorSet;
+    (void)descriptorUpdateTemplate;
+    (void)pData;
+}
+
 /* --- Pipeline Layout --- */
 VKAPI_ATTR VkResult VKAPI_CALL
 venus_CreatePipelineLayout(VkDevice device,
@@ -483,17 +725,17 @@ venus_CreatePipelineLayout(VkDevice device,
                            VkPipelineLayout *pLayout) {
     (void)pAllocator;
     if (!device || !pCreateInfo || !pLayout) return VK_ERROR_INITIALIZATION_FAILED;
-    /* W3b.4 subset: empty layout only. */
-    if (pCreateInfo->setLayoutCount != 0 ||
-        pCreateInfo->pushConstantRangeCount != 0)
-        return VK_ERROR_INITIALIZATION_FAILED;
     struct venus_device *dev = (struct venus_device *)device;
     int slot = pllayout_slot_alloc(dev);
     if (slot < 0) return VK_ERROR_OUT_OF_HOST_MEMORY;
     struct venus_pipeline_layout *pl = &dev->pl_layouts[slot];
     pl->host_id = 0;
+    pl->set_layout_count = pCreateInfo->setLayoutCount;
+    pl->push_constant_range_count = pCreateInfo->pushConstantRangeCount;
 
-    if (dev->parent && dev->parent->wire && dev->host_handle != 0) {
+    if (pCreateInfo->setLayoutCount == 0 &&
+        pCreateInfo->pushConstantRangeCount == 0 &&
+        dev->parent && dev->parent->wire && dev->host_handle != 0) {
         uint64_t host_id = 0;
         int rc = venus_cmd_encode_CreatePipelineLayout(dev->parent->wire,
                                                        dev->host_handle,
@@ -636,6 +878,37 @@ venus_DestroyCommandPool(VkDevice device, VkCommandPool pool,
         (void)venus_cmd_encode_DestroyCommandPool(dev->parent->wire,
                                                   dev->host_handle, cp->host_id);
     memset(cp, 0, sizeof(*cp));
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+venus_ResetCommandPool(VkDevice device, VkCommandPool pool,
+                       VkCommandPoolResetFlags flags) {
+    (void)flags;
+    if (!device || !pool) return VK_ERROR_INITIALIZATION_FAILED;
+    struct venus_device *dev = (struct venus_device *)device;
+    int pslot = HANDLE_TO_SLOT(pool);
+    if (pslot < 0 || pslot >= (int)VENUS_MAX_CMD_POOL_OBJECTS)
+        return VK_ERROR_INITIALIZATION_FAILED;
+    if (!dev->cmd_pools[pslot].in_use)
+        return VK_ERROR_INITIALIZATION_FAILED;
+
+    for (uint32_t i = 0; i < VENUS_MAX_CMD_BUFFER_OBJECTS; i++) {
+        struct venus_cmd_buffer *vcb = &dev->cmd_buffers[i];
+        if (!vcb->in_use || vcb->pool_slot != pslot)
+            continue;
+        vcb->recording              = 0;
+        vcb->recorded_vb_slot       = -1;
+        vcb->recorded_vb_offset     = 0;
+        vcb->recorded_vb_stride     = 0;
+        vcb->recorded_vertex_count  = 0;
+        vcb->recorded_first_vertex  = 0;
+        vcb->last_drawn_image_slot  = -1;
+        vcb->drew_flag              = 0;
+        vcb->recorded_clear_color   = 0u;
+        vcb->recorded_has_clear     = 0u;
+        vcb->recorded_clear_image_slot = -1;
+    }
+    return VK_SUCCESS;
 }
 
 /* --- Command Buffer (dispatchable) --- */

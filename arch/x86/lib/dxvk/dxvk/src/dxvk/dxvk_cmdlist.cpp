@@ -105,7 +105,8 @@ namespace dxvk {
   DxvkCommandPool::DxvkCommandPool(
           DxvkDevice*           device,
           uint32_t              queueFamily)
-  : m_device(device) {
+  : m_device(device),
+    m_queueFamily(queueFamily) {
     auto vk = m_device->vkd();
 
     VkCommandPoolCreateInfo poolInfo = { VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO };
@@ -159,8 +160,29 @@ namespace dxvk {
     auto vk = m_device->vkd();
 
     if (m_next) {
-      if (vk->vkResetCommandPool(vk->device(), m_commandPool, 0))
+      VkResult status = vk->vkResetCommandPool(vk->device(), m_commandPool, 0);
+
+#ifdef __OSITO_K__
+      if (status) {
+        printf("[DXVKcmd] reset command pool failed rc=%d; recreating pool\n", int32_t(status));
+
+        VkCommandPool oldPool = m_commandPool;
+        VkCommandPoolCreateInfo poolInfo = { VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO };
+        poolInfo.queueFamilyIndex = m_queueFamily;
+
+        status = vk->vkCreateCommandPool(vk->device(), &poolInfo, nullptr, &m_commandPool);
+        if (status)
+          dxvk::DxvkError::abort_ositok("DxvkCommandPool: Failed to recreate command pool");
+
+        printf("[DXVKcmd] replacement command pool ready; leaked old pool=%p\n", oldPool);
+        m_commandBuffers.clear();
+        m_next = 0;
+        return;
+      }
+#else
+      if (status)
         dxvk::DxvkError::abort_ositok("DxvkCommandPool: Failed to reset command pool");
+#endif
 
       m_next = 0;
     }

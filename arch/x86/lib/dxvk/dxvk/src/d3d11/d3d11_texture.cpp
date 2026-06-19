@@ -6,6 +6,19 @@
 #include "../util/util_win32_compat.h"
 
 namespace dxvk {
+
+#ifdef __OSITO_K__
+  extern "C" long write(int, const void*, unsigned long);
+
+  static void okTexLog(const char* msg) {
+    unsigned long len = 0;
+    while (msg[len])
+      len++;
+    write(2, msg, len);
+  }
+#else
+  static void okTexLog(const char*) { }
+#endif
   
   D3D11CommonTexture::D3D11CommonTexture(
           ID3D11Resource*             pInterface,
@@ -217,7 +230,7 @@ namespace dxvk {
     for (uint32_t i = 0; i < imageInfo.viewFormatCount; i++)
       imageInfo.usage |= EnableMetaCopyUsage(imageInfo.viewFormats[i], imageInfo.tiling);
 
-    // Check if we can actually create the image
+    okTexLog("[D11tex] CheckImageSupport begin\n");
     if (!CheckImageSupport(&imageInfo, imageInfo.tiling)) {
       dxvk::DxvkError::abort_ositok(str::format(
         "D3D11: Cannot create texture:",
@@ -231,6 +244,7 @@ namespace dxvk {
         "\n  Usage:   ", std::hex, m_desc.BindFlags,
         "\n  Flags:   ", std::hex, m_desc.MiscFlags));
     }
+    okTexLog("[D11tex] CheckImageSupport done\n");
     
     // Create the image on a host-visible memory type
     // in case it is going to be mapped directly.
@@ -242,10 +256,15 @@ namespace dxvk {
     if (m_11on12.Resource != nullptr)
       vkImage = VkImage(m_11on12.VulkanHandle);
 
-    if (!vkImage)
+    if (!vkImage) {
+      okTexLog("[D11tex] createImage begin\n");
       m_image = m_device->GetDXVKDevice()->createImage(imageInfo, memoryProperties);
-    else
+      okTexLog("[D11tex] createImage done\n");
+    } else {
+      okTexLog("[D11tex] importImage begin\n");
       m_image = m_device->GetDXVKDevice()->importImage(imageInfo, vkImage, memoryProperties);
+      okTexLog("[D11tex] importImage done\n");
+    }
 
     if (imageInfo.sharing.mode == DxvkSharedHandleMode::Export)
       ExportImageInfo();

@@ -48,6 +48,7 @@ typedef struct __attribute__((packed)) {
 #define SCSI_READ_10              0x28
 #define SCSI_WRITE_10             0x2A
 #define SCSI_SYNCHRONIZE_CACHE_10 0x35
+#define USB_WRITE_DIAG_RECENT     8
 
 /* ── Driver State ────────────────────────────────────────────── */
 
@@ -60,6 +61,95 @@ static struct {
     char     vendor[9];
     char     product[17];
 } usb_disk;
+
+typedef struct {
+    uint64_t lba;
+    uint32_t count;
+} usb_write_diag_entry_t;
+
+static struct {
+    uint64_t ops;
+    uint64_t sectors;
+    uint64_t first_lba;
+    uint64_t last_lba;
+    uint32_t first_count;
+    uint32_t last_count;
+    uint32_t recent_pos;
+    uint32_t recent_count;
+    usb_write_diag_entry_t recent[USB_WRITE_DIAG_RECENT];
+} usb_write_diag;
+
+static void usb_write_diag_record(uint64_t lba, uint32_t count)
+{
+    if (usb_write_diag.ops == 0) {
+        usb_write_diag.first_lba = lba;
+        usb_write_diag.first_count = count;
+    }
+    usb_write_diag.ops++;
+    usb_write_diag.sectors += count;
+    usb_write_diag.last_lba = lba;
+    usb_write_diag.last_count = count;
+
+    usb_write_diag.recent[usb_write_diag.recent_pos].lba = lba;
+    usb_write_diag.recent[usb_write_diag.recent_pos].count = count;
+    usb_write_diag.recent_pos =
+        (usb_write_diag.recent_pos + 1) % USB_WRITE_DIAG_RECENT;
+    if (usb_write_diag.recent_count < USB_WRITE_DIAG_RECENT)
+        usb_write_diag.recent_count++;
+}
+
+static void usb_write_diag_reset(void)
+{
+    memset(&usb_write_diag, 0, sizeof(usb_write_diag));
+}
+
+static void usb_write_diag_print_summary(const char *reason)
+{
+    if (usb_write_diag.ops == 0)
+        return;
+
+    serial_puts("[USB-STOR] write summary");
+    if (reason) {
+        serial_puts(" reason=");
+        serial_puts(reason);
+    }
+    serial_puts(" ops=");
+    serial_putdec(usb_write_diag.ops);
+    serial_puts(" sectors=");
+    serial_putdec(usb_write_diag.sectors);
+    serial_puts(" first=");
+    serial_putdec(usb_write_diag.first_lba);
+    serial_puts("+");
+    serial_putdec(usb_write_diag.first_count);
+    serial_puts(" last=");
+    serial_putdec(usb_write_diag.last_lba);
+    serial_puts("+");
+    serial_putdec(usb_write_diag.last_count);
+    serial_puts("\n");
+}
+
+void usb_storage_write_diag_flush(const char *reason)
+{
+    usb_write_diag_print_summary(reason);
+    usb_write_diag_reset();
+}
+
+static void usb_write_diag_print_recent(void)
+{
+    uint32_t n = usb_write_diag.recent_count;
+    uint32_t start = (usb_write_diag.recent_pos + USB_WRITE_DIAG_RECENT - n) %
+                     USB_WRITE_DIAG_RECENT;
+
+    for (uint32_t i = 0; i < n; i++) {
+        usb_write_diag_entry_t *e =
+            &usb_write_diag.recent[(start + i) % USB_WRITE_DIAG_RECENT];
+        serial_puts("[USB-STOR] recent write lba=");
+        serial_putdec(e->lba);
+        serial_puts(" count=");
+        serial_putdec(e->count);
+        serial_puts("\n");
+    }
+}
 
 /* ── SCSI Command Helpers ────────────────────────────────────── */
 
@@ -247,13 +337,10 @@ int usb_storage_read(uint64_t lba, uint32_t count, void *buf)
  * mounted disk is the boot USB. */
 int usb_storage_write(uint64_t lba, uint32_t count, const void *buf)
 {
-    serial_puts("[USB-STOR] write lba=");
-    serial_putdec(lba);
-    serial_puts(" count=");
-    serial_putdec(count);
-    serial_puts("\n");
-
     if (!usb_disk.ready) {
+        usb_write_diag_print_summary("not-ready");
+        usb_write_diag_print_recent();
+        usb_write_diag_reset();
         serial_puts("[USB-STOR] write: not ready\n");
         return -1;
     }
@@ -281,7 +368,11 @@ int usb_storage_write(uint64_t lba, uint32_t count, const void *buf)
         cdb[7] = (uint8_t)(chunk >> 8);
         cdb[8] = (uint8_t)(chunk);
 
+        usb_write_diag_record(lba, chunk);
         if (usb_scsi_cmd(cdb, 10, (void *)(uintptr_t)src, xfer, false) < 0) {
+            usb_write_diag_print_summary("error");
+            usb_write_diag_print_recent();
+            usb_write_diag_reset();
             serial_puts("[USB-STOR] WRITE_10 SCSI failed lba=");
             serial_putdec(lba);
             serial_puts("\n");
@@ -292,7 +383,6 @@ int usb_storage_write(uint64_t lba, uint32_t count, const void *buf)
         lba   += chunk;
         count -= chunk;
     }
-    serial_puts("[USB-STOR] write OK\n");
     return 0;
 }
 

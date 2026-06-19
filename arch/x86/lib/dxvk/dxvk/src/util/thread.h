@@ -24,7 +24,7 @@ namespace dxvk {
     Lowest,
   };
 
-#ifdef _WIN32
+#if defined(_WIN32) && !defined(__OSITO_K__)
 
   using ThreadProc = std::function<void()>;
 

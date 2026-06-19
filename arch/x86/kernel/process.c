@@ -15,6 +15,7 @@
 #include "../include/types.h"
 #include "../include/fd.h"
 #include "../include/paging.h"
+#include "smp.h"
 
 /* ── External functions ──────────────────────────────────────── */
 
@@ -328,8 +329,20 @@ uint64_t fpu_corrupt_val;  /* set by isr_common when fpu_state_ptr is corrupt */
 uint8_t *fpu_state_ptrs[FPU_MAX_CPUS];
 __attribute__((aligned(16))) uint8_t fpu_state_ap_bufs[FPU_MAX_CPUS][512];
 
+static void fpu_state_init(uint8_t *state)
+{
+    memset(state, 0, 512);
+    *(uint16_t *)(state + 0) = 0x037F;      /* x87 control word */
+    *(uint32_t *)(state + 24) = 0x00001F80; /* MXCSR: mask SIMD FP traps */
+    *(uint32_t *)(state + 28) = 0x0000FFFF; /* valid MXCSR feature mask */
+}
+
 void fpu_percpu_init(void)
 {
+    fpu_state_init(fpu_state_kernel);
+    for (int i = 0; i < FPU_MAX_CPUS; i++)
+        fpu_state_init(fpu_state_ap_bufs[i]);
+
     /* BSP (index 0) starts with kernel default */
     fpu_state_ptrs[0] = fpu_state_kernel;
     /* APs get their own static buffers */
@@ -448,6 +461,7 @@ static process_t *proc_alloc(const char *name)
         if (proctab[i].state == PROC_FREE) {
             process_t *p = &proctab[i];
             memset(p, 0, sizeof(*p));
+            fpu_state_init(p->fpu_state);
             p->pid = next_pid++;
             p->ppid = current_proc ? current_proc->pid : 0;
             /* State stays PROC_FREE (from memset). Caller must call
@@ -1251,6 +1265,7 @@ void proc_list(void)
 
 /* ISR stub sets RSP to this value when non-zero (defined in isr_stubs.S) */
 extern volatile uint64_t sched_switch_rsp;
+extern volatile uint64_t sched_switch_cr3;
 
 static int      sched_current_idx = -1;
 
@@ -1569,19 +1584,12 @@ void __hot sched_tick(void *frame_ptr)
     sched_current_idx = next_idx;
     wrmsr(MSR_FS_BASE, next->fs_base);  /* restore per-thread TLS */
 
-    /* X-PGTBL: switch CR3 to the new process's PML4 if it has one.
-     * Threads of the same process share cr3 (proc_clone_thread copies
-     * parent->cr3). Processes started before X-PGTBL was wired (or by
-     * sched_spawn for kernel threads) have cr3 == kernel_cr3, in which
-     * case paging_switch is a no-op load of the same value. */
-    if (next->cr3) {
-        extern void paging_switch(uint64_t cr3);
-        paging_switch(next->cr3);
-    }
+    uint64_t active_cr3;
+    __asm__ volatile ("mov %%cr3, %0" : "=r"(active_cr3));
 
     /* Sanity check: verify the interrupt frame at kernel_rsp has
      * a valid CS selector and the canary we planted at save time. */
-    {
+    if (next->kernel_rsp >= 0xFFFF800000000000ULL || next->cr3 == active_cr3) {
         uint64_t *frame = (uint64_t *)next->kernel_rsp;
         uint64_t cs = frame[18];
 
@@ -1635,9 +1643,13 @@ void __hot sched_tick(void *frame_ptr)
         if (pred) pred_prewarm(pred);
     }
 
-    /* Tell ISR stub to switch RSP before popping GPRs.
-     * The stub will: mov sched_switch_rsp → RSP, then pop + iretq
-     * using the new process's saved interrupt frame. */
+    /* Tell ISR stub to complete the address-space switch after C returns.
+     * The stub uses an upper-half trampoline stack before loading CR3, then
+     * moves to next->kernel_rsp and pops the saved interrupt frame. Doing
+     * the CR3 load here is unsafe when the timer tick entered on a low
+     * pthread stack: the outgoing stack can disappear before paging_switch()
+     * returns. */
+    sched_switch_cr3 = next->cr3;
     sched_switch_rsp = next->kernel_rsp;
 
     sched_switches++;
@@ -2351,6 +2363,22 @@ static int16_t futex_free_head = -1;            /* free slot list */
 static int      futex_timed_count = 0;          /* # of active timed waiters;
                                                  * lets sched_tick skip the
                                                  * deadline sweep when zero */
+static spinlock_t futex_lock = SPINLOCK_INIT;
+
+static inline uint64_t futex_lock_irqsave(void)
+{
+    uint64_t flags;
+    __asm__ volatile ("pushfq; pop %0; cli" : "=r"(flags) :: "memory");
+    spin_lock(&futex_lock);
+    return flags;
+}
+
+static inline void futex_unlock_irqrestore(uint64_t flags)
+{
+    spin_unlock(&futex_lock);
+    if (flags & (1ULL << 9))
+        __asm__ volatile ("sti" ::: "memory");
+}
 
 static inline uint32_t futex_hash(uint64_t addr, uint64_t space)
 {
@@ -2388,12 +2416,18 @@ int futex_do_wait(uint64_t uaddr, int expected, uint64_t space,
                   uint64_t timeout_ticks)
 {
     volatile int *addr = (volatile int *)uaddr;
+    uint64_t flags = futex_lock_irqsave();
 
-    if (*addr != expected)
+    if (*addr != expected) {
+        futex_unlock_irqrestore(flags);
         return -11; /* EAGAIN */
+    }
 
     /* Allocate from free list */
-    if (futex_free_head < 0) return -12; /* ENOMEM */
+    if (futex_free_head < 0) {
+        futex_unlock_irqrestore(flags);
+        return -12; /* ENOMEM */
+    }
     int slot = futex_free_head;
     futex_free_head = futex_waiters[slot].next;
 
@@ -2414,7 +2448,11 @@ int futex_do_wait(uint64_t uaddr, int expected, uint64_t space,
     if (futex_waiters[slot].deadline)
         futex_timed_count++;
 
+    /* The value check, bucket insert, and BLOCKED transition must be atomic
+     * with futex_wake. Otherwise a wake can unlink the waiter while it is
+     * still RUNNING, after which this thread marks itself BLOCKED forever. */
     proc_transition(cur, PROC_BLOCKED);
+    futex_unlock_irqrestore(flags);
 
     /* A BLOCKED task cannot poll its own deadline (the scheduler never
      * resumes it), so timeout enforcement is done by futex_timeout_sweep()
@@ -2423,6 +2461,7 @@ int futex_do_wait(uint64_t uaddr, int expected, uint64_t space,
         __asm__ volatile ("sti; hlt; cli" ::: "memory");
     }
 
+    flags = futex_lock_irqsave();
     int rc = futex_waiters[slot].timed_out ? -110 /* ETIMEDOUT */ : 0;
 
     /* Woken — remove from bucket and return to free list */
@@ -2439,6 +2478,7 @@ int futex_do_wait(uint64_t uaddr, int expected, uint64_t space,
     }
     futex_waiters[slot].next = futex_free_head;
     futex_free_head = (int16_t)slot;
+    futex_unlock_irqrestore(flags);
 
     return rc;
 }
@@ -2447,6 +2487,7 @@ int futex_do_wait(uint64_t uaddr, int expected, uint64_t space,
  * Returns number of processes woken. Only scans one hash bucket. */
 int futex_do_wake(uint64_t uaddr, uint64_t space, int count)
 {
+    uint64_t flags = futex_lock_irqsave();
     uint32_t bucket = futex_hash(uaddr, space);
     int woken = 0;
     int16_t *pp = &futex_buckets[bucket];
@@ -2461,19 +2502,25 @@ int futex_do_wake(uint64_t uaddr, uint64_t space, int count)
                 proc_transition(&proctab[pidx], PROC_READY);
                 woken++;
             }
-            /* Unlink from bucket and return to free list */
+            /*
+             * Unlink from the bucket, but do not return the waiter slot to
+             * the free list here. The sleeping thread still owns `slot` and
+             * will read timed_out plus release the slot after it resumes from
+             * futex_do_wait(). Returning it here races a new waiter into the
+             * same slot and then double-frees it when the old waiter wakes.
+             */
             w->active = false;
             if (w->deadline) {
                 w->deadline = 0;
                 if (futex_timed_count > 0) futex_timed_count--;
             }
             *pp = w->next;
-            w->next = futex_free_head;
-            futex_free_head = idx;
+            w->next = -1;
         } else {
             pp = &w->next;
         }
     }
+    futex_unlock_irqrestore(flags);
     return woken;
 }
 
@@ -2484,6 +2531,7 @@ int futex_do_wake(uint64_t uaddr, uint64_t space, int count)
 void futex_timeout_sweep(void)
 {
     if (futex_timed_count <= 0) return;
+    uint64_t flags = futex_lock_irqsave();
     uint64_t now = idt_get_ticks();
     for (int i = 0; i < MAX_FUTEX_WAITERS; i++) {
         futex_waiter_t *w = &futex_waiters[i];
@@ -2497,6 +2545,7 @@ void futex_timeout_sweep(void)
             }
         }
     }
+    futex_unlock_irqrestore(flags);
 }
 
 /* Thread exit cleanup: clear_child_tid + futex wake (X-THREAD) */

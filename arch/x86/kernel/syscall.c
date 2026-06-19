@@ -423,6 +423,13 @@ static ssize_t console_read(void *buf, size_t count)
     return 1;
 }
 
+static bool sys_debug_is_fx_path(const char *name)
+{
+    return name &&
+           (strcmp(name, "shaders/win32_40_lq_final/im.fxc") == 0 ||
+            strcmp(name, "rage/assets/tune/shaders/lib/win32_40/rage_im.fxc") == 0);
+}
+
 /* Seed an fd table with stdio (fd 0/1/2 → console). Called by
  * proc_init() after it creates the kernel process, and by
  * syscall_reset_process() after wiping the current process's fds
@@ -937,13 +944,76 @@ static int64_t sys_read(uint64_t fd, uint64_t buf, uint64_t count)
     if (f->type == FD_TYPE_FILE) {
         if ((f->oflags & O_ACCMODE) == O_WRONLY) return -EBADF;
         uint64_t file_size = f->node.size;
+        bool dbg_fx = false;
+        if (f->node.fs_version == 2) {
+            const char *nm = osfs2_file_name(f->node.data);
+            dbg_fx = sys_debug_is_fx_path(nm);
+            if (dbg_fx) {
+                serial_puts("[sys_read] fx name='");
+                serial_puts(nm);
+                serial_puts("' off=");
+                serial_putdec(f->offset);
+                serial_puts(" count=");
+                serial_putdec(count);
+                serial_puts(" size=");
+                serial_putdec(file_size);
+                serial_puts("\n");
+            }
+        }
         if (f->offset >= file_size) return 0;  /* EOF */
         uint64_t avail = file_size - f->offset;
         if (count > avail) count = avail;
-        int ret = vfs_read(&f->node, f->offset, (void *)buf, (size_t)count);
-        if (ret < 0) return -EFAULT;
-        f->offset += (uint64_t)ret;
-        return (int64_t)ret;
+        if (count == 0) return 0;
+
+        /*
+         * Do file I/O through a kernel bounce buffer. Some callers pass
+         * buffers that are mapped only in the process page table; letting the
+         * VFS/disk path write to those addresses directly can silently leave
+         * the user buffer unchanged. NtReadFile already uses the same pattern.
+         */
+        const uint64_t max_chunk = 64 * 1024;
+        uint64_t chunk_cap = count < max_chunk ? count : max_chunk;
+        uint8_t *sys_buf = (uint8_t *)kmalloc(chunk_cap);
+        if (!sys_buf) return -ENOMEM;
+
+        volatile uint8_t *dst = (volatile uint8_t *)buf;
+        uint64_t done = 0;
+        while (done < count) {
+            uint64_t chunk = count - done;
+            if (chunk > chunk_cap) chunk = chunk_cap;
+
+            int ret = vfs_read(&f->node, f->offset + done, sys_buf, chunk);
+            if (ret < 0) {
+                kfree(sys_buf);
+                return done ? (int64_t)done : -EFAULT;
+            }
+            if (dbg_fx) {
+                serial_puts("[sys_read] fx ret=");
+                serial_putdec(ret);
+                serial_puts(" bytes=");
+                if (ret >= 4) {
+                    serial_puthex(sys_buf[0], 2);
+                    serial_puts(" ");
+                    serial_puthex(sys_buf[1], 2);
+                    serial_puts(" ");
+                    serial_puthex(sys_buf[2], 2);
+                    serial_puts(" ");
+                    serial_puthex(sys_buf[3], 2);
+                }
+                serial_puts("\n");
+            }
+            if (ret == 0) break;
+
+            for (int i = 0; i < ret; i++)
+                dst[done + (uint64_t)i] = sys_buf[i];
+
+            done += (uint64_t)ret;
+            if ((uint64_t)ret < chunk) break;
+        }
+
+        kfree(sys_buf);
+        f->offset += done;
+        return (int64_t)done;
     }
 
     if (f->type == FD_TYPE_PIPE) {
@@ -1373,6 +1443,23 @@ static int64_t sys_open(uint64_t path_addr, uint64_t flags, uint64_t mode)
 
     if ((flags & O_TRUNC) && ((flags & O_ACCMODE) != O_RDONLY)) {
         f->offset = 0;
+    }
+
+    if (f->node.fs_version == 2) {
+        const char *resolved = osfs2_file_name(f->node.data);
+        if (sys_debug_is_fx_path(lookup) || sys_debug_is_fx_path(resolved)) {
+            serial_puts("[sys_open] fx path='");
+            serial_puts(path);
+            serial_puts("' lookup='");
+            serial_puts(lookup);
+            serial_puts("' resolved='");
+            serial_puts(resolved ? resolved : "(null)");
+            serial_puts("' size=");
+            serial_putdec(f->node.size);
+            serial_puts(" fd=");
+            serial_putdec((uint64_t)newfd);
+            serial_puts("\n");
+        }
     }
 
     return newfd;
@@ -2430,8 +2517,13 @@ static int64_t sys_nanosleep(uint64_t req_addr, uint64_t rem_addr)
     if (sleep_ticks == 0) sleep_ticks = 1;
 
     uint64_t deadline = idt_get_ticks() + sleep_ticks;
-    while (idt_get_ticks() < deadline)
-        __asm__ volatile ("hlt");
+    while (idt_get_ticks() < deadline) {
+        /*
+         * SYSCALL entry clears IF, so a plain HLT can sleep forever waiting
+         * for the timer tick that would advance idt_get_ticks().
+         */
+        __asm__ volatile ("sti; hlt; cli" ::: "memory");
+    }
 
     if (rem_addr) {
         timespec_t *rem = (timespec_t *)rem_addr;
@@ -2460,7 +2552,11 @@ static int64_t sys_getrandom(uint64_t buf_addr, uint64_t buflen, uint64_t flags)
 /* sched_yield — yield CPU (no-op in non-preemptive for now) */
 static int64_t sys_sched_yield(void)
 {
-    __asm__ volatile ("hlt");  /* Wait for next timer tick */
+    /*
+     * SYSCALL masks IF, so a bare HLT may never see the timer interrupt that
+     * should reschedule us. Mirror nanosleep's interrupt-safe wait.
+     */
+    __asm__ volatile ("sti; hlt; cli" ::: "memory");
     return 0;
 }
 

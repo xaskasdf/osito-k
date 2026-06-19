@@ -145,7 +145,7 @@ KERN_SRC = kernel/main.c kernel/serial.c kernel/framebuffer.c \
            kernel/socket.c kernel/timers.c kernel/power.c \
            kernel/sysv_ipc.c kernel/vt.c \
            kernel/blkdev.c kernel/strace.c kernel/caps.c \
-           kernel/klog.c kernel/random.c kernel/oom.c kernel/ns.c \
+           kernel/klog.c kernel/boot_diag.c kernel/random.c kernel/oom.c kernel/ns.c \
            kernel/panic.c kernel/sysfs.c kernel/netfilter.c \
            kernel/crypto2.c kernel/sched_rt.c kernel/dm.c \
            kernel/evdev.c kernel/sysctl.c kernel/tls13.c kernel/tls13_server.c kernel/sshd.c \

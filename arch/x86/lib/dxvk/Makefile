@@ -41,6 +41,10 @@ CXX ?= $(CROSS_CXX)
 endif
 AR  ?= ar
 
+ifeq ($(origin CC),default)
+CC := $(patsubst %g++,%gcc,$(CXX))
+endif
+
 GCC_INC     := $(shell $(CXX) -print-file-name=include)
 GCC_CXX_INC := $(shell $(CXX) -print-file-name=include) # placeholder
 
@@ -172,7 +176,6 @@ UTIL_C_SRCS := \
 #                                          to patch (W5.1 hand-edit).
 #   dxvk/src/util/util_gdi.cpp          -- needs HDC + GDI bitmap copy
 #   dxvk/src/util/util_shared_res.cpp   -- needs winioctl IOCTL_*
-#   dxvk/src/util/sha1/sha1.c           -- header-only path covered
 #   dxvk/src/util/com/com_guid.cpp      -- includes d3d11_interfaces.h /
 #                                          dxgi_interfaces.h / dxvk_hash.h
 #                                          which arrive in W5.1+.  Deferred.

@@ -14,6 +14,7 @@ extern void serial_puthex(uint64_t val, int digits);
 extern void serial_putdec(uint64_t val);
 extern uint64_t idt_get_ticks(void);
 extern void power_halt(void) __attribute__((weak));
+extern void boot_diag_flush(const char *reason);
 
 /* ── Panic ───────────────────────────────────────────────────── */
 
@@ -76,6 +77,7 @@ void __attribute__((noreturn)) kernel_panic(const char *msg)
 
     serial_puts("\n  System halted. Reboot to continue.\n");
     serial_puts("============================================================\n");
+    boot_diag_flush("panic");
 
     /* Halt all CPUs */
     if (power_halt)

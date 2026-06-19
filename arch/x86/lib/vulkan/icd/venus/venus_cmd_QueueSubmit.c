@@ -36,6 +36,44 @@ static void w48_fill_shm(struct venus_memory *m,
     for (uint64_t k = 0; k < pixels; k++) fb[k] = bgra;
 }
 
+static void w48_execute_recorded_clear(struct venus_device *dev,
+                                       VkCommandBuffer cb_h) {
+    if (!dev || !cb_h) return;
+    struct venus_cmd_buffer *vcb = (struct venus_cmd_buffer *)cb_h;
+    if (!vcb->in_use || !vcb->recorded_has_clear) return;
+
+    int islot = vcb->recorded_clear_image_slot;
+    if (islot < 0) islot = vcb->last_drawn_image_slot;
+    if (islot < 0 || islot >= (int)VENUS_MAX_IMAGE_OBJECTS) return;
+    struct venus_image *img = &dev->images[islot];
+    if (!img->in_use) return;
+
+    int mslot = img->bound_mem_slot;
+    if (mslot < 0 || mslot >= (int)VENUS_MAX_MEM_OBJECTS) return;
+    struct venus_memory *m = &dev->memories[mslot];
+    if (!m->in_use) return;
+
+    w48_fill_shm(m, img, vcb->recorded_clear_color);
+}
+
+static void w3b5_signal_semaphore(struct venus_device *dev,
+                                  VkSemaphore semaphore) {
+    if (!dev || !semaphore) return;
+    int slot = (int)(((uint64_t)semaphore >> 48) & VENUS_H_SLOT_MASK_W3B5);
+    if (slot >= 0 && slot < (int)VENUS_MAX_SEMA_OBJECTS &&
+        dev->semaphores[slot].in_use)
+        dev->semaphores[slot].signaled = 1;
+}
+
+static void w3b5_signal_fence(struct venus_device *dev,
+                              uint64_t fence_handle) {
+    if (!dev || !fence_handle) return;
+    int fslot = (int)((fence_handle >> 48) & VENUS_H_SLOT_MASK_W3B5);
+    if (fslot >= 0 && fslot < (int)VENUS_MAX_FENCE_OBJECTS &&
+        dev->fences[fslot].in_use)
+        dev->fences[fslot].signaled = 1;
+}
+
 int venus_cmd_encode_QueueSubmit(
         struct venus_device *dev,
         uint32_t submitCount, const VkSubmitInfo *pSubmits,
@@ -53,20 +91,7 @@ int venus_cmd_encode_QueueSubmit(
             const VkSubmitInfo *si = &pSubmits[i];
             if (!si->pCommandBuffers) continue;
             for (uint32_t j = 0; j < si->commandBufferCount; j++) {
-                VkCommandBuffer cb_h = si->pCommandBuffers[j];
-                if (!cb_h) continue;
-                struct venus_cmd_buffer *vcb = (struct venus_cmd_buffer *)cb_h;
-                if (!vcb->in_use || !vcb->recorded_has_clear) continue;
-                int islot = vcb->recorded_clear_image_slot;
-                if (islot < 0) islot = vcb->last_drawn_image_slot;
-                if (islot < 0 || islot >= (int)VENUS_MAX_IMAGE_OBJECTS) continue;
-                struct venus_image *img = &dev->images[islot];
-                if (!img->in_use) continue;
-                int mslot = img->bound_mem_slot;
-                if (mslot < 0 || mslot >= (int)VENUS_MAX_MEM_OBJECTS) continue;
-                struct venus_memory *m = &dev->memories[mslot];
-                if (!m->in_use) continue;
-                w48_fill_shm(m, img, vcb->recorded_clear_color);
+                w48_execute_recorded_clear(dev, si->pCommandBuffers[j]);
             }
         }
     }
@@ -76,23 +101,44 @@ int venus_cmd_encode_QueueSubmit(
         for (uint32_t i = 0; i < submitCount; i++) {
             const VkSubmitInfo *si = &pSubmits[i];
             for (uint32_t j = 0; j < si->signalSemaphoreCount; j++) {
-                VkSemaphore sh = si->pSignalSemaphores[j];
-                if (!sh) continue;
-                int slot = (int)(((uint64_t)sh >> 48) & VENUS_H_SLOT_MASK_W3B5);
-                if (slot < 0 || slot >= (int)VENUS_MAX_SEMA_OBJECTS) continue;
-                if (dev->semaphores[slot].in_use)
-                    dev->semaphores[slot].signaled = 1;
+                w3b5_signal_semaphore(dev, si->pSignalSemaphores[j]);
             }
         }
     }
 
     /* Signal the fence if one was passed. */
-    if (fence_handle) {
-        int fslot = (int)(((uint64_t)fence_handle >> 48) & VENUS_H_SLOT_MASK_W3B5);
-        if (fslot >= 0 && fslot < (int)VENUS_MAX_FENCE_OBJECTS &&
-            dev->fences[fslot].in_use) {
-            dev->fences[fslot].signaled = 1;
+    w3b5_signal_fence(dev, fence_handle);
+    return 0;
+}
+
+int venus_cmd_encode_QueueSubmit2(
+        struct venus_device *dev,
+        uint32_t submitCount, const VkSubmitInfo2 *pSubmits,
+        uint64_t fence_handle) {
+    if (!dev) return -22;
+
+    /* DXVK uses vkQueueSubmit2. Mirror the Submit1 guest-local behavior so
+     * fences/semaphores and SHM clears stay coherent for synchronization2. */
+    if (pSubmits) {
+        for (uint32_t i = 0; i < submitCount; i++) {
+            const VkSubmitInfo2 *si = &pSubmits[i];
+            if (!si->pCommandBufferInfos) continue;
+            for (uint32_t j = 0; j < si->commandBufferInfoCount; j++)
+                w48_execute_recorded_clear(dev,
+                        si->pCommandBufferInfos[j].commandBuffer);
         }
     }
+
+    if (pSubmits) {
+        for (uint32_t i = 0; i < submitCount; i++) {
+            const VkSubmitInfo2 *si = &pSubmits[i];
+            if (!si->pSignalSemaphoreInfos) continue;
+            for (uint32_t j = 0; j < si->signalSemaphoreInfoCount; j++)
+                w3b5_signal_semaphore(dev,
+                        si->pSignalSemaphoreInfos[j].semaphore);
+        }
+    }
+
+    w3b5_signal_fence(dev, fence_handle);
     return 0;
 }

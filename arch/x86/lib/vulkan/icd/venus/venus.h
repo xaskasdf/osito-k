@@ -18,12 +18,13 @@
  *            swapchain-owned image (VkBindImageMemory upgrades path).
  *
  * W3b.5 handle markers (keep in lockstep with venus_w3b5_objects.c):
- *   SURFACE    0xFE00
+ *   SURFACE    0x0
  *   QUEUE      dispatchable  (VK_LOADER_DATA pointer)
- *   FENCE      0xFE02
- *   SEMAPHORE  0xFE03
- *   SWAPCHAIN  0xFE04
- * Slot decode: (handle >> 48) & 0x0FFF — see the W3b.3-fix lesson.
+ *   FENCE      0x1
+ *   SEMAPHORE  0x2
+ *   SWAPCHAIN  0x3
+ * Markers occupy only bits 60..63. Slot decode is
+ * (handle >> 48) & 0x0FFF — see the W3b.3-fix lesson.
  *
  * W3b.5 linker invariant: venus_w3b5_objects.c MUST appear before
  * venus_w3b4_objects.c in the Makefile SRC list. Both TUs define
@@ -51,16 +52,18 @@
  * venus_wire_test_shim.c (test binary). Callers treat it as opaque. */
 struct venus_wire;
 
-/* Guest-local memory tracking (W3b.3). Sized for hello-memory plus a
- * little headroom — not a general-purpose allocator. */
-#define VENUS_MAX_MEM_OBJECTS  32u
-#define VENUS_MAX_BUF_OBJECTS  32u
+/* Guest-local object tracking. Handles encode 12 slot bits, so these
+ * tables can grow up to 4096 entries per object class. DXVK creates many
+ * transient buffers during device warmup, so keep enough headroom beyond
+ * the original hello-memory smoke-test sizes. */
+#define VENUS_MAX_MEM_OBJECTS  512u
+#define VENUS_MAX_BUF_OBJECTS  2048u
 
 /* W3b.5 object tables. */
-#define VENUS_MAX_SURFACE_OBJECTS     16u
-#define VENUS_MAX_QUEUE_OBJECTS        4u
-#define VENUS_MAX_FENCE_OBJECTS       32u
-#define VENUS_MAX_SEMA_OBJECTS        32u
+#define VENUS_MAX_SURFACE_OBJECTS     32u
+#define VENUS_MAX_QUEUE_OBJECTS        8u
+#define VENUS_MAX_FENCE_OBJECTS      256u
+#define VENUS_MAX_SEMA_OBJECTS       256u
 #define VENUS_MAX_SWAPCHAIN_OBJECTS    8u
 #define VENUS_MAX_SWAPCHAIN_IMAGES     4u
 
@@ -84,16 +87,21 @@ struct venus_instance {
 };
 
 /* W3b.4 object tables. */
-#define VENUS_MAX_SHADER_OBJECTS       32u
-#define VENUS_MAX_RP_OBJECTS           32u
-#define VENUS_MAX_IMAGE_OBJECTS        32u
-#define VENUS_MAX_IMAGE_VIEW_OBJECTS   32u
-#define VENUS_MAX_SAMPLER_OBJECTS      32u
-#define VENUS_MAX_FB_OBJECTS           32u
-#define VENUS_MAX_PL_LAYOUT_OBJECTS    32u
-#define VENUS_MAX_PIPELINE_OBJECTS     32u
-#define VENUS_MAX_CMD_POOL_OBJECTS     16u
-#define VENUS_MAX_CMD_BUFFER_OBJECTS   32u
+#define VENUS_MAX_SHADER_OBJECTS      512u
+#define VENUS_MAX_RP_OBJECTS          256u
+#define VENUS_MAX_IMAGE_OBJECTS       512u
+#define VENUS_MAX_IMAGE_VIEW_OBJECTS  512u
+#define VENUS_MAX_BUFFER_VIEW_OBJECTS 1024u
+#define VENUS_MAX_SAMPLER_OBJECTS     256u
+#define VENUS_MAX_FB_OBJECTS          256u
+#define VENUS_MAX_DESC_LAYOUT_OBJECTS 512u
+#define VENUS_MAX_DESC_POOL_OBJECTS   256u
+#define VENUS_MAX_DESC_SET_OBJECTS    1024u
+#define VENUS_MAX_DESC_TPL_OBJECTS    512u
+#define VENUS_MAX_PL_LAYOUT_OBJECTS   512u
+#define VENUS_MAX_PIPELINE_OBJECTS    1024u
+#define VENUS_MAX_CMD_POOL_OBJECTS     64u
+#define VENUS_MAX_CMD_BUFFER_OBJECTS  256u
 
 struct venus_memory {
     uint64_t host_id;       /* host VkDeviceMemory id (0 if guest-local fallback) */
@@ -149,6 +157,16 @@ struct venus_image_view {
     int32_t  image_slot;
 };
 
+struct venus_buffer_view {
+    uint64_t host_id;
+    uint32_t in_use;
+    int32_t  buffer_slot;
+    uint32_t format;
+    uint32_t _pad;
+    uint64_t offset;
+    uint64_t range;
+};
+
 struct venus_sampler {
     uint64_t host_id;
     uint32_t in_use;
@@ -164,9 +182,38 @@ struct venus_framebuffer {
     int32_t  first_color_image_slot;
 };
 
+struct venus_descriptor_set_layout {
+    uint64_t host_id;
+    uint32_t in_use;
+    uint32_t binding_count;
+};
+
+struct venus_descriptor_pool {
+    uint32_t in_use;
+    uint32_t max_sets;
+    uint32_t alloc_count;
+    uint32_t _pad;
+};
+
+struct venus_descriptor_set {
+    uint32_t in_use;
+    int32_t  pool_slot;
+    int32_t  layout_slot;
+    uint32_t _pad;
+};
+
+struct venus_descriptor_update_template {
+    uint32_t in_use;
+    uint32_t entry_count;
+    uint32_t template_type;
+    uint32_t _pad;
+};
+
 struct venus_pipeline_layout {
     uint64_t host_id;
     uint32_t in_use;
+    uint32_t set_layout_count;
+    uint32_t push_constant_range_count;
     uint32_t _pad;
 };
 
@@ -255,8 +302,13 @@ struct venus_device {
     struct venus_render_pass     render_passes [VENUS_MAX_RP_OBJECTS];
     struct venus_image           images        [VENUS_MAX_IMAGE_OBJECTS];
     struct venus_image_view      image_views   [VENUS_MAX_IMAGE_VIEW_OBJECTS];
+    struct venus_buffer_view     buffer_views  [VENUS_MAX_BUFFER_VIEW_OBJECTS];
     struct venus_sampler         samplers      [VENUS_MAX_SAMPLER_OBJECTS];
     struct venus_framebuffer     framebuffers  [VENUS_MAX_FB_OBJECTS];
+    struct venus_descriptor_set_layout desc_layouts [VENUS_MAX_DESC_LAYOUT_OBJECTS];
+    struct venus_descriptor_pool       desc_pools   [VENUS_MAX_DESC_POOL_OBJECTS];
+    struct venus_descriptor_set        desc_sets    [VENUS_MAX_DESC_SET_OBJECTS];
+    struct venus_descriptor_update_template desc_templates [VENUS_MAX_DESC_TPL_OBJECTS];
     struct venus_pipeline_layout pl_layouts    [VENUS_MAX_PL_LAYOUT_OBJECTS];
     struct venus_pipeline        pipelines     [VENUS_MAX_PIPELINE_OBJECTS];
     struct venus_cmd_pool        cmd_pools     [VENUS_MAX_CMD_POOL_OBJECTS];
@@ -362,6 +414,12 @@ VKAPI_ATTR void VKAPI_CALL
 venus_DestroyImageView(VkDevice, VkImageView, const VkAllocationCallbacks *);
 
 VKAPI_ATTR VkResult VKAPI_CALL
+venus_CreateBufferView(VkDevice, const VkBufferViewCreateInfo *,
+                       const VkAllocationCallbacks *, VkBufferView *);
+VKAPI_ATTR void VKAPI_CALL
+venus_DestroyBufferView(VkDevice, VkBufferView, const VkAllocationCallbacks *);
+
+VKAPI_ATTR VkResult VKAPI_CALL
 venus_CreateSampler(VkDevice, const VkSamplerCreateInfo *,
                     const VkAllocationCallbacks *, VkSampler *);
 VKAPI_ATTR void VKAPI_CALL
@@ -372,6 +430,40 @@ venus_CreateFramebuffer(VkDevice, const VkFramebufferCreateInfo *,
                         const VkAllocationCallbacks *, VkFramebuffer *);
 VKAPI_ATTR void VKAPI_CALL
 venus_DestroyFramebuffer(VkDevice, VkFramebuffer, const VkAllocationCallbacks *);
+
+VKAPI_ATTR VkResult VKAPI_CALL
+venus_CreateDescriptorSetLayout(VkDevice, const VkDescriptorSetLayoutCreateInfo *,
+                                const VkAllocationCallbacks *, VkDescriptorSetLayout *);
+VKAPI_ATTR void VKAPI_CALL
+venus_DestroyDescriptorSetLayout(VkDevice, VkDescriptorSetLayout,
+                                 const VkAllocationCallbacks *);
+
+VKAPI_ATTR VkResult VKAPI_CALL
+venus_CreateDescriptorPool(VkDevice, const VkDescriptorPoolCreateInfo *,
+                           const VkAllocationCallbacks *, VkDescriptorPool *);
+VKAPI_ATTR void VKAPI_CALL
+venus_DestroyDescriptorPool(VkDevice, VkDescriptorPool, const VkAllocationCallbacks *);
+
+VKAPI_ATTR VkResult VKAPI_CALL
+venus_AllocateDescriptorSets(VkDevice, const VkDescriptorSetAllocateInfo *,
+                             VkDescriptorSet *);
+VKAPI_ATTR VkResult VKAPI_CALL
+venus_FreeDescriptorSets(VkDevice, VkDescriptorPool, uint32_t,
+                         const VkDescriptorSet *);
+VKAPI_ATTR void VKAPI_CALL
+venus_UpdateDescriptorSets(VkDevice, uint32_t, const VkWriteDescriptorSet *,
+                           uint32_t, const VkCopyDescriptorSet *);
+
+VKAPI_ATTR VkResult VKAPI_CALL
+venus_CreateDescriptorUpdateTemplate(VkDevice,
+        const VkDescriptorUpdateTemplateCreateInfo *,
+        const VkAllocationCallbacks *, VkDescriptorUpdateTemplate *);
+VKAPI_ATTR void VKAPI_CALL
+venus_DestroyDescriptorUpdateTemplate(VkDevice, VkDescriptorUpdateTemplate,
+                                      const VkAllocationCallbacks *);
+VKAPI_ATTR void VKAPI_CALL
+venus_UpdateDescriptorSetWithTemplate(VkDevice, VkDescriptorSet,
+                                      VkDescriptorUpdateTemplate, const void *);
 
 VKAPI_ATTR VkResult VKAPI_CALL
 venus_CreatePipelineLayout(VkDevice, const VkPipelineLayoutCreateInfo *,
@@ -391,6 +483,8 @@ venus_CreateCommandPool(VkDevice, const VkCommandPoolCreateInfo *,
                         const VkAllocationCallbacks *, VkCommandPool *);
 VKAPI_ATTR void VKAPI_CALL
 venus_DestroyCommandPool(VkDevice, VkCommandPool, const VkAllocationCallbacks *);
+VKAPI_ATTR VkResult VKAPI_CALL
+venus_ResetCommandPool(VkDevice, VkCommandPool, VkCommandPoolResetFlags);
 
 VKAPI_ATTR VkResult VKAPI_CALL
 venus_AllocateCommandBuffers(VkDevice, const VkCommandBufferAllocateInfo *,
@@ -443,6 +537,10 @@ venus_DestroySurfaceKHR(VkInstance, VkSurfaceKHR,
 /* Queue + device-wait. */
 VKAPI_ATTR VkResult VKAPI_CALL
 venus_QueueSubmit(VkQueue, uint32_t, const VkSubmitInfo *, VkFence);
+VKAPI_ATTR VkResult VKAPI_CALL
+venus_QueueSubmit2(VkQueue, uint32_t, const VkSubmitInfo2 *, VkFence);
+VKAPI_ATTR VkResult VKAPI_CALL
+venus_QueueSubmit2KHR(VkQueue, uint32_t, const VkSubmitInfo2 *, VkFence);
 VKAPI_ATTR VkResult VKAPI_CALL
 venus_QueueWaitIdle(VkQueue);
 VKAPI_ATTR VkResult VKAPI_CALL

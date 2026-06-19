@@ -20,11 +20,74 @@ extern uint64_t idt_get_ticks(void);
 /* Forward decls for OsitoFS write (may not be available early boot) */
 extern void *osfs2_create(const char *name, uint64_t size);
 extern int   osfs2_write(void *file, uint64_t offset, const void *buf, uint64_t len);
+extern int   osfs2_delete(const char *name);
+extern void  boot_diag_flush(const char *reason);
+extern int   boot_diag_slot(void);
+extern uint32_t boot_diag_next_crash_index(void);
+extern void  boot_diag_format_crash_name(char *out, int slot, uint32_t idx,
+                                         const char *ext);
 
 /* ── Crash report structure ─────────────────────────────────── */
 
 #define CRASH_MAGIC  0x4F534B43  /* "OSKC" */
 #define CRASH_MAX_FRAMES 32
+
+static const char *crash_vector_name(uint32_t vector)
+{
+    switch (vector) {
+    case 0:  return "divide error";
+    case 1:  return "debug";
+    case 2:  return "nmi";
+    case 3:  return "breakpoint";
+    case 4:  return "overflow";
+    case 5:  return "bounds";
+    case 6:  return "invalid opcode";
+    case 7:  return "device not available";
+    case 8:  return "double fault";
+    case 10: return "invalid tss";
+    case 11: return "segment not present";
+    case 12: return "stack fault";
+    case 13: return "general protection";
+    case 14: return "page fault";
+    case 16: return "x87 floating point";
+    case 17: return "alignment check";
+    case 18: return "machine check";
+    case 19: return "simd floating point";
+    case 20: return "virtualization";
+    case 21: return "control protection";
+    default: return "unknown";
+    }
+}
+
+static char *cr_append_str(char *p, char *end, const char *s)
+{
+    while (*s && p < end) *p++ = *s++;
+    return p;
+}
+
+static char *cr_append_dec(char *p, char *end, uint64_t v)
+{
+    char tmp[24];
+    int n = 0;
+    if (v == 0) {
+        if (p < end) *p++ = '0';
+        return p;
+    }
+    while (v && n < (int)sizeof(tmp)) {
+        tmp[n++] = (char)('0' + (v % 10));
+        v /= 10;
+    }
+    while (n-- > 0 && p < end) *p++ = tmp[n];
+    return p;
+}
+
+static char *cr_append_hex(char *p, char *end, uint64_t v, int digits)
+{
+    static const char h[] = "0123456789abcdef";
+    for (int i = digits - 1; i >= 0 && p < end; i--)
+        *p++ = h[(v >> (i * 4)) & 0xF];
+    return p;
+}
 
 typedef struct {
     uint64_t addr;
@@ -74,7 +137,99 @@ typedef struct {
 /* ── Static report buffer (avoid allocation in crash context) ── */
 
 static crash_report_t crash_buf;
-static uint32_t crash_count;
+static char crash_text[8192];
+
+static uint32_t crash_report_text(char *out, uint32_t cap, const crash_report_t *r)
+{
+    char *p = out;
+    char *end = out + cap - 1;
+
+    p = cr_append_str(p, end, "OsitoK crash report v");
+    p = cr_append_dec(p, end, r->version);
+    p = cr_append_str(p, end, "\nprocess: ");
+    p = cr_append_str(p, end, r->name[0] ? r->name : "(unknown)");
+    p = cr_append_str(p, end, "\npid: ");
+    p = cr_append_dec(p, end, r->pid);
+    p = cr_append_str(p, end, "\nuptime_ticks: ");
+    p = cr_append_dec(p, end, r->uptime_ticks);
+    p = cr_append_str(p, end, "\nvector: ");
+    p = cr_append_dec(p, end, r->vector);
+    p = cr_append_str(p, end, " (");
+    p = cr_append_str(p, end, crash_vector_name(r->vector));
+    p = cr_append_str(p, end, ")\nerror_code: 0x");
+    p = cr_append_hex(p, end, r->error_code, 16);
+    p = cr_append_str(p, end, "\nfault_addr: 0x");
+    p = cr_append_hex(p, end, r->fault_addr, 16);
+    p = cr_append_str(p, end, "\n\nregisters:\n");
+
+    p = cr_append_str(p, end, "  rip=0x"); p = cr_append_hex(p, end, r->rip, 16);
+    p = cr_append_str(p, end, " rsp=0x"); p = cr_append_hex(p, end, r->rsp, 16);
+    p = cr_append_str(p, end, " rbp=0x"); p = cr_append_hex(p, end, r->rbp, 16);
+    p = cr_append_str(p, end, "\n  rax=0x"); p = cr_append_hex(p, end, r->rax, 16);
+    p = cr_append_str(p, end, " rbx=0x"); p = cr_append_hex(p, end, r->rbx, 16);
+    p = cr_append_str(p, end, " rcx=0x"); p = cr_append_hex(p, end, r->rcx, 16);
+    p = cr_append_str(p, end, " rdx=0x"); p = cr_append_hex(p, end, r->rdx, 16);
+    p = cr_append_str(p, end, "\n  rsi=0x"); p = cr_append_hex(p, end, r->rsi, 16);
+    p = cr_append_str(p, end, " rdi=0x"); p = cr_append_hex(p, end, r->rdi, 16);
+    p = cr_append_str(p, end, " rflags=0x"); p = cr_append_hex(p, end, r->rflags, 16);
+    p = cr_append_str(p, end, "\n  r8 =0x"); p = cr_append_hex(p, end, r->r8, 16);
+    p = cr_append_str(p, end, " r9 =0x"); p = cr_append_hex(p, end, r->r9, 16);
+    p = cr_append_str(p, end, " r10=0x"); p = cr_append_hex(p, end, r->r10, 16);
+    p = cr_append_str(p, end, " r11=0x"); p = cr_append_hex(p, end, r->r11, 16);
+    p = cr_append_str(p, end, "\n  r12=0x"); p = cr_append_hex(p, end, r->r12, 16);
+    p = cr_append_str(p, end, " r13=0x"); p = cr_append_hex(p, end, r->r13, 16);
+    p = cr_append_str(p, end, " r14=0x"); p = cr_append_hex(p, end, r->r14, 16);
+    p = cr_append_str(p, end, " r15=0x"); p = cr_append_hex(p, end, r->r15, 16);
+    p = cr_append_str(p, end, "\n  cs=0x"); p = cr_append_hex(p, end, r->cs, 4);
+    p = cr_append_str(p, end, " ss=0x"); p = cr_append_hex(p, end, r->ss, 4);
+
+    p = cr_append_str(p, end, "\n\nbacktrace:\n");
+    for (uint32_t i = 0; i < r->frame_count && i < CRASH_MAX_FRAMES; i++) {
+        p = cr_append_str(p, end, "  #");
+        p = cr_append_dec(p, end, i);
+        p = cr_append_str(p, end, " 0x");
+        p = cr_append_hex(p, end, r->frames[i].addr, 16);
+        if (r->frames[i].symbol[0]) {
+            p = cr_append_str(p, end, " ");
+            p = cr_append_str(p, end, r->frames[i].symbol);
+            p = cr_append_str(p, end, "+0x");
+            p = cr_append_hex(p, end, r->frames[i].offset, 4);
+        }
+        p = cr_append_str(p, end, "\n");
+    }
+
+    if (r->code_valid) {
+        p = cr_append_str(p, end, "\ncode bytes:\n  base=0x");
+        p = cr_append_hex(p, end, r->code_base, 16);
+        p = cr_append_str(p, end, "\n  before:");
+        for (int i = 0; i < 32; i++) {
+            p = cr_append_str(p, end, " ");
+            p = cr_append_hex(p, end, r->code_before[i], 2);
+        }
+        p = cr_append_str(p, end, "\n  at_rip:");
+        for (int i = 0; i < 32; i++) {
+            p = cr_append_str(p, end, " ");
+            p = cr_append_hex(p, end, r->code_after[i], 2);
+        }
+        p = cr_append_str(p, end, "\n");
+    }
+
+    if (r->stack_valid) {
+        p = cr_append_str(p, end, "\nstack top:\n  base=0x");
+        p = cr_append_hex(p, end, r->stack_base, 16);
+        p = cr_append_str(p, end, "\n");
+        for (int i = 0; i < 16; i++) {
+            p = cr_append_str(p, end, "  [");
+            p = cr_append_dec(p, end, (uint64_t)i);
+            p = cr_append_str(p, end, "] 0x");
+            p = cr_append_hex(p, end, r->stack_words[i], 16);
+            p = cr_append_str(p, end, "\n");
+        }
+    }
+
+    *p = '\0';
+    return (uint32_t)(p - out);
+}
 
 /* ── Build and save crash report ────────────────────────────── */
 
@@ -90,7 +245,7 @@ void crash_report_save(uint64_t *frame, uint32_t vector, uint64_t fault_addr,
     memset(r, 0, sizeof(*r));
 
     r->magic   = CRASH_MAGIC;
-    r->version = 1;
+    r->version = 2;
     r->vector  = vector;
     r->error_code = frame[16];
     r->fault_addr = fault_addr;
@@ -240,13 +395,17 @@ void crash_report_save(uint64_t *frame, uint32_t vector, uint64_t fault_addr,
 
     serial_puts("  +--------------------------------------------------+\n\n");
 
-    /* Save to OsitoFS as crash_<pid>.bin */
-    crash_count++;
-    char fname[32] = "crash_000.bin";
-    fname[6] = '0' + (crash_count / 100) % 10;
-    fname[7] = '0' + (crash_count / 10) % 10;
-    fname[8] = '0' + crash_count % 10;
+    boot_diag_flush("crash");
 
+    /* Save to OsitoFS under the current boot slot. */
+    int slot = boot_diag_slot();
+    uint32_t crash_idx = boot_diag_next_crash_index();
+    char fname[32];
+    char tname[32];
+    boot_diag_format_crash_name(fname, slot, crash_idx, "bin");
+    boot_diag_format_crash_name(tname, slot, crash_idx, "txt");
+
+    osfs2_delete(fname);
     void *file = osfs2_create(fname, sizeof(crash_report_t));
     if (file) {
         extern uint64_t osfs2_file_byte_offset(void *file);
@@ -275,4 +434,17 @@ void crash_report_save(uint64_t *frame, uint32_t vector, uint64_t fault_addr,
     } else {
         serial_puts("[CRASH] osfs2_create FAILED\n");
     }
+
+    uint32_t txt_len = crash_report_text(crash_text, sizeof(crash_text), r);
+    osfs2_delete(tname);
+    file = osfs2_create(tname, txt_len);
+    if (file && osfs2_write(file, 0, crash_text, txt_len) == 0) {
+        serial_puts("[CRASH] Summary saved: ");
+        serial_puts(tname);
+        serial_puts("\n");
+    } else {
+        serial_puts("[CRASH] summary save FAILED\n");
+    }
+
+    boot_diag_flush("crash-saved");
 }

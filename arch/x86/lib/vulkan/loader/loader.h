@@ -94,6 +94,7 @@ struct osito_memory {
 struct osito_buffer {
     struct osito_device *owner;
     VkBuffer              real;
+    VkDeviceSize          size;
 };
 
 /* W3b.4 — remaining non-dispatchable wrappers.
@@ -111,10 +112,16 @@ struct osito_render_pass {
 struct osito_image {
     struct osito_device *owner;
     VkImage               real;
+    uint32_t              width;
+    uint32_t              height;
 };
 struct osito_image_view {
     struct osito_device *owner;
     VkImageView           real;
+};
+struct osito_buffer_view {
+    struct osito_device *owner;
+    VkBufferView          real;
 };
 struct osito_framebuffer {
     struct osito_device *owner;
@@ -163,6 +170,8 @@ struct osito_semaphore {
 struct osito_swapchain {
     struct osito_device  *owner;
     VkSwapchainKHR        real;
+    uint32_t              width;
+    uint32_t              height;
 };
 
 /* Wave 3 (W4.10) — wrappers for descriptor / sampler / event /
@@ -180,6 +189,10 @@ struct osito_descriptor_pool {
 struct osito_descriptor_set {
     struct osito_device  *owner;
     VkDescriptorSet       real;
+};
+struct osito_descriptor_update_template {
+    struct osito_device        *owner;
+    VkDescriptorUpdateTemplate  real;
 };
 struct osito_event {
     struct osito_device  *owner;

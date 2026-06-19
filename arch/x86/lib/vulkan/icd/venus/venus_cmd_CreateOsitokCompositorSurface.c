@@ -24,10 +24,9 @@
 
 extern void *memset(void *, int, unsigned long);
 
-/* W3b.5 handle marker — top 12 bits. 0xFE00 is picked so it does not
- * collide with any W3b.3/W3b.4 markers (0x7..0xF ranges). See the plan
- * §W3b.5 invariants for the full marker map. */
-#define VENUS_H_MARKER_SURFACE    0xFE00000000000000ull
+/* Surface uses marker 0 so `(handle >> 48) & 0x0FFF` returns the
+ * original slot. Other W3b.5 objects use the free 0x1..0x3 high nibbles. */
+#define VENUS_H_MARKER_SURFACE    0x0000000000000000ull
 #define VENUS_H_SLOT_MASK_W3B5    0x0FFFull
 #define VENUS_H_PTR_MASK_W3B5     0x0000FFFFFFFFFFFFull
 
