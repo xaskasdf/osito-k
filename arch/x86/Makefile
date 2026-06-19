@@ -8,6 +8,7 @@
 #
 # Usage:
 #   make              Build boot.efi + kernel.elf
+#   make pxe          Build boot-pxe.efi with kernel.elf embedded
 #   make clean        Clean build artifacts
 #
 # Legacy monolithic build:
@@ -204,6 +205,7 @@ GUI_SRC  = ../../gui/gui_draw.c ../../gui/gui_text.c \
 # ── Object files ──────────────────────────────────────────────
 
 BOOT_OBJ  = $(BUILD)/boot_efi.o
+BOOT_PXE_OBJ = $(BUILD)/boot_efi_pxe.o $(BUILD)/boot_pxe_kernel.o
 KERN_OBJ  = $(KERN_SRC:%.c=$(BUILD)/%.o)
 ASM_OBJ   = $(ASM_SRC:%.S=$(BUILD)/%.o)
 DRV_OBJ   = $(DRV_SRC:%.c=$(BUILD)/%.o)
@@ -242,11 +244,15 @@ FS_MIN_OBJ   = $(FS_MINIMAL:%.c=$(BUILD)/%.o)
 ALL_MIN_OBJ  = $(KERN_MIN_OBJ) $(ASM_OBJ) $(DRV_MIN_OBJ) $(FS_MIN_OBJ) \
                $(WIN32_OBJ) $(WIN32_ASM_OBJ) $(DOS_OBJ) $(DOS_ASM_OBJ) $(GUI_OBJ)
 
-.PHONY: all clean check-deps legacy tcc tcc-clean minimal libvulkan
+.PHONY: all clean check-deps legacy tcc tcc-clean minimal libvulkan pxe
 
 all: check-deps $(BUILD)/boot.efi $(BUILD)/kernel.elf libvulkan
 	@echo ""
 	@echo "Built: $(BUILD)/boot.efi + $(BUILD)/kernel.elf + lib/vulkan/libvulkan.a"
+
+pxe: check-deps $(BUILD)/boot-pxe.efi
+	@echo ""
+	@echo "Built PXE: $(BUILD)/boot-pxe.efi (kernel.elf embedded)"
 
 # ── Wave 2: Vulkan SDK library ────────────────────────────────
 libvulkan:
@@ -273,11 +279,27 @@ $(BUILD)/boot.efi: $(BUILD)/boot.so
 	python3 scripts/elf2efi.py $< $@
 	@echo "Built: $@ ($$(stat -c%s $@ 2>/dev/null || stat -f%z $@ 2>/dev/null || wc -c < $@) bytes)"
 
+$(BUILD)/boot-pxe.efi: $(BUILD)/boot-pxe.so
+	$(OBJCOPY) -j .text -j .rodata -j .sdata -j .data -j .dynamic -j .dynsym \
+	           -j .rel -j .rela -j .reloc \
+	           --target=efi-app-x86_64 $< $@ 2>/dev/null || \
+	python3 scripts/elf2efi.py $< $@
+	@echo "Built: $@ ($$(stat -c%s $@ 2>/dev/null || stat -f%z $@ 2>/dev/null || wc -c < $@) bytes)"
+
 $(BUILD)/boot.so: $(BOOT_OBJ)
+	$(LD) $(BLDFLAGS) -o $@ $^ $(BLIBS)
+
+$(BUILD)/boot-pxe.so: $(BOOT_PXE_OBJ)
 	$(LD) $(BLDFLAGS) -o $@ $^ $(BLIBS)
 
 $(BUILD)/boot_efi.o: boot/boot_efi.c | $(BUILD)
 	$(CC) $(BFLAGS) -c -o $@ $<
+
+$(BUILD)/boot_efi_pxe.o: boot/boot_efi.c | $(BUILD)
+	$(CC) $(BFLAGS) -DOK_PXE_EMBED_KERNEL=1 -c -o $@ $<
+
+$(BUILD)/boot_pxe_kernel.o: boot/kernel_embed.S $(BUILD)/kernel.elf | $(BUILD)
+	$(CC) -c -o $@ $<
 
 # ── kernel.elf (kernel binary) ─────────────────────────────────
 

@@ -2,6 +2,7 @@
  * OsitoK x86-64 — UEFI Bootloader
  *
  * Standalone boot.efi that loads kernel.elf from the ESP and jumps to it.
+ * PXE builds define OK_PXE_EMBED_KERNEL and embed kernel.elf directly.
  * The kernel is compiled WITHOUT EFI restrictions (-fno-pie, jump tables OK).
  *
  * Boot flow:
@@ -214,6 +215,88 @@ static UINT64 kernel_phys_lo;
 static UINT64 kernel_phys_hi;
 static UINT64 kernel_entry_addr;
 
+#ifdef OK_PXE_EMBED_KERNEL
+extern const UINT8 ok_pxe_kernel_elf_start[];
+extern const UINT8 ok_pxe_kernel_elf_end[];
+
+static EFI_STATUS load_kernel_elf_from_memory(const UINT8 *image, UINTN image_size)
+{
+    if (!image || image_size < sizeof(elf64_ehdr_t))
+        return EFI_INVALID_PARAMETER;
+
+    const elf64_ehdr_t *ehdr = (const elf64_ehdr_t *)image;
+    if (ehdr->e_ident_mag != ELF_MAGIC) {
+        Print(L"Invalid embedded ELF magic (expected 0x%x got 0x%x)\r\n",
+              ELF_MAGIC, ehdr->e_ident_mag);
+        return EFI_INVALID_PARAMETER;
+    }
+
+    UINT64 ph_end = ehdr->e_phoff + ((UINT64)ehdr->e_phnum * ehdr->e_phentsize);
+    if (ehdr->e_phentsize < sizeof(elf64_phdr_t) || ph_end > image_size) {
+        Print(L"Invalid embedded ELF program header table\r\n");
+        return EFI_INVALID_PARAMETER;
+    }
+
+    Print(L"embedded kernel.elf: entry=0x%lx, %d phdrs\r\n",
+          ehdr->e_entry, ehdr->e_phnum);
+
+    kernel_entry_addr = ehdr->e_entry;
+    kernel_phys_lo = ~0ULL;
+    kernel_phys_hi = 0;
+
+    for (UINT16 i = 0; i < ehdr->e_phnum; i++) {
+        const elf64_phdr_t *phdr =
+            (const elf64_phdr_t *)(image + ehdr->e_phoff + i * ehdr->e_phentsize);
+
+        if (phdr->p_type != PT_LOAD || phdr->p_memsz == 0)
+            continue;
+        if (phdr->p_offset + phdr->p_filesz > image_size) {
+            Print(L"  embedded LOAD %d exceeds image size\r\n", i);
+            return EFI_INVALID_PARAMETER;
+        }
+
+        Print(L"  LOAD: vaddr=0x%lx filesz=0x%lx memsz=0x%lx\r\n",
+              phdr->p_vaddr, phdr->p_filesz, phdr->p_memsz);
+
+        UINT64 seg_base = phdr->p_paddr;
+        UINT64 seg_end  = seg_base + phdr->p_memsz;
+        UINT64 pages = (seg_end - (seg_base & ~0xFFFULL) + 0xFFF) >> 12;
+
+        EFI_PHYSICAL_ADDRESS alloc_addr = seg_base & ~0xFFFULL;
+        EFI_STATUS status = uefi_call_wrapper(BS->AllocatePages, 4,
+                                              AllocateAddress, EfiLoaderData,
+                                              pages, &alloc_addr);
+        if (EFI_ERROR(status)) {
+            Print(L"  AllocatePages at 0x%lx (%d pages) failed: %r\r\n",
+                  alloc_addr, pages, status);
+            return status;
+        }
+
+        UINT8 *dst = (UINT8 *)seg_base;
+        for (UINT64 j = 0; j < phdr->p_memsz; j++)
+            dst[j] = 0;
+        for (UINT64 j = 0; j < phdr->p_filesz; j++)
+            dst[j] = image[phdr->p_offset + j];
+
+        if (seg_base < kernel_phys_lo) kernel_phys_lo = seg_base;
+        if (seg_end  > kernel_phys_hi) kernel_phys_hi = seg_end;
+    }
+
+    Print(L"Kernel loaded: 0x%lx-0x%lx (%d KB)\r\n",
+          kernel_phys_lo, kernel_phys_hi,
+          (kernel_phys_hi - kernel_phys_lo) / 1024);
+
+    return EFI_SUCCESS;
+}
+
+static EFI_STATUS load_kernel_elf(EFI_HANDLE ImageHandle)
+{
+    (void)ImageHandle;
+    UINTN image_size = (UINTN)(ok_pxe_kernel_elf_end - ok_pxe_kernel_elf_start);
+    Print(L"PXE embedded kernel.elf: %d bytes\r\n", image_size);
+    return load_kernel_elf_from_memory(ok_pxe_kernel_elf_start, image_size);
+}
+#else
 static EFI_STATUS load_kernel_elf(EFI_HANDLE ImageHandle)
 {
     EFI_STATUS status;
@@ -338,6 +421,7 @@ static EFI_STATUS load_kernel_elf(EFI_HANDLE ImageHandle)
 
     return EFI_SUCCESS;
 }
+#endif
 
 /* ── Memory Map ─────────────────────────────────────────────── */
 
