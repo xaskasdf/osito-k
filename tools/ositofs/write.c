@@ -24,7 +24,7 @@
 #include "common.h"
 #include "gguf.h"
 
-#define MAX_BATCH_FILES 4096
+#define MAX_BATCH_FILES OSFS2_DEFAULT_MAX_FILES
 
 /*
  * Live-extent bitmap (one bit per block). Built from the in-memory file
@@ -65,13 +65,14 @@ static uint32_t blkmap_find_free(uint32_t count, uint32_t data_start)
 }
 
 /* Rebuild g_blkmap from the file table: mark metadata + every live extent. */
-static int blkmap_build(const osfs2_file_t *ft, uint32_t total_blocks, uint32_t data_start)
+static int blkmap_build(const osfs2_file_t *ft, uint32_t max_files,
+                        uint32_t total_blocks, uint32_t data_start)
 {
     g_total_blocks = total_blocks;
     g_blkmap = calloc((total_blocks + 7) / 8, 1);
     if (!g_blkmap) return -1;
     for (uint32_t b = 0; b < data_start; b++) blkmap_set(b);
-    for (uint32_t i = 0; i < OSFS2_MAX_FILES; i++) {
+    for (uint32_t i = 0; i < max_files; i++) {
         if (!(ft[i].flags & OSFS2_FLAG_VALID)) continue;
         for (uint32_t b = 0; b < ft[i].block_count; b++)
             blkmap_set(ft[i].start_block + b);
@@ -455,25 +456,30 @@ int main(int argc, char **argv)
 
     uint32_t bs = sb.block_size;
     uint32_t shift = osfs2_block_shift(bs);
+    uint32_t max_files = osfs2_layout_max_files(&sb);
+    uint32_t filetab_size = osfs2_layout_filetab_size(&sb);
+    uint32_t crctab_off = osfs2_layout_crctab_off(&sb);
+    uint32_t layeridx_off = osfs2_layout_layeridx_off(&sb);
+    uint32_t data_start_blk = osfs2_layout_data_start_blk(&sb);
 
     /* ── Read file table and CRC table (once) ───────────────────── */
-    void *ft_blk = osfs2_alloc_aligned(OSFS2_FILETAB_SIZE);
+    void *ft_blk = osfs2_alloc_aligned(filetab_size);
     if (!ft_blk) { osfs2_close_device(fd); free(jobs); return 1; }
-    if (osfs2_read_bytes(fd, OSFS2_FILETAB_OFF, ft_blk, OSFS2_FILETAB_SIZE) < 0)
+    if (osfs2_read_bytes(fd, OSFS2_FILETAB_OFF, ft_blk, filetab_size) < 0)
         goto fail;
 
     osfs2_file_t *ft = (osfs2_file_t *)ft_blk;
 
     /* Build the live-extent bitmap so allocation never overlaps a live file,
      * even if superblock.next_data_block is stale. */
-    if (blkmap_build(ft, sb.total_blocks, osfs2_data_start_blk(bs)) < 0) {
+    if (blkmap_build(ft, max_files, sb.total_blocks, data_start_blk) < 0) {
         fprintf(stderr, "ositofs-write: out of memory for block bitmap\n");
         goto fail;
     }
 
     void *crc_blk = osfs2_alloc_aligned(OSFS2_CRCTAB_SIZE);
     if (!crc_blk) goto fail;
-    if (osfs2_read_bytes(fd, OSFS2_CRCTAB_OFF, crc_blk, OSFS2_CRCTAB_SIZE) < 0)
+    if (osfs2_read_bytes(fd, crctab_off, crc_blk, OSFS2_CRCTAB_SIZE) < 0)
         goto fail_crc;
 
     uint32_t *crc_table = (uint32_t *)crc_blk;
@@ -488,7 +494,7 @@ int main(int argc, char **argv)
     if (any_gguf) {
         li_blk = osfs2_alloc_aligned(OSFS2_LAYERIDX_SIZE);
         if (li_blk) {
-            if (osfs2_read_bytes(fd, OSFS2_LAYERIDX_OFF, li_blk, OSFS2_LAYERIDX_SIZE) < 0) {
+            if (osfs2_read_bytes(fd, layeridx_off, li_blk, OSFS2_LAYERIDX_SIZE) < 0) {
                 free(li_blk);
                 li_blk = NULL;
             } else {
@@ -516,7 +522,7 @@ int main(int argc, char **argv)
     for (int i = 0; i < job_count; i++) {
         /* Check if name exists in FS (and would be overwritten) */
         int exists = 0;
-        for (uint32_t fi = 0; fi < OSFS2_MAX_FILES; fi++) {
+        for (uint32_t fi = 0; fi < max_files; fi++) {
             if ((ft[fi].flags & OSFS2_FLAG_VALID) &&
                 file_name_matches(&ft[fi], jobs[i].stored_name)) {
                 if (!overwrite) {
@@ -535,12 +541,12 @@ int main(int argc, char **argv)
     /* Count available file slots */
     {
         uint32_t valid_count = 0;
-        for (uint32_t fi = 0; fi < OSFS2_MAX_FILES; fi++) {
+        for (uint32_t fi = 0; fi < max_files; fi++) {
             if (ft[fi].flags & OSFS2_FLAG_VALID) valid_count++;
         }
-        if (valid_count + new_files > OSFS2_MAX_FILES) {
+        if (valid_count + new_files > max_files) {
             fprintf(stderr, "ositofs-write: not enough file table slots (%u used, need %u more, max %u)\n",
-                    valid_count, new_files, OSFS2_MAX_FILES);
+                    valid_count, new_files, max_files);
             goto fail_li;
         }
     }
@@ -562,7 +568,7 @@ int main(int argc, char **argv)
             printf("  Blocks needed: %u\n", blocks_needed);
 
         /* Handle overwrite: delete existing in-memory */
-        for (uint32_t fi = 0; fi < OSFS2_MAX_FILES; fi++) {
+        for (uint32_t fi = 0; fi < max_files; fi++) {
             if ((ft[fi].flags & OSFS2_FLAG_VALID) &&
                 file_name_matches(&ft[fi], job->stored_name)) {
                 printf("  Overwriting '%s' (freeing %u blocks)\n",
@@ -586,8 +592,8 @@ int main(int argc, char **argv)
 
                 /* Reclaim if this was the topmost allocation */
                 if (old_top == sb.next_data_block) {
-                    uint32_t hwm = osfs2_data_start_blk(sb.block_size);
-                    for (uint32_t j = 0; j < OSFS2_MAX_FILES; j++) {
+                    uint32_t hwm = data_start_blk;
+                    for (uint32_t j = 0; j < max_files; j++) {
                         if (!(ft[j].flags & OSFS2_FLAG_VALID)) continue;
                         uint32_t end = ft[j].start_block + ft[j].block_count;
                         if (end > hwm) hwm = end;
@@ -598,7 +604,6 @@ int main(int argc, char **argv)
             }
         }
 
-        uint32_t data_start_blk = osfs2_data_start_blk(sb.block_size);
         uint32_t start_block = 0;
 
         if (blocks_needed > 0) {
@@ -652,16 +657,16 @@ int main(int argc, char **argv)
         }
 
         /* Find a free file table slot */
-        uint32_t file_idx = OSFS2_MAX_FILES; /* sentinel */
+        uint32_t file_idx = max_files; /* sentinel */
         /* First: look for freed (invalid) slot within current range */
-        for (uint32_t fi = 0; fi < OSFS2_MAX_FILES; fi++) {
+        for (uint32_t fi = 0; fi < max_files; fi++) {
             if (!(ft[fi].flags & OSFS2_FLAG_VALID)) {
                 /* Check it's either within file_count or at file_count (append) */
                 file_idx = fi;
                 break;
             }
         }
-        if (file_idx == OSFS2_MAX_FILES) {
+        if (file_idx == max_files) {
             fprintf(stderr, "ositofs-write: file table full, skipping '%s'\n", job->stored_name);
             exit_code = 1;
             continue;
@@ -718,8 +723,6 @@ int main(int argc, char **argv)
         /* Update superblock in-memory. next_data_block is a high-water-mark
          * hint: only RAISE it (first-fit may place a file below the current
          * top, which must not lower the hint). */
-        if (file_idx >= sb.file_count)
-            sb.file_count = file_idx + 1;
         if (blocks_needed > 0 && start_block + blocks_needed > sb.next_data_block)
             sb.next_data_block = start_block + blocks_needed;
 
@@ -741,26 +744,31 @@ int main(int argc, char **argv)
         for (uint32_t b = 0; b < sb.total_blocks; b++)
             if (blkmap_test(b)) used++;
         sb.used_blocks = used;
+
+        uint32_t actual_files = 0;
+        for (uint32_t fi = 0; fi < max_files; fi++)
+            if (ft[fi].flags & OSFS2_FLAG_VALID) actual_files++;
+        sb.file_count = actual_files;
     }
 
     /* ── Flush all metadata once ────────────────────────────────── */
     if (success_count > 0) {
         /* Write CRC table */
-        if (osfs2_write_bytes(fd, OSFS2_CRCTAB_OFF, crc_blk, OSFS2_CRCTAB_SIZE) < 0) {
+        if (osfs2_write_bytes(fd, crctab_off, crc_blk, OSFS2_CRCTAB_SIZE) < 0) {
             fprintf(stderr, "ositofs-write: failed to write CRC table\n");
             goto fail_li;
         }
 
         /* Write layer index if any GGUF files were written */
         if (li_blk) {
-            if (osfs2_write_bytes(fd, OSFS2_LAYERIDX_OFF, li_blk, OSFS2_LAYERIDX_SIZE) < 0) {
+            if (osfs2_write_bytes(fd, layeridx_off, li_blk, OSFS2_LAYERIDX_SIZE) < 0) {
                 fprintf(stderr, "ositofs-write: failed to write layer index\n");
                 goto fail_li;
             }
         }
 
         /* Write file table */
-        if (osfs2_write_bytes(fd, OSFS2_FILETAB_OFF, ft_blk, OSFS2_FILETAB_SIZE) < 0) {
+        if (osfs2_write_bytes(fd, OSFS2_FILETAB_OFF, ft_blk, filetab_size) < 0) {
             fprintf(stderr, "ositofs-write: failed to write file table\n");
             goto fail_li;
         }

@@ -52,6 +52,8 @@ static osfs3_super_t sb;
 static uint8_t *imap = NULL;
 static uint8_t *bmap = NULL;
 static osfs3_inode_t *itab = NULL;
+static uint32_t itab_blocks = 0;
+static size_t itab_bytes = 0;
 
 /* ── Inode Management ────────────────────────────────────────── */
 
@@ -59,12 +61,20 @@ static int load_metadata(void)
 {
     imap = osfs3_alloc_block();
     bmap = osfs3_alloc_block();
-    itab = osfs3_alloc_block();
+    itab_blocks = osfs3_inode_table_blocks(sb.total_inodes);
+    itab_bytes = (size_t)itab_blocks * OSFS3_BLOCK_SIZE;
+    if (posix_memalign((void **)&itab, 4096, itab_bytes) != 0)
+        itab = NULL;
     if (!imap || !bmap || !itab) return -1;
+    memset(itab, 0, itab_bytes);
 
-    if (osfs3_read_block(dev_fd, 1, imap) < 0) return -1;
-    if (osfs3_read_block(dev_fd, 2, bmap) < 0) return -1;
-    if (osfs3_read_block(dev_fd, 3, itab) < 0) return -1;
+    if (osfs3_read_block(dev_fd, OSFS3_INODE_BITMAP_BLK, imap) < 0) return -1;
+    if (osfs3_read_block(dev_fd, OSFS3_BLOCK_BITMAP_BLK, bmap) < 0) return -1;
+    for (uint32_t i = 0; i < itab_blocks; i++) {
+        void *dst = (uint8_t *)itab + (size_t)i * OSFS3_BLOCK_SIZE;
+        if (osfs3_read_block(dev_fd, OSFS3_INODE_TABLE_BLK + i, dst) < 0)
+            return -1;
+    }
     return 0;
 }
 
@@ -74,13 +84,18 @@ static int save_metadata(void)
     sb.crc32 = osfs3_crc32(&sb, sizeof(sb));
     
     void *sb_blk = osfs3_alloc_block();
+    if (!sb_blk) return -1;
     memcpy(sb_blk, &sb, sizeof(sb));
     if (osfs3_write_block(dev_fd, 0, sb_blk) < 0) return -1;
     osfs3_free_block(sb_blk);
 
-    if (osfs3_write_block(dev_fd, 1, imap) < 0) return -1;
-    if (osfs3_write_block(dev_fd, 2, bmap) < 0) return -1;
-    if (osfs3_write_block(dev_fd, 3, itab) < 0) return -1;
+    if (osfs3_write_block(dev_fd, OSFS3_INODE_BITMAP_BLK, imap) < 0) return -1;
+    if (osfs3_write_block(dev_fd, OSFS3_BLOCK_BITMAP_BLK, bmap) < 0) return -1;
+    for (uint32_t i = 0; i < itab_blocks; i++) {
+        void *src = (uint8_t *)itab + (size_t)i * OSFS3_BLOCK_SIZE;
+        if (osfs3_write_block(dev_fd, OSFS3_INODE_TABLE_BLK + i, src) < 0)
+            return -1;
+    }
     return 0;
 }
 
@@ -192,7 +207,15 @@ static uint32_t resolve_path(const char *path, int create_dirs)
         if (!next_ino) {
             if (create_dirs) {
                 next_ino = alloc_inode(OSFS3_S_IFDIR | 0755);
+                if (!next_ino) {
+                    free(p);
+                    return 0;
+                }
                 uint32_t data_blk = alloc_block();
+                if (!data_blk) {
+                    free(p);
+                    return 0;
+                }
                 itab[next_ino].extent_count = 1;
                 itab[next_ino].extents[0].start_block = data_blk;
                 itab[next_ino].extents[0].block_count = 1;
@@ -255,6 +278,11 @@ static int write_file_to_osfs(const char *src_file, const char *dest_path)
     }
 
     uint32_t file_ino = alloc_inode(OSFS3_S_IFREG | 0644);
+    if (!file_ino) {
+        fprintf(stderr, "No free inodes for %s\n", dest_path);
+        free(dpath); free(fpath);
+        return -1;
+    }
     itab[file_ino].size = st.st_size;
     
     uint32_t blocks_needed = (st.st_size + OSFS3_BLOCK_SIZE - 1) / OSFS3_BLOCK_SIZE;

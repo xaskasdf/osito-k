@@ -42,10 +42,13 @@ int main(int argc, char **argv)
         return 0;
     }
 
-    /* Read file table (1MB at fixed offset) */
-    void *ft_blk = osfs2_alloc_aligned(OSFS2_FILETAB_SIZE);
+    uint32_t max_files = osfs2_layout_max_files(&sb);
+    uint32_t filetab_size = osfs2_layout_filetab_size(&sb);
+
+    /* Read file table */
+    void *ft_blk = osfs2_alloc_aligned(filetab_size);
     if (!ft_blk) { osfs2_close_device(fd); return 1; }
-    if (osfs2_read_bytes(fd, OSFS2_FILETAB_OFF, ft_blk, OSFS2_FILETAB_SIZE) < 0) {
+    if (osfs2_read_bytes(fd, OSFS2_FILETAB_OFF, ft_blk, filetab_size) < 0) {
         free(ft_blk);
         osfs2_close_device(fd);
         return 1;
@@ -63,7 +66,7 @@ int main(int argc, char **argv)
            "────────────────");
 
     uint64_t total_size = 0;
-    for (uint32_t i = 0; i < OSFS2_MAX_FILES; i++) {
+    for (uint32_t i = 0; i < max_files; i++) {
         if (!(ft[i].flags & OSFS2_FLAG_VALID)) continue;
 
         printf("%-40s ", display_name(&ft[i]));
@@ -102,7 +105,7 @@ int main(int argc, char **argv)
     }
 
     printf("\nTotal: "); osfs2_print_size(total_size);
-    uint32_t data_start = osfs2_data_start_blk(sb.block_size);
+    uint32_t data_start = osfs2_layout_data_start_blk(&sb);
     uint32_t data_blocks = sb.total_blocks - data_start;
     uint32_t used_data = sb.used_blocks > data_start ? sb.used_blocks - data_start : 0;
     printf(" in %u blocks (%u/%u data blocks used, %.1f%%, block_size=",

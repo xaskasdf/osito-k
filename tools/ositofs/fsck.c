@@ -34,6 +34,8 @@ static int validate_super_raw(const osfs2_super_t *sb)
     uint32_t calc = osfs2_crc32(&tmp, sizeof(tmp));
     if (calc != sb->crc32) return -1;
     if (!osfs2_valid_block_size(sb->block_size)) return -1;
+    if (!osfs2_valid_layout(sb)) return -1;
+    if (osfs2_layout_data_off(sb) % sb->block_size != 0) return -1;
     return 0;
 }
 
@@ -146,20 +148,24 @@ int main(int argc, char **argv)
         memcpy(&sb, &sb_backup, sizeof(sb));
 
     osfs2_block_sz = sb.block_size;
-    uint32_t data_start = osfs2_data_start_blk(sb.block_size);
+    uint32_t max_files = osfs2_layout_max_files(&sb);
+    uint32_t filetab_size = osfs2_layout_filetab_size(&sb);
+    uint32_t crctab_off = osfs2_layout_crctab_off(&sb);
+    uint32_t layeridx_off = osfs2_layout_layeridx_off(&sb);
+    uint32_t data_start = osfs2_layout_data_start_blk(&sb);
 
     free(sb_buf); sb_buf = NULL;
     free(sb_bak_buf); sb_bak_buf = NULL;
 
     /* ── 2. File table scan ──────────────────────────────────── */
 
-    void *ft_buf = osfs2_alloc_aligned(OSFS2_FILETAB_SIZE);
+    void *ft_buf = osfs2_alloc_aligned(filetab_size);
     if (!ft_buf) {
         fprintf(stderr, "ositofs-fsck: out of memory\n");
         osfs2_close_device(fd);
         return 1;
     }
-    if (osfs2_read_bytes(fd, OSFS2_FILETAB_OFF, ft_buf, OSFS2_FILETAB_SIZE) < 0) {
+    if (osfs2_read_bytes(fd, OSFS2_FILETAB_OFF, ft_buf, filetab_size) < 0) {
         fprintf(stderr, "ositofs-fsck: failed to read file table\n");
         free(ft_buf);
         osfs2_close_device(fd);
@@ -170,12 +176,12 @@ int main(int argc, char **argv)
 
     /* Count valid entries and collect block ranges */
     uint32_t actual_file_count = 0;
-    block_range_t *ranges = calloc(OSFS2_MAX_FILES, sizeof(block_range_t));
+    block_range_t *ranges = calloc(max_files, sizeof(block_range_t));
     uint32_t range_count = 0;
 
     int ft_errors = 0;
 
-    for (uint32_t i = 0; i < OSFS2_MAX_FILES; i++) {
+    for (uint32_t i = 0; i < max_files; i++) {
         if (!(ft[i].flags & OSFS2_FLAG_VALID)) continue;
         actual_file_count++;
 
@@ -248,9 +254,9 @@ int main(int argc, char **argv)
 
     /* Duplicate filename check */
     int dup_errors = 0;
-    for (uint32_t i = 0; i < OSFS2_MAX_FILES; i++) {
+    for (uint32_t i = 0; i < max_files; i++) {
         if (!(ft[i].flags & OSFS2_FLAG_VALID)) continue;
-        for (uint32_t j = i + 1; j < OSFS2_MAX_FILES; j++) {
+        for (uint32_t j = i + 1; j < max_files; j++) {
             if (!(ft[j].flags & OSFS2_FLAG_VALID)) continue;
             if (strcmp(ft[i].name, ft[j].name) == 0) {
                 printf("  DUPLICATE filename '%s' at slots %u and %u\n",
@@ -358,7 +364,7 @@ int main(int argc, char **argv)
         void *crc_buf = osfs2_alloc_aligned(OSFS2_CRCTAB_SIZE);
         if (!crc_buf) {
             fprintf(stderr, "ositofs-fsck: out of memory for CRC table\n");
-        } else if (osfs2_read_bytes(fd, OSFS2_CRCTAB_OFF, crc_buf,
+        } else if (osfs2_read_bytes(fd, crctab_off, crc_buf,
                                     OSFS2_CRCTAB_SIZE) < 0) {
             fprintf(stderr, "ositofs-fsck: failed to read CRC table\n");
             free(crc_buf);
@@ -373,7 +379,7 @@ int main(int argc, char **argv)
             if (!data_blk) {
                 fprintf(stderr, "ositofs-fsck: out of memory for data block\n");
             } else {
-                for (uint32_t i = 0; i < OSFS2_MAX_FILES; i++) {
+                for (uint32_t i = 0; i < max_files; i++) {
                     if (!(ft[i].flags & OSFS2_FLAG_VALID)) continue;
 
                     int file_ok = 1;
@@ -432,7 +438,7 @@ int main(int argc, char **argv)
     void *li_buf = osfs2_alloc_aligned(OSFS2_LAYERIDX_SIZE);
     if (!li_buf) {
         fprintf(stderr, "ositofs-fsck: out of memory for layer index\n");
-    } else if (osfs2_read_bytes(fd, OSFS2_LAYERIDX_OFF, li_buf,
+    } else if (osfs2_read_bytes(fd, layeridx_off, li_buf,
                                 OSFS2_LAYERIDX_SIZE) < 0) {
         fprintf(stderr, "ositofs-fsck: failed to read layer index\n");
         free(li_buf);
@@ -449,7 +455,7 @@ int main(int argc, char **argv)
         uint32_t slots_referenced = 0;
         int li_errors = 0;
 
-        for (uint32_t i = 0; i < OSFS2_MAX_FILES; i++) {
+        for (uint32_t i = 0; i < max_files; i++) {
             if (!(ft[i].flags & OSFS2_FLAG_VALID)) continue;
             if (ft[i].layer_index_slot == 0xFFFF) continue;
 
@@ -514,7 +520,7 @@ int main(int argc, char **argv)
         if (orphaned_slots > 0) {
             errors += orphaned_slots;
             if (repair) {
-                if (osfs2_write_bytes(fd, OSFS2_LAYERIDX_OFF, li_buf,
+                if (osfs2_write_bytes(fd, layeridx_off, li_buf,
                                       OSFS2_LAYERIDX_SIZE) == 0) {
                     printf("    -> repaired: cleared %u orphaned slot(s)\n",
                            orphaned_slots);

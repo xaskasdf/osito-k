@@ -116,15 +116,19 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    /* Read file table (1MB at fixed offset) */
-    void *ft_buf = osfs2_alloc_aligned(OSFS2_FILETAB_SIZE);
+    uint32_t max_files = osfs2_layout_max_files(&sb);
+    uint32_t filetab_size = osfs2_layout_filetab_size(&sb);
+    uint32_t layeridx_off = osfs2_layout_layeridx_off(&sb);
+
+    /* Read file table */
+    void *ft_buf = osfs2_alloc_aligned(filetab_size);
     if (!ft_buf) {
         fprintf(stderr, "ositofs-delete: out of memory\n");
         osfs2_close_device(fd);
         return 1;
     }
 
-    if (osfs2_read_bytes(fd, OSFS2_FILETAB_OFF, ft_buf, OSFS2_FILETAB_SIZE) < 0) {
+    if (osfs2_read_bytes(fd, OSFS2_FILETAB_OFF, ft_buf, filetab_size) < 0) {
         fprintf(stderr, "ositofs-delete: failed to read file table\n");
         free(ft_buf);
         osfs2_close_device(fd);
@@ -134,10 +138,16 @@ int main(int argc, char **argv)
     osfs2_file_t *ft = (osfs2_file_t *)ft_buf;
 
     /* Scan file table for all matches */
-    int matches[OSFS2_MAX_FILES];
+    int *matches = (int *)malloc(max_files * sizeof(int));
+    if (!matches) {
+        fprintf(stderr, "ositofs-delete: out of memory\n");
+        osfs2_free_block(ft_buf);
+        osfs2_close_device(fd);
+        return 1;
+    }
     int match_count = 0;
 
-    for (int i = 0; i < OSFS2_MAX_FILES; i++) {
+    for (uint32_t i = 0; i < max_files; i++) {
         if (!(ft[i].flags & OSFS2_FLAG_VALID)) continue;
         if (entry_matches(&ft[i], pattern))
             matches[match_count++] = i;
@@ -145,6 +155,7 @@ int main(int argc, char **argv)
 
     if (match_count == 0) {
         fprintf(stderr, "ositofs-delete: no files matching '%s'\n", pattern);
+        free(matches);
         osfs2_free_block(ft_buf);
         osfs2_close_device(fd);
         return 1;
@@ -164,6 +175,7 @@ int main(int argc, char **argv)
     if (dry_run) {
         printf("\n[dry-run] Would delete %d file%s\n",
                match_count, match_count == 1 ? "" : "s");
+        free(matches);
         osfs2_free_block(ft_buf);
         osfs2_close_device(fd);
         return 0;
@@ -179,7 +191,7 @@ int main(int argc, char **argv)
         if ((f->flags & OSFS2_FLAG_GGUF) && f->layer_index_slot != 0xFFFF) {
             li_blk = osfs2_alloc_aligned(OSFS2_LAYERIDX_SIZE);
             if (li_blk) {
-                if (osfs2_read_bytes(fd, OSFS2_LAYERIDX_OFF, li_blk,
+                if (osfs2_read_bytes(fd, layeridx_off, li_blk,
                                      OSFS2_LAYERIDX_SIZE) < 0) {
                     free(li_blk);
                     li_blk = NULL;
@@ -222,9 +234,9 @@ int main(int argc, char **argv)
     sb.used_blocks -= total_freed;
 
     /* Recalculate high-water mark once */
-    uint32_t data_start = osfs2_data_start_blk(sb.block_size);
+    uint32_t data_start = osfs2_layout_data_start_blk(&sb);
     uint32_t hwm = data_start;
-    for (int i = 0; i < OSFS2_MAX_FILES; i++) {
+    for (uint32_t i = 0; i < max_files; i++) {
         if (!(ft[i].flags & OSFS2_FLAG_VALID)) continue;
         uint32_t end = ft[i].start_block + ft[i].block_count;
         if (end > hwm) hwm = end;
@@ -237,13 +249,14 @@ int main(int argc, char **argv)
 
     /* Flush layer index if modified */
     if (li_blk && li_dirty) {
-        osfs2_write_bytes(fd, OSFS2_LAYERIDX_OFF, li_blk, OSFS2_LAYERIDX_SIZE);
+        osfs2_write_bytes(fd, layeridx_off, li_blk, OSFS2_LAYERIDX_SIZE);
     }
     free(li_blk);
 
     /* Write back file table */
-    if (osfs2_write_bytes(fd, OSFS2_FILETAB_OFF, ft_buf, OSFS2_FILETAB_SIZE) < 0) {
+    if (osfs2_write_bytes(fd, OSFS2_FILETAB_OFF, ft_buf, filetab_size) < 0) {
         fprintf(stderr, "ositofs-delete: failed to write file table\n");
+        free(matches);
         free(ft_buf);
         osfs2_close_device(fd);
         return 1;
@@ -263,6 +276,7 @@ int main(int argc, char **argv)
            deleted, deleted == 1 ? "" : "s",
            total_freed, total_freed == 1 ? "" : "s");
 
+    free(matches);
     free(ft_buf);
     osfs2_close_device(fd);
     return 0;

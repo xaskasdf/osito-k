@@ -36,7 +36,7 @@ static uint64_t     partition_offset;  /* Byte offset of OsitoFS partition on NV
 static osfs2_super_t superblock;
 static bool          mounted;
 
-/* Cached file table (4096 * 256 = 1MB — read on mount) */
+/* Cached file table — size is read from the mounted layout */
 static osfs2_file_t *file_table;
 
 /* Cached block CRC table (262144 * 4 = 1MB — read on mount) */
@@ -46,6 +46,10 @@ static uint32_t *crc_table;
 static uint32_t blk_size;
 static uint32_t blk_shift;
 static uint32_t data_start;
+static uint32_t fs_max_files;
+static uint32_t fs_filetab_size;
+static uint32_t fs_crctab_off;
+static uint32_t fs_layeridx_off;
 
 /* Boot-time epoch (approximated from superblock create_time) */
 static uint64_t boot_epoch_sec;
@@ -85,7 +89,7 @@ static void blk_bitmap_rebuild(void)
         blk_bitmap_set(i);
 
     /* Mark each valid file's blocks */
-    for (uint32_t i = 0; i < OSFS2_MAX_FILES; i++) {
+    for (uint32_t i = 0; i < fs_max_files; i++) {
         if (!(file_table[i].flags & OSFS2_FLAG_VALID)) continue;
         osfs2_file_t *f = &file_table[i];
         for (uint32_t b = 0; b < f->block_count; b++)
@@ -120,7 +124,7 @@ static uint32_t blk_bitmap_find_free(uint32_t count)
 
 /* ── File name hash table (in-memory, O(1) lookup) ──────────── */
 
-#define OSFS2_HASH_SLOTS  8192
+#define OSFS2_HASH_SLOTS  65536
 #define OSFS2_HASH_MASK   (OSFS2_HASH_SLOTS - 1)
 #define OSFS2_HASH_EMPTY  0xFFFF
 
@@ -152,7 +156,7 @@ static void osfs2_hash_build(void)
 {
     for (uint32_t i = 0; i < OSFS2_HASH_SLOTS; i++)
         name_hash[i] = OSFS2_HASH_EMPTY;
-    for (uint32_t i = 0; i < OSFS2_MAX_FILES; i++) {
+    for (uint32_t i = 0; i < fs_max_files; i++) {
         if (file_table[i].flags & OSFS2_FLAG_VALID)
             osfs2_hash_insert((uint16_t)i);
     }
@@ -239,9 +243,21 @@ superblock_ok:
         serial_puts("\n");
         return -1;
     }
+    if (!osfs2_valid_layout(&superblock)) {
+        serial_puts("[OsitoFS] Invalid metadata layout\n");
+        return -1;
+    }
     blk_size = superblock.block_size;
     blk_shift = osfs2_block_shift(blk_size);
-    data_start = osfs2_data_start_blk(blk_size);
+    if (osfs2_layout_data_off(&superblock) % blk_size != 0) {
+        serial_puts("[OsitoFS] Metadata layout is not block-aligned\n");
+        return -1;
+    }
+    fs_max_files = osfs2_layout_max_files(&superblock);
+    fs_filetab_size = osfs2_layout_filetab_size(&superblock);
+    fs_crctab_off = osfs2_layout_crctab_off(&superblock);
+    fs_layeridx_off = osfs2_layout_layeridx_off(&superblock);
+    data_start = osfs2_layout_data_start_blk(&superblock);
 
     serial_puts("[OsitoFS] Superblock OK: label=\"");
     serial_puts(superblock.label);
@@ -251,17 +267,19 @@ superblock_ok:
     serial_putdec(superblock.total_blocks);
     serial_puts(", blk_size=");
     serial_putdec(blk_size);
+    serial_puts(", slots=");
+    serial_putdec(fs_max_files);
     serial_puts("\n");
 
-    /* Read full file table (1MB) */
+    /* Read full file table */
     {
-        file_table = (osfs2_file_t *)mem_alloc_pages(OSFS2_FILETAB_SIZE / 4096);
+        file_table = (osfs2_file_t *)mem_alloc_pages(fs_filetab_size / 4096);
         if (!file_table) {
             serial_puts("[OsitoFS] Failed to allocate file table\n");
             return -1;
         }
 
-        if (osfs2_part_read(OSFS2_FILETAB_OFF, file_table, OSFS2_FILETAB_SIZE) < 0) {
+        if (osfs2_part_read(OSFS2_FILETAB_OFF, file_table, fs_filetab_size) < 0) {
             serial_puts("[OsitoFS] Failed to read file table\n");
             return -1;
         }
@@ -271,7 +289,7 @@ superblock_ok:
     /* Read block CRC table (1MB at fixed offset) */
     crc_table = (uint32_t *)mem_alloc_pages(OSFS2_CRCTAB_SIZE / 4096);
     if (crc_table) {
-        if (osfs2_part_read(OSFS2_CRCTAB_OFF, crc_table, OSFS2_CRCTAB_SIZE) < 0) {
+        if (osfs2_part_read(fs_crctab_off, crc_table, OSFS2_CRCTAB_SIZE) < 0) {
             serial_puts("[OsitoFS] CRC table read failed (verification disabled)\n");
             crc_table = NULL;
         }
@@ -329,7 +347,7 @@ void osfs2_list(void)
     serial_puts("[OsitoFS] File listing:\n");
 
     uint32_t file_count = 0;
-    for (uint32_t i = 0; i < OSFS2_MAX_FILES; i++) {
+    for (uint32_t i = 0; i < fs_max_files; i++) {
         if (!(file_table[i].flags & OSFS2_FLAG_VALID)) continue;
 
         osfs2_file_t *f = &file_table[i];
@@ -398,7 +416,7 @@ static int osfs2_wildcard_match(const char *pattern, const char *name)
 int osfs2_find_first(const char *pattern, int start_idx)
 {
     if (!mounted) return -1;
-    for (int i = start_idx; i < OSFS2_MAX_FILES; i++) {
+    for (int i = start_idx; i < (int)fs_max_files; i++) {
         if (!(file_table[i].flags & OSFS2_FLAG_VALID)) continue;
         if (osfs2_wildcard_match(pattern, file_table[i].name))
             return i;
@@ -409,7 +427,7 @@ int osfs2_find_first(const char *pattern, int start_idx)
 /* Get file entry by index */
 osfs2_file_t *osfs2_get_file(int index)
 {
-    if (index < 0 || index >= OSFS2_MAX_FILES) return NULL;
+    if (index < 0 || index >= (int)fs_max_files) return NULL;
     if (!(file_table[index].flags & OSFS2_FLAG_VALID)) return NULL;
     return &file_table[index];
 }
@@ -546,7 +564,7 @@ osfs2_file_t *osfs2_find_gguf(void)
 {
     if (!mounted) return NULL;
 
-    for (uint32_t i = 0; i < OSFS2_MAX_FILES; i++) {
+    for (uint32_t i = 0; i < fs_max_files; i++) {
         if ((file_table[i].flags & OSFS2_FLAG_VALID) &&
             (file_table[i].flags & OSFS2_FLAG_GGUF)) {
             return &file_table[i];
@@ -561,7 +579,7 @@ int osfs2_read_layer_index(uint16_t slot, osfs2_layer_idx_t *li)
 {
     if (!mounted || slot >= OSFS2_MAX_MODELS) return -1;
 
-    uint64_t offset = OSFS2_LAYERIDX_OFF
+    uint64_t offset = fs_layeridx_off
                     + (uint64_t)slot * sizeof(osfs2_layer_idx_t);
     return osfs2_part_read(offset, li, sizeof(*li));
 }
@@ -589,7 +607,7 @@ static int osfs2_write_superblock(void)
 
 static int osfs2_write_file_table(void)
 {
-    return osfs2_part_write(OSFS2_FILETAB_OFF, file_table, OSFS2_FILETAB_SIZE);
+    return osfs2_part_write(OSFS2_FILETAB_OFF, file_table, fs_filetab_size);
 }
 
 /* ── Create a new file ──────────────────────────────────────── */
@@ -608,7 +626,7 @@ osfs2_file_t *osfs2_create(const char *name, uint64_t size)
 
     /* Find free slot */
     int slot = -1;
-    for (uint32_t i = 0; i < OSFS2_MAX_FILES; i++) {
+    for (uint32_t i = 0; i < fs_max_files; i++) {
         if (!(file_table[i].flags & OSFS2_FLAG_VALID)) {
             slot = (int)i;
             break;
@@ -760,7 +778,7 @@ osfs2_file_t *osfs2_file_by_index(uint32_t idx)
 {
     if (!mounted) return NULL;
     uint32_t n = 0;
-    for (uint32_t i = 0; i < OSFS2_MAX_FILES; i++) {
+    for (uint32_t i = 0; i < fs_max_files; i++) {
         if (file_table[i].flags & OSFS2_FLAG_VALID) {
             if (n == idx) return &file_table[i];
             n++;
@@ -784,7 +802,7 @@ osfs2_file_t *osfs2_file_at(uint32_t index)
 {
     if (!mounted || !file_table) return NULL;
     uint32_t count = 0;
-    for (uint32_t i = 0; i < OSFS2_MAX_FILES; i++) {
+    for (uint32_t i = 0; i < fs_max_files; i++) {
         if (file_table[i].flags & OSFS2_FLAG_VALID) {
             if (count == index) return &file_table[i];
             count++;

@@ -31,6 +31,7 @@ extern int   osfs2_delete(const char *name);
 extern void *osfs2_get_file(int index);
 extern const char *osfs2_file_name(void *file);
 extern uint64_t osfs2_file_size(void *file);
+extern uint32_t osfs2_max_files(void);
 extern int   osfs2_is_mounted(void);
 extern int   disk_flush(void);
 
@@ -657,8 +658,9 @@ static void cmd_list(const char *cat, const char *query, pkg_out_fn out) {
 
 static void cmd_installed(pkg_out_fn out) {
     int count = 0;
-    for (int i = 0; i < 4096; i++) {
-        void *f = osfs2_get_file(i);
+    uint32_t max_files = osfs2_max_files();
+    for (uint32_t i = 0; i < max_files; i++) {
+        void *f = osfs2_get_file((int)i);
         if (!f) continue;
         const char *nm = osfs2_file_name(f);
         if (!nm) continue;

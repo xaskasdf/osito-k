@@ -54,15 +54,18 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    /* Read file table (1MB at fixed offset) */
-    void *ft_buf = osfs2_alloc_aligned(OSFS2_FILETAB_SIZE);
+    uint32_t max_files = osfs2_layout_max_files(&sb);
+    uint32_t filetab_size = osfs2_layout_filetab_size(&sb);
+
+    /* Read file table */
+    void *ft_buf = osfs2_alloc_aligned(filetab_size);
     if (!ft_buf) {
         fprintf(stderr, "ositofs-rename: out of memory\n");
         osfs2_close_device(fd);
         return 1;
     }
 
-    if (osfs2_read_bytes(fd, OSFS2_FILETAB_OFF, ft_buf, OSFS2_FILETAB_SIZE) < 0) {
+    if (osfs2_read_bytes(fd, OSFS2_FILETAB_OFF, ft_buf, filetab_size) < 0) {
         fprintf(stderr, "ositofs-rename: failed to read file table\n");
         free(ft_buf);
         osfs2_close_device(fd);
@@ -73,10 +76,10 @@ int main(int argc, char **argv)
 
     /* Scan for old name (exact match among valid entries) */
     int found_idx = -1;
-    for (int i = 0; i < OSFS2_MAX_FILES; i++) {
+    for (uint32_t i = 0; i < max_files; i++) {
         if (!(ft[i].flags & OSFS2_FLAG_VALID)) continue;
         if (strcmp(ft[i].name, old_name) == 0) {
-            found_idx = i;
+            found_idx = (int)i;
             break;
         }
     }
@@ -89,7 +92,7 @@ int main(int argc, char **argv)
     }
 
     /* Check new name doesn't already exist */
-    for (int i = 0; i < OSFS2_MAX_FILES; i++) {
+    for (uint32_t i = 0; i < max_files; i++) {
         if (!(ft[i].flags & OSFS2_FLAG_VALID)) continue;
         if (strcmp(ft[i].name, new_name) == 0) {
             fprintf(stderr, "ositofs-rename: file '%s' already exists\n", new_name);
@@ -108,7 +111,7 @@ int main(int argc, char **argv)
     f->modify_time = (uint32_t)time(NULL);
 
     /* Write back file table */
-    if (osfs2_write_bytes(fd, OSFS2_FILETAB_OFF, ft_buf, OSFS2_FILETAB_SIZE) < 0) {
+    if (osfs2_write_bytes(fd, OSFS2_FILETAB_OFF, ft_buf, filetab_size) < 0) {
         fprintf(stderr, "ositofs-rename: failed to write file table\n");
         free(ft_buf);
         osfs2_close_device(fd);

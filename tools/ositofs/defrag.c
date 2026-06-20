@@ -88,18 +88,21 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    uint32_t data_start = osfs2_data_start_blk(sb.block_size);
+    uint32_t max_files = osfs2_layout_max_files(&sb);
+    uint32_t filetab_size = osfs2_layout_filetab_size(&sb);
+    uint32_t crctab_off = osfs2_layout_crctab_off(&sb);
+    uint32_t data_start = osfs2_layout_data_start_blk(&sb);
 
     printf("ositofs-defrag: analyzing %s\n", device);
 
     /* Read file table */
-    void *ft_buf = osfs2_alloc_aligned(OSFS2_FILETAB_SIZE);
+    void *ft_buf = osfs2_alloc_aligned(filetab_size);
     if (!ft_buf) {
         fprintf(stderr, "ositofs-defrag: out of memory\n");
         osfs2_close_device(fd);
         return 1;
     }
-    if (osfs2_read_bytes(fd, OSFS2_FILETAB_OFF, ft_buf, OSFS2_FILETAB_SIZE) < 0) {
+    if (osfs2_read_bytes(fd, OSFS2_FILETAB_OFF, ft_buf, filetab_size) < 0) {
         fprintf(stderr, "ositofs-defrag: failed to read file table\n");
         free(ft_buf);
         osfs2_close_device(fd);
@@ -115,7 +118,7 @@ int main(int argc, char **argv)
         osfs2_close_device(fd);
         return 1;
     }
-    if (osfs2_read_bytes(fd, OSFS2_CRCTAB_OFF, crc_buf, OSFS2_CRCTAB_SIZE) < 0) {
+    if (osfs2_read_bytes(fd, crctab_off, crc_buf, OSFS2_CRCTAB_SIZE) < 0) {
         fprintf(stderr, "ositofs-defrag: failed to read CRC table\n");
         free(crc_buf);
         free(ft_buf);
@@ -126,7 +129,7 @@ int main(int argc, char **argv)
 
     /* ── Build sorted list of valid files by start_block ────────── */
 
-    defrag_entry_t *entries = calloc(OSFS2_MAX_FILES, sizeof(defrag_entry_t));
+    defrag_entry_t *entries = calloc(max_files, sizeof(defrag_entry_t));
     if (!entries) {
         fprintf(stderr, "ositofs-defrag: out of memory\n");
         free(crc_buf);
@@ -138,7 +141,7 @@ int main(int argc, char **argv)
     uint32_t file_count = 0;
     uint32_t total_data_blocks = 0;
 
-    for (uint32_t i = 0; i < OSFS2_MAX_FILES; i++) {
+    for (uint32_t i = 0; i < max_files; i++) {
         if (!(ft[i].flags & OSFS2_FLAG_VALID)) continue;
         entries[file_count].file_idx = i;
         entries[file_count].start_block = ft[i].start_block;
@@ -302,7 +305,7 @@ int main(int argc, char **argv)
      * was lost during the move. */
     uint32_t verify_files = 0;
     uint32_t verify_blocks = 0;
-    for (uint32_t i = 0; i < OSFS2_MAX_FILES; i++) {
+    for (uint32_t i = 0; i < max_files; i++) {
         if (!(ft[i].flags & OSFS2_FLAG_VALID)) continue;
         verify_files++;
         verify_blocks += ft[i].block_count;
@@ -337,14 +340,14 @@ int main(int argc, char **argv)
         sb.crc32 = osfs2_crc32(&sb, sizeof(sb));
 
         /* Flush CRC table */
-        if (osfs2_write_bytes(fd, OSFS2_CRCTAB_OFF, crc_buf,
+        if (osfs2_write_bytes(fd, crctab_off, crc_buf,
                               OSFS2_CRCTAB_SIZE) < 0) {
             fprintf(stderr, "ositofs-defrag: failed to write CRC table\n");
         }
 
         /* Flush file table */
         if (osfs2_write_bytes(fd, OSFS2_FILETAB_OFF, ft_buf,
-                              OSFS2_FILETAB_SIZE) < 0) {
+                              filetab_size) < 0) {
             fprintf(stderr, "ositofs-defrag: failed to write file table\n");
         }
 

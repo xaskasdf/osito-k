@@ -7,8 +7,25 @@
 import sys, struct
 
 MAGIC = 0x4F534632  # "OSF2"
+LAYOUT_MAGIC = 0x4F324C59
 FILETAB_OFF = 1 << 20
-DATA_OFF    = 4 << 20
+LEGACY_MAX_FILES = 4096
+CRCTAB_SIZE = 262144 * 4
+LAYERIDX_SIZE = 512 * 2048
+
+def layout(data, p):
+    layout_magic, file_slots, metadata_bytes = struct.unpack_from('<3I', data, p + 88)
+    slots = LEGACY_MAX_FILES
+    if layout_magic == LAYOUT_MAGIC:
+        slots = file_slots
+        if slots < LEGACY_MAX_FILES or slots % LEGACY_MAX_FILES:
+            raise ValueError(f"invalid file slot count: {slots}")
+    crctab_off = FILETAB_OFF + slots * 256
+    layeridx_off = crctab_off + CRCTAB_SIZE
+    data_off = layeridx_off + LAYERIDX_SIZE
+    if layout_magic == LAYOUT_MAGIC and metadata_bytes != data_off:
+        raise ValueError("metadata_bytes does not match layout")
+    return slots
 
 def find_part(data):
     # Scan 1MB-aligned offsets for the superblock magic (LE u32 at off+0).
@@ -29,10 +46,11 @@ def main():
     if p is None:
         print("OSFS2 superblock not found"); return
     magic, ver, bsz, total, used, fcount, nextblk = struct.unpack_from('<7I', data, p)
-    print(f"part@0x{p:x} ver={ver} block_size={bsz} files={fcount}")
+    max_files = layout(data, p)
+    print(f"part@0x{p:x} ver={ver} block_size={bsz} files={fcount}/{max_files}")
     ftab = p + FILETAB_OFF
     files = []
-    for i in range(4096):
+    for i in range(max_files):
         e = ftab + i*256
         if e+256 > len(data): break
         name = data[e:e+64].split(b'\x00')[0].decode('latin1', 'replace')

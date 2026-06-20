@@ -57,13 +57,16 @@ int main(int argc, char **argv)
     printf("Version:        %u\n", sb.version);
     printf("Block size:     "); osfs2_print_size(sb.block_size); printf("\n");
     printf("Total blocks:   %u\n", sb.total_blocks);
-    uint32_t data_start = osfs2_data_start_blk(sb.block_size);
+    uint32_t max_files = osfs2_layout_max_files(&sb);
+    uint32_t filetab_size = osfs2_layout_filetab_size(&sb);
+    uint32_t data_start = osfs2_layout_data_start_blk(&sb);
+    uint32_t metadata_bytes = osfs2_layout_data_off(&sb);
     printf("Used blocks:    %u (metadata: %u, data: %u)\n",
            sb.used_blocks, data_start,
            sb.used_blocks > data_start ?
                sb.used_blocks - data_start : 0);
     printf("Free blocks:    %u\n", sb.total_blocks - sb.used_blocks);
-    printf("File count:     %u / %u\n", sb.file_count, OSFS2_MAX_FILES);
+    printf("File count:     %u / %u\n", sb.file_count, max_files);
     printf("Next data blk:  %u\n", sb.next_data_block);
     printf("Label:          %s\n", sb.label);
 
@@ -92,16 +95,17 @@ int main(int argc, char **argv)
     printf(" (%.1f%%)\n", data_blks ? 100.0 * used_data / data_blks : 0.0);
     printf("  Free:         "); osfs2_print_size((uint64_t)free_data * sb.block_size);
     printf(" (%.1f%%)\n", data_blks ? 100.0 * free_data / data_blks : 0.0);
-    printf("  Metadata:     4 MB (offset 0-4MB)\n");
+    printf("  Metadata:     "); osfs2_print_size(metadata_bytes);
+    printf(" (offset 0-%uMB)\n", metadata_bytes / (1024 * 1024));
 
     /* ── Read file table for detailed analysis ──────────────────── */
 
-    void *ft_blk = osfs2_alloc_aligned(OSFS2_FILETAB_SIZE);
+    void *ft_blk = osfs2_alloc_aligned(filetab_size);
     if (!ft_blk) {
         osfs2_close_device(fd);
         return 1;
     }
-    if (osfs2_read_bytes(fd, OSFS2_FILETAB_OFF, ft_blk, OSFS2_FILETAB_SIZE) < 0) {
+    if (osfs2_read_bytes(fd, OSFS2_FILETAB_OFF, ft_blk, filetab_size) < 0) {
         free(ft_blk);
         osfs2_close_device(fd);
         return 1;
@@ -112,13 +116,10 @@ int main(int argc, char **argv)
 
     /* Collect valid files and their block regions */
     uint32_t valid_count = 0;
-    region_t *regions = NULL;
-    if (sb.file_count > 0) {
-        regions = (region_t *)malloc(sb.file_count * sizeof(region_t));
-        if (!regions) {
-            free(ft_blk);
-            return 1;
-        }
+    region_t *regions = (region_t *)malloc(max_files * sizeof(region_t));
+    if (!regions) {
+        free(ft_blk);
+        return 1;
     }
 
     uint32_t raw_count = 0, gguf_count = 0;
@@ -128,7 +129,7 @@ int main(int argc, char **argv)
     uint32_t oldest_idx = 0, newest_idx = 0;
     uint32_t oldest_time = UINT32_MAX, newest_time = 0;
 
-    for (uint32_t i = 0; i < OSFS2_MAX_FILES; i++) {
+    for (uint32_t i = 0; i < max_files; i++) {
         if (!(ft[i].flags & OSFS2_FLAG_VALID)) continue;
 
         if (regions) {
@@ -273,7 +274,7 @@ int main(int argc, char **argv)
 
     if (gguf_count > 0) {
         printf("\nModels:\n");
-        for (uint32_t i = 0; i < OSFS2_MAX_FILES; i++) {
+        for (uint32_t i = 0; i < max_files; i++) {
             if (!(ft[i].flags & OSFS2_FLAG_VALID)) continue;
             if (!(ft[i].flags & OSFS2_FLAG_GGUF))  continue;
 

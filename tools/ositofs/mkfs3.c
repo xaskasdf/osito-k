@@ -1,14 +1,14 @@
 /*
  * mkfs.ositofs3 — Format device with OsitoFS v3
  *
- * Usage: mkfs.ositofs3 <device> [--label <name>]
+ * Usage: mkfs.ositofs3 <device> [--label <name>] [--inodes <count>]
  *
  * Block Layout:
  *   0: Superblock
  *   1: Inode Bitmap
  *   2: Block Bitmap
- *   3: Inode Table
- *   4: Root Directory Data
+ *   3..K: Inode Table
+ *   K+1: Root Directory Data
  */
 
 #include <stdio.h>
@@ -21,7 +21,9 @@
 
 static void usage(void)
 {
-    fprintf(stderr, "Usage: mkfs.ositofs3 <device> [--label <name>]\n");
+    fprintf(stderr, "Usage: mkfs.ositofs3 <device> [--label <name>] [--inodes <count>]\n");
+    fprintf(stderr, "  --inodes: total inodes, multiple of %u (default %u)\n",
+            (uint32_t)OSFS3_INODES_PER_BLOCK, OSFS3_DEFAULT_INODES);
     exit(1);
 }
 
@@ -29,10 +31,13 @@ int main(int argc, char **argv)
 {
     const char *device = NULL;
     const char *label = "ositok-root";
+    uint32_t total_inodes = OSFS3_DEFAULT_INODES;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--label") == 0 && i + 1 < argc) {
             label = argv[++i];
+        } else if (strcmp(argv[i], "--inodes") == 0 && i + 1 < argc) {
+            total_inodes = (uint32_t)strtoul(argv[++i], NULL, 0);
         } else if (argv[i][0] != '-') {
             device = argv[i];
         } else {
@@ -46,9 +51,26 @@ int main(int argc, char **argv)
 
     uint64_t dev_size = osfs3_device_size(fd);
     uint32_t total_blocks = (uint32_t)(dev_size >> OSFS3_BLOCK_SHIFT);
+    uint32_t inode_table_blocks = osfs3_inode_table_blocks(total_inodes);
+    uint32_t root_data_block = osfs3_first_data_block_for_inodes(total_inodes);
 
-    /* Metadata requires at least 4 blocks (SB, InoMap, BlkMap, InoTab) + 1 RootData */
-    if (total_blocks < 5) {
+    if (!osfs3_valid_inode_count(total_inodes)) {
+        fprintf(stderr,
+                "mkfs: invalid inode count %u (must be %u..%u, multiple of %u)\n",
+                total_inodes, (uint32_t)OSFS3_INODES_PER_BLOCK, osfs3_max_inodes(),
+                (uint32_t)OSFS3_INODES_PER_BLOCK);
+        osfs3_close_device(fd);
+        return 1;
+    }
+    if (total_blocks > osfs3_max_blocks()) {
+        fprintf(stderr, "mkfs: device has %u blocks, bitmap supports max %u\n",
+                total_blocks, osfs3_max_blocks());
+        osfs3_close_device(fd);
+        return 1;
+    }
+
+    /* Metadata requires SB, inode bitmap, block bitmap, inode table, root dir. */
+    if (total_blocks < root_data_block + 1) {
         fprintf(stderr, "mkfs: device too small\n");
         osfs3_close_device(fd);
         return 1;
@@ -57,6 +79,10 @@ int main(int argc, char **argv)
     printf("mkfs.ositofs3: formatting %s\n", device);
     printf("  Device size: "); osfs3_print_size(dev_size); printf("\n");
     printf("  Total blocks: %u (1MB each)\n", total_blocks);
+    printf("  Inodes: %u (%u inode-table blocks)\n",
+           total_inodes, inode_table_blocks);
+    printf("  Data blocks: %u (starting at block %u)\n",
+           total_blocks - root_data_block, root_data_block);
     printf("  Label: %s\n", label);
 
     void *blk = osfs3_alloc_block();
@@ -68,10 +94,10 @@ int main(int argc, char **argv)
     sb->version = OSFS3_VERSION;
     sb->block_size = OSFS3_BLOCK_SIZE;
     sb->total_blocks = total_blocks;
-    sb->total_inodes = 4096; /* 1 block worth of inodes */
-    sb->free_blocks = total_blocks - 5; 
+    sb->total_inodes = total_inodes;
+    sb->free_blocks = total_blocks - (root_data_block + 1);
     sb->free_inodes = sb->total_inodes - 1; /* Inode 1 is root */
-    sb->first_data_block = 4;
+    sb->first_data_block = root_data_block;
     sb->root_inode = 1;
     osfs3_gen_uuid(sb->uuid);
     strncpy(sb->label, label, 31);
@@ -92,11 +118,12 @@ int main(int argc, char **argv)
     /* ── Block 2: Block Bitmap ───────────────────────────────── */
     memset(blk, 0, OSFS3_BLOCK_SIZE);
     uint8_t *bmap = (uint8_t *)blk;
-    bmap[0] = 0x1F; /* Bits 0-4 used (SB, Imap, Bmap, InoTab, RootData) */
+    for (uint32_t b = 0; b <= root_data_block; b++)
+        bmap[b / 8] |= (uint8_t)(1u << (b % 8));
     if (osfs3_write_block(fd, 2, blk) < 0) goto fail;
     printf("  [OK] Block bitmap written\n");
 
-    /* ── Block 3: Inode Table ────────────────────────────────── */
+    /* ── Blocks 3..K: Inode Table ─────────────────────────────── */
     memset(blk, 0, OSFS3_BLOCK_SIZE);
     osfs3_inode_t *inodes = (osfs3_inode_t *)blk;
     
@@ -106,13 +133,18 @@ int main(int argc, char **argv)
     inodes[1].size = OSFS3_BLOCK_SIZE;
     inodes[1].atime = inodes[1].mtime = inodes[1].ctime = sb->create_time;
     inodes[1].extent_count = 1;
-    inodes[1].extents[0].start_block = 4;
+    inodes[1].extents[0].start_block = root_data_block;
     inodes[1].extents[0].block_count = 1;
 
-    if (osfs3_write_block(fd, 3, blk) < 0) goto fail;
+    for (uint32_t i = 0; i < inode_table_blocks; i++) {
+        if (i > 0)
+            memset(blk, 0, OSFS3_BLOCK_SIZE);
+        if (osfs3_write_block(fd, OSFS3_INODE_TABLE_BLK + i, blk) < 0)
+            goto fail;
+    }
     printf("  [OK] Inode table written\n");
 
-    /* ── Block 4: Root Directory Data ────────────────────────── */
+    /* ── Root Directory Data ─────────────────────────────────── */
     memset(blk, 0, OSFS3_BLOCK_SIZE);
     /* In a directory block, we could pre-initialize '.' and '..' */
     osfs3_dentry_t *de = (osfs3_dentry_t *)blk;
@@ -132,7 +164,7 @@ int main(int argc, char **argv)
     memcpy(de2->name, "..", 2);
     de2->rec_len = OSFS3_BLOCK_SIZE - de->rec_len; /* Fill the rest of the block */
     
-    if (osfs3_write_block(fd, 4, blk) < 0) goto fail;
+    if (osfs3_write_block(fd, root_data_block, blk) < 0) goto fail;
     printf("  [OK] Root directory initialized\n");
 
     printf("\nFormatting complete.\n");

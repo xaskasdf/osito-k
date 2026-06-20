@@ -6,8 +6,9 @@
 # skips verify when slot==0). Dedups by name (case-insensitive). p=0 assumed.
 import sys, struct, zlib, os, glob
 
-MAGIC=0x4F534632; SUPER_BACKUP_OFF=4096; FILETAB_OFF=1<<20; CRCTAB_OFF=2<<20
-DATA_OFF=4<<20; MAX_FILES=4096; NAME_LEN=64; FLAG_VALID=1; FLAG_RAW=4
+MAGIC=0x4F534632; LAYOUT_MAGIC=0x4F324C59; SUPER_BACKUP_OFF=4096; FILETAB_OFF=1<<20
+LEGACY_MAX_FILES=4096; MAX_BLOCKS=262144; CRCTAB_SIZE=MAX_BLOCKS*4; LAYERIDX_SIZE=512*2048
+NAME_LEN=64; FLAG_VALID=1; FLAG_RAW=4
 CRC_OFF=84
 
 def find_part(f):
@@ -23,6 +24,20 @@ def fix_super_crc(s):
     crc=zlib.crc32(bytes(s))&0xFFFFFFFF
     struct.pack_into('<I',s,CRC_OFF,crc); return crc
 
+def layout(s):
+    layout_magic,file_slots,metadata_bytes=struct.unpack_from('<3I',s,88)
+    slots=LEGACY_MAX_FILES
+    if layout_magic==LAYOUT_MAGIC:
+        slots=file_slots
+        if slots<LEGACY_MAX_FILES or slots%LEGACY_MAX_FILES:
+            raise ValueError(f"invalid file slot count: {slots}")
+    crctab_off=FILETAB_OFF+slots*256
+    layeridx_off=crctab_off+CRCTAB_SIZE
+    data_off=layeridx_off+LAYERIDX_SIZE
+    if layout_magic==LAYOUT_MAGIC and metadata_bytes!=data_off:
+        raise ValueError("metadata_bytes does not match layout")
+    return slots,crctab_off
+
 def main():
     img=sys.argv[1]; hostdir=sys.argv[2]
     headroom=int(sys.argv[3]) if len(sys.argv)>3 else 64
@@ -34,11 +49,12 @@ def main():
         if p is None: print("no superblock"); return 1
         f.seek(p); s=bytearray(f.read(512))
         magic,ver,bsz,total,used,fcount,nextblk=struct.unpack_from('<7I',s,0)
+        max_files,crctab_off=layout(s)
         print(f"before: total={total} used={used} fcount={fcount} nextblk={nextblk} bsz={bsz}")
         # collect existing names + free slots
         names=set(); free_slots=[]
-        f.seek(p+FILETAB_OFF); tab=f.read(MAX_FILES*256)
-        for i in range(MAX_FILES):
+        f.seek(p+FILETAB_OFF); tab=f.read(max_files*256)
+        for i in range(max_files):
             ent=tab[i*256:(i+1)*256]
             flags=struct.unpack_from('<I',ent,84)[0]
             if flags & FLAG_VALID:
@@ -78,7 +94,8 @@ def main():
             slot=free_slots[si]; si+=1
             f.seek(p+FILETAB_OFF+slot*256); f.write(ent)
             for b in range(start,start+bc):
-                f.seek(p+CRCTAB_OFF+b*4); f.write(b'\x00\x00\x00\x00')
+                if b<MAX_BLOCKS:
+                    f.seek(p+crctab_off+b*4); f.write(b'\x00\x00\x00\x00')
             nextblk+=bc; used+=bc; fcount+=1
         # update superblock (primary + backup) + CRC
         struct.pack_into('<7I',s,0,magic,ver,bsz,new_total,used,fcount,nextblk)

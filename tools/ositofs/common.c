@@ -107,6 +107,8 @@ static int osfs2_validate_super(const osfs2_super_t *sb)
     uint32_t calc_crc = osfs2_crc32(&tmp, sizeof(tmp));
     if (calc_crc != saved_crc) return -1;
     if (!osfs2_valid_block_size(sb->block_size)) return -1;
+    if (!osfs2_valid_layout(sb)) return -1;
+    if (osfs2_layout_data_off(sb) % sb->block_size != 0) return -1;
     return 0;
 }
 

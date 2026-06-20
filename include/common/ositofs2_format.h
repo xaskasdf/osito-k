@@ -5,12 +5,15 @@
  * Freestanding-compatible: no libc dependencies.
  *
  * Block size: configurable (default 1MB, min 64KB, stored in superblock)
- * Metadata layout (fixed at 4MB, independent of data block size):
+ * Legacy metadata layout (fixed at 4MB, independent of data block size):
  *   Offset 0:    Superblock (512 bytes)
  *   Offset 1MB:  File Table (4096 entries × 256 bytes = 1MB)
  *   Offset 2MB:  Block CRC Table (262144 × uint32 = 1MB)
  *   Offset 3MB:  Layer Index Table (512 slots × 2048 bytes = 1MB)
  *   Offset 4MB+: Data blocks (block_size from superblock)
+ *
+ * New images store layout fields in the superblock's reserved area. Old
+ * images leave them zero, which keeps the legacy 4096-file layout.
  */
 
 #ifndef OSITOFS2_FORMAT_H
@@ -27,6 +30,7 @@
 
 #define OSFS2_MAGIC              0x4F534632      /* "OSF2" */
 #define OSFS2_VERSION            2
+#define OSFS2_LAYOUT_MAGIC       0x4F324C59      /* "O2LY" */
 
 /* Data block size — configurable per-filesystem, stored in superblock */
 #define OSFS2_DEFAULT_BLOCK_SIZE (1024 * 1024)    /* 1MB */
@@ -36,21 +40,33 @@
 /* Superblock backup (4K-aligned, within first 1MB region) */
 #define OSFS2_SUPER_BACKUP_OFF   4096
 
-/* Fixed metadata byte offsets (4MB total, independent of data block size) */
+/* Metadata byte offsets. Legacy names resolve to the expanded default layout;
+ * readers must use the osfs2_layout_* helpers after loading the superblock. */
+#define OSFS2_SUPER_REGION_SIZE  (1 * 1024 * 1024)
 #define OSFS2_FILETAB_OFF        (1 * 1024 * 1024)
-#define OSFS2_CRCTAB_OFF         (2 * 1024 * 1024)
-#define OSFS2_LAYERIDX_OFF       (3 * 1024 * 1024)
-#define OSFS2_DATA_OFF           (4 * 1024 * 1024)
 
-#define OSFS2_MAX_FILES       4096
+#define OSFS2_LEGACY_MAX_FILES   4096
+#define OSFS2_DEFAULT_MAX_FILES  16384
+#define OSFS2_FILE_SLOT_GRANULE  OSFS2_LEGACY_MAX_FILES
+#define OSFS2_MAX_FILE_SLOTS     61440
+#define OSFS2_MAX_FILES          OSFS2_DEFAULT_MAX_FILES
 #define OSFS2_MAX_BLOCKS      262144   /* CRC slots (CRCTAB_SIZE / 4) */
 #define OSFS2_MAX_MODELS      512
 #define OSFS2_MAX_LAYERS      255
 
 /* Metadata region sizes (derived from MAX_* above) */
-#define OSFS2_FILETAB_SIZE       (OSFS2_MAX_FILES * 256)     /* 1MB */
+#define OSFS2_FILE_ENTRY_SIZE    256
+#define OSFS2_LEGACY_FILETAB_SIZE  (OSFS2_LEGACY_MAX_FILES * OSFS2_FILE_ENTRY_SIZE)
+#define OSFS2_FILETAB_SIZE       (OSFS2_MAX_FILES * OSFS2_FILE_ENTRY_SIZE)
 #define OSFS2_CRCTAB_SIZE        (OSFS2_MAX_BLOCKS * 4)      /* 1MB */
 #define OSFS2_LAYERIDX_SIZE      (OSFS2_MAX_MODELS * 2048)   /* 1MB */
+
+#define OSFS2_LEGACY_CRCTAB_OFF   (OSFS2_FILETAB_OFF + OSFS2_LEGACY_FILETAB_SIZE)
+#define OSFS2_LEGACY_LAYERIDX_OFF (OSFS2_LEGACY_CRCTAB_OFF + OSFS2_CRCTAB_SIZE)
+#define OSFS2_LEGACY_DATA_OFF     (OSFS2_LEGACY_LAYERIDX_OFF + OSFS2_LAYERIDX_SIZE)
+#define OSFS2_CRCTAB_OFF          (OSFS2_FILETAB_OFF + OSFS2_FILETAB_SIZE)
+#define OSFS2_LAYERIDX_OFF        (OSFS2_CRCTAB_OFF + OSFS2_CRCTAB_SIZE)
+#define OSFS2_DATA_OFF            (OSFS2_LAYERIDX_OFF + OSFS2_LAYERIDX_SIZE)
 
 /* Streaming I/O chunk (GGUF/GSP readers — not tied to FS block size) */
 #define OSFS2_IO_CHUNK           (1024 * 1024)    /* 1MB */
@@ -97,12 +113,15 @@ typedef struct __attribute__((packed)) {
     char     label[OSFS2_LABEL_LEN]; /* Human-readable label */
     uint64_t create_time;        /* Unix timestamp */
     uint32_t crc32;              /* CRC32 of superblock (excluding this field) */
-    uint8_t  reserved[512 - 88]; /* Pad to 512 bytes */
+    uint32_t layout_magic;       /* OSFS2_LAYOUT_MAGIC if expanded layout */
+    uint32_t file_table_slots;   /* File table entries (0 => legacy 4096) */
+    uint32_t metadata_bytes;     /* Byte offset where data blocks start */
+    uint8_t  reserved[512 - 100]; /* Pad to 512 bytes */
 } osfs2_super_t;
 
 _Static_assert(sizeof(osfs2_super_t) == 512, "superblock must be 512 bytes");
 
-/* ── File Table Entry (256 bytes each, 4096 entries = 1MB) ───── */
+/* ── File Table Entry (256 bytes each) ───────────────────────── */
 
 typedef struct __attribute__((packed)) {
     char     name[OSFS2_NAME_LEN];   /* Filename (null-terminated) */
@@ -153,9 +172,75 @@ static inline uint32_t osfs2_block_shift(uint32_t block_size) {
     return shift;
 }
 
-/* First data block number for a given block_size */
+static inline int osfs2_valid_file_slots(uint32_t slots) {
+    return slots >= OSFS2_LEGACY_MAX_FILES &&
+           slots <= OSFS2_MAX_FILE_SLOTS &&
+           (slots % OSFS2_FILE_SLOT_GRANULE) == 0;
+}
+
+static inline uint32_t osfs2_layout_filetab_size_for_slots(uint32_t slots) {
+    return slots * OSFS2_FILE_ENTRY_SIZE;
+}
+
+static inline uint32_t osfs2_layout_crctab_off_for_slots(uint32_t slots) {
+    return OSFS2_FILETAB_OFF + osfs2_layout_filetab_size_for_slots(slots);
+}
+
+static inline uint32_t osfs2_layout_layeridx_off_for_slots(uint32_t slots) {
+    return osfs2_layout_crctab_off_for_slots(slots) + OSFS2_CRCTAB_SIZE;
+}
+
+static inline uint32_t osfs2_layout_data_off_for_slots(uint32_t slots) {
+    return osfs2_layout_layeridx_off_for_slots(slots) + OSFS2_LAYERIDX_SIZE;
+}
+
+static inline uint32_t osfs2_layout_data_start_blk_for_slots(uint32_t block_size,
+                                                             uint32_t slots) {
+    return osfs2_layout_data_off_for_slots(slots) / block_size;
+}
+
+static inline int osfs2_has_layout(const osfs2_super_t *sb) {
+    return sb && sb->layout_magic == OSFS2_LAYOUT_MAGIC;
+}
+
+static inline uint32_t osfs2_layout_max_files(const osfs2_super_t *sb) {
+    if (osfs2_has_layout(sb) && osfs2_valid_file_slots(sb->file_table_slots))
+        return sb->file_table_slots;
+    return OSFS2_LEGACY_MAX_FILES;
+}
+
+static inline uint32_t osfs2_layout_filetab_size(const osfs2_super_t *sb) {
+    return osfs2_layout_filetab_size_for_slots(osfs2_layout_max_files(sb));
+}
+
+static inline uint32_t osfs2_layout_crctab_off(const osfs2_super_t *sb) {
+    return osfs2_layout_crctab_off_for_slots(osfs2_layout_max_files(sb));
+}
+
+static inline uint32_t osfs2_layout_layeridx_off(const osfs2_super_t *sb) {
+    return osfs2_layout_layeridx_off_for_slots(osfs2_layout_max_files(sb));
+}
+
+static inline uint32_t osfs2_layout_data_off(const osfs2_super_t *sb) {
+    return osfs2_layout_data_off_for_slots(osfs2_layout_max_files(sb));
+}
+
+static inline uint32_t osfs2_layout_data_start_blk(const osfs2_super_t *sb) {
+    return osfs2_layout_data_off(sb) / sb->block_size;
+}
+
+static inline int osfs2_valid_layout(const osfs2_super_t *sb) {
+    if (!osfs2_has_layout(sb))
+        return 1;
+    if (!osfs2_valid_file_slots(sb->file_table_slots))
+        return 0;
+    return sb->metadata_bytes == osfs2_layout_data_off(sb);
+}
+
+/* First data block number for the legacy layout. New readers should use
+ * osfs2_layout_data_start_blk(sb). */
 static inline uint32_t osfs2_data_start_blk(uint32_t block_size) {
-    return OSFS2_DATA_OFF / block_size;
+    return OSFS2_LEGACY_DATA_OFF / block_size;
 }
 
 /* Validate block_size: power of 2 in [MIN, MAX] */

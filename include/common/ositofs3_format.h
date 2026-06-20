@@ -25,6 +25,9 @@
 #define OSFS3_BLOCK_SHIFT     20
 
 #define OSFS3_SUPERBLOCK_BLK  0
+#define OSFS3_INODE_BITMAP_BLK 1
+#define OSFS3_BLOCK_BITMAP_BLK 2
+#define OSFS3_INODE_TABLE_BLK  3
 /* Block 1: Inode Bitmap */
 /* Block 2: Block Bitmap */
 /* Block 3..K: Inode Table */
@@ -33,6 +36,7 @@
 #define OSFS3_INODES_PER_BLOCK (OSFS3_BLOCK_SIZE / sizeof(osfs3_inode_t))
 #define OSFS3_MAX_EXTENTS      12  /* Direct extents per inode before indirection (future) */
 #define OSFS3_NAME_MAX         255 /* Maximum length of a filename */
+#define OSFS3_DEFAULT_INODES   16384
 
 /* File types (matching POSIX S_IFMT) */
 #define OSFS3_S_IFMT   0170000
@@ -110,6 +114,30 @@ typedef struct __attribute__((packed)) {
 } osfs3_inode_t;
 
 _Static_assert(sizeof(osfs3_inode_t) == 256, "inode must be 256 bytes");
+
+/* ── Layout helpers ─────────────────────────────────────────── */
+
+static inline uint32_t osfs3_inode_table_blocks(uint32_t total_inodes) {
+    return (total_inodes + OSFS3_INODES_PER_BLOCK - 1) / OSFS3_INODES_PER_BLOCK;
+}
+
+static inline uint32_t osfs3_first_data_block_for_inodes(uint32_t total_inodes) {
+    return OSFS3_INODE_TABLE_BLK + osfs3_inode_table_blocks(total_inodes);
+}
+
+static inline uint32_t osfs3_max_inodes(void) {
+    return OSFS3_BLOCK_SIZE * 8; /* One 1MB inode bitmap. */
+}
+
+static inline uint32_t osfs3_max_blocks(void) {
+    return OSFS3_BLOCK_SIZE * 8; /* One 1MB block bitmap. */
+}
+
+static inline int osfs3_valid_inode_count(uint32_t total_inodes) {
+    return total_inodes >= OSFS3_INODES_PER_BLOCK &&
+           total_inodes <= osfs3_max_inodes() &&
+           (total_inodes % OSFS3_INODES_PER_BLOCK) == 0;
+}
 
 /* ── Directory Entry (Variable length) ───────────────────────── */
 /* Directories are just files (S_IFDIR) containing a sequence of these entries. */

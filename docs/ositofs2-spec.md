@@ -5,21 +5,27 @@
 OsitoFS v2 is a write-once, contiguous-block filesystem optimized for NVMe DMA
 and AI model storage. Designed for bare-metal environments with no OS overhead.
 
-- **Block size**: 1 MB (1,048,576 bytes) — optimal for NVMe sequential I/O
-- **Metadata overhead**: 4 MB (blocks 0-3) regardless of device size
-- **Max files**: 4,096
+- **Block size**: 64 KB to 1 MB, power of two; 1 MB is the default
+- **Metadata overhead**: 4 MB for legacy images; 7 MB by default for new 16K-slot images
+- **Max files**: 4,096 legacy; 16,384 default for new images
 - **Max blocks**: 262,144 (256 TB theoretical)
 - **Write-once**: Files are immutable after creation
 
 ## On-Disk Layout
 
 ```
-Block 0: Superblock (512 bytes used, rest zero-padded)
-Block 1: File Table (4096 entries × 256 bytes = 1 MB)
-Block 2: Block CRC Table (262144 × uint32 = 1 MB)
-Block 3: Layer Index Table (512 slots × 2048 bytes = 1 MB)
-Block 4..N: Data blocks (contiguous, first-fit allocation)
+Offset 0 MB: Superblock region (512 bytes used, backup at +4 KB)
+Offset 1 MB: File Table (N entries × 256 bytes)
+Next:        Block CRC Table (262144 × uint32 = 1 MB)
+Next:        Layer Index Table (512 slots × 2048 bytes = 1 MB)
+Next:        Data blocks (contiguous, first-fit allocation)
 ```
+
+If `layout_magic` is absent, readers use the legacy layout:
+4096 file slots, CRC at 2 MB, layer index at 3 MB, data at 4 MB.
+If `layout_magic == 0x4F324C59` (`"O2LY"`), readers derive offsets from
+`file_table_slots`; `mkfs.ositofs` defaults to 16,384 slots, making CRC start
+at 5 MB, layer index at 6 MB, and data at 7 MB.
 
 ## Superblock (Block 0)
 
@@ -38,11 +44,15 @@ Block 4..N: Data blocks (contiguous, first-fit allocation)
 | 0x2C | 32 | label | Human-readable label (null-terminated) |
 | 0x4C | 8 | create_time | Unix timestamp |
 | 0x54 | 4 | crc32 | CRC32 of superblock (field zeroed for calc) |
-| 0x58 | 424 | reserved | Zero-padded to 512 bytes |
+| 0x58 | 4 | layout_magic | `0x4F324C59` (`"O2LY"`) for dynamic layout |
+| 0x5C | 4 | file_table_slots | File table entries; zero means legacy 4096 |
+| 0x60 | 4 | metadata_bytes | Byte offset where data blocks start |
+| 0x64 | 412 | reserved | Zero-padded to 512 bytes |
 
-## File Table Entry (Block 1)
+## File Table Entry
 
-4096 entries × 256 bytes each = exactly 1 MB block.
+Each entry is 256 bytes. New images default to 16,384 entries, while legacy
+images have 4,096 entries.
 
 | Offset | Size | Field | Description |
 |--------|------|-------|-------------|
@@ -63,11 +73,11 @@ Block 4..N: Data blocks (contiguous, first-fit allocation)
 | 0xF4 | 2 | layer_index_slot | Layer Index slot (0xFFFF = none) |
 | 0xF6 | 10 | reserved | Zero-padded to 256 bytes |
 
-## Block CRC Table (Block 2)
+## Block CRC Table
 
 262,144 × uint32_t = exactly 1 MB. One CRC32 per data block.
 
-## Layer Index Table (Block 3)
+## Layer Index Table
 
 512 slots × 2048 bytes = exactly 1 MB.
 
@@ -108,7 +118,7 @@ The `osfs2_crc32()` function is defined in the shared header.
 
 Built from `tools/ositofs/`:
 
-- **mkfs.ositofs** `<device> [--label name]` — Format with OsitoFS v2
+- **mkfs.ositofs** `<device> [--label name] [--file-slots N]` — Format with OsitoFS v2
 - **ositofs-write** `<device> <file> [--name name]` — Write file (auto-detects GGUF)
 - **ositofs-ls** `<device>` — List files with model info
 - **ositofs-info** `<device>` — Show filesystem info

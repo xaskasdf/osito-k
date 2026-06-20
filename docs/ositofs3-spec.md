@@ -14,13 +14,17 @@ OsitoFS v3 is the next-generation native filesystem for OsitoK, designed to over
 - **Block 0**: Superblock (Metadata about the entire filesystem)
 - **Block 1**: Inode Bitmap (Tracks free/used inodes)
 - **Block 2**: Block Bitmap (Tracks free/used data blocks)
-- **Block 3..K**: Inode Table (Array of `osfs3_inode_t`)
-- **Block K+1..N**: Data Blocks (Directory contents and File data)
+- **Block 3..K**: Inode Table (Array of `osfs3_inode_t`, 4096 inodes per block)
+- **Block K+1..N**: Data Blocks (Directory contents and file data)
+
+`mkfs.ositofs3` defaults to 16,384 inodes, so the default inode table spans
+four blocks and data starts at block 7. Use `--inodes <count>` to choose another
+multiple of 4096; legacy 4096-inode images remain valid and start data at block 4.
 
 ## Data Structures
 
 ### Superblock
-Contains magic number, version, block size, total blocks, inode counts, free counts, UUID, and the root inode number.
+Contains magic number, version, block size, total blocks, inode counts, free counts, `first_data_block`, UUID, and the root inode number. Readers derive the inode table size from `total_inodes`.
 
 ### Inodes (`osfs3_inode_t`)
 Represents a filesystem object (file, directory, symlink).

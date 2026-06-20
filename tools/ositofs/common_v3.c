@@ -115,6 +115,24 @@ int osfs3_read_super(int fd, osfs3_super_t *sb)
         fprintf(stderr, "osfs3: superblock CRC mismatch\n");
         return -1;
     }
+    if (sb->block_size != OSFS3_BLOCK_SIZE) {
+        fprintf(stderr, "osfs3: unsupported block size %u\n", sb->block_size);
+        return -1;
+    }
+    if (sb->total_blocks > osfs3_max_blocks()) {
+        fprintf(stderr, "osfs3: total blocks %u exceed bitmap capacity %u\n",
+                sb->total_blocks, osfs3_max_blocks());
+        return -1;
+    }
+    if (!osfs3_valid_inode_count(sb->total_inodes)) {
+        fprintf(stderr, "osfs3: invalid inode count %u\n", sb->total_inodes);
+        return -1;
+    }
+    if (sb->first_data_block != osfs3_first_data_block_for_inodes(sb->total_inodes)) {
+        fprintf(stderr, "osfs3: invalid first_data_block %u for %u inodes\n",
+                sb->first_data_block, sb->total_inodes);
+        return -1;
+    }
 
     return 0;
 }

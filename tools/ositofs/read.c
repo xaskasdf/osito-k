@@ -202,10 +202,13 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    /* Read file table (1MB at fixed offset) */
-    void *ft_blk = osfs2_alloc_aligned(OSFS2_FILETAB_SIZE);
+    uint32_t max_files = osfs2_layout_max_files(&sb);
+    uint32_t filetab_size = osfs2_layout_filetab_size(&sb);
+
+    /* Read file table */
+    void *ft_blk = osfs2_alloc_aligned(filetab_size);
     if (!ft_blk) { osfs2_close_device(fd); return 1; }
-    if (osfs2_read_bytes(fd, OSFS2_FILETAB_OFF, ft_blk, OSFS2_FILETAB_SIZE) < 0) {
+    if (osfs2_read_bytes(fd, OSFS2_FILETAB_OFF, ft_blk, filetab_size) < 0) {
         free(ft_blk);
         osfs2_close_device(fd);
         return 1;
@@ -214,10 +217,15 @@ int main(int argc, char **argv)
     osfs2_file_t *ft = (osfs2_file_t *)ft_blk;
 
     /* Scan file table for all matches */
-    int matches[OSFS2_MAX_FILES];
+    int *matches = (int *)malloc(max_files * sizeof(int));
+    if (!matches) {
+        free(ft_blk);
+        osfs2_close_device(fd);
+        return 1;
+    }
     int match_count = 0;
 
-    for (uint32_t i = 0; i < OSFS2_MAX_FILES; i++) {
+    for (uint32_t i = 0; i < max_files; i++) {
         if (!(ft[i].flags & OSFS2_FLAG_VALID)) continue;
         if (entry_matches(&ft[i], pattern))
             matches[match_count++] = (int)i;
@@ -225,6 +233,7 @@ int main(int argc, char **argv)
 
     if (match_count == 0) {
         fprintf(stderr, "ositofs-read: no files matching '%s'\n", pattern);
+        free(matches);
         free(ft_blk);
         osfs2_close_device(fd);
         return 1;
@@ -244,6 +253,7 @@ int main(int argc, char **argv)
             fprintf(stderr, ")\n");
         }
 
+        free(matches);
         free(ft_blk);
         osfs2_close_device(fd);
         return rc;
@@ -289,6 +299,7 @@ int main(int argc, char **argv)
         fprintf(stderr, ", %d error%s", errors, errors == 1 ? "" : "s");
     fprintf(stderr, "\n");
 
+    free(matches);
     free(ft_blk);
     osfs2_close_device(fd);
     return errors > 0 ? 1 : 0;

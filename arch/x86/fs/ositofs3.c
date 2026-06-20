@@ -29,7 +29,9 @@ static bool           mounted = false;
 
 static uint8_t      *inode_bitmap = NULL;
 static uint8_t      *block_bitmap = NULL;
-static osfs3_inode_t *inode_table = NULL; /* Cached first block of inodes */
+static osfs3_inode_t *inode_table = NULL;
+static uint32_t       inode_table_blocks = 0;
+static uint64_t       inode_table_bytes = 0;
 
 /* ── Helpers ─────────────────────────────────────────────────── */
 
@@ -47,8 +49,6 @@ static int osfs3_read_block(uint32_t block, void *buf)
 static osfs3_inode_t *osfs3_get_inode(uint32_t ino)
 {
     if (!mounted || ino == 0 || ino >= superblock.total_inodes) return NULL;
-    
-    /* For now, we only handle inodes in the first block of the table (Ino 0-4095) */
     return &inode_table[ino];
 }
 
@@ -146,20 +146,36 @@ int osfs3_mount(uint64_t part_offset)
         serial_puts("[OsitoFS v3] Bad magic\n");
         return -1;
     }
+    if (superblock.version != OSFS3_VERSION ||
+        superblock.block_size != OSFS3_BLOCK_SIZE ||
+        !osfs3_valid_inode_count(superblock.total_inodes) ||
+        superblock.total_blocks > osfs3_max_blocks() ||
+        superblock.first_data_block !=
+            osfs3_first_data_block_for_inodes(superblock.total_inodes)) {
+        serial_puts("[OsitoFS v3] Unsupported layout\n");
+        return -1;
+    }
 
-    /* Load bitmaps and first inode block (upper-half virt for CPU access). */
+    inode_table_blocks = osfs3_inode_table_blocks(superblock.total_inodes);
+    inode_table_bytes = (uint64_t)inode_table_blocks * OSFS3_BLOCK_SIZE;
+
+    /* Load bitmaps and full inode table (upper-half virt for CPU access). */
     void *ib_phys = mem_alloc_aligned(OSFS3_BLOCK_SIZE, 4096);
     void *bb_phys = mem_alloc_aligned(OSFS3_BLOCK_SIZE, 4096);
-    void *it_phys = mem_alloc_aligned(OSFS3_BLOCK_SIZE, 4096);
+    void *it_phys = mem_alloc_aligned(inode_table_bytes, 4096);
     if (!ib_phys || !bb_phys || !it_phys) return -1;
     inode_bitmap = (uint8_t *)PHYS_TO_VIRT(ib_phys);
     block_bitmap = (uint8_t *)PHYS_TO_VIRT(bb_phys);
     inode_table  = (osfs3_inode_t *)PHYS_TO_VIRT(it_phys);
 
-    if (osfs3_read_block(1, inode_bitmap) < 0 ||
-        osfs3_read_block(2, block_bitmap) < 0 ||
-        osfs3_read_block(3, inode_table) < 0) {
+    if (osfs3_read_block(OSFS3_INODE_BITMAP_BLK, inode_bitmap) < 0 ||
+        osfs3_read_block(OSFS3_BLOCK_BITMAP_BLK, block_bitmap) < 0) {
         return -1;
+    }
+    for (uint32_t i = 0; i < inode_table_blocks; i++) {
+        void *dst = (uint8_t *)inode_table + (uint64_t)i * OSFS3_BLOCK_SIZE;
+        if (osfs3_read_block(OSFS3_INODE_TABLE_BLK + i, dst) < 0)
+            return -1;
     }
 
     mounted = true;

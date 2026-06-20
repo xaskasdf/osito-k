@@ -4288,10 +4288,12 @@ pdone:
             extern void *osfs2_get_file(int idx);
             extern const char *osfs2_file_name(void *f);
             extern uint64_t osfs2_file_size(void *f);
+            extern uint32_t osfs2_max_files(void);
+            uint32_t max_files = osfs2_max_files();
             uint64_t total = 0;
             int count = 0;
-            for (int i = 0; i < 4096; i++) {
-                void *f = osfs2_get_file(i);
+            for (uint32_t i = 0; i < max_files; i++) {
+                void *f = osfs2_get_file((int)i);
                 if (!f) continue;
                 const char *nm = osfs2_file_name(f);
                 if (!nm || nm[0] != 'r' || nm[1] != 'a' || nm[2] != 'g' || nm[3] != '/')
@@ -4312,12 +4314,14 @@ pdone:
             extern void *osfs2_get_file(int idx);
             extern const char *osfs2_file_name(void *f);
             extern int   osfs2_delete(const char *name);
+            extern uint32_t osfs2_max_files(void);
+            uint32_t max_files = osfs2_max_files();
             int removed = 0;
             /* Two-pass: collect names then delete (avoids index shift). */
             char names[64][128];
             int nn = 0;
-            for (int i = 0; i < 4096 && nn < 64; i++) {
-                void *f = osfs2_get_file(i);
+            for (uint32_t i = 0; i < max_files && nn < 64; i++) {
+                void *f = osfs2_get_file((int)i);
                 if (!f) continue;
                 const char *nm = osfs2_file_name(f);
                 if (!nm || nm[0]!='r'||nm[1]!='a'||nm[2]!='g'||nm[3]!='/') continue;
@@ -6195,13 +6199,15 @@ q4kgdone:
                 extern void free(void *); free(idx);
             }
         } else if (strcmp(sub, "installed") == 0) {
-            /* Walk the file table for /pkg/* entries. */
+            /* Walk the file table for pkg/ entries. */
             extern void *osfs2_get_file(int index);
             extern const char *osfs2_file_name(void *file);
             extern uint64_t osfs2_file_size(void *file);
+            extern uint32_t osfs2_max_files(void);
+            uint32_t max_files = osfs2_max_files();
             int count = 0;
-            for (int i = 0; i < 4096; i++) {  /* OSFS2_MAX_FILES upper bound */
-                void *f = osfs2_get_file(i);
+            for (uint32_t i = 0; i < max_files; i++) {
+                void *f = osfs2_get_file((int)i);
                 if (!f) continue;
                 const char *nm = osfs2_file_name(f);
                 if (!nm) continue;
