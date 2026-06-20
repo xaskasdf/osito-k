@@ -40,6 +40,7 @@ extern void serial_putdec(uint64_t val);
 extern void serial_putc(char c);
 extern void boot_diag_maybe_flush(const char *reason, uint64_t min_bytes,
                                   uint64_t min_ticks) __attribute__((weak));
+extern void boot_diag_mark(const char *reason) __attribute__((weak));
 
 extern void fb_puts(const char *s);
 extern void fb_putc(char c, uint32_t color);
@@ -268,6 +269,7 @@ static inline void wrmsr(uint32_t msr, uint64_t val) {
 #define SYS_GET_INPUT_EVENT 512
 #define SYS_BATCH           520  /* Execute array of syscalls in one trap */
 #define SYS_CMDRING_INIT    521  /* Set up syscall-free command ring */
+#define SYS_BOOT_DIAG_MARK  522  /* Persist boot diagnostics with a marker */
 
 /* errno values */
 #define EPERM    1
@@ -4137,6 +4139,20 @@ static int64_t __hot syscall_dispatch_inner(uint64_t nr, uint64_t a1, uint64_t a
         return sys_batch(a1, a2);
     case SYS_CMDRING_INIT:
         return sys_cmdring_init(a1);
+    case SYS_BOOT_DIAG_MARK: {
+        char reason[80];
+        const char *src = a1 ? (const char *)a1 : "user";
+        uint32_t i = 0;
+        if (!boot_diag_mark)
+            return -ENOSYS;
+        while (i + 1 < sizeof(reason) && src[i]) {
+            reason[i] = src[i];
+            i++;
+        }
+        reason[i] = '\0';
+        boot_diag_mark(reason);
+        return 0;
+    }
 
     /* ── OsitoK private: inference as a kernel syscall (530-534).
      * Numbers chosen to sit above SYS_BATCH (520) / SYS_CMDRING_INIT (521)

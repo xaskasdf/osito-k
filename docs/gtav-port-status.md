@@ -87,6 +87,15 @@ fixed SYSCALL-return `CS=0x90`, or legacy crash dumps using the old buggy
 `CS=0x10`. The crash reporter handles all three and normalizes low stack
 aliases against the high direct-map mirror before walking RBP frames.
 
+**Hardware render-thread diagnostics**: `hw-logs/20260620-030043-usb` reached
+the GTA render-thread spawn path on serial but persisted only through
+`gta-before-commonmain`, with no `cr*.txt`. OsitoK now exposes private syscall
+`522` (`SYS_BOOT_DIAG_MARK`) so userspace can call `boot_diag_mark()` directly.
+The GTA port marks `CommonMain`, `CSystem::Init`, `grcSetup::Init`,
+`gRenderThreadInterface.Init`, `RenderThreadInit`, and render-thread loop entry
+so a hardware hang without an exception still leaves the last reached stage in
+`diag/latest.txt` / `diag/boot*.log`.
+
 **Hardware futex crash fixed in test**: Real hardware logs from
 `/private/tmp/boot0.log` and `/private/tmp/cr0_00.txt` captured `GTA5.elf`
 crashing in kernel mode at `futex_requeue_locked`. The kernel now cleans stale
