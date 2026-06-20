@@ -503,6 +503,15 @@ void sys_brk_reset(void)
 
 #define MAP_FAILED      ((uint64_t)-1)
 
+/* Anonymous mmap defaults to a 32-bit-clean VA window. Some native ports
+ * still carry pointer-width assumptions in allocator metadata; returning
+ * high addresses like 0x500000000 makes those bugs fault at the truncated
+ * low alias. Keep the automatic pool above legacy ELF/PE load windows and
+ * fail instead of silently crossing 4GB. Explicit MAP_FIXED/addr hints keep
+ * their requested addresses. */
+#define MMAP_ANON_LOW_BASE   0x30000000ULL
+#define MMAP_ANON_LOW_LIMIT  0x100000000ULL
+
 /* VMA tracking — per-process mmap regions */
 #define MAX_VMAS        4096
 
@@ -583,6 +592,30 @@ static inline bool vma_owned_by_current(const vma_t *v)
      * for diagnostics; do not dereference it here. */
     int32_t ct = proc_current_tgid();
     return ct != 0 && v->owner_tgid != 0 && (uint32_t)ct == v->owner_tgid;
+}
+
+static bool vma_range_overlaps_current(uint64_t base, uint64_t pages)
+{
+    if (pages == 0 || pages > (UINT64_MAX / 4096ULL))
+        return true;
+
+    uint64_t end = base + pages * 4096ULL;
+    if (end < base)
+        return true;
+
+    for (int i = 0; i < MAX_VMAS; i++) {
+        if (!vma_table[i].in_use) continue;
+        if (!vma_owned_by_current(&vma_table[i])) continue;
+
+        uint64_t vma_end = vma_table[i].base + vma_table[i].pages * 4096ULL;
+        if (vma_end < vma_table[i].base)
+            return true;
+
+        if (base < vma_end && end > vma_table[i].base)
+            return true;
+    }
+
+    return false;
 }
 
 static int vma_find_free_slot_except(int except)
@@ -1796,19 +1829,32 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
     }
     if (vi < 0) return -ENOMEM;
 
-    /* Allocate a user-space VA from the anonymous pool (20GB and up,
-     * safely above any identity-mapped RAM). Callers that pass an
-     * aligned addr hint (e.g. musl mallocng guard-page patching) get
-     * that exact VA back, just like the legacy PROT_NONE path. */
-    static uint64_t mmap_anon_base = 0x500000000ULL;
+    /* Allocate a user-space VA from the 32-bit-clean anonymous pool. Callers
+     * that pass an aligned addr hint (e.g. musl mallocng guard-page patching)
+     * get that exact VA back, just like the legacy PROT_NONE path. */
+    static uint64_t mmap_anon_base = MMAP_ANON_LOW_BASE;
     uint64_t result;
     if (fixed) {
         result = addr;
     } else if (addr && (addr & 0xFFF) == 0) {
         result = addr;
     } else {
-        result = mmap_anon_base;
-        mmap_anon_base += npages * 4096;
+        uint64_t bytes = npages * 4096ULL;
+        uint64_t cursor = mmap_anon_base;
+        if (cursor < MMAP_ANON_LOW_BASE)
+            cursor = MMAP_ANON_LOW_BASE;
+
+        for (;;) {
+            if (cursor + bytes < cursor ||
+                cursor + bytes > MMAP_ANON_LOW_LIMIT)
+                return -ENOMEM;
+            if (!vma_range_overlaps_current(cursor, npages))
+                break;
+            cursor += bytes;
+        }
+
+        result = cursor;
+        mmap_anon_base = cursor + bytes;
     }
 
     vma_table[vi].base   = result;

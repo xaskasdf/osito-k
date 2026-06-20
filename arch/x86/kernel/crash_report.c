@@ -16,6 +16,8 @@ extern void *proc_current(void);
 extern bool  user_symbolize(void *p, uint64_t addr,
                             const char **name, uint64_t *off);
 extern uint64_t idt_get_ticks(void);
+extern uint64_t *paging_get_pte(uint64_t virt);
+extern uint64_t mem_get_total(void);
 
 /* Forward decls for OsitoFS write (may not be available early boot) */
 extern void *osfs2_create(const char *name, uint64_t size);
@@ -31,6 +33,47 @@ extern void  boot_diag_format_crash_name(char *out, int slot, uint32_t idx,
 
 #define CRASH_MAGIC  0x4F534B43  /* "OSKC" */
 #define CRASH_MAX_FRAMES 32
+#define CR_PTE_PRESENT (1ULL << 0)
+
+static bool cr_range_present(uint64_t addr, uint64_t len)
+{
+    if (len == 0) return true;
+    if (addr + len - 1 < addr) return false;
+
+    uint64_t page = addr & ~0xFFFULL;
+    uint64_t end = (addr + len - 1) & ~0xFFFULL;
+    for (;;) {
+        uint64_t *pte = paging_get_pte(page);
+        if (!pte || !(*pte & CR_PTE_PRESENT)) return false;
+        if (page == end) return true;
+        if (page + 0x1000ULL < page) return false;
+        page += 0x1000ULL;
+    }
+}
+
+static bool cr_readable_range(uint64_t addr, uint64_t len, uint64_t *read_addr)
+{
+    if (cr_range_present(addr, len)) {
+        *read_addr = addr;
+        return true;
+    }
+
+    /* Native ring-0 ELF stacks are allocated through PHYS_TO_VIRT(), but
+     * frame->rsp can hold the low physical alias after same-CPL exceptions.
+     * If that low alias is not mapped in the process CR3, read the shared
+     * upper-half mirror instead, but only for real RAM-sized addresses. */
+    uint64_t total = mem_get_total();
+    if (addr < KERNEL_VBASE && total != 0 && addr + len - 1 >= addr &&
+        addr + len <= total) {
+        uint64_t high = addr + KERNEL_VBASE;
+        if (cr_range_present(high, len)) {
+            *read_addr = high;
+            return true;
+        }
+    }
+
+    return false;
+}
 
 static const char *crash_vector_name(uint32_t vector)
 {
@@ -267,12 +310,12 @@ void crash_report_save(uint64_t *frame, uint32_t vector, uint64_t fault_addr,
     r->rip = frame[17]; r->cs  = frame[18]; r->rflags = frame[19];
     r->rsp = frame[20]; r->ss  = frame[21];
 
-    /* Capture code bytes around RIP (native ELF user mode only) */
-    if ((r->cs & 0xFFFF) == 0x28 && r->rip > 32 && r->rip < 0x800000000000ULL) {
+    /* Capture code bytes around RIP for low-half ELF code only. The page-table
+     * probe keeps the crash path from faulting when RIP is already bogus. */
+    if (r->rip > 32 && r->rip < 0x800000000000ULL &&
+        cr_range_present(r->rip - 32, 64)) {
         r->code_base = r->rip - 32;
         r->code_valid = true;
-        /* Safe read: these pages should be mapped since the process just
-         * executed from them. If they fault, the read simply stays zero. */
         uint8_t *p = (uint8_t *)r->code_base;
         for (int i = 0; i < 32; i++) r->code_before[i] = p[i];
         p = (uint8_t *)r->rip;
@@ -282,9 +325,6 @@ void crash_report_save(uint64_t *frame, uint32_t vector, uint64_t fault_addr,
     /* Capture stack memory at RSP. *RSP is the return address from a failed
      * CALL — invaluable when the bug is a NULL function pointer. */
     if (r->rsp != 0 && (r->rsp & 7) == 0) {
-        r->stack_base = r->rsp;
-        r->stack_valid = true;
-        uint64_t *sp = (uint64_t *)r->rsp;
         /* Do NOT read past the current page: a small pthread stack (worker /
          * render thread) places an unmapped guard page right above the top,
          * so an unconditional 2 KB read faults the crash handler itself and
@@ -293,8 +333,15 @@ void crash_report_save(uint64_t *frame, uint32_t vector, uint64_t fault_addr,
         uint64_t page_end = (r->rsp + 0x1000ULL) & ~0xFFFULL;
         int max_words = (int)((page_end - r->rsp) / 8);
         if (max_words > 256) max_words = 256;
-        for (int i = 0; i < max_words; i++) r->stack_words[i] = sp[i];
-        for (int i = max_words; i < 256; i++) r->stack_words[i] = 0;
+        uint64_t stack_read = 0;
+        if (max_words > 0 &&
+            cr_readable_range(r->rsp, (uint64_t)max_words * 8, &stack_read)) {
+            r->stack_base = r->rsp;
+            r->stack_valid = true;
+            uint64_t *sp = (uint64_t *)stack_read;
+            for (int i = 0; i < max_words; i++) r->stack_words[i] = sp[i];
+            for (int i = max_words; i < 256; i++) r->stack_words[i] = 0;
+        }
     }
 
     /* Walk backtrace (same algorithm as idt.c but captures into struct) */
@@ -325,8 +372,11 @@ void crash_report_save(uint64_t *frame, uint32_t vector, uint64_t fault_addr,
             if (rbp == 0 || (rbp & 7) || rbp + 16 < rbp) break;
             if (rbp < rsp || rbp + 16 > rsp_page_end) break;
 
-            uint64_t ret = ((uint64_t *)rbp)[1];
-            uint64_t prev = ((uint64_t *)rbp)[0];
+            uint64_t rbp_read = 0;
+            if (!cr_readable_range(rbp, 16, &rbp_read)) break;
+
+            uint64_t ret = ((uint64_t *)rbp_read)[1];
+            uint64_t prev = ((uint64_t *)rbp_read)[0];
 
             crash_frame_t *f = &r->frames[r->frame_count];
             f->addr = ret;

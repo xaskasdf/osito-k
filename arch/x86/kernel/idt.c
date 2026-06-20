@@ -1034,8 +1034,8 @@ void isr_handler(interrupt_frame_t *frame)
     }
 
     /* Demand paging — handle #PF FIRST, before any diagnostic output.
-     * Validates against VMA table. Covers ELF segments (0x400000+),
-     * mmap regions, and anonymous reservations (0x500000000+).
+     * Validates against VMA table. Covers ELF segments, file-backed mmap
+     * regions, and anonymous reservations in the low 32-bit VA pool.
      * Skip first 1MB (BIOS/bootloader) and null page (handled below). */
     if (vec == 14 && !(frame->error_code & 1)) {
         uint64_t cr2;
