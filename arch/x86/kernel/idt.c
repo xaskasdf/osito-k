@@ -1680,7 +1680,8 @@ void isr_handler(interrupt_frame_t *frame)
         serial_puthex(frame->cs, 4);
         serial_puts("\n");
 
-        /* Symbolize RIP for native ELF user crashes (CS=0x28). The
+        /* Symbolize RIP for native ELF user crashes (CS=0x28 or the current
+         * SYSCALL-return CS=0x10). The
          * symbolizer is kmalloc-safe and reads the per-process symbol
          * tables captured at elf_load time. For unmatched addresses or
          * demand-paged binaries (no symtab) it prints nothing. */
@@ -1688,7 +1689,8 @@ void isr_handler(interrupt_frame_t *frame)
             extern void *proc_current(void);
             extern bool user_symbolize(void *p, uint64_t addr,
                                        const char **name, uint64_t *off);
-            if ((frame->cs & 0xFFFF) == 0x28) {
+            uint16_t cs16 = (uint16_t)(frame->cs & 0xFFFF);
+            if (cs16 == 0x28 || cs16 == 0x10) {
                 const char *sym_name = 0;
                 uint64_t    sym_off  = 0;
                 if (user_symbolize(proc_current(), frame->rip,
@@ -1786,7 +1788,8 @@ void isr_handler(interrupt_frame_t *frame)
             int is_user   = (wrip >= 0x20000000ULL && wrip < 0x20200000ULL);
             int is_mirror = (wrip >= 0xFFFF800000000000ULL);
             int is_vdso   = (wrip >= 0x7FFF0000ULL && wrip < 0x80000000ULL);
-            int native_cs = (wcs == 0x38 || wcs == 0x28 || wcs == 0x08);
+            int native_cs = (wcs == 0x38 || wcs == 0x28 ||
+                             wcs == 0x10 || wcs == 0x08);
             if (wrip >= 0x10000ULL && native_cs &&
                 !is_kernel && !is_user && !is_mirror && !is_vdso) {
                 extern uint64_t paging_get_kernel_cr3(void);
@@ -1913,7 +1916,8 @@ void isr_handler(interrupt_frame_t *frame)
             }
         }
 
-        /* Native ELF backtrace via RBP walking (CS=0x28).
+        /* Native ELF backtrace via RBP walking (CS=0x28 or the current
+         * SYSCALL-return CS=0x10).
          *
          * Reads `[rbp] = prev_rbp, [rbp+8] = ret_addr` up to 16 frames,
          * symbolizing each return address. Safety: RBP must be
@@ -1926,46 +1930,49 @@ void isr_handler(interrupt_frame_t *frame)
          * Binaries compiled without `-fno-omit-frame-pointer` usually
          * yield only frame #0 reliably (RIP via the symbolize hook
          * above); the walk bails out at the first RBP out-of-window. */
-        if ((frame->cs & 0xFFFF) == 0x28) {
-            extern void *proc_current(void);
-            extern bool  user_symbolize(void *p, uint64_t addr,
-                                        const char **name, uint64_t *off);
+        {
+            uint16_t cs16 = (uint16_t)(frame->cs & 0xFFFF);
+            if (cs16 == 0x28 || cs16 == 0x10) {
+                extern void *proc_current(void);
+                extern bool  user_symbolize(void *p, uint64_t addr,
+                                            const char **name, uint64_t *off);
 
-            serial_puts("  Backtrace:\n");
-            uint64_t       rbp  = frame->rbp;
-            const uint64_t rsp  = frame->rsp;
-            const uint64_t WIN  = 8ULL * 1024 * 1024;  /* USER_STACK_SIZE */
-            void          *proc = proc_current();
+                serial_puts("  Backtrace:\n");
+                uint64_t       rbp  = frame->rbp;
+                const uint64_t rsp  = frame->rsp;
+                const uint64_t WIN  = 8ULL * 1024 * 1024;  /* USER_STACK_SIZE */
+                void          *proc = proc_current();
 
-            for (int depth = 0; depth < 16; depth++) {
-                if (rbp == 0) break;
-                if (rbp & 0x7) break;                  /* unaligned */
-                /* Keep RBP within ±8MB of the faulting RSP — the
-                 * kernel-allocated user stack window. Anything else is
-                 * either garbage or points outside the stack. */
-                if (rbp + 16 < rbp) break;             /* overflow guard */
-                if (rbp < rsp - 256 || rbp > rsp + WIN) break;
+                for (int depth = 0; depth < 16; depth++) {
+                    if (rbp == 0) break;
+                    if (rbp & 0x7) break;                  /* unaligned */
+                    /* Keep RBP within ±8MB of the faulting RSP — the
+                     * kernel-allocated user stack window. Anything else is
+                     * either garbage or points outside the stack. */
+                    if (rbp + 16 < rbp) break;             /* overflow guard */
+                    if (rbp < rsp - 256 || rbp > rsp + WIN) break;
 
-                uint64_t prev_rbp = ((uint64_t *)rbp)[0];
-                uint64_t ret      = ((uint64_t *)rbp)[1];
+                    uint64_t prev_rbp = ((uint64_t *)rbp)[0];
+                    uint64_t ret      = ((uint64_t *)rbp)[1];
 
-                serial_puts("    #");
-                serial_putdec((uint64_t)depth);
-                serial_puts(" 0x");
-                serial_puthex(ret, 16);
+                    serial_puts("    #");
+                    serial_putdec((uint64_t)depth);
+                    serial_puts(" 0x");
+                    serial_puthex(ret, 16);
 
-                const char *nm  = 0;
-                uint64_t    off = 0;
-                if (user_symbolize(proc, ret, &nm, &off)) {
-                    serial_puts(" ");
-                    serial_puts(nm);
-                    serial_puts("+0x");
-                    serial_puthex(off, 4);
+                    const char *nm  = 0;
+                    uint64_t    off = 0;
+                    if (user_symbolize(proc, ret, &nm, &off)) {
+                        serial_puts(" ");
+                        serial_puts(nm);
+                        serial_puts("+0x");
+                        serial_puthex(off, 4);
+                    }
+                    serial_puts("\n");
+
+                    if (prev_rbp <= rbp) break;            /* loop / end */
+                    rbp = prev_rbp;
                 }
-                serial_puts("\n");
-
-                if (prev_rbp <= rbp) break;            /* loop / end */
-                rbp = prev_rbp;
             }
         }
 

@@ -4,7 +4,7 @@ Port of GTA V SP to OsitoK (bare-metal x86-64 OS). Full source access
 to both RAGE engine and OsitoK kernel. Target: playable SP from Prologue
 to credits.
 
-## Current State (Jun 19 2026)
+## Current State (Jun 20 2026)
 
 **Build**: GTA5.elf 7MB, compiled with x86_64-ositok-gcc 14.2.0 + musl libc.
 1199 RAGE .o files in rage_core.a. Game core files (main.cpp, app.cpp,
@@ -71,6 +71,22 @@ loop. There is no `#PF`, `#GP`, futex corruption log, or process crash in the
 serial output. The next investigation target is whether the black frame is
 expected loading-screen behavior, missing assets, or a render/presenter state
 machine issue.
+
+**Hardware `sysBuddyHeap` crash triage**: Hardware log
+`hw-logs/20260620-012805-usb/diag/cr0_00.txt` faults at
+`0x09b4d74b`, `rage::sysBuddyHeap::Init+0x8b`, with `CR2=0x1f0`.
+That RIP is the second byte of `41 0f 11 87 58 01 00 00`; without the REX
+prefix it decodes as a store through `rdi+0x158`, matching `rdi=0x98` and the
+null-ish write. This looks like control entered the middle of an instruction,
+not another high-mmap truncation. QEMU with the current low anonymous mmap
+kernel reaches `RAGE heap @ 0x6015d000`, passes this allocator point, creates
+the D3D11/Vulkan swapchain, and presents continuously.
+
+**Crash diagnostics**: Native ELF faults may arrive with `CS=0x10` after
+SYSCALL/SYSRET on the current GDT, while older diagnostics only walked native
+backtraces for `CS=0x28`. The crash reporter now treats `0x10` as native ELF
+and normalizes low stack aliases against the high direct-map mirror before
+walking RBP frames.
 
 **Hardware futex crash fixed in test**: Real hardware logs from
 `/private/tmp/boot0.log` and `/private/tmp/cr0_00.txt` captured `GTA5.elf`

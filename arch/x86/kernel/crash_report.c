@@ -75,6 +75,27 @@ static bool cr_readable_range(uint64_t addr, uint64_t len, uint64_t *read_addr)
     return false;
 }
 
+static bool cr_native_elf_cs(uint64_t cs)
+{
+    uint16_t s = (uint16_t)(cs & 0xFFFF);
+
+    /* Native ELF can fault either after the initial ring-0 jump (0x28) or
+     * after returning through SYSCALL/SYSRET on the current GDT layout
+     * (0x10). Both should use the per-process symbol table and stack walker. */
+    return s == 0x28 || s == 0x10;
+}
+
+static uint64_t cr_stack_compare_addr(uint64_t addr)
+{
+    uint64_t total = mem_get_total();
+
+    if (total != 0 && addr >= KERNEL_VBASE) {
+        uint64_t low = addr - KERNEL_VBASE;
+        if (low < total) return low;
+    }
+    return addr;
+}
+
 static const char *crash_vector_name(uint32_t vector)
 {
     switch (vector) {
@@ -366,11 +387,14 @@ void crash_report_save(uint64_t *frame, uint32_t vector, uint64_t fault_addr,
      * crash handler again (crash_report_save+0x300). Staying within the page we
      * already know is mapped (rsp's) yields a shallow-but-safe backtrace. */
     (void)win;
-    uint64_t rsp_page_end = (rsp | 0xFFFULL) + 1;
-    if ((r->cs & 0xFFFF) == 0x28) {
+    uint64_t rsp_cmp = cr_stack_compare_addr(rsp);
+    uint64_t rsp_page_end = (rsp_cmp | 0xFFFULL) + 1;
+    if (cr_native_elf_cs(r->cs)) {
         for (int d = 0; d < CRASH_MAX_FRAMES - 1; d++) {
+            uint64_t rbp_cmp = cr_stack_compare_addr(rbp);
             if (rbp == 0 || (rbp & 7) || rbp + 16 < rbp) break;
-            if (rbp < rsp || rbp + 16 > rsp_page_end) break;
+            if (rbp_cmp < rsp_cmp || rbp_cmp + 16 < rbp_cmp ||
+                rbp_cmp + 16 > rsp_page_end) break;
 
             uint64_t rbp_read = 0;
             if (!cr_readable_range(rbp, 16, &rbp_read)) break;
@@ -388,7 +412,7 @@ void crash_report_save(uint64_t *frame, uint32_t vector, uint64_t fault_addr,
             }
             r->frame_count++;
 
-            if (prev <= rbp) break;
+            if (cr_stack_compare_addr(prev) <= rbp_cmp) break;
             rbp = prev;
         }
     }
