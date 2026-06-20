@@ -396,9 +396,11 @@ static EFI_STATUS load_kernel_elf(EFI_HANDLE ImageHandle)
             return status;
         }
 
-        /* UEFI AllocatePages returns zeroed memory (EfiLoaderData).
-         * The kernel also zeros BSS at startup as a safety net. */
+        /* Do not depend on firmware returning clean pages: NOBITS tails such
+         * as .bss/.lbss must be zero before the kernel sees them. */
         UINT8 *dst = (UINT8 *)seg_base;
+        for (UINT64 j = 0; j < phdr.p_memsz; j++)
+            dst[j] = 0;
 
         /* Copy file data */
         if (phdr.p_filesz > 0) {

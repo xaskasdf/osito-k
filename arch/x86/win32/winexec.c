@@ -1005,6 +1005,9 @@ int winexec_run(const uint8_t *file_data, uint64_t file_size)
                     if (apic) apic[0x320/4] &= ~0x10000u;  /* LVT_TIMER &= ~MASKED */
                 }
                 __asm__ volatile ("sti");
+                g_compat32_mode = 0;
+                user32_shim_init();
+                ddraw_shim_init();
                 serial_puts("[WINEXEC] PE process exited, code=");
                 serial_putdec((uint32_t)last_exit_code);
                 serial_puts(" (SS restored, APIC re-enabled)\n");

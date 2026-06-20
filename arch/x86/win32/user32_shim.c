@@ -373,6 +373,45 @@ static int mouselook_active(void)
     return (cursor_visible < 0) || clip_active || (capture_hwnd != NULL);
 }
 
+static void user32_reset_corrupt_window_state(const char *where)
+{
+    static int log_count = 0;
+    if (log_count < 8) {
+        serial_puts("[USER32] corrupt window state at ");
+        serial_puts(where ? where : "?");
+        serial_puts(": window_count=");
+        serial_putdec((uint64_t)(int64_t)window_count);
+        serial_puts(" reset\n");
+        log_count++;
+    }
+
+    for (int i = 0; i < MAX_WINDOWS; i++)
+        windows[i].used = 0;
+    window_count = 0;
+    focus_hwnd = NULL;
+    capture_hwnd = NULL;
+    clip_active = 0;
+    g_abs_prev_valid = 0;
+    msg_head = msg_tail = 0;
+    quit_posted = 0;
+}
+
+static int user32_window_state_sane(const char *where)
+{
+    if (window_count >= 0 && window_count <= MAX_WINDOWS)
+        return 1;
+    user32_reset_corrupt_window_state(where);
+    return 0;
+}
+
+static int win32_input_active(void)
+{
+    extern int g_compat32_mode;
+    if (!user32_window_state_sane("input"))
+        return 0;
+    return g_compat32_mode || window_count > 0;
+}
+
 /* The in-game viewport window handle: the most-recently-created *used* window
  * whose class is UT's viewport window class. Falls back to focus, then to the
  * last used window. This is the window WinDrv's ViewportWndProc is bound to and
@@ -393,6 +432,8 @@ static int is_viewport_class(const char *name)
 
 static HWND viewport_hwnd(void)
 {
+    if (!user32_window_state_sane("viewport"))
+        return NULL;
     for (int i = window_count - 1; i >= 0; i--) {
         if (windows[i].used && is_viewport_class(windows[i].class_name))
             return windows[i].handle;
@@ -405,6 +446,8 @@ static HWND viewport_hwnd(void)
  * window (menu/console), then fall back to the last used window. */
 static HWND input_target(void)
 {
+    if (!user32_window_state_sane("target"))
+        return NULL;
     HWND vp = viewport_hwnd();
     if (mouselook_active() && vp) return vp;
     if (focus_hwnd && find_window(focus_hwnd)) return focus_hwnd;
@@ -626,6 +669,7 @@ HWND WINAPI CreateWindowExA(DWORD dwExStyle, PCSTR lpClassName,
     if (lpWindowName) serial_puts(lpWindowName);
     serial_puts("\"\n");
 
+    user32_window_state_sane("CreateWindowExA");
     if (window_count >= MAX_WINDOWS) return NULL;
 
     /* Find window class.
@@ -2030,6 +2074,11 @@ static BYTE prev_was_e0 = 0;
 
 void win32_post_keyboard_event(BYTE scancode, BOOL key_up)
 {
+    if (!win32_input_active()) {
+        prev_was_e0 = 0;
+        return;
+    }
+
     /* Handle 0xE0 prefix byte */
     if (scancode == 0xE0) {
         prev_was_e0 = 1;
@@ -2085,6 +2134,7 @@ void win32_post_keyboard_event(BYTE scancode, BOOL key_up)
      * (menu/console) otherwise. This fixes B2: movement keys were landing on a
      * non-viewport window and never reaching the gameplay input. */
     HWND target = input_target();
+    if (!target) return;
 
     if (is_gameplay_key(vk)) {
         static int n = 0;
@@ -2122,6 +2172,9 @@ void win32_post_keyboard_event(BYTE scancode, BOOL key_up)
  */
 void win32_post_mouse_event(int dx, int dy, DWORD buttons, short wheel_delta)
 {
+    if (!win32_input_active())
+        return;
+
     /* Update cursor position */
     cursor_pos.x += dx;
     cursor_pos.y += dy;
@@ -2138,6 +2191,10 @@ void win32_post_mouse_event(int dx, int dy, DWORD buttons, short wheel_delta)
      * The relative-delta accumulation above is already what UE1's recenter
      * math expects (cursor_pos = recenter_origin + delta). */
     HWND target = input_target();
+    if (!target) {
+        mouse_buttons = buttons;
+        return;
+    }
 
     /* ── Phase 1 diagnostic: WM_MOUSEMOVE routing during capture ── */
     {
@@ -2205,6 +2262,9 @@ void win32_post_mouse_event(int dx, int dy, DWORD buttons, short wheel_delta)
  * Bridges the xHCI mouse to the Win32 layer (previously unwired → dead mouse). */
 void win32_post_mouse_abs(int ax, int ay, int lmin, int lmax, DWORD buttons)
 {
+    if (!win32_input_active())
+        return;
+
     int tw = SCREEN_WIDTH, th = SCREEN_HEIGHT;
     for (int i = window_count - 1; i >= 0; i--) {
         if (windows[i].used) {
@@ -2214,6 +2274,10 @@ void win32_post_mouse_abs(int ax, int ay, int lmin, int lmax, DWORD buttons)
         }
     }
     HWND target = input_target();
+    if (!target) {
+        mouse_buttons = buttons;
+        return;
+    }
 
     /* Prefer the DDraw render resolution (the 640x480 surface that
      * present_surface_to_gop scales to fill the screen) as the mapping space, so

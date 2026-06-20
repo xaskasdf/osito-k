@@ -803,7 +803,30 @@ int32_t proc_current_tgid(void)
  * the address space. */
 int32_t proc_tgid_of(void *p)
 {
-    return p ? (int32_t)((process_t *)p)->tgid : 0;
+    static int warned_bad_proc_ptr;
+
+    if (!p)
+        return 0;
+
+    uintptr_t addr = (uintptr_t)p;
+    uintptr_t base = (uintptr_t)&proctab[0];
+    uintptr_t end  = (uintptr_t)&proctab[MAX_PROCESSES];
+
+    if (addr < base || addr >= end ||
+        ((addr - base) % sizeof(process_t)) != 0) {
+        if (!warned_bad_proc_ptr) {
+            warned_bad_proc_ptr = 1;
+            serial_puts("[PROC] invalid process pointer in proc_tgid_of: ");
+            serial_puthex(addr, 16);
+            serial_puts("\n");
+        }
+        return 0;
+    }
+
+    process_t *proc = (process_t *)p;
+    if (proc->state == PROC_FREE)
+        return 0;
+    return (int32_t)proc->tgid;
 }
 
 /* Set clear_child_tid address (set_tid_address syscall) */

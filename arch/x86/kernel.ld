@@ -38,27 +38,32 @@ SECTIONS
         *(.text.init)
         . = ALIGN(4096);
         __init_end = .;
-        /* Remaining .text.* subsections */
+        /* Remaining text subsections, including large-code-model output. */
         *(.text.*)
+        *(.ltext .ltext.*)
         __text_end = .;
     }
 
     .rodata : AT(ADDR(.rodata) - KERNEL_VBASE) ALIGN(4096) {
         __rodata_start = .;
         *(.rodata .rodata.*)
+        *(.lrodata .lrodata.*)
         __rodata_end = .;
     }
 
     .data : AT(ADDR(.data) - KERNEL_VBASE) ALIGN(4096) {
         __data_start = .;
         *(.data .data.*)
+        *(.ldata .ldata.*)
         __data_end = .;
     }
 
-    .bss : AT(ADDR(.bss) - KERNEL_VBASE) ALIGN(4096) {
+    .bss (NOLOAD) : AT(ADDR(.bss) - KERNEL_VBASE) ALIGN(4096) {
         __bss_start = .;
         *(.bss .bss.*)
+        *(.lbss .lbss.*)
         *(COMMON)
+        . = ALIGN(4096);
         __bss_end = .;
     }
 

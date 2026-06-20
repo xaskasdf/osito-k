@@ -44,6 +44,17 @@ extern uint64_t idt_get_ticks(void);
 extern void boot_diag_mark(const char *reason) __attribute__((weak));
 extern void boot_diag_flush(const char *reason) __attribute__((weak));
 
+static void shell_reset_win32_state(void)
+{
+    extern int g_compat32_mode;
+    extern void *user32_shim_init(void);
+    extern void *ddraw_shim_init(void);
+
+    g_compat32_mode = 0;
+    user32_shim_init();
+    ddraw_shim_init();
+}
+
 /* OsitoFS */
 extern bool osfs2_is_mounted(void);
 extern void osfs2_list(void);
@@ -6842,10 +6853,8 @@ q4kgdone:
                 extern uint8_t ist1_stack[];
                 if (tss_ist1_ptr)
                     *tss_ist1_ptr = (uint64_t)(ist1_stack + 262144);
-                /* Reset compat32 mode flag */
-                extern int g_compat32_mode;
-                g_compat32_mode = 0;
             }
+            shell_reset_win32_state();
             compat32_crash_jmpbuf = NULL;
             sh_diag_mark(winexec_crashed ? "winexec-crash-done" : "winexec-done");
         }
@@ -6883,9 +6892,8 @@ q4kgdone:
                 extern uint8_t ist1_stack[];
                 if (tss_ist1_ptr)
                     *tss_ist1_ptr = (uint64_t)(ist1_stack + 262144);
-                extern int g_compat32_mode;
-                g_compat32_mode = 0;
             }
+            shell_reset_win32_state();
             compat32_crash_jmpbuf = NULL;
         }
     } else if (strcmp(cmd, "dosrun") == 0) {

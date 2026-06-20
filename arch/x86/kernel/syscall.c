@@ -516,32 +516,73 @@ typedef struct {
     uint32_t    prot;        /* PROT_READ|PROT_WRITE|PROT_EXEC */
     bool        in_use;
     uint8_t     type;        /* VMA_ANON, VMA_FILE_ELF, VMA_FILE_MMAP */
+    uint32_t    magic;       /* VMA_MAGIC while the slot is initialized */
     vfs_node_t  file_node;   /* copy of VFS node for file-backed VMAs */
     uint64_t    file_offset; /* byte offset into file where this VMA starts */
     uint64_t    file_size;   /* bytes backed by file (rest is zero-fill) */
-    void       *owner;       /* X-PGTBL: process_t* that owns this VMA */
+    void       *owner;       /* Debug hint only: process_t* that created it */
+    uint32_t    owner_tgid;  /* Stable owner identity for CLONE_THREAD VMAs */
 } vma_t;
 
 static vma_t vma_table[MAX_VMAS];
+#define VMA_MAGIC 0x564D4131u  /* "VMA1" */
 
 /* X-PGTBL: current process accessors (defined in process.c). */
 extern void    *proc_current(void);
 extern uint64_t proc_current_cr3(void);
+extern int32_t  proc_current_tgid(void);
+extern int32_t  proc_tgid_of(void *p);
+
+static void vma_set_owner(vma_t *v, void *owner)
+{
+    v->magic = VMA_MAGIC;
+    v->owner = owner;
+    v->owner_tgid = owner ? (uint32_t)proc_tgid_of(owner) : 0;
+}
+
+static void vma_clear_slot(vma_t *v)
+{
+    v->in_use = false;
+    v->magic = 0;
+    v->owner = NULL;
+    v->owner_tgid = 0;
+}
 
 /* True if a VMA belongs to the currently-running process (or is
  * ownerless, for backward compat with legacy allocators). */
 static inline bool vma_owned_by_current(const vma_t *v)
 {
+    static int warned_bad_vma;
+
+    if (!v->in_use)
+        return false;
+
+    if (v->magic != VMA_MAGIC) {
+        if (!warned_bad_vma) {
+            warned_bad_vma = 1;
+            serial_puts("[VMA] corrupt slot ignored: base=");
+            serial_puthex(v->base, 16);
+            serial_puts(" pages=");
+            serial_puthex(v->pages, 16);
+            serial_puts(" magic=");
+            serial_puthex(v->magic, 8);
+            serial_puts(" owner=");
+            serial_puthex((uint64_t)(uintptr_t)v->owner, 16);
+            serial_puts("\n");
+        }
+        return false;
+    }
+
     void *cur = proc_current();
     if (v->owner == NULL || v->owner == cur) return true;
     /* CLONE_THREAD threads share one address space (and its VMAs) with their
      * thread-group siblings, but each is a distinct process_t. A worker/render
      * thread must be able to demand-fault VMAs the main thread (or another
      * sibling) registered — including its own musl-mmap'd stack — so match by
-     * thread group, not the exact process_t. */
-    extern int32_t proc_tgid_of(void *p);
-    int32_t ct = proc_tgid_of(cur);
-    return ct != 0 && proc_tgid_of(v->owner) == ct;
+     * thread group, not the exact process_t. The owner pointer is kept only
+     * for diagnostics; do not dereference it here. */
+    int32_t ct = proc_current_tgid();
+    return ct != 0 && v->owner_tgid != 0 && (uint32_t)ct == v->owner_tgid;
 }
 
 static int vma_find_free_slot_except(int except)
@@ -745,7 +786,7 @@ int quarantine_check_uaf(uint64_t fault_addr, uint32_t pid)
 
 static void vma_free_pages(vma_t *v)
 {
-    uint64_t cr3 = v->owner ? proc_current_cr3() : 0;
+    uint64_t cr3 = (v->owner || v->owner_tgid) ? proc_current_cr3() : 0;
     extern int32_t proc_current_pid(void);
     uint32_t pid = (uint32_t)proc_current_pid();
 
@@ -791,7 +832,7 @@ int vma_register_file(uint64_t base, uint64_t pages, uint32_t prot,
             {
                 extern void *proc_exec_target(void);
                 void *et = proc_exec_target();
-                vma_table[i].owner = et ? et : proc_current();
+                vma_set_owner(&vma_table[i], et ? et : proc_current());
             }
             return 0;
         }
@@ -1629,12 +1670,40 @@ int64_t sys_brk(uint64_t addr)
 
 static uint64_t prot_to_pte_flags(uint32_t prot)
 {
-    uint64_t flags = PTE_PRESENT | PTE_GLOBAL;
+    /* Lower-half process mappings must not be global: CR3 switches need to
+     * flush them, otherwise two processes can alias stale TLB entries. */
+    uint64_t flags = PTE_PRESENT;
     if (prot & PROT_WRITE)
         flags |= PTE_WRITABLE;
     if (!(prot & PROT_EXEC))
         flags |= PTE_NX;
     return flags;
+}
+
+extern int paging_map_page_in_cr3(uint64_t cr3, uint64_t virt,
+                                  uint64_t phys, uint64_t flags);
+
+static int mmap_commit_anon_first_page(uint64_t va, uint32_t prot)
+{
+    if (prot == PROT_NONE)
+        return 0;
+
+    void *phys = mem_alloc_pages(1);
+    if (!phys)
+        return -ENOMEM;
+
+    memset(PHYS_TO_VIRT(phys), 0, 4096);
+
+    uint64_t pte_flags = prot_to_pte_flags(prot);
+    uint64_t cr3 = proc_current_cr3();
+    int rc = cr3 ? paging_map_page_in_cr3(cr3, va, (uint64_t)phys, pte_flags)
+                 : paging_map_page(va, (uint64_t)phys, pte_flags);
+    if (rc != 0) {
+        mem_free_pages(phys, 1);
+        return -ENOMEM;
+    }
+
+    return 0;
 }
 
 /*
@@ -1707,7 +1776,7 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
         vma_table[vi].file_node   = f->node;
         vma_table[vi].file_offset = offset;
         vma_table[vi].file_size   = backing;
-        vma_table[vi].owner       = proc_current();
+        vma_set_owner(&vma_table[vi], proc_current());
 
         return (int64_t)result;
     }
@@ -1747,7 +1816,13 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
     vma_table[vi].prot   = (uint32_t)prot;
     vma_table[vi].in_use = true;
     vma_table[vi].type   = VMA_ANON;
-    vma_table[vi].owner  = proc_current();
+    vma_set_owner(&vma_table[vi], proc_current());
+
+    int commit_rc = mmap_commit_anon_first_page(result, (uint32_t)prot);
+    if (commit_rc < 0) {
+        vma_clear_slot(&vma_table[vi]);
+        return commit_rc;
+    }
 
     return (int64_t)result;
 }
@@ -1784,7 +1859,7 @@ static int64_t sys_munmap(uint64_t addr, uint64_t length)
             }
 
             vma_free_pages(&vma_table[i]);
-            vma_table[i].in_use = false;
+            vma_clear_slot(&vma_table[i]);
             unmapped_any = true;
             progress = true;
             break;
@@ -1920,36 +1995,85 @@ int demand_page_fault(uint64_t addr, uint64_t error_code)
     if (error_code & 1) return -1;
 
     uint64_t page_addr = addr & ~0xFFFULL;
+    static uint32_t dpf_fail_logs;
 
     /* Find VMA containing this address, owned by the current process.
      * X-PGTBL: multiple demand-paged processes may have overlapping VMA
      * ranges (e.g. two musl statics both loaded at 0x400000), so the
      * owner filter is essential to pick the right one. */
     vma_t *vma = NULL;
+    vma_t *range_mismatch = NULL;
+    int range_mismatch_idx = -1;
     for (int i = 0; i < MAX_VMAS; i++) {
         if (!vma_table[i].in_use) continue;
-        if (!vma_owned_by_current(&vma_table[i])) continue;
         uint64_t vma_end = vma_table[i].base + vma_table[i].pages * 4096;
         if (addr >= vma_table[i].base && addr < vma_end) {
-            vma = &vma_table[i];
-            break;
+            if (vma_owned_by_current(&vma_table[i])) {
+                vma = &vma_table[i];
+                break;
+            }
+            if (!range_mismatch) {
+                range_mismatch = &vma_table[i];
+                range_mismatch_idx = i;
+            }
         }
     }
     if (!vma) {
+        if (dpf_fail_logs < 16) {
+            serial_puts("[DPF] no VMA addr=0x");
+            serial_puthex(addr, 16);
+            serial_puts(" page=0x");
+            serial_puthex(page_addr, 16);
+            serial_puts(" pid=");
+            serial_putdec((uint64_t)(uint32_t)proc_current_pid());
+            serial_puts(" tgid=");
+            serial_putdec((uint64_t)(uint32_t)proc_current_tgid());
+            serial_puts(" cr3=0x");
+            serial_puthex(proc_current_cr3(), 16);
+            if (range_mismatch) {
+                serial_puts(" range-owner idx=");
+                serial_putdec((uint64_t)range_mismatch_idx);
+                serial_puts(" base=0x");
+                serial_puthex(range_mismatch->base, 16);
+                serial_puts(" pages=0x");
+                serial_puthex(range_mismatch->pages, 8);
+                serial_puts(" owner_tgid=");
+                serial_putdec(range_mismatch->owner_tgid);
+            }
+            serial_puts("\n");
+            dpf_fail_logs++;
+        }
         /* Check quarantine before killing — may be use-after-free */
         extern int32_t proc_current_pid(void);
         quarantine_check_uaf(addr, (uint32_t)proc_current_pid());
         return -1;  /* No VMA → SIGSEGV (quarantine_check_uaf logged if UAF) */
     }
-    if (vma->prot == PROT_NONE)
+    if (vma->prot == PROT_NONE) {
+        if (dpf_fail_logs < 16) {
+            serial_puts("[DPF] PROT_NONE addr=0x");
+            serial_puthex(addr, 16);
+            serial_puts(" base=0x");
+            serial_puthex(vma->base, 16);
+            serial_puts("\n");
+            dpf_fail_logs++;
+        }
         return -1;
+    }
 
     /* Allocate a physical page, zero-filled via the upper-half mirror.
      * CPU writes (memset + vfs_read) go through the kernel direct map;
      * the phys value below is what later gets written into the user
      * PTE by paging_map_page_in_cr3. */
     void *phys = mem_alloc_pages(1);
-    if (!phys) return -1;
+    if (!phys) {
+        if (dpf_fail_logs < 16) {
+            serial_puts("[DPF] alloc fail addr=0x");
+            serial_puthex(addr, 16);
+            serial_puts("\n");
+            dpf_fail_logs++;
+        }
+        return -1;
+    }
     void *page_virt = PHYS_TO_VIRT(phys);
     memset(page_virt, 0, 4096);
 
@@ -1964,6 +2088,14 @@ int demand_page_fault(uint64_t addr, uint64_t error_code)
             if (vfs_read(&node_copy, vma->file_offset + offset_in_vma,
                          page_virt, to_read) < 0) {
                 mem_free_pages(phys, 1);
+                if (dpf_fail_logs < 16) {
+                    serial_puts("[DPF] read fail addr=0x");
+                    serial_puthex(addr, 16);
+                    serial_puts(" off=0x");
+                    serial_puthex(vma->file_offset + offset_in_vma, 16);
+                    serial_puts("\n");
+                    dpf_fail_logs++;
+                }
                 return -1;
             }
         }
@@ -1979,6 +2111,24 @@ int demand_page_fault(uint64_t addr, uint64_t error_code)
                  : paging_map_page(page_addr, (uint64_t)phys, pte_flags);
     if (rc != 0) {
         mem_free_pages(phys, 1);
+        if (dpf_fail_logs < 16) {
+            serial_puts("[DPF] map fail addr=0x");
+            serial_puthex(addr, 16);
+            serial_puts(" page=0x");
+            serial_puthex(page_addr, 16);
+            serial_puts(" cr3=0x");
+            serial_puthex(cr3, 16);
+            serial_puts(" base=0x");
+            serial_puthex(vma->base, 16);
+            serial_puts(" pages=0x");
+            serial_puthex(vma->pages, 8);
+            serial_puts(" prot=0x");
+            serial_puthex(vma->prot, 4);
+            serial_puts(" type=");
+            serial_putdec(vma->type);
+            serial_puts("\n");
+            dpf_fail_logs++;
+        }
         return -1;
     }
 
@@ -4193,14 +4343,11 @@ void syscall_reset_process(void)
      * even during fork+execve: the owner filter protects the parent's
      * VMAs while freeing the child's own VMAs, preventing physical-
      * page leaks when a fork'd child execve's a demand-paged binary. */
-    void *cur = proc_current();
     for (int i = 0; i < MAX_VMAS; i++) {
         if (!vma_table[i].in_use) continue;
-        if (vma_table[i].owner != NULL && vma_table[i].owner != cur)
-            continue;
+        if (!vma_owned_by_current(&vma_table[i])) continue;
         vma_free_pages(&vma_table[i]);
-        vma_table[i].in_use = false;
-        vma_table[i].owner  = NULL;
+        vma_clear_slot(&vma_table[i]);
     }
 }
 
