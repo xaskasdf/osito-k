@@ -63,6 +63,34 @@ static uint64_t *kernel_pml4;    /* Top-level page table */
 static uint64_t  kernel_cr3;     /* Physical address of PML4 */
 static uint32_t  pt_pages_used;  /* Number of 4KB pages allocated for tables */
 
+/* EFER.NXE must be enabled before any PTE uses bit 63 as NX.
+ * Otherwise the CPU treats bit 63 as reserved and raises #PF.RSVD
+ * on otherwise-valid non-executable mappings. */
+#define MSR_EFER        0xC0000080u
+#define EFER_NXE        (1ULL << 11)
+
+static inline uint64_t rdmsr(uint32_t msr)
+{
+    uint32_t lo, hi;
+    __asm__ volatile ("rdmsr" : "=a"(lo), "=d"(hi) : "c"(msr));
+    return ((uint64_t)hi << 32) | lo;
+}
+
+static inline void wrmsr(uint32_t msr, uint64_t val)
+{
+    __asm__ volatile ("wrmsr" : : "c"(msr),
+                      "a"((uint32_t)val), "d"((uint32_t)(val >> 32)));
+}
+
+static void paging_enable_nxe(void)
+{
+    uint64_t efer = rdmsr(MSR_EFER);
+    if (!(efer & EFER_NXE)) {
+        wrmsr(MSR_EFER, efer | EFER_NXE);
+        serial_puts("[PAGE] EFER.NXE enabled for NX page mappings\n");
+    }
+}
+
 /* ── Allocate a zeroed page for page tables ──────────────────── */
 
 extern void *mem_alloc_aligned_high(uint64_t size, uint64_t alignment);
@@ -543,6 +571,7 @@ static void free_old_page_tables(void)
 void __initk paging_init(void)
 {
     serial_puts("[PAGE] Setting up kernel page tables...\n");
+    paging_enable_nxe();
 
     uint64_t old_cr3 = read_cr3();
     serial_puts("[PAGE] Current CR3: 0x");

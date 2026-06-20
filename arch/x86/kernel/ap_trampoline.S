@@ -53,10 +53,12 @@ pm32:
     mov     0x8128, %eax
     mov     %eax, %cr3
 
-    /* Enable LME (MSR 0xC0000080, bit 8) */
+    /* Enable LME (bit 8) and NXE (bit 11). NXE must match the BSP before
+       shared page tables with PTE.NX bits are used by this AP. */
     mov     $0xC0000080, %ecx
     rdmsr
     bts     $8, %eax
+    bts     $11, %eax
     wrmsr
 
     /* Enable paging (CR0 bit 31) */
