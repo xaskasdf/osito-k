@@ -43,6 +43,7 @@ extern void *malloc(unsigned long);
 extern void  free(void *);
 extern void *memset(void *, int, unsigned long);
 extern void *memcpy(void *, const void *, unsigned long);
+extern int printf(const char *, ...);
 
 /* --- Encoder forward decls --- */
 extern int venus_cmd_encode_CreateShaderModule(struct venus_wire *, uint64_t,
@@ -115,6 +116,11 @@ extern int venus_cmd_encode_CmdDraw(struct venus_wire *, uint64_t, uint64_t,
               | (marker)))
 
 #define HANDLE_TO_SLOT(h)  ((int)(((uint64_t)(h) >> 48) & VENUS_H_SLOT_MASK_W3B4))
+
+static uint32_t venus_w3b4_logged_draw;
+static uint32_t venus_w3b4_logged_desc_image;
+static uint32_t venus_w3b4_logged_desc_bind;
+static uint32_t venus_w3b4_logged_rt_begin;
 
 /* --- Slot allocators (uniform shape). --- */
 #define DEFINE_SLOT_ALLOC(name, table, cap)                                 \
@@ -632,6 +638,7 @@ venus_AllocateDescriptorSets(VkDevice device,
         struct venus_descriptor_set *set = &dev->desc_sets[set_slot];
         set->pool_slot = pool_slot;
         set->layout_slot = layout_slot;
+        set->image_slot = -1;
         pDescriptorSets[i] =
             (VkDescriptorSet)MAKE_SLOT_HANDLE(dev, set_slot, VENUS_H_MARKER_DSET);
     }
@@ -666,11 +673,51 @@ venus_UpdateDescriptorSets(VkDevice device,
                            const VkWriteDescriptorSet *pDescriptorWrites,
                            uint32_t descriptorCopyCount,
                            const VkCopyDescriptorSet *pDescriptorCopies) {
-    (void)device;
-    (void)descriptorWriteCount;
-    (void)pDescriptorWrites;
-    (void)descriptorCopyCount;
-    (void)pDescriptorCopies;
+    if (!device) return;
+    struct venus_device *dev = (struct venus_device *)device;
+
+    for (uint32_t i = 0; i < descriptorWriteCount; i++) {
+        const VkWriteDescriptorSet *w = &pDescriptorWrites[i];
+        int set_slot = HANDLE_TO_SLOT(w->dstSet);
+        if (set_slot < 0 || set_slot >= (int)VENUS_MAX_DESC_SET_OBJECTS)
+            continue;
+        struct venus_descriptor_set *set = &dev->desc_sets[set_slot];
+        if (!set->in_use || !w->pImageInfo || w->descriptorCount == 0)
+            continue;
+        if (w->descriptorType != VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER &&
+            w->descriptorType != VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE &&
+            w->descriptorType != VK_DESCRIPTOR_TYPE_STORAGE_IMAGE &&
+            w->descriptorType != VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT)
+            continue;
+
+        VkImageView view = w->pImageInfo[0].imageView;
+        int view_slot = HANDLE_TO_SLOT(view);
+        if (view_slot < 0 || view_slot >= (int)VENUS_MAX_IMAGE_VIEW_OBJECTS)
+            continue;
+        if (!dev->image_views[view_slot].in_use)
+            continue;
+        set->image_slot = dev->image_views[view_slot].image_slot;
+        if (!venus_w3b4_logged_desc_image) {
+            venus_w3b4_logged_desc_image = 1u;
+            printf("[VDESC] write set=%d image=%d type=%u\n",
+                   set_slot, set->image_slot, (unsigned)w->descriptorType);
+        }
+    }
+
+    for (uint32_t i = 0; i < descriptorCopyCount; i++) {
+        const VkCopyDescriptorSet *c = &pDescriptorCopies[i];
+        int src_slot = HANDLE_TO_SLOT(c->srcSet);
+        int dst_slot = HANDLE_TO_SLOT(c->dstSet);
+        if (src_slot < 0 || src_slot >= (int)VENUS_MAX_DESC_SET_OBJECTS)
+            continue;
+        if (dst_slot < 0 || dst_slot >= (int)VENUS_MAX_DESC_SET_OBJECTS)
+            continue;
+        if (!dev->desc_sets[src_slot].in_use ||
+            !dev->desc_sets[dst_slot].in_use)
+            continue;
+        dev->desc_sets[dst_slot].image_slot =
+            dev->desc_sets[src_slot].image_slot;
+    }
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL
@@ -907,6 +954,17 @@ venus_ResetCommandPool(VkDevice device, VkCommandPool pool,
         vcb->recorded_clear_color   = 0u;
         vcb->recorded_has_clear     = 0u;
         vcb->recorded_clear_image_slot = -1;
+        vcb->recorded_has_copy_image = 0u;
+        vcb->recorded_copy_src_image_slot = -1;
+        vcb->recorded_copy_dst_image_slot = -1;
+        vcb->recorded_has_copy_buffer_to_image = 0u;
+        vcb->recorded_copy_src_buffer_slot = -1;
+        vcb->recorded_copy_buffer_dst_image_slot = -1;
+        vcb->recorded_sampled_image_slot = -1;
+        vcb->recorded_copy_buffer_offset = 0u;
+        vcb->recorded_copy_buffer_width = 0u;
+        vcb->recorded_copy_buffer_height = 0u;
+        vcb->recorded_copy_buffer_row_length = 0u;
     }
     return VK_SUCCESS;
 }
@@ -954,6 +1012,17 @@ venus_AllocateCommandBuffers(VkDevice device,
         vcb->recorded_clear_color       = 0u;
         vcb->recorded_has_clear         = 0u;
         vcb->recorded_clear_image_slot  = -1;
+        vcb->recorded_has_copy_image    = 0u;
+        vcb->recorded_copy_src_image_slot = -1;
+        vcb->recorded_copy_dst_image_slot = -1;
+        vcb->recorded_has_copy_buffer_to_image = 0u;
+        vcb->recorded_copy_src_buffer_slot = -1;
+        vcb->recorded_copy_buffer_dst_image_slot = -1;
+        vcb->recorded_sampled_image_slot = -1;
+        vcb->recorded_copy_buffer_offset = 0u;
+        vcb->recorded_copy_buffer_width = 0u;
+        vcb->recorded_copy_buffer_height = 0u;
+        vcb->recorded_copy_buffer_row_length = 0u;
     }
     if (allocated != count) {
         for (uint32_t i = 0; i < allocated; i++) {
@@ -1024,6 +1093,21 @@ static inline int cb_unwrap(VkCommandBuffer cb, struct venus_device **dev_out,
     return 1;
 }
 
+static uint32_t venus_pack_clear_bgra(const VkClearValue *clear) {
+    if (!clear) return 0;
+    const float *c = clear->color.float32;
+    float r = c[0], g = c[1], b = c[2], a = c[3];
+    if (r < 0.0f) r = 0.0f; else if (r > 1.0f) r = 1.0f;
+    if (g < 0.0f) g = 0.0f; else if (g > 1.0f) g = 1.0f;
+    if (b < 0.0f) b = 0.0f; else if (b > 1.0f) b = 1.0f;
+    if (a < 0.0f) a = 0.0f; else if (a > 1.0f) a = 1.0f;
+    uint32_t bb = (uint32_t)(b * 255.0f + 0.5f);
+    uint32_t bg = (uint32_t)(g * 255.0f + 0.5f);
+    uint32_t br = (uint32_t)(r * 255.0f + 0.5f);
+    uint32_t ba = (uint32_t)(a * 255.0f + 0.5f);
+    return bb | (bg << 8) | (br << 16) | (ba << 24);
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL
 venus_BeginCommandBuffer(VkCommandBuffer cb,
                          const VkCommandBufferBeginInfo *pBegin) {
@@ -1044,11 +1128,53 @@ venus_BeginCommandBuffer(VkCommandBuffer cb,
     vcb->recorded_clear_color       = 0u;
     vcb->recorded_has_clear         = 0u;
     vcb->recorded_clear_image_slot  = -1;
+    vcb->recorded_has_copy_image    = 0u;
+    vcb->recorded_copy_src_image_slot = -1;
+    vcb->recorded_copy_dst_image_slot = -1;
+    vcb->recorded_has_copy_buffer_to_image = 0u;
+    vcb->recorded_copy_src_buffer_slot = -1;
+    vcb->recorded_copy_buffer_dst_image_slot = -1;
+    vcb->recorded_sampled_image_slot = -1;
+    vcb->recorded_copy_buffer_offset = 0u;
+    vcb->recorded_copy_buffer_width = 0u;
+    vcb->recorded_copy_buffer_height = 0u;
+    vcb->recorded_copy_buffer_row_length = 0u;
     if (dev->parent && dev->parent->wire && vcb->host_id != 0)
         (void)venus_cmd_encode_BeginCommandBuffer(dev->parent->wire,
                                                   dev->host_handle,
                                                   vcb->host_id,
                                                   pBegin ? pBegin->flags : 0u);
+    return VK_SUCCESS;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+venus_ResetCommandBuffer(VkCommandBuffer cb, VkCommandBufferResetFlags flags) {
+    (void)flags;
+    struct venus_device *dev; int slot;
+    if (!cb_unwrap(cb, &dev, &slot)) return VK_ERROR_INITIALIZATION_FAILED;
+    struct venus_cmd_buffer *vcb = &dev->cmd_buffers[slot];
+    vcb->recording              = 0;
+    vcb->recorded_vb_slot       = -1;
+    vcb->recorded_vb_offset     = 0;
+    vcb->recorded_vb_stride     = 0;
+    vcb->recorded_vertex_count  = 0;
+    vcb->recorded_first_vertex  = 0;
+    vcb->last_drawn_image_slot  = -1;
+    vcb->drew_flag              = 0;
+    vcb->recorded_clear_color   = 0u;
+    vcb->recorded_has_clear     = 0u;
+    vcb->recorded_clear_image_slot = -1;
+    vcb->recorded_has_copy_image = 0u;
+    vcb->recorded_copy_src_image_slot = -1;
+    vcb->recorded_copy_dst_image_slot = -1;
+    vcb->recorded_has_copy_buffer_to_image = 0u;
+    vcb->recorded_copy_src_buffer_slot = -1;
+    vcb->recorded_copy_buffer_dst_image_slot = -1;
+    vcb->recorded_sampled_image_slot = -1;
+    vcb->recorded_copy_buffer_offset = 0u;
+    vcb->recorded_copy_buffer_width = 0u;
+    vcb->recorded_copy_buffer_height = 0u;
+    vcb->recorded_copy_buffer_row_length = 0u;
     return VK_SUCCESS;
 }
 
@@ -1096,22 +1222,18 @@ venus_CmdBeginRenderPass(VkCommandBuffer cb,
      * has multiple attachments but for the clear-only path we only honor
      * the first color attachment. */
     if (pBegin->clearValueCount > 0 && pBegin->pClearValues) {
-        const float *c = pBegin->pClearValues[0].color.float32;
-        float r = c[0], g = c[1], b = c[2], a = c[3];
-        if (r < 0.0f) r = 0.0f; else if (r > 1.0f) r = 1.0f;
-        if (g < 0.0f) g = 0.0f; else if (g > 1.0f) g = 1.0f;
-        if (b < 0.0f) b = 0.0f; else if (b > 1.0f) b = 1.0f;
-        if (a < 0.0f) a = 0.0f; else if (a > 1.0f) a = 1.0f;
-        uint32_t br = (uint32_t)(b * 255.0f + 0.5f);
-        uint32_t bg = (uint32_t)(g * 255.0f + 0.5f);
-        uint32_t bb = (uint32_t)(r * 255.0f + 0.5f);  /* red byte at byte[2] */
-        uint32_t ba = (uint32_t)(a * 255.0f + 0.5f);
-        vcb->recorded_clear_color = br | (bg << 8) | (bb << 16) | (ba << 24);
+        vcb->recorded_clear_color = venus_pack_clear_bgra(&pBegin->pClearValues[0]);
         vcb->recorded_has_clear   = 1u;
         /* Also tag the framebuffer's color image as the clear target — so
          * QueueSubmit can find the SHM even if no CmdDraw fires. */
         if (vcb->last_drawn_image_slot >= 0)
             vcb->recorded_clear_image_slot = vcb->last_drawn_image_slot;
+    }
+    if (venus_w3b4_logged_rt_begin < 32u) {
+        venus_w3b4_logged_rt_begin++;
+        printf("[VRT] BeginRenderPass image=%d clear=%u color=0x%x\n",
+               vcb->last_drawn_image_slot, vcb->recorded_has_clear,
+               vcb->recorded_clear_color);
     }
 
     if (dev->parent && dev->parent->wire && vcb->host_id != 0) {
@@ -1133,6 +1255,77 @@ venus_CmdEndRenderPass(VkCommandBuffer cb) {
     if (dev->parent && dev->parent->wire && vcb->host_id != 0)
         (void)venus_cmd_encode_CmdEndRenderPass(dev->parent->wire,
                                                 dev->host_handle, vcb->host_id);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+venus_CmdBeginRendering(VkCommandBuffer cb,
+                        const VkRenderingInfo *pRenderingInfo) {
+    struct venus_device *dev; int slot;
+    if (!cb_unwrap(cb, &dev, &slot)) return;
+    struct venus_cmd_buffer *vcb = &dev->cmd_buffers[slot];
+    if (!pRenderingInfo) return;
+
+    vcb->last_drawn_image_slot = -1;
+    vcb->drew_flag = 0;
+
+    if (pRenderingInfo->colorAttachmentCount > 0 &&
+        pRenderingInfo->pColorAttachments) {
+        const VkRenderingAttachmentInfo *att =
+            &pRenderingInfo->pColorAttachments[0];
+        int vs = HANDLE_TO_SLOT(att->imageView);
+        if (vs >= 0 && vs < (int)VENUS_MAX_IMAGE_VIEW_OBJECTS &&
+            dev->image_views[vs].in_use)
+            vcb->last_drawn_image_slot = dev->image_views[vs].image_slot;
+
+        if (att->loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR &&
+            vcb->last_drawn_image_slot >= 0) {
+            vcb->recorded_clear_color =
+                venus_pack_clear_bgra(&att->clearValue);
+            vcb->recorded_has_clear = 1u;
+            vcb->recorded_clear_image_slot = vcb->last_drawn_image_slot;
+        }
+    }
+    if (venus_w3b4_logged_rt_begin < 32u) {
+        venus_w3b4_logged_rt_begin++;
+        printf("[VRT] BeginRendering image=%d clear=%u color=0x%x\n",
+               vcb->last_drawn_image_slot, vcb->recorded_has_clear,
+               vcb->recorded_clear_color);
+    }
+}
+
+VKAPI_ATTR void VKAPI_CALL
+venus_CmdEndRendering(VkCommandBuffer cb) {
+    (void)cb;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+venus_CmdBindDescriptorSets(VkCommandBuffer cb, VkPipelineBindPoint bindPoint,
+                            VkPipelineLayout layout, uint32_t firstSet,
+                            uint32_t descriptorSetCount,
+                            const VkDescriptorSet *pDescriptorSets,
+                            uint32_t dynamicOffsetCount,
+                            const uint32_t *pDynamicOffsets) {
+    (void)bindPoint; (void)layout; (void)firstSet;
+    (void)dynamicOffsetCount; (void)pDynamicOffsets;
+    struct venus_device *dev; int slot;
+    if (!cb_unwrap(cb, &dev, &slot)) return;
+    if (!pDescriptorSets) return;
+    struct venus_cmd_buffer *vcb = &dev->cmd_buffers[slot];
+    for (uint32_t i = 0; i < descriptorSetCount; i++) {
+        int set_slot = HANDLE_TO_SLOT(pDescriptorSets[i]);
+        if (set_slot < 0 || set_slot >= (int)VENUS_MAX_DESC_SET_OBJECTS)
+            continue;
+        struct venus_descriptor_set *set = &dev->desc_sets[set_slot];
+        if (!set->in_use || set->image_slot < 0)
+            continue;
+        vcb->recorded_sampled_image_slot = set->image_slot;
+        if (!venus_w3b4_logged_desc_bind) {
+            venus_w3b4_logged_desc_bind = 1u;
+            printf("[VDESC] bind set=%d image=%d cb_image=%d\n",
+                   set_slot, set->image_slot, vcb->last_drawn_image_slot);
+        }
+        return;
+    }
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -1163,9 +1356,72 @@ venus_CmdDraw(VkCommandBuffer cb, uint32_t vertexCount,
     vcb->recorded_vertex_count = vertexCount;
     vcb->recorded_first_vertex = firstVertex;
     vcb->drew_flag             = 1u;
+    if (venus_w3b4_logged_draw < 32u) {
+        venus_w3b4_logged_draw++;
+        printf("[VDRAW] Draw verts=%u image=%d sampled=%d\n",
+               vertexCount, vcb->last_drawn_image_slot,
+               vcb->recorded_sampled_image_slot);
+    }
 
     if (dev->parent && dev->parent->wire && vcb->host_id != 0)
         (void)venus_cmd_encode_CmdDraw(dev->parent->wire, dev->host_handle,
                                        vcb->host_id, vertexCount, instanceCount,
                                        firstVertex, firstInstance);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+venus_CmdDrawIndexed(VkCommandBuffer cb, uint32_t indexCount,
+                     uint32_t instanceCount, uint32_t firstIndex,
+                     int32_t vertexOffset, uint32_t firstInstance) {
+    (void)firstIndex;
+    struct venus_device *dev; int slot;
+    if (!cb_unwrap(cb, &dev, &slot)) return;
+    struct venus_cmd_buffer *vcb = &dev->cmd_buffers[slot];
+
+    /* DXVK primarily emits indexed draws. Until the host Venus path executes
+     * real draws, treat them as draw work for present-time CPU diagnostics. */
+    vcb->recorded_vertex_count = indexCount;
+    vcb->recorded_first_vertex = vertexOffset > 0 ? (uint32_t)vertexOffset : 0u;
+    vcb->drew_flag             = 1u;
+    if (venus_w3b4_logged_draw < 32u) {
+        venus_w3b4_logged_draw++;
+        printf("[VDRAW] DrawIndexed indices=%u image=%d sampled=%d\n",
+               indexCount, vcb->last_drawn_image_slot,
+               vcb->recorded_sampled_image_slot);
+    }
+
+    if (dev->parent && dev->parent->wire && vcb->host_id != 0) {
+        (void)venus_cmd_encode_CmdDraw(dev->parent->wire, dev->host_handle,
+                                       vcb->host_id, indexCount, instanceCount,
+                                       vcb->recorded_first_vertex,
+                                       firstInstance);
+    }
+}
+
+VKAPI_ATTR void VKAPI_CALL
+venus_CmdDrawIndexedIndirect(VkCommandBuffer cb, VkBuffer buffer,
+                             VkDeviceSize offset, uint32_t drawCount,
+                             uint32_t stride) {
+    (void)buffer; (void)offset; (void)stride;
+    struct venus_device *dev; int slot;
+    if (!cb_unwrap(cb, &dev, &slot)) return;
+    struct venus_cmd_buffer *vcb = &dev->cmd_buffers[slot];
+
+    vcb->recorded_vertex_count = drawCount ? 3u : 0u;
+    vcb->recorded_first_vertex = 0u;
+    vcb->drew_flag             = drawCount ? 1u : 0u;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+venus_CmdDrawIndirect(VkCommandBuffer cb, VkBuffer buffer,
+                      VkDeviceSize offset, uint32_t drawCount,
+                      uint32_t stride) {
+    (void)buffer; (void)offset; (void)stride;
+    struct venus_device *dev; int slot;
+    if (!cb_unwrap(cb, &dev, &slot)) return;
+    struct venus_cmd_buffer *vcb = &dev->cmd_buffers[slot];
+
+    vcb->recorded_vertex_count = drawCount ? 3u : 0u;
+    vcb->recorded_first_vertex = 0u;
+    vcb->drew_flag             = drawCount ? 1u : 0u;
 }

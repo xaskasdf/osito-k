@@ -287,8 +287,8 @@ venus_FreeMemory(VkDevice device, VkDeviceMemory memory,
         (void)venus_cmd_encode_FreeMemory(dev->parent->wire,
                                           dev->host_handle, m->host_id);
     }
-    /* W3b.5: SHM-backed memory was obtained via SYS_SHM_MKSURFACE +
-     * SYS_SHM_MAP, not malloc. Unmap and destroy the kernel surface
+    /* W3b.5: SHM-backed memory was obtained via SYS_SHM_CREATE +
+     * SYS_SHM_MAP, not malloc. Unmap and destroy the kernel SHM object
      * instead of calling free() on the kernel-owned pointer. */
     if (m->is_shm_backed) {
         extern long __syscall1(long, long);

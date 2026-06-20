@@ -26,7 +26,7 @@ typedef struct VkOsitoCompositorSurfaceCreateInfoOSITOK {
     VkStructureType sType;
     const void*     pNext;
     VkFlags         flags;
-    uint32_t        shmHandle;   /* from SYS_SHM_MKSURFACE */
+    uint32_t        shmHandle;   /* compositor target SHM handle */
 } VkOsitoCompositorSurfaceCreateInfoOSITOK;
 
 typedef VkResult (VKAPI_PTR *PFN_vkCreateOsitoCompositorSurfaceOSITOK)(

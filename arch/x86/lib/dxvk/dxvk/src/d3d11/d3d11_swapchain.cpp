@@ -291,15 +291,14 @@ namespace dxvk {
       SyncInterval, PresentFlags, m_dirty ? 1u : 0u,
       m_presenter->hasSwapChain() ? 1u : 0u);
 
+    const bool presentTest = (PresentFlags & DXGI_PRESENT_TEST) != 0;
 #if defined(__OSITO_K__)
-    if (PresentFlags & DXGI_PRESENT_TEST) {
-      printf("[D11sc] OsitoK clearing DXGI_PRESENT_TEST flags=0x%x\n",
+    if (presentTest)
+      printf("[D11sc] OsitoK honoring DXGI_PRESENT_TEST flags=0x%x\n",
         PresentFlags);
-      PresentFlags &= ~DXGI_PRESENT_TEST;
-    }
 #endif
 
-    if (!(PresentFlags & DXGI_PRESENT_TEST))
+    if (!presentTest)
       m_dirty |= m_presenter->setSyncInterval(SyncInterval) != VK_SUCCESS;
     printf("[D11sc] Present after setSync dirty=%u hasSwap=%u\n",
       m_dirty ? 1u : 0u, m_presenter->hasSwapChain() ? 1u : 0u);
@@ -327,8 +326,10 @@ namespace dxvk {
       hr = DXGI_ERROR_DEVICE_RESET;
     }
 
-    if (PresentFlags & DXGI_PRESENT_TEST)
+    if (presentTest) {
+      printf("[D11sc] Present test returning hr=0x%x\n", (unsigned)hr);
       return hr;
+    }
 
     if (hr != S_OK) {
       printf("[D11sc] Present returning early hr=0x%x\n", (unsigned)hr);

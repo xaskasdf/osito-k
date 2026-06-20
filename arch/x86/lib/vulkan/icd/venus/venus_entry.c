@@ -128,14 +128,38 @@ venus_icdGetInstanceProcAddr(VkInstance instance, const char *name) {
         return (PFN_vkVoidFunction)venus_BeginCommandBuffer;
     if (strcmp(name, "vkEndCommandBuffer") == 0)
         return (PFN_vkVoidFunction)venus_EndCommandBuffer;
+    if (strcmp(name, "vkResetCommandBuffer") == 0)
+        return (PFN_vkVoidFunction)venus_ResetCommandBuffer;
     if (strcmp(name, "vkCmdBeginRenderPass") == 0)
         return (PFN_vkVoidFunction)venus_CmdBeginRenderPass;
     if (strcmp(name, "vkCmdEndRenderPass") == 0)
         return (PFN_vkVoidFunction)venus_CmdEndRenderPass;
+    if (strcmp(name, "vkCmdBeginRendering") == 0 ||
+        strcmp(name, "vkCmdBeginRenderingKHR") == 0)
+        return (PFN_vkVoidFunction)venus_CmdBeginRendering;
+    if (strcmp(name, "vkCmdEndRendering") == 0 ||
+        strcmp(name, "vkCmdEndRenderingKHR") == 0)
+        return (PFN_vkVoidFunction)venus_CmdEndRendering;
+    if (strcmp(name, "vkCmdBindDescriptorSets") == 0)
+        return (PFN_vkVoidFunction)venus_CmdBindDescriptorSets;
     if (strcmp(name, "vkCmdBindPipeline") == 0)
         return (PFN_vkVoidFunction)venus_CmdBindPipeline;
     if (strcmp(name, "vkCmdDraw") == 0)
         return (PFN_vkVoidFunction)venus_CmdDraw;
+    if (strcmp(name, "vkCmdDrawIndexed") == 0)
+        return (PFN_vkVoidFunction)venus_CmdDrawIndexed;
+    if (strcmp(name, "vkCmdDrawIndexedIndirect") == 0)
+        return (PFN_vkVoidFunction)venus_CmdDrawIndexedIndirect;
+    if (strcmp(name, "vkCmdDrawIndirect") == 0)
+        return (PFN_vkVoidFunction)venus_CmdDrawIndirect;
+    if (strcmp(name, "vkCmdDrawIndirectCount") == 0 ||
+        strcmp(name, "vkCmdDrawIndirectCountKHR") == 0 ||
+        strcmp(name, "vkCmdDrawIndirectCountAMD") == 0)
+        return (PFN_vkVoidFunction)venus_CmdDrawIndirectCount;
+    if (strcmp(name, "vkCmdDrawIndexedIndirectCount") == 0 ||
+        strcmp(name, "vkCmdDrawIndexedIndirectCountKHR") == 0 ||
+        strcmp(name, "vkCmdDrawIndexedIndirectCountAMD") == 0)
+        return (PFN_vkVoidFunction)venus_CmdDrawIndexedIndirectCount;
 
     /* W3b.5 — WSI + surface + swapchain + queue + sync + present. */
     if (strcmp(name, "vkCreateOsitokCompositorSurfaceKHR") == 0)
@@ -187,14 +211,64 @@ venus_icdGetInstanceProcAddr(VkInstance instance, const char *name) {
     /* W3b.6 — vertex input + dynamic state. */
     if (strcmp(name, "vkCmdBindVertexBuffers") == 0)
         return (PFN_vkVoidFunction)venus_CmdBindVertexBuffers;
+    if (strcmp(name, "vkCmdBindVertexBuffers2") == 0 ||
+        strcmp(name, "vkCmdBindVertexBuffers2EXT") == 0)
+        return (PFN_vkVoidFunction)venus_CmdBindVertexBuffers2;
     if (strcmp(name, "vkCmdSetViewport") == 0)
         return (PFN_vkVoidFunction)venus_CmdSetViewport;
+    if (strcmp(name, "vkCmdSetViewportWithCount") == 0 ||
+        strcmp(name, "vkCmdSetViewportWithCountEXT") == 0)
+        return (PFN_vkVoidFunction)venus_CmdSetViewportWithCount;
     if (strcmp(name, "vkCmdSetScissor") == 0)
         return (PFN_vkVoidFunction)venus_CmdSetScissor;
+    if (strcmp(name, "vkCmdSetScissorWithCount") == 0 ||
+        strcmp(name, "vkCmdSetScissorWithCountEXT") == 0)
+        return (PFN_vkVoidFunction)venus_CmdSetScissorWithCount;
 
     /* W4.8 — clear-only fast path. */
     if (strcmp(name, "vkCmdClearColorImage") == 0)
         return (PFN_vkVoidFunction)venus_CmdClearColorImage;
+    if (strcmp(name, "vkCmdClearDepthStencilImage") == 0)
+        return (PFN_vkVoidFunction)venus_CmdClearDepthStencilImage;
+    if (strcmp(name, "vkCmdClearAttachments") == 0)
+        return (PFN_vkVoidFunction)venus_CmdClearAttachments;
+    if (strcmp(name, "vkCmdCopyBuffer") == 0)
+        return (PFN_vkVoidFunction)venus_CmdCopyBuffer;
+    if (strcmp(name, "vkCmdCopyBuffer2") == 0 ||
+        strcmp(name, "vkCmdCopyBuffer2KHR") == 0)
+        return (PFN_vkVoidFunction)venus_CmdCopyBuffer2;
+    if (strcmp(name, "vkCmdCopyBufferToImage") == 0)
+        return (PFN_vkVoidFunction)venus_CmdCopyBufferToImage;
+    if (strcmp(name, "vkCmdCopyBufferToImage2") == 0 ||
+        strcmp(name, "vkCmdCopyBufferToImage2KHR") == 0)
+        return (PFN_vkVoidFunction)venus_CmdCopyBufferToImage2;
+    if (strcmp(name, "vkCmdCopyImage") == 0)
+        return (PFN_vkVoidFunction)venus_CmdCopyImage;
+    if (strcmp(name, "vkCmdBlitImage") == 0)
+        return (PFN_vkVoidFunction)venus_CmdBlitImage;
+    if (strcmp(name, "vkCmdResolveImage") == 0)
+        return (PFN_vkVoidFunction)venus_CmdResolveImage;
+    if (strcmp(name, "vkCmdCopyImage2") == 0 ||
+        strcmp(name, "vkCmdCopyImage2KHR") == 0)
+        return (PFN_vkVoidFunction)venus_CmdCopyImage2;
+    if (strcmp(name, "vkCmdBlitImage2") == 0 ||
+        strcmp(name, "vkCmdBlitImage2KHR") == 0)
+        return (PFN_vkVoidFunction)venus_CmdBlitImage2;
+    if (strcmp(name, "vkCmdResolveImage2") == 0 ||
+        strcmp(name, "vkCmdResolveImage2KHR") == 0)
+        return (PFN_vkVoidFunction)venus_CmdResolveImage2;
+    if (strcmp(name, "vkCmdCopyImageToBuffer") == 0)
+        return (PFN_vkVoidFunction)venus_CmdCopyImageToBuffer;
+    if (strcmp(name, "vkCmdCopyImageToBuffer2") == 0 ||
+        strcmp(name, "vkCmdCopyImageToBuffer2KHR") == 0)
+        return (PFN_vkVoidFunction)venus_CmdCopyImageToBuffer2;
+    if (strcmp(name, "vkCmdPipelineBarrier") == 0)
+        return (PFN_vkVoidFunction)venus_CmdPipelineBarrier;
+    if (strcmp(name, "vkCmdPipelineBarrier2") == 0 ||
+        strcmp(name, "vkCmdPipelineBarrier2KHR") == 0)
+        return (PFN_vkVoidFunction)venus_CmdPipelineBarrier2;
+    if (strcmp(name, "vkCmdPushConstants") == 0)
+        return (PFN_vkVoidFunction)venus_CmdPushConstants;
 
     return NULL;
 }

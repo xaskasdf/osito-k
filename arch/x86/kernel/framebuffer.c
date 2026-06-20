@@ -7,6 +7,10 @@
 
 #include "../include/types.h"
 
+extern void serial_puts(const char *s);
+extern void serial_puthex(uint64_t val, int digits);
+extern void serial_putdec(uint64_t val);
+
 /* ── Framebuffer state ───────────────────────────────────────── */
 
 static uint32_t *fb_base;    /* active drawing target (shadow or vram) */
@@ -30,6 +34,14 @@ static uint32_t  dirty_bot;
 static bool      redirect_active;
 static uint32_t  fb_clear_clr = 0x00000000;  /* background fill color */
 
+/* Optional QEMU/virtio scanout mirror. Bare-metal builds keep running
+ * through GOP only when these weak symbols are absent. */
+extern bool      virtio_gpu_ready(void)      __attribute__((weak));
+extern uint32_t *virtio_gpu_get_fb(void)     __attribute__((weak));
+extern uint32_t  virtio_gpu_get_width(void)  __attribute__((weak));
+extern uint32_t  virtio_gpu_get_height(void) __attribute__((weak));
+extern void      virtio_gpu_flush(void)      __attribute__((weak));
+
 #define FONT_W  8
 #define FONT_H  16
 
@@ -48,6 +60,8 @@ static char  term_buf[TERM_BUF_ROWS][TERM_BUF_COLS];
 static int   term_cur_row;    /* current write row */
 static int   term_cur_col;    /* current write col */
 static int   term_total_rows; /* total rows written (for scrollback) */
+
+static void fb_flush_virtio_rows(uint32_t top, uint32_t bot);
 
 /* ── Public API ──────────────────────────────────────────────── */
 
@@ -87,12 +101,15 @@ void fb_flush(void)
     if (!fb_shadow || dirty_top >= dirty_bot) return;
     /* Clamp to framebuffer bounds */
     if (dirty_bot > fb_height) dirty_bot = fb_height;
+    uint32_t top = dirty_top;
+    uint32_t bot = dirty_bot;
     /* Copy dirty rows: use 64-bit writes for efficiency on WC memory */
-    uint64_t *dst = (uint64_t *)(fb_vram + dirty_top * fb_pitch);
-    uint64_t *src = (uint64_t *)(fb_shadow + dirty_top * fb_pitch);
-    uint32_t qwords = (dirty_bot - dirty_top) * fb_pitch / 2;
+    uint64_t *dst = (uint64_t *)(fb_vram + top * fb_pitch);
+    uint64_t *src = (uint64_t *)(fb_shadow + top * fb_pitch);
+    uint32_t qwords = (bot - top) * fb_pitch / 2;
     for (uint32_t i = 0; i < qwords; i++)
         dst[i] = src[i];
+    fb_flush_virtio_rows(top, bot);
     dirty_top = fb_height;
     dirty_bot = 0;
 }
@@ -106,12 +123,77 @@ void fb_flush_all(void)
     uint32_t qwords = fb_height * fb_pitch / 2;
     for (uint32_t i = 0; i < qwords; i++)
         dst[i] = src[i];
+    fb_flush_virtio_rows(0, fb_height);
 }
 
 static void fb_mark_dirty(uint32_t pixel_top, uint32_t pixel_bot)
 {
     if (pixel_top < dirty_top) dirty_top = pixel_top;
     if (pixel_bot > dirty_bot) dirty_bot = pixel_bot;
+}
+
+static void fb_flush_virtio_rows(uint32_t top, uint32_t bot)
+{
+    static uint64_t dbg_flush_count;
+
+    if (!virtio_gpu_ready || !virtio_gpu_get_fb || !virtio_gpu_get_width ||
+        !virtio_gpu_get_height || !virtio_gpu_flush) {
+        return;
+    }
+    if (!virtio_gpu_ready() || !fb_base) {
+        return;
+    }
+
+    uint32_t *dst = virtio_gpu_get_fb();
+    if (!dst) {
+        return;
+    }
+
+    uint32_t vw = virtio_gpu_get_width();
+    uint32_t vh = virtio_gpu_get_height();
+    if (!vw || !vh || top >= fb_height || top >= vh) {
+        return;
+    }
+    if (bot > fb_height) {
+        bot = fb_height;
+    }
+    if (bot > vh) {
+        bot = vh;
+    }
+    if (top >= bot) {
+        return;
+    }
+
+    uint32_t copy_w = fb_width < vw ? fb_width : vw;
+    for (uint32_t y = top; y < bot; y++) {
+        memcpy(dst + y * vw, fb_base + y * fb_pitch,
+               (uint64_t)copy_w * sizeof(uint32_t));
+    }
+
+    dbg_flush_count++;
+    if (dbg_flush_count <= 16 ||
+        (dbg_flush_count & (dbg_flush_count - 1)) == 0) {
+        uint32_t hash = 2166136261u;
+        uint32_t step_y = (bot - top) > 32 ? (bot - top) / 32 : 1;
+        uint32_t step_x = copy_w > 64 ? copy_w / 64 : 1;
+        for (uint32_t y = top; y < bot; y += step_y) {
+            for (uint32_t x = 0; x < copy_w; x += step_x) {
+                hash ^= dst[y * vw + x];
+                hash *= 16777619u;
+            }
+        }
+        serial_puts("[FBV] flush#");
+        serial_putdec(dbg_flush_count);
+        serial_puts(" rows=");
+        serial_putdec(top);
+        serial_puts("-");
+        serial_putdec(bot);
+        serial_puts(" hash=0x");
+        serial_puthex(hash, 8);
+        serial_puts("\n");
+    }
+
+    virtio_gpu_flush();
 }
 
 void fb_clear(void)
@@ -137,6 +219,7 @@ void fb_clear(void)
         for (uint32_t i = 0; i < qwords; i++)
             dst[i] = src[i];
     }
+    fb_flush_virtio_rows(0, fb_height);
     dirty_top = fb_height;
     dirty_bot = 0;
 }

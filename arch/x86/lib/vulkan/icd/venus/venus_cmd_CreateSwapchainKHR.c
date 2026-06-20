@@ -1,12 +1,10 @@
 /*
  * Encoder for vkCreateSwapchainKHR. Guest-local: allocate swapchain
  * slot, allocate image slots for each of the minImageCount images,
- * tag each image `is_swapchain_owned = 1`. The image has no bound
- * memory yet — the app is expected to `vkBindImageMemory` a
- * host-visible memory slot to each image AFTER vkGetSwapchainImagesKHR
- * + its own vkAllocateMemory. At bind time the memory slot is
- * upgraded to SHM-backed (see venus_cmd_BindImageMemory.c W3b.5
- * additions).
+ * tag each image `is_swapchain_owned = 1`, and pre-bind a CPU-visible
+ * SHM backbuffer. vkQueuePresentKHR copies that backbuffer into the
+ * compositor surface SHM and flips the surface; swapchain images do not
+ * create compositor windows themselves.
  *
  * Width/height/format come from pCreateInfo; we don't re-query the
  * surface because the surface already stored them at CreateSurface
@@ -25,16 +23,15 @@
 extern void *memset(void *, int, unsigned long);
 extern int   printf(const char *, ...);
 extern long  __syscall1(long, long);
-extern long  __syscall3(long, long, long, long);
+extern long  __syscall2(long, long, long);
 
 #define VENUS_H_SLOT_MASK_W3B5    0x0FFFull
+#define SYS_SHM_CREATE            500L
 #define SYS_SHM_MAP               501L
 #define SYS_SHM_DESTROY           503L
-#define SYS_SHM_MKSURFACE         506L
 #define SHM_FLAG_CPU_WRITE        (1L << 0)
 #define SHM_FLAG_CPU_READ         (1L << 1)
-#define SHM_FLAG_GPU_SCANOUT      (1L << 2)
-#define SHM_SURFACE_FLAGS         (SHM_FLAG_CPU_WRITE | SHM_FLAG_CPU_READ | SHM_FLAG_GPU_SCANOUT)
+#define SHM_IMAGE_FLAGS           (SHM_FLAG_CPU_WRITE | SHM_FLAG_CPU_READ)
 
 int venus_cmd_encode_CreateSwapchainKHR(
         struct venus_device *dev,
@@ -107,26 +104,23 @@ int venus_cmd_encode_CreateSwapchainKHR(
         img->is_swapchain_owned = 1;
         sc->image_slots[i] = img_slot;
 
-        /* W4.8: pre-bind a SHM-backed memory slot per swapchain image so
-         * Mesa+Zink callers don't have to vkBindImageMemory swapchain
-         * images explicitly (the WSI standard says swapchain images come
-         * pre-bound). vkCmdClearColorImage + vkQueueSubmit can then fill
-         * the SHM directly and vkQueuePresentKHR flips it. */
+        /* W4.8: pre-bind a CPU-visible SHM backbuffer per swapchain image.
+         * Do not create scanout surfaces here; the WSI compositor surface
+         * is the only visible target. */
         int mem_slot = -1;
         for (uint32_t j = 0; j < VENUS_MAX_MEM_OBJECTS; j++) {
             if (!dev->memories[j].in_use) { mem_slot = (int)j; break; }
         }
         if (mem_slot >= 0) {
-            long shm = __syscall3(SYS_SHM_MKSURFACE,
-                                  (long)sc->width, (long)sc->height,
-                                  SHM_SURFACE_FLAGS);
+            uint64_t bytes = (uint64_t)sc->width * (uint64_t)sc->height * 4u;
+            long shm = __syscall2(SYS_SHM_CREATE, (long)bytes, SHM_IMAGE_FLAGS);
             if (shm > 0) {
                 long mapped = __syscall1(SYS_SHM_MAP, shm);
                 if (mapped != 0) {
                     struct venus_memory *m = &dev->memories[mem_slot];
                     memset(m, 0, sizeof(*m));
                     m->in_use        = 1;
-                    m->size          = (uint64_t)sc->width * sc->height * 4u;
+                    m->size          = bytes;
                     m->local_ptr     = (void *)(uintptr_t)mapped;
                     m->is_shm_backed = 1;
                     m->shm_handle    = (uint32_t)shm;

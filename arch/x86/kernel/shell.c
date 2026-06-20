@@ -23,6 +23,8 @@ extern void fb_puts_color(const char *s, uint32_t color);
 extern void fb_putchar(char c);
 extern void fb_putdec(uint64_t val);
 extern void fb_clear(void);
+extern void console_screen_log_set(bool enabled);
+extern bool console_screen_log_is_enabled(void);
 
 /* Terminal */
 extern int  term_readline(const char *prompt, char *buf, uint32_t buf_size);
@@ -609,6 +611,8 @@ static void cmd_help(void)
     sh_puts("            (kupdate [host] [path] [--channel <ch>] [--no-kexec])\n");
     sh_puts("            default: https://wasm.naranjositos.tech/k/x86_64/stable/kernel.elf\n");
     sh_puts("  exec      Run an ELF binary\n");
+    sh_puts("  execg     Run an ELF with stdout/stderr kept off the framebuffer\n");
+    sh_puts("  screenlog Toggle stdout/stderr framebuffer logging (screenlog on|off)\n");
     sh_puts("  ping      Ping an IP address\n");
     sh_puts("  tcptest   TCP connection test (tcptest [ip] [port])\n");
     sh_puts("  resolve   DNS lookup (resolve hostname)\n");
@@ -1008,10 +1012,11 @@ static void cmd_cat(int argc, char *argv[])
 
 /* ── Builtin: exec ───────────────────────────────────────────── */
 
-static void cmd_exec(int argc, char *argv[])
+static void cmd_exec_common(int argc, char *argv[], bool screen_log)
 {
     if (argc < 2) {
-        sh_puts("Usage: exec <filename>\n");
+        sh_puts(screen_log ? "Usage: exec <filename>\n" :
+                             "Usage: execg <filename>\n");
         return;
     }
 
@@ -1027,16 +1032,53 @@ static void cmd_exec(int argc, char *argv[])
         return;
     }
 
-    sh_puts_color("Executing: ", 0x0000FF00);
-    sh_puts(argv[1]);
-    sh_puts("\n");
+    if (screen_log) {
+        sh_puts_color("Executing: ", 0x0000FF00);
+        sh_puts(argv[1]);
+        sh_puts("\n");
+    } else {
+        serial_puts("[execg] executing ");
+        serial_puts(argv[1]);
+        serial_puts(" with framebuffer console logging disabled\n");
+        console_screen_log_set(false);
+        fb_clear();
+    }
 
     int ret = proc_exec(argv[1], argc - 1, (const char **)(argv + 1));
+    if (!screen_log)
+        console_screen_log_set(true);
     if (ret != 0) {
         sh_puts_color("[exec] exited with code ", 0x00FF4444);
         sh_putdec((uint64_t)(ret < 0 ? (uint64_t)(-(int64_t)ret) : (uint64_t)ret));
         sh_puts("\n");
     }
+}
+
+static void cmd_exec(int argc, char *argv[])
+{
+    cmd_exec_common(argc, argv, true);
+}
+
+static void cmd_execg(int argc, char *argv[])
+{
+    cmd_exec_common(argc, argv, false);
+}
+
+static void cmd_screenlog(int argc, char *argv[])
+{
+    if (argc >= 2) {
+        if (strcmp(argv[1], "on") == 0) {
+            console_screen_log_set(true);
+        } else if (strcmp(argv[1], "off") == 0) {
+            console_screen_log_set(false);
+        } else {
+            sh_puts("Usage: screenlog [on|off]\n");
+            return;
+        }
+    }
+
+    sh_puts("screenlog: ");
+    sh_puts(console_screen_log_is_enabled() ? "on\n" : "off\n");
 }
 
 /* ── OFTP client (kdownload) ──────────────────────────────────────
@@ -4015,6 +4057,10 @@ void shell_exec(char *line)
         cmd_cat(argc, argv);
     } else if (strcmp(cmd, "exec") == 0) {
         cmd_exec(argc, argv);
+    } else if (strcmp(cmd, "execg") == 0) {
+        cmd_execg(argc, argv);
+    } else if (strcmp(cmd, "screenlog") == 0) {
+        cmd_screenlog(argc, argv);
     } else if (strcmp(cmd, "ifconfig") == 0) {
         extern uint8_t *net_get_ip_ptr(void);
         extern void net_get_mac(uint8_t mac[6]);

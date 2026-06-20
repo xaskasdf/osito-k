@@ -5,8 +5,10 @@
 #include "venus.h"
 
 extern void *memset(void *, int, unsigned long);
+extern long  __syscall1(long, long);
 
 #define VENUS_H_SLOT_MASK_W3B5    0x0FFFull
+#define SYS_SHM_UNMAP             502L
 
 int venus_cmd_encode_DestroySurface(struct venus_instance *inst,
                                     uint64_t handle) {
@@ -15,6 +17,8 @@ int venus_cmd_encode_DestroySurface(struct venus_instance *inst,
     if (slot < 0 || slot >= (int)VENUS_MAX_SURFACE_OBJECTS) return -22;
     struct venus_surface *s = &inst->surfaces[slot];
     if (!s->in_use) return 0;  /* idempotent */
+    if (s->target_ptr && s->shm_handle)
+        (void)__syscall1(SYS_SHM_UNMAP, (long)s->shm_handle);
     memset(s, 0, sizeof(*s));
     return 0;
 }

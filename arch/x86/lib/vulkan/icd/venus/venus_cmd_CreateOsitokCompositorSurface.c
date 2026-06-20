@@ -4,8 +4,9 @@
  * VK_OSITOK_compositor_surface is an OsitoK-proprietary WSI extension.
  * Surfaces are purely guest-local bookkeeping: no wire round-trip, no
  * host Vulkan surface object. The compositor window is the actual
- * presentation target; on `vkQueuePresentKHR` we call `SYS_GUI_FLIP`
- * against the SHM handle bound to the swapchain's current image.
+ * presentation target; on `vkQueuePresentKHR` we copy the selected
+ * swapchain image into this target SHM and call `SYS_GUI_FLIP` on the
+ * surface handle.
  *
  * This file provides the encoder-shaped API used by the ICD layer so
  * the calling convention mirrors W3b.4 encoders even though there is
@@ -23,12 +24,14 @@
 #include "venus_proto_core.h"
 
 extern void *memset(void *, int, unsigned long);
+extern long  __syscall1(long, long);
 
 /* Surface uses marker 0 so `(handle >> 48) & 0x0FFF` returns the
  * original slot. Other W3b.5 objects use the free 0x1..0x3 high nibbles. */
 #define VENUS_H_MARKER_SURFACE    0x0000000000000000ull
 #define VENUS_H_SLOT_MASK_W3B5    0x0FFFull
 #define VENUS_H_PTR_MASK_W3B5     0x0000FFFFFFFFFFFFull
+#define SYS_SHM_MAP               501L
 
 static int surface_slot_alloc(struct venus_instance *inst) {
     for (uint32_t i = 0; i < VENUS_MAX_SURFACE_OBJECTS; i++) {
@@ -42,7 +45,7 @@ static int surface_slot_alloc(struct venus_instance *inst) {
 
 int venus_cmd_encode_CreateOsitokCompositorSurface(
         struct venus_instance *inst,
-        uint32_t window_id, uint32_t width, uint32_t height,
+        uint32_t target_shm_handle, uint32_t width, uint32_t height,
         uint64_t *out_handle) {
     if (!inst || !out_handle) return -22;
 
@@ -50,9 +53,15 @@ int venus_cmd_encode_CreateOsitokCompositorSurface(
     if (slot < 0) return -12;  /* -ENOMEM */
 
     struct venus_surface *s = &inst->surfaces[slot];
-    s->window_id = window_id;
-    s->width     = width;
-    s->height    = height;
+    s->shm_handle = target_shm_handle;
+    s->width      = width;
+    s->height     = height;
+    s->target_ptr = 0;
+    if (s->shm_handle != 0) {
+        long mapped = __syscall1(SYS_SHM_MAP, (long)s->shm_handle);
+        if (mapped != 0)
+            s->target_ptr = (void *)(uintptr_t)mapped;
+    }
 
     uint64_t h = ((uint64_t)(uint32_t)slot & VENUS_H_SLOT_MASK_W3B5) << 48
                | ((uint64_t)(uintptr_t)inst & VENUS_H_PTR_MASK_W3B5)

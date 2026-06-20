@@ -19,10 +19,11 @@
  * SHM upgrade path (G5 integration):
  *   When vkBindImageMemory is called and the image is is_swapchain_owned,
  *   the memory slot's malloc-backed buffer (if any) is freed and a
- *   SYS_SHM_MKSURFACE surface is created in its place. The new mapped
+ *   CPU-visible SHM backbuffer is created in its place. The new mapped
  *   SHM pointer becomes m->local_ptr so that vkMapMemory continues to
- *   return the same pointer and the app can dump BGRA pixels into the
- *   compositor window buffer. We override (via --allow-multiple-definition
+ *   return the same pointer and the app can write BGRA pixels before
+ *   vkQueuePresentKHR copies them into the compositor surface. We override
+ *   (via --allow-multiple-definition
  *   at link time — same pattern W3b.4 uses) the W3b.4 BindImageMemory
  *   body to inject this upgrade.
  */
@@ -35,7 +36,7 @@ extern void  free(void *);
 extern int   printf(const char *, ...);
 extern void *memset(void *, int, unsigned long);
 extern long  __syscall1(long, long);
-extern long  __syscall3(long, long, long, long);
+extern long  __syscall2(long, long, long);
 
 /* ---- Forward decls for encoders (defined in sibling TUs). --- */
 extern int venus_cmd_encode_CreateOsitokCompositorSurface(
@@ -101,14 +102,13 @@ static inline int nd_handle_slot(uint64_t h) {
 }
 
 /* ---- Syscall constants. ---- */
+#define SYS_SHM_CREATE           500L
 #define SYS_SHM_MAP              501L
 #define SYS_SHM_UNMAP            502L
 #define SYS_SHM_DESTROY          503L
-#define SYS_SHM_MKSURFACE        506L
 #define SHM_FLAG_CPU_WRITE       (1L << 0)
 #define SHM_FLAG_CPU_READ        (1L << 1)
-#define SHM_FLAG_GPU_SCANOUT     (1L << 2)
-#define SHM_SURFACE_FLAGS        (SHM_FLAG_CPU_WRITE | SHM_FLAG_CPU_READ | SHM_FLAG_GPU_SCANOUT)
+#define SHM_IMAGE_FLAGS          (SHM_FLAG_CPU_WRITE | SHM_FLAG_CPU_READ)
 
 /* ---- Surface (instance-scoped). ---- */
 
@@ -122,24 +122,18 @@ venus_CreateOsitokCompositorSurfaceKHR(
     if (!instance || !pCreateInfo || !pSurface)
         return VK_ERROR_INITIALIZATION_FAILED;
     struct venus_instance *inst = (struct venus_instance *)instance;
-    /* The OsitoK extension uses `shmHandle` to carry a caller-provided
-     * window id OR an existing SHM handle. For W3b.5 we interpret it
-     * as an opaque window_id and create fresh SHM surfaces lazily at
-     * BindImageMemory time. Extent defaults come from the plan's
-     * VkOsitokCompositorSurfaceCreateInfo (initial_width/height); we
-     * encode a W3b.5-extended struct by padding after shmHandle. To
-     * stay ABI-compatible with the existing 1000710000 struct, we
-     * fall back to 512x512 if the caller passes the short form. */
-    uint32_t window_id = pCreateInfo->shmHandle;
-    uint32_t w = 512u, h = 512u;
+    /* DXVK passes the compositor target SHM handle here. Swapchain
+     * images are private backbuffers; Present copies into this target. */
+    uint32_t target_shm_handle = pCreateInfo->shmHandle;
+    uint32_t w = 1024u, h = 768u;
     /* Best-effort probe of the extended fields: if the pNext/flags
      * area fits a width/height appendix, honor it. Since the short
      * form only has {sType, pNext, flags, shmHandle} (32 bytes), any
      * caller wanting custom extent sets pNext to a VkExtent2D inside
-     * the same allocation. Skip parsing that for now — default 512. */
+     * the same allocation. Skip parsing that for now — default 1024x768. */
     uint64_t sh = 0;
     int rc = venus_cmd_encode_CreateOsitokCompositorSurface(
-            inst, window_id, w, h, &sh);
+            inst, target_shm_handle, w, h, &sh);
     if (rc != 0) return VK_ERROR_OUT_OF_HOST_MEMORY;
     *pSurface = (VkSurfaceKHR)sh;
     return VK_SUCCESS;
@@ -477,7 +471,8 @@ venus_BindImageMemory(VkDevice device, VkImage image, VkDeviceMemory memory,
     /* SHM upgrade for swapchain-owned images. */
     if (img->is_swapchain_owned && !m->is_shm_backed) {
         uint32_t w = img->width, h = img->height;
-        long shm = __syscall3(SYS_SHM_MKSURFACE, (long)w, (long)h, SHM_SURFACE_FLAGS);
+        uint64_t bytes = (uint64_t)w * (uint64_t)h * 4u;
+        long shm = __syscall2(SYS_SHM_CREATE, (long)bytes, SHM_IMAGE_FLAGS);
         if (shm > 0) {
             long mapped = __syscall1(SYS_SHM_MAP, shm);
             if (mapped != 0) {
@@ -489,6 +484,7 @@ venus_BindImageMemory(VkDevice device, VkImage image, VkDeviceMemory memory,
                 m->local_ptr     = (void *)(uintptr_t)mapped;
                 m->is_shm_backed = 1;
                 m->shm_handle    = (uint32_t)shm;
+                m->size          = bytes;
                 m->shm_width     = w;
                 m->shm_height    = h;
             } else {

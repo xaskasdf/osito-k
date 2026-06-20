@@ -16,6 +16,12 @@ extern void serial_putdec(uint64_t val);
 extern void *mem_alloc_aligned(uint64_t size, uint64_t alignment);
 extern void  paging_map_mmio(uint64_t phys, uint64_t size);
 extern uint64_t idt_get_ticks(void);
+extern uint32_t *fb_get_base(void)   __attribute__((weak));
+extern uint32_t  fb_get_width(void)  __attribute__((weak));
+extern uint32_t  fb_get_height(void) __attribute__((weak));
+extern uint32_t  fb_get_pitch(void)  __attribute__((weak));
+
+void virtio_gpu_flush(void);
 
 /* ── Virtio PCI Capability Types ──────────────────────────────── */
 #define VIRTIO_PCI_CAP_COMMON_CFG   1
@@ -176,6 +182,35 @@ static struct {
 } gpu;
 
 static spinlock_t gpu_cmd_lock = SPINLOCK_INIT;
+
+static void virtio_gpu_seed_from_boot_fb(void)
+{
+    if (!fb_get_base || !fb_get_width || !fb_get_height || !fb_get_pitch) {
+        return;
+    }
+
+    uint32_t *src = fb_get_base();
+    if (!src || !gpu.framebuffer || !gpu.width || !gpu.height) {
+        return;
+    }
+
+    uint32_t sw = fb_get_width();
+    uint32_t sh = fb_get_height();
+    uint32_t sp = fb_get_pitch();
+    if (!sw || !sh || !sp) {
+        return;
+    }
+
+    uint32_t copy_w = sw < gpu.width ? sw : gpu.width;
+    uint32_t copy_h = sh < gpu.height ? sh : gpu.height;
+    for (uint32_t y = 0; y < copy_h; y++) {
+        memcpy(gpu.framebuffer + y * gpu.width, src + y * sp,
+               (uint64_t)copy_w * sizeof(uint32_t));
+    }
+
+    serial_puts("[VIRTIO-GPU] Seeded scanout from boot framebuffer\n");
+    virtio_gpu_flush();
+}
 
 /* ── PCI Config Read via ECAM ─────────────────────────────────── */
 
@@ -669,7 +704,6 @@ void virtio_gpu_init(uint64_t ecam, uint8_t bus, uint8_t dev, uint8_t func,
 
     /* ── ATTACH BACKING MEMORY ────────────────────────────────── */
     uint64_t fb_size = (uint64_t)gpu.width * gpu.height * 4;
-    uint64_t fb_pages = (fb_size + 4095) / 4096;
     void *fb_raw = mem_alloc_aligned(fb_size, 4096);
     if (!fb_raw) { serial_puts("[VIRTIO-GPU] OOM for framebuffer\n"); return; }
     gpu.fb_phys = (uint64_t)fb_raw;  /* physical addr for DMA */
@@ -699,6 +733,7 @@ void virtio_gpu_init(uint64_t ecam, uint8_t bus, uint8_t dev, uint8_t func,
     gpu.scanout_active = false;
 
     gpu.initialized = true;
+    virtio_gpu_seed_from_boot_fb();
     serial_puts("[VIRTIO-GPU] ============================\n");
     serial_puts("[VIRTIO-GPU] Display initialized: ");
     serial_putdec(gpu.width); serial_puts("x");

@@ -45,6 +45,7 @@ extern void boot_diag_mark(const char *reason) __attribute__((weak));
 extern void fb_puts(const char *s);
 extern void fb_putc(char c, uint32_t color);
 extern void fb_putdec(uint64_t val);
+extern void fb_flush(void);
 
 /* Direct serial I/O (no relocation, no FB noise) */
 static inline void dbg_serial_char(char c) {
@@ -168,6 +169,13 @@ static inline void wrmsr(uint32_t msr, uint64_t val) {
 #define SYS_PREAD64     17
 #define SYS_PWRITE64    18
 #define SYS_SCHED_YIELD 24
+#define SYS_SCHED_SETPARAM 142
+#define SYS_SCHED_GETPARAM 143
+#define SYS_SCHED_SETSCHEDULER 144
+#define SYS_SCHED_GETSCHEDULER 145
+#define SYS_SCHED_GET_PRIORITY_MAX 146
+#define SYS_SCHED_GET_PRIORITY_MIN 147
+#define SYS_SCHED_RR_GET_INTERVAL 148
 #define SYS_NANOSLEEP   35
 #define SYS_GETPID      39
 #define SYS_CLONE       56
@@ -344,6 +352,17 @@ static uint32_t sig_pending;            /* bitmask of pending signals */
 static char    *capture_buf;
 static uint32_t capture_pos;
 static uint32_t capture_max;
+static bool console_screen_log_enabled = true;
+
+void console_screen_log_set(bool enabled)
+{
+    console_screen_log_enabled = enabled;
+}
+
+bool console_screen_log_is_enabled(void)
+{
+    return console_screen_log_enabled;
+}
 
 void syscall_capture_start(char *buf, uint32_t max_len)
 {
@@ -369,12 +388,19 @@ static ssize_t console_write(const void *buf, size_t count)
     const char *s = (const char *)buf;
     for (size_t i = 0; i < count; i++) {
         serial_putc(s[i]);
-        fb_putc(s[i], 0x00CCCCCC);
+        if (console_screen_log_enabled)
+            fb_putc(s[i], 0x00CCCCCC);
         if (capture_buf && capture_pos < capture_max - 1)
             capture_buf[capture_pos++] = s[i];
-        if ((i & 0xFFFF) == 0xFFFF && boot_diag_maybe_flush)
-            boot_diag_maybe_flush("console", 64 * 1024, 50);
+        if ((i & 0xFFFF) == 0xFFFF) {
+            if (console_screen_log_enabled)
+                fb_flush();
+            if (boot_diag_maybe_flush)
+                boot_diag_maybe_flush("console", 64 * 1024, 50);
+        }
     }
+    if (console_screen_log_enabled)
+        fb_flush();
     if (boot_diag_maybe_flush)
         boot_diag_maybe_flush("console", 64 * 1024, 100);
     return (ssize_t)count;
@@ -3964,6 +3990,25 @@ static int64_t __hot syscall_dispatch_inner(uint64_t nr, uint64_t a1, uint64_t a
     case SYS_WRITEV:     return sys_writev(a1, a2, a3);
     case SYS_ACCESS:     return sys_access(a1, a2);
     case SYS_SCHED_YIELD: return sys_sched_yield();
+    case SYS_SCHED_SETPARAM: return 0;  /* keep default SCHED_OTHER */
+    case SYS_SCHED_GETPARAM:
+        if (a2) *(int32_t *)a2 = 0;     /* struct sched_param.sched_priority */
+        return 0;
+    case SYS_SCHED_SETSCHEDULER:
+        return 0;                       /* accept as no-op */
+    case SYS_SCHED_GETSCHEDULER:
+        return 0;                       /* SCHED_OTHER */
+    case SYS_SCHED_GET_PRIORITY_MAX:
+        return (a1 == 1 || a1 == 2) ? 99 : 0; /* FIFO/RR vs normal */
+    case SYS_SCHED_GET_PRIORITY_MIN:
+        return (a1 == 1 || a1 == 2) ? 1 : 0;
+    case SYS_SCHED_RR_GET_INTERVAL:
+        if (a2) {
+            int64_t *ts = (int64_t *)a2;
+            ts[0] = 0;
+            ts[1] = 10000000;           /* 10 ms scheduler tick */
+        }
+        return 0;
     case SYS_PIPE:       return sys_pipe(a1);
     case SYS_DUP:        return sys_dup(a1);
     case SYS_DUP2:       return sys_dup2(a1, a2);

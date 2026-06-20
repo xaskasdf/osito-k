@@ -345,10 +345,12 @@ static void virtio_blit(const uint32_t *src)
     for (uint32_t y = 0; y < ch; y++)
         memcpy(dst + y * vw, src + y * disp.pitch, cw * 4);
 
-    /* Throttle: flush at most ~30fps to avoid overwhelming virtqueue */
+    /* Throttle after the first present. The initial blit must flush even
+     * during early boot, otherwise QEMU never receives SET_SCANOUT and the
+     * virtio window can stay black until a later SHM/GPU present. */
     static uint64_t last_flush_tick;
     uint64_t now = idt_get_ticks();
-    if (now - last_flush_tick >= 3) {  /* 100Hz ticks → ~33ms */
+    if (last_flush_tick == 0 || now - last_flush_tick >= 3) {
         virtio_gpu_flush();
         last_flush_tick = now;
     }

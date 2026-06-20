@@ -66,6 +66,10 @@ VKAPI_ATTR VkResult VKAPI_CALL vkMapMemory(
     VkDevice, VkDeviceMemory, VkDeviceSize, VkDeviceSize,
     VkMemoryMapFlags, void **);
 VKAPI_ATTR void VKAPI_CALL vkUnmapMemory(VkDevice, VkDeviceMemory);
+VKAPI_ATTR VkResult VKAPI_CALL vkFlushMappedMemoryRanges(
+    VkDevice, uint32_t, const VkMappedMemoryRange *);
+VKAPI_ATTR VkResult VKAPI_CALL vkInvalidateMappedMemoryRanges(
+    VkDevice, uint32_t, const VkMappedMemoryRange *);
 VKAPI_ATTR VkResult VKAPI_CALL vkCreateBuffer(
     VkDevice, const VkBufferCreateInfo *,
     const VkAllocationCallbacks *, VkBuffer *);
@@ -140,9 +144,14 @@ VKAPI_ATTR void VKAPI_CALL vkFreeCommandBuffers(
 VKAPI_ATTR VkResult VKAPI_CALL vkBeginCommandBuffer(
     VkCommandBuffer, const VkCommandBufferBeginInfo *);
 VKAPI_ATTR VkResult VKAPI_CALL vkEndCommandBuffer(VkCommandBuffer);
+VKAPI_ATTR VkResult VKAPI_CALL vkResetCommandBuffer(
+    VkCommandBuffer, VkCommandBufferResetFlags);
 VKAPI_ATTR void VKAPI_CALL vkCmdBeginRenderPass(
     VkCommandBuffer, const VkRenderPassBeginInfo *, VkSubpassContents);
 VKAPI_ATTR void VKAPI_CALL vkCmdEndRenderPass(VkCommandBuffer);
+VKAPI_ATTR void VKAPI_CALL vkCmdBeginRendering(
+    VkCommandBuffer, const VkRenderingInfo *);
+VKAPI_ATTR void VKAPI_CALL vkCmdEndRendering(VkCommandBuffer);
 VKAPI_ATTR void VKAPI_CALL vkCmdBindPipeline(
     VkCommandBuffer, VkPipelineBindPoint, VkPipeline);
 VKAPI_ATTR void VKAPI_CALL vkCmdDraw(
@@ -152,10 +161,18 @@ VKAPI_ATTR void VKAPI_CALL vkCmdDraw(
 VKAPI_ATTR void VKAPI_CALL vkCmdBindVertexBuffers(
     VkCommandBuffer, uint32_t, uint32_t,
     const VkBuffer *, const VkDeviceSize *);
+VKAPI_ATTR void VKAPI_CALL vkCmdBindVertexBuffers2(
+    VkCommandBuffer, uint32_t, uint32_t,
+    const VkBuffer *, const VkDeviceSize *,
+    const VkDeviceSize *, const VkDeviceSize *);
 VKAPI_ATTR void VKAPI_CALL vkCmdSetViewport(
     VkCommandBuffer, uint32_t, uint32_t, const VkViewport *);
+VKAPI_ATTR void VKAPI_CALL vkCmdSetViewportWithCount(
+    VkCommandBuffer, uint32_t, const VkViewport *);
 VKAPI_ATTR void VKAPI_CALL vkCmdSetScissor(
     VkCommandBuffer, uint32_t, uint32_t, const VkRect2D *);
+VKAPI_ATTR void VKAPI_CALL vkCmdSetScissorWithCount(
+    VkCommandBuffer, uint32_t, const VkRect2D *);
 
 /* W3b.5 — WSI + surface + swapchain + queue + sync + present. */
 VKAPI_ATTR VkResult VKAPI_CALL vkCreateOsitokCompositorSurfaceKHR(
@@ -319,15 +336,40 @@ VKAPI_ATTR void     VKAPI_CALL vkCmdBindIndexBuffer(
     VkCommandBuffer, VkBuffer, VkDeviceSize, VkIndexType);
 VKAPI_ATTR void     VKAPI_CALL vkCmdCopyBuffer(
     VkCommandBuffer, VkBuffer, VkBuffer, uint32_t, const VkBufferCopy *);
+VKAPI_ATTR void     VKAPI_CALL vkCmdCopyBuffer2(
+    VkCommandBuffer, const VkCopyBufferInfo2 *);
 VKAPI_ATTR void     VKAPI_CALL vkCmdCopyBufferToImage(
     VkCommandBuffer, VkBuffer, VkImage, VkImageLayout,
     uint32_t, const VkBufferImageCopy *);
+VKAPI_ATTR void     VKAPI_CALL vkCmdCopyBufferToImage2(
+    VkCommandBuffer, const VkCopyBufferToImageInfo2 *);
 VKAPI_ATTR void     VKAPI_CALL vkCmdCopyImage(
     VkCommandBuffer, VkImage, VkImageLayout, VkImage, VkImageLayout,
     uint32_t, const VkImageCopy *);
+VKAPI_ATTR void     VKAPI_CALL vkCmdBlitImage(
+    VkCommandBuffer, VkImage, VkImageLayout, VkImage, VkImageLayout,
+    uint32_t, const VkImageBlit *, VkFilter);
+VKAPI_ATTR void     VKAPI_CALL vkCmdResolveImage(
+    VkCommandBuffer, VkImage, VkImageLayout, VkImage, VkImageLayout,
+    uint32_t, const VkImageResolve *);
+VKAPI_ATTR void     VKAPI_CALL vkCmdCopyImage2(
+    VkCommandBuffer, const VkCopyImageInfo2 *);
+VKAPI_ATTR void     VKAPI_CALL vkCmdBlitImage2(
+    VkCommandBuffer, const VkBlitImageInfo2 *);
+VKAPI_ATTR void     VKAPI_CALL vkCmdResolveImage2(
+    VkCommandBuffer, const VkResolveImageInfo2 *);
 VKAPI_ATTR void     VKAPI_CALL vkCmdCopyImageToBuffer(
     VkCommandBuffer, VkImage, VkImageLayout, VkBuffer,
     uint32_t, const VkBufferImageCopy *);
+VKAPI_ATTR void     VKAPI_CALL vkCmdCopyImageToBuffer2(
+    VkCommandBuffer, const VkCopyImageToBufferInfo2 *);
+VKAPI_ATTR void     VKAPI_CALL vkCmdClearDepthStencilImage(
+    VkCommandBuffer, VkImage, VkImageLayout,
+    const VkClearDepthStencilValue *, uint32_t,
+    const VkImageSubresourceRange *);
+VKAPI_ATTR void     VKAPI_CALL vkCmdClearAttachments(
+    VkCommandBuffer, uint32_t, const VkClearAttachment *,
+    uint32_t, const VkClearRect *);
 VKAPI_ATTR void     VKAPI_CALL vkCmdDispatch(
     VkCommandBuffer, uint32_t, uint32_t, uint32_t);
 VKAPI_ATTR void     VKAPI_CALL vkCmdDispatchIndirect(
@@ -338,6 +380,12 @@ VKAPI_ATTR void     VKAPI_CALL vkCmdDrawIndexedIndirect(
     VkCommandBuffer, VkBuffer, VkDeviceSize, uint32_t, uint32_t);
 VKAPI_ATTR void     VKAPI_CALL vkCmdDrawIndirect(
     VkCommandBuffer, VkBuffer, VkDeviceSize, uint32_t, uint32_t);
+VKAPI_ATTR void     VKAPI_CALL vkCmdDrawIndirectCount(
+    VkCommandBuffer, VkBuffer, VkDeviceSize, VkBuffer, VkDeviceSize,
+    uint32_t, uint32_t);
+VKAPI_ATTR void     VKAPI_CALL vkCmdDrawIndexedIndirectCount(
+    VkCommandBuffer, VkBuffer, VkDeviceSize, VkBuffer, VkDeviceSize,
+    uint32_t, uint32_t);
 VKAPI_ATTR void     VKAPI_CALL vkCmdFillBuffer(
     VkCommandBuffer, VkBuffer, VkDeviceSize, VkDeviceSize, uint32_t);
 VKAPI_ATTR void     VKAPI_CALL vkCmdNextSubpass(
@@ -348,6 +396,11 @@ VKAPI_ATTR void     VKAPI_CALL vkCmdPipelineBarrier(
     uint32_t, const VkMemoryBarrier *,
     uint32_t, const VkBufferMemoryBarrier *,
     uint32_t, const VkImageMemoryBarrier *);
+VKAPI_ATTR void     VKAPI_CALL vkCmdPipelineBarrier2(
+    VkCommandBuffer, const VkDependencyInfo *);
+VKAPI_ATTR void     VKAPI_CALL vkCmdPushConstants(
+    VkCommandBuffer, VkPipelineLayout, VkShaderStageFlags,
+    uint32_t, uint32_t, const void *);
 VKAPI_ATTR void     VKAPI_CALL vkCmdResetEvent(
     VkCommandBuffer, VkEvent, VkPipelineStageFlags);
 VKAPI_ATTR void     VKAPI_CALL vkCmdSetBlendConstants(
@@ -437,6 +490,10 @@ osito_loader_get_instance_proc_addr(VkInstance instance, const char *pName) {
         return (PFN_vkVoidFunction)vkMapMemory;
     if (strcmp(pName, "vkUnmapMemory") == 0)
         return (PFN_vkVoidFunction)vkUnmapMemory;
+    if (strcmp(pName, "vkFlushMappedMemoryRanges") == 0)
+        return (PFN_vkVoidFunction)vkFlushMappedMemoryRanges;
+    if (strcmp(pName, "vkInvalidateMappedMemoryRanges") == 0)
+        return (PFN_vkVoidFunction)vkInvalidateMappedMemoryRanges;
     if (strcmp(pName, "vkCreateBuffer") == 0)
         return (PFN_vkVoidFunction)vkCreateBuffer;
     if (strcmp(pName, "vkDestroyBuffer") == 0)
@@ -503,10 +560,18 @@ osito_loader_get_instance_proc_addr(VkInstance instance, const char *pName) {
         return (PFN_vkVoidFunction)vkBeginCommandBuffer;
     if (strcmp(pName, "vkEndCommandBuffer") == 0)
         return (PFN_vkVoidFunction)vkEndCommandBuffer;
+    if (strcmp(pName, "vkResetCommandBuffer") == 0)
+        return (PFN_vkVoidFunction)vkResetCommandBuffer;
     if (strcmp(pName, "vkCmdBeginRenderPass") == 0)
         return (PFN_vkVoidFunction)vkCmdBeginRenderPass;
     if (strcmp(pName, "vkCmdEndRenderPass") == 0)
         return (PFN_vkVoidFunction)vkCmdEndRenderPass;
+    if (strcmp(pName, "vkCmdBeginRendering") == 0 ||
+        strcmp(pName, "vkCmdBeginRenderingKHR") == 0)
+        return (PFN_vkVoidFunction)vkCmdBeginRendering;
+    if (strcmp(pName, "vkCmdEndRendering") == 0 ||
+        strcmp(pName, "vkCmdEndRenderingKHR") == 0)
+        return (PFN_vkVoidFunction)vkCmdEndRendering;
     if (strcmp(pName, "vkCmdBindPipeline") == 0)
         return (PFN_vkVoidFunction)vkCmdBindPipeline;
     if (strcmp(pName, "vkCmdDraw") == 0)
@@ -515,10 +580,19 @@ osito_loader_get_instance_proc_addr(VkInstance instance, const char *pName) {
     /* W3b.6 — vertex input + dynamic state. */
     if (strcmp(pName, "vkCmdBindVertexBuffers") == 0)
         return (PFN_vkVoidFunction)vkCmdBindVertexBuffers;
+    if (strcmp(pName, "vkCmdBindVertexBuffers2") == 0 ||
+        strcmp(pName, "vkCmdBindVertexBuffers2EXT") == 0)
+        return (PFN_vkVoidFunction)vkCmdBindVertexBuffers2;
     if (strcmp(pName, "vkCmdSetViewport") == 0)
         return (PFN_vkVoidFunction)vkCmdSetViewport;
+    if (strcmp(pName, "vkCmdSetViewportWithCount") == 0 ||
+        strcmp(pName, "vkCmdSetViewportWithCountEXT") == 0)
+        return (PFN_vkVoidFunction)vkCmdSetViewportWithCount;
     if (strcmp(pName, "vkCmdSetScissor") == 0)
         return (PFN_vkVoidFunction)vkCmdSetScissor;
+    if (strcmp(pName, "vkCmdSetScissorWithCount") == 0 ||
+        strcmp(pName, "vkCmdSetScissorWithCountEXT") == 0)
+        return (PFN_vkVoidFunction)vkCmdSetScissorWithCount;
 
     /* W3b.5 additions — WSI + surface + swapchain + queue + sync. */
     if (strcmp(pName, "vkCreateOsitokCompositorSurfaceKHR") == 0)
@@ -674,12 +748,38 @@ osito_loader_get_instance_proc_addr(VkInstance instance, const char *pName) {
         return (PFN_vkVoidFunction)vkCmdBindIndexBuffer;
     if (strcmp(pName, "vkCmdCopyBuffer") == 0)
         return (PFN_vkVoidFunction)vkCmdCopyBuffer;
+    if (strcmp(pName, "vkCmdCopyBuffer2") == 0 ||
+        strcmp(pName, "vkCmdCopyBuffer2KHR") == 0)
+        return (PFN_vkVoidFunction)vkCmdCopyBuffer2;
     if (strcmp(pName, "vkCmdCopyBufferToImage") == 0)
         return (PFN_vkVoidFunction)vkCmdCopyBufferToImage;
+    if (strcmp(pName, "vkCmdCopyBufferToImage2") == 0 ||
+        strcmp(pName, "vkCmdCopyBufferToImage2KHR") == 0)
+        return (PFN_vkVoidFunction)vkCmdCopyBufferToImage2;
     if (strcmp(pName, "vkCmdCopyImage") == 0)
         return (PFN_vkVoidFunction)vkCmdCopyImage;
+    if (strcmp(pName, "vkCmdBlitImage") == 0)
+        return (PFN_vkVoidFunction)vkCmdBlitImage;
+    if (strcmp(pName, "vkCmdResolveImage") == 0)
+        return (PFN_vkVoidFunction)vkCmdResolveImage;
+    if (strcmp(pName, "vkCmdCopyImage2") == 0 ||
+        strcmp(pName, "vkCmdCopyImage2KHR") == 0)
+        return (PFN_vkVoidFunction)vkCmdCopyImage2;
+    if (strcmp(pName, "vkCmdBlitImage2") == 0 ||
+        strcmp(pName, "vkCmdBlitImage2KHR") == 0)
+        return (PFN_vkVoidFunction)vkCmdBlitImage2;
+    if (strcmp(pName, "vkCmdResolveImage2") == 0 ||
+        strcmp(pName, "vkCmdResolveImage2KHR") == 0)
+        return (PFN_vkVoidFunction)vkCmdResolveImage2;
     if (strcmp(pName, "vkCmdCopyImageToBuffer") == 0)
         return (PFN_vkVoidFunction)vkCmdCopyImageToBuffer;
+    if (strcmp(pName, "vkCmdCopyImageToBuffer2") == 0 ||
+        strcmp(pName, "vkCmdCopyImageToBuffer2KHR") == 0)
+        return (PFN_vkVoidFunction)vkCmdCopyImageToBuffer2;
+    if (strcmp(pName, "vkCmdClearDepthStencilImage") == 0)
+        return (PFN_vkVoidFunction)vkCmdClearDepthStencilImage;
+    if (strcmp(pName, "vkCmdClearAttachments") == 0)
+        return (PFN_vkVoidFunction)vkCmdClearAttachments;
     if (strcmp(pName, "vkCmdDispatch") == 0)
         return (PFN_vkVoidFunction)vkCmdDispatch;
     if (strcmp(pName, "vkCmdDispatchIndirect") == 0)
@@ -690,12 +790,25 @@ osito_loader_get_instance_proc_addr(VkInstance instance, const char *pName) {
         return (PFN_vkVoidFunction)vkCmdDrawIndexedIndirect;
     if (strcmp(pName, "vkCmdDrawIndirect") == 0)
         return (PFN_vkVoidFunction)vkCmdDrawIndirect;
+    if (strcmp(pName, "vkCmdDrawIndirectCount") == 0 ||
+        strcmp(pName, "vkCmdDrawIndirectCountKHR") == 0 ||
+        strcmp(pName, "vkCmdDrawIndirectCountAMD") == 0)
+        return (PFN_vkVoidFunction)vkCmdDrawIndirectCount;
+    if (strcmp(pName, "vkCmdDrawIndexedIndirectCount") == 0 ||
+        strcmp(pName, "vkCmdDrawIndexedIndirectCountKHR") == 0 ||
+        strcmp(pName, "vkCmdDrawIndexedIndirectCountAMD") == 0)
+        return (PFN_vkVoidFunction)vkCmdDrawIndexedIndirectCount;
     if (strcmp(pName, "vkCmdFillBuffer") == 0)
         return (PFN_vkVoidFunction)vkCmdFillBuffer;
     if (strcmp(pName, "vkCmdNextSubpass") == 0)
         return (PFN_vkVoidFunction)vkCmdNextSubpass;
     if (strcmp(pName, "vkCmdPipelineBarrier") == 0)
         return (PFN_vkVoidFunction)vkCmdPipelineBarrier;
+    if (strcmp(pName, "vkCmdPipelineBarrier2") == 0 ||
+        strcmp(pName, "vkCmdPipelineBarrier2KHR") == 0)
+        return (PFN_vkVoidFunction)vkCmdPipelineBarrier2;
+    if (strcmp(pName, "vkCmdPushConstants") == 0)
+        return (PFN_vkVoidFunction)vkCmdPushConstants;
     if (strcmp(pName, "vkCmdResetEvent") == 0)
         return (PFN_vkVoidFunction)vkCmdResetEvent;
     if (strcmp(pName, "vkCmdSetBlendConstants") == 0)
@@ -1193,6 +1306,51 @@ vkUnmapMemory(VkDevice device, VkDeviceMemory memory) {
     PFN_vkUnmapMemory fn = (PFN_vkUnmapMemory)
         ci->icd->get_proc_addr(ci->handle, "vkUnmapMemory");
     if (fn) fn(dw->real, mw->real);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+vkFlushMappedMemoryRanges(VkDevice device, uint32_t memoryRangeCount,
+                          const VkMappedMemoryRange *pMemoryRanges) {
+    if (!device) return VK_ERROR_INITIALIZATION_FAILED;
+    if (memoryRangeCount && !pMemoryRanges) return VK_ERROR_INITIALIZATION_FAILED;
+    struct osito_device *dw = osito_device_from(device);
+    struct osito_icd_inst *ci = dw->owner;
+    if (!ci) return VK_SUCCESS;
+    PFN_vkFlushMappedMemoryRanges fn = (PFN_vkFlushMappedMemoryRanges)
+        ci->icd->get_proc_addr(ci->handle, "vkFlushMappedMemoryRanges");
+    if (!fn) return VK_SUCCESS;
+#define OSITO_MAPPED_RANGE_MAX 16u
+    VkMappedMemoryRange locals[OSITO_MAPPED_RANGE_MAX];
+    uint32_t n = memoryRangeCount;
+    if (n > OSITO_MAPPED_RANGE_MAX) n = OSITO_MAPPED_RANGE_MAX;
+    for (uint32_t i = 0; i < n; i++) {
+        locals[i] = pMemoryRanges[i];
+        if (locals[i].memory)
+            locals[i].memory = mem_from(locals[i].memory)->real;
+    }
+    return fn(dw->real, n, n ? locals : NULL);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+vkInvalidateMappedMemoryRanges(VkDevice device, uint32_t memoryRangeCount,
+                               const VkMappedMemoryRange *pMemoryRanges) {
+    if (!device) return VK_ERROR_INITIALIZATION_FAILED;
+    if (memoryRangeCount && !pMemoryRanges) return VK_ERROR_INITIALIZATION_FAILED;
+    struct osito_device *dw = osito_device_from(device);
+    struct osito_icd_inst *ci = dw->owner;
+    if (!ci) return VK_SUCCESS;
+    PFN_vkInvalidateMappedMemoryRanges fn = (PFN_vkInvalidateMappedMemoryRanges)
+        ci->icd->get_proc_addr(ci->handle, "vkInvalidateMappedMemoryRanges");
+    if (!fn) return VK_SUCCESS;
+    VkMappedMemoryRange locals[OSITO_MAPPED_RANGE_MAX];
+    uint32_t n = memoryRangeCount;
+    if (n > OSITO_MAPPED_RANGE_MAX) n = OSITO_MAPPED_RANGE_MAX;
+    for (uint32_t i = 0; i < n; i++) {
+        locals[i] = pMemoryRanges[i];
+        if (locals[i].memory)
+            locals[i].memory = mem_from(locals[i].memory)->real;
+    }
+    return fn(dw->real, n, n ? locals : NULL);
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL
@@ -1873,6 +2031,19 @@ vkEndCommandBuffer(VkCommandBuffer cb) {
     if (!fn) return VK_ERROR_INITIALIZATION_FAILED;
     return fn(w->real);
 }
+
+VKAPI_ATTR VkResult VKAPI_CALL
+vkResetCommandBuffer(VkCommandBuffer cb, VkCommandBufferResetFlags flags) {
+    if (!cb) return VK_ERROR_INITIALIZATION_FAILED;
+    struct osito_cmd_buffer *w = (struct osito_cmd_buffer *)cb;
+    struct osito_icd_inst *ci = w->owner ? w->owner->owner : 0;
+    if (!ci) return VK_SUCCESS;
+    PFN_vkResetCommandBuffer fn = (PFN_vkResetCommandBuffer)
+        ci->icd->get_proc_addr(ci->handle, "vkResetCommandBuffer");
+    if (!fn) return VK_SUCCESS;
+    return fn(w->real, flags);
+}
+
 VKAPI_ATTR void VKAPI_CALL
 vkCmdBeginRenderPass(VkCommandBuffer cb,
                      const VkRenderPassBeginInfo *pBegin,
@@ -1899,6 +2070,77 @@ vkCmdEndRenderPass(VkCommandBuffer cb) {
         ci->icd->get_proc_addr(ci->handle, "vkCmdEndRenderPass");
     if (fn) fn(w->real);
 }
+
+VKAPI_ATTR void VKAPI_CALL
+vkCmdBeginRendering(VkCommandBuffer cb, const VkRenderingInfo *pRenderingInfo) {
+    if (!cb || !pRenderingInfo) return;
+    struct osito_cmd_buffer *w = (struct osito_cmd_buffer *)cb;
+    struct osito_icd_inst *ci = w->owner ? w->owner->owner : 0;
+    if (!ci) return;
+    PFN_vkCmdBeginRendering fn = (PFN_vkCmdBeginRendering)
+        ci->icd->get_proc_addr(ci->handle, "vkCmdBeginRendering");
+    if (!fn) {
+        fn = (PFN_vkCmdBeginRendering)
+            ci->icd->get_proc_addr(ci->handle, "vkCmdBeginRenderingKHR");
+    }
+    if (!fn) return;
+
+    VkRenderingInfo tmp = *pRenderingInfo;
+#define OSITO_RENDERING_COLOR_MAX 8u
+    VkRenderingAttachmentInfo colors[OSITO_RENDERING_COLOR_MAX];
+    if (tmp.pColorAttachments && tmp.colorAttachmentCount) {
+        uint32_t n = tmp.colorAttachmentCount;
+        if (n > OSITO_RENDERING_COLOR_MAX) n = OSITO_RENDERING_COLOR_MAX;
+        for (uint32_t i = 0; i < n; i++) {
+            colors[i] = tmp.pColorAttachments[i];
+            if (colors[i].imageView)
+                colors[i].imageView = iv_from(colors[i].imageView)->real;
+            if (colors[i].resolveImageView)
+                colors[i].resolveImageView =
+                    iv_from(colors[i].resolveImageView)->real;
+        }
+        tmp.colorAttachmentCount = n;
+        tmp.pColorAttachments = colors;
+    }
+
+    VkRenderingAttachmentInfo depth;
+    if (tmp.pDepthAttachment) {
+        depth = *tmp.pDepthAttachment;
+        if (depth.imageView)
+            depth.imageView = iv_from(depth.imageView)->real;
+        if (depth.resolveImageView)
+            depth.resolveImageView = iv_from(depth.resolveImageView)->real;
+        tmp.pDepthAttachment = &depth;
+    }
+
+    VkRenderingAttachmentInfo stencil;
+    if (tmp.pStencilAttachment) {
+        stencil = *tmp.pStencilAttachment;
+        if (stencil.imageView)
+            stencil.imageView = iv_from(stencil.imageView)->real;
+        if (stencil.resolveImageView)
+            stencil.resolveImageView = iv_from(stencil.resolveImageView)->real;
+        tmp.pStencilAttachment = &stencil;
+    }
+
+    fn(w->real, &tmp);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+vkCmdEndRendering(VkCommandBuffer cb) {
+    if (!cb) return;
+    struct osito_cmd_buffer *w = (struct osito_cmd_buffer *)cb;
+    struct osito_icd_inst *ci = w->owner ? w->owner->owner : 0;
+    if (!ci) return;
+    PFN_vkCmdEndRendering fn = (PFN_vkCmdEndRendering)
+        ci->icd->get_proc_addr(ci->handle, "vkCmdEndRendering");
+    if (!fn) {
+        fn = (PFN_vkCmdEndRendering)
+            ci->icd->get_proc_addr(ci->handle, "vkCmdEndRenderingKHR");
+    }
+    if (fn) fn(w->real);
+}
+
 VKAPI_ATTR void VKAPI_CALL
 vkCmdBindPipeline(VkCommandBuffer cb, VkPipelineBindPoint bp, VkPipeline pipeline) {
     if (!cb) return;
@@ -1951,6 +2193,35 @@ vkCmdBindVertexBuffers(VkCommandBuffer cb, uint32_t firstBinding,
 }
 
 VKAPI_ATTR void VKAPI_CALL
+vkCmdBindVertexBuffers2(VkCommandBuffer cb, uint32_t firstBinding,
+                        uint32_t bindingCount, const VkBuffer *pBuffers,
+                        const VkDeviceSize *pOffsets,
+                        const VkDeviceSize *pSizes,
+                        const VkDeviceSize *pStrides) {
+    if (!cb || !pBuffers) return;
+    struct osito_cmd_buffer *w = (struct osito_cmd_buffer *)cb;
+    struct osito_icd_inst *ci = w->owner ? w->owner->owner : 0;
+    if (!ci) return;
+    PFN_vkCmdBindVertexBuffers2 fn = (PFN_vkCmdBindVertexBuffers2)
+        ci->icd->get_proc_addr(ci->handle, "vkCmdBindVertexBuffers2");
+    if (!fn) {
+        fn = (PFN_vkCmdBindVertexBuffers2)
+            ci->icd->get_proc_addr(ci->handle, "vkCmdBindVertexBuffers2EXT");
+    }
+    if (!fn) {
+        vkCmdBindVertexBuffers(cb, firstBinding, bindingCount,
+                               pBuffers, pOffsets);
+        return;
+    }
+    VkBuffer real_bufs[8];
+    uint32_t n = bindingCount;
+    if (n > 8u) n = 8u;
+    for (uint32_t i = 0; i < n; i++)
+        real_bufs[i] = pBuffers[i] ? buf_from(pBuffers[i])->real : 0;
+    fn(w->real, firstBinding, n, real_bufs, pOffsets, pSizes, pStrides);
+}
+
+VKAPI_ATTR void VKAPI_CALL
 vkCmdSetViewport(VkCommandBuffer cb, uint32_t firstViewport,
                  uint32_t viewportCount, const VkViewport *pViewports) {
     if (!cb) return;
@@ -1964,6 +2235,23 @@ vkCmdSetViewport(VkCommandBuffer cb, uint32_t firstViewport,
 }
 
 VKAPI_ATTR void VKAPI_CALL
+vkCmdSetViewportWithCount(VkCommandBuffer cb, uint32_t viewportCount,
+                          const VkViewport *pViewports) {
+    if (!cb) return;
+    struct osito_cmd_buffer *w = (struct osito_cmd_buffer *)cb;
+    struct osito_icd_inst *ci = w->owner ? w->owner->owner : 0;
+    if (!ci) return;
+    PFN_vkCmdSetViewportWithCount fn = (PFN_vkCmdSetViewportWithCount)
+        ci->icd->get_proc_addr(ci->handle, "vkCmdSetViewportWithCount");
+    if (!fn) {
+        fn = (PFN_vkCmdSetViewportWithCount)
+            ci->icd->get_proc_addr(ci->handle, "vkCmdSetViewportWithCountEXT");
+    }
+    if (fn) fn(w->real, viewportCount, pViewports);
+    else vkCmdSetViewport(cb, 0, viewportCount, pViewports);
+}
+
+VKAPI_ATTR void VKAPI_CALL
 vkCmdSetScissor(VkCommandBuffer cb, uint32_t firstScissor,
                 uint32_t scissorCount, const VkRect2D *pScissors) {
     if (!cb) return;
@@ -1974,6 +2262,23 @@ vkCmdSetScissor(VkCommandBuffer cb, uint32_t firstScissor,
         ci->icd->get_proc_addr(ci->handle, "vkCmdSetScissor");
     if (!fn) return;
     fn(w->real, firstScissor, scissorCount, pScissors);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+vkCmdSetScissorWithCount(VkCommandBuffer cb, uint32_t scissorCount,
+                         const VkRect2D *pScissors) {
+    if (!cb) return;
+    struct osito_cmd_buffer *w = (struct osito_cmd_buffer *)cb;
+    struct osito_icd_inst *ci = w->owner ? w->owner->owner : 0;
+    if (!ci) return;
+    PFN_vkCmdSetScissorWithCount fn = (PFN_vkCmdSetScissorWithCount)
+        ci->icd->get_proc_addr(ci->handle, "vkCmdSetScissorWithCount");
+    if (!fn) {
+        fn = (PFN_vkCmdSetScissorWithCount)
+            ci->icd->get_proc_addr(ci->handle, "vkCmdSetScissorWithCountEXT");
+    }
+    if (fn) fn(w->real, scissorCount, pScissors);
+    else vkCmdSetScissor(cb, 0, scissorCount, pScissors);
 }
 
 /* ---------------- W3b.5 trampolines ---------------------------------------
@@ -3725,6 +4030,23 @@ vkCmdCopyBuffer(VkCommandBuffer cb, VkBuffer src, VkBuffer dst,
 }
 
 VKAPI_ATTR void VKAPI_CALL
+vkCmdCopyBuffer2(VkCommandBuffer cb, const VkCopyBufferInfo2 *pInfo) {
+    OSITO_CB_PROLOG(return);
+    if (!pInfo) return;
+    PFN_vkCmdCopyBuffer2 fn = (PFN_vkCmdCopyBuffer2)
+        ci->icd->get_proc_addr(ci->handle, "vkCmdCopyBuffer2");
+    if (!fn) {
+        fn = (PFN_vkCmdCopyBuffer2)
+            ci->icd->get_proc_addr(ci->handle, "vkCmdCopyBuffer2KHR");
+    }
+    if (!fn) return;
+    VkCopyBufferInfo2 tmp = *pInfo;
+    if (tmp.srcBuffer) tmp.srcBuffer = buf_from(tmp.srcBuffer)->real;
+    if (tmp.dstBuffer) tmp.dstBuffer = buf_from(tmp.dstBuffer)->real;
+    fn(w->real, &tmp);
+}
+
+VKAPI_ATTR void VKAPI_CALL
 vkCmdCopyBufferToImage(VkCommandBuffer cb, VkBuffer src, VkImage dst,
                        VkImageLayout dstLayout, uint32_t regionCount,
                        const VkBufferImageCopy *pRegions) {
@@ -3735,6 +4057,24 @@ vkCmdCopyBufferToImage(VkCommandBuffer cb, VkBuffer src, VkImage dst,
     VkBuffer real_b = src ? buf_from(src)->real : 0;
     VkImage  real_i = dst ? img_from(dst)->real : 0;
     fn(w->real, real_b, real_i, dstLayout, regionCount, pRegions);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+vkCmdCopyBufferToImage2(VkCommandBuffer cb,
+                        const VkCopyBufferToImageInfo2 *pInfo) {
+    OSITO_CB_PROLOG(return);
+    if (!pInfo) return;
+    PFN_vkCmdCopyBufferToImage2 fn = (PFN_vkCmdCopyBufferToImage2)
+        ci->icd->get_proc_addr(ci->handle, "vkCmdCopyBufferToImage2");
+    if (!fn) {
+        fn = (PFN_vkCmdCopyBufferToImage2)
+            ci->icd->get_proc_addr(ci->handle, "vkCmdCopyBufferToImage2KHR");
+    }
+    if (!fn) return;
+    VkCopyBufferToImageInfo2 tmp = *pInfo;
+    if (tmp.srcBuffer) tmp.srcBuffer = buf_from(tmp.srcBuffer)->real;
+    if (tmp.dstImage) tmp.dstImage = img_from(tmp.dstImage)->real;
+    fn(w->real, &tmp);
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -3751,6 +4091,85 @@ vkCmdCopyImage(VkCommandBuffer cb, VkImage src, VkImageLayout srcLayout,
 }
 
 VKAPI_ATTR void VKAPI_CALL
+vkCmdBlitImage(VkCommandBuffer cb, VkImage src, VkImageLayout srcLayout,
+               VkImage dst, VkImageLayout dstLayout,
+               uint32_t regionCount, const VkImageBlit *pRegions,
+               VkFilter filter) {
+    OSITO_CB_PROLOG(return);
+    PFN_vkCmdBlitImage fn = (PFN_vkCmdBlitImage)
+        ci->icd->get_proc_addr(ci->handle, "vkCmdBlitImage");
+    if (!fn) return;
+    VkImage real_s = src ? img_from(src)->real : 0;
+    VkImage real_d = dst ? img_from(dst)->real : 0;
+    fn(w->real, real_s, srcLayout, real_d, dstLayout,
+       regionCount, pRegions, filter);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+vkCmdResolveImage(VkCommandBuffer cb, VkImage src, VkImageLayout srcLayout,
+                  VkImage dst, VkImageLayout dstLayout,
+                  uint32_t regionCount, const VkImageResolve *pRegions) {
+    OSITO_CB_PROLOG(return);
+    PFN_vkCmdResolveImage fn = (PFN_vkCmdResolveImage)
+        ci->icd->get_proc_addr(ci->handle, "vkCmdResolveImage");
+    if (!fn) return;
+    VkImage real_s = src ? img_from(src)->real : 0;
+    VkImage real_d = dst ? img_from(dst)->real : 0;
+    fn(w->real, real_s, srcLayout, real_d, dstLayout, regionCount, pRegions);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+vkCmdCopyImage2(VkCommandBuffer cb, const VkCopyImageInfo2 *pInfo) {
+    OSITO_CB_PROLOG(return);
+    if (!pInfo) return;
+    PFN_vkCmdCopyImage2 fn = (PFN_vkCmdCopyImage2)
+        ci->icd->get_proc_addr(ci->handle, "vkCmdCopyImage2");
+    if (!fn) {
+        fn = (PFN_vkCmdCopyImage2)
+            ci->icd->get_proc_addr(ci->handle, "vkCmdCopyImage2KHR");
+    }
+    if (!fn) return;
+    VkCopyImageInfo2 tmp = *pInfo;
+    if (tmp.srcImage) tmp.srcImage = img_from(tmp.srcImage)->real;
+    if (tmp.dstImage) tmp.dstImage = img_from(tmp.dstImage)->real;
+    fn(w->real, &tmp);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+vkCmdBlitImage2(VkCommandBuffer cb, const VkBlitImageInfo2 *pInfo) {
+    OSITO_CB_PROLOG(return);
+    if (!pInfo) return;
+    PFN_vkCmdBlitImage2 fn = (PFN_vkCmdBlitImage2)
+        ci->icd->get_proc_addr(ci->handle, "vkCmdBlitImage2");
+    if (!fn) {
+        fn = (PFN_vkCmdBlitImage2)
+            ci->icd->get_proc_addr(ci->handle, "vkCmdBlitImage2KHR");
+    }
+    if (!fn) return;
+    VkBlitImageInfo2 tmp = *pInfo;
+    if (tmp.srcImage) tmp.srcImage = img_from(tmp.srcImage)->real;
+    if (tmp.dstImage) tmp.dstImage = img_from(tmp.dstImage)->real;
+    fn(w->real, &tmp);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+vkCmdResolveImage2(VkCommandBuffer cb, const VkResolveImageInfo2 *pInfo) {
+    OSITO_CB_PROLOG(return);
+    if (!pInfo) return;
+    PFN_vkCmdResolveImage2 fn = (PFN_vkCmdResolveImage2)
+        ci->icd->get_proc_addr(ci->handle, "vkCmdResolveImage2");
+    if (!fn) {
+        fn = (PFN_vkCmdResolveImage2)
+            ci->icd->get_proc_addr(ci->handle, "vkCmdResolveImage2KHR");
+    }
+    if (!fn) return;
+    VkResolveImageInfo2 tmp = *pInfo;
+    if (tmp.srcImage) tmp.srcImage = img_from(tmp.srcImage)->real;
+    if (tmp.dstImage) tmp.dstImage = img_from(tmp.dstImage)->real;
+    fn(w->real, &tmp);
+}
+
+VKAPI_ATTR void VKAPI_CALL
 vkCmdCopyImageToBuffer(VkCommandBuffer cb, VkImage src,
                        VkImageLayout srcLayout, VkBuffer dst,
                        uint32_t regionCount,
@@ -3762,6 +4181,48 @@ vkCmdCopyImageToBuffer(VkCommandBuffer cb, VkImage src,
     VkImage  real_i = src ? img_from(src)->real : 0;
     VkBuffer real_b = dst ? buf_from(dst)->real : 0;
     fn(w->real, real_i, srcLayout, real_b, regionCount, pRegions);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+vkCmdCopyImageToBuffer2(VkCommandBuffer cb,
+                        const VkCopyImageToBufferInfo2 *pInfo) {
+    OSITO_CB_PROLOG(return);
+    if (!pInfo) return;
+    PFN_vkCmdCopyImageToBuffer2 fn = (PFN_vkCmdCopyImageToBuffer2)
+        ci->icd->get_proc_addr(ci->handle, "vkCmdCopyImageToBuffer2");
+    if (!fn) {
+        fn = (PFN_vkCmdCopyImageToBuffer2)
+            ci->icd->get_proc_addr(ci->handle, "vkCmdCopyImageToBuffer2KHR");
+    }
+    if (!fn) return;
+    VkCopyImageToBufferInfo2 tmp = *pInfo;
+    if (tmp.srcImage) tmp.srcImage = img_from(tmp.srcImage)->real;
+    if (tmp.dstBuffer) tmp.dstBuffer = buf_from(tmp.dstBuffer)->real;
+    fn(w->real, &tmp);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+vkCmdClearDepthStencilImage(VkCommandBuffer cb, VkImage image,
+                            VkImageLayout imageLayout,
+                            const VkClearDepthStencilValue *pDepthStencil,
+                            uint32_t rangeCount,
+                            const VkImageSubresourceRange *pRanges) {
+    OSITO_CB_PROLOG(return);
+    PFN_vkCmdClearDepthStencilImage fn = (PFN_vkCmdClearDepthStencilImage)
+        ci->icd->get_proc_addr(ci->handle, "vkCmdClearDepthStencilImage");
+    if (!fn) return;
+    VkImage real = image ? img_from(image)->real : 0;
+    fn(w->real, real, imageLayout, pDepthStencil, rangeCount, pRanges);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+vkCmdClearAttachments(VkCommandBuffer cb, uint32_t attachmentCount,
+                      const VkClearAttachment *pAttachments,
+                      uint32_t rectCount, const VkClearRect *pRects) {
+    OSITO_CB_PROLOG(return);
+    PFN_vkCmdClearAttachments fn = (PFN_vkCmdClearAttachments)
+        ci->icd->get_proc_addr(ci->handle, "vkCmdClearAttachments");
+    if (fn) fn(w->real, attachmentCount, pAttachments, rectCount, pRects);
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -3817,6 +4278,55 @@ vkCmdDrawIndirect(VkCommandBuffer cb, VkBuffer buffer, VkDeviceSize offset,
 }
 
 VKAPI_ATTR void VKAPI_CALL
+vkCmdDrawIndirectCount(VkCommandBuffer cb, VkBuffer buffer,
+                       VkDeviceSize offset, VkBuffer countBuffer,
+                       VkDeviceSize countBufferOffset, uint32_t maxDrawCount,
+                       uint32_t stride) {
+    OSITO_CB_PROLOG(return);
+    PFN_vkCmdDrawIndirectCount fn = (PFN_vkCmdDrawIndirectCount)
+        ci->icd->get_proc_addr(ci->handle, "vkCmdDrawIndirectCount");
+    if (!fn) {
+        fn = (PFN_vkCmdDrawIndirectCount)
+            ci->icd->get_proc_addr(ci->handle, "vkCmdDrawIndirectCountKHR");
+    }
+    if (!fn) {
+        fn = (PFN_vkCmdDrawIndirectCount)
+            ci->icd->get_proc_addr(ci->handle, "vkCmdDrawIndirectCountAMD");
+    }
+    if (!fn) return;
+    VkBuffer real_b = buffer ? buf_from(buffer)->real : 0;
+    VkBuffer real_c = countBuffer ? buf_from(countBuffer)->real : 0;
+    fn(w->real, real_b, offset, real_c, countBufferOffset,
+       maxDrawCount, stride);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+vkCmdDrawIndexedIndirectCount(VkCommandBuffer cb, VkBuffer buffer,
+                              VkDeviceSize offset, VkBuffer countBuffer,
+                              VkDeviceSize countBufferOffset,
+                              uint32_t maxDrawCount, uint32_t stride) {
+    OSITO_CB_PROLOG(return);
+    PFN_vkCmdDrawIndexedIndirectCount fn =
+        (PFN_vkCmdDrawIndexedIndirectCount)
+        ci->icd->get_proc_addr(ci->handle, "vkCmdDrawIndexedIndirectCount");
+    if (!fn) {
+        fn = (PFN_vkCmdDrawIndexedIndirectCount)
+            ci->icd->get_proc_addr(ci->handle,
+                                   "vkCmdDrawIndexedIndirectCountKHR");
+    }
+    if (!fn) {
+        fn = (PFN_vkCmdDrawIndexedIndirectCount)
+            ci->icd->get_proc_addr(ci->handle,
+                                   "vkCmdDrawIndexedIndirectCountAMD");
+    }
+    if (!fn) return;
+    VkBuffer real_b = buffer ? buf_from(buffer)->real : 0;
+    VkBuffer real_c = countBuffer ? buf_from(countBuffer)->real : 0;
+    fn(w->real, real_b, offset, real_c, countBufferOffset,
+       maxDrawCount, stride);
+}
+
+VKAPI_ATTR void VKAPI_CALL
 vkCmdFillBuffer(VkCommandBuffer cb, VkBuffer dst, VkDeviceSize dstOffset,
                 VkDeviceSize size, uint32_t data) {
     OSITO_CB_PROLOG(return);
@@ -3868,6 +4378,55 @@ vkCmdPipelineBarrier(VkCommandBuffer cb,
        memBarrierCount, pMemBarriers,
        bufBarrierCount, bufBarrierCount ? locals_b : NULL,
        imgBarrierCount, imgBarrierCount ? locals_i : NULL);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+vkCmdPipelineBarrier2(VkCommandBuffer cb,
+                      const VkDependencyInfo *pDependencyInfo) {
+    OSITO_CB_PROLOG(return);
+    if (!pDependencyInfo) return;
+    PFN_vkCmdPipelineBarrier2 fn = (PFN_vkCmdPipelineBarrier2)
+        ci->icd->get_proc_addr(ci->handle, "vkCmdPipelineBarrier2");
+    if (!fn) {
+        fn = (PFN_vkCmdPipelineBarrier2)
+            ci->icd->get_proc_addr(ci->handle, "vkCmdPipelineBarrier2KHR");
+    }
+    if (!fn) return;
+#define OSITO_PB2_MAX 16u
+    VkDependencyInfo tmp = *pDependencyInfo;
+    VkBufferMemoryBarrier2 locals_b[OSITO_PB2_MAX];
+    VkImageMemoryBarrier2 locals_i[OSITO_PB2_MAX];
+    if (tmp.bufferMemoryBarrierCount > OSITO_PB2_MAX)
+        tmp.bufferMemoryBarrierCount = OSITO_PB2_MAX;
+    if (tmp.imageMemoryBarrierCount > OSITO_PB2_MAX)
+        tmp.imageMemoryBarrierCount = OSITO_PB2_MAX;
+    for (uint32_t k = 0; k < tmp.bufferMemoryBarrierCount; k++) {
+        locals_b[k] = pDependencyInfo->pBufferMemoryBarriers[k];
+        if (locals_b[k].buffer)
+            locals_b[k].buffer = buf_from(locals_b[k].buffer)->real;
+    }
+    for (uint32_t k = 0; k < tmp.imageMemoryBarrierCount; k++) {
+        locals_i[k] = pDependencyInfo->pImageMemoryBarriers[k];
+        if (locals_i[k].image)
+            locals_i[k].image = img_from(locals_i[k].image)->real;
+    }
+    if (tmp.bufferMemoryBarrierCount)
+        tmp.pBufferMemoryBarriers = locals_b;
+    if (tmp.imageMemoryBarrierCount)
+        tmp.pImageMemoryBarriers = locals_i;
+    fn(w->real, &tmp);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+vkCmdPushConstants(VkCommandBuffer cb, VkPipelineLayout layout,
+                   VkShaderStageFlags stageFlags, uint32_t offset,
+                   uint32_t size, const void *pValues) {
+    OSITO_CB_PROLOG(return);
+    PFN_vkCmdPushConstants fn = (PFN_vkCmdPushConstants)
+        ci->icd->get_proc_addr(ci->handle, "vkCmdPushConstants");
+    if (!fn) return;
+    VkPipelineLayout real = layout ? pl_from(layout)->real : 0;
+    fn(w->real, real, stageFlags, offset, size, pValues);
 }
 
 VKAPI_ATTR void VKAPI_CALL

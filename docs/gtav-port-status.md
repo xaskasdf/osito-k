@@ -21,6 +21,14 @@ successful presents, shader/effect loading, and passes the previous
 **Assets**: 24 RPFs (39GB) loaded from 60GB NVMe image. common.rpf + x64a-x64w
 all RPF7-valid. Real assets rendered (icon.jpg, hires_lrg2.bmp from common.rpf).
 
+**QEMU Venus presentation fix (Jun 20 2026)**: macOS QEMU runs use the patched
+render-server virglrenderer plus `-display sdl,gl=core`. `GTA5.elf` must be
+relinked after `make vulkan-user`; rebuilding only `kernel.elf` leaves the old
+Venus ICD embedded in the game binary. Verified run `osito-renderfix24` creates
+one compositor target (`h=2`, `flags=0x07`) and three CPU-only swapchain
+backbuffers (`h=3..5`, `flags=0x03`) with no extra `[COMP]` windows, eliminating
+the debug-pattern/flicker path caused by scanout backbuffers.
+
 ## Architecture
 
 ```
@@ -71,6 +79,14 @@ loop. There is no `#PF`, `#GP`, futex corruption log, or process crash in the
 serial output. The next investigation target is whether the black frame is
 expected loading-screen behavior, missing assets, or a render/presenter state
 machine issue.
+
+**Presentation state**: The previous QEMU flicker/pattern was not real GTA
+rendering. It came from Venus allocating each swapchain image through
+`SYS_SHM_MKSURFACE`, which created compositor windows for backbuffers. Swapchain
+images now use `SYS_SHM_CREATE` CPU-visible SHM only; `vkQueuePresentKHR` copies
+the selected backbuffer into the OsitoK compositor surface SHM and flips that
+surface. `DXGI_PRESENT_TEST` still returns without presenting, so a real frame
+requires a non-test `Present`.
 
 **Hardware `sysBuddyHeap` crash triage**: Hardware logs
 `hw-logs/20260620-012805-usb/diag/cr0_00.txt` and
@@ -163,6 +179,11 @@ cd ~/osito-k
 tools/ositofs/ositofs-delete arch/x86/build/nvme.img GTA5.elf
 tools/ositofs/ositofs-write arch/x86/build/nvme.img ~/ok-ported/GTAV_Source/GTA5.elf --name GTA5.elf
 
+# Refresh embedded Vulkan ICD before deploying GTA after Venus edits
+cd ~/ok-ported/GTAV_Source
+make vulkan-user
+make -W GTA5_ositok.o GTA5.elf
+
 # Run with macOS HVF + SDL GL core/VIRGL.
 # Requires the patched QEMU 11.0.1 build that creates a 4.1 core context.
 PATH=/private/tmp/qemu-core-src/qemu-11.0.1/build:$PATH \
@@ -174,10 +195,12 @@ PATH=/private/tmp/qemu-core-src/qemu-11.0.1/build:$PATH \
 
 ```
 -m 8G -smp 4 -machine q35,accel=hvf -cpu host
--device virtio-gpu-gl-pci,hostmem=256M,blob=on -display sdl,gl=core
+-device virtio-vga-gl,hostmem=256M,blob=on,venus=on -display sdl,gl=core
 -device e1000e -device qemu-xhci -device usb-kbd -device usb-mouse
 -device intel-hda -device nvme
 ```
 
-Do not enable `venus=on` with the current macOS virglrenderer build: QEMU
-fails early with `Render server support was not enabled in virglrenderer`.
+Set `DYLD_LIBRARY_PATH` to the patched virglrenderer build and
+`RENDER_SERVER_EXEC_PATH` to its `virgl_render_server` binary before launching
+QEMU. On macOS, QEMU must request the OpenGL core profile; compatibility GL can
+crash during virtio-gpu/virgl scanout reset.

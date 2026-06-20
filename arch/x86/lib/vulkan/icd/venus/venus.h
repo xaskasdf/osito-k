@@ -71,9 +71,10 @@ struct venus_wire;
  * of them). */
 struct venus_surface {
     uint32_t in_use;
-    uint32_t window_id;                /* opaque app-chosen compositor window id */
+    uint32_t shm_handle;               /* compositor target SHM handle */
     uint32_t width;
     uint32_t height;
+    void    *target_ptr;               /* mapped compositor target */
 };
 
 struct venus_instance {
@@ -110,10 +111,10 @@ struct venus_memory {
     uint32_t type_index;
     uint32_t in_use;
     uint32_t mapped;
-    uint32_t is_shm_backed; /* W3b.5: 1 when local_ptr points to a mapped SHM surface */
-    uint32_t shm_handle;    /* W3b.5: SHM handle from SYS_SHM_MKSURFACE (0 if none) */
-    uint32_t shm_width;     /* W3b.5: width of the SHM surface */
-    uint32_t shm_height;    /* W3b.5: height of the SHM surface */
+    uint32_t is_shm_backed; /* W3b.5: 1 when local_ptr points to mapped SHM */
+    uint32_t shm_handle;    /* W3b.5: SHM handle (0 if none) */
+    uint32_t shm_width;     /* W3b.5: width of the SHM image */
+    uint32_t shm_height;    /* W3b.5: height of the SHM image */
 };
 
 struct venus_buffer {
@@ -199,7 +200,7 @@ struct venus_descriptor_set {
     uint32_t in_use;
     int32_t  pool_slot;
     int32_t  layout_slot;
-    uint32_t _pad;
+    int32_t  image_slot;      /* first sampled/storage/input image written */
 };
 
 struct venus_descriptor_update_template {
@@ -252,6 +253,18 @@ struct venus_cmd_buffer {
     uint32_t recorded_clear_color;     /* BGRA8 packed (B=lo,G,R,A=hi); 0 = none */
     uint32_t recorded_has_clear;       /* 1 if recorded_clear_color is valid */
     int32_t  recorded_clear_image_slot;/* venus_image slot for vkCmdClearColorImage; -1 */
+    uint32_t recorded_has_copy_image;  /* 1 if vkCmdCopyImage was recorded */
+    int32_t  recorded_copy_src_image_slot;
+    int32_t  recorded_copy_dst_image_slot;
+    uint32_t recorded_has_copy_buffer_to_image;
+    int32_t  recorded_copy_src_buffer_slot;
+    int32_t  recorded_copy_buffer_dst_image_slot;
+    int32_t  recorded_sampled_image_slot;
+    uint32_t _pad_sampled;
+    uint64_t recorded_copy_buffer_offset;
+    uint32_t recorded_copy_buffer_width;
+    uint32_t recorded_copy_buffer_height;
+    uint32_t recorded_copy_buffer_row_length;
     uint32_t _pad6;
 };
 
@@ -453,6 +466,11 @@ venus_FreeDescriptorSets(VkDevice, VkDescriptorPool, uint32_t,
 VKAPI_ATTR void VKAPI_CALL
 venus_UpdateDescriptorSets(VkDevice, uint32_t, const VkWriteDescriptorSet *,
                            uint32_t, const VkCopyDescriptorSet *);
+VKAPI_ATTR void VKAPI_CALL
+venus_CmdBindDescriptorSets(VkCommandBuffer, VkPipelineBindPoint,
+                            VkPipelineLayout, uint32_t, uint32_t,
+                            const VkDescriptorSet *, uint32_t,
+                            const uint32_t *);
 
 VKAPI_ATTR VkResult VKAPI_CALL
 venus_CreateDescriptorUpdateTemplate(VkDevice,
@@ -496,32 +514,117 @@ VKAPI_ATTR VkResult VKAPI_CALL
 venus_BeginCommandBuffer(VkCommandBuffer, const VkCommandBufferBeginInfo *);
 VKAPI_ATTR VkResult VKAPI_CALL
 venus_EndCommandBuffer(VkCommandBuffer);
+VKAPI_ATTR VkResult VKAPI_CALL
+venus_ResetCommandBuffer(VkCommandBuffer, VkCommandBufferResetFlags);
 
 VKAPI_ATTR void VKAPI_CALL
 venus_CmdBeginRenderPass(VkCommandBuffer, const VkRenderPassBeginInfo *, VkSubpassContents);
 VKAPI_ATTR void VKAPI_CALL
 venus_CmdEndRenderPass(VkCommandBuffer);
 VKAPI_ATTR void VKAPI_CALL
+venus_CmdBeginRendering(VkCommandBuffer, const VkRenderingInfo *);
+VKAPI_ATTR void VKAPI_CALL
+venus_CmdEndRendering(VkCommandBuffer);
+VKAPI_ATTR void VKAPI_CALL
 venus_CmdBindPipeline(VkCommandBuffer, VkPipelineBindPoint, VkPipeline);
 VKAPI_ATTR void VKAPI_CALL
 venus_CmdDraw(VkCommandBuffer, uint32_t, uint32_t, uint32_t, uint32_t);
+VKAPI_ATTR void VKAPI_CALL
+venus_CmdDrawIndexed(VkCommandBuffer, uint32_t, uint32_t, uint32_t,
+                     int32_t, uint32_t);
+VKAPI_ATTR void VKAPI_CALL
+venus_CmdDrawIndexedIndirect(VkCommandBuffer, VkBuffer, VkDeviceSize,
+                             uint32_t, uint32_t);
+VKAPI_ATTR void VKAPI_CALL
+venus_CmdDrawIndirect(VkCommandBuffer, VkBuffer, VkDeviceSize,
+                      uint32_t, uint32_t);
 
 /* W3b.6 — vertex input + dynamic state. */
 VKAPI_ATTR void VKAPI_CALL
 venus_CmdBindVertexBuffers(VkCommandBuffer, uint32_t, uint32_t,
                            const VkBuffer *, const VkDeviceSize *);
 VKAPI_ATTR void VKAPI_CALL
+venus_CmdBindVertexBuffers2(VkCommandBuffer, uint32_t, uint32_t,
+                            const VkBuffer *, const VkDeviceSize *,
+                            const VkDeviceSize *, const VkDeviceSize *);
+VKAPI_ATTR void VKAPI_CALL
 venus_CmdSetViewport(VkCommandBuffer, uint32_t, uint32_t,
                      const VkViewport *);
 VKAPI_ATTR void VKAPI_CALL
+venus_CmdSetViewportWithCount(VkCommandBuffer, uint32_t,
+                              const VkViewport *);
+VKAPI_ATTR void VKAPI_CALL
 venus_CmdSetScissor(VkCommandBuffer, uint32_t, uint32_t,
                     const VkRect2D *);
+VKAPI_ATTR void VKAPI_CALL
+venus_CmdSetScissorWithCount(VkCommandBuffer, uint32_t,
+                             const VkRect2D *);
 
 /* W4.8 — clear-only fast path. */
 VKAPI_ATTR void VKAPI_CALL
 venus_CmdClearColorImage(VkCommandBuffer, VkImage, VkImageLayout,
                          const VkClearColorValue *, uint32_t,
                          const VkImageSubresourceRange *);
+VKAPI_ATTR void VKAPI_CALL
+venus_CmdClearDepthStencilImage(VkCommandBuffer, VkImage, VkImageLayout,
+                                const VkClearDepthStencilValue *, uint32_t,
+                                const VkImageSubresourceRange *);
+VKAPI_ATTR void VKAPI_CALL
+venus_CmdClearAttachments(VkCommandBuffer, uint32_t,
+                          const VkClearAttachment *, uint32_t,
+                          const VkClearRect *);
+VKAPI_ATTR void VKAPI_CALL
+venus_CmdCopyBuffer(VkCommandBuffer, VkBuffer, VkBuffer, uint32_t,
+                    const VkBufferCopy *);
+VKAPI_ATTR void VKAPI_CALL
+venus_CmdCopyBuffer2(VkCommandBuffer, const VkCopyBufferInfo2 *);
+VKAPI_ATTR void VKAPI_CALL
+venus_CmdCopyBufferToImage(VkCommandBuffer, VkBuffer, VkImage,
+                           VkImageLayout, uint32_t,
+                           const VkBufferImageCopy *);
+VKAPI_ATTR void VKAPI_CALL
+venus_CmdCopyBufferToImage2(VkCommandBuffer,
+                            const VkCopyBufferToImageInfo2 *);
+VKAPI_ATTR void VKAPI_CALL
+venus_CmdCopyImage(VkCommandBuffer, VkImage, VkImageLayout, VkImage,
+                   VkImageLayout, uint32_t, const VkImageCopy *);
+VKAPI_ATTR void VKAPI_CALL
+venus_CmdBlitImage(VkCommandBuffer, VkImage, VkImageLayout, VkImage,
+                   VkImageLayout, uint32_t, const VkImageBlit *, VkFilter);
+VKAPI_ATTR void VKAPI_CALL
+venus_CmdResolveImage(VkCommandBuffer, VkImage, VkImageLayout, VkImage,
+                      VkImageLayout, uint32_t, const VkImageResolve *);
+VKAPI_ATTR void VKAPI_CALL
+venus_CmdCopyImage2(VkCommandBuffer, const VkCopyImageInfo2 *);
+VKAPI_ATTR void VKAPI_CALL
+venus_CmdBlitImage2(VkCommandBuffer, const VkBlitImageInfo2 *);
+VKAPI_ATTR void VKAPI_CALL
+venus_CmdResolveImage2(VkCommandBuffer, const VkResolveImageInfo2 *);
+VKAPI_ATTR void VKAPI_CALL
+venus_CmdCopyImageToBuffer(VkCommandBuffer, VkImage, VkImageLayout, VkBuffer,
+                           uint32_t, const VkBufferImageCopy *);
+VKAPI_ATTR void VKAPI_CALL
+venus_CmdCopyImageToBuffer2(VkCommandBuffer,
+                            const VkCopyImageToBufferInfo2 *);
+VKAPI_ATTR void VKAPI_CALL
+venus_CmdPipelineBarrier(VkCommandBuffer, VkPipelineStageFlags,
+                         VkPipelineStageFlags, VkDependencyFlags,
+                         uint32_t, const VkMemoryBarrier *,
+                         uint32_t, const VkBufferMemoryBarrier *,
+                         uint32_t, const VkImageMemoryBarrier *);
+VKAPI_ATTR void VKAPI_CALL
+venus_CmdPipelineBarrier2(VkCommandBuffer, const VkDependencyInfo *);
+VKAPI_ATTR void VKAPI_CALL
+venus_CmdPushConstants(VkCommandBuffer, VkPipelineLayout,
+                       VkShaderStageFlags, uint32_t, uint32_t,
+                       const void *);
+VKAPI_ATTR void VKAPI_CALL
+venus_CmdDrawIndirectCount(VkCommandBuffer, VkBuffer, VkDeviceSize,
+                           VkBuffer, VkDeviceSize, uint32_t, uint32_t);
+VKAPI_ATTR void VKAPI_CALL
+venus_CmdDrawIndexedIndirectCount(VkCommandBuffer, VkBuffer, VkDeviceSize,
+                                  VkBuffer, VkDeviceSize, uint32_t,
+                                  uint32_t);
 
 /* W3b.5 — WSI + surface + swapchain + queue + sync + present. */
 

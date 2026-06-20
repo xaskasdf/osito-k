@@ -13,8 +13,8 @@
  *                                              The test's vertex layout
  *                                              treats y<0 as the top.)
  *
- * Pure C, no libc. The fb is 32bpp BGRA (the format we asked for in
- * SYS_SHM_MKSURFACE).
+ * Pure C, no libc. The fb is 32bpp BGRA, matching the swapchain SHM
+ * backbuffer format.
  */
 #include <stdint.h>
 
