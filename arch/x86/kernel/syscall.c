@@ -4271,6 +4271,12 @@ static uint16_t get_cs(void)
     return cs;
 }
 
+enum {
+    SYSCALL_KERNEL_CS = 0x90,
+    SYSCALL_KERNEL_SS = 0x98,
+    SYSRET_USER_BASE  = 0x33
+};
+
 /* ── Save/restore brk state for fork+execve ──────────────────── */
 /*
  * In an identity-mapped OS, the brk globals are shared between parent
@@ -4413,12 +4419,14 @@ void syscall_init(void)
      * SYSCALL loads CS = STAR[47:32], SS = STAR[47:32]+8
      * SYSRET loads  CS = STAR[63:48]+16, SS = STAR[63:48]+8
      *
-     * With UEFI's typical GDT: CS=0x38, DS=0x30
-     * Kernel: CS=0x38, SS=0x30 → STAR[47:32] = 0x38
+     * Kernel: use the private 0x90/0x98 GDT pair installed by gdt_init().
+     * Do not derive this from the bootloader's SS: on real hardware UEFI can
+     * leave selector 0x10 as a compat descriptor, and our near syscall return
+     * would then run 64-bit ELF code with legacy instruction decoding.
      * User:   For SYSRET to give CS=user_cs, SS=user_ss
      *         CS = STAR[63:48]+16, SS = STAR[63:48]+8
      *         We want user_cs=0x43 (ring 3), user_ss=0x3B (ring 3)
-     *         → STAR[63:48] = 0x33 (so CS=0x33+16=0x43, SS=0x33+8=0x3B)
+     *         -> STAR[63:48] = 0x33 (so CS=0x33+16=0x43, SS=0x33+8=0x3B)
      *
      * But for now we only have ring 0, so user selectors don't matter yet.
      */
@@ -4426,20 +4434,19 @@ void syscall_init(void)
     uint16_t kernel_ss;
     __asm__ volatile ("mov %%ss, %0" : "=r"(kernel_ss));
 
-    /* SYSCALL requires CS and SS as adjacent GDT entries:
-     * CS = STAR[47:32], SS = STAR[47:32]+8.
-     * Use (SS-8) as the SYSCALL CS base so SS lands on the
-     * actual data segment, not the TSS. */
-    uint16_t syscall_cs_base = kernel_ss - 8;
-    uint64_t star = ((uint64_t)(syscall_cs_base - 16) << 48) |
-                    ((uint64_t)syscall_cs_base << 32);
+    uint64_t star = ((uint64_t)SYSRET_USER_BASE << 48) |
+                    ((uint64_t)SYSCALL_KERNEL_CS << 32);
 
     serial_puts("[SYSCALL] Kernel CS=0x");
     serial_puthex(kernel_cs, 4);
     serial_puts(" SS=0x");
     serial_puthex(kernel_ss, 4);
-    serial_puts(" SYSCALL CS base=0x");
-    serial_puthex(syscall_cs_base, 4);
+    serial_puts(" SYSCALL CS=0x");
+    serial_puthex(SYSCALL_KERNEL_CS, 4);
+    serial_puts(" SS=0x");
+    serial_puthex(SYSCALL_KERNEL_SS, 4);
+    serial_puts(" SYSRET base=0x");
+    serial_puthex(SYSRET_USER_BASE, 4);
     serial_puts("\n");
 
     wrmsr(MSR_STAR, star);

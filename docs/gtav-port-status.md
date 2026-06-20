@@ -72,21 +72,20 @@ serial output. The next investigation target is whether the black frame is
 expected loading-screen behavior, missing assets, or a render/presenter state
 machine issue.
 
-**Hardware `sysBuddyHeap` crash triage**: Hardware log
-`hw-logs/20260620-012805-usb/diag/cr0_00.txt` faults at
-`0x09b4d74b`, `rage::sysBuddyHeap::Init+0x8b`, with `CR2=0x1f0`.
-That RIP is the second byte of `41 0f 11 87 58 01 00 00`; without the REX
-prefix it decodes as a store through `rdi+0x158`, matching `rdi=0x98` and the
-null-ish write. This looks like control entered the middle of an instruction,
-not another high-mmap truncation. QEMU with the current low anonymous mmap
-kernel reaches `RAGE heap @ 0x6015d000`, passes this allocator point, creates
-the D3D11/Vulkan swapchain, and presents continuously.
+**Hardware `sysBuddyHeap` crash triage**: Hardware logs
+`hw-logs/20260620-012805-usb/diag/cr0_00.txt` and
+`hw-logs/20260620-022854-usb/diag/cr3_00.txt` faulted at `0x09b4d74b`,
+`rage::sysBuddyHeap::Init+0x8b`, with `CR2=0x1f0`. The bytes at that RIP are
+`41 0f 11 87 58 01 00 00`: in 64-bit mode `0x41` is a REX prefix and the store
+uses `r15+0x158`; in compat/legacy mode it is `inc ecx`, then `movups` stores
+through `edi+0x158`, matching `edi=0x98 -> 0x1f0`. The failure was therefore
+a bad `CS=0x10` SYSCALL selector, not heap corruption. SYSCALL is now pinned to
+private 64-bit GDT entries `0x90/0x98`.
 
-**Crash diagnostics**: Native ELF faults may arrive with `CS=0x10` after
-SYSCALL/SYSRET on the current GDT, while older diagnostics only walked native
-backtraces for `CS=0x28`. The crash reporter now treats `0x10` as native ELF
-and normalizes low stack aliases against the high direct-map mirror before
-walking RBP frames.
+**Crash diagnostics**: Native ELF faults may arrive with startup `CS=0x28`, the
+fixed SYSCALL-return `CS=0x90`, or legacy crash dumps using the old buggy
+`CS=0x10`. The crash reporter handles all three and normalizes low stack
+aliases against the high direct-map mirror before walking RBP frames.
 
 **Hardware futex crash fixed in test**: Real hardware logs from
 `/private/tmp/boot0.log` and `/private/tmp/cr0_00.txt` captured `GTA5.elf`

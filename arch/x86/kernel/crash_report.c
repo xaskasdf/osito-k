@@ -58,16 +58,14 @@ static bool cr_readable_range(uint64_t addr, uint64_t len, uint64_t *read_addr)
         return true;
     }
 
-    /* Native ring-0 ELF stacks are allocated through PHYS_TO_VIRT(), but
-     * frame->rsp can hold the low physical alias after same-CPL exceptions.
-     * If that low alias is not mapped in the process CR3, read the shared
-     * upper-half mirror instead, but only for real RAM-sized addresses. */
+    /* The upper-half direct map may use large pages, which paging_get_pte()
+     * intentionally does not resolve. It is still safe to read when the
+     * mirrored physical range is inside installed RAM. */
     uint64_t total = mem_get_total();
-    if (addr < KERNEL_VBASE && total != 0 && addr + len - 1 >= addr &&
-        addr + len <= total) {
-        uint64_t high = addr + KERNEL_VBASE;
-        if (cr_range_present(high, len)) {
-            *read_addr = high;
+    if (addr >= KERNEL_VBASE && total != 0 && addr + len - 1 >= addr) {
+        uint64_t low = addr - KERNEL_VBASE;
+        if (low < total && len <= total - low) {
+            *read_addr = addr;
             return true;
         }
     }
@@ -79,10 +77,30 @@ static bool cr_native_elf_cs(uint64_t cs)
 {
     uint16_t s = (uint16_t)(cs & 0xFFFF);
 
-    /* Native ELF can fault either after the initial ring-0 jump (0x28) or
-     * after returning through SYSCALL/SYSRET on the current GDT layout
-     * (0x10). Both should use the per-process symbol table and stack walker. */
-    return s == 0x28 || s == 0x10;
+    /* Native ELF can fault after the initial ring-0 jump (0x28), after the
+     * fixed SYSCALL return selector (0x90), or in old crash dumps from the
+     * buggy UEFI-derived selector (0x10). */
+    return s == 0x28 || s == 0x90 || s == 0x10;
+}
+
+static bool cr_readable_native_stack(uint64_t addr, uint64_t len,
+                                     uint64_t *read_addr)
+{
+    if (cr_readable_range(addr, len, read_addr))
+        return true;
+
+    /* Native ring-0 ELF stacks are allocated through PHYS_TO_VIRT(), but
+     * same-CPL exceptions can report the low physical alias in RSP/RBP.
+     * Use the shared upper-half mirror only for RAM-sized low aliases, and
+     * only from native ELF stack capture/walking call sites. */
+    uint64_t total = mem_get_total();
+    if (addr < KERNEL_VBASE && total != 0 && addr + len - 1 >= addr &&
+        addr < total && len <= total - addr) {
+        *read_addr = addr + KERNEL_VBASE;
+        return true;
+    }
+
+    return false;
 }
 
 static uint64_t cr_stack_compare_addr(uint64_t addr)
@@ -355,8 +373,14 @@ void crash_report_save(uint64_t *frame, uint32_t vector, uint64_t fault_addr,
         int max_words = (int)((page_end - r->rsp) / 8);
         if (max_words > 256) max_words = 256;
         uint64_t stack_read = 0;
-        if (max_words > 0 &&
-            cr_readable_range(r->rsp, (uint64_t)max_words * 8, &stack_read)) {
+        bool native_stack = cr_native_elf_cs(r->cs);
+        bool stack_ok = max_words > 0 &&
+            (native_stack
+             ? cr_readable_native_stack(r->rsp, (uint64_t)max_words * 8,
+                                        &stack_read)
+             : cr_readable_range(r->rsp, (uint64_t)max_words * 8,
+                                 &stack_read));
+        if (stack_ok) {
             r->stack_base = r->rsp;
             r->stack_valid = true;
             uint64_t *sp = (uint64_t *)stack_read;
@@ -397,7 +421,7 @@ void crash_report_save(uint64_t *frame, uint32_t vector, uint64_t fault_addr,
                 rbp_cmp + 16 > rsp_page_end) break;
 
             uint64_t rbp_read = 0;
-            if (!cr_readable_range(rbp, 16, &rbp_read)) break;
+            if (!cr_readable_native_stack(rbp, 16, &rbp_read)) break;
 
             uint64_t ret = ((uint64_t *)rbp_read)[1];
             uint64_t prev = ((uint64_t *)rbp_read)[0];

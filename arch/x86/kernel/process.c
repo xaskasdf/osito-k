@@ -1345,6 +1345,17 @@ static inline uint32_t sched_get_lapic_id(void)
     return apic[0x020 / 4] >> 24;
 }
 
+static inline bool sched_valid_frame_cs(uint64_t cs)
+{
+    uint16_t s = (uint16_t)(cs & 0xFFFF);
+
+    /* Native ELF may resume either through the direct ring-0 entry (0x28) or
+     * the fixed SYSCALL return path (0x90). Keep 0x10 valid for old saved
+     * frames during bring-up; new syscalls should not produce it. */
+    return s == 0x38 || s == 0x28 || s == 0x90 ||
+           s == 0x10 || s == 0x43 || s == 0x40;
+}
+
 void __hot sched_tick(void *frame_ptr)
 {
     if (!sched_enabled || sched_current_idx < 0)
@@ -1435,7 +1446,7 @@ void __hot sched_tick(void *frame_ptr)
     {
         uint64_t *f = (uint64_t *)frame_ptr;
         uint64_t cs = f[18];
-        if (cs != 0x38 && cs != 0x28 && cs != 0x43 && cs != 0x40) {
+        if (!sched_valid_frame_cs(cs)) {
             serial_puts("[SCHED] BAD SAVE PID ");
             serial_putdec(cur->pid);
             serial_puts(": CS=0x"); serial_puthex(cs, 8);
@@ -1623,10 +1634,14 @@ void __hot sched_tick(void *frame_ptr)
         uint64_t cs = frame[18];
 
         uint64_t rip = frame[17];
+        uint64_t vec = frame[15];
         uint64_t ss  = frame[21];
         uint64_t rsp_saved = frame[20];
-        bool bad_cs  = (cs != 0x38 && cs != 0x28 && cs != 0x43 && cs != 0x40);
-        bool bad_ss  = (ss != 0x30 && ss != 0x3B && ss != 0x00);
+        bool bad_cs  = !sched_valid_frame_cs(cs);
+        bool has_saved_ss = (vec != 32);
+        bool bad_ss  = has_saved_ss &&
+                       (ss != 0x30 && ss != 0x98 &&
+                        ss != 0x3B && ss != 0x00);
         /* A low (user-space) RIP is corruption only for a KERNEL thread,
          * whose entry is a kernel function at a high RIP. User-ELF processes
          * legitimately run their own code at low addresses (e.g. 0x20000000)

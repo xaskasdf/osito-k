@@ -261,7 +261,7 @@ Interactive command shell with builtins and argument parsing.
 ### Tier 2 Key Fixes
 - **kern_setjmp/longjmp** (`setjmp.S`): Saves/restores RBX,RBP,R12-R15,RSP,RIP. Used by proc_exec to save kernel context; proc_exit longjmps back. Cleanly bypasses syscall return path.
 - **SYSCALL return race**: `popfq` has no interrupt shadow — APIC timer could fire between IF=1 and `jmp *%rcx`, corrupting return. Fix: `sti; jmp *%rcx` (STI shadows the next instruction).
-- **STAR MSR**: SYSCALL CS base = `kernel_ss - 8` so SS = valid data segment (0x30), not TSS (0x40).
+- **STAR MSR**: SYSCALL uses private 64-bit GDT entries `0x90/0x98`; this avoids depending on UEFI selector `0x10`, which can be a compat descriptor on hardware.
 
 **Tier 2 milestone**: Interactive `osito>` shell with keyboard input, ELF execution, filesystem browsing. 20/20 QEMU test stability.
 

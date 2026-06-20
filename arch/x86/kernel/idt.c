@@ -36,6 +36,7 @@ extern void sched_tick(void *frame);
 /* Paging (paging.c) */
 extern int  paging_set_flags(uint64_t virt, uint64_t flags);
 extern uint64_t *paging_get_pte(uint64_t virt);
+extern uint64_t mem_get_total(void);
 #define PTE_PRESENT  (1ULL << 0)
 #define PTE_WRITABLE (1ULL << 1)
 #define PTE_GLOBAL   (1ULL << 8)
@@ -59,6 +60,17 @@ static void null_page_clean(void)
     paging_set_flags(0, PTE_PRESENT | PTE_GLOBAL | PTE_NX);
     __asm__ volatile ("invlpg (%0)" :: "r"((uint64_t)0) : "memory");
     g_null_page_dirty = 0;
+}
+
+static uint64_t idt_stack_compare_addr(uint64_t addr)
+{
+    uint64_t total = mem_get_total();
+
+    if (total != 0 && addr >= KERNEL_VBASE) {
+        uint64_t low = addr - KERNEL_VBASE;
+        if (low < total) return low;
+    }
+    return addr;
 }
 
 /* Process management (process.c) */
@@ -273,12 +285,15 @@ static void gdt_init(void)
     memcpy(kernel_gdt, (void *)old_gdtr.base, (uint64_t)entries * 8);
 
     /* Ensure critical entries are valid 64-bit segments.
-     * SYSCALL uses CS=0x28 (index 5), SS=0x30 (index 6).
-     * IDT gates use CS=0x38 (index 7). */
-    if (entries < 8) entries = 8;  /* Extend if UEFI GDT was smaller */
+     * Native ELF starts at CS=0x28/SS=0x30. IDT gates use CS=0x38.
+     * SYSCALL uses a private 0x90/0x98 pair so it never depends on
+     * UEFI's selector 0x10, which may be a compat descriptor on hardware. */
+    if (entries < 20) entries = 20;  /* Extend if UEFI GDT was smaller */
     kernel_gdt[5] = 0x00AF9A000000FFFFULL; /* 0x28: 64-bit code (P=1,DPL=0,S=1,type=0xA,L=1,G=1) */
     kernel_gdt[6] = 0x00CF92000000FFFFULL; /* 0x30: 64-bit data (P=1,DPL=0,S=1,type=0x2,G=1) */
     kernel_gdt[7] = 0x00AF9A000000FFFFULL; /* 0x38: 64-bit code (same as 0x28) */
+    kernel_gdt[18] = 0x00AF9A000000FFFFULL; /* 0x90: 64-bit SYSCALL code */
+    kernel_gdt[19] = 0x00CF92000000FFFFULL; /* 0x98: SYSCALL data */
 
     /* Load our GDT */
     kernel_gdtr.limit = (uint16_t)((uint64_t)entries * 8 - 1);
@@ -1680,8 +1695,8 @@ void isr_handler(interrupt_frame_t *frame)
         serial_puthex(frame->cs, 4);
         serial_puts("\n");
 
-        /* Symbolize RIP for native ELF user crashes (CS=0x28 or the current
-         * SYSCALL-return CS=0x10). The
+        /* Symbolize RIP for native ELF user crashes (CS=0x28, fixed
+         * SYSCALL-return CS=0x90, or legacy buggy CS=0x10 dumps). The
          * symbolizer is kmalloc-safe and reads the per-process symbol
          * tables captured at elf_load time. For unmatched addresses or
          * demand-paged binaries (no symtab) it prints nothing. */
@@ -1690,7 +1705,7 @@ void isr_handler(interrupt_frame_t *frame)
             extern bool user_symbolize(void *p, uint64_t addr,
                                        const char **name, uint64_t *off);
             uint16_t cs16 = (uint16_t)(frame->cs & 0xFFFF);
-            if (cs16 == 0x28 || cs16 == 0x10) {
+            if (cs16 == 0x28 || cs16 == 0x90 || cs16 == 0x10) {
                 const char *sym_name = 0;
                 uint64_t    sym_off  = 0;
                 if (user_symbolize(proc_current(), frame->rip,
@@ -1789,7 +1804,7 @@ void isr_handler(interrupt_frame_t *frame)
             int is_mirror = (wrip >= 0xFFFF800000000000ULL);
             int is_vdso   = (wrip >= 0x7FFF0000ULL && wrip < 0x80000000ULL);
             int native_cs = (wcs == 0x38 || wcs == 0x28 ||
-                             wcs == 0x10 || wcs == 0x08);
+                             wcs == 0x90 || wcs == 0x10 || wcs == 0x08);
             if (wrip >= 0x10000ULL && native_cs &&
                 !is_kernel && !is_user && !is_mirror && !is_vdso) {
                 extern uint64_t paging_get_kernel_cr3(void);
@@ -1916,8 +1931,8 @@ void isr_handler(interrupt_frame_t *frame)
             }
         }
 
-        /* Native ELF backtrace via RBP walking (CS=0x28 or the current
-         * SYSCALL-return CS=0x10).
+        /* Native ELF backtrace via RBP walking (CS=0x28, fixed
+         * SYSCALL-return CS=0x90, or legacy buggy CS=0x10 dumps).
          *
          * Reads `[rbp] = prev_rbp, [rbp+8] = ret_addr` up to 16 frames,
          * symbolizing each return address. Safety: RBP must be
@@ -1932,7 +1947,7 @@ void isr_handler(interrupt_frame_t *frame)
          * above); the walk bails out at the first RBP out-of-window. */
         {
             uint16_t cs16 = (uint16_t)(frame->cs & 0xFFFF);
-            if (cs16 == 0x28 || cs16 == 0x10) {
+            if (cs16 == 0x28 || cs16 == 0x90 || cs16 == 0x10) {
                 extern void *proc_current(void);
                 extern bool  user_symbolize(void *p, uint64_t addr,
                                             const char **name, uint64_t *off);
@@ -1940,17 +1955,20 @@ void isr_handler(interrupt_frame_t *frame)
                 serial_puts("  Backtrace:\n");
                 uint64_t       rbp  = frame->rbp;
                 const uint64_t rsp  = frame->rsp;
+                const uint64_t rsp_cmp = idt_stack_compare_addr(rsp);
                 const uint64_t WIN  = 8ULL * 1024 * 1024;  /* USER_STACK_SIZE */
                 void          *proc = proc_current();
 
                 for (int depth = 0; depth < 16; depth++) {
+                    uint64_t rbp_cmp = idt_stack_compare_addr(rbp);
+                    uint64_t lower = (rsp_cmp >= 256) ? (rsp_cmp - 256) : 0;
                     if (rbp == 0) break;
                     if (rbp & 0x7) break;                  /* unaligned */
                     /* Keep RBP within ±8MB of the faulting RSP — the
                      * kernel-allocated user stack window. Anything else is
                      * either garbage or points outside the stack. */
-                    if (rbp + 16 < rbp) break;             /* overflow guard */
-                    if (rbp < rsp - 256 || rbp > rsp + WIN) break;
+                    if (rbp_cmp + 16 < rbp_cmp) break;     /* overflow guard */
+                    if (rbp_cmp < lower || rbp_cmp > rsp_cmp + WIN) break;
 
                     uint64_t prev_rbp = ((uint64_t *)rbp)[0];
                     uint64_t ret      = ((uint64_t *)rbp)[1];
@@ -1970,7 +1988,7 @@ void isr_handler(interrupt_frame_t *frame)
                     }
                     serial_puts("\n");
 
-                    if (prev_rbp <= rbp) break;            /* loop / end */
+                    if (idt_stack_compare_addr(prev_rbp) <= rbp_cmp) break;
                     rbp = prev_rbp;
                 }
             }
