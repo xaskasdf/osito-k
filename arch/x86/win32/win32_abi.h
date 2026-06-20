@@ -48,6 +48,7 @@ typedef struct {
 
 /* Register a shim DLL's co-located export table for ABI lookup. Call once per
  * DLL alongside dll_register_shim(). `count` = number of rows. */
+void win32_abi_reset(void);
 void win32_abi_register(const char *dll_name, const WIN32_EXPORT *table, int count);
 
 /*
@@ -55,7 +56,7 @@ void win32_abi_register(const char *dll_name, const WIN32_EXPORT *table, int cou
  *   1. exact co-located table row for dll_name (case-insensitive name match)
  *   2. any registered table (covers api-ms-win-crt-* style redirections)
  *   3. MSVC C++ demangling for `?…@@…` names
- * Returns 1 and fills *out_argc/*out_cc on success, 0 on miss (caller logs).
+ * Returns 1 and fills out_argc/out_cc on success, 0 on miss (caller logs).
  */
 int win32_abi_lookup(const char *dll_name, const char *func_name,
                      uint8_t *out_argc, uint8_t *out_cc);

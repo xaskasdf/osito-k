@@ -448,6 +448,7 @@ int winexec_run(const uint8_t *file_data, uint64_t file_size)
      * derived from the prototype) so the IAT thunk's RET N comes from the
      * real signature, not the name-keyed guess_num_args default-4. */
     {
+        win32_abi_reset();
         extern const WIN32_EXPORT *ntdll_abi_table(int *);
         extern const WIN32_EXPORT *kernel32_abi_table(int *);
         extern const WIN32_EXPORT *msvcrt_abi_table(int *);
@@ -463,21 +464,26 @@ int winexec_run(const uint8_t *file_data, uint64_t file_size)
         extern const WIN32_EXPORT *comctl32_abi_table(int *);
         extern const WIN32_EXPORT *comdlg32_abi_table(int *);
         int n;
-        win32_abi_register("ntdll.dll",    ntdll_abi_table(&n),    n);
-        win32_abi_register("kernel32.dll", kernel32_abi_table(&n), n);
-        win32_abi_register("msvcrt.dll",   msvcrt_abi_table(&n),   n);
-        win32_abi_register("advapi32.dll", advapi32_abi_table(&n), n);
-        win32_abi_register("user32.dll",   user32_abi_table(&n),   n);
-        win32_abi_register("gdi32.dll",    gdi32_abi_table(&n),    n);
-        win32_abi_register("ddraw.dll",    ddraw_abi_table(&n),    n);
-        win32_abi_register("dsound.dll",   dsound_abi_table(&n),   n);
-        win32_abi_register("wsock32.dll",  wsock32_abi_table(&n),  n);
-        win32_abi_register("ws2_32.dll",   wsock32_abi_table(&n),  n);
-        win32_abi_register("shell32.dll",  shell32_abi_table(&n),  n);
-        win32_abi_register("winmm.dll",    winmm_abi_table(&n),    n);
-        win32_abi_register("ole32.dll",    ole32_abi_table(&n),    n);
-        win32_abi_register("comctl32.dll", comctl32_abi_table(&n), n);
-        win32_abi_register("comdlg32.dll", comdlg32_abi_table(&n), n);
+#define REGISTER_ABI_TABLE(dll, table_fn) do {                         \
+            const WIN32_EXPORT *table = (table_fn)(&n);                 \
+            win32_abi_register((dll), table, n);                        \
+        } while (0)
+        REGISTER_ABI_TABLE("ntdll.dll",    ntdll_abi_table);
+        REGISTER_ABI_TABLE("kernel32.dll", kernel32_abi_table);
+        REGISTER_ABI_TABLE("msvcrt.dll",   msvcrt_abi_table);
+        REGISTER_ABI_TABLE("advapi32.dll", advapi32_abi_table);
+        REGISTER_ABI_TABLE("user32.dll",   user32_abi_table);
+        REGISTER_ABI_TABLE("gdi32.dll",    gdi32_abi_table);
+        REGISTER_ABI_TABLE("ddraw.dll",    ddraw_abi_table);
+        REGISTER_ABI_TABLE("dsound.dll",   dsound_abi_table);
+        REGISTER_ABI_TABLE("wsock32.dll",  wsock32_abi_table);
+        REGISTER_ABI_TABLE("ws2_32.dll",   wsock32_abi_table);
+        REGISTER_ABI_TABLE("shell32.dll",  shell32_abi_table);
+        REGISTER_ABI_TABLE("winmm.dll",    winmm_abi_table);
+        REGISTER_ABI_TABLE("ole32.dll",    ole32_abi_table);
+        REGISTER_ABI_TABLE("comctl32.dll", comctl32_abi_table);
+        REGISTER_ABI_TABLE("comdlg32.dll", comdlg32_abi_table);
+#undef REGISTER_ABI_TABLE
     }
 
     /*

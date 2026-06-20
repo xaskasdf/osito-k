@@ -7,7 +7,7 @@
  *   * SYS_SHM_MKSURFACE (506) — create a BGRA surface of (w,h)
  *   * SYS_SHM_MAP       (501) — map the surface into the caller VA
  *   * SYS_GUI_FLIP      (507) — flip the SHM region to the framebuffer
- *   * SYS_SHM_DESTROY   (505) — release the SHM region
+ *   * SYS_SHM_DESTROY   (503) — release the SHM region
  *
  * The bridge owns up to 16 concurrent windows; each "window" is just a
  * SHM handle + cached dimensions. Window IDs are 1-indexed slot numbers
@@ -25,10 +25,13 @@
 extern "C" long syscall(long number, ...);
 
 #define SYS_SHM_MAP              501L
-#define SYS_SHM_DESTROY          505L
+#define SYS_SHM_DESTROY          503L
 #define SYS_SHM_MKSURFACE        506L
 #define SYS_GUI_FLIP             507L
-#define SHM_FMT_BGRA             0x41524742L   /* 'BGRA' LE */
+#define SHM_FLAG_CPU_WRITE       (1L << 0)
+#define SHM_FLAG_CPU_READ        (1L << 1)
+#define SHM_FLAG_GPU_SCANOUT     (1L << 2)
+#define SHM_SURFACE_FLAGS        (SHM_FLAG_CPU_WRITE | SHM_FLAG_CPU_READ | SHM_FLAG_GPU_SCANOUT)
 
 namespace {
   struct CompositorWindow {
@@ -63,7 +66,7 @@ uint32_t dxvk_compositor_create_window(uint32_t width, uint32_t height) {
   if (slot == kMaxWindows) return 0;
 
   long shm = syscall(SYS_SHM_MKSURFACE, (long)width, (long)height,
-                     SHM_FMT_BGRA);
+                     SHM_SURFACE_FLAGS);
   if (shm <= 0) {
     s_windows[slot].in_use.store(0);
     return 0;

@@ -8,12 +8,14 @@
 
 #include "../include/types.h"
 #include "../include/paging.h"
+#include "../kernel/smp.h"
 
 extern void serial_puts(const char *s);
 extern void serial_puthex(uint64_t val, int digits);
 extern void serial_putdec(uint64_t val);
 extern void *mem_alloc_aligned(uint64_t size, uint64_t alignment);
 extern void  paging_map_mmio(uint64_t phys, uint64_t size);
+extern uint64_t idt_get_ticks(void);
 
 /* ── Virtio PCI Capability Types ──────────────────────────────── */
 #define VIRTIO_PCI_CAP_COMMON_CFG   1
@@ -39,6 +41,11 @@ extern void  paging_map_mmio(uint64_t phys, uint64_t size);
 #define VIRTIO_STATUS_DRIVER       2
 #define VIRTIO_STATUS_FEATURES_OK  8
 #define VIRTIO_STATUS_DRIVER_OK    4
+
+#define VIRTQ_DESC_F_NEXT          1
+#define VIRTQ_DESC_F_WRITE         2
+#define VIRTQ_NO_DESC              0xFFFFu
+#define VIRTIO_GPU_CMD_TIMEOUT_TICKS 200u
 
 /* ── Structures ───────────────────────────────────────────────── */
 
@@ -161,11 +168,14 @@ static struct {
 
     bool initialized;
     bool scanout_active;
+    bool queue_broken;
 
     /* Negotiated device feature vector (64-bit). Populated before FEATURES_OK
      * so the 3D driver can probe VIRTIO_GPU_F_VIRGL. */
     uint64_t device_features;
 } gpu;
+
+static spinlock_t gpu_cmd_lock = SPINLOCK_INIT;
 
 /* ── PCI Config Read via ECAM ─────────────────────────────────── */
 
@@ -304,13 +314,18 @@ static int setup_controlq(void) {
     gpu.used = (vq_used_t *)PHYS_TO_VIRT((uint64_t)used_raw);
     memset(gpu.used, 0, used_bytes);
 
-    /* Chain free descriptors */
+    /* Chain free descriptors.  Use an explicit end-of-list marker so a
+     * timed-out descriptor is never accidentally reissued while the host
+     * may still own it. */
     for (uint16_t i = 0; i < gpu.vq_size - 1; i++) {
         gpu.desc[i].next = i + 1;
-        gpu.desc[i].flags = 1; /* NEXT */
+        gpu.desc[i].flags = VIRTQ_DESC_F_NEXT;
     }
+    gpu.desc[gpu.vq_size - 1].next = VIRTQ_NO_DESC;
+    gpu.desc[gpu.vq_size - 1].flags = 0;
     gpu.free_head = 0;
     gpu.last_used = 0;
+    gpu.queue_broken = false;
 
     /* Write queue physical addresses to device (desc_phys/avail_phys/used_phys
      * were captured above from mem_alloc_aligned before PHYS_TO_VIRT). */
@@ -361,24 +376,36 @@ static int setup_controlq(void) {
 
 /* ── Send Command + Wait for Response ─────────────────────────── */
 
-static int gpu_send_cmd(void *cmd, uint32_t cmd_len, void *resp, uint32_t resp_len) {
+static int gpu_send_cmd_unlocked(void *cmd, uint32_t cmd_len, void *resp, uint32_t resp_len) {
+    if (gpu.queue_broken) return -1;
+    if (gpu.free_head == VIRTQ_NO_DESC || gpu.free_head >= gpu.vq_size) {
+        serial_puts("[VIRTIO-GPU] controlq no free descriptors\n");
+        return -1;
+    }
+
     uint16_t head = gpu.free_head;
     uint16_t d0 = head;
     uint16_t d1 = gpu.desc[d0].next;
+    if (d1 == VIRTQ_NO_DESC || d1 >= gpu.vq_size || d1 == d0) {
+        serial_puts("[VIRTIO-GPU] controlq free-list corrupt\n");
+        gpu.queue_broken = true;
+        return -1;
+    }
+    uint16_t next_free = gpu.desc[d1].next;
 
     /* Descriptor 0: command (device reads) */
     gpu.desc[d0].addr = VIRT_TO_PHYS((uint64_t)cmd);
     gpu.desc[d0].len = cmd_len;
-    gpu.desc[d0].flags = 1 | 0; /* NEXT | read-only for device */
+    gpu.desc[d0].flags = VIRTQ_DESC_F_NEXT; /* NEXT | read-only for device */
     gpu.desc[d0].next = d1;
 
     /* Descriptor 1: response (device writes) */
     gpu.desc[d1].addr = VIRT_TO_PHYS((uint64_t)resp);
     gpu.desc[d1].len = resp_len;
-    gpu.desc[d1].flags = 2; /* WRITE */
+    gpu.desc[d1].flags = VIRTQ_DESC_F_WRITE;
     gpu.desc[d1].next = 0;
 
-    gpu.free_head = gpu.desc[d1].next;
+    gpu.free_head = next_free;
 
     /* Add to available ring */
     uint16_t avail_idx = gpu.avail->idx % gpu.vq_size;
@@ -394,22 +421,49 @@ static int gpu_send_cmd(void *cmd, uint32_t cmd_len, void *resp, uint32_t resp_l
     *notify_addr = 0;  /* queue 0 */
     __asm__ volatile ("mfence" ::: "memory");
 
-    /* Poll for response */
-    for (int i = 0; i < 1000000; i++) {
+    /* Poll for response.  QEMU's GL path can spend noticeable time in host
+     * rendering code, so do not use a tiny fixed spin count.  The descriptor
+     * pair is returned to the free list only after the used-ring entry naming
+     * this head is observed. */
+    uint64_t start_tick = idt_get_ticks();
+    for (uint64_t spins = 0; ; spins++) {
         __asm__ volatile ("lfence" ::: "memory");
         if (gpu.used->idx != gpu.last_used) {
+            uint16_t used_slot = gpu.last_used % gpu.vq_size;
+            uint32_t used_id = gpu.used->ring[used_slot].id;
             gpu.last_used++;
+            if (used_id != head) {
+                serial_puts("[VIRTIO-GPU] controlq unexpected used id=");
+                serial_putdec(used_id);
+                serial_puts(" expected=");
+                serial_putdec(head);
+                serial_puts("\n");
+                gpu.queue_broken = true;
+                return -1;
+            }
             /* Return descriptors to free list */
             gpu.desc[d1].next = gpu.free_head;
-            gpu.desc[d1].flags = 1;
+            gpu.desc[d1].flags = 0;
             gpu.desc[d0].next = d1;
-            gpu.desc[d0].flags = 1;
+            gpu.desc[d0].flags = VIRTQ_DESC_F_NEXT;
             gpu.free_head = d0;
             return 0;
         }
+        if ((idt_get_ticks() - start_tick) >= VIRTIO_GPU_CMD_TIMEOUT_TICKS ||
+            spins >= 200000000ULL)
+            break;
+        __asm__ volatile ("pause");
     }
     serial_puts("[VIRTIO-GPU] Command timeout!\n");
+    gpu.queue_broken = true;
     return -1;
+}
+
+static int gpu_send_cmd(void *cmd, uint32_t cmd_len, void *resp, uint32_t resp_len) {
+    spin_lock(&gpu_cmd_lock);
+    int rc = gpu_send_cmd_unlocked(cmd, cmd_len, resp, resp_len);
+    spin_unlock(&gpu_cmd_lock);
+    return rc;
 }
 
 /* ── Public Interface ─────────────────────────────────────────── */
@@ -663,6 +717,8 @@ bool      virtio_gpu_ready(void)     { return gpu.initialized; }
 void virtio_gpu_flush(void) {
     if (!gpu.initialized) return;
 
+    spin_lock(&gpu_cmd_lock);
+
     /* Lazy SET_SCANOUT: activate on first flush so VGA stays visible during boot */
     if (!gpu.scanout_active) {
         static struct virtio_gpu_set_scanout cmd_scanout;
@@ -673,7 +729,7 @@ void virtio_gpu_flush(void) {
         cmd_scanout.r.height = gpu.height;
         cmd_scanout.scanout_id = 0;
         cmd_scanout.resource_id = 1;
-        if (gpu_send_cmd(&cmd_scanout, sizeof(cmd_scanout), &resp_scanout, sizeof(resp_scanout)) == 0) {
+        if (gpu_send_cmd_unlocked(&cmd_scanout, sizeof(cmd_scanout), &resp_scanout, sizeof(resp_scanout)) == 0) {
             gpu.scanout_active = true;
             serial_puts("[VIRTIO-GPU] Scanout activated (first flush)\n");
         }
@@ -686,7 +742,7 @@ void virtio_gpu_flush(void) {
     cmd_xfer.r.width = gpu.width;
     cmd_xfer.r.height = gpu.height;
     cmd_xfer.resource_id = 1;
-    gpu_send_cmd(&cmd_xfer, sizeof(cmd_xfer), &resp_xfer, sizeof(resp_xfer));
+    gpu_send_cmd_unlocked(&cmd_xfer, sizeof(cmd_xfer), &resp_xfer, sizeof(resp_xfer));
 
     static struct virtio_gpu_resource_flush cmd_flush;
     static struct virtio_gpu_ctrl_hdr resp_flush;
@@ -695,7 +751,9 @@ void virtio_gpu_flush(void) {
     cmd_flush.r.width = gpu.width;
     cmd_flush.r.height = gpu.height;
     cmd_flush.resource_id = 1;
-    gpu_send_cmd(&cmd_flush, sizeof(cmd_flush), &resp_flush, sizeof(resp_flush));
+    gpu_send_cmd_unlocked(&cmd_flush, sizeof(cmd_flush), &resp_flush, sizeof(resp_flush));
+
+    spin_unlock(&gpu_cmd_lock);
 }
 
 /* -- Internal accessors exposed to virtio_gpu_3d.c ------------ */

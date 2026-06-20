@@ -475,8 +475,13 @@ void __initk kernel_entry(boot_info_t *info)
     /* Map VRAM through the upper-half mirror so the fb driver can
      * write pixels from any process's CR3 (PML4[256] is shared, the
      * lower-half identity map is per-process). */
-    fb_init((uint32_t *)PHYS_TO_VIRT(info->fb_base),
-            info->fb_width, info->fb_height, info->fb_pitch);
+    uint32_t *boot_fb = NULL;
+    if (info->fb_base && info->fb_width && info->fb_height && info->fb_pitch) {
+        boot_fb = (uint32_t *)PHYS_TO_VIRT(info->fb_base);
+    } else {
+        serial_puts("[FB] GOP framebuffer unavailable; using serial until GPU init\n");
+    }
+    fb_init(boot_fb, info->fb_width, info->fb_height, info->fb_pitch);
     fb_clear();
 
     /* Store ACPI RSDP for smp.c */
@@ -533,23 +538,27 @@ void __initk kernel_entry(boot_info_t *info)
         /* Program PAT entry 1 = WC for fast framebuffer writes */
         paging_setup_pat();
 
-        /* Map framebuffer VRAM as Write-Combining */
-        uint64_t fb_phys = info->fb_base;
-        uint64_t fb_size = (uint64_t)info->fb_height * info->fb_pitch * 4;
-        fb_size = (fb_size + 0x1FFFFF) & ~0x1FFFFFULL; /* Round up to 2MB */
-        paging_map_wc(fb_phys, fb_size);
-        __asm__ volatile ("mov %%cr3, %%rax; mov %%rax, %%cr3" ::: "rax", "memory");
+        if (info->fb_base && info->fb_height && info->fb_pitch) {
+            /* Map framebuffer VRAM as Write-Combining */
+            uint64_t fb_phys = info->fb_base;
+            uint64_t fb_size = (uint64_t)info->fb_height * info->fb_pitch * 4;
+            fb_size = (fb_size + 0x1FFFFF) & ~0x1FFFFFULL; /* Round up to 2MB */
+            paging_map_wc(fb_phys, fb_size);
+            __asm__ volatile ("mov %%cr3, %%rax; mov %%rax, %%cr3" ::: "rax", "memory");
 
-        /* Allocate shadow buffer in RAM for fast drawing. CPU-only
-         * buffer: accessed via the upper-half mirror so we stay aligned
-         * with heap.c and other migrated subsystems. */
-        uint64_t shadow_pages = (fb_size + 4095) / 4096;
-        void *shadow_phys = mem_alloc_pages(shadow_pages);
-        if (shadow_phys) {
-            fb_enable_shadow(PHYS_TO_VIRT(shadow_phys));
-            serial_puts("[FB] Shadow framebuffer enabled (");
-            serial_putdec(fb_size / 1024);
-            serial_puts(" KB)\n");
+            /* Allocate shadow buffer in RAM for fast drawing. CPU-only
+             * buffer: accessed via the upper-half mirror so we stay aligned
+             * with heap.c and other migrated subsystems. */
+            uint64_t shadow_pages = (fb_size + 4095) / 4096;
+            void *shadow_phys = mem_alloc_pages(shadow_pages);
+            if (shadow_phys) {
+                fb_enable_shadow(PHYS_TO_VIRT(shadow_phys));
+                serial_puts("[FB] Shadow framebuffer enabled (");
+                serial_putdec(fb_size / 1024);
+                serial_puts(" KB)\n");
+            }
+        } else {
+            serial_puts("[FB] Skipping GOP WC/shadow setup (no framebuffer)\n");
         }
     }
 

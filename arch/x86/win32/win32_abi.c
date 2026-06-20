@@ -17,6 +17,16 @@ static struct {
 } g_abi[WIN32_ABI_MAX_DLLS];
 static int g_abi_count;
 
+void win32_abi_reset(void)
+{
+    for (int i = 0; i < WIN32_ABI_MAX_DLLS; i++) {
+        g_abi[i].dll = NULL;
+        g_abi[i].table = NULL;
+        g_abi[i].count = 0;
+    }
+    g_abi_count = 0;
+}
+
 /* Case-insensitive ASCII compare, NUL-terminated. */
 static int ci_eq(const char *a, const char *b)
 {
@@ -63,11 +73,21 @@ static int cc_from_code(char c, uint8_t *cc)
     }
 }
 
+static int bounded_cstr_len(const char *s, int limit)
+{
+    if (!s) return -1;
+    for (int i = 0; i < limit; i++) {
+        if (s[i] == 0) return i;
+    }
+    return -1;
+}
+
 /* Advance *pp past a `<name>@@`-terminated qualified name. 1 ok / 0 malformed. */
-static int skip_qual_name(const char **pp)
+static int skip_qual_name(const char **pp, const char *end)
 {
     const char *q = *pp;
-    while (q[0]) {
+    while (q < end) {
+        if (q + 1 >= end) return 0;
         if (q[0] == '?' && q[1] == '$') return 0;   /* template — bail */
         if (q[0] == '@' && q[1] == '@') { *pp = q + 2; return 1; }
         q++;
@@ -77,9 +97,14 @@ static int skip_qual_name(const char **pp)
 
 /* Skip a full type token (size irrelevant — used for pointer/ref pointees).
  * Returns 1 ok / 0 if unparseable. */
-static int skip_type(const char **pp)
+static int skip_type(const char **pp, const char *end)
 {
     const char *p = *pp;
+    int depth = 0;
+
+again:
+    if (depth++ > 32) return 0;
+    if (p >= end) return 0;
     char c = *p;
     if (!c) return 0;
     switch (c) {
@@ -88,25 +113,26 @@ static int skip_type(const char **pp)
         case 'H': case 'I': case 'J': case 'K': case 'M': case 'N': case 'O':
             *pp = p + 1; return 1;
         case '_':                                /* extended primitive */
-            if (!p[1]) return 0;
+            if (p + 1 >= end || !p[1]) return 0;
             *pp = p + 2; return 1;
         case 'P': case 'Q': case 'R': case 'S':  /* pointer */
         case 'A': case 'B': {                    /* reference */
             p++;
+            if (p >= end) return 0;
             if (*p == '6' || *p == '7') return 0;/* ptr-to-function — bail */
             if (*p >= 'A' && *p <= 'Z') p++;     /* cv qualifier */
             else if (*p == '_') return 0;
-            *pp = p;
-            return skip_type(pp);                /* skip pointee */
+            goto again;                          /* skip pointee */
         }
         case 'V': case 'U': case 'T':            /* class/struct/union */
             p++; *pp = p;
-            return skip_qual_name(pp);
+            return skip_qual_name(pp, end);
         case 'W':                                /* enum: W<digit><name>@@ */
             p++;
+            if (p >= end) return 0;
             if (*p) p++;                          /* underlying-type digit */
             *pp = p;
-            return skip_qual_name(pp);
+            return skip_qual_name(pp, end);
         default:
             return 0;
     }
@@ -114,9 +140,10 @@ static int skip_type(const char **pp)
 
 /* Size (in 32-bit DWORDs) of a top-level argument type; advances *pp.
  * Returns 1 ok / 0 if ambiguous (by-value user type) or unparseable. */
-static int arg_size(const char **pp, int *dw)
+static int arg_size(const char **pp, const char *end, int *dw)
 {
     const char *p = *pp;
+    if (p >= end) return 0;
     switch (*p) {
         case 'N':                                /* double */
             *dw = 2; *pp = p + 1; return 1;
@@ -126,16 +153,17 @@ static int arg_size(const char **pp, int *dw)
         case 'H': case 'I': case 'J': case 'K': case 'M':
             *dw = 1; *pp = p + 1; return 1;
         case '_':                                /* bool/wchar=1, int64/uint64=2 */
+            if (p + 1 >= end) return 0;
             if (p[1] == 'J' || p[1] == 'K') { *dw = 2; *pp = p + 2; return 1; }
             if (p[1] == 'N' || p[1] == 'W') { *dw = 1; *pp = p + 2; return 1; }
             return 0;
         case 'P': case 'Q': case 'R': case 'S':  /* pointer = 1 DWORD */
         case 'A': case 'B':                      /* reference = 1 DWORD */
             *dw = 1;
-            return skip_type(pp);
+            return skip_type(pp, end);
         case 'W':                                /* enum = int */
             *dw = 1;
-            return skip_type(pp);
+            return skip_type(pp, end);
         case 'V': case 'U': case 'T':            /* by-value struct — unknown */
             return 0;
         default:
@@ -146,14 +174,20 @@ static int arg_size(const char **pp, int *dw)
 int msvc_demangle_abi(const char *s, uint8_t *out_argc, uint8_t *out_cc)
 {
     if (!s || s[0] != '?') return 0;
+    int slen = bounded_cstr_len(s, 256);
+    if (slen < 0) return 0;
+    const char *end = s + slen;
     const char *p = s + 1;
 
+    if (p >= end) return 0;
     if (*p == '?') {                              /* ??x operator/special */
         p++;
-        if (*p) p++;                              /* op code char */
+        if (p >= end) return 0;
+        p++;                                      /* op code char */
     }
-    if (!skip_qual_name(&p)) return 0;            /* skip up to `@@` */
+    if (!skip_qual_name(&p, end)) return 0;       /* skip up to `@@` */
 
+    if (p >= end) return 0;
     char kind = *p++;
     int code = kind - 'A';
     if (code < 0 || code > 25) return 0;
@@ -173,10 +207,13 @@ int msvc_demangle_abi(const char *s, uint8_t *out_argc, uint8_t *out_cc)
          * letter, e.g. `AE` in `?Tick@UObject@@UA E X X Z`), then read
          * the calling-convention character.  If the CC char is not a valid
          * code (constructor/destructor `@`), default to thiscall. */
+        if (p >= end) return 0;
         if (*p == 'A' || *p == 'B') {
             p++;                                   /* skip reference marker */
+            if (p >= end) return 0;
             if (*p >= 'A' && *p <= 'Z') p++;       /* skip CV qualifier */
         }
+        if (p >= end) return 0;
         if (!cc_from_code(*p, &cc)) {
             cc = CC_THISCALL;                      /* ctor/dtor @ → fallback */
             if (*p != '@') return 0;               /* truly unparseable */
@@ -184,25 +221,28 @@ int msvc_demangle_abi(const char *s, uint8_t *out_argc, uint8_t *out_cc)
         p++;
     } else {
         /* Free function or static member: read CC from next char */
+        if (p >= end) return 0;
         if (!cc_from_code(*p, &cc)) return 0;
         p++;
     }
 
     /* Skip return type (constructors/destructors use `@` as empty return) */
+    if (p >= end) return 0;
     if (*p == '@') {
         p++;
     } else {
-        if (!skip_type(&p)) return 0;
+        if (!skip_type(&p, end)) return 0;
     }
 
     int argc = 0;
+    if (p >= end) return 0;
     if (*p == 'X') {                              /* (void) */
         p++;
     } else {
-        while (*p && *p != 'Z') {                 /* 'Z' alone = ellipsis/end */
+        while (p < end && *p && *p != 'Z') {      /* 'Z' alone = ellipsis/end */
             if (*p == '@') { p++; break; }        /* end of arg list */
             int dw;
-            if (!arg_size(&p, &dw)) return 0;     /* ambiguous → bail */
+            if (!arg_size(&p, end, &dw)) return 0;/* ambiguous → bail */
             argc += dw;
             if (argc > 64) return 0;              /* sanity */
         }

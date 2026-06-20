@@ -105,7 +105,10 @@ static inline int nd_handle_slot(uint64_t h) {
 #define SYS_SHM_UNMAP            502L
 #define SYS_SHM_DESTROY          503L
 #define SYS_SHM_MKSURFACE        506L
-#define SHM_FMT_BGRA             0x41524742L   /* 'BGRA' LE */
+#define SHM_FLAG_CPU_WRITE       (1L << 0)
+#define SHM_FLAG_CPU_READ        (1L << 1)
+#define SHM_FLAG_GPU_SCANOUT     (1L << 2)
+#define SHM_SURFACE_FLAGS        (SHM_FLAG_CPU_WRITE | SHM_FLAG_CPU_READ | SHM_FLAG_GPU_SCANOUT)
 
 /* ---- Surface (instance-scoped). ---- */
 
@@ -474,7 +477,7 @@ venus_BindImageMemory(VkDevice device, VkImage image, VkDeviceMemory memory,
     /* SHM upgrade for swapchain-owned images. */
     if (img->is_swapchain_owned && !m->is_shm_backed) {
         uint32_t w = img->width, h = img->height;
-        long shm = __syscall3(SYS_SHM_MKSURFACE, (long)w, (long)h, SHM_FMT_BGRA);
+        long shm = __syscall3(SYS_SHM_MKSURFACE, (long)w, (long)h, SHM_SURFACE_FLAGS);
         if (shm > 0) {
             long mapped = __syscall1(SYS_SHM_MAP, shm);
             if (mapped != 0) {

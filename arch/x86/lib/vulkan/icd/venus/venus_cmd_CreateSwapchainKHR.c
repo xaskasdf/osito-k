@@ -31,7 +31,10 @@ extern long  __syscall3(long, long, long, long);
 #define SYS_SHM_MAP               501L
 #define SYS_SHM_DESTROY           503L
 #define SYS_SHM_MKSURFACE         506L
-#define SHM_FMT_BGRA              0x41524742L
+#define SHM_FLAG_CPU_WRITE        (1L << 0)
+#define SHM_FLAG_CPU_READ         (1L << 1)
+#define SHM_FLAG_GPU_SCANOUT      (1L << 2)
+#define SHM_SURFACE_FLAGS         (SHM_FLAG_CPU_WRITE | SHM_FLAG_CPU_READ | SHM_FLAG_GPU_SCANOUT)
 
 int venus_cmd_encode_CreateSwapchainKHR(
         struct venus_device *dev,
@@ -116,7 +119,7 @@ int venus_cmd_encode_CreateSwapchainKHR(
         if (mem_slot >= 0) {
             long shm = __syscall3(SYS_SHM_MKSURFACE,
                                   (long)sc->width, (long)sc->height,
-                                  SHM_FMT_BGRA);
+                                  SHM_SURFACE_FLAGS);
             if (shm > 0) {
                 long mapped = __syscall1(SYS_SHM_MAP, shm);
                 if (mapped != 0) {

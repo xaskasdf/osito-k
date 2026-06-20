@@ -51,6 +51,8 @@ typedef struct {
     uint64_t    pages;           /* size in pages */
     uint32_t    handle;          /* unique handle for IPC */
     uint32_t    flags;           /* SHM_FLAG_* */
+    uint32_t    surf_width;      /* nonzero for shm_create_surface() */
+    uint32_t    surf_height;     /* nonzero for shm_create_surface() */
     uint32_t    owner_pid;       /* creating process */
     int32_t     refcount;        /* number of active mappings */
     bool        active;          /* slot in use */
@@ -127,6 +129,8 @@ uint32_t shm_create(uint64_t size, uint32_t flags)
     r->pages           = pages;
     r->handle          = shm_next_handle++;
     r->flags           = flags;
+    r->surf_width      = 0;
+    r->surf_height     = 0;
     r->owner_pid       = 0;  /* Set by caller if needed */
     r->refcount        = 1;
     r->active          = true;
@@ -286,6 +290,7 @@ uint32_t shm_get_active_count(void) { return shm_active_count; }
 extern uint32_t compositor_create_window(uint32_t shm_handle, int16_t x, int16_t y, uint16_t width, uint16_t height, uint32_t pid, const char *title);
 extern void compositor_set_fullscreen(uint32_t window_id, bool fullscreen);
 extern void compositor_signal_dirty(uint32_t window_id);
+extern uint32_t compositor_find_window_by_shm(uint32_t shm_handle);
 
 /* Set before calling shm_create_surface — picked up by compositor_create_window
  * so the window can be cleaned up when the owning process exits. */
@@ -295,6 +300,13 @@ uint32_t shm_create_surface(uint32_t width, uint32_t height, uint32_t flags)
 {
     uint64_t size = (uint64_t)width * height * 4;
     uint32_t handle = shm_create(size, flags);
+    if (handle) {
+        shm_region_t *r = shm_find(handle);
+        if (r) {
+            r->surf_width = width;
+            r->surf_height = height;
+        }
+    }
 
     if (handle && (flags & 4)) { /* SHM_FLAG_GPU_SCANOUT */
         shm_set_owner(handle, shm_surface_owner_pid);
@@ -312,32 +324,113 @@ extern uint32_t fb_get_width(void);
 extern uint32_t fb_get_height(void);
 extern uint32_t fb_get_pitch(void);
 
+extern bool virtio_gpu_ready(void) __attribute__((weak));
+extern uint32_t *virtio_gpu_get_fb(void) __attribute__((weak));
+extern uint32_t virtio_gpu_get_width(void) __attribute__((weak));
+extern uint32_t virtio_gpu_get_height(void) __attribute__((weak));
+extern void virtio_gpu_flush(void) __attribute__((weak));
+extern uint64_t idt_get_ticks(void);
+
+static void shm_direct_virtio_scanout(uint32_t *src, uint32_t src_pitch,
+                                      uint32_t src_w, uint32_t src_h)
+{
+    if (!virtio_gpu_ready || !virtio_gpu_get_fb || !virtio_gpu_get_width ||
+        !virtio_gpu_get_height || !virtio_gpu_flush)
+        return;
+    if (!virtio_gpu_ready()) return;
+
+    uint32_t *dst = virtio_gpu_get_fb();
+    if (!dst) return;
+
+    uint32_t dst_w = virtio_gpu_get_width();
+    uint32_t dst_h = virtio_gpu_get_height();
+    uint32_t copy_w = src_w < dst_w ? src_w : dst_w;
+    uint32_t copy_h = src_h < dst_h ? src_h : dst_h;
+
+    for (uint32_t y = 0; y < copy_h; y++)
+        memcpy(dst + y * dst_w, src + y * src_pitch, copy_w * sizeof(uint32_t));
+
+    static uint64_t last_flush_tick;
+    uint64_t now = idt_get_ticks();
+    if (last_flush_tick != 0 && now - last_flush_tick < 6)
+        return;
+    last_flush_tick = now;
+
+    static bool logged;
+    if (!logged) {
+        serial_puts("[SHM] direct virtio scanout fallback enabled\n");
+        logged = true;
+    }
+    virtio_gpu_flush();
+}
+
 void shm_flush_surface(uint32_t handle)
 {
     shm_region_t *r = shm_find(handle);
     if (!r || !r->base) return;
 
     /* When compositor is running it reads win->pixels (same SHM region)
-     * directly each frame — no manual blit needed. */
+     * directly each frame. Mark the matching compositor window dirty so
+     * the next frame blits the SHM surface and flips it to scanout. */
     extern bool compositor_is_running(void);
-    if (compositor_is_running()) return;
-
-    /* Direct-boot fallback (no compositor): blit SHM surface to framebuffer.
-     * Derive source dimensions from the SHM region size. */
-    uint32_t *back = fb_get_base();
-    if (!back) return;
+    if (compositor_is_running()) {
+        uint32_t wid = compositor_find_window_by_shm(handle);
+        if (wid)
+            compositor_signal_dirty(wid);
+        return;
+    }
 
     uint32_t *src = (uint32_t *)r->base;
+    uint32_t sw = r->surf_width;
+    uint32_t sh = r->surf_height;
+    uint64_t npixels = r->size / 4;
+    if (!sw || !sh || (uint64_t)sw * sh > npixels) {
+        if      (npixels == 1024u * 768u) { sw = 1024; sh = 768; }
+        else if (npixels == 640u  * 480u) { sw = 640;  sh = 480; }
+        else if (npixels == 512u  * 512u) { sw = 512;  sh = 512; }
+        else if (npixels == 320u  * 240u) { sw = 320;  sh = 240; }
+        else if (npixels == 320u  * 200u) { sw = 320;  sh = 200; }
+        else { sw = npixels ? (uint32_t)npixels : 1; sh = 1; }
+    }
+
+    /* Direct virtio fallback can run even when boot GOP exposed fb=0. */
+    uint32_t *back = fb_get_base();
+    if (!back) {
+        static uint32_t nofb_log_count;
+        if (nofb_log_count < 8) {
+            serial_puts("[SHM] flush h=");
+            serial_putdec(handle);
+            serial_puts(" surface=");
+            serial_putdec(sw);
+            serial_puts("x");
+            serial_putdec(sh);
+            serial_puts(" fb=virtio-only\n");
+            nofb_log_count++;
+        }
+        shm_direct_virtio_scanout(src, sw, sw, sh);
+        return;
+    }
+
+    /* Direct-boot fallback (no compositor): blit SHM surface to framebuffer. */
     uint32_t dw = fb_get_width();
     uint32_t dh = fb_get_height();
     uint32_t pitch = fb_get_pitch();
 
-    /* Detect surface dimensions from region size */
-    uint32_t sw = 320, sh = 200;
-    uint64_t npixels = r->size / 4;
-    if      (npixels == 320u * 240u) { sw = 320; sh = 240; }
-    else if (npixels == 320u * 200u) { sw = 320; sh = 200; }
-    else if (npixels == 640u * 480u) { sw = 640; sh = 480; }
+    static uint32_t flush_log_count;
+    if (flush_log_count < 8) {
+        serial_puts("[SHM] flush h=");
+        serial_putdec(handle);
+        serial_puts(" surface=");
+        serial_putdec(sw);
+        serial_puts("x");
+        serial_putdec(sh);
+        serial_puts(" fb=");
+        serial_putdec(dw);
+        serial_puts("x");
+        serial_putdec(dh);
+        serial_puts("\n");
+        flush_log_count++;
+    }
 
     int scale = 1;
     if (dw >= sw * 2 && dh >= sh * 2) scale = 2;
@@ -345,6 +438,8 @@ void shm_flush_surface(uint32_t handle)
 
     int off_x = (int)((dw - sw * (uint32_t)scale) / 2);
     int off_y = (int)((dh - sh * (uint32_t)scale) / 2);
+
+    memset(back, 0, (uint64_t)pitch * dh * sizeof(uint32_t));
 
     for (int y = 0; y < (int)sh; y++) {
         for (int x = 0; x < (int)sw; x++) {
@@ -359,6 +454,8 @@ void shm_flush_surface(uint32_t handle)
             }
         }
     }
+
+    shm_direct_virtio_scanout(back, pitch, dw, dh);
 
     extern void fb_flush_all(void);
     fb_flush_all();

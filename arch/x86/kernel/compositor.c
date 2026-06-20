@@ -271,6 +271,28 @@ void compositor_cleanup_process(uint32_t pid)
     }
 }
 
+static void compositor_raise_window_to_front(int idx)
+{
+    if (idx < 0 || idx >= MAX_WINDOWS) return;
+    if (!(windows[idx].flags & WND_ACTIVE)) return;
+
+    uint8_t old_z = windows[idx].z_order;
+    uint8_t max_z = old_z;
+    for (int i = 0; i < MAX_WINDOWS; i++) {
+        if ((windows[i].flags & WND_ACTIVE) && windows[i].z_order > max_z)
+            max_z = windows[i].z_order;
+    }
+    if (old_z >= max_z) return;
+
+    for (int i = 0; i < MAX_WINDOWS; i++) {
+        if (i != idx && (windows[i].flags & WND_ACTIVE) &&
+            windows[i].z_order > old_z) {
+            windows[i].z_order--;
+        }
+    }
+    windows[idx].z_order = max_z;
+}
+
 /* Signal that a window's surface has new content */
 void compositor_signal_dirty(uint32_t window_id)
 {
@@ -278,6 +300,8 @@ void compositor_signal_dirty(uint32_t window_id)
     for (int i = 0; i < MAX_WINDOWS; i++) {
         if ((windows[i].flags & WND_ACTIVE) && windows[i].id == window_id) {
             windows[i].flags |= WND_DIRTY;
+            if (windows[i].flags & WND_FULLSCREEN)
+                compositor_raise_window_to_front(i);
             return;
         }
     }
@@ -825,7 +849,7 @@ static void __hot compositor_render_frame(void)
 
     /* Fullscreen window: bypass desktop UI, blit scaled to screen.
      * Supports any source size via pixel-perfect integer upscaling. */
-    for (int _fi = 0; _fi < render_count; _fi++) {
+    for (int _fi = render_count - 1; _fi >= 0; _fi--) {
         window_t *win = &windows[render_order[_fi]];
         if (!(win->flags & WND_FULLSCREEN) || !win->pixels) continue;
 
