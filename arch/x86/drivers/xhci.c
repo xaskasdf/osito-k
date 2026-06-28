@@ -156,6 +156,46 @@ const char hid_shifted[0x54] = {
     0,
 };
 
+static void hid_caps_set_boot_keyboard(hid_caps_t *caps)
+{
+    if (!caps) return;
+
+    memset(caps, 0, sizeof(*caps));
+    caps->kbd_mods_field = 0;
+    caps->kbd_keys_field = 1;
+    caps->mouse_btn_field = -1;
+    caps->mouse_x_field = -1;
+    caps->mouse_y_field = -1;
+    caps->mouse_wheel_field = -1;
+    caps->has_keyboard = true;
+    caps->total_bits = 64;
+    caps->n_fields = 2;
+
+    hid_field_t *mods = &caps->fields[0];
+    mods->bit_offset = 0;
+    mods->bit_size = 1;
+    mods->count = 8;
+    mods->usage_page = HID_PAGE_KEYBOARD;
+    mods->usage_min = 0xE0;
+    mods->usage_max = 0xE7;
+    mods->logical_min = 0;
+    mods->logical_max = 1;
+    mods->flags = HID_INPUT_VAR;
+    mods->report_id = 0;
+
+    hid_field_t *keys = &caps->fields[1];
+    keys->bit_offset = 16;
+    keys->bit_size = 8;
+    keys->count = 6;
+    keys->usage_page = HID_PAGE_KEYBOARD;
+    keys->usage_min = 0;
+    keys->usage_max = 0xFF;
+    keys->logical_min = 0;
+    keys->logical_max = 0xFF;
+    keys->flags = 0;
+    keys->report_id = 0;
+}
+
 /* ── USB Keyboard Report Handler ─────────────────────────────── */
 
 /*
@@ -252,7 +292,79 @@ static void hid_route_to_win32(uint8_t code, bool key_up)
  * input_post_key events on press/release transitions vs dev->prev_*
  * and routes ASCII to the terminal via kbd_route_to_term.
  */
-static void hid_process_keyboard(xhci_device_t *dev, const uint8_t *r)
+static bool hid_field_elem_available(const hid_field_t *f, uint16_t elem,
+                                     uint32_t report_len)
+{
+    uint32_t bit_off = (uint32_t)f->bit_offset +
+                       (uint32_t)elem * (uint32_t)f->bit_size;
+    uint32_t bit_end = bit_off + (uint32_t)f->bit_size;
+
+    return bit_end >= bit_off && bit_end <= report_len * 8U;
+}
+
+static bool hid_report_has_byte(const uint8_t *r, uint32_t len, uint8_t needle)
+{
+    for (uint32_t i = 0; i < len; i++) {
+        if (r[i] == needle) return true;
+    }
+    return false;
+}
+
+static bool hid_keys_have_usage(const uint8_t *keys, int n_keys, uint8_t usage)
+{
+    for (int i = 0; i < n_keys; i++) {
+        if (keys[i] == usage) return true;
+    }
+    return false;
+}
+
+static void hid_log_keyboard_report(const xhci_device_t *dev,
+                                    const uint8_t *r, uint32_t len,
+                                    uint8_t mods, const uint8_t *slots,
+                                    int n_slots, const uint8_t *keys,
+                                    int n_keys)
+{
+    static uint32_t log_count;
+    bool interesting = hid_keys_have_usage(keys, n_keys, 0x04) ||
+                       hid_keys_have_usage(keys, n_keys, 0x52) ||
+                       hid_report_has_byte(r, len, 0x04) ||
+                       hid_report_has_byte(r, len, 0x52);
+
+    if (!interesting || log_count >= 64) return;
+    log_count++;
+
+    serial_puts("[HID-KBD] #");
+    serial_putdec(log_count);
+    serial_puts(" len=");
+    serial_putdec(len);
+    serial_puts(" raw:");
+    uint32_t dump_len = len < 16 ? len : 16;
+    for (uint32_t i = 0; i < dump_len; i++) {
+        serial_puts(" ");
+        serial_puthex(r[i], 2);
+    }
+    serial_puts(" mods=0x");
+    serial_puthex(mods, 2);
+    serial_puts(" slots:");
+    for (int i = 0; i < n_slots; i++) {
+        serial_puts(" ");
+        serial_puthex(slots[i], 2);
+    }
+    serial_puts(" keys:");
+    for (int i = 0; i < n_keys; i++) {
+        serial_puts(" ");
+        serial_puthex(keys[i], 2);
+    }
+    serial_puts(" prev:");
+    for (int i = 0; i < 6; i++) {
+        serial_puts(" ");
+        serial_puthex(dev->prev_keys[i], 2);
+    }
+    serial_puts("\n");
+}
+
+static void hid_process_keyboard(xhci_device_t *dev, const uint8_t *r,
+                                 uint32_t len)
 {
     const hid_caps_t *caps = &dev->hid_caps;
 
@@ -262,22 +374,27 @@ static void hid_process_keyboard(xhci_device_t *dev, const uint8_t *r)
         /* Each modifier is 1 bit; pack 8 bits into a byte. */
         uint32_t total = (uint32_t)f->bit_size * (uint32_t)f->count;
         if (total > 8) total = 8;
-        mods = (uint8_t)hid_extract(r, f->bit_offset, (uint8_t)total);
+        if ((uint32_t)f->bit_offset + total <= len * 8U)
+            mods = (uint8_t)hid_extract(r, f->bit_offset, (uint8_t)total);
     }
 
     /* Keycode slots from current report. We scan up to 6 slots — the
      * boot-protocol minimum and the most common count. Devices that
      * report more usually still have the 6 most-recent in the first
      * 6 slots. */
+    uint8_t slots[6] = {0};
     uint8_t keys[6] = {0};
+    int n_slots = 0;
     int n_keys = 0;
     if (caps->kbd_keys_field >= 0) {
         const hid_field_t *f = &caps->fields[caps->kbd_keys_field];
         uint16_t cnt = f->count;
         if (cnt > 6) cnt = 6;
         for (uint16_t i = 0; i < cnt; i++) {
+            if (!hid_field_elem_available(f, i, len)) break;
             uint8_t code = (uint8_t)hid_extract(
                 r, f->bit_offset + i * f->bit_size, f->bit_size);
+            slots[n_slots++] = code;
             if (code > 1)  /* 0=none, 1=ErrorRollOver */
                 keys[n_keys++] = code;
         }
@@ -287,6 +404,8 @@ static void hid_process_keyboard(xhci_device_t *dev, const uint8_t *r)
     bool ctrl  = (mods & (HID_MOD_LCTRL  | HID_MOD_RCTRL))  != 0;
 
     extern void input_post_key(uint8_t scancode, bool pressed, bool extended);
+
+    hid_log_keyboard_report(dev, r, len, mods, slots, n_slots, keys, n_keys);
 
     /* Modifier transition events. */
     uint8_t changed = mods ^ dev->prev_mods;
@@ -421,7 +540,7 @@ static void usb_kbd_handle_report(xhci_device_t *dev, uint8_t *r, uint32_t len)
     }
 
     if (caps->has_keyboard && (!caps->has_report_id || id == caps->kbd_report_id))
-        hid_process_keyboard(dev, r);
+        hid_process_keyboard(dev, r, len);
 
     if (caps->has_mouse && (!caps->has_report_id || id == caps->mouse_report_id))
         hid_process_mouse(dev, r);
@@ -1299,6 +1418,8 @@ static void enumerate_port(xhci_hc_t *hc, int port)
     }
 
   if (iface_kind == IFACE_HID) {
+    bool hid_boot_keyboard_protocol = false;
+
     /* SET_PROTOCOL and SET_IDLE are mandatory only for HID Boot
      * Interface Subclass (bInterfaceSubClass == 1) — i.e. boot
      * keyboards and boot mice. Generic HID devices (subclass 0,
@@ -1318,7 +1439,10 @@ static void enumerate_port(xhci_hc_t *hc, int port)
         setup.wValue = 0; /* Boot protocol */
         setup.wIndex = hid_iface;
         setup.wLength = 0;
-        ctrl_transfer(hc, dev, &setup, NULL, 0, false); /* OK if fails */
+        if (ctrl_transfer(hc, dev, &setup, NULL, 0, false) >= 0 &&
+            hid_proto == 1) {
+            hid_boot_keyboard_protocol = true;
+        }
 
         /* ── SET_IDLE (rate = 0, infinite) ── */
         setup.bRequest = USB_REQ_SET_IDLE;
@@ -1361,6 +1485,17 @@ static void enumerate_port(xhci_hc_t *hc, int port)
         } else {
             serial_puts("[xHCI] GET_DESCRIPTOR(Report) failed\n");
         }
+    }
+
+    if (hid_boot_keyboard_protocol) {
+        /* The device is now in boot protocol, whose report layout is fixed
+         * and intentionally does not have Report IDs or vendor/NKRO extras.
+         * Some rebranded gaming keyboards advertise a richer report
+         * descriptor but honor SET_PROTOCOL by switching to the 8-byte boot
+         * packet; using descriptor offsets on that packet reads unrelated
+         * bytes as phantom keys. */
+        hid_caps_set_boot_keyboard(&dev->hid_caps);
+        serial_puts("[xHCI] Boot keyboard protocol active\n");
     }
 
     /* ── Configure Interrupt IN Endpoint ── */

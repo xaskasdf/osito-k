@@ -66,6 +66,8 @@ SRC := \
   icd/venus/venus_cmd_BindImageMemory.c \
   icd/venus/venus_cmd_CreateFramebuffer.c \
   icd/venus/venus_cmd_DestroyFramebuffer.c \
+  icd/venus/venus_cmd_CreateDescriptorSetLayout.c \
+  icd/venus/venus_cmd_DestroyDescriptorSetLayout.c \
   icd/venus/venus_cmd_CreatePipelineLayout.c \
   icd/venus/venus_cmd_DestroyPipelineLayout.c \
   icd/venus/venus_cmd_CreateGraphicsPipelines.c \
@@ -78,6 +80,8 @@ SRC := \
   icd/venus/venus_cmd_EndCommandBuffer.c \
   icd/venus/venus_cmd_CmdBeginRenderPass.c \
   icd/venus/venus_cmd_CmdEndRenderPass.c \
+  icd/venus/venus_cmd_CmdBeginRendering.c \
+  icd/venus/venus_cmd_CmdEndRendering.c \
   icd/venus/venus_cmd_CmdBindPipeline.c \
   icd/venus/venus_cmd_CmdDraw.c \
   icd/venus/venus_cmd_CreateOsitokCompositorSurface.c \

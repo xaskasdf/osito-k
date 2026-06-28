@@ -120,7 +120,7 @@ namespace dxvk {
     rsState.polygonMode        = VK_POLYGON_MODE_FILL;
     rsState.cullMode           = VK_CULL_MODE_BACK_BIT;
     rsState.frontFace          = VK_FRONT_FACE_COUNTER_CLOCKWISE;
-    rsState.depthClipEnable    = VK_FALSE;
+    rsState.depthClipEnable    = VK_TRUE;
     rsState.depthBiasEnable    = VK_FALSE;
     rsState.conservativeMode   = VK_CONSERVATIVE_RASTERIZATION_MODE_DISABLED_EXT;
     rsState.sampleCount        = VK_SAMPLE_COUNT_1_BIT;

@@ -5,6 +5,26 @@
 #include "dxvk_device.h"
 #include "dxvk_context.h"
 
+#if defined(__OSITO_K__)
+extern "C" int printf(const char*, ...);
+
+static uint32_t ositok_dxvk_draw_log_count = 0;
+
+static void ositok_dxvk_log_draw(
+        const char* kind,
+        bool        committed,
+        uint32_t    a,
+        uint32_t    b,
+        uint32_t    c,
+        int32_t     d,
+        uint32_t    e) {
+  if (ositok_dxvk_draw_log_count++ < 96u) {
+    printf("[DXVKdraw] %s commit=%u a=%u b=%u c=%u d=%d e=%u\n",
+      kind, committed ? 1u : 0u, a, b, c, d, e);
+  }
+}
+#endif
+
 namespace dxvk {
   
   DxvkContext::DxvkContext(const Rc<DxvkDevice>& device, DxvkContextType type)
@@ -1302,7 +1322,12 @@ namespace dxvk {
           uint32_t instanceCount,
           uint32_t firstVertex,
           uint32_t firstInstance) {
-    if (this->commitGraphicsState<false, false>()) {
+    bool committed = this->commitGraphicsState<false, false>();
+#if defined(__OSITO_K__)
+    ositok_dxvk_log_draw("draw", committed,
+      vertexCount, instanceCount, firstVertex, 0, firstInstance);
+#endif
+    if (committed) {
       m_cmd->cmdDraw(
         vertexCount, instanceCount,
         firstVertex, firstInstance);
@@ -1316,7 +1341,12 @@ namespace dxvk {
           VkDeviceSize      offset,
           uint32_t          count,
           uint32_t          stride) {
-    if (this->commitGraphicsState<false, true>()) {
+    bool committed = this->commitGraphicsState<false, true>();
+#if defined(__OSITO_K__)
+    ositok_dxvk_log_draw("drawIndirect", committed,
+      uint32_t(offset), count, stride, 0, 0);
+#endif
+    if (committed) {
       auto descriptor = m_state.id.argBuffer.getDescriptor();
       
       m_cmd->cmdDrawIndirect(
@@ -1334,7 +1364,12 @@ namespace dxvk {
           VkDeviceSize      countOffset,
           uint32_t          maxCount,
           uint32_t          stride) {
-    if (this->commitGraphicsState<false, true>()) {
+    bool committed = this->commitGraphicsState<false, true>();
+#if defined(__OSITO_K__)
+    ositok_dxvk_log_draw("drawIndirectCount", committed,
+      uint32_t(offset), uint32_t(countOffset), maxCount, 0, stride);
+#endif
+    if (committed) {
       auto argDescriptor = m_state.id.argBuffer.getDescriptor();
       auto cntDescriptor = m_state.id.cntBuffer.getDescriptor();
       
@@ -1356,7 +1391,12 @@ namespace dxvk {
           uint32_t firstIndex,
           int32_t  vertexOffset,
           uint32_t firstInstance) {
-    if (this->commitGraphicsState<true, false>()) {
+    bool committed = this->commitGraphicsState<true, false>();
+#if defined(__OSITO_K__)
+    ositok_dxvk_log_draw("drawIndexed", committed,
+      indexCount, instanceCount, firstIndex, vertexOffset, firstInstance);
+#endif
+    if (committed) {
       m_cmd->cmdDrawIndexed(
         indexCount, instanceCount,
         firstIndex, vertexOffset,
@@ -1371,7 +1411,12 @@ namespace dxvk {
           VkDeviceSize      offset,
           uint32_t          count,
           uint32_t          stride) {
-    if (this->commitGraphicsState<true, true>()) {
+    bool committed = this->commitGraphicsState<true, true>();
+#if defined(__OSITO_K__)
+    ositok_dxvk_log_draw("drawIndexedIndirect", committed,
+      uint32_t(offset), count, stride, 0, 0);
+#endif
+    if (committed) {
       auto descriptor = m_state.id.argBuffer.getDescriptor();
       
       m_cmd->cmdDrawIndexedIndirect(
@@ -1389,7 +1434,12 @@ namespace dxvk {
           VkDeviceSize      countOffset,
           uint32_t          maxCount,
           uint32_t          stride) {
-    if (this->commitGraphicsState<true, true>()) {
+    bool committed = this->commitGraphicsState<true, true>();
+#if defined(__OSITO_K__)
+    ositok_dxvk_log_draw("drawIndexedIndirectCount", committed,
+      uint32_t(offset), uint32_t(countOffset), maxCount, 0, stride);
+#endif
+    if (committed) {
       auto argDescriptor = m_state.id.argBuffer.getDescriptor();
       auto cntDescriptor = m_state.id.cntBuffer.getDescriptor();
       
@@ -1409,7 +1459,12 @@ namespace dxvk {
     const DxvkBufferSlice&  counterBuffer,
           uint32_t          counterDivisor,
           uint32_t          counterBias) {
-    if (this->commitGraphicsState<false, false>()) {
+    bool committed = this->commitGraphicsState<false, false>();
+#if defined(__OSITO_K__)
+    ositok_dxvk_log_draw("drawIndirectXfb", committed,
+      counterDivisor, counterBias, 0, 0, 0);
+#endif
+    if (committed) {
       auto physSlice = counterBuffer.getSliceHandle();
 
       m_cmd->cmdDrawIndirectVertexCount(1, 0,
@@ -2563,6 +2618,8 @@ namespace dxvk {
       rs.depthClipEnable,
       rs.depthBiasEnable,
       rs.polygonMode,
+      rs.cullMode,
+      rs.frontFace,
       rs.sampleCount,
       rs.conservativeMode,
       rs.flatShading,
@@ -5084,9 +5141,7 @@ namespace dxvk {
       ? DxvkContextFlag::GpDynamicBlendConstants
       : DxvkContextFlag::GpDirtyBlendConstants);
     
-    m_flags.set((!m_state.gp.flags.test(DxvkGraphicsPipelineFlag::HasRasterizerDiscard))
-      ? DxvkContextFlag::GpDynamicRasterizerState
-      : DxvkContextFlag::GpDirtyRasterizerState);
+    m_flags.set(DxvkContextFlag::GpDirtyRasterizerState);
 
     // Retrieve and bind actual Vulkan pipeline handle
     auto pipelineInfo = m_state.gp.pipeline->getPipelineHandle(m_state.gp.state);
@@ -5114,6 +5169,9 @@ namespace dxvk {
        && m_device->features().extExtendedDynamicState3.extendedDynamicState3RasterizationSamples
        && m_device->features().extExtendedDynamicState3.extendedDynamicState3SampleMask)
         m_flags.set(DxvkContextFlag::GpDynamicMultisampleState);
+
+      if (!m_state.gp.flags.test(DxvkGraphicsPipelineFlag::HasRasterizerDiscard))
+        m_flags.set(DxvkContextFlag::GpDynamicRasterizerState);
     } else {
       m_flags.set(m_state.gp.state.useDynamicDepthBias()
         ? DxvkContextFlag::GpDynamicDepthBias

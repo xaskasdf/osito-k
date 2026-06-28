@@ -52,13 +52,36 @@ namespace dxvk {
 
     // Don't acquire more than one image at a time
     if (m_acquireStatus == VK_NOT_READY) {
+#if defined(__OSITO_K__)
+      static uint32_t s_acquireLogCount = 0;
+      const bool logAcquire = s_acquireLogCount < 32;
+      if (logAcquire) {
+        printf("[DXVKprs] acquire begin swap=0x%llx frameIndex=%u sem=0x%llx\n",
+          (unsigned long long)m_swapchain, m_frameIndex,
+          (unsigned long long)sync.acquire);
+      }
+#endif
       m_acquireStatus = m_vkd->vkAcquireNextImageKHR(m_vkd->device(),
         m_swapchain, std::numeric_limits<uint64_t>::max(),
         sync.acquire, VK_NULL_HANDLE, &m_imageIndex);
+#if defined(__OSITO_K__)
+      if (logAcquire || (m_acquireStatus != VK_SUCCESS && m_acquireStatus != VK_SUBOPTIMAL_KHR)) {
+        printf("[DXVKprs] acquire done rc=%d image=%u swap=0x%llx\n",
+          int32_t(m_acquireStatus), m_imageIndex,
+          (unsigned long long)m_swapchain);
+        if (s_acquireLogCount < 32)
+          s_acquireLogCount += 1;
+      }
+#endif
     }
 
-    if (m_acquireStatus != VK_SUCCESS && m_acquireStatus != VK_SUBOPTIMAL_KHR)
+    if (m_acquireStatus != VK_SUCCESS && m_acquireStatus != VK_SUBOPTIMAL_KHR) {
+#if defined(__OSITO_K__)
+      printf("[DXVKprs] acquire returning cached rc=%d swap=0x%llx\n",
+        int32_t(m_acquireStatus), (unsigned long long)m_swapchain);
+#endif
       return m_acquireStatus;
+    }
     
     index = m_imageIndex;
     return m_acquireStatus;
@@ -91,8 +114,27 @@ namespace dxvk {
     if (m_device->features().extSwapchainMaintenance1.swapchainMaintenance1)
       modeInfo.pNext = const_cast<void*>(std::exchange(info.pNext, &modeInfo));
 
+#if defined(__OSITO_K__)
+    static uint32_t s_presentLogCount = 0;
+    const bool logPresent = s_presentLogCount < 16;
+    if (logPresent) {
+      printf("[DXVKprs] present queue begin frame=%llu image=%u mode=%d swap=0x%llx\n",
+        (unsigned long long)frameId, m_imageIndex, int32_t(mode),
+        (unsigned long long)m_swapchain);
+    }
+#endif
+
     VkResult status = m_vkd->vkQueuePresentKHR(
       m_device->queues().graphics.queueHandle, &info);
+
+#if defined(__OSITO_K__)
+    if (logPresent || (status != VK_SUCCESS && status != VK_SUBOPTIMAL_KHR)) {
+      printf("[DXVKprs] present queue done rc=%d frame=%llu image=%u\n",
+        int32_t(status), (unsigned long long)frameId, m_imageIndex);
+      if (s_presentLogCount < 16)
+        s_presentLogCount += 1;
+    }
+#endif
 
     if (status != VK_SUCCESS && status != VK_SUBOPTIMAL_KHR)
       return status;

@@ -1,31 +1,12 @@
-/*
- * Encoder for vkCreateBuffer over venus.
- *
- * Request payload (flattened VkBufferCreateInfo — W3b.3 subset, no pNext
- * chain, queue family array capped):
- *   dev_id                        (u64)
- *   flags                         (u32)
- *   pad                           (u32)
- *   size                          (u64)
- *   usage                         (u32)
- *   sharingMode                   (u32)
- *   queueFamilyIndexCount         (u32)
- *   pad2                          (u32)
- *   queueFamilyIndexCount * u32   (variable)
- *   pAllocator_present            (u32)  always 0
- *   pBuffer_present               (u32)  always 1
- *
- * Reply:
- *   VkResult                      (u32)
- *   pad                           (u32)
- *   host VkBuffer id              (u64)
- *
- * See master plan §W3b.3 T8. */
 #include "venus_wire.h"
-#include "venus_proto_core.h"
+#include "venus_cmd_writer.h"
 #include "venus.h"
 
 #define VENUS_CB_MAX_QFI 8u
+#define VN_CMD_TYPE_vkCreateBuffer 50u
+#define VN_CMD_GENERATE_REPLY 1u
+
+extern int printf(const char *, ...);
 
 int venus_cmd_encode_CreateBuffer(
         struct venus_wire *w, uint64_t dev_id,
@@ -33,44 +14,65 @@ int venus_cmd_encode_CreateBuffer(
         uint64_t *out_buffer_id) {
     if (!w || !pCreateInfo || !out_buffer_id) return -22;
 
+    extern uint64_t venus_wire_alloc_object_id(struct venus_wire *);
+
+    uint8_t cmd[512];
+    uint8_t reply[24];
+    struct venus_cmd_writer wr = { cmd, 0, sizeof(cmd), 0 };
+    uint64_t buffer_id = venus_wire_alloc_object_id(w);
+    if (!buffer_id) return -12;
+
     uint32_t qfi_count = pCreateInfo->queueFamilyIndexCount;
     if (qfi_count > VENUS_CB_MAX_QFI) qfi_count = VENUS_CB_MAX_QFI;
 
-    uint32_t size = 8u + 4u + 4u + 8u + 4u + 4u + 4u + 4u
-                    + qfi_count * 4u + 4u + 4u;
+    vcw_wr_i32(&wr, (int32_t)VN_CMD_TYPE_vkCreateBuffer);
+    vcw_wr_u32(&wr, VN_CMD_GENERATE_REPLY);
+    vcw_wr_u64(&wr, dev_id);
 
-    uint64_t reply_id = 0;
-    uint8_t *p = venus_wire_alloc_cmd(
-            w, VN_CMD_vkCreateBuffer,
-            VENUS_CMD_FLAG_REPLY_EXPECTED,
-            size, &reply_id);
-    if (!p) return -12;
-
-    uint32_t off = 0;
-    *(uint64_t *)(p + off) = dev_id;                     off += 8;
-    *(uint32_t *)(p + off) = pCreateInfo->flags;         off += 4;
-    *(uint32_t *)(p + off) = 0u;                         off += 4;
-    *(uint64_t *)(p + off) = pCreateInfo->size;          off += 8;
-    *(uint32_t *)(p + off) = pCreateInfo->usage;         off += 4;
-    *(uint32_t *)(p + off) = (uint32_t)pCreateInfo->sharingMode; off += 4;
-    *(uint32_t *)(p + off) = qfi_count;                  off += 4;
-    *(uint32_t *)(p + off) = 0u;                         off += 4;
+    vcw_wr_u64(&wr, 1);                                      /* pCreateInfo */
+    vcw_wr_i32(&wr, VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO);
+    vcw_wr_u64(&wr, 0);                                      /* pNext */
+    vcw_wr_u32(&wr, pCreateInfo->flags);
+    vcw_wr_u64(&wr, pCreateInfo->size);
+    vcw_wr_u32(&wr, pCreateInfo->usage);
+    vcw_wr_i32(&wr, (int32_t)pCreateInfo->sharingMode);
+    vcw_wr_u32(&wr, qfi_count);
+    vcw_wr_array_size(&wr, qfi_count);
     for (uint32_t i = 0; i < qfi_count; i++) {
         uint32_t idx = pCreateInfo->pQueueFamilyIndices
                        ? pCreateInfo->pQueueFamilyIndices[i] : 0u;
-        *(uint32_t *)(p + off) = idx;                    off += 4;
+        vcw_wr_u32(&wr, idx);
     }
-    *(uint32_t *)(p + off) = 0u; off += 4; /* pAllocator */
-    *(uint32_t *)(p + off) = 1u; off += 4; /* pBuffer present */
 
-    int rc = venus_wire_submit(w);
-    if (rc < 0) return rc;
+    vcw_wr_u64(&wr, 0);                                      /* pAllocator */
+    vcw_wr_u64(&wr, 1);                                      /* pBuffer */
+    vcw_wr_u64(&wr, buffer_id);
+    if (wr.err) return wr.err;
 
-    uint8_t reply[16] = {0};
-    int got = venus_wire_wait_reply(w, reply_id, reply, sizeof(reply));
-    if (got < 16) return -5;
+    for (uint32_t i = 0; i < sizeof(reply); i++)
+        reply[i] = 0;
+    int rc = venus_wire_submit_reply(w, cmd, wr.off, reply, sizeof(reply));
+    if (rc < (int)sizeof(reply)) return rc < 0 ? rc : -5;
 
-    uint32_t vk_result = ((uint32_t *)reply)[0];
-    *out_buffer_id = *(uint64_t *)(reply + 8);
-    return (int)vk_result;
+    uint32_t reply_cmd = *(uint32_t *)(reply + 0);
+    uint32_t vk_result = *(uint32_t *)(reply + 4);
+    uint64_t present   = *(uint64_t *)(reply + 8);
+    uint64_t buf_reply = *(uint64_t *)(reply + 16);
+    static uint32_t log_count;
+    if (log_count < 16u) {
+        log_count++;
+        printf("[VCB] reply cmd=%u vk=%u present=%llu buf=%llu guest=%llu bytes=%u\n",
+               reply_cmd, vk_result, (unsigned long long)present,
+               (unsigned long long)buf_reply,
+               (unsigned long long)buffer_id, wr.off);
+    }
+    if (reply_cmd != VN_CMD_TYPE_vkCreateBuffer)
+        return -5;
+    if (vk_result != VK_SUCCESS)
+        return (int)vk_result;
+    if (!present || !buf_reply)
+        return -5;
+
+    *out_buffer_id = buffer_id;
+    return VK_SUCCESS;
 }

@@ -45,9 +45,11 @@ extern int venus_cmd_encode_DestroySurface(struct venus_instance *, uint64_t);
 extern int venus_cmd_encode_GetDeviceQueue(
         struct venus_device *, uint32_t, uint32_t, struct venus_queue **);
 extern int venus_cmd_encode_QueueSubmit(
-        struct venus_device *, uint32_t, const VkSubmitInfo *, uint64_t);
+        struct venus_device *, struct venus_queue *,
+        uint32_t, const VkSubmitInfo *, uint64_t);
 extern int venus_cmd_encode_QueueSubmit2(
-        struct venus_device *, uint32_t, const VkSubmitInfo2 *, uint64_t);
+        struct venus_device *, struct venus_queue *,
+        uint32_t, const VkSubmitInfo2 *, uint64_t);
 extern int venus_cmd_encode_QueueWaitIdle(struct venus_device *);
 extern int venus_cmd_encode_DeviceWaitIdle(struct venus_device *);
 extern int venus_cmd_encode_CreateFence(
@@ -151,6 +153,8 @@ venus_DestroySurfaceKHR(VkInstance instance, VkSurfaceKHR surface,
 /* ---- Queue + device-wait. ---- */
 
 static struct venus_device *g_w3b5_queue_fallback_dev;
+static uint32_t venus_w3b5_log_img_bind_diag;
+static uint32_t venus_w3b5_log_getswap_diag;
 
 VKAPI_ATTR void VKAPI_CALL
 venus_GetDeviceQueue(VkDevice device, uint32_t queueFamilyIndex,
@@ -184,7 +188,8 @@ venus_QueueSubmit(VkQueue queue, uint32_t submitCount,
                   const VkSubmitInfo *pSubmits, VkFence fence) {
     struct venus_device *dev = queue_to_dev(queue);
     if (!dev) return VK_ERROR_INITIALIZATION_FAILED;
-    int rc = venus_cmd_encode_QueueSubmit(dev, submitCount, pSubmits,
+    int rc = venus_cmd_encode_QueueSubmit(dev, (struct venus_queue *)queue,
+                                          submitCount, pSubmits,
                                           (uint64_t)fence);
     if (rc < 0) return VK_ERROR_DEVICE_LOST;
     return (VkResult)rc;
@@ -198,7 +203,8 @@ venus_QueueSubmit2(VkQueue queue, uint32_t submitCount,
         printf("[VQ2] missing dev queue=%p\n", (void *)queue);
         return VK_ERROR_INITIALIZATION_FAILED;
     }
-    int rc = venus_cmd_encode_QueueSubmit2(dev, submitCount, pSubmits,
+    int rc = venus_cmd_encode_QueueSubmit2(dev, (struct venus_queue *)queue,
+                                           submitCount, pSubmits,
                                            (uint64_t)fence);
     printf("[VQ2] submit2 count=%u rc=%d fence=0x%llx\n",
            submitCount, rc, (unsigned long long)(uintptr_t)fence);
@@ -346,8 +352,21 @@ venus_GetSwapchainImagesKHR(VkDevice device, VkSwapchainKHR swapchain,
                             uint32_t *pCount, VkImage *pImages) {
     if (!device || !swapchain || !pCount) return VK_ERROR_INITIALIZATION_FAILED;
     struct venus_device *dev = (struct venus_device *)device;
+    int sc_slot = nd_handle_slot((uint64_t)swapchain);
+    if (venus_w3b5_log_getswap_diag < 12u) {
+        venus_w3b5_log_getswap_diag++;
+        printf("[VSGI] dev=%p swap=0x%llx slot=%d pCount=%p in=%u imgs=%p\n",
+               (void *)dev, (unsigned long long)(uint64_t)swapchain, sc_slot,
+               (void *)pCount, pCount ? *pCount : 0u, (void *)pImages);
+    }
     int rc = venus_cmd_encode_GetSwapchainImagesKHR(
-            dev, nd_handle_slot((uint64_t)swapchain), pCount, pImages);
+            dev, sc_slot, pCount, pImages);
+    if (venus_w3b5_log_getswap_diag < 12u) {
+        venus_w3b5_log_getswap_diag++;
+        printf("[VSGI] done rc=%d out=%u first=0x%llx\n",
+               rc, pCount ? *pCount : 0u,
+               (pImages && *pCount) ? (unsigned long long)(uintptr_t)pImages[0] : 0ull);
+    }
     if (rc < 0) return VK_ERROR_INITIALIZATION_FAILED;
     return (VkResult)rc;
 }
@@ -477,12 +496,14 @@ venus_BindImageMemory(VkDevice device, VkImage image, VkDeviceMemory memory,
             long mapped = __syscall1(SYS_SHM_MAP, shm);
             if (mapped != 0) {
                 /* Free the old malloc-backed buffer (if any). */
-                if (m->local_ptr && !m->is_shm_backed) {
+                if (m->local_ptr && !m->is_shm_backed && !m->is_gpu_backed) {
                     free(m->local_ptr);
                     m->local_ptr = 0;
                 }
                 m->local_ptr     = (void *)(uintptr_t)mapped;
                 m->is_shm_backed = 1;
+                m->is_gpu_backed = 0;
+                m->gpu_res_id    = 0;
                 m->shm_handle    = (uint32_t)shm;
                 m->size          = bytes;
                 m->shm_width     = w;
@@ -493,6 +514,18 @@ venus_BindImageMemory(VkDevice device, VkImage image, VkDeviceMemory memory,
                 (void)__syscall1(SYS_SHM_DESTROY, shm);
             }
         }
+    }
+
+    if (venus_w3b5_log_img_bind_diag < 32u) {
+        venus_w3b5_log_img_bind_diag++;
+        printf("[VIMGD] bind img=%d imghost=%llu mem=%d memhost=%llu swap=%u shm=%u gpu=%u res=%u offset=%llu forward=%u\n",
+               islot, (unsigned long long)img->host_id,
+               mslot, (unsigned long long)m->host_id,
+               img->is_swapchain_owned, m->is_shm_backed,
+               m->is_gpu_backed, m->gpu_res_id,
+               (unsigned long long)memoryOffset,
+               (dev->parent && dev->parent->wire &&
+                img->host_id != 0 && m->host_id != 0) ? 1u : 0u);
     }
 
     /* Keep wire forwarding only when both sides have a real host id. */

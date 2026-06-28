@@ -1,40 +1,12 @@
-/*
- * Encoder for vkCreateImage over venus.
- *
- * Request payload (flattened VkImageCreateInfo — W3b.4 subset):
- *   dev_id               (u64)
- *   flags                (u32)
- *   imageType            (u32)
- *   format               (u32)
- *   pad                  (u32)
- *   extent.width         (u32)
- *   extent.height        (u32)
- *   extent.depth         (u32)
- *   mipLevels            (u32)
- *   arrayLayers          (u32)
- *   samples              (u32)
- *   tiling               (u32)
- *   pad2                 (u32)
- *   usage                (u32)
- *   sharingMode          (u32)
- *   queueFamilyIndexCount(u32)
- *   pad3                 (u32)
- *   qfi[] * u32          (variable)
- *   initialLayout        (u32)
- *   pAllocator_present   (u32)  always 0
- *   pImage_present       (u32)  always 1
- *   pad4                 (u32)
- *
- * Reply:
- *   VkResult             (u32)
- *   pad                  (u32)
- *   host VkImage id      (u64)
- */
 #include "venus_wire.h"
-#include "venus_proto_core.h"
+#include "venus_cmd_writer.h"
 #include "venus.h"
 
 #define VENUS_CI_MAX_QFI 8u
+#define VN_CMD_TYPE_vkCreateImage 54u
+#define VN_CMD_GENERATE_REPLY 1u
+
+extern int printf(const char *, ...);
 
 int venus_cmd_encode_CreateImage(
         struct venus_wire *w, uint64_t dev_id,
@@ -42,62 +14,76 @@ int venus_cmd_encode_CreateImage(
         uint64_t *out_image_id) {
     if (!w || !pCreateInfo || !out_image_id) return -22;
 
+    extern uint64_t venus_wire_alloc_object_id(struct venus_wire *);
+
+    uint8_t cmd[768];
+    uint8_t reply[24];
+    struct venus_cmd_writer wr = { cmd, 0, sizeof(cmd), 0 };
+    uint64_t image_id = venus_wire_alloc_object_id(w);
+    if (!image_id) return -12;
+
     uint32_t qfi_count = pCreateInfo->queueFamilyIndexCount;
     if (qfi_count > VENUS_CI_MAX_QFI) qfi_count = VENUS_CI_MAX_QFI;
 
-    uint32_t payload =
-          8u                      /* dev_id */
-        + 4u + 4u + 4u + 4u       /* flags/type/format/pad */
-        + 4u + 4u + 4u            /* extent */
-        + 4u + 4u + 4u + 4u + 4u  /* mip/layers/samples/tiling/pad */
-        + 4u + 4u + 4u + 4u       /* usage/sharing/qfi_count/pad */
-        + qfi_count * 4u
-        + 4u + 4u + 4u + 4u;      /* initialLayout/pAlloc/pImage/pad */
-    payload = (payload + 7u) & ~7u;
+    vcw_wr_i32(&wr, (int32_t)VN_CMD_TYPE_vkCreateImage);
+    vcw_wr_u32(&wr, VN_CMD_GENERATE_REPLY);
+    vcw_wr_u64(&wr, dev_id);
 
-    uint64_t reply_id = 0;
-    uint8_t *p = venus_wire_alloc_cmd(
-            w, VN_CMD_vkCreateImage,
-            VENUS_CMD_FLAG_REPLY_EXPECTED,
-            payload, &reply_id);
-    if (!p) return -12;
-
-    uint32_t off = 0;
-    *(uint64_t *)(p + off) = dev_id;                                  off += 8;
-    *(uint32_t *)(p + off) = pCreateInfo->flags;                      off += 4;
-    *(uint32_t *)(p + off) = (uint32_t)pCreateInfo->imageType;        off += 4;
-    *(uint32_t *)(p + off) = (uint32_t)pCreateInfo->format;           off += 4;
-    *(uint32_t *)(p + off) = 0u;                                      off += 4;
-    *(uint32_t *)(p + off) = pCreateInfo->extent.width;               off += 4;
-    *(uint32_t *)(p + off) = pCreateInfo->extent.height;              off += 4;
-    *(uint32_t *)(p + off) = pCreateInfo->extent.depth;               off += 4;
-    *(uint32_t *)(p + off) = pCreateInfo->mipLevels;                  off += 4;
-    *(uint32_t *)(p + off) = pCreateInfo->arrayLayers;                off += 4;
-    *(uint32_t *)(p + off) = (uint32_t)pCreateInfo->samples;          off += 4;
-    *(uint32_t *)(p + off) = (uint32_t)pCreateInfo->tiling;           off += 4;
-    *(uint32_t *)(p + off) = 0u;                                      off += 4;
-    *(uint32_t *)(p + off) = pCreateInfo->usage;                      off += 4;
-    *(uint32_t *)(p + off) = (uint32_t)pCreateInfo->sharingMode;      off += 4;
-    *(uint32_t *)(p + off) = qfi_count;                               off += 4;
-    *(uint32_t *)(p + off) = 0u;                                      off += 4;
+    vcw_wr_u64(&wr, 1);                                      /* pCreateInfo */
+    vcw_wr_i32(&wr, VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO);
+    vcw_wr_u64(&wr, 0);                                      /* pNext */
+    vcw_wr_u32(&wr, pCreateInfo->flags);
+    vcw_wr_i32(&wr, (int32_t)pCreateInfo->imageType);
+    vcw_wr_i32(&wr, (int32_t)pCreateInfo->format);
+    vcw_wr_u32(&wr, pCreateInfo->extent.width);
+    vcw_wr_u32(&wr, pCreateInfo->extent.height);
+    vcw_wr_u32(&wr, pCreateInfo->extent.depth);
+    vcw_wr_u32(&wr, pCreateInfo->mipLevels);
+    vcw_wr_u32(&wr, pCreateInfo->arrayLayers);
+    vcw_wr_i32(&wr, (int32_t)pCreateInfo->samples);
+    vcw_wr_i32(&wr, (int32_t)pCreateInfo->tiling);
+    vcw_wr_u32(&wr, pCreateInfo->usage);
+    vcw_wr_i32(&wr, (int32_t)pCreateInfo->sharingMode);
+    vcw_wr_u32(&wr, qfi_count);
+    vcw_wr_array_size(&wr, qfi_count);
     for (uint32_t i = 0; i < qfi_count; i++) {
         uint32_t idx = pCreateInfo->pQueueFamilyIndices
                        ? pCreateInfo->pQueueFamilyIndices[i] : 0u;
-        *(uint32_t *)(p + off) = idx;                                 off += 4;
+        vcw_wr_u32(&wr, idx);
     }
-    *(uint32_t *)(p + off) = (uint32_t)pCreateInfo->initialLayout;    off += 4;
-    *(uint32_t *)(p + off) = 0u; off += 4;  /* pAllocator null */
-    *(uint32_t *)(p + off) = 1u; off += 4;  /* pImage present */
-    *(uint32_t *)(p + off) = 0u; off += 4;  /* pad */
 
-    int rc = venus_wire_submit(w);
-    if (rc < 0) return rc;
+    vcw_wr_i32(&wr, (int32_t)pCreateInfo->initialLayout);
+    vcw_wr_u64(&wr, 0);                                      /* pAllocator */
+    vcw_wr_u64(&wr, 1);                                      /* pImage */
+    vcw_wr_u64(&wr, image_id);
+    if (wr.err) return wr.err;
 
-    uint8_t reply[16] = {0};
-    int got = venus_wire_wait_reply(w, reply_id, reply, sizeof(reply));
-    if (got < 16) return -5;
+    for (uint32_t i = 0; i < sizeof(reply); i++)
+        reply[i] = 0;
+    int rc = venus_wire_submit_reply(w, cmd, wr.off, reply, sizeof(reply));
+    if (rc < (int)sizeof(reply)) return rc < 0 ? rc : -5;
 
-    uint32_t vk_result = ((uint32_t *)reply)[0];
-    *out_image_id = *(uint64_t *)(reply + 8);
-    return (int)vk_result;
+    uint32_t reply_cmd = *(uint32_t *)(reply + 0);
+    uint32_t vk_result = *(uint32_t *)(reply + 4);
+    uint64_t present   = *(uint64_t *)(reply + 8);
+    uint64_t img_reply = *(uint64_t *)(reply + 16);
+    static uint32_t log_count;
+    if (log_count < 16u) {
+        log_count++;
+        printf("[VCI] reply cmd=%u vk=%u present=%llu img=%llu guest=%llu bytes=%u %ux%u fmt=%u usage=0x%x\n",
+               reply_cmd, vk_result, (unsigned long long)present,
+               (unsigned long long)img_reply,
+               (unsigned long long)image_id, wr.off,
+               pCreateInfo->extent.width, pCreateInfo->extent.height,
+               (uint32_t)pCreateInfo->format, pCreateInfo->usage);
+    }
+    if (reply_cmd != VN_CMD_TYPE_vkCreateImage)
+        return -5;
+    if (vk_result != VK_SUCCESS)
+        return (int)vk_result;
+    if (!present || !img_reply)
+        return -5;
+
+    *out_image_id = image_id;
+    return VK_SUCCESS;
 }

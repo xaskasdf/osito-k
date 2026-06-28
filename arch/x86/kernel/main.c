@@ -84,6 +84,8 @@ extern void fb_puts(const char *s);
 extern void fb_puts_color(const char *s, uint32_t color);
 extern void fb_putdec(uint64_t val);
 extern void fb_puthex(uint64_t val, int digits);
+extern void display_set_available_modes(const boot_display_mode_t *modes,
+                                        uint32_t count, uint32_t current);
 
 /* Memory */
 extern void mem_init(void *mmap, uint64_t mmap_size, uint64_t desc_size);
@@ -482,6 +484,10 @@ void __initk kernel_entry(boot_info_t *info)
         serial_puts("[FB] GOP framebuffer unavailable; using serial until GPU init\n");
     }
     fb_init(boot_fb, info->fb_width, info->fb_height, info->fb_pitch);
+    if (info->display_mode_count > 0)
+        display_set_available_modes(info->display_modes,
+                                    info->display_mode_count,
+                                    info->display_current_mode);
     fb_clear();
 
     /* Store ACPI RSDP for smp.c */
@@ -1038,7 +1044,9 @@ void __initk kernel_entry(boot_info_t *info)
     static llama_state_t llama;
     bool model_ready = false;
     if (fs_mounted) {
+#ifdef OSITO_BOOT_LIST_FS
         osfs2_list();
+#endif
 
         /* Cluster PSK (oict-key.txt) + cluster.json live on OsitoFS,
          * which only just mounted — cluster_init() ran earlier (before

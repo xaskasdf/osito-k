@@ -1,33 +1,21 @@
-/*
- * Encoder for vkDestroyBuffer over venus.
- *
- * Request payload:
- *   dev_id             (u64)
- *   buf_id             (u64)
- *   pAllocator_present (u32)  always 0
- *   pad                (u32)
- *
- * No reply expected. */
 #include "venus_wire.h"
-#include "venus_proto_core.h"
+#include "venus_cmd_writer.h"
 #include "venus.h"
+
+#define VN_CMD_TYPE_vkDestroyBuffer 51u
 
 int venus_cmd_encode_DestroyBuffer(struct venus_wire *w,
                                    uint64_t dev_id, uint64_t buf_id) {
     if (!w) return -22;
 
-    uint64_t reply_id = 0;
-    uint8_t *p = venus_wire_alloc_cmd(
-            w, VN_CMD_vkDestroyBuffer,
-            0u /* no reply */,
-            8u + 8u + 4u + 4u,
-            &reply_id);
-    if (!p) return -12;
+    uint8_t cmd[48];
+    struct venus_cmd_writer wr = { cmd, 0, sizeof(cmd), 0 };
 
-    *(uint64_t *)(p + 0)  = dev_id;
-    *(uint64_t *)(p + 8)  = buf_id;
-    *(uint32_t *)(p + 16) = 0u;
-    *(uint32_t *)(p + 20) = 0u;
-
-    return venus_wire_submit(w);
+    vcw_wr_i32(&wr, (int32_t)VN_CMD_TYPE_vkDestroyBuffer);
+    vcw_wr_u32(&wr, 0);
+    vcw_wr_u64(&wr, dev_id);
+    vcw_wr_u64(&wr, buf_id);
+    vcw_wr_u64(&wr, 0);                                      /* pAllocator */
+    if (wr.err) return wr.err;
+    return venus_wire_submit_raw(w, cmd, wr.off);
 }

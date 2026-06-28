@@ -287,21 +287,32 @@ namespace dxvk {
           UINT                      SyncInterval,
           UINT                      PresentFlags,
     const DXGI_PRESENT_PARAMETERS*  pPresentParameters) {
-    printf("[D11sc] Present enter sync=%u flags=0x%x dirty=%u hasSwap=%u\n",
-      SyncInterval, PresentFlags, m_dirty ? 1u : 0u,
-      m_presenter->hasSwapChain() ? 1u : 0u);
-
     const bool presentTest = (PresentFlags & DXGI_PRESENT_TEST) != 0;
 #if defined(__OSITO_K__)
-    if (presentTest)
+    static uint32_t s_presentLogCount = 0;
+    const bool tracePresent = presentTest || s_presentLogCount < 16;
+    if (tracePresent && !presentTest)
+      s_presentLogCount += 1;
+#else
+    const bool tracePresent = true;
+#endif
+
+    if (tracePresent)
+      printf("[D11sc] Present enter sync=%u flags=0x%x dirty=%u hasSwap=%u\n",
+        SyncInterval, PresentFlags, m_dirty ? 1u : 0u,
+        m_presenter->hasSwapChain() ? 1u : 0u);
+
+#if defined(__OSITO_K__)
+    if (tracePresent && presentTest)
       printf("[D11sc] OsitoK honoring DXGI_PRESENT_TEST flags=0x%x\n",
         PresentFlags);
 #endif
 
     if (!presentTest)
       m_dirty |= m_presenter->setSyncInterval(SyncInterval) != VK_SUCCESS;
-    printf("[D11sc] Present after setSync dirty=%u hasSwap=%u\n",
-      m_dirty ? 1u : 0u, m_presenter->hasSwapChain() ? 1u : 0u);
+    if (tracePresent)
+      printf("[D11sc] Present after setSync dirty=%u hasSwap=%u\n",
+        m_dirty ? 1u : 0u, m_presenter->hasSwapChain() ? 1u : 0u);
 
     HRESULT hr = S_OK;
 
@@ -318,8 +329,9 @@ namespace dxvk {
     }
 
     VkResult deviceStatus = m_device->getDeviceStatus();
-    printf("[D11sc] Present device status=%d hr=0x%x\n",
-      (int)deviceStatus, (unsigned)hr);
+    if (tracePresent || deviceStatus != VK_SUCCESS || hr != S_OK)
+      printf("[D11sc] Present device status=%d hr=0x%x\n",
+        (int)deviceStatus, (unsigned)hr);
     if (deviceStatus != VK_SUCCESS) {
       printf("[D11sc] Present device status=%d -> DXGI_ERROR_DEVICE_RESET\n",
         (int)deviceStatus);
@@ -327,7 +339,8 @@ namespace dxvk {
     }
 
     if (presentTest) {
-      printf("[D11sc] Present test returning hr=0x%x\n", (unsigned)hr);
+      if (tracePresent)
+        printf("[D11sc] Present test returning hr=0x%x\n", (unsigned)hr);
       return hr;
     }
 
@@ -344,16 +357,24 @@ namespace dxvk {
     }
 
     /* try */ {
-      printf("[D11sc] PresentImage begin\n");
+      if (tracePresent)
+        printf("[D11sc] PresentImage begin\n");
       hr = PresentImage(SyncInterval);
-      printf("[D11sc] PresentImage done hr=0x%x\n", (unsigned)hr);
+      if (tracePresent || hr != S_OK)
+        printf("[D11sc] PresentImage done hr=0x%x\n", (unsigned)hr);
     }  /* ositok-W5.3: catch elided (-fno-exceptions) */
 
     // Ensure to synchronize and release the frame latency semaphore
     // even if presentation failed with STATUS_OCCLUDED, or otherwise
     // applications using the semaphore may deadlock. This works because
     // we do not increment the frame ID in those situations.
+    if (tracePresent)
+      printf("[D11sc] SyncFrameLatency call begin frame=%llu\n",
+        (unsigned long long)m_frameId);
     SyncFrameLatency();
+    if (tracePresent)
+      printf("[D11sc] SyncFrameLatency call done frame=%llu\n",
+        (unsigned long long)m_frameId);
     return hr;
   }
 
@@ -753,19 +774,42 @@ namespace dxvk {
 
   void D3D11SwapChain::SyncFrameLatency() {
     // Wait for the sync event so that we respect the maximum frame latency
-    m_frameLatencySignal->wait(m_frameId - GetActualFrameLatency());
+    uint32_t actualLatency = GetActualFrameLatency();
+    uint64_t targetFrame = m_frameId >= actualLatency
+      ? m_frameId - actualLatency
+      : 0;
+
+    printf("[D11sc] SyncFrameLatency begin frame=%llu actual=%u target=%llu signal=%llu\n",
+      (unsigned long long)m_frameId,
+      actualLatency,
+      (unsigned long long)targetFrame,
+      (unsigned long long)m_frameLatencySignal->value());
+
+    m_frameLatencySignal->wait(targetFrame);
+
+    printf("[D11sc] SyncFrameLatency wait done frame=%llu signal=%llu\n",
+      (unsigned long long)m_frameId,
+      (unsigned long long)m_frameLatencySignal->value());
 
     m_frameLatencySignal->setCallback(m_frameId, [this,
       cFrameId           = m_frameId,
       cFrameLatencyEvent = m_frameLatencyEvent
     ] () {
+      printf("[D11sc] SyncFrameLatency callback begin frame=%llu event=%p\n",
+        (unsigned long long)cFrameId, cFrameLatencyEvent);
       if (cFrameLatencyEvent)
         ReleaseSemaphore(cFrameLatencyEvent, 1, nullptr);
 
       std::lock_guard<dxvk::mutex> lock(m_frameStatisticsLock);
       m_frameStatistics.PresentCount = cFrameId - DXGI_MAX_SWAP_CHAIN_BUFFERS;
       m_frameStatistics.PresentQPCTime = dxvk::high_resolution_clock::get_counter();
+      printf("[D11sc] SyncFrameLatency callback done frame=%llu\n",
+        (unsigned long long)cFrameId);
     });
+
+    printf("[D11sc] SyncFrameLatency callback armed frame=%llu signal=%llu\n",
+      (unsigned long long)m_frameId,
+      (unsigned long long)m_frameLatencySignal->value());
   }
 
 

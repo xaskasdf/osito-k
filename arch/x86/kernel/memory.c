@@ -515,7 +515,7 @@ void sys_caps_init(void)
     g_sys_caps.heap_grow_size = CLAMP(total / 1024, 64 * 1024, 4ULL * 1024 * 1024);
 
     /* Per-process limits */
-    g_sys_caps.brk_heap_size   = CLAMP(total / 16, 16ULL * 1024 * 1024, 64ULL * 1024 * 1024);
+    g_sys_caps.brk_heap_size   = CLAMP(total / 8, 16ULL * 1024 * 1024, 1024ULL * 1024 * 1024);
     g_sys_caps.user_stack_size = CLAMP(total / 64, 1ULL * 1024 * 1024, 8ULL * 1024 * 1024);
     g_sys_caps.max_processes   = (uint32_t)CLAMP(mb / 16, 4, 256);
     g_sys_caps.max_fds_global  = (uint32_t)CLAMP(total / (256 * 1024), 128, 4096);

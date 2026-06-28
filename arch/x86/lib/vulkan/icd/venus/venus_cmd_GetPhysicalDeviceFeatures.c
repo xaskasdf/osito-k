@@ -1,40 +1,56 @@
 /*
- * Encoder for vkGetPhysicalDeviceFeatures over venus.
+ * Encoder for vkGetPhysicalDeviceFeatures over the Mesa venus protocol.
  *
- * Request payload:
- *   pd_id            (u64)
- *   pFeatures_present(u32, always 1)
- *   pad              (u32)
- *
- * Reply: flattened VkPhysicalDeviceFeatures (55 VkBool32 = 220 bytes). */
+ * The older local wire command used OsitoK-private command ids and never
+ * reached virglrenderer's generated decoder.  The real Venus stream uses
+ * command type 3, a 64-bit "simple pointer" marker for pFeatures, and a
+ * reply of cmd + pointer marker + VkPhysicalDeviceFeatures.
+ */
 #include "venus_wire.h"
-#include "venus_proto_core.h"
 #include "venus.h"
 
 extern void *memcpy(void *, const void *, unsigned long);
+extern int printf(const char *, ...);
+
+#define VN_CMD_TYPE_vkGetPhysicalDeviceFeatures 3u
+#define VN_CMD_GENERATE_REPLY 1u
 
 int venus_cmd_encode_GetPhysicalDeviceFeatures(
         struct venus_wire *w, uint64_t pd_id,
         VkPhysicalDeviceFeatures *out) {
     if (!w || !out) return -22;
 
-    uint64_t reply_id = 0;
-    uint8_t *p = venus_wire_alloc_cmd(
-            w, VN_CMD_vkGetPhysicalDeviceFeatures,
-            VENUS_CMD_FLAG_REPLY_EXPECTED,
-            8u + 4u + 4u,
-            &reply_id);
-    if (!p) return -12;
+    uint8_t cmd[24];
+    uint8_t reply[12 + sizeof(VkPhysicalDeviceFeatures)];
+    uint32_t cmd_type = VN_CMD_TYPE_vkGetPhysicalDeviceFeatures;
+    uint32_t flags = VN_CMD_GENERATE_REPLY;
+    uint64_t present = 1;
 
-    ((uint64_t *)p)[0]        = pd_id;
-    ((uint32_t *)(p + 8))[0]  = 1u;
-    ((uint32_t *)(p + 12))[0] = 0u;
+    memcpy(cmd + 0,  &cmd_type, 4);
+    memcpy(cmd + 4,  &flags, 4);
+    memcpy(cmd + 8,  &pd_id, 8);
+    memcpy(cmd + 16, &present, 8);
 
-    int rc = venus_wire_submit(w);
-    if (rc < 0) return rc;
+    for (uint32_t i = 0; i < sizeof(reply); i++)
+        reply[i] = 0;
 
-    int got = venus_wire_wait_reply(w, reply_id, out,
-                                    (uint32_t)sizeof(VkPhysicalDeviceFeatures));
-    if (got < (int)sizeof(VkPhysicalDeviceFeatures)) return -5;
+    int got = venus_wire_submit_reply(w, cmd, sizeof(cmd),
+                                      reply, sizeof(reply));
+    if (got < (int)sizeof(reply))
+        return got < 0 ? got : -5;
+
+    uint32_t reply_cmd = 0;
+    uint64_t reply_present = 0;
+    memcpy(&reply_cmd, reply + 0, 4);
+    memcpy(&reply_present, reply + 4, 8);
+    if (reply_cmd != VN_CMD_TYPE_vkGetPhysicalDeviceFeatures ||
+        !reply_present)
+        return -5;
+
+    memcpy(out, reply + 12, sizeof(*out));
+    printf("[VGF] host features geom=%u tess=%u anis=%u bc=%u int64=%u f64=%u\n",
+           out->geometryShader, out->tessellationShader,
+           out->samplerAnisotropy, out->textureCompressionBC,
+           out->shaderInt64, out->shaderFloat64);
     return 0;
 }

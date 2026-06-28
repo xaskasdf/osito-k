@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <mutex>
 
 #include "../util/sync/sync_list.h"
@@ -175,6 +176,8 @@ namespace dxvk {
       const DxvkShader*                     fs);
 
     VkPipelineViewportStateCreateInfo                     vpInfo              = { VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO };
+    std::array<VkViewport, DxvkLimits::MaxNumViewports>   vpViewports         = { };
+    std::array<VkRect2D, DxvkLimits::MaxNumViewports>     vpScissors          = { };
     VkPipelineTessellationStateCreateInfo                 tsInfo              = { VK_STRUCTURE_TYPE_PIPELINE_TESSELLATION_STATE_CREATE_INFO };
     VkPipelineRasterizationStateCreateInfo                rsInfo              = { VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO };
     VkPipelineRasterizationDepthClipStateCreateInfoEXT    rsDepthClipInfo     = { VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_DEPTH_CLIP_STATE_CREATE_INFO_EXT };

@@ -28,6 +28,7 @@ void virtio_gpu_flush(void);
 #define VIRTIO_PCI_CAP_NOTIFY_CFG   2
 #define VIRTIO_PCI_CAP_ISR_CFG      3
 #define VIRTIO_PCI_CAP_DEVICE_CFG   4
+#define VIRTIO_PCI_CAP_SHARED_MEMORY_CFG 8
 
 /* ── Virtio GPU Commands ──────────────────────────────────────── */
 #define VIRTIO_GPU_CMD_GET_DISPLAY_INFO         0x0100
@@ -51,7 +52,13 @@ void virtio_gpu_flush(void);
 #define VIRTQ_DESC_F_NEXT          1
 #define VIRTQ_DESC_F_WRITE         2
 #define VIRTQ_NO_DESC              0xFFFFu
-#define VIRTIO_GPU_CMD_TIMEOUT_TICKS 200u
+#define VIRTIO_GPU_CMD_TIMEOUT_TICKS 500u
+
+#define VIRTIO_GPU_F_VIRGL          (1ull << 0)
+#define VIRTIO_GPU_F_EDID           (1ull << 1)
+#define VIRTIO_GPU_F_RESOURCE_BLOB  (1ull << 3)
+#define VIRTIO_GPU_F_CONTEXT_INIT   (1ull << 4)
+#define VIRTIO_F_VERSION_1          (1ull << 32)
 
 /* ── Structures ───────────────────────────────────────────────── */
 
@@ -171,6 +178,8 @@ static struct {
     /* ECAM base for PCI config reads */
     uint64_t ecam_base;
     uint8_t  pci_bus, pci_dev, pci_func;
+    uint64_t hostmem_base;
+    uint64_t hostmem_size;
 
     bool initialized;
     bool scanout_active;
@@ -232,6 +241,21 @@ static uint8_t ecam_read8(uint16_t offset) {
     return *(volatile uint8_t *)addr;
 }
 
+static void ecam_write32(uint16_t offset, uint32_t value) {
+    uint64_t addr = gpu.ecam_base
+        | ((uint64_t)gpu.pci_bus << 20)
+        | ((uint64_t)gpu.pci_dev << 15)
+        | ((uint64_t)gpu.pci_func << 12)
+        | offset;
+    *(volatile uint32_t *)addr = value;
+    __asm__ volatile ("mfence" ::: "memory");
+}
+
+static uint64_t align_up_u64(uint64_t value, uint64_t align) {
+    if (align == 0) return value;
+    return (value + align - 1) & ~(align - 1);
+}
+
 /* ── Parse PCI Capabilities ───────────────────────────────────── */
 
 static int parse_capabilities(uint64_t *bars) {
@@ -258,18 +282,29 @@ static int parse_capabilities(uint64_t *bars) {
         if (cap_id == 0x09) {  /* Vendor-specific = virtio */
             uint8_t cfg_type = ecam_read8(cap_ptr + 3);
             uint8_t bar      = ecam_read8(cap_ptr + 4);
+            uint8_t cap_id2  = ecam_read8(cap_ptr + 5);
             uint32_t offset  = ecam_read32(cap_ptr + 8);
             uint32_t length  = ecam_read32(cap_ptr + 12);
+            uint64_t offset64 = offset;
+            uint64_t length64 = length;
+            if (cfg_type == VIRTIO_PCI_CAP_SHARED_MEMORY_CFG) {
+                offset64 |= (uint64_t)ecam_read32(cap_ptr + 16) << 32;
+                length64 |= (uint64_t)ecam_read32(cap_ptr + 20) << 32;
+            }
             serial_puts("[VIRTIO-GPU]   type=");
             serial_putdec(cfg_type);
             serial_puts(" bar=");
             serial_putdec(bar);
+            if (cfg_type == VIRTIO_PCI_CAP_SHARED_MEMORY_CFG) {
+                serial_puts(" id=");
+                serial_putdec(cap_id2);
+            }
             serial_puts(" off=0x");
-            serial_puthex(offset, 4);
+            serial_puthex(offset64, 16);
             serial_puts(" len=0x");
-            serial_puthex(length, 4);
+            serial_puthex(length64, 16);
             serial_puts(" baraddr=0x");
-            serial_puthex(bars[bar], 8);
+            serial_puthex(bars[bar], 16);
             serial_puts("\n");
 
             uint64_t bar_addr = bars[bar];
@@ -303,6 +338,22 @@ static int parse_capabilities(uint64_t *bars) {
             case VIRTIO_PCI_CAP_ISR_CFG:
                 found |= 8;
                 break;
+            case VIRTIO_PCI_CAP_SHARED_MEMORY_CFG:
+                if (cap_id2 == 1 && length64 != 0) {
+                    gpu.hostmem_base = bar_addr + offset64;
+                    gpu.hostmem_size = length64;
+                    paging_map_mmio(gpu.hostmem_base, gpu.hostmem_size);
+                    serial_puts("[VIRTIO-GPU] hostmem BAR");
+                    serial_putdec(bar);
+                    serial_puts("+0x");
+                    serial_puthex(offset64, 16);
+                    serial_puts(" size=0x");
+                    serial_puthex(length64, 16);
+                    serial_puts(" va=0x");
+                    serial_puthex((uint64_t)PHYS_TO_VIRT(gpu.hostmem_base), 16);
+                    serial_puts("\n");
+                }
+                break;
             }
         }
         cap_ptr = cap_next;
@@ -321,6 +372,8 @@ static int setup_controlq(void) {
 
     gpu.vq_size = *(volatile uint16_t *)(cfg + 0x18);
     if (gpu.vq_size == 0) gpu.vq_size = 64;
+    *(volatile uint16_t *)(cfg + 0x18) = gpu.vq_size;
+    __asm__ volatile ("mfence" ::: "memory");
     serial_puts("[VIRTIO-GPU] controlq size=");
     serial_putdec(gpu.vq_size);
     serial_puts("\n");
@@ -428,14 +481,17 @@ static int gpu_send_cmd_unlocked(void *cmd, uint32_t cmd_len, void *resp, uint32
     }
     uint16_t next_free = gpu.desc[d1].next;
 
+    uint64_t cmd_phys = VIRT_TO_PHYS((uint64_t)cmd);
+    uint64_t resp_phys = VIRT_TO_PHYS((uint64_t)resp);
+
     /* Descriptor 0: command (device reads) */
-    gpu.desc[d0].addr = VIRT_TO_PHYS((uint64_t)cmd);
+    gpu.desc[d0].addr = cmd_phys;
     gpu.desc[d0].len = cmd_len;
     gpu.desc[d0].flags = VIRTQ_DESC_F_NEXT; /* NEXT | read-only for device */
     gpu.desc[d0].next = d1;
 
     /* Descriptor 1: response (device writes) */
-    gpu.desc[d1].addr = VIRT_TO_PHYS((uint64_t)resp);
+    gpu.desc[d1].addr = resp_phys;
     gpu.desc[d1].len = resp_len;
     gpu.desc[d1].flags = VIRTQ_DESC_F_WRITE;
     gpu.desc[d1].next = 0;
@@ -452,6 +508,23 @@ static int gpu_send_cmd_unlocked(void *cmd, uint32_t cmd_len, void *resp, uint32
     /* Notify device — write queue index to notify register */
     uint16_t notify_off = *(volatile uint16_t *)(gpu.common_cfg + 0x1E);
     volatile uint16_t *notify_addr = (volatile uint16_t *)(gpu.notify_base + notify_off * gpu.notify_off_mult);
+    static bool logged_first_submit = false;
+    if (!logged_first_submit) {
+        const struct virtio_gpu_ctrl_hdr *hdr =
+            (const struct virtio_gpu_ctrl_hdr *)cmd;
+        serial_puts("[VIRTIO-GPU] submit type=0x");
+        serial_puthex(hdr ? hdr->type : 0, 4);
+        serial_puts(" cmd_pa=0x");
+        serial_puthex(cmd_phys, 16);
+        serial_puts(" resp_pa=0x");
+        serial_puthex(resp_phys, 16);
+        serial_puts(" notify_off=");
+        serial_putdec(notify_off);
+        serial_puts(" mult=");
+        serial_putdec(gpu.notify_off_mult);
+        serial_puts("\n");
+        logged_first_submit = true;
+    }
     __asm__ volatile ("mfence" ::: "memory");
     *notify_addr = 0;  /* queue 0 */
     __asm__ volatile ("mfence" ::: "memory");
@@ -485,11 +558,21 @@ static int gpu_send_cmd_unlocked(void *cmd, uint32_t cmd_len, void *resp, uint32
             return 0;
         }
         if ((idt_get_ticks() - start_tick) >= VIRTIO_GPU_CMD_TIMEOUT_TICKS ||
-            spins >= 200000000ULL)
+            spins >= 5000000000ULL)
             break;
         __asm__ volatile ("pause");
     }
-    serial_puts("[VIRTIO-GPU] Command timeout!\n");
+    const struct virtio_gpu_ctrl_hdr *hdr =
+        (const struct virtio_gpu_ctrl_hdr *)cmd;
+    serial_puts("[VIRTIO-GPU] Command timeout type=0x");
+    serial_puthex(hdr ? hdr->type : 0, 4);
+    serial_puts(" used_idx=");
+    serial_putdec(gpu.used->idx);
+    serial_puts(" last_used=");
+    serial_putdec(gpu.last_used);
+    serial_puts(" status=0x");
+    serial_puthex(*(volatile uint8_t *)(gpu.common_cfg + 0x14), 2);
+    serial_puts("\n");
     gpu.queue_broken = true;
     return -1;
 }
@@ -531,12 +614,12 @@ void virtio_gpu_init(uint64_t ecam, uint8_t bus, uint8_t dev, uint8_t func,
     }
 
     /* Program any unassigned BARs. UEFI assigns BARs for known devices but
-     * skips virtio. We check all 6 BARs and assign from a pool starting at
-     * 0x81100000 (well above QEMU's normal MMIO). */
+     * skips virtio. Avoid BAR sizing probes here: on macOS HVF, rewriting
+     * a live virtio-vga-gl BAR to 0xffffffff can make QEMU remap hostmem
+     * while vCPUs are running and abort in hvf_set_phys_mem(). */
     {
-        uint64_t cfg_base = gpu.ecam_base | ((uint64_t)gpu.pci_bus << 20)
-                          | ((uint64_t)gpu.pci_dev << 15) | ((uint64_t)gpu.pci_func << 12);
-        uint64_t next_addr = 0x81100000ULL;
+        uint64_t next32_addr = 0x81100000ULL;
+        uint64_t next64_addr = 0x880000000ULL;
         for (int i = 0; i < 6; i++) {
             uint32_t raw = ecam_read32(0x10 + i * 4);
             bool is_mem = (raw & 1) == 0;
@@ -545,14 +628,25 @@ void virtio_gpu_init(uint64_t ecam, uint8_t bus, uint8_t dev, uint8_t func,
             serial_puts(" raw=0x"); serial_puthex(raw, 8); serial_puts("\n");
 
             if (is_mem && (raw & ~0xFU) == 0) {
-                /* Unassigned memory BAR — program it */
-                *(volatile uint32_t *)(cfg_base + 0x10 + i * 4) = (uint32_t)(next_addr | (raw & 0xF));
+                uint64_t size = is_64 ? 0x40000000ULL : 0x100000ULL;
+                uint64_t addr;
+
+                if (is_64) {
+                    addr = align_up_u64(next64_addr, size);
+                    next64_addr = addr + size;
+                } else {
+                    addr = align_up_u64(next32_addr, size);
+                    next32_addr = addr + size;
+                }
+
+                ecam_write32(0x10 + i * 4, (uint32_t)(addr | (raw & 0xF)));
                 if (is_64)
-                    *(volatile uint32_t *)(cfg_base + 0x10 + (i+1) * 4) = (uint32_t)(next_addr >> 32);
-                __asm__ volatile ("mfence" ::: "memory");
+                    ecam_write32(0x10 + (i + 1) * 4, (uint32_t)(addr >> 32));
+
                 serial_puts("[VIRTIO-GPU] Programmed BAR"); serial_putdec(i);
-                serial_puts("=0x"); serial_puthex(next_addr, 8); serial_puts("\n");
-                next_addr += 0x100000;  /* 1 MB per BAR */
+                serial_puts("=0x"); serial_puthex(addr, 16);
+                serial_puts(" assumed_size=0x"); serial_puthex(size, 16);
+                serial_puts("\n");
             }
 
             if (is_64) {
@@ -627,20 +721,28 @@ void virtio_gpu_init(uint64_t ecam, uint8_t bus, uint8_t dev, uint8_t func,
     serial_puthex(gpu.device_features, 16);
     serial_puts("\n");
 
-    /* Accept all offered features (incl. VIRGL bit 0) when VIRGL is
-     * present. The 2D path worked without any feature negotiation, so
-     * this wider accept is fine for Wave 1; the relevant bit is VIRGL
-     * itself. If a host advertises a feature the kernel doesn't know
-     * how to drive, this would need narrowing to a known-safe mask. */
-    if (gpu.device_features & (1ull << 0)) {
+    /* Negotiate only features this split-ring driver knows how to use.
+     * Echoing all host bits can accidentally enable queue semantics we
+     * do not implement (for example event/ring extensions), which can
+     * leave the first controlq command unanswered under QEMU GL. */
+    uint64_t accepted_features = gpu.device_features &
+        (VIRTIO_GPU_F_VIRGL |
+         VIRTIO_GPU_F_EDID |
+         VIRTIO_GPU_F_RESOURCE_BLOB |
+         VIRTIO_GPU_F_CONTEXT_INIT |
+         VIRTIO_F_VERSION_1);
+    if (accepted_features & VIRTIO_GPU_F_VIRGL) {
         *(volatile uint32_t *)(cfg + 0x08) = 0; /* driver_feature_select */
         __asm__ volatile ("mfence" ::: "memory");
-        *(volatile uint32_t *)(cfg + 0x0C) = (uint32_t)((1ull << 0) | feat_lo);
+        *(volatile uint32_t *)(cfg + 0x0C) = (uint32_t)accepted_features;
         *(volatile uint32_t *)(cfg + 0x08) = 1;
         __asm__ volatile ("mfence" ::: "memory");
-        *(volatile uint32_t *)(cfg + 0x0C) = feat_hi;
+        *(volatile uint32_t *)(cfg + 0x0C) =
+            (uint32_t)(accepted_features >> 32);
         __asm__ volatile ("mfence" ::: "memory");
-        serial_puts("[VIRTIO-GPU] VIRGL accepted (full feature echo)\n");
+        serial_puts("[VIRTIO-GPU] accepted_features=0x");
+        serial_puthex(accepted_features, 16);
+        serial_puts("\n");
     }
 
     cfg[0x14] |= VIRTIO_STATUS_FEATURES_OK;
@@ -800,6 +902,8 @@ uint32_t          vgpu_notify_off_mult(void) { return gpu.notify_off_mult; }
 bool              vgpu_is_initialized(void)  { return gpu.initialized; }
 uint64_t          vgpu_device_features(void) { return gpu.device_features; }
 uint32_t          vgpu_ecam_read32(uint16_t offset) { return ecam_read32(offset); }
+uint64_t          vgpu_hostmem_base(void)    { return gpu.hostmem_base; }
+uint64_t          vgpu_hostmem_size(void)    { return gpu.hostmem_size; }
 
 int vgpu_controlq_submit(const void *cmd, uint32_t cmd_len,
                          void *resp, uint32_t resp_len) {

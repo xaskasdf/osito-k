@@ -1,28 +1,18 @@
-/*
- * Encoder for vkCmdBeginRenderPass over venus.
- *
- * Request payload:
- *   dev_id             (u64)
- *   cb_id              (u64)
- *   rp_id              (u64)
- *   fb_id              (u64)
- *   renderArea.offsetX (i32)
- *   renderArea.offsetY (i32)
- *   renderArea.extentW (u32)
- *   renderArea.extentH (u32)
- *   clearValueCount    (u32)
- *   contents           (u32)
- *   clearValues[] u32*4 each (as uints — float bits are identical)
- *
- * No reply expected.
- */
 #include "venus_wire.h"
-#include "venus_proto_core.h"
+#include "venus_cmd_writer.h"
 #include "venus.h"
 
-extern void *memcpy(void *, const void *, unsigned long);
-
 #define VENUS_CLEAR_MAX 4u
+#define VN_CMD_TYPE_vkCmdBeginRenderPass 133u
+
+static void vcw_wr_clear_value(struct venus_cmd_writer *wr,
+                               const VkClearValue *clear) {
+    vcw_wr_u32(wr, 0); /* VkClearValue union tag: color; preserves raw bytes. */
+    vcw_wr_u32(wr, clear->color.uint32[0]);
+    vcw_wr_u32(wr, clear->color.uint32[1]);
+    vcw_wr_u32(wr, clear->color.uint32[2]);
+    vcw_wr_u32(wr, clear->color.uint32[3]);
+}
 
 int venus_cmd_encode_CmdBeginRenderPass(
         struct venus_wire *w, uint64_t dev_id, uint64_t cb_id,
@@ -31,32 +21,31 @@ int venus_cmd_encode_CmdBeginRenderPass(
         uint32_t clear_count, const VkClearValue *clear_values,
         uint32_t contents) {
     if (!w) return -22;
+    (void)dev_id;
     if (clear_count > VENUS_CLEAR_MAX) clear_count = VENUS_CLEAR_MAX;
+    if (!clear_values) clear_count = 0;
 
-    uint32_t payload = 8u*4u + 4u*6u + clear_count * 16u;
-    payload = (payload + 7u) & ~7u;
+    uint8_t cmd[192];
+    struct venus_cmd_writer wr = { cmd, 0, sizeof(cmd), 0 };
 
-    uint64_t reply_id = 0;
-    uint8_t *p = venus_wire_alloc_cmd(
-            w, VN_CMD_vkCmdBeginRenderPass,
-            0u /* no reply */,
-            payload, &reply_id);
-    if (!p) return -12;
+    vcw_wr_i32(&wr, (int32_t)VN_CMD_TYPE_vkCmdBeginRenderPass);
+    vcw_wr_u32(&wr, 0);
+    vcw_wr_u64(&wr, cb_id);
+    vcw_wr_u64(&wr, 1); /* pRenderPassBegin */
+    vcw_wr_i32(&wr, VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO);
+    vcw_wr_u64(&wr, 0); /* pNext */
+    vcw_wr_u64(&wr, rp_id);
+    vcw_wr_u64(&wr, fb_id);
+    vcw_wr_i32(&wr, area_x);
+    vcw_wr_i32(&wr, area_y);
+    vcw_wr_u32(&wr, area_w);
+    vcw_wr_u32(&wr, area_h);
+    vcw_wr_u32(&wr, clear_count);
+    vcw_wr_array_size(&wr, clear_count);
+    for (uint32_t i = 0; i < clear_count; i++)
+        vcw_wr_clear_value(&wr, &clear_values[i]);
+    vcw_wr_i32(&wr, (int32_t)contents);
 
-    uint32_t off = 0;
-    *(uint64_t *)(p + off) = dev_id;  off += 8;
-    *(uint64_t *)(p + off) = cb_id;   off += 8;
-    *(uint64_t *)(p + off) = rp_id;   off += 8;
-    *(uint64_t *)(p + off) = fb_id;   off += 8;
-    *(int32_t  *)(p + off) = area_x;  off += 4;
-    *(int32_t  *)(p + off) = area_y;  off += 4;
-    *(uint32_t *)(p + off) = area_w;  off += 4;
-    *(uint32_t *)(p + off) = area_h;  off += 4;
-    *(uint32_t *)(p + off) = clear_count; off += 4;
-    *(uint32_t *)(p + off) = contents;    off += 4;
-    if (clear_count && clear_values) {
-        memcpy(p + off, clear_values, clear_count * 16u);
-    }
-
-    return venus_wire_submit(w);
+    if (wr.err) return wr.err;
+    return venus_wire_submit_raw(w, cmd, wr.off);
 }

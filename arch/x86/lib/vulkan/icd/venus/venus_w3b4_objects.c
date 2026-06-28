@@ -66,8 +66,11 @@ extern int venus_cmd_encode_CreateFramebuffer(struct venus_wire *, uint64_t,
         uint64_t, const VkFramebufferCreateInfo *, const uint64_t *, uint32_t,
         uint64_t *);
 extern int venus_cmd_encode_DestroyFramebuffer(struct venus_wire *, uint64_t, uint64_t);
+extern int venus_cmd_encode_CreateDescriptorSetLayout(struct venus_wire *, uint64_t,
+        const VkDescriptorSetLayoutCreateInfo *, uint64_t *);
+extern int venus_cmd_encode_DestroyDescriptorSetLayout(struct venus_wire *, uint64_t, uint64_t);
 extern int venus_cmd_encode_CreatePipelineLayout(struct venus_wire *, uint64_t,
-        const VkPipelineLayoutCreateInfo *, uint64_t *);
+        const VkPipelineLayoutCreateInfo *, const uint64_t *, uint32_t, uint64_t *);
 extern int venus_cmd_encode_DestroyPipelineLayout(struct venus_wire *, uint64_t, uint64_t);
 extern int venus_cmd_encode_CreateGraphicsPipelines(struct venus_wire *,
         uint64_t, uint64_t, uint32_t, const VkGraphicsPipelineCreateInfo *,
@@ -87,6 +90,9 @@ extern int venus_cmd_encode_CmdBeginRenderPass(struct venus_wire *, uint64_t,
         uint64_t, uint64_t, uint64_t, int32_t, int32_t, uint32_t, uint32_t,
         uint32_t, const VkClearValue *, uint32_t);
 extern int venus_cmd_encode_CmdEndRenderPass(struct venus_wire *, uint64_t, uint64_t);
+extern int venus_cmd_encode_CmdBeginRendering(struct venus_wire *,
+        struct venus_device *, uint64_t, const VkRenderingInfo *);
+extern int venus_cmd_encode_CmdEndRendering(struct venus_wire *, uint64_t);
 extern int venus_cmd_encode_CmdBindPipeline(struct venus_wire *, uint64_t,
         uint64_t, uint32_t, uint64_t);
 extern int venus_cmd_encode_CmdDraw(struct venus_wire *, uint64_t, uint64_t,
@@ -120,7 +126,36 @@ extern int venus_cmd_encode_CmdDraw(struct venus_wire *, uint64_t, uint64_t,
 static uint32_t venus_w3b4_logged_draw;
 static uint32_t venus_w3b4_logged_desc_image;
 static uint32_t venus_w3b4_logged_desc_bind;
+static uint32_t venus_w3b4_logged_desc_template;
 static uint32_t venus_w3b4_logged_rt_begin;
+static uint32_t venus_w3b4_log_image_create_diag;
+static uint32_t venus_w3b4_logged_pipeline_create;
+static uint32_t venus_w3b4_logged_bad_pipeline_bind;
+static uint32_t venus_w3b4_logged_shader_create;
+static uint32_t venus_w3b4_logged_dsl_create;
+static uint32_t venus_w3b4_logged_pl_create;
+
+static int venus_desc_type_has_image(uint32_t type) {
+    return type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER ||
+           type == VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE ||
+           type == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE ||
+           type == VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT;
+}
+
+static int venus_desc_set_image_from_view(struct venus_device *dev,
+                                          struct venus_descriptor_set *set,
+                                          VkImageView view) {
+    if (!dev || !set || !view) return 0;
+    int view_slot = HANDLE_TO_SLOT(view);
+    if (view_slot < 0 || view_slot >= (int)VENUS_MAX_IMAGE_VIEW_OBJECTS)
+        return 0;
+    if (!dev->image_views[view_slot].in_use)
+        return 0;
+    if (dev->image_views[view_slot].image_slot < 0)
+        return 0;
+    set->image_slot = dev->image_views[view_slot].image_slot;
+    return 1;
+}
 
 /* --- Slot allocators (uniform shape). --- */
 #define DEFINE_SLOT_ALLOC(name, table, cap)                                 \
@@ -178,7 +213,16 @@ venus_CreateShaderModule(VkDevice device,
         int rc = venus_cmd_encode_CreateShaderModule(dev->parent->wire,
                                                      dev->host_handle,
                                                      pCreateInfo, &host_id);
+        if (venus_w3b4_logged_shader_create < 32u) {
+            venus_w3b4_logged_shader_create++;
+            printf("[VSHADER] create rc=%d host=%llu code=%u\n",
+                   rc, (unsigned long long)host_id, s->code_size);
+        }
         if (rc == 0 && host_id != 0) s->host_id = host_id;
+        else {
+            memset(s, 0, sizeof(*s));
+            return rc == 0 ? VK_ERROR_INITIALIZATION_FAILED : (VkResult)rc;
+        }
     }
     *pShader = (VkShaderModule)MAKE_SLOT_HANDLE(dev, slot, VENUS_H_MARKER_SHADER);
     return VK_SUCCESS;
@@ -257,6 +301,8 @@ venus_CreateImage(VkDevice device, const VkImageCreateInfo *pCreateInfo,
     img->height         = pCreateInfo->extent.height;
     img->format         = (uint32_t)pCreateInfo->format;
     img->bound_mem_slot = -1;
+    img->usage          = pCreateInfo->usage;
+    img->is_swapchain_owned = 0;
     img->bound_offset   = 0;
 
     if (dev->parent && dev->parent->wire && dev->host_handle != 0) {
@@ -265,6 +311,12 @@ venus_CreateImage(VkDevice device, const VkImageCreateInfo *pCreateInfo,
                                               dev->host_handle,
                                               pCreateInfo, &host_id);
         if (rc == 0 && host_id != 0) img->host_id = host_id;
+    }
+    if (venus_w3b4_log_image_create_diag < 32u) {
+        venus_w3b4_log_image_create_diag++;
+        printf("[VIMGD] create slot=%d %ux%u fmt=%u usage=0x%x host=%llu\n",
+               slot, img->width, img->height, img->format, img->usage,
+               (unsigned long long)img->host_id);
     }
     *pImage = (VkImage)MAKE_SLOT_HANDLE(dev, slot, VENUS_H_MARKER_IMAGE);
     return VK_SUCCESS;
@@ -558,6 +610,23 @@ venus_CreateDescriptorSetLayout(VkDevice device,
     struct venus_descriptor_set_layout *dsl = &dev->desc_layouts[slot];
     dsl->host_id = 0;
     dsl->binding_count = pCreateInfo->bindingCount;
+    if (dev->parent && dev->parent->wire && dev->host_handle != 0) {
+        uint64_t host_id = 0;
+        int rc = venus_cmd_encode_CreateDescriptorSetLayout(dev->parent->wire,
+                                                            dev->host_handle,
+                                                            pCreateInfo, &host_id);
+        if (venus_w3b4_logged_dsl_create < 64u) {
+            venus_w3b4_logged_dsl_create++;
+            printf("[VDSL] create rc=%d host=%llu bindings=%u flags=0x%x\n",
+                   rc, (unsigned long long)host_id,
+                   pCreateInfo->bindingCount, pCreateInfo->flags);
+        }
+        if (rc == VK_SUCCESS && host_id != 0) dsl->host_id = host_id;
+        else {
+            memset(dsl, 0, sizeof(*dsl));
+            return rc == VK_SUCCESS ? VK_ERROR_INITIALIZATION_FAILED : (VkResult)rc;
+        }
+    }
     *pLayout = (VkDescriptorSetLayout)MAKE_SLOT_HANDLE(dev, slot, VENUS_H_MARKER_DSL);
     return VK_SUCCESS;
 }
@@ -570,7 +639,12 @@ venus_DestroyDescriptorSetLayout(VkDevice device, VkDescriptorSetLayout layout,
     struct venus_device *dev = (struct venus_device *)device;
     int slot = HANDLE_TO_SLOT(layout);
     if (slot < 0 || slot >= (int)VENUS_MAX_DESC_LAYOUT_OBJECTS) return;
-    memset(&dev->desc_layouts[slot], 0, sizeof(dev->desc_layouts[slot]));
+    struct venus_descriptor_set_layout *dsl = &dev->desc_layouts[slot];
+    if (dev->parent && dev->parent->wire && dsl->host_id != 0)
+        (void)venus_cmd_encode_DestroyDescriptorSetLayout(dev->parent->wire,
+                                                          dev->host_handle,
+                                                          dsl->host_id);
+    memset(dsl, 0, sizeof(*dsl));
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL
@@ -684,19 +758,12 @@ venus_UpdateDescriptorSets(VkDevice device,
         struct venus_descriptor_set *set = &dev->desc_sets[set_slot];
         if (!set->in_use || !w->pImageInfo || w->descriptorCount == 0)
             continue;
-        if (w->descriptorType != VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER &&
-            w->descriptorType != VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE &&
-            w->descriptorType != VK_DESCRIPTOR_TYPE_STORAGE_IMAGE &&
-            w->descriptorType != VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT)
+        if (!venus_desc_type_has_image((uint32_t)w->descriptorType))
             continue;
 
         VkImageView view = w->pImageInfo[0].imageView;
-        int view_slot = HANDLE_TO_SLOT(view);
-        if (view_slot < 0 || view_slot >= (int)VENUS_MAX_IMAGE_VIEW_OBJECTS)
+        if (!venus_desc_set_image_from_view(dev, set, view))
             continue;
-        if (!dev->image_views[view_slot].in_use)
-            continue;
-        set->image_slot = dev->image_views[view_slot].image_slot;
         if (!venus_w3b4_logged_desc_image) {
             venus_w3b4_logged_desc_image = 1u;
             printf("[VDESC] write set=%d image=%d type=%u\n",
@@ -734,7 +801,19 @@ venus_CreateDescriptorUpdateTemplate(
     if (slot < 0) return VK_ERROR_OUT_OF_HOST_MEMORY;
     struct venus_descriptor_update_template *tpl = &dev->desc_templates[slot];
     tpl->entry_count = pCreateInfo->descriptorUpdateEntryCount;
+    if (tpl->entry_count > VENUS_MAX_DESC_TPL_ENTRIES)
+        tpl->entry_count = VENUS_MAX_DESC_TPL_ENTRIES;
     tpl->template_type = (uint32_t)pCreateInfo->templateType;
+    for (uint32_t i = 0; i < tpl->entry_count; i++) {
+        const VkDescriptorUpdateTemplateEntry *src =
+            &pCreateInfo->pDescriptorUpdateEntries[i];
+        tpl->entries[i].dst_binding = src->dstBinding;
+        tpl->entries[i].dst_array_element = src->dstArrayElement;
+        tpl->entries[i].descriptor_count = src->descriptorCount;
+        tpl->entries[i].descriptor_type = (uint32_t)src->descriptorType;
+        tpl->entries[i].offset = (uint64_t)src->offset;
+        tpl->entries[i].stride = (uint64_t)src->stride;
+    }
     *pDescriptorUpdateTemplate =
         (VkDescriptorUpdateTemplate)MAKE_SLOT_HANDLE(dev, slot, VENUS_H_MARKER_DTEMPLATE);
     return VK_SUCCESS;
@@ -758,10 +837,45 @@ venus_UpdateDescriptorSetWithTemplate(VkDevice device,
                                       VkDescriptorSet descriptorSet,
                                       VkDescriptorUpdateTemplate descriptorUpdateTemplate,
                                       const void *pData) {
-    (void)device;
-    (void)descriptorSet;
-    (void)descriptorUpdateTemplate;
-    (void)pData;
+    if (!device || !descriptorSet || !descriptorUpdateTemplate || !pData)
+        return;
+    struct venus_device *dev = (struct venus_device *)device;
+    int set_slot = HANDLE_TO_SLOT(descriptorSet);
+    int tpl_slot = HANDLE_TO_SLOT(descriptorUpdateTemplate);
+    if (set_slot < 0 || set_slot >= (int)VENUS_MAX_DESC_SET_OBJECTS)
+        return;
+    if (tpl_slot < 0 || tpl_slot >= (int)VENUS_MAX_DESC_TPL_OBJECTS)
+        return;
+    struct venus_descriptor_set *set = &dev->desc_sets[set_slot];
+    struct venus_descriptor_update_template *tpl = &dev->desc_templates[tpl_slot];
+    if (!set->in_use || !tpl->in_use)
+        return;
+
+    const uint8_t *base = (const uint8_t *)pData;
+    for (uint32_t i = 0; i < tpl->entry_count; i++) {
+        if (!venus_desc_type_has_image(tpl->entries[i].descriptor_type))
+            continue;
+        uint32_t count = tpl->entries[i].descriptor_count;
+        uint64_t stride = tpl->entries[i].stride;
+        if (stride == 0)
+            stride = sizeof(VkDescriptorImageInfo);
+        for (uint32_t j = 0; j < count; j++) {
+            const VkDescriptorImageInfo *info =
+                (const VkDescriptorImageInfo *)(base +
+                    tpl->entries[i].offset + (uint64_t)j * stride);
+            if (!info || !info->imageView)
+                continue;
+            if (venus_desc_set_image_from_view(dev, set, info->imageView)) {
+                if (venus_w3b4_logged_desc_template < 8u) {
+                    venus_w3b4_logged_desc_template++;
+                    printf("[VDESC] template set=%d image=%d type=%u entry=%u\n",
+                           set_slot, set->image_slot,
+                           tpl->entries[i].descriptor_type, i);
+                }
+                return;
+            }
+        }
+    }
 }
 
 /* --- Pipeline Layout --- */
@@ -780,14 +894,41 @@ venus_CreatePipelineLayout(VkDevice device,
     pl->set_layout_count = pCreateInfo->setLayoutCount;
     pl->push_constant_range_count = pCreateInfo->pushConstantRangeCount;
 
-    if (pCreateInfo->setLayoutCount == 0 &&
-        pCreateInfo->pushConstantRangeCount == 0 &&
-        dev->parent && dev->parent->wire && dev->host_handle != 0) {
+    if (dev->parent && dev->parent->wire && dev->host_handle != 0) {
+        uint64_t set_ids[64];
+        if (pCreateInfo->setLayoutCount > 64u) {
+            memset(pl, 0, sizeof(*pl));
+            return VK_ERROR_INITIALIZATION_FAILED;
+        }
+        for (uint32_t i = 0; i < pCreateInfo->setLayoutCount; i++) {
+            int dslot = HANDLE_TO_SLOT(pCreateInfo->pSetLayouts[i]);
+            if (dslot < 0 || dslot >= (int)VENUS_MAX_DESC_LAYOUT_OBJECTS ||
+                !dev->desc_layouts[dslot].in_use ||
+                dev->desc_layouts[dslot].host_id == 0) {
+                memset(pl, 0, sizeof(*pl));
+                return VK_ERROR_INITIALIZATION_FAILED;
+            }
+            set_ids[i] = dev->desc_layouts[dslot].host_id;
+        }
+
         uint64_t host_id = 0;
         int rc = venus_cmd_encode_CreatePipelineLayout(dev->parent->wire,
                                                        dev->host_handle,
-                                                       pCreateInfo, &host_id);
+                                                       pCreateInfo, set_ids,
+                                                       pCreateInfo->setLayoutCount,
+                                                       &host_id);
+        if (venus_w3b4_logged_pl_create < 64u) {
+            venus_w3b4_logged_pl_create++;
+            printf("[VPLAYOUT] create rc=%d host=%llu sets=%u push=%u\n",
+                   rc, (unsigned long long)host_id,
+                   pCreateInfo->setLayoutCount,
+                   pCreateInfo->pushConstantRangeCount);
+        }
         if (rc == 0 && host_id != 0) pl->host_id = host_id;
+        else {
+            memset(pl, 0, sizeof(*pl));
+            return rc == 0 ? VK_ERROR_INITIALIZATION_FAILED : (VkResult)rc;
+        }
     }
     *pLayout = (VkPipelineLayout)MAKE_SLOT_HANDLE(dev, slot, VENUS_H_MARKER_PLLAYOUT);
     return VK_SUCCESS;
@@ -863,7 +1004,27 @@ venus_CreateGraphicsPipelines(VkDevice device, VkPipelineCache pipelineCache,
         int rc = venus_cmd_encode_CreateGraphicsPipelines(
                 dev->parent->wire, dev->host_handle, 0ull, 1u, &pCreateInfos[0],
                 vs_host, fs_host, layout_host, rp_host, &host_id);
-        if (rc == 0 && host_id != 0) pip->host_id = host_id;
+        if (venus_w3b4_logged_pipeline_create < 32u) {
+            venus_w3b4_logged_pipeline_create++;
+            printf("[VPIPE] create rc=%d host=%llu stages=%u vs=%llu fs=%llu layout=%llu rp=%llu renderPass=%p\n",
+                   rc, (unsigned long long)host_id,
+                   pCreateInfos[0].stageCount,
+                   (unsigned long long)vs_host,
+                   (unsigned long long)fs_host,
+                   (unsigned long long)layout_host,
+                   (unsigned long long)rp_host,
+                   (void *)pCreateInfos[0].renderPass);
+        }
+        if (rc != VK_SUCCESS || host_id == 0) {
+            memset(pip, 0, sizeof(*pip));
+            pPipelines[0] = VK_NULL_HANDLE;
+            return rc == VK_SUCCESS ? VK_ERROR_INITIALIZATION_FAILED : (VkResult)rc;
+        }
+        pip->host_id = host_id;
+    } else {
+        memset(pip, 0, sizeof(*pip));
+        pPipelines[0] = VK_NULL_HANDLE;
+        return VK_ERROR_INITIALIZATION_FAILED;
     }
     pPipelines[0] = (VkPipeline)MAKE_SLOT_HANDLE(dev, slot, VENUS_H_MARKER_PIPELINE);
     return VK_SUCCESS;
@@ -1291,11 +1452,20 @@ venus_CmdBeginRendering(VkCommandBuffer cb,
                vcb->last_drawn_image_slot, vcb->recorded_has_clear,
                vcb->recorded_clear_color);
     }
+    if (dev->parent && dev->parent->wire && vcb->host_id != 0)
+        (void)venus_cmd_encode_CmdBeginRendering(dev->parent->wire,
+                                                 dev, vcb->host_id,
+                                                 pRenderingInfo);
 }
 
 VKAPI_ATTR void VKAPI_CALL
 venus_CmdEndRendering(VkCommandBuffer cb) {
-    (void)cb;
+    struct venus_device *dev; int slot;
+    if (!cb_unwrap(cb, &dev, &slot)) return;
+    struct venus_cmd_buffer *vcb = &dev->cmd_buffers[slot];
+    if (dev->parent && dev->parent->wire && vcb->host_id != 0)
+        (void)venus_cmd_encode_CmdEndRendering(dev->parent->wire,
+                                               vcb->host_id);
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -1338,6 +1508,14 @@ venus_CmdBindPipeline(VkCommandBuffer cb, VkPipelineBindPoint bp,
     uint64_t pip_host = (pslot >= 0 && pslot < (int)VENUS_MAX_PIPELINE_OBJECTS &&
                          dev->pipelines[pslot].in_use)
                         ? dev->pipelines[pslot].host_id : 0ull;
+    if (pip_host == 0) {
+        if (venus_w3b4_logged_bad_pipeline_bind < 32u) {
+            venus_w3b4_logged_bad_pipeline_bind++;
+            printf("[VPIPE] skip bind invalid pipeline=%p slot=%d bp=%u\n",
+                   (void *)pipeline, pslot, (uint32_t)bp);
+        }
+        return;
+    }
     if (dev->parent && dev->parent->wire && vcb->host_id != 0)
         (void)venus_cmd_encode_CmdBindPipeline(dev->parent->wire,
                                                dev->host_handle, vcb->host_id,

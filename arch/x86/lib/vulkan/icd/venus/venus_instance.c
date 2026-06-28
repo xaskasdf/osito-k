@@ -8,6 +8,102 @@ extern long __syscall2(long, long, long);
 extern void *malloc(unsigned long);
 extern void  free(void *);
 extern void *memset(void *, int, unsigned long);
+extern unsigned long strlen(const char *);
+extern int printf(const char *, ...);
+
+#define VN_CMD_TYPE_vkEnumeratePhysicalDevices 2u
+#define VN_CMD_GENERATE_REPLY 1u
+
+struct vni_writer {
+    uint8_t *buf;
+    uint32_t off;
+    uint32_t cap;
+    int err;
+};
+
+static void vni_wr_bytes(struct vni_writer *w, const void *src, uint32_t n) {
+    if (w->err) return;
+    if (w->off + n > w->cap || w->off + n < w->off) {
+        w->err = -12;
+        return;
+    }
+    for (uint32_t i = 0; i < n; i++)
+        w->buf[w->off + i] = ((const uint8_t *)src)[i];
+    w->off += n;
+}
+
+static void vni_wr_u32(struct vni_writer *w, uint32_t v) {
+    vni_wr_bytes(w, &v, 4);
+}
+
+static void vni_wr_i32(struct vni_writer *w, int32_t v) {
+    vni_wr_bytes(w, &v, 4);
+}
+
+static void vni_wr_u64(struct vni_writer *w, uint64_t v) {
+    vni_wr_bytes(w, &v, 8);
+}
+
+static int venus_cmd_encode_EnumeratePhysicalDevices(
+        struct venus_wire *w, uint64_t instance_id,
+        uint64_t *out_phys_id, uint32_t *out_count) {
+    if (!w || !instance_id || !out_phys_id || !out_count) return -22;
+
+    extern uint64_t venus_wire_alloc_object_id(struct venus_wire *);
+    extern int venus_wire_submit_reply(struct venus_wire *, const void *,
+                                       uint32_t, void *, uint32_t);
+
+    enum { VENUS_EPD_MAX = 4 };
+    uint8_t cmd[96];
+    uint8_t reply[80];
+    struct vni_writer wr = { cmd, 0, sizeof(cmd), 0 };
+    uint64_t phys_ids[VENUS_EPD_MAX];
+    uint32_t requested_count = VENUS_EPD_MAX;
+    for (uint32_t i = 0; i < VENUS_EPD_MAX; i++) {
+        phys_ids[i] = venus_wire_alloc_object_id(w);
+        if (!phys_ids[i]) return -12;
+    }
+
+    vni_wr_i32(&wr, (int32_t)VN_CMD_TYPE_vkEnumeratePhysicalDevices);
+    vni_wr_u32(&wr, VN_CMD_GENERATE_REPLY);
+    vni_wr_u64(&wr, instance_id);
+    vni_wr_u64(&wr, 1);                 /* pPhysicalDeviceCount */
+    vni_wr_u32(&wr, requested_count);
+    vni_wr_u64(&wr, requested_count);   /* pPhysicalDevices[] */
+    for (uint32_t i = 0; i < requested_count; i++)
+        vni_wr_u64(&wr, phys_ids[i]);
+    if (wr.err) return wr.err;
+
+    for (uint32_t i = 0; i < sizeof(reply); i++)
+        reply[i] = 0;
+    int rc = venus_wire_submit_reply(w, cmd, wr.off, reply, sizeof(reply));
+    if (rc < 36) return rc < 0 ? rc : -5;
+
+    uint32_t reply_cmd  = *(uint32_t *)(reply + 0);
+    uint32_t vk_result  = *(uint32_t *)(reply + 4);
+    uint64_t cnt_present = *(uint64_t *)(reply + 8);
+    uint32_t count      = *(uint32_t *)(reply + 16);
+    uint64_t arr_size   = *(uint64_t *)(reply + 20);
+    uint64_t phys_reply = *(uint64_t *)(reply + 28);
+
+    printf("[VEPD] reply cmd=%u vk=%u cntp=%llu count=%u arr=%llu phys=%llu guest=%llu bytes=%u\n",
+           reply_cmd, vk_result, (unsigned long long)cnt_present, count,
+           (unsigned long long)arr_size, (unsigned long long)phys_reply,
+           (unsigned long long)phys_ids[0], wr.off);
+
+    if (reply_cmd != VN_CMD_TYPE_vkEnumeratePhysicalDevices)
+        return -5;
+    if (vk_result != VK_SUCCESS && vk_result != VK_INCOMPLETE)
+        return (int)vk_result;
+    if (!cnt_present || count == 0 || arr_size == 0 || phys_reply == 0)
+        return -5;
+
+    *out_count = count;
+    /* The reply may include the renderer's native handle value. Future Venus
+     * commands must use the guest object id that this request registered. */
+    *out_phys_id = phys_ids[0];
+    return (int)vk_result;
+}
 
 VKAPI_ATTR VkResult VKAPI_CALL
 venus_CreateInstance(const VkInstanceCreateInfo *pCreateInfo,
@@ -23,7 +119,8 @@ venus_CreateInstance(const VkInstanceCreateInfo *pCreateInfo,
 
     /* Probe kernel capability. Caps is u32 passed by reference. */
     uint32_t caps = 0;
-    (void)__syscall1(VENUS_SYS_GPU_CAPS, (long)&caps);
+    long caps_rc = __syscall1(VENUS_SYS_GPU_CAPS, (long)&caps);
+    printf("[VENUSI] caps rc=%ld caps=0x%x\n", caps_rc, caps);
     self->caps = caps;
 
     /* If venus not ready in the host, we still create an instance — the
@@ -31,6 +128,7 @@ venus_CreateInstance(const VkInstanceCreateInfo *pCreateInfo,
      * keeps vkCreateInstance succeeding even on hosts without virgl. */
     if (caps & VENUS_GPU_CAP_VENUS_READY) {
         long rc = __syscall1(VENUS_SYS_GPU_CTX_CREATE, (long)VENUS_GPU_CTX_VENUS);
+        printf("[VENUSI] ctx rc=%ld\n", rc);
         if (rc > 0) {
             self->ctx_id = (int32_t)rc;
 
@@ -40,10 +138,14 @@ venus_CreateInstance(const VkInstanceCreateInfo *pCreateInfo,
                                                        const VkInstanceCreateInfo *,
                                                        uint64_t *);
             self->wire = venus_wire_open(self->ctx_id);
+            printf("[VENUSI] wire=%u ctx=%d\n", self->wire ? 1u : 0u,
+                   self->ctx_id);
             if (self->wire) {
                 uint64_t host_handle = 0;
                 int r = venus_cmd_encode_CreateInstance(self->wire, pCreateInfo,
                                                         &host_handle);
+                printf("[VENUSI] create-instance rc=%d host=%llu\n", r,
+                       (unsigned long long)host_handle);
                 if (r == 0 /* VK_SUCCESS */ && host_handle != 0) {
                     self->host_handle = host_handle;
                 } else {
@@ -92,10 +194,6 @@ venus_EnumeratePhysicalDevices(VkInstance instance,
     if (!instance || !pPhysicalDeviceCount) return VK_ERROR_INITIALIZATION_FAILED;
     struct venus_instance *self = (struct venus_instance *)instance;
 
-    /* W4.7-fix: always report 1 phys device. Every W3b.x encoder has a
-     * guest-local fallback path, so even without virglrenderer/VENUS_READY
-     * apps get a usable Vulkan stack (no real GPU work, but build through). */
-    (void)self;
     uint32_t count = 1u;
 
     if (!pPhysicalDevices) {
@@ -107,9 +205,24 @@ venus_EnumeratePhysicalDevices(VkInstance instance,
         return VK_INCOMPLETE;
     }
     if (count > 0) {
+        if (self->wire &&
+            (self->caps & VENUS_GPU_CAP_VENUS_READY) &&
+            self->ctx_id > 0 && self->host_handle != 0 &&
+            self->phys_handle == 0) {
+            uint64_t host_phys = 0;
+            uint32_t host_count = 0;
+            int rc = venus_cmd_encode_EnumeratePhysicalDevices(
+                    self->wire, self->host_handle, &host_phys, &host_count);
+            printf("[VENUSI] enumerate-physical rc=%d count=%u phys=%llu\n",
+                   rc, host_count, (unsigned long long)host_phys);
+            if ((rc == VK_SUCCESS || rc == VK_INCOMPLETE) && host_phys != 0)
+                self->phys_handle = host_phys;
+        }
+
         /* Reuse the instance pointer as the physical-device handle.
          * Dispatchable-object magic works either way because both structs
-         * begin with VK_LOADER_DATA. */
+         * begin with VK_LOADER_DATA. The real host physical-device id, when
+         * available, is stored separately in self->phys_handle. */
         pPhysicalDevices[0] = (VkPhysicalDevice)self;
     }
     *pPhysicalDeviceCount = count;
@@ -373,19 +486,27 @@ VKAPI_ATTR void VKAPI_CALL
 venus_GetPhysicalDeviceFeatures(VkPhysicalDevice physicalDevice,
                                 VkPhysicalDeviceFeatures *pFeatures) {
     if (!pFeatures) return;
-    (void)physicalDevice;
-    venus_features_fallback(pFeatures);
-    return;
-#if 0
     struct venus_instance *self = (struct venus_instance *)physicalDevice;
-    if (!self || !self->wire) {
+    if (!self || !self->wire || !self->phys_handle) {
         venus_features_fallback(pFeatures);
         return;
     }
     int rc = venus_cmd_encode_GetPhysicalDeviceFeatures(
-            self->wire, self->host_handle, pFeatures);
-    if (rc != 0) venus_features_fallback(pFeatures);
-#endif
+            self->wire, self->phys_handle, pFeatures);
+    if (rc != 0) {
+        self->host_features_valid = 0;
+        venus_features_fallback(pFeatures);
+        return;
+    }
+
+    self->host_features = *pFeatures;
+    self->host_features_valid = 1;
+
+    /* DXVK requires these base feature bits to expose D3D11 FL11 paths.
+     * The host CreateDevice path masks them back out when the renderer did
+     * not report support, so this only affects guest-side capability gating. */
+    pFeatures->geometryShader = VK_TRUE;
+    pFeatures->shaderCullDistance = VK_TRUE;
 }
 
 VKAPI_ATTR void VKAPI_CALL

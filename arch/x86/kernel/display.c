@@ -11,6 +11,7 @@
 
 #include "../include/types.h"
 #include "../include/boot_info.h"
+#include "../include/sys/display_syscalls.h"
 
 /* ── External functions ──────────────────────────────────────── */
 
@@ -30,6 +31,20 @@ extern int      gpu_display_is_ready(void)  __attribute__((weak));
 extern int      gpu_display_flip(uint64_t fb_addr) __attribute__((weak));
 extern uint32_t gpu_display_vblank_count(void) __attribute__((weak));
 
+typedef struct {
+    uint32_t pixel_clock_hz;
+    uint16_t h_active, h_blank, h_sync_offset, h_sync_width;
+    uint16_t v_active, v_blank, v_sync_offset, v_sync_width;
+    uint16_t h_total, v_total;
+    uint32_t refresh_hz;
+    bool     interlaced;
+} display_edid_mode_t;
+
+extern int      gpu_display_detect_monitor(display_edid_mode_t *mode) __attribute__((weak));
+extern int      gpu_display_set_mode(const display_edid_mode_t *mode,
+                                     uint64_t fb_addr,
+                                     uint32_t fb_pitch) __attribute__((weak));
+
 /* Virtio-GPU 2D scanout (virtio_gpu.c) — weak so we link without virtio driver */
 extern bool     virtio_gpu_ready(void)      __attribute__((weak));
 extern uint32_t *virtio_gpu_get_fb(void)    __attribute__((weak));
@@ -41,6 +56,8 @@ extern void     virtio_gpu_flush(void)      __attribute__((weak));
 extern int      intel_gfx_is_ready(void)    __attribute__((weak));
 
 static void virtio_blit(const uint32_t *src);
+int display_resize(uint32_t new_width, uint32_t new_height, uint32_t new_pitch);
+uint32_t *display_get_back_buffer(void);
 
 /* ── Display state ───────────────────────────────────────────── */
 
@@ -86,11 +103,16 @@ static boot_display_mode_t avail_modes[BOOT_MAX_DISPLAY_MODES];
 static uint32_t avail_mode_count;
 static uint32_t current_mode_idx;
 
+#define DISP_EINVAL  (-22)
+#define DISP_ENOSYS  (-38)
+#define DISP_ENOTSUP (-95)
+
 void display_set_available_modes(const boot_display_mode_t *modes,
                                  uint32_t count, uint32_t current)
 {
     if (!modes || count == 0) return;
     if (count > BOOT_MAX_DISPLAY_MODES) count = BOOT_MAX_DISPLAY_MODES;
+    if (current >= count) current = 0;
     avail_mode_count = count;
     current_mode_idx = current;
     for (uint32_t i = 0; i < count; i++)
@@ -107,15 +129,142 @@ void display_set_available_modes(const boot_display_mode_t *modes,
     serial_puts(")\n");
 }
 
+static uint32_t display_backend_kind(void)
+{
+    if (disp.gpu_scanout)
+        return DISPLAY_BACKEND_NVIDIA;
+    if (disp.virtio_scanout)
+        return DISPLAY_BACKEND_VIRTIO;
+    if (disp.initialized || disp.gop_fb)
+        return DISPLAY_BACKEND_GOP;
+    return DISPLAY_BACKEND_NONE;
+}
+
+static void display_fill_mode_info(display_mode_info_t *out,
+                                   uint32_t width, uint32_t height,
+                                   uint32_t pitch, uint32_t pixel_format,
+                                   uint32_t refresh_hz, uint32_t flags)
+{
+    if (!out) return;
+    out->width = width;
+    out->height = height;
+    out->pitch = pitch;
+    out->pixel_format = pixel_format;
+    out->refresh_hz = refresh_hz;
+    out->flags = flags;
+    out->backend = display_backend_kind();
+    out->reserved = 0;
+}
+
 uint32_t display_get_mode_count(void)
 {
-    return avail_mode_count;
+    if (avail_mode_count)
+        return avail_mode_count;
+    return disp.initialized ? 1 : 0;
 }
 
 const boot_display_mode_t *display_get_mode(uint32_t idx)
 {
     if (idx >= avail_mode_count) return (void *)0;
     return &avail_modes[idx];
+}
+
+int display_modeset_get_mode(uint32_t idx, display_mode_info_t *out)
+{
+    if (!out) return DISP_EINVAL;
+
+    if (avail_mode_count) {
+        if (idx >= avail_mode_count) return DISP_EINVAL;
+        const boot_display_mode_t *m = &avail_modes[idx];
+        uint32_t flags = DISPLAY_MODE_BOOT;
+        if (idx == current_mode_idx ||
+            (disp.initialized && m->width == disp.width &&
+             m->height == disp.height)) {
+            flags |= DISPLAY_MODE_CURRENT;
+        }
+        display_fill_mode_info(out, m->width, m->height, m->pitch,
+                               m->pixel_format, 0, flags);
+        return 0;
+    }
+
+    if (idx == 0 && disp.initialized) {
+        display_fill_mode_info(out, disp.width, disp.height, disp.pitch,
+                               0, disp.target_fps, DISPLAY_MODE_CURRENT);
+        return 0;
+    }
+
+    return DISP_EINVAL;
+}
+
+int display_modeset_get_current(display_mode_info_t *out)
+{
+    if (!out) return DISP_EINVAL;
+
+    if (disp.initialized) {
+        uint32_t flags = DISPLAY_MODE_CURRENT | DISPLAY_MODE_HARDWARE;
+        display_fill_mode_info(out, disp.width, disp.height, disp.pitch,
+                               0, disp.target_fps, flags);
+        return 0;
+    }
+
+    if (avail_mode_count && current_mode_idx < avail_mode_count) {
+        const boot_display_mode_t *m = &avail_modes[current_mode_idx];
+        display_fill_mode_info(out, m->width, m->height, m->pitch,
+                               m->pixel_format, 0,
+                               DISPLAY_MODE_CURRENT | DISPLAY_MODE_BOOT);
+        return 0;
+    }
+
+    return DISP_ENOSYS;
+}
+
+int display_modeset_set(uint32_t width, uint32_t height,
+                        uint32_t refresh_hz, uint32_t flags)
+{
+    (void)refresh_hz;
+
+    if (!disp.initialized)
+        return DISP_ENOSYS;
+
+    if (flags & DISPLAY_SET_NATIVE) {
+        if (!disp.gpu_scanout || !gpu_display_detect_monitor ||
+            !gpu_display_set_mode) {
+            return DISP_ENOTSUP;
+        }
+
+        display_edid_mode_t native;
+        if (gpu_display_detect_monitor(&native) < 0)
+            return DISP_ENOTSUP;
+
+        if (width && height &&
+            (native.h_active != width || native.v_active != height)) {
+            return DISP_EINVAL;
+        }
+
+        if (display_resize(native.h_active, native.v_active,
+                           native.h_active) < 0) {
+            return DISP_ENOTSUP;
+        }
+
+        uint32_t *bb = display_get_back_buffer();
+        if (!bb)
+            return DISP_ENOTSUP;
+
+        if (gpu_display_set_mode(&native, (uint64_t)(uintptr_t)bb,
+                                 (uint32_t)native.h_active * 4) < 0) {
+            return DISP_ENOTSUP;
+        }
+
+        return 0;
+    }
+
+    if (!width || !height)
+        return DISP_EINVAL;
+
+    if (width == disp.width && height == disp.height)
+        return 0;
+
+    return DISP_ENOTSUP;
 }
 
 /* ── Surface: a drawable rectangle ───────────────────────────── */

@@ -262,7 +262,7 @@ namespace dxvk {
       auto now = Clock::now();
 
       return (now < time)
-        ? wait_for(lock, now - time)
+        ? wait_for(lock, time - now)
         : std::cv_status::timeout;
     }
 
@@ -272,15 +272,21 @@ namespace dxvk {
         return true;
 
       auto now = Clock::now();
-      return now < time && wait_for(lock, now - time, pred);
+      return now < time && wait_for(lock, time - now, pred);
     }
 
     template<typename Rep, typename Period>
     std::cv_status wait_for(std::unique_lock<dxvk::mutex>& lock, const std::chrono::duration<Rep, Period>& timeout) {
       auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(timeout);
       auto srw = lock.mutex()->native_handle();
+      if (ms.count() <= 0)
+        return std::cv_status::timeout;
 
-      return SleepConditionVariableSRW(&m_cond, srw, ms.count(), 0)
+      DWORD waitMs = ms.count() >= static_cast<decltype(ms.count())>(INFINITE)
+        ? INFINITE - 1u
+        : static_cast<DWORD>(ms.count());
+
+      return SleepConditionVariableSRW(&m_cond, srw, waitMs, 0)
         ? std::cv_status::no_timeout
         : std::cv_status::timeout;
     }

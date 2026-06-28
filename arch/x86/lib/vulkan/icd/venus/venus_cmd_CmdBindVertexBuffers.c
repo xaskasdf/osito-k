@@ -1,58 +1,35 @@
-/*
- * Encoder for vkCmdBindVertexBuffers over venus.
- *
- * W3b.6 — added so the hello-triangle smoke can record vertex bindings
- * for the CPU-fallback rasterizer at present time.
- *
- * Request payload (variable):
- *   dev_id          (u64)
- *   cb_id           (u64)
- *   firstBinding    (u32)
- *   bindingCount    (u32)
- *   buffer_ids[bindingCount]   (u64 each)
- *   offsets[bindingCount]      (u64 each)
- *
- * No reply expected.
- */
 #include "venus_wire.h"
-#include "venus_proto_core.h"
+#include "venus_cmd_writer.h"
 #include "venus.h"
 
 #define VENUS_VB_MAX_BINDINGS 8u
+#define VN_CMD_TYPE_vkCmdBindVertexBuffers 105u
 
 int venus_cmd_encode_CmdBindVertexBuffers(
         struct venus_wire *w, uint64_t dev_id, uint64_t cb_id,
         uint32_t first_binding, uint32_t binding_count,
         const uint64_t *buffer_ids, const uint64_t *offsets) {
     if (!w) return -22;
+    (void)dev_id;
     if (binding_count > VENUS_VB_MAX_BINDINGS)
         binding_count = VENUS_VB_MAX_BINDINGS;
+    if (!buffer_ids) binding_count = 0;
 
-    uint32_t payload = 8u + 8u + 4u + 4u
-                     + binding_count * 8u
-                     + binding_count * 8u;
-    payload = (payload + 7u) & ~7u;
+    uint8_t cmd[192];
+    struct venus_cmd_writer wr = { cmd, 0, sizeof(cmd), 0 };
 
-    uint64_t reply_id = 0;
-    uint8_t *p = venus_wire_alloc_cmd(
-            w, VN_CMD_vkCmdBindVertexBuffers,
-            0u /* no reply */,
-            payload, &reply_id);
-    if (!p) return -12;
+    vcw_wr_i32(&wr, (int32_t)VN_CMD_TYPE_vkCmdBindVertexBuffers);
+    vcw_wr_u32(&wr, 0);
+    vcw_wr_u64(&wr, cb_id);
+    vcw_wr_u32(&wr, first_binding);
+    vcw_wr_u32(&wr, binding_count);
+    vcw_wr_array_size(&wr, binding_count);
+    for (uint32_t i = 0; i < binding_count; i++)
+        vcw_wr_u64(&wr, buffer_ids[i]);
+    vcw_wr_array_size(&wr, offsets ? binding_count : 0);
+    for (uint32_t i = 0; offsets && i < binding_count; i++)
+        vcw_wr_u64(&wr, offsets[i]);
 
-    uint32_t off = 0;
-    *(uint64_t *)(p + off) = dev_id;        off += 8;
-    *(uint64_t *)(p + off) = cb_id;         off += 8;
-    *(uint32_t *)(p + off) = first_binding; off += 4;
-    *(uint32_t *)(p + off) = binding_count; off += 4;
-    for (uint32_t i = 0; i < binding_count; i++) {
-        *(uint64_t *)(p + off) = buffer_ids ? buffer_ids[i] : 0ull;
-        off += 8;
-    }
-    for (uint32_t i = 0; i < binding_count; i++) {
-        *(uint64_t *)(p + off) = offsets ? offsets[i] : 0ull;
-        off += 8;
-    }
-
-    return venus_wire_submit(w);
+    if (wr.err) return wr.err;
+    return venus_wire_submit_raw(w, cmd, wr.off);
 }

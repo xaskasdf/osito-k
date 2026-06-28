@@ -4,7 +4,7 @@
 
 namespace dxvk {
 
-#ifdef __OSITO_K__
+#if defined(__OSITO_K__) && defined(DXVK_OSITO_IMAGE_TRACE)
   extern "C" long write(int, const void*, unsigned long);
 
   static void okImageLog(const char* msg) {

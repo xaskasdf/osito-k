@@ -9,6 +9,7 @@
 
 #include "../include/types.h"
 #include "../include/boot_info.h"
+#include "../include/sys/display_syscalls.h"
 #include "../fs/vfs.h"
 #include "rag.h"
 
@@ -635,6 +636,8 @@ static void cmd_help(void)
     sh_puts("  dosrun    Run a DOS 16-bit binary (dosrun file.com)\n");
     sh_puts("  clear     Clear screen\n");
     sh_puts("  desktop   Launch graphical desktop (elementaryOS style)\n");
+    sh_puts("  modes     List display modes\n");
+    sh_puts("  mode      Show/set mode (mode native | mode <w> <h>)\n");
     sh_puts("  kexec     Load + boot kernel from disk (kexec [file])\n");
     sh_puts("  reboot    Reboot system\n");
     sh_puts("  halt      Halt CPU\n");
@@ -760,6 +763,128 @@ static void cmd_uptime(void)
     sh_puts("s (");
     sh_putdec(ticks);
     sh_puts(" ticks)\n");
+}
+
+/* ── Builtin: display modes ─────────────────────────────────── */
+
+static int sh_parse_u32(const char *s, uint32_t *out)
+{
+    uint32_t v = 0;
+    if (!s || !*s || !out) return -1;
+    while (*s) {
+        if (*s < '0' || *s > '9') return -1;
+        uint32_t d = (uint32_t)(*s - '0');
+        if (v > (0xFFFFFFFFu - d) / 10u) return -1;
+        v = v * 10u + d;
+        s++;
+    }
+    *out = v;
+    return 0;
+}
+
+static const char *display_backend_name(uint32_t backend)
+{
+    switch (backend) {
+    case DISPLAY_BACKEND_GOP:    return "gop";
+    case DISPLAY_BACKEND_VIRTIO: return "virtio";
+    case DISPLAY_BACKEND_NVIDIA: return "nvidia";
+    default:                     return "none";
+    }
+}
+
+static void print_display_mode(const char *prefix,
+                               const display_mode_info_t *m,
+                               uint32_t idx)
+{
+    sh_puts(prefix);
+    if (idx != 0xFFFFFFFFu) {
+        sh_putdec(idx);
+        sh_puts(": ");
+    }
+    sh_putdec(m->width);
+    sh_puts("x");
+    sh_putdec(m->height);
+    sh_puts(" pitch=");
+    sh_putdec(m->pitch);
+    if (m->refresh_hz) {
+        sh_puts(" @");
+        sh_putdec(m->refresh_hz);
+        sh_puts("Hz");
+    }
+    sh_puts(" backend=");
+    sh_puts(display_backend_name(m->backend));
+    if (m->flags & DISPLAY_MODE_CURRENT) sh_puts(" current");
+    if (m->flags & DISPLAY_MODE_BOOT)    sh_puts(" boot");
+    if (m->flags & DISPLAY_MODE_NATIVE)  sh_puts(" native");
+    if (m->flags & DISPLAY_MODE_HARDWARE) sh_puts(" hw");
+    sh_puts("\n");
+}
+
+static void cmd_mode(int argc, char *argv[])
+{
+    extern uint32_t display_get_mode_count(void);
+    extern int display_modeset_get_mode(uint32_t, display_mode_info_t *);
+    extern int display_modeset_get_current(display_mode_info_t *);
+    extern int display_modeset_set(uint32_t, uint32_t, uint32_t, uint32_t);
+
+    if (argc >= 2 && strcmp(argv[1], "list") == 0) {
+        argc = 1; /* fall through to list path */
+    }
+
+    if (argc == 1) {
+        display_mode_info_t cur;
+        int rc = display_modeset_get_current(&cur);
+        if (rc == 0)
+            print_display_mode("current: ", &cur, 0xFFFFFFFFu);
+        else
+            sh_puts("current: unavailable\n");
+
+        uint32_t n = display_get_mode_count();
+        sh_puts("modes: ");
+        sh_putdec(n);
+        sh_puts("\n");
+        for (uint32_t i = 0; i < n; i++) {
+            display_mode_info_t m;
+            if (display_modeset_get_mode(i, &m) == 0)
+                print_display_mode("  ", &m, i);
+        }
+        return;
+    }
+
+    if (strcmp(argv[1], "native") == 0) {
+        int rc = display_modeset_set(0, 0, 0, DISPLAY_SET_NATIVE);
+        if (rc == 0)
+            sh_puts("mode: native modeset requested\n");
+        else if (rc == -95)
+            sh_puts("mode: native modeset not supported by active backend\n");
+        else if (rc == -38)
+            sh_puts("mode: display subsystem is not initialized\n");
+        else
+            sh_puts("mode: native modeset failed\n");
+        return;
+    }
+
+    if (argc >= 3) {
+        uint32_t w, h;
+        if (sh_parse_u32(argv[1], &w) < 0 ||
+            sh_parse_u32(argv[2], &h) < 0) {
+            sh_puts("Usage: mode [native | <width> <height>]\n");
+            return;
+        }
+
+        int rc = display_modeset_set(w, h, 0, 0);
+        if (rc == 0)
+            sh_puts("mode: already active or switched\n");
+        else if (rc == -95)
+            sh_puts("mode: exact modeset unsupported by active backend\n");
+        else if (rc == -38)
+            sh_puts("mode: display subsystem is not initialized\n");
+        else
+            sh_puts("mode: invalid mode request\n");
+        return;
+    }
+
+    sh_puts("Usage: mode [native | <width> <height>]\n");
 }
 
 /* ── Builtin: echo ───────────────────────────────────────────── */
@@ -3585,6 +3710,8 @@ void shell_exec(char *line)
         else self_opt_stats();
     } else if (strcmp(cmd, "uptime") == 0) {
         cmd_uptime();
+    } else if (strcmp(cmd, "modes") == 0 || strcmp(cmd, "mode") == 0) {
+        cmd_mode(argc, argv);
     } else if (strcmp(cmd, "echo") == 0) {
         cmd_echo(argc, argv);
     } else if (strcmp(cmd, "ls") == 0) {
@@ -7285,8 +7412,18 @@ void __cold shell_run(void)
     sh_diag_flush("shell-banner");
 
     sh_diag_mark("shell-autoexec-check");
+    /* GTA5 bring-up: keep this opt-in so normal OsitoFS images still boot to a
+     * quiet shell. Creating diag/autoexec-gta5 in the image triggers the run. */
+    if (osfs2_is_mounted() &&
+        osfs2_find("diag/autoexec-gta5") &&
+        osfs2_find("GTA5.elf")) {
+        sh_puts(" Auto-launching GTA5.elf...\n");
+        sh_diag_mark("autoexec-gta5-start");
+        shell_exec("execg GTA5.elf");
+        sh_diag_mark("autoexec-gta5-done");
+    }
     /* Auto-launch hello_gl.elf if present (W4.10 runtime test) */
-    if (osfs2_is_mounted() && osfs2_find("hello_gl.elf")) {
+    else if (osfs2_is_mounted() && osfs2_find("hello_gl.elf")) {
         sh_puts(" Auto-launching hello_gl.elf...\n");
         sh_diag_mark("autoexec-hello-start");
         shell_exec("exec hello_gl.elf");

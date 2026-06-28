@@ -27,6 +27,27 @@ static void ok_vk_log(const char *msg) { (void)msg; }
 static void ok_vk_log_u64(unsigned long long value) { (void)value; }
 #endif
 
+extern int printf(const char *, ...);
+
+static int
+osito_req_invalid(const VkMemoryRequirements *r) {
+    return !r || r->size == 0 || r->alignment == 0 ||
+           r->memoryTypeBits == 0 ||
+           r->size == 0xCDCDCDCDCDCDCDCDULL ||
+           r->alignment == 0xCDCDCDCDCDCDCDCDULL ||
+           r->size > (1ULL << 40);
+}
+
+static void
+osito_req_fallback(VkMemoryRequirements *r,
+                   VkDeviceSize size,
+                   VkDeviceSize alignment) {
+    if (!r) return;
+    r->size = size ? size : 256u;
+    r->alignment = alignment ? alignment : 256u;
+    r->memoryTypeBits = 0xFFFFFFFFu;
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL vkCreateInstance(
     const VkInstanceCreateInfo *, const VkAllocationCallbacks *, VkInstance *);
 VKAPI_ATTR void VKAPI_CALL vkDestroyInstance(
@@ -79,6 +100,8 @@ VKAPI_ATTR void VKAPI_CALL vkGetBufferMemoryRequirements(
     VkDevice, VkBuffer, VkMemoryRequirements *);
 VKAPI_ATTR VkResult VKAPI_CALL vkBindBufferMemory(
     VkDevice, VkBuffer, VkDeviceMemory, VkDeviceSize);
+VKAPI_ATTR VkResult VKAPI_CALL vkBindBufferMemory2(
+    VkDevice, uint32_t, const VkBindBufferMemoryInfo *);
 
 /* W3b.4 — shader + render pass + image + framebuffer + pipeline + command. */
 VKAPI_ATTR VkResult VKAPI_CALL vkCreateShaderModule(
@@ -104,6 +127,8 @@ VKAPI_ATTR void VKAPI_CALL vkGetBufferMemoryRequirements2(
     VkDevice, const VkBufferMemoryRequirementsInfo2 *, VkMemoryRequirements2 *);
 VKAPI_ATTR VkResult VKAPI_CALL vkBindImageMemory(
     VkDevice, VkImage, VkDeviceMemory, VkDeviceSize);
+VKAPI_ATTR VkResult VKAPI_CALL vkBindImageMemory2(
+    VkDevice, uint32_t, const VkBindImageMemoryInfo *);
 VKAPI_ATTR VkResult VKAPI_CALL vkCreateImageView(
     VkDevice, const VkImageViewCreateInfo *,
     const VkAllocationCallbacks *, VkImageView *);
@@ -502,6 +527,9 @@ osito_loader_get_instance_proc_addr(VkInstance instance, const char *pName) {
         return (PFN_vkVoidFunction)vkGetBufferMemoryRequirements;
     if (strcmp(pName, "vkBindBufferMemory") == 0)
         return (PFN_vkVoidFunction)vkBindBufferMemory;
+    if (strcmp(pName, "vkBindBufferMemory2") == 0 ||
+        strcmp(pName, "vkBindBufferMemory2KHR") == 0)
+        return (PFN_vkVoidFunction)vkBindBufferMemory2;
 
     /* W3b.4 additions. */
     if (strcmp(pName, "vkCreateShaderModule") == 0)
@@ -526,6 +554,9 @@ osito_loader_get_instance_proc_addr(VkInstance instance, const char *pName) {
         return (PFN_vkVoidFunction)vkGetBufferMemoryRequirements2;
     if (strcmp(pName, "vkBindImageMemory") == 0)
         return (PFN_vkVoidFunction)vkBindImageMemory;
+    if (strcmp(pName, "vkBindImageMemory2") == 0 ||
+        strcmp(pName, "vkBindImageMemory2KHR") == 0)
+        return (PFN_vkVoidFunction)vkBindImageMemory2;
     if (strcmp(pName, "vkCreateImageView") == 0)
         return (PFN_vkVoidFunction)vkCreateImageView;
     if (strcmp(pName, "vkDestroyImageView") == 0)
@@ -1401,7 +1432,9 @@ vkDestroyBuffer(VkDevice device, VkBuffer buffer,
 VKAPI_ATTR void VKAPI_CALL
 vkGetBufferMemoryRequirements(VkDevice device, VkBuffer buffer,
                               VkMemoryRequirements *pReqs) {
-    if (!device || !buffer || !pReqs) return;
+    if (!pReqs) return;
+    osito_req_fallback(pReqs, 256u, 16u);
+    if (!device || !buffer) return;
     struct osito_device    *dw = osito_device_from(device);
     struct osito_icd_inst  *ci = dw->owner;
     struct osito_buffer    *bw = buf_from(buffer);
@@ -1413,12 +1446,8 @@ vkGetBufferMemoryRequirements(VkDevice device, VkBuffer buffer,
         (PFN_vkGetBufferMemoryRequirements)ci->icd->get_proc_addr(
             ci->handle, "vkGetBufferMemoryRequirements");
     if (fn) fn(dw->real, bw->real, pReqs);
-    if (pReqs->size == 0 || pReqs->alignment == 0 ||
-        pReqs->memoryTypeBits == 0) {
-        pReqs->size = bw->size ? bw->size : 1;
-        pReqs->alignment = 16u;
-        pReqs->memoryTypeBits = 0xFFFFFFFFu;
-    }
+    if (osito_req_invalid(pReqs))
+        osito_req_fallback(pReqs, bw->size ? bw->size : 1u, 16u);
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL
@@ -1434,6 +1463,19 @@ vkBindBufferMemory(VkDevice device, VkBuffer buffer,
         ci->icd->get_proc_addr(ci->handle, "vkBindBufferMemory");
     if (!fn) return VK_ERROR_INITIALIZATION_FAILED;
     return fn(dw->real, bw->real, mw->real, memoryOffset);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+vkBindBufferMemory2(VkDevice device, uint32_t bindInfoCount,
+                    const VkBindBufferMemoryInfo *pBindInfos) {
+    if (bindInfoCount && !pBindInfos) return VK_ERROR_INITIALIZATION_FAILED;
+    for (uint32_t i = 0; i < bindInfoCount; i++) {
+        VkResult rc = vkBindBufferMemory(device, pBindInfos[i].buffer,
+                                         pBindInfos[i].memory,
+                                         pBindInfos[i].memoryOffset);
+        if (rc != VK_SUCCESS) return rc;
+    }
+    return VK_SUCCESS;
 }
 
 /* ---------------- W3b.4 trampolines ---------------------------------------
@@ -1581,7 +1623,9 @@ vkDestroyImage(VkDevice device, VkImage image,
 VKAPI_ATTR void VKAPI_CALL
 vkGetImageMemoryRequirements(VkDevice device, VkImage image,
                              VkMemoryRequirements *pReqs) {
-    if (!device || !image || !pReqs) return;
+    if (!pReqs) return;
+    osito_req_fallback(pReqs, 256u, 256u);
+    if (!device || !image) return;
     struct osito_device *dw = osito_device_from(device);
     struct osito_icd_inst *ci = dw->owner;
     struct osito_image *w = img_from(image);
@@ -1592,12 +1636,9 @@ vkGetImageMemoryRequirements(VkDevice device, VkImage image,
     ok_vk_log("[vkldr] GetImageReq icd begin\n");
     if (fn) fn(dw->real, w->real, pReqs);
     ok_vk_log("[vkldr] GetImageReq icd done\n");
-    if (pReqs->size == 0 || pReqs->alignment == 0 ||
-        pReqs->memoryTypeBits == 0) {
+    if (osito_req_invalid(pReqs)) {
         VkDeviceSize pixels = (VkDeviceSize)w->width * (VkDeviceSize)w->height;
-        pReqs->size = pixels ? pixels * 4u : 256u;
-        pReqs->alignment = 256u;
-        pReqs->memoryTypeBits = 0xFFFFFFFFu;
+        osito_req_fallback(pReqs, pixels ? pixels * 4u : 256u, 256u);
     }
     ok_vk_log("[vkldr] GetImageReq leave\n");
 }
@@ -1610,8 +1651,19 @@ VKAPI_ATTR void VKAPI_CALL
 vkGetImageMemoryRequirements2(VkDevice device,
                               const VkImageMemoryRequirementsInfo2 *pInfo,
                               VkMemoryRequirements2 *pReqs) {
-    if (!pInfo || !pReqs) return;
-    vkGetImageMemoryRequirements(device, pInfo->image, &pReqs->memoryRequirements);
+    if (!pReqs) return;
+    osito_req_fallback(&pReqs->memoryRequirements, 256u, 256u);
+    if (pInfo && pInfo->image)
+        vkGetImageMemoryRequirements(device, pInfo->image, &pReqs->memoryRequirements);
+    if (osito_req_invalid(&pReqs->memoryRequirements)) {
+        static uint32_t log_count;
+        if (log_count++ < 16u)
+            printf("[VKLDr2] image requirements fallback size=%llu align=%llu bits=0x%x\n",
+                   (unsigned long long)pReqs->memoryRequirements.size,
+                   (unsigned long long)pReqs->memoryRequirements.alignment,
+                   pReqs->memoryRequirements.memoryTypeBits);
+        osito_req_fallback(&pReqs->memoryRequirements, 256u, 256u);
+    }
     /* Fill any VkMemoryDedicatedRequirements in the pNext chain. */
     VkBaseOutStructure *s = (VkBaseOutStructure *)pReqs->pNext;
     for (; s; s = s->pNext) {
@@ -1631,8 +1683,19 @@ VKAPI_ATTR void VKAPI_CALL
 vkGetBufferMemoryRequirements2(VkDevice device,
                                const VkBufferMemoryRequirementsInfo2 *pInfo,
                                VkMemoryRequirements2 *pReqs) {
-    if (!pInfo || !pReqs) return;
-    vkGetBufferMemoryRequirements(device, pInfo->buffer, &pReqs->memoryRequirements);
+    if (!pReqs) return;
+    osito_req_fallback(&pReqs->memoryRequirements, 256u, 16u);
+    if (pInfo && pInfo->buffer)
+        vkGetBufferMemoryRequirements(device, pInfo->buffer, &pReqs->memoryRequirements);
+    if (osito_req_invalid(&pReqs->memoryRequirements)) {
+        static uint32_t log_count;
+        if (log_count++ < 16u)
+            printf("[VKLDr2] buffer requirements fallback size=%llu align=%llu bits=0x%x\n",
+                   (unsigned long long)pReqs->memoryRequirements.size,
+                   (unsigned long long)pReqs->memoryRequirements.alignment,
+                   pReqs->memoryRequirements.memoryTypeBits);
+        osito_req_fallback(&pReqs->memoryRequirements, 256u, 16u);
+    }
     VkBaseOutStructure *s = (VkBaseOutStructure *)pReqs->pNext;
     for (; s; s = s->pNext) {
         if (s->sType == VK_STRUCTURE_TYPE_MEMORY_DEDICATED_REQUIREMENTS) {
@@ -1645,19 +1708,54 @@ vkGetBufferMemoryRequirements2(VkDevice device,
 VKAPI_ATTR VkResult VKAPI_CALL
 vkBindImageMemory(VkDevice device, VkImage image, VkDeviceMemory memory,
                   VkDeviceSize memoryOffset) {
+    static uint32_t bind_log_count;
     if (!device || !image || !memory) return VK_ERROR_INITIALIZATION_FAILED;
     struct osito_device *dw = osito_device_from(device);
     struct osito_icd_inst *ci = dw->owner;
     struct osito_image *w = img_from(image);
     struct osito_memory *mw = mem_from(memory);
-    if (!ci) return VK_ERROR_INITIALIZATION_FAILED;
+    if (!ci) {
+        if (bind_log_count < 16u) {
+            bind_log_count++;
+            printf("[VKLDbind] image no-ci image=%p mem=%p\n",
+                   (void *)image, (void *)memory);
+        }
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
     PFN_vkBindImageMemory fn = (PFN_vkBindImageMemory)
         ci->icd->get_proc_addr(ci->handle, "vkBindImageMemory");
-    if (!fn) return VK_ERROR_INITIALIZATION_FAILED;
+    if (!fn) {
+        if (bind_log_count < 16u) {
+            bind_log_count++;
+            printf("[VKLDbind] image no-fn image=%p mem=%p\n",
+                   (void *)image, (void *)memory);
+        }
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
     ok_vk_log("[vkldr] BindImageMemory icd begin\n");
     VkResult rc = fn(dw->real, w->real, mw->real, memoryOffset);
     ok_vk_log("[vkldr] BindImageMemory icd done\n");
+    if (bind_log_count < 16u) {
+        bind_log_count++;
+        printf("[VKLDbind] image rc=%d image=%p real=%p mem=%p realmem=%p off=%llu\n",
+               (int)rc, (void *)image, (void *)w->real,
+               (void *)memory, (void *)mw->real,
+               (unsigned long long)memoryOffset);
+    }
     return rc;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+vkBindImageMemory2(VkDevice device, uint32_t bindInfoCount,
+                   const VkBindImageMemoryInfo *pBindInfos) {
+    if (bindInfoCount && !pBindInfos) return VK_ERROR_INITIALIZATION_FAILED;
+    for (uint32_t i = 0; i < bindInfoCount; i++) {
+        VkResult rc = vkBindImageMemory(device, pBindInfos[i].image,
+                                        pBindInfos[i].memory,
+                                        pBindInfos[i].memoryOffset);
+        if (rc != VK_SUCCESS) return rc;
+    }
+    return VK_SUCCESS;
 }
 
 /* Image view */
@@ -2771,6 +2869,7 @@ vkDestroySwapchainKHR(VkDevice device, VkSwapchainKHR swapchain,
 VKAPI_ATTR VkResult VKAPI_CALL
 vkGetSwapchainImagesKHR(VkDevice device, VkSwapchainKHR swapchain,
                         uint32_t *pCount, VkImage *pImages) {
+    extern int printf(const char *, ...);
     if (!device || !swapchain || !pCount) return VK_ERROR_INITIALIZATION_FAILED;
     struct osito_device *dw = osito_device_from(device);
     struct osito_icd_inst *ci = dw->owner;
@@ -2779,9 +2878,17 @@ vkGetSwapchainImagesKHR(VkDevice device, VkSwapchainKHR swapchain,
     PFN_vkGetSwapchainImagesKHR fn = (PFN_vkGetSwapchainImagesKHR)
         ci->icd->get_proc_addr(ci->handle, "vkGetSwapchainImagesKHR");
     if (!fn) return VK_ERROR_INITIALIZATION_FAILED;
+    printf("[LDSGI] begin dev=%p realdev=%p swap=%p w=%p real=0x%llx pCount=%p in=%u imgs=%p\n",
+           (void *)device, (void *)dw->real, (void *)swapchain, (void *)w,
+           (unsigned long long)(uintptr_t)w->real,
+           (void *)pCount, pCount ? *pCount : 0u, (void *)pImages);
     /* First call (pImages==NULL) just returns the count. */
     if (!pImages) {
-        return fn(dw->real, w->real, pCount, NULL);
+        VkResult rc = fn(dw->real, w->real, pCount, NULL);
+        printf("[LDSGI] count rc=%d out=%u real=0x%llx\n",
+               (int)rc, pCount ? *pCount : 0u,
+               (unsigned long long)(uintptr_t)w->real);
+        return rc;
     }
     /* Second call: collect real VkImages from the ICD, then wrap each
      * in an osito_image {owner, real} so subsequent vkBindImageMemory
@@ -2791,6 +2898,10 @@ vkGetSwapchainImagesKHR(VkDevice device, VkSwapchainKHR swapchain,
     uint32_t n = (*pCount < OSITO_SW_MAX) ? *pCount : OSITO_SW_MAX;
     uint32_t req = n;
     VkResult rc = fn(dw->real, w->real, &req, reals);
+    printf("[LDSGI] list rc=%d req=%u n=%u real=0x%llx first=0x%llx\n",
+           (int)rc, req, n,
+           (unsigned long long)(uintptr_t)w->real,
+           (unsigned long long)(uintptr_t)reals[0]);
     if (rc != VK_SUCCESS && rc != VK_INCOMPLETE) return rc;
     for (uint32_t i = 0; i < req; i++) {
         struct osito_image *iw = malloc(sizeof(*iw));
@@ -2813,17 +2924,44 @@ VKAPI_ATTR VkResult VKAPI_CALL
 vkAcquireNextImageKHR(VkDevice device, VkSwapchainKHR swapchain,
                       uint64_t timeout, VkSemaphore sem, VkFence fence,
                       uint32_t *pImageIndex) {
-    if (!device || !swapchain || !pImageIndex) return VK_ERROR_INITIALIZATION_FAILED;
+    extern int printf(const char *, ...);
+    static uint32_t s_acquire_log_count;
+    if (!device || !swapchain || !pImageIndex) {
+        printf("[LDAI] invalid args dev=%p swap=%p out=%p\n",
+               device, (void *)swapchain, (void *)pImageIndex);
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
     struct osito_device *dw = osito_device_from(device);
     struct osito_icd_inst *ci = dw->owner;
     struct osito_swapchain *w = swp_from(swapchain);
-    if (!ci) return VK_ERROR_INITIALIZATION_FAILED;
+    if (!ci) {
+        printf("[LDAI] missing owner dev=%p dw=%p\n", device, (void *)dw);
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
     PFN_vkAcquireNextImageKHR fn = (PFN_vkAcquireNextImageKHR)
         ci->icd->get_proc_addr(ci->handle, "vkAcquireNextImageKHR");
-    if (!fn) return VK_ERROR_INITIALIZATION_FAILED;
+    if (!fn) {
+        printf("[LDAI] missing icd vkAcquireNextImageKHR\n");
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
     VkSemaphore real_sem   = sem   ? sem_from(sem)->real   : VK_NULL_HANDLE;
     VkFence     real_fence = fence ? fence_from(fence)->real : VK_NULL_HANDLE;
-    return fn(dw->real, w->real, timeout, real_sem, real_fence, pImageIndex);
+    if (s_acquire_log_count < 32u) {
+        printf("[LDAI] begin dev=%p realdev=%p swap=%p real=0x%llx sem=0x%llx realsem=0x%llx\n",
+               (void *)device, (void *)dw->real, (void *)swapchain,
+               (unsigned long long)(uintptr_t)w->real,
+               (unsigned long long)(uintptr_t)sem,
+               (unsigned long long)(uintptr_t)real_sem);
+    }
+    VkResult rc = fn(dw->real, w->real, timeout, real_sem, real_fence, pImageIndex);
+    if (s_acquire_log_count < 32u || (rc != VK_SUCCESS && rc != VK_SUBOPTIMAL_KHR)) {
+        printf("[LDAI] done rc=%d image=%u real=0x%llx\n",
+               (int)rc, pImageIndex ? *pImageIndex : 0u,
+               (unsigned long long)(uintptr_t)w->real);
+        if (s_acquire_log_count < 32u)
+            s_acquire_log_count++;
+    }
+    return rc;
 }
 
 /* --- Present --- */

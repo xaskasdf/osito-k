@@ -1,34 +1,22 @@
-/*
- * Encoder for vkDestroyShaderModule over venus.
- *
- * Request payload:
- *   dev_id             (u64)
- *   shader_id          (u64)
- *   pAllocator_present (u32)  always 0
- *   pad                (u32)
- *
- * No reply expected.
- */
 #include "venus_wire.h"
-#include "venus_proto_core.h"
+#include "venus_cmd_writer.h"
 #include "venus.h"
+
+#define VN_CMD_TYPE_vkDestroyShaderModule 60u
 
 int venus_cmd_encode_DestroyShaderModule(struct venus_wire *w,
                                          uint64_t dev_id, uint64_t shader_id) {
-    if (!w) return -22;
+    if (!w || !shader_id) return -22;
 
-    uint64_t reply_id = 0;
-    uint8_t *p = venus_wire_alloc_cmd(
-            w, VN_CMD_vkDestroyShaderModule,
-            0u /* no reply */,
-            8u + 8u + 4u + 4u,
-            &reply_id);
-    if (!p) return -12;
+    uint8_t cmd[28];
+    struct venus_cmd_writer wr = { cmd, 0, sizeof(cmd), 0 };
 
-    *(uint64_t *)(p + 0)  = dev_id;
-    *(uint64_t *)(p + 8)  = shader_id;
-    *(uint32_t *)(p + 16) = 0u;
-    *(uint32_t *)(p + 20) = 0u;
+    vcw_wr_i32(&wr, (int32_t)VN_CMD_TYPE_vkDestroyShaderModule);
+    vcw_wr_u32(&wr, 0);
+    vcw_wr_u64(&wr, dev_id);
+    vcw_wr_u64(&wr, shader_id);
+    vcw_wr_u64(&wr, 0); /* pAllocator */
+    if (wr.err) return wr.err;
 
-    return venus_wire_submit(w);
+    return venus_wire_submit_raw(w, cmd, wr.off);
 }

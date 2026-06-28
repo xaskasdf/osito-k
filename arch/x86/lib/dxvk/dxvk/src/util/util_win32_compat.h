@@ -1,25 +1,42 @@
 #pragma once
 
-#if defined(__unix__)
+#if defined(__unix__) || defined(__OSITO_K__)
 
 #include <windows.h>
+#if !defined(__OSITO_K__)
 #include <dlfcn.h>
+#endif
 
 #include "log/log.h"
 
 inline HMODULE LoadLibraryA(LPCSTR lpLibFileName) {
+#if defined(__OSITO_K__)
+  (void)lpLibFileName;
+  return nullptr;
+#else
   return dlopen(lpLibFileName, RTLD_NOW);
+#endif
 }
 
 inline void FreeLibrary(HMODULE module) {
+#if defined(__OSITO_K__)
+  (void)module;
+#else
   dlclose(module);
+#endif
 }
 
 inline void* GetProcAddress(HMODULE module, LPCSTR lpProcName) {
+#if defined(__OSITO_K__)
+  (void)module;
+  (void)lpProcName;
+  return nullptr;
+#else
   if (!module)
     return nullptr;
 
   return dlsym(module, lpProcName);
+#endif
 }
 
 inline HANDLE CreateSemaphoreA(

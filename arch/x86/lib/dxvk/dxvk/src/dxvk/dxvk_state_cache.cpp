@@ -110,6 +110,16 @@ namespace dxvk {
         return true;
       }
 
+      if (version < 18) {
+        DxvkRsInfoV17 v17;
+
+        if (!read(v17))
+          return false;
+
+        data = v17.convert();
+        return true;
+      }
+
       return read(data);
     }
 

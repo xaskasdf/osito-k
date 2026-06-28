@@ -39,13 +39,14 @@ extern void vsr_paint_triangle(uint32_t *fb, uint32_t fb_w, uint32_t fb_h,
 static uint32_t venus_present_logged_raster;
 static uint32_t venus_present_logged_empty;
 static uint32_t venus_present_logged_no_target;
+static uint32_t venus_present_logged_flip;
 
-static int present_surface_has_color(const uint32_t *fb,
-                                     uint32_t w, uint32_t h) {
+static int present_surface_has_visible_color(const uint32_t *fb,
+                                             uint32_t w, uint32_t h) {
     if (!fb || w == 0 || h == 0) return 0;
     uint64_t pixels = (uint64_t)w * (uint64_t)h;
     for (uint64_t k = 0; k < pixels; k++) {
-        if (fb[k] != 0)
+        if ((fb[k] & 0x00ffffffu) != 0)
             return 1;
     }
     return 0;
@@ -180,15 +181,12 @@ int venus_cmd_encode_QueuePresentKHR(
             const uint32_t *present_src =
                     (const uint32_t *)((const uint8_t *)m->local_ptr +
                                        img->bound_offset);
-            if (!present_surface_has_color(present_src, w, h)) {
-                if (!venus_present_logged_empty) {
-                    venus_present_logged_empty = 1u;
-                    printf("[VPRES] empty swapchain image=%d -> skip flip\n",
-                           img_slot);
+            if (!present_surface_has_visible_color(present_src, w, h)) {
+                if (venus_present_logged_empty < 8u) {
+                    venus_present_logged_empty++;
+                    printf("[VPRES] black swapchain sc=%d idx=%u image=%d %ux%u -> flip\n",
+                           sc_slot, idx, img_slot, w, h);
                 }
-                if (pPresentInfo->pResults)
-                    pPresentInfo->pResults[i] = VK_SUCCESS;
-                continue;
             }
         }
 
@@ -196,9 +194,18 @@ int venus_cmd_encode_QueuePresentKHR(
             struct venus_surface *surf = present_target_surface(dev, sc);
             if (surf) {
                 copy_present_to_surface(surf, m, img);
+                if (venus_present_logged_flip < 16u) {
+                    venus_present_logged_flip++;
+                    printf("[VPRES] flip sc=%d idx=%u image=%d src=%ux%u target=%ux%u shm=%u\n",
+                           sc_slot, idx, img_slot,
+                           m->shm_width ? m->shm_width : img->width,
+                           m->shm_height ? m->shm_height : img->height,
+                           surf->width, surf->height,
+                           (uint32_t)surf->shm_handle);
+                }
                 (void)__syscall1(SYS_GUI_FLIP, (long)(uint32_t)surf->shm_handle);
-            } else if (!venus_present_logged_no_target) {
-                venus_present_logged_no_target = 1u;
+            } else if (venus_present_logged_no_target < 4u) {
+                venus_present_logged_no_target++;
                 printf("[VPRES] no compositor target for swapchain=%d surface=%d\n",
                        sc_slot, sc->surface_slot);
             }

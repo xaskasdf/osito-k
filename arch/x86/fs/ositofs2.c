@@ -645,8 +645,11 @@ int osfs2_read(osfs2_file_t *file, uint64_t offset, void *buf, uint64_t len)
 {
     if (!mounted || !file) return -1;
     if (offset + len > file->size) return -1;
-    int dbg_fx = (strcmp(file->name, "shaders/win32_40_lq_final/im.fxc") == 0 ||
-                  strcmp(file->name, "rage/assets/tune/shaders/lib/win32_40/rage_im.fxc") == 0);
+    int dbg_fx = 0;
+#ifdef OSITO_TRACE_FX_READS
+    dbg_fx = (strcmp(file->name, "shaders/win32_40_lq_final/im.fxc") == 0 ||
+              strcmp(file->name, "rage/assets/tune/shaders/lib/win32_40/rage_im.fxc") == 0);
+#endif
     if (dbg_fx) {
         serial_puts("[OsitoFS] read fx name='");
         serial_puts(file->name);

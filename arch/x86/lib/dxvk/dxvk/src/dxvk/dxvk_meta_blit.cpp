@@ -283,8 +283,8 @@ namespace dxvk {
       VK_SHADER_STAGE_FRAGMENT_BIT, psModule, "main" };
     
     std::array<VkDynamicState, 2> dynStates = {{
-      VK_DYNAMIC_STATE_VIEWPORT_WITH_COUNT,
-      VK_DYNAMIC_STATE_SCISSOR_WITH_COUNT,
+      VK_DYNAMIC_STATE_VIEWPORT,
+      VK_DYNAMIC_STATE_SCISSOR,
     }};
     
     VkPipelineDynamicStateCreateInfo dynState = { VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO };
@@ -298,6 +298,8 @@ namespace dxvk {
     iaState.primitiveRestartEnable = VK_FALSE;
     
     VkPipelineViewportStateCreateInfo vpState = { VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO };
+    vpState.viewportCount = 1;
+    vpState.scissorCount  = 1;
     
     VkPipelineRasterizationStateCreateInfo rsState = { VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO };
     rsState.polygonMode = VK_POLYGON_MODE_FILL;

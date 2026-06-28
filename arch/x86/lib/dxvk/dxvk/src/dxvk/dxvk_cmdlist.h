@@ -900,8 +900,8 @@ namespace dxvk {
     void cmdSetScissor(
             uint32_t                scissorCount,
       const VkRect2D*               scissors) {
-      m_vkd->vkCmdSetScissorWithCount(
-        m_cmd.execBuffer, scissorCount, scissors);
+      m_vkd->vkCmdSetScissor(
+        m_cmd.execBuffer, 0, scissorCount, scissors);
     }
 
 
@@ -952,8 +952,8 @@ namespace dxvk {
     void cmdSetViewport(
             uint32_t                viewportCount,
       const VkViewport*             viewports) {
-      m_vkd->vkCmdSetViewportWithCount(
-        m_cmd.execBuffer, viewportCount, viewports);
+      m_vkd->vkCmdSetViewport(
+        m_cmd.execBuffer, 0, viewportCount, viewports);
     }
 
 

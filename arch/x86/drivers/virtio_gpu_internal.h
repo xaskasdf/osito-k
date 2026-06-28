@@ -20,6 +20,8 @@ uint64_t          vgpu_device_features(void);
 
 /* Read a u32 from the GPU's PCI config via ECAM. */
 uint32_t          vgpu_ecam_read32(uint16_t offset);
+uint64_t          vgpu_hostmem_base(void);
+uint64_t          vgpu_hostmem_size(void);
 
 /* Submit a command buffer on the control virtqueue and wait for the
  * response synchronously. Returns 0 on success, <0 on error. */

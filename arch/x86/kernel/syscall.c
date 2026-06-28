@@ -97,6 +97,15 @@ extern bool     input_pop_event(void *out_evt)                   __attribute__((
 extern int     sched_set_qos(uint32_t pid, uint8_t qos)         __attribute__((weak));
 extern uint8_t sched_get_qos(uint32_t pid)                      __attribute__((weak));
 
+/* Display modes */
+#include "../include/sys/display_syscalls.h"
+extern uint32_t display_get_mode_count(void)                    __attribute__((weak));
+extern int      display_modeset_get_mode(uint32_t idx,
+                                         display_mode_info_t *out) __attribute__((weak));
+extern int      display_modeset_get_current(display_mode_info_t *out) __attribute__((weak));
+extern int      display_modeset_set(uint32_t width, uint32_t height,
+                                    uint32_t refresh_hz, uint32_t flags) __attribute__((weak));
+
 /* GPU 3D driver (Vulkan Phase 1 / Wave 1) */
 #include "../include/sys/gpu_syscalls.h"
 extern int32_t proc_current_pid(void);
@@ -459,9 +468,14 @@ static ssize_t console_read(void *buf, size_t count)
 
 static bool sys_debug_is_fx_path(const char *name)
 {
+#ifdef OSITO_TRACE_FX_READS
     return name &&
            (strcmp(name, "shaders/win32_40_lq_final/im.fxc") == 0 ||
             strcmp(name, "rage/assets/tune/shaders/lib/win32_40/rage_im.fxc") == 0);
+#else
+    (void)name;
+    return false;
+#endif
 }
 
 /* Seed an fd table with stdio (fd 0/1/2 → console). Called by
@@ -539,6 +553,8 @@ void sys_brk_reset(void)
  * their requested addresses. */
 #define MMAP_ANON_LOW_BASE   0x30000000ULL
 #define MMAP_ANON_LOW_LIMIT  0x100000000ULL
+#define MMAP_ANON_HIGH_BASE  0x1000000000ULL
+#define MMAP_ANON_HIGH_LIMIT 0x0000800000000000ULL
 
 /* VMA tracking — per-process mmap regions */
 #define MAX_VMAS        4096
@@ -569,6 +585,17 @@ extern void    *proc_current(void);
 extern uint64_t proc_current_cr3(void);
 extern int32_t  proc_current_tgid(void);
 extern int32_t  proc_tgid_of(void *p);
+
+/* GPU contexts/resources are process-wide objects.  CLONE_THREAD gives each
+ * thread its own TID (proc_current_pid) while sharing the address space and
+ * Vulkan device state with the thread-group leader.  Key the kernel GPU tables
+ * by TGID so render threads can submit work to contexts created by the main
+ * thread. */
+static int32_t gpu_current_owner_pid(void)
+{
+    int32_t tgid = proc_current_tgid();
+    return tgid > 0 ? tgid : proc_current_pid();
+}
 
 static void vma_set_owner(vma_t *v, void *owner)
 {
@@ -1707,9 +1734,21 @@ int64_t sys_brk(uint64_t addr)
     /* Lazy init: allocate brk region on first call */
     if (!brk_base) {
         brk_base = (uint8_t *)kmalloc(BRK_HEAP_SIZE);
-        if (!brk_base) return 0;
+        if (!brk_base) {
+            serial_puts("[BRK] init failed size=");
+            serial_putdec(BRK_HEAP_SIZE / (1024 * 1024));
+            serial_puts("MB\n");
+            return 0;
+        }
         brk_current = brk_base;
         brk_max = brk_base + BRK_HEAP_SIZE;
+        serial_puts("[BRK] init base=0x");
+        serial_puthex((uint64_t)(uintptr_t)brk_base, 16);
+        serial_puts(" size=");
+        serial_putdec(BRK_HEAP_SIZE / (1024 * 1024));
+        serial_puts("MB max=0x");
+        serial_puthex((uint64_t)(uintptr_t)brk_max, 16);
+        serial_puts("\n");
     }
 
     if (addr == 0)
@@ -1722,6 +1761,16 @@ int64_t sys_brk(uint64_t addr)
         if (new_brk > brk_current)
             memset(brk_current, 0, (uint64_t)(new_brk - brk_current));
         brk_current = new_brk;
+    } else {
+        serial_puts("[BRK] reject addr=0x");
+        serial_puthex(addr, 16);
+        serial_puts(" cur=0x");
+        serial_puthex((uint64_t)(uintptr_t)brk_current, 16);
+        serial_puts(" base=0x");
+        serial_puthex((uint64_t)(uintptr_t)brk_base, 16);
+        serial_puts(" max=0x");
+        serial_puthex((uint64_t)(uintptr_t)brk_max, 16);
+        serial_puts("\n");
     }
 
     return (int64_t)(uint64_t)brk_current;
@@ -1811,7 +1860,12 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
         for (int i = 0; i < MAX_VMAS; i++) {
             if (!vma_table[i].in_use) { vi = i; break; }
         }
-        if (vi < 0) return -ENOMEM;
+        if (vi < 0) {
+            serial_puts("[MMAP] fail file no-vma len=");
+            serial_putdec(length);
+            serial_puts("\n");
+            return -ENOMEM;
+        }
 
         /* Reserve virtual address range (no physical pages allocated) */
         static uint64_t mmap_file_base = 0x600000000ULL;
@@ -1855,12 +1909,18 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
     for (int i = 0; i < MAX_VMAS; i++) {
         if (!vma_table[i].in_use) { vi = i; break; }
     }
-    if (vi < 0) return -ENOMEM;
+    if (vi < 0) {
+        serial_puts("[MMAP] fail anon no-vma len=");
+        serial_putdec(length);
+        serial_puts("\n");
+        return -ENOMEM;
+    }
 
     /* Allocate a user-space VA from the 32-bit-clean anonymous pool. Callers
      * that pass an aligned addr hint (e.g. musl mallocng guard-page patching)
      * get that exact VA back, just like the legacy PROT_NONE path. */
     static uint64_t mmap_anon_base = MMAP_ANON_LOW_BASE;
+    static uint64_t mmap_anon_high_base = MMAP_ANON_HIGH_BASE;
     uint64_t result;
     if (fixed) {
         result = addr;
@@ -1869,20 +1929,50 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
     } else {
         uint64_t bytes = npages * 4096ULL;
         uint64_t cursor = mmap_anon_base;
+        bool high_pool = false;
         if (cursor < MMAP_ANON_LOW_BASE)
             cursor = MMAP_ANON_LOW_BASE;
 
         for (;;) {
             if (cursor + bytes < cursor ||
-                cursor + bytes > MMAP_ANON_LOW_LIMIT)
+                cursor + bytes > MMAP_ANON_LOW_LIMIT) {
+                high_pool = true;
+                cursor = mmap_anon_high_base;
+                if (cursor < MMAP_ANON_HIGH_BASE)
+                    cursor = MMAP_ANON_HIGH_BASE;
+                break;
+            }
+            if (!vma_range_overlaps_current(cursor, npages))
+                break;
+            cursor += bytes;
+        }
+
+        while (high_pool) {
+            if (cursor + bytes < cursor ||
+                cursor + bytes > MMAP_ANON_HIGH_LIMIT) {
+                serial_puts("[MMAP] fail anon high-limit bytes=");
+                serial_putdec(bytes);
+                serial_puts(" cursor=0x");
+                serial_puthex(cursor, 16);
+                serial_puts("\n");
                 return -ENOMEM;
+            }
             if (!vma_range_overlaps_current(cursor, npages))
                 break;
             cursor += bytes;
         }
 
         result = cursor;
-        mmap_anon_base = cursor + bytes;
+        if (high_pool) {
+            mmap_anon_high_base = cursor + bytes;
+            serial_puts("[MMAP] anon high base=0x");
+            serial_puthex(result, 16);
+            serial_puts(" bytes=");
+            serial_putdec(bytes);
+            serial_puts("\n");
+        } else {
+            mmap_anon_base = cursor + bytes;
+        }
     }
 
     vma_table[vi].base   = result;
@@ -1894,6 +1984,13 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
 
     int commit_rc = mmap_commit_anon_first_page(result, (uint32_t)prot);
     if (commit_rc < 0) {
+        serial_puts("[MMAP] fail anon commit addr=0x");
+        serial_puthex(result, 16);
+        serial_puts(" len=");
+        serial_putdec(length);
+        serial_puts(" prot=0x");
+        serial_puthex(prot, 8);
+        serial_puts("\n");
         vma_clear_slot(&vma_table[vi]);
         return commit_rc;
     }
@@ -2766,10 +2863,12 @@ static int64_t sys_nanosleep(uint64_t req_addr, uint64_t rem_addr)
     uint64_t deadline = idt_get_ticks() + sleep_ticks;
     while (idt_get_ticks() < deadline) {
         /*
-         * SYSCALL entry clears IF, so a plain HLT can sleep forever waiting
-         * for the timer tick that would advance idt_get_ticks().
+         * SYSCALL entry clears IF. HLT is unsafe here on SMP/HVF because CPU0
+         * can sleep with its local APIC timer masked while other CPUs keep
+         * advancing the global tick. Poll with IF briefly enabled instead of
+         * depending on a local HLT wakeup interrupt.
          */
-        __asm__ volatile ("sti; hlt; cli" ::: "memory");
+        __asm__ volatile ("sti; pause; cli" ::: "memory");
     }
 
     if (rem_addr) {
@@ -2800,10 +2899,11 @@ static int64_t sys_getrandom(uint64_t buf_addr, uint64_t buflen, uint64_t flags)
 static int64_t sys_sched_yield(void)
 {
     /*
-     * SYSCALL masks IF, so a bare HLT may never see the timer interrupt that
-     * should reschedule us. Mirror nanosleep's interrupt-safe wait.
+     * SYSCALL masks IF; avoid HLT here for the same reason as nanosleep.
+     * This is still a cooperative hint, but it cannot wedge the caller if
+     * the current CPU's local timer is not delivering interrupts.
      */
-    __asm__ volatile ("sti; hlt; cli" ::: "memory");
+    __asm__ volatile ("sti; pause; cli" ::: "memory");
     return 0;
 }
 
@@ -4227,6 +4327,26 @@ static int64_t __hot syscall_dispatch_inner(uint64_t nr, uint64_t a1, uint64_t a
                                          (char *)a3, a4);
     }
 
+    /* -- Display modes mini-KMS syscalls (620..623) -- */
+    case SYS_DISPLAY_GET_MODE_COUNT:
+        return display_get_mode_count ? (int64_t)display_get_mode_count() : -ENOSYS;
+    case SYS_DISPLAY_GET_MODE:
+        if (!a2) return -EINVAL;
+        return display_modeset_get_mode
+            ? (int64_t)display_modeset_get_mode((uint32_t)a1,
+                                                (display_mode_info_t *)a2)
+            : -ENOSYS;
+    case SYS_DISPLAY_GET_CURRENT_MODE:
+        if (!a1) return -EINVAL;
+        return display_modeset_get_current
+            ? (int64_t)display_modeset_get_current((display_mode_info_t *)a1)
+            : -ENOSYS;
+    case SYS_DISPLAY_SET_MODE:
+        return display_modeset_set
+            ? (int64_t)display_modeset_set((uint32_t)a1, (uint32_t)a2,
+                                           (uint32_t)a3, (uint32_t)a4)
+            : -ENOSYS;
+
     /* -- Vulkan Phase 1 / Wave 1: GPU 3D syscalls (600..607) -- */
     case SYS_GPU_CAPS: {         /* 600: caps(*out) */
         extern bool nvk_backend_ready(void);
@@ -4237,7 +4357,7 @@ static int64_t __hot syscall_dispatch_inner(uint64_t nr, uint64_t a1, uint64_t a
         return caps;
     }
     case SYS_GPU_CTX_CREATE: {   /* 601: gpu_ctx_create(flags) */
-        int32_t pid = proc_current_pid();
+        int32_t pid = gpu_current_owner_pid();
         if (pid < 0) return -1;  /* EPERM */
         /* Caller can hint NVK via flag bit 0; otherwise prefer NVK
          * when ready (bare-metal NVIDIA), else virtio-gpu (QEMU). */
@@ -4248,7 +4368,7 @@ static int64_t __hot syscall_dispatch_inner(uint64_t nr, uint64_t a1, uint64_t a
         return vg3d_ctx_create((uint32_t)pid, (uint32_t)a1);
     }
     case SYS_GPU_CTX_DESTROY: {  /* 602: gpu_ctx_destroy(ctx_id) */
-        int32_t pid = proc_current_pid();
+        int32_t pid = gpu_current_owner_pid();
         if (pid < 0) return -1;
         extern bool nvk_backend_ready(void);
         extern int32_t nvk_backend_ctx_destroy(uint32_t pid, uint32_t ctx_id);
@@ -4258,7 +4378,7 @@ static int64_t __hot syscall_dispatch_inner(uint64_t nr, uint64_t a1, uint64_t a
     }
     case SYS_GPU_RES_CREATE: {   /* 603: (ctx_id, args *) */
         if (!a2) return -22;
-        int32_t pid = proc_current_pid();
+        int32_t pid = gpu_current_owner_pid();
         if (pid < 0) return -1;
         const struct gpu_res_create_args *a =
             (const struct gpu_res_create_args *)a2;
@@ -4269,7 +4389,7 @@ static int64_t __hot syscall_dispatch_inner(uint64_t nr, uint64_t a1, uint64_t a
         return vg3d_res_create((uint32_t)pid, (uint32_t)a1, a);
     }
     case SYS_GPU_RES_MAP: {      /* 604: (res_id) -> user VA */
-        int32_t pid = proc_current_pid();
+        int32_t pid = gpu_current_owner_pid();
         if (pid < 0) return -1;
         extern bool nvk_backend_ready(void);
         extern int64_t nvk_backend_res_map(uint32_t, uint32_t);
@@ -4282,7 +4402,7 @@ static int64_t __hot syscall_dispatch_inner(uint64_t nr, uint64_t a1, uint64_t a
             (const struct gpu_submit_args *)a1;
         if (!a) return -22; /* EINVAL */
         if (!a->cmd_bytes || !a->out_fence) return -22;
-        int32_t pid = proc_current_pid();
+        int32_t pid = gpu_current_owner_pid();
         if (pid < 0) return -1;
         extern bool nvk_backend_ready(void);
         extern int32_t nvk_backend_submit(uint32_t, uint32_t, const uint8_t *, uint32_t, uint64_t *);
@@ -4304,7 +4424,7 @@ static int64_t __hot syscall_dispatch_inner(uint64_t nr, uint64_t a1, uint64_t a
         const struct gpu_present_args *a =
             (const struct gpu_present_args *)a1;
         if (!a) return -22;
-        int32_t pid = proc_current_pid();
+        int32_t pid = gpu_current_owner_pid();
         if (pid < 0) return -1;
         extern bool nvk_backend_ready(void);
         extern int32_t nvk_backend_present(uint32_t, uint32_t, uint32_t, uint32_t);

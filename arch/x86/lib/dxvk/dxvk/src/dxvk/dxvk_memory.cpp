@@ -7,7 +7,7 @@
 
 namespace dxvk {
 
-#ifdef __OSITO_K__
+#if defined(__OSITO_K__) && defined(DXVK_OSITO_MEM_TRACE)
   extern "C" long write(int, const void*, unsigned long);
 
   static void okMemLog(const char* msg) {
@@ -467,6 +467,9 @@ namespace dxvk {
   void DxvkMemoryAllocator::free(
     const DxvkMemory&           memory) {
     std::lock_guard<dxvk::mutex> lock(m_mutex);
+    if (memory.m_type == nullptr)
+      return;
+
     memory.m_type->heap->stats.memoryUsed -= memory.m_length;
 
     if (memory.m_chunk != nullptr) {
@@ -588,7 +591,9 @@ namespace dxvk {
 
       type->chunks.erase(
         std::remove_if(type->chunks.begin(), type->chunks.end(),
-          [] (const Rc<DxvkMemoryChunk>& chunk) { return chunk->isEmpty(); }),
+          [] (const Rc<DxvkMemoryChunk>& chunk) {
+            return chunk == nullptr || chunk->isEmpty();
+          }),
         type->chunks.end());
     }
   }

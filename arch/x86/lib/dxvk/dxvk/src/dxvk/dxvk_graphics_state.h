@@ -221,6 +221,8 @@ namespace dxvk {
             VkBool32              depthClipEnable,
             VkBool32              depthBiasEnable,
             VkPolygonMode         polygonMode,
+            VkCullModeFlags       cullMode,
+            VkFrontFace           frontFace,
             VkSampleCountFlags    sampleCount,
             VkConservativeRasterizationModeEXT conservativeMode,
             VkBool32              flatShading,
@@ -228,6 +230,8 @@ namespace dxvk {
     : m_depthClipEnable (uint16_t(depthClipEnable)),
       m_depthBiasEnable (uint16_t(depthBiasEnable)),
       m_polygonMode     (uint16_t(polygonMode)),
+      m_cullMode        (uint16_t(cullMode)),
+      m_frontFace       (uint16_t(frontFace)),
       m_sampleCount     (uint16_t(sampleCount)),
       m_conservativeMode(uint16_t(conservativeMode)),
       m_flatShading     (uint16_t(flatShading)),
@@ -244,6 +248,14 @@ namespace dxvk {
 
     VkPolygonMode polygonMode() const {
       return VkPolygonMode(m_polygonMode);
+    }
+
+    VkCullModeFlags cullMode() const {
+      return VkCullModeFlags(m_cullMode);
+    }
+
+    VkFrontFace frontFace() const {
+      return VkFrontFace(m_frontFace);
     }
 
     VkSampleCountFlags sampleCount() const {
@@ -268,14 +280,16 @@ namespace dxvk {
 
   private:
 
-    uint16_t m_depthClipEnable        : 1;
-    uint16_t m_depthBiasEnable        : 1;
-    uint16_t m_polygonMode            : 2;
-    uint16_t m_sampleCount            : 5;
-    uint16_t m_conservativeMode       : 2;
-    uint16_t m_flatShading            : 1;
-    uint16_t m_lineMode               : 2;
-    uint16_t m_reserved               : 2;
+    uint32_t m_depthClipEnable        : 1;
+    uint32_t m_depthBiasEnable        : 1;
+    uint32_t m_polygonMode            : 2;
+    uint32_t m_cullMode               : 2;
+    uint32_t m_frontFace              : 1;
+    uint32_t m_sampleCount            : 5;
+    uint32_t m_conservativeMode       : 2;
+    uint32_t m_flatShading            : 1;
+    uint32_t m_lineMode               : 2;
+    uint32_t m_reserved               : 15;
   
   };
 

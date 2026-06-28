@@ -83,6 +83,9 @@ struct venus_instance {
     int32_t        ctx_id;        /* kernel GPU ctx, 0 if none */
     struct venus_wire *wire;      /* guest-side ring wrapper (W3b.1) */
     uint64_t       host_handle;   /* host VkInstance handle-id (W3b.1) */
+    uint64_t       phys_handle;   /* host VkPhysicalDevice object id */
+    VkPhysicalDeviceFeatures host_features;
+    uint32_t       host_features_valid;
     /* W3b.5 — surface slot table (guest-local). */
     struct venus_surface surfaces[VENUS_MAX_SURFACE_OBJECTS];
 };
@@ -99,6 +102,7 @@ struct venus_instance {
 #define VENUS_MAX_DESC_POOL_OBJECTS   256u
 #define VENUS_MAX_DESC_SET_OBJECTS    1024u
 #define VENUS_MAX_DESC_TPL_OBJECTS    512u
+#define VENUS_MAX_DESC_TPL_ENTRIES     32u
 #define VENUS_MAX_PL_LAYOUT_OBJECTS   512u
 #define VENUS_MAX_PIPELINE_OBJECTS    1024u
 #define VENUS_MAX_CMD_POOL_OBJECTS     64u
@@ -112,6 +116,8 @@ struct venus_memory {
     uint32_t in_use;
     uint32_t mapped;
     uint32_t is_shm_backed; /* W3b.5: 1 when local_ptr points to mapped SHM */
+    uint32_t is_gpu_backed; /* 1 when local_ptr points to SYS_GPU_RES_MAP */
+    uint32_t gpu_res_id;    /* SYS_GPU_RES_CREATE id (0 if none) */
     uint32_t shm_handle;    /* W3b.5: SHM handle (0 if none) */
     uint32_t shm_width;     /* W3b.5: width of the SHM image */
     uint32_t shm_height;    /* W3b.5: height of the SHM image */
@@ -208,6 +214,14 @@ struct venus_descriptor_update_template {
     uint32_t entry_count;
     uint32_t template_type;
     uint32_t _pad;
+    struct {
+        uint32_t dst_binding;
+        uint32_t dst_array_element;
+        uint32_t descriptor_count;
+        uint32_t descriptor_type;
+        uint64_t offset;
+        uint64_t stride;
+    } entries[VENUS_MAX_DESC_TPL_ENTRIES];
 };
 
 struct venus_pipeline_layout {
@@ -273,10 +287,10 @@ struct venus_cmd_buffer {
 struct venus_queue {
     VK_LOADER_DATA       loader_data;  /* dispatchable — VkQueue is dispatchable */
     struct venus_device *owner;
+    uint64_t             host_id;
     uint32_t             in_use;
     uint32_t             queue_family_index;
     uint32_t             queue_index;
-    uint32_t             _pad;
 };
 
 struct venus_fence {

@@ -19,6 +19,8 @@
 #define LSR_TX_EMPTY  0x20
 #define LSR_RX_READY  0x01
 
+#define SERIAL_TX_SPINS 4096u
+
 static volatile int serial_lock = 0;
 static inline int serial_acquire(void) {
     for (uint32_t spins = 0; spins < 1000000; spins++) {
@@ -53,11 +55,13 @@ void serial_putc(char c)
     extern void klog_putc(char c) __attribute__((weak));
     if (klog_putc) klog_putc(c);
 
-    for (uint32_t spins = 0; spins < 1000000; spins++) {
-        if (inb(COM1_PORT + REG_LSR) & LSR_TX_EMPTY)
-            break;
+    for (uint32_t spins = 0; spins < SERIAL_TX_SPINS; spins++) {
+        if (inb(COM1_PORT + REG_LSR) & LSR_TX_EMPTY) {
+            outb(COM1_PORT + REG_DATA, (uint8_t)c);
+            return;
+        }
+        __asm__ volatile ("pause" ::: "memory");
     }
-    outb(COM1_PORT + REG_DATA, (uint8_t)c);
 }
 
 void serial_putchar(char c)

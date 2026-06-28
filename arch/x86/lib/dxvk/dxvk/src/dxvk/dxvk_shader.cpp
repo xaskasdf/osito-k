@@ -1190,8 +1190,8 @@ namespace dxvk {
     uint32_t dynamicStateCount = 0;
     std::array<VkDynamicState, 7> dynamicStates;
 
-    dynamicStates[dynamicStateCount++] = VK_DYNAMIC_STATE_VIEWPORT_WITH_COUNT;
-    dynamicStates[dynamicStateCount++] = VK_DYNAMIC_STATE_SCISSOR_WITH_COUNT;
+    dynamicStates[dynamicStateCount++] = VK_DYNAMIC_STATE_VIEWPORT;
+    dynamicStates[dynamicStateCount++] = VK_DYNAMIC_STATE_SCISSOR;
     dynamicStates[dynamicStateCount++] = VK_DYNAMIC_STATE_DEPTH_BIAS;
     dynamicStates[dynamicStateCount++] = VK_DYNAMIC_STATE_DEPTH_BIAS_ENABLE;
     dynamicStates[dynamicStateCount++] = VK_DYNAMIC_STATE_CULL_MODE;
@@ -1210,8 +1210,19 @@ namespace dxvk {
     if (m_shaders.tcs)
       tsInfo.patchControlPoints = m_shaders.tcs->info().patchVertexCount;
 
-    // All viewport state is dynamic, so we do not need to initialize this.
     VkPipelineViewportStateCreateInfo vpInfo = { VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO };
+    std::array<VkViewport, DxvkLimits::MaxNumViewports> vpViewports = { };
+    std::array<VkRect2D, DxvkLimits::MaxNumViewports> vpScissors = { };
+
+    for (uint32_t i = 0; i < DxvkLimits::MaxNumViewports; i++) {
+      vpViewports[i] = VkViewport { 0.0f, 0.0f, 1.0f, 1.0f, 0.0f, 1.0f };
+      vpScissors[i]  = VkRect2D { { 0, 0 }, { 1, 1 } };
+    }
+
+    vpInfo.viewportCount = 1;
+    vpInfo.scissorCount  = 1;
+    vpInfo.pViewports    = vpViewports.data();
+    vpInfo.pScissors     = vpScissors.data();
 
     // Set up rasterizer state. Depth bias, cull mode and front face are
     // all dynamic. Do not support any polygon modes other than FILL.

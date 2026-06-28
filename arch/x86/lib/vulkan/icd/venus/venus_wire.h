@@ -19,7 +19,7 @@
 #define VENUS_RING_VERSION  1u
 
 /* 16 KiB total ring, 8 KiB cmds + 8 KiB replies. Power of two. */
-#define VENUS_RING_TOTAL_BYTES  (16u * 1024u)
+#define VENUS_RING_TOTAL_BYTES  (8u * 1024u * 1024u)
 #define VENUS_RING_CMD_BYTES    (VENUS_RING_TOTAL_BYTES / 2u - sizeof(struct venus_ring_header))
 #define VENUS_RING_REPLY_BYTES  (VENUS_RING_TOTAL_BYTES / 2u)
 
@@ -67,6 +67,17 @@ void *venus_wire_alloc_cmd(struct venus_wire *w,
 /* Publish the pending command and issue SYS_GPU_SUBMIT to notify the
  * host. Blocks nothing — reply still needs to be awaited. */
 int venus_wire_submit(struct venus_wire *w);
+
+/* Submit a real venus-protocol command stream directly through SUBMIT_3D.
+ * The reply variant points the renderer at this wire's reply stream, seeks it
+ * to zero, submits `cmd`, then copies `reply_size` bytes from the stream.
+ * This bootstraps the real protocol before the async ring path exists. */
+int venus_wire_submit_raw(struct venus_wire *w, const void *cmd,
+                          uint32_t cmd_size);
+int venus_wire_submit_reply(struct venus_wire *w, const void *cmd,
+                            uint32_t cmd_size, void *reply,
+                            uint32_t reply_size);
+uint64_t venus_wire_alloc_object_id(struct venus_wire *w);
 
 /* Wait for the host's reply keyed by reply_id. Copies reply payload
  * into `out_buf` up to `buf_size` bytes. Returns bytes written, or

@@ -468,12 +468,29 @@ namespace dxvk {
     const DxvkShader*                     tes,
     const DxvkShader*                     gs,
     const DxvkShader*                     fs) {
+    vpInfo.viewportCount = 1;
+    vpInfo.scissorCount  = 1;
+    vpInfo.pViewports    = vpViewports.data();
+    vpInfo.pScissors     = vpScissors.data();
+
+    for (uint32_t i = 0; i < DxvkLimits::MaxNumViewports; i++) {
+#if defined(__OSITO_K__)
+      vpViewports[i] = VkViewport { 0.0f, 0.0f, 1024.0f, 768.0f, 0.0f, 1.0f };
+      vpScissors[i]  = VkRect2D { { 0, 0 }, { 1024, 768 } };
+#else
+      vpViewports[i] = VkViewport { 0.0f, 0.0f, 1.0f, 1.0f, 0.0f, 1.0f };
+      vpScissors[i]  = VkRect2D { { 0, 0 }, { 1, 1 } };
+#endif
+    }
+
     // Set up tessellation state
     tsInfo.patchControlPoints = state.ia.patchVertexCount();
     
     // Set up basic rasterization state
     rsInfo.depthClampEnable         = VK_TRUE;
     rsInfo.polygonMode              = state.rs.polygonMode();
+    rsInfo.cullMode                 = state.rs.cullMode();
+    rsInfo.frontFace                = state.rs.frontFace();
     rsInfo.depthBiasEnable          = state.rs.depthBiasEnable();
     rsInfo.lineWidth                = 1.0f;
 
@@ -535,6 +552,8 @@ namespace dxvk {
       eq = rsInfo.depthClampEnable         == other.rsInfo.depthClampEnable
         && rsInfo.rasterizerDiscardEnable  == other.rsInfo.rasterizerDiscardEnable
         && rsInfo.polygonMode              == other.rsInfo.polygonMode
+        && rsInfo.cullMode                 == other.rsInfo.cullMode
+        && rsInfo.frontFace                == other.rsInfo.frontFace
         && rsInfo.depthBiasEnable          == other.rsInfo.depthBiasEnable
         && rsInfo.lineWidth                == other.rsInfo.lineWidth;
     }
@@ -564,6 +583,8 @@ namespace dxvk {
     hash.add(rsInfo.depthClampEnable);
     hash.add(rsInfo.rasterizerDiscardEnable);
     hash.add(rsInfo.polygonMode);
+    hash.add(rsInfo.cullMode);
+    hash.add(rsInfo.frontFace);
     hash.add(rsInfo.depthBiasEnable);
     hash.add(bit::cast<uint32_t>(rsInfo.lineWidth));
 
@@ -693,8 +714,13 @@ namespace dxvk {
     const DxvkDevice*                     device,
     const DxvkGraphicsPipelineStateInfo&  state,
           DxvkGraphicsPipelineFlags       flags) {
-    dyStates[dyInfo.dynamicStateCount++] = VK_DYNAMIC_STATE_VIEWPORT_WITH_COUNT;
-    dyStates[dyInfo.dynamicStateCount++] = VK_DYNAMIC_STATE_SCISSOR_WITH_COUNT;
+    (void)device;
+    (void)flags;
+
+#if !defined(__OSITO_K__)
+    dyStates[dyInfo.dynamicStateCount++] = VK_DYNAMIC_STATE_VIEWPORT;
+    dyStates[dyInfo.dynamicStateCount++] = VK_DYNAMIC_STATE_SCISSOR;
+#endif
 
     if (state.useDynamicVertexStrides())
       dyStates[dyInfo.dynamicStateCount++] = VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE;
@@ -710,11 +736,6 @@ namespace dxvk {
     
     if (state.useDynamicStencilRef())
       dyStates[dyInfo.dynamicStateCount++] = VK_DYNAMIC_STATE_STENCIL_REFERENCE;
-
-    if (!flags.test(DxvkGraphicsPipelineFlag::HasRasterizerDiscard)) {
-      dyStates[dyInfo.dynamicStateCount++] = VK_DYNAMIC_STATE_CULL_MODE;
-      dyStates[dyInfo.dynamicStateCount++] = VK_DYNAMIC_STATE_FRONT_FACE;
-    }
 
     if (dyInfo.dynamicStateCount)
       dyInfo.pDynamicStates = dyStates.data();
@@ -1001,9 +1022,16 @@ namespace dxvk {
         // which will then acquire it to increment the use counter.
         lock.unlock();
 
-        // If necessary, compile an optimized pipeline variant
+        // OsitoK/Venus uses the base GPL pipeline path on macOS. The
+        // background monolithic compile can fail for otherwise valid states,
+        // so only enqueue it when no base pipeline can be created.
+#if defined(__OSITO_K__)
+        if (!canCreateBasePipeline && !instance->fastHandle.load())
+          m_workers->compileGraphicsPipeline(this, state, DxvkPipelinePriority::Low);
+#else
         if (!instance->fastHandle.load())
           m_workers->compileGraphicsPipeline(this, state, DxvkPipelinePriority::Low);
+#endif
 
         // Only store pipelines in the state cache that cannot benefit
         // from pipeline libraries, or if that feature is disabled.
@@ -1140,6 +1168,10 @@ namespace dxvk {
     const DxvkGraphicsPipelineStateInfo& state) const {
     if (!m_vsLibrary || !m_fsLibrary)
       return false;
+
+#if defined(__OSITO_K__)
+    return true;
+#endif
 
     // We do not implement setting certain rarely used render
     // states dynamically since they are generally not used
