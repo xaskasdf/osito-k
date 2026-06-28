@@ -177,6 +177,7 @@ struct venus_buffer_view {
 struct venus_sampler {
     uint64_t host_id;
     uint32_t in_use;
+    uint32_t _pad;
 };
 
 struct venus_framebuffer {
@@ -196,6 +197,7 @@ struct venus_descriptor_set_layout {
 };
 
 struct venus_descriptor_pool {
+    uint64_t host_id;
     uint32_t in_use;
     uint32_t max_sets;
     uint32_t alloc_count;
@@ -203,6 +205,7 @@ struct venus_descriptor_pool {
 };
 
 struct venus_descriptor_set {
+    uint64_t host_id;
     uint32_t in_use;
     int32_t  pool_slot;
     int32_t  layout_slot;

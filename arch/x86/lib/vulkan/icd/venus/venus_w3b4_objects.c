@@ -66,9 +66,22 @@ extern int venus_cmd_encode_CreateFramebuffer(struct venus_wire *, uint64_t,
         uint64_t, const VkFramebufferCreateInfo *, const uint64_t *, uint32_t,
         uint64_t *);
 extern int venus_cmd_encode_DestroyFramebuffer(struct venus_wire *, uint64_t, uint64_t);
+extern int venus_cmd_encode_CreateSampler(struct venus_wire *, uint64_t,
+        const VkSamplerCreateInfo *, uint64_t *);
+extern int venus_cmd_encode_DestroySampler(struct venus_wire *, uint64_t, uint64_t);
 extern int venus_cmd_encode_CreateDescriptorSetLayout(struct venus_wire *, uint64_t,
         const VkDescriptorSetLayoutCreateInfo *, uint64_t *);
 extern int venus_cmd_encode_DestroyDescriptorSetLayout(struct venus_wire *, uint64_t, uint64_t);
+extern int venus_cmd_encode_CreateDescriptorPool(struct venus_wire *, uint64_t,
+        const VkDescriptorPoolCreateInfo *, uint64_t *);
+extern int venus_cmd_encode_DestroyDescriptorPool(struct venus_wire *, uint64_t, uint64_t);
+extern int venus_cmd_encode_AllocateDescriptorSets(struct venus_wire *, uint64_t,
+        uint64_t, uint32_t, const uint64_t *, uint64_t *);
+extern int venus_cmd_encode_FreeDescriptorSets(struct venus_wire *, uint64_t,
+        uint64_t, uint32_t, const uint64_t *);
+extern int venus_cmd_encode_UpdateDescriptorSets(struct venus_wire *,
+        struct venus_device *, uint32_t, const VkWriteDescriptorSet *,
+        uint32_t, const VkCopyDescriptorSet *);
 extern int venus_cmd_encode_CreatePipelineLayout(struct venus_wire *, uint64_t,
         const VkPipelineLayoutCreateInfo *, const uint64_t *, uint32_t, uint64_t *);
 extern int venus_cmd_encode_DestroyPipelineLayout(struct venus_wire *, uint64_t, uint64_t);
@@ -95,6 +108,9 @@ extern int venus_cmd_encode_CmdBeginRendering(struct venus_wire *,
 extern int venus_cmd_encode_CmdEndRendering(struct venus_wire *, uint64_t);
 extern int venus_cmd_encode_CmdBindPipeline(struct venus_wire *, uint64_t,
         uint64_t, uint32_t, uint64_t);
+extern int venus_cmd_encode_CmdBindDescriptorSets(struct venus_wire *,
+        struct venus_device *, uint64_t, uint32_t, VkPipelineLayout, uint32_t,
+        uint32_t, const VkDescriptorSet *, uint32_t, const uint32_t *);
 extern int venus_cmd_encode_CmdDraw(struct venus_wire *, uint64_t, uint64_t,
         uint32_t, uint32_t, uint32_t, uint32_t);
 
@@ -498,13 +514,27 @@ venus_CreateSampler(VkDevice device,
                     const VkSamplerCreateInfo *pCreateInfo,
                     const VkAllocationCallbacks *pAllocator,
                     VkSampler *pSampler) {
-    (void)pAllocator; (void)pCreateInfo;
+    (void)pAllocator;
     if (!device || !pCreateInfo || !pSampler) return VK_ERROR_INITIALIZATION_FAILED;
     struct venus_device *dev = (struct venus_device *)device;
     int slot = sampler_slot_alloc(dev);
     if (slot < 0) return VK_ERROR_OUT_OF_HOST_MEMORY;
     struct venus_sampler *s = &dev->samplers[slot];
     s->host_id = 0;
+
+    if (dev->parent && dev->parent->wire && dev->host_handle != 0) {
+        uint64_t host_id = 0;
+        int rc = venus_cmd_encode_CreateSampler(dev->parent->wire,
+                                                dev->host_handle,
+                                                pCreateInfo, &host_id);
+        if (rc == VK_SUCCESS && host_id != 0)
+            s->host_id = host_id;
+        else {
+            memset(s, 0, sizeof(*s));
+            return rc == VK_SUCCESS ? VK_ERROR_INITIALIZATION_FAILED : (VkResult)rc;
+        }
+    }
+
     *pSampler = (VkSampler)MAKE_SLOT_HANDLE(dev, slot, VENUS_H_MARKER_SAMPLER);
     return VK_SUCCESS;
 }
@@ -519,6 +549,9 @@ venus_DestroySampler(VkDevice device, VkSampler sampler,
     if (slot < 0 || slot >= (int)VENUS_MAX_SAMPLER_OBJECTS) return;
     struct venus_sampler *s = &dev->samplers[slot];
     if (!s->in_use) return;
+    if (dev->parent && dev->parent->wire && s->host_id != 0)
+        (void)venus_cmd_encode_DestroySampler(dev->parent->wire,
+                                              dev->host_handle, s->host_id);
     memset(s, 0, sizeof(*s));
 }
 
@@ -658,8 +691,23 @@ venus_CreateDescriptorPool(VkDevice device,
     int slot = dpool_slot_alloc(dev);
     if (slot < 0) return VK_ERROR_OUT_OF_HOST_MEMORY;
     struct venus_descriptor_pool *pool = &dev->desc_pools[slot];
+    pool->host_id = 0;
     pool->max_sets = pCreateInfo->maxSets;
     pool->alloc_count = 0;
+
+    if (dev->parent && dev->parent->wire && dev->host_handle != 0) {
+        uint64_t host_id = 0;
+        int rc = venus_cmd_encode_CreateDescriptorPool(dev->parent->wire,
+                                                       dev->host_handle,
+                                                       pCreateInfo, &host_id);
+        if (rc == VK_SUCCESS && host_id != 0)
+            pool->host_id = host_id;
+        else {
+            memset(pool, 0, sizeof(*pool));
+            return rc == VK_SUCCESS ? VK_ERROR_INITIALIZATION_FAILED : (VkResult)rc;
+        }
+    }
+
     *pPool = (VkDescriptorPool)MAKE_SLOT_HANDLE(dev, slot, VENUS_H_MARKER_DPOOL);
     return VK_SUCCESS;
 }
@@ -672,6 +720,11 @@ venus_DestroyDescriptorPool(VkDevice device, VkDescriptorPool pool,
     struct venus_device *dev = (struct venus_device *)device;
     int slot = HANDLE_TO_SLOT(pool);
     if (slot < 0 || slot >= (int)VENUS_MAX_DESC_POOL_OBJECTS) return;
+    struct venus_descriptor_pool *dp = &dev->desc_pools[slot];
+    if (dev->parent && dev->parent->wire && dp->host_id != 0)
+        (void)venus_cmd_encode_DestroyDescriptorPool(dev->parent->wire,
+                                                     dev->host_handle,
+                                                     dp->host_id);
     memset(&dev->desc_pools[slot], 0, sizeof(dev->desc_pools[slot]));
 }
 
@@ -691,6 +744,8 @@ venus_AllocateDescriptorSets(VkDevice device,
         return VK_ERROR_OUT_OF_POOL_MEMORY;
 
     int allocated[16];
+    uint64_t layout_ids[16];
+    uint64_t set_ids[16];
     uint32_t count = pAllocateInfo->descriptorSetCount;
     if (count > 16u) return VK_ERROR_OUT_OF_HOST_MEMORY;
 
@@ -698,6 +753,12 @@ venus_AllocateDescriptorSets(VkDevice device,
         int layout_slot = HANDLE_TO_SLOT(pAllocateInfo->pSetLayouts[i]);
         if (layout_slot < 0 || layout_slot >= (int)VENUS_MAX_DESC_LAYOUT_OBJECTS ||
             !dev->desc_layouts[layout_slot].in_use) {
+            for (uint32_t j = 0; j < i; j++)
+                memset(&dev->desc_sets[allocated[j]], 0, sizeof(dev->desc_sets[allocated[j]]));
+            return VK_ERROR_INITIALIZATION_FAILED;
+        }
+        layout_ids[i] = dev->desc_layouts[layout_slot].host_id;
+        if (pool->host_id != 0 && layout_ids[i] == 0) {
             for (uint32_t j = 0; j < i; j++)
                 memset(&dev->desc_sets[allocated[j]], 0, sizeof(dev->desc_sets[allocated[j]]));
             return VK_ERROR_INITIALIZATION_FAILED;
@@ -710,11 +771,27 @@ venus_AllocateDescriptorSets(VkDevice device,
         }
         allocated[i] = set_slot;
         struct venus_descriptor_set *set = &dev->desc_sets[set_slot];
+        set->host_id = 0;
         set->pool_slot = pool_slot;
         set->layout_slot = layout_slot;
         set->image_slot = -1;
         pDescriptorSets[i] =
             (VkDescriptorSet)MAKE_SLOT_HANDLE(dev, set_slot, VENUS_H_MARKER_DSET);
+    }
+
+    if (pool->host_id != 0 && dev->parent && dev->parent->wire) {
+        int rc = venus_cmd_encode_AllocateDescriptorSets(dev->parent->wire,
+                                                         dev->host_handle,
+                                                         pool->host_id,
+                                                         count, layout_ids,
+                                                         set_ids);
+        if (rc != VK_SUCCESS) {
+            for (uint32_t j = 0; j < count; j++)
+                memset(&dev->desc_sets[allocated[j]], 0, sizeof(dev->desc_sets[allocated[j]]));
+            return (VkResult)rc;
+        }
+        for (uint32_t j = 0; j < count; j++)
+            dev->desc_sets[allocated[j]].host_id = set_ids[j];
     }
 
     pool->alloc_count += count;
@@ -731,13 +808,22 @@ venus_FreeDescriptorSets(VkDevice device, VkDescriptorPool pool,
     struct venus_descriptor_pool *dp =
         (pool_slot >= 0 && pool_slot < (int)VENUS_MAX_DESC_POOL_OBJECTS)
             ? &dev->desc_pools[pool_slot] : NULL;
+    uint64_t host_sets[16];
+    uint32_t host_count = 0;
     for (uint32_t i = 0; i < descriptorSetCount; i++) {
         int slot = HANDLE_TO_SLOT(pDescriptorSets[i]);
         if (slot < 0 || slot >= (int)VENUS_MAX_DESC_SET_OBJECTS) continue;
+        if (host_count < 16u && dev->desc_sets[slot].host_id != 0)
+            host_sets[host_count++] = dev->desc_sets[slot].host_id;
         if (dev->desc_sets[slot].in_use && dp && dp->alloc_count)
             dp->alloc_count--;
         memset(&dev->desc_sets[slot], 0, sizeof(dev->desc_sets[slot]));
     }
+    if (dp && dp->host_id != 0 && host_count && dev->parent && dev->parent->wire)
+        (void)venus_cmd_encode_FreeDescriptorSets(dev->parent->wire,
+                                                  dev->host_handle,
+                                                  dp->host_id,
+                                                  host_count, host_sets);
     return VK_SUCCESS;
 }
 
@@ -785,6 +871,13 @@ venus_UpdateDescriptorSets(VkDevice device,
         dev->desc_sets[dst_slot].image_slot =
             dev->desc_sets[src_slot].image_slot;
     }
+
+    if (dev->parent && dev->parent->wire && dev->host_handle != 0)
+        (void)venus_cmd_encode_UpdateDescriptorSets(dev->parent->wire, dev,
+                                                    descriptorWriteCount,
+                                                    pDescriptorWrites,
+                                                    descriptorCopyCount,
+                                                    pDescriptorCopies);
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL
@@ -1481,6 +1574,7 @@ venus_CmdBindDescriptorSets(VkCommandBuffer cb, VkPipelineBindPoint bindPoint,
     if (!cb_unwrap(cb, &dev, &slot)) return;
     if (!pDescriptorSets) return;
     struct venus_cmd_buffer *vcb = &dev->cmd_buffers[slot];
+    int tracked = 0;
     for (uint32_t i = 0; i < descriptorSetCount; i++) {
         int set_slot = HANDLE_TO_SLOT(pDescriptorSets[i]);
         if (set_slot < 0 || set_slot >= (int)VENUS_MAX_DESC_SET_OBJECTS)
@@ -1489,12 +1583,33 @@ venus_CmdBindDescriptorSets(VkCommandBuffer cb, VkPipelineBindPoint bindPoint,
         if (!set->in_use || set->image_slot < 0)
             continue;
         vcb->recorded_sampled_image_slot = set->image_slot;
+        tracked = 1;
         if (!venus_w3b4_logged_desc_bind) {
             venus_w3b4_logged_desc_bind = 1u;
             printf("[VDESC] bind set=%d image=%d cb_image=%d\n",
                    set_slot, set->image_slot, vcb->last_drawn_image_slot);
         }
-        return;
+        break;
+    }
+
+    if (dev->parent && dev->parent->wire && vcb->host_id != 0) {
+        int rc = venus_cmd_encode_CmdBindDescriptorSets(dev->parent->wire,
+                                                        dev, vcb->host_id,
+                                                        (uint32_t)bindPoint,
+                                                        layout, firstSet,
+                                                        descriptorSetCount,
+                                                        pDescriptorSets,
+                                                        dynamicOffsetCount,
+                                                        pDynamicOffsets);
+        if (rc != 0) {
+            static uint32_t log_count;
+            if (log_count < 32u) {
+                log_count++;
+                printf("[VDBIND-H] failed rc=%d tracked=%d sets=%u first=%u; disabling host cb\n",
+                       rc, tracked, descriptorSetCount, firstSet);
+            }
+            vcb->host_id = 0;
+        }
     }
 }
 

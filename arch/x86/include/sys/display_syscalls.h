@@ -30,6 +30,7 @@
 
 /* SYS_DISPLAY_SET_MODE flags */
 #define DISPLAY_SET_NATIVE       (1u << 0)  /* use detected preferred EDID mode */
+#define DISPLAY_SET_REFRESH_ONLY (1u << 1)  /* only update display pacing Hz */
 
 typedef struct {
     uint32_t width;

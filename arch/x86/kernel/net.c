@@ -818,6 +818,11 @@ void __hot net_poll(void)
      * is already inside it.  Skip if we're already polling. */
     if (__sync_lock_test_and_set(&in_net_poll, 1)) return;
 
+    if (!nic_ops.recv) {
+        __sync_lock_release(&in_net_poll);
+        return;
+    }
+
     uint32_t len = 0;
 
     /* NAPI: check if interrupt flagged pending packets */

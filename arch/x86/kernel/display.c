@@ -24,6 +24,7 @@ extern void fb_putdec(uint64_t val);
 extern void *kmalloc(uint64_t size);
 extern void  kfree(void *ptr);
 extern void *mem_alloc_aligned(uint64_t size, uint64_t alignment);
+extern void  mem_free_pages(void *addr, uint64_t count);
 extern uint64_t idt_get_ticks(void);
 
 /* GPU display engine (gpu_display.c) — weak so we link without GPU driver */
@@ -50,12 +51,17 @@ extern bool     virtio_gpu_ready(void)      __attribute__((weak));
 extern uint32_t *virtio_gpu_get_fb(void)    __attribute__((weak));
 extern uint32_t virtio_gpu_get_width(void)  __attribute__((weak));
 extern uint32_t virtio_gpu_get_height(void) __attribute__((weak));
+extern bool     virtio_gpu_get_native_mode(uint32_t *width,
+                                           uint32_t *height) __attribute__((weak));
 extern void     virtio_gpu_flush(void)      __attribute__((weak));
+extern int      virtio_gpu_resize(uint32_t width, uint32_t height) __attribute__((weak));
 
 /* Intel Gen9 probe (GOP scanout retained, no unsafe RAM page-flip) */
 extern int      intel_gfx_is_ready(void)    __attribute__((weak));
 
 static void virtio_blit(const uint32_t *src);
+static int display_auto_modeset(void);
+static inline uint64_t disp_rdtsc(void);
 int display_resize(uint32_t new_width, uint32_t new_height, uint32_t new_pitch);
 uint32_t *display_get_back_buffer(void);
 
@@ -87,6 +93,7 @@ typedef struct {
     uint32_t  ticks_per_frame; /* ticks between frames at target_fps */
 
     /* TSC-based frame pacing (sub-tick precision, true 60fps) */
+    uint64_t  tsc_per_sec;     /* calibrated TSC frequency */
     uint64_t  tsc_per_frame;   /* TSC cycles per frame at target_fps */
     uint64_t  last_flip_tsc;   /* TSC value at last flip */
 
@@ -106,6 +113,9 @@ static uint32_t current_mode_idx;
 #define DISP_EINVAL  (-22)
 #define DISP_ENOSYS  (-38)
 #define DISP_ENOTSUP (-95)
+
+#define DISPLAY_DEFAULT_REFRESH_HZ 60u
+#define DISPLAY_MAX_REFRESH_HZ     240u
 
 void display_set_available_modes(const boot_display_mode_t *modes,
                                  uint32_t count, uint32_t current)
@@ -127,6 +137,9 @@ void display_set_available_modes(const boot_display_mode_t *modes,
     serial_puts("x");
     serial_putdec(modes[current].height);
     serial_puts(")\n");
+
+    if (disp.initialized && disp.virtio_scanout)
+        (void)display_auto_modeset();
 }
 
 static uint32_t display_backend_kind(void)
@@ -154,6 +167,104 @@ static void display_fill_mode_info(display_mode_info_t *out,
     out->flags = flags;
     out->backend = display_backend_kind();
     out->reserved = 0;
+}
+
+static void display_select_current_mode(uint32_t width, uint32_t height)
+{
+    for (uint32_t i = 0; i < avail_mode_count; i++) {
+        if (avail_modes[i].width == width && avail_modes[i].height == height) {
+            current_mode_idx = i;
+            return;
+        }
+    }
+}
+
+static uint32_t display_default_refresh(uint32_t refresh_hz)
+{
+    if (refresh_hz == 0) return DISPLAY_DEFAULT_REFRESH_HZ;
+    if (refresh_hz > DISPLAY_MAX_REFRESH_HZ) return DISPLAY_MAX_REFRESH_HZ;
+    return refresh_hz;
+}
+
+static int display_apply_refresh(uint32_t refresh_hz)
+{
+    if (refresh_hz == 0)
+        return 0;
+    if (refresh_hz > DISPLAY_MAX_REFRESH_HZ)
+        return DISP_EINVAL;
+
+    disp.target_fps = refresh_hz;
+    disp.ticks_per_frame = (100 + refresh_hz - 1) / refresh_hz;
+    if (disp.ticks_per_frame == 0) disp.ticks_per_frame = 1;
+    disp.tsc_per_frame = disp.tsc_per_sec ? disp.tsc_per_sec / refresh_hz : 0;
+    disp.last_flip_tick = idt_get_ticks();
+    disp.last_flip_tsc  = disp_rdtsc();
+
+    serial_puts("[DISP] Refresh pacing: ");
+    serial_putdec(refresh_hz);
+    serial_puts("Hz\n");
+    return 0;
+}
+
+static int display_set_virtio_mode(uint32_t width, uint32_t height)
+{
+    if (!disp.virtio_scanout || !virtio_gpu_resize)
+        return DISP_ENOTSUP;
+
+    uint32_t old_width = disp.width;
+    uint32_t old_height = disp.height;
+    uint32_t old_pitch = disp.pitch;
+    int rc = virtio_gpu_resize(width, height);
+    if (rc < 0) {
+        if (rc == DISP_EINVAL) return DISP_EINVAL;
+        if (rc == DISP_ENOSYS) return DISP_ENOSYS;
+        return DISP_ENOTSUP;
+    }
+
+    if (display_resize(width, height, width) < 0) {
+        (void)virtio_gpu_resize(old_width, old_height);
+        (void)display_resize(old_width, old_height, old_pitch);
+        return DISP_ENOTSUP;
+    }
+
+    disp.virtio_fb = virtio_gpu_get_fb ? virtio_gpu_get_fb() : NULL;
+    if (!disp.virtio_fb) {
+        (void)virtio_gpu_resize(old_width, old_height);
+        (void)display_resize(old_width, old_height, old_pitch);
+        disp.virtio_fb = virtio_gpu_get_fb ? virtio_gpu_get_fb() : NULL;
+        disp.virtio_scanout = disp.virtio_fb != NULL;
+        return DISP_ENOTSUP;
+    }
+
+    display_select_current_mode(width, height);
+    virtio_blit(disp.back);
+    return 0;
+}
+
+static int display_auto_modeset(void)
+{
+    if (!disp.initialized || !disp.virtio_scanout ||
+        !virtio_gpu_get_native_mode) {
+        return DISP_ENOTSUP;
+    }
+
+    uint32_t native_w = 0, native_h = 0;
+    if (!virtio_gpu_get_native_mode(&native_w, &native_h))
+        return DISP_ENOTSUP;
+    if (native_w == disp.width && native_h == disp.height)
+        return 0;
+
+    int rc = display_set_virtio_mode(native_w, native_h);
+    if (rc == 0) {
+        serial_puts("[DISP] Automodeset: virtio native ");
+        serial_putdec(native_w);
+        serial_puts("x");
+        serial_putdec(native_h);
+        serial_puts("\n");
+    } else {
+        serial_puts("[DISP] Automodeset: virtio native failed\n");
+    }
+    return rc;
 }
 
 uint32_t display_get_mode_count(void)
@@ -221,12 +332,31 @@ int display_modeset_get_current(display_mode_info_t *out)
 int display_modeset_set(uint32_t width, uint32_t height,
                         uint32_t refresh_hz, uint32_t flags)
 {
-    (void)refresh_hz;
-
     if (!disp.initialized)
         return DISP_ENOSYS;
+    if (refresh_hz > DISPLAY_MAX_REFRESH_HZ)
+        return DISP_EINVAL;
+
+    if (flags & DISPLAY_SET_REFRESH_ONLY) {
+        if (width || height || (flags & DISPLAY_SET_NATIVE) || !refresh_hz)
+            return DISP_EINVAL;
+        return display_apply_refresh(refresh_hz);
+    }
 
     if (flags & DISPLAY_SET_NATIVE) {
+        if (disp.virtio_scanout && virtio_gpu_get_native_mode) {
+            uint32_t native_w = 0, native_h = 0;
+            if (!virtio_gpu_get_native_mode(&native_w, &native_h))
+                return DISP_ENOTSUP;
+            if (width && height &&
+                (native_w != width || native_h != height)) {
+                return DISP_EINVAL;
+            }
+            int rc = display_set_virtio_mode(native_w, native_h);
+            if (rc < 0) return rc;
+            return display_apply_refresh(refresh_hz);
+        }
+
         if (!disp.gpu_scanout || !gpu_display_detect_monitor ||
             !gpu_display_set_mode) {
             return DISP_ENOTSUP;
@@ -255,14 +385,20 @@ int display_modeset_set(uint32_t width, uint32_t height,
             return DISP_ENOTSUP;
         }
 
-        return 0;
+        return display_apply_refresh(refresh_hz);
     }
 
     if (!width || !height)
         return DISP_EINVAL;
 
     if (width == disp.width && height == disp.height)
-        return 0;
+        return display_apply_refresh(refresh_hz);
+
+    if (disp.virtio_scanout && virtio_gpu_resize) {
+        int rc = display_set_virtio_mode(width, height);
+        if (rc < 0) return rc;
+        return display_apply_refresh(refresh_hz);
+    }
 
     return DISP_ENOTSUP;
 }
@@ -353,8 +489,7 @@ int display_init(uint32_t *gop_base, uint32_t width, uint32_t height,
     disp.fb_size = (uint64_t)pitch * height * sizeof(uint32_t);
 
     /* 0 means default 60fps; clamp to sane range */
-    if (target_fps == 0) target_fps = 60;
-    if (target_fps > 240) target_fps = 240;
+    target_fps = display_default_refresh(target_fps);
     disp.target_fps = target_fps;
 
     /* Compute ticks per frame from 100Hz APIC tick rate.
@@ -372,13 +507,15 @@ int display_init(uint32_t *gop_base, uint32_t width, uint32_t height,
     uint64_t tsc_per_sec = calibrate_tsc();
     /* Sanity check: accept 10MHz – 8GHz (covers VMs, old CPUs, modern Xeons) */
     if (tsc_per_sec >= 10000000ULL && tsc_per_sec <= 8000000000ULL) {
-        disp.tsc_per_frame = tsc_per_sec / target_fps;
+        disp.tsc_per_sec = tsc_per_sec;
+        disp.tsc_per_frame = disp.tsc_per_sec / target_fps;
         serial_puts("[DISP] TSC: ");
-        serial_putdec(tsc_per_sec / 1000000);
+        serial_putdec(disp.tsc_per_sec / 1000000);
         serial_puts(" MHz, ");
         serial_putdec(disp.tsc_per_frame / 1000);
         serial_puts(" kcy/frame\n");
     } else {
+        disp.tsc_per_sec = 0;
         disp.tsc_per_frame = 0;  /* use APIC fallback */
         serial_puts("[DISP] TSC calibration out of range, using APIC ticks\n");
     }
@@ -606,13 +743,14 @@ int display_resize(uint32_t new_width, uint32_t new_height, uint32_t new_pitch)
     if (!disp.initialized) return -1;
 
     uint64_t new_size = (uint64_t)new_pitch * new_height * sizeof(uint32_t);
+    uint64_t old_size = disp.fb_size;
 
     uint32_t *b0 = (uint32_t *)mem_alloc_aligned(new_size, 4096);
     uint32_t *b1 = (uint32_t *)mem_alloc_aligned(new_size, 4096);
     if (!b0 || !b1) {
         serial_puts("[DISP] Resize failed: cannot allocate buffers\n");
-        if (b0) kfree(b0);
-        if (b1) kfree(b1);
+        if (b0) mem_free_pages(b0, (new_size + 4095ULL) / 4096ULL);
+        if (b1) mem_free_pages(b1, (new_size + 4095ULL) / 4096ULL);
         return -1;
     }
 
@@ -621,8 +759,10 @@ int display_resize(uint32_t new_width, uint32_t new_height, uint32_t new_pitch)
     memset(b1, 0, new_size);
 
     /* Free old buffers */
-    if (disp.buffers[0]) kfree(disp.buffers[0]);
-    if (disp.buffers[1]) kfree(disp.buffers[1]);
+    if (disp.buffers[0])
+        mem_free_pages(disp.buffers[0], (old_size + 4095ULL) / 4096ULL);
+    if (disp.buffers[1])
+        mem_free_pages(disp.buffers[1], (old_size + 4095ULL) / 4096ULL);
 
     disp.width  = new_width;
     disp.height = new_height;

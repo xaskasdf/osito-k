@@ -635,9 +635,9 @@ static void cmd_help(void)
     sh_puts("  msi       Install MSI/MSIX package (msi install file.msi | msix file.msix)\n");
     sh_puts("  dosrun    Run a DOS 16-bit binary (dosrun file.com)\n");
     sh_puts("  clear     Clear screen\n");
-    sh_puts("  desktop   Launch graphical desktop (elementaryOS style)\n");
+    sh_puts("  desktop   Launch graphical desktop (desktop [hz])\n");
     sh_puts("  modes     List display modes\n");
-    sh_puts("  mode      Show/set mode (mode native | mode <w> <h>)\n");
+    sh_puts("  mode      Show/set mode (mode native [hz] | mode <w> <h> [hz] | mode refresh <hz>)\n");
     sh_puts("  kexec     Load + boot kernel from disk (kexec [file])\n");
     sh_puts("  reboot    Reboot system\n");
     sh_puts("  halt      Halt CPU\n");
@@ -851,40 +851,74 @@ static void cmd_mode(int argc, char *argv[])
         return;
     }
 
+    if (strcmp(argv[1], "refresh") == 0 || strcmp(argv[1], "hz") == 0) {
+        uint32_t hz;
+        if (argc < 3 || sh_parse_u32(argv[2], &hz) < 0) {
+            sh_puts("Usage: mode refresh <hz>\n");
+            return;
+        }
+
+        int rc = display_modeset_set(0, 0, hz, DISPLAY_SET_REFRESH_ONLY);
+        if (rc == 0) {
+            sh_puts("mode: refresh pacing set to ");
+            sh_putdec(hz);
+            sh_puts("Hz\n");
+        } else if (rc == -38) {
+            sh_puts("mode: display subsystem is not initialized\n");
+        } else {
+            sh_puts("mode: invalid refresh request\n");
+        }
+        return;
+    }
+
     if (strcmp(argv[1], "native") == 0) {
-        int rc = display_modeset_set(0, 0, 0, DISPLAY_SET_NATIVE);
+        uint32_t hz = 0;
+        if (argc >= 3 && sh_parse_u32(argv[2], &hz) < 0) {
+            sh_puts("Usage: mode native [hz]\n");
+            return;
+        }
+
+        int rc = display_modeset_set(0, 0, hz, DISPLAY_SET_NATIVE);
         if (rc == 0)
             sh_puts("mode: native modeset requested\n");
         else if (rc == -95)
             sh_puts("mode: native modeset not supported by active backend\n");
         else if (rc == -38)
             sh_puts("mode: display subsystem is not initialized\n");
+        else if (rc == -22)
+            sh_puts("mode: invalid refresh request\n");
         else
             sh_puts("mode: native modeset failed\n");
         return;
     }
 
     if (argc >= 3) {
-        uint32_t w, h;
+        uint32_t w, h, hz = 0;
         if (sh_parse_u32(argv[1], &w) < 0 ||
             sh_parse_u32(argv[2], &h) < 0) {
-            sh_puts("Usage: mode [native | <width> <height>]\n");
+            sh_puts("Usage: mode [native [hz] | <width> <height> [hz] | refresh <hz>]\n");
+            return;
+        }
+        if (argc >= 4 && sh_parse_u32(argv[3], &hz) < 0) {
+            sh_puts("Usage: mode <width> <height> [hz]\n");
             return;
         }
 
-        int rc = display_modeset_set(w, h, 0, 0);
+        int rc = display_modeset_set(w, h, hz, 0);
         if (rc == 0)
             sh_puts("mode: already active or switched\n");
         else if (rc == -95)
             sh_puts("mode: exact modeset unsupported by active backend\n");
         else if (rc == -38)
             sh_puts("mode: display subsystem is not initialized\n");
+        else if (rc == -22)
+            sh_puts("mode: invalid mode or refresh request\n");
         else
             sh_puts("mode: invalid mode request\n");
         return;
     }
 
-    sh_puts("Usage: mode [native | <width> <height>]\n");
+    sh_puts("Usage: mode [native [hz] | <width> <height> [hz] | refresh <hz>]\n");
 }
 
 /* ── Builtin: echo ───────────────────────────────────────────── */
@@ -7102,6 +7136,9 @@ q4kgdone:
         /* Launch compositor with elementaryOS desktop */
         extern int  display_init(uint32_t *gop_base, uint32_t w, uint32_t h,
                                  uint32_t pitch, uint32_t fps);
+        extern uint32_t display_get_width(void);
+        extern uint32_t display_get_height(void);
+        extern uint32_t display_get_pitch(void);
         extern void input_events_init(uint32_t scr_width, uint32_t scr_height);
         extern void shm_init(void);
         extern void compositor_init(void);
@@ -7124,8 +7161,14 @@ q4kgdone:
         uint32_t  w    = fb_get_width();
         uint32_t  h    = fb_get_height();
         uint32_t  p    = fb_get_pitch();
+        uint32_t  hz   = 0;
 
-        if (display_init(vram, w, h, p, 0) < 0) {
+        if (argc >= 2 && sh_parse_u32(argv[1], &hz) < 0) {
+            sh_puts("Usage: desktop [hz]\n");
+            return;
+        }
+
+        if (display_init(vram, w, h, p, hz) < 0) {
             sh_puts("ERROR: display_init failed\n");
         } else {
             /* Pass GOP mode table from bootloader to display subsystem */
@@ -7196,6 +7239,10 @@ q4kgdone:
                     }
                 }
             }
+
+            w = display_get_width();
+            h = display_get_height();
+            p = display_get_pitch();
 
             input_events_init(w, h);
             shm_init();

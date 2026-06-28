@@ -6,6 +6,7 @@
 VULKAN_ROOT := $(CURDIR)
 BUILD_ROOT  ?= $(VULKAN_ROOT)/../../build/lib/vulkan
 OUT         := $(BUILD_ROOT)/libvulkan.a
+.DEFAULT_GOAL := all
 
 CC       ?= gcc
 AR       ?= ar
@@ -24,7 +25,8 @@ CFLAGS   := -std=gnu99 -ffreestanding -nostdinc -fno-stack-protector \
             -mno-red-zone -Wall -Wextra -O2 -fno-pic \
             -I$(VULKAN_ROOT)/include -I$(VULKAN_ROOT)/loader \
             -I$(VULKAN_ROOT)/../../include \
-            -isystem $(GCC_INC)
+            -isystem $(GCC_INC) \
+            -MMD -MP
 
 SRC := \
   loader/icd_table.c \
@@ -66,6 +68,7 @@ SRC := \
   icd/venus/venus_cmd_BindImageMemory.c \
   icd/venus/venus_cmd_CreateFramebuffer.c \
   icd/venus/venus_cmd_DestroyFramebuffer.c \
+  icd/venus/venus_cmd_DescriptorObjects.c \
   icd/venus/venus_cmd_CreateDescriptorSetLayout.c \
   icd/venus/venus_cmd_DestroyDescriptorSetLayout.c \
   icd/venus/venus_cmd_CreatePipelineLayout.c \
@@ -112,6 +115,9 @@ SRC := \
   icd/venus/venus_cmd_present_software_raster.c
 
 OBJ := $(patsubst %.c,$(BUILD_ROOT)/%.o,$(SRC))
+DEP := $(OBJ:.o=.d)
+
+-include $(DEP)
 
 .PHONY: all clean
 all: $(OUT)

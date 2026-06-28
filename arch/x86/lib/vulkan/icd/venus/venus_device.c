@@ -67,6 +67,8 @@ extern int venus_cmd_encode_GetBufferMemoryRequirements(
         struct venus_wire *, uint64_t, uint64_t, VkMemoryRequirements *);
 extern int venus_cmd_encode_BindBufferMemory(struct venus_wire *, uint64_t,
                                              uint64_t, uint64_t, uint64_t);
+extern int venus_cmd_encode_GetDeviceQueue(
+        struct venus_device *, uint32_t, uint32_t, struct venus_queue **);
 
 static uint32_t venus_log_device_create;
 static uint32_t venus_log_device_host_disabled;
@@ -379,33 +381,18 @@ venus_GetDeviceQueue(VkDevice device, uint32_t queueFamilyIndex,
                      uint32_t queueIndex, VkQueue *pQueue) {
     if (!device || !pQueue) return;
     struct venus_device *dev = (struct venus_device *)device;
-
-    for (uint32_t i = 0; i < VENUS_MAX_QUEUE_OBJECTS; i++) {
-        struct venus_queue *q = &dev->queues[i];
-        if (q->in_use && q->queue_family_index == queueFamilyIndex &&
-            q->queue_index == queueIndex) {
-            *pQueue = (VkQueue)q;
-            return;
-        }
+    struct venus_queue *q = 0;
+    int rc = venus_cmd_encode_GetDeviceQueue(dev, queueFamilyIndex,
+                                             queueIndex, &q);
+    if (rc != 0 || !q) {
+        *pQueue = VK_NULL_HANDLE;
+        return;
     }
-
-    for (uint32_t i = 0; i < VENUS_MAX_QUEUE_OBJECTS; i++) {
-        struct venus_queue *q = &dev->queues[i];
-        if (!q->in_use) {
-            memset(q, 0, sizeof(*q));
-            set_loader_magic_value(&q->loader_data);
-            q->owner = dev;
-            q->queue_family_index = queueFamilyIndex;
-            q->queue_index = queueIndex;
-            q->in_use = 1;
-            printf("[VGQ] queue=%p owner=%p family=%u index=%u\n",
-                   (void *)q, (void *)q->owner, queueFamilyIndex, queueIndex);
-            *pQueue = (VkQueue)q;
-            return;
-        }
-    }
-
-    *pQueue = VK_NULL_HANDLE;
+    printf("[VGQ] queue=%p owner=%p host=%llu family=%u index=%u\n",
+           (void *)q, (void *)q->owner,
+           (unsigned long long)q->host_id,
+           queueFamilyIndex, queueIndex);
+    *pQueue = (VkQueue)q;
 }
 
 /* --- Memory ------------------------------------------------------------- */
