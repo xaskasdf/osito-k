@@ -8,7 +8,9 @@
 # Usage:
 #   ./qemu-test.sh              # Build + boot
 #   ./qemu-test.sh --no-build   # Boot only (skip build)
-#   ./qemu-test.sh --hvf        # Use macOS HVF acceleration
+#   ./qemu-test.sh --gtk        # Local GTK window, 2D virtio-vga
+#   ./qemu-test.sh --egl-headless # GL virtio-gpu via /dev/dri render node
+#   ./qemu-test.sh --venus      # real Vulkan host via Venus + blob resources
 #
 # Test from another terminal:
 #   echo "hola osito" | nc -u localhost 7777
@@ -30,7 +32,9 @@ ESP_IMG="${QEMU_ESP_IMG:-$BUILD_DIR/esp.img}"
 # the guest can negotiate VIRTIO_GPU_F_VIRGL. `--no-gl` falls back to the
 # plain 2D virtio-vga for hosts that lack virglrenderer. --
 USE_GL="true"
-USE_HVF="false"
+USE_VENUS="false"
+DISPLAY_MODE="auto"
+USE_KVM="auto"
 NO_BUILD="false"
 PID_FILE_DEFAULT="/tmp/qemu-test-osito.pid"
 PID_FILE="${QEMU_PID_FILE:-$PID_FILE_DEFAULT}"
@@ -38,7 +42,11 @@ DO_KILL="false"
 for arg in "$@"; do
     case "$arg" in
         --no-gl)    USE_GL="false" ;;
-        --hvf)      USE_HVF="true" ;;
+        --gtk)      USE_GL="false"; DISPLAY_MODE="gtk" ;;
+        --egl-headless) USE_GL="true"; DISPLAY_MODE="egl-headless" ;;
+        --venus)   USE_GL="true"; USE_VENUS="true"; DISPLAY_MODE="egl-headless" ;;
+        --vnc)      DISPLAY_MODE="vnc" ;;
+        --no-kvm)   USE_KVM="false" ;;
         --no-build) NO_BUILD="true" ;;
         --kill)     DO_KILL="true" ;;
     esac
@@ -190,17 +198,11 @@ info "ESP image: boot.efi=$(FSIZE "$EFI_BIN") kernel.elf=$(FSIZE "$KERN_BIN")"
 
 info "Launching QEMU..."
 info "  OVMF: $OVMF"
-info "  NIC:  e1000e (Intel 82574L, igb family)"
-info "  USB:  xHCI + keyboard + mouse"
-info "  Net:  user-mode, UDP :7777 → guest 10.0.2.15:7777"
-if [ "$USE_HVF" = "true" ]; then
-    MACHINE_ARGS="-machine q35,accel=hvf"
-    CPU_ARGS="-cpu host"
-    info "  Accel: HVF (host CPU)"
-else
-    MACHINE_ARGS="-machine q35"
-    CPU_ARGS="-cpu Nehalem"
-fi
+info "  NIC:  igb (Intel 82576, advanced descriptors)"
+info "  USB:  xHCI + keyboard + $QEMU_USB_POINTER"
+info "  RAM:  $QEMU_MEM"
+info "  CPUs: $QEMU_SMP"
+info "  Net:  user-mode, UDP :$QEMU_UDP_PORT → guest 10.0.2.15:7777"
 info ""
 echo -e "${CYAN}  Test: echo \"hola osito\" | nc -u localhost 7777${NC}"
 echo -e "${CYAN}  Exit: Ctrl-A X${NC}"
@@ -253,11 +255,36 @@ if [ "$(uname)" = "Darwin" ]; then
         info "Display: native macOS window (cocoa)"
     fi
 else
-    if [ "$USE_GL" = "true" ]; then
-        GPU_DEVICE="-device virtio-vga"
-        info "Display: VNC (virgl disabled; VNC is not GL-capable)"
+    if [ "$DISPLAY_MODE" = "auto" ]; then
+        if [ "$USE_GL" = "true" ] && [ -e "$QEMU_RENDER_NODE" ]; then
+            DISPLAY_MODE="egl-headless"
+        else
+            DISPLAY_MODE="gtk"
+        fi
     fi
-    DISPLAY_ARGS="-vnc :0,password=on"
+
+    case "$DISPLAY_MODE" in
+        egl-headless)
+            [ -e "$QEMU_RENDER_NODE" ] || error "render node not found: $QEMU_RENDER_NODE"
+            DISPLAY_ARGS="-display egl-headless,gl=on,rendernode=$QEMU_RENDER_NODE -vnc $QEMU_VNC"
+            info "Display: EGL headless GL (rendernode=$QEMU_RENDER_NODE, VNC=$QEMU_VNC)"
+            ;;
+        gtk)
+            GPU_DEVICE="-device virtio-vga"
+            DISPLAY_ARGS="-display gtk,gl=off"
+            info "Display: GTK window (2D virtio-vga)"
+            ;;
+        vnc)
+            if [ "$USE_GL" = "true" ]; then
+                GPU_DEVICE="-device virtio-vga"
+                info "Display: VNC (virgl disabled; VNC is not GL-capable)"
+            fi
+            DISPLAY_ARGS="-vnc $QEMU_VNC,password=on"
+            ;;
+        *)
+            error "unknown display mode: $DISPLAY_MODE"
+            ;;
+    esac
 fi
 
 ACCEL_ARGS="-accel tcg"
@@ -280,12 +307,12 @@ fi
     $BIOS_ARGS \
     -drive file="$ESP_IMG",format=raw,if=ide \
     $NVME_ARGS \
-    -m 4G \
-    $MACHINE_ARGS \
+    -m "$QEMU_MEM" \
+    -machine q35 \
     $CPU_ARGS \
-    -smp 4 \
-    -device e1000e,netdev=net0 \
-    -netdev user,id=net0,hostfwd=udp::7777-:7777 \
+    -smp "$QEMU_SMP" \
+    -device igb,netdev=net0 \
+    -netdev "$NETDEV_ARGS" \
     -device qemu-xhci,id=usb \
     -device usb-kbd,bus=usb.0 \
     -device "usb-$QEMU_USB_POINTER,bus=usb.0" \

@@ -196,11 +196,12 @@ int main(int argc, char **argv)
         memcpy(&sb, &sb_backup, sizeof(sb));
 
     osfs2_block_sz = sb.block_size;
+    osfs2_set_layout_from_super(&sb);
+    uint32_t data_start = osfs2_layout_data_start_blk(&sb);
     uint32_t max_files = osfs2_layout_max_files(&sb);
     uint32_t filetab_size = osfs2_layout_filetab_size(&sb);
     uint32_t crctab_off = osfs2_layout_crctab_off(&sb);
     uint32_t layeridx_off = osfs2_layout_layeridx_off(&sb);
-    uint32_t data_start = osfs2_layout_data_start_blk(&sb);
 
     free(sb_buf); sb_buf = NULL;
     free(sb_bak_buf); sb_bak_buf = NULL;
@@ -579,13 +580,14 @@ int main(int argc, char **argv)
 
         if (orphaned_slots > 0) {
             errors += orphaned_slots;
-            if (repair) {
-                if (osfs2_write_bytes(fd, layeridx_off, li_buf,
-                                      OSFS2_LAYERIDX_SIZE) == 0) {
-                    printf("    -> repaired: cleared %u orphaned slot(s)\n",
-                           orphaned_slots);
-                    repaired++;
-                }
+                if (repair) {
+                    if (osfs2_write_bytes(fd, layeridx_off, li_buf,
+                                      OSFS2_LAYERIDX_SIZE) == 0 &&
+                        osfs2_sync(fd) == 0) {
+                        printf("    -> repaired: cleared %u orphaned slot(s)\n",
+                               orphaned_slots);
+                        repaired++;
+                    } else repair_failed = 1;
             }
         }
         errors += li_errors;

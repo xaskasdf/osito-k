@@ -49,6 +49,9 @@ int      osfs3_read_file_block(const void *file, uint32_t block_index,
 void    *osfs3_create(const char *path, uint64_t size);
 int      osfs3_write(void *file, uint64_t offset, const void *buf,
                      uint64_t len);
+int      osfs3_write_data(void *file, uint64_t offset, const void *buf,
+                          uint64_t len);
+int      osfs3_set_size_reserved(void *file, uint64_t size);
 int      osfs3_truncate(void *file, uint64_t size);
 int      osfs3_rename(const char *from, const char *to, bool replace);
 int      osfs3_delete(const char *path);

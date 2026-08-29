@@ -8,54 +8,40 @@ import time
 import zlib
 
 from osfs2_journal import (JOURNAL_COMMIT_MAGIC, JOURNAL_COMMIT_OFF,
-                           JOURNAL_OP_REPLACE, commit_entries, fix_super_crc,
-                           lock, read_super, recover, super_valid)
+                           JOURNAL_OP_REPLACE, FILETAB_OFF, commit_entries,
+                           fix_super_crc, layout_from_super, lock, read_super,
+                           recover, super_valid)
 
 MAGIC = 0x4F534632
-LAYOUT_MAGIC = 0x4F324C59
-SUPER_BACKUP_OFF = 4096
-FILETAB_OFF = 1 << 20
-LEGACY_MAX_FILES = 4096
-MAX_BLOCKS  = 262144
-CRCTAB_SIZE = MAX_BLOCKS * 4
-LAYERIDX_SIZE = 512 * 2048
-NAME_LEN    = 64
-FLAG_VALID  = 1
-FLAG_RAW    = 4
-CRC_OFF_IN_SUPER = 84
+NAME_LEN = 64
+FLAG_VALID = 1
+FLAG_RAW = 4
 
-def layout(s):
-    layout_magic, file_slots, metadata_bytes = struct.unpack_from('<3I', s, 88)
-    slots = LEGACY_MAX_FILES
-    if layout_magic == LAYOUT_MAGIC:
-        slots = file_slots
-        if slots < LEGACY_MAX_FILES or slots % LEGACY_MAX_FILES:
-            raise ValueError(f"invalid file slot count: {slots}")
-    crctab_off = FILETAB_OFF + slots * 256
-    layeridx_off = crctab_off + CRCTAB_SIZE
-    data_off = layeridx_off + LAYERIDX_SIZE
-    if layout_magic == LAYOUT_MAGIC and metadata_bytes != data_off:
-        raise ValueError("metadata_bytes does not match layout")
-    return slots, crctab_off
 
-def find_part(f):
-    f.seek(0, os.SEEK_END); n = f.tell()
-    off = 0
-    while off < min(n, 256 << 20):
-        f.seek(off); d = f.read(4)
-        if len(d) == 4 and struct.unpack('<I', d)[0] == MAGIC:
-            return off
-        off += (1 << 20)
+def find_part(image):
+    image.seek(0, os.SEEK_END)
+    size = image.tell()
+    for offset in range(0, min(size, 256 << 20), 1 << 20):
+        image.seek(offset)
+        primary = image.read(512)
+        image.seek(offset + 4096)
+        backup = image.read(512)
+        image.seek(offset + JOURNAL_COMMIT_OFF)
+        commit_magic = image.read(4)
+        if super_valid(primary) or super_valid(backup) or \
+                (len(commit_magic) == 4 and
+                 struct.unpack('<I', commit_magic)[0] == JOURNAL_COMMIT_MAGIC):
+            return offset
     return None
 
 
-def find_free_extent(table, total_blocks, block_size, needed):
+def find_free_extent(table, total_blocks, block_size, needed, layout):
     if needed == 0:
         return 0
-    data_start = DATA_OFF // block_size
+    data_start = layout['data_off'] // block_size
     used = bytearray(total_blocks)
     used[:data_start] = bytes([1]) * data_start
-    for slot in range(MAX_FILES):
+    for slot in range(layout['max_files']):
         entry = table[slot * 256:(slot + 1) * 256]
         flags = struct.unpack_from('<I', entry, 84)[0]
         start, count = struct.unpack_from('<2I', entry, 72)
@@ -76,11 +62,13 @@ def find_free_extent(table, total_blocks, block_size, needed):
     return None
 
 
-def recompute_super(superblock, table):
+def recompute_super(superblock, table, layout=None):
+    if layout is None:
+        layout = layout_from_super(superblock)
     block_size = struct.unpack_from('<I', superblock, 8)[0]
-    data_start = DATA_OFF // block_size
+    data_start = layout['data_off'] // block_size
     files, used, high_water = 0, data_start, data_start
-    for slot in range(MAX_FILES):
+    for slot in range(layout['max_files']):
         entry = table[slot * 256:(slot + 1) * 256]
         if not (struct.unpack_from('<I', entry, 84)[0] & FLAG_VALID):
             continue
@@ -96,55 +84,96 @@ def recompute_super(superblock, table):
 
 
 def main():
-    img, host, dest = sys.argv[1], sys.argv[2], sys.argv[3]
-    data = open(host, 'rb').read()
-    with open(img, 'r+b') as f:
-        p = find_part(f)
-        if p is None: print("no superblock"); return 1
-        f.seek(p); s = bytearray(f.read(512))
-        magic, ver, bsz, total, used, fcount, nextblk = struct.unpack_from('<7I', s, 0)
-        max_files, crctab_off = layout(s)
-        # locate the entry to replace
+    if len(sys.argv) != 4:
+        print('usage: osfs2_replace.py <image> <hostfile> <destname>')
+        return 1
+    image_path, host_path, destination = sys.argv[1:]
+    try:
+        encoded_destination = destination.encode('latin1')
+    except UnicodeEncodeError:
+        print('destination must be Latin-1')
+        return 1
+    if not encoded_destination or len(encoded_destination) >= NAME_LEN:
+        print('destination name must contain 1-63 bytes')
+        return 1
+    data = open(host_path, 'rb').read()
+    with open(image_path, 'r+b') as image:
+        lock(image, True)
+        partition = find_part(image)
+        if partition is None:
+            print('no superblock')
+            return 1
+        recover(image, partition, True)
+        before_super = read_super(image, partition, True)
+        layout = layout_from_super(before_super)
+        _, _, block_size, total_blocks = struct.unpack_from('<4I', before_super)
+        image.seek(partition + FILETAB_OFF)
+        table = bytearray(image.read(layout['filetab_size']))
+        if len(table) != layout['filetab_size']:
+            print('short file table')
+            return 1
+
         slot = -1
-        for i in range(max_files):
-            e = p + FILETAB_OFF + i*256
-            f.seek(e); ent = f.read(256)
-            name = ent[:NAME_LEN].split(b'\x00')[0].decode('latin1','replace')
-            flags = struct.unpack_from('<I', ent, 84)[0]
-            if (flags & FLAG_VALID) and name.lower() == dest.lower():
-                slot = i; break
-        if slot < 0: print(f"not found: {dest}"); return 1
-        bcount = (len(data) + bsz - 1) // bsz
-        start = nextblk
-        if start + bcount > total:
-            print(f"NO ROOM: need {bcount} blk at {start}, total={total}"); return 1
-        # write new data at the bump pointer
-        f.seek(p + start*bsz); f.write(data)
-        pad = bcount*bsz - len(data)
-        if pad: f.write(b'\x00'*pad)
-        # repoint the existing entry
-        e = p + FILETAB_OFF + slot*256
-        f.seek(e); ent = bytearray(f.read(256))
-        struct.pack_into('<Q', ent, 64, len(data))
-        struct.pack_into('<I', ent, 72, start)
-        struct.pack_into('<I', ent, 76, bcount)
-        struct.pack_into('<I', ent, 80, zlib.crc32(data) & 0xFFFFFFFF)
-        struct.pack_into('<I', ent, 84, FLAG_VALID | FLAG_RAW)
-        f.seek(e); f.write(ent)
-        # crc_table slots for new blocks = 0 (skip verify)
-        for b in range(start, start+bcount):
-            if b < MAX_BLOCKS:
-                f.seek(p + crctab_off + b*4); f.write(b'\x00\x00\x00\x00')
-        # superblock: used += bcount (old extent leaks), nextblk advance; fcount same
-        struct.pack_into('<I', s, 16, used + bcount)
-        struct.pack_into('<I', s, 24, start + bcount)
-        struct.pack_into('<I', s, CRC_OFF_IN_SUPER, 0)
-        crc = zlib.crc32(bytes(s)) & 0xFFFFFFFF
-        struct.pack_into('<I', s, CRC_OFF_IN_SUPER, crc)
-        f.seek(p + 0); f.write(s)
-        f.seek(p + SUPER_BACKUP_OFF); f.write(s)
-        print(f"REPLACED {dest} (slot {slot}): {len(data)} B at block {start} "
-              f"(+{bcount} blk); next_data_block -> {start+bcount}/{total}")
+        for index in range(layout['max_files']):
+            entry = table[index * 256:(index + 1) * 256]
+            name = entry[:NAME_LEN].split(b'\0')[0].decode('latin1', 'replace')
+            flags = struct.unpack_from('<I', entry, 84)[0]
+            if flags & FLAG_VALID and name.lower() == destination.lower():
+                slot = index
+                break
+        if slot < 0:
+            print(f'not found: {destination}')
+            return 1
+
+        old_entry = bytes(table[slot * 256:(slot + 1) * 256])
+        old_start, old_count = struct.unpack_from('<2I', old_entry, 72)
+        block_count = (len(data) + block_size - 1) // block_size
+        start = find_free_extent(table, total_blocks, block_size, block_count,
+                                 layout)
+        if start is None:
+            print(f'NO ROOM: need a separate {block_count}-block extent')
+            return 1
+
+        if block_count:
+            image.seek(partition + start * block_size)
+            image.write(data)
+            image.write(bytes(block_count * block_size - len(data)))
+            if layout['has_crc']:
+                for block in range(start, start + block_count):
+                    image.seek(partition + layout['crctab_off'] + block * 4)
+                    image.write(bytes(4))
+        image.flush()
+        os.fsync(image.fileno())
+
+        new_entry = bytearray(256)
+        new_entry[:len(encoded_destination)] = encoded_destination
+        struct.pack_into('<Q', new_entry, 64, len(data))
+        struct.pack_into('<I', new_entry, 72, start)
+        struct.pack_into('<I', new_entry, 76, block_count)
+        struct.pack_into('<I', new_entry, 80, zlib.crc32(data) & 0xFFFFFFFF)
+        struct.pack_into('<I', new_entry, 84, FLAG_VALID | FLAG_RAW)
+        struct.pack_into('<H', new_entry, 244, 0xFFFF)
+        now = int(time.time())
+        struct.pack_into('<I', new_entry, 246,
+                         struct.unpack_from('<I', old_entry, 246)[0] or now)
+        struct.pack_into('<I', new_entry, 250, now)
+
+        table[slot * 256:(slot + 1) * 256] = new_entry
+        after_super = bytearray(before_super)
+        high_water = recompute_super(after_super, table, layout)
+        commit_entries(image, partition, JOURNAL_OP_REPLACE,
+                       before_super, after_super, [slot], [old_entry],
+                       [new_entry])
+
+        if layout['has_crc']:
+            for block in range(old_start, old_start + old_count):
+                image.seek(partition + layout['crctab_off'] + block * 4)
+                image.write(bytes(4))
+        image.flush()
+        os.fsync(image.fileno())
+        print(f'REPLACED {destination} (slot {slot}): {len(data)} B at block '
+              f'{start} (+{block_count} blk); next_data_block -> '
+              f'{high_water}/{total_blocks}')
     return 0
 
 

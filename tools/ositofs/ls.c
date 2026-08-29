@@ -69,7 +69,7 @@ int main(int argc, char **argv)
     for (uint32_t i = 0; i < max_files; i++) {
         if (!(ft[i].flags & OSFS2_FLAG_VALID)) continue;
 
-        printf("%-40s ", display_name(&ft[i]));
+        printf("%-40s ", osfs2_entry_name(&ft[i]));
 
         /* Size */
         char sizebuf[32];

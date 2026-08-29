@@ -26,7 +26,6 @@ typedef struct {
 
 static kthread_t kthreads[KTHREAD_MAX];
 
-/* Wrapper that calls the actual function with its data argument */
 static void kthread_run_slot(int idx)
 {
     if (idx < 0 || idx >= KTHREAD_MAX || !kthreads[idx].active) return;
@@ -34,8 +33,8 @@ static void kthread_run_slot(int idx)
     kthreads[idx].active = false;
 }
 
-#define KTHREAD_WRAPPER(n) \
-    static void kthread_wrapper_##n(void) { kthread_run_slot(n); }
+#define KTHREAD_WRAPPER(index) \
+    static void kthread_wrapper_##index(void) { kthread_run_slot(index); }
 
 KTHREAD_WRAPPER(0)
 KTHREAD_WRAPPER(1)
@@ -80,6 +79,10 @@ int kthread_create(const char *name, void (*func)(void *), void *data)
             kt->name[j] = '\0';
 
             kt->pid = sched_spawn(name, kthread_wrappers[i]);
+            if (kt->pid < 0) {
+                kt->active = false;
+                return -1;
+            }
 
             serial_puts("[KTHREAD] Created: ");
             serial_puts(name);

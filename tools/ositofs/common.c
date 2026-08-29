@@ -11,9 +11,7 @@
 #include <unistd.h>
 #include <errno.h>
 #include <sys/ioctl.h>
-#ifdef __APPLE__
-#include <sys/disk.h>
-#endif
+#include <sys/file.h>
 #ifdef __linux__
 #include <linux/fs.h>
 #endif
@@ -37,6 +35,17 @@ void osfs2_set_layout(uint32_t version)
     osfs2_layeridx_offset = OSFS2_LAYERIDX_OFF_STANDARD;
     osfs2_crc_table_enabled = osfs2_format_has_crc_table(version);
     osfs2_layer_index_enabled = osfs2_format_has_layer_index(version);
+}
+
+void osfs2_set_layout_from_super(const osfs2_super_t *sb)
+{
+    if (!sb) return;
+    osfs2_file_capacity = osfs2_layout_max_files(sb);
+    osfs2_filetab_size = osfs2_layout_filetab_size(sb);
+    osfs2_crctab_offset = osfs2_layout_crctab_off(sb);
+    osfs2_layeridx_offset = osfs2_layout_layeridx_off(sb);
+    osfs2_crc_table_enabled = osfs2_layout_has_crc_table(sb);
+    osfs2_layer_index_enabled = osfs2_layout_has_layer_index(sb);
 }
 
 /* ── Device I/O ──────────────────────────────────────────────── */
@@ -167,7 +176,8 @@ static int journal_super_valid(const osfs2_super_t *sb)
 {
     if (!sb || sb->magic != OSFS2_MAGIC ||
         !osfs2_supported_version(sb->version) ||
-        !osfs2_valid_block_size(sb->block_size)) return 0;
+        !osfs2_valid_block_size(sb->block_size) ||
+        !osfs2_valid_layout(sb)) return 0;
     osfs2_super_t copy = *sb;
     uint32_t expected = copy.crc32;
     copy.crc32 = 0;
@@ -190,18 +200,17 @@ static int journal_record_valid(osfs2_journal_record_t *record)
         memcmp(record->before_super.uuid, record->after_super.uuid,
                sizeof(record->before_super.uuid)) != 0 ||
         record->after_super.total_blocks <=
-            osfs2_format_data_start_blk(record->after_super.version,
-                                        record->after_super.block_size) ||
+            osfs2_layout_data_start_blk(&record->after_super) ||
         record->after_super.total_blocks > OSFS2_MAX_BLOCKS) return 0;
     for (uint32_t i = 0; i < record->page_count; i++) {
-        if (record->pages[i] >= osfs2_format_filetab_size(
-                record->after_super.version) / OSFS2_METADATA_PAGE_SIZE)
+        if (record->pages[i] >= osfs2_layout_filetab_size(
+                &record->after_super) / OSFS2_METADATA_PAGE_SIZE)
             return 0;
         if (i && record->pages[i] == record->pages[0]) return 0;
     }
     for (uint32_t i = 0; i < record->entry_count; i++) {
-        if (record->slots[i] >= osfs2_format_max_files(
-                record->after_super.version)) return 0;
+        if (record->slots[i] >= osfs2_layout_max_files(
+                &record->after_super)) return 0;
         uint32_t page = record->slots[i] / 16;
         int found = 0;
         for (uint32_t j = 0; j < record->page_count; j++)
@@ -223,9 +232,8 @@ static int journal_record_valid(osfs2_journal_record_t *record)
             } else if (after->block_count) {
                 uint64_t end = (uint64_t)after->start_block +
                                after->block_count;
-                if (after->start_block < osfs2_format_data_start_blk(
-                        record->after_super.version,
-                        record->after_super.block_size) ||
+                if (after->start_block < osfs2_layout_data_start_blk(
+                        &record->after_super) ||
                     end > record->after_super.total_blocks ||
                     after->size > (uint64_t)after->block_count *
                                       record->after_super.block_size)
@@ -508,7 +516,7 @@ int osfs2_read_super(int fd, osfs2_super_t *sb)
 
     free(buf);
     osfs2_block_sz = sb->block_size;
-    osfs2_set_layout(sb->version);
+    osfs2_set_layout_from_super(sb);
     return 0;
 }
 

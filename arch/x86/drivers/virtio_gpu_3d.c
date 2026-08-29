@@ -1,4 +1,8 @@
-/* virtio-gpu Venus transport for OsitoK. */
+/*
+ * virtio-gpu 3D driver -- Wave 1 skeleton.
+ * Functions grow task-by-task. Until implemented, each returns -ENOSYS
+ * and the corresponding selftest marker prints FAIL.
+ */
 #include "virtio_gpu_3d.h"
 #include "virtio_gpu_internal.h"
 #include "../include/paging.h"
@@ -251,22 +255,46 @@ static uint64_t vg3d_align_up_u64(uint64_t value, uint64_t align) {
     return (value + align - 1) & ~(align - 1);
 }
 
-static uint64_t g_hostmem_next_offset = 0;
-
 static int32_t vg3d_hostmem_alloc(uint64_t size, uint64_t *offset_out) {
     uint64_t hostmem_size = vgpu_hostmem_size();
     if (!offset_out || !vgpu_hostmem_base() || !hostmem_size)
         return -EINVAL;
 
     uint64_t aligned_size = vg3d_align_up_u64(size, VG3D_HOSTMEM_ALIGN);
-    uint64_t offset = vg3d_align_up_u64(g_hostmem_next_offset,
-                                        VG3D_HOSTMEM_ALIGN);
-    if (offset + aligned_size > hostmem_size || offset + aligned_size < offset)
+    uint64_t candidate = 0;
+    if (!aligned_size || aligned_size > hostmem_size)
         return -ENOMEM;
 
-    g_hostmem_next_offset = offset + aligned_size;
-    *offset_out = offset;
-    return 0;
+    /* First-fit over live blob mappings makes RESOURCE_DESTROY reclaim the
+     * aperture instead of exhausting it after repeated application starts. */
+    for (uint32_t pass = 0; pass <= VG3D_RES_MAX; pass++) {
+        bool moved = false;
+        for (uint32_t i = 0; i < VG3D_RES_MAX; i++) {
+            const struct vg3d_res *res = &g_res_tab[i];
+            if (!res->id || !res->blob) continue;
+
+            uint64_t used_start = res->hostmem_offset;
+            uint64_t used_size = vg3d_align_up_u64(res->size,
+                                                   VG3D_HOSTMEM_ALIGN);
+            uint64_t used_end = used_start + used_size;
+            uint64_t candidate_end = candidate + aligned_size;
+            if (used_end < used_start || candidate_end < candidate)
+                return -ENOMEM;
+            if (candidate < used_end && candidate_end > used_start) {
+                candidate = vg3d_align_up_u64(used_end,
+                                              VG3D_HOSTMEM_ALIGN);
+                moved = true;
+                break;
+            }
+        }
+        if (!moved) {
+            if (candidate > hostmem_size - aligned_size)
+                return -ENOMEM;
+            *offset_out = candidate;
+            return 0;
+        }
+    }
+    return -ENOMEM;
 }
 
 static int32_t vg3d_host_res_unref(uint32_t res_id) {
@@ -305,6 +333,24 @@ static int32_t vg3d_host_res_unmap_blob(uint32_t res_id) {
     int32_t err = vg3d_host_cmd(cmd, sizeof(*cmd), "RESOURCE_UNMAP_BLOB", 0);
     mem_free_pages(raw, 1);
     return err;
+}
+
+static int32_t vg3d_release_res(struct vg3d_res *res) {
+    if (!res || !res->id) return -ESRCH;
+
+    if (res->blob) {
+        /* RESOURCE_UNREF is authoritative. An already-unmapped blob may
+         * reject UNMAP, but it still must be released on the host. */
+        (void)vg3d_host_res_unmap_blob(res->id);
+        int32_t err = vg3d_host_res_unref(res->id);
+        if (err < 0) return err;
+    } else {
+        uint64_t pages = (res->size + 4095) >> 12;
+        mem_free_pages((void *)res->backing_phys, pages);
+    }
+
+    __builtin_memset(res, 0, sizeof(*res));
+    return 0;
 }
 
 static int32_t vg3d_host_res_create_blob(uint32_t ctx_id, uint32_t res_id,
@@ -378,203 +424,6 @@ static void vg3d_fence_signal(uint64_t fence) {
 }
 
 static bool g_3d_ready = false;
-static struct virgl_renderer_capset_venus g_venus_capset;
-
-#define VN_CMD_ENUMERATE_INSTANCE_VERSION 137u
-#define VN_CMD_SET_REPLY_STREAM           178u
-#define VN_CMD_CREATE_RING                188u
-#define VN_CMD_DESTROY_RING               189u
-#define VN_CMD_NOTIFY_RING                190u
-#define VN_COMMAND_GENERATE_REPLY         1u
-#define VN_STRUCTURE_TYPE_RING_CREATE_INFO 1000384000u
-
-static void vn_put_u32(uint8_t **dst, uint32_t value) {
-    __builtin_memcpy(*dst, &value, sizeof(value));
-    *dst += sizeof(value);
-}
-
-static void vn_put_u64(uint8_t **dst, uint64_t value) {
-    __builtin_memcpy(*dst, &value, sizeof(value));
-    *dst += sizeof(value);
-}
-
-static int vg3d_host_submit(uint32_t ctx_id, const void *cmd_bytes,
-                            uint32_t cmd_len) {
-    uint32_t hdr_len = sizeof(struct vg3d_ctrl_hdr) + 8;
-    uint32_t total = hdr_len + cmd_len;
-    uint64_t pages = (total + 4095) >> 12;
-    void *buf_phys = mem_alloc_pages(pages);
-    if (!buf_phys)
-        return -ENOMEM;
-    uint8_t *buf = (uint8_t *)PHYS_TO_VIRT((uint64_t)buf_phys);
-    __builtin_memset(buf, 0, total);
-
-    struct vg3d_ctrl_hdr *hdr = (struct vg3d_ctrl_hdr *)buf;
-    hdr->type = VIRTIO_GPU_CMD_SUBMIT_3D;
-    hdr->ctx_id = ctx_id;
-    *(uint32_t *)(buf + sizeof(*hdr)) = cmd_len;
-    __builtin_memcpy(buf + hdr_len, cmd_bytes, cmd_len);
-
-    struct vg3d_ctrl_hdr resp;
-    __builtin_memset(&resp, 0, sizeof(resp));
-    int rc = vgpu_controlq_submit(buf, total, &resp, sizeof(resp));
-    mem_free_pages(buf_phys, pages);
-    return rc == 0 && resp.type == VIRTIO_GPU_RESP_OK_NODATA ? 0 : -EIO;
-}
-
-/* Exercise the official Mesa Venus transport rather than a private packet
- * format. The renderer creates a real shared ring, invokes its host Vulkan
- * vkEnumerateInstanceVersion entry point and writes the generated reply into
- * a second host-owned blob. */
-static int vg3d_probe_venus_protocol(uint32_t ctx_id) {
-    const uint32_t ring_size = 4096;
-    const uint32_t head_offset = 0;
-    const uint32_t tail_offset = 64;
-    const uint32_t status_offset = 128;
-    const uint32_t buffer_offset = 192;
-    const uint32_t buffer_size = 2048;
-    const uint32_t extra_offset = buffer_offset + buffer_size;
-    const uint64_t ring_id = 0x4f5349544f564b31ull;
-    uint32_t ring_res = 0;
-    uint32_t reply_res = 0;
-    void *ring_map = 0;
-    void *reply_map = 0;
-    int result = -EIO;
-
-    if (vgpu_blob_create_map(ctx_id, ring_size, 0,
-                             &ring_res, &ring_map) < 0 ||
-        vgpu_blob_create_map(ctx_id, 4096, 0,
-                             &reply_res, &reply_map) < 0)
-        goto cleanup;
-    __builtin_memset(ring_map, 0, ring_size);
-    __builtin_memset(reply_map, 0, 4096);
-
-    uint8_t create[160];
-    uint8_t *p = create;
-    vn_put_u32(&p, VN_CMD_CREATE_RING);
-    vn_put_u32(&p, 0);
-    vn_put_u64(&p, ring_id);
-    vn_put_u64(&p, 1); /* pCreateInfo */
-    vn_put_u32(&p, VN_STRUCTURE_TYPE_RING_CREATE_INFO);
-    vn_put_u64(&p, 0); /* pNext */
-    vn_put_u32(&p, 0); /* flags */
-    vn_put_u32(&p, ring_res);
-    vn_put_u64(&p, 0); /* resource offset */
-    vn_put_u64(&p, ring_size);
-    vn_put_u64(&p, 1000000); /* idle timeout, ns */
-    vn_put_u64(&p, head_offset);
-    vn_put_u64(&p, tail_offset);
-    vn_put_u64(&p, status_offset);
-    vn_put_u64(&p, buffer_offset);
-    vn_put_u64(&p, buffer_size);
-    vn_put_u64(&p, extra_offset);
-    vn_put_u64(&p, 0); /* extra size */
-    if (vg3d_host_submit(ctx_id, create, (uint32_t)(p - create)) < 0)
-        goto cleanup;
-
-    uint8_t *ring_cmd = (uint8_t *)ring_map + buffer_offset;
-    p = ring_cmd;
-    vn_put_u32(&p, VN_CMD_SET_REPLY_STREAM);
-    vn_put_u32(&p, 0);
-    vn_put_u64(&p, 1); /* pStream */
-    vn_put_u32(&p, reply_res);
-    vn_put_u64(&p, 0); /* reply offset */
-    vn_put_u64(&p, 64); /* reply size */
-    vn_put_u32(&p, VN_CMD_ENUMERATE_INSTANCE_VERSION);
-    vn_put_u32(&p, VN_COMMAND_GENERATE_REPLY);
-    vn_put_u64(&p, 1); /* pApiVersion */
-    uint32_t command_size = (uint32_t)(p - ring_cmd);
-
-    __asm__ volatile ("mfence" ::: "memory");
-    *(volatile uint32_t *)((uint8_t *)ring_map + tail_offset) = command_size;
-    __asm__ volatile ("mfence" ::: "memory");
-
-    uint8_t notify[32];
-    p = notify;
-    vn_put_u32(&p, VN_CMD_NOTIFY_RING);
-    vn_put_u32(&p, 0);
-    vn_put_u64(&p, ring_id);
-    vn_put_u32(&p, command_size);
-    vn_put_u32(&p, 0);
-    if (vg3d_host_submit(ctx_id, notify, (uint32_t)(p - notify)) < 0)
-        goto destroy_ring;
-
-    bool consumed = false;
-    for (uint32_t attempt = 0; attempt < 100000000; attempt++) {
-        __asm__ volatile ("lfence" ::: "memory");
-        if (*(volatile uint32_t *)((uint8_t *)ring_map + head_offset) ==
-            command_size) {
-            consumed = true;
-            break;
-        }
-        __asm__ volatile ("pause" ::: "memory");
-    }
-    if (!consumed)
-        goto destroy_ring;
-
-    const volatile uint8_t *reply = (const volatile uint8_t *)reply_map;
-    uint32_t reply_cmd;
-    int32_t reply_result;
-    uint64_t reply_pointer;
-    uint32_t api_version;
-    __builtin_memcpy(&reply_cmd, (const void *)(reply + 0), 4);
-    __builtin_memcpy(&reply_result, (const void *)(reply + 4), 4);
-    __builtin_memcpy(&reply_pointer, (const void *)(reply + 8), 8);
-    __builtin_memcpy(&api_version, (const void *)(reply + 16), 4);
-    if (reply_cmd != VN_CMD_ENUMERATE_INSTANCE_VERSION ||
-        reply_result != 0 || reply_pointer != 1 || api_version == 0)
-        goto destroy_ring;
-
-    serial_puts("[VG3D] official Venus protocol host Vulkan version=0x");
-    serial_puthex(api_version, 8);
-    serial_puts("\n");
-    result = 0;
-
-destroy_ring: {
-    uint8_t destroy[16];
-    p = destroy;
-    vn_put_u32(&p, VN_CMD_DESTROY_RING);
-    vn_put_u32(&p, 0);
-    vn_put_u64(&p, ring_id);
-    if (vg3d_host_submit(ctx_id, destroy, sizeof(destroy)) < 0)
-        result = -EIO;
-}
-cleanup:
-    if (reply_res && vgpu_blob_destroy(reply_res) < 0)
-        result = -EIO;
-    if (ring_res && vgpu_blob_destroy(ring_res) < 0)
-        result = -EIO;
-    return result;
-}
-
-static int vg3d_host_ctx_create(uint32_t ctx_id) {
-    struct vg3d_ctx_create_cmd cmd;
-    struct vg3d_ctrl_hdr resp;
-    static const char name[] = "ositok-venus";
-    __builtin_memset(&cmd, 0, sizeof(cmd));
-    __builtin_memset(&resp, 0, sizeof(resp));
-    cmd.hdr.type = VIRTIO_GPU_CMD_CTX_CREATE;
-    cmd.hdr.ctx_id = ctx_id;
-    cmd.nlen = sizeof(name) - 1;
-    cmd.context_init = VIRTIO_GPU_CAPSET_VENUS;
-    for (uint32_t i = 0; i < sizeof(name) - 1; i++)
-        cmd.debug_name[i] = name[i];
-    if (vgpu_controlq_submit(&cmd, sizeof(cmd), &resp, sizeof(resp)) < 0)
-        return -EIO;
-    return resp.type == VIRTIO_GPU_RESP_OK_NODATA ? 0 : -EIO;
-}
-
-static int vg3d_host_ctx_destroy(uint32_t ctx_id) {
-    struct vg3d_ctx_destroy_cmd cmd;
-    struct vg3d_ctrl_hdr resp;
-    __builtin_memset(&cmd, 0, sizeof(cmd));
-    __builtin_memset(&resp, 0, sizeof(resp));
-    cmd.hdr.type = VIRTIO_GPU_CMD_CTX_DESTROY;
-    cmd.hdr.ctx_id = ctx_id;
-    if (vgpu_controlq_submit(&cmd, sizeof(cmd), &resp, sizeof(resp)) < 0)
-        return -EIO;
-    return resp.type == VIRTIO_GPU_RESP_OK_NODATA ? 0 : -EIO;
-}
 
 void virtio_gpu_3d_init(void) {
     if (!vgpu_is_initialized()) {
@@ -582,10 +431,9 @@ void virtio_gpu_3d_init(void) {
         g_3d_ready = false;
         return;
     }
-    if (!vgpu_has_feature(VIRTIO_GPU_F_VIRGL) ||
-        !vgpu_has_feature(VIRTIO_GPU_F_RESOURCE_BLOB) ||
-        !vgpu_has_feature(VIRTIO_GPU_F_CONTEXT_INIT)) {
-        serial_puts("[VG3D] skipped (Venus virtio features incomplete)\n");
+    uint64_t feat = vgpu_device_features();
+    if (!(feat & (1ull << VIRTIO_GPU_F_VIRGL))) {
+        serial_puts("[VG3D] skipped (VIRGL feature not offered by host)\n");
         g_3d_ready = false;
         return;
     }
@@ -604,7 +452,7 @@ uint32_t vg3d_caps(void) {
 
 int32_t vg3d_ctx_create(uint32_t pid, uint32_t flags) {
     if (!g_3d_ready) return -EINVAL;
-    if (flags != GPU_CTX_VENUS) return -EINVAL;
+    if (flags != GPU_CTX_VENUS && flags != GPU_CTX_NVK) return -EINVAL;
     for (int i = 0; i < VG3D_CTX_MAX; i++) {
         if (g_ctx_tab[i].id == 0) {
             uint32_t id = g_ctx_next_id++;
@@ -624,6 +472,13 @@ int32_t vg3d_ctx_destroy(uint32_t pid, uint32_t ctx_id) {
     for (int i = 0; i < VG3D_CTX_MAX; i++) {
         if (g_ctx_tab[i].id == ctx_id) {
             if (g_ctx_tab[i].pid != pid) return -EINVAL;
+            for (int j = 0; j < VG3D_RES_MAX; j++) {
+                if (g_res_tab[j].id && g_res_tab[j].pid == pid &&
+                    g_res_tab[j].ctx_id == ctx_id) {
+                    int32_t release_err = vg3d_release_res(&g_res_tab[j]);
+                    if (release_err < 0) return release_err;
+                }
+            }
             int32_t err = vg3d_host_ctx_destroy(ctx_id);
             if (err < 0) return err;
             g_ctx_tab[i].id = 0;
@@ -646,9 +501,15 @@ int32_t vg3d_res_create(uint32_t pid, uint32_t ctx_id,
     if (!g_3d_ready || !args) return -EINVAL;
     if (!find_ctx(pid, ctx_id)) return -ESRCH;
 
-    if (args->kind != GPU_RES_KIND_BUFFER)
+    uint64_t sz;
+    if (args->kind == GPU_RES_KIND_BUFFER) {
+        sz = args->size;
+    } else if (args->kind == GPU_RES_KIND_IMAGE2D) {
+        uint32_t pitch = args->pitch ? args->pitch : args->width * 4;
+        sz = (uint64_t)pitch * args->height;
+    } else {
         return -EINVAL;
-    uint64_t sz = args->size;
+    }
     if (sz == 0 || sz > (256u << 20)) return -EINVAL;   /* clamp to 256 MiB */
 
     for (int i = 0; i < VG3D_RES_MAX; i++) {
@@ -741,18 +602,20 @@ int32_t vg3d_res_create(uint32_t pid, uint32_t ctx_id,
 uint64_t vg3d_res_map(uint32_t pid, uint32_t res_id) {
     for (int i = 0; i < VG3D_RES_MAX; i++) {
         if (g_res_tab[i].id == res_id && g_res_tab[i].pid == pid) {
+            /* Wave 1: return kernel VA directly. User VA mapping arrives
+             * when per-process PML4 path is wired (Wave 1 runs kernel-only
+             * selftest; userspace consumers come in Wave 2). */
             return g_res_tab[i].backing_va;
         }
     }
     return 0;
 }
 int32_t vg3d_res_destroy(uint32_t pid, uint32_t res_id) {
+    if (!res_id) return -EINVAL;
     for (int i = 0; i < VG3D_RES_MAX; i++) {
-        if (g_res_tab[i].id == res_id && g_res_tab[i].pid == pid) {
-            if (vgpu_blob_destroy(g_res_tab[i].host_resource_id) < 0)
-                return -EIO;
-            __builtin_memset(&g_res_tab[i], 0, sizeof(g_res_tab[i]));
-            return 0;
+        if (g_res_tab[i].id == res_id) {
+            if (g_res_tab[i].pid != pid) return -EPERM;
+            return vg3d_release_res(&g_res_tab[i]);
         }
     }
     return -ESRCH;
@@ -807,43 +670,58 @@ int32_t vg3d_fence_wait(uint64_t fence, uint64_t timeout_ns) {
     if (fence <= g_fence_signaled) return 0;
     return -110;        /* ETIMEDOUT -- shouldn't happen in Wave 1 */
 }
+extern void    *shm_map(uint32_t handle);
+extern uint32_t compositor_find_window_by_shm(uint32_t shm_handle);
+extern void     compositor_signal_dirty(uint32_t window_id);
+
 int32_t vg3d_present(uint32_t pid, uint32_t ctx_id,
-                      uint32_t res_id, uint32_t shm_handle) {
-    (void)pid;
-    (void)ctx_id;
-    (void)res_id;
-    (void)shm_handle;
-    return -ENOSYS;
+                     uint32_t res_id, uint32_t shm_handle) {
+    if (!g_3d_ready) return -EINVAL;
+    if (!find_ctx(pid, ctx_id)) return -ESRCH;
+
+    struct vg3d_res *r = 0;
+    for (int i = 0; i < VG3D_RES_MAX; i++) {
+        if (g_res_tab[i].id == res_id && g_res_tab[i].pid == pid) {
+            r = &g_res_tab[i]; break;
+        }
+    }
+    if (!r) return -ESRCH;
+    if (r->kind != GPU_RES_KIND_IMAGE2D) return -EINVAL;
+
+    /* Resolve shm_handle -> window_id BEFORE any work so a bad handle
+     * short-circuits. shm_handle and window_id are decoupled IDs. */
+    uint32_t window_id = compositor_find_window_by_shm(shm_handle);
+    if (!window_id) return -EINVAL;
+
+    void *dst = shm_map(shm_handle);
+    if (!dst) return -EINVAL;
+
+    /* Wave 1: CPU memcpy — qword pass then byte tail for sz % 8.
+     * Wave 2 replaces with GPU-side transfer_to_host_3d + blob alias
+     * when sizes match. */
+    uint64_t sz = r->size;
+    uint64_t qwords = sz >> 3;
+    volatile uint64_t       *d64 = (volatile uint64_t *)dst;
+    const volatile uint64_t *s64 = (const volatile uint64_t *)r->backing_va;
+    for (uint64_t i = 0; i < qwords; i++) d64[i] = s64[i];
+    volatile uint8_t       *d8 = (volatile uint8_t *)dst;
+    const volatile uint8_t *s8 = (const volatile uint8_t *)r->backing_va;
+    for (uint64_t i = qwords << 3; i < sz; i++) d8[i] = s8[i];
+
+    compositor_signal_dirty(window_id);
+    return 0;
 }
 void vg3d_cleanup_process(uint32_t pid) {
+    for (int i = 0; i < VG3D_RES_MAX; i++) {
+        if (g_res_tab[i].id && g_res_tab[i].pid == pid)
+            (void)vg3d_release_res(&g_res_tab[i]);
+    }
     for (int i = 0; i < VG3D_CTX_MAX; i++) {
         if (g_ctx_tab[i].id && g_ctx_tab[i].pid == pid) {
             (void)vg3d_host_ctx_destroy(g_ctx_tab[i].id);
             g_ctx_tab[i].id = 0;
             g_ctx_tab[i].pid = 0;
             g_ctx_tab[i].flags = 0;
-        }
-    }
-    for (int i = 0; i < VG3D_RES_MAX; i++) {
-        if (g_res_tab[i].id && g_res_tab[i].pid == pid) {
-            if (g_res_tab[i].blob) {
-                (void)vg3d_host_res_unmap_blob(g_res_tab[i].id);
-                (void)vg3d_host_res_unref(g_res_tab[i].id);
-            } else {
-                uint64_t pages = (g_res_tab[i].size + 4095) >> 12;
-                /* mem_free_pages expects phys (same contract as
-                 * mem_alloc_pages); backing_phys cached at create time. */
-                mem_free_pages((void *)g_res_tab[i].backing_phys, pages);
-            }
-            g_res_tab[i].id = 0;
-            g_res_tab[i].ctx_id = 0;
-            g_res_tab[i].pid = 0;
-            g_res_tab[i].size = 0;
-            g_res_tab[i].backing_va = 0;
-            g_res_tab[i].backing_phys = 0;
-            g_res_tab[i].hostmem_offset = 0;
-            g_res_tab[i].map_info = 0;
-            g_res_tab[i].blob = false;
         }
     }
 }
@@ -995,7 +873,15 @@ static void vg3d_t5_res(void) {
 }
 
 void virtio_gpu_3d_selftest(void) {
-    serial_puts(g_3d_ready
-        ? "[VG3D-TEST] official protocol round-trip OK\n"
-        : "[VG3D-TEST] official protocol round-trip unavailable\n");
+    serial_puts("[VG3D] selftest begin\n");
+    vg3d_t2_skeleton();
+    vg3d_t3_virgl();
+    vg3d_t4_ctx();
+    vg3d_t5_res();
+    vg3d_t6_submit();
+    vg3d_t7_fence();
+    vg3d_t8_present();
+    vg3d_t9_caps();
+    /* Later tasks append more markers here. */
+    serial_puts("[VG3D] selftest end\n");
 }

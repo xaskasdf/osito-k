@@ -15,7 +15,7 @@ extern void serial_puts(const char *s);
 extern void serial_putdec(uint64_t val);
 extern void serial_puthex(uint64_t val, int digits);
 extern void *mem_alloc_aligned(uint64_t size, uint64_t alignment);
-extern void  mem_free_pages(void *addr, uint64_t count);
+extern void mem_free_pages(void *addr, uint64_t count);
 
 /* ── Block Device Interface ──────────────────────────────────── */
 
@@ -237,31 +237,61 @@ int disk_write_bytes(uint64_t byte_offset, const void *buf, uint64_t len)
         return -1;
     }
 
-    uint32_t ssz = d->sector_size;
-    if (ssz > 8192) return -1;
+    uint64_t device_bytes = d->sector_count * (uint64_t)d->sector_size;
+    if ((!buf && len) || byte_offset > device_bytes ||
+        len > device_bytes - byte_offset)
+        return -1;
+    if (!len) return 0;
 
     const uint8_t *src = (const uint8_t *)buf;
     uint64_t off  = byte_offset;
     uint64_t left = len;
-    void *tmp_phys = mem_alloc_aligned(8192, 4096);
-    if (!tmp_phys) return -1;
-    uint8_t *tmp = (uint8_t *)PHYS_TO_VIRT(tmp_phys);
+    uint32_t ssz = d->sector_size;
+    if (ssz > 8192) return -1;
+    void *tmp_phys = NULL;
+    uint8_t *tmp = NULL;
+    int result = 0;
 
     while (left > 0) {
         uint64_t lba   = off / ssz;
         uint32_t intra = (uint32_t)(off % ssz);
-        uint32_t want  = (uint32_t)((left < (8192 - intra))
-                                    ? left : (8192 - intra));
+
+        if (d->type == BLKDEV_NVME && intra == 0 && left >= ssz) {
+            uint64_t sector_count = left / ssz;
+            if (sector_count > UINT32_MAX) sector_count = UINT32_MAX;
+            uint64_t direct_bytes = sector_count * ssz;
+            if (d->write(lba, (uint32_t)sector_count, src) < 0) {
+                serial_puts("[BLK] disk_write_bytes: direct write failed lba=");
+                serial_putdec(lba);
+                serial_puts("\n");
+                result = -1;
+                goto out;
+            }
+            src += direct_bytes;
+            off += direct_bytes;
+            left -= direct_bytes;
+            continue;
+        }
+
+        if (!tmp_phys) {
+            tmp_phys = mem_alloc_aligned(8192, 4096);
+            if (!tmp_phys) return -1;
+            tmp = (uint8_t *)PHYS_TO_VIRT(tmp_phys);
+        }
+        uint32_t want  = (uint32_t)((left < (8192U - intra))
+                                    ? left : (8192U - intra));
         uint32_t sectors = (intra + want + ssz - 1) / ssz;
 
         /* Partial writes require the original boundary-sector bytes. If
          * that read fails, abort rather than manufacturing zero metadata. */
         bool partial = (intra != 0) || ((intra + want) % ssz != 0);
         if (partial) {
-            if (d->read(lba, sectors, tmp_phys) < 0) {
-                /* Unread → assume zero-fill. Only the bytes outside
-                 * [intra..intra+want] matter; we'll overwrite the rest. */
-                for (uint32_t i = 0; i < sectors * ssz; i++) tmp[i] = 0;
+            if (d->read(lba, sectors, tmp) < 0) {
+                serial_puts("[BLK] disk_write_bytes: prerequisite read failed lba=");
+                serial_putdec(lba);
+                serial_puts("\n");
+                result = -1;
+                goto out;
             }
         }
 
@@ -270,16 +300,17 @@ int disk_write_bytes(uint64_t byte_offset, const void *buf, uint64_t len)
             serial_puts("[BLK] disk_write_bytes: write failed lba=");
             serial_putdec(lba);
             serial_puts("\n");
-            mem_free_pages(tmp_phys, 2);
-            return -1;
+            result = -1;
+            goto out;
         }
 
         src  += want;
         off  += want;
         left -= want;
     }
-    mem_free_pages(tmp_phys, 2);
-    return 0;
+out:
+    if (tmp_phys) mem_free_pages(tmp_phys, 2);
+    return result;
 }
 
 /*
@@ -317,27 +348,57 @@ int disk_read_bytes(uint64_t byte_offset, void *buf, uint64_t len)
     blkdev_t *d = &devices[active_dev];
     if (!d->active || !d->read || d->sector_size == 0) return -1;
 
-    uint32_t ssz   = d->sector_size;
-    if (ssz > 8192)             /* defensive — 4 KB sectors fit */
+    uint64_t device_bytes = d->sector_count * (uint64_t)d->sector_size;
+    if ((!buf && len) || byte_offset > device_bytes ||
+        len > device_bytes - byte_offset)
         return -1;
+    if (!len) return 0;
 
     uint8_t *dst   = (uint8_t *)buf;
     uint64_t off   = byte_offset;
     uint64_t left  = len;
-    void *tmp_phys = mem_alloc_aligned(8192, 4096);
-    if (!tmp_phys) return -1;
-    uint8_t *tmp = (uint8_t *)PHYS_TO_VIRT(tmp_phys);
+    /* Use physically backed direct-map memory for DMA. Kernel stacks are
+     * not guaranteed to be physically contiguous across two pages. */
+    uint32_t ssz   = d->sector_size;
+    if (ssz > 8192) return -1;
+    void *tmp_phys = NULL;
+    uint8_t *tmp = NULL;
+    int result = 0;
 
     while (left > 0) {
         uint64_t lba    = off / ssz;
         uint32_t intra  = (uint32_t)(off % ssz);
-        uint32_t want   = (uint32_t)((left < (8192 - intra))
-                                     ? left : (8192 - intra));
+
+        if (d->type == BLKDEV_NVME && intra == 0 && left >= ssz) {
+            uint64_t sector_count = left / ssz;
+            if (sector_count > UINT32_MAX) sector_count = UINT32_MAX;
+            uint64_t direct_bytes = sector_count * ssz;
+            if (d->read(lba, (uint32_t)sector_count, dst) < 0) {
+                result = -1;
+                break;
+            }
+            extern void nvme_debug_watch_cpu_write(void *, uint64_t,
+                                                    const char *);
+            nvme_debug_watch_cpu_write(dst, direct_bytes,
+                                       "disk_read_bytes-direct");
+            dst += direct_bytes;
+            off += direct_bytes;
+            left -= direct_bytes;
+            continue;
+        }
+
+        if (!tmp_phys) {
+            tmp_phys = mem_alloc_aligned(8192, 4096);
+            if (!tmp_phys) return -1;
+            tmp = (uint8_t *)PHYS_TO_VIRT(tmp_phys);
+        }
+        uint32_t want   = (uint32_t)((left < (8192U - intra))
+                                     ? left : (8192U - intra));
         uint32_t sectors = (intra + want + ssz - 1) / ssz;
 
-        if (d->read(lba, sectors, tmp_phys) < 0) {
-            mem_free_pages(tmp_phys, 2);
-            return -1;
+        if (d->read(lba, sectors, tmp) < 0) {
+            result = -1;
+            break;
         }
 
         extern void nvme_debug_watch_cpu_write(void *, uint64_t, const char *);
@@ -347,8 +408,8 @@ int disk_read_bytes(uint64_t byte_offset, void *buf, uint64_t len)
         off  += want;
         left -= want;
     }
-    mem_free_pages(tmp_phys, 2);
-    return 0;
+    if (tmp_phys) mem_free_pages(tmp_phys, 2);
+    return result;
 }
 
 /* ── List all devices ────────────────────────────────────────── */

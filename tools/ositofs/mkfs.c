@@ -17,9 +17,10 @@
 
 static void usage(void)
 {
-    fprintf(stderr, "Usage: mkfs.ositofs <device> [--label <name>] [--block-size <bytes>] [--max-files <4096|16384>]\n");
+    fprintf(stderr, "Usage: mkfs.ositofs <device> [--label <name>] [--block-size <bytes>] [--file-slots <count>]\n");
     fprintf(stderr, "  --block-size: data block size (64K..1M, power of 2, default 1M)\n");
-    fprintf(stderr, "  --file-slots: file table entries (4096..61440, multiple of 4096, default 16384)\n");
+    fprintf(stderr, "  --file-slots: 4096..61440, multiple of 4096 (default 16384)\n");
+    fprintf(stderr, "  --max-files: legacy alias for --file-slots\n");
     exit(1);
 }
 
@@ -35,7 +36,9 @@ int main(int argc, char **argv)
             label = argv[++i];
         } else if (strcmp(argv[i], "--block-size") == 0 && i + 1 < argc) {
             block_size = (uint32_t)strtoul(argv[++i], NULL, 0);
-        } else if (strcmp(argv[i], "--file-slots") == 0 && i + 1 < argc) {
+        } else if ((strcmp(argv[i], "--file-slots") == 0 ||
+                    strcmp(argv[i], "--max-files") == 0) &&
+                   i + 1 < argc) {
             file_slots = (uint32_t)strtoul(argv[++i], NULL, 0);
         } else if (argv[i][0] != '-') {
             device = argv[i];
@@ -58,6 +61,8 @@ int main(int argc, char **argv)
         return 1;
     }
 
+    uint32_t version = OSFS2_VERSION;
+
     /* Set runtime block size before any allocations */
     osfs2_block_sz = block_size;
 
@@ -67,11 +72,19 @@ int main(int argc, char **argv)
     uint64_t dev_size = osfs2_device_size(fd);
     uint32_t shift = osfs2_block_shift(block_size);
     uint32_t total_blocks = (uint32_t)(dev_size >> shift);
-    uint32_t data_off = osfs2_layout_data_off_for_slots(file_slots);
     uint32_t filetab_size = osfs2_layout_filetab_size_for_slots(file_slots);
     uint32_t crctab_off = osfs2_layout_crctab_off_for_slots(file_slots);
     uint32_t layeridx_off = osfs2_layout_layeridx_off_for_slots(file_slots);
-    uint32_t data_start = osfs2_layout_data_start_blk_for_slots(block_size, file_slots);
+    uint32_t data_off = osfs2_layout_data_off_for_slots(file_slots);
+    uint32_t data_start =
+        osfs2_layout_data_start_blk_for_slots(block_size, file_slots);
+
+    osfs2_file_capacity = file_slots;
+    osfs2_filetab_size = filetab_size;
+    osfs2_crctab_offset = crctab_off;
+    osfs2_layeridx_offset = layeridx_off;
+    osfs2_crc_table_enabled = 1;
+    osfs2_layer_index_enabled = 1;
 
     if (total_blocks < data_start + 1) {
         fprintf(stderr, "mkfs: device too small (need at least %u blocks for metadata + 1 data, have %u)\n",
@@ -88,12 +101,14 @@ int main(int argc, char **argv)
            total_blocks - data_start, data_start);
     printf("  File slots:   %u\n", file_slots);
     printf("  Label: %s\n", label);
-    printf("  File slots: %u\n", OSFS2_MAX_FILES);
 
     uint32_t meta_size = filetab_size;
-    if (meta_size < OSFS2_SUPER_REGION_SIZE) meta_size = OSFS2_SUPER_REGION_SIZE;
-    if (meta_size < OSFS2_CRCTAB_SIZE) meta_size = OSFS2_CRCTAB_SIZE;
-    if (meta_size < OSFS2_LAYERIDX_SIZE) meta_size = OSFS2_LAYERIDX_SIZE;
+    if (meta_size < OSFS2_SUPER_REGION_SIZE)
+        meta_size = OSFS2_SUPER_REGION_SIZE;
+    if (meta_size < OSFS2_CRCTAB_SIZE)
+        meta_size = OSFS2_CRCTAB_SIZE;
+    if (meta_size < OSFS2_LAYERIDX_SIZE)
+        meta_size = OSFS2_LAYERIDX_SIZE;
 
     void *meta = osfs2_alloc_aligned(meta_size);
     if (!meta) { osfs2_close_device(fd); return 1; }
@@ -130,21 +145,30 @@ int main(int argc, char **argv)
         goto fail;
     printf("  [OK] File table written (%u slots)\n", file_slots);
 
-    /* ── CRC Table (zeroed) ──────────────────────────────────── */
-    if (osfs2_write_bytes(fd, crctab_off, meta, OSFS2_CRCTAB_SIZE) < 0)
-        goto fail;
-    printf("  [OK] Block CRC table written\n");
+    /* ── CRC Table at offset 2MB (zeroed) ────────────────────── */
+    if (osfs2_crc_table_enabled) {
+        if (osfs2_write_bytes(fd, crctab_off, meta,
+                              OSFS2_CRCTAB_SIZE) < 0)
+            goto fail;
+        printf("  [OK] Block CRC table written\n");
+    }
 
-    /* ── Layer Index (zeroed) ────────────────────────────────── */
-    if (osfs2_write_bytes(fd, layeridx_off, meta, OSFS2_LAYERIDX_SIZE) < 0)
-        goto fail;
-    printf("  [OK] Layer index written (%u slots)\n", OSFS2_MAX_MODELS);
+    /* ── Layer Index at offset 3MB (zeroed) ──────────────────── */
+    if (osfs2_layer_index_enabled) {
+        if (osfs2_write_bytes(fd, layeridx_off, meta,
+                              OSFS2_LAYERIDX_SIZE) < 0)
+            goto fail;
+        printf("  [OK] Layer index written (%u slots)\n", OSFS2_MAX_MODELS);
+    } else {
+        printf("  [OK] Large-file layout (layer index disabled)\n");
+    }
 
     printf("\nFormatting complete. Metadata overhead: ");
     osfs2_print_size(data_off);
     printf(" / ");
     osfs2_print_size(dev_size);
-    printf(" (%.2f%%)\n", 100.0 * data_off / dev_size);
+    printf(" (%.2f%%)\n",
+           100.0 * data_off / dev_size);
 
     free(meta);
     osfs2_close_device(fd);

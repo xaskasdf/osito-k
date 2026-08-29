@@ -82,10 +82,10 @@ static int blkmap_build(const osfs2_file_t *ft, uint32_t max_files,
 
 static void recompute_super(osfs2_super_t *sb, const osfs2_file_t *ft)
 {
-    uint32_t data_start = osfs2_format_data_start_blk(sb->version,
-                                                       sb->block_size);
+    uint32_t data_start = osfs2_layout_data_start_blk(sb);
+    uint32_t max_files = osfs2_layout_max_files(sb);
     uint32_t files = 0, used = data_start, hwm = data_start;
-    for (uint32_t i = 0; i < OSFS2_MAX_FILES; i++) {
+    for (uint32_t i = 0; i < max_files; i++) {
         if (!(ft[i].flags & OSFS2_FLAG_VALID)) continue;
         files++;
         if (!(ft[i].flags & OSFS2_FLAG_INLINE) && ft[i].block_count) {
@@ -108,32 +108,6 @@ typedef struct {
     int is_gguf;
     gguf_model_info_t model_info;
 } write_job_t;
-
-static int copy_stored_name(char dst[OSFS2_MODEL_NAME_LEN],
-                            const char *src, const char *context)
-{
-    size_t len = strlen(src);
-    if (len >= OSFS2_MODEL_NAME_LEN) {
-        fprintf(stderr,
-                "ositofs-write: %s name '%s' is too long (max %u bytes)\n",
-                context, src, OSFS2_MODEL_NAME_LEN - 1);
-        return -1;
-    }
-    memcpy(dst, src, len + 1);
-    return 0;
-}
-
-static int file_name_matches(const osfs2_file_t *f, const char *name)
-{
-    if (strcmp(f->name, name) == 0)
-        return 1;
-    if (!(f->flags & OSFS2_FLAG_GGUF) &&
-        !(f->flags & OSFS2_FLAG_INLINE) &&
-        f->model_name[0] &&
-        strcmp(f->model_name, name) == 0)
-        return 1;
-    return 0;
-}
 
 static void usage(void)
 {
@@ -245,17 +219,26 @@ static int parse_manifest(const char *path, write_job_t *jobs, int *count, int m
             size_t slen = strlen(stored);
             while (slen > 0 && (stored[slen - 1] == ' ' || stored[slen - 1] == '\t'))
                 stored[--slen] = '\0';
-            if (copy_stored_name(j->stored_name, stored, "stored") < 0) {
+            if (strlen(stored) >= sizeof(j->stored_name)) {
+                fprintf(stderr,
+                        "ositofs-write: manifest %s:%d: stored name too long (max %d chars)\n",
+                        path, lineno, OSFS2_MODEL_NAME_LEN - 1);
                 fclose(fp);
                 return -1;
             }
+            strcpy(j->stored_name, stored);
         } else {
             char *tmp = strdup(local);
-            if (copy_stored_name(j->stored_name, basename(tmp), "stored") < 0) {
+            const char *base = basename(tmp);
+            if (strlen(base) >= sizeof(j->stored_name)) {
+                fprintf(stderr,
+                        "ositofs-write: manifest %s:%d: basename too long (max %d chars)\n",
+                        path, lineno, OSFS2_MODEL_NAME_LEN - 1);
                 free(tmp);
                 fclose(fp);
                 return -1;
             }
+            strcpy(j->stored_name, base);
             free(tmp);
         }
 
@@ -411,17 +394,24 @@ int main(int argc, char **argv)
         j->file_size = (uint64_t)st.st_size;
 
         if (name_override) {
-            if (copy_stored_name(j->stored_name, name_override, "stored") < 0) {
+            if (strlen(name_override) >= sizeof(j->stored_name)) {
+                fprintf(stderr, "ositofs-write: stored name too long (max %d chars)\n",
+                        OSFS2_MODEL_NAME_LEN - 1);
                 free(jobs);
                 return 1;
             }
+            strcpy(j->stored_name, name_override);
         } else {
             char *tmp = strdup(pos_files[i]);
-            if (copy_stored_name(j->stored_name, basename(tmp), "stored") < 0) {
+            const char *base = basename(tmp);
+            if (strlen(base) >= sizeof(j->stored_name)) {
+                fprintf(stderr, "ositofs-write: basename too long (max %d chars)\n",
+                        OSFS2_MODEL_NAME_LEN - 1);
                 free(tmp);
                 free(jobs);
                 return 1;
             }
+            strcpy(j->stored_name, base);
             free(tmp);
         }
 
@@ -506,7 +496,9 @@ int main(int argc, char **argv)
 
     void *crc_blk = osfs2_alloc_aligned(OSFS2_CRCTAB_SIZE);
     if (!crc_blk) goto fail;
-    if (osfs2_read_bytes(fd, crctab_off, crc_blk, OSFS2_CRCTAB_SIZE) < 0)
+    if (osfs2_crc_table_enabled &&
+        osfs2_read_bytes(fd, crctab_off, crc_blk,
+                         OSFS2_CRCTAB_SIZE) < 0)
         goto fail_crc;
     if (!osfs2_crc_table_enabled)
         memset(crc_blk, 0, OSFS2_CRCTAB_SIZE);
@@ -533,7 +525,7 @@ int main(int argc, char **argv)
             } else {
                 li = (osfs2_layer_idx_t *)li_blk;
                 uint8_t referenced[OSFS2_MAX_MODELS] = {0};
-                for (uint32_t fi = 0; fi < OSFS2_MAX_FILES; fi++)
+                for (uint32_t fi = 0; fi < max_files; fi++)
                     if ((ft[fi].flags & (OSFS2_FLAG_VALID | OSFS2_FLAG_GGUF)) ==
                             (OSFS2_FLAG_VALID | OSFS2_FLAG_GGUF) &&
                         ft[fi].layer_index_slot < OSFS2_MAX_MODELS)
@@ -566,7 +558,7 @@ int main(int argc, char **argv)
         int exists = 0;
         for (uint32_t fi = 0; fi < max_files; fi++) {
             if ((ft[fi].flags & OSFS2_FLAG_VALID) &&
-                file_name_matches(&ft[fi], jobs[i].stored_name)) {
+                strcmp(osfs2_entry_name(&ft[fi]), jobs[i].stored_name) == 0) {
                 if (!overwrite) {
                     fprintf(stderr, "ositofs-write: file '%s' already exists (use --overwrite to replace)\n",
                             jobs[i].stored_name);
@@ -609,44 +601,19 @@ int main(int argc, char **argv)
         else
             printf("  Blocks needed: %u\n", blocks_needed);
 
-        /* Handle overwrite: delete existing in-memory */
+        int existing_idx = -1;
         for (uint32_t fi = 0; fi < max_files; fi++) {
             if ((ft[fi].flags & OSFS2_FLAG_VALID) &&
-                file_name_matches(&ft[fi], job->stored_name)) {
-                printf("  Overwriting '%s' (freeing %u blocks)\n",
-                       job->stored_name, ft[fi].block_count);
-                uint32_t old_blocks = ft[fi].block_count;
-                uint32_t old_top = ft[fi].start_block + old_blocks;
-
-                /* Release the old extent in the live bitmap so it can be reused. */
-                for (uint32_t b = 0; b < old_blocks; b++)
-                    blkmap_clear(ft[fi].start_block + b);
-
-                /* Free layer index slot if GGUF */
-                if (li && ft[fi].layer_index_slot != 0xFFFF &&
-                    ft[fi].layer_index_slot < OSFS2_MAX_MODELS) {
-                    li[ft[fi].layer_index_slot].num_layers = 0;
-                }
-
-                ft[fi].flags = 0;
-                if (sb.file_count > 0) sb.file_count--;
-                sb.used_blocks -= old_blocks;
-
-                /* Reclaim if this was the topmost allocation */
-                if (old_top == sb.next_data_block) {
-                    uint32_t hwm = data_start_blk;
-                    for (uint32_t j = 0; j < max_files; j++) {
-                        if (!(ft[j].flags & OSFS2_FLAG_VALID)) continue;
-                        uint32_t end = ft[j].start_block + ft[j].block_count;
-                        if (end > hwm) hwm = end;
-                    }
-                    sb.next_data_block = hwm;
-                }
+                strcmp(osfs2_entry_name(&ft[fi]), job->stored_name) == 0) {
+                existing_idx = (int)fi;
+                printf("  Replacing '%s' with copy-on-write (%u old blocks)\n",
+                        job->stored_name, ft[fi].block_count);
                 break;
             }
         }
 
         uint32_t start_block = 0;
+        uint32_t file_crc = 0;
 
         if (blocks_needed > 0) {
             /* Allocate a contiguous run from the live-extent bitmap (first-fit).
@@ -682,32 +649,31 @@ int main(int argc, char **argv)
                 blkmap_set(start_block + b);
 
             printf("  Writing %u data blocks starting at block %u...\n", blocks_needed, start_block);
-        } else {
-            printf("  Writing empty file metadata only...\n");
-        }
 
-        /* Write data blocks */
-        uint32_t file_crc = 0;
-        if (blocks_needed > 0) {
+            /* Write data blocks */
             if (write_data_blocks(fd, job, start_block, blocks_needed, bs,
                                   crc_table, &file_crc, ji, job_count) < 0) {
                 fprintf(stderr, "ositofs-write: failed to write data for '%s', skipping\n",
                         job->stored_name);
+                for (uint32_t b = 0; b < blocks_needed; b++)
+                    blkmap_clear(start_block + b);
                 exit_code = 1;
                 continue;
             }
+        } else {
+            printf("  Empty file: no data blocks\n");
         }
 
         /* Find a free file table slot */
-        uint32_t file_idx = max_files; /* sentinel */
-        /* First: look for freed (invalid) slot within current range */
-        for (uint32_t fi = 0; fi < max_files; fi++) {
-            if (!(ft[fi].flags & OSFS2_FLAG_VALID)) {
-                /* Check it's either within file_count or at file_count (append) */
-                file_idx = fi;
-                break;
+        uint32_t file_idx = existing_idx >= 0
+            ? (uint32_t)existing_idx : max_files;
+        if (existing_idx < 0)
+            for (uint32_t fi = 0; fi < max_files; fi++) {
+                if (!(ft[fi].flags & OSFS2_FLAG_VALID)) {
+                    file_idx = fi;
+                    break;
+                }
             }
-        }
         if (file_idx == max_files) {
             fprintf(stderr, "ositofs-write: file table full, skipping '%s'\n", job->stored_name);
             for (uint32_t b = 0; b < blocks_needed; b++)
@@ -736,13 +702,6 @@ int main(int argc, char **argv)
         new_entry.layer_index_slot = 0xFFFF;
         new_entry.create_time = (uint32_t)time(NULL);
         new_entry.modify_time = new_entry.create_time;
-
-        /* Long raw filenames are stored as a compatibility alias in the
-         * otherwise-unused model_name field. The fixed name[64] field remains
-         * the hash key for older tools and existing images. */
-        if (!job->is_gguf && strlen(job->stored_name) >= OSFS2_NAME_LEN)
-            strncpy(ft[file_idx].model_name, job->stored_name,
-                    OSFS2_MODEL_NAME_LEN - 1);
 
         /* GGUF metadata */
         if (job->is_gguf) {
@@ -773,41 +732,69 @@ int main(int argc, char **argv)
             }
         }
 
-        /* Update superblock in-memory. next_data_block is a high-water-mark
-         * hint: only RAISE it (first-fit may place a file below the current
-         * top, which must not lower the hint). */
-        if (blocks_needed > 0 && start_block + blocks_needed > sb.next_data_block)
-            sb.next_data_block = start_block + blocks_needed;
+        osfs2_super_t before_sb = sb;
+        ft[file_idx] = new_entry;
+        osfs2_super_t after_sb = sb;
+        recompute_super(&after_sb, ft);
 
-        if (blocks_needed > 0) {
+        /* Side metadata and staged data must be durable before the entry that
+         * exposes them is committed. Stale CRC/layer slots are harmless if an
+         * uncommitted operation is interrupted. */
+        if ((osfs2_crc_table_enabled &&
+             osfs2_write_bytes(fd, crctab_off, crc_blk,
+                               OSFS2_CRCTAB_SIZE) < 0) ||
+            (li_blk && osfs2_write_bytes(fd, layeridx_off, li_blk,
+                                         OSFS2_LAYERIDX_SIZE) < 0) ||
+            osfs2_sync(fd) < 0) {
+            ft[file_idx] = old_entry;
+            for (uint32_t b = 0; b < blocks_needed; b++)
+                blkmap_clear(start_block + b);
+            fprintf(stderr, "ositofs-write: failed to stage metadata for '%s'\n",
+                    job->stored_name);
+            exit_code = 1;
+            continue;
+        }
+
+        uint32_t slots[OSFS2_JOURNAL_MAX_ENTRIES] = { file_idx, 0 };
+        osfs2_file_t before[OSFS2_JOURNAL_MAX_ENTRIES] = { old_entry };
+        osfs2_file_t after[OSFS2_JOURNAL_MAX_ENTRIES] = { new_entry };
+        if (osfs2_journal_commit_entries(fd, OSFS2_JOURNAL_OP_REPLACE,
+                &before_sb, &after_sb, slots, before, after, 1) < 0) {
+            fprintf(stderr, "ositofs-write: journaled commit failed for '%s'\n",
+                    job->stored_name);
+            exit_code = 1;
+            break;
+        }
+        sb = after_sb;
+
+        if ((old_entry.flags & OSFS2_FLAG_VALID) && old_entry.block_count) {
+            for (uint32_t b = 0; b < old_entry.block_count; b++) {
+                blkmap_clear(old_entry.start_block + b);
+                if (old_entry.start_block + b < OSFS2_MAX_BLOCKS)
+                    crc_table[old_entry.start_block + b] = 0;
+            }
+        }
+        if (li && (old_entry.flags & OSFS2_FLAG_GGUF) &&
+            old_entry.layer_index_slot != 0xFFFF &&
+            old_entry.layer_index_slot < OSFS2_MAX_MODELS &&
+            old_entry.layer_index_slot != new_entry.layer_index_slot)
+            memset(&li[old_entry.layer_index_slot], 0,
+                   sizeof(osfs2_layer_idx_t));
+
+        if (blocks_needed > 0)
             printf("  [OK] '%s' written: blocks %u-%u, CRC 0x%08X\n",
                    job->stored_name, start_block, start_block + blocks_needed - 1, file_crc);
-        } else {
+        else
             printf("  [OK] '%s' written: empty file, CRC 0x%08X\n",
                    job->stored_name, file_crc);
-        }
         success_count++;
     }
 
-    /* Recompute used_blocks from the authoritative bitmap (metadata + every
-     * reserved data block) so the superblock stays consistent regardless of
-     * first-fit placement. */
-    {
-        uint32_t used = 0;
-        for (uint32_t b = 0; b < sb.total_blocks; b++)
-            if (blkmap_test(b)) used++;
-        sb.used_blocks = used;
-
-        uint32_t actual_files = 0;
-        for (uint32_t fi = 0; fi < max_files; fi++)
-            if (ft[fi].flags & OSFS2_FLAG_VALID) actual_files++;
-        sb.file_count = actual_files;
-    }
-
-    /* ── Flush all metadata once ────────────────────────────────── */
+    /* Remove stale side metadata left by successfully replaced extents. */
     if (success_count > 0) {
-        /* Write CRC table */
-        if (osfs2_write_bytes(fd, crctab_off, crc_blk, OSFS2_CRCTAB_SIZE) < 0) {
+        if (osfs2_crc_table_enabled &&
+            osfs2_write_bytes(fd, crctab_off, crc_blk,
+                              OSFS2_CRCTAB_SIZE) < 0) {
             fprintf(stderr, "ositofs-write: failed to write CRC table\n");
             goto fail_li;
         }
@@ -817,26 +804,7 @@ int main(int argc, char **argv)
                 goto fail_li;
             }
         }
-
-        /* Write file table */
-        if (osfs2_write_bytes(fd, OSFS2_FILETAB_OFF, ft_blk, filetab_size) < 0) {
-            fprintf(stderr, "ositofs-write: failed to write file table\n");
-            goto fail_li;
-        }
-
-        /* Write superblock + backup */
-        void *sb_blk = osfs2_alloc_aligned(4096);
-        if (!sb_blk) goto fail_li;
-        memcpy(sb_blk, &sb, sizeof(sb));
-        osfs2_super_t *sb_ptr = (osfs2_super_t *)sb_blk;
-        sb_ptr->crc32 = 0;
-        sb_ptr->crc32 = osfs2_crc32(sb_ptr, sizeof(*sb_ptr));
-        if (osfs2_write_bytes(fd, 0, sb_blk, 4096) < 0) {
-            free(sb_blk);
-            goto fail_li;
-        }
-        osfs2_write_bytes(fd, OSFS2_SUPER_BACKUP_OFF, sb_blk, 4096);
-        free(sb_blk);
+        if (osfs2_sync(fd) < 0) goto fail_li;
 
         if (job_count > 1) {
             printf("\nBatch complete: %d/%d files written successfully\n",

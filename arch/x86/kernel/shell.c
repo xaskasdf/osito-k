@@ -51,11 +51,11 @@ extern void boot_diag_flush(const char *reason) __attribute__((weak));
 
 static void shell_reset_win32_state(void)
 {
-    extern int g_compat32_mode;
+    extern int *proc_win32_compat32_mode_slot(void);
     extern void *user32_shim_init(void);
     extern void *ddraw_shim_init(void);
 
-    g_compat32_mode = 0;
+    *proc_win32_compat32_mode_slot() = 0;
     user32_shim_init();
     ddraw_shim_init();
 }
@@ -6432,10 +6432,9 @@ q4kgdone:
             extern const char *osfs2_file_name(void *file);
             extern uint64_t osfs2_file_size(void *file);
             extern uint32_t osfs2_max_files(void);
-            uint32_t max_files = osfs2_max_files();
             int count = 0;
-            for (uint32_t i = 0; i < max_files; i++) {
-                void *f = osfs2_get_file((int)i);
+            for (uint32_t i = 0; i < osfs2_max_files(); i++) {
+                void *f = osfs2_get_file(i);
                 if (!f) continue;
                 const char *nm = osfs2_file_name(f);
                 if (!nm) continue;
@@ -7295,16 +7294,29 @@ q4kgdone:
                 else        win32_exec_args(fn, argc - 1,
                                             (const char **)&argv[1]);
             } else {
-                winexec_crashed = 1;
-                sh_diag_mark("winexec-crash-return");
-                sh_puts("\n [WIN32] Process crashed — returned to shell\n");
+                if (winexec_reason == 2) {
+                    extern int32_t win32_last_exit_code;
+                    sh_puts("\n [WIN32] Process exited with code ");
+                    sh_putdec((uint64_t)(uint32_t)win32_last_exit_code);
+                    sh_puts("\n");
+                } else {
+                    winexec_crashed = 1;
+                    sh_diag_mark("winexec-crash-return");
+                    sh_puts("\n [WIN32] Process crashed — returned to shell\n");
+                }
                 /* Restore IST1 after longjmp — the compat32 exception path
                  * bypasses int2e_stub's IST1 restore, leaving it corrupted.
                  * Without this, the next IST1 interrupt loads RSP=0. */
-                extern uint64_t *tss_ist1_ptr;
-                extern uint8_t ist1_stack[];
-                if (tss_ist1_ptr)
-                    *tss_ist1_ptr = (uint64_t)(ist1_stack + 262144);
+                extern void x86_tss_reset_ist1(void);
+                x86_tss_reset_ist1();
+                /* Reset compat32 mode flag */
+                extern int *proc_win32_compat32_mode_slot(void);
+                *proc_win32_compat32_mode_slot() = 0;
+                /* Exception gates and Win32 syscall exits clear IF. Their
+                 * longjmp recovery bypasses IRET/SYSRET, so restore the
+                 * shell's interrupt-enabled execution contract here after
+                 * its scheduler and compatibility state is coherent. */
+                sh_sti();
             }
             shell_reset_win32_state();
             compat32_crash_jmpbuf = NULL;
@@ -7340,10 +7352,11 @@ q4kgdone:
                 else        sh_puts(" [MSI] install complete\n");
             } else {
                 sh_puts("\n [WIN32] Installer crashed — returned to shell\n");
-                extern uint64_t *tss_ist1_ptr;
-                extern uint8_t ist1_stack[];
-                if (tss_ist1_ptr)
-                    *tss_ist1_ptr = (uint64_t)(ist1_stack + 262144);
+                extern void x86_tss_reset_ist1(void);
+                x86_tss_reset_ist1();
+                extern int *proc_win32_compat32_mode_slot(void);
+                *proc_win32_compat32_mode_slot() = 0;
+                sh_sti();
             }
             shell_reset_win32_state();
             compat32_crash_jmpbuf = NULL;
@@ -7397,26 +7410,22 @@ q4kgdone:
         extern uint32_t  shm_create(uint64_t size, uint32_t flags);
         extern void     *shm_map(uint32_t handle);
 
-        uint32_t *vram = fb_get_vram();
-        uint32_t  w    = fb_get_width();
-        uint32_t  h    = fb_get_height();
-        uint32_t  p    = fb_get_pitch();
-        uint32_t  hz   = 0;
-
+        uint32_t hz = 0;
         if (argc >= 2 && sh_parse_u32(argv[1], &hz) < 0) {
             sh_puts("Usage: desktop [hz]\n");
             return;
         }
 
-        if (display_init(vram, w, h, p, hz) < 0) {
-            sh_puts("ERROR: display_init failed\n");
+        if (!compositor_begin_start()) {
+            compositor_focus_terminal();
+            sh_puts("Desktop already running.\n");
         } else {
             uint32_t *vram = fb_get_vram();
             uint32_t  w    = fb_get_width();
             uint32_t  h    = fb_get_height();
             uint32_t  p    = fb_get_pitch();
 
-            if (display_init(vram, w, h, p, 0) < 0) {
+            if (display_init(vram, w, h, p, hz) < 0) {
                 compositor_abort_start();
                 sh_puts("ERROR: display_init failed\n");
             } else {
@@ -7513,14 +7522,20 @@ q4kgdone:
             fb_redirect(term_px, tw, th, tw);
             fb_clear();                        /* fill surface with background */
 
-            sched_spawn("compositor", compositor_thread);
-            sh_puts("Desktop launched. Compositor running.\n");
-            /* Yield immediately so the compositor's first frame renders
-             * before we return to the shell's input poll. Without this
-             * the compositor remains READY but never gets dispatched
-             * (shell quantum doesn't expire fast enough for the user
-             * to perceive that the desktop has come up). */
-            sched_yield();
+                int compositor_pid = sched_spawn("compositor", compositor_thread);
+                if (compositor_pid < 0) {
+                    compositor_abort_start();
+                    sh_puts("ERROR: compositor spawn failed\n");
+                } else {
+                    sh_puts("Desktop launched. Compositor running.\n");
+                    /* Yield immediately so the compositor's first frame renders
+                     * before we return to the shell's input poll. Without this
+                     * the compositor remains READY but never gets dispatched
+                     * (shell quantum doesn't expire fast enough for the user
+                     * to perceive that the desktop has come up). */
+                    sched_yield();
+                }
+            }
         }
     } else if (strcmp(cmd, "fatls") == 0) {
         extern int fat32_ls(const char *path);
@@ -7740,8 +7755,6 @@ static bool shell_run_autoload_file(void)
 
 void __cold shell_run(void)
 {
-    char line[256];
-
     sh_diag_mark("shell-start");
     sh_puts("\n");
     sh_puts_color("  ____       _ _        _  __\n", 0x00FF8800);
@@ -7771,17 +7784,53 @@ void __cold shell_run(void)
     sh_puts_color(" [wasm32 | 256MB heap]\n\n", 0x00666666);
 #endif
     sh_diag_flush("shell-banner");
-
     sh_diag_mark("shell-autoexec-check");
-    /* GTA5 bring-up: keep this opt-in so normal OsitoFS images still boot to a
-     * quiet shell. Creating diag/autoexec-gta5 in the image triggers the run. */
-    if (osfs2_is_mounted() &&
-        osfs2_find("diag/autoexec-gta5") &&
-        osfs2_find("GTA5.elf")) {
+
+    /* A root marker lets debuggers boot to an idle shell without moving apps. */
+    if (osfs2_is_mounted() && osfs2_find(".noautoload")) {
+        sh_puts(" Auto-launch disabled by /.noautoload\n");
+    }
+    else if (osfs2_is_mounted() && shell_run_autoload_file()) {
+        /* The command file owns autoload selection, including invalid files. */
+    }
+    else if (osfs2_is_mounted() &&
+             osfs2_find("diag/autoexec-gta5") &&
+             osfs2_find("GTA5.elf")) {
         sh_puts(" Auto-launching GTA5.elf...\n");
         sh_diag_mark("autoexec-gta5-start");
         shell_exec("execg GTA5.elf");
         sh_diag_mark("autoexec-gta5-done");
+    }
+    /* Prefer the updated client; retain the bootstrap for incomplete installs. */
+    else if (osfs2_is_mounted() &&
+             osfs2_find("System\\Program Files\\Steam\\steam.exe")) {
+        char steam_cmd[] =
+            "winexec \"System\\Program Files\\Steam\\steam.exe\""
+            " -no-dwrite -cef-disable-breakpad"
+            " -cef-verbose-logging -cef-verbose-js-logging"
+            " -no-cef-sandbox"
+            " -noverifyfiles -nobootstrapupdate -skipinitialbootstrap"
+            " -norepairfiles";
+        shell_ensure_desktop();
+        sh_puts(" Auto-launching Steam.exe...\n");
+        shell_exec(steam_cmd);
+    }
+    else if (osfs2_is_mounted() &&
+             osfs2_find("Program Files\\Steam\\Steam.exe")) {
+        char steam_cmd[] = "winexec \"Program Files\\Steam\\Steam.exe\" -no-dwrite";
+        shell_ensure_desktop();
+        sh_puts(" Auto-launching Steam bootstrap...\n");
+        shell_exec(steam_cmd);
+    }
+    else if (osfs2_is_mounted() && osfs2_find("SteamSetup.exe")) {
+        shell_ensure_desktop();
+        sh_puts(" Auto-launching SteamSetup.exe...\n");
+        shell_exec("winexec SteamSetup.exe /S");
+    }
+    /* Auto-launch the installed application before legacy runtime tests. */
+    else if (osfs2_is_mounted() && osfs2_find("gtav-sp")) {
+        sh_puts(" Auto-launching gtav-sp...\n");
+        shell_exec("exec gtav-sp");
     }
     /* Auto-launch hello_gl.elf if present (W4.10 runtime test) */
     else if (osfs2_is_mounted() && osfs2_find("hello_gl.elf")) {
@@ -7803,11 +7852,13 @@ void __cold shell_run(void)
 
     for (;;) {
         sh_diag_flush("shell-prompt");
-        int len = term_readline("osito> ", line, sizeof(line));
+        char *line = NULL;
+        uint64_t line_len = 0;
+        int status = term_readline_alloc("osito> ", &line, &line_len);
 
-        if (len < 0) {
-            sh_diag_mark("shell-eof");
+        if (status == -1) {
             /* EOF (Ctrl+D) */
+            sh_diag_mark("shell-eof");
             sh_puts("Use 'halt' to stop or 'reboot' to restart.\n");
             sh_diag_flush("shell-eof-done");
             continue;
@@ -7817,8 +7868,9 @@ void __cold shell_run(void)
             continue;
         }
 
-        if (len == 0) {
+        if (line_len == 0) {
             sh_diag_mark("shell-empty");
+            kfree(line);
             continue;  /* Empty line or Ctrl+C */
         }
 

@@ -20,6 +20,7 @@ extern int osfs2_crc_table_enabled;
 extern int osfs2_layer_index_enabled;
 
 void osfs2_set_layout(uint32_t version);
+void osfs2_set_layout_from_super(const osfs2_super_t *sb);
 
 /* Paths shorter than 64 bytes live in name[]. Longer raw-file paths use a
  * stable short alias in name[] and store the full path in model_name[]. */

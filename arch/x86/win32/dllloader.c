@@ -828,26 +828,6 @@ static int module_name_valid(const char *name)
     return 0;
 }
 
-static int sane_module_count(void)
-{
-    static int warned_bad_count;
-
-    if (module_count < 0 || module_count > MAX_LOADED_MODULES) {
-        if (!warned_bad_count) {
-            warned_bad_count = 1;
-            serial_puts("[DLL] corrupt module_count=");
-            serial_puthex((uint64_t)(uint32_t)module_count, 8);
-            serial_puts(" clamped\n");
-        }
-        if (module_count < 0)
-            module_count = 0;
-        else
-            module_count = MAX_LOADED_MODULES;
-    }
-
-    return module_count;
-}
-
 /* ── Shim registry (built-in DLL shims) ────────────────────── */
 
 #define MAX_SHIMS 64
@@ -995,50 +975,32 @@ LOADED_MODULE *dll_find_module(const char *dll_name)
     ULONG owner_pid = dll_current_owner_pid();
     char lower[64];
     const char *base = strip_path_bounded(dll_name, 256);
-    int count = sane_module_count();
     static int warned_bad_name;
 
-    if (!base) {
+    if (!base || !module_name_valid(base)) {
         if (!warned_bad_name) {
             warned_bad_name = 1;
-            serial_puts("[DLL] bad dll name ptr: 0x");
-            serial_puthex((uint64_t)(uintptr_t)dll_name, 16);
-            serial_puts("\n");
+            serial_puts("[DLL] rejected invalid module name\n");
         }
         return NULL;
     }
+    dl_strcpy_lower(lower, base, sizeof(lower));
 
-    dl_strcpy_lower(lower, base, 64);
-
-    for (int i = 0; i < count; i++) {
-        if (!module_name_valid(modules[i].name))
-            continue;
-        if (dl_stricmp(lower, modules[i].name) == 0)
-            return &modules[i];
-    }
-
-    /* Also try without .dll extension */
-    char lower_noext[64];
-    dl_strcpy_lower(lower_noext, lower, 64);
-    int len = 0;
-    while (lower_noext[len]) len++;
-    if (len > 4 && lower_noext[len-4] == '.' &&
-        lower_noext[len-3] == 'd' && lower_noext[len-2] == 'l' &&
-        lower_noext[len-1] == 'l') {
-        lower_noext[len-4] = 0;
-    }
-
-    for (int i = 0; i < count; i++) {
-        if (!module_name_valid(modules[i].name))
-            continue;
-        char mod_noext[64];
-        dl_strcpy_lower(mod_noext, modules[i].name, 64);
-        int mlen = 0;
-        while (mod_noext[mlen]) mlen++;
-        if (mlen > 4 && mod_noext[mlen-4] == '.' &&
-            mod_noext[mlen-3] == 'd' && mod_noext[mlen-2] == 'l' &&
-            mod_noext[mlen-1] == 'l') {
-            mod_noext[mlen-4] = 0;
+    DLL_PROCESS_STATE *state = loader_process_state(owner_pid, FALSE);
+    if (state) {
+        int current =
+            __atomic_load_n(&state->module_head, __ATOMIC_ACQUIRE);
+        for (int visited = 0;
+             current >= 0 && current < MAX_LOADED_MODULES &&
+             visited < MAX_LOADED_MODULES;
+             visited++) {
+            LOADED_MODULE *mod = &modules[current];
+            int next = mod->next_owner_index;
+            if (module_visible(mod, owner_pid) &&
+                module_matches_name(mod, lower) &&
+                module_matches_caller_abi(mod))
+                return mod;
+            current = next;
         }
         return NULL;
     }
@@ -1906,11 +1868,6 @@ void iat_guard_check(void)
 static PVOID dll_load_impl(const char *dll_name, const BYTE *file_data,
                            SIZE_T file_size)
 {
-    if (sane_module_count() >= MAX_LOADED_MODULES) {
-        serial_puts("[DLL] max modules reached\n");
-        return NULL;
-    }
-
     /* Check if already loaded */
     LOADED_MODULE *existing = dll_find_module(dll_name);
     if (existing) {

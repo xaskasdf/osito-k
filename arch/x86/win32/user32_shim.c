@@ -3293,11 +3293,12 @@ static void user32_reset_corrupt_window_state(const char *where)
         windows[i].used = 0;
     window_count = 0;
     focus_hwnd = NULL;
+    active_hwnd = NULL;
     capture_hwnd = NULL;
     clip_active = 0;
     g_abs_prev_valid = 0;
     msg_head = msg_tail = 0;
-    quit_posted = 0;
+    queue_changed_status = 0;
 }
 
 static int user32_window_state_sane(const char *where)
@@ -3877,8 +3878,12 @@ HWND WINAPI CreateWindowExA(DWORD dwExStyle, PCSTR lpClassName,
     }
     serial_puts("\"\n");
 
-    user32_window_state_sane("CreateWindowExA");
-    if (window_count >= MAX_WINDOWS) return NULL;
+    /* MAKEINTATOM is a valid class argument. Resolve it before string access
+     * and never substitute a different class when an explicit atom is bad. */
+    if (class_is_atom && !cls) {
+        serial_puts("[USER32]   unknown class atom\n");
+        return NULL;
+    }
 
     WNDPROC wndproc = cls ? cls->wndproc : NULL;
     if (lpClassName && !class_is_atom && !cls) {
@@ -9764,9 +9769,8 @@ void win32_post_keyboard_event(BYTE scancode, BOOL key_up)
  */
 void win32_post_mouse_event(int dx, int dy, DWORD buttons, short wheel_delta)
 {
-    if (!win32_input_active())
-        return;
-
+    if (dx || dy || buttons != mouse_buttons || wheel_delta)
+        g_last_input_time = shim_timeGetTime();
     /* Update cursor position */
     cursor_pos.x += dx;
     cursor_pos.y += dy;
@@ -9785,11 +9789,7 @@ void win32_post_mouse_event(int dx, int dy, DWORD buttons, short wheel_delta)
 
     /* The relative-delta accumulation above is already what UE1's recenter
      * math expects (cursor_pos = recenter_origin + delta). */
-    HWND target = input_target();
-    if (!target) {
-        mouse_buttons = buttons;
-        return;
-    }
+    HWND target = mouse_input_target();
 
     /* ── Phase 1 diagnostic: WM_MOUSEMOVE routing during capture ── */
     {
@@ -9894,26 +9894,13 @@ void win32_post_mouse_screen(int screen_x, int screen_y,
  * Bridges the xHCI mouse to the Win32 layer (previously unwired → dead mouse). */
 void win32_post_mouse_abs(int ax, int ay, int lmin, int lmax, DWORD buttons)
 {
-    if (!win32_input_active())
-        return;
-
-    int tw = SCREEN_WIDTH, th = SCREEN_HEIGHT;
-    for (int i = window_count - 1; i >= 0; i--) {
-        if (windows[i].used) {
-            if (windows[i].width  > 0) tw = windows[i].width;
-            if (windows[i].height > 0) th = windows[i].height;
-            break;
-        }
-    }
-    HWND target = input_target();
-    if (!target) {
-        mouse_buttons = buttons;
-        return;
-    }
-
-    /* Prefer the DDraw render resolution (the 640x480 surface that
-     * present_surface_to_gop scales to fill the screen) as the mapping space, so
-     * the cursor lines up with the scaled image instead of a raw window rect. */
+    g_last_input_time = shim_timeGetTime();
+    int tw = screen_cx(), th = screen_cy();
+    if (tw < 1) tw = SCREEN_WIDTH;
+    if (th < 1) th = SCREEN_HEIGHT;
+    /* A live DirectDraw present may scale a smaller source (for example
+     * 640x480) over the physical screen. Only then use its source space;
+     * ddraw_get_display_size returns 0/0 for ordinary USER32/GDI apps. */
     extern void ddraw_get_display_size(unsigned *w, unsigned *h) __attribute__((weak));
     if (ddraw_get_display_size) {
         unsigned dw = 0, dh = 0; ddraw_get_display_size(&dw, &dh);

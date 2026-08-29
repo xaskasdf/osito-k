@@ -16,7 +16,7 @@ extern void  kfree(void *ptr);
 
 /* zlib decompression (from kernel/zlib.c) */
 extern int zlib_inflate(const uint8_t *src, uint32_t src_len,
-                        uint8_t *dst, uint32_t dst_len, uint32_t *out_len);
+                        uint8_t *dst, uint32_t *out_len);
 
 /* Block device read */
 static int (*sqfs_read)(uint64_t offset, void *buf, uint64_t len);
@@ -139,7 +139,8 @@ static int sqfs_read_metadata(uint64_t offset, uint8_t *out, uint32_t *out_len,
         *out_len = data_len;
     } else {
         /* Decompress with zlib */
-        if (zlib_inflate(compressed, data_len, out, 8192, out_len) < 0) {
+        *out_len = 8192;
+        if (zlib_inflate(compressed, data_len, out, out_len) < 0) {
             kfree(compressed);
             return -1;
         }

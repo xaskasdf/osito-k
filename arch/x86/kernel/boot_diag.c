@@ -21,6 +21,7 @@ extern void *osfs2_find(const char *name);
 extern void *osfs2_create(const char *name, uint64_t size);
 extern int   osfs2_write(void *file, uint64_t offset, const void *buf, uint64_t len);
 extern int   osfs2_write_data(void *file, uint64_t offset, const void *buf, uint64_t len);
+extern int   osfs2_set_size_reserved(void *file, uint64_t size);
 extern int   osfs2_read(void *file, uint64_t offset, void *buf, uint64_t len);
 extern int   osfs2_delete(const char *name);
 extern int   osfs2_truncate(void *file, uint64_t size);
@@ -233,7 +234,7 @@ void boot_diag_init(void)
         serial_puts("\n");
         return;
     }
-    osfs2_truncate(boot_diag_log_file, 0);
+    osfs2_set_size_reserved(boot_diag_log_file, 0);
 
     boot_diag_cursor = 0;
     boot_diag_log_bytes = 0;
@@ -279,7 +280,7 @@ void boot_diag_flush(const char *reason)
     }
 
     bd_write_latest(reason);
-    osfs2_truncate(boot_diag_log_file, boot_diag_log_bytes);
+    osfs2_set_size_reserved(boot_diag_log_file, boot_diag_log_bytes);
     disk_flush();
     boot_diag_flushing = false;
 }

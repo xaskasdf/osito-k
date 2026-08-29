@@ -5,20 +5,23 @@
 OsitoFS v2 is a contiguous-block filesystem optimized for NVMe DMA
 and AI model storage. Designed for bare-metal environments with no OS overhead.
 
-- **Block size**: 64 KB to 1 MB, power of two; 1 MB is the default
-- **Metadata overhead**: 4 MB for legacy images; 7 MB by default for new 16K-slot images
-- **Max files**: 4,096 legacy; 16,384 default for new images
+- **Block size**: configurable from 64 KiB to 1 MiB
+- **Metadata overhead**: 4 MiB at fixed byte offsets regardless of block size
+- **Max files**: 4,096
 - **Max blocks**: 262,144 (256 TB theoretical)
 - **Replacement**: copy-on-write metadata transactions preserve the old extent
 
 ## On-Disk Layout
 
 ```
-Offset 0 MB: Superblock region (512 bytes used, backup at +4 KB)
-Offset 1 MB: File Table (N entries × 256 bytes)
-Next:        Block CRC Table (262144 × uint32 = 1 MB)
-Next:        Layer Index Table (512 slots × 2048 bytes = 1 MB)
-Next:        Data blocks (contiguous, first-fit allocation)
+0x000000: Primary superblock (512 bytes)
+0x001000: Backup superblock (512 bytes)
+0x002000: Metadata redo record (12288 bytes)
+0x005000: Journal commit marker (512 bytes)
+0x100000: File Table (4096 entries × 256 bytes = 1 MiB)
+0x200000: Block CRC Table (262144 × uint32 = 1 MiB)
+0x300000: Layer Index Table (512 slots × 2048 bytes = 1 MiB)
+0x400000: Data blocks (contiguous, first-fit allocation)
 ```
 
 If `layout_magic` is absent, readers use the legacy layout:
@@ -142,8 +145,8 @@ The `osfs2_crc32()` function is defined in the shared header.
 
 Built from `tools/ositofs/`:
 
-- **mkfs.ositofs** `<device> [--label name] [--file-slots N]` — Format with OsitoFS v2
-- **ositofs-write** `<device> <file> [--name name]` — Write file (auto-detects GGUF)
+- **mkfs.ositofs** `<device> [--label name]` — Format with OsitoFS v2
+- **ositofs-write** `<device> <file> [--name name] [--overwrite]` — Transactional write or COW replacement
 - **ositofs-ls** `<device>` — List files with model info
 - **ositofs-info** `<device>` — Show filesystem info
 - **ositofs-fsck** `<device> [--repair]` — Validate or replay a pending journal

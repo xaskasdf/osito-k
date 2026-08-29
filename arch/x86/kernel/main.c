@@ -341,6 +341,8 @@ static bool boot_mount_ositofs_all(void)
     extern int  gpt_find_ositofs(uint64_t *part_offset, uint64_t *part_size);
     extern const char *blkdev_name(int idx);
     extern bool blkdev_can_write(int dev_idx);
+    extern uint32_t disk_lba_size(void);
+    extern uint64_t disk_lba_count(void);
 
     int n_bd = blkdev_count();
     serial_puts("[KERN] OsitoFS scan across ");
@@ -362,16 +364,17 @@ static bool boot_mount_ositofs_all(void)
             disk_set_active(i);
 
             uint64_t part_off = 0, part_size = 0;
-            (void)part_size;
+            uint64_t disk_size = disk_lba_count() *
+                                 (uint64_t)disk_lba_size();
 
             if (gpt_find_ositofs(&part_off, &part_size) == 0) {
                 if (osfs3_mount(part_off) == 0) fs_mounted = true;
-                else fs_mounted = (osfs2_mount(part_off) == 0);
+                else fs_mounted = (osfs2_mount(part_off, part_size) == 0);
             }
 
             if (!fs_mounted) {
                 if (osfs3_mount(0) == 0) fs_mounted = true;
-                else fs_mounted = (osfs2_mount(0) == 0);
+                else fs_mounted = (osfs2_mount(0, disk_size) == 0);
             }
 
             if (!fs_mounted) {
@@ -397,7 +400,8 @@ static bool boot_mount_ositofs_all(void)
                     serial_puts(blkdev_name(i));
                     serial_puts("\n");
                     if (osfs3_mount(off) == 0) fs_mounted = true;
-                    else fs_mounted = (osfs2_mount(off) == 0);
+                    else fs_mounted = (osfs2_mount(
+                        off, disk_size > off ? disk_size - off : 0) == 0);
                 }
             }
 
@@ -1042,6 +1046,14 @@ void __initk kernel_entry(boot_info_t *info)
 #ifdef OSITO_BOOT_LIST_FS
         osfs2_list();
 #endif
+
+        /* Load persistent certificate policy only after the VFS is ready. */
+        extern int cert_pin_load_dynamic(void);
+        extern int cert_pin_load_operator_roots(void);
+        extern int certmgr_load_system_roots(void);
+        cert_pin_load_dynamic();
+        cert_pin_load_operator_roots();
+        certmgr_load_system_roots();
 
         /* Cluster PSK (oict-key.txt) + cluster.json live on OsitoFS,
          * which only just mounted — cluster_init() ran earlier (before

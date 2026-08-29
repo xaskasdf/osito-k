@@ -46,7 +46,7 @@ static uint64_t     partition_size;
 static osfs2_super_t superblock;
 static bool          mounted;
 
-/* Cached file table — size is read from the mounted layout */
+/* Cached file table (4096 * 256 = 1MB — read on mount) */
 static osfs2_file_t *file_table;
 
 /* Cached block CRC table (262144 * 4 = 1MB — read on mount) */
@@ -56,10 +56,10 @@ static uint32_t *crc_table;
 static uint32_t blk_size;
 static uint32_t blk_shift;
 static uint32_t data_start;
-static uint32_t fs_max_files;
-static uint32_t fs_filetab_size;
-static uint32_t fs_crctab_off;
-static uint32_t fs_layeridx_off;
+static uint32_t file_capacity;
+static uint32_t file_table_size;
+static uint32_t crc_table_offset;
+static uint32_t layer_index_offset;
 
 /* Boot-time epoch from CMOS RTC (set once on mount) */
 static uint64_t boot_epoch_sec;
@@ -70,8 +70,8 @@ static uint64_t boot_epoch_sec;
 
 #define BLK_BITMAP_BYTES  (OSFS2_MAX_BLOCKS / 8)  /* 32KB for 262144 blocks */
 static uint8_t blk_bitmap[BLK_BITMAP_BYTES];      /* 1 = used, 0 = free */
-static uint32_t file_open_refs[OSFS2_MAX_FILES_LARGE];
-static uint64_t file_revisions[OSFS2_MAX_FILES_LARGE];
+static uint32_t file_open_refs[OSFS2_MAX_FILE_SLOTS];
+static uint64_t file_revisions[OSFS2_MAX_FILE_SLOTS];
 static osfs2_journal_record_t journal_record;
 static osfs2_journal_commit_t journal_commit;
 static volatile uint32_t journal_lock;
@@ -248,7 +248,7 @@ static void blk_bitmap_rebuild(void)
 
     /* Pass 1: real files (size>0) are authoritative. On overlap (corruption),
      * drop the LATER claimant so it can't keep a live file's blocks. */
-    for (uint32_t i = 0; i < fs_max_files; i++) {
+    for (uint32_t i = 0; i < file_capacity; i++) {
         osfs2_file_t *f = &file_table[i];
         if (!(f->flags & OSFS2_FLAG_VALID)) continue;
         if (f->size == 0 || f->block_count == 0) continue;
@@ -267,7 +267,7 @@ static void blk_bitmap_rebuild(void)
      * whose block overlaps a real file is stale corruption (the log-on-Entry.unr
      * case): writing it would clobber the real file. Drop it (no data to lose) +
      * release its block; the owner re-creates it cleanly via the fixed allocator. */
-    for (uint32_t i = 0; i < fs_max_files; i++) {
+    for (uint32_t i = 0; i < file_capacity; i++) {
         osfs2_file_t *f = &file_table[i];
         if (!(f->flags & OSFS2_FLAG_VALID)) continue;
         if (f->size != 0 || f->block_count == 0) continue;
@@ -340,7 +340,7 @@ static int blk_range_free(uint32_t start, uint32_t count)
 
 /* ── File name hash table (in-memory, O(1) lookup) ──────────── */
 
-#define OSFS2_HASH_SLOTS  65536
+#define OSFS2_HASH_SLOTS  32768
 #define OSFS2_HASH_MASK   (OSFS2_HASH_SLOTS - 1)
 #define OSFS2_HASH_EMPTY  0xFFFF
 
@@ -432,9 +432,8 @@ static void osfs2_hash_build(void)
     __atomic_add_fetch(&name_hash_generation, 1, __ATOMIC_ACQ_REL);
     for (uint32_t i = 0; i < OSFS2_HASH_SLOTS; i++) {
         name_hash[i] = OSFS2_HASH_EMPTY;
-    for (uint32_t i = 0; i < fs_max_files; i++) {
-        if (file_table[i].flags & OSFS2_FLAG_VALID)
-            osfs2_hash_insert((uint16_t)i);
+        dir_hash[i].file_index = OSFS2_HASH_EMPTY;
+        dir_hash[i].prefix_len = 0;
     }
     for (uint32_t i = 0; i < file_capacity; i++) {
         if (!(file_table[i].flags & OSFS2_FLAG_VALID)) continue;
@@ -447,43 +446,6 @@ static void osfs2_hash_build(void)
         }
     }
     __atomic_add_fetch(&name_hash_generation, 1, __ATOMIC_RELEASE);
-}
-
-static const char *osfs2_file_long_name(const osfs2_file_t *f)
-{
-    if (!(f->flags & OSFS2_FLAG_GGUF) &&
-        !(f->flags & OSFS2_FLAG_INLINE) &&
-        f->model_name[0])
-        return f->model_name;
-    return NULL;
-}
-
-static int osfs2_streq_ci(const char *a, const char *b)
-{
-    while (*a && *b) {
-        char ca = *a, cb = *b;
-        if (ca >= 'A' && ca <= 'Z') ca += 32;
-        if (cb >= 'A' && cb <= 'Z') cb += 32;
-        if (ca != cb) return 0;
-        a++; b++;
-    }
-    return *a == '\0' && *b == '\0';
-}
-
-static int osfs2_file_name_eq(const osfs2_file_t *f, const char *name)
-{
-    if (strcmp(f->name, name) == 0)
-        return 1;
-    const char *long_name = osfs2_file_long_name(f);
-    return long_name && strcmp(long_name, name) == 0;
-}
-
-static int osfs2_file_name_eq_ci(const osfs2_file_t *f, const char *name)
-{
-    if (osfs2_streq_ci(f->name, name))
-        return 1;
-    const char *long_name = osfs2_file_long_name(f);
-    return long_name && osfs2_streq_ci(long_name, name);
 }
 
 /* ── Read from partition ─────────────────────────────────────── */
@@ -508,7 +470,8 @@ static bool osfs2_super_valid(const osfs2_super_t *value)
 {
     if (!value || value->magic != OSFS2_MAGIC ||
         !osfs2_supported_version(value->version) ||
-        !osfs2_valid_block_size(value->block_size))
+        !osfs2_valid_block_size(value->block_size) ||
+        !osfs2_valid_layout(value))
         return false;
     osfs2_super_t copy = *value;
     uint32_t expected = copy.crc32;
@@ -534,21 +497,20 @@ static bool osfs2_journal_record_valid(osfs2_journal_record_t *record)
         memcmp(record->before_super.uuid, record->after_super.uuid,
                sizeof(record->before_super.uuid)) != 0 ||
         record->after_super.total_blocks <=
-            osfs2_format_data_start_blk(record->after_super.version,
-                                        record->after_super.block_size) ||
+            osfs2_layout_data_start_blk(&record->after_super) ||
         record->after_super.total_blocks > OSFS2_MAX_BLOCKS ||
         (uint64_t)record->after_super.total_blocks *
             record->after_super.block_size > partition_size)
         return false;
     for (uint32_t i = 0; i < record->page_count; i++) {
-        if (record->pages[i] >= osfs2_format_filetab_size(
-                record->after_super.version) / OSFS2_METADATA_PAGE_SIZE)
+        if (record->pages[i] >= osfs2_layout_filetab_size(
+                &record->after_super) / OSFS2_METADATA_PAGE_SIZE)
             return false;
         if (i && record->pages[i] == record->pages[0]) return false;
     }
     for (uint32_t i = 0; i < record->entry_count; i++) {
-        if (record->slots[i] >= osfs2_format_max_files(
-                record->after_super.version)) return false;
+        if (record->slots[i] >= osfs2_layout_max_files(
+                &record->after_super)) return false;
         uint32_t page = (record->slots[i] * sizeof(osfs2_file_t)) /
                         OSFS2_METADATA_PAGE_SIZE;
         bool found = false;
@@ -576,9 +538,8 @@ static bool osfs2_journal_record_valid(osfs2_journal_record_t *record)
                 uint64_t end = (uint64_t)after->start_block +
                                after->block_count;
                 if (after->start_block <
-                        osfs2_format_data_start_blk(
-                            record->after_super.version,
-                            record->after_super.block_size) ||
+                        osfs2_layout_data_start_blk(
+                            &record->after_super) ||
                     end > record->after_super.total_blocks ||
                     after->size > (uint64_t)after->block_count *
                                       record->after_super.block_size)
@@ -783,15 +744,17 @@ int osfs2_mount(uint64_t part_offset, uint64_t part_bytes)
     }
     blk_size = superblock.block_size;
     blk_shift = osfs2_block_shift(blk_size);
-    if (osfs2_layout_data_off(&superblock) % blk_size != 0) {
-        serial_puts("[OsitoFS] Metadata layout is not block-aligned\n");
+    data_start = osfs2_layout_data_start_blk(&superblock);
+    file_capacity = osfs2_layout_max_files(&superblock);
+    file_table_size = osfs2_layout_filetab_size(&superblock);
+    crc_table_offset = osfs2_layout_crctab_off(&superblock);
+    layer_index_offset = osfs2_layout_layeridx_off(&superblock);
+    if (superblock.total_blocks <= data_start ||
+        superblock.total_blocks > OSFS2_MAX_BLOCKS ||
+        (uint64_t)superblock.total_blocks * blk_size > partition_size) {
+        serial_puts("[OsitoFS] Invalid filesystem geometry\n");
         return -1;
     }
-    fs_max_files = osfs2_layout_max_files(&superblock);
-    fs_filetab_size = osfs2_layout_filetab_size(&superblock);
-    fs_crctab_off = osfs2_layout_crctab_off(&superblock);
-    fs_layeridx_off = osfs2_layout_layeridx_off(&superblock);
-    data_start = osfs2_layout_data_start_blk(&superblock);
 
     serial_puts("[OsitoFS] Superblock OK: label=\"");
     serial_puts(superblock.label);
@@ -802,13 +765,13 @@ int osfs2_mount(uint64_t part_offset, uint64_t part_bytes)
     serial_puts(", blk_size=");
     serial_putdec(blk_size);
     serial_puts(", slots=");
-    serial_putdec(fs_max_files);
+    serial_putdec(file_capacity);
     serial_puts("\n");
 
     /* Read the versioned file table. Stored as upper-half virt
      * so it stays reachable after the lower-half identity map is gone
      * from user PML4s. */
-    void *ft_phys = mem_alloc_aligned(fs_filetab_size, 4096);
+    void *ft_phys = mem_alloc_aligned(file_table_size, 4096);
     if (!ft_phys) {
         serial_puts("[OsitoFS] Failed to allocate file table\n");
         return -1;
@@ -816,19 +779,23 @@ int osfs2_mount(uint64_t part_offset, uint64_t part_bytes)
     file_table = (osfs2_file_t *)PHYS_TO_VIRT(ft_phys);
     memset(file_open_refs, 0, sizeof(file_open_refs));
 
-    if (osfs2_part_read(OSFS2_FILETAB_OFF, file_table, fs_filetab_size) < 0) {
+    if (osfs2_part_read(OSFS2_FILETAB_OFF, file_table, file_table_size) < 0) {
         serial_puts("[OsitoFS] Failed to read file table\n");
         return -1;
     }
 
-    /* Read block CRC table (1MB at fixed offset) */
-    void *crc_phys = mem_alloc_aligned(OSFS2_CRCTAB_SIZE, 4096);
-    if (crc_phys) {
-        crc_table = (uint32_t *)PHYS_TO_VIRT(crc_phys);
-        if (osfs2_part_read(fs_crctab_off, crc_table, OSFS2_CRCTAB_SIZE) < 0) {
-            serial_puts("[OsitoFS] CRC table read failed (verification disabled)\n");
-            mem_free_pages(crc_phys, OSFS2_CRCTAB_SIZE / 4096);
-            crc_table = NULL;
+    /* The many-file layout spends the full metadata region on file entries. */
+    crc_table = NULL;
+    if (osfs2_layout_has_crc_table(&superblock)) {
+        void *crc_phys = mem_alloc_aligned(OSFS2_CRCTAB_SIZE, 4096);
+        if (crc_phys) {
+            crc_table = (uint32_t *)PHYS_TO_VIRT(crc_phys);
+            if (osfs2_part_read(crc_table_offset, crc_table,
+                                OSFS2_CRCTAB_SIZE) < 0) {
+                serial_puts("[OsitoFS] CRC table read failed (verification disabled)\n");
+                mem_free_pages(crc_phys, OSFS2_CRCTAB_SIZE / 4096);
+                crc_table = NULL;
+            }
         }
     }
 
@@ -901,7 +868,7 @@ void osfs2_list(void)
     serial_puts("[OsitoFS] File listing:\n");
 
     uint32_t file_count = 0;
-    for (uint32_t i = 0; i < fs_max_files; i++) {
+    for (uint32_t i = 0; i < file_capacity; i++) {
         if (!(file_table[i].flags & OSFS2_FLAG_VALID)) continue;
 
         osfs2_file_t *f = &file_table[i];
@@ -973,13 +940,12 @@ int osfs2_find_first(const char *pattern, int start_idx)
     if (osfs3_is_mounted()) return osfs3_find_first(pattern, start_idx);
 #endif
     if (!mounted) return -1;
-    for (int i = start_idx; i < (int)fs_max_files; i++) {
+    for (int i = start_idx; i < (int)file_capacity; i++) {
         if (!(file_table[i].flags & OSFS2_FLAG_VALID)) continue;
-        if (osfs2_wildcard_match(pattern, file_table[i].name))
-            return i;
-        const char *long_name = osfs2_file_long_name(&file_table[i]);
-        if (long_name && osfs2_wildcard_match(pattern, long_name))
-            return i;
+        const char *name = osfs2_entry_name(&file_table[i]);
+        for (const char *p = name; *p; p++)
+            if (*p == '\\' || *p == '/') name = p + 1;
+        if (osfs2_wildcard_match(pattern, name)) return i;
     }
     return -1;
 }
@@ -987,7 +953,11 @@ int osfs2_find_first(const char *pattern, int start_idx)
 /* Get file entry by index */
 osfs2_file_t *osfs2_get_file(int index)
 {
-    if (index < 0 || index >= (int)fs_max_files) return NULL;
+#ifndef __EMSCRIPTEN__
+    if (osfs3_is_mounted())
+        return (osfs2_file_t *)osfs3_get_file(index);
+#endif
+    if (index < 0 || index >= (int)file_capacity) return NULL;
     if (!(file_table[index].flags & OSFS2_FLAG_VALID)) return NULL;
     return &file_table[index];
 }
@@ -1004,14 +974,9 @@ osfs2_file_t *osfs2_find(const char *name)
     while (name_hash[slot] != OSFS2_HASH_EMPTY) {
         uint16_t idx = name_hash[slot];
         if ((file_table[idx].flags & OSFS2_FLAG_VALID) &&
-            osfs2_file_name_eq(&file_table[idx], name))
+            strcmp(osfs2_entry_name(&file_table[idx]), name) == 0)
             return &file_table[idx];
         slot = (slot + 1) & OSFS2_HASH_MASK;
-    }
-    for (uint32_t i = 0; i < fs_max_files; i++) {
-        if ((file_table[i].flags & OSFS2_FLAG_VALID) &&
-            osfs2_file_name_eq(&file_table[i], name))
-            return &file_table[i];
     }
     return NULL;
 }
@@ -1051,60 +1016,53 @@ osfs2_file_t *osfs2_find_exact_ci(const char *name)
 
 osfs2_file_t *osfs2_find_ci(const char *name)
 {
-    if (!mounted || !name) return NULL;
-    const char *orig_name = name;
-    /* OsitoFS v2 is a FLAT filesystem (keys are bare filenames). Win32 callers
-     * (e.g. UT99's GetPackageLinker at LoadMap) may pass a directory-prefixed
-     * path like "Maps\Entry.unr" or "System\Entry.unr"; reduce to the basename
-     * so the flat lookup still matches. (resolve_win32 only strips \??\ and C:\,
-     * not directory components.) No-op for already-bare names. */
+    osfs2_file_t *file = osfs2_find_exact_ci(name);
+    if (file || !name) return file;
+#ifndef __EMSCRIPTEN__
+    if (osfs3_is_mounted()) return NULL;
+#endif
+
+    const char *base = name;
     for (const char *p = name; *p; p++)
-        if (*p == '\\' || *p == '/') name = p + 1;
-    uint32_t slot = osfs2_name_hash_fn(name);
-    while (name_hash[slot] != OSFS2_HASH_EMPTY) {
-        uint16_t idx = name_hash[slot];
-        if (file_table[idx].flags & OSFS2_FLAG_VALID) {
-            if (osfs2_file_name_eq_ci(&file_table[idx], name) ||
-                osfs2_file_name_eq_ci(&file_table[idx], orig_name))
-                return &file_table[idx];
-        }
+        if (*p == '\\' || *p == '/') base = p + 1;
+    return base != name ? osfs2_find_exact_ci(base) : NULL;
+}
+
+bool osfs2_directory_exists_ci(const char *directory)
+{
+#ifndef __EMSCRIPTEN__
+    if (osfs3_is_mounted()) return osfs3_directory_exists_ci(directory);
+#endif
+    if (!mounted || !directory) return false;
+    while (*directory == '\\' || *directory == '/') directory++;
+    uint32_t len = 0;
+    while (directory[len]) len++;
+    while (len && (directory[len - 1] == '\\' || directory[len - 1] == '/'))
+        len--;
+    if (!len || len > 0xFFFFU) return false;
+
+    uint32_t slot = osfs2_path_hash_fn(directory, len);
+    for (uint32_t probe = 0; probe < OSFS2_HASH_SLOTS; probe++) {
+        osfs2_dir_hash_entry_t *entry = &dir_hash[slot];
+        if (entry->file_index == OSFS2_HASH_EMPTY) return false;
+        const char *stored = osfs2_entry_name(&file_table[entry->file_index]);
+        if (entry->prefix_len == len &&
+            osfs2_path_equal_n(stored, directory, len)) return true;
         slot = (slot + 1) & OSFS2_HASH_MASK;
     }
-    for (uint32_t i = 0; i < fs_max_files; i++) {
-        if (!(file_table[i].flags & OSFS2_FLAG_VALID)) continue;
-        if (osfs2_file_name_eq_ci(&file_table[i], name) ||
-            osfs2_file_name_eq_ci(&file_table[i], orig_name))
-            return &file_table[i];
-    }
-    return NULL;
+    return false;
 }
 
 /* ── Read file data ──────────────────────────────────────────── */
 
 int osfs2_read(osfs2_file_t *file, uint64_t offset, void *buf, uint64_t len)
 {
-    if (!mounted || !file) return -1;
-    if (offset + len > file->size) return -1;
-    int dbg_fx = 0;
-#ifdef OSITO_TRACE_FX_READS
-    dbg_fx = (strcmp(file->name, "shaders/win32_40_lq_final/im.fxc") == 0 ||
-              strcmp(file->name, "rage/assets/tune/shaders/lib/win32_40/rage_im.fxc") == 0);
+#ifndef __EMSCRIPTEN__
+    if (osfs3_is_mounted())
+        return osfs3_read_file(file, offset, buf, len);
 #endif
-    if (dbg_fx) {
-        serial_puts("[OsitoFS] read fx name='");
-        serial_puts(file->name);
-        serial_puts("' off=");
-        serial_putdec(offset);
-        serial_puts(" len=");
-        serial_putdec(len);
-        serial_puts(" start=");
-        serial_putdec(file->start_block);
-        serial_puts(" blocks=");
-        serial_putdec(file->block_count);
-        serial_puts(" flags=0x");
-        serial_puthex(file->flags, 8);
-        serial_puts("\n");
-    }
+    if (!mounted || !file || (!buf && len) || len > 0x7FFFFFFFULL) return -1;
+    if (offset > file->size || len > file->size - offset) return -1;
 
     /* Inline files: data stored in model_name[128] field */
     if (file->flags & OSFS2_FLAG_INLINE) {
@@ -1113,29 +1071,8 @@ int osfs2_read(osfs2_file_t *file, uint64_t offset, void *buf, uint64_t len)
     }
 
     uint64_t abs_offset = ((uint64_t)file->start_block << blk_shift) + offset;
-    if (dbg_fx) {
-        serial_puts("[OsitoFS] read fx abs=0x");
-        serial_puthex(abs_offset, 16);
-        serial_puts(" part=0x");
-        serial_puthex(partition_offset, 16);
-        serial_puts("\n");
-    }
     int rc = osfs2_part_read(abs_offset, buf, len);
     if (rc < 0) return -1;
-    if (dbg_fx) {
-        uint8_t *p = (uint8_t *)buf;
-        serial_puts("[OsitoFS] read fx bytes=");
-        if (len >= 4) {
-            serial_puthex(p[0], 2);
-            serial_puts(" ");
-            serial_puthex(p[1], 2);
-            serial_puts(" ");
-            serial_puthex(p[2], 2);
-            serial_puts(" ");
-            serial_puthex(p[3], 2);
-        }
-        serial_puts("\n");
-    }
     return (int)len;  /* disk_read_bytes returns 0 on success, not byte count */
 }
 
@@ -1239,7 +1176,7 @@ osfs2_file_t *osfs2_find_gguf(void)
 #endif
     if (!mounted) return NULL;
 
-    for (uint32_t i = 0; i < fs_max_files; i++) {
+    for (uint32_t i = 0; i < file_capacity; i++) {
         if ((file_table[i].flags & OSFS2_FLAG_VALID) &&
             (file_table[i].flags & OSFS2_FLAG_GGUF)) {
             return &file_table[i];
@@ -1255,10 +1192,10 @@ int osfs2_read_layer_index(uint16_t slot, osfs2_layer_idx_t *li)
 #ifndef __EMSCRIPTEN__
     if (osfs3_is_mounted()) return -1;
 #endif
-    if (!mounted || !osfs2_format_has_layer_index(superblock.version) ||
+    if (!mounted || !osfs2_layout_has_layer_index(&superblock) ||
         slot >= OSFS2_MAX_MODELS) return -1;
 
-    uint64_t offset = fs_layeridx_off
+    uint64_t offset = layer_index_offset
                     + (uint64_t)slot * sizeof(osfs2_layer_idx_t);
     return osfs2_part_read(offset, li, sizeof(*li));
 }
@@ -1284,23 +1221,261 @@ static const osfs2_file_t *osfs2_transaction_entry(
     uint32_t slot, const uint32_t slots[OSFS2_JOURNAL_MAX_ENTRIES],
     const osfs2_file_t after[OSFS2_JOURNAL_MAX_ENTRIES], uint32_t count)
 {
-    return osfs2_part_write(OSFS2_FILETAB_OFF, file_table, fs_filetab_size);
+    for (uint32_t i = 0; i < count; i++)
+        if (slots[i] == slot) return &after[i];
+    return &file_table[slot];
 }
 
-static int osfs2_file_index(osfs2_file_t *file)
+static bool osfs2_entry_has_extent(const osfs2_file_t *entry)
 {
-    if (!file || file < file_table || file >= file_table + fs_max_files)
+    return (entry->flags & OSFS2_FLAG_VALID) &&
+           !(entry->flags & OSFS2_FLAG_INLINE) && entry->block_count;
+}
+
+static bool osfs2_same_extent(const osfs2_file_t *a,
+                              const osfs2_file_t *b)
+{
+    return osfs2_entry_has_extent(a) && osfs2_entry_has_extent(b) &&
+           a->start_block == b->start_block &&
+           a->block_count == b->block_count;
+}
+
+static bool osfs2_hashed_name_changed(const osfs2_file_t *before,
+                                      const osfs2_file_t *after)
+{
+    bool before_valid = (before->flags & OSFS2_FLAG_VALID) != 0;
+    bool after_valid = (after->flags & OSFS2_FLAG_VALID) != 0;
+    if (before_valid != after_valid) return true;
+    if (!before_valid) return false;
+    return strcmp(osfs2_entry_name(before), osfs2_entry_name(after)) != 0;
+}
+
+static int osfs2_transaction_super(
+    osfs2_super_t *result,
+    const uint32_t slots[OSFS2_JOURNAL_MAX_ENTRIES],
+    const osfs2_file_t after[OSFS2_JOURNAL_MAX_ENTRIES], uint32_t count)
+{
+    *result = superblock;
+    uint64_t files = result->file_count;
+    uint64_t used = result->used_blocks;
+    uint32_t old_hwm = result->next_data_block;
+    uint32_t max_after_end = data_start;
+    bool may_lower_hwm = false;
+
+    for (uint32_t i = 0; i < count; i++) {
+        const osfs2_file_t *before = &file_table[slots[i]];
+        const osfs2_file_t *next = &after[i];
+        bool before_valid = (before->flags & OSFS2_FLAG_VALID) != 0;
+        bool after_valid = (next->flags & OSFS2_FLAG_VALID) != 0;
+        uint32_t before_blocks = osfs2_entry_has_extent(before)
+                               ? before->block_count : 0;
+        uint32_t after_blocks = osfs2_entry_has_extent(next)
+                              ? next->block_count : 0;
+
+        if (after_blocks) {
+            uint64_t end = (uint64_t)next->start_block + after_blocks;
+            if (next->start_block < data_start ||
+                end > result->total_blocks) return -1;
+            if (end > max_after_end) max_after_end = (uint32_t)end;
+        }
+
+        if (before_valid) {
+            if (!files) return -1;
+            files--;
+        }
+        if (after_valid) files++;
+        if (used < before_blocks) return -1;
+        used -= before_blocks;
+        used += after_blocks;
+        if (files > file_capacity || used > result->total_blocks) return -1;
+
+        if (osfs2_entry_has_extent(before) &&
+            !osfs2_same_extent(before, next)) {
+            uint64_t before_end = (uint64_t)before->start_block +
+                                  before->block_count;
+            if (before_end >= old_hwm) may_lower_hwm = true;
+        }
+    }
+
+    uint32_t hwm = old_hwm < data_start ? data_start : old_hwm;
+    if (max_after_end > hwm) hwm = max_after_end;
+    if (may_lower_hwm && max_after_end < old_hwm) {
+        hwm = data_start;
+        for (uint32_t slot = 0; slot < file_capacity; slot++) {
+            const osfs2_file_t *entry = osfs2_transaction_entry(
+                slot, slots, after, count);
+            if (!osfs2_entry_has_extent(entry)) continue;
+            uint64_t end = (uint64_t)entry->start_block + entry->block_count;
+            if (entry->start_block < data_start ||
+                end > result->total_blocks) return -1;
+            if (end > hwm) hwm = (uint32_t)end;
+        }
+    }
+
+    result->file_count = (uint32_t)files;
+    result->used_blocks = (uint32_t)used;
+    result->next_data_block = hwm;
+    result->crc32 = 0;
+    result->crc32 = osfs2_crc32(result, sizeof(*result));
+    return 0;
+}
+
+static int osfs2_commit_metadata(
+    uint32_t operation,
+    const uint32_t slots[OSFS2_JOURNAL_MAX_ENTRIES],
+    const osfs2_file_t after[OSFS2_JOURNAL_MAX_ENTRIES], uint32_t count)
+{
+    if (!mounted || !count || count > OSFS2_JOURNAL_MAX_ENTRIES)
         return -1;
-    return (int)(file - file_table);
+    for (uint32_t i = 0; i < count; i++)
+        if (slots[i] >= file_capacity ||
+            (i && slots[i] == slots[0])) return -1;
+
+    osfs2_spin_lock(&journal_lock);
+    memset(&journal_record, 0, sizeof(journal_record));
+    journal_record.magic = OSFS2_JOURNAL_MAGIC;
+    journal_record.version = OSFS2_JOURNAL_VERSION;
+    journal_record.operation = operation;
+    journal_record.entry_count = count;
+    journal_record.transaction_id = ++journal_transaction_id;
+    journal_record.before_super = superblock;
+    for (uint32_t i = 0; i < count; i++) {
+        journal_record.slots[i] = slots[i];
+        journal_record.before_entries[i] = file_table[slots[i]];
+        uint32_t page = (slots[i] * sizeof(osfs2_file_t)) /
+                        OSFS2_METADATA_PAGE_SIZE;
+        uint32_t page_slot = journal_record.page_count;
+        for (uint32_t j = 0; j < journal_record.page_count; j++)
+            if (journal_record.pages[j] == page) page_slot = j;
+        if (page_slot == journal_record.page_count) {
+            journal_record.pages[page_slot] = page;
+            memcpy(journal_record.after_pages[page_slot],
+                   (uint8_t *)file_table +
+                       (uint64_t)page * OSFS2_METADATA_PAGE_SIZE,
+                   OSFS2_METADATA_PAGE_SIZE);
+            journal_record.page_count++;
+        }
+        uint32_t in_page = (slots[i] * sizeof(osfs2_file_t)) %
+                           OSFS2_METADATA_PAGE_SIZE;
+        memcpy(journal_record.after_pages[page_slot] + in_page, &after[i],
+               sizeof(osfs2_file_t));
+    }
+    if (osfs2_transaction_super(&journal_record.after_super, slots, after,
+                                count) < 0) {
+        osfs2_spin_unlock(&journal_lock);
+        return -1;
+    }
+    journal_record.record_crc32 = 0;
+    journal_record.record_crc32 = osfs2_crc32(&journal_record,
+                                              sizeof(journal_record));
+
+    int result = osfs2_journal_clear_commit();
+    if (result == 0)
+        result = osfs2_part_write(OSFS2_JOURNAL_RECORD_OFF, &journal_record,
+                                  sizeof(journal_record));
+    if (result == 0)
+        result = disk_flush();
+
+    if (result == 0) {
+        memset(&journal_commit, 0, sizeof(journal_commit));
+        journal_commit.magic = OSFS2_JOURNAL_COMMIT_MAGIC;
+        journal_commit.version = OSFS2_JOURNAL_VERSION;
+        journal_commit.transaction_id = journal_record.transaction_id;
+        journal_commit.record_crc32 = journal_record.record_crc32;
+        journal_commit.commit_crc32 = 0;
+        journal_commit.commit_crc32 = osfs2_crc32(&journal_commit,
+                                                  sizeof(journal_commit));
+        result = osfs2_part_write(OSFS2_JOURNAL_COMMIT_OFF, &journal_commit,
+                                  sizeof(journal_commit));
+    }
+    if (result == 0)
+        result = disk_flush();
+    if (result == 0)
+        result = osfs2_journal_apply(&journal_record);
+
+    if (result == 0) {
+        bool rebuild_hash = false;
+        for (uint32_t i = 0; i < count; i++) {
+            osfs2_file_t before = file_table[slots[i]];
+            if (osfs2_hashed_name_changed(&before, &after[i]))
+                rebuild_hash = true;
+            if (osfs2_entry_has_extent(&before) &&
+                !osfs2_same_extent(&before, &after[i])) {
+                for (uint32_t block = 0; block < before.block_count; block++) {
+                    blk_bitmap_clear(before.start_block + block);
+                    if (crc_table &&
+                        before.start_block + block < OSFS2_MAX_BLOCKS)
+                        crc_table[before.start_block + block] = 0;
+                }
+            }
+            file_table[slots[i]] = after[i];
+        }
+        for (uint32_t i = 0; i < count; i++) {
+            if (!osfs2_entry_has_extent(&after[i]) ||
+                osfs2_same_extent(&journal_record.before_entries[i],
+                                  &after[i]))
+                continue;
+            for (uint32_t block = 0; block < after[i].block_count; block++)
+                blk_bitmap_set(after[i].start_block + block);
+        }
+        superblock = journal_record.after_super;
+        if (rebuild_hash) osfs2_hash_build();
+        if (osfs2_journal_clear_commit() < 0) {
+            serial_puts("[OsitoFS] Journal clear failed; disabling mount\n");
+            mounted = false;
+            result = -1;
+        }
+    } else if (journal_commit.magic == OSFS2_JOURNAL_COMMIT_MAGIC) {
+        /* A durable commit must be replayed before any further mutation. */
+        mounted = false;
+    }
+    osfs2_spin_unlock(&journal_lock);
+    return result;
 }
 
-static int osfs2_write_file_entry(osfs2_file_t *file)
+static uint32_t osfs2_alloc_blocks(uint32_t blocks);
+
+static int osfs2_zero_extent(uint32_t start, uint64_t length)
 {
-    int idx = osfs2_file_index(file);
-    if (idx < 0) return -1;
-    return osfs2_part_write(OSFS2_FILETAB_OFF +
-                            (uint64_t)idx * sizeof(osfs2_file_t),
-                            file, sizeof(osfs2_file_t));
+    static const uint8_t zeros[4096];
+    uint64_t offset = (uint64_t)start << blk_shift;
+    while (length) {
+        uint64_t chunk = length > sizeof(zeros) ? sizeof(zeros) : length;
+        if (osfs2_part_write(offset, zeros, chunk) < 0) return -1;
+        offset += chunk;
+        length -= chunk;
+    }
+    return 0;
+}
+
+static int osfs2_zero_and_flush_crc(uint32_t start, uint32_t blocks)
+{
+    if (!crc_table || !blocks) return disk_flush();
+    if ((uint64_t)start + blocks > OSFS2_MAX_BLOCKS) return -1;
+    for (uint32_t block = start; block < start + blocks; block++)
+        crc_table[block] = 0;
+    uint32_t first_page = start / (OSFS2_METADATA_PAGE_SIZE / sizeof(uint32_t));
+    uint32_t last_page = (start + blocks - 1) /
+                         (OSFS2_METADATA_PAGE_SIZE / sizeof(uint32_t));
+    for (uint32_t page = first_page; page <= last_page; page++) {
+        if (osfs2_part_write(crc_table_offset +
+                (uint64_t)page * OSFS2_METADATA_PAGE_SIZE,
+                (uint8_t *)crc_table +
+                    (uint64_t)page * OSFS2_METADATA_PAGE_SIZE,
+                OSFS2_METADATA_PAGE_SIZE) < 0)
+            return -1;
+    }
+    return disk_flush();
+}
+
+static int osfs2_commit_one(uint32_t operation, uint32_t slot,
+                            const osfs2_file_t *after)
+{
+    uint32_t slots[OSFS2_JOURNAL_MAX_ENTRIES] = { slot, 0 };
+    osfs2_file_t entries[OSFS2_JOURNAL_MAX_ENTRIES];
+    memset(entries, 0, sizeof(entries));
+    entries[0] = *after;
+    return osfs2_commit_metadata(operation, slots, entries, 1);
 }
 
 /* ── Create a new file ──────────────────────────────────────── */
@@ -1320,7 +1495,7 @@ static osfs2_file_t *osfs2_create_impl(const char *name, uint64_t size)
 
     /* Find free slot */
     int slot = -1;
-    for (uint32_t i = 0; i < fs_max_files; i++) {
+    for (uint32_t i = 0; i < file_capacity; i++) {
         if (!(file_table[i].flags & OSFS2_FLAG_VALID)) {
             slot = (int)i;
             break;
@@ -1496,14 +1671,14 @@ static int osfs2_write_impl(osfs2_file_t *file, uint64_t offset,
 
     /* Inline files: write to model_name field, persist via file table */
     if (file->flags & OSFS2_FLAG_INLINE) {
-        if (offset + len <= OSFS2_INLINE_MAX) {
-            memcpy(file->model_name + offset, buf, len);
-            if (offset + len > file->size) {
-                file->size = offset + len;
-                file->modify_time = osfs2_get_time();
-            }
-            osfs2_write_file_entry(file);
-            return 0;
+        if (end <= OSFS2_INLINE_MAX) {
+            osfs2_file_t after = *file;
+            memcpy(after.model_name + offset, buf, len);
+            if (end > after.size) after.size = end;
+            after.crc32 = 0;
+            after.modify_time = osfs2_get_time();
+            return osfs2_commit_one(OSFS2_JOURNAL_OP_REPLACE,
+                                    (uint32_t)slot, &after);
         }
         /* The file grew past the inline limit → CONVERT it to a block-backed
          * file: allocate an extent, migrate the existing inline bytes into
@@ -1669,6 +1844,89 @@ int osfs2_write(osfs2_file_t *file, uint64_t offset, const void *buf,
     return result;
 }
 
+/* Write within an existing allocation without publishing a new file size.
+ * Boot diagnostics use this with osfs2_set_size_reserved() so their fixed
+ * extent survives each append while normal truncate still reclaims space. */
+static int osfs2_write_data_impl(osfs2_file_t *file, uint64_t offset,
+                                 const void *buf, uint64_t len)
+{
+    if (!mounted || !file || (!buf && len)) return -1;
+    int slot = osfs2_file_slot(file);
+    if (slot < 0 || !(file->flags & OSFS2_FLAG_VALID)) return -1;
+    if (!len) return 0;
+    if (offset > UINT64_MAX - len) return -1;
+
+    uint64_t capacity = (file->flags & OSFS2_FLAG_INLINE)
+                      ? OSFS2_INLINE_MAX
+                      : (uint64_t)file->block_count << blk_shift;
+    if (offset + len > capacity) return -1;
+
+    if (file->flags & OSFS2_FLAG_INLINE) {
+        memcpy(file->model_name + offset, buf, len);
+        return 0;
+    }
+
+    uint64_t absolute = ((uint64_t)file->start_block << blk_shift) + offset;
+    if (osfs2_part_write(absolute, buf, len) < 0) return -1;
+
+    uint32_t first = file->start_block + (uint32_t)(offset >> blk_shift);
+    uint32_t last = file->start_block +
+                    (uint32_t)((offset + len - 1) >> blk_shift);
+    return osfs2_zero_and_flush_crc(first, last - first + 1);
+}
+
+int osfs2_write_data(osfs2_file_t *file, uint64_t offset, const void *buf,
+                     uint64_t len)
+{
+#ifndef __EMSCRIPTEN__
+    if (osfs3_is_mounted()) return osfs3_write_data(file, offset, buf, len);
+#endif
+    osfs2_spin_lock(&mutation_lock);
+    int slot = osfs2_file_slot(file);
+    if (slot >= 0)
+        __atomic_add_fetch(&file_revisions[slot], 1, __ATOMIC_ACQ_REL);
+    int result = osfs2_write_data_impl(file, offset, buf, len);
+    if (slot >= 0)
+        __atomic_add_fetch(&file_revisions[slot], 1, __ATOMIC_RELEASE);
+    osfs2_spin_unlock(&mutation_lock);
+    return result;
+}
+
+static int osfs2_set_size_reserved_impl(osfs2_file_t *file, uint64_t size)
+{
+    if (!mounted || !file || !(file->flags & OSFS2_FLAG_VALID)) return -1;
+    int slot = osfs2_file_slot(file);
+    if (slot < 0) return -1;
+
+    uint64_t capacity = (file->flags & OSFS2_FLAG_INLINE)
+                      ? OSFS2_INLINE_MAX
+                      : (uint64_t)file->block_count << blk_shift;
+    if (size > capacity) return -1;
+
+    osfs2_file_t after = *file;
+    after.size = size;
+    after.crc32 = 0;
+    after.modify_time = osfs2_get_time();
+    return osfs2_commit_one(OSFS2_JOURNAL_OP_REPLACE,
+                            (uint32_t)slot, &after);
+}
+
+int osfs2_set_size_reserved(osfs2_file_t *file, uint64_t size)
+{
+#ifndef __EMSCRIPTEN__
+    if (osfs3_is_mounted()) return osfs3_set_size_reserved(file, size);
+#endif
+    osfs2_spin_lock(&mutation_lock);
+    int slot = osfs2_file_slot(file);
+    if (slot >= 0)
+        __atomic_add_fetch(&file_revisions[slot], 1, __ATOMIC_ACQ_REL);
+    int result = osfs2_set_size_reserved_impl(file, size);
+    if (slot >= 0)
+        __atomic_add_fetch(&file_revisions[slot], 1, __ATOMIC_RELEASE);
+    osfs2_spin_unlock(&mutation_lock);
+    return result;
+}
+
 /* Resize a file without changing its identity. Growth reuses the transactional
  * write path, which relocates extents and zero-fills sparse gaps as needed. */
 static int osfs2_truncate_impl(osfs2_file_t *file, uint64_t size)
@@ -1721,12 +1979,13 @@ static int osfs2_truncate_impl(osfs2_file_t *file, uint64_t size)
         return 0;
     }
 
-    /* Update file size if we wrote past current end */
-    if (offset + len > file->size) {
-        file->size = offset + len;
-        file->modify_time = osfs2_get_time();
-        osfs2_write_file_entry(file);
-    }
+    osfs2_file_t after = *file;
+    after.size = size;
+    after.crc32 = 0;
+    after.modify_time = osfs2_get_time();
+    return osfs2_commit_one(OSFS2_JOURNAL_OP_REPLACE,
+                            (uint32_t)slot, &after);
+}
 
 int osfs2_truncate(osfs2_file_t *file, uint64_t size)
 {
@@ -1788,58 +2047,6 @@ int osfs2_rename(const char *from, const char *to, bool replace)
     return result;
 }
 
-/* Write inside the already allocated capacity without changing visible size.
- * The caller is responsible for a later osfs2_truncate() if the written bytes
- * should become visible. */
-int osfs2_write_data(osfs2_file_t *file, uint64_t offset, const void *buf, uint64_t len)
-{
-    if (!mounted || !file || !buf) return -1;
-
-    if (file->flags & OSFS2_FLAG_INLINE) {
-        if (offset + len > OSFS2_INLINE_MAX) return -1;
-        memcpy(file->model_name + offset, buf, len);
-        osfs2_write_file_entry(file);
-        return 0;
-    }
-
-    if (offset + len > (uint64_t)file->block_count << blk_shift) return -1;
-
-    uint64_t abs_offset = ((uint64_t)file->start_block << blk_shift) + offset;
-    int ret = osfs2_part_write(abs_offset, buf, len);
-    if (ret < 0) return -1;
-
-    if (crc_table && len) {
-        uint32_t first = file->start_block + (uint32_t)(offset >> blk_shift);
-        uint32_t last  = file->start_block + (uint32_t)((offset + len - 1) >> blk_shift);
-        for (uint32_t b = first; b <= last && b < OSFS2_MAX_BLOCKS; b++)
-            crc_table[b] = 0;
-    }
-
-    return 0;
-}
-
-/* Adjust the visible size of a file without reallocating its extent.
- * Used by boot diagnostics to reserve log capacity once, then append while
- * keeping the file length equal to bytes actually written. */
-int osfs2_truncate(osfs2_file_t *file, uint64_t size)
-{
-    if (!mounted || !file) return -1;
-
-    uint64_t capacity = 0;
-    if (file->flags & OSFS2_FLAG_INLINE)
-        capacity = OSFS2_INLINE_MAX;
-    else
-        capacity = (uint64_t)file->block_count << blk_shift;
-    if (size > capacity) return -1;
-
-    file->size = size;
-    file->modify_time = osfs2_get_time();
-    if (osfs2_write_file_entry(file) < 0)
-        return -1;
-    disk_flush();
-    return 0;
-}
-
 /* ── Delete a file ──────────────────────────────────────────── */
 
 static int osfs2_delete_impl(const char *name)
@@ -1880,12 +2087,46 @@ int osfs2_delete(const char *name)
 
 /* ── Accessors ───────────────────────────────────────────────── */
 
-bool osfs2_is_mounted(void)  { return mounted; }
-uint32_t osfs2_file_count(void) { return mounted ? superblock.file_count : 0; }
-uint32_t osfs2_max_files(void) { return mounted ? fs_max_files : 0; }
-const char *osfs2_label(void) { return mounted ? superblock.label : ""; }
-uint64_t osfs2_file_size(osfs2_file_t *file) { return file ? file->size : 0; }
-const char *osfs2_file_name(osfs2_file_t *file) { return file ? file->name : NULL; }
+bool osfs2_is_mounted(void)
+{
+#ifndef __EMSCRIPTEN__
+    if (osfs3_is_mounted()) return true;
+#endif
+    return mounted;
+}
+
+uint32_t osfs2_file_count(void)
+{
+#ifndef __EMSCRIPTEN__
+    if (osfs3_is_mounted()) return osfs3_file_count();
+#endif
+    return mounted ? superblock.file_count : 0;
+}
+
+const char *osfs2_label(void)
+{
+#ifndef __EMSCRIPTEN__
+    if (osfs3_is_mounted()) return osfs3_label();
+#endif
+    return mounted ? superblock.label : "";
+}
+
+uint64_t osfs2_file_size(osfs2_file_t *file)
+{
+#ifndef __EMSCRIPTEN__
+    if (osfs3_is_mounted()) return osfs3_file_size(file);
+#endif
+    return file ? file->size : 0;
+}
+
+const char *osfs2_file_name(osfs2_file_t *file)
+{
+#ifndef __EMSCRIPTEN__
+    if (osfs3_is_mounted()) return osfs3_file_name(file);
+#endif
+    return osfs2_entry_name(file);
+}
+
 osfs2_file_t *osfs2_file_by_index(uint32_t idx)
 {
 #ifndef __EMSCRIPTEN__
@@ -1894,7 +2135,7 @@ osfs2_file_t *osfs2_file_by_index(uint32_t idx)
 #endif
     if (!mounted) return NULL;
     uint32_t n = 0;
-    for (uint32_t i = 0; i < fs_max_files; i++) {
+    for (uint32_t i = 0; i < file_capacity; i++) {
         if (file_table[i].flags & OSFS2_FLAG_VALID) {
             if (n == idx) return &file_table[i];
             n++;
@@ -1974,7 +2215,7 @@ osfs2_file_t *osfs2_file_at(uint32_t index)
 #endif
     if (!mounted || !file_table) return NULL;
     uint32_t count = 0;
-    for (uint32_t i = 0; i < fs_max_files; i++) {
+    for (uint32_t i = 0; i < file_capacity; i++) {
         if (file_table[i].flags & OSFS2_FLAG_VALID) {
             if (count == index) return &file_table[i];
             count++;

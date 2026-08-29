@@ -18,6 +18,12 @@ static struct {
 } g_abi[WIN32_ABI_MAX_DLLS];
 static int g_abi_count;
 
+static struct {
+    const void *native_target;
+    const void *compat32_target;
+} g_compat32_bridges[WIN32_ABI_MAX_COMPAT32_BRIDGES];
+static int g_compat32_bridge_count;
+
 void win32_abi_reset(void)
 {
     for (int i = 0; i < WIN32_ABI_MAX_DLLS; i++) {

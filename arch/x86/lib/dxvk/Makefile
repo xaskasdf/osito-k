@@ -43,12 +43,23 @@ SHADER_SRCS := \
 SHADER_HEADERS := $(foreach src,$(SHADER_SRCS),\
   $(GENERATED_DIR)/$(basename $(notdir $(src))).h)
 
-ifeq ($(origin CC),default)
-CC := $(patsubst %g++,%gcc,$(CXX))
-endif
+define make_shader_rule
+$(GENERATED_DIR)/$(basename $(notdir $(1))).h: $(1)
+	@mkdir -p $$(dir $$@)
+	@echo "  GLSL  $$(notdir $$<)"
+	@$$(GLSLANG) --quiet --target-env vulkan1.3 \
+		--vn $$(basename $$(notdir $$<)) $$< -o $$@
+endef
 
-GCC_INC     := $(shell $(CXX) -print-file-name=include)
-GCC_CXX_INC := $(shell $(CXX) -print-file-name=include) # placeholder
+$(foreach src,$(SHADER_SRCS),$(eval $(call make_shader_rule,$(src))))
+
+OSITOK_TOOLCHAIN_ROOT ?= /root/x-tools
+OSITOK_TARGET ?= x86_64-linux-musl
+OSITOK_BIN := $(OSITOK_TOOLCHAIN_ROOT)/bin
+
+CXX := $(OSITOK_BIN)/$(OSITOK_TARGET)-g++
+CC  := $(OSITOK_BIN)/$(OSITOK_TARGET)-gcc
+AR  := $(OSITOK_BIN)/$(OSITOK_TARGET)-ar
 
 INCLUDES := \
   -I$(DXVK_ROOT)/com_stub \
@@ -170,12 +181,7 @@ UTIL_C_SRCS := \
 # blocks incompatible with -fno-exceptions; tracked so we can lift them
 # wave by wave):
 #
-#   dxvk/src/util/util_fps_limiter.cpp  -- catches std::invalid_argument
-#                                          from std::stod when DXVK_FRAME_RATE
-#                                          env var fails to parse.  Trivial
-#                                          to patch (W5.1 hand-edit).
-#   dxvk/src/util/util_gdi.cpp          -- needs HDC + GDI bitmap copy
-#   dxvk/src/util/util_shared_res.cpp   -- needs winioctl IOCTL_*
+#   dxvk/src/util/sha1/sha1.c           -- header-only path covered
 #   dxvk/src/util/com/com_guid.cpp      -- includes d3d11_interfaces.h /
 #                                          dxgi_interfaces.h / dxvk_hash.h
 #                                          which arrive in W5.1+.  Deferred.

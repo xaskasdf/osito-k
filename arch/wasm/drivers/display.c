@@ -12,6 +12,8 @@
 #include <string.h>
 #include <emscripten.h>
 
+#include "sys/display_syscalls.h"
+
 extern void serial_puts(const char *s);
 extern void serial_putdec(uint64_t val);
 
@@ -22,6 +24,7 @@ static uint32_t  disp_w, disp_h, disp_pitch;
 static uint64_t  disp_fb_size;
 static bool      disp_dirty;
 static bool      disp_initialized;
+static uint32_t  disp_refresh_hz = 60;
 
 /* ── Display API ───────────────────────────────────────────── */
 
@@ -29,11 +32,10 @@ int display_init(uint32_t *gop_base, uint32_t width, uint32_t height,
                  uint32_t pitch, uint32_t target_fps)
 {
     (void)gop_base;
-    (void)target_fps;
-
     disp_w     = width;
     disp_h     = height;
     disp_pitch = pitch;
+    disp_refresh_hz = target_fps ? target_fps : 60;
     disp_fb_size = (uint64_t)pitch * height * sizeof(uint32_t);
 
     back_buf = (uint32_t *)malloc((size_t)disp_fb_size);
@@ -173,7 +175,7 @@ void display_force_refresh(void) { disp_dirty = true; display_blit(); }
 
 void display_wait_vblank(void)
 {
-    emscripten_sleep(16);  /* ~60 fps */
+    emscripten_sleep((int)(1000 / disp_refresh_hz));
 }
 
 uint32_t *display_get_back_buffer(void) { return back_buf; }
@@ -185,3 +187,48 @@ uint32_t  display_get_pitch(void)       { return disp_pitch; }
 typedef struct { uint32_t w, h, p, f; } boot_display_mode_t;
 void display_set_available_modes(const boot_display_mode_t *m, uint32_t n, uint32_t c)
 { (void)m; (void)n; (void)c; }
+
+static int display_fill_mode(display_mode_info_t *out)
+{
+    if (!out || !disp_initialized) return -1;
+    out->width = disp_w;
+    out->height = disp_h;
+    out->pitch = disp_pitch;
+    out->pixel_format = 0;
+    out->refresh_hz = disp_refresh_hz;
+    out->flags = DISPLAY_MODE_CURRENT | DISPLAY_MODE_HARDWARE;
+    out->backend = DISPLAY_BACKEND_NONE;
+    out->reserved = 0;
+    return 0;
+}
+
+uint32_t display_get_mode_count(void)
+{
+    return disp_initialized ? 1 : 0;
+}
+
+int display_modeset_get_mode(uint32_t index, display_mode_info_t *out)
+{
+    return index == 0 ? display_fill_mode(out) : -1;
+}
+
+int display_modeset_get_current(display_mode_info_t *out)
+{
+    return display_fill_mode(out);
+}
+
+int display_modeset_set(uint32_t width, uint32_t height,
+                        uint32_t refresh_hz, uint32_t flags)
+{
+    if (!disp_initialized || refresh_hz > 1000) return -1;
+    if (flags & DISPLAY_SET_NATIVE) {
+        width = disp_w;
+        height = disp_h;
+    }
+    if (!(flags & DISPLAY_SET_REFRESH_ONLY) &&
+            (width != disp_w || height != disp_h)) {
+        return -1;
+    }
+    if (refresh_hz) disp_refresh_hz = refresh_hz;
+    return 0;
+}

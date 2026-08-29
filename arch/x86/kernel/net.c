@@ -1113,6 +1113,7 @@ void __hot net_poll(void)
         return;
     }
 
+    net_deferred_cb_t deferred[NET_MAX_ASYNC_OPS] = {0};
     uint32_t len = 0;
 
     /* NAPI: check if interrupt flagged pending packets */

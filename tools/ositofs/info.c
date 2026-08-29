@@ -47,6 +47,9 @@ int main(int argc, char **argv)
     }
 
     uint64_t dev_size = osfs2_device_size(fd);
+    uint32_t max_files = osfs2_layout_max_files(&sb);
+    uint32_t filetab_size = osfs2_layout_filetab_size(&sb);
+    uint32_t metadata_bytes = osfs2_layout_data_off(&sb);
 
     printf("OsitoFS v2 — Filesystem Info\n");
     printf("════════════════════════════════════════\n");
@@ -57,10 +60,7 @@ int main(int argc, char **argv)
     printf("Version:        %u\n", sb.version);
     printf("Block size:     "); osfs2_print_size(sb.block_size); printf("\n");
     printf("Total blocks:   %u\n", sb.total_blocks);
-    uint32_t max_files = osfs2_layout_max_files(&sb);
-    uint32_t filetab_size = osfs2_layout_filetab_size(&sb);
     uint32_t data_start = osfs2_layout_data_start_blk(&sb);
-    uint32_t metadata_bytes = osfs2_layout_data_off(&sb);
     printf("Used blocks:    %u (metadata: %u, data: %u)\n",
            sb.used_blocks, data_start,
            sb.used_blocks > data_start ?

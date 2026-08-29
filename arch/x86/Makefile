@@ -385,7 +385,7 @@ $(BUILD)/win32/if_audit.o: win32/if_audit.c | $(BUILD)/win32
 
 # GCC-only Win32 precompiled files: use KCFLAGS_PRECOMP (TCC stack compat)
 $(BUILD)/win32/compat32.o: win32/compat32.c | $(BUILD)/win32
-	$(CC) $(filter-out -fno-pie,$(KCFLAGS_PRECOMP)) -fPIE -fno-jump-tables -Iwin32 -c -o $@ $<
+	$(CC) $(filter-out -fno-pie,$(KCFLAGS_PRECOMP)) $(WIN32_IF_AUDIT_FLAGS) -fPIE -fno-jump-tables -Iwin32 -c -o $@ $<
 
 $(BUILD)/win32/msvcrt_shim.o: win32/msvcrt_shim.c | $(BUILD)/win32
 	$(CC) $(KCFLAGS_PRECOMP) $(WIN32_IF_AUDIT_FLAGS) -Iwin32 -c -o $@ $<

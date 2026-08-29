@@ -26,21 +26,14 @@
 #define OSFS3_BLOCK_BITMAP_BLK   2U
 #define OSFS3_INODE_TABLE_BLK    3U
 
-#define OSFS3_SUPERBLOCK_BLK  0
-#define OSFS3_INODE_BITMAP_BLK 1
-#define OSFS3_BLOCK_BITMAP_BLK 2
-#define OSFS3_INODE_TABLE_BLK  3
-/* Block 1: Inode Bitmap */
-/* Block 2: Block Bitmap */
-/* Block 3..K: Inode Table */
-/* Block K+1..N: Data Blocks */
+#define OSFS3_DEFAULT_INODES     16384U
+#define OSFS3_MAX_INODES         131072U
+#define OSFS3_MAX_EXTENTS        12U
+#define OSFS3_NAME_MAX           255U
+#define OSFS3_PATH_MAX           260U
+#define OSFS3_BITMAP_BITS        (OSFS3_BLOCK_SIZE * 8U)
 
-#define OSFS3_INODES_PER_BLOCK (OSFS3_BLOCK_SIZE / sizeof(osfs3_inode_t))
-#define OSFS3_MAX_EXTENTS      12  /* Direct extents per inode before indirection (future) */
-#define OSFS3_NAME_MAX         255 /* Maximum length of a filename */
-#define OSFS3_DEFAULT_INODES   16384
-
-/* File types (matching POSIX S_IFMT) */
+/* File types, matching the POSIX S_IFMT values. */
 #define OSFS3_S_IFMT   0170000
 #define OSFS3_S_IFSOCK 0140000
 #define OSFS3_S_IFLNK  0120000
@@ -108,32 +101,40 @@ typedef struct __attribute__((packed)) {
 _Static_assert(sizeof(osfs3_inode_t) == 256,
                "OsitoFS v3 inode must be 256 bytes");
 
-/* ── Layout helpers ─────────────────────────────────────────── */
+#define OSFS3_INODES_PER_BLOCK \
+    (OSFS3_BLOCK_SIZE / (uint32_t)sizeof(osfs3_inode_t))
+#define OSFS3_INODE_TABLE_BLOCKS(inodes) \
+    (((inodes) + OSFS3_INODES_PER_BLOCK - 1U) / OSFS3_INODES_PER_BLOCK)
+#define OSFS3_FIRST_DATA_BLOCK(inodes) \
+    (OSFS3_INODE_TABLE_BLK + OSFS3_INODE_TABLE_BLOCKS(inodes))
 
-static inline uint32_t osfs3_inode_table_blocks(uint32_t total_inodes) {
-    return (total_inodes + OSFS3_INODES_PER_BLOCK - 1) / OSFS3_INODES_PER_BLOCK;
+static inline uint32_t osfs3_inode_table_blocks(uint32_t total_inodes)
+{
+    return OSFS3_INODE_TABLE_BLOCKS(total_inodes);
 }
 
-static inline uint32_t osfs3_first_data_block_for_inodes(uint32_t total_inodes) {
-    return OSFS3_INODE_TABLE_BLK + osfs3_inode_table_blocks(total_inodes);
+static inline uint32_t osfs3_first_data_block_for_inodes(
+    uint32_t total_inodes)
+{
+    return OSFS3_FIRST_DATA_BLOCK(total_inodes);
 }
 
-static inline uint32_t osfs3_max_inodes(void) {
-    return OSFS3_BLOCK_SIZE * 8; /* One 1MB inode bitmap. */
+static inline uint32_t osfs3_max_inodes(void)
+{
+    return OSFS3_BITMAP_BITS;
 }
 
-static inline uint32_t osfs3_max_blocks(void) {
-    return OSFS3_BLOCK_SIZE * 8; /* One 1MB block bitmap. */
+static inline uint32_t osfs3_max_blocks(void)
+{
+    return OSFS3_BITMAP_BITS;
 }
 
-static inline int osfs3_valid_inode_count(uint32_t total_inodes) {
+static inline int osfs3_valid_inode_count(uint32_t total_inodes)
+{
     return total_inodes >= OSFS3_INODES_PER_BLOCK &&
            total_inodes <= osfs3_max_inodes() &&
            (total_inodes % OSFS3_INODES_PER_BLOCK) == 0;
 }
-
-/* ── Directory Entry (Variable length) ───────────────────────── */
-/* Directories are just files (S_IFDIR) containing a sequence of these entries. */
 
 /* Directories are files containing aligned, variable-length records. */
 typedef struct __attribute__((packed)) {

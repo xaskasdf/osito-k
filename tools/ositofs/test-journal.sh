@@ -149,7 +149,8 @@ old_data=$TMP_ROOT/old-data.bin
 extracted=$TMP_ROOT/extracted.bin
 truncate -s 5M "$full"
 dd if=/dev/zero of="$old_data" bs=65536 count=16 status=none
-"$TOOLS/mkfs.ositofs" "$full" --block-size 65536 >/dev/null
+"$TOOLS/mkfs.ositofs" "$full" --block-size 65536 \
+    --file-slots 4096 >/dev/null
 "$TOOLS/ositofs-write" "$full" "$old_data" --name full >/dev/null
 if "$TOOLS/ositofs-write" "$full" "$TOOLS/common.c" \
         --name full --overwrite >/dev/null 2>&1; then

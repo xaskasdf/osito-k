@@ -15,6 +15,8 @@
 #include "../include/types.h"
 #include "../include/fd.h"
 #include "../include/paging.h"
+#include "../include/interrupt.h"
+#include "../include/sys_caps.h"
 #include "smp.h"
 
 /* ── External functions ──────────────────────────────────────── */
@@ -397,6 +399,7 @@ static void runq_dequeue(int idx);
 static inline void proc_transition(process_t *p, uint32_t new_state);
 static void runq_init(void);
 static void futex_cleanup_process(process_t *p);
+static void sched_sleep_timeout_sweep(uint64_t now);
 
 /* ── Exec cache: reuse read-only ELF segments across exec() ─── */
 
@@ -513,14 +516,7 @@ static void fpu_state_init(uint8_t *state)
 
 void fpu_percpu_init(void)
 {
-    fpu_state_init(fpu_state_kernel);
     for (int i = 0; i < FPU_MAX_CPUS; i++)
-        fpu_state_init(fpu_state_ap_bufs[i]);
-
-    /* BSP (index 0) starts with kernel default */
-    fpu_state_ptrs[0] = fpu_state_kernel;
-    /* APs get their own static buffers */
-    for (int i = 1; i < FPU_MAX_CPUS; i++)
         fpu_state_ptrs[i] = fpu_state_ap_bufs[i];
     extern uint32_t idt_get_bsp_apic_id(void);
     fpu_state_ptrs[idt_get_bsp_apic_id() & 0xFF] = fpu_state_kernel;
@@ -676,12 +672,30 @@ static void runq_init(void)
 
 static process_t *proc_alloc(const char *name)
 {
-    for (int i = 0; i < MAX_PROCESSES; i++) {
-        if (proctab[i].state == PROC_FREE) {
-            process_t *p = &proctab[i];
-            memset(p, 0, sizeof(*p));
-            fpu_state_init(p->fpu_state);
-            p->pid = next_pid++;
+    for (int i = 0; i < proc_capacity; i++) {
+        process_t *p = &proctab[i];
+        uint32_t expected = PROC_FREE;
+        if (__atomic_compare_exchange_n(&p->state, &expected,
+                                        PROC_ALLOCATING, false,
+                                        __ATOMIC_ACQ_REL,
+                                        __ATOMIC_ACQUIRE)) {
+            if (ntsync_cancel_waiter)
+                ntsync_cancel_waiter(i);
+            /* Keep state reserved while clearing a reused slot. A task may be
+             * preempted here and another proc_alloc() must not claim it. */
+            memset(p->name, 0,
+                   sizeof(*p) - __builtin_offsetof(process_t, name));
+            *(uint16_t *)&p->fpu_state[0] = 0x037F;
+            *(uint32_t *)&p->fpu_state[24] = 0x00001F80;
+            *(uint32_t *)&p->fpu_state[28] = 0x0000FFFF;
+            sched_compat_ist1[i] = 0;
+            sched_compat_ist1_phys[i] = NULL;
+            sched_frame_seq[i] = 0;
+            sched_frame_resumed_seq[i] = 0;
+            sched_frame_stack_rsp[i] = 0;
+            sched_frame_stack_qword0[i] = 0;
+            sched_frame_stack_qword1[i] = 0;
+            p->pid = __atomic_fetch_add(&next_pid, 1, __ATOMIC_RELAXED);
             p->ppid = current_proc ? current_proc->pid : 0;
             /* State stays PROC_ALLOCATING until the caller publishes the
              * fully initialized task as READY/RUNNING. */
@@ -732,7 +746,144 @@ static process_t *proc_alloc(const char *name)
 static void proc_attach_thread(process_t *thread, process_t *parent,
                                uint32_t parent_pid)
 {
-    futex_cleanup_process(p);
+    if (!thread || !parent) return;
+
+    fd_table_t *private_fds = thread->fd_table;
+    thread->tgid = parent->tgid;
+    thread->ppid = parent_pid;
+    thread->is_thread = true;
+    thread->cr3 = parent->cr3;
+    thread->owns_cr3 = false;
+    thread->region_count = 0;
+
+    if (parent->fd_table && private_fds != parent->fd_table) {
+        thread->fd_table = parent->fd_table;
+        thread->fd_table->refcount++;
+        if (private_fds) kfree(private_fds);
+    }
+}
+
+int sched_alloc_compat_ist1(uint32_t pid)
+{
+    for (int i = 0; i < proc_capacity; i++) {
+        if (proctab[i].state == PROC_FREE || proctab[i].pid != pid)
+            continue;
+        if (sched_compat_ist1_phys[i]) {
+            if (!sched_compat_ist1_contains(i, sched_compat_ist1[i])) {
+                sched_compat_ist1[i] =
+                    (uint64_t)PHYS_TO_VIRT(sched_compat_ist1_phys[i]) +
+                    COMPAT_IST1_STACK_SIZE;
+            }
+            return 0;
+        }
+
+        void *phys = mem_alloc_aligned(COMPAT_IST1_STACK_SIZE, 4096);
+        if (!phys)
+            return -1;
+        sched_compat_ist1_phys[i] = phys;
+        sched_compat_ist1[i] = (uint64_t)PHYS_TO_VIRT(phys) +
+                               COMPAT_IST1_STACK_SIZE;
+        return 0;
+    }
+    return -1;
+}
+
+static void proc_release_kernel_stack(process_t *p)
+{
+    if (!p || !p->kernel_stack) return;
+
+    void *stack = p->kernel_stack;
+    uint64_t stack_virt = (uint64_t)stack;
+    uint64_t stack_phys = VIRT_TO_PHYS(stack);
+    uint64_t mapped = paging_translate_in_cr3(paging_get_kernel_cr3(),
+                                               stack_virt);
+
+    if (mapped == UINT64_MAX) {
+        if (paging_restore_direct_map_page(stack_phys) < 0) {
+            serial_puts("[SCHED] refusing to free poisoned stack pid=");
+            serial_putdec(p->pid);
+            serial_puts(" phys=0x");
+            serial_puthex(stack_phys, 16);
+            serial_puts("\n");
+            p->kernel_stack = NULL;
+            return;
+        }
+    } else if ((mapped & ~0xFFFULL) != stack_phys) {
+        serial_puts("[SCHED] refusing to free aliased stack pid=");
+        serial_putdec(p->pid);
+        serial_puts(" expected=0x");
+        serial_puthex(stack_phys, 16);
+        serial_puts(" mapped=0x");
+        serial_puthex(mapped, 16);
+        serial_puts("\n");
+        p->kernel_stack = NULL;
+        return;
+    }
+
+    p->kernel_stack = NULL;
+    mem_free_pages((void *)stack_phys, KERNEL_STACK_SIZE / 4096);
+}
+
+static bool proc_free(process_t *p);
+
+/* The PML4 owner must outlive every scheduler task that references it.
+ * Zombie siblings are reclaimed first so their thread-owned mappings can
+ * still be walked through a valid CR3. */
+static bool proc_cr3_peers_quiesced(const process_t *owner)
+{
+    if (!owner || !owner->owns_cr3 || !owner->cr3 ||
+        owner->cr3 == paging_get_kernel_cr3())
+        return true;
+
+    for (int i = 0; i < proc_capacity; i++) {
+        const process_t *peer = &proctab[i];
+        if (peer == owner || peer->state == PROC_FREE ||
+            peer->cr3 != owner->cr3)
+            continue;
+        if (peer->owns_cr3 || peer->state != PROC_ZOMBIE ||
+            peer == current_proc || i == sched_current_idx)
+            return false;
+    }
+    return true;
+}
+
+static bool proc_reap_cr3_peers(process_t *owner)
+{
+    if (!proc_cr3_peers_quiesced(owner))
+        return false;
+
+    for (int i = 0; i < proc_capacity; i++) {
+        process_t *peer = &proctab[i];
+        if (peer == owner || peer->state == PROC_FREE ||
+            peer->cr3 != owner->cr3)
+            continue;
+        if (!proc_free(peer))
+            return false;
+    }
+    return true;
+}
+
+static bool proc_free(process_t *p)
+{
+    if (!p)
+        return false;
+
+    /* Only the address-space owner coordinates peer teardown.  Calling
+     * proc_reap_cr3_peers() for a non-owning thread makes that thread reap
+     * the owner, which then tries to reap the thread again.  The resulting
+     * proc_free() recursion eventually runs below the task's kernel stack
+     * and corrupts unrelated DMA buffers. */
+    if (p->owns_cr3 && !proc_reap_cr3_peers(p))
+        return false;
+
+    int slot = (int)(p - proctab);
+    if (ntsync_cancel_waiter)
+        ntsync_cancel_waiter(slot);
+
+    /* A faulted Win32 scheduler task cannot run its normal thread epilogue.
+     * Retire the compatibility-layer context while its PID is still valid. */
+    if (win32_kernel_thread_reaped)
+        win32_kernel_thread_reaped(p->pid, p->exit_code);
 
     /* Free memory regions (ELF segments + stack) */
     for (int i = 0; i < p->region_count; i++) {
@@ -1136,7 +1287,7 @@ int32_t proc_tgid_of(void *p)
 
     uintptr_t addr = (uintptr_t)p;
     uintptr_t base = (uintptr_t)&proctab[0];
-    uintptr_t end  = (uintptr_t)&proctab[MAX_PROCESSES];
+    uintptr_t end  = (uintptr_t)&proctab[proc_capacity];
 
     if (addr < base || addr >= end ||
         ((addr - base) % sizeof(process_t)) != 0) {
@@ -2236,9 +2387,8 @@ void __hot sched_tick(void *frame_ptr)
     uint64_t active_cr3;
     __asm__ volatile ("mov %%cr3, %0" : "=r"(active_cr3));
 
-    /* Sanity check: verify the interrupt frame at kernel_rsp has
-     * a valid CS selector and the canary we planted at save time. */
-    if (next->kernel_rsp >= 0xFFFF800000000000ULL || next->cr3 == active_cr3) {
+    /* Sanity check the incoming task-owned interrupt frame. */
+    {
         uint64_t *frame = (uint64_t *)next->kernel_rsp;
         if (!next->sched_frame_valid || !frame) {
             serial_puts("[SCHED] PID has no saved frame: ");
@@ -2254,11 +2404,42 @@ void __hot sched_tick(void *frame_ptr)
         uint64_t vec = frame[15];
         uint64_t ss  = frame[21];
         uint64_t rsp_saved = frame[20];
-        bool bad_cs  = !sched_valid_frame_cs(cs);
-        bool has_saved_ss = (vec != 32);
-        bool bad_ss  = has_saved_ss &&
-                       (ss != 0x30 && ss != 0x98 &&
-                        ss != 0x3B && ss != 0x00);
+        if (!(frame[19] & (1ULL << 9)) &&
+            sched_irq_off_restore_logs++ < 32) {
+            serial_puts("[SCHED-RESTORE-IF0] pid=");
+            serial_putdec(next->pid);
+            serial_puts(" by_pid=");
+            serial_putdec(cur->pid);
+            serial_puts(" compat32=");
+            serial_putdec((uint64_t)(uint32_t)next->compat32_mode);
+            serial_puts(" state=");
+            serial_putdec(next->state);
+            serial_puts(" rip=0x");
+            serial_puthex(rip, 16);
+            serial_puts("\n");
+        }
+        if (next_seq && next->saved_frame_rip &&
+            rip != next->saved_frame_rip) {
+            serial_puts("[SCHED-RIP-CLOBBER] pid=");
+            serial_putdec(next->pid);
+            serial_puts(" by_pid=");
+            serial_putdec(cur->pid);
+            serial_puts(" seq=");
+            serial_putdec(next_seq);
+            serial_puts(" saved=0x");
+            serial_puthex(next->saved_frame_rip, 16);
+            serial_puts(" current=0x");
+            serial_puthex(rip, 16);
+            serial_puts(" rsp=0x");
+            serial_puthex(rsp_saved, 16);
+            serial_puts("\n");
+            frame[17] = next->saved_frame_rip;
+            rip = next->saved_frame_rip;
+        }
+        bool bad_cs  = (cs != 0x38 && cs != 0x28 && cs != 0x43 && cs != 0x40);
+        /* Native shims may yield before returning to compat32, while SS is
+         * still the valid 32-bit data selector used by the caller. */
+        bool bad_ss  = (ss != 0x30 && ss != 0x48 && ss != 0x3B && ss != 0x00);
         /* A low (user-space) RIP is corruption only for a KERNEL thread,
          * whose entry is a kernel function at a high RIP. User-ELF processes
          * legitimately run their own code at low addresses (e.g. 0x20000000)
@@ -3199,14 +3380,14 @@ static int futex_waiter_capacity;
 static int16_t futex_buckets[FUTEX_HASH_SIZE];  /* heads, -1 = empty */
 static int16_t futex_free_head = -1;            /* free slot list */
 static int      futex_timed_count = 0;          /* # of active timed waiters;
-                                                 * lets sched_tick skip the
-                                                 * deadline sweep when zero */
+                                                  * lets sched_tick skip the
+                                                  * deadline sweep when zero */
 static spinlock_t futex_lock = SPINLOCK_INIT;
 
 static inline uint64_t futex_lock_irqsave(void)
 {
     uint64_t flags;
-    __asm__ volatile ("pushfq; pop %0; cli" : "=r"(flags) :: "memory");
+    __asm__ volatile ("pushfq; popq %0; cli" : "=r"(flags) :: "memory");
     spin_lock(&futex_lock);
     return flags;
 }
@@ -3283,7 +3464,7 @@ static int futex_validate_uaddr(uint64_t uaddr)
 
 static inline bool futex_slot_valid(int idx)
 {
-    return idx >= 0 && idx < MAX_FUTEX_WAITERS;
+    return idx >= 0 && idx < futex_waiter_capacity;
 }
 
 static void futex_log_corrupt(const char *where, int idx)
@@ -3332,15 +3513,18 @@ int futex_do_wait(uint64_t uaddr, int expected, uint64_t space,
     volatile int *addr = (volatile int *)uaddr;
     uint64_t flags = futex_lock_irqsave();
 
+    /* Serialize the value recheck with waiter publication. Otherwise a waker
+     * can update the word and complete FUTEX_WAKE between the userspace check
+     * and bucket insertion, leaving this task blocked forever. */
     if (*addr != expected) {
         futex_unlock_irqrestore(flags);
-        return -FUTEX_EAGAIN;
+        return -11; /* EAGAIN */
     }
 
     /* Allocate from free list */
     if (futex_free_head < 0) {
         futex_unlock_irqrestore(flags);
-        return -FUTEX_ENOMEM;
+        return -12; /* ENOMEM */
     }
     int slot = futex_free_head;
     futex_free_head = futex_waiters[slot].next;
@@ -3391,7 +3575,7 @@ int futex_do_wait(uint64_t uaddr, int expected, uint64_t space,
     /* Unlink from bucket (may already be unlinked by wake) */
     int16_t *pp = &futex_buckets[cleanup_bucket];
     int guard = 0;
-    while (*pp >= 0 && guard++ < MAX_FUTEX_WAITERS) {
+    while (*pp >= 0 && guard++ < futex_waiter_capacity) {
         int idx = *pp;
         if (!futex_slot_valid(idx)) {
             futex_log_corrupt("wait-cleanup", idx);
@@ -3422,7 +3606,7 @@ int futex_do_wake(uint64_t uaddr, uint64_t space, int count)
     int16_t *pp = &futex_buckets[bucket];
 
     int guard = 0;
-    while (*pp >= 0 && woken < count && guard++ < MAX_FUTEX_WAITERS) {
+    while (*pp >= 0 && woken < count && guard++ < futex_waiter_capacity) {
         int16_t idx = *pp;
         if (!futex_slot_valid(idx)) {
             futex_log_corrupt("wake", idx);
@@ -3437,13 +3621,7 @@ int futex_do_wake(uint64_t uaddr, uint64_t space, int count)
                 proc_transition(&proctab[pidx], PROC_READY);
                 woken++;
             }
-            /*
-             * Unlink from the bucket, but do not return the waiter slot to
-             * the free list here. The sleeping thread still owns `slot` and
-             * will read timed_out plus release the slot after it resumes from
-             * futex_do_wait(). Returning it here races a new waiter into the
-             * same slot and then double-frees it when the old waiter wakes.
-             */
+            /* Unlink now; the resumed waiter owns and releases its slot. */
             w->active = false;
             if (w->deadline) {
                 w->deadline = 0;
@@ -3455,7 +3633,7 @@ int futex_do_wake(uint64_t uaddr, uint64_t space, int count)
             pp = &w->next;
         }
     }
-    if (*pp >= 0 && guard >= MAX_FUTEX_WAITERS) {
+    if (*pp >= 0 && guard >= futex_waiter_capacity) {
         futex_log_corrupt("wake-loop", *pp);
         *pp = -1;
     }
@@ -3489,7 +3667,7 @@ static int futex_requeue_locked(uint64_t uaddr, uint64_t space, int wake_count,
 
     int guard = 0;
     while (*pp >= 0 &&
-           guard++ < MAX_FUTEX_WAITERS &&
+           guard++ < futex_waiter_capacity &&
            (woken < wake_count || (can_requeue && requeued < requeue_count))) {
         int16_t idx = *pp;
         if (!futex_slot_valid(idx)) {
@@ -3502,7 +3680,7 @@ static int futex_requeue_locked(uint64_t uaddr, uint64_t space, int wake_count,
         if (w->active && w->addr == uaddr && w->space == space) {
             if (woken < wake_count) {
                 int pidx = w->proc_idx;
-                if (pidx >= 0 && pidx < MAX_PROCESSES &&
+                if (pidx >= 0 && pidx < proc_capacity &&
                     proctab[pidx].state == PROC_BLOCKED) {
                     proc_transition(&proctab[pidx], PROC_READY);
                     woken++;
@@ -3526,7 +3704,7 @@ static int futex_requeue_locked(uint64_t uaddr, uint64_t space, int wake_count,
             pp = &w->next;
         }
     }
-    if (*pp >= 0 && guard >= MAX_FUTEX_WAITERS) {
+    if (*pp >= 0 && guard >= futex_waiter_capacity) {
         futex_log_corrupt("requeue-loop", *pp);
         *pp = -1;
     }
@@ -3534,7 +3712,7 @@ static int futex_requeue_locked(uint64_t uaddr, uint64_t space, int wake_count,
     if (moved_head >= 0) {
         uint32_t dst_bucket = futex_hash(uaddr2, space2);
         guard = 0;
-        while (moved_head >= 0 && guard++ < MAX_FUTEX_WAITERS) {
+        while (moved_head >= 0 && guard++ < futex_waiter_capacity) {
             int16_t idx = moved_head;
             if (!futex_slot_valid(idx)) {
                 futex_log_corrupt("requeue-moved", idx);
@@ -3632,7 +3810,7 @@ static void futex_cleanup_process(process_t *p)
 {
     if (!p) return;
     int pidx = (int)(p - &proctab[0]);
-    if (pidx < 0 || pidx >= MAX_PROCESSES) return;
+    if (pidx < 0 || pidx >= proc_capacity) return;
 
     uint64_t flags = futex_lock_irqsave();
     int dropped = 0;
@@ -3640,7 +3818,7 @@ static void futex_cleanup_process(process_t *p)
     for (int b = 0; b < FUTEX_HASH_SIZE; b++) {
         int16_t *pp = &futex_buckets[b];
         int guard = 0;
-        while (*pp >= 0 && guard++ < MAX_FUTEX_WAITERS) {
+        while (*pp >= 0 && guard++ < futex_waiter_capacity) {
             int idx = *pp;
             if (!futex_slot_valid(idx)) {
                 futex_log_corrupt("cleanup-proc", idx);
@@ -3666,7 +3844,7 @@ static void futex_cleanup_process(process_t *p)
             futex_free_head = (int16_t)idx;
             dropped++;
         }
-        if (*pp >= 0 && guard >= MAX_FUTEX_WAITERS) {
+        if (*pp >= 0 && guard >= futex_waiter_capacity) {
             futex_log_corrupt("cleanup-proc-loop", *pp);
             *pp = -1;
         }

@@ -110,22 +110,9 @@ static int extract_file(int fd, osfs2_file_t *f, const char *output)
     }
 
     if (f->flags & OSFS2_FLAG_INLINE) {
-        if (file_size > OSFS2_INLINE_MAX) {
-            fprintf(stderr, "ositofs-read: inline file '%s' has invalid size %llu\n",
-                    f->name, (unsigned long long)file_size);
-            close(out_fd);
-            return -1;
-        }
-        if (file_size) {
-            ssize_t n = write(out_fd, f->model_name, (size_t)file_size);
-            if (n != (ssize_t)file_size) {
-                perror("write output");
-                close(out_fd);
-                return -1;
-            }
-        }
+        ssize_t written = write(out_fd, f->model_name, (size_t)file_size);
         close(out_fd);
-        return 0;
+        return written == (ssize_t)file_size ? 0 : -1;
     }
 
     void *data_blk = osfs2_alloc_block();
@@ -277,7 +264,7 @@ int main(int argc, char **argv)
 
     for (uint32_t i = 0; i < max_files; i++) {
         if (!(ft[i].flags & OSFS2_FLAG_VALID)) continue;
-        if (entry_matches(&ft[i], pattern))
+        if (wildcard_match(pattern, osfs2_entry_name(&ft[i])))
             matches[match_count++] = (int)i;
     }
 
@@ -292,7 +279,7 @@ int main(int argc, char **argv)
     /* Single file with explicit output path (legacy mode) */
     if (match_count == 1 && output_path) {
         osfs2_file_t *f = &ft[matches[0]];
-        fprintf(stderr, "Extracting '%s' (", display_name(f));
+        fprintf(stderr, "Extracting '%s' (", osfs2_entry_name(f));
         fprint_size(stderr, f->size);
         fprintf(stderr, ")...\n");
 

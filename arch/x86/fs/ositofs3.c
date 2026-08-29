@@ -50,11 +50,16 @@ static uint64_t partition_offset;
 static osfs3_super_t superblock;
 static bool mounted;
 
-static uint8_t      *inode_bitmap = NULL;
-static uint8_t      *block_bitmap = NULL;
-static osfs3_inode_t *inode_table = NULL;
-static uint32_t       inode_table_blocks = 0;
-static uint64_t       inode_table_bytes = 0;
+static void *inode_bitmap_phys;
+static void *block_bitmap_phys;
+static void *inode_table_phys;
+static void *path_table_phys;
+static void *path_known_phys;
+static void *path_hash_phys;
+static void *index_nodes_phys;
+static void *open_refs_phys;
+static void *file_revisions_phys;
+static void *scratch_phys;
 
 static uint8_t *inode_bitmap;
 static uint8_t *block_bitmap;
@@ -136,8 +141,8 @@ static int osfs3_part_write(uint64_t offset, const void *buf, uint64_t len)
 
 static int osfs3_read_block_raw(uint32_t block, void *buf)
 {
-    if (!mounted || ino == 0 || ino >= superblock.total_inodes) return NULL;
-    return &inode_table[ino];
+    if (block >= superblock.total_blocks) return -1;
+    return osfs3_part_read(osfs3_block_offset(block), buf, OSFS3_BLOCK_SIZE);
 }
 
 static int osfs3_write_block_raw(uint32_t block, const void *buf)
@@ -1059,36 +1064,140 @@ static int osfs3_rebuild_paths_nolock(void)
         osfs3_cache_free(&new_nodes_phys, node_bytes);
         return -1;
     }
-    if (superblock.version != OSFS3_VERSION ||
-        superblock.block_size != OSFS3_BLOCK_SIZE ||
-        !osfs3_valid_inode_count(superblock.total_inodes) ||
-        superblock.total_blocks > osfs3_max_blocks() ||
-        superblock.first_data_block !=
-            osfs3_first_data_block_for_inodes(superblock.total_inodes)) {
-        serial_puts("[OsitoFS v3] Unsupported layout\n");
+
+    void *old_path_phys = path_table_phys;
+    void *old_known_phys = path_known_phys;
+    void *old_hash_phys = path_hash_phys;
+    void *old_nodes_phys = index_nodes_phys;
+    char *old_path_table = path_table;
+    uint8_t *old_path_known = path_known;
+    uint32_t *old_path_hash = path_hash;
+    osfs3_index_node_t *old_index_nodes = index_nodes;
+    uint32_t old_file_count = regular_file_count;
+
+    path_table_phys = new_path_phys;
+    path_known_phys = new_known_phys;
+    path_hash_phys = new_hash_phys;
+    index_nodes_phys = new_nodes_phys;
+    path_table = new_path_table;
+    path_known = new_path_known;
+    path_hash = new_path_hash;
+    index_nodes = new_index_nodes;
+
+    if (osfs3_rebuild_paths_in_place_nolock() < 0) {
+        osfs3_cache_free(&new_path_phys, path_bytes);
+        osfs3_cache_free(&new_known_phys, superblock.total_inodes);
+        osfs3_cache_free(&new_hash_phys, hash_bytes);
+        osfs3_cache_free(&new_nodes_phys, node_bytes);
+        path_table_phys = old_path_phys;
+        path_known_phys = old_known_phys;
+        path_hash_phys = old_hash_phys;
+        index_nodes_phys = old_nodes_phys;
+        path_table = old_path_table;
+        path_known = old_path_known;
+        path_hash = old_path_hash;
+        index_nodes = old_index_nodes;
+        regular_file_count = old_file_count;
         return -1;
     }
 
-    inode_table_blocks = osfs3_inode_table_blocks(superblock.total_inodes);
-    inode_table_bytes = (uint64_t)inode_table_blocks * OSFS3_BLOCK_SIZE;
+    osfs3_cache_free(&old_path_phys, path_bytes);
+    osfs3_cache_free(&old_known_phys, superblock.total_inodes);
+    osfs3_cache_free(&old_hash_phys, hash_bytes);
+    osfs3_cache_free(&old_nodes_phys, node_bytes);
+    return 0;
+}
 
-    /* Load bitmaps and full inode table (upper-half virt for CPU access). */
-    void *ib_phys = mem_alloc_aligned(OSFS3_BLOCK_SIZE, 4096);
-    void *bb_phys = mem_alloc_aligned(OSFS3_BLOCK_SIZE, 4096);
-    void *it_phys = mem_alloc_aligned(inode_table_bytes, 4096);
-    if (!ib_phys || !bb_phys || !it_phys) return -1;
-    inode_bitmap = (uint8_t *)PHYS_TO_VIRT(ib_phys);
-    block_bitmap = (uint8_t *)PHYS_TO_VIRT(bb_phys);
-    inode_table  = (osfs3_inode_t *)PHYS_TO_VIRT(it_phys);
+static bool osfs3_super_valid(const osfs3_super_t *value)
+{
+    if (value->magic != OSFS3_MAGIC || value->version != OSFS3_VERSION ||
+        value->block_size != OSFS3_BLOCK_SIZE ||
+        value->total_blocks <= value->first_data_block ||
+        value->total_blocks > OSFS3_BITMAP_BITS ||
+        value->total_inodes < 2 ||
+        value->total_inodes > OSFS3_MAX_INODES ||
+        value->first_data_block != OSFS3_FIRST_DATA_BLOCK(value->total_inodes) ||
+        value->root_inode == 0 || value->root_inode >= value->total_inodes)
+        return false;
 
-    if (osfs3_read_block(OSFS3_INODE_BITMAP_BLK, inode_bitmap) < 0 ||
-        osfs3_read_block(OSFS3_BLOCK_BITMAP_BLK, block_bitmap) < 0) {
+    osfs3_super_t copy = *value;
+    uint32_t saved_crc = copy.crc32;
+    copy.crc32 = 0;
+    return saved_crc == osfs3_crc32(&copy, sizeof(copy));
+}
+
+int osfs3_mount(uint64_t part_offset)
+{
+    if (inode_bitmap_phys || block_bitmap_phys || inode_table_phys ||
+        path_table_phys || path_known_phys || path_hash_phys ||
+        index_nodes_phys ||
+        open_refs_phys || file_revisions_phys || scratch_phys)
+        osfs3_release_cache();
+    mounted = false;
+    path_index_ready = false;
+    partition_offset = part_offset;
+
+    osfs3_super_t candidate;
+    if (osfs3_part_read(0, &candidate, sizeof(candidate)) < 0)
+        return -1;
+    if (!osfs3_super_valid(&candidate)) {
+        if (candidate.magic == OSFS3_MAGIC)
+            serial_puts("[OsitoFS v3] invalid superblock\n");
         return -1;
     }
-    for (uint32_t i = 0; i < inode_table_blocks; i++) {
-        void *dst = (uint8_t *)inode_table + (uint64_t)i * OSFS3_BLOCK_SIZE;
-        if (osfs3_read_block(OSFS3_INODE_TABLE_BLK + i, dst) < 0)
-            return -1;
+
+    uint64_t disk_bytes = (uint64_t)disk_lba_size() * disk_lba_count();
+    uint64_t fs_bytes = (uint64_t)candidate.total_blocks * OSFS3_BLOCK_SIZE;
+    if (part_offset > disk_bytes || fs_bytes > disk_bytes - part_offset)
+        return -1;
+
+    superblock = candidate;
+    superblock.label[sizeof(superblock.label) - 1] = '\0';
+
+    uint64_t inode_table_bytes =
+        (uint64_t)OSFS3_INODE_TABLE_BLOCKS(superblock.total_inodes) *
+        OSFS3_BLOCK_SIZE;
+    path_hash_slots = 1;
+    while (path_hash_slots < superblock.total_inodes * 2U)
+        path_hash_slots <<= 1;
+    path_hash_mask = path_hash_slots - 1U;
+
+    inode_bitmap = osfs3_cache_alloc(OSFS3_BLOCK_SIZE, &inode_bitmap_phys);
+    block_bitmap = osfs3_cache_alloc(OSFS3_BLOCK_SIZE, &block_bitmap_phys);
+    inode_table = osfs3_cache_alloc(inode_table_bytes, &inode_table_phys);
+    path_table = osfs3_cache_alloc(
+        (uint64_t)superblock.total_inodes * OSFS3_PATH_MAX, &path_table_phys);
+    path_known = osfs3_cache_alloc(superblock.total_inodes, &path_known_phys);
+    path_hash = osfs3_cache_alloc(
+        (uint64_t)path_hash_slots * sizeof(*path_hash), &path_hash_phys);
+    index_nodes = osfs3_cache_alloc(
+        (uint64_t)superblock.total_inodes * sizeof(*index_nodes),
+        &index_nodes_phys);
+    file_open_refs = osfs3_cache_alloc(
+        (uint64_t)superblock.total_inodes * sizeof(*file_open_refs),
+        &open_refs_phys);
+    file_revisions = osfs3_cache_alloc(
+        (uint64_t)superblock.total_inodes * sizeof(*file_revisions),
+        &file_revisions_phys);
+    scratch_block = osfs3_cache_alloc(OSFS3_BLOCK_SIZE, &scratch_phys);
+    if (!inode_bitmap || !block_bitmap || !inode_table || !path_table ||
+        !path_known || !path_hash || !index_nodes || !file_open_refs ||
+        !file_revisions ||
+        !scratch_block) {
+        serial_puts("[OsitoFS v3] metadata cache allocation failed\n");
+        osfs3_release_cache();
+        return -1;
+    }
+
+    if (osfs3_read_block_raw(OSFS3_INODE_BITMAP_BLK, inode_bitmap) < 0 ||
+        osfs3_read_block_raw(OSFS3_BLOCK_BITMAP_BLK, block_bitmap) < 0 ||
+        osfs3_part_read(osfs3_block_offset(OSFS3_INODE_TABLE_BLK),
+                        inode_table, inode_table_bytes) < 0 ||
+        !osfs3_inode_body_valid(superblock.root_inode) ||
+        !osfs3_inode_is_dir(&inode_table[superblock.root_inode])) {
+        serial_puts("[OsitoFS v3] metadata load failed\n");
+        osfs3_release_cache();
+        return -1;
     }
 
     mounted = true;
@@ -2473,6 +2582,72 @@ void *osfs3_create(const char *path, uint64_t size)
     }
     void *result = &inode_table[ino];
     __atomic_add_fetch(&file_revisions[ino], 2, __ATOMIC_RELEASE);
+    osfs3_spin_unlock();
+    return result;
+}
+
+int osfs3_write_data(void *file, uint64_t offset, const void *buf,
+                     uint64_t len)
+{
+    osfs3_spin_lock();
+    int ino_number = osfs3_inode_number(file);
+    if (!mounted || ino_number <= 0 || (!buf && len) ||
+        !osfs3_inode_valid((uint32_t)ino_number) ||
+        !osfs3_inode_is_file(&inode_table[ino_number]) ||
+        offset > UINT64_MAX - len) {
+        osfs3_spin_unlock();
+        return -1;
+    }
+    if (!len) {
+        osfs3_spin_unlock();
+        return 0;
+    }
+
+    uint32_t ino = (uint32_t)ino_number;
+    osfs3_inode_t *inode = &inode_table[ino];
+    uint64_t capacity = (uint64_t)osfs3_inode_block_count(inode) <<
+                        OSFS3_BLOCK_SHIFT;
+    if (offset + len > capacity) {
+        osfs3_spin_unlock();
+        return -1;
+    }
+
+    __atomic_add_fetch(&file_revisions[ino], 1, __ATOMIC_ACQ_REL);
+    int result = osfs3_write_file_range_nolock(inode, offset, buf, len);
+    __atomic_add_fetch(&file_revisions[ino], 1, __ATOMIC_RELEASE);
+    osfs3_spin_unlock();
+    return result;
+}
+
+int osfs3_set_size_reserved(void *file, uint64_t size)
+{
+    osfs3_spin_lock();
+    int ino_number = osfs3_inode_number(file);
+    if (!mounted || ino_number <= 0 ||
+        !osfs3_inode_valid((uint32_t)ino_number) ||
+        !osfs3_inode_is_file(&inode_table[ino_number])) {
+        osfs3_spin_unlock();
+        return -1;
+    }
+
+    uint32_t ino = (uint32_t)ino_number;
+    osfs3_inode_t *inode = &inode_table[ino];
+    uint64_t capacity = (uint64_t)osfs3_inode_block_count(inode) <<
+                        OSFS3_BLOCK_SHIFT;
+    if (size > capacity) {
+        osfs3_spin_unlock();
+        return -1;
+    }
+
+    __atomic_add_fetch(&file_revisions[ino], 1, __ATOMIC_ACQ_REL);
+    osfs3_inode_t original = *inode;
+    inode->size = size;
+    inode->mtime = osfs3_now();
+    inode->crc32 = 0;
+    int result = osfs3_persist_inode_nolock(ino);
+    if (!result) result = disk_flush();
+    if (result < 0) *inode = original;
+    __atomic_add_fetch(&file_revisions[ino], 1, __ATOMIC_RELEASE);
     osfs3_spin_unlock();
     return result;
 }

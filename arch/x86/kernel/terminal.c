@@ -15,6 +15,9 @@ extern void serial_puthex(uint64_t val, int digits);
 extern void serial_putdec(uint64_t val);
 extern void boot_diag_maybe_flush(const char *reason, uint64_t min_bytes,
                                   uint64_t min_ticks) __attribute__((weak));
+extern void *kmalloc(uint64_t size);
+extern void *krealloc(void *ptr, uint64_t new_size);
+extern void  kfree(void *ptr);
 
 /* Framebuffer */
 extern void fb_puts(const char *s);

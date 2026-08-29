@@ -83,8 +83,8 @@ int main(int argc, char **argv)
     int found_idx = -1;
     for (uint32_t i = 0; i < max_files; i++) {
         if (!(ft[i].flags & OSFS2_FLAG_VALID)) continue;
-        if (strcmp(ft[i].name, old_name) == 0) {
-            found_idx = (int)i;
+        if (strcmp(osfs2_entry_name(&ft[i]), old_name) == 0) {
+            found_idx = i;
             break;
         }
     }
@@ -120,9 +120,9 @@ int main(int argc, char **argv)
     /* Update modify_time */
     after[0].modify_time = (uint32_t)time(NULL);
 
-    /* Write back file table */
-    if (osfs2_write_bytes(fd, OSFS2_FILETAB_OFF, ft_buf, filetab_size) < 0) {
-        fprintf(stderr, "ositofs-rename: failed to write file table\n");
+    if (osfs2_journal_commit_entries(fd, OSFS2_JOURNAL_OP_RENAME,
+            &sb, &sb, slots, before, after, 1) < 0) {
+        fprintf(stderr, "ositofs-rename: journaled rename failed\n");
         free(ft_buf);
         osfs2_close_device(fd);
         return 1;

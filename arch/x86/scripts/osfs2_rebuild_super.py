@@ -6,18 +6,37 @@ import struct
 import sys
 import time
 
-from osfs2_journal import (JOURNAL_COMMIT_OFF, JOURNAL_COMMIT_SIZE,
-                           fix_super_crc, lock)
+from osfs2_journal import (FILE_ENTRY_SIZE, FILETAB_OFF, JOURNAL_COMMIT_OFF,
+                           JOURNAL_COMMIT_SIZE, LAYOUT_MAGIC, LEGACY_MAX_FILES,
+                           MAGIC, MAX_BLOCKS, VERSION, JournalError,
+                           fix_super_crc, layout_from_super, lock)
 
 BLOCK_SIZE = 1 << 20
-DATA_OFF = 4 << 20
-FILETAB_OFF = 1 << 20
-MAX_FILES = 4096
-ENTRY_SIZE = 256
 FLAG_VALID = 1
 FLAG_INLINE = 8
-MAGIC = 0x4F534632
-VERSION = 2
+
+
+def recover_layout(image):
+    for offset in (0, 4096):
+        image.seek(offset)
+        candidate = image.read(512)
+        try:
+            layout = layout_from_super(candidate)
+        except JournalError:
+            continue
+        block_size = struct.unpack_from('<I', candidate, 8)[0]
+        if block_size >= 65536 and block_size <= BLOCK_SIZE and \
+                not block_size & (block_size - 1):
+            return candidate, layout
+
+    fallback = bytearray(512)
+    struct.pack_into('<3I', fallback, 0, MAGIC, VERSION, BLOCK_SIZE)
+    return fallback, {
+        'version': VERSION,
+        'max_files': LEGACY_MAX_FILES,
+        'filetab_size': LEGACY_MAX_FILES * FILE_ENTRY_SIZE,
+        'data_off': 4 << 20,
+    }
 
 
 def main():
@@ -37,27 +56,30 @@ def main():
 
     with open(image_path, 'r+b') as image:
         lock(image, True)
+        candidate, layout = recover_layout(image)
+        version, block_size = struct.unpack_from('<2I', candidate, 4)
         image.seek(0, os.SEEK_END)
         image_size = image.tell()
-        if image_size % BLOCK_SIZE:
-            print('image size is not aligned to the 1 MiB block size')
+        if image_size % block_size:
+            print(f'image size is not aligned to the {block_size}-byte block size')
             return 1
-        total_blocks = image_size // BLOCK_SIZE
-        if total_blocks <= DATA_OFF // BLOCK_SIZE or total_blocks > 262144:
+        total_blocks = image_size // block_size
+        data_start = layout['data_off'] // block_size
+        if total_blocks <= data_start or total_blocks > MAX_BLOCKS:
             print('image size is outside the OsitoFS v2 range')
             return 1
 
         image.seek(FILETAB_OFF)
-        table = image.read(MAX_FILES * ENTRY_SIZE)
-        if len(table) != MAX_FILES * ENTRY_SIZE:
+        table = image.read(layout['filetab_size'])
+        if len(table) != layout['filetab_size']:
             print('short file table')
             return 1
 
         file_count = 0
-        used_blocks = DATA_OFF // BLOCK_SIZE
+        used_blocks = data_start
         high_water = used_blocks
-        for slot in range(MAX_FILES):
-            entry = table[slot * ENTRY_SIZE:(slot + 1) * ENTRY_SIZE]
+        for slot in range(layout['max_files']):
+            entry = table[slot * FILE_ENTRY_SIZE:(slot + 1) * FILE_ENTRY_SIZE]
             flags = struct.unpack_from('<I', entry, 84)[0]
             if not flags & FLAG_VALID:
                 continue
@@ -70,9 +92,9 @@ def main():
                 valid_extent = size <= 128 and start == 0 and count == 0
             else:
                 valid_extent = (size == 0 and count == 0) or (
-                    count > 0 and start >= DATA_OFF // BLOCK_SIZE and
+                    count > 0 and start >= data_start and
                     start + count <= total_blocks and
-                    size <= count * BLOCK_SIZE)
+                    size <= count * block_size)
             if not valid_extent:
                 print(f'invalid extent in slot {slot}')
                 return 1
@@ -81,11 +103,13 @@ def main():
             high_water = max(high_water, start + count)
 
         superblock = bytearray(512)
-        struct.pack_into('<7I', superblock, 0, MAGIC, VERSION, BLOCK_SIZE,
+        struct.pack_into('<7I', superblock, 0, MAGIC, version, block_size,
                          total_blocks, used_blocks, file_count, high_water)
         superblock[28:44] = os.urandom(16)
         superblock[44:44 + len(encoded_label)] = encoded_label
         struct.pack_into('<Q', superblock, 76, int(time.time()))
+        if struct.unpack_from('<I', candidate, 88)[0] == LAYOUT_MAGIC:
+            superblock[88:100] = candidate[88:100]
         fix_super_crc(superblock)
 
         image.seek(0)

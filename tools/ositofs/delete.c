@@ -88,8 +88,7 @@ static void usage(void)
 
 static void recompute_super(osfs2_super_t *sb, const osfs2_file_t *ft)
 {
-    uint32_t data_start = osfs2_format_data_start_blk(sb->version,
-                                                       sb->block_size);
+    uint32_t data_start = osfs2_layout_data_start_blk(sb);
     uint32_t files = 0;
     uint32_t used = data_start;
     uint32_t hwm = data_start;
@@ -177,7 +176,7 @@ int main(int argc, char **argv)
 
     for (uint32_t i = 0; i < max_files; i++) {
         if (!(ft[i].flags & OSFS2_FLAG_VALID)) continue;
-        if (entry_matches(&ft[i], pattern))
+        if (wildcard_match(pattern, osfs2_entry_name(&ft[i])))
             matches[match_count++] = i;
     }
 
@@ -193,7 +192,7 @@ int main(int argc, char **argv)
     printf("Matched %d file%s:\n", match_count, match_count == 1 ? "" : "s");
     for (int m = 0; m < match_count; m++) {
         osfs2_file_t *f = &ft[matches[m]];
-        printf("  %-48s ", display_name(f));
+        printf("  %-48s ", osfs2_entry_name(f));
         osfs2_print_size(f->size);
         printf("  (blocks %u-%u)\n", f->start_block,
                f->start_block + f->block_count - 1);
@@ -270,37 +269,15 @@ int main(int argc, char **argv)
         deleted++;
     }
 
-    /* Update superblock counters */
-    if (sb.file_count >= (uint32_t)deleted)
-        sb.file_count -= (uint32_t)deleted;
-    else
-        sb.file_count = 0;
-    sb.used_blocks -= total_freed;
-
-    /* Recalculate high-water mark once */
-    uint32_t data_start = osfs2_layout_data_start_blk(&sb);
-    uint32_t hwm = data_start;
-    for (uint32_t i = 0; i < max_files; i++) {
-        if (!(ft[i].flags & OSFS2_FLAG_VALID)) continue;
-        uint32_t end = ft[i].start_block + ft[i].block_count;
-        if (end > hwm) hwm = end;
-    }
-    sb.next_data_block = hwm;
-
-    /* Recalculate superblock CRC */
-    sb.crc32 = 0;
-    sb.crc32 = osfs2_crc32(&sb, sizeof(sb));
-
     /* Flush layer index if modified */
     if (li_blk && li_dirty) {
-        osfs2_write_bytes(fd, layeridx_off, li_blk, OSFS2_LAYERIDX_SIZE);
+        if (osfs2_write_bytes(fd, layeridx_off, li_blk,
+                              OSFS2_LAYERIDX_SIZE) < 0 || osfs2_sync(fd) < 0)
+            journal_failed = 1;
     }
     free(li_blk);
 
-    /* Write back file table */
-    if (osfs2_write_bytes(fd, OSFS2_FILETAB_OFF, ft_buf, filetab_size) < 0) {
-        fprintf(stderr, "ositofs-delete: failed to write file table\n");
-        free(matches);
+    if (journal_failed) {
         free(ft_buf);
         osfs2_close_device(fd);
         return 1;

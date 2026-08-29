@@ -316,6 +316,7 @@ static inline void wrmsr(uint32_t msr, uint64_t val) {
 #define SYS_BATCH           520  /* Execute array of syscalls in one trap */
 #define SYS_CMDRING_INIT    521  /* Set up syscall-free command ring */
 #define SYS_BOOT_DIAG_MARK  522  /* Persist boot diagnostics with a marker */
+#define SYS_DEBUG_WATCH     523  /* GTA/Win32 buffer diagnostics */
 
 /* errno values */
 #define EPERM    1
@@ -985,9 +986,24 @@ int quarantine_check_uaf(uint64_t fault_addr, uint32_t pid)
 
 static void vma_free_pages_in_cr3(vma_t *v, uint64_t cr3, uint32_t pid)
 {
-    uint64_t cr3 = (v->owner || v->owner_tgid) ? proc_current_cr3() : 0;
-    extern int32_t proc_current_pid(void);
-    uint32_t pid = (uint32_t)proc_current_pid();
+    if (v->type == VMA_SHARED_STACK ||
+        v->type == VMA_DEFERRED_SHARED_STACK) {
+        extern uint32_t proc_pid_of(void *p);
+        extern uint32_t proc_state_of(void *p);
+        serial_puts("[VMA-STACK] free direct owner=");
+        serial_putdec(proc_pid_of(v->owner));
+        serial_puts(" state=");
+        serial_putdec(proc_state_of(v->owner));
+        serial_puts(" caller-pid=");
+        serial_putdec(pid);
+        serial_puts(" base=0x");
+        serial_puthex(v->base, 16);
+        serial_puts(" pages=");
+        serial_putdec(v->pages);
+        serial_puts("\n");
+        mem_free_pages((void *)VIRT_TO_PHYS(v->base), v->pages);
+        return;
+    }
 
     /* Expire old quarantine entries periodically */
     if (quarantine_enabled)
@@ -1204,7 +1220,9 @@ static int64_t sys_read(uint64_t fd, uint64_t buf, uint64_t count)
 
     if (f->type == FD_TYPE_FILE) {
         if ((f->oflags & O_ACCMODE) == O_WRONLY) return -EBADF;
-        uint64_t file_size = f->node.size;
+        uint64_t file_size = f->node.fs_version == 2
+                           ? osfs2_file_size(f->node.data) : f->node.size;
+        f->node.size = file_size;
         bool dbg_fx = false;
         if (f->node.fs_version == 2) {
             const char *nm = osfs2_file_name(f->node.data);
@@ -1922,6 +1940,10 @@ static int64_t sys_open(uint64_t path_addr, uint64_t flags, uint64_t mode)
             serial_putdec((uint64_t)newfd);
             serial_puts("\n");
         }
+        if (osfs2_file_retain(f->node.data) < 0) {
+            memset(f, 0, sizeof(*f));
+            return -EIO;
+        }
     }
 
     return newfd;
@@ -2291,6 +2313,22 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
         serial_putdec(length);
         serial_puts("\n");
         return -ENOMEM;
+    }
+
+    /* Keep pthread stacks in the shared upper-half mirror while an ISR or
+     * syscall frame is still unwinding across a scheduler CR3 switch. */
+    if (flags & MAP_STACK) {
+        void *phys = mem_alloc_pages(npages);
+        if (!phys) return -ENOMEM;
+        uint64_t result = (uint64_t)PHYS_TO_VIRT(phys);
+        memset((void *)result, 0, npages * 4096);
+        vma_table[vi].base = result;
+        vma_table[vi].pages = npages;
+        vma_table[vi].prot = (uint32_t)prot;
+        vma_table[vi].in_use = true;
+        vma_table[vi].type = VMA_SHARED_STACK;
+        vma_set_owner(&vma_table[vi], proc_current());
+        return (int64_t)result;
     }
 
     /* Allocate a user-space VA from the 32-bit-clean anonymous pool. Callers
@@ -4930,6 +4968,7 @@ static int64_t __hot syscall_dispatch_inner(uint64_t nr, uint64_t a1, uint64_t a
     case SYS_ARCH_PRCTL: return sys_arch_prctl(a1, a2);
     case SYS_GETTID:     return sys_gettid();
     case SYS_FUTEX:      return sys_futex(a1, a2, a3, a4, a5, a6);
+    case SYS_SCHED_GETAFFINITY: return sys_sched_getaffinity(a1, a2, a3);
     case SYS_GETDENTS64: return sys_getdents64(a1, a2, a3);
     case SYS_SET_TID_ADDR: return sys_set_tid_address(a1);
     case SYS_CLOCK_GETTIME: return sys_clock_gettime(a1, a2);
@@ -5068,6 +5107,8 @@ static int64_t __hot syscall_dispatch_inner(uint64_t nr, uint64_t a1, uint64_t a
         boot_diag_mark(reason);
         return 0;
     }
+    case SYS_DEBUG_WATCH:
+        return sys_debug_watch(a1, a2, a3);
 
     /* ── OsitoK private: inference as a kernel syscall (530-534).
      * Numbers chosen to sit above SYS_BATCH (520) / SYS_CMDRING_INIT (521)

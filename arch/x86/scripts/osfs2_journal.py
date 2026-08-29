@@ -9,7 +9,16 @@ import zlib
 
 MAGIC = 0x4F534632
 VERSION = 2
+VERSION_LARGE_FILES = 3
+LAYOUT_MAGIC = 0x4F324C59
 FILETAB_OFF = 1 << 20
+FILE_ENTRY_SIZE = 256
+LEGACY_MAX_FILES = 4096
+LARGE_MAX_FILES = 16384
+MAX_FILE_SLOTS = 61440
+CRCTAB_SIZE = 1 << 20
+LAYERIDX_SIZE = 1 << 20
+MAX_BLOCKS = 262144
 SUPER_BACKUP_OFF = 4096
 JOURNAL_RECORD_OFF = 8192
 JOURNAL_RECORD_SIZE = 12288
@@ -29,6 +38,59 @@ COMMIT_CRC_OFF = 20
 
 class JournalError(RuntimeError):
     pass
+
+
+def layout_from_super(superblock):
+    if len(superblock) != 512:
+        raise JournalError('short superblock')
+    magic, version = struct.unpack_from('<2I', superblock)
+    if magic != MAGIC:
+        raise JournalError('invalid superblock magic')
+
+    layout_magic, file_slots, metadata_bytes = struct.unpack_from(
+        '<3I', superblock, 88)
+    if layout_magic == LAYOUT_MAGIC:
+        if version != VERSION or file_slots < LEGACY_MAX_FILES or \
+                file_slots > MAX_FILE_SLOTS or \
+                file_slots % LEGACY_MAX_FILES:
+            raise JournalError('invalid extensible layout')
+        filetab_size = file_slots * FILE_ENTRY_SIZE
+        crctab_off = FILETAB_OFF + filetab_size
+        layeridx_off = crctab_off + CRCTAB_SIZE
+        data_off = layeridx_off + LAYERIDX_SIZE
+        if metadata_bytes != data_off:
+            raise JournalError('metadata_bytes does not match layout')
+        has_crc = True
+        has_layer_index = True
+    elif version == VERSION:
+        file_slots = LEGACY_MAX_FILES
+        filetab_size = file_slots * FILE_ENTRY_SIZE
+        crctab_off = 2 << 20
+        layeridx_off = 3 << 20
+        data_off = 4 << 20
+        has_crc = True
+        has_layer_index = True
+    elif version == VERSION_LARGE_FILES:
+        file_slots = LARGE_MAX_FILES
+        filetab_size = file_slots * FILE_ENTRY_SIZE
+        crctab_off = 2 << 20
+        layeridx_off = 3 << 20
+        data_off = 5 << 20
+        has_crc = False
+        has_layer_index = False
+    else:
+        raise JournalError(f'unsupported filesystem version {version}')
+
+    return {
+        'version': version,
+        'max_files': file_slots,
+        'filetab_size': filetab_size,
+        'crctab_off': crctab_off,
+        'layeridx_off': layeridx_off,
+        'data_off': data_off,
+        'has_crc': has_crc,
+        'has_layer_index': has_layer_index,
+    }
 
 
 def lock(image, exclusive):
@@ -61,10 +123,17 @@ def _crc_with_zero(data, offset):
 def super_valid(superblock):
     if len(superblock) != 512:
         return False
-    magic, version, block_size = struct.unpack_from('<3I', superblock)
-    if magic != MAGIC or version != VERSION:
+    magic, _, block_size, total_blocks = struct.unpack_from('<4I', superblock)
+    if magic != MAGIC:
         return False
     if block_size < 65536 or block_size > 1048576 or block_size & (block_size - 1):
+        return False
+    try:
+        layout = layout_from_super(superblock)
+    except JournalError:
+        return False
+    data_start = layout['data_off'] // block_size
+    if total_blocks <= data_start or total_blocks > MAX_BLOCKS:
         return False
     return struct.unpack_from('<I', superblock, SUPER_CRC_OFF)[0] == \
         _crc_with_zero(superblock, SUPER_CRC_OFF)
@@ -99,24 +168,33 @@ def _record_valid(record):
     if count < 1 or count > JOURNAL_MAX_ENTRIES:
         return False
     slots = struct.unpack_from('<2I', record, 24)
-    if any(slot >= 4096 for slot in slots[:count]):
-        return False
     page_count = struct.unpack_from('<I', record, 32)[0]
     pages = struct.unpack_from('<2I', record, 36)
-    if page_count < 1 or page_count > 2 or \
-            any(page >= 256 for page in pages[:page_count]) or \
-            len(set(pages[:page_count])) != page_count:
-        return False
-    if any(slot // 16 not in pages[:page_count] for slot in slots[:count]):
-        return False
     before_super = record[48:560]
     after_super = record[560:1072]
     if not super_valid(before_super) or not super_valid(after_super):
         return False
+    try:
+        before_layout = layout_from_super(before_super)
+        after_layout = layout_from_super(after_super)
+    except JournalError:
+        return False
+    if before_layout != after_layout:
+        return False
+    if any(slot >= after_layout['max_files'] for slot in slots[:count]):
+        return False
+    max_pages = after_layout['filetab_size'] // 4096
+    if page_count < 1 or page_count > 2 or \
+            any(page >= max_pages for page in pages[:page_count]) or \
+            len(set(pages[:page_count])) != page_count:
+        return False
+    if any(slot // 16 not in pages[:page_count] for slot in slots[:count]):
+        return False
     before_block_size = struct.unpack_from('<I', before_super, 8)[0]
     block_size, total_blocks = struct.unpack_from('<2I', after_super, 8)
     if before_block_size != block_size or before_super[28:44] != after_super[28:44] or \
-            total_blocks <= (4 << 20) // block_size or total_blocks > 262144:
+            total_blocks <= after_layout['data_off'] // block_size or \
+            total_blocks > MAX_BLOCKS:
         return False
     for index, slot in enumerate(slots[:count]):
         page_index = pages[:page_count].index(slot // 16)
@@ -133,7 +211,7 @@ def _record_valid(record):
             if size > 128 or extent_start or extent_count:
                 return False
         elif extent_count:
-            if extent_start < (4 << 20) // block_size or \
+            if extent_start < after_layout['data_off'] // block_size or \
                     extent_start + extent_count > total_blocks or \
                     size > extent_count * block_size:
                 return False
@@ -226,9 +304,14 @@ def commit_entries(image, partition, operation, before_super, after_super,
     if len(before_super) != 512 or len(after_super) != 512 or \
             not super_valid(after_super):
         raise JournalError('invalid post-transaction superblock')
+    before_layout = layout_from_super(before_super)
+    after_layout = layout_from_super(after_super)
+    if before_layout != after_layout:
+        raise JournalError('transaction changes filesystem layout')
     if operation < JOURNAL_OP_RENAME or operation > JOURNAL_OP_REPLACE:
         raise JournalError('invalid journal operation')
-    if len(set(slots)) != count or any(slot < 0 or slot >= 4096 for slot in slots):
+    if len(set(slots)) != count or any(
+            slot < 0 or slot >= after_layout['max_files'] for slot in slots):
         raise JournalError('invalid journal slots')
     if any(len(entry) != 256 for entry in before_entries + after_entries):
         raise JournalError('journal entries must be exactly 256 bytes')

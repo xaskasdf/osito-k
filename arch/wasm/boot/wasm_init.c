@@ -174,7 +174,7 @@ EM_JS(int, js_fsimg_ready, (), { return window.__fsImageDone ? 1 : 0; });
 EM_JS(uint32_t, js_fsimg_size, (), { return (window.__fsImageBuf ? window.__fsImageBuf.length : 0) >>> 0; });
 EM_JS(void, js_fsimg_copy, (uint8_t *dst), { if (window.__fsImageBuf) HEAPU8.set(window.__fsImageBuf, dst >>> 0); });
 
-extern int  osfs2_mount(uint64_t part_offset);
+extern int  osfs2_mount(uint64_t part_offset, uint64_t part_size);
 extern void wasm_nvme_set_buffer(void *buf, uint64_t size);
 
 static void load_filesystem(void)
@@ -211,7 +211,7 @@ static void load_filesystem(void)
     wasm_persist_load();
 
     /* Mount OsitoFS (partition offset 0 = raw image, no GPT) */
-    if (osfs2_mount(0) < 0) {
+    if (osfs2_mount(0, sz) < 0) {
         serial_puts("[WASM] OsitoFS mount failed\n\n");
     } else {
         extern uint32_t osfs2_file_count(void);

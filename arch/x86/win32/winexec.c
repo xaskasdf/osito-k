@@ -2756,26 +2756,65 @@ int winexec_run(const uint8_t *file_data, uint64_t file_size)
         extern const WIN32_EXPORT *comdlg32_abi_table(int *);
         extern const WIN32_EXPORT *libusb_abi_table(int *);
         int n;
-#define REGISTER_ABI_TABLE(dll, table_fn) do {                         \
-            const WIN32_EXPORT *table = (table_fn)(&n);                 \
-            win32_abi_register((dll), table, n);                        \
-        } while (0)
-        REGISTER_ABI_TABLE("ntdll.dll",    ntdll_abi_table);
-        REGISTER_ABI_TABLE("kernel32.dll", kernel32_abi_table);
-        REGISTER_ABI_TABLE("msvcrt.dll",   msvcrt_abi_table);
-        REGISTER_ABI_TABLE("advapi32.dll", advapi32_abi_table);
-        REGISTER_ABI_TABLE("user32.dll",   user32_abi_table);
-        REGISTER_ABI_TABLE("gdi32.dll",    gdi32_abi_table);
-        REGISTER_ABI_TABLE("ddraw.dll",    ddraw_abi_table);
-        REGISTER_ABI_TABLE("dsound.dll",   dsound_abi_table);
-        REGISTER_ABI_TABLE("wsock32.dll",  wsock32_abi_table);
-        REGISTER_ABI_TABLE("ws2_32.dll",   wsock32_abi_table);
-        REGISTER_ABI_TABLE("shell32.dll",  shell32_abi_table);
-        REGISTER_ABI_TABLE("winmm.dll",    winmm_abi_table);
-        REGISTER_ABI_TABLE("ole32.dll",    ole32_abi_table);
-        REGISTER_ABI_TABLE("comctl32.dll", comctl32_abi_table);
-        REGISTER_ABI_TABLE("comdlg32.dll", comdlg32_abi_table);
-#undef REGISTER_ABI_TABLE
+        win32_abi_register("ntdll.dll",    ntdll_abi_table(&n),    n);
+        win32_abi_register("kernel32.dll", kernel32_abi_table(&n), n);
+        win32_abi_register("psapi.dll",    kernel32_abi_table(&n), n);
+        win32_abi_register("setupapi.dll", kernel32_abi_table(&n), n);
+        win32_abi_register("cfgmgr32.dll", kernel32_abi_table(&n), n);
+        win32_abi_register("hid.dll",      kernel32_abi_table(&n), n);
+        win32_abi_register("mf.dll",       kernel32_abi_table(&n), n);
+        win32_abi_register("mfplat.dll",   kernel32_abi_table(&n), n);
+        win32_abi_register("mfreadwrite.dll", kernel32_abi_table(&n), n);
+        win32_abi_register("d3d9.dll",     kernel32_abi_table(&n), n);
+        win32_abi_register("dxva2.dll",    kernel32_abi_table(&n), n);
+        win32_abi_register("dbghelp.dll",  kernel32_abi_table(&n), n);
+        win32_abi_register("api-ms-win-power-base-l1-1-0.dll",
+                           kernel32_abi_table(&n), n);
+        win32_abi_register("api-ms-win-power-setting-l1-1-0.dll",
+                           kernel32_abi_table(&n), n);
+        win32_abi_register("msvcrt.dll",   msvcrt_abi_table(&n),   n);
+        win32_abi_register("ucrtbase.dll", msvcrt_abi_table(&n),   n);
+        win32_abi_register("vcruntime140.dll",
+                           msvcrt_abi_table(&n), n);
+        win32_abi_register("vcruntime140_1.dll",
+                           msvcrt_abi_table(&n), n);
+        win32_abi_register("advapi32.dll", advapi32_abi_table(&n), n);
+        win32_abi_register("wevtapi.dll",  advapi32_abi_table(&n), n);
+        win32_abi_register("bcrypt.dll",   advapi32_abi_table(&n), n);
+        win32_abi_register("bcryptprimitives.dll",
+                           advapi32_abi_table(&n), n);
+        win32_abi_register("user32.dll",   user32_abi_table(&n),   n);
+        win32_abi_register("imm32.dll",    user32_abi_table(&n),   n);
+        win32_abi_register("api-ms-win-shcore-scaling-l1-1-1.dll",
+                           user32_abi_table(&n), n);
+        win32_abi_register("wtsapi32.dll", user32_abi_table(&n), n);
+        win32_abi_register("dwmapi.dll",   user32_abi_table(&n), n);
+        win32_abi_register("gdi32.dll",    gdi32_abi_table(&n),    n);
+        win32_abi_register("msimg32.dll",  gdi32_abi_table(&n),    n);
+        win32_abi_register("dwrite.dll",   gdi32_abi_table(&n),    n);
+        win32_abi_register("opengl32.dll", opengl32_abi_table(&n), n);
+        win32_abi_register("dxgi.dll",     dxgi_abi_table(&n),     n);
+        win32_abi_register("version.dll",  version_abi_table(&n),  n);
+        win32_abi_register("ddraw.dll",    ddraw_abi_table(&n),    n);
+        win32_abi_register("dsound.dll",   dsound_abi_table(&n),   n);
+        win32_abi_register("wsock32.dll",  wsock32_abi_table(&n),  n);
+        win32_abi_register("ws2_32.dll",   wsock32_abi_table(&n),  n);
+        win32_abi_register("mswsock.dll",  wsock32_abi_table(&n),  n);
+        win32_abi_register("iphlpapi.dll", wsock32_abi_table(&n),  n);
+        win32_abi_register("wininet.dll",  wsock32_abi_table(&n),  n);
+        win32_abi_register("winhttp.dll",  wsock32_abi_table(&n),  n);
+        win32_abi_register("shell32.dll",  shell32_abi_table(&n),  n);
+        win32_abi_register("shlwapi.dll",  shlwapi_abi_table(&n),  n);
+        win32_abi_register("winmm.dll",    winmm_abi_table(&n),    n);
+        win32_abi_register("ole32.dll",    ole32_abi_table(&n),    n);
+        win32_abi_register("oleaut32.dll", oleaut32_abi_table(&n), n);
+        win32_abi_register("oleacc.dll", oleacc_abi_table(&n), n);
+        win32_abi_register("crypt32.dll", crypt32_abi_table(&n), n);
+        win32_abi_register("ncrypt.dll", ncrypt_abi_table(&n), n);
+        win32_abi_register("wintrust.dll", wintrust_abi_table(&n), n);
+        win32_abi_register("comctl32.dll", comctl32_abi_table(&n), n);
+        win32_abi_register("comdlg32.dll", comdlg32_abi_table(&n), n);
+        win32_abi_register("libusb-1.0.dll", libusb_abi_table(&n), n);
     }
 
     /*

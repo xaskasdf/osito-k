@@ -44,14 +44,10 @@ static void bitmap_set(uint8_t *bitmap, uint32_t bit)
     bitmap[bit >> 3] |= (uint8_t)(1U << (bit & 7U));
 }
 
-/* ── Global State ────────────────────────────────────────────── */
-static int dev_fd = -1;
-static osfs3_super_t sb;
-static uint8_t *imap = NULL;
-static uint8_t *bmap = NULL;
-static osfs3_inode_t *itab = NULL;
-static uint32_t itab_blocks = 0;
-static size_t itab_bytes = 0;
+static void bitmap_clear(uint8_t *bitmap, uint32_t bit)
+{
+    bitmap[bit >> 3] &= (uint8_t)~(1U << (bit & 7U));
+}
 
 static int alloc_aligned(void **out, size_t bytes)
 {
@@ -62,42 +58,64 @@ static int alloc_aligned(void **out, size_t bytes)
 
 static int load_metadata(void)
 {
-    imap = osfs3_alloc_block();
-    bmap = osfs3_alloc_block();
-    itab_blocks = osfs3_inode_table_blocks(sb.total_inodes);
-    itab_bytes = (size_t)itab_blocks * OSFS3_BLOCK_SIZE;
-    if (posix_memalign((void **)&itab, 4096, itab_bytes) != 0)
-        itab = NULL;
-    if (!imap || !bmap || !itab) return -1;
-    memset(itab, 0, itab_bytes);
-
-    if (osfs3_read_block(dev_fd, OSFS3_INODE_BITMAP_BLK, imap) < 0) return -1;
-    if (osfs3_read_block(dev_fd, OSFS3_BLOCK_BITMAP_BLK, bmap) < 0) return -1;
-    for (uint32_t i = 0; i < itab_blocks; i++) {
-        void *dst = (uint8_t *)itab + (size_t)i * OSFS3_BLOCK_SIZE;
-        if (osfs3_read_block(dev_fd, OSFS3_INODE_TABLE_BLK + i, dst) < 0)
-            return -1;
-    }
+    uint32_t inode_blocks = OSFS3_INODE_TABLE_BLOCKS(superblock.total_inodes);
+    size_t inode_bytes = (size_t)inode_blocks * OSFS3_BLOCK_SIZE;
+    if (alloc_aligned((void **)&inode_bitmap, OSFS3_BLOCK_SIZE) < 0 ||
+        alloc_aligned((void **)&block_bitmap, OSFS3_BLOCK_SIZE) < 0 ||
+        alloc_aligned((void **)&inode_table, inode_bytes) < 0 ||
+        alloc_aligned((void **)&block_buffer, OSFS3_BLOCK_SIZE) < 0)
+        return -1;
+    if (osfs3_read_block(device_fd, OSFS3_INODE_BITMAP_BLK,
+                         inode_bitmap) < 0 ||
+        osfs3_read_block(device_fd, OSFS3_BLOCK_BITMAP_BLK,
+                         block_bitmap) < 0 ||
+        osfs3_read_bytes(device_fd,
+            (uint64_t)OSFS3_INODE_TABLE_BLK * OSFS3_BLOCK_SIZE,
+            inode_table, inode_bytes) < 0)
+        return -1;
+    next_block_hint = superblock.first_data_block;
+    while (next_block_hint < superblock.total_blocks &&
+           bitmap_test(block_bitmap, next_block_hint))
+        next_block_hint++;
     return 0;
 }
 
 static int save_metadata(void)
 {
-    sb.crc32 = 0;
-    sb.crc32 = osfs3_crc32(&sb, sizeof(sb));
-    
-    void *sb_blk = osfs3_alloc_block();
-    if (!sb_blk) return -1;
-    memcpy(sb_blk, &sb, sizeof(sb));
-    if (osfs3_write_block(dev_fd, 0, sb_blk) < 0) return -1;
-    osfs3_free_block(sb_blk);
+    uint32_t inode_blocks = OSFS3_INODE_TABLE_BLOCKS(superblock.total_inodes);
+    size_t inode_bytes = (size_t)inode_blocks * OSFS3_BLOCK_SIZE;
+    if (osfs3_write_block(device_fd, OSFS3_INODE_BITMAP_BLK,
+                          inode_bitmap) < 0 ||
+        osfs3_write_block(device_fd, OSFS3_BLOCK_BITMAP_BLK,
+                          block_bitmap) < 0 ||
+        osfs3_write_bytes(device_fd,
+            (uint64_t)OSFS3_INODE_TABLE_BLK * OSFS3_BLOCK_SIZE,
+            inode_table, inode_bytes) < 0)
+        return -1;
 
-    if (osfs3_write_block(dev_fd, OSFS3_INODE_BITMAP_BLK, imap) < 0) return -1;
-    if (osfs3_write_block(dev_fd, OSFS3_BLOCK_BITMAP_BLK, bmap) < 0) return -1;
-    for (uint32_t i = 0; i < itab_blocks; i++) {
-        void *src = (uint8_t *)itab + (size_t)i * OSFS3_BLOCK_SIZE;
-        if (osfs3_write_block(dev_fd, OSFS3_INODE_TABLE_BLK + i, src) < 0)
-            return -1;
+    superblock.crc32 = 0;
+    superblock.crc32 = osfs3_crc32(&superblock, sizeof(superblock));
+    memset(block_buffer, 0, OSFS3_BLOCK_SIZE);
+    memcpy(block_buffer, &superblock, sizeof(superblock));
+    return osfs3_write_block(device_fd, OSFS3_SUPERBLOCK_BLK,
+                             block_buffer) == 0 && fsync(device_fd) == 0
+        ? 0 : -1;
+}
+
+static uint32_t inode_block_count(const osfs3_inode_t *inode)
+{
+    uint32_t count = 0;
+    for (uint32_t i = 0; i < inode->extent_count; i++)
+        count += inode->extents[i].block_count;
+    return count;
+}
+
+static uint32_t map_file_block(const osfs3_inode_t *inode, uint32_t logical)
+{
+    for (uint32_t i = 0; i < inode->extent_count; i++) {
+        if (logical < inode->extents[i].block_count)
+            return inode->extents[i].start_block + logical;
+        logical -= inode->extents[i].block_count;
     }
     return 0;
 }
@@ -439,34 +457,24 @@ static int split_destination(const char *path, char parent[OSFS3_PATH_MAX],
     return 0;
 }
 
-    while (token) {
-        uint32_t next_ino = find_in_dir(current_ino, token);
-        
-        if (!next_ino) {
-            if (create_dirs) {
-                next_ino = alloc_inode(OSFS3_S_IFDIR | 0755);
-                if (!next_ino) {
-                    free(p);
-                    return 0;
-                }
-                uint32_t data_blk = alloc_block();
-                if (!data_blk) {
-                    free(p);
-                    return 0;
-                }
-                itab[next_ino].extent_count = 1;
-                itab[next_ino].extents[0].start_block = data_blk;
-                itab[next_ino].extents[0].block_count = 1;
-                
-                void *blk = osfs3_alloc_block();
-                osfs3_dentry_t *de = (osfs3_dentry_t *)blk;
-                de->inode = next_ino; de->name_len = 1; de->type = OSFS3_DT_DIR;
-                memcpy(de->name, ".", 1); de->rec_len = OSFS3_DIR_REC_LEN(1);
-                osfs3_dentry_t *de2 = (osfs3_dentry_t *)((char *)de + de->rec_len);
-                de2->inode = current_ino; de2->name_len = 2; de2->type = OSFS3_DT_DIR;
-                memcpy(de2->name, "..", 2); de2->rec_len = OSFS3_BLOCK_SIZE - de->rec_len;
-                osfs3_write_block(dev_fd, data_blk, blk);
-                osfs3_free_block(blk);
+static int import_file(const char *host_path, const char *destination)
+{
+    struct stat metadata;
+    if (stat(host_path, &metadata) < 0 || !S_ISREG(metadata.st_mode)) {
+        fprintf(stderr, "ositofs-write3: cannot stat %s: %s\n",
+                host_path, strerror(errno));
+        return -1;
+    }
+    char parent_path[OSFS3_PATH_MAX];
+    char name[OSFS3_NAME_MAX + 1U];
+    if (split_destination(destination, parent_path, name) < 0) return -1;
+    uint32_t parent = resolve_path(parent_path, 1);
+    uint32_t existing = parent ? find_in_dir(parent, name) : 0;
+    if (!parent || (existing && !replace_existing)) {
+        fprintf(stderr, "ositofs-write3: duplicate or invalid path %s\n",
+                destination);
+        return -1;
+    }
 
     uint32_t ino = existing;
     if (ino && (inode_table[ino].mode & OSFS3_S_IFMT) != OSFS3_S_IFREG) {
@@ -505,64 +513,10 @@ static int split_destination(const char *path, char parent[OSFS3_PATH_MAX],
             }
             done += (size_t)amount;
         }
-        current_ino = next_ino;
-        token = strtok(NULL, "/");
-    }
-    free(p);
-    return current_ino;
-}
-
-/* ── Main ────────────────────────────────────────────────────── */
-
-#include <dirent.h>
-
-/* ... existing includes ... */
-
-static int is_dir(const char *path)
-{
-    struct stat st;
-    if (stat(path, &st) < 0) return 0;
-    return S_ISDIR(st.st_mode);
-}
-
-static int import_recursive(const char *host_path, const char *dest_path);
-
-static int write_file_to_osfs(const char *src_file, const char *dest_path)
-{
-    struct stat st;
-    if (stat(src_file, &st) < 0) { perror("stat"); return -1; }
-
-    char *dpath = strdup(dest_path);
-    char *fpath = strdup(dest_path);
-    char *parent_dir = dirname(dpath);
-    char *filename = basename(fpath);
-
-    uint32_t parent_ino = resolve_path(parent_dir, 1);
-    if (!parent_ino) { fprintf(stderr, "Could not resolve/create parent: %s\n", parent_dir); free(dpath); free(fpath); return -1; }
-
-    if (find_in_dir(parent_ino, filename)) {
-        // fprintf(stderr, "File '%s' already exists, skipping\n", filename);
-        free(dpath); free(fpath); return 0;
-    }
-
-    uint32_t file_ino = alloc_inode(OSFS3_S_IFREG | 0644);
-    if (!file_ino) {
-        fprintf(stderr, "No free inodes for %s\n", dest_path);
-        free(dpath); free(fpath);
-        return -1;
-    }
-    itab[file_ino].size = st.st_size;
-    
-    uint32_t blocks_needed = (st.st_size + OSFS3_BLOCK_SIZE - 1) / OSFS3_BLOCK_SIZE;
-    if (st.st_size > 0) {
-        uint32_t start_blk = 0;
-        uint32_t found_count = 0;
-        for (uint32_t b = sb.first_data_block; b < sb.total_blocks; b++) {
-            if (!(bmap[b / 8] & (1 << (b % 8)))) {
-                if (found_count == 0) start_blk = b;
-                found_count++;
-                if (found_count == blocks_needed) break;
-            } else found_count = 0;
+        uint32_t block = map_file_block(inode, logical++);
+        if (!block || osfs3_write_block(device_fd, block, block_buffer) < 0) {
+            close(source);
+            return -1;
         }
         remaining -= wanted;
     }

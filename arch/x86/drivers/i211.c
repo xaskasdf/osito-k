@@ -655,6 +655,7 @@ int i211_send(const void *data, uint32_t len)
                 serial_puthex(*dd, 8);
                 serial_puts("\n");
             }
+#endif
             i211_note_tx_success();
             return 0;
         }

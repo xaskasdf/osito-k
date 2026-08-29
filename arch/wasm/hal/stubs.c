@@ -59,6 +59,7 @@ uint64_t paging_get_kernel_cr3(void) { return 0; }
 int  paging_map_mmio(uint64_t phys, uint64_t size) { (void)phys; (void)size; return 0; }
 void paging_setup_pat(void) {}
 int  paging_map_wc(uint64_t phys, uint64_t size) { (void)phys; (void)size; return 0; }
+int  paging_process_cr3_selftest(void) { return -1; }
 
 /* ── SMP ─────────────────────────────────────────────────────── */
 
@@ -67,6 +68,10 @@ void smp_init(void) {}
 /* ── Syscall ─────────────────────────────────────────────────── */
 
 void syscall_init(void) {}
+
+static bool wasm_console_screen_log = true;
+void console_screen_log_set(bool enabled) { wasm_console_screen_log = enabled; }
+bool console_screen_log_is_enabled(void) { return wasm_console_screen_log; }
 
 /* ── Process subsystem ───────────────────────────────────────── */
 
@@ -409,6 +414,35 @@ void dl_init(void) {}
 void win32_init(void) {}
 int  win32_install(const char *filename) { (void)filename; return -1; }
 int  installer_uninstall(const char *pkg) { (void)pkg; return -1; }
+void *user32_shim_init(void) { return NULL; }
+void *ddraw_shim_init(void) { return NULL; }
+
+int advapi32_registry_selftest(void) { return -1; }
+int dxgi_selftest(void) { return -1; }
+int gdi32_dib_selftest(void) { return -1; }
+int gdi32_dwrite_selftest(void) { return -1; }
+int gdi32_region_selftest(void) { return -1; }
+int kernel32_iocp_selftest(void) { return -1; }
+int kernel32_module_selftest(void) { return -1; }
+int kernel32_tls_selftest(void) { return -1; }
+int kernel32_wait_selftest(void) { return -1; }
+int nt_process_inspection_selftest(void) { return -1; }
+int nt_vm_selftest(void) { return -1; }
+int ntdll_object_selftest(void) { return -1; }
+int oleacc_selftest(void) { return -1; }
+int pe_protection_selftest(void) { return -1; }
+int user32_input_selftest(void) { return -1; }
+int user32_window_model_selftest(void) { return -1; }
+int wsock_selftest(void) { return -1; }
+
+void dll_export_lookup_dump(void) {}
+void dll_file_cache_dump(void) {}
+int dll_file_cache_flush_unused(void) { return 0; }
+void nt_section_cache_dump(void) {}
+int nt_section_cache_flush_unused(void) { return 0; }
+void pe_import_diagnostics_clear(void) {}
+void pe_import_diagnostics_dump(void) {}
+void pe_import_set_strict(int enabled) { (void)enabled; }
 
 /* ── PCI ─────────────────────────────────────────────────────── */
 
@@ -4139,6 +4173,7 @@ int disk_write_bytes(uint64_t byte_offset, const void *buf, uint64_t len)
 { return nvme_write_bytes(byte_offset, buf, len); }
 int disk_flush(void) { wasm_persist_flush(); return 0; }
 uint32_t disk_lba_size(void) { return 512; }
+uint64_t disk_lba_count(void) { return wasm_nvme_size / disk_lba_size(); }
 
 /* ── Network ─────────────────────────────────────────────────── */
 
@@ -4154,7 +4189,24 @@ int net_udp_send(const uint8_t dst_ip[4], uint16_t dst_port, uint16_t src_port,
     (void)dst_ip; (void)dst_port; (void)src_port; (void)data; (void)len;
     return -1;
 }
-void net_udp_listen(uint16_t port, void *handler) { (void)port; (void)handler; }
+int net_udp_listen(uint16_t port, void *handler)
+{
+    (void)port; (void)handler;
+    return -1;
+}
+uint16_t net_udp_dispatch_port(void) { return 0; }
+int net_udp_send_broadcast_self(uint16_t dst_port, uint16_t src_port,
+                                const void *data, uint32_t len)
+{
+    (void)dst_port; (void)src_port; (void)data; (void)len;
+    return -1;
+}
+int net_tcp_set_keepalive(int conn, int enabled, uint32_t idle_ticks,
+                          uint32_t interval_ticks)
+{
+    (void)conn; (void)enabled; (void)idle_ticks; (void)interval_ticks;
+    return -1;
+}
 void net_icmp_send_echo(const uint8_t dst_ip[4], uint16_t seq) { (void)dst_ip; (void)seq; }
 uint32_t net_icmp_get_rx_count(void) { return 0; }
 
@@ -4220,6 +4272,11 @@ int  sched_spawn(const char *name, void (*entry)(void))
 }
 uint64_t sched_get_switches(void) { return 0; }
 bool sched_is_enabled(void)       { return false; }
+int sched_sleep_ticks(uint64_t ticks)
+{
+    emscripten_sleep((unsigned int)(ticks * 10));
+    return 0;
+}
 
 /* tensor_benchmark is defined in arch/x86/kernel/tensor.c */
 int rag_retrieve(const char *corpus, const char *query, char *result, int result_max)
@@ -5984,6 +6041,7 @@ uint32_t nvme_get_lba_size(void)        { return 512; }
 /* ── OsitoFS v3 (only v2 is mounted in wasm MVP) ──────────────── */
 bool osfs3_is_mounted(void)             { return false; }
 uint32_t osfs3_resolve_path(const char *p) { (void)p; return 0; }
+uint32_t osfs3_resolve_path_ci(const char *p) { return osfs3_resolve_path(p); }
 int  osfs3_read(uint32_t inode, uint64_t off, void *buf, uint64_t len)
 { (void)inode; (void)off; (void)buf; (void)len; return -1; }
 void osfs3_list_dir(uint32_t inode) { (void)inode; }
@@ -6000,6 +6058,9 @@ void display_enable_gpu_scanout(void) {}
 /* ── Globals expected by various subsystems ──────────────────── */
 /* hwbps[] defined above with proper hwbp_t type from hwbp.h */
 int g_compat32_mode = 0;
+int *proc_win32_compat32_mode_slot(void) { return &g_compat32_mode; }
+int32_t win32_last_exit_code = 0;
+void x86_tss_reset_ist1(void) {}
 uint8_t g_tensor_arena[1] = {0};   /* placeholder symbol */
 uint8_t ist1_stack[4096] = {0};
 void *tss_ist1_ptr = NULL;

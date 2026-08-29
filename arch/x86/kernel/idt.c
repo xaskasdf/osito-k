@@ -40,10 +40,54 @@ extern void sched_tick(void *frame);
 extern int  paging_set_flags(uint64_t virt, uint64_t flags);
 extern uint64_t *paging_get_pte(uint64_t virt);
 extern uint64_t mem_get_total(void);
+extern void mem_debug_dump_page(uint64_t phys);
 #define PTE_PRESENT  (1ULL << 0)
 #define PTE_WRITABLE (1ULL << 1)
 #define PTE_GLOBAL   (1ULL << 8)
 #define PTE_NX       (1ULL << 63)
+
+static bool debug_read_u64_in_cr3(uint64_t cr3, uint64_t virt,
+                                  uint64_t *value, uint64_t *phys_out)
+{
+    uint64_t phys = paging_translate_in_cr3(cr3, virt);
+    if (phys == UINT64_MAX || (phys & 0xFFFULL) > 0xFF8ULL)
+        return false;
+    if (value)
+        *value = *(volatile uint64_t *)PHYS_TO_VIRT(phys);
+    if (phys_out)
+        *phys_out = phys;
+    return true;
+}
+
+static bool current_win32_exe_is(const char *wanted)
+{
+    extern const char *win32_current_exe_name(void);
+    const char *name = win32_current_exe_name();
+    const char *base = name;
+
+    if (!name || !wanted) return false;
+    for (const char *p = name; *p; p++)
+        if (*p == '\\' || *p == '/') base = p + 1;
+
+    while (*base && *wanted) {
+        char a = *base++;
+        char b = *wanted++;
+        if (a >= 'A' && a <= 'Z') a += 'a' - 'A';
+        if (b >= 'A' && b <= 'Z') b += 'a' - 'A';
+        if (a != b) return false;
+    }
+    return *base == 0 && *wanted == 0;
+}
+
+static bool current_cr3_range_is_mapped(uint64_t address, uint64_t size)
+{
+    uint64_t cr3;
+    __asm__ volatile ("mov %%cr3, %0" : "=r"(cr3));
+    for (uint64_t offset = 0; offset < size; offset += 4096)
+        if (paging_translate_in_cr3(cr3, address + offset) == UINT64_MAX)
+            return false;
+    return true;
+}
 
 /* NULL page policy: page 0 is read-only+NX. Native ELF user code must fault
  * normally on NULL writes so the crash reporter sees the real bug. Compat32 PE
