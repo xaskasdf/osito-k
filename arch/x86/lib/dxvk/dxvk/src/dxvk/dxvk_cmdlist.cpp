@@ -78,8 +78,12 @@ namespace dxvk {
 
     VkResult vr = VK_SUCCESS;
 
-    if (!this->isEmpty())
+    if (!this->isEmpty()) {
       vr = vk->vkQueueSubmit2(queue, 1, &submitInfo, m_fence);
+      if (vr != VK_SUCCESS)
+        Logger::err(str::format(
+          "DxvkCommandSubmission: vkQueueSubmit2 failed: ", vr));
+    }
 
     this->reset();
     return vr;
@@ -198,10 +202,26 @@ namespace dxvk {
 
     VkSemaphoreCreateInfo semaphoreInfo = { VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
 
-    if (m_vkd->vkCreateSemaphore(m_vkd->device(), &semaphoreInfo, nullptr, &m_bindSemaphore)
-     || m_vkd->vkCreateSemaphore(m_vkd->device(), &semaphoreInfo, nullptr, &m_postSemaphore)
-     || m_vkd->vkCreateSemaphore(m_vkd->device(), &semaphoreInfo, nullptr, &m_sdmaSemaphore))
-      dxvk::DxvkError::abort_ositok("DxvkCommandList: Failed to create semaphore");
+    VkResult semaphoreStatus = m_vkd->vkCreateSemaphore(
+      m_vkd->device(), &semaphoreInfo, nullptr, &m_bindSemaphore);
+    uint32_t semaphoreIndex = 0;
+
+    if (semaphoreStatus == VK_SUCCESS) {
+      semaphoreIndex = 1;
+      semaphoreStatus = m_vkd->vkCreateSemaphore(
+        m_vkd->device(), &semaphoreInfo, nullptr, &m_postSemaphore);
+    }
+
+    if (semaphoreStatus == VK_SUCCESS) {
+      semaphoreIndex = 2;
+      semaphoreStatus = m_vkd->vkCreateSemaphore(
+        m_vkd->device(), &semaphoreInfo, nullptr, &m_sdmaSemaphore);
+    }
+
+    if (semaphoreStatus != VK_SUCCESS)
+      dxvk::DxvkError::abort_ositok(str::format(
+        "DxvkCommandList: Failed to create semaphore ",
+        semaphoreIndex, ": ", semaphoreStatus).c_str());
 
     VkFenceCreateInfo fenceInfo = { VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
 
@@ -381,7 +401,12 @@ namespace dxvk {
 
   
   VkResult DxvkCommandList::synchronizeFence() {
-    return m_vkd->vkWaitForFences(m_vkd->device(), 1, &m_fence, VK_TRUE, ~0ull);
+    VkResult status = m_vkd->vkWaitForFences(
+      m_vkd->device(), 1, &m_fence, VK_TRUE, ~0ull);
+    if (status != VK_SUCCESS)
+      Logger::err(str::format(
+        "DxvkCommandList: Failed to wait for fence: ", status));
+    return status;
   }
 
 

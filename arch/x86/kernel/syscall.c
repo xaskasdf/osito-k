@@ -27,6 +27,7 @@
 
 #include "../include/types.h"
 #include "../include/paging.h"
+#include "../include/hwbp.h"
 #include "../fs/vfs.h"
 #include "../fs/ositofs3.h"
 
@@ -65,6 +66,19 @@ extern const char *osfs2_file_name(void *file);    /* get filename for hint */
 extern int   osfs2_read(void *file, uint64_t offset, void *buf, uint64_t len);
 extern int   osfs2_write(void *file, uint64_t offset, const void *buf, uint64_t len);
 extern void *osfs2_create(const char *name, uint64_t size);
+extern int   osfs2_truncate(void *file, uint64_t size);
+extern int   osfs2_rename(const char *from, const char *to, bool replace);
+extern int   osfs2_file_retain(void *file);
+extern void  osfs2_file_release(void *file);
+extern void *osfs2_file_at(uint32_t index);
+extern uint32_t osfs2_file_count(void);
+extern uint32_t osfs2_file_ctime(void *file);
+extern uint32_t osfs2_file_mtime(void *file);
+extern uint32_t osfs2_free_blocks(void);
+extern uint32_t osfs2_get_block_size(void);
+extern uint32_t osfs2_total_blocks(void);
+extern uint32_t osfs2_max_files(void);
+extern int   disk_flush(void);
 
 /* Heap */
 extern void *kmalloc(uint64_t size);
@@ -115,6 +129,7 @@ extern int32_t  vg3d_ctx_destroy(uint32_t pid, uint32_t ctx_id);
 extern int32_t  vg3d_res_create(uint32_t pid, uint32_t ctx_id,
                                 const struct gpu_res_create_args *args);
 extern uint64_t vg3d_res_map(uint32_t pid, uint32_t res_id);
+extern int32_t  vg3d_res_destroy(uint32_t pid, uint32_t res_id);
 extern int32_t  vg3d_submit(uint32_t pid, uint32_t ctx_id,
                             const void *cmd_bytes, uint64_t cmd_len,
                             uint64_t *out_fence);
@@ -187,6 +202,18 @@ static inline void wrmsr(uint32_t msr, uint64_t val) {
 #define SYS_SCHED_RR_GET_INTERVAL 148
 #define SYS_NANOSLEEP   35
 #define SYS_GETPID      39
+#define SYS_SOCKET      41
+#define SYS_CONNECT     42
+#define SYS_ACCEPT      43
+#define SYS_SENDTO      44
+#define SYS_RECVFROM    45
+#define SYS_SHUTDOWN    48
+#define SYS_BIND        49
+#define SYS_LISTEN      50
+#define SYS_GETSOCKNAME 51
+#define SYS_GETPEERNAME 52
+#define SYS_SETSOCKOPT  54
+#define SYS_GETSOCKOPT  55
 #define SYS_CLONE       56
 #define SYS_FORK        57
 #define SYS_EXECVE      59
@@ -198,6 +225,7 @@ static inline void wrmsr(uint32_t msr, uint64_t val) {
 #define SYS_GETTID      186
 #define SYS_TKILL       200
 #define SYS_FUTEX       202
+#define SYS_SCHED_GETAFFINITY 204
 #define SYS_SET_TID_ADDR 218
 #define SYS_CLOCK_GETTIME 228
 #define SYS_EXIT_GROUP  231
@@ -262,6 +290,7 @@ static inline void wrmsr(uint32_t msr, uint64_t val) {
 #define SYS_TRUNCATE    76
 #define SYS_WAITID      247
 #define SYS_UNLINKAT    263
+#define SYS_RENAMEAT    264
 #define SYS_MKDIRAT     258
 #define SYS_FCHOWNAT    260
 #define SYS_FCHMODAT    268
@@ -290,6 +319,7 @@ static inline void wrmsr(uint32_t msr, uint64_t val) {
 
 /* errno values */
 #define EPERM    1
+#define EIO      5
 #define ENOSYS  38
 #define EBADF    9
 #define EFAULT  14
@@ -309,6 +339,9 @@ static inline void wrmsr(uint32_t msr, uint64_t val) {
 #define ENOTSUP 95
 #define EAFNOSUPPORT 97
 #define EINTR    4
+#define ENAMETOOLONG 36
+#define EEXIST  17
+#define EBUSY   16
 
 /* open flags (Linux values) */
 #define O_RDONLY    0x0000
@@ -317,7 +350,11 @@ static inline void wrmsr(uint32_t msr, uint64_t val) {
 #define O_CREAT     0x0040
 #define O_TRUNC     0x0200
 #define O_APPEND    0x0400
+#define O_DIRECTORY 0x10000
+#define O_CLOEXEC   0x80000
 #define O_ACCMODE   0x0003
+
+#define AT_FDCWD    -100
 
 /* lseek whence */
 #define SEEK_SET    0
@@ -337,6 +374,29 @@ extern uint64_t osfs2_file_size(void *file);
  * unchanged while each process has its own copy of 8 KB. */
 extern fd_entry_t *syscall_fds(void);
 #define fd_table (syscall_fds())
+
+/* BSD socket backend (socket.c). Socket functions return negative errno. */
+extern int sock_socket(int domain, int type, int protocol);
+extern int sock_bind(int sock_idx, const void *addr);
+extern int sock_listen(int sock_idx, int backlog);
+extern int sock_accept(int sock_idx, void *addr, uint32_t *addrlen);
+extern int sock_connect(int sock_idx, const void *addr);
+extern int sock_send(int sock_idx, const void *buf, uint32_t len, int flags);
+extern int sock_recv(int sock_idx, void *buf, uint32_t len, int flags);
+extern int sock_sendto(int sock_idx, const void *buf, uint32_t len,
+                       int flags, const void *dest);
+extern int sock_recvfrom(int sock_idx, void *buf, uint32_t len,
+                         int flags, void *src, uint32_t *addrlen);
+extern int sock_close(int sock_idx);
+extern int sock_setsockopt(int sock_idx, int level, int optname,
+                           const void *optval, uint32_t optlen);
+extern int sock_getsockopt(int sock_idx, int level, int optname,
+                           void *optval, uint32_t *optlen);
+extern int sock_getsockname(int sock_idx, void *addr, uint32_t *addrlen);
+extern int sock_getpeername(int sock_idx, void *addr, uint32_t *addrlen);
+extern int sock_pending_bytes(int sock_idx);
+extern void net_get_mac(uint8_t mac_out[6]);
+extern uint8_t *net_get_ip_ptr(void);
 
 /* Pipe pool stays global (only 8 slots), but each pipe_buf_t now
  * carries refcounts instead of open booleans. */
@@ -534,6 +594,7 @@ void sys_brk_reset(void)
 #define MAP_PRIVATE     0x02
 #define MAP_FIXED       0x10
 #define MAP_ANONYMOUS   0x20
+#define MAP_STACK       0x20000
 #define MAP_ANON        MAP_ANONYMOUS
 
 /* Page table flags */
@@ -562,6 +623,10 @@ void sys_brk_reset(void)
 #define VMA_ANON        0   /* Anonymous mapping (zero-fill on demand) */
 #define VMA_FILE_ELF    1   /* ELF segment backed by file */
 #define VMA_FILE_MMAP   2   /* mmap() file-backed mapping */
+#define VMA_SHARED_STACK 3  /* pthread stack in the global upper-half mirror */
+#define VMA_THREAD_STACK 4  /* demand-paged mmap assigned to CLONE_THREAD */
+#define VMA_DEFERRED_STACK 5 /* munmapped stack, free after thread exit */
+#define VMA_DEFERRED_SHARED_STACK 6
 
 typedef struct {
     uint64_t    base;        /* virtual address */
@@ -579,6 +644,20 @@ typedef struct {
 
 static vma_t vma_table[MAX_VMAS];
 #define VMA_MAGIC 0x564D4131u  /* "VMA1" */
+
+bool syscall_file_is_mapped(void *file)
+{
+    if (!file) return false;
+    for (int i = 0; i < MAX_VMAS; i++) {
+        if (vma_table[i].in_use &&
+            (vma_table[i].type == VMA_FILE_ELF ||
+             vma_table[i].type == VMA_FILE_MMAP) &&
+            vma_table[i].file_node.fs_version == 2 &&
+            vma_table[i].file_node.data == file)
+            return true;
+    }
+    return false;
+}
 
 /* X-PGTBL: current process accessors (defined in process.c). */
 extern void    *proc_current(void);
@@ -671,6 +750,38 @@ static bool vma_range_overlaps_current(uint64_t base, uint64_t pages)
     }
 
     return false;
+}
+
+int syscall_assign_thread_stack(void *thread, uint64_t stack_pointer)
+{
+    if (!thread || !stack_pointer) return -1;
+    extern int32_t proc_tgid_of(void *p);
+    int32_t tgid = proc_tgid_of(thread);
+    for (int i = 0; i < MAX_VMAS; i++) {
+        if (!vma_table[i].in_use) continue;
+        uint64_t end = vma_table[i].base + vma_table[i].pages * 4096;
+        if (stack_pointer < vma_table[i].base || stack_pointer >= end)
+            continue;
+        if (vma_table[i].owner && proc_tgid_of(vma_table[i].owner) != tgid)
+            continue;
+        if (vma_table[i].type != VMA_SHARED_STACK)
+            vma_table[i].type = VMA_THREAD_STACK;
+        vma_table[i].owner = thread;
+        extern uint32_t proc_pid_of(void *p);
+        serial_puts("[VMA-STACK] assign pid=");
+        serial_putdec(proc_pid_of(thread));
+        serial_puts(" base=0x");
+        serial_puthex(vma_table[i].base, 16);
+        serial_puts(" pages=");
+        serial_putdec(vma_table[i].pages);
+        serial_puts(" sp=0x");
+        serial_puthex(stack_pointer, 16);
+        serial_puts(" type=");
+        serial_putdec(vma_table[i].type);
+        serial_puts("\n");
+        return 0;
+    }
+    return -1;
 }
 
 static int vma_find_free_slot_except(int except)
@@ -872,7 +983,7 @@ int quarantine_check_uaf(uint64_t fault_addr, uint32_t pid)
     return 0;
 }
 
-static void vma_free_pages(vma_t *v)
+static void vma_free_pages_in_cr3(vma_t *v, uint64_t cr3, uint32_t pid)
 {
     uint64_t cr3 = (v->owner || v->owner_tgid) ? proc_current_cr3() : 0;
     extern int32_t proc_current_pid(void);
@@ -897,6 +1008,13 @@ static void vma_free_pages(vma_t *v)
                 mem_free_pages((void *)phys, 1);
         }
     }
+}
+
+static void vma_free_pages(vma_t *v)
+{
+    extern int32_t proc_current_pid(void);
+    uint64_t cr3 = v->owner ? proc_current_cr3() : 0;
+    vma_free_pages_in_cr3(v, cr3, (uint32_t)proc_current_pid());
 }
 
 /* ── Public VMA registration (called from elf.c for demand paging) ── */
@@ -970,8 +1088,12 @@ static int64_t sys_write(uint64_t fd, uint64_t buf, uint64_t count)
 {
     if (fd >= MAX_FDS || !fd_table[fd].open) return -EBADF;
     if (!buf && count > 0) return -EFAULT;
+    if (count == 0) return 0;
 
     fd_entry_t *f = &fd_table[fd];
+
+    if (f->type == FD_TYPE_SOCKET)
+        return sock_send(f->socket_idx, (const void *)buf, (uint32_t)count, 0);
 
     if (f->type == FD_TYPE_DEV) {
         int dev_id = (int)f->offset;
@@ -993,7 +1115,7 @@ static int64_t sys_write(uint64_t fd, uint64_t buf, uint64_t count)
         /* Only v2 supports write for now */
         if (f->node.fs_version != 2) return -EROFS;
         int ret = osfs2_write(f->node.data, f->offset, (const void *)buf, count);
-        if (ret < 0) return -EFAULT;
+        if (ret < 0) return -EIO;
         f->offset += count;
         if (f->offset > f->node.size) f->node.size = f->offset;
         return (int64_t)count;
@@ -1037,7 +1159,11 @@ static int64_t sys_read(uint64_t fd, uint64_t buf, uint64_t count)
 {
     if (fd >= MAX_FDS || !fd_table[fd].open) return -EBADF;
     if (!buf && count > 0) return -EFAULT;
+    if (count == 0) return 0;
     fd_entry_t *f = &fd_table[fd];
+
+    if (f->type == FD_TYPE_SOCKET)
+        return sock_recv(f->socket_idx, (void *)buf, (uint32_t)count, 0);
 
     if (f->type == FD_TYPE_DEV) {
         int dev_id = (int)f->offset;
@@ -1210,6 +1336,7 @@ static int proc_gen_maps(char *buf, int max)
 
     for (int i = 0; i < MAX_VMAS && pos < max - 128; i++) {
         if (!vma_table[i].in_use) continue;
+        if (!vma_owned_by_current(&vma_table[i])) continue;
         uint64_t start = vma_table[i].base;
         uint64_t end = start + vma_table[i].pages * 4096;
         uint32_t p = vma_table[i].prot;
@@ -1306,6 +1433,45 @@ static int proc_gen_status(char *buf, int max)
     s = "State:\tR (running)\n";
     while (*s && pos < max - 1) buf[pos++] = *s++;
 
+	uint64_t virtual_bytes = 0;
+	uint64_t resident_bytes = 0;
+	uint64_t cr3 = proc_current_cr3();
+	for (int i = 0; i < MAX_VMAS; i++) {
+		if (!vma_table[i].in_use || !vma_owned_by_current(&vma_table[i]))
+			continue;
+		virtual_bytes += vma_table[i].pages * 4096;
+		for (uint64_t page = 0; page < vma_table[i].pages; page++) {
+			uint64_t address = vma_table[i].base + page * 4096;
+			uint64_t *pte = cr3 ? paging_get_pte_in_cr3(cr3, address)
+				: paging_get_pte(address);
+			if (pte && (*pte & PTE_PRESENT))
+				resident_bytes += 4096;
+		}
+	}
+	if (brk_base && brk_current > brk_base) {
+		uint64_t brk_bytes = (uint64_t)(brk_current - brk_base);
+		virtual_bytes += brk_bytes;
+		resident_bytes += brk_bytes;
+	}
+
+	const char *labels[2] = { "VmSize:\t", "VmRSS:\t" };
+	uint64_t values[2] = { virtual_bytes / 1024, resident_bytes / 1024 };
+	for (int field = 0; field < 2; field++) {
+		s = labels[field];
+		while (*s && pos < max - 1) buf[pos++] = *s++;
+		char number[24];
+		int count = 0;
+		uint64_t value = values[field];
+		if (value == 0) number[count++] = '0';
+		while (value > 0 && count < (int)sizeof(number)) {
+			number[count++] = '0' + (value % 10);
+			value /= 10;
+		}
+		while (count-- > 0 && pos < max - 1) buf[pos++] = number[count];
+		s = " kB\n";
+		while (*s && pos < max - 1) buf[pos++] = *s++;
+	}
+
     buf[pos] = 0;
     return pos;
 }
@@ -1324,6 +1490,137 @@ static int vfs_alloc_fd(void)
     for (int i = 0; i < MAX_FDS; i++)
         if (!fd_table[i].open) return i;
     return -1;
+}
+
+static int socket_index_from_fd(uint64_t fd)
+{
+    if (fd >= MAX_FDS || !fd_table[fd].open ||
+        fd_table[fd].type != FD_TYPE_SOCKET)
+        return -EBADF;
+    return fd_table[fd].socket_idx;
+}
+
+static int64_t sys_socket(uint64_t domain, uint64_t type, uint64_t protocol)
+{
+    int sock_idx = sock_socket((int)domain, (int)(type & 0xf), (int)protocol);
+    if (sock_idx < 0) return sock_idx;
+
+    int fd = vfs_alloc_fd();
+    if (fd < 0) {
+        sock_close(sock_idx);
+        return -EMFILE;
+    }
+
+    fd_entry_t *entry = &fd_table[fd];
+    memset(entry, 0, sizeof(*entry));
+    entry->open = true;
+    entry->type = FD_TYPE_SOCKET;
+    entry->socket_idx = sock_idx;
+    entry->oflags = (type & 0x800) ? 04000 : 0; /* SOCK_NONBLOCK */
+    return fd;
+}
+
+static int64_t sys_bind(uint64_t fd, uint64_t addr, uint64_t addrlen)
+{
+    (void)addrlen;
+    int idx = socket_index_from_fd(fd);
+    if (idx < 0) return idx;
+    if (!addr) return -EFAULT;
+    return sock_bind(idx, (const void *)addr);
+}
+
+static int64_t sys_listen(uint64_t fd, uint64_t backlog)
+{
+    int idx = socket_index_from_fd(fd);
+    return idx < 0 ? idx : sock_listen(idx, (int)backlog);
+}
+
+static int64_t sys_accept(uint64_t fd, uint64_t addr, uint64_t addrlen)
+{
+    int idx = socket_index_from_fd(fd);
+    if (idx < 0) return idx;
+
+    int accepted_idx = sock_accept(idx, (void *)addr, (uint32_t *)addrlen);
+    if (accepted_idx < 0) return accepted_idx;
+
+    int accepted_fd = vfs_alloc_fd();
+    if (accepted_fd < 0) {
+        sock_close(accepted_idx);
+        return -EMFILE;
+    }
+
+    fd_entry_t *entry = &fd_table[accepted_fd];
+    memset(entry, 0, sizeof(*entry));
+    entry->open = true;
+    entry->type = FD_TYPE_SOCKET;
+    entry->socket_idx = accepted_idx;
+    return accepted_fd;
+}
+
+static int64_t sys_connect(uint64_t fd, uint64_t addr, uint64_t addrlen)
+{
+    (void)addrlen;
+    int idx = socket_index_from_fd(fd);
+    if (idx < 0) return idx;
+    if (!addr) return -EFAULT;
+    return sock_connect(idx, (const void *)addr);
+}
+
+static int64_t sys_sendto(uint64_t fd, uint64_t buf, uint64_t len,
+                          uint64_t flags, uint64_t addr, uint64_t addrlen)
+{
+    (void)addrlen;
+    int idx = socket_index_from_fd(fd);
+    if (idx < 0) return idx;
+    if (!buf && len) return -EFAULT;
+    if (!addr)
+        return sock_send(idx, (const void *)buf, (uint32_t)len, (int)flags);
+    return sock_sendto(idx, (const void *)buf, (uint32_t)len,
+                       (int)flags, (const void *)addr);
+}
+
+static int64_t sys_recvfrom(uint64_t fd, uint64_t buf, uint64_t len,
+                            uint64_t flags, uint64_t addr, uint64_t addrlen)
+{
+    int idx = socket_index_from_fd(fd);
+    if (idx < 0) return idx;
+    if (!buf && len) return -EFAULT;
+    if (!addr)
+        return sock_recv(idx, (void *)buf, (uint32_t)len, (int)flags);
+    return sock_recvfrom(idx, (void *)buf, (uint32_t)len, (int)flags,
+                         (void *)addr, (uint32_t *)addrlen);
+}
+
+static int64_t sys_getsockname(uint64_t fd, uint64_t addr, uint64_t addrlen)
+{
+    int idx = socket_index_from_fd(fd);
+    if (idx < 0) return idx;
+    return sock_getsockname(idx, (void *)addr, (uint32_t *)addrlen);
+}
+
+static int64_t sys_getpeername(uint64_t fd, uint64_t addr, uint64_t addrlen)
+{
+    int idx = socket_index_from_fd(fd);
+    if (idx < 0) return idx;
+    return sock_getpeername(idx, (void *)addr, (uint32_t *)addrlen);
+}
+
+static int64_t sys_setsockopt(uint64_t fd, uint64_t level, uint64_t optname,
+                              uint64_t optval, uint64_t optlen)
+{
+    int idx = socket_index_from_fd(fd);
+    if (idx < 0) return idx;
+    return sock_setsockopt(idx, (int)level, (int)optname,
+                           (const void *)optval, (uint32_t)optlen);
+}
+
+static int64_t sys_getsockopt(uint64_t fd, uint64_t level, uint64_t optname,
+                              uint64_t optval, uint64_t optlen)
+{
+    int idx = socket_index_from_fd(fd);
+    if (idx < 0) return idx;
+    return sock_getsockopt(idx, (int)level, (int)optname,
+                           (void *)optval, (uint32_t *)optlen);
 }
 
 /* ── Path normalization for the flat OsitoFS namespace ──────────────
@@ -1437,6 +1734,11 @@ bool path_normalize_flat(const char *path, char *out, int out_sz)
     return rewritten;
 }
 
+static const char *normalized_lookup(const char *path, char *out, int out_sz)
+{
+    return path_normalize_flat(path, out, out_sz) ? out : path;
+}
+
 /* Synthetic directories for the flat OsitoFS namespace. A path is a
  * "directory" if it is the slash-prefix of any stored file key (the FS has
  * no real directory entries — keys are full paths like "usr/include/foo").
@@ -1446,15 +1748,16 @@ bool path_normalize_flat(const char *path, char *out, int out_sz)
  * be path_normalize_flat()'d. */
 static bool osfs2_path_is_dir(const char *flat)
 {
-    extern uint32_t     osfs2_file_count(void);
-    extern void        *osfs2_get_file(int index);
-    extern const char  *osfs2_file_name(void *file);
     if (!flat) return false;
     if (!flat[0]) return true;                 /* "" == root */
     uint64_t len = strlen(flat);
+    if (len >= 64) return false;
     uint32_t n = osfs2_file_count();
     for (uint32_t i = 0; i < n; i++) {
-        const char *name = osfs2_file_name(osfs2_get_file((int)i));
+        const char *name = osfs2_file_name(osfs2_file_at(i));
+        uint32_t name_len = 0;
+        while (name && name_len < 64 && name[name_len]) name_len++;
+        if (!name || name_len == 64) continue;
         if (name && str_startswith(name, flat) && name[len] == '/')
             return true;
     }
@@ -1488,7 +1791,7 @@ static int64_t sys_open(uint64_t path_addr, uint64_t flags, uint64_t mode)
         memset(f, 0, sizeof(*f));
         f->open   = true;
         f->type   = FD_TYPE_DEV;
-        f->oflags = (uint16_t)(flags & 0xFFFF);
+        f->oflags = (uint32_t)flags;
         f->offset = (uint64_t)dev_id;  /* store device ID in offset field */
         return newfd;
     }
@@ -1539,11 +1842,23 @@ static int64_t sys_open(uint64_t path_addr, uint64_t flags, uint64_t mode)
      * Only the regular-file branch is affected — /dev/ and /proc/ above are
      * checked first and return before reaching here. */
     char norm_path[256];
-    const char *lookup = path;
-    if (path_normalize_flat(path, norm_path, sizeof(norm_path)) && norm_path[0])
-        lookup = norm_path;
+    const char *lookup = normalized_lookup(path, norm_path, sizeof(norm_path));
+    if (strlen(lookup) >= 64) return -ENAMETOOLONG;
 
-    if (!vfs_find(lookup, VFS_MODE_POSIX, &f->node)) {
+    bool found = vfs_find(lookup, VFS_MODE_POSIX, &f->node);
+    if (!found && osfs2_path_is_dir(lookup)) {
+        if ((flags & O_ACCMODE) != O_RDONLY || (flags & (O_CREAT | O_TRUNC)))
+            return -EISDIR;
+        f->open = true;
+        f->type = FD_TYPE_DIR;
+        f->oflags = (uint32_t)flags;
+        f->offset = 0;
+        strcpy(f->dir_path, lookup);
+        return newfd;
+    }
+
+    if (!found) {
+        if (flags & O_DIRECTORY) return -ENOTDIR;
         if (flags & O_CREAT) {
             void *f2 = osfs2_create(lookup, 0);
             if (f2) {
@@ -1551,10 +1866,13 @@ static int64_t sys_open(uint64_t path_addr, uint64_t flags, uint64_t mode)
                 f->node.data = f2;
                 f->node.size = 0;
             } else return -ENOENT;
-        } else {
-            if (!vfs_find(lookup, VFS_MODE_WIN32, &f->node)) return -ENOENT;
+        } else if (!vfs_find(lookup, VFS_MODE_WIN32, &f->node)) {
+            return -ENOENT;
         }
     }
+
+    if ((flags & O_DIRECTORY) && f->node.fs_version == 2)
+        return -ENOTDIR;
 
     /* ETXTBSY: refuse write access to a binary that is being executed.
      * Linux returns -ETXTBSY (-26) for open(O_WRONLY/O_RDWR) on a running
@@ -1570,13 +1888,22 @@ static int64_t sys_open(uint64_t path_addr, uint64_t flags, uint64_t mode)
 
     f->open   = true;
     f->type   = FD_TYPE_FILE;
-    f->oflags = (uint16_t)(flags & 0xFFFF);
+    f->oflags = (uint32_t)flags;
     f->offset = 0;
 
     if (flags & O_APPEND)
         f->offset = f->node.size;
 
     if ((flags & O_TRUNC) && ((flags & O_ACCMODE) != O_RDONLY)) {
+        if (f->node.fs_version != 2) {
+            memset(f, 0, sizeof(*f));
+            return -EROFS;
+        }
+        if (osfs2_truncate(f->node.data, 0) < 0) {
+            memset(f, 0, sizeof(*f));
+            return -EIO;
+        }
+        f->node.size = 0;
         f->offset = 0;
     }
 
@@ -1600,11 +1927,11 @@ static int64_t sys_open(uint64_t path_addr, uint64_t flags, uint64_t mode)
     return newfd;
 }
 
-static int64_t sys_close(uint64_t fd)
+static int64_t close_fd_in_table(fd_entry_t *table, uint64_t fd)
 {
-    if (fd >= MAX_FDS || !fd_table[fd].open) return -EBADF;
+    if (!table || fd >= MAX_FDS || !table[fd].open) return -EBADF;
 
-    fd_entry_t *f = &fd_table[fd];
+    fd_entry_t *f = &table[fd];
 
     if (f->type == FD_TYPE_PIPE && f->pipe) {
         pipe_buf_t *p = (pipe_buf_t *)f->pipe;
@@ -1620,22 +1947,39 @@ static int64_t sys_close(uint64_t fd)
     }
 
     if (f->type == FD_TYPE_FILE) {
+        if (f->node.fs_version == 2)
+            osfs2_file_release(f->node.data);
         /* Embedded node, no need to free but we clear version for safety */
         f->node.fs_version = 0;
     }
 
+    if (f->type == FD_TYPE_SOCKET)
+        sock_close(f->socket_idx);
+
     f->open = false;
     return 0;
+}
+
+static int64_t sys_close(uint64_t fd)
+{
+    return close_fd_in_table(fd_table, fd);
 }
 
 static int64_t sys_lseek(uint64_t fd, int64_t offset, uint64_t whence)
 {
     if (fd >= MAX_FDS || !fd_table[fd].open) return -EBADF;
     fd_entry_t *f = &fd_table[fd];
+    if (f->type == FD_TYPE_DIR) {
+        if (whence != SEEK_SET || offset < 0) return -EINVAL;
+        f->offset = (uint64_t)offset;
+        return offset;
+    }
     if (f->type != FD_TYPE_FILE) return -ESPIPE;
 
     int64_t new_off;
-    uint64_t file_size = f->node.size;
+    uint64_t file_size = f->node.fs_version == 2
+                       ? osfs2_file_size(f->node.data) : f->node.size;
+    f->node.size = file_size;
 
     switch (whence) {
     case SEEK_SET: new_off = offset; break;
@@ -1682,6 +2026,8 @@ static int64_t sys_fstat(uint64_t fd, uint64_t statbuf_addr)
     fd_entry_t *f = &fd_table[fd];
 
     if (f->type == FD_TYPE_FILE) {
+        if (f->node.fs_version == 2)
+            f->node.size = osfs2_file_size(f->node.data);
         st->st_mode = 0100644;  /* S_IFREG | 0644 */
         if (f->node.fs_version == 3 && osfs3_is_dir(f->node.ino))
             st->st_mode = 0040755; /* S_IFDIR | 0755 */
@@ -1689,6 +2035,14 @@ static int64_t sys_fstat(uint64_t fd, uint64_t statbuf_addr)
         st->st_blksize = 4096;
         st->st_blocks = (st->st_size + 511) / 512;
         st->st_nlink = 1;
+        if (f->node.fs_version == 2) {
+            st->st_mtime_sec = osfs2_file_mtime(f->node.data);
+            st->st_ctime_sec = osfs2_file_ctime(f->node.data);
+        }
+    } else if (f->type == FD_TYPE_DIR) {
+        st->st_mode = 0040755;  /* S_IFDIR | 0755 */
+        st->st_nlink = 2;
+        st->st_blksize = 4096;
     } else if (f->type == FD_TYPE_DEV) {
         st->st_mode = 0020666;  /* S_IFCHR | 0666 */
         int dev_id = (int)f->offset;
@@ -1711,6 +2065,29 @@ static int64_t sys_fstat(uint64_t fd, uint64_t statbuf_addr)
         st->st_blksize = 1024;
     }
 
+    return 0;
+}
+
+static int64_t sys_fsync(uint64_t fd)
+{
+    if (fd >= MAX_FDS || !fd_table[fd].open) return -EBADF;
+    fd_entry_t *f = &fd_table[fd];
+    if (f->type == FD_TYPE_DIR)
+        return disk_flush() == 0 ? 0 : -EIO;
+    if (f->type != FD_TYPE_FILE) return -EINVAL;
+    if (f->node.fs_version != 2) return 0;
+    return disk_flush() == 0 ? 0 : -EIO;
+}
+
+static int64_t sys_ftruncate(uint64_t fd, uint64_t length)
+{
+    if (fd >= MAX_FDS || !fd_table[fd].open) return -EBADF;
+    fd_entry_t *f = &fd_table[fd];
+    if (f->type != FD_TYPE_FILE) return -EINVAL;
+    if ((f->oflags & O_ACCMODE) == O_RDONLY) return -EBADF;
+    if (f->node.fs_version != 2) return -EROFS;
+    if (osfs2_truncate(f->node.data, length) < 0) return -ENOTSUP;
+    f->node.size = length;
     return 0;
 }
 
@@ -1823,7 +2200,7 @@ static int mmap_commit_anon_first_page(uint64_t va, uint32_t prot)
  * on first access (anonymous) or first read (file-backed).
  * Linux ABI: mmap(addr, length, prot, flags, fd, offset)
  *   args: a1=addr, a2=length, a3=prot, a4=flags, a5(R8)=fd, a6(R9)=offset
- *   Note: R10 carries flags (a4 in our dispatch), fd is a5, offset is unused.
+ *   R10 carries flags (a4), R8 carries fd (a5), and R9 carries offset (a6).
  */
 static int64_t sys_munmap(uint64_t addr, uint64_t length);
 
@@ -1852,6 +2229,7 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
 
     /* File-backed mmap: demand-paged (pages loaded on first access) */
     if (!(flags & MAP_ANONYMOUS)) {
+        if (offset & 0xFFF) return -EINVAL;
         if (fd >= MAX_FDS || !fd_table[fd].open) return -EBADF;
         fd_entry_t *f = &fd_table[fd];
         if (f->type != FD_TYPE_FILE) return -EBADF;
@@ -1879,9 +2257,8 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
 
         /* How much of this mapping is backed by file data? */
         uint64_t fsize = f->node.size;
-        uint64_t backing = length;
-        if (offset + backing > fsize)
-            backing = (offset < fsize) ? fsize - offset : 0;
+        uint64_t backing = offset < fsize ? fsize - offset : 0;
+        if (backing > length) backing = length;
 
         vma_table[vi].base        = result;
         vma_table[vi].pages       = npages;
@@ -2021,6 +2398,43 @@ static int64_t sys_munmap(uint64_t addr, uint64_t length)
             uint64_t overlap_start = addr > vma_start ? addr : vma_start;
             uint64_t overlap_end = unmap_end < vma_end ? unmap_end : vma_end;
             if (overlap_start >= overlap_end) continue;
+
+            /* pthread_join wakes when clear_child_tid becomes zero, slightly
+             * before the child has stopped executing its SYS_exit epilogue.
+             * A parent munmap of that stack can therefore race with the final
+             * child stack writes. Detached musl threads also unmap themselves.
+             * In both cases keep the mapping until the zombie reaper runs. */
+            extern bool proc_is_thread_of(void *p);
+            bool thread_stack = vma_table[i].owner &&
+                proc_is_thread_of(vma_table[i].owner) &&
+                (vma_table[i].type == VMA_SHARED_STACK ||
+                 vma_table[i].type == VMA_THREAD_STACK);
+            extern volatile uint64_t syscall_user_rsp;
+            bool active_stack = syscall_user_rsp >= overlap_start &&
+                syscall_user_rsp < overlap_end;
+            if (thread_stack || active_stack) {
+                if (overlap_start != vma_start || overlap_end != vma_end) {
+                    int ti = vma_split_for_range(
+                        i, overlap_start, (overlap_end - overlap_start) / 4096);
+                    if (ti < 0) return ti;
+                    i = ti;
+                }
+                vma_table[i].type =
+                    vma_table[i].type == VMA_SHARED_STACK
+                    ? VMA_DEFERRED_SHARED_STACK : VMA_DEFERRED_STACK;
+                if (!thread_stack)
+                    vma_table[i].owner = proc_current();
+                serial_puts("[MMAP] deferred active stack unmap base=0x");
+                serial_puthex(vma_table[i].base, 16);
+                serial_puts(" pages=");
+                serial_putdec(vma_table[i].pages);
+                serial_puts(" rsp=0x");
+                serial_puthex(syscall_user_rsp, 16);
+                serial_puts(" pid=");
+                serial_putdec((uint64_t)proc_current_pid());
+                serial_puts("\n");
+                return 0;
+            }
 
             if (overlap_start != vma_start || overlap_end != vma_end) {
                 int ti = vma_split_for_range(i, overlap_start,
@@ -2403,7 +2817,37 @@ typedef struct {
 
 static int64_t sys_ioctl(uint64_t fd, uint64_t request, uint64_t arg)
 {
-    (void)fd;
+    if (fd < MAX_FDS && fd_table[fd].open &&
+        fd_table[fd].type == FD_TYPE_SOCKET) {
+        int sock_idx = fd_table[fd].socket_idx;
+        if (request == 0x541B) { /* FIONREAD */
+            if (!arg) return -EFAULT;
+            int pending = sock_pending_bytes(sock_idx);
+            if (pending < 0) return pending;
+            *(int *)arg = pending;
+            return 0;
+        }
+
+        if (!arg) return -EFAULT;
+        uint8_t *ifreq = (uint8_t *)arg;
+        if (request == 0x8915) { /* SIOCGIFADDR */
+            memset(ifreq + 16, 0, 24);
+            *(uint16_t *)(ifreq + 16) = 2; /* AF_INET */
+            memcpy(ifreq + 20, net_get_ip_ptr(), 4);
+            return 0;
+        }
+        if (request == 0x8927) { /* SIOCGIFHWADDR */
+            memset(ifreq + 16, 0, 24);
+            *(uint16_t *)(ifreq + 16) = 1; /* ARPHRD_ETHER */
+            net_get_mac(ifreq + 18);
+            return 0;
+        }
+        if (request == 0x8921) { /* SIOCGIFMTU */
+            *(int32_t *)(ifreq + 16) = 1500;
+            return 0;
+        }
+    }
+
     switch (request) {
     case TIOCGWINSZ: {
         if (!arg) return -EFAULT;
@@ -2489,9 +2933,108 @@ static int poll_check(struct pollfd *fds, uint64_t nfds)
         /* Files/pipes: always ready */
         if (f->type == FD_TYPE_FILE || f->type == FD_TYPE_PIPE)
             fds[i].revents |= (fds[i].events & (POLLIN | POLLOUT));
+        if (f->type == FD_TYPE_SOCKET) {
+            int pending = sock_pending_bytes(f->socket_idx);
+            if ((fds[i].events & POLLIN) && pending > 0)
+                fds[i].revents |= POLLIN;
+            if (fds[i].events & POLLOUT)
+                fds[i].revents |= POLLOUT;
+            if (pending < 0)
+                fds[i].revents |= POLLERR;
+        }
         if (fds[i].revents) ready++;
     }
     return ready;
+}
+
+#define FDSET_WORDS 16
+
+typedef struct {
+    int64_t tv_sec;
+    int64_t tv_usec;
+} select_timeval_t;
+
+static int64_t sys_select(uint64_t nfds, uint64_t readfds_addr,
+                          uint64_t writefds_addr, uint64_t exceptfds_addr,
+                          uint64_t timeout_addr)
+{
+    uint64_t read_req[FDSET_WORDS] = {0};
+    uint64_t write_req[FDSET_WORDS] = {0};
+    uint64_t except_req[FDSET_WORDS] = {0};
+    uint64_t read_out[FDSET_WORDS];
+    uint64_t write_out[FDSET_WORDS];
+    uint64_t except_out[FDSET_WORDS];
+
+    if (readfds_addr) memcpy(read_req, (void *)readfds_addr, sizeof(read_req));
+    if (writefds_addr) memcpy(write_req, (void *)writefds_addr, sizeof(write_req));
+    if (exceptfds_addr) memcpy(except_req, (void *)exceptfds_addr, sizeof(except_req));
+    if (nfds > MAX_FDS) nfds = MAX_FDS;
+
+    uint64_t timeout_ticks = UINT64_MAX;
+    if (timeout_addr) {
+        select_timeval_t *tv = (select_timeval_t *)timeout_addr;
+        uint64_t usec = (tv->tv_sec > 0 ? (uint64_t)tv->tv_sec : 0) * 1000000ULL;
+        if (tv->tv_usec > 0) usec += (uint64_t)tv->tv_usec;
+        timeout_ticks = (usec + 9999) / 10000;
+    }
+    uint64_t start = idt_get_ticks();
+
+    for (;;) {
+        memset(read_out, 0, sizeof(read_out));
+        memset(write_out, 0, sizeof(write_out));
+        memset(except_out, 0, sizeof(except_out));
+        int ready = 0;
+
+        for (uint64_t fd = 0; fd < nfds; fd++) {
+            uint64_t mask = 1ULL << (fd & 63);
+            uint64_t word = fd >> 6;
+            bool want_read = (read_req[word] & mask) != 0;
+            bool want_write = (write_req[word] & mask) != 0;
+            bool want_except = (except_req[word] & mask) != 0;
+            if (!want_read && !want_write && !want_except) continue;
+            if (!fd_table[fd].open) return -EBADF;
+
+            fd_entry_t *entry = &fd_table[fd];
+            bool fd_ready = false;
+            if (entry->type == FD_TYPE_SOCKET) {
+                int pending = sock_pending_bytes(entry->socket_idx);
+                if (want_read && pending > 0) {
+                    read_out[word] |= mask;
+                    fd_ready = true;
+                }
+                if (want_write && pending >= 0) {
+                    write_out[word] |= mask;
+                    fd_ready = true;
+                }
+                if (want_except && pending < 0) {
+                    except_out[word] |= mask;
+                    fd_ready = true;
+                }
+            } else {
+                if (want_read && (entry->type == FD_TYPE_FILE ||
+                    entry->type == FD_TYPE_PIPE || entry->type == FD_TYPE_DEV)) {
+                    read_out[word] |= mask;
+                    fd_ready = true;
+                }
+                if (want_write && entry->type != FD_TYPE_PROC &&
+                    entry->type != FD_TYPE_DIR) {
+                    write_out[word] |= mask;
+                    fd_ready = true;
+                }
+            }
+            if (fd_ready) ready++;
+        }
+
+        if (ready > 0 || timeout_ticks == 0 ||
+            (timeout_ticks != UINT64_MAX && idt_get_ticks() - start >= timeout_ticks)) {
+            if (readfds_addr) memcpy((void *)readfds_addr, read_out, sizeof(read_out));
+            if (writefds_addr) memcpy((void *)writefds_addr, write_out, sizeof(write_out));
+            if (exceptfds_addr) memcpy((void *)exceptfds_addr, except_out, sizeof(except_out));
+            return ready;
+        }
+
+        __asm__ volatile ("sti; hlt; cli" ::: "memory");
+    }
 }
 
 extern uint64_t idt_get_ticks(void);
@@ -2551,7 +3094,51 @@ static int64_t sys_unlink(uint64_t path_addr)
 {
     const char *path = (const char *)path_addr;
     if (!path) return -EFAULT;
-    return osfs2_delete(path) == 0 ? 0 : -ENOENT;
+    char norm[256];
+    const char *lookup = normalized_lookup(path, norm, sizeof(norm));
+    if (strlen(lookup) >= 64) return -ENAMETOOLONG;
+    if (osfs2_path_is_dir(lookup)) return -EISDIR;
+    int result = osfs2_delete(lookup);
+    if (result == 0) return 0;
+    return result == -2 ? -EBUSY : -ENOENT;
+}
+
+static int64_t sys_rename_impl(uint64_t from_addr, uint64_t to_addr,
+                               bool replace)
+{
+    const char *from = (const char *)from_addr;
+    const char *to = (const char *)to_addr;
+    if (!from || !to) return -EFAULT;
+
+    char from_norm[256], to_norm[256];
+    const char *from_lookup = normalized_lookup(from, from_norm, sizeof(from_norm));
+    const char *to_lookup = normalized_lookup(to, to_norm, sizeof(to_norm));
+    if (!from_lookup[0] || !to_lookup[0]) return -EISDIR;
+    if (strlen(from_lookup) >= 64 || strlen(to_lookup) >= 64)
+        return -ENAMETOOLONG;
+    if (osfs2_path_is_dir(from_lookup) || osfs2_path_is_dir(to_lookup))
+        return -EISDIR;
+    if (!osfs2_find(from_lookup)) return -ENOENT;
+    int result = osfs2_rename(from_lookup, to_lookup, replace);
+    if (result == 0) return 0;
+    if (result == -2) return -EEXIST;
+    if (result == -3) return -EBUSY;
+    return -EIO;
+}
+
+static int64_t sys_rename(uint64_t from_addr, uint64_t to_addr)
+{
+    return sys_rename_impl(from_addr, to_addr, true);
+}
+
+static int64_t sys_renameat(uint64_t olddirfd, uint64_t oldpath,
+                            uint64_t newdirfd, uint64_t newpath,
+                            uint64_t flags)
+{
+    if ((int32_t)olddirfd != AT_FDCWD || (int32_t)newdirfd != AT_FDCWD)
+        return -ENOTSUP;
+    if (flags & ~1ULL) return -EINVAL;
+    return sys_rename_impl(oldpath, newpath, !(flags & 1ULL));
 }
 
 /* ── pipe(pipefd[2]) — create pipe ──────────────────────────── */
@@ -2631,6 +3218,9 @@ static int64_t sys_dup2(uint64_t oldfd, uint64_t newfd)
             p->read_refs++;
         else
             p->write_refs++;
+    } else if (fd_table[newfd].type == FD_TYPE_FILE &&
+               fd_table[newfd].node.fs_version == 2) {
+        osfs2_file_retain(fd_table[newfd].node.data);
     }
 
     return (int64_t)newfd;
@@ -2785,6 +3375,30 @@ static int64_t sys_gettid(void)
     return (int64_t)proc_current_pid();
 }
 
+static int64_t sys_sched_getaffinity(uint64_t pid, uint64_t cpusetsize,
+                                     uint64_t mask_addr)
+{
+    const uint64_t kernel_mask_size = sizeof(uint64_t);
+    if (!mask_addr) return -EFAULT;
+    if (cpusetsize < kernel_mask_size) return -EINVAL;
+
+    if ((int64_t)pid < 0) return -ESRCH;
+    if (pid != 0 && (int64_t)pid != proc_current_pid()) {
+        extern void *proc_find_ptr(uint16_t pid);
+        if (pid > 0xFFFFu || !proc_find_ptr((uint16_t)pid))
+            return -ESRCH;
+    }
+
+    extern uint32_t smp_cpu_count(void);
+    uint32_t cpus = smp_cpu_count();
+    uint64_t mask = cpus >= 64 ? UINT64_MAX : ((1ULL << cpus) - 1ULL);
+    *(uint64_t *)mask_addr = mask;
+
+    /* Linux returns the number of kernel cpumask bytes copied. Musl turns
+     * this into API success and zero-fills any larger cpu_set_t tail. */
+    return (int64_t)kernel_mask_size;
+}
+
 /* rt_sigprocmask — block/unblock signals (minimal stub) */
 static int64_t sys_rt_sigprocmask(uint64_t how, uint64_t set_addr,
                                    uint64_t oldset_addr, uint64_t sigsetsize)
@@ -2895,7 +3509,7 @@ static int64_t sys_getrandom(uint64_t buf_addr, uint64_t buflen, uint64_t flags)
     return (int64_t)buflen;
 }
 
-/* sched_yield — yield CPU (no-op in non-preemptive for now) */
+/* sched_yield — wait for the next timer tick. */
 static int64_t sys_sched_yield(void)
 {
     /*
@@ -2924,7 +3538,7 @@ static int64_t sys_fcntl(uint64_t fd, uint64_t cmd, uint64_t arg)
     case F_GETFD: return 0;  /* No close-on-exec */
     case F_SETFD: return 0;  /* Ignore */
     case F_GETFL: return (int64_t)fd_table[fd].oflags;
-    case F_SETFL: fd_table[fd].oflags = (uint16_t)(arg & 0xFFFF); return 0;
+    case F_SETFL: fd_table[fd].oflags = (uint32_t)arg; return 0;
     case F_DUPFD:
     case F_DUPFD_CLOEXEC: {
         /* Find lowest fd >= arg */
@@ -2937,6 +3551,9 @@ static int64_t sys_fcntl(uint64_t fd, uint64_t cmd, uint64_t arg)
                         p->read_refs++;
                     else
                         p->write_refs++;
+                } else if (fd_table[i].type == FD_TYPE_FILE &&
+                           fd_table[i].node.fs_version == 2) {
+                    osfs2_file_retain(fd_table[i].node.data);
                 }
                 return (int64_t)i;
             }
@@ -2948,7 +3565,6 @@ static int64_t sys_fcntl(uint64_t fd, uint64_t cmd, uint64_t arg)
 }
 
 /* newfstatat / fstatat — stat by path relative to dirfd */
-#define AT_FDCWD -100
 
 static int64_t sys_newfstatat(uint64_t dirfd, uint64_t path_addr,
                                uint64_t statbuf_addr, uint64_t flags)
@@ -2964,9 +3580,7 @@ static int64_t sys_newfstatat(uint64_t dirfd, uint64_t path_addr,
          * to open. Report it as a directory if it is the prefix of any
          * stored file — lets gcc keep its include dirs (S_ISDIR check). */
         char norm[256];
-        const char *flat = path;
-        if (path_normalize_flat(path, norm, sizeof(norm)) && norm[0])
-            flat = norm;
+        const char *flat = normalized_lookup(path, norm, sizeof(norm));
         if (osfs2_path_is_dir(flat)) {
             linux_stat_t *st = (linux_stat_t *)statbuf_addr;
             memset(st, 0, sizeof(*st));
@@ -2986,28 +3600,34 @@ static int64_t sys_newfstatat(uint64_t dirfd, uint64_t path_addr,
 static int64_t sys_pread64(uint64_t fd, uint64_t buf, uint64_t count, uint64_t offset)
 {
     if (fd >= MAX_FDS || !fd_table[fd].open) return -EBADF;
+    if (!buf && count) return -EFAULT;
+    if (count == 0) return 0;
     fd_entry_t *f = &fd_table[fd];
     if (f->type != FD_TYPE_FILE) return -ESPIPE;
-
-    uint64_t saved_offset = f->offset;
-    f->offset = offset;
-    int64_t ret = sys_read(fd, buf, count);
-    f->offset = saved_offset;
-    return ret;
+    if ((f->oflags & O_ACCMODE) == O_WRONLY) return -EBADF;
+    uint64_t size = f->node.fs_version == 2
+                  ? osfs2_file_size(f->node.data) : f->node.size;
+    f->node.size = size;
+    if (offset >= size) return 0;
+    if (count > size - offset) count = size - offset;
+    int ret = vfs_read(&f->node, offset, (void *)buf, (size_t)count);
+    return ret < 0 ? -EIO : ret;
 }
 
 /* pwrite64 — write to fd at offset without changing position */
 static int64_t sys_pwrite64(uint64_t fd, uint64_t buf, uint64_t count, uint64_t offset)
 {
     if (fd >= MAX_FDS || !fd_table[fd].open) return -EBADF;
+    if (!buf && count) return -EFAULT;
+    if (count == 0) return 0;
     fd_entry_t *f = &fd_table[fd];
     if (f->type != FD_TYPE_FILE) return -ESPIPE;
-
-    uint64_t saved_offset = f->offset;
-    f->offset = offset;
-    int64_t ret = sys_write(fd, buf, count);
-    f->offset = saved_offset;
-    return ret;
+    if ((f->oflags & O_ACCMODE) == O_RDONLY) return -EBADF;
+    if (f->node.fs_version != 2) return -EROFS;
+    if (osfs2_write(f->node.data, offset, (const void *)buf, count) < 0)
+        return -EIO;
+    f->node.size = osfs2_file_size(f->node.data);
+    return (int64_t)count;
 }
 
 /* futex — Linux-compatible subset used by musl pthreads */
@@ -3172,6 +3792,9 @@ static int64_t sys_dup(uint64_t oldfd)
                     p->read_refs++;
                 else
                     p->write_refs++;
+            } else if (fd_table[i].type == FD_TYPE_FILE &&
+                       fd_table[i].node.fs_version == 2) {
+                osfs2_file_retain(fd_table[i].node.data);
             }
             return (int64_t)i;
         }
@@ -3447,64 +4070,112 @@ typedef struct {
 #define DT_CHR  2
 #define DT_DIR  4
 
-extern void *osfs2_file_at(uint32_t index);
-extern const char *osfs2_file_name(void *file);
+static uint64_t bounded_name_len(const char *name, uint64_t limit)
+{
+    uint64_t len = 0;
+    while (len < limit && name[len]) len++;
+    return len;
+}
+
+/* Return the immediate child of `dir` represented by a flat OsitoFS key.
+ * Invalid legacy 64-byte unterminated keys are intentionally omitted. */
+static bool osfs2_dir_child(const char *dir, const char *name,
+                            char child[64], uint8_t *type)
+{
+    uint64_t name_len = bounded_name_len(name, 64);
+    if (name_len == 64) return false;
+
+    uint64_t dir_len = strlen(dir);
+    uint64_t start = 0;
+    if (dir_len) {
+        if (name_len <= dir_len || memcmp(name, dir, dir_len) != 0 ||
+            name[dir_len] != '/')
+            return false;
+        start = dir_len + 1;
+    }
+    if (start >= name_len) return false;
+
+    uint64_t end = start;
+    while (end < name_len && name[end] != '/') end++;
+    uint64_t child_len = end - start;
+    if (!child_len || child_len >= 64) return false;
+    memcpy(child, name + start, child_len);
+    child[child_len] = '\0';
+    *type = end < name_len ? DT_DIR : DT_REG;
+    return true;
+}
+
+static bool osfs2_child_seen(const char *dir, const char *child,
+                             uint32_t before)
+{
+    for (uint32_t i = 0; i < before; i++) {
+        void *file = osfs2_file_at(i);
+        const char *name = file ? osfs2_file_name(file) : NULL;
+        char previous[64];
+        uint8_t type;
+        if (name && osfs2_dir_child(dir, name, previous, &type) &&
+            strcmp(previous, child) == 0)
+            return true;
+    }
+    return false;
+}
+
+static int append_dirent(uint8_t *buf, uint64_t count, uint64_t *pos,
+                         uint64_t ino, uint64_t next, uint8_t type,
+                         const char *name)
+{
+    uint64_t namelen = strlen(name);
+    uint64_t reclen = (19 + namelen + 1 + 7) & ~7ULL;
+    if (*pos + reclen > count) return 0;
+
+    linux_dirent64_t *entry = (linux_dirent64_t *)(buf + *pos);
+    memset(entry, 0, reclen);
+    entry->d_ino = ino;
+    entry->d_off = (int64_t)next;
+    entry->d_reclen = (uint16_t)reclen;
+    entry->d_type = type;
+    memcpy(entry->d_name, name, namelen + 1);
+    *pos += reclen;
+    return 1;
+}
 
 static int64_t sys_getdents64(uint64_t fd, uint64_t dirp_addr, uint64_t count)
 {
     if (fd >= MAX_FDS || !fd_table[fd].open) return -EBADF;
+    if (!dirp_addr) return -EFAULT;
 
     fd_entry_t *f = &fd_table[fd];
+    if (f->type != FD_TYPE_DIR) return -ENOTDIR;
+
     uint8_t *buf = (uint8_t *)dirp_addr;
     uint64_t pos = 0;
-    int idx = (int)f->offset;  /* use offset as directory position */
 
-    if (f->type == FD_TYPE_DEV) {
-        /* Listing /dev/ directory */
-        static const char *dev_names[] = { "null", "zero", "urandom", "console", "tty", "random" };
-        int ndevs = 6;
-
-        for (int i = idx; i < ndevs; i++) {
-            uint64_t namelen = strlen(dev_names[i]);
-            uint64_t reclen = (uint64_t)(((int)(19 + namelen + 1) + 7) & ~7);  /* align to 8 */
-            if (pos + reclen > count) break;
-
-            linux_dirent64_t *d = (linux_dirent64_t *)(buf + pos);
-            d->d_ino = (uint64_t)(i + 100);
-            d->d_off = (int64_t)(i + 1);
-            d->d_reclen = (uint16_t)reclen;
-            d->d_type = DT_CHR;
-            memcpy(d->d_name, dev_names[i], (size_t)(namelen + 1));
-            pos += reclen;
-            f->offset = (uint64_t)(i + 1);
-        }
-        return (int64_t)pos;
+    static const char *dots[] = { ".", ".." };
+    for (uint64_t i = f->offset; i < 2; i++) {
+        if (!append_dirent(buf, count, &pos, i + 1, i + 1,
+                           DT_DIR, dots[i]))
+            return pos ? (int64_t)pos : -EINVAL;
+        f->offset = i + 1;
     }
 
-    if (f->type == FD_TYPE_FILE || f->type == FD_TYPE_PROC) {
-        /* Listing OsitoFS root directory or /proc */
-        for (int i = idx; ; i++) {
-            void *file = osfs2_file_at(i);
-            if (!file) break;
-            const char *name = osfs2_file_name(file);
-            if (!name) continue;
-            uint64_t namelen = strlen(name);
-            uint64_t reclen = (uint64_t)(((int)(19 + namelen + 1) + 7) & ~7);
-            if (pos + reclen > count) break;
-
-            linux_dirent64_t *d = (linux_dirent64_t *)(buf + pos);
-            d->d_ino = (uint64_t)(i + 1);
-            d->d_off = (int64_t)(i + 1);
-            d->d_reclen = (uint16_t)reclen;
-            d->d_type = DT_REG;
-            memcpy(d->d_name, name, (size_t)(namelen + 1));
-            pos += reclen;
-            f->offset = (uint64_t)(i + 1);
+    uint32_t files = osfs2_file_count();
+    uint32_t start = f->offset > 2 ? (uint32_t)(f->offset - 2) : 0;
+    for (uint32_t i = start; i < files; i++) {
+        void *file = osfs2_file_at(i);
+        const char *name = file ? osfs2_file_name(file) : NULL;
+        char child[64];
+        uint8_t type;
+        if (!name || !osfs2_dir_child(f->dir_path, name, child, &type) ||
+            osfs2_child_seen(f->dir_path, child, i)) {
+            f->offset = (uint64_t)i + 3;
+            continue;
         }
-        return (int64_t)pos;
+        if (!append_dirent(buf, count, &pos, i + 3, (uint64_t)i + 3,
+                           type, child))
+            return pos ? (int64_t)pos : -EINVAL;
+        f->offset = (uint64_t)i + 3;
     }
-
-    return -ENOTDIR;
+    return (int64_t)pos;
 }
 
 /* ── Trivial POSIX stubs for busybox/musl compatibility ──────── */
@@ -3609,12 +4280,16 @@ static int64_t sys_statfs(uint64_t path_addr, uint64_t buf_addr)
     struct linux_statfs *st = (struct linux_statfs *)buf_addr;
     memset(st, 0, sizeof(*st));
     st->f_type = 0x4F534654;  /* "OSFT" magic */
-    st->f_bsize = 4096;
-    st->f_blocks = mem_get_total() / 4096;
-    st->f_bfree = mem_get_free() / 4096;
+    uint32_t block_size = osfs2_get_block_size();
+    st->f_bsize = block_size ? block_size : 4096;
+    st->f_blocks = block_size ? osfs2_total_blocks() : mem_get_total() / 4096;
+    st->f_bfree = block_size ? osfs2_free_blocks() : mem_get_free() / 4096;
     st->f_bavail = st->f_bfree;
-    st->f_namelen = 64;
-    st->f_frsize = 4096;
+    st->f_files = block_size ? osfs2_max_files() : 0;
+    uint64_t used_files = block_size ? osfs2_file_count() : 0;
+    st->f_ffree = used_files < st->f_files ? st->f_files - used_files : 0;
+    st->f_namelen = 63;
+    st->f_frsize = st->f_bsize;
     return 0;
 }
 
@@ -3887,7 +4562,7 @@ void vdso_init(void)
 
     vdso_page->cpu_count    = smp_cpu_count();
     vdso_page->page_size    = 4096;
-    vdso_page->total_memory = mem_get_total() * 4096;
+    vdso_page->total_memory = mem_get_total();
 
     /* Calibrate TSC: wait for one APIC tick, measure TSC elapsed */
     extern uint64_t idt_get_ticks(void);
@@ -3923,7 +4598,7 @@ void vdso_update(void)
     if (ntp_is_synced())
         vdso_page->unix_timestamp = (int64_t)ntp_get_utc();
 
-    vdso_page->free_memory  = mem_get_free() * 4096;
+    vdso_page->free_memory  = mem_get_free();
     vdso_page->random_seed ^= vdso_page->tsc_at_update;
 
     __asm__ volatile ("" ::: "memory");
@@ -4009,6 +4684,94 @@ static void memo_invalidate_nr(uint64_t nr)
             memo_cache[i].active = false;
 }
 
+typedef struct {
+    uint64_t dr0;
+    uint64_t dr6;
+    uint64_t dr7;
+    uint64_t cr3;
+    uint64_t phys;
+} debug_watch_state_t;
+
+static int64_t sys_debug_watch(uint64_t operation, uint64_t address,
+                               uint64_t state_addr)
+{
+    uint64_t cr3 = proc_current_cr3();
+    uint64_t phys = paging_translate_in_cr3(cr3, address);
+    extern volatile uint64_t syscall_user_rsp;
+    uint64_t rsp_phys = paging_translate_in_cr3(cr3, syscall_user_rsp);
+
+    if (operation == 1) {
+        if ((address & 3) || phys == UINT64_MAX) return -EINVAL;
+        if (hwbp_set(0, address, HWBP_WRITE, HWBP_LEN_4, "gtavbuf") < 0)
+            return -EINVAL;
+        extern void nvme_debug_watch_set(uint64_t phys, uint64_t virt);
+        nvme_debug_watch_set(phys, address);
+        extern void mem_debug_dump_page(uint64_t phys);
+        mem_debug_dump_page(phys);
+        hwbp_set(1, (uint64_t)PHYS_TO_VIRT(phys), HWBP_WRITE,
+                 HWBP_LEN_4, "gtavphys");
+        serial_puts("[GTAV-WATCH] arm pid=");
+        serial_putdec((uint64_t)proc_current_pid());
+        serial_puts(" va=0x");
+        serial_puthex(address, 16);
+        serial_puts(" phys=0x");
+        serial_puthex(phys, 16);
+        serial_puts(" user-rsp=0x");
+        serial_puthex(syscall_user_rsp, 16);
+        serial_puts(" rsp-phys=0x");
+        serial_puthex(rsp_phys, 16);
+        serial_puts(" alias=");
+        serial_putdec(phys != UINT64_MAX && rsp_phys != UINT64_MAX &&
+                      ((phys ^ rsp_phys) < 4096));
+        serial_puts("\n");
+
+        extern uint32_t proc_pid_of(void *p);
+        extern uint32_t proc_state_of(void *p);
+        for (int i = 0; i < MAX_VMAS; i++) {
+            if (!vma_table[i].in_use) continue;
+            if (vma_table[i].type != VMA_SHARED_STACK &&
+                vma_table[i].type != VMA_THREAD_STACK &&
+                vma_table[i].type != VMA_DEFERRED_STACK &&
+                vma_table[i].type != VMA_DEFERRED_SHARED_STACK)
+                continue;
+            uint64_t stack_phys = vma_table[i].type == VMA_SHARED_STACK ||
+                                  vma_table[i].type == VMA_DEFERRED_SHARED_STACK
+                ? VIRT_TO_PHYS(vma_table[i].base)
+                : paging_translate_in_cr3(cr3, vma_table[i].base);
+            if (stack_phys == UINT64_MAX || phys == UINT64_MAX ||
+                (phys & ~0xFFFULL) < (stack_phys & ~0xFFFULL) ||
+                (phys & ~0xFFFULL) >= (stack_phys & ~0xFFFULL) +
+                                      vma_table[i].pages * 4096)
+                continue;
+            serial_puts("[GTAV-WATCH] stack owner=");
+            serial_putdec(proc_pid_of(vma_table[i].owner));
+            serial_puts(" state=");
+            serial_putdec(proc_state_of(vma_table[i].owner));
+            serial_puts(" base=0x");
+            serial_puthex(vma_table[i].base, 16);
+            serial_puts(" phys=0x");
+            serial_puthex(stack_phys, 16);
+            serial_puts(" pages=");
+            serial_putdec(vma_table[i].pages);
+            serial_puts(" type=");
+            serial_putdec(vma_table[i].type);
+            serial_puts("\n");
+        }
+    } else if (operation != 0) {
+        return -EINVAL;
+    }
+
+    if (state_addr) {
+        debug_watch_state_t *state = (debug_watch_state_t *)state_addr;
+        __asm__ volatile ("mov %%dr0, %0" : "=r"(state->dr0));
+        __asm__ volatile ("mov %%dr6, %0" : "=r"(state->dr6));
+        __asm__ volatile ("mov %%dr7, %0" : "=r"(state->dr7));
+        state->cr3 = cr3;
+        state->phys = phys;
+    }
+    return phys == UINT64_MAX ? -EFAULT : (int64_t)phys;
+}
+
 /* ── Syscall dispatch (called from assembly) ─────────────────── */
 
 static int64_t __hot syscall_dispatch_inner(uint64_t nr, uint64_t a1, uint64_t a2,
@@ -4049,8 +4812,7 @@ static int64_t __hot syscall_dispatch_inner(uint64_t nr, uint64_t a1, uint64_t a
 {
     /* Memoization: check cache for known-memoizable syscalls.
      * Buffer-writing syscalls replay via memcpy on cache hit. */
-    if (nr == SYS_UNAME || nr == SYS_GETCWD || nr == SYS_FSTAT ||
-        nr == SYS_STAT) {
+    if (nr == SYS_UNAME || nr == SYS_GETCWD) {
         uint64_t hash = memo_hash(nr, a1, a2);
         /* For uname/getcwd: buf is a1. For stat/fstat: buf is a2. */
         uint64_t dst = (nr == SYS_UNAME || nr == SYS_GETCWD) ? a1 : a2;
@@ -4069,11 +4831,7 @@ static int64_t __hot syscall_dispatch_inner(uint64_t nr, uint64_t a1, uint64_t a
     }
     case SYS_OPEN:       return sys_open(a1, a2, a3);
     case SYS_CLOSE:      return sys_close(a1);
-    case SYS_FSTAT: {
-        int64_t r = sys_fstat(a1, a2);
-        if (r == 0) memo_store(nr, memo_hash(nr, a1, a2), r, (void *)a2, 144, 10);
-        return r;
-    }
+    case SYS_FSTAT:      return sys_fstat(a1, a2);
     case SYS_POLL:       return sys_poll(a1, a2, a3);
     case SYS_LSEEK:      return sys_lseek(a1, (int64_t)a2, a3);
     case SYS_MMAP:       return sys_mmap(a1, a2, a3, a4, a5, a6);
@@ -4115,14 +4873,25 @@ static int64_t __hot syscall_dispatch_inner(uint64_t nr, uint64_t a1, uint64_t a
     case SYS_NANOSLEEP:  return sys_nanosleep(a1, a2);
     case SYS_GETPID:     return sys_getpid();
     case SYS_MADVISE:    return 0;  /* ignore hints */
-    case SYS_STAT: {
-        int64_t r = sys_stat(a1, a2);
-        if (r == 0) memo_store(nr, memo_hash(nr, a1, a2), r, (void *)a2, 144, 10);
-        return r;
-    }
+    case SYS_STAT:       return sys_stat(a1, a2);
     case SYS_LSTAT:      return sys_stat(a1, a2);  /* no symlinks */
     case SYS_SENDFILE:   return sys_sendfile(a1, a2, a3, a4);
-    case SYS_SELECT:     return sys_poll(0, 0, 0);  /* stub: pretend nothing ready */
+    case SYS_SELECT:     return sys_select(a1, a2, a3, a4, a5);
+    case SYS_SOCKET:     return sys_socket(a1, a2, a3);
+    case SYS_CONNECT:    return sys_connect(a1, a2, a3);
+    case SYS_ACCEPT:     return sys_accept(a1, a2, a3);
+    case SYS_SENDTO:     return sys_sendto(a1, a2, a3, a4, a5, a6);
+    case SYS_RECVFROM:   return sys_recvfrom(a1, a2, a3, a4, a5, a6);
+    case SYS_SHUTDOWN: {
+        int idx = socket_index_from_fd(a1);
+        return idx < 0 ? idx : 0;
+    }
+    case SYS_BIND:       return sys_bind(a1, a2, a3);
+    case SYS_LISTEN:     return sys_listen(a1, a2);
+    case SYS_GETSOCKNAME: return sys_getsockname(a1, a2, a3);
+    case SYS_GETPEERNAME: return sys_getpeername(a1, a2, a3);
+    case SYS_SETSOCKOPT: return sys_setsockopt(a1, a2, a3, a4, a5);
+    case SYS_GETSOCKOPT: return sys_getsockopt(a1, a2, a3, a4, a5);
     case SYS_CLONE:      return sys_clone(a1, a2, a3, a4, a5);
     case SYS_FORK:       return sys_clone(17 /* SIGCHLD */, 0, 0, 0, 0);
     case SYS_VFORK:      return sys_clone(17 /* SIGCHLD */, 0, 0, 0, 0);
@@ -4136,7 +4905,7 @@ static int64_t __hot syscall_dispatch_inner(uint64_t nr, uint64_t a1, uint64_t a
         return r;
     }
     case SYS_FCNTL:      return sys_fcntl(a1, a2, a3);
-    case SYS_FSYNC:      return 0;  /* no-op */
+    case SYS_FSYNC:      return sys_fsync(a1);
     case SYS_GETCWD: {
         int64_t r = sys_getcwd(a1, a2);
         if (r > 0) memo_store(nr, memo_hash(nr, a1, a2), r, (void *)a1, 2, 0);
@@ -4183,7 +4952,7 @@ static int64_t __hot syscall_dispatch_inner(uint64_t nr, uint64_t a1, uint64_t a
     case SYS_PAUSE:      return sys_pause();
     case SYS_CHDIR:      return sys_chdir(a1);
     case SYS_FCHDIR:     return sys_fchdir(a1);
-    case SYS_RENAME:     return -ENOSYS;  /* no rename in OsitoFS */
+    case SYS_RENAME:     return sys_rename(a1, a2);
     case SYS_MKDIR:      return -ENOSYS;  /* no directories */
     case SYS_RMDIR:      return -ENOSYS;
     case SYS_CHMOD:      return 0;   /* pretend success */
@@ -4222,11 +4991,12 @@ static int64_t __hot syscall_dispatch_inner(uint64_t nr, uint64_t a1, uint64_t a
     case SYS_STATFS:     return sys_statfs(a1, a2);
     case SYS_FSTATFS:    return sys_statfs(0, a2);  /* reuse */
     case SYS_SETRLIMIT:  return 0;   /* pretend success */
-    case SYS_SYNC:       return 0;   /* no-op */
+    case SYS_SYNC:       disk_flush(); return 0;
     case SYS_TRUNCATE:   return -ENOSYS;
-    case SYS_FTRUNCATE:  return 0;   /* pretend success */
+    case SYS_FTRUNCATE:  return sys_ftruncate(a1, a2);
     case SYS_WAITID:     return sys_wait4(-1, a3, (uint64_t)(int)a4, 0);
     case SYS_UNLINKAT:   return sys_unlink(a2);  /* ignore dirfd */
+    case SYS_RENAMEAT:   return sys_renameat(a1, a2, a3, a4, 0);
     case SYS_MKDIRAT:    return -ENOSYS;
     case SYS_FCHOWNAT:   return 0;
     case SYS_FCHMODAT:   return 0;
@@ -4234,7 +5004,7 @@ static int64_t __hot syscall_dispatch_inner(uint64_t nr, uint64_t a1, uint64_t a
     case SYS_FACCESSAT2: return sys_access(a2, a3);
     case SYS_PSELECT6:   return sys_poll(0, 0, 0);
     case SYS_UTIMENSAT:  return 0;   /* pretend success */
-    case SYS_RENAMEAT2:  return -ENOSYS;
+    case SYS_RENAMEAT2:  return sys_renameat(a1, a2, a3, a4, a5);
     case SYS_STATX:      return sys_statx(a1, a2, a3, a4, a5);
 
     /* ── OsitoK private: shared memory ────────────────────────── */
@@ -4349,31 +5119,21 @@ static int64_t __hot syscall_dispatch_inner(uint64_t nr, uint64_t a1, uint64_t a
 
     /* -- Vulkan Phase 1 / Wave 1: GPU 3D syscalls (600..607) -- */
     case SYS_GPU_CAPS: {         /* 600: caps(*out) */
-        extern bool nvk_backend_ready(void);
         uint32_t caps = 0;
         if (vg3d_caps() & GPU_CAP_VENUS_READY) caps |= GPU_CAP_VENUS_READY;
-        if (nvk_backend_ready())               caps |= GPU_CAP_NVK_READY;
         if (a1) *(uint32_t *)a1 = caps;
         return caps;
     }
     case SYS_GPU_CTX_CREATE: {   /* 601: gpu_ctx_create(flags) */
         int32_t pid = gpu_current_owner_pid();
         if (pid < 0) return -1;  /* EPERM */
-        /* Caller can hint NVK via flag bit 0; otherwise prefer NVK
-         * when ready (bare-metal NVIDIA), else virtio-gpu (QEMU). */
-        extern bool nvk_backend_ready(void);
-        extern int32_t nvk_backend_ctx_create(uint32_t pid, uint32_t flags);
-        if (nvk_backend_ready())
-            return nvk_backend_ctx_create((uint32_t)pid, (uint32_t)a1);
+        if ((uint32_t)a1 != GPU_CTX_VENUS)
+            return -ENOSYS;
         return vg3d_ctx_create((uint32_t)pid, (uint32_t)a1);
     }
     case SYS_GPU_CTX_DESTROY: {  /* 602: gpu_ctx_destroy(ctx_id) */
         int32_t pid = gpu_current_owner_pid();
         if (pid < 0) return -1;
-        extern bool nvk_backend_ready(void);
-        extern int32_t nvk_backend_ctx_destroy(uint32_t pid, uint32_t ctx_id);
-        if (nvk_backend_ready())
-            return nvk_backend_ctx_destroy((uint32_t)pid, (uint32_t)a1);
         return vg3d_ctx_destroy((uint32_t)pid, (uint32_t)a1);
     }
     case SYS_GPU_RES_CREATE: {   /* 603: (ctx_id, args *) */
@@ -4382,19 +5142,11 @@ static int64_t __hot syscall_dispatch_inner(uint64_t nr, uint64_t a1, uint64_t a
         if (pid < 0) return -1;
         const struct gpu_res_create_args *a =
             (const struct gpu_res_create_args *)a2;
-        extern bool nvk_backend_ready(void);
-        extern int32_t nvk_backend_res_create(uint32_t, uint32_t, const struct gpu_res_create_args *);
-        if (nvk_backend_ready())
-            return nvk_backend_res_create((uint32_t)pid, (uint32_t)a1, a);
         return vg3d_res_create((uint32_t)pid, (uint32_t)a1, a);
     }
     case SYS_GPU_RES_MAP: {      /* 604: (res_id) -> user VA */
         int32_t pid = gpu_current_owner_pid();
         if (pid < 0) return -1;
-        extern bool nvk_backend_ready(void);
-        extern int64_t nvk_backend_res_map(uint32_t, uint32_t);
-        if (nvk_backend_ready())
-            return nvk_backend_res_map((uint32_t)pid, (uint32_t)a1);
         return (int64_t)vg3d_res_map((uint32_t)pid, (uint32_t)a1);
     }
     case SYS_GPU_SUBMIT: {       /* 605: (args *) */
@@ -4404,20 +5156,20 @@ static int64_t __hot syscall_dispatch_inner(uint64_t nr, uint64_t a1, uint64_t a
         if (!a->cmd_bytes || !a->out_fence) return -22;
         int32_t pid = gpu_current_owner_pid();
         if (pid < 0) return -1;
-        extern bool nvk_backend_ready(void);
-        extern int32_t nvk_backend_submit(uint32_t, uint32_t, const uint8_t *, uint32_t, uint64_t *);
-        if (nvk_backend_ready())
-            return nvk_backend_submit((uint32_t)pid, a->ctx_id,
-                                       (const uint8_t *)a->cmd_bytes,
-                                       (uint32_t)a->cmd_len, a->out_fence);
-        return vg3d_submit((uint32_t)pid, a->ctx_id,
-                           a->cmd_bytes, a->cmd_len, a->out_fence);
+        int32_t result = vg3d_submit((uint32_t)pid, a->ctx_id,
+                                     a->cmd_bytes, a->cmd_len, a->out_fence);
+        if (result < 0) {
+            serial_puts("[VG3D] submit failed tgid=");
+            serial_putdec((uint32_t)pid);
+            serial_puts(" ctx=");
+            serial_putdec(a->ctx_id);
+            serial_puts(" rc=0x");
+            serial_puthex((uint64_t)(int64_t)result, 16);
+            serial_puts("\n");
+        }
+        return result;
     }
     case SYS_GPU_FENCE_WAIT: {   /* 606: (fence, timeout_ns) */
-        extern bool nvk_backend_ready(void);
-        extern int32_t nvk_backend_fence_wait(uint64_t, uint64_t);
-        if (nvk_backend_ready())
-            return nvk_backend_fence_wait((uint64_t)a1, (uint64_t)a2);
         return vg3d_fence_wait((uint64_t)a1, (uint64_t)a2);
     }
     case SYS_GPU_PRESENT: {      /* 607: (args *) */
@@ -4426,13 +5178,13 @@ static int64_t __hot syscall_dispatch_inner(uint64_t nr, uint64_t a1, uint64_t a
         if (!a) return -22;
         int32_t pid = gpu_current_owner_pid();
         if (pid < 0) return -1;
-        extern bool nvk_backend_ready(void);
-        extern int32_t nvk_backend_present(uint32_t, uint32_t, uint32_t, uint32_t);
-        if (nvk_backend_ready())
-            return nvk_backend_present((uint32_t)pid,
-                                        a->ctx_id, a->res_id, a->shm_handle);
         return vg3d_present((uint32_t)pid,
                             a->ctx_id, a->res_id, a->shm_handle);
+    }
+    case SYS_GPU_RES_DESTROY: {  /* 608: (res_id) */
+        int32_t pid = proc_current_tgid();
+        if (pid < 0) return -1;
+        return vg3d_res_destroy((uint32_t)pid, (uint32_t)a1);
     }
 
     default:
@@ -4535,12 +5287,46 @@ void syscall_restore_brk(void)
 
 /* ── Reset per-process syscall state ─────────────────────────── */
 
+/* Tear down state owned by a process that is no longer current. Process
+ * reaping commonly happens after the parent CR3/current_proc are restored,
+ * so cleanup must not infer either value from global scheduler state. */
+void syscall_cleanup_process(void *owner, uint64_t cr3,
+                             fd_entry_t *fds, uint32_t pid)
+{
+    if (fds) {
+        for (int i = 3; i < MAX_FDS; i++) {
+            if (fds[i].open)
+                close_fd_in_table(fds, (uint64_t)i);
+        }
+    }
+
+    extern bool proc_is_thread_of(void *p);
+    bool owner_is_thread = proc_is_thread_of(owner);
+    for (int i = 0; i < MAX_VMAS; i++) {
+        if (!vma_table[i].in_use || vma_table[i].owner != owner)
+            continue;
+        /* CLONE_THREAD siblings share one address space. VMAs created by a
+         * worker remain group-owned even if that worker exits; otherwise its
+         * reaper can free a live sibling's stack or heap page. The one safe
+         * exception is a stack whose own munmap was deferred above. */
+        if (owner_is_thread &&
+            vma_table[i].type != VMA_SHARED_STACK &&
+            vma_table[i].type != VMA_THREAD_STACK &&
+            vma_table[i].type != VMA_DEFERRED_STACK &&
+            vma_table[i].type != VMA_DEFERRED_SHARED_STACK)
+            continue;
+        vma_free_pages_in_cr3(&vma_table[i], cr3, pid);
+        vma_table[i].in_use = false;
+        vma_table[i].owner = NULL;
+    }
+}
+
 void syscall_reset_process(void)
 {
     /* Close all FDs >= 3 */
     for (int i = 3; i < MAX_FDS; i++) {
         if (fd_table[i].open)
-            sys_close((uint64_t)i);
+            close_fd_in_table(fd_table, (uint64_t)i);
     }
 
     /* Force-reset stdin/stdout/stderr to console.

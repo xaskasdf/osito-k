@@ -80,6 +80,7 @@
 #define OSFS2_FLAG_GGUF       (1 << 1)
 #define OSFS2_FLAG_RAW        (1 << 2)
 #define OSFS2_FLAG_INLINE     (1 << 3)  /* data stored inline in model_name[128] */
+#define OSFS2_FLAG_LONG_NAME  (1 << 4)  /* full name stored in model_name[128] */
 #define OSFS2_INLINE_MAX      128       /* max inline bytes */
 
 /* GGUF quantization types (subset) */
@@ -148,6 +149,44 @@ typedef struct __attribute__((packed)) {
 } osfs2_file_t;
 
 _Static_assert(sizeof(osfs2_file_t) == 256, "file entry must be 256 bytes");
+
+/* ── Metadata redo journal ───────────────────────────────────── */
+
+typedef struct __attribute__((packed)) {
+    uint32_t magic;
+    uint32_t version;
+    uint32_t operation;
+    uint32_t entry_count;
+    uint64_t transaction_id;
+    uint32_t slots[OSFS2_JOURNAL_MAX_ENTRIES];
+    uint32_t page_count;
+    uint32_t pages[OSFS2_JOURNAL_MAX_PAGES];
+    uint32_t reserved_header;
+    osfs2_super_t before_super;
+    osfs2_super_t after_super;
+    osfs2_file_t before_entries[OSFS2_JOURNAL_MAX_ENTRIES];
+    uint8_t after_pages[OSFS2_JOURNAL_MAX_PAGES][OSFS2_METADATA_PAGE_SIZE];
+    uint32_t record_crc32;
+    uint8_t reserved[OSFS2_JOURNAL_RECORD_SIZE - 9780];
+} osfs2_journal_record_t;
+
+_Static_assert(sizeof(osfs2_journal_record_t) == OSFS2_JOURNAL_RECORD_SIZE,
+               "journal record must be 4096 bytes");
+
+typedef struct __attribute__((packed)) {
+    uint32_t magic;
+    uint32_t version;
+    uint64_t transaction_id;
+    uint32_t record_crc32;
+    uint32_t commit_crc32;
+    uint8_t reserved[OSFS2_JOURNAL_COMMIT_SIZE - 24];
+} osfs2_journal_commit_t;
+
+_Static_assert(sizeof(osfs2_journal_commit_t) == OSFS2_JOURNAL_COMMIT_SIZE,
+               "journal commit must be 512 bytes");
+
+_Static_assert(OSFS2_JOURNAL_COMMIT_OFF + OSFS2_JOURNAL_COMMIT_SIZE <=
+               OSFS2_FILETAB_OFF, "journal overlaps file table");
 
 /* ── Block CRC Table (1MB = 262144 × uint32) ────────────────── */
 /* One CRC32 per data block. Stored as flat array of uint32_t.   */
@@ -241,6 +280,11 @@ static inline int osfs2_valid_layout(const osfs2_super_t *sb) {
  * osfs2_layout_data_start_blk(sb). */
 static inline uint32_t osfs2_data_start_blk(uint32_t block_size) {
     return OSFS2_LEGACY_DATA_OFF / block_size;
+}
+
+static inline uint32_t osfs2_format_data_start_blk(uint32_t version,
+                                                    uint32_t block_size) {
+    return osfs2_format_data_off(version) / block_size;
 }
 
 /* Validate block_size: power of 2 in [MIN, MAX] */

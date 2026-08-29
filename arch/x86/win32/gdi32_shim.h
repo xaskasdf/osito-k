@@ -18,6 +18,13 @@ typedef HANDLE HBRUSH_GDI;
 typedef HANDLE HPALETTE;
 typedef HANDLE HGDIOBJ;
 
+typedef struct {
+    LONG left;
+    LONG top;
+    LONG right;
+    LONG bottom;
+} GDI_RECT;
+
 /* Pixel format descriptor */
 typedef struct tagPIXELFORMATDESCRIPTOR {
     WORD  nSize;
@@ -41,6 +48,13 @@ typedef struct tagPIXELFORMATDESCRIPTOR {
     DWORD dwDamageMask;
 } PIXELFORMATDESCRIPTOR, *LPPIXELFORMATDESCRIPTOR;
 
+#define PFD_DOUBLEBUFFER   0x00000001U
+#define PFD_DRAW_TO_WINDOW 0x00000004U
+#define PFD_SUPPORT_OPENGL 0x00000020U
+#define PFD_GENERIC_FORMAT  0x00000040U
+#define PFD_TYPE_RGBA      0
+#define PFD_MAIN_PLANE     0
+
 /* Device caps */
 #define HORZRES         8
 #define VERTRES         10
@@ -48,6 +62,8 @@ typedef struct tagPIXELFORMATDESCRIPTOR {
 #define PLANES          14
 #define RASTERCAPS      38
 #define TECHNOLOGY      2
+#define LOGPIXELSX      88
+#define LOGPIXELSY      90
 
 /* GDI API */
 int   WINAPI GetDeviceCaps(HDC hdc, int index);
@@ -61,6 +77,18 @@ int   WINAPI DescribePixelFormat(HDC hdc, int iPixelFormat, DWORD nBytes,
                                   LPPIXELFORMATDESCRIPTOR ppfd);
 BOOL  WINAPI SwapBuffers(HDC hdc);
 HGDIOBJ WINAPI SelectObject(HDC hdc, HGDIOBJ h);
+HGDIOBJ WINAPI GetCurrentObject(HDC hdc, UINT type);
+HGDIOBJ WINAPI CreateRectRgn(int left, int top, int right, int bottom);
+HGDIOBJ WINAPI CreateRectRgnIndirect(const GDI_RECT *rect);
+BOOL  WINAPI SetRectRgn(HGDIOBJ rgn, int left, int top, int right, int bottom);
+int   WINAPI CombineRgn(HGDIOBJ dest, HGDIOBJ src1, HGDIOBJ src2, int mode);
+BOOL  WINAPI EqualRgn(HGDIOBJ first, HGDIOBJ second);
+BOOL  WINAPI PtInRegion(HGDIOBJ rgn, int x, int y);
+BOOL  WINAPI RectInRegion(HGDIOBJ rgn, const GDI_RECT *rect);
+int   WINAPI GetRgnBox(HGDIOBJ rgn, GDI_RECT *rect);
+int   WINAPI OffsetRgn(HGDIOBJ rgn, int x, int y);
+int   WINAPI SelectClipRgn(HDC hdc, HGDIOBJ rgn);
+UINT  WINAPI SetTextAlign(HDC hdc, UINT align);
 BOOL  WINAPI DeleteObject(HGDIOBJ ho);
 int   WINAPI GetObjectA(HGDIOBJ h, int c, PVOID pv);
 
@@ -72,6 +100,12 @@ HPEN       WINAPI CreatePen(int iStyle, int cWidth, DWORD color);
 HBITMAP    WINAPI CreateCompatibleBitmap(HDC hdc, int cx, int cy);
 HBITMAP    WINAPI CreateBitmap(int nWidth, int nHeight, UINT nPlanes,
                                UINT nBitCount, PVOID lpBits);
+HBITMAP    gdi32_clone_bitmap(HBITMAP bitmap);
+BOOL       gdi32_draw_icon_bitmap(HDC hdc, HBITMAP color, HBITMAP mask,
+                                  int x, int y, int width, int height);
+int        WINAPI GetDIBits(HDC hdc, HBITMAP bitmap, UINT start_scan,
+                            UINT scan_lines, PVOID bits, PVOID bitmap_info,
+                            UINT usage);
 HBITMAP    WINAPI CreateDIBitmap(HDC hdc, PVOID pbmih, DWORD flInit,
                                  PVOID pjBits, PVOID pbmi, UINT iUsage);
 HGDIOBJ    WINAPI GetStockObject(int i);
@@ -95,10 +129,15 @@ BOOL  WINAPI GetTextExtentPoint32W(HDC hdc, PCWSTR lpString, int c, PVOID lpSize
 
 /* Screen DC helpers (for user32 GetDC/ReleaseDC) */
 HDC   gdi32_alloc_screen_dc(void);
+HDC   gdi32_alloc_window_dc(HANDLE window);
+HANDLE gdi32_window_from_dc(HDC hdc);
 void  gdi32_free_screen_dc(HDC hdc);
 
 /* Shim */
 PVOID gdi32_shim_init(void);
 PVOID gdi32_resolve(const char *func_name, USHORT ordinal, BOOL by_ordinal);
+int   gdi32_dwrite_selftest(void);
+int   gdi32_dib_selftest(void);
+int   gdi32_region_selftest(void);
 
 #endif /* GDI32_SHIM_H */

@@ -11,6 +11,7 @@
 
 #include "../include/types.h"
 #include "../include/paging.h"
+#include "smp.h"
 
 /* ── External functions ──────────────────────────────────────── */
 
@@ -62,6 +63,22 @@ extern uint64_t mem_get_total(void);
 static uint64_t *kernel_pml4;    /* Top-level page table */
 static uint64_t  kernel_cr3;     /* Physical address of PML4 */
 static uint32_t  pt_pages_used;  /* Number of 4KB pages allocated for tables */
+static spinlock_t paging_lock = SPINLOCK_INIT;
+
+static inline uint64_t paging_lock_irqsave(void)
+{
+    uint64_t flags;
+    __asm__ volatile ("pushfq; popq %0; cli" : "=r"(flags) :: "memory");
+    spin_lock(&paging_lock);
+    return flags;
+}
+
+static inline void paging_unlock_irqrestore(uint64_t flags)
+{
+    spin_unlock(&paging_lock);
+    if (flags & (1ULL << 9))
+        __asm__ volatile ("sti" ::: "memory");
+}
 
 /* EFER.NXE must be enabled before any PTE uses bit 63 as NX.
  * Otherwise the CPU treats bit 63 as reserved and raises #PF.RSVD
@@ -146,11 +163,13 @@ static uint64_t *pt_get_or_create(uint64_t *table, int index)
 
 static int paging_map_4k(uint64_t virt, uint64_t phys, uint64_t flags)
 {
+    uint64_t irq_flags = paging_lock_irqsave();
+    int result = -1;
     uint64_t *pdpt = pt_get_or_create(kernel_pml4, PML4_INDEX(virt));
-    if (!pdpt) return -1;
+    if (!pdpt) goto out;
 
     uint64_t *pd = pt_get_or_create(pdpt, PDPT_INDEX(virt));
-    if (!pd) return -1;
+    if (!pd) goto out;
 
     /* If PD entry is a 2MB large page, split into 512 × 4KB pages */
     int pd_idx = PD_INDEX(virt);
@@ -162,18 +181,20 @@ static int paging_map_4k(uint64_t virt, uint64_t phys, uint64_t flags)
             serial_puts("[paging] FAIL: pt_alloc for 2MB split at 0x");
             serial_puthex(virt, 16);
             serial_puts("\n");
-            return -1;
+            goto out;
         }
         /* Fill PT with 512 identity-mapped 4KB entries */
         for (int i = 0; i < 512; i++)
             pt[i] = (large_phys + i * PAGE_SIZE) | large_flags;
         /* Replace 2MB entry with PT pointer (store phys, hardware reads it) */
         pd[pd_idx] = (uint64_t)VIRT_TO_PHYS(pt) | PTE_PRESENT | PTE_WRITABLE;
+#ifndef OK_QUIET
         serial_puts("[paging] split 2MB @ 0x");
         serial_puthex(large_phys, 8);
         serial_puts(" -> PT 0x");
         serial_puthex((uint64_t)VIRT_TO_PHYS(pt), 8);
         serial_puts("\n");
+#endif
 
         /* Full TLB flush after 2MB→4KB split.
          * invlpg alone doesn't reliably flush stale 2MB TLB entries
@@ -190,25 +211,33 @@ static int paging_map_4k(uint64_t virt, uint64_t phys, uint64_t flags)
     }
 
     uint64_t *pt = pt_get_or_create(pd, pd_idx);
-    if (!pt) return -1;
+    if (!pt) goto out;
 
     pt[PT_INDEX(virt)] = (phys & PTE_ADDR_MASK) | flags;
+    result = 0;
 
-    return 0;
+out:
+    paging_unlock_irqrestore(irq_flags);
+    return result;
 }
 
 /* ── Map a 2MB large page ────────────────────────────────────── */
 
 static int paging_map_2m(uint64_t virt, uint64_t phys, uint64_t flags)
 {
+    uint64_t irq_flags = paging_lock_irqsave();
+    int result = -1;
     uint64_t *pdpt = pt_get_or_create(kernel_pml4, PML4_INDEX(virt));
-    if (!pdpt) return -1;
+    if (!pdpt) goto out;
 
     uint64_t *pd = pt_get_or_create(pdpt, PDPT_INDEX(virt));
-    if (!pd) return -1;
+    if (!pd) goto out;
 
     pd[PD_INDEX(virt)] = (phys & 0x000FFFFFFFE00000ULL) | flags | PTE_LARGE;
-    return 0;
+    result = 0;
+out:
+    paging_unlock_irqrestore(irq_flags);
+    return result;
 }
 
 /* ── Map a range with an arbitrary virt = phys + virt_offset ── */
@@ -279,11 +308,13 @@ static uint64_t *pte_walk(uint64_t *table, int index);
  * specific process's address space. Auto-creates intermediate tables. */
 static int paging_map_4k_in(uint64_t *pml4, uint64_t virt, uint64_t phys, uint64_t flags)
 {
+    uint64_t irq_flags = paging_lock_irqsave();
+    int result = -1;
     uint64_t *pdpt = pt_get_or_create(pml4, PML4_INDEX(virt));
-    if (!pdpt) return -1;
+    if (!pdpt) goto out;
 
     uint64_t *pd = pt_get_or_create(pdpt, PDPT_INDEX(virt));
-    if (!pd) return -1;
+    if (!pd) goto out;
 
     int pd_idx = PD_INDEX(virt);
     if ((pd[pd_idx] & PTE_PRESENT) && (pd[pd_idx] & PTE_LARGE)) {
@@ -291,7 +322,7 @@ static int paging_map_4k_in(uint64_t *pml4, uint64_t virt, uint64_t phys, uint64
         uint64_t large_phys = pd[pd_idx] & 0x000FFFFFFFE00000ULL;
         uint64_t large_flags = pd[pd_idx] & ~(PTE_ADDR_MASK | PTE_LARGE);
         uint64_t *pt = pt_alloc_page();
-        if (!pt) return -1;
+        if (!pt) goto out;
         for (int i = 0; i < 512; i++)
             pt[i] = (large_phys + i * PAGE_SIZE) | large_flags;
         pd[pd_idx] = (uint64_t)VIRT_TO_PHYS(pt) | PTE_PRESENT | PTE_WRITABLE;
@@ -306,10 +337,13 @@ static int paging_map_4k_in(uint64_t *pml4, uint64_t virt, uint64_t phys, uint64
     }
 
     uint64_t *pt = pt_get_or_create(pd, pd_idx);
-    if (!pt) return -1;
+    if (!pt) goto out;
 
     pt[PT_INDEX(virt)] = (phys & PTE_ADDR_MASK) | flags;
-    return 0;
+    result = 0;
+out:
+    paging_unlock_irqrestore(irq_flags);
+    return result;
 }
 
 /* ── Public API ──────────────────────────────────────────────── */
@@ -339,26 +373,31 @@ int paging_map_page_in_cr3(uint64_t cr3, uint64_t virt, uint64_t phys, uint64_t 
 int paging_unmap_page_in_cr3(uint64_t cr3, uint64_t virt)
 {
     if (!cr3) return -1;
+    uint64_t irq_flags = paging_lock_irqsave();
+    int result = -1;
     uint64_t *pml4 = (uint64_t *)PHYS_TO_VIRT(cr3 & PTE_ADDR_MASK);
     uint64_t *pdpt, *pd, *pt;
     int idx;
 
     idx = PML4_INDEX(virt);
-    if (!(pml4[idx] & PTE_PRESENT)) return -1;
+    if (!(pml4[idx] & PTE_PRESENT)) goto out;
     pdpt = (uint64_t *)PHYS_TO_VIRT(pml4[idx] & PTE_ADDR_MASK);
 
     idx = PDPT_INDEX(virt);
-    if (!(pdpt[idx] & PTE_PRESENT)) return -1;
+    if (!(pdpt[idx] & PTE_PRESENT)) goto out;
     pd = (uint64_t *)PHYS_TO_VIRT(pdpt[idx] & PTE_ADDR_MASK);
 
     idx = PD_INDEX(virt);
-    if (!(pd[idx] & PTE_PRESENT)) return -1;
-    if (pd[idx] & PTE_LARGE) return -1;
+    if (!(pd[idx] & PTE_PRESENT)) goto out;
+    if (pd[idx] & PTE_LARGE) goto out;
     pt = (uint64_t *)PHYS_TO_VIRT(pd[idx] & PTE_ADDR_MASK);
 
     pt[PT_INDEX(virt)] = 0;
-    invlpg(virt);
-    return 0;
+    result = 0;
+out:
+    paging_unlock_irqrestore(irq_flags);
+    if (result == 0) invlpg(virt);
+    return result;
 }
 
 /* Read a PTE from a specific process's address space. */
@@ -374,6 +413,215 @@ uint64_t *paging_get_pte_in_cr3(uint64_t cr3, uint64_t virt)
     uint64_t *pt = pte_walk(pd, PD_INDEX(virt));
     if (!pt) return NULL;
     return &pt[PT_INDEX(virt)];
+}
+
+uint64_t paging_translate_in_cr3(uint64_t cr3, uint64_t virt)
+{
+    if (!cr3) return UINT64_MAX;
+
+    uint64_t *pml4 = (uint64_t *)PHYS_TO_VIRT(cr3 & PTE_ADDR_MASK);
+    uint64_t pml4e = pml4[PML4_INDEX(virt)];
+    if (!(pml4e & PTE_PRESENT)) return UINT64_MAX;
+
+    uint64_t *pdpt = (uint64_t *)PHYS_TO_VIRT(pml4e & PTE_ADDR_MASK);
+    uint64_t pdpte = pdpt[PDPT_INDEX(virt)];
+    if (!(pdpte & PTE_PRESENT)) return UINT64_MAX;
+    if (pdpte & PTE_LARGE)
+        return (pdpte & 0x000FFFFFC0000000ULL) | (virt & 0x3FFFFFFFULL);
+
+    uint64_t *pd = (uint64_t *)PHYS_TO_VIRT(pdpte & PTE_ADDR_MASK);
+    uint64_t pde = pd[PD_INDEX(virt)];
+    if (!(pde & PTE_PRESENT)) return UINT64_MAX;
+    if (pde & PTE_LARGE)
+        return (pde & 0x000FFFFFFFE00000ULL) | (virt & 0x1FFFFFULL);
+
+    uint64_t *pt = (uint64_t *)PHYS_TO_VIRT(pde & PTE_ADDR_MASK);
+    uint64_t pte = pt[PT_INDEX(virt)];
+    if (!(pte & PTE_PRESENT)) return UINT64_MAX;
+    return (pte & PTE_ADDR_MASK) | (virt & 0xFFFULL);
+}
+
+void paging_debug_dump_walk_in_cr3(uint64_t cr3, uint64_t virt)
+{
+    uint64_t root = cr3 & PTE_ADDR_MASK;
+    serial_puts("  [PT-WALK] cr3=0x");
+    serial_puthex(root, 16);
+    serial_puts(" va=0x");
+    serial_puthex(virt, 16);
+    serial_puts("\n");
+    if (!root) {
+        serial_puts("  [PT-WALK] invalid root\n");
+        return;
+    }
+
+    uint64_t *pml4 = (uint64_t *)PHYS_TO_VIRT(root);
+    uint64_t pml4e = pml4[PML4_INDEX(virt)];
+    serial_puts("  [PT-WALK] pml4e=0x");
+    serial_puthex(pml4e, 16);
+    if (!(pml4e & PTE_PRESENT)) {
+        serial_puts(" not-present\n");
+        return;
+    }
+
+    uint64_t *pdpt = (uint64_t *)PHYS_TO_VIRT(pml4e & PTE_ADDR_MASK);
+    uint64_t pdpte = pdpt[PDPT_INDEX(virt)];
+    serial_puts(" pdpte=0x");
+    serial_puthex(pdpte, 16);
+    if (!(pdpte & PTE_PRESENT)) {
+        serial_puts(" not-present\n");
+        return;
+    }
+    if (pdpte & PTE_LARGE) {
+        serial_puts(" 1g-large\n");
+        return;
+    }
+
+    uint64_t *pd = (uint64_t *)PHYS_TO_VIRT(pdpte & PTE_ADDR_MASK);
+    uint64_t pde = pd[PD_INDEX(virt)];
+    serial_puts(" pde=0x");
+    serial_puthex(pde, 16);
+    if (!(pde & PTE_PRESENT)) {
+        serial_puts(" not-present\n");
+        return;
+    }
+    if (pde & PTE_LARGE) {
+        serial_puts(" 2m-large\n");
+        return;
+    }
+
+    uint64_t *pt = (uint64_t *)PHYS_TO_VIRT(pde & PTE_ADDR_MASK);
+    uint64_t pte = pt[PT_INDEX(virt)];
+    serial_puts(" pte=0x");
+    serial_puthex(pte, 16);
+    serial_puts("\n");
+}
+
+static uint64_t paging_next_boundary(uint64_t address, uint64_t span,
+                                     uint64_t limit)
+{
+    uint64_t next = (address & ~(span - 1)) + span;
+    if (next <= address || next > limit)
+        return limit;
+    return next;
+}
+
+uint64_t paging_first_mapped_end_in_cr3(uint64_t cr3, uint64_t virt,
+                                        uint64_t size)
+{
+    if (!cr3 || !size || virt + size < virt)
+        return UINT64_MAX;
+
+    uint64_t end = virt + size;
+    uint64_t cursor = virt;
+    uint64_t mapped_end = 0;
+    uint64_t irq_flags = paging_lock_irqsave();
+    uint64_t *pml4 = (uint64_t *)PHYS_TO_VIRT(cr3 & PTE_ADDR_MASK);
+
+    while (cursor < end) {
+        uint64_t pml4e = pml4[PML4_INDEX(cursor)];
+        if (!(pml4e & PTE_PRESENT)) {
+            cursor = paging_next_boundary(cursor, 1ULL << 39, end);
+            continue;
+        }
+
+        uint64_t *pdpt = (uint64_t *)PHYS_TO_VIRT(pml4e & PTE_ADDR_MASK);
+        uint64_t pdpte = pdpt[PDPT_INDEX(cursor)];
+        if (!(pdpte & PTE_PRESENT)) {
+            cursor = paging_next_boundary(cursor, 1ULL << 30, end);
+            continue;
+        }
+        if (pdpte & PTE_LARGE) {
+            mapped_end = paging_next_boundary(cursor, 1ULL << 30,
+                                               UINT64_MAX);
+            break;
+        }
+
+        uint64_t *pd = (uint64_t *)PHYS_TO_VIRT(pdpte & PTE_ADDR_MASK);
+        uint64_t pde = pd[PD_INDEX(cursor)];
+        if (!(pde & PTE_PRESENT)) {
+            cursor = paging_next_boundary(cursor, 1ULL << 21, end);
+            continue;
+        }
+        if (pde & PTE_LARGE) {
+            mapped_end = paging_next_boundary(cursor, 1ULL << 21,
+                                               UINT64_MAX);
+            break;
+        }
+
+        uint64_t *pt = (uint64_t *)PHYS_TO_VIRT(pde & PTE_ADDR_MASK);
+        uint64_t pt_end = paging_next_boundary(cursor, 1ULL << 21, end);
+        while (cursor < pt_end) {
+            if (pt[PT_INDEX(cursor)] & PTE_PRESENT) {
+                mapped_end = cursor + PAGE_SIZE;
+                goto out;
+            }
+            cursor += PAGE_SIZE;
+        }
+    }
+
+out:
+    paging_unlock_irqrestore(irq_flags);
+    return mapped_end;
+}
+
+int paging_copy_between_cr3(uint64_t dst_cr3, uint64_t dst_va,
+                            uint64_t src_cr3, uint64_t src_va,
+                            uint64_t size, uint64_t *bytes_copied)
+{
+    uint64_t done = 0;
+    if (bytes_copied) *bytes_copied = 0;
+    if (!size) return 0;
+    if (!dst_cr3 || !src_cr3 || dst_va + size < dst_va ||
+        src_va + size < src_va)
+        return -1;
+
+    int backward = dst_cr3 == src_cr3 && dst_va > src_va &&
+                   dst_va < src_va + size;
+    while (done < size) {
+        uint64_t src_cur;
+        uint64_t dst_cur;
+        uint64_t chunk;
+        if (backward) {
+            src_cur = src_va + size - done - 1;
+            dst_cur = dst_va + size - done - 1;
+            chunk = size - done;
+            uint64_t src_in_page = (src_cur & 0xFFFULL) + 1;
+            uint64_t dst_in_page = (dst_cur & 0xFFFULL) + 1;
+            if (chunk > src_in_page) chunk = src_in_page;
+            if (chunk > dst_in_page) chunk = dst_in_page;
+        } else {
+            src_cur = src_va + done;
+            dst_cur = dst_va + done;
+            chunk = size - done;
+            uint64_t src_left = 4096 - (src_cur & 0xFFFULL);
+            uint64_t dst_left = 4096 - (dst_cur & 0xFFFULL);
+            if (chunk > src_left) chunk = src_left;
+            if (chunk > dst_left) chunk = dst_left;
+        }
+
+        uint64_t irq_flags = paging_lock_irqsave();
+        uint64_t src_phys = paging_translate_in_cr3(src_cr3, src_cur);
+        uint64_t dst_phys = paging_translate_in_cr3(dst_cr3, dst_cur);
+        if (src_phys == UINT64_MAX || dst_phys == UINT64_MAX) {
+            paging_unlock_irqrestore(irq_flags);
+            if (bytes_copied) *bytes_copied = done;
+            return -1;
+        }
+
+        volatile uint8_t *src = (volatile uint8_t *)PHYS_TO_VIRT(src_phys);
+        volatile uint8_t *dst = (volatile uint8_t *)PHYS_TO_VIRT(dst_phys);
+        if (backward) {
+            for (uint64_t i = 0; i < chunk; i++)
+                dst[-(int64_t)i] = src[-(int64_t)i];
+        } else {
+            for (uint64_t i = 0; i < chunk; i++) dst[i] = src[i];
+        }
+        paging_unlock_irqrestore(irq_flags);
+        done += chunk;
+    }
+
+    if (bytes_copied) *bytes_copied = done;
+    return 0;
 }
 
 /* Unmap a single 4KB page — clears PTE, invalidates TLB */
@@ -400,6 +648,17 @@ int paging_unmap_page(uint64_t virt)
     pt[PT_INDEX(virt)] = 0;
     invlpg(virt);
     return 0;
+}
+
+/* Restore the normal writable/global upper-half alias for a RAM frame.
+ * Guard pages temporarily punch holes in the direct map; the hole must be
+ * closed before the frame returns to the PMM or its next owner will receive
+ * allocated physical memory that faults through PHYS_TO_VIRT(). */
+int paging_restore_direct_map_page(uint64_t phys)
+{
+    phys &= PTE_ADDR_MASK;
+    return paging_map_page(KERNEL_VBASE + phys, phys,
+                           PTE_WRITABLE | PTE_GLOBAL);
 }
 
 /* Change protection flags on a 4KB page */
@@ -435,14 +694,22 @@ int paging_set_flags_in_cr3(uint64_t cr3, uint64_t virt, uint64_t flags)
 {
     if (!cr3) return -1;
 
+    uint64_t irq_flags = paging_lock_irqsave();
+    int result = -1;
     uint64_t *pte = paging_get_pte_in_cr3(cr3, virt);
-    if (!pte || !(*pte & PTE_PRESENT))
-        return -1;
+    /* PAGE_NOACCESS intentionally clears PRESENT while retaining the backing
+     * frame in the PTE. Accept that state so VirtualProtect can restore access
+     * without allocating or losing the original page. */
+    if (!pte || !(*pte & PTE_ADDR_MASK))
+        goto out;
 
     uint64_t phys = *pte & PTE_ADDR_MASK;
     *pte = phys | flags;
-    invlpg(virt);
-    return 0;
+    result = 0;
+out:
+    paging_unlock_irqrestore(irq_flags);
+    if (result == 0) invlpg(virt);
+    return result;
 }
 
 /* Map an MMIO region (uncacheable) */
@@ -720,22 +987,13 @@ uint64_t paging_create_process_cr3(void)
 {
     if (!kernel_pml4) return 0;
 
-    /* New PML4 — copy kernel entries (shared by reference). The upper
-     * half (PML4[256+]) gives the process the kernel direct map and
-     * kernel text via shared upper PDPTs. The lower half (PML4[0]) is
-     * replaced below with an empty PDPT so user processes get a
-     * pristine lower-half address space with NO kernel identity map. */
+    /* pt_alloc_page() returns a zeroed PML4. Share only the canonical
+     * upper half with the kernel; every lower-half slot must stay private.
+     * Win64 images use lower-half PML4 slots far above slot zero. */
     uint64_t *pml4 = pt_alloc_page();
     if (!pml4) return 0;
-    memcpy(pml4, kernel_pml4, PAGE_SIZE);
-
-    /* Empty PDPT for PML4[0]. ELF demand-paging and sys_mmap demand-
-     * fault install PD/PT/PTE entries via paging_map_4k_in as the
-     * process actually touches addresses. Until then the lower half
-     * is unmapped — accessing it triggers SIGSEGV semantics. */
-    uint64_t *pdpt = pt_alloc_page();
-    if (!pdpt) return 0;
-    pml4[0] = (uint64_t)VIRT_TO_PHYS(pdpt) | PTE_PRESENT | PTE_WRITABLE;
+    for (int i = 256; i < 512; i++)
+        pml4[i] = kernel_pml4[i];
 
     /* Return phys for the CR3 register */
     return VIRT_TO_PHYS(pml4);
@@ -747,13 +1005,144 @@ void paging_free_process_cr3(uint64_t cr3)
 
     /* cr3 is a phys address; resolve it via the upper-half mirror. */
     uint64_t *pml4 = (uint64_t *)PHYS_TO_VIRT(cr3 & PTE_ADDR_MASK);
-    if (pml4[0] & PTE_PRESENT) {
-        uint64_t pdpt_phys = pml4[0] & PTE_ADDR_MASK;
+    for (int i = 0; i < 256; i++) {
+        if (!(pml4[i] & PTE_PRESENT))
+            continue;
+        uint64_t pdpt_phys = pml4[i] & PTE_ADDR_MASK;
         uint64_t *pdpt = (uint64_t *)PHYS_TO_VIRT(pdpt_phys);
         free_user_pdpt(pdpt);
         mem_free_pages((void *)pdpt_phys, 1);
     }
     mem_free_pages((void *)(cr3 & PTE_ADDR_MASK), 1);
+}
+
+static void paging_test_expect(int condition, const char *name,
+                               int *checks, int *failures)
+{
+    (*checks)++;
+    if (condition) return;
+    (*failures)++;
+    serial_puts("[CR3TEST] FAIL: ");
+    serial_puts(name);
+    serial_puts("\n");
+}
+
+int paging_process_cr3_selftest(void)
+{
+    const uint64_t test_va = 0x0000002000000000ULL;
+    const uint64_t low_win64_va = 0x00000001F0000000ULL;
+    const uint64_t value_a = 0x1122334455667788ULL;
+    const uint64_t value_b = 0x8877665544332211ULL;
+    uint64_t cr3_a = 0;
+    uint64_t cr3_b = 0;
+    void *phys_a_ptr = NULL;
+    void *phys_b_ptr = NULL;
+    int mapped_a = 0;
+    int mapped_b = 0;
+    int checks = 0;
+    int failures = 0;
+
+    serial_puts("[CR3TEST] starting process address-space isolation test\n");
+    cr3_a = paging_create_process_cr3();
+    cr3_b = paging_create_process_cr3();
+    paging_test_expect(cr3_a && cr3_b && cr3_a != cr3_b,
+                       "create distinct process roots", &checks, &failures);
+    if (!cr3_a || !cr3_b) goto cleanup;
+
+    paging_test_expect(paging_translate_in_cr3(cr3_a, test_va) == UINT64_MAX &&
+                       paging_translate_in_cr3(cr3_b, test_va) == UINT64_MAX,
+                       "private lower halves start unmapped", &checks,
+                       &failures);
+    paging_test_expect(
+        paging_first_mapped_end_in_cr3(cr3_a, low_win64_va,
+                                       0x0FFE0000ULL) == 0 &&
+        paging_first_mapped_end_in_cr3(cr3_b, low_win64_va,
+                                       0x0FFE0000ULL) == 0,
+        "low Win64 reservation range starts unmapped", &checks, &failures);
+
+    phys_a_ptr = mem_alloc_pages(1);
+    phys_b_ptr = mem_alloc_pages(1);
+    paging_test_expect(phys_a_ptr && phys_b_ptr && phys_a_ptr != phys_b_ptr,
+                       "allocate distinct backing pages", &checks, &failures);
+    if (!phys_a_ptr || !phys_b_ptr) goto cleanup;
+
+    uint64_t phys_a = (uint64_t)(uintptr_t)phys_a_ptr;
+    uint64_t phys_b = (uint64_t)(uintptr_t)phys_b_ptr;
+    *(volatile uint64_t *)PHYS_TO_VIRT(phys_a) = value_a;
+    *(volatile uint64_t *)PHYS_TO_VIRT(phys_b) = value_b;
+
+    mapped_a = paging_map_page_in_cr3(
+        cr3_a, test_va, phys_a, PTE_WRITABLE | PTE_USER | PTE_NX) == 0;
+    mapped_b = paging_map_page_in_cr3(
+        cr3_b, test_va, phys_b, PTE_WRITABLE | PTE_USER | PTE_NX) == 0;
+    paging_test_expect(mapped_a && mapped_b, "map identical VA in both roots",
+                       &checks, &failures);
+    if (!mapped_a || !mapped_b) goto cleanup;
+
+    paging_test_expect(
+        paging_translate_in_cr3(cr3_a, test_va) == phys_a &&
+        paging_translate_in_cr3(cr3_b, test_va) == phys_b,
+        "identical VA resolves to owner backing", &checks, &failures);
+    paging_test_expect(
+        *(volatile uint64_t *)PHYS_TO_VIRT(
+            paging_translate_in_cr3(cr3_a, test_va)) == value_a &&
+        *(volatile uint64_t *)PHYS_TO_VIRT(
+            paging_translate_in_cr3(cr3_b, test_va)) == value_b,
+        "owner contents remain independent", &checks, &failures);
+
+    uint64_t copied = 0;
+    paging_test_expect(
+        paging_copy_between_cr3(cr3_b, test_va, cr3_a, test_va,
+                                sizeof(value_a), &copied) == 0 &&
+        copied == sizeof(value_a) &&
+        *(volatile uint64_t *)PHYS_TO_VIRT(phys_b) == value_a,
+        "copy data between explicit roots", &checks, &failures);
+    *(volatile uint64_t *)PHYS_TO_VIRT(phys_b) = value_b;
+    copied = 0;
+    paging_test_expect(
+        paging_copy_between_cr3(cr3_b, test_va + 4088,
+                                cr3_a, test_va + 4088, 16, &copied) != 0 &&
+        copied == 8,
+        "report partial copy at unmapped boundary", &checks, &failures);
+
+    paging_test_expect(
+        paging_set_flags_in_cr3(cr3_a, test_va,
+                                PTE_PRESENT | PTE_USER | PTE_NX) == 0,
+        "change protection in one root", &checks, &failures);
+    uint64_t *pte_a = paging_get_pte_in_cr3(cr3_a, test_va);
+    uint64_t *pte_b = paging_get_pte_in_cr3(cr3_b, test_va);
+    paging_test_expect(pte_a && pte_b && !(*pte_a & PTE_WRITABLE) &&
+                       (*pte_b & PTE_WRITABLE),
+                       "protection changes stay owner-local", &checks,
+                       &failures);
+
+    uint64_t kernel_va = (uint64_t)(uintptr_t)&paging_process_cr3_selftest;
+    uint64_t kernel_phys = paging_translate_in_cr3(kernel_cr3, kernel_va);
+    paging_test_expect(kernel_phys != UINT64_MAX &&
+                       paging_translate_in_cr3(cr3_a, kernel_va) == kernel_phys &&
+                       paging_translate_in_cr3(cr3_b, kernel_va) == kernel_phys,
+                       "kernel upper half is shared", &checks, &failures);
+
+    paging_test_expect(paging_unmap_page_in_cr3(cr3_a, test_va) == 0 &&
+                       paging_translate_in_cr3(cr3_a, test_va) == UINT64_MAX &&
+                       paging_translate_in_cr3(cr3_b, test_va) == phys_b,
+                       "unmap stays owner-local", &checks, &failures);
+    mapped_a = 0;
+
+cleanup:
+    if (mapped_a) paging_unmap_page_in_cr3(cr3_a, test_va);
+    if (mapped_b) paging_unmap_page_in_cr3(cr3_b, test_va);
+    if (cr3_a) paging_free_process_cr3(cr3_a);
+    if (cr3_b) paging_free_process_cr3(cr3_b);
+    if (phys_a_ptr) mem_free_pages(phys_a_ptr, 1);
+    if (phys_b_ptr) mem_free_pages(phys_b_ptr, 1);
+
+    serial_puts("[CR3TEST] checks=");
+    serial_putdec((uint64_t)checks);
+    serial_puts(" failures=");
+    serial_putdec((uint64_t)failures);
+    serial_puts("\n");
+    return failures;
 }
 
 /* ── Copy-on-Write (COW) support ─────────────────────────────── */

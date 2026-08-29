@@ -10,10 +10,12 @@
 
 #include "wdbg.h"
 #include "compat32.h"
+#include "../include/paging.h"
 
 extern void serial_puts(const char *s);
 extern void serial_puthex(uint64_t val, int digits);
 extern void serial_putdec(uint64_t val);
+extern uint64_t proc_current_cr3(void);
 
 /* ── Module table ───────────────────────────────────────────── */
 
@@ -168,9 +170,19 @@ static int va_readable(uint32_t va, int bytes)
     /* Coarse readability check: must be inside known module ranges
      * or known heap/IAT zones. For now, accept anything in
      * [0x10000, 0x80000000) — bare-metal compat32 mapping. */
-    if (va < 0x10000) return 0;
-    if (va + bytes < va) return 0;
-    if (va + bytes >= 0x80000000u) return 0;
+    if (va < 0x10000 || bytes <= 0) return 0;
+    uint32_t end = va + (uint32_t)bytes - 1U;
+    if (end < va || end >= 0x80000000U) return 0;
+
+    uint64_t cr3 = proc_current_cr3();
+    if (!cr3) return 0;
+    uint64_t page = (uint64_t)va & ~0xFFFULL;
+    uint64_t last = (uint64_t)end & ~0xFFFULL;
+    for (;;) {
+        if (paging_translate_in_cr3(cr3, page) == UINT64_MAX) return 0;
+        if (page == last) break;
+        page += 0x1000ULL;
+    }
     return 1;
 }
 
@@ -276,19 +288,25 @@ static int looks_like_retaddr(uint32_t va)
     }
     if (!in_module) return 0;
     /* Need to read [va-5..va-1] safely. */
-    if (!va_readable(va - 5, 5)) return 0;
+    if (va < 5 || !va_readable(va - 5, 5)) return 0;
     uint8_t b5 = *(volatile uint8_t *)(uintptr_t)(va - 5);
     if (b5 == 0xE8) return 1;  /* CALL rel32 — 5 bytes total */
     /* CALL [r/m32] via 0xFF — usually 2-6 bytes; check b2..b1 for
      * the most common 2-byte form (FF 15 disp32 = 6 bytes total) */
-    uint8_t b6 = *(volatile uint8_t *)(uintptr_t)(va - 6);
-    if (va_readable(va - 6, 6) && b6 == 0xFF) return 1;
+    if (va >= 6 && va_readable(va - 6, 6)) {
+        uint8_t b6 = *(volatile uint8_t *)(uintptr_t)(va - 6);
+        if (b6 == 0xFF) return 1;
+    }
     /* 2-byte indirect: FF D? / FF E? / FF 1? */
-    uint8_t b2 = *(volatile uint8_t *)(uintptr_t)(va - 2);
-    if (b2 == 0xFF) return 1;
+    if (va >= 2 && va_readable(va - 2, 2)) {
+        uint8_t b2 = *(volatile uint8_t *)(uintptr_t)(va - 2);
+        if (b2 == 0xFF) return 1;
+    }
     /* 3-byte indirect: FF /r modrm with disp8 */
-    uint8_t b3 = *(volatile uint8_t *)(uintptr_t)(va - 3);
-    if (b3 == 0xFF) return 1;
+    if (va >= 3 && va_readable(va - 3, 3)) {
+        uint8_t b3 = *(volatile uint8_t *)(uintptr_t)(va - 3);
+        if (b3 == 0xFF) return 1;
+    }
     return 0;
 }
 

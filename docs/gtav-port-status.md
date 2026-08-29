@@ -6,9 +6,12 @@ to credits.
 
 ## Current State (Jun 20 2026)
 
-**Build**: GTA5.elf 7MB, compiled with x86_64-ositok-gcc 14.2.0 + musl libc.
-1199 RAGE .o files in rage_core.a. Game core files (main.cpp, app.cpp,
-system.cpp, game.cpp, filemgr.cpp) compile and link.
+**Build**: `gtav-app-shell` is a 94.0 MiB static x86-64 SysV ELF, compiled
+with the OsitoK GCC/musl toolchain. The production link now consumes the
+audited retail frontiers for Core, Audio, Graphics, Physics, Creature,
+Security, Network, Framework, SuiteCreature and Script plus the required
+RageMisc closures. The 263-TU `game4_lib` frontier also builds, passes the
+combined whole-archive audit and is present in the production link lazily.
 
 **Runtime**: FSM reaches RunGame (state 2), game loop ran 1.5M+ ticks with
 CSystem::BeginUpdate/EndUpdate active. Compositor shows GTA5 window via
@@ -32,14 +35,15 @@ the debug-pattern/flicker path caused by scanout backbuffers.
 ## Architecture
 
 ```
-GTA5.elf (userspace, musl libc)
-├── RAGE Engine (rage_core.a, 1199 objects)
-│   ├── ipc_ositok.cpp — real threading via syscall (clone, futex, nanosleep)
-│   ├── device_ositok.cpp — file I/O via OsitoK VFS
-│   ├── ositok_stubs.cpp — controlled stubs (StreamingInstall, singletons)
-│   └── ositok_phase1_stubs.cpp — 1049 auto-generated long-return stubs
-├── Game Core (main.cpp, app.cpp, system.cpp, game.cpp)
-└── PSC-generated headers (gen_psc_headers.py v4.5, 543 .psc files)
+gtav-app-shell (static x86-64 SysV ELF, musl libc)
+├── Manifest-derived RAGE retail archives
+│   ├── Core / Audio / Graphics / Physics / Creature / Sec / Net
+│   ├── Framework / SuiteCreature / Script / required RageMisc clusters
+│   └── game4_lib (Vehicles / vehicleAi / weapons / VFX / text / tools)
+├── Osito platform closures
+│   ├── pthread, VFS, socket and asynchronous task backends
+│   └── D3D11 -> DXVK -> Vulkan/Venus graphics backend
+└── Deterministic CApp FSM and subsystem probes
 
 OsitoK Kernel
 ├── sys_clone (CLONE_THREAD) + sys_futex (WAIT/WAKE, 256 slots)
@@ -58,6 +62,7 @@ OsitoK Kernel
 | File I/O (fiDeviceOsitoK) | DONE | VFS mount game:/, RPF7 read+inflate |
 | Heap (InitGameHeap) | DONE | 256MB via mmap at 0x504001000 |
 | Threading (ipc_ositok.cpp) | DONE | Real clone/futex/nanosleep |
+| Task scheduler (task_ositok.cpp) | DONE | Pthread worker queues, 512 reusable handles, prepared/local dispatch, aligned scratch, same/cross-scheduler wait assistance and phased draining shutdown. The standalone lifecycle smoke and concurrent retail collider, NaturalMotion and force-solver app-shell probes pass Venus. |
 | RPF loading | DONE | 24 packs, StreamingInstall override |
 | CApp FSM | DONE | InitSystem→InitGame→RunGame |
 | CFileMgr | DONE | Real impl compiled, 24 RPFs mounted |
@@ -67,9 +72,9 @@ OsitoK Kernel
 | Audio backend | STUB | HDA driver exists, no RAGE bridge |
 | Input | STUB | Kernel has xHCI+evdev, no RAGE bridge |
 | Streaming (pgStreamer) | STUB | Thread creation works, real streaming pending |
-| Script VM (.ysc) | NOT STARTED | rage/script/ not compiled |
+| Script VM (.ysc) | PARTIAL | The complete seven-TU RageScript retail library compiles, links and passes whole-audit; game `.ysc` mounting, native registration and execution are pending. |
 | Save/Load | NOT STARTED | Needs OsitoFS file write |
-| Network/Social | EXCLUDED | Stubs, offline-only |
+| Network transport/Social | PARTIAL | RageNet transport and wolfSSL are real and validated offline; native Rockstar Social Club login/UI/entitlements remain unavailable outside Win32. |
 
 ## Current Blocker
 
@@ -141,15 +146,13 @@ that until the kernel VM change has been validated with non-GTA mmap tests.
 
 | File | Purpose |
 |------|---------|
-| `GTAV_Source/Makefile` | Build rules, source lists, cross-compiler flags |
-| `GTAV_Source/GTA5_ositok.cpp` | Entry point, heap init, VFS mount |
-| `GTAV_Source/ositok_stubs.cpp` | Controlled stubs (singletons, StreamingInstall) |
-| `GTAV_Source/ositok_phase1_stubs.cpp` | 1049 auto-generated function stubs |
-| `GTAV_Source/ositok_auto_stubs.cpp` | C++ mangled symbol stubs |
-| `GTAV_Source/gen_psc_headers.py` | PSC XML → C++ header generator |
-| `GTAV_Source/src/dev_ng/rage/base/src/system/ipc_ositok.cpp` | Threading layer |
-| `GTAV_Source/src/dev_ng/rage/base/src/file/device_ositok.cpp` | File I/O |
-| `GTAV_Source/src/dev_ng/rage/base/src/forceinclude/ositok_beta.h` | Platform defines |
+| `GTAV Source/CMakeLists.txt` | Manifest-derived retail frontiers, archive ownership and production app-shell link |
+| `GTAV Source/ports/ositok/game/core/app_shell_ositok.cpp` | Deterministic subsystem and Framework runtime probes |
+| `GTAV Source/ports/ositok/forceinclude/ositok_original_platform.h` | Osito platform identity and ABI feature selection |
+| `GTAV Source/ports/ositok/rage/` | VFS, networking, graphics and other Osito platform owners |
+| `GTAV Source/ports/ositok/rage/system/task_ositok.cpp` | Asynchronous RAGE task scheduler and handle lifecycle |
+| `osito-k/arch/x86/fs/ositofs2.c` | Guest OsitoFS implementation used by GTA mounts |
+| `osito-k/arch/x86/scripts/test-venus-user.sh` | Automated Venus/DXVK/app-shell regression |
 
 ## Next Steps
 
@@ -168,16 +171,12 @@ that until the kernel VM change has been validated with non-GTA mmap tests.
 ## Build Commands
 
 ```bash
-# Full rebuild
-cd ~/ok-ported/GTAV_Source && make clean && make -j4
-
-# Single file
-make src/dev_ng/rage/base/src/system/ipc_ositok.o
+# Production app-shell build
+cmake --build /root/gtav-dxvk-smoke --target gtav_ositok_app_shell -j4
 
 # Deploy to NVMe
-cd ~/osito-k
-tools/ositofs/ositofs-delete arch/x86/build/nvme.img GTA5.elf
-tools/ositofs/ositofs-write arch/x86/build/nvme.img ~/ok-ported/GTAV_Source/GTA5.elf --name GTA5.elf
+tools/ositofs/ositofs-write /root/osito/nvme_gcc.img \
+    /root/gtav-dxvk-smoke/gtav-app-shell --name gtav --overwrite
 
 # Refresh embedded Vulkan ICD before deploying GTA after Venus edits
 cd ~/ok-ported/GTAV_Source
@@ -192,6 +191,13 @@ PATH=/private/tmp/qemu-core-src/qemu-11.0.1/build:$PATH \
 ```
 
 ## QEMU Configuration
+
+The currently validated Venus baseline is intentionally limited to 4 GiB,
+4 vCPUs, 512 MiB of virtio-gpu host memory, and TCG. Larger RAM/SMP and KVM
+configurations currently break NVMe/OsitoFS, while WSL Vulkan exposes only
+llvmpipe rather than the RTX 3090. See `docs/dev-environment.md`, section
+"Current WSL Venus resource limits", for the measured matrix and the criteria
+for treating memory or GPU availability as a rendering blocker.
 
 ```
 -m 8G -smp 4 -machine q35,accel=hvf -cpu host

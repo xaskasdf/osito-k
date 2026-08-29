@@ -133,8 +133,13 @@ The original loader is preserved untouched. Dynamic linking, NT_GNU_ABI_TAG
 patching, fork_saves, and TLS init all need the in-memory file buffer.
 
 Tracking: demand-paged segments are *not* registered via `proc_add_region`.
-They're tracked by the global `vma_table[]` and freed on exit by
-`syscall_reset_process` walking PTEs through `vma_free_pages`.
+They're tracked by the global `vma_table[]`. Current-process teardown uses
+`syscall_reset_process`; reaping a non-current child uses
+`syscall_cleanup_process(owner, cr3, ...)`, so its PTEs are walked through the
+child CR3 rather than whichever parent the scheduler has already restored.
+This also removes the VMA owner entries before a `process_t` slot is reused,
+preventing a later ELF at the same fixed VA from paging bytes from the previous
+executable.
 
 ### `vma_t` extension (`kernel/syscall.c`)
 
@@ -153,6 +158,20 @@ typedef struct {
 
 Backward compatible: existing code that creates VMAs leaves the new fields
 zero, which means `type == VMA_ANON` and behaves like before.
+
+### File-backed `mmap` ABI (`kernel/syscall_entry.S`, `kernel/syscall.c`)
+
+The x86-64 syscall entry preserves the complete Linux six-argument ABI:
+`RDI`, `RSI`, `RDX`, `R10`, `R8`, `R9`. `syscall_dispatch` receives the saved
+`R9` value as its seventh C argument, allowing `SYS_MMAP` to pass the real file
+offset to `sys_mmap`; direct kernel stubs and batched syscalls follow the same
+contract.
+
+File-backed offsets must be 4096-byte aligned (`EINVAL` otherwise). The VMA
+copies its `vfs_node_t` by value, so closing the source descriptor does not
+invalidate later demand faults. Backing length is computed as
+`min(length, file_size - offset)` without overflowing `offset + length`, and
+the remainder of the final mapping stays zero-filled.
 
 ### `demand_page_fault` (`kernel/syscall.c`)
 

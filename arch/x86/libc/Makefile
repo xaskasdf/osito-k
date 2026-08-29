@@ -117,6 +117,24 @@ $(TEST)/hello_gl.elf: $(LIBC)/crt.o $(LIBC)/syscall.o $(LIBC)/math.o $(LIBC)/mal
 
 hello_gl.elf: $(TEST)/hello_gl.elf
 
+# Real Venus user-space transport smoke test.  The public Vulkan archive
+# intentionally exposes only host-validated entry points at this stage.
+VK_INC := -I../lib/vulkan/include
+
+$(TEST)/hello_vk.elf: $(LIBC)/crt.o $(LIBC)/syscall.o $(LIBC)/malloc.o \
+                      $(LIBC)/tcclib.o $(TEST)/hello_vk.c \
+                      $(BUILD)/lib/vulkan/libvulkan.a
+	$(XCC) -c -O2 -fno-pie -ffreestanding -nostdinc \
+	    $(VK_INC) -isystem qjs_headers \
+	    $(TEST)/hello_vk.c -o $(BUILD)/hello_vk.o
+	$(XLD) -nostdlib -static -no-pie -e _start -Ttext=0x401000 \
+	    --allow-multiple-definition \
+	    $(LIBC)/crt.o $(LIBC)/syscall.o $(LIBC)/malloc.o $(LIBC)/tcclib.o \
+	    $(BUILD)/hello_vk.o $(BUILD)/lib/vulkan/libvulkan.a -o $@
+	@ls -lh $@
+
+hello_vk.elf: $(TEST)/hello_vk.elf
+
 # ── Build TCC for OsitoK ──
 TCC_OBJ := $(BUILD)/tcc.o
 

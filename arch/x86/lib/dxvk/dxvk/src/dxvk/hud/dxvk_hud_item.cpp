@@ -1,5 +1,6 @@
 #include "dxvk_hud_item.h"
 
+#include <cstdlib>
 #include <iomanip>
 #include <version.h>
 
@@ -75,11 +76,10 @@ namespace dxvk::hud {
 
 
   void HudItemSet::parseOption(const std::string& str, float& value) {
-    try {
-      value = std::stof(str);
-    } catch (const std::invalid_argument&) {
-      return;
-    }
+    char* end = nullptr;
+    float parsed = std::strtof(str.c_str(), &end);
+    if (end != str.c_str())
+      value = parsed;
   }
 
 

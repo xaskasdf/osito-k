@@ -7,10 +7,12 @@
 
 #include "../include/types.h"
 #include "../include/sys_caps.h"
+#include "smp.h"
 
 /* ── Declarations ────────────────────────────────────────────── */
 
 extern void serial_puts(const char *s);
+extern void serial_putc(char c);
 extern void serial_puthex(uint64_t val, int digits);
 extern void serial_putdec(uint64_t val);
 extern void fb_puts(const char *s);
@@ -45,6 +47,88 @@ static uint64_t total_pages;
 static uint64_t free_pages;
 static uint64_t total_memory;
 static uint64_t max_tracked_page;  /* highest page ever marked free */
+static spinlock_t pmm_lock = SPINLOCK_INIT;
+
+#define PMM_DEBUG_EVENTS 262144
+typedef struct {
+    uint64_t sequence;
+    uint64_t start_page;
+    uint64_t count;
+    uint64_t caller;
+    char operation;
+} pmm_debug_event_t;
+
+static pmm_debug_event_t pmm_debug_events[PMM_DEBUG_EVENTS];
+static uint64_t pmm_debug_sequence;
+static inline uint64_t pmm_lock_irqsave(void);
+static inline void pmm_unlock_irqrestore(uint64_t flags);
+static int bitmap_test(uint64_t page);
+
+static void pmm_debug_record(char operation, uint64_t start_page,
+                             uint64_t count, uint64_t caller)
+{
+    uint64_t sequence = ++pmm_debug_sequence;
+    pmm_debug_event_t *event =
+        &pmm_debug_events[sequence % PMM_DEBUG_EVENTS];
+    event->sequence = sequence;
+    event->start_page = start_page;
+    event->count = count;
+    event->caller = caller;
+    event->operation = operation;
+}
+
+void mem_debug_dump_page(uint64_t phys)
+{
+    uint64_t page = phys >> PAGE_SHIFT;
+    uint64_t flags = pmm_lock_irqsave();
+    int free = bitmap_test(page);
+    uint64_t sequence = pmm_debug_sequence;
+    pmm_unlock_irqrestore(flags);
+
+    serial_puts("[PMM-TRACE] page=0x");
+    serial_puthex(page << PAGE_SHIFT, 16);
+    serial_puts(" bitmap-free=");
+    serial_putdec(free);
+    serial_puts(" current-seq=");
+    serial_putdec(sequence);
+    serial_puts("\n");
+
+    uint64_t oldest = sequence > PMM_DEBUG_EVENTS
+        ? sequence - PMM_DEBUG_EVENTS : 0;
+    for (uint64_t seq = oldest + 1; seq <= sequence; seq++) {
+        pmm_debug_event_t *event =
+            &pmm_debug_events[seq % PMM_DEBUG_EVENTS];
+        if (event->sequence != seq || page < event->start_page ||
+            page >= event->start_page + event->count)
+            continue;
+        serial_puts("[PMM-TRACE] seq=");
+        serial_putdec(seq);
+        serial_puts(" op=");
+        serial_putc(event->operation);
+        serial_puts(" start=0x");
+        serial_puthex(event->start_page << PAGE_SHIFT, 16);
+        serial_puts(" pages=");
+        serial_putdec(event->count);
+        serial_puts(" caller=0x");
+        serial_puthex(event->caller, 16);
+        serial_puts("\n");
+    }
+}
+
+static inline uint64_t pmm_lock_irqsave(void)
+{
+    uint64_t flags;
+    __asm__ volatile ("pushfq; popq %0; cli" : "=r"(flags) :: "memory");
+    spin_lock(&pmm_lock);
+    return flags;
+}
+
+static inline void pmm_unlock_irqrestore(uint64_t flags)
+{
+    spin_unlock(&pmm_lock);
+    if (flags & (1ULL << 9))
+        __asm__ volatile ("sti" ::: "memory");
+}
 
 /* ── Bitmap helpers ──────────────────────────────────────────── */
 
@@ -66,6 +150,34 @@ static int bitmap_test(uint64_t page)
     return (page_bitmap[page / 8] >> (page % 8)) & 1;
 }
 
+/* Return the first free page in [page, limit), or limit when none exists.
+ * Most long-running Win32 allocations sit behind dense used ranges. Skip
+ * those ranges a machine word at a time instead of testing every page bit. */
+static uint64_t bitmap_find_next_free(uint64_t page, uint64_t limit)
+{
+    while (page < limit && (page & 63)) {
+        if (bitmap_test(page))
+            return page;
+        page++;
+    }
+
+    while (page + 64 <= limit) {
+        uint64_t free_bits;
+        __builtin_memcpy(&free_bits, &page_bitmap[page / 8],
+                         sizeof(free_bits));
+        if (free_bits)
+            return page + (uint64_t)__builtin_ctzll(free_bits);
+        page += 64;
+    }
+
+    while (page < limit) {
+        if (bitmap_test(page))
+            return page;
+        page++;
+    }
+    return limit;
+}
+
 /* ── Initialize from UEFI memory map ────────────────────────── */
 
 void __initk mem_init(void *mmap, uint64_t mmap_size, uint64_t desc_size)
@@ -75,6 +187,7 @@ void __initk mem_init(void *mmap, uint64_t mmap_size, uint64_t desc_size)
     total_pages = 0;
     free_pages = 0;
     total_memory = 0;
+    max_tracked_page = 0;
 
     /* Walk the UEFI memory map */
     uint64_t entries = mmap_size / desc_size;
@@ -84,8 +197,6 @@ void __initk mem_init(void *mmap, uint64_t mmap_size, uint64_t desc_size)
 
     for (uint64_t i = 0; i < entries; i++) {
         efi_memory_descriptor_t *desc = (efi_memory_descriptor_t *)(ptr + i * desc_size);
-
-        total_memory += desc->number_of_pages * PAGE_SIZE;
 
         /* Only use conventional memory and freed boot services memory */
         if (desc->type == EFI_CONVENTIONAL_MEMORY ||
@@ -103,8 +214,13 @@ void __initk mem_init(void *mmap, uint64_t mmap_size, uint64_t desc_size)
                 num_pages -= skip;
             }
 
-            /* Mark pages as free */
-            for (uint64_t p = 0; p < num_pages && (start_page + p) < MAX_PHYS_PAGES; p++) {
+            if (start_page >= MAX_PHYS_PAGES)
+                continue;
+            if (num_pages > MAX_PHYS_PAGES - start_page)
+                num_pages = MAX_PHYS_PAGES - start_page;
+
+            /* Mark every page represented by the allocator as free. */
+            for (uint64_t p = 0; p < num_pages; p++) {
                 bitmap_set(start_page + p);
                 free_pages++;
             }
@@ -115,6 +231,8 @@ void __initk mem_init(void *mmap, uint64_t mmap_size, uint64_t desc_size)
             usable_regions++;
         }
     }
+
+    total_memory = total_pages * PAGE_SIZE;
 
     /* Clamp the top-down search bound to the bitmap. max_tracked_page is
      * built ONLY from usable descriptors (conventional + freed boot
@@ -234,11 +352,10 @@ void __initk mem_reserve_boot_stack(uint64_t boot_rsp)
 
 void *mem_alloc_pages(uint64_t count)
 {
-    if (count == 0 || free_pages < count) return NULL;
-
-    /* Simple first-fit search */
-    uint64_t run_start = 0;
-    uint64_t run_len = 0;
+    void *result = NULL;
+    uint64_t caller = (uint64_t)__builtin_return_address(0);
+    uint64_t flags = pmm_lock_irqsave();
+    if (count == 0 || free_pages < count) goto out;
 
     /* Start above 16MB to avoid collisions with:
      * - Page tables (0x100000-0x110000)
@@ -246,24 +363,32 @@ void *mem_alloc_pages(uint64_t count)
      *   e.g. Quake 2 has a 9.5MB BSS reaching 0xDF0000 (~14MB)
      * Heap/general allocator must not overlap the fixed-load VA range. */
     uint64_t limit = max_tracked_page ? max_tracked_page : MAX_PHYS_PAGES;
-    for (uint64_t p = 4096; p < limit; p++) {  /* Start above 16MB */
-        if (bitmap_test(p)) {
-            if (run_len == 0) run_start = p;
-            run_len++;
-            if (run_len == count) {
-                /* Found a contiguous run */
-                for (uint64_t i = 0; i < count; i++) {
-                    bitmap_clear(run_start + i);
-                    free_pages--;
-                }
-                return (void *)(run_start << PAGE_SHIFT);
+    uint64_t p = 4096;
+    while (p <= limit && count <= limit - p) {
+        p = bitmap_find_next_free(p, limit);
+        if (p >= limit || count > limit - p)
+            break;
+
+        uint64_t i = 0;
+        while (i < count && bitmap_test(p + i))
+            i++;
+        if (i == count) {
+            for (i = 0; i < count; i++) {
+                bitmap_clear(p + i);
+                free_pages--;
             }
-        } else {
-            run_len = 0;
+            result = (void *)(p << PAGE_SHIFT);
+            pmm_debug_record('A', p, count, caller);
+            goto out;
         }
+
+        /* Every candidate through the failed page overlaps that failure. */
+        p += i + 1;
     }
 
-    return NULL; /* Out of contiguous pages */
+out:
+    pmm_unlock_irqrestore(flags);
+    return result;
 }
 
 /* ── Reserve specific physical pages (for ET_EXEC fixed loads) ─ */
@@ -271,14 +396,16 @@ void *mem_alloc_pages(uint64_t count)
 int mem_reserve_range(uint64_t phys, uint64_t count)
 {
     uint64_t start_page = phys >> PAGE_SHIFT;
+    uint64_t conflict_page = 0;
+    int result = 0;
+    uint64_t flags = pmm_lock_irqsave();
 
     /* Check all pages are free first */
     for (uint64_t i = 0; i < count; i++) {
         if (!bitmap_test(start_page + i)) {
-            serial_puts("[MEM] CONFLICT: page 0x");
-            serial_puthex((start_page + i) << PAGE_SHIFT, 16);
-            serial_puts(" already allocated\n");
-            return -1;
+            conflict_page = start_page + i;
+            result = -1;
+            goto out;
         }
     }
 
@@ -287,8 +414,17 @@ int mem_reserve_range(uint64_t phys, uint64_t count)
         bitmap_clear(start_page + i);
         free_pages--;
     }
+    pmm_debug_record('R', start_page, count,
+                     (uint64_t)__builtin_return_address(0));
 
-    return 0;
+out:
+    pmm_unlock_irqrestore(flags);
+    if (result < 0) {
+        serial_puts("[MEM] CONFLICT: page 0x");
+        serial_puthex(conflict_page << PAGE_SHIFT, 16);
+        serial_puts(" already allocated\n");
+    }
+    return result;
 }
 
 /* ── Free physical pages ─────────────────────────────────────── */
@@ -297,6 +433,11 @@ void mem_free_pages(void *addr, uint64_t count)
 {
     uint64_t start_page = (uint64_t)addr >> PAGE_SHIFT;
     static int dfree_warned = 0;
+    uint64_t warned_pages[8];
+    uint64_t caller = (uint64_t)__builtin_return_address(0);
+    int warned_count = 0;
+    uint64_t flags = pmm_lock_irqsave();
+
     for (uint64_t i = 0; i < count; i++) {
         if (bitmap_test(start_page + i)) {
             /* Page was already free — double-free of a phys page.
@@ -307,16 +448,22 @@ void mem_free_pages(void *addr, uint64_t count)
              * (would corrupt the page accounting). */
             if (dfree_warned < 8) {
                 dfree_warned++;
-                serial_puts("[MEM] !!! DOUBLE PAGE-FREE phys=0x");
-                serial_puthex((start_page + i) << PAGE_SHIFT, 16);
-                serial_puts(" caller=0x");
-                serial_puthex((uint64_t)__builtin_return_address(0), 16);
-                serial_puts("\n");
+                warned_pages[warned_count++] = start_page + i;
             }
             continue;
         }
         bitmap_set(start_page + i);
         free_pages++;
+    }
+    pmm_debug_record('F', start_page, count, caller);
+
+    pmm_unlock_irqrestore(flags);
+    for (int i = 0; i < warned_count; i++) {
+        serial_puts("[MEM] !!! DOUBLE PAGE-FREE phys=0x");
+        serial_puthex(warned_pages[i] << PAGE_SHIFT, 16);
+        serial_puts(" caller=0x");
+        serial_puthex(caller, 16);
+        serial_puts("\n");
     }
 }
 
@@ -345,9 +492,12 @@ void *mem_alloc_aligned(uint64_t size, uint64_t alignment)
 {
     uint64_t pages = (size + PAGE_SIZE - 1) >> PAGE_SHIFT;
     uint64_t align_pages = alignment >> PAGE_SHIFT;
+    void *result = NULL;
+    uint64_t caller = (uint64_t)__builtin_return_address(0);
     if (align_pages == 0) align_pages = 1;
 
-    if (free_pages < pages) return NULL;
+    uint64_t flags = pmm_lock_irqsave();
+    if (free_pages < pages) goto out;
 
     /* Search for aligned contiguous pages (above 16MB, clear of ELF load area) */
     uint64_t limit = max_tracked_page ? max_tracked_page : MAX_PHYS_PAGES;
@@ -357,6 +507,14 @@ void *mem_alloc_aligned(uint64_t size, uint64_t alignment)
         p = ((p / align_pages) + 1) * align_pages;
 
     while (p + pages <= limit) {
+        p = bitmap_find_next_free(p, limit);
+        if (p >= limit)
+            break;
+        if (p % align_pages != 0)
+            p = ((p / align_pages) + 1) * align_pages;
+        if (p > limit || pages > limit - p)
+            break;
+
         /* Check if enough contiguous pages starting at p */
         uint64_t ok = 1;
         uint64_t i;
@@ -369,7 +527,9 @@ void *mem_alloc_aligned(uint64_t size, uint64_t alignment)
                 bitmap_clear(p + i);
                 free_pages--;
             }
-            return (void *)(p << PAGE_SHIFT);
+            result = (void *)(p << PAGE_SHIFT);
+            pmm_debug_record('L', p, pages, caller);
+            goto out;
         }
 
         /* Skip past the failed page to the next aligned candidate */
@@ -379,7 +539,9 @@ void *mem_alloc_aligned(uint64_t size, uint64_t alignment)
         p = fail;
     }
 
-    return NULL;
+out:
+    pmm_unlock_irqrestore(flags);
+    return result;
 }
 
 /* ── High-memory allocator (for kernel structures) ────────────────
@@ -392,11 +554,15 @@ void *mem_alloc_aligned_high(uint64_t size, uint64_t alignment)
 {
     uint64_t pages = (size + PAGE_SIZE - 1) >> PAGE_SHIFT;
     uint64_t align_pages = alignment >> PAGE_SHIFT;
+    void *result = NULL;
+    uint64_t caller = (uint64_t)__builtin_return_address(0);
     if (align_pages == 0) align_pages = 1;
 
-    if (free_pages < pages) return NULL;
+    uint64_t flags = pmm_lock_irqsave();
+    if (free_pages < pages) goto out;
 
     uint64_t limit = max_tracked_page ? max_tracked_page : MAX_PHYS_PAGES;
+    if (limit < pages) goto out;
     /* Start from the top and work down */
     uint64_t p = (limit - pages) & ~(align_pages - 1);
 
@@ -412,7 +578,9 @@ void *mem_alloc_aligned_high(uint64_t size, uint64_t alignment)
                 bitmap_clear(p + i);
                 free_pages--;
             }
-            return (void *)(p << PAGE_SHIFT);
+            result = (void *)(p << PAGE_SHIFT);
+            pmm_debug_record('H', p, pages, caller);
+            goto out;
         }
 
         /* Move down past the failed page */
@@ -420,7 +588,9 @@ void *mem_alloc_aligned_high(uint64_t size, uint64_t alignment)
         p -= align_pages;
     }
 
-    return NULL;
+out:
+    pmm_unlock_irqrestore(flags);
+    return result;
 }
 
 /* ── Top-down allocation bounded to below 4 GB ─────────────────── */
@@ -441,13 +611,16 @@ void *mem_alloc_aligned_high_below4g(uint64_t size, uint64_t alignment)
 {
     uint64_t pages = (size + PAGE_SIZE - 1) >> PAGE_SHIFT;
     uint64_t align_pages = alignment >> PAGE_SHIFT;
+    void *result = NULL;
+    uint64_t caller = (uint64_t)__builtin_return_address(0);
     if (align_pages == 0) align_pages = 1;
 
-    if (free_pages < pages) return NULL;
+    uint64_t flags = pmm_lock_irqsave();
+    if (free_pages < pages) goto out;
 
     uint64_t limit = max_tracked_page ? max_tracked_page : MAX_PHYS_PAGES;
     if (limit > MEM_4GB_PAGE) limit = MEM_4GB_PAGE;
-    if (limit < pages) return NULL;
+    if (limit < pages) goto out;
 
     uint64_t p = (limit - pages) & ~(align_pages - 1);
 
@@ -461,24 +634,31 @@ void *mem_alloc_aligned_high_below4g(uint64_t size, uint64_t alignment)
                 bitmap_clear(p + i);
                 free_pages--;
             }
-            return (void *)(p << PAGE_SHIFT);
+            result = (void *)(p << PAGE_SHIFT);
+            pmm_debug_record('P', p, pages, caller);
+            goto out;
         }
         if (p < align_pages) break;
         p -= align_pages;
     }
-    return NULL;
+out:
+    pmm_unlock_irqrestore(flags);
+    return result;
 }
 
 /* ── Info ────────────────────────────────────────────────────── */
 
 uint64_t mem_get_free(void)
 {
-    return free_pages * PAGE_SIZE;
+    uint64_t flags = pmm_lock_irqsave();
+    uint64_t result = free_pages * PAGE_SIZE;
+    pmm_unlock_irqrestore(flags);
+    return result;
 }
 
 uint64_t mem_get_total(void)
 {
-    return total_memory;
+    return total_pages * PAGE_SIZE;
 }
 
 /* Highest physical address that may contain usable RAM.
@@ -490,7 +670,10 @@ uint64_t mem_get_highest_address(void)
 
 uint64_t mem_get_used(void)
 {
-    return (total_pages - free_pages) * PAGE_SIZE;
+    uint64_t flags = pmm_lock_irqsave();
+    uint64_t result = (total_pages - free_pages) * PAGE_SIZE;
+    pmm_unlock_irqrestore(flags);
+    return result;
 }
 
 /* ── System capabilities (hardware-derived resource limits) ──────── */
@@ -517,7 +700,12 @@ void sys_caps_init(void)
     /* Per-process limits */
     g_sys_caps.brk_heap_size   = CLAMP(total / 8, 16ULL * 1024 * 1024, 1024ULL * 1024 * 1024);
     g_sys_caps.user_stack_size = CLAMP(total / 64, 1ULL * 1024 * 1024, 8ULL * 1024 * 1024);
-    g_sys_caps.max_processes   = (uint32_t)CLAMP(mb / 16, 4, 256);
+    uint64_t process_slots = total / SYS_CAPS_PROCESS_RAM_BUDGET;
+    process_slots = CLAMP(process_slots, SYS_CAPS_PROCESS_MIN,
+                          SYS_CAPS_PROCESS_MAX);
+    process_slots = (process_slots / SYS_CAPS_PROCESS_GRANULARITY) *
+                    SYS_CAPS_PROCESS_GRANULARITY;
+    g_sys_caps.max_processes = (uint32_t)process_slots;
     g_sys_caps.max_fds_global  = (uint32_t)CLAMP(total / (256 * 1024), 128, 4096);
 
     /* ELF loader */
@@ -545,7 +733,7 @@ void sys_caps_init(void)
 
 int sys_caps_check_alloc(uint64_t bytes, const char *what)
 {
-    uint64_t avail = free_pages * PAGE_SIZE;
+    uint64_t avail = mem_get_free();
     if (bytes <= avail) return 1;  /* OK */
 
     serial_puts("[CAPS] ");

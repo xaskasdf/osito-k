@@ -1,4 +1,5 @@
 #include <thread>
+#include <cstdlib>
 
 #include "thread.h"
 #include "util_env.h"
@@ -16,11 +17,11 @@ namespace dxvk {
     std::string env = env::getEnvVar("DXVK_FRAME_RATE");
 
     if (!env.empty()) {
-      try {
-        setTargetFrameRate(std::stod(env));
+      char* end = nullptr;
+      double frameRate = std::strtod(env.c_str(), &end);
+      if (end != env.c_str()) {
+        setTargetFrameRate(frameRate);
         m_envOverride = true;
-      } catch (const std::invalid_argument&) {
-        // no-op
       }
     }
   }

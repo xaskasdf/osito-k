@@ -26,6 +26,7 @@ extern void  kfree(void *ptr);
 extern void *mem_alloc_aligned(uint64_t size, uint64_t alignment);
 extern void  mem_free_pages(void *addr, uint64_t count);
 extern uint64_t idt_get_ticks(void);
+extern void sched_yield(void);
 
 /* GPU display engine (gpu_display.c) — weak so we link without GPU driver */
 extern int      gpu_display_is_ready(void)  __attribute__((weak));
@@ -454,23 +455,24 @@ void display_wait_vblank(void)
         uint64_t deadline = idt_get_ticks() + 100;  /* ~1s at 100Hz */
         while (gpu_display_vblank_count() == start) {
             if (idt_get_ticks() >= deadline) break;
-            __asm__ volatile ("hlt");  /* sleep until next interrupt */
+            sched_yield();
         }
     } else if (disp.tsc_per_frame) {
-        /* Spin-wait until target TSC value.
-         * Use HLT only if we're more than ~5ms away (5M cycles at 1GHz). */
+        /* Yield while there is useful time left in the frame.  compat32 can
+         * run with interrupts or the APIC timer masked, so HLT is not a safe
+         * pacing primitive here. */
         uint64_t target = disp.last_flip_tsc + disp.tsc_per_frame;
         while (disp_rdtsc() < target) {
             uint64_t remaining = target - disp_rdtsc();
             if (remaining > disp.tsc_per_frame / 4)
-                __asm__ volatile ("hlt");
+                sched_yield();
             else
                 __asm__ volatile ("pause");
         }
     } else {
         /* Fallback: APIC tick-based (50fps cap at 100Hz) */
         while ((idt_get_ticks() - disp.last_flip_tick) < disp.ticks_per_frame)
-            __asm__ volatile ("hlt");
+            sched_yield();
     }
     disp.vblank_count++;
 }

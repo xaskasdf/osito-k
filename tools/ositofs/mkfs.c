@@ -17,7 +17,7 @@
 
 static void usage(void)
 {
-    fprintf(stderr, "Usage: mkfs.ositofs <device> [--label <name>] [--block-size <bytes>]\n");
+    fprintf(stderr, "Usage: mkfs.ositofs <device> [--label <name>] [--block-size <bytes>] [--max-files <4096|16384>]\n");
     fprintf(stderr, "  --block-size: data block size (64K..1M, power of 2, default 1M)\n");
     fprintf(stderr, "  --file-slots: file table entries (4096..61440, multiple of 4096, default 16384)\n");
     exit(1);
@@ -88,6 +88,7 @@ int main(int argc, char **argv)
            total_blocks - data_start, data_start);
     printf("  File slots:   %u\n", file_slots);
     printf("  Label: %s\n", label);
+    printf("  File slots: %u\n", OSFS2_MAX_FILES);
 
     uint32_t meta_size = filetab_size;
     if (meta_size < OSFS2_SUPER_REGION_SIZE) meta_size = OSFS2_SUPER_REGION_SIZE;
@@ -101,7 +102,7 @@ int main(int argc, char **argv)
     memset(meta, 0, meta_size);
     osfs2_super_t *sb = (osfs2_super_t *)meta;
     sb->magic = OSFS2_MAGIC;
-    sb->version = OSFS2_VERSION;
+    sb->version = version;
     sb->block_size = block_size;
     sb->total_blocks = total_blocks;
     sb->used_blocks = data_start;  /* metadata only */

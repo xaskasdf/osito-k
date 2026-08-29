@@ -29,6 +29,8 @@ extern bool console_screen_log_is_enabled(void);
 
 /* Terminal */
 extern int  term_readline(const char *prompt, char *buf, uint32_t buf_size);
+extern int  term_readline_alloc(const char *prompt, char **buf_out,
+                                uint64_t *len_out);
 extern void term_init(void);
 
 /* Keyboard */
@@ -477,7 +479,7 @@ static inline void sh_halt(void)   { serial_puts("\n[WASM] Halted. Reload to res
 #else
 static inline void sh_hlt(void)    { __asm__ volatile ("hlt"); }
 static inline void sh_cli(void)    { __asm__ volatile ("cli"); }
-static inline void sh_sti(void)    { __asm__ volatile ("sti"); }
+static inline void sh_sti(void)    { __asm__ volatile ("sti" ::: "memory"); }
 static inline void sh_reboot(void) {
     struct { uint16_t limit; uint64_t base; } __attribute__((packed)) null_idt = { 0, 0 };
     __asm__ volatile ("lidt %0; int3" : : "m"(null_idt));
@@ -571,10 +573,11 @@ static int parse_args(char *line, char *argv[])
         while (*p == ' ' || *p == '\t') p++;
         if (*p == '\0') break;
 
+        char quote = 0;
+        if (*p == '"' || *p == '\'') quote = *p++;
         argv[argc++] = p;
 
-        /* Find end of token */
-        while (*p && *p != ' ' && *p != '\t') p++;
+        while (*p && (quote ? *p != quote : (*p != ' ' && *p != '\t'))) p++;
         if (*p) *p++ = '\0';
     }
 
@@ -632,6 +635,24 @@ static void cmd_help(void)
     sh_puts("  apipa     Auto-assign link-local 169.254.X.Y (RFC 3927)\n");
     sh_puts("  ipconf    Set static IP (ipconf <ip> [gw] [mask] [dns])\n");
     sh_puts("  winexec   Run a Win32 PE executable (winexec file.exe)\n");
+    sh_puts("  win32-wm-test  Validate USER32 hierarchy, geometry, z-order, and teardown\n");
+    sh_puts("  win32-input-test  Validate USER32 SendInput and message metadata\n");
+    sh_puts("  win32-tls-test  Validate process-local Win32 TLS allocation\n");
+    sh_puts("  win32-reg-test  Validate predefined HKEY aliases and WOW64 views\n");
+    sh_puts("  win32-gdi-test  Validate DIB orientation, scaling, conversion, and presentation\n");
+    sh_puts("  win32-dwrite-test  Validate custom font loaders, streams, and COM lifetime\n");
+    sh_puts("  win32-oleacc-test  Validate MSAA objects, enumeration, and WM_GETOBJECT tokens\n");
+    sh_puts("  win32-wsock-test  Validate Winsock UDP, select, catalog, extensions, and IOCP\n");
+    sh_puts("  win32-vm-test  Validate NT reserve, commit, protect, decommit, query, and release\n");
+    sh_puts("  win32-pe-test  Validate PE section permissions and protection transitions\n");
+    sh_puts("  win32-cr3-test  Validate private process mappings and shared kernel mappings\n");
+    sh_puts("  win32-process-test  Validate per-process image and PEB identity\n");
+    sh_puts("  win32-object-test  Validate NT handle names, types, and metadata\n");
+    sh_puts("  win32-module-test  Validate process-local shim module images and references\n");
+    sh_puts("  win32-loader  DLL/section cache and import diagnostics\n");
+    sh_puts("  win32-dxgi-test  Validate DXGI factory and virtio adapter enumeration\n");
+    sh_puts("  win32-iocp-test  Validate IOCP lifecycle and the PE32 thunk path\n");
+    sh_puts("  win32-wait-test  Validate registered-wait cancellation and completion\n");
     sh_puts("  msi       Install MSI/MSIX package (msi install file.msi | msix file.msix)\n");
     sh_puts("  dosrun    Run a DOS 16-bit binary (dosrun file.com)\n");
     sh_puts("  clear     Clear screen\n");
@@ -1319,7 +1340,7 @@ static void oftp_handler(const uint8_t *src_ip, uint16_t src_port,
 
 static int parse_ip(const char *s, uint8_t ip[4]);  /* forward */
 static void cmd_kexec(const char *arg);              /* forward */
-extern void net_udp_listen(uint16_t port,
+extern int net_udp_listen(uint16_t port,
     void (*handler)(const uint8_t *, uint16_t, const void *, uint32_t));
 
 static void cmd_kdownload(int argc, char *argv[])
@@ -7028,11 +7049,227 @@ q4kgdone:
         if (!found) sh_puts("No crash reports saved\n");
     } else if (strcmp(cmd, "httpd") == 0) {
         cmd_httpd(argc, argv);
+    } else if (strcmp(cmd, "win32-wm-test") == 0) {
+        extern int user32_window_model_selftest(void);
+        int failures = user32_window_model_selftest();
+        if (!failures) {
+            sh_puts("USER32 window-model test: PASS\n");
+        } else {
+            sh_puts("USER32 window-model test: FAIL (");
+            sh_putdec((uint64_t)failures);
+            sh_puts(")\n");
+        }
+    } else if (strcmp(cmd, "win32-input-test") == 0) {
+        extern int user32_input_selftest(void);
+        int failures = user32_input_selftest();
+        if (!failures) {
+            sh_puts("USER32 SendInput test: PASS\n");
+        } else {
+            sh_puts("USER32 SendInput test: FAIL (");
+            sh_putdec((uint64_t)failures);
+            sh_puts(")\n");
+        }
+    } else if (strcmp(cmd, "win32-tls-test") == 0) {
+        extern int kernel32_tls_selftest(void);
+        int failures = kernel32_tls_selftest();
+        if (!failures) {
+            sh_puts("Win32 process-local TLS test: PASS\n");
+        } else {
+            sh_puts("Win32 process-local TLS test: FAIL (");
+            sh_putdec((uint64_t)failures);
+            sh_puts(")\n");
+        }
+    } else if (strcmp(cmd, "win32-reg-test") == 0) {
+        extern int advapi32_registry_selftest(void);
+        int failures = advapi32_registry_selftest();
+        if (!failures) {
+            sh_puts("Win32 registry root/WOW64 test: PASS\n");
+        } else {
+            sh_puts("Win32 registry root/WOW64 test: FAIL (");
+            sh_putdec((uint64_t)failures);
+            sh_puts(")\n");
+        }
+    } else if (strcmp(cmd, "win32-dwrite-test") == 0) {
+        extern int gdi32_dwrite_selftest(void);
+        int failures = gdi32_dwrite_selftest();
+        if (!failures) {
+            sh_puts("DirectWrite custom-font test: PASS\n");
+        } else {
+            sh_puts("DirectWrite custom-font test: FAIL (");
+            sh_putdec((uint64_t)failures);
+            sh_puts(")\n");
+        }
+    } else if (strcmp(cmd, "win32-gdi-test") == 0) {
+        extern int gdi32_dib_selftest(void);
+        int failures = gdi32_dib_selftest();
+        if (!failures) {
+            sh_puts("GDI DIB presentation test: PASS\n");
+        } else {
+            sh_puts("GDI DIB presentation test: FAIL (");
+            sh_putdec((uint64_t)failures);
+            sh_puts(")\n");
+        }
+    } else if (strcmp(cmd, "win32-region-test") == 0) {
+        extern int gdi32_region_selftest(void);
+        int failures = gdi32_region_selftest();
+        if (!failures) {
+            sh_puts("GDI region test: PASS\n");
+        } else {
+            sh_puts("GDI region test: FAIL (");
+            sh_putdec((uint64_t)failures);
+            sh_puts(")\n");
+        }
+    } else if (strcmp(cmd, "win32-oleacc-test") == 0) {
+        extern int oleacc_selftest(void);
+        int failures = oleacc_selftest();
+        if (!failures) {
+            sh_puts("OLEACC/MSAA test: PASS\n");
+        } else {
+            sh_puts("OLEACC/MSAA test: FAIL (");
+            sh_putdec((uint64_t)failures);
+            sh_puts(")\n");
+        }
+    } else if (strcmp(cmd, "win32-wsock-test") == 0) {
+        extern int wsock_selftest(void);
+        int failures = wsock_selftest();
+        if (!failures) {
+            sh_puts("Winsock contract test: PASS\n");
+        } else {
+            sh_puts("Winsock contract test: FAIL (");
+            sh_putdec((uint64_t)failures);
+            sh_puts(")\n");
+        }
+    } else if (strcmp(cmd, "win32-vm-test") == 0) {
+        extern int nt_vm_selftest(void);
+        int failures = nt_vm_selftest();
+        if (!failures) {
+            sh_puts("NT virtual-memory test: PASS\n");
+        } else {
+            sh_puts("NT virtual-memory test: FAIL (");
+            sh_putdec((uint64_t)failures);
+            sh_puts(")\n");
+        }
+    } else if (strcmp(cmd, "win32-pe-test") == 0) {
+        extern int pe_protection_selftest(void);
+        int failures = pe_protection_selftest();
+        if (!failures) {
+            sh_puts("Win32 PE protection test: PASS\n");
+        } else {
+            sh_puts("Win32 PE protection test: FAIL (");
+            sh_putdec((uint64_t)failures);
+            sh_puts(")\n");
+        }
+    } else if (strcmp(cmd, "win32-cr3-test") == 0) {
+        extern int paging_process_cr3_selftest(void);
+        int failures = paging_process_cr3_selftest();
+        if (!failures) {
+            sh_puts("Win32 CR3 isolation test: PASS\n");
+        } else {
+            sh_puts("Win32 CR3 isolation test: FAIL (");
+            sh_putdec((uint64_t)failures);
+            sh_puts(")\n");
+        }
+    } else if (strcmp(cmd, "win32-process-test") == 0) {
+        extern int nt_process_inspection_selftest(void);
+        int failures = nt_process_inspection_selftest();
+        if (!failures) {
+            sh_puts("Win32 process identity test: PASS\n");
+        } else {
+            sh_puts("Win32 process identity test: FAIL (");
+            sh_putdec((uint64_t)failures);
+            sh_puts(")\n");
+        }
+    } else if (strcmp(cmd, "win32-object-test") == 0) {
+        extern int ntdll_object_selftest(void);
+        int failures = ntdll_object_selftest();
+        if (!failures) {
+            sh_puts("NT object query test: PASS\n");
+        } else {
+            sh_puts("NT object query test: FAIL (");
+            sh_putdec((uint64_t)failures);
+            sh_puts(")\n");
+        }
+    } else if (strcmp(cmd, "win32-module-test") == 0) {
+        extern int kernel32_module_selftest(void);
+        int failures = kernel32_module_selftest();
+        if (!failures) {
+            sh_puts("Win32 module-image test: PASS\n");
+        } else {
+            sh_puts("Win32 module-image test: FAIL (");
+            sh_putdec((uint64_t)failures);
+            sh_puts(")\n");
+        }
+    } else if (strcmp(cmd, "win32-loader") == 0) {
+        extern void dll_file_cache_dump(void);
+        extern void dll_export_lookup_dump(void);
+        extern int dll_file_cache_flush_unused(void);
+        extern void nt_section_cache_dump(void);
+        extern int nt_section_cache_flush_unused(void);
+        extern void pe_import_diagnostics_dump(void);
+        extern void pe_import_diagnostics_clear(void);
+        extern void pe_import_set_strict(int enabled);
+        if (argc >= 2 && strcmp(argv[1], "flush") == 0) {
+            int count = dll_file_cache_flush_unused();
+            int section_count = nt_section_cache_flush_unused();
+            sh_puts("DLL source-cache entries evicted: ");
+            sh_putdec((uint64_t)count);
+            sh_puts("\n");
+            sh_puts("Section control areas evicted: ");
+            sh_putdec((uint64_t)section_count);
+            sh_puts("\n");
+        } else if (argc >= 2 && strcmp(argv[1], "clear") == 0) {
+            pe_import_diagnostics_clear();
+            sh_puts("PE import diagnostics cleared.\n");
+        } else if (argc >= 3 && strcmp(argv[1], "strict") == 0 &&
+                   strcmp(argv[2], "on") == 0) {
+            pe_import_set_strict(true);
+            sh_puts("Strict required-import loading enabled.\n");
+        } else if (argc >= 3 && strcmp(argv[1], "strict") == 0 &&
+                   strcmp(argv[2], "off") == 0) {
+            pe_import_set_strict(false);
+            sh_puts("Strict required-import loading disabled.\n");
+        } else {
+            dll_file_cache_dump();
+            dll_export_lookup_dump();
+            nt_section_cache_dump();
+            pe_import_diagnostics_dump();
+        }
+    } else if (strcmp(cmd, "win32-dxgi-test") == 0) {
+        extern int dxgi_selftest(void);
+        int failures = dxgi_selftest();
+        if (!failures) {
+            sh_puts("Win32 DXGI factory test: PASS\n");
+        } else {
+            sh_puts("Win32 DXGI factory test: FAIL (");
+            sh_putdec((uint64_t)failures);
+            sh_puts(")\n");
+        }
+    } else if (strcmp(cmd, "win32-iocp-test") == 0) {
+        extern int kernel32_iocp_selftest(void);
+        int failures = kernel32_iocp_selftest();
+        if (!failures) {
+            sh_puts("Win32 IOCP test: PASS\n");
+        } else {
+            sh_puts("Win32 IOCP test: FAIL (");
+            sh_putdec((uint64_t)failures);
+            sh_puts(")\n");
+        }
+    } else if (strcmp(cmd, "win32-wait-test") == 0) {
+        extern int kernel32_wait_selftest(void);
+        int failures = kernel32_wait_selftest();
+        if (!failures) {
+            sh_puts("Win32 registered-wait test: PASS\n");
+        } else {
+            sh_puts("Win32 registered-wait test: FAIL (");
+            sh_putdec((uint64_t)failures);
+            sh_puts(")\n");
+        }
     } else if (strcmp(cmd, "winexec") == 0) {
         if (argc < 2) {
             sh_puts("Usage: winexec <file.exe>\n");
         } else {
-            extern int win32_exec(const char *filename);
+            extern int win32_exec_args(const char *filename, int argc,
+                                       const char **argv);
             extern int win32_install(const char *filename);
             extern int  kern_setjmp(uint64_t *buf) __attribute__((returns_twice));
             extern uint64_t *compat32_crash_jmpbuf;
@@ -7052,9 +7289,11 @@ q4kgdone:
             int winexec_crashed = 0;
             sh_diag_mark("winexec-start");
             compat32_crash_jmpbuf = winexec_jmpbuf;
-            if (kern_setjmp(winexec_jmpbuf) == 0) {
+            int winexec_reason = kern_setjmp(winexec_jmpbuf);
+            if (winexec_reason == 0) {
                 if (is_pkg) win32_install(fn);
-                else        win32_exec(fn);
+                else        win32_exec_args(fn, argc - 1,
+                                            (const char **)&argv[1]);
             } else {
                 winexec_crashed = 1;
                 sh_diag_mark("winexec-crash-return");
@@ -7116,8 +7355,7 @@ q4kgdone:
             extern int dos_run(const char *filename, int argc, const char **argv);
             extern int  kern_setjmp(uint64_t *buf) __attribute__((returns_twice));
             extern uint64_t *dos_native_exit_jmpbuf;
-            extern uint64_t *tss_ist1_ptr;
-            extern uint8_t   ist1_stack[];
+            extern void x86_tss_reset_ist1(void);
             static uint64_t dosrun_jmpbuf[9];
             dos_native_exit_jmpbuf = dosrun_jmpbuf;
             int rc = kern_setjmp(dosrun_jmpbuf);
@@ -7127,8 +7365,7 @@ q4kgdone:
                 sh_puts("\n [DOS] Program exited (");
                 sh_puts(rc == 2 ? "crash" : "normal");
                 sh_puts(") — returned to shell\n");
-                if (tss_ist1_ptr)
-                    *tss_ist1_ptr = (uint64_t)(ist1_stack + 262144);
+                x86_tss_reset_ist1();
             }
             dos_native_exit_jmpbuf = NULL;
         }
@@ -7143,6 +7380,9 @@ q4kgdone:
         extern void shm_init(void);
         extern void compositor_init(void);
         extern void compositor_thread(void);
+        extern bool compositor_begin_start(void);
+        extern void compositor_abort_start(void);
+        extern void compositor_focus_terminal(void);
         extern uint32_t *fb_get_vram(void);
         extern uint32_t  fb_get_width(void);
         extern uint32_t  fb_get_height(void);
@@ -7171,6 +7411,15 @@ q4kgdone:
         if (display_init(vram, w, h, p, hz) < 0) {
             sh_puts("ERROR: display_init failed\n");
         } else {
+            uint32_t *vram = fb_get_vram();
+            uint32_t  w    = fb_get_width();
+            uint32_t  h    = fb_get_height();
+            uint32_t  p    = fb_get_pitch();
+
+            if (display_init(vram, w, h, p, 0) < 0) {
+                compositor_abort_start();
+                sh_puts("ERROR: display_init failed\n");
+            } else {
             /* Pass GOP mode table from bootloader to display subsystem */
             extern void display_set_available_modes(const boot_display_mode_t *,
                                                     uint32_t, uint32_t);
@@ -7424,6 +7673,71 @@ q4kgdone:
 
 /* ── Shell main loop ─────────────────────────────────────────── */
 
+static void shell_ensure_desktop(void)
+{
+    extern bool compositor_is_running(void);
+
+    if (!compositor_is_running()) {
+        char desktop_cmd[] = "desktop";
+        shell_exec(desktop_cmd);
+    }
+}
+
+static bool shell_text_starts_with(const char *text, const char *prefix)
+{
+    while (*prefix) {
+        if (*text++ != *prefix++)
+            return false;
+    }
+    return true;
+}
+
+static bool shell_run_autoload_file(void)
+{
+    void *file = osfs2_find(".autoload");
+    if (!file)
+        return false;
+
+    uint64_t size = osfs2_file_size(file);
+    if (size == 0 || size == UINT64_MAX) {
+        sh_puts(" Invalid /.autoload: command is empty or too large\n");
+        return true;
+    }
+
+    char *command = (char *)kmalloc(size + 1);
+    if (!command) {
+        sh_puts(" Unable to allocate /.autoload command\n");
+        return true;
+    }
+    if (osfs2_read(file, 0, command, size) < 0) {
+        sh_puts(" Failed to read /.autoload\n");
+        kfree(command);
+        return true;
+    }
+
+    size_t length = (size_t)size;
+    while (length && (command[length - 1] == '\r' ||
+                      command[length - 1] == '\n'))
+        length--;
+    command[length] = '\0';
+
+    char *start = command;
+    while (*start == ' ' || *start == '\t')
+        start++;
+    if (!*start) {
+        sh_puts(" Invalid /.autoload: command is empty\n");
+        kfree(command);
+        return true;
+    }
+
+    if (shell_text_starts_with(start, "winexec "))
+        shell_ensure_desktop();
+    sh_puts(" Auto-launching /.autoload command...\n");
+    shell_exec(start);
+    kfree(command);
+    return true;
+}
+
 void __cold shell_run(void)
 {
     char line[256];
@@ -7498,6 +7812,10 @@ void __cold shell_run(void)
             sh_diag_flush("shell-eof-done");
             continue;
         }
+        if (status < 0) {
+            sh_puts("Unable to allocate command line.\n");
+            continue;
+        }
 
         if (len == 0) {
             sh_diag_mark("shell-empty");
@@ -7560,6 +7878,8 @@ void __cold shell_run(void)
         sh_diag_mark("shell-exec");
         shell_exec_pipeline(line);
         sh_diag_mark("shell-exec-done");
+
+        kfree(line);
 
         if (here_buf) {
             kfree(here_buf);

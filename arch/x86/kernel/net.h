@@ -107,7 +107,7 @@ typedef struct __attribute__((packed)) {
  * throttled CF responses past ~15 KiB once the application drain
  * rate lagged the inbound burst (the bge-large /embed body is
  * the canonical reproducer at 19 KiB).  Memory cost:
- * TCP_MAX_CONNS (32) × 128 KiB ≈ 4 MiB BSS — acceptable on 512 MiB. */
+ * TCP_MAX_CONNS (64) × 128 KiB ≈ 8 MiB BSS — acceptable on 512 MiB. */
 #define TCP_RX_BUF_SIZE 131072
 #define TCP_RX_WSCALE   3   /* log2 of the granularity we advertise */
 /* 16 KiB unACKed TX window (~11 MSS).  Was 4096 — too small to fill
@@ -117,10 +117,15 @@ typedef struct __attribute__((packed)) {
  * we can carry up to 4 SACK'd gaps' worth of in-flight data, which
  * is the exact regime where multi-block SACK parsing earns its keep. */
 #define TCP_TX_BUF_SIZE 16384
-#define TCP_MAX_CONNS   32
+#define TCP_MAX_CONNS   64
 #define TCP_MSS         1460
 
+#define NET_TCP_ERROR_NONE       0
+#define NET_TCP_ERROR_RESET      1
+#define NET_TCP_ERROR_TIMED_OUT  2
+
 typedef struct {
+    uint32_t  claimed;      /* slot remains owned even after terminal state */
     int       state;
     uint8_t   remote_ip[4];
     uint16_t  local_port;
@@ -174,6 +179,13 @@ typedef struct {
     uint32_t  rto;
 
     uint64_t  last_activity;  /* tick of last packet */
+    uint64_t  keepalive_next_tick;
+    uint32_t  keepalive_idle_ticks;
+    uint32_t  keepalive_interval_ticks;
+    uint8_t   keepalive_enabled;
+    uint8_t   keepalive_probes;
+    uint8_t   close_reason;
+    uint8_t   loopback;       /* connection is delivered inside net.c */
 } tcp_conn_t;
 
 /* ── Network API ─────────────────────────────────────────────── */
@@ -188,12 +200,16 @@ void net_init(const uint8_t ip[4]);
 /* Poll for incoming packets (call in main loop) */
 void net_poll(void);
 
+/* Start the scheduler-owned RX polling thread. */
+int net_start_poll_worker(void);
+
 /* Send UDP datagram. Returns 0 on success, -1 on failure. */
 int  net_udp_send(const uint8_t dst_ip[4], uint16_t dst_port,
                   uint16_t src_port, const void *data, uint32_t len);
 
 /* Register UDP listener on a port */
-void net_udp_listen(uint16_t port, udp_handler_t handler);
+int net_udp_listen(uint16_t port, udp_handler_t handler);
+int net_udp_unlisten(uint16_t port, udp_handler_t handler);
 
 /* ICMP */
 void     net_icmp_send_echo(const uint8_t dst_ip[4], uint16_t seq);
@@ -206,13 +222,22 @@ uint32_t net_icmp_get_rx_count(void);
 int  net_tcp_connect(const uint8_t dst_ip[4], uint16_t dst_port,
                      uint16_t src_port);
 
+/* Start a TCP handshake without waiting for SYN-ACK. The returned connection
+ * remains in TCP_SYN_SENT until net_poll() establishes or closes it. */
+int  net_tcp_connect_begin(const uint8_t dst_ip[4], uint16_t dst_port,
+                           uint16_t src_port);
+
 /* Listen for incoming connections on a port.
  * Returns listener index or -1 on failure. */
 int  net_tcp_listen(uint16_t port);
+void net_tcp_set_listen_backlog(int listener, int backlog);
 
 /* Accept incoming connection on a listener. Blocks until SYN arrives
  * or timeout. Returns connection index or -1 on timeout. */
 int  net_tcp_accept(int listener, uint32_t timeout_ticks);
+
+/* Return non-zero when accept() can consume an established connection. */
+int  net_tcp_accept_ready(int listener);
 
 /* Send data on established connection. Blocks until sent or timeout.
  * Returns bytes sent, or -1 on error. */
@@ -221,6 +246,9 @@ int  net_tcp_send(int conn, const void *data, uint32_t len);
 /* Receive data from connection. Non-blocking — returns bytes copied
  * to buf, or 0 if nothing available, or -1 if connection closed. */
 int  net_tcp_recv(int conn, void *buf, uint32_t buf_size);
+
+/* Copy available receive bytes without consuming them. */
+int  net_tcp_peek(int conn, void *buf, uint32_t buf_size);
 
 /* Receive data with timeout (in ticks). Blocks until data arrives
  * or timeout. Returns bytes read, 0 on timeout, -1 on closed. */
@@ -233,8 +261,39 @@ void net_tcp_stop_listen(int listener);
 /* Close TCP connection gracefully. Blocks for FIN handshake. */
 void net_tcp_close(int conn);
 
+/* Relinquish ownership after close/shutdown. A terminal slot is not reused
+ * until its owner releases it, preventing stale descriptors from targeting a
+ * new connection that happens to receive the same table index. */
+void net_tcp_release(int conn);
+
+/* Close gracefully for at most timeout_ticks, then abort with RST. */
+int net_tcp_close_timeout(int conn, uint32_t timeout_ticks);
+
+/* Abort a connection immediately with RST. */
+void net_tcp_abort(int conn);
+
+/* Initiate a graceful TCP close without waiting for the peer FIN. */
+void net_tcp_shutdown(int conn);
+
 /* Get TCP connection state */
 int  net_tcp_state(int conn);
+
+/* Configure keepalive probes. idle/interval are expressed in timer ticks. */
+int  net_tcp_set_keepalive(int conn, int enabled, uint32_t idle_ticks,
+                           uint32_t interval_ticks);
+
+/* Return NET_TCP_ERROR_* for a closed connection. */
+int  net_tcp_error(int conn);
+
+/* Get the number of bytes currently available to receive. */
+int  net_tcp_rx_available(int conn);
+
+/* Return non-zero when send() can make progress without overrunning the
+ * peer's advertised receive window. */
+int  net_tcp_send_ready(int conn);
+
+/* Query the peer endpoint of an active connection. */
+int  net_tcp_get_peer(int conn, uint8_t ip_out[4], uint16_t *port_out);
 
 /* ── DNS API ─────────────────────────────────────────────────── */
 

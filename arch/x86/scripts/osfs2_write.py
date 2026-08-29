@@ -1,10 +1,5 @@
 #!/usr/bin/env python3
-# Minimal OsitoFS v2 WRITER (pure stdlib) — inject a host file into an image.
-# Appends at next_data_block (bump), adds a file-table entry, fixes superblock CRC
-# (primary+backup), leaves the new block's CRC-table slot 0 (read path skips verify
-# when slot==0). Mount-time blk_bitmap_rebuild reconciles the allocator bitmap.
-#   osfs2_write.py <image> add <hostfile> [destname]
-import sys, struct, zlib, os
+"""Add one file to OsitoFS v2 using a recoverable metadata transaction."""
 
 MAGIC = 0x4F534632
 LAYOUT_MAGIC = 0x4F324C59
@@ -19,16 +14,11 @@ FLAG_VALID  = 1
 FLAG_RAW    = 4
 CRC_OFF_IN_SUPER = 84   # offset of crc32 field within the 512B superblock
 
-def find_part(f):
-    f.seek(0, os.SEEK_END); n = f.tell()
-    step = 1 << 20
-    off = 0
-    while off < min(n, 256 << 20):
-        f.seek(off); d = f.read(4)
-        if len(d) == 4 and struct.unpack('<I', d)[0] == MAGIC:
-            return off
-        off += step
-    return None
+from osfs2_journal import (JOURNAL_OP_REPLACE, commit_entries, lock, read_super,
+                           recover)
+from osfs2_replace import (CRCTAB_OFF, FILETAB_OFF, FLAG_RAW, FLAG_VALID,
+                           MAX_FILES, NAME_LEN, find_free_extent, find_part,
+                           recompute_super)
 
 def read_super(f, p):
     f.seek(p); s = bytearray(f.read(512))
@@ -116,6 +106,7 @@ def main():
         print(f"ADDED {dest}: {len(data)} B at block {start} (+{bcount} blk), "
               f"slot {free_slot}; next_data_block -> {start+bcount}/{sb['total']}")
     return 0
+
 
 if __name__ == '__main__':
     sys.exit(main())

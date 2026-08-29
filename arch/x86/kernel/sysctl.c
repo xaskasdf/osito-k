@@ -6,6 +6,7 @@
  */
 
 #include "../include/types.h"
+#include "../include/sys_caps.h"
 
 extern void serial_puts(const char *s);
 extern void serial_putdec(uint64_t val);
@@ -48,11 +49,11 @@ void sysctl_init(void)
         .is_string = true, .writable = false
     };
     sysctl_table[sysctl_count++] = (sysctl_entry_t){
-        .name = "kernel.pid_max", .value = 256,
+        .name = "kernel.pid_max", .value = g_sys_caps.max_processes,
         .is_string = false, .writable = true
     };
     sysctl_table[sysctl_count++] = (sysctl_entry_t){
-        .name = "kernel.threads-max", .value = 256,
+        .name = "kernel.threads-max", .value = g_sys_caps.max_processes,
         .is_string = false, .writable = false
     };
 

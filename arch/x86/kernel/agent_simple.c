@@ -44,6 +44,8 @@ extern char g_tokenizer[];
 extern void serial_puts(const char *s);
 extern void serial_putdec(uint64_t v);
 extern int  kthread_create(const char *name, void (*func)(void *), void *data);
+extern void sched_yield(void);
+extern int sched_sleep_ticks(uint64_t ticks);
 extern int  llama_forward(llama_state_t *state, uint32_t token);
 extern bool tok_is_ready(const tokenizer_t *tok);
 
@@ -135,8 +137,8 @@ static void agent_worker(void *_)
             __sync_synchronize();
             sl->done = 1;
         }
-        /* Yield CPU between sweeps so other kthreads get scheduled. */
-        __asm__ volatile ("sti; hlt; cli" ::: "memory");
+        /* No slot event exists yet, so poll at the scheduler tick rate. */
+        (void)sched_sleep_ticks(1);
     }
 }
 
@@ -219,7 +221,7 @@ int agent_slot_wait(uint32_t slot, uint64_t task_id, uint32_t timeout_ticks)
         if (sl->task_id == task_id && sl->done) {
             return sl->failed ? -1 : 0;
         }
-        __asm__ volatile ("sti; hlt; cli" ::: "memory");
+        sched_yield();
     }
     return -2;  /* timeout */
 }

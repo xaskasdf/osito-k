@@ -56,4 +56,26 @@ static inline uint64_t kvirt_to_phys(const void *v)
     return (a >= KERNEL_VBASE) ? (a - KERNEL_VBASE) : a;
 }
 
+/* Translate a virtual address through an explicit CR3. Returns UINT64_MAX
+ * when the address is not mapped. Handles both 4 KB and 2 MB mappings. */
+uint64_t paging_translate_in_cr3(uint64_t cr3, uint64_t virt);
+void paging_debug_dump_walk_in_cr3(uint64_t cr3, uint64_t virt);
+/* Return the end of the first mapped page intersecting the range, zero when
+ * the complete range is unmapped, or UINT64_MAX for an invalid range. */
+uint64_t paging_first_mapped_end_in_cr3(uint64_t cr3, uint64_t virt,
+                                        uint64_t size);
+int paging_copy_between_cr3(uint64_t dst_cr3, uint64_t dst_va,
+                            uint64_t src_cr3, uint64_t src_va,
+                            uint64_t size, uint64_t *bytes_copied);
+uint64_t paging_get_kernel_cr3(void);
+uint64_t paging_create_process_cr3(void);
+void paging_free_process_cr3(uint64_t cr3);
+int paging_map_page_in_cr3(uint64_t cr3, uint64_t virt, uint64_t phys,
+                            uint64_t flags);
+int paging_unmap_page_in_cr3(uint64_t cr3, uint64_t virt);
+uint64_t *paging_get_pte_in_cr3(uint64_t cr3, uint64_t virt);
+int paging_set_flags_in_cr3(uint64_t cr3, uint64_t virt, uint64_t flags);
+int paging_restore_direct_map_page(uint64_t phys);
+int paging_process_cr3_selftest(void);
+
 #endif /* _OSITOK_PAGING_H */

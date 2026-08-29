@@ -86,6 +86,29 @@ static void usage(void)
     exit(1);
 }
 
+static void recompute_super(osfs2_super_t *sb, const osfs2_file_t *ft)
+{
+    uint32_t data_start = osfs2_format_data_start_blk(sb->version,
+                                                       sb->block_size);
+    uint32_t files = 0;
+    uint32_t used = data_start;
+    uint32_t hwm = data_start;
+    for (uint32_t i = 0; i < OSFS2_MAX_FILES; i++) {
+        if (!(ft[i].flags & OSFS2_FLAG_VALID)) continue;
+        files++;
+        if (!(ft[i].flags & OSFS2_FLAG_INLINE) && ft[i].block_count) {
+            used += ft[i].block_count;
+            uint32_t end = ft[i].start_block + ft[i].block_count;
+            if (end > hwm) hwm = end;
+        }
+    }
+    sb->file_count = files;
+    sb->used_blocks = used;
+    sb->next_data_block = hwm;
+    sb->crc32 = 0;
+    sb->crc32 = osfs2_crc32(sb, sizeof(*sb));
+}
+
 int main(int argc, char **argv)
 {
     if (argc < 3 || argc > 4)
@@ -105,6 +128,11 @@ int main(int argc, char **argv)
     int fd = osfs2_open_device(device, dry_run /* readonly if dry-run */);
     if (fd < 0) {
         fprintf(stderr, "ositofs-delete: cannot open %s\n", device);
+        return 1;
+    }
+    if (!dry_run && osfs2_journal_recover(fd, 1) < 0) {
+        fprintf(stderr, "ositofs-delete: journal recovery failed\n");
+        osfs2_close_device(fd);
         return 1;
     }
 
@@ -188,7 +216,8 @@ int main(int argc, char **argv)
     /* Check if any match is GGUF before allocating */
     for (int m = 0; m < match_count; m++) {
         osfs2_file_t *f = &ft[matches[m]];
-        if ((f->flags & OSFS2_FLAG_GGUF) && f->layer_index_slot != 0xFFFF) {
+        if (osfs2_layer_index_enabled && (f->flags & OSFS2_FLAG_GGUF) &&
+            f->layer_index_slot != 0xFFFF) {
             li_blk = osfs2_alloc_aligned(OSFS2_LAYERIDX_SIZE);
             if (li_blk) {
                 if (osfs2_read_bytes(fd, layeridx_off, li_blk,
@@ -201,28 +230,43 @@ int main(int argc, char **argv)
         }
     }
 
-    /* Delete each matched file */
+    /* Delete each matched file as its own recoverable transaction. */
     uint32_t total_freed = 0;
     int deleted = 0;
+    int journal_failed = 0;
 
     for (int m = 0; m < match_count; m++) {
-        osfs2_file_t *f = &ft[matches[m]];
+        uint32_t slot = (uint32_t)matches[m];
+        osfs2_file_t *f = &ft[slot];
 
-        printf("Deleting '%s'...\n", f->name);
+        printf("Deleting '%s'...\n", osfs2_entry_name(f));
+
+        osfs2_file_t before[OSFS2_JOURNAL_MAX_ENTRIES] = { *f };
+        osfs2_file_t after[OSFS2_JOURNAL_MAX_ENTRIES] = {0};
+        uint32_t slots[OSFS2_JOURNAL_MAX_ENTRIES] = { slot, 0 };
+        osfs2_super_t before_sb = sb;
+        osfs2_file_t saved = *f;
+        memset(f, 0, sizeof(*f));
+        osfs2_super_t after_sb = sb;
+        recompute_super(&after_sb, ft);
+        if (osfs2_journal_commit_entries(fd, OSFS2_JOURNAL_OP_DELETE,
+                &before_sb, &after_sb, slots, before, after, 1) < 0) {
+            *f = saved;
+            fprintf(stderr, "ositofs-delete: journaled delete failed\n");
+            journal_failed = 1;
+            break;
+        }
+        sb = after_sb;
 
         /* Clean up layer index if GGUF file */
-        if (li_blk && (f->flags & OSFS2_FLAG_GGUF) &&
-            f->layer_index_slot != 0xFFFF) {
+        if (li_blk && (saved.flags & OSFS2_FLAG_GGUF) &&
+            saved.layer_index_slot < OSFS2_MAX_MODELS) {
             osfs2_layer_idx_t *li = (osfs2_layer_idx_t *)li_blk;
-            memset(&li[f->layer_index_slot], 0, sizeof(osfs2_layer_idx_t));
+            memset(&li[saved.layer_index_slot], 0, sizeof(osfs2_layer_idx_t));
             li_dirty = 1;
         }
 
-        /* Mark entry as invalid */
-        total_freed += f->block_count;
-        f->flags = 0;
-        f->create_time = 0;
-        f->modify_time = 0;
+        total_freed += saved.block_count;
         deleted++;
     }
 
@@ -260,15 +304,6 @@ int main(int argc, char **argv)
         free(ft_buf);
         osfs2_close_device(fd);
         return 1;
-    }
-
-    /* Write back superblock + backup */
-    void *sb_buf = osfs2_alloc_aligned(4096);
-    if (sb_buf) {
-        memcpy(sb_buf, &sb, sizeof(sb));
-        osfs2_write_bytes(fd, 0, sb_buf, 4096);
-        osfs2_write_bytes(fd, OSFS2_SUPER_BACKUP_OFF, sb_buf, 4096);
-        free(sb_buf);
     }
 
     /* Summary */

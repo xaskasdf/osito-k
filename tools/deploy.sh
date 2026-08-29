@@ -14,6 +14,7 @@
 # Removes the old NVMe entry, writes new, kills running QEMU, relaunches.
 
 set -e
+set -o pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 OSITOK_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -58,21 +59,17 @@ info "NVMe:   $NVME_IMG"
 # 1. Kill any running QEMU
 "$QEMU_SCRIPT" --kill > /dev/null 2>&1 || true
 
-# 2. Delete old, write new (ignore "not found" on first deploy)
-"$OSITOK_ROOT/tools/ositofs/ositofs-delete" "$NVME_IMG" "$ELF_BASENAME" \
-    > /dev/null 2>&1 || true
+# 2. Copy-on-write replacement (also creates the file on first deploy)
 "$OSITOK_ROOT/tools/ositofs/ositofs-write" "$NVME_IMG" "$ELF" \
-    --name "$ELF_BASENAME" 2>&1 | tail -3
+    --name "$ELF_BASENAME" --overwrite 2>&1 | tail -3
 
 # 3. Optional: write a startup script that auto-execs the ELF
 if [ "$AUTO" = "1" ]; then
     info "Auto-exec: writing /startup.sh that runs '$ELF_BASENAME'"
     TMP=$(mktemp /tmp/osito-startup.XXXXXX)
     echo "exec $ELF_BASENAME" > "$TMP"
-    "$OSITOK_ROOT/tools/ositofs/ositofs-delete" "$NVME_IMG" "startup.sh" \
-        > /dev/null 2>&1 || true
     "$OSITOK_ROOT/tools/ositofs/ositofs-write" "$NVME_IMG" "$TMP" \
-        --name "startup.sh" 2>&1 | tail -1
+        --name "startup.sh" --overwrite 2>&1 | tail -1
     rm -f "$TMP"
 fi
 

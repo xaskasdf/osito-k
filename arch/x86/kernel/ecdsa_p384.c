@@ -8,10 +8,10 @@
  * that's the OID; the actual curve is determined by the *issuer's*
  * public key, which for GTS Root R4 is P-384).
  *
- * Correctness > speed.  Verify runs once per chain link, so the
- * O(n²) shift-and-subtract modular reduction and Fermat's little
- * theorem inversion are fine.  Not constant-time — verify operates
- * on public values; do NOT reuse for signing.
+ * Field/order products use Montgomery reduction and scalar multiplication
+ * uses Jacobian coordinates, so certificate checks fit network deadlines.
+ * Not constant-time: verification only handles public values. Do not reuse
+ * this implementation for signing or private scalar operations.
  */
 
 #include "../include/types.h"
@@ -20,138 +20,167 @@
 extern void serial_puts(const char *s);
 extern void serial_putdec(uint64_t v);
 
-#define BL 6   /* limbs */
+#define BL 6
 
-/* ── 384-bit unsigned bignum primitives ───────────────────────── */
+/* 384-bit unsigned arithmetic, little-endian 64-bit limbs. */
+static inline void bn_zero(uint64_t r[BL])
+{
+    for (int i = 0; i < BL; i++) r[i] = 0;
+}
 
-static inline void bn_zero(uint64_t r[BL]) { for (int i = 0; i < BL; i++) r[i] = 0; }
-static inline void bn_copy(uint64_t r[BL], const uint64_t a[BL]) {
+static inline void bn_copy(uint64_t r[BL], const uint64_t a[BL])
+{
     for (int i = 0; i < BL; i++) r[i] = a[i];
 }
-static inline int bn_is_zero(const uint64_t a[BL]) {
-    uint64_t s = 0; for (int i = 0; i < BL; i++) s |= a[i]; return s == 0;
+
+static inline int bn_is_zero(const uint64_t a[BL])
+{
+    uint64_t bits = 0;
+    for (int i = 0; i < BL; i++) bits |= a[i];
+    return bits == 0;
 }
-static int bn_cmp(const uint64_t a[BL], const uint64_t b[BL]) {
-    for (int i = BL - 1; i >= 0; i--)
+
+static int bn_cmp(const uint64_t a[BL], const uint64_t b[BL])
+{
+    for (int i = BL - 1; i >= 0; i--) {
         if (a[i] != b[i]) return a[i] < b[i] ? -1 : 1;
+    }
     return 0;
 }
-static uint64_t bn_add(uint64_t c[BL], const uint64_t a[BL], const uint64_t b[BL]) {
+
+static uint64_t bn_add(uint64_t out[BL], const uint64_t a[BL],
+                       const uint64_t b[BL])
+{
     uint64_t carry = 0;
     for (int i = 0; i < BL; i++) {
-        __uint128_t s = (__uint128_t)a[i] + b[i] + carry;
-        c[i] = (uint64_t)s;
-        carry = (uint64_t)(s >> 64);
+        __uint128_t sum = (__uint128_t)a[i] + b[i] + carry;
+        out[i] = (uint64_t)sum;
+        carry = (uint64_t)(sum >> 64);
     }
     return carry;
 }
-static uint64_t bn_sub(uint64_t c[BL], const uint64_t a[BL], const uint64_t b[BL]) {
-    __int128_t s = 0;
+
+static uint64_t bn_sub(uint64_t out[BL], const uint64_t a[BL],
+                       const uint64_t b[BL])
+{
+    uint64_t borrow = 0;
     for (int i = 0; i < BL; i++) {
-        s = (__int128_t)a[i] - b[i] + (int64_t)(s >> 64);
-        c[i] = (uint64_t)s;
+        uint64_t d = a[i] - b[i];
+        uint64_t b1 = a[i] < b[i];
+        uint64_t d2 = d - borrow;
+        uint64_t b2 = d < borrow;
+        out[i] = d2;
+        borrow = b1 | b2;
     }
-    return (uint64_t)((s >> 64) & 1);
+    return borrow;
 }
 
-/* Full 12-limb product a*b. */
-static void bn_mul_full(uint64_t c[BL * 2], const uint64_t a[BL], const uint64_t b[BL])
+typedef struct {
+    const uint64_t *mod;
+    const uint64_t *r2;
+    const uint64_t *one;
+    uint64_t n0_inv;
+} mont_ctx_t;
+
+/* out = a * b * R^-1 mod m, R = 2^384. */
+static void mont_mul(uint64_t out[BL], const uint64_t a[BL],
+                     const uint64_t b[BL], const mont_ctx_t *ctx)
 {
-    for (int i = 0; i < BL * 2; i++) c[i] = 0;
+    uint64_t t[BL * 2 + 1];
+    for (int i = 0; i < BL * 2 + 1; i++) t[i] = 0;
+
     for (int i = 0; i < BL; i++) {
-        __uint128_t carry = 0;
-        for (int j = 0; j < BL; j++) {
-            __uint128_t prod = (__uint128_t)a[i] * b[j] + c[i + j] + (uint64_t)carry;
-            c[i + j] = (uint64_t)prod;
-            carry = prod >> 64;
-        }
-        c[i + BL] = (uint64_t)carry;
-    }
-}
-
-/* prod (12 limbs) mod m (6 limbs).  Shift-and-subtract — 384 iters. */
-static void bn_mod_full(uint64_t r[BL], const uint64_t prod[BL * 2], const uint64_t m[BL])
-{
-    uint64_t hi[BL], lo[BL];
-    for (int i = 0; i < BL; i++) lo[i] = prod[i];
-    for (int i = 0; i < BL; i++) hi[i] = prod[i + BL];
-
-    for (int bit = 0; bit < BL * 64; bit++) {
-        (void)bit;
         uint64_t carry = 0;
-        for (int i = 0; i < BL; i++) {
-            uint64_t nc = lo[i] >> 63;
-            lo[i] = (lo[i] << 1) | carry;
-            carry = nc;
+        for (int j = 0; j < BL; j++) {
+            __uint128_t sum = (__uint128_t)a[i] * b[j] +
+                              t[i + j] + carry;
+            t[i + j] = (uint64_t)sum;
+            carry = (uint64_t)(sum >> 64);
         }
-        for (int i = 0; i < BL; i++) {
-            uint64_t nc = hi[i] >> 63;
-            hi[i] = (hi[i] << 1) | carry;
-            carry = nc;
-        }
-        if (carry || bn_cmp(hi, m) >= 0) {
-            uint64_t tmp[BL];
-            bn_sub(tmp, hi, m);
-            for (int i = 0; i < BL; i++) hi[i] = tmp[i];
+        int k = i + BL;
+        while (carry != 0) {
+            __uint128_t sum = (__uint128_t)t[k] + carry;
+            t[k] = (uint64_t)sum;
+            carry = (uint64_t)(sum >> 64);
+            k++;
         }
     }
-    for (int i = 0; i < BL; i++) r[i] = hi[i];
+
+    for (int i = 0; i < BL; i++) {
+        uint64_t q = t[i] * ctx->n0_inv;
+        uint64_t carry = 0;
+        for (int j = 0; j < BL; j++) {
+            __uint128_t sum = (__uint128_t)q * ctx->mod[j] +
+                              t[i + j] + carry;
+            t[i + j] = (uint64_t)sum;
+            carry = (uint64_t)(sum >> 64);
+        }
+        int k = i + BL;
+        while (carry != 0) {
+            __uint128_t sum = (__uint128_t)t[k] + carry;
+            t[k] = (uint64_t)sum;
+            carry = (uint64_t)(sum >> 64);
+            k++;
+        }
+    }
+
+    for (int i = 0; i < BL; i++) out[i] = t[i + BL];
+    if (t[BL * 2] != 0 || bn_cmp(out, ctx->mod) >= 0) {
+        (void)bn_sub(out, out, ctx->mod);
+    }
 }
 
-static void bn_mod_add(uint64_t r[BL], const uint64_t a[BL], const uint64_t b[BL],
-                       const uint64_t m[BL])
+static void mont_encode(uint64_t out[BL], const uint64_t in[BL],
+                        const mont_ctx_t *ctx)
 {
-    uint64_t carry = bn_add(r, a, b);
-    if (carry || bn_cmp(r, m) >= 0) {
-        uint64_t tmp[BL];
-        bn_sub(tmp, r, m);
-        for (int i = 0; i < BL; i++) r[i] = tmp[i];
-    }
-}
-static void bn_mod_sub(uint64_t r[BL], const uint64_t a[BL], const uint64_t b[BL],
-                       const uint64_t m[BL])
-{
-    uint64_t borrow = bn_sub(r, a, b);
-    if (borrow) {
-        uint64_t tmp[BL];
-        bn_add(tmp, r, m);
-        for (int i = 0; i < BL; i++) r[i] = tmp[i];
-    }
-}
-static void bn_mod_mul(uint64_t r[BL], const uint64_t a[BL], const uint64_t b[BL],
-                       const uint64_t m[BL])
-{
-    uint64_t prod[BL * 2];
-    bn_mul_full(prod, a, b);
-    bn_mod_full(r, prod, m);
+    mont_mul(out, in, ctx->r2, ctx);
 }
 
-/* r = base ^ exp mod m.  exp is a BL-limb bignum.  Square-and-
- * multiply over the bits of exp, MSB first. */
-static void bn_mod_pow(uint64_t r[BL], const uint64_t base[BL],
-                       const uint64_t exp[BL], const uint64_t m[BL])
+static void mont_decode(uint64_t out[BL], const uint64_t in[BL],
+                        const mont_ctx_t *ctx)
 {
-    uint64_t res[BL], b[BL];
-    bn_zero(res); res[0] = 1;
-    bn_copy(b, base);
-    for (int limb = 0; limb < BL; limb++) {
-        uint64_t e = exp[limb];
-        for (int bit = 0; bit < 64; bit++) {
-            if (e & 1) bn_mod_mul(res, res, b, m);
-            e >>= 1;
-            bn_mod_mul(b, b, b, m);
+    static const uint64_t one[BL] = {1, 0, 0, 0, 0, 0};
+    mont_mul(out, in, one, ctx);
+}
+
+static void mont_pow(uint64_t out[BL], const uint64_t base[BL],
+                     const uint64_t exp[BL], const mont_ctx_t *ctx)
+{
+    uint64_t acc[BL], tmp[BL];
+    bn_copy(acc, ctx->one);
+    for (int limb = BL - 1; limb >= 0; limb--) {
+        for (int bit = 63; bit >= 0; bit--) {
+            mont_mul(tmp, acc, acc, ctx);
+            bn_copy(acc, tmp);
+            if ((exp[limb] >> bit) & 1ULL) {
+                mont_mul(tmp, acc, base, ctx);
+                bn_copy(acc, tmp);
+            }
         }
     }
-    bn_copy(r, res);
+    bn_copy(out, acc);
 }
 
-/* Modular inverse via Fermat: a^(p-2) mod p. */
-static void bn_mod_inv(uint64_t r[BL], const uint64_t a[BL], const uint64_t m[BL])
+static void mont_inv(uint64_t out[BL], const uint64_t in[BL],
+                     const mont_ctx_t *ctx)
 {
-    /* exp = m - 2 */
-    uint64_t two[BL]; bn_zero(two); two[0] = 2;
-    uint64_t exp[BL]; bn_sub(exp, m, two);
-    bn_mod_pow(r, a, exp, m);
+    uint64_t two[BL] = {2, 0, 0, 0, 0, 0};
+    uint64_t exp[BL];
+    (void)bn_sub(exp, ctx->mod, two);
+    mont_pow(out, in, exp, ctx);
+}
+
+static void mod_add(uint64_t out[BL], const uint64_t a[BL],
+                    const uint64_t b[BL], const uint64_t mod[BL])
+{
+    uint64_t carry = bn_add(out, a, b);
+    if (carry || bn_cmp(out, mod) >= 0) (void)bn_sub(out, out, mod);
+}
+
+static void mod_sub(uint64_t out[BL], const uint64_t a[BL],
+                    const uint64_t b[BL], const uint64_t mod[BL])
+{
+    if (bn_sub(out, a, b)) (void)bn_add(out, out, mod);
 }
 
 /* ── P-384 curve constants (FIPS 186-4 D.2.4) ────────────────── */
@@ -164,11 +193,6 @@ static const uint64_t P384_P[BL] = {
 /* Group order n */
 static const uint64_t P384_N[BL] = {
     0xecec196accc52973ULL, 0x581a0db248b0a77aULL, 0xc7634d81f4372ddfULL,
-    0xffffffffffffffffULL, 0xffffffffffffffffULL, 0xffffffffffffffffULL,
-};
-/* a = -3 mod p */
-static const uint64_t P384_A[BL] = {
-    0x00000000fffffffcULL, 0xffffffff00000000ULL, 0xfffffffffffffffeULL,
     0xffffffffffffffffULL, 0xffffffffffffffffULL, 0xffffffffffffffffULL,
 };
 /* b */
@@ -187,148 +211,311 @@ static const uint64_t P384_GY[BL] = {
     0xf8f41dbd289a147cULL, 0x5d9e98bf9292dc29ULL, 0x3617de4a96262c6fULL,
 };
 
-/* ── EC point operations (affine) ─────────────────────────────── */
+static const uint64_t P384_P_R[BL] = {
+    0xffffffff00000001ULL, 0x00000000ffffffffULL, 0x0000000000000001ULL,
+    0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+};
+static const uint64_t P384_P_R2[BL] = {
+    0xfffffffe00000001ULL, 0x0000000200000000ULL, 0xfffffffe00000000ULL,
+    0x0000000200000000ULL, 0x0000000000000001ULL, 0x0000000000000000ULL,
+};
+static const uint64_t P384_N_R[BL] = {
+    0x1313e695333ad68dULL, 0xa7e5f24db74f5885ULL, 0x389cb27e0bc8d220ULL,
+    0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+};
+static const uint64_t P384_N_R2[BL] = {
+    0x2d319b2419b409a9ULL, 0xff3d81e5df1aa419ULL, 0xbc3e483afcb82947ULL,
+    0xd40d49174aab1cc5ULL, 0x3fb05b7a28266895ULL, 0x0c84ee012b39bf21ULL,
+};
+
+static const mont_ctx_t P384_FIELD = {
+    P384_P, P384_P_R2, P384_P_R, 0x0000000100000001ULL,
+};
+static const mont_ctx_t P384_ORDER = {
+    P384_N, P384_N_R2, P384_N_R, 0x6ed46089e88fdc45ULL,
+};
+
+/* Field values below stay in Montgomery form. */
+static void fe_add(uint64_t out[BL], const uint64_t a[BL], const uint64_t b[BL])
+{
+    mod_add(out, a, b, P384_P);
+}
+
+static void fe_sub(uint64_t out[BL], const uint64_t a[BL], const uint64_t b[BL])
+{
+    mod_sub(out, a, b, P384_P);
+}
+
+static void fe_mul(uint64_t out[BL], const uint64_t a[BL], const uint64_t b[BL])
+{
+    mont_mul(out, a, b, &P384_FIELD);
+}
+
+static void fe_sqr(uint64_t out[BL], const uint64_t a[BL])
+{
+    mont_mul(out, a, a, &P384_FIELD);
+}
+
+static void fe_mul2(uint64_t out[BL], const uint64_t a[BL])
+{
+    fe_add(out, a, a);
+}
+
+static void fe_mul3(uint64_t out[BL], const uint64_t a[BL])
+{
+    uint64_t twice[BL];
+    fe_mul2(twice, a);
+    fe_add(out, twice, a);
+}
+
+static void fe_mul4(uint64_t out[BL], const uint64_t a[BL])
+{
+    uint64_t twice[BL];
+    fe_mul2(twice, a);
+    fe_mul2(out, twice);
+}
+
+static void fe_mul8(uint64_t out[BL], const uint64_t a[BL])
+{
+    uint64_t four[BL];
+    fe_mul4(four, a);
+    fe_mul2(out, four);
+}
 
 typedef struct {
     uint64_t x[BL], y[BL];
-    int      infinity;
-} ec_point_t;
+    int infinity;
+} ec_affine_t;
 
-static void ec_set_inf(ec_point_t *p) { p->infinity = 1; bn_zero(p->x); bn_zero(p->y); }
+typedef struct {
+    uint64_t x[BL], y[BL], z[BL];
+    int infinity;
+} ec_jacobian_t;
 
-/* Point doubling on y² = x³ + ax + b mod p.
- *   λ = (3·x² + a) / (2·y)
- *   x3 = λ² − 2·x
- *   y3 = λ·(x − x3) − y
- */
-static void ec_double(ec_point_t *r, const ec_point_t *a)
+static void jac_set_inf(ec_jacobian_t *p)
 {
-    if (a->infinity) { ec_set_inf(r); return; }
-    /* λ = (3x² + a) / (2y) */
-    uint64_t x_sq[BL], three_x_sq[BL], num[BL], two_y[BL], inv[BL], lam[BL];
-    bn_mod_mul(x_sq, a->x, a->x, P384_P);
-    bn_mod_add(three_x_sq, x_sq, x_sq, P384_P);
-    bn_mod_add(three_x_sq, three_x_sq, x_sq, P384_P);
-    bn_mod_add(num, three_x_sq, P384_A, P384_P);
-    bn_mod_add(two_y, a->y, a->y, P384_P);
-    bn_mod_inv(inv, two_y, P384_P);
-    bn_mod_mul(lam, num, inv, P384_P);
-
-    /* x3 = λ² − 2x */
-    uint64_t lam_sq[BL], two_x[BL], x3[BL];
-    bn_mod_mul(lam_sq, lam, lam, P384_P);
-    bn_mod_add(two_x, a->x, a->x, P384_P);
-    bn_mod_sub(x3, lam_sq, two_x, P384_P);
-
-    /* y3 = λ·(x − x3) − y */
-    uint64_t x_minus_x3[BL], lam_dx[BL], y3[BL];
-    bn_mod_sub(x_minus_x3, a->x, x3, P384_P);
-    bn_mod_mul(lam_dx, lam, x_minus_x3, P384_P);
-    bn_mod_sub(y3, lam_dx, a->y, P384_P);
-
-    bn_copy(r->x, x3);
-    bn_copy(r->y, y3);
-    r->infinity = 0;
+    bn_zero(p->x);
+    bn_zero(p->y);
+    bn_zero(p->z);
+    p->infinity = 1;
 }
 
-/* Point addition (a != b, neither infinity, x_a != x_b).
- * λ = (y_b − y_a) / (x_b − x_a)
- * x3 = λ² − x_a − x_b
- * y3 = λ·(x_a − x3) − y_a
- */
-static void ec_add(ec_point_t *r, const ec_point_t *a, const ec_point_t *b)
+static void jac_from_affine(ec_jacobian_t *out, const ec_affine_t *p)
 {
-    if (a->infinity) { bn_copy(r->x, b->x); bn_copy(r->y, b->y); r->infinity = b->infinity; return; }
-    if (b->infinity) { bn_copy(r->x, a->x); bn_copy(r->y, a->y); r->infinity = a->infinity; return; }
-    if (bn_cmp(a->x, b->x) == 0) {
-        /* Same x: either doubling or P + (-P) = infinity. */
-        if (bn_cmp(a->y, b->y) == 0) { ec_double(r, a); return; }
-        ec_set_inf(r); return;
+    if (p->infinity) {
+        jac_set_inf(out);
+        return;
     }
-    uint64_t dy[BL], dx[BL], inv[BL], lam[BL];
-    bn_mod_sub(dy, b->y, a->y, P384_P);
-    bn_mod_sub(dx, b->x, a->x, P384_P);
-    bn_mod_inv(inv, dx, P384_P);
-    bn_mod_mul(lam, dy, inv, P384_P);
-
-    uint64_t lam_sq[BL], x3[BL];
-    bn_mod_mul(lam_sq, lam, lam, P384_P);
-    bn_mod_sub(x3, lam_sq, a->x, P384_P);
-    bn_mod_sub(x3, x3, b->x, P384_P);
-
-    uint64_t x_minus_x3[BL], lam_dx[BL], y3[BL];
-    bn_mod_sub(x_minus_x3, a->x, x3, P384_P);
-    bn_mod_mul(lam_dx, lam, x_minus_x3, P384_P);
-    bn_mod_sub(y3, lam_dx, a->y, P384_P);
-
-    bn_copy(r->x, x3);
-    bn_copy(r->y, y3);
-    r->infinity = 0;
+    bn_copy(out->x, p->x);
+    bn_copy(out->y, p->y);
+    bn_copy(out->z, P384_FIELD.one);
+    out->infinity = 0;
 }
 
-/* Scalar multiply: r = k · P.  Double-and-add, MSB-first. */
-static void ec_scalar_mul(ec_point_t *r, const uint64_t k[BL], const ec_point_t *P)
+/* Jacobian doubling specialized for a = -3. */
+static void jac_double(ec_jacobian_t *out, const ec_jacobian_t *p)
 {
-    ec_point_t acc; ec_set_inf(&acc);
+    if (p->infinity || bn_is_zero(p->y)) {
+        jac_set_inf(out);
+        return;
+    }
+
+    uint64_t delta[BL], gamma[BL], beta[BL], alpha[BL];
+    uint64_t t1[BL], t2[BL], x3[BL], y3[BL], z3[BL];
+
+    fe_sqr(delta, p->z);
+    fe_sqr(gamma, p->y);
+    fe_mul(beta, p->x, gamma);
+    fe_sub(t1, p->x, delta);
+    fe_add(t2, p->x, delta);
+    fe_mul(alpha, t1, t2);
+    fe_mul3(alpha, alpha);
+
+    fe_sqr(x3, alpha);
+    fe_mul8(t1, beta);
+    fe_sub(x3, x3, t1);
+
+    fe_add(z3, p->y, p->z);
+    fe_sqr(z3, z3);
+    fe_sub(z3, z3, gamma);
+    fe_sub(z3, z3, delta);
+
+    fe_mul4(t1, beta);
+    fe_sub(t1, t1, x3);
+    fe_mul(y3, alpha, t1);
+    fe_sqr(t2, gamma);
+    fe_mul8(t2, t2);
+    fe_sub(y3, y3, t2);
+
+    bn_copy(out->x, x3);
+    bn_copy(out->y, y3);
+    bn_copy(out->z, z3);
+    out->infinity = 0;
+}
+
+/* Add an affine point to a Jacobian point. */
+static void jac_add_mixed(ec_jacobian_t *out, const ec_jacobian_t *p,
+                          const ec_affine_t *q)
+{
+    if (p->infinity) {
+        jac_from_affine(out, q);
+        return;
+    }
+    if (q->infinity) {
+        *out = *p;
+        return;
+    }
+
+    uint64_t z1z1[BL], u2[BL], s2[BL], h[BL], rr[BL];
+    uint64_t hh[BL], i4[BL], j[BL], v[BL];
+    uint64_t x3[BL], y3[BL], z3[BL], t1[BL], t2[BL];
+
+    fe_sqr(z1z1, p->z);
+    fe_mul(u2, q->x, z1z1);
+    fe_mul(t1, p->z, z1z1);
+    fe_mul(s2, q->y, t1);
+    fe_sub(h, u2, p->x);
+    fe_sub(rr, s2, p->y);
+
+    if (bn_is_zero(h)) {
+        if (bn_is_zero(rr)) jac_double(out, p);
+        else jac_set_inf(out);
+        return;
+    }
+
+    fe_sqr(hh, h);
+    fe_mul4(i4, hh);
+    fe_mul(j, h, i4);
+    fe_mul2(rr, rr);
+    fe_mul(v, p->x, i4);
+
+    fe_sqr(x3, rr);
+    fe_sub(x3, x3, j);
+    fe_mul2(t1, v);
+    fe_sub(x3, x3, t1);
+
+    fe_sub(t1, v, x3);
+    fe_mul(y3, rr, t1);
+    fe_mul(t2, p->y, j);
+    fe_mul2(t2, t2);
+    fe_sub(y3, y3, t2);
+
+    fe_add(z3, p->z, h);
+    fe_sqr(z3, z3);
+    fe_sub(z3, z3, z1z1);
+    fe_sub(z3, z3, hh);
+
+    bn_copy(out->x, x3);
+    bn_copy(out->y, y3);
+    bn_copy(out->z, z3);
+    out->infinity = 0;
+}
+
+/* Full Jacobian addition, used once to combine u1*G and u2*Q. */
+static void jac_add(ec_jacobian_t *out, const ec_jacobian_t *p,
+                    const ec_jacobian_t *q)
+{
+    if (p->infinity) { *out = *q; return; }
+    if (q->infinity) { *out = *p; return; }
+
+    uint64_t z1z1[BL], z2z2[BL], u1[BL], u2[BL], s1[BL], s2[BL];
+    uint64_t h[BL], rr[BL], i4[BL], j[BL], v[BL];
+    uint64_t x3[BL], y3[BL], z3[BL], t1[BL], t2[BL];
+
+    fe_sqr(z1z1, p->z);
+    fe_sqr(z2z2, q->z);
+    fe_mul(u1, p->x, z2z2);
+    fe_mul(u2, q->x, z1z1);
+    fe_mul(t1, q->z, z2z2);
+    fe_mul(s1, p->y, t1);
+    fe_mul(t1, p->z, z1z1);
+    fe_mul(s2, q->y, t1);
+    fe_sub(h, u2, u1);
+    fe_sub(rr, s2, s1);
+
+    if (bn_is_zero(h)) {
+        if (bn_is_zero(rr)) jac_double(out, p);
+        else jac_set_inf(out);
+        return;
+    }
+
+    fe_mul2(t1, h);
+    fe_sqr(i4, t1);
+    fe_mul(j, h, i4);
+    fe_mul2(rr, rr);
+    fe_mul(v, u1, i4);
+
+    fe_sqr(x3, rr);
+    fe_sub(x3, x3, j);
+    fe_mul2(t1, v);
+    fe_sub(x3, x3, t1);
+
+    fe_sub(t1, v, x3);
+    fe_mul(y3, rr, t1);
+    fe_mul(t2, s1, j);
+    fe_mul2(t2, t2);
+    fe_sub(y3, y3, t2);
+
+    fe_add(z3, p->z, q->z);
+    fe_sqr(z3, z3);
+    fe_sub(z3, z3, z1z1);
+    fe_sub(z3, z3, z2z2);
+    fe_mul(z3, z3, h);
+
+    bn_copy(out->x, x3);
+    bn_copy(out->y, y3);
+    bn_copy(out->z, z3);
+    out->infinity = 0;
+}
+
+static void ec_scalar_mul(ec_jacobian_t *out, const uint64_t scalar[BL],
+                          const ec_affine_t *point)
+{
+    ec_jacobian_t acc;
+    jac_set_inf(&acc);
     for (int limb = BL - 1; limb >= 0; limb--) {
-        uint64_t v = k[limb];
         for (int bit = 63; bit >= 0; bit--) {
-            ec_point_t tmp;
-            ec_double(&tmp, &acc);
-            if ((v >> bit) & 1) {
-                ec_add(&acc, &tmp, P);
-            } else {
-                bn_copy(acc.x, tmp.x); bn_copy(acc.y, tmp.y);
-                acc.infinity = tmp.infinity;
+            ec_jacobian_t tmp;
+            jac_double(&tmp, &acc);
+            acc = tmp;
+            if ((scalar[limb] >> bit) & 1ULL) {
+                jac_add_mixed(&tmp, &acc, point);
+                acc = tmp;
             }
         }
     }
-    bn_copy(r->x, acc.x);
-    bn_copy(r->y, acc.y);
-    r->infinity = acc.infinity;
+    *out = acc;
+}
+
+static int ec_affine_on_curve(const ec_affine_t *p)
+{
+    uint64_t lhs[BL], x2[BL], rhs[BL], three_x[BL], b[BL];
+    fe_sqr(lhs, p->y);
+    fe_sqr(x2, p->x);
+    fe_mul(rhs, x2, p->x);
+    fe_mul3(three_x, p->x);
+    fe_sub(rhs, rhs, three_x);
+    mont_encode(b, P384_B, &P384_FIELD);
+    fe_add(rhs, rhs, b);
+    return bn_cmp(lhs, rhs) == 0;
+}
+
+static int jac_get_x(uint64_t x_normal[BL], const ec_jacobian_t *p)
+{
+    if (p->infinity || bn_is_zero(p->z)) return -1;
+    uint64_t z_inv[BL], z2_inv[BL], x_mont[BL];
+    mont_inv(z_inv, p->z, &P384_FIELD);
+    fe_sqr(z2_inv, z_inv);
+    fe_mul(x_mont, p->x, z2_inv);
+    mont_decode(x_normal, x_mont, &P384_FIELD);
+    return 0;
 }
 
 /* ── DER signature parsing ──────────────────────────────────── */
 
-/* SEQUENCE { r INTEGER, s INTEGER } where r, s are <= 48 bytes big-
- * endian (leftmost zero pad allowed; sign byte stripped). */
+/* Parse SEQUENCE { INTEGER r, INTEGER s } into padded big-endian scalars. */
 static int parse_ecdsa_sig(const uint8_t *sig, uint32_t sig_len,
                            uint8_t r_be[48], uint8_t s_be[48])
-{
-    if (sig_len < 8 || sig[0] != 0x30) return -1;
-    uint32_t i = 1;
-    uint32_t seq_len;
-    if ((sig[i] & 0x80) == 0) { seq_len = sig[i]; i++; }
-    else {
-        uint8_t nb = sig[i++] & 0x7F;
-        if (nb == 0 || nb > 2 || i + nb > sig_len) return -1;
-        seq_len = 0;
-        for (uint8_t k = 0; k < nb; k++) seq_len = (seq_len << 8) | sig[i++];
-    }
-    if (i + seq_len > sig_len) return -1;
-
-    /* r INTEGER */
-    if (sig[i] != 0x02) return -1;
-    i++;
-    uint32_t r_len = sig[i++];
-    if (i + r_len > sig_len) return -1;
-    const uint8_t *r_p = sig + i;
-    if (r_len > 1 && r_p[0] == 0x00) { r_p++; r_len--; }
-    if (r_len > 48) return -1;
-    for (int k = 0; k < 48; k++) r_be[k] = 0;
-    for (uint32_t k = 0; k < r_len; k++) r_be[48 - r_len + k] = r_p[k];
-    i += sig[i - 1];      /* advance past r */
-    /* fix the cursor: we read r_len from sig[i-1] which was already
-     * past the value if we'd already consumed it.  Recompute: */
-    /* the above is brittle — let's just do it cleanly: */
-    return 0;  /* fall through; cursor below */
-}
-
-/* Cleaner re-do — the above was getting tangled.  Parse from scratch
- * with a proper cursor.  Returns 0 + fills r_be / s_be with 48-byte
- * big-endian-padded scalars. */
-static int parse_ecdsa_sig_clean(const uint8_t *sig, uint32_t sig_len,
-                                  uint8_t r_be[48], uint8_t s_be[48])
 {
     if (sig_len < 8 || sig[0] != 0x30) return -1;
     uint32_t p = 1;
@@ -378,8 +565,7 @@ int ecdsa_p384_verify(const uint8_t pub_x[48], const uint8_t pub_y[48],
                       const uint8_t *sig_der, uint32_t sig_der_len)
 {
     uint8_t r_be[48], s_be[48];
-    if (parse_ecdsa_sig_clean(sig_der, sig_der_len, r_be, s_be) < 0) return -1;
-    (void)parse_ecdsa_sig;   /* silence unused-function warning */
+    if (parse_ecdsa_sig(sig_der, sig_der_len, r_be, s_be) < 0) return -1;
 
     uint64_t r[BL], s[BL], z[BL];
     be48_to_bn(r_be, r);
@@ -390,40 +576,44 @@ int ecdsa_p384_verify(const uint8_t pub_x[48], const uint8_t pub_y[48],
     if (bn_is_zero(r) || bn_cmp(r, P384_N) >= 0) return -1;
     if (bn_is_zero(s) || bn_cmp(s, P384_N) >= 0) return -1;
 
-    /* w = s^-1 mod n */
-    uint64_t w[BL]; bn_mod_inv(w, s, P384_N);
+    if (bn_cmp(z, P384_N) >= 0) (void)bn_sub(z, z, P384_N);
 
-    /* u1 = z · w mod n,  u2 = r · w mod n */
-    uint64_t u1[BL], u2[BL];
-    bn_mod_mul(u1, z, w, P384_N);
-    bn_mod_mul(u2, r, w, P384_N);
+    /* Compute the ECDSA scalars in the order's Montgomery domain. */
+    uint64_t r_m[BL], s_m[BL], z_m[BL], w_m[BL];
+    uint64_t u1_m[BL], u2_m[BL], u1[BL], u2[BL];
+    mont_encode(r_m, r, &P384_ORDER);
+    mont_encode(s_m, s, &P384_ORDER);
+    mont_encode(z_m, z, &P384_ORDER);
+    mont_inv(w_m, s_m, &P384_ORDER);
+    mont_mul(u1_m, z_m, w_m, &P384_ORDER);
+    mont_mul(u2_m, r_m, w_m, &P384_ORDER);
+    mont_decode(u1, u1_m, &P384_ORDER);
+    mont_decode(u2, u2_m, &P384_ORDER);
 
-    /* (x1, y1) = u1·G + u2·Pub */
-    ec_point_t G, Pub, u1G, u2P, sum;
-    bn_copy(G.x, P384_GX); bn_copy(G.y, P384_GY); G.infinity = 0;
-    be48_to_bn(pub_x, Pub.x);
-    be48_to_bn(pub_y, Pub.y);
-    Pub.infinity = 0;
+    uint64_t pub_x_n[BL], pub_y_n[BL];
+    be48_to_bn(pub_x, pub_x_n);
+    be48_to_bn(pub_y, pub_y_n);
+    if (bn_cmp(pub_x_n, P384_P) >= 0 || bn_cmp(pub_y_n, P384_P) >= 0)
+        return -1;
 
-    ec_scalar_mul(&u1G, u1, &G);
-    ec_scalar_mul(&u2P, u2, &Pub);
-    ec_add(&sum, &u1G, &u2P);
+    ec_affine_t generator, pub;
+    mont_encode(generator.x, P384_GX, &P384_FIELD);
+    mont_encode(generator.y, P384_GY, &P384_FIELD);
+    generator.infinity = 0;
+    mont_encode(pub.x, pub_x_n, &P384_FIELD);
+    mont_encode(pub.y, pub_y_n, &P384_FIELD);
+    pub.infinity = 0;
+    if (!ec_affine_on_curve(&pub)) return -1;
 
-    if (sum.infinity) return -1;
+    ec_jacobian_t u1g, u2p, sum;
+    ec_scalar_mul(&u1g, u1, &generator);
+    ec_scalar_mul(&u2p, u2, &pub);
+    jac_add(&sum, &u1g, &u2p);
 
-    /* Verify: r ≡ sum.x mod n. */
-    uint64_t sum_x_mod_n[BL];
-    bn_copy(sum_x_mod_n, sum.x);
-    if (bn_cmp(sum_x_mod_n, P384_N) >= 0) {
-        uint64_t tmp[BL];
-        bn_sub(tmp, sum_x_mod_n, P384_N);
-        for (int i = 0; i < BL; i++) sum_x_mod_n[i] = tmp[i];
-    }
-    if (bn_cmp(sum_x_mod_n, r) != 0) return -1;
-
-    /* Suppress "unused but useful" b parameter — it's only conceptual. */
-    (void)P384_B;
-    return 0;
+    uint64_t x[BL];
+    if (jac_get_x(x, &sum) < 0) return -1;
+    if (bn_cmp(x, P384_N) >= 0) (void)bn_sub(x, x, P384_N);
+    return bn_cmp(x, r) == 0 ? 0 : -1;
 }
 
 /* ── Self-test ──────────────────────────────────────────────── */

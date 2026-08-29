@@ -1,22 +1,19 @@
 #include "venus_wire.h"
-#include "venus.h"   /* for VENUS_SYS_* and GPU_RES_* constants */
 
-/* Minimum libc surface. */
 extern void *malloc(unsigned long);
-extern void  free(void *);
+extern void free(void *);
 extern void *memset(void *, int, unsigned long);
 extern long  __syscall2(long, long, long);
 extern long  __syscall1(long, long);
 extern int   printf(const char *, ...);
 
-/* From gpu_syscalls.h — duplicated here because that header is in the
- * kernel tree and not visible from user builds. */
-#define VENUS_SYS_GPU_RES_CREATE   603L
-#define VENUS_SYS_GPU_RES_MAP      604L
-#define VENUS_SYS_GPU_SUBMIT       605L
-#define VENUS_SYS_GPU_FENCE_WAIT   606L
+#define SYS_GPU_RES_CREATE 603L
+#define SYS_GPU_RES_MAP 604L
+#define SYS_GPU_SUBMIT 605L
+#define SYS_GPU_RES_DESTROY 608L
+#define SYS_NANOSLEEP 35L
 
-#define GPU_RES_KIND_BUFFER         0u
+#define GPU_RES_KIND_BUFFER 0u
 #define GPU_RES_FLAG_HOST_COHERENT (1u << 0)
 
 #define VN_CMD_TYPE_vkSetReplyCommandStreamMESA 178u
@@ -35,14 +32,15 @@ struct gpu_res_create_args {
     uint32_t height;
     uint32_t pitch;
     uint64_t size;
+    uint64_t blob_id;
 };
 
 struct gpu_submit_args {
-    uint32_t   ctx_id;
-    uint32_t   reserved;
+    uint32_t ctx_id;
+    uint32_t reserved;
     const void *cmd_bytes;
-    uint64_t   cmd_len;
-    uint64_t  *out_fence;
+    uint64_t cmd_len;
+    uint64_t *out_fence;
 };
 
 struct venus_wire {
@@ -212,67 +210,54 @@ struct venus_wire *venus_wire_open(int32_t ctx_id) {
     return w;
 }
 
-void venus_wire_close(struct venus_wire *w) {
-    if (!w) return;
-    /* Kernel-side resource cleanup happens at process teardown
-     * (vg3d_cleanup_process); we don't call SYS_GPU_RES_DESTROY in
-     * Wave 1's syscall set. Just release guest struct. */
-    free(w);
+static void wire_unlock(struct venus_wire *w)
+{
+    __sync_lock_release(&w->lock);
 }
 
-void *venus_wire_alloc_cmd(struct venus_wire *w,
-                           uint32_t cmd_id, uint16_t flags,
-                           uint32_t payload_size, uint64_t *out_reply_id) {
-    if (!w) return 0;
-    /* Single-in-flight contract: if a prior alloc_cmd wasn't followed by
-     * submit, refuse to start a new one. Prevents silently overwriting
-     * the previous command's payload. */
-    if (w->pending_head_advance != 0) return 0;
-    /* Round payload to 8 bytes for wire alignment. */
-    uint32_t aligned = (payload_size + 7) & ~7u;
-    uint32_t total = sizeof(struct venus_cmd_header) + aligned;
-
-    /* Simple bumped head — no wraparound in W3b.1. Ring must not fill. */
-    uint32_t head = w->hdr->head;
-    if (head + total > VENUS_RING_CMD_BYTES) return 0;
-
-    struct venus_cmd_header *h = (struct venus_cmd_header *)(w->cmd_area + head);
-    h->cmd_id = cmd_id;
-    h->flags  = flags;
-    h->_reserved = 0;
-    h->payload_size = payload_size;
-    h->reply_id = w->next_reply_id++;
-    if (out_reply_id) *out_reply_id = h->reply_id;
-
-    w->pending_head_advance = total;
-    /* Caller writes payload directly after the header. */
-    return (void *)(w->cmd_area + head + sizeof(*h));
+static void put_u32(uint8_t **dst, uint32_t value)
+{
+    memcpy(*dst, &value, sizeof(value));
+    *dst += sizeof(value);
 }
 
-int venus_wire_submit(struct venus_wire *w) {
-    if (!w || w->pending_head_advance == 0) return -22 /* EINVAL */;
+static void put_u64(uint8_t **dst, uint64_t value)
+{
+    memcpy(*dst, &value, sizeof(value));
+    *dst += sizeof(value);
+}
 
-    /* Make the command visible to the host BEFORE bumping head. */
-    __asm__ volatile("mfence" ::: "memory");
-    w->hdr->head += w->pending_head_advance;
-    __asm__ volatile("mfence" ::: "memory");
-    w->pending_head_advance = 0;
-
-    /* Send a single-byte "ping" via SYS_GPU_SUBMIT so the kernel pokes
-     * the virtio-gpu virtqueue. Actual command bytes live in the ring;
-     * this submission just tells the host to drain. */
+static int submit_direct(struct venus_wire *w, const void *bytes, uint32_t size)
+{
     uint64_t fence = 0;
-    uint8_t ping = 0;
-    struct gpu_submit_args sa = {
-        .ctx_id = (uint32_t)w->ctx_id,
-        .cmd_bytes = &ping,
-        .cmd_len = 1,
+    struct gpu_submit_args args = {
+        .ctx_id = w->ctx_id,
+        .cmd_bytes = bytes,
+        .cmd_len = size,
         .out_fence = &fence,
     };
-    long rc = __syscall1(VENUS_SYS_GPU_SUBMIT, (long)&sa);
-    if (rc < 0) return (int)rc;
-    /* Fence wait is deferred — the *reply* is how we know the command
-     * was consumed. We don't need to fence-wait here. */
+    return (int)__syscall1(SYS_GPU_SUBMIT, (long)&args);
+}
+
+static int create_resource(uint32_t ctx_id, uint64_t size,
+                           uint32_t *resource_id, uint8_t **mapping)
+{
+    struct gpu_res_create_args args = {
+        .kind = GPU_RES_KIND_BUFFER,
+        .flags = GPU_RES_FLAG_HOST_COHERENT,
+        .size = size,
+    };
+    long id = __syscall2(SYS_GPU_RES_CREATE, ctx_id, (long)&args);
+    if (id <= 0)
+        return -1;
+    long va = __syscall1(SYS_GPU_RES_MAP, id);
+    /* Osito ELF processes currently execute in ring 0 with the kernel's
+     * shared upper-half PML4, so a valid mapped blob is a negative signed
+     * long (0xFFFF...).  Only a null mapping is failure here. */
+    if (va == 0)
+        return -1;
+    *resource_id = (uint32_t)id;
+    *mapping = (uint8_t *)va;
     return 0;
 }
 
@@ -373,5 +358,219 @@ int venus_wire_wait_reply(struct venus_wire *w, uint64_t reply_id,
             return (int)copy;
         }
     }
-    return -110 /* ETIMEDOUT */;
+    *resource_id = (uint32_t)id;
+    mapped = (uint8_t *)va;
+    int result = 0;
+    *mapping = mapped;
+    return result;
+}
+
+int venus_wire_resource_destroy(struct venus_wire *w, uint32_t resource_id)
+{
+    if (!w || !resource_id)
+        return -1;
+    return (int)__syscall1(SYS_GPU_RES_DESTROY, resource_id);
+}
+
+static void ring_copy(uint8_t *ring, uint32_t position,
+                      const void *source, uint32_t size)
+{
+    const uint8_t *src = source;
+    uint32_t offset = position % VN_RING_BUFFER_SIZE;
+    uint32_t first = VN_RING_BUFFER_SIZE - offset;
+    if (first > size)
+        first = size;
+    memcpy(ring + VN_RING_BUFFER_OFFSET + offset, src, first);
+    if (first < size)
+        memcpy(ring + VN_RING_BUFFER_OFFSET, src + first, size - first);
+}
+
+static int notify_ring(struct venus_wire *w)
+{
+    uint8_t command[24];
+    uint8_t *p = command;
+    put_u32(&p, VN_CMD_NOTIFY_RING);
+    put_u32(&p, 0);
+    put_u64(&p, w->ring_id);
+    put_u32(&p, ++w->seqno);
+    put_u32(&p, 0);
+    return submit_direct(w, command, sizeof(command));
+}
+
+static int wait_consumed(struct venus_wire *w, uint32_t tail)
+{
+    volatile uint32_t *head = (volatile uint32_t *)(w->ring + VN_RING_HEAD_OFFSET);
+    volatile uint32_t *status =
+        (volatile uint32_t *)(w->ring + VN_RING_STATUS_OFFSET);
+    for (uint32_t attempt = 0; attempt < 100000u; attempt++) {
+        __asm__ volatile("lfence" ::: "memory");
+        if (*head == tail)
+            return 0;
+        if (*status & 2u)
+            return -1;
+        __asm__ volatile("pause" ::: "memory");
+    }
+
+    struct {
+        long seconds;
+        long nanoseconds;
+    } delay = {0, 1000000};
+    for (uint32_t attempt = 0; attempt < 30000u; attempt++) {
+        __asm__ volatile("lfence" ::: "memory");
+        if (*head == tail)
+            return 0;
+        if (*status & 2u)
+            return -1;
+        (void)__syscall2(SYS_NANOSLEEP, (long)&delay, 0);
+    }
+    return -1;
+}
+
+struct venus_wire *venus_wire_open(int32_t ctx_id)
+{
+    if (ctx_id <= 0)
+        return 0;
+    struct venus_wire *w = malloc(sizeof(*w));
+    if (!w)
+        return 0;
+    memset(w, 0, sizeof(*w));
+    w->ctx_id = (uint32_t)ctx_id;
+    w->ring_id = 0x4f5349544f000000ull | (uint32_t)ctx_id;
+
+    if (create_resource(w->ctx_id, VN_RING_SIZE, &w->ring_resource_id,
+                        &w->ring) < 0 ||
+        create_resource(w->ctx_id, VN_REPLY_SIZE, &w->reply_resource_id,
+                        &w->reply) < 0) {
+        free(w);
+        return 0;
+    }
+    memset(w->ring, 0, VN_RING_SIZE);
+    memset(w->reply, 0, VN_REPLY_SIZE);
+
+    uint8_t command[124];
+    uint8_t *p = command;
+    put_u32(&p, VN_CMD_CREATE_RING);
+    put_u32(&p, 0);
+    put_u64(&p, w->ring_id);
+    put_u64(&p, 1);
+    put_u32(&p, VN_STRUCTURE_TYPE_RING_CREATE_INFO);
+    put_u64(&p, 0);
+    put_u32(&p, 0);
+    put_u32(&p, w->ring_resource_id);
+    put_u64(&p, 0);
+    put_u64(&p, VN_RING_SIZE);
+    put_u64(&p, 1000000);
+    put_u64(&p, VN_RING_HEAD_OFFSET);
+    put_u64(&p, VN_RING_TAIL_OFFSET);
+    put_u64(&p, VN_RING_STATUS_OFFSET);
+    put_u64(&p, VN_RING_BUFFER_OFFSET);
+    put_u64(&p, VN_RING_BUFFER_SIZE);
+    put_u64(&p, VN_RING_EXTRA_OFFSET);
+    put_u64(&p, VN_RING_EXTRA_SIZE);
+    if ((uint32_t)(p - command) != sizeof(command) ||
+        submit_direct(w, command, sizeof(command)) < 0) {
+        free(w);
+        return 0;
+    }
+    return w;
+}
+
+static int submit_ring(struct venus_wire *w, const void *prefix,
+                       uint32_t prefix_size, const void *command,
+                       uint32_t command_size, uint32_t *new_tail,
+                       int wait)
+{
+    volatile uint32_t *head = (volatile uint32_t *)(w->ring + VN_RING_HEAD_OFFSET);
+    volatile uint32_t *tail = (volatile uint32_t *)(w->ring + VN_RING_TAIL_OFFSET);
+    uint32_t total = prefix_size + command_size;
+    if (!command || !command_size || total > VN_RING_BUFFER_SIZE)
+        return -1;
+
+    uint32_t current_tail = *tail;
+    for (uint32_t attempt = 0; attempt < 100000000u; attempt++) {
+        __asm__ volatile("lfence" ::: "memory");
+        if (current_tail - *head <= VN_RING_BUFFER_SIZE - total)
+            break;
+        if (attempt == 99999999u)
+            return -1;
+        __asm__ volatile("pause" ::: "memory");
+    }
+
+    if (prefix_size)
+        ring_copy(w->ring, current_tail, prefix, prefix_size);
+    ring_copy(w->ring, current_tail + prefix_size, command, command_size);
+    *new_tail = current_tail + total;
+    __asm__ volatile("mfence" ::: "memory");
+    *tail = *new_tail;
+    __asm__ volatile("mfence" ::: "memory");
+    if (notify_ring(w) < 0)
+        return -1;
+    return wait ? wait_consumed(w, *new_tail) : 0;
+}
+
+int venus_wire_call(struct venus_wire *w, const void *command,
+                    uint32_t command_size, void *reply,
+                    uint32_t reply_size)
+{
+    if (!w || !reply || !reply_size || reply_size > VN_REPLY_SIZE)
+        return -1;
+    wire_lock(w);
+    memset(w->reply, 0, reply_size);
+    __asm__ volatile("mfence" ::: "memory");
+
+    uint8_t set_reply[36];
+    uint8_t *p = set_reply;
+    put_u32(&p, VN_CMD_SET_REPLY_STREAM);
+    put_u32(&p, 0);
+    put_u64(&p, 1);
+    put_u32(&p, w->reply_resource_id);
+    put_u64(&p, 0);
+    put_u64(&p, reply_size);
+
+    uint32_t tail = 0;
+    int rc = submit_ring(w, set_reply, sizeof(set_reply), command,
+                         command_size, &tail, 1);
+    if (rc == 0) {
+        __asm__ volatile("mfence" ::: "memory");
+        memcpy(reply, w->reply, reply_size);
+        if (*(volatile uint32_t *)(w->ring + VN_RING_STATUS_OFFSET) & 2u)
+            rc = -1;
+    }
+    if (rc < 0) {
+        uint32_t command_type = 0;
+        memcpy(&command_type, command, sizeof(command_type));
+        printf("[VN wire] command=%u bytes=%u capacity=%u head=%u tail=%u "
+               "status=0x%x\n", command_type, command_size,
+               VN_RING_BUFFER_SIZE,
+               *(volatile uint32_t *)(w->ring + VN_RING_HEAD_OFFSET),
+               *(volatile uint32_t *)(w->ring + VN_RING_TAIL_OFFSET),
+               *(volatile uint32_t *)(w->ring + VN_RING_STATUS_OFFSET));
+    }
+    wire_unlock(w);
+    return rc;
+}
+
+int venus_wire_submit_async(struct venus_wire *w, const void *command,
+                            uint32_t command_size)
+{
+    if (!w)
+        return -1;
+    wire_lock(w);
+    uint32_t tail = 0;
+    int rc = submit_ring(w, 0, 0, command, command_size, &tail, 0);
+    wire_unlock(w);
+    return rc;
+}
+
+void venus_wire_close(struct venus_wire *w)
+{
+    if (!w)
+        return;
+    uint8_t command[16];
+    uint8_t *p = command;
+    put_u32(&p, VN_CMD_DESTROY_RING);
+    put_u32(&p, 0);
+    put_u64(&p, w->ring_id);
+    (void)submit_direct(w, command, sizeof(command));
+    free(w);
 }

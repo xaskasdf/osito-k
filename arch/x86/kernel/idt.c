@@ -11,6 +11,9 @@
 
 #include "../include/types.h"
 #include "../include/paging.h"
+#include "../include/interrupt.h"
+#include "../include/cpu_features.h"
+#include "smp.h"
 
 /* ── External functions ──────────────────────────────────────── */
 
@@ -104,19 +107,7 @@ static idt_ptr_t   idtr;
 
 /* ── Interrupt frame pushed by CPU + our stub ────────────────── */
 
-typedef struct __attribute__((packed)) {
-    /* Pushed by our stub (isr_common) */
-    uint64_t r15, r14, r13, r12, r11, r10, r9, r8;
-    uint64_t rbp, rdi, rsi, rdx, rcx, rbx, rax;
-    uint64_t vector;
-    uint64_t error_code;  /* CPU pushes for some vectors, stub pushes 0 for others */
-    /* Pushed by CPU on interrupt */
-    uint64_t rip;
-    uint64_t cs;
-    uint64_t rflags;
-    uint64_t rsp;
-    uint64_t ss;
-} interrupt_frame_t;
+typedef x86_interrupt_frame_t interrupt_frame_t;
 
 /* ── ISR stub declarations (defined in isr_stubs.S) ──────────── */
 
@@ -156,7 +147,8 @@ extern void isr_stub_31(void);
 extern void isr_stub_32(void);   /* APIC timer */
 extern void isr_stub_33(void);   /* Keyboard IRQ */
 extern void isr_stub_40(void);   /* I211 NIC MSI */
-extern void isr_stub_41(void);   /* RTL8111 NIC MSI */
+extern void isr_stub_41(void);   /* Win32 __fastfail (INT 0x29) */
+extern void isr_stub_42(void);   /* RTL8111 NIC MSI */
 extern void isr_stub_default(void);  /* vectors 34-255 */
 
 /* Keyboard handler */
@@ -253,7 +245,9 @@ static inline void wrmsr(uint32_t msr, uint64_t val) {
  * any allocations can corrupt the original.
  */
 
-#define GDT_MAX_ENTRIES 32
+#define GDT_MAX_ENTRIES 68
+#define GDT_TSS_BSP_INDEX 32
+#define GDT_TSS_AP_INDEX(cpu_index) (34 + ((cpu_index) * 2))
 uint64_t kernel_gdt[GDT_MAX_ENTRIES] __attribute__((aligned(16)));
 
 struct __attribute__((packed)) {
@@ -295,8 +289,13 @@ static void gdt_init(void)
     kernel_gdt[18] = 0x00AF9A000000FFFFULL; /* 0x90: 64-bit SYSCALL code */
     kernel_gdt[19] = 0x00CF92000000FFFFULL; /* 0x98: SYSCALL data */
 
-    /* Load our GDT */
-    kernel_gdtr.limit = (uint16_t)((uint64_t)entries * 8 - 1);
+    /* Keep the complete table visible so AP-specific TSS descriptors can be
+     * installed after heap initialization without reloading every CPU's GDTR. */
+    for (int i = entries; i < GDT_MAX_ENTRIES; i++)
+        kernel_gdt[i] = 0;
+    for (int i = GDT_TSS_BSP_INDEX; i < GDT_MAX_ENTRIES; i++)
+        kernel_gdt[i] = 0;
+    kernel_gdtr.limit = (uint16_t)(sizeof(kernel_gdt) - 1);
     kernel_gdtr.base  = (uint64_t)kernel_gdt;
 
     __asm__ volatile ("lgdt %0" : : "m"(kernel_gdtr));
@@ -316,12 +315,12 @@ static void gdt_init(void)
  */
 struct __attribute__((packed)) tss64 {
     uint32_t reserved0;
-    uint64_t rsp0;      /* Ring 0 stack (unused — we're already ring 0) */
+    uint64_t rsp0;      /* Ring-3 compatibility transitions */
     uint64_t rsp1;
     uint64_t rsp2;
     uint64_t reserved1;
     uint64_t ist1;      /* IST1: INT 0x2E (compat32 dispatch) */
-    uint64_t ist2;      /* IST2: available for future use */
+    uint64_t ist2;      /* IST2: debug and DOS traps */
     uint64_t ist3;
     uint64_t ist4;
     uint64_t ist5;
@@ -363,70 +362,139 @@ uint8_t ist2_stack[IST2_STACK_SIZE] __attribute__((aligned(16)));
 #define IST3_STACK_SIZE 32768
 uint8_t ist3_stack[IST3_STACK_SIZE] __attribute__((aligned(16)));
 
-/*
- * Install TSS: write descriptor to GDT index 10-11 (selector 0x50),
- * configure IST1, and load TR.
- *
- * TSS descriptor in 64-bit mode occupies 16 bytes (2 GDT entries):
- *   Entry N:   [limit 15:0] [base 15:0] [base 23:16] [type=0x9,P=1] [limit 19:16] [base 31:24]
- *   Entry N+1: [base 63:32] [reserved]
- */
+/* Regular asynchronous interrupts use IST4 rather than the interrupted SysV
+ * stack. The BSP scheduler copies live frames out before IST4 can be reused. */
+#define IST4_STACK_SIZE 262144
+#define IST5_STACK_SIZE 32768
+#define IST6_STACK_SIZE 32768
+#define IST7_STACK_SIZE 32768
+static uint8_t ist4_stack[IST4_STACK_SIZE] __attribute__((aligned(16)));
+static uint8_t ist5_stack[IST5_STACK_SIZE] __attribute__((aligned(16)));
+static uint8_t ist6_stack[IST6_STACK_SIZE] __attribute__((aligned(16)));
+static uint8_t ist7_stack[IST7_STACK_SIZE] __attribute__((aligned(16)));
+
+/* APs do not run compat32/DOS dispatch, but every IDT IST selector still needs
+ * valid CPU-local storage for faults and unexpected software interrupts. */
+#define AP_IST1_STACK_SIZE 32768
+#define AP_IST2_STACK_SIZE 32768
+#define AP_IST3_STACK_SIZE 65536
+#define AP_IST4_STACK_SIZE 262144
+#define AP_IST5_STACK_SIZE 32768
+#define AP_IST6_STACK_SIZE 32768
+#define AP_IST7_STACK_SIZE 32768
+#define AP_IST_TOTAL_SIZE (AP_IST1_STACK_SIZE + AP_IST2_STACK_SIZE + \
+                           AP_IST3_STACK_SIZE + AP_IST4_STACK_SIZE + \
+                           AP_IST5_STACK_SIZE + AP_IST6_STACK_SIZE + \
+                           AP_IST7_STACK_SIZE)
+
+typedef struct {
+    struct tss64 tss;
+    uint8_t *stacks;
+    uint16_t selector;
+    bool prepared;
+} ap_tss_state_t;
+
+static ap_tss_state_t ap_tss[SMP_MAX_CPUS] __attribute__((aligned(16)));
+
+static void tss_install_descriptor(uint32_t index, struct tss64 *tss)
+{
+    uint64_t base = (uint64_t)tss;
+    uint32_t limit = sizeof(*tss) - 1;
+    uint64_t lo = 0;
+
+    lo |= (uint64_t)(limit & 0xFFFF);
+    lo |= (uint64_t)(base & 0xFFFF) << 16;
+    lo |= (uint64_t)((base >> 16) & 0xFF) << 32;
+    lo |= (uint64_t)0x89ULL << 40; /* available 64-bit TSS, present */
+    lo |= (uint64_t)((limit >> 16) & 0xF) << 48;
+    lo |= (uint64_t)((base >> 24) & 0xFF) << 56;
+
+    kernel_gdt[index] = lo;
+    kernel_gdt[index + 1] = (base >> 32) & 0xFFFFFFFF;
+    __asm__ volatile ("mfence" ::: "memory");
+}
+
 static void tss_init(void)
 {
-    /* Zero TSS, set IST1 to top of dedicated stack */
+    /* BSP TSS uses permanent, mutually independent stacks. */
     memset(&kernel_tss, 0, sizeof(kernel_tss));
     kernel_tss.ist1 = (uint64_t)(ist1_stack + IST1_STACK_SIZE);
     kernel_tss.ist2 = (uint64_t)(ist2_stack + IST2_STACK_SIZE);
     kernel_tss.ist3 = (uint64_t)(ist3_stack + IST3_STACK_SIZE);
+    kernel_tss.ist4 = (uint64_t)(ist4_stack + IST4_STACK_SIZE);
+    kernel_tss.ist5 = (uint64_t)(ist5_stack + IST5_STACK_SIZE);
+    kernel_tss.ist6 = (uint64_t)(ist6_stack + IST6_STACK_SIZE);
+    kernel_tss.ist7 = (uint64_t)(ist7_stack + IST7_STACK_SIZE);
+    kernel_tss.rsp0 = kernel_tss.ist4;
     kernel_tss.iopb_offset = sizeof(struct tss64);
     tss_ist1_ptr = &kernel_tss.ist1;
     tss_ist2_ptr = &kernel_tss.ist2;
 
-    /* Build TSS descriptor at GDT index 10 (selector 0x50) */
-    uint64_t base = (uint64_t)&kernel_tss;
-    uint32_t limit = sizeof(struct tss64) - 1;
-
-    /*
-     * GDT entry (low qword):
-     *   bits  0-15: limit[15:0]
-     *   bits 16-31: base[15:0]
-     *   bits 32-39: base[23:16]
-     *   bits 40-43: type (0x9 = 64-bit TSS available)
-     *   bit  44:    S=0 (system segment)
-     *   bits 45-46: DPL=0
-     *   bit  47:    P=1 (present)
-     *   bits 48-51: limit[19:16]
-     *   bits 52-55: flags (G=0, AVL=0)
-     *   bits 56-63: base[31:24]
-     */
-    uint64_t lo = 0;
-    lo |= (uint64_t)(limit & 0xFFFF);                    /* limit[15:0] */
-    lo |= (uint64_t)(base & 0xFFFF) << 16;               /* base[15:0] */
-    lo |= (uint64_t)((base >> 16) & 0xFF) << 32;         /* base[23:16] */
-    lo |= (uint64_t)0x89ULL << 40;                        /* type=0x9, P=1 */
-    lo |= (uint64_t)((limit >> 16) & 0xF) << 48;         /* limit[19:16] */
-    lo |= (uint64_t)((base >> 24) & 0xFF) << 56;         /* base[31:24] */
-
-    /* High qword: base[63:32] */
-    uint64_t hi = (base >> 32) & 0xFFFFFFFF;
-
-    kernel_gdt[10] = lo;
-    kernel_gdt[11] = hi;
-
-    /* Update GDT limit to include TSS descriptor (index 10-11 = 12 entries min) */
-    int current_entries = (kernel_gdtr.limit + 1) / 8;
-    if (current_entries < 12) {
-        kernel_gdtr.limit = 12 * 8 - 1;
-        __asm__ volatile ("lgdt %0" : : "m"(kernel_gdtr));
-    }
+    tss_install_descriptor(GDT_TSS_BSP_INDEX, &kernel_tss);
 
     /* Load Task Register */
-    uint16_t tss_sel = 10 * 8;  /* 0x50 */
+    uint16_t tss_sel = GDT_TSS_BSP_INDEX * 8;
     __asm__ volatile ("ltr %0" : : "r"(tss_sel));
 
-    serial_puts("[TSS] Installed at GDT 0x50, IST1=0x");
+    serial_puts("[TSS] BSP installed, IST1=0x");
     serial_puthex(kernel_tss.ist1, 16);
+    serial_puts(" IST4=0x");
+    serial_puthex(kernel_tss.ist4, 16);
     serial_puts("\n");
+}
+
+/* The BSP prepares each AP's TSS before SIPI, while allocation and GDT
+ * mutation are serialized. */
+int x86_tss_prepare_ap(uint32_t cpu_index)
+{
+    if (cpu_index >= SMP_MAX_CPUS) return -1;
+    ap_tss_state_t *state = &ap_tss[cpu_index];
+    if (state->prepared) return 0;
+
+    extern void *mem_alloc_aligned(uint64_t size, uint64_t alignment);
+    void *phys = mem_alloc_aligned(AP_IST_TOTAL_SIZE, 4096);
+    if (!phys) return -1;
+
+    uint8_t *cursor = (uint8_t *)PHYS_TO_VIRT(phys);
+    state->stacks = cursor;
+    memset(cursor, 0, AP_IST_TOTAL_SIZE);
+    memset(&state->tss, 0, sizeof(state->tss));
+
+    cursor += AP_IST1_STACK_SIZE; state->tss.ist1 = (uint64_t)cursor;
+    cursor += AP_IST2_STACK_SIZE; state->tss.ist2 = (uint64_t)cursor;
+    cursor += AP_IST3_STACK_SIZE; state->tss.ist3 = (uint64_t)cursor;
+    cursor += AP_IST4_STACK_SIZE; state->tss.ist4 = (uint64_t)cursor;
+    cursor += AP_IST5_STACK_SIZE; state->tss.ist5 = (uint64_t)cursor;
+    cursor += AP_IST6_STACK_SIZE; state->tss.ist6 = (uint64_t)cursor;
+    cursor += AP_IST7_STACK_SIZE; state->tss.ist7 = (uint64_t)cursor;
+    state->tss.rsp0 = state->tss.ist4;
+    state->tss.iopb_offset = sizeof(struct tss64);
+
+    uint32_t index = GDT_TSS_AP_INDEX(cpu_index);
+    state->selector = (uint16_t)(index * 8);
+    tss_install_descriptor(index, &state->tss);
+    state->prepared = true;
+    return 0;
+}
+
+/* The AP loads TR before programming its LAPIC timer or enabling IF. */
+int x86_tss_load_ap(uint32_t cpu_index)
+{
+    if (cpu_index >= SMP_MAX_CPUS || !ap_tss[cpu_index].prepared)
+        return -1;
+    uint16_t selector = ap_tss[cpu_index].selector;
+    __asm__ volatile ("ltr %0" : : "r"(selector));
+    return 0;
+}
+
+void x86_tss_reset_ist1(void)
+{
+    kernel_tss.ist1 = (uint64_t)(ist1_stack + IST1_STACK_SIZE);
+}
+
+void x86_tss_reset_rsp0(void)
+{
+    kernel_tss.rsp0 = (uint64_t)(ist4_stack + IST4_STACK_SIZE);
 }
 
 /* ── State ───────────────────────────────────────────────────── */
@@ -434,12 +502,15 @@ static void tss_init(void)
 static volatile uint64_t tick_count;
 static bool apic_enabled;
 static uint32_t apic_timer_init_saved;
+uint32_t bsp_apic_id_global;
+uint32_t isr_tsc_aux_enabled;
 
 /* TSC-deadline mode state */
 static bool     tsc_deadline_mode;
 static uint64_t tsc_freq;              /* TSC cycles per second */
 static uint64_t tsc_last_tick;         /* TSC value of last virtual 100Hz tick */
 #define MSR_IA32_TSC_DEADLINE  0x6E0
+#define MSR_IA32_TSC_AUX       0xC0000103
 #define APIC_TIMER_TSC_DEADLINE  0x40000  /* LVT bits 18:17 = 10b */
 
 static inline uint64_t idt_rdtsc(void)
@@ -452,6 +523,13 @@ static inline uint64_t idt_rdtsc(void)
 uint64_t idt_get_ticks(void) { return tick_count; }
 uint64_t idt_get_tsc_freq(void) { return tsc_freq; }
 bool     idt_tsc_deadline_active(void) { return tsc_deadline_mode; }
+uint32_t idt_get_bsp_apic_id(void) { return bsp_apic_id_global; }
+
+void idt_set_current_apic_id(uint32_t apic_id)
+{
+    if (isr_tsc_aux_enabled)
+        wrmsr(MSR_IA32_TSC_AUX, apic_id & 0xFFU);
+}
 
 /*
  * Arm a hardware write watchpoint on a 4-byte address.
@@ -772,11 +850,12 @@ void isr_handler(interrupt_frame_t *frame)
         }
     }
 
-    /* EARLY check: code execution outside DLL range in compat32 mode.
-     * Must run BEFORE crash dump which reads Code@RIP — reading from
-     * unmapped addresses (0xFFFF1017) would cause a nested exception. */
+    /* UT99-specific recovery for attempts to execute invalid bytecode as
+     * native instructions. Other PE32 programs legitimately load modules and
+     * JIT code above 0x20000000; their faults must reach the SEH dispatcher. */
+    extern int g_compat32_ut99;
     if ((frame->cs & 0xFFFF) == 0x40 &&
-        (vec == 6 || vec == 13) &&
+        g_compat32_ut99 && vec == 6 &&
         (frame->rip < 0x10000000 || frame->rip >= 0x20000000)) {
         static int bytecode_fix_count = 0;
         bytecode_fix_count++;
@@ -962,6 +1041,47 @@ void isr_handler(interrupt_frame_t *frame)
             serial_puts(":");
             serial_putdec(line);
             serial_puts("\n");
+        } else if ((g_swbreak_addr >= 0x00454D08 &&
+                    g_swbreak_addr <= 0x00454D8B) ||
+                   (g_swbreak_addr >= 0x004B6210 &&
+                    g_swbreak_addr <= 0x004B674F)) {
+            static const uint32_t steam_bisect[] = {
+                0x00454D08, 0x00454D0F, 0x00454D14,
+                0x004B6210, 0x004B6211, 0x004B631F, 0x004B6417,
+                0x004B6536, 0x004B6602, 0x004B6650, 0x004B66FB,
+                0x004B673E, 0x004B6741, 0x004B674F,
+                0x00454D41, 0x00454D8B
+            };
+            serial_puts(g_swbreak_addr == 0x00454D08 ? " EAX=0x" : " EDI=0x");
+            serial_puthex(g_swbreak_addr == 0x00454D08
+                              ? (uint32_t)frame->rax
+                              : (uint32_t)frame->rdi,
+                          8);
+            if (g_swbreak_addr >= 0x004B6210) {
+                uint32_t ebp = (uint32_t)frame->rbp;
+                serial_puts(" ESP-EBP=");
+                serial_putdec((int32_t)((uint32_t)frame->rsp - ebp));
+                serial_puts(" slots=");
+                serial_puthex(*(uint32_t *)(uintptr_t)(ebp - 20), 8);
+                serial_puts("/");
+                serial_puthex(*(uint32_t *)(uintptr_t)(ebp - 16), 8);
+                serial_puts("/");
+                serial_puthex(*(uint32_t *)(uintptr_t)(ebp - 12), 8);
+            }
+            serial_puts("\n");
+
+            *(uint8_t *)(uintptr_t)g_swbreak_addr = g_swbreak_saved;
+            frame->rip = g_swbreak_addr;
+            for (uint32_t i = 0; i + 1 < sizeof(steam_bisect) / sizeof(steam_bisect[0]); i++) {
+                if (steam_bisect[i] != g_swbreak_addr)
+                    continue;
+                g_swbreak_addr = steam_bisect[i + 1];
+                g_swbreak_saved = *(uint8_t *)(uintptr_t)g_swbreak_addr;
+                *(uint8_t *)(uintptr_t)g_swbreak_addr = 0xCC;
+                return;
+            }
+            g_swbreak_addr = 0;
+            return;
         } else {
             serial_puts(" ESP=0x");
             serial_puthex(frame->rsp, 8);
@@ -974,12 +1094,60 @@ void isr_handler(interrupt_frame_t *frame)
         return;
     }
 
-    /* IAT auto-recovery: if execution reaches heap (0x40xxxxxx), the engine
-     * jumped to a corrupted IAT entry. Scan .idata for the corrupt value,
-     * resolve the original function via dll_resolve_iat_original(), fix it. */
-    if (vec == 14 || vec == 6 /* #UD */) {
+    /* Native Win32 children currently have no PE64 breakpoint-dispatch path.
+     * Continue past an INT3 while debugging CEF instead of killing the helper
+     * and leaving the parent blocked forever waiting for its service. The CPU
+     * has already advanced RIP past the one-byte instruction. */
+    if (vec == 3 && (frame->cs & 0xFFFF) == 0x38 &&
+        frame->rip >= 0xFFFF800000000000ULL) {
+        extern uint64_t *win32_current_child_jmpbuf(void);
+        if (win32_current_child_jmpbuf()) {
+            const uint8_t *code = (const uint8_t *)(frame->rip - 1);
+            extern void dll_debug_log_address(void *address);
+            serial_puts("[PE64-BP] continued at rip=0x");
+            serial_puthex(frame->rip, 16);
+            serial_puts(" pid=");
+            serial_putdec(proc_current_pid());
+            serial_puts("\n");
+            dll_debug_log_address((void *)(frame->rip - 1));
+            serial_puts("[PE64-BP-BYTES]");
+            for (int i = 0; i < 16; i++) {
+                serial_puts(" ");
+                serial_puthex(code[i], 2);
+            }
+            serial_puts("\n");
+            return;
+        }
+    }
+
+    /* Chromium's official PE64 build uses `int3; ud2; xor eax,eax` for a
+     * NOTREACHED diagnostic with a valid false-return fallback immediately
+     * after the trap pair. Continue only that exact byte signature. */
+    if (vec == 6 && (frame->cs & 0xFFFF) == 0x38 &&
+        frame->rip >= 0xFFFF800000000001ULL) {
+        const uint8_t *code = (const uint8_t *)frame->rip;
+        extern uint64_t *win32_current_child_jmpbuf(void);
+        if (win32_current_child_jmpbuf() && code[-1] == 0xCC &&
+            code[0] == 0x0F && code[1] == 0x0B &&
+            code[2] == 0x31 && code[3] == 0xC0) {
+            serial_puts("[PE64-TRAP] continued fallback at rip=0x");
+            serial_puthex(frame->rip, 16);
+            serial_puts(" pid=");
+            serial_putdec(proc_current_pid());
+            serial_puts("\n");
+            frame->rip += 2;
+            return;
+        }
+    }
+
+    /* UT99 IAT recovery is tied to Engine.dll's fixed PE32 layout. Never
+     * probe those addresses in another process: the exception handler itself
+     * would otherwise fault while trying to diagnose unrelated PE32 code. */
+    if ((vec == 14 || vec == 6 /* #UD */) &&
+        current_win32_exe_is("UnrealTournament.exe")) {
         uint64_t fault_rip = frame->rip;
-        if (fault_rip >= 0x40000000ULL && fault_rip < 0x80000000ULL) {
+        if (fault_rip >= 0x40000000ULL && fault_rip < 0x80000000ULL &&
+            current_cr3_range_is_mapped(0x105A5000ULL, 7 * 4096ULL)) {
             uint32_t corrupt = (uint32_t)fault_rip;
             /* Scan Engine.dll .idata (0x105A5000, 7 pages) */
             volatile uint32_t *idata = (volatile uint32_t *)(uintptr_t)0x105A5000;
@@ -1056,6 +1224,10 @@ void isr_handler(interrupt_frame_t *frame)
         uint64_t cr2;
         __asm__ volatile ("mov %%cr2, %0" : "=r"(cr2));
         if (cr2 >= 0x100000ULL) {
+            extern int nt_section_page_fault(uint64_t addr,
+                                             uint64_t error_code);
+            if (nt_section_page_fault(cr2, frame->error_code) == 0)
+                return;
             extern int demand_page_fault(uint64_t addr, uint64_t error_code);
             if (demand_page_fault(cr2, frame->error_code) == 0)
                 return;
@@ -1068,13 +1240,12 @@ void isr_handler(interrupt_frame_t *frame)
          * unless a native DOS VM is active and in mode 13h). */
         extern void dos_vga_mode13_present(void);
         dos_vga_mode13_present();
-        /* In TSC-deadline mode, advance tick_count based on elapsed TSC
-         * to maintain a stable ~100Hz virtual tick for TCP/timers/display.
-         * In periodic mode, simply increment. */
-        if (tsc_deadline_mode) {
+        /* Base time on elapsed TSC in both timer modes. sched_yield() raises
+         * this vector in software, so blindly incrementing in periodic mode
+         * made every cooperative yield advance the clock by 10 ms. */
+        if (tsc_freq && tsc_last_tick) {
             uint64_t now_tsc = idt_rdtsc();
             uint64_t tsc_per_tick = tsc_freq / 100;
-            if (tsc_last_tick == 0) tsc_last_tick = now_tsc;
             while (now_tsc - tsc_last_tick >= tsc_per_tick) {
                 tick_count++;
                 tsc_last_tick += tsc_per_tick;
@@ -1087,13 +1258,14 @@ void isr_handler(interrupt_frame_t *frame)
         extern void vdso_update(void);
         vdso_update();
 
-        /* IAT watchdog: restore Engine.dll StaticLoadClass on every tick.
+        /* UT99 IAT watchdog: restore Engine.dll StaticLoadClass on every tick.
          * The Unreal package loader overwrites this between INT 0x2E calls,
-         * so the compat32_dispatch guard alone isn't fast enough. Only
-         * runs when a PE32 binary is loaded — without this gate the
+         * so the compat32_dispatch guard alone isn't fast enough. It runs
+         * only for UT99 — without this gate the
          * watchdog would touch unmapped low VA from any process CR3. */
-        extern int g_compat32_mode;
-        if (g_compat32_mode) {
+        extern int *proc_win32_compat32_mode_slot(void);
+        extern int g_compat32_ut99;
+        if (*proc_win32_compat32_mode_slot() && g_compat32_ut99) {
             static uint32_t iat_orig = 0;
             volatile uint32_t *iat = (volatile uint32_t *)(uintptr_t)0x105A5E08;
             if (!iat_orig && *iat >= 0x10100000 && *iat < 0x10200000)
@@ -1132,8 +1304,26 @@ void isr_handler(interrupt_frame_t *frame)
         }
 
         /* X-SCHED: preemptive scheduler — check quantum, switch if expired.
-         * frame points to saved GPRs on the current process's stack. */
+         * frame points to saved GPRs on the BSP's IRQ IST. */
+        uint64_t interrupted_rip = frame->rip;
         sched_tick(frame);
+
+        /* With no context switch pending, isr_common consumes this live IST
+         * frame. A timer tick must not rewrite its return RIP. */
+        {
+            extern volatile uint64_t sched_switch_rsp;
+            static uint32_t live_rip_clobber_logs;
+            if (!sched_switch_rsp && frame->rip != interrupted_rip) {
+                if (live_rip_clobber_logs++ < 32) {
+                    serial_puts("[SCHED-LIVE-RIP-CLOBBER] old=0x");
+                    serial_puthex(interrupted_rip, 16);
+                    serial_puts(" new=0x");
+                    serial_puthex(frame->rip, 16);
+                    serial_puts("\n");
+                }
+                frame->rip = interrupted_rip;
+            }
+        }
 
         /* TSC-deadline: reprogram next deadline based on current process's QoS.
          * In periodic mode, the APIC timer auto-reloads — nothing to do. */
@@ -1168,8 +1358,31 @@ void isr_handler(interrupt_frame_t *frame)
         return;
     }
 
-    /* RTL8111 NIC MSI interrupt */
+    /* Windows reserves INT 0x29 for __fastfail. Keep it separate from
+     * hardware MSI vectors and terminate the active Win32 process without
+     * attempting recoverable SEH dispatch. */
     if (vec == 41) {
+        const int32_t fast_fail_status = (int32_t)0xC0000409u;
+        serial_puts("[WIN32-FASTFAIL] code=0x");
+        serial_puthex((uint32_t)frame->rcx, 8);
+        serial_puts(" rip=0x");
+        serial_puthex(frame->rip, 16);
+        serial_puts("\n");
+
+        extern int win32_terminate_current_child(int32_t status);
+        extern int win32_terminate_current_main(int32_t status);
+        if (win32_terminate_current_child(fast_fail_status) ||
+            win32_terminate_current_main(fast_fail_status))
+            return;
+
+        extern void proc_exit(int32_t code);
+        if (proc_current_pid() > 1)
+            proc_exit(fast_fail_status);
+        return;
+    }
+
+    /* RTL8111 NIC MSI interrupt */
+    if (vec == 42) {
         extern void rtl8111_isr(void) __attribute__((weak));
         if (rtl8111_isr) rtl8111_isr();
         apic_write(APIC_EOI, 0);
@@ -1724,6 +1937,10 @@ void isr_handler(interrupt_frame_t *frame)
         serial_puts("  RSP = 0x");
         serial_puthex(frame->rsp, 16);
         serial_puts("\n");
+        if (frame->rsp >= (uint64_t)ist3_stack &&
+            frame->rsp < (uint64_t)(ist3_stack + IST3_STACK_SIZE)) {
+            serial_puts("  [FAULT-IST-REENTRY] saved RSP is inside IST3\n");
+        }
 
         serial_puts("  RAX = 0x");
         serial_puthex(frame->rax, 16);
@@ -1757,6 +1974,181 @@ void isr_handler(interrupt_frame_t *frame)
         serial_puts("  R13 = 0x"); serial_puthex(frame->r13, 16); serial_puts("\n");
         serial_puts("  R14 = 0x"); serial_puthex(frame->r14, 16);
         serial_puts("  R15 = 0x"); serial_puthex(frame->r15, 16); serial_puts("\n");
+
+        /* Resolve the instruction page through the faulting address space and
+         * dump its PMM history before process teardown can overwrite it. This
+         * catches stale mappings where a live PE code page was freed and then
+         * reused by an unrelated kernel allocation. */
+        if (vec == 14) {
+            uint64_t active_cr3;
+            uint64_t rip_phys;
+
+            __asm__ volatile ("mov %%cr3, %0" : "=r"(active_cr3));
+            rip_phys = paging_translate_in_cr3(active_cr3, frame->rip);
+            serial_puts("  [PF-RIP-PHYS] cr3=0x");
+            serial_puthex(active_cr3, 16);
+            serial_puts(" rip-phys=0x");
+            serial_puthex(rip_phys, 16);
+            serial_puts("\n");
+            if (rip_phys != UINT64_MAX)
+                mem_debug_dump_page(rip_phys);
+        }
+
+        /* tier0's page-map decoder leaves enough state in volatile registers
+         * to recover the source metadata slot after its decoded AA pointer
+         * faults. Read through the physical mirror so a bad diagnostic VA
+         * cannot recursively page-fault inside the exception handler. */
+        if (vec == 14 && (frame->cs & 0xFFFF) == 0x38 &&
+            frame->rdx == 0xFFFFAAAAAAAAAA80ULL) {
+            uint64_t cr3;
+            uint64_t target = frame->rsi;
+            uint64_t cache = frame->r10;
+            uint64_t band = (target >> 30) & 0xFULL;
+            uint64_t cache_entry = cache + band * 16;
+            uint64_t key = 0, table = 0, slot = 0;
+            uint64_t slot_value = 0, slot_phys = UINT64_MAX;
+            uint64_t output_value = 0, output_phys = UINT64_MAX;
+            bool cache_ok;
+
+            __asm__ volatile ("mov %%cr3, %0" : "=r"(cr3));
+            cache_ok = debug_read_u64_in_cr3(cr3, cache_entry, &key, NULL) &&
+                       debug_read_u64_in_cr3(cr3, cache_entry + 8,
+                                             &table, NULL);
+            if (cache_ok && table) {
+                slot = table + (((target >> 12) & 0x3FFFFULL) * 8);
+                debug_read_u64_in_cr3(cr3, slot, &slot_value, &slot_phys);
+            }
+            debug_read_u64_in_cr3(cr3, frame->rax, &output_value,
+                                  &output_phys);
+
+            serial_puts("  [TIER0-AA] target=0x");
+            serial_puthex(target, 16);
+            serial_puts(" cache=0x");
+            serial_puthex(cache, 16);
+            serial_puts(" band=");
+            serial_putdec(band);
+            serial_puts("\n  [TIER0-AA] key=0x");
+            serial_puthex(key, 16);
+            serial_puts(" table=0x");
+            serial_puthex(table, 16);
+            serial_puts(" slot=0x");
+            serial_puthex(slot, 16);
+            serial_puts("\n  [TIER0-AA] slot-phys=0x");
+            serial_puthex(slot_phys, 16);
+            serial_puts(" slot-value=0x");
+            serial_puthex(slot_value, 16);
+            serial_puts(" output-phys=0x");
+            serial_puthex(output_phys, 16);
+            serial_puts(" output-value=0x");
+            serial_puthex(output_value, 16);
+            serial_puts("\n");
+            if (slot_phys != UINT64_MAX)
+                mem_debug_dump_page(slot_phys);
+        }
+
+        /* Temporary native PE64 crash probe. Preserve the raw return chain
+         * before recovery tears down the process. Keep all reads within the
+         * current upper-half user stack. */
+        if ((frame->cs & 0xFFFF) == 0x38) {
+            extern void dll_debug_log_address(void *address);
+            extern void dll_debug_log_delay_failure(void *address,
+                                                     void *info);
+            dll_debug_log_address((void *)frame->rip);
+            if (vec == 3) {
+                void *delay_info = (void *)frame->rdx;
+                uint64_t active_cr3;
+                uint64_t saved_delay_info;
+
+                /* libcef's delay-load fatal helper saves its incoming RSI
+                 * after three pushes and a 0x150-byte local frame. The outer
+                 * helper keeps DelayLoadInfo in RSI, so the saved value at
+                 * RSP+0x160 is the original pointer. Read it through the
+                 * active page tables because Win64 stacks live in the lower
+                 * half and cannot be dereferenced through the kernel CR3. */
+                __asm__ volatile ("mov %%cr3, %0" : "=r"(active_cr3));
+                if (frame->rsp <= UINT64_MAX - 0x160ULL &&
+                    debug_read_u64_in_cr3(active_cr3, frame->rsp + 0x160ULL,
+                                          &saved_delay_info, NULL))
+                    delay_info = (void *)saved_delay_info;
+
+                dll_debug_log_delay_failure((void *)frame->rip,
+                                            delay_info);
+            }
+        }
+
+        if ((frame->cs & 0xFFFF) == 0x38 &&
+            frame->rsp >= 0xFFFF800000000000ULL &&
+            frame->rsp < 0xFFFF900000000000ULL) {
+            uint64_t *sp64 = (uint64_t *)frame->rsp;
+            extern void dll_debug_log_address(void *address);
+            if (sp64[0] >= 0x10000ULL &&
+                sp64[0] < 0x0000800000000000ULL)
+                dll_debug_log_address((void *)sp64[0]);
+            serial_puts("  [PE64-STACK]");
+            for (int i = 0; i < 48; i++) {
+                serial_puts(" ");
+                serial_puthex(sp64[i], 16);
+            }
+            serial_puts("\n");
+
+            uint64_t fp = frame->rbp;
+            serial_puts("  [PE64-FP]");
+            for (int i = 0; i < 16; i++) {
+                if ((fp & 7) != 0 || fp < frame->rsp ||
+                    fp + 16 < fp || fp + 16 > frame->rsp + 0x100000ULL)
+                    break;
+                uint64_t *frame64 = (uint64_t *)fp;
+                serial_puts(" ");
+                serial_puthex(frame64[1], 16);
+                if (frame64[0] <= fp)
+                    break;
+                fp = frame64[0];
+            }
+            serial_puts("\n");
+        }
+
+        if (frame->rip == 0 && (frame->cs & 0xFFFF) == 0x38) {
+            uint64_t active_cr3;
+            uint64_t retaddr = 0;
+            uint64_t next = 0;
+            bool have_ret;
+            bool have_next;
+
+            __asm__ volatile ("mov %%cr3, %0" : "=r"(active_cr3));
+            have_ret = debug_read_u64_in_cr3(active_cr3, frame->rsp,
+                                              &retaddr, NULL);
+            have_next = debug_read_u64_in_cr3(active_cr3, frame->rsp + 8,
+                                               &next, NULL);
+
+            serial_puts("  [NULL64] stack=0x");
+            serial_puthex(frame->rsp, 16);
+            serial_puts(" mapped=");
+            serial_putdec(have_ret ? 1 : 0);
+            serial_puts(" return=0x");
+            serial_puthex(retaddr, 16);
+            serial_puts(" next=0x");
+            serial_puthex(have_next ? next : 0, 16);
+            serial_puts("\n");
+
+            if (have_ret) {
+                extern void dll_debug_log_address(void *address);
+                dll_debug_log_address((void *)retaddr);
+            }
+
+            serial_puts("  [NULL64-STACK]");
+            for (int i = 0; i < 12; i++) {
+                uint64_t word = 0;
+                if (!debug_read_u64_in_cr3(active_cr3,
+                                           frame->rsp + (uint64_t)i * 8,
+                                           &word, NULL)) {
+                    serial_puts(" <unmapped>");
+                    break;
+                }
+                serial_puts(" ");
+                serial_puthex(word, 16);
+            }
+            serial_puts("\n");
+        }
 
         /* Kernel-mode exception extras (CS==0x08): dump CR3, SS and
          * the dword at [RSP] so post-kexec #UD/#GP can be triaged.
@@ -1892,6 +2284,14 @@ void isr_handler(interrupt_frame_t *frame)
             if (frame->error_code & 8) serial_puts("RESERVED-BIT ");
             if (frame->error_code & 16) serial_puts("INSTRUCTION-FETCH ");
             serial_puts("\n");
+
+            {
+                uint64_t active_cr3;
+                __asm__ volatile ("mov %%cr3, %0" : "=r"(active_cr3));
+                paging_debug_dump_walk_in_cr3(active_cr3, cr2);
+                extern void nt_vm_debug_address(uint64_t address);
+                nt_vm_debug_address(cr2);
+            }
 
             /* TLS diagnostic: a fault at a low linear address from user
              * code is the signature of a lost FS base (fs:[0] with
@@ -2165,16 +2565,28 @@ void isr_handler(interrupt_frame_t *frame)
             serial_puts("  [WIN32] SEH unhandled — falling through to recovery\n");
         }
 compat32_null_recovery:
+        {
+            extern uint64_t *win32_current_child_jmpbuf(void);
+            extern void kern_longjmp(uint64_t *buf, int val);
+            uint64_t *child_jmp = win32_current_child_jmpbuf();
+            if (child_jmp) {
+                serial_puts("  [WIN32] Child crashed - terminating child\n");
+                kern_longjmp(child_jmp, 3);
+            }
+        }
         /* Legacy crash recovery: longjmp back to shell */
         {
             extern uint64_t *compat32_crash_jmpbuf;
             extern void kern_longjmp(uint64_t *buf, int val);
-            if (compat32_crash_jmpbuf) {
+            /* This buffer belongs to the synchronous shell-run PE context.
+             * A spawned Win32 worker has its own kernel PID and must be
+             * zombified below; long-jumping it onto the owner's saved stack
+             * corrupts both contexts and frees DLL/TLS memory while live. */
+            if (compat32_crash_jmpbuf && proc_current_pid() <= 1) {
                 serial_puts("  [WIN32] Crash recovery — returning to shell\n");
                 /* Restore IST1 BEFORE longjmp — longjmp bypasses
                  * int2e_stub's IST1 restore, leaving it corrupted. */
-                extern uint8_t ist1_stack[];
-                kernel_tss.ist1 = (uint64_t)(ist1_stack + IST1_STACK_SIZE);
+                x86_tss_reset_ist1();
                 uint64_t *jmp = compat32_crash_jmpbuf;
                 compat32_crash_jmpbuf = NULL;
 
@@ -2369,9 +2781,14 @@ static void apic_init(void)
     extern int paging_map_mmio(uint64_t phys, uint64_t size);
     paging_map_mmio(apic_phys, 4096);
     apic_base = (volatile uint32_t *)PHYS_TO_VIRT(apic_phys);
+    bsp_apic_id_global = (apic_read(APIC_ID) >> 24) & 0xFF;
+    isr_tsc_aux_enabled = cpu_features.rdtscp ? 1U : 0U;
+    idt_set_current_apic_id(bsp_apic_id_global);
 
     serial_puts("[IDT] APIC base: 0x");
     serial_puthex(apic_phys, 16);
+    serial_puts(", BSP ID=");
+    serial_putdec(bsp_apic_id_global);
     serial_puts("\n");
 
     /* Enable APIC via SVR (spurious vector = 0xFF) */
@@ -2427,13 +2844,13 @@ static void apic_init(void)
 
     /* Calibrate TSC: PIT measured ~10ms, so TSC freq = elapsed_tsc * 100 */
     tsc_freq = (tsc_cal_end - tsc_cal_start) * 100;
+    tsc_last_tick = idt_rdtsc();
 
     if (tsc_deadline_mode) {
         /* ── TSC-Deadline mode: sub-microsecond precision ── */
         apic_write(APIC_LVT_TIMER, APIC_TIMER_TSC_DEADLINE | 32);
 
         /* Program initial 10ms deadline */
-        tsc_last_tick = idt_rdtsc();
         wrmsr(MSR_IA32_TSC_DEADLINE, tsc_last_tick + tsc_freq / 100);
 
         apic_timer_init_saved = 0;
@@ -2501,48 +2918,45 @@ void __initk idt_init(void)
         isr_stub_33
     };
 
-    /* Set exception + timer + keyboard entries with actual CS */
+    /* Exceptions use fault-class stacks; asynchronous vectors use the
+     * CPU-local IRQ stack and never touch the interrupted task's red zone. */
     for (int i = 0; i <= 33; i++) {
-        idt_set_entry(i, stubs[i], 0);
+        uint8_t ist = (i < 32) ? X86_IST_FAULT : X86_IST_IRQ;
+        idt_set_entry(i, stubs[i], ist);
         idt[i].selector = cs;
     }
 
     /* Vectors 34-255: default stub (just IRET) */
     for (int i = 34; i < 256; i++) {
-        idt_set_entry(i, isr_stub_default, 0);
+        idt_set_entry(i, isr_stub_default, X86_IST_IRQ);
         idt[i].selector = cs;
     }
 
-    /* Exceptions that can fire from compat32 mode need IST to avoid
-     * pushing 64-bit frames on the 32-bit user stack (which causes
-     * cascading #GP). Share IST1 with INT 0x2E — these handlers
-     * either halt (#UD) or return quickly (#PF null-page, #DB). */
-    idt[1].ist  = 2;  /* #DB — IST2 (TF single-step + null-page tracking) */
-    idt[3].ist  = 2;  /* #BP — IST2 (avoids IST1 collision with INT 0x2E) */
-    idt[6].ist  = 3;  /* #UD — IST3 (decoupled from INT 0x2E IST1 drift) */
-    idt[13].ist = 3;  /* #GP — IST3 */
-    idt[14].ist = 3;  /* #PF — IST3 (was IST1 — caused garbage-RBP crash
-                       * when nested INT 0x2E lowered IST1 then a #PF
-                       * fired and re-loaded RSP from the stale value) */
-    /* idt[32].ist intentionally 0: timer uses current process stack so
-     * kernel_rsp is unique per-process → context switch works correctly.
-     * compat32 ring-0 RSP is always a valid 64-bit kernel address, safe. */
+    idt[1].ist  = X86_IST_DEBUG;
+    idt[2].ist  = X86_IST_NMI;
+    idt[3].ist  = X86_IST_DEBUG;
+    idt[8].ist  = X86_IST_DF;
+    idt[18].ist = X86_IST_MC;
 
     /* Override: vector 0x71 = keyboard IRQ (uses isr_stub_33) */
-    idt_set_entry(0x71, isr_stub_33, 0);
+    idt_set_entry(0x71, isr_stub_33, X86_IST_IRQ);
     idt[0x71].selector = cs;
 
     /* Vector 40: I211 NIC MSI interrupt */
-    idt_set_entry(40, isr_stub_40, 0);
+    idt_set_entry(40, isr_stub_40, X86_IST_IRQ);
     idt[40].selector = cs;
 
-    /* Vector 41: RTL8111 NIC MSI interrupt */
-    idt_set_entry(41, isr_stub_41, 0);
+    /* Vector 41: Win32 __fastfail (INT 0x29) */
+    idt_set_entry(41, isr_stub_41, X86_IST_IRQ);
     idt[41].selector = cs;
+
+    /* Vector 42: RTL8111 NIC MSI interrupt */
+    idt_set_entry(42, isr_stub_42, X86_IST_IRQ);
+    idt[42].selector = cs;
 
     /* SMP work IPI: lightweight stub, no fxsave (safe for APs) */
     extern void isr_stub_smp_ipi(void);
-    idt_set_entry(0xFE, isr_stub_smp_ipi, 0);
+    idt_set_entry(0xFE, isr_stub_smp_ipi, X86_IST_IRQ);
     idt[0xFE].selector = cs;
 
     /* Load IDT */

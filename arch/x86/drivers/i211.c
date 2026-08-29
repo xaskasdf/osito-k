@@ -93,6 +93,21 @@ static void i211_delay(uint32_t iterations)
         __asm__ volatile ("pause");
 }
 
+static int i211_restart_autoneg(void)
+{
+    uint32_t bmcr = I211_BMCR_SPEED1000 | I211_BMCR_FD |
+                    I211_BMCR_ANRESTART | I211_BMCR_AUTOEN;
+    i211_write(I211_MDIC, I211_MDIC_PHY(1) | I211_MDIC_OP_WRITE | bmcr);
+
+    for (int i = 0; i < 100000; i++) {
+        uint32_t mdic = i211_read(I211_MDIC);
+        if (mdic & I211_MDIC_READY)
+            return (mdic & I211_MDIC_ERROR) ? -1 : 0;
+        __asm__ volatile ("pause");
+    }
+    return -1;
+}
+
 /* ── Read MAC Address from RAL/RAH ───────────────────────────── */
 
 static void i211_read_mac(void)
@@ -363,6 +378,8 @@ int __initk i211_init(uint64_t bar0_phys)
     ctrl |= I211_CTRL_SLU;
     ctrl &= ~I211_CTRL_PHY_RST;
     i211_write(I211_CTRL, ctrl);
+    if (i211_restart_autoneg() < 0)
+        serial_puts("[I211] PHY autonegotiation restart failed\n");
 
     /* Step 5: Read MAC address from RAL/RAH */
     i211_read_mac();
@@ -559,6 +576,7 @@ int i211_send(const void *data, uint32_t len)
     (void)i211_read(I211_TDT0);   /* force posted write to retire */
     __asm__ volatile ("mfence" ::: "memory");
 
+#ifndef OK_QUIET
     /* DEBUG: snapshot HW state right after kicking TDT. If TDH advances
      * past `tail` the chip fetched our descriptor; if it stays at `tail`
      * the chip is ignoring us.  Limit to first 8 sends so we don't flood
@@ -619,6 +637,7 @@ int i211_send(const void *data, uint32_t len)
         serial_puts(" RX_ISR=");                  serial_puthex(i211_isr_rx_count, 4);
         serial_puts("\n");
     }
+#endif
 
     /* Poll for completion.  Read volatile para evitar que el compilador
      * cache-ee el valor en registro durante el loop.                     */
@@ -626,6 +645,7 @@ int i211_send(const void *data, uint32_t len)
     int spins = 0;
     for (int i = 0; i < 1000000; i++) {
         if (*dd & I211_TXD_STAT_DD) {
+#ifndef OK_QUIET
             if (dbg_count < 64) {
                 serial_puts("[I211] TX-done tail=");
                 serial_putdec(tail);
@@ -680,6 +700,7 @@ int i211_recv(void *buf, uint32_t *len)
     /* DEBUG — first 8 RX events: log so we can confirm bidirectional link
      * with the peer. If TX seems silent on the wire but RX sees the peer's
      * frames, the bug is purely on the TX path. */
+#ifndef OK_QUIET
     static int rx_dbg = 0;
     if (rx_dbg < 8) {
         rx_dbg++;
@@ -688,6 +709,7 @@ int i211_recv(void *buf, uint32_t *len)
         serial_puts(" status_error=");         serial_puthex(desc->wb.status_error, 8);
         serial_puts("\n");
     }
+#endif
 
     uint32_t pkt_len = desc->wb.length;
     if (pkt_len > I211_PKT_BUF_SIZE)
@@ -702,19 +724,13 @@ int i211_recv(void *buf, uint32_t *len)
     desc->read.pkt_addr = buf_phys;
     desc->read.hdr_addr = 0;
 
-    /* Avanzar tail.  RDT se escribe DESPUÉS de invalidar el descriptor
-     * para evitar carrera con el HW DMA.
-     *
-     * Per Intel I210/I211 datasheet §7.1.6: RDT points one descriptor
-     * BEYOND the last one HW may use.  Linux igb writes RDT=next_to_use
-     * (= last-re-armed + 1).  Writing RDT=old_tail (off-by-one) means
-     * HW does NOT see the slot we just re-armed until the NEXT consume,
-     * starving the ring under bursty load — observed as "37 packets
-     * received but only 5 drained per IRQ batch" in the post-pings
-     * nic_stats snapshot. */
+    /* RDT marks the last descriptor available to hardware; rx_tail tracks
+     * the next descriptor software will inspect.  Advancing both makes
+     * RDH == RDT after one packet, which means an empty receive ring. */
+    uint32_t old_tail = tail;
     nic.rx_tail = (tail + 1) % I211_RX_RING_SIZE;
     wmb();
-    i211_write(I211_RDT0, nic.rx_tail);
+    i211_write(I211_RDT0, old_tail);
 
     return 0;
 }

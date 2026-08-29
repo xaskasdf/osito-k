@@ -1,14 +1,10 @@
-#pragma once
-/* OsitoK W5.2 stub: glslang-generated SPIR-V blob for shader 'dxvk_dummy_frag'.
- * Empty SPIR-V module header (magic + version) so SpirvCodeBuffer ctor
- * accepts it. No glslang in our Docker build path; runtime use of the
- * meta_* shader pipelines will fail until W5.4 (presenter) when we
- * either ship glslang or pre-generate the SPIR-V offline. */
-#include <stdint.h>
-static const uint32_t dxvk_dummy_frag[] = {
-  0x07230203u, /* SPIR-V magic */
-  0x00010000u, /* version 1.0 */
-  0x00000000u, /* generator id 0 */
-  0x00000001u, /* bound */
-  0x00000000u  /* schema */
+	// 1115.1.0
+	 #pragma once
+const uint32_t dxvk_dummy_frag[] = {
+	0x07230203,0x00010600,0x0008000b,0x00000006,0x00000000,0x00020011,0x00000001,0x0006000b,
+	0x00000001,0x4c534c47,0x6474732e,0x3035342e,0x00000000,0x0003000e,0x00000000,0x00000001,
+	0x0005000f,0x00000004,0x00000004,0x6e69616d,0x00000000,0x00030010,0x00000004,0x00000007,
+	0x00030003,0x00000002,0x000001c2,0x00040005,0x00000004,0x6e69616d,0x00000000,0x00020013,
+	0x00000002,0x00030021,0x00000003,0x00000002,0x00050036,0x00000002,0x00000004,0x00000000,
+	0x00000003,0x000200f8,0x00000005,0x000100fd,0x00010038
 };

@@ -73,10 +73,21 @@ int main(int argc, char **argv)
             usage();
     }
 
+    if (!dry_run) {
+        fprintf(stderr, "ositofs-defrag: writable defrag is disabled until "
+                        "extent moves are journaled; use --dry-run\n");
+        return 1;
+    }
+
     /* Open device (read-only if dry-run) */
     int fd = osfs2_open_device(device, dry_run);
     if (fd < 0) {
         fprintf(stderr, "ositofs-defrag: cannot open %s\n", device);
+        return 1;
+    }
+    if (!dry_run && osfs2_journal_recover(fd, 1) < 0) {
+        fprintf(stderr, "ositofs-defrag: journal recovery failed\n");
+        osfs2_close_device(fd);
         return 1;
     }
 
@@ -125,6 +136,8 @@ int main(int argc, char **argv)
         osfs2_close_device(fd);
         return 1;
     }
+    if (!osfs2_crc_table_enabled)
+        memset(crc_buf, 0, OSFS2_CRCTAB_SIZE);
     uint32_t *crc_tab = (uint32_t *)crc_buf;
 
     /* ── Build sorted list of valid files by start_block ────────── */
@@ -224,7 +237,7 @@ int main(int argc, char **argv)
         if (next_pos > old_start) {
             fprintf(stderr, "ositofs-defrag: BUG — would move '%s' forward "
                     "(blocks %u -> %u), aborting\n",
-                    ft[fidx].name, old_start, next_pos);
+                    osfs2_entry_name(&ft[fidx]), old_start, next_pos);
             free(blk_buf);
             free(entries);
             free(crc_buf);
@@ -237,7 +250,7 @@ int main(int argc, char **argv)
         if (next_pos + count > old_start) {
             fprintf(stderr, "ositofs-defrag: BUG — destination overlaps source "
                     "for '%s' (dst %u-%u, src %u-%u), aborting\n",
-                    ft[fidx].name, next_pos, next_pos + count - 1,
+                    osfs2_entry_name(&ft[fidx]), next_pos, next_pos + count - 1,
                     old_start, old_start + count - 1);
             free(blk_buf);
             free(entries);
@@ -249,7 +262,7 @@ int main(int argc, char **argv)
 
         if (verbose || dry_run) {
             printf("  Moving '%s' (blocks %u-%u -> %u-%u)...\n",
-                   ft[fidx].name,
+                   osfs2_entry_name(&ft[fidx]),
                    old_start, old_start + count - 1,
                    next_pos, next_pos + count - 1);
         }
@@ -262,7 +275,8 @@ int main(int argc, char **argv)
 
                 if (osfs2_read_block(fd, src_blk, blk_buf) < 0) {
                     fprintf(stderr, "ositofs-defrag: read failed at block %u "
-                            "for '%s', aborting\n", src_blk, ft[fidx].name);
+                            "for '%s', aborting\n", src_blk,
+                            osfs2_entry_name(&ft[fidx]));
                     free(blk_buf);
                     free(entries);
                     free(crc_buf);
@@ -273,7 +287,8 @@ int main(int argc, char **argv)
 
                 if (osfs2_write_block(fd, dst_blk, blk_buf) < 0) {
                     fprintf(stderr, "ositofs-defrag: write failed at block %u "
-                            "for '%s', aborting\n", dst_blk, ft[fidx].name);
+                            "for '%s', aborting\n", dst_blk,
+                            osfs2_entry_name(&ft[fidx]));
                     free(blk_buf);
                     free(entries);
                     free(crc_buf);

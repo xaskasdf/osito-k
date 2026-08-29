@@ -12,7 +12,7 @@
 
 #include "../types.h"
 
-/* -- Syscall numbers (600..607) ------------------------------ */
+/* -- Syscall numbers (600..608) ------------------------------ */
 #define SYS_GPU_CAPS         600
 #define SYS_GPU_CTX_CREATE   601
 #define SYS_GPU_CTX_DESTROY  602
@@ -21,6 +21,7 @@
 #define SYS_GPU_SUBMIT       605
 #define SYS_GPU_FENCE_WAIT   606
 #define SYS_GPU_PRESENT      607
+#define SYS_GPU_RES_DESTROY  608
 
 /* -- SYS_GPU_CAPS: bitfield of available backends ------------ */
 #define GPU_CAP_VENUS_READY  (1u << 0)  /* virtio-gpu with VIRGL feature */
@@ -46,6 +47,7 @@ struct gpu_res_create_args {
     uint32_t height;     /* IMAGE2D only; 0 for BUFFER */
     uint32_t pitch;      /* IMAGE2D only; 0 = tightly packed */
     uint64_t size;       /* BUFFER only; 0 for IMAGE2D */
+    uint64_t blob_id;    /* Venus object ID, or 0 for generic blobs */
 };
 
 /* -- SYS_GPU_SUBMIT: single entrypoint for venus command streams -- */

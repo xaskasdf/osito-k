@@ -15,7 +15,8 @@ GCC_INC  := $(shell $(CC) -print-file-name=include)
 # Refuse to build with a host compiler — produces wrong object format
 # (Mach-O on macOS) which the cross-ld silently drops, leaving NULL
 # function pointers in the ICD table. CC must be the x86_64-elf-* cross.
-ifeq ($(findstring elf,$(shell $(CC) -dumpmachine 2>/dev/null)),)
+CC_MACHINE := $(shell $(CC) -dumpmachine 2>/dev/null)
+ifeq ($(or $(findstring elf,$(CC_MACHINE)),$(findstring linux,$(CC_MACHINE))),)
 $(error CC=$(CC) is not a freestanding ELF cross-compiler. \
         Set CC=x86_64-elf-gcc (or equivalent). Building with a host \
         compiler silently produces unusable object files — see the \
@@ -123,13 +124,14 @@ DEP := $(OBJ:.o=.d)
 all: $(OUT)
 
 $(BUILD_ROOT):
-	@mkdir -p $(BUILD_ROOT)/loader $(BUILD_ROOT)/icd/nvk_stub $(BUILD_ROOT)/icd/venus
+	@mkdir -p $(BUILD_ROOT)/loader $(BUILD_ROOT)/icd/venus
 
 $(BUILD_ROOT)/%.o: %.c | $(BUILD_ROOT)
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(OUT): $(OBJ)
+	@rm -f $@
 	$(AR) rcs $@ $(OBJ)
 
 clean:

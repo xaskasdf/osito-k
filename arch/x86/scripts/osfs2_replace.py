@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
-# OsitoFS v2 REPLACE — overwrite the data of an existing file by appending the
-# new bytes at next_data_block and repointing the file-table entry to them
-# (old extent leaks; mount-time bitmap rebuild reconciles). Counterpart to
-# osfs2_write.py (which refuses to overwrite an existing name).
-#   osfs2_replace.py <image> <hostfile> <destname>
-import sys, struct, zlib, os
+"""Crash-safe copy-on-write replacement of one OsitoFS v2 file."""
+
+import os
+import struct
+import sys
+import time
+import zlib
+
+from osfs2_journal import (JOURNAL_COMMIT_MAGIC, JOURNAL_COMMIT_OFF,
+                           JOURNAL_OP_REPLACE, commit_entries, fix_super_crc,
+                           lock, read_super, recover, super_valid)
 
 MAGIC = 0x4F534632
 LAYOUT_MAGIC = 0x4F324C59
@@ -42,6 +47,53 @@ def find_part(f):
             return off
         off += (1 << 20)
     return None
+
+
+def find_free_extent(table, total_blocks, block_size, needed):
+    if needed == 0:
+        return 0
+    data_start = DATA_OFF // block_size
+    used = bytearray(total_blocks)
+    used[:data_start] = bytes([1]) * data_start
+    for slot in range(MAX_FILES):
+        entry = table[slot * 256:(slot + 1) * 256]
+        flags = struct.unpack_from('<I', entry, 84)[0]
+        start, count = struct.unpack_from('<2I', entry, 72)
+        if flags & FLAG_VALID:
+            for block in range(start, min(start + count, total_blocks)):
+                used[block] = 1
+    run_start = 0
+    run_length = 0
+    for block in range(data_start, total_blocks):
+        if not used[block]:
+            if run_length == 0:
+                run_start = block
+            run_length += 1
+            if run_length == needed:
+                return run_start
+        else:
+            run_length = 0
+    return None
+
+
+def recompute_super(superblock, table):
+    block_size = struct.unpack_from('<I', superblock, 8)[0]
+    data_start = DATA_OFF // block_size
+    files, used, high_water = 0, data_start, data_start
+    for slot in range(MAX_FILES):
+        entry = table[slot * 256:(slot + 1) * 256]
+        if not (struct.unpack_from('<I', entry, 84)[0] & FLAG_VALID):
+            continue
+        files += 1
+        start, count = struct.unpack_from('<2I', entry, 72)
+        used += count
+        high_water = max(high_water, start + count)
+    struct.pack_into('<I', superblock, 16, used)
+    struct.pack_into('<I', superblock, 20, files)
+    struct.pack_into('<I', superblock, 24, high_water)
+    fix_super_crc(superblock)
+    return high_water
+
 
 def main():
     img, host, dest = sys.argv[1], sys.argv[2], sys.argv[3]
@@ -94,6 +146,7 @@ def main():
         print(f"REPLACED {dest} (slot {slot}): {len(data)} B at block {start} "
               f"(+{bcount} blk); next_data_block -> {start+bcount}/{total}")
     return 0
+
 
 if __name__ == '__main__':
     sys.exit(main())

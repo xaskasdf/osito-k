@@ -33,6 +33,7 @@ extern uint64_t mem_get_free(void);
 extern uint64_t idt_get_ticks(void);
 extern int  kthread_create(const char *name, void (*fn)(void *), void *data);
 extern void sched_yield(void);
+extern int sched_sleep_ticks(uint64_t ticks);
 
 #define IC_GROUP_IP   { 239, 255, 255, 250 }
 #define IC_PORT       19999
@@ -147,7 +148,7 @@ static void ic_thread(void *data)
             }
             ic_last_send_tick = now;
         }
-        sched_yield();
+        (void)sched_sleep_ticks(1);
     }
 
     serial_puts("[IC] worker broadcast stopped\n");
@@ -177,7 +178,7 @@ typedef struct {
 static ic_peer_t ic_peers[IC_MAX_PEERS];
 static uint32_t  ic_peers_seen_total;
 
-extern void net_udp_listen(uint16_t port,
+extern int net_udp_listen(uint16_t port,
     void (*handler)(const uint8_t *src_ip, uint16_t src_port,
                     const void *data, uint32_t len));
 

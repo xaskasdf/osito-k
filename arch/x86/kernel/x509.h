@@ -59,6 +59,47 @@ int x509_extract_ec_pubkey_from_msg(const uint8_t *cert_msg, uint32_t msg_len,
 int x509_verify_chain_link(const uint8_t *child_cert,  uint32_t child_len,
                            const uint8_t *issuer_cert, uint32_t issuer_len);
 
+/* Verify an arbitrary ASN.1 signed object using an X.509 signer's SPKI.
+ * `signature_algorithm` is the complete AlgorithmIdentifier TLV and `tbs`
+ * includes the complete signed TLV. */
+int x509_verify_signed_blob(const uint8_t *tbs, uint32_t tbs_len,
+                            const uint8_t *signature_algorithm,
+                            uint32_t signature_algorithm_len,
+                            const uint8_t *signature, uint32_t signature_len,
+                            const uint8_t *signer_cert,
+                            uint32_t signer_cert_len);
+
+/* Cheap path-building filter.  Returns 1 when the child's encoded
+ * issuer Name equals the candidate's encoded subject Name, 0 for a
+ * mismatch, and -1 for malformed input. */
+int x509_issuer_matches_subject(const uint8_t *child, uint32_t child_len,
+                                const uint8_t *candidate,
+                                uint32_t candidate_len);
+
+/* Return the complete DER Name TLV for issuer/subject. The returned pointer
+ * aliases the certificate buffer and remains valid for the same lifetime. */
+int x509_get_issuer_name_der(const uint8_t *cert, uint32_t cert_len,
+                             const uint8_t **out_ptr, uint32_t *out_len);
+int x509_get_subject_name_der(const uint8_t *cert, uint32_t cert_len,
+                              const uint8_t **out_ptr, uint32_t *out_len);
+
+/* Extract RFC 5280 key identifiers. These are optional extensions, so -1
+ * means either absent or malformed; success returns bytes inside `cert`. */
+int x509_get_authority_key_id(const uint8_t *cert, uint32_t cert_len,
+                              const uint8_t **out_ptr, uint32_t *out_len);
+int x509_get_subject_key_id(const uint8_t *cert, uint32_t cert_len,
+                            const uint8_t **out_ptr, uint32_t *out_len);
+
+/* Evaluate ExtendedKeyUsage for one ASCII dotted OID. An absent EKU means
+ * unrestricted usage. Returns 1 when allowed, 0 when explicitly excluded,
+ * and -1 for malformed certificate/OID input. */
+int x509_allows_extended_key_usage(const uint8_t *cert, uint32_t cert_len,
+                                   const char *usage_oid);
+
+/* Strict variant for delegated signers: an absent EKU is not accepted. */
+int x509_has_extended_key_usage(const uint8_t *cert, uint32_t cert_len,
+                                const char *usage_oid);
+
 /* ── Validity-window check (A12.6) ─────────────────────────────
  *
  * Parse the cert's notBefore/notAfter fields and check that `now`
@@ -75,6 +116,10 @@ int x509_verify_chain_link(const uint8_t *child_cert,  uint32_t child_len,
  * accept a cert in a pre-NTP boot than fail closed on an unbacked
  * clock reading. */
 int x509_check_validity(const uint8_t *cert, uint32_t cert_len, uint32_t now_utc);
+
+/* Parse one DER UTCTime/GeneralizedTime TLV. `consumed` may be NULL. */
+int x509_parse_time_der(const uint8_t *tlv, uint32_t tlv_len,
+                        uint32_t *unix_time, uint32_t *consumed);
 
 /* ── SAN / hostname matching (A12.8) ───────────────────────────
  *
@@ -146,6 +191,13 @@ int x509_check_chain_constraints(const uint8_t **chain,
                                  const uint32_t *chain_lens,
                                  uint32_t        count);
 
+/* Detailed form used by certificate-chain APIs. `bad_index` receives the
+ * intermediate that violated BasicConstraints, KeyUsage, or pathLen. */
+int x509_check_chain_constraints_at(const uint8_t **chain,
+                                    const uint32_t *chain_lens,
+                                    uint32_t count,
+                                    uint32_t *bad_index);
+
 /* ── Authority Information Access (A12.11) ─────────────────────
  *
  * RFC 5280 §4.2.2.1.  Two URLs of interest typically appear in
@@ -202,14 +254,21 @@ int x509_get_issuer_der(const uint8_t *cert, uint32_t cert_len,
                         const uint8_t **out_ptr, uint32_t *out_len);
 int x509_get_subject_pubkey_bits(const uint8_t *cert, uint32_t cert_len,
                                  const uint8_t **out_ptr, uint32_t *out_len);
+
+/* Return the complete DER SubjectPublicKeyInfo TLV. Hashing this value gives
+ * the stable SPKI identity used for root trust anchors, independent of a
+ * certificate's issuer, validity window, or cross-signature. */
+int x509_get_spki_der(const uint8_t *cert, uint32_t cert_len,
+                      const uint8_t **out_ptr, uint32_t *out_len);
+
 int x509_get_serial_number(const uint8_t *cert, uint32_t cert_len,
                            const uint8_t **out_ptr, uint32_t *out_len);
 
 /* Extract an RSA public key (modulus + exponent) from a cert's SPKI.
  * On success the returned pointers point INTO the cert buffer, so the
- * cert must remain valid for the lifetime of any verify call.  Returns
- * 0 on success, -1 if the cert is malformed or the SPKI is not RSA
- * (or the modulus is not exactly 256 bytes / RSA-2048). */
+ * cert must remain valid for the lifetime of any verify call. Returns
+ * 0 on success, -1 if the cert is malformed or the SPKI is not an
+ * RSA-2048..RSA-4096 public key. */
 int x509_extract_rsa_pubkey(const uint8_t *cert, uint32_t cert_len,
                             const uint8_t **n_out, uint32_t *n_len_out,
                             const uint8_t **e_out, uint32_t *e_len_out);

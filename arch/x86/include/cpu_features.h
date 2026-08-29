@@ -28,6 +28,7 @@ typedef struct {
     bool     rdrand, rdseed;
     bool     invariant_tsc;
     bool     tsc_deadline;
+    bool     rdtscp;
 
     /* PMU (Performance Monitoring Unit) */
     bool     pmu_available;

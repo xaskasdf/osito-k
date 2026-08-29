@@ -233,6 +233,39 @@ bool hwbp_dispatch(struct interrupt_frame *frame)
 
         {
             const char *nm = hwbps[i].name;
+            int is_tlsidx = (nm[0] == 't' && nm[1] == 'l' && nm[2] == 's' &&
+                             nm[3] == 'i' && nm[4] == 'd' && nm[5] == 'x' &&
+                             nm[6] == 0);
+            if (is_tlsidx) {
+                serial_puts("[TLSIDX] write rip=0x");
+                serial_puthex(frame->rip, 16);
+                serial_puts(" value=0x");
+                serial_puthex(*(volatile uint32_t *)(uintptr_t)hwbps[i].addr, 8);
+                serial_puts("\n");
+                handled = true;
+                continue;
+            }
+            int is_gtavbuf = (nm[0] == 'g' && nm[1] == 't' && nm[2] == 'a' &&
+                              nm[3] == 'v' && nm[4] == 'b' && nm[5] == 'u' &&
+                              nm[6] == 'f' && nm[7] == 0);
+            int is_gtavphys = (nm[0] == 'g' && nm[1] == 't' && nm[2] == 'a' &&
+                               nm[3] == 'v' && nm[4] == 'p' && nm[5] == 'h' &&
+                               nm[6] == 'y' && nm[7] == 's' && nm[8] == 0);
+            if (is_gtavbuf || is_gtavphys) {
+                serial_puts(is_gtavphys
+                    ? "[GTAV-WATCH] PHYS alias CPU write addr=0x"
+                    : "[GTAV-WATCH] user VA CPU write addr=0x");
+                serial_puthex(dr_get_addr(i), 16);
+                serial_puts(" rip=0x");
+                serial_puthex(frame->rip, 16);
+                serial_puts(" rsp=0x");
+                serial_puthex(frame->rsp, 16);
+                serial_puts(" hits=");
+                serial_putdec(hwbps[i].hit_count);
+                serial_puts("\n");
+                handled = true;
+                continue;
+            }
             int is_cieret = (nm[0] == 'c' && nm[1] == 'i' && nm[2] == 'e' &&
                              nm[3] == 'r');
             if (is_cieret) {

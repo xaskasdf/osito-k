@@ -2,14 +2,14 @@
 
 ## Overview
 
-OsitoFS v2 is a write-once, contiguous-block filesystem optimized for NVMe DMA
+OsitoFS v2 is a contiguous-block filesystem optimized for NVMe DMA
 and AI model storage. Designed for bare-metal environments with no OS overhead.
 
 - **Block size**: 64 KB to 1 MB, power of two; 1 MB is the default
 - **Metadata overhead**: 4 MB for legacy images; 7 MB by default for new 16K-slot images
 - **Max files**: 4,096 legacy; 16,384 default for new images
 - **Max blocks**: 262,144 (256 TB theoretical)
-- **Write-once**: Files are immutable after creation
+- **Replacement**: copy-on-write metadata transactions preserve the old extent
 
 ## On-Disk Layout
 
@@ -71,7 +71,31 @@ images have 4,096 entries.
 | 0x70 | 4 | context_length | Max context length |
 | 0x74 | 128 | model_name | Model identifier string |
 | 0xF4 | 2 | layer_index_slot | Layer Index slot (0xFFFF = none) |
-| 0xF6 | 10 | reserved | Zero-padded to 256 bytes |
+| 0xF6 | 4 | create_time | Unix epoch seconds (`0` = unknown) |
+| 0xFA | 4 | modify_time | Unix epoch seconds (`0` = unknown) |
+| 0xFE | 2 | reserved | Zero-padded to 256 bytes |
+
+## Metadata Journal
+
+Rename, delete, create, and copy-on-write replacement use a redo transaction:
+
+1. Write new file data and side metadata without changing the live entry.
+2. Write and flush the immutable 12 KiB redo record at `0x2000`.
+3. Write and flush the independently checksummed commit marker at `0x5000`.
+4. Apply the new file entries and both superblocks, then flush them.
+5. Clear and flush the commit marker.
+
+A valid commit is the transaction boundary. Mount replays a committed record
+before reading either superblock or the file table. An uncommitted record is
+ignored; a torn commit marker fails its CRC and is treated as uncommitted.
+The record stores complete 4 KiB file-table pages, not isolated 256-byte
+entries, so replay also restores neighboring metadata after a torn page write.
+Replay is idempotent, so interruption during replay is safe. Replacements
+require a separate free extent; if one is unavailable, the old file is kept.
+
+The journal occupies bytes that were unused in existing v2 images, so no
+version bump or migration is required. Old readers can read clean images but
+cannot recover a pending transaction.
 
 ## Block CRC Table
 
@@ -122,5 +146,7 @@ Built from `tools/ositofs/`:
 - **ositofs-write** `<device> <file> [--name name]` — Write file (auto-detects GGUF)
 - **ositofs-ls** `<device>` — List files with model info
 - **ositofs-info** `<device>` — Show filesystem info
+- **ositofs-fsck** `<device> [--repair]` — Validate or replay a pending journal
+- `make check` — Run deterministic power-failure recovery tests
 
 All tools use `O_DIRECT` for block-aligned I/O on raw devices.

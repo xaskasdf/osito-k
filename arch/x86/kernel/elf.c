@@ -469,7 +469,12 @@ static int elf_load_segments(const uint8_t *data, uint64_t data_size,
 
 /* ── Set up user stack ───────────────────────────────────────── */
 
-__attribute__((noinline))
+/* Keep initial argc/argv/envp/auxv construction scalar and deterministic. */
+#if defined(__clang__)
+__attribute__((noinline, optnone))
+#else
+__attribute__((noinline, optimize("O0")))
+#endif
 static uint64_t elf_setup_stack(elf_loaded_t *loaded,
                                 int argc, const char **argv)
 {
@@ -529,6 +534,7 @@ static uint64_t elf_setup_stack(elf_loaded_t *loaded,
         str_need += strlen(argv[i]) + 1;
     for (int i = 0; i < DEFAULT_ENV_COUNT; i++)
         str_need += strlen(default_env[i]) + 1;
+    str_need += 16;   /* AT_RANDOM lives in the same string area */
     if (str_need < 256) str_need = 256;
     str_need = (str_need + 15) & ~15ULL;
 
@@ -704,13 +710,13 @@ static void elf_jump(uint64_t entry, uint64_t sp)
     /* Switch CR3 to the new process and jump in one asm block. After
      * the CR3 switch the lower-half boot kernel stack is no longer
      * mapped, so we must NOT touch the C stack until the asm has
-     * loaded the new RSP. A timer IRQ firing between the CR3 switch
-     * and the RSP load would try to push the interrupt frame to the
-     * old (boot) stack and fault, so we disable interrupts across
-     * the whole critical section and re-enable them just before the
+     * loaded the new RSP. A timer IRQ firing after scheduler ownership
+     * changes, or between the CR3 switch and RSP load, could save or use
+     * the old boot stack under the child's CR3. Disable interrupts across
+     * the whole transition and re-enable them just before the
      * jmp into user code (sti has a 1-instruction delay, so the jmp
-     * runs first and the user binary starts with IF=1). The asm does:
-     *   cli
+     * runs first and the user binary starts with IF=1). The transition does:
+     *   cli                     ;; before proc_launch_prepare
      *   mov new_cr3, %cr3   ;; switch address space
      *   mov sp, %rsp        ;; switch to user stack (upper-half)
      *   xor %rbp, %rbp
@@ -725,6 +731,7 @@ static void elf_jump(uint64_t entry, uint64_t sp)
      * the binary un-isolated under kernel_cr3 (load-VA / identity-map
      * collision → self-corruption). See proc_launch_prepare. */
     extern uint64_t proc_launch_prepare(void);
+    __asm__ volatile ("cli" ::: "memory");
     uint64_t pcr3 = proc_launch_prepare();
 
     /* Reset the FPU/SSE state to the x86-64 ABI default before entering a
@@ -741,7 +748,6 @@ static void elf_jump(uint64_t entry, uint64_t sp)
     }
 
     __asm__ volatile (
-        "cli\n"
         "test %2, %2\n"
         "jz   1f\n"
         "mov  %2, %%cr3\n"

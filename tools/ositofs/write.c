@@ -80,6 +80,27 @@ static int blkmap_build(const osfs2_file_t *ft, uint32_t max_files,
     return 0;
 }
 
+static void recompute_super(osfs2_super_t *sb, const osfs2_file_t *ft)
+{
+    uint32_t data_start = osfs2_format_data_start_blk(sb->version,
+                                                       sb->block_size);
+    uint32_t files = 0, used = data_start, hwm = data_start;
+    for (uint32_t i = 0; i < OSFS2_MAX_FILES; i++) {
+        if (!(ft[i].flags & OSFS2_FLAG_VALID)) continue;
+        files++;
+        if (!(ft[i].flags & OSFS2_FLAG_INLINE) && ft[i].block_count) {
+            used += ft[i].block_count;
+            uint32_t end = ft[i].start_block + ft[i].block_count;
+            if (end > hwm) hwm = end;
+        }
+    }
+    sb->file_count = files;
+    sb->used_blocks = used;
+    sb->next_data_block = hwm;
+    sb->crc32 = 0;
+    sb->crc32 = osfs2_crc32(sb, sizeof(*sb));
+}
+
 typedef struct {
     const char *local_path;
     char stored_name[OSFS2_MODEL_NAME_LEN];
@@ -301,7 +322,7 @@ static int write_data_blocks(int fd, const write_job_t *job, uint32_t start_bloc
 
         /* Block CRC */
         uint32_t blk_idx = start_block + b;
-        if (blk_idx < OSFS2_MAX_BLOCKS)
+        if (crc_table && blk_idx < OSFS2_MAX_BLOCKS)
             crc_table[blk_idx] = osfs2_crc32(data_blk, bs);
 
         if (osfs2_write_block(fd, start_block + b, data_blk) < 0) {
@@ -446,6 +467,12 @@ int main(int argc, char **argv)
     /* ── Open device, read superblock ───────────────────────────── */
     int fd = osfs2_open_device(device, 0);
     if (fd < 0) { free(jobs); return 1; }
+    if (osfs2_journal_recover(fd, 1) < 0) {
+        fprintf(stderr, "ositofs-write: journal recovery failed\n");
+        osfs2_close_device(fd);
+        free(jobs);
+        return 1;
+    }
 
     osfs2_super_t sb;
     if (osfs2_read_super(fd, &sb) < 0) {
@@ -481,6 +508,8 @@ int main(int argc, char **argv)
     if (!crc_blk) goto fail;
     if (osfs2_read_bytes(fd, crctab_off, crc_blk, OSFS2_CRCTAB_SIZE) < 0)
         goto fail_crc;
+    if (!osfs2_crc_table_enabled)
+        memset(crc_blk, 0, OSFS2_CRCTAB_SIZE);
 
     uint32_t *crc_table = (uint32_t *)crc_blk;
 
@@ -488,6 +517,10 @@ int main(int argc, char **argv)
     int any_gguf = 0;
     for (int i = 0; i < job_count; i++)
         if (jobs[i].is_gguf) { any_gguf = 1; break; }
+    if (any_gguf && !osfs2_layer_index_enabled) {
+        fprintf(stderr, "ositofs-write: GGUF files require the standard layout\n");
+        goto fail_crc;
+    }
 
     void *li_blk = NULL;
     osfs2_layer_idx_t *li = NULL;
@@ -499,6 +532,15 @@ int main(int argc, char **argv)
                 li_blk = NULL;
             } else {
                 li = (osfs2_layer_idx_t *)li_blk;
+                uint8_t referenced[OSFS2_MAX_MODELS] = {0};
+                for (uint32_t fi = 0; fi < OSFS2_MAX_FILES; fi++)
+                    if ((ft[fi].flags & (OSFS2_FLAG_VALID | OSFS2_FLAG_GGUF)) ==
+                            (OSFS2_FLAG_VALID | OSFS2_FLAG_GGUF) &&
+                        ft[fi].layer_index_slot < OSFS2_MAX_MODELS)
+                        referenced[ft[fi].layer_index_slot] = 1;
+                for (uint32_t slot = 0; slot < OSFS2_MAX_MODELS; slot++)
+                    if (!referenced[slot])
+                        memset(&li[slot], 0, sizeof(osfs2_layer_idx_t));
             }
         }
     }
@@ -668,21 +710,32 @@ int main(int argc, char **argv)
         }
         if (file_idx == max_files) {
             fprintf(stderr, "ositofs-write: file table full, skipping '%s'\n", job->stored_name);
+            for (uint32_t b = 0; b < blocks_needed; b++)
+                blkmap_clear(start_block + b);
             exit_code = 1;
             continue;
         }
 
-        /* Fill file table entry */
-        memset(&ft[file_idx], 0, sizeof(osfs2_file_t));
-        strncpy(ft[file_idx].name, job->stored_name, OSFS2_NAME_LEN - 1);
-        ft[file_idx].size = job->file_size;
-        ft[file_idx].start_block = start_block;
-        ft[file_idx].block_count = blocks_needed;
-        ft[file_idx].crc32 = file_crc;
-        ft[file_idx].flags = OSFS2_FLAG_VALID | (job->is_gguf ? OSFS2_FLAG_GGUF : OSFS2_FLAG_RAW);
-        ft[file_idx].layer_index_slot = 0xFFFF;
-        ft[file_idx].create_time = (uint32_t)time(NULL);
-        ft[file_idx].modify_time = ft[file_idx].create_time;
+        osfs2_file_t old_entry = ft[file_idx];
+        osfs2_file_t new_entry;
+        memset(&new_entry, 0, sizeof(new_entry));
+        if (osfs2_set_entry_name(&new_entry, job->stored_name) < 0) {
+            fprintf(stderr, "ositofs-write: cannot encode stored name '%s'\n",
+                    job->stored_name);
+            for (uint32_t b = 0; b < blocks_needed; b++)
+                blkmap_clear(start_block + b);
+            exit_code = 1;
+            continue;
+        }
+        new_entry.size = job->file_size;
+        new_entry.start_block = start_block;
+        new_entry.block_count = blocks_needed;
+        new_entry.crc32 = file_crc;
+        new_entry.flags |= OSFS2_FLAG_VALID |
+                           (job->is_gguf ? OSFS2_FLAG_GGUF : OSFS2_FLAG_RAW);
+        new_entry.layer_index_slot = 0xFFFF;
+        new_entry.create_time = (uint32_t)time(NULL);
+        new_entry.modify_time = new_entry.create_time;
 
         /* Long raw filenames are stored as a compatibility alias in the
          * otherwise-unused model_name field. The fixed name[64] field remains
@@ -693,14 +746,14 @@ int main(int argc, char **argv)
 
         /* GGUF metadata */
         if (job->is_gguf) {
-            ft[file_idx].quant_type = job->model_info.quant_type;
-            ft[file_idx].num_layers = job->model_info.num_layers;
-            ft[file_idx].hidden_size = job->model_info.hidden_size;
-            ft[file_idx].vocab_size = job->model_info.vocab_size;
-            ft[file_idx].head_count = job->model_info.head_count;
-            ft[file_idx].kv_head_count = job->model_info.kv_head_count;
-            ft[file_idx].context_length = job->model_info.context_length;
-            strncpy(ft[file_idx].model_name, job->model_info.model_name,
+            new_entry.quant_type = job->model_info.quant_type;
+            new_entry.num_layers = job->model_info.num_layers;
+            new_entry.hidden_size = job->model_info.hidden_size;
+            new_entry.vocab_size = job->model_info.vocab_size;
+            new_entry.head_count = job->model_info.head_count;
+            new_entry.kv_head_count = job->model_info.kv_head_count;
+            new_entry.context_length = job->model_info.context_length;
+            strncpy(new_entry.model_name, job->model_info.model_name,
                     OSFS2_MODEL_NAME_LEN - 1);
 
             /* Write layer index if we have layer offsets */
@@ -713,7 +766,7 @@ int main(int argc, char **argv)
                     li[slot].num_layers = job->model_info.layer_count;
                     for (uint32_t l = 0; l < job->model_info.layer_count && l < OSFS2_MAX_LAYERS; l++)
                         li[slot].layer_offset[l] = job->model_info.layer_offsets[l];
-                    ft[file_idx].layer_index_slot = slot;
+                    new_entry.layer_index_slot = slot;
                     printf("  Layer index slot %u (%u layers)\n",
                            slot, job->model_info.layer_count);
                 }
@@ -758,8 +811,6 @@ int main(int argc, char **argv)
             fprintf(stderr, "ositofs-write: failed to write CRC table\n");
             goto fail_li;
         }
-
-        /* Write layer index if any GGUF files were written */
         if (li_blk) {
             if (osfs2_write_bytes(fd, layeridx_off, li_blk, OSFS2_LAYERIDX_SIZE) < 0) {
                 fprintf(stderr, "ositofs-write: failed to write layer index\n");

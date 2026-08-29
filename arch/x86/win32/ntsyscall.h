@@ -96,6 +96,50 @@ typedef struct _NT_SERVICE_TABLE {
 /* Initialize SSDT with our handlers */
 void nt_syscall_init(NT_SERVICE_TABLE *table);
 
+/* Release VirtualAlloc regions that belong to a terminating Win32 process. */
+void nt_vm_release_process(ULONG owner_pid);
+/* Dump VMA ownership/protection metadata for a fatal guest address. */
+void nt_vm_debug_address(uint64_t address);
+
+/* Allocate and release a process-private Win32 stack. AllocationBase includes
+ * a protected bottom page; StackLimit..StackBase is committed PAGE_READWRITE. */
+NTSTATUS nt_vm_allocate_stack(SIZE_T reserve_size, PVOID *allocation_base,
+                              PVOID *stack_limit, PVOID *stack_base);
+NTSTATUS nt_vm_free_stack(PVOID allocation_base);
+NTSTATUS nt_vm_free_stack_for_process(ULONG owner_pid,
+                                      PVOID allocation_base);
+int nt_vm_selftest(void);
+
+/* Thread impersonation state is owned by the NT thread object. ADVAPI32 uses
+ * these helpers so pseudo handles and duplicated thread handles observe the
+ * same per-thread security context. */
+PVOID nt_thread_get_impersonation_token(PVOID thread_object);
+BOOL nt_thread_set_impersonation_token(PVOID thread_object,
+                                       PVOID token_object);
+
+/* Close a handle on behalf of a specific Win32 process. Kernel-owned
+ * references use this instead of depending on the caller's current TEB. */
+NTSTATUS nt_close_handle_for_process(HANDLE handle, ULONG owner_pid);
+
+/* Apply the section object's DACL when DuplicateHandle requests new rights. */
+BOOL nt_section_allows_access_escalation(PVOID section,
+                                         ACCESS_MASK desired_access);
+
+/* Named mappings use the identity to reject stale pointers when a section
+ * pool slot is recycled. */
+BOOL nt_section_is_alive(PVOID section);
+uint64_t nt_section_identity(PVOID section);
+BOOL nt_section_reopen_handle(PVOID section);
+
+/* Return the underlying byte-stream identity for a pipe endpoint.  Pending
+ * overlapped operations use this to preserve FIFO ordering across duplicated
+ * handles that refer to the same stream. */
+PVOID nt_pipe_stream_identity(HANDLE handle, ULONG owner_pid, BOOL write);
+
+/* Inspect or evict inactive immutable file-backed section control areas. */
+void nt_section_cache_dump(void);
+int nt_section_cache_flush_unused(void);
+
 /* Dispatch a syscall. Called from assembly entry point.
  * nr = EAX, args[] populated from R10/RDX/R8/R9/stack. */
 NTSTATUS nt_syscall_dispatch(NT_SERVICE_TABLE *table,

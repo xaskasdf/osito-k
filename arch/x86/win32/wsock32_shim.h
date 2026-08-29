@@ -1,6 +1,6 @@
 /*
  * OsitoK Windows Compatibility Layer — wsock32.dll / ws2_32.dll Shim
- * Stub — all calls return errors (offline mode). UT99 works offline.
+ * Winsock calls are bridged to the kernel network and synchronization layers.
  */
 
 #ifndef WSOCK32_SHIM_H
@@ -64,5 +64,11 @@ USHORT WINAPI htons(USHORT hostshort);
 
 PVOID wsock32_shim_init(void);
 PVOID wsock32_resolve(const char *func_name, USHORT ordinal, BOOL by_ordinal);
+PVOID ws2_32_resolve(const char *func_name, USHORT ordinal, BOOL by_ordinal);
+void  wsock_service_pending_io(void);
+BOOL  wsock_cancel_io(SOCKET socket, PVOID overlapped,
+                      BOOL current_thread_only);
+DWORD wsock_release_process(DWORD process_id);
+int   wsock_selftest(void);
 
 #endif /* WSOCK32_SHIM_H */

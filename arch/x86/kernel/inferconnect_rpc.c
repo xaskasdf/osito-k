@@ -365,10 +365,8 @@ static void ic_rpc_thread(void *data)
     serial_puts("\n");
 
     while (ic_rpc_running) {
-        /* Short timeout per accept attempt — keeps the kthread
-         * yielding back to the scheduler so other workers (broadcaster,
-         * agent slots) get fair CPU. The internal hlt loop in
-         * net_tcp_accept holds the CPU otherwise. */
+        /* Bound each accept attempt so the worker revisits its stop flag;
+         * the network waiter yields cooperatively until data or timeout. */
         int conn = net_tcp_accept(listener, 10);   /* 100ms poll */
         if (conn < 0) { sched_yield(); continue; }
         ic_handle_connection(conn);

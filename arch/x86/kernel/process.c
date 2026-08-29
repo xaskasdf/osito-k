@@ -29,8 +29,12 @@ extern void fb_putdec(uint64_t val);
 
 extern void *kmalloc(uint64_t size);
 extern void  kfree(void *ptr);
+extern void *kcalloc(uint64_t count, uint64_t size);
 extern void *mem_alloc_aligned(uint64_t size, uint64_t alignment);
 extern void  mem_free_pages(void *addr, uint64_t count);
+extern void win32_kernel_thread_reaped(uint32_t pid, int exit_code)
+    __attribute__((weak));
+extern void k32_iocp_thread_blocking(void) __attribute__((weak));
 
 /* Forward decl: sched_current_idx is defined (= -1) further down but used by
  * the FS-base/TLS diagnostics above its definition (parallel fork/TLS work). */
@@ -42,6 +46,7 @@ extern int demand_page_fault(uint64_t addr, uint64_t error_code);
 
 /* MSR access for per-thread TLS (X-THREAD) */
 #define MSR_FS_BASE 0xC0000100
+#define MSR_GS_BASE 0xC0000101
 static inline uint64_t rdmsr(uint32_t msr) {
     uint32_t lo, hi;
     __asm__ volatile ("rdmsr" : "=a"(lo), "=d"(hi) : "c"(msr));
@@ -60,6 +65,11 @@ extern void elf_fork_restore(void);
 
 /* Syscall state cleanup */
 extern void syscall_reset_process(void);
+extern void syscall_cleanup_process(void *owner, uint64_t cr3,
+                                    fd_entry_t *fds, uint32_t pid);
+extern int osfs2_file_retain(void *file);
+extern void ntsync_cancel_waiter(int proc_idx) __attribute__((weak));
+extern void ntsync_debug_dump_waiter(int proc_idx) __attribute__((weak));
 
 /* Brk save/restore for fork+execve (syscall.c) */
 extern void syscall_save_brk(void);
@@ -67,7 +77,6 @@ extern void syscall_restore_brk(void);
 
 /* ── Constants ───────────────────────────────────────────────── */
 
-#define MAX_PROCESSES   64  /* Increased from 16; further scaling via sys_caps planned */
 #define MAX_NAME_LEN    64
 #define MAX_REGIONS     32
 
@@ -77,6 +86,7 @@ extern void syscall_restore_brk(void);
 #define PROC_RUNNING    2
 #define PROC_BLOCKED    3
 #define PROC_ZOMBIE     4
+#define PROC_ALLOCATING 5
 
 /* Scheduler constants (X-SCHED) */
 #define SCHED_QUANTUM       5       /* default ticks per time slice (50ms @ 100Hz) */
@@ -149,7 +159,9 @@ typedef struct {
 
     /* Scheduler context (X-SCHED) */
     void    *kernel_stack;       /* allocated kernel stack (NULL for kernel proc) */
-    uint64_t kernel_rsp;         /* saved RSP pointing to interrupt frame */
+    x86_interrupt_frame_t sched_frame __attribute__((aligned(16)));
+    bool     sched_frame_valid;  /* frame is task-owned, never left on CPU IST */
+    uint64_t kernel_rsp;         /* canonical &sched_frame for assembly/prefetch */
     uint32_t quantum;            /* ticks remaining in time slice */
     uint8_t  qos_class;          /* QOS_IDLE..QOS_REALTIME */
     int16_t  runq_next;          /* next in same-QoS run queue, -1 = tail */
@@ -158,6 +170,8 @@ typedef struct {
     uint32_t tgid;               /* thread group ID (= leader's PID) */
     bool     is_thread;          /* true if created via CLONE_THREAD */
     uint64_t fs_base;            /* per-thread FS_BASE (TLS) */
+    uint64_t gs_base;            /* per-thread GS_BASE (Win64 TEB) */
+    int      compat32_mode;      /* Win32 ABI width for the running task */
     uint64_t *clear_child_tid;   /* set_tid_address / CLONE_CHILD_CLEARTID */
 
     /* Memory compression (macOS-style) */
@@ -174,12 +188,10 @@ typedef struct {
     uint64_t  user_strtab_size;  /* bytes */
     uint64_t  user_load_bias;    /* PIE: rip = st_value + bias */
 
-    /* x87 + SSE state buffer used by isr_common's fxsave64/fxrstor64.
-     * 512 bytes, 16-aligned. Points-to is stored in fpu_state_ptr while
-     * this process is current, so interrupts save/restore into the
-     * owning process's slot and context switches atomically change
-     * which slot the ISR touches next. */
-    __attribute__((aligned(16))) uint8_t fpu_state[512];
+    /* x87 + SSE + AVX state used by isr_common's xsave64/xrstor64.
+     * XCR0 is restricted to 0x7, whose standard-format area is 832 bytes;
+     * keep a rounded, cache-aligned slot for every process. */
+    __attribute__((aligned(64))) uint8_t fpu_state[1024];
 
     /* Speculation analysis — populated at ELF load time (spec_analyze.c) */
     void        *spec_info;          /* spec_analysis_t* or NULL */
@@ -200,17 +212,175 @@ typedef struct {
     char         last_opened[32];
 } process_t;
 
+_Static_assert(_Alignof(process_t) >= 64,
+               "process_t must preserve XSAVE alignment");
+_Static_assert(sizeof(process_t) % 64 == 0,
+               "process_t array stride must preserve XSAVE alignment");
+
 /* ── Process table ───────────────────────────────────────────── */
 
-static process_t proctab[MAX_PROCESSES];
+static process_t *proctab;
+static void *proctab_storage;
+static int proc_capacity;
+#define COMPAT_IST1_STACK_SIZE 1048576
+static uint64_t *sched_compat_ist1;
+static void **sched_compat_ist1_phys;
+/* Context-switch diagnostics. A saved frame may be resumed exactly once;
+ * the next deschedule must replace it with a newer generation. The stack
+ * snapshot catches reuse or aliasing of both compat IST1 and Win64 runtime
+ * stacks before a poisoned return address reaches IRET/RET. */
+static uint64_t *sched_frame_seq;
+static uint64_t *sched_frame_resumed_seq;
+static uint64_t *sched_frame_stack_rsp;
+static uint64_t *sched_frame_stack_qword0;
+static uint64_t *sched_frame_stack_qword1;
+/* Relative sleeps are tracked out-of-line so process_t remains ABI-stable for
+ * the scheduler assembly and live-debugging tools. A non-zero entry is an
+ * idt_get_ticks() deadline for a task parked in PROC_BLOCKED. */
+static uint64_t *sched_sleep_deadline;
+static uint32_t sched_sleeping_count;
+static volatile uint32_t sched_tick_active;
+static uint32_t sched_nested_yield_logs;
+static uint32_t sched_irq_off_yield_logs;
+static uint32_t sched_irq_off_save_logs;
+static uint32_t sched_irq_off_restore_logs;
+static uint32_t sched_owner_mismatch_logs;
+static uint32_t sched_ist1_guard_logs;
+
+static void proc_tables_release(void)
+{
+    kfree(sched_sleep_deadline);
+    kfree(sched_frame_stack_qword1);
+    kfree(sched_frame_stack_qword0);
+    kfree(sched_frame_stack_rsp);
+    kfree(sched_frame_resumed_seq);
+    kfree(sched_frame_seq);
+    kfree(sched_compat_ist1_phys);
+    kfree(sched_compat_ist1);
+    kfree(proctab_storage);
+
+    sched_sleep_deadline = NULL;
+    sched_frame_stack_qword1 = NULL;
+    sched_frame_stack_qword0 = NULL;
+    sched_frame_stack_rsp = NULL;
+    sched_frame_resumed_seq = NULL;
+    sched_frame_seq = NULL;
+    sched_compat_ist1_phys = NULL;
+    sched_compat_ist1 = NULL;
+    proctab = NULL;
+    proctab_storage = NULL;
+}
+
+static bool proc_tables_allocate(uint32_t capacity)
+{
+    uint64_t proctab_bytes = (uint64_t)capacity * sizeof(*proctab);
+    proctab_storage = kcalloc(1, proctab_bytes + 63);
+    if (proctab_storage) {
+        uint64_t aligned = ((uint64_t)proctab_storage + 63) & ~63ULL;
+        proctab = (process_t *)aligned;
+    }
+    sched_compat_ist1 = (uint64_t *)kcalloc(
+        capacity, sizeof(*sched_compat_ist1));
+    sched_compat_ist1_phys = (void **)kcalloc(
+        capacity, sizeof(*sched_compat_ist1_phys));
+    sched_frame_seq = (uint64_t *)kcalloc(capacity,
+                                          sizeof(*sched_frame_seq));
+    sched_frame_resumed_seq = (uint64_t *)kcalloc(
+        capacity, sizeof(*sched_frame_resumed_seq));
+    sched_frame_stack_rsp = (uint64_t *)kcalloc(
+        capacity, sizeof(*sched_frame_stack_rsp));
+    sched_frame_stack_qword0 = (uint64_t *)kcalloc(
+        capacity, sizeof(*sched_frame_stack_qword0));
+    sched_frame_stack_qword1 = (uint64_t *)kcalloc(
+        capacity, sizeof(*sched_frame_stack_qword1));
+    sched_sleep_deadline = (uint64_t *)kcalloc(
+        capacity, sizeof(*sched_sleep_deadline));
+
+    if (!proctab || !sched_compat_ist1 || !sched_compat_ist1_phys ||
+        !sched_frame_seq || !sched_frame_resumed_seq ||
+        !sched_frame_stack_rsp || !sched_frame_stack_qword0 ||
+        !sched_frame_stack_qword1 || !sched_sleep_deadline) {
+        proc_tables_release();
+        return false;
+    }
+    return true;
+}
+
+uint32_t sched_capacity_get(void)
+{
+    return (uint32_t)proc_capacity;
+}
 static process_t *current_proc;
+static int win32_compat32_boot_mode;
 static uint32_t next_pid = 1;
+extern volatile uint64_t syscall_kernel_rsp;
 
-/* ── O(1) run queue: bitmap + per-QoS linked lists ──────────── */
+int *proc_win32_compat32_mode_slot(void)
+{
+    return current_proc ? &current_proc->compat32_mode
+                        : &win32_compat32_boot_mode;
+}
 
-/* One bit per proctab slot. With MAX_PROCESSES=64, fits in one uint64_t.
- * Bit i is set iff proctab[i].state == PROC_READY. */
-static uint64_t ready_bitmap;
+static bool sched_compat_ist1_contains(int idx, uint64_t rsp)
+{
+    if (idx < 0 || idx >= proc_capacity || !sched_compat_ist1_phys[idx])
+        return false;
+
+    uint64_t base = (uint64_t)PHYS_TO_VIRT(sched_compat_ist1_phys[idx]);
+    return rsp > base && rsp <= base + COMPAT_IST1_STACK_SIZE;
+}
+
+static void sched_ist1_guard_log(const char *op, int idx, uint64_t bad,
+                                 uint64_t replacement)
+{
+    if (sched_ist1_guard_logs++ >= 64)
+        return;
+    serial_puts("[SCHED-IST1-GUARD] ");
+    serial_puts(op);
+    serial_puts(" pid=");
+    serial_putdec(proctab[idx].pid);
+    serial_puts(" invalid=0x");
+    serial_puthex(bad, 16);
+    serial_puts(" use=0x");
+    serial_puthex(replacement, 16);
+    serial_puts("\n");
+}
+
+/* Return the live process slot whose private runtime or compat stack
+ * contains rsp. A mismatch at a scheduling boundary means the CPU is
+ * executing on another task's stack, before that turns into an opaque
+ * return-address failure. */
+static int sched_stack_owner(uint64_t rsp, const char **kind)
+{
+    for (int i = 0; i < proc_capacity; i++) {
+        if (proctab[i].state == PROC_FREE)
+            continue;
+
+        if (sched_compat_ist1_phys[i]) {
+            if (sched_compat_ist1_contains(i, rsp)) {
+                if (kind) *kind = "compat";
+                return i;
+            }
+        }
+
+        if (proctab[i].kernel_stack) {
+            uint64_t base = (uint64_t)proctab[i].kernel_stack;
+            if (rsp >= base + 4096 && rsp <= base + KERNEL_STACK_SIZE) {
+                if (kind) *kind = "runtime";
+                return i;
+            }
+        }
+    }
+
+    if (kind) *kind = "none";
+    return -1;
+}
+
+/* ── O(1) run queue: count + per-QoS linked lists ───────────── */
+
+/* Number of entries linked into the QoS queues.  A count keeps the fast
+ * empty check without constraining the process table to one machine word. */
+static uint32_t ready_count;
 
 /* Per-QoS run queue heads. Each is an index into proctab, or -1 if empty.
  * process_t gains a runq_next field (int16_t) for chaining. */
@@ -311,27 +481,27 @@ void exec_cache_release(const char *name)
 }
 
 /* ── Per-process FPU/SSE state ────────────────────────────────
- * `isr_common` does `fxsave64 (%rax)` / `fxrstor64 (%rax)` where
- * %rax is loaded from `fpu_state_ptr`. That pointer tracks the
+ * `isr_common` uses XSAVE/XRSTOR with mask 0x7 (x87, SSE, AVX).
+ * The pointer loaded from `fpu_state_ptr` tracks the
  * currently scheduled process's `fpu_state` field, so an ISR that
  * fires while process A is running saves A's FPU state on entry;
  * if the scheduler chooses to switch to process B inside the C
  * handler, we also rewrite `fpu_state_ptr` to B's slot, and the
- * exit path's `fxrstor64` restores B's state on the way out via
+ * exit path's `xrstor64` restores B's state on the way out via
  * IRETQ. For the boot window (before any process exists) and for
  * kernel threads that never got a process_t, the pointer points
  * at `fpu_state_kernel` below. */
-__attribute__((aligned(16))) uint8_t fpu_state_kernel[512];
+__attribute__((aligned(64))) uint8_t fpu_state_kernel[1024];
 uint8_t *fpu_state_ptr = fpu_state_kernel;  /* BSP default (legacy, index 0) */
 uint64_t fpu_corrupt_val;  /* set by isr_common when fpu_state_ptr is corrupt */
 
-/* Per-CPU FPU state pointers — indexed by LAPIC ID (0..15).
- * BSP (LAPIC 0) uses fpu_state_ptrs[0] = process's fpu_state.
+/* Per-CPU FPU state pointers — indexed by the full xAPIC ID (0..255).
+ * The BSP's actual APIC-ID slot follows the currently scheduled process.
  * APs use fpu_state_ptrs[lapic_id] = their own static buffer.
  * The ISR stub reads LAPIC ID and indexes into this array. */
-#define FPU_MAX_CPUS 16
+#define FPU_MAX_CPUS 256
 uint8_t *fpu_state_ptrs[FPU_MAX_CPUS];
-__attribute__((aligned(16))) uint8_t fpu_state_ap_bufs[FPU_MAX_CPUS][512];
+__attribute__((aligned(64))) uint8_t fpu_state_ap_bufs[FPU_MAX_CPUS][1024];
 
 static void fpu_state_init(uint8_t *state)
 {
@@ -352,6 +522,8 @@ void fpu_percpu_init(void)
     /* APs get their own static buffers */
     for (int i = 1; i < FPU_MAX_CPUS; i++)
         fpu_state_ptrs[i] = fpu_state_ap_bufs[i];
+    extern uint32_t idt_get_bsp_apic_id(void);
+    fpu_state_ptrs[idt_get_bsp_apic_id() & 0xFF] = fpu_state_kernel;
 }
 
 /* Update both current_proc and fpu_state_ptr together so the ISR
@@ -362,7 +534,17 @@ static inline void set_current_proc(process_t *p)
     current_proc = p;
     uint8_t *fpu = p ? p->fpu_state : fpu_state_kernel;
     fpu_state_ptr = fpu;           /* legacy global (BSP only) */
-    fpu_state_ptrs[0] = fpu;      /* per-CPU array slot for BSP */
+    extern uint32_t idt_get_bsp_apic_id(void);
+    fpu_state_ptrs[idt_get_bsp_apic_id() & 0xFF] = fpu;
+
+    /* SYSCALL does not switch stacks in hardware because Osito's ELF tasks
+     * currently run at CPL0. Publish the private 256KB stack for user tasks so
+     * syscall_entry can leave small pthread stacks before calling into C/VFS.
+     * Kernel threads already execute on kernel_stack and must not switch to its
+     * top again while live frames are below it. */
+    syscall_kernel_rsp = p && p->kernel_stack && p->cr3 &&
+                         p->cr3 != paging_get_kernel_cr3()
+        ? (uint64_t)p->kernel_stack + KERNEL_STACK_SIZE : 0;
 }
 
 /* Kernel return context — saved before exec, restored on exit */
@@ -398,13 +580,33 @@ static void runq_enqueue(int idx)
     else
         runq_head[q] = (int16_t)idx;
     runq_tail[q] = (int16_t)idx;
-    ready_bitmap |= (1ULL << idx);
+    ready_count++;
+}
+
+static void runq_enqueue_front(int idx)
+{
+    uint8_t q = proctab[idx].qos_class;
+    proctab[idx].runq_next = runq_head[q];
+    runq_head[q] = (int16_t)idx;
+    if (runq_tail[q] < 0)
+        runq_tail[q] = (int16_t)idx;
+    ready_count++;
+}
+
+static void runq_promote_front(int idx)
+{
+    uint8_t q = proctab[idx].qos_class;
+    if (runq_head[q] == idx)
+        return;
+    runq_dequeue(idx);
+    runq_enqueue_front(idx);
 }
 
 static void runq_dequeue(int idx)
 {
     uint8_t q = proctab[idx].qos_class;
-    ready_bitmap &= ~(1ULL << idx);
+    if (ready_count > 0)
+        ready_count--;
 
     if (runq_head[q] == idx) {
         runq_head[q] = proctab[idx].runq_next;
@@ -423,31 +625,44 @@ static void runq_dequeue(int idx)
     proctab[idx].runq_next = -1;
 }
 
+static inline void sched_sleep_cancel(int idx)
+{
+    if (idx < 0 || idx >= proc_capacity || !sched_sleep_deadline[idx])
+        return;
+
+    sched_sleep_deadline[idx] = 0;
+    if (sched_sleeping_count)
+        sched_sleeping_count--;
+}
+
 static inline void proc_transition(process_t *p, uint32_t new_state)
 {
     int idx = (int)(p - proctab);
-    uint32_t old = p->state;
-    p->state = new_state;
+    uint32_t old = __atomic_load_n(&p->state, __ATOMIC_ACQUIRE);
+
+    /* Any wake, exit, or slot release cancels a pending scheduler sleep. */
+    if (new_state != PROC_BLOCKED)
+        sched_sleep_cancel(idx);
+
+    /* Publish the zombie timestamp before the state.  The reaper may run on
+     * another CPU as soon as it observes PROC_ZOMBIE. */
+    if (new_state == PROC_ZOMBIE && old != PROC_ZOMBIE)
+        p->zombie_tick = idt_get_ticks();
+    else if (new_state == PROC_FREE)
+        p->zombie_tick = 0;
+
+    __atomic_store_n(&p->state, new_state, __ATOMIC_RELEASE);
 
     if (old == PROC_READY && new_state != PROC_READY)
         runq_dequeue(idx);
     else if (old != PROC_READY && new_state == PROC_READY)
         runq_enqueue(idx);
 
-    /* Stamp the death time when a process first enters ZOMBIE state.
-     * The auto-reaper uses this to apply a grace period before
-     * reclaiming the slot, so a parent that calls wait4() within the
-     * grace window can still observe its child's exit_code. Reset on
-     * a transition back to PROC_FREE (slot reuse). */
-    if (new_state == PROC_ZOMBIE && old != PROC_ZOMBIE)
-        p->zombie_tick = idt_get_ticks();
-    else if (new_state == PROC_FREE)
-        p->zombie_tick = 0;
 }
 
 static void runq_init(void)
 {
-    ready_bitmap = 0;
+    ready_count = 0;
     for (int q = 0; q < QOS_NUM_CLASSES; q++) {
         runq_head[q] = -1;
         runq_tail[q] = -1;
@@ -468,8 +683,8 @@ static process_t *proc_alloc(const char *name)
             fpu_state_init(p->fpu_state);
             p->pid = next_pid++;
             p->ppid = current_proc ? current_proc->pid : 0;
-            /* State stays PROC_FREE (from memset). Caller must call
-             * proc_transition() to PROC_READY/RUNNING after setup. */
+            /* State stays PROC_ALLOCATING until the caller publishes the
+             * fully initialized task as READY/RUNNING. */
             p->runq_next = -1;
             p->cr3 = paging_get_kernel_cr3();
 
@@ -488,6 +703,7 @@ static process_t *proc_alloc(const char *name)
             p->tgid = p->pid;
             p->is_thread = false;
             p->fs_base = 0;
+            p->gs_base = 0;
             p->clear_child_tid = NULL;
 
             /* Allocate per-process fd_table (refcounted) */
@@ -509,7 +725,12 @@ static process_t *proc_alloc(const char *name)
 
 /* ── Free a process ──────────────────────────────────────────── */
 
-static void proc_free(process_t *p)
+/* Convert a freshly allocated scheduler slot into a thread of parent. The
+ * slot starts with its own empty fd table, so release that table before
+ * sharing the process-wide one. Callers must do this before publishing the
+ * slot as READY. */
+static void proc_attach_thread(process_t *thread, process_t *parent,
+                               uint32_t parent_pid)
 {
     futex_cleanup_process(p);
 
@@ -533,11 +754,19 @@ static void proc_free(process_t *p)
     extern void kbd_flush(void);
     kbd_flush();
 
-    /* Reset per-process syscall state (file FDs, brk heap) */
-    syscall_reset_process();
+    /* Reaping usually happens after the parent has been restored as current.
+     * Clean the target's VMAs through its own CR3 instead of accidentally
+     * tearing down the parent and leaving stale ELF mappings behind. */
+    if (p == current_proc) {
+        syscall_reset_process();
+    } else {
+        fd_entry_t *fds = NULL;
+        if (p->fd_table && p->fd_table->refcount <= 1)
+            fds = p->fd_table->entries;
+        syscall_cleanup_process(p, p->cr3, fds, p->pid);
+    }
 
-    /* FDs live in the global fd_table[] in syscall.c — closed via
-     * syscall_reset_process() which is called from compositor_cleanup_process. */
+    /* The target's final fd-table reference is closed by the cleanup above. */
 
     /* X-PGTBL: release the per-process page tables if this process owns
      * one. Must run *after* syscall_reset_process because VMA cleanup
@@ -564,29 +793,109 @@ static void proc_free(process_t *p)
         p->fd_table = NULL;
     }
 
+    if (sched_compat_ist1_phys[slot]) {
+        mem_free_pages(sched_compat_ist1_phys[slot],
+                       COMPAT_IST1_STACK_SIZE / 4096);
+        sched_compat_ist1_phys[slot] = NULL;
+        sched_compat_ist1[slot] = 0;
+    }
+
+    proc_release_kernel_stack(p);
+
     /* Clear PID lookup before freeing slot */
     if (p->pid < MAX_PID)
         pid_to_idx[p->pid] = -1;
     proc_transition(p, PROC_FREE);
+    return true;
 }
 
-/* External kill-and-reap — mark a process as ZOMBIE, free all its
- * resources (page tables, fd table, symbol tables, GPU contexts,
- * SHM regions, ...), then put the proctab slot back to PROC_FREE so
- * it can be reused. Used by winexec to clean up orphan win32 threads
- * before re-enabling the APIC LVT: leaving them as ZOMBIE merely
- * stops the scheduler from dispatching them, but keeps their slot
- * occupied and their context structures allocated. proc_free() does
- * the real work; we just need to make sure we aren't reaping the
- * currently-running process (would self-corrupt).
- *
- * Returns 0 on successful reap, -1 if the pid is invalid, the slot
- * is already free, or the process is the caller itself. */
+/* Replace a stopped task's next resume address with a kernel trampoline.
+ * The target must not be the caller and the trampoline must not return. This
+ * is used to deliver process-wide Win32 termination on the owning main
+ * thread: jumping directly to that thread's setjmp buffer from a worker would
+ * combine the worker's scheduler identity with the main thread's stack. */
+int proc_inject_noreturn_pid(int pid, void (*entry)(void))
+{
+    if (pid <= 0 || pid >= MAX_PID || !entry) return -1;
+
+    uint64_t flags;
+    __asm__ volatile ("pushfq; popq %0; cli" : "=r"(flags) :: "memory");
+
+    int idx = pid_to_idx[pid];
+    if (idx < 0 || idx >= proc_capacity) goto fail;
+    process_t *p = &proctab[idx];
+    uint32_t state = __atomic_load_n(&p->state, __ATOMIC_ACQUIRE);
+    if (p->pid != (uint32_t)pid || p == current_proc ||
+        idx == sched_current_idx ||
+        (state != PROC_READY && state != PROC_BLOCKED) ||
+        !p->kernel_stack || !p->sched_frame_valid)
+        goto fail;
+
+    if (ntsync_cancel_waiter)
+        ntsync_cancel_waiter(idx);
+
+    uint64_t *frame = (uint64_t *)&p->sched_frame;
+    frame[17] = (uint64_t)(uintptr_t)entry;
+    p->saved_frame_rip = frame[17];
+    p->kernel_rsp = (uint64_t)&p->sched_frame;
+    if (state == PROC_BLOCKED)
+        proc_transition(p, PROC_READY);
+    p->quantum = 0;
+
+    if (flags & (1ULL << 9))
+        __asm__ volatile ("sti" ::: "memory");
+    return 0;
+
+fail:
+    if (flags & (1ULL << 9))
+        __asm__ volatile ("sti" ::: "memory");
+    return -1;
+}
+
+/* Wake a task without rewriting its saved instruction pointer. This is used
+ * for cross-thread Win32 process termination: a PE32 owner must resume through
+ * its existing compatibility-mode frame and consume the request at a safe
+ * 32->64 transition rather than iret to a 64-bit trampoline under CS32. */
+int proc_wake_pid(int pid)
+{
+    if (pid <= 0 || pid >= MAX_PID) return -1;
+
+    uint64_t flags;
+    __asm__ volatile ("pushfq; popq %0; cli" : "=r"(flags) :: "memory");
+
+    int idx = pid_to_idx[pid];
+    if (idx < 0 || idx >= proc_capacity) goto fail;
+    process_t *p = &proctab[idx];
+    uint32_t state = __atomic_load_n(&p->state, __ATOMIC_ACQUIRE);
+    if (p->pid != (uint32_t)pid || state == PROC_FREE ||
+        state == PROC_ZOMBIE)
+        goto fail;
+
+    if (ntsync_cancel_waiter)
+        ntsync_cancel_waiter(idx);
+    if (state == PROC_BLOCKED)
+        proc_transition(p, PROC_READY);
+    if (sched_current_idx >= 0 && sched_current_idx != idx)
+        proctab[sched_current_idx].quantum = 0;
+
+    if (flags & (1ULL << 9))
+        __asm__ volatile ("sti" ::: "memory");
+    return 0;
+
+fail:
+    if (flags & (1ULL << 9))
+        __asm__ volatile ("sti" ::: "memory");
+    return -1;
+}
+
+/* External task termination. The runnable state changes synchronously, while
+ * stack, IST and address-space reclamation is deferred to the zombie reaper.
+ * Returns 0 when the request is accepted, or -1 for an invalid/self target. */
 int proc_kill_pid(int pid)
 {
     if (pid <= 0 || pid >= MAX_PID) return -1;
     int idx = pid_to_idx[pid];
-    if (idx < 0 || idx >= MAX_PROCESSES) return -1;
+    if (idx < 0 || idx >= proc_capacity) return -1;
     process_t *p = &proctab[idx];
     if (p->state == PROC_FREE) return -1;
     /* Refuse to reap ourselves — proc_free dismantles state that the
@@ -594,14 +903,12 @@ int proc_kill_pid(int pid)
      * right API for self-termination. */
     if (p == current_proc) return -1;
 
-    /* If the process is ready but never dispatched (compositor's
-     * orphan win32 threads after PE exit fall into this bucket), we
-     * can free it immediately. proc_free handles dequeueing from the
-     * run queue, releasing per-process resources, and transitioning
-     * to PROC_FREE. */
+    /* Resource destruction is deferred until the scheduler has switched away
+     * from every saved frame owned by this task. Treat externally terminated
+     * tasks as orphans so the next reaper sweep can reclaim them immediately. */
     p->exit_code = -1;
+    p->ppid = 0;
     proc_transition(p, PROC_ZOMBIE);
-    proc_free(p);
     return 0;
 }
 
@@ -664,6 +971,25 @@ fd_entry_t *syscall_fds(void)
 uint64_t proc_current_cr3(void)
 {
     return current_proc ? current_proc->cr3 : 0;
+}
+
+uint64_t proc_get_cr3_pid(int pid)
+{
+    if (pid <= 0 || pid >= MAX_PID) return 0;
+
+    uint64_t flags;
+    __asm__ volatile ("pushfq; popq %0; cli" : "=r"(flags) :: "memory");
+    int idx = pid_to_idx[pid];
+    uint64_t cr3 = 0;
+    if (idx >= 0 && idx < proc_capacity) {
+        process_t *process = &proctab[idx];
+        uint32_t state = __atomic_load_n(&process->state, __ATOMIC_ACQUIRE);
+        if (process->pid == (uint32_t)pid && state != PROC_FREE)
+            cr3 = process->cr3;
+    }
+    if (flags & (1ULL << 9))
+        __asm__ volatile ("sti" ::: "memory");
+    return cr3;
 }
 
 /* Called by elf_jump right before entering a freshly-exec'd binary.
@@ -829,6 +1155,21 @@ int32_t proc_tgid_of(void *p)
     return (int32_t)proc->tgid;
 }
 
+bool proc_is_thread_of(void *p)
+{
+    return p && ((process_t *)p)->is_thread;
+}
+
+uint32_t proc_pid_of(void *p)
+{
+    return p ? ((process_t *)p)->pid : 0;
+}
+
+uint32_t proc_state_of(void *p)
+{
+    return p ? ((process_t *)p)->state : PROC_FREE;
+}
+
 /* Set clear_child_tid address (set_tid_address syscall) */
 void proc_set_clear_child_tid(uint64_t *addr)
 {
@@ -855,7 +1196,7 @@ void proc_set_fs_base(uint64_t addr)
         serial_puts(" | sched_idx=");
         serial_putdec((uint64_t)(uint32_t)si);
         serial_puts(" slot_pid=");
-        serial_putdec((si >= 0 && si < MAX_PROCESSES) ? proctab[si].pid : 0);
+        serial_putdec((si >= 0 && si < proc_capacity) ? proctab[si].pid : 0);
         serial_puts(" fs_base=0x");
         serial_puthex(addr, 16);
         serial_puts("\n");
@@ -881,6 +1222,36 @@ void proc_set_user_stack_top(uint64_t top)
 uint64_t proc_get_fs_base(void)
 {
     return current_proc ? current_proc->fs_base : 0;
+}
+
+void proc_set_gs_base(uint64_t addr)
+{
+    if (current_proc) current_proc->gs_base = addr;
+}
+
+uint64_t proc_get_gs_base(void)
+{
+    return current_proc ? current_proc->gs_base : 0;
+}
+
+int proc_get_kernel_stack_bounds(uint64_t *limit, uint64_t *base)
+{
+    if (!current_proc || !current_proc->kernel_stack || !limit || !base)
+        return -1;
+
+    *limit = (uint64_t)current_proc->kernel_stack + 4096;
+    *base = (uint64_t)current_proc->kernel_stack + KERNEL_STACK_SIZE;
+    return 0;
+}
+
+void proc_set_gs_base_pid(int pid, uint64_t addr)
+{
+    for (int i = 0; i < proc_capacity; i++) {
+        if ((int)proctab[i].pid == pid && proctab[i].state != PROC_FREE) {
+            proctab[i].gs_base = addr;
+            return;
+        }
+    }
 }
 
 /* TLS contract hardening (x86-64 Linux ABI):
@@ -950,7 +1321,7 @@ bool proc_is_executing(const char *name)
     if (!name || !*name) return false;
     /* Skip leading "/" if present */
     if (*name == '/') name++;
-    for (int i = 0; i < MAX_PROCESSES; i++) {
+    for (int i = 0; i < proc_capacity; i++) {
         if (proctab[i].state == PROC_FREE) continue;
         if (proctab[i].state == PROC_ZOMBIE) continue;
         const char *pname = proctab[i].name;
@@ -969,12 +1340,12 @@ process_t *proc_find(uint32_t pid)
     /* O(1) PID lookup via index table */
     if (pid < MAX_PID) {
         int16_t idx = pid_to_idx[pid];
-        if (idx >= 0 && idx < MAX_PROCESSES &&
+        if (idx >= 0 && idx < proc_capacity &&
             proctab[idx].pid == pid && proctab[idx].state != PROC_FREE)
             return &proctab[idx];
     }
     /* Fallback: linear scan (for PIDs beyond MAX_PID) */
-    for (int i = 0; i < MAX_PROCESSES; i++) {
+    for (int i = 0; i < proc_capacity; i++) {
         if (proctab[i].pid == pid && proctab[i].state != PROC_FREE)
             return &proctab[i];
     }
@@ -989,6 +1360,22 @@ void *proc_fpu_state_ptr(void *p) { return p ? ((process_t *)p)->fpu_state : 0; 
 /* Forward declaration for thread exit cleanup (X-THREAD) */
 static void thread_exit_cleanup(process_t *p);
 
+static void proc_zombify_group_peers(process_t *self, int32_t code)
+{
+    if (!self || !self->tgid) return;
+
+    for (int i = 0; i < proc_capacity; i++) {
+        process_t *peer = &proctab[i];
+        if (peer == self || peer->tgid != self->tgid)
+            continue;
+        if (peer->state == PROC_FREE || peer->state == PROC_ZOMBIE)
+            continue;
+        thread_exit_cleanup(peer);
+        peer->exit_code = code;
+        proc_transition(peer, PROC_ZOMBIE);
+    }
+}
+
 /* Exception kill — safe to call from ISR context.
  * Marks the current process as ZOMBIE and enters HLT loop.
  * Uses no SSE/XMM instructions (compiled with -O0 for safety).
@@ -1002,6 +1389,7 @@ int proc_exception_kill(int32_t code)
 
     /* Forked/spawned process — mark ZOMBIE, scheduler will switch away */
     if (p->kernel_stack) {
+        proc_zombify_group_peers(p, code);
         thread_exit_cleanup(p);
         p->exit_code = code;
         proc_transition(p, PROC_ZOMBIE);
@@ -1035,16 +1423,18 @@ void proc_exit(int32_t code)
          * proc_wait4 handles all cleanup after the process is reaped. */
 
         /* Wake parent if it's blocked in wait4 */
-        for (int i = 0; i < MAX_PROCESSES; i++) {
+        for (int i = 0; i < proc_capacity; i++) {
             if (proctab[i].pid == p->ppid && proctab[i].state == PROC_BLOCKED) {
                 proc_transition(&proctab[i], PROC_READY);
                 break;
             }
         }
 
-        /* Halt — scheduler will pick another process on next tick */
+        /* Force a scheduling boundary even when the APIC timer is masked by
+         * a Win32 session. A plain HLT here can strand a ZOMBIE worker and
+         * prevent a process-wide exit request from reaching its main thread. */
         __asm__ volatile ("sti");
-        for (;;) __asm__ volatile ("hlt");
+        for (;;) __asm__ volatile ("int $0x20" ::: "memory");
     }
 
     /* Normal exit — process started by proc_exec (shell's exec command).
@@ -1056,10 +1446,8 @@ void proc_exit(int32_t code)
      * by int2e_stub. kern_longjmp bypasses the stub's IST1 restore (popq).
      * Without this, next INT 0x2E uses stale IST1 → stack corruption. */
     {
-        extern uint64_t *tss_ist1_ptr;
-        extern uint8_t ist1_stack[];
-        if (tss_ist1_ptr)
-            *tss_ist1_ptr = (uint64_t)(ist1_stack + 262144);  /* IST1_STACK_SIZE */
+        extern void x86_tss_reset_ist1(void);
+        x86_tss_reset_ist1();
     }
 
     kern_longjmp(exec_jmpbuf, 1);
@@ -1082,18 +1470,7 @@ void proc_exit(int32_t code)
 void proc_exit_group(int32_t code)
 {
     process_t *self = current_proc;
-    if (self) {
-        uint32_t tg = self->tgid;
-        for (int i = 0; i < MAX_PROCESSES; i++) {
-            process_t *p = &proctab[i];
-            if (p == self) continue;
-            if (p->tgid != tg) continue;
-            if (p->state == PROC_FREE || p->state == PROC_ZOMBIE) continue;
-            thread_exit_cleanup(p);   /* clear_child_tid + futex wake */
-            p->exit_code = code;
-            proc_transition(p, PROC_ZOMBIE);
-        }
-    }
+    proc_zombify_group_peers(self, code);
     proc_exit(code);   /* never returns */
 }
 
@@ -1106,8 +1483,10 @@ int proc_waitpid(uint32_t pid, int32_t *status)
     /* In single-process mode, the process has already run to completion
      * by the time we call waitpid. */
     if (p->state == PROC_ZOMBIE) {
-        if (status) *status = p->exit_code;
-        proc_free(p);
+        int32_t exit_code = p->exit_code;
+        if (!proc_free(p))
+            return -1;
+        if (status) *status = exit_code;
         return 0;
     }
 
@@ -1214,7 +1593,7 @@ int proc_exec(const char *filename, int argc, const char **argv)
             paging_switch(prev->cr3);
         else
             paging_switch(paging_get_kernel_cr3());
-        proc_free(p);
+        (void)proc_free(p);
         return code;
     }
 
@@ -1242,7 +1621,7 @@ int proc_exec(const char *filename, int argc, const char **argv)
             proc_transition(exec_parent_proc, PROC_RUNNING);
         exec_parent_proc = NULL;
     }
-    proc_free(p);
+    (void)proc_free(p);
 
     return ret;
 }
@@ -1253,7 +1632,7 @@ void proc_list(void)
     serial_puts("  PID  STATE    NAME\n");
     fb_puts("  PID  STATE    NAME\n");
 
-    for (int i = 0; i < MAX_PROCESSES; i++) {
+    for (int i = 0; i < proc_capacity; i++) {
         if (proctab[i].state == PROC_FREE) continue;
 
         serial_puts("  ");
@@ -1287,12 +1666,53 @@ void proc_list(void)
  * timer tick — if non-zero, it swaps RSP before popping GPRs,
  * effectively switching to the next process's saved interrupt frame.
  *
- * Each kernel thread gets a 16KB stack with a fake interrupt frame
- * at the top for the first context switch. After that, real frames
- * are saved/restored by the timer ISR.
+ * Each task owns a canonical interrupt frame in process_t. The timer ISR
+ * copies frames out of the CPU's IST before a task can be descheduled.
  * ════════════════════════════════════════════════════════════════ */
 
 /* ISR stub sets RSP to this value when non-zero (defined in isr_stubs.S) */
+/* Focused scheduler snapshot for Win32/CEF timeout diagnostics. */
+void proc_debug_dump_pid(uint32_t pid)
+{
+    process_t *p = proc_find(pid);
+    if (!p) {
+        serial_puts("[PROC-SNAP] pid=");
+        serial_putdec(pid);
+        serial_puts(" missing\n");
+        return;
+    }
+
+    int idx = (int)(p - proctab);
+    serial_puts("[PROC-SNAP] pid=");
+    serial_putdec(pid);
+    serial_puts(" slot=");
+    serial_putdec((uint64_t)idx);
+    serial_puts(" state=");
+    serial_putdec(p->state);
+    serial_puts(" current=");
+    serial_putdec(p == current_proc);
+    serial_puts(" sched=");
+    serial_putdec((uint64_t)(uint32_t)sched_current_idx);
+    serial_puts(" frame=");
+    serial_putdec(p->sched_frame_valid);
+    serial_puts(" rip=0x");
+    serial_puthex(p->sched_frame.rip, 16);
+    serial_puts(" rsp=0x");
+    serial_puthex(p->sched_frame.rsp, 16);
+    serial_puts(" rbp=0x");
+    serial_puthex(p->sched_frame.rbp, 16);
+    serial_puts(" gs=0x");
+    serial_puthex(p->gs_base, 16);
+    serial_puts(" sleep=0x");
+    serial_puthex(sched_sleep_deadline[idx], 16);
+    serial_puts(" active=0x");
+    serial_puthex(p->last_active_tick, 16);
+    serial_puts("\n");
+
+    if (ntsync_debug_dump_waiter)
+        ntsync_debug_dump_waiter(idx);
+}
+
 extern volatile uint64_t sched_switch_rsp;
 extern volatile uint64_t sched_switch_cr3;
 
@@ -1307,6 +1727,13 @@ static int      sched_current_idx = -1;
  * identity map and corrupting its own code. The fork path already does this
  * fixup (sched_current_idx = parent_idx); this generalizes it to plain exec. */
 int  sched_current_get(void) { return sched_current_idx; }
+uint64_t sched_current_frame_seq(void)
+{
+    int idx = sched_current_idx;
+    if (idx < 0 || idx >= proc_capacity)
+        return ~0ULL;
+    return __atomic_load_n(&sched_frame_seq[idx], __ATOMIC_RELAXED);
+}
 void sched_current_set_idx(int idx) { sched_current_idx = idx; }
 void sched_current_set_proc(void *pp)
 {
@@ -1317,13 +1744,21 @@ void sched_current_set_proc(void *pp)
 }
 static bool     sched_enabled = false;
 static uint64_t sched_switches = 0;
+/* The idle task is a scheduler fallback, not ordinary runnable work. Keep it
+ * out of normal round-robin selection unless the current task must leave the
+ * CPU (BLOCKED/ZOMBIE). */
+static int      sched_idle_idx = -1;
 
 /* Thread exit trampoline — if a kernel thread's entry function returns,
  * execution lands here (the return address was placed below the fake frame). */
 static void __attribute__((noreturn)) sched_thread_exit(void)
 {
-    if (sched_current_idx >= 0)
-        proctab[sched_current_idx].state = PROC_ZOMBIE;
+    if (sched_current_idx >= 0) {
+        process_t *p = &proctab[sched_current_idx];
+        thread_exit_cleanup(p);
+        p->exit_code = 0;
+        proc_transition(p, PROC_ZOMBIE);
+    }
     /* Yield repeatedly via software int $0x20 instead of `hlt`. With
      * the APIC timer masked (compat32 sessions do this), a hlt would
      * never wake; the scheduler would never run again and any
@@ -1335,14 +1770,21 @@ static void __attribute__((noreturn)) sched_thread_exit(void)
 
 /* ── sched_tick: called from ISR on every APIC timer tick ────── */
 
-/* Read LAPIC ID from APIC_ID register (bits 31:24) */
-extern volatile uint32_t *idt_get_apic_base(void);
-
-static inline uint32_t sched_get_lapic_id(void)
+static void sched_sleep_timeout_sweep(uint64_t now)
 {
-    volatile uint32_t *apic = idt_get_apic_base();
-    if (!apic) return 0;
-    return apic[0x020 / 4] >> 24;
+    if (!sched_sleeping_count)
+        return;
+
+    for (int i = 0; i < proc_capacity; i++) {
+        uint64_t deadline = sched_sleep_deadline[i];
+        if (!deadline || now < deadline)
+            continue;
+
+        if (proctab[i].state == PROC_BLOCKED)
+            proc_transition(&proctab[i], PROC_READY);
+        else
+            sched_sleep_cancel(i);
+    }
 }
 
 static inline bool sched_valid_frame_cs(uint64_t cs)
@@ -1361,17 +1803,97 @@ void __hot sched_tick(void *frame_ptr)
     if (!sched_enabled || sched_current_idx < 0)
         return;
 
-    /* Only BSP (LAPIC ID 0) runs the scheduler — APs have their own
-     * timer interrupts but must not touch single-CPU scheduler state */
-    if (sched_get_lapic_id() != 0)
+    /* isr_common filters AP interrupts before they can reach this function. */
+
+    /* A software yield from code called by sched_tick would enter vector 32
+     * on IST4 again and overwrite this ISR's still-live frame. sched_yield()
+     * checks this flag before issuing INT 0x20; retain this guard as a final
+     * diagnostic in case another path reaches the ISR recursively. */
+    if (__atomic_exchange_n(&sched_tick_active, 1, __ATOMIC_ACQ_REL)) {
+        if (sched_nested_yield_logs++ < 32)
+            serial_puts("[SCHED-NESTED-TICK] rejected\n");
         return;
+    }
+
+    /* Wake scheduler sleeps before selecting the next runnable task. */
+    sched_sleep_timeout_sweep(idt_get_ticks());
 
     /* Expire any timed futex waiters (pthread_cond_timedwait, sem_timedwait).
      * No-op unless at least one timed waiter is parked. */
     extern void futex_timeout_sweep(void);
     futex_timeout_sweep();
 
+    /* Parked NT waits use the same scheduler state as futexes. Wake expired
+     * waits and waitable timers before selecting the next runnable task. */
+    extern void ntsync_poll_waiters(uint64_t now);
+    ntsync_poll_waiters(idt_get_ticks());
+
     process_t *cur = &proctab[sched_current_idx];
+    uint64_t *frame_words = (uint64_t *)frame_ptr;
+    uint64_t interrupted_rsp = frame_words[20];
+
+    if (!(frame_words[19] & (1ULL << 9)) &&
+        sched_irq_off_save_logs++ < 32) {
+        serial_puts("[SCHED-SAVE-IF0] pid=");
+        serial_putdec(cur->pid);
+        serial_puts(" compat32=");
+        serial_putdec((uint64_t)(uint32_t)cur->compat32_mode);
+        serial_puts(" state=");
+        serial_putdec(cur->state);
+        serial_puts(" rip=0x");
+        serial_puthex(frame_words[17], 16);
+        serial_puts(" vec=");
+        serial_putdec(frame_words[15]);
+        serial_puts("\n");
+    }
+
+    /* Validate scheduler identity and both task-owned stack channels before
+     * touching the run queue. This catches a bad restore at the next yield,
+     * while the offending PID and stack owner are still recoverable. */
+    {
+        extern uint64_t *tss_ist1_ptr;
+        const char *rsp_kind = "none";
+        const char *ist_kind = "none";
+        int rsp_owner = sched_stack_owner(interrupted_rsp, &rsp_kind);
+        int ist_owner = tss_ist1_ptr
+                      ? sched_stack_owner(*tss_ist1_ptr, &ist_kind) : -1;
+        /* Some Win64 process entry paths intentionally switch to a PE-owned
+         * stack that is not registered in process_t. Only a stack positively
+         * owned by another scheduler slot is a mismatch. */
+        bool bad_rsp_owner = rsp_owner >= 0 &&
+                             rsp_owner != sched_current_idx;
+        bool bad_ist_owner = sched_compat_ist1_phys[sched_current_idx] &&
+                             ist_owner != sched_current_idx;
+
+        if ((current_proc != cur || bad_rsp_owner || bad_ist_owner) &&
+            sched_owner_mismatch_logs++ < 64) {
+            serial_puts("[SCHED-OWNER-MISMATCH] idx=");
+            serial_putdec((uint64_t)sched_current_idx);
+            serial_puts(" pid="); serial_putdec(cur->pid);
+            serial_puts(" state="); serial_putdec(cur->state);
+            serial_puts(" current=0x");
+            serial_puthex((uint64_t)(uintptr_t)current_proc, 16);
+            serial_puts(" rsp=0x"); serial_puthex(interrupted_rsp, 16);
+            serial_puts(" rsp_owner=");
+            if (rsp_owner >= 0) {
+                serial_putdec(proctab[rsp_owner].pid);
+                serial_puts("/"); serial_puts(rsp_kind);
+            } else {
+                serial_puts("none");
+            }
+            serial_puts(" ist1=0x");
+            serial_puthex(tss_ist1_ptr ? *tss_ist1_ptr : 0, 16);
+            serial_puts(" ist_owner=");
+            if (ist_owner >= 0) {
+                serial_putdec(proctab[ist_owner].pid);
+                serial_puts("/"); serial_puts(ist_kind);
+            } else {
+                serial_puts("none");
+            }
+            serial_puts(" rip=0x"); serial_puthex(frame_words[17], 16);
+            serial_puts("\n");
+        }
+    }
 
     /* Drain syscall-free command ring for current process (if registered).
      * fd_table macro resolves via current_proc which is correct here. */
@@ -1386,6 +1908,23 @@ void __hot sched_tick(void *frame_ptr)
     bool force_switch = (cur->state == PROC_ZOMBIE || cur->state == PROC_BLOCKED);
     bool quantum_expired = false;
 
+    /* Native INT 0x2E frames live on IST1 and cannot be asynchronously
+     * preempted.  Cooperative yields use quantum == 0 and remain valid. */
+    extern uint8_t ist1_stack[];
+    uint64_t compat_stack = sched_compat_ist1_phys[sched_current_idx]
+        ? (uint64_t)PHYS_TO_VIRT(sched_compat_ist1_phys[sched_current_idx])
+        : (uint64_t)ist1_stack;
+    bool in_compat_shim = interrupted_rsp >= compat_stack &&
+                          interrupted_rsp < compat_stack + COMPAT_IST1_STACK_SIZE;
+    uint64_t runtime_stack = (uint64_t)cur->kernel_stack;
+    bool in_runtime_stack = cur->kernel_stack &&
+                            interrupted_rsp >= runtime_stack + 4096 &&
+                            interrupted_rsp <= runtime_stack + KERNEL_STACK_SIZE - 16;
+    if (in_compat_shim && !force_switch && cur->quantum != 0) {
+        __atomic_store_n(&sched_tick_active, 0, __ATOMIC_RELEASE);
+        return;
+    }
+
     if (!force_switch) {
         extern bool idt_tsc_deadline_active(void);
         if (idt_tsc_deadline_active()) {
@@ -1399,21 +1938,35 @@ void __hot sched_tick(void *frame_ptr)
         }
     }
 
-    /* O(1) run queue: pick head of highest non-empty QoS queue */
+    /* Pick the highest-priority non-idle task. The dedicated idle task stays
+     * READY so the last real task can block, but must not steal quanta from a
+     * RUNNING task merely because it is the only run-queue entry. */
     int next_idx = -1;
-    if (ready_bitmap) {
+    int idle_candidate = -1;
+    if (ready_count) {
         for (int q = QOS_REALTIME; q >= QOS_IDLE; q--) {
-            if (runq_head[q] >= 0) {
-                next_idx = runq_head[q];
+            for (int idx = runq_head[q]; idx >= 0;
+                 idx = proctab[idx].runq_next) {
+                if (idx == sched_idle_idx) {
+                    idle_candidate = idx;
+                    continue;
+                }
+                next_idx = idx;
                 break;
             }
+            if (next_idx >= 0)
+                break;
         }
     }
+
+    if (next_idx < 0 && force_switch)
+        next_idx = idle_candidate;
 
     if (next_idx < 0) {
         /* No other runnable process — reset quantum, continue */
         if (quantum_expired)
             cur->quantum = qos_quantum[cur->qos_class];
+        __atomic_store_n(&sched_tick_active, 0, __ATOMIC_RELEASE);
         return;
     }
 
@@ -1429,6 +1982,7 @@ void __hot sched_tick(void *frame_ptr)
             extern void spec_prefetch_ahead(uint64_t rip, uint64_t cr3);
             uint64_t *f = (uint64_t *)frame_ptr;
             spec_prefetch_ahead(f[17] /* RIP */, cur->cr3);
+            __atomic_store_n(&sched_tick_active, 0, __ATOMIC_RELEASE);
             return;
         }
         /* Preemption: higher priority process is waiting */
@@ -1436,15 +1990,48 @@ void __hot sched_tick(void *frame_ptr)
 
     /* ── Context switch ────────────────────────────────────────── */
 
-    /* Save current process: frame_ptr is RSP pointing to the saved
-     * GPRs on this process's stack (set by ISR stub before calling
-     * isr_handler). Store it so we can restore later. */
-    cur->kernel_rsp = (uint64_t)frame_ptr;
+    /* INT 0x2E may yield while its C call chain is live. Preserve the
+     * process-owned IST1 cursor before another process uses the TSS. */
+    extern uint64_t *tss_ist1_ptr;
+    if (tss_ist1_ptr) {
+        uint64_t cursor = *tss_ist1_ptr;
+        if (!sched_compat_ist1_phys[sched_current_idx]) {
+            sched_compat_ist1[sched_current_idx] = cursor;
+        } else if (sched_compat_ist1_contains(sched_current_idx, cursor)) {
+            sched_compat_ist1[sched_current_idx] = cursor;
+        } else {
+            uint64_t replacement = sched_compat_ist1[sched_current_idx];
+            if (!sched_compat_ist1_contains(sched_current_idx, replacement)) {
+                uint64_t base = (uint64_t)PHYS_TO_VIRT(
+                    sched_compat_ist1_phys[sched_current_idx]);
+                replacement = base + COMPAT_IST1_STACK_SIZE;
+                sched_compat_ist1[sched_current_idx] = replacement;
+            }
+            sched_ist1_guard_log("save", sched_current_idx, cursor,
+                                 replacement);
+        }
+    }
 
-    /* Save-time canary: verify frame is valid NOW and plant a canary
-     * below it so we can detect post-save corruption at restore time. */
+    /* IST4 belongs to the CPU and will be reused by the next interrupt.
+     * Copy the complete return frame into task-owned storage before the
+     * current task can remain descheduled across another tick. */
+    memcpy(&cur->sched_frame, frame_ptr, sizeof(cur->sched_frame));
+    cur->sched_frame_valid = true;
+    cur->kernel_rsp = (uint64_t)&cur->sched_frame;
+    sched_frame_seq[sched_current_idx]++;
+    sched_frame_stack_rsp[sched_current_idx] = 0;
+    if ((in_compat_shim &&
+         interrupted_rsp <= compat_stack + COMPAT_IST1_STACK_SIZE - 16) ||
+        in_runtime_stack) {
+        uint64_t *saved_stack = (uint64_t *)interrupted_rsp;
+        sched_frame_stack_rsp[sched_current_idx] = interrupted_rsp;
+        sched_frame_stack_qword0[sched_current_idx] = saved_stack[0];
+        sched_frame_stack_qword1[sched_current_idx] = saved_stack[1];
+    }
+
+    /* Verify the copied frame now and retain CS/RIP diagnostics. */
     {
-        uint64_t *f = (uint64_t *)frame_ptr;
+        uint64_t *f = (uint64_t *)&cur->sched_frame;
         uint64_t cs = f[18];
         if (!sched_valid_frame_cs(cs)) {
             serial_puts("[SCHED] BAD SAVE PID ");
@@ -1475,71 +2062,14 @@ void __hot sched_tick(void *frame_ptr)
         }
         cur->fs_base = live_fs;
     }
+    cur->gs_base = rdmsr(MSR_GS_BASE);
     /* Only mark as READY if currently RUNNING.
      * ZOMBIE processes must stay ZOMBIE — proc_wait4 relies on this. */
     if (cur->state == PROC_RUNNING)
         proc_transition(cur, PROC_READY);
 
-    /* ── Memory compression: track idle time ── */
-    {
-        uint64_t now = idt_get_ticks();
-
-        /* Update departing process's activity timestamp */
-        cur->last_active_tick = now;
-
-        /* Compress pages of processes idle too long (macOS-style).
-         * Only do this occasionally (every 100 ticks = 1s) to avoid
-         * overhead in the hot scheduler path. */
-        extern uint32_t memcompress_idle_threshold(void);
-        extern int memcompress_process_pages(uint32_t, void*, uint64_t);
-        extern int memcompress_restore_process(uint32_t);
-
-        if ((now & 0xFF) == 0) {  /* ~every 2.5 seconds */
-            extern int smp_submit_any(void (*)(void*, void*), void*, void*);
-            extern int ap_worker_count;
-
-            /* Pool of arg blocks — fixes single-static-arg race where
-             * two eligible processes in the same tick clobber each other's
-             * args before the AP reads them. */
-            #define MC_SLOTS 4
-            static struct mc_arg_s {
-                uint32_t pid; void *base; uint64_t pages;
-                volatile int in_use;
-            } mc_args[MC_SLOTS];
-
-            for (int i = 0; i < MAX_PROCESSES; i++) {
-                process_t *p = &proctab[i];
-                if (p->state == PROC_BLOCKED && !p->pages_compressed &&
-                    p->last_active_tick > 0 &&
-                    (now - p->last_active_tick) > memcompress_idle_threshold()) {
-                    if (ap_worker_count > 0) {
-                        /* Find a free arg slot */
-                        int slot = -1;
-                        for (int s = 0; s < MC_SLOTS; s++) {
-                            if (__sync_lock_test_and_set(&mc_args[s].in_use, 1) == 0) {
-                                slot = s;
-                                break;
-                            }
-                        }
-                        if (slot < 0) break;  /* all slots busy, retry next cycle */
-
-                        mc_args[slot].pid = p->pid;
-                        mc_args[slot].base = (p->region_count > 0) ? p->regions[0].base : 0;
-                        mc_args[slot].pages = (p->region_count > 0) ? p->regions[0].pages : 0;
-                        extern void memcompress_worker(void *arg, void *result);
-                        extern int smp_submit_ff(void (*)(void*, void*), void*, void*);
-                        if (smp_submit_ff(memcompress_worker, &mc_args[slot], 0) < 0)
-                            __sync_lock_release(&mc_args[slot].in_use);  /* no AP free */
-                    }
-                    /* No inline fallback — never compress inside the ISR.
-                     * Single-CPU systems skip compression entirely (acceptable:
-                     * compression is an optimization, not a correctness requirement). */
-                    p->pages_compressed = true;
-                }
-            }
-        }
-    }
-
+#if 0
+    /* Legacy scheduler-owned polling. Kept temporarily for hardware bisects. */
     /* Drive network stack en cada timer tick:
      *   - Si hay process bloqueado en net I/O (DHCP retry, TCP connect, etc.).
      *   - O si la NIC señaló IRQ pending (paquete entrante por drenar).
@@ -1607,22 +2137,101 @@ void __hot sched_tick(void *frame_ptr)
          * thread or a kernel thread. */
     }
 
+#endif
+    /* RX is driven by the net-rx kernel thread. Calling net_poll() here is
+     * unsafe because packet handling can wake scheduler waiters while this
+     * function still owns the outgoing ISR frame. */
+
     /* Load next process */
     process_t *next = &proctab[next_idx];
 
-    /* Decompress pages if needed before running */
-    if (next->pages_compressed) {
-        extern int memcompress_restore_process(uint32_t);
-        memcompress_restore_process(next->pid);
-        next->pages_compressed = false;
+    /* A task cannot legitimately consume the same saved frame twice. If it
+     * does, its live stack may already have been reused by a later INT 2E.
+     * Report both the stale generation and any changed return-stack words
+     * before IRET turns the corruption into an opaque #GP. */
+    uint64_t next_seq = sched_frame_seq[next_idx];
+    if (next_seq && next_seq == sched_frame_resumed_seq[next_idx]) {
+        serial_puts("[SCHED-STALE-FRAME] pid=");
+        serial_putdec(next->pid);
+        serial_puts(" by_pid=");
+        serial_putdec(cur->pid);
+        serial_puts(" seq=");
+        serial_putdec(next_seq);
+        serial_puts(" rip=0x");
+        serial_puthex(((uint64_t *)&next->sched_frame)[17], 16);
+        serial_puts(" rsp=0x");
+        serial_puthex(((uint64_t *)&next->sched_frame)[20], 16);
+        serial_puts("\n");
     }
+    uint64_t saved_stack_rsp = sched_frame_stack_rsp[next_idx];
+    if (saved_stack_rsp) {
+        uint64_t now0 = ((uint64_t *)saved_stack_rsp)[0];
+        uint64_t now1 = ((uint64_t *)saved_stack_rsp)[1];
+        if (now0 != sched_frame_stack_qword0[next_idx] ||
+            now1 != sched_frame_stack_qword1[next_idx]) {
+            uint64_t next_stack = (uint64_t)next->kernel_stack;
+            bool runtime_snapshot = next->kernel_stack &&
+                saved_stack_rsp >= next_stack + 4096 &&
+                saved_stack_rsp <= next_stack + KERNEL_STACK_SIZE - 16;
+            serial_puts("[SCHED-STACK-CLOBBER] pid=");
+            serial_putdec(next->pid);
+            serial_puts(" by_pid=");
+            serial_putdec(cur->pid);
+            serial_puts(" seq=");
+            serial_putdec(next_seq);
+            serial_puts(" rsp=0x");
+            serial_puthex(saved_stack_rsp, 16);
+            serial_puts(" saved=");
+            serial_puthex(sched_frame_stack_qword0[next_idx], 16);
+            serial_puts("/");
+            serial_puthex(sched_frame_stack_qword1[next_idx], 16);
+            serial_puts(" now=");
+            serial_puthex(now0, 16);
+            serial_puts("/");
+            serial_puthex(now1, 16);
+            serial_puts(" kind=");
+            serial_puts(runtime_snapshot ? "runtime" : "compat");
+            serial_puts(" ist1=0x");
+            serial_puthex(sched_compat_ist1[next_idx], 16);
+            serial_puts("\n");
+
+            /* The PMM ring tells us whether the backing page was freed and
+             * reused, or remained allocated and was reached through a bad
+             * alias/write. Emit it at the first observable corruption point. */
+            if (saved_stack_rsp >= KERNEL_VBASE) {
+                extern void mem_debug_dump_page(uint64_t phys);
+                mem_debug_dump_page(VIRT_TO_PHYS(saved_stack_rsp));
+            }
+        }
+    }
+    sched_frame_resumed_seq[next_idx] = next_seq;
 
     proc_transition(next, PROC_RUNNING);
     next->quantum = qos_quantum[next->qos_class];
-    next->last_active_tick = idt_get_ticks();
     set_current_proc(next);
     sched_current_idx = next_idx;
+    if (tss_ist1_ptr) {
+        uint64_t cursor = sched_compat_ist1[next_idx];
+        if (sched_compat_ist1_phys[next_idx]) {
+            if (!sched_compat_ist1_contains(next_idx, cursor)) {
+                uint64_t base = (uint64_t)PHYS_TO_VIRT(
+                    sched_compat_ist1_phys[next_idx]);
+                uint64_t replacement = base + COMPAT_IST1_STACK_SIZE;
+                sched_ist1_guard_log("restore", next_idx, cursor,
+                                     replacement);
+                cursor = replacement;
+                sched_compat_ist1[next_idx] = replacement;
+            }
+            *tss_ist1_ptr = cursor;
+        } else if (cursor) {
+            *tss_ist1_ptr = cursor;
+        } else {
+            extern void x86_tss_reset_ist1(void);
+            x86_tss_reset_ist1();
+        }
+    }
     wrmsr(MSR_FS_BASE, next->fs_base);  /* restore per-thread TLS */
+    wrmsr(MSR_GS_BASE, next->gs_base);  /* restore Win64 TEB */
 
     uint64_t active_cr3;
     __asm__ volatile ("mov %%cr3, %0" : "=r"(active_cr3));
@@ -1631,6 +2240,14 @@ void __hot sched_tick(void *frame_ptr)
      * a valid CS selector and the canary we planted at save time. */
     if (next->kernel_rsp >= 0xFFFF800000000000ULL || next->cr3 == active_cr3) {
         uint64_t *frame = (uint64_t *)next->kernel_rsp;
+        if (!next->sched_frame_valid || !frame) {
+            serial_puts("[SCHED] PID has no saved frame: ");
+            serial_putdec(next->pid);
+            serial_puts("\n");
+            proc_transition(next, PROC_ZOMBIE);
+            __atomic_store_n(&sched_tick_active, 0, __ATOMIC_RELEASE);
+            return;
+        }
         uint64_t cs = frame[18];
 
         uint64_t rip = frame[17];
@@ -1668,6 +2285,7 @@ void __hot sched_tick(void *frame_ptr)
             serial_puts(" RIP=0x"); serial_puthex(next->saved_frame_rip, 16);
             serial_puts("\n");
             proc_transition(next, PROC_ZOMBIE);
+            __atomic_store_n(&sched_tick_active, 0, __ATOMIC_RELEASE);
             return;
         }
     }
@@ -1697,24 +2315,32 @@ void __hot sched_tick(void *frame_ptr)
     sched_switch_rsp = next->kernel_rsp;
 
     sched_switches++;
+    __atomic_store_n(&sched_tick_active, 0, __ATOMIC_RELEASE);
 }
 
-/* ── sched_spawn: create a preemptively-scheduled kernel thread ── */
-
-int sched_spawn(const char *name, void (*entry)(void))
+/* A task's CR3 must be installed before PROC_READY is published. Otherwise a
+ * timer tick can run a newly spawned process briefly in the caller's address
+ * space before the creator gets a chance to update its process-table slot. */
+static int sched_spawn_with_address_space(const char *name,
+                                          void (*entry)(void),
+                                          uint64_t cr3, int owns_cr3,
+                                          bool start_blocked)
 {
+    process_t *address_space_parent = NULL;
+    if (!owns_cr3 && cr3 && cr3 != paging_get_kernel_cr3() &&
+        current_proc && current_proc->cr3 == cr3)
+        address_space_parent = current_proc;
+
     process_t *p = proc_alloc(name);
     if (!p) {
         serial_puts("[SCHED] No free process slot\n");
         return -1;
     }
 
-    /* Allocate kernel stack via the upper-half direct map. The stack
+    /* Allocate the runtime stack via the upper-half direct map. The stack
      * top RSP needs to be reachable from any process's CR3, and only
      * PML4[256] (the kernel mirror) is shared across all CR3s once the
-     * lower-half identity map disappears. Storing the upper-half view
-     * in p->kernel_stack also means writes to the fake interrupt frame
-     * below go through PML4[256]. */
+     * lower-half identity map disappears. */
     void *stack_phys = mem_alloc_aligned(KERNEL_STACK_SIZE, 4096);
     if (!stack_phys) {
         proc_transition(p, PROC_FREE);
@@ -1731,16 +2357,14 @@ int sched_spawn(const char *name, void (*entry)(void))
 
     uint64_t stack_top = (uint64_t)stack + KERNEL_STACK_SIZE;
 
-    /* Place fake interrupt frame at top of stack (176 bytes = 22 × uint64_t).
-     * When the scheduler first switches to this process, the ISR stub
-     * pops GPRs from this frame and iretq jumps to the entry function. */
-    uint64_t frame_addr = (stack_top - 176) & ~0xFULL;  /* 16-byte aligned */
-    uint64_t *frame = (uint64_t *)frame_addr;
-    memset(frame, 0, 176);
+    /* The initial return context is canonical process state, not a live frame
+     * on a CPU or runtime stack. */
+    uint64_t *frame = (uint64_t *)&p->sched_frame;
+    memset(frame, 0, sizeof(p->sched_frame));
 
-    /* Place return address below frame — if entry() returns, it lands
+    /* Place a return address on the runtime stack. If entry() returns, it lands
      * in sched_thread_exit() which marks the process as ZOMBIE. */
-    uint64_t ret_addr = frame_addr - 8;
+    uint64_t ret_addr = stack_top - 8;
     *(uint64_t *)ret_addr = (uint64_t)sched_thread_exit;
 
     /* Fill CPU-pushed portion of interrupt frame:
@@ -1751,10 +2375,19 @@ int sched_spawn(const char *name, void (*entry)(void))
     frame[20] = ret_addr;           /* RSP = just below frame (ABI: 8 mod 16) */
     frame[21] = 0x30;               /* SS  = kernel data segment */
 
+    if (cr3) {
+        p->cr3 = cr3;
+        p->owns_cr3 = owns_cr3 != 0;
+    }
+    if (address_space_parent)
+        proc_attach_thread(p, address_space_parent,
+                           address_space_parent->tgid);
+
     /* Set initial scheduler state */
-    p->kernel_rsp = frame_addr;
-    proc_transition(p, PROC_READY);
+    p->sched_frame_valid = true;
+    p->kernel_rsp = (uint64_t)&p->sched_frame;
     p->quantum = qos_quantum[p->qos_class];
+    proc_transition(p, start_blocked ? PROC_BLOCKED : PROC_READY);
 
     /* Auto-activate scheduler on first spawn */
     if (!sched_enabled) {
@@ -1764,13 +2397,46 @@ int sched_spawn(const char *name, void (*entry)(void))
         serial_puts("[SCHED] Preemptive scheduling activated\n");
     }
 
+#if !defined(OK_QUIET) || !OK_QUIET
     serial_puts("[SCHED] Spawned '");
     serial_puts(name);
     serial_puts("' PID ");
     serial_putdec(p->pid);
     serial_puts("\n");
+#endif
 
     return (int)p->pid;
+}
+
+int sched_spawn(const char *name, void (*entry)(void))
+{
+    return sched_spawn_with_address_space(
+        name, entry, paging_get_kernel_cr3(), false, false);
+}
+
+int sched_spawn_in_address_space(const char *name, void (*entry)(void),
+                                 uint64_t cr3, int owns_cr3)
+{
+    if (!cr3 || cr3 == paging_get_kernel_cr3())
+        owns_cr3 = false;
+    return sched_spawn_with_address_space(name, entry,
+                                          cr3 ? cr3 : paging_get_kernel_cr3(),
+                                          owns_cr3, false);
+}
+
+/* Create a fully initialized scheduler task without making it runnable. The
+ * caller publishes subsystem-specific lookup state, then calls proc_wake_pid.
+ * This closes the window where another CPU can enter a task before its owner
+ * has installed thread-local state such as a TEB or compatibility IST. */
+int sched_spawn_in_address_space_blocked(const char *name,
+                                         void (*entry)(void),
+                                         uint64_t cr3, int owns_cr3)
+{
+    if (!cr3 || cr3 == paging_get_kernel_cr3())
+        owns_cr3 = false;
+    return sched_spawn_with_address_space(name, entry,
+                                          cr3 ? cr3 : paging_get_kernel_cr3(),
+                                          owns_cr3, true);
 }
 
 /* ── sched_yield: voluntarily give up remaining time slice ────── */
@@ -1778,6 +2444,32 @@ int sched_spawn(const char *name, void (*entry)(void))
 void sched_yield(void)
 {
     if (!sched_enabled || sched_current_idx < 0) return;
+
+    uint64_t entry_flags;
+    __asm__ volatile ("pushfq; popq %0" : "=r"(entry_flags));
+    if (!(entry_flags & (1ULL << 9))) {
+        if (sched_irq_off_yield_logs++ < 32) {
+            serial_puts("[SCHED-YIELD-IF0] rejected pid=");
+            serial_putdec(proctab[sched_current_idx].pid);
+            serial_puts(" caller=0x");
+            serial_puthex((uint64_t)__builtin_return_address(0), 16);
+            serial_puts(" flags=0x");
+            serial_puthex(entry_flags, 16);
+            serial_puts("\n");
+        }
+        return;
+    }
+
+    if (__atomic_load_n(&sched_tick_active, __ATOMIC_ACQUIRE)) {
+        if (sched_nested_yield_logs++ < 32) {
+            serial_puts("[SCHED-NESTED-YIELD] pid=");
+            serial_putdec(proctab[sched_current_idx].pid);
+            serial_puts(" caller=0x");
+            serial_puthex((uint64_t)__builtin_return_address(0), 16);
+            serial_puts("\n");
+        }
+        return;
+    }
     proctab[sched_current_idx].quantum = 0;
     /* Invoke the timer ISR via software INT instead of waiting for
      * the next hardware tick. The APIC LVT_TIMER is masked while UT99
@@ -1788,6 +2480,63 @@ void sched_yield(void)
      * whichever process the scheduler picks next (or back to us if
      * we're still the highest-priority READY process). */
     __asm__ volatile ("int $0x20" ::: "memory");
+}
+
+/* Park the current task for at least ticks scheduler ticks (10ms each).
+ * Returning -1 means no other task was runnable, so callers can use a local
+ * fallback without leaving the scheduler's current slot BLOCKED. */
+int sched_sleep_ticks(uint64_t ticks)
+{
+    if (!ticks) {
+        sched_yield();
+        return 0;
+    }
+    if (!sched_enabled || sched_current_idx < 0)
+        return -1;
+
+    /* Releasing IOCP concurrency slots may contend on a port lock and yield.
+     * Do it before disabling interrupts; yielding from the irq-off window
+     * would save a task frame with IF=0 and eventually stall the BSP timer. */
+    if (k32_iocp_thread_blocking)
+        k32_iocp_thread_blocking();
+
+    uint64_t flags;
+    __asm__ volatile ("pushfq; popq %0; cli" : "=r"(flags) :: "memory");
+
+    int idx = sched_current_idx;
+    process_t *cur = &proctab[idx];
+    if (cur->state != PROC_RUNNING) {
+        if (flags & (1ULL << 9))
+            __asm__ volatile ("sti" ::: "memory");
+        return -1;
+    }
+
+    uint64_t now = idt_get_ticks();
+    uint64_t deadline = now + ticks;
+    if (deadline < now)
+        deadline = ~0ULL;
+
+    sched_sleep_deadline[idx] = deadline;
+    sched_sleeping_count++;
+    proc_transition(cur, PROC_BLOCKED);
+
+    if (flags & (1ULL << 9))
+        __asm__ volatile ("sti" ::: "memory");
+
+    sched_yield();
+
+    /* With no READY peer sched_tick keeps the current task in place. Undo the
+     * park so the caller can preserve progress with its cooperative fallback. */
+    if (__atomic_load_n(&cur->state, __ATOMIC_ACQUIRE) == PROC_BLOCKED) {
+        __asm__ volatile ("cli" ::: "memory");
+        if (cur->state == PROC_BLOCKED)
+            proc_transition(cur, PROC_RUNNING);
+        if (flags & (1ULL << 9))
+            __asm__ volatile ("sti" ::: "memory");
+        return -1;
+    }
+
+    return 0;
 }
 
 /* ── sched_stats: return context switch count ────────────────── */
@@ -1802,12 +2551,28 @@ uint64_t sched_get_next_deadline_us(void)
     if (!sched_enabled || sched_current_idx < 0)
         return 10000;  /* 10ms default if scheduler not active yet */
 
-    /* Check if any process is READY */
-    if (ready_bitmap == 0)
-        return 0;  /* tickless idle — no deadline */
-
     process_t *cur = &proctab[sched_current_idx];
-    return qos_quantum_us[cur->qos_class];
+    uint64_t next_us = ready_count ? qos_quantum_us[cur->qos_class] : 0;
+
+    /* A blocked sleeper still needs a hardware deadline even when the normal
+     * run queue is empty; otherwise TSC-deadline mode would idle forever. */
+    if (sched_sleeping_count) {
+        uint64_t now = idt_get_ticks();
+        uint64_t sleep_us = 0;
+        for (int i = 0; i < proc_capacity; i++) {
+            uint64_t deadline = sched_sleep_deadline[i];
+            if (!deadline)
+                continue;
+            uint64_t candidate = deadline <= now
+                ? 1 : (deadline - now) * 10000ULL;
+            if (!sleep_us || candidate < sleep_us)
+                sleep_us = candidate;
+        }
+        if (sleep_us && (!next_us || sleep_us < next_us))
+            next_us = sleep_us;
+    }
+
+    return next_us;  /* 0 only for true tickless idle */
 }
 
 /* ── Net-blocking helpers ───────────────────────────────────────
@@ -1819,23 +2584,45 @@ uint64_t sched_get_next_deadline_us(void)
 int sched_block_current(void)
 {
     if (!sched_enabled || sched_current_idx < 0) return -1;
-    proc_transition(&proctab[sched_current_idx], PROC_BLOCKED);
+    if (k32_iocp_thread_blocking)
+        k32_iocp_thread_blocking();
+
+    uint64_t flags;
+    __asm__ volatile ("pushfq; popq %0; cli" : "=r"(flags) :: "memory");
+
+    int idx = sched_current_idx;
+    if (idx < 0 || proctab[idx].state != PROC_RUNNING || ready_count == 0) {
+        if (flags & (1ULL << 9))
+            __asm__ volatile ("sti" ::: "memory");
+        return -1;
+    }
+
+    proc_transition(&proctab[idx], PROC_BLOCKED);
     __asm__ volatile ("mfence" ::: "memory");
-    return sched_current_idx;
+    if (flags & (1ULL << 9))
+        __asm__ volatile ("sti" ::: "memory");
+    return idx;
 }
 
 void sched_unblock(int proc_idx)
 {
-    if (proc_idx >= 0 && proc_idx < MAX_PROCESSES &&
-        proctab[proc_idx].state == PROC_BLOCKED)
+    if (proc_idx >= 0 && proc_idx < proc_capacity &&
+        proctab[proc_idx].state == PROC_BLOCKED) {
         proc_transition(&proctab[proc_idx], PROC_READY);
+        /* A task woken by IPC is latency-sensitive. Put it at the front of
+         * its QoS queue and expire the current slice so a producer that then
+         * blocks hands the CPU directly to its consumer. */
+        runq_promote_front(proc_idx);
+        if (sched_current_idx >= 0 && sched_current_idx != proc_idx)
+            proctab[sched_current_idx].quantum = 0;
+    }
 }
 
 /* Accessor for io_predict — returns pointer to the current process's
  * 32-byte last_opened scratch buffer, or NULL if no current proc. */
 char *proc_current_last_opened(void)
 {
-    if (sched_current_idx < 0 || sched_current_idx >= MAX_PROCESSES) return 0;
+    if (sched_current_idx < 0 || sched_current_idx >= proc_capacity) return 0;
     process_t *p = &proctab[sched_current_idx];
     if (p->state == PROC_FREE) return 0;
     return p->last_opened;
@@ -1896,6 +2683,7 @@ void sched_test_b(void)
 
 /* User RSP saved by syscall_entry.S before any pushes */
 extern volatile uint64_t syscall_user_rsp;
+extern volatile uint64_t syscall_frame_rsp;
 
 /*
  * proc_fork — create child process via scheduler.
@@ -1944,9 +2732,10 @@ int32_t proc_fork(uint64_t child_stack)
      * what matters for resuming the C caller.
      */
 
-    /* Read ALL user registers from the SYSCALL save area on the stack.
-     * syscall_entry.S saves user RSP in syscall_user_rsp before any pushes,
-     * then pushes 14 registers in this order:
+    /* Read ALL user registers from the SYSCALL save area. syscall_entry.S
+     * publishes its actual address in syscall_frame_rsp because the frame may
+     * live on the private kernel stack rather than below the user RSP. It
+     * pushes 14 registers in this order:
      *   push RBP, RBX, R12, R13, R14, R15, RCX(=RIP), R11(=RFLAGS),
      *        RDI, RSI, RDX, R10, R8, R9
      * So frame_base = user_rsp - 14*8 and the offsets are:
@@ -1960,7 +2749,7 @@ int32_t proc_fork(uint64_t child_stack)
      * user values saved at SYSCALL entry.
      */
     uint64_t user_rsp = syscall_user_rsp;
-    uint64_t *frame_base = (uint64_t *)(user_rsp - 14 * 8);
+    uint64_t *frame_base = (uint64_t *)syscall_frame_rsp;
 
     uint64_t user_r9     = frame_base[0];
     uint64_t user_r8     = frame_base[1];
@@ -2008,6 +2797,7 @@ int32_t proc_fork(uint64_t child_stack)
      * userland via the fake IRETQ frame, NOT the syscall return path, so the
      * syscall_dispatch FS-restore wrapper does not cover it — this does. */
     child->fs_base = parent->fs_base;
+    child->gs_base = parent->gs_base;
 
     /* Fork: allocate a NEW fd_table (separate copy for child).
      * Each inherited pipe fd bumps the corresponding refcounts. */
@@ -2044,14 +2834,9 @@ int32_t proc_fork(uint64_t child_stack)
     void *stack = PHYS_TO_VIRT(stack_phys);
     child->kernel_stack = stack;
 
-    uint64_t stack_top = (uint64_t)stack + KERNEL_STACK_SIZE;
-
-    /* Build fake interrupt frame at top of child's kernel stack.
-     * When the scheduler switches to this process, the ISR stub
-     * pops GPRs from this frame and IRETQ returns to userspace. */
-    uint64_t child_frame_addr = (stack_top - 176) & ~0xFULL;
-    uint64_t *cf = (uint64_t *)child_frame_addr;
-    memset(cf, 0, 176);
+    /* Build the child's canonical initial return context. */
+    uint64_t *cf = (uint64_t *)&child->sched_frame;
+    memset(cf, 0, sizeof(child->sched_frame));
 
     /* GPRs — match parent's values */
     cf[0]  = r15;           /* R15 */
@@ -2158,9 +2943,19 @@ int32_t proc_fork(uint64_t child_stack)
         }
     }
 
+    /* The copied table owns independent descriptor references. Delay these
+     * retains until all fallible child allocations have succeeded. */
+    for (int i = 0; i < MAX_FDS; i++) {
+        fd_entry_t *entry = &child->fd_table->entries[i];
+        if (entry->open && entry->type == FD_TYPE_FILE &&
+            entry->node.fs_version == 2)
+            osfs2_file_retain(entry->node.data);
+    }
+
     /* Set up scheduler state — child inherits parent's QoS class */
     child->qos_class = parent->qos_class;
-    child->kernel_rsp = child_frame_addr;
+    child->sched_frame_valid = true;
+    child->kernel_rsp = (uint64_t)&child->sched_frame;
     child->quantum = qos_quantum[child->qos_class];
     proc_transition(child, PROC_READY);
 
@@ -2225,7 +3020,7 @@ void vfork_release(void *child_vp)
     if (!child || !child->vforked_parent) return;
     uint32_t ppid = child->vforked_parent;
     child->vforked_parent = 0;
-    for (int i = 0; i < MAX_PROCESSES; i++) {
+    for (int i = 0; i < proc_capacity; i++) {
         if (proctab[i].pid == ppid && proctab[i].state == PROC_BLOCKED) {
             proc_transition(&proctab[i], PROC_READY);
             serial_puts("[VFORK-REL] woke parent pid="); serial_putdec(ppid);
@@ -2259,8 +3054,7 @@ int32_t proc_clone_thread(uint64_t child_stack, uint64_t parent_tidptr,
     process_t *parent = current_proc;
 
     /* Read parent's register state from SYSCALL save frame */
-    uint64_t user_rsp = syscall_user_rsp;
-    uint64_t *frame_base = (uint64_t *)(user_rsp - 14 * 8);
+    uint64_t *frame_base = (uint64_t *)syscall_frame_rsp;
 
     uint64_t user_r9     = frame_base[0];
     uint64_t user_r8     = frame_base[1];
@@ -2284,26 +3078,12 @@ int32_t proc_clone_thread(uint64_t child_stack, uint64_t parent_tidptr,
         return -1;
     }
 
-    /* Thread shares parent's thread group */
-    thread->tgid = parent->tgid;
-    thread->ppid = parent->pid;
-    thread->is_thread = true;
-
-    /* A CLONE_THREAD thread genuinely shares the parent's address space →
-     * share its CR3 (the old "identity-mapped OS is automatic" assumption
-     * is false under X-PGTBL). Thread must NOT free the shared CR3. */
-    thread->cr3 = parent->cr3;
-    thread->owns_cr3 = false;
-
-    /* CLONE_FILES: threads SHARE the parent's fd_table (POSIX-correct).
-     * No copy — bump refcount. open()/close() in either thread affects both. */
-    thread->fd_table = parent->fd_table;
-    thread->fd_table->refcount++;
-
-    thread->region_count = 0;
+    /* Share the thread group, address space and process fd table. */
+    proc_attach_thread(thread, parent, parent->pid);
 
     /* Set per-thread TLS */
     thread->fs_base = tls;
+    thread->gs_base = parent->gs_base;
 
     /* CLONE_PARENT_SETTID: write child TID to parent's memory */
     if (parent_tidptr) {
@@ -2327,12 +3107,25 @@ int32_t proc_clone_thread(uint64_t child_stack, uint64_t parent_tidptr,
     void *kstack = PHYS_TO_VIRT(kstack_phys);
     thread->kernel_stack = kstack;
 
-    uint64_t kstack_top = (uint64_t)kstack + KERNEL_STACK_SIZE;
+    /* Tie the mmap backing child_stack to this process_t. pthread_join may
+     * request munmap as soon as clear_child_tid is zero, while this thread is
+     * still finishing SYS_exit on that stack; syscall.c defers the release
+     * until this process_t is reaped. */
+    {
+        extern int syscall_assign_thread_stack(void *thread,
+                                                uint64_t stack_pointer);
+        if (syscall_assign_thread_stack(thread, child_stack) < 0) {
+            serial_puts("[THREAD] stack VMA not found sp=0x");
+            serial_puthex(child_stack, 16);
+            serial_puts(" pid=");
+            serial_putdec(thread->pid);
+            serial_puts("\n");
+        }
+    }
 
-    /* Build fake interrupt frame */
-    uint64_t frame_addr = (kstack_top - 176) & ~0xFULL;
-    uint64_t *cf = (uint64_t *)frame_addr;
-    memset(cf, 0, 176);
+    /* Build the thread's canonical initial return context. */
+    uint64_t *cf = (uint64_t *)&thread->sched_frame;
+    memset(cf, 0, sizeof(thread->sched_frame));
 
     /* GPRs — copy parent's values */
     cf[0]  = r15;
@@ -2362,7 +3155,8 @@ int32_t proc_clone_thread(uint64_t child_stack, uint64_t parent_tidptr,
 
     /* Scheduler state — thread inherits parent's QoS class */
     thread->qos_class = parent->qos_class;
-    thread->kernel_rsp = frame_addr;
+    thread->sched_frame_valid = true;
+    thread->kernel_rsp = (uint64_t)&thread->sched_frame;
     thread->quantum = qos_quantum[thread->qos_class];
     proc_transition(thread, PROC_READY);
 
@@ -2383,7 +3177,6 @@ int32_t proc_clone_thread(uint64_t child_stack, uint64_t parent_tidptr,
 
 #define FUTEX_HASH_BITS   5
 #define FUTEX_HASH_SIZE   (1 << FUTEX_HASH_BITS)   /* 32 buckets */
-#define MAX_FUTEX_WAITERS 256
 
 typedef struct {
     uint64_t    addr;       /* futex user address */
@@ -2401,7 +3194,8 @@ typedef struct {
     int16_t     next;       /* next in same hash bucket, -1 = end */
 } futex_waiter_t;
 
-static futex_waiter_t futex_waiters[MAX_FUTEX_WAITERS];
+static futex_waiter_t *futex_waiters;
+static int futex_waiter_capacity;
 static int16_t futex_buckets[FUTEX_HASH_SIZE];  /* heads, -1 = empty */
 static int16_t futex_free_head = -1;            /* free slot list */
 static int      futex_timed_count = 0;          /* # of active timed waiters;
@@ -2442,13 +3236,27 @@ static void futex_init(void)
 {
     for (int i = 0; i < FUTEX_HASH_SIZE; i++)
         futex_buckets[i] = -1;
+
+    futex_waiter_capacity = proc_capacity;
+    futex_waiters = (futex_waiter_t *)kcalloc(
+        (uint64_t)futex_waiter_capacity, sizeof(*futex_waiters));
+    if (!futex_waiters) {
+        futex_waiter_capacity = 0;
+        futex_free_head = -1;
+        serial_puts("[FUTEX] Failed to allocate waiter table\n");
+        return;
+    }
+
     /* Build free list */
-    for (int i = 0; i < MAX_FUTEX_WAITERS; i++) {
+    for (int i = 0; i < futex_waiter_capacity; i++) {
         futex_waiters[i].active = false;
         futex_waiters[i].next = (int16_t)(i + 1);
     }
-    futex_waiters[MAX_FUTEX_WAITERS - 1].next = -1;
+    futex_waiters[futex_waiter_capacity - 1].next = -1;
     futex_free_head = 0;
+    serial_puts("[FUTEX] Waiter capacity ");
+    serial_putdec((uint64_t)futex_waiter_capacity);
+    serial_puts("\n");
 }
 
 /* futex_wait — block current process until woken or (optionally) timed out.
@@ -2624,7 +3432,7 @@ int futex_do_wake(uint64_t uaddr, uint64_t space, int count)
         futex_waiter_t *w = &futex_waiters[idx];
         if (w->active && w->addr == uaddr && w->space == space) {
             int pidx = w->proc_idx;
-            if (pidx >= 0 && pidx < MAX_PROCESSES &&
+            if (pidx >= 0 && pidx < proc_capacity &&
                 proctab[pidx].state == PROC_BLOCKED) {
                 proc_transition(&proctab[pidx], PROC_READY);
                 woken++;
@@ -2805,12 +3613,12 @@ void futex_timeout_sweep(void)
     if (futex_timed_count <= 0) return;
     uint64_t flags = futex_lock_irqsave();
     uint64_t now = idt_get_ticks();
-    for (int i = 0; i < MAX_FUTEX_WAITERS; i++) {
+    for (int i = 0; i < futex_waiter_capacity; i++) {
         futex_waiter_t *w = &futex_waiters[i];
         if (!w->active || !w->deadline) continue;
         if (now >= w->deadline) {
             int pidx = w->proc_idx;
-            if (pidx >= 0 && pidx < MAX_PROCESSES &&
+            if (pidx >= 0 && pidx < proc_capacity &&
                 proctab[pidx].state == PROC_BLOCKED) {
                 w->timed_out = true;
                 proc_transition(&proctab[pidx], PROC_READY);
@@ -2903,7 +3711,7 @@ int32_t proc_wait4(int32_t pid, int *wstatus, int options)
     uint32_t my_pid = current_proc->pid;
     bool has_children = false;
 
-    for (int i = 0; i < MAX_PROCESSES; i++) {
+    for (int i = 0; i < proc_capacity; i++) {
         if (proctab[i].state == PROC_FREE) continue;
         if (proctab[i].ppid != my_pid) continue;
 
@@ -2926,11 +3734,7 @@ int32_t proc_wait4(int32_t pid, int *wstatus, int options)
                                    proctab[i].regions[r].pages);
             }
             proctab[i].region_count = 0;
-            if (proctab[i].kernel_stack) {
-                mem_free_pages((void *)VIRT_TO_PHYS(proctab[i].kernel_stack),
-                               KERNEL_STACK_SIZE / 4096);
-                proctab[i].kernel_stack = NULL;
-            }
+            proc_release_kernel_stack(&proctab[i]);
 
             /* Restore parent's RW data and brk heap state after child
              * overwrote them (fork+execve of same binary in identity-mapped OS). */
@@ -2957,7 +3761,7 @@ int32_t proc_wait4(int32_t pid, int *wstatus, int options)
      * scan above and our PROC_BLOCKED assignment (close the race window). */
     {
         bool found_early = false;
-        for (int i = 0; i < MAX_PROCESSES; i++) {
+        for (int i = 0; i < proc_capacity; i++) {
             if (proctab[i].state != PROC_ZOMBIE) continue;
             if (proctab[i].ppid != my_pid) continue;
             if (pid > 0 && proctab[i].pid != (uint32_t)pid) continue;
@@ -2977,7 +3781,7 @@ int32_t proc_wait4(int32_t pid, int *wstatus, int options)
     proc_transition(current_proc, PROC_READY);
 
     /* Scan for the zombie child */
-    for (int i = 0; i < MAX_PROCESSES; i++) {
+    for (int i = 0; i < proc_capacity; i++) {
         if (proctab[i].state != PROC_ZOMBIE) continue;
         if (proctab[i].ppid != my_pid) continue;
         if (pid > 0 && proctab[i].pid != (uint32_t)pid) continue;
@@ -2994,11 +3798,7 @@ int32_t proc_wait4(int32_t pid, int *wstatus, int options)
                                proctab[i].regions[r].pages);
         }
         proctab[i].region_count = 0;
-        if (proctab[i].kernel_stack) {
-            mem_free_pages((void *)VIRT_TO_PHYS(proctab[i].kernel_stack),
-                           KERNEL_STACK_SIZE / 4096);
-            proctab[i].kernel_stack = NULL;
-        }
+        proc_release_kernel_stack(&proctab[i]);
 
         elf_fork_restore();
         syscall_restore_brk();
@@ -3224,7 +4024,7 @@ int sched_set_qos(uint32_t pid, uint8_t qos)
     if (pid == 0) {
         target = current_proc;
     } else {
-        for (int i = 0; i < MAX_PROCESSES; i++) {
+        for (int i = 0; i < proc_capacity; i++) {
             if (proctab[i].state != PROC_FREE && proctab[i].pid == pid) {
                 target = &proctab[i];
                 break;
@@ -3233,11 +4033,25 @@ int sched_set_qos(uint32_t pid, uint8_t qos)
     }
     if (!target) return -1;
 
+    uint64_t flags;
+    __asm__ volatile ("pushfq; popq %0; cli" : "=r"(flags) :: "memory");
+
+    /* runq_dequeue() follows target->qos_class, so a READY task must leave
+     * its old queue before publishing the new class. The previous code only
+     * changed the field and left a cross-linked run queue behind. */
+    uint32_t state = __atomic_load_n(&target->state, __ATOMIC_ACQUIRE);
+    int idx = (int)(target - proctab);
+    if (state == PROC_READY)
+        runq_dequeue(idx);
+
     target->qos_class = qos;
-    /* Adjust quantum immediately if upgrading */
-    uint32_t new_q = qos_quantum[qos];
-    if (new_q < target->quantum)
-        target->quantum = new_q;
+    target->quantum = qos_quantum[qos];
+
+    if (state == PROC_READY)
+        runq_enqueue(idx);
+
+    if (flags & (1ULL << 9))
+        __asm__ volatile ("sti" ::: "memory");
     return 0;
 }
 
@@ -3247,7 +4061,7 @@ uint8_t sched_get_qos(uint32_t pid)
     if (pid == 0 && current_proc)
         return current_proc->qos_class;
 
-    for (int i = 0; i < MAX_PROCESSES; i++) {
+    for (int i = 0; i < proc_capacity; i++) {
         if (proctab[i].state != PROC_FREE && proctab[i].pid == pid)
             return proctab[i].qos_class;
     }
@@ -3297,7 +4111,7 @@ static int proc_has_blocked_waiter(uint32_t pid, uint32_t ppid)
      * is alive and currently BLOCKED. That's the same predicate
      * proc_exit() uses to wake a waiter (line 781). */
     if (ppid == 0) return 0;
-    for (int i = 0; i < MAX_PROCESSES; i++) {
+    for (int i = 0; i < proc_capacity; i++) {
         if (proctab[i].pid == ppid &&
             proctab[i].state == PROC_BLOCKED) {
             (void)pid;
@@ -3310,7 +4124,7 @@ static int proc_has_blocked_waiter(uint32_t pid, uint32_t ppid)
 static int proc_parent_alive(uint32_t ppid)
 {
     if (ppid == 0) return 0;
-    for (int i = 0; i < MAX_PROCESSES; i++) {
+    for (int i = 0; i < proc_capacity; i++) {
         if (proctab[i].pid == ppid &&
             proctab[i].state != PROC_FREE &&
             proctab[i].state != PROC_ZOMBIE)
@@ -3359,21 +4173,25 @@ static void proc_reap_dump(const process_t *p, uint64_t age_ticks,
 }
 
 /* Scan the proctab once and reap eligible zombies. Safe to call from
- * any context that can be preempted; the loop is O(MAX_PROCESSES). */
+ * any context that can be preempted; the loop is O(proc_capacity). */
 void proc_reap_zombies(void)
 {
-    uint64_t now = idt_get_ticks();
     int reaped = 0;
-    for (int i = 0; i < MAX_PROCESSES; i++) {
+    for (int i = 0; i < proc_capacity; i++) {
         process_t *p = &proctab[i];
-        if (p->state != PROC_ZOMBIE) continue;
+        if (__atomic_load_n(&p->state, __ATOMIC_ACQUIRE) != PROC_ZOMBIE)
+            continue;
         if (p == current_proc) continue;   /* paranoia */
+        if (i == sched_current_idx) continue; /* frame still scheduler-owned */
 
         /* If a parent is currently blocked in wait4 for this child,
          * leave the zombie for it. wait4 wants to observe exit_code. */
         if (proc_has_blocked_waiter(p->pid, p->ppid))
             continue;
 
+        uint64_t now = idt_get_ticks();
+        if (now < p->zombie_tick)
+            continue;
         uint64_t age = now - p->zombie_tick;
         const char *reason;
         if (!proc_parent_alive(p->ppid)) {
@@ -3388,29 +4206,52 @@ void proc_reap_zombies(void)
             continue;
         }
 
+        if (!proc_cr3_peers_quiesced(p))
+            continue;
         proc_reap_dump(p, age, reason);
-        proc_free(p);
-        reaped++;
+        if (proc_free(p))
+            reaped++;
     }
     (void)reaped;
 }
 
-/* Periodic kthread: sweep zombies once per second.
- * Runs at QOS_BACKGROUND so it can never starve real work. */
+/* Periodic kthread: sweep zombies once per second. Keep the default QoS:
+ * strict priority scheduling can otherwise starve cleanup indefinitely. */
 static void zombie_reaper_thread(void)
 {
-    extern void proc_set_qos(uint8_t qos);
-    proc_set_qos(QOS_BACKGROUND);
-    serial_puts("[reaper] zombie auto-reaper online (QOS_BACKGROUND, "
+    serial_puts("[reaper] zombie auto-reaper online (QOS_DEFAULT, "
                 "sweep=1s, grace=10s)\n");
     while (1) {
         proc_reap_zombies();
-        /* Sleep ~1 s on APIC ticks. hlt + IRQ; if APIC is masked the
-         * sweep cadence stretches, but that's fine — we're not on a
-         * latency budget here. */
-        uint64_t target = idt_get_ticks() + REAP_SWEEP_TICKS;
-        while (idt_get_ticks() < target)
-            __asm__ volatile ("hlt");
+        (void)sched_sleep_ticks(REAP_SWEEP_TICKS);
+    }
+}
+
+static void __attribute__((noreturn)) scheduler_idle_thread(void)
+{
+    serial_puts("[SCHED] Idle task online\n");
+
+    for (;;) {
+        /* Disable interrupts before observing the run queue. STI's interrupt
+         * shadow covers the following HLT, closing the wake-before-sleep race. */
+        __asm__ volatile ("cli" ::: "memory");
+        if (__atomic_load_n(&ready_count, __ATOMIC_ACQUIRE)) {
+            __asm__ volatile ("sti" ::: "memory");
+            sched_yield();
+            continue;
+        }
+
+        extern volatile uint32_t *idt_get_apic_base(void);
+        volatile uint32_t *apic = idt_get_apic_base();
+        bool timer_masked = apic && (apic[0x320 / 4] & 0x10000U);
+
+        if (timer_masked) {
+            /* UT99 owns a lifetime LAPIC mask. A software timer boundary is
+             * required there so blocked timeouts can still become READY. */
+            __asm__ volatile ("sti; int $0x20" ::: "memory");
+        } else {
+            __asm__ volatile ("sti; hlt" ::: "memory");
+        }
     }
 }
 
@@ -3418,7 +4259,36 @@ void proc_init(void)
 {
     serial_puts("[PROC] Initializing process subsystem...\n");
 
-    memset(proctab, 0, sizeof(proctab));
+    uint64_t total_memory = g_sys_caps.total_ram;
+    uint32_t requested = g_sys_caps.max_processes;
+    while (requested >= SYS_CAPS_PROCESS_MIN) {
+        if (proc_tables_allocate(requested)) {
+            proc_capacity = (int)requested;
+            g_sys_caps.max_processes = requested;
+            break;
+        }
+        if (requested == SYS_CAPS_PROCESS_MIN)
+            break;
+        requested /= 2;
+        requested = (requested / SYS_CAPS_PROCESS_GRANULARITY) *
+                    SYS_CAPS_PROCESS_GRANULARITY;
+        if (requested < SYS_CAPS_PROCESS_MIN)
+            requested = SYS_CAPS_PROCESS_MIN;
+    }
+    if (!proc_capacity) {
+        serial_puts("[PROC] FATAL: cannot allocate process tables\n");
+        fb_puts_color(" Process subsystem unavailable\n", 0xFFFF5555);
+        return;
+    }
+
+    serial_puts("[PROC] Capacity ");
+    serial_putdec(proc_capacity);
+    serial_puts(" slots for ");
+    serial_putdec(total_memory / (1024ULL * 1024ULL));
+    serial_puts(" MB RAM (");
+    serial_putdec(SYS_CAPS_PROCESS_RAM_BUDGET / (1024ULL * 1024ULL));
+    serial_puts(" MB/slot budget)\n");
+
     runq_init();
     futex_init();
     set_current_proc(NULL);
@@ -3450,12 +4320,19 @@ void proc_init(void)
 void proc_start_reaper(void)
 {
     sched_spawn("reaper", zombie_reaper_thread);
+
+    int idle_pid = sched_spawn_qos("idle", scheduler_idle_thread, QOS_IDLE);
+    process_t *idle = idle_pid > 0 ? proc_find((uint32_t)idle_pid) : NULL;
+    if (idle)
+        sched_idle_idx = (int)(idle - proctab);
+    else
+        serial_puts("[SCHED] WARNING: idle task unavailable\n");
 }
 
 uint32_t proc_count_active(void)
 {
     uint32_t count = 0;
-    for (int i = 0; i < MAX_PROCESSES; i++) {
+    for (int i = 0; i < proc_capacity; i++) {
         if (proctab[i].state != PROC_FREE)
             count++;
     }

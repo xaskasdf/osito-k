@@ -1,19 +1,9 @@
-/*
- * venus_wire.h — guest side of the venus wire protocol.
- *
- * Layout:
- *   +--------------------+ <- ring_base
- *   | venus_ring_header  |
- *   +--------------------+
- *   | command area       | (capacity/2 bytes)
- *   +--------------------+
- *   | reply area         | (capacity/2 bytes)
- *   +--------------------+
- */
+/* Official Mesa Venus ring transport over OsitoK GPU syscalls. */
 #ifndef OSITOK_VENUS_WIRE_H
 #define OSITOK_VENUS_WIRE_H
 
-#include <vulkan/vulkan.h>
+#include <stddef.h>
+#include <stdint.h>
 
 #define VENUS_RING_MAGIC    0x53554E56u   /* 'VNUS' LE */
 #define VENUS_RING_VERSION  1u
@@ -53,8 +43,6 @@ struct venus_cmd_header {
  * header, and returns the ring base pointer. ctx_id must be a live
  * kernel GPU context (from SYS_GPU_CTX_CREATE(GPU_CTX_VENUS)). */
 struct venus_wire *venus_wire_open(int32_t ctx_id);
-
-/* Tear down the ring and free the GPU resource. */
 void venus_wire_close(struct venus_wire *w);
 
 /* Reserve `payload_size` bytes in the command area, return a writable

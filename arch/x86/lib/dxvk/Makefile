@@ -1,10 +1,12 @@
 # arch/x86/lib/dxvk/Makefile -- W5.0/W5.1/W5.2 build infrastructure for DXVK on OsitoK.
 #
-# Produces four static archives:
+# Produces six static archives:
 #   $(BUILD_DIR)/libdxvk_util.a   -- DXVK src/util/  (hash maps, log, etc.)
 #   $(BUILD_DIR)/libdxvk_spirv.a  -- DXVK src/spirv/ (SPIR-V module builder)
 #   $(BUILD_DIR)/libdxvk_dxbc.a   -- DXVK src/dxbc/  (D3D11 bytecode -> SPIR-V)
 #   $(BUILD_DIR)/libdxvk_core.a   -- DXVK src/dxvk/  (Vulkan abstraction layer) [W5.2]
+#   $(BUILD_DIR)/libdxvk_dxgi.a   -- DXGI frontend
+#   $(BUILD_DIR)/libdxvk_d3d11.a  -- D3D10/D3D11 frontend
 #
 # Both compiled C++17 with -fno-exceptions -fno-rtti, force-including the
 # osito_compat/dxvk_compat.h shim so the upstream sources compile unchanged.
@@ -19,10 +21,7 @@ DXVK_ROOT := $(CURDIR)
 OSITOK_ROOT ?= $(DXVK_ROOT)/../../../..
 DXVK_SRC  := $(DXVK_ROOT)/dxvk/src
 DXVK_INC  := $(DXVK_ROOT)/dxvk/include
-# Port C++ stdlib: GTA V uses a hand-rolled libstdc++ subset under
-# GTAV_Source/ositok_native (there is no hosted libstdc++ for this target).
-# DXVK must use the SAME stdlib so its objects are ABI-compatible with GTA5.elf.
-OSITOK_STDCPP := /Users/pc/ok-ported/GTAV_Source/ositok_stdcpp
+GENERATED_DIR := $(DXVK_ROOT)/include/generated
 BUILD_DIR := $(OSITOK_ROOT)/arch/x86/build/lib/dxvk
 UTIL_OUT  := $(BUILD_DIR)/libdxvk_util.a
 SPIRV_OUT := $(BUILD_DIR)/libdxvk_spirv.a
@@ -31,15 +30,18 @@ CORE_OUT  := $(BUILD_DIR)/libdxvk_core.a
 D3D11_OUT := $(BUILD_DIR)/libdxvk_d3d11.a
 DXGI_OUT  := $(BUILD_DIR)/libdxvk_dxgi.a
 
-# C++ compiler.  Prefer the OsitoK cross-compiler if present; else fall
-# back to the host g++ (which inside Docker is gcc:12's g++).
-CROSS_CXX := $(OSITOK_ROOT)/../ok-ported/toolchain/cross-bin/x86_64-pc-ositok-musl-c++
-ifeq ($(wildcard $(CROSS_CXX)),)
-CXX ?= g++
-else
-CXX ?= $(CROSS_CXX)
-endif
-AR  ?= ar
+GLSLANG := glslangValidator
+SHADER_SRCS := \
+  $(wildcard $(DXVK_SRC)/dxvk/shaders/*.comp) \
+  $(wildcard $(DXVK_SRC)/dxvk/shaders/*.frag) \
+  $(wildcard $(DXVK_SRC)/dxvk/shaders/*.geom) \
+  $(wildcard $(DXVK_SRC)/dxvk/shaders/*.vert) \
+  $(wildcard $(DXVK_SRC)/dxvk/hud/shaders/*.frag) \
+  $(wildcard $(DXVK_SRC)/dxvk/hud/shaders/*.vert) \
+  $(wildcard $(DXVK_SRC)/d3d11/shaders/*.frag) \
+  $(wildcard $(DXVK_SRC)/d3d11/shaders/*.vert)
+SHADER_HEADERS := $(foreach src,$(SHADER_SRCS),\
+  $(GENERATED_DIR)/$(basename $(notdir $(src))).h)
 
 ifeq ($(origin CC),default)
 CC := $(patsubst %g++,%gcc,$(CXX))
@@ -49,7 +51,6 @@ GCC_INC     := $(shell $(CXX) -print-file-name=include)
 GCC_CXX_INC := $(shell $(CXX) -print-file-name=include) # placeholder
 
 INCLUDES := \
-  -nostdinc++ -I$(OSITOK_STDCPP) \
   -I$(DXVK_ROOT)/com_stub \
   -I$(DXVK_ROOT)/include \
   -I$(DXVK_ROOT)/include/generated \
@@ -74,10 +75,8 @@ INCLUDES := \
 # dxvk/include/mingw/. The com_stub/ headers used by the rest of DXVK
 # stay out of the search path so the two GUID definitions don't collide.
 D3D11_INCLUDES := \
-  -nostdinc++ \
   -I$(DXVK_INC)/native/windows \
   -I$(DXVK_INC)/mingw \
-  -I$(OSITOK_STDCPP) \
   -I$(DXVK_ROOT)/include \
   -I$(DXVK_ROOT)/include/generated \
   -I$(DXVK_SRC) \
@@ -95,22 +94,20 @@ D3D11_INCLUDES := \
   -I$(OSITOK_ROOT)/arch/x86/lib/vulkan/include \
   -I$(DXVK_ROOT)/com_stub_d3d11
 
-# C++17, freestanding, no exceptions, no RTTI.  Hosted libstdc++ is
-# pulled via -isystem (gcc:12 ships it under /usr/include/c++/12/).
+# C++17 with the hosted musl libstdc++ used by the GTA toolchain.
 CXX_FLAGS := \
   -std=gnu++17 \
-  -ffreestanding -fno-stack-protector -mno-red-zone \
+  -fno-stack-protector -mno-red-zone \
   -fno-exceptions -fno-rtti \
-  -fPIC -fvisibility=hidden \
+  -fno-pic -fno-pie -fvisibility=hidden \
   -O2 \
   -Wall -Wextra \
   -Wno-unused-parameter -Wno-unused-function -Wno-missing-field-initializers \
   -Wno-sign-compare -Wno-unused-variable -Wno-unused-but-set-variable \
   -Wno-non-virtual-dtor -Wno-deprecated-declarations \
-  -DDXVK_NO_EXCEPTIONS=1 -DUSE_X86_64 -D__OSITO_K__ \
+  -D_GNU_SOURCE -DDXVK_NO_EXCEPTIONS=1 -DUSE_X86_64 -D__OSITO_K__ \
   -include $(DXVK_ROOT)/osito_compat/dxvk_compat.h \
-  $(INCLUDES) \
-  -isystem $(GCC_INC)
+  $(INCLUDES)
 
 # D3D11/DXGI flags: same toolchain, different INCLUDES (native windows
 # shim instead of com_stub/), and skip the dxvk_compat.h force-include
@@ -118,19 +115,18 @@ CXX_FLAGS := \
 # otherwise clash on GUID/IUnknown).
 D3D11_CXX_FLAGS := \
   -std=gnu++17 \
-  -ffreestanding -fno-stack-protector -mno-red-zone \
+  -fno-stack-protector -mno-red-zone \
   -fno-exceptions \
-  -fPIC -fvisibility=hidden \
+  -fno-pic -fno-pie -fvisibility=hidden \
   -O2 \
   -Wall -Wextra \
   -Wno-unused-parameter -Wno-unused-function -Wno-missing-field-initializers \
   -Wno-sign-compare -Wno-unused-variable -Wno-unused-but-set-variable \
   -Wno-non-virtual-dtor -Wno-deprecated-declarations -Wno-attributes \
   -Wno-class-memaccess -Wno-pragmas -Wno-narrowing \
-  -DDXVK_NO_EXCEPTIONS=1 -DUSE_X86_64 -D__OSITO_K__ \
+  -D_GNU_SOURCE -DDXVK_NO_EXCEPTIONS=1 -DUSE_X86_64 -D__OSITO_K__ \
   -include $(DXVK_ROOT)/osito_compat/dxvk_d3d11_compat.h \
-  $(D3D11_INCLUDES) \
-  -isystem $(GCC_INC)
+  $(D3D11_INCLUDES)
 
 # ----------------------------------------------------------------------
 # UTIL_SRCS — DXVK src/util/ subset that we currently compile.  Files
@@ -140,6 +136,7 @@ D3D11_CXX_FLAGS := \
 UTIL_SRCS := \
   dxvk/src/util/util_env.cpp \
   dxvk/src/util/util_error_ositok.cpp \
+  dxvk/src/util/util_fps_limiter.cpp \
   dxvk/src/util/util_flush.cpp \
   dxvk/src/util/util_luid.cpp \
   dxvk/src/util/util_matrix.cpp \
@@ -152,7 +149,8 @@ UTIL_SRCS := \
   dxvk/src/util/sha1/sha1_util.cpp \
   dxvk/src/util/sync/sync_recursive.cpp \
   dxvk/src/util/thread.cpp \
-  osito_compat/dxvk_compositor_bridge.cpp
+  osito_compat/dxvk_compositor_bridge.cpp \
+  osito_compat/dxvk_logger_ositok.cpp
 
 # com_guid.cpp pulls d3d11_interfaces.h + dxgi_interfaces.h transitively,
 # which reach the native windows shim — same dependency surface as
@@ -160,7 +158,9 @@ UTIL_SRCS := \
 # and stash it in libdxvk_util.a alongside the other com bits via a
 # dedicated rule below.
 UTIL_D3D11_SRCS := \
-  dxvk/src/util/com/com_guid.cpp
+  dxvk/src/util/com/com_guid.cpp \
+  dxvk/src/util/util_gdi.cpp \
+  dxvk/src/util/util_shared_res.cpp
 
 # C sources (sha1.c is the SHA-1 reference impl in plain C).
 UTIL_C_SRCS := \
@@ -281,6 +281,10 @@ CORE_SRCS := \
   dxvk/src/dxvk/dxvk_swapchain_blitter.cpp \
   dxvk/src/dxvk/dxvk_unbound.cpp \
   dxvk/src/dxvk/dxvk_util.cpp \
+  dxvk/src/dxvk/hud/dxvk_hud.cpp \
+  dxvk/src/dxvk/hud/dxvk_hud_font.cpp \
+  dxvk/src/dxvk/hud/dxvk_hud_item.cpp \
+  dxvk/src/dxvk/hud/dxvk_hud_renderer.cpp \
   dxvk/src/dxvk/dxvk_platform_exts.cpp \
   dxvk/src/vulkan/vulkan_loader.cpp \
   dxvk/src/vulkan/vulkan_names.cpp \
@@ -383,8 +387,11 @@ D3D11_OBJS   := $(patsubst %.cpp,$(BUILD_DIR)/%.o,$(D3D11_SRCS))
 D3D10_OBJS   := $(patsubst %.cpp,$(BUILD_DIR)/%.o,$(D3D10_SRCS))
 DXGI_OBJS    := $(patsubst %.cpp,$(BUILD_DIR)/%.o,$(DXGI_SRCS))
 
-.PHONY: all clean util spirv dxbc core d3d11 dxgi
+$(CORE_OBJS) $(D3D11_OBJS): $(SHADER_HEADERS)
+
+.PHONY: all clean shaders util spirv dxbc core d3d11 dxgi
 all: util spirv dxbc core dxgi d3d11
+shaders: $(SHADER_HEADERS)
 
 util:  $(UTIL_OUT)
 spirv: $(SPIRV_OUT)
@@ -442,10 +449,26 @@ $(BUILD_DIR)/dxvk/src/dxgi/%.o: $(DXVK_ROOT)/dxvk/src/dxgi/%.cpp | $(BUILD_DIR)
 	@echo "  CXX[dxgi]    $*"
 	@$(CXX) $(D3D11_CXX_FLAGS) -c -o $@ $<
 
+# WSI types cross the DXGI boundary and must use the same Win32 ABI typedefs.
+$(BUILD_DIR)/dxvk/src/wsi/wsi_platform_ositok.o: $(DXVK_ROOT)/dxvk/src/wsi/wsi_platform_ositok.cpp | $(BUILD_DIR)
+	@mkdir -p $(dir $@)
+	@echo "  CXX[dxgi]    wsi/wsi_platform_ositok"
+	@$(CXX) $(D3D11_CXX_FLAGS) -c -o $@ $<
+
 # com_guid.cpp ships with libdxvk_util.a but is compiled like d3d11/dxgi.
 $(BUILD_DIR)/dxvk/src/util/com/com_guid.o: $(DXVK_ROOT)/dxvk/src/util/com/com_guid.cpp | $(BUILD_DIR)
 	@mkdir -p $(dir $@)
 	@echo "  CXX[d3d11]   util/com/com_guid"
+	@$(CXX) $(D3D11_CXX_FLAGS) -c -o $@ $<
+
+$(BUILD_DIR)/dxvk/src/util/util_gdi.o: $(DXVK_ROOT)/dxvk/src/util/util_gdi.cpp | $(BUILD_DIR)
+	@mkdir -p $(dir $@)
+	@echo "  CXX[d3d11]   util/util_gdi"
+	@$(CXX) $(D3D11_CXX_FLAGS) -c -o $@ $<
+
+$(BUILD_DIR)/dxvk/src/util/util_shared_res.o: $(DXVK_ROOT)/dxvk/src/util/util_shared_res.cpp | $(BUILD_DIR)
+	@mkdir -p $(dir $@)
+	@echo "  CXX[d3d11]   util/util_shared_res"
 	@$(CXX) $(D3D11_CXX_FLAGS) -c -o $@ $<
 
 # dxbc_options.cpp likewise needs the d3d11 include path.
@@ -476,14 +499,13 @@ $(BUILD_DIR)/%.o: $(DXVK_ROOT)/%.cpp | $(BUILD_DIR)
 	@$(CXX) $(CXX_FLAGS) -c -o $@ $<
 
 # Plain C path (sha1.c). Same warning posture, different std.
-CC ?= gcc
 $(BUILD_DIR)/%.o: $(DXVK_ROOT)/%.c | $(BUILD_DIR)
 	@mkdir -p $(dir $@)
 	@echo "  CC    $*"
 	@$(CC) -std=gnu11 -ffreestanding -fno-stack-protector -mno-red-zone \
 	       -fPIC -O2 -Wall \
 	       -D__OSITO_K__ \
-	       $(INCLUDES) -isystem $(GCC_INC) \
+	       $(INCLUDES) \
 	       -c -o $@ $<
 
 $(BUILD_DIR):

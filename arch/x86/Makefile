@@ -14,6 +14,8 @@
 # Legacy monolithic build:
 #   make legacy       Build ositok.efi (single PE32+ binary)
 
+.DEFAULT_GOAL := all
+
 # Cross toolchain. `make CLANG=1` uses clang as a freestanding cross-compiler
 # + lld (the Windows/msys2 path — no x86_64-elf-gcc needed). Default is the
 # x86_64-elf GNU toolchain (Linux/macOS).
@@ -66,6 +68,23 @@ ifeq ($(COMPAT_TRACE),1)
   KCFLAGS += -DCOMPAT_TRACE=1
 endif
 
+# Focused completion-port tracing. This remains useful with QUIET=1 and is
+# deliberately bounded in kernel32_shim.c so Steam diagnostics stay readable.
+#   make -C arch/x86 CLANG=1 QUIET=1 IOCP_TRACE=1
+IOCP_TRACE ?= 0
+ifeq ($(IOCP_TRACE),1)
+  KCFLAGS += -DK32_IOCP_TRACE=1
+endif
+
+# Diagnose native PE calls that return from a Win32 shim with interrupts
+# disabled. This is intentionally opt-in because function instrumentation is
+# too expensive for normal QEMU and hardware runs.
+#   make -C arch/x86 CLANG=1 WIN32_IF_AUDIT=1
+WIN32_IF_AUDIT ?= 0
+ifeq ($(WIN32_IF_AUDIT),1)
+  WIN32_IF_AUDIT_FLAGS = -finstrument-functions
+endif
+
 # Dev fast-boot: skip the boot-time GGUF/LLM model load (brandon-tiny, ~20 MB)
 # to shorten the build→boot→UT99 loop. Inference is unavailable in this build.
 #   make -C arch/x86 CLANG=1 SKIP_MODEL=1
@@ -82,6 +101,16 @@ endif
 QUIET ?= 0
 ifeq ($(QUIET),1)
   KCFLAGS += -DOK_QUIET=1
+endif
+
+# Detailed PE import tracing is intentionally opt-in. Steam and CEF resolve
+# tens of thousands of symbols and each COM1 character causes a VM exit under
+# QEMU. The normal build retains unresolved-import summaries and the diagnostic
+# ring exposed by `pe-imports`, while this flag restores per-symbol output.
+#   make -C arch/x86 CLANG=1 PE_LOADER_TRACE=1
+PE_LOADER_TRACE ?= 0
+ifeq ($(PE_LOADER_TRACE),1)
+  KCFLAGS += -DPE_LOADER_TRACE=1
 endif
 
 # Flags for precompiled .o files that may be called from TCC code.
@@ -163,7 +192,7 @@ KERN_SRC = kernel/main.c kernel/serial.c kernel/framebuffer.c \
            kernel/tensor_arena.c kernel/sys_inference.c \
            kernel/pred_sched.c kernel/io_predict.c \
            kernel/hwbp.c kernel/self_optimize.c kernel/nic.c \
-           kernel/apipa.c kernel/rag.c kernel/cert_pin.c \
+           kernel/apipa.c kernel/rag.c kernel/cert_pin.c kernel/certmgr.c \
            kernel/rsa.c kernel/x509.c kernel/ecdsa_p256.c kernel/ecdsa_p384.c \
            kernel/http_plain.c kernel/ocsp.c kernel/crl.c \
            kernel/inferconnect.c kernel/inferconnect_rpc.c kernel/inferconnect_client.c \
@@ -182,11 +211,16 @@ FS_SRC   = fs/ositofs2.c fs/ositofs3.c fs/gpt.c fs/gguf.c fs/vfs.c fs/fat32.c \
            fs/udf.c fs/squashfs.c fs/hfsplus.c fs/btrfs.c fs/apfs.c
 WIN32_SRC = win32/win32_init.c win32/compat32.c win32/pe.c win32/winexec.c \
             win32/handle.c win32/ntsyscall.c win32/ntprocess.c win32/ntsync.c \
-            win32/dllloader.c win32/wdbg.c win32/win32_abi.c \
-            win32/kernel32_shim.c win32/ntdll_shim.c win32/msvcrt_shim.c \
-            win32/user32_shim.c win32/gdi32_shim.c win32/advapi32_shim.c \
+            win32/dllloader.c win32/wdbg.c win32/if_audit.c win32/win32_abi.c \
+            win32/wintime.c win32/kernel32_shim.c win32/ntdll_shim.c \
+            win32/msvcrt_shim.c \
+             win32/user32_shim.c win32/gdi32_shim.c win32/opengl32_shim.c \
+             win32/libusb_shim.c \
+             win32/dxgi_shim.c win32/version_shim.c \
+            win32/advapi32_shim.c win32/scm.c \
             win32/ddraw_shim.c win32/dsound_shim.c \
-            win32/ole32_shim.c win32/shell32_shim.c \
+            win32/ole32_shim.c win32/oleacc_shim.c \
+             win32/crypt32_shim.c win32/authenticode.c win32/shell32_shim.c \
             win32/comctl32_shim.c win32/comdlg32_shim.c \
             win32/winmm_shim.c win32/wsock32_shim.c \
             win32/ole2.c win32/msi.c win32/cab.c \
@@ -217,6 +251,9 @@ DOS_ASM_OBJ = $(DOS_ASM:%.S=$(BUILD)/%.o)
 GUI_OBJ   = $(patsubst ../../gui/%.c,$(BUILD)/gui/%.o,$(GUI_SRC))
 
 ALL_KERN_OBJ = $(KERN_OBJ) $(ASM_OBJ) $(DRV_OBJ) $(FS_OBJ) $(WIN32_OBJ) $(WIN32_ASM_OBJ) $(DOS_OBJ) $(DOS_ASM_OBJ) $(GUI_OBJ)
+KERNEL_C_OBJ = $(KERN_OBJ) $(DRV_OBJ) $(FS_OBJ) $(WIN32_OBJ) $(DOS_OBJ) $(GUI_OBJ)
+KERNEL_FLAGS_ID := $(shell printf '%s\n' '$(CC) $(KCFLAGS) $(KCFLAGS_PRECOMP) $(AVXFLAGS) $(WIN32_IF_AUDIT_FLAGS)' | cksum | cut -d' ' -f1)
+KERNEL_FLAGS_STAMP = $(BUILD)/.kernel-cflags-$(KERNEL_FLAGS_ID)
 
 # ── Targets ───────────────────────────────────────────────────
 
@@ -245,6 +282,12 @@ ALL_MIN_OBJ  = $(KERN_MIN_OBJ) $(ASM_OBJ) $(DRV_MIN_OBJ) $(FS_MIN_OBJ) \
                $(WIN32_OBJ) $(WIN32_ASM_OBJ) $(DOS_OBJ) $(DOS_ASM_OBJ) $(GUI_OBJ)
 
 .PHONY: all clean check-deps legacy tcc tcc-clean minimal libvulkan pxe
+
+$(KERNEL_FLAGS_STAMP): | $(BUILD)
+	@rm -f $(BUILD)/.kernel-cflags $(BUILD)/.kernel-cflags-*
+	@printf '%s\n' '$(CC) $(KCFLAGS) $(KCFLAGS_PRECOMP) $(AVXFLAGS) $(WIN32_IF_AUDIT_FLAGS)' > $@
+
+$(KERNEL_C_OBJ): $(KERNEL_FLAGS_STAMP)
 
 all: check-deps $(BUILD)/boot.efi $(BUILD)/kernel.elf libvulkan
 	@echo ""
@@ -332,22 +375,26 @@ $(BUILD)/drivers/%.o: drivers/%.c | $(BUILD)/drivers
 $(BUILD)/fs/%.o: fs/%.c | $(BUILD)/fs
 	$(CC) $(KCFLAGS) -c -o $@ $<
 
-# Win32 compatibility layer
+# Win32 compatibility layer — shims run on the guest thread's SIMD state.
 $(BUILD)/win32/%.o: win32/%.c | $(BUILD)/win32
-	$(CC) $(KCFLAGS) -Iwin32 -c -o $@ $<
+	$(CC) $(KCFLAGS) $(WIN32_IF_AUDIT_FLAGS) -fno-tree-vectorize -fno-slp-vectorize -Iwin32 -c -o $@ $<
+
+# The profiling hooks themselves must never be instrumented.
+$(BUILD)/win32/if_audit.o: win32/if_audit.c | $(BUILD)/win32
+	$(CC) $(KCFLAGS) -fno-tree-vectorize -fno-slp-vectorize -Iwin32 -c -o $@ $<
 
 # GCC-only Win32 precompiled files: use KCFLAGS_PRECOMP (TCC stack compat)
 $(BUILD)/win32/compat32.o: win32/compat32.c | $(BUILD)/win32
 	$(CC) $(filter-out -fno-pie,$(KCFLAGS_PRECOMP)) -fPIE -fno-jump-tables -Iwin32 -c -o $@ $<
 
 $(BUILD)/win32/msvcrt_shim.o: win32/msvcrt_shim.c | $(BUILD)/win32
-	$(CC) $(KCFLAGS_PRECOMP) -Iwin32 -c -o $@ $<
+	$(CC) $(KCFLAGS_PRECOMP) $(WIN32_IF_AUDIT_FLAGS) -Iwin32 -c -o $@ $<
 
 $(BUILD)/win32/ddraw_shim.o: win32/ddraw_shim.c | $(BUILD)/win32
-	$(CC) $(KCFLAGS_PRECOMP) -Iwin32 -c -o $@ $<
+	$(CC) $(KCFLAGS_PRECOMP) $(WIN32_IF_AUDIT_FLAGS) -Iwin32 -c -o $@ $<
 
 $(BUILD)/win32/dsound_shim.o: win32/dsound_shim.c | $(BUILD)/win32
-	$(CC) $(KCFLAGS_PRECOMP) -Iwin32 -c -o $@ $<
+	$(CC) $(KCFLAGS_PRECOMP) $(WIN32_IF_AUDIT_FLAGS) -Iwin32 -c -o $@ $<
 
 # Win32 assembly
 $(BUILD)/win32/%.o: win32/%.S | $(BUILD)/win32

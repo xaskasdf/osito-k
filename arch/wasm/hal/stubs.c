@@ -4984,6 +4984,8 @@ void sched_test_b(void) {}
 /* ── Win32 + setjmp ──────────────────────────────────────────── */
 
 int  win32_exec(const char *filename) { (void)filename; return -1; }
+int  win32_exec_args(const char *filename, int argc, const char **argv)
+{ (void)filename; (void)argc; (void)argv; return -1; }
 int  kern_setjmp(uint64_t *buf) { (void)buf; return 0; }  /* never restores */
 uint64_t *compat32_crash_jmpbuf = NULL;
 

@@ -1,28 +1,17 @@
 #!/usr/bin/env python3
-# Grow an OsitoFS v2 image and bulk-add decompressed maps from a host dir.
-#   osfs2_grow_addmaps.py <image> <hostdir-with-*.unr> [headroom_blocks]
-# Extends the .img, bumps superblock total (primary+backup+CRC), bump-allocates
-# each new file, writes file-table entries, zeroes their CRC slots (read path
-# skips verify when slot==0). Dedups by name (case-insensitive). p=0 assumed.
-import sys, struct, zlib, os, glob
+"""Grow OsitoFS v2 and transactionally add maps from a host directory."""
 
 MAGIC=0x4F534632; LAYOUT_MAGIC=0x4F324C59; SUPER_BACKUP_OFF=4096; FILETAB_OFF=1<<20
 LEGACY_MAX_FILES=4096; MAX_BLOCKS=262144; CRCTAB_SIZE=MAX_BLOCKS*4; LAYERIDX_SIZE=512*2048
 NAME_LEN=64; FLAG_VALID=1; FLAG_RAW=4
 CRC_OFF=84
 
-def find_part(f):
-    f.seek(0,os.SEEK_END); n=f.tell(); off=0
-    while off<min(n,256<<20):
-        f.seek(off); d=f.read(4)
-        if len(d)==4 and struct.unpack('<I',d)[0]==MAGIC: return off
-        off+=1<<20
-    return None
+from osfs2_journal import (JOURNAL_OP_REPLACE, commit_entries, fix_super_crc,
+                           lock, read_super, recover)
+from osfs2_replace import (CRCTAB_OFF, FILETAB_OFF, FLAG_RAW, FLAG_VALID,
+                           MAX_FILES, NAME_LEN, find_free_extent, find_part,
+                           recompute_super)
 
-def fix_super_crc(s):
-    struct.pack_into('<I',s,CRC_OFF,0)
-    crc=zlib.crc32(bytes(s))&0xFFFFFFFF
-    struct.pack_into('<I',s,CRC_OFF,crc); return crc
 
 def layout(s):
     layout_magic,file_slots,metadata_bytes=struct.unpack_from('<3I',s,88)
@@ -58,7 +47,8 @@ def main():
             ent=tab[i*256:(i+1)*256]
             flags=struct.unpack_from('<I',ent,84)[0]
             if flags & FLAG_VALID:
-                names.add(ent[:NAME_LEN].split(b'\x00')[0].decode('latin1','replace').lower())
+                names.add(entry[:NAME_LEN].split(b'\0')[0]
+                          .decode('latin1', 'replace').lower())
             else:
                 free_slots.append(i)
         # plan: which files to add (skip dups), total blocks needed
@@ -106,4 +96,6 @@ def main():
         print("done.")
     return 0
 
-sys.exit(main())
+
+if __name__ == '__main__':
+    sys.exit(main())

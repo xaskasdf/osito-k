@@ -9,11 +9,13 @@
 #         (defaults to arch/x86/build/nvme.img)
 
 set -e
+set -o pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 X86_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+REPO_DIR="$(cd "$X86_DIR/../.." && pwd)"
 BUILD="$X86_DIR/build"
 NVME="${1:-$BUILD/nvme.img}"
-OFS_TOOLS=/Users/pc/osito-a/tools/ositofs
+OFS_TOOLS="$REPO_DIR/tools/ositofs"
 [ -f "$NVME" ] || { echo "no nvme image at $NVME"; exit 1; }
 [ -x "$OFS_TOOLS/ositofs-write" ] || { echo "ositofs-write missing"; exit 1; }
 
@@ -65,8 +67,6 @@ fi
 mkdir -p "$WORK/cluster"
 cp "$WORK/cert.der" "$WORK/cluster/tls-cert.der"
 cp "$WORK/key.bin"  "$WORK/cluster/tls-key.bin"
-"$OFS_TOOLS/ositofs-delete" "$NVME" "cluster/tls-cert.der" >/dev/null 2>&1 || true
-"$OFS_TOOLS/ositofs-delete" "$NVME" "cluster/tls-key.bin"  >/dev/null 2>&1 || true
 "$OFS_TOOLS/ositofs-write"  "$NVME" "$WORK/cluster/tls-cert.der" \
     --name "cluster/tls-cert.der" --overwrite | tail -1
 "$OFS_TOOLS/ositofs-write"  "$NVME" "$WORK/cluster/tls-key.bin" \

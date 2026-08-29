@@ -14,6 +14,7 @@ extern void serial_puts(const char *s);
 
 /* Weak reference to kernel tick source (100 Hz timer) */
 extern uint64_t idt_get_ticks(void) __attribute__((weak));
+extern uint64_t idt_get_tsc_freq(void);
 
 /* ── Multimedia timers ─────────────────────────────────────── */
 
@@ -33,7 +34,9 @@ DWORD WINAPI shim_timeGetTime(void)
 
     /* Assume ~3 GHz TSC → divide by 3M to get ms.
      * This is approximate but monotonic, which is what matters. */
-    DWORD result = (DWORD)(tsc / 3000000ULL);
+    uint64_t freq = idt_get_tsc_freq();
+    if (!freq) freq = 3000000000ULL;
+    DWORD result = (DWORD)(tsc / (freq / 1000));
 
     static int tgt_log = 0;
     if (tgt_log < 3) {
@@ -131,11 +134,22 @@ static UINT WINAPI shim_waveOutOpen(PVOID *phwo, UINT dev, PVOID fmt, ULONG_PTR 
                                      ULONG_PTR inst, DWORD flags)
     { (void)dev; (void)fmt; (void)cb; (void)inst; (void)flags;
       if (phwo) *phwo = NULL; return 5; /* MMSYSERR_ERROR — no audio */ }
+static UINT WINAPI shim_waveOutMessage(PVOID hwo, UINT msg, ULONG_PTR p1,
+                                        ULONG_PTR p2)
+    { (void)hwo; (void)msg; (void)p1; (void)p2; return 6; /* MMSYSERR_NODRIVER */ }
 static UINT WINAPI shim_waveOutClose(PVOID hwo)       { (void)hwo; return 0; }
 static UINT WINAPI shim_waveOutWrite(PVOID hwo, PVOID hdr, UINT sz)
     { (void)hwo; (void)hdr; (void)sz; return 5; }
 static UINT WINAPI shim_waveOutPrepareHeader(PVOID hwo, PVOID hdr, UINT sz)
     { (void)hwo; (void)hdr; (void)sz; return 0; }
+
+static UINT WINAPI shim_waveInMessage(PVOID hwi, UINT msg, ULONG_PTR p1,
+                                       ULONG_PTR p2)
+    { (void)hwi; (void)msg; (void)p1; (void)p2; return 6; /* MMSYSERR_NODRIVER */ }
+static UINT WINAPI shim_waveInOpen(PVOID *phwi, UINT dev, PVOID fmt, ULONG_PTR cb,
+                                    ULONG_PTR inst, DWORD flags)
+    { (void)dev; (void)fmt; (void)cb; (void)inst; (void)flags;
+      if (phwi) *phwi = NULL; return 6; /* MMSYSERR_NODRIVER */ }
 
 /* ── aux/mixer stubs ──────────────────────────────────────── */
 
@@ -146,6 +160,10 @@ static UINT WINAPI shim_auxSetVolume(UINT dev, DWORD vol)
     { (void)dev; (void)vol; return 0; }
 
 static UINT WINAPI shim_mixerGetNumDevs(void)  { return 0; }
+static UINT WINAPI shim_mixerOpen(PVOID *mixer, UINT device, ULONG_PTR callback,
+                                   ULONG_PTR instance, DWORD flags)
+    { (void)device; (void)callback; (void)instance; (void)flags;
+      if (mixer) *mixer = NULL; return 6; /* MMSYSERR_NODRIVER */ }
 static UINT WINAPI shim_mixerGetControlDetailsA(PVOID hmx, PVOID det, DWORD flags)
     { (void)hmx; (void)det; (void)flags; return 5; }
 static UINT WINAPI shim_mixerGetDevCapsA(UINT dev, PVOID caps, UINT sz)
@@ -180,13 +198,17 @@ static const SHIM_EXPORT winmm_exports[] = {
     { "waveOutGetPosition",       (PVOID)shim_waveOutGetPosition,      3, CC_STDCALL },
     { "waveOutGetDevCapsA",       (PVOID)shim_waveOutGetDevCapsA,      3, CC_STDCALL },
     { "waveOutOpen",              (PVOID)shim_waveOutOpen,             6, CC_STDCALL },
+    { "waveOutMessage",           (PVOID)shim_waveOutMessage,          4, CC_STDCALL },
     { "waveOutClose",             (PVOID)shim_waveOutClose,            1, CC_STDCALL },
     { "waveOutWrite",             (PVOID)shim_waveOutWrite,            3, CC_STDCALL },
     { "waveOutPrepareHeader",     (PVOID)shim_waveOutPrepareHeader,    3, CC_STDCALL },
+    { "waveInMessage",            (PVOID)shim_waveInMessage,           4, CC_STDCALL },
+    { "waveInOpen",               (PVOID)shim_waveInOpen,              6, CC_STDCALL },
     { "auxGetNumDevs",            (PVOID)shim_auxGetNumDevs,           0, CC_STDCALL },
     { "auxGetDevCapsA",           (PVOID)shim_auxGetDevCapsA,          3, CC_STDCALL },
     { "auxSetVolume",             (PVOID)shim_auxSetVolume,            2, CC_STDCALL },
     { "mixerGetNumDevs",          (PVOID)shim_mixerGetNumDevs,         0, CC_STDCALL },
+    { "mixerOpen",                (PVOID)shim_mixerOpen,               5, CC_STDCALL },
     { "mixerGetControlDetailsA",  (PVOID)shim_mixerGetControlDetailsA, 3, CC_STDCALL },
     { "mixerGetDevCapsA",         (PVOID)shim_mixerGetDevCapsA,        3, CC_STDCALL },
     { "mixerGetLineInfoA",        (PVOID)shim_mixerGetLineInfoA,       3, CC_STDCALL },

@@ -104,6 +104,7 @@ void cpu_features_detect(void)
     if (max_ext >= 0x80000001u) {
         cpuid(0x80000001u, &a, &b, &c, &d);
         cpu_features.huge_1g = (d >> 26) & 1;
+        cpu_features.rdtscp  = (d >> 27) & 1;
     }
 
     /* ── Leaves 80000002..80000004h: brand string ── */
@@ -160,10 +161,10 @@ void cpu_features_detect(void)
         }
         uint32_t xcr0_lo, xcr0_hi;
         __asm__ volatile("xgetbv" : "=a"(xcr0_lo), "=d"(xcr0_hi) : "c"(0));
-        if ((xcr0_lo & 0x7) != 0x7) {
-            xcr0_lo |= 0x7;
-            __asm__ volatile("xsetbv" :: "a"(xcr0_lo), "d"(xcr0_hi), "c"(0));
-        }
+        /* isr_common allocates the standard 832-byte x87/SSE/AVX image.
+         * Do not inherit firmware-enabled AVX-512 or AMX components. */
+        if (xcr0_lo != 0x7 || xcr0_hi != 0)
+            __asm__ volatile("xsetbv" :: "a"(0x7), "d"(0), "c"(0));
     }
 }
 
@@ -185,6 +186,7 @@ void cpu_features_dump(void)
     if (cpu_features.avx512f)  serial_puts(" AVX512F");
     if (cpu_features.huge_1g)  serial_puts(" 1GPAGES");
     if (cpu_features.invariant_tsc) serial_puts(" TSC_INV");
+    if (cpu_features.rdtscp)        serial_puts(" RDTSCP");
     serial_puts("\n[CPU] Cache: L1d=");
     serial_putdec(cpu_features.l1d_size / 1024);
     serial_puts("KB L2=");

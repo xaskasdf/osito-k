@@ -8,10 +8,6 @@
 #include "d3d11_enums.h"
 #include "d3d11_interop.h"
 
-namespace dxvk {
-  Logger Logger::s_instance("d3d11.log");
-}
-
 // OsitoK: direct fd2 trace (DXVK Logger goes to a file/cerr that may be lost)
 extern "C" long write(int, const void*, unsigned long);
 static inline void okd11(const char* s) {

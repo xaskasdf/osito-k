@@ -41,10 +41,15 @@ static const char *resolve_posix(const char *path)
 static const char *resolve_win32(const char *path)
 {
     if (!path || !*path) return NULL;
-    /* Strip NT prefix */
-    if (path[0] == '\\' && path[1] == '?' && path[2] == '?' && path[3] == '\\') path += 4;
-    /* Strip drive letter C:\ */
-    if (path[0] && path[1] == ':' && (path[2] == '\\' || path[2] == '/')) path += 3;
+    /* Strip NT and Win32 extended-length prefixes. */
+    if (path[0] == '\\' && path[1] == '?' && path[2] == '?' && path[3] == '\\')
+        path += 4;
+    else if (path[0] == '\\' && path[1] == '\\' && path[2] == '?' && path[3] == '\\')
+        path += 4;
+    /* Strip an absolute drive root. Drive-relative C:foo is resolved by the
+     * Win32 current-directory layer before it reaches the VFS. */
+    if (path[0] && path[1] == ':' && (path[2] == '\\' || path[2] == '/'))
+        path += 3;
     return path;
 }
 
@@ -73,7 +78,8 @@ bool vfs_find(const char *path, int mode, vfs_node_t *out_node)
 
     /* Try v3 first */
     if (osfs3_is_mounted()) {
-        uint32_t ino = osfs3_resolve_path(rpath);
+        uint32_t ino = mode == VFS_MODE_WIN32
+            ? osfs3_resolve_path_ci(rpath) : osfs3_resolve_path(rpath);
         if (ino) {
             out_node->fs_version = 3;
             out_node->ino = ino;
@@ -126,4 +132,3 @@ void vfs_list(const char *path)
         osfs2_list();
     }
 }
-

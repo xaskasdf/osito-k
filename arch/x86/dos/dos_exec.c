@@ -388,9 +388,8 @@ static void dos_nt_propagate_user(uint64_t cr3, uint64_t va)
 }
 
 /* GDT slot reserved for the DOS LDT descriptor (2 slots, 16 bytes).
- * Slots 0-9 are claimed (null, kernel CS/DS, 64-bit CS/DS, CODE32, DATA32);
- * slots 10-11 hold the TSS descriptor (see idt.c:382-383). Slots 12-13
- * are free. Selector = 12 << 3 = 0x60. */
+ * CPU-local TSS descriptors live at slot 32 and above. Keep the historical
+ * DOS selector at slot 12 so guest assumptions remain unchanged. */
 #define DOS_LDT_GDT_SLOT   12
 #define DOS_LDT_SELECTOR   (DOS_LDT_GDT_SLOT << 3)
 
@@ -611,26 +610,12 @@ void dos_transfer_to_native(dos_vm_t *vm)
         }
     }
 
-    /* Set TSS.RSP0 so ring-3→ring-0 transitions (timer interrupt and any
-     * other non-IST vector) land on a valid kernel stack. Without this
-     * the CPU pushes the iret frame at offset 0 and faults at -8. */
+    /* Ring-3-to-ring-0 compatibility transitions use the BSP's permanent IRQ
+     * stack through RSP0. Ordinary external interrupts select IST4 directly. */
     {
-        extern struct __attribute__((packed)) {
-            uint32_t reserved0;
-            uint64_t rsp0;
-            uint64_t rsp1;
-            uint64_t rsp2;
-            uint64_t reserved1;
-            uint64_t ist1, ist2, ist3, ist4, ist5, ist6, ist7;
-            uint64_t reserved2;
-            uint16_t reserved3;
-            uint16_t iopb_offset;
-        } kernel_tss;
-        extern uint8_t ist1_stack[];
-        /* Reuse top of IST1 — IST1_STACK_SIZE is 256KB. */
-        kernel_tss.rsp0 = (uint64_t)(ist1_stack + 262144);
-        serial_puts("[DOS-NT] TSS.RSP0 set to IST1 top = 0x");
-        serial_puthex(kernel_tss.rsp0, 16); serial_puts("\n");
+        extern void x86_tss_reset_rsp0(void);
+        x86_tss_reset_rsp0();
+        serial_puts("[DOS-NT] TSS.RSP0 reset to IRQ stack\n");
     }
 
     /* ── The jump ───────────────────────────────────────────── */

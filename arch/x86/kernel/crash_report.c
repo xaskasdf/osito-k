@@ -21,6 +21,7 @@ extern uint64_t mem_get_total(void);
 
 /* Forward decls for OsitoFS write (may not be available early boot) */
 extern void *osfs2_create(const char *name, uint64_t size);
+extern void *osfs2_find(const char *name);
 extern int   osfs2_write(void *file, uint64_t offset, const void *buf, uint64_t len);
 extern int   osfs2_delete(const char *name);
 extern void  boot_diag_flush(const char *reason);

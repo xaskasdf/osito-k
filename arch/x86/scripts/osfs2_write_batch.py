@@ -1,9 +1,5 @@
 #!/usr/bin/env python3
-# Batch OsitoFS v2 writer — inject MANY files in one pass (one image open, one
-# superblock update). Reads a manifest of "hostpath\tdestkey" lines. Skips dupes
-# and names >=64 chars. Far faster than per-file osfs2_write.py for big closures.
-#   osfs2_write_batch.py <image> <manifest>
-import sys, struct, zlib, os
+"""Add a manifest of files through independent OsitoFS v2 transactions."""
 
 MAGIC = 0x4F534632
 LAYOUT_MAGIC = 0x4F324C59
@@ -94,12 +90,82 @@ with open(img, 'r+b') as f:
         existing.add(key.lower())
         added += 1
 
-    struct.pack_into('<I', s, 16, used)
-    struct.pack_into('<I', s, 20, fcount)
-    struct.pack_into('<I', s, 24, nextblk)
-    struct.pack_into('<I', s, CRC_OFF_IN_SUPER, 0)
-    crc = zlib.crc32(bytes(s)) & 0xFFFFFFFF
-    struct.pack_into('<I', s, CRC_OFF_IN_SUPER, crc)
-    f.seek(p); f.write(s)
-    f.seek(p + SUPER_BACKUP_OFF); f.write(s)
-    print(f"added={added} dup={dup} skipped={skipped} nextblk={nextblk}/{total}")
+        existing = set()
+        free_slots = []
+        for slot in range(MAX_FILES):
+            entry = table[slot * 256:(slot + 1) * 256]
+            flags = struct.unpack_from('<I', entry, 84)[0]
+            if flags & FLAG_VALID:
+                existing.add(entry[:NAME_LEN].split(b'\0')[0]
+                             .decode('latin1', 'replace').lower())
+            else:
+                free_slots.append(slot)
+
+        added = duplicate = skipped = 0
+        incomplete = False
+        for host_path, destination in entries:
+            try:
+                encoded_destination = destination.encode('latin1')
+            except UnicodeEncodeError:
+                skipped += 1
+                continue
+            if not os.path.isfile(host_path) or not encoded_destination or \
+                    len(encoded_destination) >= NAME_LEN:
+                skipped += 1
+                continue
+            if destination.lower() in existing:
+                duplicate += 1
+                continue
+            if not free_slots:
+                print('OUT OF FILE SLOTS')
+                incomplete = True
+                break
+
+            data = open(host_path, 'rb').read()
+            block_count = (len(data) + block_size - 1) // block_size
+            start = find_free_extent(table, total_blocks, block_size, block_count)
+            if start is None:
+                print(f'OUT OF SPACE at {destination} (need {block_count})')
+                incomplete = True
+                break
+            if block_count:
+                image.seek(partition + start * block_size)
+                image.write(data)
+                image.write(bytes(block_count * block_size - len(data)))
+                for block in range(start, start + block_count):
+                    image.seek(partition + CRCTAB_OFF + block * 4)
+                    image.write(bytes(4))
+            image.flush()
+            os.fsync(image.fileno())
+
+            slot = free_slots.pop(0)
+            old_entry = bytes(table[slot * 256:(slot + 1) * 256])
+            new_entry = bytearray(256)
+            new_entry[:len(encoded_destination)] = encoded_destination
+            struct.pack_into('<Q', new_entry, 64, len(data))
+            struct.pack_into('<II', new_entry, 72, start, block_count)
+            struct.pack_into('<I', new_entry, 80, zlib.crc32(data) & 0xFFFFFFFF)
+            struct.pack_into('<I', new_entry, 84, FLAG_VALID | FLAG_RAW)
+            struct.pack_into('<H', new_entry, 244, 0xFFFF)
+            now = int(time.time())
+            struct.pack_into('<II', new_entry, 246, now, now)
+
+            before_super = bytearray(superblock)
+            table[slot * 256:(slot + 1) * 256] = new_entry
+            after_super = bytearray(superblock)
+            recompute_super(after_super, table)
+            commit_entries(image, partition, JOURNAL_OP_REPLACE,
+                           before_super, after_super, [slot], [old_entry],
+                           [new_entry])
+            superblock = after_super
+            existing.add(destination.lower())
+            added += 1
+
+        next_block = struct.unpack_from('<I', superblock, 24)[0]
+        print(f'added={added} dup={duplicate} skipped={skipped} '
+              f'nextblk={next_block}/{total_blocks}')
+    return 1 if incomplete or skipped else 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

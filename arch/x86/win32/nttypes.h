@@ -54,6 +54,16 @@ typedef const WCHAR *PCWSTR;
 typedef char       *PSTR;
 typedef const char *PCSTR;
 
+/* The active PE ABI belongs to the scheduled task. Keeping this behind a
+ * slot accessor preserves the existing lvalue-style call sites while avoiding
+ * a global mode bit that another Win32 thread or CPU can overwrite. */
+#ifdef __KERNEL_X86__
+int *proc_win32_compat32_mode_slot(void);
+#define g_compat32_mode (*proc_win32_compat32_mode_slot())
+#else
+extern int g_compat32_mode;
+#endif
+
 #ifndef NULL
 #define NULL ((void *)0)
 #endif
@@ -96,6 +106,7 @@ typedef LONG NTSTATUS;
 #define STATUS_SUCCESS                  ((NTSTATUS)0x00000000)
 #define STATUS_PENDING                  ((NTSTATUS)0x00000103)
 #define STATUS_BUFFER_OVERFLOW          ((NTSTATUS)0x80000005)
+#define STATUS_PARTIAL_COPY             ((NTSTATUS)0x8000000D)
 
 /* Error */
 #define STATUS_UNSUCCESSFUL             ((NTSTATUS)0xC0000001)
@@ -110,13 +121,21 @@ typedef LONG NTSTATUS;
 #define STATUS_NO_MEMORY                ((NTSTATUS)0xC0000017)
 #define STATUS_CONFLICTING_ADDRESSES    ((NTSTATUS)0xC0000018)
 #define STATUS_UNABLE_TO_FREE_VM        ((NTSTATUS)0xC000001A)
+#define STATUS_ACCESS_DENIED            ((NTSTATUS)0xC0000022)
 #define STATUS_OBJECT_NAME_INVALID      ((NTSTATUS)0xC0000033)
 #define STATUS_OBJECT_NAME_NOT_FOUND    ((NTSTATUS)0xC0000034)
 #define STATUS_OBJECT_NAME_COLLISION    ((NTSTATUS)0xC0000035)
 #define STATUS_OBJECT_PATH_NOT_FOUND    ((NTSTATUS)0xC000003A)
 #define STATUS_OBJECT_PATH_SYNTAX_BAD   ((NTSTATUS)0xC000003B)
+#define STATUS_PROCEDURE_NOT_FOUND      ((NTSTATUS)0xC000007A)
+#define STATUS_INVALID_IMAGE_FORMAT     ((NTSTATUS)0xC000007B)
 #define STATUS_INSUFFICIENT_RESOURCES   ((NTSTATUS)0xC000009A)
+#define STATUS_IO_TIMEOUT               ((NTSTATUS)0xC00000B5)
 #define STATUS_NOT_SUPPORTED            ((NTSTATUS)0xC00000BB)
+#define STATUS_CANCELLED                ((NTSTATUS)0xC0000120)
+#define STATUS_DLL_NOT_FOUND            ((NTSTATUS)0xC0000135)
+#define STATUS_CONNECTION_RESET         ((NTSTATUS)0xC000020D)
+#define STATUS_CONNECTION_REFUSED       ((NTSTATUS)0xC0000236)
 #define STATUS_INVALID_PARAMETER_1      ((NTSTATUS)0xC00000EF)
 #define STATUS_INVALID_PARAMETER_2      ((NTSTATUS)0xC00000F0)
 #define STATUS_OBJECT_TYPE_MISMATCH     ((NTSTATUS)0xC0000024)
@@ -134,6 +153,14 @@ typedef HANDLE *PHANDLE;
 #define NT_CURRENT_THREAD       ((HANDLE)(LONG_PTR)-2)
 
 /* ── UNICODE_STRING ─────────────────────────────────────────── */
+
+typedef struct _ANSI_STRING {
+    USHORT Length;          /* bytes, excluding terminator */
+    USHORT MaximumLength;   /* bytes, including terminator */
+    PSTR   Buffer;
+} ANSI_STRING, *PANSI_STRING;
+
+typedef const ANSI_STRING *PCANSI_STRING;
 
 typedef struct _UNICODE_STRING {
     USHORT Length;              /* current length in BYTES */
@@ -283,6 +310,7 @@ typedef ULONG ACCESS_MASK;
 #define MEM_DECOMMIT            0x00004000
 #define MEM_RELEASE             0x00008000
 #define MEM_FREE                0x00010000
+#define MEM_RESET               0x00080000
 
 /* ── Page protection ────────────────────────────────────────── */
 
@@ -302,6 +330,16 @@ typedef struct _CLIENT_ID {
     HANDLE UniqueProcess;
     HANDLE UniqueThread;
 } CLIENT_ID, *PCLIENT_ID;
+
+/* User stack bounds supplied to NtCreateThread. The stack storage itself is
+ * owned by the process virtual-memory manager, not by the thread object. */
+typedef struct _INITIAL_TEB {
+    PVOID StackBase;
+    PVOID StackLimit;
+    PVOID StackCommit;
+    PVOID StackCommitMax;
+    PVOID StackReserved;
+} INITIAL_TEB, *PINITIAL_TEB;
 
 /* ── LIST_ENTRY (doubly-linked list) ────────────────────────── */
 
@@ -340,7 +378,10 @@ typedef struct _LIST_ENTRY {
 typedef enum _FILE_INFORMATION_CLASS {
     FileBasicInformation          = 4,
     FileStandardInformation       = 5,
+    FileRenameInformation         = 10,
+    FileDispositionInformation    = 13,
     FilePositionInformation       = 14,
+    FileAllocationInformation     = 19,
     FileEndOfFileInformation      = 20,
     FileNameInformation           = 9,
 } FILE_INFORMATION_CLASS;
@@ -381,21 +422,142 @@ typedef struct _PROCESS_BASIC_INFORMATION {
     ULONG_PTR InheritedFromUniqueProcessId;
 } PROCESS_BASIC_INFORMATION;
 
-/* ── PEB (Process Environment Block) — minimal ──────────────── */
+/* Process parameters. The layout matches the native x64 ABI through the
+ * Windows 10/11 fields that are read directly by CRT, SDL and Chromium. */
 
+#define RTL_USER_PROC_PARAMS_NORMALIZED 0x00000001UL
+
+typedef struct _CURDIR {
+    UNICODE_STRING DosPath;
+    HANDLE         Handle;
+} CURDIR, *PCURDIR;
+
+typedef struct _RTL_DRIVE_LETTER_CURDIR {
+    USHORT         Flags;
+    USHORT         Length;
+    ULONG          TimeStamp;
+    UNICODE_STRING DosPath;
+} RTL_DRIVE_LETTER_CURDIR, *PRTL_DRIVE_LETTER_CURDIR;
+
+typedef struct _RTL_USER_PROCESS_PARAMETERS {
+    ULONG          MaximumLength;                 /* +0x000 */
+    ULONG          Length;                        /* +0x004 */
+    ULONG          Flags;                         /* +0x008 */
+    ULONG          DebugFlags;                    /* +0x00C */
+    HANDLE         ConsoleHandle;                 /* +0x010 */
+    ULONG          ConsoleFlags;                  /* +0x018 */
+    ULONG          Padding0;
+    HANDLE         StandardInput;                 /* +0x020 */
+    HANDLE         StandardOutput;                /* +0x028 */
+    HANDLE         StandardError;                 /* +0x030 */
+    CURDIR         CurrentDirectory;              /* +0x038 */
+    UNICODE_STRING DllPath;                       /* +0x050 */
+    UNICODE_STRING ImagePathName;                 /* +0x060 */
+    UNICODE_STRING CommandLine;                   /* +0x070 */
+    PVOID          Environment;                   /* +0x080 */
+    ULONG          StartingX;                     /* +0x088 */
+    ULONG          StartingY;
+    ULONG          CountX;
+    ULONG          CountY;
+    ULONG          CountCharsX;
+    ULONG          CountCharsY;
+    ULONG          FillAttribute;
+    ULONG          WindowFlags;
+    ULONG          ShowWindowFlags;               /* +0x0A8 */
+    ULONG          Padding1;
+    UNICODE_STRING WindowTitle;                   /* +0x0B0 */
+    UNICODE_STRING DesktopInfo;
+    UNICODE_STRING ShellInfo;
+    UNICODE_STRING RuntimeData;
+    RTL_DRIVE_LETTER_CURDIR CurrentDirectories[32]; /* +0x0F0 */
+    ULONG_PTR      EnvironmentSize;               /* +0x3F0 */
+    ULONG_PTR      EnvironmentVersion;
+    PVOID          PackageDependencyData;
+    ULONG          ProcessGroupId;
+    ULONG          LoaderThreads;
+    UNICODE_STRING RedirectionDllName;
+    UNICODE_STRING HeapPartitionName;
+    ULONGLONG     *DefaultThreadpoolCpuSetMasks;
+    ULONG          DefaultThreadpoolCpuSetMaskCount;
+    ULONG          DefaultThreadpoolThreadMaximum;
+    ULONG          HeapMemoryTypeMask;             /* +0x440 */
+    ULONG          Padding2;
+} RTL_USER_PROCESS_PARAMETERS, *PRTL_USER_PROCESS_PARAMETERS;
+
+_Static_assert(__builtin_offsetof(RTL_USER_PROCESS_PARAMETERS, Flags) == 0x08,
+               "RTL process parameters Flags offset changed");
+_Static_assert(__builtin_offsetof(RTL_USER_PROCESS_PARAMETERS,
+                                  CurrentDirectory) == 0x38,
+               "RTL process parameters CWD offset changed");
+_Static_assert(__builtin_offsetof(RTL_USER_PROCESS_PARAMETERS,
+                                  ImagePathName) == 0x60,
+               "RTL process parameters image offset changed");
+_Static_assert(__builtin_offsetof(RTL_USER_PROCESS_PARAMETERS,
+                                  CommandLine) == 0x70,
+               "RTL process parameters command line offset changed");
+_Static_assert(__builtin_offsetof(RTL_USER_PROCESS_PARAMETERS,
+                                  Environment) == 0x80,
+               "RTL process parameters environment offset changed");
+_Static_assert(sizeof(RTL_USER_PROCESS_PARAMETERS) == 0x448,
+               "RTL process parameters x64 size changed");
+
+/* PEB prefix through GdiSharedHandleTable. This is the stable x64 layout
+ * commonly read without API mediation by runtime libraries. */
 typedef struct _PEB {
-    BYTE        InheritedAddressSpace;
+    BYTE        InheritedAddressSpace;             /* +0x000 */
     BYTE        ReadImageFileExecOptions;
     BYTE        BeingDebugged;
     BYTE        BitField;
     ULONG       Padding0;
-    PVOID       Mutant;
-    PVOID       ImageBaseAddress;
-    PVOID       Ldr;                /* PPEB_LDR_DATA */
-    PVOID       ProcessParameters;  /* PRTL_USER_PROCESS_PARAMETERS */
+    PVOID       Mutant;                            /* +0x008 */
+    PVOID       ImageBaseAddress;                  /* +0x010 */
+    PVOID       Ldr;                               /* +0x018 */
+    PRTL_USER_PROCESS_PARAMETERS ProcessParameters; /* +0x020 */
     PVOID       SubSystemData;
-    PVOID       ProcessHeap;
+    PVOID       ProcessHeap;                       /* +0x030 */
+    PVOID       FastPebLock;
+    PVOID       AtlThunkSListPtr;
+    PVOID       IFEOKey;
+    ULONG       CrossProcessFlags;                 /* +0x050 */
+    ULONG       Padding1;
+    PVOID       KernelCallbackTable;
+    ULONG       SystemReserved;                    /* +0x060 */
+    ULONG       AtlThunkSListPtr32;
+    PVOID       ApiSetMap;
+    ULONG       TlsExpansionCounter;               /* +0x070 */
+    ULONG       Padding2;
+    PVOID       TlsBitmap;
+    ULONG       TlsBitmapBits[2];                  /* +0x080 */
+    PVOID       ReadOnlySharedMemoryBase;
+    PVOID       SharedData;
+    PVOID       ReadOnlyStaticServerData;
+    PVOID       AnsiCodePageData;
+    PVOID       OemCodePageData;
+    PVOID       UnicodeCaseTableData;
+    ULONG       NumberOfProcessors;                /* +0x0B8 */
+    ULONG       NtGlobalFlag;                      /* +0x0BC */
+    LARGE_INTEGER CriticalSectionTimeout;
+    ULONG_PTR   HeapSegmentReserve;
+    ULONG_PTR   HeapSegmentCommit;
+    ULONG_PTR   HeapDeCommitTotalFreeThreshold;
+    ULONG_PTR   HeapDeCommitFreeBlockThreshold;
+    ULONG       NumberOfHeaps;
+    ULONG       MaximumNumberOfHeaps;
+    PVOID       ProcessHeaps;
+    PVOID       GdiSharedHandleTable;              /* +0x0F8 */
 } PEB, *PPEB;
+
+_Static_assert(__builtin_offsetof(PEB, ImageBaseAddress) == 0x10,
+               "PEB image base offset changed");
+_Static_assert(__builtin_offsetof(PEB, ProcessParameters) == 0x20,
+               "PEB process parameters offset changed");
+_Static_assert(__builtin_offsetof(PEB, ProcessHeap) == 0x30,
+               "PEB process heap offset changed");
+_Static_assert(__builtin_offsetof(PEB, NtGlobalFlag) == 0xBC,
+               "PEB NtGlobalFlag offset changed");
+_Static_assert(__builtin_offsetof(PEB, GdiSharedHandleTable) == 0xF8,
+               "PEB GDI table offset changed");
+_Static_assert(sizeof(PEB) == 0x100, "PEB x64 prefix size changed");
 
 /* ── SEH (Structured Exception Handling) ────────────────────── */
 
@@ -507,21 +669,53 @@ typedef struct _EH3_EXCEPTION_REGISTRATION {
 
 /* ── TEB (Thread Environment Block) — minimal ──────────────── */
 
+#define TEB64_STORAGE_SIZE 0x2000u
+
 typedef struct _TEB {
-    PVOID       ExceptionList;      /* SEH chain head */
+    PVOID       ExceptionList;      /* +0x0000: NT_TIB */
     PVOID       StackBase;
     PVOID       StackLimit;
     PVOID       SubSystemTib;
     PVOID       FiberData;
     PVOID       ArbitraryUserPointer;
-    struct _TEB *Self;              /* linear address of TEB */
+    struct _TEB *Self;              /* +0x0030 */
     PVOID       EnvironmentPointer;
-    CLIENT_ID   ClientId;           /* PID + TID */
+    CLIENT_ID   ClientId;           /* +0x0040: PID + TID */
     PVOID       ActiveRpcHandle;
-    PVOID       ThreadLocalStoragePointer;
-    PPEB        ProcessEnvironmentBlock;
-    ULONG       LastErrorValue;
+    PVOID       ThreadLocalStoragePointer; /* +0x0058: static TLS vector */
+    PPEB        ProcessEnvironmentBlock;   /* +0x0060 */
+    ULONG       LastErrorValue;             /* +0x0068 */
+    ULONG       CountOfOwnedCriticalSections;
+    BYTE        ReservedToLastStatusValue[0x1250 - 0x70];
+    NTSTATUS    LastStatusValue;            /* +0x1250 */
+    BYTE        ReservedToDeallocationStack[0x1478 - 0x1254];
+    PVOID       DeallocationStack;          /* +0x1478 */
+    PVOID       TlsSlots[64];               /* +0x1480 */
+    BYTE        ReservedToGuaranteedStackBytes[0x1748 - 0x1680];
+    ULONG       GuaranteedStackBytes;       /* +0x1748 */
+    BYTE        ReservedToTlsExpansionSlots[0x1780 - 0x174C];
+    PVOID      *TlsExpansionSlots;          /* +0x1780 */
+    BYTE        ReservedTail[TEB64_STORAGE_SIZE - 0x1788];
 } TEB, *PTEB;
+
+_Static_assert(__builtin_offsetof(TEB, Self) == 0x30,
+               "TEB64 Self offset changed");
+_Static_assert(__builtin_offsetof(TEB, ProcessEnvironmentBlock) == 0x60,
+               "TEB64 PEB offset changed");
+_Static_assert(__builtin_offsetof(TEB, LastErrorValue) == 0x68,
+               "TEB64 LastErrorValue offset changed");
+_Static_assert(__builtin_offsetof(TEB, LastStatusValue) == 0x1250,
+               "TEB64 LastStatusValue offset changed");
+_Static_assert(__builtin_offsetof(TEB, DeallocationStack) == 0x1478,
+               "TEB64 DeallocationStack offset changed");
+_Static_assert(__builtin_offsetof(TEB, TlsSlots) == 0x1480,
+               "TEB64 TlsSlots offset changed");
+_Static_assert(__builtin_offsetof(TEB, GuaranteedStackBytes) == 0x1748,
+               "TEB64 GuaranteedStackBytes offset changed");
+_Static_assert(__builtin_offsetof(TEB, TlsExpansionSlots) == 0x1780,
+               "TEB64 TlsExpansionSlots offset changed");
+_Static_assert(sizeof(TEB) == TEB64_STORAGE_SIZE,
+               "TEB64 backing storage must remain two pages");
 
 /*
  * 32-bit TEB for PE32 (i386) compatibility mode.

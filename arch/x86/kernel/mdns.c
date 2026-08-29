@@ -12,7 +12,7 @@ extern void serial_puts(const char *s);
 extern void serial_puthex(uint64_t val, int digits);
 extern void serial_putdec(uint64_t val);
 
-extern void     net_udp_listen(uint16_t port, void *handler);
+extern int      net_udp_listen(uint16_t port, void *handler);
 extern int      net_udp_send(const uint8_t dst_ip[4], uint16_t dst_port,
                              uint16_t src_port, const void *data, uint32_t len);
 extern void     net_get_mac(uint8_t mac_out[6]);

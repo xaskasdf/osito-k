@@ -23,6 +23,8 @@
 .text
 
 .globl syscall_user_rsp
+.globl syscall_frame_rsp
+.globl syscall_kernel_rsp
 .globl syscall_entry
 syscall_entry:
     /*
@@ -31,8 +33,27 @@ syscall_entry:
      * RSP is still the user stack (ring-0 only).
      */
 
-    /* Save user RSP for fork() — needed before any pushes */
+    /* Save user RSP for fork() and diagnostics before any pushes. */
     movq %rsp, syscall_user_rsp(%rip)
+
+    /* ELF tasks run at CPL0, so SYSCALL leaves RSP on the caller's stack.
+     * pthread stacks can be only 16KB, while VFS/NVMe syscall call chains need
+     * substantially more. Switch to the current task's private 256KB kernel
+     * stack when process.c published one. Save both the original RSP and a
+     * switch marker locally: a syscall may sleep and another task will then
+     * overwrite the global stack selectors before this task resumes. */
+    cmpq $0, syscall_kernel_rsp(%rip)
+    je .Lsyscall_user_stack
+    xchgq %rsp, syscall_kernel_rsp(%rip)
+    pushq syscall_kernel_rsp(%rip)  /* original caller RSP */
+    pushq $1                       /* switched stacks */
+    jmp .Lsyscall_save_regs
+
+.Lsyscall_user_stack:
+    pushq syscall_user_rsp(%rip)
+    pushq $0
+
+.Lsyscall_save_regs:
 
     /* Save ALL user registers we might clobber.
      * SYSCALL ABI: only RAX (return value), RCX, R11 may change.
@@ -55,6 +76,7 @@ syscall_entry:
     push %r10
     push %r8
     push %r9
+    movq %rsp, syscall_frame_rsp(%rip)
 
     /* Set up arguments for syscall_dispatch(nr, a1, a2, a3, a4, a5, a6)
      * C calling convention: RDI, RSI, RDX, RCX, R8, R9, stack[0]
@@ -112,6 +134,20 @@ syscall_entry:
     pop %rbx
     pop %rbp
 
+    /* R11 is caller-clobbered by the x86-64 SYSCALL ABI. Use it to restore the
+     * caller RSP without disturbing the return value in RAX or RIP in RCX. */
+    pop %r11                       /* stack-switch marker */
+    test %r11, %r11
+    jz .Lsyscall_restore_user_stack
+    mov (%rsp), %r11               /* saved caller RSP */
+    add $8, %rsp                    /* private kernel-stack top */
+    mov %rsp, syscall_kernel_rsp(%rip)
+    mov %r11, %rsp
+    jmp .Lsyscall_return
+
+.Lsyscall_restore_user_stack:
+    add $8, %rsp                    /* discard saved caller RSP */
+
     /*
      * Return to caller (ring-0 only).
      * RAX = syscall return value (from syscall_dispatch).
@@ -121,6 +157,7 @@ syscall_entry:
      * STI has a 1-instruction interrupt shadow, so the JMP
      * executes atomically before any pending interrupt fires.
      */
+.Lsyscall_return:
     sti
     jmp *%rcx           /* Jump to saved RIP (in STI shadow) */
 
@@ -129,6 +166,14 @@ syscall_entry:
 .bss
 .align 8
 syscall_user_rsp:
+    .quad 0
+
+.align 8
+syscall_frame_rsp:
+    .quad 0
+
+.align 8
+syscall_kernel_rsp:
     .quad 0
 
 .section .note.GNU-stack,"",%progbits

@@ -33,6 +33,15 @@ extern int  net_tcp_state(int conn);
 
 #define TCP_STATE_ESTABLISHED 2
 
+static volatile uint32_t http_plain_port_ticket;
+
+static uint16_t http_plain_source_port(void)
+{
+    uint32_t ticket = __atomic_fetch_add(&http_plain_port_ticket, 1,
+                                         __ATOMIC_RELAXED);
+    return (uint16_t)(52000U + ticket % 2000U);
+}
+
 /* Parse a URL of the form `http://host[:port]/path`.  Fills `host`,
  * `port`, `path`.  Returns 0 on success. */
 static int parse_http_url(const char *url, char *host, uint32_t host_cap,
@@ -87,7 +96,7 @@ static uint32_t put_u32(uint8_t *buf, uint32_t off, uint32_t cap, uint32_t v)
  * success, -1 on failure. */
 static int read_response(int conn, uint8_t *out, uint32_t cap)
 {
-    static uint8_t buf[4096];
+    uint8_t buf[4096];
     uint32_t buf_len = 0;
     uint32_t body_off = 0;
     int header_done = 0;
@@ -199,11 +208,11 @@ int http_plain_get(const char *url, uint8_t *out, uint32_t out_cap)
         serial_puts("[HTTP-P] DNS fail: "); serial_puts(host); serial_puts("\n");
         return -1;
     }
-    int conn = net_tcp_connect(ip, port, 50100 + (port & 0xFF));
+    int conn = net_tcp_connect(ip, port, http_plain_source_port());
     if (conn < 0) { serial_puts("[HTTP-P] TCP connect fail\n"); return -1; }
 
     /* Build request. */
-    static uint8_t req[1024];
+    uint8_t req[1024];
     uint32_t off = 0;
     off = put_str(req, off, sizeof req, "GET ");
     off = put_str(req, off, sizeof req, path);
@@ -234,10 +243,10 @@ int http_plain_post(const char *url, const char *content_type,
         serial_puts("[HTTP-P] DNS fail: "); serial_puts(host); serial_puts("\n");
         return -1;
     }
-    int conn = net_tcp_connect(ip, port, 50200 + (port & 0xFF));
+    int conn = net_tcp_connect(ip, port, http_plain_source_port());
     if (conn < 0) { serial_puts("[HTTP-P] TCP connect fail\n"); return -1; }
 
-    static uint8_t req[2048];
+    uint8_t req[2048];
     uint32_t off = 0;
     off = put_str(req, off, sizeof req, "POST ");
     off = put_str(req, off, sizeof req, path);

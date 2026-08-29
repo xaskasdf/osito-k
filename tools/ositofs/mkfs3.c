@@ -27,6 +27,23 @@ static void usage(void)
     exit(1);
 }
 
+static uint32_t recommended_inode_count(uint32_t total_blocks)
+{
+    uint32_t inodes = total_blocks;
+    if (inodes < OSFS3_DEFAULT_INODES) inodes = OSFS3_DEFAULT_INODES;
+    if (inodes > OSFS3_MAX_INODES) inodes = OSFS3_MAX_INODES;
+
+    while (inodes > 2U &&
+           OSFS3_FIRST_DATA_BLOCK(inodes) + 1U >= total_blocks)
+        inodes /= 2U;
+    return inodes;
+}
+
+static void bitmap_set(uint8_t *bitmap, uint32_t bit)
+{
+    bitmap[bit >> 3] |= (uint8_t)(1U << (bit & 7U));
+}
+
 int main(int argc, char **argv)
 {
     const char *device = NULL;
@@ -34,7 +51,7 @@ int main(int argc, char **argv)
     uint32_t total_inodes = OSFS3_DEFAULT_INODES;
 
     for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "--label") == 0 && i + 1 < argc) {
+        if (strcmp(argv[i], "--label") == 0 && i + 1 < argc)
             label = argv[++i];
         } else if (strcmp(argv[i], "--inodes") == 0 && i + 1 < argc) {
             total_inodes = (uint32_t)strtoul(argv[++i], NULL, 0);
@@ -43,8 +60,13 @@ int main(int argc, char **argv)
         } else {
             usage();
         }
+        else if (argv[i][0] != '-' && !device)
+            device = argv[i];
+        else
+            usage();
     }
-    if (!device) usage();
+    if (!device || strlen(label) >= sizeof(((osfs3_super_t *)0)->label))
+        usage();
 
     int fd = osfs3_open_device(device, 0);
     if (fd < 0) return 1;
@@ -85,8 +107,10 @@ int main(int argc, char **argv)
            total_blocks - root_data_block, root_data_block);
     printf("  Label: %s\n", label);
 
-    void *blk = osfs3_alloc_block();
-    if (!blk) { osfs3_close_device(fd); return 1; }
+    void *block = osfs3_alloc_block();
+    void *inode_bitmap = osfs3_alloc_block();
+    void *block_bitmap = osfs3_alloc_block();
+    if (!block || !inode_bitmap || !block_bitmap) goto fail;
 
     /* ── Block 0: Superblock ─────────────────────────────────── */
     osfs3_super_t *sb = (osfs3_super_t *)blk;
@@ -105,15 +129,14 @@ int main(int argc, char **argv)
     sb->crc32 = 0;
     sb->crc32 = osfs3_crc32(sb, sizeof(*sb));
 
-    if (osfs3_write_block(fd, 0, blk) < 0) goto fail;
-    printf("  [OK] Superblock written\n");
+    memset(block, 0, OSFS3_BLOCK_SIZE);
+    memcpy(block, &super, sizeof(super));
+    if (osfs3_write_block(fd, OSFS3_SUPERBLOCK_BLK, block) < 0) goto fail;
 
-    /* ── Block 1: Inode Bitmap ───────────────────────────────── */
-    memset(blk, 0, OSFS3_BLOCK_SIZE);
-    uint8_t *imap = (uint8_t *)blk;
-    imap[0] = 0x03; /* Bit 0 (reserved), Bit 1 (root inode) */
-    if (osfs3_write_block(fd, 1, blk) < 0) goto fail;
-    printf("  [OK] Inode bitmap written\n");
+    bitmap_set(inode_bitmap, 0);
+    bitmap_set(inode_bitmap, 1);
+    if (osfs3_write_block(fd, OSFS3_INODE_BITMAP_BLK, inode_bitmap) < 0)
+        goto fail;
 
     /* ── Block 2: Block Bitmap ───────────────────────────────── */
     memset(blk, 0, OSFS3_BLOCK_SIZE);
@@ -174,7 +197,9 @@ int main(int argc, char **argv)
     return 0;
 
 fail:
-    osfs3_free_block(blk);
+    osfs3_free_block(block);
+    osfs3_free_block(inode_bitmap);
+    osfs3_free_block(block_bitmap);
     osfs3_close_device(fd);
     return 1;
 }

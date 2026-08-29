@@ -10,6 +10,7 @@
 #include "ntdll_shim.h"
 #include "compat32.h"
 #include "win32_abi.h"
+#include "wintime.h"
 
 #ifdef TEST_HARNESS
 #include <math.h>
@@ -34,6 +35,28 @@ extern void serial_puthex(uint64_t val, int digits);
 extern void serial_putdec(uint64_t val);
 extern void proc_exit(int32_t code);
 extern void compat32_callback(uint32_t func_addr);
+extern void sched_yield(void);
+extern DWORD win32_current_process_id(void);
+extern const char *win32_current_exe_name(void);
+
+static int msvcrt_running_ut99(void)
+{
+    const char *name = win32_current_exe_name();
+    const char *expected = "UnrealTournament.exe";
+    if (!name) return 0;
+
+    for (const char *p = name; *p; p++)
+        if (*p == '\\' || *p == '/') name = p + 1;
+
+    while (*name && *expected) {
+        char a = *name++;
+        char b = *expected++;
+        if (a >= 'A' && a <= 'Z') a += 'a' - 'A';
+        if (b >= 'A' && b <= 'Z') b += 'a' - 'A';
+        if (a != b) return 0;
+    }
+    return *name == 0 && *expected == 0;
+}
 
 /* ── CRT Initialization ────────────────────────────────────── */
 
@@ -61,6 +84,7 @@ extern void kfree(void *ptr);
 extern PVOID WINAPI HeapAlloc(HANDLE hHeap, DWORD dwFlags, SIZE_T dwBytes);
 extern BOOL  WINAPI HeapFree(HANDLE hHeap, DWORD dwFlags, PVOID lpMem);
 extern PVOID WINAPI HeapReAlloc(HANDLE hHeap, DWORD dwFlags, PVOID lpMem, SIZE_T dwBytes);
+extern SIZE_T WINAPI HeapSize(HANDLE hHeap, DWORD dwFlags, PCVOID lpMem);
 extern HANDLE WINAPI GetProcessHeap(void);
 
 static int fmalloc_log_count = 0;
@@ -123,6 +147,8 @@ int g_gmalloc_preload_phase = 0;
 
 static void ensure_gmalloc_stub(void)
 {
+    if (!msvcrt_running_ut99()) return;
+
     /* GMalloc is at Core.dll + RVA 0xA7B90 (VA 0x101A7B90 when base=0x10100000).
      * It's a FMalloc* pointer. On disk, it points to a BSS object (0x101E3450)
      * whose vtable starts as 0 (zero-initialized). The pointer is NON-NULL but
@@ -296,6 +322,8 @@ static void fmw_install_router(uint32_t obj_addr)
  * ensure_gmalloc_stub so it fires as soon as each real vtable is set. */
 static void fmw_install_routers(void)
 {
+    if (!msvcrt_running_ut99()) return;
+
     fmw_install_router(0x1092F738);
     volatile uint32_t *gmalloc = (volatile uint32_t *)(uintptr_t)0x101A7B90;
     fmw_install_router(*gmalloc);
@@ -304,6 +332,24 @@ static void fmw_install_routers(void)
 void WINAPI _initterm(_PVFV *pfbegin, _PVFV *pfend)
 {
 #ifndef TEST_HARNESS
+    if (!g_compat32_mode) {
+        typedef void (WINAPI *init_fn64_t)(void);
+        uint64_t *begin64 = (uint64_t *)(ULONG_PTR)pfbegin;
+        uint64_t *end64   = (uint64_t *)(ULONG_PTR)pfend;
+
+        serial_puts("[MSVCRT] _initterm64: ");
+        serial_putdec((uint64_t)(end64 - begin64));
+        serial_puts(" entries at 0x");
+        serial_puthex((uint64_t)(ULONG_PTR)begin64, 16);
+        serial_puts("\n");
+
+        for (uint64_t *p = begin64; p < end64; p++) {
+            if (*p)
+                ((init_fn64_t)(ULONG_PTR)*p)();
+        }
+        return;
+    }
+
     /* Ensure GMalloc is valid before any callback can call appMalloc.
      * Core.dll's global constructors and DLL _initterm callbacks may
      * use appMalloc BEFORE the EXE's appInit() sets up FMallocWindows. */
@@ -355,7 +401,7 @@ void WINAPI _initterm(_PVFV *pfbegin, _PVFV *pfend)
      * protection fault!". If GErrorHist is set when WinMain's Browse()
      * runs, the engine skips rendering → error exit. Clear it so the
      * engine starts WinMain with clean error state. */
-    {
+    if (msvcrt_running_ut99()) {
         volatile uint16_t *gerr = (volatile uint16_t *)(uintptr_t)0x101E3474;
         volatile uint32_t *gcrit = (volatile uint32_t *)(uintptr_t)0x101E568C;
         if (*gerr != 0) {
@@ -384,6 +430,27 @@ void WINAPI _initterm(_PVFV *pfbegin, _PVFV *pfend)
 int WINAPI _initterm_e(_PIFV *pfbegin, _PIFV *pfend)
 {
 #ifndef TEST_HARNESS
+    if (!g_compat32_mode) {
+        typedef int (WINAPI *init_fn64_t)(void);
+        uint64_t *begin64 = (uint64_t *)(ULONG_PTR)pfbegin;
+        uint64_t *end64   = (uint64_t *)(ULONG_PTR)pfend;
+
+        serial_puts("[MSVCRT] _initterm_e64: ");
+        serial_putdec((uint64_t)(end64 - begin64));
+        serial_puts(" entries at 0x");
+        serial_puthex((uint64_t)(ULONG_PTR)begin64, 16);
+        serial_puts("\n");
+
+        for (uint64_t *p = begin64; p < end64; p++) {
+            if (*p) {
+                int ret = ((init_fn64_t)(ULONG_PTR)*p)();
+                if (ret != 0)
+                    return ret;
+            }
+        }
+        return 0;
+    }
+
     /* PE32 mode: same 32-bit pointer handling */
     uint32_t *begin32 = (uint32_t *)(ULONG_PTR)pfbegin;
     uint32_t *end32   = (uint32_t *)(ULONG_PTR)pfend;
@@ -446,128 +513,79 @@ int WINAPI __wgetmainargs(int *argc, WCHAR ***argv, WCHAR ***env,
     return 0;
 }
 
+int WINAPI __crtGetShowWindowMode(void) { return 10; /* SW_SHOWDEFAULT */ }
 void WINAPI __set_app_type(int type) { (void)type; serial_puts("[CRT] __set_app_type\n"); }
-int  WINAPI _set_new_mode(int mode) { (void)mode; return 0; }
+static int crt_exchange_new_mode(int mode);
+static PVOID crt_exchange_new_handler(PVOID handler);
+
+int WINAPI _set_new_mode(int mode)
+{
+    return crt_exchange_new_mode(mode ? 1 : 0);
+}
+
+PVOID WINAPI crt_set_new_handler(PVOID handler)
+{
+    return crt_exchange_new_handler(handler);
+}
 
 /* ── Heap-backed malloc/free ───────────────────────────────── */
 
-/*
- * Simple allocator with size prefix for realloc support.
- * Each allocation: [8-byte size header][user data...]
- * Aligned to 16 bytes.
- */
-/* CRT heap: dynamic from sys_caps (scales with RAM) */
-#include "../include/sys_caps.h"
+/* CRT allocations use the Win32 process heap. PE32 callers therefore receive
+ * mapped user addresses instead of truncated kernel-heap pointers. */
 
-/* CRT pool allocated dynamically via kmalloc (no static fallback — saves 64MB BSS).
- * Size scales with available RAM via sys_caps. */
-static BYTE  *crt_pool = NULL;
-static SIZE_T crt_pool_size = 0;
-static SIZE_T crt_pool_offset = 0;
-
-static void crt_pool_init(void)
-{
-    if (crt_pool) return;
-    uint64_t target = g_sys_caps.crt_pool_size;
-    if (!target) target = 64ULL * 1024 * 1024;
-    extern void *kmalloc(uint64_t size);
-    crt_pool = (BYTE *)kmalloc(target);
-    if (crt_pool) {
-        crt_pool_size = target;
-    } else {
-        /* Try smaller fallback */
-        crt_pool = (BYTE *)kmalloc(1024 * 1024);
-        crt_pool_size = crt_pool ? (1024 * 1024) : 0;
-    }
-    serial_puts("[CRT-POOL] addr=0x");
-    serial_puthex((uint64_t)(uintptr_t)crt_pool, 16);
-    serial_puts(" size=");
-    serial_putdec(crt_pool_size / (1024*1024));
-    serial_puts("MB\n");
-}
-
-/* Free list for basic reuse */
-#define FREE_LIST_MAX 256
-typedef struct { PVOID addr; SIZE_T size; } FREE_ENTRY;
-static FREE_ENTRY free_list[FREE_LIST_MAX];
-static int free_list_count = 0;
-
-static int crt_malloc_log_count = 0;
 PVOID WINAPI crt_malloc(SIZE_T size)
 {
-    if (size == 0) size = 1;
-    SIZE_T total = (size + 8 + 15) & ~(SIZE_T)15;  /* 8-byte header + alignment */
-
-    /* Check free list first */
-    for (int i = 0; i < free_list_count; i++) {
-        if (free_list[i].size >= total) {
-            BYTE *block = (BYTE *)free_list[i].addr;
-            /* Remove from free list */
-            free_list[i] = free_list[--free_list_count];
-            *(SIZE_T *)block = total;
-            return block + 8;
+    PVOID result = HeapAlloc(GetProcessHeap(), 0, size ? size : 1);
+    if (size == 0x60 || size == 0x68) {
+        static uint32_t raw_monitor_alloc_logs;
+        if (raw_monitor_alloc_logs++ < 8) {
+            serial_puts("[CRT-MALLOC-MON] size=");
+            serial_putdec(size);
+            serial_puts(" -> 0x");
+            serial_puthex((ULONG_PTR)result, 16);
+            serial_puts("\n");
         }
-    }
-
-    if (!crt_pool) crt_pool_init();
-    if (crt_pool_offset + total > crt_pool_size)
-        return NULL;
-
-    BYTE *block = crt_pool + crt_pool_offset;
-    crt_pool_offset += total;
-    *(SIZE_T *)block = total;
-    PVOID result = block + 8;
-
-    if (crt_malloc_log_count < 10) {
-        crt_malloc_log_count++;
-        serial_puts("[CRT-MALLOC] size=");
-        serial_putdec(size);
-        serial_puts(" -> 0x");
-        serial_puthex((uint64_t)(uintptr_t)result, 16);
-        serial_puts("\n");
     }
     return result;
 }
 
 PVOID WINAPI crt_calloc(SIZE_T count, SIZE_T size)
 {
+    if (size && count > (SIZE_T)-1 / size)
+        return NULL;
     SIZE_T total = count * size;
-    PVOID p = crt_malloc(total);
-    if (p) crt_memset(p, 0, total);
-    return p;
+    PVOID result = HeapAlloc(GetProcessHeap(),
+                             0x00000008 /* HEAP_ZERO_MEMORY */,
+                             total ? total : 1);
+    static uint32_t calloc120_logs;
+    if (total == 0x78 && calloc120_logs++ < 8) {
+        serial_puts("[CRT-CALLOC120] count=");
+        serial_putdec(count);
+        serial_puts(" size=");
+        serial_putdec(size);
+        serial_puts(" -> 0x");
+        serial_puthex((ULONG_PTR)result, 16);
+        serial_puts("\n");
+    }
+    return result;
 }
 
 void WINAPI crt_free(PVOID ptr)
 {
-    if (!ptr) return;
-    BYTE *block = (BYTE *)ptr - 8;
-    SIZE_T total = *(SIZE_T *)block;
-
-    /* Add to free list if space */
-    if (free_list_count < FREE_LIST_MAX) {
-        free_list[free_list_count].addr = block;
-        free_list[free_list_count].size = total;
-        free_list_count++;
-    }
+    if (ptr)
+        HeapFree(GetProcessHeap(), 0, ptr);
 }
 
 PVOID WINAPI crt_realloc(PVOID ptr, SIZE_T size)
 {
     if (!ptr) return crt_malloc(size);
     if (size == 0) { crt_free(ptr); return NULL; }
+    return HeapReAlloc(GetProcessHeap(), 0, ptr, size);
+}
 
-    BYTE *old_block = (BYTE *)ptr - 8;
-    SIZE_T old_total = *(SIZE_T *)old_block;
-    SIZE_T old_data = old_total - 8;
-
-    if (size <= old_data)
-        return ptr;  /* fits in existing block */
-
-    PVOID new_ptr = crt_malloc(size);
-    if (!new_ptr) return NULL;
-    crt_memcpy(new_ptr, ptr, old_data < size ? old_data : size);
-    crt_free(ptr);
-    return new_ptr;
+SIZE_T WINAPI crt_msize(PVOID ptr)
+{
+    return HeapSize(GetProcessHeap(), 0, ptr);
 }
 
 /* ── String functions ──────────────────────────────────────── */
@@ -667,6 +685,34 @@ char* WINAPI crt_strrchr(const char *s, int c)
 }
 
 /* ── Memory ops ────────────────────────────────────────────── */
+
+static BOOL crt_char_is_delimiter(char c, const char *delimiters)
+{
+    for (const char *d = delimiters; *d; d++)
+        if (*d == c) return TRUE;
+    return FALSE;
+}
+
+char* WINAPI crt_strtok_s(char *str, const char *delimiters, char **context)
+{
+    if (!delimiters || !context || (!str && !*context)) {
+        *crt_errno() = 22; /* EINVAL */
+        return NULL;
+    }
+
+    char *cursor = str ? str : *context;
+    while (*cursor && crt_char_is_delimiter(*cursor, delimiters)) cursor++;
+    if (!*cursor) {
+        *context = cursor;
+        return NULL;
+    }
+
+    char *token = cursor;
+    while (*cursor && !crt_char_is_delimiter(*cursor, delimiters)) cursor++;
+    if (*cursor) *cursor++ = 0;
+    *context = cursor;
+    return token;
+}
 
 PVOID WINAPI crt_memcpy(PVOID dst, PCVOID src, SIZE_T n)
 {
@@ -783,6 +829,16 @@ int WINAPI crt_memcmp(PCVOID a, PCVOID b, SIZE_T n)
     return 0;
 }
 
+PVOID WINAPI crt_memchr(PCVOID ptr, int value, SIZE_T n)
+{
+    const BYTE *p = (const BYTE *)ptr;
+    BYTE needle = (BYTE)value;
+    for (SIZE_T i = 0; i < n; i++) {
+        if (p[i] == needle) return (PVOID)(ULONG_PTR)&p[i];
+    }
+    return NULL;
+}
+
 /* ── Format I/O engine ─────────────────────────────────────── */
 
 /*
@@ -837,6 +893,33 @@ static SIZE_T uint_to_str(char *buf, unsigned long long val, int base, int upper
     for (int j = 0; j < i; j++) buf[j] = tmp[i - 1 - j];
     buf[i] = 0;
     return i;
+}
+
+static void fmt_integer(FMT_CTX *ctx, const char *digits, SIZE_T digit_count,
+                        int width, int precision, int left_align,
+                        int zero_pad, char sign)
+{
+    if (precision == 0 && digit_count == 1 && digits[0] == '0')
+        digit_count = 0;
+
+    int precision_zeroes = 0;
+    if (precision > (int)digit_count)
+        precision_zeroes = precision - (int)digit_count;
+
+    int content = (sign ? 1 : 0) + precision_zeroes + (int)digit_count;
+    int width_pad = width > content ? width - content : 0;
+
+    /* An explicit integer precision disables the zero flag. */
+    if (!left_align && (!zero_pad || precision >= 0))
+        fmt_pad(ctx, width_pad, ' ');
+    if (sign)
+        fmt_putc(ctx, sign);
+    if (!left_align && zero_pad && precision < 0)
+        fmt_pad(ctx, width_pad, '0');
+    fmt_pad(ctx, precision_zeroes, '0');
+    fmt_puts(ctx, digits, digit_count);
+    if (left_align)
+        fmt_pad(ctx, width_pad, ' ');
 }
 
 static int do_vformat(FMT_CTX *ctx, const char *fmt, ms_va_list ap)
@@ -904,20 +987,18 @@ static int do_vformat(FMT_CTX *ctx, const char *fmt, ms_va_list ap)
             else if (len_mod == 1 || len_mod == 3) val = ms_va_arg(ap, long);
             else val = ms_va_arg(ap, int);
 
-            if (val < 0) { negative = 1; val = -val; }
-            num_len = uint_to_str(num_buf, (unsigned long long)val, 10, 0);
-
-            int total = (int)num_len + negative;
-            if (plus_sign || space_sign) total++;
-            char pad = (zero_pad && !left_align) ? '0' : ' ';
-
-            if (!left_align && pad == ' ') fmt_pad(ctx, width - total, ' ');
-            if (negative) fmt_putc(ctx, '-');
-            else if (plus_sign) fmt_putc(ctx, '+');
-            else if (space_sign) fmt_putc(ctx, ' ');
-            if (!left_align && pad == '0') fmt_pad(ctx, width - total, '0');
-            fmt_puts(ctx, num_buf, num_len);
-            if (left_align) fmt_pad(ctx, width - total, ' ');
+            unsigned long long magnitude;
+            if (val < 0) {
+                negative = 1;
+                magnitude = (unsigned long long)(-(val + 1)) + 1;
+            } else {
+                magnitude = (unsigned long long)val;
+            }
+            num_len = uint_to_str(num_buf, magnitude, 10, 0);
+            char sign = negative ? '-' : (plus_sign ? '+' :
+                                           (space_sign ? ' ' : 0));
+            fmt_integer(ctx, num_buf, num_len, width, precision, left_align,
+                        zero_pad, sign);
             break;
         }
         case 'u': {
@@ -927,9 +1008,8 @@ static int do_vformat(FMT_CTX *ctx, const char *fmt, ms_va_list ap)
             else val = ms_va_arg(ap, unsigned int);
 
             num_len = uint_to_str(num_buf, val, 10, 0);
-            if (!left_align) fmt_pad(ctx, width - (int)num_len, zero_pad ? '0' : ' ');
-            fmt_puts(ctx, num_buf, num_len);
-            if (left_align) fmt_pad(ctx, width - (int)num_len, ' ');
+            fmt_integer(ctx, num_buf, num_len, width, precision, left_align,
+                        zero_pad, 0);
             break;
         }
         case 'x': case 'X': {
@@ -939,9 +1019,8 @@ static int do_vformat(FMT_CTX *ctx, const char *fmt, ms_va_list ap)
             else val = ms_va_arg(ap, unsigned int);
 
             num_len = uint_to_str(num_buf, val, 16, (*fmt == 'X'));
-            if (!left_align) fmt_pad(ctx, width - (int)num_len, zero_pad ? '0' : ' ');
-            fmt_puts(ctx, num_buf, num_len);
-            if (left_align) fmt_pad(ctx, width - (int)num_len, ' ');
+            fmt_integer(ctx, num_buf, num_len, width, precision, left_align,
+                        zero_pad, 0);
             break;
         }
         case 'o': {
@@ -950,9 +1029,8 @@ static int do_vformat(FMT_CTX *ctx, const char *fmt, ms_va_list ap)
             else val = ms_va_arg(ap, unsigned int);
 
             num_len = uint_to_str(num_buf, val, 8, 0);
-            if (!left_align) fmt_pad(ctx, width - (int)num_len, zero_pad ? '0' : ' ');
-            fmt_puts(ctx, num_buf, num_len);
-            if (left_align) fmt_pad(ctx, width - (int)num_len, ' ');
+            fmt_integer(ctx, num_buf, num_len, width, precision, left_align,
+                        zero_pad, 0);
             break;
         }
         case 'p': {
@@ -1164,20 +1242,18 @@ static int do_vformat32(FMT_CTX *ctx, const char *fmt, uint32_t *vp)
                 val = (long long)(int32_t)(*vp++);
             }
 
-            if (val < 0) { negative = 1; val = -val; }
-            num_len = uint_to_str(num_buf, (unsigned long long)val, 10, 0);
-
-            int total = (int)num_len + negative;
-            if (plus_sign || space_sign) total++;
-            char pad = (zero_pad && !left_align) ? '0' : ' ';
-
-            if (!left_align && pad == ' ') fmt_pad(ctx, width - total, ' ');
-            if (negative) fmt_putc(ctx, '-');
-            else if (plus_sign) fmt_putc(ctx, '+');
-            else if (space_sign) fmt_putc(ctx, ' ');
-            if (!left_align && pad == '0') fmt_pad(ctx, width - total, '0');
-            fmt_puts(ctx, num_buf, num_len);
-            if (left_align) fmt_pad(ctx, width - total, ' ');
+            unsigned long long magnitude;
+            if (val < 0) {
+                negative = 1;
+                magnitude = (unsigned long long)(-(val + 1)) + 1;
+            } else {
+                magnitude = (unsigned long long)val;
+            }
+            num_len = uint_to_str(num_buf, magnitude, 10, 0);
+            char sign = negative ? '-' : (plus_sign ? '+' :
+                                           (space_sign ? ' ' : 0));
+            fmt_integer(ctx, num_buf, num_len, width, precision, left_align,
+                        zero_pad, sign);
             break;
         }
         case 'u': {
@@ -1190,9 +1266,8 @@ static int do_vformat32(FMT_CTX *ctx, const char *fmt, uint32_t *vp)
             }
 
             num_len = uint_to_str(num_buf, val, 10, 0);
-            if (!left_align) fmt_pad(ctx, width - (int)num_len, zero_pad ? '0' : ' ');
-            fmt_puts(ctx, num_buf, num_len);
-            if (left_align) fmt_pad(ctx, width - (int)num_len, ' ');
+            fmt_integer(ctx, num_buf, num_len, width, precision, left_align,
+                        zero_pad, 0);
             break;
         }
         case 'x': case 'X': {
@@ -1205,9 +1280,8 @@ static int do_vformat32(FMT_CTX *ctx, const char *fmt, uint32_t *vp)
             }
 
             num_len = uint_to_str(num_buf, val, 16, (*fmt == 'X'));
-            if (!left_align) fmt_pad(ctx, width - (int)num_len, zero_pad ? '0' : ' ');
-            fmt_puts(ctx, num_buf, num_len);
-            if (left_align) fmt_pad(ctx, width - (int)num_len, ' ');
+            fmt_integer(ctx, num_buf, num_len, width, precision, left_align,
+                        zero_pad, 0);
             break;
         }
         case 'o': {
@@ -1220,9 +1294,8 @@ static int do_vformat32(FMT_CTX *ctx, const char *fmt, uint32_t *vp)
             }
 
             num_len = uint_to_str(num_buf, val, 8, 0);
-            if (!left_align) fmt_pad(ctx, width - (int)num_len, zero_pad ? '0' : ' ');
-            fmt_puts(ctx, num_buf, num_len);
-            if (left_align) fmt_pad(ctx, width - (int)num_len, ' ');
+            fmt_integer(ctx, num_buf, num_len, width, precision, left_align,
+                        zero_pad, 0);
             break;
         }
         case 'p': {
@@ -1354,6 +1427,34 @@ done32:
     return (int)ctx->pos;
 }
 
+static int WINAPI crt_printf_compat32(const char *fmt, uint32_t *args)
+{
+    FMT_CTX ctx = { NULL, 0, 0 };
+    return do_vformat32(&ctx, fmt, args);
+}
+
+static int WINAPI crt_sprintf_compat32(char *buf, const char *fmt,
+                                       uint32_t *args)
+{
+    FMT_CTX ctx = { buf, (SIZE_T)-1, 0 };
+    return do_vformat32(&ctx, fmt, args);
+}
+
+static int WINAPI crt_snprintf_compat32(char *buf, SIZE_T size,
+                                        const char *fmt, uint32_t *args)
+{
+    FMT_CTX ctx = { buf, size, 0 };
+    return do_vformat32(&ctx, fmt, args);
+}
+
+static int WINAPI crt_fprintf_compat32(PVOID stream, const char *fmt,
+                                       uint32_t *args)
+{
+    (void)stream;
+    FMT_CTX ctx = { NULL, 0, 0 };
+    return do_vformat32(&ctx, fmt, args);
+}
+
 int WINAPI crt_printf(const char *fmt, ...)
 {
     ms_va_list ap;
@@ -1395,12 +1496,25 @@ int WINAPI crt_fprintf(PVOID stream, const char *fmt, ...)
     return ret;
 }
 
-int WINAPI crt_sscanf(const char *buf, const char *fmt, ...)
+typedef struct {
+    ms_va_list *native;
+    uint32_t *compat32;
+} CRT_SCAN_ARGS;
+
+static PVOID crt_scan_output_arg(CRT_SCAN_ARGS *args)
+{
+    if (args->compat32) {
+        PVOID output = (PVOID)(ULONG_PTR)*args->compat32;
+        args->compat32++;
+        return output;
+    }
+    return ms_va_arg(*args->native, PVOID);
+}
+
+static int crt_vsscanf_core(const char *buf, const char *fmt,
+                            CRT_SCAN_ARGS *args)
 {
     if (!buf || !fmt) return -1;
-
-    ms_va_list ap;
-    ms_va_start(ap, fmt);
 
     const char *p = buf;  /* current position in input */
     int matched = 0;      /* number of successfully assigned items */
@@ -1448,6 +1562,15 @@ int WINAPI crt_sscanf(const char *buf, const char *fmt, ...)
         } else if (*fmt == 'h') {
             fmt++; s_len_mod = 2;
             if (*fmt == 'h') { fmt++; s_len_mod = 2; }
+        } else if (*fmt == 'I') {
+            /* Microsoft CRT integer widths: %I32d / %I64u. */
+            if (fmt[1] == '6' && fmt[2] == '4') {
+                fmt += 3;
+                s_len_mod = 3;
+            } else if (fmt[1] == '3' && fmt[2] == '2') {
+                fmt += 3;
+                s_len_mod = 0;
+            }
         }
 
         switch (*fmt) {
@@ -1497,10 +1620,10 @@ int WINAPI crt_sscanf(const char *buf, const char *fmt, ...)
 
             if (p == start) goto done; /* no chars consumed */
             if (!suppress) {
-                if (s_len_mod == 3) *ms_va_arg(ap, long long *) = val;
-                else if (s_len_mod == 1) *ms_va_arg(ap, long *) = (long)val;
-                else if (s_len_mod == 2) *ms_va_arg(ap, short *) = (short)val;
-                else *ms_va_arg(ap, int *) = (int)val;
+                if (s_len_mod == 3) *(long long *)crt_scan_output_arg(args) = val;
+                else if (s_len_mod == 1) *(long *)crt_scan_output_arg(args) = (long)val;
+                else if (s_len_mod == 2) *(short *)crt_scan_output_arg(args) = (short)val;
+                else *(int *)crt_scan_output_arg(args) = (int)val;
                 matched++;
             }
             break;
@@ -1518,10 +1641,10 @@ int WINAPI crt_sscanf(const char *buf, const char *fmt, ...)
                 p++; count++;
             }
             if (!suppress) {
-                if (s_len_mod == 3) *ms_va_arg(ap, unsigned long long *) = val;
-                else if (s_len_mod == 1) *ms_va_arg(ap, unsigned long *) = (unsigned long)val;
-                else if (s_len_mod == 2) *ms_va_arg(ap, unsigned short *) = (unsigned short)val;
-                else *ms_va_arg(ap, unsigned int *) = (unsigned int)val;
+                if (s_len_mod == 3) *(unsigned long long *)crt_scan_output_arg(args) = val;
+                else if (s_len_mod == 1) *(unsigned long *)crt_scan_output_arg(args) = (unsigned long)val;
+                else if (s_len_mod == 2) *(unsigned short *)crt_scan_output_arg(args) = (unsigned short)val;
+                else *(unsigned int *)crt_scan_output_arg(args) = (unsigned int)val;
                 matched++;
             }
             break;
@@ -1548,9 +1671,9 @@ int WINAPI crt_sscanf(const char *buf, const char *fmt, ...)
                 p++; count++;
             }
             if (!suppress) {
-                if (s_len_mod == 3) *ms_va_arg(ap, unsigned long long *) = val;
-                else if (s_len_mod == 1) *ms_va_arg(ap, unsigned long *) = (unsigned long)val;
-                else *ms_va_arg(ap, unsigned int *) = (unsigned int)val;
+                if (s_len_mod == 3) *(unsigned long long *)crt_scan_output_arg(args) = val;
+                else if (s_len_mod == 1) *(unsigned long *)crt_scan_output_arg(args) = (unsigned long)val;
+                else *(unsigned int *)crt_scan_output_arg(args) = (unsigned int)val;
                 matched++;
             }
             break;
@@ -1567,8 +1690,10 @@ int WINAPI crt_sscanf(const char *buf, const char *fmt, ...)
                 p++; count++;
             }
             if (!suppress) {
-                if (s_len_mod == 1) *ms_va_arg(ap, unsigned long *) = (unsigned long)val;
-                else *ms_va_arg(ap, unsigned int *) = (unsigned int)val;
+                if (s_len_mod == 3) *(unsigned long long *)crt_scan_output_arg(args) = val;
+                else if (s_len_mod == 1) *(unsigned long *)crt_scan_output_arg(args) = (unsigned long)val;
+                else if (s_len_mod == 2) *(unsigned short *)crt_scan_output_arg(args) = (unsigned short)val;
+                else *(unsigned int *)crt_scan_output_arg(args) = (unsigned int)val;
                 matched++;
             }
             break;
@@ -1577,7 +1702,7 @@ int WINAPI crt_sscanf(const char *buf, const char *fmt, ...)
             while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
             if (!*p) goto done;
 
-            char *dst = suppress ? NULL : ms_va_arg(ap, char *);
+            char *dst = suppress ? NULL : (char *)crt_scan_output_arg(args);
             int count = 0;
             while (*p && *p != ' ' && *p != '\t' && *p != '\n' && *p != '\r' &&
                    (fw == 0 || count < fw)) {
@@ -1593,7 +1718,7 @@ int WINAPI crt_sscanf(const char *buf, const char *fmt, ...)
             int count = (fw > 0) ? fw : 1;
             if (!*p) goto done;
 
-            char *dst = suppress ? NULL : ms_va_arg(ap, char *);
+            char *dst = suppress ? NULL : (char *)crt_scan_output_arg(args);
             for (int ci = 0; ci < count && *p; ci++) {
                 if (dst) dst[ci] = *p;
                 p++;
@@ -1631,8 +1756,8 @@ int WINAPI crt_sscanf(const char *buf, const char *fmt, ...)
 
             if (p == fstart) goto done;
             if (!suppress) {
-                if (s_len_mod == 1) *ms_va_arg(ap, double *) = fval;
-                else *ms_va_arg(ap, float *) = (float)fval;
+                if (s_len_mod == 1) *(double *)crt_scan_output_arg(args) = fval;
+                else *(float *)crt_scan_output_arg(args) = (float)fval;
                 matched++;
             }
             break;
@@ -1640,7 +1765,7 @@ int WINAPI crt_sscanf(const char *buf, const char *fmt, ...)
         case 'n': {
             /* Store number of characters consumed so far */
             if (!suppress) {
-                *ms_va_arg(ap, int *) = (int)(p - buf);
+                *(int *)crt_scan_output_arg(args) = (int)(p - buf);
                 /* %n does not increment matched count per C standard */
             }
             break;
@@ -1663,7 +1788,7 @@ int WINAPI crt_sscanf(const char *buf, const char *fmt, ...)
             if (*fmt == ']') fmt++; /* skip closing ']' */
 
             if (!*p) goto done;
-            char *dst = suppress ? NULL : ms_va_arg(ap, char *);
+            char *dst = suppress ? NULL : (char *)crt_scan_output_arg(args);
             int count = 0;
             while (*p && (fw == 0 || count < fw)) {
                 int in_set = set[(unsigned char)*p];
@@ -1686,8 +1811,24 @@ int WINAPI crt_sscanf(const char *buf, const char *fmt, ...)
     }
 
 done:
+    return matched;
+}
+
+int WINAPI crt_sscanf(const char *buf, const char *fmt, ...)
+{
+    ms_va_list ap;
+    ms_va_start(ap, fmt);
+    CRT_SCAN_ARGS args = { &ap, NULL };
+    int matched = crt_vsscanf_core(buf, fmt, &args);
     ms_va_end(ap);
     return matched;
+}
+
+static int WINAPI crt_sscanf_compat32(const char *buf, const char *fmt,
+                                      uint32_t *args32)
+{
+    CRT_SCAN_ARGS args = { NULL, args32 };
+    return crt_vsscanf_core(buf, fmt, &args);
 }
 
 int WINAPI crt_puts(const char *s)
@@ -1714,12 +1855,77 @@ struct _CRT_FILE {
     HANDLE  nt_handle;
     int     flags;      /* 1=read, 2=write, 4=eof, 8=error, 16=ungetc valid */
     int     ungetc_ch;
+    int     open_flags;
+    int     owns_handle;
 };
 
 #define CRT_FILE_MAX 32
+#define CRT_FILE_PROXY_PROCESS_SLOTS 512
+
+/* PE32 programs can inspect FILE directly. Keep the ABI-visible object in
+ * process-owned low memory and translate it to the native backing table at
+ * the shim boundary. This is the MSVCR100/UCRT x86 _iobuf layout. */
+typedef struct {
+    uint32_t ptr;
+    int32_t  cnt;
+    uint32_t base;
+    int32_t  flag;
+    int32_t  file;
+    int32_t  charbuf;
+    int32_t  bufsiz;
+    uint32_t tmpfname;
+} CRT_FILE32;
+
+_Static_assert(sizeof(CRT_FILE32) == 32, "PE32 _iobuf layout changed");
+
+typedef struct {
+    DWORD owner_pid;
+    CRT_FILE32 *files;
+} CRT_FILE_PROXY_SLOT;
+
+#define CRT_EBADF       9
+#define CRT_ENOMEM     12
+#define CRT_EINVAL     22
+#define CRT_EMFILE     24
+#define CRT_ENOENT      2
+#define CRT_ENAMETOOLONG 38
+#define CRT_EOVERFLOW 132
+#define CRT_ERANGE     34
+#define CRT_STRUNCATE  80
+
+#define CRT_O_WRONLY   0x0001
+#define CRT_O_RDWR     0x0002
+#define CRT_O_APPEND   0x0008
+#define CRT_O_CREAT    0x0100
+#define CRT_O_TRUNC    0x0200
+#define CRT_O_EXCL     0x0400
+#define CRT_O_TEXT     0x4000
+#define CRT_O_BINARY   0x8000
+
+#define CRT_FILE_BEGIN   0
+#define CRT_FILE_CURRENT 1
+#define CRT_FILE_END     2
+
+#define CRT_DUPLICATE_SAME_ACCESS 0x00000002
+
+extern BOOL WINAPI FlushFileBuffers(HANDLE hFile);
 
 static CRT_FILE crt_files[CRT_FILE_MAX];
 static int crt_files_init = 0;
+static CRT_FILE_PROXY_SLOT crt_file_proxies[CRT_FILE_PROXY_PROCESS_SLOTS];
+static volatile uint32_t crt_file_proxy_lock;
+static volatile uint32_t crt_open_trace_count;
+static volatile uint32_t crt_close_trace_count;
+static volatile uint32_t crt_read_trace_count;
+static volatile uint32_t crt_lseek_trace_count;
+static volatile uint32_t crt_lseek32_trace_count;
+static volatile uint32_t crt_stat_trace_count;
+
+static int crt_io_trace_take(volatile uint32_t *counter, uint32_t limit)
+{
+    if (limit > 8) limit = 8;
+    return __sync_fetch_and_add(counter, 1) < limit;
+}
 
 /* Standard streams as FILE indices */
 #define CRT_STDIN   (&crt_files[0])
@@ -1732,51 +1938,261 @@ static void ensure_stdio_init(void)
     crt_files_init = 1;
     crt_files[0].nt_handle = (HANDLE)(ULONG_PTR)4;   /* stdin */
     crt_files[0].flags = 1;
+    crt_files[0].open_flags = CRT_O_TEXT;
     crt_files[1].nt_handle = (HANDLE)(ULONG_PTR)8;   /* stdout */
     crt_files[1].flags = 2;
+    crt_files[1].open_flags = CRT_O_TEXT | CRT_O_WRONLY;
     crt_files[2].nt_handle = (HANDLE)(ULONG_PTR)12;  /* stderr */
     crt_files[2].flags = 2;
+    crt_files[2].open_flags = CRT_O_TEXT | CRT_O_WRONLY;
 }
 
-CRT_FILE* WINAPI crt_iob_func(int index)
+static void crt_file_proxy_lock_acquire(void)
+{
+    while (__sync_lock_test_and_set(&crt_file_proxy_lock, 1)) {
+        for (int spin = 0; spin < 100; spin++)
+            __asm__ volatile ("pause" ::: "memory");
+        sched_yield();
+    }
+}
+
+static void crt_file_proxy_lock_release(void)
+{
+    __sync_lock_release(&crt_file_proxy_lock);
+}
+
+static int crt_file_proxy_flags(const CRT_FILE *file)
+{
+    int flags = 0;
+    if (file->flags & 1) flags |= 0x0001; /* _IOREAD */
+    if (file->flags & 2) flags |= 0x0002; /* _IOWRT */
+    if (file->flags & 4) flags |= 0x0010; /* _IOEOF */
+    if (file->flags & 8) flags |= 0x0020; /* _IOERR */
+    return flags;
+}
+
+static void crt_file_proxy_init(CRT_FILE32 *files)
 {
     ensure_stdio_init();
-    if (index >= 0 && index < 3)
-        return &crt_files[index];
-    return NULL;
+    for (int fd = 0; fd < CRT_FILE_MAX; fd++) {
+        files[fd].flag = crt_file_proxy_flags(&crt_files[fd]);
+        files[fd].file = fd;
+    }
+}
+
+static CRT_FILE32 *crt_file_proxy_array(BOOL create)
+{
+    DWORD owner_pid = win32_current_process_id();
+    if (!owner_pid) owner_pid = 1;
+
+    CRT_FILE32 *files = NULL;
+    BOOL have_free_slot = FALSE;
+    crt_file_proxy_lock_acquire();
+    for (uint32_t i = 0; i < CRT_FILE_PROXY_PROCESS_SLOTS; i++) {
+        if (crt_file_proxies[i].owner_pid == owner_pid) {
+            files = crt_file_proxies[i].files;
+            break;
+        }
+        if (!crt_file_proxies[i].owner_pid)
+            have_free_slot = TRUE;
+    }
+    crt_file_proxy_lock_release();
+
+    if (files || !create || !have_free_slot)
+        return files;
+
+    CRT_FILE32 *candidate = (CRT_FILE32 *)VirtualAlloc(
+        NULL, sizeof(CRT_FILE32) * CRT_FILE_MAX,
+        MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    ULONG_PTR candidate_end = (ULONG_PTR)candidate +
+                              sizeof(CRT_FILE32) * CRT_FILE_MAX - 1;
+    if (!candidate || (ULONG_PTR)candidate > (ULONG_PTR)UINT32_MAX ||
+        candidate_end > (ULONG_PTR)UINT32_MAX) {
+        if (candidate)
+            VirtualFree(candidate, 0, MEM_RELEASE);
+        return NULL;
+    }
+    crt_file_proxy_init(candidate);
+
+    CRT_FILE32 *unused = candidate;
+    crt_file_proxy_lock_acquire();
+    CRT_FILE_PROXY_SLOT *free_slot = NULL;
+    for (uint32_t i = 0; i < CRT_FILE_PROXY_PROCESS_SLOTS; i++) {
+        CRT_FILE_PROXY_SLOT *slot = &crt_file_proxies[i];
+        if (slot->owner_pid == owner_pid) {
+            files = slot->files;
+            break;
+        }
+        if (!slot->owner_pid && !free_slot)
+            free_slot = slot;
+    }
+    if (!files && free_slot) {
+        free_slot->owner_pid = owner_pid;
+        free_slot->files = candidate;
+        files = candidate;
+        unused = NULL;
+    }
+    crt_file_proxy_lock_release();
+
+    if (unused)
+        VirtualFree(unused, 0, MEM_RELEASE);
+    if (files == candidate) {
+        serial_puts("[CRT] PE32 stdio proxy pid=");
+        serial_putdec(owner_pid);
+        serial_puts(" va=0x");
+        serial_puthex((ULONG_PTR)files, 8);
+        serial_puts("\n");
+    }
+    return files;
+}
+
+static void crt_file_proxy_sync(int fd)
+{
+    if (fd < 0 || fd >= CRT_FILE_MAX) return;
+    CRT_FILE32 *files = crt_file_proxy_array(FALSE);
+    if (!files) return;
+    files[fd].flag = crt_file_proxy_flags(&crt_files[fd]);
+    files[fd].file = fd;
+}
+
+static void crt_file_proxy_release_process(DWORD process_id)
+{
+    crt_file_proxy_lock_acquire();
+    for (uint32_t i = 0; i < CRT_FILE_PROXY_PROCESS_SLOTS; i++) {
+        if (crt_file_proxies[i].owner_pid == process_id) {
+            crt_file_proxies[i].owner_pid = 0;
+            crt_file_proxies[i].files = NULL;
+        }
+    }
+    crt_file_proxy_lock_release();
+}
+
+static int crt_file_index(CRT_FILE *file)
+{
+    uintptr_t address = (uintptr_t)file;
+    uintptr_t first = (uintptr_t)&crt_files[0];
+    uintptr_t end = (uintptr_t)&crt_files[CRT_FILE_MAX];
+
+    ensure_stdio_init();
+    if (address >= first && address < end &&
+        ((address - first) % sizeof(CRT_FILE)) == 0) {
+        int fd = (int)((address - first) / sizeof(CRT_FILE));
+        return crt_files[fd].nt_handle ? fd : -1;
+    }
+
+    CRT_FILE32 *files = crt_file_proxy_array(FALSE);
+    first = (uintptr_t)files;
+    end = first + sizeof(CRT_FILE32) * CRT_FILE_MAX;
+    if (!files || address < first || address >= end ||
+        ((address - first) % sizeof(CRT_FILE32)) != 0)
+        return -1;
+
+    int fd = (int)((address - first) / sizeof(CRT_FILE32));
+    return crt_files[fd].nt_handle ? fd : -1;
+}
+
+static CRT_FILE *crt_file_resolve(CRT_FILE *file, int *fd_out)
+{
+    int fd = crt_file_index(file);
+    if (fd_out) *fd_out = fd;
+    return fd >= 0 ? &crt_files[fd] : NULL;
+}
+
+static CRT_FILE *crt_file_from_fd(int fd)
+{
+    ensure_stdio_init();
+    if (fd < 0 || fd >= CRT_FILE_MAX || !crt_files[fd].nt_handle)
+        return NULL;
+    return &crt_files[fd];
+}
+
+static CRT_FILE *crt_file_for_caller(int fd)
+{
+    CRT_FILE *file = crt_file_from_fd(fd);
+    if (!file || !g_compat32_mode)
+        return file;
+
+    CRT_FILE32 *files = crt_file_proxy_array(TRUE);
+    if (!files) {
+        *crt_errno() = CRT_ENOMEM;
+        return NULL;
+    }
+    crt_file_proxy_sync(fd);
+    return (CRT_FILE *)(ULONG_PTR)&files[fd];
+}
+
+static int crt_file_attach(HANDLE handle, int open_flags)
+{
+    if (!handle || handle == INVALID_HANDLE_VALUE) {
+        *crt_errno() = CRT_EBADF;
+        return -1;
+    }
+
+    ensure_stdio_init();
+    for (int fd = 3; fd < CRT_FILE_MAX; fd++) {
+        if (crt_files[fd].nt_handle) continue;
+        crt_files[fd].nt_handle = handle;
+        crt_files[fd].flags = (open_flags & CRT_O_RDWR) ? 3 :
+                              (open_flags & CRT_O_WRONLY) ? 2 : 1;
+        crt_files[fd].ungetc_ch = -1;
+        crt_files[fd].open_flags = open_flags;
+        crt_files[fd].owns_handle = 1;
+        crt_file_proxy_sync(fd);
+        return fd;
+    }
+
+    *crt_errno() = CRT_EMFILE;
+    return -1;
+}
+
+CRT_FILE* WINAPI crt_iob_func(void)
+{
+    ensure_stdio_init();
+    if (!g_compat32_mode)
+        return &crt_files[0];
+
+    CRT_FILE32 *files = crt_file_proxy_array(TRUE);
+    return (CRT_FILE *)(ULONG_PTR)files;
+}
+
+CRT_FILE* WINAPI crt_acrt_iob_func(unsigned int index)
+{
+    if (index >= 3)
+        return NULL;
+    return crt_file_for_caller((int)index);
 }
 
 CRT_FILE* WINAPI crt_fopen(const char *path, const char *mode)
 {
-    ensure_stdio_init();
-
-    DWORD access = 0, disposition = 3; /* OPEN_EXISTING */
-    int flags = 0;
-
-    if (mode[0] == 'r') { access = GENERIC_READ; flags = 1; disposition = 3; }
-    if (mode[0] == 'w') { access = GENERIC_WRITE; flags = 2; disposition = 2; /* CREATE_ALWAYS */ }
-    if (mode[0] == 'a') { access = GENERIC_WRITE; flags = 2; disposition = 4; /* OPEN_ALWAYS */ }
-    /* '+' means read+write */
-    for (const char *m = mode + 1; *m; m++) {
-        if (*m == '+') { access = GENERIC_READ | GENERIC_WRITE; flags = 3; }
+    if (!path || !mode || !mode[0]) {
+        *crt_errno() = CRT_EINVAL;
+        return NULL;
     }
 
-    HANDLE h = CreateFileA(path, access, FILE_SHARE_READ, NULL, disposition, 0, NULL);
-    if (h == INVALID_HANDLE_VALUE)
+    int open_flags;
+    if (mode[0] == 'r') open_flags = 0;
+    else if (mode[0] == 'w')
+        open_flags = CRT_O_WRONLY | CRT_O_CREAT | CRT_O_TRUNC;
+    else if (mode[0] == 'a')
+        open_flags = CRT_O_WRONLY | CRT_O_CREAT | CRT_O_APPEND;
+    else {
+        *crt_errno() = CRT_EINVAL;
         return NULL;
+    }
 
-    /* Find free slot */
-    for (int i = 3; i < CRT_FILE_MAX; i++) {
-        if (crt_files[i].nt_handle == NULL) {
-            crt_files[i].nt_handle = h;
-            crt_files[i].flags = flags;
-            crt_files[i].ungetc_ch = -1;
-            return &crt_files[i];
+    open_flags |= CRT_O_TEXT;
+    for (const char *option = mode + 1; *option; option++) {
+        if (*option == '+') {
+            open_flags &= ~CRT_O_WRONLY;
+            open_flags |= CRT_O_RDWR;
+        } else if (*option == 'b') {
+            open_flags &= ~CRT_O_TEXT;
+            open_flags |= CRT_O_BINARY;
         }
     }
 
-    CloseHandle(h);
-    return NULL;
+    int fd = crt_open(path, open_flags, 0666);
+    return fd >= 0 ? crt_file_for_caller(fd) : NULL;
 }
 
 CRT_FILE* WINAPI crt_wfopen(const uint16_t *wpath, const uint16_t *wmode)
@@ -1793,20 +2209,43 @@ CRT_FILE* WINAPI crt_wfopen(const uint16_t *wpath, const uint16_t *wmode)
 
 SIZE_T WINAPI crt_fread(PVOID buf, SIZE_T size, SIZE_T count, CRT_FILE *f)
 {
-    if (!f || !f->nt_handle || !(f->flags & 1)) return 0;
+    int fd;
+    CRT_FILE *file = crt_file_resolve(f, &fd);
+    if (!size || !count) return 0;
+    if (!buf || !file || !(file->flags & 1)) {
+        if (file) {
+            file->flags |= 8;
+            crt_file_proxy_sync(fd);
+        }
+        return 0;
+    }
     DWORD total = (DWORD)(size * count);
     DWORD bytes_read = 0;
-    BOOL ok = ReadFile(f->nt_handle, buf, total, &bytes_read, NULL);
-    if (!ok || bytes_read == 0) f->flags |= 4; /* EOF */
+    BOOL ok = ReadFile(file->nt_handle, buf, total, &bytes_read, NULL);
+    if (!ok) file->flags |= 8;
+    else if (bytes_read == 0) file->flags |= 4;
+    crt_file_proxy_sync(fd);
     return bytes_read / size;
 }
 
 SIZE_T WINAPI crt_fwrite(PCVOID buf, SIZE_T size, SIZE_T count, CRT_FILE *f)
 {
-    if (!f || !f->nt_handle || !(f->flags & 2)) return 0;
+    int fd;
+    CRT_FILE *file = crt_file_resolve(f, &fd);
+    if (!size || !count) return 0;
+    if (!buf || !file || !(file->flags & 2)) {
+        if (file) {
+            file->flags |= 8;
+            crt_file_proxy_sync(fd);
+        }
+        return 0;
+    }
     DWORD total = (DWORD)(size * count);
     DWORD bytes_written = 0;
-    WriteFile(f->nt_handle, buf, total, &bytes_written, NULL);
+    if (!WriteFile(file->nt_handle, buf, total, &bytes_written, NULL)) {
+        file->flags |= 8;
+        crt_file_proxy_sync(fd);
+    }
 
     /* Echo text writes to serial (captures engine log output) */
     if (total > 0 && total < 4096) {
@@ -1829,50 +2268,67 @@ SIZE_T WINAPI crt_fwrite(PCVOID buf, SIZE_T size, SIZE_T count, CRT_FILE *f)
 
 int WINAPI crt_fclose(CRT_FILE *f)
 {
-    if (!f || f == CRT_STDIN || f == CRT_STDOUT || f == CRT_STDERR)
-        return -1;
-    if (f->nt_handle) {
-        CloseHandle(f->nt_handle);
-        f->nt_handle = NULL;
-        f->flags = 0;
-    }
-    return 0;
+    int fd = crt_file_index(f);
+    return fd < 0 ? -1 : crt_close(fd);
 }
 
 int WINAPI crt_fseek(CRT_FILE *f, long offset, int whence)
 {
-    if (!f || !f->nt_handle) return -1;
-    return SetFilePointer(f->nt_handle, offset, NULL, (DWORD)whence) ? 0 : -1;
+    int fd = crt_file_index(f);
+    if (fd < 0 || crt_lseeki64(fd, (LONGLONG)offset, whence) < 0)
+        return -1;
+    return 0;
 }
 
 long WINAPI crt_ftell(CRT_FILE *f)
 {
-    if (!f || !f->nt_handle) return -1;
+    CRT_FILE *file = crt_file_resolve(f, NULL);
+    if (!file) return -1;
     /* Get current position by seeking 0 from current */
     IO_STATUS_BLOCK iosb;
     FILE_POSITION_INFORMATION pos_info;
-    NTSTATUS status = NtQueryInformationFile(f->nt_handle, &iosb, &pos_info,
+    NTSTATUS status = NtQueryInformationFile(file->nt_handle, &iosb, &pos_info,
                                               sizeof(pos_info),
                                               FilePositionInformation);
     if (!NT_SUCCESS(status)) return -1;
     return (long)pos_info.CurrentByteOffset.QuadPart;
 }
 
-int WINAPI crt_fflush(CRT_FILE *f) { (void)f; return 0; }
-int WINAPI crt_feof(CRT_FILE *f) { return f ? (f->flags & 4) : 0; }
-int WINAPI crt_ferror(CRT_FILE *f) { return f ? (f->flags & 8) : 0; }
+int WINAPI crt_fflush(CRT_FILE *f)
+{
+    if (!f) return 0;
+    CRT_FILE *file = crt_file_resolve(f, NULL);
+    if (!file) return -1;
+    if (!(file->flags & 2)) return 0;
+    return FlushFileBuffers(file->nt_handle) ? 0 : -1;
+}
+int WINAPI crt_feof(CRT_FILE *f)
+{
+    CRT_FILE *file = crt_file_resolve(f, NULL);
+    return file ? (file->flags & 4) : 0;
+}
+
+int WINAPI crt_ferror(CRT_FILE *f)
+{
+    CRT_FILE *file = crt_file_resolve(f, NULL);
+    return file ? (file->flags & 8) : 0;
+}
 
 int WINAPI crt_fgetc(CRT_FILE *f)
 {
-    if (!f) return -1;
-    if (f->flags & 16) {
-        f->flags &= ~16;
-        return f->ungetc_ch;
+    int fd;
+    CRT_FILE *file = crt_file_resolve(f, &fd);
+    if (!file) return -1;
+    if (file->flags & 16) {
+        file->flags &= ~16;
+        crt_file_proxy_sync(fd);
+        return file->ungetc_ch;
     }
     char c;
     DWORD read;
-    if (!ReadFile(f->nt_handle, &c, 1, &read, NULL) || read == 0) {
-        f->flags |= 4;
+    if (!ReadFile(file->nt_handle, &c, 1, &read, NULL) || read == 0) {
+        file->flags |= 4;
+        crt_file_proxy_sync(fd);
         return -1;
     }
     return (unsigned char)c;
@@ -1880,16 +2336,22 @@ int WINAPI crt_fgetc(CRT_FILE *f)
 
 int WINAPI crt_fputc(int c, CRT_FILE *f)
 {
-    if (!f) return -1;
+    int fd;
+    CRT_FILE *file = crt_file_resolve(f, &fd);
+    if (!file) return -1;
     char ch = (char)c;
-    DWORD written;
-    WriteFile(f->nt_handle, &ch, 1, &written, NULL);
+    DWORD written = 0;
+    if (!WriteFile(file->nt_handle, &ch, 1, &written, NULL) || written != 1) {
+        file->flags |= 8;
+        crt_file_proxy_sync(fd);
+        return -1;
+    }
     return (unsigned char)ch;
 }
 
 char* WINAPI crt_fgets(char *buf, int n, CRT_FILE *f)
 {
-    if (!f || n <= 0) return NULL;
+    if (!buf || !crt_file_resolve(f, NULL) || n <= 0) return NULL;
     int i;
     for (i = 0; i < n - 1; i++) {
         int c = crt_fgetc(f);
@@ -1906,23 +2368,546 @@ char* WINAPI crt_fgets(char *buf, int n, CRT_FILE *f)
 
 int WINAPI crt_fputs(const char *s, CRT_FILE *f)
 {
-    if (!f || !s) return -1;
+    int fd;
+    CRT_FILE *file = crt_file_resolve(f, &fd);
+    if (!file || !s) return -1;
     SIZE_T len = crt_strlen(s);
-    DWORD written;
-    WriteFile(f->nt_handle, s, (DWORD)len, &written, NULL);
+    DWORD written = 0;
+    if (!WriteFile(file->nt_handle, s, (DWORD)len, &written, NULL)) {
+        file->flags |= 8;
+        crt_file_proxy_sync(fd);
+        return -1;
+    }
     return (int)written;
 }
 
 int WINAPI crt_ungetc(int c, CRT_FILE *f)
 {
-    if (!f || c == -1) return -1;
-    f->ungetc_ch = c;
-    f->flags |= 16;
-    f->flags &= ~4;  /* clear EOF */
+    int fd;
+    CRT_FILE *file = crt_file_resolve(f, &fd);
+    if (!file || c == -1) return -1;
+    file->ungetc_ch = c;
+    file->flags |= 16;
+    file->flags &= ~4;  /* clear EOF */
+    crt_file_proxy_sync(fd);
     return c;
 }
 
+int WINAPI crt_fileno(CRT_FILE *f)
+{
+    int fd = crt_file_index(f);
+    if (fd < 0) *crt_errno() = CRT_EBADF;
+    return fd;
+}
+
+static void WINAPI crt_clearerr(CRT_FILE *file)
+{
+    int fd;
+    CRT_FILE *native = crt_file_resolve(file, &fd);
+    if (native) {
+        native->flags &= ~(4 | 8);
+        crt_file_proxy_sync(fd);
+    }
+}
+
+static void WINAPI crt_rewind(CRT_FILE *file)
+{
+    if (file && crt_fseek(file, 0, CRT_FILE_BEGIN) == 0)
+        crt_clearerr(file);
+}
+
+static int WINAPI crt_setvbuf(CRT_FILE *file, char *buffer, int mode,
+                              SIZE_T size)
+{
+    (void)buffer;
+    (void)size;
+    if (!crt_file_resolve(file, NULL) ||
+        (mode != 0 && mode != 4 && mode != 64)) {
+        *crt_errno() = CRT_EINVAL;
+        return -1;
+    }
+    /* Osito's CRT streams are unbuffered, so all valid policies are already
+     * synchronized with the backing NT handle. */
+    *crt_errno() = 0;
+    return 0;
+}
+
 /* ── Conversion ────────────────────────────────────────────── */
+
+static int crt_errno_from_last_error(void)
+{
+    switch (GetLastError()) {
+    case 2:  /* ERROR_FILE_NOT_FOUND */
+    case 3:  /* ERROR_PATH_NOT_FOUND */
+        return 2;
+    case 5:  /* ERROR_ACCESS_DENIED */
+    case 32: /* ERROR_SHARING_VIOLATION */
+    case 33: /* ERROR_LOCK_VIOLATION */
+        return 13;
+    case 6:  /* ERROR_INVALID_HANDLE */
+        return CRT_EBADF;
+    case 80:  /* ERROR_FILE_EXISTS */
+    case 183: /* ERROR_ALREADY_EXISTS */
+        return 17;
+    case 112: /* ERROR_DISK_FULL */
+        return 28;
+    default:
+        return CRT_EINVAL;
+    }
+}
+
+static DWORD crt_open_access(int flags)
+{
+    if (flags & CRT_O_RDWR) return GENERIC_READ | GENERIC_WRITE;
+    if (flags & CRT_O_WRONLY) return GENERIC_WRITE;
+    return GENERIC_READ;
+}
+
+static DWORD crt_open_disposition(int flags)
+{
+    if ((flags & (CRT_O_CREAT | CRT_O_EXCL)) ==
+        (CRT_O_CREAT | CRT_O_EXCL))
+        return 1; /* CREATE_NEW */
+    if ((flags & (CRT_O_CREAT | CRT_O_TRUNC)) ==
+        (CRT_O_CREAT | CRT_O_TRUNC))
+        return 2; /* CREATE_ALWAYS */
+    if (flags & CRT_O_CREAT) return 4; /* OPEN_ALWAYS */
+    if (flags & CRT_O_TRUNC) return 5; /* TRUNCATE_EXISTING */
+    return 3; /* OPEN_EXISTING */
+}
+
+static int crt_open_handle(HANDLE handle, int flags)
+{
+    if (handle == INVALID_HANDLE_VALUE) {
+        *crt_errno() = crt_errno_from_last_error();
+        return -1;
+    }
+
+    int fd = crt_file_attach(handle, flags);
+    if (fd < 0) {
+        CloseHandle(handle);
+        return -1;
+    }
+    if ((flags & CRT_O_APPEND) && crt_lseeki64(fd, 0, CRT_FILE_END) < 0) {
+        crt_close(fd);
+        return -1;
+    }
+    *crt_errno() = 0;
+    return fd;
+}
+
+int WINAPI crt_open(const char *path, int flags, int mode)
+{
+    (void)mode;
+    if (!path || !path[0]) {
+        *crt_errno() = CRT_EINVAL;
+        return -1;
+    }
+
+    HANDLE handle = CreateFileA(path, crt_open_access(flags),
+                                FILE_SHARE_READ | FILE_SHARE_WRITE |
+                                    FILE_SHARE_DELETE,
+                                NULL, crt_open_disposition(flags), 0, NULL);
+    int fd = crt_open_handle(handle, flags);
+    if (crt_io_trace_take(&crt_open_trace_count, 64)) {
+        serial_puts("[CRT-OPEN] fd=");
+        serial_putdec((uint64_t)(uint32_t)fd);
+        serial_puts(" flags=0x");
+        serial_puthex((uint32_t)flags, 8);
+        serial_puts(" mode=0x");
+        serial_puthex((uint32_t)mode, 8);
+        serial_puts(" handle=0x");
+        serial_puthex((ULONG_PTR)handle, 8);
+        serial_puts(" errno=");
+        serial_putdec((uint64_t)(uint32_t)*crt_errno());
+        serial_puts(" path='");
+        serial_puts(path);
+        serial_puts("'\n");
+    }
+    return fd;
+}
+
+int WINAPI crt_wopen(const WCHAR *path, int flags, int mode)
+{
+    (void)mode;
+    if (!path || !path[0]) {
+        *crt_errno() = CRT_EINVAL;
+        return -1;
+    }
+
+    HANDLE handle = CreateFileW(path, crt_open_access(flags),
+                                FILE_SHARE_READ | FILE_SHARE_WRITE |
+                                    FILE_SHARE_DELETE,
+                                NULL, crt_open_disposition(flags), 0, NULL);
+    return crt_open_handle(handle, flags);
+}
+
+LONG_PTR WINAPI crt_get_osfhandle(int fd)
+{
+    CRT_FILE *file = crt_file_from_fd(fd);
+    if (!file) {
+        *crt_errno() = CRT_EBADF;
+        return -1;
+    }
+    return (LONG_PTR)(ULONG_PTR)file->nt_handle;
+}
+
+int WINAPI crt_open_osfhandle(LONG_PTR handle, int flags)
+{
+    int fd = crt_file_attach((HANDLE)(ULONG_PTR)handle, flags);
+    if (fd >= 0) *crt_errno() = 0;
+    return fd;
+}
+
+int WINAPI crt_close(int fd)
+{
+    int trace = crt_io_trace_take(&crt_close_trace_count, 64);
+    CRT_FILE *file = crt_file_from_fd(fd);
+    if (!file) {
+        *crt_errno() = CRT_EBADF;
+        if (trace) {
+            serial_puts("[CRT-CLOSE] invalid fd=");
+            serial_putdec((uint64_t)(uint32_t)fd);
+            serial_puts("\n");
+        }
+        return -1;
+    }
+
+    /* Standard handles are kernel pseudo-handles shared by every Win32
+     * process. Keep their backing objects alive. */
+    if (fd < 3) {
+        *crt_errno() = 0;
+        return 0;
+    }
+    if (file->owns_handle && !CloseHandle(file->nt_handle)) {
+        *crt_errno() = crt_errno_from_last_error();
+        return -1;
+    }
+
+    file->nt_handle = NULL;
+    file->flags = 0;
+    file->ungetc_ch = -1;
+    file->open_flags = 0;
+    file->owns_handle = 0;
+    crt_file_proxy_sync(fd);
+    *crt_errno() = 0;
+    if (trace) {
+        serial_puts("[CRT-CLOSE] fd=");
+        serial_putdec((uint64_t)(uint32_t)fd);
+        serial_puts(" ok\n");
+    }
+    return 0;
+}
+
+int WINAPI crt_read(int fd, PVOID buffer, unsigned int count)
+{
+    int trace = count != 1 && crt_io_trace_take(&crt_read_trace_count, 96);
+    CRT_FILE *file = crt_file_from_fd(fd);
+    if (!file || !(file->flags & 1)) {
+        *crt_errno() = CRT_EBADF;
+        if (trace) {
+            serial_puts("[CRT-READ] invalid fd=");
+            serial_putdec((uint64_t)(uint32_t)fd);
+            serial_puts(" count=");
+            serial_putdec(count);
+            serial_puts("\n");
+        }
+        return -1;
+    }
+    if (!buffer && count) {
+        *crt_errno() = CRT_EINVAL;
+        return -1;
+    }
+
+    DWORD transferred = 0;
+    if (!ReadFile(file->nt_handle, buffer, count, &transferred, NULL)) {
+        file->flags |= 8;
+        crt_file_proxy_sync(fd);
+        *crt_errno() = crt_errno_from_last_error();
+        if (trace) {
+            serial_puts("[CRT-READ] fd=");
+            serial_putdec((uint64_t)(uint32_t)fd);
+            serial_puts(" count=");
+            serial_putdec(count);
+            serial_puts(" failed errno=");
+            serial_putdec((uint64_t)(uint32_t)*crt_errno());
+            serial_puts("\n");
+        }
+        return -1;
+    }
+    if (!transferred && count) file->flags |= 4;
+    crt_file_proxy_sync(fd);
+    *crt_errno() = 0;
+    if (trace) {
+        serial_puts("[CRT-READ] fd=");
+        serial_putdec((uint64_t)(uint32_t)fd);
+        serial_puts(" count=");
+        serial_putdec(count);
+        serial_puts(" -> ");
+        serial_putdec(transferred);
+        serial_puts("\n");
+    }
+    return (int)transferred;
+}
+
+int WINAPI crt_write(int fd, PCVOID buffer, unsigned int count)
+{
+    CRT_FILE *file = crt_file_from_fd(fd);
+    if (!file || !(file->flags & 2)) {
+        *crt_errno() = CRT_EBADF;
+        return -1;
+    }
+    if (!buffer && count) {
+        *crt_errno() = CRT_EINVAL;
+        return -1;
+    }
+
+    DWORD transferred = 0;
+    if (!WriteFile(file->nt_handle, buffer, count, &transferred, NULL)) {
+        file->flags |= 8;
+        crt_file_proxy_sync(fd);
+        *crt_errno() = crt_errno_from_last_error();
+        return -1;
+    }
+    *crt_errno() = 0;
+    return (int)transferred;
+}
+
+LONGLONG WINAPI crt_lseeki64(int fd, LONGLONG offset, int origin)
+{
+    int trace = crt_io_trace_take(&crt_lseek_trace_count, 96);
+    CRT_FILE *file = crt_file_from_fd(fd);
+    if (!file) {
+        *crt_errno() = CRT_EBADF;
+        if (trace) {
+            serial_puts("[CRT-LSEEK] invalid fd=");
+            serial_putdec((uint64_t)(uint32_t)fd);
+            serial_puts("\n");
+        }
+        return -1;
+    }
+    if (origin < CRT_FILE_BEGIN || origin > CRT_FILE_END) {
+        *crt_errno() = CRT_EINVAL;
+        if (trace) {
+            serial_puts("[CRT-LSEEK] fd=");
+            serial_putdec((uint64_t)(uint32_t)fd);
+            serial_puts(" invalid origin=");
+            serial_putdec((uint64_t)(uint32_t)origin);
+            serial_puts(" offset=0x");
+            serial_puthex((uint64_t)offset, 16);
+            serial_puts("\n");
+        }
+        return -1;
+    }
+
+    LONG high = (LONG)((ULONGLONG)offset >> 32);
+    SetLastError(0);
+    DWORD low = SetFilePointer(file->nt_handle, (LONG)offset, &high,
+                               (DWORD)origin);
+    if (low == 0xFFFFFFFFU && GetLastError() != 0) {
+        *crt_errno() = crt_errno_from_last_error();
+        if (trace) {
+            serial_puts("[CRT-LSEEK] fd=");
+            serial_putdec((uint64_t)(uint32_t)fd);
+            serial_puts(" failed errno=");
+            serial_putdec((uint64_t)(uint32_t)*crt_errno());
+            serial_puts("\n");
+        }
+        return -1;
+    }
+
+    file->flags &= ~4;
+    crt_file_proxy_sync(fd);
+    *crt_errno() = 0;
+    LONGLONG result = (LONGLONG)(((ULONGLONG)(ULONG)high << 32) | low);
+    if (trace) {
+        serial_puts("[CRT-LSEEK] fd=");
+        serial_putdec((uint64_t)(uint32_t)fd);
+        serial_puts(" origin=");
+        serial_putdec((uint64_t)(uint32_t)origin);
+        serial_puts(" offset=0x");
+        serial_puthex((uint64_t)offset, 16);
+        serial_puts(" -> 0x");
+        serial_puthex((uint64_t)result, 16);
+        serial_puts("\n");
+    }
+    return result;
+}
+
+static LONGLONG WINAPI crt_lseeki64_compat32(uint32_t fd,
+                                              uint32_t offset_low,
+                                              uint32_t offset_high,
+                                              uint32_t origin)
+{
+    ULONGLONG bits = ((ULONGLONG)offset_high << 32) | offset_low;
+    if (crt_io_trace_take(&crt_lseek32_trace_count, 96)) {
+        serial_puts("[CRT-LSEEK32] fd=");
+        serial_putdec(fd);
+        serial_puts(" raw=0x");
+        serial_puthex(offset_high, 8);
+        serial_puthex(offset_low, 8);
+        serial_puts(" origin=");
+        serial_putdec(origin);
+        serial_puts("\n");
+    }
+    return crt_lseeki64((int)fd, (LONGLONG)bits, (int)origin);
+}
+
+LONG WINAPI crt_lseek(int fd, LONG offset, int origin)
+{
+    LONGLONG result = crt_lseeki64(fd, offset, origin);
+    if (result < (LONGLONG)(-2147483647 - 1) || result > 2147483647) {
+        *crt_errno() = CRT_EINVAL;
+        return -1;
+    }
+    return (LONG)result;
+}
+
+int WINAPI crt_dup(int fd)
+{
+    CRT_FILE *source = crt_file_from_fd(fd);
+    if (!source) {
+        *crt_errno() = CRT_EBADF;
+        return -1;
+    }
+
+    HANDLE duplicate = source->nt_handle;
+    BOOL owns_handle = FALSE;
+    if (source->owns_handle) {
+        if (!DuplicateHandle(GetCurrentProcess(), source->nt_handle,
+                             GetCurrentProcess(), &duplicate, 0, FALSE,
+                             CRT_DUPLICATE_SAME_ACCESS)) {
+            *crt_errno() = crt_errno_from_last_error();
+            return -1;
+        }
+        owns_handle = TRUE;
+    }
+
+    int new_fd = crt_file_attach(duplicate, source->open_flags);
+    if (new_fd < 0) {
+        if (owns_handle) CloseHandle(duplicate);
+        return -1;
+    }
+    crt_files[new_fd].owns_handle = owns_handle;
+    *crt_errno() = 0;
+    return new_fd;
+}
+
+int WINAPI crt_dup2(int source_fd, int target_fd)
+{
+    CRT_FILE *source = crt_file_from_fd(source_fd);
+    if (!source || target_fd < 0 || target_fd >= CRT_FILE_MAX) {
+        *crt_errno() = CRT_EBADF;
+        return -1;
+    }
+    if (source_fd == target_fd) return 0;
+
+    HANDLE duplicate = source->nt_handle;
+    BOOL owns_handle = FALSE;
+    if (source->owns_handle) {
+        if (!DuplicateHandle(GetCurrentProcess(), source->nt_handle,
+                             GetCurrentProcess(), &duplicate, 0, FALSE,
+                             CRT_DUPLICATE_SAME_ACCESS)) {
+            *crt_errno() = crt_errno_from_last_error();
+            return -1;
+        }
+        owns_handle = TRUE;
+    }
+
+    CRT_FILE *target = &crt_files[target_fd];
+    if (target->nt_handle && target->owns_handle)
+        CloseHandle(target->nt_handle);
+    *target = *source;
+    target->nt_handle = duplicate;
+    target->owns_handle = owns_handle;
+    target->flags &= ~(4 | 8 | 16);
+    target->ungetc_ch = -1;
+    crt_file_proxy_sync(target_fd);
+    *crt_errno() = 0;
+    return 0;
+}
+
+int WINAPI crt_commit(int fd)
+{
+    CRT_FILE *file = crt_file_from_fd(fd);
+    if (!file) {
+        *crt_errno() = CRT_EBADF;
+        return -1;
+    }
+    if (!FlushFileBuffers(file->nt_handle)) {
+        *crt_errno() = crt_errno_from_last_error();
+        return -1;
+    }
+    *crt_errno() = 0;
+    return 0;
+}
+
+int WINAPI crt_isatty(int fd)
+{
+    CRT_FILE *file = crt_file_from_fd(fd);
+    if (!file) {
+        *crt_errno() = CRT_EBADF;
+        return 0;
+    }
+    *crt_errno() = 0;
+    return file->nt_handle == (HANDLE)(ULONG_PTR)4 ||
+           file->nt_handle == (HANDLE)(ULONG_PTR)8 ||
+           file->nt_handle == (HANDLE)(ULONG_PTR)12;
+}
+
+int WINAPI crt_setmode(int fd, int mode)
+{
+    CRT_FILE *file = crt_file_from_fd(fd);
+    const int mode_mask = CRT_O_TEXT | CRT_O_BINARY | 0x10000 | 0x20000 |
+                          0x40000;
+    if (!file) {
+        *crt_errno() = CRT_EBADF;
+        return -1;
+    }
+    if (mode != CRT_O_TEXT && mode != CRT_O_BINARY && mode != 0x10000 &&
+        mode != 0x20000 && mode != 0x40000) {
+        *crt_errno() = CRT_EINVAL;
+        return -1;
+    }
+
+    int previous = file->open_flags & mode_mask;
+    if (!previous) previous = CRT_O_TEXT;
+    file->open_flags = (file->open_flags & ~mode_mask) | mode;
+    *crt_errno() = 0;
+    return previous;
+}
+
+int WINAPI crt_chsize_s(int fd, ULONGLONG size)
+{
+    CRT_FILE *file = crt_file_from_fd(fd);
+    IO_STATUS_BLOCK iosb;
+    FILE_POSITION_INFORMATION original;
+    LARGE_INTEGER end;
+    if (!file) {
+        *crt_errno() = CRT_EBADF;
+        return CRT_EBADF;
+    }
+
+    NTSTATUS status = NtQueryInformationFile(file->nt_handle, &iosb, &original,
+                                              sizeof(original),
+                                              FilePositionInformation);
+    if (!NT_SUCCESS(status)) {
+        *crt_errno() = CRT_EBADF;
+        return CRT_EBADF;
+    }
+
+    end.QuadPart = (LONGLONG)size;
+    status = NtSetInformationFile(file->nt_handle, &iosb, &end, sizeof(end),
+                                  FileEndOfFileInformation);
+    (void)NtSetInformationFile(file->nt_handle, &iosb, &original,
+                               sizeof(original), FilePositionInformation);
+    if (!NT_SUCCESS(status)) {
+        *crt_errno() = CRT_EINVAL;
+        return CRT_EINVAL;
+    }
+    *crt_errno() = 0;
+    return 0;
+}
 
 int WINAPI crt_atoi(const char *s)
 {
@@ -1967,6 +2952,11 @@ double WINAPI crt_atof(const char *s)
     }
 
     return sign * result;
+}
+
+int WINAPI crt_abs(int value)
+{
+    return value < 0 ? -value : value;
 }
 
 long WINAPI crt_strtol(const char *s, char **endptr, int base)
@@ -2016,7 +3006,6 @@ static int atexit_count = 0;
 
 void WINAPI crt_exit(int code)
 {
-    extern int g_compat32_mode;
 
     /* In compat32 mode, skip atexit handlers — PE32 cleanup code
      * tends to crash (NULL vtable calls, uninitialized subsystems).
@@ -2039,11 +3028,614 @@ void WINAPI crt__exit(int code)
     ExitProcess((DWORD)code);
 }
 
+int WINAPI crt_getpid(void)
+{
+    return (int)GetCurrentProcessId();
+}
+
+ULONG_PTR WINAPI crt_beginthreadex(PVOID security, unsigned stack_size,
+                                    PVOID start_address, PVOID argument,
+                                    unsigned init_flags, unsigned *thread_id)
+{
+    HANDLE thread = CreateThread(
+        security, (SIZE_T)stack_size,
+        (LPTHREAD_START_ROUTINE)(ULONG_PTR)start_address, argument,
+        (DWORD)init_flags, (DWORD *)thread_id);
+    return (ULONG_PTR)thread;
+}
+
+void WINAPI __attribute__((noreturn)) crt_endthreadex(unsigned exit_code)
+{
+    ExitThread((DWORD)exit_code);
+    __builtin_unreachable();
+}
+
 int WINAPI crt_atexit(void (*func)(void))
 {
     if (atexit_count >= ATEXIT_MAX) return -1;
     atexit_funcs[atexit_count++] = func;
     return 0;
+}
+
+/* Universal CRT startup uses a caller-owned descriptor containing three
+ * pointers: first registered callback, next free slot, and allocation end.
+ * Keep the descriptor layout dependent on the importing PE instead of the
+ * kernel's native pointer width. */
+typedef struct {
+    uint32_t first;
+    uint32_t last;
+    uint32_t end;
+} UCRT_ONEXIT_TABLE32;
+
+typedef struct {
+    ULONG_PTR first;
+    ULONG_PTR last;
+    ULONG_PTR end;
+} UCRT_ONEXIT_TABLE64;
+
+#define UCRT_ONEXIT_INITIAL_CAPACITY 32U
+#define UCRT_ONEXIT_MAX_CAPACITY     (1U << 20)
+#define UCRT_INVALID_HANDLER_SLOTS   512U
+#define UCRT_PROCESS_MODE_SLOTS      512U
+
+typedef struct {
+    DWORD owner_pid;
+    DWORD owner_tid;
+    PVOID handler;
+    BOOL used;
+} UCRT_INVALID_HANDLER_SLOT;
+
+struct crt_tm {
+    int tm_sec;
+    int tm_min;
+    int tm_hour;
+    int tm_mday;
+    int tm_mon;
+    int tm_year;
+    int tm_wday;
+    int tm_yday;
+    int tm_isdst;
+};
+
+typedef struct {
+    int commode;
+    int fmode;
+    int new_mode;
+    PVOID new_handler;
+    struct crt_tm time_buffer;
+} UCRT_PROCESS_MODE_VALUES;
+
+typedef struct {
+    DWORD owner_pid;
+    UCRT_PROCESS_MODE_VALUES *values;
+} UCRT_PROCESS_MODE_SLOT;
+
+static UCRT_INVALID_HANDLER_SLOT ucrt_invalid_handlers[
+    UCRT_INVALID_HANDLER_SLOTS];
+static UCRT_PROCESS_MODE_SLOT ucrt_process_modes[UCRT_PROCESS_MODE_SLOTS];
+static volatile uint32_t ucrt_state_lock;
+
+static void crt_env_release_process(DWORD process_id);
+
+static void ucrt_state_lock_acquire(void)
+{
+    while (__sync_lock_test_and_set(&ucrt_state_lock, 1)) {
+        for (int spin = 0; spin < 100; spin++)
+            __asm__ volatile ("pause" ::: "memory");
+        sched_yield();
+    }
+}
+
+static void ucrt_state_lock_release(void)
+{
+    __sync_lock_release(&ucrt_state_lock);
+}
+
+static UCRT_PROCESS_MODE_VALUES *ucrt_process_mode_state(BOOL create)
+{
+    DWORD owner_pid = win32_current_process_id();
+    if (!owner_pid) owner_pid = 1;
+
+    UCRT_PROCESS_MODE_SLOT *free_slot = NULL;
+    UCRT_PROCESS_MODE_VALUES *values = NULL;
+    ucrt_state_lock_acquire();
+    for (uint32_t i = 0; i < UCRT_PROCESS_MODE_SLOTS; i++) {
+        UCRT_PROCESS_MODE_SLOT *slot = &ucrt_process_modes[i];
+        if (slot->owner_pid == owner_pid) {
+            values = slot->values;
+            break;
+        }
+        if (!slot->owner_pid && !free_slot)
+            free_slot = slot;
+    }
+
+    if (!values && create && free_slot) {
+        values = (UCRT_PROCESS_MODE_VALUES *)VirtualAlloc(
+            NULL, sizeof(*values), MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+        if (values && (!g_compat32_mode ||
+                       (ULONG_PTR)values <= (ULONG_PTR)UINT32_MAX)) {
+            values->commode = 0;
+            values->fmode = 0x4000; /* _O_TEXT */
+            values->new_mode = 0;
+            values->new_handler = NULL;
+            free_slot->owner_pid = owner_pid;
+            free_slot->values = values;
+            serial_puts("[CRT] process mode state pid=");
+            serial_putdec(owner_pid);
+            serial_puts(" va=0x");
+            serial_puthex((ULONG_PTR)values, g_compat32_mode ? 8 : 16);
+            serial_puts("\n");
+        } else {
+            values = NULL;
+        }
+    }
+    ucrt_state_lock_release();
+    return values;
+}
+
+static int crt_exchange_new_mode(int mode)
+{
+    UCRT_PROCESS_MODE_VALUES *values = ucrt_process_mode_state(TRUE);
+    if (!values) return 0;
+
+    ucrt_state_lock_acquire();
+    int previous = values->new_mode;
+    values->new_mode = mode;
+    ucrt_state_lock_release();
+    return previous;
+}
+
+static PVOID crt_exchange_new_handler(PVOID handler)
+{
+    UCRT_PROCESS_MODE_VALUES *values = ucrt_process_mode_state(TRUE);
+    if (!values) return NULL;
+
+    ucrt_state_lock_acquire();
+    PVOID previous = values->new_handler;
+    values->new_handler = handler;
+    ucrt_state_lock_release();
+    return previous;
+}
+
+void msvcrt_release_process(DWORD process_id)
+{
+    if (!process_id) return;
+
+    ucrt_state_lock_acquire();
+    for (uint32_t i = 0; i < UCRT_PROCESS_MODE_SLOTS; i++) {
+        if (ucrt_process_modes[i].owner_pid == process_id) {
+            ucrt_process_modes[i].owner_pid = 0;
+            ucrt_process_modes[i].values = NULL;
+        }
+    }
+    for (uint32_t i = 0; i < UCRT_INVALID_HANDLER_SLOTS; i++) {
+        if (ucrt_invalid_handlers[i].used &&
+            ucrt_invalid_handlers[i].owner_pid == process_id) {
+            ucrt_invalid_handlers[i].used = FALSE;
+            ucrt_invalid_handlers[i].owner_pid = 0;
+            ucrt_invalid_handlers[i].owner_tid = 0;
+            ucrt_invalid_handlers[i].handler = NULL;
+        }
+    }
+    ucrt_state_lock_release();
+
+    crt_env_release_process(process_id);
+    crt_file_proxy_release_process(process_id);
+}
+
+static void ucrt_onexit_read(PVOID opaque, BOOL is_32bit,
+                             ULONG_PTR *first, ULONG_PTR *last,
+                             ULONG_PTR *end)
+{
+    if (is_32bit) {
+        UCRT_ONEXIT_TABLE32 *table = (UCRT_ONEXIT_TABLE32 *)opaque;
+        *first = table->first;
+        *last = table->last;
+        *end = table->end;
+    } else {
+        UCRT_ONEXIT_TABLE64 *table = (UCRT_ONEXIT_TABLE64 *)opaque;
+        *first = table->first;
+        *last = table->last;
+        *end = table->end;
+    }
+}
+
+static void ucrt_onexit_write(PVOID opaque, BOOL is_32bit,
+                              ULONG_PTR first, ULONG_PTR last,
+                              ULONG_PTR end)
+{
+    if (is_32bit) {
+        UCRT_ONEXIT_TABLE32 *table = (UCRT_ONEXIT_TABLE32 *)opaque;
+        table->first = (uint32_t)first;
+        table->last = (uint32_t)last;
+        table->end = (uint32_t)end;
+    } else {
+        UCRT_ONEXIT_TABLE64 *table = (UCRT_ONEXIT_TABLE64 *)opaque;
+        table->first = first;
+        table->last = last;
+        table->end = end;
+    }
+}
+
+static BOOL ucrt_onexit_valid(ULONG_PTR first, ULONG_PTR last,
+                              ULONG_PTR end, SIZE_T slot_size)
+{
+    if (!first && !last && !end) return TRUE;
+    if (!first || !last || !end || last < first || end < last)
+        return FALSE;
+    if ((last - first) % slot_size || (end - first) % slot_size)
+        return FALSE;
+    return (end - first) / slot_size <= UCRT_ONEXIT_MAX_CAPACITY;
+}
+
+int WINAPI crt_initialize_onexit_table(PVOID opaque)
+{
+    if (!opaque) return -1;
+
+    ucrt_state_lock_acquire();
+    ucrt_onexit_write(opaque, g_compat32_mode ? TRUE : FALSE, 0, 0, 0);
+    ucrt_state_lock_release();
+    return 0;
+}
+
+int WINAPI crt_register_onexit_function(PVOID opaque, PVOID function)
+{
+    if (!opaque || !function) return -1;
+
+    BOOL is_32bit = g_compat32_mode ? TRUE : FALSE;
+    SIZE_T slot_size = is_32bit ? sizeof(uint32_t) : sizeof(ULONG_PTR);
+    ULONG_PTR first, last, end;
+
+    ucrt_state_lock_acquire();
+    ucrt_onexit_read(opaque, is_32bit, &first, &last, &end);
+    if (!ucrt_onexit_valid(first, last, end, slot_size)) {
+        ucrt_state_lock_release();
+        return -1;
+    }
+
+    SIZE_T count = first ? (last - first) / slot_size : 0;
+    SIZE_T capacity = first ? (end - first) / slot_size : 0;
+    if (count == capacity) {
+        SIZE_T new_capacity = capacity ? capacity * 2 :
+                              UCRT_ONEXIT_INITIAL_CAPACITY;
+        if (new_capacity > UCRT_ONEXIT_MAX_CAPACITY ||
+            new_capacity < capacity) {
+            ucrt_state_lock_release();
+            return -1;
+        }
+
+        SIZE_T bytes = new_capacity * slot_size;
+        PVOID storage = first
+            ? HeapReAlloc(GetProcessHeap(), 0, (PVOID)first, bytes)
+            : HeapAlloc(GetProcessHeap(), 0, bytes);
+        if (!storage || (is_32bit && (ULONG_PTR)storage > 0xFFFFFFFFULL)) {
+            if (storage && !first)
+                HeapFree(GetProcessHeap(), 0, storage);
+            ucrt_state_lock_release();
+            return -1;
+        }
+        first = (ULONG_PTR)storage;
+        last = first + count * slot_size;
+        end = first + new_capacity * slot_size;
+    }
+
+    if (is_32bit)
+        *(uint32_t *)last = (uint32_t)(ULONG_PTR)function;
+    else
+        *(ULONG_PTR *)last = (ULONG_PTR)function;
+    last += slot_size;
+    ucrt_onexit_write(opaque, is_32bit, first, last, end);
+    ucrt_state_lock_release();
+    return 0;
+}
+
+int WINAPI crt_execute_onexit_table(PVOID opaque)
+{
+    if (!opaque) return -1;
+
+    BOOL is_32bit = g_compat32_mode ? TRUE : FALSE;
+    SIZE_T slot_size = is_32bit ? sizeof(uint32_t) : sizeof(ULONG_PTR);
+    ULONG_PTR first, last, end;
+
+    ucrt_state_lock_acquire();
+    ucrt_onexit_read(opaque, is_32bit, &first, &last, &end);
+    if (!ucrt_onexit_valid(first, last, end, slot_size)) {
+        ucrt_state_lock_release();
+        return -1;
+    }
+    ucrt_onexit_write(opaque, is_32bit, 0, 0, 0);
+    ucrt_state_lock_release();
+
+    while (last > first) {
+        last -= slot_size;
+        ULONG_PTR callback = is_32bit
+            ? *(uint32_t *)last : *(ULONG_PTR *)last;
+        if (!callback) continue;
+        if (is_32bit)
+            compat32_callback((uint32_t)callback);
+        else
+            ((void (WINAPI *)(void))callback)();
+    }
+
+    if (first)
+        HeapFree(GetProcessHeap(), 0, (PVOID)first);
+    return 0;
+}
+
+int WINAPI crt_configure_narrow_argv(int mode)
+{
+    /* _crt_argv_mode has exactly three public values. OsitoK already
+     * supplies normalized argv storage; wildcard expansion is not needed by
+     * the Win32 loader itself. */
+    return mode >= 0 && mode <= 2 ? 0 : -1;
+}
+
+int WINAPI crt_initialize_narrow_environment(void)
+{
+    /* __getmainargs exposes the process environment initialized by winexec. */
+    return 0;
+}
+
+char *WINAPI crt_get_narrow_winmain_command_line(void)
+{
+    char *command = (char *)(ULONG_PTR)GetCommandLineA();
+    if (!command)
+        return NULL;
+
+    char *cursor = command;
+    if (*cursor == '"') {
+        cursor++;
+        while (*cursor && *cursor != '"')
+            cursor++;
+        if (*cursor == '"')
+            cursor++;
+    } else {
+        while (*cursor && *cursor != ' ' && *cursor != '\t')
+            cursor++;
+    }
+    while (*cursor == ' ' || *cursor == '\t')
+        cursor++;
+    return cursor;
+}
+
+PVOID WINAPI crt_set_thread_local_invalid_parameter_handler(PVOID handler)
+{
+    DWORD owner_pid = GetCurrentProcessId();
+    DWORD owner_tid = GetCurrentThreadId();
+    uint32_t start = (owner_pid * 2654435761U ^ owner_tid) &
+                     (UCRT_INVALID_HANDLER_SLOTS - 1);
+    UCRT_INVALID_HANDLER_SLOT *free_slot = NULL;
+    PVOID previous = NULL;
+
+    ucrt_state_lock_acquire();
+    for (uint32_t probe = 0; probe < UCRT_INVALID_HANDLER_SLOTS; probe++) {
+        UCRT_INVALID_HANDLER_SLOT *slot =
+            &ucrt_invalid_handlers[(start + probe) &
+                                   (UCRT_INVALID_HANDLER_SLOTS - 1)];
+        if (slot->used && slot->owner_pid == owner_pid &&
+            slot->owner_tid == owner_tid) {
+            previous = slot->handler;
+            if (handler) {
+                slot->handler = handler;
+            } else {
+                slot->used = FALSE;
+                slot->owner_pid = 0;
+                slot->owner_tid = 0;
+                slot->handler = NULL;
+            }
+            ucrt_state_lock_release();
+            return previous;
+        }
+        if (!slot->used && !free_slot) free_slot = slot;
+    }
+
+    if (handler && free_slot) {
+        free_slot->owner_pid = owner_pid;
+        free_slot->owner_tid = owner_tid;
+        free_slot->handler = handler;
+        free_slot->used = TRUE;
+    }
+    ucrt_state_lock_release();
+    return previous;
+}
+
+/* Locale. The CRT starts in C and OsitoK currently has no configurable
+ * user-locale backend, so an empty locale name resolves to C as well. */
+#define CRT_LC_ALL       0
+#define CRT_LC_COLLATE   1
+#define CRT_LC_CTYPE     2
+#define CRT_LC_MONETARY  3
+#define CRT_LC_NUMERIC   4
+#define CRT_LC_TIME      5
+#define CRT_CHAR_MAX     127
+
+typedef struct {
+    char *decimal_point;
+    char *thousands_sep;
+    char *grouping;
+    char *int_curr_symbol;
+    char *currency_symbol;
+    char *mon_decimal_point;
+    char *mon_thousands_sep;
+    char *mon_grouping;
+    char *positive_sign;
+    char *negative_sign;
+    char int_frac_digits;
+    char frac_digits;
+    char p_cs_precedes;
+    char p_sep_by_space;
+    char n_cs_precedes;
+    char n_sep_by_space;
+    char p_sign_posn;
+    char n_sign_posn;
+    WCHAR *_W_decimal_point;
+    WCHAR *_W_thousands_sep;
+    WCHAR *_W_int_curr_symbol;
+    WCHAR *_W_currency_symbol;
+    WCHAR *_W_mon_decimal_point;
+    WCHAR *_W_mon_thousands_sep;
+    WCHAR *_W_positive_sign;
+    WCHAR *_W_negative_sign;
+} CRT_LCONV;
+
+/* PE32 sees 32-bit pointers inside struct lconv even though the shim itself
+ * is compiled as x86-64. Keep a separate layout for compat-mode callers. */
+typedef struct {
+    uint32_t decimal_point;
+    uint32_t thousands_sep;
+    uint32_t grouping;
+    uint32_t int_curr_symbol;
+    uint32_t currency_symbol;
+    uint32_t mon_decimal_point;
+    uint32_t mon_thousands_sep;
+    uint32_t mon_grouping;
+    uint32_t positive_sign;
+    uint32_t negative_sign;
+    char int_frac_digits;
+    char frac_digits;
+    char p_cs_precedes;
+    char p_sep_by_space;
+    char n_cs_precedes;
+    char n_sep_by_space;
+    char p_sign_posn;
+    char n_sign_posn;
+    uint32_t _W_decimal_point;
+    uint32_t _W_thousands_sep;
+    uint32_t _W_int_curr_symbol;
+    uint32_t _W_currency_symbol;
+    uint32_t _W_mon_decimal_point;
+    uint32_t _W_mon_thousands_sep;
+    uint32_t _W_positive_sign;
+    uint32_t _W_negative_sign;
+} CRT_LCONV32;
+
+static char crt_locale_c[] = "C";
+static char crt_locale_dot[] = ".";
+static char crt_locale_empty[] = "";
+static WCHAR crt_wlocale_c[] = { 'C', 0 };
+static WCHAR crt_wlocale_dot[] = { '.', 0 };
+static WCHAR crt_wlocale_empty[] = { 0 };
+
+static CRT_LCONV crt_c_lconv = {
+    .decimal_point = crt_locale_dot,
+    .thousands_sep = crt_locale_empty,
+    .grouping = crt_locale_empty,
+    .int_curr_symbol = crt_locale_empty,
+    .currency_symbol = crt_locale_empty,
+    .mon_decimal_point = crt_locale_empty,
+    .mon_thousands_sep = crt_locale_empty,
+    .mon_grouping = crt_locale_empty,
+    .positive_sign = crt_locale_empty,
+    .negative_sign = crt_locale_empty,
+    .int_frac_digits = CRT_CHAR_MAX,
+    .frac_digits = CRT_CHAR_MAX,
+    .p_cs_precedes = CRT_CHAR_MAX,
+    .p_sep_by_space = CRT_CHAR_MAX,
+    .n_cs_precedes = CRT_CHAR_MAX,
+    .n_sep_by_space = CRT_CHAR_MAX,
+    .p_sign_posn = CRT_CHAR_MAX,
+    .n_sign_posn = CRT_CHAR_MAX,
+    ._W_decimal_point = crt_wlocale_dot,
+    ._W_thousands_sep = crt_wlocale_empty,
+    ._W_int_curr_symbol = crt_wlocale_empty,
+    ._W_currency_symbol = crt_wlocale_empty,
+    ._W_mon_decimal_point = crt_wlocale_empty,
+    ._W_mon_thousands_sep = crt_wlocale_empty,
+    ._W_positive_sign = crt_wlocale_empty,
+    ._W_negative_sign = crt_wlocale_empty,
+};
+
+static CRT_LCONV32 crt_c_lconv32 = {
+    .int_frac_digits = CRT_CHAR_MAX,
+    .frac_digits = CRT_CHAR_MAX,
+    .p_cs_precedes = CRT_CHAR_MAX,
+    .p_sep_by_space = CRT_CHAR_MAX,
+    .n_cs_precedes = CRT_CHAR_MAX,
+    .n_sep_by_space = CRT_CHAR_MAX,
+    .p_sign_posn = CRT_CHAR_MAX,
+    .n_sign_posn = CRT_CHAR_MAX,
+};
+static BOOL crt_c_lconv32_initialized;
+
+static void crt_lconv32_init(void)
+{
+    if (crt_c_lconv32_initialized) return;
+    uint32_t dot = (uint32_t)(ULONG_PTR)crt_locale_dot;
+    uint32_t empty = (uint32_t)(ULONG_PTR)crt_locale_empty;
+    uint32_t wdot = (uint32_t)(ULONG_PTR)crt_wlocale_dot;
+    uint32_t wempty = (uint32_t)(ULONG_PTR)crt_wlocale_empty;
+
+    crt_c_lconv32.decimal_point = dot;
+    crt_c_lconv32.thousands_sep = empty;
+    crt_c_lconv32.grouping = empty;
+    crt_c_lconv32.int_curr_symbol = empty;
+    crt_c_lconv32.currency_symbol = empty;
+    crt_c_lconv32.mon_decimal_point = empty;
+    crt_c_lconv32.mon_thousands_sep = empty;
+    crt_c_lconv32.mon_grouping = empty;
+    crt_c_lconv32.positive_sign = empty;
+    crt_c_lconv32.negative_sign = empty;
+    crt_c_lconv32._W_decimal_point = wdot;
+    crt_c_lconv32._W_thousands_sep = wempty;
+    crt_c_lconv32._W_int_curr_symbol = wempty;
+    crt_c_lconv32._W_currency_symbol = wempty;
+    crt_c_lconv32._W_mon_decimal_point = wempty;
+    crt_c_lconv32._W_mon_thousands_sep = wempty;
+    crt_c_lconv32._W_positive_sign = wempty;
+    crt_c_lconv32._W_negative_sign = wempty;
+    crt_c_lconv32_initialized = TRUE;
+}
+
+static BOOL crt_locale_category_valid(int category)
+{
+    return category >= CRT_LC_ALL && category <= CRT_LC_TIME;
+}
+
+static BOOL crt_locale_name_is_c(const char *locale)
+{
+    if (!locale[0]) return TRUE;
+    if (locale[0] == 'C' && !locale[1]) return TRUE;
+    return locale[0] == 'P' && locale[1] == 'O' && locale[2] == 'S' &&
+           locale[3] == 'I' && locale[4] == 'X' && !locale[5];
+}
+
+static BOOL crt_wlocale_name_is_c(const WCHAR *locale)
+{
+    if (!locale[0]) return TRUE;
+    if (locale[0] == 'C' && !locale[1]) return TRUE;
+    return locale[0] == 'P' && locale[1] == 'O' && locale[2] == 'S' &&
+           locale[3] == 'I' && locale[4] == 'X' && !locale[5];
+}
+
+char* WINAPI crt_setlocale(int category, const char *locale)
+{
+    if (!crt_locale_category_valid(category)) {
+        *crt_errno() = 22; /* EINVAL */
+        return NULL;
+    }
+    if (!locale || crt_locale_name_is_c(locale))
+        return crt_locale_c;
+    return NULL;
+}
+
+WCHAR* WINAPI crt_wsetlocale(int category, const WCHAR *locale)
+{
+    if (!crt_locale_category_valid(category)) {
+        *crt_errno() = 22; /* EINVAL */
+        return NULL;
+    }
+    if (!locale || crt_wlocale_name_is_c(locale))
+        return crt_wlocale_c;
+    return NULL;
+}
+
+PVOID WINAPI crt_localeconv(void)
+{
+    if (g_compat32_mode) {
+        crt_lconv32_init();
+        return &crt_c_lconv32;
+    }
+    return &crt_c_lconv;
 }
 
 /* ── ctype ─────────────────────────────────────────────────── */
@@ -2057,6 +3649,110 @@ int WINAPI crt_islower(int c)  { return c >= 'a' && c <= 'z'; }
 int WINAPI crt_isprint(int c)  { return c >= 0x20 && c <= 0x7e; }
 int WINAPI crt_toupper(int c)  { return (c >= 'a' && c <= 'z') ? c - 32 : c; }
 int WINAPI crt_tolower(int c)  { return (c >= 'A' && c <= 'Z') ? c + 32 : c; }
+
+static BOOL crt_is_wide_upper(int c)
+{
+    return (c >= 'A' && c <= 'Z') ||
+           (c >= 0x00C0 && c <= 0x00D6) ||
+           (c >= 0x00D8 && c <= 0x00DE) || c == 0x0178;
+}
+
+static BOOL crt_is_wide_lower(int c)
+{
+    return (c >= 'a' && c <= 'z') ||
+           (c >= 0x00E0 && c <= 0x00F6) ||
+           (c >= 0x00F8 && c <= 0x00FF);
+}
+
+int WINAPI crt_towupper(int c)
+{
+    if ((c >= 'a' && c <= 'z') ||
+        (c >= 0x00E0 && c <= 0x00F6) ||
+        (c >= 0x00F8 && c <= 0x00FE))
+        return c - 0x20;
+    if (c == 0x00FF) return 0x0178;
+    return c;
+}
+
+int WINAPI crt_towlower(int c)
+{
+    if ((c >= 'A' && c <= 'Z') ||
+        (c >= 0x00C0 && c <= 0x00D6) ||
+        (c >= 0x00D8 && c <= 0x00DE))
+        return c + 0x20;
+    if (c == 0x0178) return 0x00FF;
+    return c;
+}
+
+static int crt_wide_ctype_mask(int c)
+{
+    const int upper = 0x0001;
+    const int lower = 0x0002;
+    const int digit = 0x0004;
+    const int space = 0x0008;
+    const int punct = 0x0010;
+    const int control = 0x0020;
+    const int blank = 0x0040;
+    const int hex = 0x0080;
+    const int alpha = 0x0100;
+    int result = 0;
+
+    if (crt_is_wide_upper(c)) result |= upper | alpha;
+    if (crt_is_wide_lower(c)) result |= lower | alpha;
+    if (c >= '0' && c <= '9') result |= digit;
+    if (c == ' ' || c == '\t') result |= blank;
+    if (c == ' ' || c == '\t' || c == '\n' || c == '\r' ||
+        c == '\f' || c == '\v')
+        result |= space;
+    if ((c >= 0 && c < 0x20) || c == 0x7F) result |= control;
+    if ((c >= '0' && c <= '9') || (c >= 'A' && c <= 'F') ||
+        (c >= 'a' && c <= 'f'))
+        result |= hex;
+    if (c >= 0x20 && c <= 0x7E &&
+        !(result & (upper | lower | digit | space)))
+        result |= punct;
+    return result;
+}
+
+int WINAPI crt_iswctype(int c, int mask)
+{
+    return crt_wide_ctype_mask(c) & mask;
+}
+
+int WINAPI crt_iswalpha(int c)
+{
+    return (crt_wide_ctype_mask(c) & 0x0100) != 0;
+}
+
+int WINAPI crt_iswalnum(int c)
+{
+    return (crt_wide_ctype_mask(c) & (0x0100 | 0x0004)) != 0;
+}
+
+int WINAPI crt_iswdigit(int c)
+{
+    return (crt_wide_ctype_mask(c) & 0x0004) != 0;
+}
+
+int WINAPI crt_iswspace(int c)
+{
+    return (crt_wide_ctype_mask(c) & 0x0008) != 0;
+}
+
+int WINAPI crt_iswupper(int c)
+{
+    return (crt_wide_ctype_mask(c) & 0x0001) != 0;
+}
+
+int WINAPI crt_iswlower(int c)
+{
+    return (crt_wide_ctype_mask(c) & 0x0002) != 0;
+}
+
+int WINAPI crt_iswprint(int c)
+{
+    return c >= 0x20 && c != 0x7F && c <= 0xFFFF;
+}
 
 /* ── Algorithm ─────────────────────────────────────────────── */
 
@@ -2108,24 +3804,116 @@ PVOID WINAPI crt_bsearch(PCVOID key, PCVOID base, SIZE_T nmemb,
 /* ── Error ─────────────────────────────────────────────────── */
 
 static int crt_errno_val = 0;
+static ULONG crt_doserrno_val = 0;
+
+static char *crt_error_messages[] = {
+    "No error",
+    "Operation not permitted",
+    "No such file or directory",
+    "No such process",
+    "Interrupted function call",
+    "Input/output error",
+    "No such device or address",
+    "Arg list too long",
+    "Exec format error",
+    "Bad file descriptor",
+    "No child processes",
+    "Resource temporarily unavailable",
+    "Not enough space",
+    "Permission denied",
+    "Bad address",
+    "Unknown error",
+    "Resource device",
+    "File exists",
+    "Improper link",
+    "No such device",
+    "Not a directory",
+    "Is a directory",
+    "Invalid argument",
+    "Too many open files in system",
+    "Too many open files",
+    "Inappropriate I/O control operation",
+    "Unknown error",
+    "File too large",
+    "No space left on device",
+    "Invalid seek",
+    "Read-only file system",
+    "Too many links",
+    "Broken pipe",
+    "Domain error",
+    "Result too large",
+    "Unknown error",
+    "Resource deadlock avoided",
+    "Unknown error",
+    "Filename too long",
+    "No locks available",
+    "Function not implemented",
+    "Directory not empty",
+    "Illegal byte sequence",
+};
+
+static int crt_sys_nerr_val =
+    (int)(sizeof(crt_error_messages) / sizeof(crt_error_messages[0]));
 
 int* WINAPI crt_errno(void) { return &crt_errno_val; }
+
+ULONG* WINAPI crt_doserrno(void) { return &crt_doserrno_val; }
+
+char** WINAPI crt_sys_errlist(void) { return crt_error_messages; }
+
+int* WINAPI crt_sys_nerr(void) { return &crt_sys_nerr_val; }
+
+char* WINAPI crt_strerror(int error)
+{
+    if (error >= 0 && error < crt_sys_nerr_val)
+        return crt_error_messages[error];
+    return "Unknown error";
+}
+
+int WINAPI crt_fpe_flt_rounds(void)
+{
+    unsigned int mxcsr;
+    __asm__ volatile ("stmxcsr %0" : "=m"(mxcsr));
+
+    switch ((mxcsr >> 13) & 3U) {
+    case 0: return 1; /* nearest */
+    case 1: return 3; /* toward negative infinity */
+    case 2: return 2; /* toward positive infinity */
+    default: return 0; /* toward zero */
+    }
+}
 
 /* ── Time ──────────────────────────────────────────────────── */
 
 extern uint64_t idt_get_ticks(void);
 
+/* The Win32 time-zone APIs expose UTC until Osito gains configurable zones. */
+static LONG crt_timezone_val;
+static int crt_daylight_val;
+
+void WINAPI crt_tzset(void)
+{
+    crt_timezone_val = 0;
+    crt_daylight_val = 0;
+}
+
+LONG* WINAPI crt_timezone(void) { return &crt_timezone_val; }
+
+int* WINAPI crt_daylight(void) { return &crt_daylight_val; }
+
 crt_time_t WINAPI crt_time(crt_time_t *timer)
 {
-    /* Stub: return ticks as pseudo-time */
-    crt_time_t t = (crt_time_t)idt_get_ticks();
+    int64_t unix_seconds = wintime_now_unix_seconds();
+    crt_time_t t = unix_seconds >= 0 ? (crt_time_t)unix_seconds
+                                     : (crt_time_t)-1;
     if (timer) *timer = t;
     return t;
 }
 
 crt_clock_t WINAPI crt_clock(void)
 {
-    return (crt_clock_t)idt_get_ticks();
+    /* MSVCRT CLOCKS_PER_SEC is 1000; the APIC clock advances at 100 Hz. */
+    return (crt_clock_t)(idt_get_ticks() * 10ULL);
 }
 
 /* ── SEH (Structured Exception Handling) ───────────────────── */
@@ -2172,7 +3960,6 @@ EXCEPTION_DISPOSITION WINAPI crt_except_handler3(
     serial_puthex(code, 8);
     serial_puts("\n");
 
-    extern int g_compat32_mode;
 
     /*
      * Walk the scopetable from current TryLevel upward.
@@ -2318,6 +4105,31 @@ int WINAPI crt_XcptFilter(int code, PVOID pointers)
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
+/* compat32_dispatch intercepts these targets before the generic ABI bridge.
+ * Keeping distinct functions makes import resolution explicit while avoiding
+ * an incorrect 64-bit C approximation of the i386 register capture. */
+__attribute__((noinline))
+int WINAPI crt_compat32_setjmp_marker(PVOID environment)
+{
+    (void)environment;
+    return 0;
+}
+
+__attribute__((noinline))
+int WINAPI crt_compat32_setjmp3_marker(PVOID environment, int unwind_count)
+{
+    (void)environment;
+    (void)unwind_count;
+    return 0;
+}
+
+__attribute__((noinline))
+void WINAPI crt_compat32_longjmp_marker(PVOID environment, int value)
+{
+    (void)environment;
+    (void)value;
+}
+
 /* ── Misc CRT internal ────────────────────────────────────── */
 
 int  WINAPI crt_controlfp_s(unsigned int *old, unsigned int newval, unsigned int mask)
@@ -2335,6 +4147,21 @@ PVOID WINAPI crt_amsg_exit(int errnum) { (void)errnum; crt_abort(); return NULL;
 void WINAPI crt_type_info_dtor(PVOID _this)
 {
     (void)_this;
+}
+
+typedef struct _CRT_TYPE_INFO_ENTRY {
+    struct _CRT_TYPE_INFO_ENTRY *next;
+} CRT_TYPE_INFO_ENTRY;
+
+void WINAPI crt_std_type_info_destroy_list(PVOID list_head)
+{
+    CRT_TYPE_INFO_ENTRY *entry =
+        (CRT_TYPE_INFO_ENTRY *)InterlockedFlushSList(list_head);
+    while (entry) {
+        CRT_TYPE_INFO_ENTRY *next = entry->next;
+        crt_free(entry);
+        entry = next;
+    }
 }
 
 /*
@@ -2359,6 +4186,7 @@ uint32_t crt_get_base_seh_thunk(void); /* forward decl */
 
 void WINAPI crt_CxxThrowException(PVOID pExceptionObject, PVOID pThrowInfo)
 {
+    TEB32 *teb = compat32_current_teb();
     extern uint32_t compat32_get_last_caller_eip(void);
     uint32_t throw_eip = compat32_get_last_caller_eip();
     serial_puts("[MSVCRT] _CxxThrowException: obj=0x");
@@ -2368,6 +4196,103 @@ void WINAPI crt_CxxThrowException(PVOID pExceptionObject, PVOID pThrowInfo)
     serial_puts(" thrown_from=0x");
     serial_puthex(throw_eip, 8);
     serial_puts("\n");
+
+    /* OpenJDK AWT keeps JNIEnv* in ESI while creating a frame.  If its
+     * AwtFrame::Create path throws because FindClass returned NULL, describe
+     * the already-pending Java exception before the C++ unwind hides it on
+     * the toolkit thread.  ExceptionDescribe clears the pending exception,
+     * so restore the same throwable immediately afterwards. */
+    if (throw_eip == 0x6D0894C4U &&
+        (uint32_t)(ULONG_PTR)pThrowInfo == 0x6D0D93A8U) {
+        extern uint32_t compat32_get_last_user_esi(void);
+        uint32_t env32 = compat32_get_last_user_esi();
+
+        serial_puts("[AWT-JNI] env=0x");
+        serial_puthex(env32, 8);
+        if (env32 >= 0x10000U && env32 < 0x80000000U) {
+            uint32_t functions = *(volatile uint32_t *)(uintptr_t)env32;
+            serial_puts(" functions=0x");
+            serial_puthex(functions, 8);
+            serial_puts("\n");
+
+            if (functions >= 0x10000U && functions < 0x80000000U) {
+                uint32_t exception_occurred =
+                    *(volatile uint32_t *)(uintptr_t)(functions + 15U * 4U);
+                uint32_t throw_exception =
+                    *(volatile uint32_t *)(uintptr_t)(functions + 13U * 4U);
+                uint32_t exception_clear =
+                    *(volatile uint32_t *)(uintptr_t)(functions + 17U * 4U);
+                uint32_t find_class =
+                    *(volatile uint32_t *)(uintptr_t)(functions + 6U * 4U);
+                uint32_t delete_local_ref =
+                    *(volatile uint32_t *)(uintptr_t)(functions + 23U * 4U);
+                uint32_t is_instance_of =
+                    *(volatile uint32_t *)(uintptr_t)(functions + 32U * 4U);
+                uint32_t env_args[1] = { env32 };
+                uint32_t pending = compat32_callback_args(
+                    exception_occurred, 1, env_args);
+
+                serial_puts("[AWT-JNI] pending=0x");
+                serial_puthex(pending, 8);
+                serial_puts("\n");
+
+                if (pending != 0 && exception_clear != 0 &&
+                    find_class != 0 && delete_local_ref != 0 &&
+                    is_instance_of != 0 && throw_exception != 0) {
+                    static const struct {
+                        uint32_t name32;
+                        const char *label;
+                    } exception_types[] = {
+                        { 0x6D427C48U, "ClassNotFoundException" },
+                        { 0x6D427CF2U, "IllegalMonitorStateException" },
+                        { 0x6D427DDFU, "LinkageError" },
+                        { 0x6D427E5AU, "NullPointerException" },
+                        { 0x6D427F2BU, "RuntimeException" },
+                        { 0x6D428012U, "ExceptionInInitializerError" },
+                        { 0x6D42807CU, "InternalError" },
+                        { 0x6D428094U, "NoClassDefFoundError" },
+                        { 0x6D4280EAU, "OutOfMemoryError" },
+                    };
+                    uint32_t throw_args[2] = { env32, pending };
+
+                    compat32_callback_args(exception_clear, 1, env_args);
+                    serial_puts("[AWT-JNI] exception=");
+                    int identified = 0;
+                    for (uint32_t i = 0;
+                         i < sizeof(exception_types) / sizeof(exception_types[0]);
+                         i++) {
+                        uint32_t find_args[2] = {
+                            env32, exception_types[i].name32
+                        };
+                        uint32_t cls = compat32_callback_args(
+                            find_class, 2, find_args);
+                        if (cls != 0) {
+                            uint32_t instance_args[3] = {
+                                env32, pending, cls
+                            };
+                            uint32_t match = compat32_callback_args(
+                                is_instance_of, 3, instance_args);
+                            uint32_t delete_args[2] = { env32, cls };
+                            compat32_callback_args(
+                                delete_local_ref, 2, delete_args);
+                            if (match) {
+                                serial_puts(exception_types[i].label);
+                                identified = 1;
+                                break;
+                            }
+                        }
+                    }
+                    if (!identified)
+                        serial_puts("<other>");
+                    serial_puts("\n");
+
+                    compat32_callback_args(throw_exception, 2, throw_args);
+                }
+            }
+        } else {
+            serial_puts(" (invalid)\n");
+        }
+    }
 
     /* [THROWMSG] diagnostic: UT99's New-Game crash is preceded by a recoverable
      * `throw (TCHAR*)errmsg` (throwInfo 0x1017D4B0, type wchar_t*) from a failed
@@ -2492,16 +4417,15 @@ void WINAPI crt_CxxThrowException(PVOID pExceptionObject, PVOID pThrowInfo)
      * which triggers SEH dispatch → __CxxFrameHandler → catch block.
      *
      * We implement a minimal SEH dispatch: walk the chain from
-     * g_teb32.ExceptionList, call each handler via compat32_callback,
+     * the current TEB's ExceptionList, call each handler via compat32_callback,
      * looking for EXCEPTION_EXECUTE_HANDLER. If found, restore the
      * handler's stack frame and longjmp to the catch block.
      *
      * For now: call RaiseException which walks the SEH chain from
-     * g_teb32 and dispatches to registered handlers.
+     * that TEB and dispatches to registered handlers.
      */
     {
-        extern TEB32 g_teb32;
-        uint32_t seh_head = g_teb32.ExceptionList;
+        uint32_t seh_head = teb->ExceptionList;
         serial_puts("[CXX] SEH chain head: 0x");
         serial_puthex(seh_head, 8);
         serial_puts("\n");
@@ -2546,8 +4470,7 @@ void WINAPI crt_CxxThrowException(PVOID pExceptionObject, PVOID pThrowInfo)
      * the data/import area extends past that. Tighten the range to
      * only DLL code regions where SEH frames CAN'T live. */
     {
-        extern TEB32 g_teb32;
-        uint32_t head = g_teb32.ExceptionList;
+        uint32_t head = teb->ExceptionList;
         /* PE image .text range: 0x10000000-0x12000000 (Engine + Core
          * + Render + a few smaller DLLs). UT99 stack is 0x13xxxxxx,
          * so 0x12000000 is a safe upper bound — anything above is
@@ -2574,7 +4497,7 @@ void WINAPI crt_CxxThrowException(PVOID pExceptionObject, PVOID pThrowInfo)
                     emergency_frame[0] = next; /* chain to remaining frames */
                     emergency_frame[1] = base_handler;
                     emergency_frame[2] = 0;
-                    g_teb32.ExceptionList =
+                    teb->ExceptionList =
                         (uint32_t)(uintptr_t)emergency_frame;
                     serial_puts("[CXX] Repaired: emergency frame at 0x");
                     serial_puthex((uint32_t)(uintptr_t)emergency_frame, 8);
@@ -2582,7 +4505,7 @@ void WINAPI crt_CxxThrowException(PVOID pExceptionObject, PVOID pThrowInfo)
                     serial_puthex(next, 8);
                     serial_puts("\n");
                 } else {
-                    g_teb32.ExceptionList = next;
+                    teb->ExceptionList = next;
                     serial_puts("[CXX] Repaired: chain head -> 0x");
                     serial_puthex(next, 8);
                     serial_puts("\n");
@@ -2857,6 +4780,27 @@ void WINAPI crt_CxxThrowException(PVOID pExceptionObject, PVOID pThrowInfo)
  *   +8:  dispCatchObj
  *   +12: addressOfHandler
  */
+uint32_t crt_find_cxx_func_info(uint32_t handler_addr)
+{
+    if (handler_addr < 0x10000 || handler_addr >= 0x80000000)
+        return 0;
+
+    const uint8_t *stub = (const uint8_t *)(ULONG_PTR)handler_addr;
+    for (uint32_t i = 0; i + 10 <= 64; i++) {
+        if (stub[i] != 0xB8 || stub[i + 5] != 0xE9)
+            continue;
+
+        uint32_t candidate = *(const uint32_t *)(stub + i + 1);
+        if (candidate < 0x10000 || candidate >= 0x80000000)
+            continue;
+
+        uint32_t magic = *(const uint32_t *)(ULONG_PTR)candidate;
+        if (magic == 0x19930520 || magic == 0x19930522)
+            return candidate;
+    }
+    return 0;
+}
+
 EXCEPTION_DISPOSITION WINAPI crt_CxxFrameHandler(
     PEXCEPTION_RECORD ExceptionRecord,
     PVOID EstablisherFrame,
@@ -2872,7 +4816,6 @@ EXCEPTION_DISPOSITION WINAPI crt_CxxFrameHandler(
     if (flags & EXCEPTION_UNWIND)
         return ExceptionContinueSearch;
 
-    extern int g_compat32_mode;
     if (!g_compat32_mode || code != 0xE06D7363)
         return ExceptionContinueSearch;
 
@@ -2890,12 +4833,8 @@ EXCEPTION_DISPOSITION WINAPI crt_CxxFrameHandler(
     uint32_t handler_addr = frame32[1];
     int32_t  cur_state    = (int32_t)frame32[2];  /* TryLevel */
 
-    /* Extract FuncInfo from handler stub: MOV EAX, imm32 = B8 xx xx xx xx */
-    uint8_t *stub = (uint8_t *)(ULONG_PTR)handler_addr;
-    uint32_t func_info_addr = 0;
-    if (stub[0] == 0xB8) {
-        func_info_addr = *(uint32_t *)(stub + 1);
-    }
+    /* /GS wrappers perform cookie checks before MOV EAX, FuncInfo. */
+    uint32_t func_info_addr = crt_find_cxx_func_info(handler_addr);
 
     serial_puts("[CxxEH] handler=0x");
     serial_puthex(handler_addr, 8);
@@ -3012,17 +4951,47 @@ _PVFV_DLL WINAPI crt_dllonexit(_PVFV_DLL func, _PVFV_DLL **pbegin, _PVFV_DLL **p
 }
 
 /* __p__commode — pointer to _commode variable */
-static int crt_commode_val = 0;
 int* WINAPI crt_p_commode(void)
 {
-    return &crt_commode_val;
+    UCRT_PROCESS_MODE_VALUES *values = ucrt_process_mode_state(TRUE);
+    return values ? &values->commode : NULL;
 }
 
 /* __p__fmode — pointer to _fmode variable */
-static int crt_fmode_val = 0;
 int* WINAPI crt_p_fmode(void)
 {
-    return &crt_fmode_val;
+    UCRT_PROCESS_MODE_VALUES *values = ucrt_process_mode_state(TRUE);
+    return values ? &values->fmode : NULL;
+}
+
+int WINAPI crt_set_fmode(int mode)
+{
+    switch (mode) {
+        case 0x4000:  /* _O_TEXT */
+        case 0x8000:  /* _O_BINARY */
+        case 0x10000: /* _O_WTEXT */
+        case 0x20000: /* _O_U16TEXT */
+        case 0x40000: /* _O_U8TEXT */
+            break;
+        default:
+            return 22; /* EINVAL */
+    }
+
+    UCRT_PROCESS_MODE_VALUES *values = ucrt_process_mode_state(TRUE);
+    if (!values) return 12; /* ENOMEM */
+    values->fmode = mode;
+    return 0;
+}
+
+int WINAPI crt_get_fmode(int *mode)
+{
+    if (!mode)
+        return 22; /* EINVAL */
+
+    UCRT_PROCESS_MODE_VALUES *values = ucrt_process_mode_state(TRUE);
+    if (!values) return 12; /* ENOMEM */
+    *mode = values->fmode;
+    return 0;
 }
 
 /* __C_specific_handler — x86-64 SEH handler (stub, no-op) */
@@ -3128,11 +5097,474 @@ static int WINAPI crt_vsnprintf(char *buf, SIZE_T size, const char *fmt, ms_va_l
     return do_vformat32(&ctx, fmt, (uint32_t *)(void *)ap);
 }
 
+static BOOL crt_secure_truncate_count(SIZE_T count)
+{
+    /* PE32 passes _TRUNCATE as a zero-extended 0xffffffff. */
+    return count == (SIZE_T)-1 || count == (SIZE_T)0xFFFFFFFFU;
+}
+
+static SIZE_T crt_snprintf_s_capacity(SIZE_T size, SIZE_T count)
+{
+    if (crt_secure_truncate_count(count) || count >= size)
+        return size;
+    return count + 1;
+}
+
+static int crt_snprintf_s_result(char *buf, SIZE_T size, SIZE_T count,
+                                 int required)
+{
+    SIZE_T max_chars = crt_secure_truncate_count(count)
+        ? size - 1
+        : (count < size ? count : size - 1);
+
+    if (required >= 0 && (SIZE_T)required <= max_chars)
+        return required;
+
+    /* Explicit count and _TRUNCATE both leave a terminated prefix. When the
+     * caller claimed the whole destination was available, MSVCRT treats an
+     * overrun as a range error and clears the destination. */
+    if (crt_secure_truncate_count(count) || count < size)
+        return -1;
+
+    buf[0] = 0;
+    *crt_errno() = CRT_ERANGE;
+    return -1;
+}
+
+static int WINAPI crt_snprintf_s_compat32(char *buf, SIZE_T size,
+                                           SIZE_T count, const char *fmt,
+                                           uint32_t *args)
+{
+    if (!buf || !size || !fmt) {
+        if (buf && size) buf[0] = 0;
+        *crt_errno() = CRT_EINVAL;
+        return -1;
+    }
+
+    FMT_CTX ctx = { buf, crt_snprintf_s_capacity(size, count), 0 };
+    int required = do_vformat32(&ctx, fmt, args);
+    return crt_snprintf_s_result(buf, size, count, required);
+}
+
+int WINAPI crt_snprintf_s(char *buf, SIZE_T size, SIZE_T count,
+                          const char *fmt, ...)
+{
+    if (!buf || !size || !fmt) {
+        if (buf && size) buf[0] = 0;
+        *crt_errno() = CRT_EINVAL;
+        return -1;
+    }
+
+    ms_va_list ap;
+    ms_va_start(ap, fmt);
+    FMT_CTX ctx = { buf, crt_snprintf_s_capacity(size, count), 0 };
+    int required = do_vformat(&ctx, fmt, ap);
+    ms_va_end(ap);
+    return crt_snprintf_s_result(buf, size, count, required);
+}
+
 static int WINAPI crt_vfprintf(PVOID stream, const char *fmt, ms_va_list ap)
 {
     (void)stream;
     FMT_CTX ctx = { NULL, 0, 0 };
     return do_vformat32(&ctx, fmt, (uint32_t *)(void *)ap);
+}
+
+#define CRT_PRINTF_STANDARD_SNPRINTF (1ULL << 1)
+
+int WINAPI crt_stdio_common_vsprintf(uint64_t options, char *buffer,
+                                     SIZE_T buffer_count,
+                                     const char *format, PVOID locale,
+                                     PVOID arg_list)
+{
+    (void)locale;
+    if (!format || (!buffer && buffer_count != 0) || !arg_list) {
+        if (buffer && buffer_count) buffer[0] = 0;
+        *crt_errno() = 22; /* EINVAL */
+        return -1;
+    }
+
+    FMT_CTX ctx = { buffer, buffer_count, 0 };
+    int required = do_vformat(&ctx, format, (ms_va_list)arg_list);
+    int truncated = buffer_count == 0 || (SIZE_T)required >= buffer_count;
+
+    static int trace_count;
+    if (trace_count < 8) {
+        trace_count++;
+        serial_puts("[UCRT-VS] options=0x");
+        serial_puthex(options, 8);
+        serial_puts(" count=");
+        serial_putdec(buffer_count);
+        serial_puts(" required=");
+        serial_putdec((uint64_t)required);
+        serial_puts(" fmt=\"");
+        for (int i = 0; i < 64 && format[i]; i++)
+            serial_putchar((unsigned char)format[i] < 0x80 ? format[i] : '?');
+        serial_puts("\"\n");
+    }
+
+    if (truncated && !(options & CRT_PRINTF_STANDARD_SNPRINTF))
+        return -1;
+    return required;
+}
+
+/* Universal CRT wide formatting for native PE32+ callers. A Microsoft x64
+ * va_list walks 8-byte argument homes; it must not share the PE32 formatter
+ * below, whose va_list is a packed array of 4-byte stack slots. */
+typedef struct {
+    WCHAR *buf;
+    SIZE_T size;
+    SIZE_T pos;
+} WFMT_CTX;
+
+static void wfmt_putc(WFMT_CTX *ctx, WCHAR c)
+{
+    if (ctx->buf && ctx->size > 0 && ctx->pos < ctx->size - 1)
+        ctx->buf[ctx->pos] = c;
+    ctx->pos++;
+}
+
+static void wfmt_put_ascii(WFMT_CTX *ctx, const char *s, SIZE_T len)
+{
+    for (SIZE_T i = 0; i < len; i++)
+        wfmt_putc(ctx, (WCHAR)(unsigned char)s[i]);
+}
+
+static void wfmt_put_wide(WFMT_CTX *ctx, const WCHAR *s, SIZE_T len)
+{
+    for (SIZE_T i = 0; i < len; i++)
+        wfmt_putc(ctx, s[i]);
+}
+
+static void wfmt_pad(WFMT_CTX *ctx, int count, WCHAR c)
+{
+    while (count-- > 0)
+        wfmt_putc(ctx, c);
+}
+
+static SIZE_T wfmt_wcsnlen(const WCHAR *s, int precision)
+{
+    SIZE_T n = 0;
+    if (!s) return 0;
+    while (s[n] && (precision < 0 || n < (SIZE_T)precision)) n++;
+    return n;
+}
+
+enum {
+    WLEN_DEFAULT,
+    WLEN_HH,
+    WLEN_H,
+    WLEN_L,
+    WLEN_LL,
+    WLEN_J,
+    WLEN_Z,
+    WLEN_T,
+    WLEN_I32,
+    WLEN_I64
+};
+
+static void wfmt_integer(WFMT_CTX *ctx, unsigned long long value, int negative,
+                         int base, int upper, int width, int precision,
+                         int left, int zero, int plus, int space, int alternate)
+{
+    char digits[24];
+    SIZE_T digits_len = uint_to_str(digits, value, base, upper);
+    if (precision == 0 && value == 0) digits_len = 0;
+
+    char prefix[2];
+    int prefix_len = 0;
+    if (negative) prefix[prefix_len++] = '-';
+    else if (plus) prefix[prefix_len++] = '+';
+    else if (space) prefix[prefix_len++] = ' ';
+
+    char radix_prefix[2];
+    int radix_len = 0;
+    if (alternate && base == 16 && value != 0) {
+        radix_prefix[radix_len++] = '0';
+        radix_prefix[radix_len++] = upper ? 'X' : 'x';
+    } else if (alternate && base == 8 &&
+               (digits_len == 0 || digits[0] != '0')) {
+        radix_prefix[radix_len++] = '0';
+    }
+
+    int precision_zeroes = precision > (int)digits_len
+                         ? precision - (int)digits_len : 0;
+    int content = prefix_len + radix_len + precision_zeroes + (int)digits_len;
+    int width_pad = width > content ? width - content : 0;
+
+    if (!left && (!zero || precision >= 0)) wfmt_pad(ctx, width_pad, ' ');
+    wfmt_put_ascii(ctx, prefix, (SIZE_T)prefix_len);
+    wfmt_put_ascii(ctx, radix_prefix, (SIZE_T)radix_len);
+    if (!left && zero && precision < 0) wfmt_pad(ctx, width_pad, '0');
+    wfmt_pad(ctx, precision_zeroes, '0');
+    wfmt_put_ascii(ctx, digits, digits_len);
+    if (left) wfmt_pad(ctx, width_pad, ' ');
+}
+
+static void wfmt_float(WFMT_CTX *ctx, double value, int width, int precision,
+                       int left, int zero, int plus, int space)
+{
+    char out[96];
+    int pos = 0;
+    int negative = value < 0.0;
+    if (negative) value = -value;
+    if (precision < 0) precision = 6;
+    if (precision > 48) precision = 48;
+
+    unsigned long long integer = (unsigned long long)value;
+    double fraction = value - (double)integer;
+    pos = (int)uint_to_str(out, integer, 10, 0);
+    if (precision > 0) {
+        out[pos++] = '.';
+        for (int i = 0; i < precision; i++) {
+            fraction *= 10.0;
+            int digit = (int)fraction;
+            if (digit < 0) digit = 0;
+            if (digit > 9) digit = 9;
+            out[pos++] = (char)('0' + digit);
+            fraction -= digit;
+        }
+        if (fraction >= 0.5) {
+            int i = pos - 1;
+            while (i >= 0) {
+                if (out[i] == '.') { i--; continue; }
+                if (out[i] != '9') { out[i]++; break; }
+                out[i--] = '0';
+            }
+            if (i < 0 && pos < (int)sizeof(out) - 1) {
+                for (int j = pos; j > 0; j--) out[j] = out[j - 1];
+                out[0] = '1';
+                pos++;
+            }
+        }
+    } else if (fraction >= 0.5) {
+        integer++;
+        pos = (int)uint_to_str(out, integer, 10, 0);
+    }
+
+    char sign = negative ? '-' : plus ? '+' : space ? ' ' : 0;
+    int content = pos + (sign != 0);
+    int pad = width > content ? width - content : 0;
+    if (!left && !zero) wfmt_pad(ctx, pad, ' ');
+    if (sign) wfmt_putc(ctx, (WCHAR)sign);
+    if (!left && zero) wfmt_pad(ctx, pad, '0');
+    wfmt_put_ascii(ctx, out, (SIZE_T)pos);
+    if (left) wfmt_pad(ctx, pad, ' ');
+}
+
+static int do_vformat_wide64(WFMT_CTX *ctx, const WCHAR *fmt, ms_va_list ap)
+{
+    static const WCHAR null_wide[] = {'(','n','u','l','l',')',0};
+    static const char null_narrow[] = "(null)";
+
+    while (*fmt) {
+        if (*fmt != '%') {
+            wfmt_putc(ctx, *fmt++);
+            continue;
+        }
+        fmt++;
+
+        int left = 0, zero = 0, plus = 0, space = 0, alternate = 0;
+        for (;;) {
+            if (*fmt == '-') { left = 1; fmt++; }
+            else if (*fmt == '0') { zero = 1; fmt++; }
+            else if (*fmt == '+') { plus = 1; fmt++; }
+            else if (*fmt == ' ') { space = 1; fmt++; }
+            else if (*fmt == '#') { alternate = 1; fmt++; }
+            else break;
+        }
+
+        int width = 0;
+        if (*fmt == '*') {
+            width = ms_va_arg(ap, int);
+            fmt++;
+            if (width < 0) { left = 1; width = -width; }
+        } else {
+            while (*fmt >= '0' && *fmt <= '9')
+                width = width * 10 + (*fmt++ - '0');
+        }
+
+        int precision = -1;
+        if (*fmt == '.') {
+            fmt++;
+            precision = 0;
+            if (*fmt == '*') {
+                precision = ms_va_arg(ap, int);
+                fmt++;
+                if (precision < 0) precision = -1;
+            } else {
+                while (*fmt >= '0' && *fmt <= '9')
+                    precision = precision * 10 + (*fmt++ - '0');
+            }
+        }
+
+        int length = WLEN_DEFAULT;
+        if (*fmt == 'h') {
+            fmt++;
+            length = WLEN_H;
+            if (*fmt == 'h') { fmt++; length = WLEN_HH; }
+        } else if (*fmt == 'l') {
+            fmt++;
+            length = WLEN_L;
+            if (*fmt == 'l') { fmt++; length = WLEN_LL; }
+        } else if (*fmt == 'j') { fmt++; length = WLEN_J; }
+        else if (*fmt == 'z') { fmt++; length = WLEN_Z; }
+        else if (*fmt == 't') { fmt++; length = WLEN_T; }
+        else if (*fmt == 'I') {
+            if (fmt[1] == '6' && fmt[2] == '4') { fmt += 3; length = WLEN_I64; }
+            else if (fmt[1] == '3' && fmt[2] == '2') { fmt += 3; length = WLEN_I32; }
+            else { fmt++; length = WLEN_Z; }
+        }
+
+        WCHAR conversion = *fmt;
+        if (!conversion) break;
+        fmt++;
+
+        switch (conversion) {
+        case 'd': case 'i': {
+            long long signed_value;
+            if (length == WLEN_LL || length == WLEN_I64 ||
+                length == WLEN_J || length == WLEN_Z || length == WLEN_T)
+                signed_value = ms_va_arg(ap, long long);
+            else
+                signed_value = (long long)ms_va_arg(ap, int);
+            int negative = signed_value < 0;
+            unsigned long long magnitude = negative
+                ? 0ULL - (unsigned long long)signed_value
+                : (unsigned long long)signed_value;
+            wfmt_integer(ctx, magnitude, negative, 10, 0, width, precision,
+                         left, zero, plus, space, 0);
+            break;
+        }
+        case 'u': case 'o': case 'x': case 'X': {
+            unsigned long long value;
+            if (length == WLEN_LL || length == WLEN_I64 ||
+                length == WLEN_J || length == WLEN_Z || length == WLEN_T)
+                value = ms_va_arg(ap, unsigned long long);
+            else
+                value = (unsigned long long)ms_va_arg(ap, unsigned int);
+            int base = conversion == 'o' ? 8 :
+                       (conversion == 'x' || conversion == 'X') ? 16 : 10;
+            wfmt_integer(ctx, value, 0, base, conversion == 'X', width,
+                         precision, left, zero, 0, 0, alternate);
+            break;
+        }
+        case 'p': {
+            unsigned long long value =
+                (unsigned long long)(ULONG_PTR)ms_va_arg(ap, PVOID);
+            wfmt_integer(ctx, value, 0, 16, 0, width, precision,
+                         left, zero, 0, 0, 1);
+            break;
+        }
+        case 's': {
+            if (length == WLEN_H || length == WLEN_HH) {
+                const char *s = ms_va_arg(ap, const char *);
+                if (!s) s = null_narrow;
+                SIZE_T len = 0;
+                while (s[len] && (precision < 0 || len < (SIZE_T)precision)) len++;
+                if (!left) wfmt_pad(ctx, width - (int)len, ' ');
+                wfmt_put_ascii(ctx, s, len);
+                if (left) wfmt_pad(ctx, width - (int)len, ' ');
+            } else {
+                const WCHAR *s = ms_va_arg(ap, const WCHAR *);
+                if (!s) s = null_wide;
+                SIZE_T len = wfmt_wcsnlen(s, precision);
+                if (!left) wfmt_pad(ctx, width - (int)len, ' ');
+                wfmt_put_wide(ctx, s, len);
+                if (left) wfmt_pad(ctx, width - (int)len, ' ');
+            }
+            break;
+        }
+        case 'S': {
+            const char *s = ms_va_arg(ap, const char *);
+            if (!s) s = null_narrow;
+            SIZE_T len = 0;
+            while (s[len] && (precision < 0 || len < (SIZE_T)precision)) len++;
+            if (!left) wfmt_pad(ctx, width - (int)len, ' ');
+            wfmt_put_ascii(ctx, s, len);
+            if (left) wfmt_pad(ctx, width - (int)len, ' ');
+            break;
+        }
+        case 'c': {
+            WCHAR c = (WCHAR)ms_va_arg(ap, int);
+            if (!left) wfmt_pad(ctx, width - 1, ' ');
+            wfmt_putc(ctx, c);
+            if (left) wfmt_pad(ctx, width - 1, ' ');
+            break;
+        }
+        case 'C': {
+            WCHAR c = (WCHAR)(unsigned char)ms_va_arg(ap, int);
+            if (!left) wfmt_pad(ctx, width - 1, ' ');
+            wfmt_putc(ctx, c);
+            if (left) wfmt_pad(ctx, width - 1, ' ');
+            break;
+        }
+        case 'f': case 'F': case 'e': case 'E': case 'g': case 'G':
+            wfmt_float(ctx, ms_va_arg(ap, double), width, precision,
+                       left, zero, plus, space);
+            break;
+        case 'n': {
+            PVOID out = ms_va_arg(ap, PVOID);
+            if (!out) break;
+            if (length == WLEN_HH) *(signed char *)out = (signed char)ctx->pos;
+            else if (length == WLEN_H) *(short *)out = (short)ctx->pos;
+            else if (length == WLEN_LL || length == WLEN_I64 ||
+                     length == WLEN_J || length == WLEN_Z || length == WLEN_T)
+                *(long long *)out = (long long)ctx->pos;
+            else *(int *)out = (int)ctx->pos;
+            break;
+        }
+        case '%':
+            wfmt_putc(ctx, '%');
+            break;
+        default:
+            wfmt_putc(ctx, '%');
+            wfmt_putc(ctx, conversion);
+            break;
+        }
+    }
+
+    if (ctx->buf && ctx->size > 0) {
+        SIZE_T end = ctx->pos < ctx->size - 1 ? ctx->pos : ctx->size - 1;
+        ctx->buf[end] = 0;
+    }
+    return (int)ctx->pos;
+}
+
+int WINAPI crt_stdio_common_vswprintf(uint64_t options, WCHAR *buffer,
+                                      SIZE_T buffer_count,
+                                      const WCHAR *format, PVOID locale,
+                                      PVOID arg_list)
+{
+    (void)locale; /* The locale shim currently exposes the invariant C locale. */
+    if (!format || (!buffer && buffer_count != 0) || !arg_list) {
+        if (buffer && buffer_count) buffer[0] = 0;
+        *crt_errno() = 22; /* EINVAL */
+        return -1;
+    }
+
+    WFMT_CTX ctx = { buffer, buffer_count, 0 };
+    int required = do_vformat_wide64(&ctx, format, (ms_va_list)arg_list);
+    int truncated = buffer_count == 0 || (SIZE_T)required >= buffer_count;
+
+    static int trace_count;
+    if (trace_count < 8) {
+        trace_count++;
+        serial_puts("[UCRT-VSW] options=0x");
+        serial_puthex(options, 8);
+        serial_puts(" count=");
+        serial_putdec(buffer_count);
+        serial_puts(" required=");
+        serial_putdec((uint64_t)required);
+        serial_puts(" fmt=\"");
+        for (int i = 0; i < 48 && format[i]; i++)
+            serial_putchar((char)(format[i] < 0x80 ? format[i] : '?'));
+        serial_puts("\"\n");
+    }
+
+    if (truncated && !(options & CRT_PRINTF_STANDARD_SNPRINTF))
+        return -1;
+    return required;
 }
 
 /* ── UT99 Core.dll / Engine.dll missing exports ────────────── */
@@ -3182,12 +5614,15 @@ double WINAPI crt_CIfmod(double x, double y)
 uint32_t g_fast_CIpow_addr = 0;
 uint32_t g_fast_CIfmod_addr = 0;
 uint32_t g_fast_CIacos_addr = 0;
+uint32_t g_fast_fabs_addr = 0;
+uint32_t g_fast_sqrt_addr = 0;
 
-void compat32_init_fast_math(void)
+void compat32_init_fast_math(uint8_t *page, uint32_t user_base)
 {
-    extern void *mem_alloc_pages(uint64_t count);
-    uint8_t *page = (uint8_t *)mem_alloc_pages(1);
-    if (!page) { serial_puts("[FAST-MATH] alloc failed\n"); return; }
+    if (!page || !user_base) {
+        serial_puts("[FAST-MATH] runtime page missing\n");
+        return;
+    }
 
     /* Zero and make executable (page from mem_alloc_pages is identity-mapped) */
     for (int i = 0; i < 4096; i++) page[i] = 0xCC;  /* INT3 fill */
@@ -3197,7 +5632,7 @@ void compat32_init_fast_math(void)
     /* _CIpow: ST(1)=base, ST(0)=exp → result in ST(0)
      * Algorithm: pow(x,y) = 2^(y * log2(x))
      * Using x87: fyl2x → f2xm1 → fscale */
-    g_fast_CIpow_addr = (uint32_t)(uintptr_t)(page + p);
+    g_fast_CIpow_addr = user_base + (uint32_t)p;
     /* fxch st(1) */          page[p++] = 0xD9; page[p++] = 0xC9;
     /* fyl2x — ST(0) = ST(1) * log2(ST(0)), pop */
                                page[p++] = 0xD9; page[p++] = 0xF1;
@@ -3221,7 +5656,7 @@ void compat32_init_fast_math(void)
     p = (p + 15) & ~15;
 
     /* _CIfmod: ST(1)=x, ST(0)=y → result in ST(0) = x mod y */
-    g_fast_CIfmod_addr = (uint32_t)(uintptr_t)(page + p);
+    g_fast_CIfmod_addr = user_base + (uint32_t)p;
     /* fxch st(1) */          page[p++] = 0xD9; page[p++] = 0xC9;
     /* fprem */               page[p++] = 0xD9; page[p++] = 0xF8;
     /* fstp st(1) */          page[p++] = 0xDD; page[p++] = 0xD9;
@@ -3231,7 +5666,7 @@ void compat32_init_fast_math(void)
 
     /* _CIacos: ST(0)=x → result in ST(0) = acos(x)
      * acos(x) = atan2(sqrt(1-x^2), x) */
-    g_fast_CIacos_addr = (uint32_t)(uintptr_t)(page + p);
+    g_fast_CIacos_addr = user_base + (uint32_t)p;
     /* fld st(0) — dup x */   page[p++] = 0xD9; page[p++] = 0xC0;
     /* fmul st(0), st(0) */   page[p++] = 0xD8; page[p++] = 0xC8;
     /* fld1 */                page[p++] = 0xD9; page[p++] = 0xE8;
@@ -3242,12 +5677,34 @@ void compat32_init_fast_math(void)
                                page[p++] = 0xD9; page[p++] = 0xF3;
     /* ret */                 page[p++] = 0xC3;
 
+    p = (p + 15) & ~15;
+
+    /* fabs(double): argument at [esp+4], cdecl result in ST(0). */
+    g_fast_fabs_addr = user_base + (uint32_t)p;
+    /* fld qword [esp+4] */   page[p++] = 0xDD; page[p++] = 0x44;
+                               page[p++] = 0x24; page[p++] = 0x04;
+    /* fabs */                page[p++] = 0xD9; page[p++] = 0xE1;
+    /* ret */                 page[p++] = 0xC3;
+
+    p = (p + 15) & ~15;
+
+    /* sqrt(double): argument at [esp+4], cdecl result in ST(0). */
+    g_fast_sqrt_addr = user_base + (uint32_t)p;
+    /* fld qword [esp+4] */   page[p++] = 0xDD; page[p++] = 0x44;
+                               page[p++] = 0x24; page[p++] = 0x04;
+    /* fsqrt */               page[p++] = 0xD9; page[p++] = 0xFA;
+    /* ret */                 page[p++] = 0xC3;
+
     serial_puts("[FAST-MATH] pow=0x");
     serial_puthex(g_fast_CIpow_addr, 8);
     serial_puts(" fmod=0x");
     serial_puthex(g_fast_CIfmod_addr, 8);
     serial_puts(" acos=0x");
     serial_puthex(g_fast_CIacos_addr, 8);
+    serial_puts(" fabs=0x");
+    serial_puthex(g_fast_fabs_addr, 8);
+    serial_puts(" sqrt=0x");
+    serial_puthex(g_fast_sqrt_addr, 8);
     serial_puts("\n");
 }
 
@@ -3291,64 +5748,353 @@ int WINAPI crt_isnan(double x)
     return ((bits >> 52) & 0x7FF) == 0x7FF && (bits & 0x000FFFFFFFFFFFFFULL) != 0;
 }
 
-/* _stat / _wstat — file stat (stub: file not found) */
-struct crt_stat_buf {
-    unsigned int st_dev;
-    unsigned short st_ino;
-    unsigned short st_mode;
-    short st_nlink;
-    short st_uid;
-    short st_gid;
-    unsigned int st_rdev;
-    long st_size;
-    long st_atime;
-    long st_mtime;
-    long st_ctime;
-};
+static short crt_fpclass_from_parts(uint64_t exponent, uint64_t fraction,
+                                    uint64_t exponent_mask)
+{
+    if (exponent == exponent_mask)
+        return fraction ? 2 : 1;   /* FP_NAN : FP_INFINITE */
+    if (exponent == 0)
+        return fraction ? -2 : 0;  /* FP_SUBNORMAL : FP_ZERO */
+    return -1;                     /* FP_NORMAL */
+}
 
+short WINAPI crt_dclass(double x)
+{
+    uint64_t bits;
+    __builtin_memcpy(&bits, &x, sizeof(bits));
+    return crt_fpclass_from_parts((bits >> 52) & 0x7FF,
+                                  bits & 0x000FFFFFFFFFFFFFULL, 0x7FF);
+}
+
+short WINAPI crt_fdclass(float x)
+{
+    uint32_t bits;
+    __builtin_memcpy(&bits, &x, sizeof(bits));
+    return crt_fpclass_from_parts((bits >> 23) & 0xFF,
+                                  bits & 0x007FFFFF, 0xFF);
+}
+
+/* PE32 MSVC stat layouts. Keep these independent from the 64-bit kernel ABI. */
+typedef struct __attribute__((packed)) {
+    uint32_t st_dev;
+    uint16_t st_ino;
+    uint16_t st_mode;
+    int16_t st_nlink;
+    int16_t st_uid;
+    int16_t st_gid;
+    uint16_t reserved0;
+    uint32_t st_rdev;
+    int32_t st_size;
+    int32_t st_atime;
+    int32_t st_mtime;
+    int32_t st_ctime;
+} CRT_STAT32;
+
+typedef struct __attribute__((packed)) {
+    uint32_t st_dev;
+    uint16_t st_ino;
+    uint16_t st_mode;
+    int16_t st_nlink;
+    int16_t st_uid;
+    int16_t st_gid;
+    uint16_t reserved0;
+    uint32_t st_rdev;
+    uint32_t reserved1;
+    int64_t st_size;
+    int32_t st_atime;
+    int32_t st_mtime;
+    int32_t st_ctime;
+    uint32_t reserved2;
+} CRT_STAT32I64;
+
+typedef struct __attribute__((packed)) {
+    uint32_t st_dev;
+    uint16_t st_ino;
+    uint16_t st_mode;
+    int16_t st_nlink;
+    int16_t st_uid;
+    int16_t st_gid;
+    uint16_t reserved0;
+    uint32_t st_rdev;
+    int32_t st_size;
+    int64_t st_atime;
+    int64_t st_mtime;
+    int64_t st_ctime;
+} CRT_STAT64I32;
+
+typedef struct __attribute__((packed)) {
+    uint32_t st_dev;
+    uint16_t st_ino;
+    uint16_t st_mode;
+    int16_t st_nlink;
+    int16_t st_uid;
+    int16_t st_gid;
+    uint16_t reserved0;
+    uint32_t st_rdev;
+    uint32_t reserved1;
+    int64_t st_size;
+    int64_t st_atime;
+    int64_t st_mtime;
+    int64_t st_ctime;
+} CRT_STAT64;
+
+_Static_assert(sizeof(CRT_STAT32) == 36, "PE32 _stat32 layout changed");
+_Static_assert(sizeof(CRT_STAT32I64) == 48,
+               "PE32 _stat32i64 layout changed");
+_Static_assert(sizeof(CRT_STAT64I32) == 48,
+               "PE32 _stat64i32 layout changed");
+_Static_assert(sizeof(CRT_STAT64) == 56, "PE32 _stat64 layout changed");
+
+typedef struct {
+    uint16_t mode;
+    uint64_t size;
+    int64_t atime;
+    int64_t mtime;
+    int64_t ctime;
+} CRT_STAT_META;
+
+#define CRT_S_IFDIR  0x4000
+#define CRT_S_IFREG  0x8000
+#define CRT_S_IEXEC  0x0040
+#define CRT_S_IWRITE 0x0080
+#define CRT_S_IREAD  0x0100
+
+extern void *osfs2_find_exact_ci(const char *name);
 extern void *osfs2_find(const char *name);
 extern uint64_t osfs2_file_size(void *file);
+extern uint32_t osfs2_file_ctime(void *file);
+extern uint32_t osfs2_file_mtime(void *file);
+
+static int crt_path_has_executable_suffix(const char *path)
+{
+    const char *suffix = path;
+    for (const char *p = path; *p; p++) {
+        if (*p == '\\' || *p == '/' || *p == '.') suffix = p;
+    }
+    if (*suffix != '.') return 0;
+
+    char ext[5] = {0};
+    int i = 0;
+    while (suffix[i] && i < 4) {
+        char c = suffix[i];
+        if (c >= 'A' && c <= 'Z') c += 'a' - 'A';
+        ext[i++] = c;
+    }
+    if (suffix[i]) return 0;
+    return (ext[1] == 'e' && ext[2] == 'x' && ext[3] == 'e') ||
+           (ext[1] == 'c' && ext[2] == 'o' && ext[3] == 'm') ||
+           (ext[1] == 'b' && ext[2] == 'a' && ext[3] == 't') ||
+           (ext[1] == 'c' && ext[2] == 'm' && ext[3] == 'd');
+}
+
+static int crt_stat_query(const char *path, CRT_STAT_META *meta)
+{
+    if (!path || !path[0] || !meta) {
+        *crt_errno() = CRT_EINVAL;
+        return -1;
+    }
+
+    char normalized[260];
+    if (!win32_normalize_path(path, normalized)) {
+        *crt_errno() = CRT_ENAMETOOLONG;
+        return -1;
+    }
+
+    void *file = osfs2_find_exact_ci(normalized);
+    if (file) {
+        meta->mode = CRT_S_IFREG | CRT_S_IREAD | CRT_S_IWRITE;
+        if (crt_path_has_executable_suffix(normalized))
+            meta->mode |= CRT_S_IEXEC;
+        meta->size = osfs2_file_size(file);
+        meta->ctime = (int64_t)osfs2_file_ctime(file);
+        meta->mtime = (int64_t)osfs2_file_mtime(file);
+        meta->atime = meta->mtime;
+        *crt_errno() = 0;
+        return 0;
+    }
+
+    if (win32_directory_exists_normalized(normalized)) {
+        meta->mode = CRT_S_IFDIR | CRT_S_IREAD | CRT_S_IWRITE | CRT_S_IEXEC;
+        meta->size = 0;
+        meta->atime = 0;
+        meta->mtime = 0;
+        meta->ctime = 0;
+        *crt_errno() = 0;
+        return 0;
+    }
+
+    *crt_errno() = CRT_ENOENT;
+    return -1;
+}
+
+#define CRT_STAT_FILL_COMMON(stat, meta) do { \
+    (stat)->st_dev = 2; /* C: */ \
+    (stat)->st_ino = 0; \
+    (stat)->st_mode = (meta)->mode; \
+    (stat)->st_nlink = 1; \
+    (stat)->st_uid = 0; \
+    (stat)->st_gid = 0; \
+    (stat)->st_rdev = 2; \
+} while (0)
+
+static int crt_stat32_impl(const char *path, PVOID buf)
+{
+    CRT_STAT_META meta;
+    if (!buf) {
+        *crt_errno() = CRT_EINVAL;
+        return -1;
+    }
+    if (crt_stat_query(path, &meta) < 0) return -1;
+    if (meta.size > 0x7FFFFFFFULL) {
+        *crt_errno() = CRT_EOVERFLOW;
+        return -1;
+    }
+
+    CRT_STAT32 *stat = (CRT_STAT32 *)buf;
+    crt_memset(stat, 0, sizeof(*stat));
+    CRT_STAT_FILL_COMMON(stat, &meta);
+    stat->st_size = (int32_t)meta.size;
+    stat->st_atime = (int32_t)meta.atime;
+    stat->st_mtime = (int32_t)meta.mtime;
+    stat->st_ctime = (int32_t)meta.ctime;
+    return 0;
+}
+
+static int crt_stat32i64_impl(const char *path, PVOID buf)
+{
+    CRT_STAT_META meta;
+    if (!buf) {
+        *crt_errno() = CRT_EINVAL;
+        return -1;
+    }
+    if (crt_stat_query(path, &meta) < 0) return -1;
+
+    CRT_STAT32I64 *stat = (CRT_STAT32I64 *)buf;
+    crt_memset(stat, 0, sizeof(*stat));
+    CRT_STAT_FILL_COMMON(stat, &meta);
+    stat->st_size = (int64_t)meta.size;
+    stat->st_atime = (int32_t)meta.atime;
+    stat->st_mtime = (int32_t)meta.mtime;
+    stat->st_ctime = (int32_t)meta.ctime;
+    return 0;
+}
+
+static int crt_stat64i32_impl(const char *path, PVOID buf)
+{
+    CRT_STAT_META meta;
+    if (!buf) {
+        *crt_errno() = CRT_EINVAL;
+        return -1;
+    }
+    if (crt_stat_query(path, &meta) < 0) return -1;
+    if (meta.size > 0x7FFFFFFFULL) {
+        *crt_errno() = CRT_EOVERFLOW;
+        return -1;
+    }
+
+    CRT_STAT64I32 *stat = (CRT_STAT64I32 *)buf;
+    crt_memset(stat, 0, sizeof(*stat));
+    CRT_STAT_FILL_COMMON(stat, &meta);
+    stat->st_size = (int32_t)meta.size;
+    stat->st_atime = meta.atime;
+    stat->st_mtime = meta.mtime;
+    stat->st_ctime = meta.ctime;
+    if (crt_io_trace_take(&crt_stat_trace_count, 64)) {
+        serial_puts("[CRT-STAT64I32] size=");
+        serial_putdec(meta.size);
+        serial_puts(" mode=0x");
+        serial_puthex(meta.mode, 4);
+        serial_puts(" path='");
+        serial_puts(path);
+        serial_puts("'\n");
+    }
+    return 0;
+}
+
+static int crt_stat64_impl(const char *path, PVOID buf)
+{
+    CRT_STAT_META meta;
+    if (!buf) {
+        *crt_errno() = CRT_EINVAL;
+        return -1;
+    }
+    if (crt_stat_query(path, &meta) < 0) return -1;
+
+    CRT_STAT64 *stat = (CRT_STAT64 *)buf;
+    crt_memset(stat, 0, sizeof(*stat));
+    CRT_STAT_FILL_COMMON(stat, &meta);
+    stat->st_size = (int64_t)meta.size;
+    stat->st_atime = meta.atime;
+    stat->st_mtime = meta.mtime;
+    stat->st_ctime = meta.ctime;
+    return 0;
+}
 
 int WINAPI crt_stat(const char *path, PVOID buf)
 {
-    if (!path || !buf) return -1;
+    return crt_stat64i32_impl(path, buf);
+}
 
-    /* Extract basename (OsitoFS is flat) */
-    const char *base = path;
-    for (const char *p = path; *p; p++) {
-        if (*p == '\\' || *p == '/') base = p + 1;
+int WINAPI crt_stat32(const char *path, PVOID buf)
+{
+    return crt_stat32_impl(path, buf);
+}
+
+int WINAPI crt_stat32i64(const char *path, PVOID buf)
+{
+    return crt_stat32i64_impl(path, buf);
+}
+
+int WINAPI crt_stat64i32(const char *path, PVOID buf)
+{
+    return crt_stat64i32_impl(path, buf);
+}
+
+int WINAPI crt_stat64(const char *path, PVOID buf)
+{
+    return crt_stat64_impl(path, buf);
+}
+
+typedef int (*CRT_STAT_IMPL)(const char *, PVOID);
+
+static int crt_wstat_impl(const WCHAR *path, PVOID buf, CRT_STAT_IMPL impl)
+{
+    if (!path || !buf) {
+        *crt_errno() = CRT_EINVAL;
+        return -1;
     }
-
-    void *f = osfs2_find(base);
-    if (!f && base != path)
-        f = osfs2_find(path);
-
-    serial_puts("[CRT] _stat('");
-    serial_puts(path);
-    serial_puts("') -> ");
-    serial_puts(f ? "OK\n" : "FAIL\n");
-
-    if (!f) return -1;
-
-    struct crt_stat_buf *sb = (struct crt_stat_buf *)buf;
-    for (int i = 0; i < (int)sizeof(struct crt_stat_buf); i++)
-        ((char *)sb)[i] = 0;
-    sb->st_mode = 0x8000 | 0x0100 | 0x0080; /* _S_IFREG | _S_IREAD | _S_IWRITE */
-    sb->st_nlink = 1;
-    sb->st_size = (long)osfs2_file_size(f);
-    return 0;
+    char narrow[260];
+    if (!WideCharToMultiByte(0 /* CP_ACP */, 0, path, -1, narrow,
+                             sizeof(narrow), NULL, NULL)) {
+        *crt_errno() = CRT_ENAMETOOLONG;
+        return -1;
+    }
+    return impl(narrow, buf);
 }
 
 int WINAPI crt_wstat(const WCHAR *path, PVOID buf)
 {
-    if (!path || !buf) return -1;
-    /* Convert wide to narrow */
-    char narrow[260];
-    int i = 0;
-    for (; path[i] && i < 259; i++)
-        narrow[i] = (char)(path[i] & 0xFF);
-    narrow[i] = 0;
-    return crt_stat(narrow, buf);
+    return crt_wstat_impl(path, buf, crt_stat64i32_impl);
+}
+
+int WINAPI crt_wstat32(const WCHAR *path, PVOID buf)
+{
+    return crt_wstat_impl(path, buf, crt_stat32_impl);
+}
+
+int WINAPI crt_wstat32i64(const WCHAR *path, PVOID buf)
+{
+    return crt_wstat_impl(path, buf, crt_stat32i64_impl);
+}
+
+int WINAPI crt_wstat64i32(const WCHAR *path, PVOID buf)
+{
+    return crt_wstat_impl(path, buf, crt_stat64i32_impl);
+}
+
+int WINAPI crt_wstat64(const WCHAR *path, PVOID buf)
+{
+    return crt_wstat_impl(path, buf, crt_stat64_impl);
 }
 
 /* _strdate / _strtime — date/time strings (stub values) */
@@ -3445,6 +6191,7 @@ int WINAPI crt_vsnwprintf(WCHAR *buf, SIZE_T count, const WCHAR *fmt, ms_va_list
         }
     }
 
+#ifndef OK_QUIET
     /* Debug: trace first 30 calls to see what's going on */
     if (vsnw_trace_count < 30) {
         vsnw_trace_count++;
@@ -3576,6 +6323,7 @@ int WINAPI crt_vsnwprintf(WCHAR *buf, SIZE_T count, const WCHAR *fmt, ms_va_list
             }
         }
     }
+#endif
 
     SIZE_T pos = 0;
     SIZE_T max = count - 1;
@@ -3856,6 +6604,31 @@ double WINAPI crt_floor(double x)
     return (double)i;
 }
 
+double WINAPI crt_fabs(double x)
+{
+    union { double value; uint64_t bits; } v = { x };
+    v.bits &= ~(1ULL << 63);
+    return v.value;
+}
+
+double WINAPI crt_sqrt(double x)
+{
+    union { double value; uint64_t bits; } v = { x };
+    if (x == 0.0 || (v.bits & 0x7FF0000000000000ULL) ==
+                    0x7FF0000000000000ULL)
+        return x;
+    if (x < 0.0) {
+        v.bits = 0x7FF8000000000000ULL;
+        return v.value;
+    }
+
+    union { double value; uint64_t bits; } guess;
+    guess.bits = (v.bits >> 1) + 0x1FF8000000000000ULL;
+    for (int i = 0; i < 8; i++)
+        guess.value = 0.5 * (guess.value + x / guess.value);
+    return guess.value;
+}
+
 /* difftime — difference between two time_t values */
 double WINAPI crt_difftime(crt_time_t t1, crt_time_t t0)
 {
@@ -3863,34 +6636,390 @@ double WINAPI crt_difftime(crt_time_t t1, crt_time_t t0)
 }
 
 /* gmtime — convert time_t to struct tm (stub) */
-struct crt_tm {
-    int tm_sec;
-    int tm_min;
-    int tm_hour;
-    int tm_mday;
-    int tm_mon;
-    int tm_year;
-    int tm_wday;
-    int tm_yday;
-    int tm_isdst;
-};
+static int crt_tm_from_unix(int64_t unix_seconds, struct crt_tm *result)
+{
+    WINTIME_CALENDAR calendar;
+    if (!result || wintime_unix_to_calendar(unix_seconds, &calendar) < 0)
+        return CRT_EINVAL;
 
-static struct crt_tm crt_gmtime_buf;
+    result->tm_sec = calendar.second;
+    result->tm_min = calendar.minute;
+    result->tm_hour = calendar.hour;
+    result->tm_mday = calendar.day;
+    result->tm_mon = calendar.month - 1;
+    result->tm_year = calendar.year - 1900;
+    result->tm_wday = calendar.day_of_week;
+    result->tm_yday = calendar.day_of_year;
+    result->tm_isdst = 0;
+    return 0;
+}
 
 PVOID WINAPI crt_gmtime(const crt_time_t *timer)
 {
-    (void)timer;
-    crt_memset(&crt_gmtime_buf, 0, sizeof(crt_gmtime_buf));
-    crt_gmtime_buf.tm_mday = 1;   /* day 1 */
-    crt_gmtime_buf.tm_year = 126;  /* 2026 - 1900 */
-    return (PVOID)&crt_gmtime_buf;
+    if (!timer) {
+        crt_errno_val = CRT_EINVAL;
+        return NULL;
+    }
+    UCRT_PROCESS_MODE_VALUES *state = ucrt_process_mode_state(TRUE);
+    if (!state ||
+        crt_tm_from_unix((int64_t)*timer, &state->time_buffer) != 0) {
+        crt_errno_val = CRT_EINVAL;
+        return NULL;
+    }
+    crt_errno_val = 0;
+    return (PVOID)&state->time_buffer;
+}
+
+int64_t WINAPI crt_time64(int64_t *timer)
+{
+    int64_t result = wintime_now_unix_seconds();
+    if (timer) *timer = result;
+    return result;
+}
+
+int WINAPI crt_gmtime64_s(PVOID result, const int64_t *timer)
+{
+    if (!result || !timer) {
+        crt_errno_val = CRT_EINVAL;
+        return CRT_EINVAL;
+    }
+    int error = crt_tm_from_unix(*timer, (struct crt_tm *)result);
+    crt_errno_val = error;
+    return error;
+}
+
+PVOID WINAPI crt_localtime64(const int64_t *timer)
+{
+    if (!timer) {
+        crt_errno_val = CRT_EINVAL;
+        return NULL;
+    }
+
+    UCRT_PROCESS_MODE_VALUES *state = ucrt_process_mode_state(TRUE);
+    if (!state || crt_tm_from_unix(*timer, &state->time_buffer) != 0) {
+        crt_errno_val = CRT_EINVAL;
+        return NULL;
+    }
+    crt_errno_val = 0;
+    return (PVOID)&state->time_buffer;
+}
+
+int WINAPI crt_localtime64_s(PVOID result, const int64_t *timer)
+{
+    /* Local time is UTC while the system time-zone bias is zero. */
+    return crt_gmtime64_s(result, timer);
 }
 
 /* mktime — convert struct tm to time_t (stub) */
-crt_time_t WINAPI crt_mktime(PVOID tm)
+typedef struct {
+    char *data;
+    SIZE_T capacity;
+    SIZE_T length;
+    BOOL overflow;
+} CRT_STRFTIME_OUTPUT;
+
+static void crt_strftime_putc(CRT_STRFTIME_OUTPUT *output, char c)
 {
-    (void)tm;
-    return 0;
+    if (output->overflow) return;
+    if (output->length + 1 >= output->capacity) {
+        output->overflow = TRUE;
+        return;
+    }
+    output->data[output->length++] = c;
+    output->data[output->length] = 0;
+}
+
+static void crt_strftime_puts(CRT_STRFTIME_OUTPUT *output, const char *text)
+{
+    while (*text) crt_strftime_putc(output, *text++);
+}
+
+static void crt_strftime_number(CRT_STRFTIME_OUTPUT *output,
+                                unsigned int value, int width, char padding,
+                                BOOL alternate)
+{
+    char digits[16];
+    int count = 0;
+    do {
+        digits[count++] = (char)('0' + value % 10U);
+        value /= 10U;
+    } while (value && count < (int)sizeof(digits));
+
+    if (!alternate)
+        while (count < width) {
+            crt_strftime_putc(output, padding);
+            width--;
+        }
+    while (count > 0) crt_strftime_putc(output, digits[--count]);
+}
+
+static BOOL crt_tm_is_leap_year(int year)
+{
+    return (year % 4 == 0) && (year % 100 != 0 || year % 400 == 0);
+}
+
+static int crt_tm_jan1_wday(const struct crt_tm *tm)
+{
+    int wday = tm->tm_wday - (tm->tm_yday % 7);
+    if (wday < 0) wday += 7;
+    return wday;
+}
+
+static int crt_tm_iso_weeks(int year, int jan1_wday)
+{
+    return jan1_wday == 4 ||
+           (jan1_wday == 3 && crt_tm_is_leap_year(year)) ? 53 : 52;
+}
+
+static void crt_tm_iso_week(const struct crt_tm *tm, int *iso_year,
+                            int *iso_week)
+{
+    int year = tm->tm_year + 1900;
+    int iso_wday = tm->tm_wday == 0 ? 7 : tm->tm_wday;
+    int week = (tm->tm_yday + 10 - iso_wday) / 7;
+    int jan1_wday = crt_tm_jan1_wday(tm);
+
+    if (week < 1) {
+        int previous_year = year - 1;
+        int previous_days = crt_tm_is_leap_year(previous_year) ? 366 : 365;
+        int previous_jan1 = (jan1_wday - previous_days % 7 + 7) % 7;
+        year = previous_year;
+        week = crt_tm_iso_weeks(year, previous_jan1);
+    } else if (week > crt_tm_iso_weeks(year, jan1_wday)) {
+        year++;
+        week = 1;
+    }
+
+    *iso_year = year;
+    *iso_week = week;
+}
+
+static void crt_strftime_format(CRT_STRFTIME_OUTPUT *output,
+                                const char *format,
+                                const struct crt_tm *tm)
+{
+    static const char *const weekdays_short[] = {
+        "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"
+    };
+    static const char *const weekdays_long[] = {
+        "Sunday", "Monday", "Tuesday", "Wednesday", "Thursday",
+        "Friday", "Saturday"
+    };
+    static const char *const months_short[] = {
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+        "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"
+    };
+    static const char *const months_long[] = {
+        "January", "February", "March", "April", "May", "June",
+        "July", "August", "September", "October", "November", "December"
+    };
+
+    while (*format && !output->overflow) {
+        if (*format != '%') {
+            crt_strftime_putc(output, *format++);
+            continue;
+        }
+        format++;
+        BOOL alternate = FALSE;
+        if (*format == '#') {
+            alternate = TRUE;
+            format++;
+        }
+        if (*format == 'E' || *format == 'O') format++;
+        char specifier = *format ? *format++ : 0;
+        int year = tm->tm_year + 1900;
+        int hour12 = tm->tm_hour % 12;
+        if (!hour12) hour12 = 12;
+
+        switch (specifier) {
+        case '%': crt_strftime_putc(output, '%'); break;
+        case 'a':
+            crt_strftime_puts(output,
+                tm->tm_wday >= 0 && tm->tm_wday < 7
+                    ? weekdays_short[tm->tm_wday] : "???");
+            break;
+        case 'A':
+            crt_strftime_puts(output,
+                tm->tm_wday >= 0 && tm->tm_wday < 7
+                    ? weekdays_long[tm->tm_wday] : "???");
+            break;
+        case 'b': case 'h':
+            crt_strftime_puts(output,
+                tm->tm_mon >= 0 && tm->tm_mon < 12
+                    ? months_short[tm->tm_mon] : "???");
+            break;
+        case 'B':
+            crt_strftime_puts(output,
+                tm->tm_mon >= 0 && tm->tm_mon < 12
+                    ? months_long[tm->tm_mon] : "???");
+            break;
+        case 'c':
+            crt_strftime_format(output, "%a %b %e %H:%M:%S %Y", tm);
+            break;
+        case 'C':
+            crt_strftime_number(output, (unsigned int)(year / 100), 2, '0',
+                                alternate);
+            break;
+        case 'd':
+            crt_strftime_number(output, (unsigned int)tm->tm_mday, 2, '0',
+                                alternate);
+            break;
+        case 'D': crt_strftime_format(output, "%m/%d/%y", tm); break;
+        case 'e':
+            crt_strftime_number(output, (unsigned int)tm->tm_mday, 2, ' ',
+                                alternate);
+            break;
+        case 'F': crt_strftime_format(output, "%Y-%m-%d", tm); break;
+        case 'g': case 'G': case 'V': {
+            int iso_year, iso_week;
+            crt_tm_iso_week(tm, &iso_year, &iso_week);
+            if (specifier == 'V')
+                crt_strftime_number(output, (unsigned int)iso_week, 2, '0',
+                                    alternate);
+            else if (specifier == 'g')
+                crt_strftime_number(output,
+                    (unsigned int)((iso_year % 100 + 100) % 100), 2, '0',
+                    alternate);
+            else
+                crt_strftime_number(output, (unsigned int)iso_year, 4, '0',
+                                    alternate);
+            break;
+        }
+        case 'H':
+            crt_strftime_number(output, (unsigned int)tm->tm_hour, 2, '0',
+                                alternate);
+            break;
+        case 'I':
+            crt_strftime_number(output, (unsigned int)hour12, 2, '0',
+                                alternate);
+            break;
+        case 'j':
+            crt_strftime_number(output, (unsigned int)(tm->tm_yday + 1),
+                                3, '0', alternate);
+            break;
+        case 'm':
+            crt_strftime_number(output, (unsigned int)(tm->tm_mon + 1),
+                                2, '0', alternate);
+            break;
+        case 'M':
+            crt_strftime_number(output, (unsigned int)tm->tm_min, 2, '0',
+                                alternate);
+            break;
+        case 'n': crt_strftime_putc(output, '\n'); break;
+        case 'p': crt_strftime_puts(output, tm->tm_hour < 12 ? "AM" : "PM"); break;
+        case 'r': crt_strftime_format(output, "%I:%M:%S %p", tm); break;
+        case 'R': crt_strftime_format(output, "%H:%M", tm); break;
+        case 'S':
+            crt_strftime_number(output, (unsigned int)tm->tm_sec, 2, '0',
+                                alternate);
+            break;
+        case 't': crt_strftime_putc(output, '\t'); break;
+        case 'T': crt_strftime_format(output, "%H:%M:%S", tm); break;
+        case 'u':
+            crt_strftime_number(output,
+                (unsigned int)(tm->tm_wday == 0 ? 7 : tm->tm_wday),
+                1, '0', alternate);
+            break;
+        case 'U':
+            crt_strftime_number(output,
+                (unsigned int)((tm->tm_yday + 7 - tm->tm_wday) / 7),
+                2, '0', alternate);
+            break;
+        case 'w':
+            crt_strftime_number(output, (unsigned int)tm->tm_wday, 1, '0',
+                                alternate);
+            break;
+        case 'W': {
+            int monday_wday = (tm->tm_wday + 6) % 7;
+            crt_strftime_number(output,
+                (unsigned int)((tm->tm_yday + 7 - monday_wday) / 7),
+                2, '0', alternate);
+            break;
+        }
+        case 'x': crt_strftime_format(output, "%m/%d/%y", tm); break;
+        case 'X': crt_strftime_format(output, "%H:%M:%S", tm); break;
+        case 'y':
+            crt_strftime_number(output,
+                (unsigned int)((year % 100 + 100) % 100), 2, '0', alternate);
+            break;
+        case 'Y':
+            crt_strftime_number(output, (unsigned int)year, 4, '0', alternate);
+            break;
+        case 'z': crt_strftime_puts(output, "+0000"); break;
+        case 'Z': crt_strftime_puts(output, "UTC"); break;
+        case 0:
+            crt_strftime_putc(output, '%');
+            break;
+        default:
+            crt_strftime_putc(output, '%');
+            crt_strftime_putc(output, specifier);
+            break;
+        }
+    }
+}
+
+SIZE_T WINAPI crt_strftime(char *buffer, SIZE_T max_size,
+                           const char *format, PCVOID tm_ptr)
+{
+    if (!buffer || !max_size || !format || !tm_ptr) {
+        if (buffer && max_size) buffer[0] = 0;
+        *crt_errno() = CRT_EINVAL;
+        return 0;
+    }
+
+    CRT_STRFTIME_OUTPUT output = { buffer, max_size, 0, FALSE };
+    buffer[0] = 0;
+    crt_strftime_format(&output, format, (const struct crt_tm *)tm_ptr);
+    if (output.overflow) {
+        buffer[0] = 0;
+        *crt_errno() = CRT_ERANGE;
+        return 0;
+    }
+    *crt_errno() = 0;
+    return output.length;
+}
+
+void WINAPI crt_sleep(unsigned long milliseconds)
+{
+    Sleep((DWORD)milliseconds);
+}
+
+crt_time_t WINAPI crt_mktime(PVOID tm_ptr)
+{
+    struct crt_tm *tm = (struct crt_tm *)tm_ptr;
+    if (!tm) {
+        crt_errno_val = 22;
+        return (crt_time_t)-1;
+    }
+    WINTIME_CALENDAR calendar;
+    calendar.year = (uint16_t)(tm->tm_year + 1900);
+    calendar.month = (uint16_t)(tm->tm_mon + 1);
+    calendar.day_of_week = 0;
+    calendar.day = (uint16_t)tm->tm_mday;
+    calendar.hour = (uint16_t)tm->tm_hour;
+    calendar.minute = (uint16_t)tm->tm_min;
+    calendar.second = (uint16_t)tm->tm_sec;
+    calendar.millisecond = 0;
+    calendar.day_of_year = 0;
+    int64_t unix_seconds;
+    if (wintime_calendar_to_unix(&calendar, &unix_seconds) < 0) {
+        crt_errno_val = 22;
+        return (crt_time_t)-1;
+    }
+
+    WINTIME_CALENDAR normalized;
+    if (wintime_unix_to_calendar(unix_seconds, &normalized) == 0) {
+        tm->tm_wday = normalized.day_of_week;
+        tm->tm_yday = normalized.day_of_year;
+        tm->tm_isdst = 0;
+    }
+    crt_errno_val = 0;
+    return (crt_time_t)unix_seconds;
+}
+
+int64_t WINAPI crt_mktime64(PVOID tm_ptr)
+{
+    return (int64_t)crt_mktime(tm_ptr);
 }
 
 /* rand / srand — simple LCG PRNG */
@@ -3920,11 +7049,76 @@ char* WINAPI crt_strncat(char *dst, const char *src, SIZE_T n)
 
 /* ── Wide string functions ─────────────────────────────────── */
 
+char* WINAPI crt_strdup(const char *s)
+{
+    static volatile uint32_t strdup_trace_count;
+    if (!s) {
+        *crt_errno() = CRT_EINVAL;
+        return NULL;
+    }
+    SIZE_T chars = crt_strlen(s) + 1;
+    char *copy = (char *)crt_malloc(chars);
+    if (!copy) {
+        *crt_errno() = CRT_ENOMEM;
+        return NULL;
+    }
+    for (SIZE_T i = 0; i < chars; i++) copy[i] = s[i];
+    if (__sync_fetch_and_add(&strdup_trace_count, 1) < 4) {
+        serial_puts("[CRT-STRDUP] -> 0x");
+        serial_puthex((ULONG_PTR)copy, 16);
+        serial_puts(" value='");
+        serial_puts(s);
+        serial_puts("'\n");
+    }
+    return copy;
+}
+
+SIZE_T WINAPI crt_strcspn(const char *s, const char *reject)
+{
+    SIZE_T length = 0;
+    while (s[length]) {
+        for (const char *r = reject; *r; r++)
+            if (s[length] == *r) return length;
+        length++;
+    }
+    return length;
+}
+
+char* WINAPI crt_strpbrk(const char *s, const char *accept)
+{
+    for (; *s; s++)
+        for (const char *a = accept; *a; a++)
+            if (*s == *a) return (char *)s;
+    return NULL;
+}
+
 SIZE_T WINAPI crt_wcslen(const WCHAR *s)
 {
     SIZE_T len = 0;
     while (s[len]) len++;
     return len;
+}
+
+SIZE_T WINAPI crt_wcsnlen(const WCHAR *s, SIZE_T max_chars)
+{
+    if (!s) {
+        *crt_errno() = CRT_EINVAL;
+        return 0;
+    }
+    SIZE_T len = 0;
+    while (len < max_chars && s[len]) len++;
+    return len;
+}
+
+WCHAR* WINAPI crt_wcsdup(const WCHAR *s)
+{
+    if (!s) return NULL;
+    SIZE_T chars = crt_wcslen(s) + 1;
+    WCHAR *copy = (WCHAR *)crt_malloc(chars * sizeof(WCHAR));
+    if (!copy) return NULL;
+    for (SIZE_T i = 0; i < chars; i++)
+        copy[i] = s[i];
+    return copy;
 }
 
 WCHAR* WINAPI crt_wcscpy(WCHAR *dst, const WCHAR *src)
@@ -3991,12 +7185,149 @@ WCHAR* WINAPI crt_wcsncpy(WCHAR *dst, const WCHAR *src, SIZE_T n)
     return dst;
 }
 
+int WINAPI crt_wcscpy_s(WCHAR *dst, SIZE_T dst_chars, const WCHAR *src)
+{
+    if (!dst) {
+        *crt_errno() = CRT_EINVAL;
+        return CRT_EINVAL;
+    }
+    if (!src) {
+        if (dst_chars) dst[0] = 0;
+        *crt_errno() = CRT_EINVAL;
+        return CRT_EINVAL;
+    }
+    if (!dst_chars) {
+        *crt_errno() = CRT_ERANGE;
+        return CRT_ERANGE;
+    }
+
+    SIZE_T src_chars = crt_wcslen(src);
+    if (src_chars >= dst_chars) {
+        dst[0] = 0;
+        *crt_errno() = CRT_ERANGE;
+        return CRT_ERANGE;
+    }
+    for (SIZE_T i = 0; i <= src_chars; i++) dst[i] = src[i];
+    return 0;
+}
+
+int WINAPI crt_strncpy_s(char *dst, SIZE_T dst_chars,
+                         const char *src, SIZE_T count)
+{
+    if (!dst || !dst_chars) {
+        *crt_errno() = CRT_EINVAL;
+        return CRT_EINVAL;
+    }
+    if (count == 0) {
+        dst[0] = 0;
+        return 0;
+    }
+    if (!src) {
+        dst[0] = 0;
+        *crt_errno() = CRT_EINVAL;
+        return CRT_EINVAL;
+    }
+
+    BOOL truncate = crt_secure_truncate_count(count);
+    SIZE_T src_chars = crt_strlen(src);
+    SIZE_T copy_chars = truncate || src_chars < count ? src_chars : count;
+
+    if (truncate && src_chars >= dst_chars) {
+        copy_chars = dst_chars - 1;
+        for (SIZE_T i = 0; i < copy_chars; i++) dst[i] = src[i];
+        dst[copy_chars] = 0;
+        return CRT_STRUNCATE;
+    }
+    if (copy_chars >= dst_chars) {
+        dst[0] = 0;
+        *crt_errno() = CRT_ERANGE;
+        return CRT_ERANGE;
+    }
+
+    ULONG_PTR dst_begin = (ULONG_PTR)dst;
+    ULONG_PTR src_begin = (ULONG_PTR)src;
+    SIZE_T span = copy_chars + 1;
+    if (dst_begin < src_begin + span && src_begin < dst_begin + span) {
+        dst[0] = 0;
+        *crt_errno() = CRT_EINVAL;
+        return CRT_EINVAL;
+    }
+
+    for (SIZE_T i = 0; i < copy_chars; i++) dst[i] = src[i];
+    dst[copy_chars] = 0;
+    return 0;
+}
+
+int WINAPI crt_wcsncpy_s(WCHAR *dst, SIZE_T dst_chars,
+                         const WCHAR *src, SIZE_T count)
+{
+    if (!dst || !dst_chars) {
+        *crt_errno() = CRT_EINVAL;
+        return CRT_EINVAL;
+    }
+    if (!src) {
+        dst[0] = 0;
+        *crt_errno() = CRT_EINVAL;
+        return CRT_EINVAL;
+    }
+
+    BOOL truncate = count == (SIZE_T)-1 || count == 0xFFFFFFFFU;
+    SIZE_T src_chars = crt_wcslen(src);
+    SIZE_T copy_chars = src_chars < count ? src_chars : count;
+    if (truncate && src_chars >= dst_chars) {
+        copy_chars = dst_chars - 1;
+        for (SIZE_T i = 0; i < copy_chars; i++) dst[i] = src[i];
+        dst[copy_chars] = 0;
+        return CRT_STRUNCATE;
+    }
+    if (copy_chars >= dst_chars) {
+        dst[0] = 0;
+        *crt_errno() = CRT_ERANGE;
+        return CRT_ERANGE;
+    }
+    for (SIZE_T i = 0; i < copy_chars; i++) dst[i] = src[i];
+    dst[copy_chars] = 0;
+    return 0;
+}
+
 WCHAR* WINAPI crt_wcscat(WCHAR *dst, const WCHAR *src)
 {
     WCHAR *d = dst;
     while (*d) d++;
     while ((*d++ = *src++));
     return dst;
+}
+
+int WINAPI crt_wcscat_s(WCHAR *dst, SIZE_T dst_chars, const WCHAR *src)
+{
+    if (!dst) {
+        *crt_errno() = CRT_EINVAL;
+        return CRT_EINVAL;
+    }
+    if (!dst_chars) {
+        *crt_errno() = CRT_ERANGE;
+        return CRT_ERANGE;
+    }
+
+    SIZE_T dst_len = crt_wcsnlen(dst, dst_chars);
+    if (dst_len == dst_chars) {
+        *crt_errno() = CRT_EINVAL;
+        return CRT_EINVAL;
+    }
+    if (!src) {
+        dst[0] = 0;
+        *crt_errno() = CRT_EINVAL;
+        return CRT_EINVAL;
+    }
+
+    SIZE_T src_len = crt_wcslen(src);
+    if (src_len >= dst_chars - dst_len) {
+        dst[0] = 0;
+        *crt_errno() = CRT_ERANGE;
+        return CRT_ERANGE;
+    }
+    for (SIZE_T i = 0; i <= src_len; i++) dst[dst_len + i] = src[i];
+    return 0;
 }
 
 int WINAPI crt_wcscmp(const WCHAR *a, const WCHAR *b)
@@ -4014,11 +7345,42 @@ int WINAPI crt_wcsncmp(const WCHAR *a, const WCHAR *b, SIZE_T n)
     return 0;
 }
 
+int WINAPI crt_wcscoll(const WCHAR *a, const WCHAR *b)
+{
+    /* OsitoK currently exposes the invariant C locale. */
+    return crt_wcscmp(a, b);
+}
+
+SIZE_T WINAPI crt_wcsxfrm(WCHAR *dst, const WCHAR *src, SIZE_T dst_chars)
+{
+    if (!src) {
+        *crt_errno() = CRT_EINVAL;
+        return (SIZE_T)-1;
+    }
+    SIZE_T src_chars = crt_wcslen(src);
+    if (dst && dst_chars) {
+        SIZE_T copy_chars = src_chars < dst_chars ? src_chars : dst_chars;
+        for (SIZE_T i = 0; i < copy_chars; i++) dst[i] = src[i];
+        if (src_chars < dst_chars) dst[src_chars] = 0;
+    }
+    return src_chars;
+}
+
 WCHAR* WINAPI crt_wcschr(const WCHAR *s, WCHAR c)
 {
     for (; *s; s++)
         if (*s == c) return (WCHAR *)s;
     return (c == 0) ? (WCHAR *)s : NULL;
+}
+
+WCHAR* WINAPI crt_wcsrchr(const WCHAR *s, WCHAR c)
+{
+    const WCHAR *last = NULL;
+    do {
+        if (*s == c)
+            last = s;
+    } while (*s++);
+    return (WCHAR *)last;
 }
 
 WCHAR* WINAPI crt_wcsstr(const WCHAR *haystack, const WCHAR *needle)
@@ -4030,6 +7392,35 @@ WCHAR* WINAPI crt_wcsstr(const WCHAR *haystack, const WCHAR *needle)
         if (!*n) return (WCHAR *)haystack;
     }
     return NULL;
+}
+
+static BOOL crt_wchar_is_delimiter(WCHAR c, const WCHAR *delimiters)
+{
+    for (const WCHAR *d = delimiters; *d; d++)
+        if (*d == c) return TRUE;
+    return FALSE;
+}
+
+WCHAR* WINAPI crt_wcstok_s(WCHAR *str, const WCHAR *delimiters,
+                           WCHAR **context)
+{
+    if (!delimiters || !context || (!str && !*context)) {
+        *crt_errno() = CRT_EINVAL;
+        return NULL;
+    }
+
+    WCHAR *cursor = str ? str : *context;
+    while (*cursor && crt_wchar_is_delimiter(*cursor, delimiters)) cursor++;
+    if (!*cursor) {
+        *context = cursor;
+        return NULL;
+    }
+
+    WCHAR *token = cursor;
+    while (*cursor && !crt_wchar_is_delimiter(*cursor, delimiters)) cursor++;
+    if (*cursor) *cursor++ = 0;
+    *context = cursor;
+    return token;
 }
 
 unsigned long WINAPI crt_wcstoul(const WCHAR *s, WCHAR **endptr, int base)
@@ -4106,7 +7497,474 @@ unsigned int* WINAPI crt_p_winminor(void) { return &crt_winminor_val; }
 
 static int crt_getch_stub(void)  { return -1; /* EOF */ }
 static int crt_kbhit_stub(void)  { return 0;  /* no key pressed */ }
-static int crt_putenv_stub(const char *s) { (void)s; return -1; /* fail */ }
+
+typedef struct _CRT_ENV_VALUE_CACHE {
+    struct _CRT_ENV_VALUE_CACHE *next;
+    DWORD pid;
+    DWORD tid;
+    char *narrow;
+    SIZE_T narrow_capacity;
+    WCHAR *wide;
+    SIZE_T wide_capacity;
+} CRT_ENV_VALUE_CACHE;
+
+typedef struct _CRT_WENV_CACHE {
+    struct _CRT_WENV_CACHE *next;
+    DWORD pid;
+    BOOL is_32bit;
+    WCHAR *block;
+    SIZE_T block_capacity;
+    PVOID entries;
+    SIZE_T entry_capacity;
+    PVOID view_cell;
+} CRT_WENV_CACHE;
+
+static CRT_ENV_VALUE_CACHE *crt_env_values;
+static CRT_WENV_CACHE *crt_wenv_cache;
+static volatile uint32_t crt_env_lock;
+
+static void crt_env_lock_acquire(void)
+{
+    while (__sync_lock_test_and_set(&crt_env_lock, 1)) {
+        for (int spin = 0; spin < 100; spin++)
+            __asm__ volatile ("pause" ::: "memory");
+        sched_yield();
+    }
+}
+
+static void crt_env_lock_release(void)
+{
+    __sync_lock_release(&crt_env_lock);
+}
+
+static CRT_ENV_VALUE_CACHE *crt_env_value_cache(void)
+{
+    DWORD pid = GetCurrentProcessId();
+    DWORD tid = GetCurrentThreadId();
+
+    crt_env_lock_acquire();
+    for (CRT_ENV_VALUE_CACHE *cache = crt_env_values; cache;
+         cache = cache->next) {
+        if (cache->pid == pid && cache->tid == tid) {
+            crt_env_lock_release();
+            return cache;
+        }
+    }
+
+    CRT_ENV_VALUE_CACHE *cache = (CRT_ENV_VALUE_CACHE *)kmalloc(sizeof(*cache));
+    if (cache) {
+        cache->pid = pid;
+        cache->tid = tid;
+        cache->narrow = NULL;
+        cache->narrow_capacity = 0;
+        cache->wide = NULL;
+        cache->wide_capacity = 0;
+        cache->next = crt_env_values;
+        crt_env_values = cache;
+    }
+    crt_env_lock_release();
+    return cache;
+}
+
+static BOOL crt_env_user_buffer(PVOID buffer, SIZE_T bytes)
+{
+    if (!buffer) return FALSE;
+    if (!g_compat32_mode) return TRUE;
+
+    ULONG_PTR address = (ULONG_PTR)buffer;
+    return address <= UINT32_MAX && bytes - 1 <= UINT32_MAX - address;
+}
+
+char* WINAPI crt_getenv(const char *name)
+{
+    if (!name || !*name) {
+        *crt_errno() = CRT_EINVAL;
+        return NULL;
+    }
+    DWORD required = GetEnvironmentVariableA(name, NULL, 0);
+    if (!required) return NULL;
+
+    CRT_ENV_VALUE_CACHE *cache = crt_env_value_cache();
+    if (!cache) {
+        *crt_errno() = CRT_ENOMEM;
+        return NULL;
+    }
+    if (required > cache->narrow_capacity) {
+        char *buffer = (char *)crt_realloc(cache->narrow, required);
+        if (!crt_env_user_buffer(buffer, required)) {
+            if (buffer) crt_free(buffer);
+            cache->narrow = NULL;
+            cache->narrow_capacity = 0;
+            *crt_errno() = CRT_ENOMEM;
+            return NULL;
+        }
+        cache->narrow = buffer;
+        cache->narrow_capacity = required;
+    }
+    GetEnvironmentVariableA(name, cache->narrow,
+                            (DWORD)cache->narrow_capacity);
+    *crt_errno() = 0;
+    return cache->narrow;
+}
+
+WCHAR* WINAPI crt_wgetenv(const WCHAR *name)
+{
+    if (!name || !*name) {
+        *crt_errno() = CRT_EINVAL;
+        return NULL;
+    }
+    DWORD required = GetEnvironmentVariableW(name, NULL, 0);
+    if (!required) return NULL;
+
+    CRT_ENV_VALUE_CACHE *cache = crt_env_value_cache();
+    if (!cache) {
+        *crt_errno() = CRT_ENOMEM;
+        return NULL;
+    }
+    SIZE_T bytes = (SIZE_T)required * sizeof(WCHAR);
+    if (required > cache->wide_capacity) {
+        WCHAR *buffer = (WCHAR *)crt_realloc(cache->wide, bytes);
+        if (!crt_env_user_buffer(buffer, bytes)) {
+            if (buffer) crt_free(buffer);
+            cache->wide = NULL;
+            cache->wide_capacity = 0;
+            *crt_errno() = CRT_ENOMEM;
+            return NULL;
+        }
+        cache->wide = buffer;
+        cache->wide_capacity = required;
+    }
+    GetEnvironmentVariableW(name, cache->wide,
+                            (DWORD)cache->wide_capacity);
+    *crt_errno() = 0;
+    return cache->wide;
+}
+
+int WINAPI crt_putenv_s(const char *name, const char *value)
+{
+    if (!name || !*name || !value) {
+        *crt_errno() = CRT_EINVAL;
+        return CRT_EINVAL;
+    }
+    if (!SetEnvironmentVariableA(name, *value ? value : NULL)) {
+        int error = crt_errno_from_last_error();
+        *crt_errno() = error;
+        return error;
+    }
+    *crt_errno() = 0;
+    return 0;
+}
+
+int WINAPI crt_wputenv_s(const WCHAR *name, const WCHAR *value)
+{
+    if (!name || !*name || !value) {
+        *crt_errno() = CRT_EINVAL;
+        return CRT_EINVAL;
+    }
+    if (!SetEnvironmentVariableW(name, *value ? value : NULL)) {
+        int error = crt_errno_from_last_error();
+        *crt_errno() = error;
+        return error;
+    }
+    *crt_errno() = 0;
+    return 0;
+}
+
+int WINAPI crt_putenv(const char *assignment)
+{
+    if (!assignment) {
+        *crt_errno() = CRT_EINVAL;
+        return -1;
+    }
+    SIZE_T separator = assignment[0] == '=' ? 1 : 0;
+    while (assignment[separator] && assignment[separator] != '=') separator++;
+    if (!separator || !assignment[separator] || separator >= 64) {
+        *crt_errno() = CRT_EINVAL;
+        return -1;
+    }
+    char name[64];
+    for (SIZE_T i = 0; i < separator; i++) name[i] = assignment[i];
+    name[separator] = 0;
+    return crt_putenv_s(name, assignment + separator + 1) ? -1 : 0;
+}
+
+int WINAPI crt_wputenv(const WCHAR *assignment)
+{
+    if (!assignment) {
+        *crt_errno() = CRT_EINVAL;
+        return -1;
+    }
+    SIZE_T separator = assignment[0] == '=' ? 1 : 0;
+    while (assignment[separator] && assignment[separator] != '=') separator++;
+    if (!separator || !assignment[separator] || separator >= 64) {
+        *crt_errno() = CRT_EINVAL;
+        return -1;
+    }
+    WCHAR name[64];
+    for (SIZE_T i = 0; i < separator; i++) name[i] = assignment[i];
+    name[separator] = 0;
+    return crt_wputenv_s(name, assignment + separator + 1) ? -1 : 0;
+}
+
+WCHAR*** WINAPI crt_p_wenviron(void)
+{
+    DWORD pid = GetCurrentProcessId();
+    CRT_WENV_CACHE *cache = NULL;
+    BOOL is_32bit = g_compat32_mode;
+
+    crt_env_lock_acquire();
+    for (CRT_WENV_CACHE *candidate = crt_wenv_cache; candidate;
+         candidate = candidate->next) {
+        if (candidate->pid == pid) {
+            cache = candidate;
+            break;
+        }
+    }
+    if (!cache) {
+        cache = (CRT_WENV_CACHE *)kmalloc(sizeof(*cache));
+        if (!cache) {
+            crt_env_lock_release();
+            *crt_errno() = CRT_ENOMEM;
+            return NULL;
+        }
+        cache->pid = pid;
+        cache->is_32bit = is_32bit;
+        cache->block = NULL;
+        cache->block_capacity = 0;
+        cache->entries = NULL;
+        cache->entry_capacity = 0;
+        cache->view_cell = NULL;
+        cache->next = crt_wenv_cache;
+        crt_wenv_cache = cache;
+    }
+
+    SIZE_T chars = kernel32_build_environment_block_w(pid, NULL, 0);
+    if (chars < 2) chars = 2;
+    SIZE_T entries_capacity = chars + 1;
+    if (chars > cache->block_capacity) {
+        WCHAR *block = (WCHAR *)crt_realloc(cache->block,
+                                             chars * sizeof(WCHAR));
+        if (!crt_env_user_buffer(block, chars * sizeof(WCHAR))) {
+            if (block) crt_free(block);
+            cache->block = NULL;
+            cache->block_capacity = 0;
+            crt_env_lock_release();
+            *crt_errno() = CRT_ENOMEM;
+            return NULL;
+        }
+        cache->block = block;
+        cache->block_capacity = chars;
+    }
+    if (entries_capacity > cache->entry_capacity) {
+        SIZE_T entry_size = is_32bit ? sizeof(uint32_t) : sizeof(WCHAR *);
+        SIZE_T entries_bytes = entries_capacity * entry_size;
+        PVOID entries = crt_realloc(cache->entries, entries_bytes);
+        if (!crt_env_user_buffer(entries, entries_bytes)) {
+            if (entries) crt_free(entries);
+            cache->entries = NULL;
+            cache->entry_capacity = 0;
+            crt_env_lock_release();
+            *crt_errno() = CRT_ENOMEM;
+            return NULL;
+        }
+        cache->entries = entries;
+        cache->entry_capacity = entries_capacity;
+    }
+    if (!cache->view_cell) {
+        SIZE_T cell_size = is_32bit ? sizeof(uint32_t) : sizeof(WCHAR **);
+        cache->view_cell = crt_malloc(cell_size);
+        if (!crt_env_user_buffer(cache->view_cell, cell_size)) {
+            if (cache->view_cell) crt_free(cache->view_cell);
+            cache->view_cell = NULL;
+            crt_env_lock_release();
+            *crt_errno() = CRT_ENOMEM;
+            return NULL;
+        }
+    }
+
+    kernel32_build_environment_block_w(pid, cache->block,
+                                        cache->block_capacity);
+    SIZE_T offset = 0;
+    SIZE_T count = 0;
+    while (offset < chars && cache->block[offset]) {
+        if (is_32bit)
+            ((uint32_t *)cache->entries)[count++] =
+                (uint32_t)(ULONG_PTR)(cache->block + offset);
+        else
+            ((WCHAR **)cache->entries)[count++] = cache->block + offset;
+        while (offset < chars && cache->block[offset]) offset++;
+        offset++;
+    }
+    if (is_32bit) {
+        ((uint32_t *)cache->entries)[count] = 0;
+        *(uint32_t *)cache->view_cell = (uint32_t)(ULONG_PTR)cache->entries;
+    } else {
+        ((WCHAR **)cache->entries)[count] = NULL;
+        *(WCHAR ***)cache->view_cell = (WCHAR **)cache->entries;
+    }
+    WCHAR ***result = (WCHAR ***)cache->view_cell;
+    crt_env_lock_release();
+    *crt_errno() = 0;
+    return result;
+}
+
+static void crt_env_release_process(DWORD process_id)
+{
+    CRT_ENV_VALUE_CACHE *released_values = NULL;
+    CRT_WENV_CACHE *released_wenv = NULL;
+
+    crt_env_lock_acquire();
+    CRT_ENV_VALUE_CACHE **value_link = &crt_env_values;
+    while (*value_link) {
+        CRT_ENV_VALUE_CACHE *cache = *value_link;
+        if (cache->pid != process_id) {
+            value_link = &cache->next;
+            continue;
+        }
+        *value_link = cache->next;
+        cache->next = released_values;
+        released_values = cache;
+    }
+
+    CRT_WENV_CACHE **wenv_link = &crt_wenv_cache;
+    while (*wenv_link) {
+        CRT_WENV_CACHE *cache = *wenv_link;
+        if (cache->pid != process_id) {
+            wenv_link = &cache->next;
+            continue;
+        }
+        *wenv_link = cache->next;
+        cache->next = released_wenv;
+        released_wenv = cache;
+    }
+    crt_env_lock_release();
+
+    /* User buffers belong to the process VM and are released with it. Only
+     * the kernel-side cache metadata needs explicit reclamation here. */
+    while (released_values) {
+        CRT_ENV_VALUE_CACHE *next = released_values->next;
+        kfree(released_values);
+        released_values = next;
+    }
+    while (released_wenv) {
+        CRT_WENV_CACHE *next = released_wenv->next;
+        kfree(released_wenv);
+        released_wenv = next;
+    }
+}
+
+char* WINAPI crt_getcwd(char *buffer, int max_length)
+{
+    if (max_length <= 0) {
+        *crt_errno() = CRT_EINVAL;
+        return NULL;
+    }
+    BOOL allocated = buffer == NULL;
+    if (allocated) buffer = (char *)crt_malloc((SIZE_T)max_length);
+    if (!buffer) {
+        *crt_errno() = CRT_ENOMEM;
+        return NULL;
+    }
+    DWORD length = GetCurrentDirectoryA((DWORD)max_length, buffer);
+    if (!length || length >= (DWORD)max_length) {
+        if (allocated) crt_free(buffer);
+        *crt_errno() = CRT_ERANGE;
+        return NULL;
+    }
+    *crt_errno() = 0;
+    return buffer;
+}
+
+WCHAR* WINAPI crt_wgetcwd(WCHAR *buffer, int max_length)
+{
+    if (max_length <= 0) {
+        *crt_errno() = CRT_EINVAL;
+        return NULL;
+    }
+    BOOL allocated = buffer == NULL;
+    if (allocated)
+        buffer = (WCHAR *)crt_malloc((SIZE_T)max_length * sizeof(WCHAR));
+    if (!buffer) {
+        *crt_errno() = CRT_ENOMEM;
+        return NULL;
+    }
+    DWORD length = GetCurrentDirectoryW((DWORD)max_length, buffer);
+    if (!length || length >= (DWORD)max_length) {
+        if (allocated) crt_free(buffer);
+        *crt_errno() = CRT_ERANGE;
+        return NULL;
+    }
+    *crt_errno() = 0;
+    return buffer;
+}
+
+/* Path resolution */
+
+char* WINAPI crt_fullpath(char *absolute, const char *relative,
+                          SIZE_T max_length)
+{
+    char resolved[260];
+    if (!relative) {
+        *crt_errno() = CRT_EINVAL;
+        return NULL;
+    }
+
+    DWORD length = GetFullPathNameA(relative, sizeof(resolved), resolved, NULL);
+    if (!length || length >= sizeof(resolved)) {
+        *crt_errno() = length ? CRT_ENAMETOOLONG : CRT_EINVAL;
+        return NULL;
+    }
+
+    BOOL allocated = absolute == NULL;
+    if (!allocated && (max_length == 0 || (SIZE_T)length >= max_length)) {
+        *crt_errno() = max_length ? CRT_ERANGE : CRT_EINVAL;
+        return NULL;
+    }
+    if (allocated) {
+        absolute = (char *)crt_malloc((SIZE_T)length + 1);
+        if (!absolute) {
+            *crt_errno() = CRT_ENOMEM;
+            return NULL;
+        }
+    }
+
+    memcpy(absolute, resolved, (SIZE_T)length + 1);
+    *crt_errno() = 0;
+    return absolute;
+}
+
+WCHAR* WINAPI crt_wfullpath(WCHAR *absolute, const WCHAR *relative,
+                            SIZE_T max_length)
+{
+    WCHAR resolved[260];
+    if (!relative) {
+        *crt_errno() = CRT_EINVAL;
+        return NULL;
+    }
+
+    DWORD length = GetFullPathNameW(relative, 260, resolved, NULL);
+    if (!length || length >= 260) {
+        *crt_errno() = length ? CRT_ENAMETOOLONG : CRT_EINVAL;
+        return NULL;
+    }
+
+    BOOL allocated = absolute == NULL;
+    if (!allocated && (max_length == 0 || (SIZE_T)length >= max_length)) {
+        *crt_errno() = max_length ? CRT_ERANGE : CRT_EINVAL;
+        return NULL;
+    }
+    if (allocated) {
+        absolute = (WCHAR *)crt_malloc(((SIZE_T)length + 1) * sizeof(WCHAR));
+        if (!absolute) {
+            *crt_errno() = CRT_ENOMEM;
+            return NULL;
+        }
+    }
+
+    memcpy(absolute, resolved, ((SIZE_T)length + 1) * sizeof(WCHAR));
+    *crt_errno() = 0;
+    return absolute;
+}
 
 /* ── Base SEH handler (catch-all for unhandled exceptions) ── */
 
@@ -4176,14 +8034,25 @@ static const MSVCRT_EXPORT msvcrt_exports[] = {
     { "_initterm_e",         (PVOID)_initterm_e,      2, CC_CDECL },
     { "__getmainargs",       (PVOID)__getmainargs,    5, CC_CDECL },
     { "__wgetmainargs",      (PVOID)__wgetmainargs,   5, CC_CDECL },
+    { "__crtGetShowWindowMode", (PVOID)__crtGetShowWindowMode, 0, CC_CDECL },
+    { "__crtSetUnhandledExceptionFilter",
+                            (PVOID)SetUnhandledExceptionFilter, 1, CC_CDECL },
     { "__set_app_type",      (PVOID)__set_app_type,   1, CC_CDECL },
+    { "_set_app_type",       (PVOID)__set_app_type,   1, CC_CDECL },
+    { "_set_fmode",          (PVOID)crt_set_fmode,    1, CC_CDECL },
+    { "_get_fmode",          (PVOID)crt_get_fmode,    1, CC_CDECL },
     { "_set_new_mode",       (PVOID)_set_new_mode,    1, CC_CDECL },
+    { "?_set_new_mode@@YAHH@Z", (PVOID)_set_new_mode, 1, CC_CDECL },
+    { "?_set_new_handler@@YAP6AHI@ZP6AHI@Z@Z",
+                              (PVOID)crt_set_new_handler, 1, CC_CDECL },
 
     /* Memory */
     { "malloc",              (PVOID)crt_malloc,       1, CC_CDECL },
+    { "_malloc_crt",         (PVOID)crt_malloc,       1, CC_CDECL },
     { "calloc",              (PVOID)crt_calloc,       2, CC_CDECL },
     { "realloc",             (PVOID)crt_realloc,      2, CC_CDECL },
     { "free",                (PVOID)crt_free,         1, CC_CDECL },
+    { "_msize",              (PVOID)crt_msize,        1, CC_CDECL },
     { "?malloc@@YAPEAX_K@Z", (PVOID)crt_malloc,       1, CC_CDECL },  /* C++ mangled (64-bit) */
     { "?free@@YAXPEAX@Z",   (PVOID)crt_free,          1, CC_CDECL },
     /* MSVC 32-bit operator new/delete — used by C++ code via MSVCRT */
@@ -4201,27 +8070,39 @@ static const MSVCRT_EXPORT msvcrt_exports[] = {
     { "_strcmpi",            (PVOID)crt_stricmp,      2, CC_CDECL },
     { "strcpy",              (PVOID)crt_strcpy,       2, CC_CDECL },
     { "strncpy",             (PVOID)crt_strncpy,      3, CC_CDECL },
+    { "strncpy_s",           (PVOID)crt_strncpy_s,    4, CC_CDECL },
     { "strcat",              (PVOID)crt_strcat,       2, CC_CDECL },
     { "strstr",              (PVOID)crt_strstr,       2, CC_CDECL },
     { "strchr",              (PVOID)crt_strchr,       2, CC_CDECL },
     { "strrchr",             (PVOID)crt_strrchr,      2, CC_CDECL },
+    { "_strdup",             (PVOID)crt_strdup,       1, CC_CDECL },
+    { "strcspn",             (PVOID)crt_strcspn,      2, CC_CDECL },
+    { "strpbrk",             (PVOID)crt_strpbrk,      2, CC_CDECL },
+    { "strtok_s",            (PVOID)crt_strtok_s,     3, CC_CDECL },
 
     /* Memory ops */
     { "memcpy",              (PVOID)crt_memcpy,       3, CC_CDECL },
     { "memset",              (PVOID)crt_memset,       3, CC_CDECL },
     { "memmove",             (PVOID)crt_memmove,      3, CC_CDECL },
     { "memcmp",              (PVOID)crt_memcmp,       3, CC_CDECL },
+    { "memchr",              (PVOID)crt_memchr,       3, CC_CDECL },
 
     /* Format I/O (variadic → fixed-param count) */
-    { "printf",              (PVOID)crt_printf,       1, CC_CDECL },
-    { "sprintf",             (PVOID)crt_sprintf,      2, CC_CDECL },
-    { "_snprintf",           (PVOID)crt_snprintf,     3, CC_CDECL },
+    { "printf",              (PVOID)crt_printf,       1, CC_CDECL | CC_VARIADIC },
+    { "sprintf",             (PVOID)crt_sprintf,      2, CC_CDECL | CC_VARIADIC },
+    { "_snprintf",           (PVOID)crt_snprintf,     3, CC_CDECL | CC_VARIADIC },
+    { "_snprintf_s",         (PVOID)crt_snprintf_s,   4, CC_CDECL | CC_VARIADIC },
     { "_vsnprintf",          (PVOID)crt_vsnprintf,    4, CC_CDECL },
-    { "fprintf",             (PVOID)crt_fprintf,      2, CC_CDECL },
+    { "fprintf",             (PVOID)crt_fprintf,      2, CC_CDECL | CC_VARIADIC },
     { "vprintf",             (PVOID)crt_vprintf,      2, CC_CDECL },
     { "vsprintf",            (PVOID)crt_vsprintf,     3, CC_CDECL },
     { "vfprintf",            (PVOID)crt_vfprintf,     3, CC_CDECL },
-    { "sscanf",              (PVOID)crt_sscanf,       2, CC_CDECL },
+    { "__stdio_common_vsprintf",
+                            (PVOID)crt_stdio_common_vsprintf, 6, CC_CDECL },
+    { "__stdio_common_vswprintf",
+                            (PVOID)crt_stdio_common_vswprintf, 6, CC_CDECL },
+    { "sscanf",              (PVOID)crt_sscanf,       2, CC_CDECL | CC_VARIADIC },
+    { "sscanf_s",            (PVOID)crt_sscanf,       2, CC_CDECL | CC_VARIADIC },
     { "puts",                (PVOID)crt_puts,         1, CC_CDECL },
     { "putchar",             (PVOID)crt_putchar,      1, CC_CDECL },
 
@@ -4237,17 +8118,42 @@ static const MSVCRT_EXPORT msvcrt_exports[] = {
     { "feof",                (PVOID)crt_feof,         1, CC_CDECL },
     { "ferror",              (PVOID)crt_ferror,       1, CC_CDECL },
     { "fgetc",               (PVOID)crt_fgetc,        1, CC_CDECL },
+    { "getc",                (PVOID)crt_fgetc,        1, CC_CDECL },
     { "fputc",               (PVOID)crt_fputc,        2, CC_CDECL },
     { "fgets",               (PVOID)crt_fgets,        3, CC_CDECL },
     { "fputs",               (PVOID)crt_fputs,        2, CC_CDECL },
     { "ungetc",              (PVOID)crt_ungetc,       2, CC_CDECL },
-    { "__iob_func",          (PVOID)crt_iob_func,     1, CC_CDECL },
-    { "__acrt_iob_func",     (PVOID)crt_iob_func,     1, CC_CDECL },
+    { "clearerr",            (PVOID)crt_clearerr,     1, CC_CDECL },
+    { "rewind",              (PVOID)crt_rewind,       1, CC_CDECL },
+    { "setvbuf",             (PVOID)crt_setvbuf,      4, CC_CDECL },
+    { "_fileno",             (PVOID)crt_fileno,       1, CC_CDECL },
+    { "fileno",              (PVOID)crt_fileno,       1, CC_CDECL },
+    { "__iob_func",          (PVOID)crt_iob_func,     0, CC_CDECL },
+    { "__acrt_iob_func",     (PVOID)crt_acrt_iob_func, 1, CC_CDECL },
+
+    /* Low-level UCRT descriptors. */
+    { "_get_osfhandle",      (PVOID)crt_get_osfhandle, 1, CC_CDECL },
+    { "_open_osfhandle",     (PVOID)crt_open_osfhandle, 2, CC_CDECL },
+    { "_open",               (PVOID)crt_open,          3, CC_CDECL },
+    { "?_open@@YAHPBDHH@Z",  (PVOID)crt_open,          3, CC_CDECL },
+    { "_wopen",              (PVOID)crt_wopen,         3, CC_CDECL },
+    { "_close",              (PVOID)crt_close,         1, CC_CDECL },
+    { "_read",               (PVOID)crt_read,          3, CC_CDECL },
+    { "_write",              (PVOID)crt_write,         3, CC_CDECL },
+    { "_lseek",              (PVOID)crt_lseek,         3, CC_CDECL },
+    { "_lseeki64",           (PVOID)crt_lseeki64,      4, CC_CDECL },
+    { "_dup",                (PVOID)crt_dup,           1, CC_CDECL },
+    { "_dup2",               (PVOID)crt_dup2,          2, CC_CDECL },
+    { "_commit",             (PVOID)crt_commit,        1, CC_CDECL },
+    { "_isatty",             (PVOID)crt_isatty,        1, CC_CDECL },
+    { "_setmode",            (PVOID)crt_setmode,       2, CC_CDECL },
+    { "_chsize_s",           (PVOID)crt_chsize_s,      2, CC_CDECL },
 
     /* Conversion */
     { "atoi",                (PVOID)crt_atoi,         1, CC_CDECL },
     { "atol",                (PVOID)crt_atol,         1, CC_CDECL },
     { "atof",                (PVOID)crt_atof,         1, CC_CDECL },
+    { "abs",                 (PVOID)crt_abs,          1, CC_CDECL },
     { "strtol",              (PVOID)crt_strtol,       3, CC_CDECL },
     { "strtoul",             (PVOID)crt_strtoul,      3, CC_CDECL },
 
@@ -4257,7 +8163,39 @@ static const MSVCRT_EXPORT msvcrt_exports[] = {
     { "_exit",               (PVOID)crt__exit,        1, CC_CDECL },
     { "_cexit",              (PVOID)crt_exit,         1, CC_CDECL },
     { "_c_exit",             (PVOID)crt__exit,        1, CC_CDECL },
+    { "_getpid",             (PVOID)crt_getpid,       0, CC_CDECL },
+    { "_beginthreadex",      (PVOID)crt_beginthreadex, 6, CC_CDECL },
+    { "_endthreadex",        (PVOID)crt_endthreadex,   1, CC_CDECL },
     { "atexit",              (PVOID)crt_atexit,       1, CC_CDECL },
+    { "_crt_atexit",         (PVOID)crt_atexit,       1, CC_CDECL },
+    { "_configure_narrow_argv",
+                            (PVOID)crt_configure_narrow_argv, 1, CC_CDECL },
+    { "_initialize_narrow_environment",
+                            (PVOID)crt_initialize_narrow_environment, 0, CC_CDECL },
+    { "_get_narrow_winmain_command_line",
+                            (PVOID)crt_get_narrow_winmain_command_line,
+                            0, CC_CDECL },
+    { "getenv",              (PVOID)crt_getenv,       1, CC_CDECL },
+    { "_wgetenv",            (PVOID)crt_wgetenv,      1, CC_CDECL },
+    { "_putenv",             (PVOID)crt_putenv,       1, CC_CDECL },
+    { "_wputenv",            (PVOID)crt_wputenv,      1, CC_CDECL },
+    { "_putenv_s",           (PVOID)crt_putenv_s,     2, CC_CDECL },
+    { "_wputenv_s",          (PVOID)crt_wputenv_s,    2, CC_CDECL },
+    { "__p__wenviron",       (PVOID)crt_p_wenviron,   0, CC_CDECL },
+    { "_initialize_onexit_table",
+                            (PVOID)crt_initialize_onexit_table, 1, CC_CDECL },
+    { "_register_onexit_function",
+                            (PVOID)crt_register_onexit_function, 2, CC_CDECL },
+    { "_execute_onexit_table",
+                            (PVOID)crt_execute_onexit_table, 1, CC_CDECL },
+    { "_set_thread_local_invalid_parameter_handler",
+                            (PVOID)crt_set_thread_local_invalid_parameter_handler,
+                            1, CC_CDECL },
+
+    /* Locale */
+    { "setlocale",           (PVOID)crt_setlocale,    2, CC_CDECL },
+    { "_wsetlocale",         (PVOID)crt_wsetlocale,   2, CC_CDECL },
+    { "localeconv",          (PVOID)crt_localeconv,   0, CC_CDECL },
 
     /* ctype */
     { "isalpha",             (PVOID)crt_isalpha,      1, CC_CDECL },
@@ -4269,6 +8207,17 @@ static const MSVCRT_EXPORT msvcrt_exports[] = {
     { "isprint",             (PVOID)crt_isprint,      1, CC_CDECL },
     { "toupper",             (PVOID)crt_toupper,      1, CC_CDECL },
     { "tolower",             (PVOID)crt_tolower,      1, CC_CDECL },
+    { "iswctype",            (PVOID)crt_iswctype,     2, CC_CDECL },
+    { "_iswctype",           (PVOID)crt_iswctype,     2, CC_CDECL },
+    { "iswalpha",            (PVOID)crt_iswalpha,     1, CC_CDECL },
+    { "iswalnum",            (PVOID)crt_iswalnum,     1, CC_CDECL },
+    { "iswdigit",            (PVOID)crt_iswdigit,     1, CC_CDECL },
+    { "iswspace",            (PVOID)crt_iswspace,     1, CC_CDECL },
+    { "iswupper",            (PVOID)crt_iswupper,     1, CC_CDECL },
+    { "iswlower",            (PVOID)crt_iswlower,     1, CC_CDECL },
+    { "iswprint",            (PVOID)crt_iswprint,     1, CC_CDECL },
+    { "towupper",            (PVOID)crt_towupper,     1, CC_CDECL },
+    { "towlower",            (PVOID)crt_towlower,     1, CC_CDECL },
 
     /* Algorithm */
     { "qsort",               (PVOID)crt_qsort,        4, CC_CDECL },
@@ -4276,41 +8225,64 @@ static const MSVCRT_EXPORT msvcrt_exports[] = {
 
     /* Error */
     { "_errno",              (PVOID)crt_errno,        0, CC_CDECL },
+    { "__doserrno",          (PVOID)crt_doserrno,     0, CC_CDECL },
+    { "__sys_errlist",       (PVOID)crt_sys_errlist,  0, CC_CDECL },
+    { "__sys_nerr",          (PVOID)crt_sys_nerr,     0, CC_CDECL },
+    { "strerror",            (PVOID)crt_strerror,     1, CC_CDECL },
+    { "__fpe_flt_rounds",    (PVOID)crt_fpe_flt_rounds, 0, CC_CDECL },
 
     /* Time */
     { "time",                (PVOID)crt_time,         1, CC_CDECL },
+    { "_time64",             (PVOID)crt_time64,       1, CC_CDECL },
     { "clock",               (PVOID)crt_clock,        0, CC_CDECL },
+    { "_tzset",              (PVOID)crt_tzset,        0, CC_CDECL },
+    { "__timezone",          (PVOID)crt_timezone,     0, CC_CDECL },
+    { "__daylight",          (PVOID)crt_daylight,     0, CC_CDECL },
+    { "_gmtime64_s",         (PVOID)crt_gmtime64_s,   2, CC_CDECL },
+    { "_localtime64",        (PVOID)crt_localtime64,  1, CC_CDECL },
+    { "_localtime64_s",      (PVOID)crt_localtime64_s, 2, CC_CDECL },
+    { "_mktime64",           (PVOID)crt_mktime64,     1, CC_CDECL },
+    { "strftime",            (PVOID)crt_strftime,     4, CC_CDECL },
+    { "_sleep",              (PVOID)crt_sleep,        1, CC_CDECL },
 
     /* SEH */
     { "_except_handler3",    (PVOID)crt_except_handler3, 4, CC_CDECL },
     { "_except_handler4",    (PVOID)crt_except_handler4, 4, CC_CDECL },
     { "_XcptFilter",         (PVOID)crt_XcptFilter,   2, CC_CDECL },
+    { "_setjmp",             (PVOID)crt_compat32_setjmp_marker,
+                                                        1, CC_CDECL },
+    { "_setjmp3",            (PVOID)crt_compat32_setjmp3_marker,
+                                                        2, CC_CDECL },
+    { "longjmp",             (PVOID)crt_compat32_longjmp_marker,
+                                                        2, CC_CDECL },
+    { "_longjmpex",          (PVOID)crt_compat32_longjmp_marker,
+                                                        2, CC_CDECL },
 
     /* Misc CRT internal */
     { "_controlfp_s",        (PVOID)crt_controlfp_s,  3, CC_CDECL },
     { "_configthreadlocale", (PVOID)crt_configthreadlocale, 1, CC_CDECL },
     { "_lock",               (PVOID)crt_lock,         1, CC_CDECL },
     { "_unlock",             (PVOID)crt_unlock,       1, CC_CDECL },
-    { "__CxxFrameHandler3",  (PVOID)crt_except_handler3, 4, CC_CDECL },
+    { "__CxxFrameHandler3",  (PVOID)crt_CxxFrameHandler, 4, CC_CDECL },
     { "__CxxFrameHandler4",  (PVOID)crt_except_handler4, 4, CC_CDECL },
     { "_CRT_DEBUGGER_HOOK",  (PVOID)crt_crt_debugger_hook, 1, CC_CDECL },
+    { "_crt_debugger_hook",  (PVOID)crt_crt_debugger_hook, 1, CC_CDECL },
     { "_encoded_null",       (PVOID)crt_encoded_null, 0, CC_CDECL },
     { "_amsg_exit",          (PVOID)crt_amsg_exit,    1, CC_CDECL },
 
     /* C++ EH / UT99 required stubs */
     { "??1type_info@@UAE@XZ", (PVOID)crt_type_info_dtor, 0, CC_THISCALL },
+    { "__std_type_info_destroy_list", (PVOID)crt_std_type_info_destroy_list, 1, CC_CDECL },
     { "_CxxThrowException",  (PVOID)crt_CxxThrowException, 2, CC_CDECL },
     { "__CxxFrameHandler",   (PVOID)crt_CxxFrameHandler, 4, CC_CDECL },
     { "__dllonexit",         (PVOID)crt_dllonexit,    3, CC_CDECL },
     { "__p__commode",        (PVOID)crt_p_commode,    0, CC_CDECL },
     { "__p__fmode",          (PVOID)crt_p_fmode,      0, CC_CDECL },
-    { "_commode",            (PVOID)&crt_commode_val, 0, CC_CDECL },  /* data export */
-    { "_fmode",              (PVOID)&crt_fmode_val,   0, CC_CDECL },  /* data export */
     { "__C_specific_handler",(PVOID)crt_C_specific_handler, 4, CC_CDECL },
-    { "__initenv",           (PVOID)&crt_initenv_val, 0, CC_CDECL },  /* data export */
+    WX_DATA("__initenv",      &crt_initenv_val),
     { "signal",              (PVOID)crt_signal,       2, CC_CDECL },
     { "__setusermatherr",    (PVOID)crt_setusermatherr, 1, CC_CDECL },
-    { "_acmdln",             (PVOID)crt_acmdln,       0, CC_CDECL },
+    WX_DATA("_acmdln",        &crt_acmdln_val),
     { "_adjust_fdiv",        (PVOID)crt_adjust_fdiv,  0, CC_CDECL },
     { "_controlfp",          (PVOID)crt_controlfp,    2, CC_CDECL },
     { "_ftol",               (PVOID)crt_ftol,         2, CC_CDECL },  /* double = 2 DWORDs */
@@ -4323,8 +8295,18 @@ static const MSVCRT_EXPORT msvcrt_exports[] = {
     { "_CIfmod",             (PVOID)crt_CIfmod,       4, CC_CDECL },  /* 2 doubles = 4 DWORDs */
     { "_CIpow",              (PVOID)crt_CIpow,        4, CC_CDECL },  /* 2 doubles = 4 DWORDs */
     { "_isnan",              (PVOID)crt_isnan,        2, CC_CDECL },  /* double = 2 DWORDs */
+    { "_dclass",             (PVOID)crt_dclass,       2, CC_CDECL },  /* double = 2 DWORDs */
+    { "_fdclass",            (PVOID)crt_fdclass,      1, CC_CDECL },
     { "_stat",               (PVOID)crt_stat,         2, CC_CDECL },
+    { "_stat32",             (PVOID)crt_stat32,       2, CC_CDECL },
+    { "_stat32i64",          (PVOID)crt_stat32i64,    2, CC_CDECL },
+    { "_stat64i32",          (PVOID)crt_stat64i32,    2, CC_CDECL },
+    { "_stat64",             (PVOID)crt_stat64,       2, CC_CDECL },
     { "_wstat",              (PVOID)crt_wstat,        2, CC_CDECL },
+    { "_wstat32",            (PVOID)crt_wstat32,      2, CC_CDECL },
+    { "_wstat32i64",         (PVOID)crt_wstat32i64,   2, CC_CDECL },
+    { "_wstat64i32",         (PVOID)crt_wstat64i32,   2, CC_CDECL },
+    { "_wstat64",            (PVOID)crt_wstat64,      2, CC_CDECL },
     { "_strdate",            (PVOID)crt_strdate,      1, CC_CDECL },
     { "_strtime",            (PVOID)crt_strtime,      1, CC_CDECL },
     { "_wstrdate",           (PVOID)crt_wstrdate,     1, CC_CDECL },
@@ -4336,6 +8318,8 @@ static const MSVCRT_EXPORT msvcrt_exports[] = {
     { "_wtoi",               (PVOID)crt_wtoi,         1, CC_CDECL },
     { "ceil",                (PVOID)crt_ceil,         2, CC_CDECL },  /* double = 2 DWORDs */
     { "floor",               (PVOID)crt_floor,        2, CC_CDECL },  /* double = 2 DWORDs */
+    { "fabs",                (PVOID)crt_fabs,         2, CC_CDECL },  /* double = 2 DWORDs */
+    { "sqrt",                (PVOID)crt_sqrt,         2, CC_CDECL },  /* double = 2 DWORDs */
     { "difftime",            (PVOID)crt_difftime,     2, CC_CDECL },  /* 2× long (time_t) */
     { "gmtime",              (PVOID)crt_gmtime,       1, CC_CDECL },
     { "mktime",              (PVOID)crt_mktime,       1, CC_CDECL },
@@ -4343,17 +8327,30 @@ static const MSVCRT_EXPORT msvcrt_exports[] = {
     { "srand",               (PVOID)crt_srand,        1, CC_CDECL },
     { "strncat",             (PVOID)crt_strncat,      3, CC_CDECL },
     { "wcscat",              (PVOID)crt_wcscat,       2, CC_CDECL },
+    { "wcscat_s",            (PVOID)crt_wcscat_s,     3, CC_CDECL },
     { "wcschr",              (PVOID)crt_wcschr,       2, CC_CDECL },
+    { "wcsrchr",             (PVOID)crt_wcsrchr,      2, CC_CDECL },
+    { "wcscoll",             (PVOID)crt_wcscoll,      2, CC_CDECL },
     { "wcscmp",              (PVOID)crt_wcscmp,       2, CC_CDECL },
     { "wcscpy",              (PVOID)crt_wcscpy,       2, CC_CDECL },
+    { "wcscpy_s",            (PVOID)crt_wcscpy_s,     3, CC_CDECL },
+    { "_wcsdup",             (PVOID)crt_wcsdup,       1, CC_CDECL },
     { "wcslen",              (PVOID)crt_wcslen,       1, CC_CDECL },
+    { "wcsnlen",             (PVOID)crt_wcsnlen,      2, CC_CDECL },
     { "wcsncmp",             (PVOID)crt_wcsncmp,      3, CC_CDECL },
     { "wcsncpy",             (PVOID)crt_wcsncpy,      3, CC_CDECL },
+    { "wcsncpy_s",           (PVOID)crt_wcsncpy_s,    4, CC_CDECL },
     { "wcsstr",              (PVOID)crt_wcsstr,       2, CC_CDECL },
+    { "wcstok_s",            (PVOID)crt_wcstok_s,     3, CC_CDECL },
+    { "wcsxfrm",             (PVOID)crt_wcsxfrm,      3, CC_CDECL },
     { "wcstoul",             (PVOID)crt_wcstoul,      3, CC_CDECL },
     /* File access */
     { "_access",             (PVOID)crt_access,       2, CC_CDECL },
     { "_waccess",            (PVOID)crt_waccess,      2, CC_CDECL },
+    { "_getcwd",             (PVOID)crt_getcwd,       2, CC_CDECL },
+    { "_wgetcwd",            (PVOID)crt_wgetcwd,      2, CC_CDECL },
+    { "_fullpath",           (PVOID)crt_fullpath,     3, CC_CDECL },
+    { "_wfullpath",          (PVOID)crt_wfullpath,    3, CC_CDECL },
 
     /* CRT globals (as accessor functions through INT 0x2E) */
     { "_fltused",            (PVOID)crt_fltused,      0, CC_CDECL },
@@ -4365,7 +8362,6 @@ static const MSVCRT_EXPORT msvcrt_exports[] = {
     /* Stubs for bundled MSVCRT.dll imports */
     { "_getch",              (PVOID)crt_getch_stub,   0, CC_CDECL },
     { "_kbhit",              (PVOID)crt_kbhit_stub,   0, CC_CDECL },
-    { "_putenv",             (PVOID)crt_putenv_stub,  1, CC_CDECL },
 
     { NULL, NULL, 0, CC_CDECL }
 };
@@ -4385,6 +8381,13 @@ PVOID msvcrt_resolve(const char *func_name, USHORT ordinal, BOOL by_ordinal)
 {
     if (by_ordinal) return NULL;
 
+    /* These CRT data exports are process-local writable variables. Resolve
+     * them when each image is loaded instead of exposing kernel .data. */
+    if (msvcrt_strcmp(func_name, "_commode") == 0)
+        return (PVOID)crt_p_commode();
+    if (msvcrt_strcmp(func_name, "_fmode") == 0)
+        return (PVOID)crt_p_fmode();
+
     for (int i = 0; msvcrt_exports[i].name; i++) {
         if (msvcrt_strcmp(func_name, msvcrt_exports[i].name) == 0)
             return msvcrt_exports[i].func;
@@ -4396,6 +8399,20 @@ PVOID msvcrt_resolve(const char *func_name, USHORT ordinal, BOOL by_ordinal)
 PVOID msvcrt_shim_init(void)
 {
     ensure_stdio_init();
+    win32_abi_register_compat32_bridge((PVOID)crt_printf,
+                                        (PVOID)crt_printf_compat32);
+    win32_abi_register_compat32_bridge((PVOID)crt_sprintf,
+                                        (PVOID)crt_sprintf_compat32);
+    win32_abi_register_compat32_bridge((PVOID)crt_snprintf,
+                                        (PVOID)crt_snprintf_compat32);
+    win32_abi_register_compat32_bridge((PVOID)crt_snprintf_s,
+                                        (PVOID)crt_snprintf_s_compat32);
+    win32_abi_register_compat32_bridge((PVOID)crt_fprintf,
+                                        (PVOID)crt_fprintf_compat32);
+    win32_abi_register_compat32_bridge((PVOID)crt_sscanf,
+                                        (PVOID)crt_sscanf_compat32);
+    win32_abi_register_compat32_bridge((PVOID)crt_lseeki64,
+                                        (PVOID)crt_lseeki64_compat32);
     /* Re-exec resets. stub_gmalloc_installed is a one-shot whose stub vtable
      * holds thunks into the PREVIOUS run's thunk pool (compat32_init re-allocates
      * it) — must rebuild. The FMW Free router likewise re-installs on the freshly
