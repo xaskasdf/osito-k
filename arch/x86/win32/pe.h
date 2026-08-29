@@ -294,6 +294,15 @@ typedef struct _IMAGE_BASE_RELOCATION {
 
 /* ── TLS Directory ──────────────────────────────────────────── */
 
+typedef struct _IMAGE_TLS_DIRECTORY32 {
+    ULONG StartAddressOfRawData;
+    ULONG EndAddressOfRawData;
+    ULONG AddressOfIndex;           /* PULONG */
+    ULONG AddressOfCallBacks;       /* PIMAGE_TLS_CALLBACK* */
+    ULONG SizeOfZeroFill;
+    ULONG Characteristics;
+} IMAGE_TLS_DIRECTORY32, *PIMAGE_TLS_DIRECTORY32;
+
 typedef struct _IMAGE_TLS_DIRECTORY64 {
     ULONGLONG StartAddressOfRawData;
     ULONGLONG EndAddressOfRawData;
@@ -323,7 +332,33 @@ typedef struct _PE_IMAGE_INFO {
 
 NTSTATUS pe_load(const BYTE *file_data, SIZE_T file_size,
                  PPE_IMAGE_INFO info);
+NTSTATUS pe_load_named(const BYTE *file_data, SIZE_T file_size,
+                       PPE_IMAGE_INFO info, const char *image_name);
 void     pe_unload(PPE_IMAGE_INFO info);
+NTSTATUS compat32_attach_tls(PPE_IMAGE_INFO info);
+
+/* Apply final page permissions after relocations and IAT fixups, before
+ * invoking TLS callbacks or the image entry point. */
+NTSTATUS pe_finalize_image_protections(PPE_IMAGE_INFO info);
+int      pe_protection_selftest(void);
+
+/* Required-import diagnostics. Compatibility mode records unresolved imports
+ * without failing the image; strict mode matches NT load-time failure. */
+void pe_import_diagnostics_dump(void);
+void pe_import_diagnostics_clear(void);
+void pe_import_set_strict(BOOL enabled);
+BOOL pe_import_get_strict(void);
+
+/* Backing allocator used by PE images and synthetic loader modules. */
+PVOID pe_alloc(PVOID preferred, SIZE_T size, BOOL is_32bit);
+void  pe_free(PVOID addr, SIZE_T size);
+void  pe_free_for_owner(PVOID addr, SIZE_T size, ULONG owner_pid);
+
+/* PE images are mapped outside the VirtualAlloc VMA tracker. These helpers
+ * let NtAllocateVirtualMemory/NtQueryVirtualMemory treat them as occupied. */
+BOOL pe_va_range_conflicts(ULONGLONG base, ULONGLONG size);
+BOOL pe_va_query_range(ULONGLONG address, ULONGLONG *base,
+                       ULONGLONG *size, ULONGLONG *next_base);
 
 /* ── Helper macros ──────────────────────────────────────────── */
 

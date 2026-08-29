@@ -57,7 +57,8 @@ int main(int argc, char **argv)
     printf("Version:        %u\n", sb.version);
     printf("Block size:     "); osfs2_print_size(sb.block_size); printf("\n");
     printf("Total blocks:   %u\n", sb.total_blocks);
-    uint32_t data_start = osfs2_data_start_blk(sb.block_size);
+    uint32_t data_start = osfs2_format_data_start_blk(sb.version,
+                                                       sb.block_size);
     printf("Used blocks:    %u (metadata: %u, data: %u)\n",
            sb.used_blocks, data_start,
            sb.used_blocks > data_start ?
@@ -235,10 +236,10 @@ int main(int argc, char **argv)
         printf("  GGUF:     %u (", gguf_count);
         osfs2_print_size(gguf_bytes);
         printf(")\n");
-        printf("  Smallest: %s (", ft[smallest_idx].name);
+        printf("  Smallest: %s (", osfs2_entry_name(&ft[smallest_idx]));
         osfs2_print_size(smallest_size);
         printf(")\n");
-        printf("  Largest:  %s (", ft[largest_idx].name);
+        printf("  Largest:  %s (", osfs2_entry_name(&ft[largest_idx]));
         osfs2_print_size(largest_size);
         printf(")\n");
         printf("  Avg size: ");
@@ -258,14 +259,16 @@ int main(int argc, char **argv)
             time_t ot = (time_t)oldest_time;
             struct tm *otm = localtime(&ot);
             strftime(tbuf, sizeof(tbuf), "%Y-%m-%d %H:%M", otm);
-            printf("  Oldest:   %s (%s)\n", tbuf, ft[oldest_idx].name);
+            printf("  Oldest:   %s (%s)\n", tbuf,
+                   osfs2_entry_name(&ft[oldest_idx]));
         }
 
         if (newest_time > 0) {
             time_t nt = (time_t)newest_time;
             struct tm *ntm = localtime(&nt);
             strftime(tbuf, sizeof(tbuf), "%Y-%m-%d %H:%M", ntm);
-            printf("  Newest:   %s (%s)\n", tbuf, ft[newest_idx].name);
+            printf("  Newest:   %s (%s)\n", tbuf,
+                   osfs2_entry_name(&ft[newest_idx]));
         }
     }
 
@@ -277,7 +280,7 @@ int main(int argc, char **argv)
             if (!(ft[i].flags & OSFS2_FLAG_VALID)) continue;
             if (!(ft[i].flags & OSFS2_FLAG_GGUF))  continue;
 
-            printf("  %-28s %-8s", ft[i].name,
+            printf("  %-28s %-8s", osfs2_entry_name(&ft[i]),
                    osfs2_quant_name(ft[i].quant_type));
 
             if (ft[i].num_layers > 0 || ft[i].hidden_size > 0 ||

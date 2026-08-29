@@ -376,6 +376,17 @@ static volatile uint32_t ap_started_count;
 
 void smp_ap_entry(uint32_t cpu_index)
 {
+    /* TR is per logical CPU. Load the descriptor/stacks prepared by the BSP
+     * before the LAPIC timer can deliver an IST-backed interrupt. */
+    extern int x86_tss_load_ap(uint32_t cpu_index);
+    if (x86_tss_load_ap(cpu_index) < 0) {
+        for (;;) __asm__ volatile ("cli; hlt");
+    }
+
+    /* Interrupt entry reads TSC_AUX instead of LAPIC MMIO for CPU identity. */
+    extern void idt_set_current_apic_id(uint32_t apic_id);
+    idt_set_current_apic_id(cpus[cpu_index].apic_id);
+
     /* Initialize this AP's LAPIC */
     volatile uint32_t *apic = idt_get_apic_base();
     if (apic) {
@@ -492,6 +503,12 @@ static int start_ap(uint32_t cpu_index, uint8_t apic_id)
 {
     volatile uint32_t *apic = idt_get_apic_base();
     if (!apic) return -1;
+
+    extern int x86_tss_prepare_ap(uint32_t cpu_index);
+    if (x86_tss_prepare_ap(cpu_index) < 0) {
+        serial_puts("[SMP] Failed to prepare AP TSS/IST stacks\n");
+        return -1;
+    }
 
     /* Allocate AP stack */
     uint8_t *stack_mem = (uint8_t *)kmalloc(SMP_AP_STACK_SIZE);

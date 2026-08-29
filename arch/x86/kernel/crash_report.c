@@ -19,6 +19,7 @@ extern uint64_t idt_get_ticks(void);
 
 /* Forward decls for OsitoFS write (may not be available early boot) */
 extern void *osfs2_create(const char *name, uint64_t size);
+extern void *osfs2_find(const char *name);
 extern int   osfs2_write(void *file, uint64_t offset, const void *buf, uint64_t len);
 
 /* ── Crash report structure ─────────────────────────────────── */
@@ -240,14 +241,23 @@ void crash_report_save(uint64_t *frame, uint32_t vector, uint64_t fault_addr,
 
     serial_puts("  +--------------------------------------------------+\n\n");
 
-    /* Save to OsitoFS as crash_<pid>.bin */
-    crash_count++;
+    /* Crash counters restart at boot, while reports persist on disk. Pick the
+     * first free slot so an existing crash_001.bin does not hide later data. */
     char fname[32] = "crash_000.bin";
-    fname[6] = '0' + (crash_count / 100) % 10;
-    fname[7] = '0' + (crash_count / 10) % 10;
-    fname[8] = '0' + crash_count % 10;
+    bool have_name = false;
+    for (uint32_t attempt = 0; attempt < 999; attempt++) {
+        crash_count = (crash_count % 999) + 1;
+        fname[6] = '0' + (crash_count / 100) % 10;
+        fname[7] = '0' + (crash_count / 10) % 10;
+        fname[8] = '0' + crash_count % 10;
+        if (!osfs2_find(fname)) {
+            have_name = true;
+            break;
+        }
+    }
 
-    void *file = osfs2_create(fname, sizeof(crash_report_t));
+    void *file = have_name ? osfs2_create(fname, sizeof(crash_report_t))
+                           : NULL;
     if (file) {
         extern uint64_t osfs2_file_byte_offset(void *file);
         uint64_t off = osfs2_file_byte_offset(file);

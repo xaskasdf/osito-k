@@ -20,21 +20,35 @@
 .globl isr_common
 isr_common:
     /* AP fast-path: APs must not enter isr_handler (it accesses BSP-only
-     * state like sched_switch_rsp, process table, null page, etc.).
-     * Check LAPIC ID and do EOI + iretq immediately for non-BSP CPUs. */
+     * state like sched_switch_rsp, process table, null page, etc.). TSC_AUX
+     * caches the APIC ID per CPU and avoids a VM exit on every interrupt.
+     * Keep one LAPIC MMIO read as a fallback for CPUs without RDTSCP. */
     push %rax
+    push %rcx
+    push %rdx
+    cmpl   $0, isr_tsc_aux_enabled(%rip)
+    je     .Lisr_read_apic_id
+    rdtscp
+    movl   %ecx, %eax
+    jmp    .Lisr_have_apic_id
+.Lisr_read_apic_id:
     movabs $0xFFFF800000000000 + 0xFEE00020, %rax
     movl   (%rax), %eax
     shrl   $24, %eax
-    testl  %eax, %eax
-    jz     1f
+.Lisr_have_apic_id:
+    cmpl   bsp_apic_id_global(%rip), %eax
+    je     1f
     /* AP: EOI and return */
     movabs $0xFFFF800000000000 + 0xFEE000B0, %rax
     movl   $0, (%rax)
+    pop    %rdx
+    pop    %rcx
     pop    %rax
     add    $16, %rsp    /* skip vector + error_code */
     iretq
-1:  pop    %rax
+1:  pop    %rdx
+    pop    %rcx
+    pop    %rax
 
     /* Save all GPRs (BSP only from here) */
     push %rax
@@ -53,34 +67,35 @@ isr_common:
     push %r14
     push %r15
 
+    /* C requires DF clear. IRETQ restores the interrupted RFLAGS. */
+    cld
+
     /* Pass frame pointer as argument (RSP points to saved regs) */
     mov %rsp, %rdi
 
     /* Save FPU/SSE state into the currently-scheduled process's per-
      * process slot before calling the C handler. The handler may clobber
-     * xmm registers (memset/memcpy are emitted as SSE moves by gcc -O2),
-     * and a user-mode SSE instruction that triggered a demand-page-fault
-     * needs its xmm state preserved verbatim so the retried store writes
-     * the right bytes. If the handler decides to context-switch, it
+     * vector registers (optimized code may use SSE or AVX), and a user-mode
+     * vector instruction that triggered a demand-page-fault needs its state
+     * preserved verbatim so the retried instruction uses the right values.
+     * If the handler decides to context-switch, it
      * rewrites `fpu_state_ptr` to the incoming process's slot via
-     * `set_current_proc`, and the fxrstor64 on exit pulls the *new*
+     * `set_current_proc`, and the xrstor64 on exit pulls the *new*
      * process's state into the FPU — atomic with the GPR swap a few
      * instructions below. For the boot window before any process exists,
      * `fpu_state_ptr` points at the kernel-default buffer in process.c. */
-    /* Per-CPU fxsave: read LAPIC ID, index into fpu_state_ptrs[],
-     * and fxsave to the per-CPU buffer. Safe for both BSP and APs. */
+    /* APs returned above, so the BSP's cached ID selects the FPU slot. */
     push %rcx
-    movabs $0xFFFF800000000000 + 0xFEE00020, %rax
-    movl   (%rax), %eax
-    shrl   $24, %eax           /* eax = LAPIC ID (0..15) */
-    andl   $0xF, %eax          /* safety clamp */
+    movl   bsp_apic_id_global(%rip), %eax
     leaq   fpu_state_ptrs(%rip), %rcx
-    movq   (%rcx, %rax, 8), %rax  /* rax = fpu_state_ptrs[lapic_id] */
-    test   %rax, %rax
+    movq   (%rcx, %rax, 8), %rcx  /* rcx = fpu_state_ptrs[lapic_id] */
+    test   %rcx, %rcx
     jz     .Lfxsave_done
-    test   $0xF, %rax
+    test   $0x3F, %rcx
     jnz    .Lfxsave_done
-    fxsave64 (%rax)
+    movl   $0x7, %eax
+    xorl   %edx, %edx
+    xsave64 (%rcx)
 .Lfxsave_done:
     pop    %rcx
 
@@ -100,34 +115,23 @@ isr_common:
      * `fpu_state_ptr` while we were in C). */
     mov %rbp, %rsp
 
-    /* Per-CPU fxrstor: same LAPIC-indexed lookup as fxsave.
-     * For BSP, the scheduler may have rewritten fpu_state_ptrs[0]
-     * to the incoming process's FPU slot. */
+    /* The scheduler may have changed the BSP slot to the incoming process. */
     push %rcx
-    movabs $0xFFFF800000000000 + 0xFEE00020, %rax
-    movl   (%rax), %eax
-    shrl   $24, %eax
-    andl   $0xF, %eax
+    movl   bsp_apic_id_global(%rip), %eax
     leaq   fpu_state_ptrs(%rip), %rcx
-    movq   (%rcx, %rax, 8), %rax
-    test   %rax, %rax
+    movq   (%rcx, %rax, 8), %rcx
+    test   %rcx, %rcx
     jz     .Lskip_fxrstor
-    test   $0xF, %rax
+    test   $0x3F, %rcx
     jnz    .Lskip_fxrstor
-    fxrstor64 (%rax)
+    movl   $0x7, %eax
+    xorl   %edx, %edx
+    xrstor64 (%rcx)
 .Lskip_fxrstor:
     pop    %rcx
 
     /* ── Scheduler: check for context switch (X-SCHED) ────────── */
-    /* Only BSP (LAPIC 0) does context switches. APs must NOT touch
-     * sched_switch_rsp — it's set by BSP's sched_tick for BSP's
-     * own context switch. An AP reading it would steal the switch. */
-    movabs $0xFFFF800000000000 + 0xFEE00020, %rax
-    movl   (%rax), %eax
-    shrl   $24, %eax
-    testl  %eax, %eax
-    jnz    .Lno_switch       /* AP → skip context switch */
-
+    /* APs returned before isr_handler, so only the BSP reaches this point. */
     xor %rax, %rax
     xchg sched_switch_rsp(%rip), %rax
     test %rax, %rax
@@ -225,9 +229,12 @@ ISR_NOERR 33
 
 ISR_NOERR 40
 
-/* ── Vector 41: RTL8111 NIC MSI interrupt ────────────────────── */
+/* ── Vector 41: Win32 __fastfail (INT 0x29) ─────────────────── */
 
 ISR_NOERR 41
+
+/* Vector 42: RTL8111 NIC MSI interrupt. */
+ISR_NOERR 42
 
 /* ── Vector 0xFE: SMP work IPI (lightweight, no fxsave) ─────── */
 /* APs receive this to wake from HLT. Only does APIC EOI — no GPR

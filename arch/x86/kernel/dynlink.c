@@ -131,51 +131,51 @@ static uint64_t stub_unresolved(void) { return 0; }
  * directly instead of going through the SYSCALL instruction.
  * This also handles the case where libc's wrappers fail. */
 extern int64_t syscall_dispatch(uint64_t nr, uint64_t a1, uint64_t a2,
-                                 uint64_t a3, uint64_t a4, uint64_t a5);
+                                 uint64_t a3, uint64_t a4, uint64_t a5,
+                                 uint64_t a6);
 
 static int64_t kern_open(const char *path, int flags, int mode)
 {
     return syscall_dispatch(2/*SYS_OPEN*/, (uint64_t)path,
-                            (uint64_t)flags, (uint64_t)mode, 0, 0);
+                            (uint64_t)flags, (uint64_t)mode, 0, 0, 0);
 }
 
 static int64_t kern_close(int fd)
 {
-    return syscall_dispatch(3/*SYS_CLOSE*/, (uint64_t)fd, 0, 0, 0, 0);
+    return syscall_dispatch(3/*SYS_CLOSE*/, (uint64_t)fd, 0, 0, 0, 0, 0);
 }
 
 static int64_t kern_read(int fd, void *buf, uint64_t n)
 {
     return syscall_dispatch(0/*SYS_READ*/, (uint64_t)fd,
-                            (uint64_t)buf, n, 0, 0);
+                            (uint64_t)buf, n, 0, 0, 0);
 }
 
 static int64_t kern_write(int fd, const void *buf, uint64_t n)
 {
     return syscall_dispatch(1/*SYS_WRITE*/, (uint64_t)fd,
-                            (uint64_t)buf, n, 0, 0);
+                            (uint64_t)buf, n, 0, 0, 0);
 }
 
 static void *kern_mmap(void *addr, uint64_t len, int prot,
                         int flags, int fd, int64_t off)
 {
-    (void)off;
     int64_t r = syscall_dispatch(9/*SYS_MMAP*/, (uint64_t)addr, len,
-                                  (uint64_t)prot, (uint64_t)flags,
-                                  (uint64_t)fd);
+                                   (uint64_t)prot, (uint64_t)flags,
+                                   (uint64_t)fd, (uint64_t)off);
     return (void *)r;
 }
 
 static int kern_mprotect(void *addr, uint64_t len, int prot)
 {
     return (int)syscall_dispatch(10/*SYS_MPROTECT*/, (uint64_t)addr,
-                                 len, (uint64_t)prot, 0, 0);
+                                  len, (uint64_t)prot, 0, 0, 0);
 }
 
 static int kern_munmap(void *addr, uint64_t len)
 {
     return (int)syscall_dispatch(11/*SYS_MUNMAP*/, (uint64_t)addr,
-                                 len, 0, 0, 0);
+                                  len, 0, 0, 0, 0);
 }
 
 /* __tls_get_addr: reads DTV from %fs:8, returns dtv[module] + offset */

@@ -121,10 +121,10 @@ extern void net_udp_send(const uint8_t dst_ip[4], uint16_t dst_port,
                          uint16_t src_port, const void *data, uint32_t len);
 typedef void (*udp_handler_t)(const uint8_t *src_ip, uint16_t src_port,
                               const void *data, uint32_t len);
-extern void net_udp_listen(uint16_t port, udp_handler_t handler);
+extern int net_udp_listen(uint16_t port, udp_handler_t handler);
 
 /* OsitoFS */
-extern int osfs2_mount(uint64_t part_offset);
+extern int osfs2_mount(uint64_t part_offset, uint64_t part_size);
 extern void osfs2_list(void);
 extern bool osfs2_is_mounted(void);
 
@@ -614,11 +614,15 @@ void __initk kernel_entry(boot_info_t *info)
             virtio_gpu_init(pci_get_ecam_base(), vgpu->bus, vgpu->dev, vgpu->func,
                            info->fb_width, info->fb_height);
 
-            /* Vulkan Phase 1 -- Wave 1: 3D extension + selftest */
+            /* Vulkan Phase 1 -- Wave 1: 3D extension. Keep the active
+             * submit selftest behind a build flag; it sends synthetic 3D
+             * bytes that QEMU/virgl rejects on normal boot. */
             extern void virtio_gpu_3d_init(void);
-            extern void virtio_gpu_3d_selftest(void);
             virtio_gpu_3d_init();
+#ifdef OK_VG3D_SELFTEST
+            extern void virtio_gpu_3d_selftest(void);
             virtio_gpu_3d_selftest();
+#endif
         } else {
             serial_puts("[KERN] No virtio-GPU found\n");
         }
@@ -785,6 +789,12 @@ void __initk kernel_entry(boot_info_t *info)
 
             net_udp_listen(7777, prompt_handler);
 
+            /* Drive RX from process context. net_poll() may wake scheduler
+             * waiters and must not run while sched_tick owns an ISR frame. */
+            extern int net_start_poll_worker(void);
+            if (net_start_poll_worker() != 0)
+                serial_puts("[KERN] Failed to start net-rx worker\n");
+
             /* Agent task queue init (single-worker, 4 slots). Must run
              * before inferconnect_start so any incoming RPC agent_task
              * sees agent_is_initialized() = true. */
@@ -829,21 +839,6 @@ void __initk kernel_entry(boot_info_t *info)
                     vfs_find("cluster-delegate.txt", VFS_MODE_POSIX, &n))
                     cluster_delegate_probe_start();
             }
-
-            /* A12.4: load any previously-captured dynamic leaf-cert pins
-             * from osfs2 (`tls/pins.bin`). After the static intermediate
-             * pin validates a CF chain, we remember the leaf so the next
-             * handshake matches it directly — survives CF's ~90 d rotation
-             * without an operator rebuild. */
-            extern int cert_pin_load_dynamic(void);
-            cert_pin_load_dynamic();
-
-            /* A12.9: operator CA bundle — parse tls/roots.txt (one
-             * SHA-256 hex digest per line, `#` comments tolerated)
-             * and append each to the dynamic pin table. Lets the
-             * operator extend trust without rebuilding the kernel. */
-            extern int cert_pin_load_operator_roots(void);
-            cert_pin_load_operator_roots();
 
             /* TLS 1.3 key-schedule self-test (RFC 8448 §3 vectors).
              * Verifies hkdf_extract + hkdf_expand_label produce the
@@ -987,13 +982,13 @@ void __initk kernel_entry(boot_info_t *info)
              * can find OsitoFS by partition name or magic probe. */
             if (gpt_find_ositofs(&part_off, &part_size) == 0) {
                 if (osfs3_mount(part_off) == 0) fs_mounted = true;
-                else fs_mounted = (osfs2_mount(part_off) == 0);
+                else fs_mounted = (osfs2_mount(part_off, part_size) == 0);
             }
 
             /* (2) Raw OsitoFS at offset 0. */
             if (!fs_mounted) {
                 if (osfs3_mount(0) == 0) fs_mounted = true;
-                else fs_mounted = (osfs2_mount(0) == 0);
+                else fs_mounted = (osfs2_mount(0, 0) == 0);
             }
 
             /* (3) Magic scan at MB-aligned offsets — handles macOS-flashed
@@ -1019,7 +1014,8 @@ void __initk kernel_entry(boot_info_t *info)
                                      ((uint32_t)probe[1] << 8) |
                                      ((uint32_t)probe[2] << 16) |
                                      ((uint32_t)probe[3] << 24);
-                    if (magic != 0x4F534632 /* "OSF2" */) continue;
+                    if (magic != 0x4F534632 /* "OSF2" */ &&
+                        magic != 0x4F534633 /* "OSF3" */) continue;
 
                     serial_puts("[KERN] OSFS magic at +");
                     serial_putdec(probe_mb[k]);
@@ -1027,7 +1023,7 @@ void __initk kernel_entry(boot_info_t *info)
                     serial_puts(blkdev_name(i));
                     serial_puts("\n");
                     if (osfs3_mount(off) == 0) fs_mounted = true;
-                    else fs_mounted = (osfs2_mount(off) == 0);
+                    else fs_mounted = (osfs2_mount(off, 0) == 0);
                 }
             }
 
@@ -1051,7 +1047,14 @@ void __initk kernel_entry(boot_info_t *info)
     static llama_state_t llama;
     bool model_ready = false;
     if (fs_mounted) {
-        osfs2_list();
+        /* Certificate policy is persistent state, so load it only after the
+         * VFS is available. Endpoint pins and system trust remain separate. */
+        extern int cert_pin_load_dynamic(void);
+        extern int cert_pin_load_operator_roots(void);
+        extern int certmgr_load_system_roots(void);
+        cert_pin_load_dynamic();
+        cert_pin_load_operator_roots();
+        certmgr_load_system_roots();
 
         /* Cluster PSK (oict-key.txt) + cluster.json live on OsitoFS,
          * which only just mounted — cluster_init() ran earlier (before

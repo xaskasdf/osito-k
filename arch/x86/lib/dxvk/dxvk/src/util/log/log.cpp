@@ -91,6 +91,10 @@ namespace dxvk {
   
   
   std::string Logger::getFileName(const std::string& base) {
+#ifdef __OSITO_K__
+    (void)base;
+    return std::string();
+#else
     std::string path = env::getEnvVar("DXVK_LOG_PATH");
     
     if (path == "none")
@@ -106,6 +110,7 @@ namespace dxvk {
     std::string exeName = env::getExeBaseName();
     path += exeName + "_" + base;
     return path;
+#endif
   }
 
 

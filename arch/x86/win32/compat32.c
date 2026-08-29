@@ -19,19 +19,46 @@
 
 #include "compat32.h"
 #include "dllloader.h"
+#include "kernel32_shim.h"
+#include "msvcrt_shim.h"
 #include "wdbg.h"
 #include "win32_abi.h"
+#include "../include/paging.h"
+#include "../kernel/smp.h"
 
 extern void serial_puts(const char *s);
 extern void serial_puthex(uint64_t val, int digits);
 extern void serial_putdec(uint64_t val);
 extern void *mem_alloc_pages(uint64_t count);
+extern void mem_free_pages(void *addr, uint64_t count);
+extern void *kcalloc(uint64_t count, uint64_t size);
+extern void kfree(void *ptr);
 extern int  kern_setjmp(uint64_t *buf) __attribute__((returns_twice));
 extern void kern_longjmp(uint64_t *buf, int val);
 
+static int compat32_running_ut99(void)
+{
+    extern char win32_exe_name[64];
+    const char *base = win32_exe_name;
+    const char *want = "UnrealTournament.exe";
+
+    for (const char *p = base; *p; p++)
+        if (*p == '\\' || *p == '/') base = p + 1;
+    while (*base && *want) {
+        char a = *base++, b = *want++;
+        if (a >= 'A' && a <= 'Z') a += 'a' - 'A';
+        if (b >= 'A' && b <= 'Z') b += 'a' - 'A';
+        if (a != b) return 0;
+    }
+    return *base == 0 && *want == 0;
+}
+
 /* ── Global compat32 mode flag ────────────────────────────────── */
 
+#ifndef __KERNEL_X86__
 int g_compat32_mode = 0;
+#endif
+int g_compat32_ut99 = 0;
 uint32_t g_int2e_rsp_depth = 0; /* shared with int2e_stub.S */
 
 /* ── C++ EH unwind state (set by _CxxThrowException) ────────── */
@@ -39,14 +66,38 @@ uint32_t g_compat32_unwind_eip = 0;
 uint32_t g_compat32_last_stack_arg13 = 0;  /* for CreateWindowExW lpParam workaround */
 uint32_t g_compat32_unwind_esp = 0;
 uint32_t g_compat32_unwind_ebp = 0;
+uint32_t g_compat32_unwind_ebx = 0;
+uint32_t g_compat32_unwind_esi = 0;
+uint32_t g_compat32_unwind_edi = 0;
+uint32_t g_compat32_unwind_restore_nonvolatile = 0;
 
 /* ── Thunk state ─────────────────────────────────────────────── */
 
 #define THUNK_STUB_SIZE  64      /* bytes per thunk stub */
 #define THUNKS_PER_PAGE  (4096 / THUNK_STUB_SIZE)  /* 64 */
-#define THUNK_POOL_PAGES 32      /* 32 pages = 2048 thunks */
+#define THUNK_CODE_PAGES ((COMPAT32_MAX_THUNKS + THUNKS_PER_PAGE - 1) / \
+                          THUNKS_PER_PAGE)
+/* Keep callback/data stubs out of the final four regular thunk slots. */
+#define THUNK_POOL_PAGES (THUNK_CODE_PAGES + 1)
+#define THUNK_POOL_BYTES (THUNK_POOL_PAGES * 4096U)
+#define RUNTIME_QSORT_PAGE THUNK_POOL_PAGES
+#define RUNTIME_ATOF_PAGE  (RUNTIME_QSORT_PAGE + 1)
+#define RUNTIME_MATH_PAGE  (RUNTIME_ATOF_PAGE + 1)
+#define COMPAT32_RUNTIME_PAGES (RUNTIME_MATH_PAGE + 1)
+#define COMPAT32_RUNTIME_BYTES (COMPAT32_RUNTIME_PAGES * 4096U)
+#define THUNK_NAME_POOL_SIZE (COMPAT32_MAX_THUNKS * 256U)
+#define THUNK_NAME_MAX 512U
 
-static uint8_t *thunk_pool = NULL;
+/* The runtime is allocated once below the Win32 VirtualAlloc window. PE32
+ * code uses its physical address as a stable 32-bit VA; kernel code writes
+ * through the shared upper-half alias, which is valid in every CR3. */
+static uint8_t *thunk_pool = NULL;       /* upper-half writable alias */
+static uint64_t compat32_runtime_phys;
+static uint32_t compat32_runtime_addr;
+static volatile uint32_t compat32_runtime_state; /* 0=empty, 1=init, 2=ready */
+static char thunk_name_pool[THUNK_NAME_POOL_SIZE];
+static uint32_t thunk_name_pool_used;
+static spinlock_t thunk_table_lock = SPINLOCK_INIT;
 
 /* B3 fix: native 32-bit qsort/bsearch blob (clang -m32, position-independent,
  * no relocations; qsort@0, bsearch@0x1a0). Installed in PE-executable low memory
@@ -107,6 +158,97 @@ static uint32_t thunk_count = 0;
 
 static compat32_thunk_t thunk_table[COMPAT32_MAX_THUNKS];
 
+static const char *thunk_copy_name(const char *name)
+{
+    if (!name)
+        return NULL;
+
+    uint32_t len = 0;
+    while (name[len]) {
+        if (len + 1 >= THUNK_NAME_POOL_SIZE)
+            return NULL;
+        len++;
+    }
+
+    uint32_t bytes = len + 1;
+    uint32_t aligned = (bytes + 7U) & ~7U;
+    if (aligned > THUNK_NAME_POOL_SIZE - thunk_name_pool_used)
+        return NULL;
+
+    char *copy = &thunk_name_pool[thunk_name_pool_used];
+    for (uint32_t i = 0; i < bytes; i++)
+        copy[i] = name[i];
+    thunk_name_pool_used += aligned;
+    return copy;
+}
+
+BOOL compat32_runtime_range_conflicts(ULONGLONG base, ULONGLONG size)
+{
+    if (__atomic_load_n(&compat32_runtime_state, __ATOMIC_ACQUIRE) != 2 ||
+        !size || base + size < base)
+        return FALSE;
+
+    uint64_t runtime_base = compat32_runtime_addr;
+    uint64_t runtime_end = runtime_base + COMPAT32_RUNTIME_BYTES;
+    uint64_t end = base + size;
+    return base < runtime_end && end > runtime_base;
+}
+
+static int compat32_map_runtime_current(void)
+{
+    if (__atomic_load_n(&compat32_runtime_state, __ATOMIC_ACQUIRE) != 2)
+        return -1;
+
+#ifdef TEST_HARNESS
+    return 0;
+#else
+    extern uint64_t proc_current_cr3(void);
+    uint64_t cr3 = proc_current_cr3();
+    if (!cr3) cr3 = paging_get_kernel_cr3();
+    if (!cr3) return -1;
+
+    uint64_t last_offset = (COMPAT32_RUNTIME_PAGES - 1U) * 4096ULL;
+    uint64_t first = paging_translate_in_cr3(cr3, compat32_runtime_addr);
+    uint64_t last = paging_translate_in_cr3(
+        cr3, (uint64_t)compat32_runtime_addr + last_offset);
+    if ((first & ~0xFFFULL) == compat32_runtime_phys &&
+        (last & ~0xFFFULL) == compat32_runtime_phys + last_offset)
+        return 0;
+
+    int installed = 0;
+    for (uint64_t i = 0; i < COMPAT32_RUNTIME_PAGES; i++) {
+        uint64_t offset = i * 4096ULL;
+        uint64_t va = (uint64_t)compat32_runtime_addr + offset;
+        uint64_t phys = compat32_runtime_phys + offset;
+        uint64_t mapped = paging_translate_in_cr3(cr3, va);
+
+        if (mapped != UINT64_MAX && (mapped & ~0xFFFULL) != phys) {
+            serial_puts("[COMPAT32] runtime VA conflict at 0x");
+            serial_puthex(va, 8);
+            serial_puts(" mapped=0x");
+            serial_puthex(mapped, 16);
+            serial_puts("\n");
+            return -1;
+        }
+        if (mapped != UINT64_MAX)
+            continue;
+        if (paging_map_page_in_cr3(cr3, va, phys,
+                                   (1ULL << 0) | (1ULL << 1)) != 0)
+            return -1;
+        installed = 1;
+    }
+
+    if (installed) {
+        serial_puts("[COMPAT32] runtime mapped cr3=0x");
+        serial_puthex(cr3, 16);
+        serial_puts(" va=0x");
+        serial_puthex(compat32_runtime_addr, 8);
+        serial_puts("\n");
+    }
+    return 0;
+#endif
+}
+
 /* INT 0x2E now uses IST1 via TSS — no manual stack management needed */
 
 /* ── FName::Names diagnostic ────────────────────────────────── */
@@ -130,8 +272,13 @@ uint32_t g_gmalloc_addr = 0;
 /* Return stub address (32-bit code in thunk pool that INT 0x2Es back) */
 static uint32_t callback_return_stub_addr = 0;
 
-/* Stub for unresolved imports: XOR EAX,EAX; RET (returns 0) */
+/* Fallback for unresolved imports whose ABI cannot be determined. */
 static uint32_t unresolved_stub_addr = 0;
+
+static uint64_t WINAPI unresolved_import_zero(void)
+{
+    return 0;
+}
 static uint32_t compat32_data_area = 0;
 
 /* Stub for C++ catch funclet return: JMP EAX (continues at funclet's return value) */
@@ -149,12 +296,11 @@ static uint32_t catch_continue_stub_addr = 0;
  * own jmpbuf, return value, and stack.
  */
 #define MAX_CALLBACK_DEPTH    128
+/* Callback ownership is indexed by the scheduler's process-table slot. The
+ * owner table follows the scheduler's RAM-derived capacity so concurrent
+ * callbacks cannot longjmp into another task after the old fixed limit. */
 #define CALLBACK_STACK_SIZE   65536
 
-/* Force to .data section to change RIP-relative displacement encoding.
- * In BSS, the displacement contained 0xCC at a critical code address,
- * which QEMU TCG misinterpreted as INT3. */
-static int      callback_depth __attribute__((section(".data"))) = 0;
 /* kern_setjmp / kern_longjmp use a 9-quad jmp_buf:
  *   [0..5] callee-saved GPRs (rbx, rbp, r12-r15)
  *   [6]    rsp     [7] rip     [8] cr3
@@ -162,22 +308,147 @@ static int      callback_depth __attribute__((section(".data"))) = 0;
  * setjmp at depth N+1 wrote its rbx (slot[0]) on top of slot N's cr3 —
  * causing the depth=0 longjmp after _initterm to triple-fault on a
  * bogus 0x40 CR3. Must be at least 9. */
-static uint64_t callback_jmpbufs[MAX_CALLBACK_DEPTH][9];
-static uint64_t callback_saved_ist1[MAX_CALLBACK_DEPTH];
-/* Callback stacks allocated lazily (saves 2MB BSS).
- * Each depth level gets its own 64KB stack on first use. */
-static uint8_t *callback_stacks_ptr[MAX_CALLBACK_DEPTH];
+typedef struct {
+    int depth;
+    uint64_t jmpbufs[MAX_CALLBACK_DEPTH][9];
+    uint64_t saved_ist1[MAX_CALLBACK_DEPTH];
+    uint32_t saved_stack_args[MAX_CALLBACK_DEPTH];
+    uint8_t *stacks[MAX_CALLBACK_DEPTH];
+    DWORD stack_process_ids[MAX_CALLBACK_DEPTH];
+    uint32_t retvals[MAX_CALLBACK_DEPTH];
+    uint32_t current_stack_args;
+} callback_owner_state_t;
 
-static uint8_t *callback_stack_get(int depth) {
-    if (depth < 0 || depth >= MAX_CALLBACK_DEPTH) return NULL;
-    if (!callback_stacks_ptr[depth]) {
-        extern void *mem_alloc_aligned(uint64_t, uint64_t);
-        callback_stacks_ptr[depth] = (uint8_t *)mem_alloc_aligned(CALLBACK_STACK_SIZE, 16);
-    }
-    return callback_stacks_ptr[depth];
+/* One pointer per scheduler slot; owner state and callback stacks are lazy. */
+static callback_owner_state_t **callback_owners;
+static uint32_t callback_owner_capacity;
+static volatile uint32_t callback_owner_table_lock;
+
+static void callback_table_lock(void)
+{
+    while (__sync_lock_test_and_set(&callback_owner_table_lock, 1))
+        __asm__ volatile ("pause" ::: "memory");
 }
-/* Compat macro: callback_stack_get(depth) → callback_stack_get(depth) */
-#define callback_stacks(d) callback_stack_get(d)
+
+static void callback_table_unlock(void)
+{
+    __sync_lock_release(&callback_owner_table_lock);
+}
+
+static int callback_owner_table_ensure(void)
+{
+    if (__atomic_load_n(&callback_owners, __ATOMIC_ACQUIRE))
+        return 1;
+
+    callback_table_lock();
+    if (!callback_owners) {
+        extern uint32_t sched_capacity_get(void);
+        uint32_t capacity = sched_capacity_get();
+        callback_owner_state_t **owners =
+            (callback_owner_state_t **)kcalloc(capacity, sizeof(*owners));
+        if (!capacity || !owners) {
+            callback_table_unlock();
+            return 0;
+        }
+        callback_owner_capacity = capacity;
+        __atomic_store_n(&callback_owners, owners, __ATOMIC_RELEASE);
+    }
+    callback_table_unlock();
+    return 1;
+}
+
+static int callback_owner(void)
+{
+#ifndef TEST_HARNESS
+    extern int sched_current_get(void);
+    int owner = sched_current_get();
+    if (owner >= 0 && (uint32_t)owner < callback_owner_capacity)
+        return owner;
+#else
+    return 0;
+#endif
+    return -1;
+}
+
+static callback_owner_state_t *callback_state_get(int create, int *owner_out)
+{
+    if (!callback_owner_table_ensure())
+        return NULL;
+    int owner = callback_owner();
+    if (owner < 0)
+        return NULL;
+    if (owner_out)
+        *owner_out = owner;
+
+    callback_owner_state_t *state = __atomic_load_n(
+        &callback_owners[owner], __ATOMIC_ACQUIRE);
+    if (!state && create) {
+        callback_owner_state_t *fresh = (callback_owner_state_t *)kcalloc(
+            1, sizeof(*fresh));
+        if (!fresh)
+            return NULL;
+        callback_owner_state_t *expected = NULL;
+        if (!__atomic_compare_exchange_n(&callback_owners[owner], &expected,
+                                         fresh, FALSE, __ATOMIC_ACQ_REL,
+                                         __ATOMIC_ACQUIRE)) {
+            kfree(fresh);
+            state = expected;
+        } else {
+            state = fresh;
+        }
+    }
+    return state;
+}
+
+uint32_t compat32_current_user_stack_top(void)
+{
+#ifndef TEST_HARNESS
+    callback_owner_state_t *state = callback_state_get(0, NULL);
+    uint32_t stack_args = state ? state->current_stack_args : 0;
+    if (stack_args < sizeof(uint32_t))
+        return 0;
+
+    uint32_t stack_top = stack_args - sizeof(uint32_t);
+    TEB32 *teb = compat32_current_teb();
+    if (!teb || !teb->StackBase || !teb->StackLimit ||
+        stack_top < teb->StackLimit || stack_top > teb->StackBase ||
+        stack_top - teb->StackLimit < 64U)
+        return 0;
+    return stack_top;
+#else
+    return 0;
+#endif
+}
+
+static uint8_t *callback_stack_get(callback_owner_state_t *state, int depth)
+{
+    if (!state || depth < 0 || depth >= MAX_CALLBACK_DEPTH)
+        return NULL;
+    extern DWORD win32_current_process_id(void);
+    DWORD process_id = win32_current_process_id();
+    if (!process_id) process_id = 1;
+
+    /* Scheduler slots are reusable. A stack VMA from the previous process is
+     * not mapped in the new process even if the numeric slot is identical. */
+    if (state->stacks[depth] &&
+        state->stack_process_ids[depth] != process_id) {
+        state->stacks[depth] = NULL;
+        state->stack_process_ids[depth] = 0;
+    }
+    if (!state->stacks[depth]) {
+        uint8_t *stack = (uint8_t *)VirtualAlloc(
+            NULL, CALLBACK_STACK_SIZE, MEM_RESERVE | MEM_COMMIT,
+            PAGE_READWRITE);
+        if (!stack || (uint64_t)(ULONG_PTR)stack + CALLBACK_STACK_SIZE >
+                          UINT32_MAX) {
+            if (stack) VirtualFree(stack, 0, MEM_RELEASE);
+            return NULL;
+        }
+        state->stacks[depth] = stack;
+        state->stack_process_ids[depth] = process_id;
+    }
+    return state->stacks[depth];
+}
 
 /* The last 32-bit caller EIP (stack_args[-1] = the address right
  * after the CALL into a kernel32_shim API). Updated on every
@@ -199,15 +470,20 @@ uint32_t compat32_get_last_stack_args(void) { return g_last_stack_args; }
  * crash). Safe to add now that the IST1 stack-overflow is fixed. */
 const char *g_rcall_name[64];
 uint32_t    g_rcall_args[64][4];
+uint32_t    g_rcall_ret[64];
 uint8_t     g_rcall_nargs[64];
 uint32_t    g_rcall_caller[64];
+uint32_t    g_rcall_repeat[64];
+uint32_t    g_rcall_ebp[64];
+uint32_t    g_rcall_esp[64];
 uint32_t    g_rcall_idx = 0;
 
 void compat32_dump_recent_calls(void)
 {
     serial_puts("[RCALL] last native calls before fault (oldest->newest):\n");
-    uint32_t start = (g_rcall_idx >= 24) ? g_rcall_idx - 24 : 0;
-    for (uint32_t k = start; k < g_rcall_idx; k++) {
+    uint32_t end = g_rcall_idx;
+    uint32_t start = (end >= 64) ? end - 64 : 0;
+    for (uint32_t k = start; k < end; k++) {
         uint32_t ri = k & 63;
         serial_puts("  ");
         serial_putdec(k);
@@ -217,12 +493,22 @@ void compat32_dump_recent_calls(void)
         serial_putdec(g_rcall_nargs[ri]);
         serial_puts(" args) caller=0x");
         serial_puthex(g_rcall_caller[ri], 8);
+        serial_puts(" ebp=0x");
+        serial_puthex(g_rcall_ebp[ri], 8);
+        serial_puts(" esp=0x");
+        serial_puthex(g_rcall_esp[ri], 8);
+        if (g_rcall_repeat[ri] > 1) {
+            serial_puts(" repeat=");
+            serial_putdec(g_rcall_repeat[ri]);
+        }
         serial_puts(" a=[0x");
         serial_puthex(g_rcall_args[ri][0], 8);
         serial_puts(" 0x"); serial_puthex(g_rcall_args[ri][1], 8);
         serial_puts(" 0x"); serial_puthex(g_rcall_args[ri][2], 8);
         serial_puts(" 0x"); serial_puthex(g_rcall_args[ri][3], 8);
-        serial_puts("]\n");
+        serial_puts("] ret=0x");
+        serial_puthex(g_rcall_ret[ri], 8);
+        serial_puts("\n");
     }
 }
 
@@ -243,14 +529,6 @@ uint32_t compat32_get_last_user_esi(void) { return (uint32_t)g_int2e_user_rsi; }
 uint32_t compat32_get_last_user_edi(void) { return (uint32_t)g_int2e_user_rdi; }
 uint32_t compat32_get_last_user_ebp(void) { return (uint32_t)g_int2e_user_rbp; }
 uint32_t compat32_get_last_user_ebx(void) { return (uint32_t)g_int2e_user_rbx; }
-
-/*
- * Single global retval written by the 32-bit return stub (MOV [addr], EAX).
- * The stub uses a fixed address so we can't index by depth there.
- * The dispatch handler reads this and stores it before longjmp.
- */
-static uint32_t callback_retval = 0;           /* written by 32-bit return stub */
-static uint32_t callback_retval_per_depth[MAX_CALLBACK_DEPTH]; /* saved before longjmp */
 
 /* ── Thunk code generation ───────────────────────────────────── */
 
@@ -326,7 +604,7 @@ static void emit_thunk(uint8_t *code, uint64_t target, uint8_t num_args, uint8_t
      * the thunk pops N bytes, then the caller also does add esp,N or pop.
      * This corrupts the stack and causes wild jumps after a few calls.
      */
-    if (callconv == CC_CDECL || num_args == 0) {
+    if ((callconv & CC_CONVENTION_MASK) == CC_CDECL || num_args == 0) {
         code[p++] = 0xC3;  /* RET — caller will clean up args */
     } else {
         code[p++] = 0xC2;  /* RET imm16 — callee cleans (stdcall) */
@@ -345,70 +623,103 @@ static void emit_thunk(uint8_t *code, uint64_t target, uint8_t num_args, uint8_t
 
 void compat32_init(void)
 {
-    thunk_count = 0;
+    g_compat32_ut99 = compat32_running_ut99();
 
-    /* Re-exec reset: a relaunch arrives via ExitProcess (longjmp out of guest
-     * code), so any nested-callback bookkeeping from the previous run is stale —
-     * a leftover depth/jmpbuf would make the next callback unwind into the
-     * previous run's stack/CR3. callback_stacks_ptr is kept (stacks reusable). */
-    callback_depth = 0;
-    for (int i = 0; i < MAX_CALLBACK_DEPTH; i++)
-        for (int j = 0; j < 9; j++)
-            callback_jmpbufs[i][j] = 0;
+    /* Re-exec resets only this scheduler slot. Its prior callback-stack VMAs
+     * were released with the process address space. */
+    int owner = -1;
+    callback_owner_state_t *callback_state = callback_state_get(1, &owner);
+    if (!callback_state) {
+        serial_puts("[COMPAT32] Failed to allocate callback owner state\n");
+        return;
+    }
+    (void)owner;
+    memset(callback_state, 0, sizeof(*callback_state));
 
-    /* Allocate executable thunk pool in low memory */
-    thunk_pool = (uint8_t *)mem_alloc_pages(THUNK_POOL_PAGES);
-    if (!thunk_pool) {
-        serial_puts("[COMPAT32] Failed to allocate thunk pool!\n");
+    if (__atomic_load_n(&compat32_runtime_state, __ATOMIC_ACQUIRE) == 2) {
+        if (compat32_map_runtime_current() != 0)
+            serial_puts("[COMPAT32] Failed to map shared runtime\n");
         return;
     }
 
-    /* Fill with INT3 */
-    for (uint32_t i = 0; i < THUNK_POOL_PAGES * 4096; i++)
-        thunk_pool[i] = 0xCC;
-
-    serial_puts("[COMPAT32] Thunk pool at 0x");
-    serial_puthex((uint64_t)(ULONG_PTR)thunk_pool, 16);
-    serial_puts(" (");
-    serial_putdec(THUNKS_PER_PAGE * THUNK_POOL_PAGES);
-    serial_puts(" slots)\n");
-
-    /* B3: install the native 32-bit qsort/bsearch blob in a low (<4GB),
-     * executable page (same identity-mapped exec memory class as the thunk pool)
-     * so the MSVCRT qsort/bsearch imports can point at it and run in-mode. */
-    {
-        uint8_t *blob = (uint8_t *)mem_alloc_pages(1);
-        if (blob) {
-            for (uint32_t i = 0; i < (uint32_t)sizeof(qsort32_blob); i++)
-                blob[i] = qsort32_blob[i];
-            qsort32_blob_addr = (uint32_t)(ULONG_PTR)blob;
-            serial_puts("[COMPAT32] qsort32 blob at 0x");
-            serial_puthex(qsort32_blob_addr, 8);
-            serial_puts(" (bsearch +0x");
-            serial_puthex(QSORT32_BSEARCH_OFF, 4);
-            serial_puts(")\n");
-        }
+    uint32_t expected = 0;
+    if (!__atomic_compare_exchange_n(&compat32_runtime_state, &expected, 1,
+                                     FALSE, __ATOMIC_ACQ_REL,
+                                     __ATOMIC_ACQUIRE)) {
+        while (__atomic_load_n(&compat32_runtime_state, __ATOMIC_ACQUIRE) == 1)
+            __asm__ volatile ("pause");
+        if (__atomic_load_n(&compat32_runtime_state, __ATOMIC_ACQUIRE) == 2 &&
+            compat32_map_runtime_current() != 0)
+            serial_puts("[COMPAT32] Failed to map shared runtime\n");
+        return;
     }
 
-    /* MSVCRT atof returns a double in x87 ST(0) on i386. The regular INT 0x2E
-     * thunk returns only EAX/EDX, which leaves PE32 callers reading stale x87
-     * state. Install a small native decimal parser so Core.dll's appAtof sees
-     * a real ST(0) return value. */
+    thunk_count = 0;
+    thunk_name_pool_used = 0;
+    void *runtime_block = mem_alloc_pages(COMPAT32_RUNTIME_PAGES);
+    if (!runtime_block) {
+        serial_puts("[COMPAT32] Failed to allocate shared runtime!\n");
+        __atomic_store_n(&compat32_runtime_state, 0, __ATOMIC_RELEASE);
+        return;
+    }
+
+    compat32_runtime_phys = (uint64_t)(ULONG_PTR)runtime_block;
+#ifndef TEST_HARNESS
+    /* Keep the identity VA outside the Win32 VirtualAlloc window. */
+    if (compat32_runtime_phys + COMPAT32_RUNTIME_BYTES <
+            compat32_runtime_phys ||
+        compat32_runtime_phys + COMPAT32_RUNTIME_BYTES > 0x40000000ULL) {
+        serial_puts("[COMPAT32] No shared runtime space below 1GB\n");
+        mem_free_pages(runtime_block, COMPAT32_RUNTIME_PAGES);
+        compat32_runtime_phys = 0;
+        __atomic_store_n(&compat32_runtime_state, 0, __ATOMIC_RELEASE);
+        return;
+    }
+    thunk_pool = (uint8_t *)PHYS_TO_VIRT(compat32_runtime_phys);
+#else
+    thunk_pool = (uint8_t *)runtime_block;
+#endif
+    compat32_runtime_addr = (uint32_t)(ULONG_PTR)runtime_block;
+
+    for (uint32_t i = 0; i < COMPAT32_RUNTIME_BYTES; i++)
+        thunk_pool[i] = 0xCC;
+
+    serial_puts("[COMPAT32] Shared runtime at 0x");
+    serial_puthex(compat32_runtime_addr, 8);
+    serial_puts(" (");
+    serial_putdec(COMPAT32_MAX_THUNKS);
+    serial_puts(" thunk slots)\n");
+
+    /* Native PE32 qsort/bsearch and atof code uses the same persistent
+     * physical backing as the regular thunk pool. */
     {
-        uint8_t *blob = (uint8_t *)mem_alloc_pages(1);
-        if (blob) {
-            emit_atof32_blob(blob);
-            atof32_blob_addr = (uint32_t)(ULONG_PTR)blob;
-            serial_puts("[COMPAT32] atof32 blob at 0x");
-            serial_puthex(atof32_blob_addr, 8);
-            serial_puts("\n");
-        }
+        uint8_t *blob = thunk_pool + RUNTIME_QSORT_PAGE * 4096U;
+        for (uint32_t i = 0; i < (uint32_t)sizeof(qsort32_blob); i++)
+            blob[i] = qsort32_blob[i];
+        qsort32_blob_addr = compat32_runtime_addr +
+                            RUNTIME_QSORT_PAGE * 4096U;
+        serial_puts("[COMPAT32] qsort32 blob at 0x");
+        serial_puthex(qsort32_blob_addr, 8);
+        serial_puts(" (bsearch +0x");
+        serial_puthex(QSORT32_BSEARCH_OFF, 4);
+        serial_puts(")\n");
+    }
+
+    {
+        uint8_t *blob = thunk_pool + RUNTIME_ATOF_PAGE * 4096U;
+        emit_atof32_blob(blob);
+        atof32_blob_addr = compat32_runtime_addr +
+                           RUNTIME_ATOF_PAGE * 4096U;
+        serial_puts("[COMPAT32] atof32 blob at 0x");
+        serial_puthex(atof32_blob_addr, 8);
+        serial_puts("\n");
     }
 
 #ifdef TEST_HARNESS
     /* On Linux test harness, make thunk pool executable */
     #include <sys/mman.h>
-    mprotect(thunk_pool, THUNK_POOL_PAGES * 4096,
+    mprotect((void *)(ULONG_PTR)compat32_runtime_addr,
+             COMPAT32_RUNTIME_BYTES,
              PROT_READ | PROT_WRITE | PROT_EXEC);
 #endif
 
@@ -416,32 +727,28 @@ void compat32_init(void)
     /*
      * Install a "callback return stub" at the END of the thunk pool.
      * This is a 32-bit code snippet that a compat-mode function RETs to.
-     * It saves EAX (function return value) to a known address, then
-     * does INT 0x2E with a magic index to signal "callback complete".
+     * It copies EAX (function return value) to EDX, then does INT 0x2E
+     * with a magic index to signal "callback complete".
      *
-     * Code (18 bytes):
-     *   A3 xx xx xx xx       MOV [callback_retval], EAX  ; save return value
+     * Code (13 bytes):
+     *   89 C2                MOV EDX, EAX
      *   B8 FE FF FF FF       MOV EAX, 0xFFFFFFFE  (THUNK_CALLBACK_RETURN)
      *   B9 00 00 00 00       MOV ECX, 0
      *   CD 2E                INT 0x2E
      *   F4                   HLT  (should never reach here)
      */
     {
-        uint8_t *stub = thunk_pool + (THUNK_POOL_PAGES * 4096) - 24;
-        uint32_t retval_addr = (uint32_t)(ULONG_PTR)&callback_retval;
+        uint32_t offset = THUNK_POOL_BYTES - 24;
+        uint8_t *stub = thunk_pool + offset;
         int p = 0;
-        stub[p++] = 0xA3;  /* MOV [moffs32], EAX */
-        stub[p++] = (uint8_t)(retval_addr);
-        stub[p++] = (uint8_t)(retval_addr >> 8);
-        stub[p++] = (uint8_t)(retval_addr >> 16);
-        stub[p++] = (uint8_t)(retval_addr >> 24);
+        stub[p++] = 0x89; stub[p++] = 0xC2;  /* MOV EDX, EAX */
         stub[p++] = 0xB8;  /* MOV EAX, imm32 */
         stub[p++] = 0xFE; stub[p++] = 0xFF; stub[p++] = 0xFF; stub[p++] = 0xFF;
         stub[p++] = 0xB9;  /* MOV ECX, 0 */
         stub[p++] = 0x00; stub[p++] = 0x00; stub[p++] = 0x00; stub[p++] = 0x00;
         stub[p++] = 0xCD; stub[p++] = 0x2E;  /* INT 0x2E */
         stub[p++] = 0xF4;  /* HLT */
-        callback_return_stub_addr = (uint32_t)(ULONG_PTR)stub;
+        callback_return_stub_addr = compat32_runtime_addr + offset;
         serial_puts("[COMPAT32] Callback return stub at 0x");
         serial_puthex(callback_return_stub_addr, 8);
         serial_puts("\n");
@@ -453,10 +760,11 @@ void compat32_init(void)
      * wild jumps to RVA addresses left in the IAT.
      */
     {
-        uint8_t *stub = thunk_pool + (THUNK_POOL_PAGES * 4096) - 32;
+        uint32_t offset = THUNK_POOL_BYTES - 32;
+        uint8_t *stub = thunk_pool + offset;
         stub[0] = 0x31; stub[1] = 0xC0;  /* XOR EAX, EAX */
         stub[2] = 0xC3;                   /* RET */
-        unresolved_stub_addr = (uint32_t)(ULONG_PTR)stub;
+        unresolved_stub_addr = compat32_runtime_addr + offset;
     }
 
     /* Catch continuation stub: JMP EAX
@@ -466,9 +774,10 @@ void compat32_init(void)
      * JMP EAX continues execution at the establishing function's
      * code after the try/catch block. */
     {
-        uint8_t *stub = thunk_pool + (THUNK_POOL_PAGES * 4096) - 40;
+        uint32_t offset = THUNK_POOL_BYTES - 40;
+        uint8_t *stub = thunk_pool + offset;
         stub[0] = 0xFF; stub[1] = 0xE0;  /* JMP EAX */
-        catch_continue_stub_addr = (uint32_t)(ULONG_PTR)stub;
+        catch_continue_stub_addr = compat32_runtime_addr + offset;
     }
 
     /*
@@ -486,12 +795,13 @@ void compat32_init(void)
      *   +20: char   cmdline[64] = "UnrealTournament.exe"
      */
     {
-        uint8_t *data = thunk_pool + (THUNK_POOL_PAGES * 4096) - 256;
+        uint32_t offset = THUNK_POOL_BYTES - 256;
+        uint8_t *data = thunk_pool + offset;
         memset(data, 0, 128);
         /* _adjust_fdiv at +0 */
         *(int32_t *)(data + 0) = 0;
         /* _acmdln at +4: points to cmdline string at +20 */
-        *(uint32_t *)(data + 4) = (uint32_t)(ULONG_PTR)(data + 20);
+        *(uint32_t *)(data + 4) = compat32_runtime_addr + offset + 20;
         /* _commode at +8 */
         *(int32_t *)(data + 8) = 0;
         /* _fmode at +12 */
@@ -499,13 +809,13 @@ void compat32_init(void)
         /* __mb_cur_max at +16 */
         *(int32_t *)(data + 16) = 1;
         /* cmdline at +20 */
-        extern char win32_exe_name[64];
-        const char *cmd = win32_exe_name[0] ? win32_exe_name : "UnrealTournament.exe";
+        extern char win32_command_line[4096];
+        const char *cmd = win32_command_line[0] ? win32_command_line : "UnrealTournament.exe";
         int ci = 0;
         while (cmd[ci] && ci < 60) { data[20 + ci] = cmd[ci]; ci++; }
         data[20 + ci] = 0;
 
-        compat32_data_area = (uint32_t)(ULONG_PTR)data;
+        compat32_data_area = compat32_runtime_addr + offset;
         serial_puts("[COMPAT32] Data exports at 0x");
         serial_puthex(compat32_data_area, 8);
         serial_puts("\n");
@@ -513,9 +823,20 @@ void compat32_init(void)
 
     /* Initialize fast 32-bit x87 math functions (pow, fmod, acos).
      * These run natively in compat mode without INT 0x2E overhead. */
-    extern void compat32_init_fast_math(void);
-    compat32_init_fast_math();
+    extern void compat32_init_fast_math(uint8_t *, uint32_t);
+    compat32_init_fast_math(thunk_pool + RUNTIME_MATH_PAGE * 4096U,
+                            compat32_runtime_addr +
+                            RUNTIME_MATH_PAGE * 4096U);
 #endif
+
+    __atomic_store_n(&compat32_runtime_state, 2, __ATOMIC_RELEASE);
+    if (compat32_map_runtime_current() != 0)
+        serial_puts("[COMPAT32] Failed to map shared runtime\n");
+}
+
+BOOL compat32_is_initialized(void)
+{
+    return __atomic_load_n(&compat32_runtime_state, __ATOMIC_ACQUIRE) == 2;
 }
 
 /* ── Data export resolution ──────────────────────────────────
@@ -535,10 +856,17 @@ uint32_t compat32_resolve_data_import(const char *name)
             return compat32_data_area + 4;  /* _acmdln */
         if (name[1] == 'a' && name[2] == 'd' && name[3] == 'j') /* _adjust_fdiv */
             return compat32_data_area + 0;
-        if (name[1] == 'c' && name[2] == 'o' && name[3] == 'm') /* _commode */
-            return compat32_data_area + 8;
-        if (name[1] == 'f' && name[2] == 'm' && name[3] == 'o') /* _fmode */
-            return compat32_data_area + 12;
+        if (name[1] == 'c' && name[2] == 'o' && name[3] == 'm' &&
+            name[4] == 'm' && name[5] == 'o' && name[6] == 'd' &&
+            name[7] == 'e' && name[8] == 0) { /* _commode */
+            int *commode = crt_p_commode();
+            return (uint32_t)(ULONG_PTR)commode;
+        }
+        if (name[1] == 'f' && name[2] == 'm' && name[3] == 'o' &&
+            name[4] == 'd' && name[5] == 'e' && name[6] == 0) { /* _fmode */
+            int *fmode = crt_p_fmode();
+            return (uint32_t)(ULONG_PTR)fmode;
+        }
     }
     if (name[0] == '_' && name[1] == '_' && name[2] == 'm' && name[3] == 'b')
         return compat32_data_area + 16;  /* __mb_cur_max */
@@ -721,50 +1049,97 @@ static int is_atof_helper(const char *n)
            n[3] == 'f' && n[4] == 0;
 }
 
+static int thunk_name_equal(const char *a, const char *b)
+{
+    if (a == b) return 1;
+    if (!a || !b) return 0;
+    while (*a && *a == *b) { a++; b++; }
+    return *a == *b;
+}
+
 uint32_t compat32_make_thunk_ex(uint64_t target, const char *name,
                                  uint8_t num_args, uint8_t callconv)
 {
-    if (!thunk_pool) return 0;
+    if (!compat32_is_initialized()) return 0;
+
+    /* Import names normally point into a process-owned PE mapping. Copy the
+     * name before taking the global table lock so a malformed/stale mapping
+     * cannot leave every Win32 process spinning on a leaked lock. */
+    char local_name[THUNK_NAME_MAX];
+    const char *safe_name = NULL;
+    if (name) {
+        uint32_t i = 0;
+        while (i + 1 < THUNK_NAME_MAX && name[i]) {
+            local_name[i] = name[i];
+            i++;
+        }
+        if (i + 1 == THUNK_NAME_MAX && name[i]) {
+            serial_puts("[COMPAT32] Import name exceeds limit\n");
+            return 0;
+        }
+        local_name[i] = 0;
+        safe_name = local_name;
+    }
 
     /* B3: resolve qsort/bsearch to the native 32-bit blob (runs in-mode, calls
      * the comparator 32->32 native) instead of an INT 0x2E thunk into the 64-bit
      * crt_qsort, whose per-comparison compat32_callback_args round-trip corrupts
      * IST1 state and triple-faults New Game. */
-    if (qsort32_blob_addr && name) {
+    if (qsort32_blob_addr && safe_name) {
         const char *q = "qsort", *b = "bsearch";
         int mq = 1, mb = 1;
-        for (int i = 0; i < 6; i++) if (name[i] != q[i]) { mq = 0; break; }
-        for (int i = 0; i < 8; i++) if (name[i] != b[i]) { mb = 0; break; }
+        for (int i = 0; i < 6; i++) if (safe_name[i] != q[i]) { mq = 0; break; }
+        for (int i = 0; i < 8; i++) if (safe_name[i] != b[i]) { mb = 0; break; }
         if (mq) return qsort32_blob_addr;
         if (mb) return qsort32_blob_addr + QSORT32_BSEARCH_OFF;
     }
-    if (atof32_blob_addr && is_atof_helper(name))
+    if (atof32_blob_addr && is_atof_helper(safe_name))
         return atof32_blob_addr;
+
+    spin_lock(&thunk_table_lock);
+    for (uint32_t i = 0; i < thunk_count; i++) {
+        compat32_thunk_t *t = &thunk_table[i];
+        if (t->target_addr == target && t->num_args == num_args &&
+            t->callconv == callconv && thunk_name_equal(t->name, safe_name)) {
+            spin_unlock(&thunk_table_lock);
+            return t->thunk_addr;
+        }
+    }
     if (thunk_count >= COMPAT32_MAX_THUNKS) {
+        spin_unlock(&thunk_table_lock);
         serial_puts("[COMPAT32] Thunk table full!\n");
         return 0;
     }
 
     uint32_t idx = thunk_count;
     uint8_t *stub = thunk_pool + (idx * THUNK_STUB_SIZE);
+    uint32_t stub_addr = compat32_runtime_addr + idx * THUNK_STUB_SIZE;
+    const char *owned_name = thunk_copy_name(safe_name);
+    if (safe_name && !owned_name) {
+        spin_unlock(&thunk_table_lock);
+        serial_puts("[COMPAT32] Thunk name pool full!\n");
+        return 0;
+    }
 
     /* Generate thunk code — _ftol family runs as a native x87 stub (see above);
      * everything else goes through the INT 0x2E gateway. */
-    if (is_ftol_helper(name))
+    if (is_ftol_helper(safe_name))
         emit_ftol_stub(stub);
     else
         emit_thunk(stub, target, num_args, callconv);
 
     /* Record in table */
-    thunk_table[idx].thunk_addr  = (uint32_t)(ULONG_PTR)stub;
+    thunk_table[idx].thunk_addr  = stub_addr;
     thunk_table[idx].target_addr = target;
     thunk_table[idx].num_args    = num_args;
     thunk_table[idx].callconv    = callconv;
-    thunk_table[idx].name        = name;
+    /* Import names live inside PE mappings and disappear on module unload. */
+    thunk_table[idx].name        = owned_name;
 
     thunk_count++;
+    spin_unlock(&thunk_table_lock);
 
-    return (uint32_t)(ULONG_PTR)stub;
+    return stub_addr;
 }
 
 /*
@@ -786,6 +1161,8 @@ static uint8_t guess_num_args(const char *name)
         { "ExitProcess",           1 }, { "GetCurrentProcess",     0 },
         { "GetCurrentThread",      0 }, { "GetCurrentThreadId",    0 },
         { "GetCurrentProcessId",   0 }, { "CloseHandle",           1 },
+        { "SetHandleInformation",  3 },
+        { "MulDiv",                3 },
         { "GetCommandLineA",       0 }, { "GetCommandLineW",       0 },
         { "GetTickCount",          0 }, { "Sleep",                 1 },
         { "CreateFileA",           7 }, { "CreateFileW",           7 },
@@ -807,6 +1184,11 @@ static uint8_t guess_num_args(const char *name)
         { "GetSystemInfo",        1 }, { "GetVersionExA",         1 },
         { "QueryPerformanceCounter",   1 },
         { "QueryPerformanceFrequency", 1 },
+        { "QueryUnbiasedInterruptTimePrecise", 1 },
+        { "AcquireSRWLockShared",      1 },
+        { "TryAcquireSRWLockShared",   1 },
+        { "ReleaseSRWLockShared",      1 },
+        { "EnumResourceNamesW",        4 },
         { "GetStartupInfoA",      1 }, { "GetStartupInfoW",       1 },
         { "GetEnvironmentVariableA", 3 },
         { "GetSystemDirectoryA",  2 }, { "GetWindowsDirectoryA",  2 },
@@ -859,9 +1241,12 @@ static uint8_t guess_num_args(const char *name)
         { "TerminateProcess",     2 }, { "SetEnvironmentVariableA", 2 },
         { "SetEnvironmentVariableW", 2 }, { "FreeEnvironmentStringsA", 1 },
         { "GetEnvironmentStrings", 0 }, { "GetProcessWorkingSetSize", 3 },
+        { "QueryWorkingSetEx",     3 }, { "K32QueryWorkingSetEx", 3 },
         { "RemoveDirectoryA",     1 }, { "RemoveDirectoryW",     1 },
         { "FileTimeToSystemTime", 2 }, { "FileTimeToLocalFileTime", 2 },
         { "LocalFileTimeToFileTime", 2 }, { "SystemTimeToFileTime", 2 },
+        { "SystemTimeToTzSpecificLocalTime", 3 },
+        { "TzSpecificLocalTimeToSystemTime", 3 },
         { "SetConsoleCtrlHandler", 2 }, { "GetNumberOfConsoleInputEvents", 2 },
         { "PeekNamedPipe",        6 }, { "PeekConsoleInputA",    5 },
         { "ReadConsoleA",         5 }, { "ReadConsoleInputA",    5 },
@@ -895,9 +1280,20 @@ static uint8_t guess_num_args(const char *name)
         { "GetClipboardData",     1 }, { "GetDlgItem",           2 },
         { "GetMenu",              1 }, { "GetMenuItemCount",     1 },
         { "GetMenuState",         2 }, { "GetMessageTime",       0 },
+        { "GetCaretBlinkTime",    0 }, { "GetGuiResources",       2 },
+        { "GetKeyboardLayoutList", 2 },
+        { "ImmGetIMEFileNameW",   3 },
+        { "ImmGetIMEFileNameA",   3 }, { "ImmGetContext",         1 },
+        { "ImmReleaseContext",    2 }, { "ImmAssociateContext",   2 },
+        { "ImmGetCompositionStringW", 4 },
+        { "ImmSetCompositionStringW", 6 },
+        { "ImmGetCandidateListW", 4 }, { "ImmGetCompositionFontW", 2 },
+        { "ImmNotifyIME",         4 }, { "ImmSetCompositionWindow", 2 },
+        { "ImmSetCandidateWindow", 2 },
         { "GetSysColor",          1 }, { "GetWindowLongA",       2 },
         { "GetWindowThreadProcessId", 2 }, { "IsWindowVisible",  1 },
-        { "LoadImageA",           6 }, { "LoadMenuA",            2 },
+        { "LoadImageA",           6 }, { "LoadImageW",           6 },
+        { "LoadMenuA",            2 },
         { "LoadMenuW",            2 }, { "OpenClipboard",        1 },
         { "SetClipboardData",     2 }, { "SetMenu",              2 },
         { "SetParent",            2 }, { "SetWindowLongA",       3 },
@@ -907,6 +1303,7 @@ static uint8_t guess_num_args(const char *name)
         { "DrawTextExW",          5 },
         /* gdi32 */
         { "CreateFontA",          14 }, { "CreateFontW",         14 },
+        { "CreateFontIndirectW",   1 },
         { "CreatePen",            3 }, { "ExtTextOutA",          8 },
         { "GetPixel",             3 }, { "LineTo",               2 },
         { "PatBlt",               6 }, { "SetBkColor",           2 },
@@ -926,10 +1323,14 @@ static uint8_t guess_num_args(const char *name)
         /* ole32 / shell32 */
         { "CoCreateGuid",         1 }, { "CoCreateInstance",     5 },
         { "CoInitialize",         1 }, { "CoUninitialize",       0 },
+        { "RegisterDragDrop",     2 }, { "RevokeDragDrop",       1 },
         { "ShellExecuteA",        6 }, { "ShellExecuteW",        6 },
+        { "CommandLineToArgvW",   2 },
         { "Shell_NotifyIconA",    2 },
         { "HeapReAlloc",          4 }, { "HeapSize",             3 },
         { "RtlUnwind",            4 },
+        { "RtlAddFunctionTable",  3 }, { "RtlDeleteFunctionTable", 1 },
+        { "RtlLookupFunctionEntry", 3 },
         { "CreateThread",         6 }, { "ExitThread",           1 },
         { "ResumeThread",         1 }, { "SuspendThread",        1 },
         { "SetThreadPriority",    2 }, { "GetThreadPriority",    1 },
@@ -940,9 +1341,10 @@ static uint8_t guess_num_args(const char *name)
         { "GlobalAlloc",          2 }, { "GlobalFree",           1 },
         { "GlobalLock",           1 }, { "GlobalUnlock",         1 },
         { "LocalAlloc",           2 }, { "LocalFree",            1 },
-        { "GetModuleHandleExA",   3 },
+        { "GetModuleHandleExA",   3 }, { "GetModuleHandleExW",   3 },
         { "IsProcessorFeaturePresent", 1 },
         { "GetTimeZoneInformation",    1 },
+        { "GetDynamicTimeZoneInformation", 1 },
         { "FormatMessageA",       7 }, { "FormatMessageW",        7 },
         { "CompareStringA",       6 }, { "CompareStringW",        6 },
         { "GetDiskFreeSpaceA",    5 }, { "GetVolumeInformationA", 8 },
@@ -951,6 +1353,7 @@ static uint8_t guess_num_args(const char *name)
         { "GetFileAttributesA",   1 }, { "SetFileAttributesA",    2 },
         { "GetPrivateProfileSectionNamesA", 3 },
         { "GetComputerNameA",     2 }, { "GetComputerNameW",     2 },
+        { "GetComputerNameExA",   3 }, { "GetComputerNameExW",   3 },
         { "GetVersionExA",        1 }, { "GetVersionExW",        1 },
         { "FormatMessageA",       7 }, { "FormatMessageW",       7 },
         { "GetUserNameA",         2 }, { "GetUserNameW",         2 },
@@ -977,20 +1380,29 @@ static uint8_t guess_num_args(const char *name)
         { "SendMessageW",         4 }, { "PostMessageW",          4 },
         { "SetWindowTextW",       2 },
         { "LoadCursorW",          2 }, { "LoadIconW",             2 },
-        { "MapVirtualKeyW",       2 }, { "MessageBoxW",           4 },
+        { "MapVirtualKeyW",       2 }, { "ToUnicode",             6 },
+        { "MessageBoxW",          4 },
         { "GetObjectW",           3 },
         /* MSVCRT — critical: _initterm with wrong args crashes! */
         { "_initterm",            2 }, { "_initterm_e",           2 },
         { "__dllonexit",          3 }, { "_onexit",               1 },
         { "_atexit",              1 }, { "atexit",                1 },
         { "_controlfp",           2 }, { "__set_app_type",        1 },
+        { "_set_app_type",        1 },
+        { "_set_fmode",           1 }, { "_get_fmode",            1 },
+        { "_get_narrow_winmain_command_line", 0 },
         { "__p__fmode",           0 }, { "__p__commode",          0 },
         { "_adjust_fdiv",         0 }, { "__setusermatherr",      1 },
         { "_except_handler3",     4 }, { "_except_handler4",      4 },
+        { "_setjmp",              1 }, { "_setjmp3",               2 },
+        { "longjmp",              2 }, { "_longjmpex",             2 },
+        { "InitializeSecurityDescriptor", 2 },
         { "RegOpenKeyExW",        5 }, { "RegQueryValueExW",      6 },
         { "RegSetValueExW",       6 }, { "RegCreateKeyExW",       9 },
+        { "RegDeleteKeyW",        2 }, { "RegDeleteKeyExW",       4 },
         /* Completely missing functions */
         { "GetLogicalDrives",     0 },
+        { "GetLogicalDriveStringsA", 2 }, { "GetLogicalDriveStringsW", 2 },
         { "GetDriveTypeW",        1 }, { "GetDriveTypeA",         1 },
         { "CreateSemaphoreW",     4 }, { "CreateSemaphoreA",      4 },
         { "CreateMutexW",         3 },
@@ -1017,11 +1429,14 @@ static uint8_t guess_num_args(const char *name)
         { "GetFocus",             0 }, { "SetFocus",              1 },
         { "GetActiveWindow",      0 }, { "SetActiveWindow",       1 },
         { "GetDesktopWindow",     0 }, { "GetSystemMetrics",      1 },
+        { "MonitorFromRect",      2 },
         { "MoveWindow",           6 }, { "SetWindowPos",          7 },
         { "MessageBoxA",          4 }, { "GetAsyncKeyState",      1 },
         { "GetKeyState",          1 }, { "MapVirtualKeyA",        2 },
+        { "SendInput",            3 },
         { "SetTimer",             4 }, { "KillTimer",             2 },
-        { "ClipCursor",           1 }, { "SetCursorPos",          2 },
+        { "ClipCursor",           1 }, { "GetClipCursor",         1 },
+        { "SetCursorPos",         2 },
         { "GetCursorPos",         1 }, { "ScreenToClient",        2 },
         { "ClientToScreen",       2 },
 
@@ -1061,11 +1476,19 @@ static uint8_t guess_num_args(const char *name)
         /* gdi32 — extended */
         { "GetDeviceCaps",        2 }, { "CreateCompatibleDC",    1 },
         { "DeleteDC",             1 }, { "SelectObject",          2 },
+        { "GetCurrentObject",     2 },
+        { "CreateRectRgn",        4 }, { "SetRectRgn",            5 },
+        { "CreateRectRgnIndirect", 1 }, { "CombineRgn",            4 },
+        { "EqualRgn",             2 }, { "PtInRegion",            3 },
+        { "RectInRegion",         2 }, { "GetRgnBox",             2 },
+        { "OffsetRgn",            3 },
+        { "SelectClipRgn",        2 }, { "SetTextAlign",          2 },
         { "GetObjectA",           3 }, { "DeleteObject",          1 },
         { "ChoosePixelFormat",    2 }, { "SetPixelFormat",        3 },
         { "CreateDIBitmap",       6 }, { "CreateBitmap",          5 },
         { "CreatePatternBrush",   1 }, { "CreateSolidBrush",      1 },
         { "GetStockObject",       1 }, { "GetObjectW",            3 },
+        { "GetTextMetricsA",      2 }, { "GetTextMetricsW",       2 },
         { "CreateDIBSection",     6 }, { "BitBlt",                9 },
 
         /* ddraw COM methods (called via thunks, stdcall with 'this') */
@@ -1082,6 +1505,7 @@ static uint8_t guess_num_args(const char *name)
         { "RegOpenKeyExA",        5 }, { "RegCloseKey",           1 },
         { "RegQueryValueExA",     6 }, { "RegSetValueExA",        6 },
         { "RegCreateKeyExA",      9 },
+        { "RegDeleteKeyA",        2 }, { "RegDeleteKeyExA",       4 },
 
         /* msvcrt */
         { "malloc",               1 }, { "free",                  1 },
@@ -1174,9 +1598,11 @@ static uint8_t guess_num_args(const char *name)
      * spot the next GlobalAddAtomW-style stack-imbalance bug (a stdcall API
      * whose real arg count != 4 over/under-cleans the stack → caller
      * callee-saved register / pool corruption). Logged once per import patch. */
+#ifndef OK_QUIET
     serial_puts("[ARGCOUNT-DEFAULT4] ");
     serial_puts(name);
     serial_puts("\n");
+#endif
     return 4;
 }
 
@@ -1217,48 +1643,7 @@ static uint8_t dll_calling_convention(const char *dll_name)
  */
 static int is_shim_dll(const char *dll_name)
 {
-    if (!dll_name) return 0;
-
-    /* Lowercase first 16 chars */
-    char low[16];
-    int i;
-    for (i = 0; i < 15 && dll_name[i]; i++) {
-        char c = dll_name[i];
-        low[i] = (c >= 'A' && c <= 'Z') ? c + 32 : c;
-    }
-    low[i] = '\0';
-
-    /* Known shim DLLs (our 64-bit implementations) */
-    static const char *shim_names[] = {
-        "kernel32", "ntdll", "msvcrt", "msvcr",
-        "user32", "gdi32", "advapi32",
-        "ddraw", "dsound", "ole32", "oleaut32",
-        "shell32", "comctl32", "comdlg32",
-        "winmm", "wsock32", "ws2_32",
-        "ucrtbase", "vcruntime",
-        NULL
-    };
-
-    /* Strip .dll extension from low */
-    int len = i;
-    if (len > 4 && low[len-4]=='.' && low[len-3]=='d' &&
-        low[len-2]=='l' && low[len-1]=='l')
-        low[len-4] = '\0';
-
-    for (int j = 0; shim_names[j]; j++) {
-        const char *a = low, *b = shim_names[j];
-        while (*a && *b && *a == *b) { a++; b++; }
-        if (*a == '\0' && *b == '\0') return 1;
-        /* Also check prefix match for msvcr* */
-        if (shim_names[j][0]=='m' && shim_names[j][4]=='r' &&
-            shim_names[j][5]=='\0') {
-            /* "msvcr" prefix — check if low starts with it */
-            if (low[0]=='m' && low[1]=='s' && low[2]=='v' &&
-                low[3]=='c' && low[4]=='r')
-                return 1;
-        }
-    }
-    return 0;
+    return dll_is_shim(dll_name);
 }
 
 /*
@@ -1271,9 +1656,13 @@ NTSTATUS compat32_patch_iat(PE_IMAGE_INFO *info)
     if (!info || !info->Is32Bit || !info->ImageBase)
         return STATUS_INVALID_PARAMETER;
 
-    if (!thunk_pool) {
+    if (!compat32_is_initialized()) {
         serial_puts("[COMPAT32] Thunk pool not initialized\n");
         return STATUS_UNSUCCESSFUL;
+    }
+    if (compat32_map_runtime_current() != 0) {
+        serial_puts("[COMPAT32] Thunk runtime map failed\n");
+        return STATUS_CONFLICTING_ADDRESSES;
     }
 
     BYTE *base = (BYTE *)info->ImageBase;
@@ -1295,6 +1684,9 @@ NTSTATUS compat32_patch_iat(PE_IMAGE_INFO *info)
 
     if (imp_dir->VirtualAddress == 0 || imp_dir->Size == 0)
         return STATUS_SUCCESS;
+
+    int saved_compat_mode = g_compat32_mode;
+    g_compat32_mode = 1;
 
     /* IAT patch trace removed — debug serial_puts changes code layout
      * and can introduce 0xCC displacement bytes that QEMU TCG misinterprets */
@@ -1343,25 +1735,51 @@ NTSTATUS compat32_patch_iat(PE_IMAGE_INFO *info)
 
             if (!resolved) {
                 /*
-                 * Unresolved import — patch IAT with a stub that returns 0.
-                 * Without this, the IAT keeps the original RVA (e.g. 0x1F68)
-                 * and calling through it jumps to garbage → #UD.
+                 * Preserve the imported function's 32-bit stack contract even
+                 * when its implementation is optional. A plain RET corrupts
+                 * ESP for stdcall imports because their arguments remain.
                  */
-                if (unresolved_stub_addr)
-                    iat_entry->u1.Function = unresolved_stub_addr;
+                uint32_t thunk_addr = 0;
+                if (func_name) {
+                    uint8_t nargs, abi_cc;
+                    if (!win32_abi_lookup(dll_name, func_name, &nargs, &abi_cc)) {
+                        nargs = guess_num_args(func_name);
+                        abi_cc = cc;
+                    }
+                    thunk_addr = compat32_make_thunk_ex(
+                        (uint64_t)(ULONG_PTR)unresolved_import_zero,
+                        func_name, nargs, abi_cc);
+                }
+                iat_entry->u1.Function = thunk_addr ? thunk_addr
+                                                   : unresolved_stub_addr;
                 continue;
             }
 
-            if (shim) {
+            /* A compatibility fallback may resolve an unregistered provider
+             * (for example MSVCR100.dll) through one of our kernel shims.
+             * Classify the resolved target as well as the import DLL name:
+             * writing a truncated FFFF8000... kernel pointer into a PE32 IAT
+             * produces an unmapped low-address jump. */
+            BOOL kernel_target =
+                (uint64_t)(ULONG_PTR)resolved >= KERNEL_VBASE;
+            if (shim || kernel_target) {
                 /*
                  * Import from a shim DLL (64-bit kernel code).
                  * Check for fast-math native 32-bit implementations first.
                  * These run directly in compat mode (no INT 0x2E overhead).
                  */
-                extern uint32_t g_fast_CIpow_addr, g_fast_CIfmod_addr, g_fast_CIacos_addr;
+                extern uint32_t g_fast_CIpow_addr, g_fast_CIfmod_addr,
+                                g_fast_CIacos_addr, g_fast_fabs_addr,
+                                g_fast_sqrt_addr;
                 if (func_name && g_fast_CIpow_addr) {
                     uint32_t fast = 0;
-                    if (func_name[0]=='_' && func_name[1]=='C' && func_name[2]=='I') {
+                    if (func_name[0]=='f' && func_name[1]=='a' &&
+                        func_name[2]=='b' && func_name[3]=='s' && !func_name[4])
+                        fast = g_fast_fabs_addr;
+                    else if (func_name[0]=='s' && func_name[1]=='q' &&
+                             func_name[2]=='r' && func_name[3]=='t' && !func_name[4])
+                        fast = g_fast_sqrt_addr;
+                    else if (func_name[0]=='_' && func_name[1]=='C' && func_name[2]=='I') {
                         if (func_name[3]=='p' && func_name[4]=='o' && func_name[5]=='w' && !func_name[6])
                             fast = g_fast_CIpow_addr;
                         else if (func_name[3]=='f' && func_name[4]=='m' && func_name[5]=='o' && func_name[6]=='d' && !func_name[7])
@@ -1404,14 +1822,20 @@ NTSTATUS compat32_patch_iat(PE_IMAGE_INFO *info)
                      * name-keyed guess_num_args (with its default-4) is only a
                      * fallback until every shim table is migrated. */
                     uint64_t target64 = (uint64_t)(ULONG_PTR)resolved;
+                    const char *thunk_name = func_name;
                     uint8_t nargs, abi_cc;
                     if (func_name &&
                         win32_abi_lookup(dll_name, func_name, &nargs, &abi_cc)) {
                         cc = abi_cc;  /* co-located convention wins */
+                    } else if (!func_name && win32_abi_lookup_target(
+                                   dll_name, resolved, &thunk_name,
+                                   &nargs, &abi_cc)) {
+                        cc = abi_cc;
                     } else {
                         nargs = func_name ? guess_num_args(func_name) : 4;
                     }
-                    uint32_t thunk_addr = compat32_make_thunk_ex(target64, func_name, nargs, cc);
+                    uint32_t thunk_addr = compat32_make_thunk_ex(
+                        target64, thunk_name, nargs, cc);
                     if (thunk_addr) {
                         iat_entry->u1.Function = thunk_addr;
                         patched++;
@@ -1423,24 +1847,23 @@ NTSTATUS compat32_patch_iat(PE_IMAGE_INFO *info)
                  * Write the address directly — no thunk needed.
                  */
                 /* Use volatile to ensure the write hits memory */
-                volatile uint32_t *iat_ptr = (volatile uint32_t *)&iat_entry->u1.Function;
+                volatile uint32_t *iat_ptr =
+                    (volatile uint32_t *)&iat_entry->u1.Function;
+                LOADED_MODULE *target_module =
+                    dll_find_module_by_address(resolved);
+                if (!target_module || !target_module->image.Is32Bit) {
+                    serial_puts("[IAT-WARN] non-PE32 direct target: ");
+                    if (func_name) serial_puts(func_name);
+                    serial_puts(" from ");
+                    serial_puts(dll_name);
+                    serial_puts(" -> 0x");
+                    serial_puthex((uint32_t)(ULONG_PTR)resolved, 8);
+                    serial_puts("\n");
+                    *iat_ptr = unresolved_stub_addr;
+                    continue;
+                }
                 *iat_ptr = (uint32_t)(ULONG_PTR)resolved;
                 direct++;
-
-                /* Catch imports resolved to VirtualAlloc range (never valid DLL code) */
-                {
-                    uint32_t val = (uint32_t)(ULONG_PTR)resolved;
-                    if (val >= 0x40000000 && val < 0x80000000) {
-                        serial_puts("[IAT-WARN] VirtualAlloc addr: ");
-                        if (func_name) serial_puts(func_name);
-                        serial_puts(" from ");
-                        serial_puts(dll_name);
-                        serial_puts(" -> 0x");
-                        serial_puthex(val, 8);
-                        serial_puts("\n");
-                        *iat_ptr = unresolved_stub_addr;
-                    }
-                }
 
                 /* Log GIsRunning resolution for debugging */
                 if (func_name && func_name[0]=='?' && func_name[1]=='G' &&
@@ -1519,9 +1942,171 @@ NTSTATUS compat32_patch_iat(PE_IMAGE_INFO *info)
         }
     }
 
+    g_compat32_mode = saved_compat_mode;
     return STATUS_SUCCESS;
 }
 
+/* Initialize one PE32 module's static TLS before its entry point runs. */
+NTSTATUS compat32_attach_tls(PE_IMAGE_INFO *info)
+{
+    if (!info || !info->ImageBase || !info->Is32Bit)
+        return STATUS_INVALID_PARAMETER;
+
+    int process_bits = dll_current_process_bitness();
+    if (process_bits && process_bits != 32) {
+        serial_puts("[TLS32] refusing PE32 TLS in PE64 process\n");
+        return STATUS_INVALID_IMAGE_FORMAT;
+    }
+
+    BYTE *base = (BYTE *)info->ImageBase;
+    uint64_t image_start = (uint64_t)(ULONG_PTR)base;
+    uint64_t image_end = image_start + info->SizeOfImage;
+    if (info->SizeOfImage < sizeof(IMAGE_DOS_HEADER))
+        return STATUS_INVALID_PARAMETER;
+
+    PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)base;
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE || dos->e_lfanew < 0 ||
+        (ULONG)dos->e_lfanew > info->SizeOfImage - sizeof(IMAGE_NT_HEADERS32))
+        return STATUS_INVALID_PARAMETER;
+
+    PIMAGE_NT_HEADERS32 nt =
+        (PIMAGE_NT_HEADERS32)(base + (ULONG)dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE ||
+        nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR32_MAGIC)
+        return STATUS_INVALID_PARAMETER;
+
+    if (nt->OptionalHeader.NumberOfRvaAndSizes <= IMAGE_DIRECTORY_ENTRY_TLS)
+        return STATUS_SUCCESS;
+
+    IMAGE_DATA_DIRECTORY *dir =
+        &nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS];
+    if (!dir->VirtualAddress || !dir->Size)
+        return STATUS_SUCCESS;
+    if (dir->Size < sizeof(IMAGE_TLS_DIRECTORY32) ||
+        dir->VirtualAddress > info->SizeOfImage - sizeof(IMAGE_TLS_DIRECTORY32))
+        return STATUS_INVALID_PARAMETER;
+
+    PIMAGE_TLS_DIRECTORY32 tls =
+        (PIMAGE_TLS_DIRECTORY32)(base + dir->VirtualAddress);
+    uint64_t raw_start = tls->StartAddressOfRawData;
+    uint64_t raw_end = tls->EndAddressOfRawData;
+    uint64_t index_addr = tls->AddressOfIndex;
+    uint64_t callbacks_addr = tls->AddressOfCallBacks;
+
+    if (raw_end < raw_start ||
+        (raw_end != raw_start &&
+         (raw_start < image_start || raw_end > image_end)) ||
+        index_addr < image_start || index_addr > image_end - sizeof(uint32_t))
+        return STATUS_INVALID_PARAMETER;
+
+    uint64_t raw_size = raw_end - raw_start;
+    uint64_t total_size = raw_size + tls->SizeOfZeroFill;
+    if (total_size < raw_size || total_size > 16ULL * 1024 * 1024)
+        return STATUS_NO_MEMORY;
+
+    uint32_t callback_count = 0;
+    if (callbacks_addr) {
+        while (callback_count < 64) {
+            uint64_t entry_addr = callbacks_addr +
+                                  callback_count * sizeof(uint32_t);
+            if (entry_addr < image_start ||
+                entry_addr > image_end - sizeof(uint32_t))
+                return STATUS_INVALID_PARAMETER;
+            uint32_t callback = *(uint32_t *)(ULONG_PTR)entry_addr;
+            if (!callback) break;
+            if ((uint64_t)callback < image_start ||
+                (uint64_t)callback >= image_end)
+                return STATUS_INVALID_PARAMETER;
+            callback_count++;
+        }
+        if (callback_count == 64)
+            return STATUS_INVALID_PARAMETER;
+    }
+
+    uint64_t pages = (total_size + 4095) / 4096;
+    if (!pages) pages = 1;
+
+    int saved_compat_mode = g_compat32_mode;
+    g_compat32_mode = 1;
+    BYTE *block = (BYTE *)VirtualAlloc(NULL, pages * 4096,
+                                       MEM_RESERVE | MEM_COMMIT,
+                                       PAGE_READWRITE);
+    if (!block || (uint64_t)(ULONG_PTR)block > UINT32_MAX) {
+        if (block) VirtualFree(block, 0, MEM_RELEASE);
+        g_compat32_mode = saved_compat_mode;
+        return STATUS_NO_MEMORY;
+    }
+
+    for (uint64_t i = 0; i < pages * 4096; i++) block[i] = 0;
+    for (uint64_t i = 0; i < raw_size; i++)
+        block[i] = *(BYTE *)(ULONG_PTR)(raw_start + i);
+
+    DWORD index = TlsAlloc();
+    if (index == (DWORD)-1) {
+        VirtualFree(block, 0, MEM_RELEASE);
+        g_compat32_mode = saved_compat_mode;
+        return STATUS_NO_MEMORY;
+    }
+    if (!TlsSetValue(index, block)) {
+        TlsFree(index);
+        VirtualFree(block, 0, MEM_RELEASE);
+        g_compat32_mode = saved_compat_mode;
+        return STATUS_NO_MEMORY;
+    }
+    *(uint32_t *)(ULONG_PTR)index_addr = index;
+
+    extern BOOL win32_tls_register_static(DWORD, uint32_t, uint32_t,
+                                           uint32_t, uint32_t, uint32_t,
+                                           uint32_t);
+    if (!win32_tls_register_static(index,
+            (uint32_t)(ULONG_PTR)info->ImageBase,
+            (uint32_t)raw_start, (uint32_t)raw_size,
+            (uint32_t)total_size, (uint32_t)callbacks_addr,
+            callback_count)) {
+        TlsFree(index);
+        VirtualFree(block, 0, MEM_RELEASE);
+        g_compat32_mode = saved_compat_mode;
+        return STATUS_NO_MEMORY;
+    }
+    g_compat32_mode = saved_compat_mode;
+
+    serial_puts("[TLS32] index@0x");
+    serial_puthex(index_addr, 8);
+    serial_puts("=0x");
+    serial_puthex(*(uint32_t *)(ULONG_PTR)index_addr, 8);
+    serial_puts("\n");
+
+    serial_puts("[TLS32] slot=");
+    serial_putdec(index);
+    serial_puts(" template=0x");
+    serial_puthex(raw_size, 8);
+    serial_puts(" block=0x");
+    serial_puthex((uint64_t)(ULONG_PTR)block, 8);
+    serial_puts("\n");
+
+    for (uint32_t i = 0; i < callback_count; i++) {
+        uint32_t callback =
+            *(uint32_t *)(ULONG_PTR)(callbacks_addr + i * sizeof(uint32_t));
+        uint32_t args[3] = {
+            (uint32_t)(ULONG_PTR)info->ImageBase,
+            DLL_PROCESS_ATTACH,
+            0
+        };
+        compat32_callback_args(callback, 3, args);
+    }
+
+    serial_puts("[TLS32] post-callback index=0x");
+    serial_puthex(*(uint32_t *)(ULONG_PTR)index_addr, 8);
+    serial_puts("\n");
+#ifndef TEST_HARNESS
+    if (index_addr == 0x008571A8ULL) {
+        extern int hwbp_set(int, uint64_t, int, int, const char *);
+        hwbp_set(2, index_addr, 1 /* write */, 3 /* 4 bytes */, "tlsidx");
+    }
+#endif
+
+    return STATUS_SUCCESS;
+}
 /* ── TEB setup for 32-bit code ───────────────────────────────── */
 
 void compat32_setup_teb(void *teb_addr)
@@ -1532,6 +2117,7 @@ void compat32_setup_teb(void *teb_addr)
      * On x86-64, FS base is set via MSR 0xC0000100.
      */
 #ifndef TEST_HARNESS
+    extern void proc_set_fs_base(uint64_t addr);
     uint64_t addr = (uint64_t)(ULONG_PTR)teb_addr;
     __asm__ volatile (
         "mov $0xC0000100, %%ecx\n"   /* MSR_FS_BASE */
@@ -1543,6 +2129,7 @@ void compat32_setup_teb(void *teb_addr)
         : "r"(addr)
         : "rax", "rcx", "rdx"
     );
+    proc_set_fs_base(addr);
 #else
     /* On Linux, use arch_prctl to set FS base for 32-bit TEB access */
     {
@@ -1558,6 +2145,18 @@ void compat32_setup_teb(void *teb_addr)
 }
 
 /* ── Enter 32-bit compatibility mode ─────────────────────────── */
+
+extern TEB32 g_teb32;
+
+TEB32 *compat32_current_teb(void)
+{
+#ifndef TEST_HARNESS
+    extern uint64_t proc_get_fs_base(void);
+    uint64_t addr = proc_get_fs_base();
+    if (addr) return (TEB32 *)(ULONG_PTR)addr;
+#endif
+    return &g_teb32;
+}
 
 void compat32_enter(uint32_t entry, uint32_t stack_top)
 {
@@ -1579,8 +2178,8 @@ void compat32_enter(uint32_t entry, uint32_t stack_top)
      * VirtualAlloc maps via paging_map_page (kernel PTs) which is
      * visible to all processes. No CR3 switch needed. */
 
-    /* Mask APIC timer for the duration of compat32 execution. UT99
-     * (PID 1) runs almost entirely in 32-bit user code on a low-half
+    /* Mask APIC timer for UT99's compat32 execution. UT99
+     * runs almost entirely in 32-bit user code on a low-half
      * stack; if the timer ISR fires there, it saves the GP frame on
      * that low-half stack and the scheduler stores frame_ptr (a low-
      * half address) in PID 1->kernel_rsp. Subsequent user-mode writes
@@ -1588,13 +2187,17 @@ void compat32_enter(uint32_t entry, uint32_t stack_top)
      * dispatch reads garbage as CS/RIP/SS/RSP — `[SCHED] CORRUPT PID
      * 1 CS=0x1F10` style triple-fault.
      *
-     * The timer is unmasked transiently by INT 0x2E handlers (so
-     * cooperative thread yield works inside compat32_callback_args),
-     * and by sched_yield from the spinlock loop. */
+     * Other PE32 programs need the timer for waits and scheduling, so
+     * explicitly leave it unmasked for them. */
     {
         extern volatile uint32_t *idt_get_apic_base(void);
         volatile uint32_t *apic = idt_get_apic_base();
-        if (apic) apic[0x320/4] |= 0x10000;  /* LVT_TIMER |= MASKED */
+        if (apic) {
+            if (g_compat32_ut99)
+                apic[0x320/4] |= 0x10000;   /* LVT_TIMER |= MASKED */
+            else
+                apic[0x320/4] &= ~0x10000;  /* keep scheduler/timers alive */
+        }
     }
 
     /* Set data segments to 32-bit data selector, then RETF to compat mode.
@@ -1653,16 +2256,20 @@ void compat32_callback(uint32_t func_addr)
 {
 #ifndef TEST_HARNESS
     if (!callback_return_stub_addr) return;
+    callback_owner_state_t *callback_state = callback_state_get(1, NULL);
+    if (!callback_state) return;
 
     /* Do not recycle live callback slots. A deep WndProc/message-pump nest can
      * legitimately approach the old limit; reusing slot 0 corrupts jmpbufs and
      * later returns through a stale callback_return_stub. */
-    if (callback_depth >= MAX_CALLBACK_DEPTH) {
+    if (callback_state->depth >= MAX_CALLBACK_DEPTH) {
         serial_puts("[CB32] FATAL: callback depth overflow\n");
         return;
     }
 
-    int depth = callback_depth++;
+    int depth = callback_state->depth++;
+    callback_state->saved_stack_args[depth] =
+        callback_state->current_stack_args;
 
     if (depth >= 16) {
         serial_puts("[CB32] depth=");
@@ -1675,37 +2282,45 @@ void compat32_callback(uint32_t func_addr)
     /* Save IST1 before callback — longjmp bypasses int2e_stub's restore */
     {
         extern uint64_t *tss_ist1_ptr;
-        if (tss_ist1_ptr) callback_saved_ist1[depth] = *tss_ist1_ptr;
+        if (tss_ist1_ptr) callback_state->saved_ist1[depth] = *tss_ist1_ptr;
     }
 
     /* Save SEH ExceptionList — 32-bit code may push SEH frames on the
      * callback stack. Restore on return so the main chain stays valid. */
-    extern TEB32 g_teb32;
-    uint32_t saved_seh = g_teb32.ExceptionList;
+    TEB32 *teb = compat32_current_teb();
+    uint32_t saved_seh = teb->ExceptionList;
 
-    if (kern_setjmp(callback_jmpbufs[depth]) == 0) {
+    /* PE32 callbacks run on a low callback stack. Keep timer preemption out
+     * until that stack has returned through the callback gate. */
+    extern volatile uint32_t *idt_get_apic_base(void);
+    volatile uint32_t *callback_apic = idt_get_apic_base();
+    uint32_t saved_callback_timer = callback_apic ? callback_apic[0x320/4] : 0;
+    if (callback_apic)
+        callback_apic[0x320/4] = saved_callback_timer | 0x10000;
+
+    if (kern_setjmp(callback_state->jmpbufs[depth]) == 0) {
         /*
          * First return from setjmp — switch to compat mode.
          * Set up a small stack with the return stub as return address,
          * then LRETQ to the 32-bit function.
          */
-        uint32_t *sp = (uint32_t *)(callback_stack_get(depth) + CALLBACK_STACK_SIZE);
+        uint8_t *stack = callback_stack_get(callback_state, depth);
+        if (!stack) {
+            if (!g_compat32_ut99 && callback_apic)
+                callback_apic[0x320/4] = saved_callback_timer;
+            teb->ExceptionList = saved_seh;
+            callback_state->current_stack_args =
+                callback_state->saved_stack_args[depth];
+            callback_state->depth--;
+            return;
+        }
+        uint32_t *sp = (uint32_t *)(stack + CALLBACK_STACK_SIZE);
         sp--;
         *sp = callback_return_stub_addr;  /* return address for the function */
 
         uint64_t cs64 = GDT_SEL_CODE32;
         uint64_t ip64 = func_addr;
         uint64_t sp64 = (uint64_t)(ULONG_PTR)sp;
-
-        /* Mask APIC timer during callback to prevent RSP=0 crash.
-         * Callback stacks are 8KB mini-buffers — if the timer fires
-         * on them with IST=0, the ISR gets an invalid RSP. The timer
-         * ticks are not needed during 32-bit callbacks (single-threaded). */
-        {
-            extern volatile uint32_t *idt_get_apic_base(void);
-            volatile uint32_t *apic = idt_get_apic_base();
-            if (apic) apic[0x320/4] |= 0x10000;  /* LVT_TIMER |= MASKED */
-        }
 
         __asm__ volatile (
             "movw $0x48, %%ax\n"    /* GDT_SEL_DATA32 */
@@ -1728,16 +2343,14 @@ void compat32_callback(uint32_t func_addr)
 
     /* longjmp returned here — 32-bit function is done. */
 
-    /* DON'T unmask the APIC timer here. compat32_enter masked it for
-     * the entire UT99 lifetime (commit 0311d5f); the per-callback
-     * mask added in commit 6702735 was originally paired with this
-     * unmask, but with the lifetime mask in place, unmasking here
-     * re-exposes the exact race that lifetime mask was meant to
-     * close: any subsequent UT99 user-mode code that gets preempted
-     * onto a low-half stack would corrupt PID 1's saved frame. */
+    /* UT99 owns a lifetime mask; other callers get their prior state back. */
+    if (!g_compat32_ut99 && callback_apic)
+        callback_apic[0x320/4] = saved_callback_timer;
 
-    g_teb32.ExceptionList = saved_seh;  /* Restore SEH chain */
-    callback_depth--;
+    teb->ExceptionList = saved_seh;  /* Restore SEH chain */
+    callback_state->current_stack_args =
+        callback_state->saved_stack_args[depth];
+    callback_state->depth--;
     if (depth >= 16) {
         serial_puts("[CB32] depth=");
         serial_putdec(depth);
@@ -1756,68 +2369,57 @@ void compat32_callback(uint32_t func_addr)
  * args:  array of uint32_t arguments (pushed right-to-left)
  * Returns: EAX from the 32-bit function.
  */
-uint32_t compat32_callback_args(uint32_t func_addr, int nargs, const uint32_t *args)
+static uint32_t compat32_callback_args_impl(uint32_t func_addr, int nargs,
+                                            const uint32_t *args,
+                                            uint32_t stack_top)
 {
 #ifndef TEST_HARNESS
     if (!callback_return_stub_addr) return 0;
+    callback_owner_state_t *callback_state = callback_state_get(1, NULL);
+    if (!callback_state) return 0;
 
-    if (callback_depth >= MAX_CALLBACK_DEPTH) {
+    if (callback_state->depth >= MAX_CALLBACK_DEPTH) {
         serial_puts("[CB32] FATAL: callback depth overflow\n");
         return 0;
     }
 
-    int depth = callback_depth++;
-
-    callback_retval = 0;
+    int depth = callback_state->depth++;
+    callback_state->retvals[depth] = 0;
+    callback_state->saved_stack_args[depth] =
+        callback_state->current_stack_args;
 
     /* Save IST1 before callback — longjmp bypasses int2e_stub's restore */
     {
         extern uint64_t *tss_ist1_ptr;
-        if (tss_ist1_ptr) callback_saved_ist1[depth] = *tss_ist1_ptr;
+        if (tss_ist1_ptr) callback_state->saved_ist1[depth] = *tss_ist1_ptr;
     }
 
     /* Save SEH ExceptionList — 32-bit code may push SEH frames on the
      * callback stack. Restore on return so the main chain stays valid. */
-    extern TEB32 g_teb32;
-    uint32_t saved_seh = g_teb32.ExceptionList;
+    TEB32 *teb = compat32_current_teb();
+    uint32_t saved_seh = teb->ExceptionList;
 
-    /* Mask APIC timer for the duration of the 32-bit callback. The
-     * callback runs on a SHARED `callback_stack[depth]` (one buffer per
-     * depth, not per process) — if the timer ISR fires here it saves
-     * the interrupted process's full GP frame on top of that stack,
-     * the scheduler stores frame_ptr in proc->kernel_rsp, then a
-     * different thread's later callback at the same depth WRITES OVER
-     * the saved frame as it pushes arguments. The saved frame becomes
-     * garbage, the next dispatch of the original process triple-faults
-     * on a CS=0x1F10-style bogus selector. Until callback_stacks are
-     * per-process the only safe thing is no-preempt during callback. */
-    {
-        extern volatile uint32_t *idt_get_apic_base(void);
-        volatile uint32_t *apic = idt_get_apic_base();
-        if (apic) apic[0x320/4] |= 0x10000;  /* LVT_TIMER |= MASKED */
-    }
+    extern volatile uint32_t *idt_get_apic_base(void);
+    volatile uint32_t *callback_apic = idt_get_apic_base();
+    uint32_t saved_callback_timer = callback_apic ? callback_apic[0x320/4] : 0;
+    if (callback_apic)
+        callback_apic[0x320/4] = saved_callback_timer | 0x10000;
 
-    /* Pick the callback stack slot. PID 1 (UT99 main) uses slot=depth
-     * as before. Worker threads spawned via CreateThread use a HIGH
-     * slot offset (8 + thread_index) so their stack writes can't
-     * overlap PID 1's saved interrupt frames on slot=depth. Without
-     * this isolation, the timer-mask only narrows the race window —
-     * PID 1 may still have been preempted onto callback_stack[0]
-     * BEFORE the thread acquired the lock and TID=2's later push of
-     * arguments overwrites the saved frame. Out of MAX_CALLBACK_DEPTH
-     * = 32 slots we reserve [0..7] for PID 1 and [8..31] for threads. */
-    int stack_slot;
-    {
-        extern int32_t proc_current_pid(void);
-        int my_pid = proc_current_pid();
-        stack_slot = (my_pid == 1)
-                   ? depth
-                   : (8 + (my_pid & 0xF));
-        if (stack_slot >= MAX_CALLBACK_DEPTH) stack_slot = depth;
-    }
-
-    if (kern_setjmp(callback_jmpbufs[depth]) == 0) {
-        uint32_t *sp = (uint32_t *)(callback_stack_get(stack_slot) + CALLBACK_STACK_SIZE);
+    if (kern_setjmp(callback_state->jmpbufs[depth]) == 0) {
+        uint8_t *stack = stack_top ? NULL :
+                         callback_stack_get(callback_state, depth);
+        if (!stack_top && !stack) {
+            if (!g_compat32_ut99 && callback_apic)
+                callback_apic[0x320/4] = saved_callback_timer;
+            teb->ExceptionList = saved_seh;
+            callback_state->current_stack_args =
+                callback_state->saved_stack_args[depth];
+            callback_state->depth--;
+            return 0;
+        }
+        uint32_t *sp = stack_top
+                     ? (uint32_t *)(uintptr_t)stack_top
+                     : (uint32_t *)(stack + CALLBACK_STACK_SIZE);
 
         /* Push arguments right-to-left (cdecl/stdcall convention) */
         for (int i = nargs - 1; i >= 0; i--) {
@@ -1852,13 +2454,14 @@ uint32_t compat32_callback_args(uint32_t func_addr, int nargs, const uint32_t *a
         /* never reached */
     }
 
-    /* longjmp returned — 32-bit function is done. The APIC timer was
-     * masked by compat32_enter and stays masked while UT99 is in
-     * compat32 mode; we don't unmask here. */
+    if (!g_compat32_ut99 && callback_apic)
+        callback_apic[0x320/4] = saved_callback_timer;
 
-    g_teb32.ExceptionList = saved_seh;  /* Restore SEH chain */
-    callback_depth--;
-    return callback_retval_per_depth[depth];
+    teb->ExceptionList = saved_seh;  /* Restore SEH chain */
+    callback_state->current_stack_args =
+        callback_state->saved_stack_args[depth];
+    callback_state->depth--;
+    return callback_state->retvals[depth];
 #else
     /* Test harness: call directly */
     typedef uint32_t (*fn0)(void);
@@ -1875,6 +2478,20 @@ uint32_t compat32_callback_args(uint32_t func_addr, int nargs, const uint32_t *a
     default: return ((fn4)f)(args[0], args[1], args[2], args[3]);
     }
 #endif
+}
+
+uint32_t compat32_callback_args(uint32_t func_addr, int nargs,
+                                const uint32_t *args)
+{
+    return compat32_callback_args_impl(func_addr, nargs, args, 0);
+}
+
+uint32_t compat32_callback_args_on_stack(uint32_t func_addr, int nargs,
+                                         const uint32_t *args,
+                                         uint32_t stack_top)
+{
+    return compat32_callback_args_impl(func_addr, nargs, args,
+                                       stack_top & ~0xFULL);
 }
 
 /*
@@ -1923,8 +2540,6 @@ const char *compat32_get_name(uint32_t thunk_idx)
  */
 
 extern TEB g_teb;
-extern TEB32 g_teb32;
-extern PVOID g_unhandled_filter;
 
 /* 32-bit EXCEPTION_RECORD for passing to 32-bit filter functions */
 typedef struct __attribute__((packed)) {
@@ -1946,6 +2561,318 @@ typedef struct __attribute__((packed)) {
 static EXCEPTION_RECORD32 seh32_exception_record;
 static EXCEPTION_POINTERS32 seh32_exception_pointers;
 
+#define CXX32_MAX_TYPES           64
+#define CXX32_MAX_UNWIND_ACTIONS  32
+#define CXX32_MAX_TYPE_NAME       256
+
+typedef struct __attribute__((packed)) {
+    uint32_t attributes;
+    uint32_t unwind;
+    uint32_t forward_compat;
+    uint32_t catchable_types;
+} CXX_THROW_INFO32;
+
+typedef struct __attribute__((packed)) {
+    uint32_t properties;
+    uint32_t type;
+    int32_t mdisp;
+    int32_t pdisp;
+    int32_t vdisp;
+    int32_t size_or_offset;
+    uint32_t copy_function;
+} CXX_CATCHABLE_TYPE32;
+
+typedef struct __attribute__((packed)) {
+    int32_t to_state;
+    uint32_t action;
+} CXX_UNWIND_MAP_ENTRY32;
+
+static int seh32_range_readable(uint32_t address, uint32_t size)
+{
+    if (address < 0x10000U || size == 0)
+        return 0;
+
+    uint32_t end = address + size - 1U;
+    if (end < address || end >= 0x80000000U)
+        return 0;
+
+#ifndef TEST_HARNESS
+    extern uint64_t proc_current_cr3(void);
+    uint64_t cr3 = proc_current_cr3();
+    if (!cr3)
+        return 0;
+
+    uint64_t page = (uint64_t)address & ~0xFFFULL;
+    uint64_t last = (uint64_t)end & ~0xFFFULL;
+    for (;;) {
+        if (paging_translate_in_cr3(cr3, page) == UINT64_MAX)
+            return 0;
+        if (page == last)
+            break;
+        page += 0x1000ULL;
+    }
+#endif
+    return 1;
+}
+
+#define MSVC_JMPBUF_COOKIE 0x56433230U
+
+/* _setjmp/_setjmp3 cannot be implemented by an ordinary 64-bit shim: they
+ * capture the i386 caller's register file and return address. Likewise,
+ * longjmp must replace the pending iret frame instead of returning through
+ * the thunk. The marker targets exported by msvcrt_shim route those calls
+ * here while the original PE32 state is still available. */
+static int compat32_dispatch_nonlocal_jump(uint64_t target,
+                                           uint32_t *stack_args,
+                                           uint64_t *result)
+{
+    const uint64_t setjmp_target =
+        (uint64_t)(ULONG_PTR)crt_compat32_setjmp_marker;
+    const uint64_t setjmp3_target =
+        (uint64_t)(ULONG_PTR)crt_compat32_setjmp3_marker;
+    const uint64_t longjmp_target =
+        (uint64_t)(ULONG_PTR)crt_compat32_longjmp_marker;
+
+    if (target != setjmp_target && target != setjmp3_target &&
+        target != longjmp_target)
+        return 0;
+
+    if (!stack_args || !result)
+        return 0;
+
+    uint32_t env_addr = stack_args[0];
+    uint32_t required_dwords = target == setjmp3_target ? 10U : 8U;
+
+    if (target == setjmp3_target) {
+        uint32_t count = stack_args[1];
+        uint32_t copied = count > 2U ? count - 2U : 0U;
+        if (copied > 6U) copied = 6U;
+        required_dwords += copied;
+
+        uint32_t input_count = count > 8U ? 8U : count;
+        uint32_t input_addr = (uint32_t)(uintptr_t)stack_args;
+        if (!seh32_range_readable(input_addr,
+                                  (2U + input_count) * sizeof(uint32_t))) {
+            serial_puts("[MSVCRT-JMP] invalid _setjmp3 argument range\n");
+            *result = 0;
+            return 1;
+        }
+    }
+
+    if (!seh32_range_readable(env_addr,
+                              required_dwords * sizeof(uint32_t))) {
+        serial_puts("[MSVCRT-JMP] invalid jump buffer 0x");
+        serial_puthex(env_addr, 8);
+        serial_puts("\n");
+        *result = 0;
+        return 1;
+    }
+
+    uint32_t *env = (uint32_t *)(uintptr_t)env_addr;
+    TEB32 *teb = compat32_current_teb();
+
+    if (target == setjmp_target || target == setjmp3_target) {
+        uint32_t registration = teb ? teb->ExceptionList : 0xFFFFFFFFU;
+        uint32_t try_level = 0xFFFFFFFFU;
+
+        if (registration != 0xFFFFFFFFU &&
+            seh32_range_readable(registration, 4U * sizeof(uint32_t)))
+            try_level = ((uint32_t *)(uintptr_t)registration)[3];
+
+        env[0] = (uint32_t)g_int2e_user_rbp;
+        env[1] = (uint32_t)g_int2e_user_rbx;
+        env[2] = (uint32_t)g_int2e_user_rdi;
+        env[3] = (uint32_t)g_int2e_user_rsi;
+        env[4] = (uint32_t)(uintptr_t)(stack_args - 1);
+        env[5] = stack_args[-1];
+        env[6] = registration;
+        env[7] = try_level;
+
+        if (target == setjmp3_target) {
+            uint32_t count = stack_args[1];
+            env[8] = MSVC_JMPBUF_COOKIE;
+            env[9] = 0;
+
+            if (registration != 0xFFFFFFFFU && count != 0) {
+                env[9] = stack_args[2];
+                count--;
+                if (count != 0) {
+                    env[7] = stack_args[3];
+                    count--;
+                    if (count > 6U) count = 6U;
+                    for (uint32_t i = 0; i < count; i++)
+                        env[10 + i] = stack_args[4 + i];
+                }
+            }
+        }
+
+        *result = 0;
+        return 1;
+    }
+
+    uint32_t return_eip = env[5];
+    uint32_t saved_esp = env[4];
+    if (!seh32_range_readable(return_eip, 1) ||
+        !seh32_range_readable(saved_esp, sizeof(uint32_t))) {
+        serial_puts("[MSVCRT-JMP] invalid longjmp target eip=0x");
+        serial_puthex(return_eip, 8);
+        serial_puts(" esp=0x");
+        serial_puthex(saved_esp, 8);
+        serial_puts("\n");
+        *result = 0;
+        return 1;
+    }
+
+    uint32_t registration = env[6];
+    uint32_t unwind_function = 0;
+    if (seh32_range_readable(env_addr, 10U * sizeof(uint32_t)) &&
+        env[8] == MSVC_JMPBUF_COOKIE)
+        unwind_function = env[9];
+
+    /* _setjmp3 may provide the compiler's local-unwind helper. Run it on the
+     * active PE32 stack before discarding that stack frame. */
+    if (unwind_function && seh32_range_readable(unwind_function, 1)) {
+        uint32_t unwind_arg = env_addr;
+        uint32_t stack_top = (uint32_t)(uintptr_t)(stack_args - 1);
+        (void)compat32_callback_args_on_stack(unwind_function, 1,
+                                              &unwind_arg, stack_top);
+    }
+
+    if (teb) {
+        if (registration == 0xFFFFFFFFU || registration == 0 ||
+            seh32_range_readable(registration, 4U * sizeof(uint32_t))) {
+            teb->ExceptionList = registration;
+
+            /* The plain _setjmp path relies on _local_unwind2. There is no
+             * custom helper in that buffer, so retain the saved EH3 state
+             * when the target registration has the standard frame layout. */
+            if (!unwind_function && registration != 0xFFFFFFFFU &&
+                registration != 0)
+                ((uint32_t *)(uintptr_t)registration)[3] = env[7];
+        }
+    }
+
+    g_compat32_unwind_ebp = env[0];
+    g_compat32_unwind_ebx = env[1];
+    g_compat32_unwind_edi = env[2];
+    g_compat32_unwind_esi = env[3];
+    g_compat32_unwind_esp = saved_esp + sizeof(uint32_t);
+    g_compat32_unwind_restore_nonvolatile = 1;
+    g_compat32_unwind_eip = return_eip;
+
+    *result = stack_args[1] ? stack_args[1] : 1U;
+    return 1;
+}
+
+static int cxx32_type_name_equal(uint32_t left_type, uint32_t right_type)
+{
+    /* TypeDescriptor is { vftable, spare, name[] }. Keep the fallback
+     * bounded; identical descriptors normally match by pointer first. */
+    const uint32_t bytes = 8U + CXX32_MAX_TYPE_NAME;
+    if (!seh32_range_readable(left_type, bytes) ||
+        !seh32_range_readable(right_type, bytes))
+        return 0;
+
+    const char *left = (const char *)(uintptr_t)(left_type + 8U);
+    const char *right = (const char *)(uintptr_t)(right_type + 8U);
+    for (uint32_t i = 0; i < CXX32_MAX_TYPE_NAME; i++) {
+        if (left[i] != right[i])
+            return 0;
+        if (left[i] == '\0')
+            return 1;
+    }
+    return 0;
+}
+
+static int cxx32_handler_matches(const EXCEPTION_RECORD32 *record,
+                                 uint32_t handler_type,
+                                 uint32_t *matched_type)
+{
+    if (matched_type)
+        *matched_type = 0;
+    if (!record || record->NumberParameters < 3 || !handler_type)
+        return 0;
+
+    uint32_t throw_info_addr = record->ExceptionInformation[2];
+    if (!seh32_range_readable(throw_info_addr, sizeof(CXX_THROW_INFO32)))
+        return 0;
+
+    const CXX_THROW_INFO32 *throw_info =
+        (const CXX_THROW_INFO32 *)(uintptr_t)throw_info_addr;
+    uint32_t array_addr = throw_info->catchable_types;
+    if (!seh32_range_readable(array_addr, sizeof(int32_t)))
+        return 0;
+
+    int32_t count = *(const int32_t *)(uintptr_t)array_addr;
+    if (count <= 0 || count > CXX32_MAX_TYPES ||
+        !seh32_range_readable(array_addr,
+                              sizeof(int32_t) + (uint32_t)count * sizeof(uint32_t)))
+        return 0;
+
+    const uint32_t *types =
+        (const uint32_t *)(uintptr_t)(array_addr + sizeof(int32_t));
+    for (int32_t i = 0; i < count; i++) {
+        uint32_t catchable_addr = types[i];
+        if (!seh32_range_readable(catchable_addr,
+                                  sizeof(CXX_CATCHABLE_TYPE32)))
+            continue;
+
+        const CXX_CATCHABLE_TYPE32 *catchable =
+            (const CXX_CATCHABLE_TYPE32 *)(uintptr_t)catchable_addr;
+        uint32_t thrown_type = catchable->type;
+        if (!thrown_type)
+            continue;
+        if (thrown_type == handler_type ||
+            cxx32_type_name_equal(thrown_type, handler_type)) {
+            if (matched_type)
+                *matched_type = catchable_addr;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int cxx32_collect_unwind_actions(uint32_t unwind_map,
+                                        int32_t max_state,
+                                        int32_t current_state,
+                                        int32_t target_state,
+                                        uint32_t *actions,
+                                        uint32_t *action_count)
+{
+    *action_count = 0;
+    if (current_state == target_state)
+        return 1;
+    if (!unwind_map || max_state <= 0 || max_state > 4096 ||
+        current_state < 0 || current_state >= max_state ||
+        target_state < -1 || target_state >= current_state ||
+        !seh32_range_readable(unwind_map,
+                              (uint32_t)max_state *
+                                  sizeof(CXX_UNWIND_MAP_ENTRY32)))
+        return 0;
+
+    int32_t state = current_state;
+    for (int32_t steps = 0; state > target_state && steps <= max_state; steps++) {
+        if (state < 0 || state >= max_state)
+            return 0;
+
+        const CXX_UNWIND_MAP_ENTRY32 *entry =
+            (const CXX_UNWIND_MAP_ENTRY32 *)(uintptr_t)(
+                unwind_map + (uint32_t)state *
+                                 sizeof(CXX_UNWIND_MAP_ENTRY32));
+        if (entry->to_state >= state || entry->to_state < -1)
+            return 0;
+
+        if (entry->action) {
+            if (*action_count >= CXX32_MAX_UNWIND_ACTIONS ||
+                !seh32_range_readable(entry->action, 1))
+                return 0;
+            actions[(*action_count)++] = entry->action;
+        }
+        state = entry->to_state;
+    }
+    return state == target_state;
+}
+
 /* Accessor for msvcrt_shim.c's crt_except_handler3 compat32 path */
 PVOID seh32_ep_addr_for_filter(void)
 {
@@ -1954,6 +2881,8 @@ PVOID seh32_ep_addr_for_filter(void)
 
 int compat32_seh_dispatch(PEXCEPTION_RECORD ExceptionRecord)
 {
+    TEB32 *teb = compat32_current_teb();
+
     /* Track reentrant catch dispatch.
      * When a catch handler throws (e.g., appUnwindf re-throws), skip the
      * current frame (which is corrupted by the first dispatch) and start
@@ -1961,19 +2890,24 @@ int compat32_seh_dispatch(PEXCEPTION_RECORD ExceptionRecord)
     static int in_catch_dispatch = 0;
     static uint32_t catch_frame_addr = 0;
     static uint32_t saved_next_frame = 0;  /* saved Next BEFORE catch corrupts it */
-    if (in_catch_dispatch) {
+    if (in_catch_dispatch && ExceptionRecord->ExceptionCode == 0xE06D7363) {
         serial_puts("[SEH32] Re-throw from catch — using saved next frame 0x");
         serial_puthex(saved_next_frame, 8);
         serial_puts("\n");
         in_catch_dispatch = 0;
         /* Use the saved Next (from before the catch handler corrupted the frame) */
-        g_teb32.ExceptionList = saved_next_frame;
+        teb->ExceptionList = saved_next_frame;
+    } else if (in_catch_dispatch) {
+        /* A hardware fault raised by a catch funclet is a new exception, not
+         * C++ `throw;`. The catching frame was already unlinked before entry,
+         * so continue from the live chain without rewriting it. */
+        in_catch_dispatch = 0;
+        catch_frame_addr = 0;
+        saved_next_frame = 0;
     }
 
-    /* Read the 32-bit ExceptionList from TEB32.
-     * 32-bit code writes FS:[0] — since FS base points to g_teb32,
-     * the SEH chain is at g_teb32.ExceptionList (4 bytes). */
-    uint32_t frame_addr = g_teb32.ExceptionList;
+    /* Read the 32-bit ExceptionList from the current thread's TEB. */
+    uint32_t frame_addr = teb->ExceptionList;
 
     /* Diagnostic: read FS base from MSR to verify it points to g_teb32 */
 #ifndef TEST_HARNESS
@@ -1989,11 +2923,15 @@ int compat32_seh_dispatch(PEXCEPTION_RECORD ExceptionRecord)
         uint64_t fs_base = ((uint64_t)hi << 32) | lo;
         serial_puts("[SEH32] FS_BASE MSR = 0x");
         serial_puthex(fs_base, 16);
-        serial_puts(" g_teb32 = 0x");
-        serial_puthex((uint64_t)(ULONG_PTR)&g_teb32, 16);
-        uint32_t *fs0 = (uint32_t *)fs_base;
+        serial_puts(" teb = 0x");
+        serial_puthex((uint64_t)(ULONG_PTR)teb, 16);
         serial_puts(" *FS[0] = 0x");
-        serial_puthex(*fs0, 8);
+        if (fs_base)
+            serial_puthex(*(const uint32_t *)(ULONG_PTR)fs_base, 8);
+        else
+            serial_puts("<unavailable>");
+        serial_puts(" teb->ExceptionList=0x");
+        serial_puthex(teb ? teb->ExceptionList : 0, 8);
         serial_puts("\n");
     }
 #endif
@@ -2177,13 +3115,13 @@ int compat32_seh_dispatch(PEXCEPTION_RECORD ExceptionRecord)
                              * Unwind frames between chain head and this frame.
                              * Send EXCEPTION_UNWINDING to each handler above us.
                              */
-                            uint32_t uw_addr = g_teb32.ExceptionList;
+                            uint32_t uw_addr = teb->ExceptionList;
                             while (uw_addr != 0xFFFFFFFF && uw_addr != frame_addr) {
                                 uint32_t *uw32 = (uint32_t *)(ULONG_PTR)uw_addr;
                                 uw_addr = uw32[0]; /* skip to next */
                             }
                             /* Set this frame as new chain head */
-                            g_teb32.ExceptionList = frame_addr;
+                            teb->ExceptionList = frame_addr;
 
                             /*
                              * Call the 32-bit handler function.
@@ -2264,19 +3202,24 @@ int compat32_seh_dispatch(PEXCEPTION_RECORD ExceptionRecord)
             }
 
             /*
-             * Check for MSVC C++ EH handler thunk pattern:
-             *   B8 xx xx xx xx    MOV EAX, <FuncInfo_ptr>
-             *   E9 xx xx xx xx    JMP <__CxxFrameHandler>
+             * Check for an MSVC C++ EH handler thunk. /GS wrappers can run
+             * cookie checks before loading FuncInfo and tail-jumping to the
+             * CRT frame handler.
              *
              * If detected, parse FuncInfo directly and dispatch
              * to the matching catch block without calling the handler
              * (which needs a valid CONTEXT we can't easily provide).
              */
-            uint8_t *hcode = (uint8_t *)(uintptr_t)handler32;
+            uint32_t func_info_addr = crt_find_cxx_func_info(handler32);
+            if (func_info_addr) {
 
-            if (hcode[0] == 0xB8 && hcode[5] == 0xE9) {
-                /* Extract FuncInfo pointer from MOV EAX, imm32 */
-                uint32_t func_info_addr = *(uint32_t *)(hcode + 1);
+                /* __CxxFrameHandler3 only searches typed/catch-all handlers
+                 * for an MSVC C++ exception. Hardware faults continue through
+                 * the ordinary SEH chain. */
+                if (ExceptionRecord->ExceptionCode != 0xE06D7363) {
+                    serial_puts(" (CxxFrameHandler, non-C++ exception)\n");
+                    goto next_frame;
+                }
 
                 serial_puts(" (CxxFrameHandler thunk)\n");
                 serial_puts("[SEH32] FuncInfo=0x");
@@ -2286,8 +3229,8 @@ int compat32_seh_dispatch(PEXCEPTION_RECORD ExceptionRecord)
                  *                nTryBlocks(4), pTryBlockMap(4) */
                 uint32_t *fi = (uint32_t *)(uintptr_t)func_info_addr;
                 uint32_t magic = fi[0];
-                /* int32_t maxState = (int32_t)fi[1]; */
-                /* uint32_t pUnwindMap = fi[2]; */
+                int32_t maxState = (int32_t)fi[1];
+                uint32_t pUnwindMap = fi[2];
                 int32_t nTryBlocks = (int32_t)fi[3];
                 uint32_t pTryBlockMap = fi[4];
 
@@ -2299,6 +3242,13 @@ int compat32_seh_dispatch(PEXCEPTION_RECORD ExceptionRecord)
 
                 if (magic != 0x19930520 && magic != 0x19930522) {
                     serial_puts("[SEH32] bad FuncInfo magic, skipping\n");
+                    goto next_frame;
+                }
+                if (maxState <= 0 || maxState > 4096 ||
+                    nTryBlocks <= 0 || nTryBlocks > 64 ||
+                    !seh32_range_readable(pTryBlockMap,
+                                           (uint32_t)nTryBlocks * 20U)) {
+                    serial_puts("[SEH32] invalid C++ EH metadata, skipping\n");
                     goto next_frame;
                 }
 
@@ -2320,12 +3270,18 @@ int compat32_seh_dispatch(PEXCEPTION_RECORD ExceptionRecord)
                     uint32_t *tb = (uint32_t *)(uintptr_t)(pTryBlockMap + t * 20);
                     int32_t tryLow  = (int32_t)tb[0];
                     int32_t tryHigh = (int32_t)tb[1];
-                    /* int32_t catchHigh = (int32_t)tb[2]; */
+                    int32_t catchHigh = (int32_t)tb[2];
                     int32_t nCatches = (int32_t)tb[3];
                     uint32_t pHandlerArray = tb[4];
 
                     if (cur_state < tryLow || cur_state > tryHigh)
                         continue;
+                    if (nCatches <= 0 || nCatches > 64 ||
+                        !seh32_range_readable(pHandlerArray,
+                                               (uint32_t)nCatches * 16U)) {
+                        serial_puts("[SEH32] invalid catch metadata, skipping\n");
+                        continue;
+                    }
 
                     serial_puts("[SEH32] try[");
                     serial_putdec(t);
@@ -2338,8 +3294,8 @@ int compat32_seh_dispatch(PEXCEPTION_RECORD ExceptionRecord)
                     serial_puts("])\n");
 
                     /* HandlerType: adjectives(4), pType(4),
-                     *              dispCatchObj(4), addressOfHandler(4) = 16 bytes
-                     * Look for catch(...) first (pType == 0), then typed catches */
+                     *              dispCatchObj(4), addressOfHandler(4) = 16 bytes.
+                     * Handlers are tested in source order. */
                     uint32_t catch_handler = 0;
                     int32_t catch_disp = 0;
                     for (int32_t c = 0; c < nCatches; c++) {
@@ -2357,29 +3313,42 @@ int compat32_seh_dispatch(PEXCEPTION_RECORD ExceptionRecord)
                             serial_puts("\n");
                             break;
                         }
-                        /* TODO: typed catch matching */
-                    }
-
-                    /* Also accept first typed catch as fallback */
-                    if (!catch_handler && nCatches > 0) {
-                        uint32_t *ch = (uint32_t *)(uintptr_t)pHandlerArray;
-                        catch_handler = ch[3];
-                        catch_disp = (int32_t)ch[2];
-                        serial_puts("[SEH32] fallback catch handler=0x");
-                        serial_puthex(catch_handler, 8);
-                        serial_puts("\n");
+                        uint32_t matched_type = 0;
+                        if (cxx32_handler_matches(&seh32_exception_record,
+                                                  pType, &matched_type)) {
+                            catch_handler = addr;
+                            catch_disp = disp;
+                            serial_puts("[SEH32] typed catch type=0x");
+                            serial_puthex(pType, 8);
+                            serial_puts(" catchable=0x");
+                            serial_puthex(matched_type, 8);
+                            serial_puts(" handler=0x");
+                            serial_puthex(addr, 8);
+                            serial_puts("\n");
+                            break;
+                        }
                     }
 
                     if (catch_handler) {
-                        /* Update state to catchHigh (after the catch block) */
-                        frame32[2] = (uint32_t)((int32_t)tb[2]);
+                        uint32_t unwind_actions[CXX32_MAX_UNWIND_ACTIONS];
+                        uint32_t unwind_count = 0;
+                        if (!cxx32_collect_unwind_actions(
+                                pUnwindMap, maxState, cur_state, tryLow,
+                                unwind_actions, &unwind_count)) {
+                            serial_puts("[SEH32] invalid unwind path, skipping catch\n");
+                            goto next_frame;
+                        }
+
+                        /* The frame is in the catch state before the funclet
+                         * runs. Cleanup actions execute first on the same EBP. */
+                        frame32[2] = (uint32_t)catchHigh;
 
                         /* Unwind SEH chain to the NEXT frame after the catcher.
                          * Windows removes all frames up to and including the
                          * catching frame. The catch handler's locals overlap
                          * with the SEH registration at [EBP-4/-8/-C], so the
                          * frame must be unlinked before the handler runs. */
-                        g_teb32.ExceptionList = next32;
+                        teb->ExceptionList = next32;
 
                         /* EBP for the catch handler = frame_addr + 0x0C
                          * (C++ EH frame is 3 fields: Next+Handler+State = 12 bytes) */
@@ -2428,29 +3397,6 @@ int compat32_seh_dispatch(PEXCEPTION_RECORD ExceptionRecord)
                         in_catch_dispatch = 1;
                         catch_frame_addr = frame_addr;
                         saved_next_frame = next32;  /* save BEFORE catch corrupts it */
-                        g_compat32_unwind_eip = catch_handler;
-                        /*
-                         * The catch handler epilog does:
-                         *   pop edi; pop esi; pop ebx
-                         *   mov esp, ebp
-                         *   pop ebp
-                         *   ret N
-                         *
-                         * The pops MUST restore correct callee-saved values.
-                         * We write EDI/ESI/EBX from the establishing function's
-                         * stack frame into the area below EBP so the pops work.
-                         *
-                         * The establishing function prologue does:
-                         *   push ebx; push esi; push edi
-                         * at [EBP-N-12], [EBP-N-8], [EBP-N-4] after sub esp,N.
-                         * We can't know N, but we can read the saved ESP from
-                         * [EBP-0x10] (mov [ebp-0x10], esp after all pushes).
-                         *
-                         * Alternative: write EDI/ESI/EBX just below EBP and
-                         * set ESP there. The catch handler pushes/calls use
-                         * their own stack (below ESP), and the pops at epilog
-                         * restore correct values before mov esp,ebp resets ESP.
-                         */
                         /* MSVC catch funclet:
                          * - Gets EBP from establishing function
                          * - Does work (error handling)
@@ -2461,14 +3407,58 @@ int compat32_seh_dispatch(PEXCEPTION_RECORD ExceptionRecord)
                          * so the funclet's RET jumps to our stub (JMP EAX)
                          * which continues at the funclet's chosen address.
                          *
-                         * Stack layout at funclet entry:
-                         *   [ESP+0] = catch_continue_stub_addr (return addr)
+                         * Local unwind actions are ordinary funclets too. Chain
+                         * their RET addresses before the catch handler:
+                         *   action[0] -> ... -> catch -> continuation stub.
                          */
                         {
-                            uint32_t esp = catch_ebp - 4;
+                            /* EH3/EH4 prologs save the post-allocation stack
+                             * pointer at [EBP-0x10]. Starting a funclet at
+                             * EBP-4 reuses and corrupts its caller's locals.
+                             * Put our synthetic return below the saved stack
+                             * cursor, where an ordinary nested call belongs. */
+                            uint32_t saved_esp =
+                                *(uint32_t *)(uintptr_t)(catch_ebp - 0x10);
+                            uint32_t stack_bytes = (unwind_count + 1U) * 4U;
+
+                            /* Reject corrupt metadata without moving the stack
+                             * outside the establishing frame. */
+                            if (saved_esp == 0 || saved_esp >= catch_ebp ||
+                                saved_esp < stack_bytes ||
+                                catch_ebp - saved_esp > 0x100000 ||
+                                !seh32_range_readable(saved_esp - stack_bytes,
+                                                       stack_bytes)) {
+                                serial_puts("[SEH32] invalid saved funclet ESP=0x");
+                                serial_puthex(saved_esp, 8);
+                                serial_puts("\n");
+                                in_catch_dispatch = 0;
+                                g_compat32_unwind_eip = 0;
+                                goto next_frame;
+                            }
+
+                            uint32_t esp = saved_esp;
+                            esp -= 4;
                             *(uint32_t *)(uintptr_t)esp = catch_continue_stub_addr;
+                            if (unwind_count) {
+                                esp -= 4;
+                                *(uint32_t *)(uintptr_t)esp = catch_handler;
+                                for (uint32_t i = unwind_count; i > 1; i--) {
+                                    esp -= 4;
+                                    *(uint32_t *)(uintptr_t)esp =
+                                        unwind_actions[i - 1U];
+                                }
+                                g_compat32_unwind_eip = unwind_actions[0];
+                            } else {
+                                g_compat32_unwind_eip = catch_handler;
+                            }
                             g_compat32_unwind_esp = esp;
                             g_compat32_unwind_ebp = catch_ebp;
+
+                            serial_puts("[SEH32] local unwind actions=");
+                            serial_putdec(unwind_count);
+                            serial_puts(" entry=0x");
+                            serial_puthex(g_compat32_unwind_eip, 8);
+                            serial_puts("\n");
                         }
 
                         return 1;  /* handled — INT2E will apply unwind */
@@ -2509,19 +3499,17 @@ next_frame:
         frame_num++;
     }
 
-    /* Try unhandled exception filter */
-    if (g_unhandled_filter) {
-        serial_puts("[SEH32] calling UnhandledExceptionFilter\n");
-        EXCEPTION_POINTERS ep;
-        ep.ExceptionRecord = ExceptionRecord;
-        ep.ContextRecord   = NULL;
-
-        typedef LONG (WINAPI *uef_fn)(PEXCEPTION_POINTERS);
-        uef_fn filter = (uef_fn)g_unhandled_filter;
-        LONG result = filter(&ep);
-
-        if (result == EXCEPTION_CONTINUE_EXECUTION)
-            return 1;
+    /* Try the PE32 unhandled exception filter in compat mode. */
+    {
+        ULONG_PTR filter = (ULONG_PTR)
+            kernel32_get_unhandled_exception_filter();
+        if (filter >= 0x10000 && filter < 0x80000000) {
+            serial_puts("[SEH32] calling UnhandledExceptionFilter\n");
+            uint32_t arg = (uint32_t)(ULONG_PTR)&seh32_exception_pointers;
+            LONG result = (LONG)compat32_callback_args((uint32_t)filter, 1, &arg);
+            if (result == EXCEPTION_CONTINUE_EXECUTION)
+                return 1;
+        }
     }
 
     /* Try the base SEH frame as last resort — the normal chain may be
@@ -2594,6 +3582,7 @@ void dump_call_trace(void)
 
 uint64_t compat32_dispatch(uint32_t thunk_idx, uint32_t *stack_args)
 {
+    const int ut99 = g_compat32_ut99;
 #ifdef COMPAT_TRACE
     /* Panorama probe: confirms risk #1 (compat INT soft-int has no LAPIC
      * fast-path). On -smp 1 this is silent (BSP is LAPIC 0). On -smp 2+,
@@ -2617,6 +3606,8 @@ uint64_t compat32_dispatch(uint32_t thunk_idx, uint32_t *stack_args)
         }
     }
 #endif
+
+    if (ut99) {
 
     /* ENGINE-PATCH UnLevel.h:246-247 — skip Actors(0) assertions.
      * The function at Engine.dll ~0x1038C320 does two consecutive
@@ -2994,6 +3985,7 @@ uint64_t compat32_dispatch(uint32_t thunk_idx, uint32_t *stack_args)
      * stability, the engine's own ProcessRegistrants + Empty cycle
      * should complete naturally. */
 
+#ifndef OK_QUIET
     /* GOBJREG-DIAG — passive observer for GObjRegistrants TArray<UObject*>.
      * Each entry is a UObject* (4 bytes). UObject::Name (FName) is at
      * offset +0x20. Dereference to get the FName index, then look up
@@ -3484,6 +4476,8 @@ uint64_t compat32_dispatch(uint32_t thunk_idx, uint32_t *stack_args)
         }
     }
 
+#endif
+
     /* PRECREATE-PACKAGES REMOVED in Phase 7h.
      *
      * Phase 7g HWBP data confirmed Register's CreatePackage call fires
@@ -3583,6 +4577,8 @@ uint64_t compat32_dispatch(uint32_t thunk_idx, uint32_t *stack_args)
      * subsequent `call ebx` jumped into the object and #PF'd. Fix: GetProcAddress
      * now uses win32_abi_lookup for the real argc/cc (the Phase 1 mechanism). */
 
+    }
+
     /* Log PE32 caller return address (at stack_args[-1] = [ESP] on entry) */
     if (stack_args && thunk_idx < 0xFFFFFFF0) {
         uint32_t ret_addr = stack_args[-1]; /* return address pushed by CALL */
@@ -3592,12 +4588,25 @@ uint64_t compat32_dispatch(uint32_t thunk_idx, uint32_t *stack_args)
         extern uint32_t g_last_stack_args;
         g_last_caller_eip = ret_addr;
         g_last_stack_args = (uint32_t)(uintptr_t)stack_args;
+        callback_owner_state_t *dispatch_state =
+            callback_state_get(1, NULL);
+        if (dispatch_state)
+            dispatch_state->current_stack_args =
+                (uint32_t)(uintptr_t)stack_args;
 
+        if (ret_addr == 0x004018D1) {
+            serial_puts("[NSIS-EXTRACT] result=0x");
+            serial_puthex((uint32_t)g_int2e_user_rdi, 8);
+            serial_puts(" handle=0x");
+            serial_puthex(stack_args[0], 8);
+            serial_puts("\n");
+        }
 
         /* wdbg: dispatch any address-site hooks registered by callers
          * who want to inspect engine state when the PE is executing
          * inside a given VA range. No-op when no hooks registered. */
-        wdbg_check_caller(ret_addr, stack_args);
+        if (ut99)
+            wdbg_check_caller(ret_addr, stack_args);
 
         /* BAD-THIS detector: only flag ECX in PE-image .text range.
          * EDX in code range is often a legit function-pointer arg
@@ -3648,6 +4657,7 @@ uint64_t compat32_dispatch(uint32_t thunk_idx, uint32_t *stack_args)
         }
     }
 
+    if (ut99) {
     /* Dynamic IAT guard: protects specific entries discovered via #PF
      * auto-recovery. Also includes hardcoded StaticLoadClass for bootstrap. */
     {
@@ -3699,6 +4709,8 @@ uint64_t compat32_dispatch(uint32_t thunk_idx, uint32_t *stack_args)
         }
     }
 
+    }
+
     /* Callback return: 32-bit function completed, longjmp back */
     if (thunk_idx == THUNK_CALLBACK_RETURN) {
         /* Restore 64-bit data segments (compat mode set them to 0x48) */
@@ -3710,7 +4722,12 @@ uint64_t compat32_dispatch(uint32_t thunk_idx, uint32_t *stack_args)
             ::: "ax"
         );
 
-        int depth = callback_depth - 1;
+        callback_owner_state_t *callback_state = callback_state_get(0, NULL);
+        if (!callback_state) {
+            serial_puts("[INT2E] FATAL: callback owner state missing\n");
+            return 0;
+        }
+        int depth = callback_state->depth - 1;
         if (depth >= 16) {
             serial_puts("[INT2E] callback return depth=");
             serial_putdec(depth);
@@ -3732,12 +4749,12 @@ uint64_t compat32_dispatch(uint32_t thunk_idx, uint32_t *stack_args)
         {
             extern uint64_t *tss_ist1_ptr;
             if (tss_ist1_ptr && depth >= 0 && depth < MAX_CALLBACK_DEPTH)
-                *tss_ist1_ptr = callback_saved_ist1[depth];
+                *tss_ist1_ptr = callback_state->saved_ist1[depth];
         }
 
         /* Save retval per-depth BEFORE longjmp */
         if (depth >= 0 && depth < MAX_CALLBACK_DEPTH)
-            callback_retval_per_depth[depth] = callback_retval;
+            callback_state->retvals[depth] = (uint32_t)g_int2e_user_rdx;
 
         /* Compensate: longjmp bypasses int2e_stub's depth-- for RSP stack.
          * The callback-return INT 0x2E incremented g_int2e_rsp_depth but
@@ -3753,7 +4770,7 @@ uint64_t compat32_dispatch(uint32_t thunk_idx, uint32_t *stack_args)
          * state, or whether the slot was clobbered between setjmp and
          * the longjmp dispatch. */
         {
-            uint64_t *jb = callback_jmpbufs[depth];
+            uint64_t *jb = callback_state->jmpbufs[depth];
             if (depth >= 16) {
                 serial_puts("[CB32] longjmp depth="); serial_putdec(depth);
                 serial_puts(" rip=0x"); serial_puthex(jb[7], 16);
@@ -3762,7 +4779,7 @@ uint64_t compat32_dispatch(uint32_t thunk_idx, uint32_t *stack_args)
                 serial_puts("\n");
             }
         }
-        kern_longjmp(callback_jmpbufs[depth], 1);
+        kern_longjmp(callback_state->jmpbufs[depth], 1);
         /* never reached */
         return 0;
     }
@@ -3777,23 +4794,56 @@ uint64_t compat32_dispatch(uint32_t thunk_idx, uint32_t *stack_args)
     compat32_thunk_t *t = &thunk_table[thunk_idx];
     uint64_t target = t->target_addr;
     uint8_t nargs = t->num_args;
+    BOOL unresolved_target =
+        target == (uint64_t)(ULONG_PTR)unresolved_import_zero;
+    uint8_t dispatch_nargs = unresolved_target ? 0 : nargs;
+
+    if (unresolved_target) {
+        serial_puts("[UNRESOLVED-CALL] ");
+        if (t->name) serial_puts(t->name);
+        else serial_puts("<ordinal>");
+        serial_puts(" caller=0x");
+        serial_puthex(stack_args[-1], 8);
+        serial_puts(" argc=");
+        serial_putdec(nargs);
+        serial_puts("\n");
+    }
 
     /* Recent-native-call ring buffer: record this shim dispatch (cheap, no I/O)
      * so the NULL-CALL/#PF handler can dump the calls leading up to a crash. */
+    uint32_t rcall_slot;
     {
-        uint32_t ri = g_rcall_idx & 63;
-        g_rcall_name[ri]   = t->name;
-        g_rcall_nargs[ri]  = nargs;
-        g_rcall_caller[ri] = stack_args[-1];
-        g_rcall_args[ri][0] = nargs > 0 ? stack_args[0] : 0;
-        g_rcall_args[ri][1] = nargs > 1 ? stack_args[1] : 0;
-        g_rcall_args[ri][2] = nargs > 2 ? stack_args[2] : 0;
-        g_rcall_args[ri][3] = nargs > 3 ? stack_args[3] : 0;
-        g_rcall_idx++;
+        uint32_t caller = stack_args[-1];
+        uint32_t ri = g_rcall_idx ? (g_rcall_idx - 1) & 63 : 0;
+        if (g_rcall_idx && g_rcall_name[ri] == t->name &&
+            g_rcall_caller[ri] == caller &&
+            g_rcall_nargs[ri] == nargs &&
+            g_rcall_args[ri][0] == (dispatch_nargs > 0 ? stack_args[0] : 0) &&
+            g_rcall_args[ri][1] == (dispatch_nargs > 1 ? stack_args[1] : 0) &&
+            g_rcall_args[ri][2] == (dispatch_nargs > 2 ? stack_args[2] : 0) &&
+            g_rcall_args[ri][3] == (dispatch_nargs > 3 ? stack_args[3] : 0)) {
+            g_rcall_repeat[ri]++;
+        } else {
+            ri = g_rcall_idx & 63;
+            g_rcall_name[ri] = t->name;
+            g_rcall_nargs[ri] = nargs;
+            g_rcall_caller[ri] = caller;
+            g_rcall_repeat[ri] = 1;
+            g_rcall_idx++;
+        }
+        rcall_slot = ri;
+        g_rcall_args[ri][0] = dispatch_nargs > 0 ? stack_args[0] : 0;
+        g_rcall_args[ri][1] = dispatch_nargs > 1 ? stack_args[1] : 0;
+        g_rcall_args[ri][2] = dispatch_nargs > 2 ? stack_args[2] : 0;
+        g_rcall_args[ri][3] = dispatch_nargs > 3 ? stack_args[3] : 0;
+        g_rcall_ebp[ri] = (uint32_t)g_int2e_user_rbp;
+        g_rcall_esp[ri] = (uint32_t)(uintptr_t)stack_args - 4;
+        g_rcall_ret[ri] = 0;
     }
 
     /* Save the 13th stack arg for CreateWindowExW workaround. */
-    g_compat32_last_stack_arg13 = (nargs >= 12) ? stack_args[12] : 0;
+    g_compat32_last_stack_arg13 =
+        (dispatch_nargs >= 12) ? stack_args[12] : 0;
 
     /* Debug: dump full stack for 12-arg functions (CreateWindowExW) */
     if (nargs >= 12 && t->name && t->name[0] == 'C' && t->name[6] == 'W') {
@@ -3842,6 +4892,7 @@ uint64_t compat32_dispatch(uint32_t thunk_idx, uint32_t *stack_args)
                 st_acc += delta;
                 st_bad++;
                 if (st_bad <= 64) {
+#ifndef OK_QUIET
                     serial_puts("[STACK-DELTA] prev=");
                     if (st_prev_name) serial_puts(st_prev_name);
                     else serial_puts("?");
@@ -3858,12 +4909,13 @@ uint64_t compat32_dispatch(uint32_t thunk_idx, uint32_t *stack_args)
                     serial_puts(" prev_esp=0x");
                     serial_puthex(st_prev_esp, 8);
                     serial_puts("\n");
+#endif
                 }
             }
         }
         st_prev_esp   = esp32;
         st_prev_nargs = nargs;
-        st_prev_cc    = t->callconv;
+        st_prev_cc    = t->callconv & CC_CONVENTION_MASK;
         st_prev_name  = t->name;
 
         /* Also check alignment — a misaligned ESP is always a bug */
@@ -3936,23 +4988,78 @@ uint64_t compat32_dispatch(uint32_t thunk_idx, uint32_t *stack_args)
 
     /* Zero-extend 32-bit stack args to 64-bit */
     uint64_t a[12] = {0};
-    for (int i = 0; i < nargs && i < 12; i++)
+    for (int i = 0; i < dispatch_nargs && i < 12; i++)
         a[i] = (uint64_t)stack_args[i];
 
-    switch (nargs) {
-    case 0:  return ((fn0)(ULONG_PTR)target)();
-    case 1:  return ((fn1)(ULONG_PTR)target)(a[0]);
-    case 2:  return ((fn2)(ULONG_PTR)target)(a[0], a[1]);
-    case 3:  return ((fn3)(ULONG_PTR)target)(a[0], a[1], a[2]);
-    case 4:  return ((fn4)(ULONG_PTR)target)(a[0], a[1], a[2], a[3]);
-    case 5:  return ((fn5)(ULONG_PTR)target)(a[0], a[1], a[2], a[3], a[4]);
-    case 6:  return ((fn6)(ULONG_PTR)target)(a[0], a[1], a[2], a[3], a[4], a[5]);
-    case 7:  return ((fn7)(ULONG_PTR)target)(a[0], a[1], a[2], a[3], a[4], a[5], a[6]);
-    case 8:  return ((fn8)(ULONG_PTR)target)(a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7]);
-    case 9:  return ((fn9)(ULONG_PTR)target)(a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8]);
-    default: return ((fn12)(ULONG_PTR)target)(a[0], a[1], a[2], a[3], a[4], a[5],
-                                                a[6], a[7], a[8], a[9], a[10], a[11]);
+    int saved_compat_mode = g_compat32_mode;
+    g_compat32_mode = 1;
+    uint64_t result = 0;
+    if (!compat32_dispatch_nonlocal_jump(target, stack_args, &result)) {
+        uint8_t call_nargs = dispatch_nargs;
+        const void *bridge = unresolved_target ? NULL :
+            win32_abi_compat32_bridge((const void *)(ULONG_PTR)target);
+        if (t->callconv & CC_VARIADIC) {
+            if (!bridge || dispatch_nargs >= 12) {
+                serial_puts("[COMPAT32] Missing PE32 variadic bridge for ");
+                serial_puts(t->name ? t->name : "<unnamed>");
+                serial_puts("\n");
+                g_compat32_mode = saved_compat_mode;
+                return 0;
+            }
+            a[dispatch_nargs] =
+                (uint64_t)(ULONG_PTR)(stack_args + dispatch_nargs);
+            call_nargs++;
+        }
+        if (bridge)
+            target = (uint64_t)(ULONG_PTR)bridge;
+
+        switch (call_nargs) {
+        case 0:  result = ((fn0)(ULONG_PTR)target)(); break;
+        case 1:  result = ((fn1)(ULONG_PTR)target)(a[0]); break;
+        case 2:  result = ((fn2)(ULONG_PTR)target)(a[0], a[1]); break;
+        case 3:  result = ((fn3)(ULONG_PTR)target)(a[0], a[1], a[2]); break;
+        case 4:  result = ((fn4)(ULONG_PTR)target)(a[0], a[1], a[2], a[3]); break;
+        case 5:  result = ((fn5)(ULONG_PTR)target)(a[0], a[1], a[2], a[3], a[4]); break;
+        case 6:  result = ((fn6)(ULONG_PTR)target)(a[0], a[1], a[2], a[3], a[4], a[5]); break;
+        case 7:  result = ((fn7)(ULONG_PTR)target)(a[0], a[1], a[2], a[3], a[4], a[5], a[6]); break;
+        case 8:  result = ((fn8)(ULONG_PTR)target)(a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7]); break;
+        case 9:  result = ((fn9)(ULONG_PTR)target)(a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8]); break;
+        default: result = ((fn12)(ULONG_PTR)target)(a[0], a[1], a[2], a[3], a[4], a[5],
+                                                    a[6], a[7], a[8], a[9], a[10], a[11]); break;
+        }
     }
+    g_compat32_mode = saved_compat_mode;
+    {
+        extern void win32_main_termination_checkpoint(void);
+        win32_main_termination_checkpoint();
+    }
+    g_rcall_ret[rcall_slot] = (uint32_t)result;
+#ifndef OK_QUIET
+    if (nargs == 3 && a[2] == 0x54 && t->name &&
+        t->name[0] == 'H' && t->name[1] == 'e' && t->name[2] == 'a' &&
+        t->name[3] == 'p' && t->name[4] == 'A' && t->name[5] == 'l' &&
+        t->name[6] == 'l' && t->name[7] == 'o' && t->name[8] == 'c' &&
+        t->name[9] == 0) {
+        uint32_t ebp = (uint32_t)g_int2e_user_rbp;
+        uint32_t caller0 = 0, caller1 = 0;
+        if (ebp >= 0x10000 && ebp < 0x7FFFFFF8) {
+            uint32_t parent = *(volatile uint32_t *)(uintptr_t)ebp;
+            caller0 = *(volatile uint32_t *)(uintptr_t)(ebp + 4);
+            if (parent >= 0x10000 && parent < 0x7FFFFFF8)
+                caller1 = *(volatile uint32_t *)(uintptr_t)(parent + 4);
+        }
+        serial_puts("[HEAP54] ret=0x");
+        serial_puthex((uint32_t)result, 8);
+        serial_puts(" edi=0x");
+        serial_puthex((uint32_t)g_int2e_user_rdi, 8);
+        serial_puts(" callers=0x");
+        serial_puthex(caller0, 8);
+        serial_puts("/0x");
+        serial_puthex(caller1, 8);
+        serial_puts("\n");
+    }
+#endif
+    return result;
 }
 
 /* ── Stub UObject factory ────────────────────────────────────── */

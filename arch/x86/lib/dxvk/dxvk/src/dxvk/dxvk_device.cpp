@@ -315,8 +315,10 @@ namespace dxvk {
     m_submissionQueue.waitForIdle();
     m_submissionQueue.lockDeviceQueue();
 
-    if (m_vkd->vkDeviceWaitIdle(m_vkd->device()) != VK_SUCCESS)
-      Logger::err("DxvkDevice: waitForIdle: Operation failed");
+    VkResult status = m_vkd->vkDeviceWaitIdle(m_vkd->device());
+    if (status != VK_SUCCESS)
+      Logger::err(str::format(
+        "DxvkDevice: waitForIdle: Operation failed: ", status));
 
     m_submissionQueue.unlockDeviceQueue();
   }

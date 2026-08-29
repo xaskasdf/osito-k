@@ -183,13 +183,7 @@ namespace dxvk::wsi {
       pfn = pfnVkGipa(instance, "vkCreateOsitokCompositorSurfaceKHR");
 
     if (!pfn) {
-      /* Fall back to the directly-linked symbol from our libvulkan.    */
-      *pSurface = VK_NULL_HANDLE;
-      VkOsitoCompositorSurfaceCreateInfoOSITOK info = {};
-      info.sType     = VK_STRUCTURE_TYPE_OSITOK_COMPOSITOR_SURFACE_CREATE_INFO;
-      info.shmHandle = dxvk_compositor_window_shm(s_hwnds[idx].window_id);
-      return ::vkCreateOsitokCompositorSurfaceKHR(instance, &info,
-                                                  nullptr, pSurface);
+      return VK_ERROR_EXTENSION_NOT_PRESENT;
     }
 
     using PFN_T = VkResult (VKAPI_PTR *)(VkInstance,

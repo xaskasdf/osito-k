@@ -78,6 +78,20 @@ void serial_puts(const char *s)
     if (locked) serial_release();
 }
 
+void serial_write(const char *data, uint64_t length)
+{
+    if (!data || !length) return;
+
+    int locked = serial_acquire();
+    for (uint64_t i = 0; i < length; i++) {
+        char c = data[i];
+        if (!c) continue;
+        if (c == '\n') serial_putc('\r');
+        serial_putc(c);
+    }
+    if (locked) serial_release();
+}
+
 void serial_puthex(uint64_t val, int digits)
 {
     static const char hex[] = "0123456789ABCDEF";

@@ -242,9 +242,13 @@ namespace dxvk {
     // Deliberately pick a very high number of descriptor sets so that
     // we will typically end up using all available pool memory before
     // the descriptor set limit becomes the limiting factor.
+#ifdef __OSITO_K__
+    m_maxSets = 512u;
+#else
     m_maxSets = m_contextType == DxvkContextType::Primary
       ? (env::is32BitHostPlatform() ? 24576u : 49152u)
       : (512u);
+#endif
   }
 
 

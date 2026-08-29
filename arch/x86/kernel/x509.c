@@ -74,6 +74,87 @@ static int der_enter(const uint8_t **p, const uint8_t *end,
     return 0;
 }
 
+static int der_capture_tlv(const uint8_t **p, const uint8_t *end,
+                           const uint8_t **start, uint32_t *len)
+{
+    const uint8_t *tlv = *p;
+    if (der_skip_tlv(p, end) < 0) return -1;
+    *start = tlv;
+    *len = (uint32_t)(*p - tlv);
+    return 0;
+}
+
+static int x509_get_names(const uint8_t *cert, uint32_t cert_len,
+                          const uint8_t **issuer, uint32_t *issuer_len,
+                          const uint8_t **subject, uint32_t *subject_len)
+{
+    const uint8_t *p = cert;
+    const uint8_t *end = cert + cert_len;
+    const uint8_t *outer_end;
+    const uint8_t *tbs_end;
+
+    if (der_enter(&p, end, 0x30, &outer_end) < 0 ||
+        der_enter(&p, outer_end, 0x30, &tbs_end) < 0)
+        return -1;
+    if (p < tbs_end && p[0] == 0xA0)
+        if (der_skip_tlv(&p, tbs_end) < 0) return -1;
+
+    /* serialNumber, signature */
+    if (der_skip_tlv(&p, tbs_end) < 0 ||
+        der_skip_tlv(&p, tbs_end) < 0)
+        return -1;
+    if (der_capture_tlv(&p, tbs_end, issuer, issuer_len) < 0)
+        return -1;
+    /* validity */
+    if (der_skip_tlv(&p, tbs_end) < 0)
+        return -1;
+    return der_capture_tlv(&p, tbs_end, subject, subject_len);
+}
+
+int x509_get_issuer_name_der(const uint8_t *cert, uint32_t cert_len,
+                             const uint8_t **out_ptr, uint32_t *out_len)
+{
+    const uint8_t *subject;
+    uint32_t subject_len;
+    return x509_get_names(cert, cert_len, out_ptr, out_len,
+                          &subject, &subject_len);
+}
+
+int x509_get_subject_name_der(const uint8_t *cert, uint32_t cert_len,
+                              const uint8_t **out_ptr, uint32_t *out_len)
+{
+    const uint8_t *issuer;
+    uint32_t issuer_len;
+    return x509_get_names(cert, cert_len, &issuer, &issuer_len,
+                          out_ptr, out_len);
+}
+
+int x509_issuer_matches_subject(const uint8_t *child, uint32_t child_len,
+                                const uint8_t *candidate,
+                                uint32_t candidate_len)
+{
+    const uint8_t *child_issuer, *child_subject;
+    const uint8_t *candidate_issuer, *candidate_subject;
+    uint32_t child_issuer_len, child_subject_len;
+    uint32_t candidate_issuer_len, candidate_subject_len;
+
+    if (x509_get_names(child, child_len,
+                       &child_issuer, &child_issuer_len,
+                       &child_subject, &child_subject_len) < 0 ||
+        x509_get_names(candidate, candidate_len,
+                       &candidate_issuer, &candidate_issuer_len,
+                       &candidate_subject, &candidate_subject_len) < 0)
+        return -1;
+
+    (void)child_subject;
+    (void)child_subject_len;
+    (void)candidate_issuer;
+    (void)candidate_issuer_len;
+    if (child_issuer_len != candidate_subject_len)
+        return 0;
+    return bytes_eq(child_issuer, candidate_subject, child_issuer_len) == 0;
+}
+
 /* ── X.509 leaf-cert EC pubkey extraction ──────────────────── */
 
 int x509_extract_ec_pubkey(const uint8_t *cert, uint32_t cert_len,
@@ -213,8 +294,158 @@ extern int  ecdsa_p256_verify(const uint8_t pub_x[32], const uint8_t pub_y[32],
                               const uint8_t hash[32],
                               const uint8_t *sig, uint32_t sig_len);
 extern int  ecdsa_p384_verify(const uint8_t pub_x[48], const uint8_t pub_y[48],
-                              const uint8_t hash[48],
-                              const uint8_t *sig, uint32_t sig_len);
+                               const uint8_t hash[48],
+                               const uint8_t *sig, uint32_t sig_len);
+
+#if defined(__KERNEL_X86__) && !defined(WASM_BUILD)
+extern void sched_yield(void);
+#endif
+
+/* Certificate chains are commonly verified by several browser processes at
+ * once.  P-384 verification is expensive on machines without an accelerated
+ * bignum backend, while its result is immutable for a fixed child/issuer DER
+ * pair.  Keep a small process-independent cache and coalesce concurrent work
+ * on the same link. */
+#define X509_LINK_CACHE_SLOTS 64
+
+enum {
+    X509_LINK_CACHE_EMPTY = 0,
+    X509_LINK_CACHE_RUNNING,
+    X509_LINK_CACHE_READY,
+};
+
+typedef struct {
+    uint8_t child_hash[32];
+    uint8_t issuer_hash[32];
+    uint8_t state;
+    int8_t result;
+    uint64_t last_use;
+} x509_link_cache_entry_t;
+
+static x509_link_cache_entry_t x509_link_cache[X509_LINK_CACHE_SLOTS];
+static volatile uint32_t x509_link_cache_lock;
+static uint64_t x509_link_cache_generation;
+
+enum {
+    X509_LINK_CACHE_HIT = 0,
+    X509_LINK_CACHE_OWNER,
+    X509_LINK_CACHE_BYPASS,
+};
+
+static void x509_link_cache_lock_acquire(void)
+{
+    while (__sync_lock_test_and_set(&x509_link_cache_lock, 1)) {
+#if defined(__x86_64__) || defined(__i386__)
+        __asm__ volatile ("pause");
+#else
+        __sync_synchronize();
+#endif
+    }
+}
+
+static void x509_link_cache_lock_release(void)
+{
+    __sync_lock_release(&x509_link_cache_lock);
+}
+
+static int x509_link_hash_equal(const uint8_t left[32],
+                                const uint8_t right[32])
+{
+    return bytes_eq(left, right, 32) == 0;
+}
+
+static void x509_link_hash_copy(uint8_t destination[32],
+                                const uint8_t source[32])
+{
+    for (uint32_t i = 0; i < 32; i++) destination[i] = source[i];
+}
+
+static int x509_link_cache_claim(const uint8_t child_hash[32],
+                                 const uint8_t issuer_hash[32],
+                                 int *slot_out, int *result_out,
+                                 bool *coalesced_out)
+{
+    bool waited = false;
+
+    for (;;) {
+        int empty_slot = -1;
+        int victim_slot = -1;
+        uint64_t oldest = UINT64_MAX;
+
+        x509_link_cache_lock_acquire();
+        for (int i = 0; i < X509_LINK_CACHE_SLOTS; i++) {
+            x509_link_cache_entry_t *entry = &x509_link_cache[i];
+            if (entry->state == X509_LINK_CACHE_EMPTY) {
+                if (empty_slot < 0) empty_slot = i;
+                continue;
+            }
+            if (x509_link_hash_equal(entry->child_hash, child_hash) &&
+                x509_link_hash_equal(entry->issuer_hash, issuer_hash)) {
+                if (entry->state == X509_LINK_CACHE_READY) {
+                    entry->last_use = ++x509_link_cache_generation;
+                    *result_out = entry->result;
+                    *coalesced_out = waited;
+                    x509_link_cache_lock_release();
+                    return X509_LINK_CACHE_HIT;
+                }
+
+                x509_link_cache_lock_release();
+#if defined(__KERNEL_X86__) && !defined(WASM_BUILD)
+                waited = true;
+                sched_yield();
+                goto retry;
+#else
+                /* Host tools and the single-threaded WASM build do not have
+                 * the kernel scheduler.  Computing independently is safer
+                 * than spinning forever if a caller is re-entrant. */
+                *slot_out = -1;
+                return X509_LINK_CACHE_BYPASS;
+#endif
+            }
+            if (entry->state == X509_LINK_CACHE_READY &&
+                entry->last_use < oldest) {
+                oldest = entry->last_use;
+                victim_slot = i;
+            }
+        }
+
+        int slot = empty_slot >= 0 ? empty_slot : victim_slot;
+        if (slot < 0) {
+            x509_link_cache_lock_release();
+            *slot_out = -1;
+            return X509_LINK_CACHE_BYPASS;
+        }
+
+        x509_link_cache_entry_t *entry = &x509_link_cache[slot];
+        x509_link_hash_copy(entry->child_hash, child_hash);
+        x509_link_hash_copy(entry->issuer_hash, issuer_hash);
+        entry->last_use = ++x509_link_cache_generation;
+        entry->state = X509_LINK_CACHE_RUNNING;
+        *slot_out = slot;
+        *coalesced_out = waited;
+        x509_link_cache_lock_release();
+        return X509_LINK_CACHE_OWNER;
+
+#if defined(__KERNEL_X86__) && !defined(WASM_BUILD)
+retry:
+        ;
+#endif
+    }
+}
+
+static void x509_link_cache_publish(int slot, int result)
+{
+    if (slot < 0 || slot >= X509_LINK_CACHE_SLOTS) return;
+
+    x509_link_cache_lock_acquire();
+    x509_link_cache_entry_t *entry = &x509_link_cache[slot];
+    if (entry->state == X509_LINK_CACHE_RUNNING) {
+        entry->result = (int8_t)result;
+        entry->last_use = ++x509_link_cache_generation;
+        entry->state = X509_LINK_CACHE_READY;
+    }
+    x509_link_cache_lock_release();
+}
 
 /* OIDs we recognize for signature algorithms. */
 static const uint8_t OID_SHA256_WITH_RSA[] = {
@@ -297,8 +528,8 @@ typedef enum {
     SIG_UNKNOWN = 0,
     SIG_RSA_SHA256,
     SIG_RSA_SHA384,
-    SIG_ECDSA_P256_SHA256,
-    SIG_ECDSA_P256_SHA384,   /* P-256 key + SHA-384 hash (truncated) */
+    SIG_ECDSA_SHA256,
+    SIG_ECDSA_SHA384,
 } sig_alg_t;
 
 static sig_alg_t sigalg_recognize(const cert_parts_t *cp)
@@ -318,11 +549,53 @@ static sig_alg_t sigalg_recognize(const cert_parts_t *cp)
         return SIG_RSA_SHA384;
     if (avail >= sizeof OID_ECDSA_WITH_SHA256 &&
         !bytes_eq(p, OID_ECDSA_WITH_SHA256, sizeof OID_ECDSA_WITH_SHA256))
-        return SIG_ECDSA_P256_SHA256;
+        return SIG_ECDSA_SHA256;
     if (avail >= sizeof OID_ECDSA_WITH_SHA384 &&
         !bytes_eq(p, OID_ECDSA_WITH_SHA384, sizeof OID_ECDSA_WITH_SHA384))
-        return SIG_ECDSA_P256_SHA384;
+        return SIG_ECDSA_SHA384;
     return SIG_UNKNOWN;
+}
+
+/* Signature OIDs select the digest, not the EC curve.  Read the
+ * issuer SPKI parameters once so verification can dispatch without
+ * probing noisy, curve-specific extractors. */
+static int x509_ec_curve_bits(const uint8_t *cert, uint32_t cert_len)
+{
+    static const uint8_t OID_ID_EC_PUBLIC_KEY[] = {
+        0x06, 0x07, 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x02, 0x01
+    };
+    static const uint8_t OID_PRIME256V1[] = {
+        0x06, 0x08, 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x03, 0x01, 0x07
+    };
+    static const uint8_t OID_SECP384R1[] = {
+        0x06, 0x05, 0x2B, 0x81, 0x04, 0x00, 0x22
+    };
+    const uint8_t *p = cert;
+    const uint8_t *end = cert + cert_len;
+    const uint8_t *outer_end, *tbs_end, *spki_end, *alg_end;
+
+    if (der_enter(&p, end, 0x30, &outer_end) < 0 ||
+        der_enter(&p, outer_end, 0x30, &tbs_end) < 0)
+        return 0;
+    if (p < tbs_end && p[0] == 0xA0)
+        if (der_skip_tlv(&p, tbs_end) < 0) return 0;
+    for (int i = 0; i < 5; i++)
+        if (der_skip_tlv(&p, tbs_end) < 0) return 0;
+    if (der_enter(&p, tbs_end, 0x30, &spki_end) < 0 ||
+        der_enter(&p, spki_end, 0x30, &alg_end) < 0)
+        return 0;
+    if ((uint32_t)(alg_end - p) < sizeof OID_ID_EC_PUBLIC_KEY ||
+        bytes_eq(p, OID_ID_EC_PUBLIC_KEY,
+                 sizeof OID_ID_EC_PUBLIC_KEY) != 0)
+        return 0;
+    p += sizeof OID_ID_EC_PUBLIC_KEY;
+    if ((uint32_t)(alg_end - p) >= sizeof OID_PRIME256V1 &&
+        bytes_eq(p, OID_PRIME256V1, sizeof OID_PRIME256V1) == 0)
+        return 256;
+    if ((uint32_t)(alg_end - p) >= sizeof OID_SECP384R1 &&
+        bytes_eq(p, OID_SECP384R1, sizeof OID_SECP384R1) == 0)
+        return 384;
+    return 0;
 }
 
 /* Extract the RSA modulus + exponent from an issuer cert's SPKI.
@@ -373,11 +646,11 @@ static int extract_rsa_pubkey(const uint8_t *cert, uint32_t cert_len,
     /* DER INTEGER may have a leading 0x00 sign byte for positive
      * values whose MSB would otherwise be set.  Strip it. */
     const uint8_t *mp = p;
+    p += mlen;
     if (mlen > 1 && mp[0] == 0x00) { mp++; mlen--; }
     *n_out = mp;
     *n_len_out = mlen;
-    p += mlen;
-    if (mlen != 256) { /* Not RSA-2048 — bail. */ return -1; }
+    if (mlen < 256 || mlen > 512) return -1;
     /* publicExponent INTEGER */
     if (p >= rpk_end || *p != 0x02) return -1;
     p++;
@@ -389,26 +662,21 @@ static int extract_rsa_pubkey(const uint8_t *cert, uint32_t cert_len,
     return 0;
 }
 
-int x509_verify_chain_link(const uint8_t *child_cert, uint32_t child_len,
-                           const uint8_t *issuer_cert, uint32_t issuer_len)
+static int x509_verify_parts(const cert_parts_t *parts,
+                             const uint8_t *issuer_cert,
+                             uint32_t issuer_len)
 {
-    cert_parts_t cp;
-    if (cert_split(child_cert, child_len, &cp) < 0) {
-        serial_puts("[X509] chain: cert split failed\n");
-        return -1;
-    }
+    cert_parts_t cp = *parts;
     sig_alg_t sa = sigalg_recognize(&cp);
     if (sa == SIG_UNKNOWN) {
         serial_puts("[X509] chain: unrecognized signature algorithm\n");
         return -1;
     }
 
-    /* Compute the hash matching the sig algorithm.  For ECDSA-P256
-     * with SHA-384, the 48-byte digest is truncated to the leftmost
-     * 32 bytes (curve order width) per FIPS 186-4 §6.4. */
+    /* Compute the digest selected by the signature algorithm. */
     uint8_t hash32[32];
     uint8_t hash48[48];
-    bool use_sha384 = (sa == SIG_RSA_SHA384 || sa == SIG_ECDSA_P256_SHA384);
+    bool use_sha384 = (sa == SIG_RSA_SHA384 || sa == SIG_ECDSA_SHA384);
     if (use_sha384)
         sha384(cp.tbs, cp.tbs_len, hash48);
     else
@@ -437,46 +705,51 @@ int x509_verify_chain_link(const uint8_t *child_cert, uint32_t child_len,
         return 0;
     }
 
-    if (sa == SIG_ECDSA_P256_SHA256 || sa == SIG_ECDSA_P256_SHA384) {
-        /* ECDSA verification — the *curve* is determined by the
-         * issuer's pubkey, NOT by the sigalg OID.  Probe both
-         * extractors and dispatch to the matching primitive.  P-256
-         * first since it's the common case. */
+    if (sa == SIG_ECDSA_SHA256 || sa == SIG_ECDSA_SHA384) {
+        int curve_bits = x509_ec_curve_bits(issuer_cert, issuer_len);
+        /* ECDSA verification uses the issuer SPKI curve. */
         uint8_t p256x[32], p256y[32];
-        if (x509_extract_ec_pubkey(issuer_cert, issuer_len, p256x, p256y) == 0) {
+        if (curve_bits == 256 &&
+            x509_extract_ec_pubkey(issuer_cert, issuer_len,
+                                   p256x, p256y) == 0) {
             /* For SHA-384 → P-256, FIPS 186-4 §6.4 leftmost-truncates
              * the 48-byte digest to 32 bytes. */
-            const uint8_t *hh = (sa == SIG_ECDSA_P256_SHA256) ? hash32 : hash48;
+            const uint8_t *hh = (sa == SIG_ECDSA_SHA256) ? hash32 : hash48;
             if (ecdsa_p256_verify(p256x, p256y, hh, cp.sig, cp.sig_len) != 0) {
-                serial_puts(sa == SIG_ECDSA_P256_SHA256
+                serial_puts(sa == SIG_ECDSA_SHA256
                     ? "[X509] chain: ECDSA-P256-SHA256 verify FAILED\n"
                     : "[X509] chain: ECDSA-P256-SHA384 verify FAILED\n");
                 return -1;
             }
-            serial_puts(sa == SIG_ECDSA_P256_SHA256
+            serial_puts(sa == SIG_ECDSA_SHA256
                 ? "[X509] chain: ECDSA-P256-SHA256 link verified\n"
                 : "[X509] chain: ECDSA-P256-SHA384 link verified\n");
             return 0;
         }
         uint8_t p384x[48], p384y[48];
-        if (x509_extract_ec_pubkey_p384(issuer_cert, issuer_len,
-                                         p384x, p384y) == 0) {
+        if (curve_bits == 384 &&
+            x509_extract_ec_pubkey_p384(issuer_cert, issuer_len,
+                                        p384x, p384y) == 0) {
             /* SHA-256 against P-384 is not used in practice, but
              * support it for completeness: zero-pad the 32-byte
              * hash to 48 (right-align — leftmost bits zero).  The
              * canonical case is SHA-384 → P-384, no truncation. */
             uint8_t hh48[48];
-            if (sa == SIG_ECDSA_P256_SHA384) {
+            if (sa == SIG_ECDSA_SHA384) {
                 for (int i = 0; i < 48; i++) hh48[i] = hash48[i];
             } else {
                 for (int i = 0; i < 16; i++) hh48[i] = 0;
                 for (int i = 0; i < 32; i++) hh48[16 + i] = hash32[i];
             }
             if (ecdsa_p384_verify(p384x, p384y, hh48, cp.sig, cp.sig_len) != 0) {
-                serial_puts("[X509] chain: ECDSA-P384 verify FAILED\n");
+                serial_puts(sa == SIG_ECDSA_SHA384
+                    ? "[X509] chain: ECDSA-P384-SHA384 verify FAILED\n"
+                    : "[X509] chain: ECDSA-P384-SHA256 verify FAILED\n");
                 return -1;
             }
-            serial_puts("[X509] chain: ECDSA-P384 link verified\n");
+            serial_puts(sa == SIG_ECDSA_SHA384
+                ? "[X509] chain: ECDSA-P384-SHA384 link verified\n"
+                : "[X509] chain: ECDSA-P384-SHA256 link verified\n");
             return 0;
         }
         serial_puts("[X509] chain: issuer EC pubkey extract failed (neither P-256 nor P-384)\n");
@@ -484,6 +757,66 @@ int x509_verify_chain_link(const uint8_t *child_cert, uint32_t child_len,
     }
 
     return -1;
+}
+
+int x509_verify_chain_link(const uint8_t *child_cert, uint32_t child_len,
+                           const uint8_t *issuer_cert, uint32_t issuer_len)
+{
+    cert_parts_t cp;
+    if (!child_cert || !child_len || !issuer_cert || !issuer_len)
+        return -1;
+    if (cert_split(child_cert, child_len, &cp) < 0) {
+        serial_puts("[X509] chain: cert split failed\n");
+        return -1;
+    }
+
+    uint8_t child_hash[32];
+    uint8_t issuer_hash[32];
+    sha256(child_cert, child_len, child_hash);
+    sha256(issuer_cert, issuer_len, issuer_hash);
+
+    int slot = -1;
+    int result = -1;
+    bool coalesced = false;
+    int cache_status = x509_link_cache_claim(child_hash, issuer_hash,
+                                             &slot, &result, &coalesced);
+    if (cache_status == X509_LINK_CACHE_HIT) {
+        if (result == 0) {
+            serial_puts(coalesced
+                ? "[X509] chain: signature verification coalesced\n"
+                : "[X509] chain: signature cache hit\n");
+        } else {
+            serial_puts("[X509] chain: rejected signature cache hit\n");
+        }
+        return result;
+    }
+
+    result = x509_verify_parts(&cp, issuer_cert, issuer_len);
+    if (cache_status == X509_LINK_CACHE_OWNER)
+        x509_link_cache_publish(slot, result);
+    return result;
+}
+
+int x509_verify_signed_blob(const uint8_t *tbs, uint32_t tbs_len,
+                            const uint8_t *signature_algorithm,
+                            uint32_t signature_algorithm_len,
+                            const uint8_t *signature, uint32_t signature_len,
+                            const uint8_t *signer_cert,
+                            uint32_t signer_cert_len)
+{
+    if (!tbs || !tbs_len || !signature_algorithm ||
+        !signature_algorithm_len || !signature || !signature_len ||
+        !signer_cert || !signer_cert_len)
+        return -1;
+    cert_parts_t parts = {
+        .tbs = tbs,
+        .tbs_len = tbs_len,
+        .sigalg = signature_algorithm,
+        .sigalg_len = signature_algorithm_len,
+        .sig = signature,
+        .sig_len = signature_len,
+    };
+    return x509_verify_parts(&parts, signer_cert, signer_cert_len);
 }
 
 /* ── Validity-window check (A12.6) ──────────────────────────── */
@@ -540,13 +873,13 @@ static int parse_time_tlv(const uint8_t **p, const uint8_t *end,
     *p = q_end;          /* always advance past TLV */
 
     int year, month, day, hour, minute, second;
-    if (tag == 0x17 && len >= 13) {
+    if (tag == 0x17 && len == 13) {
         /* UTCTime: YYMMDDHHMMSSZ.  RFC 5280 §4.1.2.5.1: YY ∈ 00..49
          * → 2000..2049; YY ∈ 50..99 → 1950..1999. */
         int yy = read_ndigits(&q, q_end, 2);
         if (yy < 0) return -1;
         year = (yy < 50) ? (2000 + yy) : (1900 + yy);
-    } else if (tag == 0x18 && len >= 15) {
+    } else if (tag == 0x18 && len == 15) {
         /* GeneralizedTime: YYYYMMDDHHMMSSZ. */
         year = read_ndigits(&q, q_end, 4);
         if (year < 0) return -1;
@@ -558,13 +891,31 @@ static int parse_time_tlv(const uint8_t **p, const uint8_t *end,
     hour   = read_ndigits(&q, q_end, 2);
     minute = read_ndigits(&q, q_end, 2);
     second = read_ndigits(&q, q_end, 2);
-    if (month < 1 || month > 12 || day < 1 || day > 31) return -1;
+    if (month < 1 || month > 12 || day < 1) return -1;
+    static const uint8_t month_days[12] = {
+        31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31
+    };
+    int max_day = month_days[month - 1];
+    if (month == 2 && ((year % 4 == 0 && year % 100 != 0) ||
+                       year % 400 == 0))
+        max_day = 29;
+    if (day > max_day) return -1;
     if (hour < 0 || hour > 23) return -1;
     if (minute < 0 || minute > 59 || second < 0 || second > 60) return -1;
-    if (q >= q_end || (*q != 'Z' && *q != '+' && *q != '-')) return -1;
-    /* We don't handle timezone offsets — RFC 5280 mandates 'Z'. */
+    if (q + 1 != q_end || *q != 'Z') return -1;
 
     *out_unix = civil_to_unix(year, month, day, hour, minute, second);
+    return 0;
+}
+
+int x509_parse_time_der(const uint8_t *tlv, uint32_t tlv_len,
+                        uint32_t *unix_time, uint32_t *consumed)
+{
+    if (!tlv || !tlv_len || !unix_time) return -1;
+    const uint8_t *p = tlv;
+    const uint8_t *end = tlv + tlv_len;
+    if (parse_time_tlv(&p, end, unix_time) < 0) return -1;
+    if (consumed) *consumed = (uint32_t)(p - tlv);
     return 0;
 }
 
@@ -780,6 +1131,198 @@ static int find_extensions(const uint8_t *cert, uint32_t cert_len,
         break;
     }
     return -1;
+}
+
+/* Returns 1 when found, 0 when the extension is absent, and -1 when the
+ * extensions block exists but is malformed. */
+static int find_extension_value_status(const uint8_t *cert, uint32_t cert_len,
+                                       const uint8_t *oid, uint32_t oid_len,
+                                       const uint8_t **value,
+                                       uint32_t *value_len)
+{
+    const uint8_t *p, *end;
+    if (find_extensions(cert, cert_len, &p, &end) < 0) return 0;
+
+    while (p < end) {
+        const uint8_t *ext_end;
+        if (der_enter(&p, end, 0x30, &ext_end) < 0) return -1;
+        const uint8_t *ext_oid = p;
+        if (der_skip_tlv(&p, ext_end) < 0) return -1;
+        uint32_t ext_oid_len = (uint32_t)(p - ext_oid);
+        bool match = ext_oid_len == oid_len &&
+                     bytes_eq(ext_oid, oid, oid_len) == 0;
+        if (p < ext_end && *p == 0x01)
+            if (der_skip_tlv(&p, ext_end) < 0) return -1;
+        if (!match) {
+            p = ext_end;
+            continue;
+        }
+        if (p >= ext_end || *p++ != 0x04) return -1;
+        uint32_t len;
+        if (der_read_len(&p, ext_end, &len) < 0 || p + len > ext_end)
+            return -1;
+        *value = p;
+        *value_len = len;
+        return 1;
+    }
+    return 0;
+}
+
+static int find_extension_value(const uint8_t *cert, uint32_t cert_len,
+                                const uint8_t *oid, uint32_t oid_len,
+                                const uint8_t **value, uint32_t *value_len)
+{
+    return find_extension_value_status(cert, cert_len, oid, oid_len,
+                                       value, value_len) == 1 ? 0 : -1;
+}
+
+int x509_get_subject_key_id(const uint8_t *cert, uint32_t cert_len,
+                            const uint8_t **out_ptr, uint32_t *out_len)
+{
+    static const uint8_t OID_SKI[] = { 0x06, 0x03, 0x55, 0x1d, 0x0e };
+    const uint8_t *p, *end;
+    uint32_t len;
+    if (find_extension_value(cert, cert_len, OID_SKI, sizeof OID_SKI,
+                             &p, &len) < 0)
+        return -1;
+    end = p + len;
+    if (p >= end || *p++ != 0x04 ||
+        der_read_len(&p, end, &len) < 0 || p + len > end || len == 0)
+        return -1;
+    *out_ptr = p;
+    *out_len = len;
+    return 0;
+}
+
+int x509_get_authority_key_id(const uint8_t *cert, uint32_t cert_len,
+                              const uint8_t **out_ptr, uint32_t *out_len)
+{
+    static const uint8_t OID_AKI[] = { 0x06, 0x03, 0x55, 0x1d, 0x23 };
+    const uint8_t *p, *end;
+    uint32_t len;
+    if (find_extension_value(cert, cert_len, OID_AKI, sizeof OID_AKI,
+                             &p, &len) < 0)
+        return -1;
+    end = p + len;
+    const uint8_t *seq_end;
+    if (der_enter(&p, end, 0x30, &seq_end) < 0) return -1;
+    while (p < seq_end) {
+        if (*p == 0x80) {
+            p++;
+            if (der_read_len(&p, seq_end, &len) < 0 ||
+                p + len > seq_end || len == 0)
+                return -1;
+            *out_ptr = p;
+            *out_len = len;
+            return 0;
+        }
+        if (der_skip_tlv(&p, seq_end) < 0) return -1;
+    }
+    return -1;
+}
+
+static int oid_encode_arc(uint32_t arc, uint8_t *out, uint32_t capacity,
+                          uint32_t *offset)
+{
+    uint8_t reversed[5];
+    uint32_t count = 0;
+    do {
+        reversed[count++] = (uint8_t)(arc & 0x7fU);
+        arc >>= 7;
+    } while (arc && count < sizeof reversed);
+    if (arc || *offset + count > capacity) return -1;
+    while (count) {
+        uint8_t value = reversed[--count];
+        if (count) value |= 0x80;
+        out[(*offset)++] = value;
+    }
+    return 0;
+}
+
+static int oid_text_to_der(const char *text, uint8_t *out,
+                           uint32_t capacity, uint32_t *out_len)
+{
+    uint32_t arcs[32];
+    uint32_t count = 0;
+    const char *p = text;
+    if (!p || !*p) return -1;
+    for (;;) {
+        if (*p < '0' || *p > '9' || count == 32) return -1;
+        uint64_t value = 0;
+        do {
+            value = value * 10U + (uint32_t)(*p - '0');
+            if (value > UINT32_MAX) return -1;
+            p++;
+        } while (*p >= '0' && *p <= '9');
+        arcs[count++] = (uint32_t)value;
+        if (!*p) break;
+        if (*p++ != '.') return -1;
+    }
+    if (count < 2 || arcs[0] > 2 || (arcs[0] < 2 && arcs[1] > 39))
+        return -1;
+
+    uint64_t combined = (uint64_t)arcs[0] * 40U + arcs[1];
+    if (combined > UINT32_MAX) return -1;
+    uint32_t offset = 0;
+    if (oid_encode_arc((uint32_t)combined, out, capacity, &offset) < 0)
+        return -1;
+    for (uint32_t i = 2; i < count; i++)
+        if (oid_encode_arc(arcs[i], out, capacity, &offset) < 0)
+            return -1;
+    *out_len = offset;
+    return 0;
+}
+
+static int x509_evaluate_extended_key_usage(const uint8_t *cert,
+                                            uint32_t cert_len,
+                                            const char *usage_oid,
+                                            int absent_allowed)
+{
+    static const uint8_t OID_EKU[] = { 0x06, 0x03, 0x55, 0x1d, 0x25 };
+    static const uint8_t OID_ANY_EKU[] = { 0x55, 0x1d, 0x25, 0x00 };
+    uint8_t requested[64];
+    uint32_t requested_len;
+    if (oid_text_to_der(usage_oid, requested, sizeof requested,
+                        &requested_len) < 0)
+        return -1;
+
+    const uint8_t *p;
+    uint32_t len;
+    int status = find_extension_value_status(cert, cert_len,
+                                             OID_EKU, sizeof OID_EKU,
+                                             &p, &len);
+    if (status <= 0) return status == 0 ? absent_allowed : -1;
+
+    const uint8_t *end = p + len;
+    const uint8_t *seq_end;
+    if (der_enter(&p, end, 0x30, &seq_end) < 0 || seq_end != end)
+        return -1;
+    while (p < seq_end) {
+        if (*p++ != 0x06) return -1;
+        uint32_t oid_len;
+        if (der_read_len(&p, seq_end, &oid_len) < 0 ||
+            p + oid_len > seq_end || oid_len == 0)
+            return -1;
+        if ((oid_len == requested_len &&
+             bytes_eq(p, requested, requested_len) == 0) ||
+            (oid_len == sizeof OID_ANY_EKU &&
+             bytes_eq(p, OID_ANY_EKU, sizeof OID_ANY_EKU) == 0))
+            return 1;
+        p += oid_len;
+    }
+    return 0;
+}
+
+int x509_allows_extended_key_usage(const uint8_t *cert, uint32_t cert_len,
+                                   const char *usage_oid)
+{
+    return x509_evaluate_extended_key_usage(cert, cert_len, usage_oid, 1);
+}
+
+int x509_has_extended_key_usage(const uint8_t *cert, uint32_t cert_len,
+                                const char *usage_oid)
+{
+    return x509_evaluate_extended_key_usage(cert, cert_len, usage_oid, 0);
 }
 
 /* Find the Subject CN value (case insensitive match in matcher).
@@ -1035,10 +1578,12 @@ int x509_parse_v3(const uint8_t *cert, uint32_t cert_len, x509_v3_t *out)
     return 0;
 }
 
-int x509_check_chain_constraints(const uint8_t **chain,
-                                 const uint32_t *chain_lens,
-                                 uint32_t        count)
+int x509_check_chain_constraints_at(const uint8_t **chain,
+                                    const uint32_t *chain_lens,
+                                    uint32_t count,
+                                    uint32_t *bad_index)
 {
+    if (bad_index) *bad_index = 0;
     if (count == 0) return -1;
     /* Walk intermediates: chain[1..count-1].  The leaf chain[0]
      * generally doesn't have CA=TRUE; the root chain[count-1]
@@ -1048,6 +1593,7 @@ int x509_check_chain_constraints(const uint8_t **chain,
         x509_parse_v3(chain[i], chain_lens[i], &v3);
 
         if (!v3.has_bc || !v3.is_ca) {
+            if (bad_index) *bad_index = i;
             serial_puts("[X509] chain constraint: cert#");
             serial_putdec((uint64_t)i);
             serial_puts(" lacks BasicConstraints.cA=TRUE\n");
@@ -1056,6 +1602,7 @@ int x509_check_chain_constraints(const uint8_t **chain,
         /* If KeyUsage is present (most intermediates), it MUST
          * include keyCertSign — the right to sign other certs. */
         if (v3.has_ku && !(v3.key_usage_flags & X509_KU_KEY_CERT_SIGN)) {
+            if (bad_index) *bad_index = i;
             serial_puts("[X509] chain constraint: cert#");
             serial_putdec((uint64_t)i);
             serial_puts(" KeyUsage lacks keyCertSign\n");
@@ -1066,6 +1613,7 @@ int x509_check_chain_constraints(const uint8_t **chain,
          * ≤ path_len.  Count of intermediates below this one =
          * (i - 1).  RFC 5280 §4.2.1.9. */
         if (v3.path_len >= 0 && (int)(i - 1) > v3.path_len) {
+            if (bad_index) *bad_index = i;
             serial_puts("[X509] chain constraint: cert#");
             serial_putdec((uint64_t)i);
             serial_puts(" pathLenConstraint violated\n");
@@ -1073,6 +1621,13 @@ int x509_check_chain_constraints(const uint8_t **chain,
         }
     }
     return 0;
+}
+
+int x509_check_chain_constraints(const uint8_t **chain,
+                                 const uint32_t *chain_lens,
+                                 uint32_t count)
+{
+    return x509_check_chain_constraints_at(chain, chain_lens, count, NULL);
 }
 
 /* ── AIA extension parsing (A12.11) ─────────────────────────── */
@@ -1293,6 +1848,29 @@ int x509_get_issuer_der(const uint8_t *cert, uint32_t cert_len,
 /* Subject Public Key BIT STRING content (without the tag/length and
  * the leading unused-bits byte).  This is what OCSP CertID hashes
  * for the issuer-key-hash field. */
+int x509_get_spki_der(const uint8_t *cert, uint32_t cert_len,
+                      const uint8_t **out_ptr, uint32_t *out_len)
+{
+    const uint8_t *p = cert;
+    const uint8_t *end = cert + cert_len;
+    const uint8_t *outer_end, *tbs_end;
+    if (der_enter(&p, end, 0x30, &outer_end) < 0) return -1;
+    if (der_enter(&p, outer_end, 0x30, &tbs_end) < 0) return -1;
+    if (p < tbs_end && p[0] == 0xA0)
+        if (der_skip_tlv(&p, tbs_end) < 0) return -1;
+    /* serial, sigAlg, issuer, validity, subject = 5 */
+    for (int i = 0; i < 5; i++)
+        if (der_skip_tlv(&p, tbs_end) < 0) return -1;
+
+    if (p >= tbs_end || *p != 0x30) return -1;
+    const uint8_t *spki_start = p;
+    const uint8_t *spki_end;
+    if (der_enter(&p, tbs_end, 0x30, &spki_end) < 0) return -1;
+    *out_ptr = spki_start;
+    *out_len = (uint32_t)(spki_end - spki_start);
+    return 0;
+}
+
 int x509_get_subject_pubkey_bits(const uint8_t *cert, uint32_t cert_len,
                                  const uint8_t **out_ptr, uint32_t *out_len)
 {

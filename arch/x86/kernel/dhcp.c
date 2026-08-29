@@ -19,7 +19,7 @@ extern void     net_set_ip(const uint8_t ip[4]);
 extern void     net_set_gateway(const uint8_t gw[4]);
 extern void     net_set_netmask(const uint8_t mask[4]);
 extern void     net_dns_set_server(const uint8_t ip[4]);
-extern void     net_udp_listen(uint16_t port, void *handler);
+extern int      net_udp_listen(uint16_t port, void *handler);
 extern int      net_udp_send_broadcast(uint16_t dst_port, uint16_t src_port,
                                        const void *data, uint32_t len);
 extern void     net_poll(void);

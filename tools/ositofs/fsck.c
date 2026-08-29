@@ -6,7 +6,7 @@
  * Checks:
  *   1. Superblock validation (primary vs backup)
  *   2. File table scan (valid entries, bounds, overlaps, duplicates)
- *   3. Block accounting (used_blocks, next_data_block, orphans)
+ *   3. Block accounting (used_blocks, next_data_block, free gaps)
  *   4. Block CRC verification (--verbose only)
  *   5. Layer index validation (slot bounds, orphaned slots)
  *
@@ -27,7 +27,7 @@
 static int validate_super_raw(const osfs2_super_t *sb)
 {
     if (sb->magic != OSFS2_MAGIC) return -1;
-    if (sb->version != OSFS2_VERSION) return -1;
+    if (!osfs2_supported_version(sb->version)) return -1;
     osfs2_super_t tmp;
     memcpy(&tmp, sb, sizeof(tmp));
     tmp.crc32 = 0;
@@ -54,6 +54,14 @@ static int cmp_range(const void *a, const void *b)
     return 0;
 }
 
+static int file_names_equal(const char a[OSFS2_NAME_LEN],
+                            const char b[OSFS2_NAME_LEN])
+{
+    size_t a_len = strnlen(a, OSFS2_NAME_LEN);
+    size_t b_len = strnlen(b, OSFS2_NAME_LEN);
+    return a_len == b_len && memcmp(a, b, a_len) == 0;
+}
+
 /* ── Main ────────────────────────────────────────────────────── */
 
 int main(int argc, char **argv)
@@ -77,12 +85,40 @@ int main(int argc, char **argv)
 
     int errors = 0;
     int repaired = 0;
+    int repair_failed = 0;
 
     /* Open device (read-write only if --repair) */
     int fd = osfs2_open_device(device, repair ? 0 : 1);
     if (fd < 0) return 1;
 
     printf("ositofs-fsck: checking %s\n", device);
+
+    int journal_status = osfs2_journal_recover(fd, 0);
+    if (journal_status < 0) {
+        fprintf(stderr, "ositofs-fsck: committed journal is corrupt\n");
+        osfs2_close_device(fd);
+        return 1;
+    }
+    if (journal_status > 0) {
+        printf("  Journal: COMMITTED transaction pending\n");
+        errors++;
+        if (!repair) {
+            printf("ositofs-fsck: recovery required (use --repair)\n");
+            osfs2_close_device(fd);
+            return 1;
+        }
+    }
+    if (repair && osfs2_journal_recover(fd, 1) < 0) {
+        fprintf(stderr, "ositofs-fsck: journal replay failed\n");
+        osfs2_close_device(fd);
+        return 1;
+    }
+    if (journal_status > 0) {
+        printf("    -> repaired: replayed and cleared journal\n");
+        repaired++;
+    } else {
+        printf("  Journal: clean\n");
+    }
 
     /* ── 1. Superblock validation ────────────────────────────── */
 
@@ -113,22 +149,34 @@ int main(int argc, char **argv)
         else {
             printf("  Superblock: WARNING (primary and backup differ)\n");
             errors++;
+            if (repair) {
+                if (osfs2_write_bytes(fd, OSFS2_SUPER_BACKUP_OFF,
+                                      sb_buf, 4096) == 0 &&
+                    osfs2_sync(fd) == 0) {
+                    printf("    -> repaired: copied primary to backup\n");
+                    repaired++;
+                } else repair_failed = 1;
+            }
         }
     } else if (primary_ok && !backup_ok) {
         printf("  Superblock: WARNING (backup CORRUPT, primary OK)\n");
         errors++;
         if (repair) {
-            osfs2_write_bytes(fd, OSFS2_SUPER_BACKUP_OFF, sb_buf, 4096);
-            printf("    -> repaired: copied primary to backup\n");
-            repaired++;
+            if (osfs2_write_bytes(fd, OSFS2_SUPER_BACKUP_OFF, sb_buf, 4096) == 0 &&
+                osfs2_sync(fd) == 0) {
+                printf("    -> repaired: copied primary to backup\n");
+                repaired++;
+            } else repair_failed = 1;
         }
     } else if (!primary_ok && backup_ok) {
         printf("  Superblock: PRIMARY CORRUPT (backup OK)\n");
         errors++;
         if (repair) {
-            osfs2_write_bytes(fd, 0, sb_bak_buf, 4096);
-            printf("    -> repaired: copied backup to primary\n");
-            repaired++;
+            if (osfs2_write_bytes(fd, 0, sb_bak_buf, 4096) == 0 &&
+                osfs2_sync(fd) == 0) {
+                printf("    -> repaired: copied backup to primary\n");
+                repaired++;
+            } else repair_failed = 1;
         }
     } else {
         printf("  Superblock: BOTH CORRUPT\n");
@@ -146,7 +194,9 @@ int main(int argc, char **argv)
         memcpy(&sb, &sb_backup, sizeof(sb));
 
     osfs2_block_sz = sb.block_size;
-    uint32_t data_start = osfs2_data_start_blk(sb.block_size);
+    osfs2_set_layout(sb.version);
+    uint32_t data_start = osfs2_format_data_start_blk(sb.version,
+                                                       sb.block_size);
 
     free(sb_buf); sb_buf = NULL;
     free(sb_bak_buf); sb_bak_buf = NULL;
@@ -179,50 +229,60 @@ int main(int argc, char **argv)
         if (!(ft[i].flags & OSFS2_FLAG_VALID)) continue;
         actual_file_count++;
 
-        /* Bounds check: start_block */
-        if (ft[i].start_block < data_start) {
-            printf("  File [%u] '%s': start_block %u < data_start %u\n",
-                   i, ft[i].name, ft[i].start_block, data_start);
-            ft_errors++;
-        }
-
-        /* Bounds check: end within device */
-        uint32_t end = ft[i].start_block + ft[i].block_count;
-        if (end > sb.total_blocks) {
-            printf("  File [%u] '%s': end block %u > total_blocks %u\n",
-                   i, ft[i].name, end, sb.total_blocks);
-            ft_errors++;
-        }
-
         /* Null-terminated name check */
-        int name_ok = 0;
-        for (int j = 0; j < OSFS2_NAME_LEN; j++) {
-            if (ft[i].name[j] == '\0') { name_ok = 1; break; }
-        }
+        int name_ok = strnlen(ft[i].name, OSFS2_NAME_LEN) < OSFS2_NAME_LEN;
         if (!name_ok) {
-            printf("  File [%u]: name not null-terminated\n", i);
+            printf("  File [%u] '%.*s': name not null-terminated\n",
+                   i, OSFS2_NAME_LEN, ft[i].name);
             ft_errors++;
         }
 
-        /* Size vs block_count consistency */
-        if (ft[i].block_count > 0) {
+        int range_ok = 0;
+        if (ft[i].flags & OSFS2_FLAG_INLINE) {
+            if (ft[i].start_block != 0 || ft[i].block_count != 0) {
+                printf("  File [%u] '%.*s': inline file has extent %u+%u\n",
+                       i, OSFS2_NAME_LEN, ft[i].name,
+                       ft[i].start_block, ft[i].block_count);
+                ft_errors++;
+            }
+            if (ft[i].size > OSFS2_INLINE_MAX) {
+                printf("  File [%u] '%.*s': inline size %llu exceeds %u bytes\n",
+                       i, OSFS2_NAME_LEN, ft[i].name,
+                       (unsigned long long)ft[i].size, OSFS2_INLINE_MAX);
+                ft_errors++;
+            }
+        } else if (ft[i].block_count > 0) {
+            uint64_t end = (uint64_t)ft[i].start_block + ft[i].block_count;
+            if (ft[i].start_block < data_start) {
+                printf("  File [%u] '%.*s': start_block %u < data_start %u\n",
+                       i, OSFS2_NAME_LEN, ft[i].name,
+                       ft[i].start_block, data_start);
+                ft_errors++;
+            } else if (end > sb.total_blocks) {
+                printf("  File [%u] '%.*s': end block %llu > total_blocks %u\n",
+                       i, OSFS2_NAME_LEN, ft[i].name,
+                       (unsigned long long)end, sb.total_blocks);
+                ft_errors++;
+            } else {
+                range_ok = 1;
+            }
+
             uint64_t max_size = (uint64_t)ft[i].block_count * sb.block_size;
-            uint64_t min_size = (uint64_t)(ft[i].block_count - 1) * sb.block_size + 1;
             if (ft[i].size > max_size) {
-                printf("  File [%u] '%s': size %llu exceeds %u blocks capacity (%llu)\n",
-                       i, ft[i].name, (unsigned long long)ft[i].size,
+                printf("  File [%u] '%.*s': size %llu exceeds %u blocks capacity (%llu)\n",
+                       i, OSFS2_NAME_LEN, ft[i].name,
+                       (unsigned long long)ft[i].size,
                        ft[i].block_count, (unsigned long long)max_size);
                 ft_errors++;
             }
-            (void)min_size; /* size can be smaller (padding is fine) */
         } else if (ft[i].size > 0) {
-            printf("  File [%u] '%s': nonzero size but block_count=0\n",
-                   i, ft[i].name);
+            printf("  File [%u] '%.*s': nonzero size but block_count=0\n",
+                   i, OSFS2_NAME_LEN, ft[i].name);
             ft_errors++;
         }
 
         /* Collect range for overlap check */
-        if (ft[i].block_count > 0) {
+        if (range_ok) {
             ranges[range_count].start = ft[i].start_block;
             ranges[range_count].count = ft[i].block_count;
             ranges[range_count].file_idx = i;
@@ -252,9 +312,9 @@ int main(int argc, char **argv)
         if (!(ft[i].flags & OSFS2_FLAG_VALID)) continue;
         for (uint32_t j = i + 1; j < OSFS2_MAX_FILES; j++) {
             if (!(ft[j].flags & OSFS2_FLAG_VALID)) continue;
-            if (strcmp(ft[i].name, ft[j].name) == 0) {
-                printf("  DUPLICATE filename '%s' at slots %u and %u\n",
-                       ft[i].name, i, j);
+            if (file_names_equal(ft[i].name, ft[j].name)) {
+                printf("  DUPLICATE filename '%.*s' at slots %u and %u\n",
+                       OSFS2_NAME_LEN, ft[i].name, i, j);
                 dup_errors++;
             }
         }
@@ -272,13 +332,15 @@ int main(int argc, char **argv)
     for (uint32_t i = 1; i < range_count; i++) {
         uint32_t prev_end = ranges[i - 1].start + ranges[i - 1].count;
         if (ranges[i].start < prev_end) {
-            printf("  OVERLAP: files [%u] '%s' (blocks %u-%u) and [%u] '%s' (blocks %u-%u)\n",
-                   ranges[i - 1].file_idx,
-                   ft[ranges[i - 1].file_idx].name,
-                   ranges[i - 1].start,
-                   ranges[i - 1].start + ranges[i - 1].count - 1,
-                   ranges[i].file_idx,
-                   ft[ranges[i].file_idx].name,
+            printf("  OVERLAP: files [%u] '%.*s' (blocks %u-%u) and [%u] '%.*s' (blocks %u-%u)\n",
+                    ranges[i - 1].file_idx,
+                    OSFS2_NAME_LEN,
+                    ft[ranges[i - 1].file_idx].name,
+                    ranges[i - 1].start,
+                    ranges[i - 1].start + ranges[i - 1].count - 1,
+                    ranges[i].file_idx,
+                    OSFS2_NAME_LEN,
+                    ft[ranges[i].file_idx].name,
                    ranges[i].start,
                    ranges[i].start + ranges[i].count - 1);
             overlap_errors++;
@@ -333,28 +395,29 @@ int main(int argc, char **argv)
         }
     }
 
-    /* Orphaned blocks: blocks between data_start and hwm not covered by any file.
-     * We already have the sorted ranges, so walk them and count gaps. */
-    uint32_t orphaned = 0;
+    /* Extents are the allocation map in v2. Gaps below the high-water mark are
+     * free space left by block reclamation, not orphaned allocations. */
+    uint32_t free_gaps = 0;
     if (range_count > 0) {
         /* Gap before first file */
         if (ranges[0].start > data_start)
-            orphaned += ranges[0].start - data_start;
+            free_gaps += ranges[0].start - data_start;
         /* Gaps between files */
         for (uint32_t i = 1; i < range_count; i++) {
             uint32_t prev_end = ranges[i - 1].start + ranges[i - 1].count;
             if (ranges[i].start > prev_end)
-                orphaned += ranges[i].start - prev_end;
+                free_gaps += ranges[i].start - prev_end;
         }
     }
-    printf("  Orphaned blocks: %u\n", orphaned);
-    if (orphaned > 0) errors += (int)orphaned; /* each orphaned block is an issue */
+    printf("  Free gaps below high-water mark: %u blocks\n", free_gaps);
 
     free(ranges);
 
     /* ── 4. Block CRC verification (--verbose) ───────────────── */
 
-    if (verbose) {
+    if (verbose && !osfs2_crc_table_enabled) {
+        printf("  Block CRCs: unavailable in many-file layout\n");
+    } else if (verbose) {
         void *crc_buf = osfs2_alloc_aligned(OSFS2_CRCTAB_SIZE);
         if (!crc_buf) {
             fprintf(stderr, "ositofs-fsck: out of memory for CRC table\n");
@@ -380,8 +443,8 @@ int main(int argc, char **argv)
                     for (uint32_t b = 0; b < ft[i].block_count; b++) {
                         uint32_t blk = ft[i].start_block + b;
                         if (blk >= OSFS2_MAX_BLOCKS) {
-                            printf("  CRC: file '%s' block %u out of CRC table range\n",
-                                   ft[i].name, blk);
+                            printf("  CRC: file '%.*s' block %u out of CRC table range\n",
+                                    OSFS2_NAME_LEN, ft[i].name, blk);
                             file_ok = 0;
                             break;
                         }
@@ -390,23 +453,18 @@ int main(int argc, char **argv)
                         if (stored_crc == 0) continue; /* no CRC recorded */
 
                         if (osfs2_read_block(fd, blk, data_blk) < 0) {
-                            printf("  CRC: file '%s' block %u read error\n",
-                                   ft[i].name, blk);
+                            printf("  CRC: file '%.*s' block %u read error\n",
+                                    OSFS2_NAME_LEN, ft[i].name, blk);
                             file_ok = 0;
                             break;
                         }
 
-                        /* For the last block, only hash up to file size */
-                        uint64_t remaining = ft[i].size -
-                            (uint64_t)b * osfs2_block_sz;
-                        size_t hash_len = (remaining < osfs2_block_sz) ?
-                            (size_t)remaining : osfs2_block_sz;
-
-                        uint32_t calc = osfs2_crc32(data_blk, hash_len);
+                        uint32_t calc = osfs2_crc32(data_blk, osfs2_block_sz);
                         if (calc != stored_crc) {
-                            printf("  CRC MISMATCH: file '%s' block %u "
+                            printf("  CRC MISMATCH: file '%.*s' block %u "
                                    "(stored=0x%08X, calc=0x%08X)\n",
-                                   ft[i].name, blk, stored_crc, calc);
+                                    OSFS2_NAME_LEN, ft[i].name, blk,
+                                    stored_crc, calc);
                             file_ok = 0;
                         }
                     }
@@ -429,8 +487,11 @@ int main(int argc, char **argv)
 
     /* ── 5. Layer index validation ───────────────────────────── */
 
-    void *li_buf = osfs2_alloc_aligned(OSFS2_LAYERIDX_SIZE);
-    if (!li_buf) {
+    void *li_buf = osfs2_layer_index_enabled
+        ? osfs2_alloc_aligned(OSFS2_LAYERIDX_SIZE) : NULL;
+    if (!osfs2_layer_index_enabled)
+        printf("  Layer index: unavailable in large-file layout\n");
+    else if (!li_buf) {
         fprintf(stderr, "ositofs-fsck: out of memory for layer index\n");
     } else if (osfs2_read_bytes(fd, OSFS2_LAYERIDX_OFF, li_buf,
                                 OSFS2_LAYERIDX_SIZE) < 0) {
@@ -455,8 +516,8 @@ int main(int argc, char **argv)
 
             uint16_t slot = ft[i].layer_index_slot;
             if (slot >= OSFS2_MAX_MODELS) {
-                printf("  Layer index: file '%s' slot %u out of range [0, %u)\n",
-                       ft[i].name, slot, OSFS2_MAX_MODELS);
+                printf("  Layer index: file '%.*s' slot %u out of range [0, %u)\n",
+                       OSFS2_NAME_LEN, ft[i].name, slot, OSFS2_MAX_MODELS);
                 li_errors++;
                 continue;
             }
@@ -474,9 +535,10 @@ int main(int argc, char **argv)
                 for (uint32_t l = 0; l < nl; l++) {
                     if (li[slot].layer_offset[l] > ft[i].size) {
                         printf("  Layer index: slot %u layer %u offset %llu > "
-                               "file '%s' size %llu\n",
+                               "file '%.*s' size %llu\n",
                                slot, l,
                                (unsigned long long)li[slot].layer_offset[l],
+                               OSFS2_NAME_LEN,
                                ft[i].name,
                                (unsigned long long)ft[i].size);
                         li_errors++;
@@ -513,13 +575,14 @@ int main(int argc, char **argv)
 
         if (orphaned_slots > 0) {
             errors += orphaned_slots;
-            if (repair) {
-                if (osfs2_write_bytes(fd, OSFS2_LAYERIDX_OFF, li_buf,
-                                      OSFS2_LAYERIDX_SIZE) == 0) {
-                    printf("    -> repaired: cleared %u orphaned slot(s)\n",
-                           orphaned_slots);
-                    repaired++;
-                }
+                if (repair) {
+                    if (osfs2_write_bytes(fd, OSFS2_LAYERIDX_OFF, li_buf,
+                                      OSFS2_LAYERIDX_SIZE) == 0 &&
+                        osfs2_sync(fd) == 0) {
+                        printf("    -> repaired: cleared %u orphaned slot(s)\n",
+                               orphaned_slots);
+                        repaired++;
+                    } else repair_failed = 1;
             }
         }
         errors += li_errors;
@@ -537,16 +600,23 @@ int main(int argc, char **argv)
         if (wb) {
             memset(wb, 0, 4096);
             memcpy(wb, &sb, sizeof(sb));
-            osfs2_write_bytes(fd, 0, wb, 4096);
-            osfs2_write_bytes(fd, OSFS2_SUPER_BACKUP_OFF, wb, 4096);
+            if (osfs2_write_bytes(fd, 0, wb, 4096) < 0 ||
+                osfs2_write_bytes(fd, OSFS2_SUPER_BACKUP_OFF, wb, 4096) < 0 ||
+                osfs2_sync(fd) < 0)
+                repair_failed = 1;
             free(wb);
-        }
+        } else repair_failed = 1;
     }
 
     /* ── Summary ─────────────────────────────────────────────── */
 
     free(ft_buf);
     osfs2_close_device(fd);
+
+    if (repair_failed) {
+        fprintf(stderr, "ositofs-fsck: repair could not be persisted\n");
+        return 2;
+    }
 
     if (errors == 0) {
         printf("ositofs-fsck: filesystem is clean\n");

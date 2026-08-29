@@ -12,6 +12,7 @@
  */
 
 #include "ddraw_shim.h"
+#include "paging.h"
 #include "win32_abi.h"
 
 extern uint32_t compat32_callback_args(uint32_t func_addr, int nargs, const uint32_t *args);
@@ -64,6 +65,8 @@ static DWORD display_bpp    = 16;  /* UT99 SoftDrv uses 16-bit (RGB565) */
 static BYTE *framebuffer = NULL;
 static SIZE_T fb_size = 0;
 static uint32_t gop_pitch = 0;   /* GOP scanline pitch in pixels */
+static void *fallback_fb_phys = NULL;
+static SIZE_T fallback_fb_size = 0;
 static HANDLE ddraw_hwnd = NULL;  /* game window — saved by SetCooperativeLevel */
 
 /* GOP framebuffer accessors (defined in kernel/framebuffer.c) */
@@ -77,27 +80,42 @@ extern void      fb_flush_all(void)  __attribute__((weak));
 
 static void ensure_framebuffer(void)
 {
-    /* Try to use the real GOP framebuffer first */
-    if (!framebuffer && fb_get_base) {
+    /* fb_get_base() is borrowed storage. It may change when the console is
+     * redirected to a compositor surface, so refresh it on every present and
+     * never release it through the physical page allocator. */
+    if (fb_get_base) {
         uint32_t *gop = fb_get_base();
         if (gop) {
             framebuffer = (BYTE *)gop;
             gop_pitch = fb_get_pitch ? fb_get_pitch() : display_width;
             fb_size = (SIZE_T)gop_pitch * (fb_get_height ? fb_get_height() : display_height) * 4;
-            serial_puts("[DDRAW] Using GOP framebuffer at 0x");
-            serial_puthex((uint64_t)(ULONG_PTR)framebuffer, 16);
-            serial_puts("\n");
             return;
         }
     }
 
-    /* Fallback: allocate system RAM buffer */
+    /* Headless fallback. mem_alloc_pages() returns a physical address; kernel
+     * code under an isolated process CR3 must use the shared direct map. */
     SIZE_T needed = (SIZE_T)display_width * display_height * 4; /* 32bpp output */
-    if (framebuffer && fb_size >= needed) return;
-    if (framebuffer) mem_free_pages(framebuffer, (fb_size + 4095) / 4096);
+    if (fallback_fb_phys && fallback_fb_size >= needed) {
+        framebuffer = (BYTE *)PHYS_TO_VIRT(fallback_fb_phys);
+        fb_size = fallback_fb_size;
+        gop_pitch = display_width;
+        return;
+    }
+
+    void *new_phys = mem_alloc_pages((needed + 4095) / 4096);
+    if (!new_phys) {
+        framebuffer = NULL;
+        fb_size = 0;
+        return;
+    }
+    if (fallback_fb_phys)
+        mem_free_pages(fallback_fb_phys, (fallback_fb_size + 4095) / 4096);
+    fallback_fb_phys = new_phys;
+    fallback_fb_size = needed;
     fb_size = needed;
     gop_pitch = display_width;
-    framebuffer = (BYTE *)mem_alloc_pages((fb_size + 4095) / 4096);
+    framebuffer = (BYTE *)PHYS_TO_VIRT(fallback_fb_phys);
     if (framebuffer) dd_memset(framebuffer, 0, fb_size);
 }
 
@@ -526,17 +544,20 @@ static void present_surface_to_gop(DDSurface *s)
                          s->palette ? s->palette->entries : NULL);
 }
 
-/* Report the current SoftDrv render resolution (the surface space that
- * present_surface_to_gop scales to fill the whole screen). win32_post_mouse_abs
- * maps the absolute tablet into THIS space so the cursor lines up with the
- * scaled image. Returns 0/0 until a display mode is set. */
+/* Report the active scaled-present coordinate space. A process that has not
+ * presented or selected a DirectDraw mode must return 0/0 so USER32 keeps
+ * ordinary NT screen coordinates instead of inheriting the 640x480 legacy
+ * default. */
 void ddraw_get_display_size(uint32_t *w, uint32_t *h)
 {
-    /* Prefer the size of what is actually being PRESENTED (DIB or ddraw
-     * surface) so the cursor space always matches the visible image; fall back
-     * to the ddraw display mode before the first present. */
-    if (w) *w = g_present_src_w ? g_present_src_w : display_width;
-    if (h) *h = g_present_src_h ? g_present_src_h : display_height;
+    uint32_t active_w = g_present_src_w;
+    uint32_t active_h = g_present_src_h;
+    if ((!active_w || !active_h) && g_mode_set) {
+        active_w = display_width;
+        active_h = display_height;
+    }
+    if (w) *w = active_w;
+    if (h) *h = active_h;
 }
 
 /* Called by the GDI present path (BitBlt of a DIB to the window DC): the game

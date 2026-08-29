@@ -35,7 +35,6 @@ prepare_nvme() {
     local img="$BUILD/nvme-cluster-$name.img"
     cp "$(readlink "$BUILD/nvme.img" || echo "$BUILD/nvme.img")" "$img"
     # Provision the shared cluster PSK so HEARTBEAT verify succeeds.
-    "$OFS_TOOLS/ositofs-delete" "$img" oict-key.txt >/dev/null 2>&1 || true
     "$OFS_TOOLS/ositofs-write"  "$img" "$CLUSTER_KEY" --name oict-key.txt --overwrite >/dev/null
     # Disable the boot-time UT99/DOOM auto-launch (shell.c) — it would
     # monopolize the BSP with the win32 exception cascade and starve the
@@ -52,7 +51,6 @@ prepare_nvme() {
     local empty
     empty=$(mktemp)
     : > "$empty"
-    "$OFS_TOOLS/ositofs-delete" "$img" no-demo.bin >/dev/null 2>&1 || true
     "$OFS_TOOLS/ositofs-write"  "$img" "$empty" --name no-demo.bin --overwrite >/dev/null
     rm -f "$empty"
     # VM A initiates delegation — drop the sentinel that gates the probe.
@@ -60,7 +58,6 @@ prepare_nvme() {
         local sent
         sent=$(mktemp)
         echo "delegate-2026-06-01" > "$sent"
-        "$OFS_TOOLS/ositofs-delete" "$img" cluster-delegate.txt >/dev/null 2>&1 || true
         "$OFS_TOOLS/ositofs-write"  "$img" "$sent" --name cluster-delegate.txt --overwrite >/dev/null
         rm -f "$sent"
     fi

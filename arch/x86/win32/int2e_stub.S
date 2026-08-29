@@ -91,26 +91,26 @@ int2e_stub:
                                         `EBX + 0xC` FArray pattern */
     movq %r10, g_int2e_user_rbx(%rip)
 
-    /* Save RSP to per-depth stack before aligning and calling C dispatcher.
-     * Cannot use RBP (kern_longjmp overwrites it) or a single global
-     * (nested INT 0x2E from callback returns overwrites it). */
-    leaq g_int2e_rsp_stack(%rip), %r10
-    leaq g_int2e_rsp_depth(%rip), %r12
-    movl (%r12), %r13d
-    movq %rsp, (%r10,%r13,8)        /* save RSP at stack[depth] */
-    leal 1(%r13d), %r14d
-    movl %r14d, (%r12)               /* depth++ */
+    /* The scheduler preserves TSS.IST1 per process, so it is also the
+     * process-local cursor that survives a yield inside the dispatcher. */
+    incl g_int2e_rsp_depth(%rip)
 
     and $~0xF, %rsp
     call compat32_dispatch
 
-    /* Restore RSP from per-depth stack */
-    leaq g_int2e_rsp_stack(%rip), %r10
-    leaq g_int2e_rsp_depth(%rip), %r12
-    movl (%r12), %r13d
-    subl $1, %r13d                    /* depth-- */
-    movl %r13d, (%r12)
-    movq (%r10,%r13,8), %rsp         /* restore RSP from stack[depth] */
+    /* Recover this entry's saved frame from its current IST1 cursor. */
+    movq tss_ist1_ptr(%rip), %r10
+    movq (%r10), %rsp
+    addq $16384, %rsp
+    decl g_int2e_rsp_depth(%rip)
+
+    /* i386 returns 64-bit integers in EDX:EAX. EAX already survives the
+     * handler; publish the high half through the saved RDX slot. For ordinary
+     * 32-bit returns EDX is caller-clobbered, so zero/high propagation is also
+     * ABI-correct. */
+    movq %rax, %r11
+    shrq $32, %r11
+    movq %r11, 96(%rsp)
 
     /*
      * C++ EH catch dispatch: if compat32_seh_dispatch found a catch
@@ -138,6 +138,26 @@ int2e_stub:
     movq %r11, 72(%rsp)              /* offset 72 = saved RBP */
     movl $0, (%r10)                  /* clear ebp */
 
+    /* longjmp restores all i386 nonvolatile registers. C++ EH transfers use
+     * the same EIP/ESP/EBP channel but leave this flag clear. */
+    leaq g_compat32_unwind_restore_nonvolatile(%rip), %r10
+    movl (%r10), %r11d
+    testl %r11d, %r11d
+    jz .Lno_unwind
+    movl $0, (%r10)
+
+    leaq g_compat32_unwind_ebx(%rip), %r10
+    movl (%r10), %r11d
+    movq %r11, 112(%rsp)             /* offset 112 = saved RBX */
+
+    leaq g_compat32_unwind_esi(%rip), %r10
+    movl (%r10), %r11d
+    movq %r11, 88(%rsp)              /* offset 88 = saved RSI */
+
+    leaq g_compat32_unwind_edi(%rip), %r10
+    movl (%r10), %r11d
+    movq %r11, 80(%rsp)              /* offset 80 = saved RDI */
+
 .Lno_unwind:
     /* Restore old IST1 from stack */
     movq tss_ist1_ptr(%rip), %r11
@@ -161,13 +181,5 @@ int2e_stub:
 
     iretq
 
-.section .bss
-.align 8
-g_int2e_rsp_stack:
-    .fill 96, 8, 0             /* 96 depth levels × 8 bytes — must exceed the
-                                 IST1 nesting capacity (1MB / 16KB = 64 levels)
-                                 so deep boot-storm nesting can't overflow this
-                                 saved-RSP array into adjacent BSS. */
 /* g_int2e_rsp_depth defined in compat32.c */
-
 .section .note.GNU-stack,"",%progbits

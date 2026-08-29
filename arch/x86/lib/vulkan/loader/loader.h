@@ -74,10 +74,13 @@ struct osito_phys_device {
     VkPhysicalDevice           real;
 };
 
+struct osito_queue;
+
 struct osito_device {
     VK_LOADER_DATA             loader_data;
     struct osito_icd_inst     *owner;
     VkDevice                   real;
+    struct osito_queue        *queues;
 };
 
 /* W3b.3 — non-dispatchable wrappers. These don't carry VK_LOADER_DATA
@@ -151,6 +154,7 @@ struct osito_queue {
     VK_LOADER_DATA        loader_data;
     struct osito_device  *owner;
     VkQueue               real;
+    struct osito_queue   *next;
 };
 struct osito_fence {
     struct osito_device  *owner;

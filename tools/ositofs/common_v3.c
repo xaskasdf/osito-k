@@ -105,6 +105,15 @@ int osfs3_read_super(int fd, osfs3_super_t *sb)
         fprintf(stderr, "osfs3: unsupported version %u\n", sb->version);
         return -1;
     }
+    if (sb->block_size != OSFS3_BLOCK_SIZE ||
+        sb->total_blocks <= sb->first_data_block ||
+        sb->total_blocks > OSFS3_BITMAP_BITS ||
+        sb->total_inodes < 2 || sb->total_inodes > OSFS3_MAX_INODES ||
+        sb->first_data_block != OSFS3_FIRST_DATA_BLOCK(sb->total_inodes) ||
+        sb->root_inode == 0 || sb->root_inode >= sb->total_inodes) {
+        fprintf(stderr, "osfs3: invalid filesystem geometry\n");
+        return -1;
+    }
 
     uint32_t saved_crc = sb->crc32;
     sb->crc32 = 0;

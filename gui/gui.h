@@ -73,6 +73,8 @@ typedef struct {
 #define GUI_DOCK_HEIGHT     48
 #define GUI_DOCK_ICON_SIZE  36
 #define GUI_DOCK_PADDING    8
+#define GUI_DOCK_BUILTIN_COUNT 2
+#define GUI_DOCK_MAX_TASKS  32
 #define GUI_TITLEBAR_H      28
 #define GUI_BORDER_W        1
 #define GUI_CORNER_RADIUS   4
@@ -90,6 +92,14 @@ typedef struct {
     uint32_t content_color;
     bool     hidden;        /* window is closed/minimized — skip rendering */
 } gui_win_desc_t;
+
+typedef struct {
+    uint32_t id;
+    uint32_t color;
+    char     label;
+    bool     focused;
+    bool     minimized;
+} gui_dock_task_t;
 
 /* ── Debug info (populated by kernel, rendered by panel) ──── */
 
@@ -172,6 +182,9 @@ const gui_debug_info_t *gui_panel_get_debug(void);
 
 void gui_dock_render(gui_surface_t *s, uint32_t screen_w, uint32_t screen_h,
                      int32_t cursor_x, int32_t cursor_y);
+void gui_dock_set_tasks(const gui_dock_task_t *tasks, int count);
+int  gui_dock_item_count(void);
+uint32_t gui_dock_task_id(int dock_index);
 
 /* ── Window decorations (gui_window.c) ────────────────────── */
 
@@ -204,6 +217,7 @@ bool gui_anim_any_active(void);
 
 void gui_desktop_init(uint32_t screen_w, uint32_t screen_h);
 void gui_desktop_render(gui_surface_t *screen);
+void gui_desktop_render_dock(gui_surface_t *screen);
 gui_win_desc_t *gui_desktop_get_windows(int *count);
 void gui_desktop_set_cursor(int32_t x, int32_t y);
 void gui_desktop_raise_window(int idx);

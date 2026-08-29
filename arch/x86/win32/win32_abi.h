@@ -27,6 +27,12 @@
 #define CC_FASTCALL 3   /* first two DWORD args in ECX/EDX */
 #endif
 
+/* The low bits retain the calling convention. ABI flags below preserve the
+ * descriptor layout shared by the existing shim tables. */
+#define WIN32_EXPORT_DATA_FLAG 0x80U
+#define WIN32_EXPORT_ABI_MASK  0x7FU
+#define WIN32_EXPORT_CC_MASK   CC_CONVENTION_MASK
+
 /*
  * Co-located export descriptor. `argc` = number of 32-bit stack DWORD slots
  * the caller pushes (a 64-bit-by-value param — __int64/double — counts as 2).
@@ -45,6 +51,8 @@ typedef struct {
 #define WX_STD(name, fn, n)   { name, (void *)(fn), (uint8_t)(n), CC_STDCALL }
 #define WX_CDL(name, fn, n)   { name, (void *)(fn), (uint8_t)(n), CC_CDECL }
 #define WX_THIS(name, fn, n)  { name, (void *)(fn), (uint8_t)(n), CC_THISCALL }
+#define WX_DATA(name, ptr)     { name, (void *)(ptr), 0, \
+                                 (uint8_t)(CC_CDECL | WIN32_EXPORT_DATA_FLAG) }
 
 /* Register a shim DLL's co-located export table for ABI lookup. Call once per
  * DLL alongside dll_register_shim(). `count` = number of rows. */
@@ -59,6 +67,23 @@ void win32_abi_register(const char *dll_name, const WIN32_EXPORT *table, int cou
  */
 int win32_abi_lookup(const char *dll_name, const char *func_name,
                      uint8_t *out_argc, uint8_t *out_cc);
+
+/* Resolve an ordinal import's ABI from the function selected by its DLL
+ * resolver. Also returns the canonical export name for diagnostics. */
+int win32_abi_lookup_target(const char *dll_name, const void *target,
+                            const char **out_name, uint8_t *out_argc,
+                            uint8_t *out_cc);
+
+/* True when a registered resolver target is exported storage rather than an
+ * entry point.  Such targets must be written directly to an IAT/GPA result. */
+int win32_abi_target_is_data(const char *dll_name, const void *target);
+
+/* Register and resolve a fixed-signature PE32 bridge for a native variadic
+ * shim. The compat dispatcher passes the bridge a pointer to the first
+ * variadic DWORD; native PE64 callers continue to use the original target. */
+void win32_abi_register_compat32_bridge(const void *native_target,
+                                        const void *compat32_target);
+const void *win32_abi_compat32_bridge(const void *native_target);
 
 /*
  * Decode argc (32-bit stack DWORDs) + calling convention from an MSVC-mangled

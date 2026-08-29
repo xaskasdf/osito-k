@@ -36,6 +36,7 @@ extern void *mem_alloc_pages(uint64_t count);
 extern void  mem_free_pages(void *addr, uint64_t count);
 extern void *kmalloc(uint64_t size);
 extern void  kfree(void *ptr);
+extern int   strncmp(const char *a, const char *b, uint64_t n);
 
 /* winexec engine */
 extern int winexec_run(const uint8_t *file_data, uint64_t file_size);
@@ -180,6 +181,10 @@ void win32_init(void)
 /* ── Current PE name (for GetModuleFileName) ─────────────────── */
 
 char win32_exe_name[64] = "program.exe";
+char win32_image_path[260] = "program.exe";
+#define WIN32_COMMAND_LINE_CAP 4096
+char win32_command_line[WIN32_COMMAND_LINE_CAP] = "program.exe";
+static char win32_relaunch_command_line[WIN32_COMMAND_LINE_CAP];
 
 /* Set by ShellExecuteA/CreateProcessA when the guest launches an .exe (UT99
  * re-launches itself to apply a video-mode/color-depth change). win32_exec
@@ -187,9 +192,41 @@ char win32_exe_name[64] = "program.exe";
  * same EXE — a minimal "process re-exec" so the relaunch isn't a dead exit. */
 int  g_win32_relaunch = 0;
 
+BOOL win32_request_relaunch(const char *application,
+                            const char *command_line)
+{
+    const char *source = command_line && command_line[0]
+                       ? command_line : application;
+    if (!source || !source[0]) return FALSE;
+
+    int out = 0;
+    BOOL quote_application = (!command_line || !command_line[0]);
+    if (quote_application) {
+        for (int i = 0; source[i]; i++) {
+            if (source[i] == ' ' || source[i] == '\t') {
+                if (out >= WIN32_COMMAND_LINE_CAP - 1) return FALSE;
+                win32_relaunch_command_line[out++] = '"';
+                break;
+            }
+        }
+    }
+
+    for (int i = 0; source[i]; i++) {
+        if (out >= WIN32_COMMAND_LINE_CAP - 1) return FALSE;
+        win32_relaunch_command_line[out++] = source[i];
+    }
+    if (quote_application && out && win32_relaunch_command_line[0] == '"') {
+        if (out >= WIN32_COMMAND_LINE_CAP - 1) return FALSE;
+        win32_relaunch_command_line[out++] = '"';
+    }
+    win32_relaunch_command_line[out] = 0;
+    __atomic_store_n(&g_win32_relaunch, 1, __ATOMIC_RELEASE);
+    return TRUE;
+}
+
 /* ── Load and execute a PE from OsitoFS ──────────────────────── */
 
-int win32_exec(const char *filename)
+int win32_exec_args(const char *filename, int argc, const char **argv)
 {
     if (!win32_initialized) {
         serial_puts("[WIN32] Not initialized — call win32_init() first\n");
@@ -201,9 +238,34 @@ int win32_exec(const char *filename)
         return -1;
     }
 
+    int cmd_pos = 0;
+    for (int arg = 0; arg < argc &&
+                            cmd_pos < WIN32_COMMAND_LINE_CAP - 1; arg++) {
+        int quoted = argv[arg][0] == 0;
+        for (int i = 0; argv[arg][i]; i++) {
+            if (argv[arg][i] == ' ' || argv[arg][i] == '\t') {
+                quoted = 1;
+                break;
+            }
+        }
+        if (arg > 0) win32_command_line[cmd_pos++] = ' ';
+        if (quoted && cmd_pos < WIN32_COMMAND_LINE_CAP - 1)
+            win32_command_line[cmd_pos++] = '"';
+        for (int i = 0; argv[arg][i] &&
+                            cmd_pos < WIN32_COMMAND_LINE_CAP - 1; i++)
+            win32_command_line[cmd_pos++] = argv[arg][i];
+        if (quoted && cmd_pos < WIN32_COMMAND_LINE_CAP - 1)
+            win32_command_line[cmd_pos++] = '"';
+    }
+    win32_command_line[cmd_pos] = 0;
+    serial_puts("[WIN32] Command line: ");
+    serial_puts(win32_command_line);
+    serial_puts("\n");
+
     int result = -1;
   relaunch:
-    g_win32_relaunch = 0;
+    __atomic_store_n(&g_win32_relaunch, 0, __ATOMIC_RELEASE);
+    win32_relaunch_command_line[0] = 0;
 
     /* Find file on OsitoFS */
     void *file = osfs2_find(filename);
@@ -243,9 +305,18 @@ int win32_exec(const char *filename)
 
     /* Set the PE name for GetModuleFileName */
     {
+        int path_len = 0;
+        while (filename[path_len] && path_len < 259) {
+            win32_image_path[path_len] = filename[path_len];
+            path_len++;
+        }
+        win32_image_path[path_len] = 0;
+
+        const char *exe_name = filename;
+        if (strncmp(exe_name, "System\\", 7) == 0) exe_name += 7;
         int i;
-        for (i = 0; filename[i] && i < 63; i++)
-            win32_exe_name[i] = filename[i];
+        for (i = 0; exe_name[i] && i < 63; i++)
+            win32_exe_name[i] = exe_name[i];
         win32_exe_name[i] = 0;
     }
 
@@ -265,7 +336,16 @@ int win32_exec(const char *filename)
      * same EXE. NOTE: win32 global state (PE/DLL VA mappings, FName, GMalloc,
      * surfaces) is only partially reset by winexec_run's *_shim_init — this is a
      * debug attempt to see how far a naive re-exec gets. */
-    if (g_win32_relaunch) {
+    if (__atomic_load_n(&g_win32_relaunch, __ATOMIC_ACQUIRE)) {
+        if (win32_relaunch_command_line[0]) {
+            int i = 0;
+            while (win32_relaunch_command_line[i] &&
+                   i < WIN32_COMMAND_LINE_CAP - 1) {
+                win32_command_line[i] = win32_relaunch_command_line[i];
+                i++;
+            }
+            win32_command_line[i] = 0;
+        }
         serial_puts("[WIN32] === RE-EXEC requested — relaunching ");
         serial_puts(filename);
         serial_puts(" ===\n");
@@ -273,6 +353,12 @@ int win32_exec(const char *filename)
     }
 
     return result;
+}
+
+int win32_exec(const char *filename)
+{
+    const char *argv[] = { filename };
+    return win32_exec_args(filename, 1, argv);
 }
 
 /* ── Install an MSI/MSIX package from OsitoFS ─────────────────── */

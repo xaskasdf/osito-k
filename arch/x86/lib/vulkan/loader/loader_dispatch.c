@@ -273,6 +273,8 @@ VKAPI_ATTR void     VKAPI_CALL vkCmdBindDescriptorSets(
     uint32_t, const uint32_t *);
 VKAPI_ATTR void     VKAPI_CALL vkCmdBindIndexBuffer(
     VkCommandBuffer, VkBuffer, VkDeviceSize, VkIndexType);
+VKAPI_ATTR void     VKAPI_CALL vkCmdBindIndexBuffer2KHR(
+    VkCommandBuffer, VkBuffer, VkDeviceSize, VkDeviceSize, VkIndexType);
 VKAPI_ATTR void     VKAPI_CALL vkCmdCopyBuffer(
     VkCommandBuffer, VkBuffer, VkBuffer, uint32_t, const VkBufferCopy *);
 VKAPI_ATTR void     VKAPI_CALL vkCmdCopyBufferToImage(
@@ -330,11 +332,6 @@ VKAPI_ATTR void     VKAPI_CALL vkCmdWaitEvents(
     uint32_t, const VkMemoryBarrier *,
     uint32_t, const VkBufferMemoryBarrier *,
     uint32_t, const VkImageMemoryBarrier *);
-
-/* W4.7-fix: stub returning VK_ERROR_FEATURE_NOT_PRESENT for any
- * Vulkan symbol we don't implement. Mesa/Zink/DXVK check returns
- * and bail gracefully instead of dereferencing a NULL function ptr. */
-VKAPI_ATTR VkResult VKAPI_CALL osito_vk_unimplemented_stub(void);
 
 PFN_vkVoidFunction
 osito_loader_get_instance_proc_addr(VkInstance instance, const char *pName) {
@@ -610,6 +607,9 @@ osito_loader_get_instance_proc_addr(VkInstance instance, const char *pName) {
         return (PFN_vkVoidFunction)vkCmdBindDescriptorSets;
     if (strcmp(pName, "vkCmdBindIndexBuffer") == 0)
         return (PFN_vkVoidFunction)vkCmdBindIndexBuffer;
+    if (strcmp(pName, "vkCmdBindIndexBuffer2") == 0 ||
+        strcmp(pName, "vkCmdBindIndexBuffer2KHR") == 0)
+        return (PFN_vkVoidFunction)vkCmdBindIndexBuffer2KHR;
     if (strcmp(pName, "vkCmdCopyBuffer") == 0)
         return (PFN_vkVoidFunction)vkCmdCopyBuffer;
     if (strcmp(pName, "vkCmdCopyBufferToImage") == 0)
@@ -669,18 +669,7 @@ osito_loader_get_instance_proc_addr(VkInstance instance, const char *pName) {
             if (fn) return fn;
         }
     }
-    /* W4.7-fix: rather than NULL (which crashes Mesa when it later
-     * calls a NULL function pointer), return a stub that just yields
-     * VK_ERROR_FEATURE_NOT_PRESENT. Mesa+Zink check returns and bail
-     * gracefully on unsupported entries. */
-    { extern int printf(const char *, ...);
-      printf("[LOADER] STUB proc '%s'\n", pName); }  /* DIAG: procs DXVK wants but unimplemented */
-    return (PFN_vkVoidFunction)osito_vk_unimplemented_stub;
-}
-
-VKAPI_ATTR VkResult VKAPI_CALL
-osito_vk_unimplemented_stub(void) {
-    return VK_ERROR_FEATURE_NOT_PRESENT;
+    return NULL;
 }
 
 VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL
@@ -3285,6 +3274,28 @@ vkCmdBindIndexBuffer(VkCommandBuffer cb, VkBuffer buffer,
     if (!fn) return;
     VkBuffer real = buffer ? buf_from(buffer)->real : 0;
     fn(w->real, real, offset, indexType);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+vkCmdBindIndexBuffer2KHR(VkCommandBuffer cb, VkBuffer buffer,
+                         VkDeviceSize offset, VkDeviceSize size,
+                         VkIndexType indexType) {
+    OSITO_CB_PROLOG(return);
+    PFN_vkCmdBindIndexBuffer2KHR fn = (PFN_vkCmdBindIndexBuffer2KHR)
+        ci->icd->get_proc_addr(ci->handle, "vkCmdBindIndexBuffer2KHR");
+    if (!fn)
+        fn = (PFN_vkCmdBindIndexBuffer2KHR)
+            ci->icd->get_proc_addr(ci->handle, "vkCmdBindIndexBuffer2");
+    if (!fn) return;
+    VkBuffer real = buffer ? buf_from(buffer)->real : 0;
+    fn(w->real, real, offset, size, indexType);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+vkCmdBindIndexBuffer2(VkCommandBuffer cb, VkBuffer buffer,
+                      VkDeviceSize offset, VkDeviceSize size,
+                      VkIndexType indexType) {
+    vkCmdBindIndexBuffer2KHR(cb, buffer, offset, size, indexType);
 }
 
 VKAPI_ATTR void VKAPI_CALL

@@ -1,9 +1,8 @@
 /*
- * OsitoK -- virtio-gpu 3D extension (Vulkan Phase 1 / Wave 1)
+ * OsitoK -- virtio-gpu Venus transport
  *
- * Builds on drivers/virtio_gpu.c. Adds VIRGL feature negotiation,
- * per-process GPU context tracking, resource table, and venus wire
- * command submission.
+ * Builds on drivers/virtio_gpu.c. Provides Venus context lifecycle,
+ * host-visible blob resources and official protocol submission.
  *
  * Callers come from kernel/syscall.c (sys_gpu_* cases 600-607).
  */
@@ -50,6 +49,7 @@ int32_t vg3d_res_create(uint32_t pid, uint32_t ctx_id,
 /* Map resource backing memory into caller's VA space.
  * Returns virtual address or 0 on error. */
 uint64_t vg3d_res_map(uint32_t pid, uint32_t res_id);
+int32_t vg3d_res_destroy(uint32_t pid, uint32_t res_id);
 
 /* Submit venus command bytes. Writes fence_id to *out_fence on success. */
 int32_t vg3d_submit(uint32_t pid, uint32_t ctx_id,
@@ -60,8 +60,7 @@ int32_t vg3d_submit(uint32_t pid, uint32_t ctx_id,
  * signaled, -ETIMEDOUT on timeout, -EINVAL on bad id. */
 int32_t vg3d_fence_wait(uint64_t fence, uint64_t timeout_ns);
 
-/* Bridge to compositor: push a resource's memory into the SHM surface
- * backing `shm_handle` and signal it dirty. */
+/* Presentation is not exposed until a GPU-backed WSI path is connected. */
 int32_t vg3d_present(uint32_t pid, uint32_t ctx_id,
                      uint32_t res_id, uint32_t shm_handle);
 

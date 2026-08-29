@@ -171,7 +171,7 @@ sequenceDiagram
     U->>U: SYSCALL (Linux ABI:<br/>rax=nr · rdi rsi rdx r10 r8 r9)
     U->>SE: trap to ring 0 via LSTAR MSR
     SE->>SE: swap gs · save user RSP<br/>push frame
-    SE->>SD: syscall_dispatch(nr, a1..a5)
+    SE->>SD: syscall_dispatch(nr, a1..a6)
     alt nr in {uname, getcwd, fstat, stat}
         SD->>MEMO: lookup(nr, hash)
         MEMO-->>SD: hit -> return cached

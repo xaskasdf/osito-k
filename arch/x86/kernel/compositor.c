@@ -39,6 +39,7 @@ extern int     input_drain_coalesced(int16_t *mdx, int16_t *mdy,
                                      uint8_t *buttons, int16_t *wheel,
                                      void *key_out, int key_max);
 extern void    input_get_cursor(int32_t *x, int32_t *y);
+extern uint8_t input_get_buttons(void);
 extern void    input_post_mouse_move(int16_t dx, int16_t dy);
 
 /* Shared memory (shm.c) */
@@ -48,11 +49,14 @@ extern uint64_t shm_get_phys(uint32_t handle);
 
 /* Scheduler / process (process.c) */
 extern void proc_set_qos(uint8_t qos);
+extern int sched_sleep_ticks(uint64_t ticks);
 extern uint64_t idt_get_ticks(void);
 extern uint32_t proc_count_active(void);
 
 /* USB HID polling (xhci.c — weak: absent if no xHCI) */
 extern void xhci_poll(void) __attribute__((weak));
+extern bool user32_activate_compositor_window(uint32_t window_id)
+    __attribute__((weak));
 
 
 /* ── CMOS RTC helpers ──────────────────────────────────────── */
@@ -84,7 +88,7 @@ extern uint64_t mem_get_total(void);
 
 /* ── Window Structure ────────────────────────────────────────── */
 
-#define MAX_WINDOWS     32
+#define MAX_WINDOWS     256
 #define MAX_TITLE_LEN   64
 
 /* Window flags */
@@ -94,15 +98,21 @@ extern uint64_t mem_get_total(void);
 #define WND_MINIMIZED   (1 << 3)
 #define WND_FOCUSED     (1 << 4)
 #define WND_DIRTY       (1 << 5)  /* surface has new content */
+#define WND_TASKBAR     (1 << 6)  /* top-level application window */
 
 typedef struct {
     uint32_t id;
     int16_t  x, y;                 /* position on screen */
     uint16_t width, height;
+    uint16_t surface_pitch;        /* backing surface width in pixels */
+    uint16_t surface_height;       /* backing surface allocation height */
     uint32_t shm_handle;           /* shared memory containing pixels */
     uint32_t *pixels;              /* mapped pointer to surface */
     uint32_t owner_pid;
-    uint8_t  z_order;              /* 0 = bottom, higher = on top */
+    uint32_t z_order;              /* 0 = bottom, higher = on top */
+    int16_t  clip_x, clip_y;
+    uint16_t clip_width, clip_height;
+    bool     clip_enabled;
     uint8_t  flags;
     char     title[MAX_TITLE_LEN];
 } window_t;
@@ -111,6 +121,7 @@ typedef struct {
 
 static window_t windows[MAX_WINDOWS];
 static uint32_t next_window_id = 1;
+static uint32_t next_z_order = 1;
 static int32_t  focused_window = -1;  /* index into windows[] */
 
 /* Sorted window list for rendering (by z_order) */
@@ -121,6 +132,7 @@ static int render_count;
 static bool     dragging;
 static int32_t  drag_win_idx;       /* index into demo_windows[] */
 static int32_t  drag_off_x, drag_off_y;
+static bool     managed_pointer_active;
 static uint8_t  prev_buttons;
 static int      focused_demo_idx = 0;   /* 0=Terminal (focused by default) */
 
@@ -207,10 +219,15 @@ uint32_t compositor_create_window(uint32_t shm_handle,
     w->y = y;
     w->width = width;
     w->height = height;
+    w->surface_pitch = width;
+    w->surface_height = height;
     w->shm_handle = shm_handle;
     w->pixels = (uint32_t *)shm_map(shm_handle);
     w->owner_pid = pid;
-    w->z_order = (uint8_t)slot;
+    w->z_order = next_z_order++;
+    w->clip_x = w->clip_y = 0;
+    w->clip_width = w->clip_height = 0;
+    w->clip_enabled = false;
     w->flags = WND_ACTIVE | WND_VISIBLE | WND_DIRTY;
 
     /* Copy title */
@@ -260,6 +277,180 @@ void compositor_destroy_window(uint32_t window_id)
             return;
         }
     }
+}
+
+void compositor_set_visible(uint32_t window_id, bool visible)
+{
+    for (int i = 0; i < MAX_WINDOWS; i++) {
+        if (!(windows[i].flags & WND_ACTIVE) || windows[i].id != window_id)
+            continue;
+        uint8_t old_flags = windows[i].flags;
+        if (visible)
+            windows[i].flags |= WND_VISIBLE;
+        else
+            windows[i].flags &= (uint8_t)~WND_VISIBLE;
+        if (windows[i].flags != old_flags)
+            comp_frame_dirty = true;
+        return;
+    }
+}
+
+void compositor_set_title(uint32_t window_id, const char *title)
+{
+    for (int i = 0; i < MAX_WINDOWS; i++) {
+        if (!(windows[i].flags & WND_ACTIVE) || windows[i].id != window_id)
+            continue;
+
+        char updated[MAX_TITLE_LEN];
+        int j = 0;
+        if (title) {
+            while (title[j] && j < MAX_TITLE_LEN - 1) {
+                updated[j] = title[j];
+                j++;
+            }
+        }
+        updated[j] = '\0';
+
+        bool changed = false;
+        for (int k = 0; k < MAX_TITLE_LEN; k++) {
+            if (windows[i].title[k] != updated[k]) changed = true;
+            windows[i].title[k] = updated[k];
+            if (!updated[k]) break;
+        }
+        if (changed) comp_frame_dirty = true;
+        return;
+    }
+}
+
+void compositor_set_taskbar(uint32_t window_id, bool taskbar)
+{
+    for (int i = 0; i < MAX_WINDOWS; i++) {
+        if (!(windows[i].flags & WND_ACTIVE) || windows[i].id != window_id)
+            continue;
+        uint8_t old_flags = windows[i].flags;
+        if (taskbar)
+            windows[i].flags |= WND_TASKBAR;
+        else
+            windows[i].flags &= (uint8_t)~WND_TASKBAR;
+        if (old_flags != windows[i].flags)
+            comp_frame_dirty = true;
+        return;
+    }
+}
+
+void compositor_focus_window(uint32_t window_id)
+{
+    int selected = -1;
+    for (int i = 0; i < MAX_WINDOWS; i++) {
+        if (!(windows[i].flags & WND_ACTIVE))
+            continue;
+        windows[i].flags &= (uint8_t)~WND_FOCUSED;
+        if (windows[i].id == window_id)
+            selected = i;
+    }
+    if (selected >= 0) {
+        windows[selected].flags |= WND_FOCUSED;
+        focused_window = selected;
+        focused_demo_idx = -1;
+        comp_frame_dirty = true;
+    }
+}
+
+void compositor_set_position(uint32_t window_id, int16_t x, int16_t y)
+{
+    for (int i = 0; i < MAX_WINDOWS; i++) {
+        if (!(windows[i].flags & WND_ACTIVE) || windows[i].id != window_id)
+            continue;
+        if (windows[i].x != x || windows[i].y != y) {
+            windows[i].x = x;
+            windows[i].y = y;
+            comp_frame_dirty = true;
+        }
+        return;
+    }
+}
+
+void compositor_set_z_order(uint32_t window_id, uint32_t z_order)
+{
+    for (int i = 0; i < MAX_WINDOWS; i++) {
+        if (!(windows[i].flags & WND_ACTIVE) || windows[i].id != window_id)
+            continue;
+        if (windows[i].z_order != z_order) {
+            windows[i].z_order = z_order;
+            comp_frame_dirty = true;
+        }
+        return;
+    }
+}
+
+void compositor_set_clip_rect(uint32_t window_id, bool enabled,
+                              int16_t x, int16_t y,
+                              uint16_t width, uint16_t height)
+{
+    for (int i = 0; i < MAX_WINDOWS; i++) {
+        if (!(windows[i].flags & WND_ACTIVE) || windows[i].id != window_id)
+            continue;
+        window_t *w = &windows[i];
+        if (w->clip_enabled != enabled || w->clip_x != x || w->clip_y != y ||
+            w->clip_width != width || w->clip_height != height) {
+            w->clip_enabled = enabled;
+            w->clip_x = x;
+            w->clip_y = y;
+            w->clip_width = width;
+            w->clip_height = height;
+            comp_frame_dirty = true;
+        }
+        return;
+    }
+}
+
+void compositor_set_size(uint32_t window_id, uint16_t width, uint16_t height)
+{
+    for (int i = 0; i < MAX_WINDOWS; i++) {
+        if (!(windows[i].flags & WND_ACTIVE) || windows[i].id != window_id)
+            continue;
+
+        if (width > windows[i].surface_pitch)
+            width = windows[i].surface_pitch;
+        if (height > windows[i].surface_height)
+            height = windows[i].surface_height;
+        if (windows[i].width != width || windows[i].height != height) {
+            windows[i].width = width;
+            windows[i].height = height;
+            windows[i].flags |= WND_DIRTY;
+            comp_frame_dirty = true;
+        }
+        return;
+    }
+}
+
+bool compositor_replace_surface(uint32_t window_id, uint32_t shm_handle,
+                                uint16_t width, uint16_t height)
+{
+    uint32_t *pixels = (uint32_t *)shm_map(shm_handle);
+    if (!pixels)
+        return false;
+
+    for (int i = 0; i < MAX_WINDOWS; i++) {
+        if (!(windows[i].flags & WND_ACTIVE) || windows[i].id != window_id)
+            continue;
+
+        uint32_t old_handle = windows[i].shm_handle;
+        windows[i].shm_handle = shm_handle;
+        windows[i].pixels = pixels;
+        windows[i].width = width;
+        windows[i].height = height;
+        windows[i].surface_pitch = width;
+        windows[i].surface_height = height;
+        windows[i].flags |= WND_DIRTY;
+        comp_frame_dirty = true;
+        if (old_handle)
+            shm_unmap(old_handle);
+        return true;
+    }
+
+    shm_unmap(shm_handle);
+    return false;
 }
 
 /* Destroy all windows owned by a process (called on proc_free) */
@@ -378,6 +569,24 @@ static void blit_window(uint32_t *dst, uint32_t dst_pitch,
     if (dy < 0) { sy = -dy; bh += dy; dy = 0; }
     if (dx + bw > (int32_t)dst_w) bw = (int32_t)dst_w - dx;
     if (dy + bh > (int32_t)dst_h) bh = (int32_t)dst_h - dy;
+    if (w->clip_enabled) {
+        int32_t clip_right = (int32_t)w->clip_x + w->clip_width;
+        int32_t clip_bottom = (int32_t)w->clip_y + w->clip_height;
+        if (dx < w->clip_x) {
+            int32_t delta = w->clip_x - dx;
+            sx += delta;
+            bw -= delta;
+            dx = w->clip_x;
+        }
+        if (dy < w->clip_y) {
+            int32_t delta = w->clip_y - dy;
+            sy += delta;
+            bh -= delta;
+            dy = w->clip_y;
+        }
+        if (dx + bw > clip_right) bw = clip_right - dx;
+        if (dy + bh > clip_bottom) bh = clip_bottom - dy;
+    }
     if (bw <= 0 || bh <= 0) return;
 
     extern int ap_worker_count;
@@ -395,7 +604,7 @@ static void blit_window(uint32_t *dst, uint32_t dst_pitch,
 
         for (int i = 0; i < n_ap; i++) {
             bb_args[i] = (blit_band_arg_t){
-                dst, dst_pitch, w->pixels, w->width,
+                dst, dst_pitch, w->pixels, w->surface_pitch,
                 sx, sy, dx, dy, bw, i * band, (i + 1) * band
             };
             bb_ids[i] = smp_submit_any(blit_band_worker, &bb_args[i], NULL);
@@ -403,7 +612,7 @@ static void blit_window(uint32_t *dst, uint32_t dst_pitch,
         /* BSP handles remainder */
         for (int32_t y = n_ap * band; y < bh; y++) {
             uint32_t *d = dst + (uint32_t)(dy + y) * dst_pitch + (uint32_t)dx;
-            const uint32_t *s = w->pixels + (uint32_t)(sy + y) * w->width + (uint32_t)sx;
+            const uint32_t *s = w->pixels + (uint32_t)(sy + y) * w->surface_pitch + (uint32_t)sx;
             memcpy(d, s, (uint64_t)bw * sizeof(uint32_t));
         }
         for (int i = 0; i < n_ap; i++)
@@ -412,7 +621,7 @@ static void blit_window(uint32_t *dst, uint32_t dst_pitch,
         /* Serial blit (small windows or no APs) */
         for (int32_t y = 0; y < bh; y++) {
             uint32_t *d = dst + ((uint32_t)(dy + y)) * dst_pitch + (uint32_t)dx;
-            const uint32_t *s = w->pixels + ((uint32_t)(sy + y)) * w->width + (uint32_t)sx;
+            const uint32_t *s = w->pixels + ((uint32_t)(sy + y)) * w->surface_pitch + (uint32_t)sx;
             memcpy(d, s, (uint64_t)bw * sizeof(uint32_t));
         }
     }
@@ -562,6 +771,44 @@ static int hit_test_demo_window(int32_t mx, int32_t my)
     return -1;
 }
 
+/* Managed surfaces (Win32 and other SHM clients) render after the built-in
+ * desktop, so they also own pointer gestures over their visible rectangle.
+ * Keep the winning surface latched until button-up: a captured drag may leave
+ * the original rectangle, but must never fall through to a demo window. */
+static int hit_test_managed_window(int32_t mx, int32_t my)
+{
+    int best = -1;
+    uint32_t best_z = 0;
+
+    for (int i = 0; i < MAX_WINDOWS; i++) {
+        window_t *w = &windows[i];
+        if ((w->flags & (WND_ACTIVE | WND_VISIBLE)) !=
+                (WND_ACTIVE | WND_VISIBLE) ||
+            (w->flags & WND_MINIMIZED) || !w->width || !w->height)
+            continue;
+
+        int32_t left = w->x;
+        int32_t top = w->y;
+        int32_t right = left + (int32_t)w->width;
+        int32_t bottom = top + (int32_t)w->height;
+        if (w->clip_enabled) {
+            int32_t clip_right = w->clip_x + (int32_t)w->clip_width;
+            int32_t clip_bottom = w->clip_y + (int32_t)w->clip_height;
+            if (w->clip_x > left) left = w->clip_x;
+            if (w->clip_y > top) top = w->clip_y;
+            if (clip_right < right) right = clip_right;
+            if (clip_bottom < bottom) bottom = clip_bottom;
+        }
+
+        if (mx >= left && mx < right && my >= top && my < bottom &&
+            (best < 0 || w->z_order >= best_z)) {
+            best = i;
+            best_z = w->z_order;
+        }
+    }
+    return best;
+}
+
 /* Check if point hits a traffic-light button. Returns 1=close, 2=min, 3=max, 0=none */
 static int hit_test_buttons(gui_win_desc_t *w, int32_t mx, int32_t my)
 {
@@ -581,6 +828,154 @@ static int hit_test_buttons(gui_win_desc_t *w, int32_t mx, int32_t my)
     return 0;
 }
 
+static char taskbar_label(const char *title)
+{
+    if (title) {
+        for (int i = 0; title[i]; i++) {
+            char c = title[i];
+            if (c >= 'a' && c <= 'z') return (char)(c - 'a' + 'A');
+            if ((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')) return c;
+        }
+    }
+    return 'W';
+}
+
+static int taskbar_representative(uint32_t owner_pid)
+{
+    if (focused_window >= 0 && focused_window < MAX_WINDOWS &&
+        windows[focused_window].owner_pid == owner_pid &&
+        (windows[focused_window].flags & WND_TASKBAR))
+        return focused_window;
+
+    int best = -1;
+    uint32_t best_z = 0;
+    for (int i = 0; i < MAX_WINDOWS; i++) {
+        window_t *w = &windows[i];
+        if ((w->flags & (WND_ACTIVE | WND_TASKBAR)) !=
+            (WND_ACTIVE | WND_TASKBAR) || w->owner_pid != owner_pid)
+            continue;
+        if (best < 0 || w->z_order >= best_z) {
+            best = i;
+            best_z = w->z_order;
+        }
+    }
+    return best;
+}
+
+static void refresh_dock_tasks(void)
+{
+    static const uint32_t colors[] = {
+        0xFF2F80ED, 0xFF27AE60, 0xFFF2994A, 0xFF9B51E0,
+        0xFFEB5757, 0xFF00A6A6, 0xFF6D5BD0, 0xFF4F7C5B,
+    };
+    gui_dock_task_t tasks[GUI_DOCK_MAX_TASKS];
+    int count = 0;
+    uint32_t previous_pid = 0;
+
+    while (count < GUI_DOCK_MAX_TASKS) {
+        uint32_t best_pid = ~0u;
+        for (int i = 0; i < MAX_WINDOWS; i++) {
+            window_t *w = &windows[i];
+            if ((w->flags & (WND_ACTIVE | WND_TASKBAR)) !=
+                (WND_ACTIVE | WND_TASKBAR))
+                continue;
+            if (w->owner_pid > previous_pid && w->owner_pid < best_pid)
+                best_pid = w->owner_pid;
+        }
+        if (best_pid == ~0u) break;
+
+        int best = taskbar_representative(best_pid);
+        if (best < 0) break;
+        window_t *w = &windows[best];
+        bool minimized = true;
+        for (int i = 0; i < MAX_WINDOWS; i++) {
+            if ((windows[i].flags & (WND_ACTIVE | WND_TASKBAR | WND_VISIBLE)) ==
+                    (WND_ACTIVE | WND_TASKBAR | WND_VISIBLE) &&
+                windows[i].owner_pid == best_pid) {
+                minimized = false;
+                break;
+            }
+        }
+        tasks[count].id = best_pid;
+        tasks[count].color = colors[best_pid % (sizeof(colors) / sizeof(colors[0]))];
+        tasks[count].label = taskbar_label(w->title);
+        tasks[count].focused = focused_window >= 0 &&
+                               windows[focused_window].owner_pid == best_pid;
+        tasks[count].minimized = minimized;
+        previous_pid = best_pid;
+        count++;
+    }
+    gui_dock_set_tasks(tasks, count);
+}
+
+static int managed_window_by_pid(uint32_t owner_pid)
+{
+    return taskbar_representative(owner_pid);
+}
+
+static void focus_demo_window(int index)
+{
+    for (int i = 0; i < MAX_WINDOWS; i++)
+        windows[i].flags &= (uint8_t)~WND_FOCUSED;
+    focused_window = -1;
+    focused_demo_idx = index;
+    gui_desktop_show_window(index);
+    comp_frame_dirty = true;
+}
+
+static void focus_managed_window(int index)
+{
+    if (index < 0 || index >= MAX_WINDOWS ||
+        !(windows[index].flags & WND_ACTIVE))
+        return;
+    uint32_t id = windows[index].id;
+    if (user32_activate_compositor_window &&
+        user32_activate_compositor_window(id))
+        return;
+    compositor_focus_window(id);
+}
+
+static void cycle_task_switcher(void)
+{
+    int demo_count = 0;
+    gui_desktop_get_windows(&demo_count);
+    refresh_dock_tasks();
+    int task_count = gui_dock_item_count() - GUI_DOCK_BUILTIN_COUNT;
+    int total = demo_count + task_count;
+    if (total <= 1) return;
+
+    int current = -1;
+    if (focused_demo_idx >= 0 && focused_demo_idx < demo_count) {
+        current = focused_demo_idx;
+    } else if (focused_window >= 0 && focused_window < MAX_WINDOWS) {
+        uint32_t current_pid = windows[focused_window].owner_pid;
+        for (int i = 0; i < task_count; i++) {
+            if (gui_dock_task_id(GUI_DOCK_BUILTIN_COUNT + i) == current_pid) {
+                current = demo_count + i;
+                break;
+            }
+        }
+    }
+
+    int next = (current + 1) % total;
+    if (next < demo_count) {
+        focus_demo_window(next);
+        serial_puts("[COMP] Alt+Tab -> desktop window ");
+        serial_putdec((uint64_t)next);
+        serial_puts("\n");
+        return;
+    }
+
+    uint32_t pid = gui_dock_task_id(GUI_DOCK_BUILTIN_COUNT + next - demo_count);
+    int index = managed_window_by_pid(pid);
+    if (index >= 0) {
+        focus_managed_window(index);
+        serial_puts("[COMP] Alt+Tab -> app window ");
+        serial_putdec(pid);
+        serial_puts("\n");
+    }
+}
+
 /* Hit-test the dock.
  * Returns:
  *   >= 0  : dock icon index (0, 1, 2, ...)
@@ -593,7 +988,8 @@ static int hit_test_dock(int32_t mx, int32_t my)
     uint32_t scr_w = display_get_width();
     uint32_t scr_h = display_get_height();
     int32_t item_slot = GUI_DOCK_ICON_SIZE + GUI_DOCK_PADDING;
-    int32_t dock_w = 2 * item_slot + GUI_DOCK_PADDING;  /* 2 icons to match gui_dock.c */
+    int item_count = gui_dock_item_count();
+    int32_t dock_w = item_count * item_slot + GUI_DOCK_PADDING;
     int32_t dock_h = GUI_DOCK_HEIGHT;
     int32_t dock_x = ((int32_t)scr_w - dock_w) / 2;
     int32_t dock_y = (int32_t)scr_h - dock_h - 8;
@@ -615,7 +1011,7 @@ static int hit_test_dock(int32_t mx, int32_t my)
     if (my < dock_y || my >= dock_y + dock_h) return -1;
 
     /* Inside dock bounds — check individual icon squares */
-    for (int i = 0; i < 2; i++) {
+    for (int i = 0; i < item_count; i++) {
         int32_t ix = dock_x + GUI_DOCK_PADDING + i * item_slot;
         int32_t iy = dock_y + (dock_h - GUI_DOCK_ICON_SIZE) / 2;
         if (mx >= ix && mx < ix + GUI_DOCK_ICON_SIZE &&
@@ -631,6 +1027,35 @@ static void process_mouse_input(void)
 {
     uint8_t pressed  = comp_button_state & ~prev_buttons;
     uint8_t released = prev_buttons & ~comp_button_state;
+
+    if (pressed & 1) {
+        int32_t cx, cy;
+        input_get_cursor(&cx, &cy);
+        int managed_hit = hit_test_dock(cx, cy) == -1
+                        ? hit_test_managed_window(cx, cy) : -1;
+        if (managed_hit >= 0) {
+            dragging = false;
+            drag_win_idx = -1;
+            managed_pointer_active = true;
+            focus_managed_window(managed_hit);
+
+            static unsigned managed_trace_count;
+            if (managed_trace_count++ < 32) {
+                serial_puts("[COMP] managed pointer id=");
+                serial_putdec(windows[managed_hit].id);
+                serial_puts(" cx="); serial_putdec((uint64_t)cx);
+                serial_puts(" cy="); serial_putdec((uint64_t)cy);
+                serial_puts("\n");
+            }
+        }
+    }
+
+    if (managed_pointer_active) {
+        if (released & 1)
+            managed_pointer_active = false;
+        prev_buttons = comp_button_state;
+        return;
+    }
 
     if (pressed & 1) {  /* left button newly pressed */
         int32_t cx, cy;
@@ -653,10 +1078,18 @@ static void process_mouse_input(void)
                 int count2;
                 gui_desktop_get_windows(&count2);
                 if (dock_hit < count2) {
-                    gui_desktop_show_window(dock_hit);
-                    focused_demo_idx = dock_hit;
+                    focus_demo_window(dock_hit);
                     serial_puts("[COMP] Dock icon="); serial_putdec((uint64_t)dock_hit);
                     serial_puts(" raised\n");
+                } else {
+                    uint32_t pid = gui_dock_task_id(dock_hit);
+                    int index = managed_window_by_pid(pid);
+                    if (index >= 0) {
+                        focus_managed_window(index);
+                        serial_puts("[COMP] Dock app pid=");
+                        serial_putdec(pid);
+                        serial_puts(" raised\n");
+                    }
                 }
             }
             prev_buttons = comp_button_state;
@@ -795,14 +1228,14 @@ void scaleblit_worker(void *arg, void *result)
 
 /* ── Render One Frame ────────────────────────────────────────── */
 
-static void __hot compositor_render_frame(void)
+static bool __hot compositor_render_frame(void)
 {
     uint32_t *back = display_get_back_buffer();
     uint32_t w = display_get_width();
     uint32_t h = display_get_height();
     uint32_t p = display_get_pitch();
 
-    if (!back) return;
+    if (!back) return false;
 
     /* Frame-level dirty skip: if nothing changed and cursor didn't move,
      * skip the entire render. Force dirty once per second for RTC clock. */
@@ -813,7 +1246,7 @@ static void __hot compositor_render_frame(void)
         bool cursor_moved = (cx != comp_last_cx || cy != comp_last_cy);
         bool clock_tick   = (now_tick - comp_dirty_tick >= 100); /* 1 sec @ 100Hz */
         if (!comp_frame_dirty && !cursor_moved && !clock_tick)
-            return;
+            return false;
         comp_last_cx = cx;
         comp_last_cy = cy;
         if (clock_tick)
@@ -834,7 +1267,7 @@ static void __hot compositor_render_frame(void)
             memcpy(back, win->pixels, (uint64_t)w * h * 4);
             display_mark_dirty();
             comp_direct_scanout++;
-            return;
+            return true;
         }
 
         /* Pixel-perfect: largest integer scale that fits within the screen.
@@ -930,7 +1363,7 @@ static void __hot compositor_render_frame(void)
 
         display_mark_dirty();
         comp_direct_scanout++;
-        return;
+        return true;
     }
 
     /* Update FPS counter (APIC timer @ 100Hz → 100 ticks = 1 second) */
@@ -961,6 +1394,8 @@ static void __hot compositor_render_frame(void)
         gui_panel_set_debug(&info);
     }
 
+    refresh_dock_tasks();
+
     /* Render elementaryOS-inspired desktop (bg, panel, window chrome, dock) */
     {
         gui_surface_t screen = { back, w, h, p };
@@ -975,6 +1410,12 @@ static void __hot compositor_render_frame(void)
         blit_window(back, p, w, h, &windows[render_order[i]]);
     }
 
+    /* The taskbar is desktop chrome and must remain above application surfaces. */
+    {
+        gui_surface_t screen = { back, w, h, p };
+        gui_desktop_render_dock(&screen);
+    }
+
     /* Draw cursor on top — but in WASM the canvas already shows the
      * native browser cursor on top, so a second one drawn into the
      * framebuffer just looks weird. Skip on WASM. */
@@ -985,6 +1426,7 @@ static void __hot compositor_render_frame(void)
 #endif
 
     display_mark_dirty();
+    return true;
 }
 
 /* ── Compositor Main Loop ────────────────────────────────────── */
@@ -993,14 +1435,19 @@ static void __hot compositor_render_frame(void)
  * Called from sched_spawn("compositor", compositor_thread). */
 
 volatile bool compositor_running;
+static volatile bool compositor_claimed;
 
 #ifdef __EMSCRIPTEN__
 /* WASM helper: kernel uses rAF instead of compositor_thread; just mark running. */
-void compositor_start_wasm(void) { compositor_running = true; }
+void compositor_start_wasm(void)
+{
+    __atomic_store_n(&compositor_claimed, true, __ATOMIC_RELEASE);
+    __atomic_store_n(&compositor_running, true, __ATOMIC_RELEASE);
+}
 
 /* One frame of the compositor, callable from JS via Module.ccall.
  * Replaces the body of the compositor_thread while loop on WASM. */
-static void __hot compositor_render_frame(void);
+static bool __hot compositor_render_frame(void);
 void wasm_compositor_frame(void)
 {
     if (!compositor_running) return;
@@ -1022,20 +1469,30 @@ void wasm_compositor_frame(void)
      * leaves comp_button_state pinned at "pressed" even when the
      * physical button has already been released within the same
      * frame, breaking subsequent click detection. */
-    extern uint8_t input_get_buttons(void);
     comp_button_state = input_get_buttons();
-    compositor_render_frame();
+    bool rendered = compositor_render_frame();
     /* The native compositor_thread's blit step never runs in WASM; the
      * rAF wrapper has to invoke display_flip itself or pixels stay in
      * the back buffer and the canvas shows black. */
-    display_flip();
+    if (rendered)
+        display_flip();
 }
 #endif
 
 void compositor_thread(void)
 {
+    /* shell.c normally reserves the compositor before spawning this thread.
+     * Keep direct callers safe as well, without allowing a second owner. */
+    if (!__atomic_load_n(&compositor_claimed, __ATOMIC_ACQUIRE)) {
+        bool expected = false;
+        if (!__atomic_compare_exchange_n(&compositor_claimed, &expected, true,
+                                         false, __ATOMIC_ACQ_REL,
+                                         __ATOMIC_ACQUIRE))
+            return;
+    }
+
     proc_set_qos(QOS_INTERACTIVE);
-    compositor_running = true;
+    __atomic_store_n(&compositor_running, true, __ATOMIC_RELEASE);
 
     serial_puts("[COMP] Compositor thread started (QOS_INTERACTIVE)\n");
 
@@ -1083,13 +1540,21 @@ void compositor_thread(void)
             /* Each key_buf entry is an input_event_t (24 bytes):
              *   offset 0: type (uint8_t)
              *   offset 1: scancode (uint8_t) */
-            if (nkeys > 0) {
-                serial_puts("[COMP] keys="); serial_putdec((uint64_t)nkeys); serial_puts("\n");
-            }
             for (int i = 0; i < nkeys; i++) {
                 uint8_t *evt = &key_buf[i * 24];
                 uint8_t type = evt[0];
                 uint8_t sc   = evt[1];
+
+#if !defined(OK_QUIET) || !OK_QUIET
+                static uint32_t input_trace_count;
+                if (input_trace_count++ < 64) {
+                    serial_puts("[COMP] key type=");
+                    serial_putdec(type);
+                    serial_puts(" sc=0x");
+                    serial_puthex(sc, 2);
+                    serial_puts("\n");
+                }
+#endif
 
                 /* Track modifier key state from HID virtual scancodes (0xE0+index). */
                 if (sc == 0xE2 || sc == 0xE6 || sc == 0x38) alt_held        = (type == 1);
@@ -1098,16 +1563,7 @@ void compositor_thread(void)
 
                 /* Alt+Tab: cycle through windows (USB Tab = HID 0x2B, PS/2 Tab = 0x0F) */
                 if (type == 1 && alt_held && (sc == 0x2B || sc == 0x0F)) {
-                    int count;
-                    gui_desktop_get_windows(&count);
-                    if (count > 1) {
-                        focused_demo_idx = (focused_demo_idx + 1) % count;
-                        if (focused_demo_idx < 0) focused_demo_idx = 0;
-                        gui_desktop_raise_window(focused_demo_idx);
-                        serial_puts("[COMP] Alt+Tab -> window ");
-                        serial_putdec((uint64_t)focused_demo_idx);
-                        serial_puts("\n");
-                    }
+                    cycle_task_switcher();
                     continue;  /* don't push Tab into key ring while Alt is held */
                 }
 
@@ -1154,6 +1610,11 @@ void compositor_thread(void)
 
         /* 1b. Process mouse clicks on demo windows */
         process_mouse_input();
+        /* input_drain_coalesced preserves a press+release pair as one pressed
+         * frame so fast clicks are observable. Restore the physical state
+         * immediately afterward; otherwise a native drag remains armed until
+         * another HID report happens to arrive. */
+        comp_button_state = input_get_buttons();
 
         /* Mark frame dirty on mouse movement (keyboard input dirtied via
          * compositor_signal_dirty when terminal/app writes new pixels) */
@@ -1168,10 +1629,11 @@ void compositor_thread(void)
         gui_anim_tick(idt_get_ticks() * 10);  /* convert to ms (100Hz * 10 = ms) */
 
         /* 3. Render frame */
-        compositor_render_frame();
+        bool rendered = compositor_render_frame();
 
         /* 4. Flip (waits for VBlank) */
-        display_flip();
+        if (rendered)
+            display_flip();
 
         /* 5. Fullscreen→desktop transition: force a regular-memcpy refresh.
          * memcpy_nt (non-temporal stores) in display_flip may not trigger
@@ -1189,19 +1651,54 @@ void compositor_thread(void)
         comp_was_fullscreen = has_fullscreen;
 
         comp_frames++;
+
+        /* INTERACTIVE tasks outrank normal Win32 processes. Park until the
+         * next scheduler tick so frame pacing cannot monopolize the BSP. */
+        sched_sleep_ticks(1);
     }
+
+    __atomic_store_n(&compositor_claimed, false, __ATOMIC_RELEASE);
 }
 
 /* ── Control ─────────────────────────────────────────────────── */
 
 void compositor_stop(void)
 {
-    compositor_running = false;
+    __atomic_store_n(&compositor_running, false, __ATOMIC_RELEASE);
+#ifdef __EMSCRIPTEN__
+    /* There is no native compositor thread to release the reservation. */
+    __atomic_store_n(&compositor_claimed, false, __ATOMIC_RELEASE);
+#endif
 }
 
 bool compositor_is_running(void)
 {
-    return compositor_running;
+    return __atomic_load_n(&compositor_claimed, __ATOMIC_ACQUIRE);
+}
+
+bool compositor_begin_start(void)
+{
+    bool expected = false;
+    return __atomic_compare_exchange_n(&compositor_claimed, &expected, true,
+                                       false, __ATOMIC_ACQ_REL,
+                                       __ATOMIC_ACQUIRE);
+}
+
+void compositor_abort_start(void)
+{
+    __atomic_store_n(&compositor_running, false, __ATOMIC_RELEASE);
+    __atomic_store_n(&compositor_claimed, false, __ATOMIC_RELEASE);
+}
+
+void compositor_focus_terminal(void)
+{
+    if (!__atomic_load_n(&compositor_running, __ATOMIC_ACQUIRE))
+        return;
+
+    focused_demo_idx = 0;
+    gui_desktop_show_window(0);
+    comp_frame_dirty = true;
+    display_mark_dirty();
 }
 
 /* ── Input Query (for user32_shim) ────────────────────────────── */
@@ -1246,6 +1743,10 @@ void compositor_init(void)
     key_ring_tail = 0;
     comp_button_state = 0;
     comp_wheel_accum = 0;
+    dragging = false;
+    drag_win_idx = -1;
+    managed_pointer_active = false;
+    prev_buttons = 0;
     focused_demo_idx = 0;   /* terminal has focus by default */
     is_maximized[0] = false;
     is_maximized[1] = false;

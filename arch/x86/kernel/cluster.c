@@ -15,6 +15,7 @@ extern void serial_putdec(uint64_t v);
 extern uint64_t idt_get_ticks(void);
 extern int  kthread_create(const char *name, void (*fn)(void *), void *data);
 extern void sched_yield(void);
+extern int sched_sleep_ticks(uint64_t ticks);
 
 extern int  net_tcp_connect(const uint8_t ip[4], uint16_t port, uint16_t src_port);
 extern int  net_tcp_send(int conn, const void *data, uint32_t len);
@@ -638,7 +639,7 @@ static void cluster_tick_thread(void *unused)
             }
             last_hmac_log = now;
         }
-        sched_yield();
+        (void)sched_sleep_ticks(1);
     }
     serial_puts("[CLUSTER] tick kthread stopped\n");
 }

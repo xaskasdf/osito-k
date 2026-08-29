@@ -49,12 +49,17 @@ tools/ositofs/ositofs-read
 tools/ositofs/ositofs-rename
 tools/ositofs/ositofs-defrag
 tools/ositofs/ositofs-fsck
+tools/ositofs/ositofs-fsck3
+tools/ositofs/ositofs-read3
 tools/uzdecomp/uzdecomp
 
 # Local agent/tool state
 .agents/
 .omo/
 .wrangler/
+.debug/
+.tmp-*
+**/__pycache__/
 
 # Game / workload artifacts (binaries, discs, NVMe images)
 *.WAD

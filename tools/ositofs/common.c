@@ -11,6 +11,7 @@
 #include <unistd.h>
 #include <errno.h>
 #include <sys/ioctl.h>
+#include <sys/file.h>
 #ifdef __linux__
 #include <linux/fs.h>
 #endif
@@ -19,8 +20,61 @@
 #include "common.h"
 
 uint32_t osfs2_block_sz = OSFS2_DEFAULT_BLOCK_SIZE;
+uint32_t osfs2_file_capacity = OSFS2_MAX_FILES_STANDARD;
+uint32_t osfs2_filetab_size = OSFS2_FILETAB_SIZE_STANDARD;
+uint32_t osfs2_crctab_offset = OSFS2_CRCTAB_OFF_STANDARD;
+uint32_t osfs2_layeridx_offset = OSFS2_LAYERIDX_OFF_STANDARD;
+int osfs2_crc_table_enabled = 1;
+int osfs2_layer_index_enabled = 1;
+
+void osfs2_set_layout(uint32_t version)
+{
+    osfs2_file_capacity = osfs2_format_max_files(version);
+    osfs2_filetab_size = osfs2_format_filetab_size(version);
+    osfs2_crctab_offset = osfs2_format_crctab_off(version);
+    osfs2_layeridx_offset = OSFS2_LAYERIDX_OFF_STANDARD;
+    osfs2_crc_table_enabled = osfs2_format_has_crc_table(version);
+    osfs2_layer_index_enabled = osfs2_format_has_layer_index(version);
+}
 
 /* ── Device I/O ──────────────────────────────────────────────── */
+
+const char *osfs2_entry_name(const osfs2_file_t *file)
+{
+    if (file && (file->flags & OSFS2_FLAG_LONG_NAME) && file->model_name[0])
+        return file->model_name;
+    return file ? file->name : NULL;
+}
+
+int osfs2_set_entry_name(osfs2_file_t *file, const char *name)
+{
+    if (!file || !name) return -1;
+
+    size_t len = strlen(name);
+    int was_long = (file->flags & OSFS2_FLAG_LONG_NAME) != 0;
+    if (len >= OSFS2_MODEL_NAME_LEN) return -1;
+
+    memset(file->name, 0, sizeof(file->name));
+    file->flags &= ~OSFS2_FLAG_LONG_NAME;
+    if (len < OSFS2_NAME_LEN) {
+        memcpy(file->name, name, len + 1);
+        if (was_long) memset(file->model_name, 0, sizeof(file->model_name));
+        return 0;
+    }
+    if (file->flags & (OSFS2_FLAG_INLINE | OSFS2_FLAG_GGUF)) return -1;
+
+    memcpy(file->model_name, name, len + 1);
+    file->flags |= OSFS2_FLAG_LONG_NAME;
+
+    static const char hex[] = "0123456789abcdef";
+    uint32_t crc = osfs2_crc32(name, len);
+    size_t prefix = OSFS2_NAME_LEN - 10;
+    memcpy(file->name, name, prefix);
+    file->name[prefix] = '~';
+    for (int i = 0; i < 8; i++)
+        file->name[prefix + 1 + i] = hex[(crc >> (28 - i * 4)) & 0xF];
+    return 0;
+}
 
 int osfs2_open_device(const char *path, int readonly)
 {
@@ -31,6 +85,11 @@ int osfs2_open_device(const char *path, int readonly)
     int fd = open(path, flags);
     if (fd < 0) {
         fprintf(stderr, "osfs2: cannot open %s: %s\n", path, strerror(errno));
+        return -1;
+    }
+    if (flock(fd, readonly ? LOCK_SH : LOCK_EX) < 0) {
+        fprintf(stderr, "osfs2: cannot lock %s: %s\n", path, strerror(errno));
+        close(fd);
         return -1;
     }
     return fd;
@@ -91,12 +150,315 @@ int osfs2_write_bytes(int fd, uint64_t offset, const void *buf, size_t len)
     return 0;
 }
 
+int osfs2_sync(int fd)
+{
+    if (fsync(fd) < 0) {
+        fprintf(stderr, "osfs2: fsync failed: %s\n", strerror(errno));
+        return -1;
+    }
+    return 0;
+}
+
+/* ── Metadata journal ────────────────────────────────────────── */
+
+static int journal_super_valid(const osfs2_super_t *sb)
+{
+    if (!sb || sb->magic != OSFS2_MAGIC ||
+        !osfs2_supported_version(sb->version) ||
+        !osfs2_valid_block_size(sb->block_size)) return 0;
+    osfs2_super_t copy = *sb;
+    uint32_t expected = copy.crc32;
+    copy.crc32 = 0;
+    return expected == osfs2_crc32(&copy, sizeof(copy));
+}
+
+static int journal_record_valid(osfs2_journal_record_t *record)
+{
+    if (!record || record->magic != OSFS2_JOURNAL_MAGIC ||
+        record->version != OSFS2_JOURNAL_VERSION || !record->entry_count ||
+        record->entry_count > OSFS2_JOURNAL_MAX_ENTRIES ||
+        !record->page_count ||
+        record->page_count > OSFS2_JOURNAL_MAX_PAGES ||
+        record->operation < OSFS2_JOURNAL_OP_RENAME ||
+        record->operation > OSFS2_JOURNAL_OP_REPLACE ||
+        !journal_super_valid(&record->before_super) ||
+        !journal_super_valid(&record->after_super)) return 0;
+    if (record->before_super.version != record->after_super.version ||
+        record->before_super.block_size != record->after_super.block_size ||
+        memcmp(record->before_super.uuid, record->after_super.uuid,
+               sizeof(record->before_super.uuid)) != 0 ||
+        record->after_super.total_blocks <=
+            osfs2_format_data_start_blk(record->after_super.version,
+                                        record->after_super.block_size) ||
+        record->after_super.total_blocks > OSFS2_MAX_BLOCKS) return 0;
+    for (uint32_t i = 0; i < record->page_count; i++) {
+        if (record->pages[i] >= osfs2_format_filetab_size(
+                record->after_super.version) / OSFS2_METADATA_PAGE_SIZE)
+            return 0;
+        if (i && record->pages[i] == record->pages[0]) return 0;
+    }
+    for (uint32_t i = 0; i < record->entry_count; i++) {
+        if (record->slots[i] >= osfs2_format_max_files(
+                record->after_super.version)) return 0;
+        uint32_t page = record->slots[i] / 16;
+        int found = 0;
+        for (uint32_t j = 0; j < record->page_count; j++)
+            if (record->pages[j] == page) found = 1;
+        if (!found || (i && record->slots[i] == record->slots[0])) return 0;
+
+        const osfs2_file_t *after = NULL;
+        for (uint32_t j = 0; j < record->page_count; j++)
+            if (record->pages[j] == page)
+                after = (const osfs2_file_t *)(record->after_pages[j] +
+                        (record->slots[i] % 16) * sizeof(osfs2_file_t));
+        if (!after) return 0;
+        if (after->flags & OSFS2_FLAG_VALID) {
+            if (strnlen(after->name, OSFS2_NAME_LEN) == OSFS2_NAME_LEN)
+                return 0;
+            if (after->flags & OSFS2_FLAG_INLINE) {
+                if (after->size > OSFS2_INLINE_MAX || after->start_block ||
+                    after->block_count) return 0;
+            } else if (after->block_count) {
+                uint64_t end = (uint64_t)after->start_block +
+                               after->block_count;
+                if (after->start_block < osfs2_format_data_start_blk(
+                        record->after_super.version,
+                        record->after_super.block_size) ||
+                    end > record->after_super.total_blocks ||
+                    after->size > (uint64_t)after->block_count *
+                                      record->after_super.block_size)
+                    return 0;
+            } else if (after->size) return 0;
+        }
+    }
+    uint32_t expected = record->record_crc32;
+    record->record_crc32 = 0;
+    uint32_t actual = osfs2_crc32(record, sizeof(*record));
+    record->record_crc32 = expected;
+    return expected == actual;
+}
+
+static int journal_commit_valid(osfs2_journal_commit_t *commit)
+{
+    if (!commit || commit->magic != OSFS2_JOURNAL_COMMIT_MAGIC ||
+        commit->version != OSFS2_JOURNAL_VERSION) return 0;
+    uint32_t expected = commit->commit_crc32;
+    commit->commit_crc32 = 0;
+    uint32_t actual = osfs2_crc32(commit, sizeof(*commit));
+    commit->commit_crc32 = expected;
+    return expected == actual;
+}
+
+static int journal_clear_commit(int fd, void *commit_buf)
+{
+    memset(commit_buf, 0, OSFS2_METADATA_PAGE_SIZE);
+    return osfs2_write_bytes(fd, OSFS2_JOURNAL_COMMIT_OFF, commit_buf,
+                             OSFS2_METADATA_PAGE_SIZE) == 0
+        ? osfs2_sync(fd) : -1;
+}
+
+static void journal_failpoint(int fd, const char *name)
+{
+    const char *requested = getenv("OSFS2_JOURNAL_FAILPOINT");
+    if (!requested || strcmp(requested, name) != 0) return;
+    (void)osfs2_sync(fd);
+    _exit(86);
+}
+
+static int journal_apply(int fd, const osfs2_journal_record_t *record)
+{
+    void *page = osfs2_alloc_aligned(4096);
+    void *super_buf = osfs2_alloc_aligned(4096);
+    if (!page || !super_buf) {
+        free(page); free(super_buf);
+        return -1;
+    }
+
+    for (uint32_t i = 0; i < record->page_count; i++) {
+        uint64_t page_offset = OSFS2_FILETAB_OFF +
+            (uint64_t)record->pages[i] * OSFS2_METADATA_PAGE_SIZE;
+        memcpy(page, record->after_pages[i], OSFS2_METADATA_PAGE_SIZE);
+        if (osfs2_write_bytes(fd, page_offset, page,
+                              OSFS2_METADATA_PAGE_SIZE) < 0) goto fail;
+    }
+    journal_failpoint(fd, "entries");
+
+    memset(super_buf, 0, 4096);
+    memcpy(super_buf, &record->after_super, sizeof(record->after_super));
+    if (osfs2_write_bytes(fd, 0, super_buf, 4096) < 0) goto fail;
+    journal_failpoint(fd, "primary-super");
+    if (osfs2_write_bytes(fd, OSFS2_SUPER_BACKUP_OFF, super_buf, 4096) < 0)
+        goto fail;
+    journal_failpoint(fd, "backup-super");
+    if (osfs2_sync(fd) < 0) goto fail;
+    free(page); free(super_buf);
+    return 0;
+
+fail:
+    free(page); free(super_buf);
+    return -1;
+}
+
+int osfs2_journal_recover(int fd, int repair)
+{
+    void *record_buf = osfs2_alloc_aligned(OSFS2_JOURNAL_RECORD_SIZE);
+    void *commit_buf = osfs2_alloc_aligned(4096);
+    if (!record_buf || !commit_buf) {
+        free(record_buf); free(commit_buf);
+        return -1;
+    }
+    osfs2_journal_commit_t *commit = commit_buf;
+    int result = osfs2_read_bytes(fd, OSFS2_JOURNAL_COMMIT_OFF, commit_buf,
+                                  OSFS2_METADATA_PAGE_SIZE);
+    if (result < 0) goto out;
+    if (commit->magic != OSFS2_JOURNAL_COMMIT_MAGIC) {
+        result = 0;
+        goto out;
+    }
+    if (!journal_commit_valid(commit)) {
+        if (!repair) {
+            result = 0;
+            goto out;
+        }
+        result = journal_clear_commit(fd, commit_buf);
+        goto out;
+    }
+    if (osfs2_read_bytes(fd, OSFS2_JOURNAL_RECORD_OFF, record_buf,
+                         OSFS2_JOURNAL_RECORD_SIZE) < 0) {
+        result = -1;
+        goto out;
+    }
+    osfs2_journal_record_t *record = record_buf;
+    if (!journal_record_valid(record) ||
+        record->transaction_id != commit->transaction_id ||
+        record->record_crc32 != commit->record_crc32) {
+        fprintf(stderr, "osfs2: committed journal record is corrupt\n");
+        result = -1;
+        goto out;
+    }
+    void *super_buf = osfs2_alloc_aligned(4096);
+    if (!super_buf) {
+        result = -1;
+        goto out;
+    }
+    osfs2_super_t current;
+    int have_current = 0;
+    if (osfs2_read_bytes(fd, 0, super_buf, 4096) == 0) {
+        memcpy(&current, super_buf, sizeof(current));
+        have_current = journal_super_valid(&current);
+    }
+    if (!have_current &&
+        osfs2_read_bytes(fd, OSFS2_SUPER_BACKUP_OFF, super_buf, 4096) == 0) {
+        memcpy(&current, super_buf, sizeof(current));
+        have_current = journal_super_valid(&current);
+    }
+    free(super_buf);
+    if (have_current &&
+        (current.version != record->after_super.version ||
+         current.block_size != record->after_super.block_size ||
+         memcmp(current.uuid, record->after_super.uuid,
+                sizeof(current.uuid)) != 0)) {
+        fprintf(stderr, "osfs2: journal belongs to another filesystem\n");
+        result = -1;
+        goto out;
+    }
+    if (!repair) {
+        result = 1;
+        goto out;
+    }
+    if (journal_apply(fd, record) < 0) {
+        result = -1;
+        goto out;
+    }
+    result = journal_clear_commit(fd, commit_buf);
+
+out:
+    free(record_buf); free(commit_buf);
+    return result;
+}
+
+int osfs2_journal_commit_entries(
+    int fd, uint32_t operation,
+    const osfs2_super_t *before_super,
+    const osfs2_super_t *after_super,
+    const uint32_t slots[OSFS2_JOURNAL_MAX_ENTRIES],
+    const osfs2_file_t before[OSFS2_JOURNAL_MAX_ENTRIES],
+    const osfs2_file_t after[OSFS2_JOURNAL_MAX_ENTRIES], uint32_t count)
+{
+    if (!before_super || !after_super || !slots || !before || !after ||
+        !count || count > OSFS2_JOURNAL_MAX_ENTRIES) return -1;
+    void *record_buf = osfs2_alloc_aligned(OSFS2_JOURNAL_RECORD_SIZE);
+    void *commit_buf = osfs2_alloc_aligned(4096);
+    if (!record_buf || !commit_buf) {
+        free(record_buf); free(commit_buf);
+        return -1;
+    }
+    osfs2_journal_record_t *record = record_buf;
+    osfs2_journal_commit_t *commit = commit_buf;
+    record->magic = OSFS2_JOURNAL_MAGIC;
+    record->version = OSFS2_JOURNAL_VERSION;
+    record->operation = operation;
+    record->entry_count = count;
+    record->transaction_id = ((uint64_t)time(NULL) << 32) ^
+                             (uint64_t)getpid() ^ (uintptr_t)record;
+    record->before_super = *before_super;
+    record->after_super = *after_super;
+    for (uint32_t i = 0; i < count; i++) {
+        if (slots[i] >= OSFS2_MAX_FILES) goto fail;
+        record->slots[i] = slots[i];
+        record->before_entries[i] = before[i];
+        uint32_t page_index = slots[i] / 16;
+        uint32_t page_slot = record->page_count;
+        for (uint32_t j = 0; j < record->page_count; j++)
+            if (record->pages[j] == page_index) page_slot = j;
+        if (page_slot == record->page_count) {
+            uint64_t page_offset = OSFS2_FILETAB_OFF +
+                (uint64_t)page_index * OSFS2_METADATA_PAGE_SIZE;
+            if (osfs2_read_bytes(fd, page_offset, commit_buf,
+                                 OSFS2_METADATA_PAGE_SIZE) < 0) goto fail;
+            memcpy(record->after_pages[page_slot], commit_buf,
+                   OSFS2_METADATA_PAGE_SIZE);
+            record->pages[page_slot] = page_index;
+            record->page_count++;
+        }
+        memcpy(record->after_pages[page_slot] +
+                   (slots[i] % 16) * sizeof(osfs2_file_t),
+               &after[i], sizeof(osfs2_file_t));
+    }
+    record->record_crc32 = osfs2_crc32(record, sizeof(*record));
+
+    if (journal_clear_commit(fd, commit_buf) < 0 ||
+        osfs2_write_bytes(fd, OSFS2_JOURNAL_RECORD_OFF, record_buf,
+                          OSFS2_JOURNAL_RECORD_SIZE) < 0 ||
+        osfs2_sync(fd) < 0) goto fail;
+    journal_failpoint(fd, "prepared");
+
+    memset(commit_buf, 0, 4096);
+    commit->magic = OSFS2_JOURNAL_COMMIT_MAGIC;
+    commit->version = OSFS2_JOURNAL_VERSION;
+    commit->transaction_id = record->transaction_id;
+    commit->record_crc32 = record->record_crc32;
+    commit->commit_crc32 = osfs2_crc32(commit, sizeof(*commit));
+    if (osfs2_write_bytes(fd, OSFS2_JOURNAL_COMMIT_OFF, commit_buf,
+                          OSFS2_METADATA_PAGE_SIZE) < 0 ||
+        osfs2_sync(fd) < 0) goto fail;
+    journal_failpoint(fd, "committed");
+    if (journal_apply(fd, record) < 0) goto fail;
+    if (journal_clear_commit(fd, commit_buf) < 0) goto fail;
+    free(record_buf); free(commit_buf);
+    return 0;
+
+fail:
+    free(record_buf); free(commit_buf);
+    return -1;
+}
+
 /* ── Superblock ──────────────────────────────────────────────── */
 
 static int osfs2_validate_super(const osfs2_super_t *sb)
 {
     if (sb->magic != OSFS2_MAGIC) return -1;
-    if (sb->version != OSFS2_VERSION) return -1;
+    if (!osfs2_supported_version(sb->version)) return -1;
     uint32_t saved_crc = sb->crc32;
     osfs2_super_t tmp;
     memcpy(&tmp, sb, sizeof(tmp));
@@ -109,6 +471,13 @@ static int osfs2_validate_super(const osfs2_super_t *sb)
 
 int osfs2_read_super(int fd, osfs2_super_t *sb)
 {
+    int journal_status = osfs2_journal_recover(fd, 0);
+    if (journal_status != 0) {
+        fprintf(stderr, journal_status > 0
+            ? "osfs2: committed journal pending; recover it before reading\n"
+            : "osfs2: journal validation failed\n");
+        return -1;
+    }
     void *buf = osfs2_alloc_aligned(4096);
     if (!buf) return -1;
 
@@ -135,6 +504,7 @@ int osfs2_read_super(int fd, osfs2_super_t *sb)
 
     free(buf);
     osfs2_block_sz = sb->block_size;
+    osfs2_set_layout(sb->version);
     return 0;
 }
 

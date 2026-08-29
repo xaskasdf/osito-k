@@ -13,6 +13,7 @@
 
 #include "../include/types.h"
 #include "../include/paging.h"
+#include "smp.h"
 
 /* ── External functions ──────────────────────────────────────── */
 
@@ -75,6 +76,22 @@ static uint8_t     *heap_end;      /* Current end of heap */
 static uint64_t     heap_size;     /* Total heap bytes */
 static uint64_t     heap_used;     /* Currently allocated bytes */
 static uint64_t     alloc_count;   /* Number of active allocations */
+static spinlock_t   heap_lock = SPINLOCK_INIT;
+
+static inline uint64_t heap_lock_irqsave(void)
+{
+    uint64_t flags;
+    __asm__ volatile ("pushfq; popq %0; cli" : "=r"(flags) :: "memory");
+    spin_lock(&heap_lock);
+    return flags;
+}
+
+static inline void heap_unlock_irqrestore(uint64_t flags)
+{
+    spin_unlock(&heap_lock);
+    if (flags & (1ULL << 9))
+        __asm__ volatile ("sti" ::: "memory");
+}
 
 /* ── Align up ────────────────────────────────────────────────── */
 
@@ -258,9 +275,12 @@ static void *_kmalloc_with_ra(uint64_t size, uint64_t alloc_ra, uint64_t alloc_r
 
 void *kmalloc(uint64_t size)
 {
-    return _kmalloc_with_ra(size,
-                            (uint64_t)__builtin_return_address(0),
-                            (uint64_t)__builtin_return_address(1));
+    uint64_t alloc_ra = (uint64_t)__builtin_return_address(0);
+    uint64_t alloc_ra2 = (uint64_t)__builtin_return_address(1);
+    uint64_t irq_flags = heap_lock_irqsave();
+    void *result = _kmalloc_with_ra(size, alloc_ra, alloc_ra2);
+    heap_unlock_irqrestore(irq_flags);
+    return result;
 }
 
 /* ── free ────────────────────────────────────────────────────── */
@@ -280,7 +300,7 @@ static void heap_print_sym(uint64_t addr)
     serial_puts(")");
 }
 
-void kfree(void *ptr)
+static void kfree_unlocked(void *ptr, uint64_t free_ra)
 {
     if (!ptr) return;
 
@@ -291,8 +311,8 @@ void kfree(void *ptr)
         serial_puts("[HEAP] !!! CORRUPTION: bad magic at 0x");
         serial_puthex((uint64_t)block, 16);
         serial_puts(" caller=0x");
-        serial_puthex((uint64_t)__builtin_return_address(0), 16);
-        heap_print_sym((uint64_t)__builtin_return_address(0));
+        serial_puthex(free_ra, 16);
+        heap_print_sym(free_ra);
         serial_puts("\n");
         return;
     }
@@ -304,8 +324,6 @@ void kfree(void *ptr)
          * here so the read is safe. */
         uint64_t orig_ra  = block->alloc_ra;
         uint64_t orig_ra2 = block->alloc_ra2;
-        uint64_t free_ra  = (uint64_t)__builtin_return_address(0);
-
         serial_puts("[HEAP] !!! DOUBLE FREE at 0x");
         serial_puthex((uint64_t)ptr, 16);
         serial_puts(" size=");
@@ -330,10 +348,22 @@ void kfree(void *ptr)
     coalesce(block);
 }
 
+void kfree(void *ptr)
+{
+    if (!ptr) return;
+
+    uint64_t free_ra = (uint64_t)__builtin_return_address(0);
+    uint64_t irq_flags = heap_lock_irqsave();
+    kfree_unlocked(ptr, free_ra);
+    heap_unlock_irqrestore(irq_flags);
+}
+
 /* ── calloc ──────────────────────────────────────────────────── */
 
 void *kcalloc(uint64_t count, uint64_t size)
 {
+    if (size != 0 && count > UINT64_MAX / size)
+        return NULL;
     uint64_t total = count * size;
     void *ptr = kmalloc(total);
     if (ptr) memset(ptr, 0, total);
@@ -347,25 +377,57 @@ void *krealloc(void *ptr, uint64_t new_size)
     if (!ptr) return kmalloc(new_size);
     if (new_size == 0) { kfree(ptr); return NULL; }
 
+    uint64_t alloc_ra = (uint64_t)__builtin_return_address(0);
+    uint64_t alloc_ra2 = (uint64_t)__builtin_return_address(1);
+    uint64_t irq_flags = heap_lock_irqsave();
+    void *result = NULL;
     block_hdr_t *block = (block_hdr_t *)((uint8_t *)ptr - sizeof(block_hdr_t));
-    if (block->magic != BLOCK_MAGIC) return NULL;
+    if (block->magic != BLOCK_MAGIC || block->flags != BLOCK_USED)
+        goto out;
 
     /* If current block is large enough, keep it */
-    if (block->size >= new_size) return ptr;
+    if (block->size >= new_size) {
+        result = ptr;
+        goto out;
+    }
 
     /* Allocate new, copy, free old */
-    void *new_ptr = kmalloc(new_size);
-    if (!new_ptr) return NULL;
+    void *new_ptr = _kmalloc_with_ra(new_size, alloc_ra, alloc_ra2);
+    if (!new_ptr) goto out;
     memcpy(new_ptr, ptr, block->size);
-    kfree(ptr);
-    return new_ptr;
+    kfree_unlocked(ptr, alloc_ra);
+    result = new_ptr;
+
+out:
+    heap_unlock_irqrestore(irq_flags);
+    return result;
 }
 
 /* ── Stats ───────────────────────────────────────────────────── */
 
-uint64_t heap_get_used(void)  { return heap_used; }
-uint64_t heap_get_total(void) { return heap_size; }
-uint64_t heap_get_count(void) { return alloc_count; }
+uint64_t heap_get_used(void)
+{
+    uint64_t irq_flags = heap_lock_irqsave();
+    uint64_t result = heap_used;
+    heap_unlock_irqrestore(irq_flags);
+    return result;
+}
+
+uint64_t heap_get_total(void)
+{
+    uint64_t irq_flags = heap_lock_irqsave();
+    uint64_t result = heap_size;
+    heap_unlock_irqrestore(irq_flags);
+    return result;
+}
+
+uint64_t heap_get_count(void)
+{
+    uint64_t irq_flags = heap_lock_irqsave();
+    uint64_t result = alloc_count;
+    heap_unlock_irqrestore(irq_flags);
+    return result;
+}
 
 /* ── Initialize heap ─────────────────────────────────────────── */
 

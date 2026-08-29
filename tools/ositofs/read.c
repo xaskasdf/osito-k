@@ -18,6 +18,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <errno.h>
 
 #include "common.h"
 
@@ -89,6 +90,12 @@ static int extract_file(int fd, osfs2_file_t *f, const char *output)
         return -1;
     }
 
+    if (f->flags & OSFS2_FLAG_INLINE) {
+        ssize_t written = write(out_fd, f->model_name, (size_t)file_size);
+        close(out_fd);
+        return written == (ssize_t)file_size ? 0 : -1;
+    }
+
     void *data_blk = osfs2_alloc_block();
     if (!data_blk) {
         close(out_fd);
@@ -124,6 +131,46 @@ static int extract_file(int fd, osfs2_file_t *f, const char *output)
     return ok ? 0 : -1;
 }
 
+static int normalize_tree_path(const char *stored, char *out, size_t capacity)
+{
+    size_t write_pos = 0;
+    const char *p = stored;
+    while (*p == '/' || *p == '\\') p++;
+    while (*p) {
+        const char *component = p;
+        size_t length = 0;
+        while (*p && *p != '/' && *p != '\\') {
+            p++;
+            length++;
+        }
+        while (*p == '/' || *p == '\\') p++;
+        if (!length || (length == 1 && component[0] == '.')) continue;
+        if (length == 2 && component[0] == '.' && component[1] == '.')
+            return -1;
+        if (write_pos + length + (write_pos != 0) >= capacity) return -1;
+        if (write_pos) out[write_pos++] = '/';
+        memcpy(out + write_pos, component, length);
+        write_pos += length;
+    }
+    out[write_pos] = '\0';
+    return write_pos ? 0 : -1;
+}
+
+static int mkdir_parents(const char *path)
+{
+    char copy[2048];
+    size_t length = strlen(path);
+    if (length >= sizeof(copy)) return -1;
+    memcpy(copy, path, length + 1);
+    for (char *p = copy + 1; *p; p++) {
+        if (*p != '/') continue;
+        *p = '\0';
+        if (mkdir(copy, 0755) < 0 && errno != EEXIST) return -1;
+        *p = '/';
+    }
+    return 0;
+}
+
 /* ── Main ────────────────────────────────────────────────────────────── */
 
 int main(int argc, char **argv)
@@ -131,6 +178,7 @@ int main(int argc, char **argv)
     if (argc < 3) {
         fprintf(stderr,
             "Usage: ositofs-read <device> <pattern> [--output-dir <dir>]\n"
+            "       ositofs-read <device> '*' --output-dir <dir> --tree\n"
             "       ositofs-read <device> <filename> [output-path]\n"
             "\n"
             "Patterns: *  *.ext  prefix*  exact-name\n");
@@ -141,11 +189,14 @@ int main(int argc, char **argv)
     const char *pattern    = argv[2];
     const char *output_dir = NULL;
     const char *output_path = NULL;
+    int tree_mode = 0;
 
     /* Parse optional arguments */
     for (int i = 3; i < argc; i++) {
         if (strcmp(argv[i], "--output-dir") == 0 && i + 1 < argc) {
             output_dir = argv[++i];
+        } else if (strcmp(argv[i], "--tree") == 0) {
+            tree_mode = 1;
         } else if (!output_path && i == 3 && !is_wildcard(pattern)) {
             /* Legacy: ositofs-read dev file.bin /tmp/out.bin */
             output_path = argv[i];
@@ -153,6 +204,11 @@ int main(int argc, char **argv)
             fprintf(stderr, "ositofs-read: unknown argument '%s'\n", argv[i]);
             return 1;
         }
+    }
+    if (tree_mode && !output_dir) output_dir = ".";
+    if (output_dir && mkdir(output_dir, 0755) < 0 && errno != EEXIST) {
+        perror("mkdir output directory");
+        return 1;
     }
 
     int fd = osfs2_open_device(device, 1);
@@ -181,7 +237,7 @@ int main(int argc, char **argv)
 
     for (uint32_t i = 0; i < OSFS2_MAX_FILES; i++) {
         if (!(ft[i].flags & OSFS2_FLAG_VALID)) continue;
-        if (wildcard_match(pattern, ft[i].name))
+        if (wildcard_match(pattern, osfs2_entry_name(&ft[i])))
             matches[match_count++] = (int)i;
     }
 
@@ -195,13 +251,13 @@ int main(int argc, char **argv)
     /* Single file with explicit output path (legacy mode) */
     if (match_count == 1 && output_path) {
         osfs2_file_t *f = &ft[matches[0]];
-        fprintf(stderr, "Extracting '%s' (", f->name);
+        fprintf(stderr, "Extracting '%s' (", osfs2_entry_name(f));
         fprint_size(stderr, f->size);
         fprintf(stderr, ")...\n");
 
         int rc = extract_file(fd, f, output_path);
         if (rc == 0) {
-            fprintf(stderr, "OK: %s -> %s (", f->name, output_path);
+            fprintf(stderr, "OK: %s -> %s (", osfs2_entry_name(f), output_path);
             fprint_size(stderr, f->size);
             fprintf(stderr, ")\n");
         }
@@ -222,13 +278,29 @@ int main(int argc, char **argv)
         /* Build output path */
         char out_path[1024];
         if (output_dir) {
-            snprintf(out_path, sizeof(out_path), "%s/%s", output_dir, f->name);
+            char relative[1024];
+            const char *stored = osfs2_entry_name(f);
+            if (tree_mode) {
+                if (normalize_tree_path(stored, relative, sizeof(relative)) < 0) {
+                    fprintf(stderr, "unsafe or long stored path: %s\n", stored);
+                    errors++;
+                    continue;
+                }
+                stored = relative;
+            }
+            snprintf(out_path, sizeof(out_path), "%s/%s", output_dir, stored);
         } else {
-            snprintf(out_path, sizeof(out_path), "%s", f->name);
+            snprintf(out_path, sizeof(out_path), "%s", osfs2_entry_name(f));
+        }
+
+        if (mkdir_parents(out_path) < 0) {
+            fprintf(stderr, "cannot create parent path for %s\n", out_path);
+            errors++;
+            continue;
         }
 
         fprintf(stderr, "[%d/%d] Extracting '%s' (",
-                m + 1, match_count, f->name);
+                m + 1, match_count, osfs2_entry_name(f));
         fprint_size(stderr, f->size);
         fprintf(stderr, ")...\n");
 
@@ -238,7 +310,7 @@ int main(int argc, char **argv)
             total_bytes += f->size;
         } else {
             errors++;
-            fprintf(stderr, "  FAILED: %s\n", f->name);
+            fprintf(stderr, "  FAILED: %s\n", osfs2_entry_name(f));
         }
     }
 

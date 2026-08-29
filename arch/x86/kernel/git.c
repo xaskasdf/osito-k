@@ -33,6 +33,7 @@ extern void *osfs2_create(const char *name, uint64_t size);
 extern int   osfs2_delete(const char *name);
 extern uint64_t osfs2_file_size(void *file);
 extern void *osfs2_file_at(uint32_t index);
+extern const char *osfs2_file_name(void *file);
 
 /* Heap */
 extern void *kmalloc(uint64_t size);
@@ -982,8 +983,7 @@ int git_status(void)
         if (!f) break;
 
         /* Get filename — the file pointer is osfs2_file_t* */
-        typedef struct { char name[64]; } name_peek_t;
-        const char *fname = ((name_peek_t *)f)->name;
+        const char *fname = osfs2_file_name(f);
 
         /* Skip git internal files and binaries */
         if (git_strncmp(fname, ".git/", 5) == 0) continue;
@@ -1141,8 +1141,7 @@ int git_branch(const char *name)
         for (uint32_t i = 0; ; i++) {
             void *f = osfs2_file_at(i);
             if (!f) break;
-            typedef struct { char name[64]; } name_peek_t;
-            const char *fname = ((name_peek_t *)f)->name;
+            const char *fname = osfs2_file_name(f);
 
             if (git_strncmp(fname, ".git/refs/heads/", 16) != 0) continue;
             const char *bname = fname + 16;

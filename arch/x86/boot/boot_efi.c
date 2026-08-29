@@ -282,6 +282,42 @@ static EFI_STATUS load_kernel_elf(EFI_HANDLE ImageHandle)
     kernel_phys_lo = ~0ULL;
     kernel_phys_hi = 0;
 
+    UINT64 load_start = ~0ULL;
+    UINT64 load_end = 0;
+
+    for (UINT16 i = 0; i < ehdr.e_phnum; i++) {
+        elf64_phdr_t phdr;
+        UINT64 phdr_off = ehdr.e_phoff + i * ehdr.e_phentsize;
+
+        uefi_call_wrapper(file->SetPosition, 2, file, phdr_off);
+        sz = sizeof(phdr);
+        uefi_call_wrapper(file->Read, 3, file, &sz, &phdr);
+
+        if (phdr.p_type != PT_LOAD || phdr.p_memsz == 0)
+            continue;
+
+        UINT64 seg_start = phdr.p_paddr & ~0xFFFULL;
+        UINT64 seg_end = (phdr.p_paddr + phdr.p_memsz + 0xFFFULL) & ~0xFFFULL;
+        if (seg_start < load_start) load_start = seg_start;
+        if (seg_end > load_end) load_end = seg_end;
+    }
+
+    if (load_start == ~0ULL || load_end <= load_start)
+        return EFI_LOAD_ERROR;
+
+    UINT64 load_pages = (load_end - load_start) >> 12;
+    EFI_PHYSICAL_ADDRESS load_addr = load_start;
+    status = uefi_call_wrapper(BS->AllocatePages, 4,
+                               AllocateAddress, EfiLoaderData,
+                               load_pages, &load_addr);
+    if (EFI_ERROR(status)) {
+        Print(L"  AllocatePages kernel range 0x%lx-0x%lx (%d pages) failed: %r\r\n",
+              load_start, load_end, load_pages, status);
+        return status;
+    }
+    uefi_call_wrapper(BS->SetMem, 3, (VOID *)(UINTN)load_start,
+                      (UINTN)(load_end - load_start), 0);
+
     /* Load each PT_LOAD segment */
     for (UINT16 i = 0; i < ehdr.e_phnum; i++) {
         elf64_phdr_t phdr;
@@ -298,23 +334,8 @@ static EFI_STATUS load_kernel_elf(EFI_HANDLE ImageHandle)
         Print(L"  LOAD: vaddr=0x%lx filesz=0x%lx memsz=0x%lx\r\n",
               phdr.p_vaddr, phdr.p_filesz, phdr.p_memsz);
 
-        /* Allocate pages at the specified physical address */
         UINT64 seg_base = phdr.p_paddr;
         UINT64 seg_end  = seg_base + phdr.p_memsz;
-        UINT64 pages = (seg_end - (seg_base & ~0xFFFULL) + 0xFFF) >> 12;
-
-        EFI_PHYSICAL_ADDRESS alloc_addr = seg_base & ~0xFFFULL;
-        status = uefi_call_wrapper(BS->AllocatePages, 4,
-                                   AllocateAddress, EfiLoaderData,
-                                   pages, &alloc_addr);
-        if (EFI_ERROR(status)) {
-            Print(L"  AllocatePages at 0x%lx (%d pages) failed: %r\r\n",
-                  alloc_addr, pages, status);
-            return status;
-        }
-
-        /* UEFI AllocatePages returns zeroed memory (EfiLoaderData).
-         * The kernel also zeros BSS at startup as a safety net. */
         UINT8 *dst = (UINT8 *)seg_base;
 
         /* Copy file data */

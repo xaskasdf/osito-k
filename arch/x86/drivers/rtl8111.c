@@ -376,8 +376,8 @@ int rtl8111_recv(void *buf, uint32_t *len)
 
 /* ── IRQ wiring ────────────────────────────────────────────────────  */
 
-/* ISR llamado desde el dispatcher común de idt.c (vec==41 → rtl8111_isr).
- * No se registra dinámicamente: el stub isr_stub_41 + el ramal en
+/* ISR llamado desde el dispatcher común de idt.c (vec==42 → rtl8111_isr).
+ * No se registra dinámicamente: el stub isr_stub_42 + el ramal en
  * common_isr_handler ya están wired en kernel/idt.c y kernel/isr_stubs.S. */
 void rtl8111_isr(void)
 {
@@ -392,12 +392,12 @@ void rtl8111_enable_interrupts(uint8_t bus, uint8_t dev, uint8_t func)
 {
     if (!nic.initialized) return;
 
-    /* MSI vía PCI config write — entrega al LAPIC del BSP, vector 41.     */
-    pci_enable_msi(bus, dev, func, 41);
+    /* MSI vía PCI config write — entrega al LAPIC del BSP, vector 42.     */
+    pci_enable_msi(bus, dev, func, 42);
 
     /* Habilitar ROK + RDU + FOVW + LinkChg.                                */
     rtl_w16(RTL_IMR, RTL_INT_ROK | RTL_INT_RDU | RTL_INT_FOVW |
                      RTL_INT_LINKCHG);
 
-    serial_puts("[RTL8111] IRQ enabled (MSI vector 41)\n");
+    serial_puts("[RTL8111] IRQ enabled (MSI vector 42)\n");
 }

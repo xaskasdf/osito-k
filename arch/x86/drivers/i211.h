@@ -84,6 +84,16 @@
 #define I211_STATUS_LU      (1 << 1)    /* Link Up */
 #define I211_STATUS_SPEED   (3 << 6)    /* Speed: 00=10M 01=100M 10=1G 11=1G */
 
+/* MDIC / PHY basic control */
+#define I211_MDIC_PHY(n)        ((uint32_t)(n) << 21)
+#define I211_MDIC_OP_WRITE      (1u << 26)
+#define I211_MDIC_READY         (1u << 28)
+#define I211_MDIC_ERROR         (1u << 30)
+#define I211_BMCR_SPEED1000     (1u << 6)
+#define I211_BMCR_FD            (1u << 8)
+#define I211_BMCR_ANRESTART     (1u << 9)
+#define I211_BMCR_AUTOEN        (1u << 12)
+
 /* RCTL */
 #define I211_RCTL_EN        (1 << 1)    /* Receiver Enable */
 #define I211_RCTL_SBP       (1 << 2)    /* Store Bad Packets */

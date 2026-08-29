@@ -5,24 +5,25 @@
 # observations for both probe questions.
 
 set -e
+set -o pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 X86_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+REPO_DIR="$(cd "$X86_DIR/../.." && pwd)"
 BUILD="$X86_DIR/build"
 [ -f "$BUILD/kernel.elf" ] || { echo "build first"; exit 1; }
 
-OFS_TOOLS=/Users/pc/osito-a/tools/ositofs
+OFS_TOOLS="$REPO_DIR/tools/ositofs"
 NVME="$BUILD/nvme-tls13.img"
 cp "$BUILD/nvme.img" "$NVME"
 
 SENT_DIR=$(mktemp -d)
 : > "$SENT_DIR/no-demo.bin"
 echo "tls13-probe-2026-05-16" > "$SENT_DIR/tls13-probe.txt"
-for fn in ws-test.txt ws-send.txt ws-serve.txt ws-gen.txt no-demo.bin \
-          agent-probe.txt tls13-probe.txt; do
+for fn in ws-test.txt ws-send.txt ws-serve.txt ws-gen.txt agent-probe.txt; do
   "$OFS_TOOLS/ositofs-delete" "$NVME" "$fn" >/dev/null 2>&1 || true
 done
-"$OFS_TOOLS/ositofs-write" "$NVME" "$SENT_DIR/no-demo.bin"    | tail -1
-"$OFS_TOOLS/ositofs-write" "$NVME" "$SENT_DIR/tls13-probe.txt"  | tail -1
+"$OFS_TOOLS/ositofs-write" "$NVME" "$SENT_DIR/no-demo.bin" --overwrite | tail -1
+"$OFS_TOOLS/ositofs-write" "$NVME" "$SENT_DIR/tls13-probe.txt" --overwrite | tail -1
 
 # A12.9: drop an operator CA bundle test file so the loader sees
 # it during boot.  Mix of duplicates (already-pinned) and one
@@ -36,7 +37,6 @@ cat > "$SENT_DIR/tls/roots.txt" <<'_ROOTS'
 # A made-up hash to test parsing of new entries
 0000111122223333444455556666777788889999aaaabbbbccccddddeeeeffff
 _ROOTS
-"$OFS_TOOLS/ositofs-delete" "$NVME" "tls/roots.txt" >/dev/null 2>&1 || true
 "$OFS_TOOLS/ositofs-write" "$NVME" "$SENT_DIR/tls/roots.txt" \
     --name "tls/roots.txt" --overwrite | tail -1
 rm -rf "$SENT_DIR"

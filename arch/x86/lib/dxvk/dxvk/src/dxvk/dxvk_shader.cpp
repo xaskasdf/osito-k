@@ -869,7 +869,7 @@ namespace dxvk {
     auto& stageInfo = m_stageInfos[m_stageCount];
     stageInfo = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO };
 
-    if (!stageInfo.module)
+    if (!shaderModule)
       stageInfo.pNext = &moduleInfo;
 
     stageInfo.stage = stage;

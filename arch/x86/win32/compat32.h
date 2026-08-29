@@ -34,13 +34,18 @@
 /* Calling conventions for thunk generation */
 #define CC_STDCALL  0   /* callee cleans stack: ret N  (KERNEL32, USER32, ...) */
 #define CC_CDECL    1   /* caller cleans stack: ret    (MSVCRT) */
+#define CC_CONVENTION_MASK 0x0F
+
+/* The fixed arguments are followed by a PE32 vararg area. The dispatcher
+ * appends a uint32_t pointer to that area when calling the registered bridge. */
+#define CC_VARIADIC 0x40
 
 /* Thunk entry: maps a 32-bit callable address to a 64-bit shim */
 typedef struct {
     uint32_t thunk_addr;    /* 32-bit address of the thunk stub */
     uint64_t target_addr;   /* 64-bit address of the real shim function */
     uint8_t  num_args;      /* number of DWORD stack arguments (for dispatch) */
-    uint8_t  callconv;      /* CC_STDCALL or CC_CDECL */
+    uint8_t  callconv;      /* CC_* convention plus optional ABI flags */
     const char *name;       /* function name (for debug) */
 } compat32_thunk_t;
 
@@ -49,6 +54,8 @@ typedef struct {
  * Allocates executable memory below 4GB for thunk stubs.
  */
 void compat32_init(void);
+BOOL compat32_is_initialized(void);
+BOOL compat32_runtime_range_conflicts(ULONGLONG base, ULONGLONG size);
 
 /*
  * Create a thunk for a 64-bit shim function.
@@ -75,6 +82,7 @@ NTSTATUS compat32_patch_iat(PE_IMAGE_INFO *info);
  * Windows i386 uses FS:0 to access the TEB.
  */
 void compat32_setup_teb(void *teb_addr);
+TEB32 *compat32_current_teb(void);
 
 /*
  * Enter 32-bit compatibility mode and jump to the PE32 entry point.
@@ -97,7 +105,15 @@ void compat32_callback(uint32_t func_addr);
  * Switches to compat mode, pushes args (right-to-left), calls func,
  * captures EAX return value, returns to 64-bit code.
  */
-uint32_t compat32_callback_args(uint32_t func_addr, int nargs, const uint32_t *args);
+uint32_t compat32_callback_args(uint32_t func_addr, int nargs,
+                                const uint32_t *args);
+uint32_t compat32_callback_args_on_stack(uint32_t func_addr, int nargs,
+                                         const uint32_t *args,
+                                         uint32_t stack_top);
+
+/* Return the active PE32 API caller's ESP for callbacks on this scheduler
+ * thread. Zero means there is no validated user-stack context. */
+uint32_t compat32_current_user_stack_top(void);
 
 /*
  * Look up a thunk entry by its 32-bit stub address.
@@ -128,7 +144,6 @@ int compat32_seh_dispatch(PEXCEPTION_RECORD ExceptionRecord);
  * Writing a 64-bit struct to a 32-bit buffer overflows, corrupting
  * the stack (most commonly: SEH ExceptionList on the 32-bit stack).
  */
-extern int g_compat32_mode;
 
 /*
  * Create a stub UObject with a valid vtable (all entries return 0).

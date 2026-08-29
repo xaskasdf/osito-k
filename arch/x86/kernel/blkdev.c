@@ -9,10 +9,13 @@
  */
 
 #include "../include/types.h"
+#include "../include/paging.h"
 
 extern void serial_puts(const char *s);
 extern void serial_putdec(uint64_t val);
 extern void serial_puthex(uint64_t val, int digits);
+extern void *mem_alloc_aligned(uint64_t size, uint64_t alignment);
+extern void mem_free_pages(void *addr, uint64_t count);
 
 /* ── Block Device Interface ──────────────────────────────────── */
 
@@ -234,37 +237,61 @@ int disk_write_bytes(uint64_t byte_offset, const void *buf, uint64_t len)
         return -1;
     }
 
+    uint64_t device_bytes = d->sector_count * (uint64_t)d->sector_size;
+    if ((!buf && len) || byte_offset > device_bytes ||
+        len > device_bytes - byte_offset)
+        return -1;
+    if (!len) return 0;
+
     const uint8_t *src = (const uint8_t *)buf;
     uint64_t off  = byte_offset;
     uint64_t left = len;
-    /* Page-aligned so the 2-page PRP1/PRP2 split nvme_write does is on a
-     * clean 4 KB boundary (mirrors the read path's tmp buffer below). */
-    uint8_t  tmp[8192] __attribute__((aligned(4096)));
     uint32_t ssz = d->sector_size;
-    if (ssz > sizeof(tmp)) return -1;
+    if (ssz > 8192) return -1;
+    void *tmp_phys = NULL;
+    uint8_t *tmp = NULL;
+    int result = 0;
 
     while (left > 0) {
         uint64_t lba   = off / ssz;
         uint32_t intra = (uint32_t)(off % ssz);
-        uint32_t want  = (uint32_t)((left < (sizeof(tmp) - intra))
-                                    ? left : (sizeof(tmp) - intra));
+
+        if (d->type == BLKDEV_NVME && intra == 0 && left >= ssz) {
+            uint64_t sector_count = left / ssz;
+            if (sector_count > UINT32_MAX) sector_count = UINT32_MAX;
+            uint64_t direct_bytes = sector_count * ssz;
+            if (d->write(lba, (uint32_t)sector_count, src) < 0) {
+                serial_puts("[BLK] disk_write_bytes: direct write failed lba=");
+                serial_putdec(lba);
+                serial_puts("\n");
+                result = -1;
+                goto out;
+            }
+            src += direct_bytes;
+            off += direct_bytes;
+            left -= direct_bytes;
+            continue;
+        }
+
+        if (!tmp_phys) {
+            tmp_phys = mem_alloc_aligned(8192, 4096);
+            if (!tmp_phys) return -1;
+            tmp = (uint8_t *)PHYS_TO_VIRT(tmp_phys);
+        }
+        uint32_t want  = (uint32_t)((left < (8192U - intra))
+                                    ? left : (8192U - intra));
         uint32_t sectors = (intra + want + ssz - 1) / ssz;
 
-        /* Read-modify-write only when the write doesn't span full sectors.
-         * Some USB MSC controllers return CHECK CONDITION when reading
-         * sectors that have never been written (post-mkfs blank flash);
-         * in that case we treat the unread bytes as zeros — equivalent
-         * to what a fresh sector should contain anyway. The user data
-         * portion (intra..intra+want) is overwritten from src below, so
-         * the only bytes that matter from the read are the head/tail
-         * outside the user range. Zero-fill is safe for fresh blocks
-         * and the only realistic content for unwritten flash. */
+        /* Partial writes require the original boundary-sector bytes. If
+         * that read fails, abort rather than manufacturing zero metadata. */
         bool partial = (intra != 0) || ((intra + want) % ssz != 0);
         if (partial) {
             if (d->read(lba, sectors, tmp) < 0) {
-                /* Unread → assume zero-fill. Only the bytes outside
-                 * [intra..intra+want] matter; we'll overwrite the rest. */
-                for (uint32_t i = 0; i < sectors * ssz; i++) tmp[i] = 0;
+                serial_puts("[BLK] disk_write_bytes: prerequisite read failed lba=");
+                serial_putdec(lba);
+                serial_puts("\n");
+                result = -1;
+                goto out;
             }
         }
 
@@ -273,14 +300,17 @@ int disk_write_bytes(uint64_t byte_offset, const void *buf, uint64_t len)
             serial_puts("[BLK] disk_write_bytes: write failed lba=");
             serial_putdec(lba);
             serial_puts("\n");
-            return -1;
+            result = -1;
+            goto out;
         }
 
         src  += want;
         off  += want;
         left -= want;
     }
-    return 0;
+out:
+    if (tmp_phys) mem_free_pages(tmp_phys, 2);
+    return result;
 }
 
 /*
@@ -289,16 +319,17 @@ int disk_write_bytes(uint64_t byte_offset, const void *buf, uint64_t len)
  * device — without this, USB sticks may report "complete" while the
  * controller still holds the data in its DRAM cache.
  *
- * Only USB MSC currently implements this. NVMe driver does flush
- * implicitly on every write, so its blkdev entry's flush is a no-op.
+ * USB MSC and NVMe expose transport-specific cache flush commands.
  */
 int disk_flush(void)
 {
     if (active_dev < 0) return -1;
     blkdev_t *d = &devices[active_dev];
     if (!d->active) return -1;
-    /* Currently only usb0 has a flush hook; nvme is write-through. */
+    extern int nvme_flush(void) __attribute__((weak));
     extern int usb_storage_flush(void) __attribute__((weak));
+    if (d->type == BLKDEV_NVME && nvme_flush)
+        return nvme_flush();
     if (d->type == 3 /* BLKDEV_USB */ && usb_storage_flush)
         return usb_storage_flush();
     return 0;
@@ -306,10 +337,10 @@ int disk_flush(void)
 
 /*
  * Read `len` bytes starting at byte_offset on the active device.
- * Translates byte coordinates to LBA + intra-sector offset, reads via
- * the device's blk_read_fn into a temporary aligned buffer, and copies
- * the requested bytes into the caller's buffer. Returns 0 on success,
- * -1 on any sub-read failure or when no device is active.
+ * Translates byte coordinates to LBA + intra-sector offset. Aligned NVMe
+ * spans use the caller buffer directly; partial boundary sectors use a
+ * temporary aligned buffer. Returns 0 on success, -1 on any sub-read
+ * failure or when no device is active.
  */
 int disk_read_bytes(uint64_t byte_offset, void *buf, uint64_t len)
 {
@@ -317,36 +348,68 @@ int disk_read_bytes(uint64_t byte_offset, void *buf, uint64_t len)
     blkdev_t *d = &devices[active_dev];
     if (!d->active || !d->read || d->sector_size == 0) return -1;
 
+    uint64_t device_bytes = d->sector_count * (uint64_t)d->sector_size;
+    if ((!buf && len) || byte_offset > device_bytes ||
+        len > device_bytes - byte_offset)
+        return -1;
+    if (!len) return 0;
+
     uint8_t *dst   = (uint8_t *)buf;
     uint64_t off   = byte_offset;
     uint64_t left  = len;
-    /* MUST be page-aligned AND in lower-half identity (so its virt addr
-     * equals its phys, since nvme_read passes the buffer pointer
-     * directly as PRP1/PRP2).  Stack-allocated with aligned(4096) lives
-     * in the kernel stack, which is in lower-half identity-mapped
-     * memory during early boot — so the address GCC gives us IS the
-     * phys NVMe DMA needs.  Cannot use a `static` .bss buffer because
-     * .bss is in the upper-half kernel mirror, where virt != phys. */
-    uint8_t tmp[8192] __attribute__((aligned(4096)));
+    /* Use physically backed direct-map memory for DMA. Kernel stacks are
+     * not guaranteed to be physically contiguous across two pages. */
     uint32_t ssz   = d->sector_size;
-    if (ssz > sizeof(tmp))             /* defensive — 4 KB sectors fit */
-        return -1;
+    if (ssz > 8192) return -1;
+    void *tmp_phys = NULL;
+    uint8_t *tmp = NULL;
+    int result = 0;
 
     while (left > 0) {
         uint64_t lba    = off / ssz;
         uint32_t intra  = (uint32_t)(off % ssz);
-        uint32_t want   = (uint32_t)((left < (sizeof(tmp) - intra))
-                                     ? left : (sizeof(tmp) - intra));
+
+        if (d->type == BLKDEV_NVME && intra == 0 && left >= ssz) {
+            uint64_t sector_count = left / ssz;
+            if (sector_count > UINT32_MAX) sector_count = UINT32_MAX;
+            uint64_t direct_bytes = sector_count * ssz;
+            if (d->read(lba, (uint32_t)sector_count, dst) < 0) {
+                result = -1;
+                break;
+            }
+            extern void nvme_debug_watch_cpu_write(void *, uint64_t,
+                                                    const char *);
+            nvme_debug_watch_cpu_write(dst, direct_bytes,
+                                       "disk_read_bytes-direct");
+            dst += direct_bytes;
+            off += direct_bytes;
+            left -= direct_bytes;
+            continue;
+        }
+
+        if (!tmp_phys) {
+            tmp_phys = mem_alloc_aligned(8192, 4096);
+            if (!tmp_phys) return -1;
+            tmp = (uint8_t *)PHYS_TO_VIRT(tmp_phys);
+        }
+        uint32_t want   = (uint32_t)((left < (8192U - intra))
+                                     ? left : (8192U - intra));
         uint32_t sectors = (intra + want + ssz - 1) / ssz;
 
-        if (d->read(lba, sectors, tmp) < 0) return -1;
+        if (d->read(lba, sectors, tmp) < 0) {
+            result = -1;
+            break;
+        }
 
+        extern void nvme_debug_watch_cpu_write(void *, uint64_t, const char *);
+        nvme_debug_watch_cpu_write(dst, want, "disk_read_bytes");
         for (uint32_t i = 0; i < want; i++) dst[i] = tmp[intra + i];
         dst  += want;
         off  += want;
         left -= want;
     }
-    return 0;
+    if (tmp_phys) mem_free_pages(tmp_phys, 2);
+    return result;
 }
 
 /* ── List all devices ────────────────────────────────────────── */

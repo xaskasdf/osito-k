@@ -8,7 +8,8 @@ extern void serial_puts(const char *s);
 
 /* ── Registry: dll_name → co-located export table ───────────────── */
 
-#define WIN32_ABI_MAX_DLLS 24
+#define WIN32_ABI_MAX_DLLS 64
+#define WIN32_ABI_MAX_COMPAT32_BRIDGES 32
 
 static struct {
     const char         *dll;
@@ -16,6 +17,12 @@ static struct {
     int                 count;
 } g_abi[WIN32_ABI_MAX_DLLS];
 static int g_abi_count;
+
+static struct {
+    const void *native_target;
+    const void *compat32_target;
+} g_compat32_bridges[WIN32_ABI_MAX_COMPAT32_BRIDGES];
+static int g_compat32_bridge_count;
 
 /* Case-insensitive ASCII compare, NUL-terminated. */
 static int ci_eq(const char *a, const char *b)
@@ -32,7 +39,15 @@ static int ci_eq(const char *a, const char *b)
 
 void win32_abi_register(const char *dll_name, const WIN32_EXPORT *table, int count)
 {
-    if (g_abi_count >= WIN32_ABI_MAX_DLLS || !dll_name || !table) return;
+    if (!dll_name || !table) return;
+    for (int i = 0; i < g_abi_count; i++) {
+        if (ci_eq(g_abi[i].dll, dll_name)) {
+            g_abi[i].table = table;
+            g_abi[i].count = count;
+            return;
+        }
+    }
+    if (g_abi_count >= WIN32_ABI_MAX_DLLS) return;
     g_abi[g_abi_count].dll   = dll_name;
     g_abi[g_abi_count].table = table;
     g_abi[g_abi_count].count = count;
@@ -45,6 +60,46 @@ static const WIN32_EXPORT *find_in_table(const WIN32_EXPORT *t, int n,
     for (int i = 0; i < n; i++)
         if (t[i].name && ci_eq(t[i].name, name))
             return &t[i];
+    return NULL;
+}
+
+static const WIN32_EXPORT *find_target_in_table(const WIN32_EXPORT *t, int n,
+                                                const void *target)
+{
+    for (int i = 0; i < n; i++)
+        if (t[i].name && t[i].func == target)
+            return &t[i];
+    return NULL;
+}
+
+static uint8_t export_callconv(const WIN32_EXPORT *e)
+{
+    return (uint8_t)(e->cc & WIN32_EXPORT_ABI_MASK);
+}
+
+void win32_abi_register_compat32_bridge(const void *native_target,
+                                        const void *compat32_target)
+{
+    if (!native_target || !compat32_target) return;
+
+    for (int i = 0; i < g_compat32_bridge_count; i++) {
+        if (g_compat32_bridges[i].native_target == native_target) {
+            g_compat32_bridges[i].compat32_target = compat32_target;
+            return;
+        }
+    }
+    if (g_compat32_bridge_count >= WIN32_ABI_MAX_COMPAT32_BRIDGES) return;
+
+    g_compat32_bridges[g_compat32_bridge_count].native_target = native_target;
+    g_compat32_bridges[g_compat32_bridge_count].compat32_target = compat32_target;
+    g_compat32_bridge_count++;
+}
+
+const void *win32_abi_compat32_bridge(const void *native_target)
+{
+    for (int i = 0; i < g_compat32_bridge_count; i++)
+        if (g_compat32_bridges[i].native_target == native_target)
+            return g_compat32_bridges[i].compat32_target;
     return NULL;
 }
 
@@ -229,7 +284,11 @@ int win32_abi_lookup(const char *dll_name, const char *func_name,
             if (ci_eq(g_abi[i].dll, dll_name)) {
                 const WIN32_EXPORT *e =
                     find_in_table(g_abi[i].table, g_abi[i].count, func_name);
-                if (e) { *out_argc = e->argc; *out_cc = e->cc; return 1; }
+                if (e) {
+                    *out_argc = e->argc;
+                    *out_cc = export_callconv(e);
+                    return 1;
+                }
                 break;
             }
         }
@@ -239,12 +298,75 @@ int win32_abi_lookup(const char *dll_name, const char *func_name,
     for (int i = 0; i < g_abi_count; i++) {
         const WIN32_EXPORT *e =
             find_in_table(g_abi[i].table, g_abi[i].count, func_name);
-        if (e) { *out_argc = e->argc; *out_cc = e->cc; return 1; }
+        if (e) {
+            *out_argc = e->argc;
+            *out_cc = export_callconv(e);
+            return 1;
+        }
     }
 
     /* 3. MSVC C++ mangled name → exact argc + cc */
     if (func_name[0] == '?')
         return msvc_demangle_abi(func_name, out_argc, out_cc);
 
+    return 0;
+}
+
+int win32_abi_lookup_target(const char *dll_name, const void *target,
+                            const char **out_name, uint8_t *out_argc,
+                            uint8_t *out_cc)
+{
+    if (!target) return 0;
+
+    if (dll_name) {
+        for (int i = 0; i < g_abi_count; i++) {
+            if (ci_eq(g_abi[i].dll, dll_name)) {
+                const WIN32_EXPORT *e = find_target_in_table(
+                    g_abi[i].table, g_abi[i].count, target);
+                if (e) {
+                    *out_name = e->name;
+                    *out_argc = e->argc;
+                    *out_cc = export_callconv(e);
+                    return 1;
+                }
+                break;
+            }
+        }
+    }
+
+    for (int i = 0; i < g_abi_count; i++) {
+        const WIN32_EXPORT *e = find_target_in_table(
+            g_abi[i].table, g_abi[i].count, target);
+        if (e) {
+            *out_name = e->name;
+            *out_argc = e->argc;
+            *out_cc = export_callconv(e);
+            return 1;
+        }
+    }
+    return 0;
+}
+
+
+int win32_abi_target_is_data(const char *dll_name, const void *target)
+{
+    if (!target) return 0;
+
+    if (dll_name) {
+        for (int i = 0; i < g_abi_count; i++) {
+            if (ci_eq(g_abi[i].dll, dll_name)) {
+                const WIN32_EXPORT *e = find_target_in_table(
+                    g_abi[i].table, g_abi[i].count, target);
+                if (e) return (e->cc & WIN32_EXPORT_DATA_FLAG) != 0;
+                break;
+            }
+        }
+    }
+
+    for (int i = 0; i < g_abi_count; i++) {
+        const WIN32_EXPORT *e = find_target_in_table(
+            g_abi[i].table, g_abi[i].count, target);
+        if (e) return (e->cc & WIN32_EXPORT_DATA_FLAG) != 0;
+    }
     return 0;
 }

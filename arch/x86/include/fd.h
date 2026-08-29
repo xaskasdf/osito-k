@@ -19,6 +19,8 @@
 #define FD_TYPE_PIPE     3
 #define FD_TYPE_DEV      4   /* /dev/null, /dev/zero, ... */
 #define FD_TYPE_PROC     5   /* /proc/self/maps, ... */
+#define FD_TYPE_DIR      6   /* synthetic OsitoFS v2 directory */
+#define FD_TYPE_SOCKET   7   /* BSD socket backed by kernel/socket.c */
 
 typedef ssize_t (*fd_write_fn)(const void *buf, size_t count);
 typedef ssize_t (*fd_read_fn)(void *buf, size_t count);
@@ -26,12 +28,14 @@ typedef ssize_t (*fd_read_fn)(void *buf, size_t count);
 typedef struct {
     bool        open;
     uint8_t     type;       /* FD_TYPE_* */
-    uint16_t    oflags;     /* O_RDONLY, O_WRONLY, O_RDWR */
+    uint32_t    oflags;     /* Linux O_* flags */
     fd_read_fn  read;
     fd_write_fn write;
     vfs_node_t  node;       /* embedded VFS node for regular files */
     void       *pipe;       /* pipe_buf_t *, or NULL */
+    int32_t     socket_idx; /* index in kernel socket table */
     uint64_t    offset;     /* file position */
+    char        dir_path[64]; /* normalized prefix for FD_TYPE_DIR */
 } fd_entry_t;
 
 /* Refcounted fd table: shared between threads (CLONE_FILES),

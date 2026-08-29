@@ -13,6 +13,7 @@
 #include "../include/types.h"
 #include "gpt.h"
 #include "../../../include/common/ositofs2_format.h"
+#include "../../../include/common/ositofs3_format.h"
 
 /* ── External functions ──────────────────────────────────────── */
 
@@ -192,9 +193,9 @@ int gpt_find_ositofs(uint64_t *part_offset, uint64_t *part_size)
         if (disk_read_bytes(part_start, probe, sizeof(probe)) < 0)
             continue;
 
-        /* Check for OSFS2 magic at offset 0 */
+        /* Check for either supported OsitoFS superblock at offset 0. */
         uint32_t magic = *(uint32_t *)probe;
-        if (magic == OSFS2_MAGIC) {
+        if (magic == OSFS2_MAGIC || magic == OSFS3_MAGIC) {
             uint64_t off  = part_start;
             uint64_t size = (entry.last_lba - entry.first_lba + 1) * lba_size;
 

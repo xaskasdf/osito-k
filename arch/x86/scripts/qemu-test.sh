@@ -8,6 +8,9 @@
 # Usage:
 #   ./qemu-test.sh              # Build + boot
 #   ./qemu-test.sh --no-build   # Boot only (skip build)
+#   ./qemu-test.sh --gtk        # Local GTK window, 2D virtio-vga
+#   ./qemu-test.sh --egl-headless # GL virtio-gpu via /dev/dri render node
+#   ./qemu-test.sh --venus      # real Vulkan host via Venus + blob resources
 #
 # Test from another terminal:
 #   echo "hola osito" | nc -u localhost 7777
@@ -16,29 +19,54 @@
 #
 
 set -e
+set -o pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 X86_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 BUILD_DIR="$X86_DIR/build"
 EFI_BIN="$BUILD_DIR/boot.efi"
-KERN_BIN="$BUILD_DIR/kernel.elf"
-ESP_IMG="$BUILD_DIR/esp.img"
+KERN_BIN="${QEMU_KERNEL_BIN:-$BUILD_DIR/kernel.elf}"
+ESP_IMG="${QEMU_ESP_IMG:-$BUILD_DIR/esp.img}"
 
 # -- Vulkan Wave 1: virtio-gpu-gl-pci is the default display device so
 # the guest can negotiate VIRTIO_GPU_F_VIRGL. `--no-gl` falls back to the
 # plain 2D virtio-vga for hosts that lack virglrenderer. --
 USE_GL="true"
+USE_VENUS="false"
+DISPLAY_MODE="auto"
+USE_KVM="auto"
 NO_BUILD="false"
 PID_FILE_DEFAULT="/tmp/qemu-test-osito.pid"
-PID_FILE="$PID_FILE_DEFAULT"
+PID_FILE="${QEMU_PID_FILE:-$PID_FILE_DEFAULT}"
 DO_KILL="false"
 for arg in "$@"; do
     case "$arg" in
         --no-gl)    USE_GL="false" ;;
+        --gtk)      USE_GL="false"; DISPLAY_MODE="gtk" ;;
+        --egl-headless) USE_GL="true"; DISPLAY_MODE="egl-headless" ;;
+        --venus)   USE_GL="true"; USE_VENUS="true"; DISPLAY_MODE="egl-headless" ;;
+        --vnc)      DISPLAY_MODE="vnc" ;;
+        --no-kvm)   USE_KVM="false" ;;
         --no-build) NO_BUILD="true" ;;
         --kill)     DO_KILL="true" ;;
     esac
 done
+
+QEMU_MEM="${QEMU_MEM:-4G}"
+QEMU_SMP="${QEMU_SMP:-4}"
+QEMU_GPU_HOSTMEM="${QEMU_GPU_HOSTMEM:-512M}"
+QEMU_RENDER_NODE="${QEMU_RENDER_NODE:-/dev/dri/renderD128}"
+QEMU_GPU_BLOB="${QEMU_GPU_BLOB:-0}"
+QEMU_VNC="${QEMU_VNC:-:0}"
+QEMU_USB_POINTER="${QEMU_USB_POINTER:-tablet}"
+QEMU_UDP_PORT="${QEMU_UDP_PORT:-7777}"
+QEMU_TCP_PORT="${QEMU_TCP_PORT:-}"
+QEMU_TCP_GUEST_PORT="${QEMU_TCP_GUEST_PORT:-$QEMU_TCP_PORT}"
+QEMU_MONITOR_SOCKET="${QEMU_MONITOR_SOCKET:-/tmp/qemu-monitor.sock}"
+QEMU_AUDIO_PATH="${QEMU_AUDIO_PATH:-$BUILD_DIR/audio.wav}"
+QEMU_BIN="${QEMU_BIN:-qemu-system-x86_64}"
+QEMU_NVME_CACHE="${QEMU_NVME_CACHE:-writeback}"
+QEMU_EXTRA_ARGS="${QEMU_EXTRA_ARGS:-}"
 
 # --kill: terminate a previously-launched instance by reading the PID file.
 # Only kills that exact PID — safe for concurrent qemu-system-x86_64 users.
@@ -57,7 +85,13 @@ if [ "$DO_KILL" = "true" ]; then
     exit 0
 fi
 if [ "$USE_GL" = "true" ]; then
-    GPU_DEVICE="-device virtio-gpu-gl-pci,hostmem=256M,blob=on"
+    GPU_BLOB_OPT=""
+    VENUS_OPT=""
+    if [ "$QEMU_GPU_BLOB" = "1" ] || [ "$USE_VENUS" = "true" ]; then
+        GPU_BLOB_OPT=",blob=on"
+    fi
+    [ "$USE_VENUS" = "true" ] && VENUS_OPT=",venus=on"
+    GPU_DEVICE="-device virtio-gpu-gl-pci,hostmem=$QEMU_GPU_HOSTMEM$GPU_BLOB_OPT$VENUS_OPT"
 else
     GPU_DEVICE="-device virtio-vga"
 fi
@@ -106,9 +140,21 @@ error() { echo -e "${RED}[!]${NC} $*"; exit 1; }
 
 # ── Check prerequisites ──────────────────────────────────────
 
-command -v qemu-system-x86_64 >/dev/null || error "qemu-system-x86 not installed. Run: sudo apt install qemu-system-x86"
+command -v "$QEMU_BIN" >/dev/null || error "QEMU not found: $QEMU_BIN"
 [ -n "$OVMF" ] || error "OVMF not found. Run: sudo apt install ovmf"
 command -v mtools >/dev/null 2>&1 || command -v mcopy >/dev/null 2>&1 || error "mtools not installed. Run: sudo apt install mtools"
+case "$QEMU_USB_POINTER" in
+    mouse|tablet) ;;
+    *) error "QEMU_USB_POINTER must be 'mouse' or 'tablet'" ;;
+esac
+if [ "$USE_VENUS" = "true" ]; then
+    VENUS_HELP="$("$QEMU_BIN" -display egl-headless,gl=on,rendernode="$QEMU_RENDER_NODE" \
+        -device virtio-gpu-gl-pci,help 2>&1 || true)"
+    case "$VENUS_HELP" in
+        *"venus=<bool>"*) ;;
+        *) error "QEMU does not expose virtio-gpu Venus; use QEMU 9.2+ built with virglrenderer" ;;
+    esac
+fi
 
 # ── Build if needed ───────────────────────────────────────────
 
@@ -152,9 +198,11 @@ info "ESP image: boot.efi=$(FSIZE "$EFI_BIN") kernel.elf=$(FSIZE "$KERN_BIN")"
 
 info "Launching QEMU..."
 info "  OVMF: $OVMF"
-info "  NIC:  e1000e (Intel 82574L, igb family)"
-info "  USB:  xHCI + keyboard + mouse"
-info "  Net:  user-mode, UDP :7777 → guest 10.0.2.15:7777"
+info "  NIC:  igb (Intel 82576, advanced descriptors)"
+info "  USB:  xHCI + keyboard + $QEMU_USB_POINTER"
+info "  RAM:  $QEMU_MEM"
+info "  CPUs: $QEMU_SMP"
+info "  Net:  user-mode, UDP :$QEMU_UDP_PORT → guest 10.0.2.15:7777"
 info ""
 echo -e "${CYAN}  Test: echo \"hola osito\" | nc -u localhost 7777${NC}"
 echo -e "${CYAN}  Exit: Ctrl-A X${NC}"
@@ -171,20 +219,31 @@ else
     BIOS_ARGS="-bios $OVMF"
 fi
 
-SERIAL_LOG="$BUILD_DIR/serial.log"
+SERIAL_LOG="${QEMU_SERIAL_LOG:-$BUILD_DIR/serial.log}"
 rm -f "$SERIAL_LOG"
 info "Serial log: $SERIAL_LOG"
 info "  (tail -f $SERIAL_LOG to watch)"
 
-# NVMe disk image (OsitoFS)
-NVME_IMG="$BUILD_DIR/nvme.img"
-NVME_ARGS=""
-if [ -f "$NVME_IMG" ]; then
-    info "NVMe disk: $NVME_IMG ($(FSIZE "$NVME_IMG") bytes)"
-    NVME_ARGS="-drive file=$NVME_IMG,format=raw,if=none,id=nvme0,cache=none -device nvme,serial=deadbeef,drive=nvme0"
+SERIAL_SOCKET="${QEMU_SERIAL_SOCKET:-}"
+if [ -n "$SERIAL_SOCKET" ]; then
+    rm -f "$SERIAL_SOCKET"
+    SERIAL_ARGS=(-chardev "socket,id=osito_serial,path=$SERIAL_SOCKET,server=on,wait=off,logfile=$SERIAL_LOG" \
+                 -serial chardev:osito_serial)
+    info "Serial input: $SERIAL_SOCKET"
+else
+    SERIAL_ARGS=(-serial "file:$SERIAL_LOG")
 fi
 
-# Display: cocoa native window on macOS, VNC fallback on Linux
+# NVMe disk image (OsitoFS)
+NVME_IMG="${QEMU_NVME_IMG:-$BUILD_DIR/nvme.img}"
+NVME_ARGS=""
+if [ -f "$NVME_IMG" ]; then
+    info "NVMe disk: $NVME_IMG ($(FSIZE "$NVME_IMG") bytes, cache=$QEMU_NVME_CACHE)"
+    NVME_ARGS="-drive file=$NVME_IMG,format=raw,if=none,id=nvme0,cache=$QEMU_NVME_CACHE -device nvme,serial=deadbeef,drive=nvme0"
+fi
+
+# Display: cocoa native window on macOS. On Linux/WSL, --egl-headless is the
+# stable GL path for virgl; --gtk is the interactive 2D window path.
 if [ "$(uname)" = "Darwin" ]; then
     if [ "$USE_GL" = "true" ]; then
         # cocoa lacks OpenGL on macOS QEMU builds — use SDL with gl=core
@@ -196,33 +255,75 @@ if [ "$(uname)" = "Darwin" ]; then
         info "Display: native macOS window (cocoa)"
     fi
 else
-    if [ "$USE_GL" = "true" ]; then
-        GPU_DEVICE="-device virtio-vga"
-        info "Display: VNC (virgl disabled; VNC is not GL-capable)"
+    if [ "$DISPLAY_MODE" = "auto" ]; then
+        if [ "$USE_GL" = "true" ] && [ -e "$QEMU_RENDER_NODE" ]; then
+            DISPLAY_MODE="egl-headless"
+        else
+            DISPLAY_MODE="gtk"
+        fi
     fi
-    DISPLAY_ARGS="-vnc :0,password=on"
+
+    case "$DISPLAY_MODE" in
+        egl-headless)
+            [ -e "$QEMU_RENDER_NODE" ] || error "render node not found: $QEMU_RENDER_NODE"
+            DISPLAY_ARGS="-display egl-headless,gl=on,rendernode=$QEMU_RENDER_NODE -vnc $QEMU_VNC"
+            info "Display: EGL headless GL (rendernode=$QEMU_RENDER_NODE, VNC=$QEMU_VNC)"
+            ;;
+        gtk)
+            GPU_DEVICE="-device virtio-vga"
+            DISPLAY_ARGS="-display gtk,gl=off"
+            info "Display: GTK window (2D virtio-vga)"
+            ;;
+        vnc)
+            if [ "$USE_GL" = "true" ]; then
+                GPU_DEVICE="-device virtio-vga"
+                info "Display: VNC (virgl disabled; VNC is not GL-capable)"
+            fi
+            DISPLAY_ARGS="-vnc $QEMU_VNC,password=on"
+            ;;
+        *)
+            error "unknown display mode: $DISPLAY_MODE"
+            ;;
+    esac
 fi
 
-qemu-system-x86_64 \
+ACCEL_ARGS="-accel tcg"
+CPU_ARGS="-cpu Nehalem"
+if [ "$(uname)" != "Darwin" ] && [ "$USE_KVM" != "false" ] && [ -e /dev/kvm ]; then
+    ACCEL_ARGS="-accel kvm"
+    CPU_ARGS="-cpu host"
+    info "Accel: KVM"
+else
+    info "Accel: TCG"
+fi
+
+NETDEV_ARGS="user,id=net0,hostfwd=udp::${QEMU_UDP_PORT}-:7777"
+if [ -n "$QEMU_TCP_PORT" ]; then
+    NETDEV_ARGS="${NETDEV_ARGS},hostfwd=tcp::${QEMU_TCP_PORT}-:${QEMU_TCP_GUEST_PORT}"
+fi
+
+"$QEMU_BIN" \
+    $ACCEL_ARGS \
     $BIOS_ARGS \
     -drive file="$ESP_IMG",format=raw,if=ide \
     $NVME_ARGS \
-    -m 4G \
+    -m "$QEMU_MEM" \
     -machine q35 \
-    -cpu Nehalem \
-    -smp 4 \
-    -device e1000e,netdev=net0 \
-    -netdev user,id=net0,hostfwd=udp::7777-:7777 \
+    $CPU_ARGS \
+    -smp "$QEMU_SMP" \
+    -device igb,netdev=net0 \
+    -netdev "$NETDEV_ARGS" \
     -device qemu-xhci,id=usb \
     -device usb-kbd,bus=usb.0 \
-    -device usb-mouse,bus=usb.0 \
-    -audiodev wav,id=wav0,path=$BUILD_DIR/audio.wav \
+    -device "usb-$QEMU_USB_POINTER,bus=usb.0" \
+    -audiodev wav,id=wav0,path="$QEMU_AUDIO_PATH" \
     -device intel-hda,id=hda0 \
     -device hda-duplex,id=snd0,audiodev=wav0 \
     $GPU_DEVICE \
     $DISPLAY_ARGS \
-    -serial file:"$SERIAL_LOG" \
-    -monitor unix:/tmp/qemu-monitor.sock,server,nowait \
+    "${SERIAL_ARGS[@]}" \
+    -monitor unix:"$QEMU_MONITOR_SOCKET",server,nowait \
+    $QEMU_EXTRA_ARGS \
     -name osito-test \
     -no-reboot -no-shutdown &
 

@@ -4,9 +4,7 @@
 extern "C" int printf(const char*, ...);  /* DIAG */
 
 namespace dxvk {
-  
-  Logger Logger::s_instance("dxgi.log");
-  
+
   HRESULT createDxgiFactory(UINT Flags, REFIID riid, void **ppFactory) {
     /* OsitoK W5.3: -fno-exceptions, so the upstream try/catch around
      * `new DxgiFactory(Flags)` collapses to direct construction. The

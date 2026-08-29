@@ -29,6 +29,7 @@ extern void  pci_enable_bus_master(uint8_t bus, uint8_t dev, uint8_t func);
 extern void input_post_mouse_move(int16_t dx, int16_t dy);
 extern void input_set_mouse_abs(int32_t abs_x, int32_t abs_y);
 extern void input_post_mouse_button(uint8_t buttons);
+extern void input_get_cursor(int32_t *x, int32_t *y);
 
 /* Keyboard injection (keyboard.c — weak: works without PS/2 driver) */
 extern void kb_push(char c)     __attribute__((weak));
@@ -353,6 +354,10 @@ static void hid_process_mouse(xhci_device_t *dev, const uint8_t *r)
     /* Win32 bridge (UT99 etc.) — weak so a kernel without the win32 layer
      * still links. The keyboard takes the same path (hid_route_to_win32). */
     extern void win32_post_mouse_event(int dx, int dy, uint32_t buttons, short wheel) __attribute__((weak));
+    extern void win32_post_mouse_screen(int screen_x, int screen_y,
+                                        int raw_dx, int raw_dy,
+                                        uint32_t buttons, short wheel)
+        __attribute__((weak));
     extern void win32_post_mouse_abs(int ax, int ay, int lmin, int lmax, uint32_t buttons) __attribute__((weak));
 
     uint8_t btns = 0;
@@ -379,8 +384,14 @@ static void hid_process_mouse(xhci_device_t *dev, const uint8_t *r)
             int32_t dy = hid_extract_signed(r, y_off, fy->bit_size);
             if (dx != 0 || dy != 0)
                 input_post_mouse_move((int16_t)dx, (int16_t)dy);
-            if (win32_post_mouse_event)
+            if (win32_post_mouse_screen) {
+                int32_t screen_x, screen_y;
+                input_get_cursor(&screen_x, &screen_y);
+                win32_post_mouse_screen((int)screen_x, (int)screen_y,
+                                        (int)dx, (int)dy, btns, 0);
+            } else if (win32_post_mouse_event) {
                 win32_post_mouse_event((int)dx, (int)dy, btns, 0);
+            }
         } else {
             int32_t ax = hid_extract(r, x_off, fx->bit_size);
             int32_t ay = hid_extract(r, y_off, fy->bit_size);
@@ -389,6 +400,12 @@ static void hid_process_mouse(xhci_device_t *dev, const uint8_t *r)
                 win32_post_mouse_abs((int)ax, (int)ay,
                                      fx->logical_min, fx->logical_max, btns);
         }
+    } else if (caps->mouse_btn_field >= 0 && win32_post_mouse_screen) {
+        /* Button-only reports must use the cursor the compositor displays. */
+        int32_t screen_x, screen_y;
+        input_get_cursor(&screen_x, &screen_y);
+        win32_post_mouse_screen((int)screen_x, (int)screen_y,
+                                0, 0, btns, 0);
     } else if (caps->mouse_btn_field >= 0 && win32_post_mouse_event) {
         /* Button-only report (no axes this frame): still deliver clicks. */
         win32_post_mouse_event(0, 0, btns, 0);

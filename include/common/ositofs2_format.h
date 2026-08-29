@@ -5,12 +5,17 @@
  * Freestanding-compatible: no libc dependencies.
  *
  * Block size: configurable (default 1MB, min 64KB, stored in superblock)
- * Metadata layout (fixed at 4MB, independent of data block size):
- *   Offset 0:    Superblock (512 bytes)
+ * Standard metadata layout (version 2, fixed at 4MB):
+ *   Offset 0:    Primary superblock (512 bytes)
+ *   Offset 4KB:  Backup superblock (512 bytes)
+ *   Offset 8KB:  Metadata redo record (12KB)
+ *   Offset 20KB: Journal commit marker (512 bytes)
  *   Offset 1MB:  File Table (4096 entries × 256 bytes = 1MB)
  *   Offset 2MB:  Block CRC Table (262144 × uint32 = 1MB)
  *   Offset 3MB:  Layer Index Table (512 slots × 2048 bytes = 1MB)
  *   Offset 4MB+: Data blocks (block_size from superblock)
+ * Many-file layout (version 3): file table at 1-5MB, data at 5MB+;
+ * the block CRC and layer index tables are omitted.
  */
 
 #ifndef OSITOFS2_FORMAT_H
@@ -27,6 +32,7 @@
 
 #define OSFS2_MAGIC              0x4F534632      /* "OSF2" */
 #define OSFS2_VERSION            2
+#define OSFS2_VERSION_LARGE_FILES 3
 
 /* Data block size — configurable per-filesystem, stored in superblock */
 #define OSFS2_DEFAULT_BLOCK_SIZE (1024 * 1024)    /* 1MB */
@@ -36,21 +42,82 @@
 /* Superblock backup (4K-aligned, within first 1MB region) */
 #define OSFS2_SUPER_BACKUP_OFF   4096
 
+/* Power-fail recovery journal. Older v2 readers ignore this previously unused
+ * region, so clean existing images remain format-compatible. */
+#define OSFS2_JOURNAL_RECORD_OFF 8192
+#define OSFS2_JOURNAL_RECORD_SIZE 12288
+#define OSFS2_JOURNAL_COMMIT_OFF (OSFS2_JOURNAL_RECORD_OFF + OSFS2_JOURNAL_RECORD_SIZE)
+#define OSFS2_JOURNAL_COMMIT_SIZE 512
+#define OSFS2_JOURNAL_MAGIC      0x4A324653  /* "SF2J" */
+#define OSFS2_JOURNAL_VERSION    2
+#define OSFS2_JOURNAL_COMMIT_MAGIC 0x43324A53 /* "SJ2C" */
+#define OSFS2_JOURNAL_MAX_ENTRIES 2
+#define OSFS2_JOURNAL_MAX_PAGES   2
+#define OSFS2_METADATA_PAGE_SIZE  4096
+
+#define OSFS2_JOURNAL_OP_RENAME  1
+#define OSFS2_JOURNAL_OP_DELETE  2
+#define OSFS2_JOURNAL_OP_REPLACE 3
+
 /* Fixed metadata byte offsets (4MB total, independent of data block size) */
 #define OSFS2_FILETAB_OFF        (1 * 1024 * 1024)
-#define OSFS2_CRCTAB_OFF         (2 * 1024 * 1024)
-#define OSFS2_LAYERIDX_OFF       (3 * 1024 * 1024)
-#define OSFS2_DATA_OFF           (4 * 1024 * 1024)
+#define OSFS2_CRCTAB_OFF_STANDARD (2 * 1024 * 1024)
+#define OSFS2_LAYERIDX_OFF_STANDARD (3 * 1024 * 1024)
+#define OSFS2_CRCTAB_OFF         OSFS2_CRCTAB_OFF_STANDARD
+#define OSFS2_LAYERIDX_OFF       OSFS2_LAYERIDX_OFF_STANDARD
+#define OSFS2_DATA_OFF_STANDARD  (4 * 1024 * 1024)
+#define OSFS2_DATA_OFF_LARGE     (5 * 1024 * 1024)
+#define OSFS2_DATA_OFF           OSFS2_DATA_OFF_STANDARD
 
-#define OSFS2_MAX_FILES       4096
+#define OSFS2_MAX_FILES_STANDARD 4096
+#define OSFS2_MAX_FILES       OSFS2_MAX_FILES_STANDARD
+#define OSFS2_MAX_FILES_LARGE 16384
 #define OSFS2_MAX_BLOCKS      262144   /* CRC slots (CRCTAB_SIZE / 4) */
 #define OSFS2_MAX_MODELS      512
 #define OSFS2_MAX_LAYERS      255
 
 /* Metadata region sizes (derived from MAX_* above) */
-#define OSFS2_FILETAB_SIZE       (OSFS2_MAX_FILES * 256)     /* 1MB */
+#define OSFS2_FILETAB_SIZE_STANDARD (OSFS2_MAX_FILES_STANDARD * 256) /* 1MB */
+#define OSFS2_FILETAB_SIZE       OSFS2_FILETAB_SIZE_STANDARD
+#define OSFS2_FILETAB_SIZE_LARGE (OSFS2_MAX_FILES_LARGE * 256) /* 4MB */
 #define OSFS2_CRCTAB_SIZE        (OSFS2_MAX_BLOCKS * 4)      /* 1MB */
 #define OSFS2_LAYERIDX_SIZE      (OSFS2_MAX_MODELS * 2048)   /* 1MB */
+
+/* Version 3 dedicates offsets 1-5MB to file entries. Per-block CRCs and the
+ * model layer index are omitted; file-level CRCs remain in each entry. */
+
+static inline int osfs2_supported_version(uint32_t version) {
+    return version == OSFS2_VERSION ||
+           version == OSFS2_VERSION_LARGE_FILES;
+}
+
+static inline uint32_t osfs2_format_max_files(uint32_t version) {
+    return version == OSFS2_VERSION_LARGE_FILES
+        ? OSFS2_MAX_FILES_LARGE : OSFS2_MAX_FILES;
+}
+
+static inline uint32_t osfs2_format_filetab_size(uint32_t version) {
+    return version == OSFS2_VERSION_LARGE_FILES
+        ? OSFS2_FILETAB_SIZE_LARGE : OSFS2_FILETAB_SIZE;
+}
+
+static inline uint32_t osfs2_format_crctab_off(uint32_t version) {
+    (void)version;
+    return OSFS2_CRCTAB_OFF;
+}
+
+static inline int osfs2_format_has_crc_table(uint32_t version) {
+    return version == OSFS2_VERSION;
+}
+
+static inline int osfs2_format_has_layer_index(uint32_t version) {
+    return version == OSFS2_VERSION;
+}
+
+static inline uint32_t osfs2_format_data_off(uint32_t version) {
+    return version == OSFS2_VERSION_LARGE_FILES
+        ? OSFS2_DATA_OFF_LARGE : OSFS2_DATA_OFF_STANDARD;
+}
 
 /* Streaming I/O chunk (GGUF/GSP readers — not tied to FS block size) */
 #define OSFS2_IO_CHUNK           (1024 * 1024)    /* 1MB */
@@ -64,6 +131,7 @@
 #define OSFS2_FLAG_GGUF       (1 << 1)
 #define OSFS2_FLAG_RAW        (1 << 2)
 #define OSFS2_FLAG_INLINE     (1 << 3)  /* data stored inline in model_name[128] */
+#define OSFS2_FLAG_LONG_NAME  (1 << 4)  /* full name stored in model_name[128] */
 #define OSFS2_INLINE_MAX      128       /* max inline bytes */
 
 /* GGUF quantization types (subset) */
@@ -130,6 +198,44 @@ typedef struct __attribute__((packed)) {
 
 _Static_assert(sizeof(osfs2_file_t) == 256, "file entry must be 256 bytes");
 
+/* ── Metadata redo journal ───────────────────────────────────── */
+
+typedef struct __attribute__((packed)) {
+    uint32_t magic;
+    uint32_t version;
+    uint32_t operation;
+    uint32_t entry_count;
+    uint64_t transaction_id;
+    uint32_t slots[OSFS2_JOURNAL_MAX_ENTRIES];
+    uint32_t page_count;
+    uint32_t pages[OSFS2_JOURNAL_MAX_PAGES];
+    uint32_t reserved_header;
+    osfs2_super_t before_super;
+    osfs2_super_t after_super;
+    osfs2_file_t before_entries[OSFS2_JOURNAL_MAX_ENTRIES];
+    uint8_t after_pages[OSFS2_JOURNAL_MAX_PAGES][OSFS2_METADATA_PAGE_SIZE];
+    uint32_t record_crc32;
+    uint8_t reserved[OSFS2_JOURNAL_RECORD_SIZE - 9780];
+} osfs2_journal_record_t;
+
+_Static_assert(sizeof(osfs2_journal_record_t) == OSFS2_JOURNAL_RECORD_SIZE,
+               "journal record must be 4096 bytes");
+
+typedef struct __attribute__((packed)) {
+    uint32_t magic;
+    uint32_t version;
+    uint64_t transaction_id;
+    uint32_t record_crc32;
+    uint32_t commit_crc32;
+    uint8_t reserved[OSFS2_JOURNAL_COMMIT_SIZE - 24];
+} osfs2_journal_commit_t;
+
+_Static_assert(sizeof(osfs2_journal_commit_t) == OSFS2_JOURNAL_COMMIT_SIZE,
+               "journal commit must be 512 bytes");
+
+_Static_assert(OSFS2_JOURNAL_COMMIT_OFF + OSFS2_JOURNAL_COMMIT_SIZE <=
+               OSFS2_FILETAB_OFF, "journal overlaps file table");
+
 /* ── Block CRC Table (1MB = 262144 × uint32) ────────────────── */
 /* One CRC32 per data block. Stored as flat array of uint32_t.   */
 
@@ -156,6 +262,11 @@ static inline uint32_t osfs2_block_shift(uint32_t block_size) {
 /* First data block number for a given block_size */
 static inline uint32_t osfs2_data_start_blk(uint32_t block_size) {
     return OSFS2_DATA_OFF / block_size;
+}
+
+static inline uint32_t osfs2_format_data_start_blk(uint32_t version,
+                                                    uint32_t block_size) {
+    return osfs2_format_data_off(version) / block_size;
 }
 
 /* Validate block_size: power of 2 in [MIN, MAX] */

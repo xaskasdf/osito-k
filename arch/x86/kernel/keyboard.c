@@ -18,6 +18,10 @@ extern void xhci_poll(void) __attribute__((weak));
 /* Compositor state (weak: absent if compositor not compiled) */
 extern bool compositor_is_running(void) __attribute__((weak));
 
+/* Avoid burning a runnable scheduler slot while the shell waits for input.
+ * The weak declaration preserves the early-boot polling fallback. */
+extern int sched_sleep_ticks(uint64_t ticks) __attribute__((weak));
+
 /* ── PS/2 ports ──────────────────────────────────────────────── */
 
 #define KB_DATA_PORT    0x60
@@ -251,6 +255,11 @@ char kb_getchar(void)
             int sc = serial_getc();
             if (sc >= 0) return (char)sc;
         }
+        /* COM1 RX interrupts are disabled, so wake periodically to poll. A
+         * single 10 ms tick keeps console input responsive without issuing
+         * hundreds of thousands of KVM port-I/O exits per second. */
+        if (sched_sleep_ticks && sched_sleep_ticks(1) == 0)
+            continue;
         /* Bare-metal safe: PAUSE instead of HLT.
          * HLT depends on the APIC timer or xHCI MSI/INTx waking us up.
          * Same pattern as commit 2832f23 (sched yield via INT $0x20):

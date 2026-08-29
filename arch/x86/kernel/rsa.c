@@ -1,5 +1,5 @@
 /*
- * rsa.c — RSA-2048 PKCS#1 v1.5 signature verification.
+ * rsa.c — RSA PKCS#1 v1.5 signature verification (2048..4096 bits).
  *
  * Verify-only.  No keygen, no signing, no encryption.  Public values
  * only (the signature, the public key (n, e), and the candidate
@@ -10,7 +10,7 @@
  *
  *   Sig    = RSAEP(n, e, EM)
  *   EM     = 0x00 || 0x01 || PS || 0x00 || DigestInfo
- *   PS     = 0xFF * (k - 3 - len(DigestInfo))           (k = 256 for RSA-2048)
+ *   PS     = 0xFF * (k - 3 - len(DigestInfo))
  *   DigestInfo = ASN.1 SHA-256 prefix (19 bytes) || hash (32 bytes)
  *
  * Caller computes the hash, hands us (sig, sig_len, n, n_len, e, e_len,
@@ -23,32 +23,28 @@
 extern void serial_puts(const char *s);
 extern void serial_putdec(uint64_t v);
 
-/* ── Bignum: 32 × uint64 limbs, little-endian (limb[0] = low). ─── */
-
-#define BN_LIMBS  32                /* 2048 bits / 64 */
-typedef struct { uint64_t v[BN_LIMBS]; } bn_t;
+/* Bignum storage is sized for RSA-4096, while arithmetic uses only the
+ * modulus' active limbs so RSA-2048 does not pay the 4096-bit cost. */
+#define BN_MAX_LIMBS  64
+typedef struct { uint64_t v[BN_MAX_LIMBS]; } bn_t;
 
 static void bn_zero(bn_t *r) {
-    for (int i = 0; i < BN_LIMBS; i++) r->v[i] = 0;
+    for (int i = 0; i < BN_MAX_LIMBS; i++) r->v[i] = 0;
 }
-static void bn_copy(bn_t *r, const bn_t *a) {
-    for (int i = 0; i < BN_LIMBS; i++) r->v[i] = a->v[i];
+static void bn_copy(bn_t *r, const bn_t *a, uint32_t limbs) {
+    for (uint32_t i = 0; i < limbs; i++) r->v[i] = a->v[i];
+    for (uint32_t i = limbs; i < BN_MAX_LIMBS; i++) r->v[i] = 0;
 }
-static int bn_is_zero(const bn_t *a) {
-    uint64_t acc = 0;
-    for (int i = 0; i < BN_LIMBS; i++) acc |= a->v[i];
-    return acc == 0;
-}
-static int bn_cmp(const bn_t *a, const bn_t *b) {
-    for (int i = BN_LIMBS - 1; i >= 0; i--) {
+static int bn_cmp(const bn_t *a, const bn_t *b, uint32_t limbs) {
+    for (int i = (int)limbs - 1; i >= 0; i--) {
         if (a->v[i] != b->v[i]) return a->v[i] < b->v[i] ? -1 : 1;
     }
     return 0;
 }
 /* Read big-endian byte buffer into limb array. Buffer length up to
- * BN_LIMBS*8 bytes.  Leading-zero short buffers are zero-extended. */
+ * BN_MAX_LIMBS*8 bytes. Leading-zero short buffers are zero-extended. */
 static int bn_from_be(bn_t *r, const uint8_t *be, uint32_t len) {
-    if (len > BN_LIMBS * 8) return -1;
+    if (len > BN_MAX_LIMBS * 8) return -1;
     bn_zero(r);
     /* Walk from least-significant byte (end of buffer) backwards. */
     uint32_t i = 0;
@@ -58,33 +54,25 @@ static int bn_from_be(bn_t *r, const uint8_t *be, uint32_t len) {
         for (int b = 0; b < 8 && bi >= 0; b++, bi--)
             limb |= ((uint64_t)be[bi]) << (b * 8);
         r->v[i++] = limb;
-        if (i >= BN_LIMBS) break;
+        if (i >= BN_MAX_LIMBS) break;
     }
     return 0;
 }
-/* Write limbs into big-endian buffer. Always writes BN_LIMBS*8 bytes. */
-static void bn_to_be(const bn_t *a, uint8_t *out) {
-    for (int i = 0; i < BN_LIMBS; i++) {
+/* Write the active limbs into a fixed-width big-endian buffer. */
+static void bn_to_be(const bn_t *a, uint8_t *out, uint32_t limbs) {
+    for (uint32_t i = 0; i < limbs; i++) {
         uint64_t limb = a->v[i];
-        int off = (BN_LIMBS - 1 - i) * 8;
+        uint32_t off = (limbs - 1U - i) * 8U;
         for (int b = 0; b < 8; b++)
             out[off + b] = (uint8_t)(limb >> ((7 - b) * 8));
     }
 }
 
-/* Add a + b → r ; returns carry-out. */
-static uint64_t bn_add(bn_t *r, const bn_t *a, const bn_t *b) {
-    __uint128_t s = 0;
-    for (int i = 0; i < BN_LIMBS; i++) {
-        s = (__uint128_t)a->v[i] + b->v[i] + (uint64_t)(s >> 64);
-        r->v[i] = (uint64_t)s;
-    }
-    return (uint64_t)(s >> 64);
-}
 /* Subtract a - b → r ; returns borrow-out (0 or 1). */
-static uint64_t bn_sub(bn_t *r, const bn_t *a, const bn_t *b) {
+static uint64_t bn_sub(bn_t *r, const bn_t *a, const bn_t *b,
+                       uint32_t limbs) {
     __int128_t s = 0;
-    for (int i = 0; i < BN_LIMBS; i++) {
+    for (uint32_t i = 0; i < limbs; i++) {
         s = (__int128_t)a->v[i] - b->v[i] + (int64_t)(s >> 64);
         r->v[i] = (uint64_t)s;
     }
@@ -92,40 +80,27 @@ static uint64_t bn_sub(bn_t *r, const bn_t *a, const bn_t *b) {
     return (uint64_t)((s >> 64) & 1);
 }
 
-/* r ← (a * b) mod 2^2048 (i.e. the low 32 limbs of the product). */
-static void bn_mul_low(bn_t *r, const bn_t *a, const bn_t *b) {
-    uint64_t buf[BN_LIMBS] = {0};
-    for (int i = 0; i < BN_LIMBS; i++) {
+static void bn_mul_full(uint64_t c[BN_MAX_LIMBS * 2], const bn_t *a,
+                        const bn_t *b, uint32_t limbs) {
+    for (uint32_t i = 0; i < limbs * 2U; i++) c[i] = 0;
+    for (uint32_t i = 0; i < limbs; i++) {
         __uint128_t carry = 0;
-        for (int j = 0; j + i < BN_LIMBS; j++) {
-            __uint128_t prod = (__uint128_t)a->v[i] * b->v[j] + buf[i + j] + (uint64_t)carry;
-            buf[i + j] = (uint64_t)prod;
-            carry = prod >> 64;
-        }
-    }
-    for (int i = 0; i < BN_LIMBS; i++) r->v[i] = buf[i];
-}
-
-/* Full 64-limb product a*b → c[0..64].  Output limbs little-endian. */
-static void bn_mul_full(uint64_t c[BN_LIMBS * 2], const bn_t *a, const bn_t *b) {
-    for (int i = 0; i < BN_LIMBS * 2; i++) c[i] = 0;
-    for (int i = 0; i < BN_LIMBS; i++) {
-        __uint128_t carry = 0;
-        for (int j = 0; j < BN_LIMBS; j++) {
+        for (uint32_t j = 0; j < limbs; j++) {
             __uint128_t prod = (__uint128_t)a->v[i] * b->v[j] + c[i + j] + (uint64_t)carry;
             c[i + j] = (uint64_t)prod;
             carry = prod >> 64;
         }
-        c[i + BN_LIMBS] = (uint64_t)carry;
+        c[i + limbs] = (uint64_t)carry;
     }
 }
 
-/* Schoolbook modulo: divide 64-limb dividend by 32-limb modulus.
+/* Schoolbook modulo: divide a 2N-limb dividend by an N-limb modulus.
  *
  * For verify-only this is fine — slow (O(limbs^2)) but works.  We're
  * called once per cert signature; no perf budget concerns. */
-static void bn_mod_full(bn_t *r, const uint64_t prod[BN_LIMBS * 2], const bn_t *m) {
-    /* Take the top half of the product, then shift in 32 more limbs
+static void bn_mod_full(bn_t *r, const uint64_t prod[BN_MAX_LIMBS * 2],
+                        const bn_t *m, uint32_t limbs) {
+    /* Take the top half of the product, then shift in N more limbs
      * (worth of zero limbs) until we land within m.  We use a
      * shift-and-subtract loop on the whole 4096-bit value, treating
      * `prod` as the high-half and gradually pulling in bits.
@@ -136,60 +111,61 @@ static void bn_mod_full(bn_t *r, const uint64_t prod[BN_LIMBS * 2], const bn_t *
      * O(32-limb add/sub)) but solid.
      *
      * For a verify of 1 cert chain (≤4 sigs) this is fine. */
-    uint64_t hi[BN_LIMBS] = {0};      /* upper 2048 bits */
-    uint64_t lo[BN_LIMBS];             /* lower 2048 bits (input) */
-    for (int i = 0; i < BN_LIMBS; i++) lo[i] = prod[i];
-    for (int i = 0; i < BN_LIMBS; i++) hi[i] = prod[i + BN_LIMBS];
+    uint64_t hi[BN_MAX_LIMBS] = {0};
+    uint64_t lo[BN_MAX_LIMBS] = {0};
+    for (uint32_t i = 0; i < limbs; i++) lo[i] = prod[i];
+    for (uint32_t i = 0; i < limbs; i++) hi[i] = prod[i + limbs];
 
-    for (int bit = 2047; bit >= 0; bit--) {
+    for (int bit = (int)(limbs * 64U) - 1; bit >= 0; bit--) {
         (void)bit;
         /* Shift {hi:lo} left by 1. */
         uint64_t carry = 0;
-        for (int i = 0; i < BN_LIMBS; i++) {
+        for (uint32_t i = 0; i < limbs; i++) {
             uint64_t nc = lo[i] >> 63;
             lo[i] = (lo[i] << 1) | carry;
             carry = nc;
         }
-        uint64_t hi_carry = 0;
-        for (int i = 0; i < BN_LIMBS; i++) {
+        for (uint32_t i = 0; i < limbs; i++) {
             uint64_t nc = hi[i] >> 63;
             hi[i] = (hi[i] << 1) | carry;
             carry = nc;
-            (void)hi_carry;
         }
         /* If hi >= m or there was an overflow out of hi, subtract m. */
         bn_t hi_bn;
-        for (int i = 0; i < BN_LIMBS; i++) hi_bn.v[i] = hi[i];
-        if (carry || bn_cmp(&hi_bn, m) >= 0) {
+        for (uint32_t i = 0; i < limbs; i++) hi_bn.v[i] = hi[i];
+        if (carry || bn_cmp(&hi_bn, m, limbs) >= 0) {
             bn_t after;
-            bn_sub(&after, &hi_bn, m);
-            for (int i = 0; i < BN_LIMBS; i++) hi[i] = after.v[i];
+            bn_sub(&after, &hi_bn, m, limbs);
+            for (uint32_t i = 0; i < limbs; i++) hi[i] = after.v[i];
         }
     }
-    for (int i = 0; i < BN_LIMBS; i++) r->v[i] = hi[i];
+    for (uint32_t i = 0; i < limbs; i++) r->v[i] = hi[i];
+    for (uint32_t i = limbs; i < BN_MAX_LIMBS; i++) r->v[i] = 0;
 }
 
 /* r = (a * b) mod m */
-static void bn_mod_mul(bn_t *r, const bn_t *a, const bn_t *b, const bn_t *m) {
-    uint64_t prod[BN_LIMBS * 2];
-    bn_mul_full(prod, a, b);
-    bn_mod_full(r, prod, m);
+static void bn_mod_mul(bn_t *r, const bn_t *a, const bn_t *b,
+                       const bn_t *m, uint32_t limbs) {
+    uint64_t prod[BN_MAX_LIMBS * 2];
+    bn_mul_full(prod, a, b, limbs);
+    bn_mod_full(r, prod, m, limbs);
 }
 
 /* r = base ^ exp mod m.  exp is at most 64 bits (RSA verify uses
  * small e — typically 65537). */
-static void bn_mod_pow_small_e(bn_t *r, const bn_t *base, uint64_t exp, const bn_t *m) {
+static void bn_mod_pow_small_e(bn_t *r, const bn_t *base, uint64_t exp,
+                               const bn_t *m, uint32_t limbs) {
     bn_t result;
     bn_zero(&result); result.v[0] = 1;            /* 1 */
 
-    bn_t b; bn_copy(&b, base);
+    bn_t b; bn_copy(&b, base, limbs);
 
     while (exp) {
-        if (exp & 1) bn_mod_mul(&result, &result, &b, m);
+        if (exp & 1) bn_mod_mul(&result, &result, &b, m, limbs);
         exp >>= 1;
-        if (exp) bn_mod_mul(&b, &b, &b, m);
+        if (exp) bn_mod_mul(&b, &b, &b, m, limbs);
     }
-    bn_copy(r, &result);
+    bn_copy(r, &result, limbs);
 }
 
 /* ── Public API ─────────────────────────────────────────────── */
@@ -215,8 +191,9 @@ static int rsa_verify_inner(const uint8_t *sig, uint32_t sig_len,
                             const uint8_t *di_prefix, uint32_t di_prefix_len)
 {
     if (sig_len != n_len) return -1;
-    if (n_len == 0 || n_len > BN_LIMBS * 8) return -1;
+    if (n_len == 0 || n_len > BN_MAX_LIMBS * 8) return -1;
     if (e_len == 0 || e_len > 8)            return -1;
+    uint32_t limbs = (n_len + 7U) / 8U;
 
     bn_t S, N, M;
     if (bn_from_be(&S, sig, sig_len) < 0) return -1;
@@ -225,13 +202,13 @@ static int rsa_verify_inner(const uint8_t *sig, uint32_t sig_len,
     uint64_t exp = 0;
     for (uint32_t i = 0; i < e_len; i++) exp = (exp << 8) | e[i];
     if (exp == 0) return -1;
-    if (bn_cmp(&S, &N) >= 0) return -1;
+    if (bn_cmp(&S, &N, limbs) >= 0) return -1;
 
-    bn_mod_pow_small_e(&M, &S, exp, &N);
+    bn_mod_pow_small_e(&M, &S, exp, &N, limbs);
 
-    uint8_t em_full[BN_LIMBS * 8];
-    bn_to_be(&M, em_full);
-    const uint8_t *em = em_full + (BN_LIMBS * 8 - sig_len);
+    uint8_t em_full[BN_MAX_LIMBS * 8];
+    bn_to_be(&M, em_full, limbs);
+    const uint8_t *em = em_full + (limbs * 8U - sig_len);
 
     /* EM = 0x00 || 0x01 || 0xFF...0xFF || 0x00 || T  (RFC 8017 §9.2). */
     if (em[0] != 0x00 || em[1] != 0x01) return -1;

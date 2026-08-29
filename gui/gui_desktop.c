@@ -241,6 +241,12 @@ void gui_desktop_render(gui_surface_t *screen)
     gui_dock_render(screen, sw, sh, desk_cursor_x, desk_cursor_y);
 }
 
+void gui_desktop_render_dock(gui_surface_t *screen)
+{
+    gui_dock_render(screen, screen->width, screen->height,
+                    desk_cursor_x, desk_cursor_y);
+}
+
 gui_win_desc_t *gui_desktop_get_windows(int *count)
 {
     if (count) *count = NUM_DEMO_WINDOWS;

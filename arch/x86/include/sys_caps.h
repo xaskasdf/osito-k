@@ -12,6 +12,12 @@
 
 #include "types.h"
 
+#define SYS_CAPS_PROCESS_MIN          256U
+#define SYS_CAPS_PROCESS_MAX         4096U
+#define SYS_CAPS_PROCESS_GRANULARITY   64U
+#define SYS_CAPS_PROCESS_RAM_BUDGET \
+    (8ULL * 1024ULL * 1024ULL)
+
 typedef struct {
     /* ── Hardware facts (from UEFI memory map + CPUID) ── */
     uint64_t total_ram;         /* Total usable RAM in bytes */
@@ -28,7 +34,7 @@ typedef struct {
     /* Per-process */
     uint64_t brk_heap_size;     /* Process brk heap: max(16MB, total_ram/16) */
     uint64_t user_stack_size;   /* User stack: max(1MB, min(8MB, total_ram/64)) */
-    uint32_t max_processes;     /* max(4, min(256, total_ram/16MB)) */
+    uint32_t max_processes;     /* RAM-derived scheduler slot capacity */
     uint32_t max_fds_global;    /* max(128, min(4096, total_ram/256KB)) */
 
     /* ELF loader */

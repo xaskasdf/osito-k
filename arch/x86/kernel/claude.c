@@ -27,6 +27,7 @@ extern int   osfs2_delete(const char *name);
 extern uint32_t osfs2_file_count(void);
 extern void    *osfs2_file_at(uint32_t index);
 extern uint64_t osfs2_file_size(void *file);
+extern const char *osfs2_file_name(void *file);
 
 /* Process execution + output capture (X-CL4 tool exec) */
 extern int  proc_exec(const char *filename, int argc, const char **argv);
@@ -800,8 +801,7 @@ static int tool_file_list(char *result, int max_len)
     for (uint32_t i = 0; i < count && p < max_len - 64; i++) {
         void *file = osfs2_file_at(i);
         if (!file) break;
-        /* File name is at offset 0 of osfs2_file_t */
-        const char *name = (const char *)file;
+        const char *name = osfs2_file_name(file);
         uint64_t size = osfs2_file_size(file);
         p = jp(result, p, max_len, "  ");
         p = jp(result, p, max_len, name);

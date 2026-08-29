@@ -57,7 +57,7 @@ int main(int argc, char **argv)
     for (uint32_t i = 0; i < OSFS2_MAX_FILES; i++) {
         if (!(ft[i].flags & OSFS2_FLAG_VALID)) continue;
 
-        printf("%-40s ", ft[i].name);
+        printf("%-40s ", osfs2_entry_name(&ft[i]));
 
         /* Size */
         char sizebuf[32];
@@ -93,7 +93,8 @@ int main(int argc, char **argv)
     }
 
     printf("\nTotal: "); osfs2_print_size(total_size);
-    uint32_t data_start = osfs2_data_start_blk(sb.block_size);
+    uint32_t data_start = osfs2_format_data_start_blk(sb.version,
+                                                       sb.block_size);
     uint32_t data_blocks = sb.total_blocks - data_start;
     uint32_t used_data = sb.used_blocks > data_start ? sb.used_blocks - data_start : 0;
     printf(" in %u blocks (%u/%u data blocks used, %.1f%%, block_size=",

@@ -41,34 +41,16 @@ static const struct osito_icd_entry *osito_icd_find(const char *name)
 
 /* Build a probe order based on detected hardware. Writes pointers into
  * `order[]` (length must be >= osito_icd_count) and returns the number
- * of entries written. ICDs whose backend isn't detected are still added
- * at the end as a fallback — they may produce CPU-only handles useful
- * for headless test paths. */
+ * of entries written. Backends that are not hardware-ready are not probed. */
 static unsigned osito_icd_probe_order(const struct osito_icd_entry **order)
 {
     unsigned caps = osito_query_gpu_caps();
     unsigned n = 0;
 
-    /* Register EXACTLY ONE primary ICD. Exposing two ICDs (e.g. venus +
-     * nvk-stub) as two separate VkPhysicalDevices makes a D3D11 frontend
-     * (DXVK) enumerate a second, unusable adapter and hang during adapter
-     * enumeration — and because GPU_CAP_NVK_READY toggles per boot, the phys-
-     * device count was non-deterministically 1 or 2. Venus is the project's
-     * validated DXVK backend (it has a guest-local fallback that works without
-     * a live virgl host), so prefer it; fall back to nvk, then the first table
-     * entry. To re-enable true multi-ICD enumeration later, restore the
-     * append-unpicked loop below the single-pick. */
+    /* Register exactly one validated backend. */
     if (caps & GPU_CAP_VENUS_READY) {
         const struct osito_icd_entry *e = osito_icd_find("venus");
         if (e) { order[n++] = e; return n; }
-    }
-    if (caps & GPU_CAP_NVK_READY) {
-        const struct osito_icd_entry *e = osito_icd_find("nvk-stub");
-        if (e) { order[n++] = e; return n; }
-    }
-    /* No caps detected (or named ICDs missing): first available ICD only. */
-    if (osito_icd_count > 0) {
-        order[n++] = &osito_icd_table[0];
     }
     return n;
 }
