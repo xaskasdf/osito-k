@@ -480,6 +480,8 @@ NTSTATUS kernel32_set_process_environment_block(DWORD process_id,
                                                   PCVOID environment,
                                                   BOOL unicode);
 void    kernel32_release_process_environment(DWORD process_id);
+/* Transfer pending Win32 thread-stack cleanup to process-wide VM teardown. */
+void    kernel32_prepare_process_vm_release(DWORD process_id);
 SIZE_T  kernel32_build_environment_block_w(DWORD process_id, PWSTR buffer,
                                            SIZE_T capacity);
 void    k32_power_request_release(PVOID object);

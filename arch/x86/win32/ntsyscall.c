@@ -690,6 +690,11 @@ void nt_vm_release_process(ULONG owner_pid)
 {
     if (!owner_pid) return;
 
+    /* Individual thread stacks are reservations in this same owner table.
+     * Transfer their pending cleanup before removing any entry so the task
+     * reaper cannot race process teardown and report a false double free. */
+    kernel32_prepare_process_vm_release(owner_pid);
+
     /* The CRT caches pointers into this process's user mappings. Remove those
      * references before the mappings themselves are torn down. */
     dinput8_release_process(owner_pid);

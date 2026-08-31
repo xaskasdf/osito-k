@@ -8916,7 +8916,23 @@ static win32_thread_ctx_t **g_win32_threads_by_sched_slot;
 static int g_win32_thread_capacity;
 static int g_win32_thread_sched_capacity;
 static volatile uint32_t g_win32_thread_table_state;
+static spinlock_t g_win32_thread_stack_lock = SPINLOCK_INIT;
 static WCHAR g_primary_thread_description[64];
+
+static uint64_t win32_thread_stack_lock_irqsave(void)
+{
+    uint64_t flags;
+    __asm__ volatile ("pushfq; popq %0; cli" : "=r"(flags) :: "memory");
+    spin_lock(&g_win32_thread_stack_lock);
+    return flags;
+}
+
+static void win32_thread_stack_unlock_irqrestore(uint64_t flags)
+{
+    spin_unlock(&g_win32_thread_stack_lock);
+    if (flags & (1ULL << 9))
+        __asm__ volatile ("sti" ::: "memory");
+}
 
 static BOOL win32_thread_table_ensure(void)
 {
@@ -9655,25 +9671,78 @@ extern int32_t proc_current_pid(void);   /* from process.c */
 
 static void win32_thread_release_stack(win32_thread_ctx_t *ctx)
 {
-    if (!ctx || !ctx->stack_allocation) {
-        if (ctx) ctx->reclaim_pending = 0;
+    if (!ctx) return;
+
+    uint64_t irq_flags = win32_thread_stack_lock_irqsave();
+    if (!ctx->stack_allocation) {
+        ctx->reclaim_pending = 0;
+        win32_thread_stack_unlock_irqrestore(irq_flags);
         return;
     }
 
-    NTSTATUS status = nt_vm_free_stack_for_process(ctx->owner_pid,
-                                                    ctx->stack_allocation);
-    if (!NT_SUCCESS(status)) {
-        serial_puts("[K32-THREAD] stack release failed status=0x");
-        serial_puthex((uint32_t)status, 8);
-        serial_puts(" owner=");
-        serial_putdec(ctx->owner_pid);
-        serial_puts("\n");
-    }
+    ULONG owner_pid = ctx->owner_pid;
+    PVOID allocation = ctx->stack_allocation;
+    NTSTATUS status = nt_vm_free_stack_for_process(owner_pid, allocation);
     ctx->stack_allocation = NULL;
     ctx->stack_limit = NULL;
     ctx->stack_base = NULL;
     ctx->stack_size = 0;
     ctx->reclaim_pending = 0;
+    win32_thread_stack_unlock_irqrestore(irq_flags);
+
+    if (!NT_SUCCESS(status)) {
+        serial_puts("[K32-THREAD] stack release failed status=0x");
+        serial_puthex((uint32_t)status, 8);
+        serial_puts(" owner=");
+        serial_putdec(owner_pid);
+        serial_puts(" allocation=0x");
+        serial_puthex((ULONG_PTR)allocation, 16);
+        serial_puts("\n");
+    }
+}
+
+void kernel32_prepare_process_vm_release(DWORD process_id)
+{
+    if (!process_id ||
+        __atomic_load_n(&g_win32_thread_table_state, __ATOMIC_ACQUIRE) != 2)
+        return;
+
+    uint32_t transferred = 0;
+    uint32_t active = 0;
+    uint64_t irq_flags = win32_thread_stack_lock_irqsave();
+    for (int i = 0; i < g_win32_thread_capacity; i++) {
+        win32_thread_ctx_t *ctx = &g_win32_threads[i];
+        if (ctx->owner_pid != process_id)
+            continue;
+        if (__atomic_load_n(&ctx->active, __ATOMIC_ACQUIRE))
+            active++;
+        if (ctx->stack_allocation) {
+            ctx->stack_allocation = NULL;
+            ctx->stack_limit = NULL;
+            ctx->stack_base = NULL;
+            ctx->stack_size = 0;
+            transferred++;
+        }
+        ctx->reclaim_pending = 0;
+        ctx->teb = NULL;
+        ctx->tls_vector = NULL;
+    }
+    win32_thread_stack_unlock_irqrestore(irq_flags);
+
+    if (transferred) {
+        serial_puts("[K32-THREAD] process VM owns pending stacks owner=");
+        serial_putdec(process_id);
+        serial_puts(" count=");
+        serial_putdec(transferred);
+        serial_puts("\n");
+    }
+    if (active) {
+        serial_puts("[K32-THREAD] WARNING: process VM release with active threads owner=");
+        serial_putdec(process_id);
+        serial_puts(" count=");
+        serial_putdec(active);
+        serial_puts("\n");
+    }
 }
 
 static void win32_thread_release_tls32_environment(win32_thread_ctx_t *ctx)
